@@ -574,10 +574,37 @@ test("assessVeracodeScaPosture fails on high CVSS and HIGH risk licenses and tre
   assert.equal(statusOf(result.findings, 6), "fail");
   assert.equal(statusOf(result.findings, 18), "warn");
 
-  const unlicensed = await assessVeracodeScaPosture(mockClient(healthyFixture(), { async listScaWorkspaces() { throw forbidden("/srcclr/v3/workspaces"); } }));
+  const projectRequests = [];
+  const unlicensed = await assessVeracodeScaPosture(mockClient(healthyFixture(), {
+    async listScaWorkspaces() { throw forbidden("/srcclr/v3/workspaces"); },
+    async getScaApplicationProjects(guid) { projectRequests.push(guid); return { linked_projects: [] }; },
+  }));
   assert.equal(statusOf(unlicensed.findings, 5), "manual");
   assert.equal(statusOf(unlicensed.findings, 6), "manual");
   assert.match(unlicensed.findings[0].summary, /unlicensed|not applicable/);
+
+  const coverage = unlicensed.findings.find((item) => item.id === "VERACODE-18");
+  assert.deepEqual(projectRequests, [], "no linked project list is requested while the SCA Agent API is unreadable");
+  assert.equal(coverage.status, "warn");
+  assert.equal(coverage.summary, "1/2 sampled applications have no upload-and-scan SCA and their linked SCA agent projects were not checked because the SCA Agent API workspace list was forbidden (403), so their coverage is unknown.");
+  assert.doesNotMatch(coverage.summary, /neither upload-and-scan SCA enabled nor a linked SCA agent project/, "an unchecked application is never reported as uncovered");
+  assert.equal(coverage.evidence.uncovered_applications, null, "the uncovered set was never determined");
+  assert.deepEqual(coverage.evidence.unchecked_applications, ["Portal"]);
+  assert.deepEqual(coverage.evidence.unreadable_applications, []);
+  assert.equal(coverage.evidence.linked_projects_by_application, null);
+  assert.equal(coverage.evidence.covered_applications, 1);
+  assert.equal(coverage.evidence.sca_agent_api_available, false);
+  assert.equal(coverage.evidence.sca_agent_api_status, 403);
+  assert.equal(unlicensed.rawData.sca_projects_by_application.collected, false);
+  assert.match(unlicensed.rawData.sca_projects_by_application.error, /^Not requested: the SCA Agent API was not readable/);
+
+  const projectsDenied = await assessVeracodeScaPosture(mockClient(healthyFixture(), { async getScaApplicationProjects() { throw forbidden("/srcclr/v3/applications/app-2/projects"); } }));
+  const denied = projectsDenied.findings.find((item) => item.id === "VERACODE-18");
+  assert.equal(denied.status, "warn");
+  assert.deepEqual(denied.evidence.unreadable_applications, ["Portal"], "a failed per-application request is unreadable, not uncovered");
+  assert.deepEqual(denied.evidence.uncovered_applications, [], "a readable Agent API with every list read leaves the uncovered set determined and empty");
+  assert.deepEqual(denied.evidence.unchecked_applications, []);
+  assert.equal(denied.evidence.sca_agent_api_status, null);
 });
 
 test("assessVeracodeScaPosture reads linked_projects from the documented LinkedProjects shape for agent-only tenants", async () => {
@@ -956,8 +983,59 @@ test("rule 1 corollary: unreadable library lists and an unavailable SCA Agent AP
   const agentless = await assessVeracodeScaPosture(mockClient(covered, { async listScaWorkspaces() { throw forbidden("/srcclr/v3/workspaces"); } }), {});
   const coverage = agentless.findings.find((item) => item.id === "VERACODE-18");
   assert.equal(coverage.status, "pass", "upload-and-scan SCA on every sampled application does not depend on the SCA Agent API");
-  assert.match(coverage.summary, /The SCA Agent API was unavailable \(403\), so linked agent projects were not checked; every sampled application is covered by upload-and-scan SCA alone/);
+  assert.match(coverage.summary, /Linked agent projects were not checked because the SCA Agent API workspace list was forbidden \(403\); every sampled application is covered by upload-and-scan SCA alone/);
   assert.equal(coverage.evidence.sca_agent_api_available, false);
+  assert.equal(coverage.evidence.sca_agent_api_status, 403);
+  assert.equal(coverage.evidence.uncovered_applications, null);
+  assert.deepEqual(coverage.evidence.unchecked_applications, []);
+});
+
+test("null standard: evidence counters derived from an unread inventory render null, never 0 or [] (VERACODE-07, 09, 10, 13, 15)", async () => {
+  const reject = (path) => async () => { throw forbidden(path); };
+  const findingOf = (result, number) => result.findings.find((item) => item.id === `VERACODE-${String(number).padStart(2, "0")}`);
+
+  const noApplications = mockClient(healthyFixture(), { listApplications: reject("/appsec/v1/applications") });
+  const policies = findingOf(await assessVeracodePolicyCompliance(noApplications, {}), 15);
+  assert.equal(policies.status, "warn");
+  assert.equal(policies.evidence.applications_on_custom_policies, null);
+  assert.equal(policies.evidence.applications_on_default_policies, null);
+  assert.match(policies.summary, /1 custom policies with finding rules exist and the assignment per application is unknown\. The application inventory was unreadable/);
+  assert.doesNotMatch(policies.summary, /all 0 applications/);
+  const teams = findingOf(await assessVeracodeAccessControls(noApplications, { now: NOW }), 7);
+  assert.equal(teams.evidence.applications_without_team, null);
+  assert.match(teams.summary, /The application inventory was unreadable, so application team assignment was not verified/);
+  const readApplications = findingOf(await assessVeracodePolicyCompliance(mockClient(healthyFixture()), {}), 15);
+  assert.equal(readApplications.evidence.applications_on_custom_policies, 2, "a read inventory keeps its real count");
+  assert.deepEqual(readApplications.evidence.applications_on_default_policies, []);
+
+  const noSandboxes = findingOf(await assessVeracodeScanCoverage(mockClient(healthyFixture(), { listSandboxes: reject("/appsec/v1/applications/x/sandboxes") }), { now: NOW }), 10);
+  assert.equal(noSandboxes.status, "manual");
+  assert.equal(noSandboxes.evidence.applications_with_sandboxes, null);
+  assert.equal(noSandboxes.evidence.applications_without_sandboxes, null);
+  assert.equal(noSandboxes.evidence.unreadable_applications, 2);
+
+  const noScanLists = findingOf(await assessVeracodeScanCoverage(mockClient(healthyFixture(), { listDynamicAnalysisScans: reject("/was/configservice/v1/analyses/x/scans") }), { now: NOW }), 13);
+  assert.equal(noScanLists.status, "manual");
+  for (const key of ["scan_coverage", "configured_scans", "unauthenticated_scans", "crawl_disabled_scans"]) assert.equal(noScanLists.evidence[key], null, key);
+  assert.deepEqual(noScanLists.evidence.unreadable, ["Portal DAST"]);
+
+  const noConfigurations = findingOf(await assessVeracodeScanCoverage(mockClient(healthyFixture(), { getDynamicScanConfiguration: reject("/was/configservice/v1/scans/x/configuration") }), { now: NOW }), 13);
+  assert.equal(noConfigurations.status, "manual");
+  assert.deepEqual(noConfigurations.evidence.scan_coverage, [{ analysis_id: "an-1", scans_inspected: 1, scans_seen: 1, scans_total: 1, scan_list_complete: true }], "the scan lists were read, so their coverage is real");
+  for (const key of ["configured_scans", "unauthenticated_scans", "crawl_disabled_scans"]) assert.equal(noConfigurations.evidence[key], null, key);
+
+  const emptyScans = findingOf(await assessVeracodeScanCoverage(mockClient({ ...healthyFixture(), scans: [] }), { now: NOW }), 13);
+  assert.equal(emptyScans.evidence.configured_scans, 0, "a readable but empty scan inventory keeps its real zero");
+  assert.deepEqual(emptyScans.evidence.unauthenticated_scans, []);
+  assert.deepEqual(emptyScans.evidence.scan_coverage, [{ analysis_id: "an-1", scans_inspected: 0, scans_seen: 0, scans_total: 0, scan_list_complete: true }]);
+
+  const noCredentials = findingOf(await assessVeracodeAccessControls(mockClient(healthyFixture(), { getUserApiCredentials: reject("/api/authn/v2/api_credentials/user_id/x") }), { now: NOW }), 9);
+  assert.equal(noCredentials.status, "manual");
+  assert.equal(noCredentials.evidence.credentials_readable, 0, "the count of records read is honest");
+  for (const key of ["credentials_current", "credentials_over_max_age", "credentials_over_max_age_count", "credentials_expired", "credentials_missing_dates"]) assert.equal(noCredentials.evidence[key], null, key);
+  const readCredentials = findingOf(await assessVeracodeAccessControls(mockClient(healthyFixture()), { now: NOW }), 9);
+  assert.equal(readCredentials.evidence.credentials_current, 1);
+  assert.deepEqual(readCredentials.evidence.credentials_over_max_age, []);
 });
 
 /** The healthy fixture served as HAL pages by path, so a real VeracodeApiClient walks it exactly as it would the vendor API. */

@@ -1274,7 +1274,9 @@ async function evaluateSandboxUsage(client: ClientLike, snapshot: ApplicationSna
   const withSandboxes = results.filter((item) => item.sandboxes.status === "ok" && item.sandboxes.value.items.length > 0).length;
   const raw = { sandboxes_by_application: Object.fromEntries(results.map((item) => [item.guid, rawSurface(item.sandboxes, (value) => value.items)])) };
   const caveats = [partialInventoryNote(list, "applications"), scopeNote(sampled.length, list.items.length, "applications")];
-  const evidence = { applications_sampled: sampled.length, applications_total: knownTotal(list), applications_with_sandboxes: withSandboxes, applications_without_sandboxes: withoutSandboxes.slice(0, 50), unreadable_applications: unreadable.length };
+  // With no sandbox list readable the counts are unknown, not 0.
+  const anyReadable = results.some((item) => item.sandboxes.status === "ok");
+  const evidence = { applications_sampled: sampled.length, applications_total: knownTotal(list), applications_with_sandboxes: anyReadable ? withSandboxes : null, applications_without_sandboxes: anyReadable ? withoutSandboxes.slice(0, 50) : null, unreadable_applications: unreadable.length };
   if (unreadable.length === results.length) {
     return { finding: manualFinding(10, "medium", unreadableReason("sandboxes", unreadable[0].sandboxes), ["Confirm sandbox usage per application in the Platform."], evidence), raw, errors };
   }
@@ -1329,6 +1331,7 @@ async function evaluateDynamicScanConfiguration(client: ClientLike, maxAnalyses:
   const scanCaveats: string[] = [];
   const scanCoverage: JsonRecord[] = [];
   let configured = 0;
+  let configurationsRequested = 0;
   const rawScansByAnalysis: JsonRecord = {};
   const rawScans: JsonRecord[] = [];
   for (const analysis of sampled) {
@@ -1348,6 +1351,7 @@ async function evaluateDynamicScanConfiguration(client: ClientLike, maxAnalyses:
     scanCoverage.push({ analysis_id: analysisId, scans_inspected: inspected.length, scans_seen: scans.value.items.length, scans_total: scans.value.totalElements ?? null, scan_list_complete: scans.value.complete });
     for (const scan of inspected) {
       const scanId = asString(scan.scan_id) ?? "";
+      configurationsRequested += 1;
       const configuration = await surface(() => client.getDynamicScanConfiguration(scanId));
       errors.push(...surfaceErrors(`dynamic scan configuration ${scanId}`, configuration));
       const label = `${analysisLabel}:${scrubUrlValue(asString(scan.target_url) ?? scanId)}`;
@@ -1365,11 +1369,22 @@ async function evaluateDynamicScanConfiguration(client: ClientLike, maxAnalyses:
     }
   }
   const caveats = [partialInventoryNote(analyses.value, "analyses"), scopeNote(sampled.length, analyses.value.items.length, "analyses"), ...scanCaveats, unreadable.length > 0 ? `${unreadable.length} scan configurations were unreadable.` : undefined];
-  const evidence = { analyses_seen: analyses.value.items.length, analyses_sampled: sampled.length, scan_coverage: scanCoverage.slice(0, 50), configured_scans: configured, unauthenticated_scans: unauthenticated.slice(0, 50), crawl_disabled_scans: crawlDisabled.slice(0, 50), unreadable: unreadable.slice(0, 50) };
   // No readable scan list means no configuration request was issued, so the list carries a marker rather than [].
   const scanListsUnreadable = sampled.length > 0 && scanCoverage.length === 0;
+  // The configuration counts are unknown, not 0 or [], when no scan list was readable or every requested configuration failed; a readable but empty scan inventory keeps its real zeros.
+  const configurationsRead = configured + unauthenticated.length + crawlDisabled.length;
+  const configurationsUnknown = scanListsUnreadable || (configurationsRequested > 0 && configurationsRead === 0);
+  const evidence = {
+    analyses_seen: analyses.value.items.length,
+    analyses_sampled: sampled.length,
+    scan_coverage: scanListsUnreadable ? null : scanCoverage.slice(0, 50),
+    configured_scans: configurationsUnknown ? null : configured,
+    unauthenticated_scans: configurationsUnknown ? null : unauthenticated.slice(0, 50),
+    crawl_disabled_scans: configurationsUnknown ? null : crawlDisabled.slice(0, 50),
+    unreadable: unreadable.slice(0, 50),
+  };
   const raw = { analyses: analyses.value.items, scans_by_analysis: rawScansByAnalysis, scan_configurations: scanListsUnreadable ? notAttempted("no scan list was readable, so no scan configuration was requested.") : rawScans };
-  if (configured === 0 && unauthenticated.length === 0 && crawlDisabled.length === 0) {
+  if (configurationsRead === 0) {
     return { finding: manualFinding(13, "medium", "No Dynamic Analysis scan configuration could be read, so authentication and crawl settings are unknown.", manualEvidence, evidence), raw, errors };
   }
   if (unauthenticated.length > 0 || crawlDisabled.length > 0) {
@@ -1507,15 +1522,18 @@ function evaluateCustomPolicies(snapshot: ApplicationSnapshot, policies: Surface
       else appsOnDefaultPolicies.push(applicationName(app));
     }
   }
+  const applicationsRead = snapshot.applications.status === "ok";
   const caveats = [partialInventoryNote(policies.value, "policies"), snapshot.applications.status === "ok" ? partialInventoryNote(snapshot.applications.value, "applications") : "The application inventory was unreadable, so policy assignment per application was not verified."];
-  const evidence = { policies_seen: policies.value.items.length, custom_policies: customPolicies.length, custom_policies_without_finding_rules: customWithoutRules, custom_policies_without_grace_periods: customWithoutGrace, applications_on_default_policies: appsOnDefaultPolicies.slice(0, 50), applications_on_custom_policies: appsOnCustom };
+  // Per-application assignment counts come from the application inventory: null, never 0 or [], when it was not read.
+  const evidence = { policies_seen: policies.value.items.length, custom_policies: customPolicies.length, custom_policies_without_finding_rules: customWithoutRules, custom_policies_without_grace_periods: customWithoutGrace, applications_on_default_policies: applicationsRead ? appsOnDefaultPolicies.slice(0, 50) : null, applications_on_custom_policies: applicationsRead ? appsOnCustom : null };
   if (customPolicies.length === 0) {
     return finding(15, "high", "fail", joinNotes(`None of the ${policies.value.items.length} policies is a customer-defined (CUSTOMER type) policy, so applications rely on Veracode default policies.`, ...caveats), evidence);
   }
   if (appsOnDefaultPolicies.length > 0 || customWithoutRules.length > 0) {
     return finding(15, "high", "warn", joinNotes(`${customPolicies.length} custom policies exist, but ${appsOnDefaultPolicies.length}/${appsSeen} applications are assigned only built-in or Veracode Level policies and ${customWithoutRules.length} custom policies define no finding rules.`, ...caveats), evidence);
   }
-  return finding(15, "high", limitedStatus("pass", caveats), joinNotes(`${customPolicies.length} custom policies with finding rules exist and all ${appsOnCustom} applications read are assigned a custom policy.`, ...caveats), evidence);
+  const assignmentNote = applicationsRead ? `all ${appsOnCustom} applications read are assigned a custom policy` : "the assignment per application is unknown";
+  return finding(15, "high", limitedStatus("pass", caveats), joinNotes(`${customPolicies.length} custom policies with finding rules exist and ${assignmentNote}.`, ...caveats), evidence);
 }
 
 function evaluateCollectionsPosture(snapshot: ApplicationSnapshot): VeracodeFinding {
@@ -1938,12 +1956,14 @@ async function evaluateScaWorkspaceCoverage(client: ClientLike, snapshot: Applic
   const blocker = applicationInventoryBlocker(18, "medium", snapshot, ["Map each application with third-party dependencies to an SCA workspace or upload-and-scan SCA."]);
   if (blocker) return { finding: blocker, raw: { sca_projects_by_application: notAttempted("the application inventory was not readable, so no linked project list was requested.") }, errors: [] };
   const scaBlocker = scaUnavailableFinding(18, "medium", workspaces, ["Map each application to an SCA workspace or confirm upload-and-scan SCA is enabled."]);
+  const scaAgentNote = scaBlocker ? scaAgentUnavailableCause(workspaces) : undefined;
   const list = (snapshot.applications as { value: HalListResult }).value;
   const sampled = list.items.slice(0, maxApplications);
   const errors: string[] = [];
   const covered: string[] = [];
   const uncovered: string[] = [];
   const unreadable: string[] = [];
+  const unchecked: string[] = [];
   const rawProjects: JsonRecord = {};
   const linkedProjectsByApplication: JsonRecord = {};
   for (const app of sampled) {
@@ -1953,7 +1973,8 @@ async function evaluateScaWorkspaceCoverage(client: ClientLike, snapshot: Applic
       continue;
     }
     if (scaBlocker) {
-      uncovered.push(applicationName(app));
+      // No linked project list is requested while the SCA Agent API is unreadable, so the application is unchecked, never uncovered.
+      unchecked.push(applicationName(app));
       continue;
     }
     const projects = await surface(() => client.getScaApplicationProjects(guid));
@@ -1973,20 +1994,41 @@ async function evaluateScaWorkspaceCoverage(client: ClientLike, snapshot: Applic
     else uncovered.push(applicationName(app));
   }
   const caveats = [partialInventoryNote(list, "applications"), scopeNote(sampled.length, list.items.length, "applications"), unreadable.length > 0 ? `${unreadable.length} linked project lists were unreadable.` : undefined];
-  const evidence = { applications_sampled: sampled.length, covered_applications: covered.length, uncovered_applications: uncovered.slice(0, 50), unreadable_applications: unreadable.slice(0, 50), linked_projects_by_application: linkedProjectsByApplication, sca_agent_api_available: !scaBlocker };
-  // With the SCA Agent API unreadable no project list is requested, so the snapshot carries a marker rather than an empty map.
+  // With the SCA Agent API unreadable no project list is requested: the uncovered set and the linked project map were never determined, so they render null and the snapshot carries a marker rather than an empty map.
+  const evidence = {
+    applications_sampled: sampled.length,
+    covered_applications: covered.length,
+    uncovered_applications: scaBlocker ? null : uncovered.slice(0, 50),
+    unreadable_applications: unreadable.slice(0, 50),
+    unchecked_applications: unchecked.slice(0, 50),
+    linked_projects_by_application: scaBlocker ? null : linkedProjectsByApplication,
+    sca_agent_api_available: !scaBlocker,
+    sca_agent_api_status: workspaces.status === "error" ? workspaces.statusCode ?? null : null,
+  };
   const raw = { sca_projects_by_application: scaBlocker ? notAttempted("the SCA Agent API was not readable, so no linked project list was requested.") : rawProjects };
   if (scaBlocker && covered.length === 0) {
     return { finding: { ...scaBlocker, evidence: { ...scaBlocker.evidence, ...evidence } }, raw, errors };
   }
+  if (unchecked.length > 0) {
+    return { finding: finding(18, "medium", "warn", joinNotes(`${unchecked.length}/${sampled.length} sampled applications have no upload-and-scan SCA and their linked SCA agent projects were not checked because ${scaAgentNote}, so their coverage is unknown.`, ...caveats), evidence), raw, errors };
+  }
   if (uncovered.length > 0) {
-    return { finding: finding(18, "medium", "warn", joinNotes(`${uncovered.length}/${sampled.length} sampled applications have neither upload-and-scan SCA enabled nor a linked SCA agent project.`, scaBlocker ? "The SCA Agent API was unavailable, so linked agent projects could not be checked." : undefined, ...caveats), evidence), raw, errors };
+    return { finding: finding(18, "medium", "warn", joinNotes(`${uncovered.length}/${sampled.length} sampled applications have neither upload-and-scan SCA enabled nor a linked SCA agent project.`, ...caveats), evidence), raw, errors };
   }
   if (covered.length === 0) {
     return { finding: manualFinding(18, "medium", "No application could be evaluated for SCA coverage.", ["Map each application to an SCA workspace."], evidence), raw, errors };
   }
-  const scaAgentNote = scaBlocker ? `The SCA Agent API was unavailable (${workspaces.status === "error" ? `${workspaces.statusCode ?? "error"}` : "no workspaces"}), so linked agent projects were not checked; every sampled application is covered by upload-and-scan SCA alone.` : undefined;
-  return { finding: finding(18, "medium", limitedStatus("pass", caveats), joinNotes(`All ${covered.length} sampled applications have upload-and-scan SCA enabled or a linked SCA agent project (linked_projects from the SCA Agent API).`, scaAgentNote, ...caveats), evidence), raw, errors };
+  const agentlessNote = scaAgentNote ? `Linked agent projects were not checked because ${scaAgentNote}; every sampled application is covered by upload-and-scan SCA alone.` : undefined;
+  return { finding: finding(18, "medium", limitedStatus("pass", caveats), joinNotes(`All ${covered.length} sampled applications have upload-and-scan SCA enabled or a linked SCA agent project (linked_projects from the SCA Agent API).`, agentlessNote, ...caveats), evidence), raw, errors };
+}
+
+/** Names the observed cause when the SCA Agent API workspace list could not be used: its own status code, or the empty inventory. */
+function scaAgentUnavailableCause(workspaces: Surface<HalListResult>): string {
+  if (workspaces.status === "error") {
+    if (isForbidden(workspaces)) return `the SCA Agent API workspace list was forbidden (${workspaces.statusCode})`;
+    return workspaces.statusCode ? `the SCA Agent API workspace list returned an error (${workspaces.statusCode})` : "the SCA Agent API workspace list could not be read";
+  }
+  return "the SCA Agent API returned zero workspaces";
 }
 
 export async function assessVeracodeScaPosture(
@@ -2076,10 +2118,12 @@ function evaluateTeamAccess(snapshot: IdentitySnapshot, maxUnrestricted: number)
   if (snapshot.roles.value.items.length === 0) return manualFinding(7, "high", "The roles endpoint returned zero roles, which cannot be a complete inventory because Veracode ships built-in roles; the empty list is treated as unverifiable rather than compliant.", manualEvidence);
   const unrestrictedRoles = new Set(snapshot.roles.value.items.filter((role) => asBoolean(role.ignore_team_restrictions) === true).map((role) => asString(role.role_name) ?? ""));
   const unrestrictedUsers = snapshot.users.value.items.filter((user) => isActiveHuman(user) && userRoleNames(user).some((role) => unrestrictedRoles.has(role))).map(userLabel);
+  const applicationsRead = snapshot.applications.status === "ok";
   const appsWithoutTeams = snapshot.applications.status === "ok" ? snapshot.applications.value.items.filter((app) => applicationTeams(app).length === 0).map(applicationName) : [];
   const teamScopeNotes = snapshot.teams.value.notes ?? [];
   const caveats = [partialInventoryNote(snapshot.users.value, "users"), partialInventoryNote(snapshot.roles.value, "roles"), partialInventoryNote(snapshot.teams.value, "teams"), ...teamScopeNotes, snapshot.applications.status === "ok" ? partialInventoryNote(snapshot.applications.value, "applications") : "The application inventory was unreadable, so application team assignment was not verified."];
-  const evidence = { users_seen: snapshot.users.value.items.length, roles_seen: snapshot.roles.value.items.length, roles_complete: snapshot.roles.value.complete, teams_seen: snapshot.teams.value.items.length, teams_scope: teamScopeNotes.length > 0 ? "member_only" : "organization", team_unrestricted_roles: [...unrestrictedRoles].filter(Boolean), users_with_all_application_access: unrestrictedUsers.slice(0, 100), users_with_all_application_access_count: unrestrictedUsers.length, applications_without_team: appsWithoutTeams.slice(0, 50), max_unrestricted_users: maxUnrestricted };
+  // The team assignment list comes from the application inventory: null, never [], when it was not read.
+  const evidence = { users_seen: snapshot.users.value.items.length, roles_seen: snapshot.roles.value.items.length, roles_complete: snapshot.roles.value.complete, teams_seen: snapshot.teams.value.items.length, teams_scope: teamScopeNotes.length > 0 ? "member_only" : "organization", team_unrestricted_roles: [...unrestrictedRoles].filter(Boolean), users_with_all_application_access: unrestrictedUsers.slice(0, 100), users_with_all_application_access_count: unrestrictedUsers.length, applications_without_team: applicationsRead ? appsWithoutTeams.slice(0, 50) : null, max_unrestricted_users: maxUnrestricted };
   if (snapshot.teams.value.items.length === 0 && teamScopeNotes.length > 0) {
     return manualFinding(7, "high", joinNotes("The organization-wide team list was refused and the API user is a member of no teams, so team scoping could not be verified.", ...teamScopeNotes), manualEvidence, evidence);
   }
@@ -2155,7 +2199,9 @@ async function evaluateApiCredentials(client: ClientLike, snapshot: IdentitySnap
     else current += 1;
   }
   const caveats = [partialInventoryNote(snapshot.users.value, "users"), scopeNote(sampled.length, apiUsers.length, "API accounts"), unreadable.length > 0 ? `${unreadable.length} credential records were unreadable.` : undefined];
-  const evidence = { api_accounts: apiUsers.length, api_accounts_sampled: sampled.length, credentials_readable: readable.length, credentials_current: current, credentials_over_max_age: aged.slice(0, 100), credentials_over_max_age_count: aged.length, credentials_expired: expired.slice(0, 50), credentials_missing_dates: missingDates.slice(0, 50), max_credential_age_days: maxAgeDays };
+  // With no credential record readable the age classification is unknown, not 0 or []; credentials_readable stays the honest count of records read.
+  const anyReadable = readable.length > 0;
+  const evidence = { api_accounts: apiUsers.length, api_accounts_sampled: sampled.length, credentials_readable: readable.length, credentials_current: anyReadable ? current : null, credentials_over_max_age: anyReadable ? aged.slice(0, 100) : null, credentials_over_max_age_count: anyReadable ? aged.length : null, credentials_expired: anyReadable ? expired.slice(0, 50) : null, credentials_missing_dates: anyReadable ? missingDates.slice(0, 50) : null, max_credential_age_days: maxAgeDays };
   if (readable.length === 0) {
     return { finding: manualFinding(9, "high", unreadableReason("api_credentials (Administrator role)", unreadable[0].credentials), manualEvidence, evidence), raw: { api_credentials_by_user: rawCredentials }, errors };
   }
