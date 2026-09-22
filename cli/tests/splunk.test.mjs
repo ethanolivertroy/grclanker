@@ -1167,6 +1167,48 @@ test("rule 10: list() reports a full last page without paging.total, the item ca
   assert.match(byId(stuckAccess, "SPLUNK-AC-07").summary, /3 of 50 roles/);
 });
 
+test("rule 10: the repeated-page check fingerprints entries by id or by name within acl.app and acl.owner, so same-named namespaced objects across a page boundary are not a repeated page", async () => {
+  const savedSearchesPath = "/servicesNS/-/-/saved/searches";
+  const search = (app, owner, id) => ({ name: "Errors", content: { is_scheduled: 0, disabled: 0, search: "index=main error" }, acl: { app, owner, sharing: "app", perms: { read: ["*"], write: ["admin"] } }, ...(id ? { id } : {}) });
+  const page = (entries, total) => ({ entry: entries, paging: { total, perPage: 1, offset: 0 } });
+
+  const namespaced = new SplunkApiClient(sampleConfig(), { fetchImpl: pagedFetch(HARDENED, savedSearchesPath, (offset) => page(offset === 0 ? [search("search", "admin")] : [search("itsi", "svc_itsi")], 2)), retryDelayMs: 0, pageSize: 1 });
+  const twoNamespaces = await namespaced.listSavedSearches();
+  assert.equal(twoNamespaces.truncated, false, "a same-named saved search in another app and owner is a different object, not a repeated page");
+  assert.equal(twoNamespaces.totalKnown, true);
+  assert.equal(twoNamespaces.entries.length, 2);
+  assert.deepEqual(twoNamespaces.entries.map((item) => item.acl.app), ["search", "itsi"]);
+  const access = await assessSplunkAccessControl(namespaced);
+  assert.equal(byId(access, "SPLUNK-AC-11").status, "pass", byId(access, "SPLUNK-AC-11").summary);
+  assert.doesNotMatch(byId(access, "SPLUNK-AC-11").summary, /before the walk stopped|partially retrieved/);
+  const platform = await assessSplunkPlatformHardening(namespaced);
+  assert.equal(byId(platform, "SPLUNK-PLAT-22").status, "pass", byId(platform, "SPLUNK-PLAT-22").summary);
+
+  const byOwner = new SplunkApiClient(sampleConfig(), { fetchImpl: pagedFetch(HARDENED, savedSearchesPath, (offset) => page(offset === 0 ? [search("search", "admin")] : [search("search", "analyst")], 2)), retryDelayMs: 0, pageSize: 1 });
+  const twoOwners = await byOwner.listSavedSearches();
+  assert.equal(twoOwners.truncated, false, "the same name and app under another owner is a different object");
+  assert.equal(twoOwners.entries.length, 2);
+
+  const byId_ = new SplunkApiClient(sampleConfig(), { fetchImpl: pagedFetch(HARDENED, savedSearchesPath, (offset) => page(offset === 0 ? [search("search", "admin", "https://splunk.example.com:8089/servicesNS/admin/search/saved/searches/Errors")] : [search("search", "admin", "https://splunk.example.com:8089/servicesNS/nobody/search/saved/searches/Errors")], 2)), retryDelayMs: 0, pageSize: 1 });
+  const twoIds = await byId_.listSavedSearches();
+  assert.equal(twoIds.truncated, false, "distinct entry ids are distinct objects even with the same name, app, and owner");
+  assert.equal(twoIds.entries.length, 2);
+  assert.ok(twoIds.entries.every((item) => item.id === undefined), "the entry id is used for the fingerprint only and is not kept");
+
+  const repeatingByName = new SplunkApiClient(sampleConfig(), { fetchImpl: pagedFetch(HARDENED, savedSearchesPath, () => page([search("search", "admin")], 50)), retryDelayMs: 0, pageSize: 1 });
+  const stuckByName = await repeatingByName.listSavedSearches();
+  assert.equal(stuckByName.truncated, true, "the same name, app, and owner on two consecutive pages is a repeated page");
+  assert.equal(stuckByName.entries.length, 1);
+
+  const repeatingById = new SplunkApiClient(sampleConfig(), { fetchImpl: pagedFetch(HARDENED, savedSearchesPath, () => page([search("search", "admin", "https://splunk.example.com:8089/servicesNS/admin/search/saved/searches/Errors")], 50)), retryDelayMs: 0, pageSize: 1 });
+  const stuckById = await repeatingById.listSavedSearches();
+  assert.equal(stuckById.truncated, true, "the same entry id on two consecutive pages is a repeated page");
+  assert.equal(stuckById.entries.length, 1);
+  const stuckAccess = await assessSplunkAccessControl(repeatingById);
+  assert.equal(byId(stuckAccess, "SPLUNK-AC-11").status, "warn");
+  assert.match(byId(stuckAccess, "SPLUNK-AC-11").summary, /1 of 50 saved searches/);
+});
+
 test("rule 10: acsListAll reports a repeated ACS page as truncated and an unrecognized payload as unreadable, and control 16 never passes on either", async () => {
   const cloud = { ...HARDENED, "/services/server/info": [entry("server-info", { version: "9.3.2411", product_type: "splunk_cloud", instance_type: "cloud" })] };
   const config = { stack: "acme-stack", acsToken: "acs-jwt" };

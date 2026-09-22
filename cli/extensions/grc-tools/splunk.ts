@@ -923,6 +923,20 @@ function parseEntry(value: unknown): SplunkEntry | undefined {
   };
 }
 
+/**
+ * Identifies a raw entry for the repeated-page check before parseEntry drops
+ * the id: the entry id splunkd returns is unique, and without one the name is
+ * unique only within its `acl.app` and `acl.owner` namespace, so two saved
+ * searches that share a name across apps or owners are different objects,
+ * not a repeated page. The id is never kept, so the persisted shape does not
+ * change.
+ */
+function entryFingerprint(value: unknown): string {
+  const object = asObject(value) ?? {};
+  const acl = asObject(object.acl) ?? {};
+  return asString(object.id) ?? JSON.stringify([asString(object.name) ?? "", asString(acl.app) ?? null, asString(acl.owner) ?? null]);
+}
+
 function isRetryableStatus(status: number): boolean {
   return status === 429 || status >= 500;
 }
@@ -1084,6 +1098,9 @@ export class SplunkApiClient {
    * (item cap, a page repeating the previous one because the server ignored
    * offset, or a full page with no paging.total) is reported as truncated so
    * consumers demote; `totalKnown` is false whenever splunkd omitted the total.
+   * A page repeats only when the same entries (by id, or by name within
+   * acl.app and acl.owner) come back, so namespaced objects that share a name
+   * across a page boundary do not read as a repeated page.
    */
   async list(path: string, query: JsonRecord = {}): Promise<SplunkListResult> {
     const entries: SplunkEntry[] = [];
@@ -1093,9 +1110,10 @@ export class SplunkApiClient {
     const cappedResult = (): SplunkListResult => ({ entries, total: Math.max(total ?? 0, entries.length), truncated: true, totalKnown: total !== undefined });
     for (;;) {
       const payload = await this.getJson(path, { ...query, count: this.pageSize, offset });
-      const pageEntries = asArray(payload.entry).map(parseEntry).filter((item): item is SplunkEntry => Boolean(item));
+      const rawEntries = asArray(payload.entry).filter((item) => asObject(item) !== undefined);
+      const pageEntries = rawEntries.map(parseEntry).filter((item): item is SplunkEntry => Boolean(item));
       total = asNumber(asObject(payload.paging)?.total) ?? total;
-      const pageKey = pageEntries.map((item) => item.name).join("\n");
+      const pageKey = rawEntries.map(entryFingerprint).join("\n");
       if (pageEntries.length > 0 && pageKey === previousPage) return cappedResult();
       previousPage = pageKey;
       entries.push(...pageEntries);
