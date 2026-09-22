@@ -3,16 +3,25 @@ slug: "gcp-sec-inspector"
 name: "GCP Security Inspector"
 vendor: "Google Cloud"
 category: "cloud-infrastructure"
-language: "go"
-status: "spec-only"
+language: "typescript"
+status: "implemented"
 version: "1.0"
-last_updated: "2026-03-29"
-source_repo: "https://github.com/hackIDLE/gcp-sec-inspector"
+last_updated: "2026-09-21"
+source_repo: "https://github.com/hackIDLE/grclanker"
 ---
 
 # gcp-sec-inspector
 
 Multi-framework security compliance audit tool for Google Cloud Platform.
+
+## grclanker implementation
+
+The spec ships as native grclanker tools in `cli/extensions/grc-tools/gcp.ts` with tests in `cli/tests/gcp.test.mjs` and the integration guide at `src/content/docs/docs/integrations/gcp.md`:
+
+- `gcp_check_access`, `gcp_assess_identity`, `gcp_assess_logging_detection`, `gcp_assess_org_guardrails`, `gcp_assess_data_protection`, `gcp_assess_network_security`, `gcp_export_audit_bundle`
+- Authentication: explicit token, service account key or ADC JSON via `GCP_CREDENTIALS_FILE` or `GOOGLE_APPLICATION_CREDENTIALS` (OAuth 2.0 JWT bearer flow signed with `node:crypto`), the ADC well-known file, then `gcloud auth print-access-token`; `GCP_ORG_ID` is accepted as an alias of `GCP_ORGANIZATION_ID`
+- Verdicts follow the grclanker verdict-safety rules: forbidden, errored, empty, API-disabled, or partial inventories never pass
+- Live smoke: `npm --prefix cli run test:gcp:live`
 
 ## Overview
 
@@ -364,4 +373,38 @@ gcp-sec-inspector diff --baseline baseline.json --current current.json
 
 ## Status
 
-Not yet implemented. Spec only.
+Implemented in grclanker as of 2026-09-21 (TypeScript, `cli/extensions/grc-tools/gcp.ts`).
+
+### What shipped
+
+- 31 findings across five assess tools cover all 23 controls: `GCP-IAM-01..05`, `GCP-LOG-01..05`, `GCP-ORG-01..08`, `GCP-DATA-01..07`, `GCP-NET-01..06`. The finding-to-control map is in the integration guide's coverage table.
+- Multi-project scope: projects are enumerated with Cloud Asset Inventory `searchAllResources` under the organization, capped by `project_limit` (alias `max_projects`, default 20). A truncated inventory, a denied project, or a disabled API downgrades every dependent finding to `warn` or `manual` with seen and total counts.
+- Dependent inventories: every finding names the datasets it reads (`GCP_INVENTORIES`, one dataset name and endpoint per API surface). When any of them is unreadable (403, 401, or an error), fully or for one project, the finding drops below `pass` even if its primary inventory was complete: `manual` when the unreadable dataset is the one the finding scores, `warn` otherwise. The summary names the dataset and endpoint, `evidence.unreadable_inventories` carries each entry with its scope and error, and every count or list derived from the unreadable dataset is rendered as `null` rather than zero or empty, in finding evidence and in the assessment-level summaries alike, whether the dataset is the one the finding scores or a dependent one; summary sentences state the unreadable dataset instead of a zero-count clause. A table-driven test makes each of the 35 inventory surfaces unreadable in turn (fully, and for one of two projects where the read is per project), asserts that exactly the dependent findings demote, cross-checks the surfaces against `GCP_INVENTORIES`, fails on any request that matches no surface, and asserts the `null` rendering for every evidence field and summary counter that a source map ties to the denied surface.
+- Collection status: `evidence.truncated`, `denied_projects`, `unreachable_scopes`, and the summary-level `projects_truncated`, `sources_truncated`, and `findings_truncated` are three-valued. They are `null` whenever the scan they describe was denied or never ran and carry `false`, `0`, or `[]` only when that scan ran to completion, so no status says complete about a call that never happened. A read skipped because its upstream discovery failed (a per-project scan under a denied project inventory, an effective org policy read with no project, service account keys with no account list, perimeters with no access policy list or no organization ID, Security Command Center without an organization ID) is recorded with `status: "not_collected"`, names the upstream call and the status that call returned, and never attributes an HTTP status to the call it did not make. `core_data/` writes a `{status, dataset, endpoint, scope, error, data: null}` marker in place of a denied or never-collected dataset, never `[]`, and lists the same entry in the snapshot's `unreadable_inventories`. The sweep records the HTTP status of every request and asserts, on every row (each surface at 403, 401, and 500, fully and per project, plus a zero-scope row with no configured project and a denied project inventory) and on the exported bundle, that every completeness claim, every attributed status code, every `was not called` clause, and every marker matches the recorder.
+- OS Login (`GCP-ORG-06`) is scored from project and instance metadata on every existing resource. `constraints/compute.requireOsLogin` protects newly created projects and rejects future disabling but never enables OS Login on existing projects or instances, so an enforced constraint is reported in the summary and is never sufficient for `pass`; a project without `enable-oslogin=TRUE` in `commonInstanceMetadata` or an instance overriding it fails and is named.
+- Export bundle: `core_data/` (projected snapshots: identifiers plus the documented fields each control reads, never whole resources, metadata values, labels, key material, or other free-form values; a status marker, never `[]`, for a dataset that was denied or not collected), `analysis/` (`findings.json`, `category_summaries.json`, per-category JSON and markdown, with evidence limited to derived values), `compliance/` (`executive_summary.md`, `unified_compliance_matrix.md`, `frameworks/<framework>.md` for the eight frameworks in the mapping table), `QUICK_REFERENCE.md`, `_errors.log` only when collection partially failed, and a zip named after the allocated directory (`-2`, `-3` on rerun).
+- Pagination: every list follows `nextPageToken` to completion; a list cut short by its item cap, a repeating cursor, or the 250-page budget is recorded as truncated and downgrades its findings to `warn` with `N seen, total unknown`. This applies to every paginated surface, including service accounts, log sinks, log buckets, Security Command Center sources, access policies, and service perimeters.
+- Error text: a response body is never copied into an error string. A failed request is described by its HTTP status, method, and endpoint plus the documented `google.rpc.Status` fields (`error.status`, a scrubbed `error.message`, `error.details[]` `@type` name and `reason`) or, for any other body, `non-JSON error body (<content type>; N bytes)`; the token endpoint is described by the RFC 6749 `error` and scrubbed `error_description` fields the same way. Every error string is created through `GcpApiError` (or `describeError` for values thrown outside the client) and scrubbed there by the exported `scrubErrorText`: configured credentials and the exchanged token by exact match, `Bearer` and `Basic` values, `ya29.`, `AIza`, `GOCSPX-`, `1//`, and JWT shapes, `Cookie` and `Set-Cookie` values, credential name-value pairs quoted or not, embedded URL userinfo, query, and fragment, and a long-token rule (16+ characters with a digit or mixed case, not made of words: snake_case, camelCase, and PascalCase identifiers without digits such as `PreconditionFailure` survive) that is on for error text and off for data values. The bundle writer scrubs every file again, `.md` files and `_errors.log` included, without the long-token rule. Any cap on the message runs after the scrub, and `shortError` abbreviates a status-less note at a word boundary so an endpoint is quoted whole or not at all.
+- Credential loaders: `parseGcpCredentialsJson` and the file reader read and parse in two guarded steps and never interpolate the parser or filesystem message (V8 quotes the ten characters around a fault, which for a malformed `private_key` line is key material). A parse failure throws `invalid JSON in <path>` (a position only when the runtime attaches a structured one), a read failure `unable to read <path> (<code>)` with the code validated against `^E[A-Z0-9_]{1,30}$`, and an unsupported `type` is echoed only when it has an identifier shape; every loader message passes the scrub with the long-token rule off, since a path is a data value.
+- Tests: a four-fixture false-pass self-check (all endpoints 403, all lists empty, partial inventory including Compute `unreachables[]` and `warning.code` `UNREACHABLE` scopes, fully compliant organization) plus regression tests for the credential chain, JWT signing, encoded query strings, pagination (cap exits, repeating cursors, page budget), violation detection, bundle layout, bundle secret hygiene (a seeded secret in every collected object must be absent from every bundle file and zip entry, and a shapeless configured token plus an `AIza` key planted in the organization display name must be absent from every file and zip entry, which fails when the writer's scrub is bypassed), credential-loader hygiene (a malformed service account file whose `private_key` line carries a fake PEM header and `ya29.` token, with `JSON.parse` as the positive control quoting the key body, plus EISDIR, ENOENT, and non-standard thrown values, asserting the fixed descriptions only), error-body hygiene (a unit test on `scrubErrorText` for every shape and for benign operator text, a `GcpApiError` test for every body class, and a walk that fails every `GCP_INVENTORIES` surface with four canary-bearing body shapes and asserts no canary reaches any finding, summary, `unreadable_inventories` entry, `core_data` marker, errors array, bundle file, zip entry, or thrown error while each failure is disclosed with status, endpoint, and content type and length or the documented fields), the per-inventory sweep with its request recorder (null rendering, status-field and attributed-status matching, snapshot markers, the zero-scope row), a `core_data/` walk of a bundle exported under a denied project inventory (a marker for every denied or blocked dataset and no `[]` where the compliant bundle has rows), a project-only fixture (organization, Security Command Center, and perimeter reads not attempted and rendered `not_collected`), and secure output paths.
+- Compute-backed findings read the documented partial-view signals (`unreachables[]`, per-scope `UNREACHABLE` warnings), match SSL policies by full global or regional path, count IPv6 access configs as external addresses, read both `logConfig.enable` and `enableFlowLogs`, judge NAT coverage per subnetwork from `sourceSubnetworkIpRangesToNat`, evaluate every Binary Authorization rule map, and include `H2C` backends.
+- Log sink coverage (`GCP-LOG-03`) counts only sinks whose documented `LogSink.disabled` flag is not true; disabled sinks export nothing, so a project whose sinks are all disabled fails and the disabled sinks are named in evidence.
+
+### Deviations from this spec, following the official documentation
+
+- Cloud Asset Inventory `searchAllResources` and `searchAllIamPolicies` are `GET` requests with query parameters (`scope`, `query`, `assetTypes`, `pageSize` max 500, `pageToken`), not `POST` as listed in the API table.
+- Cloud KMS keys are inventoried through Cloud Asset Inventory `assets.list` with `assetTypes=cloudkms.googleapis.com/CryptoKey` and `contentType=RESOURCE` instead of per-location `keyRings.list` and `cryptoKeys.list`, because the KMS list APIs require an explicit location per call.
+- API keys are read from the API Keys API (`apikeys.googleapis.com/v2`), not IAM as the control table states.
+- Cloud NAT, firewall, subnetwork, SSL policy, backend service, disk, and instance data come from the Compute Engine API (`list` and `aggregatedList`) rather than Cloud Asset Inventory, so the read works with only the Compute API enabled in the target project.
+- Security Command Center is visibility only (`GCP-LOG-05`); it never scores a control. The `assets`, `findings:group`, `notificationConfigs`, custom module, and compliance report endpoints are not called.
+- Effective organization policies are read with the v1 `projects.getEffectiveOrgPolicy` method (`booleanPolicy.enforced`, `listPolicy`) against the first inventoried project; the v2 `policies` endpoints are not used.
+- The tool is read-only: the `export --format scc` write-back, HTML dashboard, CKL and OSCAL output, and baseline diffing described under CLI Interface and Output Formats are not implemented.
+
+### What remains (deferrals)
+
+- Control 2: unused permission analysis (Policy Intelligence recommender) is not evaluated; only owner/editor-style bindings are scored.
+- Control 4: unused firewall rule detection (Firewall Insights) is not evaluated.
+- Control 8: attestor configuration is not evaluated; only the default admission rule is scored.
+- Control 11: OS Login 2FA enforcement is not evaluated.
+- Folder-scoped inventory (`GCP_FOLDER_ID`) is not supported; scope is an organization or a single project.
+- Object ACLs on non-uniform buckets are not inspected; public exposure relies on IAM policy search.
