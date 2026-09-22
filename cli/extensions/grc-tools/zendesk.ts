@@ -381,8 +381,14 @@ export function resolveZendeskConfiguration(
   }
   sourceChain.push(`subdomain:${subdomain.source}`);
 
+  // The credential set from the higher-ranked source wins (arguments over environment
+  // over config file), so a token left in a config file never displaces the credentials
+  // the environment or the caller supplied; on a tie OAuth is preferred.
+  const sourceRank = (source?: string): number => (source === "arguments" ? 3 : source === "environment" ? 2 : source === "config-file" ? 1 : 0);
+  const apiTokenRank = apiToken.value && email.value ? Math.min(sourceRank(apiToken.source), sourceRank(email.source)) : 0;
+  const oauthRank = oauthToken.value ? sourceRank(oauthToken.source) : 0;
   let authMode: ZendeskAuthMode;
-  if (oauthToken.value && !(asString(input.api_token) && asString(input.email))) {
+  if (oauthToken.value && oauthRank >= apiTokenRank) {
     authMode = "oauth";
     sourceChain.push(`oauth-token:${oauthToken.source}`);
   } else if (apiToken.value && email.value) {

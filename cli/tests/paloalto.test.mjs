@@ -396,6 +396,35 @@ test("resolvePaloaltoConfiguration allows a single product and rejects incomplet
   assert.throws(() => resolvePaloaltoConfiguration({ config_file: "/nonexistent/paloalto.json" }, {}), /Unable to read Palo Alto config file \/nonexistent\/paloalto\.json \(ENOENT\)/);
 });
 
+test("round 7(b): environment credentials survive an argument overlay that carries unrelated or undefined keys, and the source chain names the environment", () => {
+  const configFile = join(createTempBase("grclanker-paloalto-env-overlay-"), "paloalto.json");
+  writeFileSync(configFile, JSON.stringify({ PRISMA_SECRET_KEY: "fileQ7wR2tY8uI3oP5aS", PANOS_API_KEY: "fileL4kJ9hG2fD6sA8zX" }));
+  const env = {
+    PALOALTO_CONFIG_FILE: configFile,
+    PRISMA_ACCESS_KEY_ID: "envK3mN8bV5cX2zL7qW4",
+    PRISMA_SECRET_KEY: "envS9dF2gH6jK4lZ8xC1",
+    PANOS_HOST: "fw1.example.com",
+    PANOS_API_KEY: "envP5rT8yU2iO7pA3sD6",
+  };
+  // The overlay a tool builds from optional arguments: one unrelated argument plus the
+  // credential keys present but undefined, as a spread of an unfilled schema produces.
+  const overlay = { timeout_seconds: 45, prisma_access_key_id: undefined, prisma_secret_key: undefined, panos_api_key: undefined, panos_hosts: undefined, config_file: undefined };
+  const config = resolvePaloaltoConfiguration(overlay, env);
+  assert.equal(config.prisma.accessKeyId, env.PRISMA_ACCESS_KEY_ID);
+  assert.equal(config.prisma.secretKey, env.PRISMA_SECRET_KEY, "the environment value beats the config file and is not erased by the undefined argument");
+  assert.equal(config.panos[0].apiKey, env.PANOS_API_KEY);
+  assert.equal(config.timeoutMs, 45_000, "the unrelated argument still applies");
+  for (const source of ["environment-prisma-access-key", "environment-prisma-secret-key", "environment-panos-host", "environment-panos-api-key"]) {
+    assert.ok(config.sourceChain.includes(source), `${source} in ${config.sourceChain.join(", ")}`);
+  }
+  assert.ok(!config.sourceChain.some((source) => source.startsWith("arguments-")), config.sourceChain.join(", "));
+  assert.ok(!config.sourceChain.some((source) => source.startsWith("config-file-")), config.sourceChain.join(", "));
+  // With nothing in the environment the same overlay falls through to the file.
+  const fromFile = resolvePaloaltoConfiguration(overlay, { PALOALTO_CONFIG_FILE: configFile, PRISMA_ACCESS_KEY_ID: env.PRISMA_ACCESS_KEY_ID, PANOS_HOST: "fw1.example.com" });
+  assert.equal(fromFile.prisma.secretKey, "fileQ7wR2tY8uI3oP5aS");
+  assert.ok(fromFile.sourceChain.includes("config-file-prisma-secret-key"));
+});
+
 // Config loader canaries: no two share an 8-character window, so any fragment a parser
 // quotes from the file is attributable to one fixture. The short canary keeps the JSON
 // short file at 20 characters, within the size at which JSON.parse quotes the whole source.

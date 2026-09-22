@@ -447,6 +447,32 @@ test("resolveZendeskConfiguration prefers env over config file and falls back to
   assert.equal(fromHome.authMode, "api_token");
 });
 
+test("round 7(b): environment credentials survive an argument overlay that carries unrelated or undefined keys, and the source chain names the environment", () => {
+  const base = createTempBase("grclanker-zendesk-env-overlay-");
+  const configPath = join(base, "config.json");
+  writeFileSync(configPath, JSON.stringify({ subdomain: "file-sub", email: "file@example.com", api_token: "fileW3eR7tY1uI5oP9aS", oauth_token: "fileZ6xC2vB8nM4kL7jH" }));
+  const env = { ZENDESK_CONFIG_FILE: configPath, ZENDESK_SUBDOMAIN: "env-sub", ZENDESK_EMAIL: "env@example.com", ZENDESK_API_TOKEN: "envT8yU3iO6pA1sD4fG9" };
+  // The overlay a tool builds from optional arguments: one unrelated argument plus the
+  // credential keys present but undefined, as a spread of an unfilled schema produces.
+  const overlay = { timeout_seconds: 21, subdomain: undefined, email: undefined, api_token: undefined, oauth_token: undefined, config_file: undefined };
+  const config = resolveZendeskConfiguration(overlay, env, base);
+  assert.equal(config.authMode, "api_token", "the environment's API token wins over the file's OAuth token");
+  assert.equal(config.apiToken, env.ZENDESK_API_TOKEN, "the environment value beats the config file and is not erased by the undefined argument");
+  assert.equal(config.email, "env@example.com");
+  assert.equal(config.subdomain, "env-sub");
+  assert.equal(config.timeoutMs, 21_000, "the unrelated argument still applies");
+  for (const source of ["subdomain:environment", "api-token:environment", "email:environment"]) {
+    assert.ok(config.sourceChain.includes(source), `${source} in ${config.sourceChain.join(", ")}`);
+  }
+  assert.ok(!config.sourceChain.some((source) => source.endsWith(":arguments")), config.sourceChain.join(", "));
+
+  const oauthEnv = { ZENDESK_CONFIG_FILE: configPath, ZENDESK_SUBDOMAIN: "env-sub", ZENDESK_OAUTH_TOKEN: "envQ2wE5rT8yU1iO4pA7" };
+  const oauth = resolveZendeskConfiguration(overlay, oauthEnv, base);
+  assert.equal(oauth.authMode, "oauth");
+  assert.equal(oauth.oauthToken, oauthEnv.ZENDESK_OAUTH_TOKEN);
+  assert.ok(oauth.sourceChain.includes("oauth-token:environment"), oauth.sourceChain.join(", "));
+});
+
 test("resolveZendeskConfiguration selects auth mode and rejects incomplete credentials", () => {
   const base = createTempBase("grclanker-zendesk-config-");
   const both = resolveZendeskConfiguration({}, { ZENDESK_SUBDOMAIN: "acme", ZENDESK_EMAIL: "a@example.com", ZENDESK_API_TOKEN: "tok", ZENDESK_OAUTH_TOKEN: "oauth" }, base);

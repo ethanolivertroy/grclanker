@@ -254,6 +254,25 @@ test("resolveTenableConfiguration treats non-cloud URLs as Tenable Security Cent
   assert.throws(() => resolveTenableConfiguration({ url: "https://sc.example.internal", config_file: EMPTY_CONFIG_FILE }, EMPTY_ENV), /needs API keys/);
 });
 
+test("round 7(b): environment credentials survive an argument overlay that carries unrelated or undefined keys, and the source chain names the environment", () => {
+  const configPath = join(mkdtempSync(join(tmpdir(), "tenable-env-overlay-")), "config.yaml");
+  writeFileSync(configPath, "access_key: fileA7sD2fG9hJ4kL1zX\nsecret_key: fileM3nB8vC5xZ2qW6eR\nurl: https://fedcloud.tenable.com\n");
+  const env = { ...EMPTY_ENV, TENABLE_CONFIG_FILE: configPath, TENABLE_ACCESS_KEY: "envH5jK8lZ3xC6vB2nM9", TENABLE_SECRET_KEY: "envR4tY7uI1oP8aS3dF6" };
+  // The overlay a tool builds from optional arguments: one unrelated argument plus the
+  // credential keys present but undefined, as a spread of an unfilled schema produces.
+  const overlay = { timeout_seconds: 33, access_key: undefined, secret_key: undefined, url: undefined, sc_url: undefined, config_file: undefined };
+  const config = resolveTenableConfiguration(overlay, env);
+  assert.equal(config.vm.accessKey, env.TENABLE_ACCESS_KEY);
+  assert.equal(config.vm.secretKey, env.TENABLE_SECRET_KEY, "the environment value beats the config file and is not erased by the undefined argument");
+  assert.equal(config.vm.baseUrl, "https://fedcloud.tenable.com", "the file's URL still applies where the environment is silent");
+  assert.equal(config.timeoutMs, 33_000, "the unrelated argument still applies");
+  for (const source of ["environment-TENABLE_ACCESS_KEY", "environment-TENABLE_SECRET_KEY"]) {
+    assert.ok(config.sourceChain.includes(source), `${source} in ${config.sourceChain.join(", ")}`);
+  }
+  assert.ok(!config.sourceChain.some((source) => source.startsWith("arguments-")), config.sourceChain.join(", "));
+  assert.ok(!config.sourceChain.some((source) => /^config-file-(access_key|secret_key)$/.test(source)), config.sourceChain.join(", "));
+});
+
 // Config loader canaries: no two share an 8-character window, so any fragment a parser
 // quotes from the file is attributable to one fixture. The short canary keeps the JSON
 // short file at 20 characters, within the size at which JSON.parse quotes the whole source.
