@@ -1729,6 +1729,11 @@ type AccessClient = IdentityClient & ApiGatewayClient & RuntimeClient & AuditCli
 export type MulesoftBundleClient = AccessClient;
 
 interface Collected<T> {
+  /**
+   * The source name, with the scope of a per-item read in parentheses (`secret_groups (Production)`).
+   * A `name:scope` shape would put a credential-named label such as `secret_groups` before a colon,
+   * which the redaction pass reads as a credential pair and eats along with the scope.
+   */
   label: string;
   value: T;
   error?: string;
@@ -2171,12 +2176,12 @@ export async function assessMulesoftIdentityAccess(
     const id = roleGroupId(roleGroup);
     const name = roleGroupName(roleGroup);
     if (!id) {
-      roleGroupDetails.push({ roleGroup, roles: { ...failedSource(`role_group_roles:${name}`, "role group has no id"), value: toPage([]) } });
+      roleGroupDetails.push({ roleGroup, roles: { ...failedSource(`role_group_roles (${name})`, "role group has no id"), value: toPage([]) } });
       continue;
     }
-    const roles = await collectPage(`role_group_roles:${name}`, () => client.listRoleGroupRoles(id), errors);
+    const roles = await collectPage(`role_group_roles (${name})`, () => client.listRoleGroupRoles(id), errors);
     const users = isOrgAdminRoleGroup(roleGroup, roles.value.items)
-      ? await collectPage(`role_group_users:${name}`, () => client.listRoleGroupUsers(id), errors)
+      ? await collectPage(`role_group_users (${name})`, () => client.listRoleGroupUsers(id), errors)
       : undefined;
     roleGroupDetails.push({ roleGroup, roles, users });
   }
@@ -2188,8 +2193,8 @@ export async function assessMulesoftIdentityAccess(
     const clientId = asString(app.client_id);
     const name = connectedAppName(app);
     const scopes = clientId
-      ? await collectPage(`connected_app_scopes:${name}`, () => client.listConnectedApplicationScopes(clientId), errors)
-      : { ...failedSource(`connected_app_scopes:${name}`, "connected app has no client_id"), value: toPage([]) };
+      ? await collectPage(`connected_app_scopes (${name})`, () => client.listConnectedApplicationScopes(clientId), errors)
+      : { ...failedSource(`connected_app_scopes (${name})`, "connected app has no client_id"), value: toPage([]) };
     connectedAppScopes.push({ app, scopes });
   }
   const scopesSource = mergeSources("connected_app_scopes", connectedAppScopes.map((item) => item.scopes), connectedApps);
@@ -2725,7 +2730,7 @@ export async function assessMulesoftApiGateway(
     const environmentId = asString(environment.id);
     const label = environmentLabel(environment);
     if (!environmentId) {
-      apiSources.push({ ...failedSource(`api_manager_apis:${label}`, "environment has no id"), value: toPage([]) });
+      apiSources.push({ ...failedSource(`api_manager_apis (${label})`, "environment has no id"), value: toPage([]) });
       continue;
     }
     const remaining = apiLimit - apiRecords.length;
@@ -2733,15 +2738,15 @@ export async function assessMulesoftApiGateway(
       apiPartialNotes.push(`the API limit of ${apiLimit} was reached before sampling ${label}`);
       continue;
     }
-    const apis = await collectPage(`api_manager_apis:${label}`, () => client.listManagedApis(environmentId, remaining), errors);
+    const apis = await collectPage(`api_manager_apis (${label})`, () => client.listManagedApis(environmentId, remaining), errors);
     apiSources.push(apis);
     const note = truncationNote(`${label} API instance`, apis.value);
     if (note) apiPartialNotes.push(note);
     for (const api of apis.value.items) {
       const apiId = asString(api.id);
       const policies: Collected<JsonRecord[]> = apiId
-        ? await collect<JsonRecord[]>(`api_policies:${apiLabel(api)}`, [], () => client.listApiPolicies(environmentId, apiId), errors)
-        : { label: `api_policies:${apiLabel(api)}`, value: [], error: "API instance has no id" };
+        ? await collect<JsonRecord[]>(`api_policies (${apiLabel(api)})`, [], () => client.listApiPolicies(environmentId, apiId), errors)
+        : { label: `api_policies (${apiLabel(api)})`, value: [], error: "API instance has no id" };
       apiRecords.push({ environment, api, policies });
     }
   }
@@ -3113,10 +3118,10 @@ export async function assessMulesoftRuntimeInfrastructure(
     const environmentId = asString(environment.id);
     const label = environmentLabel(environment);
     if (!environmentId) {
-      applicationSources.push({ label: `cloudhub_applications:${label}`, value: [], error: "environment has no id" });
+      applicationSources.push({ label: `cloudhub_applications (${label})`, value: [], error: "environment has no id" });
       continue;
     }
-    const environmentApplications = await collect<JsonRecord[]>(`cloudhub_applications:${label}`, [], () => client.listCloudhubApplications(environmentId), errors);
+    const environmentApplications = await collect<JsonRecord[]>(`cloudhub_applications (${label})`, [], () => client.listCloudhubApplications(environmentId), errors);
     applicationSources.push(environmentApplications);
     for (const application of environmentApplications.value) {
       if (applications.length >= applicationLimit) {
@@ -3126,29 +3131,29 @@ export async function assessMulesoftRuntimeInfrastructure(
       applications.push({ environment, application });
     }
 
-    const environmentServers = await collect<JsonRecord[]>(`hybrid_servers:${label}`, [], () => client.listHybridServers(environmentId), errors);
+    const environmentServers = await collect<JsonRecord[]>(`hybrid_servers (${label})`, [], () => client.listHybridServers(environmentId), errors);
     serverSources.push(environmentServers);
     servers.push(...environmentServers.value.map((server) => ({ environment, server })));
 
-    const regions = await collect<JsonRecord[]>(`mq_regions:${label}`, [], () => client.listMqRegions(environmentId), errors);
+    const regions = await collect<JsonRecord[]>(`mq_regions (${label})`, [], () => client.listMqRegions(environmentId), errors);
     mqRegionSources.push(regions);
     for (const region of regions.value) {
       const regionId = asString(region.regionId) ?? asString(region.id);
       if (!regionId) {
-        mqQueueSources.push({ label: `mq_queues:${label}`, value: [], error: "MQ region has no id" });
+        mqQueueSources.push({ label: `mq_queues (${label})`, value: [], error: "MQ region has no id" });
         continue;
       }
-      const queues = await collect<JsonRecord[]>(`mq_queues:${label}:${regionId}`, [], () => client.listMqQueues(environmentId, regionId), errors);
+      const queues = await collect<JsonRecord[]>(`mq_queues (${label}, ${regionId})`, [], () => client.listMqQueues(environmentId, regionId), errors);
       mqQueueSources.push(queues);
       mqInventory.push({ environment: label, region: regionId, queues: queues.value });
     }
     if (regions.value.length > 0) {
-      const clients = await collect<JsonRecord[]>(`mq_clients:${label}`, [], () => client.listMqClients(environmentId), errors);
+      const clients = await collect<JsonRecord[]>(`mq_clients (${label})`, [], () => client.listMqClients(environmentId), errors);
       mqClientSources.push(clients);
       mqClients.push({ environment: label, clients: clients.value });
     }
 
-    const secretGroups = await collect<JsonRecord[]>(`secret_groups:${label}`, [], () => client.listSecretGroups(environmentId), errors);
+    const secretGroups = await collect<JsonRecord[]>(`secret_groups (${label})`, [], () => client.listSecretGroups(environmentId), errors);
     secretGroupSources.push(secretGroups);
     secretGroupsByEnvironment.push({ environment, secretGroups: secretGroups.value });
   }
@@ -3167,8 +3172,8 @@ export async function assessMulesoftRuntimeInfrastructure(
     const vpcId = asString(vpc.id);
     const vpcName = asString(vpc.name) ?? vpcId ?? "vpc";
     const detail: Collected<JsonRecord> = vpcId
-      ? await collect<JsonRecord>(`vpc:${vpcName}`, {}, () => client.getVpc(vpcId), errors)
-      : { label: `vpc:${vpcName}`, value: {}, error: "VPC has no id" };
+      ? await collect<JsonRecord>(`vpc (${vpcName})`, {}, () => client.getVpc(vpcId), errors)
+      : { label: `vpc (${vpcName})`, value: {}, error: "VPC has no id" };
     vpcDetails.push(detail);
     vpcs.push({ ...vpc, ...detail.value });
   }
@@ -3187,7 +3192,7 @@ export async function assessMulesoftRuntimeInfrastructure(
       loadBalancers.push(summary);
       continue;
     }
-    const detail = await collect<JsonRecord>(`load_balancer:${loadBalancerLabel(summary)}`, {}, () => client.getLoadBalancer(vpcId, loadBalancerId), errors);
+    const detail = await collect<JsonRecord>(`load_balancer (${loadBalancerLabel(summary)})`, {}, () => client.getLoadBalancer(vpcId, loadBalancerId), errors);
     loadBalancerDetails.push(detail);
     loadBalancers.push({ ...summary, ...detail.value });
   }
@@ -3210,7 +3215,7 @@ export async function assessMulesoftRuntimeInfrastructure(
         certificateProbes.push({ loadBalancer, sslEndpoint: target.label, servername: target.servername, certificate });
       } catch (error) {
         const message = errorMessage(error);
-        errors.push(`certificate_probe:${host}${target.servername === host ? "" : `:${target.servername}`}: ${message}`);
+        errors.push(`certificate_probe (${host}${target.servername === host ? "" : `, ${target.servername}`}): ${message}`);
         certificateProbes.push({ loadBalancer, sslEndpoint: target.label, servername: target.servername, error: message });
       }
     }
@@ -3778,7 +3783,7 @@ export async function assessMulesoftAuditMonitoring(
     const environmentId = asString(environment.id);
     const label = environmentLabel(environment);
     if (!environmentId) {
-      const missing = { label: `alerts:${label}`, value: [] as JsonRecord[], error: "environment has no id" };
+      const missing = { label: `alerts (${label})`, value: [] as JsonRecord[], error: "environment has no id" };
       alertCoverage.push({
         environment: label,
         cloudhubAlerts: missing,
@@ -3791,9 +3796,9 @@ export async function assessMulesoftAuditMonitoring(
       });
       continue;
     }
-    const cloudhubAlerts = await collect<JsonRecord[]>(`cloudhub_alerts:${label}`, [], () => client.listCloudhubAlerts(environmentId), errors);
-    const hybridAlerts = await collect<JsonRecord[]>(`hybrid_alerts:${label}`, [], () => client.listHybridAlerts(environmentId), errors);
-    const applications = await collect<JsonRecord[]>(`cloudhub_applications:${label}`, [], () => client.listCloudhubApplications(environmentId), errors);
+    const cloudhubAlerts = await collect<JsonRecord[]>(`cloudhub_alerts (${label})`, [], () => client.listCloudhubAlerts(environmentId), errors);
+    const hybridAlerts = await collect<JsonRecord[]>(`hybrid_alerts (${label})`, [], () => client.listHybridAlerts(environmentId), errors);
+    const applications = await collect<JsonRecord[]>(`cloudhub_applications (${label})`, [], () => client.listCloudhubApplications(environmentId), errors);
     const allAlerts = [...cloudhubAlerts.value, ...hybridAlerts.value];
     const enabledAlerts = allAlerts.filter((alert) => alertState(alert) === "enabled");
     const unknownStateAlerts = allAlerts.filter((alert) => alertState(alert) === "unknown");

@@ -35,6 +35,7 @@ import {
 import { getRegisteredToolSummaries } from "../dist/pi/tool-catalog.js";
 import { assertSecretFragmentsAbsent, readBundleFiles, readZipEntries } from "./helpers/bundle-contents.mjs";
 import { CONFIG_CANARIES, assertConfigLoaderMatrix, configLoaderCases } from "./helpers/config-loader-matrix.mjs";
+import { assertFixedTextsSurvive, collectFixedTexts, logLines } from "./helpers/fixed-text-survival.mjs";
 import { assertFragmentsAbsent, assertPlantedValuesWellFormed } from "./helpers/planted-values.mjs";
 import { assertScrubBoundary } from "./helpers/scrub-boundary-matrix.mjs";
 
@@ -1005,7 +1006,7 @@ test("assessMulesoftRuntimeInfrastructure marks VPC controls manual and certific
   assert.equal(statusOf(result, "MULESOFT-RT-14"), "manual");
   assert.equal(statusOf(result, "MULESOFT-RT-16"), "manual");
   assert.match(findingById(result, "MULESOFT-RT-16").summary, /Runtime Manager > Load Balancers/);
-  assert.ok(result.errors.some((error) => error.startsWith("certificate_probe:prod-dlb.lb.anypointdns.net")));
+  assert.ok(result.errors.some((error) => error.startsWith("certificate_probe (prod-dlb.lb.anypointdns.net")));
 });
 
 test("assessMulesoftAuditMonitoring passes when audit logs flow and production alerts cover applications", async () => {
@@ -3015,8 +3016,8 @@ test("review round items 7 and 8: denied Anypoint datasets are written as not-co
       const partial = JSON.parse(files.get("core_data/alerts.json"));
       assert.equal(partial.collected, "partial");
       assert.equal(partial.dataset, "alerts");
-      assert.deepEqual(partial.failed_reads.map((read) => [read.read, read.status]), [["cloudhub_alerts:Production", 403]]);
-      assertNotCollectedMarker(partial.items[0].cloudhub_alerts, "cloudhub_alerts:Production", "alerts[].cloudhub_alerts");
+      assert.deepEqual(partial.failed_reads.map((read) => [read.read, read.status]), [["cloudhub_alerts (Production)", 403]]);
+      assertNotCollectedMarker(partial.items[0].cloudhub_alerts, "cloudhub_alerts (Production)", "alerts[].cloudhub_alerts");
       assert.deepEqual(partial.items[0].runtime_manager_alerts, []);
       const zipped = JSON.parse(readZipEntries(result.zipPath).get("core_data/alerts.json"));
       assert.equal(zipped.collected, "partial");
@@ -3106,7 +3107,7 @@ test("review round items 7 and 8: denied Anypoint datasets are written as not-co
   assert.equal(rolesDenied.summary.role_groups, 2);
   assert.equal(rolesDenied.summary.organization_admins, null);
   for (const group of rolesDenied.snapshots.role_groups) {
-    assertNotCollectedMarker(group.roles, `role_group_roles:${group.role_group.name}`, `role_groups[].roles for ${group.role_group.name}`);
+    assertNotCollectedMarker(group.roles, `role_group_roles (${group.role_group.name})`, `role_groups[].roles for ${group.role_group.name}`);
     assert.equal(group.roles_truncated, null);
   }
   for (const id of ["MULESOFT-IAM-03", "MULESOFT-IAM-04", "MULESOFT-IAM-05"]) {
@@ -3116,7 +3117,7 @@ test("review round items 7 and 8: denied Anypoint datasets are written as not-co
 
   // Denied connected app scopes: the app record stays and its scopes become a marker; IAM-18 is manual with no partial view.
   const scopesDenied = await assessMulesoftIdentityAccess(healthyIdentityClient({ listConnectedApplicationScopes: forbidden(`/accounts/api/organizations/${ORG_ID}/connectedApplications/app-1/scopes`) }));
-  assertNotCollectedMarker(scopesDenied.snapshots.connected_applications[0].scopes, "connected_app_scopes:Auditor", "connected_applications[].scopes");
+  assertNotCollectedMarker(scopesDenied.snapshots.connected_applications[0].scopes, "connected_app_scopes (Auditor)", "connected_applications[].scopes");
   assert.equal(scopesDenied.snapshots.connected_applications[0].client_id, "app-1");
   assert.equal(statusOf(scopesDenied, "MULESOFT-IAM-18"), "manual");
   assert.equal(findingById(scopesDenied, "MULESOFT-IAM-18").evidence.partial_view, null);
@@ -3126,7 +3127,7 @@ test("review round items 7 and 8: denied Anypoint datasets are written as not-co
   assert.equal(policiesDenied.snapshots.api_manager_apis.length, 2);
   for (const record of policiesDenied.snapshots.api_manager_apis) {
     assert.equal(record.policies.collected, false, `${record.environment}: policies are a marker`);
-    assert.match(record.policies.dataset, /^api_policies:/);
+    assert.match(record.policies.dataset, /^api_policies \(/);
     assert.equal(record.policies.status, 403);
     assert.equal(record.api.assetName, "orders-api", "the API record itself is kept");
   }
@@ -3276,6 +3277,10 @@ function msCanaryFetch(failing) {
       if (failing.flavor === "html") {
         return new Response(msCanaryHtml(), { status: 502, statusText: "Bad Gateway", headers: { "content-type": "text/html; charset=utf-8" } });
       }
+      // Credential-free failure flavors for the fixed-text harvest: a plain proxy page, an unrecognized JSON shape, a documented error.
+      if (failing.flavor === "plainHtml") return new Response("<html><head><title>502 Bad Gateway</title></head><body>upstream unavailable</body></html>", { status: 502, statusText: "Bad Gateway", headers: { "content-type": "text/html; charset=utf-8" } });
+      if (failing.flavor === "opaqueJson") return jsonResponse({ unexpected: { shape: true } }, { status: 403, statusText: "Forbidden" });
+      if (failing.flavor === "plainJson") return jsonResponse({ message: "Forbidden: insufficient permissions for this organization" }, { status: 403, statusText: "Forbidden" });
       return jsonResponse(
         { message: `Upstream failed; retry at ${MS_CANARY_URL} with Bearer ${MS_CANARY.bearer} (JSESSIONID=${MS_CANARY.cookie}; x-api-key: ${MS_CANARY.apiKey})` },
         { status: 403, statusText: "Forbidden" },
@@ -3371,7 +3376,158 @@ test("planted values self-check: every canary and planted secret is alphanumeric
   ]);
 });
 
-test("scrub boundary: bare name-shaped values stay, carriers and registered secrets (in every encoded form) and real token shapes go, on redactSecretText, in MulesoftApiError, and on client.redact", () => {
+function msCanaryClient(failing, config = sampleConfig()) {
+  return new MulesoftApiClient(config, {
+    fetchImpl: msCanaryFetch(failing),
+    sleepImpl: async () => {},
+    maxRetries: 0,
+    certificateProbe: async (host, _timeoutMs, servername = host) => ({ host, servername, subject: "*.example.com", issuer: "Example CA", validFrom: isoDaysFromNow(-100), validTo: isoDaysFromNow(200), authorized: true }),
+  });
+}
+
+async function msAssessAll(client) {
+  return [
+    await assessMulesoftIdentityAccess(client),
+    await assessMulesoftApiGateway(client),
+    await assessMulesoftRuntimeInfrastructure(client),
+    await assessMulesoftAuditMonitoring(client),
+  ];
+}
+
+/** Every Anypoint path the client requests, with the organization, environment, and item ids the fixtures use. */
+const MULESOFT_PATHS = [
+  "/accounts/api/v2/oauth2/token",
+  "/accounts/login",
+  "/accounts/api/me",
+  `/accounts/api/organizations/${ORG_ID}`,
+  `/accounts/api/organizations/${ORG_ID}/hierarchy`,
+  `/accounts/api/organizations/${ORG_ID}/identityProviders`,
+  `/accounts/api/organizations/${ORG_ID}/identityProviderSettings`,
+  `/accounts/api/organizations/${ORG_ID}/members`,
+  `/accounts/api/organizations/${ORG_ID}/users`,
+  `/accounts/api/organizations/${ORG_ID}/rolegroups`,
+  `/accounts/api/organizations/${ORG_ID}/rolegroups/rg-admin/roles`,
+  `/accounts/api/organizations/${ORG_ID}/rolegroups/rg-admin/users`,
+  `/accounts/api/organizations/${ORG_ID}/environments`,
+  `/accounts/api/organizations/${ORG_ID}/connectedApplications`,
+  `/accounts/api/organizations/${ORG_ID}/connectedApplications/app-1/scopes`,
+  `/apimanager/api/v1/organizations/${ORG_ID}/environments/env-prod/apis`,
+  `/apimanager/api/v1/organizations/${ORG_ID}/environments/env-prod/apis/101/policies`,
+  "/exchange/api/v2/assets/search",
+  "/cloudhub/api/v2/applications",
+  "/cloudhub/api/v2/alerts",
+  `/cloudhub/api/organizations/${ORG_ID}/vpcs`,
+  `/cloudhub/api/organizations/${ORG_ID}/vpcs/vpc-1`,
+  `/cloudhub/api/organizations/${ORG_ID}/loadbalancers`,
+  `/cloudhub/api/organizations/${ORG_ID}/vpcs/vpc-1/loadbalancers/lb-1`,
+  "/hybrid/api/v1/servers",
+  "/hybrid/api/v1/alerts",
+  `/audit/v2/organizations/${ORG_ID}/platforms`,
+  `/audit/v2/organizations/${ORG_ID}/retentionSettings`,
+  `/audit/v2/organizations/${ORG_ID}/query`,
+  `/mq/admin/api/v1/organizations/${ORG_ID}/environments/env-prod/regions`,
+  `/mq/admin/api/v1/organizations/${ORG_ID}/environments/env-prod/regions/us-east-1/destinations/queues`,
+  `/mq/admin/api/v1/organizations/${ORG_ID}/environments/env-prod/clients`,
+  `/secrets-manager/api/v1/organizations/${ORG_ID}/environments/env-prod/secretGroups`,
+];
+
+const MS_SAMPLE_DENIAL = `Anypoint request failed (403 Forbidden) for GET /accounts/api/organizations/${ORG_ID}/members: Forbidden: insufficient permissions for this organization`;
+const MS_SAMPLE_ROLE_GROUP_DENIAL = `Anypoint request failed (403 Forbidden) for GET /accounts/api/organizations/${ORG_ID}/rolegroups: Forbidden: insufficient permissions for this organization`;
+const MS_SAMPLE_ENVIRONMENTS_DENIAL = `Anypoint request failed (403 Forbidden) for GET /accounts/api/organizations/${ORG_ID}/environments: Forbidden: insufficient permissions for this organization`;
+const MS_SAMPLE_HIERARCHY_DENIAL = `Anypoint request failed (403 Forbidden) for GET /accounts/api/organizations/${ORG_ID}/hierarchy: Forbidden: insufficient permissions for this organization`;
+const MS_SAMPLE_ROLE_GROUPS_SKIP = `the role_groups read failed (${MS_SAMPLE_ROLE_GROUP_DENIAL}), so there were no role_groups to scope the role_group_roles read`;
+const MS_SAMPLE_APIS_SKIP = `the environments read failed (${MS_SAMPLE_ENVIRONMENTS_DENIAL}), so there were no environments to scope the api_manager_apis read`;
+
+/**
+ * The standing fixed texts MuleSoft emits, rendered with sample paths and the snake_case source labels the
+ * collectors use: the config loader read and parse messages, the credential and organization requirements,
+ * the non-JSON and opaque-body notes, the documented-error rendering, the timeout and transport wordings,
+ * the TLS probe texts, the source states (complete, partial, unread, not requested), the skipped-read
+ * reasons naming the parent, the merged-read wordings, the failure descriptions with their HTTP cause, and
+ * the corollary summary templates. Each must come back from redactSecretText, MulesoftApiError's pass, and
+ * client.redact unchanged.
+ */
+const MULESOFT_FIXED_TEXTS = [
+  "Unable to read MuleSoft config file /home/svc/.config/mulesoft-sec-inspector/config.toml (ENOENT)",
+  "Unable to read MuleSoft config file /tmp/grclanker-mulesoft-loader-Ab3dEf/directory.toml (EISDIR)",
+  "Unable to read MuleSoft config file /tmp/grclanker-mulesoft-loader-Ab3dEf/locked.toml (EACCES)",
+  "Unable to read MuleSoft config file /tmp/grclanker-mulesoft-loader-Ab3dEf/config.toml",
+  "Unable to parse MuleSoft config file: invalid TOML in /tmp/grclanker-mulesoft-loader-Ab3dEf/config.toml",
+  "ANYPOINT_ORG_ID, an organization_id argument, or org_id in config.toml is required.",
+  "Provide connected app credentials (ANYPOINT_CLIENT_ID and ANYPOINT_CLIENT_SECRET), username and password (ANYPOINT_USERNAME and ANYPOINT_PASSWORD), a pre-issued ANYPOINT_TOKEN, or the matching arguments or config.toml keys.",
+  'Unsupported MuleSoft control plane "apac". Use us, eu, or gov, or pass base_url.',
+  "Anypoint response was not valid JSON.",
+  `Anypoint request failed (502 Bad Gateway) for GET /accounts/api/organizations/${ORG_ID}/members: non-JSON body (text/html, 5120 bytes)`,
+  "Anypoint request failed (403 Forbidden) for GET /cloudhub/api/v2/applications: JSON body without a recognized error field (application/json, 27 bytes)",
+  "Anypoint request failed (429 Too Many Requests) for GET /exchange/api/v2/assets/search: non-JSON body (text/plain, 12 bytes)",
+  "Anypoint request failed (503 Service Unavailable) for GET /hybrid/api/v1/servers: non-JSON body (unknown content type, 64 bytes)",
+  "Anypoint request failed (502 Bad Gateway) for POST /accounts/api/v2/oauth2/token: non-JSON body (text/html, 5120 bytes)",
+  "Anypoint request failed (401 Unauthorized) for POST /accounts/api/v2/oauth2/token: Client authentication failed; invalid_client",
+  "Anypoint request failed (401 Unauthorized) for POST /accounts/login: Unauthorized",
+  `Anypoint request to GET /accounts/api/organizations/${ORG_ID}/members timed out after 30000 ms`,
+  "Anypoint request failed for GET /hybrid/api/v1/servers: fetch failed",
+  "TLS probe of prod-dlb.lb.anypointdns.net timed out.",
+  "Load balancer did not expose a domain to probe.",
+  MS_SAMPLE_DENIAL,
+  `unread (${MS_SAMPLE_DENIAL})`,
+  "complete (12 items)",
+  "complete (1 item)",
+  "complete (0 items)",
+  "complete",
+  "partial (200 of 2500 total)",
+  "partial (200 of an unknown total)",
+  `not requested (${MS_SAMPLE_ROLE_GROUPS_SKIP})`,
+  `not requested (the api_manager_apis read was not requested (${MS_SAMPLE_APIS_SKIP}), so there were no api_manager_apis to scope the api_policies read)`,
+  `not requested: ${MS_SAMPLE_ROLE_GROUPS_SKIP}`,
+  `role_group_roles reads were requested only for the role_groups that were read (${MS_SAMPLE_ROLE_GROUP_DENIAL})`,
+  `2 of 2 reads failed (api_manager_apis (Production): Anypoint request failed (403 Forbidden) for GET /apimanager/api/v1/organizations/${ORG_ID}/environments/env-prod/apis: Forbidden; api_manager_apis (Sandbox): Anypoint request failed (403 Forbidden) for GET /apimanager/api/v1/organizations/${ORG_ID}/environments/env-sandbox/apis: Forbidden)`,
+  `members could not be read, the credential lacks permission (HTTP 403): ${MS_SAMPLE_DENIAL}`,
+  `audit_platforms could not be read, the endpoint is unavailable on this control plane or plan (HTTP 404): Anypoint request failed (404 Not Found) for GET /audit/v2/organizations/${ORG_ID}/platforms`,
+  "hybrid_servers could not be read, the read errored: Anypoint request failed for GET /hybrid/api/v1/servers: fetch failed",
+  `role_group_users was not requested because ${MS_SAMPLE_ROLE_GROUPS_SKIP}`,
+  `organization_hierarchy could not be read, the credential lacks permission (HTTP 403): ${MS_SAMPLE_HIERARCHY_DENIAL}, so it is unknown whether this organization is a business group with root settings and sibling groups outside the view`,
+  "the organization hierarchy did not expose isRoot, so it is unknown whether this organization is a business group with root settings and sibling groups outside the view",
+  `load_balancer_details could not be read, the credential lacks permission (HTTP 403): Anypoint request failed (403 Forbidden) for GET /cloudhub/api/organizations/${ORG_ID}/vpcs/vpc-1/loadbalancers/lb-1: Forbidden, so SSL endpoints carried only by the detail record were not probed`,
+  "Zero connected apps were returned for this organization. Zero apps is treated as manual rather than pass: confirm in Access Management > Connected Apps that no apps exist in child business groups either.",
+  "Zero CloudHub 1.0 applications were visible in 2 sampled environment(s). Zero applications is treated as manual: this tool inventories CloudHub 1.0 only, so if workloads run on CloudHub 2.0, Runtime Fabric, or hybrid servers, export their configuration from Runtime Manager.",
+];
+
+/** Addendum 7 must-keep table for MuleSoft: paths and sources, control planes and tenants, principals, finding ids, and the standing fixed texts. */
+function mulesoftKeepTable(sourceLabels) {
+  return {
+    paths: MULESOFT_PATHS,
+    tables: sourceLabels,
+    tenants: [
+      "anypoint.mulesoft.com",
+      "https://anypoint.mulesoft.com",
+      "eu1.anypoint.mulesoft.com",
+      "gov.anypoint.mulesoft.com",
+      "prod-dlb.lb.anypointdns.net",
+      // Anypoint organization and environment ids are canonical UUIDs.
+      "550e8400-e29b-41d4-a716-446655440000",
+      "Acme_Platform_Team",
+      "Production-US-East-2026",
+      "prod-us-east-2026",
+      "us-east-1",
+    ],
+    principals: [
+      "alice",
+      "bob.user@acme.example",
+      "svc-integration-2026",
+      "Organization Administrators",
+      "Organization Administrator",
+      "Auditor",
+      "app-1",
+      "mq-client-1",
+      "orders-api",
+      "orders-prod",
+    ],
+    findingIds: getMulesoftControlCatalog().map((definition) => definition.id),
+    fixedTexts: MULESOFT_FIXED_TEXTS,
+  };
+}
+
+test("scrub boundary: bare name-shaped values stay, carriers and registered secrets (in every encoded form) and real token shapes go, on redactSecretText, in MulesoftApiError, and on client.redact; the addendum 7 must-keep table survives in isolation and in sentences", async () => {
   const fetchImpl = async () => jsonResponse({});
   const mustKeep = [
     "Anypoint request failed (502 Bad Gateway) for /accounts/api/organizations/org-1/members: non-JSON body (text/html, 5120 bytes)",
@@ -3380,12 +3536,133 @@ test("scrub boundary: bare name-shaped values stay, carriers and registered secr
     "Unable to parse MuleSoft config file: invalid TOML in /tmp/grclanker-mulesoft-loader-Ab3dEf/config.toml at line 3",
     "environment Production-US-East-2026 and business group Acme_Platform_Team on control plane us",
   ];
+  const sourceLabels = [...new Set((await msAssessAll(healthyBundleClient())).flatMap((assessment) => Object.keys(assessment.summary.inventories)))];
+  const keepTable = mulesoftKeepTable(sourceLabels);
+  assert.equal(keepTable.findingIds.length, 25, "every MuleSoft finding id is in the table");
+  assert.ok(keepTable.findingIds.includes("MULESOFT-IAM-03"));
+  assert.ok(sourceLabels.length >= 20, `every source the four assessments name is in the table (${sourceLabels.length})`);
   // The client constructor is the registration path (rememberSecrets on the configured token).
   assertScrubBoundary({
     scrub: (text) => redactSecretText(text),
     registerSecret: (secret) => new MulesoftApiClient(sampleConfig({ token: secret }), { fetchImpl }),
     mustKeep,
+    keepTable,
   });
-  assertScrubBoundary({ scrub: (text) => new MulesoftApiError(502, text, "/x").message, mustKeep });
-  assertScrubBoundary({ scrub: (text) => new MulesoftApiClient(sampleConfig(), { fetchImpl }).redact(text), mustKeep });
+  assertScrubBoundary({ scrub: (text) => new MulesoftApiError(502, text, "/x").message, mustKeep, keepTable });
+  assertScrubBoundary({ scrub: (text) => new MulesoftApiClient(sampleConfig(), { fetchImpl }).redact(text), mustKeep, keepTable });
+});
+
+test("round 7 note 1: every fixed-text message MuleSoft emits (loader, opaque body, timeout, source states, skipped reads naming the parent, merged reads, failure causes, corollary summaries) comes back from every MuleSoft pass unchanged", async () => {
+  const texts = new Set(MULESOFT_FIXED_TEXTS);
+  const fetchImpl = async () => jsonResponse({});
+  const scrubs = {
+    redactSecretText: (text) => redactSecretText(text),
+    MulesoftApiError: (text) => new MulesoftApiError(502, text, "/x").message,
+    "client.redact": (text) => new MulesoftApiClient(sampleConfig(), { fetchImpl }).redact(text),
+  };
+  const harvest = async (client, config = sampleConfig()) => {
+    collectFixedTexts(await checkMulesoftAccess(client), texts);
+    collectFixedTexts(await msAssessAll(client), texts);
+    const exported = await exportMulesoftAuditBundle(client, config, createTempBase("grclanker-mulesoft-fixed-text-bundle-"));
+    const files = readBundleFiles(exported.outputDir);
+    for (const line of logLines(files.get("_errors.log"))) texts.add(line);
+    for (const [name, content] of files) {
+      if ((name.startsWith("analysis/") || name.startsWith("core_data/")) && name.endsWith(".json")) collectFixedTexts(JSON.parse(content), texts);
+    }
+  };
+
+  // The loader's own read and parse messages on real failing files, plus the required-organization message.
+  for (const item of configLoaderCases({ format: "toml", displayName: "MuleSoft", fileNoun: "config file", extension: ".toml" })) {
+    if (item.skip) continue;
+    assert.throws(() => resolveMulesoftConfiguration({ config_file: item.path }, {}), (error) => {
+      texts.add(error.message);
+      return true;
+    });
+  }
+  const scratch = createTempBase("grclanker-mulesoft-fixed-text-");
+  const emptyPath = join(scratch, "config.toml");
+  writeFileSync(emptyPath, "# no keys\n");
+  assert.throws(() => resolveMulesoftConfiguration({ config_file: emptyPath }, {}), (error) => {
+    texts.add(error.message);
+    return true;
+  });
+
+  // Every surface under three credential-free failure flavors (plain proxy page, unrecognized JSON shape, documented
+  // error): the access check, the four assessments, the analysis and core_data files, and the error log render the
+  // opaque-body notes, the unread and not requested states, the skipped-read reasons naming the parent, the merged
+  // read wordings, and the demotion templates on real paths.
+  for (const surface of MS_CANARY_SURFACES) {
+    for (const flavor of ["plainHtml", "opaqueJson", "plainJson"]) {
+      const config = sampleConfig({ authMode: "connected_app", clientId: "client-1", clientSecret: "connected-app-secret-value", token: undefined });
+      await harvest(msCanaryClient({ surface, flavor }, config), config);
+    }
+  }
+
+  // The mock clients: healthy and every read forbidden.
+  await harvest(healthyBundleClient());
+  await harvest(forbidAll(healthyBundleClient()));
+
+  // The timeout wording through the real client.
+  const timingOut = new MulesoftApiClient(sampleConfig({ timeoutMs: 1000 }), {
+    fetchImpl: async (_input, init) => new Promise((_resolve, reject) => init?.signal?.addEventListener("abort", () => reject(new DOMException("aborted", "AbortError")))),
+    sleepImpl: async () => {},
+    maxRetries: 0,
+  });
+  await assert.rejects(timingOut.getOrganization(), (error) => {
+    texts.add(error.message);
+    return true;
+  });
+
+  for (const [label, scrub] of Object.entries(scrubs)) {
+    const checked = assertFixedTextsSurvive(scrub, texts, `MuleSoft fixed texts through ${label}`);
+    assert.ok(checked >= MULESOFT_FIXED_TEXTS.length + 40, `the harvest rendered texts beyond the standing list (${checked})`);
+  }
+  assert.ok([...texts].some((text) => /^unread \(/.test(text)), "the harvest rendered an unread source state");
+  assert.ok([...texts].some((text) => /^not requested \(/.test(text)), "the harvest rendered a not requested source state");
+  assert.ok([...texts].some((text) => /^not requested: /.test(text)), "the harvest rendered a not requested marker error");
+  assert.ok([...texts].some((text) => /^partial \(/.test(text)), "the harvest rendered a partial source state");
+  assert.ok([...texts].some((text) => /non-JSON body \(text\/html, \d+ bytes\)/.test(text)), "the harvest rendered a status-and-length note");
+  assert.ok([...texts].some((text) => /JSON body without a recognized error field \(application\/json, \d+ bytes\)/.test(text)), "the harvest rendered an opaque JSON note");
+  assert.ok([...texts].some((text) => /timed out after \d+ ms/.test(text)), "the harvest rendered the timeout wording");
+  assert.ok([...texts].some((text) => /could not be read, the credential lacks permission \(HTTP 403\)/.test(text)), "the harvest rendered a failure description with its HTTP cause");
+});
+
+test("round 7 note 2: credentials and the config file path set through the environment survive an unrelated argument, and the source chain names the environment", () => {
+  const base = createTempBase("grclanker-mulesoft-env-survives-");
+  const configPath = join(base, "config.toml");
+  writeFileSync(configPath, ["[anypoint]", 'org_id = "file-org"', 'token = "file-token-value"', 'control_plane = "eu"', 'environments = ["env-file"]', ""].join("\n"));
+  for (const configEnv of ["ANYPOINT_CONFIG_FILE", "MULESOFT_SEC_INSPECTOR_CONFIG"]) {
+    for (const tokenKey of ["ANYPOINT_TOKEN", "ANYPOINT_ACCESS_TOKEN"]) {
+      const env = { [configEnv]: configPath, [tokenKey]: "env-token-value", ANYPOINT_ORG_ID: "env-org" };
+      for (const [label, unrelated] of [
+        ["timeout_seconds", { timeout_seconds: 45 }],
+        ["control_plane", { control_plane: "us" }],
+        ["environments", { environments: ["env-arg"] }],
+      ]) {
+        const resolved = resolveMulesoftConfiguration(unrelated, env, { homeDir: base });
+        const context = `${configEnv} and ${tokenKey} with ${label}`;
+        assert.equal(resolved.authMode, "token", context);
+        assert.equal(resolved.token, "env-token-value", `${context}: the environment token resolves over the file`);
+        assert.equal(resolved.organizationId, "env-org", `${context}: the environment organization resolves over the file`);
+        assert.ok(resolved.sourceChain.includes("environment-token"), `${context}: the source chain names the environment: ${JSON.stringify(resolved.sourceChain)}`);
+        assert.ok(resolved.sourceChain.includes("environment-organization"), context);
+        assert.ok(resolved.sourceChain.includes(`config:${configPath}`), `${context}: the source chain names the config file from the environment`);
+        assert.ok(!resolved.sourceChain.includes("arguments-token"), `${context}: the unrelated argument does not claim the token`);
+        assert.equal(resolved.controlPlane, label === "control_plane" ? "us" : "eu", `${context}: the file value not set elsewhere still applies`);
+        assert.deepEqual(resolved.environmentFilter, label === "environments" ? ["env-arg"] : ["env-file"], context);
+        if (label === "timeout_seconds") assert.equal(resolved.timeoutMs, 45000, context);
+      }
+    }
+  }
+  // An argument object whose credential keys are present but undefined must not shadow the environment.
+  const env = { ANYPOINT_CONFIG_FILE: configPath, ANYPOINT_TOKEN: "env-token-value", ANYPOINT_ORG_ID: "env-org" };
+  const shadowed = resolveMulesoftConfiguration({ token: undefined, client_id: undefined, organization_id: undefined, timeout_seconds: 45 }, env, { homeDir: base });
+  assert.equal(shadowed.token, "env-token-value");
+  assert.equal(shadowed.organizationId, "env-org");
+  assert.deepEqual(shadowed.sourceChain, [`config:${configPath}`, "environment-organization", "environment-token", "config-control-plane", "config-environments"]);
+  // Connected app credentials through the environment survive the same way.
+  const connected = resolveMulesoftConfiguration({ timeout_seconds: 45 }, { ANYPOINT_ORG_ID: "env-org", ANYPOINT_CLIENT_ID: "env-client-id", ANYPOINT_CLIENT_SECRET: "env-client-secret-value" }, { homeDir: base });
+  assert.equal(connected.authMode, "connected_app");
+  assert.equal(connected.clientSecret, "env-client-secret-value");
+  assert.deepEqual(connected.sourceChain, ["environment-organization", "environment-client-id", "environment-client-secret"]);
 });
