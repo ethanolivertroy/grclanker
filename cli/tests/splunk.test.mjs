@@ -1388,6 +1388,62 @@ test("collection status: a denied snapshot is written to core_data as a not-coll
   assertOutputsNameOnlyObservedRequests(splunkOutputs(access, results, exported), requests, "healthy with an empty token list");
 });
 
+test("collection status: leaves derived from a denied snapshot render null, never [] or 0 (DP-13 web_sslVersions, PLAT-23 ssl_stanza, PLAT-22 admin-owner counts, deployment serverRoles)", async () => {
+  const base = createTempBase("grclanker-splunk-null-leaves-");
+  const unscheduled = { ...HARDENED, "/servicesNS/-/-/saved/searches": [entry("Errors", { is_scheduled: 1, disabled: 0, search: "index=main error", dispatchAs: "owner", "dispatch.earliest_time": "-24h" }, { sharing: "app", owner: "auditor", app: "search", perms: { read: ["*"], write: ["admin"] } })] };
+
+  const webDenied = await assessSplunkDataProtection(forbidding(HARDENED, ["/services/configs/conf-web"]));
+  const tls = byId(webDenied, "SPLUNK-DP-13");
+  assert.equal(tls.evidence.web_sslVersions, null, "web.conf sslVersions is unknown when conf-web was denied");
+  assert.equal(tls.evidence.enableSplunkWebSSL, null);
+  assert.ok(Array.isArray(tls.evidence.sslVersions) && tls.evidence.sslVersions.length > 0, "server.conf sslVersions were read and stay a real list");
+  assert.match(tls.summary, /web\.conf unreadable \(.*403/);
+  const webReadable = byId(await assessSplunkDataProtection(forbidding(HARDENED, [])), "SPLUNK-DP-13");
+  assert.deepEqual(webReadable.evidence.web_sslVersions, ["tls1.2"], "a readable web.conf keeps the list");
+
+  const inputsDenied = await assessSplunkPlatformHardening(forbidding(HARDENED, ["/services/configs/conf-inputs"]));
+  const s2s = byId(inputsDenied, "SPLUNK-PLAT-23");
+  assert.equal(s2s.evidence.inputs_conf_readable, false);
+  assert.equal(s2s.evidence.ssl_stanza, null, "the [SSL] stanza is unknown, not an empty stanza, when inputs.conf was denied");
+  assert.equal(s2s.evidence.ssl_stanza_present, null);
+  assert.equal(s2s.status, "manual");
+  const inputsReadable = byId(await assessSplunkPlatformHardening(forbidding(HARDENED, [])), "SPLUNK-PLAT-23");
+  assert.equal(typeof inputsReadable.evidence.ssl_stanza_present, "boolean");
+  assert.ok(Array.isArray(inputsReadable.evidence.ssl_stanza.sslVersions));
+
+  const usersDenied = await assessSplunkPlatformHardening(forbidding(unscheduled, ["/services/authentication/users"]));
+  const dispatch = byId(usersDenied, "SPLUNK-PLAT-22");
+  assert.equal(dispatch.status, "warn");
+  assert.equal(dispatch.evidence.owner_dispatched_by_admins, null, "admin ownership is unknown without the user list");
+  assert.equal(dispatch.evidence.risky_scheduled_searches, null);
+  assert.equal(dispatch.evidence.scheduled, 1, "the schedule flag was read from the saved search itself");
+  assert.match(dispatch.evidence.owner_roles_note, /^owner roles were not verified because the user list could not be read \(.*403/);
+  assert.deepEqual(dispatch.evidence.unverified_owner_searches, [], "the bounded search is not listed as unverified-risky");
+  assert.match(dispatch.summary, /^Owner roles of the 1 scheduled searches could not be verified because the user list could not be read \(.*403.*\); none combine all indexes with an unbounded time range\.$/);
+  assert.doesNotMatch(dispatch.summary, /\b0 of 1\b/);
+  const usersReadable = byId(await assessSplunkPlatformHardening(forbidding(unscheduled, [])), "SPLUNK-PLAT-22");
+  assert.equal(usersReadable.evidence.owner_dispatched_by_admins, 0);
+  assert.deepEqual(usersReadable.evidence.risky_scheduled_searches, []);
+  assert.equal(usersReadable.evidence.owner_roles_note, undefined);
+  const riskyUnverified = { ...unscheduled, "/servicesNS/-/-/saved/searches": [entry("Everything", { is_scheduled: 1, disabled: 0, search: "error", dispatchAs: "owner", "dispatch.earliest_time": "0" }, { sharing: "app", owner: "auditor", app: "search", perms: { read: ["*"], write: ["admin"] } })] };
+  const unverifiedFail = byId(await assessSplunkPlatformHardening(forbidding(riskyUnverified, ["/services/authentication/users"])), "SPLUNK-PLAT-22");
+  assert.equal(unverifiedFail.status, "fail");
+  assert.match(unverifiedFail.summary, /run as their \(unverified\) owner across all indexes with no time bound\. Owner roles were not verified because the user list could not be read/);
+  assert.equal(unverifiedFail.evidence.risky_scheduled_searches, null);
+  assert.deepEqual(unverifiedFail.evidence.unverified_owner_searches.map((item) => item.name), ["Everything"], "the fail stays grounded in the searches that were read");
+
+  const { client: api, requests } = recording(HARDENED, ["/services/server/info"]);
+  const access = await checkSplunkAccess(api);
+  assert.equal(access.deployment.serverRoles, null, "server roles are unknown, not [], when server/info was denied");
+  assert.equal(access.deployment.source, "unknown", "a non-splunkcloud.com URL gives no deployment source when server/info was denied");
+  const exported = await exportSplunkAuditBundle(api, sampleConfig(), join(base, "server-info-denied"));
+  const accessFile = JSON.parse(readFileSync(join(exported.outputDir, "core_data", "access_check.json"), "utf8"));
+  assert.equal(accessFile.deployment.serverRoles, null);
+  assert.ok(requests.some((request) => request.endpoint === "/services/server/info" && request.status === 403));
+  const healthyAccess = await checkSplunkAccess(recording(HARDENED, []).client);
+  assert.ok(Array.isArray(healthyAccess.deployment.serverRoles), "a readable server/info keeps the role list");
+});
+
 test("resolveSecureOutputPath rejects traversal and symlink parents", () => {
   const base = createTempBase("grclanker-splunk-path-");
   const outside = createTempBase("grclanker-splunk-outside-");

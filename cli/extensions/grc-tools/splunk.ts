@@ -130,7 +130,8 @@ export interface SplunkDeploymentInfo {
   productType?: string;
   instanceType?: string;
   serverName?: string;
-  serverRoles: string[];
+  /** Roles from /services/server/info; null when that endpoint was not read, never an empty list. */
+  serverRoles: string[] | null;
   isCloud: boolean;
   source: "server_info" | "url_heuristic" | "unknown";
 }
@@ -1177,7 +1178,7 @@ export function deploymentInfoFrom(serverInfo: SplunkEntry | undefined, url: str
     productType,
     instanceType,
     serverName: asString(content.serverName),
-    serverRoles: asStringList(content.server_roles),
+    serverRoles: serverInfo ? asStringList(content.server_roles) : null,
     isCloud: serverInfo ? cloudByInfo : cloudByUrl,
     source: serverInfo ? "server_info" : cloudByUrl ? "url_heuristic" : "unknown",
   };
@@ -1749,7 +1750,7 @@ export async function assessSplunkDataProtection(client: SplunkInspectorClient):
     } else if (!webSettings) {
       unknowns.push("web.conf [settings] stanza not returned");
     }
-    const evidence = { enableSplunkdSSL: ssl?.enableSplunkdSSL ?? null, sslVersions, cipherSuite: asString(ssl?.cipherSuite) ?? null, requireClientCert: ssl?.requireClientCert ?? null, enableSplunkWebSSL: webSettings?.enableSplunkWebSSL ?? null, web_sslVersions: asStringList(webSettings?.sslVersions), assumed_defaults: assumed, unknown_defaults: unknownDefaults, problems, unknowns };
+    const evidence = { enableSplunkdSSL: ssl?.enableSplunkdSSL ?? null, sslVersions, cipherSuite: asString(ssl?.cipherSuite) ?? null, requireClientCert: ssl?.requireClientCert ?? null, enableSplunkWebSSL: webSettings?.enableSplunkWebSSL ?? null, web_sslVersions: webConf.ok ? asStringList(webSettings?.sslVersions) : null, assumed_defaults: assumed, unknown_defaults: unknownDefaults, problems, unknowns };
     if (problems.length > 0) {
       findings.push(finding(13, "fail", `TLS configuration problems: ${problems.join("; ")}.`, evidence));
     } else if (unknowns.length > 0) {
@@ -2197,14 +2198,32 @@ export async function assessSplunkPlatformHardening(client: SplunkInspectorClien
     });
     const risky = evaluated.filter((item) => item.dispatchAs === "owner" && item.owner_is_admin !== false && item.all_indexes && item.all_time);
     const ownerAdmin = evaluated.filter((item) => item.dispatchAs === "owner" && item.owner_is_admin === true);
-    const evidence = { ...inventoryNote(savedSearches.value), scheduled: scheduled.length, users_readable: users.ok, risky_scheduled_searches: risky.slice(0, 50), owner_dispatched_by_admins: ownerAdmin.length };
+    // Whether an owner is an admin is read from the user list: with that list
+    // unreadable the admin-owner count and the risky list render null with a
+    // note, and the owner-dispatched searches that could not be verified are
+    // listed under their own name so a fail stays grounded.
+    const evidence = {
+      ...inventoryNote(savedSearches.value),
+      scheduled: scheduled.length,
+      users_readable: users.ok,
+      risky_scheduled_searches: users.ok ? risky.slice(0, 50) : null,
+      owner_dispatched_by_admins: users.ok ? ownerAdmin.length : null,
+      ...(users.ok
+        ? {}
+        : {
+            owner_roles_note: `owner roles were not verified because the user list could not be read (${unreadableCause(users)})`,
+            unverified_owner_searches: risky.slice(0, 50),
+          }),
+    };
     if (risky.length > 0) {
-      findings.push(finding(22, "fail", `${risky.length} scheduled searches run as their (admin or unverified) owner across all indexes with no time bound.${partialSuffix(savedSearches.value, "saved searches")}`, evidence));
+      findings.push(finding(22, "fail", `${risky.length} scheduled searches run as their (${users.ok ? "admin" : "unverified"}) owner across all indexes with no time bound.${users.ok ? "" : ` Owner roles were not verified because the user list could not be read (${unreadableCause(users)}).`}${partialSuffix(savedSearches.value, "saved searches")}`, evidence));
     } else if (scheduled.length === 0) {
       const usersCaveat = users.ok ? "" : `The user list could not be read (${unreadableCause(users)}), so owner roles were not available for verification.`;
       findings.push(capWithCaveats(finding(22, withPartial("pass", savedSearches.value), `${savedSearches.value.entries.length} saved searches were inspected and none are scheduled, so no scheduled search runs with elevated scope.${partialSuffix(savedSearches.value, "saved searches")}`, evidence), [usersCaveat]));
-    } else if (!users.ok || ownerAdmin.length > 0 || partialView(savedSearches.value)) {
-      findings.push(finding(22, "warn", `${ownerAdmin.length} of ${scheduled.length} scheduled searches dispatch as an admin owner${users.ok ? "" : " (owner roles could not be verified because users were unreadable)"}; none combine all indexes with an unbounded time range.${partialSuffix(savedSearches.value, "saved searches")}`, evidence));
+    } else if (!users.ok) {
+      findings.push(finding(22, "warn", `Owner roles of the ${scheduled.length} scheduled searches could not be verified because the user list could not be read (${unreadableCause(users)}); none combine all indexes with an unbounded time range.${partialSuffix(savedSearches.value, "saved searches")}`, evidence));
+    } else if (ownerAdmin.length > 0 || partialView(savedSearches.value)) {
+      findings.push(finding(22, "warn", `${ownerAdmin.length} of ${scheduled.length} scheduled searches dispatch as an admin owner; none combine all indexes with an unbounded time range.${partialSuffix(savedSearches.value, "saved searches")}`, evidence));
     } else {
       findings.push(finding(22, "pass", `None of the ${scheduled.length} scheduled searches run as an admin owner over all indexes without a time bound.`, evidence));
     }
@@ -2228,8 +2247,10 @@ export async function assessSplunkPlatformHardening(client: SplunkInspectorClien
       ...inventoryNote(cookedInputs.value),
       listeners: listeners.map(listenerEvidence),
       inputs_conf_readable: inputsConf.ok,
-      ssl_stanza_present: Boolean(sslStanza),
-      ssl_stanza: { serverCert: asString(sslStanza?.serverCert) ?? null, requireClientCert: sslStanza?.requireClientCert ?? null, sslVersions: asStringList(sslStanza?.sslVersions) },
+      ssl_stanza_present: inputsConf.ok ? Boolean(sslStanza) : null,
+      ssl_stanza: inputsConf.ok
+        ? { serverCert: asString(sslStanza?.serverCert) ?? null, requireClientCert: sslStanza?.requireClientCert ?? null, sslVersions: asStringList(sslStanza?.sslVersions) }
+        : null,
       note: "data/inputs/tcp/cooked does not report TLS; encryption is decided from inputs.conf [splunktcp-ssl:*] stanzas, and serverCert and requireClientCert are resolved per port from [splunktcp-ssl:<port>] first, then [SSL]",
     };
     const ports = (items: S2sListener[]): string => items.map((item) => item.port).join(", ");
