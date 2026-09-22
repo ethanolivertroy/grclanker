@@ -1,7 +1,9 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import {
+  chmodSync,
   existsSync,
+  mkdirSync,
   mkdtempSync,
   readFileSync,
   readdirSync,
@@ -10,9 +12,11 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { parse as parseYaml } from "yaml";
 
 import {
   KNOWBE4_CONTROLS,
+  KNOWBE4_INVENTORIES,
   Knowbe4ApiClient,
   assessKnowbe4AccountGovernance,
   assessKnowbe4PhishingProgram,
@@ -21,13 +25,21 @@ import {
   checkKnowbe4Access,
   collectKnowbe4Snapshot,
   exportKnowbe4AuditBundle,
+  knowbe4CollectionStatus,
   knowbe4ControlMappings,
   knowbe4ToolForArea,
+  projectKnowbe4User,
+  redactCredentialValues,
   redactKnowbe4Pii,
+  registerKnowbe4Tools,
   resolveKnowbe4Configuration,
   resolveSecureOutputPath,
+  scrubErrorText,
 } from "../dist/extensions/grc-tools/knowbe4.js";
 import { getRegisteredToolSummaries } from "../dist/pi/tool-catalog.js";
+import { readBundleFiles, readZipEntries } from "./helpers/bundle-contents.mjs";
+import { assertCanaryFixture, assertCanaryWindowsAbsent } from "./helpers/canary-windows.mjs";
+import { scrubAlterations } from "./helpers/scrub-survival.mjs";
 
 const NOW = new Date("2026-09-21T12:00:00Z");
 const DAY_MS = 86_400_000;
@@ -408,9 +420,11 @@ function mockClient(fixture, options = {}) {
   const failures = options.failures ?? {};
   const phisher = options.phisher ?? false;
   const config = sampleConfig({ ...(phisher ? { phisherApiToken: "phisher-token" } : {}), ...(options.config ?? {}) });
+  // A failure keyed by the bare method name (for example listSecurityTestRecipients) fails every per-record read too.
   const guard = (name, result) => {
     calls.push(name);
-    if (failures[name]) throw new Error(failures[name]);
+    const failure = failures[name] ?? failures[name.split(":")[0]];
+    if (failure) throw new Error(failure);
     return result;
   };
   return {
@@ -567,7 +581,10 @@ test("Knowbe4ApiClient sends bearer auth, paginates with page and per_page, and 
   });
   const users = await client.list("/v1/users", { status: "active" }, { limit: 10, pageSize: 2 });
 
-  assert.deepEqual(users.map((item) => item.id), [1, 2, 3]);
+  assert.deepEqual(users.items.map((item) => item.id), [1, 2, 3]);
+  assert.equal(users.truncated, false, "a short final page means the listing is complete");
+  assert.equal(users.pages, 2);
+  assert.equal(users.limit, 10);
   assert.equal(seen.length, 3);
   assert.ok(seen.every((item) => item.pathname === "/v1/users"));
   assert.ok(seen.every((item) => item.auth === "Bearer reporting-token"));
@@ -592,7 +609,7 @@ test("Knowbe4ApiClient stops retrying after max retries and redacts tokens in er
     minRequestIntervalMs: 0,
   });
   await assert.rejects(() => leaking.getAccount(), (error) => {
-    assert.match(error.message, /KnowBe4 request to \/v1\/account failed/);
+    assert.match(error.message, /KnowBe4 request failed: GET \/v1\/account/);
     assert.ok(!error.message.includes("super-secret-token"));
     assert.ok(!error.message.includes("phisher-secret"));
     assert.match(error.message, /\[REDACTED\]/);
@@ -666,7 +683,9 @@ test("Knowbe4ApiClient shapes PhishER GraphQL requests and paginates with per, p
   }), { fetchImpl, minRequestIntervalMs: 0 });
 
   const messages = await client.listPhisherMessages({ query: "reported_at:[2026-06-23 TO *]", limit: 2000 });
-  assert.deepEqual(messages.map((item) => item.id), ["m1", "m2", "m3"]);
+  assert.deepEqual(messages.items.map((item) => item.id), ["m1", "m2", "m3"]);
+  assert.equal(messages.total, 3);
+  assert.equal(messages.truncated, false);
   assert.equal(seen.length, 2);
   assert.ok(seen.every((item) => item.url === "https://eu.knowbe4.com/graphql"));
   assert.ok(seen.every((item) => item.method === "POST"));
@@ -783,7 +802,7 @@ test("assessKnowbe4PhishingProgram fails a stale, narrow, and worsening program"
   assert.ok(findingFor(result, 20).evidence.max_gap_days > 45);
 });
 
-test("assessKnowbe4PhishingProgram degrades to warn findings when security tests are unreadable", async () => {
+test("assessKnowbe4PhishingProgram turns security-test controls manual when security tests are unreadable", async () => {
   const client = mockClient(healthyFixture(), { failures: { listSecurityTests: "KnowBe4 request failed (403 Forbidden) for /v1/phishing/security_tests" } });
   const snapshot = await collectKnowbe4Snapshot(client, { scopes: ["phishing"], now: NOW });
   const result = assessKnowbe4PhishingProgram(snapshot, { now: NOW });
@@ -791,10 +810,17 @@ test("assessKnowbe4PhishingProgram degrades to warn findings when security tests
   assert.ok(snapshot.errors.some((error) => error.startsWith("security_tests:")));
   for (const control of [1, 2, 6, 7, 19, 20]) {
     const item = findingFor(result, control);
-    assert.equal(item.status, "warn", `control ${control} should warn`);
-    assert.match(item.summary, /not readable/);
+    assert.equal(item.status, "manual", `control ${control} cannot be judged without security tests`);
+    assert.match(item.summary, /^Unreadable inventory: security_tests \(GET \/v1\/phishing\/security_tests: KnowBe4 request failed \(403 Forbidden\)/);
+    assert.match(item.summary, /Collect manually: the phishing security test list/);
     assert.match(item.evidence.collection_error, /403/);
+    assert.equal(item.evidence.unreadable_inventories[0].inventory, "security_tests");
+    assert.match(item.manualEvidence, /Phishing > Reports > Security Tests/);
   }
+  // Campaign targeting is judged from the campaign list itself; the missing tests only demote it.
+  const targeting = findingFor(result, 9);
+  assert.equal(targeting.status, "warn");
+  assert.match(targeting.summary, /target All Users.*Unreadable inventory: security_tests/);
   assert.ok(result.errors.length > 0);
 });
 
@@ -998,11 +1024,15 @@ test("assessKnowbe4TrainingProgram degrades remedial training to warn when tests
   assert.equal(item.evidence.remediated_users, 1);
   assert.equal(item.evidence.remediated_pct, 100);
 
-  // With only the newest test sampled there are no observed failures, which still cannot pass on a partial sample.
+  // With only the newest test sampled there are no observed failures, which still cannot pass on a partial sample, and
+  // the window-wide failure count is unknown rather than 0 because two tests were never read.
   const thinSnapshot = await collectKnowbe4Snapshot(mockClient(fixture), { scopes: ["training"], now: NOW, securityTestSampleLimit: 1 });
   const thin = findingFor(assessKnowbe4TrainingProgram(thinSnapshot, { now: NOW }), 10);
   assert.equal(thin.status, "warn");
-  assert.equal(thin.evidence.failed_users_in_window, 0);
+  assert.equal(thin.evidence.failed_users_in_window, null);
+  assert.equal(thin.evidence.failed_users_in_sampled_tests, 0);
+  assert.equal(thin.evidence.recipient_reads_complete, false);
+  assert.equal(thin.evidence.violation_observed, null);
   assert.equal(thin.evidence.unsampled_security_tests, 2);
   assert.match(thin.summary, /2 additional tests in the window were not sampled/);
 
@@ -1068,11 +1098,15 @@ test("assessKnowbe4TrainingProgram never passes compliance completion computed o
   assert.equal(truncated.status, "warn");
   assert.match(truncated.summary, /truncated at enrollment_limit \(3\)/);
   assert.match(truncated.summary, /cannot be verified/);
-  assert.equal(truncated.evidence.topics[0].enrollments, 3);
-  assert.equal(truncated.evidence.topics[0].completion_pct, 100);
+  // Population figures are unknown over a truncated list; only the "_loaded" figures describe the records read.
+  assert.equal(truncated.evidence.topics[0].enrollments, null);
+  assert.equal(truncated.evidence.topics[0].completion_pct, null);
+  assert.equal(truncated.evidence.topics[0].enrollments_loaded, 3);
+  assert.equal(truncated.evidence.topics[0].completion_pct_loaded, 100);
   assert.equal(truncated.evidence.enrollment_limit_reached, true);
   assert.equal(truncated.evidence.completion_data_partial, true);
-  assert.deepEqual(truncated.evidence.topics_without_enrollments, []);
+  assert.equal(truncated.evidence.topics_without_enrollments, null);
+  assert.deepEqual(truncated.evidence.topics_without_loaded_enrollments, []);
 
   // Without the cap the same topic is measured at 50% and warns on low completion instead.
   const fullSnapshot = await collectKnowbe4Snapshot(mockClient(fixture), { scopes: ["training"], now: NOW });
@@ -1080,6 +1114,8 @@ test("assessKnowbe4TrainingProgram never passes compliance completion computed o
   assert.equal(full.status, "warn");
   assert.match(full.summary, /below 90%/);
   assert.equal(full.evidence.topics[0].completion_pct, 50);
+  assert.equal(full.evidence.topics[0].enrollments, 6);
+  assert.deepEqual(full.evidence.topics_without_enrollments, []);
   assert.equal(full.evidence.completion_data_partial, false);
 
   // The auto-detect path is guarded the same way.
@@ -1159,7 +1195,8 @@ test("user-set controls warn instead of passing when the Reporting API returns n
   // An unreadable user list still reports the collection error rather than the empty-list guard.
   const unreadable = await collectKnowbe4Snapshot(mockClient(fixture, { failures: { listUsers: "KnowBe4 request failed (403 Forbidden) for /v1/users" } }), { now: NOW });
   const unreadableTimeliness = findingFor(assessKnowbe4TrainingProgram(unreadable, { now: NOW }), 4);
-  assert.match(unreadableTimeliness.summary, /not readable/);
+  assert.equal(unreadableTimeliness.status, "manual");
+  assert.match(unreadableTimeliness.summary, /Unreadable inventory: users \(GET \/v1\/users\?status=active: .*403 Forbidden/);
   assert.equal(unreadableTimeliness.evidence.user_list_empty, undefined);
 });
 
@@ -1194,7 +1231,19 @@ test("collectKnowbe4Snapshot flags user_limit truncation and user-set controls d
   assert.equal(findingFor(phishing, 1).status, "pass");
   assert.equal(findingFor(phishing, 20).status, "pass");
   assert.equal(findingFor(risk, 8).status, "pass");
-  assert.equal(findingFor(phishing, 2).evidence.coverage_pct, 100);
+  // Coverage over a capped user list is unknown; only the figures over the users actually read render.
+  const coverage = findingFor(phishing, 2);
+  assert.equal(coverage.evidence.coverage_pct, null);
+  assert.equal(coverage.evidence.active_users, null);
+  assert.equal(coverage.evidence.tested_users, null);
+  assert.equal(coverage.evidence.users_read, 5);
+  assert.equal(coverage.evidence.tested_users_in_read_samples, 5);
+  assert.equal(coverage.evidence.untested_user_sample, null);
+  assert.match(coverage.summary, /5 of the 5 active users read appear in the 3 sampled security tests, so coverage over the full population is unknown\. Truncated listing: users \(5 of unknown loaded, truncated at user_limit \(5\)\)/);
+  assert.equal(findingFor(risk, 18).evidence.inactive_users, null);
+  assert.equal(findingFor(risk, 18).evidence.inactive_user_sample, null);
+  assert.equal(findingFor(risk, 5).evidence.users_scored, null);
+  assert.equal(findingFor(risk, 5).evidence.users_scored_read, 5);
 });
 
 test("assessKnowbe4AccountGovernance passes admin hygiene and callback tests while flagging manual controls", async () => {
@@ -1342,6 +1391,7 @@ test("exportKnowbe4AuditBundle writes core data, analysis, compliance reports, a
     "QUICK_REFERENCE.md",
     "metadata.json",
     "core_data/access.json",
+    "core_data/collection_status.json",
     "core_data/account.json",
     "core_data/account_risk_score_history.json",
     "core_data/users_active.json",
@@ -1434,8 +1484,25 @@ test("exportKnowbe4AuditBundle records partial collection failures and honors PI
   assert.ok(!recipients.includes("@acme.example"));
   assert.ok(!recipients.includes("203.0.113.10"));
   const findings = JSON.parse(readFileSync(join(result.outputDir, "analysis", "findings.json"), "utf8"));
-  assert.equal(findings.find((item) => item.control === 4).status, "warn");
+  assert.equal(findings.find((item) => item.control === 4).status, "manual", "enrollment timeliness cannot be judged without enrollments");
+  assert.equal(findings.find((item) => item.control === 3).status, "warn", "reported completion still judges the campaigns; the missing enrollment fallback demotes");
   assert.ok(!JSON.stringify(findings).includes("@acme.example"));
+  const status = JSON.parse(readFileSync(join(result.outputDir, "core_data", "collection_status.json"), "utf8"));
+  const enrollmentRow = status.inventories.find((row) => row.inventory === "training_enrollments");
+  assert.equal(enrollmentRow.readable, false);
+  assert.match(enrollmentRow.error, /500/);
+  // Nothing about the failed read defaults: completeness, truncation, and counts are unknown, not false or 0.
+  assert.deepEqual(
+    { collected: enrollmentRow.collected, complete: enrollmentRow.complete, truncated: enrollmentRow.truncated, seen: enrollmentRow.seen, total: enrollmentRow.total },
+    { collected: false, complete: null, truncated: null, seen: null, total: null },
+  );
+  const usersRow = status.inventories.find((row) => row.inventory === "users");
+  assert.equal(usersRow.readable, true);
+  assert.equal(usersRow.truncated, false);
+  assert.equal(usersRow.seen, 10);
+  assert.equal(status.totals.not_readable, 2);
+  assert.equal(status.totals.not_requested, 1, "PhishER was not configured, so its inventory was never requested");
+  assert.equal(status.totals.truncation_unknown, 3, "denied and never-requested inventories are neither complete nor truncated");
 
   const second = await exportKnowbe4AuditBundle(client, client.getResolvedConfig(), base, { now: NOW });
   assert.match(second.outputDir, /acme-corp-knowbe4-audit-bundle-2$/);
@@ -1472,4 +1539,1232 @@ test("KnowBe4 tools are registered in the tool catalog under the KnowBe4 group",
   assert.deepEqual(regionParam.enumValues, ["us", "eu", "ca", "uk", "de"]);
   const checkAccess = summaries.find((tool) => tool.name === "knowbe4_check_access");
   assert.equal(checkAccess.parameterSummaries.length, 8);
+});
+
+function forbidden(path) {
+  return `KnowBe4 request failed (403 Forbidden) for ${path}`;
+}
+
+// Every KnowBe4 finding whose verdict reads two or more collected inventories, with each secondary inventory forbidden
+// in turn while the primary stays healthy. `status` is the verdict the finding must report and `names` the summary
+// text that must name the unreadable inventory. Controls 1, 12, 16, and 20 read a single inventory; 13, 14, and 15
+// are always manual.
+const KNOWBE4_MULTI_INVENTORY_CASES = [
+  { control: 2, area: "phishing", secondary: "users", failure: "listUsers", path: "/v1/users", status: "manual", names: /Unreadable inventory: users \(GET \/v1\/users\?status=active: KnowBe4 request failed \(403 Forbidden\)/ },
+  { control: 2, area: "phishing", secondary: "security_test_recipients", failure: "listSecurityTestRecipients", path: "/v1/phishing/security_tests/900/recipients", status: "warn", names: /recipient results could not be read.*Unreadable inventory: security_test_recipients \(GET \/v1\/phishing\/security_tests\/900\/recipients, GET \/v1\/phishing\/security_tests\/901\/recipients, [^)]*: security_test_recipients\[900\]: KnowBe4 request failed \(403 Forbidden\)/ },
+  { control: 6, area: "phishing", secondary: "users", failure: "listUsers", path: "/v1/users", status: "warn", names: /within the 15% ceiling.*Unreadable inventory: users \(GET \/v1\/users\?status=active: .*403 Forbidden.*\), so the per-user phish-prone average was not computed/ },
+  { control: 6, area: "phishing", secondary: "account", failure: "getAccount", path: "/v1/account", status: "warn", names: /Unreadable inventory: account \(GET \/v1\/account: .*403 Forbidden.*\), so the account risk score was not attached/ },
+  { control: 7, area: "phishing", secondary: "account_risk_score_history", failure: "getAccountRiskScoreHistory", path: "/v1/account/risk_score_history", status: "warn", names: /stable or improving.*Unreadable inventory: account_risk_score_history \(GET \/v1\/account\/risk_score_history\?full=true: .*403 Forbidden/ },
+  { control: 9, area: "phishing", secondary: "security_tests", failure: "listSecurityTests", path: "/v1/phishing/security_tests", status: "warn", names: /target All Users.*Unreadable inventory: security_tests \(GET \/v1\/phishing\/security_tests: .*403 Forbidden.*\), so campaigns were classed as active from their status and last run alone/ },
+  { control: 9, area: "phishing", secondary: "users", failure: "listUsers", path: "/v1/users", status: "warn", names: /Unreadable inventory: users \(GET \/v1\/users\?status=active: .*403 Forbidden.*\), so the active user count behind the coverage estimate was not available/ },
+  { control: 9, area: "phishing", secondary: "groups", failure: "listGroups", path: "/v1/groups", status: "warn", names: /Unreadable inventory: groups \(GET \/v1\/groups\?status=active: .*403 Forbidden.*\), so group member counts behind the coverage estimate were not available/ },
+  { control: 19, area: "phishing", phisher: true, secondary: "phisher_messages", failure: "listPhisherMessages", path: "PhishER GraphQL", status: "warn", names: /reported with the Phish Alert Button.*Unreadable inventory: phisher_messages \(PhishER GraphQL phisherMessages: .*403 Forbidden.*\), so PhishER inbox categories and reporter counts were not cross-checked/ },
+  { control: 3, area: "training", secondary: "training_enrollments", failure: "listTrainingEnrollments", path: "/v1/training/enrollments", status: "warn", names: /met the 90% completion target.*Unreadable inventory: training_enrollments \(GET \/v1\/training\/enrollments: .*403 Forbidden.*\), so campaigns reporting the -1 completion sentinel could not be measured/ },
+  { control: 4, area: "training", secondary: "training_enrollments", failure: "listTrainingEnrollments", path: "/v1/training/enrollments", status: "manual", names: /^Unreadable inventory: training_enrollments \(GET \/v1\/training\/enrollments: .*403 Forbidden.*\), so training enrollment timeliness could not be evaluated from the API\. Collect manually: the training enrollment report/ },
+  { control: 4, area: "training", secondary: "users", failure: "listUsers", path: "/v1/users", status: "manual", names: /^Unreadable inventory: users \(GET \/v1\/users\?status=active: .*403 Forbidden/ },
+  { control: 10, area: "training", secondary: "training_enrollments", failure: "listTrainingEnrollments", path: "/v1/training/enrollments", status: "manual", names: /^Unreadable inventory: training_enrollments \(GET \/v1\/training\/enrollments: .*403 Forbidden/ },
+  { control: 10, area: "training", secondary: "security_test_recipients", failure: "listSecurityTestRecipients", path: "/v1/phishing/security_tests/900/recipients", status: "warn", names: /had recipient results available.*Unreadable inventory: security_test_recipients \(GET \/v1\/phishing\/security_tests\/900\/recipients, GET \/v1\/phishing\/security_tests\/901\/recipients, [^)]*: .*403 Forbidden/ },
+  { control: 10, area: "training", secondary: "training_campaigns", failure: "listTrainingCampaigns", path: "/v1/training/campaigns", status: "warn", names: /were enrolled in training after the failure.*Unreadable inventory: training_campaigns \(GET \/v1\/training\/campaigns: .*403 Forbidden.*\), so auto-enroll remedial campaigns were not listed/ },
+  { control: 11, area: "training", secondary: "store_purchases", failure: "listStorePurchases", path: "/v1/training/store_purchases", status: "warn", names: /none are marked retired in the campaign content; the ModStore catalog was not read.*Unreadable inventory: store_purchases \(GET \/v1\/training\/store_purchases: .*403 Forbidden.*\), so assigned modules were not cross-checked against the ModStore catalog/ },
+  { control: 17, area: "training", secondary: "training_enrollments", failure: "listTrainingEnrollments", path: "/v1/training/enrollments", status: "warn", names: /enrollment data is unavailable.*Unreadable inventory: training_enrollments \(GET \/v1\/training\/enrollments: .*403 Forbidden/ },
+  { control: 17, area: "training", secondary: "training_policies", failure: "listTrainingPolicies", path: "/v1/training/policies", status: "warn", names: /completion at or above 90%.*Unreadable inventory: training_policies \(GET \/v1\/training\/policies: .*403 Forbidden.*\), so uploaded policy documents were not counted/ },
+  { control: 5, area: "risk", secondary: "account", failure: "getAccount", path: "/v1/account", status: "warn", names: /mean user risk score is 25\.5.*Unreadable inventory: account \(GET \/v1\/account: .*403 Forbidden.*\), so the organization risk score was not attached/ },
+  { control: 5, area: "risk", secondary: "account_risk_score_history", failure: "getAccountRiskScoreHistory", path: "/v1/account/risk_score_history", status: "warn", names: /Unreadable inventory: account_risk_score_history \(GET \/v1\/account\/risk_score_history\?full=true: .*403 Forbidden.*\), so the organization risk score trend was not attached/ },
+  { control: 8, area: "risk", secondary: "phishing_campaigns", failure: "listPhishingCampaigns", path: "/v1/phishing/campaigns", status: "manual", names: /^Unreadable inventory: phishing_campaigns \(GET \/v1\/phishing\/campaigns: .*403 Forbidden.*\), so group coverage analysis could not be evaluated from the API\. Collect manually: the phishing campaign list/ },
+  { control: 8, area: "risk", secondary: "training_campaigns", failure: "listTrainingCampaigns", path: "/v1/training/campaigns", status: "manual", names: /^Unreadable inventory: training_campaigns \(GET \/v1\/training\/campaigns: .*403 Forbidden/ },
+  { control: 18, area: "risk", secondary: "security_tests", failure: "listSecurityTests", path: "/v1/phishing/security_tests", status: "warn", names: /show phishing, training, or sign-in activity.*Unreadable inventory: security_tests \(GET \/v1\/phishing\/security_tests: .*403 Forbidden.*\), so phishing participation could not be used as an activity signal/ },
+  { control: 18, area: "risk", secondary: "security_test_recipients", failure: "listSecurityTestRecipients", path: "/v1/phishing/security_tests/900/recipients", status: "warn", names: /Unreadable inventory: security_test_recipients \(GET \/v1\/phishing\/security_tests\/900\/recipients, GET \/v1\/phishing\/security_tests\/901\/recipients, [^)]*: .*403 Forbidden.*\), so deliveries in the security tests whose recipient results did not load were not counted as activity/ },
+  { control: 18, area: "risk", secondary: "training_enrollments", failure: "listTrainingEnrollments", path: "/v1/training/enrollments", status: "warn", names: /Unreadable inventory: training_enrollments \(GET \/v1\/training\/enrollments: .*403 Forbidden.*\), so training activity could not be used as an activity signal/ },
+];
+
+const ASSESS_BY_AREA = {
+  phishing: assessKnowbe4PhishingProgram,
+  training: assessKnowbe4TrainingProgram,
+  risk: assessKnowbe4UserRisk,
+};
+
+test("verdict rule 1 corollary: KnowBe4 findings that read several inventories never pass while a secondary inventory is forbidden", async () => {
+  const baselines = new Map();
+  for (const item of KNOWBE4_MULTI_INVENTORY_CASES) {
+    const assess = ASSESS_BY_AREA[item.area];
+    const baselineKey = `${item.area}:${Boolean(item.phisher)}`;
+    if (!baselines.has(baselineKey)) {
+      const healthy = await collectKnowbe4Snapshot(mockClient(healthyFixture(), { phisher: Boolean(item.phisher) }), { scopes: [item.area], now: NOW });
+      baselines.set(baselineKey, assess(healthy, { now: NOW }));
+    }
+    assert.equal(findingFor(baselines.get(baselineKey), item.control).status, "pass", `control ${item.control} baseline on the healthy fixture`);
+
+    const label = `control ${item.control} with ${item.secondary} forbidden`;
+    const client = mockClient(healthyFixture(), { phisher: Boolean(item.phisher), failures: { [item.failure]: forbidden(item.path) } });
+    const snapshot = await collectKnowbe4Snapshot(client, { scopes: [item.area], now: NOW });
+    assert.ok(snapshot.errors.length > 0 && snapshot.errors.every((error) => error.startsWith(item.secondary)), `${label}: only the secondary inventory failed (${snapshot.errors.join(" | ")})`);
+
+    const found = findingFor(assess(snapshot, { now: NOW }), item.control);
+    assert.notEqual(found.status, "pass", `${label} must not pass`);
+    assert.equal(found.status, item.status, `${label} status`);
+    assert.match(found.summary, item.names, `${label} must name the unreadable inventory`);
+    assert.match(found.summary, /403 Forbidden/, `${label} must carry the HTTP error`);
+    assert.match(found.summary, /Collect manually: /, `${label} must tell the human what to collect`);
+    const gaps = found.evidence.unreadable_inventories;
+    assert.ok(Array.isArray(gaps) && gaps.some((gap) => gap.inventory === item.secondary), `${label} evidence lists the gap`);
+    assert.ok(gaps.every((gap) => gap.endpoint && gap.error && gap.not_checked && gap.collect_manually), `${label} gap entries are complete`);
+    if (item.status === "manual") {
+      assert.match(found.manualEvidence ?? "", /^Collect the /, `${label} names the console evidence to collect`);
+    }
+  }
+});
+
+test("verdict rule 1 corollary: KnowBe4 findings keep judging the readable inventories and still fail on them", async () => {
+  // Control 9 with partial-targeting campaigns cannot estimate coverage without users, so it is manual rather than a false fail.
+  const partial = failingFixture();
+  const noUsers = await collectKnowbe4Snapshot(mockClient(partial, { failures: { listUsers: forbidden("/v1/users") } }), { scopes: ["phishing"], now: NOW });
+  const targeting = findingFor(assessKnowbe4PhishingProgram(noUsers, { now: NOW }), 9);
+  assert.equal(targeting.status, "manual");
+  assert.match(targeting.summary, /^Unreadable inventory: users/);
+  const noGroups = await collectKnowbe4Snapshot(mockClient(partial, { failures: { listGroups: forbidden("/v1/groups") } }), { scopes: ["phishing"], now: NOW });
+  assert.equal(findingFor(assessKnowbe4PhishingProgram(noGroups, { now: NOW }), 9).status, "manual");
+
+  // A failing verdict on readable data stands, with the gap appended rather than masking it.
+  const failing = await collectKnowbe4Snapshot(mockClient(failingFixture(), { failures: { listStorePurchases: forbidden("/v1/training/store_purchases") } }), { scopes: ["training"], now: NOW });
+  const currency = findingFor(assessKnowbe4TrainingProgram(failing, { now: NOW }), 11);
+  assert.equal(currency.status, "fail", "the retired module on the campaign itself still fails");
+  assert.match(currency.summary, /retired by the publisher.*Unreadable inventory: store_purchases/);
+
+  // Controls that never read the failed inventory keep their verdicts.
+  const noHistory = await collectKnowbe4Snapshot(mockClient(healthyFixture(), { failures: { getAccountRiskScoreHistory: forbidden("/v1/account/risk_score_history") } }), { scopes: ["risk"], now: NOW });
+  const risk = assessKnowbe4UserRisk(noHistory, { now: NOW });
+  assert.equal(findingFor(risk, 5).status, "warn");
+  assert.equal(findingFor(risk, 8).status, "pass", "group coverage does not read the risk history");
+  assert.equal(findingFor(risk, 18).status, "pass", "inactive users do not read the risk history");
+});
+
+test("verdict rule 10: Knowbe4ApiClient reports Reporting API listings truncated when the cap stops a still-full page", async () => {
+  const pageOf = (page, size) => Array.from({ length: size }, (_, index) => ({ id: (page - 1) * size + index + 1 }));
+  const fullPages = async (input) => {
+    const url = new URL(typeof input === "string" ? input : input.toString());
+    return jsonResponse(pageOf(Number(url.searchParams.get("page")), Number(url.searchParams.get("per_page"))));
+  };
+  const client = new Knowbe4ApiClient(sampleConfig(), { fetchImpl: fullPages, minRequestIntervalMs: 0 });
+
+  const atCap = await client.list("/v1/users", {}, { limit: 4, pageSize: 2 });
+  assert.deepEqual(atCap.items.map((item) => item.id), [1, 2, 3, 4]);
+  assert.equal(atCap.truncated, true, "the cap was reached while the last page was still full");
+  assert.equal(atCap.pages, 2);
+  assert.equal(client.getRequestCount(), 2, "the loop stops at the cap instead of fetching a page it would drop");
+
+  const overfull = await client.list("/v1/users", {}, { limit: 3, pageSize: 2 });
+  assert.deepEqual(overfull.items.map((item) => item.id), [1, 2, 3]);
+  assert.equal(overfull.truncated, true, "records dropped from the final page mark the listing truncated");
+
+  const exact = new Knowbe4ApiClient(sampleConfig(), {
+    fetchImpl: async (input) => {
+      const url = new URL(typeof input === "string" ? input : input.toString());
+      return jsonResponse(url.searchParams.get("page") === "1" ? pageOf(1, 2) : []);
+    },
+    minRequestIntervalMs: 0,
+  });
+  const complete = await exact.list("/v1/groups", {}, { limit: 10, pageSize: 2 });
+  assert.deepEqual(complete.items.map((item) => item.id), [1, 2]);
+  assert.equal(complete.truncated, false, "an empty page after a full page means the listing is complete");
+  assert.equal(complete.pages, 2);
+
+  const listing = await client.listUsers({ limit: 4 });
+  assert.equal(listing.limit, 4);
+  assert.equal(listing.truncated, true);
+});
+
+test("verdict rule 10: Knowbe4ApiClient reports PhishER connections truncated on caps, stuck page keys, and unreached totals", async () => {
+  const phisherClient = (respond, field = "phisherMessages") => new Knowbe4ApiClient(sampleConfig({ phisherApiToken: "phisher-token" }), {
+    fetchImpl: async (_input, init = {}) => jsonResponse({ data: { [field]: respond(JSON.parse(init.body).variables) } }),
+    minRequestIntervalMs: 0,
+  });
+
+  const capped = phisherClient(({ page }) => ({
+    nodes: [{ id: `m${page}a` }, { id: `m${page}b` }],
+    pagination: { page, pages: 3, per: 2, totalCount: 5, nextPageKey: `key-${page + 1}` },
+  }));
+  const atCap = await capped.listPhisherMessages({ query: "reported_at:[2026-06-23 TO *]", limit: 2 });
+  assert.deepEqual(atCap.items.map((item) => item.id), ["m1a", "m1b"]);
+  assert.equal(atCap.truncated, true);
+  assert.equal(atCap.total, 5, "the server total is kept so the summary can say seen versus total");
+  assert.equal(capped.getRequestCount(), 1);
+
+  const stuck = phisherClient(({ page }) => ({
+    nodes: [{ id: `m${page}` }],
+    pagination: { page, per: 1, nextPageKey: "same-key" },
+  }));
+  const stuckListing = await stuck.listPhisherMessages({ limit: 10 });
+  assert.deepEqual(stuckListing.items.map((item) => item.id), ["m1", "m2"]);
+  assert.equal(stuckListing.truncated, true, "a nextPageKey that never advances ends the loop as truncated");
+  assert.equal(stuck.getRequestCount(), 2);
+
+  const shortfall = phisherClient(() => ({ nodes: [], pagination: { page: 1, pages: 1, per: 200, totalCount: 7, nextPageKey: null } }));
+  const empty = await shortfall.listPhisherMessages({ limit: 10 });
+  assert.equal(empty.items.length, 0);
+  assert.equal(empty.total, 7);
+  assert.equal(empty.truncated, true, "an empty page while totalCount says more exist is not a complete read");
+
+  const complete = phisherClient(({ page }) => ({
+    nodes: page === 1 ? [{ id: "r1" }, { id: "r2" }] : [{ id: "r3" }],
+    pagination: { page, pages: 2, per: 2, totalCount: 3 },
+  }), "phisherRules");
+  const rules = await complete.listPhisherRules({ limit: 10 });
+  assert.deepEqual(rules.items.map((item) => item.id), ["r1", "r2", "r3"]);
+  assert.equal(rules.truncated, false);
+  assert.equal(rules.total, 3);
+});
+
+test("verdict rule 10: truncated KnowBe4 inventories demote the findings that judge them and state seen versus total", async () => {
+  const fixture = healthyFixture();
+  const client = mockClient(fixture, { phisher: true });
+  client.listSecurityTests = async (listOptions = {}) => {
+    if (listOptions.campaignType === "callback") return fixture.callbackTests;
+    return { items: fixture.securityTests, truncated: true, limit: 20000, pages: 40 };
+  };
+  client.listPhisherMessages = async () => ({ items: fixture.phisherMessages, truncated: true, limit: 1000, pages: 5, total: 1500 });
+  const snapshot = await collectKnowbe4Snapshot(client, { scopes: ["phishing"], now: NOW });
+  assert.equal(snapshot.securityTests.truncated, true);
+  assert.equal(snapshot.phisherMessages.total, 1500);
+
+  const result = assessKnowbe4PhishingProgram(snapshot, { now: NOW });
+  for (const control of [1, 2, 6, 7, 9, 20]) {
+    const item = findingFor(result, control);
+    assert.equal(item.status, "warn", `control ${control} cannot pass on a truncated security test list`);
+    assert.match(item.summary, /Truncated listing: security_tests \(12 of unknown loaded, truncated at the collection cap \(20000\)\), so this verdict only covers the records that were loaded\./);
+    assert.deepEqual(item.evidence.truncated_inventories.find((entry) => entry.inventory === "security_tests"), { inventory: "security_tests", seen: 12, total: null, limit: 20000, argument: null });
+  }
+  const reportRate = findingFor(result, 19);
+  assert.equal(reportRate.status, "warn");
+  assert.match(reportRate.summary, /PhishER inbox: 2 user-reported messages in the window \(2 of 1500 loaded, truncated at phisher_message_limit \(1000\)\)\./);
+  assert.equal(reportRate.evidence.phisher.messages_total, 1500);
+  assert.equal(reportRate.evidence.phisher.truncated, true);
+
+  const status = knowbe4CollectionStatus(snapshot);
+  assert.deepEqual(status.inventories.map((row) => row.inventory), KNOWBE4_INVENTORIES);
+  const tests = status.inventories.find((row) => row.inventory === "security_tests");
+  assert.equal(tests.truncated, true);
+  assert.equal(tests.complete, false);
+  assert.equal(tests.seen, 12);
+  assert.equal(tests.limit, 20000);
+  const phisher = status.inventories.find((row) => row.inventory === "phisher_messages");
+  assert.deepEqual({ seen: phisher.seen, total: phisher.total, limit: phisher.limit, limit_argument: phisher.limit_argument }, { seen: 2, total: 1500, limit: 1000, limit_argument: "phisher_message_limit" });
+  // The phishing scope never requested enrollments: no endpoint, status, or flag is invented for that inventory.
+  const enrollments = status.inventories.find((row) => row.inventory === "training_enrollments");
+  assert.deepEqual(
+    { status: enrollments.status, collected: enrollments.collected, readable: enrollments.readable, endpoint: enrollments.endpoint, complete: enrollments.complete, truncated: enrollments.truncated, seen: enrollments.seen, limit: enrollments.limit },
+    { status: "not_requested", collected: false, readable: null, endpoint: null, complete: null, truncated: null, seen: null, limit: null },
+  );
+  assert.equal(status.totals.truncated, 2);
+  assert.equal(status.totals.not_requested, 5);
+  assert.equal(status.totals.truncation_unknown, 5);
+
+  // Only the enrichment inventory truncated: the report rate still stands on the test counters but says what was cut.
+  const enrichmentOnly = mockClient(healthyFixture(), { phisher: true });
+  enrichmentOnly.listPhisherMessages = async () => ({ items: fixture.phisherMessages, truncated: true, limit: 1000, pages: 5, total: 1500 });
+  const enrichment = findingFor(assessKnowbe4PhishingProgram(await collectKnowbe4Snapshot(enrichmentOnly, { scopes: ["phishing"], now: NOW }), { now: NOW }), 19);
+  assert.equal(enrichment.status, "pass");
+  assert.match(enrichment.summary, /2 of 1500 loaded, truncated at phisher_message_limit \(1000\)/);
+  assert.equal(enrichment.evidence.truncated_inventories[0].inventory, "phisher_messages");
+});
+
+test("verdict rule 9: Knowbe4ApiClient describes non-JSON error bodies instead of echoing them", async () => {
+  const token = "reporting-token";
+  const page = `<html><body>Forbidden. Request headers: Authorization: Bearer ${token}</body></html>`;
+  const client = new Knowbe4ApiClient(sampleConfig({ apiToken: token }), {
+    fetchImpl: async () => new Response(page, { status: 403, statusText: "Forbidden", headers: { "content-type": "text/html; charset=utf-8" } }),
+    minRequestIntervalMs: 0,
+  });
+  await assert.rejects(() => client.getAccount(), (error) => {
+    assert.match(error.message, /^KnowBe4 request failed \(403 Forbidden\) GET \/v1\/account: 403 Forbidden: non-JSON body \(text\/html, \d+ bytes, not echoed\)$/);
+    assert.ok(!error.message.includes("Bearer"), "the reflected header is not echoed");
+    assert.ok(!error.message.includes("<html>"));
+    assert.equal(error.status, 403);
+    assert.equal(error.endpoint, "GET /v1/account");
+    return true;
+  });
+
+  const longMessage = "x".repeat(1000);
+  const verbose = new Knowbe4ApiClient(sampleConfig(), {
+    fetchImpl: async () => jsonResponse({ message: longMessage }, { status: 400, statusText: "Bad Request" }),
+    minRequestIntervalMs: 0,
+  });
+  await assert.rejects(() => verbose.getAccount(), (error) => {
+    assert.ok(error.message.length < 400, "structured error messages are capped");
+    return true;
+  });
+});
+
+test("verdict rule 9: redactCredentialValues masks credential-shaped keys and reduces URLs while keeping structure", () => {
+  const redacted = redactCredentialValues({
+    id: 7,
+    name: "SIEM export",
+    apiKey: "FAKE_CAMEL_1",
+    client_secret: "FAKE_SNAKE_2",
+    tokens: ["FAKE_PLURAL_3"],
+    group_key: "finance",
+    policy_url: "https://files.example.com/policies/acme.pdf?X-Amz-Signature=FAKE_SIG_4",
+    webhookUrl: "https://hooks.example.com/services/T0/FAKE_PATH_5",
+    settings: [{ name: "download_token", value: "FAKE_PAIR_6" }, { name: "retention_days", value: "90" }],
+    nested: { authorization: "Bearer FAKE_NESTED_7", enabled: true, count: 3 },
+    relative_link: "/download?token=FAKE_QUERY_8",
+  });
+
+  assert.equal(redacted.id, 7);
+  assert.equal(redacted.name, "SIEM export");
+  assert.equal(redacted.apiKey, "[REDACTED]");
+  assert.equal(redacted.client_secret, "[REDACTED]");
+  assert.equal(redacted.tokens, "[REDACTED]", "a list under a plural credential key is dropped whole");
+  assert.equal(redacted.group_key, "finance", "a non-credential key ending in key is kept");
+  assert.equal(redacted.policy_url, "https://files.example.com");
+  assert.equal(redacted.webhookUrl, "https://hooks.example.com");
+  assert.equal(redacted.settings[0].value, "[REDACTED]");
+  assert.equal(redacted.settings[1].value, "90");
+  assert.equal(redacted.nested.authorization, "[REDACTED]");
+  assert.equal(redacted.nested.enabled, true);
+  assert.equal(redacted.nested.count, 3);
+  assert.equal(redacted.relative_link, "[REDACTED]", "a relative URL carrying a token-shaped query is dropped");
+
+  const projected = projectKnowbe4User({ id: 1, email: "user1@acme.example", comment: "vpn pw FAKE", custom_field_1: "FAKE", custom_date_1: "2026-01-01", joined_on: "2024-01-15" });
+  assert.deepEqual(Object.keys(projected), ["id", "email", "joined_on"]);
+});
+
+// Credential values planted in collected objects, in order: policy URL signature, user custom field, user comment,
+// account shared secret, webhook URL path, recipient user custom field, name/value pair setting, policy password,
+// PhishER attachment URL token. Alphanumeric and random-looking so that every 6-to-24-character window can be asserted absent.
+const KNOWBE4_FAKE_SECRETS = [
+  "X3FbUbhhGiSFX6sHkNrUAhpHF8a6TnB8",
+  "QDSPmGmVxtX97SmGyfKAmDW86Uf5CoVK",
+  "toTBF45nFScEQMMpSQdrJ7xiAYW6dhSR",
+  "jeWBe7qRoxo2ECEUbwRNb99qKecZ7Pzu",
+  "nNfBgmJKWaZ5uxWc8bpWgV7XNkUFPbfp",
+  "J5tUD9FFHNhjFCYQKUWBAaRpeq3p4Q9T",
+  "X7dGVP2XHLR6Na7nD3e8vgwAJUvL34bA",
+  "tUYsX4ybRbBMD9qRG6Jsc8nLQRGTEKaB",
+  "QVzH3EeJNJyVKuza4iSEnrasY5UxSheU",
+];
+
+function secretBearingKnowbe4Fixture() {
+  const fixture = healthyFixture();
+  fixture.storePurchases[0].policy_url = `https://policies.knowbe4.example/download/acme.pdf?X-Amz-Signature=${KNOWBE4_FAKE_SECRETS[0]}`;
+  fixture.users[0].custom_field_1 = KNOWBE4_FAKE_SECRETS[1];
+  fixture.users[0].comment = `shared vpn password ${KNOWBE4_FAKE_SECRETS[2]}`;
+  fixture.account.integrations = [{ name: "SIEM webhook", webhook_url: `https://hooks.example.com/services/${KNOWBE4_FAKE_SECRETS[4]}`, shared_secret: KNOWBE4_FAKE_SECRETS[3] }];
+  const rows = fixture.recipientsByTest.get(String(fixture.securityTests[0].pst_id));
+  rows[0] = { ...rows[0], user: { ...rows[0].user, custom_field_2: KNOWBE4_FAKE_SECRETS[5] } };
+  fixture.trainingPolicies[0].settings = [{ name: "download_token", value: KNOWBE4_FAKE_SECRETS[6] }, { name: "minimum_time", value: "60" }];
+  fixture.trainingPolicies[0].policy_password = KNOWBE4_FAKE_SECRETS[7];
+  fixture.phisherMessages[0].attachmentUrl = `https://phisher.knowbe4.example/attachments/1?token=${KNOWBE4_FAKE_SECRETS[8]}`;
+  return fixture;
+}
+
+test("verdict rule 9: the KnowBe4 bundle and its zip never carry credential-shaped values, token-bearing URLs, or free-form user fields", async () => {
+  const base = createTempBase("grclanker-knowbe4-secrets-");
+  const tokens = { apiToken: KB_TEST_TOKEN, phisherApiToken: KB_PHISHER_TOKEN };
+  // Self-check: the planted values share no 6-character window with each other or with the healthy fixture's own output.
+  const baseline = await exportKnowbe4AuditBundle(mockClient(healthyFixture(), { phisher: true, config: tokens }), sampleConfig(tokens), createTempBase("grclanker-knowbe4-secrets-baseline-"), { now: NOW });
+  assertCanaryFixture(assert, [...KNOWBE4_FAKE_SECRETS, KB_TEST_TOKEN, KB_PHISHER_TOKEN], readBundleFiles(baseline.outputDir), "collected-object canaries");
+
+  const client = mockClient(secretBearingKnowbe4Fixture(), { phisher: true, config: tokens });
+  const result = await exportKnowbe4AuditBundle(client, client.getResolvedConfig(), base, { now: NOW });
+
+  assert.equal(result.findingCount, 20);
+  const files = readBundleFiles(result.outputDir);
+  const entries = readZipEntries(result.zipPath);
+  assert.ok(files.size >= 30, "the bundle directory was written");
+  assert.equal(entries.size, files.size, "the zip archive carries every bundle file");
+  const planted = [...KNOWBE4_FAKE_SECRETS, KB_TEST_TOKEN, KB_PHISHER_TOKEN];
+  assertCanaryWindowsAbsent(assert, files, planted, "bundle file");
+  assertCanaryWindowsAbsent(assert, entries, planted, "zip entry");
+
+  const purchases = JSON.parse(files.get(join("core_data", "store_purchases.json")));
+  assert.equal(purchases[0].policy_url, "https://policies.knowbe4.example", "the policy download URL keeps only scheme and host");
+  const users = JSON.parse(files.get(join("core_data", "users_active.json")));
+  assert.ok(!("custom_field_1" in users[0]) && !("comment" in users[0]), "free-form user fields are dropped at collection time");
+  assert.equal(users[0].email, "user1@acme.example", "assessment fields survive without PII redaction enabled");
+  const account = JSON.parse(files.get(join("core_data", "account.json")));
+  assert.equal(account.integrations[0].shared_secret, "[REDACTED]");
+  assert.equal(account.integrations[0].webhook_url, "https://hooks.example.com");
+  assert.equal(account.integrations[0].name, "SIEM webhook");
+  const recipients = JSON.parse(files.get(join("core_data", "security_test_recipients.json")));
+  assert.ok(recipients.every((sample) => sample.recipients.every((row) => !("custom_field_2" in row.user))), "embedded recipient users are projected too");
+  const policies = JSON.parse(files.get(join("core_data", "training_policies.json")));
+  assert.equal(policies[0].settings[0].value, "[REDACTED]");
+  assert.equal(policies[0].settings[1].value, "60");
+  assert.equal(policies[0].policy_password, "[REDACTED]");
+  const messages = JSON.parse(files.get(join("core_data", "phisher_messages.json")));
+  assert.equal(messages[0].attachmentUrl, "https://phisher.knowbe4.example");
+
+  const findings = JSON.parse(files.get(join("analysis", "findings.json")));
+  assert.equal(findings.find((item) => item.control === 11).status, "pass", "reducing policy_url does not change content currency");
+  assert.equal(findings.filter((item) => item.status === "pass").length, 17, "redaction leaves the healthy verdicts intact");
+});
+
+// ---------------------------------------------------------------------------------------------------------------
+// Addenda 2 to 6: the real client over an HTTP router that records every request the run makes.
+// ---------------------------------------------------------------------------------------------------------------
+
+// Every planted credential is alphanumeric and random-looking; helpers/canary-windows.mjs asserts every 6-to-24-character
+// window of each one absent, and the fixture self-check below proves no window occurs in the fixture's own values.
+const KB_TEST_TOKEN = "tTy4it2NbNVWLjmDrDgg4E5wiQxg7SDp";
+const KB_PHISHER_TOKEN = "4WVSdSG5bXWSpcsYrJWDqWoVbkoC6E6v";
+const KB_CANARIES = {
+  bearer: "4GMSvvHWpGX5UfGVS2GiWLCeUno3jBeN",
+  cookie: "ShdPECF3iZ73AsrqRCDSNBJndtHq8LUs",
+  apiKey: "CUD9ejYDya5wZQ7QnHUY2WsuhQQM8F3X",
+  urlToken: "zgLBVJZ37SdoNdbZfBfHeSQAkGYNYYfj",
+  jwtHeader: "hiEroWQpcidJArLSq7tEQG4LQt9AvEAR",
+  jwtPayload: "wVHitqDurMm9EnikZhoLd42URdFJbT6j",
+  jwtSignature: "JPrA66Ms5PDVBbHkKWRXnQVa4UwknUbW",
+};
+const KB_JWT_CANARY = `eyJ${KB_CANARIES.jwtHeader}.${KB_CANARIES.jwtPayload}.${KB_CANARIES.jwtSignature}`;
+
+const KB_HTML_ERROR_BODY = `<html><body><h1>502 Bad Gateway</h1><p>upstream sent Authorization: Bearer ${KB_CANARIES.bearer}; Set-Cookie: session=${KB_CANARIES.cookie}; api_key=${KB_CANARIES.apiKey}; retry at https://api.example.com/v1/x?token=${KB_CANARIES.urlToken} later; jwt ${KB_JWT_CANARY}</p></body></html>`;
+
+/** A proxy error page: non-JSON, carrying every credential class in its body. */
+function htmlGateway() {
+  return () => new Response(KB_HTML_ERROR_BODY, { status: 502, statusText: "Bad Gateway", headers: { "content-type": "text/html; charset=utf-8" } });
+}
+
+/** KnowBe4's documented JSON error shape whose message embeds a URL with a credential in its query string. */
+function jsonForbiddenWithUrl() {
+  return () => jsonResponse({ message: `Forbidden; see https://api.example.com/v1/x?token=${KB_CANARIES.urlToken} for details` }, { status: 403, statusText: "Forbidden" });
+}
+
+const KB_RECIPIENTS_ROUTE = "GET /v1/phishing/security_tests/{pst_id}/recipients";
+const KB_PHISHER_ROUTE = "POST /graphql";
+
+function pageOf(items, url) {
+  const per = Number(url.searchParams.get("per_page") ?? "500");
+  const page = Number(url.searchParams.get("page") ?? "1");
+  return jsonResponse(items.slice((page - 1) * per, page * per));
+}
+
+function phisherResponse(fixture, init) {
+  const body = JSON.parse(init.body);
+  const messages = fixture.phisherMessages;
+  if (/GrclankerPhisherMessageCount/.test(body.query)) {
+    return jsonResponse({ data: { phisherMessages: { pagination: { totalCount: messages.length } } } });
+  }
+  const per = body.variables.per ?? 100;
+  const page = body.variables.page ?? 1;
+  const nodes = messages.slice((page - 1) * per, page * per);
+  const pages = Math.max(1, Math.ceil(messages.length / per));
+  return jsonResponse({ data: { phisherMessages: { nodes, pagination: { page, pages, per, totalCount: messages.length, nextPageKey: null } } } });
+}
+
+/** One route per KnowBe4 surface, serving the fixture with the Reporting API's page/per_page pagination and the PhishER connection shape. */
+function kbRoutes(fixture) {
+  return {
+    "GET /v1/account": () => jsonResponse(fixture.account),
+    "GET /v1/account/risk_score_history": (url) => pageOf(fixture.riskHistory, url),
+    "GET /v1/users": (url) => pageOf(fixture.users, url),
+    "GET /v1/groups": (url) => pageOf(fixture.groups, url),
+    "GET /v1/phishing/campaigns": (url) => pageOf(fixture.phishingCampaigns, url),
+    "GET /v1/phishing/security_tests": (url) => pageOf(url.searchParams.get("campaign_type") === "callback" ? fixture.callbackTests : fixture.securityTests, url),
+    [KB_RECIPIENTS_ROUTE]: (url, pstId) => pageOf(fixture.recipientsByTest.get(pstId) ?? [], url),
+    "GET /v1/training/campaigns": (url) => pageOf(fixture.trainingCampaigns, url),
+    "GET /v1/training/enrollments": (url) => pageOf(fixture.enrollments, url),
+    "GET /v1/training/store_purchases": (url) => pageOf(fixture.storePurchases, url),
+    "GET /v1/training/policies": (url) => pageOf(fixture.trainingPolicies, url),
+    [KB_PHISHER_ROUTE]: (url, pstId, init) => phisherResponse(fixture, init),
+  };
+}
+
+/** The real Knowbe4ApiClient over a fetch router that records the method, path, URL, and status of every request served. */
+function httpKnowbe4(fixture, options = {}) {
+  const routes = { ...kbRoutes(fixture), ...(options.routes ?? {}) };
+  const log = [];
+  const fetchImpl = async (input, init = {}) => {
+    const url = new URL(typeof input === "string" ? input : input.url);
+    const method = (init.method ?? "GET").toUpperCase();
+    const recipients = url.pathname.match(/^\/v1\/phishing\/security_tests\/([^/]+)\/recipients$/);
+    const key = recipients ? KB_RECIPIENTS_ROUTE : `${method} ${url.pathname}`;
+    const handler = routes[key];
+    const response = handler
+      ? await handler(url, recipients ? decodeURIComponent(recipients[1]) : undefined, init)
+      : jsonResponse({ message: "Not Found" }, { status: 404, statusText: "Not Found" });
+    log.push({ method, path: url.pathname, url: url.toString(), status: response.status });
+    return response;
+  };
+  const config = sampleConfig({ apiToken: KB_TEST_TOKEN, phisherApiToken: options.phisher === false ? undefined : KB_PHISHER_TOKEN, ...(options.config ?? {}) });
+  const client = new Knowbe4ApiClient(config, { fetchImpl, sleepImpl: async () => {}, maxRetries: 0, minRequestIntervalMs: 0 });
+  return { client, config, log };
+}
+
+const KB_AREAS = [
+  ["phishing", assessKnowbe4PhishingProgram],
+  ["training", assessKnowbe4TrainingProgram],
+  ["risk", assessKnowbe4UserRisk],
+  ["governance", assessKnowbe4AccountGovernance],
+];
+
+/** What the four assess tools return: one snapshot per area, assessed with the default options. */
+async function runAllKnowbe4Assessments(client) {
+  const results = [];
+  for (const [area, assess] of KB_AREAS) {
+    const snapshot = await collectKnowbe4Snapshot(client, { scopes: [area], now: NOW });
+    results.push(assess(snapshot, { now: NOW }));
+  }
+  return results;
+}
+
+function kbMentionedEndpoints(text) {
+  return [...text.matchAll(/\b(GET|POST|PUT|PATCH|DELETE)\s+(\/[A-Za-z0-9_./?=&{}[\]-]+)/g)]
+    .map((match) => ({ method: match[1], path: match[2].split("?")[0].replace(/[.,;:)]+$/, "") }));
+}
+
+function kbMentionedStatusCodes(text) {
+  const codes = new Set();
+  for (const match of text.matchAll(/\b([1-5]\d\d) (?:OK|Forbidden|Unauthorized|Bad Request|Not Found|Too Many Requests|Internal Server Error|Bad Gateway|Service Unavailable|Gateway Timeout|Error)\b/g)) codes.add(Number(match[1]));
+  for (const match of text.matchAll(/request failed \(([1-5]\d\d)\b/g)) codes.add(Number(match[1]));
+  for (const match of text.matchAll(/"(?:http_)?status":\s*([1-5]\d\d)\b/g)) codes.add(Number(match[1]));
+  for (const match of text.matchAll(/\bHTTP ([1-5]\d\d)\b/g)) codes.add(Number(match[1]));
+  return [...codes];
+}
+
+/** Asserts every endpoint and status code named anywhere in `outputs` was requested and observed according to `log`. */
+function assertKbOutputMatchesRequestLog(outputs, log, label) {
+  const requested = new Set(log.map((entry) => `${entry.method} ${entry.path}`));
+  const statuses = new Set(log.map((entry) => entry.status));
+  let endpointMentions = 0;
+  let statusMentions = 0;
+  for (const [name, text] of outputs) {
+    for (const { method, path } of kbMentionedEndpoints(text)) {
+      endpointMentions += 1;
+      assert.ok(requested.has(`${method} ${path}`), `${label}: ${name} names ${method} ${path} but the run never requested it; requested: ${[...requested].sort().join(", ")}`);
+    }
+    for (const code of kbMentionedStatusCodes(text)) {
+      statusMentions += 1;
+      assert.ok(statuses.has(code), `${label}: ${name} names HTTP ${code} but no request observed it; observed: ${[...statuses]}`);
+    }
+  }
+  return { endpointMentions, statusMentions };
+}
+
+function leafEntries(value, path = "", output = []) {
+  if (Array.isArray(value)) {
+    if (value.length === 0) output.push([path, "[]"]);
+    value.forEach((entry, index) => leafEntries(entry, path ? `${path}.${index}` : String(index), output));
+  } else if (value !== null && typeof value === "object") {
+    const keys = Object.keys(value);
+    if (keys.length === 0) output.push([path, "{}"]);
+    for (const key of keys) leafEntries(value[key], path ? `${path}.${key}` : key, output);
+  } else {
+    output.push([path, value]);
+  }
+  return output;
+}
+
+function pluckPath(value, path) {
+  return path.split(".").reduce((cursor, key) => (cursor === null || cursor === undefined ? undefined : cursor[key]), value);
+}
+
+/** Every error string a KnowBe4 run can record, gathered from the access check, the assess payloads, and the bundle. */
+function kbRecordedErrorStrings(access, assessments, files) {
+  const strings = [];
+  for (const surface of access.surfaces) if (typeof surface.error === "string") strings.push(surface.error);
+  strings.push(...access.notes);
+  for (const assessment of assessments) {
+    strings.push(...(assessment.errors ?? []));
+    for (const finding of assessment.findings) {
+      strings.push(finding.summary);
+      for (const [, value] of leafEntries(finding.evidence ?? {})) if (typeof value === "string") strings.push(value);
+    }
+  }
+  const errorsLog = files.get("_errors.log");
+  if (errorsLog) strings.push(...errorsLog.split("\n"));
+  return strings;
+}
+
+test("canary fixture self-check: every planted KnowBe4 credential is alphanumeric, random-looking, and shares no 6-character window with the fixture's legitimate values", async () => {
+  const { client, config } = httpKnowbe4(healthyFixture());
+  const access = await checkKnowbe4Access(client);
+  const assessments = await runAllKnowbe4Assessments(client);
+  const exported = await exportKnowbe4AuditBundle(client, config, createTempBase("grclanker-knowbe4-self-check-"), { now: NOW });
+  const legitimate = new Map([
+    ...readBundleFiles(exported.outputDir),
+    ["fixture", JSON.stringify(healthyFixture())],
+    ["principal fixture", JSON.stringify(principalFixture())],
+    ["check_access", JSON.stringify(access)],
+    ["assessments", JSON.stringify(assessments)],
+    ["config", JSON.stringify({ ...config, apiToken: null, phisherApiToken: null })],
+  ]);
+  const canaries = [...Object.values(KB_CANARIES), KB_TEST_TOKEN, KB_PHISHER_TOKEN, ...KNOWBE4_FAKE_SECRETS, ...Object.values(KB_CONFIG_CANARIES), KB_PARSER_SNIPPET_CANARY];
+  assertCanaryFixture(assert, canaries, legitimate, "KnowBe4 canaries");
+});
+
+test("verdict rule 9 / addendum 2: the KnowBe4 bundle, its zip, every assess payload, and the access check never carry any window of a canary from an error body, and errors carry the status-and-length note", async () => {
+  const { client, config, log } = httpKnowbe4(healthyFixture(), {
+    routes: { "GET /v1/groups": htmlGateway(), "GET /v1/training/store_purchases": jsonForbiddenWithUrl() },
+  });
+
+  const access = await checkKnowbe4Access(client);
+  const result = await exportKnowbe4AuditBundle(client, config, createTempBase("grclanker-knowbe4-canary-"), { now: NOW });
+  const assessments = await runAllKnowbe4Assessments(client);
+
+  const files = readBundleFiles(result.outputDir);
+  const entries = readZipEntries(result.zipPath);
+  assert.ok(files.size >= 25 && entries.size === files.size, `expected the zip to mirror ${files.size} files, got ${entries.size}`);
+  const planted = [...Object.values(KB_CANARIES), KB_JWT_CANARY, config.apiToken, config.phisherApiToken];
+  assertCanaryWindowsAbsent(assert, files, planted, "bundle file");
+  assertCanaryWindowsAbsent(assert, entries, planted, "zip entry");
+  assertCanaryWindowsAbsent(assert, new Map([["check_access", JSON.stringify(access)], ["assessments", JSON.stringify(assessments)]]), planted, "tool payload");
+  assert.ok(log.some((entry) => entry.status === 502) && log.some((entry) => entry.status === 403), "both failing surfaces were requested");
+
+  // The non-JSON body is described by status and length; the JSON error is quoted with its URL query scrubbed.
+  const errors = files.get("_errors.log");
+  assert.match(errors, /^groups: KnowBe4 request failed \(502 Bad Gateway\) GET \/v1\/groups: 502 Bad Gateway: non-JSON body \(text\/html, \d+ bytes, not echoed\)$/m);
+  assert.match(errors, /^store_purchases: KnowBe4 request failed \(403 Forbidden\) GET \/v1\/training\/store_purchases: Forbidden; see https:\/\/api\.example\.com\/v1\/x\?\[REDACTED\] for details$/m);
+  assert.equal(result.errorCount, 2, `only the two failing surfaces are recorded:\n${errors}`);
+
+  // The observed status flows into the marker, the finding, the access surface, and the collection status; no "403" is
+  // invented for the 502 path and no endpoint is named from a constant.
+  const groups = JSON.parse(files.get("core_data/groups.json"));
+  assert.deepEqual(
+    { collected: groups.collected, status: groups.status, endpoint: groups.endpoint, reason: groups.reason },
+    { collected: false, status: 502, endpoint: "GET /v1/groups", reason: "not_readable" },
+  );
+  assert.match(groups.error, /non-JSON body \(text\/html/);
+  const purchases = JSON.parse(files.get("core_data/store_purchases.json"));
+  assert.deepEqual({ collected: purchases.collected, status: purchases.status, endpoint: purchases.endpoint }, { collected: false, status: 403, endpoint: "GET /v1/training/store_purchases" });
+
+  const risk = assessments[2];
+  const coverage = findingFor(risk, 8);
+  assert.equal(coverage.status, "manual");
+  assert.match(coverage.summary, /^Unreadable inventory: groups \(GET \/v1\/groups: KnowBe4 request failed \(502 Bad Gateway\) GET \/v1\/groups: 502 Bad Gateway: non-JSON body/);
+  assert.doesNotMatch(coverage.summary, /403/);
+  assert.equal(coverage.evidence.unreadable_inventories[0].http_status, 502);
+  const currency = findingFor(assessments[1], 11);
+  assert.notEqual(currency.status, "pass");
+  assert.match(currency.summary, /Unreadable inventory: store_purchases \(GET \/v1\/training\/store_purchases: KnowBe4 request failed \(403 Forbidden\).*\[REDACTED\]/);
+
+  const groupsProbe = access.surfaces.find((surface) => surface.name === "groups");
+  assert.deepEqual(
+    { status: groupsProbe.status, collected: groupsProbe.collected, http_status: groupsProbe.http_status, count: groupsProbe.count },
+    { status: "not_readable", collected: false, http_status: 502, count: null },
+  );
+  assert.match(groupsProbe.error, /502 Bad Gateway: non-JSON body \(text\/html, \d+ bytes, not echoed\)/);
+  const purchasesProbe = access.surfaces.find((surface) => surface.name === "store_purchases");
+  assert.deepEqual({ status: purchasesProbe.status, http_status: purchasesProbe.http_status }, { status: "not_readable", http_status: 403 });
+
+  const status = JSON.parse(files.get("core_data/collection_status.json"));
+  const groupsRow = status.inventories.find((row) => row.inventory === "groups");
+  assert.deepEqual(
+    { status: groupsRow.status, collected: groupsRow.collected, readable: groupsRow.readable, http_status: groupsRow.http_status, complete: groupsRow.complete, truncated: groupsRow.truncated, seen: groupsRow.seen, endpoint: groupsRow.endpoint },
+    { status: "not_readable", collected: false, readable: false, http_status: 502, complete: null, truncated: null, seen: null, endpoint: "GET /v1/groups" },
+  );
+  assert.equal(status.totals.not_readable, 2);
+  assert.equal(status.totals.truncation_unknown, 2);
+  // Readable rows name the request the listing made, never the templated documentation path.
+  const recipientsRow = status.inventories.find((row) => row.inventory === "security_test_recipients");
+  assert.match(recipientsRow.endpoint, /^GET \/v1\/phishing\/security_tests\/900\/recipients, GET \/v1\/phishing\/security_tests\/901\/recipients/);
+  assert.ok(!JSON.stringify([...files.values()]).includes("{pst_id}"), "no templated endpoint reaches the bundle");
+  const groupsState = risk.summary.inventories.find((row) => row.inventory === "groups");
+  assert.deepEqual({ status: groupsState.status, read: groupsState.read, http_status: groupsState.http_status, endpoint: groupsState.endpoint }, { status: "not_readable", read: false, http_status: 502, endpoint: "GET /v1/groups" });
+});
+
+test("addendum 5: every endpoint and status code named in KnowBe4 output corresponds to a request the run made and observed", async () => {
+  const fixture = healthyFixture();
+  const base = kbRoutes(fixture);
+  const { client, config, log } = httpKnowbe4(fixture, {
+    routes: {
+      "GET /v1/groups": htmlGateway(),
+      "GET /v1/training/store_purchases": jsonForbiddenWithUrl(),
+      "GET /v1/account/risk_score_history": () => jsonResponse({ message: "Not Found" }, { status: 404, statusText: "Not Found" }),
+      // Only one security test's recipient results are denied; the other per-test reads succeed.
+      [KB_RECIPIENTS_ROUTE]: (url, pstId, init) => (pstId === "901" ? jsonForbiddenWithUrl()() : base[KB_RECIPIENTS_ROUTE](url, pstId, init)),
+    },
+  });
+
+  const access = await checkKnowbe4Access(client);
+  const result = await exportKnowbe4AuditBundle(client, config, createTempBase("grclanker-knowbe4-request-log-"), { now: NOW });
+  const assessments = await runAllKnowbe4Assessments(client);
+  const outputs = [...readBundleFiles(result.outputDir), ["check_access", JSON.stringify(access)], ["assessments", JSON.stringify(assessments)]];
+
+  assert.deepEqual([...new Set(log.map((entry) => entry.status))].sort(), [200, 403, 404, 502], "the fixture served 200, 403, 404, and 502");
+  assert.ok(log.some((entry) => entry.path === "/v1/phishing/security_tests/901/recipients" && entry.status === 403), "the per-test recipients request was made and denied");
+  const { endpointMentions, statusMentions } = assertKbOutputMatchesRequestLog(outputs, log, "mixed denials");
+  assert.ok(endpointMentions > 40, `expected endpoint mentions across the bundle, got ${endpointMentions}`);
+  assert.ok(statusMentions > 5, `expected status mentions across the bundle, got ${statusMentions}`);
+  assert.ok(!JSON.stringify(outputs).includes("{pst_id}"), "no templated endpoint reaches the output");
+
+  // The per-test gap names the request the run made and the status it observed, alongside the tests that did load.
+  const phishing = assessments[0];
+  const coverage = findingFor(phishing, 2);
+  assert.notEqual(coverage.status, "pass");
+  assert.match(coverage.summary, /Unreadable inventory: security_test_recipients \(GET \/v1\/phishing\/security_tests\/901\/recipients: security_test_recipients\[901\]: KnowBe4 request failed \(403 Forbidden\) GET \/v1\/phishing\/security_tests\/901\/recipients: Forbidden; see https:\/\/api\.example\.com\/v1\/x\?\[REDACTED\] for details\)/);
+  const recipients = JSON.parse(readFileSync(join(result.outputDir, "core_data", "security_test_recipients.json"), "utf8"));
+  const failed = recipients.find((entry) => entry.collected === false);
+  assert.deepEqual({ pst_id: failed.pst_id, status: failed.status, endpoint: failed.endpoint, reason: failed.reason }, { pst_id: "901", status: 403, endpoint: "GET /v1/phishing/security_tests/901/recipients", reason: "not_readable" });
+  assert.equal(recipients.filter((entry) => entry.collected !== false).length, 5, "the five other tests inside the 180-day export window keep their samples");
+  const history = JSON.parse(readFileSync(join(result.outputDir, "core_data", "account_risk_score_history.json"), "utf8"));
+  assert.deepEqual({ collected: history.collected, status: history.status, endpoint: history.endpoint }, { collected: false, status: 404, endpoint: "GET /v1/account/risk_score_history" });
+  const trend = findingFor(phishing, 7);
+  assert.match(trend.summary, /account_risk_score_history \(GET \/v1\/account\/risk_score_history: KnowBe4 request failed \(404 Not Found\)/);
+  assert.doesNotMatch(trend.summary, /403/);
+});
+
+/** Every list dataset written to core_data, the route that fills it, and the file a readable-but-empty read leaves as `[]`. */
+const KB_CORE_DATA_DATASETS = [
+  { inventory: "account_risk_score_history", route: "GET /v1/account/risk_score_history", file: "core_data/account_risk_score_history.json" },
+  { inventory: "users", route: "GET /v1/users", file: "core_data/users_active.json" },
+  { inventory: "groups", route: "GET /v1/groups", file: "core_data/groups.json" },
+  { inventory: "phishing_campaigns", route: "GET /v1/phishing/campaigns", file: "core_data/phishing_campaigns.json" },
+  { inventory: "security_tests", route: "GET /v1/phishing/security_tests", file: "core_data/security_tests.json", callback: false },
+  { inventory: "callback_security_tests", route: "GET /v1/phishing/security_tests", file: "core_data/callback_security_tests.json", callback: true },
+  { inventory: "security_test_recipients", route: KB_RECIPIENTS_ROUTE, file: "core_data/security_test_recipients.json" },
+  { inventory: "training_campaigns", route: "GET /v1/training/campaigns", file: "core_data/training_campaigns.json" },
+  { inventory: "training_enrollments", route: "GET /v1/training/enrollments", file: "core_data/training_enrollments.json" },
+  { inventory: "store_purchases", route: "GET /v1/training/store_purchases", file: "core_data/store_purchases.json" },
+  { inventory: "training_policies", route: "GET /v1/training/policies", file: "core_data/training_policies.json" },
+  { inventory: "phisher_messages", route: KB_PHISHER_ROUTE, file: "core_data/phisher_messages.json" },
+];
+
+/** The healthy fixture with several inventories legitimately empty, so a readable-but-empty `[]` sits beside every denial. */
+function sparseFixture() {
+  return { ...healthyFixture(), riskHistory: [], groups: [], callbackTests: [], storePurchases: [], trainingPolicies: [], phisherMessages: [] };
+}
+
+/** Denies one dataset; the security test listing is split by campaign_type so the callback and standard reads deny independently. */
+function denyDataset(base, denial) {
+  const forbidden = jsonForbiddenWithUrl();
+  if (denial.callback === undefined) return forbidden;
+  return (url, pstId, init) => ((url.searchParams.get("campaign_type") === "callback") === denial.callback ? forbidden() : base[denial.route](url, pstId, init));
+}
+
+test("addendum 5: under each single-inventory denial the denied dataset's core_data file is a not-collected marker while readable-but-empty datasets stay []", async () => {
+  for (const denial of KB_CORE_DATA_DATASETS) {
+    const fixture = sparseFixture();
+    const { client, config, log } = httpKnowbe4(fixture, { routes: { [denial.route]: denyDataset(kbRoutes(fixture), denial) } });
+    const result = await exportKnowbe4AuditBundle(client, config, createTempBase("grclanker-knowbe4-marker-"), { now: NOW });
+    const files = readBundleFiles(result.outputDir);
+    const label = `${denial.inventory} denied`;
+
+    const denied = JSON.parse(files.get(denial.file));
+    assert.ok(!Array.isArray(denied), `${label}: ${denial.file} must be a marker object, not an array`);
+    assert.equal(denied.collected, false, label);
+    assert.equal(denied.status, 403, `${label}: the marker carries the observed status`);
+    assert.equal(denied.reason, "not_readable", label);
+    assert.match(denied.error, /KnowBe4 request failed \(403 Forbidden\)/, label);
+    assertCanaryWindowsAbsent(assert, JSON.stringify(denied), [KB_CANARIES.urlToken], `${label} marker`);
+    const requested = new Set(log.filter((entry) => entry.status === 403).map((entry) => `${entry.method} ${entry.path}`));
+    for (const endpoint of denied.endpoint.split(", ")) {
+      assert.ok(requested.has(endpoint.split("?")[0].replace(/ phisherMessages$/, "")), `${label}: marker names ${endpoint}, which was not the denied request (${[...requested].join(", ")})`);
+    }
+    if (denial.inventory === "security_test_recipients") {
+      const deniedReads = log.filter((entry) => /\/recipients$/.test(entry.path) && entry.status === 403).length;
+      assert.ok(Array.isArray(denied.failed_reads) && deniedReads > 0 && denied.failed_reads.length === deniedReads, `${label}: one failed read per sampled test (${deniedReads} denied requests)`);
+      assert.ok(denied.failed_reads.every((read) => read.collected === false && read.status === 403 && /^GET \/v1\/phishing\/security_tests\/\d+\/recipients$/.test(read.endpoint)), label);
+    }
+    if (denial.inventory === "security_tests") {
+      // No per-test read is attempted when the test listing is denied, so the recipients file is a not-requested marker naming no endpoint.
+      const recipients = JSON.parse(files.get("core_data/security_test_recipients.json"));
+      assert.deepEqual({ collected: recipients.collected, status: recipients.status, endpoint: recipients.endpoint, reason: recipients.reason }, { collected: false, status: "not-collected", endpoint: null, reason: "not_requested" });
+    }
+
+    const emptyFile = denial.inventory === "training_policies" ? "core_data/store_purchases.json" : "core_data/training_policies.json";
+    assert.deepEqual(JSON.parse(files.get(emptyFile)), [], `${label}: a readable-but-empty dataset stays []`);
+    const status = JSON.parse(files.get("core_data/collection_status.json"));
+    const row = status.inventories.find((entry) => entry.inventory === denial.inventory);
+    assert.deepEqual({ status: row.status, collected: row.collected, readable: row.readable, http_status: row.http_status, complete: row.complete, truncated: row.truncated, seen: row.seen }, { status: "not_readable", collected: false, readable: false, http_status: 403, complete: null, truncated: null, seen: null }, label);
+    const emptyRow = status.inventories.find((entry) => entry.inventory === (denial.inventory === "training_policies" ? "store_purchases" : "training_policies"));
+    assert.deepEqual({ status: emptyRow.status, complete: emptyRow.complete, truncated: emptyRow.truncated, seen: emptyRow.seen }, { status: "readable", complete: true, truncated: false, seen: 0 }, `${label}: the empty inventory is a complete, untruncated read of zero records`);
+  }
+
+  // The account is a single record, not a list, and gets the same marker when denied.
+  const { client, config } = httpKnowbe4(sparseFixture(), { routes: { "GET /v1/account": jsonForbiddenWithUrl() } });
+  const result = await exportKnowbe4AuditBundle(client, config, createTempBase("grclanker-knowbe4-marker-"), { now: NOW });
+  const account = JSON.parse(readBundleFiles(result.outputDir).get("core_data/account.json"));
+  assert.deepEqual({ collected: account.collected, status: account.status, endpoint: account.endpoint, reason: account.reason }, { collected: false, status: 403, endpoint: "GET /v1/account", reason: "not_readable" });
+});
+
+/**
+ * Principals that only one inventory (or one combination of inventories) can name. Each is asserted present in the
+ * all-readable baseline and absent from every assess payload and the bundle when any listed inventory is denied.
+ * A `control` scopes the check to that finding's evidence: the inactive user is still a legitimately named high-risk
+ * user from the readable user list, but may not be called inactive once phishing or training participation is unread.
+ */
+const KB_PRINCIPAL_CANARIES = [
+  { canary: "AcmeCanaryAccountNameQz", inventories: ["account"] },
+  { canary: "admin-canary-q7x@acme.example", inventories: ["account"] },
+  { canary: "inactive-canary-u11@acme.example", inventories: ["users"] },
+  { canary: "inactive-canary-u11@acme.example", inventories: ["security_tests", "security_test_recipients", "training_enrollments"], control: 18 },
+  { canary: "CanaryUncoveredGroupZq", inventories: ["groups", "phishing_campaigns", "training_campaigns"] },
+  { canary: "Canary Security Test Vw", inventories: ["security_tests"] },
+  { canary: "recipient-canary-r9@acme.example", inventories: ["security_test_recipients", "training_enrollments", "security_tests"] },
+  { canary: "Canary Training Campaign Tk", inventories: ["training_campaigns"] },
+  { canary: "Canary Stale Module Mj", inventories: ["training_campaigns"] },
+  { canary: "late-canary-l3@acme.example", inventories: ["users"] },
+  { canary: "late-canary-l3@acme.example", inventories: ["training_enrollments"], control: 4 },
+  { canary: "Canary Callback Test Cb", inventories: ["callback_security_tests"] },
+];
+
+/** The healthy fixture with one principal per inventory that no other inventory carries, and campaigns targeting named groups. */
+function principalFixture() {
+  const fixture = healthyFixture();
+  fixture.account.name = "AcmeCanaryAccountNameQz";
+  fixture.account.admins.push({ id: 77, first_name: "AdminCanary", last_name: "Qx", email: "admin-canary-q7x@acme.example" });
+  // A user who never signed in, was never phished, and was never enrolled: inactive, and named only by the users inventory.
+  fixture.users.push(user(11, { first_name: "InactiveCanary", last_name: "Ueleven", email: "inactive-canary-u11@acme.example", joined_on: daysAgo(400), last_sign_in: null, groups: [101] }));
+  // A recent joiner enrolled well after the grace period: late, named by the users and enrollments inventories.
+  const lateUser = user(12, { first_name: "LateCanary", last_name: "Lthree", email: "late-canary-l3@acme.example", joined_on: daysAgo(100), groups: [100] });
+  fixture.users.push(lateUser);
+  fixture.enrollments.push(enrollment(500, lateUser, 701, "Security Awareness Fundamentals", daysAgo(50)));
+  for (const item of fixture.securityTests) fixture.recipientsByTest.get(String(item.pst_id)).push(recipient(item.pst_id, lateUser, item.started_at));
+  // Campaigns target the two console groups by name, so a third group no campaign targets is uncovered and named.
+  const targeted = [{ group_id: 100, name: "Finance" }, { group_id: 101, name: "Engineering" }];
+  for (const campaign of [...fixture.phishingCampaigns, ...fixture.trainingCampaigns]) campaign.groups = targeted;
+  fixture.groups.push({ id: 102, name: "CanaryUncoveredGroupZq", group_type: "console_group", adi_guid: null, member_count: 2, current_risk_score: 30, status: "active" });
+  // The latest security test carries a name only the security_tests inventory holds.
+  fixture.securityTests[0].name = "Canary Security Test Vw";
+  // A recipient who clicked, past the remedial window, in neither the user list nor the enrollments: unremediated, named only by recipient results.
+  const failedTest = fixture.securityTests[1];
+  const canaryRecipient = { id: 91, first_name: "RecipientCanary", last_name: "Rnine", email: "recipient-canary-r9@acme.example" };
+  fixture.recipientsByTest.get(String(failedTest.pst_id)).push(recipient(failedTest.pst_id, canaryRecipient, failedTest.started_at, {
+    opened_at: failedTest.started_at,
+    clicked_at: new Date(new Date(failedTest.started_at).getTime() + 1_800_000).toISOString(),
+  }));
+  // A completed training campaign whose only module is years old: stale content named only by the training_campaigns inventory.
+  fixture.trainingCampaigns.push({
+    campaign_id: 702,
+    name: "Canary Training Campaign Tk",
+    groups: targeted,
+    status: "Completed",
+    content: [{ store_purchase_id: 3, content_type: "Store Purchase", name: "Canary Stale Module Mj", publish_date: "2021-01-01T00:00:00Z", retired: false }],
+    duration_type: "Specific End Date",
+    start_date: daysAgo(80),
+    end_date: daysAgo(40),
+    relative_duration: null,
+    auto_enroll: true,
+    allow_multiple_enrollments: false,
+    completion_percentage: 97,
+  });
+  fixture.callbackTests[0].name = "Canary Callback Test Cb";
+  return fixture;
+}
+
+const KB_SINGLE_INVENTORY_DENIALS = KB_CORE_DATA_DATASETS.concat([{ inventory: "account", route: "GET /v1/account", file: "core_data/account.json" }]);
+
+const KB_FALLBACK_VALUES = new Set([0, false, "none", "[]", "{}"]);
+
+/** Fields that describe the read itself (read-state flags, inventory states, gaps, caveats) and legitimately flip under a denial. */
+const KB_READ_STATE_PATHS = [
+  /(^|\.)[a-z_]*(complete|readable|observed|loaded|read|sampled|available)$/,
+  /^inventories(\.|$)/,
+  /^unreadable_inventories(\.|$)/,
+  /^truncated_inventories(\.|$)/,
+  /^collection_error$/,
+  /^(pass|warn|fail|manual)$/,
+];
+
+/** True when a denied-run value is a zero, false, or empty fallback where the all-readable baseline held real data. */
+function isKbFallback(path, value, baselineValue) {
+  if (!KB_FALLBACK_VALUES.has(value)) return false;
+  if (baselineValue === undefined || baselineValue === null || KB_FALLBACK_VALUES.has(baselineValue)) return false;
+  if (Array.isArray(baselineValue) && baselineValue.length === 0) return false;
+  if (typeof baselineValue === "object" && !Array.isArray(baselineValue) && Object.keys(baselineValue).length === 0) return false;
+  return !KB_READ_STATE_PATHS.some((pattern) => pattern.test(path));
+}
+
+test("addendum 3: under every single-inventory denial no KnowBe4 finding, summary, or tool payload falls back to a zero, false, or empty value, and no principal is named from the denied inventory", async () => {
+  const baselineRun = httpKnowbe4(principalFixture());
+  const baseline = await runAllKnowbe4Assessments(baselineRun.client);
+  const baselineExport = await exportKnowbe4AuditBundle(baselineRun.client, baselineRun.config, createTempBase("grclanker-knowbe4-principal-baseline-"), { now: NOW });
+  const baselineText = JSON.stringify(baseline) + [...readBundleFiles(baselineExport.outputDir).values()].join("\n");
+  for (const { canary } of KB_PRINCIPAL_CANARIES) {
+    assert.ok(JSON.stringify(baseline).includes(canary), `${canary} must be named by an all-readable assess payload for its gating check to mean anything`);
+  }
+  assert.ok(baselineText.length > 0);
+
+  const offenders = [];
+  let comparedLeaves = 0;
+  for (const denial of KB_SINGLE_INVENTORY_DENIALS) {
+    const fixture = principalFixture();
+    const { client, config } = httpKnowbe4(fixture, { routes: { [denial.route]: denyDataset(kbRoutes(fixture), denial) } });
+    const denied = await runAllKnowbe4Assessments(client);
+    const exported = await exportKnowbe4AuditBundle(client, config, createTempBase("grclanker-knowbe4-principal-"), { now: NOW });
+    const files = readBundleFiles(exported.outputDir);
+    const label = `${denial.inventory} denied`;
+    // Raw core_data records are the readable inventories themselves; the gating rule covers what the run asserts about
+    // principals, so the analysis, compliance, and quick-reference files are scanned alongside the tool payloads.
+    const derived = [...files].filter(([name]) => !name.startsWith("core_data/"));
+    const deniedText = JSON.stringify(denied) + derived.map(([, text]) => text).join("\n");
+    for (const { canary, inventories, control } of KB_PRINCIPAL_CANARIES) {
+      if (!inventories.includes(denial.inventory)) continue;
+      if (control !== undefined) {
+        const item = denied.flatMap((result) => result.findings).find((candidate) => candidate.control === control);
+        assert.ok(!JSON.stringify(item).includes(canary), `${label}: control ${control} still names ${canary} from the denied inventory: ${JSON.stringify(item.evidence)}`);
+        continue;
+      }
+      const where = [
+        ...leafEntries(denied).filter(([, value]) => typeof value === "string" && value.includes(canary)).map(([path]) => `assessments.${path}`),
+        ...derived.filter(([, text]) => text.includes(canary)).map(([name]) => name),
+      ];
+      assert.ok(!deniedText.includes(canary), `${label}: ${canary} is still named from the denied inventory at ${where.join(", ")}`);
+    }
+    for (const [areaIndex, result] of denied.entries()) {
+      const baselineResult = baseline[areaIndex];
+      for (const [path, value] of leafEntries(result.summary)) {
+        comparedLeaves += 1;
+        const baselineValue = pluckPath(baselineResult.summary, path);
+        if (isKbFallback(path, value, baselineValue)) offenders.push(`${label}: ${result.area} summary.${path} = ${JSON.stringify(value)} (baseline ${JSON.stringify(baselineValue)})`);
+      }
+      for (const item of result.findings) {
+        const baselineFinding = findingFor(baselineResult, item.control);
+        for (const [path, value] of leafEntries(item.evidence ?? {})) {
+          comparedLeaves += 1;
+          const baselineValue = pluckPath(baselineFinding.evidence ?? {}, path);
+          if (isKbFallback(path, value, baselineValue)) offenders.push(`${label}: control ${item.control} evidence.${path} = ${JSON.stringify(value)} (baseline ${JSON.stringify(baselineValue)})`);
+        }
+      }
+    }
+    // The bundle's assessment-level summaries get the same treatment as the tool payloads.
+    const baselineAnalysis = readBundleFiles(baselineExport.outputDir);
+    for (const name of ["analysis/phishing.json", "analysis/training.json", "analysis/risk.json", "analysis/governance.json"]) {
+      if (!files.has(name)) continue;
+      const summary = JSON.parse(files.get(name)).summary ?? {};
+      const baselineSummary = JSON.parse(baselineAnalysis.get(name)).summary ?? {};
+      for (const [path, value] of leafEntries(summary)) {
+        comparedLeaves += 1;
+        if (isKbFallback(path, value, pluckPath(baselineSummary, path))) offenders.push(`${label}: ${name} summary.${path} = ${JSON.stringify(value)}`);
+      }
+    }
+  }
+  assert.ok(comparedLeaves > 3000, `expected the sweep to compare thousands of leaves, got ${comparedLeaves}`);
+  assert.deepEqual(offenders, [], `values that fell back to zero, false, or empty under a denial:\n${offenders.join("\n")}`);
+});
+
+// ---------------------------------------------------------------------------------------------------------------
+// Addendum 4: every surface fails in turn with a 502 HTML page and a JSON error carrying canaries.
+// ---------------------------------------------------------------------------------------------------------------
+
+/** How each route is named in an error string, so the strings about a failing surface can be picked out. */
+function kbSurfacePattern(route) {
+  if (route === KB_RECIPIENTS_ROUTE) return /GET \/v1\/phishing\/security_tests\/\d+\/recipients/;
+  return new RegExp(route.replace(/[/]/g, "\\/"));
+}
+
+test("addendum 4: a 502 HTML page or a JSON error message carrying credentials on any KnowBe4 surface never reaches the access check, an assess payload, or the bundle, and every recorded error carries the status-and-length note", async () => {
+  const surfaces = Object.keys(kbRoutes(healthyFixture()));
+  assert.equal(surfaces.length, 12, "every collector and access probe route");
+  const variants = [
+    { name: "html502", handler: htmlGateway, note: /502 Bad Gateway: non-JSON body \(text\/html, \d+ bytes, not echoed\)/ },
+    { name: "json403", handler: jsonForbiddenWithUrl, note: /\(403 Forbidden\)/ },
+  ];
+  let notedSurfaces = 0;
+  for (const surface of surfaces) {
+    for (const variant of variants) {
+      const { client, config } = httpKnowbe4(healthyFixture(), { routes: { [surface]: variant.handler() } });
+      const label = `${surface} ${variant.name}`;
+      const planted = [...Object.values(KB_CANARIES), KB_JWT_CANARY, config.apiToken, config.phisherApiToken];
+
+      const access = await checkKnowbe4Access(client);
+      const assessments = await runAllKnowbe4Assessments(client);
+      const result = await exportKnowbe4AuditBundle(client, config, createTempBase("grclanker-knowbe4-surface-canary-"), { now: NOW });
+      const files = readBundleFiles(result.outputDir);
+      const entries = readZipEntries(result.zipPath);
+
+      assertCanaryWindowsAbsent(assert, files, planted, `${label} bundle file`);
+      assertCanaryWindowsAbsent(assert, entries, planted, `${label} zip entry`);
+      assertCanaryWindowsAbsent(assert, new Map([["check_access", JSON.stringify(access)], ["assessments", JSON.stringify(assessments)]]), planted, `${label} tool payload`);
+
+      const pattern = kbSurfacePattern(surface);
+      const aboutSurface = kbRecordedErrorStrings(access, assessments, files).filter((text) => pattern.test(text) && /request failed|timed out/.test(text));
+      assert.ok(aboutSurface.length > 0, `${label}: the failure is recorded somewhere`);
+      notedSurfaces += 1;
+      for (const text of aboutSurface) {
+        assert.match(text, variant.note, `${label}: error string lacks the status note: ${text}`);
+        assert.ok(!/<html|Bad Gateway<\/|upstream sent/.test(text), `${label}: error string echoes the body: ${text}`);
+        if (variant.name === "json403") assertCanaryWindowsAbsent(assert, text, [KB_CANARIES.urlToken], `${label} error string`);
+      }
+    }
+  }
+  assert.equal(notedSurfaces, surfaces.length * variants.length);
+});
+
+// ---------------------------------------------------------------------------------------------------------------
+// Addenda 6 and 6b: config loader errors are fixed text carrying only the path, a validated code, and a line.
+// ---------------------------------------------------------------------------------------------------------------
+
+const KB_CONFIG_CANARIES = {
+  nestedKey: "UfJ5c4A7p6pL5VJpnbCyGKExThjgzGZV",
+  nestedValue: "Wi2seuvnQDjpk2UxuJBrwco7B4tCrzqN",
+  alias: "sehnBAdXx2kHYN8SfAk9HfdMM6UEYrnS",
+  unreadable: "9WWhhs4NH3gsi2oJGCcfZkWbDMrPq7jB",
+};
+const KB_PARSER_SNIPPET_CANARY = "sFp3XJQYXRyCxM7KH9e4mnZXTzaHVQQk";
+
+const LIBRARY_WORDING = ["Nested mappings", "is not valid JSON", "Unresolved alias", "illegal operation", "permission denied", "no such file"];
+
+/** Asserts a message carries neither any window of a canary nor the parser's or filesystem's own wording. */
+function assertFixedTextOnly(message, canaries, label) {
+  assertCanaryWindowsAbsent(assert, message, canaries, label);
+  for (const wording of LIBRARY_WORDING) assert.ok(!message.includes(wording), `${label}: carries library wording "${wording}": ${message}`);
+}
+
+test("config loader errors: a KnowBe4 config file that cannot be read or parsed yields fixed text with only the path, a validated code, and the parser's line, from the resolver and from check_access", async () => {
+  const registered = [];
+  registerKnowbe4Tools({ registerTool: (tool) => registered.push(tool) });
+  const checkTool = registered.find((tool) => tool.name === "knowbe4_check_access");
+  const exportTool = registered.find((tool) => tool.name === "knowbe4_export_audit_bundle");
+  const canaries = Object.values(KB_CONFIG_CANARIES);
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = () => { throw new Error("no request may be made while the config file is unreadable"); };
+  try {
+    const base = createTempBase("grclanker-knowbe4-config-errors-");
+    const cases = [];
+
+    // YAML nested mapping: the parser quotes the whole source line, key, value, and bearer token included.
+    const nested = join(base, "nested.yaml");
+    writeFileSync(nested, `api_token: ${KB_CONFIG_CANARIES.nestedKey}: Bearer ${KB_CONFIG_CANARIES.nestedValue}\n`, "utf8");
+    assert.throws(() => parseYaml(readFileSync(nested, "utf8")), (error) => error.message.includes(KB_CONFIG_CANARIES.nestedKey) && error.message.includes("Nested mappings"), "positive control: yaml.parse quotes the line");
+    cases.push({ name: "yaml nested mapping", path: nested, code: "INVALID_YAML", line: 1, message: `Unable to parse KnowBe4 config file: invalid YAML in ${nested} at line 1` });
+
+    // YAML alias: a plain ReferenceError (no linePos) whose message leads with the value and no key name.
+    const alias = join(base, "alias.yaml");
+    writeFileSync(alias, `api_token: *${KB_CONFIG_CANARIES.alias}\n`, "utf8");
+    assert.throws(() => parseYaml(readFileSync(alias, "utf8")), (error) => error instanceof ReferenceError && error.message.includes(KB_CONFIG_CANARIES.alias) && error.message.includes("Unresolved alias"), "positive control: yaml.parse throws a ReferenceError carrying the value");
+    cases.push({ name: "yaml alias", path: alias, code: "INVALID_YAML", line: undefined, message: `Unable to parse KnowBe4 config file: invalid YAML in ${alias}` });
+
+    // EISDIR: a directory at the path is a read failure, not a parse failure.
+    const directory = join(base, "config-dir");
+    mkdirSync(directory);
+    assert.throws(() => readFileSync(directory, "utf8"), (error) => error.code === "EISDIR" && /illegal operation/.test(error.message), "positive control: the filesystem message carries its own wording");
+    cases.push({ name: "EISDIR", path: directory, code: "EISDIR", line: undefined, message: `Unable to read KnowBe4 config file ${directory} (EISDIR)` });
+
+    // EACCES: an unreadable file (root reads everything, so the case is skipped when running as root).
+    if (typeof process.getuid === "function" && process.getuid() !== 0) {
+      const unreadable = join(base, "unreadable.yaml");
+      writeFileSync(unreadable, `api_token: ${KB_CONFIG_CANARIES.unreadable}\n`, "utf8");
+      chmodSync(unreadable, 0o000);
+      assert.throws(() => readFileSync(unreadable, "utf8"), (error) => error.code === "EACCES" && /permission denied/.test(error.message), "positive control");
+      cases.push({ name: "EACCES", path: unreadable, code: "EACCES", line: undefined, message: `Unable to read KnowBe4 config file ${unreadable} (EACCES)` });
+    }
+
+    // ENOENT on an explicit path: a missing file named by argument or environment is an error, not a silent default.
+    const missing = join(base, "missing.yaml");
+    cases.push({ name: "ENOENT", path: missing, code: "ENOENT", line: undefined, message: `Unable to read KnowBe4 config file ${missing} (ENOENT)` });
+
+    for (const item of cases) {
+      let thrown;
+      try {
+        resolveKnowbe4Configuration({ config_file: item.path }, {}, base, base);
+      } catch (error) {
+        thrown = error;
+      }
+      assert.ok(thrown, `${item.name}: the resolver must reject the file`);
+      assert.equal(thrown.name, "Knowbe4ConfigFileError", item.name);
+      assert.equal(thrown.message, item.message, `${item.name}: fixed text only`);
+      assert.equal(thrown.code, item.code, item.name);
+      assert.equal(thrown.line, item.line, item.name);
+      assert.equal(thrown.path, item.path, item.name);
+      assertFixedTextOnly(thrown.message, canaries, `${item.name} resolver`);
+
+      const access = await checkTool.execute("call-config", checkTool.prepareArguments({ config_file: item.path }));
+      assert.equal(access.isError, true, item.name);
+      assert.equal(access.content[0].text, `KnowBe4 access check failed: ${item.message}`, item.name);
+      assertFixedTextOnly(JSON.stringify(access), canaries, `${item.name} check_access`);
+
+      const outputDir = join(base, `export-${item.code}`);
+      const exported = await exportTool.execute("call-config-export", exportTool.prepareArguments({ config_file: item.path, output_dir: outputDir }));
+      assert.equal(exported.isError, true, item.name);
+      assert.equal(exported.content[0].text, `KnowBe4 audit bundle export failed: ${item.message}`, item.name);
+      assert.equal(existsSync(outputDir), false, `${item.name}: nothing is written when the config file is unreadable`);
+    }
+
+    // The environment variable is an explicit path too, and a missing default file is still simply absent.
+    assert.throws(() => resolveKnowbe4Configuration({ api_token: "t" }, { KNOWBE4_CONFIG_FILE: missing }, base, base), { message: `Unable to read KnowBe4 config file ${missing} (ENOENT)` });
+    assert.equal(resolveKnowbe4Configuration({ api_token: "t" }, {}, base, base).apiToken, "t");
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("config loader errors: a SyntaxError raised by the transport is recorded by name only, never by the parser's message that quotes the body", async () => {
+  const snippet = `<html>${KB_PARSER_SNIPPET_CANARY}</html>`;
+  const client = new Knowbe4ApiClient(sampleConfig(), {
+    fetchImpl: async () => { throw new SyntaxError(`Unexpected token '<', "${snippet}"... is not valid JSON`); },
+    minRequestIntervalMs: 0,
+    maxRetries: 0,
+  });
+  await assert.rejects(() => client.getAccount(), (error) => {
+    assert.equal(error.message, "KnowBe4 request failed: GET /v1/account: SyntaxError: response could not be parsed as JSON; the parser's message is not recorded because it quotes the body");
+    assert.equal(error.status, null);
+    return true;
+  });
+  const access = await checkKnowbe4Access(client);
+  assertCanaryWindowsAbsent(assert, JSON.stringify(access), [KB_PARSER_SNIPPET_CANARY], "check_access");
+  assert.ok(access.surfaces.every((surface) => surface.status !== "readable" || surface.name === "phisher_messages"));
+  const snapshot = await collectKnowbe4Snapshot(client, { scopes: ["risk"], now: NOW });
+  assert.ok(snapshot.errors.length > 0 && snapshot.errors.every((text) => text.includes("SyntaxError: response could not be parsed as JSON")), snapshot.errors.join("\n"));
+  assertCanaryWindowsAbsent(assert, JSON.stringify(snapshot), [KB_PARSER_SNIPPET_CANARY], "snapshot");
+});
+
+// ---------------------------------------------------------------------------------------------------------------
+// Scrub boundary: fixed message text and every string a run records about legitimate data survive the scrubber.
+// ---------------------------------------------------------------------------------------------------------------
+
+/** Every fixed-text message the KnowBe4 integration emits that a fixture run does not already produce. */
+const KB_FIXED_TEXT_MESSAGES = [
+  "Unable to read KnowBe4 config file /home/auditor/.knowbe4-inspector/config.yaml (ENOENT)",
+  "Unable to read KnowBe4 config file /home/auditor/.knowbe4-inspector/config.yaml (EACCES)",
+  "Unable to parse KnowBe4 config file: invalid YAML in /home/auditor/.knowbe4-inspector/config.yaml at line 3",
+  "Unable to parse KnowBe4 config file: invalid YAML in /home/auditor/.knowbe4-inspector/config.yaml",
+  "KnowBe4 Reporting API token is required. Pass api_token, set KNOWBE4_API_TOKEN, or add api_token to ~/.knowbe4-inspector/config.yaml.",
+  'Unsupported KnowBe4 region "mars". Use one of: us, eu, ca, uk, de.',
+  "502 Bad Gateway: non-JSON body (text/html, 5120 bytes, not echoed)",
+  "403 Forbidden: JSON body without a documented error field (64 bytes, not echoed)",
+  "KnowBe4 request failed (502 Bad Gateway) GET /v1/groups: 502 Bad Gateway: non-JSON body (text/html, 5120 bytes, not echoed)",
+  "KnowBe4 request failed (403 Forbidden) GET /v1/training/store_purchases: Forbidden; see https://api.example.com/v1/x?[REDACTED] for details",
+  "KnowBe4 request timed out after 30000ms: GET /v1/users?page=1&per_page=500",
+  "KnowBe4 request failed: GET /v1/account: SyntaxError: response could not be parsed as JSON; the parser's message is not recorded because it quotes the body",
+  "Using KnowBe4 region us (https://us.api.knowbe4.com).",
+  "Regenerate the Reporting API key in the KnowBe4 console (Account Settings, API section) and confirm the region matches where the account is hosted.",
+  "Config precedence resolved from: environment-api-token -> config-region -> config-file-present.",
+  "Account Settings > API: the Reporting API key's creation date and the admin who owns it",
+  "Users > Groups: membership of every console group targeted by a phishing or training campaign",
+  JSON.stringify({ collected: false, status: "not-collected", endpoint: null, error: null, reason: "not_requested" }),
+  JSON.stringify({ collected: false, status: 403, endpoint: "GET /v1/groups", error: "KnowBe4 request failed (403 Forbidden) GET /v1/groups: Forbidden", reason: "not_readable" }),
+];
+
+test("scrub boundary: every fixed-text message the KnowBe4 integration emits survives its own scrubber unchanged, including every string a healthy or partially denied run records", async () => {
+  for (const message of KB_FIXED_TEXT_MESSAGES) {
+    assert.equal(scrubErrorText(message), message, `fixed text was altered by the scrubber: ${message}`);
+  }
+
+  // Every string a run writes about legitimate data is fixed text from the run's point of view: the scrubber must not
+  // rewrite a finding summary, a manual-evidence instruction, an inventory gap, or a bundle document. The principal
+  // fixture is used so every named user, group, campaign, and test the run can mention is part of the sweep.
+  const runs = [httpKnowbe4(principalFixture())];
+  for (const denial of KB_SINGLE_INVENTORY_DENIALS) {
+    const fixture = principalFixture();
+    runs.push(httpKnowbe4(fixture, { routes: { [denial.route]: denyDataset(kbRoutes(fixture), denial) } }));
+  }
+  let checked = 0;
+  const altered = new Set();
+  for (const { client, config } of runs) {
+    const access = await checkKnowbe4Access(client);
+    const assessments = await runAllKnowbe4Assessments(client);
+    const exported = await exportKnowbe4AuditBundle(client, config, createTempBase("grclanker-knowbe4-scrub-survival-"), { now: NOW });
+    const files = readBundleFiles(exported.outputDir);
+    const texts = [
+      ...kbRecordedErrorStrings(access, assessments, files),
+      ...[...files].filter(([name]) => !name.startsWith("core_data/")).map(([, text]) => text),
+      ...leafEntries(assessments).map(([, value]) => value).filter((value) => typeof value === "string"),
+    ];
+    checked += texts.length;
+    for (const alteration of scrubAlterations(texts, scrubErrorText)) altered.add(alteration);
+  }
+  assert.ok(checked > 2000, `expected thousands of recorded strings, got ${checked}`);
+  assert.deepEqual([...altered], [], `legitimate run text altered by the scrubber:\n${[...altered].join("\n")}`);
+});
+
+// ---------------------------------------------------------------------------------------------------------------
+// Review round 1: base URL userinfo, scrub before the detail cut, silent success.
+// ---------------------------------------------------------------------------------------------------------------
+
+const KB_USERINFO_PASSWORD = "Wq7pLz3KfR9vT2mXc8NbH4yJ";
+
+test("rule 9: a user:password@ userinfo in the base URL is dropped at resolution and its password reaches no surface, request label, or bundle file", async () => {
+  const config = resolveKnowbe4Configuration(
+    { base_url: `https://audit:${KB_USERINFO_PASSWORD}@us.api.knowbe4.com/` },
+    { KNOWBE4_API_TOKEN: KB_TEST_TOKEN, KNOWBE4_REGION: "us" },
+    createTempBase("grclanker-knowbe4-userinfo-home-"),
+  );
+  assert.equal(config.baseUrl, "https://us.api.knowbe4.com", "scheme and host only");
+  assertCanaryWindowsAbsent(assert, JSON.stringify(config), [KB_USERINFO_PASSWORD], "resolved configuration");
+
+  // Every read fails with a body that echoes the request URL with its userinfo, the way a proxy would.
+  const fixture = healthyFixture();
+  const routes = Object.fromEntries(Object.keys(kbRoutes(fixture)).map((route) => [route, () => jsonResponse({ message: `denied for https://audit:${KB_USERINFO_PASSWORD}@us.api.knowbe4.com/v1/users` }, { status: 403, statusText: "Forbidden" })]));
+  const { client, log } = httpKnowbe4(fixture, { routes, config: { baseUrl: config.baseUrl } });
+  const access = await checkKnowbe4Access(client);
+  const assessments = await runAllKnowbe4Assessments(client);
+  const exported = await exportKnowbe4AuditBundle(client, client.getResolvedConfig(), createTempBase("grclanker-knowbe4-userinfo-"), { now: NOW });
+  const files = readBundleFiles(exported.outputDir);
+  assert.ok(log.length > 0 && log.every((entry) => !entry.url.includes("@")), "no request carried the userinfo");
+  assertCanaryWindowsAbsent(assert, JSON.stringify(access), [KB_USERINFO_PASSWORD], "check_access result");
+  assertCanaryWindowsAbsent(assert, JSON.stringify(assessments), [KB_USERINFO_PASSWORD], "assess results");
+  for (const [name, text] of files) assertCanaryWindowsAbsent(assert, text, [KB_USERINFO_PASSWORD], `bundle file ${name}`);
+  for (const [name, text] of readZipEntries(exported.zipPath)) assertCanaryWindowsAbsent(assert, text, [KB_USERINFO_PASSWORD], `zip entry ${name}`);
+});
+
+test("rule 9: a configured token straddling the 300-character error detail cut is scrubbed at full length before the cut, so no fragment survives", async () => {
+  for (const offset of [290, 295, 299, 300]) {
+    const message = `${"denied ".repeat(60).slice(0, offset)}${KB_TEST_TOKEN} was rejected by the Reporting API`;
+    const { client } = httpKnowbe4(healthyFixture(), { routes: { "GET /v1/users": () => jsonResponse({ message }, { status: 403, statusText: "Forbidden" }) } });
+    await assert.rejects(() => client.listUsers(), (error) => {
+      assertCanaryWindowsAbsent(assert, error.message, [KB_TEST_TOKEN], `detail cut at offset ${offset}`);
+      assert.match(error.message, /^KnowBe4 request failed \(403 Forbidden\) GET \/v1\/users: denied /, "the documented message is still quoted up to the cut");
+      assert.ok(error.message.length <= 120 + MAX_KB_DETAIL, `the detail is still cut (${error.message.length} characters)`);
+      return true;
+    });
+  }
+});
+const MAX_KB_DETAIL = 300;
+
+const KB_SILENT_BODIES = [
+  ["empty", () => new Response("", { status: 200, statusText: "OK" }), /returned 200 OK with an empty body \(0 bytes\)/],
+  ["html", () => new Response("<html><body>Sign in to KnowBe4</body></html>", { status: 200, statusText: "OK", headers: { "content-type": "text/html" } }), /returned a 200 OK: non-JSON body \(text\/html, \d+ bytes, not echoed\)/],
+  ["foreign", () => jsonResponse({ status: "ok", service: "status-page" }), /returned 200 OK with a JSON body that is not the documented JSON array \(\d+ bytes, not echoed\)/],
+];
+
+test("silent success: a 2xx whose body is empty, an HTML page, or JSON of another shape is a failed read with http_status 200, a marker in core_data, and manual dependents, never an empty inventory", async () => {
+  const healthy = httpKnowbe4(healthyFixture());
+  const baselineExport = await exportKnowbe4AuditBundle(healthy.client, healthy.config, createTempBase("grclanker-knowbe4-silent-baseline-"), { now: NOW });
+  const baseline = JSON.parse(readBundleFiles(baselineExport.outputDir).get("analysis/findings.json"));
+  for (const [kind, body, expected] of KB_SILENT_BODIES) {
+    const fixture = healthyFixture();
+    const { client, config, log } = httpKnowbe4(fixture, { routes: { "GET /v1/users": body } });
+    const label = `users served a ${kind} 200`;
+    const access = await checkKnowbe4Access(client);
+    const usersSurface = access.surfaces.find((surface) => /users/i.test(surface.name) || /\/v1\/users/.test(surface.endpoint ?? ""));
+    assert.ok(usersSurface, `${label}: an access surface reads /v1/users`);
+    assert.equal(usersSurface.status, "not_readable", `${label}: the surface is not readable`);
+    assert.match(usersSurface.error, expected, label);
+    assert.equal(usersSurface.http_status, 200, `${label}: the observed status is the 200 the server sent`);
+
+    const exported = await exportKnowbe4AuditBundle(client, config, createTempBase("grclanker-knowbe4-silent-"), { now: NOW });
+    const files = readBundleFiles(exported.outputDir);
+    const status = JSON.parse(files.get("core_data/collection_status.json"));
+    const row = status.inventories.find((entry) => entry.inventory === "users");
+    assert.deepEqual({ status: row.status, collected: row.collected, readable: row.readable, http_status: row.http_status, complete: row.complete, truncated: row.truncated, seen: row.seen }, { status: "not_readable", collected: false, readable: false, http_status: 200, complete: null, truncated: null, seen: null }, label);
+    const written = JSON.parse(files.get("core_data/users_active.json"));
+    assert.deepEqual({ collected: written.collected, status: written.status, reason: written.reason }, { collected: false, status: 200, reason: "not_readable" }, `${label}: core_data carries a marker, not []`);
+    assert.match(written.error, expected, label);
+
+    // Against the all-readable baseline, a finding may only move to manual or warn; the reviewer's false fails
+    // (KNOWBE4-01/02/09/20 and KNOWBE4-16 on unobserved data) go manual.
+    const findings = JSON.parse(files.get("analysis/findings.json"));
+    for (const finding of findings) {
+      const before = baseline.find((item) => item.control === finding.control);
+      if (before.status === finding.status) continue;
+      assert.ok(["manual", "warn"].includes(finding.status), `${label}: KNOWBE4-${finding.control} moved ${before.status} -> ${finding.status}; only manual or warn may follow an unobserved read: ${finding.summary}`);
+    }
+    const moved = findings.filter((finding) => baseline.find((item) => item.control === finding.control).status !== finding.status);
+    assert.ok(moved.length >= 3, `${label}: the user-dependent findings demote (${moved.length} moved)`);
+    assert.ok(log.some((entry) => entry.path === "/v1/users" && entry.status === 200), `${label}: the 200 was observed`);
+
+    // Every endpoint silent: nothing was observed, so no finding may pass or fail; the reviewer's false fails
+    // (KNOWBE4-01/02/09/20 on empty lists, KNOWBE4-16 on an unobserved account) are manual.
+    const silentRoutes = Object.fromEntries(Object.keys(kbRoutes(healthyFixture())).map((route) => [route, body]));
+    const allSilent = httpKnowbe4(healthyFixture(), { routes: silentRoutes });
+    const allExport = await exportKnowbe4AuditBundle(allSilent.client, allSilent.config, createTempBase("grclanker-knowbe4-silent-all-"), { now: NOW });
+    const allFiles = readBundleFiles(allExport.outputDir);
+    const allFindings = JSON.parse(allFiles.get("analysis/findings.json"));
+    for (const finding of allFindings) {
+      assert.equal(finding.status, "manual", `${label} on every endpoint: KNOWBE4-${finding.control} is ${finding.status}: ${finding.summary}`);
+    }
+    const allStatus = JSON.parse(allFiles.get("core_data/collection_status.json"));
+    for (const row of allStatus.inventories) {
+      if (row.status === "not_configured" || row.status === "not_requested") continue;
+      assert.deepEqual({ status: row.status, http_status: row.http_status, seen: row.seen }, { status: "not_readable", http_status: 200, seen: null }, `${label} on every endpoint: ${row.inventory}`);
+    }
+  }
+
+  // A single resource (the account) and the PhishER GraphQL endpoint apply the same guard with their own documented shapes.
+  const account = httpKnowbe4(healthyFixture(), { routes: { "GET /v1/account": () => jsonResponse({}) } });
+  await assert.rejects(() => account.client.getAccount(), /returned 200 OK with a JSON body that is not the documented JSON object \(one of name, type, domains, admins, subscription_level, subscription_end_date, number_of_seats, current_risk_score\) \(\d+ bytes, not echoed\)/);
+  const phisher = httpKnowbe4(healthyFixture(), { routes: { [KB_PHISHER_ROUTE]: () => jsonResponse({ hello: "world" }) } });
+  await assert.rejects(() => phisher.client.graphql("query { x }"), /returned 200 OK with a JSON body that is not the documented GraphQL response object \(data or errors\) \(\d+ bytes, not echoed\)/);
 });
