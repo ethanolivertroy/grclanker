@@ -375,9 +375,13 @@ function scrubSchemeValue(match: string, scheme: string, value: string): string 
  * value, a header name, or a scheme word such as `Authorization: Bearer <token>`, where the scheme is
  * kept and the token removed); only an unquoted word after a plain `name:` that runs on into more
  * prose is judged by shape, so "InvalidAuthenticationToken: Access token has expired" stays legible
- * while "(session_id: value)" and "token: value" at the end of a clause lose the value.
+ * while "(session_id: value)" and "token: value" at the end of a clause lose the value. The last
+ * segment of a bare path used as a label ("/api/authn/v2/api_credentials: <detail>") is a request
+ * target, not a pair key, so the text after it is kept; inside a URL with a scheme the pair rule
+ * still applies.
  */
 function replaceCredentialAssignments(text: string): string {
+  const urlSpans = [...text.matchAll(EMBEDDED_URL_PATTERN)].map((match) => [match.index ?? 0, (match.index ?? 0) + match[0].length] as const);
   ASSIGNMENT_KEY_PATTERN.lastIndex = 0;
   let out = "";
   let last = 0;
@@ -389,6 +393,7 @@ function replaceCredentialAssignments(text: string): string {
       continue;
     }
     if (!isCredentialCarrierKey(key)) continue;
+    if (openingQuote === "" && separatorChar === ":" && isBarePathSegment(text, match.index, urlSpans)) continue;
     const valueStart = match.index + whole.length;
     ASSIGNMENT_VALUE_PATTERN.lastIndex = valueStart;
     const value = ASSIGNMENT_VALUE_PATTERN.exec(text)?.[0];
