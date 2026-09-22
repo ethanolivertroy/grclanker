@@ -1652,11 +1652,36 @@ const FAKE_CROWDSTRIKE_SECRETS = {
   rtrRunscriptSecret: "RtrInlineSecret-2026-Q3",
   rtrPutCommand: "put creds-export-9a8b7c.txt",
   rtrStdoutSecret: "rtr-stdout-secret-5561",
+  // Free-text exclusion carriers (review round item 6): command-line and image regexes, paths, and notes.
+  ioaClRegexToken: "IoaClRegexToken-71c2e9",
+  ioaIfnRegexKey: "IoaIfnApiKey-33ab90",
+  ioaDescriptionBearer: "eyJhbGciOiJIUzI1NiJ9.ioa-description-bearer.c2VjcmV0",
+  mlValuePassword: "MlValuePassword-58d1f4",
+  svValueSecret: "SvValueSecret-9e0b2a",
+  svCommentUrlToken: "SvCommentUrlToken-4477cc",
 };
 
 function secretBearingCrowdstrikeClient() {
   const fake = FAKE_CROWDSTRIKE_SECRETS;
   return createFakeClient({
+    listIoaExclusions: async () => [{
+      id: "ioa-1",
+      name: "Backup agent",
+      pattern_name: "SuspiciousCommandLine",
+      ifn_regex: `C:\\\\Tools\\\\uploader\\.exe api_key=${fake.ioaIfnRegexKey}`,
+      cl_regex: `.*uploader\\.exe --token ${fake.ioaClRegexToken} --quiet.*`,
+      description: `Allow the uploader; it authenticates with Authorization: Bearer ${fake.ioaDescriptionBearer}`,
+      applied_globally: false,
+      groups: [{ id: "hg-1" }],
+    }],
+    listMlExclusions: async () => [{ id: "ml-1", value: `D:\\Builds\\artifacts\\password=${fake.mlValuePassword}\\*.pdb`, excluded_from: ["blocking"], applied_globally: false, groups: [{ id: "hg-1" }] }],
+    listSensorVisibilityExclusions: async () => [{
+      id: "sv-1",
+      value: `/opt/vendor/agent/collector --secret ${fake.svValueSecret}`,
+      comment: `Registered at https://vendor.example.com/register?token=${fake.svCommentUrlToken} by ops`,
+      applied_globally: false,
+      groups: [{ id: "hg-1" }],
+    }],
     listAlerts: async () => [
       {
         id: "a-1",
@@ -1785,6 +1810,25 @@ test("verdict safety rule 9: exportCrowdstrikeAuditBundle never writes alert com
   assert.equal(findingById(response, "CS-07").status, "manual");
   assert.equal(findingById(response, "CS-07").evidence.sessions_reviewed, 2);
   assert.equal(response.summary.rtr_sessions_reviewed, 2);
+
+  // Review round item 6: the exclusion records are kept, with the redaction marker where a credential shape was found.
+  const ioa = JSON.parse(files.get("core_data/access_governance/ioa_exclusions.json"));
+  assert.equal(ioa.length, 1);
+  assert.equal(ioa[0].cl_regex, ".*uploader\\.exe --token [REDACTED] --quiet.*");
+  assert.equal(ioa[0].ifn_regex, "C:\\\\Tools\\\\uploader\\.exe api_key=[REDACTED]");
+  assert.match(ioa[0].description, /^Allow the uploader; it authenticates with Authorization: \[REDACTED\]/);
+  assert.equal(ioa[0].name, "Backup agent");
+  const ml = JSON.parse(files.get("core_data/access_governance/ml_exclusions.json"));
+  assert.equal(ml[0].value, "D:\\Builds\\artifacts\\password=[REDACTED]");
+  const sv = JSON.parse(files.get("core_data/access_governance/sensor_visibility_exclusions.json"));
+  assert.equal(sv[0].value, "/opt/vendor/agent/collector --secret [REDACTED]");
+  assert.equal(sv[0].comment, "Registered at https://vendor.example.com/register?[REDACTED] by ops");
+  const governance = JSON.parse(files.get("analysis/access_governance.json"));
+  assert.equal(findingById(governance, "CS-19").evidence.listing[0].cl_regex, ".*uploader\\.exe --token [REDACTED] --quiet.*");
+  assert.equal(findingById(governance, "CS-19").evidence.listing[0].ifn_regex, "C:\\\\Tools\\\\uploader\\.exe api_key=[REDACTED]");
+  assert.equal(findingById(governance, "CS-20").evidence.listing[0].value, "D:\\Builds\\artifacts\\password=[REDACTED]");
+  assert.equal(findingById(governance, "CS-21").evidence.listing[0].value, "/opt/vendor/agent/collector --secret [REDACTED]");
+  assert.equal(findingById(governance, "CS-19").status, "pass", "redaction does not change the broad-regex verdict");
 });
 
 test("verdict safety rule 10: stuck cursors, empty cursor pages, and absent totals are reported as truncated instead of complete", async () => {
@@ -1927,6 +1971,336 @@ test("verdict safety rule 10: a stuck alert cursor and a role catalog without a 
   assert.equal(governance.summary.reported_total_roles, "unknown");
   assert.equal(findingById(governance, "CS-18").status, "pass");
   assert.equal(findingById(governance, "CS-24").status, "pass");
+});
+
+// Review round items 3 and 4: every denied dataset is written as a not-collected marker, dependents skipped
+// because their parent was denied name the parent, and every summary count or flag derived from an unread
+// dataset renders null instead of 0, [] or false.
+
+function assertNotCollected(marker, { dataset, endpoint, status = 403, context }) {
+  assert.ok(marker && typeof marker === "object" && !Array.isArray(marker), `${context}: expected a marker object, got ${JSON.stringify(marker)}`);
+  assert.equal(marker.collected, false, `${context}: collected`);
+  assert.equal(marker.dataset, dataset, `${context}: dataset`);
+  assert.equal(marker.status, status, `${context}: status`);
+  assert.equal(marker.endpoint, endpoint, `${context}: endpoint`);
+  assert.match(marker.error, new RegExp(`\\(${status}\\)`), `${context}: error names the status`);
+}
+
+function assertNotRequested(marker, { dataset, parent, context }) {
+  assert.ok(marker && typeof marker === "object" && !Array.isArray(marker), `${context}: expected a marker object, got ${JSON.stringify(marker)}`);
+  assert.equal(marker.collected, false, `${context}: collected`);
+  assert.equal(marker.dataset, dataset, `${context}: dataset`);
+  assert.equal(marker.status, null, `${context}: status`);
+  assert.match(marker.error, /^not requested: /, `${context}: error`);
+  assert.match(marker.error, parent, `${context}: names the parent read`);
+}
+
+const CROWDSTRIKE_DENIALS = [
+  { method: "listPreventionPolicies", endpoint: "/policy/combined/prevention/v1", category: "prevention_policies", markers: { prevention_policies: "prevention policies" }, nulls: ["total_policies", "enabled_policies", "enabled_and_assigned_policies", "enabled_but_unassigned_policies", "policies_truncated", "platforms_covered"] },
+  { method: "listResponsePolicies", endpoint: "/policy/combined/response/v1", category: "response_readiness", markers: { response_policies: "response policies" }, nulls: ["response_policies", "enabled_and_assigned_response_policies"] },
+  { method: "listRtrSessions", endpoint: "/real-time-response-audit/combined/sessions/v1", category: "response_readiness", markers: { rtr_audit_sessions: "rtr audit sessions" }, nulls: ["rtr_sessions_reviewed"] },
+  { method: "listAlerts", endpoint: "/alerts/combined/alerts/v1", category: "response_readiness", markers: { alerts: "alerts" }, nulls: ["critical_high_alerts", "alerts_truncated"] },
+  { method: "listHosts", endpoint: "/devices/combined/devices/v1", category: "response_readiness", markers: { contained_hosts: "contained hosts" }, nulls: ["contained_hosts"] },
+  { method: "listDeviceControlPolicies", endpoint: "/policy/combined/device-control/v1", category: "device_firewall", markers: { device_control_policies: "device control policies" }, skipped: { device_control_policy_details: /device control policies list was not read/ }, nulls: ["device_control_policies", "enabled_and_assigned_device_control_policies"] },
+  { method: "getDeviceControlPoliciesV2", endpoint: "/policy/entities/device-control/v2", category: "device_firewall", markers: { device_control_policy_details: "device control policy details" }, nulls: [] },
+  { method: "listFirewallPolicies", endpoint: "/policy/combined/firewall/v1", category: "device_firewall", markers: { firewall_policies: "firewall policies" }, skipped: { firewall_policy_containers: /firewall policies list was not read/ }, nulls: ["firewall_policies", "enabled_and_assigned_firewall_policies"] },
+  { method: "getFirewallPolicyContainers", endpoint: "/fwmgr/entities/policies/v1", category: "device_firewall", markers: { firewall_policy_containers: "firewall policy containers" }, nulls: [] },
+  { method: "listFirewallRuleGroups", endpoint: "/fwmgr/queries/rule-groups/v1", category: "device_firewall", markers: { firewall_rule_groups: "firewall rule groups" }, nulls: ["firewall_rule_groups"] },
+  { method: "listFirewallRules", endpoint: "/fwmgr/queries/rules/v1", category: "device_firewall", markers: { firewall_rules: "firewall rules" }, nulls: ["firewall_rules_reviewed", "firewall_rules_truncated"] },
+  { method: "listSensorUpdatePolicies", endpoint: "/policy/combined/sensor-update/v2", category: "sensor_coverage", markers: { sensor_update_policies: "sensor update policies" }, skipped: { sensor_update_builds: /sensor update policies list was not read/ }, nulls: ["sensor_update_policies", "enabled_and_assigned_sensor_update_policies"] },
+  { method: "listSensorUpdateBuilds", endpoint: "/policy/combined/sensor-update-builds/v1", category: "sensor_coverage", nested: { sensor_update_builds: { windows: "sensor builds (windows)" } }, nulls: [] },
+  { method: "listHosts", endpoint: "/devices/combined/devices/v1", category: "sensor_coverage", markers: { hosts: "hosts" }, nulls: ["sampled_hosts", "reported_total_hosts", "hosts_truncated"] },
+  { method: "listHostGroups", endpoint: "/devices/combined/host-groups/v1", category: "sensor_coverage", markers: { host_groups: "host groups" }, nulls: ["host_groups"] },
+  { method: "countDiscoverHosts", endpoint: "/discover/queries/hosts/v1", category: "sensor_coverage", skipped: { discover_unmanaged_samples: /discover unmanaged hosts count was not read/ }, nulls: ["unmanaged_assets"] },
+  { method: "listDiscoverHosts", endpoint: "/discover/combined/hosts/v1", category: "sensor_coverage", markers: { discover_unmanaged_samples: "discover unmanaged samples" }, nulls: [] },
+  { method: "countZtaAssessments", endpoint: "/zero-trust-assessment/queries/assessments/v1", category: "sensor_coverage", skipped: { zero_trust_assessments_below_threshold: /zero trust assessment totals count was not read/ }, nulls: ["zta_scored_hosts"] },
+  { method: "listZtaAssessments", endpoint: "/zero-trust-assessment/queries/assessments/v1", category: "sensor_coverage", markers: { zero_trust_assessments_below_threshold: "zero trust assessments below threshold" }, nulls: [] },
+  { method: "listUserUuids", endpoint: "/user-management/queries/users/v1", category: "access_governance", skipped: { users: /user uuid list was not read/, user_roles: /user uuid list was not read/ }, nulls: ["users_reviewed", "reported_total_users", "users_truncated", "role_lookups_failed", "role_pages_truncated", "admin_users"] },
+  { method: "getUsers", endpoint: "/user-management/entities/users/GET/v1", category: "access_governance", markers: { users: "users" }, skipped: { user_roles: /user details were not read/ }, nulls: ["users_reviewed", "role_lookups_failed", "role_pages_truncated", "admin_users"] },
+  { method: "listUserRoles", endpoint: "/user-management/combined/user-roles/v2", category: "access_governance", nested: { user_roles: { "u-admin": "user roles (u-admin)", "u-analyst": "user roles (u-analyst)" } }, nulls: ["admin_users"] },
+  { method: "listRoles", endpoint: "/user-management/queries/roles/v1", category: "access_governance", markers: { roles: "role catalog" }, nulls: [], unavailable: ["roles_in_catalog", "reported_total_roles", "role_catalog_truncated"] },
+  { method: "listApiClients", endpoint: "/api-clients/queries/api-clients/v1", category: "access_governance", markers: { api_clients: "api clients" }, nulls: ["api_clients"] },
+  { method: "listIoaExclusions", endpoint: "/policy/queries/ioa-exclusions/v1", category: "access_governance", markers: { ioa_exclusions: "ioa exclusions" }, nulls: ["ioa_exclusions"] },
+  { method: "listMlExclusions", endpoint: "/policy/queries/ml-exclusions/v1", category: "access_governance", markers: { ml_exclusions: "ml exclusions" }, nulls: ["ml_exclusions"] },
+  { method: "listSensorVisibilityExclusions", endpoint: "/policy/queries/sv-exclusions/v1", category: "access_governance", markers: { sensor_visibility_exclusions: "sensor visibility exclusions" }, nulls: ["sensor_visibility_exclusions"] },
+  { method: "listIdentityProtectionRules", endpoint: "/identity-protection/queries/policy-rules/v1", category: "access_governance", markers: { identity_protection_rules: "identity protection rules" }, nulls: [], unavailable: ["identity_protection_rules", "identity_protection_rules_truncated"] },
+];
+
+test("review round items 3 and 4: every denied Falcon dataset is a not-collected marker, skipped dependents name the parent, and derived summary counts and flags render null", async () => {
+  const healthy = Object.fromEntries((await runAllCrowdstrikeAssessments(createFakeClient())).map((assessment) => [assessment.category, assessment]));
+  for (const [category, assessment] of Object.entries(healthy)) {
+    for (const [name, snapshot] of Object.entries(assessment.snapshots)) {
+      assert.ok(!(snapshot && snapshot.collected === false), `${category}/${name} must not carry a marker when every read succeeded`);
+    }
+    for (const description of Object.values(assessment.summary.inventories)) {
+      const states = typeof description === "string" ? [description] : Object.values(description);
+      for (const state of states) assert.match(state, /^read/, `${category} inventories: ${state}`);
+    }
+  }
+
+  for (const denial of CROWDSTRIKE_DENIALS) {
+    const context = `${denial.method} denied`;
+    const assessments = await runAllCrowdstrikeAssessments(createFakeClient({ [denial.method]: forbidden(denial.endpoint) }));
+    const assessment = assessments.find((entry) => entry.category === denial.category);
+    for (const [name, dataset] of Object.entries(denial.markers ?? {})) {
+      assertNotCollected(assessment.snapshots[name], { dataset, endpoint: denial.endpoint, context: `${context}: snapshots.${name}` });
+      assert.match(assessment.summary.inventories[name] ?? "", /^unread \(/, `${context}: inventories.${name}`);
+    }
+    for (const [name, parent] of Object.entries(denial.skipped ?? {})) {
+      assertNotRequested(assessment.snapshots[name], { dataset: assessment.snapshots[name]?.dataset, parent, context: `${context}: snapshots.${name}` });
+      assert.match(assessment.summary.inventories[name] ?? "", /^not requested \(/, `${context}: inventories.${name}`);
+    }
+    for (const [name, entries] of Object.entries(denial.nested ?? {})) {
+      const snapshot = assessment.snapshots[name];
+      for (const [key, dataset] of Object.entries(entries)) {
+        assertNotCollected(snapshot[key], { dataset, endpoint: denial.endpoint, context: `${context}: snapshots.${name}.${key}` });
+      }
+    }
+    for (const key of denial.nulls) {
+      assert.ok(key in assessment.summary, `${context}: summary.${key} exists`);
+      assert.equal(assessment.summary[key], null, `${context}: summary.${key} renders null, got ${JSON.stringify(assessment.summary[key])}`);
+      assert.notEqual(healthy[denial.category].summary[key], null, `${context}: summary.${key} is populated on the healthy run`);
+    }
+    for (const key of denial.unavailable ?? []) {
+      assert.equal(assessment.summary[key], "unavailable", `${context}: summary.${key}`);
+    }
+    // The denial must reach at least one verdict, every finding that names the unread dataset must not pass,
+    // and a finding that still passes must have passed on the healthy run too (a denial never upgrades).
+    const affected = assessment.findings.filter((item) => item.evidence?.unreadable_dataset || item.evidence?.unreadable_secondary_reads || item.evidence?.not_applicable);
+    assert.ok(affected.length > 0, `${context}: at least one ${denial.category} finding must record the unread dataset`);
+    for (const item of affected) {
+      assert.notEqual(item.status, "pass", `${context}: ${item.id} names an unread dataset and must not pass`);
+    }
+    for (const item of assessment.findings.filter((entry) => entry.status === "pass")) {
+      assert.equal(findingById(healthy[denial.category], item.id).status, "pass", `${context}: ${item.id} passes under denial but not on the healthy run`);
+    }
+  }
+});
+
+test("review round items 3 and 4: the exported bundle writes markers for denied datasets and skipped dependents instead of empty arrays", async () => {
+  const base = createTempBase("grclanker-cs-markers-");
+  const client = createFakeClient({
+    listFirewallPolicies: forbidden("/policy/combined/firewall/v1"),
+    listUserUuids: forbidden("/user-management/queries/users/v1"),
+    listSensorUpdateBuilds: async () => { throw new Error("socket hang up"); },
+  });
+  const result = await exportCrowdstrikeAuditBundle(client, sampleConfig(), base);
+  const files = readBundleFiles(result.outputDir);
+  const zipEntries = readZipEntries(result.zipPath);
+
+  for (const source of [files, zipEntries]) {
+    const firewall = JSON.parse(source.get("core_data/device_firewall/firewall_policies.json"));
+    assertNotCollected(firewall, { dataset: "firewall policies", endpoint: "/policy/combined/firewall/v1", context: "firewall_policies.json" });
+    const containers = JSON.parse(source.get("core_data/device_firewall/firewall_policy_containers.json"));
+    assertNotRequested(containers, { dataset: "firewall policy containers", parent: /firewall policies list was not read/, context: "firewall_policy_containers.json" });
+    const users = JSON.parse(source.get("core_data/access_governance/users.json"));
+    assertNotRequested(users, { dataset: "users", parent: /user uuid list was not read/, context: "users.json" });
+    const userRoles = JSON.parse(source.get("core_data/access_governance/user_roles.json"));
+    assertNotRequested(userRoles, { dataset: "user roles", parent: /user uuid list was not read/, context: "user_roles.json" });
+    const builds = JSON.parse(source.get("core_data/sensor_coverage/sensor_update_builds.json"));
+    assert.equal(builds.windows.collected, false);
+    assert.equal(builds.windows.status, null, "a transport failure carries no HTTP status");
+    assert.equal(builds.windows.endpoint, "/policy/combined/sensor-update-builds/v1");
+    assert.match(builds.windows.error, /socket hang up/);
+    // Readable datasets keep their array shape.
+    assert.ok(Array.isArray(JSON.parse(source.get("core_data/device_firewall/firewall_rules.json"))));
+    assert.ok(Array.isArray(JSON.parse(source.get("core_data/sensor_coverage/hosts.json"))));
+  }
+
+  const deviceFirewall = JSON.parse(files.get("analysis/device_firewall.json"));
+  assert.equal(deviceFirewall.summary.firewall_policies, null);
+  assert.equal(deviceFirewall.summary.enabled_and_assigned_firewall_policies, null);
+  assert.equal(deviceFirewall.summary.firewall_rules_reviewed, 1, "an independent readable dataset keeps its count");
+  assert.match(deviceFirewall.summary.inventories.firewall_policies, /^unread \(firewall policies: .*\(403\)/);
+  assert.match(deviceFirewall.summary.inventories.firewall_policy_containers, /^not requested \(the firewall policies list was not read\)/);
+  const governance = JSON.parse(files.get("analysis/access_governance.json"));
+  assert.equal(governance.summary.users_reviewed, null);
+  assert.equal(governance.summary.admin_users, null);
+  assert.equal(governance.summary.users_truncated, null);
+  assert.equal(governance.summary.role_pages_truncated, null);
+  assert.equal(governance.summary.api_clients, 1);
+  assert.equal(findingById(governance, "CS-16").status, "manual");
+  assert.equal(findingById(governance, "CS-16").evidence.users_reviewed, undefined, "no user count is rendered beside the denial");
+  const quickReference = files.get("QUICK_REFERENCE.md");
+  assert.match(quickReference, /"collected": false/);
+  assert.match(quickReference, /summary\.inventories/);
+});
+
+test("review round item 5: a capped prevention policy list never asserts platforms without a policy, and an absence-driven fail on a truncated list renders manual", async () => {
+  const capped = await assessCrowdstrikePreventionPolicies(createFakeClient({
+    listPreventionPolicies: async () => truncatedPage([preventionPolicy()], 43),
+  }));
+  const ml = findingById(capped, "CS-01");
+  assert.equal(ml.status, "warn");
+  assert.equal(ml.evidence.platforms_without_policy, null, "Mac and Linux are provable only against the 42 unread policies");
+  assert.doesNotMatch(ml.summary, /no assigned policy covers/);
+  assert.match(ml.summary, /Partial inventory: only 1 of 43 prevention policies were read/);
+  assert.deepEqual(ml.evidence.partial_inventory, [{ dataset: "prevention policies", seen: 1, total: 43 }]);
+  assert.equal(capped.summary.policies_truncated, true);
+  assert.equal(capped.summary.platforms_covered, "Windows", "platforms covered by a visible policy remain a presence claim");
+
+  const complete = await assessCrowdstrikePreventionPolicies(createFakeClient({ listPreventionPolicies: async () => [preventionPolicy()] }));
+  assert.deepEqual(findingById(complete, "CS-01").evidence.platforms_without_policy, ["Mac", "Linux"], "a complete list still names the uncovered platforms");
+  assert.match(findingById(complete, "CS-01").summary, /no assigned policy covers Mac, Linux/);
+
+  const unassignedCapped = await assessCrowdstrikePreventionPolicies(createFakeClient({
+    listPreventionPolicies: async () => truncatedPage([preventionPolicy({ groups: [] })], 43),
+  }));
+  for (const id of ["CS-01", "CS-02", "CS-03", "CS-04", "CS-05"]) {
+    const item = findingById(unassignedCapped, id);
+    assert.equal(item.status, "manual", `${id} must not fail on the absence of an assigned policy among 1 of 43 visible policies: ${item.summary}`);
+    assert.match(item.summary, /None of the 1 prevention policies is both enabled and assigned/);
+    assert.match(item.summary, /so the absence this verdict rests on cannot be asserted for the unread rows\. Verdict: manual \(unknown\)\.$/);
+    assert.equal(item.evidence.absence_claim, true);
+  }
+  const unassignedComplete = await assessCrowdstrikePreventionPolicies(createFakeClient({ listPreventionPolicies: async () => [preventionPolicy({ groups: [] })] }));
+  assert.equal(findingById(unassignedComplete, "CS-01").status, "fail", "a complete list with no assigned policy still fails");
+
+  const firewall = passingFirewall();
+  const cappedFirewall = await assessCrowdstrikeDeviceFirewall(createFakeClient({
+    listFirewallPolicies: async () => truncatedPage(firewall.policies.map((policy) => ({ ...policy, groups: [] })), 40),
+  }));
+  assert.equal(findingById(cappedFirewall, "CS-10").status, "manual");
+  assert.equal(findingById(cappedFirewall, "CS-11").status, "manual", "no containers among the visible unassigned policies is an absence claim over the unread rows");
+  assert.equal(findingById(cappedFirewall, "CS-11").evidence.absence_claim, true);
+});
+
+// Addendum 4: on every Falcon surface, a 502 HTML body or a JSON error embedding a credential URL never reaches
+// tool results, findings, summaries, or the bundle; the recorded error carries a status-and-length note instead.
+
+const CS_CANARY = {
+  bearer: "CSCANARY-BEARER-TOKEN-9f8e7d6c",
+  session: "CSCANARY-SESSION-COOKIE-1a2b3c4d",
+  apiKey: "CSCANARY-API-KEY-55667788",
+  urlToken: "CSCANARY-URL-TOKEN-deadbeef",
+  clientSecret: "CSCANARY-CLIENT-SECRET-0001",
+  accessToken: "cs-canary-access-token-0001",
+};
+const CS_CANARY_URL = `https://api.example.com/v1/x?token=${CS_CANARY.urlToken}`;
+
+function csCanaryHtml() {
+  return [
+    "<html><head><title>502 Bad Gateway</title></head><body>",
+    `<p>The upstream request carried Authorization: Bearer ${CS_CANARY.bearer} and Set-Cookie: session=${CS_CANARY.session}.</p>`,
+    `<p>Retry with x-api-key: ${CS_CANARY.apiKey}; the incident is tracked at ${CS_CANARY_URL} until resolved.</p>`,
+    "</body></html>",
+  ].join("");
+}
+
+const CS_CANARY_SURFACES = [
+  "/oauth2/token",
+  "/policy/combined/prevention/v1",
+  "/policy/combined/response/v1",
+  "/policy/combined/device-control/v1",
+  "/policy/entities/device-control/v2",
+  "/policy/combined/firewall/v1",
+  "/fwmgr/entities/policies/v1",
+  "/fwmgr/queries/rule-groups/v1",
+  "/fwmgr/entities/rule-groups/v1",
+  "/fwmgr/queries/rules/v1",
+  "/fwmgr/entities/rules/v1",
+  "/policy/combined/sensor-update/v2",
+  "/policy/combined/sensor-update-builds/v1",
+  "/devices/combined/devices/v1",
+  "/devices/combined/host-groups/v1",
+  "/user-management/queries/users/v1",
+  "/user-management/entities/users/GET/v1",
+  "/user-management/combined/user-roles/v2",
+  "/user-management/queries/roles/v1",
+  "/user-management/entities/roles/v1",
+  "/api-clients/queries/api-clients/v1",
+  "/api-clients/entities/api-clients/v1",
+  "/discover/queries/hosts/v1",
+  "/discover/combined/hosts/v1",
+  "/alerts/queries/alerts/v2",
+  "/alerts/combined/alerts/v1",
+  "/policy/queries/ioa-exclusions/v1",
+  "/policy/entities/ioa-exclusions/v1",
+  "/policy/queries/ml-exclusions/v1",
+  "/policy/entities/ml-exclusions/v1",
+  "/policy/queries/sv-exclusions/v1",
+  "/policy/entities/sv-exclusions/v1",
+  "/zero-trust-assessment/queries/assessments/v1",
+  "/identity-protection/queries/policy-rules/v1",
+  "/identity-protection/entities/policy-rules/v1",
+  "/real-time-response-audit/combined/sessions/v1",
+];
+
+function csHealthyResponse(path) {
+  if (path === "/oauth2/token") return jsonResponse({ access_token: CS_CANARY.accessToken, expires_in: 1799 });
+  if (path === "/user-management/queries/users/v1") return jsonResponse({ resources: ["u-1"], meta: { pagination: { total: 1 } } });
+  if (path === "/user-management/entities/users/GET/v1") return jsonResponse({ resources: [{ uuid: "u-1", uid: "alice@example.com", status: "active", last_login_at: isoDaysAgo(1) }] });
+  if (path === "/user-management/combined/user-roles/v2") return jsonResponse({ resources: [{ role_id: "falcon_analyst", role_name: "Falcon Analyst" }], meta: { pagination: { total: 1 } } });
+  if (path === "/alerts/combined/alerts/v1") return jsonResponse({ resources: [{ composite_id: "a-1", severity: 90, status: "closed", created_timestamp: isoHoursAgo(30), seconds_to_resolved: 3600 }], meta: { pagination: { total: 1 } } });
+  if (path === "/policy/combined/sensor-update-builds/v1") return jsonResponse({ resources: [{ build: "17306|n-1|tagged", sensor_version: "7.21.17306", platform: "windows" }] });
+  if (path.includes("/queries/")) return jsonResponse({ resources: ["id-1"], meta: { pagination: { total: 1 } } });
+  if (path.includes("/entities/")) {
+    return jsonResponse({ resources: [{ id: "id-1", policy_id: "id-1", name: "Entity", enabled: true, groups: [{ id: "hg-1" }], platform_name: "Windows", rule_ids: ["r-1"], rule_group_ids: ["id-1"], default_inbound: "DENY", enforce: true, action: "ALLOW", description: "documented", scopes: [apiScope("hosts", "read")] }] });
+  }
+  return jsonResponse({
+    resources: [{
+      id: "id-1", name: "Combined", enabled: true, groups: [{ id: "hg-1" }], platform_name: "Windows", device_id: "aid-1", hostname: "ws-01",
+      last_seen: isoDaysAgo(1), created_at: isoHoursAgo(2), deleted_at: isoHoursAgo(1.9), settings: { build: "17306|n-1|tagged", uninstall_protection: "ENABLED" },
+    }],
+    meta: { pagination: { total: 1 } },
+  });
+}
+
+function csCanaryFetch(failing) {
+  return async (input) => {
+    const url = new URL(typeof input === "string" ? input : input.toString());
+    if (url.pathname === failing.path) {
+      if (failing.flavor === "html") {
+        return new Response(csCanaryHtml(), { status: 502, headers: { "content-type": "text/html; charset=utf-8" } });
+      }
+      return jsonResponse({ errors: [{ code: 403, message: `access denied for this API client; see ${CS_CANARY_URL} for the scope that is missing` }] }, { status: 403 });
+    }
+    return csHealthyResponse(url.pathname);
+  };
+}
+
+function assertCsCanariesAbsent(text, context) {
+  for (const [name, value] of Object.entries(CS_CANARY)) {
+    assert.ok(!text.includes(value), `${context}: canary ${name} (${value}) leaked`);
+  }
+}
+
+test("addendum 4: on every Falcon surface a 502 HTML body or a JSON error embedding a credential URL never reaches results or the bundle, and the recorded error carries a status-and-length note", async () => {
+  const runs = [];
+  for (const path of CS_CANARY_SURFACES) {
+    for (const flavor of ["html", "json"]) {
+      const base = createTempBase("grclanker-cs-canary-");
+      const config = sampleConfig({ clientSecret: CS_CANARY.clientSecret });
+      const client = new CrowdstrikeApiClient(config, { fetchImpl: csCanaryFetch({ path, flavor }), sleep: async () => {}, retryLimit: 0 });
+      const access = await checkCrowdstrikeAccess(client);
+      const assessments = await runAllCrowdstrikeAssessments(client);
+      const result = await exportCrowdstrikeAuditBundle(client, config, base);
+      const files = readBundleFiles(result.outputDir);
+      const zipEntries = readZipEntries(result.zipPath);
+      const context = `${path} (${flavor})`;
+
+      assertCsCanariesAbsent(JSON.stringify(access), `${context} check_access`);
+      assertCsCanariesAbsent(JSON.stringify(assessments), `${context} assessments`);
+      for (const [name, content] of files) assertCsCanariesAbsent(content, `${context} bundle ${name}`);
+      for (const [name, content] of zipEntries) assertCsCanariesAbsent(content, `${context} zip ${name}`);
+
+      const errorStrings = [
+        ...access.surfaces.map((surface) => surface.error).filter(Boolean),
+        ...assessments.flatMap((assessment) => assessment.errors),
+        ...(files.get("_errors.log") ?? "").split("\n").filter(Boolean),
+      ];
+      assert.ok(errorStrings.length > 0, `${context}: the failing surface must be exercised by the access check, an assessment, or the export`);
+      for (const errorString of errorStrings) {
+        if (flavor === "html") {
+          assert.match(errorString, /\(502\)[^\n]*: non-JSON body \(text\/html, \d+ bytes\)/, `${context}: ${errorString}`);
+        } else {
+          assert.match(errorString, /\(403\)[^\n]*https:\/\/api\.example\.com\/v1\/x\?\[REDACTED\]/, `${context}: ${errorString}`);
+        }
+      }
+      runs.push(context);
+    }
+  }
+  assert.equal(runs.length, CS_CANARY_SURFACES.length * 2);
 });
 
 test("resolveSecureOutputPath rejects traversal and symlink parents", () => {
