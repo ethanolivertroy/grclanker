@@ -43,6 +43,16 @@ function createScriptedBinary(base, script) {
   return pathname;
 }
 
+/**
+ * The published gws prints two lines for --version (crates/google-workspace-cli/src/main.rs, the is_version_flag branch:
+ * `gws <CARGO_PKG_VERSION>`, then the fixed disclaimer added in 0.3.5 as CHANGELOG entry 1991d53). Pinned here byte for
+ * byte as the v0.22.5 release binary prints it, so every fixture in this file answers --version with the real shape.
+ */
+const REAL_VERSION_LINES = ["gws 0.22.5", "This is not an officially supported Google product."];
+const REAL_VERSION_STDOUT = `${REAL_VERSION_LINES.join("\n")}\n`;
+/** The shell branch a scripted gws uses to answer --version with the real two-line output. */
+const PRINT_REAL_VERSION = `if [ "$1" = "--version" ]; then printf '%s\\n' "${REAL_VERSION_LINES[0]}" "${REAL_VERSION_LINES[1]}"; exit 0; fi`;
+
 function parseParams(args) {
   const paramsIndex = args.indexOf("--params");
   if (paramsIndex === -1) return {};
@@ -217,7 +227,7 @@ function createSecretEchoingBinary(base) {
     nextPageToken: "more-tokens",
   };
   return createScriptedBinary(base, [
-    'if [ "$1" = "--version" ]; then echo "gws 0.22.5"; exit 0; fi',
+    PRINT_REAL_VERSION,
     'case "$*" in',
     "  alertcenter:v1beta1*)",
     heredoc(alerts),
@@ -240,7 +250,7 @@ function createRunner(options = {}) {
     seen.push(request);
     const command = [executable.displayExecutable, ...args].join(" ");
     if (args[0] === "--version") {
-      return execution(executable, args, "gws 0.22.5");
+      return execution(executable, args, REAL_VERSION_STDOUT);
     }
 
     if (args[0] === "alertcenter:v1beta1") {
@@ -379,7 +389,7 @@ test("checkGwsCliAccess maps auth failures cleanly", async () => {
   const runner = async ({ executable, args }) => {
     const command = [executable.displayExecutable, ...args].join(" ");
     if (args[0] === "--version") {
-      return execution(executable, args, "gws 0.22.5");
+      return execution(executable, args, REAL_VERSION_STDOUT);
     }
     throw new GwsCliCommandError("auth", "Credentials missing", command, 2);
   };
@@ -392,7 +402,7 @@ test("checkGwsCliAccess maps auth failures cleanly", async () => {
 
 test("verdict rule 1: a failing CLI invocation is an explicit error mapped from the documented exit codes", async () => {
   const base = createTempBase("grclanker-gws-ops-exit-");
-  const fake = createScriptedBinary(base, 'if [ "$1" = "--version" ]; then echo "gws 0.22.5"; exit 0; fi\necho "Error: credentials missing, expired, or invalid" 1>&2\nexit 2');
+  const fake = createScriptedBinary(base, `${PRINT_REAL_VERSION}\necho "Error: credentials missing, expired, or invalid" 1>&2\nexit 2`);
 
   await assert.rejects(
     () => traceGwsAdminActivity({ gwsBin: fake }, defaultGwsCliRunner),
@@ -423,7 +433,7 @@ test("verdict rule 1: a failing CLI invocation is an explicit error mapped from 
 
 test("verdict rule 1: a successful but non-JSON CLI response is an explicit error, while --version may be plain text", async () => {
   const base = createTempBase("grclanker-gws-ops-nonjson-");
-  const fake = createScriptedBinary(base, 'if [ "$1" = "--version" ]; then echo "gws 0.22.5"; exit 0; fi\necho "Fetching discovery document..."\necho "done"');
+  const fake = createScriptedBinary(base, `${PRINT_REAL_VERSION}\necho "Fetching discovery document..."\necho "done"`);
 
   await assert.rejects(
     () => traceGwsAdminActivity({ gwsBin: fake }, defaultGwsCliRunner),
@@ -451,7 +461,7 @@ test("defaultGwsCliRunner parses a real JSON response and forwards the environme
   const base = createTempBase("grclanker-gws-ops-realjson-");
   const fake = createScriptedBinary(
     base,
-    'if [ "$1" = "--version" ]; then echo "gws 0.22.5"; exit 0; fi\necho "{\\"items\\":[{\\"id\\":{\\"time\\":\\"2030-01-01T12:00:00Z\\",\\"uniqueQualifier\\":\\"u1\\"},\\"actor\\":{\\"email\\":\\"$GOOGLE_WORKSPACE_CLI_CONFIG_DIR\\"},\\"events\\":[{\\"name\\":\\"CHANGE_APPLICATION_SETTING\\"}]}]}"',
+    `${PRINT_REAL_VERSION}\n` + 'echo "{\\"items\\":[{\\"id\\":{\\"time\\":\\"2030-01-01T12:00:00Z\\",\\"uniqueQualifier\\":\\"u1\\"},\\"actor\\":{\\"email\\":\\"$GOOGLE_WORKSPACE_CLI_CONFIG_DIR\\"},\\"events\\":[{\\"name\\":\\"CHANGE_APPLICATION_SETTING\\"}]}]}"',
   );
 
   const result = await traceGwsAdminActivity({ gwsBin: fake, configDir: "/tmp/cfg-from-arg" }, defaultGwsCliRunner, { PATH: process.env.PATH });
@@ -719,7 +729,7 @@ test("rule 9: CLI stderr is scrubbed where the error is built, so no thrown mess
   const env = { PATH: process.env.PATH, GOOGLE_WORKSPACE_CLI_TOKEN: envToken };
   // The CLI stand-in echoes its own credential from the environment plus the two documented token shapes into stderr and exits 2 (auth).
   const stderrLine = `Error: token $GOOGLE_WORKSPACE_CLI_TOKEN rejected; retry with Bearer ${bearer} or ${pair}`;
-  const denied = createScriptedBinary(base, `if [ "$1" = "--version" ]; then echo "gws 0.22.5"; exit 0; fi\necho "${stderrLine}" 1>&2\nexit 2`);
+  const denied = createScriptedBinary(base, `${PRINT_REAL_VERSION}\necho "${stderrLine}" 1>&2\nexit 2`);
 
   // The thrown error is the surface the live smoke script logs.
   await assert.rejects(
@@ -767,7 +777,7 @@ test("rule 9: CLI stderr is scrubbed where the error is built, so no thrown mess
   // A successful probe keeps its stderr (warnings) but scrubbed, since checkGwsCliAccess returns the execution to callers.
   const noisy = createScriptedBinary(
     createTempBase("grclanker-gws-ops-stderr-warn-"),
-    `if [ "$1" = "--version" ]; then echo "gws 0.22.5"; exit 0; fi\necho "Warning: refreshed with $GOOGLE_WORKSPACE_CLI_TOKEN and Bearer ${bearer}" 1>&2\necho '{"items":[]}'`,
+    `${PRINT_REAL_VERSION}\necho "Warning: refreshed with $GOOGLE_WORKSPACE_CLI_TOKEN and Bearer ${bearer}" 1>&2\necho '{"items":[]}'`,
   );
   const check = await checkGwsCliAccess({ gwsBin: noisy }, defaultGwsCliRunner, env);
   assert.equal(check.status, "ready");
@@ -775,44 +785,78 @@ test("rule 9: CLI stderr is scrubbed where the error is built, so no thrown mess
   assert.doesNotMatch(JSON.stringify(check), leak);
 });
 
-test("rule 9: the --version line is scrubbed and projected to the documented gws <version> shape before it reaches gws_ops_check_cli", async () => {
-  const envToken = "PLANTEDr5-version-env-token-0123";
+test("rule 9: the --version first line is matched against the real two-line output and only the numeric core reaches gws_ops_check_cli", async () => {
+  const envToken = "PLANTEDr6-version-env-token-0123456789";
+  const fragment = envToken.slice(0, 20);
   const leak = /PLANTED/;
   const env = { PATH: process.env.PATH, GOOGLE_WORKSPACE_CLI_TOKEN: envToken };
   const probeOk = `echo '{"items":[]}'`;
-  const scripted = (label, versionLine) => createScriptedBinary(
+  const scripted = (label, versionScript) => createScriptedBinary(
     createTempBase(`grclanker-gws-ops-version-${label}-`),
-    `if [ "$1" = "--version" ]; then ${versionLine}; exit 0; fi\n${probeOk}`,
+    `if [ "$1" = "--version" ]; then ${versionScript}; exit 0; fi\n${probeOk}`,
   );
-  const withheld = "gws 0.22.5 (the rest of the --version output did not match the documented `gws <version>` line and is not repeated here)";
+  const version = async (label, versionScript, runEnv = env) => {
+    const result = await checkGwsCliAccess({ gwsBin: scripted(label, versionScript) }, defaultGwsCliRunner, runEnv);
+    assert.doesNotMatch(JSON.stringify(result), leak, `${label}: ${JSON.stringify(result)}`);
+    assert.equal(JSON.stringify(result).includes(fragment), false, `${label}: the token fragment reached the result`);
+    return result.version;
+  };
+  const withheld = "gws 0.22.5 (the rest of the --version output did not match the documented `gws <version>` first line and is not repeated here)";
+  const printLines = (...lines) => `printf '%s\\n' ${lines.map((line) => `"${line}"`).join(" ")}`;
 
-  // The binary echoes its own credential and a bearer token after the version: the version survives, the rest is withheld.
-  const echoing = scripted("echo", `echo "gws 0.22.5 PLANTEDr5versionword token=$GOOGLE_WORKSPACE_CLI_TOKEN Bearer ya29.PLANTEDr5versionbearer0123"`);
+  // The real binary's output, byte for byte: the documented branch fires and the disclaimer line is never repeated.
+  const real = await checkGwsCliAccess({ gwsBin: scripted("real", printLines(...REAL_VERSION_LINES)) }, defaultGwsCliRunner, env);
+  assert.equal(real.version, "gws 0.22.5");
+  assert.equal(JSON.stringify(real).includes("officially"), false, "the disclaimer line is not rendered");
+  assert.equal(await version("crlf", `printf 'gws 0.22.5\\r\\nThis is not an officially supported Google product.\\r\\n'`), "gws 0.22.5");
+  assert.equal(await version("single", `echo "gws 0.22.5"`), "gws 0.22.5", "the single line releases before 0.3.5 printed still matches");
+  assert.equal(await version("vprefix", `echo "gws v1.2.3"`), "gws 1.2.3");
+
+  // A Cargo pre-release or build suffix is accepted so the line is recognized, but only major.minor.patch is rendered.
+  assert.equal(await version("pre", `echo "gws v1.2.3-beta.1"`), "gws 1.2.3");
+  assert.equal(await version("build", `echo "gws 0.22.5+build.PLANTEDr6meta"`), "gws 0.22.5");
+  // The parent's criterion: a 20-character fragment of the token in the pre-release position is neither a known value
+  // nor a credential shape, so no scrub catches it; the projection renders the numeric core and nothing else.
+  assert.equal(fragment.length, 20);
+  assert.equal(await version("fragment", `echo "gws 0.22.5-${fragment}"`), "gws 0.22.5");
+  assert.equal(await version("fragment-ya29", `echo "gws 0.22.5-PLANTEDr6ya29body012"`), "gws 0.22.5", "20 characters of a ya29 body without its prefix");
+  assert.equal(await version("suffix64", `echo "gws 0.22.5-${"a".repeat(64)}"`), "gws 0.22.5");
+  assert.equal(await version("suffix65", `echo "gws 0.22.5-${"a".repeat(65)}"`), withheld, "a suffix beyond the grammar falls to the core note");
+  // The whole token in the pre-release position is a known value: scrubbed to [REDACTED], which the grammar rejects.
+  assert.equal(await version("whole", `echo "gws 0.22.5-$GOOGLE_WORKSPACE_CLI_TOKEN"`), withheld);
+  const shortToken = { PATH: process.env.PATH, GOOGLE_WORKSPACE_CLI_TOKEN: "PLANTEDr6tok" };
+  assert.equal(await version("short", `echo "gws 0.22.5-$GOOGLE_WORKSPACE_CLI_TOKEN"`, shortToken), withheld);
+
+  // The round 5 echo fixture: the binary echoes its own credential and a bearer after the version. Still clean.
+  const echoing = scripted("echo", `echo "gws 0.22.5 PLANTEDr6versionword token=$GOOGLE_WORKSPACE_CLI_TOKEN Bearer ya29.PLANTEDr6versionbearer0123"`);
   const result = await checkGwsCliAccess({ gwsBin: echoing }, defaultGwsCliRunner, env);
   assert.equal(result.version, withheld);
   assert.doesNotMatch(JSON.stringify(result), leak);
+  // A token on the second line of otherwise real output, the lines reordered, or another binary name: never rendered.
+  assert.equal(await version("second-line", printLines("gws 0.22.5", "$GOOGLE_WORKSPACE_CLI_TOKEN")), "gws 0.22.5");
+  assert.equal(await version("reordered", printLines(REAL_VERSION_LINES[1], REAL_VERSION_LINES[0])), withheld);
+  assert.equal(await version("name", `echo "google-workspace-cli 0.22.5"`), withheld);
+  assert.equal(await version("huge", `echo "gws 1234567.0.0"`), "unrecognized (--version printed 15 character(s) without a version number; the output is not repeated here)");
 
   // Only the credential: no version number is found, so the line is dropped behind a descriptor that counts the printed characters.
-  const tokenOnly = await checkGwsCliAccess({ gwsBin: scripted("token", `echo "$GOOGLE_WORKSPACE_CLI_TOKEN"`) }, defaultGwsCliRunner, env);
-  assert.equal(tokenOnly.version, `unrecognized (--version printed ${envToken.length} character(s) without a version number; the output is not repeated here)`);
-  const silent = await checkGwsCliAccess({ gwsBin: scripted("silent", "true") }, defaultGwsCliRunner, env);
-  assert.equal(silent.version, "unknown (--version printed nothing)");
-
-  // Documented shapes render as `gws <semver>`, including a v prefix and a short pre-release suffix.
-  assert.equal((await checkGwsCliAccess({ gwsBin: scripted("plain", `echo "gws 0.22.5"`) }, defaultGwsCliRunner, env)).version, "gws 0.22.5");
-  assert.equal((await checkGwsCliAccess({ gwsBin: scripted("pre", `echo "gws v1.2.3-beta.1"`) }, defaultGwsCliRunner, env)).version, "gws 1.2.3-beta.1");
-  assert.equal((await checkGwsCliAccess({ gwsBin: scripted("name", `echo "google-workspace-cli 0.22.5"`) }, defaultGwsCliRunner, env)).version, withheld);
-  // A short credential in the pre-release position fits the documented grammar, so the scrub is the layer that removes it (negative control for scrubCliText here).
-  const shortToken = { PATH: process.env.PATH, GOOGLE_WORKSPACE_CLI_TOKEN: "PLANTEDr5tok" };
-  const suffixed = await checkGwsCliAccess({ gwsBin: scripted("suffix", `echo "gws 0.22.5-$GOOGLE_WORKSPACE_CLI_TOKEN"`) }, defaultGwsCliRunner, shortToken);
-  assert.equal(suffixed.version, withheld);
-  const longSuffix = await checkGwsCliAccess({ gwsBin: scripted("long", `echo "gws 0.22.5-${"a".repeat(21)}"`) }, defaultGwsCliRunner, env);
-  assert.equal(longSuffix.version, withheld, "a pre-release suffix longer than 20 characters is not rendered");
+  assert.equal(await version("token", `echo "$GOOGLE_WORKSPACE_CLI_TOKEN"`), `unrecognized (--version printed ${envToken.length} character(s) without a version number; the output is not repeated here)`);
+  assert.equal(await version("silent", "true"), "unknown (--version printed nothing)");
 
   // The registered tool reads the real environment; its text and JSON carry the projected version only.
   const previous = process.env.GOOGLE_WORKSPACE_CLI_TOKEN;
   process.env.GOOGLE_WORKSPACE_CLI_TOKEN = envToken;
   try {
+    const realTool = await registeredTools().run("gws_ops_check_cli", { gws_bin: scripted("real-tool", printLines(...REAL_VERSION_LINES)) });
+    assert.equal(realTool.isError, undefined);
+    assert.equal(realTool.details.version, "gws 0.22.5");
+    assert.match(realTool.content[0].text, /^Version: gws 0\.22\.5$/m);
+    assert.equal(JSON.stringify(realTool).includes("officially"), false);
+
+    const fragmentTool = await registeredTools().run("gws_ops_check_cli", { gws_bin: scripted("fragment-tool", `echo "gws 0.22.5-${fragment}"`) });
+    assert.equal(fragmentTool.details.version, "gws 0.22.5");
+    assert.match(fragmentTool.content[0].text, /^Version: gws 0\.22\.5$/m);
+    assert.equal(JSON.stringify(fragmentTool).includes(fragment), false, "the fragment reached the tool text or JSON");
+
     const tool = await registeredTools().run("gws_ops_check_cli", { gws_bin: echoing });
     assert.equal(tool.isError, undefined);
     assert.equal(tool.details.version, withheld);
@@ -843,7 +887,7 @@ test("rule 9: GwsCliCommandError scrubs its message in the constructor, independ
   const env = { PATH: process.env.PATH, GOOGLE_WORKSPACE_CLI_TOKEN: envToken };
   const stdoutOnly = createScriptedBinary(
     createTempBase("grclanker-gws-ops-ctor-stdout-"),
-    `if [ "$1" = "--version" ]; then echo "gws 0.22.5"; exit 0; fi\necho "${raw}"\nexit 1`,
+    `${PRINT_REAL_VERSION}\necho "${raw}"\nexit 1`,
   );
   await assert.rejects(
     () => traceGwsAdminActivity({ gwsBin: stdoutOnly }, defaultGwsCliRunner, env),

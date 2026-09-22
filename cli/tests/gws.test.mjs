@@ -2,6 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import {
   existsSync,
+  mkdirSync,
   mkdtempSync,
   readFileSync,
   readdirSync,
@@ -27,8 +28,10 @@ import {
   describeErrorReasons,
   exportGwsAuditBundle,
   normalizeFrameworkSelection,
+  parseServiceAccount,
   projectActivitySnapshot,
   projectAlertSnapshot,
+  readServiceAccountFromFile,
   redactKnownValues,
   redactSecrets,
   registerGwsTools,
@@ -1708,7 +1711,119 @@ test("rule 9 (tool path): a transport error carrying credentials is scrubbed whe
   const badJson = await tools.run("gws_assess_identity", { auth_mode: "service_account", credentials_json: `ya29.PLANTEDr5notjson0123456789 ${"x".repeat(40)}`, admin_email: "admin@example.com" });
   assert.equal(badJson.isError, true);
   assert.doesNotMatch(badJson.text, leak, badJson.text);
-  assert.equal(badJson.text, "Google Workspace identity assessment failed: Failed to parse service account JSON from credentials_json: the contents are not valid JSON (72 character(s); the contents are not repeated here).");
+  assert.equal(badJson.text, "Google Workspace identity assessment failed: Service account JSON: invalid JSON in credentials_json (72 character(s) read; the contents are not repeated here).");
+  clearGwsTokenCacheForTests();
+});
+
+test("config loader canary: a malformed service-account key file is reported as invalid JSON in <path> without the parser message, and a read failure by its system error code", async () => {
+  clearGwsTokenCacheForTests();
+  const base = createTempBase("grclanker-gws-key-file-");
+  const keyLine = "MIIEvPLANTEDr6keyline0123456789abcdefghij";
+  const bearer = "ya29.PLANTEDr6bearer0123456789";
+  const leak = /PLANTED|MIIEv|ya29|Bearer/;
+  const libraryWords = /Unexpected token|is not valid JSON|Expected .* in JSON|at position|no such file|illegal operation|not a directory/;
+  // The malformed line carries the key body as a bareword with the bearer beside it, so the parser's own message quotes it.
+  const malformedLine = `  "private_key": ${keyLine} Bearer ${bearer}`;
+  const text = ["{", '  "type": "service_account",', '  "client_email": "svc@example-project.iam.gserviceaccount.com",', malformedLine, "}"].join("\n");
+  const keyPath = join(base, "service-account.json");
+  writeFileSync(keyPath, text);
+
+  // Control: JSON.parse quotes ten characters of context around an unexpected bareword, so interpolating its message
+  // would put the head of the planted key line into the error.
+  const parserMessage = (() => {
+    try {
+      JSON.parse(text);
+      return "";
+    } catch (error) {
+      return error.message;
+    }
+  })();
+  assert.match(parserMessage, /^Unexpected token 'M'/);
+  assert.ok(parserMessage.includes(keyLine.slice(0, 10)), `control: the parser message carries the planted key line: ${parserMessage}`);
+
+  const rejected = async (promise) => {
+    try {
+      await promise;
+    } catch (error) {
+      assert.ok(error instanceof Error, "rejects with an Error");
+      return error.message;
+    }
+    assert.fail("expected a rejection");
+  };
+  const invalid = `Service account JSON: invalid JSON in ${keyPath} (${text.length} character(s) read; the contents are not repeated here).`;
+  const args = { auth_mode: "service_account", credentials_file: keyPath, admin_email: "admin@example.com" };
+  const thrown = await rejected(resolveGwsConfiguration(args, {}));
+  assert.equal(thrown, invalid);
+  assert.doesNotMatch(thrown, leak);
+  assert.doesNotMatch(thrown, libraryWords);
+  const envArgs = { auth_mode: "service_account", admin_email: "admin@example.com" };
+  assert.equal(await rejected(resolveGwsConfiguration(envArgs, { GWS_CREDENTIALS_FILE: keyPath })), invalid, "the environment path takes the same loader");
+  assert.equal(await rejected(resolveGwsConfiguration(envArgs, { GOOGLE_APPLICATION_CREDENTIALS: keyPath })), invalid);
+  assert.equal(
+    await rejected(resolveGwsConfiguration({ ...envArgs, credentials_json: text }, {})),
+    `Service account JSON: invalid JSON in credentials_json (${text.length} character(s) read; the contents are not repeated here).`,
+    "inline credentials take the same parser under their own label",
+  );
+  assert.throws(() => parseServiceAccount(text, keyPath), { message: invalid });
+
+  // Every tool result carries the fixed message and nothing from the file or the parser.
+  const tools = registeredTools();
+  for (const name of INSPECTOR_TOOLS) {
+    const result = await tools.run(name, args);
+    assert.equal(result.isError, true, `${name} fails the call`);
+    assert.doesNotMatch(result.text + result.json, leak, `${name} leaked the key file: ${result.text}`);
+    assert.doesNotMatch(result.text + result.json, libraryWords, `${name} carries a library message: ${result.text}`);
+    assert.ok(result.text.endsWith(invalid), `${name}: ${result.text}`);
+  }
+
+  // Read failures render the system error code only, never Node's message.
+  const directoryPath = join(base, "key-as-directory.json");
+  mkdirSync(directoryPath);
+  assert.equal(await rejected(resolveGwsConfiguration({ ...args, credentials_file: directoryPath }, {})), `Service account JSON: unable to read ${directoryPath} (EISDIR).`);
+  const missingPath = join(base, "missing", "service-account.json");
+  assert.equal(await rejected(resolveGwsConfiguration({ ...args, credentials_file: missingPath }, {})), `Service account JSON: unable to read ${missingPath} (ENOENT).`);
+  const missingTool = await tools.run("gws_check_access", { ...args, credentials_file: missingPath });
+  assert.equal(missingTool.isError, true);
+  assert.equal(missingTool.text, `Google Workspace access check failed: Service account JSON: unable to read ${missingPath} (ENOENT).`);
+
+  // A read failure whose error is not a Node system error (no code, a non-string code, a code outside the grammar, a
+  // bare string, a plain Error, null) renders the path alone; its message is never read.
+  const nonStandard = [
+    { code: "not a code", message: `read failed for Bearer ${bearer}` },
+    { code: 13, message: keyLine },
+    { code: `E${"X".repeat(31)}`, message: keyLine },
+    { code: "Eaccess", message: keyLine },
+    { message: keyLine },
+    `refused: ${bearer}`,
+    new Error(`fs layer said ${keyLine}`),
+    null,
+  ];
+  for (const thrownValue of nonStandard) {
+    const message = await rejected(readServiceAccountFromFile(keyPath, () => { throw thrownValue; }));
+    assert.equal(message, `Service account JSON: unable to read ${keyPath}.`, `for ${String(thrownValue && thrownValue.code)}`);
+  }
+  assert.equal(
+    await rejected(readServiceAccountFromFile(keyPath, () => { throw { code: "EACCES", message: `denied ${keyLine}` }; })),
+    `Service account JSON: unable to read ${keyPath} (EACCES).`,
+    "a well-formed code renders with nothing else from the error",
+  );
+  // The path is operator input and passes through the error scrub like every other message.
+  assert.equal(
+    await rejected(readServiceAccountFromFile(`/keys/${bearer}/service-account.json`, () => { throw { code: "ENOENT" }; })),
+    "Service account JSON: unable to read /keys/[REDACTED]/service-account.json (ENOENT).",
+  );
+
+  // Well-formed JSON without the required fields names the fields, never the contents.
+  writeFileSync(keyPath, JSON.stringify({ type: "service_account", client_email: "svc@example-project.iam.gserviceaccount.com", note: bearer }));
+  assert.equal(await rejected(resolveGwsConfiguration(args, {})), `Service account JSON: ${keyPath} is missing client_email or private_key.`);
+
+  // The documented environment fallback loads the file even when other arguments are supplied (the argument overlay
+  // used to erase it with undefined), so the env cases above reached the loader rather than the missing-credentials error.
+  writeFileSync(keyPath, JSON.stringify({ type: "service_account", client_email: "svc@example-project.iam.gserviceaccount.com", private_key: "-----BEGIN PRIVATE KEY-----\nMIIEv\n-----END PRIVATE KEY-----\n" }));
+  const resolved = await resolveGwsConfiguration(envArgs, { GWS_CREDENTIALS_FILE: keyPath });
+  assert.equal(resolved.credentialsFile, keyPath);
+  assert.equal(resolved.adminEmail, "admin@example.com");
+  assert.deepEqual(resolved.sourceChain, ["environment", "arguments"]);
   clearGwsTokenCacheForTests();
 });
 
@@ -1750,6 +1865,24 @@ test("rule 9 (tool path): a 200 body that is not JSON is described by content ty
     const adminAccess = await tools.run("gws_assess_admin_access", toolArgs);
     assert.equal(adminAccess.details.snapshot_summary.privileged_users_status, `unreadable: Directory roles.list (${described})`);
     assert.equal(findingById(adminAccess.details, "GWS-ADMIN-001").status, "Manual");
+    // The access probe reads the body too: a 200 page is not API access, so the probe agrees with the assessments.
+    const access = await tools.run("gws_check_access", toolArgs);
+    const rolesProbe = access.details.probes.find((probe) => probe.key === "roles");
+    assert.equal(rolesProbe.status, "error");
+    assert.equal(rolesProbe.detail, described);
+    assert.equal(access.details.status, "limited");
+    assert.match(access.text, /^Status: limited$/m);
+    assert.match(access.text, /roles\s+│\s+error\s+│\s+200 OK with non-JSON text\/html body \(\d+ bytes\) withheld/);
+    assert.equal(access.details.probes.filter((probe) => probe.status === "ok").length, access.details.probes.length - 1, "the JSON endpoints still probe ok");
+  });
+  // Control: a 200 JSON body without a content-type header is API access, so the probe stays ok.
+  const untypedRoles = [(url) => url.pathname.endsWith("/roles"), () => new Response('{"items":[]}', { status: 200 })];
+  await withRoutedFetch(routeEndpoints([untypedRoles]), async () => {
+    const access = await tools.run("gws_check_access", toolArgs);
+    const rolesProbe = access.details.probes.find((probe) => probe.key === "roles");
+    assert.equal(rolesProbe.status, "ok");
+    assert.equal(rolesProbe.detail, "200 OK");
+    assert.equal(access.details.status, "healthy");
   });
 
   // The bundle exported from the same client carries the description and nothing from the body, in the directory and the zip.

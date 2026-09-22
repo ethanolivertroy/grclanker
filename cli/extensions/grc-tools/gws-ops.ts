@@ -36,11 +36,16 @@ const GWS_BIN_ENV_KEYS = ["GRCLANKER_GWS_BIN"] as const;
 const CAPTURE_PROJECTION_NOTE =
   "The stored capture is projected to the documented Reports API activity fields (id, actor, ipAddress, events[].type and name); event parameters are not stored and credential-like values are redacted. Re-run the recorded command for parameter detail.";
 /**
- * The README documents `gws --version` as a plain-text version line; the binary name plus a semver-like token (with at most a
- * short pre-release suffix) is the only shape rendered whole. Anything else yields the bare version core or a descriptor.
+ * The published `gws` prints two lines for `--version`: `gws <CARGO_PKG_VERSION>` and then the fixed disclaimer
+ * `This is not an officially supported Google product.` (crates/google-workspace-cli/src/main.rs, the `is_version_flag`
+ * branch; the disclaimer line was added in 0.3.5, CHANGELOG entry 1991d53). Only the first line is matched. A Cargo
+ * pre-release or build suffix is accepted so the line is still recognized, but it is never rendered: no published
+ * release carries one, and a suffix of that grammar could carry a token fragment. The rendered version is therefore
+ * always `major.minor.patch`, digits and dots only, at most six digits per component.
  */
-const VERSION_LINE_PATTERN = /^gws\s+v?(\d+\.\d+\.\d+(?:-[0-9A-Za-z.]{1,20})?)$/;
-const VERSION_CORE_PATTERN = /\d+\.\d+\.\d+/;
+const VERSION_FIRST_LINE_PATTERN = /^gws\s+v?(\d{1,6}\.\d{1,6}\.\d{1,6})(?:-[0-9A-Za-z.-]{1,64})?(?:\+[0-9A-Za-z.-]{1,64})?$/;
+/** A bare version core anywhere in output whose first line is not the documented one; digits and dots only. */
+const VERSION_CORE_PATTERN = /(?<![\d.])\d{1,6}\.\d{1,6}\.\d{1,6}(?![\d.])/;
 
 /**
  * The one scrub every CLI-produced string passes through before it can become an error message, a tool result, or a
@@ -473,19 +478,22 @@ async function runGwsVersion(
 }
 
 /**
- * The version is the one CLI-produced string that reaches a tool result without a JSON projection, so it passes through
- * scrubCliText and is then validated against the documented shape; anything else the binary printed is withheld behind a
- * descriptor rather than rendered.
+ * The version is the one CLI-produced string that reaches a tool result without a JSON projection. The output is
+ * scrubbed, its first line is matched against the documented `gws <version>` line, and only the numeric core is
+ * rendered: the pre-release or build suffix, the disclaimer line, and anything else the binary printed are never
+ * repeated. Output whose first line is not the documented one yields a bare version core found anywhere in it plus a
+ * note, or a descriptor that gives only the output length.
  */
 function projectVersionOutput(stdout: string, knownSecrets: string[]): string {
   const printed = stdout.trim();
   const scrubbed = scrubCliText(printed, knownSecrets);
   if (scrubbed.length === 0) return "unknown (--version printed nothing)";
-  const documented = VERSION_LINE_PATTERN.exec(scrubbed);
+  const firstLine = scrubbed.split(/\r?\n/, 1)[0]?.trim() ?? "";
+  const documented = VERSION_FIRST_LINE_PATTERN.exec(firstLine);
   if (documented) return `gws ${documented[1]}`;
   const core = VERSION_CORE_PATTERN.exec(scrubbed);
   if (core) {
-    return `gws ${core[0]} (the rest of the --version output did not match the documented \`gws <version>\` line and is not repeated here)`;
+    return `gws ${core[0]} (the rest of the --version output did not match the documented \`gws <version>\` first line and is not repeated here)`;
   }
   return `unrecognized (--version printed ${printed.length} character(s) without a version number; the output is not repeated here)`;
 }

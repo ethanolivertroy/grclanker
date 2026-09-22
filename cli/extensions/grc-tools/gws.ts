@@ -168,6 +168,8 @@ const TEXT_SECRET_KEY_PATTERN = /(token|secret|password|passwd|credential|creden
  * None of them carry `.`, `-`, or `/`, so excluding those drops every dotted, hyphenated, or path-shaped credential form.
  */
 const ERROR_IDENTIFIER_PATTERN = /^[A-Za-z][A-Za-z0-9_]{0,62}$/;
+/** The `code` of a Node system error (ENOENT, EACCES, EISDIR): the only part of a read failure that is ever rendered. */
+const SYSTEM_ERROR_CODE_PATTERN = /^E[A-Z0-9_]{1,30}$/;
 /** RFC 9110 section 15 reason phrases for the statuses Google APIs return; the server-supplied phrase is never rendered. */
 const HTTP_REASON_PHRASES: Record<number, string> = {
   200: "OK",
@@ -2018,24 +2020,44 @@ async function countFilesRecursively(pathname: string): Promise<number> {
   return count;
 }
 
-async function readServiceAccountFromFile(pathname: string): Promise<ServiceAccountCredentials> {
-  const contents = readFileSync(pathname, "utf8");
+/** The system error code of a failed read when Node supplied one; a non-standard error object yields nothing. */
+function systemErrorCode(error: unknown): string | undefined {
+  const code = typeof error === "object" && error !== null && "code" in error ? (error as { code: unknown }).code : undefined;
+  return typeof code === "string" && SYSTEM_ERROR_CODE_PATTERN.test(code) ? code : undefined;
+}
+
+type FileReader = (pathname: string) => string;
+const readUtf8File: FileReader = (pathname) => readFileSync(pathname, "utf8");
+
+/**
+ * Reads and parses the service-account key file in two guarded steps. Neither the read error nor the parser error is
+ * interpolated: Node's message would repeat the path with its own wording, and the JSON parser quotes the characters
+ * around the failure, which in a key file is credential material. A read failure renders the path and the system
+ * error code; a parse failure renders the path and the size read, and both pass through the module's error scrub.
+ */
+export async function readServiceAccountFromFile(pathname: string, readFile: FileReader = readUtf8File): Promise<ServiceAccountCredentials> {
+  let contents: string;
+  try {
+    contents = readFile(pathname);
+  } catch (error) {
+    const code = systemErrorCode(error);
+    throw new Error(scrubErrorText(`Service account JSON: unable to read ${pathname}${code ? ` (${code})` : ""}.`));
+  }
   return parseServiceAccount(contents, pathname);
 }
 
-function parseServiceAccount(contents: string, label: string): ServiceAccountCredentials {
+export function parseServiceAccount(contents: string, label: string): ServiceAccountCredentials {
   let parsed: unknown;
   try {
     parsed = JSON.parse(contents);
   } catch {
-    // The parser's own message quotes the first characters of the input, which here is credential material.
-    throw new Error(`Failed to parse service account JSON from ${label}: the contents are not valid JSON (${contents.length} character(s); the contents are not repeated here).`);
+    throw new Error(scrubErrorText(`Service account JSON: invalid JSON in ${label} (${contents.length} character(s) read; the contents are not repeated here).`));
   }
   const record = asRecord(parsed);
   const clientEmail = asString(record.client_email);
   const privateKey = asString(record.private_key);
   if (!clientEmail || !privateKey) {
-    throw new Error(`Service account JSON from ${label} is missing client_email or private_key.`);
+    throw new Error(scrubErrorText(`Service account JSON: ${label} is missing client_email or private_key.`));
   }
   return {
     client_email: clientEmail,
@@ -2058,6 +2080,10 @@ function normalizeAssessmentArgs(args: RawConfigArgs): RawConfigArgs {
 }
 
 const normalizeExportArgs = normalizeAssessmentArgs;
+
+function definedEntries<T extends object>(overlay: T): Partial<T> {
+  return Object.fromEntries(Object.entries(overlay).filter(([, value]) => value !== undefined)) as Partial<T>;
+}
 
 export function normalizeFrameworkSelection(value: unknown): ReportFrameworkKey[] {
   const raw = Array.isArray(value)
@@ -2118,7 +2144,9 @@ export async function resolveGwsConfiguration(
     sourceChain.push("arguments");
   }
 
-  const merged = overlays.reduce<GwsConfigOverlay>((acc, overlay) => ({ ...acc, ...overlay }), {});
+  // Later overlays win only where they carry a value: the argument overlay lists every key, so spreading it whole
+  // would erase an environment-supplied credentials path with undefined.
+  const merged = overlays.reduce<GwsConfigOverlay>((acc, overlay) => ({ ...acc, ...definedEntries(overlay) }), {});
   const authMode = (merged.authMode
     ?? (merged.accessToken ? "access_token" : "service_account")) as GwsAuthMode;
   if (authMode !== "service_account" && authMode !== "access_token") {
@@ -2213,6 +2241,17 @@ export class GoogleWorkspaceAuditorClient implements GwsAuditCollector {
           path: pathname,
           status: response.status === 401 ? "unauthorized" : response.status === 403 ? "forbidden" : "error",
           detail: httpStatusLabel(response.status),
+        };
+      }
+      // A 2xx whose body is not JSON (an intercepting proxy page, a sign-in page) is not API access; the probe reports
+      // the same fixed description the assessments render for that response, and never the body.
+      const body = await readJsonBody(response);
+      if (body.failure !== undefined) {
+        return {
+          key: basename(pathname) || pathname,
+          path: pathname,
+          status: "error",
+          detail: `${httpStatusLabel(response.status)} with ${body.failure}`,
         };
       }
       return {
