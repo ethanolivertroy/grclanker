@@ -4,6 +4,7 @@ import {
   existsSync,
   mkdtempSync,
   readFileSync,
+  readdirSync,
   rmSync,
   statSync,
   symlinkSync,
@@ -34,6 +35,7 @@ import {
   projectSecuritySignal,
   redactCredentialValues,
   reduceUrl,
+  registerDatadogTools,
   resolveDatadogConfiguration,
   resolveSecureOutputPath,
 } from "../dist/extensions/grc-tools/datadog.js";
@@ -3354,4 +3356,138 @@ test("addendum 3: under every single-inventory denial no Datadog finding, summar
   }
   assert.ok(comparedLeaves > 3000, `expected the sweep to compare thousands of leaves, got ${comparedLeaves}`);
   assert.deepEqual(offenders, [], `values that fell back to zero, false, or empty under a denial:\n${offenders.join("\n")}`);
+});
+
+// ---------------------------------------------------------------------------------------------------------------
+// Addendum 4: every surface fails in turn with a 502 HTML page and a JSON error carrying canaries.
+// ---------------------------------------------------------------------------------------------------------------
+
+/** Every error string a Datadog run can record, gathered from the access check, the assess payloads, and the bundle. */
+function ddRecordedErrorStrings(access, assessments, files) {
+  const strings = [];
+  for (const surface of access.surfaces) if (typeof surface.error === "string") strings.push(surface.error);
+  strings.push(...access.notes);
+  for (const assessment of assessments) {
+    strings.push(...(assessment.errors ?? []));
+    for (const finding of assessment.findings) {
+      strings.push(finding.summary);
+      for (const [, value] of leafEntries(finding.evidence ?? {})) if (typeof value === "string") strings.push(value);
+    }
+  }
+  const errorsLog = files.get("_errors.log");
+  if (errorsLog) strings.push(...errorsLog.split("\n"));
+  return strings;
+}
+
+test("addendum 4: a 502 HTML page or a JSON error message carrying credentials on any Datadog surface never reaches the access check, an assess payload, or the bundle, and every recorded error carries the status-and-length note", async () => {
+  const surfaces = Object.keys(routesFromClient(leakyClient()));
+  assert.ok(surfaces.length >= 24, `expected every collector and access probe route, got ${surfaces.length}`);
+  const variants = [
+    { name: "html502", handler: htmlGateway, note: /502 Bad Gateway: non-JSON body \(text\/html, \d+ bytes, not echoed\)/ },
+    { name: "json403", handler: jsonForbiddenWithUrl, note: /\(403 Forbidden\)/ },
+  ];
+  let notedSurfaces = 0;
+  for (const surface of surfaces) {
+    for (const variant of variants) {
+      const routes = routesFromClient(leakyClient());
+      routes[surface] = variant.handler();
+      const { client, config } = httpClient(routes, []);
+      const label = `${surface} ${variant.name}`;
+      const secrets = [...ddCanaryValues(), ...DATADOG_FAKE_SECRETS, config.apiKey, config.appKey];
+
+      const access = await checkDatadogAccess(client);
+      const assessments = await runAllAssessments(client);
+      const result = await exportDatadogAuditBundle(client, config, createTempBase("grclanker-datadog-surface-canary-"), { now: NOW });
+      const files = readBundleFiles(result.outputDir);
+      const entries = readZipEntries(result.zipPath);
+
+      assertSecretsAbsent(assert, files, secrets, `${label} bundle file`);
+      assertSecretsAbsent(assert, entries, secrets, `${label} zip entry`);
+      assertSecretsAbsent(assert, new Map([["check_access", JSON.stringify(access)], ["assessments", JSON.stringify(assessments)]]), secrets, `${label} tool payload`);
+
+      const [method, path] = surface.split(" ");
+      const aboutSurface = ddRecordedErrorStrings(access, assessments, files).filter((text) => text.includes(`${method} ${path}`) && /request failed|timed out/.test(text));
+      if (aboutSurface.length === 0) continue;
+      notedSurfaces += 1;
+      for (const text of aboutSurface) {
+        assert.match(text, variant.note, `${label}: error string lacks the status note: ${text}`);
+        assert.ok(!/<html|Bad Gateway<\/|upstream sent/.test(text), `${label}: error string echoes the body: ${text}`);
+        if (variant.name === "json403") assert.ok(!text.includes(`token=${DD_CANARIES.urlToken}`), `${label}: URL token survives in ${text}`);
+      }
+    }
+  }
+  assert.ok(notedSurfaces >= surfaces.length, `every surface should record its failure at least once across the variants, got ${notedSurfaces} of ${surfaces.length * variants.length}`);
+});
+
+// ---------------------------------------------------------------------------------------------------------------
+// Addendum 6: config loader errors never quote the file.
+// ---------------------------------------------------------------------------------------------------------------
+
+const DOGRC_CANARY = "DOGRC_CANARY_7d8e9f0a1b2c3d4e";
+
+/** Malformed dogshell INI shapes with the canary on the bad line; the parser skips or keeps the line but never quotes it. */
+const MALFORMED_DOGRC_FILES = [
+  { name: "unterminated quote", content: `[Connection]\napikey = "${DOGRC_CANARY}\nappkey = app-key-0123456789\n` },
+  { name: "bad indent", content: `[Connection]\n    apikey = ${DOGRC_CANARY}\n\tappkey = app-key-0123456789\n` },
+  { name: "duplicate key", content: `[Connection]\napikey = first-key-0123456789\napikey = ${DOGRC_CANARY}\nappkey = app-key-0123456789\n` },
+  { name: "trailing comma", content: `[Connection]\napikey = ${DOGRC_CANARY},\nappkey = app-key-0123456789,\n` },
+  { name: "missing separator", content: `[Connection]\napikey ${DOGRC_CANARY}\nappkey app-key-0123456789\n` },
+  { name: "unterminated section header", content: `[Connection\napikey = ${DOGRC_CANARY}\nappkey = app-key-0123456789\n` },
+];
+
+test("rule 9 / addendum 6: a malformed .dogrc whose bad line carries a credential never reaches the resolver error, the check_access payload, or a bundle, and a filesystem failure names only the path and errno code", async () => {
+  const registered = [];
+  registerDatadogTools({ registerTool: (tool) => registered.push(tool) });
+  const checkTool = registered.find((tool) => tool.name === "datadog_check_access");
+  const exportTool = registered.find((tool) => tool.name === "datadog_export_audit_bundle");
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async () => { throw new TypeError("fetch failed"); };
+  try {
+    for (const shape of MALFORMED_DOGRC_FILES) {
+      const base = createTempBase("grclanker-dogrc-malformed-");
+      const configPath = join(base, "dogrc");
+      writeFileSync(configPath, shape.content, "utf8");
+      const outputDir = join(base, "export");
+
+      let resolverMessage;
+      try {
+        resolveDatadogConfiguration({ config_file: configPath }, {}, base);
+      } catch (error) {
+        resolverMessage = error.message;
+      }
+      if (resolverMessage !== undefined) {
+        assert.match(resolverMessage, /DD_API_KEY|DD_APP_KEY/, `${shape.name}: a skipped line surfaces as the missing-key message`);
+        assert.ok(!resolverMessage.includes(DOGRC_CANARY), `${shape.name}: the resolver message quotes the credential: ${resolverMessage}`);
+      }
+
+      const access = await checkTool.execute("call-dogrc", checkTool.prepareArguments({ config_file: configPath }));
+      assert.ok(!JSON.stringify(access).includes(DOGRC_CANARY), `${shape.name}: the check_access payload quotes the credential: ${access.content[0].text}`);
+      // The export records unreachable surfaces as collection errors rather than failing, so whatever it wrote is scanned.
+      const exported = await exportTool.execute("call-dogrc-export", exportTool.prepareArguments({ config_file: configPath, output_dir: outputDir }));
+      assert.ok(!JSON.stringify(exported).includes(DOGRC_CANARY), `${shape.name}: the export payload quotes the credential`);
+      if (existsSync(outputDir)) {
+        for (const entry of readdirSync(outputDir)) {
+          if (entry.endsWith(".zip")) continue;
+          assertSecretsAbsent(assert, readBundleFiles(join(outputDir, entry)), [DOGRC_CANARY], `${shape.name} bundle file`);
+        }
+      }
+    }
+
+    const directoryAsFile = createTempBase("grclanker-dogrc-dir-");
+    let fsError;
+    try {
+      resolveDatadogConfiguration({ config_file: directoryAsFile }, {}, directoryAsFile);
+    } catch (error) {
+      fsError = error;
+    }
+    assert.equal(fsError.name, "DatadogConfigFileError");
+    assert.equal(fsError.code, "EISDIR");
+    assert.ok(fsError.message.includes(directoryAsFile));
+    assert.match(fsError.message, /could not be loaded \(EISDIR\)\./);
+    const access = await checkTool.execute("call-dogrc-dir", checkTool.prepareArguments({ config_file: directoryAsFile }));
+    assert.equal(access.isError, true);
+    assert.match(access.content[0].text, /Datadog access check failed: Datadog config file .* could not be loaded \(EISDIR\)/);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
 });

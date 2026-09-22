@@ -997,9 +997,35 @@ function parseDogrc(content: string): DogrcOverlay {
   return overlay;
 }
 
+const ERRNO_CODE_PATTERN = /^E[A-Z]+$/;
+
+/**
+ * Raised when the .dogrc file cannot be read. The file carries the API and application keys, so the
+ * message names only the path and a validated errno code; the filesystem's own message is withheld.
+ * parseDogrc itself never throws: a line it cannot read is skipped, never quoted.
+ */
+export class DatadogConfigFileError extends Error {
+  readonly path: string;
+  readonly code: string;
+
+  constructor(path: string, code: string) {
+    super(`Datadog config file ${path} could not be loaded (${code}). The parser detail is withheld because config files carry credentials; fix or remove the file and retry.`);
+    this.name = "DatadogConfigFileError";
+    this.path = path;
+    this.code = code;
+  }
+}
+
 function readDogrc(location: string): DogrcOverlay | undefined {
   if (!existsSync(location)) return undefined;
-  return parseDogrc(readFileSync(location, "utf8"));
+  let content: string;
+  try {
+    content = readFileSync(location, "utf8");
+  } catch (error) {
+    const errno = asString(asObject(error)?.code);
+    throw new DatadogConfigFileError(location, errno && ERRNO_CODE_PATTERN.test(errno) ? errno : "INVALID_CONFIG");
+  }
+  return parseDogrc(content);
 }
 
 export function resolveDatadogConfiguration(
@@ -1059,7 +1085,8 @@ export class DatadogApiError extends Error {
   readonly path: string;
 
   constructor(message: string, status: number, path: string) {
-    super(message);
+    // The constructor is the last stop before the message can escape, so the unanchored scrub runs here as well as at the sink.
+    super(scrubErrorText(message));
     this.name = "DatadogApiError";
     this.status = status;
     this.path = path;
