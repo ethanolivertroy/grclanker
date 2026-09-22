@@ -244,6 +244,9 @@ test("checkAwsAccess reports readable AWS audit surfaces", async () => {
     async getAccountSummary() {
       return { SummaryMap: { Users: 3 } };
     },
+    async listIamUsers(limit) {
+      return paged([{ UserName: "alice" }], limit === 1);
+    },
     async describeTrails() {
       return [{ Name: "org-trail" }];
     },
@@ -269,21 +272,33 @@ test("checkAwsAccess reports readable AWS audit surfaces", async () => {
 
   const result = await checkAwsAccess(client);
   assert.equal(result.status, "healthy");
-  assert.equal(result.surfaces.filter((surface) => surface.status === "readable").length, 8);
+  assert.equal(result.surfaces.filter((surface) => surface.status === "readable").length, 9);
   const counts = Object.fromEntries(result.surfaces.map((surface) => [surface.name, surface.count]));
   assert.equal(counts.security_hub, 1, "paged lists report the items seen as the surface count");
   assert.equal(counts.guardduty, 1);
   assert.equal(counts.access_analyzer, 1);
   assert.equal(counts.identity_center, 1);
   assert.equal(counts.organizations, 1);
+  assert.equal(counts.iam_users, 1, "IAM.ListUsers is probed so a denial of the user inventory is visible in the access check");
+  const users = result.surfaces.find((surface) => surface.name === "iam_users");
+  assert.deepEqual(
+    { command: users.command, region: users.region, truncated: users.truncated },
+    { command: "iam:ListUsers", region: "us-east-1", truncated: true },
+    "a probe capped at its page limit carries truncated: true beside the command and region it issued",
+  );
+  for (const surface of result.surfaces) {
+    assert.match(surface.command, /^[a-z0-9-]+:[A-Z][A-Za-z]+$/, `${surface.name} names the IAM action it issued`);
+    assert.equal(surface.region, "us-east-1");
+    assert.equal(typeof surface.count, "number", `${surface.name}: a completed probe carries a numeric count`);
+  }
   assert.match(result.recommendedNextStep, /aws_assess_identity/);
 });
 
 test("checkAwsAccess probes EC2, S3, KMS, RDS, Audit Manager, and Account surfaces and reports limited when any is denied", async () => {
   const healthy = await checkAwsAccess(compliantBundleClient());
   assert.equal(healthy.status, "healthy");
-  assert.equal(healthy.surfaces.length, 14);
-  for (const name of ["ec2_regions", "s3_buckets", "kms_keys", "rds_instances", "audit_manager", "account_contacts"]) {
+  assert.equal(healthy.surfaces.length, 15);
+  for (const name of ["ec2_regions", "s3_buckets", "kms_keys", "rds_instances", "audit_manager", "account_contacts", "iam_users"]) {
     const probe = healthy.surfaces.find((surface) => surface.name === name);
     assert.equal(probe?.status, "readable", `${name} should be readable`);
   }
@@ -299,11 +314,27 @@ test("checkAwsAccess probes EC2, S3, KMS, RDS, Audit Manager, and Account surfac
     },
   }));
   assert.equal(limited.status, "limited");
-  assert.equal(limited.surfaces.find((surface) => surface.name === "kms_keys")?.status, "not_readable");
+  const kms = limited.surfaces.find((surface) => surface.name === "kms_keys");
+  assert.equal(kms?.status, "not_readable");
+  assert.deepEqual(
+    { count: kms.count, truncated: kms.truncated, command: kms.command, region: kms.region, error_code: kms.error_code, http_status: kms.http_status },
+    { count: null, truncated: null, command: "kms:ListKeys", region: "us-east-1", error_code: "AccessDeniedException", http_status: 403 },
+    "a denied probe keeps count and truncated null and names the command, region, SDK error code, and HTTP status that failed",
+  );
+  assert.match(kms.error, /AccessDeniedException/);
   assert.equal(limited.surfaces.find((surface) => surface.name === "account_contacts")?.status, "readable", "a missing contact is readable evidence, not a denial");
   assert.equal(limited.surfaces.find((surface) => surface.name === "account_contacts")?.count, 0);
   assert.match(limited.recommendedNextStep, /kms/);
   assert.match(limited.recommendedNextStep, /never pass/);
+
+  const usersDenied = await checkAwsAccess(compliantBundleClient({
+    async listIamUsers() {
+      throw accessDenied();
+    },
+  }));
+  assert.equal(usersDenied.status, "limited", "a denied IAM.ListUsers is visible in the access check instead of leaving it healthy");
+  assert.equal(usersDenied.surfaces.find((surface) => surface.name === "iam_users")?.status, "not_readable");
+  assert.equal(usersDenied.surfaces.find((surface) => surface.name === "iam_users")?.count, null);
 });
 
 test("assessAwsIdentity flags root, MFA, password, key, and boundary issues", async () => {
@@ -1965,11 +1996,39 @@ test("rule 1 corollary: assessAwsIdentity never passes a user control whose per-
       throw accessDenied();
     },
   }));
-  assertOnlyDemoted(lastUsed, { "AWS-IAM-04": "warn" }, "GetAccessKeyLastUsed denied");
-  assert.match(findingById(lastUsed, "AWS-IAM-04").summary, /Downgraded to warn: GetAccessKeyLastUsed unreadable for 1 key\(s\), judged by key age only/);
+  assertOnlyDemoted(lastUsed, { "AWS-IAM-04": "manual" }, "GetAccessKeyLastUsed denied for the only sampled key");
+  assert.match(findingById(lastUsed, "AWS-IAM-04").summary, /Last-used dates could not be read for any of the 1 sampled access key\(s\) \(iam:GetAccessKeyLastUsed AKIA\*\*\*\*MPLE: AccessDenied/);
+  assert.match(findingById(lastUsed, "AWS-IAM-04").summary, /no key was judged/);
   assert.deepEqual(findingById(lastUsed, "AWS-IAM-04").evidence.keys_last_used_unreadable, ["AKIA****MPLE"]);
+  assert.deepEqual(findingById(lastUsed, "AWS-IAM-04").evidence.stale_access_keys, [], "an unjudged key is never listed as stale");
   assert.ok(lastUsed.errors.some((line) => /^iam:GetAccessKeyLastUsed AKIA\*\*\*\*MPLE: AccessDenied/.test(line)), "the error line carries the masked key id only");
   assert.ok(!JSON.stringify(lastUsed).includes("AKIAIOSFODNN7EXAMPLE"));
+
+  // The review-round fixture: svc-deploy holds a key older than the threshold whose last use is denied. The creation
+  // date must not stand in for the denied last-used date, so the user is never failed on evidence the run did not see.
+  const oldKeyDenied = await assessAwsIdentity(compliantIdentityClient({
+    async listIamUsers() {
+      return paged([
+        { UserName: "alice", PasswordLastUsed: "2026-04-14T00:00:00Z" },
+        { UserName: "svc-deploy", PasswordLastUsed: "2026-04-13T00:00:00Z" },
+      ]);
+    },
+    async listAccessKeys(userName) {
+      if (userName === "svc-deploy") return [{ AccessKeyId: "AKIAIOSFODNN7EXAMPLE", CreateDate: "2024-01-01T00:00:00Z" }];
+      return [{ AccessKeyId: "AKIAALICEKEY00000001", CreateDate: "2026-04-01T00:00:00Z" }];
+    },
+    async getAccessKeyLastUsed(accessKeyId) {
+      if (accessKeyId === "AKIAIOSFODNN7EXAMPLE") throw accessDenied();
+      return { LastUsedDate: "2026-04-15T00:00:00Z" };
+    },
+  }));
+  assertOnlyDemoted(oldKeyDenied, { "AWS-IAM-04": "warn" }, "GetAccessKeyLastUsed denied for one of two sampled keys");
+  const oldKeyFinding = findingById(oldKeyDenied, "AWS-IAM-04");
+  assert.notEqual(oldKeyFinding.status, "fail", "a user is never failed on a key whose last use was unreadable");
+  assert.deepEqual(oldKeyFinding.evidence.stale_access_keys, [], "the 2024 key is not judged stale by its creation date");
+  assert.deepEqual(oldKeyFinding.evidence.keys_last_used_unreadable, ["AKIA****MPLE"]);
+  assert.match(oldKeyFinding.summary, /No sampled access key exceeded the 90-day staleness threshold\. Downgraded to warn: GetAccessKeyLastUsed unreadable for 1 key\(s\) \(AKIA\*\*\*\*MPLE\); those keys were not judged and need a manual last-used review/);
+  assert.ok(!JSON.stringify(oldKeyDenied).includes("AKIAIOSFODNN7EXAMPLE"));
 });
 
 test("assessAwsIdentity renders manual, never fail, when a primary IAM read is denied", async () => {

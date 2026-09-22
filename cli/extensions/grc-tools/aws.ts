@@ -266,9 +266,21 @@ export interface AwsResolvedConfig {
 export interface AwsAccessSurface {
   name: string;
   service: string;
+  /** IAM action the probe issued, for example iam:ListUsers. */
+  command: string;
+  /** Region the probe was sent to. */
+  region: string;
   status: "readable" | "not_readable";
-  count?: number;
+  /** Items the probe saw; null until a read completes. */
+  count: number | null;
+  /** True when a paged probe stopped at its cap; null for unpaged probes and for reads that never completed. */
+  truncated: boolean | null;
+  /** Redacted description of the failure; absent for a readable probe. */
   error?: string;
+  /** SDK error code of the failure (for example AccessDeniedException); null when the SDK reported none. */
+  error_code?: string | null;
+  /** HTTP status the failed request observed; null for transport failures. */
+  http_status?: number | null;
 }
 
 export interface AwsAccessCheckResult {
@@ -300,13 +312,19 @@ export interface AwsAssessmentResult {
 /** Outcome of one API read; a denied or errored surface never contributes to a pass. */
 export interface AwsSurfaceResult<T> {
   value?: T;
+  /** Redacted, labelled description of the failure. */
   error?: string;
   denied?: boolean;
+  /** SDK error code of the failure, when the SDK reported one. */
+  errorCode?: string;
+  /** HTTP status the failed request observed, when the SDK reported one. */
+  httpStatus?: number;
 }
 
 export interface AwsRegionScope {
   regions: string[];
-  regionsTotal: number;
+  /** Enabled regions known to exist; null when the region list could not be read and only the configured region was assessed. */
+  regionsTotal: number | null;
   regionsSeen: number;
   partial: boolean;
   source: "arguments" | "describe-regions" | "configured-region-fallback";
@@ -455,10 +473,93 @@ function isErrorCode(error: unknown, ...codes: string[]): boolean {
   return codes.some((candidate) => candidate === code);
 }
 
+const REDACTED_ERROR_VALUE = "[REDACTED]";
+
+const ERROR_CREDENTIAL_KEY_PATTERN =
+  "[A-Za-z0-9_.-]*(?:token|secret|passw(?:or)?d|pwd|api[_-]?key|apikey|session(?:[_-]?id)?|sid|cookie|csrftoken|authorization|auth|signature|sig|credentials?|access[_-]?key|private[_-]?key)";
+// A credential value is a single token that is either long or carries a digit; short prose words after a
+// colon (for example "Authentication error: Invalid token") are left alone.
+const ERROR_CREDENTIAL_VALUE_PATTERN = `(?:(?:Bearer|Basic|Digest|Token)\\s+)?(?:(?=[^\\s"'&;,<>]{16,})|(?=[^\\s"'&;,<>]*\\d))[^\\s"'&;,<>]{8,}`;
+
+const ERROR_TEXT_PATTERNS: ReadonlyArray<readonly [RegExp, string]> = [
+  // Authorization scheme values wherever they appear (headers, cookies, HTML, JSON messages); the value must
+  // be long or carry a digit or base64 padding so prose such as "Basic authentication" is left alone.
+  [/\b(Bearer|Basic|Digest|Negotiate|SSWS|Token)\s+(?=[A-Za-z0-9\-._~+/=:]{16,}|[A-Za-z0-9\-._~+/=:]*[\d+/=])[A-Za-z0-9\-._~+/=:]{8,}/gi, `$1 ${REDACTED_ERROR_VALUE}`],
+  // JWT-shaped strings.
+  [/\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}/g, REDACTED_ERROR_VALUE],
+  // AWS access key ids, 40-character secret access keys, long secret-shaped blobs, and hex API keys.
+  [/\b(?:AKIA|ASIA|AROA|AIDA|AGPA|ANPA|ANVA|APKA)[A-Z0-9]{16}\b/g, REDACTED_ERROR_VALUE],
+  [/(?<![A-Za-z0-9/+=])[A-Za-z0-9/+]{40}(?![A-Za-z0-9/+=])/g, REDACTED_ERROR_VALUE],
+  // Long blobs must carry a digit so camelCase identifiers survive.
+  [/(?<![A-Za-z0-9+_=-])(?=[A-Za-z0-9+_-]*\d)[A-Za-z0-9+_-]{40,}={0,2}(?![A-Za-z0-9+_=-])/g, REDACTED_ERROR_VALUE],
+  [/\b[a-f0-9]{32,}\b/gi, REDACTED_ERROR_VALUE],
+  // Cookie headers carry session values in free form.
+  [/\b(set-cookie|cookie)(\s*[:=]\s*)[^\n<>]+/gi, `$1$2${REDACTED_ERROR_VALUE}`],
+  // key=value, key: value, and "key":"value" pairs whose key names a credential.
+  [new RegExp(`\\b(${ERROR_CREDENTIAL_KEY_PATTERN})(["']?\\s*[=:]\\s*["']?)${ERROR_CREDENTIAL_VALUE_PATTERN}`, "gi"), `$1$2${REDACTED_ERROR_VALUE}`],
+];
+
+// URL userinfo and query strings anywhere in the string, not only when the string starts with a URL.
+const ERROR_URL_PATTERN = /\b(https?:\/\/)(?:[^\s/@"'<>]+@)?([^\s?#"'<>]+)(\?[^\s#"'<>]*)?/gi;
+
+/**
+ * Rule 9 sink for error text. describeError() (every attemptAwsRead failure and every access probe) and
+ * errorMessage() (tool-level failures) are the only conversions from a thrown SDK error to recorded text,
+ * and both run this pass, so no path can carry a credential echoed by a request context, a proxy body, or
+ * a URL into findings, summaries, access checks, or the bundle.
+ */
+export function redactErrorText(text: string): string {
+  let scrubbed = text.replace(ERROR_URL_PATTERN, (_match, scheme: string, hostPath: string, query?: string) =>
+    `${scheme}${hostPath}${query ? `?${REDACTED_ERROR_VALUE}` : ""}`,
+  );
+  for (const [pattern, replacement] of ERROR_TEXT_PATTERNS) {
+    scrubbed = scrubbed.replace(pattern, replacement);
+  }
+  return scrubbed;
+}
+
+/** Content type of the response an SDK error carries, when the SDK attached one. */
+function responseContentType(error: JsonRecord): string | undefined {
+  const headers = asObject(asObject(error.$response)?.headers);
+  if (!headers) return undefined;
+  const entry = Object.entries(headers).find(([key]) => key.toLowerCase() === "content-type");
+  return asString(entry?.[1])?.split(";")[0]?.trim();
+}
+
+/**
+ * The SDK attaches the raw body as $responseBodyText when a response could not be parsed as the service
+ * protocol (for example a proxy's 502 HTML page). Such a body can echo request headers, so it is described by
+ * content type and byte length only; a message that is itself markup is treated the same way.
+ */
+function nonJsonBodyNote(error: JsonRecord | undefined): string | undefined {
+  if (!error) return undefined;
+  const bodyText = typeof error.$responseBodyText === "string" ? error.$responseBodyText : undefined;
+  const message = typeof error.message === "string" ? error.message : undefined;
+  const body = bodyText ?? (message && /^\s*<(?:!doctype|html|\?xml)/i.test(message) ? message : undefined);
+  if (body === undefined) return undefined;
+  const contentType = responseContentType(error) ?? (/^\s*<(?:!doctype|html)/i.test(body) ? "text/html" : "unknown content type");
+  return `non-JSON body (${contentType}, ${Buffer.byteLength(body, "utf8")} bytes)`;
+}
+
+/**
+ * Describes a thrown SDK error as "<code> (HTTP <status>): <message>" with every part scrubbed; the code
+ * and status are kept so a failure names what the service answered without repeating request context.
+ */
 function describeError(error: unknown): string {
+  const object = asObject(error);
   const code = errorCode(error);
-  const message = error instanceof Error ? error.message : String(error);
-  return code && !message.startsWith(code) ? `${code}: ${message}` : message;
+  const status = errorHttpStatus(error);
+  const rawMessage = nonJsonBodyNote(object) ?? (error instanceof Error ? error.message : String(error));
+  const message = code && rawMessage.startsWith(`${code}:`) ? rawMessage.slice(code.length + 1).trim() : rawMessage;
+  const prefix = code
+    ? (status !== undefined ? `${code} (HTTP ${status})` : code)
+    : (status !== undefined ? `HTTP ${status}` : "");
+  return redactErrorText(prefix && message ? `${prefix}: ${message}` : prefix || message);
+}
+
+/** Message of a tool-level failure, run through the same sink as every recorded read error. */
+function errorMessage(error: unknown): string {
+  return describeError(error);
 }
 
 /** Run one read and classify the outcome instead of throwing. */
@@ -473,8 +574,29 @@ export async function attemptAwsRead<T>(
     const denied = isAwsAccessDenied(error);
     const message = `${label}: ${denied ? "AccessDenied" : "error"} (${describeError(error)})`;
     errors.push(message);
-    return { error: message, denied };
+    return { error: message, denied, errorCode: errorCode(error) || undefined, httpStatus: errorHttpStatus(error) };
   }
+}
+
+/** Renders a value only when its read completed; an unread inventory renders null rather than an empty default. */
+function ifRead<T>(read: AwsSurfaceResult<unknown> | undefined, value: T): T | null {
+  return read && !read.error ? value : null;
+}
+
+/** Truncation flag of a paged read; null until the read completes, so a denied list never renders as complete. */
+function truncatedFlag(read: AwsSurfaceResult<AwsPagedList<unknown>> | undefined): boolean | null {
+  return read?.value ? read.value.truncated : null;
+}
+
+/** Marker written in place of a dataset whose read failed, naming the command and what the service answered. */
+function notCollectedMarker(command: string, read: AwsSurfaceResult<unknown>): JsonRecord {
+  return {
+    collected: false,
+    command,
+    error: read.error ?? null,
+    error_code: read.errorCode ?? null,
+    http_status: read.httpStatus ?? null,
+  };
 }
 
 interface AwsPage<T> {
@@ -611,9 +733,10 @@ export function resolveRegionScope(
       source: "describe-regions",
     };
   }
+  // The enabled-region list is unknown when DescribeRegions failed, so the total is null rather than the one region read.
   return {
     regions: [fallbackRegion],
-    regionsTotal: 1,
+    regionsTotal: null,
     regionsSeen: 1,
     partial: true,
     source: "configured-region-fallback",
@@ -1514,74 +1637,98 @@ export class AwsAuditorClient {
   }
 }
 
+/** What a readable probe saw: the items counted and, for paged reads, whether the walk stopped at its cap. */
+interface ProbeObservation {
+  count: number | null;
+  truncated: boolean | null;
+}
+
 async function surface(
   name: string,
   service: string,
+  command: string,
+  region: string,
   loader: () => Promise<unknown>,
-  countResolver?: (value: unknown) => number | undefined,
+  observe: (value: unknown) => ProbeObservation,
 ): Promise<AwsAccessSurface> {
   try {
     const value = await loader();
-    return {
-      name,
-      service,
-      status: "readable",
-      count: countResolver?.(value),
-    };
+    return { name, service, command, region, status: "readable", ...observe(value) };
   } catch (error) {
+    // A probe that never completed has no count and no truncation state; it names what the service answered instead.
     return {
       name,
       service,
+      command,
+      region,
       status: "not_readable",
-      error: error instanceof Error ? error.message : String(error),
+      count: null,
+      truncated: null,
+      error: describeError(error),
+      error_code: errorCode(error) || null,
+      http_status: errorHttpStatus(error) ?? null,
     };
   }
 }
 
 export type AwsAccessCheckClient = Pick<
   AwsAuditorClient,
-  "getCallerIdentity" | "getAccountSummary" | "describeTrails" | "getEnabledSecurityHubStandards" | "describeConfigurationRecorders" | "listDetectors" | "listAnalyzers" | "describeOrganization" | "listIdentityCenterInstances" | "getResolvedConfig"
+  "getCallerIdentity" | "getAccountSummary" | "listIamUsers" | "describeTrails" | "getEnabledSecurityHubStandards" | "describeConfigurationRecorders" | "listDetectors" | "listAnalyzers" | "describeOrganization" | "listIdentityCenterInstances" | "getResolvedConfig"
 > & Partial<Pick<
   AwsAuditorClient,
   "describeRegions" | "listBuckets" | "listKmsKeys" | "describeDbInstances" | "listActiveAuditManagerAssessments" | "getSecurityAlternateContact"
 >>;
 
-function pagedCount(value: unknown): number | undefined {
-  const items = asObject(value)?.items;
-  return Array.isArray(items) ? items.length : undefined;
+function pagedObservation(value: unknown): ProbeObservation {
+  const record = asObject(value);
+  const items = record?.items;
+  return {
+    count: Array.isArray(items) ? items.length : null,
+    truncated: typeof record?.truncated === "boolean" ? record.truncated : null,
+  };
+}
+
+function arrayObservation(value: unknown): ProbeObservation {
+  return { count: Array.isArray(value) ? value.length : null, truncated: null };
+}
+
+function presenceObservation(value: unknown): ProbeObservation {
+  return { count: value ? 1 : 0, truncated: null };
 }
 
 export async function checkAwsAccess(client: AwsAccessCheckClient): Promise<AwsAccessCheckResult> {
   const caller = await client.getCallerIdentity();
   const config = client.getResolvedConfig();
+  const region = config.region;
   const optionalProbes: Array<Promise<AwsAccessSurface>> = [];
   if (client.describeRegions) {
-    optionalProbes.push(surface("ec2_regions", "ec2", () => client.describeRegions!(), (value) => Array.isArray(value) ? value.length : undefined));
+    optionalProbes.push(surface("ec2_regions", "ec2", "ec2:DescribeRegions", region, () => client.describeRegions!(), arrayObservation));
   }
   if (client.listBuckets) {
-    optionalProbes.push(surface("s3_buckets", "s3", () => client.listBuckets!(1), pagedCount));
+    optionalProbes.push(surface("s3_buckets", "s3", "s3:ListBuckets", region, () => client.listBuckets!(1), pagedObservation));
   }
   if (client.listKmsKeys) {
-    optionalProbes.push(surface("kms_keys", "kms", () => client.listKmsKeys!(config.region, 1), pagedCount));
+    optionalProbes.push(surface("kms_keys", "kms", "kms:ListKeys", region, () => client.listKmsKeys!(region, 1), pagedObservation));
   }
   if (client.describeDbInstances) {
-    optionalProbes.push(surface("rds_instances", "rds", () => client.describeDbInstances!(config.region, 1), pagedCount));
+    optionalProbes.push(surface("rds_instances", "rds", "rds:DescribeDBInstances", region, () => client.describeDbInstances!(region, 1), pagedObservation));
   }
   if (client.listActiveAuditManagerAssessments) {
-    optionalProbes.push(surface("audit_manager", "auditmanager", () => client.listActiveAuditManagerAssessments!(1), pagedCount));
+    optionalProbes.push(surface("audit_manager", "auditmanager", "auditmanager:ListAssessments", region, () => client.listActiveAuditManagerAssessments!(1), pagedObservation));
   }
   if (client.getSecurityAlternateContact) {
-    optionalProbes.push(surface("account_contacts", "account", () => client.getSecurityAlternateContact!(), (value) => (value ? 1 : 0)));
+    optionalProbes.push(surface("account_contacts", "account", "account:GetAlternateContact", region, () => client.getSecurityAlternateContact!(), presenceObservation));
   }
   const surfaces = await Promise.all([
-    surface("iam_summary", "iam", () => client.getAccountSummary(), () => 1),
-    surface("cloudtrail", "cloudtrail", () => client.describeTrails(), (value) => Array.isArray(value) ? value.length : undefined),
-    surface("security_hub", "securityhub", () => client.getEnabledSecurityHubStandards(), pagedCount),
-    surface("config", "config", () => client.describeConfigurationRecorders(), (value) => Array.isArray(value) ? value.length : undefined),
-    surface("guardduty", "guardduty", () => client.listDetectors(), pagedCount),
-    surface("access_analyzer", "access-analyzer", () => client.listAnalyzers(), pagedCount),
-    surface("organizations", "organizations", () => client.describeOrganization(), (value) => (value ? 1 : 0)),
-    surface("identity_center", "sso-admin", () => client.listIdentityCenterInstances(), pagedCount),
+    surface("iam_summary", "iam", "iam:GetAccountSummary", region, () => client.getAccountSummary(), () => ({ count: 1, truncated: null })),
+    surface("iam_users", "iam", "iam:ListUsers", region, () => client.listIamUsers(1), pagedObservation),
+    surface("cloudtrail", "cloudtrail", "cloudtrail:DescribeTrails", region, () => client.describeTrails(), arrayObservation),
+    surface("security_hub", "securityhub", "securityhub:GetEnabledStandards", region, () => client.getEnabledSecurityHubStandards(), pagedObservation),
+    surface("config", "config", "config:DescribeConfigurationRecorders", region, () => client.describeConfigurationRecorders(), arrayObservation),
+    surface("guardduty", "guardduty", "guardduty:ListDetectors", region, () => client.listDetectors(), pagedObservation),
+    surface("access_analyzer", "access-analyzer", "access-analyzer:ListAnalyzers", region, () => client.listAnalyzers(), pagedObservation),
+    surface("organizations", "organizations", "organizations:DescribeOrganization", region, () => client.describeOrganization(), presenceObservation),
+    surface("identity_center", "sso-admin", "sso:ListInstances", region, () => client.listIdentityCenterInstances(), pagedObservation),
     ...optionalProbes,
   ]);
 
@@ -1743,8 +1890,8 @@ export async function assessAwsIdentity(
   });
 
   const summaryMap = asObject(summary.SummaryMap) ?? {};
-  const accountMfaEnabled = asNumber(summaryMap.AccountMFAEnabled) ?? 0;
-  const accountAccessKeysPresent = asNumber(summaryMap.AccountAccessKeysPresent) ?? 0;
+  const accountMfaEnabled = asNumber(summaryMap.AccountMFAEnabled);
+  const accountAccessKeysPresent = asNumber(summaryMap.AccountAccessKeysPresent);
 
   const usersWithoutMfa: string[] = [];
   const mfaUnreadableUsers: string[] = [];
@@ -1752,6 +1899,7 @@ export async function assessAwsIdentity(
   const keysUnreadableUsers: string[] = [];
   const lastUsedUnreadableKeys: string[] = [];
   const dormantUsers: string[] = [];
+  let sampledKeys = 0;
 
   // Per-user reads are attempted individually so one denied user is named and capped instead of aborting the assessment.
   const userDetails = await mapWithConcurrency(users, DEFAULT_CONCURRENCY, async (user) => {
@@ -1775,8 +1923,14 @@ export async function assessAwsIdentity(
 
     if (user.accessKeys.error) keysUnreadableUsers.push(user.userName);
     for (const key of user.keys) {
-      if (key.lastUsed.error) lastUsedUnreadableKeys.push(maskAccessKeyId(key.accessKeyId));
-      // A key whose last use is unreadable is judged by its age, which can only understate freshness, never overstate it.
+      sampledKeys += 1;
+      // A key whose last use could not be read is not judged: its creation date says nothing about use, so
+      // substituting it would fail a named user on evidence the run never saw. The key is listed for review instead.
+      if (key.lastUsed.error) {
+        lastUsedUnreadableKeys.push(maskAccessKeyId(key.accessKeyId));
+        continue;
+      }
+      // A key never used since creation carries no LastUsedDate and is judged by its age.
       const ageDays = daysBetween(now, extractTimestamp(key.lastUsed.value) ?? key.createDate);
       if (ageDays !== undefined && ageDays > staleDays) {
         staleAccessKeys.push({ userName: user.userName, accessKeyId: key.accessKeyId, ageDays });
@@ -1796,7 +1950,7 @@ export async function assessAwsIdentity(
   const keyCaps = [...userCaps];
   if (keysUnreadableUsers.length > 0) keyCaps.push(`ListAccessKeys unreadable for ${keysUnreadableUsers.length} user(s) (${sample(keysUnreadableUsers, 10).join(", ")})`);
   const keyRotationCaps = [...keyCaps];
-  if (lastUsedUnreadableKeys.length > 0) keyRotationCaps.push(`GetAccessKeyLastUsed unreadable for ${lastUsedUnreadableKeys.length} key(s), judged by key age only`);
+  if (lastUsedUnreadableKeys.length > 0) keyRotationCaps.push(`GetAccessKeyLastUsed unreadable for ${lastUsedUnreadableKeys.length} key(s) (${sample(lastUsedUnreadableKeys, 10).join(", ")}); those keys were not judged and need a manual last-used review`);
 
   let mfaStatus: AwsFinding["status"];
   let mfaSummary: string;
@@ -1826,6 +1980,9 @@ export async function assessAwsIdentity(
   } else if (users.length > 0 && keysUnreadableUsers.length === users.length) {
     keyRotationStatus = "manual";
     keyRotationSummary = `Access keys could not be listed for any of the ${users.length} sampled IAM users (${errors.find((line) => line.startsWith("iam:ListAccessKeys")) ?? "iam:ListAccessKeys failed"}); review key age in the IAM credential report.`;
+  } else if (sampledKeys > 0 && lastUsedUnreadableKeys.length === sampledKeys) {
+    keyRotationStatus = "manual";
+    keyRotationSummary = `Last-used dates could not be read for any of the ${sampledKeys} sampled access key(s) (${errors.find((line) => line.startsWith("iam:GetAccessKeyLastUsed")) ?? "iam:GetAccessKeyLastUsed failed"}); no key was judged. Review key age and last use in the IAM credential report.`;
   } else {
     keyRotationStatus = "pass";
     keyRotationSummary = `No sampled access key exceeded the ${staleDays}-day staleness threshold.`;
@@ -1868,9 +2025,9 @@ export async function assessAwsIdentity(
   if (summaryRead.error) {
     rootMfaStatus = "manual";
     rootMfaSummary = `The IAM account summary could not be read (${summaryRead.error}); verify root MFA and the absence of root access keys under IAM > Dashboard.`;
-  } else if (accountMfaEnabled !== 1 || accountAccessKeysPresent > 0) {
+  } else if (accountMfaEnabled !== 1 || (accountAccessKeysPresent ?? 0) > 0) {
     rootMfaStatus = "fail";
-    rootMfaSummary = `Root MFA enabled=${accountMfaEnabled === 1}; root access keys present=${accountAccessKeysPresent}.`;
+    rootMfaSummary = `Root MFA enabled=${accountMfaEnabled === 1}; root access keys present=${accountAccessKeysPresent ?? "unknown (AccountAccessKeysPresent missing from the summary)"}.`;
   } else {
     rootMfaStatus = "pass";
     rootMfaSummary = "Root account shows MFA enabled and no access keys present.";
@@ -1904,7 +2061,11 @@ export async function assessAwsIdentity(
       rootMfaStatus,
       rootMfaSummary,
       ["FedRAMP IA-2(1)", "FedRAMP AC-6(1)", "CMMC 3.1.5", "CIS AWS 1.4"],
-      { summary_readable: !summaryRead.error, account_mfa_enabled: accountMfaEnabled, account_access_keys_present: accountAccessKeysPresent },
+      {
+        summary_readable: !summaryRead.error,
+        account_mfa_enabled: ifRead(summaryRead, accountMfaEnabled ?? null),
+        account_access_keys_present: ifRead(summaryRead, accountAccessKeysPresent ?? null),
+      },
     ),
     finding(
       "AWS-IAM-02",
@@ -1915,10 +2076,10 @@ export async function assessAwsIdentity(
       ["FedRAMP IA-2(1)", "FedRAMP IA-2(2)", "CMMC 3.5.3", "PCI-DSS 8.4.2"],
       {
         users_readable: !userListRead.error,
-        user_count: users.length,
-        users_without_mfa: usersWithoutMfa.slice(0, 25),
-        users_mfa_unreadable: sample(mfaUnreadableUsers),
-        user_inventory_truncated: userList.truncated,
+        user_count: ifRead(userListRead, users.length),
+        users_without_mfa: ifRead(userListRead, usersWithoutMfa.slice(0, 25)),
+        users_mfa_unreadable: ifRead(userListRead, sample(mfaUnreadableUsers)),
+        user_inventory_truncated: truncatedFlag(userListRead),
       },
     ),
     finding(
@@ -1928,7 +2089,11 @@ export async function assessAwsIdentity(
       passwordStatus,
       passwordSummary,
       ["FedRAMP IA-5(1)", "CMMC 3.5.7", "SOC 2 CC6.1", "CIS AWS 1.8"],
-      { password_policy_readable: !passwordPolicyRead.error, password_policy: passwordPolicy ?? {} },
+      {
+        password_policy_readable: !passwordPolicyRead.error,
+        password_policy_configured: ifRead(passwordPolicyRead, Boolean(passwordPolicy)),
+        password_policy: ifRead(passwordPolicyRead, passwordPolicy),
+      },
     ),
     finding(
       "AWS-IAM-04",
@@ -1939,10 +2104,11 @@ export async function assessAwsIdentity(
       ["FedRAMP IA-5(1)", "FedRAMP AC-2(3)", "CMMC 3.5.8", "CIS AWS 1.12"],
       {
         users_readable: !userListRead.error,
-        stale_access_keys: staleAccessKeys.slice(0, 25).map((key) => ({ userName: key.userName, accessKeyId: maskAccessKeyId(key.accessKeyId), ageDays: key.ageDays })),
-        users_keys_unreadable: sample(keysUnreadableUsers),
-        keys_last_used_unreadable: sample(lastUsedUnreadableKeys),
-        user_inventory_truncated: userList.truncated,
+        keys_sampled: ifRead(userListRead, sampledKeys),
+        stale_access_keys: ifRead(userListRead, staleAccessKeys.slice(0, 25).map((key) => ({ userName: key.userName, accessKeyId: maskAccessKeyId(key.accessKeyId), ageDays: key.ageDays }))),
+        users_keys_unreadable: ifRead(userListRead, sample(keysUnreadableUsers)),
+        keys_last_used_unreadable: ifRead(userListRead, sample(lastUsedUnreadableKeys)),
+        user_inventory_truncated: truncatedFlag(userListRead),
       },
     ),
     finding(
@@ -1954,11 +2120,11 @@ export async function assessAwsIdentity(
       ["FedRAMP AC-6(1)", "FedRAMP AC-6(2)", "CMMC 3.1.5", "CIS AWS 1.16"],
       {
         roles_readable: !roleListRead.error,
-        roles_read: roles.length,
-        privileged_roles: privilegedRoles.length,
-        roles_without_boundaries: rolesWithoutBoundaries.slice(0, 25).map((role) => role.RoleName ?? role.Arn),
+        roles_read: ifRead(roleListRead, roles.length),
+        privileged_roles: ifRead(roleListRead, privilegedRoles.length),
+        roles_without_boundaries: ifRead(roleListRead, rolesWithoutBoundaries.slice(0, 25).map((role) => role.RoleName ?? role.Arn)),
         max_privileged_roles: maxPrivilegedRoles,
-        role_inventory_truncated: roleList.truncated,
+        role_inventory_truncated: truncatedFlag(roleListRead),
       },
     ),
     finding(
@@ -1970,9 +2136,9 @@ export async function assessAwsIdentity(
       ["FedRAMP AC-2(3)", "CMMC 3.1.12", "SOC 2 CC6.2", "CIS AWS 1.12"],
       {
         users_readable: !userListRead.error,
-        dormant_users: dormantUsers.slice(0, 25),
-        users_keys_unreadable: sample(keysUnreadableUsers),
-        user_inventory_truncated: userList.truncated,
+        dormant_users: ifRead(userListRead, dormantUsers.slice(0, 25)),
+        users_keys_unreadable: ifRead(userListRead, sample(keysUnreadableUsers)),
+        user_inventory_truncated: truncatedFlag(userListRead),
       },
     ),
   ];
@@ -2021,10 +2187,11 @@ export async function assessAwsIdentity(
       global_lookup_error: rootActivity.globalLookupError ?? null,
       lookback_days: lookbackDays,
       window_start: lookbackStart.toISOString(),
-      root_events: rootEventList.length,
-      root_console_logins: sample(rootConsoleLogins.map((event) => ({ time: event.EventTime, source: event.EventSource }))),
-      root_other_events: sample(rootOtherEvents.map((event) => ({ time: event.EventTime, name: event.EventName, source: event.EventSource }))),
-      lookup_truncated: rootEvents.value?.truncated ?? false,
+      events_readable: !rootEvents.error,
+      root_events: ifRead(rootEvents, rootEventList.length),
+      root_console_logins: ifRead(rootEvents, sample(rootConsoleLogins.map((event) => ({ time: event.EventTime, source: event.EventSource })))),
+      root_other_events: ifRead(rootEvents, sample(rootOtherEvents.map((event) => ({ time: event.EventTime, name: event.EventName, source: event.EventSource })))),
+      lookup_truncated: truncatedFlag(rootEvents),
     },
   ));
 
@@ -2063,12 +2230,13 @@ export async function assessAwsIdentity(
     leastPrivilegeVerdict.summary,
     buildAwsMappings(18),
     {
-      customer_managed_policies: policyRows.length,
-      full_admin_attached: sample(fullAdminAttached.map((row) => ({ name: row.name, attachment_count: row.attachment_count }))),
-      full_admin_unattached: sample(fullAdminUnattached.map((row) => row.name)),
-      service_wildcard_policies: sample(serviceWildcardPolicies.map((row) => row.name)),
-      policies_unreadable: sample(unreadablePolicies.map((row) => row.name)),
-      policy_inventory_truncated: customerPolicies.value?.truncated ?? false,
+      policies_readable: !customerPolicies.error,
+      customer_managed_policies: ifRead(customerPolicies, policyRows.length),
+      full_admin_attached: ifRead(customerPolicies, sample(fullAdminAttached.map((row) => ({ name: row.name, attachment_count: row.attachment_count })))),
+      full_admin_unattached: ifRead(customerPolicies, sample(fullAdminUnattached.map((row) => row.name))),
+      service_wildcard_policies: ifRead(customerPolicies, sample(serviceWildcardPolicies.map((row) => row.name))),
+      policies_unreadable: ifRead(customerPolicies, sample(unreadablePolicies.map((row) => row.name))),
+      policy_inventory_truncated: truncatedFlag(customerPolicies),
       inline_policies: "not assessed",
     },
   ));
@@ -2076,18 +2244,19 @@ export async function assessAwsIdentity(
   return {
     title: "AWS identity posture",
     summary: {
-      users: users.length,
-      user_inventory_truncated: userList.truncated,
-      users_without_mfa: usersWithoutMfa.length,
-      stale_access_keys: staleAccessKeys.length,
-      roles: roles.length,
-      role_inventory_truncated: roleList.truncated,
-      privileged_roles: privilegedRoles.length,
-      roles_without_boundaries: rolesWithoutBoundaries.length,
-      dormant_users: dormantUsers.length,
-      root_console_logins: rootConsoleLogins.length,
-      customer_managed_policies: policyRows.length,
-      full_admin_policies_attached: fullAdminAttached.length,
+      users: ifRead(userListRead, users.length),
+      user_inventory_truncated: truncatedFlag(userListRead),
+      users_without_mfa: ifRead(userListRead, usersWithoutMfa.length),
+      stale_access_keys: ifRead(userListRead, staleAccessKeys.length),
+      keys_last_used_unreadable: ifRead(userListRead, lastUsedUnreadableKeys.length),
+      roles: ifRead(roleListRead, roles.length),
+      role_inventory_truncated: truncatedFlag(roleListRead),
+      privileged_roles: ifRead(roleListRead, privilegedRoles.length),
+      roles_without_boundaries: ifRead(roleListRead, rolesWithoutBoundaries.length),
+      dormant_users: ifRead(userListRead, dormantUsers.length),
+      root_console_logins: ifRead(rootEvents, rootConsoleLogins.length),
+      customer_managed_policies: ifRead(customerPolicies, policyRows.length),
+      full_admin_policies_attached: ifRead(customerPolicies, fullAdminAttached.length),
       collection_errors: errors.length,
     },
     findings,
@@ -2282,7 +2451,7 @@ export async function assessAwsLoggingDetection(client: AwsLoggingDetectionClien
       ["FedRAMP AU-2", "FedRAMP AU-9", "CMMC 3.3.1", "CIS AWS 3.1"],
       {
         trails_readable: !trailList.error,
-        trails: trailDetails.map((trail) => ({ name: trail.name, is_multi_region: trail.isMultiRegion, validation: trail.validation, is_logging: trail.isLogging ?? null, status_error: trail.statusError ?? null })),
+        trails: ifRead(trailList, trailDetails.map((trail) => ({ name: trail.name, is_multi_region: trail.isMultiRegion, validation: trail.validation, is_logging: trail.isLogging ?? null, status_error: trail.statusError ?? null }))),
       },
     ),
     finding(
@@ -2294,8 +2463,8 @@ export async function assessAwsLoggingDetection(client: AwsLoggingDetectionClien
       ["FedRAMP AU-12", "CMMC 3.3.1", "SOC 2 CC7.2", "CIS AWS 3.3"],
       {
         trails_readable: !trailList.error,
-        data_event_trails: trailsWithDataEvents.map((trail) => trail.name),
-        selectors_unreadable: selectorsUnreadable.map((trail) => trail.name),
+        data_event_trails: ifRead(trailList, trailsWithDataEvents.map((trail) => trail.name)),
+        selectors_unreadable: ifRead(trailList, selectorsUnreadable.map((trail) => trail.name)),
       },
     ),
     finding(
@@ -2307,10 +2476,10 @@ export async function assessAwsLoggingDetection(client: AwsLoggingDetectionClien
       ["FedRAMP CA-7", "FedRAMP SI-4", "SOC 2 CC7.1", "PCI-DSS 11.5.1"],
       {
         hub_readable: !hub.error,
-        hub_enabled: Boolean(hub.value),
+        hub_enabled: ifRead(hub, Boolean(hub.value)),
         standards_readable: standards ? !standards.error : null,
-        standard_count: standardList.length,
-        standards_truncated: standards?.value?.truncated ?? false,
+        standard_count: ifRead(standards, standardList.length),
+        standards_truncated: truncatedFlag(standards),
       },
     ),
     finding(
@@ -2322,10 +2491,10 @@ export async function assessAwsLoggingDetection(client: AwsLoggingDetectionClien
       ["FedRAMP SI-4", "FedRAMP IR-4", "SOC 2 CC7.2", "CIS AWS 1.1"],
       {
         detectors_readable: !detectorIds.error,
-        detector_count: detectorList.length,
-        enabled_detectors: enabledDetectors.length,
-        detectors_unreadable: unreadableDetectors.map((detector) => detector.id),
-        detector_list_truncated: detectorIds.value?.truncated ?? false,
+        detector_count: ifRead(detectorIds, detectorList.length),
+        enabled_detectors: ifRead(detectorIds, enabledDetectors.length),
+        detectors_unreadable: ifRead(detectorIds, unreadableDetectors.map((detector) => detector.id)),
+        detector_list_truncated: truncatedFlag(detectorIds),
       },
     ),
     finding(
@@ -2338,8 +2507,8 @@ export async function assessAwsLoggingDetection(client: AwsLoggingDetectionClien
       {
         recorders_readable: !recorders.error,
         recorder_status_readable: !recorderStatuses.error,
-        recorders: recorderList.map((recorder) => ({ name: recorder.name, all_supported: asObject(recorder.recordingGroup)?.allSupported })),
-        recorder_statuses: statusList.map((status) => ({ name: status.name, recording: status.recording, last_status: status.lastStatus })),
+        recorders: ifRead(recorders, recorderList.map((recorder) => ({ name: recorder.name, all_supported: asObject(recorder.recordingGroup)?.allSupported ?? null }))),
+        recorder_statuses: ifRead(recorderStatuses, statusList.map((status) => ({ name: status.name, recording: status.recording ?? null, last_status: status.lastStatus ?? null }))),
       },
     ),
   ];
@@ -2347,14 +2516,14 @@ export async function assessAwsLoggingDetection(client: AwsLoggingDetectionClien
   return {
     title: "AWS logging and detection posture",
     summary: {
-      trails: trailDetails.length,
-      compliant_trails: goodTrails.length,
-      security_hub_enabled: Boolean(hub.value),
-      security_hub_standards: standardList.length,
-      guardduty_detectors: detectorList.length,
-      enabled_guardduty_detectors: enabledDetectors.length,
-      config_recorders: recorderList.length,
-      recording_config_recorders: recordingRecorders.length,
+      trails: ifRead(trailList, trailDetails.length),
+      compliant_trails: ifRead(trailList, goodTrails.length),
+      security_hub_enabled: ifRead(hub, Boolean(hub.value)),
+      security_hub_standards: ifRead(standards, standardList.length),
+      guardduty_detectors: ifRead(detectorIds, detectorList.length),
+      enabled_guardduty_detectors: ifRead(detectorIds, enabledDetectors.length),
+      config_recorders: ifRead(recorders, recorderList.length),
+      recording_config_recorders: recorders.error || recorderStatuses.error ? null : recordingRecorders.length,
       collection_errors: errors.length,
     },
     findings,
@@ -2553,10 +2722,11 @@ export async function assessAwsOrgGuardrails(
       ["FedRAMP PM-2", "SOC 2 CC2.1", "CIS AWS 1.1"],
       {
         organization_readable: !organization.error,
-        organization: organization.value ?? {},
+        standalone: ifRead(organization, standalone),
+        organization: ifRead(organization, organization.value ?? null),
         accounts_readable: accounts ? !accounts.error : null,
-        accounts: accountList.length,
-        account_list_truncated: accounts?.value?.truncated ?? false,
+        accounts: ifRead(accounts, accountList.length),
+        account_list_truncated: truncatedFlag(accounts),
       },
     ),
     finding(
@@ -2568,10 +2738,11 @@ export async function assessAwsOrgGuardrails(
       ["FedRAMP AC-3", "FedRAMP CM-7", "SOC 2 CC6.8", "CIS AWS 1.20"],
       {
         scps_readable: scps ? !scps.error : null,
-        scp_count: scpList.length,
-        attached_scp_count: attachedScps.length,
-        scps_targets_unreadable: unreadableScps.map((policy) => policy.name),
-        sample: attachedScps.slice(0, 20).map((policy) => ({ policyId: policy.policyId, name: policy.name, targets: policy.targets.value?.items ?? [] })),
+        scp_count: ifRead(scps, scpList.length),
+        attached_scp_count: ifRead(scps, attachedScps.length),
+        scps_targets_unreadable: ifRead(scps, unreadableScps.map((policy) => policy.name)),
+        scp_list_truncated: truncatedFlag(scps),
+        sample: ifRead(scps, attachedScps.slice(0, 20).map((policy) => ({ policyId: policy.policyId, name: policy.name, targets: policy.targets.value?.items ?? [] }))),
       },
     ),
     finding(
@@ -2581,7 +2752,7 @@ export async function assessAwsOrgGuardrails(
       analyzerVerdict.status,
       analyzerVerdict.summary,
       ["FedRAMP AC-3", "FedRAMP AC-6", "SOC 2 CC6.3", "CIS AWS 1.16"],
-      { analyzers_readable: !analyzers.error, analyzers: analyzerList, analyzer_list_truncated: analyzers.value?.truncated ?? false },
+      { analyzers_readable: !analyzers.error, analyzers: ifRead(analyzers, analyzerList), analyzer_list_truncated: truncatedFlag(analyzers) },
     ),
     finding(
       "AWS-ORG-04",
@@ -2592,11 +2763,11 @@ export async function assessAwsOrgGuardrails(
       ["FedRAMP AC-3", "FedRAMP AC-4", "SOC 2 CC6.6", "CIS AWS 1.16"],
       {
         analyzers_readable: !analyzers.error,
-        analyzers_sampled: readableFindingLists.map((item) => item.name),
-        analyzers_findings_unreadable: unreadableFindingLists.map((item) => item.name),
-        analyzers_findings_truncated: truncatedFindingLists.map((item) => item.name),
-        active_finding_count: activeExternalFindings.length,
-        sample: activeExternalFindings.slice(0, 20),
+        analyzers_sampled: ifRead(analyzers, readableFindingLists.map((item) => item.name)),
+        analyzers_findings_unreadable: ifRead(analyzers, unreadableFindingLists.map((item) => item.name)),
+        analyzers_findings_truncated: ifRead(analyzers, truncatedFindingLists.map((item) => item.name)),
+        active_finding_count: !analyzers.error && readableFindingLists.length > 0 ? activeExternalFindings.length : null,
+        sample: ifRead(analyzers, activeExternalFindings.slice(0, 20)),
       },
     ),
     finding(
@@ -2606,7 +2777,11 @@ export async function assessAwsOrgGuardrails(
       identityCenterVerdict.status,
       identityCenterVerdict.summary,
       ["FedRAMP AC-2", "FedRAMP IA-2", "SOC 2 CC6.2", "PCI-DSS 8.4.2"],
-      { instances_readable: !identityCenterInstances.error, identity_center_instances: identityCenterList.length },
+      {
+        instances_readable: !identityCenterInstances.error,
+        identity_center_instances: ifRead(identityCenterInstances, identityCenterList.length),
+        instance_list_truncated: truncatedFlag(identityCenterInstances),
+      },
     ),
   ];
 
@@ -2637,9 +2812,10 @@ export async function assessAwsOrgGuardrails(
     auditVerdict.summary,
     buildAwsMappings(24),
     {
-      active_assessments: activeAssessments.length,
-      assessments: sample(activeAssessments.map((assessment) => ({ name: assessment.name, compliance_type: assessment.complianceType, last_updated: assessment.lastUpdated }))),
-      list_truncated: auditAssessments.value?.truncated ?? false,
+      assessments_readable: !auditAssessments.error,
+      active_assessments: ifRead(auditAssessments, activeAssessments.length),
+      assessments: ifRead(auditAssessments, sample(activeAssessments.map((assessment) => ({ name: assessment.name, compliance_type: assessment.complianceType, last_updated: assessment.lastUpdated ?? null })))),
+      list_truncated: truncatedFlag(auditAssessments),
     },
   ));
 
@@ -2670,11 +2846,12 @@ export async function assessAwsOrgGuardrails(
     contactSummary,
     buildAwsMappings(25),
     {
-      security_contact_configured: securityContact.value !== null && securityContact.value !== undefined,
-      has_name: Boolean(asString(contact?.Name)),
-      has_title: Boolean(asString(contact?.Title)),
+      contact_readable: !securityContact.error,
+      security_contact_configured: ifRead(securityContact, contact !== undefined),
+      has_name: ifRead(securityContact, Boolean(asString(contact?.Name))),
+      has_title: ifRead(securityContact, Boolean(asString(contact?.Title))),
       email_domain: contactEmail?.includes("@") ? contactEmail.slice(contactEmail.indexOf("@")) : null,
-      has_phone: Boolean(contactPhone),
+      has_phone: ifRead(securityContact, Boolean(contactPhone)),
       billing_and_operations_contacts: "not assessed",
     },
   ));
@@ -2682,16 +2859,16 @@ export async function assessAwsOrgGuardrails(
   return {
     title: "AWS organization guardrails",
     summary: {
-      organization_visible: Boolean(organization.value),
-      accounts: accountList.length,
-      scps: scpList.length,
-      attached_scps: attachedScps.length,
-      analyzers: analyzerList.length,
-      active_analyzers: activeAnalyzers.length,
-      active_external_findings: activeExternalFindings.length,
-      identity_center_instances: identityCenterList.length,
-      audit_manager_active_assessments: activeAssessments.length,
-      security_contact_configured: securityContact.value !== null && securityContact.value !== undefined,
+      organization_visible: ifRead(organization, Boolean(organization.value)),
+      accounts: ifRead(accounts, accountList.length),
+      scps: ifRead(scps, scpList.length),
+      attached_scps: ifRead(scps, attachedScps.length),
+      analyzers: ifRead(analyzers, analyzerList.length),
+      active_analyzers: ifRead(analyzers, activeAnalyzers.length),
+      active_external_findings: !analyzers.error && readableFindingLists.length > 0 ? activeExternalFindings.length : null,
+      identity_center_instances: ifRead(identityCenterInstances, identityCenterList.length),
+      audit_manager_active_assessments: ifRead(auditAssessments, activeAssessments.length),
+      security_contact_configured: ifRead(securityContact, contact !== undefined),
       collection_errors: errors.length,
     },
     findings,
@@ -2839,8 +3016,9 @@ export async function assessAwsDataProtection(
   });
 
   // Control 11: S3 Block Public Access (account plus bucket).
+  const accountBlockRead = !accountBlock.error;
   const accountFlags = publicAccessFlags(accountBlock.value ?? undefined);
-  const accountConfigured = accountBlock.value !== null && accountBlock.value !== undefined;
+  const accountConfigured = accountBlockRead && accountBlock.value !== null && accountBlock.value !== undefined;
   const accountFull = accountConfigured && allPublicAccessFlagsTrue(accountFlags);
   const publicAccessRows = bucketDetails.map((bucket) => {
     const flags = publicAccessFlags(bucket.publicAccessBlock.value ?? undefined);
@@ -2854,7 +3032,11 @@ export async function assessAwsDataProtection(
     };
   });
   const publicPolicyBuckets = publicAccessRows.filter((row) => row.is_public === true);
-  const uncoveredBuckets = publicAccessRows.filter((row) => !accountFull && !row.bucket_full && !row.unreadable);
+  // Bucket-level fact only: which readable buckets do not block public access on their own.
+  const bucketsWithoutOwnBlock = publicAccessRows.filter((row) => !row.bucket_full && !row.unreadable);
+  // Coverage claim: a bucket is uncovered only when the account block is known not to cover it, so the list is
+  // withheld (null) while the account-level read failed rather than naming every bucket that relies on it.
+  const uncoveredBuckets = accountBlockRead ? bucketsWithoutOwnBlock.filter(() => !accountFull) : null;
   const unreadablePublicAccessBuckets = publicAccessRows.filter((row) => row.unreadable);
   const flagText = REQUIRED_PUBLIC_ACCESS_FLAGS.map((key) => `${key}=${accountFlags[key] ?? "unset"}`).join(", ");
 
@@ -2862,17 +3044,20 @@ export async function assessAwsDataProtection(
   let publicAccessSummary: string;
   if (accountBlock.error) {
     publicAccessStatus = "manual";
-    publicAccessSummary = `Account-level S3 Block Public Access could not be read (${accountBlock.error}). Capture the S3 console Block Public Access settings for account ${accountId ?? "unknown"} and every bucket manually.`;
+    const bucketFact = bucketList.error
+      ? `The bucket inventory could not be read either (${bucketList.error}).`
+      : `${bucketsWithoutOwnBlock.length} of ${buckets.length} buckets do not block public access at the bucket level; whether the account block covers them is unknown.`;
+    publicAccessSummary = `Account-level S3 Block Public Access could not be read (${accountBlock.error}). ${bucketFact} Capture the S3 console Block Public Access settings for account ${accountId ?? "unknown"} manually.`;
   } else if (bucketList.error) {
     publicAccessStatus = "manual";
     publicAccessSummary = `Account-level flags: ${flagText}. The bucket inventory could not be read (${bucketList.error}), so bucket-level exposure is unverified.`;
   } else if (!accountConfigured) {
     publicAccessStatus = "fail";
-    publicAccessSummary = `Account-level S3 Block Public Access is not configured (S3 Control returned NoSuchPublicAccessBlockConfiguration); ${uncoveredBuckets.length}/${buckets.length} buckets lack a full bucket-level block and ${publicPolicyBuckets.length} have public bucket policies.`;
+    publicAccessSummary = `Account-level S3 Block Public Access is not configured (S3 Control returned NoSuchPublicAccessBlockConfiguration); ${uncoveredBuckets?.length ?? 0}/${buckets.length} buckets lack a full bucket-level block and ${publicPolicyBuckets.length} have public bucket policies.`;
   } else if (!accountFull) {
-    if (uncoveredBuckets.length > 0 || publicPolicyBuckets.length > 0) {
+    if ((uncoveredBuckets?.length ?? 0) > 0 || publicPolicyBuckets.length > 0) {
       publicAccessStatus = "fail";
-      publicAccessSummary = `Account-level Block Public Access is incomplete (${flagText}); ${uncoveredBuckets.length}/${buckets.length} buckets lack a full bucket-level block and ${publicPolicyBuckets.length} have public bucket policies.`;
+      publicAccessSummary = `Account-level Block Public Access is incomplete (${flagText}); ${uncoveredBuckets?.length ?? 0}/${buckets.length} buckets lack a full bucket-level block and ${publicPolicyBuckets.length} have public bucket policies.`;
     } else {
       publicAccessStatus = "warn";
       publicAccessSummary = `Account-level Block Public Access is incomplete (${flagText}), but all ${buckets.length} buckets block public access individually and no bucket policy is public.`;
@@ -2897,12 +3082,14 @@ export async function assessAwsDataProtection(
   }));
   const ebsOff = ebsRows.filter((row) => row.EbsEncryptionByDefault === false);
   const ebsUnknown = ebsRows.filter((row) => row.EbsEncryptionByDefault === undefined);
+  const ebsAllUnknown = ebsRows.length > 0 && ebsUnknown.length === ebsRows.length;
   const rdsInstances: Array<JsonRecord & { region: string }> = regionResults.flatMap((result) =>
     (result.rds.value?.items ?? []).map((instance) => ({ ...instance, region: result.region })),
   );
   const rdsUnencrypted = rdsInstances.filter((instance) => instance.StorageEncrypted === false);
   const rdsUnknown = rdsInstances.filter((instance) => typeof instance.StorageEncrypted !== "boolean");
   const rdsErrors = regionResults.filter((result) => result.rds.error);
+  const rdsAllFailed = regionResults.length > 0 && rdsErrors.length === regionResults.length;
   const rdsTruncated = regionResults.filter((result) => result.rds.value?.truncated === true);
   const bucketsWithoutSse = bucketDetails.filter((bucket) => {
     if (bucket.encryption.error) return false;
@@ -3021,13 +3208,16 @@ export async function assessAwsDataProtection(
       buildAwsMappings(11),
       {
         account_id: accountId ?? null,
-        account_block_configured: accountConfigured,
-        account_flags: accountFlags,
-        buckets: buckets.length,
-        buckets_without_full_block: sample(uncoveredBuckets.map((row) => ({ name: row.name, flags: row.flags }))),
-        buckets_with_public_policy: sample(publicPolicyBuckets.map((row) => row.name)),
-        buckets_unreadable: sample(unreadablePublicAccessBuckets.map((row) => row.name)),
-        bucket_inventory_truncated: bucketsTruncated,
+        account_block_readable: accountBlockRead,
+        account_block_configured: ifRead(accountBlock, accountConfigured),
+        account_flags: accountBlockRead ? accountFlags : notCollectedMarker("s3control:GetPublicAccessBlock", accountBlock),
+        buckets_readable: !bucketList.error,
+        buckets: ifRead(bucketList, buckets.length),
+        buckets_without_full_block: bucketList.error || uncoveredBuckets === null ? null : sample(uncoveredBuckets.map((row) => ({ name: row.name, flags: row.flags }))),
+        buckets_without_bucket_level_block: ifRead(bucketList, sample(bucketsWithoutOwnBlock.map((row) => ({ name: row.name, flags: row.flags })))),
+        buckets_with_public_policy: ifRead(bucketList, sample(publicPolicyBuckets.map((row) => row.name))),
+        buckets_unreadable: ifRead(bucketList, sample(unreadablePublicAccessBuckets.map((row) => row.name))),
+        bucket_inventory_truncated: truncatedFlag(bucketList),
       },
     ),
     finding(
@@ -3039,13 +3229,16 @@ export async function assessAwsDataProtection(
       buildAwsMappings(12),
       {
         ...scopeEvidence(scope),
-        ebs_by_region: ebsRows,
-        rds_instances: rdsInstances.length,
-        rds_unencrypted: sample(rdsUnencrypted.map((instance) => ({ region: instance.region, id: instance.DBInstanceIdentifier, engine: instance.Engine }))),
-        rds_without_flag: sample(rdsUnknown.map((instance) => instance.DBInstanceIdentifier)),
-        buckets: buckets.length,
-        buckets_without_default_encryption: sample(bucketsWithoutSse.map((bucket) => bucket.name)),
-        buckets_encryption_unreadable: sample(bucketEncryptionUnreadable.map((bucket) => bucket.name)),
+        ebs_by_region: ebsRows.map((row) => ({ region: row.region, EbsEncryptionByDefault: row.EbsEncryptionByDefault ?? null, error: row.error ?? null })),
+        rds_instances: rdsAllFailed ? null : rdsInstances.length,
+        rds_unencrypted: rdsAllFailed ? null : sample(rdsUnencrypted.map((instance) => ({ region: instance.region, id: instance.DBInstanceIdentifier, engine: instance.Engine }))),
+        rds_without_flag: rdsAllFailed ? null : sample(rdsUnknown.map((instance) => instance.DBInstanceIdentifier)),
+        regions_with_rds_errors: rdsErrors.map((result) => result.region),
+        buckets_readable: !bucketList.error,
+        buckets: ifRead(bucketList, buckets.length),
+        buckets_without_default_encryption: ifRead(bucketList, sample(bucketsWithoutSse.map((bucket) => bucket.name))),
+        buckets_encryption_unreadable: ifRead(bucketList, sample(bucketEncryptionUnreadable.map((bucket) => bucket.name))),
+        bucket_inventory_truncated: truncatedFlag(bucketList),
         efs: "not assessed",
       },
     ),
@@ -3057,10 +3250,11 @@ export async function assessAwsDataProtection(
       transitVerdict.summary,
       buildAwsMappings(13),
       {
-        buckets: buckets.length,
-        buckets_without_tls_deny: sample(transitMissing.map((row) => ({ name: row.name, has_policy: row.has_policy }))),
-        buckets_policy_unreadable: sample(transitUnreadable.map((row) => row.name)),
-        bucket_inventory_truncated: bucketsTruncated,
+        buckets_readable: !bucketList.error,
+        buckets: ifRead(bucketList, buckets.length),
+        buckets_without_tls_deny: ifRead(bucketList, sample(transitMissing.map((row) => ({ name: row.name, has_policy: row.has_policy })))),
+        buckets_policy_unreadable: ifRead(bucketList, sample(transitUnreadable.map((row) => row.name))),
+        bucket_inventory_truncated: truncatedFlag(bucketList),
         load_balancer_tls: "not assessed",
       },
     ),
@@ -3073,19 +3267,20 @@ export async function assessAwsDataProtection(
       buildAwsMappings(22),
       {
         ...scopeEvidence(scope),
-        keys: keyRows.length,
-        customer_managed_keys: customerKeys.length,
-        eligible_keys: eligibleKeys.length,
-        keys_not_rotating: sample(notRotating.map((key) => ({ region: key.region, key_id: key.keyId }))),
-        keys_rotation_unreadable: sample(rotationUnknown.map((key) => ({ region: key.region, key_id: key.keyId }))),
-        keys_manager_unreadable: sample(managerUnknown.map((key) => ({ region: key.region, key_id: key.keyId }))),
-        ineligible_customer_keys: sample(ineligibleCustomerKeys.map((key) => ({
+        keys: kmsListsAllFailed ? null : keyRows.length,
+        customer_managed_keys: kmsListsAllFailed ? null : customerKeys.length,
+        eligible_keys: kmsListsAllFailed ? null : eligibleKeys.length,
+        keys_not_rotating: kmsListsAllFailed ? null : sample(notRotating.map((key) => ({ region: key.region, key_id: key.keyId }))),
+        keys_rotation_unreadable: kmsListsAllFailed ? null : sample(rotationUnknown.map((key) => ({ region: key.region, key_id: key.keyId }))),
+        keys_manager_unreadable: kmsListsAllFailed ? null : sample(managerUnknown.map((key) => ({ region: key.region, key_id: key.keyId }))),
+        ineligible_customer_keys: kmsListsAllFailed ? null : sample(ineligibleCustomerKeys.map((key) => ({
           region: key.region,
           key_id: key.keyId,
-          key_state: key.metadata.value?.KeyState,
-          key_spec: key.metadata.value?.KeySpec,
-          origin: key.metadata.value?.Origin,
+          key_state: key.metadata.value?.KeyState ?? null,
+          key_spec: key.metadata.value?.KeySpec ?? null,
+          origin: key.metadata.value?.Origin ?? null,
         }))),
+        key_inventory_truncated: kmsListsAllFailed ? null : kmsTruncated.length > 0,
         regions_with_list_errors: kmsListErrors.map((result) => result.region),
       },
     ),
@@ -3097,16 +3292,17 @@ export async function assessAwsDataProtection(
       account_id: accountId ?? "unknown",
       regions_seen: scope.regionsSeen,
       regions_total: scope.regionsTotal,
-      buckets: buckets.length,
-      buckets_without_full_block: uncoveredBuckets.length,
-      buckets_with_public_policy: publicPolicyBuckets.length,
-      buckets_without_default_encryption: bucketsWithoutSse.length,
-      buckets_without_tls_deny: transitMissing.length,
-      ebs_regions_without_default_encryption: ebsOff.length,
-      rds_instances: rdsInstances.length,
-      rds_unencrypted: rdsUnencrypted.length,
-      customer_managed_keys: customerKeys.length,
-      keys_not_rotating: notRotating.length,
+      buckets: ifRead(bucketList, buckets.length),
+      buckets_without_full_block: bucketList.error || uncoveredBuckets === null ? null : uncoveredBuckets.length,
+      buckets_without_bucket_level_block: ifRead(bucketList, bucketsWithoutOwnBlock.length),
+      buckets_with_public_policy: ifRead(bucketList, publicPolicyBuckets.length),
+      buckets_without_default_encryption: ifRead(bucketList, bucketsWithoutSse.length),
+      buckets_without_tls_deny: ifRead(bucketList, transitMissing.length),
+      ebs_regions_without_default_encryption: ebsAllUnknown ? null : ebsOff.length,
+      rds_instances: rdsAllFailed ? null : rdsInstances.length,
+      rds_unencrypted: rdsAllFailed ? null : rdsUnencrypted.length,
+      customer_managed_keys: kmsListsAllFailed ? null : customerKeys.length,
+      keys_not_rotating: kmsListsAllFailed ? null : notRotating.length,
       collection_errors: errors.length,
     },
     findings,
@@ -3244,6 +3440,8 @@ export async function assessAwsNetworkSecurity(
   const vpcRegionErrors = regionResults.filter((result) => result.vpcs.error);
   const flowLogRegionErrors = regionResults.filter((result) => result.flowLogs.error && !result.vpcs.error);
   const vpcsAllUnreadable = regionResults.length > 0 && vpcRegionErrors.length === regionResults.length;
+  // With no readable flow log list anywhere, the count of VPCs lacking an active flow log is unknown, not zero.
+  const flowLogsAllUnreadable = regionResults.length > 0 && regionResults.every((result) => result.flowLogs.error);
   const vpcsWithoutFlowLogs = vpcRows.filter((row) => row.active_flow_logs === 0 && !row.flow_logs_unreadable);
   const vpcsUnverified = vpcRows.filter((row) => row.flow_logs_unreadable || (row.active_flow_logs === 0 && row.status_unknown > 0));
   const vpcTruncated = regionResults.filter((result) => result.vpcs.value?.truncated || result.flowLogs.value?.truncated);
@@ -3358,9 +3556,10 @@ export async function assessAwsNetworkSecurity(
       buildAwsMappings(14),
       {
         ...scopeEvidence(scope),
-        vpcs: vpcRows.length,
-        vpcs_without_active_flow_logs: sample(vpcsWithoutFlowLogs.map((row) => ({ region: row.region, vpc_id: row.vpc_id, is_default: row.is_default, flow_logs: row.flow_logs }))),
-        vpcs_unverified: sample(vpcsUnverified.map((row) => ({ region: row.region, vpc_id: row.vpc_id }))),
+        vpcs: vpcsAllUnreadable ? null : vpcRows.length,
+        vpcs_without_active_flow_logs: vpcsAllUnreadable || flowLogsAllUnreadable ? null : sample(vpcsWithoutFlowLogs.map((row) => ({ region: row.region, vpc_id: row.vpc_id, is_default: row.is_default, flow_logs: row.flow_logs }))),
+        vpcs_unverified: vpcsAllUnreadable ? null : sample(vpcsUnverified.map((row) => ({ region: row.region, vpc_id: row.vpc_id }))),
+        inventory_truncated: vpcsAllUnreadable ? null : vpcTruncated.length > 0,
         regions_with_vpc_errors: vpcRegionErrors.map((result) => result.region),
         regions_with_flow_log_errors: flowLogRegionErrors.map((result) => result.region),
       },
@@ -3375,8 +3574,9 @@ export async function assessAwsNetworkSecurity(
       {
         ...scopeEvidence(scope),
         sensitive_ports: sensitivePorts,
-        network_acls: aclRows.length,
-        permissive_network_acls: sample(permissiveAcls.map((row) => ({ region: row.region, network_acl_id: row.network_acl_id, vpc_id: row.vpc_id, is_default: row.is_default, entries: row.permissive_entries.slice(0, 5) }))),
+        network_acls: aclsAllUnreadable ? null : aclRows.length,
+        permissive_network_acls: aclsAllUnreadable ? null : sample(permissiveAcls.map((row) => ({ region: row.region, network_acl_id: row.network_acl_id, vpc_id: row.vpc_id, is_default: row.is_default, entries: row.permissive_entries.slice(0, 5) }))),
+        inventory_truncated: aclsAllUnreadable ? null : aclTruncated.length > 0,
         regions_with_errors: aclRegionErrors.map((result) => result.region),
       },
     ),
@@ -3390,8 +3590,9 @@ export async function assessAwsNetworkSecurity(
       {
         ...scopeEvidence(scope),
         sensitive_ports: sensitivePorts,
-        security_groups: groupRows.length,
-        unrestricted_security_groups: sample(unrestrictedGroups.map((row) => ({ region: row.region, group_id: row.group_id, group_name: row.group_name, vpc_id: row.vpc_id, rules: row.unrestricted_rules.slice(0, 5) }))),
+        security_groups: groupsAllUnreadable ? null : groupRows.length,
+        unrestricted_security_groups: groupsAllUnreadable ? null : sample(unrestrictedGroups.map((row) => ({ region: row.region, group_id: row.group_id, group_name: row.group_name, vpc_id: row.vpc_id, rules: row.unrestricted_rules.slice(0, 5) }))),
+        inventory_truncated: groupsAllUnreadable ? null : groupTruncated.length > 0,
         regions_with_errors: groupRegionErrors.map((result) => result.region),
       },
     ),
@@ -3402,12 +3603,12 @@ export async function assessAwsNetworkSecurity(
     summary: {
       regions_seen: scope.regionsSeen,
       regions_total: scope.regionsTotal,
-      vpcs: vpcRows.length,
-      vpcs_without_active_flow_logs: vpcsWithoutFlowLogs.length,
-      network_acls: aclRows.length,
-      permissive_network_acls: permissiveAcls.length,
-      security_groups: groupRows.length,
-      unrestricted_security_groups: unrestrictedGroups.length,
+      vpcs: vpcsAllUnreadable ? null : vpcRows.length,
+      vpcs_without_active_flow_logs: vpcsAllUnreadable || flowLogsAllUnreadable ? null : vpcsWithoutFlowLogs.length,
+      network_acls: aclsAllUnreadable ? null : aclRows.length,
+      permissive_network_acls: aclsAllUnreadable ? null : permissiveAcls.length,
+      security_groups: groupsAllUnreadable ? null : groupRows.length,
+      unrestricted_security_groups: groupsAllUnreadable ? null : unrestrictedGroups.length,
       collection_errors: errors.length,
     },
     findings,
@@ -3418,9 +3619,9 @@ export async function assessAwsNetworkSecurity(
 function formatAccessCheckText(result: AwsAccessCheckResult): string {
   const rows = result.surfaces.map((surface) => [
     surface.name,
-    surface.service,
+    surface.command,
     surface.status,
-    surface.count === undefined ? "-" : String(surface.count),
+    surface.count === null ? "-" : `${surface.count}${surface.truncated ? "+" : ""}`,
     surface.error ? surface.error.replace(/\s+/g, " ").slice(0, 80) : "",
   ]);
   return [
@@ -3428,7 +3629,7 @@ function formatAccessCheckText(result: AwsAccessCheckResult): string {
     "",
     ...result.notes,
     "",
-    formatTable(["Surface", "Service", "Status", "Count", "Note"], rows),
+    formatTable(["Surface", "Command", "Status", "Count", "Note"], rows),
     "",
     `Next: ${result.recommendedNextStep}`,
   ].join("\n");
@@ -3877,7 +4078,7 @@ export function registerAwsTools(pi: any): void {
         return textResult(formatAccessCheckText(result), { tool: "aws_check_access", ...result });
       } catch (error) {
         return errorResult(
-          `AWS access check failed: ${error instanceof Error ? error.message : String(error)}`,
+          `AWS access check failed: ${errorMessage(error)}`,
           { tool: "aws_check_access" },
         );
       }
@@ -3912,7 +4113,7 @@ export function registerAwsTools(pi: any): void {
         return textResult(formatAssessmentText(result), { tool: "aws_assess_identity", ...result });
       } catch (error) {
         return errorResult(
-          `AWS identity assessment failed: ${error instanceof Error ? error.message : String(error)}`,
+          `AWS identity assessment failed: ${errorMessage(error)}`,
           { tool: "aws_assess_identity" },
         );
       }
@@ -3932,7 +4133,7 @@ export function registerAwsTools(pi: any): void {
         return textResult(formatAssessmentText(result), { tool: "aws_assess_logging_detection", ...result });
       } catch (error) {
         return errorResult(
-          `AWS logging and detection assessment failed: ${error instanceof Error ? error.message : String(error)}`,
+          `AWS logging and detection assessment failed: ${errorMessage(error)}`,
           { tool: "aws_assess_logging_detection" },
         );
       }
@@ -3957,7 +4158,7 @@ export function registerAwsTools(pi: any): void {
         return textResult(formatAssessmentText(result), { tool: "aws_assess_org_guardrails", ...result });
       } catch (error) {
         return errorResult(
-          `AWS organization guardrail assessment failed: ${error instanceof Error ? error.message : String(error)}`,
+          `AWS organization guardrail assessment failed: ${errorMessage(error)}`,
           { tool: "aws_assess_org_guardrails" },
         );
       }
@@ -3986,7 +4187,7 @@ export function registerAwsTools(pi: any): void {
         return textResult(formatAssessmentText(result), { tool: "aws_assess_data_protection", ...result });
       } catch (error) {
         return errorResult(
-          `AWS data protection assessment failed: ${error instanceof Error ? error.message : String(error)}`,
+          `AWS data protection assessment failed: ${errorMessage(error)}`,
           { tool: "aws_assess_data_protection" },
         );
       }
@@ -4016,7 +4217,7 @@ export function registerAwsTools(pi: any): void {
         return textResult(formatAssessmentText(result), { tool: "aws_assess_network_security", ...result });
       } catch (error) {
         return errorResult(
-          `AWS network security assessment failed: ${error instanceof Error ? error.message : String(error)}`,
+          `AWS network security assessment failed: ${errorMessage(error)}`,
           { tool: "aws_assess_network_security" },
         );
       }
@@ -4068,7 +4269,7 @@ export function registerAwsTools(pi: any): void {
         );
       } catch (error) {
         return errorResult(
-          `AWS audit bundle export failed: ${error instanceof Error ? error.message : String(error)}`,
+          `AWS audit bundle export failed: ${errorMessage(error)}`,
           { tool: "aws_export_audit_bundle" },
         );
       }
