@@ -85,9 +85,10 @@ const COOKIE_HEADER_PATTERN = /\b(set-cookie|cookies?)(["']?\s*[:=]\s*)(?!\[REDA
 
 // Authorization scheme values wherever they appear (`Bearer <token>`, `Basic <base64>`, Okta `SSWS`,
 // GitHub `token`, Splunk `Splunk`). Scheme spellings are enumerated so `[a-z]` in the value guard
-// stays case-sensitive: a plain lowercase word after the scheme ("Basic authentication") is prose.
+// stays case-sensitive: a value that is one plain lowercase word ("Basic authentication") is prose,
+// while a lowercase word that continues into more value characters ("Bearer abc-DEF-123") is not.
 const SCHEME_VALUE_PATTERN =
-  /\b(Bearer|BEARER|bearer|Basic|BASIC|basic|Digest|digest|Token|TOKEN|token|OAuth|oauth|Negotiate|NTLM|SSWS|ApiKey|Apikey|apikey|APIKEY|Api-Key|api-key|Splunk|splunk)\s+(?![a-z]+\b)([A-Za-z0-9._~+/=-]{8,})/g;
+  /\b(Bearer|BEARER|bearer|Basic|BASIC|basic|Digest|digest|Token|TOKEN|token|OAuth|oauth|Negotiate|NTLM|SSWS|ApiKey|Apikey|apikey|APIKEY|Api-Key|api-key|Splunk|splunk)\s+(?![a-z]+(?![A-Za-z0-9._~+/=-]))([A-Za-z0-9._~+/=-]{8,})/g;
 
 // `key=value`, `key: value`, `"key":"value"`, and `Header-Name: value` where the key names a credential.
 const ASSIGNMENT_KEY_PATTERN = /(["']?)\b([A-Za-z][A-Za-z0-9_.-]{0,63})\b(["']?\s*[:=]\s*["']?)/g;
@@ -124,6 +125,9 @@ const WORD_SEGMENT_PATTERN = /^(?:[A-Z]?[a-z]+|[A-Z]+|[a-z]+(?:[A-Z][a-z]+)+|(?:
 
 // Keys that name a credential in query strings and name-value pairs beyond what the Flue heuristic
 // covers: bare `sid`, `sig`, `pwd`, `session`, `auth`, and the signed-URL parameters of S3 and GCS.
+// The safe-shape exemption mirrors the Flue one: `session_count`, `auth_timeout_seconds`, and
+// `sig_path` are thresholds or file references, not credentials.
+const SAFE_KEY_SHAPE_PATTERN = /^(?:max|min)[_-]|[_-](?:limit|days|hours|minutes|seconds|count|path|file|dir)$/i;
 const EXTRA_CREDENTIAL_KEY_SEGMENTS = new Set(["sid", "sig", "pwd", "passwd", "pass", "session", "sessid", "auth", "nonce", "sas"]);
 const EXTRA_CREDENTIAL_KEYS = new Set([
   "x-amz-signature",
@@ -160,10 +164,12 @@ function keySegments(key: string): string[] {
 /**
  * True when a name in a query string, header, or name-value pair carries a credential: the Flue
  * argument-key heuristic (`token`, `secret`, `password`, `api_key`, `authorization`, `cookie`, ...)
- * plus the bare and signed-URL names it does not cover.
+ * plus the bare and signed-URL names it does not cover, under the same safe-shape exemption for
+ * thresholds, counts, and file references.
  */
 export function isCredentialKey(key: string): boolean {
   if (isSensitiveArgumentKey(key)) return true;
+  if (SAFE_KEY_SHAPE_PATTERN.test(key)) return false;
   const normalized = key.toLowerCase();
   if (EXTRA_CREDENTIAL_KEYS.has(normalized)) return true;
   return keySegments(key).some((segment) => EXTRA_CREDENTIAL_KEY_SEGMENTS.has(segment));
