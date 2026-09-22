@@ -193,6 +193,81 @@ export function assertIdentifierKeyRows(assert, redact, rows = IDENTIFIER_KEY_RO
 }
 
 /**
+ * The bearer-id override to the identifier ruling above (CodeRabbit r4077259415 on #78): a key ending in `secret_id`,
+ * any prefix, casing, and separator, holds a Vault AppRole secret id, and a session-id key holds a session token;
+ * each authenticates rather than identifies, so it is a credential key despite its `id` suffix and its value is
+ * removed whatever its shape, a UUID included. Every key rides every form of credentialPairForms with a UUID, a
+ * random, and a name-shaped value; none of the values' 6-to-24 windows occurs in any key, form, or sentence.
+ */
+export const BEARER_ID_KEYS = Object.freeze([
+  "secret_id",
+  "SECRET_ID",
+  "secret-id",
+  "VAULT_SECRET_ID",
+  "role_secret_id",
+  "roleSecretId",
+  "vault.secret_id",
+  "session_id",
+  "sid",
+  "sessid",
+  "jsessionid",
+  "JSESSIONID",
+  "PHPSESSID",
+]);
+export const BEARER_ID_VALUES = Object.freeze(["9b2f6c1e-3d4a-4e5f-8a7b-1c2d3e4f5a6b", "Qv7Lx2Zm9Kp4Rt8W", "prod-approle-2026"]);
+
+/**
+ * Controls beside the override: the identifier keys with the same suffixes keep a UUID or a plain value and lose
+ * only a value the bare-shape rules remove (an AKIA access key id), `role_id` (the public half of an AppRole) and
+ * `secret_name` stay identifiers, and `ssid` is a network name, not a session id.
+ */
+export const BEARER_ID_CONTROL_ROWS = Object.freeze([
+  ["AZURE_TENANT_ID=9b2f6c1e-3d4a-4e5f-8a7b-1c2d3e4f5a6b", "AZURE_TENANT_ID=9b2f6c1e-3d4a-4e5f-8a7b-1c2d3e4f5a6b"],
+  ['"AZURE_TENANT_ID": "9b2f6c1e-3d4a-4e5f-8a7b-1c2d3e4f5a6b"', '"AZURE_TENANT_ID": "9b2f6c1e-3d4a-4e5f-8a7b-1c2d3e4f5a6b"'],
+  ["client_id=9b2f6c1e-3d4a-4e5f-8a7b-1c2d3e4f5a6b", "client_id=9b2f6c1e-3d4a-4e5f-8a7b-1c2d3e4f5a6b"],
+  ["tenant_id: 9b2f6c1e-3d4a-4e5f-8a7b-1c2d3e4f5a6b", "tenant_id: 9b2f6c1e-3d4a-4e5f-8a7b-1c2d3e4f5a6b"],
+  ['{"role_id":"9b2f6c1e-3d4a-4e5f-8a7b-1c2d3e4f5a6b"}', '{"role_id":"9b2f6c1e-3d4a-4e5f-8a7b-1c2d3e4f5a6b"}'],
+  ["access_key_id=audit-2026", "access_key_id=audit-2026"],
+  ["access_key_id=AKIAIOSFODNN7EXAMPLE", "access_key_id=[REDACTED]"],
+  ["key_id=alias/aws/ebs", "key_id=alias/aws/ebs"],
+  ["secret_name=my-secret", "secret_name=my-secret"],
+  ["VAULT_SECRET_NAME=prod-approle-2026", "VAULT_SECRET_NAME=prod-approle-2026"],
+  ["ssid=corp-wifi-2026", "ssid=corp-wifi-2026"],
+]);
+/** The controls a data-string scrub (carriers only, no bare-shape rules) must keep: every row above whose value stays. */
+export const BEARER_ID_CARRIER_CONTROL_ROWS = Object.freeze(BEARER_ID_CONTROL_ROWS.filter(([text, expected]) => text === expected));
+
+/**
+ * Asserts the bearer-id override on one text scrub: every bearer-id key loses its value in every form whatever
+ * the value's shape (through assertCredentialPairValuesRemoved, so only the value goes and a second pass changes
+ * nothing), and every control row scrubs to exactly its expected text. A data-string scrub passes
+ * BEARER_ID_CARRIER_CONTROL_ROWS as its controls, since it has no bare-shape rule to remove an access key id.
+ */
+export function assertBearerIdKeyRows(assert, redact, { keys = BEARER_ID_KEYS, values = BEARER_ID_VALUES, controls = BEARER_ID_CONTROL_ROWS } = {}) {
+  assertCredentialPairValuesRemoved(assert, redact, { keys, values });
+  assertIdentifierKeyRows(assert, redact, controls);
+}
+
+/**
+ * Asserts the bearer-id override on a snapshot walker: a value under a key ending in `secret_id` is the marker at
+ * the top level and nested, while the identifier keys beside it keep their values, whatever the shape of either.
+ */
+export function assertBearerIdSnapshotKeys(assert, scrubSnapshot, values = BEARER_ID_VALUES) {
+  for (const value of values) {
+    const identifiers = { AZURE_TENANT_ID: value, client_id: value, tenant_id: value, role_id: value, access_key_id: value, key_id: value, secret_name: value, user_id: value };
+    const bearers = { secret_id: value, SECRET_ID: value, VAULT_SECRET_ID: value, role_secret_id: value, roleSecretId: value };
+    const output = scrubSnapshot({ ...identifiers, ...bearers, nested: { approle: { ...identifiers, ...bearers } }, list: [{ ...bearers }] });
+    for (const record of [output, output.nested.approle, output.list[0]]) {
+      for (const key of Object.keys(bearers)) assert.equal(record[key], "[REDACTED]", `snapshot key ${key} holds the marker for ${value}`);
+    }
+    for (const record of [output, output.nested.approle]) {
+      for (const key of Object.keys(identifiers)) assert.equal(record[key], value, `snapshot key ${key} keeps ${value}`);
+    }
+    assertNoCanaryWindows(assert, JSON.stringify({ bearers: [output.secret_id, output.nested.approle.roleSecretId, output.list[0].VAULT_SECRET_ID] }), [value], `snapshot bearer ids for ${value}`);
+  }
+}
+
+/**
  * reviewer D round 5 escapes. Inside a serialized message a header line follows a JSON escape rather than a
  * real line break: `\n`, `\t`, `\r\n` (two characters each) or `\u000a`, `\u0009`, `\u000d\u000a` (six), as
  * backslash text. The character before the header name is then the escape's last letter, a word character to

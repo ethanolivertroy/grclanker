@@ -19,6 +19,7 @@ import {
   ANSIBLE_CONTROLS,
   ANSIBLE_REDACTION_MARKER,
   AnsibleAapClient,
+  AnsibleApiError,
   ansibleFixedTexts,
   assessAnsibleHostCoverage,
   assessAnsibleJobHealth,
@@ -64,11 +65,15 @@ import {
   parserSnippetBody,
 } from "./helpers/error-canaries.mjs";
 import {
+  BEARER_ID_CARRIER_CONTROL_ROWS,
+  BEARER_ID_VALUES,
   DEPTH_CONTROL,
   DEPTH_CONTROL_CANARIES,
   ESCAPED_HEADER_LINES,
   JSON_ESCAPES,
   QUOTED_NON_CREDENTIAL_GROUP,
+  assertBearerIdKeyRows,
+  assertBearerIdSnapshotKeys,
   assertCarrierTextScrub,
   assertCredentialPairValuesRemoved,
   assertDepthControl,
@@ -2098,6 +2103,19 @@ test("rule 9 credential-named pairs (reviewer D round 5 baseline): a value under
   ]) {
     assert.equal(redactErrorText(text), text, `prose beside a credential word survives: ${text}`);
   }
+});
+
+test("rule 9 bearer-id override (CodeRabbit r4077259415 on #78): a key ending in secret_id or naming a session id is a credential key despite its id suffix, so a Vault AppRole secret id goes whatever its shape, a UUID included, through the error sink, the data-string sink, the snapshot walker, and the thrown error, while AZURE_TENANT_ID=<uuid> and the other identifier keys keep their values", async () => {
+  assertBearerIdKeyRows(assert, redactErrorText);
+  assertBearerIdKeyRows(assert, redactCarrierText, { controls: BEARER_ID_CARRIER_CONTROL_ROWS });
+  assertBearerIdSnapshotKeys(assert, scrubSnapshotValue);
+  const [uuid, random] = BEARER_ID_VALUES;
+  const tenant = "3f2504e0-4f89-11d3-9a0c-0305e82c3301";
+  const echoed = `VAULT_SECRET_ID=${uuid} and role_secret_id: ${random} were rejected; AZURE_TENANT_ID=${tenant} was accepted`;
+  const expected = `VAULT_SECRET_ID=[REDACTED] and role_secret_id: [REDACTED] were rejected; AZURE_TENANT_ID=${tenant} was accepted`;
+  const thrown = new AnsibleApiError(`AAP request failed for /api/v2/users/ (403 Forbidden): ${echoed}`, 403, "/api/v2/users/");
+  assert.equal(thrown.message, `AAP request failed for /api/v2/users/ (403 Forbidden): ${expected}`);
+  assertNoCanaryWindows(assert, thrown.message, [uuid, random], "AnsibleApiError message");
 });
 
 test("fixture self-check: every planted canary is alphanumeric and random-looking, and no 6-to-24-character window of any canary occurs in the healthy fixture's legitimate values, so a windowed leak assertion can fail only on a real echo", async () => {

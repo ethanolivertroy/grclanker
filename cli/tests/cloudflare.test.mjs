@@ -13,6 +13,7 @@ import {
   CLOUDFLARE_RULESET_PHASES,
   CLOUDFLARE_ZONE_SETTING_IDS,
   CloudflareApiClient,
+  CloudflareApiError,
   assessCloudflareIdentity,
   assessCloudflareTrafficControls,
   assessCloudflareZoneSecurity,
@@ -51,12 +52,16 @@ import {
   shortBodyResponse,
 } from "./helpers/error-canaries.mjs";
 import {
+  BEARER_ID_CARRIER_CONTROL_ROWS,
+  BEARER_ID_VALUES,
   DEPTH_CONTROL,
   ESCAPED_HEADER_LINES,
   JSON_ESCAPES,
   MASKED_HEX_ID_GROUP,
   QUOTED_NON_CREDENTIAL_GROUP,
   SERVER_ASSIGNED_HEX_IDS,
+  assertBearerIdKeyRows,
+  assertBearerIdSnapshotKeys,
   assertCarrierTextScrub,
   assertCredentialPairValuesRemoved,
   assertDepthControl,
@@ -1516,6 +1521,19 @@ test("rule 9 credential-named pairs (reviewer D round 5 baseline): a value under
   ]) {
     assert.equal(redactErrorText(text), text, `prose beside a credential word survives: ${text}`);
   }
+});
+
+test("rule 9 bearer-id override (CodeRabbit r4077259415 on #78): a key ending in secret_id or naming a session id is a credential key despite its id suffix, so a Vault AppRole secret id goes whatever its shape, a UUID included, through the error sink, the data-string sink, the snapshot walker, and the thrown error, while AZURE_TENANT_ID=<uuid> and the other identifier keys keep their values", async () => {
+  assertBearerIdKeyRows(assert, redactErrorText);
+  assertBearerIdKeyRows(assert, redactCarrierText, { controls: BEARER_ID_CARRIER_CONTROL_ROWS });
+  assertBearerIdSnapshotKeys(assert, scrubSnapshotValue);
+  const [uuid, random] = BEARER_ID_VALUES;
+  const tenant = "3f2504e0-4f89-11d3-9a0c-0305e82c3301";
+  const echoed = `VAULT_SECRET_ID=${uuid} and role_secret_id: ${random} were rejected; AZURE_TENANT_ID=${tenant} was accepted`;
+  const expected = `VAULT_SECRET_ID=[REDACTED] and role_secret_id: [REDACTED] were rejected; AZURE_TENANT_ID=${tenant} was accepted`;
+  const thrown = new CloudflareApiError(`Cloudflare request failed for /accounts/acc-123/members (403 Forbidden): ${echoed}`, 403, "/accounts/acc-123/members");
+  assert.equal(thrown.message, `Cloudflare request failed for /accounts/acc-123/members (403 Forbidden): ${expected}`);
+  assertNoCanaryWindows(assert, thrown.message, [uuid, random], "CloudflareApiError message");
 });
 
 const CLOUDFLARE_JSON_HEADERS = { "content-type": "application/json" };

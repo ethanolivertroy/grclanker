@@ -489,9 +489,13 @@ function scrubConfiguredSecrets(text: string): string {
 // The words that name a credential. A key ends in one of them; isCredentialNamedKey below decides how the word may
 // be attached to the rest of the key. `skey` and `ikey` are Duo's secret key and integration key (DUO_SKEY, DUO_IKEY),
 // both configured secrets of that integration; there is no bare `key`, so KmsKeyId, ssh_key_name, and the like stay
-// identifiers.
+// identifiers. The bearer ids are the one override to that identifier suffix (CodeRabbit r4077259415 on #78): a key
+// ending in `secret_id` (a Vault AppRole secret id: `secret_id`, `VAULT_SECRET_ID`, `role_secret_id`, `roleSecretId`)
+// or in a session id (`session_id`, `sid`, `sessid`, `jsessionid`, `PHPSESSID`) authenticates rather than identifies,
+// so it is a credential key despite ending in `id` and its value goes whatever its shape, UUID included, while
+// `client_id`, `tenant_id`, `access_key_id`, `key_id`, and `secret_name` keep theirs unless the value's own shape goes.
 const ERROR_CREDENTIAL_WORDS =
-  "token|secret|passw(?:or)?d|pwd|api[_-]?key|apikey|auth[_-]?key|auth[_-]?email|session(?:[_-]?id)?|sid|cookie|csrftoken|authorization|auth|signature|sig|nonce|credentials?|access[_-]?key|private[_-]?key|skey|ikey";
+  "token|secret[_-]?id|secret|passw(?:or)?d|pwd|api[_-]?key|apikey|auth[_-]?key|auth[_-]?email|session(?:[_-]?id)?|sessid|sid|cookie|csrftoken|authorization|auth|signature|sig|nonce|credentials?|access[_-]?key|private[_-]?key|skey|ikey";
 const ERROR_CREDENTIAL_KEY_PATTERN = `[A-Za-z0-9_.-]*(?:${ERROR_CREDENTIAL_WORDS})`;
 /**
  * key=value and key: value pairs whose key ends in a credential word (a key after "/" is a path segment, not a
@@ -551,7 +555,8 @@ const BARE_SCHEME_WORD_PATTERN = /^(?:Bearer|Basic|Digest|Token|ApiKey)$/i;
  * (`accessToken`, `clientSecret`, `dbpassword`, `ACCESSTOKEN`). A PascalCase identifier that merely ends in the
  * word (`InvalidAuthenticationToken`, `ExpiredToken`) is an error code or a type name, and the text after its
  * colon is prose. A key that names an identifier (`AWS_ACCESS_KEY_ID`, `AZURE_TENANT_ID`, `CLOUDFLARE_EMAIL`)
- * never ends in a credential word, so its value is judged by its own shape alone.
+ * never ends in a credential word, so its value is judged by its own shape alone; the bearer ids (`secret_id` and
+ * the session ids, see ERROR_CREDENTIAL_WORDS) are credential words, so that suffix test never reaches them.
  */
 function isCredentialNamedKey(key: string): boolean {
   const word = CREDENTIAL_KEY_WORD_PATTERN.exec(key)?.[0];
@@ -771,6 +776,13 @@ const SNAPSHOT_DEPTH_CAP = 32;
  */
 const SNAPSHOT_SECRET_KEY_PATTERN =
   /^(?:secret[_-]?key|skey|secret|client[_-]?secret|api[_-]?secret|password|passwd|passphrase|private[_-]?key|access[_-]?token|refresh[_-]?token|id[_-]?token|authorization|cookie|set-cookie|x-auth-key|api[_-]?key|x-api-key)$/i;
+/**
+ * The bearer-id override for snapshot keys (CodeRabbit r4077259415 on #78): a key ending in `secret_id`, any prefix,
+ * casing, and separator (`secret_id`, `VAULT_SECRET_ID`, `role_secret_id`, `roleSecretId`), holds a Vault AppRole
+ * secret id, which authenticates rather than identifies, so its value is the marker whatever its shape; an `_id` key
+ * that identifies (`client_id`, `tenant_id`, `key_id`, `user_id`) is data and stays.
+ */
+const SNAPSHOT_BEARER_ID_KEY_PATTERN = /secret[_-]?id$/i;
 
 /** The snapshot walk behind scrubSnapshotValue and the integration's own data walkers: one key rule, one string rule, one cap. */
 function scrubSnapshotTree(value: unknown, isSecretKey: (key: string) => boolean, depth: number): unknown {
@@ -799,7 +811,7 @@ function snapshotMarkerFor(entry: unknown): unknown {
  * server-supplied tree bounds the work and nothing deeper than the cap is copied.
  */
 export function scrubSnapshotValue(value: unknown): unknown {
-  return scrubSnapshotTree(value, (key) => SNAPSHOT_SECRET_KEY_PATTERN.test(key), 1);
+  return scrubSnapshotTree(value, (key) => SNAPSHOT_SECRET_KEY_PATTERN.test(key) || SNAPSHOT_BEARER_ID_KEY_PATTERN.test(key), 1);
 }
 
 /**
