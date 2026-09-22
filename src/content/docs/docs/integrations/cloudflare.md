@@ -34,7 +34,7 @@ Use a scoped API token (`CLOUDFLARE_API_TOKEN`). The legacy Global API Key pair 
 
 | Tool | Purpose |
 |------|---------|
-| `cloudflare_check_access` | Probe token verification, accounts, zones, zone settings, DNSSEC, rulesets, members, Access apps, and audit logs |
+| `cloudflare_check_access` | Probe token verification, accounts, zones, zone settings, DNSSEC, rulesets, members, Access apps, and audit logs. A failed probe carries `count: null`, the observed `http_status`, and the scrubbed error. The zone-scoped probes (zone settings, DNSSEC, rulesets) are `not_attempted` when `/zones` itself could not be read, carrying the `/zones` status and error (`Not attempted: /zones could not be read (...)`), counted outside the readable tally, and turning the check `limited`; they are `not_configured` only when `/zones` was read and returned no zone |
 | `cloudflare_assess_identity` | CF-IAM-01 through CF-IAM-06 |
 | `cloudflare_assess_zone_security` | CF-ZONE-01 through CF-ZONE-15 |
 | `cloudflare_assess_traffic_controls` | CF-TRF-01 through CF-TRF-06 |
@@ -49,7 +49,7 @@ The bundle never carries credentials or contact details. `core_data/accounts.jso
 - `fail`: at least one sampled item violates the control
 - `manual`: the API could not prove the control (401/403, plan not present, empty inventory that cannot be judged, or no automatable signal); the summary names the endpoint, the missing permission, and the evidence to collect
 
-A 401, 403, or errored read never produces `pass`. That holds for every inventory a finding reads, not only its primary one: CF-IAM-04 is manual when `/accounts/{account_id}/access/policies` cannot be read even though the application list was (a bypass decision can live in a reusable policy), CF-IAM-06 is warn when only one of `/user/tokens` and `/accounts/{account_id}/tokens` is readable, and CF-TRF-06 is manual when zero Gateway rules exist and `/accounts/{account_id}/gateway` cannot be read; each summary names the endpoint and the permission to grant. Items without dates (`expires_on`, `last_used_on`, certificate `expires_on`, `modified_on`) are never counted valid or fresh.
+A 401, 403, or errored read never produces `pass`. That holds for every inventory a finding reads, not only its primary one: CF-IAM-04 is manual when `/accounts/{account_id}/access/policies` cannot be read even though the application list was (a bypass decision can live in a reusable policy), CF-IAM-06 is warn when only one of `/user/tokens` and `/accounts/{account_id}/tokens` is readable, with its counts scoped to "the N readable tokens (<source>)" and the denied source named as the reason for the cap rather than folded into the tally as zero (its `sources` entry carries `seen`, `total`, and `truncated` as `null` beside the `http_status` and error), and CF-TRF-06 is manual when zero Gateway rules exist and `/accounts/{account_id}/gateway` cannot be read; each summary names the endpoint and the permission to grant. Items without dates (`expires_on`, `last_used_on`, certificate `expires_on`, `modified_on`) are never counted valid or fresh.
 
 A truncated listing never produces `pass` either. Page-numbered listings stop at their item cap or when `result_info.total_count` exceeds the collected items, cursor listings (`/zones/{zone_id}/rulesets`) stop at their cap, at a 100-page budget, at a cursor that repeats, or at an empty page that still carries a cursor, and a 404 that arrives after items were collected keeps them; every one of those exits reports `truncated` with the total when the API supplied one, and the dependent finding is capped at warn with `Partial <inventory> inventory: <seen> seen of <total>` in its summary. CF-IAM-04 applies that to both the application list and the reusable policy list.
 
@@ -69,7 +69,7 @@ A truncated listing never produces `pass` either. Page-numbered listings stop at
 | 10 | Identity providers | identity | CF-IAM-05 | at least one non `onetimepin` provider |
 | 11 | Audit logging | traffic_controls | CF-TRF-04 | events in the last 30 days from `/audit_logs`; retention is manual |
 | 12 | Token scoping | identity | CF-IAM-01, CF-IAM-02 | auth method; `/user/tokens/verify` `status`, token `policies[].permission_groups` |
-| 13 | Token expiration | identity | CF-IAM-06 | active tokens without `expires_on` fail |
+| 13 | Token expiration | identity | CF-IAM-06 | active tokens without `expires_on` fail; manual when no token source is readable, with every token count `null`; warn with counts scoped to the readable source when `/user/tokens` or `/accounts/{account_id}/tokens` is denied or truncated |
 | 14 | Member roles | identity | CF-IAM-03 | Super Administrator role count, `two_factor_authentication_enabled` |
 | 15 | Page rules | traffic_controls | CF-TRF-02 | rules requested with `status=active`; `disable_security`, `security_level` essentially_off, `ssl` off/flexible, cache_everything on sensitive paths fail |
 | 16 | Rate limiting | traffic_controls | CF-TRF-01 | enabled rules with `ratelimit` in `http_ratelimit`; none fails; legacy `/rate_limits` is read only when the entry point is unreadable and caps at warn |

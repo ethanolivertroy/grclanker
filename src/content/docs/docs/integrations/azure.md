@@ -99,7 +99,7 @@ Empty inventories that pass by intent are stated in the finding text: no guests 
 | 22 | App Registrations | identity | AZURE-ID-12, AZURE-ID-13 | expired credentials fail; missing dates, long-lived secrets, or no owners warn; risky AllPrincipals grants fail; zero grants manual |
 | 23 | Service Principals | identity, subscription_guardrails | AZURE-ID-05, AZURE-SUB-05 | expired credentials or Owner/Contributor service principals fail |
 | 24 | Network Watcher | subscription_guardrails, network_and_policy | AZURE-SUB-04, AZURE-NP-04 | SUB-04 warns without a Network Watcher; NP-04 reads flow logs from every Network Watcher and passes only when every NSG has an enabled flow log whose targetResourceId is that NSG (partial coverage warns, none fails, truncation caps at warn) |
-| 25 | Azure Policy | network_and_policy | AZURE-NP-02, AZURE-NP-03 | assignments must use enforcementMode Default; non-compliant policies warn |
+| 25 | Azure Policy | network_and_policy | AZURE-NP-02, AZURE-NP-03 | assignments must use enforcementMode Default; non-compliant policies warn. AZURE-NP-02 names absent mandatory built-ins under `mandatory_missing` only when the assignment page was complete; under a truncated page they move to `mandatory_not_seen` (`mandatory_missing` is `null`) and the summary says they "may exist among the unseen assignments" |
 
 ## Framework mappings
 
