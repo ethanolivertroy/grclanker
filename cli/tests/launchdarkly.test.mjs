@@ -1,6 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import {
+  chmodSync,
   existsSync,
   mkdirSync,
   mkdtempSync,
@@ -27,11 +28,14 @@ import {
   checkLaunchdarklyAccess,
   exportLaunchdarklyAuditBundle,
   parseSimpleToml,
+  registerLaunchdarklyTools,
   resolveLaunchdarklyConfiguration,
   resolveSecureOutputPath,
+  scrubErrorText,
 } from "../dist/extensions/grc-tools/launchdarkly.js";
 import { getRegisteredToolSummaries } from "../dist/pi/tool-catalog.js";
-import { assertSecretsAbsent, readBundleFiles, readZipEntries } from "./helpers/bundle-contents.mjs";
+import { readBundleFiles, readZipEntries } from "./helpers/bundle-contents.mjs";
+import { assertCanaryFixture, assertCanaryWindowsAbsent } from "./helpers/canary-windows.mjs";
 
 const NOW = Date.parse("2026-09-21T00:00:00Z");
 const RECENT = "2026-09-15T00:00:00Z";
@@ -39,7 +43,9 @@ const RECENT_MS = Date.parse(RECENT);
 const OLD = "2025-01-01T00:00:00Z";
 const OLD_MS = Date.parse(OLD);
 const FUTURE_MS = NOW + 90 * 24 * 60 * 60 * 1000;
-const TEST_TOKEN = "api-11111111-2222-3333-4444-555555555555";
+// The configured token is itself a planted credential: alphanumeric and random-looking so every 6-to-24-character
+// window of it can be asserted absent from every output (see helpers/canary-windows.mjs).
+const TEST_TOKEN = "U7ktAa5zEHKELrac4CfrjWJF3zBQuiEx";
 
 function createTempBase(prefix) {
   return mkdtempSync(join(tmpdir(), prefix));
@@ -1803,24 +1809,29 @@ test("verdict rule 1 corollary: LaunchDarkly findings keep judging readable inve
   assert.equal(findingStatus(allAudit, "LD-13"), "fail");
 });
 
-const LAUNCHDARKLY_FAKE_SECRETS = [
-  "FAKE_WEBHOOK_PATH_TOKEN_1",
-  "FAKE_WEBHOOK_QUERY_TOKEN_2",
-  "FAKE_INTEGRATION_URL_TOKEN_3",
-  "FAKE_INTEGRATION_HEADER_TOKEN_4",
-  "FAKE_INTEGRATION_NESTED_KEY_5",
-  "FAKE_FLAG_VARIATION_SECRET_6",
-  "FAKE_ACCESS_TOKEN_VALUE_7",
-  "FAKE_RELAY_FULL_KEY_8",
-  "FAKE_PROJECT_ENV_API_KEY_9",
-  "sdk-aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
-];
+// Credential values planted in collected objects. Alphanumeric and random-looking so that every 6-to-24-character window
+// can be asserted absent; the SDK key keeps LaunchDarkly's sdk-<uuid> shape around a random hex body.
+const LD_SDK_KEY_HEX = "e83bd5a5f00659aed175191b7953c460";
+const LD_SDK_KEY_CANARY = `sdk-${LD_SDK_KEY_HEX.slice(0, 8)}-${LD_SDK_KEY_HEX.slice(8, 12)}-${LD_SDK_KEY_HEX.slice(12, 16)}-${LD_SDK_KEY_HEX.slice(16, 20)}-${LD_SDK_KEY_HEX.slice(20)}`;
+const LAUNCHDARKLY_FAKE_SECRETS = {
+  webhookPath: "pPXDbR3TsHbMajWLVZ4nDenRJ5eXtCZY",
+  webhookQuery: "wfT9kKT8uFCLktEKb9jXg3hnVJebXMNZ",
+  integrationUrl: "b2aNgSfKeEHwSMN33X77Bof3JZStQBGg",
+  integrationHeader: "HEi8h3UJAs8Zn8CFUV6vkBT684NbuKY4",
+  integrationNestedKey: "4idBU9tWqjTjawfBTxvH68aXvkfESBG3",
+  flagVariation: "YJLeRkSTZCiKDoe8ZvaSi3NYxMZ4UHTa",
+  accessTokenValue: "WB3FfAGQCKmcpSbk7MGRBT5tshEK3rrL",
+  relayFullKey: "uCANkAy4FHeqgLEqUbRo93C8P7NAJbBf",
+  projectEnvApiKey: "BYAE7HSiWwjvHTvPPwjGYcJbPxHBW7tY",
+  sdkKey: LD_SDK_KEY_CANARY,
+};
 
 function secretBearingLaunchdarklyClient() {
   const base = healthyClient();
+  const secrets = LAUNCHDARKLY_FAKE_SECRETS;
   return healthyClient({
     async listWebhooks() {
-      return [{ _id: "wh-1", name: "ci-hook", url: `https://hooks.example.com/services/T0/B0/${LAUNCHDARKLY_FAKE_SECRETS[0]}?token=${LAUNCHDARKLY_FAKE_SECRETS[1]}`, secret: "whsec_FAKE", on: true }];
+      return [{ _id: "wh-1", name: "ci-hook", url: `https://hooks.example.com/services/T0/B0/${secrets.webhookPath}?token=${secrets.webhookQuery}`, secret: "whsec_FAKE", on: true }];
     },
     async listIntegrationSubscriptions(integrationKey) {
       if (integrationKey !== "datadog") return [];
@@ -1829,9 +1840,9 @@ function secretBearingLaunchdarklyClient() {
         name: "datadog-prod",
         on: true,
         config: {
-          url: `https://hooks.example.com/services/${LAUNCHDARKLY_FAKE_SECRETS[2]}`,
-          headers: [{ name: "Authorization", value: `Bearer ${LAUNCHDARKLY_FAKE_SECRETS[3]}` }],
-          destination: { credentials: { apiKey: LAUNCHDARKLY_FAKE_SECRETS[4] } },
+          url: `https://hooks.example.com/services/${secrets.integrationUrl}`,
+          headers: [{ name: "Authorization", value: `Bearer ${secrets.integrationHeader}` }],
+          destination: { credentials: { apiKey: secrets.integrationNestedKey } },
         },
         statements: [{ effect: "allow", actions: ["updateOn", "updateRules"], resources: ["proj/web:env/production:flag/*"] }],
       }];
@@ -1840,29 +1851,34 @@ function secretBearingLaunchdarklyClient() {
       const flags = await base.listFlags(...args);
       return flags.map((flag) => ({
         ...flag,
-        variations: [{ value: { apiSecret: LAUNCHDARKLY_FAKE_SECRETS[5] }, name: "on" }, { value: false, name: "off" }],
-        environments: { production: { ...flag.environments.production, on: true, rules: [{ clauses: [{ attribute: "email", op: "in", values: [LAUNCHDARKLY_FAKE_SECRETS[5]] }] }] } },
+        variations: [{ value: { apiSecret: secrets.flagVariation }, name: "on" }, { value: false, name: "off" }],
+        environments: { production: { ...flag.environments.production, on: true, rules: [{ clauses: [{ attribute: "email", op: "in", values: [secrets.flagVariation] }] }] } },
       }));
     },
     async listTokens() {
       const tokens = await base.listTokens();
-      return tokens.map((token) => ({ ...token, token: LAUNCHDARKLY_FAKE_SECRETS[6] }));
+      return tokens.map((token) => ({ ...token, token: secrets.accessTokenValue }));
     },
     async listRelayProxyConfigs() {
       const relays = await base.listRelayProxyConfigs();
-      return relays.map((relay) => ({ ...relay, fullKey: LAUNCHDARKLY_FAKE_SECRETS[7], displayKey: "y-8" }));
+      return relays.map((relay) => ({ ...relay, fullKey: secrets.relayFullKey, displayKey: "y-8" }));
     },
     async listProjects() {
-      return [{ key: "web", name: "Web App", tags: [], environments: [{ key: "production", apiKey: LAUNCHDARKLY_FAKE_SECRETS[8], mobileKey: "mob-FAKE" }] }];
+      return [{ key: "web", name: "Web App", tags: [], environments: [{ key: "production", apiKey: secrets.projectEnvApiKey, mobileKey: "mob-FAKE" }] }];
     },
     async listSdkKeys() {
-      return [{ key: LAUNCHDARKLY_FAKE_SECRETS[9], kind: "sdk", _createdAt: RECENT_MS, isDefault: true, value: LAUNCHDARKLY_FAKE_SECRETS[9] }];
+      return [{ key: secrets.sdkKey, kind: "sdk", _createdAt: RECENT_MS, isDefault: true, value: secrets.sdkKey }];
     },
   });
 }
 
 test("verdict rule 9: the LaunchDarkly bundle and its zip never carry credential-shaped values or token-bearing URLs from any collected object", async () => {
   const base = createTempBase("grclanker-ld-secrets-");
+  // Self-check: the planted values share no 6-character window with each other or with the healthy fixture's own output.
+  const baseline = await exportLaunchdarklyAuditBundle(healthyClient(), sampleConfig({ token: "not-a-canary" }), createTempBase("grclanker-ld-secrets-baseline-"), { now: NOW });
+  const plantedAlphanumeric = [...Object.values(LAUNCHDARKLY_FAKE_SECRETS).filter((value) => value !== LD_SDK_KEY_CANARY), LD_SDK_KEY_HEX, TEST_TOKEN];
+  assertCanaryFixture(assert, plantedAlphanumeric, readBundleFiles(baseline.outputDir), "collected-object canaries");
+
   const result = await exportLaunchdarklyAuditBundle(secretBearingLaunchdarklyClient(), sampleConfig(), base, { now: NOW });
 
   assert.equal(result.findingCount, 25);
@@ -1870,8 +1886,9 @@ test("verdict rule 9: the LaunchDarkly bundle and its zip never carry credential
   const entries = readZipEntries(result.zipPath);
   assert.ok(files.size >= 30, "the bundle directory was written");
   assert.ok(entries.size >= 30, "the zip archive carries the bundle files");
-  assertSecretsAbsent(assert, files, [...LAUNCHDARKLY_FAKE_SECRETS, TEST_TOKEN], "bundle file");
-  assertSecretsAbsent(assert, entries, [...LAUNCHDARKLY_FAKE_SECRETS, TEST_TOKEN], "zip entry");
+  const planted = [...Object.values(LAUNCHDARKLY_FAKE_SECRETS), TEST_TOKEN];
+  assertCanaryWindowsAbsent(assert, files, planted, "bundle file");
+  assertCanaryWindowsAbsent(assert, entries, planted, "zip entry");
 
   const webhooks = JSON.parse(files.get(join("core_data", "webhooks.json")));
   assert.equal(webhooks.items[0].url, "https://hooks.example.com", "the webhook destination is reduced to scheme plus host");
@@ -2100,4 +2117,941 @@ test("LaunchDarkly tools are registered in the tool catalog under the LaunchDark
   const exportTool = tools.find((tool) => tool.name === "launchdarkly_export_audit_bundle");
   assert.ok(exportTool.parameterSummaries.some((parameter) => parameter.name === "output_dir"));
   assert.ok(tools.every((tool) => !tool.description.includes("\u2014")));
+});
+
+// ---------------------------------------------------------------------------------------------------------------
+// Addenda 2 to 7: the real client over an HTTP router that records every request the run makes.
+// ---------------------------------------------------------------------------------------------------------------
+
+// Every planted credential is alphanumeric and random-looking; helpers/canary-windows.mjs asserts every 6-to-24-character
+// window of each one absent, and the fixture self-check below proves no window occurs in the fixture's own values.
+const LD_CANARIES = {
+  bearer: "aMF3WGwJ9UKifFXjxkPA8WexoDtcP4ZT",
+  cookie: "wDLfuP8P7gnn3JsU2DT3XrCUrQwJLnZ7",
+  apiKey: "QJGjPixxDSCkGNoArXMeL2USsBcdGfdd",
+  urlToken: "PCWXTXXWpLrVFgXp2SPm7YQKZgcAgWUx",
+  jwtHeader: "aNrGBaN7JZ6Gfs4wQKAgRchyWs4dGuV2",
+  jwtPayload: "9uZpMZQPRAt8TdXJ6H77iwUnT5TzR6H3",
+  jwtSignature: "YQex5tM7P4nUAJd5oXvRWDYC72r5sFqQ",
+};
+const LD_JWT_CANARY = `eyJ${LD_CANARIES.jwtHeader}.${LD_CANARIES.jwtPayload}.${LD_CANARIES.jwtSignature}`;
+
+const LD_HTML_ERROR_BODY = `<html><body><h1>502 Bad Gateway</h1><p>upstream sent Authorization: Bearer ${LD_CANARIES.bearer}; Set-Cookie: session=${LD_CANARIES.cookie}; api_key=${LD_CANARIES.apiKey}; retry at https://api.example.com/v1/x?token=${LD_CANARIES.urlToken} later; jwt ${LD_JWT_CANARY}</p></body></html>`;
+
+/** A proxy error page: non-JSON, carrying every credential class in its body. */
+function ldHtmlGateway() {
+  return () => new Response(LD_HTML_ERROR_BODY, { status: 502, statusText: "Bad Gateway", headers: { "content-type": "text/html; charset=utf-8" } });
+}
+
+/** LaunchDarkly's documented JSON error shape whose message embeds a URL with a credential in its query string. */
+function ldJsonForbiddenWithUrl() {
+  return () => jsonResponse({ code: "forbidden", message: `Forbidden; see https://api.example.com/v1/x?token=${LD_CANARIES.urlToken} for details` }, { status: 403, statusText: "Forbidden" });
+}
+
+/** A JSON 401 whose long message places the configured token across the 300-character cut of the quoted message. */
+function ldJsonUnauthorizedWithSplitToken() {
+  const padding = "The request was rejected by the account policy engine. ".repeat(5);
+  return () => jsonResponse({ code: "unauthorized", message: `${padding.slice(0, 288)}${TEST_TOKEN} is not an active token` }, { status: 401, statusText: "Unauthorized" });
+}
+
+function ldNotFound() {
+  return () => jsonResponse({ code: "not_found", message: "Not Found" }, { status: 404, statusText: "Not Found" });
+}
+
+/** The all-readable data the router serves: the same records healthyClient() returns, as plain data keyed by scope. */
+function ldFixture() {
+  const production = { key: "production", name: "Production", critical: true, secureMode: true, defaultTtl: 5, confirmChanges: true, requireComments: true, approvalSettings: { required: true, bypassApprovalsForPendingChanges: false, canReviewOwnRequest: false, minNumApprovals: 1 }, apiKey: "****abcd" };
+  const staging = { key: "staging", name: "Staging", critical: false, secureMode: false, defaultTtl: 0 };
+  return {
+    identity: { accountId: "acct-123", memberId: "m1", tokenId: "tok-1", tokenName: "grc-audit", serviceToken: false },
+    members: [
+      { _id: "m1", email: "owner@example.com", role: "owner", mfa: "enabled", mfaEnforced: true, teams: [{ key: "platform" }], _integrationMetadata: { externalId: "idp-1" } },
+      { _id: "m2", email: "dev@example.com", role: "writer", mfa: "enabled", teams: [{ key: "platform" }] },
+      { _id: "m3", email: "invitee@example.com", role: "reader", mfa: "disabled", _pendingInvite: true, teams: [] },
+    ],
+    teams: [{ key: "platform", name: "Platform" }],
+    teamRoles: { platform: [{ key: "release-manager", name: "Release manager" }] },
+    customRoles: [{ key: "release-manager", basePermissions: "no_access", policy: [
+      { effect: "allow", actions: ["updateOn", "updateRules"], resources: ["proj/*:env/production:flag/*"] },
+      { effect: "deny", actions: ["updateOn"], resources: ["proj/*:env/*;{critical:true}:flag/*"] },
+    ] }],
+    projects: [{ key: "web", name: "Web App", tags: [] }],
+    environments: { web: [production, staging] },
+    sdkKeys: { "web/production": [{ key: "sdk-current", kind: "sdk", _createdAt: RECENT_MS, isDefault: true, value: "****wxyz" }], "web/staging": [{ key: "sdk-staging", kind: "sdk", _createdAt: RECENT_MS, isDefault: true, value: "****stag" }] },
+    flags: { web: [
+      { key: "checkout-v2", creationDate: OLD_MS, environments: { production: { targets: [], contextTargets: [], prerequisites: [{ key: "payments-enabled", variation: 0 }] } } },
+      { key: "payments-enabled", creationDate: OLD_MS, environments: { production: { targets: [], contextTargets: [], prerequisites: [] } } },
+    ] },
+    flagStatuses: { "web/production": [
+      { name: "active", lastRequested: RECENT, _links: { parent: { href: "/api/v2/flags/web/checkout-v2" } } },
+      { name: "launched", lastRequested: RECENT, _links: { parent: { href: "/api/v2/flags/web/payments-enabled" } } },
+    ] },
+    auditLog: {
+      recent: [{ date: RECENT_MS, kind: "flag", accesses: [{ action: "updateOn", resource: "proj/web:env/production:flag/checkout-v2" }] }],
+      retention: [{ date: OLD_MS, kind: "flag", accesses: [{ action: "updateOn", resource: "proj/web:env/production:flag/x" }] }],
+      members: [{ date: RECENT_MS, kind: "member", accesses: [{ action: "createMember", resource: "member/m2" }] }],
+      roles: [{ date: RECENT_MS, kind: "role", accesses: [{ action: "updatePolicy", resource: "role/release-manager" }] }],
+      account: [{ date: RECENT_MS, kind: "account", title: "Require SSO enabled", accesses: [{ action: "updateSamlRequireSso", resource: "acct" }] }],
+    },
+    tokens: [
+      { _id: "tok-1", name: "grc-audit", role: "admin", serviceToken: false, memberId: "m1", expiry: FUTURE_MS, lastUsed: RECENT_MS, creationDate: RECENT_MS },
+      { _id: "t1", name: "ci-service", token: "api-xxxxxxxx-1234", role: "reader", serviceToken: true, expiry: FUTURE_MS, lastUsed: RECENT_MS, creationDate: OLD_MS, customRoleIds: ["release-manager"] },
+      { _id: "t2", name: "dev-personal", role: "writer", serviceToken: false, memberId: "m2", expiry: FUTURE_MS, lastUsed: RECENT_MS, creationDate: RECENT_MS },
+    ],
+    webhooks: [{ _id: "wh-1", name: "ci-hook", url: "https://hooks.example.com/ld", secret: "[REDACTED]", on: true }],
+    integrations: { datadog: [{ _id: "sub-1", name: "datadog-prod", on: true, statements: [{ effect: "allow", actions: ["updateOn", "updateRules"], resources: ["proj/web:env/production:flag/*"] }] }] },
+    relayConfigs: [{ _id: "relay-1", name: "edge-relay", lastModified: RECENT_MS, creationDate: OLD_MS, policy: [{ effect: "allow", actions: ["*"], resources: ["proj/web:env/production"] }] }],
+  };
+}
+
+/** One page of a LaunchDarkly collection: items, totalCount, and a _links.next href while more remain. */
+function ldPage(items, url) {
+  const limit = Number(url.searchParams.get("limit") ?? "20");
+  const offset = Number(url.searchParams.get("offset") ?? "0");
+  const page = items.slice(offset, offset + limit);
+  const links = { self: { href: `${url.pathname}${url.search}` } };
+  if (offset + page.length < items.length) {
+    const next = new URLSearchParams(url.searchParams);
+    next.set("offset", String(offset + page.length));
+    links.next = { href: `${url.pathname}?${next}` };
+  }
+  return jsonResponse({ items: page, totalCount: items.length, _links: links });
+}
+
+const LD_ROUTE_TEMPLATES = [
+  ["GET /api/v2/caller-identity", /^\/api\/v2\/caller-identity$/],
+  ["GET /api/v2/members", /^\/api\/v2\/members$/],
+  ["GET /api/v2/teams", /^\/api\/v2\/teams$/],
+  ["GET /api/v2/teams/{team}/roles", /^\/api\/v2\/teams\/([^/]+)\/roles$/],
+  ["GET /api/v2/roles", /^\/api\/v2\/roles$/],
+  ["GET /api/v2/projects", /^\/api\/v2\/projects$/],
+  ["GET /api/v2/projects/{project}/environments", /^\/api\/v2\/projects\/([^/]+)\/environments$/],
+  ["GET /api/v2/projects/{project}/environments/{environment}/sdk-keys", /^\/api\/v2\/projects\/([^/]+)\/environments\/([^/]+)\/sdk-keys$/],
+  ["GET /api/v2/flags/{project}", /^\/api\/v2\/flags\/([^/]+)$/],
+  ["GET /api/v2/flag-statuses/{project}/{environment}", /^\/api\/v2\/flag-statuses\/([^/]+)\/([^/]+)$/],
+  ["GET /api/v2/auditlog", /^\/api\/v2\/auditlog$/],
+  ["GET /api/v2/tokens", /^\/api\/v2\/tokens$/],
+  ["GET /api/v2/webhooks", /^\/api\/v2\/webhooks$/],
+  ["GET /api/v2/integrations/{integration}", /^\/api\/v2\/integrations\/([^/]+)$/],
+  ["GET /api/v2/account/relay-auto-configs", /^\/api\/v2\/account\/relay-auto-configs$/],
+];
+
+/** One handler per LaunchDarkly surface; handlers receive the URL and the decoded path parameters. */
+function ldRoutes(fixture) {
+  return {
+    "GET /api/v2/caller-identity": () => jsonResponse(fixture.identity),
+    "GET /api/v2/members": (url) => ldPage(fixture.members, url),
+    "GET /api/v2/teams": (url) => ldPage(fixture.teams, url),
+    "GET /api/v2/teams/{team}/roles": (url, [team]) => ldPage(fixture.teamRoles[team] ?? [], url),
+    "GET /api/v2/roles": (url) => ldPage(fixture.customRoles, url),
+    "GET /api/v2/projects": (url) => {
+      const filter = url.searchParams.get("filter");
+      const keys = filter?.startsWith("keys:") ? new Set(filter.slice(5).split("|")) : null;
+      return ldPage(fixture.projects.filter((project) => keys === null || keys.has(project.key)), url);
+    },
+    "GET /api/v2/projects/{project}/environments": (url, [project]) => ldPage(fixture.environments[project] ?? [], url),
+    "GET /api/v2/projects/{project}/environments/{environment}/sdk-keys": (url, [project, environment]) => ldPage(fixture.sdkKeys[`${project}/${environment}`] ?? [], url),
+    "GET /api/v2/flags/{project}": (url, [project]) => ldPage(fixture.flags[project] ?? [], url),
+    "GET /api/v2/flag-statuses/{project}/{environment}": (url, [project, environment]) => jsonResponse({ items: fixture.flagStatuses[`${project}/${environment}`] ?? [] }),
+    "GET /api/v2/auditlog": (url) => {
+      const spec = url.searchParams.get("spec");
+      const entries = url.searchParams.has("before")
+        ? fixture.auditLog.retention
+        : spec === "member/*" ? fixture.auditLog.members : spec === "role/*" ? fixture.auditLog.roles : spec === "acct" ? fixture.auditLog.account : fixture.auditLog.recent;
+      return ldPage(entries, url);
+    },
+    "GET /api/v2/tokens": (url) => ldPage(fixture.tokens, url),
+    "GET /api/v2/webhooks": () => jsonResponse({ items: fixture.webhooks, totalCount: fixture.webhooks.length }),
+    "GET /api/v2/integrations/{integration}": (url, [integration]) => jsonResponse({ items: fixture.integrations[integration] ?? [] }),
+    "GET /api/v2/account/relay-auto-configs": () => jsonResponse({ items: fixture.relayConfigs, totalCount: fixture.relayConfigs.length }),
+  };
+}
+
+/** The real LaunchdarklyApiClient over a fetch router that records the method, path, URL, and status of every request served. */
+function httpLaunchdarkly(fixture, options = {}) {
+  const routes = { ...ldRoutes(fixture), ...(options.routes ?? {}) };
+  const log = [];
+  const fetchImpl = async (input, init = {}) => {
+    const url = new URL(typeof input === "string" ? input : input.url);
+    const method = (init.method ?? "GET").toUpperCase();
+    let response;
+    const template = LD_ROUTE_TEMPLATES.find(([, pattern]) => pattern.test(url.pathname));
+    if (template) {
+      const params = [...url.pathname.match(template[1])].slice(1).map(decodeURIComponent);
+      response = await routes[template[0]](url, params, init);
+    } else {
+      response = jsonResponse({ code: "not_found", message: "Not Found" }, { status: 404, statusText: "Not Found" });
+    }
+    log.push({ method, path: url.pathname, url: url.toString(), host: url.host, status: response.status, authorization: headerValue(init.headers, "authorization") });
+    return response;
+  };
+  const config = sampleConfig(options.config ?? {});
+  const client = new LaunchdarklyApiClient(config, { fetchImpl, sleep: async () => {}, maxRetries: 0 });
+  return { client, config, log, routes, fetchImpl };
+}
+
+/** Runs a registered LaunchDarkly tool against the router by standing in for global fetch for the duration of the call. */
+async function runLaunchdarklyTool(toolName, fetchImpl, args) {
+  const registered = [];
+  registerLaunchdarklyTools({ registerTool: (tool) => registered.push(tool) });
+  const tool = registered.find((candidate) => candidate.name === toolName);
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = fetchImpl;
+  try {
+    return await tool.execute(`call-${toolName}`, tool.prepareArguments(args));
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+}
+
+const LD_AREAS = [
+  ["identity", assessLaunchdarklyIdentity],
+  ["access_control", assessLaunchdarklyAccessControl],
+  ["environment_governance", assessLaunchdarklyEnvironmentGovernance],
+  ["flag_hygiene", assessLaunchdarklyFlagHygiene],
+  ["monitoring_integrations", assessLaunchdarklyMonitoringIntegrations],
+];
+
+/** What the five assess tools return, assessed with the default options. */
+async function runAllLaunchdarklyAssessments(client) {
+  const results = [];
+  for (const [, assess] of LD_AREAS) results.push(await assess(client, { now: NOW }));
+  return results;
+}
+
+/** Request labels the way the run writes them: method, path, and the query without the pagination parameters. */
+function ldRequestLabel(entry) {
+  const url = new URL(entry.url);
+  url.searchParams.delete("limit");
+  url.searchParams.delete("offset");
+  const query = url.searchParams.toString();
+  return `${entry.method} ${url.pathname}${query.length > 0 ? `?${query}` : ""}`;
+}
+
+function ldMentionedEndpoints(text) {
+  return [...text.matchAll(/\b(GET|POST|PUT|PATCH|DELETE)\s+(\/api\/v2\/[A-Za-z0-9_.\/?=&%*{}|-]+)/g)]
+    .map((match) => `${match[1]} ${match[2].replace(/[.,;:)]+$/, "")}`);
+}
+
+function ldMentionedStatusCodes(text) {
+  const codes = new Set();
+  for (const match of text.matchAll(/\b([1-5]\d\d) (?:OK|Forbidden|Unauthorized|Bad Request|Not Found|Too Many Requests|Internal Server Error|Bad Gateway|Service Unavailable|Gateway Timeout|Error)\b/g)) codes.add(Number(match[1]));
+  for (const match of text.matchAll(/request failed \(([1-5]\d\d)\b/g)) codes.add(Number(match[1]));
+  for (const match of text.matchAll(/"(?:http_)?status":\s*([1-5]\d\d)\b/g)) codes.add(Number(match[1]));
+  for (const match of text.matchAll(/\bHTTP ([1-5]\d\d)\b/g)) codes.add(Number(match[1]));
+  return [...codes];
+}
+
+/** Asserts every request label and status code named anywhere in `outputs` was requested and observed according to `log`. */
+function assertLdOutputMatchesRequestLog(outputs, log, label) {
+  const requested = new Set(log.map(ldRequestLabel));
+  const statuses = new Set(log.map((entry) => entry.status));
+  let endpointMentions = 0;
+  let statusMentions = 0;
+  for (const [name, text] of outputs) {
+    for (const endpoint of ldMentionedEndpoints(text)) {
+      endpointMentions += 1;
+      assert.ok(requested.has(endpoint), `${label}: ${name} names ${endpoint} but the run never requested it; requested: ${[...requested].sort().join(", ")}`);
+    }
+    for (const code of ldMentionedStatusCodes(text)) {
+      statusMentions += 1;
+      assert.ok(statuses.has(code), `${label}: ${name} names HTTP ${code} but no request observed it; observed: ${[...statuses]}`);
+    }
+  }
+  return { endpointMentions, statusMentions };
+}
+
+function ldLeafEntries(value, path = "", output = []) {
+  if (Array.isArray(value)) {
+    if (value.length === 0) output.push([path, "[]"]);
+    value.forEach((entry, index) => ldLeafEntries(entry, path ? `${path}.${index}` : String(index), output));
+  } else if (value !== null && typeof value === "object") {
+    const keys = Object.keys(value);
+    if (keys.length === 0) output.push([path, "{}"]);
+    for (const key of keys) ldLeafEntries(value[key], path ? `${path}.${key}` : key, output);
+  } else {
+    output.push([path, value]);
+  }
+  return output;
+}
+
+function ldPluck(value, path) {
+  return path.split(".").reduce((cursor, key) => (cursor === null || cursor === undefined ? undefined : cursor[key]), value);
+}
+
+/** Every string a LaunchDarkly run records: access check errors and notes, assessment errors, finding text, evidence strings, and the errors log. */
+function ldRecordedStrings(access, assessments, files) {
+  const strings = [];
+  for (const surface of access.surfaces) if (typeof surface.error === "string") strings.push(surface.error);
+  strings.push(...access.notes);
+  for (const assessment of assessments) {
+    strings.push(...(assessment.errors ?? []));
+    for (const finding of assessment.findings) {
+      strings.push(finding.summary);
+      for (const [, value] of ldLeafEntries(finding.evidence ?? {})) if (typeof value === "string") strings.push(value);
+    }
+  }
+  const errorsLog = files.get("_errors.log");
+  if (errorsLog) strings.push(...errorsLog.split("\n"));
+  return strings;
+}
+
+test("canary fixture self-check: every planted LaunchDarkly credential is alphanumeric, random-looking, and shares no 6-character window with the fixture's legitimate values", async () => {
+  const { client, config } = httpLaunchdarkly(ldFixture());
+  const access = await checkLaunchdarklyAccess(client);
+  const assessments = await runAllLaunchdarklyAssessments(client);
+  const exported = await exportLaunchdarklyAuditBundle(client, config, createTempBase("grclanker-ld-self-check-"), { now: NOW });
+  const legitimate = new Map([
+    ...readBundleFiles(exported.outputDir),
+    ["fixture", JSON.stringify(ldFixture())],
+    ["principal fixture", JSON.stringify(ldPrincipalFixture())],
+    ["check_access", JSON.stringify(access)],
+    ["assessments", JSON.stringify(assessments)],
+    ["config", JSON.stringify({ ...config, token: null })],
+  ]);
+  assertCanaryFixture(assert, [...Object.values(LD_CANARIES), TEST_TOKEN, ...Object.values(LD_CONFIG_CANARIES), LD_PARSER_SNIPPET_CANARY], legitimate, "LaunchDarkly canaries");
+});
+
+test("verdict rule 9 / addendum 2: the LaunchDarkly bundle, its zip, every assess payload, and the access check never carry any window of a canary from an error body, and errors carry the status-and-length note", async () => {
+  const { client, config, log } = httpLaunchdarkly(ldFixture(), {
+    routes: {
+      "GET /api/v2/teams": ldHtmlGateway(),
+      "GET /api/v2/roles": ldJsonForbiddenWithUrl(),
+      "GET /api/v2/webhooks": ldJsonUnauthorizedWithSplitToken(),
+    },
+  });
+
+  const access = await checkLaunchdarklyAccess(client);
+  const result = await exportLaunchdarklyAuditBundle(client, config, createTempBase("grclanker-ld-canary-"), { now: NOW });
+  const assessments = await runAllLaunchdarklyAssessments(client);
+
+  const files = readBundleFiles(result.outputDir);
+  const entries = readZipEntries(result.zipPath);
+  assert.ok(files.size >= 30 && entries.size === files.size, `expected the zip to mirror ${files.size} files, got ${entries.size}`);
+  const planted = [...Object.values(LD_CANARIES), LD_JWT_CANARY, config.token];
+  assertCanaryWindowsAbsent(assert, files, planted, "bundle file");
+  assertCanaryWindowsAbsent(assert, entries, planted, "zip entry");
+  assertCanaryWindowsAbsent(assert, new Map([["check_access", JSON.stringify(access)], ["assessments", JSON.stringify(assessments)]]), planted, "tool payload");
+  assert.ok(log.some((entry) => entry.status === 502) && log.some((entry) => entry.status === 403) && log.some((entry) => entry.status === 401), "the three failing surfaces were requested");
+
+  // The non-JSON body is described by status and length; the JSON error is quoted with its URL query scrubbed; the token
+  // that straddled the 300-character cut of the quoted message is redacted before the cut, so no fragment survives.
+  const errors = files.get("_errors.log");
+  assert.match(errors, /^identity: teams: LaunchDarkly request failed \(502 Bad Gateway\) for GET \/api\/v2\/teams\?expand=members: 502 Bad Gateway: non-JSON body \(text\/html, \d+ bytes, not echoed\)$/m);
+  assert.match(errors, /^access_control: custom_roles: LaunchDarkly request failed \(403 Forbidden\) for GET \/api\/v2\/roles: forbidden: Forbidden; see https:\/\/api\.example\.com\/v1\/x\?\[REDACTED\] for details$/m);
+  assert.match(errors, /^monitoring_integrations: webhooks: LaunchDarkly request failed \(401 Unauthorized\) for GET \/api\/v2\/webhooks: unauthorized: The request was rejected by the account policy engine\. .*\[REDACTED\]/m);
+  assert.doesNotMatch(errors, /<html|upstream sent|Set-Cookie/);
+
+  // The observed status flows into the marker, the finding, the access surface, and the collection status; no "403" is
+  // invented for the 502 path and no endpoint is named from a constant.
+  const teams = JSON.parse(files.get("core_data/teams.json"));
+  assert.deepEqual(
+    { collected: teams.collected, status: teams.status, endpoint: teams.endpoint, reason: teams.reason, items: teams.items, seen: teams.seen, truncated: teams.truncated },
+    { collected: false, status: 502, endpoint: "GET /api/v2/teams?expand=members", reason: "not_readable", items: null, seen: null, truncated: null },
+  );
+  assert.match(teams.error, /non-JSON body \(text\/html/);
+  const roles = JSON.parse(files.get("core_data/custom_roles.json"));
+  assert.deepEqual({ collected: roles.collected, status: roles.status, endpoint: roles.endpoint }, { collected: false, status: 403, endpoint: "GET /api/v2/roles" });
+  const teamRoles = JSON.parse(files.get("core_data/team_roles.json"));
+  assert.deepEqual({ collected: teamRoles.collected, status: teamRoles.status, reason: teamRoles.reason, endpoint: teamRoles.endpoint }, { collected: false, status: "not-collected", reason: "not_requested", endpoint: null }, "no per-team role listing is requested when the team listing failed");
+
+  const identity = assessments[0];
+  const teamsFinding = finding(identity, "LD-06");
+  assert.equal(teamsFinding.status, "manual");
+  assert.match(teamsFinding.summary, /Unreadable inventory: teams \(GET \/api\/v2\/teams\?expand=members: LaunchDarkly request failed \(502 Bad Gateway\) for GET \/api\/v2\/teams\?expand=members: 502 Bad Gateway: non-JSON body/);
+  assert.doesNotMatch(teamsFinding.summary, /403/);
+  assert.equal(teamsFinding.evidence.unreadable_inventories[0].http_status, 502);
+  const wildcard = finding(assessments[1], "LD-04");
+  assert.equal(wildcard.status, "manual");
+  assert.match(wildcard.summary, /Unreadable inventory: custom_roles \(GET \/api\/v2\/roles: LaunchDarkly request failed \(403 Forbidden\).*\[REDACTED\]/);
+
+  const teamsProbe = access.surfaces.find((surface) => surface.name === "teams");
+  assert.deepEqual(
+    { status: teamsProbe.status, collected: teamsProbe.collected, http_status: teamsProbe.http_status, count: teamsProbe.count, endpoint: teamsProbe.endpoint },
+    { status: "not_readable", collected: false, http_status: 502, count: null, endpoint: "GET /api/v2/teams?expand=members" },
+  );
+  assert.match(teamsProbe.error, /502 Bad Gateway: non-JSON body \(text\/html, \d+ bytes, not echoed\)/);
+  const webhooksProbe = access.surfaces.find((surface) => surface.name === "webhooks");
+  assert.deepEqual({ status: webhooksProbe.status, http_status: webhooksProbe.http_status }, { status: "not_readable", http_status: 401 });
+
+  const status = JSON.parse(files.get("core_data/collection_status.json"));
+  const teamsRow = status.inventories.find((row) => row.inventory === "teams");
+  assert.deepEqual(
+    { status: teamsRow.status, collected: teamsRow.collected, http_status: teamsRow.http_status, complete: teamsRow.complete, truncated: teamsRow.truncated, seen: teamsRow.seen, total: teamsRow.total, endpoint: teamsRow.endpoint },
+    { status: "not_readable", collected: false, http_status: 502, complete: null, truncated: null, seen: null, total: null, endpoint: "GET /api/v2/teams?expand=members" },
+  );
+  const teamRolesRow = status.inventories.find((row) => row.inventory === "team_roles");
+  assert.deepEqual({ status: teamRolesRow.status, collected: teamRolesRow.collected, http_status: teamRolesRow.http_status, complete: teamRolesRow.complete, truncated: teamRolesRow.truncated }, { status: "not_requested", collected: false, http_status: null, complete: null, truncated: null });
+  assert.equal(status.totals.not_readable, 3);
+  assert.equal(status.totals.not_requested, 1);
+  assert.equal(status.totals.truncation_unknown, 4);
+  assert.equal(identity.summary.teams, null, "an unread inventory renders null, never 0");
+  assert.equal(identity.summary.orphaned_members, null);
+  assert.equal(assessments[1].summary.custom_roles, null);
+  assert.equal(assessments[1].summary.wildcard_roles, null);
+});
+
+test("addendum 5: every request label and status code named in LaunchDarkly output corresponds to a request the run made and observed", async () => {
+  const fixture = ldFixture();
+  const base = ldRoutes(fixture);
+  const { client, config, log, fetchImpl } = httpLaunchdarkly(fixture, {
+    routes: {
+      "GET /api/v2/teams": ldHtmlGateway(),
+      "GET /api/v2/roles": ldJsonForbiddenWithUrl(),
+      "GET /api/v2/account/relay-auto-configs": ldNotFound(),
+      // Only the staging SDK key read is denied; the production read succeeds.
+      "GET /api/v2/projects/{project}/environments/{environment}/sdk-keys": (url, params, init) => (params[1] === "staging" ? ldJsonForbiddenWithUrl()() : base["GET /api/v2/projects/{project}/environments/{environment}/sdk-keys"](url, params, init)),
+    },
+  });
+
+  const access = await checkLaunchdarklyAccess(client);
+  const result = await exportLaunchdarklyAuditBundle(client, config, createTempBase("grclanker-ld-request-log-"), { now: NOW });
+  const assessments = await runAllLaunchdarklyAssessments(client);
+  // The human-readable access check table (Request and Note columns) is produced through the registered tool.
+  const accessTool = await runLaunchdarklyTool("launchdarkly_check_access", fetchImpl, { token: TEST_TOKEN, allowed_domains: ["example.com"] });
+  assert.notEqual(accessTool.isError, true, accessTool.content[0].text);
+  const outputs = [...readBundleFiles(result.outputDir), ["check_access", JSON.stringify(access)], ["check_access_text", accessTool.content[0].text], ["assessments", JSON.stringify(assessments)]];
+
+  assert.deepEqual([...new Set(log.map((entry) => entry.status))].sort(), [200, 403, 404, 502], "the fixture served 200, 403, 404, and 502");
+  assert.ok(log.some((entry) => entry.path === "/api/v2/projects/web/environments/staging/sdk-keys" && entry.status === 403), "the per-environment SDK key request was made and denied");
+  const { endpointMentions, statusMentions } = assertLdOutputMatchesRequestLog(outputs, log, "mixed denials");
+  assert.ok(endpointMentions > 60, `expected request labels across the bundle, got ${endpointMentions}`);
+  assert.ok(statusMentions > 8, `expected status mentions across the bundle, got ${statusMentions}`);
+  assert.ok(!JSON.stringify(outputs).includes("{project}") && !JSON.stringify(outputs).includes("{environment}"), "no templated endpoint reaches the output");
+
+  // The per-environment gap names the request the run made and the status it observed, beside the environment that did load.
+  const governance = assessments[2];
+  const rotation = finding(governance, "LD-19");
+  assert.notEqual(rotation.status, "pass");
+  assert.match(rotation.summary, /Unreadable inventory: sdk_keys for environment web\/staging \(GET \/api\/v2\/projects\/web\/environments\/staging\/sdk-keys: LaunchDarkly request failed \(403 Forbidden\) for GET \/api\/v2\/projects\/web\/environments\/staging\/sdk-keys: forbidden: Forbidden; see https:\/\/api\.example\.com\/v1\/x\?\[REDACTED\] for details\)/);
+  const sdkKeys = JSON.parse(readFileSync(join(result.outputDir, "core_data", "sdk_keys.json"), "utf8"));
+  const failed = sdkKeys.find((entry) => entry.collected === false);
+  assert.deepEqual({ environment: failed.environment, status: failed.status, endpoint: failed.endpoint, reason: failed.reason, items: failed.items }, { environment: "web/staging", status: 403, endpoint: "GET /api/v2/projects/web/environments/staging/sdk-keys", reason: "not_readable", items: null });
+  assert.equal(sdkKeys.filter((entry) => entry.collected === true).length, 1, "the production key listing keeps its records");
+  const relays = JSON.parse(readFileSync(join(result.outputDir, "core_data", "relay_proxy_configs.json"), "utf8"));
+  assert.deepEqual({ collected: relays.collected, status: relays.status, endpoint: relays.endpoint }, { collected: false, status: 404, endpoint: "GET /api/v2/account/relay-auto-configs" });
+  const relayFinding = finding(assessments[4], "LD-18");
+  assert.match(relayFinding.summary, /relay_proxy_configs \(GET \/api\/v2\/account\/relay-auto-configs: LaunchDarkly request failed \(404 Not Found\)/);
+  assert.doesNotMatch(relayFinding.summary, /403/);
+});
+
+/** Every list dataset written to core_data, the route (and, for the audit log, the query) that fills it, and its file. */
+const LD_CORE_DATA_DATASETS = [
+  { inventory: "members", route: "GET /api/v2/members", file: "core_data/members.json" },
+  { inventory: "teams", route: "GET /api/v2/teams", file: "core_data/teams.json" },
+  { inventory: "team_roles", route: "GET /api/v2/teams/{team}/roles", file: "core_data/team_roles.json", scoped: true },
+  { inventory: "audit_log_account", route: "GET /api/v2/auditlog", file: "core_data/audit_log_account.json", query: (url) => url.searchParams.get("spec") === "acct" },
+  { inventory: "custom_roles", route: "GET /api/v2/roles", file: "core_data/custom_roles.json" },
+  { inventory: "access_tokens", route: "GET /api/v2/tokens", file: "core_data/access_tokens.json" },
+  { inventory: "projects", route: "GET /api/v2/projects", file: "core_data/projects.json" },
+  { inventory: "environments", route: "GET /api/v2/projects/{project}/environments", file: "core_data/environments.json", scoped: true },
+  { inventory: "sdk_keys", route: "GET /api/v2/projects/{project}/environments/{environment}/sdk-keys", file: "core_data/sdk_keys.json", scoped: true },
+  { inventory: "flags", route: "GET /api/v2/flags/{project}", file: "core_data/flags.json", scoped: true },
+  { inventory: "flag_statuses", route: "GET /api/v2/flag-statuses/{project}/{environment}", file: "core_data/flag_statuses.json", scoped: true },
+  { inventory: "audit_log_recent", route: "GET /api/v2/auditlog", file: "core_data/audit_log_recent.json", query: (url) => !url.searchParams.has("spec") && !url.searchParams.has("before") },
+  { inventory: "audit_log_retention_probe", route: "GET /api/v2/auditlog", file: "core_data/audit_log_retention_probe.json", query: (url) => url.searchParams.has("before") },
+  { inventory: "audit_log_members", route: "GET /api/v2/auditlog", file: "core_data/audit_log_members.json", query: (url) => url.searchParams.get("spec") === "member/*" },
+  { inventory: "audit_log_roles", route: "GET /api/v2/auditlog", file: "core_data/audit_log_roles.json", query: (url) => url.searchParams.get("spec") === "role/*" },
+  { inventory: "relay_proxy_configs", route: "GET /api/v2/account/relay-auto-configs", file: "core_data/relay_proxy_configs.json" },
+  { inventory: "integration_subscriptions", route: "GET /api/v2/integrations/{integration}", file: "core_data/integration_subscriptions.json", scoped: true },
+  { inventory: "webhooks", route: "GET /api/v2/webhooks", file: "core_data/webhooks.json" },
+];
+
+/** Denies one dataset; audit log datasets share a route and are told apart by their query. */
+function ldDenyDataset(base, denial) {
+  const forbidden = ldJsonForbiddenWithUrl();
+  if (denial.query === undefined) return forbidden;
+  return (url, params, init) => (denial.query(url) ? forbidden() : base[denial.route](url, params, init));
+}
+
+/** The healthy fixture with the webhook and Relay Proxy listings legitimately empty, so a readable-but-empty read sits beside every denial. */
+function ldSparseFixture() {
+  return { ...ldFixture(), webhooks: [], relayConfigs: [] };
+}
+
+test("addendum 5: under each single-inventory denial the denied LaunchDarkly dataset's core_data file is a not-collected marker while readable-but-empty datasets keep items []", async () => {
+  for (const denial of LD_CORE_DATA_DATASETS) {
+    const fixture = ldSparseFixture();
+    const { client, config, log } = httpLaunchdarkly(fixture, { routes: { [denial.route]: ldDenyDataset(ldRoutes(fixture), denial) } });
+    const result = await exportLaunchdarklyAuditBundle(client, config, createTempBase("grclanker-ld-marker-"), { now: NOW });
+    const files = readBundleFiles(result.outputDir);
+    const label = `${denial.inventory} denied`;
+
+    const denied = JSON.parse(files.get(denial.file));
+    assert.ok(!Array.isArray(denied), `${label}: ${denial.file} must be a marker object, not an array`);
+    assert.equal(denied.collected, false, label);
+    assert.equal(denied.status, 403, `${label}: the marker carries the observed status`);
+    assert.equal(denied.reason, "not_readable", label);
+    assert.equal(denied.items, null, `${label}: a denied list carries items: null, never []`);
+    assert.deepEqual([denied.truncated, denied.seen, denied.total], [null, null, null], `${label}: no collection-status flag defaults on a read that never completed`);
+    assert.match(denied.error, /LaunchDarkly request failed \(403 Forbidden\)/, label);
+    assertCanaryWindowsAbsent(assert, JSON.stringify(denied), [LD_CANARIES.urlToken], `${label} marker`);
+    const deniedRequests = new Set(log.filter((entry) => entry.status === 403).map(ldRequestLabel));
+    for (const endpoint of denied.endpoint.split(", ")) {
+      assert.ok(deniedRequests.has(endpoint), `${label}: marker names ${endpoint}, which was not the denied request (${[...deniedRequests].join(", ")})`);
+    }
+    if (denial.scoped) {
+      // Several assessments may repeat the same scoped read; the marker carries one failed read per distinct request.
+      const deniedReads = deniedRequests.size;
+      assert.ok(Array.isArray(denied.failed_reads) && deniedReads > 0 && denied.failed_reads.length === deniedReads, `${label}: one failed read per scope (${deniedReads} denied requests, ${denied.failed_reads?.length} failed reads)`);
+      assert.ok(denied.failed_reads.every((read) => read.collected === false && read.status === 403 && deniedRequests.has(read.endpoint) && read.items === null), label);
+    }
+    if (denial.inventory === "teams") {
+      const teamRoles = JSON.parse(files.get("core_data/team_roles.json"));
+      assert.deepEqual({ collected: teamRoles.collected, status: teamRoles.status, endpoint: teamRoles.endpoint, reason: teamRoles.reason }, { collected: false, status: "not-collected", endpoint: null, reason: "not_requested" }, "no per-team role read is attempted when the team listing is denied");
+    }
+    if (denial.inventory === "projects") {
+      for (const file of ["core_data/environments.json", "core_data/sdk_keys.json", "core_data/flags.json", "core_data/flag_statuses.json"]) {
+        const dependent = JSON.parse(files.get(file));
+        assert.deepEqual({ collected: dependent.collected, status: dependent.status, endpoint: dependent.endpoint, reason: dependent.reason }, { collected: false, status: "not-collected", endpoint: null, reason: "not_requested" }, `${file}: nothing below a denied project listing is requested`);
+      }
+    }
+
+    const emptyFile = denial.inventory === "webhooks" ? "core_data/relay_proxy_configs.json" : "core_data/webhooks.json";
+    const empty = JSON.parse(files.get(emptyFile));
+    assert.deepEqual({ collected: empty.collected, items: empty.items, truncated: empty.truncated, seen: empty.seen }, { collected: true, items: [], truncated: false, seen: 0 }, `${label}: a readable-but-empty dataset keeps items []`);
+    const status = JSON.parse(files.get("core_data/collection_status.json"));
+    const row = status.inventories.find((entry) => entry.inventory === denial.inventory);
+    assert.deepEqual({ status: row.status, collected: row.collected, http_status: row.http_status, complete: row.complete, truncated: row.truncated, seen: row.seen, total: row.total }, { status: "not_readable", collected: false, http_status: 403, complete: null, truncated: null, seen: null, total: null }, label);
+    const emptyRow = status.inventories.find((entry) => entry.inventory === (denial.inventory === "webhooks" ? "relay_proxy_configs" : "webhooks"));
+    assert.deepEqual({ status: emptyRow.status, complete: emptyRow.complete, truncated: emptyRow.truncated, seen: emptyRow.seen }, { status: "readable", complete: true, truncated: false, seen: 0 }, `${label}: the empty inventory is a complete, untruncated read of zero records`);
+  }
+});
+
+/**
+ * Principals that only one inventory (or one combination of inventories) can name. Each is asserted present in the
+ * all-readable baseline and absent from every assess payload and derived bundle file when any listed inventory is denied.
+ */
+const LD_PRINCIPAL_CANARIES = [
+  { canary: "nomfa.canaryqz@example.com", inventories: ["members"] },
+  { canary: "canary-empty-team-zq", inventories: ["teams"] },
+  // The team is legitimately named by the readable team listing and by the gap that names its denied role request; what
+  // may not be claimed from the denied role listing is that it has no custom role.
+  { canary: "canary-empty-team-zq", inventories: ["team_roles"], field: "teams_without_custom_roles" },
+  { canary: "canary-wildcard-role-zq", inventories: ["custom_roles"] },
+  { canary: "canary-noexpiry-token-zq", inventories: ["access_tokens"] },
+  { canary: "canary-sandbox-project-zq", inventories: ["projects"] },
+  { canary: "canary-open-prod-zq", inventories: ["projects", "environments"] },
+  { canary: "CanaryStaleSdkKeyZq", inventories: ["projects", "environments", "sdk_keys"] },
+  { canary: "canary-targeted-flag-zq", inventories: ["projects", "environments", "flags"] },
+  { canary: "canary-stale-flag-zq", inventories: ["projects", "environments", "flags", "flag_statuses"] },
+  { canary: "canary-insecure-hook-zq", inventories: ["webhooks"] },
+  { canary: "canary-broad-relay-zq", inventories: ["relay_proxy_configs"] },
+  { canary: "canary-broad-subscription-zq", inventories: ["integration_subscriptions"] },
+  { canary: "CanaryRequireSsoChangeZq", inventories: ["audit_log_account"] },
+  { canary: "canaryaccountzq", inventories: ["caller_identity"] },
+];
+
+/** The healthy fixture with one principal per inventory that no other inventory carries. */
+function ldPrincipalFixture() {
+  const fixture = ldFixture();
+  fixture.identity = { ...fixture.identity, accountId: "canaryaccountzq" };
+  fixture.members.push({ _id: "m9", email: "nomfa.canaryqz@example.com", role: "writer", mfa: "disabled", teams: [{ key: "platform" }] });
+  fixture.teams.push({ key: "canary-empty-team-zq", name: "Canary Empty Team" });
+  fixture.teamRoles["canary-empty-team-zq"] = [];
+  fixture.customRoles.push({ key: "canary-wildcard-role-zq", basePermissions: "no_access", policy: [{ effect: "allow", actions: ["*"], resources: ["proj/*"] }] });
+  fixture.tokens.push({ _id: "t9", name: "canary-noexpiry-token-zq", role: "reader", serviceToken: true, lastUsed: RECENT_MS, creationDate: RECENT_MS });
+  fixture.projects.push({ key: "canary-sandbox-project-zq", name: "Canary Sandbox", tags: [] });
+  fixture.environments["canary-sandbox-project-zq"] = [];
+  fixture.environments.web.push({ key: "canary-open-prod-zq", name: "Canary Open Prod", critical: true, secureMode: false, defaultTtl: 0 });
+  fixture.sdkKeys["web/canary-open-prod-zq"] = [{ key: "sdk-open", name: "CanaryStaleSdkKeyZq", kind: "sdk", _createdAt: OLD_MS, isDefault: true, value: "****open" }];
+  fixture.flags.web.push(
+    { key: "canary-targeted-flag-zq", creationDate: OLD_MS, environments: { production: { targets: [{ values: ["user-1"], variation: 0 }], contextTargets: [], prerequisites: [] } } },
+    { key: "canary-stale-flag-zq", creationDate: OLD_MS, environments: { production: { targets: [], contextTargets: [], prerequisites: [] } } },
+  );
+  fixture.flagStatuses["web/production"].push(
+    { name: "active", lastRequested: RECENT, _links: { parent: { href: "/api/v2/flags/web/canary-targeted-flag-zq" } } },
+    { name: "inactive", lastRequested: OLD, _links: { parent: { href: "/api/v2/flags/web/canary-stale-flag-zq" } } },
+  );
+  fixture.webhooks.push({ _id: "wh-9", name: "canary-insecure-hook-zq", url: "http://hooks.example.com/legacy", on: true });
+  fixture.relayConfigs.push({ _id: "relay-9", name: "canary-broad-relay-zq", lastModified: RECENT_MS, creationDate: RECENT_MS, policy: [{ effect: "allow", actions: ["*"], resources: ["proj/*:env/*"] }] });
+  fixture.integrations.datadog.push({ _id: "sub-9", name: "canary-broad-subscription-zq", on: true, statements: [{ effect: "allow", actions: ["*"], resources: ["proj/*:env/*"] }] });
+  fixture.auditLog.account.push({ date: RECENT_MS, kind: "account", title: "CanaryRequireSsoChangeZq", accesses: [{ action: "updateSamlRequireSso", resource: "acct" }] });
+  return fixture;
+}
+
+const LD_SINGLE_INVENTORY_DENIALS = LD_CORE_DATA_DATASETS.concat([{ inventory: "caller_identity", route: "GET /api/v2/caller-identity", file: null }]);
+
+const LD_FALLBACK_VALUES = new Set([0, false, "none", "[]", "{}"]);
+
+/** Fields that describe the read itself (read-state flags, inventory states, gaps, caveats) and legitimately flip under a denial. */
+const LD_READ_STATE_PATHS = [
+  /(^|\.)[a-z_]*(complete|readable|observed|loaded|read|sampled|available|requested|collected)$/,
+  /^inventories(\.|$)/,
+  /^unreadable_inventories(\.|$)/,
+  /^truncated_collections(\.|$)/,
+  /^unreadable_(environments|projects)$/,
+  /^teams_with_unreadable_roles$/,
+  /^token_inventory_scope$/,
+  /^truncation_unknown$/,
+  /^(pass|warn|fail|manual)$/,
+];
+
+/** True when a denied-run value is a zero, false, or empty fallback where the all-readable baseline held real data. */
+function isLdFallback(path, value, baselineValue) {
+  if (!LD_FALLBACK_VALUES.has(value)) return false;
+  if (baselineValue === undefined || baselineValue === null || LD_FALLBACK_VALUES.has(baselineValue)) return false;
+  if (Array.isArray(baselineValue) && baselineValue.length === 0) return false;
+  if (typeof baselineValue === "object" && !Array.isArray(baselineValue) && Object.keys(baselineValue).length === 0) return false;
+  return !LD_READ_STATE_PATHS.some((pattern) => pattern.test(path));
+}
+
+test("addendum 3: under every single-inventory denial no LaunchDarkly finding, summary, or tool payload falls back to a zero, false, or empty value, and no principal is named from the denied inventory", async () => {
+  const baselineRun = httpLaunchdarkly(ldPrincipalFixture());
+  const baseline = await runAllLaunchdarklyAssessments(baselineRun.client);
+  const baselineExport = await exportLaunchdarklyAuditBundle(baselineRun.client, baselineRun.config, createTempBase("grclanker-ld-principal-baseline-"), { now: NOW });
+  const baselineFiles = readBundleFiles(baselineExport.outputDir);
+  const baselineText = JSON.stringify(baseline) + [...baselineFiles].filter(([name]) => !name.startsWith("core_data/")).map(([, text]) => text).join("\n");
+  for (const { canary } of LD_PRINCIPAL_CANARIES) {
+    assert.ok(baselineText.includes(canary), `${canary} must be named by an all-readable assess payload or derived bundle file for its gating check to mean anything`);
+  }
+
+  const offenders = [];
+  let comparedLeaves = 0;
+  for (const denial of LD_SINGLE_INVENTORY_DENIALS) {
+    const fixture = ldPrincipalFixture();
+    const { client, config } = httpLaunchdarkly(fixture, { routes: { [denial.route]: ldDenyDataset(ldRoutes(fixture), denial) } });
+    const denied = await runAllLaunchdarklyAssessments(client);
+    const exported = await exportLaunchdarklyAuditBundle(client, config, createTempBase("grclanker-ld-principal-"), { now: NOW });
+    const files = readBundleFiles(exported.outputDir);
+    const label = `${denial.inventory} denied`;
+    // Raw core_data records and the snapshots an assess payload carries are the readable inventories themselves; the gating
+    // rule covers what the run asserts about principals, so findings, summaries, errors, and the analysis, compliance,
+    // metadata, and quick-reference files are scanned.
+    const withoutSnapshots = (text) => {
+      const { snapshots: _snapshots, ...rest } = JSON.parse(text);
+      return JSON.stringify(rest);
+    };
+    const derived = [...files]
+      .filter(([name]) => !name.startsWith("core_data/"))
+      .map(([name, text]) => [name, /^analysis\/[a-z_]+\.json$/.test(name) && name !== "analysis/findings.json" ? withoutSnapshots(text) : text]);
+    const asserted = denied.map(({ snapshots: _snapshots, ...rest }) => rest);
+    const deniedText = JSON.stringify(asserted) + derived.map(([, text]) => text).join("\n");
+    for (const { canary, inventories, field } of LD_PRINCIPAL_CANARIES) {
+      if (!inventories.includes(denial.inventory)) continue;
+      if (field !== undefined) {
+        for (const item of denied.flatMap((result) => result.findings)) {
+          if (!(item.evidence && field in item.evidence)) continue;
+          assert.ok(!JSON.stringify(item.evidence[field]).includes(canary), `${label}: ${item.id} evidence.${field} still names ${canary} from the denied inventory: ${JSON.stringify(item.evidence[field])}`);
+        }
+        for (const result of denied) {
+          if (field in result.summary) assert.ok(!JSON.stringify(result.summary[field]).includes(canary), `${label}: ${result.category} summary.${field} still names ${canary}`);
+        }
+        continue;
+      }
+      const where = [
+        ...ldLeafEntries(asserted).filter(([, value]) => typeof value === "string" && value.includes(canary)).map(([path]) => `assessments.${path}`),
+        ...derived.filter(([, text]) => text.includes(canary)).map(([name]) => name),
+      ];
+      assert.ok(!deniedText.includes(canary), `${label}: ${canary} is still named from the denied inventory at ${where.join(", ")}`);
+    }
+    for (const [areaIndex, result] of denied.entries()) {
+      const baselineResult = baseline[areaIndex];
+      for (const [path, value] of ldLeafEntries(result.summary)) {
+        comparedLeaves += 1;
+        const baselineValue = ldPluck(baselineResult.summary, path);
+        if (isLdFallback(path, value, baselineValue)) offenders.push(`${label}: ${result.category} summary.${path} = ${JSON.stringify(value)} (baseline ${JSON.stringify(baselineValue)})`);
+      }
+      for (const item of result.findings) {
+        const baselineFinding = finding(baselineResult, item.id);
+        for (const [path, value] of ldLeafEntries(item.evidence ?? {})) {
+          comparedLeaves += 1;
+          const baselineValue = ldPluck(baselineFinding.evidence ?? {}, path);
+          if (isLdFallback(path, value, baselineValue)) offenders.push(`${label}: ${item.id} evidence.${path} = ${JSON.stringify(value)} (baseline ${JSON.stringify(baselineValue)})`);
+        }
+      }
+    }
+    // The bundle's assessment-level summaries get the same treatment as the tool payloads.
+    for (const [, area] of LD_AREAS.map(([category]) => [category, `analysis/${category}.json`])) {
+      if (!files.has(area)) continue;
+      const summary = JSON.parse(files.get(area)).summary ?? {};
+      const baselineSummary = JSON.parse(baselineFiles.get(area)).summary ?? {};
+      for (const [path, value] of ldLeafEntries(summary)) {
+        comparedLeaves += 1;
+        if (isLdFallback(path, value, ldPluck(baselineSummary, path))) offenders.push(`${label}: ${area} summary.${path} = ${JSON.stringify(value)}`);
+      }
+    }
+    if (denial.inventory === "caller_identity") {
+      const metadata = JSON.parse(files.get("metadata.json"));
+      assert.equal(metadata.account_id, null, "the account id is unknown when the caller identity was not readable");
+    }
+  }
+  assert.ok(comparedLeaves > 3000, `expected the sweep to compare thousands of leaves, got ${comparedLeaves}`);
+  assert.deepEqual(offenders, [], `values that fell back to zero, false, or empty under a denial:\n${offenders.join("\n")}`);
+});
+
+// ---------------------------------------------------------------------------------------------------------------
+// Addendum 4: every surface fails in turn with a 502 HTML page and a JSON error carrying canaries.
+// ---------------------------------------------------------------------------------------------------------------
+
+/** How each route template is named in an error string, so the strings about a failing surface can be picked out. */
+function ldSurfacePattern(template) {
+  const escaped = template.replace(/[/?]/g, (character) => `\\${character}`).replace(/\{[a-z]+\}/g, "[^/?:\\s]+");
+  return new RegExp(escaped);
+}
+
+test("addendum 4: a 502 HTML page or a JSON error message carrying credentials on any LaunchDarkly surface never reaches the access check, an assess payload, or the bundle, and every recorded error carries the status-and-length note", async () => {
+  const surfaces = Object.keys(ldRoutes(ldFixture()));
+  assert.equal(surfaces.length, 15, "every collector and access probe route");
+  const variants = [
+    { name: "html502", handler: ldHtmlGateway, note: /502 Bad Gateway: non-JSON body \(text\/html, \d+ bytes, not echoed\)/ },
+    { name: "json403", handler: ldJsonForbiddenWithUrl, note: /\(403 Forbidden\)/ },
+  ];
+  let notedSurfaces = 0;
+  for (const surface of surfaces) {
+    for (const variant of variants) {
+      const { client, config } = httpLaunchdarkly(ldFixture(), { routes: { [surface]: variant.handler() } });
+      const label = `${surface} ${variant.name}`;
+      const planted = [...Object.values(LD_CANARIES), LD_JWT_CANARY, config.token];
+
+      const access = await checkLaunchdarklyAccess(client);
+      const assessments = await runAllLaunchdarklyAssessments(client);
+      const result = await exportLaunchdarklyAuditBundle(client, config, createTempBase("grclanker-ld-surface-canary-"), { now: NOW });
+      const files = readBundleFiles(result.outputDir);
+      const entries = readZipEntries(result.zipPath);
+
+      assertCanaryWindowsAbsent(assert, files, planted, `${label} bundle file`);
+      assertCanaryWindowsAbsent(assert, entries, planted, `${label} zip entry`);
+      assertCanaryWindowsAbsent(assert, new Map([["check_access", JSON.stringify(access)], ["assessments", JSON.stringify(assessments)]]), planted, `${label} tool payload`);
+
+      const pattern = ldSurfacePattern(surface);
+      const aboutSurface = ldRecordedStrings(access, assessments, files).filter((text) => pattern.test(text) && /request failed|timed out/.test(text));
+      assert.ok(aboutSurface.length > 0, `${label}: the failure is recorded somewhere`);
+      notedSurfaces += 1;
+      for (const text of aboutSurface) {
+        assert.match(text, variant.note, `${label}: error string lacks the status note: ${text}`);
+        assert.ok(!/<html|Bad Gateway<\/|upstream sent/.test(text), `${label}: error string echoes the body: ${text}`);
+        if (variant.name === "json403") assert.ok(!text.includes("token=") || text.includes("?[REDACTED]"), `${label}: URL token survives in ${text}`);
+      }
+    }
+  }
+  assert.equal(notedSurfaces, surfaces.length * variants.length);
+});
+
+// ---------------------------------------------------------------------------------------------------------------
+// Addenda 6 and 6b: config loader errors are fixed text carrying only the path, a validated code, and a line.
+// ---------------------------------------------------------------------------------------------------------------
+
+const LD_CONFIG_CANARIES = {
+  tomlLine: "ZV8owUdYUiDGBtsFcAnAHaYCAnCEEK8g",
+  jsonValue: "BPt5mgDrRZ5YyLTHaQPepJUYQbGYRCjG",
+  unreadable: "tLeWcrtPjZyf6J7YmrvbbFCbduuypKkb",
+};
+const LD_PARSER_SNIPPET_CANARY = "nSRVHATViWUGzQZKaE9NdiBW4nUZeRsL";
+
+const LD_LIBRARY_WORDING = ["expected a comment", "Invalid TOML", "is not valid JSON", "Unexpected token", "illegal operation", "permission denied", "no such file"];
+
+/** Asserts a message carries neither any window of a canary nor the parser's or filesystem's own wording. */
+function assertLdFixedTextOnly(message, canaries, label) {
+  assertCanaryWindowsAbsent(assert, message, canaries, label);
+  for (const wording of LD_LIBRARY_WORDING) assert.ok(!message.includes(wording), `${label}: carries library wording "${wording}": ${message}`);
+}
+
+test("config loader errors: a LaunchDarkly config file that cannot be read or parsed yields fixed text with only the path, a validated code, and the parser's line, from the resolver and from check_access", async () => {
+  const registered = [];
+  registerLaunchdarklyTools({ registerTool: (tool) => registered.push(tool) });
+  const checkTool = registered.find((tool) => tool.name === "launchdarkly_check_access");
+  const exportTool = registered.find((tool) => tool.name === "launchdarkly_export_audit_bundle");
+  const canaries = Object.values(LD_CONFIG_CANARIES);
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = () => { throw new Error("no request may be made while the config file is unreadable"); };
+  try {
+    const base = createTempBase("grclanker-ld-config-errors-");
+    const cases = [];
+
+    // A YAML-style line in the TOML file: the in-house parser rejects the line by number and quotes nothing from it.
+    const yamlStyle = join(base, "yaml-style.toml");
+    writeFileSync(yamlStyle, `# LaunchDarkly\ntoken: Bearer ${LD_CONFIG_CANARIES.tomlLine}\n`, "utf8");
+    assert.throws(() => parseSimpleToml(readFileSync(yamlStyle, "utf8")), (error) => error.name === "LaunchdarklyTomlSyntaxError" && error.line === 2 && !error.message.includes(LD_CONFIG_CANARIES.tomlLine), "positive control: the parser rejects line 2 without quoting it");
+    cases.push({ name: "toml yaml-style line", path: yamlStyle, code: "INVALID_TOML", line: 2, message: `Unable to parse LaunchDarkly config file: invalid TOML in ${yamlStyle} at line 2` });
+
+    // A JSON document where TOML was expected: the first line has no key = value pair.
+    const jsonFile = join(base, "config.json.toml");
+    writeFileSync(jsonFile, `{"token":"${LD_CONFIG_CANARIES.jsonValue}"}`, "utf8");
+    assert.throws(() => JSON.parse(`{"token":${LD_CONFIG_CANARIES.jsonValue}}`), (error) => error instanceof SyntaxError && error.message.includes(LD_CONFIG_CANARIES.jsonValue.slice(0, 6)), "positive control: JSON.parse quotes the source window");
+    cases.push({ name: "json in toml", path: jsonFile, code: "INVALID_TOML", line: 1, message: `Unable to parse LaunchDarkly config file: invalid TOML in ${jsonFile} at line 1` });
+
+    // EISDIR: a directory at the path is a read failure, not a parse failure.
+    const directory = join(base, "config-dir");
+    mkdirSync(directory);
+    assert.throws(() => readFileSync(directory, "utf8"), (error) => error.code === "EISDIR" && /illegal operation/.test(error.message), "positive control: the filesystem message carries its own wording");
+    cases.push({ name: "EISDIR", path: directory, code: "EISDIR", line: undefined, message: `Unable to read LaunchDarkly config file ${directory} (EISDIR)` });
+
+    // EACCES: an unreadable file (root reads everything, so the case is skipped when running as root).
+    if (typeof process.getuid === "function" && process.getuid() !== 0) {
+      const unreadable = join(base, "unreadable.toml");
+      writeFileSync(unreadable, `token = "${LD_CONFIG_CANARIES.unreadable}"\n`, "utf8");
+      chmodSync(unreadable, 0o000);
+      assert.throws(() => readFileSync(unreadable, "utf8"), (error) => error.code === "EACCES" && /permission denied/.test(error.message), "positive control");
+      cases.push({ name: "EACCES", path: unreadable, code: "EACCES", line: undefined, message: `Unable to read LaunchDarkly config file ${unreadable} (EACCES)` });
+    }
+
+    // ENOENT on an explicit path: a missing file named by argument or environment is an error, not a silent default.
+    const missing = join(base, "missing.toml");
+    cases.push({ name: "ENOENT", path: missing, code: "ENOENT", line: undefined, message: `Unable to read LaunchDarkly config file ${missing} (ENOENT)` });
+
+    for (const item of cases) {
+      let thrown;
+      try {
+        resolveLaunchdarklyConfiguration({ config_path: item.path }, {}, { homeDir: base });
+      } catch (error) {
+        thrown = error;
+      }
+      assert.ok(thrown, `${item.name}: the resolver must reject the file`);
+      assert.equal(thrown.name, "LaunchdarklyConfigFileError", item.name);
+      assert.ok(thrown instanceof LaunchdarklyConfigFileError, item.name);
+      assert.equal(thrown.message, item.message, `${item.name}: fixed text only`);
+      assert.equal(thrown.code, item.code, item.name);
+      assert.equal(thrown.line, item.line, item.name);
+      assert.equal(thrown.path, item.path, item.name);
+      assertLdFixedTextOnly(thrown.message, canaries, `${item.name} resolver`);
+
+      const access = await checkTool.execute("call-config", checkTool.prepareArguments({ config_path: item.path }));
+      assert.equal(access.isError, true, item.name);
+      assert.equal(access.content[0].text, `LaunchDarkly access check failed: ${item.message}`, item.name);
+      assertLdFixedTextOnly(JSON.stringify(access), canaries, `${item.name} check_access`);
+
+      const outputDir = join(base, `export-${item.code}-${item.name.replace(/[^a-z]+/g, "-")}`);
+      const exported = await exportTool.execute("call-config-export", exportTool.prepareArguments({ config_path: item.path, output_dir: outputDir }));
+      assert.equal(exported.isError, true, item.name);
+      assert.equal(exported.content[0].text, `LaunchDarkly audit bundle export failed: ${item.message}`, item.name);
+      assert.equal(existsSync(outputDir), false, `${item.name}: nothing is written when the config file is unreadable`);
+    }
+
+    // The environment variable is an explicit path too, and a missing default file is still simply absent.
+    assert.throws(() => resolveLaunchdarklyConfiguration({ token: TEST_TOKEN }, { LAUNCHDARKLY_CONFIG: missing }, { homeDir: base }), { message: `Unable to read LaunchDarkly config file ${missing} (ENOENT)` });
+    assert.equal(resolveLaunchdarklyConfiguration({ token: TEST_TOKEN }, {}, { homeDir: base }).token, TEST_TOKEN);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("config loader errors: a SyntaxError raised by the transport is recorded by name only, never by the parser's message that quotes the body", async () => {
+  const snippet = `<html>${LD_PARSER_SNIPPET_CANARY}</html>`;
+  const client = new LaunchdarklyApiClient(sampleConfig(), {
+    fetchImpl: async () => { throw new SyntaxError(`Unexpected token '<', "${snippet}"... is not valid JSON`); },
+    maxRetries: 0,
+  });
+  await assert.rejects(() => client.getCallerIdentity(), (error) => {
+    assert.ok(error instanceof LaunchdarklyApiError);
+    assert.equal(error.message, "LaunchDarkly request failed for GET /api/v2/caller-identity: SyntaxError: response could not be parsed as JSON; the parser's message is not recorded because it quotes the body");
+    assert.equal(error.status, null);
+    return true;
+  });
+  const access = await checkLaunchdarklyAccess(client);
+  assertCanaryWindowsAbsent(assert, JSON.stringify(access), [LD_PARSER_SNIPPET_CANARY], "check_access");
+  assert.ok(access.surfaces.every((surface) => surface.status !== "readable"));
+  const identity = await assessLaunchdarklyIdentity(client, { now: NOW });
+  assert.ok(identity.errors.length > 0 && identity.errors.every((text) => text.includes("SyntaxError: response could not be parsed as JSON")), identity.errors.join("\n"));
+  assertCanaryWindowsAbsent(assert, JSON.stringify(identity), [LD_PARSER_SNIPPET_CANARY], "assess payload");
+});
+
+// ---------------------------------------------------------------------------------------------------------------
+// Round 7: fixed message text survives the scrubber, and argument overlays never erase env-provided credentials.
+// ---------------------------------------------------------------------------------------------------------------
+
+/** Every fixed-text message the LaunchDarkly integration emits that a fixture run does not already produce. */
+const LD_FIXED_TEXT_MESSAGES = [
+  "Unable to read LaunchDarkly config file /home/auditor/.config/launchdarkly-sec-inspector/config.toml (ENOENT)",
+  "Unable to read LaunchDarkly config file /home/auditor/.config/launchdarkly-sec-inspector/config.toml (EACCES)",
+  "Unable to parse LaunchDarkly config file: invalid TOML in /home/auditor/.config/launchdarkly-sec-inspector/config.toml at line 3",
+  "Unable to parse LaunchDarkly config file: invalid TOML in /home/auditor/.config/launchdarkly-sec-inspector/config.toml",
+  "Invalid TOML at line 3: expected a comment, a [table] header, or a key = value pair",
+  "LaunchDarkly API access token is required. Pass token, set LAUNCHDARKLY_API_TOKEN, or add token to /home/auditor/.config/launchdarkly-sec-inspector/config.toml.",
+  "Unsupported LaunchDarkly base URL protocol: ftp:",
+  "502 Bad Gateway: non-JSON body (text/html, 5120 bytes, not echoed)",
+  "403 Forbidden: JSON body without a documented error field (64 bytes, not echoed)",
+  "LaunchDarkly request failed (502 Bad Gateway) for GET /api/v2/tokens?showAll=true: 502 Bad Gateway: non-JSON body (text/html, 5120 bytes, not echoed)",
+  "LaunchDarkly response for GET /api/v2/members was not valid JSON (200 OK: non-JSON body (text/html, 1024 bytes, not echoed)).",
+  "LaunchDarkly request failed for GET /api/v2/caller-identity: timed out after 30000ms",
+  "LaunchDarkly request failed for GET /api/v2/caller-identity: SyntaxError: response could not be parsed as JSON; the parser's message is not recorded because it quotes the body",
+  "LaunchDarkly request failed (403 Forbidden) for GET /api/v2/auditlog?spec=member%2F*: forbidden: You do not have permission to view the audit log",
+  "The caller identity was not readable (HTTP 403), so the token name, token kind, and member are unknown.",
+  "No project was readable, so no environment listing was requested.",
+  "Using LaunchDarkly instance https://app.launchdarkly.com with API version 20240415.",
+  "Config precedence resolved from: environment-token -> config-base-url -> config-file-present.",
+  "Authorization > Access tokens: name, role or custom role, owner, expiry, and last used date of every token (showAll as an Owner or Admin)",
+  "Authorization > Access tokens: the role of the token used for this assessment",
+  "Organization settings > Security > SAML: Enable SSO and Require SSO are checked",
+  "Account settings > Security: multi-factor authentication requirement and the members who have not enrolled",
+  "Unknown LaunchDarkly control 99",
+  JSON.stringify({ collected: false, status: "not-collected", endpoint: null, error: null, reason: "not_requested", truncated: null, seen: null, total: null, items: null }),
+  JSON.stringify({ collected: false, status: 403, endpoint: "GET /api/v2/tokens?showAll=true", error: "LaunchDarkly request failed (403 Forbidden) for GET /api/v2/tokens?showAll=true: forbidden: access_denied", reason: "not_readable", truncated: null, seen: null, total: null, items: null }),
+];
+
+test("round 7a: every fixed-text message the LaunchDarkly integration emits survives its own scrubber unchanged, including every string a healthy or partially denied run records", async () => {
+  for (const message of LD_FIXED_TEXT_MESSAGES) {
+    assert.equal(scrubErrorText(message), message, `fixed text was altered by the scrubber: ${message}`);
+  }
+
+  // Every string a run writes about legitimate data is fixed text from the run's point of view: the scrubber must not
+  // rewrite a finding summary, a manual-evidence instruction, an inventory gap, or a bundle document.
+  const runs = [httpLaunchdarkly(ldPrincipalFixture())];
+  for (const denial of LD_SINGLE_INVENTORY_DENIALS) {
+    const fixture = ldPrincipalFixture();
+    runs.push(httpLaunchdarkly(fixture, { routes: { [denial.route]: ldDenyDataset(ldRoutes(fixture), denial) } }));
+  }
+  let checked = 0;
+  const altered = [];
+  for (const { client, config } of runs) {
+    const access = await checkLaunchdarklyAccess(client);
+    const assessments = await runAllLaunchdarklyAssessments(client);
+    const exported = await exportLaunchdarklyAuditBundle(client, config, createTempBase("grclanker-ld-fixed-text-"), { now: NOW });
+    const files = readBundleFiles(exported.outputDir);
+    const texts = [
+      ...ldRecordedStrings(access, assessments, files),
+      ...[...files].filter(([name]) => !name.startsWith("core_data/")).map(([, text]) => text),
+      ...ldLeafEntries(assessments).map(([, value]) => value).filter((value) => typeof value === "string"),
+    ];
+    for (const text of texts) {
+      checked += 1;
+      const scrubbed = scrubErrorText(text);
+      if (scrubbed !== text) altered.push(`${text.slice(0, 160)} -> ${scrubbed.slice(0, 160)}`);
+    }
+  }
+  assert.ok(checked > 2000, `expected thousands of recorded strings, got ${checked}`);
+  assert.deepEqual([...new Set(altered)], [], `legitimate run text altered by the scrubber:\n${[...new Set(altered)].join("\n")}`);
+});
+
+test("round 7b: resolveLaunchdarklyConfiguration keeps env-provided credentials and config path when an unrelated argument is passed, and the tool sends the env token", async () => {
+  const registered = [];
+  registerLaunchdarklyTools({ registerTool: (tool) => registered.push(tool) });
+  const checkTool = registered.find((tool) => tool.name === "launchdarkly_check_access");
+  const home = createTempBase("grclanker-ld-env-overlay-");
+  const configPath = join(home, "canary.toml");
+  writeFileSync(configPath, 'base_url = "https://app.eu.launchdarkly.com"\nallowed_domains = ["file.example"]\n', "utf8");
+  const env = { LAUNCHDARKLY_API_TOKEN: TEST_TOKEN, LAUNCHDARKLY_CONFIG: configPath };
+
+  // The tool's prepareArguments emits every auth key (undefined when not passed); that shape must not erase env values.
+  const prepared = checkTool.prepareArguments({ timeout_seconds: 45 });
+  assert.ok(Object.prototype.hasOwnProperty.call(prepared, "token") && prepared.token === undefined, "the overlay carries an undefined token key");
+  const resolved = resolveLaunchdarklyConfiguration(prepared, env, { homeDir: home });
+  assert.equal(resolved.token, TEST_TOKEN, "the env token survives an unrelated argument");
+  assert.equal(resolved.configPath, configPath, "the env config path survives an unrelated argument");
+  assert.equal(resolved.baseUrl, "https://app.eu.launchdarkly.com", "the file the env path names is still read");
+  assert.deepEqual(resolved.allowedDomains, ["file.example"]);
+  assert.equal(resolved.timeoutMs, 45000, "the unrelated argument still applies");
+  assert.ok(resolved.sourceChain.includes("environment-token"), `source chain names env for the token: ${resolved.sourceChain.join(" -> ")}`);
+  assert.ok(resolved.sourceChain.includes("config-base-url"), resolved.sourceChain.join(" -> "));
+
+  // Through the registered tool with the environment set: every request carries the env token to the env-named instance.
+  const saved = { LAUNCHDARKLY_API_TOKEN: process.env.LAUNCHDARKLY_API_TOKEN, LAUNCHDARKLY_CONFIG: process.env.LAUNCHDARKLY_CONFIG, LAUNCHDARKLY_BASE_URL: process.env.LAUNCHDARKLY_BASE_URL };
+  const { log, fetchImpl } = httpLaunchdarkly(ldFixture());
+  try {
+    process.env.LAUNCHDARKLY_API_TOKEN = TEST_TOKEN;
+    process.env.LAUNCHDARKLY_CONFIG = configPath;
+    delete process.env.LAUNCHDARKLY_BASE_URL;
+    const result = await runLaunchdarklyTool("launchdarkly_check_access", fetchImpl, { timeout_seconds: 45 });
+    assert.notEqual(result.isError, true, result.content[0].text);
+    assert.ok(log.length > 0, "requests were made");
+    assert.ok(log.every((entry) => entry.authorization === TEST_TOKEN), "every request carries the env token");
+    assert.ok(log.every((entry) => entry.host === "app.eu.launchdarkly.com"), "the base URL from the env-named config file is used");
+    assert.match(result.content[0].text, /environment-token/);
+    assertCanaryWindowsAbsent(assert, JSON.stringify(result), [TEST_TOKEN], "check_access result");
+  } finally {
+    for (const [key, value] of Object.entries(saved)) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+  }
 });
