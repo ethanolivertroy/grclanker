@@ -666,6 +666,55 @@ function describeFailure(result: { error: string; status?: number }): string {
   return result.error.replace(/\s+/g, " ").slice(0, 160);
 }
 
+const TOKEN_ENDPOINT_SUFFIX = "/oauth2/v2.0/token";
+
+/**
+ * True when the recorded failure is the token request itself. Every resource read starts with
+ * getToken, so a refused token means the finding's own endpoint was never requested and must
+ * not be named as the request that failed.
+ */
+function isTokenRequestFailure(result: { url?: string }): boolean {
+  return typeof result.url === "string" && result.url.endsWith(TOKEN_ENDPOINT_SUFFIX);
+}
+
+/** "POST /<tenant>/oauth2/v2.0/token", taken from the observed request URL rather than a constant. */
+function tokenRequestLabel(result: { url?: string }): string {
+  return `POST ${(result.url ?? "").replace(/^[a-z]+:\/\/[^/]+/i, "")}`;
+}
+
+/** Which API the finding's endpoint belongs to, from the documented endpoint label. */
+function resourceApiFor(endpoint: string): string {
+  return /\bMicrosoft\./.test(endpoint) ? "Azure Resource Manager" : "Microsoft Graph";
+}
+
+/** The failure detail without the "Token request failed:" prefix getToken adds, so it is not repeated after the request label. */
+function describeTokenFailure(result: { error: string; status?: number }): string {
+  return describeFailure(result).replace(/^Token request failed: /, "");
+}
+
+/** Sentence and marker for a finding whose resource request never happened because the token request failed. */
+function tokenFailureText(result: { error: string; status?: number; url?: string }, endpoint: string): { request: string; detail: string; api: string; marker: string } {
+  const api = resourceApiFor(endpoint);
+  return {
+    request: tokenRequestLabel(result),
+    detail: describeTokenFailure(result),
+    api,
+    marker: `not attempted: the token request failed, so no ${api} request was made`,
+  };
+}
+
+/**
+ * The error-log line for a failed read: "<request>: <detail>". When the token request was the one
+ * that failed it is named instead of the finding's endpoint, with the note that no resource request was made.
+ */
+function failedReadNote(result: { error: string; status?: number; url?: string }, endpoint: string): string {
+  if (isTokenRequestFailure(result)) {
+    const token = tokenFailureText(result, endpoint);
+    return `${token.request}: ${token.detail}; no ${token.api} request was made`;
+  }
+  return `${endpoint}: ${describeFailure(result)}`;
+}
+
 function manualForError(
   id: string,
   control: number,
@@ -678,8 +727,29 @@ function manualForError(
   docUrl: string,
   errors: string[],
 ): AzureFinding {
+  errors.push(`${id} ${failedReadNote(result, endpoint)}`);
+  if (isTokenRequestFailure(result)) {
+    const token = tokenFailureText(result, endpoint);
+    return finding(
+      id,
+      control,
+      title,
+      severity,
+      "manual",
+      `${token.request} returned ${token.detail}, so no ${token.api} request was made for this finding. Fix the app registration's client credentials (tenant id, client id, client secret) so a token is issued; the read then needs ${requirement}. Or collect ${evidenceToCollect} manually.`,
+      {
+        endpoint: token.request,
+        http_status: result.status ?? null,
+        request_url: result.url ?? null,
+        error: result.error.slice(0, 300),
+        resource_request: token.marker,
+        required_access: requirement,
+        evidence_to_collect: evidenceToCollect,
+        documentation: [AZURE_ENDPOINT_DOCS.clientCredentials, docUrl],
+      },
+    );
+  }
   const detail = describeFailure(result);
-  errors.push(`${id} ${endpoint}: ${detail}`);
   return finding(
     id,
     control,
@@ -1454,9 +1524,15 @@ export async function checkAzureAccess(
   const readableCount = surfaces.filter((item) => item.status === "readable").length;
   const status = readableCount >= 6 ? "healthy" : "limited";
   const truncatedSurfaces = surfaces.filter((item) => item.truncated).map((item) => item.name);
+  // A probe that failed at the token request never reached its resource; the note names the request that was made.
+  const tokenFailures = surfaces.filter((item) => item.status === "not_readable" && isTokenRequestFailure({ url: item.request_url ?? undefined }));
+  const tokenNote = tokenFailures[0]
+    ? `${tokenRequestLabel({ url: tokenFailures[0].request_url ?? undefined })} returned ${describeTokenFailure({ error: tokenFailures[0].error ?? "", status: tokenFailures[0].http_status ?? undefined })}; no resource request was made for ${tokenFailures.map((item) => item.name).join(", ")}.`
+    : undefined;
   const notes = [
     `Authenticated against ${describeSourceChain(config)}.`,
     `${readableCount}/${surfaces.length} Azure audit surfaces are readable.`,
+    ...(tokenNote ? [tokenNote] : []),
     ...(truncatedSurfaces.length > 0
       ? [`Probe counts for ${truncatedSurfaces.join(", ")} stopped at the probe page cap and are lower bounds, not inventory sizes.`]
       : []),
@@ -1471,7 +1547,9 @@ export async function checkAzureAccess(
     recommendedNextStep:
       status === "healthy"
         ? "Run azure_assess_identity, azure_assess_monitoring, azure_assess_subscription_guardrails, azure_assess_data_protection, azure_assess_network_and_policy, or azure_export_audit_bundle."
-        : "Grant Microsoft Graph read permissions and Azure Reader/Security Reader roles for the audit principal.",
+        : tokenNote
+          ? "Fix the app registration's client credentials (tenant id, client id, client secret) so the token request succeeds, then re-run the access check."
+          : "Grant Microsoft Graph read permissions and Azure Reader/Security Reader roles for the audit principal.",
   };
 }
 
@@ -1559,7 +1637,11 @@ export async function assessAzureIdentity(client: IdentityClient): Promise<Azure
     // Security defaults are a secondary read: an enabled MFA or block policy satisfies the control on its own,
     // but when no such policy exists the verdict rests entirely on the defaults, so an unreadable read is manual, not fail.
     const defaultsFailure = securityDefaults.ok ? undefined : describeFailure(securityDefaults);
-    const defaultsNote = defaultsFailure ? ` Security defaults could not be read (${SECURITY_DEFAULTS_ENDPOINT} returned ${defaultsFailure}).` : "";
+    const defaultsNote = securityDefaults.ok
+      ? ""
+      : isTokenRequestFailure(securityDefaults)
+        ? ` Security defaults could not be read (${failedReadNote(securityDefaults, SECURITY_DEFAULTS_ENDPOINT)}).`
+        : ` Security defaults could not be read (${SECURITY_DEFAULTS_ENDPOINT} returned ${defaultsFailure}).`;
     const defaultsEvidence = {
       security_defaults_enabled: securityDefaults.ok ? securityDefaultsEnabled : null,
       security_defaults_readable: securityDefaults.ok,
@@ -1567,7 +1649,7 @@ export async function assessAzureIdentity(client: IdentityClient): Promise<Azure
       security_defaults_request_url: securityDefaults.ok ? null : securityDefaults.url ?? null,
       security_defaults_error: defaultsFailure ?? null,
     };
-    if (defaultsFailure) errors.push(`AZURE-ID-01 ${SECURITY_DEFAULTS_ENDPOINT}: ${defaultsFailure}`);
+    if (!securityDefaults.ok) errors.push(`AZURE-ID-01 ${failedReadNote(securityDefaults, SECURITY_DEFAULTS_ENDPOINT)}`);
     const policyEvidence = { total_policies: policies.value.items.length, enabled_policies: enabled.length, report_only_policies: reportOnly.length, mfa_policies: mfaPolicies.length, ...defaultsEvidence, ...pageEvidence(policies.value) };
     const baseline = mfaPolicies.length > 0 || securityDefaultsEnabled;
     if (!baseline && !securityDefaults.ok) {
@@ -1868,7 +1950,7 @@ export async function assessAzureMonitoring(client: MonitoringClient): Promise<A
   const standardPlans = defenderPricings.ok ? defenderPricings.value.items.filter((item) => asLower(asObject(item.properties)?.pricingTier) === "standard") : [];
   const totalPlans = defenderPricings.ok ? defenderPricings.value.items.length : 0;
   // The alerts read only annotates MON-04, but a failed read is still logged so the bundle names it.
-  if (!alerts.ok) errors.push(`AZURE-MON-04 GET /v1.0/security/alerts_v2: ${describeFailure(alerts)}`);
+  if (!alerts.ok) errors.push(`AZURE-MON-04 ${failedReadNote(alerts, "GET /v1.0/security/alerts_v2")}`);
   if (!defenderPricings.ok) {
     findings.push(manualForError("AZURE-MON-04", 16, "Defender for Cloud plan coverage", "high", "GET Microsoft.Security/pricings", "Security Reader on the subscription", "the Defender for Cloud environment settings page", defenderPricings, AZURE_ENDPOINT_DOCS.defenderPricings, errors));
   } else {
@@ -2168,11 +2250,17 @@ export async function assessAzureDataProtection(
     let mailboxesErrored = 0;
     let permissionFailure: { error: string; status?: number } | undefined;
     let otherFailure: { error: string; status?: number } | undefined;
+    let tokenFailure: { error: string; status?: number; url?: string } | undefined;
     for (const user of members.value.items) {
       const userId = asString(user.id);
       if (!userId) continue;
       const rules = await attemptPage(() => client.listInboxMessageRules(userId));
       if (!rules.ok) {
+        // A refused token (expired mid-run) is not a mailbox permission gap: no mailbox request was made and none can be.
+        if (isTokenRequestFailure(rules)) {
+          tokenFailure = rules;
+          break;
+        }
         if (rules.status === 401 || rules.status === 403) {
           mailboxesDenied += 1;
           permissionFailure = rules;
@@ -2192,7 +2280,9 @@ export async function assessAzureDataProtection(
       }
     }
     const mailboxesUnreadable = mailboxesDenied + mailboxesErrored;
-    if (permissionFailure && mailboxesRead === 0) {
+    if (tokenFailure) {
+      findings.push(manualForError("AZURE-DP-06", 20, "Inbox forwarding rules", "high", MESSAGE_RULES_ENDPOINT, MAILBOX_RULES_PERMISSION, "the inbox rule export for every mailbox", tokenFailure, AZURE_ENDPOINT_DOCS.messageRules, errors));
+    } else if (permissionFailure && mailboxesRead === 0) {
       findings.push(manualForError("AZURE-DP-06", 20, "Inbox forwarding rules", "high", MESSAGE_RULES_ENDPOINT, MAILBOX_RULES_PERMISSION, "the inbox rule export for every mailbox", permissionFailure, AZURE_ENDPOINT_DOCS.messageRules, errors));
     } else {
       // A denied subset is a permission gap on those mailboxes, not a licensing quirk; only non-permission

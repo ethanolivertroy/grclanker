@@ -13,6 +13,7 @@ import { join } from "node:path";
 
 import {
   AZURE_ARM_API_VERSIONS,
+  AZURE_ENDPOINT_DOCS,
   AzureApiError,
   AzureAuditorClient,
   assessAzureDataProtection,
@@ -1555,6 +1556,78 @@ test("request matching: every endpoint, request URL, and HTTP status named in an
   assert.ok(statuses.has(403) && statuses.has(502) && statuses.has(404), `the outputs name the observed failure statuses (${[...statuses].join(", ")})`);
   for (const status of statuses) {
     assert.ok(observedStatuses.has(status), `status ${status} is named in output but no request observed it`);
+  }
+});
+
+const AZURE_TOKEN_URL = `https://login.microsoftonline.com${AZURE_TOKEN_PATH}`;
+
+function refusedTokenResponse(status, statusText) {
+  return () => new Response(JSON.stringify({ error: "invalid_client", error_description: "AADSTS7000215: Invalid client secret provided." }), {
+    status,
+    statusText,
+    headers: { "content-type": "application/json" },
+  });
+}
+
+test("request matching: a token-endpoint denial is attributed to POST /<tenant>/oauth2/v2.0/token, every output states that no resource request was made, and no resource endpoint or status the run never observed is named", async () => {
+  for (const [status, statusText] of [[403, "Forbidden"], [401, "Unauthorized"]]) {
+    const config = canaryConfig();
+    const outputRoot = createTempBase("grclanker-azure-token-denied-");
+    const log = [];
+    const routes = { ...healthyAzureRoutes(), [AZURE_TOKEN_PATH]: refusedTokenResponse(status, statusText) };
+    const client = new AzureAuditorClient(config, { fetchImpl: recordingAzureFetch(routes, log), now: () => NOW });
+    const { access, assessments, exported } = await runEveryAzureTool(client, config, outputRoot);
+    const label = `token ${status}`;
+
+    // The only request the run made is the token request; the resource endpoints were never reached.
+    assert.ok(log.length > 0, `${label}: the token request was made`);
+    assert.deepEqual([...new Set(log.map((entry) => `${entry.method} ${entry.url} ${entry.status}`))], [`POST ${AZURE_TOKEN_URL} ${status}`], `${label}: the run made only the token request`);
+
+    const files = readBundleFiles(exported.outputDir);
+    const outputs = [JSON.stringify(access), ...assessments.map((assessment) => JSON.stringify(assessment)), ...files.values()];
+    const text = outputs.join("\n");
+    for (const mention of namedAzureEndpoints(text)) {
+      assert.ok(endpointWasRequested(mention, log), `${label}: endpoint "${mention}" is named in output but the run never requested it`);
+    }
+    for (const url of namedAzureRequestUrls(text)) assert.equal(url, AZURE_TOKEN_URL, `${label}: request URL ${url} is named in output but the run never requested it`);
+    assert.deepEqual([...namedAzureStatusCodes(text)], [status], `${label}: the outputs name only the observed status`);
+    assert.ok(!text.includes("/v1.0/") && !text.includes("/beta/") && !/\bMicrosoft\.[A-Za-z]+\//.test(text), `${label}: no resource endpoint is named anywhere in the outputs`);
+
+    // Access check: every probe failed at the token request and says so; the next step is the credential, not a permission grant.
+    assert.equal(access.status, "limited", `${label}: the access check is limited`);
+    for (const probe of access.surfaces) {
+      assert.equal(probe.status, "not_readable", `${label}: probe ${probe.name} is not readable`);
+      assert.deepEqual({ count: probe.count, truncated: probe.truncated, http_status: probe.http_status, request_url: probe.request_url }, { count: null, truncated: null, http_status: status, request_url: AZURE_TOKEN_URL }, `${label}: probe ${probe.name} records the token request`);
+      assert.match(probe.error, new RegExp(`^Token request failed: ${status} ${statusText}`), `${label}: probe ${probe.name} names the token request`);
+    }
+    assert.ok(access.notes.some((note) => note.startsWith(`POST ${AZURE_TOKEN_PATH} returned ${status} ${statusText}; no resource request was made for `)), `${label}: the access check note names the token request: ${JSON.stringify(access.notes)}`);
+    assert.match(access.recommendedNextStep, /^Fix the app registration's client credentials/, `${label}: the next step is the credential`);
+    assert.doesNotMatch(access.recommendedNextStep, /Grant/, `${label}: the next step does not ask for a permission grant`);
+
+    // Findings: every finding that recorded the failure names the token request and carries the not-attempted marker.
+    const recorded = assessments.flatMap((assessment) => assessment.findings.filter((finding) => finding.evidence?.http_status === status));
+    assert.ok(recorded.length >= 30, `${label}: the token failure reaches every finding that reads a resource (${recorded.length})`);
+    for (const item of recorded) {
+      assert.equal(item.status, "manual", `${label}: ${item.id} renders manual`);
+      assert.equal(item.evidence.endpoint, `POST ${AZURE_TOKEN_PATH}`, `${label}: ${item.id} names the token request as the failed request`);
+      assert.equal(item.evidence.request_url, AZURE_TOKEN_URL, `${label}: ${item.id} carries the observed request URL`);
+      assert.match(item.evidence.resource_request, /^not attempted: the token request failed, so no (Microsoft Graph|Azure Resource Manager) request was made$/, `${label}: ${item.id} carries the not-attempted marker`);
+      assert.match(item.summary, new RegExp(`^POST ${AZURE_TOKEN_PATH.replace(/[.]/g, "\\.")} returned ${status} ${statusText}, so no (Microsoft Graph|Azure Resource Manager) request was made for this finding\\. Fix the app registration's client credentials`), `${label}: ${item.id} summary names the token request: ${item.summary}`);
+      assert.doesNotMatch(item.summary, /^GET |Grant /, `${label}: ${item.id} does not attribute the failure to its resource endpoint`);
+      assert.deepEqual(item.evidence.documentation, [AZURE_ENDPOINT_DOCS.clientCredentials, item.evidence.documentation[1]], `${label}: ${item.id} documents the client credentials grant first`);
+      assert.equal(typeof item.evidence.required_access, "string", `${label}: ${item.id} still records the permission the read will need`);
+    }
+    // The ARM findings name their API in the marker so a reader knows neither Graph nor ARM was reached by that finding.
+    assert.ok(recorded.some((item) => item.evidence.resource_request.endsWith("no Azure Resource Manager request was made")), `${label}: ARM findings name their API`);
+    assert.ok(recorded.some((item) => item.evidence.resource_request.endsWith("no Microsoft Graph request was made")), `${label}: Graph findings name their API`);
+    for (const assessment of assessments) {
+      for (const error of assessment.errors) {
+        assert.match(error, new RegExp(`^AZURE-[A-Z]+-\\d+ POST ${AZURE_TOKEN_PATH.replace(/[.]/g, "\\.")}: ${status} ${statusText}; no (Microsoft Graph|Azure Resource Manager) request was made$`), `${label}: the errors array names the token request: ${error}`);
+      }
+    }
+    assert.ok(exported.errorCount >= 30, `${label}: the export logs every failed read`);
+    assert.doesNotMatch(files.get("_errors.log"), /GET /, `${label}: the error log attributes nothing to a GET`);
+    assertNoCanaryWindowsInFiles(assert, files, AZURE_PLANTED_CANARIES, `${label} bundle`);
   }
 });
 
