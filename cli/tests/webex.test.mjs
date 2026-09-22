@@ -13,6 +13,7 @@ import { tmpdir } from "node:os";
 import { dirname, join, relative } from "node:path";
 import { fileURLToPath } from "node:url";
 import { inflateRawSync } from "node:zlib";
+import { parse as parseYaml } from "yaml";
 
 import {
   WEBEX_DOCS,
@@ -28,6 +29,7 @@ import {
   parseLinkHeaderNext,
   projectSurface,
   redactSecrets,
+  registerWebexTools,
   resolveSecureOutputPath,
   resolveWebexConfiguration,
   scrubErrorText,
@@ -507,6 +509,141 @@ test("resolveWebexConfiguration discovers JSON and YAML config files under ~/.co
   const fromYaml = resolveWebexConfiguration({}, { WEBEX_ORG_ID: "org-env" }, { homeDir: yamlHome });
   assert.deepEqual(fromYaml.refresh, { clientId: "cid", clientSecret: "csecret", refreshToken: "rtoken" });
   assert.equal(fromYaml.orgId, "org-env");
+});
+
+/** The registered tools captured through a fake pi, so the agent-visible result text can be asserted. */
+function capturedWebexTools() {
+  const tools = new Map();
+  registerWebexTools({ registerTool: (tool) => tools.set(tool.name, tool) });
+  return tools;
+}
+
+function thrownBy(fn) {
+  try {
+    fn();
+  } catch (error) {
+    return error;
+  }
+  return undefined;
+}
+
+/** Runs webex_check_access against process.env with WEBEX_CONFIG_FILE set only for the call, returning the rendered result. */
+async function checkAccessThroughTool(args, envConfigFile) {
+  const tool = capturedWebexTools().get("webex_check_access");
+  const saved = { WEBEX_CONFIG_FILE: process.env.WEBEX_CONFIG_FILE, WEBEX_TOKEN: process.env.WEBEX_TOKEN };
+  if (envConfigFile === undefined) delete process.env.WEBEX_CONFIG_FILE;
+  else process.env.WEBEX_CONFIG_FILE = envConfigFile;
+  delete process.env.WEBEX_TOKEN;
+  try {
+    return await tool.execute("call-1", tool.prepareArguments(args));
+  } finally {
+    for (const [key, value] of Object.entries(saved)) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+  }
+}
+
+test("config loader canary: neither the YAML parser message, the JSON parser window, nor the fs message reaches the resolver error or the webex_check_access result", async () => {
+  const home = createTempBase("grclanker-webex-home-canary-");
+  const configDir = createTempBase("grclanker-webex-config-canary-");
+  const tokenCanary = "TOKCANARYqz8m2v4x7k1p3w5n9r";
+  const bearerCanary = "BRCANARYh6j2f8d4s0a1g3l5";
+  const aliasCanary = "ALCANARYu3y7e1t9r5w";
+  const jsonCanary = "JSCANARYb2n4m6v8c0x1z3l5k7";
+  const forbiddenEverywhere = [tokenCanary, bearerCanary, aliasCanary, jsonCanary, "CANARY", "Nested mappings", "Unresolved alias", "is not valid JSON", "illegal operation", "Unexpected token", ":\n"];
+  const assertClean = (text, label) => {
+    for (const forbidden of forbiddenEverywhere) {
+      assert.ok(!text.includes(forbidden), `${label} must not carry ${JSON.stringify(forbidden)}: ${text}`);
+    }
+  };
+  const toolText = (result) => {
+    assert.equal(result.isError, true);
+    assert.equal(result.details.tool, "webex_check_access");
+    return result.content[0].text;
+  };
+
+  // (1) YAML reference shape: the malformed line is the credential itself, reached through both routes.
+  const referenceText = `org_id: org-1\ntoken: ${tokenCanary}: Bearer ${bearerCanary}\n`;
+  const referencePath = join(configDir, "config.yaml");
+  writeFileSync(referencePath, referenceText);
+  const yamlControl = thrownBy(() => parseYaml(referenceText));
+  assert.ok(yamlControl instanceof Error);
+  assert.match(yamlControl.message, /Nested mappings .* line 2/);
+  assert.ok(yamlControl.message.includes(tokenCanary) && yamlControl.message.includes(bearerCanary), "positive control: yaml.parse quotes the whole line, both canaries included");
+  assert.equal(yamlControl.linePos?.[0]?.line, 2, "the structured position is what the loader may use");
+
+  const viaArgument = thrownBy(() => resolveWebexConfiguration({ config_file: referencePath }, {}, { homeDir: home }));
+  assert.ok(viaArgument instanceof Error);
+  assert.match(viaArgument.message, /^Unable to parse Webex config file: invalid YAML in .*config\.yaml at line 2$/);
+  assertClean(viaArgument.message, "resolver (config_file route)");
+  const viaEnv = thrownBy(() => resolveWebexConfiguration({}, { WEBEX_CONFIG_FILE: referencePath }, { homeDir: home }));
+  assert.ok(viaEnv instanceof Error);
+  assert.equal(viaEnv.message, viaArgument.message, "the WEBEX_CONFIG_FILE route throws the same fixed description");
+  const toolViaArgument = toolText(await checkAccessThroughTool({ config_file: referencePath }));
+  assert.match(toolViaArgument, /^Webex access check failed: Unable to parse Webex config file: invalid YAML in .*config\.yaml at line 2$/);
+  assertClean(toolViaArgument, "webex_check_access (config_file route)");
+  const toolViaEnv = toolText(await checkAccessThroughTool({}, referencePath));
+  assert.equal(toolViaEnv, toolViaArgument);
+
+  // (2) YAML alias shape: yaml.parse throws a plain ReferenceError naming the value with no key in front of it.
+  const aliasText = `token: *${aliasCanary}\n`;
+  const aliasPath = join(configDir, "alias.yml");
+  writeFileSync(aliasPath, aliasText);
+  const aliasControl = thrownBy(() => parseYaml(aliasText));
+  assert.ok(aliasControl instanceof ReferenceError, "positive control: an unresolved alias is a ReferenceError, not a YAMLError");
+  assert.match(aliasControl.message, /^Unresolved alias/);
+  assert.ok(aliasControl.message.includes(aliasCanary));
+  assert.equal(aliasControl.linePos, undefined);
+  const aliasThrown = thrownBy(() => resolveWebexConfiguration({ config_file: aliasPath }, {}, { homeDir: home }));
+  assert.ok(aliasThrown instanceof Error);
+  assert.match(aliasThrown.message, /^Unable to parse Webex config file: invalid YAML in .*alias\.yml$/, "no line number because the thrown value is not a structured YAMLError");
+  assertClean(aliasThrown.message, "resolver (alias shape)");
+  assertClean(toolText(await checkAccessThroughTool({ config_file: aliasPath })), "webex_check_access (alias shape)");
+
+  // (3) JSON with an unquoted credential value: JSON.parse quotes a ten-character window that starts inside the value.
+  const jsonText = `{"org_id": "org-1", "token": ${jsonCanary}}`;
+  const jsonPath = join(configDir, "config.json");
+  writeFileSync(jsonPath, jsonText);
+  const jsonControl = thrownBy(() => JSON.parse(jsonText));
+  assert.ok(jsonControl instanceof SyntaxError);
+  assert.match(jsonControl.message, /is not valid JSON$/);
+  assert.ok(jsonControl.message.includes(jsonCanary.slice(0, 10)), `positive control: JSON.parse quotes the first ten characters of the value: ${jsonControl.message}`);
+  const jsonThrown = thrownBy(() => resolveWebexConfiguration({ config_file: jsonPath }, {}, { homeDir: home }));
+  assert.ok(jsonThrown instanceof Error);
+  assert.match(jsonThrown.message, /^Unable to parse Webex config file: invalid JSON in .*config\.json$/);
+  assert.ok(!jsonThrown.message.includes(jsonCanary.slice(0, 10)), "the ten-character fragment is absent");
+  assertClean(jsonThrown.message, "resolver (JSON shape)");
+  const jsonTool = toolText(await checkAccessThroughTool({ config_file: jsonPath }));
+  assert.ok(!jsonTool.includes(jsonCanary.slice(0, 10)));
+  assertClean(jsonTool, "webex_check_access (JSON shape)");
+
+  // (4) A read failure is a fixed description with the system error code, never the fs wording.
+  const directoryPath = join(configDir, "config-as-directory.yaml");
+  mkdirSync(directoryPath);
+  const readThrown = thrownBy(() => resolveWebexConfiguration({ config_file: directoryPath }, {}, { homeDir: home }));
+  assert.ok(readThrown instanceof Error);
+  assert.match(readThrown.message, /^Unable to read Webex config file .*config-as-directory\.yaml \(EISDIR\)$/);
+  assertClean(readThrown.message, "resolver (EISDIR)");
+  const readTool = toolText(await checkAccessThroughTool({ config_file: directoryPath }));
+  assert.match(readTool, /^Webex access check failed: Unable to read Webex config file .*config-as-directory\.yaml \(EISDIR\)$/);
+  assertClean(readTool, "webex_check_access (EISDIR)");
+
+  // (5) An explicit path that does not exist is reported instead of silently falling through.
+  const missingPath = join(configDir, "missing.yaml");
+  assert.throws(() => resolveWebexConfiguration({ config_file: missingPath }, {}, { homeDir: home }), (error) => error instanceof Error && error.message === `Webex config file not found: ${missingPath}`);
+  assert.throws(() => resolveWebexConfiguration({}, { WEBEX_CONFIG_FILE: missingPath }, { homeDir: home }), (error) => error instanceof Error && error.message === `Webex config file not found: ${missingPath}`);
+  assert.equal(toolText(await checkAccessThroughTool({ config_file: missingPath })), `Webex access check failed: Webex config file not found: ${missingPath}`);
+  assert.throws(() => resolveWebexConfiguration({}, {}, { homeDir: home }), /WEBEX_TOKEN/, "the default locations stay optional");
+
+  // A well-formed file through the same routes still resolves, so the guards change only the failure text.
+  const goodPath = join(configDir, "good.yaml");
+  writeFileSync(goodPath, "token: file-token\norg_id: org-file\n");
+  assert.equal(resolveWebexConfiguration({ config_file: goodPath }, {}, { homeDir: home }).token, "file-token");
+  assert.equal(resolveWebexConfiguration({}, { WEBEX_CONFIG_FILE: goodPath }, { homeDir: home }).orgId, "org-file");
+  const scalarPath = join(configDir, "scalar.yaml");
+  writeFileSync(scalarPath, "just-a-string\n");
+  assert.throws(() => resolveWebexConfiguration({ config_file: scalarPath }, {}, { homeDir: home }), /^Error: Webex config file .*scalar\.yaml must contain an object\.$/);
 });
 
 test("WebexApiClient refreshes an access token through POST /access_token and redacts it", async () => {
