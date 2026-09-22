@@ -965,10 +965,17 @@ export function redactVariables(value: unknown): unknown {
   return names.length > 0 ? `${ANSIBLE_REDACTION_MARKER} (variable names: ${names.join(", ")})` : ANSIBLE_REDACTION_MARKER;
 }
 
-function pick(item: JsonRecord, keys: readonly string[]): JsonRecord {
+/**
+ * Projects the documented fields of a record. A body that parsed to a primitive or an array is not the
+ * documented object: it projects to nothing rather than reaching the `in` operator, whose TypeError
+ * message would quote the value.
+ */
+function pick(item: unknown, keys: readonly string[]): JsonRecord {
   const projected: JsonRecord = {};
+  const object = asObject(item);
+  if (!object) return projected;
   for (const key of keys) {
-    if (key in item) projected[key] = item[key];
+    if (key in object) projected[key] = object[key];
   }
   return projected;
 }
@@ -1153,8 +1160,10 @@ function projectSettings(settings: JsonRecord | undefined): JsonRecord | undefin
   return settings ? redactCredentialTree(settings) as JsonRecord : settings;
 }
 
-function projectPing(ping: JsonRecord | undefined): JsonRecord | undefined {
-  return ping ? pick(ping, PING_FIELDS) : ping;
+/** The ping document's documented fields; a body that is not a JSON object (a string, number, or array) is not a ping and is dropped. */
+function projectPing(ping: unknown): JsonRecord | undefined {
+  const object = asObject(ping);
+  return object ? pick(object, PING_FIELDS) : undefined;
 }
 
 export class AnsibleAapClient {
@@ -1660,7 +1669,7 @@ async function readableSurface(client: AnsibleAapClient, name: string, endpoint:
 export async function checkAnsibleAccess(client: AnsibleAapClient): Promise<AnsibleAccessCheckResult> {
   const me = await client.get("/api/v2/me/");
   const currentUser = currentUserFromMe(me);
-  const ping = await client.get<JsonRecord>("/api/v2/ping/").catch(() => undefined);
+  const ping = await client.get<unknown>("/api/v2/ping/").catch(() => undefined);
 
   const surfaces = await Promise.all([
     readableSurface(client, "organizations", "/api/v2/organizations/"),

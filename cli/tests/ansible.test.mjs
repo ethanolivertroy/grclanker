@@ -1552,6 +1552,12 @@ test("rule 1 corollary: partialNotes caps any pass built on an unreadable view a
 const ANSIBLE_RUN_TOKEN_CANARY = "VJQu6BSFDkFPS2g6GsLGSMsg";
 const ANSIBLE_ERROR_BODY_CANARIES = Object.freeze({ json: "Uw34sFSRwES87v9q", html: "PYZakdJQxmAaNZv7" });
 
+/**
+ * A 2xx body that is valid JSON but not the documented object (a JSON string or array): 19 characters plus
+ * the quotes make the 21-character body the reviewer measured leaking in full through a TypeError message.
+ */
+const ANSIBLE_PRIMITIVE_BODY_CANARY = "kR7dQx2mVt9HpZ4wLc3";
+
 /** Every planted canary an Ansible output is swept for, window by window. */
 const ANSIBLE_PLANTED_CANARIES = Object.freeze([
   ...CANARY_VALUES,
@@ -1562,6 +1568,7 @@ const ANSIBLE_PLANTED_CANARIES = Object.freeze([
   ANSIBLE_AUDITOR_LOCAL_PART_CANARY,
   ANSIBLE_RUN_TOKEN_CANARY,
   ...Object.values(ANSIBLE_ERROR_BODY_CANARIES),
+  ANSIBLE_PRIMITIVE_BODY_CANARY,
 ]);
 
 const AAP_CLIENT_CONFIG = { baseUrl: "https://aap.example.com", token: ANSIBLE_RUN_TOKEN_CANARY, timeoutMs: 30_000, verifySsl: true, sourceChain: ["tests"] };
@@ -2070,4 +2077,49 @@ test("config loader errors: a 200 answer whose body is short non-JSON text is re
   for (const [name, text] of readZipEntries(run.exported.zipPath)) assertNoShortBodyFragments(assert, text, `zip ${name}`);
   assertShortBodyRecordedAsNote(assert, files.get("_errors.log"), "_errors.log");
   assert.ok(log.some((entry) => entry.path === surface && entry.status === 200), "the 200 answer named in the note was observed");
+});
+
+const PRIMITIVE_BODY_WORDING = /Cannot use 'in' operator|TypeError|is not an object/;
+
+test("rule 9: a 200 answer whose body is a JSON string or array on /api/v2/ping/ or /api/v2/me/ is not the documented object and is dropped; no 6-to-24-character window of it and no TypeError wording reaches the access check, an assessment, or the bundle", async () => {
+  // Positive control for the class: the `in` operator on a primitive quotes the whole value in its TypeError message.
+  assert.throws(() => "version" in ANSIBLE_PRIMITIVE_BODY_CANARY, (error) => error instanceof TypeError && error.message.includes(ANSIBLE_PRIMITIVE_BODY_CANARY));
+  const stringBody = JSON.stringify(ANSIBLE_PRIMITIVE_BODY_CANARY);
+  assert.equal(stringBody.length, 21, "the string body is the 21-character shape the reviewer measured");
+
+  for (const [surface, body] of [
+    ["/api/v2/ping/", stringBody],
+    ["/api/v2/ping/", JSON.stringify([ANSIBLE_PRIMITIVE_BODY_CANARY])],
+    ["/api/v2/me/", stringBody],
+  ]) {
+    const label = `${surface} ${body[0] === "[" ? "array" : "string"} body`;
+    const log = [];
+    const client = aapClient({ ...healthyAapRoutes(), [surface]: () => aapResponse(body, 200, "OK", "application/json") }, log);
+    const run = await runEveryAnsibleTool(client, createTempBase("grclanker-ansible-primitive-body-"));
+
+    assert.equal(run.accessError, undefined, `${label}: the access check completes`);
+    if (surface === "/api/v2/ping/") {
+      assert.equal(run.access.ping, undefined, `${label}: a body that is not the ping object is dropped, not projected`);
+      assert.equal(run.access.status, "healthy", `${label}: the ping body does not change the verdict of the readable surfaces`);
+    } else {
+      assert.equal(run.access.currentUser, undefined, `${label}: a body that is not the user object yields no current user`);
+      assert.ok(run.access.notes.includes("Authentication succeeded but /api/v2/me/ did not return a recognizable user."), `${label}: the access check says the user was not recognizable`);
+      assert.equal(run.access.status, "limited", `${label}: no current user caps the access verdict`);
+    }
+    assertNoCanaryWindows(assert, run.access, [ANSIBLE_PRIMITIVE_BODY_CANARY], `${label} check_access`);
+    assert.doesNotMatch(JSON.stringify(run.access), PRIMITIVE_BODY_WORDING, `${label}: no TypeError wording reaches check_access`);
+    for (const assessment of run.assessments) {
+      assertNoCanaryWindows(assert, assessment, [ANSIBLE_PRIMITIVE_BODY_CANARY], `${label} ${assessment.title}`);
+      assert.doesNotMatch(JSON.stringify(assessment), PRIMITIVE_BODY_WORDING, `${label}: no TypeError wording reaches ${assessment.title}`);
+    }
+
+    assert.equal(run.exportError, undefined, `${label}: the export completes`);
+    const files = readBundleFiles(run.exported.outputDir);
+    assertNoCanaryWindowsInFiles(assert, files, [ANSIBLE_PRIMITIVE_BODY_CANARY], `${label} bundle`);
+    assertNoCanaryWindowsInFiles(assert, readZipEntries(run.exported.zipPath), [ANSIBLE_PRIMITIVE_BODY_CANARY], `${label} zip`);
+    for (const [name, text] of files) assert.doesNotMatch(text, PRIMITIVE_BODY_WORDING, `${label}: no TypeError wording reaches bundle ${name}`);
+    const accessFile = JSON.parse(files.get("core_data/access.json"));
+    if (surface === "/api/v2/ping/") assert.equal(accessFile.ping, undefined, `${label}: access.json carries no ping`);
+    assert.ok(log.some((entry) => entry.path === surface && entry.status === 200), `${label}: the 200 answer was observed`);
+  }
 });
