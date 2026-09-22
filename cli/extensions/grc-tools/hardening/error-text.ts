@@ -70,6 +70,18 @@ export const MAX_VENDOR_MESSAGE_LENGTH = 400;
 export const MAX_ERROR_MESSAGE_LENGTH = 2000;
 
 const TRUNCATION_NOTE = " [truncated]";
+// The cut of a long message (see `truncate`): a word is not split when a space stands within this
+// many characters before the limit, and the head is moved back to a space at most this many times
+// until it is a fixed point of the scrub.
+const CUT_WORD_BOUNDARY_WINDOW = 40;
+const MAX_CUT_ATTEMPTS = 4;
+// The tail of a cut head that a second pass would read as a value: a separator followed only by a
+// quote, a scheme word, or both (`X-Api-Key: "`, `"Authorization": "Bearer`), a trailing partial query
+// or fragment of a URL (`?token=`, `#`), trailing spaces, and a dangling escape backslash.
+const CUT_VALUE_OPENER_PATTERN = /([:=])[ \t]*(?:\\*["'])?[ \t]*(?:(?:Bearer|Basic|Token|Digest|OAuth|Negotiate|NTLM|SSWS|ApiKey|Api-Key|Splunk)[ \t]*)?$/i;
+const CUT_URL_TAIL_PATTERN = /([a-z][a-z0-9+.-]*:\/\/(?:\[REDACTED\]|[^\s"'<>()[\]{}\\])*?)[?#&](?!\[REDACTED\]$)[^\s?#&"'<>()[\]{}\\]*$/i;
+const CUT_TAIL_PATTERN = /(?:[ \t]|\\+|[?#&]+)+$/;
+const CUT_WORD_CHARACTER_PATTERN = /[A-Za-z0-9_-]/;
 const MAX_CAUSE_DEPTH = 5;
 const MAX_AGGREGATE_MEMBERS = 3;
 const MAX_VENDOR_MESSAGES = 5;
@@ -165,6 +177,9 @@ const PAIR_BARE_VALUE_PATTERN = /[^\s"',;&<>()[\]{}\\]+/y;
 // Punctuation that closes a clause rather than a value (`password: <value>.`, `token=<value>:`); it is
 // left standing after the marker so the sentence keeps its shape.
 const CLAUSE_PUNCTUATION_PATTERN = /[.:]+$/;
+// A character that continues a value glued to a marker (`[REDACTED]abc` is not scrubbed text; see
+// `isBlankOrScrubbed`).
+const VALUE_CHARACTER_PATTERN = /[A-Za-z0-9_~+/=%-]/;
 // The JSON literals hold no credential (`"password": null`, `"otp": true`), as in `redactSecretValues`.
 const JSON_LITERAL_PATTERN = /^(?:null|true|false)$/;
 
@@ -557,10 +572,17 @@ function stickyExec(pattern: RegExp, text: string, index: number): string | null
   return pattern.exec(text)?.[0] ?? null;
 }
 
-/** A value position already holding the marker is left alone so a second pass over scrubbed text is a no-op. */
+/**
+ * A value position already holding the marker is left alone so a second pass over scrubbed text is a
+ * no-op: blank, the marker alone, or the marker followed by something that is not a value character,
+ * which is what a renderer or the cut appends after an unterminated quoted value (`"password":
+ * "[REDACTED])`, `"[REDACTED]; two)`, `"[REDACTED] [truncated]`). A marker glued to a value
+ * (`[REDACTED]abc`) is not scrubbed text and goes with it.
+ */
 function isBlankOrScrubbed(value: string): boolean {
   const trimmed = value.trim();
-  return trimmed.length === 0 || trimmed === REDACTED;
+  if (trimmed.length === 0 || trimmed === REDACTED) return true;
+  return trimmed.startsWith(REDACTED) && !VALUE_CHARACTER_PATTERN.test(trimmed.charAt(REDACTED.length));
 }
 
 function skipSpaces(text: string, index: number): number {
@@ -858,8 +880,48 @@ function asText(value: unknown): string | undefined {
   return typeof value === "string" && value.trim().length > 0 ? value : undefined;
 }
 
-function truncate(text: string, limit: number): string {
-  return text.length <= limit ? text : `${text.slice(0, limit)}${TRUNCATION_NOTE}`;
+/**
+ * Cuts scrubbed `text` to at most `limit` characters and appends the truncation note; a text already
+ * cut and carrying the note is returned as it is. The cut falls where a second scrub over the cut
+ * text is a no-op: never inside a marker (the head ends before it), at a space rather than inside a
+ * word when one stands within `CUT_WORD_BOUNDARY_WINDOW` characters (a scheme word or a kept prose
+ * word cut in half would be read as a value), and never on a value opener the cut leaves standing
+ * (a separator followed only by a quote or a scheme word drops back to the separator; a partial query
+ * or fragment of a URL is dropped). The head is then checked as a fixed point of `scrubErrorText`
+ * with the same options and moved back to the previous space while it is not, a few times at most.
+ */
+function truncate(text: string, limit: number, options: ScrubErrorTextOptions = {}): string {
+  if (text.length <= limit) return text;
+  if (text.endsWith(TRUNCATION_NOTE) && text.length <= limit + TRUNCATION_NOTE.length) return text;
+  let end = limit;
+  let candidate = "";
+  for (let attempt = 0; attempt < MAX_CUT_ATTEMPTS; attempt += 1) {
+    const head = cutHead(text, end);
+    candidate = `${head}${TRUNCATION_NOTE}`;
+    if (scrubErrorText(candidate, options) === candidate) return candidate;
+    const space = head.search(/\s\S*$/);
+    if (space <= 0) break;
+    end = space;
+  }
+  return candidate;
+}
+
+/** The head of `text` cut at or before `end` under the rules of `truncate`, without the note. */
+function cutHead(text: string, end: number): string {
+  let cut = end;
+  const marker = text.lastIndexOf(REDACTED, cut - 1);
+  if (marker >= 0 && marker + REDACTED.length > cut) cut = marker;
+  if (cut > 0 && cut < text.length && CUT_WORD_CHARACTER_PATTERN.test(text[cut]) && CUT_WORD_CHARACTER_PATTERN.test(text[cut - 1])) {
+    const window = text.slice(Math.max(0, cut - CUT_WORD_BOUNDARY_WINDOW), cut);
+    const space = window.search(/\s\S*$/);
+    if (space >= 0) cut -= window.length - space;
+  }
+  return text
+    .slice(0, cut)
+    .replace(CUT_TAIL_PATTERN, "")
+    .replace(CUT_URL_TAIL_PATTERN, "$1")
+    .replace(CUT_VALUE_OPENER_PATTERN, "$1")
+    .replace(CUT_TAIL_PATTERN, "");
 }
 
 /** The media type of a Content-Type header value, lowercased and without parameters; "unknown" when missing or malformed. */
@@ -928,7 +990,7 @@ export function describeErrorBody(contentType: string | null | undefined, rawTex
   if (!JSON_MEDIA_TYPE_PATTERN.test(mediaType)) return `non-JSON body (${mediaType}, ${bytes} bytes)`;
   const payload = parseJsonValue(rawText);
   if (payload === undefined) return `malformed JSON body (${mediaType}, ${bytes} bytes)`;
-  const messages = documentedMessages(payload).map((message) => truncate(scrubErrorText(message, options), MAX_VENDOR_MESSAGE_LENGTH));
+  const messages = documentedMessages(payload).map((message) => truncate(scrubErrorText(message, options), MAX_VENDOR_MESSAGE_LENGTH, options));
   if (messages.length === 0) return `JSON body without a documented message field (${bytes} bytes)`;
   return messages.join("; ");
 }
@@ -1087,7 +1149,7 @@ function scrubErrorValue(value: unknown, options: ScrubErrorTextOptions, seen: S
     endpoint ??= scrubbedCause.endpoint;
   }
 
-  const scrubbed: ScrubbedError = { name, message: truncate(parts.join(" "), MAX_ERROR_MESSAGE_LENGTH) };
+  const scrubbed: ScrubbedError = { name, message: truncate(parts.join(" "), MAX_ERROR_MESSAGE_LENGTH, options) };
   if (code !== undefined) scrubbed.code = code;
   if (status !== undefined) scrubbed.status = status;
   if (endpoint !== undefined) scrubbed.endpoint = endpoint;

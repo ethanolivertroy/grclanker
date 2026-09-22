@@ -41,6 +41,7 @@ import {
   jsonCanarySentence,
 } from "./helpers/hardening-canaries.mjs";
 
+const TRUNCATION_NOTE = " [truncated]";
 const HEX_DIGEST = "4f3a9c1b7e2d8f6a0b5c4d3e2f1a0b9c";
 const UUID = "123e4567-e89b-12d3-a456-426614174000";
 const CONFIGURED_SECRET = "s3cr3t-Value-With-Case-42";
@@ -486,10 +487,110 @@ test("URL scrubbing is idempotent for query-only, fragment-only, and mixed URLs,
   for (const text of corpus) {
     const once = describe(text);
     assert.ok(once.startsWith(prefix), `describeFailedResponse for ${JSON.stringify(text)}: ${once}`);
-    const asMessage = once.length <= MAX_VENDOR_MESSAGE_LENGTH ? once : `${once.slice(0, MAX_VENDOR_MESSAGE_LENGTH)} [truncated]`;
-    assert.equal(describe(once), `${prefix}${asMessage}`, `describeFailedResponse changed its own output for ${JSON.stringify(text)}`);
+    const again = describe(once);
+    if (once.length <= MAX_VENDOR_MESSAGE_LENGTH) {
+      assert.equal(again, `${prefix}${once}`, `describeFailedResponse changed its own output for ${JSON.stringify(text)}`);
+    } else {
+      // A line over the cut is cut again as a message: the head is a prefix of the line, cut where a
+      // second scrub is a no-op (see the cut test below), and the note follows.
+      const middle = again.slice(prefix.length, again.length - TRUNCATION_NOTE.length);
+      assert.ok(again.endsWith(TRUNCATION_NOTE) && once.startsWith(middle), `describeFailedResponse cut its own output badly for ${JSON.stringify(text)}: ${again}`);
+      assert.equal(scrubErrorText(again, { secrets }), again);
+    }
     assert.equal(scrubErrorText(once, { secrets }), once, `describeFailedResponse: scrubErrorText changed its output for ${JSON.stringify(text)}`);
     assert.equal(scrubDataText(once, { secrets }), once, `describeFailedResponse: scrubDataText changed its output for ${JSON.stringify(text)}`);
+  }
+});
+
+test("the cut of a long message and the cause, aggregate, and one-line renderings are fixed points: no split marker, no partial value, no re-read unterminated quote", () => {
+  // Review of #78 (gap 3): the 400-character cut left `"[REDACTED] [truncated]`, `'[REDACT [truncated]`,
+  // or `Bear [truncated]`, and a cause or aggregate frame left `"[REDACTED])`; the second pass read the
+  // unterminated quoted value again or took the partial token for a value.
+  const canary = ERROR_CANARY.apiKey;
+  // A marker followed by what a frame appended is scrubbed text: the frame's characters stay.
+  for (const [text, expected] of [
+    [`x "password": "${canary}`, `x "password": "${REDACTED}`],
+    [`x "password": "${REDACTED})`, `x "password": "${REDACTED})`],
+    [`x "password": "${REDACTED}; two)`, `x "password": "${REDACTED}; two)`],
+    [`X-Auth-Token: "${REDACTED}${TRUNCATION_NOTE}`, `X-Auth-Token: "${REDACTED}${TRUNCATION_NOTE}`],
+    [`X-Auth-Token: 'Bearer ${REDACTED}${TRUNCATION_NOTE}`, `X-Auth-Token: 'Bearer ${REDACTED}${TRUNCATION_NOTE}`],
+    [`"password": "${REDACTED} Cookie :${REDACTED}`, `"password": "${REDACTED} Cookie :${REDACTED}`],
+    [`Cookie: "${REDACTED})`, `Cookie: "${REDACTED})`],
+    // A marker glued to a value is not scrubbed text.
+    [`"password": "${REDACTED}${canary}"`, `"password": "${REDACTED}"`],
+    [`"password": "${REDACTED}-${canary}"`, `"password": "${REDACTED}"`],
+  ]) {
+    for (const scrub of [scrubErrorText, scrubDataText]) {
+      assert.equal(scrub(text), expected, text);
+      assert.equal(scrub(scrub(text)), expected, `second pass over ${JSON.stringify(text)}`);
+    }
+  }
+  const causeMessage = scrubError(new Error("outer", { cause: new Error(`upstream "password": "${canary}`) })).message;
+  assert.equal(causeMessage, `outer (cause: upstream "password": "${REDACTED})`);
+  assert.equal(scrubErrorText(causeMessage), causeMessage);
+  const aggregateMessage = scrubError(new AggregateError([new Error(`"password": "${canary}`), new Error("two")], "several")).message;
+  assert.equal(aggregateMessage, `several (2 errors: "password": "${REDACTED}; two)`);
+  assert.equal(scrubErrorText(aggregateMessage), aggregateMessage);
+  const folded = errorMessage(new Error(`"password": "${canary}\n Cookie: sid=${canary}`));
+  assert.equal(folded, `"password": "${REDACTED} Cookie: ${REDACTED}`);
+  assert.equal(errorMessage(new Error(folded)), folded);
+
+  // The cut swept across every position of a carrier straddling the vendor-message limit, through
+  // describeErrorBody's message and nested frames and describeFailedResponse: the output is at most
+  // the limit plus the note, a fixed point of both text scrubs and of the describer itself, and no
+  // window of the value survives.
+  const carriers = [
+    `header X-Auth-Token: "${canary}" was refused by the upstream`,
+    `header Proxy-Authorization: Bearer "${canary}" was refused`,
+    `header X-Api-Key: '${canary}' rejected`,
+    `body {"password": "${canary}", "status": 401} rejected`,
+    `header Cookie: sid=${canary}; Path=/; HttpOnly rejected`,
+    `see https://api.example.com/v1/x?token=${canary}&limit=5#frag for details`,
+    `client_token: expired at noon, then api_key=${canary} was tried`,
+    `the header Authorization: Bearer was sent empty, then Authorization: Bearer ${canary} was sent`,
+    `token_type: Bearer, access_token: ${canary}, expires_in: 3600`,
+    `header \\"X-Auth-Token\\": \\"Bearer ${canary}\\" was refused`,
+  ];
+  const describeMessage = (message) => describeErrorBody("application/json", JSON.stringify({ message }));
+  const describeNested = (message) => describeErrorBody("application/json", JSON.stringify({ error: { message: JSON.stringify({ detail: message }) } }));
+  const describeResponse = (message) =>
+    describeFailedResponse({ method: "GET", endpoint: "/v1/users", status: 502, statusText: "Bad Gateway", contentType: "application/json", body: JSON.stringify({ message }) });
+  let sweeps = 0;
+  for (const carrier of carriers) {
+    for (let padding = MAX_VENDOR_MESSAGE_LENGTH - carrier.length - 4; padding <= MAX_VENDOR_MESSAGE_LENGTH + 4; padding += 1) {
+      const message = `${"x".repeat(padding)} ${carrier}`;
+      for (const [name, describe] of [["describeErrorBody message", describeMessage], ["describeErrorBody nested", describeNested], ["describeFailedResponse", describeResponse]]) {
+        sweeps += 1;
+        const once = describe(message);
+        assert.ok(once.length <= MAX_VENDOR_MESSAGE_LENGTH + TRUNCATION_NOTE.length + 80, `${name}: ${once.length} characters for padding ${padding}`);
+        assertNoFragment(once, canary, { label: `${name} padding ${padding}` });
+        assert.equal(scrubErrorText(once), once, `${name} padding ${padding}: not a fixed point of scrubErrorText: ${JSON.stringify(once)}`);
+        assert.equal(scrubDataText(once), once, `${name} padding ${padding}: not a fixed point of scrubDataText: ${JSON.stringify(once)}`);
+        if (name === "describeErrorBody message") assert.equal(describe(once), once, `${name} padding ${padding}: re-described differently: ${JSON.stringify(once)}`);
+      }
+    }
+  }
+  assert.ok(sweeps > 0);
+  // The same sweep over the error-message limit of scrubError.
+  for (const carrier of carriers.slice(0, 5)) {
+    for (let padding = MAX_ERROR_MESSAGE_LENGTH - carrier.length - 2; padding <= MAX_ERROR_MESSAGE_LENGTH + 2; padding += 1) {
+      const message = `${"y".repeat(padding)} ${carrier}`;
+      const once = scrubError(new Error(message)).message;
+      assert.ok(once.length <= MAX_ERROR_MESSAGE_LENGTH + TRUNCATION_NOTE.length, `scrubError: ${once.length} characters for padding ${padding}`);
+      assertNoFragment(once, canary, { label: `scrubError padding ${padding}` });
+      assert.equal(scrubError(new Error(once)).message, once, `scrubError padding ${padding}: not a fixed point: ${JSON.stringify(once.slice(-80))}`);
+      assert.equal(errorMessage(new Error(once)), once, `errorMessage padding ${padding}`);
+    }
+  }
+  // A cut never splits a marker, and the head never ends on a value opener.
+  for (const carrier of carriers) {
+    for (let padding = MAX_VENDOR_MESSAGE_LENGTH - carrier.length - 4; padding <= MAX_VENDOR_MESSAGE_LENGTH + 4; padding += 1) {
+      const once = describeMessage(`${"x".repeat(padding)} ${carrier}`);
+      if (!once.endsWith(TRUNCATION_NOTE)) continue;
+      const head = once.slice(0, once.length - TRUNCATION_NOTE.length);
+      assert.doesNotMatch(head, /\[R(?:E(?:D(?:A(?:C(?:T(?:E(?:D)?)?)?)?)?)?)?$/, `split marker in ${JSON.stringify(head.slice(-40))}`);
+      assert.doesNotMatch(head, /[:=][ \t]*\\*["'][ \t]*(?:Bearer)?$/i, `value opener at the cut in ${JSON.stringify(head.slice(-40))}`);
+    }
   }
 });
 
