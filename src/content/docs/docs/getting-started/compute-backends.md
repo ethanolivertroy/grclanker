@@ -71,7 +71,7 @@ Adapters that do not support an operation throw a clear "does not support" error
 
 Command output is untrusted text: a container, VM, worker, or pod can echo its own environment, and the host shell inherits yours. Every adapter therefore routes its output through one redaction guard before anything is streamed, returned, printed, or persisted:
 
-- Exact values of `RUNPOD_API_KEY`, `MODAL_TOKEN_ID`, `MODAL_TOKEN_SECRET`, `VERCEL_TOKEN`, and `CLOUDFLARE_API_TOKEN` from your environment are replaced with `[REDACTED]`.
+- Exact values of `RUNPOD_API_KEY`, `MODAL_TOKEN_ID`, `MODAL_TOKEN_SECRET`, `VERCEL_TOKEN`, and `CLOUDFLARE_API_TOKEN` from your environment are replaced with `[REDACTED]`. Token values stored in the Modal CLI profile (`~/.modal.toml`) never enter grclanker's output at all: the profile loader records only whether `token_id` and `token_secret` are present (see "Modal").
 - Format-based patterns catch the same credentials when they arrive from the remote without being set locally: `Bearer <token>` headers, RunPod keys (`rpa_...`), Modal token ids and secrets (`ak-...`, `as-...`), `NAME=value` assignments of those variables (quoted or not), and PEM private key blocks (`-----BEGIN ... PRIVATE KEY-----` through `-----END ...-----`, replaced with `[REDACTED PRIVATE KEY]`).
 - Generic shapes that carry credentials without announcing a provider: in any `scheme://...` URL, the userinfo, every query value, and the fragment are replaced (`https://x/callback?access_token=[REDACTED]&state=[REDACTED]`; the path and parameter names stay so the URL is still recognizable, and a URL without a query is untouched); `Cookie:` and `Set-Cookie:` header values; and credential-named fields in header, assignment, or JSON form (`X-Api-Key: v`, `session_id=v`, `"token": "v"`, also `api_key`, `access_token`, `refresh_token`, `client_secret`, `password`, `sid`, `signature`, and similar names) with values of four or more characters. Query values are redacted regardless of name because a session token does not label itself, so a `curl -v` of a URL with a harmless query also shows `[REDACTED]` values in bash output.
 - Streamed output is scrubbed per completed line, so a credential split across two chunks is still caught; the trailing partial line is held until the next newline or the end of the command. The stream is the only channel the bash tool and `env exec` surface, so the sink also refuses to flush through an open PEM block: from a `-----BEGIN ... PRIVATE KEY-----` marker onward, output is held until the matching `END` marker arrives, which is what stops a line-at-a-time producer (a tty-attached `docker exec -t`, a script that flushes per line, a slow remote) from leaking the header and body one line at a time. A line that ends in `Bearer` is held for the token on the next line for the same reason. A block whose `END` never arrives (a truncated key file, a command killed by its timeout mid-key, or a held buffer that reaches the 256 KiB cap) is flushed at that point with the `BEGIN` marker and the contiguous run of body-shaped lines after it (base64, 16 or more characters, plus a trailing base64 fragment cut off by the end of the output) replaced by `[REDACTED PRIVATE KEY: unterminated block, body withheld]` (or `[REDACTED PRIVATE KEY: unterminated block]` when nothing followed the marker). The replacement names the withholding because that truncation would otherwise be invisible in the stream. Ordinary output after the body survives: a short line such as `ok` or a log line is not body shaped and ends the run, so `cat` of a truncated key followed by `done` streams as `[REDACTED PRIVATE KEY: unterminated block, body withheld]` then `done`. The cap exists so a never-closed block cannot pin memory; a block still open at 256 KiB is not a real key (those are a few KB), and only its body-shaped lines are withheld.
@@ -346,13 +346,18 @@ Snapshot and rollback run through the contract adapter (`prlctl snapshot <clone>
 
 State: shipped through the `modal` CLI. Modal exposes Sandbox lifecycle through its Python and JavaScript SDKs, so grclanker drives the documented CLI surface instead of adding an SDK dependency.
 
-Credentials: `MODAL_TOKEN_ID` and `MODAL_TOKEN_SECRET` (optionally `MODAL_ENVIRONMENT` and `MODAL_PROFILE`), as documented at [modal.com/docs/reference/modal.config](https://modal.com/docs/reference/modal.config). Run `modal setup` or `modal token set` once, or export the variables.
+Credentials: the modal CLI resolves its own credentials, and grclanker accepts either source it does, as documented at [modal.com/docs/reference/modal.config](https://modal.com/docs/reference/modal.config):
+
+- `MODAL_TOKEN_ID` and `MODAL_TOKEN_SECRET` in the environment, or
+- the profile that `modal setup` or `modal token set` writes to `.modal.toml` in your home directory (`MODAL_CONFIG_PATH` overrides the location). The file holds one table per profile with `token_id` and `token_secret`; grclanker picks the profile the way the client does: `MODAL_PROFILE` if set, else the table marked `active = true` by `modal profile activate` or `modal token set --activate`, else `[default]`. Each key may also come from its environment variable on its own, so `MODAL_TOKEN_ID` in the environment plus `token_secret` in the profile is accepted.
+
+`grclanker env list`, `env doctor`, and the adapter's healthcheck report which source was found (`Found Modal CLI profile "default" in /home/you/.modal.toml.`) and never a token value. The profile file is read and parsed in two guarded steps that keep only the presence of `token_id` and `token_secret`; a file that cannot be read is reported as `Unable to read Modal config file <path> (<code>)` with the errno code only, and a malformed file as `Unable to parse Modal config file: invalid TOML in <path> at line N (INVALID_TOML)`, so a token on the offending line never appears in the message. Optional settings: `MODAL_ENVIRONMENT` and `MODAL_PROFILE`.
 
 Setup:
 
 ```bash
 pip install modal
-export MODAL_TOKEN_ID=... MODAL_TOKEN_SECRET=...
+modal setup   # or: export MODAL_TOKEN_ID=... MODAL_TOKEN_SECRET=...
 grclanker setup --compute modal
 grclanker env smoke-test --backend modal
 ```
@@ -417,7 +422,7 @@ State: stubs. Both kinds exist in settings and `env list`, but selecting them fa
 npm --prefix cli run test:compute-backends:live
 ```
 
-The script runs `env doctor`, then `env smoke-test --backend <kind>` for every non-host backend whose binaries or credentials are present (Docker daemon, `prlctl`, `modal` with `MODAL_TOKEN_*`, `RUNPOD_API_KEY` with `RUNPOD_ENDPOINT_ID` or `RUNPOD_POD_ID`). It exits 0 with a skip message when nothing is available. Set `GRCLANKER_LIVE_BACKENDS=docker,modal` to restrict the run, or include `sandbox-runtime` to exercise the local sandbox.
+The script runs `env doctor`, then `env smoke-test --backend <kind>` for every non-host backend whose binaries or credentials are present (Docker daemon, `prlctl`, `modal` with `MODAL_TOKEN_*` or a `~/.modal.toml` profile, `RUNPOD_API_KEY` with `RUNPOD_ENDPOINT_ID` or `RUNPOD_POD_ID`). It exits 0 with a skip message when nothing is available. Set `GRCLANKER_LIVE_BACKENDS=docker,modal` to restrict the run, or include `sandbox-runtime` to exercise the local sandbox.
 
 ## Choose the right backend
 

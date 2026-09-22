@@ -7,6 +7,8 @@ import { dirname, join } from "node:path";
 
 import {
   COMPUTE_BACKEND_KINDS,
+  getComputeBackendConfigurationIssues,
+  getComputeBackendCredentialState,
   getComputeBackendSurfaceLabel,
   getComputeProfileIssues,
   getDefaultComputeProfile,
@@ -30,6 +32,13 @@ import {
   createModalBackend,
   decodeModalCommandWrapper,
 } from "../dist/pi/backends/modal.js";
+import {
+  describeModalCredentialSource,
+  detectModalCredentials,
+  MODAL_CONFIG_FILE_NAME,
+  parseModalProfileText,
+  resolveModalConfigPath,
+} from "../dist/pi/backends/modal-profile.js";
 import {
   buildParallelsShareArgs,
   createParallelsBackend,
@@ -83,6 +92,10 @@ const RUNPOD_POD_JSON = JSON.stringify({
   publicIp: "203.0.113.10",
   portMappings: { "22": 22022 },
 });
+
+// A profile path that never exists, so a real ~/.modal.toml on the test host cannot change
+// what the "no Modal credentials" cases observe.
+const MISSING_MODAL_CONFIG_PATH = join(tmpdir(), "grclanker-no-modal-profile-3f9c1a", ".modal.toml");
 
 function createFakeRunner(handler) {
   const calls = [];
@@ -385,7 +398,7 @@ test("modal adapter shells out through documented modal shell flags and redacts 
     await backend.teardown("m1");
   });
 
-  await withEnv({ MODAL_TOKEN_ID: undefined, MODAL_TOKEN_SECRET: undefined }, async () => {
+  await withEnv({ MODAL_TOKEN_ID: undefined, MODAL_TOKEN_SECRET: undefined, MODAL_CONFIG_PATH: MISSING_MODAL_CONFIG_PATH }, async () => {
     const backend = createModalBackend({ runner: async () => ({ exitCode: 0, stdout: "", stderr: "" }) });
     await assert.rejects(() => backend.healthcheck(), /Set MODAL_TOKEN_ID/);
   });
@@ -506,6 +519,7 @@ test("env list reports every backend with kind, bucket, and readiness", () => {
   withEnv({
     MODAL_TOKEN_ID: undefined,
     MODAL_TOKEN_SECRET: undefined,
+    MODAL_CONFIG_PATH: MISSING_MODAL_CONFIG_PATH,
     RUNPOD_API_KEY: undefined,
     RUNPOD_ENDPOINT_ID: undefined,
     RUNPOD_POD_ID: undefined,
@@ -1966,4 +1980,175 @@ test("parallels mount wait reports the deadline exit as a typed timeout and dest
   );
   assert.deepEqual(calls.slice(-2).map((call) => call.args[0]), ["stop", "delete"]);
   await assert.rejects(() => backend.exec({ sessionId: "s", command: ["true"], cwd: "/x" }), /Call stageWorkspace first/);
+});
+
+test("modal credentials resolve from the environment or the CLI profile file without exposing a token value", async () => {
+  const home = mkdtempSync(join(tmpdir(), "grclanker-modal-home-"));
+  const profilePath = join(home, MODAL_CONFIG_FILE_NAME);
+  const PROFILE_ID = "ak-FAKEPROFILEID0123456789";
+  const PROFILE_SECRET = "as-FAKEPROFILESECRET0123456789";
+  // Not shaped like a Modal token on purpose: only the loader's fixed-text contract, never the
+  // format scrub, can keep it out of an error.
+  const PLANTED = "plantedProfileSecret7Q9Z";
+  const tokenValues = [PROFILE_ID, PROFILE_SECRET, PLANTED];
+  const assertNoTokenValue = (text) => {
+    for (const value of tokenValues) assert.ok(!text.includes(value), `token value leaked into: ${text}`);
+  };
+  const noEnv = { MODAL_TOKEN_ID: undefined, MODAL_TOKEN_SECRET: undefined, MODAL_PROFILE: undefined, MODAL_CONFIG_PATH: undefined };
+  const settings = { computeBackend: "modal" };
+  const credentialIssues = (issues) => issues.filter((issue) => !issue.startsWith("Install the modal CLI"));
+  const versionRunner = () => createFakeRunner(async (_executable, args) => (
+    args[0] === "--version" ? { exitCode: 0, stdout: "modal client version: 1.0\n" } : { exitCode: 0, stdout: "ok\n" }
+  ));
+
+  try {
+    // Documented location: ~/.modal.toml, overridable through MODAL_CONFIG_PATH.
+    assert.equal(resolveModalConfigPath({}, home), profilePath);
+    assert.equal(resolveModalConfigPath({ MODAL_CONFIG_PATH: "/etc/modal/profile.toml" }, home), "/etc/modal/profile.toml");
+
+    // 1. The documented shape written by `modal token set`, env unset: not flagged, and the
+    //    healthcheck and exec paths proceed to the CLI call.
+    writeFileSync(profilePath, `# written by modal token set\n[default]\ntoken_id = "${PROFILE_ID}"\ntoken_secret = "${PROFILE_SECRET}"\n`);
+    await withEnv({ ...noEnv, MODAL_CONFIG_PATH: profilePath }, async () => {
+      assert.deepEqual(detectModalCredentials(), { kind: "profile", path: profilePath, profile: "default" });
+      assert.deepEqual(credentialIssues(getComputeBackendConfigurationIssues(settings, "modal")), []);
+      const state = getComputeBackendCredentialState("modal");
+      assert.equal(state.ok, true);
+      assert.match(state.detail, /^Found Modal CLI profile "default" in .*\.modal\.toml\.$/);
+      assertNoTokenValue(state.detail);
+
+      const { runner, calls } = versionRunner();
+      const backend = createModalBackend({ runner });
+      await backend.healthcheck();
+      assert.deepEqual(calls.map((call) => [call.executable, call.args[0]]), [["modal", "--version"]]);
+      const result = await backend.exec({ sessionId: "p", command: ["pwd"], cwd: "/mnt/repo" });
+      assert.equal(result.exitCode, 0);
+      assert.equal(calls.at(-1).args[0], "shell");
+      for (const call of calls) assertNoTokenValue(JSON.stringify(call.args));
+    });
+    // The same file is found through the home directory, not only through the override.
+    assert.deepEqual(detectModalCredentials({}, home), { kind: "profile", path: profilePath, profile: "default" });
+
+    // 2. Neither the environment nor the file: still flagged, and the CLI is never called.
+    await withEnv({ ...noEnv, MODAL_CONFIG_PATH: MISSING_MODAL_CONFIG_PATH }, async () => {
+      assert.equal(detectModalCredentials().kind, "missing");
+      const issues = credentialIssues(getComputeBackendConfigurationIssues(settings, "modal"));
+      assert.equal(issues.length, 1);
+      assert.match(
+        issues[0],
+        /^Set MODAL_TOKEN_ID and MODAL_TOKEN_SECRET in the environment, or run `modal setup` \/ `modal token set` to write .*\.modal\.toml \(the file does not exist\)\.$/,
+      );
+      assert.equal(getComputeBackendCredentialState("modal").ok, false);
+      const { runner, calls } = versionRunner();
+      const backend = createModalBackend({ runner });
+      await assert.rejects(() => backend.healthcheck(), /Set MODAL_TOKEN_ID and MODAL_TOKEN_SECRET/);
+      await assert.rejects(() => backend.exec({ sessionId: "p", command: ["pwd"], cwd: "/" }), /Set MODAL_TOKEN_ID and MODAL_TOKEN_SECRET/);
+      assert.equal(calls.length, 0);
+    });
+
+    // The environment alone is still enough, with or without a file.
+    await withEnv({ ...noEnv, MODAL_TOKEN_ID: "ak-FAKEENVID0123456789ABC", MODAL_TOKEN_SECRET: "as-FAKEENVSECRET0123456789", MODAL_CONFIG_PATH: MISSING_MODAL_CONFIG_PATH }, () => {
+      assert.deepEqual(detectModalCredentials(), { kind: "environment" });
+      assert.deepEqual(credentialIssues(getComputeBackendConfigurationIssues(settings, "modal")), []);
+      assert.equal(getComputeBackendCredentialState("modal").detail, "Found MODAL_TOKEN_ID, MODAL_TOKEN_SECRET in the environment.");
+    });
+
+    // Per-key resolution like the client: an environment override for one key completes a
+    // profile that holds only the other.
+    writeFileSync(profilePath, `[default]\ntoken_secret = "${PROFILE_SECRET}"\n`);
+    await withEnv({ ...noEnv, MODAL_TOKEN_ID: "ak-FAKEENVID0123456789ABC", MODAL_CONFIG_PATH: profilePath }, () => {
+      assert.equal(detectModalCredentials().kind, "profile");
+    });
+    await withEnv({ ...noEnv, MODAL_CONFIG_PATH: profilePath }, () => {
+      const source = detectModalCredentials();
+      assert.equal(source.kind, "missing");
+      assert.equal(source.detail, 'profile "default" has no token_id');
+    });
+
+    // 3. Profile selection: MODAL_PROFILE, else the table marked active, else default.
+    writeFileSync(profilePath, [
+      "[default]",
+      'loglevel = "DEBUG"',
+      "",
+      "[work] # activated with `modal profile activate work`",
+      `token_id = '${PROFILE_ID}'`,
+      `token_secret = "${PROFILE_SECRET}" # trailing comment`,
+      "active = true",
+      "logs_timeout = 10",
+      "",
+    ].join("\n"));
+    await withEnv({ ...noEnv, MODAL_CONFIG_PATH: profilePath }, () => {
+      assert.deepEqual(detectModalCredentials(), { kind: "profile", path: profilePath, profile: "work" });
+    });
+    await withEnv({ ...noEnv, MODAL_CONFIG_PATH: profilePath, MODAL_PROFILE: "default" }, () => {
+      const source = detectModalCredentials();
+      assert.equal(source.kind, "missing");
+      assert.equal(source.detail, 'profile "default" has no token_id and token_secret');
+      assertNoTokenValue(describeModalCredentialSource(source));
+    });
+    await withEnv({ ...noEnv, MODAL_CONFIG_PATH: profilePath, MODAL_PROFILE: "staging" }, () => {
+      const source = detectModalCredentials();
+      assert.equal(source.kind, "missing");
+      assert.equal(source.detail, 'the file has no "staging" profile');
+    });
+
+    // 4. A malformed profile with a planted credential on the bad line: the error carries the
+    //    path, the line number, and the code only, and the healthcheck never reaches the CLI.
+    writeFileSync(profilePath, `[default]\ntoken_id = "${PROFILE_ID}"\ntoken_secret = ${PLANTED}\n`);
+    await withEnv({ ...noEnv, MODAL_CONFIG_PATH: profilePath }, async () => {
+      const source = detectModalCredentials();
+      assert.equal(source.kind, "invalid");
+      assert.equal(source.message, `Unable to parse Modal config file: invalid TOML in ${profilePath} at line 3 (INVALID_TOML)`);
+      const issues = credentialIssues(getComputeBackendConfigurationIssues(settings, "modal"));
+      assert.equal(issues.length, 1);
+      assert.match(
+        issues[0],
+        /^Unable to parse Modal config file: invalid TOML in .*\.modal\.toml at line 3 \(INVALID_TOML\)\. Fix the file or set MODAL_TOKEN_ID and MODAL_TOKEN_SECRET in the environment\.$/,
+      );
+      assertNoTokenValue(issues[0]);
+      assertNoTokenValue(getComputeBackendCredentialState("modal").detail);
+      const { runner, calls } = versionRunner();
+      const backend = createModalBackend({ runner });
+      await assert.rejects(() => backend.healthcheck(), (error) => {
+        assert.ok(error instanceof ExecutionBackendError);
+        assert.match(error.message, /invalid TOML in .* at line 3 \(INVALID_TOML\)/);
+        assertNoTokenValue(error.message);
+        return true;
+      });
+      assert.equal(calls.length, 0);
+    });
+
+    // Other malformed shapes: a bare line carrying tokens, a duplicate table, a broken header, a duplicate key.
+    for (const [text, line, code] of [
+      [`[default]\n${PLANTED} ${PROFILE_SECRET}\n`, 2, "INVALID_TOML"],
+      [`[default]\ntoken_id = "${PROFILE_ID}"\n[default]\ntoken_secret = "${PROFILE_SECRET}"\n`, 3, "DUPLICATE_KEY"],
+      [`[default\ntoken_id = "${PROFILE_ID}"\n`, 1, "INVALID_TOML"],
+      [`[default]\ntoken_id = "${PROFILE_ID}"\ntoken_id = "${PLANTED}"\n`, 3, "DUPLICATE_KEY"],
+    ]) {
+      assert.throws(() => parseModalProfileText(text, profilePath), (error) => {
+        assert.equal(error.name, "ConfigFileError");
+        assert.equal(error.message, `Unable to parse Modal config file: invalid TOML in ${profilePath} at line ${line} (${code})`);
+        assertNoTokenValue(error.message);
+        return true;
+      });
+    }
+
+    // The parser keeps presence only; no token value is held on the parsed result.
+    const parsed = parseModalProfileText(`[default]\ntoken_id = "${PROFILE_ID}"\ntoken_secret = "${PROFILE_SECRET}"\n`, profilePath);
+    assert.deepEqual([...parsed.profiles.get("default").credentials].sort(), ["token_id", "token_secret"]);
+    assertNoTokenValue(JSON.stringify([...parsed.profiles.entries()].map(([name, table]) => [name, [...table.credentials], table.active])));
+
+    // 5. A read failure other than ENOENT follows the loader standard: path and errno code, no filesystem wording.
+    const directoryPath = join(home, "profile-dir");
+    mkdirSync(directoryPath);
+    await withEnv({ ...noEnv, MODAL_CONFIG_PATH: directoryPath }, () => {
+      const source = detectModalCredentials();
+      assert.equal(source.kind, "invalid");
+      assert.equal(source.message, `Unable to read Modal config file ${directoryPath} (EISDIR)`);
+      const issues = credentialIssues(getComputeBackendConfigurationIssues(settings, "modal"));
+      assert.match(issues[0], /^Unable to read Modal config file .* \(EISDIR\)\. Fix the file or set MODAL_TOKEN_ID/);
+    });
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
 });
