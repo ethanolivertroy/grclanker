@@ -2299,6 +2299,86 @@ test("reviewer E gap 9: every credential header and pair key after a JSON string
   assert.equal(cases, 2 * (GAP9_HEADERS.length * GAP9_ESCAPES.length + GAP9_PAIRS.length) * GAP9_CONTEXTS.length);
 });
 
+// Reviewer E gap 10: two RFC 6265 token characters let a later cookie pair's value through.
+// An apostrophe in a pair name or value (my'pref=value, sid=O'hunter2) was read as the quote
+// closing the text the line was quoted in, so the value ended at "my" and the pair after
+// the apostrophe stayed; and "&" or "#" in a credential-named pair whose value sat in
+// JSON-escaped quotes (my&sid=\"value\") was taken first by the URL query rule with the
+// lone backslash as its value, leaving the quoted value behind an orphan quote. Two rules
+// now hold in both scrubs of all three modules: a quote closes a value only at the end of a
+// token (before whitespace, a delimiter, a bracket, another quote, an escape, or the end),
+// never mid-token, in header values, pair values, quoted attributes, and query values; and
+// a bare query value never takes a backslash (the escape after it is kept, so a JSON string
+// still parses and the text after it is still read), with a recognised header line read
+// before the query rule. The controls, the closing quote and following members of an
+// enclosing JSON member, escaped controls, and a single-quoted enclosing text survive.
+const GAP10_VALUES = ["hunter2", "Tr0ub4dor3", "correct-horse-battery-staple", "abc123", "x7", "9f8e7d6c5b4a3f2e1d0c", "O'Brien42", "p@ss.w0rd", "sess-apos-QUOTE-14142135623730", "dXNlcjpwYXNzd29yZA==", "AKIAIOSFODNN7EXAMPLE", "s3cr3t_2026-09-22T18.00.00Z"];
+const GAP10_ROWS = [
+  // rule 1: an apostrophe or a raw quote inside a token is content of the value
+  [(v) => `Cookie: theme=dark; my'pref=${v}; Content-Type: "text/html; charset=utf-8"`, () => `Cookie: [REDACTED]; Content-Type: "text/html; charset=utf-8"`],
+  [(v) => `Cookie: theme=dark; my'pref="${v}"; Date: "Mon, 22 Sep 2026 12:30:00 GMT"`, () => `Cookie: [REDACTED]; Date: "Mon, 22 Sep 2026 12:30:00 GMT"`],
+  [(v) => `Cookie: sid=O'${v}; Content-Type: "text/html; charset=utf-8"`, () => `Cookie: [REDACTED]; Content-Type: "text/html; charset=utf-8"`],
+  [(v) => `Cookie: theme=dark; my"pref=${v}`, () => `Cookie: [REDACTED]`],
+  [(v) => `Cookie: sid="O'${v}"; theme=dark; X-ApiKeys: accessKey=${v}`, () => `Cookie: [REDACTED]; X-ApiKeys: [REDACTED]`],
+  [(v) => `Set-Cookie: my'sid=${v}; Path=/; HttpOnly; Date: Mon, 22 Sep 2026 12:30:00 GMT`, () => `Set-Cookie: [REDACTED]; Date: Mon, 22 Sep 2026 12:30:00 GMT`],
+  [(v) => `X-Cookie: token=a; my'pref=${v}`, () => `X-Cookie: [REDACTED]`],
+  [(v) => `{"detail":"Cookie: theme=dark; my'pref=${v}","code":401}`, () => `{"detail":"Cookie: [REDACTED]","code":401}`],
+  [(v) => `{"detail":"Cookie: sid=O'${v}; Content-Type: text/html","code":401}`, () => `{"detail":"Cookie: [REDACTED]; Content-Type: text/html","code":401}`],
+  [(v) => `'Cookie: sid=O'${v}'`, () => `'Cookie: [REDACTED]'`],
+  [(v) => `sid=O'${v}; path=/`, () => `sid=[REDACTED]; path=/`],
+  [(v) => `password: O'${v}`, () => `password: [REDACTED]`],
+  [(v) => `password='O'${v}'`, () => `password='[REDACTED]'`],
+  [(v) => `{"x":"token=O'${v}"}`, () => `{"x":"token=[REDACTED]"}`],
+  [(v) => `?token=O'${v}&x=1`, () => `?token=[REDACTED]&x=1`],
+  // rule 2: a bare query value stops before a backslash and the escape is kept
+  [(v) => `{"url": "https://h.example.com/p?token=${v}\\"}`, () => `{"url": "https://h.example.com/p?token=[REDACTED]\\"}`],
+  [(v) => `{"log": "GET /x?api_key=${v}\\nstatus 502"}`, () => `{"log": "GET /x?api_key=[REDACTED]\\nstatus 502"}`],
+  [(v) => `{"hook":"https://hooks.slack.com/services/T000/B000/${v}\\"}`, () => `{"hook":"https://hooks.slack.com/services/[REDACTED]\\"}`],
+  [(v) => `{"message": "Cookie: theme=dark; my&sid=\\"${v}\\""}`, () => `{"message": "Cookie: [REDACTED]"}`],
+  [(v) => `{"headers":"Set-Cookie: my#sid=\\"${v}\\"; HttpOnly; Content-Type: \\"text/html\\""}`, () => `{"headers":"Set-Cookie: [REDACTED]; Content-Type: \\"text/html\\""}`],
+  [(v) => `{"headers":"Cookie: theme=dark; my&sid=\\"${v}\\"; Content-Type: \\"text/html; charset=utf-8\\"; Date: \\"Mon, 22 Sep 2026 12:30:00 GMT\\""}`, () => `{"headers":"Cookie: [REDACTED]; Content-Type: \\"text/html; charset=utf-8\\"; Date: \\"Mon, 22 Sep 2026 12:30:00 GMT\\""}`],
+  // boundaries that held before and must keep holding
+  [(v) => `Authorization: Bearer ${v}&token=${v}`, () => `Authorization: [REDACTED]`],
+  [(v) => `Cookie: my&sid=${v}`, () => `Cookie: [REDACTED]`],
+  [(v) => `Cookie: theme=dark; my#sid=${v}`, () => `Cookie: [REDACTED]`],
+  [(v) => `rejected header "Cookie: sid=${v}" and "X-Other: 1"`, () => `rejected header "Cookie: [REDACTED]" and "X-Other: 1"`],
+  [(v) => `{"detail":"Cookie: sid=${v}","code":401}`, () => `{"detail":"Cookie: [REDACTED]","code":401}`],
+  [(v) => `'Cookie: sid=${v}'`, () => `'Cookie: [REDACTED]'`],
+  [(v) => `Cookie: "sid=${v}; X-ApiKeys: ${v}`, () => `Cookie: [REDACTED]; X-ApiKeys: [REDACTED]`],
+  [(v) => `X-ApiKeys: accessKey="${v}";secretKey="${v}"; Content-Type: application/json`, () => `X-ApiKeys: [REDACTED]; Content-Type: application/json`],
+  [(v) => `{"error":"X-ApiKeys: accessKey=\\"${v}\\";secretKey=\\"${v}\\"","code":403}`, () => `{"error":"X-ApiKeys: [REDACTED]","code":403}`],
+  [(v) => `Cookie: sid=${v}"; theme=dark`, () => `Cookie: [REDACTED]"; theme=dark`],
+  [(v) => `{"detail":"Authorization: Basic ${v}=","code":401}`, () => `{"detail":"Authorization: [REDACTED]","code":401}`],
+  [(v) => `Cookie: sid=${v}=" and "X-Other: 1"`, () => `Cookie: [REDACTED]" and "X-Other: 1"`],
+  [(v) => `sid=${v}'; path=/`, () => `sid=[REDACTED]'; path=/`],
+  [(v) => `api_key=${v}"}`, () => `api_key=[REDACTED]"}`],
+  [(v) => `?token=${v}'}`, () => `?token=[REDACTED]'}`],
+];
+const GAP10_CONTROLS = [
+  `Content-Type: "text/html; charset=utf-8"; Date: "Mon, 22 Sep 2026 12:30:00 GMT"`,
+  `{"detail":"it's a fine day","code":200}`,
+  `the cookie count is 3 and the token inventory holds 2`,
+  `{"names":["O'Brien","D'Angelo"],"cookies":0}`,
+  `password=""`,
+];
+
+test("reviewer E gap 10: a quote inside a token is content of a cookie, pair, attribute, or query value in both scrubs, a bare query value stops before a backslash and keeps the escape, and a recognised header line is read before the query rule", () => {
+  let cases = 0;
+  for (const scrub of [redactErrorText, redactCredentialValueText]) {
+    for (const [make, expect] of GAP10_ROWS) for (const value of GAP10_VALUES) {
+      const input = make(value);
+      const out = scrub(input);
+      const label = `reviewer E gap 10: ${scrub.name} ${JSON.stringify(input)}`;
+      assert.equal(out, expect(value), label);
+      assertNoWindow(out, value, label);
+      assert.equal(scrub(out), out, `${label}: not idempotent on ${out}`);
+      cases += 1;
+    }
+    for (const text of GAP10_CONTROLS) assert.equal(scrub(text), text, `reviewer E gap 10: ${scrub.name} changed a control: ${text}`);
+  }
+  assert.equal(cases, 2 * GAP10_ROWS.length * GAP10_VALUES.length);
+});
+
 test("scrub boundary: name-shaped values stay bare in prose, leave every carrier whatever their shape, and go as configured secrets in every form", () => {
   for (const value of NAME_SHAPED_VALUES) {
     for (const prose of [`inventory ${value} was not read`, `${value}`, `webhook ${value} read 12 of 40 destinations`, `path /var/lib/${value}/state`]) {
@@ -2620,6 +2700,11 @@ const CANARY_PLAIN = "jdvdnheoejphwk";
 // nor the pair rule removes it, only a header rule that carries a quoted value through its
 // closing quote, so its absence proves that rule ran.
 const CANARY_QUOTED = "sess-qtdv-QCARRY-16180339887498";
+// Reviewer E gap 10: a name-shaped value carried only behind an apostrophe in a cookie pair
+// name or value, behind "&" or "#" in a JSON-escaped quoted pair, and before an escaped
+// quote or line break in a query pair, so only the mid-token quote rule and the backslash
+// boundary remove it.
+const CANARY_APOSTROPHE = "sess-apos-QUOTE-14142135623730";
 const CANARIES = [CANARY_BEARER, CANARY_SESSION, CANARY_API_KEY, CANARY_URL_TOKEN, CANARY_NAMED, CANARY_PLAIN, CANARY_QUOTED];
 const CANARY_URL = `https://api.example.com/v1/x?token=${CANARY_URL_TOKEN}`;
 // A value only a refused foreign-origin next link carries, in its query and as its
@@ -2664,6 +2749,18 @@ const ECHOED_FORMS = [...secretForms(FIXTURE_API_TOKEN), ...secretForms(FIXTURE_
 // The plain Basic pair is echoed too; its email half is not a secret and stays.
 const ECHOED_MARKER = /credentials(?: \[REDACTED\])+ auditor@example\.com\/token:\[REDACTED\] rejected/;
 
+// Reviewer E gap 10: a 502 whose documented fields carry the apostrophe pair name, the
+// apostrophe pair value, the "&"-named pair in JSON-escaped quotes one level down, and a
+// query pair before an escaped line break, each followed by a control.
+function apostropheCookieResponse() {
+  return jsonResponse({
+    error: `Cookie: theme=dark; my'pref=${CANARY_APOSTROPHE}; Content-Type: "text/html; charset=utf-8"`,
+    description: `Cookie: sid=O'${CANARY_APOSTROPHE}; Date: "Mon, 22 Sep 2026 12:30:00 GMT"`,
+    message: `upstream said {"headers":"Cookie: theme=dark; my&sid=\\"${CANARY_APOSTROPHE}\\"; Content-Type: \\"application/json\\""} after GET /x?token=${CANARY_APOSTROPHE}\\nstatus 502`,
+  }, { status: 502, statusText: "Bad Gateway" });
+}
+const APOSTROPHE_MARKER = new RegExp(escapeRegExp(`502 Bad Gateway; Cookie: [REDACTED]; Content-Type: "text/html; charset=utf-8"; Cookie: [REDACTED]; Date: "Mon, 22 Sep 2026 12:30:00 GMT"; upstream said {"headers":"Cookie: [REDACTED]; Content-Type: \\"application/json\\""} after GET /x?token=[REDACTED]\\nstatus 502`));
+
 function echoedSecretsResponse() {
   return jsonResponse({ error: "InvalidUpstream", description: `credentials ${ECHOED_FORMS.join(" ")} auditor@example.com/token:${FIXTURE_API_TOKEN} rejected` }, { status: 400, statusText: "Bad Request" });
 }
@@ -2677,8 +2774,8 @@ function assertNoCanary(text, label, canaries = CANARIES) {
 // rules run on their own (hyphenated words with one digit group), the plain lowercase word
 // that only the Bearer scheme gives away, and the Slack path (the documented T/B/secret
 // shape, the whole path being the secret).
-const PLANTED_CREDENTIALS = [...Object.values(LOADER_CANARIES), ...CANARIES, CANARY_NEXT_LINK, CANARY_USERINFO, ...Object.values(FAKE_ZENDESK_SECRETS), FIXTURE_API_TOKEN];
-const SHAPED_CREDENTIALS = new Set([CANARY_NAMED, CANARY_QUOTED, CANARY_PLAIN, FIXTURE_API_TOKEN, FAKE_ZENDESK_SECRETS.slackWebhookPath]);
+const PLANTED_CREDENTIALS = [...Object.values(LOADER_CANARIES), ...CANARIES, CANARY_NEXT_LINK, CANARY_APOSTROPHE, CANARY_USERINFO, ...Object.values(FAKE_ZENDESK_SECRETS), FIXTURE_API_TOKEN];
+const SHAPED_CREDENTIALS = new Set([CANARY_NAMED, CANARY_QUOTED, CANARY_APOSTROPHE, CANARY_PLAIN, FIXTURE_API_TOKEN, FAKE_ZENDESK_SECRETS.slackWebhookPath]);
 
 // Every HTTP surface ZendeskApiClient reads, keyed by path (the three /audit_logs reads are
 // distinguished by their query), served from the same fixtures as healthyClient().
@@ -2767,6 +2864,7 @@ test("error-body canary sweep: every Zendesk surface failing with an HTML 502 or
     { name: "html-502", make: htmlCanaryResponse, marker: /502 Bad Gateway; non-JSON text\/html response body \(\d+ bytes, not echoed\)/, canaries: CANARIES },
     { name: "json-400", make: jsonCanaryResponse, marker: JSON_CANARY_MARKER, canaries: CANARIES },
     { name: "echoed-secrets", make: echoedSecretsResponse, marker: ECHOED_MARKER, canaries: ECHOED_FORMS },
+    { name: "json-502-apostrophe-cookie", make: apostropheCookieResponse, marker: APOSTROPHE_MARKER, canaries: [CANARY_APOSTROPHE] },
   ];
   // Fixture self-check: each body carries every canary or form verbatim before the scrubs see it.
   for (const shape of shapes) {

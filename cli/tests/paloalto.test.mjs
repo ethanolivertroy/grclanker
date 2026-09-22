@@ -1253,6 +1253,15 @@ const CANARY_NAMED = "sess-canary-COOKIE-31415926535897";
 // closing quote, so its absence proves that rule ran.
 const CANARY_QUOTED = "sess-qtdv-QCARRY-16180339887498";
 const CANARIES = [CANARY_BEARER, CANARY_SESSION, CANARY_API_KEY, CANARY_URL_TOKEN, CANARY_NAMED, CANARY_QUOTED];
+// Reviewer E gap 10: a name-shaped value carried only behind an apostrophe in a cookie pair
+// name or value, behind "&" or "#" in a JSON-escaped quoted pair, and before an escaped
+// quote or line break in a query pair, so only the mid-token quote rule and the backslash
+// boundary remove it.
+const CANARY_APOSTROPHE = "sess-apos-QUOTE-14142135623730";
+// Short enough that the scrubbed rendering stays under the 200 characters a Prisma Cloud
+// error summary keeps per part.
+const APOSTROPHE_SENTENCE = `Cookie: theme=dark; my'pref=${CANARY_APOSTROPHE}; Content-Type: text/html; X-PAN-KEY: O'${CANARY_APOSTROPHE}; Date: Mon, 22 Sep; {"headers":"Cookie: my#sid=\\"${CANARY_APOSTROPHE}\\"; Content-Type: \\"text/html\\""} after GET /api/?key=${CANARY_APOSTROPHE}\\nstatus 502`;
+const SCRUBBED_APOSTROPHE_SENTENCE = `Cookie: [REDACTED]; Content-Type: text/html; X-PAN-KEY: [REDACTED]; Date: Mon, 22 Sep; {"headers":"Cookie: [REDACTED]; Content-Type: \\"text/html\\""} after GET /api/?key=[REDACTED]\\nstatus 502`;
 // The secret of a user-and-secret prefix on a configured URL (rule 9: a configured URL is
 // written as scheme and host only).
 const CANARY_USERINFO = "Vd4kRt8Hq2ZpWn6Ys1CxJ7";
@@ -1284,8 +1293,8 @@ function assertNoCanary(text, label, canaries = CANARIES) {
 // rules run on their own (hyphenated words with one digit group), the Slack path (the
 // documented T/B/secret shape, the whole path being the secret), and the PAN-OS password
 // (every character class an encoding changes).
-const PLANTED_CREDENTIALS = [...Object.values(LOADER_CANARIES), ...CANARIES, CANARY_USERINFO, ...Object.values(FAKE_PANOS_SECRETS), ...Object.values(FAKE_PRISMA_SECRETS), FIXTURE_SECRET_KEY, FIXTURE_PANOS_PASSWORD];
-const SHAPED_CREDENTIALS = new Set([CANARY_NAMED, CANARY_QUOTED, FIXTURE_SECRET_KEY, FAKE_PRISMA_SECRETS.slackWebhookPath, FIXTURE_PANOS_PASSWORD]);
+const PLANTED_CREDENTIALS = [...Object.values(LOADER_CANARIES), ...CANARIES, CANARY_APOSTROPHE, CANARY_USERINFO, ...Object.values(FAKE_PANOS_SECRETS), ...Object.values(FAKE_PRISMA_SECRETS), FIXTURE_SECRET_KEY, FIXTURE_PANOS_PASSWORD];
+const SHAPED_CREDENTIALS = new Set([CANARY_NAMED, CANARY_QUOTED, CANARY_APOSTROPHE, FIXTURE_SECRET_KEY, FAKE_PRISMA_SECRETS.slackWebhookPath, FIXTURE_PANOS_PASSWORD]);
 
 // A proxy or load balancer error page: HTML with header lines and a URL carrying a token.
 // Retry-After is tiny so clients that do retry 5xx responses do so without waiting. Served
@@ -1309,6 +1318,16 @@ function jsonCanaryResponse() {
 
 function xmlCanaryResponse() {
   return xmlResponse(`<response status="error" code="403"><result><msg>${CANARY_SENTENCE}; ${CANARY_ESCAPED_NOTE}</msg></result></response>`, 403);
+}
+
+// Reviewer E gap 10: the apostrophe pair name, the apostrophe header value, the "#"-named
+// pair in JSON-escaped quotes one level down, and a query pair before an escaped line
+// break, each followed by a control, in a Prisma JSON message and a PAN-OS <msg>.
+function jsonApostropheResponse() {
+  return jsonResponse({ message: APOSTROPHE_SENTENCE }, { status: 400, statusText: "Bad Request" });
+}
+function xmlApostropheResponse() {
+  return xmlResponse(`<response status="error" code="403"><result><msg>${APOSTROPHE_SENTENCE.replaceAll("&", "&amp;")}</msg></result></response>`, 403);
 }
 
 test("redaction helpers scrub credential-shaped text, JSON pairs, URL credentials, and credential-named properties", () => {
@@ -1544,6 +1563,86 @@ test("reviewer E gap 9: every credential header and pair key after a JSON string
     for (const text of GAP9_CONTROLS) assert.equal(scrub(text), text, `reviewer E gap 9: ${scrub.name} changed a control: ${text}`);
   }
   assert.equal(cases, 2 * (GAP9_HEADERS.length * GAP9_ESCAPES.length + GAP9_PAIRS.length) * GAP9_CONTEXTS.length);
+});
+
+// Reviewer E gap 10: two RFC 6265 token characters let a later cookie pair's value through.
+// An apostrophe in a pair name or value (my'pref=value, sid=O'hunter2) was read as the quote
+// closing the text the line was quoted in, so the value ended at "my" and the pair after
+// the apostrophe stayed; and "&" or "#" in a credential-named pair whose value sat in
+// JSON-escaped quotes (my&sid=\"value\") was taken first by the URL query rule with the
+// lone backslash as its value, leaving the quoted value behind an orphan quote. Two rules
+// now hold in both scrubs of all three modules: a quote closes a value only at the end of a
+// token (before whitespace, a delimiter, a bracket, another quote, an escape, or the end),
+// never mid-token, in header values, pair values, quoted attributes, and query values; and
+// a bare query value never takes a backslash (the escape after it is kept, so a JSON string
+// still parses and the text after it is still read), with a recognised header line read
+// before the query rule. The controls, the closing quote and following members of an
+// enclosing JSON member, escaped controls, and a single-quoted enclosing text survive.
+const GAP10_VALUES = ["hunter2", "Tr0ub4dor3", "correct-horse-battery-staple", "abc123", "x7", "9f8e7d6c5b4a3f2e1d0c", "O'Brien42", "p@ss.w0rd", "sess-apos-QUOTE-14142135623730", "dXNlcjpwYXNzd29yZA==", "AKIAIOSFODNN7EXAMPLE", "s3cr3t_2026-09-22T18.00.00Z"];
+const GAP10_ROWS = [
+  // rule 1: an apostrophe or a raw quote inside a token is content of the value
+  [(v) => `Cookie: theme=dark; my'pref=${v}; Content-Type: "text/html; charset=utf-8"`, () => `Cookie: [REDACTED]; Content-Type: "text/html; charset=utf-8"`],
+  [(v) => `Cookie: theme=dark; my'pref="${v}"; Date: "Mon, 22 Sep 2026 12:30:00 GMT"`, () => `Cookie: [REDACTED]; Date: "Mon, 22 Sep 2026 12:30:00 GMT"`],
+  [(v) => `Cookie: sid=O'${v}; Content-Type: "text/html; charset=utf-8"`, () => `Cookie: [REDACTED]; Content-Type: "text/html; charset=utf-8"`],
+  [(v) => `Cookie: theme=dark; my"pref=${v}`, () => `Cookie: [REDACTED]`],
+  [(v) => `Cookie: sid="O'${v}"; theme=dark; X-ApiKeys: accessKey=${v}`, () => `Cookie: [REDACTED]; X-ApiKeys: [REDACTED]`],
+  [(v) => `Set-Cookie: my'sid=${v}; Path=/; HttpOnly; Date: Mon, 22 Sep 2026 12:30:00 GMT`, () => `Set-Cookie: [REDACTED]; Date: Mon, 22 Sep 2026 12:30:00 GMT`],
+  [(v) => `X-Cookie: token=a; my'pref=${v}`, () => `X-Cookie: [REDACTED]`],
+  [(v) => `{"detail":"Cookie: theme=dark; my'pref=${v}","code":401}`, () => `{"detail":"Cookie: [REDACTED]","code":401}`],
+  [(v) => `{"detail":"Cookie: sid=O'${v}; Content-Type: text/html","code":401}`, () => `{"detail":"Cookie: [REDACTED]; Content-Type: text/html","code":401}`],
+  [(v) => `'Cookie: sid=O'${v}'`, () => `'Cookie: [REDACTED]'`],
+  [(v) => `sid=O'${v}; path=/`, () => `sid=[REDACTED]; path=/`],
+  [(v) => `password: O'${v}`, () => `password: [REDACTED]`],
+  [(v) => `password='O'${v}'`, () => `password='[REDACTED]'`],
+  [(v) => `{"x":"token=O'${v}"}`, () => `{"x":"token=[REDACTED]"}`],
+  [(v) => `?token=O'${v}&x=1`, () => `?token=[REDACTED]&x=1`],
+  // rule 2: a bare query value stops before a backslash and the escape is kept
+  [(v) => `{"url": "https://h.example.com/p?token=${v}\\"}`, () => `{"url": "https://h.example.com/p?token=[REDACTED]\\"}`],
+  [(v) => `{"log": "GET /x?api_key=${v}\\nstatus 502"}`, () => `{"log": "GET /x?api_key=[REDACTED]\\nstatus 502"}`],
+  [(v) => `{"hook":"https://hooks.slack.com/services/T000/B000/${v}\\"}`, () => `{"hook":"https://hooks.slack.com/services/[REDACTED]\\"}`],
+  [(v) => `{"message": "Cookie: theme=dark; my&sid=\\"${v}\\""}`, () => `{"message": "Cookie: [REDACTED]"}`],
+  [(v) => `{"headers":"Set-Cookie: my#sid=\\"${v}\\"; HttpOnly; Content-Type: \\"text/html\\""}`, () => `{"headers":"Set-Cookie: [REDACTED]; Content-Type: \\"text/html\\""}`],
+  [(v) => `{"headers":"Cookie: theme=dark; my&sid=\\"${v}\\"; Content-Type: \\"text/html; charset=utf-8\\"; Date: \\"Mon, 22 Sep 2026 12:30:00 GMT\\""}`, () => `{"headers":"Cookie: [REDACTED]; Content-Type: \\"text/html; charset=utf-8\\"; Date: \\"Mon, 22 Sep 2026 12:30:00 GMT\\""}`],
+  // boundaries that held before and must keep holding
+  [(v) => `Authorization: Bearer ${v}&token=${v}`, () => `Authorization: [REDACTED]`],
+  [(v) => `Cookie: my&sid=${v}`, () => `Cookie: [REDACTED]`],
+  [(v) => `Cookie: theme=dark; my#sid=${v}`, () => `Cookie: [REDACTED]`],
+  [(v) => `rejected header "Cookie: sid=${v}" and "X-Other: 1"`, () => `rejected header "Cookie: [REDACTED]" and "X-Other: 1"`],
+  [(v) => `{"detail":"Cookie: sid=${v}","code":401}`, () => `{"detail":"Cookie: [REDACTED]","code":401}`],
+  [(v) => `'Cookie: sid=${v}'`, () => `'Cookie: [REDACTED]'`],
+  [(v) => `Cookie: "sid=${v}; X-ApiKeys: ${v}`, () => `Cookie: [REDACTED]; X-ApiKeys: [REDACTED]`],
+  [(v) => `X-ApiKeys: accessKey="${v}";secretKey="${v}"; Content-Type: application/json`, () => `X-ApiKeys: [REDACTED]; Content-Type: application/json`],
+  [(v) => `{"error":"X-ApiKeys: accessKey=\\"${v}\\";secretKey=\\"${v}\\"","code":403}`, () => `{"error":"X-ApiKeys: [REDACTED]","code":403}`],
+  [(v) => `Cookie: sid=${v}"; theme=dark`, () => `Cookie: [REDACTED]"; theme=dark`],
+  [(v) => `{"detail":"Authorization: Basic ${v}=","code":401}`, () => `{"detail":"Authorization: [REDACTED]","code":401}`],
+  [(v) => `Cookie: sid=${v}=" and "X-Other: 1"`, () => `Cookie: [REDACTED]" and "X-Other: 1"`],
+  [(v) => `sid=${v}'; path=/`, () => `sid=[REDACTED]'; path=/`],
+  [(v) => `api_key=${v}"}`, () => `api_key=[REDACTED]"}`],
+  [(v) => `?token=${v}'}`, () => `?token=[REDACTED]'}`],
+];
+const GAP10_CONTROLS = [
+  `Content-Type: "text/html; charset=utf-8"; Date: "Mon, 22 Sep 2026 12:30:00 GMT"`,
+  `{"detail":"it's a fine day","code":200}`,
+  `the cookie count is 3 and the token inventory holds 2`,
+  `{"names":["O'Brien","D'Angelo"],"cookies":0}`,
+  `password=""`,
+];
+
+test("reviewer E gap 10: a quote inside a token is content of a cookie, pair, attribute, or query value in both scrubs, a bare query value stops before a backslash and keeps the escape, and a recognised header line is read before the query rule", () => {
+  let cases = 0;
+  for (const scrub of [redactErrorText, redactCredentialValueText]) {
+    for (const [make, expect] of GAP10_ROWS) for (const value of GAP10_VALUES) {
+      const input = make(value);
+      const out = scrub(input);
+      const label = `reviewer E gap 10: ${scrub.name} ${JSON.stringify(input)}`;
+      assert.equal(out, expect(value), label);
+      assertNoWindow(out, value, label);
+      assert.equal(scrub(out), out, `${label}: not idempotent on ${out}`);
+      cases += 1;
+    }
+    for (const text of GAP10_CONTROLS) assert.equal(scrub(text), text, `reviewer E gap 10: ${scrub.name} changed a control: ${text}`);
+  }
+  assert.equal(cases, 2 * GAP10_ROWS.length * GAP10_VALUES.length);
 });
 
 test("scrub boundary: name-shaped values stay bare in prose, leave every carrier whatever their shape, and go as configured secrets in every form", () => {
@@ -1892,6 +1991,11 @@ const STRUCTURED_MARKERS = {
   "prisma-compute": new RegExp(`\\(400\\): x-redlock-status upstream_body, ${escapeRegExp(SCRUBBED_ESCAPED_NOTE)}; ${escapeRegExp(SCRUBBED_SENTENCE)}`),
   "pan-os": new RegExp(`failed \\(code 403, status 403\\): ${escapeRegExp(SCRUBBED_SENTENCE)}; ${escapeRegExp(SCRUBBED_ESCAPED_NOTE)}`),
 };
+const APOSTROPHE_MARKERS = {
+  "prisma-cloud": new RegExp(`\\(400\\): ${escapeRegExp(SCRUBBED_APOSTROPHE_SENTENCE)}`),
+  "prisma-compute": new RegExp(`\\(400\\): ${escapeRegExp(SCRUBBED_APOSTROPHE_SENTENCE)}`),
+  "pan-os": new RegExp(`failed \\(code 403, status 403\\): ${escapeRegExp(SCRUBBED_APOSTROPHE_SENTENCE)}`),
+};
 const ECHOED_BODY_TEXT = /<html|<!DOCTYPE|Set-Cookie|X-Api-Key:|did not answer/i;
 
 test("the two-device keygen sweep fixture is healthy before the canary sweep relies on it, and every fixed text survives the scrubs", async () => {
@@ -2100,6 +2204,8 @@ test("error-body canary sweep: every Palo Alto surface on every device failing w
   const shapes = [
     { name: "html-502", make: () => htmlCanaryResponse(), markers: HTML_MARKERS },
     { name: "structured-error", make: (product) => (product === "pan-os" ? xmlCanaryResponse() : jsonCanaryResponse()), markers: STRUCTURED_MARKERS },
+    // Reviewer E gap 10: apostrophe, "#", and escaped-quote pair shapes in a structured error.
+    { name: "apostrophe-cookie", make: (product) => (product === "pan-os" ? xmlApostropheResponse() : jsonApostropheResponse()), markers: APOSTROPHE_MARKERS, canaries: [CANARY_APOSTROPHE] },
   ];
   const productOf = (surface) => (surface.startsWith("prisma-cloud ") ? "prisma-cloud" : surface.startsWith("prisma-compute ") ? "prisma-compute" : "pan-os");
   // Surfaces the access check does not probe directly (Compute registry scans, images, and
@@ -2115,8 +2221,8 @@ test("error-body canary sweep: every Palo Alto surface on every device failing w
       const files = readBundleFiles(bundle.outputDir);
       const zipEntries = readZipEntries(bundle.zipPath);
       assert.equal(zipEntries.size, files.size, `${label}: the zip carries exactly the written files`);
-      for (const [name, text] of files) assertNoCanary(text, `${label} bundle ${name}`);
-      for (const [name, text] of zipEntries) assertNoCanary(text, `${label} zip ${name}`);
+      for (const [name, text] of files) assertNoCanary(text, `${label} bundle ${name}`, shape.canaries ?? CANARIES);
+      for (const [name, text] of zipEntries) assertNoCanary(text, `${label} zip ${name}`, shape.canaries ?? CANARIES);
 
       const access = JSON.parse(files.get(join("core_data", "access.json")));
       const failedProbes = access.surfaces.filter((entry) => entry.status !== "readable");
