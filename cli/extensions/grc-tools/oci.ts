@@ -598,11 +598,19 @@ export function redactSensitiveText(text: string): string {
 }
 
 /**
- * The one scrub for error strings, applied where they are created: the
- * OciCommandError constructor (every CLI failure) and errorMessage (every
- * other thrown value a collector records), then again on the errors written
- * into the bundle. Adds the long-token rule to redactSensitiveText because an
- * error message is free text that may quote an unlabeled credential.
+ * The strict scrub for error strings, applied once where they are created:
+ * the OciCommandError constructor (every CLI failure, run before the
+ * ServiceError message cap) and errorMessage (every other thrown value a
+ * collector records, run before its own cap). Adds the long-token rule to
+ * redactSensitiveText because an error message is free text that may quote
+ * an unlabeled credential. The bundle sink does not rerun it:
+ * scrubAssessmentForBundle and the export path apply redactSensitiveText in
+ * data mode (long-token rule off) so identifiers such as a compartment named
+ * prod-us-east-2026 survive there while token= shapes are still redacted.
+ * An opc-request-id survives the long-token rule only directly behind its
+ * label and only in a documented layout (isDocumentedOpcRequestId); a value
+ * of that layout placed behind the label on purpose therefore stays
+ * readable, which is the exfiltration class rather than an accidental echo.
  */
 export function scrubErrorText(text: string): string {
   return redactLongTokensOutsideUrls(redactSensitiveText(text));
