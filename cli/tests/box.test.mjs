@@ -37,6 +37,7 @@ import {
 import { getRegisteredToolSummaries } from "../dist/pi/tool-catalog.js";
 import { assertSecretsAbsent, readBundleFiles, readZipEntries } from "./helpers/bundle-contents.mjs";
 import { assertCanaryFixture, assertCanaryWindowsAbsent, assertDepthCapPins } from "./helpers/canary-windows.mjs";
+import { assertCookieAttributeCarriersScrubbed } from "./helpers/cookie-attribute-carriers.mjs";
 
 const NOW = new Date("2026-09-21T00:00:00Z");
 const FRAMEWORKS = ["FedRAMP", "CMMC", "SOC 2", "CIS", "PCI-DSS", "STIG", "IRAP", "ISMAP"];
@@ -2415,4 +2416,11 @@ test("verdict rule 9 (data-side carriers): Box blanks the whole subtree under to
   assert.match(written.job_title, /^Ops lead; profile at https:\/\/intranet\.example\.com\/people\/42\?\[REDACTED\] mid sentence$/, `a URL query mid string is replaced: ${written.job_title}`);
   assert.match(written.address, /^(Bearer )?\[REDACTED\] was pasted here$/, `a bearer carrier in free text loses its value: ${written.address}`);
   assert.equal(written.login, fixture.users[1].login, "identifiers and logins are untouched");
+});
+
+test("cookie attribute class: a later cookie whose name holds a dot or another token character goes with the header value through the Box error text, secret, and record scrubbers", () => {
+  assertCookieAttributeCarriersScrubbed(assert, scrubErrorText, "box scrubErrorText");
+  assertCookieAttributeCarriersScrubbed(assert, (text) => redactSecrets(text, []), "box redactSecrets");
+  assertCookieAttributeCarriersScrubbed(assert, (text) => redactCredentialValues({ note: text }).note, "box redactCredentialValues");
+  assertCookieAttributeCarriersScrubbed(assert, (text) => redactCredentialValues([{ message: text }])[0].message, "box redactCredentialValues, error list");
 });

@@ -39,6 +39,7 @@ import {
 import { getRegisteredToolSummaries } from "../dist/pi/tool-catalog.js";
 import { readBundleFiles, readZipEntries } from "./helpers/bundle-contents.mjs";
 import { assertCanaryFixture, assertCanaryWindowsAbsent, assertDepthCapPins } from "./helpers/canary-windows.mjs";
+import { assertCookieAttributeCarriersScrubbed } from "./helpers/cookie-attribute-carriers.mjs";
 import { scrubAlterations } from "./helpers/scrub-survival.mjs";
 
 const NOW = Date.parse("2026-09-21T00:00:00Z");
@@ -3392,4 +3393,10 @@ test("round 7b: resolveLaunchdarklyConfiguration keeps env-provided credentials 
       else process.env[key] = value;
     }
   }
+});
+
+test("cookie attribute class: a later cookie whose name holds a dot or another token character goes with the header value through the LaunchDarkly error text and record scrubbers", () => {
+  assertCookieAttributeCarriersScrubbed(assert, scrubErrorText, "launchdarkly scrubErrorText");
+  assertCookieAttributeCarriersScrubbed(assert, (text) => redactCredentialValues({ note: text }).note, "launchdarkly redactCredentialValues");
+  assertCookieAttributeCarriersScrubbed(assert, (text) => redactCredentialValues([{ message: text }])[0].message, "launchdarkly redactCredentialValues, error list");
 });

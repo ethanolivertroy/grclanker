@@ -18,6 +18,7 @@ import { redactCredentialValues as redactKnowbe4Values, scrubErrorText as scrubK
 import { redactCredentialValues as redactDatadogValues, scrubErrorText as scrubDatadogErrorText } from "../dist/extensions/grc-tools/datadog.js";
 import { redactSensitiveValues as redactElasticValues, scrubErrorText as scrubElasticErrorText } from "../dist/extensions/grc-tools/elastic.js";
 import { assertCanaryFixture, assertCanaryWindowsAbsent, assertDepthCapPins, canaryWindows } from "./helpers/canary-windows.mjs";
+import { COOKIE_ATTRIBUTE_CANARIES, TOKEN_PUNCTUATION_COOKIE_NAME, assertCookieAttributeCarriersScrubbed, cookieAttributeCarrierTexts } from "./helpers/cookie-attribute-carriers.mjs";
 import { scrubAlterations } from "./helpers/scrub-survival.mjs";
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -684,6 +685,67 @@ test("row (a), prose: a plural inventory label or PascalCase code followed by a 
   assert.equal(scrubber.scrub('"sdk_key": "letmein", "api_key": "hunter2"'), `"sdk_key": "${REDACTED}", "api_key": "${REDACTED}"`);
   assert.equal(scrubber.scrub(`"key": "${TOKEN_SHAPED.tokenCasing}"`), `"key": "${REDACTED}"`);
   assert.equal(scrubber.scrub("[auth]\ndeveloper_token = letmein\nregion = us"), `[auth]\ndeveloper_token = ${REDACTED}\nregion = us`);
+});
+
+// ---------------------------------------------------------------------------------------------------------------
+// The cookie attribute class (CodeRabbit on #78, r4076392614): a later cookie whose name holds a "." or any other
+// RFC 6265 token character goes with the header value, the scan still stops at the next header's `Name:` token, and
+// the following header keeps its name. The rows live in helpers/cookie-attribute-carriers.mjs so each integration
+// suite can run them too.
+// ---------------------------------------------------------------------------------------------------------------
+
+/** The same twelve entry points as text-to-text functions, so the rows' exact expected text can be asserted. */
+const TEXT_ENTRY_POINTS = [
+  ["shared scrub", (text) => createCredentialScrubber().scrub(text)],
+  ["shared scrubData", (text) => createCredentialScrubber().scrubData({ note: text }).note],
+  ["box scrubErrorText", scrubBoxErrorText],
+  ["launchdarkly scrubErrorText", scrubLaunchdarklyErrorText],
+  ["knowbe4 scrubErrorText", scrubKnowbe4ErrorText],
+  ["datadog scrubErrorText", scrubDatadogErrorText],
+  ["elastic scrubErrorText", scrubElasticErrorText],
+  ["box redactCredentialValues", (text) => redactBoxValues({ note: text }).note],
+  ["launchdarkly redactCredentialValues", (text) => redactLaunchdarklyValues({ note: text }).note],
+  ["knowbe4 redactCredentialValues", (text) => redactKnowbe4Values({ note: text }).note],
+  ["datadog redactCredentialValues", (text) => redactDatadogValues({ note: text }).note],
+  ["elastic redactSensitiveValues", (text) => redactElasticValues({ note: text }).note],
+];
+
+test("cookie attribute class: the planted values look random and share no 6-character window with the rows or the must-keep strings, and the name row holds every token character", () => {
+  const legitimate = [...cookieAttributeCarrierTexts(), ...MUST_KEEP.map((text, index) => [`must-keep ${index}`, text])];
+  assertCanaryFixture(assert, COOKIE_ATTRIBUTE_CANARIES, legitimate, "cookie attribute rows");
+  for (const character of "!#$%&*+-.^_`|~") assert.ok(TOKEN_PUNCTUATION_COOKIE_NAME.includes(character), `token character ${character} is in the name row`);
+  assert.doesNotMatch(TOKEN_PUNCTUATION_COOKIE_NAME, /[\s;,="'<>()[\]{}\\]/, "the name row holds no cookie separator");
+});
+
+test("cookie attribute class: a later cookie whose name holds a dot or another token character goes with the header value through every entry point, and the following header names survive", () => {
+  const values = [...COOKIE_ATTRIBUTE_CANARIES, ...NAME_SHAPED];
+  for (const [label, entry] of TEXT_ENTRY_POINTS) assertCookieAttributeCarriersScrubbed(assert, entry, label, values);
+  assert.equal(TEXT_ENTRY_POINTS.length, ENTRY_POINTS.length, "every entry point of the row (a) matrix runs the cookie rows");
+  // With the value registered as a configured secret, the secret pass runs first and leaves its marker inside the
+  // header value; the cookie reader steps over it so the attributes after it go with the header value.
+  const registered = createCredentialScrubber();
+  registered.registerSecrets(values);
+  assertCookieAttributeCarriersScrubbed(assert, (text) => registered.scrub(text), "shared scrub, values registered as secrets", values);
+});
+
+test("cookie attribute class: the reported shapes come out with the whole header value gone and nothing of a later pair left behind", () => {
+  const scrubber = createCredentialScrubber();
+  assert.equal(scrubber.scrub("Cookie: theme=dark; my.sid=hunter2"), `Cookie: ${REDACTED}`);
+  assert.equal(scrubber.scrub("Cookie: theme=dark; ASP.NET_SessionId=abc; Path=/"), `Cookie: ${REDACTED}`);
+  assert.equal(scrubber.scrub("Set-Cookie: .AspNetCore.Session=v; HttpOnly; SameSite=Lax"), `Set-Cookie: ${REDACTED}`);
+  assert.equal(scrubber.scrub("Cookie: theme=dark; my.sid=hunter2; Accept: application/json"), `Cookie: ${REDACTED}; Accept: application/json`);
+  assert.equal(scrubber.scrub("Cookie: theme=dark; my.sid=hunter2; X.Api.Key: hunter2"), `Cookie: ${REDACTED}; X.Api.Key: ${REDACTED}`);
+  assert.equal(scrubber.scrub("Cookie: a=1&sid=hunter2"), `Cookie: ${REDACTED}`, "a marker an earlier rule left at the end of the header value folds into the header's own");
+  // A configured secret is replaced before the cookie reader runs; its marker inside the header value is stepped over
+  // so the attributes after it go too, and the next header still ends the value.
+  const registered = createCredentialScrubber();
+  registered.registerSecrets(["hunter2-secret-zq"]);
+  assert.equal(registered.scrub("Cookie: theme=dark; ASP.NET_SessionId=hunter2-secret-zq; Path=/; HttpOnly"), `Cookie: ${REDACTED}`);
+  assert.equal(registered.scrub("Cookie: my'pref=1; sid=O'hunter2-secret-zq; Path=/"), `Cookie: ${REDACTED}`);
+  assert.equal(registered.scrub("Cookie: theme=dark; ASP.NET_SessionId=hunter2-secret-zq; Path=/; X-Api-Key: hunter2-secret-zq"), `Cookie: ${REDACTED}; X-Api-Key: ${REDACTED}`);
+  for (const text of ["the Cookie header was rejected", "Cookie: ", "Cookie: [REDACTED]", "cookie consent banner; the session ended"]) {
+    assert.equal(scrubber.scrub(text), text, `nothing to remove: ${text}`);
+  }
 });
 
 const DATA_CANARIES = {

@@ -45,6 +45,7 @@ import {
 import { getRegisteredToolSummaries } from "../dist/pi/tool-catalog.js";
 import { readBundleFiles, readZipEntries } from "./helpers/bundle-contents.mjs";
 import { assertCanaryFixture, assertCanaryWindowsAbsent, assertDepthCapPins } from "./helpers/canary-windows.mjs";
+import { assertCookieAttributeCarriersScrubbed } from "./helpers/cookie-attribute-carriers.mjs";
 import { scrubAlterations } from "./helpers/scrub-survival.mjs";
 
 const NOW = new Date("2026-09-21T00:00:00.000Z");
@@ -3928,4 +3929,10 @@ test("verdict rule 10: a short page under a larger server-reported total is a tr
     assert.notEqual(finding.status, "pass", `${id} must not pass on 1 of 7 users: ${finding.summary}`);
   }
   assert.match(findings.find((item) => item.id === "DD-02").summary, /1 of 7 loaded/);
+});
+
+test("cookie attribute class: a later cookie whose name holds a dot or another token character goes with the header value through the Datadog error text and record scrubbers", () => {
+  assertCookieAttributeCarriersScrubbed(assert, scrubErrorText, "datadog scrubErrorText");
+  assertCookieAttributeCarriersScrubbed(assert, (text) => redactCredentialValues({ note: text }).note, "datadog redactCredentialValues");
+  assertCookieAttributeCarriersScrubbed(assert, (text) => redactCredentialValues([{ message: text }])[0].message, "datadog redactCredentialValues, error list");
 });

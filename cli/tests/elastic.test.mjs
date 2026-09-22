@@ -44,6 +44,7 @@ import {
 import { getRegisteredToolSummaries } from "../dist/pi/tool-catalog.js";
 import { readBundleFiles, readZipEntries } from "./helpers/bundle-contents.mjs";
 import { assertCanaryFixture, assertCanaryWindowsAbsent, assertDepthCapPins } from "./helpers/canary-windows.mjs";
+import { assertCookieAttributeCarriersScrubbed } from "./helpers/cookie-attribute-carriers.mjs";
 import { scrubAlterations } from "./helpers/scrub-survival.mjs";
 
 const DAY_MS = 86_400_000;
@@ -3585,4 +3586,11 @@ test("scrub boundary: every fixed-text message the Elastic integration emits sur
   assert.ok(surfaces.length >= 30, `expected every collector and access probe route, got ${surfaces.length}`);
   assert.ok(checked > 2000, `expected thousands of recorded strings, got ${checked}`);
   assert.deepEqual([...altered], [], `legitimate run text altered by the scrubber:\n${[...altered].join("\n")}`);
+});
+
+test("cookie attribute class: a later cookie whose name holds a dot or another token character goes with the header value through the Elastic error text, secret, and record scrubbers", () => {
+  assertCookieAttributeCarriersScrubbed(assert, scrubErrorText, "elastic scrubErrorText");
+  assertCookieAttributeCarriersScrubbed(assert, (text) => redactSecrets(text, sampleConfig()), "elastic redactSecrets");
+  assertCookieAttributeCarriersScrubbed(assert, (text) => redactSensitiveValues({ note: text }).note, "elastic redactSensitiveValues");
+  assertCookieAttributeCarriersScrubbed(assert, (text) => redactSensitiveValues([{ message: text }])[0].message, "elastic redactSensitiveValues, error list");
 });
