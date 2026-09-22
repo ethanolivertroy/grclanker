@@ -1476,6 +1476,35 @@ function partialView(result: SplunkListResult): boolean {
   return result.truncated || result.total > result.entries.length;
 }
 
+type SubjectCheckView = "complete" | "partial" | "unreadable";
+
+/** How far the token subject-to-user check can go: a complete user list decides, a partial one cannot show a subject orphaned, an unreadable one skips the check. */
+function subjectCheckView(users: Collected<SplunkListResult>): SubjectCheckView {
+  if (!users.ok) return "unreadable";
+  return partialView(users.value) ? "partial" : "complete";
+}
+
+/** The sentence a token finding carries when the user list was unreadable or partial; a partial list withholds the subjects it could not resolve. */
+function subjectCheckCaveat(users: Collected<SplunkListResult>, view: SubjectCheckView, unmatched: number, tokenCount: number): string {
+  switch (view) {
+    case "complete":
+      return "";
+    case "partial": {
+      if (!users.ok) return "";
+      const retrieved = `The user list was only partially retrieved (${seenVersusTotal(users.value, "users")})`;
+      return unmatched > 0
+        ? `${retrieved}, so the subject-to-user check could not be completed: ${unmatched} of ${tokenCount} token subjects were not among the users seen, and their names are withheld because a subject missing from a partial list is not shown to be orphaned. Read the full user list to decide.`
+        : `${retrieved}; every token subject was among the users seen, but the check is not complete until the full list is read.`;
+    }
+    case "unreadable":
+      return users.ok ? "" : `The subject-to-user check was skipped because the user list could not be read (${unreadableCause(users)}); confirm each token subject is a current user.`;
+    default: {
+      const exhaustive: never = view;
+      return exhaustive;
+    }
+  }
+}
+
 function stanza(conf: SplunkListResult, name: string): JsonRecord | undefined {
   return conf.entries.find((entry) => entry.name === name)?.content;
 }
@@ -1751,11 +1780,12 @@ export async function assessSplunkAuthentication(
     findings.push(finding(6, "manual", "No authentication tokens were visible. Emptiness is treated as unknown: confirm token authentication is disabled or that the credential holds list_tokens_all rather than list_tokens_own.", inventoryNote(tokens.value)));
   } else {
     const nowSeconds = Date.now() / 1000;
+    const usersView = subjectCheckView(users);
     const knownUsers = users.ok ? new Set(users.value.entries.map((user) => user.name)) : undefined;
     const noExpiry: string[] = [];
     const stale: string[] = [];
     const missingDates: string[] = [];
-    const orphaned: string[] = [];
+    const unmatched: string[] = [];
     let enabledCount = 0;
     for (const token of tokens.value.entries) {
       const claims = asObject(token.content.claims) ?? {};
@@ -1768,8 +1798,10 @@ export async function assessSplunkAuthentication(
       if (exp === undefined || iat === undefined) missingDates.push(label);
       if (exp === 0) noExpiry.push(label);
       if (iat !== undefined && iat > 0 && nowSeconds - iat > maxTokenAgeDays * 86400) stale.push(label);
-      if (knownUsers && subject !== "unknown" && !knownUsers.has(subject)) orphaned.push(label);
+      if (knownUsers && subject !== "unknown" && !knownUsers.has(subject)) unmatched.push(label);
     }
+    // A subject missing from a partial user list may sit on the unread part, so only a complete list shows a token orphaned (addendum 3: no named principal from a truncated set).
+    const orphaned = usersView === "complete" ? unmatched : [];
     const evidence = {
       ...inventoryNote(tokens.value),
       enabled: enabledCount,
@@ -1777,17 +1809,25 @@ export async function assessSplunkAuthentication(
       older_than_days: maxTokenAgeDays,
       stale: stale.slice(0, 50),
       missing_dates: missingDates.slice(0, 50),
-      subject_not_in_user_list: users.ok ? orphaned.slice(0, 50) : null,
+      subject_not_in_user_list: usersView === "complete" ? orphaned.slice(0, 50) : null,
+      subjects_not_among_seen_users: usersView === "partial" ? unmatched.length : null,
       users_readable: users.ok,
+      users_inventory: users.ok ? inventoryNote(users.value) : null,
     };
-    const usersCaveat = users.ok ? "" : `The subject-to-user check was skipped because the user list could not be read (${unreadableCause(users)}); confirm each token subject is a current user.`;
-    const orphanedText = users.ok ? `${orphaned.length} tokens belong to subjects not present in the user list` : "the subject-to-user check was skipped because the user list was unreadable";
+    const usersCaveat = subjectCheckCaveat(users, usersView, unmatched.length, tokens.value.entries.length);
+    const orphanedText = usersView === "complete"
+      ? `${orphaned.length} tokens belong to subjects not present in the user list`
+      : usersView === "partial"
+        ? "the subject-to-user check could not be completed on a partial user list"
+        : "the subject-to-user check was skipped because the user list was unreadable";
     if (noExpiry.length > 0 || orphaned.length > 0) {
       findings.push(capWithCaveats(finding(6, "fail", `${noExpiry.length} tokens never expire and ${orphanedText} (of ${tokens.value.entries.length} seen).`, evidence), [usersCaveat]));
     } else if (stale.length > 0 || missingDates.length > 0 || partialView(tokens.value)) {
-      findings.push(capWithCaveats(finding(6, "warn", `${stale.length} tokens are older than ${maxTokenAgeDays} days, ${missingDates.length} lack issue or expiry claims${partialView(tokens.value) ? `, and only ${seenVersusTotal(tokens.value, "tokens")} were retrieved` : ""}.`, evidence), [usersCaveat]));
-    } else if (!users.ok) {
-      findings.push(capWithCaveats(finding(6, "pass", `All ${tokens.value.entries.length} tokens expire and are newer than ${maxTokenAgeDays} days, but whether every subject maps to a known user was not checked.`, evidence), [usersCaveat]));
+      const partialTokens = partialView(tokens.value) ? `, and only ${seenVersusTotal(tokens.value, "tokens")} were retrieved` : "";
+      findings.push(capWithCaveats(finding(6, "warn", `${stale.length} tokens are older than ${maxTokenAgeDays} days, ${missingDates.length} lack issue or expiry claims${partialTokens}.`, evidence), [usersCaveat]));
+    } else if (usersView !== "complete") {
+      // The caveat caps this pass at warn; a partial user list leaves the subject check open whether or not every subject was among the users seen.
+      findings.push(capWithCaveats(finding(6, "pass", `All ${tokens.value.entries.length} tokens expire and are newer than ${maxTokenAgeDays} days, but whether every subject maps to a known user was not ${usersView === "partial" ? "fully " : ""}checked.`, evidence), [usersCaveat]));
     } else {
       findings.push(finding(6, "pass", `All ${tokens.value.entries.length} tokens expire, are newer than ${maxTokenAgeDays} days, and map to known users.`, evidence));
     }

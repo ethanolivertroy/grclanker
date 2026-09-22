@@ -671,6 +671,66 @@ test("rule 10 corollary: a truncated inventory demotes only the findings that re
   assert.equal(byId(access, "SPLUNK-AC-07").status, "pass", "the role verdicts never read the saved search list");
 });
 
+test("reviewer C final verdict, item J: a truncated user list never turns SPLUNK-AUTH-06 into fail or names a token subject as orphaned; the finding caps at warn, states the partial view, and withholds the names", async () => {
+  const users = [
+    entry("admin", { roles: ["admin"], type: "Splunk" }),
+    entry("auditor", { roles: ["auditor"], type: "SAML" }),
+    entry("analyst1", { roles: ["user"], type: "Splunk" }),
+  ];
+  const tok2 = entry("tok2", { claims: { exp: NOW_SECONDS + 86400 * 30, iat: NOW_SECONDS - 86400 * 5, sub: "analyst1", roles: ["user"] }, status: "enabled" });
+  const fixture = { ...HARDENED, "/services/authentication/users": users, "/services/authorization/tokens": [...HARDENED["/services/authorization/tokens"], tok2] };
+  assert.equal(byId(await assessSplunkAuthentication(client(fixture).client), "SPLUNK-AUTH-06").status, "pass", "with the full user list every subject maps to a known user");
+
+  // The server stops after two of the three users, so analyst1 sits on the unread part of the list.
+  const truncatedUsers = (target) => {
+    const { fetchImpl } = createFetch(target);
+    const wrapped = async (input, init) => {
+      const url = new URL(typeof input === "string" ? input : input.toString());
+      if (url.pathname !== "/services/authentication/users") return fetchImpl(input, init);
+      const offset = Number(url.searchParams.get("offset") ?? "0");
+      return jsonResponse({ entry: users.slice(0, 2).slice(offset), paging: { total: users.length, perPage: 100, offset } });
+    };
+    return new SplunkApiClient(sampleConfig(), { fetchImpl: wrapped, retryDelayMs: 0 });
+  };
+
+  const item = byId(await assessSplunkAuthentication(truncatedUsers(fixture)), "SPLUNK-AUTH-06");
+  assert.equal(item.status, "warn", item.summary);
+  assert.match(item.summary, /^All 2 tokens expire and are newer than 90 days, but whether every subject maps to a known user was not fully checked\. The user list was only partially retrieved \(2 of 3 users\)/);
+  assert.match(item.summary, /1 of 2 token subjects were not among the users seen/);
+  assert.match(item.summary, /names are withheld/);
+  const rendered = JSON.stringify(item);
+  assert.doesNotMatch(rendered, /analyst1/, "no named principal from a truncated set");
+  assert.doesNotMatch(rendered, /tok2/, "the token whose subject could not be resolved is not named either");
+  assert.doesNotMatch(rendered, /not present in the user list|belong to subjects/, "no orphan claim from a partial list");
+  assert.equal(item.evidence.subject_not_in_user_list, null);
+  assert.equal(item.evidence.subjects_not_among_seen_users, 1);
+  assert.equal(item.evidence.users_readable, true);
+  assert.deepEqual(item.evidence.users_inventory, { seen: 2, total: 3, total_known: true, truncated: true });
+  assert.ok(item.evidence.caveats.some((caveat) => /partially retrieved/.test(caveat)), "the partial view sits in evidence.caveats");
+
+  // Every subject among the users seen: the pass is still capped, and the cap says why.
+  const allSeen = byId(await assessSplunkAuthentication(truncatedUsers({ ...fixture, "/services/authorization/tokens": HARDENED["/services/authorization/tokens"] })), "SPLUNK-AUTH-06");
+  assert.equal(allSeen.status, "warn", allSeen.summary);
+  assert.match(allSeen.summary, /not fully checked/);
+  assert.match(allSeen.summary, /every token subject was among the users seen, but the check is not complete until the full list is read/);
+  assert.equal(allSeen.evidence.subjects_not_among_seen_users, 0);
+
+  // A non-expiring token is a fail from the token list itself; the partial user list adds a partial-view sentence, never an orphan claim or a name from the unread part.
+  const forever = entry("tok-forever", { claims: { exp: 0, iat: NOW_SECONDS - 86400 * 2, sub: "admin" }, status: "enabled" });
+  const failing = byId(await assessSplunkAuthentication(truncatedUsers({ ...fixture, "/services/authorization/tokens": [...fixture["/services/authorization/tokens"], forever] })), "SPLUNK-AUTH-06");
+  assert.equal(failing.status, "fail");
+  assert.match(failing.summary, /1 tokens never expire and the subject-to-user check could not be completed on a partial user list \(of 3 seen\)/);
+  assert.match(failing.summary, /names are withheld/);
+  assert.doesNotMatch(JSON.stringify(failing), /analyst1|tok2/);
+  assert.deepEqual(failing.evidence.no_expiry, ["tok-forever (admin, enabled)"]);
+
+  // With the complete list the same token is named as orphaned, so the withholding is the truncation's doing.
+  const named = byId(await assessSplunkAuthentication(client({ ...fixture, "/services/authentication/users": users.slice(0, 2) }).client), "SPLUNK-AUTH-06");
+  assert.equal(named.status, "fail");
+  assert.deepEqual(named.evidence.subject_not_in_user_list, ["tok2 (analyst1, enabled)"]);
+  assert.equal(named.evidence.subjects_not_among_seen_users, null);
+});
+
 test("unreadable audit search downgrades an enabled _audit index to warn, and a disabled search skips to warn", async () => {
   const { client: api } = client({ ...HARDENED }, { searchResults: [] });
   const noEvents = await assessSplunkAuditMonitoring(api);
