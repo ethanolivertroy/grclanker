@@ -319,7 +319,7 @@ test("AzureAuditorClient acquires tokens via the documented client credentials g
 });
 
 // Prototype members that do not issue a Graph or ARM request; every other client method must appear in the URL assertions below.
-const NON_REQUEST_CLIENT_MEMBERS = new Set(["constructor", "getToken", "parseJsonBody", "getResolvedConfig", "getNow", "getCloud", "requestJson", "collectPages", "collectGraph", "collectArm", "graph", "arm"]);
+const NON_REQUEST_CLIENT_MEMBERS = new Set(["constructor", "getToken", "parseJsonBody", "send", "getResolvedConfig", "getNow", "getCloud", "requestJson", "collectPages", "collectGraph", "collectArm", "graph", "arm"]);
 
 test("AzureAuditorClient sends the documented request URL and API version for every request method", async () => {
   const requests = [];
@@ -1782,6 +1782,96 @@ test("request matching: a token-endpoint denial is attributed to POST /<tenant>/
     assert.doesNotMatch(files.get("_errors.log"), /GET /, `${label}: the error log attributes nothing to a GET`);
     assertNoCanaryWindowsInFiles(assert, files, AZURE_PLANTED_CANARIES, `${label} bundle`);
   }
+});
+
+const AZURE_TRANSPORT_CANARY = "Vq8LmT2xRc7ZpWd4Kn9Y";
+
+/** Rejections before any HTTP response, each carrying a credential the way transport errors sometimes echo request headers. */
+const AZURE_TRANSPORT_REJECTIONS = [
+  ["dns", () => Object.assign(new TypeError("fetch failed"), { cause: Object.assign(new Error("getaddrinfo ENOTFOUND login.microsoftonline.com"), { code: "ENOTFOUND" }) }), /^TypeError: fetch failed \(ENOTFOUND\)$/],
+  ["tls", () => Object.assign(new TypeError(`fetch failed: unable to verify the first certificate; request carried Authorization: Bearer ${AZURE_TRANSPORT_CANARY}`), { cause: Object.assign(new Error("unable to verify the first certificate"), { code: "UNABLE_TO_VERIFY_LEAF_SIGNATURE" }) }), /^TypeError: fetch failed: unable to verify the first certificate; request carried Authorization: Bearer \[REDACTED\]$/],
+  ["timeout", () => Object.assign(new Error(`The operation was aborted due to timeout; last header X-Auth-Key: "${AZURE_TRANSPORT_CANARY}"`), { name: "TimeoutError" }), /^TimeoutError: The operation was aborted due to timeout; last header X-Auth-Key: \[REDACTED\]$/],
+];
+
+test("request matching (Codex P2): a token request rejected before any response (DNS, TLS, timeout) is attributed to POST /<tenant>/oauth2/v2.0/token with no status, every output states that no resource request was made, no Graph or ARM endpoint or status is named anywhere, and the transport message reaches no sink unscrubbed", async () => {
+  for (const [label, reject, detail] of AZURE_TRANSPORT_REJECTIONS) {
+    const config = canaryConfig();
+    const outputRoot = createTempBase(`grclanker-azure-token-${label}-`);
+    const log = [];
+    const fetchImpl = async (url, init) => {
+      log.push({ method: init?.method ?? "GET", url: String(url).split("?")[0], status: null });
+      throw reject();
+    };
+    const client = new AzureAuditorClient(config, { fetchImpl, now: () => NOW });
+    const { access, assessments, exported } = await runEveryAzureTool(client, config, outputRoot);
+
+    // The only request the run made is the token request, and it produced no response.
+    assert.ok(log.length > 0, `${label}: the token request was made`);
+    assert.deepEqual([...new Set(log.map((entry) => `${entry.method} ${entry.url} ${entry.status}`))], [`POST ${AZURE_TOKEN_URL} null`], `${label}: the run made only the token request and observed no status`);
+
+    const files = readBundleFiles(exported.outputDir);
+    const outputs = [JSON.stringify(access), ...assessments.map((assessment) => JSON.stringify(assessment)), ...files.values()];
+    const text = outputs.join("\n");
+    const mentions = namedAzureEndpoints(text);
+    assert.deepEqual([...mentions], [`POST ${AZURE_TOKEN_PATH}`], `${label}: the token request is the only endpoint named anywhere (${[...mentions].join(", ")})`);
+    for (const url of namedAzureRequestUrls(text)) assert.equal(url, AZURE_TOKEN_URL, `${label}: request URL ${url} is named in output but the run never requested it`);
+    assert.deepEqual([...namedAzureStatusCodes(text)], [], `${label}: no HTTP status is named because none was observed`);
+    assert.ok(!text.includes("/v1.0/") && !text.includes("/beta/") && !/\bMicrosoft\.[A-Za-z]+\//.test(text), `${label}: no resource endpoint is named anywhere in the outputs`);
+    assert.doesNotMatch(text, /Grant /, `${label}: no output recommends a permission grant for a request that was never answered`);
+    assertNoCanaryWindows(assert, text, [AZURE_TRANSPORT_CANARY, ...AZURE_PLANTED_CANARIES], `${label} outputs`);
+    assertNoCanaryWindowsInFiles(assert, files, [AZURE_TRANSPORT_CANARY, ...AZURE_PLANTED_CANARIES], `${label} bundle`);
+
+    // Access check: every probe failed at the token request with no status; the note and next step name the network path, not a credential or permission.
+    assert.equal(access.status, "limited", `${label}: the access check is limited`);
+    for (const probe of access.surfaces) {
+      assert.equal(probe.status, "not_readable", `${label}: probe ${probe.name} is not readable`);
+      assert.deepEqual({ count: probe.count, truncated: probe.truncated, http_status: probe.http_status, request_url: probe.request_url }, { count: null, truncated: null, http_status: null, request_url: AZURE_TOKEN_URL }, `${label}: probe ${probe.name} records the token request without a status`);
+      assert.match(probe.error, new RegExp(`^Token request failed: no response \\(${detail.source.slice(1, -1)}\\)$`), `${label}: probe ${probe.name} records the shape of the transport failure: ${probe.error}`);
+    }
+    const note = access.notes.find((item) => item.startsWith(`POST ${AZURE_TOKEN_PATH} received no response (`));
+    assert.ok(note, `${label}: the access check note names the token request and says no response arrived: ${JSON.stringify(access.notes)}`);
+    assert.match(note, /\); no resource request was made for organization, conditional_access, directory_roles, secure_scores, defender_pricings, role_assignments, diagnostic_settings, security_contacts\.$/, `${label}: the note lists every probe that never reached its resource`);
+    assert.equal(access.recommendedNextStep, "Restore network access to login.microsoftonline.com (DNS, TLS, proxy) so the token request receives a response, then re-run the access check.", `${label}: the next step is the network path`);
+
+    // Findings: every finding that recorded the failure names the token request, carries no status, and carries the not-attempted marker.
+    const recorded = assessments.flatMap((assessment) => assessment.findings.filter((finding) => finding.evidence?.request_url === AZURE_TOKEN_URL));
+    assert.ok(recorded.length >= 30, `${label}: the token failure reaches every finding that reads a resource (${recorded.length})`);
+    assert.ok(recorded.some((item) => item.id === "AZURE-ID-01") && recorded.some((item) => item.id === "AZURE-ID-02"), `${label}: AZURE-ID-01 and AZURE-ID-02 record the token failure`);
+    for (const item of recorded) {
+      assert.equal(item.status, "manual", `${label}: ${item.id} renders manual`);
+      assert.equal(item.evidence.endpoint, `POST ${AZURE_TOKEN_PATH}`, `${label}: ${item.id} names the token request as the failed request`);
+      assert.equal(item.evidence.http_status, null, `${label}: ${item.id} records no status`);
+      assert.match(item.evidence.resource_request, /^not attempted: the token request failed, so no (Microsoft Graph|Azure Resource Manager) request was made$/, `${label}: ${item.id} carries the not-attempted marker`);
+      assert.match(item.summary, new RegExp(`^POST ${AZURE_TOKEN_PATH.replace(/[.]/g, "\\.")} received no response \\(${detail.source.slice(1, -1)}\\), so no (Microsoft Graph|Azure Resource Manager) request was made for this finding\\. Restore network access to login\\.microsoftonline\\.com \\(DNS, TLS, proxy\\) so the token request receives a response; the read then needs `), `${label}: ${item.id} summary names the token request and the network remedy: ${item.summary}`);
+      assert.doesNotMatch(item.summary, /^GET |Grant |returned/, `${label}: ${item.id} neither attributes the failure to its resource endpoint nor says the token endpoint returned anything`);
+      assert.equal(typeof item.evidence.required_access, "string", `${label}: ${item.id} still records the permission the read will need`);
+    }
+    for (const assessment of assessments) {
+      for (const error of assessment.errors) {
+        assert.match(error, new RegExp(`^AZURE-[A-Z]+-\\d+ POST ${AZURE_TOKEN_PATH.replace(/[.]/g, "\\.")}: no response \\(${detail.source.slice(1, -1)}\\); no (Microsoft Graph|Azure Resource Manager) request was made$`), `${label}: the errors array names the token request: ${error}`);
+      }
+    }
+    assert.ok(exported.errorCount >= 30, `${label}: the export logs every failed read`);
+    assert.doesNotMatch(files.get("_errors.log"), /GET /, `${label}: the error log attributes nothing to a GET`);
+  }
+});
+
+test("request matching (Codex P2): a Graph request rejected before any response keeps its own endpoint and observed URL, records no status, and asks for the network path rather than a permission grant", async () => {
+  const config = canaryConfig();
+  const [, reject, detail] = AZURE_TRANSPORT_REJECTIONS[0];
+  const routes = { ...healthyAzureRoutes(), "/v1.0/identity/conditionalAccess/policies": async () => { throw reject(); } };
+  const client = new AzureAuditorClient(config, { fetchImpl: azureRoutedFetch(routes), now: () => NOW });
+  const identity = await assessAzureIdentity(client);
+  const finding = identity.findings.find((item) => item.id === "AZURE-ID-01");
+  assert.equal(finding.status, "manual");
+  assert.match(finding.summary, new RegExp(`^GET /v1\\.0/identity/conditionalAccess/policies received no response \\(${detail.source.slice(1, -1)}\\)\\. Restore network access to graph\\.microsoft\\.com \\(DNS, TLS, proxy\\) and re-run; the read needs Policy\\.Read\\.All\\. Or collect `), finding.summary);
+  assert.doesNotMatch(finding.summary, /Grant |returned/);
+  assert.deepEqual(
+    { endpoint: finding.evidence.endpoint, http_status: finding.evidence.http_status, request_url: finding.evidence.request_url, resource_request: finding.evidence.resource_request },
+    { endpoint: "GET /v1.0/identity/conditionalAccess/policies", http_status: null, request_url: "https://graph.microsoft.com/v1.0/identity/conditionalAccess/policies", resource_request: undefined },
+  );
+  assert.match(finding.evidence.error, new RegExp(`^no response \\(${detail.source.slice(1, -1)}\\)$`));
+  assert.ok(identity.errors.some((error) => error === `AZURE-ID-01 GET /v1.0/identity/conditionalAccess/policies: no response (${detail.source.slice(1, -1).replace(/\\/g, "")})`), JSON.stringify(identity.errors));
 });
 
 test("verdict safety 8: re-running the export never overwrites a prior bundle and logs errors on partial failure", async () => {

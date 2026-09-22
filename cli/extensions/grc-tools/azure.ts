@@ -644,6 +644,30 @@ function describeThrown(error: unknown): string {
   return redactErrorText(error instanceof Error ? error.message : String(error));
 }
 
+const ERROR_NAME_PATTERN = /^[A-Za-z][A-Za-z0-9_]{0,63}$/;
+const TRANSPORT_CODE_PATTERN = /^E[A-Z_]{2,31}$/;
+/** Detail for a rejection before any HTTP response: "no response (<name>: <scrubbed message> (<cause code>))". */
+const NO_RESPONSE_PREFIX = "no response (";
+
+/**
+ * Describes a fetch rejection that produced no response (DNS, TLS, connection, timeout): the error's name when
+ * it is not the plain Error, its scrubbed message, and the cause's network code (ENOTFOUND, ECONNREFUSED) when
+ * it is one. Only the shape of the failure is kept; nothing is copied from a body because there was none.
+ */
+function describeNoResponse(error: unknown): string {
+  const message = describeThrown(error);
+  const name = error instanceof Error && ERROR_NAME_PATTERN.test(error.name) && error.name !== "Error" ? `${error.name}: ` : "";
+  const cause = error instanceof Error ? (error as Error & { cause?: unknown }).cause : undefined;
+  const code = cause instanceof Error || (typeof cause === "object" && cause !== null) ? (cause as { code?: unknown }).code : undefined;
+  const codeText = typeof code === "string" && TRANSPORT_CODE_PATTERN.test(code) && !message.includes(code) ? ` (${code})` : "";
+  return `${NO_RESPONSE_PREFIX}${name}${message}${codeText})`;
+}
+
+/** True when the recorded failure detail says the request produced no response at all. */
+function isNoResponseFailure(result: { error: string; status?: number }): boolean {
+  return result.status === undefined && describeTokenFailure(result).startsWith(NO_RESPONSE_PREFIX);
+}
+
 export class AzureApiError extends Error {
   constructor(
     message: string,
@@ -722,12 +746,38 @@ function describeTokenFailure(result: { error: string; status?: number }): strin
   return describeFailure(result).replace(/^Token request failed: /, "");
 }
 
+/**
+ * "<request> returned 403 Forbidden" when a response arrived, "<request> received no response (...)" when the
+ * request was rejected before any response, so a transport failure is never rendered as something the
+ * endpoint returned.
+ */
+function requestOutcomeClause(request: string, result: { error: string; status?: number }): string {
+  const detail = describeTokenFailure(result);
+  return isNoResponseFailure(result) ? `${request} received ${detail}` : `${request} returned ${detail}`;
+}
+
+/** The host of the request that failed, taken from the observed URL, for the network remedy. */
+function requestHost(result: { url?: string }): string {
+  const match = /^[a-z]+:\/\/([^/?#]+)/i.exec(result.url ?? "");
+  return match ? redactErrorText(match[1]) : "the endpoint";
+}
+
+/** The remedy for a failed token request: credentials when the endpoint answered, the network path when it did not. */
+function tokenFailureRemedy(result: { error: string; status?: number; url?: string }): string {
+  return isNoResponseFailure(result)
+    ? `Restore network access to ${requestHost(result)} (DNS, TLS, proxy) so the token request receives a response`
+    : "Fix the app registration's client credentials (tenant id, client id, client secret) so a token is issued";
+}
+
 /** Sentence and marker for a finding whose resource request never happened because the token request failed. */
-function tokenFailureText(result: { error: string; status?: number; url?: string }, endpoint: string): { request: string; detail: string; api: string; marker: string } {
+function tokenFailureText(result: { error: string; status?: number; url?: string }, endpoint: string): { request: string; detail: string; outcome: string; remedy: string; api: string; marker: string } {
   const api = resourceApiFor(endpoint);
+  const request = tokenRequestLabel(result);
   return {
-    request: tokenRequestLabel(result),
+    request,
     detail: describeTokenFailure(result),
+    outcome: requestOutcomeClause(request, result),
+    remedy: tokenFailureRemedy(result),
     api,
     marker: `not attempted: the token request failed, so no ${api} request was made`,
   };
@@ -766,7 +816,7 @@ function manualForError(
       title,
       severity,
       "manual",
-      `${token.request} returned ${token.detail}, so no ${token.api} request was made for this finding. Fix the app registration's client credentials (tenant id, client id, client secret) so a token is issued; the read then needs ${requirement}. Or collect ${evidenceToCollect} manually.`,
+      `${token.outcome}, so no ${token.api} request was made for this finding. ${token.remedy}; the read then needs ${requirement}. Or collect ${evidenceToCollect} manually.`,
       {
         endpoint: token.request,
         http_status: result.status ?? null,
@@ -779,6 +829,19 @@ function manualForError(
       },
     );
   }
+  const evidence = { endpoint, http_status: result.status ?? null, request_url: result.url ?? null, error: result.error.slice(0, 300), required_access: requirement, evidence_to_collect: evidenceToCollect, documentation: docUrl };
+  if (isNoResponseFailure(result)) {
+    // The request was made but nothing came back, so a missing permission cannot be inferred and is not recommended.
+    return finding(
+      id,
+      control,
+      title,
+      severity,
+      "manual",
+      `${requestOutcomeClause(endpoint, result)}. Restore network access to ${requestHost(result)} (DNS, TLS, proxy) and re-run; the read needs ${requirement}. Or collect ${evidenceToCollect} manually.`,
+      evidence,
+    );
+  }
   const detail = describeFailure(result);
   return finding(
     id,
@@ -787,7 +850,7 @@ function manualForError(
     severity,
     "manual",
     `${endpoint} returned ${detail}. Grant ${requirement}, or collect ${evidenceToCollect} manually.`,
-    { endpoint, http_status: result.status ?? null, request_url: result.url ?? null, error: result.error.slice(0, 300), required_access: requirement, evidence_to_collect: evidenceToCollect, documentation: docUrl },
+    evidence,
   );
 }
 
@@ -1210,11 +1273,14 @@ export class AzureAuditorClient {
       scope: `${scopeBase}/.default`,
       grant_type: "client_credentials",
     });
-    const response = await this.fetchImpl(url, {
+    // A rejection before any response (DNS, TLS, connection, timeout) is still the token request failing: it is
+    // wrapped with the token URL so the findings name this request and state that no resource request was made,
+    // instead of blaming the Graph or ARM endpoint that was never called.
+    const response = await this.send(url, {
       method: "POST",
       headers: { "Content-Type": "application/x-www-form-urlencoded" },
       body: body.toString(),
-    });
+    }, "Token request failed: ");
     const text = await response.text().catch(() => "");
     if (!response.ok) {
       const detail = describeErrorBody(text, response.headers.get("content-type"));
@@ -1239,9 +1305,24 @@ export class AzureAuditorClient {
     }
   }
 
+  /**
+   * One fetch with its pre-response rejection wrapped: the observed URL and the shape of the failure travel in an
+   * AzureApiError with no status, so `request_url` names the request that was actually made and `http_status`
+   * stays null. Nothing is read from a body because none arrived.
+   */
+  private async send(url: string, init: RequestInit, prefix = ""): Promise<Response> {
+    try {
+      return await this.fetchImpl(url, init);
+    } catch (error) {
+      if (error instanceof AzureApiError) throw error;
+      // A parser error raised inside the transport keeps its fixed note; anything else produced no response.
+      throw new AzureApiError(`${prefix}${isParseError(error) ? PARSE_ERROR_NOTE : describeNoResponse(error)}`, url);
+    }
+  }
+
   private async requestJson(url: string, resource: "graph" | "management", init: { method?: string; headers?: Record<string, string>; body?: string } = {}): Promise<JsonRecord> {
     const token = await this.getToken(resource);
-    const response = await this.fetchImpl(url, {
+    const response = await this.send(url, {
       method: init.method ?? "GET",
       headers: {
         Authorization: `Bearer ${token}`,
@@ -1556,8 +1637,11 @@ export async function checkAzureAccess(
   const truncatedSurfaces = surfaces.filter((item) => item.truncated).map((item) => item.name);
   // A probe that failed at the token request never reached its resource; the note names the request that was made.
   const tokenFailures = surfaces.filter((item) => item.status === "not_readable" && isTokenRequestFailure({ url: item.request_url ?? undefined }));
-  const tokenNote = tokenFailures[0]
-    ? `${tokenRequestLabel({ url: tokenFailures[0].request_url ?? undefined })} returned ${describeTokenFailure({ error: tokenFailures[0].error ?? "", status: tokenFailures[0].http_status ?? undefined })}; no resource request was made for ${tokenFailures.map((item) => item.name).join(", ")}.`
+  const tokenFailure = tokenFailures[0]
+    ? { error: tokenFailures[0].error ?? "", status: tokenFailures[0].http_status ?? undefined, url: tokenFailures[0].request_url ?? undefined }
+    : undefined;
+  const tokenNote = tokenFailure
+    ? `${requestOutcomeClause(tokenRequestLabel(tokenFailure), tokenFailure)}; no resource request was made for ${tokenFailures.map((item) => item.name).join(", ")}.`
     : undefined;
   const notes = [
     `Authenticated against ${describeSourceChain(config)}.`,
@@ -1577,8 +1661,10 @@ export async function checkAzureAccess(
     recommendedNextStep:
       status === "healthy"
         ? "Run azure_assess_identity, azure_assess_monitoring, azure_assess_subscription_guardrails, azure_assess_data_protection, azure_assess_network_and_policy, or azure_export_audit_bundle."
-        : tokenNote
-          ? "Fix the app registration's client credentials (tenant id, client id, client secret) so the token request succeeds, then re-run the access check."
+        : tokenFailure
+          ? isNoResponseFailure(tokenFailure)
+            ? `${tokenFailureRemedy(tokenFailure)}, then re-run the access check.`
+            : "Fix the app registration's client credentials (tenant id, client id, client secret) so the token request succeeds, then re-run the access check."
           : "Grant Microsoft Graph read permissions and Azure Reader/Security Reader roles for the audit principal.",
   };
 }
@@ -1671,7 +1757,7 @@ export async function assessAzureIdentity(client: IdentityClient): Promise<Azure
       ? ""
       : isTokenRequestFailure(securityDefaults)
         ? ` Security defaults could not be read (${failedReadNote(securityDefaults, SECURITY_DEFAULTS_ENDPOINT)}).`
-        : ` Security defaults could not be read (${SECURITY_DEFAULTS_ENDPOINT} returned ${defaultsFailure}).`;
+        : ` Security defaults could not be read (${requestOutcomeClause(SECURITY_DEFAULTS_ENDPOINT, securityDefaults)}).`;
     const defaultsEvidence = {
       security_defaults_enabled: securityDefaults.ok ? securityDefaultsEnabled : null,
       security_defaults_readable: securityDefaults.ok,
@@ -3062,6 +3148,11 @@ export function azureFixedTexts(): readonly string[] {
   const mailboxMissing = { error: `404 Not Found: ${describeErrorBody(JSON.stringify({ error: { code: "ErrorItemNotFound", message: "The specified object was not found in the store." } }), "application/json")}`, status: 404 };
   const tokenDenied = { error: "Token request failed: 403 Forbidden", status: 403, url: tokenUrl };
   const tokenInvalid = { error: `Token request failed: 401 Unauthorized: ${describeErrorBody(invalidClientBody, "application/json")}`, status: 401, url: tokenUrl };
+  // Rejections before any response, rendered the way send() wraps them: the token request and a Graph request.
+  const dnsFailure = Object.assign(new TypeError("fetch failed"), { cause: Object.assign(new Error("getaddrinfo ENOTFOUND login.microsoftonline.com"), { code: "ENOTFOUND" }) });
+  const timeout = Object.assign(new Error("The operation was aborted due to timeout"), { name: "TimeoutError" });
+  const tokenNoResponse = { error: `Token request failed: ${describeNoResponse(dnsFailure)}`, url: tokenUrl };
+  const graphNoResponse = { error: describeNoResponse(timeout), url: "https://graph.microsoft.com/v1.0/identity/conditionalAccess/policies" };
   const conditionalAccess = "GET /v1.0/identity/conditionalAccess/policies";
   const pricings = "GET /subscriptions/sub-123/providers/Microsoft.Security/pricings";
   const errors: string[] = [];
@@ -3069,7 +3160,10 @@ export function azureFixedTexts(): readonly string[] {
   const findings = [
     manualForError("AZURE-ID-01", 1, "Conditional Access MFA baseline", "high", conditionalAccess, "Policy.Read.All", evidence, graphDenied, AZURE_ENDPOINT_DOCS.conditionalAccess, errors),
     manualForError("AZURE-ID-01", 1, "Conditional Access MFA baseline", "high", conditionalAccess, "Policy.Read.All", evidence, tokenInvalid, AZURE_ENDPOINT_DOCS.conditionalAccess, errors),
+    manualForError("AZURE-ID-01", 1, "Conditional Access MFA baseline", "high", conditionalAccess, "Policy.Read.All", evidence, tokenNoResponse, AZURE_ENDPOINT_DOCS.conditionalAccess, errors),
+    manualForError("AZURE-ID-01", 1, "Conditional Access MFA baseline", "high", conditionalAccess, "Policy.Read.All", evidence, graphNoResponse, AZURE_ENDPOINT_DOCS.conditionalAccess, errors),
     manualForError("AZURE-MON-05", 10, "Defender for Cloud plans", "high", pricings, "Security Reader", "the Defender for Cloud plan list", tokenDenied, AZURE_ENDPOINT_DOCS.defenderPricings, errors),
+    manualForError("AZURE-MON-05", 10, "Defender for Cloud plans", "high", pricings, "Security Reader", "the Defender for Cloud plan list", tokenNoResponse, AZURE_ENDPOINT_DOCS.defenderPricings, errors),
     manualForError("AZURE-DP-06", 20, "Inbox forwarding rules", "high", MESSAGE_RULES_ENDPOINT, MAILBOX_RULES_PERMISSION, "the inbox rule export for every mailbox", mailboxDenied, AZURE_ENDPOINT_DOCS.messageRules, errors),
   ];
   const surfaceNames = ["organization", "conditional_access", "directory_roles", "secure_scores", "defender_pricings", "role_assignments", "diagnostic_settings", "security_contacts"];
@@ -3109,8 +3203,14 @@ export function azureFixedTexts(): readonly string[] {
     "Member inventory is partial; verdict capped at warn.",
     "6/8 Azure audit surfaces are readable.",
     `${tokenRequestLabel(tokenDenied)} returned ${describeTokenFailure(tokenDenied)}; no resource request was made for ${surfaceNames.join(", ")}.`,
+    `${requestOutcomeClause(tokenRequestLabel(tokenNoResponse), tokenNoResponse)}; no resource request was made for ${surfaceNames.join(", ")}.`,
+    tokenNoResponse.error,
+    graphNoResponse.error,
+    failedReadNote(tokenNoResponse, SECURITY_DEFAULTS_ENDPOINT),
+    `Security defaults could not be read (${requestOutcomeClause(SECURITY_DEFAULTS_ENDPOINT, graphNoResponse)}).`,
     "Probe counts for role_assignments stopped at the probe page cap and are lower bounds, not inventory sizes.",
     "Fix the app registration's client credentials (tenant id, client id, client secret) so the token request succeeds, then re-run the access check.",
+    `${tokenFailureRemedy(tokenNoResponse)}, then re-run the access check.`,
     "Grant Microsoft Graph read permissions and Azure Reader/Security Reader roles for the audit principal.",
   ]);
 }
