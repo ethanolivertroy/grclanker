@@ -1518,9 +1518,13 @@ test("rule 10: control 10 names each capped forwarding inventory and never passe
   const partitionsCapped = await assessSumologicDataGovernance(readerFrom(data, { listPartitions: async () => partial(data.partitions) }), { now: NOW, approvedDestinationDomains: ["example.com"] });
   assert.equal(byId(partitionsCapped, "SUMO-10").status, "warn");
   assert.match(byId(partitionsCapped, "SUMO-10").summary, /Pagination of the partition list stopped before the last page, so only 2 were seen/);
-  assert.equal(byId(partitionsCapped, "SUMO-09").status, "pass", "SUMO-09 is an existence check and keeps pass");
-  assert.match(byId(partitionsCapped, "SUMO-09").summary, /Pagination stopped before the last page/);
+  assert.equal(byId(partitionsCapped, "SUMO-09").status, "warn", "SUMO-09 never passes on a page-capped partition list");
+  assert.match(byId(partitionsCapped, "SUMO-09").summary, /active audit index partition\(s\) exist .* Pagination stopped before the last page, so only 2 items were seen and the population is incomplete\.$/);
   assert.equal(byId(partitionsCapped, "SUMO-09").evidence.partitions_complete, false);
+  assert.equal(byId(partitionsCapped, "SUMO-09").evidence.partitions_seen, 2);
+  const partitionsComplete = await assessSumologicDataGovernance(readerFrom(data), { now: NOW });
+  assert.equal(byId(partitionsComplete, "SUMO-09").status, "pass");
+  assert.doesNotMatch(byId(partitionsComplete, "SUMO-09").summary, /Pagination stopped/);
 
   const allCapped = await assessSumologicDataGovernance(readerFrom(data, {
     listPartitions: async () => partial(data.partitions),
@@ -1643,6 +1647,84 @@ test("rule 1 corollary: every multi-inventory finding drops below pass and names
   const noKeys = await assessSumologicAccessControl(readerFrom(healthyData(), { listAccessKeys: async () => forbidden() }), { now: NOW });
   assert.equal(noKeys.summary.access_keys_seen, null);
   assert.equal(noKeys.summary.access_key_scope, null);
+});
+
+test("content permissions: never requested when the personal folder is unreadable, not collected when every lookup failed, and counted only from the lookups that succeeded", async () => {
+  const base = createTempBase("grclanker-sumo-content-permissions-");
+  const marker = (entry) => entry.data;
+
+  const folderDenied = recordingFetch({ deniedPaths: ["/api/v2/content/folders/personal"] });
+  const folderClient = new SumologicApiClient(sampleConfig(), { fetchImpl: folderDenied.fetchImpl, sleepImpl: async () => {}, maxRetries: 0 });
+  const folderAccess = await checkSumologicAccess(folderClient);
+  const folderResults = await allAssessments(folderClient);
+  const folderExport = await exportSumologicAuditBundle(folderClient, sampleConfig(), join(base, "folder-denied"), { now: NOW });
+  assert.ok(folderDenied.requests.every((request) => !/\/permissions$/.test(request.path)), "no permission lookup is issued when the folder listing failed");
+  const folderSharing = folderResults.find((result) => result.area === "content-sharing");
+  for (const [label, entry] of [
+    ["core_data", JSON.parse(readFileSync(join(folderExport.outputDir, "core_data", "content-sharing.json"), "utf8")).content_permissions],
+    ["rawData", folderSharing.rawData.content_permissions],
+  ]) {
+    assert.equal(entry.ok, false, `${label}: content_permissions is not collected`);
+    assert.equal(entry.complete, null, label);
+    assert.equal(entry.scope, null, label);
+    assert.equal(entry.count, null, `${label}: count is null, not 0`);
+    assert.equal(entry.http_status, null, `${label}: no status is invented for lookups that were never issued`);
+    assert.equal(entry.endpoint, null, `${label}: no endpoint is invented for lookups that were never issued`);
+    assert.match(entry.error, /^Not requested: no content permission lookups were issued because the personal folder could not be read \(.*\(403 forbidden\).*\)\.$/, label);
+    assert.deepEqual(marker(entry), { collected: false, status: null, endpoint: null, error: entry.error }, `${label}: the marker, not []`);
+  }
+  assert.ok(folderSharing.errors.some((line) => /^content_permissions: Not requested: /.test(line)));
+  assert.equal(byId(folderSharing, "SUMO-11").evidence.org_shared_items, null);
+  assertOutputsNameOnlyObservedRequests(sumologicOutputs(folderAccess, folderResults, folderExport), folderDenied.requests, "personal folder denied");
+
+  const lookupsDenied = recordingFetch({ deniedPaths: ["/api/v2/content/c1/permissions"] });
+  const lookupClient = new SumologicApiClient(sampleConfig(), { fetchImpl: lookupsDenied.fetchImpl, sleepImpl: async () => {}, maxRetries: 0 });
+  const lookupAccess = await checkSumologicAccess(lookupClient);
+  const lookupResults = await allAssessments(lookupClient);
+  const lookupExport = await exportSumologicAuditBundle(lookupClient, sampleConfig(), join(base, "lookups-denied"), { now: NOW });
+  assert.ok(lookupsDenied.requests.some((request) => request.path === "/api/v2/content/c1/permissions" && request.status === 403), "the lookup was issued and denied");
+  const lookupSharing = lookupResults.find((result) => result.area === "content-sharing");
+  for (const [label, entry] of [
+    ["core_data", JSON.parse(readFileSync(join(lookupExport.outputDir, "core_data", "content-sharing.json"), "utf8")).content_permissions],
+    ["rawData", lookupSharing.rawData.content_permissions],
+  ]) {
+    assert.equal(entry.ok, false, `${label}: a set of lookups that all failed is not collected`);
+    assert.equal(entry.count, null, `${label}: count is null, not the number of items whose lookups failed`);
+    assert.equal(entry.complete, null, label);
+    assert.equal(entry.http_status, null, `${label}: no single status stands for the whole set`);
+    assert.equal(entry.endpoint, null, label);
+    assert.match(entry.error, /^every content permission lookup failed \(1 of 1\): .*\(403 forbidden\)/, label);
+    assert.deepEqual(marker(entry), { collected: false, status: null, endpoint: null, error: entry.error }, label);
+  }
+  assert.equal(lookupSharing.summary.org_shared_items, null, "org-wide shares are unknown when every lookup failed");
+  const sharingFinding = byId(lookupSharing, "SUMO-11");
+  assert.equal(sharingFinding.status, "manual");
+  assert.equal(sharingFinding.evidence.org_shared_items, null, "never [] from lookups that all failed");
+  assert.equal(sharingFinding.evidence.permission_lookups_failed, 1);
+  assert.equal(sharingFinding.evidence.personal_folder_items_sampled, 1, "the folder itself was read, so its counts are real");
+  assert.equal(byId(lookupSharing, "SUMO-18").evidence.lookup_tables_shared_org_wide, null);
+  assertOutputsNameOnlyObservedRequests(sumologicOutputs(lookupAccess, lookupResults, lookupExport), lookupsDenied.requests, "permission lookups denied");
+
+  const twoItems = healthyData();
+  twoItems.personalFolder.children = [
+    { id: "c1", name: "Shared search", itemType: "Search" },
+    { id: "c2", name: "Private lookup", itemType: "Lookups" },
+  ];
+  const partial = await assessSumologicContentSharing(
+    readerFrom(twoItems, {
+      getContentPermissions: async (id) => (id === "c2" ? failedCollection("Sumo Logic request failed (403 forbidden)", 403, "/v2/content/c2/permissions") : collectionOf(twoItems.permissions)),
+    }),
+    { now: NOW },
+  );
+  const partialEntry = partial.rawData.content_permissions;
+  assert.equal(partialEntry.ok, true, "one successful lookup makes the set collected");
+  assert.equal(partialEntry.complete, false, "a failed lookup makes it incomplete");
+  assert.equal(partialEntry.count, 2);
+  assert.deepEqual(partialEntry.data.map((row) => [row.id, row.ok]), [["c1", true], ["c2", false]]);
+  assert.equal(partial.summary.org_shared_items, byId(partial, "SUMO-11").evidence.org_shared_items.length, "the count covers the lookups that succeeded");
+  assert.equal(byId(partial, "SUMO-11").evidence.permission_lookups_failed, 1);
+  assert.notEqual(byId(partial, "SUMO-11").status, "pass");
+  assert.match(byId(partial, "SUMO-11").summary, /1 content permission lookup\(s\) failed \(Private lookup: /);
 });
 
 test("resolveSecureOutputPath rejects traversal and symlink parents", () => {

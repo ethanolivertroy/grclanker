@@ -993,6 +993,37 @@ export function failedCollection<T>(error: string, httpStatus?: number, endpoint
   return { ok: false, error, httpStatus, endpoint, complete: null, scope: null };
 }
 
+interface ContentPermissionLookup {
+  item: JsonRecord;
+  permissions: SumologicCollection<JsonRecord>;
+}
+
+/**
+ * The content_permissions dataset hangs off the personal folder listing. When
+ * that listing could not be read no lookup is issued and the dataset is a
+ * not-requested marker naming the folder's failure; when every issued lookup
+ * failed it is not collected either (the error names each failed request, and
+ * no single status or endpoint is invented for the set); otherwise it carries
+ * one row per sampled item and is complete only when every lookup succeeded.
+ */
+function contentPermissionsCollection(
+  personalFolder: SumologicCollection<JsonRecord>,
+  lookups: ContentPermissionLookup[],
+  failed: ContentPermissionLookup[],
+): SumologicCollection<JsonRecord[]> {
+  if (!personalFolder.ok) {
+    return failedCollection(`Not requested: no content permission lookups were issued because the personal folder could not be read (${personalFolder.error ?? "unknown error"}).`);
+  }
+  const describe = (entry: ContentPermissionLookup): string => `${asString(entry.item.name) ?? asString(entry.item.id) ?? "item"}: ${entry.permissions.error ?? "unknown error"}`;
+  if (lookups.length > 0 && failed.length === lookups.length) {
+    return failedCollection(`every content permission lookup failed (${failed.length} of ${lookups.length}): ${failed.map(describe).join("; ")}`);
+  }
+  return collectionOf(
+    lookups.map((entry) => ({ id: entry.item.id, name: entry.item.name, itemType: entry.item.itemType, ok: entry.permissions.ok, permissions: entry.permissions.data ?? null })),
+    { complete: failed.length === 0 },
+  );
+}
+
 /**
  * The object written in place of a dataset that was never collected, so a
  * bundle consumer cannot mistake a denied or failed read for an empty
@@ -1792,11 +1823,12 @@ export async function assessSumologicDataGovernance(
     } else if (searchAuditPolicy.ok && searchAuditPolicy.data?.enabled !== true) {
       findings.push(finding(9, "high", "warn", `The audit policy is enabled and ${activeAuditIndexes.length} active audit index partition(s) exist, but the search audit policy is disabled, so query activity is not logged. Event flow still requires a manual search of _index=sumologic_audit_events.${partialNote(partitions)}`, evidence));
     } else {
-      // An existence check: a truncated partition list cannot hide the active
-      // audit index that was seen, so the partial note is legibility only.
       const policyText = searchAuditPolicy.ok ? "Audit and search audit policies are enabled" : "The audit policy is enabled";
       findings.push(withUnreadableDowngrade(
-        finding(9, "high", "pass", `${policyText} and ${activeAuditIndexes.length} active audit index partition(s) exist (${names(activeAuditIndexes).join(", ")}). Confirm event flow with a search of _index=sumologic_audit_events.${partialNote(partitions)}`, evidence),
+        withPartialDowngrade(
+          finding(9, "high", "pass", `${policyText} and ${activeAuditIndexes.length} active audit index partition(s) exist (${names(activeAuditIndexes).join(", ")}). Confirm event flow with a search of _index=sumologic_audit_events.`, evidence),
+          partitions,
+        ),
         "search audit policy",
         searchAuditPolicy,
         "screenshot Administration > Security > Policies > Search Audit to confirm query activity is logged.",
@@ -1948,6 +1980,7 @@ export async function assessSumologicContentSharing(
     if (!id) continue;
     permissionResults.push({ item, permissions: await client.getContentPermissions(id) });
   }
+  const unreadablePermissions = permissionResults.filter((entry) => !entry.permissions.ok);
   const collections: Array<[string, SumologicCollection<unknown>]> = [
     ["data_access_level_policy", dataAccessPolicy],
     ["share_dashboards_outside_organization_policy", sharePolicy],
@@ -1956,12 +1989,15 @@ export async function assessSumologicContentSharing(
     ["monitors", monitors],
     ["connections", connections],
     ["users", users],
-    ["content_permissions", collectionOf(permissionResults.map((entry) => ({ id: entry.item.id, name: entry.item.name, itemType: entry.item.itemType, ok: entry.permissions.ok, permissions: entry.permissions.data ?? null })))],
+    ["content_permissions", contentPermissionsCollection(personalFolder, permissionResults, unreadablePermissions)],
   ];
   const findings: SumologicFinding[] = [];
 
+  // Items shared org-wide are only known when at least one permission lookup
+  // succeeded; when every lookup failed the count and list render null.
+  const permissionsAllFailed = permissionResults.length > 0 && unreadablePermissions.length === permissionResults.length;
   const orgShared = permissionResults.filter((entry) => [...asRecords(entry.permissions.data?.explicitPermissions), ...asRecords(entry.permissions.data?.implicitPermissions)].some((permission) => asString(permission.sourceType) === "org"));
-  const unreadablePermissions = permissionResults.filter((entry) => !entry.permissions.ok);
+  const whenPermissionsRead = <T>(value: T): T | null => (personalFolder.ok && !permissionsAllFailed ? value : null);
   const sampleNote = unsampledChildren > 0 ? ` Only ${children.length} of ${allChildren.length} personal-folder items were sampled (content_sample=${sample}); ${unsampledChildren} were not evaluated.` : "";
   const sharingEvidence = {
     data_access_level_enabled: dataAccessPolicy.ok ? dataAccessPolicy.data?.enabled === true : null,
@@ -1970,7 +2006,7 @@ export async function assessSumologicContentSharing(
     personal_folder_items_sampled: whenReadable(personalFolder, permissionResults.length),
     personal_folder_items_unsampled: whenReadable(personalFolder, unsampledChildren),
     content_sample: sample,
-    org_shared_items: whenReadable(personalFolder, names(orgShared.map((entry) => entry.item))),
+    org_shared_items: whenPermissionsRead(names(orgShared.map((entry) => entry.item))),
     permission_lookups_failed: whenReadable(personalFolder, unreadablePermissions.length),
   };
   const sampledShareText = personalFolder.ok ? `${orgShared.length} sampled item(s) are shared org-wide` : "the personal folder could not be read, so no items were sampled";
@@ -2022,7 +2058,7 @@ export async function assessSumologicContentSharing(
   const lookupOrgShared = orgShared.filter((entry) => /lookup/i.test(asString(entry.item.itemType) ?? ""));
   const lookupEvidence = {
     lookup_tables_in_sampled_folder: whenReadable(personalFolder, names(lookupItems)),
-    lookup_tables_shared_org_wide: whenReadable(personalFolder, names(lookupOrgShared.map((entry) => entry.item))),
+    lookup_tables_shared_org_wide: whenPermissionsRead(names(lookupOrgShared.map((entry) => entry.item))),
     personal_folder_items_total: whenReadable(personalFolder, allChildren.length),
     personal_folder_items_sampled: whenReadable(personalFolder, children.length),
     personal_folder_readable: personalFolder.ok,
@@ -2136,7 +2172,7 @@ export async function assessSumologicContentSharing(
       personal_folder_items_total: whenReadable(personalFolder, allChildren.length),
       personal_folder_items_sampled: whenReadable(personalFolder, permissionResults.length),
       personal_folder_items_unsampled: whenReadable(personalFolder, unsampledChildren),
-      org_shared_items: whenReadable(personalFolder, orgShared.length),
+      org_shared_items: whenPermissionsRead(orgShared.length),
       dashboards_seen: whenReadable(dashboards, dashboardList.length),
       monitors_seen: whenReadable(monitors, monitorList.length),
       external_email_recipients: monitors.ok && orgDomains.size > 0 ? externalRecipients.length : null,
