@@ -1374,6 +1374,8 @@ test("scrub boundary: name-shaped values stay bare in prose, leave every carrier
     assert.equal(redactErrorText(text), expected);
     assert.equal(redactCredentialValueText(text), expected);
   }
+  // A digit string under a singular credential word is still a credential (a PIN, a numeric token).
+  assert.equal(redactErrorText('"pin": 4711, "token": 12345678, otp=123456, "tokens": 2'), '"pin": [REDACTED], "token": [REDACTED], otp=[REDACTED], "tokens": 2');
   assert.equal(redactCredentialValueText("bare Kq7Zx2Vw9Lm4Tp8R id"), "bare Kq7Zx2Vw9Lm4Tp8R id", "an opaque identifier in evidence is not a secret");
   const certificate = "-----BEGIN CERTIFICATE-----\nMIIEfake\n-----END CERTIFICATE-----";
   assert.equal(redactCredentialValueText(certificate), certificate, "a public certificate is evidence");
@@ -1392,6 +1394,7 @@ test("scrub boundary: name-shaped values stay bare in prose, leave every carrier
     "Basic authentication is required; the Bearer token is missing; token expired, retry later",
     "Unable to read Palo Alto config file /etc/paloalto.json (EACCES)",
     '"pass": 12, "pass_rate": 95, "default_snmp_community": false, "credential_enforcement_disabled": [], "password_complexity_by_device": [',
+    '"api_keys": 3, "secrets": 0, "oauth_tokens": 1, "credentials": 12; keys=3 tokens: 7 cookies: 0',
     '"credential-enforcement": {\n "client-auth": {\n "multi-factor-auth": {\n "password-complexity": {',
     "session_timeout_minutes=30 auth_mode=saml credentials_file=/etc/x credentialID=reg-cred-1 access_key_id=AKIA client_id=abc",
     "misconfiguration of the Authorization Code flow on misconfigured-firewall-cluster",
@@ -1647,6 +1650,22 @@ const ECHOED_MARKER = /credentials(?: \[REDACTED\])+ rejected/;
 function echoedSecretsMessage(forms) {
   return `credentials ${forms.join(" ")} rejected`;
 }
+
+test("a documented error field is scrubbed of the configured secrets before it is shortened, so the 200-character cut never leaves a fragment of a secret", async () => {
+  const forms = [...secretForms(FIXTURE_SECRET_KEY), ...secretForms("k")].filter((form) => form.length >= 8);
+  for (const form of forms) {
+    // The form straddles the 200-character boundary of the shortened field: scrubbing
+    // after the cut would leave its head behind.
+    const message = `${"x".repeat(200 - Math.floor(form.length / 2))} ${form} was rejected by the upstream identity provider`;
+    const fetchImpl = async () => jsonResponse({ message }, { status: 400, statusText: "Bad Request" });
+    const client = new PrismaCloudClient({ apiUrl: "https://api2.prismacloud.io", accessKeyId: "k", secretKey: FIXTURE_SECRET_KEY }, { fetchImpl, sleepImpl: noSleep });
+    await assert.rejects(client.get("/v2/policy"), (error) => {
+      assertNoWindow(error.message, form, 8, `straddling ${form}`);
+      assert.match(error.message, /x{20,} \[REDACTED\]/, error.message);
+      return true;
+    });
+  }
+});
 
 test("configured secrets echoed by an error body in every encoded form never reach a probe, finding, analysis error, bundle file, or zip entry", async () => {
   const prismaForms = secretForms(FIXTURE_SECRET_KEY);

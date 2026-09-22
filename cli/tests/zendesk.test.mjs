@@ -10,6 +10,7 @@ import {
   symlinkSync,
   writeFileSync,
 } from "node:fs";
+import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -21,12 +22,16 @@ import {
   assessZendeskDataProtection,
   assessZendeskIntegrations,
   checkZendeskAccess,
+  configuredZendeskSecrets,
   describeErrorBody,
   exportZendeskAuditBundle,
+  isCredentialKey,
   isCredentialPropertyName,
+  redactConfiguredSecrets,
   redactCredentialProperties,
   redactCredentialValueText,
   redactErrorText,
+  redactSecrets,
   registerZendeskTools,
   resolveSecureOutputPath,
   resolveZendeskConfiguration,
@@ -45,13 +50,27 @@ function createTempBase(prefix) {
   return mkdtempSync(join(tmpdir(), prefix));
 }
 
+// The configured API token of the fixtures, which only the configured-secret pass
+// (guard 2) removes: it is deliberately name-shaped, so bare in prose no carrier or
+// token-shape rule touches it and its absence proves that pass ran. Its words appear
+// nowhere in the module's own vocabulary, and no 8-character window of it does either
+// (source_chain renders "api-token:environment", so "api-token" is out).
+const FIXTURE_API_TOKEN = "fixture-teal-harbor-2026";
+// The composed Basic credential the client sends for the fixture configuration.
+const FIXTURE_BASIC_CREDENTIAL = Buffer.from(`auditor@example.com/token:${FIXTURE_API_TOKEN}`).toString("base64");
+
+// The forms a configured secret can be echoed in: as is, JSON-escaped, URL-encoded, base64, base64url.
+function secretForms(value) {
+  return [...new Set([value, JSON.stringify(value).slice(1, -1), encodeURIComponent(value), Buffer.from(value).toString("base64"), Buffer.from(value).toString("base64url")])];
+}
+
 function sampleConfig(overrides = {}) {
   return {
     subdomain: "acme",
     baseUrl: "https://acme.zendesk.com/api/v2",
     authMode: "api_token",
     email: "auditor@example.com",
-    apiToken: "secret-api-token-value",
+    apiToken: FIXTURE_API_TOKEN,
     oauthToken: undefined,
     timeoutMs: 30000,
     sourceChain: ["tests"],
@@ -638,7 +657,7 @@ test("ZendeskApiClient sends API token basic auth and OAuth bearer headers", asy
 
   const tokenClient = new ZendeskApiClient(sampleConfig(), { fetchImpl });
   await tokenClient.getCurrentUser();
-  const expectedBasic = `Basic ${Buffer.from("auditor@example.com/token:secret-api-token-value").toString("base64")}`;
+  const expectedBasic = `Basic ${FIXTURE_BASIC_CREDENTIAL}`;
   assert.equal(seen[0].authorization, expectedBasic);
   assert.equal(seen[0].url, "https://acme.zendesk.com/api/v2/users/me");
 
@@ -824,20 +843,20 @@ test("ZendeskApiClient retries 429 with Retry-After and 5xx before succeeding", 
 });
 
 test("ZendeskApiClient surfaces API errors with status codes and redacts secrets", async () => {
-  const fetchImpl = async () => jsonResponse({ error: "Forbidden", description: "token secret-api-token-value was rejected" }, { status: 403, statusText: "Forbidden" });
+  const fetchImpl = async () => jsonResponse({ error: "Forbidden", description: `token ${FIXTURE_API_TOKEN} was rejected` }, { status: 403, statusText: "Forbidden" });
   const client = new ZendeskApiClient(sampleConfig(), { fetchImpl });
   await assert.rejects(client.getAccountSettings(), (error) => {
     assert.ok(error instanceof ZendeskApiError);
     assert.equal(error.status, 403);
     assert.match(error.message, /403/);
-    assert.doesNotMatch(error.message, /secret-api-token-value/);
-    assert.match(error.message, /\[REDACTED\]/);
+    assert.ok(!error.message.includes(FIXTURE_API_TOKEN), error.message);
+    assert.match(error.message, /token \[REDACTED\] was rejected/, "a name-shaped configured secret bare in prose is removed by the configured-secret pass alone");
     return true;
   });
 
   const failing = new ZendeskApiClient(sampleConfig(), {
     fetchImpl: async () => {
-      throw new Error("connect ECONNREFUSED secret-api-token-value");
+      throw new Error(`connect ECONNREFUSED ${FIXTURE_API_TOKEN}`);
     },
   });
   await assert.rejects(failing.getCurrentUser(), /ECONNREFUSED \[REDACTED\]/);
@@ -1652,7 +1671,7 @@ test("exportZendeskAuditBundle writes the bundle layout, archive, and never over
   assert.match(executive, /Subdomain: acme/);
   assert.match(executive, /## Manual Evidence Required/);
   const rawSettings = readFileSync(join(first.outputDir, "core_data/account_settings.json"), "utf8");
-  assert.doesNotMatch(rawSettings, /secret-api-token-value/);
+  assert.ok(!rawSettings.includes(FIXTURE_API_TOKEN));
 
   const second = await exportZendeskAuditBundle(healthyClient(), config, base, { now: () => NOW });
   assert.notEqual(second.outputDir, first.outputDir);
@@ -2062,6 +2081,227 @@ test("redactErrorText and describeErrorBody scrub credential-shaped text regardl
   assert.equal(describeErrorBody(jsonResponse({}, { status: 422, statusText: "Unprocessable Entity" }), nestedBody), "422 Unprocessable Entity; Invalid; Bearer [REDACTED]; Bad; api_key=[REDACTED]");
   const longBody = JSON.stringify({ error: `x`.repeat(300) });
   assert.equal(describeErrorBody(jsonResponse({}, { status: 400, statusText: "Bad Request" }), longBody), `400 Bad Request; ${"x".repeat(200)}`, "documented fields are shortened to 200 characters after scrubbing");
+});
+
+// ---------------------------------------------------------------------------
+// Scrub boundary ruling: a name-shaped value bare in prose stays, a carrier loses its value
+// whatever its shape, a configured secret is removed in every form whatever its shape, and
+// real token shapes are removed bare.
+// ---------------------------------------------------------------------------
+const NAME_SHAPED_VALUES = ["prod-us-east-2026", "fw-dc1-01", "sess-canary-COOKIE-31415926535897"];
+
+// Neither the canary nor any window of `windowSize` characters of it may survive, so a
+// partial echo (a slice, a split token) is attributable to the canary it came from.
+function assertNoWindow(text, canary, windowSize, label) {
+  assert.ok(!text.includes(canary), `${label}: ${canary} leaked`);
+  for (let index = 0; index + windowSize <= canary.length; index += 1) {
+    const fragment = canary.slice(index, index + windowSize);
+    assert.ok(!text.includes(fragment), `${label}: fragment ${fragment} of ${canary} leaked`);
+  }
+}
+
+// Every carrier of the ruling with the value in it, and the exact rendering after the scrub.
+function carriersOf(value) {
+  return [
+    [`Authorization: Bearer ${value}`, /^Authorization: (?:Bearer )?\[REDACTED\]$/],
+    [`Proxy-Authorization: Basic ${value}`, /^Proxy-Authorization: (?:Basic )?\[REDACTED\]$/],
+    [`Cookie: _zendesk_session=${value}; theme=dark`, /^Cookie: \[REDACTED\]$/],
+    [`Set-Cookie: _zendesk_session=${value}; Path=/; HttpOnly`, /^Set-Cookie: \[REDACTED\]$/],
+    [`X-Api-Key: ${value}`, /^X-Api-Key: \[REDACTED\]$/],
+    [`x-auth-token: ${value}`, /^x-auth-token: \[REDACTED\]$/],
+    [`<p>X-Api-Key: ${value}</p><p>next</p>`, /^<p>X-Api-Key: \[REDACTED\]<\/p><p>next<\/p>$/],
+    [`session=${value}; Path=/`, /^session=\[REDACTED\]; Path=\/$/],
+    [`_zendesk_session=${value} expired`, /^_zendesk_session=\[REDACTED\] expired$/],
+    [`JSESSIONID=${value}; Path=/`, /^JSESSIONID=\[REDACTED\]; Path=\/$/],
+    [`https://svc:${value}@proxy.example.com/x`, /^https:\/\/\[REDACTED\]@proxy\.example\.com\/x$/],
+    [`https://hooks.example.com/zendesk?token=${value}&channel=ops`, /^https:\/\/hooks\.example\.com\/zendesk\?token=\[REDACTED\]&channel=ops$/],
+    [`https://x.example.com/cb?state=1&api_key=${value}`, /^https:\/\/x\.example\.com\/cb\?state=1&api_key=\[REDACTED\]$/],
+    [`GET /login?user=a&pass=${value}`, /^GET \/login\?user=a&pass=\[REDACTED\]$/],
+    [`https://x.example.com/cb#access_token=${value}&state=1`, /^https:\/\/x\.example\.com\/cb#access_token=\[REDACTED\]&state=1$/],
+    [`https://hooks.slack.com/services/${value}`, /^https:\/\/hooks\.slack\.com\/services\/\[REDACTED\]$/],
+    [`Bearer ${value}`, /^Bearer \[REDACTED\]$/],
+    [`Basic ${value}`, /^Basic \[REDACTED\]$/],
+    [`Token ${value}`, /^Token \[REDACTED\]$/],
+    [`ApiKey ${value}`, /^ApiKey \[REDACTED\]$/],
+    [`password=${value}`, /^password=\[REDACTED\]$/],
+    [`password: ${value}`, /^password: \[REDACTED\]$/],
+    [`passphrase: ${value} and more words`, /^passphrase: \[REDACTED\]$/],
+    [`client_secret=${value}&grant_type=x`, /^client_secret=\[REDACTED\]&grant_type=x$/],
+    [`{"client_secret":"${value}","name":"svc"}`, /^\{"client_secret":"\[REDACTED\]","name":"svc"\}$/],
+    [`{"full_token": "${value}", "id": 7}`, /^\{"full_token": "\[REDACTED\]", "id": 7\}$/],
+    [`<target name="t1" token="${value}"/>`, /^<target name="t1" token="\[REDACTED\]"\/>$/],
+    [`<field name='pw' password='${value}'/>`, /^<field name='pw' password='\[REDACTED\]'\/>$/],
+  ];
+}
+
+test("scrub boundary: name-shaped values stay bare in prose, leave every carrier whatever their shape, and go as configured secrets in every form", () => {
+  for (const value of NAME_SHAPED_VALUES) {
+    for (const prose of [`inventory ${value} was not read`, `${value}`, `webhook ${value} read 12 of 40 destinations`, `path /var/lib/${value}/state`]) {
+      assert.equal(redactErrorText(prose), prose, `${value} stays bare in error text`);
+      assert.equal(redactCredentialValueText(prose), prose, `${value} stays bare in a data value`);
+    }
+    for (const [text, expected] of carriersOf(value)) {
+      for (const scrub of [redactErrorText, redactCredentialValueText]) {
+        const out = scrub(text);
+        assert.match(out, expected, `${scrub.name}(${JSON.stringify(text)}) -> ${JSON.stringify(out)}`);
+        assertNoWindow(out, value, 6, `${scrub.name} ${text}`);
+        assert.equal(scrub(out), out, `${scrub.name} is idempotent on ${out}`);
+      }
+    }
+    // A configured secret goes bare and in every encoded form, however name-shaped it is.
+    for (const form of secretForms(value)) {
+      assert.equal(redactSecrets(`login rejected for ${form} by upstream`, [value]), "login rejected for [REDACTED] by upstream", `configured ${value} as ${form}`);
+      assert.equal(redactConfiguredSecrets(`login rejected for ${form} by upstream`, [value]), "login rejected for [REDACTED] by upstream", `guard 2 alone on ${form}`);
+    }
+  }
+  // The composed Basic credential is its own configured secret: no encoding of the token alone matches it.
+  const secrets = configuredZendeskSecrets(sampleConfig());
+  assert.deepEqual(secrets, [FIXTURE_API_TOKEN, `auditor@example.com/token:${FIXTURE_API_TOKEN}`, FIXTURE_BASIC_CREDENTIAL]);
+  assert.ok(!secretForms(FIXTURE_API_TOKEN).includes(FIXTURE_BASIC_CREDENTIAL), "the fixture proves the point: the Basic form is not a form of the token");
+  assert.equal(redactConfiguredSecrets(`sent Authorization Basic ${FIXTURE_BASIC_CREDENTIAL} upstream`, secrets), "sent Authorization Basic [REDACTED] upstream");
+  assert.equal(redactConfiguredSecrets(`sent ${FIXTURE_BASIC_CREDENTIAL} upstream`, [FIXTURE_API_TOKEN]), `sent ${FIXTURE_BASIC_CREDENTIAL} upstream`, "the token alone does not cover the Basic form, so the client registers it");
+  assert.deepEqual(configuredZendeskSecrets(sampleConfig({ authMode: "oauth", email: undefined, apiToken: undefined, oauthToken: "oauth-fixture-value-2026" })), ["oauth-fixture-value-2026"]);
+  assert.equal(redactConfiguredSecrets("a pin 4711 and pin 47110", ["4711"]), "a pin [REDACTED] and pin 47110", "a short secret is removed as a whole token only");
+  assert.equal(redactConfiguredSecrets("too short abc", ["abc"]), "too short abc", "below the minimum length nothing is scrubbed");
+
+  // Real token shapes go bare from error text, and stay in data values where they are identifiers.
+  for (const [text, expected] of [
+    ["bare Kq7Zx2Vw9Lm4Tp8R token", "bare [REDACTED] token"],
+    ["digest 0f9e8d7c6b5a4938 shown", "digest [REDACTED] shown"],
+    ["hash 3a7bd3e2360a3d29eea436fcfb7e44c735d117c42d1c1835420b6b9942dd4f1b shown", "hash [REDACTED] shown"],
+    ["jwt eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0In0.abcdefghijk expired", "jwt [REDACTED] expired"],
+    ["bare dXNlcjpwYXNzd29yZA== padded", "bare [REDACTED] padded"],
+    ["akid AKIAIOSFODNN7EXAMPLE shown", "akid [REDACTED] shown"],
+    ["-----BEGIN RSA PRIVATE KEY-----\nMIIEfake\n-----END RSA PRIVATE KEY-----", "[REDACTED]"],
+    ["-----BEGIN CERTIFICATE-----\nMIIEfake\n-----END CERTIFICATE-----", "[REDACTED]"],
+    ["truncated -----BEGIN PRIVATE KEY-----\nMIIEfake", "truncated [REDACTED]"],
+  ]) {
+    assert.equal(redactErrorText(text), expected);
+    assert.equal(redactErrorText(expected), expected, "idempotent");
+  }
+  // After a scheme the value goes whatever its shape, a plain lowercase word included,
+  // unless it is one of the listed prose words; after the noun "Token" any short plain
+  // lowercase word is prose, and OAuth is this module's vocabulary, not a scheme.
+  for (const [text, expected] of [
+    ["Bearer abcdefghijklmnop rejected", "Bearer [REDACTED] rejected"],
+    ["Basic canarybasic rejected", "Basic [REDACTED] rejected"],
+    ["ApiKey canaryapikey rejected", "ApiKey [REDACTED] rejected"],
+    ["Token abcdefghijklmnopq expired", "Token [REDACTED] expired"],
+    ["Token hygiene could not be judged; token inventory read; Token count 3", "Token hygiene could not be judged; token inventory read; Token count 3"],
+    ["OAuth clients all declare scopes; an OAuth bearer token; OAuth abcdefghijklmnop", "OAuth clients all declare scopes; an OAuth bearer token; OAuth abcdefghijklmnop"],
+    ["API token basic auth; Bearer tokens expire; Basic credential; Basic authentication is required", "API token basic auth; Bearer tokens expire; Basic credential; Basic authentication is required"],
+  ]) {
+    assert.equal(redactErrorText(text), expected);
+    assert.equal(redactCredentialValueText(text), expected);
+  }
+  // A digit string under a singular credential word is still a credential (a PIN, a numeric token).
+  assert.equal(redactErrorText('"pin": 4711, "token": 12345678, otp=123456, "tokens": 2'), '"pin": [REDACTED], "token": [REDACTED], otp=[REDACTED], "tokens": 2');
+  assert.equal(redactCredentialValueText("bare Kq7Zx2Vw9Lm4Tp8R id"), "bare Kq7Zx2Vw9Lm4Tp8R id", "an opaque identifier in evidence is not a secret");
+  const certificate = "-----BEGIN CERTIFICATE-----\nMIIEfake\n-----END CERTIFICATE-----";
+  assert.equal(redactCredentialValueText(certificate), certificate, "a public certificate is evidence");
+  assert.equal(redactCredentialValueText("-----BEGIN PRIVATE KEY-----\nMIIEfake\n-----END PRIVATE KEY-----"), "[REDACTED]");
+  assert.equal(redactCredentialValueText(`${certificate}\n-----BEGIN EC PRIVATE KEY-----\nMHcC`), `${certificate}\n[REDACTED]`, "a truncated private block after a kept certificate");
+
+  // Names, prose, and this module's own vocabulary survive.
+  for (const text of [
+    "Zendesk request failed for /users/me (403 Forbidden)",
+    "Zendesk request failed for /oauth/tokens (502 Bad Gateway; non-JSON text/html response body (1234 bytes, not echoed))",
+    "GET /api/v2/audit_logs?filter[source_type]=apitoken&sort=-created_at&page[size]=100",
+    "The OAuth client and token endpoints were readable and returned zero clients and zero tokens, so no third-party OAuth applications are registered on this account.",
+    "3 OAuth clients all declare allowed scopes; review 1 public clients, 2 tokens with write or impersonate scope, 0 non-expiring tokens. Token hygiene could not be judged because GET /api/v2/oauth/tokens returned 403 (credential lacks permission).",
+    "API token access is disabled (api_token_access=false); manage_api_credentials=true; two_factor_auth=true; password_policy=high",
+    "review each outstanding token in Admin Center > Apps and integrations > APIs > API tokens, confirm its owner and purpose, delete unused tokens, and record the OAuth migration plan.",
+    "Using Zendesk subdomain acme with API token basic auth.",
+    "Unable to read Zendesk config file /etc/zendesk.json (EACCES)",
+    "Unable to parse Zendesk config file: invalid JSON in /etc/zendesk.json at line 3",
+    "/tmp/grclanker-zendesk-loader-errors-Ab3xY9/nested.yaml",
+    "policy 550e8400-e29b-41d4-a716-446655440000 unified_compliance_matrix ENOENT PCI-DSS-4",
+    "Basic authentication is required; the Bearer token is missing; token expired, retry later",
+    '"pass": 12, "pass_rate": 95, "api_token_access": false, "two_factor_auth": {"enforce": true}, "password": {"min_length": 12}',
+    '"api_keys": 3, "secrets": 0, "oauth_tokens": 1, "credentials": 12; keys=3 tokens: 7 cookies: 0',
+    "session_timeout_minutes=30 auth_mode=saml credentials_file=/etc/x access_key_id=AKIA client_id=abc",
+    "misconfiguration of the Authorization Code flow on misconfigured-support-cluster",
+  ]) {
+    assert.equal(redactErrorText(text), text, text);
+  }
+
+  for (const [key, expected] of [
+    ["key", true], ["token", true], ["full_token", true], ["api_key", true], ["X-Api-Key", true], ["Set-Cookie", true],
+    ["_zendesk_session", true], ["session_id", true], ["JSESSIONID", true], ["password1", true], ["authtoken", true],
+    ["sharedsecret", true], ["privatekey", true], ["password_hash", true], ["token_value", true], ["authorization_header", true],
+    ["client_secret", true], ["signing_secret", true], ["sid", true], ["sig", true],
+    ["api_token_access", false], ["public_key", false], ["tokenCount", false], ["scopes", false], ["client_id", false], ["user", false],
+    ["login", false], ["max_keys", false], ["auth_mode", false], ["password_policy", false], ["two_factor_auth", true],
+    ["pass_rate", false], ["pass", false], ["access_key_id", false], ["monkey", false], ["oauth", false], ["sessions", false],
+    ["session_timeout_minutes", false], ["credentials_file", false], ["passwordPolicy", false], ["webhookUrl", false], ["target_url", false],
+  ]) {
+    assert.equal(isCredentialKey(key), expected, key);
+  }
+});
+
+test("no window of a carried or configured canary survives, for every canary length from 6 to 24", () => {
+  // A deterministic generator so a failure reproduces; one digit is forced so the value
+  // never falls under a prose exception after a scheme.
+  let seed = 0x2545f491;
+  const next = () => {
+    seed = (seed * 1103515245 + 12345) % 0x80000000;
+    return seed;
+  };
+  const alphabet = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+  const canary = (length) => {
+    let value = "";
+    for (let index = 0; index < length; index += 1) value += alphabet[next() % alphabet.length];
+    return `${value.slice(0, -1)}${next() % 10}`;
+  };
+  for (let length = 6; length <= 24; length += 1) {
+    for (let sample = 0; sample < 3; sample += 1) {
+      const value = canary(length);
+      for (const [text] of carriersOf(value)) {
+        for (const scrub of [redactErrorText, redactCredentialValueText]) {
+          assertNoWindow(scrub(text), value, Math.min(6, length), `${scrub.name} ${text}`);
+        }
+      }
+      for (const form of secretForms(value)) {
+        assertNoWindow(redactSecrets(`upstream echoed ${form} in a ${length}-character reply`, [value]), value, Math.min(6, length), `configured ${value} as ${form}`);
+      }
+    }
+  }
+});
+
+test("the healthy bundle is fixed text the scrubs leave untouched, so every marker in a bundle is attributable to a credential or an echo", async () => {
+  const bundle = await exportZendeskAuditBundle(healthyClient(), sampleConfig(), createTempBase("grclanker-zendesk-fixed-text-"), { now: () => NOW });
+  const files = readBundleFiles(bundle.outputDir);
+  assert.ok(files.size >= 20);
+  for (const [name, content] of files) {
+    assert.equal(redactErrorText(content), content, `${name} is fixed text redactErrorText leaves alone`);
+    assert.equal(redactCredentialValueText(content), content, `${name} is fixed text redactCredentialValueText leaves alone`);
+    assert.equal(redactConfiguredSecrets(content, configuredZendeskSecrets(sampleConfig())), content, `${name} carries no configured secret`);
+    // core_data/ carries the fixture's own webhook and target credentials as markers, and
+    // QUICK_REFERENCE.md describes the marker; every other file is marker-free on a healthy tenant.
+    if (!name.startsWith("core_data") && name !== "QUICK_REFERENCE.md") assert.ok(!content.includes("[REDACTED]"), `${name} carries no marker on a healthy tenant`);
+  }
+  const access = await checkZendeskAccess(healthyClient());
+  const results = await runAllAssessments(healthyClient());
+  for (const [label, text] of [["access check", JSON.stringify(access)], ["assessments", JSON.stringify(results)]]) {
+    assert.equal(redactErrorText(text), text, `${label} is fixed text`);
+    assert.ok(!text.includes("[REDACTED]"), `${label} carries no marker on a healthy tenant`);
+  }
+});
+
+test("a documented error field is scrubbed of the configured secrets before it is shortened, so the 200-character cut never leaves a fragment of a secret", async () => {
+  const forms = [...secretForms(FIXTURE_API_TOKEN), ...secretForms(FIXTURE_BASIC_CREDENTIAL)];
+  for (const form of forms) {
+    // The form straddles the 200-character boundary of the shortened field: scrubbing
+    // after the cut would leave its head behind.
+    const description = `${"x".repeat(200 - Math.floor(form.length / 2))} ${form} was rejected by the upstream identity provider`;
+    const fetchImpl = async () => jsonResponse({ error: "Forbidden", description }, { status: 403, statusText: "Forbidden" });
+    const client = new ZendeskApiClient(sampleConfig(), { fetchImpl, sleep: async () => {} });
+    await assert.rejects(client.getAccountSettings(), (error) => {
+      assertNoWindow(error.message, form, 8, `straddling ${form}`);
+      assert.match(error.message, /403 Forbidden; Forbidden; x{20,} \[REDACTED\]/, error.message);
+      return true;
+    });
+  }
 });
 
 // Canary values that must never survive into any tool result, finding, summary, or bundle file.

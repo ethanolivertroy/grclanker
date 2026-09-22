@@ -499,10 +499,12 @@ const SCHEME_PROSE_WORDS = new Set([
 const JSON_QUOTED_PAIR_PATTERN = /"([A-Za-z_][A-Za-z0-9_.-]{0,63})"(\s*:\s*)"((?!\[REDACTED\])[^"\r\n]+)"/g;
 const QUOTED_ATTRIBUTE_PATTERN = /(?<![A-Za-z0-9_.:-])([A-Za-z_][A-Za-z0-9_.:-]{0,63})\s*=\s*(["'])((?!\[REDACTED\])[^"'\r\n]+)\2/g;
 // An unquoted pair: key=value runs to the next delimiter, key: value (a header or
-// YAML-style line) to the end of the line.
+// YAML-style line) to the end of the line, where a brace or bracket ends it so a JSON
+// structure after a credential-named key (compact "password":{...}, "auth":null}) is
+// never taken for a value.
 const ASSIGNMENT_KEY_PATTERN = /(?<![A-Za-z0-9_.-])(["']?)([A-Za-z_][A-Za-z0-9_.-]{0,63})(["']?\s*([:=])\s*["']?)/g;
 const DELIMITED_VALUE_PATTERN = /(?!\[REDACTED\])[^\s"'<>;,&]+/y;
-const LINE_VALUE_PATTERN = /(?!\[REDACTED\])[^\r\n<>"',;]*[^\s\r\n<>"',;]/y;
+const LINE_VALUE_PATTERN = /(?!\[REDACTED\])[^\r\n<>"',;{}[\]]*[^\s\r\n<>"',;{}[\]]/y;
 const TOKEN_IN_PATH_WEBHOOK_PATTERN = /(https?:\/\/(?:hooks\.slack\.com\/services|discord(?:app)?\.com\/api\/webhooks|[a-z0-9.-]*webhook\.office\.com\/webhookb2)\/)(?!\[REDACTED\])[^\s"'<>]+/gi;
 const JWT_PATTERN = /\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}(?:\.[A-Za-z0-9_-]+)*/g;
 const PANOS_API_KEY_PATTERN = /\bLUFRPT[A-Za-z0-9+/=_-]{16,}/g;
@@ -541,6 +543,10 @@ const EXTRA_CREDENTIAL_KEYS = new Set(["x-pan-key", "x-redlock-auth", "proxy-aut
 const ASSIGNMENT_ONLY_CREDENTIAL_WORDS = new Set(["pass"]);
 // JSON structure and literals after a key are never a credential value.
 const STRUCTURAL_VALUE_PATTERN = /^(?:[{[]|\{\}|\[\]|true|false|null)$/;
+// A bare integer under a plural credential word ("oauth_tokens": 1, keys=3, secrets: 0) is
+// a count, this module's own summary vocabulary, not a credential.
+const PLURAL_CREDENTIAL_WORDS = new Set(["tokens", "secrets", "keys", "cookies", "passwords", "credentials"]);
+const COUNT_VALUE_PATTERN = /^\d+(?:\s|$)/;
 
 function credentialKeyWord(segment: string): boolean {
   return CREDENTIAL_KEY_WORDS.has(segment) || CREDENTIAL_KEY_SUFFIX_PATTERN.test(segment);
@@ -560,6 +566,14 @@ export function isCredentialKey(key: string): boolean {
   if ((last === "key" || last === "keys") && words.length > 1 && NON_CREDENTIAL_KEY_QUALIFIERS.has(words[words.length - 2])) return false;
   if (credentialKeyWord(last)) return true;
   return CREDENTIAL_VALUE_FORM_WORDS.has(last) && words.slice(0, -1).some(credentialKeyWord);
+}
+
+// True for a value that opens with a bare integer under a plural credential word: a count,
+// not a carrier (the rest of a key: value line is rescanned for pairs of its own).
+function isCountValue(key: string, value: string): boolean {
+  if (!COUNT_VALUE_PATTERN.test(value)) return false;
+  const words = keyWords(key);
+  return words.length > 0 && PLURAL_CREDENTIAL_WORDS.has(words[words.length - 1]);
 }
 
 /** isCredentialKey plus the words that name a credential only in a query string or = assignment. */
@@ -663,7 +677,7 @@ function replaceCredentialAssignments(text: string): string {
     const valuePattern = operator === ":" ? LINE_VALUE_PATTERN : DELIMITED_VALUE_PATTERN;
     valuePattern.lastIndex = match.index + whole.length;
     const value = valuePattern.exec(text)?.[0];
-    if (value === undefined || STRUCTURAL_VALUE_PATTERN.test(value)) continue;
+    if (value === undefined || STRUCTURAL_VALUE_PATTERN.test(value) || isCountValue(key, value)) continue;
     out += `${text.slice(last, match.index)}${openingQuote}${key}${separator}${REDACTION_MARKER}`;
     last = match.index + whole.length + value.length;
     ASSIGNMENT_KEY_PATTERN.lastIndex = last;
@@ -679,7 +693,7 @@ function scrubCarriers(text: string, pemScope: PemScope): string {
     .replace(QUERY_PAIR_PATTERN, (match, separator: string, key: string, value: string) => (isCredentialAssignmentKey(key) || isTokenShapedValue(value) ? `${separator}${key}=${REDACTION_MARKER}` : match))
     .replace(HEADER_LINE_PATTERN, `$1$2${REDACTION_MARKER}`)
     .replace(SCHEME_VALUE_PATTERN, (match, scheme: string, value: string) => (isSchemeProse(scheme, value) ? match : `${scheme} ${REDACTION_MARKER}`))
-    .replace(JSON_QUOTED_PAIR_PATTERN, (match, key: string, separator: string) => (isCredentialKey(key) ? `"${key}"${separator}"${REDACTION_MARKER}"` : match))
+    .replace(JSON_QUOTED_PAIR_PATTERN, (match, key: string, separator: string, value: string) => (isCredentialKey(key) && !isCountValue(key, value) ? `"${key}"${separator}"${REDACTION_MARKER}"` : match))
     .replace(QUOTED_ATTRIBUTE_PATTERN, (match, key: string, quote: string) => (isCredentialKey(key) ? `${key}=${quote}${REDACTION_MARKER}${quote}` : match));
   return replaceCredentialAssignments(scrubbed)
     .replace(JWT_PATTERN, REDACTION_MARKER)
@@ -1637,7 +1651,12 @@ function prismaErrorFields(payload: unknown): string[] {
   return [...new Set(fields.filter((field): field is string => Boolean(field)))];
 }
 
-export function describePrismaErrorBody(response: Response, rawText: string): string {
+/**
+ * The status-and-length note or Prisma Cloud's documented error fields for a failed
+ * response. Each field is scrubbed before it is shortened, with the caller's scrub when
+ * it knows the configured secrets, so the cut never leaves a fragment of a secret behind.
+ */
+export function describePrismaErrorBody(response: Response, rawText: string, scrub: (text: string) => string = redactErrorText): string {
   const parts: string[] = [];
   const header = response.headers.get("x-redlock-status");
   if (header) {
@@ -1655,12 +1674,14 @@ export function describePrismaErrorBody(response: Response, rawText: string): st
       parts.push(fields.length > 0 ? fields.join("; ") : `JSON response body without documented error fields (${rawText.length} bytes, not echoed)`);
     }
   }
-  return parts.map((part) => redactErrorText(part.replace(/\s+/g, " ")).slice(0, 200)).join("; ");
+  return parts.map((part) => scrub(part.replace(/\s+/g, " ")).slice(0, 200)).join("; ");
 }
 
 export class PrismaCloudClient {
   private readonly config: PaloaltoPrismaConfig;
   private readonly http: HttpOptions;
+  // The client-side scrub, handed to describePrismaErrorBody so a field is scrubbed of the configured secrets before it is shortened.
+  private readonly scrub = (text: string): string => redactSecrets(text, this.http.secrets);
   private token?: string;
   private tokenExpiresAt = 0;
   private prismaId?: string;
@@ -1698,7 +1719,7 @@ export class PrismaCloudClient {
     }, this.http, endpoint);
     const rawText = await response.text();
     if (!response.ok) {
-      throw new PaloaltoApiError(redactSecrets(`Prisma Cloud login failed (${response.status}): ${describePrismaErrorBody(response, rawText)}`, this.http.secrets), response.status, endpoint);
+      throw new PaloaltoApiError(redactSecrets(`Prisma Cloud login failed (${response.status}): ${describePrismaErrorBody(response, rawText, this.scrub)}`, this.http.secrets), response.status, endpoint);
     }
     const parsed = safeJsonParse(rawText);
     if (parsed === undefined) {
@@ -1753,7 +1774,7 @@ export class PrismaCloudClient {
       return this.request(method, path, query, body, false);
     }
     if (!response.ok) {
-      throw new PaloaltoApiError(redactSecrets(`Prisma Cloud ${method} ${path} failed (${response.status}): ${describePrismaErrorBody(response, rawText)}`, this.http.secrets), response.status, endpoint);
+      throw new PaloaltoApiError(redactSecrets(`Prisma Cloud ${method} ${path} failed (${response.status}): ${describePrismaErrorBody(response, rawText, this.scrub)}`, this.http.secrets), response.status, endpoint);
     }
     if (rawText.length === 0) return {};
     const parsed = safeJsonParse(rawText);
@@ -1875,6 +1896,7 @@ export class PrismaComputeClient {
   private readonly consoleUrl: string;
   private readonly cspm: Pick<PrismaCloudClient, "getToken" | "credentials" | "httpOptions">;
   private readonly http: HttpOptions;
+  private readonly scrub = (text: string): string => redactSecrets(text, this.http.secrets);
   private bearer?: string;
   private bearerExpiresAt = 0;
   private useRedlockHeader = false;
@@ -1921,7 +1943,7 @@ export class PrismaComputeClient {
     }, this.http, endpoint);
     const rawText = await response.text();
     if (!response.ok) {
-      throw new PaloaltoApiError(redactSecrets(`Prisma Cloud Compute GET ${path} failed (${response.status}): ${describePrismaErrorBody(response, rawText)}`, this.http.secrets), response.status, endpoint);
+      throw new PaloaltoApiError(redactSecrets(`Prisma Cloud Compute GET ${path} failed (${response.status}): ${describePrismaErrorBody(response, rawText, this.scrub)}`, this.http.secrets), response.status, endpoint);
     }
     if (rawText.length === 0) return {};
     const parsed = safeJsonParse(rawText);
