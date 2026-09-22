@@ -51,6 +51,7 @@
     "test:launchdarkly:live": "npm run build && node scripts/launchdarkly-live-smoke.mjs",
     "test:mulesoft:live": "npm run build && node scripts/mulesoft-live-smoke.mjs",
     "test:newrelic:live": "npm run build && node scripts/newrelic-live-smoke.mjs",
+    "test:oci:live": "npm run build && node scripts/oci-live-smoke.mjs",
     "test:okta:live": "npm run build && node scripts/okta-live-smoke.mjs",
     "test:oscal:live": "npm run build && node scripts/oscal-live-smoke.mjs",
     "test:pagerduty:live": "npm run build && node scripts/pagerduty-live-smoke.mjs",
