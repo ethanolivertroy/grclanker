@@ -1761,6 +1761,31 @@ function skippedDataset<T>(fallback: T, reason: string): CollectedDataset<T> {
   return { data: fallback, error, truncated: null, notCollected: { collected: false, status: null, endpoint: null, error } };
 }
 
+/**
+ * A per-parent collection in which every child lookup failed: nothing was
+ * collected, so the dataset is not collected (its count and truncated flag
+ * render null, never 0 or false), the error says every lookup failed, and the
+ * child markers keep each failed request for the bundle. No single status or
+ * endpoint is invented for the whole map; each child marker carries its own.
+ */
+function allChildrenFailedDataset<T>(
+  fallback: T,
+  childLabel: string,
+  errors: string[],
+  childMarkers: Record<string, OktaNotCollectedMarker>,
+): CollectedDataset<T> {
+  const error = `every ${childLabel} lookup failed (${errors.length} of ${errors.length}): ${errors.join("; ")}`;
+  return {
+    data: fallback,
+    error,
+    truncated: null,
+    notCollected: { collected: false, status: null, endpoint: null, error },
+    childMarkers,
+  };
+}
+
+const ALL_CHILDREN_FAILED_PATTERN = /^every (.+?) lookup failed \((\d+) of \2\): ([\s\S]*)$/;
+
 /** Every list lands here: records are redacted (or projected) before they are kept, and a page-capped walk forwards truncated plus its note. */
 async function collectArrayDataset(
   fetcher: () => Promise<ListResult>,
@@ -1812,10 +1837,12 @@ async function collectRecordMap(
   const errors: string[] = [];
   const notes: string[] = [];
   const childMarkers: Record<string, OktaNotCollectedMarker> = {};
+  let attempted = 0;
 
   for (const parent of parents.data) {
     const parentId = asString(parent.id);
     if (!parentId) continue;
+    attempted += 1;
     try {
       const page = toPaginatedList(await fetcher(parentId));
       data[parentId] = page.items.map(redactRecord);
@@ -1825,6 +1852,10 @@ async function collectRecordMap(
       errors.push(`${parentId}: ${errorText(error)}`);
       childMarkers[parentId] = notCollectedMarker(error);
     }
+  }
+
+  if (attempted > 0 && errors.length === attempted) {
+    return allChildrenFailedDataset({}, childLabel, errors, childMarkers);
   }
 
   return {
@@ -1848,11 +1879,11 @@ async function collectPolicyRuleMap(
  * What core_data carries for a dataset: the data when it was collected, its
  * marker when nothing was, and, for a per-parent collection, the collected
  * children plus a marker for every child that failed (array datasets append
- * the markers with the child key as `id`).
+ * the markers with the child key as `id`); when every child failed the file
+ * holds only those per-child markers.
  */
 function coreDataSnapshot(dataset: CollectedDataset<unknown>): unknown {
-  if (dataset.notCollected) return dataset.notCollected;
-  if (!dataset.childMarkers) return dataset.data;
+  if (!dataset.childMarkers) return dataset.notCollected ?? dataset.data;
   if (Array.isArray(dataset.data)) {
     return [...dataset.data, ...Object.entries(dataset.childMarkers).map(([id, marker]) => ({ id, ...marker }))];
   }
@@ -2143,9 +2174,11 @@ async function collectOrgContacts(
     const resolved: JsonRecord[] = [];
     const errors: string[] = [];
     const childMarkers: Record<string, OktaNotCollectedMarker> = {};
+    let attempted = 0;
     for (const contact of contactTypes.items) {
       const contactType = asString(contact.contactType);
       if (!contactType) continue;
+      attempted += 1;
       try {
         const assignment = await client.getOrgContactUser(contactType);
         const userId = asString(asRecord(assignment).userId);
@@ -2160,6 +2193,9 @@ async function collectOrgContacts(
         errors.push(`${contactType}: ${errorText(error)}`);
         childMarkers[contactType] = notCollectedMarker(error);
       }
+    }
+    if (attempted > 0 && errors.length === attempted) {
+      return allChildrenFailedDataset<JsonRecord[]>([], "org contact", errors, childMarkers);
     }
     return {
       data: resolved,
@@ -2406,6 +2442,10 @@ function userLogin(user: JsonRecord): string {
 }
 
 function describeEndpointError(error: string): string {
+  const allChildrenFailed = ALL_CHILDREN_FAILED_PATTERN.exec(error);
+  if (allChildrenFailed) {
+    return `every ${allChildrenFailed[1]} lookup failed (${allChildrenFailed[2]} of ${allChildrenFailed[2]}): ${describeEndpointError(allChildrenFailed[3])}`;
+  }
   if (/^Not requested: /.test(error)) return "the inventory it depends on was not collected, so its request was never issued";
   if (/\(403 /.test(error)) return "the endpoint returned 403 Forbidden (missing scope or admin role)";
   if (/\(401 /.test(error)) return "the endpoint returned 401 Unauthorized (credential rejected)";
@@ -2943,17 +2983,26 @@ export function assessOktaAuthentication(
         "Keep certificate-based and smart-card options documented for scoped federal or DoD use cases.",
       ),
     );
+  } else if (data.idps.error || data.authenticators.error) {
+    const unreadList = data.idps.error ? "identity provider" : "authenticator";
+    const readList = data.idps.error ? "authenticator" : "identity provider";
+    const unreadError = data.idps.error ?? data.authenticators.error ?? "unknown error";
+    findings.push(
+      manualFinding(
+        "OKTA-AUTH-008",
+        "Certificate or PIV/CAC authentication",
+        `no ACTIVE certificate-oriented entry was found in the ${readList} list while the ${unreadList} list was unreadable (${describeEndpointError(unreadError)}), so ${isFederalTenant ? "this federal-domain tenant" : "the tenant"} cannot be judged on half of the certificate inventory`,
+        "Record whether a Smart Card IdP or certificate authenticator is ACTIVE under Security > Identity Providers and Security > Authenticators.",
+        `Org URL: ${config.orgUrl} | ${data.idps.error ? "IdP" : "Authenticator"} data unavailable: ${unreadError}`,
+      ),
+    );
   } else if (isFederalTenant) {
     findings.push(
       buildFinding(
         "OKTA-AUTH-008",
         "Fail",
         "No ACTIVE certificate-oriented authentication method was detected for a federal-domain tenant.",
-        [
-          `Org URL: ${config.orgUrl}`,
-          ...(data.idps.error ? [`IdP data unavailable: ${data.idps.error}`] : []),
-          ...(data.authenticators.error ? [`Authenticator data unavailable: ${data.authenticators.error}`] : []),
-        ],
+        [`Org URL: ${config.orgUrl}`],
         "Validate whether PIV/CAC or certificate-based authentication is required for this tenant and configure it if so.",
       ),
     );
@@ -2963,11 +3012,7 @@ export function assessOktaAuthentication(
         "OKTA-AUTH-008",
         "Manual",
         "No ACTIVE certificate-oriented authentication method was detected.",
-        [
-          `Org URL: ${config.orgUrl}`,
-          ...(data.idps.error ? [`IdP data unavailable: ${data.idps.error}`] : []),
-          ...(data.authenticators.error ? [`Authenticator data unavailable: ${data.authenticators.error}`] : []),
-        ],
+        [`Org URL: ${config.orgUrl}`],
         "If this Okta tenant supports federal or smart-card requirements, verify whether certificate-based authentication should be added.",
         {
           manualNote:
@@ -3132,6 +3177,8 @@ export function assessOktaAdminAccess(
     );
   } else if (privilegedUsers.length === 0) {
     findings.push(manualFinding("OKTA-ADMIN-001", "Super admin concentration", emptyPrivilegedCause, roleAssigneeExport));
+  } else if (data.userRoles.notCollected) {
+    findings.push(manualForDataset("OKTA-ADMIN-001", "Super admin concentration", data.userRoles, roleAssigneeExport));
   } else {
     const baseStatus: OktaFindingStatus =
       superAdmins.length <= 2 ? "Pass" : superAdmins.length <= 5 ? "Partial" : "Fail";
@@ -3178,7 +3225,7 @@ export function assessOktaAdminAccess(
           ? `${stalePrivileged.length} privileged accounts are stale or non-active.`
           : unknownActivityPrivileged.length > 0
             ? `${unknownActivityPrivileged.length} privileged accounts have no lastLogin timestamp, so their activity cannot be confirmed.`
-            : `All ${privilegedUsers.length} privileged accounts are ACTIVE with a sign-in within 90 days${data.userRoles.error ? " (role lookups were incomplete)" : ""}.`,
+            : `All ${privilegedUsers.length} privileged accounts are ACTIVE with a sign-in within 90 days${data.userRoles.notCollected ? " (every role lookup failed)" : data.userRoles.error ? " (role lookups were incomplete)" : ""}.`,
         [
           ...(data.userRoles.error ? [`Partial data: ${data.userRoles.error}`] : []),
           ...stalePrivileged.map(
