@@ -1,6 +1,8 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
+import fs from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
+import { syncBuiltinESMExports } from "node:module";
 import { tmpdir } from "node:os";
 import { join, relative } from "node:path";
 import { inflateRawSync } from "node:zlib";
@@ -23,6 +25,7 @@ import {
   parseCsv,
   parseXml,
   rawDataSurfaceNames,
+  registerQualysTools,
   resolveQualysConfiguration,
   resolveQualysPlatform,
   resolveSecureOutputPath,
@@ -1162,6 +1165,235 @@ test("resolveQualysPlatform maps every documented platform ID to its API server"
   }
   assert.equal(resolveQualysPlatform("US2").baseUrl, "https://qualysapi.qg2.apps.qualys.com");
   assert.equal(resolveQualysPlatform("AU1").baseUrl, "https://qualysapi.qg1.apps.qualys.com.au");
+});
+
+// ---------------------------------------------------------------------------------------------
+// Config loader: the read error, the tool catches, and the platform value are never echoed
+// ---------------------------------------------------------------------------------------------
+
+// Captures the six tool handlers so a test can drive execute() the way the pi runtime does.
+function registeredQualysTools() {
+  const tools = new Map();
+  registerQualysTools({
+    registerTool(tool) {
+      tools.set(tool.name, tool);
+    },
+  });
+  return tools;
+}
+
+// Replaces one node:fs function while `run` executes. syncBuiltinESMExports makes the dist module's named import see
+// the stub, and the original is restored (and synced back) whether or not `run` throws.
+async function withFsStub(name, stub, run) {
+  const original = fs[name];
+  fs[name] = (...args) => stub(original, ...args);
+  syncBuiltinESMExports();
+  try {
+    return await run();
+  } finally {
+    fs[name] = original;
+    syncBuiltinESMExports();
+  }
+}
+
+function thrownBy(fn) {
+  try {
+    fn();
+    return undefined;
+  } catch (error) {
+    return error;
+  }
+}
+
+const TOOL_FAILURE_PREFIXES = {
+  qualys_assess_scan_coverage: "Assess Qualys scan coverage failed",
+  qualys_assess_asset_inventory: "Assess Qualys asset inventory failed",
+  qualys_assess_vulnerability_management: "Assess Qualys vulnerability management failed",
+  qualys_assess_administration: "Assess Qualys administration hygiene failed",
+  qualys_check_access: "Qualys access check failed",
+  qualys_export_audit_bundle: "Qualys audit bundle export failed",
+};
+
+test("config loader: a directory as the config file reports the system error code through config_file and QUALYS_CONFIG_FILE, never the fs message", () => {
+  const dir = createTempBase("qualys-config-loader-");
+  const directoryPath = join(dir, "config-as-directory.qcrc");
+  mkdirSync(directoryPath);
+
+  // Positive control: the fs error the loader used to rethrow unwrapped carries the operation wording.
+  const fsError = thrownBy(() => readFileSync(directoryPath, "utf8"));
+  assert.ok(fsError instanceof Error);
+  assert.equal(fsError.code, "EISDIR");
+  assert.match(fsError.message, /^EISDIR: illegal operation on a directory, read/);
+
+  for (const [label, input, env] of [
+    ["config_file", { config_file: directoryPath }, {}],
+    ["QUALYS_CONFIG_FILE", {}, { QUALYS_CONFIG_FILE: directoryPath }],
+  ]) {
+    const thrown = thrownBy(() => resolveQualysConfiguration(input, env));
+    assert.ok(thrown instanceof Error, `${label}: a directory throws`);
+    assert.match(thrown.message, /^Unable to read Qualys config file .* \(EISDIR\)$/, label);
+    assert.ok(thrown.message.endsWith("/config-as-directory.qcrc (EISDIR)"), `${label}: the path is named: ${thrown.message}`);
+    for (const forbidden of ["illegal operation", "EISDIR:", "on a directory", ", read", fsError.message]) {
+      assert.ok(!thrown.message.includes(forbidden), `${label}: no fs wording ${JSON.stringify(forbidden)} in ${thrown.message}`);
+    }
+  }
+
+  // ENOENT is unreachable: a missing file is simply an empty config.
+  assert.deepEqual(thrownBy(() => resolveQualysConfiguration({ config_file: join(dir, "missing.qcrc"), username: "u", password: "p" }, {})), undefined);
+});
+
+test("config loader: a non-standard value thrown by the config read reaches neither the thrown error nor the qualys_check_access result", async () => {
+  const dir = createTempBase("qualys-config-loader-");
+  const configPath = join(dir, "stubbed.qcrc");
+  writeFileSync(configPath, "username = u\npassword = p\n");
+  const tools = registeredQualysTools();
+  const fields = ["NONSTD-CODE-CANARY", "NONSTD-MSG-CANARY", "NONSTD-FIELD-CANARY", "NONSTD-TOSTRING-CANARY"];
+  const nonStandard = {
+    code: "NONSTD-CODE-CANARY",
+    message: "NONSTD-MSG-CANARY",
+    field: "NONSTD-FIELD-CANARY",
+    toString() {
+      return "NONSTD-TOSTRING-CANARY";
+    },
+  };
+  class ReadFailure extends Error {
+    constructor() {
+      super(`EACCES: permission denied, open '${configPath}' NONSTD-MSG-CANARY`);
+      this.code = "EACCES";
+      this.field = "NONSTD-FIELD-CANARY";
+    }
+  }
+
+  let failure = "non-standard object";
+  const [objectResult, subclassResult] = await withFsStub(
+    "readFileSync",
+    (original, pathname, ...rest) => {
+      if (pathname !== configPath) return original(pathname, ...rest);
+      throw failure === "non-standard object" ? nonStandard : new ReadFailure();
+    },
+    async () => {
+      // Positive control: without the loader the object's toString() is what String(error) would have rendered.
+      assert.equal(String(nonStandard), "NONSTD-TOSTRING-CANARY");
+      assert.equal(thrownBy(() => readFileSync(configPath, "utf8")), nonStandard);
+
+      // The code is outside the E[A-Z0-9_] grammar, so the thrown text is the fixed description with no code at all.
+      const direct = thrownBy(() => resolveQualysConfiguration({ config_file: configPath }, {}));
+      assert.ok(direct instanceof Error);
+      assert.match(direct.message, /^Unable to read Qualys config file .*\/stubbed\.qcrc$/);
+      const viaTool = await tools.get("qualys_check_access").execute("call-1", { config_file: configPath });
+
+      failure = "Error subclass";
+      const subclass = await tools.get("qualys_check_access").execute("call-2", { config_file: configPath });
+      return [viaTool, subclass];
+    },
+  );
+
+  assert.equal(objectResult.isError, true);
+  assert.match(objectResult.content[0].text, /^Qualys access check failed: Unable to read Qualys config file .*\/stubbed\.qcrc$/);
+  assert.deepEqual(objectResult.details, { tool: "qualys_check_access" });
+  for (const field of fields) {
+    assert.ok(!JSON.stringify(objectResult).includes(field), `${field} reached the tool result: ${JSON.stringify(objectResult)}`);
+  }
+
+  // An Error subclass with a valid system code contributes exactly that code, never its message or extra fields.
+  assert.equal(subclassResult.isError, true);
+  assert.match(subclassResult.content[0].text, /^Qualys access check failed: Unable to read Qualys config file .*\/stubbed\.qcrc \(EACCES\)$/);
+  for (const forbidden of [...fields, "permission denied", "open '"]) {
+    assert.ok(!JSON.stringify(subclassResult).includes(forbidden), `${forbidden} reached the tool result: ${JSON.stringify(subclassResult)}`);
+  }
+
+  // The stub is gone: the same file reads normally again.
+  assert.equal(resolveQualysConfiguration({ config_file: configPath }, {}).username, "u");
+});
+
+test("config loader: an unrecognised platform or base_url names its source and the documented platforms, never the value", async () => {
+  const dir = createTempBase("qualys-config-loader-");
+  const platformCanary = "qk_live_LEAKPLATFORMCANARY7f3a9c1d";
+  const baseUrlCanary = `https://LEAKPLATFORMCANARY:${platformCanary}@bad host/path`;
+  const platformFile = join(dir, "platform.qcrc");
+  writeFileSync(platformFile, `username = u\npassword = p\nplatform = ${platformCanary}\n`);
+  const baseUrlFile = join(dir, "base-url.qcrc");
+  writeFileSync(baseUrlFile, `username = u\npassword = p\nbase_url = ${baseUrlCanary}\n`);
+  const tools = registeredQualysTools();
+  const allowed = QUALYS_PLATFORMS.map((platform) => platform.id).join(", ");
+  const expected = (source) =>
+    `Unknown Qualys platform in ${source} (the value is not repeated here). Use one of ${allowed}, an API server hostname, or a full https URL.`;
+  const parts = ["qk_live", "LEAKPLATFORMCANARY", "7f3a9c1d", "LEAK", "bad host", "@bad", "Invalid URL", platformCanary, baseUrlCanary];
+
+  // Positive control: the URL parser rejects the base_url value, and its error carries the value as `input`.
+  const urlError = thrownBy(() => new URL(baseUrlCanary));
+  assert.ok(urlError instanceof TypeError);
+  assert.equal(urlError.input, baseUrlCanary);
+
+  const direct = [
+    ["the config file key platform", () => resolveQualysConfiguration({ config_file: platformFile }, {})],
+    ["the config file key base_url", () => resolveQualysConfiguration({ config_file: baseUrlFile }, {})],
+    ["QUALYS_PLATFORM", () => resolveQualysConfiguration({ config_file: join(dir, "missing.qcrc") }, { QUALYS_USERNAME: "u", QUALYS_PASSWORD: "p", QUALYS_PLATFORM: platformCanary })],
+    ["QUALYS_BASE_URL", () => resolveQualysConfiguration({ config_file: join(dir, "missing.qcrc") }, { QUALYS_USERNAME: "u", QUALYS_PASSWORD: "p", QUALYS_BASE_URL: baseUrlCanary })],
+    ["the platform argument", () => resolveQualysConfiguration({ config_file: join(dir, "missing.qcrc"), username: "u", password: "p", platform: platformCanary }, {})],
+    ["the base_url argument", () => resolveQualysConfiguration({ config_file: join(dir, "missing.qcrc"), username: "u", password: "p", base_url: baseUrlCanary }, {})],
+    ["the platform value", () => resolveQualysPlatform(platformCanary)],
+    ["the platform value", () => resolveQualysPlatform(baseUrlCanary)],
+  ];
+  for (const [source, run] of direct) {
+    const thrown = thrownBy(run);
+    assert.ok(thrown instanceof Error, source);
+    assert.equal(thrown.message, expected(source));
+    for (const part of parts) assert.ok(!thrown.message.includes(part), `${source}: ${JSON.stringify(part)} reached the thrown message`);
+  }
+
+  // Through the tool the same message is rendered, prefixed and scrubbed, with the source named.
+  for (const [name, args, source] of [
+    ["qualys_check_access", { config_file: platformFile }, "the config file key platform"],
+    ["qualys_check_access", { config_file: baseUrlFile }, "the config file key base_url"],
+    ["qualys_assess_administration", { config_file: join(dir, "missing.qcrc"), username: "u", password: "p", platform: platformCanary }, "the platform argument"],
+  ]) {
+    const result = await tools.get(name).execute("call", args);
+    assert.equal(result.isError, true, name);
+    assert.equal(result.content[0].text, `${TOOL_FAILURE_PREFIXES[name]}: ${expected(source)}`);
+    for (const part of parts) assert.ok(!JSON.stringify(result).includes(part), `${name}: ${JSON.stringify(part)} reached the tool result`);
+  }
+
+  // A documented shape from the same file is still accepted, so the guard only bites on the undocumented grammar.
+  writeFileSync(platformFile, "username = u\npassword = p\nplatform = qualysapi.qg2.apps.qualys.eu\n");
+  assert.equal(resolveQualysConfiguration({ config_file: platformFile }, {}).platform, "EU2");
+});
+
+test("tool handlers: an error raised inside each try block renders through the scrub, so a planted bearer reads [REDACTED] in the assess, check_access, and export results", async () => {
+  const dir = createTempBase("qualys-config-loader-");
+  const configPath = join(dir, "probe.qcrc");
+  writeFileSync(configPath, "username = u\npassword = p\n");
+  const bearer = "LEAKBEARERCANARY7f3a9c1d2e4b";
+  const outputRoot = join(dir, "export");
+  const tools = registeredQualysTools();
+  assert.deepEqual([...tools.keys()].sort(), Object.keys(TOOL_FAILURE_PREFIXES).sort());
+
+  await withFsStub(
+    "existsSync",
+    (original, pathname) => {
+      // existsSync is the first call inside every handler's try block that is not already guarded, so an error thrown
+      // here reaches the catch with its message intact.
+      if (pathname === configPath) throw new Error(`config probe failed: Authorization: Bearer ${bearer}`);
+      return original(pathname);
+    },
+    async () => {
+      // Positive control: the error reaches the handlers' catch blocks with the bearer verbatim.
+      const raw = thrownBy(() => resolveQualysConfiguration({ config_file: configPath }, {}));
+      assert.ok(raw instanceof Error);
+      assert.equal(raw.message, `config probe failed: Authorization: Bearer ${bearer}`);
+
+      for (const [name, prefix] of Object.entries(TOOL_FAILURE_PREFIXES)) {
+        const result = await tools.get(name).execute("call", { config_file: configPath, output_dir: outputRoot });
+        assert.equal(result.isError, true, name);
+        assert.equal(result.content[0].text, `${prefix}: config probe failed: Authorization: Bearer [REDACTED]`, name);
+        assert.deepEqual(result.details, { tool: name });
+        assert.ok(!JSON.stringify(result).includes(bearer), `${name}: the bearer reached the tool result`);
+        assert.ok(!JSON.stringify(result).includes("LEAKBEARER"), name);
+      }
+    },
+  );
+  assert.ok(!existsSync(outputRoot), "the export handler wrote nothing before failing");
+  assert.equal(resolveQualysConfiguration({ config_file: configPath }, {}).username, "u", "the stub is gone");
 });
 
 test("parseXml handles declarations, DOCTYPE, CDATA, entities, attributes, and repeated elements", () => {

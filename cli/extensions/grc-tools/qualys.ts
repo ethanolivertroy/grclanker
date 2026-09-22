@@ -614,18 +614,31 @@ function normalizeBaseUrl(rawUrl: string): string {
   return parsed.toString().replace(/\/+$/, "");
 }
 
-export function resolveQualysPlatform(value: string | undefined): { platform: string; baseUrl: string; gatewayUrl: string } {
+/**
+ * Maps a platform setting to its API server and gateway. `source` names where the setting came from (the platform
+ * argument, an environment variable, or a config file key) so an unrecognised value can be reported without echoing
+ * it: such a value is outside the documented grammar by definition and may be a pasted credential.
+ */
+export function resolveQualysPlatform(value: string | undefined, source = "the platform value"): { platform: string; baseUrl: string; gatewayUrl: string } {
   const trimmed = (value ?? "US1").trim();
   const byId = QUALYS_PLATFORMS.find((platform) => platform.id.toLowerCase() === trimmed.toLowerCase());
   if (byId) return { platform: byId.id, baseUrl: byId.apiServer, gatewayUrl: byId.gateway };
 
-  const asUrl = /^https?:\/\//i.test(trimmed) ? trimmed : trimmed.includes(".") ? `https://${trimmed}` : undefined;
-  if (!asUrl) {
-    throw new Error(
-      `Unknown Qualys platform "${trimmed}". Use one of ${QUALYS_PLATFORMS.map((platform) => platform.id).join(", ")}, an API server hostname, or a full https URL.`,
+  const unrecognised = () =>
+    new Error(
+      scrubErrorText(
+        `Unknown Qualys platform in ${source} (the value is not repeated here). Use one of ${QUALYS_PLATFORMS.map((platform) => platform.id).join(", ")}, an API server hostname, or a full https URL.`,
+      ),
     );
+  const asUrl = /^https?:\/\//i.test(trimmed) ? trimmed : trimmed.includes(".") ? `https://${trimmed}` : undefined;
+  if (!asUrl) throw unrecognised();
+  let baseUrl: string;
+  try {
+    baseUrl = normalizeBaseUrl(asUrl);
+  } catch {
+    // The URL parser's error carries the input; neither it nor the input is echoed.
+    throw unrecognised();
   }
-  const baseUrl = normalizeBaseUrl(asUrl);
   const host = new URL(baseUrl).host;
   const byHost = QUALYS_PLATFORMS.find((platform) => new URL(platform.apiServer).host === host);
   if (byHost) return { platform: byHost.id, baseUrl: byHost.apiServer, gatewayUrl: byHost.gateway };
@@ -633,10 +646,28 @@ export function resolveQualysPlatform(value: string | undefined): { platform: st
   return { platform: "custom", baseUrl, gatewayUrl: `https://${gatewayHost}` };
 }
 
+/** The `code` of a Node system error (ENOENT, EACCES, EISDIR): a fixed identifier, never the message. */
+function systemErrorCode(error: unknown): string | undefined {
+  const code = asObject(error)?.code;
+  return typeof code === "string" && /^E[A-Z0-9_]{1,30}$/.test(code) ? code : undefined;
+}
+
+/**
+ * Reads the optional key=value config file. The read error is never interpolated: a Node fs error names the path
+ * and operation, and a non-standard thrown value contributes whatever its `toString()` yields, so the thrown text is
+ * a fixed description with the path and the validated system error code, scrubbed like every other error here. The
+ * parser below is a hand-rolled loop that cannot throw, so it has no error path to guard.
+ */
 export function readQualysConfigFile(pathname: string | undefined): Record<string, string> {
   if (!pathname || !existsSync(pathname)) return {};
   const values: Record<string, string> = {};
-  const content = readFileSync(pathname, "utf8");
+  let content: string;
+  try {
+    content = readFileSync(pathname, "utf8");
+  } catch (error) {
+    const code = systemErrorCode(error);
+    throw new Error(scrubErrorText(`Unable to read Qualys config file ${pathname}${code ? ` (${code})` : ""}`));
+  }
   for (const rawLine of content.split(/\r?\n/)) {
     const line = rawLine.trim();
     if (!line || line.startsWith("#") || line.startsWith(";") || line.startsWith("[")) continue;
@@ -657,38 +688,40 @@ export function resolveQualysConfiguration(
   const configPath = asString(input.config_file) ?? asString(env.QUALYS_CONFIG_FILE) ?? join(homedir(), ".qcrc");
   const file = readQualysConfigFile(configPath);
 
-  const pick = (argKey: string, envKeys: string[], fileKeys: string[]): string | undefined => {
+  // Each setting remembers where it came from, so a validation error can name the source instead of the value.
+  const pick = (argKey: string, envKeys: string[], fileKeys: string[]): { value: string; source: string } | undefined => {
     const fromArgs = asString(input[argKey]);
     if (fromArgs) {
       sourceChain.push(`arguments-${argKey}`);
-      return fromArgs;
+      return { value: fromArgs, source: `the ${argKey} argument` };
     }
     for (const envKey of envKeys) {
       const fromEnv = asString(env[envKey]);
       if (fromEnv) {
         sourceChain.push(`environment-${argKey}`);
-        return fromEnv;
+        return { value: fromEnv, source: envKey };
       }
     }
     for (const fileKey of fileKeys) {
       const fromFile = asString(file[fileKey]);
       if (fromFile) {
         sourceChain.push(`config-file-${argKey}`);
-        return fromFile;
+        return { value: fromFile, source: `the config file key ${fileKey}` };
       }
     }
     return undefined;
   };
 
-  const username = pick("username", ["QUALYS_USERNAME", "QUALYS_USER"], ["username", "user"]);
-  const password = pick("password", ["QUALYS_PASSWORD"], ["password"]);
-  const token = pick("token", ["QUALYS_TOKEN", "QUALYS_ACCESS_TOKEN"], ["token"]);
+  const username = pick("username", ["QUALYS_USERNAME", "QUALYS_USER"], ["username", "user"])?.value;
+  const password = pick("password", ["QUALYS_PASSWORD"], ["password"])?.value;
+  const token = pick("token", ["QUALYS_TOKEN", "QUALYS_ACCESS_TOKEN"], ["token"])?.value;
   const useOauth = asBoolean(input.use_oauth) ?? asBoolean(env.QUALYS_USE_OAUTH) ?? asBoolean(file.use_oauth) ?? false;
-  const platformValue = pick("platform", ["QUALYS_PLATFORM", "QUALYS_API_SERVER"], ["platform", "hostname"]);
-  const baseUrlOverride = pick("base_url", ["QUALYS_BASE_URL", "QUALYS_API_URL"], ["base_url"]);
-  const gatewayOverride = pick("gateway_url", ["QUALYS_GATEWAY_URL"], ["gateway_url"]);
+  const platformSetting = pick("platform", ["QUALYS_PLATFORM", "QUALYS_API_SERVER"], ["platform", "hostname"]);
+  const baseUrlSetting = pick("base_url", ["QUALYS_BASE_URL", "QUALYS_API_URL"], ["base_url"]);
+  const gatewayOverride = pick("gateway_url", ["QUALYS_GATEWAY_URL"], ["gateway_url"])?.value;
 
-  const resolvedPlatform = resolveQualysPlatform(baseUrlOverride ?? platformValue);
+  const platformSource = baseUrlSetting ?? platformSetting;
+  const resolvedPlatform = resolveQualysPlatform(platformSource?.value, platformSource?.source);
   const authMode: QualysAuthMode = token ? "bearer" : useOauth ? "oauth" : "basic";
   if (authMode !== "bearer" && (!username || !password)) {
     throw new Error("Provide QUALYS_USERNAME and QUALYS_PASSWORD (or username/password arguments), or a pre-issued QUALYS_TOKEN.");
@@ -807,8 +840,9 @@ export class QualysApiError extends Error {
   }
 }
 
-// Every thrown value that becomes a surface error string goes through here, so a plain Error raised outside the
-// client (a data-client stub, a parser) gets the same treatment as a QualysApiError.
+// Every thrown value that becomes a surface error string or a tool result goes through here, so a plain Error raised
+// outside the client (configuration resolution, a data-client stub, a parser) gets the same treatment as a
+// QualysApiError. The six tool handlers render their catch through this function and nothing else.
 function errorMessage(error: unknown): string {
   return scrubErrorText(error instanceof Error ? error.message : String(error));
 }
@@ -4445,10 +4479,7 @@ function registerAssessmentTool(
           errors: result.errors,
         });
       } catch (error) {
-        return errorResult(
-          `${label} failed: ${error instanceof Error ? error.message : String(error)}`,
-          { tool: name },
-        );
+        return errorResult(`${label} failed: ${errorMessage(error)}`, { tool: name });
       }
     },
   });
@@ -4467,10 +4498,7 @@ export function registerQualysTools(pi: any): void {
         const result = await checkQualysAccess(createClient(args));
         return textResult(formatAccessCheckText(result), { tool: "qualys_check_access", ...result });
       } catch (error) {
-        return errorResult(
-          `Qualys access check failed: ${error instanceof Error ? error.message : String(error)}`,
-          { tool: "qualys_check_access" },
-        );
+        return errorResult(`Qualys access check failed: ${errorMessage(error)}`, { tool: "qualys_check_access" });
       }
     },
   });
@@ -4541,10 +4569,7 @@ export function registerQualysTools(pi: any): void {
           },
         );
       } catch (error) {
-        return errorResult(
-          `Qualys audit bundle export failed: ${error instanceof Error ? error.message : String(error)}`,
-          { tool: "qualys_export_audit_bundle" },
-        );
+        return errorResult(`Qualys audit bundle export failed: ${errorMessage(error)}`, { tool: "qualys_export_audit_bundle" });
       }
     },
   });
