@@ -33,6 +33,7 @@ import {
 import { getRegisteredToolSummaries } from "../dist/pi/tool-catalog.js";
 import { assertSecretFragmentsAbsent, readBundleFiles, readZipEntries } from "./helpers/bundle-contents.mjs";
 import { CONFIG_CANARIES, assertConfigLoaderMatrix, configLoaderCases } from "./helpers/config-loader-matrix.mjs";
+import { assertFixedTextsSurvive, collectFixedTexts, logLines } from "./helpers/fixed-text-survival.mjs";
 import { assertFragmentsAbsent, assertPlantedValuesWellFormed } from "./helpers/planted-values.mjs";
 import { assertScrubBoundary } from "./helpers/scrub-boundary-matrix.mjs";
 
@@ -2299,6 +2300,10 @@ function csCanaryFetch(failing) {
       if (failing.flavor === "html") {
         return new Response(csCanaryHtml(), { status: 502, headers: { "content-type": "text/html; charset=utf-8" } });
       }
+      // Credential-free failure flavors for the fixed-text harvest: a plain proxy page, an unrecognized JSON shape, a documented error.
+      if (failing.flavor === "plainHtml") return new Response("<html><head><title>502 Bad Gateway</title></head><body>upstream unavailable</body></html>", { status: 502, headers: { "content-type": "text/html; charset=utf-8" } });
+      if (failing.flavor === "opaqueJson") return jsonResponse({ unexpected: { shape: true } }, { status: 403 });
+      if (failing.flavor === "plainJson") return jsonResponse({ errors: [{ code: 403, message: "access denied, authorization failed" }] }, { status: 403 });
       return jsonResponse({ errors: [{ code: 403, message: `access denied for this API client; see ${CS_CANARY_URL} for the scope that is missing` }] }, { status: 403 });
     }
     return csHealthyResponse(url.pathname);
@@ -2368,7 +2373,101 @@ test("planted values self-check: every canary and planted secret is alphanumeric
   ]);
 });
 
-test("scrub boundary: bare name-shaped values stay, carriers and registered secrets (in every encoded form) and real token shapes go, in CrowdstrikeHttpError", () => {
+/** Every Falcon dataset the collectors read, as the summaries' inventories and the not-collected markers name them. */
+const CROWDSTRIKE_DATASETS = [...new Set([
+  ...CROWDSTRIKE_DENIALS.flatMap((denial) => [
+    ...Object.values(denial.markers ?? {}),
+    ...Object.values(denial.nested ?? {}).flatMap((entries) => Object.values(entries)),
+  ]),
+  "discover managed hosts",
+  "zero trust assessment below-threshold totals",
+  "user roles",
+  "sensor builds (linux)",
+])];
+
+const CS_SAMPLE_DENIAL = "CrowdStrike request failed for /policy/combined/prevention/v1 (403): access denied, authorization failed";
+
+/**
+ * The standing fixed texts CrowdStrike emits, rendered with sample paths and names: the config loader read
+ * and parse messages, the non-JSON and opaque-body notes, the timeout, the inventory states (read, read
+ * truncated, unread, not requested), the `not requested:` marker errors naming the parent read, the scope
+ * notes, and the corollary summary templates. Each must come back from CrowdstrikeHttpError's pass unchanged.
+ */
+const CROWDSTRIKE_FIXED_TEXTS = [
+  "Unable to read CrowdStrike config file /home/svc/.crowdstrike/config.json (ENOENT)",
+  "Unable to read CrowdStrike config file /tmp/grclanker-crowdstrike-loader-Ab3dEf/directory.json (EISDIR)",
+  "Unable to read CrowdStrike config file /tmp/grclanker-crowdstrike-loader-Ab3dEf/locked.json (EACCES)",
+  "Unable to parse CrowdStrike config file: invalid JSON in /tmp/grclanker-crowdstrike-loader-Ab3dEf/short.json",
+  "Unable to parse CrowdStrike config file: invalid JSON in /tmp/grclanker-crowdstrike-loader-Ab3dEf/trailing-comma.json at line 3",
+  "Unable to parse CrowdStrike config file: /home/svc/.crowdstrike/config.json must contain a JSON object",
+  "CrowdStrike OAuth2 token request failed (502): non-JSON body (text/html, 5120 bytes)",
+  "CrowdStrike OAuth2 token request failed (401): access denied, invalid bearer token",
+  "CrowdStrike request failed for /policy/combined/prevention/v1 (403): JSON body without a documented error field (application/json, 27 bytes)",
+  "CrowdStrike request failed for /user-management/queries/users/v1 (429): non-JSON body (text/plain, 12 bytes)",
+  "CrowdStrike request timed out after 30000ms: /devices/combined/devices/v1",
+  CS_SAMPLE_DENIAL,
+  `unread (${CS_SAMPLE_DENIAL})`,
+  "not requested (the device control policies list was not read)",
+  "not requested (the firewall policies list was not read)",
+  "not requested (the sensor update policies list was not read)",
+  "not requested (the user uuid list was not read)",
+  "not requested (the user details were not read)",
+  "not requested (the discover unmanaged hosts count was not read)",
+  "not requested (the zero trust assessment totals count was not read)",
+  "not requested: the user uuid list was not read",
+  "not requested: the device control policies list returned no policy ids to look up",
+  "not requested: no enabled and host-assigned sensor update policy named a platform to look up",
+  "read (12 items)",
+  "read, truncated (500 of 5000 items)",
+  "read (3 records)",
+  "read (total 3)",
+  "read (no server-side total reported)",
+  "read for 2 of 5 users (3 lookups failed, 0 truncated)",
+  "Scope: results cover the CID that issued the API client; Flight Control child tenants need CS_MEMBER_CID runs.",
+  "issuing CID only (Flight Control children need CS_MEMBER_CID runs)",
+  "host group Workstations-US-East-2026 and sensor update policy platform_default on cloud us-1",
+  "None of the enabled prevention policies expose ScriptBasedExecutionMonitoring, InterpreterProtection, EngineProtectionV2",
+  "the prevention policies list was not read, so CS-01 is manual and the enabled policy count renders null",
+  "1 of 3 sampled hosts (srv-01) run a sensor build older than n-2; the host list was truncated at 500 of 5000, so the unread hosts are not counted",
+  "alice@example.com holds Falcon Administrator and has not logged in for 120 days; admin users from a partial read are not named",
+];
+
+/** Addendum 7 must-keep table for CrowdStrike: paths and datasets, clouds and tenants, principals, finding ids, and the standing fixed texts. */
+function crowdstrikeKeepTable() {
+  return {
+    paths: CS_CANARY_SURFACES,
+    tables: CROWDSTRIKE_DATASETS,
+    tenants: [
+      "api.crowdstrike.com",
+      "https://api.crowdstrike.com",
+      "api.us-2.crowdstrike.com",
+      "api.eu-1.crowdstrike.com",
+      "api.laggar.gcw.crowdstrike.com",
+      "us-1",
+      "us-gov-1",
+      "prod-us-east-2026",
+      "Acme_Production_Org",
+    ],
+    principals: [
+      "alice@example.com",
+      "bob.user@acme.example",
+      // Falcon user uuids are canonical UUIDs.
+      "3f2a1c4e-8b7d-4e6f-9a0b-1c2d3e4f5a6b",
+      "falcon_administrator",
+      "Falcon Administrator",
+      "falcon_analyst",
+      "grclanker audit",
+      "Workstations-US-East-2026",
+      "ws-01",
+      "srv-01",
+      "platform_default",
+    ],
+    findingIds: ALL_CONTROL_IDS,
+    fixedTexts: CROWDSTRIKE_FIXED_TEXTS,
+  };
+}
+
+test("scrub boundary: bare name-shaped values stay, carriers and registered secrets (in every encoded form) and real token shapes go, in CrowdstrikeHttpError; the addendum 7 must-keep table survives in isolation and in sentences", () => {
   const fetchImpl = async () => jsonResponse({});
   const mustKeep = [
     "Falcon request failed (502) for /oauth2/token: non-JSON body (text/html, 5120 bytes)",
@@ -2377,12 +2476,130 @@ test("scrub boundary: bare name-shaped values stay, carriers and registered secr
     "Unable to parse CrowdStrike config file: invalid JSON in /tmp/grclanker-crowdstrike-loader-Ab3dEf/short.json",
     "host group Workstations-US-East-2026 and sensor update policy platform_default on cloud us-1",
   ];
+  const keepTable = crowdstrikeKeepTable();
+  assert.equal(keepTable.findingIds.length, 25, "every CrowdStrike finding id is in the table");
+  assert.ok(keepTable.tables.includes("prevention policies") && keepTable.tables.includes("sensor builds (windows)") && keepTable.tables.includes("user roles (u-admin)"));
   // The client constructor is the registration path (rememberSecrets on the configured client secret); the error constructor is the pass.
   assertScrubBoundary({
     scrub: (text) => new CrowdstrikeHttpError(text, 502, "/x").message,
     registerSecret: (secret) => new CrowdstrikeApiClient(sampleConfig({ clientSecret: secret }), { fetchImpl }),
     mustKeep,
+    keepTable,
   });
+});
+
+test("round 7 note 1: every fixed-text message CrowdStrike emits (loader, opaque body, timeout, inventory states, not requested markers, scope notes, corollary summaries) comes back from CrowdstrikeHttpError's pass unchanged", async () => {
+  const texts = new Set(CROWDSTRIKE_FIXED_TEXTS);
+  const scrub = (text) => new CrowdstrikeHttpError(text, 502, "/x").message;
+  const assessAndExport = async (client, config, texts) => {
+    collectFixedTexts(await checkCrowdstrikeAccess(client), texts);
+    collectFixedTexts(await runAllCrowdstrikeAssessments(client), texts);
+    const exported = await exportCrowdstrikeAuditBundle(client, config, createTempBase("grclanker-cs-fixed-text-bundle-"));
+    const files = readBundleFiles(exported.outputDir);
+    for (const line of logLines(files.get("_errors.log"))) texts.add(line);
+    for (const [name, content] of files) {
+      if ((name.startsWith("analysis/") || name.startsWith("core_data/")) && name.endsWith(".json")) collectFixedTexts(JSON.parse(content), texts);
+    }
+  };
+
+  // The loader's own read and parse messages on real failing files, plus the shape guard.
+  for (const item of configLoaderCases({ format: "json", displayName: "CrowdStrike", fileNoun: "config file", extension: ".json" })) {
+    if (item.skip) continue;
+    assert.throws(() => resolveCrowdstrikeConfiguration({ config_file: item.path }, {}), (error) => {
+      texts.add(error.message);
+      return true;
+    });
+  }
+  const arrayPath = join(createTempBase("grclanker-cs-fixed-text-"), "config.json");
+  writeFileSync(arrayPath, "[]\n");
+  assert.throws(() => resolveCrowdstrikeConfiguration({ config_file: arrayPath }, {}), (error) => {
+    texts.add(error.message);
+    return true;
+  });
+
+  // Every surface under three credential-free failure flavors (plain proxy page, unrecognized JSON shape, documented
+  // error): the access check, every assessment, the analysis and core_data files, and the error log render the
+  // opaque-body notes, the unread and not requested states, the markers naming the parent read, and the demotion
+  // templates on real paths.
+  for (const path of CS_CANARY_SURFACES) {
+    for (const flavor of ["plainHtml", "opaqueJson", "plainJson"]) {
+      const config = sampleConfig();
+      const client = new CrowdstrikeApiClient(config, { fetchImpl: csCanaryFetch({ path, flavor }), sleep: async () => {}, retryLimit: 0 });
+      await assessAndExport(client, config, texts);
+    }
+  }
+
+  // The fake clients: healthy, every read forbidden, one dataset denied at a time, and every paged read truncated.
+  await assessAndExport(createFakeClient(), sampleConfig(), texts);
+  await assessAndExport(createForbiddenClient(), sampleConfig(), texts);
+  for (const denial of CROWDSTRIKE_DENIALS) {
+    collectFixedTexts(await runAllCrowdstrikeAssessments(createFakeClient({ [denial.method]: forbidden(denial.endpoint) })), texts);
+  }
+  const partial = createFakeClient();
+  for (const name of PAGED_METHODS) {
+    const inner = partial[name];
+    partial[name] = async (...args) => {
+      const result = await inner(...args);
+      return { ...result, total: Math.max(result.items.length * 10, 10), truncated: true };
+    };
+  }
+  await assessAndExport(partial, sampleConfig(), texts);
+
+  // The timeout wording through the real client.
+  const timingOut = new CrowdstrikeApiClient(sampleConfig({ timeoutMs: 1000 }), {
+    fetchImpl: async (_input, init) => new Promise((_resolve, reject) => init?.signal?.addEventListener("abort", () => reject(new DOMException("aborted", "AbortError")))),
+    sleep: async () => {},
+    retryLimit: 0,
+  });
+  await assert.rejects(timingOut.getJson("/devices/combined/devices/v1"), (error) => {
+    texts.add(error.message);
+    return true;
+  });
+
+  const checked = assertFixedTextsSurvive(scrub, texts, "CrowdStrike fixed texts");
+  assert.ok(checked >= CROWDSTRIKE_FIXED_TEXTS.length + 40, `the harvest rendered texts beyond the standing list (${checked})`);
+  assert.ok([...texts].some((text) => /^unread \(/.test(text)), "the harvest rendered an unread inventory state");
+  assert.ok([...texts].some((text) => /^not requested \(/.test(text)), "the harvest rendered a not requested inventory state");
+  assert.ok([...texts].some((text) => /^not requested: /.test(text)), "the harvest rendered a not requested marker error");
+  assert.ok([...texts].some((text) => /^read, truncated \(/.test(text)), "the harvest rendered a truncated inventory state");
+  assert.ok([...texts].some((text) => /non-JSON body \(text\/html, \d+ bytes\)/.test(text)), "the harvest rendered a status-and-length note");
+  assert.ok([...texts].some((text) => /JSON body without a documented error field \(application\/json, \d+ bytes\)/.test(text)), "the harvest rendered an opaque JSON note");
+  assert.ok([...texts].some((text) => /timed out after \d+ms/.test(text)), "the harvest rendered the timeout wording");
+});
+
+test("round 7 note 2: credentials and the config file path set through the environment survive an unrelated argument, and the source chain names the environment", () => {
+  const base = createTempBase("grclanker-cs-env-survives-");
+  const configPath = join(base, "falcon.json");
+  writeFileSync(configPath, JSON.stringify({ client_id: "file-client-id", client_secret: "file-client-secret", cloud: "eu-1", member_cid: "file-member-cid" }));
+  for (const env of [
+    { CS_CONFIG_FILE: configPath, CS_CLIENT_ID: "env-client-id", CS_CLIENT_SECRET: "env-client-secret-value" },
+    { CS_CONFIG_FILE: configPath, FALCON_CLIENT_ID: "env-client-id", FALCON_CLIENT_SECRET: "env-client-secret-value" },
+  ]) {
+    for (const [label, unrelated] of [
+      ["cloud", { cloud: "us-2" }],
+      ["timeout_seconds", { timeout_seconds: 45 }],
+      ["member_cid", { member_cid: "arg-member-cid" }],
+    ]) {
+      const resolved = resolveCrowdstrikeConfiguration(unrelated, env, base);
+      const context = `${Object.keys(env).join(",")} with ${label}`;
+      assert.equal(resolved.clientId, "env-client-id", `${context}: the environment client id resolves over the file`);
+      assert.equal(resolved.clientSecret, "env-client-secret-value", `${context}: the environment client secret resolves over the file`);
+      assert.ok(resolved.sourceChain.includes("environment-client-id"), `${context}: the source chain names the environment: ${JSON.stringify(resolved.sourceChain)}`);
+      assert.ok(resolved.sourceChain.includes("environment-client-secret"), context);
+      assert.ok(resolved.sourceChain.includes(`config:${configPath}`), `${context}: the source chain names the config file from the environment`);
+      assert.ok(!resolved.sourceChain.includes("arguments-client-id"), `${context}: the unrelated argument does not claim the client id`);
+      if (label === "cloud") assert.equal(resolved.baseUrl, "https://api.us-2.crowdstrike.com", context);
+      else assert.equal(resolved.baseUrl, "https://api.eu-1.crowdstrike.com", `${context}: the file value not set elsewhere still applies`);
+      if (label === "timeout_seconds") assert.equal(resolved.timeoutMs, 45000, context);
+      assert.equal(resolved.memberCid, label === "member_cid" ? "arg-member-cid" : "file-member-cid", context);
+    }
+  }
+  // An argument object whose credential keys are present but undefined must not shadow the environment.
+  const env = { CS_CONFIG_FILE: configPath, CS_CLIENT_ID: "env-client-id", CS_CLIENT_SECRET: "env-client-secret-value" };
+  const shadowed = resolveCrowdstrikeConfiguration({ client_id: undefined, client_secret: undefined, cloud: "us-2" }, env, base);
+  assert.equal(shadowed.clientId, "env-client-id");
+  assert.equal(shadowed.clientSecret, "env-client-secret-value");
+  assert.deepEqual(shadowed.sourceChain, [`config:${configPath}`, "environment-client-id", "environment-client-secret", "arguments-cloud", "config-member-cid"]);
 });
 
 test("resolveSecureOutputPath rejects traversal and symlink parents", () => {
