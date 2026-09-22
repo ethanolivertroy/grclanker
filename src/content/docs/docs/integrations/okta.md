@@ -64,6 +64,8 @@ Later sources override earlier ones field by field:
 3. environment variables (`OKTA_CLIENT_ORGURL`, `OKTA_CLIENT_TOKEN`, `OKTA_CLIENT_AUTHORIZATIONMODE`, `OKTA_CLIENT_CLIENTID`, `OKTA_CLIENT_PRIVATEKEY`, `OKTA_CLIENT_PRIVATEKEYID`, `OKTA_CLIENT_CLIENTASSERTION`, `OKTA_CLIENT_SCOPES`)
 4. explicit tool arguments (`org_url`, `auth_mode`, `api_token`, `client_id`, `private_key`, `private_key_id`, `client_assertion`, `scopes`, or `config_file` to bypass the default YAML locations)
 
+A missing YAML file is skipped. One that cannot be read stops the tool with `Unable to read Okta config file <path> (<errno code>)`, and one that cannot be parsed stops it with `Unable to parse Okta config file: invalid YAML in <path> at line N, column M (<code>)`, where the code is the yaml package's own (`DUPLICATE_KEY`, `MISSING_CHAR`, `BAD_INDENT`, and so on) or `INVALID_YAML` when the parser threw something else, such as the unresolved alias `token: *value`; the position is omitted when the parser reports none. A private key that `node:crypto` cannot load is reported as `Okta PrivateKey auth could not load the configured private key (<ERR_ code>)`. None of these messages repeats a line, key, value, or key material from the file.
+
 ```yaml
 okta:
   client:

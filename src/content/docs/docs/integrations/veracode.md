@@ -25,7 +25,7 @@ The Veracode tools inspect a Veracode Application Security Platform account thro
 3. Provide credentials with one of these mechanisms (explicit tool arguments win, then environment variables, then the credentials file):
    - Tool arguments `api_key_id` and `api_key_secret`
    - Environment variables `VERACODE_API_KEY_ID` and `VERACODE_API_KEY_SECRET`
-   - `~/.veracode/credentials` INI file with `veracode_api_key_id` and `veracode_api_key_secret` under a profile; `VERACODE_API_PROFILE` or the `profile` argument selects the profile (default `default`), and `credentials_file` or `VERACODE_API_CREDENTIALS_FILE` overrides the path
+   - `~/.veracode/credentials` INI file with `veracode_api_key_id` and `veracode_api_key_secret` under a profile; `VERACODE_API_PROFILE` or the `profile` argument selects the profile (default `default`), and `credentials_file` or `VERACODE_API_CREDENTIALS_FILE` overrides the path. A missing file is skipped; one that cannot be read stops the tool with `Unable to read Veracode credentials file <path> (<errno code>)`. INI lines without `=` are ignored, and no message ever repeats a line from the file
 4. Pick the region with `region` or `VERACODE_REGION`: `us` (api.veracode.com, default), `eu` (api.veracode.eu), or `us-fed` (api.veracode.us). `base_url` or `VERACODE_API_BASE_URL` overrides the host explicitly.
 
 Requests are signed per the documented `VERACODE-HMAC-SHA-256` scheme: the data string `id=...&host=...&url=<path and query>&method=GET`, a 16-byte random nonce, a millisecond timestamp, the key chain `HMAC(key, nonce) -> HMAC(., timestamp) -> HMAC(., "vcode_request_version_1")`, and a final HMAC over the data string. The secret is redacted from error messages and never written into bundles.

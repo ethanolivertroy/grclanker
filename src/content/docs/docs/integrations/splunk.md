@@ -51,7 +51,7 @@ For Splunk Cloud Platform, set `SPLUNK_STACK` to the stack name (the `<stack>` i
 
 ### Environment variables and config file
 
-Precedence is explicit tool arguments, then environment variables, then the JSON config file at `~/.config/grclanker/splunk.json` (override the path with `SPLUNK_CONFIG_FILE` or the `config_file` argument).
+Precedence is explicit tool arguments, then environment variables, then the JSON config file at `~/.config/grclanker/splunk.json` (override the path with `SPLUNK_CONFIG_FILE` or the `config_file` argument). A missing config file is skipped. One that cannot be read stops the tool with `Unable to read Splunk config file <path> (<errno code>)`, and one that is not valid JSON stops it with `Unable to parse Splunk config file: invalid JSON in <path> at line N, column M (INVALID_JSON)`, with the position only when `JSON.parse` reports an offset. The message never repeats the `JSON.parse` text, which quotes a window of the file around the failure.
 
 | Variable | Config key | Purpose |
 |----------|------------|---------|

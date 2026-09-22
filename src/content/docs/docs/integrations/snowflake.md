@@ -55,6 +55,8 @@ The client builds the JWT with `node:crypto`: `iss` is `<ACCOUNT>.<USER>.SHA256:
 
 Precedence is explicit tool arguments, then environment variables, then `~/.snowflake/connections.toml` (a `[<name>]` table) or `~/.snowflake/config.toml` (`default_connection_name` plus `[connections.<name>]` tables), matching the [connections.toml format](https://docs.snowflake.com/en/developer-guide/snowflake-cli/connecting/configure-connections) used by Snowflake CLI and the Python connector. The reader accepts the documented keys `account`, `user`, `role`, `warehouse`, `database`, `schema`, `host`, `private_key_file`, `private_key_raw`, `private_key_file_pwd`, `token`, and `authenticator`.
 
+The TOML reader handles comments, `[table]` headers, and single-line `key = value` pairs (basic, literal, and single-line triple-quoted strings, numbers, and booleans). Any other line, including a multi-line string or a quoted value that does not close on its line, stops the tool with `Unable to parse Snowflake config file: invalid TOML in <path> at line N (INVALID_TOML)`. A missing file is skipped; one that cannot be read stops the tool with `Unable to read Snowflake config file <path> (<errno code>)`. The private key file follows the same rule (`Unable to read Snowflake private key file <path> (<errno code>)`, or `Snowflake private key file was not found: <path> (ENOENT)`), and a key that OpenSSL cannot load is reported as `Unable to load the Snowflake private key (<ERR_ code>)`. None of these messages repeats a line from the file or any key material.
+
 ### Recommended read-only role
 
 ```sql
