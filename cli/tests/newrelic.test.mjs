@@ -12,6 +12,7 @@ import {
 import { tmpdir } from "node:os";
 import { join, relative } from "node:path";
 import { inflateRawSync } from "node:zlib";
+import { parse as parseYaml } from "yaml";
 
 import {
   API_KEY_DOCUMENTED_ONLY_NOTE,
@@ -443,6 +444,64 @@ test("resolveNewrelicConfiguration honors explicit config paths, defaults to US,
 
   assert.throws(() => resolveNewrelicConfiguration({ api_key: TEST_KEY, region: "APAC" }, {}, home), /Unsupported New Relic region/);
   assert.throws(() => resolveNewrelicConfiguration({}, {}, home), /NEW_RELIC_API_KEY/);
+});
+
+test("resolveNewrelicConfiguration never echoes a malformed config line and keeps the line number", () => {
+  const home = createTempBase("grclanker-newrelic-home-malformed-");
+  const configDir = createTempBase("grclanker-newrelic-config-malformed-");
+  const keyCanary = "NRAK-LEAKCANARY1234567890ABCDEF";
+  const bearerCanary = "LEAKBEARERCANARY7f3a9c1d2e4b";
+  const malformedLine = `api_key: ${keyCanary}: Bearer ${bearerCanary}`;
+  const configText = `region: US\naccount_id: 777\n${malformedLine}\n`;
+  const configPath = join(configDir, "inspector.yaml");
+  writeFileSync(configPath, configText);
+
+  // Control: the parser's own message quotes the offending line, so interpolating it would leak both canaries.
+  const parserMessage = (() => {
+    try {
+      parseYaml(configText);
+      return "";
+    } catch (error) {
+      return error.message;
+    }
+  })();
+  assert.match(parserMessage, /line 3/);
+  assert.ok(parserMessage.includes(keyCanary) && parserMessage.includes(bearerCanary), "control: the parser message carries the canaries");
+
+  const thrown = (() => {
+    try {
+      resolveNewrelicConfiguration({ config_file: configPath }, {}, home);
+      return undefined;
+    } catch (error) {
+      return error;
+    }
+  })();
+  assert.ok(thrown instanceof Error, "a malformed config throws");
+  assert.match(thrown.message, /^Unable to parse New Relic config file: invalid YAML in .*inspector\.yaml at line 3$/);
+  for (const forbidden of [keyCanary, bearerCanary, "LEAKCANARY", "LEAKBEARER", "Bearer", "Nested mappings", malformedLine]) {
+    assert.ok(!thrown.message.includes(forbidden), `thrown message must not carry ${JSON.stringify(forbidden)}: ${thrown.message}`);
+  }
+  assert.ok(!thrown.message.includes(":\n"), "the parser's quoted source block is never appended");
+
+  // Same file reached through the environment path variable.
+  assert.throws(
+    () => resolveNewrelicConfiguration({}, { NEW_RELIC_SEC_INSPECTOR_CONFIG: configPath }, home),
+    (error) => error instanceof Error && /invalid YAML in .*inspector\.yaml at line 3$/.test(error.message) && !error.message.includes("LEAK"),
+  );
+
+  // A read failure is a fixed description with the system error code, never the library message.
+  const directoryPath = join(configDir, "config-as-directory.yaml");
+  mkdirSync(directoryPath);
+  assert.throws(
+    () => resolveNewrelicConfiguration({ config_file: directoryPath }, {}, home),
+    (error) => error instanceof Error && /^Unable to read New Relic config file .*config-as-directory\.yaml \(EISDIR\)$/.test(error.message),
+  );
+
+  // The region validation error interpolates the caller's value, so it is scrubbed too.
+  assert.throws(
+    () => resolveNewrelicConfiguration({ api_key: TEST_KEY, region: keyCanary }, {}, home),
+    (error) => error instanceof Error && /^Unsupported New Relic region "NRAK-\[REDACTED\]"\. Use US or EU\.$/.test(error.message),
+  );
 });
 
 test("NewrelicApiClient posts NerdGraph queries with the Api-Key header and follows nextCursor pagination", async () => {
@@ -3074,9 +3133,13 @@ function belowPass(item, context) {
   assert.ok(item.status === "warn" || item.status === "manual", `${item.id} is ${item.status} ${context}: ${item.summary}`);
 }
 
-/** Wraps a fixture client so every query it receives is recorded as the collector `source` it carries. */
+/**
+ * Wraps a fixture client so every query it receives is recorded as the collector `source` it carries. `calls` keeps
+ * each request with the table rows that claimed it, so the coverage test can check the table query by query.
+ */
 function recordingClient(client) {
   const requested = new Set();
+  const calls = [];
   const recorded = {};
   for (const method of NEWRELIC_CLIENT_SURFACE_METHODS) {
     if (typeof client[method] !== "function") continue;
@@ -3084,13 +3147,15 @@ function recordingClient(client) {
       // resolveAccountIds discovers accounts through actor.accounts when none are configured.
       if (method === "resolveAccountIds") requested.add("actor.accounts");
       const text = String(method === "runNrql" ? args[1] : args[0]);
-      for (const row of COROLLARY_INVENTORIES) {
-        if (row.method === method && (!row.match || row.match(text))) requested.add(row.source);
-      }
+      const sources = COROLLARY_INVENTORIES
+        .filter((row) => row.method === method && (!row.match || row.match(text)))
+        .map((row) => row.source);
+      for (const source of sources) requested.add(source);
+      calls.push({ method, text, sources });
       return client[method](...args);
     };
   }
-  return { client: recorded, requested };
+  return { client: recorded, requested, calls };
 }
 
 const UNAVAILABLE_STATUS = /^(unreadable|not collected|unknown)\b/;
@@ -3195,7 +3260,7 @@ test("rule 1 corollary: the corollary baseline passes every pass-capable finding
   await assessGuarded(emptyClient(), "empty fixture");
 });
 
-test("rule 1 corollary table: the per-inventory table covers exactly the collectors' client methods", () => {
+test("rule 1 corollary table: the per-inventory table claims every query the collectors issue exactly once", async () => {
   // getResolvedConfig reads local configuration and resolveAccountIds resolves the account scope through
   // actor.accounts, which the table carries under listAccounts. listRestUsers is the REST v2 probe that only
   // check_access issues, so no finding depends on it and it is excluded from the denial sweep.
@@ -3204,6 +3269,32 @@ test("rule 1 corollary table: the per-inventory table covers exactly the collect
   assert.deepEqual([...new Set(COROLLARY_INVENTORIES.map((row) => row.method))].sort(), [...collectorMethods].sort());
   assert.equal(new Set(COROLLARY_INVENTORIES.map((row) => row.source)).size, COROLLARY_INVENTORIES.length, "every row records a distinct collector source");
   for (const method of collectorMethods) assert.equal(typeof corollaryClient()[method], "function", `${method} is stubbed by the corollary fixture`);
+
+  // Query-granular cross-check: run the four collectors once and key every request by method, plus the query text for
+  // the methods that carry more than one inventory (searchEntities, runNrql), with the account scope normalised. Each
+  // distinct query must be claimed by exactly one row and every row must be issued, so deleting the entitySearch
+  // workloads row leaves the WORKLOAD search unclaimed and fails here, as does a new query without a row or two rows
+  // whose matchers overlap.
+  const sharedMethods = new Set(COROLLARY_INVENTORIES.filter((row) => row.match).map((row) => row.method));
+  const recorder = recordingClient(corollaryClient());
+  await assessAll({ identity: recorder.client, accessControl: recorder.client, alerting: recorder.client, dataGovernance: recorder.client });
+  const queries = new Map();
+  for (const call of recorder.calls) {
+    if (nonQueryMethods.includes(call.method)) continue;
+    const key = sharedMethods.has(call.method)
+      ? `${call.method}: ${call.text.replace(/accountId = \d+/g, "accountId = <account>")}`
+      : call.method;
+    const previous = queries.get(key);
+    if (previous) assert.deepEqual(call.sources, previous, `${key} is claimed consistently across scopes`);
+    queries.set(key, call.sources);
+  }
+  const unclaimed = [...queries].filter(([, sources]) => sources.length === 0).map(([key]) => key);
+  const ambiguous = [...queries].filter(([, sources]) => sources.length > 1).map(([key, sources]) => `${key} -> ${sources.join(", ")}`);
+  assert.deepEqual(unclaimed, [], "every collector query is claimed by one table row");
+  assert.deepEqual(ambiguous, [], "no collector query is claimed by more than one table row");
+  const claimed = new Set([...queries.values()].flat());
+  assert.deepEqual([...claimed].sort(), COROLLARY_INVENTORIES.map((row) => row.source).sort(), "every table row is issued by the corollary baseline");
+  assert.equal(queries.size, COROLLARY_INVENTORIES.length, `distinct collector queries and table rows correspond one to one: ${[...queries.keys()].join("; ")}`);
 });
 
 test("rule 1 corollary root cause: a fully denied secondary dataset produces a coverage note and caps the verdict at warn", async () => {

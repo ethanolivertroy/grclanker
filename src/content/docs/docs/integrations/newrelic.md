@@ -47,7 +47,7 @@ timeout_seconds: 30
 audit_window_days: 30
 ```
 
-Resolution precedence is explicit tool arguments, then environment variables, then the config file, then defaults (US region, account discovery through `actor.accounts`). The audit bundle's `metadata.json` records the `source_chain` that was used. The API key is never requested from the API, and every error message is scrubbed of credential material before it is stored (see rule 13 under "Verdict safety"), so neither the configured key nor a credential an upstream error page happens to carry appears in an audit bundle.
+Resolution precedence is explicit tool arguments, then environment variables, then the config file, then defaults (US region, account discovery through `actor.accounts`). The audit bundle's `metadata.json` records the `source_chain` that was used. The API key is never requested from the API, and every error message is scrubbed of credential material before it is stored (see rule 13 under "Verdict safety"), so neither the configured key nor a credential an upstream error page happens to carry appears in an audit bundle. A config file that fails to parse is reported as `invalid YAML in <path> at line N`, and a file that cannot be read as `Unable to read New Relic config file <path> (<code>)`: the YAML parser quotes the offending source line in its own message, which for a malformed `api_key:` line would be the key itself, so that message is never echoed.
 
 ### API behavior
 
