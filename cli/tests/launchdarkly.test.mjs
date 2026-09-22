@@ -17,6 +17,8 @@ import { join } from "node:path";
 import {
   LAUNCHDARKLY_CONTROL_CATALOG,
   LaunchdarklyApiClient,
+  LaunchdarklyApiError,
+  LaunchdarklyConfigFileError,
   assessLaunchdarklyAccessControl,
   assessLaunchdarklyEnvironmentGovernance,
   assessLaunchdarklyFlagHygiene,
@@ -73,6 +75,11 @@ function headerValue(headers, name) {
   if (headers instanceof Headers) return headers.get(name) ?? undefined;
   if (typeof headers.get === "function") return headers.get(name) ?? undefined;
   return headers[name] ?? headers[name.toLowerCase()];
+}
+
+/** The error the real client throws for a failed request: the status and request travel as fields, not only as text. */
+function apiError(status, statusText, endpoint, detail = "access_denied") {
+  return new LaunchdarklyApiError(`LaunchDarkly request failed (${status} ${statusText}) for ${endpoint}: ${detail}`, status, endpoint);
 }
 
 function findingStatus(result, id) {
@@ -436,7 +443,7 @@ test("LaunchdarklyApiClient signals truncation when _links.next remains at the l
     fetchImpl: async () => jsonResponse({ items: [], totalCount: 0 }),
   });
   const none = await empty.list("/api/v2/members", {}, { limit: 5 });
-  assert.deepEqual(none, { items: [], truncated: false, seen: 0, total: 0 });
+  assert.deepEqual(none, { items: [], truncated: false, seen: 0, total: 0, endpoint: "GET /api/v2/members" });
 });
 
 test("LaunchdarklyApiClient retries 429 using X-Ratelimit-Reset and retries 5xx responses", async () => {
@@ -646,9 +653,12 @@ test("verdict rule 9: non-JSON error bodies are described, never echoed, into La
     maxRetries: 0,
   });
   await assert.rejects(client.listMembers(5), (error) => {
-    assert.match(error.message, /403 Forbidden/);
-    assert.match(error.message, /non-JSON text\/html response body \(\d+ bytes, not echoed\)/);
+    assert.ok(error instanceof LaunchdarklyApiError);
+    assert.equal(error.status, 403);
+    assert.equal(error.endpoint, "GET /api/v2/members");
+    assert.match(error.message, /403 Forbidden: non-JSON body \(text\/html, 47 bytes, not echoed\)/);
     assert.ok(!error.message.includes("FAKE_REFLECTED_SECRET"));
+    assert.ok(!error.message.includes("proxy denied"), "the body text is described by length, never echoed");
     return true;
   });
 });
@@ -865,7 +875,8 @@ test("assessLaunchdarklyAccessControl infers inventory completeness when the cal
   }), { now: NOW });
   assert.equal(identityUnreadable.summary.token_inventory_scope, "unknown");
   assert.equal(findingStatus(identityUnreadable, "LD-08"), "warn");
-  assert.match(finding(identityUnreadable, "LD-08").summary, /caller identity could not be read/);
+  assert.match(finding(identityUnreadable, "LD-08").summary, /The caller identity was not readable, so the assessment token's base role and the completeness of the showAll token listing could not be confirmed/);
+  assert.match(finding(identityUnreadable, "LD-08").summary, /Unreadable inventory: caller_identity \(GET \/api\/v2\/caller-identity: .*403 Forbidden/);
   assert.ok(identityUnreadable.errors.some((error) => error.startsWith("caller_identity:")));
 });
 
@@ -1091,13 +1102,15 @@ test("assessLaunchdarklyAccessControl never passes role or token controls on tru
   assert.match(finding(truncatedMembers, "LD-11").summary, /1\/2 visible personal tokens could not be matched to a member in the truncated member listing/);
   assert.match(finding(truncatedMembers, "LD-11").summary, /Truncated listing: members \(1 of 400 collected\)/);
   assert.deepEqual(finding(truncatedMembers, "LD-11").evidence.unverified_personal_tokens, ["dev-personal"]);
-  assert.deepEqual(finding(truncatedMembers, "LD-11").evidence.orphaned_personal_tokens, []);
+  // "No personal token is orphaned" is an absence claim over the member listing, which a truncated read cannot support.
+  assert.equal(finding(truncatedMembers, "LD-11").evidence.orphaned_personal_tokens, null);
+  assert.equal(truncatedMembers.summary.orphaned_personal_tokens, null);
   assert.deepEqual(finding(truncatedMembers, "LD-11").evidence.truncated_collections, [
     { collection: "members", option: "member_limit", seen: 1, total: 400 },
   ]);
 });
 
-test("assessLaunchdarklyAccessControl warns instead of passing when tokens cannot be read", async () => {
+test("assessLaunchdarklyAccessControl marks token controls manual instead of passing when tokens cannot be read", async () => {
   const result = await assessLaunchdarklyAccessControl(healthyClient({
     async listTokens() {
       throw new Error("LaunchDarkly request failed (403 Forbidden) for GET /api/v2/tokens");
@@ -1105,9 +1118,19 @@ test("assessLaunchdarklyAccessControl warns instead of passing when tokens canno
   }), { now: NOW });
 
   for (const id of ["LD-08", "LD-09", "LD-10", "LD-11"]) {
-    assert.equal(findingStatus(result, id), "warn", `${id} should warn`);
+    assert.equal(findingStatus(result, id), "manual", `${id} cannot be judged without the token listing`);
+    assert.match(finding(result, id).summary, /^Access tokens could not be read, so this token control could not be evaluated\. Unreadable inventory: access_tokens \(GET \/api\/v2\/tokens\?showAll=true: .*403 Forbidden/);
+    assert.equal(finding(result, id).evidence.token_inventory.visible_tokens, null, `${id} renders no token count from a denied listing`);
   }
+  assert.equal(result.summary.tokens, null);
+  assert.equal(result.summary.tokens_without_expiry, null);
+  assert.equal(result.summary.stale_tokens, null);
+  assert.equal(result.summary.token_inventory_scope, "unknown");
   assert.ok(result.errors.some((error) => error.startsWith("access_tokens:")));
+  assert.deepEqual(
+    { collected: result.snapshots.access_tokens.collected, reason: result.snapshots.access_tokens.reason, items: result.snapshots.access_tokens.items },
+    { collected: false, reason: "not_readable", items: null },
+  );
 });
 
 test("assessLaunchdarklyEnvironmentGovernance passes hardened production environments", async () => {
@@ -1279,14 +1302,21 @@ test("assessLaunchdarklyEnvironmentGovernance flags unrestricted production, mis
 
 test("assessLaunchdarklyEnvironmentGovernance marks SDK key rotation manual when the beta endpoint is unavailable", async () => {
   const result = await assessLaunchdarklyEnvironmentGovernance(healthyClient({
-    async listSdkKeys() {
-      throw new Error("LaunchDarkly request failed (404 Not Found) for GET /api/v2/projects/web/environments/production/sdk-keys");
+    async listSdkKeys(projectKey, environmentKey) {
+      throw apiError(404, "Not Found", `GET /api/v2/projects/${projectKey}/environments/${environmentKey}/sdk-keys`, "Not Found");
     },
   }), { now: NOW });
 
   assert.equal(findingStatus(result, "LD-19"), "manual");
   assert.match(finding(result, "LD-19").summary, /Organization settings > SDK keys/);
-  assert.equal(result.errors.length, 0);
+  assert.match(finding(result, "LD-19").summary, /Unreadable inventory: sdk_keys for environment web\/production \(GET \/api\/v2\/projects\/web\/environments\/production\/sdk-keys: .*404 Not Found/);
+  assert.doesNotMatch(finding(result, "LD-19").summary, /403/, "no status code is named that the run did not observe");
+  // The failed reads are recorded, one per environment, and the SDK key snapshot is a marker naming both requests.
+  assert.deepEqual(result.errors.map((error) => error.split(":").slice(0, 2).join(":")).sort(), ["sdk_keys:web/production", "sdk_keys:web/staging"]);
+  assert.equal(result.summary.stale_sdk_keys, null, "no stale-key count is asserted from unread SDK key listings");
+  assert.equal(result.snapshots.sdk_keys.collected, false);
+  assert.equal(result.snapshots.sdk_keys.status, 404);
+  assert.equal(result.snapshots.sdk_keys.failed_reads.length, 2);
 });
 
 test("assessLaunchdarklyEnvironmentGovernance treats tag-scoped approvals and declined-change application as weak approval gates", async () => {
@@ -1393,7 +1423,12 @@ test("assessLaunchdarklyEnvironmentGovernance never passes on truncated project,
   assert.equal(truncatedProjects.summary.truncated_collections, 1);
   assert.equal(truncatedProjects.snapshots.projects.truncated, true);
   assert.equal(truncatedProjects.snapshots.projects.total, 12);
-  assert.equal(truncatedProjects.snapshots.environments.truncated, false);
+  // Environments are snapshotted per project, each entry carrying its own read's flags.
+  assert.equal(truncatedProjects.snapshots.environments.length, 1);
+  assert.deepEqual(
+    { project: truncatedProjects.snapshots.environments[0].project, collected: truncatedProjects.snapshots.environments[0].collected, truncated: truncatedProjects.snapshots.environments[0].truncated },
+    { project: "web", collected: true, truncated: false },
+  );
 
   const truncatedEnvironments = await assessLaunchdarklyEnvironmentGovernance(healthyClient({
     listEnvironments: (projectKey) => truncatedListing(base, "listEnvironments", 2, 9, projectKey),
@@ -1406,10 +1441,10 @@ test("assessLaunchdarklyEnvironmentGovernance never passes on truncated project,
       { collection: "environments", option: "environment_limit", seen: 2, total: 9, scope: "project web" },
     ]);
   }
-  assert.equal(truncatedEnvironments.snapshots.environments.truncated, true);
-  assert.deepEqual(truncatedEnvironments.snapshots.environments.truncated_projects, ["web"]);
-  assert.equal(truncatedEnvironments.snapshots.environments.seen, 2);
-  assert.equal(truncatedEnvironments.snapshots.environments.total, 9);
+  assert.deepEqual(
+    truncatedEnvironments.snapshots.environments.map((entry) => ({ project: entry.project, truncated: entry.truncated, seen: entry.seen, total: entry.total, items: entry.items.length })),
+    [{ project: "web", truncated: true, seen: 2, total: 9, items: 2 }],
+  );
 
   const truncatedRoles = await assessLaunchdarklyEnvironmentGovernance(healthyClient({
     listCustomRoles: () => truncatedListing(base, "listCustomRoles", 1, 80),
@@ -1500,17 +1535,29 @@ test("assessLaunchdarklyFlagHygiene flags individual targeting, stale flags, and
 test("assessLaunchdarklyFlagHygiene marks flag controls manual instead of passing when flags cannot be read", async () => {
   const result = await assessLaunchdarklyFlagHygiene(healthyClient({
     async listFlags() {
-      throw new Error("LaunchDarkly request failed (403 Forbidden) for GET /api/v2/flags/web");
+      throw forbidden("/api/v2/flags/web?env=production");
     },
   }), { now: NOW });
 
   for (const id of ["LD-14", "LD-15", "LD-25"]) {
     assert.equal(findingStatus(result, id), "manual", `${id} cannot be judged without the flag inventory`);
     assert.match(finding(result, id).summary, /flag listing was unreadable in every one of the 1 evaluated environments/);
-    assert.match(finding(result, id).summary, /Unreadable inventory: flags for environment web\/production/);
+    assert.match(finding(result, id).summary, /Unreadable inventory: flags for environment web\/production \(GET \/api\/v2\/flags\/web\?env=production: .*403 Forbidden/);
   }
   assert.ok(result.errors.some((error) => error.startsWith("flags:web/production")));
-  assert.equal(result.snapshots.flags[0].readable, false);
+  assert.equal(result.summary.evaluated_flags, null, "no flag count is rendered from a denied listing");
+  assert.equal(result.summary.individually_targeted_flags, null);
+  assert.equal(result.summary.stale_flags, null);
+  assert.equal(result.summary.prerequisite_cycles, null);
+  // With every per-environment flag read denied the snapshot is one marker carrying each failed read, not an empty array.
+  assert.ok(!Array.isArray(result.snapshots.flags));
+  assert.deepEqual(
+    { collected: result.snapshots.flags.collected, status: result.snapshots.flags.status, endpoint: result.snapshots.flags.endpoint, reason: result.snapshots.flags.reason, items: result.snapshots.flags.items },
+    { collected: false, status: 403, endpoint: "GET /api/v2/flags/web?env=production", reason: "not_readable", items: null },
+  );
+  assert.deepEqual(result.snapshots.flags.failed_reads.map((read) => ({ environment: read.environment, status: read.status, collected: read.collected })), [
+    { environment: "web/production", status: 403, collected: false },
+  ]);
 });
 
 test("assessLaunchdarklyFlagHygiene never passes on truncated flag, project, or environment listings", async () => {
@@ -1638,13 +1685,17 @@ test("assessLaunchdarklyMonitoringIntegrations warns on short retention and mark
 });
 
 function forbidden(endpoint) {
-  return new Error(`LaunchDarkly request failed (403 Forbidden) for GET ${endpoint}: access_denied`);
+  return apiError(403, "Forbidden", `GET ${endpoint}`);
 }
 
-function forbidAuditQuery(base, matches, endpoint) {
+/** Denies the audit log queries `matches` selects, naming the request the way the client would (query parameters included). */
+function forbidAuditQuery(base, matches) {
   return {
     async listAuditLogEntries(query = {}) {
-      if (matches(query)) throw forbidden(endpoint);
+      if (matches(query)) {
+        const params = new URLSearchParams(Object.entries(query).map(([key, value]) => [key, String(value)]));
+        throw forbidden(`/api/v2/auditlog${params.size > 0 ? `?${params}` : ""}`);
+      }
       return base.listAuditLogEntries(query);
     },
   };
@@ -1654,40 +1705,40 @@ function forbidAuditQuery(base, matches, endpoint) {
 // forbidden in turn while the primary stays healthy. Status is what the finding must report; names is the inventory the
 // summary must name. LD-08/09/10 also read members and the caller identity through the token inventory scope gate.
 const LAUNCHDARKLY_MULTI_INVENTORY_CASES = [
-  { id: "LD-01", assess: assessLaunchdarklyIdentity, secondary: "audit_log_account", status: "manual", baseline: "manual", names: /Unreadable inventory: audit_log_account \(GET \/api\/v2\/auditlog\?spec=acct: .*403 Forbidden/, overrides: (base) => forbidAuditQuery(base, (query) => query.spec === "acct", "/api/v2/auditlog?spec=acct") },
-  { id: "LD-06", assess: assessLaunchdarklyIdentity, secondary: "teams", status: "manual", names: /Unreadable inventory: teams \(GET \/api\/v2\/teams: .*403 Forbidden/, overrides: () => ({ listTeams: async () => { throw forbidden("/api/v2/teams"); } }) },
+  { id: "LD-01", assess: assessLaunchdarklyIdentity, secondary: "audit_log_account", status: "manual", baseline: "manual", names: /Unreadable inventory: audit_log_account \(GET \/api\/v2\/auditlog\?spec=acct: .*403 Forbidden/, overrides: (base) => forbidAuditQuery(base, (query) => query.spec === "acct") },
+  { id: "LD-06", assess: assessLaunchdarklyIdentity, secondary: "teams", status: "manual", names: /Unreadable inventory: teams \(GET \/api\/v2\/teams\?expand=members: .*403 Forbidden/, overrides: () => ({ listTeams: async () => { throw forbidden("/api/v2/teams?expand=members"); } }) },
   { id: "LD-06", assess: assessLaunchdarklyIdentity, secondary: "members", status: "manual", names: /Unreadable inventory: members \(GET \/api\/v2\/members: .*403 Forbidden/, overrides: () => ({ listMembers: async () => { throw forbidden("/api/v2/members"); } }) },
-  { id: "LD-07", assess: assessLaunchdarklyIdentity, secondary: "team_roles", status: "manual", names: /Unreadable inventory: team_roles for team platform \(GET \/api\/v2\/teams\/\{teamKey\}\/roles: .*403 Forbidden/, overrides: () => ({ listTeamRoles: async () => { throw forbidden("/api/v2/teams/platform/roles"); } }) },
-  { id: "LD-07", assess: assessLaunchdarklyIdentity, secondary: "teams", status: "manual", names: /Unreadable inventory: teams \(GET \/api\/v2\/teams/, overrides: () => ({ listTeams: async () => { throw forbidden("/api/v2/teams"); } }) },
+  { id: "LD-07", assess: assessLaunchdarklyIdentity, secondary: "team_roles", status: "manual", names: /Unreadable inventory: team_roles for team platform \(GET \/api\/v2\/teams\/platform\/roles: .*403 Forbidden/, overrides: () => ({ listTeamRoles: async (teamKey) => { throw forbidden(`/api/v2/teams/${teamKey}/roles`); } }) },
+  { id: "LD-07", assess: assessLaunchdarklyIdentity, secondary: "teams", status: "manual", names: /Unreadable inventory: teams \(GET \/api\/v2\/teams\?expand=members/, overrides: () => ({ listTeams: async () => { throw forbidden("/api/v2/teams?expand=members"); } }) },
   { id: "LD-08", assess: assessLaunchdarklyAccessControl, secondary: "members", status: "warn", names: /member inventory was unreadable \(GET \/api\/v2\/members: .*403 Forbidden/, overrides: () => ({ listMembers: async () => { throw forbidden("/api/v2/members"); } }) },
   { id: "LD-09", assess: assessLaunchdarklyAccessControl, secondary: "members", status: "warn", names: /member inventory was unreadable \(GET \/api\/v2\/members/, overrides: () => ({ listMembers: async () => { throw forbidden("/api/v2/members"); } }) },
   { id: "LD-10", assess: assessLaunchdarklyAccessControl, secondary: "members", status: "warn", names: /member inventory was unreadable \(GET \/api\/v2\/members/, overrides: () => ({ listMembers: async () => { throw forbidden("/api/v2/members"); } }) },
   { id: "LD-11", assess: assessLaunchdarklyAccessControl, secondary: "members", status: "manual", names: /Unreadable inventory: members \(GET \/api\/v2\/members: .*403 Forbidden/, overrides: () => ({ listMembers: async () => { throw forbidden("/api/v2/members"); } }) },
-  { id: "LD-08", assess: assessLaunchdarklyAccessControl, secondary: "caller_identity", status: "warn", names: /caller identity could not be read \(GET \/api\/v2\/caller-identity: .*403 Forbidden/, overrides: () => ({ getCallerIdentity: async () => { throw forbidden("/api/v2/caller-identity"); } }) },
-  { id: "LD-09", assess: assessLaunchdarklyAccessControl, secondary: "caller_identity", status: "warn", names: /caller identity could not be read/, overrides: () => ({ getCallerIdentity: async () => { throw forbidden("/api/v2/caller-identity"); } }) },
-  { id: "LD-10", assess: assessLaunchdarklyAccessControl, secondary: "caller_identity", status: "warn", names: /caller identity could not be read/, overrides: () => ({ getCallerIdentity: async () => { throw forbidden("/api/v2/caller-identity"); } }) },
-  { id: "LD-11", assess: assessLaunchdarklyAccessControl, secondary: "caller_identity", status: "warn", names: /caller identity could not be read/, overrides: () => ({ getCallerIdentity: async () => { throw forbidden("/api/v2/caller-identity"); } }) },
+  { id: "LD-08", assess: assessLaunchdarklyAccessControl, secondary: "caller_identity", status: "warn", names: /The caller identity was not readable, so .* Unreadable inventory: caller_identity \(GET \/api\/v2\/caller-identity: .*403 Forbidden/, overrides: () => ({ getCallerIdentity: async () => { throw forbidden("/api/v2/caller-identity"); } }) },
+  { id: "LD-09", assess: assessLaunchdarklyAccessControl, secondary: "caller_identity", status: "warn", names: /Unreadable inventory: caller_identity \(GET \/api\/v2\/caller-identity/, overrides: () => ({ getCallerIdentity: async () => { throw forbidden("/api/v2/caller-identity"); } }) },
+  { id: "LD-10", assess: assessLaunchdarklyAccessControl, secondary: "caller_identity", status: "warn", names: /Unreadable inventory: caller_identity \(GET \/api\/v2\/caller-identity/, overrides: () => ({ getCallerIdentity: async () => { throw forbidden("/api/v2/caller-identity"); } }) },
+  { id: "LD-11", assess: assessLaunchdarklyAccessControl, secondary: "caller_identity", status: "warn", names: /Unreadable inventory: caller_identity \(GET \/api\/v2\/caller-identity/, overrides: () => ({ getCallerIdentity: async () => { throw forbidden("/api/v2/caller-identity"); } }) },
   { id: "LD-16", assess: assessLaunchdarklyEnvironmentGovernance, secondary: "custom_roles", status: "manual", names: /Unreadable inventory: custom_roles \(GET \/api\/v2\/roles: .*403 Forbidden/, overrides: () => ({ listCustomRoles: async () => { throw forbidden("/api/v2/roles"); } }) },
-  { id: "LD-16", assess: assessLaunchdarklyEnvironmentGovernance, secondary: "environments", status: "manual", names: /Unreadable inventory: environments for project web \(GET \/api\/v2\/projects\/\{projectKey\}\/environments: .*403 Forbidden/, overrides: () => ({ listEnvironments: async () => { throw forbidden("/api/v2/projects/web/environments"); } }) },
-  { id: "LD-17", assess: assessLaunchdarklyEnvironmentGovernance, secondary: "environments", status: "manual", names: /Unreadable inventory: environments for project web/, overrides: () => ({ listEnvironments: async () => { throw forbidden("/api/v2/projects/web/environments"); } }) },
-  { id: "LD-19", assess: assessLaunchdarklyEnvironmentGovernance, secondary: "environments", status: "manual", names: /Unreadable inventory: environments for project web/, overrides: () => ({ listEnvironments: async () => { throw forbidden("/api/v2/projects/web/environments"); } }) },
-  { id: "LD-19", assess: assessLaunchdarklyEnvironmentGovernance, secondary: "sdk_keys", status: "manual", names: /SDK keys endpoint was not readable for any environment \(.*403 Forbidden/, overrides: () => ({ listSdkKeys: async () => { throw forbidden("/api/v2/projects/web/environments/production/sdk-keys"); } }) },
-  { id: "LD-23", assess: assessLaunchdarklyEnvironmentGovernance, secondary: "environments", status: "manual", names: /Unreadable inventory: environments for project web/, overrides: () => ({ listEnvironments: async () => { throw forbidden("/api/v2/projects/web/environments"); } }) },
-  { id: "LD-14", assess: assessLaunchdarklyFlagHygiene, secondary: "environments", status: "manual", names: /Unreadable inventory: environments for project web/, overrides: () => ({ listEnvironments: async () => { throw forbidden("/api/v2/projects/web/environments"); } }) },
-  { id: "LD-14", assess: assessLaunchdarklyFlagHygiene, secondary: "flags", status: "manual", names: /Unreadable inventory: flags for environment web\/production \(GET \/api\/v2\/flags\/\{projectKey\}\?env=\{environmentKey\}: .*403 Forbidden/, overrides: () => ({ listFlags: async () => { throw forbidden("/api/v2/flags/web"); } }) },
-  { id: "LD-15", assess: assessLaunchdarklyFlagHygiene, secondary: "flag_statuses", status: "manual", names: /Unreadable inventory: flag_statuses for environment web\/production \(GET \/api\/v2\/flag-statuses\/\{projectKey\}\/\{environmentKey\}: .*403 Forbidden/, overrides: () => ({ listFlagStatuses: async () => { throw forbidden("/api/v2/flag-statuses/web/production"); } }) },
-  { id: "LD-15", assess: assessLaunchdarklyFlagHygiene, secondary: "flags", status: "manual", names: /Unreadable inventory: flags for environment web\/production/, overrides: () => ({ listFlags: async () => { throw forbidden("/api/v2/flags/web"); } }) },
-  { id: "LD-15", assess: assessLaunchdarklyFlagHygiene, secondary: "environments", status: "manual", names: /Unreadable inventory: environments for project web/, overrides: () => ({ listEnvironments: async () => { throw forbidden("/api/v2/projects/web/environments"); } }) },
-  { id: "LD-25", assess: assessLaunchdarklyFlagHygiene, secondary: "environments", status: "manual", names: /Unreadable inventory: environments for project web/, overrides: () => ({ listEnvironments: async () => { throw forbidden("/api/v2/projects/web/environments"); } }) },
-  { id: "LD-25", assess: assessLaunchdarklyFlagHygiene, secondary: "flags", status: "manual", names: /Unreadable inventory: flags for environment web\/production/, overrides: () => ({ listFlags: async () => { throw forbidden("/api/v2/flags/web"); } }) },
-  { id: "LD-12", assess: assessLaunchdarklyMonitoringIntegrations, secondary: "audit_log_recent", status: "warn", names: /Unreadable inventory: audit_log_recent \(GET \/api\/v2\/auditlog: .*403 Forbidden/, overrides: (base) => forbidAuditQuery(base, (query) => query.before === undefined && query.spec === undefined, "/api/v2/auditlog") },
-  { id: "LD-12", assess: assessLaunchdarklyMonitoringIntegrations, secondary: "audit_log_retention_probe", status: "manual", names: /Unreadable inventory: audit_log_retention_probe \(GET \/api\/v2\/auditlog\?before=<now - 90 days>: .*403 Forbidden/, overrides: (base) => forbidAuditQuery(base, (query) => query.before !== undefined, "/api/v2/auditlog?before=...") },
-  { id: "LD-13", assess: assessLaunchdarklyMonitoringIntegrations, secondary: "audit_log_members", status: "warn", names: /Unreadable inventory: audit_log_members \(GET \/api\/v2\/auditlog\?spec=member\/\*: .*403 Forbidden/, overrides: (base) => forbidAuditQuery(base, (query) => query.spec === "member/*", "/api/v2/auditlog?spec=member/*") },
-  { id: "LD-13", assess: assessLaunchdarklyMonitoringIntegrations, secondary: "audit_log_roles", status: "warn", names: /Unreadable inventory: audit_log_roles \(GET \/api\/v2\/auditlog\?spec=role\/\*: .*403 Forbidden/, overrides: (base) => forbidAuditQuery(base, (query) => query.spec === "role/*", "/api/v2/auditlog?spec=role/*") },
-  { id: "LD-18", assess: assessLaunchdarklyMonitoringIntegrations, secondary: "environments", status: "warn", names: /Unreadable inventory: environments for project web \(GET \/api\/v2\/projects\/\{projectKey\}\/environments: .*403 Forbidden.*\), so secure mode on the production environments the Relay Proxy serves was not checked/, overrides: () => ({ listEnvironments: async () => { throw forbidden("/api/v2/projects/web/environments"); } }) },
-  { id: "LD-18", assess: assessLaunchdarklyMonitoringIntegrations, secondary: "projects", status: "warn", names: /Unreadable inventory: projects \(GET \/api\/v2\/projects: .*403 Forbidden/, overrides: () => ({ listProjects: async () => { throw forbidden("/api/v2/projects"); } }) },
+  { id: "LD-16", assess: assessLaunchdarklyEnvironmentGovernance, secondary: "environments", status: "manual", names: /Unreadable inventory: environments for project web \(GET \/api\/v2\/projects\/web\/environments: .*403 Forbidden/, overrides: () => ({ listEnvironments: async (projectKey) => { throw forbidden(`/api/v2/projects/${projectKey}/environments`); } }) },
+  { id: "LD-17", assess: assessLaunchdarklyEnvironmentGovernance, secondary: "environments", status: "manual", names: /Unreadable inventory: environments for project web \(GET \/api\/v2\/projects\/web\/environments/, overrides: () => ({ listEnvironments: async (projectKey) => { throw forbidden(`/api/v2/projects/${projectKey}/environments`); } }) },
+  { id: "LD-19", assess: assessLaunchdarklyEnvironmentGovernance, secondary: "environments", status: "manual", names: /Unreadable inventory: environments for project web \(GET \/api\/v2\/projects\/web\/environments/, overrides: () => ({ listEnvironments: async (projectKey) => { throw forbidden(`/api/v2/projects/${projectKey}/environments`); } }) },
+  { id: "LD-19", assess: assessLaunchdarklyEnvironmentGovernance, secondary: "sdk_keys", status: "manual", names: /SDK keys endpoint was not readable for any of the 2 environments\. .* Unreadable inventory: sdk_keys for environment web\/production \(GET \/api\/v2\/projects\/web\/environments\/production\/sdk-keys: .*403 Forbidden.*; sdk_keys for environment web\/staging \(GET \/api\/v2\/projects\/web\/environments\/staging\/sdk-keys: .*403 Forbidden/, overrides: () => ({ listSdkKeys: async (projectKey, environmentKey) => { throw forbidden(`/api/v2/projects/${projectKey}/environments/${environmentKey}/sdk-keys`); } }) },
+  { id: "LD-23", assess: assessLaunchdarklyEnvironmentGovernance, secondary: "environments", status: "manual", names: /Unreadable inventory: environments for project web \(GET \/api\/v2\/projects\/web\/environments/, overrides: () => ({ listEnvironments: async (projectKey) => { throw forbidden(`/api/v2/projects/${projectKey}/environments`); } }) },
+  { id: "LD-14", assess: assessLaunchdarklyFlagHygiene, secondary: "environments", status: "manual", names: /Unreadable inventory: environments for project web \(GET \/api\/v2\/projects\/web\/environments/, overrides: () => ({ listEnvironments: async (projectKey) => { throw forbidden(`/api/v2/projects/${projectKey}/environments`); } }) },
+  { id: "LD-14", assess: assessLaunchdarklyFlagHygiene, secondary: "flags", status: "manual", names: /Unreadable inventory: flags for environment web\/production \(GET \/api\/v2\/flags\/web\?env=production: .*403 Forbidden/, overrides: () => ({ listFlags: async (projectKey, environmentKey) => { throw forbidden(`/api/v2/flags/${projectKey}?env=${environmentKey}`); } }) },
+  { id: "LD-15", assess: assessLaunchdarklyFlagHygiene, secondary: "flag_statuses", status: "manual", names: /Unreadable inventory: flag_statuses for environment web\/production \(GET \/api\/v2\/flag-statuses\/web\/production: .*403 Forbidden/, overrides: () => ({ listFlagStatuses: async (projectKey, environmentKey) => { throw forbidden(`/api/v2/flag-statuses/${projectKey}/${environmentKey}`); } }) },
+  { id: "LD-15", assess: assessLaunchdarklyFlagHygiene, secondary: "flags", status: "manual", names: /Unreadable inventory: flags for environment web\/production \(GET \/api\/v2\/flags\/web\?env=production/, overrides: () => ({ listFlags: async (projectKey, environmentKey) => { throw forbidden(`/api/v2/flags/${projectKey}?env=${environmentKey}`); } }) },
+  { id: "LD-15", assess: assessLaunchdarklyFlagHygiene, secondary: "environments", status: "manual", names: /Unreadable inventory: environments for project web \(GET \/api\/v2\/projects\/web\/environments/, overrides: () => ({ listEnvironments: async (projectKey) => { throw forbidden(`/api/v2/projects/${projectKey}/environments`); } }) },
+  { id: "LD-25", assess: assessLaunchdarklyFlagHygiene, secondary: "environments", status: "manual", names: /Unreadable inventory: environments for project web \(GET \/api\/v2\/projects\/web\/environments/, overrides: () => ({ listEnvironments: async (projectKey) => { throw forbidden(`/api/v2/projects/${projectKey}/environments`); } }) },
+  { id: "LD-25", assess: assessLaunchdarklyFlagHygiene, secondary: "flags", status: "manual", names: /Unreadable inventory: flags for environment web\/production \(GET \/api\/v2\/flags\/web\?env=production/, overrides: () => ({ listFlags: async (projectKey, environmentKey) => { throw forbidden(`/api/v2/flags/${projectKey}?env=${environmentKey}`); } }) },
+  { id: "LD-12", assess: assessLaunchdarklyMonitoringIntegrations, secondary: "audit_log_recent", status: "warn", names: /Unreadable inventory: audit_log_recent \(GET \/api\/v2\/auditlog: .*403 Forbidden/, overrides: (base) => forbidAuditQuery(base, (query) => query.before === undefined && query.spec === undefined) },
+  { id: "LD-12", assess: assessLaunchdarklyMonitoringIntegrations, secondary: "audit_log_retention_probe", status: "manual", names: /Unreadable inventory: audit_log_retention_probe \(GET \/api\/v2\/auditlog\?before=\d{13}: .*403 Forbidden/, overrides: (base) => forbidAuditQuery(base, (query) => query.before !== undefined) },
+  { id: "LD-13", assess: assessLaunchdarklyMonitoringIntegrations, secondary: "audit_log_members", status: "warn", names: /Unreadable inventory: audit_log_members \(GET \/api\/v2\/auditlog\?spec=member%2F\*: .*403 Forbidden/, overrides: (base) => forbidAuditQuery(base, (query) => query.spec === "member/*") },
+  { id: "LD-13", assess: assessLaunchdarklyMonitoringIntegrations, secondary: "audit_log_roles", status: "warn", names: /Unreadable inventory: audit_log_roles \(GET \/api\/v2\/auditlog\?spec=role%2F\*: .*403 Forbidden/, overrides: (base) => forbidAuditQuery(base, (query) => query.spec === "role/*") },
+  { id: "LD-18", assess: assessLaunchdarklyMonitoringIntegrations, secondary: "environments", status: "warn", names: /Unreadable inventory: environments for project web \(GET \/api\/v2\/projects\/web\/environments: .*403 Forbidden.*\), so secure mode on the production environments the Relay Proxy serves was not checked/, overrides: () => ({ listEnvironments: async (projectKey) => { throw forbidden(`/api/v2/projects/${projectKey}/environments`); } }) },
+  { id: "LD-18", assess: assessLaunchdarklyMonitoringIntegrations, secondary: "projects", status: "warn", names: /Unreadable inventory: projects \(GET \/api\/v2\/projects\?filter=keys%3Aweb: .*403 Forbidden/, overrides: () => ({ listProjects: async (limit, projectKeys = []) => { throw forbidden(`/api/v2/projects${projectKeys.length > 0 ? `?filter=keys%3A${projectKeys.join("%7C")}` : ""}`); } }) },
   { id: "LD-18", assess: assessLaunchdarklyMonitoringIntegrations, secondary: "relay_proxy_configs", status: "manual", names: /Unreadable inventory: relay_proxy_configs \(GET \/api\/v2\/account\/relay-auto-configs: .*403 Forbidden/, overrides: () => ({ listRelayProxyConfigs: async () => { throw forbidden("/api/v2/account/relay-auto-configs"); } }) },
-  { id: "LD-20", assess: assessLaunchdarklyMonitoringIntegrations, secondary: "integration_subscriptions:splunk", status: "warn", names: /Unreadable inventory: integration_subscriptions for splunk \(GET \/api\/v2\/integrations\/\{integrationKey\}: .*403 Forbidden.*\), so splunk audit log subscriptions were not checked/, overrides: (base) => ({ async listIntegrationSubscriptions(key) { if (key === "splunk") throw forbidden("/api/v2/integrations/splunk"); return base.listIntegrationSubscriptions(key); } }) },
+  { id: "LD-20", assess: assessLaunchdarklyMonitoringIntegrations, secondary: "integration_subscriptions:splunk", status: "warn", names: /Unreadable inventory: integration_subscriptions for splunk \(GET \/api\/v2\/integrations\/splunk: .*403 Forbidden.*\), so splunk audit log subscriptions were not checked/, overrides: (base) => ({ async listIntegrationSubscriptions(key) { if (key === "splunk") throw forbidden(`/api/v2/integrations/${key}`); return base.listIntegrationSubscriptions(key); } }) },
 ];
 
 test("verdict rule 1 corollary: LaunchDarkly findings that read several inventories never pass while a secondary inventory is forbidden", async () => {
@@ -1728,10 +1779,12 @@ test("verdict rule 1 corollary: LaunchDarkly findings keep judging readable inve
   assert.match(finding(partialTeams, "LD-07").summary, /All 1 sampled teams with readable roles have at least one custom role assigned/);
   assert.match(finding(partialTeams, "LD-07").summary, /team_roles for team data/);
   assert.deepEqual(finding(partialTeams, "LD-07").evidence.teams_with_unreadable_roles, ["data"]);
-  assert.deepEqual(finding(partialTeams, "LD-07").evidence.teams_without_custom_roles, [], "an unreadable listing is not counted as zero roles");
+  // An unreadable role listing is neither counted as zero roles nor used to assert that every team has one.
+  assert.equal(finding(partialTeams, "LD-07").evidence.teams_without_custom_roles, null);
+  assert.equal(partialTeams.summary.teams_without_custom_roles, null);
 
   const failingAndGapped = await assessLaunchdarklyMonitoringIntegrations(healthyClient({
-    ...forbidAuditQuery(base, (query) => query.spec === "role/*", "/api/v2/auditlog?spec=role/*"),
+    ...forbidAuditQuery(base, (query) => query.spec === "role/*"),
     async listWebhooks() {
       return [{ name: "legacy", url: "http://hooks.example.com/ld", on: true }];
     },

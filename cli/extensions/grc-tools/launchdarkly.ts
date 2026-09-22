@@ -93,9 +93,15 @@ export interface LaunchdarklyResolvedConfig {
 
 export interface LaunchdarklyAccessSurface {
   name: string;
-  endpoint: string;
+  /** The request the probe made, as "GET /path"; null when the surface was not configured and no request was made. */
+  endpoint: string | null;
   status: "readable" | "not_readable" | "not_configured";
-  count?: number;
+  /** Whether the probe completed; false for a denied, failed, or unconfigured surface. */
+  collected: boolean;
+  /** The HTTP status the failing probe observed; null when the probe succeeded or observed no response. */
+  http_status: number | null;
+  /** The count the probe established; null when it did not complete. */
+  count: number | null;
   error?: string;
 }
 
@@ -125,6 +131,31 @@ export interface LaunchdarklyCollection {
   total?: number;
   /** Set when the listing could not be read at all; items is then empty but not "known empty". */
   error?: string;
+  /** The HTTP status the failing request observed; null when the failure produced no response. */
+  httpStatus?: number | null;
+  /** The request the listing made (for a failed listing, the one that failed), as "GET /path[?query]". */
+  endpoint?: string;
+}
+
+/** A single record read (caller identity) together with how the read ended. */
+interface LaunchdarklyRecordRead {
+  payload: JsonRecord;
+  error?: string;
+  httpStatus?: number | null;
+  endpoint: string;
+}
+
+/** The marker written in place of a list dataset that was denied, errored, or never requested. */
+export interface LaunchdarklyNotCollectedMarker {
+  collected: false;
+  status: number | "error" | "not-collected";
+  endpoint: string | null;
+  error: string | null;
+  reason: "not_readable" | "not_requested";
+  truncated: null;
+  seen: null;
+  total: null;
+  items: null;
 }
 
 export interface LaunchdarklyTruncationNote {
@@ -138,7 +169,10 @@ export interface LaunchdarklyTruncationNote {
 /** A secondary inventory that a finding reads but that could not be collected (403, 401, 5xx, transport). */
 export interface LaunchdarklyInventoryGap {
   inventory: string;
-  endpoint: string;
+  /** The request that failed, as "GET /path[?query]"; null when the collector identified none. */
+  endpoint: string | null;
+  /** The HTTP status the failing request observed; null for a timeout or transport failure. */
+  http_status: number | null;
   error: string;
   unchecked: string;
   manual_evidence: string;
@@ -571,6 +605,9 @@ function normalizeBaseUrl(rawUrl: string): string {
   }
   parsed.hash = "";
   parsed.search = "";
+  // user:password@ userinfo would otherwise be stored in the resolved config and echoed in every note and error.
+  parsed.username = "";
+  parsed.password = "";
   parsed.pathname = parsed.pathname.replace(/\/+$/, "");
   return parsed.toString().replace(/\/+$/, "");
 }
@@ -592,11 +629,136 @@ function safeDirName(value: string): string {
   return normalized || "launchdarkly";
 }
 
-function errorMessage(error: unknown): string {
+const REDACTED = "[REDACTED]";
+
+/**
+ * Reduces every URL in the text to scheme, host, and path, dropping userinfo, query, and fragment wherever it appears.
+ * An already-scrubbed `?[REDACTED]` tail is consumed whole so a second pass over the same string is a no-op.
+ */
+function scrubUrlsInText(text: string): string {
+  return text.replace(/\b[a-z][a-z0-9+.-]*:\/\/(?:\[REDACTED\]|[^\s"'<>)\]])+/gi, (match) => {
+    try {
+      const parsed = new URL(match);
+      const hadUserinfo = parsed.username.length > 0 || parsed.password.length > 0;
+      const hadDetail = parsed.search.length > 0 || parsed.hash.length > 0 || hadUserinfo;
+      return hadDetail ? `${parsed.protocol}//${parsed.host}${parsed.pathname}?${REDACTED}` : match;
+    } catch {
+      return REDACTED;
+    }
+  });
+}
+
+/**
+ * Configuration-independent scrub applied to every error string before it is recorded anywhere (findings, summaries,
+ * analysis objects, access surfaces, the bundle): LaunchDarkly key shapes, authorization values, session and cookie
+ * values, JWT-shaped strings, credential-shaped key/value pairs, and URL userinfo and query strings anywhere in the text.
+ */
+export function scrubErrorText(text: string): string {
+  return scrubUrlsInText(text)
+    .replace(/\b(?:api|sdk|mob|rel)-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b/gi, REDACTED)
+    .replace(/\bapi-[A-Za-z0-9-]{8,}/g, `api-${REDACTED}`)
+    .replace(/\b(authorization|proxy-authorization|x-api-key)\b(\s*[:=]\s*)(?:apikey|basic|bearer|token|digest)?\s*[^\s,;"']+/gi, `$1$2${REDACTED}`)
+    .replace(/\b(bearer|basic|apikey)\s+[A-Za-z0-9+/=_.:-]{8,}/gi, `$1 ${REDACTED}`)
+    .replace(/\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}(?:\.[A-Za-z0-9_-]+)?/g, REDACTED)
+    .replace(/\b((?:set-)?cookie|session(?:[_-]?(?:id|token))?|sid|jsessionid|xsrf[_-]?token|csrf[_-]?token)(["']?\s*[:=]\s*["']?)([^"';,\s}]+)/gi, `$1$2${REDACTED}`)
+    .replace(/\b((?:api[_-]?key|x-api-key|app[_-]?key|application[_-]?key|access[_-]?key|secret[_-]?key|client[_-]?secret|password|passwd|secret|token|access[_-]?token|refresh[_-]?token|private[_-]?key|credentials?)["']?\s*[:=]\s*["']?)([^"',;\s}]+)/gi, `$1${REDACTED}`);
+}
+
+const PARSE_ERROR_NOTE = "SyntaxError: response could not be parsed as JSON; the parser's message is not recorded because it quotes the body";
+
+/** JSON.parse quotes a window of the text it rejected, so a SyntaxError is recorded by name only, never by its message. */
+function isParseError(error: unknown): boolean {
+  return error instanceof SyntaxError || (error instanceof Error && error.name === "SyntaxError");
+}
+
+/** The message of any thrown value with the structural parse-error guard applied, before scrubbing. */
+function describeThrown(error: unknown): string {
+  if (isParseError(error)) return PARSE_ERROR_NOTE;
   return error instanceof Error ? error.message : String(error);
 }
 
-const REDACTED = "[REDACTED]";
+/** The scrubbed message of any thrown value; the single point through which every recorded error string passes. */
+function errorMessage(error: unknown): string {
+  return scrubErrorText(describeThrown(error));
+}
+
+/** Tool-level sink: every message a tool's catch block returns passes the same guard and scrub, whatever threw it. */
+function toolErrorText(error: unknown): string {
+  return errorMessage(error);
+}
+
+export class LaunchdarklyApiError extends Error {
+  /** The HTTP status observed, or null for a timeout or transport failure. */
+  readonly status: number | null;
+  /** The request that failed, as "GET /path[?query]" without the pagination parameters. */
+  readonly endpoint: string;
+
+  constructor(message: string, status: number | null, endpoint: string) {
+    // The constructor is the last stop before the message can escape, so the unanchored scrub runs here as well as at the sink.
+    super(scrubErrorText(message));
+    this.name = "LaunchdarklyApiError";
+    this.status = status;
+    this.endpoint = endpoint;
+  }
+}
+
+/** The HTTP status a failed request observed, or null when the failure produced no response or the error did not come from the client. */
+function observedStatus(error: unknown): number | null {
+  return error instanceof LaunchdarklyApiError ? error.status : null;
+}
+
+/** The "GET /path" of the failed request when the error identifies one. */
+function observedEndpoint(error: unknown): string | undefined {
+  return error instanceof LaunchdarklyApiError ? error.endpoint : undefined;
+}
+
+const PAGINATION_PARAMETERS = new Set(["limit", "offset"]);
+const REQUEST_LABEL_PATTERN = /^(?:GET|HEAD|POST|PUT|PATCH|DELETE) \//;
+
+/** "GET /path?query" for a request URL, without the pagination parameters, so the listing is named by what it asked for. */
+function requestLabel(url: string): string {
+  const parsed = new URL(url);
+  const params = new URLSearchParams();
+  for (const [key, value] of parsed.searchParams) {
+    if (!PAGINATION_PARAMETERS.has(key)) params.append(key, value);
+  }
+  const query = params.toString();
+  return `GET ${parsed.pathname}${query ? `?${query}` : ""}`;
+}
+
+/**
+ * The label of the request a collector issues for a path and query, built the same way the client labels the request
+ * it sends. Used only when no request was observed (a client that returns plain arrays), so a caveat can still name the
+ * concrete request that would have been made instead of a templated path.
+ */
+function describeRequest(path: string, query: JsonRecord = {}): string {
+  const url = new URL(path.startsWith("/") ? path : `/${path}`, "https://launchdarkly.invalid");
+  for (const [key, value] of Object.entries(query)) {
+    if (value === undefined || value === null || value === "") continue;
+    url.searchParams.set(key, String(value));
+  }
+  return requestLabel(url.toString());
+}
+
+/** The request label a collection or record read carries when the client recorded one. */
+function endpointOf(value: unknown): string | undefined {
+  const record = asObject(value);
+  return record && Array.isArray(record.items) ? asString(record.endpoint) : undefined;
+}
+
+/** "403 Forbidden", or just "403" when the response carried no status text. */
+function statusLine(response: Response): string {
+  return response.statusText ? `${response.status} ${response.statusText}` : String(response.status);
+}
+
+/**
+ * Describes a body that is not the documented JSON error shape by status, content type, and length instead of
+ * echoing it: an HTML or proxy error page can reflect the request (including its Authorization header) back at us.
+ */
+function describeOpaqueBody(response: Response, rawText: string): string {
+  const contentType = (response.headers.get("content-type") ?? "").split(";")[0].trim() || "untyped";
+  return `${statusLine(response)}: non-JSON body (${contentType}, ${Buffer.byteLength(rawText, "utf8")} bytes, not echoed)`;
+}
 
 function maskSecret(value: unknown): string | undefined {
   const text = asString(value);
@@ -676,8 +838,9 @@ export function redactCredentialValues(value: unknown, depth = 0): unknown {
     if (typeof entry === "string") {
       // Booleans and numbers under credential-shaped keys (serviceToken: true) carry no secret, so only strings are blanked.
       if (isCredentialKey(key) || (pair && key === "value")) return [key, REDACTED];
-      // A url/endpoint key whose value is not an absolute URL may still be a host-relative path carrying a token.
-      if (isUrlKey(key) && !ABSOLUTE_URL_PATTERN.test(entry)) return [key, REDACTED];
+      // A url/endpoint key whose value is not an absolute URL may still be a host-relative path carrying a token. The
+      // inspector's own request labels ("GET /api/v2/...") name the request a read made and carry no credential.
+      if (isUrlKey(key) && !ABSOLUTE_URL_PATTERN.test(entry) && !REQUEST_LABEL_PATTERN.test(entry)) return [key, REDACTED];
       return [key, reduceUrl(entry)];
     }
     if (typeof entry !== "object") return [key, entry];
@@ -900,11 +1063,26 @@ function parseTomlScalar(raw: string): unknown {
   return value;
 }
 
+/**
+ * Raised by parseSimpleToml for a line that is not a comment, a table header, or a `key = value` pair. The message
+ * names only the line number: the rejected line is the one most likely to hold a mistyped token, so it is never quoted.
+ */
+export class LaunchdarklyTomlSyntaxError extends Error {
+  readonly line: number;
+
+  constructor(line: number) {
+    super(`Invalid TOML at line ${line}: expected a comment, a [table] header, or a key = value pair`);
+    this.name = "LaunchdarklyTomlSyntaxError";
+    this.line = line;
+  }
+}
+
 export function parseSimpleToml(text: string): JsonRecord {
   const result: JsonRecord = {};
   let section = "";
-  for (const rawLine of text.split(/\r?\n/)) {
-    const line = stripTomlComment(rawLine).trim();
+  const lines = text.split(/\r?\n/);
+  for (let index = 0; index < lines.length; index += 1) {
+    const line = stripTomlComment(lines[index]).trim();
     if (line.length === 0) continue;
     const sectionMatch = /^\[\s*([^\]]+?)\s*\]$/.exec(line);
     if (sectionMatch) {
@@ -912,7 +1090,9 @@ export function parseSimpleToml(text: string): JsonRecord {
       continue;
     }
     const separator = line.indexOf("=");
-    if (separator <= 0) continue;
+    // A line with no key (YAML `key: value`, a JSON object, a stray continuation line) is rejected instead of being
+    // silently skipped, so a config written in the wrong syntax cannot resolve to defaults without notice.
+    if (separator <= 0) throw new LaunchdarklyTomlSyntaxError(index + 1);
     const key = line.slice(0, separator).trim().replace(/^["']|["']$/g, "");
     const value = parseTomlScalar(line.slice(separator + 1));
     result[section ? `${section}.${key}` : key] = value;
@@ -932,13 +1112,66 @@ function lookupConfigValue(values: JsonRecord, keys: string[]): unknown {
   return undefined;
 }
 
-function readLaunchdarklyConfigFile(configPath: string): { values: JsonRecord; present: boolean } {
-  if (!existsSync(configPath)) return { values: {}, present: false };
-  try {
-    return { values: parseSimpleToml(readFileSync(configPath, "utf8")), present: true };
-  } catch (error) {
-    throw new Error(`Unable to read LaunchDarkly config file ${configPath}: ${errorMessage(error)}`);
+const ERRNO_CODE_PATTERN = /^E[A-Z0-9_]{1,30}$/;
+
+/**
+ * Raised when the config file cannot be read or parsed. The file carries the access token, so the message is fixed
+ * text built only from the path, an errno code validated against ERRNO_CODE_PATTERN, and a line number: neither the
+ * filesystem's message (which quotes the path with its own wording) nor anything the parser might throw is interpolated.
+ */
+export class LaunchdarklyConfigFileError extends Error {
+  readonly path: string;
+  /** The errno code of a read failure, or INVALID_TOML for a parse failure. */
+  readonly code: string;
+  /** The line the parser rejected, when it identified one. */
+  readonly line: number | undefined;
+
+  constructor(step: "read" | "parse", path: string, code: string | undefined, line?: number) {
+    super(step === "read"
+      ? `Unable to read LaunchDarkly config file ${path}${code ? ` (${code})` : ""}`
+      : `Unable to parse LaunchDarkly config file: invalid TOML in ${path}${line === undefined ? "" : ` at line ${line}`}`);
+    this.name = "LaunchdarklyConfigFileError";
+    this.path = path;
+    this.code = code ?? "UNKNOWN";
+    this.line = line;
   }
+}
+
+/** The errno code of a filesystem error, only when it has the strict E[A-Z0-9_] shape; anything else is dropped. */
+function errnoCode(error: unknown): string | undefined {
+  const code = asString(asObject(error)?.code);
+  return code && ERRNO_CODE_PATTERN.test(code) ? code : undefined;
+}
+
+/** Read step of the config loader: any filesystem failure surfaces as fixed text with the validated errno code only. */
+function readConfigSource(location: string): string {
+  try {
+    return readFileSync(location, "utf8");
+  } catch (error) {
+    throw new LaunchdarklyConfigFileError("read", location, errnoCode(error));
+  }
+}
+
+/**
+ * Parse step of the config loader: every thrown value, whatever its class, becomes fixed text naming only the path,
+ * plus the line number when the thrown value is the parser's own error (which carries no source text).
+ */
+function parseConfigToml(location: string, source: string): JsonRecord {
+  try {
+    return parseSimpleToml(source);
+  } catch (error) {
+    const line = error instanceof LaunchdarklyTomlSyntaxError && Number.isInteger(error.line) && error.line > 0 ? error.line : undefined;
+    throw new LaunchdarklyConfigFileError("parse", location, "INVALID_TOML", line);
+  }
+}
+
+/**
+ * Loads the config file. A missing default file is simply absent; a path named explicitly (argument or environment)
+ * that cannot be read is an error, so a typo in the path is not silently ignored.
+ */
+function readLaunchdarklyConfigFile(configPath: string, explicit: boolean): { values: JsonRecord; present: boolean } {
+  if (!explicit && !existsSync(configPath)) return { values: {}, present: false };
+  return { values: parseConfigToml(configPath, readConfigSource(configPath)), present: true };
 }
 
 export function resolveLaunchdarklyConfiguration(
@@ -948,10 +1181,9 @@ export function resolveLaunchdarklyConfiguration(
 ): LaunchdarklyResolvedConfig {
   const sourceChain: string[] = [];
   const homeDir = options.homeDir ?? homedir();
-  const configPath = asString(input.config_path)
-    ?? asString(env.LAUNCHDARKLY_CONFIG)
-    ?? join(homeDir, ".config", "launchdarkly-sec-inspector", "config.toml");
-  const configFile = readLaunchdarklyConfigFile(configPath);
+  const explicitConfigPath = asString(input.config_path) ?? asString(env.LAUNCHDARKLY_CONFIG);
+  const configPath = explicitConfigPath ?? join(homeDir, ".config", "launchdarkly-sec-inspector", "config.toml");
+  const configFile = readLaunchdarklyConfigFile(configPath, explicitConfigPath !== undefined);
   const fileValues = configFile.values;
 
   const pick = (
@@ -1043,19 +1275,19 @@ function extractItems(payload: JsonRecord): JsonRecord[] {
   return asRecordArray(payload.items);
 }
 
-function launchdarklyErrorDetail(payload: JsonRecord | undefined, rawText: string, contentType: string | null): string | undefined {
+// Only LaunchDarkly's documented JSON error fields (code, message) are quoted; anything else is described, never echoed,
+// so no reflected header or token from a proxy or WAF page can reach the bundle.
+function launchdarklyErrorDetail(response: Response, payload: JsonRecord | undefined, rawText: string): string | undefined {
+  if (rawText.trim().length === 0) return undefined;
   if (payload) {
     const code = asString(payload.code);
-    const message = asString(payload.message);
+    const message = asString(payload.message)?.replace(/\s+/g, " ").slice(0, 300);
     if (code && message) return `${code}: ${message}`;
     if (message) return message;
     if (code) return code;
+    return `${statusLine(response)}: JSON body without a documented error field (${Buffer.byteLength(rawText, "utf8")} bytes, not echoed)`;
   }
-  const trimmed = rawText.trim();
-  // Non-JSON bodies (proxy or WAF pages) are described, never echoed, so no reflected header or token can reach the bundle.
-  return trimmed.length > 0
-    ? `non-JSON ${contentType ?? "unknown content type"} response body (${trimmed.length} bytes, not echoed)`
-    : undefined;
+  return describeOpaqueBody(response, rawText);
 }
 
 function parseJsonSafely(text: string): JsonRecord | undefined {
@@ -1114,7 +1346,11 @@ function redactIntegrationSubscription(subscription: JsonRecord): JsonRecord {
 }
 
 /** Wraps a single-request listing so a paginated payload (_links.next) is reported as truncated instead of silently dropped. */
-function singlePageCollection(payload: JsonRecord, mapItem: (item: JsonRecord) => JsonRecord = (item) => item): LaunchdarklyCollection {
+function singlePageCollection(
+  payload: JsonRecord,
+  endpoint: string,
+  mapItem: (item: JsonRecord) => JsonRecord = (item) => item,
+): LaunchdarklyCollection {
   const items = extractItems(payload).map(mapItem);
   const total = asNumber(payload.totalCount);
   const nextHref = asString(asObject(asObject(payload._links)?.next)?.href);
@@ -1123,6 +1359,7 @@ function singlePageCollection(payload: JsonRecord, mapItem: (item: JsonRecord) =
     truncated: Boolean(nextHref) || (total !== undefined && total > items.length),
     seen: items.length,
     total,
+    endpoint,
   };
 }
 
@@ -1194,7 +1431,8 @@ export class LaunchdarklyApiClient {
   }
 
   private async fetchJson(url: string, options: { apiVersion?: string } = {}): Promise<JsonRecord> {
-    const pathname = new URL(url).pathname;
+    // Every error names the request as it was actually issued (path plus non-pagination query), never a template.
+    const endpoint = requestLabel(url);
     for (let attempt = 0; ; attempt += 1) {
       const pause = this.pauseUntil - Date.now();
       if (pause > 0) await this.sleep(Math.min(pause, MAX_RATE_LIMIT_WAIT_MS));
@@ -1221,8 +1459,9 @@ export class LaunchdarklyApiClient {
           await this.sleep(Math.min(500 * 2 ** attempt, MAX_RATE_LIMIT_WAIT_MS));
           continue;
         }
+        // No response was observed, so no status is recorded; a transport SyntaxError is named without its message.
         const detail = timedOut ? `timed out after ${this.config.timeoutMs}ms` : errorMessage(error);
-        throw new Error(this.redact(`LaunchDarkly request failed for GET ${pathname}: ${detail}`));
+        throw new LaunchdarklyApiError(this.redact(`LaunchDarkly request failed for ${endpoint}: ${detail}`), null, endpoint);
       } finally {
         clearTimeout(timer);
       }
@@ -1240,13 +1479,20 @@ export class LaunchdarklyApiClient {
 
       const payload = parseJsonSafely(rawText);
       if (!response.ok) {
-        const detail = launchdarklyErrorDetail(payload, rawText, response.headers.get("content-type"));
-        throw new Error(this.redact(
-          `LaunchDarkly request failed (${response.status} ${response.statusText}) for GET ${pathname}${detail ? `: ${detail}` : ""}`,
-        ));
+        const detail = launchdarklyErrorDetail(response, payload, rawText);
+        throw new LaunchdarklyApiError(
+          this.redact(`LaunchDarkly request failed (${statusLine(response)}) for ${endpoint}${detail ? `: ${detail}` : ""}`),
+          response.status,
+          endpoint,
+        );
       }
       if (!payload) {
-        throw new Error(this.redact(`LaunchDarkly response for GET ${pathname} was not valid JSON.`));
+        // The body is not echoed: the parser's message would quote it, and a 200 with a non-JSON body is typically a portal page.
+        throw new LaunchdarklyApiError(
+          this.redact(`LaunchDarkly response for ${endpoint} was not valid JSON (${describeOpaqueBody(response, rawText)}).`),
+          response.status,
+          endpoint,
+        );
       }
       return payload;
     }
@@ -1268,6 +1514,7 @@ export class LaunchdarklyApiClient {
     let total: number | undefined;
     let remaining = false;
     let nextUrl: string | undefined = this.buildUrl(path, { ...query, limit: Math.min(pageSize, limit), offset });
+    const endpoint = requestLabel(nextUrl);
     const visited = new Set<string>([nextUrl]);
 
     while (nextUrl) {
@@ -1312,6 +1559,7 @@ export class LaunchdarklyApiClient {
       truncated: total !== undefined ? total > items.length : remaining,
       seen: items.length,
       total,
+      endpoint,
     };
   }
 
@@ -1321,7 +1569,8 @@ export class LaunchdarklyApiClient {
     query: JsonRecord = {},
     options: { apiVersion?: string } = {},
   ): Promise<LaunchdarklyCollection> {
-    return singlePageCollection(await this.get(path, query, options), mapItem);
+    const url = this.buildUrl(path, query);
+    return singlePageCollection(await this.fetchJson(url, options), requestLabel(url), mapItem);
   }
 
   async getCallerIdentity(): Promise<JsonRecord> {
@@ -1466,9 +1715,14 @@ export type LaunchdarklyAuditClient = IdentityClient
   & MonitoringClient
   & AccessCheckClient;
 
+/**
+ * Probes one surface. The surface names the request the probe observed (the collection's own label, or the failing
+ * request named by the error); `request` is the concrete request the probe issues and stands in only when the client
+ * recorded none. Every flag and count is null for a probe that did not complete.
+ */
 async function readableSurface(
   name: string,
-  endpoint: string,
+  request: string,
   load: () => Promise<unknown>,
   countResolver?: (value: unknown) => number | undefined,
 ): Promise<LaunchdarklyAccessSurface> {
@@ -1476,18 +1730,28 @@ async function readableSurface(
     const value = await load();
     return {
       name,
-      endpoint,
+      endpoint: endpointOf(value) ?? request,
       status: "readable",
-      count: countResolver?.(value),
+      collected: true,
+      http_status: null,
+      count: countResolver?.(value) ?? null,
     };
   } catch (error) {
     return {
       name,
-      endpoint,
+      endpoint: observedEndpoint(error) ?? request,
       status: "not_readable",
+      collected: false,
+      http_status: observedStatus(error),
+      count: null,
       error: errorMessage(error),
     };
   }
+}
+
+/** A surface the probe could not attempt because the surface it depends on was not readable; no request was made. */
+function unconfiguredSurface(name: string, error: string): LaunchdarklyAccessSurface {
+  return { name, endpoint: null, status: "not_configured", collected: false, http_status: null, count: null, error };
 }
 
 function toCollection(value: unknown): LaunchdarklyCollection {
@@ -1499,12 +1763,16 @@ function toCollection(value: unknown): LaunchdarklyCollection {
   const items = asRecordArray(record?.items);
   const total = asNumber(record?.total);
   const error = asString(record?.error);
+  const endpoint = asString(record?.endpoint);
+  const httpStatus = record?.httpStatus === null ? null : asNumber(record?.httpStatus);
   return {
     items,
     truncated: asBoolean(record?.truncated) === true || (total !== undefined && total > items.length),
     seen: items.length,
     total,
     ...(error ? { error } : {}),
+    ...(endpoint ? { endpoint } : {}),
+    ...(error && httpStatus !== undefined ? { httpStatus } : {}),
   };
 }
 
@@ -1526,17 +1794,35 @@ function parseCallerIdentity(payload: JsonRecord): LaunchdarklyCallerIdentity {
   };
 }
 
+// The requests the collectors issue, labelled the way the client labels the request it sends; each stands in for the
+// observed request only when the client did not record one.
+const CALLER_IDENTITY_REQUEST = "GET /api/v2/caller-identity";
+const MEMBERS_REQUEST = describeRequest("/api/v2/members");
+const TEAMS_REQUEST = describeRequest("/api/v2/teams", { expand: "members" });
+const TOKENS_REQUEST = describeRequest("/api/v2/tokens", { showAll: "true" });
+const CUSTOM_ROLES_REQUEST = describeRequest("/api/v2/roles");
+
+/** The identity note names the token, kind, and member only from a caller identity that was actually read. */
+function callerIdentityNote(surface: LaunchdarklyAccessSurface, identity: LaunchdarklyCallerIdentity): string {
+  if (surface.status !== "readable") {
+    const status = surface.http_status === null ? "" : ` (HTTP ${surface.http_status})`;
+    return `The caller identity was not readable${status}, so the token name, token kind, and member are unknown.`;
+  }
+  const kind = identity.serviceToken === undefined ? "token kind unknown" : identity.serviceToken ? "service token" : "personal token";
+  return `Authenticated as ${identity.tokenName ?? identity.tokenId ?? "unknown token"} (${kind}, member ${identity.memberId ?? "unknown"}).`;
+}
+
 export async function checkLaunchdarklyAccess(client: AccessCheckClient): Promise<LaunchdarklyAccessCheckResult> {
   const config = client.getResolvedConfig();
   let callerIdentity: LaunchdarklyCallerIdentity = {};
-  const callerSurface = await readableSurface("caller_identity", "/api/v2/caller-identity", async () => {
+  const callerSurface = await readableSurface("caller_identity", CALLER_IDENTITY_REQUEST, async () => {
     const payload = await client.getCallerIdentity();
     callerIdentity = parseCallerIdentity(payload);
     return payload;
   }, () => 1);
 
   let firstProjectKey: string | undefined;
-  const projectsSurface = await readableSurface("projects", "/api/v2/projects", async () => {
+  const projectsSurface = await readableSurface("projects", projectsRequest(config.projectKeys), async () => {
     const projects = toCollection(await client.listProjects(5, config.projectKeys));
     firstProjectKey = asString(projects.items[0]?.key);
     return projects;
@@ -1544,30 +1830,40 @@ export async function checkLaunchdarklyAccess(client: AccessCheckClient): Promis
 
   let firstEnvironmentKey: string | undefined;
   const environmentsSurface = firstProjectKey
-    ? await readableSurface("environments", "/api/v2/projects/{projectKey}/environments", async () => {
+    ? await readableSurface("environments", environmentsRequest(firstProjectKey), async () => {
       const environments = toCollection(await client.listEnvironments(firstProjectKey ?? "", 5));
       firstEnvironmentKey = asString(environments.items[0]?.key);
       return environments;
     }, listCount)
-    : { name: "environments", endpoint: "/api/v2/projects/{projectKey}/environments", status: "not_configured" as const, error: "No project was readable." };
+    : unconfiguredSurface("environments", "No project was readable, so no environment listing was requested.");
 
   const flagsSurface = firstProjectKey && firstEnvironmentKey
-    ? await readableSurface("flags", "/api/v2/flags/{projectKey}", () => client.listFlags(firstProjectKey ?? "", firstEnvironmentKey ?? "", 5), listCount)
-    : { name: "flags", endpoint: "/api/v2/flags/{projectKey}", status: "not_configured" as const, error: "No project environment was readable." };
+    ? await readableSurface(
+      "flags",
+      describeRequest(`/api/v2/flags/${encodeURIComponent(firstProjectKey)}`, { env: firstEnvironmentKey, summary: "0" }),
+      () => client.listFlags(firstProjectKey ?? "", firstEnvironmentKey ?? "", 5),
+      listCount,
+    )
+    : unconfiguredSurface("flags", "No project environment was readable, so no flag listing was requested.");
 
   const surfaces: LaunchdarklyAccessSurface[] = [
     callerSurface,
-    await readableSurface("members", "/api/v2/members", () => client.listMembers(5), listCount),
-    await readableSurface("teams", "/api/v2/teams", () => client.listTeams(5), listCount),
-    await readableSurface("custom_roles", "/api/v2/roles", () => client.listCustomRoles(5), listCount),
+    await readableSurface("members", MEMBERS_REQUEST, () => client.listMembers(5), listCount),
+    await readableSurface("teams", TEAMS_REQUEST, () => client.listTeams(5), listCount),
+    await readableSurface("custom_roles", CUSTOM_ROLES_REQUEST, () => client.listCustomRoles(5), listCount),
     projectsSurface,
     environmentsSurface,
     flagsSurface,
-    await readableSurface("access_tokens", "/api/v2/tokens", () => client.listTokens(5), listCount),
-    await readableSurface("audit_log", "/api/v2/auditlog", () => client.listAuditLogEntries({}, 5), listCount),
-    await readableSurface("webhooks", "/api/v2/webhooks", () => client.listWebhooks(), listCount),
-    await readableSurface("relay_proxy_configs", "/api/v2/account/relay-auto-configs", () => client.listRelayProxyConfigs(), listCount),
-    await readableSurface("integration_subscriptions", "/api/v2/integrations/{integrationKey}", () => client.listIntegrationSubscriptions(DEFAULT_INTEGRATION_KEYS[0]), listCount),
+    await readableSurface("access_tokens", TOKENS_REQUEST, () => client.listTokens(5), listCount),
+    await readableSurface("audit_log", describeRequest("/api/v2/auditlog"), () => client.listAuditLogEntries({}, 5), listCount),
+    await readableSurface("webhooks", describeRequest("/api/v2/webhooks"), () => client.listWebhooks(), listCount),
+    await readableSurface("relay_proxy_configs", describeRequest("/api/v2/account/relay-auto-configs"), () => client.listRelayProxyConfigs(), listCount),
+    await readableSurface(
+      "integration_subscriptions",
+      describeRequest(`/api/v2/integrations/${encodeURIComponent(DEFAULT_INTEGRATION_KEYS[0])}`),
+      () => client.listIntegrationSubscriptions(DEFAULT_INTEGRATION_KEYS[0]),
+      listCount,
+    ),
   ];
 
   const readableCount = surfaces.filter((surface) => surface.status === "readable").length;
@@ -1583,7 +1879,7 @@ export async function checkLaunchdarklyAccess(client: AccessCheckClient): Promis
     surfaces,
     notes: [
       `Using LaunchDarkly instance ${config.baseUrl} with API version ${config.apiVersion}.`,
-      `Authenticated as ${callerIdentity.tokenName ?? callerIdentity.tokenId ?? "unknown token"} (${callerIdentity.serviceToken ? "service token" : "personal token"}, member ${callerIdentity.memberId ?? "n/a"}).`,
+      callerIdentityNote(callerSurface, callerIdentity),
       `Config precedence resolved from: ${config.sourceChain.join(" -> ")}.`,
       `${readableCount}/${surfaces.length} LaunchDarkly audit surfaces are readable (webhooks, Relay Proxy configs, and integration subscriptions are optional).`,
     ],
@@ -1617,18 +1913,31 @@ function buildFinding(
   };
 }
 
-async function collect<T>(errors: string[], label: string, load: () => Promise<T>, fallback: T): Promise<T> {
+/**
+ * Reads a single record and, on failure, records the error in the shared errors array and on the returned read together
+ * with the status and request the failure observed. `request` is the request the read issues and names the read only
+ * when the client did not identify the failing request itself.
+ */
+async function collectRecord(
+  errors: string[],
+  label: string,
+  request: string,
+  load: () => Promise<JsonRecord>,
+): Promise<LaunchdarklyRecordRead> {
   try {
-    return await load();
+    return { payload: await load(), endpoint: request };
   } catch (error) {
-    errors.push(`${label}: ${errorMessage(error)}`);
-    return fallback;
+    const message = errorMessage(error);
+    errors.push(`${label}: ${message}`);
+    return { payload: {}, error: message, httpStatus: observedStatus(error), endpoint: observedEndpoint(error) ?? request };
   }
 }
 
 /**
- * Collects a listing and, on failure, records the error both in the shared errors array and on the returned collection,
- * so a finding can tell an unreadable inventory (verdict rule 1 corollary) apart from a genuinely empty one.
+ * Collects a listing and, on failure, records the error both in the shared errors array and on the returned collection
+ * (with the HTTP status and request the failure observed), so a finding can tell an unreadable inventory (verdict rule 1
+ * corollary) apart from a genuinely empty one. The failed collection's `truncated: false` is never rendered: every
+ * flag and count derived from it goes through the null-rendering helpers below.
  */
 async function collectList(
   errors: string[],
@@ -1640,19 +1949,74 @@ async function collectList(
   } catch (error) {
     const message = errorMessage(error);
     errors.push(`${label}: ${message}`);
-    return { items: [], truncated: false, seen: 0, error: message };
+    return { items: [], truncated: false, seen: 0, error: message, httpStatus: observedStatus(error), endpoint: observedEndpoint(error) };
   }
 }
 
+/** True when the listing was read (the request completed and its payload parsed); false when it was denied, errored, or timed out. */
+function isRead(collection: LaunchdarklyCollection): boolean {
+  return collection.error === undefined;
+}
+
+/** True when the listing was read and did not stop at a cap or a dropped page, so counts and names derived from it are complete. */
+function isComplete(collection: LaunchdarklyCollection): boolean {
+  return isRead(collection) && !collection.truncated;
+}
+
+/** A value derived from a listing renders only when the listing was read at all. */
+function whenRead<T>(collection: LaunchdarklyCollection, value: T): T | null {
+  return isRead(collection) ? value : null;
+}
+
+/** A value joined across several listings renders only when every one of them was read. */
+function whenAllRead<T>(collections: LaunchdarklyCollection[], value: T): T | null {
+  return collections.every(isRead) ? value : null;
+}
+
+/** A count or list that asserts completeness renders only when every listing it reads was read completely. */
+function whenAllComplete<T>(collections: LaunchdarklyCollection[], value: T): T | null {
+  return collections.every(isComplete) ? value : null;
+}
+
+/**
+ * A list of records observed to hold a property: the records found are real observations and always render, while an
+ * empty list renders `[]` only when every listing that could have revealed one was read completely, and null otherwise.
+ */
+function observedList<T>(sources: LaunchdarklyCollection[], items: T[]): T[] | null {
+  return items.length > 0 || sources.every(isComplete) ? items : null;
+}
+
+/** The count of records observed to hold a property, with the same rule as observedList: zero is asserted only from complete reads. */
+function observedCount(sources: LaunchdarklyCollection[], count: number): number | null {
+  return count > 0 || sources.every(isComplete) ? count : null;
+}
+
+/** "N" for a listing that was read, "unread" for one that was not, so a sentence never states a zero from a denied read. */
+function countOrUnread(collection: LaunchdarklyCollection, count: number = collection.items.length): string {
+  return isRead(collection) ? String(count) : "unread";
+}
+
+/**
+ * The gap a finding records for an inventory it reads that could not be collected. The endpoint is the request the
+ * failure observed; `request` is the concrete request the collector issued and stands in only when the client did not
+ * name the failing request. The HTTP status is the one observed, or null when the failure produced no response.
+ */
 function inventoryGap(
   inventory: string,
-  endpoint: string,
-  collection: Pick<LaunchdarklyCollection, "error"> | undefined,
+  request: string | null,
+  collection: Pick<LaunchdarklyCollection, "error" | "endpoint" | "httpStatus"> | undefined,
   unchecked: string,
   manualEvidence: string,
 ): LaunchdarklyInventoryGap | undefined {
   if (!collection?.error) return undefined;
-  return { inventory, endpoint, error: collection.error, unchecked, manual_evidence: manualEvidence };
+  return {
+    inventory,
+    endpoint: collection.endpoint ?? request,
+    http_status: collection.httpStatus ?? null,
+    error: collection.error,
+    unchecked,
+    manual_evidence: manualEvidence,
+  };
 }
 
 function presentGaps(gaps: Array<LaunchdarklyInventoryGap | undefined>): LaunchdarklyInventoryGap[] {
@@ -1660,7 +2024,7 @@ function presentGaps(gaps: Array<LaunchdarklyInventoryGap | undefined>): Launchd
 }
 
 function inventoryGapCaveat(gaps: LaunchdarklyInventoryGap[]): string {
-  const parts = gaps.map((gap) => `${gap.inventory} (${gap.endpoint}: ${gap.error}), so ${gap.unchecked}`);
+  const parts = gaps.map((gap) => `${gap.inventory} (${gap.endpoint ? `${gap.endpoint}: ` : ""}${gap.error}), so ${gap.unchecked}`);
   const evidence = uniqueStrings(gaps.map((gap) => gap.manual_evidence));
   return `Unreadable inventory: ${parts.join("; ")}. Collect manually: ${evidence.join("; ")}.`;
 }
@@ -1720,6 +2084,9 @@ function truncationAwareFinding(
     const priorNotes = asRecordArray(evidence?.truncated_collections);
     const seenNotes = new Set(priorNotes.map((note) => JSON.stringify(note)));
     const mergedNotes = [...priorNotes, ...notes.filter((note) => !seenNotes.has(JSON.stringify(note)))];
+    const priorGaps = asRecordArray(evidence?.unreadable_inventories);
+    const seenGaps = new Set(priorGaps.map((gap) => JSON.stringify(gap)));
+    const mergedGaps = [...priorGaps, ...gaps.filter((gap) => !seenGaps.has(JSON.stringify(gap)))];
     return buildFinding(
       controlNumber,
       demoted,
@@ -1729,19 +2096,74 @@ function truncationAwareFinding(
       {
         ...(evidence ?? {}),
         ...(mergedNotes.length > 0 ? { truncated_collections: mergedNotes } : {}),
-        ...(gaps.length > 0 ? { unreadable_inventories: gaps, manual_evidence: manualEvidence } : {}),
+        ...(mergedGaps.length > 0 ? { unreadable_inventories: mergedGaps } : {}),
+        ...(gaps.length > 0 ? { manual_evidence: manualEvidence } : {}),
       },
     );
   };
 }
 
-function collectionSnapshot(result: LaunchdarklyCollection, items: unknown[] = result.items): JsonRecord {
+/** The marker written for a listing that was requested and could not be read; it names the request and status observed. */
+function notReadableMarker(result: LaunchdarklyCollection, request: string | null = null): LaunchdarklyNotCollectedMarker {
   return {
+    collected: false,
+    status: result.httpStatus ?? "error",
+    endpoint: result.endpoint ?? request,
+    error: result.error ?? null,
+    reason: "not_readable",
+    truncated: null,
+    seen: null,
+    total: null,
+    items: null,
+  };
+}
+
+/** The marker written for a listing that was never requested because the inventory it depends on was not readable. */
+function notRequestedMarker(): LaunchdarklyNotCollectedMarker {
+  return { collected: false, status: "not-collected", endpoint: null, error: null, reason: "not_requested", truncated: null, seen: null, total: null, items: null };
+}
+
+/**
+ * The core_data snapshot of one listing: the records with the read's own flags when it was read, and a marker object
+ * (never an empty array) when it was denied, errored, or timed out, so a consumer cannot mistake a denial for an
+ * empty inventory. `request` names the request the collector issued when the client did not record one.
+ */
+function collectionSnapshot(result: LaunchdarklyCollection, items: unknown[] = result.items, request: string | null = null): JsonRecord {
+  if (!isRead(result)) return { ...notReadableMarker(result, request) };
+  return {
+    collected: true,
+    endpoint: result.endpoint ?? request,
     truncated: result.truncated,
     seen: result.seen,
     total: result.total ?? null,
-    ...(result.error ? { readable: false, error: result.error } : {}),
     items,
+  };
+}
+
+interface ScopedSnapshotEntry {
+  scope: JsonRecord;
+  collection: LaunchdarklyCollection;
+  items?: unknown[];
+  request?: string;
+}
+
+/**
+ * The core_data snapshot of a listing collected once per scope (team, environment, integration): one entry per scope
+ * when at least one was read, a single marker carrying every failed read when none was, `[]` when the readable parent
+ * inventory had no scopes to read, and a not-requested marker when the parent inventory itself was unreadable.
+ */
+function scopedSnapshots(entries: ScopedSnapshotEntry[], parentsRead: boolean): unknown {
+  if (entries.length === 0) return parentsRead ? [] : notRequestedMarker();
+  const rendered = entries.map((entry) => ({ ...entry.scope, ...collectionSnapshot(entry.collection, entry.items, entry.request ?? null) }));
+  if (entries.some((entry) => isRead(entry.collection))) return rendered;
+  // The collapsed marker carries the status every failed read observed, or "error" when they differed or none had one.
+  const statuses = uniqueStrings(entries.map((entry) => String(entry.collection.httpStatus ?? "error")));
+  const endpoints = uniqueStrings(entries.map((entry) => entry.collection.endpoint ?? entry.request ?? "").filter(Boolean));
+  return {
+    ...notReadableMarker(entries[0].collection, entries[0].request ?? null),
+    status: statuses.length === 1 ? entries[0].collection.httpStatus ?? "error" : "error",
+    endpoint: endpoints.length > 0 ? endpoints.join(", ") : null,
+    failed_reads: rendered,
   };
 }
 
@@ -1805,33 +2227,35 @@ export async function assessLaunchdarklyIdentity(
   const teamRoleNotes = teamRoles.flatMap((team) => truncationNote("team_roles", "role_limit", team.collection, `team ${team.key}`));
   const membersGap = inventoryGap(
     "members",
-    "GET /api/v2/members",
+    MEMBERS_REQUEST,
     memberCollection,
     "member posture was not checked",
     "Organization settings > Members export (role, MFA state, teams, email domain per member)",
   );
   const teamsGap = inventoryGap(
     "teams",
-    "GET /api/v2/teams",
+    TEAMS_REQUEST,
     teamCollection,
     "team membership and team role assignments were not checked",
     "Organization settings > Teams: member and custom role assignments per team",
   );
   const accountAuditGap = inventoryGap(
     "audit_log_account",
-    "GET /api/v2/auditlog?spec=acct",
+    describeRequest("/api/v2/auditlog", { spec: "acct" }),
     accountAuditCollection,
     "recent SAML, SCIM, and MFA setting changes were not checked",
     "Audit log filtered to account resources for SAML, SCIM, and MFA changes",
   );
-  const unreadableTeamRoles = teamRoles.filter((team) => team.collection.error);
+  const teamRolesRequest = (teamKey: string) => describeRequest(`/api/v2/teams/${encodeURIComponent(teamKey)}/roles`);
+  const unreadableTeamRoles = teamRoles.filter((team) => !isRead(team.collection));
   const teamRoleGaps = unreadableTeamRoles.map((team) => inventoryGap(
     `team_roles for team ${team.key}`,
-    "GET /api/v2/teams/{teamKey}/roles",
+    teamRolesRequest(team.key),
     team.collection,
     `custom role assignments of team ${team.key} were not checked`,
     "Organization settings > Teams > (team) > Roles: custom roles assigned to each team",
   ));
+  const teamRoleCollections = teamRoles.map((team) => team.collection);
   const memberFinding = truncationAwareFinding(memberNotes, presentGaps([membersGap]), "manual");
   const ssoFinding = truncationAwareFinding(memberNotes, presentGaps([membersGap, accountAuditGap]), "manual");
   const membershipFinding = truncationAwareFinding([...memberNotes, ...teamNotes], presentGaps([membersGap, teamsGap]), "manual");
@@ -1858,7 +2282,7 @@ export async function assessLaunchdarklyIdentity(
 
   const orphanedMembers = activeMembers.filter((member) => asRecordArray(member.teams).length === 0);
   // A team whose role listing was unreadable has unknown roles, not zero roles; it is reported through the inventory gap.
-  const teamsWithoutCustomRoles = teamRoles.filter((team) => !team.collection.error && team.roles.length === 0);
+  const teamsWithoutCustomRoles = teamRoles.filter((team) => isRead(team.collection) && team.roles.length === 0);
 
   const domainCounts = new Map<string, number>();
   for (const member of activeMembers) {
@@ -1875,6 +2299,10 @@ export async function assessLaunchdarklyIdentity(
     })
     : [];
 
+  const membersRead = isRead(memberCollection);
+  const teamsRead = isRead(teamCollection);
+  const readableDomains = domainDistribution.slice(0, 5).map((item) => `${item.domain} (${item.members})`).join(", ");
+
   const findings: LaunchdarklyFinding[] = [
     ssoFinding(
       1,
@@ -1882,26 +2310,32 @@ export async function assessLaunchdarklyIdentity(
       [
         "The LaunchDarkly REST API does not expose the account SSO/SAML enforcement setting.",
         "Confirm in Organization settings > Security that SAML SSO is enabled and Require SSO is on, then capture a screenshot or the SCIM/IdP configuration as evidence.",
-        scimProvisioned.length > 0
-          ? `${scimProvisioned.length}/${activeMembers.length} active members are SCIM/IdP provisioned, which supports an SSO deployment.`
-          : "No active members exposed IdP provisioning metadata.",
-        passwordDataMembers.length > 0
-          ? `${passwordMembers.length}/${passwordDataMembers.length} members with password data still have a LaunchDarkly password set.`
-          : "Member password state was not exposed by the API.",
-        ssoAuditEvents.length > 0
-          ? `${ssoAuditEvents.length} recent account audit entries touched SAML, SCIM, or MFA settings.`
-          : "No recent account audit entries touched SAML, SCIM, or MFA settings.",
-      ].join(" "),
+        !membersRead
+          ? "Member provisioning and password state were not read because the member inventory was unreadable."
+          : scimProvisioned.length > 0
+            ? `${scimProvisioned.length}/${activeMembers.length} active members are SCIM/IdP provisioned, which supports an SSO deployment.`
+            : "No active members exposed IdP provisioning metadata.",
+        !membersRead
+          ? undefined
+          : passwordDataMembers.length > 0
+            ? `${passwordMembers.length}/${passwordDataMembers.length} members with password data still have a LaunchDarkly password set.`
+            : "Member password state was not exposed by the API.",
+        !isRead(accountAuditCollection)
+          ? "Recent account audit entries were not read because the account audit log query was unreadable."
+          : ssoAuditEvents.length > 0
+            ? `${ssoAuditEvents.length} recent account audit entries touched SAML, SCIM, or MFA settings.`
+            : "No recent account audit entries touched SAML, SCIM, or MFA settings.",
+      ].filter((part): part is string => Boolean(part)).join(" "),
       {
-        active_members: activeMembers.length,
-        scim_provisioned_members: scimProvisioned.length,
-        members_with_password: passwordMembers.length,
-        members_with_oauth_providers: oauthMembers.length,
-        recent_sso_audit_events: sample(ssoAuditEvents.map((entry) => ({
+        active_members: whenRead(memberCollection, activeMembers.length),
+        scim_provisioned_members: whenRead(memberCollection, scimProvisioned.length),
+        members_with_password: whenRead(memberCollection, passwordMembers.length),
+        members_with_oauth_providers: whenRead(memberCollection, oauthMembers.length),
+        recent_sso_audit_events: whenRead(accountAuditCollection, sample(ssoAuditEvents.map((entry) => ({
           date: isoDate(asTimestamp(entry.date)),
           actions: auditActions(entry),
           title: asString(entry.title) ?? asString(entry.shortDescription),
-        }))),
+        })))),
         manual_evidence: [
           "Organization settings > Security > SAML: Enable SSO and Require SSO are checked",
           "IdP application assignment export or SCIM provisioning configuration",
@@ -1910,35 +2344,40 @@ export async function assessLaunchdarklyIdentity(
     ),
     memberFinding(
       2,
-      activeMembers.length === 0 ? "warn" : membersWithoutMfa.length === 0 ? "pass" : "fail",
-      activeMembers.length === 0
-        ? "No active members were readable, so MFA coverage could not be evaluated."
-        : membersWithoutMfa.length === 0
-          ? `All ${activeMembers.length} active members report MFA enabled (${mfaEnforcedMembers.length} under account enforcement). Confirm the account level Require MFA for new members setting in Organization settings > Security.`
-          : `${membersWithoutMfa.length}/${activeMembers.length} active members do not have MFA enabled.`,
+      !membersRead ? "manual" : activeMembers.length === 0 ? "warn" : membersWithoutMfa.length === 0 ? "pass" : "fail",
+      !membersRead
+        ? "The member inventory was unreadable, so MFA coverage could not be evaluated."
+        : activeMembers.length === 0
+          ? "No active members were readable, so MFA coverage could not be evaluated."
+          : membersWithoutMfa.length === 0
+            ? `All ${activeMembers.length} active members report MFA enabled (${mfaEnforcedMembers.length} under account enforcement). Confirm the account level Require MFA for new members setting in Organization settings > Security.`
+            : `${membersWithoutMfa.length}/${activeMembers.length} active members do not have MFA enabled.`,
       {
-        active_members: activeMembers.length,
-        pending_invites: pendingMembers.length,
-        members_without_mfa: sample(membersWithoutMfa.map(memberEmail)),
-        mfa_enforced_members: mfaEnforcedMembers.length,
+        active_members: whenRead(memberCollection, activeMembers.length),
+        pending_invites: whenRead(memberCollection, pendingMembers.length),
+        // Members observed without MFA are real observations; an empty list is asserted only from a complete listing.
+        members_without_mfa: observedList([memberCollection], sample(membersWithoutMfa.map(memberEmail))),
+        mfa_enforced_members: whenRead(memberCollection, mfaEnforcedMembers.length),
       },
     ),
     memberFinding(
       3,
-      owners.length > maxOwners ? "fail" : admins.length > maxAdmins ? "warn" : members.length === 0 ? "warn" : "pass",
+      !membersRead ? "manual" : owners.length > maxOwners ? "fail" : admins.length > maxAdmins ? "warn" : members.length === 0 ? "warn" : "pass",
       owners.length > maxOwners
         ? `${owners.length} members hold the Owner base role, exceeding the configured maximum of ${maxOwners}.`
         : admins.length > maxAdmins
           ? `${owners.length} Owner and ${admins.length} Admin base role members were found; Admin count exceeds the configured maximum of ${maxAdmins}.`
-          : members.length === 0
-            ? "No members were readable, so Owner and Admin concentration could not be evaluated."
-            : `${owners.length} Owner and ${admins.length} Admin base role members are within the configured thresholds (${maxOwners} owners, ${maxAdmins} admins).`,
+          : !membersRead
+            ? "The member inventory was unreadable, so Owner and Admin concentration could not be evaluated."
+            : members.length === 0
+              ? "No members were readable, so Owner and Admin concentration could not be evaluated."
+              : `${owners.length} Owner and ${admins.length} Admin base role members are within the configured thresholds (${maxOwners} owners, ${maxAdmins} admins).`,
       {
-        owners: sample(owners.map(memberEmail)),
-        admins: sample(admins.map(memberEmail)),
+        owners: observedList([memberCollection], sample(owners.map(memberEmail))),
+        admins: observedList([memberCollection], sample(admins.map(memberEmail))),
         max_owners: maxOwners,
         max_admins: maxAdmins,
-        total_members: members.length,
+        total_members: whenRead(memberCollection, members.length),
       },
     ),
     membershipFinding(
@@ -1956,8 +2395,9 @@ export async function assessLaunchdarklyIdentity(
             ? `All ${activeMembers.length} active members belong to at least one of ${teams.length} teams.`
             : `${orphanedMembers.length}/${activeMembers.length} active members are not assigned to any team.`,
       {
-        teams: teams.length,
-        orphaned_members: sample(orphanedMembers.map(memberEmail)),
+        teams: whenRead(teamCollection, teams.length),
+        // A member is named as unassigned only when both the member and team inventories were read; the list is complete only from complete reads.
+        orphaned_members: whenAllRead([memberCollection, teamCollection], observedList([memberCollection, teamCollection], sample(orphanedMembers.map(memberEmail)))),
       },
     ),
     teamRoleFinding(
@@ -1976,30 +2416,36 @@ export async function assessLaunchdarklyIdentity(
           : teamRoles.length > 0 && unreadableTeamRoles.length === teamRoles.length
             ? `The role listing was unreadable for every one of the ${teamRoles.length} sampled teams, so team assigned custom roles could not be evaluated.`
             : teamsWithoutCustomRoles.length === 0
-              ? `All ${teamRoles.length - unreadableTeamRoles.length} sampled teams with readable roles have at least one custom role assigned; ${admins.length + owners.length} members still hold built-in Admin or Owner base roles.`
+              ? `All ${teamRoles.length - unreadableTeamRoles.length} sampled teams with readable roles have at least one custom role assigned; ${countOrUnread(memberCollection, admins.length + owners.length)} members still hold built-in Admin or Owner base roles.`
               : `${teamsWithoutCustomRoles.length}/${teamRoles.length - unreadableTeamRoles.length} sampled teams with readable roles have no custom roles assigned, so their members rely on built-in base roles.`,
       {
-        teams_sampled: teamRoles.length,
-        teams_with_unreadable_roles: sample(unreadableTeamRoles.map((team) => team.key)),
-        teams_without_custom_roles: sample(teamsWithoutCustomRoles.map((team) => team.key)),
-        built_in_admin_or_owner_members: admins.length + owners.length,
-        team_roles: sample(teamRoles.map((team) => ({ team: team.key, roles: team.roles.map((role) => asString(role.key) ?? asString(role.name)) }))),
+        teams_sampled: whenRead(teamCollection, teamRoles.length),
+        teams_with_unreadable_roles: whenRead(teamCollection, sample(unreadableTeamRoles.map((team) => team.key))),
+        // A team is named as lacking custom roles only from its own readable role listing; "none lack" needs every listing complete.
+        teams_without_custom_roles: whenRead(teamCollection, observedList([teamCollection, ...teamRoleCollections], sample(teamsWithoutCustomRoles.map((team) => team.key)))),
+        built_in_admin_or_owner_members: whenRead(memberCollection, admins.length + owners.length),
+        team_roles: whenRead(teamCollection, sample(teamRoles.map((team) => ({
+          team: team.key,
+          roles: whenRead(team.collection, team.roles.map((role) => asString(role.key) ?? asString(role.name))),
+        })))),
       },
     ),
     memberFinding(
       24,
-      allowedDomains.length === 0
+      allowedDomains.length === 0 || !membersRead
         ? "manual"
         : offDomainMembers.length === 0 ? "pass" : "fail",
       allowedDomains.length === 0
-        ? `No organization domain policy was supplied. Provide allowed_domains (or LAUNCHDARKLY_ALLOWED_DOMAINS) and compare against the observed member domains: ${domainDistribution.slice(0, 5).map((item) => `${item.domain} (${item.members})`).join(", ") || "none"}.`
-        : offDomainMembers.length === 0
-          ? `All ${activeMembers.length} active members use approved domains (${allowedDomains.join(", ")}).`
-          : `${offDomainMembers.length}/${activeMembers.length} active members use email domains outside the approved list (${allowedDomains.join(", ")}).`,
+        ? `No organization domain policy was supplied. Provide allowed_domains (or LAUNCHDARKLY_ALLOWED_DOMAINS) and compare against the observed member domains: ${!membersRead ? "unread (the member inventory was unreadable)" : readableDomains || "none"}.`
+        : !membersRead
+          ? `The member inventory was unreadable, so member email domains could not be compared against the approved list (${allowedDomains.join(", ")}).`
+          : offDomainMembers.length === 0
+            ? `All ${activeMembers.length} active members use approved domains (${allowedDomains.join(", ")}).`
+            : `${offDomainMembers.length}/${activeMembers.length} active members use email domains outside the approved list (${allowedDomains.join(", ")}).`,
       {
         allowed_domains: allowedDomains,
-        domain_distribution: sample(domainDistribution),
-        off_domain_members: sample(offDomainMembers.map(memberEmail)),
+        domain_distribution: whenRead(memberCollection, sample(domainDistribution)),
+        off_domain_members: whenRead(memberCollection, allowedDomains.length === 0 ? [] : observedList([memberCollection], sample(offDomainMembers.map(memberEmail)))),
       },
     ),
   ];
@@ -2009,27 +2455,31 @@ export async function assessLaunchdarklyIdentity(
     category: "identity",
     summary: {
       base_url: config.baseUrl,
-      members: members.length,
-      active_members: activeMembers.length,
-      pending_invites: pendingMembers.length,
-      members_without_mfa: membersWithoutMfa.length,
-      owners: owners.length,
-      admins: admins.length,
-      teams: teams.length,
-      orphaned_members: orphanedMembers.length,
-      teams_without_custom_roles: teamsWithoutCustomRoles.length,
+      members: whenRead(memberCollection, members.length),
+      active_members: whenRead(memberCollection, activeMembers.length),
+      pending_invites: whenRead(memberCollection, pendingMembers.length),
+      members_without_mfa: observedCount([memberCollection], membersWithoutMfa.length),
+      owners: observedCount([memberCollection], owners.length),
+      admins: observedCount([memberCollection], admins.length),
+      teams: whenRead(teamCollection, teams.length),
+      orphaned_members: whenAllRead([memberCollection, teamCollection], observedCount([memberCollection, teamCollection], orphanedMembers.length)),
+      teams_without_custom_roles: whenRead(teamCollection, observedCount([teamCollection, ...teamRoleCollections], teamsWithoutCustomRoles.length)),
       allowed_domains: allowedDomains.length,
-      off_domain_members: offDomainMembers.length,
+      off_domain_members: whenRead(memberCollection, allowedDomains.length === 0 ? 0 : observedCount([memberCollection], offDomainMembers.length)),
       truncated_collections: memberNotes.length + teamNotes.length + teamRoleNotes.length,
+      unreadable_inventories: presentGaps([membersGap, teamsGap, accountAuditGap, ...teamRoleGaps]).length,
       evaluated_at: new Date(now).toISOString(),
     },
     findings,
     errors,
     snapshots: {
-      members: collectionSnapshot(memberCollection),
-      teams: collectionSnapshot(teamCollection),
-      team_roles: teamRoles.map((team) => ({ team: team.key, name: team.name, ...collectionSnapshot(team.collection) })),
-      audit_log_account: collectionSnapshot(accountAuditCollection),
+      members: collectionSnapshot(memberCollection, memberCollection.items, MEMBERS_REQUEST),
+      teams: collectionSnapshot(teamCollection, teamCollection.items, TEAMS_REQUEST),
+      team_roles: scopedSnapshots(
+        teamRoles.map((team) => ({ scope: { team: team.key, name: team.name }, collection: team.collection, request: teamRolesRequest(team.key) })),
+        teamsRead,
+      ),
+      audit_log_account: collectionSnapshot(accountAuditCollection, accountAuditCollection.items, describeRequest("/api/v2/auditlog", { spec: "acct" })),
     },
   };
 }
@@ -2138,13 +2588,24 @@ interface TokenInventory {
   visibleMemberIds: number;
 }
 
+/** How the reads the token inventory depends on ended; each error travels with the request the failure observed. */
+interface TokenInventoryReadability {
+  tokens: LaunchdarklyCollection;
+  caller: LaunchdarklyRecordRead;
+  members: LaunchdarklyCollection;
+}
+
+/** "GET /path: error" naming the request the failed read observed. */
+function failedReadNote(read: Pick<LaunchdarklyCollection, "error" | "endpoint">, request: string): string {
+  return `${read.endpoint ?? request}: ${read.error ?? "unknown error"}`;
+}
+
 function resolveTokenInventory(
   tokens: JsonRecord[],
   members: JsonRecord[],
   caller: LaunchdarklyCallerIdentity,
-  readability: { callerError?: string; memberError?: string },
+  readability: TokenInventoryReadability,
 ): TokenInventory {
-  const callerReadable = readability.callerError === undefined;
   const callerToken = caller.tokenId ? tokens.find((token) => asString(token._id) === caller.tokenId) : undefined;
   const callerTokenRole = callerToken ? tokenRole(callerToken) : undefined;
   const callerMemberId = caller.memberId ?? (callerToken ? asString(callerToken.memberId) : undefined);
@@ -2155,13 +2616,19 @@ function resolveTokenInventory(
     .filter((memberId): memberId is string => Boolean(memberId)));
   const base = { callerToken, callerTokenRole, callerMemberRole, visibleMemberIds: personalMemberIds.size };
 
-  if (!callerReadable) {
+  if (!isRead(readability.tokens)) {
+    // A denied listing is not an empty one: nothing about the inventory's completeness can be inferred from it. The
+    // inventory gap on the finding names the request and error.
+    return { ...base, scope: "unknown", reason: "The token listing was not readable, so no access token was evaluated." };
+  }
+
+  if (readability.caller.error !== undefined) {
     // Rule 1 corollary: the caller identity is one of the inventories every token verdict reads, so its loss can never
-    // be papered over by inferring completeness from the visible members.
+    // be papered over by inferring completeness from the visible members. The inventory gap names the request and error.
     return {
       ...base,
       scope: "unknown",
-      reason: `The caller identity could not be read (GET /api/v2/caller-identity: ${readability.callerError}), so the assessment token's base role and the completeness of the showAll token listing could not be confirmed (${personalMemberIds.size} members' personal tokens are visible).`,
+      reason: `The caller identity was not readable, so the assessment token's base role and the completeness of the showAll token listing could not be confirmed (${personalMemberIds.size} members' personal tokens are visible).`,
     };
   }
 
@@ -2174,8 +2641,8 @@ function resolveTokenInventory(
     }
     if (asBoolean(callerToken.serviceToken) !== true) {
       if (callerMemberRole === undefined) {
-        const memberSource = readability.memberError
-          ? `the member inventory was unreadable (GET /api/v2/members: ${readability.memberError})`
+        const memberSource = !isRead(readability.members)
+          ? `the member inventory was unreadable (${failedReadNote(readability.members, MEMBERS_REQUEST)})`
           : "its member record could not be resolved from the member listing";
         return { ...base, scope: "unknown", reason: `The assessment token carries the ${callerTokenRole} base role, but ${memberSource}, so the member role that caps a personal token could not be confirmed.` };
       }
@@ -2222,35 +2689,54 @@ export async function assessLaunchdarklyAccessControl(
   const tokenLimit = clampNumber(options.tokenLimit, DEFAULT_TOKEN_LIMIT, 1, 10_000);
   const staleTokenDays = clampNumber(options.staleTokenDays, DEFAULT_STALE_TOKEN_DAYS, 1, 3650);
 
-  const tokenErrors: string[] = [];
-  const memberErrors: string[] = [];
-  const callerErrors: string[] = [];
-  const [roleCollection, tokenCollection, memberCollection, callerPayload] = await Promise.all([
+  const [roleCollection, tokenCollection, memberCollection, callerRead] = await Promise.all([
     collectList(errors, "custom_roles", () => client.listCustomRoles(roleLimit)),
-    collectList(tokenErrors, "access_tokens", () => client.listTokens(tokenLimit)),
-    collectList(memberErrors, "members", () => client.listMembers(DEFAULT_MEMBER_LIMIT)),
-    collect(callerErrors, "caller_identity", () => client.getCallerIdentity(), {} as JsonRecord),
+    collectList(errors, "access_tokens", () => client.listTokens(tokenLimit)),
+    collectList(errors, "members", () => client.listMembers(DEFAULT_MEMBER_LIMIT)),
+    collectRecord(errors, "caller_identity", CALLER_IDENTITY_REQUEST, () => client.getCallerIdentity()),
   ]);
-  errors.push(...tokenErrors, ...memberErrors, ...callerErrors);
   const roles = roleCollection.items;
   const tokens = tokenCollection.items;
   const members = memberCollection.items;
-  const tokensReadable = tokenErrors.length === 0;
-  const membersComplete = memberErrors.length === 0 && !memberCollection.truncated;
+  const rolesRead = isRead(roleCollection);
+  const tokensRead = isRead(tokenCollection);
+  const membersRead = isRead(memberCollection);
+  const membersComplete = isComplete(memberCollection);
   const roleNotes = truncationNote("custom_roles", "role_limit", roleCollection);
   const tokenNotes = truncationNote("access_tokens", "token_limit", tokenCollection);
   const memberNotes = truncationNote("members", "member_limit", memberCollection);
-  const roleFinding = truncationAwareFinding(roleNotes);
-  const callerIdentity = parseCallerIdentity(callerPayload);
+  const callerIdentity = parseCallerIdentity(callerRead.payload);
+  const rolesGap = inventoryGap(
+    "custom_roles",
+    CUSTOM_ROLES_REQUEST,
+    roleCollection,
+    "custom role policy statements were not checked",
+    "Organization settings > Roles: base permissions and policy statements of every custom role",
+  );
+  const tokensGap = inventoryGap(
+    "access_tokens",
+    TOKENS_REQUEST,
+    tokenCollection,
+    "no access token was evaluated",
+    "Authorization > Access tokens: name, role or custom role, owner, expiry, and last used date of every token (showAll as an Owner or Admin)",
+  );
   const membersGap = inventoryGap(
     "members",
-    "GET /api/v2/members",
+    MEMBERS_REQUEST,
     memberCollection,
     "personal tokens could not be matched to current members or to their members' base roles",
     "Organization settings > Members export (member id and base role) to reconcile against Authorization > Access tokens",
   );
+  const callerGap = inventoryGap(
+    "caller_identity",
+    CALLER_IDENTITY_REQUEST,
+    callerRead,
+    "the assessment token's own role and the completeness of the token listing were not confirmed",
+    "Authorization > Access tokens: the role of the token used for this assessment",
+  );
+  const roleFinding = truncationAwareFinding(roleNotes, presentGaps([rolesGap]), "manual");
   const inventory = withTruncatedTokens(
-    resolveTokenInventory(tokens, members, callerIdentity, { callerError: callerErrors[0], memberError: memberCollection.error }),
+    resolveTokenInventory(tokens, members, callerIdentity, { tokens: tokenCollection, caller: callerRead, members: memberCollection }),
     tokenCollection,
   );
   const inventoryEvidence: JsonRecord = {
@@ -2258,11 +2744,12 @@ export async function assessLaunchdarklyAccessControl(
     reason: inventory.reason,
     caller_token_role: inventory.callerTokenRole ?? null,
     caller_member_role: inventory.callerMemberRole ?? null,
-    visible_tokens: tokens.length,
-    total_tokens: tokenCollection.total ?? null,
-    visible_personal_token_members: inventory.visibleMemberIds,
+    visible_tokens: whenRead(tokenCollection, tokens.length),
+    total_tokens: whenRead(tokenCollection, tokenCollection.total ?? null),
+    visible_personal_token_members: whenRead(tokenCollection, inventory.visibleMemberIds),
   };
-  const degradeForInventory = tokensReadable && inventory.scope !== "full";
+  const degradeForInventory = tokensRead && inventory.scope !== "full";
+  // Every token finding reads the token listing (essential: manual when denied) and the caller identity (warn when denied).
   const tokenFinding = (
     control: number,
     status: LaunchdarklyFindingStatus,
@@ -2273,12 +2760,18 @@ export async function assessLaunchdarklyAccessControl(
   ): LaunchdarklyFinding => {
     const notes = [...tokenNotes, ...extraNotes];
     const degraded = degradeForInventory || extraNotes.length > 0;
-    const guarded = truncationAwareFinding(extraNotes, gaps, "manual");
+    // The token listing and the finding's own secondary inventories are essential (manual); the caller identity only
+    // gates completeness, so its loss alone demotes a pass to warn through the token inventory caveat.
+    const guarded = truncationAwareFinding(
+      extraNotes,
+      presentGaps([tokensGap, callerGap, ...gaps]),
+      tokensGap || gaps.length > 0 ? "manual" : "warn",
+    );
     return guarded(
       control,
-      degraded && status === "pass" ? "warn" : status,
+      !tokensRead ? "manual" : degraded && status === "pass" ? "warn" : status,
       [
-        summary,
+        !tokensRead ? "Access tokens could not be read, so this token control could not be evaluated." : summary,
         degradeForInventory ? tokenInventoryCaveat(inventory) : undefined,
       ].filter((part): part is string => Boolean(part)).join(" "),
       { ...evidence, token_inventory: inventoryEvidence, ...(notes.length > 0 ? { truncated_collections: notes } : {}) },
@@ -2347,153 +2840,158 @@ export async function assessLaunchdarklyAccessControl(
     return [{ token: tokenLabel(token), token_role: tokenRole(token), member_role: memberRole }];
   });
 
+  // A personal token is named as orphaned (absent from the member listing) only from a complete member listing and a
+  // readable token listing; as over-scoped only from its own matched member record.
+  const membersReconciled = tokensRead && membersComplete;
   const findings: LaunchdarklyFinding[] = [
     roleFinding(
       4,
-      roles.length === 0 ? "warn" : wildcardRoles.length === 0 ? "pass" : "fail",
-      roles.length === 0
-        ? "No custom roles were readable; access is governed by built-in base roles only, so least privilege scoping cannot be demonstrated."
-        : wildcardRoles.length === 0
-          ? `All ${roles.length} custom roles enumerate explicit actions without wildcard or notActions grants.`
-          : `${wildcardRoles.length}/${roles.length} custom roles contain allow statements with wildcard actions or open ended notActions grants.`,
+      !rolesRead ? "manual" : roles.length === 0 ? "warn" : wildcardRoles.length === 0 ? "pass" : "fail",
+      !rolesRead
+        ? "Custom roles could not be read, so least privilege scoping could not be evaluated."
+        : roles.length === 0
+          ? "No custom roles exist; access is governed by built-in base roles only, so least privilege scoping cannot be demonstrated."
+          : wildcardRoles.length === 0
+            ? `All ${roles.length} custom roles enumerate explicit actions without wildcard or notActions grants.`
+            : `${wildcardRoles.length}/${roles.length} custom roles contain allow statements with wildcard actions or open ended notActions grants.`,
       {
-        custom_roles: roles.length,
-        wildcard_roles: sample(wildcardRoles.map((role) => ({
+        custom_roles: whenRead(roleCollection, roles.length),
+        wildcard_roles: observedList([roleCollection], sample(wildcardRoles.map((role) => ({
           role: role.key,
           statements: role.wildcardStatements.map((statement) => ({ actions: statement.actions, notActions: statement.notActions, resources: statement.resources })),
-        }))),
+        })))),
       },
     ),
     roleFinding(
       5,
-      roles.length === 0
-        ? "warn"
-        : sensitiveRoles.length > 0 ? "fail" : readerBaseRoles.length > 0 ? "warn" : "pass",
-      roles.length === 0
-        ? "No custom roles were readable, so deny-by-default policy design could not be evaluated."
-        : sensitiveRoles.length > 0
-          ? `${sensitiveRoles.length}/${roles.length} custom roles allow sensitive account, member, role, token, relay, webhook, or team administration actions without an explicit deny.`
-          : readerBaseRoles.length > 0
-            ? `No custom role grants sensitive administration actions, but ${readerBaseRoles.length}/${roles.length} roles use reader base permissions instead of no_access.`
-            : `All ${roles.length} custom roles start from no_access base permissions and do not allow sensitive administration actions.`,
+      !rolesRead
+        ? "manual"
+        : roles.length === 0
+          ? "warn"
+          : sensitiveRoles.length > 0 ? "fail" : readerBaseRoles.length > 0 ? "warn" : "pass",
+      !rolesRead
+        ? "Custom roles could not be read, so deny-by-default policy design could not be evaluated."
+        : roles.length === 0
+          ? "No custom roles exist, so deny-by-default policy design could not be evaluated."
+          : sensitiveRoles.length > 0
+            ? `${sensitiveRoles.length}/${roles.length} custom roles allow sensitive account, member, role, token, relay, webhook, or team administration actions without an explicit deny.`
+            : readerBaseRoles.length > 0
+              ? `No custom role grants sensitive administration actions, but ${readerBaseRoles.length}/${roles.length} roles use reader base permissions instead of no_access.`
+              : `All ${roles.length} custom roles start from no_access base permissions and do not allow sensitive administration actions.`,
       {
-        custom_roles: roles.length,
-        sensitive_roles: sample(sensitiveRoles.map((role) => ({ role: role.key, granted: sample(role.sensitiveGrants) }))),
-        reader_base_permission_roles: sample(readerBaseRoles.map((role) => role.key)),
+        custom_roles: whenRead(roleCollection, roles.length),
+        sensitive_roles: observedList([roleCollection], sample(sensitiveRoles.map((role) => ({ role: role.key, granted: sample(role.sensitiveGrants) })))),
+        reader_base_permission_roles: observedList([roleCollection], sample(readerBaseRoles.map((role) => role.key))),
       },
     ),
     tokenFinding(
       8,
       tokens.length === 0 ? "warn" : tokensWithoutExpiry.length === 0 ? "pass" : "fail",
       tokens.length === 0
-        ? "No access tokens were readable (use an Admin token so showAll returns every member's personal tokens)."
+        ? "The token listing returned no tokens even though the assessment token itself should appear in it (use an Admin token so showAll returns every member's personal tokens)."
         : tokensWithoutExpiry.length === 0
           ? `All ${tokens.length} visible access tokens have an expiry configured.`
           : `${tokensWithoutExpiry.length}/${tokens.length} visible access tokens have no expiry configured.`,
       {
-        tokens: tokens.length,
-        tokens_without_expiry: sample(tokensWithoutExpiry.map(tokenLabel)),
+        tokens: whenRead(tokenCollection, tokens.length),
+        tokens_without_expiry: observedList([tokenCollection], sample(tokensWithoutExpiry.map(tokenLabel))),
       },
     ),
     tokenFinding(
       9,
       tokens.length === 0 ? "warn" : staleTokens.length === 0 ? "pass" : "fail",
       tokens.length === 0
-        ? "No access tokens were readable, so token staleness could not be evaluated."
+        ? "The token listing returned no tokens, so token staleness could not be evaluated."
         : staleTokens.length === 0
           ? `All ${tokens.length} visible access tokens were used (or created) within the last ${staleTokenDays} days.`
           : `${staleTokens.length}/${tokens.length} visible access tokens have not been used in more than ${staleTokenDays} days.`,
       {
         stale_token_days: staleTokenDays,
-        stale_tokens: sample(staleTokens.map((token) => ({
+        stale_tokens: observedList([tokenCollection], sample(staleTokens.map((token) => ({
           token: tokenLabel(token),
           last_used: isoDate(asTimestamp(token.lastUsed)),
           created: isoDate(asTimestamp(token.creationDate)),
           service_token: asBoolean(token.serviceToken) === true,
-        }))),
+        })))),
       },
     ),
     tokenFinding(
       10,
-      !tokensReadable
-        ? "warn"
-        : serviceTokens.length === 0
-          ? "pass"
-          : overScopedOtherServiceTokens.length > 0 || wildcardInlineTokens.length > 0
-            ? "fail"
-            : assessmentTokenOverScoped || writerServiceTokens.length > 0 ? "warn" : "pass",
-      !tokensReadable
-        ? "Access tokens could not be read, so service token scoping could not be evaluated."
-        : serviceTokens.length === 0
-          ? "No service tokens are visible."
-          : serviceTokenIssues.length > 0
-            ? `Of ${serviceTokens.length} visible service tokens, ${serviceTokenIssues.join("; ")}.`
-            : `All ${serviceTokens.length} visible service tokens use Reader, custom role, or scoped inline policy permissions.`,
+      serviceTokens.length === 0
+        ? "pass"
+        : overScopedOtherServiceTokens.length > 0 || wildcardInlineTokens.length > 0
+          ? "fail"
+          : assessmentTokenOverScoped || writerServiceTokens.length > 0 ? "warn" : "pass",
+      serviceTokens.length === 0
+        ? "No service tokens are visible."
+        : serviceTokenIssues.length > 0
+          ? `Of ${serviceTokens.length} visible service tokens, ${serviceTokenIssues.join("; ")}.`
+          : `All ${serviceTokens.length} visible service tokens use Reader, custom role, or scoped inline policy permissions.`,
       {
-        service_tokens: serviceTokens.length,
-        owner_or_admin_service_tokens: sample(overScopedOtherServiceTokens.map(tokenLabel)),
-        assessment_service_token: assessmentServiceToken
+        service_tokens: whenRead(tokenCollection, serviceTokens.length),
+        owner_or_admin_service_tokens: observedList([tokenCollection], sample(overScopedOtherServiceTokens.map(tokenLabel))),
+        assessment_service_token: whenRead(tokenCollection, assessmentServiceToken
           ? { token: tokenLabel(assessmentServiceToken), role: tokenRole(assessmentServiceToken), over_scoped: assessmentTokenOverScoped }
-          : null,
-        writer_service_tokens: sample(writerServiceTokens.map(tokenLabel)),
-        wildcard_inline_policy_tokens: sample(wildcardInlineTokens.map(tokenLabel)),
+          : null),
+        writer_service_tokens: observedList([tokenCollection], sample(writerServiceTokens.map(tokenLabel))),
+        wildcard_inline_policy_tokens: observedList([tokenCollection], sample(wildcardInlineTokens.map(tokenLabel))),
       },
     ),
     tokenFinding(
       11,
-      !tokensReadable
-        ? "warn"
-        : membersGap && personalTokens.length > 0
-          ? "manual"
-          : orphanedPersonalTokens.length > 0
-            ? "fail"
-            : overScopedPersonalTokens.length > 0 || unverifiedPersonalTokens.length > 0 ? "warn" : "pass",
-      !tokensReadable
-        ? "Access tokens could not be read, so personal token scope could not be evaluated."
-        : membersGap && personalTokens.length > 0
-          ? `${personalTokens.length} visible personal tokens could not be reconciled against members because the member inventory was unreadable, so orphaned or over-scoped personal tokens cannot be ruled out.`
-          : orphanedPersonalTokens.length > 0
-            ? `${orphanedPersonalTokens.length} visible personal tokens are not tied to a current account member.`
-            : overScopedPersonalTokens.length > 0
-              ? `${overScopedPersonalTokens.length}/${personalTokens.length} visible personal tokens carry a base role above their member's own role; personal tokens must stay within the member's scope.`
-              : unverifiedPersonalTokens.length > 0
-                ? `${unverifiedPersonalTokens.length}/${personalTokens.length} visible personal tokens could not be matched to a member in the truncated member listing, so orphaned tokens cannot be ruled out.`
-                : personalTokens.length === 0
-                  ? "No personal tokens are visible."
-                  : `All ${personalTokens.length} visible personal tokens are tied to current members and stay within each member's base role scope.`,
+      membersGap && personalTokens.length > 0
+        ? "manual"
+        : orphanedPersonalTokens.length > 0
+          ? "fail"
+          : overScopedPersonalTokens.length > 0 || unverifiedPersonalTokens.length > 0 ? "warn" : "pass",
+      membersGap && personalTokens.length > 0
+        ? `${personalTokens.length} visible personal tokens could not be reconciled against members because the member inventory was unreadable, so orphaned or over-scoped personal tokens cannot be ruled out.`
+        : orphanedPersonalTokens.length > 0
+          ? `${orphanedPersonalTokens.length} visible personal tokens are not tied to a current account member.`
+          : overScopedPersonalTokens.length > 0
+            ? `${overScopedPersonalTokens.length}/${personalTokens.length} visible personal tokens carry a base role above their member's own role; personal tokens must stay within the member's scope.`
+            : unverifiedPersonalTokens.length > 0
+              ? `${unverifiedPersonalTokens.length}/${personalTokens.length} visible personal tokens could not be matched to a member in the truncated member listing, so orphaned tokens cannot be ruled out.`
+              : personalTokens.length === 0
+                ? "No personal tokens are visible."
+                : `All ${personalTokens.length} visible personal tokens are tied to current members and stay within each member's base role scope.`,
       {
-        personal_tokens: personalTokens.length,
-        orphaned_personal_tokens: sample(orphanedPersonalTokens.map(tokenLabel)),
-        unverified_personal_tokens: sample(unverifiedPersonalTokens.map(tokenLabel)),
-        over_scoped_personal_tokens: sample(overScopedPersonalTokens),
+        personal_tokens: whenRead(tokenCollection, personalTokens.length),
+        orphaned_personal_tokens: membersReconciled ? observedList([tokenCollection], sample(orphanedPersonalTokens.map(tokenLabel))) : null,
+        unverified_personal_tokens: tokensRead && membersRead ? sample(unverifiedPersonalTokens.map(tokenLabel)) : null,
+        over_scoped_personal_tokens: whenRead(memberCollection, observedList([tokenCollection, memberCollection], sample(overScopedPersonalTokens))),
       },
       memberNotes,
       presentGaps([membersGap]),
     ),
   ];
 
+  const collections = [roleCollection, tokenCollection, memberCollection];
   return {
     title: "LaunchDarkly access control",
     category: "access_control",
     summary: {
       base_url: config.baseUrl,
-      custom_roles: roles.length,
-      wildcard_roles: wildcardRoles.length,
-      sensitive_roles: sensitiveRoles.length,
-      tokens: tokens.length,
+      custom_roles: whenRead(roleCollection, roles.length),
+      wildcard_roles: observedCount([roleCollection], wildcardRoles.length),
+      sensitive_roles: observedCount([roleCollection], sensitiveRoles.length),
+      tokens: whenRead(tokenCollection, tokens.length),
       token_inventory_scope: inventory.scope,
-      service_tokens: serviceTokens.length,
-      personal_tokens: personalTokens.length,
-      tokens_without_expiry: tokensWithoutExpiry.length,
-      stale_tokens: staleTokens.length,
+      service_tokens: whenRead(tokenCollection, serviceTokens.length),
+      personal_tokens: whenRead(tokenCollection, personalTokens.length),
+      tokens_without_expiry: observedCount([tokenCollection], tokensWithoutExpiry.length),
+      stale_tokens: observedCount([tokenCollection], staleTokens.length),
+      orphaned_personal_tokens: membersReconciled ? observedCount([tokenCollection], orphanedPersonalTokens.length) : null,
       truncated_collections: roleNotes.length + tokenNotes.length + memberNotes.length,
+      truncation_unknown: collections.filter((collection) => !isRead(collection)).length + (callerRead.error === undefined ? 0 : 1),
+      unreadable_inventories: presentGaps([rolesGap, tokensGap, membersGap, callerGap]).length,
       evaluated_at: new Date(now).toISOString(),
     },
     findings,
     errors,
     snapshots: {
-      custom_roles: collectionSnapshot(roleCollection),
-      access_tokens: collectionSnapshot(tokenCollection),
+      custom_roles: collectionSnapshot(roleCollection, roleCollection.items, CUSTOM_ROLES_REQUEST),
+      access_tokens: collectionSnapshot(tokenCollection, tokenCollection.items, TOKENS_REQUEST),
     },
   };
 }
@@ -2504,13 +3002,24 @@ function environmentKeyOf(environment: JsonRecord): string {
 
 interface EnvironmentInventory {
   projects: LaunchdarklyCollection;
+  /** The project listing request the collector issued, as "GET /path[?query]". */
+  projectsRequest: string;
   environments: EnvironmentContext[];
-  environmentCollections: Array<{ projectKey: string; collection: LaunchdarklyCollection }>;
+  environmentCollections: Array<{ projectKey: string; collection: LaunchdarklyCollection; request: string }>;
   notes: LaunchdarklyTruncationNote[];
   /** Unreadable project or per-project environment listings (rule 1 corollary). */
   gaps: LaunchdarklyInventoryGap[];
   /** Project keys whose environment listing was unreadable. */
   unreadableProjects: string[];
+}
+
+/** The project listing request for a set of project keys, labelled the way the client labels the request it sends. */
+function projectsRequest(projectKeys: string[]): string {
+  return describeRequest("/api/v2/projects", { filter: projectKeys.length > 0 ? `keys:${projectKeys.join("|")}` : undefined });
+}
+
+function environmentsRequest(projectKey: string): string {
+  return describeRequest(`/api/v2/projects/${encodeURIComponent(projectKey)}/environments`);
 }
 
 async function collectEnvironmentContexts(
@@ -2533,7 +3042,7 @@ async function collectEnvironmentContexts(
       `environments:${projectKey}`,
       () => client.listEnvironments(projectKey, options.environmentLimit),
     );
-    environmentCollections.push({ projectKey, collection: projectEnvironments });
+    environmentCollections.push({ projectKey, collection: projectEnvironments, request: environmentsRequest(projectKey) });
     for (const environment of projectEnvironments.items) {
       const key = environmentKeyOf(environment);
       const name = asString(environment.name) ?? key;
@@ -2555,42 +3064,43 @@ async function collectEnvironmentContexts(
     ...environmentCollections.flatMap((entry) =>
       truncationNote("environments", "environment_limit", entry.collection, `project ${entry.projectKey}`)),
   ];
-  const unreadableProjects = environmentCollections.filter((entry) => entry.collection.error).map((entry) => entry.projectKey);
+  const unreadableProjects = environmentCollections.filter((entry) => !isRead(entry.collection)).map((entry) => entry.projectKey);
+  const request = projectsRequest(options.projectKeys);
   const gaps = presentGaps([
     inventoryGap(
       "projects",
-      "GET /api/v2/projects",
+      request,
       projects,
       "no project or environment could be evaluated",
       "Projects list with each project's environments from the LaunchDarkly UI",
     ),
     ...environmentCollections.map((entry) => inventoryGap(
       `environments for project ${entry.projectKey}`,
-      "GET /api/v2/projects/{projectKey}/environments",
+      entry.request,
       entry.collection,
       `the environments of project ${entry.projectKey} were not evaluated`,
       `Project ${entry.projectKey} > Environments: settings of every environment (critical, secure mode, approvals, TTL, confirm changes, require comments)`,
     )),
   ]);
-  return { projects, environments, environmentCollections, notes, gaps, unreadableProjects };
+  return { projects, projectsRequest: request, environments, environmentCollections, notes, gaps, unreadableProjects };
 }
 
-function environmentsSnapshot(inventory: EnvironmentInventory): JsonRecord {
-  const truncatedProjects = inventory.environmentCollections
-    .filter((entry) => entry.collection.truncated)
-    .map((entry) => entry.projectKey);
-  const totals = inventory.environmentCollections.map((entry) => entry.collection.total);
-  const total = totals.length > 0 && totals.every((value) => value !== undefined)
-    ? totals.reduce((sum, value) => sum + (value ?? 0), 0)
-    : null;
-  return {
-    truncated: truncatedProjects.length > 0,
-    seen: inventory.environments.length,
-    total,
-    truncated_projects: truncatedProjects,
-    unreadable_projects: inventory.unreadableProjects,
-    items: inventory.environments.map((context) => ({ project: context.projectKey, production: context.production, ...context.environment })),
-  };
+/**
+ * The core_data snapshot of the environment listings, one entry per project: a denied project's environments are a
+ * marker, not an empty list, and when the project listing itself was unreadable no environment listing was requested.
+ */
+function environmentsSnapshot(inventory: EnvironmentInventory): unknown {
+  return scopedSnapshots(
+    inventory.environmentCollections.map((entry) => ({
+      scope: { project: entry.projectKey },
+      collection: entry.collection,
+      items: inventory.environments
+        .filter((context) => context.projectKey === entry.projectKey)
+        .map((context) => ({ project: context.projectKey, production: context.production, ...context.environment })),
+      request: entry.request,
+    })),
+    isRead(inventory.projects),
+  );
 }
 
 function environmentLabel(context: EnvironmentContext): string {
@@ -2817,22 +3327,21 @@ export async function assessLaunchdarklyEnvironmentGovernance(
   });
   const projects = inventory.projects.items;
   const environments = inventory.environments;
-  const roleErrors: string[] = [];
-  const roleCollection = await collectList(roleErrors, "custom_roles", () => client.listCustomRoles(DEFAULT_ROLE_LIMIT));
-  errors.push(...roleErrors);
+  const roleCollection = await collectList(errors, "custom_roles", () => client.listCustomRoles(DEFAULT_ROLE_LIMIT));
   const roles = roleCollection.items;
-  const rolesReadable = roleErrors.length === 0;
+  const rolesReadable = isRead(roleCollection);
   const roleStatements = roles.map((role) => ({ key: roleKey(role), statements: parseStatements(role.policy) }));
 
   const productionEnvironments = environments.filter((context) => context.production);
+  const sdkKeysRequest = (context: EnvironmentContext) =>
+    describeRequest(`/api/v2/projects/${encodeURIComponent(context.projectKey)}/environments/${encodeURIComponent(context.key)}/sdk-keys`);
   const sdkKeyResults = await Promise.all(environments.map(async (context) => {
-    const sdkKeyErrors: string[] = [];
     const collection = await collectList(
-      sdkKeyErrors,
+      errors,
       `sdk_keys:${environmentLabel(context)}`,
       () => client.listSdkKeys(context.projectKey, context.key),
     );
-    return { context, keys: collection.items, collection, readable: sdkKeyErrors.length === 0, error: sdkKeyErrors[0] };
+    return { context, keys: collection.items, collection, readable: isRead(collection), request: sdkKeysRequest(context) };
   }));
   const unreadableSdkKeyEnvironments = sdkKeyResults.filter((result) => !result.readable);
 
@@ -2841,11 +3350,18 @@ export async function assessLaunchdarklyEnvironmentGovernance(
     truncationNote("sdk_keys", undefined, result.collection, `environment ${environmentLabel(result.context)}`));
   const rolesGap = inventoryGap(
     "custom_roles",
-    "GET /api/v2/roles",
+    CUSTOM_ROLES_REQUEST,
     roleCollection,
     "role statements that restrict production environments were not checked",
     "Organization settings > Roles: policy statements of every custom role (deny, notResources, or scoped allows on production environments)",
   );
+  const sdkKeyGaps = presentGaps(unreadableSdkKeyEnvironments.map((result) => inventoryGap(
+    `sdk_keys for environment ${environmentLabel(result.context)}`,
+    result.request,
+    result.collection,
+    `SDK key age in ${environmentLabel(result.context)} was not checked`,
+    "Organization settings > SDK keys: creation dates of active server-side SDK keys per production environment",
+  )));
   // With no readable environment at all the environment controls cannot be judged; with some readable, a warn caveat names the rest.
   const environmentGapStatus = environments.length === 0 ? "manual" : "warn";
   const environmentsUnreadable = inventory.gaps.length > 0 && environments.length === 0;
@@ -2855,8 +3371,18 @@ export async function assessLaunchdarklyEnvironmentGovernance(
     presentGaps([...inventory.gaps, rolesGap]),
     rolesGap ? "manual" : environmentGapStatus,
   );
-  const sdkKeyFinding = truncationAwareFinding([...inventory.notes, ...sdkKeyNotes], inventory.gaps, environmentGapStatus);
+  const sdkKeyFinding = truncationAwareFinding(
+    [...inventory.notes, ...sdkKeyNotes],
+    [...inventory.gaps, ...sdkKeyGaps],
+    unreadableSdkKeyEnvironments.length === sdkKeyResults.length ? "manual" : environmentGapStatus,
+  );
   const projectFinding = truncationAwareFinding(inventory.notes, presentGaps([inventory.gaps.find((gap) => gap.inventory === "projects")]), "manual");
+  // Every listing an environment verdict reads: the project listing and each project's environment listing.
+  const environmentCollections = [inventory.projects, ...inventory.environmentCollections.map((entry) => entry.collection)];
+  const sdkKeyCollections = sdkKeyResults.map((result) => result.collection);
+  const projectsRead = isRead(inventory.projects);
+  // An environment is named as unrestricted (no role statement scopes actions away from it) only from a complete role listing.
+  const rolesComplete = isComplete(roleCollection);
   const staleSdkKeys = sdkKeyResults.flatMap((result) => result.keys
     .filter((key) => (asString(key.kind) ?? "sdk").toLowerCase() === "sdk")
     .filter((key) => {
@@ -2935,15 +3461,17 @@ export async function assessLaunchdarklyEnvironmentGovernance(
               ? `${criticalOnlyProduction.length}/${productionEnvironments.length} production environments are marked critical, which only enables safeguards and UI prompts; no custom role denies, excludes, or scopes actions away from them (for example a deny on proj/*:env/*;{critical:true}:flag/*).`
               : `All ${productionEnvironments.length} production environments are restricted by custom role statements that deny, exclude, or scope actions away from them (${roles.length} custom roles evaluated).`,
       {
-        production_environments: sample(productionEnvironments.map(environmentLabel)),
-        restricted_production_environments: sample(restrictedProduction.map((entry) => ({
+        // The production set is known only when the project listing and every project's environment listing were read.
+        production_environments: whenAllRead(environmentCollections, sample(productionEnvironments.map(environmentLabel))),
+        // A restriction is a role statement observed to cover the environment; "none is restricted" needs every listing complete.
+        restricted_production_environments: whenRead(roleCollection, observedList([roleCollection, ...environmentCollections], sample(restrictedProduction.map((entry) => ({
           environment: environmentLabel(entry.context),
           critical: entry.critical,
           restrictions: sample(entry.restrictions.map(restrictionLabel)),
-        }))),
-        critical_only_production_environments: sample(criticalOnlyProduction.map((entry) => environmentLabel(entry.context))),
-        unrestricted_production_environments: sample(unrestrictedProduction.map(environmentLabel)),
-        custom_roles_evaluated: roles.length,
+        }))))),
+        critical_only_production_environments: rolesComplete ? observedList(environmentCollections, sample(criticalOnlyProduction.map((entry) => environmentLabel(entry.context)))) : null,
+        unrestricted_production_environments: rolesComplete ? observedList(environmentCollections, sample(unrestrictedProduction.map(environmentLabel))) : null,
+        custom_roles_evaluated: whenRead(roleCollection, roles.length),
       },
     ),
     environmentFinding(
@@ -2959,13 +3487,13 @@ export async function assessLaunchdarklyEnvironmentGovernance(
             ? `All production environments require approvals, but ${approvalsWeak.length} weaken the gate: ${approvalWeaknessKinds.map(approvalWeaknessLabel).join("; ")}.`
             : `All ${productionEnvironments.length} production environments require approvals on every flag, with no bypass, self review, or declined-change application.`,
       {
-        approvals_missing: sample(approvalsMissing.map(environmentLabel)),
-        approvals_weak: sample(approvalsWeak.map((entry) => ({
+        approvals_missing: observedList(environmentCollections, sample(approvalsMissing.map(environmentLabel))),
+        approvals_weak: observedList(environmentCollections, sample(approvalsWeak.map((entry) => ({
           environment: environmentLabel(entry.context),
           weaknesses: entry.approvals.weaknesses,
           settings: entry.approvals.settings,
-        }))),
-        production_environment_settings: sample(productionSummary),
+        })))),
+        production_environment_settings: whenAllRead(environmentCollections, sample(productionSummary)),
       },
     ),
     sdkKeyFinding(
@@ -2976,9 +3504,11 @@ export async function assessLaunchdarklyEnvironmentGovernance(
           ? "manual"
           : staleSdkKeys.length > 0 ? "fail" : unreadableSdkKeyEnvironments.length > 0 ? "warn" : "pass",
       environments.length === 0
-        ? "No environments were readable, so SDK key age could not be evaluated."
+        ? environmentsUnreadable
+          ? "SDK key age could not be evaluated because the project or environment inventory was unreadable."
+          : "No environments exist, so SDK key age could not be evaluated."
         : unreadableSdkKeyEnvironments.length === environments.length
-          ? `The beta SDK keys endpoint was not readable for any environment (${unreadableSdkKeyEnvironments[0]?.error ?? "unknown error"}). Review Organization settings > SDK keys for each production environment and record the creation date of every active server-side SDK key; rotate keys older than ${sdkKeyMaxAgeDays} days.`
+          ? `The beta SDK keys endpoint was not readable for any of the ${environments.length} environments. Review Organization settings > SDK keys for each production environment and record the creation date of every active server-side SDK key; rotate keys older than ${sdkKeyMaxAgeDays} days.`
           : staleSdkKeys.length > 0
             ? `${staleSdkKeys.length} server-side SDK keys are older than ${sdkKeyMaxAgeDays} days without a near term expiry.`
             : unreadableSdkKeyEnvironments.length > 0
@@ -2986,8 +3516,9 @@ export async function assessLaunchdarklyEnvironmentGovernance(
               : `All server-side SDK keys across ${environments.length} environments are within the ${sdkKeyMaxAgeDays} day rotation policy.`,
       {
         sdk_key_max_age_days: sdkKeyMaxAgeDays,
-        stale_sdk_keys: sample(staleSdkKeys),
-        unreadable_environments: sample(unreadableSdkKeyEnvironments.map((result) => environmentLabel(result.context))),
+        // A stale key is a real observation; "no stale key" needs every environment and key listing complete.
+        stale_sdk_keys: observedList([...environmentCollections, ...sdkKeyCollections], sample(staleSdkKeys)),
+        unreadable_environments: whenAllRead(environmentCollections, sample(unreadableSdkKeyEnvironments.map((result) => environmentLabel(result.context)))),
         manual_evidence: unreadableSdkKeyEnvironments.length > 0
           ? ["Organization settings > SDK keys: creation dates of active server-side SDK keys per production environment"]
           : [],
@@ -2995,15 +3526,17 @@ export async function assessLaunchdarklyEnvironmentGovernance(
     ),
     projectFinding(
       22,
-      projects.length === 0 ? (inventory.projects.error ? "manual" : "warn") : testProjects.length === 0 ? "pass" : "warn",
-      projects.length === 0
-        ? "No projects were readable."
-        : testProjects.length === 0
-          ? `None of the ${projects.length} projects look like test or temporary projects.`
-          : `${testProjects.length}/${projects.length} projects look like test or temporary projects; confirm they are intentional and not exposed to production SDK traffic.`,
+      !projectsRead ? "manual" : projects.length === 0 ? "warn" : testProjects.length === 0 ? "pass" : "warn",
+      !projectsRead
+        ? "Projects could not be read, so test or temporary projects could not be identified."
+        : projects.length === 0
+          ? "No projects were returned by the project listing."
+          : testProjects.length === 0
+            ? `None of the ${projects.length} projects look like test or temporary projects.`
+            : `${testProjects.length}/${projects.length} projects look like test or temporary projects; confirm they are intentional and not exposed to production SDK traffic.`,
       {
-        projects: projects.length,
-        test_like_projects: sample(testProjects.map((project) => asString(project.key) ?? asString(project.name) ?? "project")),
+        projects: whenRead(inventory.projects, projects.length),
+        test_like_projects: observedList([inventory.projects], sample(testProjects.map((project) => asString(project.key) ?? asString(project.name) ?? "project"))),
       },
     ),
     environmentFinding(
@@ -3019,44 +3552,45 @@ export async function assessLaunchdarklyEnvironmentGovernance(
             ? `Secure mode is enabled everywhere, but ${ttlZero.length} production environments use a zero default TTL and ${changeSafeguardsMissing.length} lack confirm changes or require comments.`
             : `All ${productionEnvironments.length} production environments enable secure mode, a non-zero default TTL, confirm changes, and required comments.`,
       {
-        production_environment_settings: sample(productionSummary),
-        secure_mode_missing: sample(secureModeMissing.map(environmentLabel)),
-        zero_ttl: sample(ttlZero.map(environmentLabel)),
-        change_safeguards_missing: sample(changeSafeguardsMissing.map(environmentLabel)),
+        production_environment_settings: whenAllRead(environmentCollections, sample(productionSummary)),
+        secure_mode_missing: observedList(environmentCollections, sample(secureModeMissing.map(environmentLabel))),
+        zero_ttl: observedList(environmentCollections, sample(ttlZero.map(environmentLabel))),
+        change_safeguards_missing: observedList(environmentCollections, sample(changeSafeguardsMissing.map(environmentLabel))),
       },
     ),
   ];
 
+  const collections = [...environmentCollections, roleCollection, ...sdkKeyCollections];
   return {
     title: "LaunchDarkly environment governance",
     category: "environment_governance",
     summary: {
       base_url: config.baseUrl,
-      projects: projects.length,
-      environments: environments.length,
-      production_environments: productionEnvironments.length,
-      restricted_production_environments: restrictedProduction.length,
-      critical_only_production_environments: criticalOnlyProduction.length,
-      unrestricted_production_environments: unrestrictedProduction.length,
-      approvals_missing: approvalsMissing.length,
-      approvals_weak: approvalsWeak.length,
-      stale_sdk_keys: staleSdkKeys.length,
-      test_like_projects: testProjects.length,
-      secure_mode_missing: secureModeMissing.length,
+      projects: whenRead(inventory.projects, projects.length),
+      environments: whenAllRead(environmentCollections, environments.length),
+      production_environments: whenAllRead(environmentCollections, productionEnvironments.length),
+      restricted_production_environments: whenRead(roleCollection, observedCount([roleCollection, ...environmentCollections], restrictedProduction.length)),
+      critical_only_production_environments: rolesComplete ? observedCount(environmentCollections, criticalOnlyProduction.length) : null,
+      unrestricted_production_environments: rolesComplete ? observedCount(environmentCollections, unrestrictedProduction.length) : null,
+      approvals_missing: observedCount(environmentCollections, approvalsMissing.length),
+      approvals_weak: observedCount(environmentCollections, approvalsWeak.length),
+      stale_sdk_keys: observedCount([...environmentCollections, ...sdkKeyCollections], staleSdkKeys.length),
+      test_like_projects: observedCount([inventory.projects], testProjects.length),
+      secure_mode_missing: observedCount(environmentCollections, secureModeMissing.length),
       truncated_collections: inventory.notes.length + roleNotes.length + sdkKeyNotes.length,
-      unreadable_inventories: inventory.gaps.length + (rolesGap ? 1 : 0) + unreadableSdkKeyEnvironments.length,
+      truncation_unknown: collections.filter((collection) => !isRead(collection)).length,
+      unreadable_inventories: inventory.gaps.length + (rolesGap ? 1 : 0) + sdkKeyGaps.length,
       evaluated_at: new Date(now).toISOString(),
     },
     findings,
     errors,
     snapshots: {
-      projects: collectionSnapshot(inventory.projects),
+      projects: collectionSnapshot(inventory.projects, inventory.projects.items, inventory.projectsRequest),
       environments: environmentsSnapshot(inventory),
-      sdk_keys: sdkKeyResults.map((result) => ({
-        environment: environmentLabel(result.context),
-        readable: result.readable,
-        ...collectionSnapshot(result.collection),
-      })),
+      sdk_keys: scopedSnapshots(
+        sdkKeyResults.map((result) => ({ scope: { environment: environmentLabel(result.context) }, collection: result.collection, request: result.request })),
+        environmentCollections.every(isRead),
+      ),
     },
   };
 }
@@ -3133,7 +3667,15 @@ export async function assessLaunchdarklyFlagHygiene(
   const environmentResults = await Promise.all(targetEnvironments.map(async (context) => {
     const flagCollection = await collectList(errors, `flags:${environmentLabel(context)}`, () => client.listFlags(context.projectKey, context.key, flagLimit));
     const statusCollection = await collectList(errors, `flag_statuses:${environmentLabel(context)}`, () => client.listFlagStatuses(context.projectKey, context.key));
-    return { context, flags: flagCollection.items, flagCollection, statuses: statusCollection.items, statusCollection };
+    return {
+      context,
+      flags: flagCollection.items,
+      flagCollection,
+      flagsRequest: describeRequest(`/api/v2/flags/${encodeURIComponent(context.projectKey)}`, { env: context.key, summary: "0" }),
+      statuses: statusCollection.items,
+      statusCollection,
+      statusesRequest: describeRequest(`/api/v2/flag-statuses/${encodeURIComponent(context.projectKey)}/${encodeURIComponent(context.key)}`),
+    };
   }));
   const flagNotes = environmentResults.flatMap((result) =>
     truncationNote("flags", "flag_limit", result.flagCollection, `environment ${environmentLabel(result.context)}`));
@@ -3141,20 +3683,24 @@ export async function assessLaunchdarklyFlagHygiene(
     truncationNote("flag_statuses", undefined, result.statusCollection, `environment ${environmentLabel(result.context)}`));
   const flagGaps = presentGaps(environmentResults.map((result) => inventoryGap(
     `flags for environment ${environmentLabel(result.context)}`,
-    "GET /api/v2/flags/{projectKey}?env={environmentKey}",
+    result.flagsRequest,
     result.flagCollection,
     `flags in ${environmentLabel(result.context)} were not evaluated`,
     `Project ${result.context.projectKey} > Flags (environment ${result.context.key}): targeting, prerequisites, and status of every flag`,
   )));
   const statusGaps = presentGaps(environmentResults.map((result) => inventoryGap(
     `flag_statuses for environment ${environmentLabel(result.context)}`,
-    "GET /api/v2/flag-statuses/{projectKey}/{environmentKey}",
+    result.statusesRequest,
     result.statusCollection,
     `flag evaluation status (inactive, last requested) in ${environmentLabel(result.context)} was not checked`,
     `Project ${result.context.projectKey} > Flags (environment ${result.context.key}): evaluation status and last requested date of every flag`,
   )));
-  const readableFlagEnvironments = environmentResults.filter((result) => !result.flagCollection.error);
-  const readableStatusEnvironments = environmentResults.filter((result) => !result.statusCollection.error);
+  const readableFlagEnvironments = environmentResults.filter((result) => isRead(result.flagCollection));
+  const readableStatusEnvironments = environmentResults.filter((result) => isRead(result.statusCollection));
+  // Every listing a flag verdict reads: the project listing, each project's environment listing, and the per-environment flag listings.
+  const environmentCollections = [inventory.projects, ...inventory.environmentCollections.map((entry) => entry.collection)];
+  const flagCollections = environmentResults.map((result) => result.flagCollection);
+  const statusCollections = environmentResults.map((result) => result.statusCollection);
   const flagsUnreadableEverywhere = environmentResults.length > 0 && readableFlagEnvironments.length === 0;
   const statusesUnreadableEverywhere = environmentResults.length > 0 && readableStatusEnvironments.length === 0;
   const flagGapStatus = inventory.environments.length === 0 || flagsUnreadableEverywhere ? "manual" : "warn";
@@ -3235,8 +3781,9 @@ export async function assessLaunchdarklyFlagHygiene(
             ? `None of the ${evaluatedFlags} evaluated flags use individual context targets in production environments.`
             : `${individuallyTargetedFlags.length} flags expose individual user or context keys through production targeting.`,
       {
-        production_environments: sample(productionTargets.map(environmentLabel)),
-        individually_targeted_flags: sample(individuallyTargetedFlags),
+        production_environments: whenAllRead(environmentCollections, sample(productionTargets.map(environmentLabel))),
+        // A targeted flag is a real observation; "no flag is targeted" needs every environment and flag listing complete.
+        individually_targeted_flags: observedList([...environmentCollections, ...flagCollections], sample(individuallyTargetedFlags)),
       },
     ),
     staleFlagFinding(
@@ -3257,7 +3804,7 @@ export async function assessLaunchdarklyFlagHygiene(
               : `${staleFlags.length} flags are inactive or have not been requested for more than ${staleFlagDays} days and should be reviewed for cleanup.`,
       {
         stale_flag_days: staleFlagDays,
-        stale_flags: sample(staleFlags),
+        stale_flags: observedList([...environmentCollections, ...flagCollections, ...statusCollections], sample(staleFlags)),
       },
     ),
     flagFinding(
@@ -3271,23 +3818,25 @@ export async function assessLaunchdarklyFlagHygiene(
             ? `No circular prerequisite chains were found across ${evaluatedFlags} evaluated flags.`
             : `${prerequisiteCycles.length} circular prerequisite chains were detected.`,
       {
-        prerequisite_cycles: sample(prerequisiteCycles),
+        prerequisite_cycles: observedList([...environmentCollections, ...flagCollections], sample(prerequisiteCycles)),
       },
     ),
   ];
 
+  const collections = [...environmentCollections, ...flagCollections, ...statusCollections];
   return {
     title: "LaunchDarkly flag hygiene",
     category: "flag_hygiene",
     summary: {
       base_url: config.baseUrl,
-      projects: projects.length,
-      evaluated_environments: targetEnvironments.length,
-      evaluated_flags: evaluatedFlags,
-      individually_targeted_flags: individuallyTargetedFlags.length,
-      stale_flags: staleFlags.length,
-      prerequisite_cycles: prerequisiteCycles.length,
+      projects: whenRead(inventory.projects, projects.length),
+      evaluated_environments: whenAllRead(environmentCollections, targetEnvironments.length),
+      evaluated_flags: whenAllRead([...environmentCollections, ...flagCollections], evaluatedFlags),
+      individually_targeted_flags: observedCount([...environmentCollections, ...flagCollections], individuallyTargetedFlags.length),
+      stale_flags: observedCount(collections, staleFlags.length),
+      prerequisite_cycles: observedCount([...environmentCollections, ...flagCollections], prerequisiteCycles.length),
       truncated_collections: inventory.notes.length + flagNotes.length + statusNotes.length,
+      truncation_unknown: collections.filter((collection) => !isRead(collection)).length,
       unreadable_inventories: inventory.gaps.length + flagGaps.length + statusGaps.length,
       evaluated_at: new Date(now).toISOString(),
     },
@@ -3295,11 +3844,23 @@ export async function assessLaunchdarklyFlagHygiene(
     errors,
     snapshots: {
       // Flags are projected to the fields the verdicts read; variation values and rule clauses are user data.
-      flags: environmentResults.map((result) => ({
-        environment: environmentLabel(result.context),
-        ...collectionSnapshot(result.flagCollection, result.flags.map(projectFlag)),
-      })),
-      flag_statuses: environmentResults.map((result) => ({ environment: environmentLabel(result.context), ...collectionSnapshot(result.statusCollection) })),
+      flags: scopedSnapshots(
+        environmentResults.map((result) => ({
+          scope: { environment: environmentLabel(result.context) },
+          collection: result.flagCollection,
+          items: result.flags.map(projectFlag),
+          request: result.flagsRequest,
+        })),
+        environmentCollections.every(isRead),
+      ),
+      flag_statuses: scopedSnapshots(
+        environmentResults.map((result) => ({
+          scope: { environment: environmentLabel(result.context) },
+          collection: result.statusCollection,
+          request: result.statusesRequest,
+        })),
+        environmentCollections.every(isRead),
+      ),
     },
   };
 }
@@ -3348,55 +3909,67 @@ export async function assessLaunchdarklyMonitoringIntegrations(
   const integrationKeys = uniqueStrings(options.integrationKeys && options.integrationKeys.length > 0 ? options.integrationKeys : DEFAULT_INTEGRATION_KEYS);
   const productionPattern = buildRegex(options.productionPattern, DEFAULT_PRODUCTION_PATTERN);
 
-  const auditErrors: string[] = [];
+  const retentionBefore = now - retentionDays * DAY_MS;
+  const auditRequest = (query: JsonRecord = {}) => describeRequest("/api/v2/auditlog", query);
+  const relayRequest = describeRequest("/api/v2/account/relay-auto-configs");
+  const webhooksRequest = describeRequest("/api/v2/webhooks");
   const [recentAuditCollection, retentionProbeCollection, memberAuditCollection, roleAuditCollection, relayCollection, webhookCollection] = await Promise.all([
-    collectList(auditErrors, "audit_log_recent", () => client.listAuditLogEntries({}, AUDIT_LOG_PAGE_SIZE)),
-    collectList(auditErrors, "audit_log_retention_probe", () => client.listAuditLogEntries({ before: now - retentionDays * DAY_MS }, 1)),
-    collectList(auditErrors, "audit_log_members", () => client.listAuditLogEntries({ spec: "member/*" }, AUDIT_LOG_PAGE_SIZE)),
-    collectList(auditErrors, "audit_log_roles", () => client.listAuditLogEntries({ spec: "role/*" }, AUDIT_LOG_PAGE_SIZE)),
+    collectList(errors, "audit_log_recent", () => client.listAuditLogEntries({}, AUDIT_LOG_PAGE_SIZE)),
+    collectList(errors, "audit_log_retention_probe", () => client.listAuditLogEntries({ before: retentionBefore }, 1)),
+    collectList(errors, "audit_log_members", () => client.listAuditLogEntries({ spec: "member/*" }, AUDIT_LOG_PAGE_SIZE)),
+    collectList(errors, "audit_log_roles", () => client.listAuditLogEntries({ spec: "role/*" }, AUDIT_LOG_PAGE_SIZE)),
     collectList(errors, "relay_proxy_configs", () => client.listRelayProxyConfigs()),
     collectList(errors, "webhooks", () => client.listWebhooks()),
   ]);
-  errors.push(...auditErrors);
   const recentAuditEntries = recentAuditCollection.items;
   const retentionProbe = retentionProbeCollection.items;
   const memberAuditEntries = memberAuditCollection.items;
   const roleAuditEntries = roleAuditCollection.items;
   const relayConfigs = relayCollection.items;
   const webhooks = webhookCollection.items;
-  const auditReadable = auditErrors.length < 4;
-  const webhooksReadable = webhookCollection.error === undefined;
+  const auditCollections = [recentAuditCollection, retentionProbeCollection, memberAuditCollection, roleAuditCollection];
+  const auditQueriesReadable = auditCollections.filter(isRead).length;
+  const auditReadable = auditQueriesReadable > 0;
+  const webhooksReadable = isRead(webhookCollection);
 
   const auditEvidence = "Audit log export (Organization settings > Audit log, or a SIEM export) covering the retention window";
-  const recentAuditGap = inventoryGap("audit_log_recent", "GET /api/v2/auditlog", recentAuditCollection, "the age of the newest retained entries was not checked", auditEvidence);
+  const recentAuditGap = inventoryGap("audit_log_recent", auditRequest(), recentAuditCollection, "the age of the newest retained entries was not checked", auditEvidence);
   const retentionProbeGap = inventoryGap(
     "audit_log_retention_probe",
-    `GET /api/v2/auditlog?before=<now - ${retentionDays} days>`,
+    auditRequest({ before: retentionBefore }),
     retentionProbeCollection,
     `entries older than ${retentionDays} days were not checked`,
     auditEvidence,
   );
-  const memberAuditGap = inventoryGap("audit_log_members", "GET /api/v2/auditlog?spec=member/*", memberAuditCollection, "member change entries were not checked", "Audit log filtered to member resources (createMember, deleteMember, updateRole)");
-  const roleAuditGap = inventoryGap("audit_log_roles", "GET /api/v2/auditlog?spec=role/*", roleAuditCollection, "custom role change entries were not checked", "Audit log filtered to role resources (createRole, updatePolicy, deleteRole)");
+  const memberAuditGap = inventoryGap("audit_log_members", auditRequest({ spec: "member/*" }), memberAuditCollection, "member change entries were not checked", "Audit log filtered to member resources (createMember, deleteMember, updateRole)");
+  const roleAuditGap = inventoryGap("audit_log_roles", auditRequest({ spec: "role/*" }), roleAuditCollection, "custom role change entries were not checked", "Audit log filtered to role resources (createRole, updatePolicy, deleteRole)");
   const relayGap = inventoryGap(
     "relay_proxy_configs",
-    "GET /api/v2/account/relay-auto-configs",
+    relayRequest,
     relayCollection,
     "Relay Proxy scope and rotation were not checked",
     "Account settings > Relay Proxy: scope policy and last rotation of every automatic configuration",
+  );
+  const webhooksGap = inventoryGap(
+    "webhooks",
+    webhooksRequest,
+    webhookCollection,
+    "webhook transport security was not checked",
+    "Integrations > Webhooks: URL scheme and signing secret of every webhook",
   );
   const webhookNotes = truncationNote("webhooks", undefined, webhookCollection);
   const relayNotes = truncationNote("relay_proxy_configs", undefined, relayCollection);
 
   const subscriptionResults = await Promise.all(integrationKeys.map(async (integrationKey) => {
     const collection = await collectList(errors, `integration_subscriptions:${integrationKey}`, () => client.listIntegrationSubscriptions(integrationKey));
-    return { integrationKey, subscriptions: collection.items, collection };
+    return { integrationKey, subscriptions: collection.items, collection, request: describeRequest(`/api/v2/integrations/${encodeURIComponent(integrationKey)}`) };
   }));
   const subscriptions = subscriptionResults.flatMap((result) =>
     result.subscriptions.map((subscription) => ({ integrationKey: result.integrationKey, subscription })));
+  const subscriptionCollections = subscriptionResults.map((result) => result.collection);
   const subscriptionGaps = presentGaps(subscriptionResults.map((result) => inventoryGap(
     `integration_subscriptions for ${result.integrationKey}`,
-    "GET /api/v2/integrations/{integrationKey}",
+    result.request,
     result.collection,
     `${result.integrationKey} audit log subscriptions were not checked`,
     `Organization settings > Integrations > ${result.integrationKey}: scope (projects, environments, actions) of every subscription`,
@@ -3432,7 +4005,8 @@ export async function assessLaunchdarklyMonitoringIntegrations(
     relayGap ? "manual" : "warn",
   );
   const subscriptionFinding = truncationAwareFinding(subscriptionNotes, subscriptionGaps, subscriptionsUnreadableEverywhere ? "manual" : "warn");
-  const webhookFinding = truncationAwareFinding(webhookNotes);
+  const webhookFinding = truncationAwareFinding(webhookNotes, presentGaps([webhooksGap]), "manual");
+  const relayCollections = [relayCollection, ...(relayInventory ? [relayInventory.projects, ...relayInventory.environmentCollections.map((entry) => entry.collection)] : [])];
 
   const oldestRecentEntry = recentAuditEntries
     .map((entry) => asTimestamp(entry.date))
@@ -3483,7 +4057,7 @@ export async function assessLaunchdarklyMonitoringIntegrations(
             ? "pass"
             : recentAuditGap ? "manual" : recentAuditEntries.length === 0 ? "fail" : "warn",
       !auditReadable
-        ? `The audit log could not be read (${auditErrors[0] ?? "unknown error"}), so retention cannot be demonstrated.`
+        ? `The audit log could not be read (${failedReadNote(recentAuditCollection, auditRequest())}), so retention cannot be demonstrated.`
         : retentionProbeGap
           ? `The retention probe for entries older than ${retentionDays} days could not be read, so retention cannot be demonstrated from the API.`
           : retentionProbe.length > 0
@@ -3495,9 +4069,9 @@ export async function assessLaunchdarklyMonitoringIntegrations(
                 : `No audit entries older than ${retentionDays} days were returned; the oldest recent entry is from ${isoDate(oldestRecentEntry) ?? "unknown"}. Confirm plan retention with LaunchDarkly or export the audit log to a SIEM for ${retentionDays}+ day retention.`,
       {
         retention_days: retentionDays,
-        entries_older_than_retention: retentionProbe.length,
-        oldest_recent_entry: isoDate(oldestRecentEntry),
-        recent_entries_sampled: recentAuditEntries.length,
+        entries_older_than_retention: whenRead(retentionProbeCollection, retentionProbe.length),
+        oldest_recent_entry: whenRead(recentAuditCollection, isoDate(oldestRecentEntry)),
+        recent_entries_sampled: whenRead(recentAuditCollection, recentAuditEntries.length),
       },
     ),
     criticalActionFinding(
@@ -3515,10 +4089,11 @@ export async function assessLaunchdarklyMonitoringIntegrations(
             ? `Audit log entries for ${memberAuditGap ? "role" : roleAuditGap ? "member" : "member and role"} resources are present with critical actions (${criticalActionsSeen.slice(0, 6).join(", ")}).`
             : `The audit log is readable, but no recent member or role change entries were returned (${memberAuditEntries.length} member entries, ${roleAuditEntries.length} role entries). Verify that role changes and member additions appear in the audit log during the next change window.`,
       {
-        member_entries: memberAuditEntries.length,
-        role_entries: roleAuditEntries.length,
-        critical_actions_seen: criticalActionsSeen,
-        recent_entry_kinds: uniqueStrings(recentAuditEntries.map((entry) => asString(entry.kind) ?? "unknown")),
+        member_entries: whenRead(memberAuditCollection, memberAuditEntries.length),
+        role_entries: whenRead(roleAuditCollection, roleAuditEntries.length),
+        // Actions seen are real observations; an empty list is asserted only from complete member and role queries.
+        critical_actions_seen: observedList([memberAuditCollection, roleAuditCollection], criticalActionsSeen),
+        recent_entry_kinds: whenRead(recentAuditCollection, uniqueStrings(recentAuditEntries.map((entry) => asString(entry.kind) ?? "unknown"))),
       },
     ),
     relayFinding(
@@ -3540,14 +4115,15 @@ export async function assessLaunchdarklyMonitoringIntegrations(
             ? `Relay Proxy configurations are scoped to specific environments with secure mode, but ${staleRelayConfigs.length} have not been rotated or modified in more than ${relayConfigMaxAgeDays} days.`
             : `All ${relayConfigs.length} Relay Proxy configurations are scoped to specific environments with secure mode enabled.`,
       {
-        relay_configs: relayConfigs.length,
-        broad_relay_configs: sample(broadRelayConfigs.map((item) => asString(item.relayConfig.name) ?? "relay")),
-        insecure_relay_environments: sample(insecureRelayEnvironments),
-        stale_relay_configs: sample(staleRelayConfigs.map((item) => ({
+        relay_configs: whenRead(relayCollection, relayConfigs.length),
+        broad_relay_configs: observedList([relayCollection], sample(broadRelayConfigs.map((item) => asString(item.relayConfig.name) ?? "relay"))),
+        // A referenced environment is named as insecure only from its own readable environment record; "none" needs every listing complete.
+        insecure_relay_environments: observedList(relayCollections, sample(insecureRelayEnvironments)),
+        stale_relay_configs: observedList([relayCollection], sample(staleRelayConfigs.map((item) => ({
           relay_config: asString(item.relayConfig.name) ?? "relay",
           last_modified: isoDate(asTimestamp(item.relayConfig.lastModified)),
-        }))),
-        manual_evidence: relayConfigs.length === 0
+        })))),
+        manual_evidence: isRead(relayCollection) && relayConfigs.length === 0
           ? ["Relay Proxy deployment configuration (environment allowlist, TLS termination, key rotation records)"]
           : [],
       },
@@ -3570,13 +4146,14 @@ export async function assessLaunchdarklyMonitoringIntegrations(
             : `All ${subscriptions.length} integration subscriptions are scoped to specific resources or actions.`,
       {
         probed_integration_keys: integrationKeys,
-        subscriptions: subscriptions.length,
-        broad_subscriptions: sample(broadSubscriptions.map((item) => ({
+        unreadable_integration_keys: subscriptionResults.filter((result) => !isRead(result.collection)).map((result) => result.integrationKey),
+        subscriptions: whenAllRead(subscriptionCollections, subscriptions.length),
+        broad_subscriptions: observedList(subscriptionCollections, sample(broadSubscriptions.map((item) => ({
           integration: item.integrationKey,
           name: asString(item.subscription.name) ?? asString(item.subscription._id),
           enabled: asBoolean(item.subscription.on) !== false,
-        }))),
-        manual_evidence: subscriptions.length === 0
+        })))),
+        manual_evidence: !subscriptionsUnreadableEverywhere && subscriptions.length === 0
           ? ["Organization settings > Integrations: scope of each configured integration"]
           : [],
       },
@@ -3584,12 +4161,12 @@ export async function assessLaunchdarklyMonitoringIntegrations(
     webhookFinding(
       21,
       !webhooksReadable
-        ? "warn"
+        ? "manual"
         : webhooks.length === 0
           ? "pass"
           : insecureEnabledWebhooks.length > 0 ? "fail" : insecureDisabledWebhooks.length > 0 ? "warn" : "pass",
       !webhooksReadable
-        ? `The webhooks endpoint could not be read (${webhookCollection.error}), so webhook transport security could not be evaluated.`
+        ? "The webhooks endpoint could not be read, so webhook transport security could not be evaluated."
         : webhooks.length === 0
           ? "No webhooks are configured."
           : insecureEnabledWebhooks.length > 0
@@ -3598,42 +4175,48 @@ export async function assessLaunchdarklyMonitoringIntegrations(
               ? `All enabled webhooks use HTTPS with signing, but ${insecureDisabledWebhooks.length} disabled webhooks would be insecure if re-enabled.`
               : `All ${webhooks.length} webhooks use HTTPS endpoints with a signing secret.`,
       {
-        webhooks: webhooks.length,
-        insecure_enabled_webhooks: sample(insecureEnabledWebhooks.map(webhookLabel)),
-        insecure_disabled_webhooks: sample(insecureDisabledWebhooks.map(webhookLabel)),
+        webhooks: whenRead(webhookCollection, webhooks.length),
+        insecure_enabled_webhooks: observedList([webhookCollection], sample(insecureEnabledWebhooks.map(webhookLabel))),
+        insecure_disabled_webhooks: observedList([webhookCollection], sample(insecureDisabledWebhooks.map(webhookLabel))),
       },
     ),
   ];
 
+  const collections = [...auditCollections, ...relayCollections, ...subscriptionCollections, webhookCollection];
   return {
     title: "LaunchDarkly monitoring and integrations",
     category: "monitoring_integrations",
     summary: {
       base_url: config.baseUrl,
-      audit_log_readable: auditReadable,
-      entries_older_than_retention: retentionProbe.length,
-      critical_actions_seen: criticalActionsSeen.length,
-      relay_configs: relayConfigs.length,
-      broad_relay_configs: broadRelayConfigs.length,
-      integration_subscriptions: subscriptions.length,
-      broad_subscriptions: broadSubscriptions.length,
-      webhooks: webhooks.length,
-      insecure_enabled_webhooks: insecureEnabledWebhooks.length,
+      audit_log_queries: auditCollections.length,
+      audit_log_queries_readable: auditQueriesReadable,
+      entries_older_than_retention: whenRead(retentionProbeCollection, retentionProbe.length),
+      critical_actions_seen: observedCount([memberAuditCollection, roleAuditCollection], criticalActionsSeen.length),
+      relay_configs: whenRead(relayCollection, relayConfigs.length),
+      broad_relay_configs: observedCount([relayCollection], broadRelayConfigs.length),
+      integration_subscriptions: whenAllRead(subscriptionCollections, subscriptions.length),
+      broad_subscriptions: observedCount(subscriptionCollections, broadSubscriptions.length),
+      webhooks: whenRead(webhookCollection, webhooks.length),
+      insecure_enabled_webhooks: observedCount([webhookCollection], insecureEnabledWebhooks.length),
       truncated_collections: webhookNotes.length + relayNotes.length + subscriptionNotes.length + (relayInventory?.notes.length ?? 0),
-      unreadable_inventories: presentGaps([recentAuditGap, retentionProbeGap, memberAuditGap, roleAuditGap, relayGap]).length
-        + subscriptionGaps.length + relayEnvironmentGaps.length + (webhooksReadable ? 0 : 1),
+      truncation_unknown: collections.filter((collection) => !isRead(collection)).length,
+      unreadable_inventories: presentGaps([recentAuditGap, retentionProbeGap, memberAuditGap, roleAuditGap, relayGap, webhooksGap]).length
+        + subscriptionGaps.length + relayEnvironmentGaps.length,
       evaluated_at: new Date(now).toISOString(),
     },
     findings,
     errors,
     snapshots: {
-      audit_log_recent: collectionSnapshot(recentAuditCollection),
-      audit_log_retention_probe: collectionSnapshot(retentionProbeCollection),
-      audit_log_members: collectionSnapshot(memberAuditCollection),
-      audit_log_roles: collectionSnapshot(roleAuditCollection),
-      relay_proxy_configs: collectionSnapshot(relayCollection),
-      integration_subscriptions: subscriptionResults.map((result) => ({ integrationKey: result.integrationKey, ...collectionSnapshot(result.collection) })),
-      webhooks: collectionSnapshot(webhookCollection),
+      audit_log_recent: collectionSnapshot(recentAuditCollection, recentAuditCollection.items, auditRequest()),
+      audit_log_retention_probe: collectionSnapshot(retentionProbeCollection, retentionProbeCollection.items, auditRequest({ before: retentionBefore })),
+      audit_log_members: collectionSnapshot(memberAuditCollection, memberAuditCollection.items, auditRequest({ spec: "member/*" })),
+      audit_log_roles: collectionSnapshot(roleAuditCollection, roleAuditCollection.items, auditRequest({ spec: "role/*" })),
+      relay_proxy_configs: collectionSnapshot(relayCollection, relayCollection.items, relayRequest),
+      integration_subscriptions: scopedSnapshots(
+        subscriptionResults.map((result) => ({ scope: { integrationKey: result.integrationKey }, collection: result.collection, request: result.request })),
+        true,
+      ),
+      webhooks: collectionSnapshot(webhookCollection, webhookCollection.items, webhooksRequest),
     },
   };
 }
@@ -3642,8 +4225,11 @@ function formatAccessCheckText(result: LaunchdarklyAccessCheckResult): string {
   const rows = result.surfaces.map((surface) => [
     surface.name,
     surface.status,
-    surface.count === undefined ? "-" : String(surface.count),
-    surface.error ? surface.error.replace(/\s+/g, " ").slice(0, 90) : "",
+    // A probe that did not complete established no count; "unread" keeps a denial from reading as zero.
+    surface.count === null ? (surface.collected ? "-" : "unread") : String(surface.count),
+    surface.endpoint ?? "-",
+    // The note is never cut: a truncated "GET /path" would name a request the run did not make.
+    surface.error ? surface.error.replace(/\s+/g, " ") : "",
   ]);
 
   return [
@@ -3651,7 +4237,7 @@ function formatAccessCheckText(result: LaunchdarklyAccessCheckResult): string {
     "",
     ...result.notes,
     "",
-    formatTable(["Surface", "Status", "Count", "Note"], rows),
+    formatTable(["Surface", "Status", "Count", "Request", "Note"], rows),
     "",
     `Next: ${result.recommendedNextStep}`,
   ].join("\n");
@@ -3832,7 +4418,11 @@ function buildQuickReference(): string {
     "# LaunchDarkly Audit Bundle Quick Reference",
     "",
     "- `core_data/` contains LaunchDarkly REST API v2 snapshots: credential-shaped keys (SDK, mobile, relay, and API keys, webhook and integration secrets) are written as [REDACTED], destination URLs are reduced to scheme plus host, and flags are projected to the fields the verdicts read.",
-    "- Each snapshot records `truncated`, `seen`, `total`, and `readable: false` with the error when the listing could not be collected.",
+    "- A listing that was read carries `collected: true`, the request it made as `endpoint`, `truncated`, `seen`, `total`, and `items` (an empty inventory stays `items: []`). A listing that was denied, errored, or timed out is a marker object, never an empty array: `collected: false`, the HTTP `status` observed (or `error`), the `endpoint` that failed, the scrubbed `error`, and `null` for every flag and count. A listing that was never requested because its parent inventory was unreadable is a `status: \"not-collected\"` marker. Listings collected per team, environment, or integration are arrays with one entry per scope, collapsing to a single marker when no scope could be read.",
+    "- `core_data/collection_status.json` records, per listing (`inventories[]`), whether the read completed, the request and HTTP status of a failed read, how the read ended (complete or truncated at a cap), how many records were loaded, and the server total when the API exposes one; every flag and count is `null` for a read that did not complete, and `totals` counts those reads as unknown rather than as complete or untruncated.",
+    "- Error strings in every file are scrubbed before they are recorded (LaunchDarkly key shapes, authorization and cookie values, credential-shaped key/value pairs, JWTs, and URL userinfo and query strings anywhere in the text); non-JSON error bodies are described by status, content type, and length, never echoed.",
+    "- Finding evidence, assessment summaries, and analysis snapshots render `null` (never 0, [], or \"none\") for any count, list, or flag derived from an inventory that was not read; lists of named members, tokens, roles, environments, or flags are populated only from inventories that were actually read, and an empty list is asserted only from complete reads.",
+    "- Every HTTP status code and `GET /path` named in a finding, summary, access check surface, or error string is the request the run actually made and the response it observed.",
     "- `analysis/` contains normalized findings plus one JSON summary per assessment category.",
     "- `compliance/` contains the executive summary, unified matrix, and per-framework reports (FedRAMP, CMMC, SOC 2, CIS, PCI-DSS, STIG, IRAP, ISMAP).",
     "- `_errors.log` appears only when some reads fail but the bundle still completes.",
@@ -3847,6 +4437,75 @@ function buildQuickReference(): string {
     "Access tokens are never written into the bundle.",
     "",
   ].join("\n");
+}
+
+const SNAPSHOT_SCOPE_KEYS = ["environment", "team", "project", "integrationKey"];
+
+interface LaunchdarklyCollectionStatusRow {
+  inventory: string;
+  scope: string | null;
+  endpoint: string | null;
+  status: "readable" | "not_readable" | "not_requested";
+  collected: boolean;
+  http_status: number | null;
+  error: string | null;
+  complete: boolean | null;
+  truncated: boolean | null;
+  seen: number | null;
+  total: number | null;
+}
+
+/** One collection_status row from a core_data snapshot or marker; every flag and count is null unless the read completed. */
+function collectionStatusRow(inventory: string, record: JsonRecord): LaunchdarklyCollectionStatusRow {
+  const collected = record.collected === true;
+  const scopeKey = SNAPSHOT_SCOPE_KEYS.find((key) => asString(record[key]) !== undefined);
+  return {
+    inventory,
+    scope: scopeKey ? asString(record[scopeKey]) ?? null : null,
+    endpoint: asString(record.endpoint) ?? null,
+    status: collected ? "readable" : record.reason === "not_requested" ? "not_requested" : "not_readable",
+    collected,
+    http_status: typeof record.status === "number" ? record.status : null,
+    error: asString(record.error) ?? null,
+    complete: collected ? asBoolean(record.truncated) !== true : null,
+    truncated: collected ? asBoolean(record.truncated) === true : null,
+    seen: collected ? asNumber(record.seen) ?? null : null,
+    total: collected ? asNumber(record.total) ?? null : null,
+  };
+}
+
+function collectionStatusRows(inventory: string, snapshot: unknown): LaunchdarklyCollectionStatusRow[] {
+  if (Array.isArray(snapshot)) {
+    return asRecordArray(snapshot).map((entry) => collectionStatusRow(inventory, entry));
+  }
+  const record = asObject(snapshot);
+  if (!record) return [];
+  // A collapsed per-scope marker carries every failed read; each is its own row so the request that failed is named.
+  if (Array.isArray(record.failed_reads)) return asRecordArray(record.failed_reads).map((entry) => collectionStatusRow(inventory, entry));
+  return [collectionStatusRow(inventory, record)];
+}
+
+/**
+ * core_data/collection_status.json: one row per listing the run requested (or skipped because its parent was
+ * unreadable), with the request and status observed. Reads that did not complete count as unknown in the totals,
+ * never as complete or untruncated.
+ */
+export function launchdarklyCollectionStatus(assessments: LaunchdarklyAssessmentResult[]): { inventories: LaunchdarklyCollectionStatusRow[]; totals: JsonRecord } {
+  const inventories = assessments.flatMap((assessment) =>
+    Object.entries(assessment.snapshots).flatMap(([name, snapshot]) => collectionStatusRows(name, snapshot)));
+  const readable = inventories.filter((row) => row.collected);
+  return {
+    inventories,
+    totals: {
+      inventories: inventories.length,
+      readable: readable.length,
+      not_readable: inventories.filter((row) => row.status === "not_readable").length,
+      not_requested: inventories.filter((row) => row.status === "not_requested").length,
+      complete: readable.filter((row) => row.complete === true).length,
+      truncated: readable.filter((row) => row.truncated === true).length,
+      truncation_unknown: inventories.length - readable.length,
+    },
+  };
 }
 
 const FRAMEWORK_REPORTS: Array<[LaunchdarklyFramework, string, string]> = [
@@ -3915,6 +4574,7 @@ export async function exportLaunchdarklyAuditBundle(
     controls_in_spec: 25,
   }));
   await writeSecureTextFile(outputDir, "core_data/access_check.json", serializeJson(redactCredentialValues(access)));
+  await writeSecureTextFile(outputDir, "core_data/collection_status.json", serializeJson(launchdarklyCollectionStatus(assessments)));
   for (const assessment of assessments) {
     // Collectors redact at the client; this pass is defense in depth so no credential-shaped value or token-bearing URL
     // from any collected object reaches the bundle even through a fake or future client.
