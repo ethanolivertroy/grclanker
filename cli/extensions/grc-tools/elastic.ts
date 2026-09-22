@@ -19,7 +19,7 @@ import { homedir } from "node:os";
 import { dirname, join, relative, resolve } from "node:path";
 import { ZipArchive } from "archiver";
 import { Type } from "@sinclair/typebox";
-import { parse as parseYaml, YAMLParseError } from "yaml";
+import { parse as parseYaml, YAMLError } from "yaml";
 import { errorResult, formatTable, textResult } from "./shared.js";
 
 type FetchImpl = typeof fetch;
@@ -786,49 +786,68 @@ function overlayKeys(source: JsonRecord, ...keys: string[]): unknown {
   return undefined;
 }
 
-const YAML_ERROR_CODE_PATTERN = /^[A-Z_]+$/;
-const ERRNO_CODE_PATTERN = /^E[A-Z]+$/;
+const ERRNO_CODE_PATTERN = /^E[A-Z0-9_]{1,30}$/;
 
 /**
- * Raised when a config file cannot be read or parsed. Config files carry credentials, so the message
- * is built only from the path, the parser's structured position, and a validated error code: the
- * parser's own message (which quotes the offending source line) and the file contents never appear.
+ * Raised when the config file cannot be read or parsed. The file carries credentials, so the message is fixed text
+ * built only from the path, an errno code validated against ERRNO_CODE_PATTERN, and a line number taken from the
+ * parser's structured position: neither the filesystem's nor the parser's own message (which quotes the offending
+ * source, and for an unresolved alias quotes the value with no key name) is ever interpolated.
  */
 export class ElasticConfigFileError extends Error {
   readonly path: string;
+  /** The errno code of a read failure, or INVALID_YAML for a parse failure. */
   readonly code: string;
+  /** The parser's structured line for a parse failure; undefined for a read failure or a non-parser throw. */
   readonly line: number | undefined;
-  readonly column: number | undefined;
 
-  constructor(path: string, code: string, position?: { line?: number; column?: number }) {
-    const where = position?.line !== undefined ? ` at line ${position.line}${position.column !== undefined ? `, column ${position.column}` : ""}` : "";
-    super(`Elastic config file ${path} could not be loaded (${code}${where}). The parser detail is withheld because config files carry credentials; fix or remove the file and retry.`);
+  constructor(step: "read" | "parse", path: string, code: string | undefined, line?: number) {
+    super(step === "read"
+      ? `Unable to read Elastic config file ${path}${code ? ` (${code})` : ""}`
+      : `Unable to parse Elastic config file: invalid YAML in ${path}${line !== undefined ? ` at line ${line}` : ""}`);
     this.name = "ElasticConfigFileError";
     this.path = path;
-    this.code = code;
-    this.line = position?.line;
-    this.column = position?.column;
+    this.code = code ?? "UNKNOWN";
+    this.line = line;
   }
 }
 
-function configFileError(location: string, error: unknown): ElasticConfigFileError {
-  if (error instanceof YAMLParseError) {
-    const code = YAML_ERROR_CODE_PATTERN.test(error.code) ? error.code : "INVALID_YAML";
-    const position = error.linePos?.[0];
-    return new ElasticConfigFileError(location, code, position ? { line: position.line, column: position.col } : undefined);
-  }
-  const errno = asString(asObject(error)?.code);
-  return new ElasticConfigFileError(location, errno && ERRNO_CODE_PATTERN.test(errno) ? errno : "INVALID_CONFIG");
+/** The errno code of a filesystem error, only when it has the strict E[A-Z0-9_] shape; anything else is dropped. */
+function errnoCode(error: unknown): string | undefined {
+  const code = asString(asObject(error)?.code);
+  return code && ERRNO_CODE_PATTERN.test(code) ? code : undefined;
 }
 
-function overlayFromConfigFile(location: string): ElasticConfigOverlay | undefined {
-  if (!existsSync(location)) return undefined;
-  let parsed: JsonRecord;
+/** The line a YAMLError points at; every other thrown value (for example the ReferenceError of an unresolved alias) has none. */
+function yamlErrorLine(error: unknown): number | undefined {
+  return error instanceof YAMLError ? error.linePos?.[0]?.line : undefined;
+}
+
+/** Read step of the config loader: any filesystem failure surfaces as fixed text with the validated errno code only. */
+function readConfigSource(location: string): string {
   try {
-    parsed = asObject(parseYaml(readFileSync(location, "utf8"))) ?? {};
+    return readFileSync(location, "utf8");
   } catch (error) {
-    throw configFileError(location, error);
+    throw new ElasticConfigFileError("read", location, errnoCode(error));
   }
+}
+
+/** Parse step of the config loader: every thrown value, parser error class or not, becomes fixed text with at most a line number. */
+function parseConfigYaml(location: string, source: string): unknown {
+  try {
+    return parseYaml(source);
+  } catch (error) {
+    throw new ElasticConfigFileError("parse", location, "INVALID_YAML", yamlErrorLine(error));
+  }
+}
+
+/**
+ * Loads the config file overlay. A missing default file is simply absent; a path named explicitly (argument or
+ * environment) that cannot be read is an error, so a typo in the path is not silently ignored.
+ */
+function overlayFromConfigFile(location: string, explicit: boolean): ElasticConfigOverlay | undefined {
+  if (!explicit && !existsSync(location)) return undefined;
+  const parsed = asObject(parseConfigYaml(location, readConfigSource(location))) ?? {};
   const elasticsearch = asObject(parsed.elasticsearch) ?? {};
   const kibana = asObject(parsed.kibana) ?? {};
   const cloud = asObject(parsed.cloud) ?? {};
@@ -919,7 +938,7 @@ export function resolveElasticConfiguration(
   const configPath = explicitConfigFile
     ? resolve(cwd, explicitConfigFile)
     : join(homeDir, DEFAULT_CONFIG_DIR, DEFAULT_CONFIG_FILE);
-  const fileOverlay = overlayFromConfigFile(configPath);
+  const fileOverlay = overlayFromConfigFile(configPath, explicitConfigFile !== undefined);
   if (fileOverlay && overlayHasValues(fileOverlay)) {
     merged = applyOverlay(merged, fileOverlay);
     sourceChain.push(explicitConfigFile ? `config:${explicitConfigFile}` : `config:~/${DEFAULT_CONFIG_DIR}/${DEFAULT_CONFIG_FILE}`);
