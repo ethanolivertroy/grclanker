@@ -104,7 +104,7 @@ grclanker env smoke-test
 grclanker env exec -- pwd
 ```
 
-`env list` prints every backend kind with its routing bucket (`host`, `sandboxed`, `gpu-burst`, `persistent-remote`), its readiness (`ready`, `not detected`, `needs configuration`, `not available`), and marks the preferred backend. Add `--json` for machine-readable output.
+`env list` prints every backend kind with its routing bucket (`host`, `sandboxed`, `gpu-burst`, `persistent-remote`), its readiness (`ready`, `not detected`, `needs configuration`, `not available`), and marks the preferred backend. Add `--json` for machine-readable output. Readiness for the remote kinds means credentials plus every local tool the adapter cannot work without: `modal` needs the `modal` CLI, and `runpod-pod` needs `ssh`, `scp`, and `git` (git lists the tracked files that get staged). `env list`, `env doctor`, `env smoke-test`, `setup`, and the live smoke selector all use the same check, and the message names the missing tool and why it is needed (for example ``Install `git`; git is required to stage tracked files (runpod-pod uploads the git index of the workspace).``).
 
 ## Pick a backend per run
 
@@ -397,7 +397,9 @@ Limits: no workspace upload, no snapshots, and artifact sync-back is limited to 
 
 State: shipped for pods you already created. grclanker never creates, stops, or deletes pods; it only reads pod metadata and works inside a per-session directory that it removes on teardown.
 
-Credentials: `RUNPOD_API_KEY` and `RUNPOD_POD_ID`, plus an SSH key that the pod accepts and local `ssh`, `scp`, and `git` clients.
+Credentials: `RUNPOD_API_KEY` and `RUNPOD_POD_ID`, plus an SSH key that the pod accepts.
+
+Prerequisites on the machine running grclanker: `ssh` (every command runs over SSH), `scp` (the staged workspace is uploaded with it), and `git` (the staged set is the git index, so `git ls-files` must run). `env list` and `env doctor` report the backend as `not detected` until all three are on PATH, naming the missing one, and the live smoke skips it for the same reason.
 
 Requests: `GET https://rest.runpod.io/v1/pods/{podId}` with `Authorization: Bearer <RUNPOD_API_KEY>`, reading `desiredStatus`, `publicIp`, and `portMappings["22"]` as documented at [Find a Pod by ID](https://docs.runpod.io/api-reference/pods/GET/pods/podId). RunPod marks REST API v1 as deprecated with retirement on 2026-11-15 ([API overview](https://docs.runpod.io/api-reference/overview)); the base URL lives in one constant so the v2 move is a one-line change.
 
@@ -422,7 +424,7 @@ State: stubs. Both kinds exist in settings and `env list`, but selecting them fa
 npm --prefix cli run test:compute-backends:live
 ```
 
-The script runs `env doctor`, then `env smoke-test --backend <kind>` for every non-host backend whose binaries or credentials are present (Docker daemon, `prlctl`, `modal` with `MODAL_TOKEN_*` or a `~/.modal.toml` profile, `RUNPOD_API_KEY` with `RUNPOD_ENDPOINT_ID` or `RUNPOD_POD_ID`). It exits 0 with a skip message when nothing is available. Set `GRCLANKER_LIVE_BACKENDS=docker,modal` to restrict the run, or include `sandbox-runtime` to exercise the local sandbox.
+The script runs `env doctor`, then `env smoke-test --backend <kind>` for every non-host backend that `env list` reports as available (Docker daemon, `prlctl`, `modal` with `MODAL_TOKEN_*` or a `~/.modal.toml` profile, `RUNPOD_API_KEY` with `RUNPOD_ENDPOINT_ID`, or `RUNPOD_API_KEY` with `RUNPOD_POD_ID` plus `ssh`, `scp`, and `git` on PATH); the selection is `selectLiveSmokeCandidates` in `cli/pi/env.ts`, the same readiness the list command uses. It exits 0 with a skip message when nothing is available. Set `GRCLANKER_LIVE_BACKENDS=docker,modal` to restrict the run, or include `sandbox-runtime` to exercise the local sandbox.
 
 ## Choose the right backend
 

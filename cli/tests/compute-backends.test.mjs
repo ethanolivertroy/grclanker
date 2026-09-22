@@ -8,8 +8,10 @@ import { fileURLToPath } from "node:url";
 
 import {
   COMPUTE_BACKEND_KINDS,
+  detectComputeBackendStatuses,
   getComputeBackendConfigurationIssues,
   getComputeBackendCredentialState,
+  getComputeBackendRequiredTools,
   getComputeBackendSurfaceLabel,
   getComputeProfileIssues,
   getDefaultComputeProfile,
@@ -66,6 +68,7 @@ import {
   ONE_SHOT_SMOKE_NOTE,
   runBackendSearchSmokeTest,
   runBackendToolSmokeTest,
+  selectLiveSmokeCandidates,
 } from "../dist/pi/env.js";
 import { createHostBackend, createSandboxRuntimeBackend } from "../dist/pi/backends/local.js";
 import {
@@ -555,6 +558,114 @@ test("env list reports every backend with kind, bucket, and readiness", () => {
     assert.match(text, /\* modal\s+gpu-burst\s+not detected/);
     assert.match(text, /runpod-pod\s+persistent-remote/);
   });
+});
+
+test("runpod-pod readiness requires git next to ssh and scp on every surface", async () => {
+  const GIT_ISSUE = "Install `git`; git is required to stage tracked files (runpod-pod uploads the git index of the workspace).";
+  const SSH_ISSUE = "Install an `ssh` client; grclanker executes inside RunPod pods over SSH.";
+  const SCP_ISSUE = "Install `scp` (part of the OpenSSH client); the staged workspace is uploaded to the pod with scp.";
+  const lookupFor = (present) => {
+    const seen = [];
+    return {
+      seen,
+      toolExists: (tool) => {
+        seen.push(tool);
+        return present.includes(tool);
+      },
+    };
+  };
+  await withEnv({
+    RUNPOD_API_KEY: "rpa_podkey_ABCDEFG",
+    RUNPOD_POD_ID: "pod42",
+    RUNPOD_ENDPOINT_ID: undefined,
+    MODAL_TOKEN_ID: undefined,
+    MODAL_TOKEN_SECRET: undefined,
+    MODAL_CONFIG_PATH: MISSING_MODAL_CONFIG_PATH,
+  }, async () => {
+    const settings = { computeBackend: "runpod-pod", computeProfile: "persistent-remote" };
+    assert.deepEqual(getComputeBackendRequiredTools("runpod-pod").map((requirement) => requirement.tool), ["ssh", "scp", "git"]);
+    assert.deepEqual(getComputeBackendRequiredTools("modal").map((requirement) => requirement.tool), ["modal"]);
+    assert.deepEqual(getComputeBackendRequiredTools("runpod-serverless"), []);
+
+    // ssh and scp present, git absent: the issues list, env list, env doctor's status, and the
+    // live smoke selector all report the backend as not ready and name git.
+    const noGit = lookupFor(["ssh", "scp"]);
+    assert.deepEqual(getComputeBackendConfigurationIssues(settings, "runpod-pod", { toolExists: noGit.toolExists }), [GIT_ISSUE]);
+    const statuses = detectComputeBackendStatuses({ toolExists: noGit.toolExists });
+    const pod = statuses.find((status) => status.kind === "runpod-pod");
+    assert.equal(pod.available, false);
+    assert.equal(pod.detail, "Found RUNPOD_API_KEY, RUNPOD_POD_ID in the environment. Install `git` to use this backend; git is required to stage tracked files (runpod-pod uploads the git index of the workspace).");
+    assert.ok(noGit.seen.includes("git") && noGit.seen.includes("ssh") && noGit.seen.includes("scp"));
+    assert.ok(noGit.seen.includes("docker"), "the docker lookup goes through the injected function too, so no real docker runs");
+    const entry = buildComputeBackendList(settings, statuses, { toolExists: noGit.toolExists }).find((listed) => listed.kind === "runpod-pod");
+    assert.equal(entry.readiness, "not detected");
+    assert.equal(entry.detail, GIT_ISSUE);
+    assert.deepEqual(selectLiveSmokeCandidates(statuses, ["runpod-pod"]), [], "the live smoke selector skips it");
+    assert.deepEqual(selectLiveSmokeCandidates(statuses), []);
+
+    // Each missing tool is named on its own, in the order ssh, scp, git.
+    assert.deepEqual(getComputeBackendConfigurationIssues(settings, "runpod-pod", { toolExists: lookupFor(["scp", "git"]).toolExists }), [SSH_ISSUE]);
+    assert.deepEqual(getComputeBackendConfigurationIssues(settings, "runpod-pod", { toolExists: lookupFor(["ssh", "git"]).toolExists }), [SCP_ISSUE]);
+    assert.deepEqual(getComputeBackendConfigurationIssues(settings, "runpod-pod", { toolExists: lookupFor([]).toolExists }), [SSH_ISSUE, SCP_ISSUE, GIT_ISSUE]);
+    const nothing = detectComputeBackendStatuses({ toolExists: lookupFor([]).toolExists }).find((status) => status.kind === "runpod-pod");
+    assert.equal(nothing.available, false);
+    assert.match(nothing.detail, /Install `ssh` to use this backend; .* Install `scp` to use this backend; .* Install `git` to use this backend; git is required to stage tracked files/);
+
+    // All three present: ready as before, and the smoke selector picks it.
+    const all = lookupFor(["ssh", "scp", "git"]);
+    assert.deepEqual(getComputeBackendConfigurationIssues(settings, "runpod-pod", { toolExists: all.toolExists }), []);
+    const readyStatuses = detectComputeBackendStatuses({ toolExists: all.toolExists });
+    const readyPod = readyStatuses.find((status) => status.kind === "runpod-pod");
+    assert.equal(readyPod.available, true);
+    assert.equal(readyPod.detail, "Found RUNPOD_API_KEY, RUNPOD_POD_ID in the environment. Found `ssh`, `scp`, `git` on PATH.");
+    assert.equal(buildComputeBackendList(settings, readyStatuses, { toolExists: all.toolExists }).find((listed) => listed.kind === "runpod-pod").readiness, "ready");
+    assert.deepEqual(selectLiveSmokeCandidates(readyStatuses, ["runpod-pod"]).map((status) => status.kind), ["runpod-pod"]);
+    assert.deepEqual(selectLiveSmokeCandidates(readyStatuses, ["runpod-pod", "modal"]).map((status) => status.kind), ["runpod-pod"], "modal has no credentials here");
+
+    // Tools present but credentials missing is still not ready (unchanged behavior).
+    await withEnv({ RUNPOD_POD_ID: undefined }, () => {
+      const noPod = detectComputeBackendStatuses({ toolExists: all.toolExists }).find((status) => status.kind === "runpod-pod");
+      assert.equal(noPod.available, false);
+      assert.match(noPod.detail, /^Set RUNPOD_POD_ID to use this backend\. Found `ssh`, `scp`, `git` on PATH\.$/);
+    });
+
+    // The modal CLI check goes through the same requirement list with its original wording.
+    assert.ok(getComputeBackendConfigurationIssues({ computeBackend: "modal" }, "modal", { toolExists: lookupFor([]).toolExists })
+      .includes("Install the modal CLI (`pip install modal`) and run `modal setup`; grclanker drives Modal through `modal shell`."));
+  });
+
+  // The live smoke script itself, with a PATH that holds `which`, `ssh`, and `scp` but no `git`:
+  // it selects nothing and exits 0 with the skip message instead of advertising runpod-pod.
+  const realWhich = spawnSync("which", ["which"], { encoding: "utf8" });
+  if (realWhich.status !== 0 || process.platform === "win32") return;
+  const stubBin = mkdtempSync(join(tmpdir(), "grclanker-live-smoke-path-"));
+  try {
+    writeFileSync(join(stubBin, "which"), `#!/bin/sh\nexec ${quoteForBash(realWhich.stdout.trim())} "$@"\n`);
+    for (const tool of ["which", "ssh", "scp"]) {
+      if (tool !== "which") writeFileSync(join(stubBin, tool), "#!/bin/sh\nexit 0\n");
+      chmodSync(join(stubBin, tool), 0o755);
+    }
+    const script = join(dirname(fileURLToPath(import.meta.url)), "..", "scripts", "compute-backends-live-smoke.mjs");
+    const run = spawnSync(process.execPath, [script], {
+      encoding: "utf8",
+      timeout: 60_000,
+      env: {
+        ...process.env,
+        PATH: stubBin,
+        GRCLANKER_LIVE_BACKENDS: "runpod-pod",
+        RUNPOD_API_KEY: "rpa_podkey_ABCDEFG",
+        RUNPOD_POD_ID: "pod42",
+        MODAL_TOKEN_ID: "",
+        MODAL_TOKEN_SECRET: "",
+        MODAL_CONFIG_PATH: MISSING_MODAL_CONFIG_PATH,
+      },
+    });
+    assert.equal(run.status, 0, `live smoke exited ${run.status}: ${run.stdout}${run.stderr}`);
+    assert.match(run.stdout, /^Skipping live compute backend smoke test: .*RUNPOD_API_KEY \+ RUNPOD_POD_ID with ssh, scp, and git on PATH/);
+    assert.ok(!run.stdout.includes("env smoke-test --backend runpod-pod"), "runpod-pod was not selected without git");
+  } finally {
+    rmSync(stubBin, { recursive: true, force: true });
+  }
 });
 
 test("runtime awaits remote teardown on the success path and the throw path", async () => {
