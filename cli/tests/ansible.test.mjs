@@ -61,7 +61,14 @@ import {
   parserMessageFor,
   parserSnippetBody,
 } from "./helpers/error-canaries.mjs";
-import { QUOTED_NON_CREDENTIAL_GROUP, assertFixedTextsSurvive, assertMustKeepRows, assertMustRedactRowsBesideMustKeep } from "./helpers/redaction-table.mjs";
+import {
+  QUOTED_NON_CREDENTIAL_GROUP,
+  assertCredentialPairValuesRemoved,
+  assertFixedTextsSurvive,
+  assertIdentifierKeyRows,
+  assertMustKeepRows,
+  assertMustRedactRowsBesideMustKeep,
+} from "./helpers/redaction-table.mjs";
 
 const NOW = new Date("2026-09-21T00:00:00.000Z");
 const SUPERUSER = { id: 1, username: "auditor", is_superuser: true, is_system_auditor: false };
@@ -1679,7 +1686,7 @@ test("rule 1 corollary: multi-inventory findings never pass when a secondary inv
   const cases = [
     { control: 12, assess: assessAnsibleHostCoverage, forbidden: "/api/v2/schedules/", names: /schedules could not be read/ },
     { control: 13, assess: assessAnsibleHostCoverage, forbidden: "/api/v2/job_templates/", names: /job templates list could not be read/ },
-    { control: 18, assess: assessAnsiblePlatformSecurity, forbidden: "/api/v2/credentials/", names: /Vault credential usage could not be read \(credentials: /, expected: "warn" },
+    { control: 18, assess: assessAnsiblePlatformSecurity, forbidden: "/api/v2/credentials/", names: /Vault credential usage could not be read \(credential records \(\/api\/v2\/credentials\/\): /, expected: "warn" },
     { control: 18, assess: assessAnsiblePlatformSecurity, forbidden: "/api/v2/inventories/", names: /variable sources \(inventories\) could not be read/, expected: "manual" },
     { control: 21, assess: assessAnsiblePlatformSecurity, forbidden: "/api/v2/organizations/1/admins/", names: /admins list of 1 organizations \(Default\) could not be read/, expected: "manual" },
     { control: 22, assess: assessAnsiblePlatformSecurity, forbidden: "/api/v2/inventories/", names: /inventories list could not be read/, expected: "warn", partialView: /^inventories: unreadable \(inventories \(\/api\/v2\/inventories\/\): / },
@@ -1975,6 +1982,33 @@ test("rule 9 must-keep and must-redact table (addendum 7): every endpoint path, 
   ];
   assertMustKeepRows(assert, redactErrorText, groups);
   assertMustRedactRowsBesideMustKeep(assert, redactErrorText, groups);
+});
+
+test("rule 9 credential-named pairs (reviewer D round 5 baseline): a value under a credential-named key is removed whatever its shape and length, unquoted as well as quoted, in every form the pair takes, while identifier-named keys keep their values unless the value's own shape removes it", () => {
+  assertCredentialPairValuesRemoved(assert, redactErrorText);
+  assertIdentifierKeyRows(assert, redactErrorText);
+  // The retired value-shape test would have kept every one of these; the pair rule no longer asks.
+  for (const [text, expected] of [
+    ["password=letmein", "password=[REDACTED]"],
+    ["DB_PASSWORD=Sunshine", "DB_PASSWORD=[REDACTED]"],
+    ["AZURE_CLIENT_SECRET: abc12", "AZURE_CLIENT_SECRET: [REDACTED]"],
+    ["DUO_SKEY=p@ss", "DUO_SKEY=[REDACTED]"],
+    ["Authorization: Basic letmein", "Authorization: Basic [REDACTED]"],
+    ["token: value shape", "token: [REDACTED] shape"],
+  ]) {
+    assert.equal(redactErrorText(text), expected, `credential-named pair: ${text}`);
+  }
+  // A PascalCase error code that ends in a credential word is prose, and a bare scheme word or a path segment is not a pair.
+  for (const text of [
+    "InvalidAuthenticationToken: Access token has expired. Basic authentication is disabled for this tenant.",
+    "ExpiredToken: The security token included in the request is expired",
+    "sent as Authorization: Bearer) or as X-Auth-Key",
+    "GET /_security/api_key: 403 Forbidden",
+    "POST /tenant/oauth2/v2.0/token: 401 Unauthorized",
+    "oauth: invalid_grant was returned",
+  ]) {
+    assert.equal(redactErrorText(text), text, `prose beside a credential word survives: ${text}`);
+  }
 });
 
 test("fixture self-check: every planted canary is alphanumeric and random-looking, and no 6-to-24-character window of any canary occurs in the healthy fixture's legitimate values, so a windowed leak assertion can fail only on a real echo", async () => {

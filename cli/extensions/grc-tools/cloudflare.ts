@@ -545,11 +545,20 @@ function scrubConfiguredSecrets(text: string): string {
   return scrubbed;
 }
 
-const ERROR_CREDENTIAL_KEY_PATTERN =
-  "[A-Za-z0-9_.-]*(?:token|secret|passw(?:or)?d|pwd|api[_-]?key|apikey|auth[_-]?key|auth[_-]?email|session(?:[_-]?id)?|sid|cookie|csrftoken|authorization|auth|signature|sig|nonce|credentials?|access[_-]?key|private[_-]?key|skey)";
-// key=value, key: value, and "key":"value" pairs whose key names a credential; the value's shape decides below.
+// The words that name a credential. A key ends in one of them; isCredentialNamedKey below decides how the word may
+// be attached to the rest of the key.
+const ERROR_CREDENTIAL_WORDS =
+  "token|secret|passw(?:or)?d|pwd|api[_-]?key|apikey|auth[_-]?key|auth[_-]?email|session(?:[_-]?id)?|sid|cookie|csrftoken|authorization|auth|signature|sig|nonce|credentials?|access[_-]?key|private[_-]?key|skey";
+const ERROR_CREDENTIAL_KEY_PATTERN = `[A-Za-z0-9_.-]*(?:${ERROR_CREDENTIAL_WORDS})`;
+/**
+ * key=value and key: value pairs whose key ends in a credential word (a key after "/" is a path segment, not a
+ * key). The value runs to whitespace, a quote, `&`, `;`, `,`, a closing bracket, an angle bracket, or a
+ * backslash (the compound-line rule), so a pair inside a query string, a header list, a JSON fragment, or a
+ * parenthesis keeps the text after it. A value that is already the marker is not a value, so a second pass over a
+ * scrubbed message changes nothing; scrubCredentialPairs decides whether the key names a credential.
+ */
 const ERROR_CREDENTIAL_PAIR_PATTERN = new RegExp(
-  `\\b(${ERROR_CREDENTIAL_KEY_PATTERN})(["']?\\s*[=:]\\s*["']?)((?:(?:Bearer|Basic|Digest|Token|ApiKey)\\s+)?[^\\s"'&;,<>]+)`,
+  `(?<!/)\\b(${ERROR_CREDENTIAL_KEY_PATTERN})(["']?\\s*[=:]\\s*["']?)((?:(?:Bearer|Basic|Digest|Token|ApiKey)\\s+)?(?!\\[REDACTED\\])[^\\s"'&;,<>)\\]}\\\\]+)`,
   "gi",
 );
 const TRAILING_PUNCTUATION_PATTERN = /[.!?:)]+$/;
@@ -573,26 +582,49 @@ const ERROR_QUOTED_CREDENTIAL_PATTERN = new RegExp(
   String.raw`\b(${ERROR_CREDENTIAL_KEY_PATTERN})((?:\\?["'])?\s*[=:]\s*(?:${ERROR_SCHEME_PATTERN}\s*)?)${ERROR_QUOTED_VALUE_PATTERN}`,
   "gi",
 );
-// A scheme word that is itself quoted (`"Token":"..."`, a JSON key) is a pair the rule above already handled.
-const ERROR_QUOTED_SCHEME_PATTERN = new RegExp(String.raw`(?<!["'\\])\b(${ERROR_SCHEME_PATTERN})(\s*)${ERROR_QUOTED_VALUE_PATTERN}`, "gi");
+// A scheme word that is itself quoted (`"Token":"..."`, a JSON key) or ends a compound key (`"x-api-key":`,
+// `"settings.token":`) is a pair the rule above already handled.
+const ERROR_QUOTED_SCHEME_PATTERN = new RegExp(String.raw`(?<!["'\\./-])\b(${ERROR_SCHEME_PATTERN})(\s*)${ERROR_QUOTED_VALUE_PATTERN}`, "gi");
 const QUOTED_VALUE_REPLACEMENT = `$1$2$3${REDACTED_ERROR_VALUE}$5`;
 
+const CREDENTIAL_KEY_WORD_PATTERN = new RegExp(`(?:${ERROR_CREDENTIAL_WORDS})$`, "i");
+// Credential words that end too many ordinary words to count when glued to a lowercase prefix (`oauth`, `ssid`).
+const WEAK_CREDENTIAL_WORD_PATTERN = /^(?:auth|sid|sig)$/i;
+const PAIR_VALUE_SCHEME_PATTERN = /^(?:Bearer|Basic|Digest|Token|ApiKey)\s+/i;
+const BARE_SCHEME_WORD_PATTERN = /^(?:Bearer|Basic|Digest|Token|ApiKey)$/i;
+
 /**
- * A value after a credential-named key is the credential (whatever its shape) when it is at least six
- * characters and is twelve or longer, carries a digit or a character that is not a letter, or changes case
- * inside the word. Short plain words after a colon ("InvalidAuthenticationToken: Access token has expired")
- * are prose and stay.
+ * Whether a key names a credential (reviewer D round 5 baseline). It does when it is a credential word
+ * (`password`, `Token`, `skey`), sets one off with `_`, `-`, or `.` (`DB_PASSWORD`, `AZURE_CLIENT_SECRET`,
+ * `x-api-key`, `Proxy-Authorization`), or is a lowerCamelCase, lowercase, or uppercase compound ending in one
+ * (`accessToken`, `clientSecret`, `dbpassword`, `ACCESSTOKEN`). A PascalCase identifier that merely ends in the
+ * word (`InvalidAuthenticationToken`, `ExpiredToken`) is an error code or a type name, and the text after its
+ * colon is prose. A key that names an identifier (`AWS_ACCESS_KEY_ID`, `AZURE_TENANT_ID`, `CLOUDFLARE_EMAIL`)
+ * never ends in a credential word, so its value is judged by its own shape alone.
  */
-function looksLikeCredentialValue(value: string): boolean {
-  return value.length >= 6 && (value.length >= 12 || /\d/.test(value) || /[^A-Za-z]/.test(value) || /[a-z][A-Z]/.test(value));
+function isCredentialNamedKey(key: string): boolean {
+  const word = CREDENTIAL_KEY_WORD_PATTERN.exec(key)?.[0];
+  if (word === undefined) return false;
+  const prefix = key.slice(0, key.length - word.length);
+  if (prefix.length === 0 || /[_.-]$/.test(prefix)) return true;
+  if (/^[A-Z]/.test(prefix) && /[a-z]/.test(prefix)) return false;
+  return !WEAK_CREDENTIAL_WORD_PATTERN.test(word);
 }
 
+/**
+ * The value of a pair whose key names a credential is the credential and is removed whatever its shape and
+ * length (reviewer D round 5 baseline): `password=letmein`, `DB_PASSWORD=Sunshine`, `AZURE_CLIENT_SECRET: abc12`,
+ * and `DUO_SKEY=p@ss` go the way `{"password":"letmein"}` already did. The key, the separator, a scheme word in
+ * front of the value, and the sentence punctuation after it stay; a scheme word standing alone ("sent as
+ * Authorization: Bearer") names the scheme and carries nothing.
+ */
 function scrubCredentialPairs(text: string): string {
   return text.replace(ERROR_CREDENTIAL_PAIR_PATTERN, (match: string, key: string, separator: string, value: string) => {
-    // A value the scheme rule already replaced ("Authorization: Bearer [REDACTED]") keeps its scheme name.
-    if (value.includes(REDACTED_ERROR_VALUE)) return match;
-    const core = value.replace(TRAILING_PUNCTUATION_PATTERN, "");
-    return looksLikeCredentialValue(core) ? `${key}${separator}${REDACTED_ERROR_VALUE}${value.slice(core.length)}` : match;
+    if (!isCredentialNamedKey(key)) return match;
+    const scheme = PAIR_VALUE_SCHEME_PATTERN.exec(value)?.[0] ?? "";
+    const core = value.slice(scheme.length).replace(TRAILING_PUNCTUATION_PATTERN, "");
+    if (core.length === 0 || BARE_SCHEME_WORD_PATTERN.test(core)) return match;
+    return `${key}${separator}${scheme}${REDACTED_ERROR_VALUE}${value.slice(scheme.length + core.length)}`;
   });
 }
 
@@ -675,7 +707,9 @@ const ERROR_URL_PATTERN = /\b(https?:\/\/)(?:[^\s/@"'<>]+@)?([^\s?#"'<>]+)(\?[^\
  * whitespace end a run, so path segments, hostnames, ARNs, and emails are judged piece by piece. Opaque
  * identifiers whose shape is a token's are removed from error text as well; they travel in structured fields.
  */
-const LONG_TOKEN_RUN_PATTERN = /[A-Za-z0-9+_-]{16,}(?:={1,2}(?![A-Za-z0-9&]))?/g;
+// Trailing "=" is base64 padding only when a delimiter follows it; before a marker (`API_KEY=[REDACTED]`) or a path
+// (`AWS_SHARED_CREDENTIALS_FILE=/home/audit/.aws/credentials`) it is the pair's separator, so the key keeps its name.
+const LONG_TOKEN_RUN_PATTERN = /[A-Za-z0-9+_-]{16,}(?:={1,2}(?![A-Za-z0-9&[/]))?/g;
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const UPPERCASE_CODE_PATTERN = /^[A-Z][A-Z_]*$|^[A-Z][A-Z0-9]*(?:[_-][A-Z0-9]+)+$/;
 const MIN_LETTERS_FOR_CASING = 6;
