@@ -73,6 +73,42 @@ function forbiddenResponse() {
   return jsonResponse({ error: { message: "Insufficient rights to query records", detail: "Field(s) present in the query do not have permission to be read" }, status: "failure" }, { status: 403 });
 }
 
+const SNOW_CANARY = {
+  bearer: "SNOWCANARY-BEARER-TOKEN-9f8e7d6c",
+  session: "SNOWCANARY-SESSION-COOKIE-1a2b3c4d",
+  apiKey: "SNOWCANARY-API-KEY-55667788",
+  urlToken: "SNOWCANARY-URL-TOKEN-deadbeef",
+  password: "SNOWCANARY-BASIC-PASSWORD-0001",
+  clientSecret: "SNOWCANARY-CLIENT-SECRET-0001",
+  accessToken: "snowcanary-oauth-access-token-0001",
+};
+const SNOW_CANARY_URL = `https://api.example.com/v1/x?token=${SNOW_CANARY.urlToken}`;
+
+/**
+ * `fail` serves one table (Table API and Aggregate API) or one path with a body that must never be
+ * echoed: html is a 502 proxy page carrying the canaries; json is a 403 ServiceNow error object whose
+ * documented message and detail fields embed the canary URL mid-sentence and a bearer value.
+ */
+function snowCanaryResponse(flavor) {
+  if (flavor === "html") {
+    const page = [
+      "<html><head><title>502 Bad Gateway</title></head><body>",
+      `<p>The upstream request carried Authorization: Bearer ${SNOW_CANARY.bearer} and Set-Cookie: JSESSIONID=${SNOW_CANARY.session}.</p>`,
+      `<p>Retry with x-api-key: ${SNOW_CANARY.apiKey}; the incident is tracked at ${SNOW_CANARY_URL} until resolved.</p>`,
+      "</body></html>",
+    ].join("");
+    return new Response(page, { status: 502, statusText: "Bad Gateway", headers: { "content-type": "text/html; charset=utf-8" } });
+  }
+  return jsonResponse({
+    error: {
+      message: `Insufficient rights; the request was logged at ${SNOW_CANARY_URL} for review`,
+      detail: `Presented Authorization: Bearer ${SNOW_CANARY.bearer}; see ${SNOW_CANARY_URL} for the ACL decision`,
+    },
+    error_description: `Token exchange refused; retry at ${SNOW_CANARY_URL}`,
+    status: "failure",
+  }, { status: 403 });
+}
+
 function parseConditionGroups(query) {
   if (!query) return [];
   const groups = [];
@@ -141,6 +177,12 @@ function fixtureFetch(fixture, options = {}) {
     const tableMatch = url.pathname.match(/^\/api\/now\/table\/([^/]+)$/);
     const statsMatch = url.pathname.match(/^\/api\/now\/stats\/([^/]+)$/);
     const table = tableMatch?.[1] ?? statsMatch?.[1];
+    if (options.fail && ((options.fail.table !== undefined && table === options.fail.table) || (options.fail.path !== undefined && url.pathname === options.fail.path))) {
+      return respond(snowCanaryResponse(options.fail.flavor));
+    }
+    if (options.oauthToken && url.pathname === "/oauth_token.do") {
+      return respond(jsonResponse({ access_token: options.oauthToken, expires_in: 1799, token_type: "Bearer" }));
+    }
     if (options.forbidAll || (table && forbidden.has(table))) return respond(forbiddenResponse());
     if (statsMatch && forbiddenCounts.has(table)) return respond(forbiddenResponse());
     if (tableMatch && forbiddenQueries.some((rule) => rule.table === table && (url.searchParams.get("sysparm_query") ?? "").includes(rule.queryIncludes))) {
@@ -2047,4 +2089,117 @@ test("review round item 13: absence-driven fails on a partial ACL, plugin, or pr
   const completeProperties = await assessServicenowIdentityAccess(createClient(fixtureFetch(withoutMfaProperty).fetchImpl));
   assert.equal(findingsById(completeProperties).get("SNOW-07").status, "fail");
   assert.match(findingsById(completeProperties).get("SNOW-07").summary, /has no sys_properties row; the documented default is false/);
+});
+
+function assertSnowCanariesAbsent(text, context) {
+  for (const [name, value] of Object.entries(SNOW_CANARY)) {
+    assert.ok(!text.includes(value), `${context}: canary ${name} (${value}) leaked`);
+  }
+  assert.ok(!text.includes("token=SNOWCANARY"), `${context}: the canary URL query survived`);
+  assert.ok(!text.includes("<html>"), `${context}: an HTML body was echoed`);
+}
+
+/** Every table the healthy run reads through the Table API or the Aggregate API, in first-request order. */
+async function snowCanaryTables() {
+  const { fetchImpl, requests } = fixtureFetch(healthyFixture());
+  const client = createClient(fetchImpl);
+  await checkServicenowAccess(client);
+  await exportServicenowAuditBundle(client, sampleConfig(), createTempBase("grclanker-snow-surfaces-"));
+  const tables = [];
+  for (const request of requests) {
+    const table = request.path.match(/^\/api\/now\/(?:table|stats)\/([^/]+)$/)?.[1];
+    if (table && !tables.includes(table)) tables.push(table);
+  }
+  return tables;
+}
+
+/**
+ * Runs the access check, all four assessments, and the export against a fixture where one surface
+ * answers with the canary body, and asserts no canary reaches any result, bundle file, or zip entry,
+ * and that every error string naming the failing surface carries the status-and-length note (html)
+ * or the redacted URL (json).
+ */
+async function snowCanaryRun(configOverrides, fail, fixtureOptions = {}) {
+  const base = createTempBase("grclanker-snow-canary-");
+  const { fetchImpl, requests } = fixtureFetch(healthyFixture(), { ...fixtureOptions, fail });
+  const config = sampleConfig(configOverrides);
+  const client = new ServicenowApiClient(config, { fetchImpl, sleep: async () => {}, now: () => FIXED_NOW });
+  const context = `${fail.table ?? fail.path} (${fail.flavor})`;
+  const access = await checkServicenowAccess(client);
+  const assessments = await Promise.all([
+    assessServicenowIdentityAccess(client),
+    assessServicenowPlatformHardening(client),
+    assessServicenowAccessControl(client),
+    assessServicenowOperationsGovernance(client),
+  ]);
+  const result = await exportServicenowAuditBundle(client, config, base);
+  const files = readBundleFiles(result.outputDir);
+  const zipEntries = readZipEntries(result.zipPath);
+  const failingPaths = fail.table ? [`/api/now/table/${fail.table}`, `/api/now/stats/${fail.table}`] : [fail.path];
+  assert.ok(requests.some((request) => failingPaths.includes(request.path)), `${context}: the failing surface was requested`);
+
+  assertSnowCanariesAbsent(JSON.stringify(access), `${context} check_access`);
+  assertSnowCanariesAbsent(JSON.stringify(assessments), `${context} assessments`);
+  for (const [name, content] of files) assertSnowCanariesAbsent(content, `${context} bundle ${name}`);
+  for (const [name, content] of zipEntries) assertSnowCanariesAbsent(content, `${context} zip ${name}`);
+
+  const errorStrings = [
+    ...access.surfaces.map((surface) => surface.error).filter(Boolean),
+    ...access.notes.filter((note) => /identity lookup failed/.test(note)),
+    ...assessments.flatMap((assessment) => assessment.errors),
+    ...(files.get("_errors.log") ?? "").split("\n").filter(Boolean),
+  ].filter((text) => failingPaths.some((path) => text.includes(path)));
+  assert.ok(errorStrings.length > 0, `${context}: the failing surface must be recorded by the access check, an assessment, or the export`);
+  for (const errorString of errorStrings) {
+    if (fail.flavor === "html") {
+      assert.match(errorString, /\(502 Bad Gateway\) for \/[^\s:]+: non-JSON body \(text\/html, \d+ bytes\)/, `${context}: ${errorString}`);
+    } else {
+      assert.match(errorString, /\(403 Forbidden\) for \/[^\s:]+: [^\n]*https:\/\/api\.example\.com\/v1\/x\?\[REDACTED\]/, `${context}: ${errorString}`);
+      assert.ok(!errorString.includes("token="), `${context}: ${errorString}`);
+      assert.ok(!errorString.includes("Bearer SNOWCANARY"), `${context}: ${errorString}`);
+    }
+  }
+  return { access, assessments, files, requests };
+}
+
+test("addendum 4: on every ServiceNow table a 502 HTML body or a JSON error embedding a credential URL never reaches results or the bundle, and the recorded error carries a status-and-length note or the redacted URL", async () => {
+  const tables = await snowCanaryTables();
+  assert.ok(tables.length >= 15, `the healthy run reads ${tables.length} tables`);
+  assert.ok(tables.includes("sys_user") && tables.includes("sys_properties") && tables.includes("sys_plugins") && tables.includes("sys_security_acl"));
+  let runs = 0;
+  for (const table of tables) {
+    for (const flavor of ["html", "json"]) {
+      const run = await snowCanaryRun({ password: SNOW_CANARY.password }, { table, flavor });
+      if (table === "sys_user") {
+        const identityNote = run.access.notes.find((note) => /identity lookup failed/.test(note));
+        assert.match(identityNote, flavor === "html" ? /non-JSON body \(text\/html, \d+ bytes\)/ : /\?\[REDACTED\]/);
+      }
+      runs += 1;
+    }
+  }
+  assert.equal(runs, tables.length * 2);
+});
+
+test("addendum 4: an OAuth token endpoint that answers with a 502 HTML page or a JSON error embedding a credential URL never echoes the body, and the obtained bearer token is redacted from every later error string", async () => {
+  const oauth = { authMode: "oauth", username: undefined, password: undefined, clientId: "client-id", clientSecret: SNOW_CANARY.clientSecret };
+  for (const flavor of ["html", "json"]) {
+    const run = await snowCanaryRun(oauth, { path: "/oauth_token.do", flavor });
+    for (const surface of run.access.surfaces) {
+      assert.equal(surface.status, flavor === "html" ? "not_readable" : "forbidden");
+      assert.equal(surface.http_status, flavor === "html" ? 502 : 403);
+      assert.match(surface.error, /^ServiceNow OAuth token request failed \((502 Bad Gateway|403 Forbidden)\) for \/oauth_token\.do: /);
+    }
+    assert.ok(run.requests.every((request) => request.path === "/oauth_token.do"), `${flavor}: no Table API request is issued without a bearer token`);
+  }
+
+  // With the token endpoint healthy, the bearer it returns is remembered and redacted from a later error,
+  // and the configured client secret never appears either.
+  const { fetchImpl } = fixtureFetch(healthyFixture(), { oauthToken: SNOW_CANARY.accessToken, fail: { table: "sys_user", flavor: "json" } });
+  const client = new ServicenowApiClient(sampleConfig(oauth), { fetchImpl, sleep: async () => {}, now: () => FIXED_NOW });
+  const snapshot = await client.queryTable("sys_user", { fields: ["sys_id"] });
+  assert.equal(snapshot.statusCode, 403);
+  assertSnowCanariesAbsent(snapshot.error, "post-exchange error");
+  assert.equal(client.redact(`Authorization: Bearer ${SNOW_CANARY.accessToken}; client_secret=${SNOW_CANARY.clientSecret}; ${SNOW_CANARY_URL}`).includes("SNOWCANARY"), false);
+  assert.equal(redactSecrets(`header Bearer ${SNOW_CANARY.bearer}, cookie JSESSIONID=${SNOW_CANARY.session}, at https://u:p@example.com/a?sid=1#frag`, []), "header Bearer [REDACTED], cookie JSESSIONID=[REDACTED], at https://[REDACTED]@example.com/a?[REDACTED]#[REDACTED]");
+  assert.match(redactSecrets("Authorization: Bearer eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.c2lnbmF0dXJl", []), /^Authorization: \[REDACTED\]/);
 });
