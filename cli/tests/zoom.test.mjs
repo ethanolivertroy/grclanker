@@ -531,8 +531,9 @@ test("readConfigFile never echoes the JSON.parse window or the filesystem messag
     assert.throws(() => JSON.parse(text), (error) => error instanceof SyntaxError && error.message.includes(fragment) && /is not valid JSON/.test(error.message), `${shape.name}: JSON.parse control`);
 
     // The template is scrubbed like every other error string, so the random mkdtemp segment of the fixture path may be redacted by the long-token rule; the file name itself survives.
-    const expected = scrubErrorText(`Unable to parse Zoom config file: invalid JSON in ${pathname}`);
-    assert.match(expected, /^Unable to parse Zoom config file: invalid JSON in \S+\/[a-z_-]+\.json$/);
+    // The quoted-window message carries no offset, so the loader renders no position and the fixed INVALID_JSON code stands in for the parser's.
+    const expected = scrubErrorText(`Unable to parse Zoom config file: invalid JSON in ${pathname} (INVALID_JSON)`);
+    assert.match(expected, /^Unable to parse Zoom config file: invalid JSON in \S+\/[a-z_-]+\.json \(INVALID_JSON\)$/);
     const routes = [
       { name: "config_file argument", run: () => resolveZoomConfiguration({ config_file: pathname }, {}) },
       { name: "ZOOM_CONFIG_FILE", run: () => resolveZoomConfiguration({}, { ZOOM_CONFIG_FILE: pathname }) },
