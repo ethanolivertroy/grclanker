@@ -41,6 +41,7 @@ import {
 import { getRegisteredToolSummaries } from "../dist/pi/tool-catalog.js";
 import { assertSecretFragmentsAbsent, readBundleFiles, readZipEntries } from "./helpers/bundle-contents.mjs";
 import { CONFIG_CANARIES, assertConfigLoaderMatrix, configLoaderCases } from "./helpers/config-loader-matrix.mjs";
+import { assertFixedTextsSurvive, collectFixedTexts, logLines } from "./helpers/fixed-text-survival.mjs";
 import { assertFragmentsAbsent, assertPlantedValuesWellFormed } from "./helpers/planted-values.mjs";
 import { assertScrubBoundary } from "./helpers/scrub-boundary-matrix.mjs";
 
@@ -2654,6 +2655,13 @@ function pagerdutyApiFixture({ deny = [], empty = [], truncate = [], fail } = {}
         requests.push({ method: init.method ?? "GET", url: url.toString(), path: url.pathname, status: 502 });
         return new Response(pdCanaryHtml(), { status: 502, statusText: "Bad Gateway", headers: { "content-type": "text/html; charset=utf-8" } });
       }
+      // Credential-free failure flavors for the fixed-text harvest: a plain proxy page, an unrecognized JSON shape, a documented error.
+      if (fail.flavor === "plainHtml") {
+        requests.push({ method: init.method ?? "GET", url: url.toString(), path: url.pathname, status: 502 });
+        return new Response("<html><head><title>502 Bad Gateway</title></head><body>upstream unavailable</body></html>", { status: 502, statusText: "Bad Gateway", headers: { "content-type": "text/html; charset=utf-8" } });
+      }
+      if (fail.flavor === "opaqueJson") return respond({ unexpected: { shape: true } }, 403, "Forbidden");
+      if (fail.flavor === "plainJson") return respond({ error: { message: "Access Denied", code: 2010, errors: ["Access Denied"] } }, 403, "Forbidden");
       if (url.pathname === "/oauth/token") {
         return respond({ error: "invalid_client", error_description: `client rejected; see ${PD_CANARY_URL} for the registration` }, 403, "Forbidden");
       }
@@ -3049,7 +3057,91 @@ test("planted values self-check: every canary and planted secret is alphanumeric
   ]);
 });
 
-test("scrub boundary: bare name-shaped values stay, carriers and registered secrets (in every encoded form) and real token shapes go, in PagerdutyRequestError and on client.redact", () => {
+/** Every PagerDuty inventory the collectors read, as the summaries' inventories and the markers label them. */
+const PAGERDUTY_DATASETS = [
+  "users", "teams", "team members", "services", "escalation policies", "priorities", "incident workflows", "incident workflow triggers",
+  "schedules", "schedule details", "oncalls", "audit records", "extensions", "webhook subscriptions", "business services",
+  "business service dependencies", "change events", "abilities", "credential scope",
+];
+
+const PD_SAMPLE_DENIAL = "PagerDuty request failed (403 Forbidden) for /users: Access Denied; code 2010; Access Denied";
+
+/**
+ * The standing fixed texts PagerDuty emits, rendered with sample paths and names: the config loader read and
+ * parse messages, the non-JSON and opaque-body notes, the timeout, the inventory states (complete, partial with
+ * the truncation reason, unread, not requested), the `not requested:` marker errors naming the parent read, the
+ * principals_withheld and partial-view wordings, the credential scope notes, and the corollary summary templates.
+ * Each must come back from PagerdutyRequestError's pass and client.redact unchanged.
+ */
+const PAGERDUTY_FIXED_TEXTS = [
+  "Unable to read PagerDuty config file /home/svc/.config/grclanker/pagerduty.json (ENOENT)",
+  "Unable to read PagerDuty config file /tmp/grclanker-pagerduty-loader-Ab3dEf/directory.json (EISDIR)",
+  "Unable to read PagerDuty config file /tmp/grclanker-pagerduty-loader-Ab3dEf/locked.json (EACCES)",
+  "Unable to parse PagerDuty config file: invalid JSON in /tmp/grclanker-pagerduty-loader-Ab3dEf/short.json",
+  "Unable to parse PagerDuty config file: invalid JSON in /tmp/grclanker-pagerduty-loader-Ab3dEf/trailing-comma.json at line 3",
+  "PagerDuty request failed (502 Bad Gateway) for /users: non-JSON body (text/html, 5120 bytes)",
+  "PagerDuty request failed (403 Forbidden) for /audit/records: JSON body without documented error fields (application/json, 27 bytes)",
+  "PagerDuty request failed (429 Too Many Requests) for /oncalls: non-JSON body (text/plain, 12 bytes)",
+  "PagerDuty OAuth token request failed (502) for /oauth/token: non-JSON body (text/html, 5120 bytes)",
+  "PagerDuty OAuth token request failed (403) for /oauth/token: invalid_client: client rejected",
+  "PagerDuty request timed out after 30000ms: /users",
+  PD_SAMPLE_DENIAL,
+  `users: unread (${PD_SAMPLE_DENIAL})`,
+  "users: complete (4 seen)",
+  "users: 4 of 2500 seen (the API returned an empty page while more was true)",
+  "users: 100 seen of an unknown total (collection incomplete)",
+  "audit records: 100 of 2500 seen (record limit 100 reached)",
+  "team members: not requested (the teams list was not read)",
+  "schedule details: not requested (the schedules list was not read)",
+  "business service dependencies: not requested (the business services list was not read)",
+  "not requested: the teams list was not read",
+  "not requested: the schedules list was not read",
+  "users could not be read (PagerDuty request failed (403 Forbidden) for /users: Access Denied; code 2010; Access Denied). Export Users > All Users from the PagerDuty web app and confirm each admin role.",
+  "credential scope could not be determined (PagerDuty request failed (502 Bad Gateway) for /users/me: non-JSON body (text/html, 5120 bytes))",
+  "Credential scope could not be determined (PagerDuty request failed (502 Bad Gateway) for /users/me: non-JSON body (text/html, 5120 bytes)); universal-claim findings will not pass until it is.",
+  "Credential scope: account-level REST API key.",
+  "Credential scope: user-level credential for bob.user@acme.example with role admin (partial visibility, passing findings are downgraded to warn).",
+  "user-level credential for bob.user@acme.example with role responder only returns the objects that user can see",
+  "Downgraded from pass to warn because the inventory is partial: users: 4 of 2500 seen (the API returned an empty page while more was true).",
+  "users: 4 of 2500 seen (the API returned an empty page while more was true); teams: unread (PagerDuty request failed (403 Forbidden) for /teams: Access Denied; code 2010; Access Denied)",
+  "Use a read-only account-level REST API key created by an account admin (Integrations > API Access Keys), or a Scoped OAuth app token that includes the listed *.read scopes.",
+  "escalation policy Platform-Primary-2026 and schedule SRE_Weekend_Rotation on team Acme_Platform_Team",
+  "Only 2 of 25 controls read every inventory to completion on acme-corp.pagerduty.com; PD-03 is manual and names users",
+];
+
+/** Addendum 7 must-keep table for PagerDuty: paths and inventories, tenants, principals, finding ids, and the standing fixed texts. */
+function pagerdutyKeepTable() {
+  return {
+    paths: ["/oauth/token", "/users/me", ...PAGERDUTY_CANARY_SURFACES.filter((path) => path !== "/users/me")],
+    tables: PAGERDUTY_DATASETS,
+    tenants: [
+      "acme-corp.pagerduty.com",
+      "https://api.pagerduty.com",
+      "api.eu.pagerduty.com",
+      "https://identity.pagerduty.com/oauth/token",
+      "acme-corp",
+      "prod-us-east-2026",
+      "Acme_Platform_Team",
+    ],
+    principals: [
+      "bob.user@acme.example",
+      "owner-1@example.com",
+      // PagerDuty ids: an uppercase P followed by six alphanumerics.
+      "PABC123",
+      "PXYZ789",
+      "PF9KQ2M",
+      "owner-1",
+      "team-1",
+      "sched-1",
+      "Platform-Primary-2026",
+      "SRE_Weekend_Rotation",
+    ],
+    findingIds: ALL_CONTROLS.map((control) => findingId(control)),
+    fixedTexts: PAGERDUTY_FIXED_TEXTS,
+  };
+}
+
+test("scrub boundary: bare name-shaped values stay, carriers and registered secrets (in every encoded form) and real token shapes go, in PagerdutyRequestError and on client.redact; the addendum 7 must-keep table survives in isolation and in sentences", () => {
   const fetchImpl = async () => jsonResponse({});
   const mustKeep = [
     "PagerDuty request failed (502 Bad Gateway) for /users: non-JSON body (text/html, 5120 bytes)",
@@ -3058,13 +3150,122 @@ test("scrub boundary: bare name-shaped values stay, carriers and registered secr
     "Unable to parse PagerDuty config file: invalid JSON in /tmp/grclanker-pagerduty-loader-Ab3dEf/short.json",
     "escalation policy Platform-Primary-2026 and schedule SRE_Weekend_Rotation on team Acme_Platform_Team",
   ];
+  const keepTable = pagerdutyKeepTable();
+  assert.equal(keepTable.findingIds.length, 25, "every PagerDuty finding id is in the table");
+  assert.ok(keepTable.findingIds.includes(findingId(3)));
+  assert.equal(keepTable.paths.length, PAGERDUTY_CANARY_SURFACES.length + 1, "every requested path plus the token endpoint is in the table");
   // The client constructor is the registration path (rememberSecrets on the configured REST API key); the error constructor is the pass.
   assertScrubBoundary({
     scrub: (text) => new PagerdutyRequestError(502, text, "/x").message,
     registerSecret: (secret) => new PagerdutyApiClient(sampleConfig({ apiToken: secret }), { fetchImpl }),
     mustKeep,
+    keepTable,
   });
-  assertScrubBoundary({ scrub: (text) => new PagerdutyApiClient(sampleConfig(), { fetchImpl }).redact(text), mustKeep });
+  assertScrubBoundary({ scrub: (text) => new PagerdutyApiClient(sampleConfig(), { fetchImpl }).redact(text), mustKeep, keepTable });
+});
+
+test("round 7 note 1: every fixed-text message PagerDuty emits (loader, opaque body, timeout, inventory states, not requested markers, principals_withheld, credential scope notes, corollary summaries) comes back from PagerdutyRequestError's pass unchanged", async () => {
+  const texts = new Set(PAGERDUTY_FIXED_TEXTS);
+  const fetchImpl = async () => jsonResponse({});
+  const scrubs = {
+    "PagerdutyRequestError": (text) => new PagerdutyRequestError(502, text, "/x").message,
+    "client.redact": (text) => new PagerdutyApiClient(sampleConfig(), { fetchImpl }).redact(text),
+  };
+
+  // The loader's own read and parse messages on real failing files.
+  for (const item of configLoaderCases({ format: "json", displayName: "PagerDuty", fileNoun: "config file", extension: ".json" })) {
+    if (item.skip) continue;
+    assert.throws(() => resolvePagerdutyConfiguration({ config_file: item.path }, {}), (error) => {
+      texts.add(error.message);
+      return true;
+    });
+  }
+
+  // Every surface under three credential-free failure flavors (plain proxy page, unrecognized JSON shape, documented
+  // error), then every endpoint denied, every list empty, and every list truncated: the access check, the five
+  // assessments, the analysis and core_data files, and the error log render the opaque-body notes, the inventory
+  // states, the markers naming the parent read, the withheld notes, and the demotion templates on real paths.
+  const harvest = (run) => {
+    collectFixedTexts([run.analysis, run.accessCheck, run.payloads], texts);
+    for (const line of logLines(run.errors)) texts.add(line);
+    for (const [name, content] of run.files) {
+      if (name.startsWith("core_data/") && name.endsWith(".json")) collectFixedTexts(JSON.parse(content), texts);
+    }
+  };
+  for (const path of PAGERDUTY_CANARY_SURFACES) {
+    for (const flavor of ["plainHtml", "opaqueJson", "plainJson"]) harvest(await exportWithFixture({ fail: { path, flavor } }));
+  }
+  harvest(await exportWithFixture({}));
+  const listPaths = PAGERDUTY_LIST_ENDPOINTS.map(([path]) => path);
+  harvest(await exportWithFixture({ deny: [...PAGERDUTY_OBJECT_ENDPOINTS, ...listPaths] }));
+  harvest(await exportWithFixture({ empty: listPaths }));
+  harvest(await exportWithFixture({ truncate: listPaths }));
+  for (const path of [...PAGERDUTY_OBJECT_ENDPOINTS, ...listPaths]) harvest(await exportWithFixture({ deny: [path] }));
+
+  // The token endpoint and the timeout wording through the real client.
+  const oauth = sampleConfig({ authMode: "oauth_client_credentials", apiToken: undefined, clientId: "pd-client-id", clientSecret: "pd-client-secret-value", subdomain: "acme-corp" });
+  for (const flavor of ["plainHtml", "opaqueJson"]) {
+    const fixture = pagerdutyApiFixture({ fail: { path: "/oauth/token", flavor } });
+    const client = new PagerdutyApiClient(oauth, { fetchImpl: fixture.fetchImpl, now: () => NOW, sleep: async () => {} });
+    collectFixedTexts(await checkPagerdutyAccess(client), texts);
+  }
+  const timingOut = new PagerdutyApiClient(sampleConfig({ timeoutMs: 1000 }), {
+    fetchImpl: async (_input, init) => new Promise((_resolve, reject) => init?.signal?.addEventListener("abort", () => reject(new DOMException("aborted", "AbortError")))),
+    now: () => NOW,
+    sleep: async () => {},
+  });
+  await assert.rejects(timingOut.listUsers(5), (error) => {
+    texts.add(error.message);
+    return true;
+  });
+
+  for (const [label, scrub] of Object.entries(scrubs)) {
+    const checked = assertFixedTextsSurvive(scrub, texts, `PagerDuty fixed texts through ${label}`);
+    assert.ok(checked >= PAGERDUTY_FIXED_TEXTS.length + 40, `the harvest rendered texts beyond the standing list (${checked})`);
+  }
+  assert.ok([...texts].some((text) => /^[a-z ]+: unread \(/.test(text)), "the harvest rendered an unread inventory state");
+  assert.ok([...texts].some((text) => /^[a-z ]+: not requested \(/.test(text)), "the harvest rendered a not requested inventory state");
+  assert.ok([...texts].some((text) => /^not requested: /.test(text)), "the harvest rendered a not requested marker error");
+  assert.ok([...texts].some((text) => / of \d+ seen \(/.test(text)), "the harvest rendered a partial inventory state");
+  assert.ok([...texts].some((text) => /non-JSON body \(text\/html, \d+ bytes\)/.test(text)), "the harvest rendered a status-and-length note");
+  assert.ok([...texts].some((text) => /JSON body without documented error fields \(application\/json, \d+ bytes\)/.test(text)), "the harvest rendered an opaque JSON note");
+  assert.ok([...texts].some((text) => /^Credential scope/.test(text)), "the harvest rendered a credential scope note");
+  assert.ok([...texts].some((text) => /timed out after \d+ms/.test(text)), "the harvest rendered the timeout wording");
+});
+
+test("round 7 note 2: credentials and the config file path set through the environment survive an unrelated argument, and the source chain names the environment", () => {
+  const base = createTempBase("grclanker-pagerduty-env-survives-");
+  const configPath = join(base, "pagerduty.json");
+  writeFileSync(configPath, JSON.stringify({ api_token: "file-api-token-value", region: "eu", from_email: "file@acme.example" }));
+  for (const tokenKey of ["PAGERDUTY_API_TOKEN", "PAGERDUTY_API_KEY", "PAGERDUTY_TOKEN", "PD_API_KEY"]) {
+    const env = { PAGERDUTY_CONFIG_FILE: configPath, [tokenKey]: "env-api-token-value" };
+    for (const [label, unrelated] of [
+      ["timeout_seconds", { timeout_seconds: 45 }],
+      ["region", { region: "us" }],
+      ["subdomain", { subdomain: "acme-corp" }],
+    ]) {
+      const resolved = resolvePagerdutyConfiguration(unrelated, env);
+      const context = `${tokenKey} with ${label}`;
+      assert.equal(resolved.authMode, "api_token", context);
+      assert.equal(resolved.apiToken, "env-api-token-value", `${context}: the environment token resolves over the file`);
+      assert.equal(resolved.fromEmail, "file@acme.example", `${context}: the file value not set elsewhere still applies`);
+      assert.ok(resolved.sourceChain.includes("environment-api-token"), `${context}: the source chain names the environment: ${JSON.stringify(resolved.sourceChain)}`);
+      assert.ok(resolved.sourceChain.includes("config-file-from-email"), `${context}: the source chain names the config file from the environment`);
+      assert.ok(!resolved.sourceChain.includes("arguments-api-token"), `${context}: the unrelated argument does not claim the token`);
+      assert.equal(resolved.baseUrl, label === "region" ? "https://api.pagerduty.com" : "https://api.eu.pagerduty.com", context);
+      if (label === "timeout_seconds") assert.equal(resolved.timeoutMs, 45000, context);
+    }
+  }
+  // An argument object whose credential keys are present but undefined must not shadow the environment.
+  const env = { PAGERDUTY_CONFIG_FILE: configPath, PAGERDUTY_API_TOKEN: "env-api-token-value" };
+  const shadowed = resolvePagerdutyConfiguration({ api_token: undefined, token: undefined, timeout_seconds: 45 }, env);
+  assert.equal(shadowed.apiToken, "env-api-token-value");
+  assert.deepEqual(shadowed.sourceChain, ["environment-api-token", "config-file-from-email", "config-file-region"]);
+  // Scoped OAuth credentials through the environment survive the same way.
+  const oauth = resolvePagerdutyConfiguration({ timeout_seconds: 45 }, { PAGERDUTY_CONFIG_FILE: EMPTY_CONFIG_FILE, PAGERDUTY_CLIENT_ID: "env-client-id", PAGERDUTY_CLIENT_SECRET: "env-client-secret-value", PAGERDUTY_SUBDOMAIN: "acme-corp" });
+  assert.equal(oauth.authMode, "oauth_client_credentials");
+  assert.equal(oauth.clientSecret, "env-client-secret-value");
+  assert.deepEqual(oauth.sourceChain, ["environment-client-id", "environment-client-secret", "environment-subdomain"]);
 });
 
 test("collection status: a truncated user directory keeps seen counts, renders principal-derived counts and lists null, and names no user from the partial set", async () => {
