@@ -344,8 +344,9 @@ export const QUOTED_CARRIER_CASES = Object.freeze([
  * Codex P1 (quoted header value), the class as reported: a NAME-shaped value (the token scrub keeps such a value
  * bare in prose) inside a quoted carrier, with the exact text expected after the scrub. Consumed by
  * assertScrubBoundary, so a sink that has not yet closed the class fails on the value rather than on wording.
- * The cookie and X-Auth-* rules consume through the end of their line; inside a JSON-escaped body the quoted
- * pair rule keeps the escaped structure instead.
+ * A cookie value (its quoted attributes included) runs to the end of its line; a header value that is itself
+ * quoted ends at its closing quote (compound-line rule: closing quote first), so the prose after it survives;
+ * inside a JSON-escaped body the quoted pair rule keeps the escaped structure instead.
  */
 export const NAME_SHAPED_QUOTED_CASES = Object.freeze([
   ['Cookie: sid="prod-cookie" was rejected by the upstream proxy.', "Cookie: [REDACTED]", ["prod-cookie"]],
@@ -353,8 +354,8 @@ export const NAME_SHAPED_QUOTED_CASES = Object.freeze([
   ['Upstream error: X-Api-Key: "prod-key" is not authorized.', 'Upstream error: X-Api-Key: "[REDACTED]" is not authorized.', ["prod-key"]],
   ["Upstream error: X-Api-Key: 'prod-key' is not authorized.", "Upstream error: X-Api-Key: '[REDACTED]' is not authorized.", ["prod-key"]],
   ['Upstream error: x-api-key:"prod-key" is not authorized.', 'Upstream error: x-api-key:"[REDACTED]" is not authorized.', ["prod-key"]],
-  ['Cloudflare said X-Auth-Key: "prod-key" was invalid.', "Cloudflare said X-Auth-Key: [REDACTED]", ["prod-key"]],
-  ["Cloudflare said X-Auth-Key:'prod-key' was invalid.", "Cloudflare said X-Auth-Key:[REDACTED]", ["prod-key"]],
+  ['Cloudflare said X-Auth-Key: "prod-key" was invalid.', 'Cloudflare said X-Auth-Key: "[REDACTED]" was invalid.', ["prod-key"]],
+  ["Cloudflare said X-Auth-Key:'prod-key' was invalid.", "Cloudflare said X-Auth-Key:'[REDACTED]' was invalid.", ["prod-key"]],
   ['Gateway rejected Authorization: Bearer "prod-token" at the edge.', 'Gateway rejected Authorization: Bearer "[REDACTED]" at the edge.', ["prod-token"]],
   ["Gateway rejected Authorization: Bearer 'prod-token' at the edge.", "Gateway rejected Authorization: Bearer '[REDACTED]' at the edge.", ["prod-token"]],
   ['Gateway rejected Authorization:Bearer"prod-token" at the edge.', 'Gateway rejected Authorization:Bearer"[REDACTED]" at the edge.', ["prod-token"]],
@@ -461,11 +462,12 @@ export function carrierCases(value) {
     ["URL query pair", `see https://api.example.com/v1/x?token=${value} for details`, "see https://api.example.com/v1/x?[REDACTED] for details"],
     ["URL userinfo", `see https://auditor:${value}@api.example.com/v1/x for details`, "see https://api.example.com/v1/x for details"],
     // Codex P1 (quoted header value) and round 4 item F (X-Auth-Key / X-Auth-Email): quoted, single-quoted,
-    // spaceless, and JSON-escaped forms; the X-Auth-* value is consumed through the end of the line like a cookie.
+    // spaceless, and JSON-escaped forms; a bare X-Auth-* value is consumed through the end of the line like a
+    // cookie, a quoted one through its closing quote (compound-line rule).
     ["quoted Authorization header", `Authorization: Bearer "${value}" was rejected`, 'Authorization: Bearer "[REDACTED]" was rejected'],
     ["single-quoted Authorization header", `Authorization: Bearer '${value}' was rejected`, "Authorization: Bearer '[REDACTED]' was rejected"],
     ["quoted Basic scheme", `WWW-Authenticate replayed Basic "${value}" upstream`, 'WWW-Authenticate replayed Basic "[REDACTED]" upstream'],
-    ["quoted X-Auth-Key header", `X-Auth-Key: "${value}" was invalid`, "X-Auth-Key: [REDACTED]"],
+    ["quoted X-Auth-Key header", `X-Auth-Key: "${value}" was invalid`, 'X-Auth-Key: "[REDACTED]" was invalid'],
     ["bare X-Auth-Key header", `X-Auth-Key: ${value} was invalid`, "X-Auth-Key: [REDACTED]"],
     ["bare X-Auth-Email header", `X-Auth-Email: ${value} was invalid`, "X-Auth-Email: [REDACTED]"],
     ["quoted x-api-key header without spaces", `x-api-key:"${value}" was invalid`, 'x-api-key:"[REDACTED]" was invalid'],
@@ -474,6 +476,49 @@ export function carrierCases(value) {
     ["JSON-escaped quoted header", `{\\"X-Auth-Key\\":\\"${value}\\"}`, '{\\"X-Auth-Key\\":\\"[REDACTED]\\"}'],
     ["JSON-escaped quoted Authorization", `{\\"Authorization\\":\\"Bearer ${value}\\"}`, '{\\"Authorization\\":\\"[REDACTED]\\"}'],
   ];
+}
+
+
+/**
+ * Compound header lines (the sweep-wide rule from the group A, B, and C reviews, refined: closing quote first, the
+ * `Name:` cut only for unterminated values). Two planted values ride one line with a following header that must
+ * keep its name and, when it carries no credential, its value: a quoted value ends at its closing quote (a closed
+ * value holding `; note:` is one value); an unquoted value, or a quoted value that is never closed, ends at the `;`
+ * or `,` that introduces the next `Name:` token, or at the end of the line; the next header gets its own carrier
+ * treatment. Each row is [input, expected output, planted values]; a Date header holds the comma and colons the
+ * rule reads as a value end and a header separator, and survives whole.
+ */
+export function compoundLineCases(value, second) {
+  const date = "Date: Mon, 22 Sep 2026 12:30:00 GMT";
+  return [
+    ["unquoted cookie before a quoted X-Api-Key and Content-Type", `Cookie: sid=${value}; X-Api-Key: "${second}"; Content-Type: "application/json"`, 'Cookie: [REDACTED]; X-Api-Key: "[REDACTED]"; Content-Type: "application/json"'],
+    ["every value unquoted", `Cookie: sid=${value}; X-Api-Key: ${second}; Content-Type: application/json`, "Cookie: [REDACTED]; X-Api-Key: [REDACTED]; Content-Type: application/json"],
+    ["cookie attribute loop stops at the next header", `Set-Cookie: sid=${value}; Path=/; HttpOnly; X-Auth-Key: ${second}`, "Set-Cookie: [REDACTED]; X-Auth-Key: [REDACTED]"],
+    ["comma-separated headers", `X-Auth-Key: ${value}, X-Auth-Email: ${second}, Accept: application/json`, "X-Auth-Key: [REDACTED], X-Auth-Email: [REDACTED], Accept: application/json"],
+    ["closed quoted header value ends at its closing quote", `X-Auth-Key: "${value}"; Content-Type: "application/json"`, 'X-Auth-Key: "[REDACTED]"; Content-Type: "application/json"'],
+    ["closed quoted cookie holding a following-header shape is one value (gap 28)", `Cookie: "sid=${value}; note: ${second}" was rejected`, 'Cookie: "[REDACTED]" was rejected'],
+    ["closed quoted value before a quoted Accept", `X-Auth-Email: '${value}', X-Api-Key: '${second}', Accept: 'application/json'`, "X-Auth-Email: '[REDACTED]', X-Api-Key: '[REDACTED]', Accept: 'application/json'"],
+    ["unterminated cookie quote ends at the next header", `Cookie: "sid=${value}; X-Api-Key: ${second}; Content-Type: text/html`, "Cookie: [REDACTED]; X-Api-Key: [REDACTED]; Content-Type: text/html"],
+    ["unterminated quoted header ends at the next header", `X-Auth-Key: "${value}; Content-Type: text/html`, "X-Auth-Key: [REDACTED]; Content-Type: text/html"],
+    ["Date header after an unquoted cookie", `Cookie: sid=${value}; ${date}`, `Cookie: [REDACTED]; ${date}`],
+    ["Date header after an unterminated cookie quote", `Cookie: "sid=${value}, ${date}`, `Cookie: [REDACTED], ${date}`],
+    ["Date value inside a Set-Cookie attribute before the next header", `Set-Cookie: sid=${value}; Expires=Mon, 22 Sep 2026 12:30:00 GMT; HttpOnly, X-Api-Key: ${second}`, "Set-Cookie: [REDACTED], X-Api-Key: [REDACTED]"],
+    ["quoted Date before a quoted Authorization", `${date.replace(/: (.*)$/, ': "$1"')}, Authorization: Bearer "${value}"`, `${date.replace(/: (.*)$/, ': "$1"')}, Authorization: Bearer "[REDACTED]"`],
+    ["JSON-escaped headers inside a JSON string", `{\\"Cookie\\":\\"sid=${value}\\",\\"X-Auth-Key\\":\\"${second}\\",\\"Content-Type\\":\\"application/json\\"}`, '{\\"Cookie\\":\\"[REDACTED]\\",\\"X-Auth-Key\\":\\"[REDACTED]\\",\\"Content-Type\\":\\"application/json\\"}'],
+    ["closed Content-Type before a quoted header", `Content-Type: "text/html; charset=utf-8", X-Auth-Key: "${value}"`, 'Content-Type: "text/html; charset=utf-8", X-Auth-Key: "[REDACTED]"'],
+  ];
+}
+
+/** Asserts the compound-line rule on one scrub: every planted value is removed, the following header keeps its name, and a second pass changes nothing. */
+export function assertCompoundLineCases(assert, redact, pairs = [["prod-us-east-2026", "sess-canary-COOKIE-31415926535897"], [CANARY.sessionCookie, CANARY.apiKey]]) {
+  for (const [value, second] of pairs) {
+    for (const [label, input, expected] of compoundLineCases(value, second)) {
+      const output = redact(input);
+      assert.equal(output, expected, `compound line, ${label}: ${input}`);
+      assertNoCanaryWindows(assert, output, [value, second], `compound line, ${label}`);
+      assert.equal(redact(output), output, `compound line, ${label}: a second pass changes nothing`);
+    }
+  }
 }
 
 /**
@@ -518,6 +563,7 @@ export function assertScrubBoundary(assert, redact, { configuredSecret, mustKeep
   for (const text of QUOTED_NON_CREDENTIAL_TEXTS) {
     assert.equal(redact(text), text, `quoted non-credential header survives the scrub: ${text}`);
   }
+  assertCompoundLineCases(assert, redact);
   for (const text of mustKeep) {
     assert.equal(redact(text), text, `fixed text survives the scrub: ${text}`);
   }

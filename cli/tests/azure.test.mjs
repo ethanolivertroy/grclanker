@@ -1811,7 +1811,7 @@ const AZURE_TRANSPORT_CANARY = "Vq8LmT2xRc7ZpWd4Kn9Y";
 const AZURE_TRANSPORT_REJECTIONS = [
   ["dns", () => Object.assign(new TypeError("fetch failed"), { cause: Object.assign(new Error("getaddrinfo ENOTFOUND login.microsoftonline.com"), { code: "ENOTFOUND" }) }), /^TypeError: fetch failed \(ENOTFOUND\)$/],
   ["tls", () => Object.assign(new TypeError(`fetch failed: unable to verify the first certificate; request carried Authorization: Bearer ${AZURE_TRANSPORT_CANARY}`), { cause: Object.assign(new Error("unable to verify the first certificate"), { code: "UNABLE_TO_VERIFY_LEAF_SIGNATURE" }) }), /^TypeError: fetch failed: unable to verify the first certificate; request carried Authorization: Bearer \[REDACTED\]$/],
-  ["timeout", () => Object.assign(new Error(`The operation was aborted due to timeout; last header X-Auth-Key: "${AZURE_TRANSPORT_CANARY}"`), { name: "TimeoutError" }), /^TimeoutError: The operation was aborted due to timeout; last header X-Auth-Key: \[REDACTED\]$/],
+  ["timeout", () => Object.assign(new Error(`The operation was aborted due to timeout; last header X-Auth-Key: "${AZURE_TRANSPORT_CANARY}"`), { name: "TimeoutError" }), /^TimeoutError: The operation was aborted due to timeout; last header X-Auth-Key: "\[REDACTED\]"$/],
 ];
 
 test("request matching (Codex P2): a token request rejected before any response (DNS, TLS, timeout) is attributed to POST /<tenant>/oauth2/v2.0/token with no status, every output states that no resource request was made, no Graph or ARM endpoint or status is named anywhere, and the transport message reaches no sink unscrubbed", async () => {

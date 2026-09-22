@@ -580,14 +580,53 @@ function scrubCredentialPairs(text: string): string {
   });
 }
 
+/**
+ * Header carriers whose value is free form: Cookie and Set-Cookie (session values with their attributes) and
+ * Cloudflare's legacy X-Auth-Key / X-Auth-Email pair (the global API key and its account; round 4 item F). The
+ * value is removed whatever its shape. Where it ends follows the compound-line rule shared by every scrubber:
+ * a quoted value (a plain or JSON-escaped quote) ends at its closing quote, so a closed value that holds `; Name:`
+ * is one value and the quotes stay around the marker; an unquoted value, or a quoted one that is never closed,
+ * ends at the `;` or `,` that introduces the next `Name:` header token on the line, at a `<` or `>` (the header
+ * quoted inside markup), or at the end of the line, so the next header keeps its name and gets its own carrier
+ * treatment. A value that is already the marker is left alone, so a second pass over a scrubbed message leaves
+ * the text after the marker as it is.
+ */
+const HEADER_CARRIER_PATTERN = /\b(set-cookie|cookie|x-auth-key|x-auth-email)(\s*[:=]\s*)(?!\s*\[REDACTED\])/gi;
+const HEADER_CARRIER_QUOTE_PATTERN = /^(\\?)(["'])/;
+const NEXT_HEADER_TOKEN_PATTERN = /[;,]\s*[A-Za-z][A-Za-z0-9-]*\s*:/;
+const MARKUP_STOP_PATTERN = /[<>]/;
+
+/** The end of a free-form header value that starts at `start`, and the quote (plain or escaped) that encloses a closed quoted value. */
+function headerCarrierValueEnd(text: string, start: number): { end: number; quote?: string } {
+  const newline = text.indexOf("\n", start);
+  const line = text.slice(start, newline === -1 ? text.length : newline);
+  const opening = HEADER_CARRIER_QUOTE_PATTERN.exec(line);
+  if (opening) {
+    const close = line.indexOf(opening[0], opening[0].length);
+    if (close !== -1) return { end: start + close + opening[0].length, quote: opening[0] };
+  }
+  const stops = [MARKUP_STOP_PATTERN.exec(line)?.index, NEXT_HEADER_TOKEN_PATTERN.exec(line)?.index].filter((index): index is number => index !== undefined);
+  return { end: start + (stops.length > 0 ? Math.min(...stops) : line.length) };
+}
+
+function scrubHeaderCarriers(text: string): string {
+  let scrubbed = "";
+  let cursor = 0;
+  for (const match of text.matchAll(HEADER_CARRIER_PATTERN)) {
+    // A carrier name inside a value already consumed (`Cookie: "a; X-Auth-Key: b"`) is part of that value.
+    if (match.index < cursor) continue;
+    const valueStart = match.index + match[0].length;
+    const { end, quote } = headerCarrierValueEnd(text, valueStart);
+    if (end === valueStart) continue;
+    scrubbed += text.slice(cursor, valueStart) + (quote === undefined ? REDACTED_ERROR_VALUE : `${quote}${REDACTED_ERROR_VALUE}${quote}`);
+    cursor = end;
+  }
+  return scrubbed + text.slice(cursor);
+}
+
 const ERROR_TEXT_PATTERNS: ReadonlyArray<readonly [RegExp, string]> = [
-  // Carriers first, whatever the value's shape, so the shape rules below only ever see the marker. Cookie headers
-  // carry session values in free form and are consumed through the end of the line; Cloudflare's legacy
-  // X-Auth-Key / X-Auth-Email pair (the global API key and its account) is consumed the same way, quotes
-  // included (round 4 item F). Both rules skip a value that is already the marker so a second pass over a
-  // scrubbed message leaves the text after the marker alone.
-  [/\b(set-cookie|cookie)(\s*[:=]\s*)(?!\s*\[REDACTED\])[^\n<>]+/gi, `$1$2${REDACTED_ERROR_VALUE}`],
-  [/\b(x-auth-(?:key|email))(\s*[:=]\s*)(?!\s*\[REDACTED\])[^\n<>]+/gi, `$1$2${REDACTED_ERROR_VALUE}`],
+  // The free-form header carriers (Cookie, Set-Cookie, X-Auth-Key, X-Auth-Email) run first in scrubHeaderCarriers,
+  // so the shape rules below only ever see the marker.
   // Quoted header and pair values next, whatever their shape, so the scheme and pair rules see the marker.
   [ERROR_QUOTED_CREDENTIAL_PATTERN, QUOTED_VALUE_REPLACEMENT],
   [ERROR_QUOTED_SCHEME_PATTERN, QUOTED_VALUE_REPLACEMENT],
@@ -670,6 +709,7 @@ export function redactErrorText(text: string): string {
   scrubbed = scrubbed.replace(ERROR_URL_PATTERN, (_match, scheme: string, hostPath: string, query?: string) =>
     `${scheme}${hostPath}${query ? `?${REDACTED_ERROR_VALUE}` : ""}`,
   );
+  scrubbed = scrubHeaderCarriers(scrubbed);
   for (const [pattern, replacement] of ERROR_TEXT_PATTERNS) {
     scrubbed = scrubbed.replace(pattern, replacement);
   }
