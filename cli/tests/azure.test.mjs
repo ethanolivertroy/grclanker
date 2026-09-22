@@ -784,7 +784,15 @@ test("verdict safety 5: partial inventories are flagged with seen and total coun
   assert.equal(data.findings.find((item) => item.id === "AZURE-DP-05").status, "manual");
   const network = await assessAzureNetworkAndPolicy(partial);
   assert.notEqual(network.findings.find((item) => item.id === "AZURE-NP-01").status, "pass");
-  assert.equal(network.findings.find((item) => item.id === "AZURE-NP-02").status, "warn");
+  const policyAssignments = network.findings.find((item) => item.id === "AZURE-NP-02");
+  assert.equal(policyAssignments.status, "warn");
+  // A truncated page cannot prove a mandatory built-in is missing: the names move to mandatory_not_seen.
+  assert.equal(policyAssignments.evidence.mandatory_missing, null, "a truncated assignment page asserts no absence");
+  assert.ok(policyAssignments.evidence.mandatory_not_seen.length > 0);
+  assert.match(policyAssignments.summary, /mandatory built-ins were not seen on the truncated page/);
+  const completeAssignments = (await assessAzureNetworkAndPolicy(compliantClient())).findings.find((item) => item.id === "AZURE-NP-02");
+  assert.equal(completeAssignments.evidence.mandatory_not_seen, null, "a complete page reports missing definitions, not unseen ones");
+  assert.ok(Array.isArray(completeAssignments.evidence.mandatory_missing));
   assert.notEqual(network.findings.find((item) => item.id === "AZURE-NP-04").status, "pass");
 
   const partialFlowLogs = clientWith(compliantClient(), {});

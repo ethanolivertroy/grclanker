@@ -2296,12 +2296,24 @@ export async function assessAzureNetworkAndPolicy(client: NetworkPolicyClient): 
   } else {
     const enforced = assignments.value.items.filter((item) => asLower(asObject(item.properties)?.enforcementMode) !== "donotenforce");
     const mandatoryPresent = MANDATORY_POLICY_DEFINITIONS.filter((definition) => assignments.value.items.some((item) => (asLower(asObject(item.properties)?.policyDefinitionId) ?? "").endsWith(definition.id)));
+    const mandatoryNotSeen = MANDATORY_POLICY_DEFINITIONS.filter((item) => !mandatoryPresent.includes(item)).map((item) => item.name);
+    // A truncated page cannot prove absence: the unseen built-ins are reported as not seen, and only a
+    // complete page states which mandatory definitions are missing.
+    const pageComplete = !assignments.value.truncated;
     findings.push(finding("AZURE-NP-02", 25, "Azure Policy assignments enforced", "medium",
       assignments.value.items.length === 0 ? "fail" : enforced.length === 0 ? "fail" : enforced.length < assignments.value.items.length ? "warn" : capForPartial("pass", assignments.value),
       assignments.value.items.length === 0
         ? "Zero Azure Policy assignments apply at subscription scope (empty inventory fails by intent)."
-        : `${enforced.length}/${assignments.value.items.length} policy assignments use enforcementMode Default; mandatory built-ins present: ${mandatoryPresent.map((item) => item.name).join(", ") || "none"}.${partialNote(assignments.value, "policy assignments")}`,
-      { assignments: assignments.value.items.length, enforced: enforced.length, do_not_enforce: assignments.value.items.length - enforced.length, mandatory_present: mandatoryPresent.map((item) => item.name), mandatory_missing: MANDATORY_POLICY_DEFINITIONS.filter((item) => !mandatoryPresent.includes(item)).map((item) => item.name), ...pageEvidence(assignments.value) }));
+        : `${enforced.length}/${assignments.value.items.length} policy assignments use enforcementMode Default; mandatory built-ins present: ${mandatoryPresent.map((item) => item.name).join(", ") || "none"}${pageComplete ? "" : `; ${mandatoryNotSeen.length} mandatory built-ins were not seen on the truncated page and may exist among the unseen assignments`}.${partialNote(assignments.value, "policy assignments")}`,
+      {
+        assignments: assignments.value.items.length,
+        enforced: enforced.length,
+        do_not_enforce: assignments.value.items.length - enforced.length,
+        mandatory_present: mandatoryPresent.map((item) => item.name),
+        mandatory_missing: pageComplete ? mandatoryNotSeen : null,
+        mandatory_not_seen: pageComplete ? null : mandatoryNotSeen,
+        ...pageEvidence(assignments.value),
+      }));
   }
 
   if (!summary.ok) {
