@@ -31,6 +31,7 @@ import {
   resolveOktaConfiguration,
   resolveSecureOutputPath,
   runOktaAccessCheck,
+  scrubErrorText,
 } from "../dist/extensions/grc-tools/okta.js";
 import { assertSecretsAbsent, readBundleFiles, readZipEntries } from "./helpers/bundle-contents.mjs";
 
@@ -2490,4 +2491,46 @@ test("collection status: denying one child of several keeps the parent collected
   assert.match(contact.summary, /technical contact lookup failed/);
   const mentions = assertOktaOutputsNameOnlyObservedRequests(oktaOutputs(run.access, run.results, run.exported), run.requests, label);
   assert.ok(mentions.statuses > 0 && mentions.endpoints > 0, `${label}: the outputs name the failed status and endpoint`);
+});
+
+test("rule 9: scrub boundary: a name-shaped value stays bare in prose and is removed inside every carrier, as a configured secret in every encoding, and whenever it has a real token shape", () => {
+  const name = "prod-us-east-2026";
+  const bare = `Okta request failed for tenant ${name} owned by sess-canary-COOKIE-31415926535897`;
+  assert.equal(scrubErrorText(bare), bare, "a name-shaped value bare in prose is indistinguishable from a resource name");
+  assert.equal(scrubErrorText(bare, [name]), "Okta request failed for tenant [REDACTED] owned by sess-canary-COOKIE-31415926535897", "the same value registered as a configured secret is removed");
+  const carriers = [
+    [`Cookie: sid=${name}; Path=/`, "Cookie: [REDACTED]"],
+    [`Set-Cookie: session=${name}; HttpOnly`, "Set-Cookie: [REDACTED]"],
+    [`X-Api-Key: ${name} rejected`, "X-Api-Key: [REDACTED] rejected"],
+    [`Authorization: Basic ${name} rejected`, "Authorization: Basic [REDACTED] rejected"],
+    [`token=${name} rejected`, "token=[REDACTED] rejected"],
+    [`{"client_secret": "${name}"} rejected`, '{"client_secret": "[REDACTED]"} rejected'],
+    [`(session_id: ${name}) rejected`, "(session_id: [REDACTED]) rejected"],
+    [`https://svc:${name}@host/p?k=${name} rejected`, "https://host/p?[REDACTED] rejected"],
+    [`Bearer ${name} rejected`, "Bearer [REDACTED] rejected"],
+    [`SSWS ${name} rejected`, "SSWS [REDACTED] rejected"],
+    ["Basic authentication is required", "Basic authentication is required"],
+    ["InvalidAuthenticationToken: Access token has expired", "InvalidAuthenticationToken: Access token has expired"],
+  ];
+  for (const [input, expected] of carriers) assert.equal(scrubErrorText(input), expected, input);
+  const secret = 'top secret/value+1"x';
+  const forms = {
+    raw: secret,
+    json: JSON.stringify(secret).slice(1, -1),
+    url: encodeURIComponent(secret),
+    base64: Buffer.from(secret).toString("base64"),
+    base64url: Buffer.from(secret).toString("base64url"),
+  };
+  const encoded = Object.entries(forms).map(([label, form]) => `${label}=${form}`).join(" ");
+  assert.equal(scrubErrorText(encoded, [secret]), "raw=[REDACTED] json=[REDACTED] url=[REDACTED] base64=[REDACTED] base64url=[REDACTED]");
+  assert.equal(
+    scrubErrorText("bare shapes eyJhbGciOiJSUzI1NiJ9.eyJzdWIiOiJhIn0.c2lnbmF0dXJl 9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08 QmFzZTY0K1N5bWJvbHM= aB3xZ9qL2mN8pR4tV7wY1 ABCD-EFGH-1234-5678 xKqZvBnMwLpRtYsHdG stay-01 name_with_words-2026 ERR_MODULE_NOT_FOUND"),
+    "bare shapes [REDACTED] [REDACTED] [REDACTED] [REDACTED] [REDACTED] [REDACTED] stay-01 name_with_words-2026 ERR_MODULE_NOT_FOUND",
+    "a JWT, a hex digest, a padded base64 run, scattered digits, a second numeric segment, and token casing are removed bare; short runs, names, and uppercase codes stay",
+  );
+  assert.equal(
+    scrubErrorText("failed for /api/v1/users/aB3xZ9qL2mN8pR4tV7wY1/factors from /tmp/run-9b6rz9m4l55zg7/config.yaml and https://hooks.example.com/services/T0/aB3xZ9qL2mN8pR4tV7wY1"),
+    "failed for /api/v1/users/aB3xZ9qL2mN8pR4tV7wY1/factors from /tmp/run-9b6rz9m4l55zg7/config.yaml and https://hooks.example.com/services/T0/[REDACTED]",
+    "a token-shaped segment of a bare request target or file path is an identifier the run named; inside a URL it is a webhook token",
+  );
 });

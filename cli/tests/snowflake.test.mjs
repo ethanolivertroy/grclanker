@@ -811,11 +811,50 @@ test("redactSecrets removes private keys, JWTs, bearer tokens, and configured se
   const redacted = redactSecrets(message, ["topsecret"]);
   assert.ok(!redacted.includes("BEGIN PRIVATE KEY"));
   assert.ok(!redacted.includes(jwt));
-  assert.ok(!redacted.includes("abcdefghijkl"));
+  assert.ok(!redacted.includes("abcdefghijkl"), "a plain-word value after the Bearer scheme is removed whatever its shape");
   assert.ok(!redacted.includes("topsecret"));
-  assert.ok(redacted.includes("[REDACTED PRIVATE KEY]"));
-  assert.ok(redacted.includes("[REDACTED TOKEN]"));
-  assert.ok(redacted.includes("[REDACTED]"));
+  assert.match(redacted, /^failed with \[REDACTED\]\s*token \[REDACTED\] header Bearer \[REDACTED\] passphrase \[REDACTED\]$/);
+});
+
+test("rule 9: scrub boundary: a name-shaped value stays bare in prose and is removed inside every carrier, as a configured secret in every encoding, and whenever it has a real token shape", () => {
+  const bare = "statement failed for warehouse prod-us-east-2026 owned by role sess-canary-COOKIE-31415926535897";
+  assert.equal(redactSecrets(bare), bare, "a name-shaped value bare in prose is indistinguishable from a resource name");
+  assert.equal(redactSecrets(bare, ["prod-us-east-2026"]), "statement failed for warehouse [REDACTED] owned by role sess-canary-COOKIE-31415926535897");
+  const carriers = [
+    ["Cookie: sid=prod-us-east-2026; Path=/", "Cookie: [REDACTED]"],
+    ["Set-Cookie: session=prod-us-east-2026; HttpOnly", "Set-Cookie: [REDACTED]"],
+    ["X-Api-Key: prod-us-east-2026 rejected", "X-Api-Key: [REDACTED] rejected"],
+    ["Authorization: Basic prod-us-east-2026 rejected", "Authorization: Basic [REDACTED] rejected"],
+    ["token=prod-us-east-2026 rejected", "token=[REDACTED] rejected"],
+    ['{"client_secret": "prod-us-east-2026"} rejected', '{"client_secret": "[REDACTED]"} rejected'],
+    ["(session_id: prod-us-east-2026) rejected", "(session_id: [REDACTED]) rejected"],
+    ["https://svc:prod-us-east-2026@host/p?k=prod-us-east-2026 rejected", "https://host/p?[REDACTED] rejected"],
+    ["Bearer prod-us-east-2026 rejected", "Bearer [REDACTED] rejected"],
+    ["SSWS prod-us-east-2026 rejected", "SSWS [REDACTED] rejected"],
+    ["Basic authentication is required", "Basic authentication is required"],
+    ["InvalidAuthenticationToken: Access token has expired", "InvalidAuthenticationToken: Access token has expired"],
+  ];
+  for (const [input, expected] of carriers) assert.equal(redactSecrets(input), expected, input);
+  const secret = 'top secret/value+1"x';
+  const forms = {
+    raw: secret,
+    json: JSON.stringify(secret).slice(1, -1),
+    url: encodeURIComponent(secret),
+    base64: Buffer.from(secret).toString("base64"),
+    base64url: Buffer.from(secret).toString("base64url"),
+  };
+  const encodedText = Object.entries(forms).map(([name, form]) => `${name}=${form}`).join(" ");
+  assert.equal(redactSecrets(encodedText, [secret]), "raw=[REDACTED] json=[REDACTED] url=[REDACTED] base64=[REDACTED] base64url=[REDACTED]");
+  assert.equal(
+    redactSecrets("bare shapes eyJhbGciOiJSUzI1NiJ9.eyJzdWIiOiJhIn0.c2lnbmF0dXJl 9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08 QmFzZTY0K1N5bWJvbHM= aB3xZ9qL2mN8pR4tV7wY1 ABCD-EFGH-1234-5678 xKqZvBnMwLpRtYsHdG stay-01 name_with_words-2026 ERR_MODULE_NOT_FOUND"),
+    "bare shapes [REDACTED] [REDACTED] [REDACTED] [REDACTED] [REDACTED] [REDACTED] stay-01 name_with_words-2026 ERR_MODULE_NOT_FOUND",
+    "a JWT, a hex digest, a padded base64 run, scattered digits, a second numeric segment, and token casing are removed bare; short runs, names, and uppercase codes stay",
+  );
+  assert.equal(
+    redactSecrets("failed for /api/v1/users/aB3xZ9qL2mN8pR4tV7wY1/factors from /tmp/run-9b6rz9m4l55zg7/config.toml and https://hooks.example.com/services/T0/aB3xZ9qL2mN8pR4tV7wY1"),
+    "failed for /api/v1/users/aB3xZ9qL2mN8pR4tV7wY1/factors from /tmp/run-9b6rz9m4l55zg7/config.toml and https://hooks.example.com/services/T0/[REDACTED]",
+    "a token-shaped segment of a bare request target or file path is an identifier the run named; inside a URL it is a webhook token",
+  );
 });
 
 test("SnowflakeSqlClient submits async statements, polls, and fetches every partition", async () => {
@@ -1874,7 +1913,7 @@ test("exportSnowflakeAuditBundle records partial collection failures in _errors.
   const errorLog = readFileSync(join(first.outputDir, "_errors.log"), "utf8");
   assert.match(errorLog, /\[denied\] show_shares: /);
   assert.match(errorLog, /SHOW SHARES/);
-  assert.match(errorLog, /Authorization: \[REDACTED\] \[REDACTED TOKEN\]; session \[REDACTED TOKEN\]; key \[REDACTED PRIVATE KEY\]/);
+  assert.match(errorLog, /Authorization: Bearer \[REDACTED\]; session \[REDACTED\]; key \[REDACTED\]/);
   const findings = JSON.parse(readFileSync(join(first.outputDir, "analysis", "findings.json"), "utf8"));
   const shares = findings.find((item) => item.id === "SNOWFLAKE-22");
   assert.equal(shares.status, "manual");
@@ -1967,8 +2006,8 @@ test("rule 9: every Snowflake statement that fails with a 502 HTML page or a JSO
         if (variant === "html") {
           assert.match(text, /failed \(502 Bad Gateway\): non-JSON body \(text\/html, \d+ bytes\)$/, `${label}: the error carries the status-and-length note, got ${text}`);
         } else {
-          assert.match(text, /https:\/\/api\.example\.com\/v1\/x(?![?#])/, `${label}: the URL keeps scheme, host, and path, got ${text}`);
-          assert.match(text, /Authorization: \[REDACTED\]/, `${label}: the authorization value is redacted, got ${text}`);
+          assert.match(text, /https:\/\/api\.example\.com\/v1\/x\?\[REDACTED\] for this key/, `${label}: the URL keeps scheme, host, and path and its query collapses to a marker, got ${text}`);
+          assert.match(text, /Authorization: Bearer \[REDACTED\]/, `${label}: the authorization scheme stays and its value is redacted, got ${text}`);
         }
       }
       for (const outcome of failedOutcomes) {

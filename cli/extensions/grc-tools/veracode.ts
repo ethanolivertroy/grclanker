@@ -19,6 +19,7 @@ import { basename, dirname, join, relative, resolve } from "node:path";
 import { createHmac, randomBytes } from "node:crypto";
 import { ZipArchive } from "archiver";
 import { Type } from "@sinclair/typebox";
+import { REDACTED_VALUE, isSensitiveArgumentKey, scrubSensitiveValues } from "../../flue/redact.js";
 import { errorResult, formatTable, textResult } from "./shared.js";
 
 type FetchImpl = typeof fetch;
@@ -189,12 +190,248 @@ export interface VeracodeNotCollectedMarker {
   error: string;
 }
 
+// ---------------------------------------------------------------------------------------------
+// Error-text hygiene (rule 9). Every error string this module records passes through
+// scrubErrorText when the API error is constructed and again where the error is recorded. Two
+// guards are construction requirements: a value inside any carrier (Authorization, Cookie,
+// Set-Cookie, x-api-key and similar headers, cookie or session assignments, URL userinfo and query
+// pairs, the Bearer, Basic, SSWS, Token, and ApiKey schemes, credential-named pairs) is removed
+// whatever its shape, and a configured secret is removed whatever its shape in its raw,
+// JSON-escaped, URL-encoded, base64, and base64url forms. Real token shapes (JWTs, PEM blocks, vendor
+// prefixes, hex digests, runs of 16 or more token characters with base64 symbols, scattered digits,
+// or token casing) are removed bare. A bare value shaped like a name (words joined by hyphens or
+// underscores with at most one digit group, such as prod-us-east-2026) is indistinguishable from a
+// resource name and stays; it is caught only inside a carrier or as a configured secret. A
+// token-shaped segment of a bare path (preceded by "/" outside a URL: a request target such as
+// /api/v1/users/<id>/factors or a config file path) is an identifier the run itself named and stays
+// so the endpoint reported is the one requested; inside a URL with a scheme every path segment keeps
+// the rule because webhook URLs carry their token there.
+// ---------------------------------------------------------------------------------------------
+
+const MIN_CONFIGURED_SECRET_LENGTH = 4;
+const LONG_TOKEN_MIN_LENGTH = 16;
+const MIN_LETTERS_FOR_CASING = 6;
+
+const PEM_BLOCK_PATTERN = /-----BEGIN [A-Z0-9 ]+-----[\s\S]*?-----END [A-Z0-9 ]+-----/g;
+const PEM_OPEN_PATTERN = /-----BEGIN [A-Z0-9 ]+-----[\s\S]*$/;
+const EMBEDDED_URL_PATTERN = /\b[a-z][a-z0-9+.-]*:\/\/[^\s"'<>()[\]{}]+/gi;
+const URL_PARTS_PATTERN = /^([a-z][a-z0-9+.-]*:\/\/)(?:[^\s/@"'<>]+@)?([^?#]*)(\?[^#]*)?(#.*)?$/i;
+const TRAILING_PUNCTUATION_PATTERN = /[.,;:!?]+$/;
+const QUERY_PAIR_PATTERN = /([?&])([A-Za-z0-9_.[\]-]+)=([^&#\s"'<>)\]}]+)/g;
+const COOKIE_HEADER_PATTERN = /\b(set-cookie|cookies?)(["']?\s*[:=]\s*)(?!\[REDACTED\])[^\s<>"'][^\r\n<>"']*/gi;
+// A scheme word spelled as a header scheme followed by a run of 8 or more token characters is a
+// credential whatever the run's shape; only the mechanism words vendor prose puts there ("Basic
+// authentication", "Bearer credentials") are kept. Lowercase spellings in prose ("token provided")
+// are not schemes; inside an Authorization carrier the scheme word is matched case-insensitively.
+const SCHEME_VALUE_PATTERN =
+  /\b(Bearer|BEARER|Basic|BASIC|Digest|DIGEST|Token|TOKEN|OAuth|OAUTH|Negotiate|NEGOTIATE|NTLM|SSWS|ApiKey|APIKEY|Api-Key|API-KEY)\s+([A-Za-z0-9._~+/=-]{8,})/g;
+const SCHEME_PROSE_WORDS = new Set(["authentication", "authorization", "authenticated", "authorized", "credential", "credentials", "challenge"]);
+const SCHEME_WORD_PATTERN = /^(?:bearer|basic|digest|token|oauth|negotiate|ntlm|ssws|apikey|api-key|splunk|hmac)$/i;
+const SCHEME_TOKEN_PATTERN = /^(\s+)(?!\[REDACTED\])([^\s"'<>;,()[\]{}]+)/;
+const ASSIGNMENT_KEY_PATTERN = /(["']?)\b([A-Za-z][A-Za-z0-9_.-]{0,63})\b(["']?\s*([:=])\s*(["']?))/g;
+const ASSIGNMENT_VALUE_PATTERN = /(?!\[REDACTED\])[^\s"'<>;,&()[\]{}]+/y;
+const CLAUSE_END_PATTERN = /(?:[)\]}]|[.,;!?](?=\s|$)|[ \t]*(?:\r?\n|$))/y;
+const HEADER_NAME_PATTERN = /^(?:[A-Za-z0-9]+(?:-[A-Za-z0-9]+)+|authorization|cookies?)$/i;
+const JWT_IN_TEXT_PATTERN = /\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}(?:\.[A-Za-z0-9_-]+)*/g;
+const AWS_ACCESS_KEY_ID_PATTERN = /\b(?:AKIA|ASIA|AROA|AIDA|AGPA|ANPA|ANVA|APKA|ABIA|ACCA)[A-Z0-9]{16}\b/g;
+const AWS_SECRET_PATTERN = /(?<![A-Za-z0-9/+=])[A-Za-z0-9/+]{40}(?![A-Za-z0-9/+=])/g;
+const HEX_DIGEST_PATTERN = /\b[A-Fa-f0-9]{32,}\b/g;
+const VENDOR_TOKEN_PATTERNS: readonly RegExp[] = [
+  /\bVERACODE-HMAC-SHA-256\s+(?!\[REDACTED\])\S+/g,
+  /\b00[A-Za-z0-9_-]{40}\b/g,
+  /\bxox[abopers]-[A-Za-z0-9-]{10,}/g,
+  /\bgh[pousr]_[A-Za-z0-9]{20,}/g,
+  /\bgithub_pat_[A-Za-z0-9_]{20,}/g,
+  /\bglpat-[A-Za-z0-9_-]{20,}/g,
+  /\bAIza[0-9A-Za-z_-]{35}\b/g,
+  /\bya29\.[0-9A-Za-z._-]{20,}/g,
+  /\bsk_(?:live|test)_[A-Za-z0-9]{10,}/g,
+  /\bSG\.[A-Za-z0-9_-]{16,}\.[A-Za-z0-9_-]{16,}/g,
+];
+// "/", ".", ":", "@", "=", and whitespace end a run, so URL path segments, dotted hostnames, and the
+// two sides of a pair are judged on their own; "=" joins a run only as trailing base64 padding.
+const LONG_TOKEN_RUN_PATTERN = new RegExp(`[A-Za-z0-9+_-]{${LONG_TOKEN_MIN_LENGTH},}(?:={1,2}(?![A-Za-z0-9&]))?`, "g");
+const DIGIT_GROUP_PATTERN = /\d+/g;
+const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const SAFE_KEY_SHAPE_PATTERN = /^(?:max|min)[_-]|[_-](?:limit|days|hours|minutes|seconds|count|path|file|dir)$/i;
+const EXTRA_CREDENTIAL_KEY_SEGMENTS = new Set(["sid", "sig", "pwd", "passwd", "pass", "session", "sessid", "phpsessid", "auth", "nonce", "sas"]);
+const EXTRA_CREDENTIAL_KEYS = new Set(["x-amz-signature", "x-amz-credential", "x-amz-security-token", "x-goog-signature", "x-goog-credential", "oauth_signature", "oauth_token", "oauth_verifier", "proxy-authorization"]);
+
+function keySegments(key: string): string[] {
+  return key
+    .replace(/([a-z0-9])([A-Z])/g, "$1_$2")
+    .toLowerCase()
+    .split(/[^a-z0-9]+/)
+    .filter(Boolean);
+}
+
+/** True when a header, query parameter, or pair name carries a credential; thresholds and file references are exempt. */
+function isCredentialCarrierKey(key: string): boolean {
+  if (isSensitiveArgumentKey(key)) return true;
+  if (SAFE_KEY_SHAPE_PATTERN.test(key)) return false;
+  if (EXTRA_CREDENTIAL_KEYS.has(key.toLowerCase())) return true;
+  return keySegments(key).some((segment) => EXTRA_CREDENTIAL_KEY_SEGMENTS.has(segment));
+}
+
+/** An unquoted value after `word:` is the credential unless it is a short plain word inside running prose ("InvalidAuthenticationToken: Access token has expired"). */
+function looksLikeCredentialValue(value: string): boolean {
+  if (value.length < 6) return false;
+  if (/\d/.test(value) || value.length >= 12 || /[^A-Za-z]/.test(value)) return true;
+  return /[a-z][A-Z]/.test(value);
+}
+
+/** True when only a closing bracket, clause punctuation, or the end of the line follows `index`, so the word before it stands as a pair value rather than as prose. */
+function endsClause(text: string, index: number): boolean {
+  CLAUSE_END_PATTERN.lastIndex = index;
+  return CLAUSE_END_PATTERN.test(text);
+}
+
+function looksLikeAwsSecret(run: string): boolean {
+  if (/[/+]/.test(run)) return true;
+  return /\d/.test(run) && /[a-z]/.test(run) && /[A-Z]/.test(run);
+}
+
+/** MD5, SHA-1, and SHA-256 digests and hex-encoded keys: 32 or more hex characters mixing letters and digits. */
+function looksLikeHexDigest(run: string): boolean {
+  return /[A-Fa-f]/.test(run) && /\d/.test(run);
+}
+
+/** Token casing changes more often than once every three letters; words, acronyms, and camelCase change at word boundaries only. */
+function hasTokenCasing(letters: string): boolean {
+  if (letters.length < MIN_LETTERS_FOR_CASING) return false;
+  let changes = 0;
+  for (let index = 1; index < letters.length; index += 1) {
+    const previousLower = letters[index - 1] >= "a" && letters[index - 1] <= "z";
+    const currentLower = letters[index] >= "a" && letters[index] <= "z";
+    if (previousLower !== currentLower) changes += 1;
+  }
+  return changes * 3 > letters.length;
+}
+
+/** The long-token rule: a UUID is an identifier; a base64 symbol, a second digit group anywhere in the run, or a "-" or "_" separated segment with token casing makes a token; words joined by "-" or "_" with at most one digit group are a name. */
+function looksLikeToken(run: string): boolean {
+  if (UUID_PATTERN.test(run)) return false;
+  if (/[+=]/.test(run)) return true;
+  if ((run.match(DIGIT_GROUP_PATTERN) ?? []).length > 1) return true;
+  return run.split(/[-_]/).some((segment) => hasTokenCasing(segment.replace(DIGIT_GROUP_PATTERN, "")));
+}
+
+/** True when the run at `index` is a segment of a bare path: preceded by a path separator and not inside a URL that carries a scheme. */
+function isBarePathSegment(text: string, index: number, urlSpans: ReadonlyArray<readonly [number, number]>): boolean {
+  if (index === 0 || (text[index - 1] !== "/" && text[index - 1] !== "\\")) return false;
+  return !urlSpans.some(([start, end]) => index >= start && index < end);
+}
+
+function scrubBareTokens(text: string): string {
+  const urlSpans = [...text.matchAll(EMBEDDED_URL_PATTERN)].map((match) => [match.index ?? 0, (match.index ?? 0) + match[0].length] as const);
+  return text.replace(LONG_TOKEN_RUN_PATTERN, (run: string, offset: number) =>
+    looksLikeToken(run) && !isBarePathSegment(text, offset, urlSpans) ? REDACTED : run,
+  );
+}
+
+function scrubConfiguredSecrets(text: string, secrets: ReadonlyArray<string | undefined>): string {
+  const values = secrets.filter((value): value is string => typeof value === "string" && value.length >= MIN_CONFIGURED_SECRET_LENGTH);
+  if (values.length === 0) return text;
+  return scrubSensitiveValues(text, values).split(REDACTED_VALUE).join(REDACTED);
+}
+
+function scrubEmbeddedUrl(match: string): string {
+  const trailing = TRAILING_PUNCTUATION_PATTERN.exec(match)?.[0] ?? "";
+  const url = match.slice(0, match.length - trailing.length);
+  const parts = URL_PARTS_PATTERN.exec(url);
+  if (!parts) return match;
+  const [, scheme, hostAndPath, query, fragment] = parts;
+  return `${scheme}${hostAndPath}${query ? `?${REDACTED}` : ""}${fragment ? `#${REDACTED}` : ""}${trailing}`;
+}
+
+function scrubQueryPair(match: string, separator: string, key: string): string {
+  return isCredentialCarrierKey(key) ? `${separator}${key}=${REDACTED}` : match;
+}
+
+function scrubSchemeValue(match: string, scheme: string, value: string): string {
+  const trailing = TRAILING_PUNCTUATION_PATTERN.exec(value)?.[0] ?? "";
+  const word = value.slice(0, value.length - trailing.length);
+  return SCHEME_PROSE_WORDS.has(word.toLowerCase()) ? match : `${scheme} ${REDACTED}${trailing}`;
+}
+
+/**
+ * Replaces the value of every credential-named pair: `key=value`, `"key": "value"`, and
+ * `Header-Name: value`. Inside a carrier the value goes whatever its shape (an `=` pair, a quoted
+ * value, a header name, or a scheme word such as `Authorization: Bearer <token>`, where the scheme is
+ * kept and the token removed); only an unquoted word after a plain `name:` that runs on into more
+ * prose is judged by shape, so "InvalidAuthenticationToken: Access token has expired" stays legible
+ * while "(session_id: value)" and "token: value" at the end of a clause lose the value.
+ */
+function replaceCredentialAssignments(text: string): string {
+  ASSIGNMENT_KEY_PATTERN.lastIndex = 0;
+  let out = "";
+  let last = 0;
+  let match: RegExpExecArray | null;
+  while ((match = ASSIGNMENT_KEY_PATTERN.exec(text)) !== null) {
+    const [whole, openingQuote, key, separator, separatorChar, valueQuote] = match;
+    if (whole.length === 0) {
+      ASSIGNMENT_KEY_PATTERN.lastIndex += 1;
+      continue;
+    }
+    if (!isCredentialCarrierKey(key)) continue;
+    const valueStart = match.index + whole.length;
+    ASSIGNMENT_VALUE_PATTERN.lastIndex = valueStart;
+    const value = ASSIGNMENT_VALUE_PATTERN.exec(text)?.[0];
+    if (value === undefined) continue;
+    let kept = "";
+    let consumed = value.length;
+    if (SCHEME_WORD_PATTERN.test(value)) {
+      const token = SCHEME_TOKEN_PATTERN.exec(text.slice(valueStart + value.length));
+      if (!token) continue;
+      kept = `${value}${token[1]}`;
+      consumed += token[0].length;
+    } else if (
+      separatorChar === ":" &&
+      valueQuote === "" &&
+      !HEADER_NAME_PATTERN.test(key) &&
+      !looksLikeCredentialValue(value) &&
+      !endsClause(text, valueStart + value.length)
+    ) {
+      continue;
+    }
+    out += `${text.slice(last, match.index)}${openingQuote}${key}${separator}${kept}${REDACTED}`;
+    last = valueStart + consumed;
+    ASSIGNMENT_KEY_PATTERN.lastIndex = last;
+  }
+  return last === 0 ? text : `${out}${text.slice(last)}`;
+}
+
+/**
+ * The single redaction pass for error text. Idempotent: text that has been scrubbed once comes
+ * back unchanged because `[REDACTED]` matches none of the patterns.
+ */
+export function scrubErrorText(text: string, secrets: ReadonlyArray<string | undefined> = []): string {
+  let scrubbed = text.replace(PEM_BLOCK_PATTERN, REDACTED).replace(PEM_OPEN_PATTERN, REDACTED);
+  scrubbed = scrubConfiguredSecrets(scrubbed, secrets)
+    .replace(EMBEDDED_URL_PATTERN, scrubEmbeddedUrl)
+    .replace(QUERY_PAIR_PATTERN, scrubQueryPair)
+    .replace(COOKIE_HEADER_PATTERN, `$1$2${REDACTED}`);
+  scrubbed = replaceCredentialAssignments(scrubbed)
+    .replace(SCHEME_VALUE_PATTERN, scrubSchemeValue)
+    .replace(JWT_IN_TEXT_PATTERN, REDACTED)
+    .replace(AWS_ACCESS_KEY_ID_PATTERN, REDACTED)
+    .replace(AWS_SECRET_PATTERN, (run) => (looksLikeAwsSecret(run) ? REDACTED : run))
+    .replace(HEX_DIGEST_PATTERN, (run) => (looksLikeHexDigest(run) ? REDACTED : run));
+  for (const pattern of VENDOR_TOKEN_PATTERNS) scrubbed = scrubbed.replace(pattern, REDACTED);
+  return scrubBareTokens(scrubbed);
+}
+
 export class VeracodeApiError extends Error {
   readonly statusCode?: number;
   readonly endpoint?: string;
 
+  /**
+   * The message is scrubbed here as well as at the record point, so an error
+   * built anywhere in the client never carries a credential even if a caller
+   * stores error.message directly.
+   */
   constructor(message: string, statusCode?: number, endpoint?: string) {
-    super(message);
+    super(scrubErrorText(message));
     this.name = "VeracodeApiError";
     this.statusCode = statusCode;
     this.endpoint = endpoint;
@@ -565,8 +802,14 @@ export function buildVeracodeAuthorizationHeader(
   return `${AUTH_SCHEME} id=${input.apiKeyId},ts=${timestampMs},nonce=${nonceHex},sig=${signature}`;
 }
 
-function redactSecret(text: string, secret: string): string {
-  return secret.length > 0 ? text.split(secret).join("[REDACTED]") : text;
+/** The caller's API key pair; every form of each is removed from error text. */
+function configuredSecretsOf(config: Pick<VeracodeResolvedConfig, "apiKeyId" | "apiKeySecret">): string[] {
+  return [config.apiKeyId, config.apiKeySecret];
+}
+
+/** Describes a body that is not JSON by size only; the text itself is never kept. */
+function describeNonJsonBody(rawText: string): string {
+  return `non-JSON response body (${Buffer.byteLength(rawText)} bytes, not recorded)`;
 }
 
 /** Keeps only the vendor's message fields from an error body; a non-JSON body is described by size, never quoted. */
@@ -578,8 +821,29 @@ function errorDetailFrom(rawText: string): string {
     const message = [asString(payload.message), asString(payload.error_description), asString(payload.error), ...embeddedErrors].filter((item): item is string => Boolean(item)).join("; ");
     return message.length > 0 ? message.replace(/\s+/g, " ").slice(0, 240) : `JSON response body (${rawText.length} bytes) carried no message field`;
   } catch {
-    return `non-JSON response body (${rawText.length} bytes, not recorded)`;
+    return describeNonJsonBody(rawText);
   }
+}
+
+/**
+ * Parses a 2xx body. A body that is not a JSON object (an HTML sign-in page,
+ * a proxy notice) is an unreadable surface, not an empty result, and is
+ * described by size: JSON.parse's own message quotes a window of the text and
+ * is never interpolated.
+ */
+function parseSuccessBody(response: Response, rawText: string, endpoint: string): JsonRecord {
+  if (rawText.length === 0) return {};
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(rawText);
+  } catch {
+    throw new VeracodeApiError(
+      `Veracode request to ${endpoint} returned an unreadable response (${response.status} ${response.statusText}): ${describeNonJsonBody(rawText)}`,
+      response.status,
+      endpoint,
+    );
+  }
+  return asObject(parsed) ?? {};
 }
 
 function extractEmbedded(payload: JsonRecord, embeddedKey: string): JsonRecord[] {
@@ -651,16 +915,14 @@ export class VeracodeApiClient {
           signal: controller.signal,
         });
         const rawText = await response.text();
-        if (response.ok) {
-          return rawText.length > 0 ? asObject(JSON.parse(rawText)) ?? {} : {};
-        }
+        if (response.ok) return parseSuccessBody(response, rawText, url.pathname);
         const retryable = response.status === 429 || response.status >= 500;
         if (retryable && attempt < this.config.retries) {
           attempt += 1;
           await this.sleep(Math.min(250 * 2 ** attempt, 8_000));
           continue;
         }
-        const detail = redactSecret(errorDetailFrom(rawText), this.config.apiKeySecret);
+        const detail = scrubErrorText(errorDetailFrom(rawText), configuredSecretsOf(this.config));
         throw new VeracodeApiError(
           `Veracode request failed (${response.status} ${response.statusText}) for ${url.pathname}${detail ? `: ${detail}` : ""}`,
           response.status,
@@ -668,8 +930,8 @@ export class VeracodeApiClient {
         );
       } catch (error) {
         if (error instanceof VeracodeApiError) throw error;
-        const message = redactSecret(error instanceof Error ? error.message : String(error), this.config.apiKeySecret);
-        if (attempt < this.config.retries && !(error instanceof SyntaxError)) {
+        const message = scrubErrorText(error instanceof Error ? error.message : String(error), configuredSecretsOf(this.config));
+        if (attempt < this.config.retries) {
           attempt += 1;
           await this.sleep(Math.min(250 * 2 ** attempt, 8_000));
           continue;
@@ -829,6 +1091,11 @@ type ClientLike = Pick<
   | "getDynamicScanConfiguration"
 >;
 
+/**
+ * The record point for every surface error: the message is scrubbed here as
+ * well as in VeracodeApiError, so an error thrown by anything other than the
+ * client (a mocked reader, a JSON parse) is recorded without a credential too.
+ */
 async function surface<T>(load: () => Promise<T>): Promise<Surface<T>> {
   try {
     return { status: "ok", value: await load() };
@@ -836,11 +1103,16 @@ async function surface<T>(load: () => Promise<T>): Promise<Surface<T>> {
     const statusCode = asNumber(asObject(error)?.statusCode);
     return {
       status: "error",
-      error: error instanceof Error ? error.message : String(error),
+      error: toolErrorText(error),
       statusCode,
       endpoint: asString(asObject(error)?.endpoint),
     };
   }
+}
+
+/** The text a tool result or a surface keeps for a thrown value: scrubbed here as well as in the VeracodeApiError constructor. */
+function toolErrorText(error: unknown): string {
+  return scrubErrorText(error instanceof Error ? error.message : String(error));
 }
 
 /**
@@ -2745,7 +3017,7 @@ export function registerVeracodeTools(pi: any): void {
         const result = await checkVeracodeAccess(createClient(args));
         return textResult(formatAccessCheckText(result), { tool: "veracode_check_access", ...result });
       } catch (error) {
-        return errorResult(`Veracode access check failed: ${error instanceof Error ? error.message : String(error)}`, { tool: "veracode_check_access" });
+        return errorResult(`Veracode access check failed: ${toolErrorText(error)}`, { tool: "veracode_check_access" });
       }
     },
   });
@@ -2775,7 +3047,7 @@ export function registerVeracodeTools(pi: any): void {
         });
         return textResult(formatAssessmentText(result), { tool: "veracode_assess_scan_coverage", title: result.title, summary: result.summary, findings: result.findings, errors: result.errors });
       } catch (error) {
-        return errorResult(`Veracode scan coverage assessment failed: ${error instanceof Error ? error.message : String(error)}`, { tool: "veracode_assess_scan_coverage" });
+        return errorResult(`Veracode scan coverage assessment failed: ${toolErrorText(error)}`, { tool: "veracode_assess_scan_coverage" });
       }
     },
   });
@@ -2792,7 +3064,7 @@ export function registerVeracodeTools(pi: any): void {
         const result = await assessVeracodePolicyCompliance(createClient(args), { maxApplications: args.max_applications });
         return textResult(formatAssessmentText(result), { tool: "veracode_assess_policy_compliance", title: result.title, summary: result.summary, findings: result.findings, errors: result.errors });
       } catch (error) {
-        return errorResult(`Veracode policy compliance assessment failed: ${error instanceof Error ? error.message : String(error)}`, { tool: "veracode_assess_policy_compliance" });
+        return errorResult(`Veracode policy compliance assessment failed: ${toolErrorText(error)}`, { tool: "veracode_assess_policy_compliance" });
       }
     },
   });
@@ -2814,7 +3086,7 @@ export function registerVeracodeTools(pi: any): void {
         const result = await assessVeracodeFindingsHygiene(createClient(args), { maxApplications: args.max_applications, maxFpRatePercent: args.max_fp_rate_percent, maxFlawDensityPerKloc: args.max_flaw_density_per_kloc });
         return textResult(formatAssessmentText(result), { tool: "veracode_assess_findings_hygiene", title: result.title, summary: result.summary, findings: result.findings, errors: result.errors });
       } catch (error) {
-        return errorResult(`Veracode findings hygiene assessment failed: ${error instanceof Error ? error.message : String(error)}`, { tool: "veracode_assess_findings_hygiene" });
+        return errorResult(`Veracode findings hygiene assessment failed: ${toolErrorText(error)}`, { tool: "veracode_assess_findings_hygiene" });
       }
     },
   });
@@ -2836,7 +3108,7 @@ export function registerVeracodeTools(pi: any): void {
         const result = await assessVeracodeScaPosture(createClient(args), { maxApplications: args.max_applications, maxWorkspaces: args.max_workspaces, scaCvssThreshold: args.sca_cvss_threshold });
         return textResult(formatAssessmentText(result), { tool: "veracode_assess_sca_posture", title: result.title, summary: result.summary, findings: result.findings, errors: result.errors });
       } catch (error) {
-        return errorResult(`Veracode SCA posture assessment failed: ${error instanceof Error ? error.message : String(error)}`, { tool: "veracode_assess_sca_posture" });
+        return errorResult(`Veracode SCA posture assessment failed: ${toolErrorText(error)}`, { tool: "veracode_assess_sca_posture" });
       }
     },
   });
@@ -2859,7 +3131,7 @@ export function registerVeracodeTools(pi: any): void {
         const result = await assessVeracodeAccessControls(createClient(args), { maxAdmins: args.max_admins, maxUnrestrictedUsers: args.max_unrestricted_users, inactiveDays: args.inactive_days, maxCredentialAgeDays: args.max_credential_age_days });
         return textResult(formatAssessmentText(result), { tool: "veracode_assess_access_controls", title: result.title, summary: result.summary, findings: result.findings, errors: result.errors });
       } catch (error) {
-        return errorResult(`Veracode access controls assessment failed: ${error instanceof Error ? error.message : String(error)}`, { tool: "veracode_assess_access_controls" });
+        return errorResult(`Veracode access controls assessment failed: ${toolErrorText(error)}`, { tool: "veracode_assess_access_controls" });
       }
     },
   });
@@ -2897,7 +3169,7 @@ export function registerVeracodeTools(pi: any): void {
           { tool: "veracode_export_audit_bundle", output_dir: result.outputDir, zip_path: result.zipPath, finding_count: result.findingCount, file_count: result.fileCount, error_count: result.errorCount },
         );
       } catch (error) {
-        return errorResult(`Veracode audit bundle export failed: ${error instanceof Error ? error.message : String(error)}`, { tool: "veracode_export_audit_bundle" });
+        return errorResult(`Veracode audit bundle export failed: ${toolErrorText(error)}`, { tool: "veracode_export_audit_bundle" });
       }
     },
   });

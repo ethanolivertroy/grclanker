@@ -29,6 +29,7 @@ import {
   resolveSecureOutputPath,
   resolveSumologicBaseUrl,
   resolveSumologicConfiguration,
+  scrubErrorText,
 } from "../dist/extensions/grc-tools/sumologic.js";
 import { getRegisteredToolSummaries } from "../dist/pi/tool-catalog.js";
 import { assertSecretsAbsent, readBundleFiles, readZipEntries } from "./helpers/bundle-contents.mjs";
@@ -1172,7 +1173,7 @@ test("rule 9: error bodies and vendor messages are scrubbed at the record point,
   assert.match(connections.error, /^Sumo Logic request to \/v1\/connections failed \(502 Bad Gateway\): non-JSON body \(text\/html, \d+ bytes\)$/);
   const roles = await client.listRoles();
   assert.equal(roles.ok, false);
-  assert.match(roles.error, /failed \(403 forbidden\): Denied while fetching https:\/\/api\.example\.com\/v1\/x for this key, sent with Authorization: \[REDACTED\] \[REDACTED\], api_key=\[REDACTED\] \(session_id: \[REDACTED\]\) and \[REDACTED\]$/);
+  assert.match(roles.error, /failed \(403 forbidden\): Denied while fetching https:\/\/api\.example\.com\/v1\/x\?\[REDACTED\] for this key, sent with Authorization: Bearer \[REDACTED\], api_key=\[REDACTED\] \(session_id: \[REDACTED\]\) and \[REDACTED\]$/);
   const collectors = await client.listCollectors();
   assert.equal(collectors.ok, false, "a 200 with a non-JSON body is an unreadable surface, not an empty inventory");
   assert.match(collectors.error, /returned an unreadable response \(200 OK\): non-JSON body \(text\/html, \d+ bytes\)$/);
@@ -1189,7 +1190,7 @@ test("rule 9: error bodies and vendor messages are scrubbed at the record point,
   const governance = results[2];
   assert.equal(byId(governance, "SUMO-10").status, "manual");
   assert.match(byId(governance, "SUMO-10").summary, /non-JSON body \(text\/html, \d+ bytes\)/, "the finding carries the status-and-length note instead of the body");
-  assert.match(byId(results[1], "SUMO-06").evidence.endpoint_error, /https:\/\/api\.example\.com\/v1\/x for this key/, "the URL keeps scheme, host, and path so the error stays legible");
+  assert.match(byId(results[1], "SUMO-06").evidence.endpoint_error, /https:\/\/api\.example\.com\/v1\/x\?\[REDACTED\] for this key/, "the URL keeps scheme, host, and path so the error stays legible, and its query collapses to a marker");
 
   const base = createTempBase("grclanker-sumo-error-bodies-");
   const exported = await exportSumologicAuditBundle(client, sampleConfig(), base, { now: NOW });
@@ -1314,8 +1315,8 @@ test("rule 9: every Sumo Logic surface that fails with a 502 HTML page or a JSON
         if (variant === "html") {
           assert.match(text, /\(502 Bad Gateway\): non-JSON body \(text\/html, \d+ bytes\)/, `${label}: the error carries the status-and-length note, got ${text}`);
         } else {
-          assert.match(text, /https:\/\/api\.example\.com\/v1\/x(?![?#])/, `${label}: the URL keeps scheme, host, and path, got ${text}`);
-          assert.match(text, /Authorization: \[REDACTED\]/, `${label}: the authorization value is redacted, got ${text}`);
+          assert.match(text, /https:\/\/api\.example\.com\/v1\/x\?\[REDACTED\] for this key/, `${label}: the URL keeps scheme, host, and path and its query collapses to a marker, got ${text}`);
+          assert.match(text, /Authorization: Bearer \[REDACTED\]/, `${label}: the authorization scheme stays and its value is redacted, got ${text}`);
         }
       }
     }
@@ -1754,4 +1755,46 @@ test("Sumo Logic tools are registered in the tool catalog under the Sumo Logic g
   const exportTool = tools.find((tool) => tool.name === "sumologic_export_audit_bundle");
   assert.ok(exportTool.parameterSummaries.some((parameter) => parameter.name === "output_dir"));
   assert.ok(exportTool.parameterSummaries.some((parameter) => parameter.name === "endpoint"));
+});
+
+test("rule 9: scrub boundary: a name-shaped value stays bare in prose and is removed inside every carrier, as a configured secret in every encoding, and whenever it has a real token shape", () => {
+  const name = "prod-us-east-2026";
+  const bare = `Sumo Logic request failed for tenant ${name} owned by sess-canary-COOKIE-31415926535897`;
+  assert.equal(scrubErrorText(bare), bare, "a name-shaped value bare in prose is indistinguishable from a resource name");
+  assert.equal(scrubErrorText(bare, [name]), "Sumo Logic request failed for tenant [REDACTED] owned by sess-canary-COOKIE-31415926535897", "the same value registered as a configured secret is removed");
+  const carriers = [
+    [`Cookie: sid=${name}; Path=/`, "Cookie: [REDACTED]"],
+    [`Set-Cookie: session=${name}; HttpOnly`, "Set-Cookie: [REDACTED]"],
+    [`X-Api-Key: ${name} rejected`, "X-Api-Key: [REDACTED] rejected"],
+    [`Authorization: Basic ${name} rejected`, "Authorization: Basic [REDACTED] rejected"],
+    [`token=${name} rejected`, "token=[REDACTED] rejected"],
+    [`{"client_secret": "${name}"} rejected`, '{"client_secret": "[REDACTED]"} rejected'],
+    [`(session_id: ${name}) rejected`, "(session_id: [REDACTED]) rejected"],
+    [`https://svc:${name}@host/p?k=${name} rejected`, "https://host/p?[REDACTED] rejected"],
+    [`Bearer ${name} rejected`, "Bearer [REDACTED] rejected"],
+    [`SSWS ${name} rejected`, "SSWS [REDACTED] rejected"],
+    ["Basic authentication is required", "Basic authentication is required"],
+    ["InvalidAuthenticationToken: Access token has expired", "InvalidAuthenticationToken: Access token has expired"],
+  ];
+  for (const [input, expected] of carriers) assert.equal(scrubErrorText(input), expected, input);
+  const secret = 'top secret/value+1"x';
+  const forms = {
+    raw: secret,
+    json: JSON.stringify(secret).slice(1, -1),
+    url: encodeURIComponent(secret),
+    base64: Buffer.from(secret).toString("base64"),
+    base64url: Buffer.from(secret).toString("base64url"),
+  };
+  const encoded = Object.entries(forms).map(([label, form]) => `${label}=${form}`).join(" ");
+  assert.equal(scrubErrorText(encoded, [secret]), "raw=[REDACTED] json=[REDACTED] url=[REDACTED] base64=[REDACTED] base64url=[REDACTED]");
+  assert.equal(
+    scrubErrorText("bare shapes eyJhbGciOiJSUzI1NiJ9.eyJzdWIiOiJhIn0.c2lnbmF0dXJl 9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08 QmFzZTY0K1N5bWJvbHM= aB3xZ9qL2mN8pR4tV7wY1 ABCD-EFGH-1234-5678 xKqZvBnMwLpRtYsHdG stay-01 name_with_words-2026 ERR_MODULE_NOT_FOUND"),
+    "bare shapes [REDACTED] [REDACTED] [REDACTED] [REDACTED] [REDACTED] [REDACTED] stay-01 name_with_words-2026 ERR_MODULE_NOT_FOUND",
+    "a JWT, a hex digest, a padded base64 run, scattered digits, a second numeric segment, and token casing are removed bare; short runs, names, and uppercase codes stay",
+  );
+  assert.equal(
+    scrubErrorText("failed for /api/v1/users/aB3xZ9qL2mN8pR4tV7wY1/factors from /tmp/run-9b6rz9m4l55zg7/config.yaml and https://hooks.example.com/services/T0/aB3xZ9qL2mN8pR4tV7wY1"),
+    "failed for /api/v1/users/aB3xZ9qL2mN8pR4tV7wY1/factors from /tmp/run-9b6rz9m4l55zg7/config.yaml and https://hooks.example.com/services/T0/[REDACTED]",
+    "a token-shaped segment of a bare request target or file path is an identifier the run named; inside a URL it is a webhook token",
+  );
 });
