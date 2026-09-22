@@ -2859,11 +2859,15 @@ export function assessOktaAuthentication(
       ),
     );
   } else if (certIdps.length > 0 || certAuthenticators.length > 0) {
+    const unreadList = data.idps.error ? "identity provider" : data.authenticators.error ? "authenticator" : undefined;
+    const detected = `Detected ${certIdps.length + certAuthenticators.length} ACTIVE certificate-oriented IdP or authenticator entries`;
     findings.push(
       buildFinding(
         "OKTA-AUTH-008",
-        "Pass",
-        `Detected ${certIdps.length + certAuthenticators.length} ACTIVE certificate-oriented IdP or authenticator entries${data.idps.error || data.authenticators.error ? " (one source was unreadable; see evidence)" : ""}.`,
+        unreadList ? "Partial" : "Pass",
+        unreadList
+          ? `${detected}, but the ${unreadList} list was unreadable, so the other half of the certificate inventory could not be verified.`
+          : `${detected}.`,
         [
           ...certIdps.map((idp) => `IdP: ${recordName(idp)} (${asString(idp.status)})`),
           ...certAuthenticators.map((auth) => `Authenticator: ${authenticatorLabel(auth)}`),

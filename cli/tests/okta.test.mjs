@@ -1896,13 +1896,24 @@ test("multi-inventory verdicts name the unreadable secondary source (OKTA-AUTH-0
   assert.match(adminMfa.summary, /authenticator list was unreadable/);
   assert.ok(adminMfa.evidence.includes("Strong authenticators: unknown (authenticator list unreadable)"));
   assert.ok(adminMfa.evidence.some((line) => /^Authenticator error: .*403 Forbidden/.test(line)));
+  const certIdpOnly = findingById(authResult, "OKTA-AUTH-008");
+  assert.equal(certIdpOnly.status, "Partial", "a found certificate IdP never passes while the authenticator list is unreadable");
+  assert.match(certIdpOnly.summary, /^Detected 1 ACTIVE certificate-oriented IdP or authenticator entries, but the authenticator list was unreadable, so the other half of the certificate inventory could not be verified\.$/);
+  assert.ok(certIdpOnly.evidence.includes("IdP: PIV Smart Card (ACTIVE)"), "the found IdP stays in evidence");
+  assert.ok(certIdpOnly.evidence.some((line) => /^Authenticator data unavailable: .*\/api\/v1\/authenticators \(403 Forbidden\)/.test(line)));
 
   const idpUnreadable = createSampleAuthenticationData();
   idpUnreadable.idps = dataset([], "Okta API request failed for /api/v1/idps (403 Forbidden): Access denied");
   const certFinding = findingById(assessOktaAuthentication(idpUnreadable, config), "OKTA-AUTH-008");
-  assert.equal(certFinding.status, "Pass", "an ACTIVE certificate authenticator proves the capability on its own");
-  assert.match(certFinding.summary, /one source was unreadable; see evidence/);
-  assert.ok(certFinding.evidence.some((line) => /^IdP data unavailable: .*403 Forbidden/.test(line)));
+  assert.equal(certFinding.status, "Partial", "a found certificate authenticator never passes while the IdP list is unreadable");
+  assert.match(certFinding.summary, /^Detected 1 ACTIVE certificate-oriented IdP or authenticator entries, but the identity provider list was unreadable, so the other half of the certificate inventory could not be verified\.$/);
+  assert.doesNotMatch(certFinding.summary, /one source was unreadable/);
+  assert.ok(certFinding.evidence.includes("Authenticator: smart_card_idp / Smart Card"), "the found authenticator stays in evidence");
+  assert.ok(certFinding.evidence.some((line) => /^IdP data unavailable: .*\/api\/v1\/idps \(403 Forbidden\)/.test(line)));
+
+  const bothReadable = findingById(assessOktaAuthentication(createSampleAuthenticationData(), config), "OKTA-AUTH-008");
+  assert.equal(bothReadable.status, "Pass");
+  assert.equal(bothReadable.summary, "Detected 2 ACTIVE certificate-oriented IdP or authenticator entries.");
 
   const orgFactorsUnreadable = createSampleAuthenticationData();
   orgFactorsUnreadable.orgFactors = dataset([], "Okta API request failed for /api/v1/org/factors (403 Forbidden): Access denied");
@@ -2010,14 +2021,14 @@ function recordingOktaFetch({ denied = [] } = {}) {
 
 const RECORDING_CONFIG = { orgUrl: "https://tenant.example.okta.com", authMode: "SSWS", token: "okta-test-token", scopes: [], sourceChain: ["tests"] };
 
-/** Every top-level Okta dataset: the request that produces it, its core_data file, the per-parent files that are never requested when it is denied, the assess category that reads it, the snapshot counters that must render null, and the access probe that reads the same surface. */
+/** Every top-level Okta dataset: the request that produces it, its core_data file, the per-parent files that are never requested when it is denied, the assess category that reads it, the snapshot counters that must render null, the access probe that reads the same surface, and the multi-inventory findings that must not pass while it is unreadable (the found item they keep in evidence). */
 const OKTA_DATASETS = [
   { name: "sign-on policies", pattern: /^\/api\/v1\/policies\?type=OKTA_SIGN_ON&limit=\d+$/, file: "core_data/sign_on_policies.json", skipped: ["core_data/sign_on_policy_rules.json"], category: "authentication", nullCounters: ["sign_on_policies", "admin_dashboard_policies", "admin_mfa_rules"], probe: "policies" },
   { name: "password policies", pattern: /^\/api\/v1\/policies\?type=PASSWORD&limit=\d+$/, file: "core_data/password_policies.json", skipped: ["core_data/password_policy_rules.json"], category: "authentication", nullCounters: ["password_policies"] },
   { name: "MFA enrollment policies", pattern: /^\/api\/v1\/policies\?type=MFA_ENROLL&limit=\d+$/, file: "core_data/mfa_enrollment_policies.json", skipped: [], category: "authentication", nullCounters: [] },
   { name: "access policies", pattern: /^\/api\/v1\/policies\?type=ACCESS_POLICY&limit=\d+$/, file: "core_data/access_policies.json", skipped: ["core_data/access_policy_rules.json"], category: "authentication", nullCounters: ["access_policies", "admin_dashboard_policies", "admin_mfa_rules"] },
-  { name: "authenticators", pattern: /^\/api\/v1\/authenticators$/, file: "core_data/authenticators.json", skipped: [], category: "authentication", nullCounters: ["active_authenticators", "strong_authenticators", "phishing_resistant_authenticators", "restricted_authenticators"], nullLabels: ["okta_verify_fips_mode"] },
-  { name: "identity providers", pattern: /^\/api\/v1\/idps\?limit=\d+$/, file: "core_data/idps.json", skipped: [], category: "authentication", nullCounters: [] },
+  { name: "authenticators", pattern: /^\/api\/v1\/authenticators$/, file: "core_data/authenticators.json", skipped: [], category: "authentication", nullCounters: ["active_authenticators", "strong_authenticators", "phishing_resistant_authenticators", "restricted_authenticators"], nullLabels: ["okta_verify_fips_mode"], notPass: [{ id: "OKTA-AUTH-008", summary: /, but the authenticator list was unreadable, so the other half of the certificate inventory could not be verified\.$/, found: "IdP: PIV Smart Card (ACTIVE)" }] },
+  { name: "identity providers", pattern: /^\/api\/v1\/idps\?limit=\d+$/, file: "core_data/idps.json", skipped: [], category: "authentication", nullCounters: [], notPass: [{ id: "OKTA-AUTH-008", summary: /, but the identity provider list was unreadable, so the other half of the certificate inventory could not be verified\.$/, found: "Authenticator: smart_card_idp / Smart Card" }] },
   { name: "authorization servers", pattern: /^\/api\/v1\/authorizationServers\?limit=\d+$/, file: "core_data/authorization_servers.json", skipped: [], category: "authentication", nullCounters: [] },
   { name: "default authorization server", pattern: /^\/api\/v1\/authorizationServers\/default$/, file: "core_data/default_authorization_server.json", skipped: [], category: "authentication", nullCounters: [] },
   { name: "org factors", pattern: /^\/api\/v1\/org\/factors\?limit=\d+$/, file: "core_data/org_factors.json", skipped: [], category: "authentication", nullCounters: [] },
@@ -2195,6 +2206,13 @@ test("collection status: a denied dataset is written to core_data as a not-colle
       assert.equal(summary[key], "not collected", `${label}: ${dataset.category} snapshot ${key}`);
     }
     assert.match(run.results[dataset.category].text, /not collected/, `${label}: the assessment text says so`);
+
+    for (const expectation of dataset.notPass ?? []) {
+      const finding = findingById(run.results[dataset.category], expectation.id);
+      assert.notEqual(finding.status, "Pass", `${label}: ${expectation.id} reads this list and never passes while it is unreadable`);
+      assert.match(finding.summary, expectation.summary, `${label}: ${expectation.id} names the unread list`);
+      assert.ok(finding.evidence.includes(expectation.found), `${label}: ${expectation.id} keeps the found item in evidence: ${finding.evidence.join(" | ")}`);
+    }
 
     if (dataset.probe) {
       const probe = run.access.probes.find((item) => item.key === dataset.probe);
