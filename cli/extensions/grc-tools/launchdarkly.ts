@@ -18,7 +18,7 @@ import { homedir } from "node:os";
 import { basename, dirname, join, relative, resolve } from "node:path";
 import { ZipArchive } from "archiver";
 import { Type } from "@sinclair/typebox";
-import { REDACTED, createCredentialScrubber } from "./credential-scrub.js";
+import { DEFAULT_DATA_SCRUB_DEPTH, REDACTED, createCredentialScrubber } from "./credential-scrub.js";
 import { errorResult, formatTable, textResult } from "./shared.js";
 
 type FetchImpl = typeof fetch;
@@ -828,33 +828,49 @@ function isNameValuePair(record: JsonRecord): boolean {
   return "value" in record && (typeof record.name === "string" || typeof record.key === "string");
 }
 
-const REDACTION_DEPTH_LIMIT = 12;
-
 /**
- * Recursively redacts credential-shaped keys, reduces every absolute URL to scheme plus host, and blanks the value of
- * {name, value} or {key, value} pairs (header lists). Arrays and nested objects are walked; the shape is preserved.
+ * Header lists ({name, value} or {key, value}) lose their value whatever the name says: an integration subscription's
+ * custom header is a credential more often than not, and nothing downstream reads the value. Booleans and numbers
+ * pass through; the shape is preserved.
  */
-export function redactCredentialValues(value: unknown, depth = 0): unknown {
-  if (depth > REDACTION_DEPTH_LIMIT) return REDACTED;
-  if (typeof value === "string") return reduceUrl(value);
-  if (Array.isArray(value)) return value.map((entry) => redactCredentialValues(entry, depth + 1));
-  const record = asObject(value);
-  if (!record) return value;
+function blankPairValues(value: unknown, depth = 0): unknown {
+  if (depth > DEFAULT_DATA_SCRUB_DEPTH || value === null || typeof value !== "object") return value;
+  if (Array.isArray(value)) return value.map((entry) => blankPairValues(entry, depth + 1));
+  const record = value as JsonRecord;
   const pair = isNameValuePair(record);
   return Object.fromEntries(Object.entries(record).map(([key, entry]) => {
-    if (entry === undefined || entry === null) return [key, entry];
-    if (typeof entry === "string") {
-      // Booleans and numbers under credential-shaped keys (serviceToken: true) carry no secret, so only strings are blanked.
-      if (isCredentialKey(key) || (pair && key === "value")) return [key, REDACTED];
-      // A url/endpoint key whose value is not an absolute URL may still be a host-relative path carrying a token. The
-      // inspector's own request labels ("GET /api/v2/...") name the request a read made and carry no credential.
-      if (isUrlKey(key) && !ABSOLUTE_URL_PATTERN.test(entry) && !REQUEST_LABEL_PATTERN.test(entry)) return [key, REDACTED];
-      return [key, reduceUrl(entry)];
-    }
-    if (typeof entry !== "object") return [key, entry];
-    if (pair && key === "value") return [key, REDACTED];
-    return [key, redactCredentialValues(entry, depth + 1)];
+    if (pair && key === "value" && entry !== null && entry !== undefined && typeof entry !== "boolean" && typeof entry !== "number") return [key, REDACTED];
+    return [key, blankPairValues(entry, depth + 1)];
   }));
+}
+
+/**
+ * Data-side pass over everything written to core_data/ and everything a finding reads. The whole subtree under a
+ * credential-shaped key becomes [REDACTED] whether it is a string, a list (`tokens: [...]`), or an object
+ * (`credentials: { value }`); header pairs lose their value; a url/endpoint key keeps scheme and host of an absolute
+ * URL and is blanked when it holds a host-relative path (which may carry a token), except for the inspector's own
+ * request labels ("GET /api/v2/..."), which name a read and carry no credential; and every other string, free text
+ * included (`comment`, `description`, `name`, `title`), gets the shared scrubber's pattern pass: query tokens
+ * anywhere in the text, bearer and assignment carriers, LaunchDarkly key shapes, real token shapes, and the
+ * configured secrets. Booleans, numbers, and nulls pass through.
+ */
+export function redactCredentialValues(value: unknown): unknown {
+  return credentialScrubber.scrubData(blankPairValues(value), {
+    isCredentialKey,
+    transformString: (text, key) => {
+      if (key !== undefined && isUrlKey(key) && !ABSOLUTE_URL_PATTERN.test(text) && !REQUEST_LABEL_PATTERN.test(text)) return REDACTED;
+      return reduceUrl(text);
+    },
+  });
+}
+
+/**
+ * The client's collection boundary: every record a listing or single-resource read returns passes through the
+ * data-side scrub once, so an assess payload's snapshots, the findings' evidence, and the bundle all read the same
+ * scrubbed record; the export's second pass over snapshots is defense in depth against a fake or future client.
+ */
+function scrubCollectedRecord(record: JsonRecord): JsonRecord {
+  return asObject(redactCredentialValues(record)) ?? record;
 }
 
 /** Keeps only the flag fields the hygiene verdicts read; variation values and rule clauses are user data and are dropped. */
@@ -1281,6 +1297,34 @@ function extractItems(payload: JsonRecord): JsonRecord[] {
   return asRecordArray(payload.items);
 }
 
+/**
+ * The documented shape of a successful body. Every list endpoint the inspector reads answers with an object carrying an
+ * `items` array (empty when the inventory is empty); a single resource answers with an object carrying at least one of
+ * its documented keys. A 2xx whose body is empty, is not JSON, or has another shape (a portal or proxy page, a status
+ * document, a different API behind the same host) is a failed read of that request, not an empty inventory.
+ */
+type LaunchdarklyResponseShape =
+  | { kind: "list" }
+  | { kind: "object"; documentedKeys: readonly string[] };
+
+const LIST_SHAPE: LaunchdarklyResponseShape = { kind: "list" };
+// GET /api/v2/caller-identity as documented; a body carrying none of these is some other service's JSON.
+const CALLER_IDENTITY_SHAPE: LaunchdarklyResponseShape = { kind: "object", documentedKeys: ["accountId", "memberId", "tokenId", "tokenName", "serviceToken", "clientId", "environmentId", "projectId"] };
+// GET /api/v2/members/{id} as documented.
+const MEMBER_SHAPE: LaunchdarklyResponseShape = { kind: "object", documentedKeys: ["_id", "email", "role", "customRoles", "mfa", "_lastSeen", "teams"] };
+
+function matchesResponseShape(payload: unknown, shape: LaunchdarklyResponseShape): payload is JsonRecord {
+  const record = asObject(payload);
+  if (!record) return false;
+  if (shape.kind === "list") return Array.isArray(record.items);
+  return shape.documentedKeys.some((key) => key in record);
+}
+
+/** Fixed text naming the documented shape; nothing from the body enters it. */
+function describeResponseShape(shape: LaunchdarklyResponseShape): string {
+  return shape.kind === "list" ? "list object with an items array" : `resource object with any of ${shape.documentedKeys.join(", ")}`;
+}
+
 // Only LaunchDarkly's documented JSON error fields (code, message) are quoted; anything else is described, never echoed,
 // so no reflected header or token from a proxy or WAF page can reach the bundle. The message is redacted before it is
 // cut to length: cutting first could leave the tail of a token that the whole-value scrub no longer recognizes.
@@ -1460,9 +1504,10 @@ export class LaunchdarklyApiClient {
     return Math.min(500 * 2 ** attempt, MAX_RATE_LIMIT_WAIT_MS);
   }
 
-  private async fetchJson(url: string, options: { apiVersion?: string } = {}): Promise<JsonRecord> {
+  private async fetchJson(url: string, options: { apiVersion?: string; shape?: LaunchdarklyResponseShape } = {}): Promise<JsonRecord> {
     // Every error names the request as it was actually issued (path plus non-pagination query), never a template.
     const endpoint = requestLabel(url);
+    const shape = options.shape ?? LIST_SHAPE;
     for (let attempt = 0; ; attempt += 1) {
       const pause = this.pauseUntil - Date.now();
       if (pause > 0) await this.sleep(Math.min(pause, MAX_RATE_LIMIT_WAIT_MS));
@@ -1516,10 +1561,27 @@ export class LaunchdarklyApiClient {
           endpoint,
         );
       }
+      // A success status is not a success by itself. An empty body, a portal or proxy page, or JSON of some other shape
+      // is not an empty inventory; each is recorded as a failed read of this request with the status the server sent,
+      // so the dependents go manual instead of passing or failing on data that was never observed. The body is never
+      // echoed: the parser's message would quote it.
+      if (rawText.trim().length === 0) {
+        throw new LaunchdarklyApiError(
+          this.redact(`LaunchDarkly response for ${endpoint} returned ${statusLine(response)} with an empty body (0 bytes); the endpoint is not serving the JSON API.`),
+          response.status,
+          endpoint,
+        );
+      }
       if (!payload) {
-        // The body is not echoed: the parser's message would quote it, and a 200 with a non-JSON body is typically a portal page.
         throw new LaunchdarklyApiError(
           this.redact(`LaunchDarkly response for ${endpoint} was not valid JSON (${describeOpaqueBody(response, rawText)}).`),
+          response.status,
+          endpoint,
+        );
+      }
+      if (!matchesResponseShape(payload, shape)) {
+        throw new LaunchdarklyApiError(
+          this.redact(`LaunchDarkly response for ${endpoint} returned ${statusLine(response)} with a JSON body that is not the documented ${describeResponseShape(shape)} (${Buffer.byteLength(rawText, "utf8")} bytes, not echoed); the endpoint is not serving the JSON API.`),
           response.status,
           endpoint,
         );
@@ -1528,8 +1590,10 @@ export class LaunchdarklyApiClient {
     }
   }
 
-  async get(path: string, query: JsonRecord = {}, options: { apiVersion?: string } = {}): Promise<JsonRecord> {
-    return this.fetchJson(this.buildUrl(path, query), options);
+  /** Reads one resource; the body must carry at least one of the documented keys, or the read fails with the observed status. */
+  async get(path: string, query: JsonRecord = {}, options: { apiVersion?: string; shape?: LaunchdarklyResponseShape } = {}): Promise<JsonRecord> {
+    const payload = await this.fetchJson(this.buildUrl(path, query), { ...options, shape: options.shape ?? { kind: "object", documentedKeys: ["_id", "_links", "key", "name", "items"] } });
+    return scrubCollectedRecord(payload);
   }
 
   async list(
@@ -1594,7 +1658,7 @@ export class LaunchdarklyApiClient {
     }
 
     return {
-      items,
+      items: items.map(scrubCollectedRecord),
       // A refused next link leaves the remainder unread even when the server total matches the items seen so far.
       truncated: truncationReason !== undefined || (total !== undefined ? total > items.length : remaining),
       seen: items.length,
@@ -1611,11 +1675,11 @@ export class LaunchdarklyApiClient {
     options: { apiVersion?: string } = {},
   ): Promise<LaunchdarklyCollection> {
     const url = this.buildUrl(path, query);
-    return singlePageCollection(await this.fetchJson(url, options), requestLabel(url), mapItem);
+    return singlePageCollection(await this.fetchJson(url, options), requestLabel(url), (item) => scrubCollectedRecord(mapItem(item)));
   }
 
   async getCallerIdentity(): Promise<JsonRecord> {
-    return this.get("/api/v2/caller-identity");
+    return this.get("/api/v2/caller-identity", {}, { shape: CALLER_IDENTITY_SHAPE });
   }
 
   async listMembers(limit = DEFAULT_MEMBER_LIMIT): Promise<LaunchdarklyCollection> {
@@ -1623,7 +1687,7 @@ export class LaunchdarklyApiClient {
   }
 
   async getMember(memberId: string): Promise<JsonRecord> {
-    return this.get(`/api/v2/members/${encodeURIComponent(memberId)}`);
+    return this.get(`/api/v2/members/${encodeURIComponent(memberId)}`, {}, { shape: MEMBER_SHAPE });
   }
 
   async listTeams(limit = DEFAULT_TEAM_LIMIT): Promise<LaunchdarklyCollection> {

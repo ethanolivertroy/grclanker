@@ -2032,7 +2032,7 @@ test("verdict rule 9: the LaunchDarkly bundle and its zip never carry credential
   const config = subscriptions[0].items[0].config;
   assert.equal(config.url, "https://hooks.example.com");
   assert.deepEqual(config.headers, [{ name: "Authorization", value: "[REDACTED]" }]);
-  assert.equal(config.destination.credentials.apiKey, "[REDACTED]");
+  assert.equal(config.destination.credentials, "[REDACTED]", "the whole subtree under a credential-shaped key is blanked, not only its string leaves");
   const flags = JSON.parse(files.get(join("core_data", "flags.json")));
   assert.equal(flags[0].items[0].variations, 2, "flag variations are projected to a count");
   assert.equal(flags[0].items[0].environments.production.rules, 1, "rule clauses are projected to a count");
@@ -2828,6 +2828,41 @@ function isLdFallback(path, value, baselineValue) {
   return !LD_READ_STATE_PATHS.some((pattern) => pattern.test(path));
 }
 
+/**
+ * Diffs every summary and evidence leaf of a degraded run (tool payloads and the bundle's analysis summaries) against
+ * the all-readable baseline, appending each zero, false, or empty fallback to `offenders`; returns the leaf count.
+ */
+function ldCollectFallbacks(label, degraded, baseline, files, baselineFiles, offenders) {
+  let comparedLeaves = 0;
+  for (const [areaIndex, result] of degraded.entries()) {
+    const baselineResult = baseline[areaIndex];
+    for (const [path, value] of ldLeafEntries(result.summary)) {
+      comparedLeaves += 1;
+      const baselineValue = ldPluck(baselineResult.summary, path);
+      if (isLdFallback(path, value, baselineValue)) offenders.push(`${label}: ${result.category} summary.${path} = ${JSON.stringify(value)} (baseline ${JSON.stringify(baselineValue)})`);
+    }
+    for (const item of result.findings) {
+      const baselineFinding = finding(baselineResult, item.id);
+      for (const [path, value] of ldLeafEntries(item.evidence ?? {})) {
+        comparedLeaves += 1;
+        const baselineValue = ldPluck(baselineFinding.evidence ?? {}, path);
+        if (isLdFallback(path, value, baselineValue)) offenders.push(`${label}: ${item.id} evidence.${path} = ${JSON.stringify(value)} (baseline ${JSON.stringify(baselineValue)})`);
+      }
+    }
+  }
+  // The bundle's assessment-level summaries get the same treatment as the tool payloads.
+  for (const [, area] of LD_AREAS.map(([category]) => [category, `analysis/${category}.json`])) {
+    if (!files.has(area)) continue;
+    const summary = JSON.parse(files.get(area)).summary ?? {};
+    const baselineSummary = JSON.parse(baselineFiles.get(area)).summary ?? {};
+    for (const [path, value] of ldLeafEntries(summary)) {
+      comparedLeaves += 1;
+      if (isLdFallback(path, value, ldPluck(baselineSummary, path))) offenders.push(`${label}: ${area} summary.${path} = ${JSON.stringify(value)}`);
+    }
+  }
+  return comparedLeaves;
+}
+
 test("addendum 3: under every single-inventory denial no LaunchDarkly finding, summary, or tool payload falls back to a zero, false, or empty value, and no principal is named from the denied inventory", async () => {
   const baselineRun = httpLaunchdarkly(ldPrincipalFixture());
   const baseline = await runAllLaunchdarklyAssessments(baselineRun.client);
@@ -2877,32 +2912,7 @@ test("addendum 3: under every single-inventory denial no LaunchDarkly finding, s
       ];
       assert.ok(!deniedText.includes(canary), `${label}: ${canary} is still named from the denied inventory at ${where.join(", ")}`);
     }
-    for (const [areaIndex, result] of denied.entries()) {
-      const baselineResult = baseline[areaIndex];
-      for (const [path, value] of ldLeafEntries(result.summary)) {
-        comparedLeaves += 1;
-        const baselineValue = ldPluck(baselineResult.summary, path);
-        if (isLdFallback(path, value, baselineValue)) offenders.push(`${label}: ${result.category} summary.${path} = ${JSON.stringify(value)} (baseline ${JSON.stringify(baselineValue)})`);
-      }
-      for (const item of result.findings) {
-        const baselineFinding = finding(baselineResult, item.id);
-        for (const [path, value] of ldLeafEntries(item.evidence ?? {})) {
-          comparedLeaves += 1;
-          const baselineValue = ldPluck(baselineFinding.evidence ?? {}, path);
-          if (isLdFallback(path, value, baselineValue)) offenders.push(`${label}: ${item.id} evidence.${path} = ${JSON.stringify(value)} (baseline ${JSON.stringify(baselineValue)})`);
-        }
-      }
-    }
-    // The bundle's assessment-level summaries get the same treatment as the tool payloads.
-    for (const [, area] of LD_AREAS.map(([category]) => [category, `analysis/${category}.json`])) {
-      if (!files.has(area)) continue;
-      const summary = JSON.parse(files.get(area)).summary ?? {};
-      const baselineSummary = JSON.parse(baselineFiles.get(area)).summary ?? {};
-      for (const [path, value] of ldLeafEntries(summary)) {
-        comparedLeaves += 1;
-        if (isLdFallback(path, value, ldPluck(baselineSummary, path))) offenders.push(`${label}: ${area} summary.${path} = ${JSON.stringify(value)}`);
-      }
-    }
+    comparedLeaves += ldCollectFallbacks(label, denied, baseline, files, baselineFiles, offenders);
     if (denial.inventory === "caller_identity") {
       const metadata = JSON.parse(files.get("metadata.json"));
       assert.equal(metadata.account_id, null, "the account id is unknown when the caller identity was not readable");
@@ -2910,6 +2920,182 @@ test("addendum 3: under every single-inventory denial no LaunchDarkly finding, s
   }
   assert.ok(comparedLeaves > 3000, `expected the sweep to compare thousands of leaves, got ${comparedLeaves}`);
   assert.deepEqual(offenders, [], `values that fell back to zero, false, or empty under a denial:\n${offenders.join("\n")}`);
+});
+
+// ---------------------------------------------------------------------------------------------------------------
+// Silent success: a 200 whose body is not the documented shape is a failed read, never an empty inventory.
+// ---------------------------------------------------------------------------------------------------------------
+
+/** A word planted in every silent body; any echo of the body into an output is caught by looking for it. */
+const LD_SILENT_MARKER = "SilentPortalMarkerZq";
+
+/** The four bodies a 200 can carry without being a LaunchDarkly answer, with the fixed note each must produce. */
+const LD_SILENT_BODIES = [
+  { name: "empty body", response: () => new Response("", { status: 200, statusText: "OK" }), note: /returned 200 OK with an empty body \(0 bytes\); the endpoint is not serving the JSON API/ },
+  { name: "HTML page", response: () => new Response(`<html><body><h1>Sign in</h1><p>${LD_SILENT_MARKER}</p></body></html>`, { status: 200, statusText: "OK", headers: { "content-type": "text/html; charset=utf-8" } }), note: /was not valid JSON \(200 OK: non-JSON body \(text\/html, \d+ bytes, not echoed\)\)/ },
+  { name: "foreign JSON object", response: () => jsonResponse({ status: "ok", service: LD_SILENT_MARKER, version: "3.2.1" }), note: /returned 200 OK with a JSON body that is not the documented (list object with an items array|resource object with any of [A-Za-z_, ]+) \(\d+ bytes, not echoed\); the endpoint is not serving the JSON API/ },
+  { name: "JSON array", response: () => jsonResponse([{ _id: LD_SILENT_MARKER, email: "array@example.com" }]), note: /returned 200 OK with a JSON body that is not the documented (list object with an items array|resource object with any of [A-Za-z_, ]+) \(\d+ bytes, not echoed\)/ },
+];
+
+/** Answers one dataset's route with a silent 200; audit log datasets share a route and are told apart by their query. */
+function ldSilentDataset(base, denial, variant) {
+  if (denial.query === undefined) return () => variant.response();
+  return (url, params, init) => (denial.query(url) ? variant.response() : base[denial.route](url, params, init));
+}
+
+test("verdict rule 1 (silent success): LaunchdarklyApiClient treats a 200 with an empty, HTML, foreign-JSON, or array body as a failed read with http_status 200 and a fixed note, never as an empty inventory", async () => {
+  for (const variant of LD_SILENT_BODIES) {
+    const client = new LaunchdarklyApiClient(sampleConfig(), { fetchImpl: async () => variant.response(), maxRetries: 0 });
+    await assert.rejects(client.listMembers(5), (error) => {
+      assert.ok(error instanceof LaunchdarklyApiError, `${variant.name}: the read fails as an API error`);
+      assert.equal(error.status, 200, `${variant.name}: the observed 200 travels with the error`);
+      assert.equal(error.endpoint, "GET /api/v2/members");
+      assert.match(error.message, variant.note, `${variant.name}: the message is the fixed note`);
+      assert.ok(!error.message.includes(LD_SILENT_MARKER) && !error.message.includes("array@example.com") && !error.message.includes("3.2.1"), `${variant.name}: nothing from the body is echoed`);
+      return true;
+    });
+    await assert.rejects(client.getCallerIdentity(), (error) => {
+      assert.ok(error instanceof LaunchdarklyApiError);
+      assert.equal(error.status, 200, `${variant.name}: a single-resource read is guarded the same way`);
+      assert.ok(!error.message.includes(LD_SILENT_MARKER));
+      return true;
+    });
+  }
+
+  // The documented shapes still read: an empty inventory is `items: []`, and a caller identity carries its documented keys.
+  const documented = new LaunchdarklyApiClient(sampleConfig(), {
+    fetchImpl: async (input) => (String(input).includes("caller-identity") ? jsonResponse({ accountId: "acct-1", memberId: "m1" }) : jsonResponse({ items: [], totalCount: 0 })),
+  });
+  const none = await documented.listMembers(5);
+  assert.deepEqual({ items: none.items, truncated: none.truncated, seen: none.seen, total: none.total }, { items: [], truncated: false, seen: 0, total: 0 }, "a documented empty listing stays a readable empty inventory");
+  assert.equal((await documented.getCallerIdentity()).accountId, "acct-1");
+});
+
+test("verdict rule 1 (silent success): a silent 200 on any LaunchDarkly inventory is recorded not_readable with the observed 200, nothing passes or fails on it, no value falls back, and nothing from the body is echoed", async () => {
+  const baselineRun = httpLaunchdarkly(ldPrincipalFixture());
+  const baseline = await runAllLaunchdarklyAssessments(baselineRun.client);
+  const baselineExport = await exportLaunchdarklyAuditBundle(baselineRun.client, baselineRun.config, createTempBase("grclanker-ld-silent-baseline-"), { now: NOW });
+  const baselineFiles = readBundleFiles(baselineExport.outputDir);
+
+  const offenders = [];
+  let comparedLeaves = 0;
+  let rowsChecked = 0;
+  for (const [index, denial] of LD_SINGLE_INVENTORY_DENIALS.entries()) {
+    // Every inventory meets one silent body and every body meets several inventories; the client test above covers each pair.
+    const variant = LD_SILENT_BODIES[index % LD_SILENT_BODIES.length];
+    const fixture = ldPrincipalFixture();
+    const { client, config, log } = httpLaunchdarkly(fixture, { routes: { [denial.route]: ldSilentDataset(ldRoutes(fixture), denial, variant) } });
+    const degraded = await runAllLaunchdarklyAssessments(client);
+    const exported = await exportLaunchdarklyAuditBundle(client, config, createTempBase("grclanker-ld-silent-"), { now: NOW });
+    const files = readBundleFiles(exported.outputDir);
+    const label = `${denial.inventory} answered with a silent 200 (${variant.name})`;
+
+    comparedLeaves += ldCollectFallbacks(label, degraded, baseline, files, baselineFiles, offenders);
+    const outputs = new Map([...files, ["assess payloads", JSON.stringify(degraded)]]);
+    for (const [name, text] of outputs) {
+      assert.ok(!text.includes(LD_SILENT_MARKER), `${label}: the body text was echoed into ${name}`);
+    }
+    assert.ok(log.some((entry) => entry.status === 200), `${label}: the 200 the rows cite was observed on the wire`);
+
+    if (denial.file === null) {
+      const metadata = JSON.parse(files.get("metadata.json"));
+      assert.equal(metadata.account_id, null, `${label}: the account id is unknown when the caller identity was not readable`);
+      continue;
+    }
+    const status = JSON.parse(files.get("core_data/collection_status.json"));
+    const rows = status.inventories.filter((row) => row.inventory === denial.inventory);
+    assert.ok(rows.length > 0, `${label}: the inventory has a collection_status row`);
+    for (const row of rows) {
+      rowsChecked += 1;
+      assert.deepEqual(
+        { status: row.status, collected: row.collected, http_status: row.http_status, complete: row.complete, truncated: row.truncated, truncation_reason: row.truncation_reason, seen: row.seen, total: row.total },
+        { status: "not_readable", collected: false, http_status: 200, complete: null, truncated: null, truncation_reason: null, seen: null, total: null },
+        `${label}: the row is a failed read carrying the observed 200, with every flag and count null`,
+      );
+      assert.match(row.error, variant.note, `${label}: the row's error is the fixed note`);
+      assert.match(row.endpoint, /^GET \/api\/v2\//, `${label}: the row names the request that was made`);
+    }
+    const record = JSON.parse(files.get(denial.file));
+    const markers = Array.isArray(record) ? record : Array.isArray(record.failed_reads) ? record.failed_reads : [record];
+    for (const marker of markers) {
+      assert.deepEqual({ collected: marker.collected, status: marker.status, items: marker.items, seen: marker.seen }, { collected: false, status: 200, items: null, seen: null }, `${label}: ${denial.file} is a marker object with the observed 200, not an empty array`);
+    }
+  }
+  assert.ok(rowsChecked >= LD_CORE_DATA_DATASETS.length, `every dataset produced at least one row, got ${rowsChecked}`);
+  assert.ok(comparedLeaves > 3000, `expected the sweep to compare thousands of leaves, got ${comparedLeaves}`);
+  assert.deepEqual(offenders, [], `values that fell back to zero, false, or empty under a silent 200:\n${offenders.join("\n")}`);
+});
+
+// ---------------------------------------------------------------------------------------------------------------
+// Data-side carriers: credential subtrees and free text in collected records.
+// ---------------------------------------------------------------------------------------------------------------
+
+// Random alphanumeric values with no 6-character window in common with each other or the fixture (self-checked below).
+const LD_DATA_CANARIES = {
+  tokensEntry: "itUua8RSaaYJmiJJafrKLp7xzGScVwRi",
+  credentialsValue: "Vp8CkeZuEMbdWw5eD9FfgsrZEFCFBcAV",
+  secretValue: "56eDKUCdKB43HRb5QAXnPEJt4VQB6bwi",
+  customHeaderValue: "HUZVrVBd6HGoeNEMKHNdtiC3EBjRfC9K",
+  commentToken: "3HBmKocR7PPS5uBfjHMcVCV7WgcSJFhH",
+  descriptionBearer: "xbNmLM27AbakCH5EMqypSkSNTkqHc3d6",
+  titleQuery: "tUgNTdkCYRefmSZrsDsEk2Fxjn7CHfyG",
+  nameAssignment: "LR53Hd7BzBVfXcjtksAYPnwYLg79V4xf",
+  roleDescriptionToken: "gG8UG456pXwM9PVP6LAeK9KXvPEJbo7v",
+};
+
+test("verdict rule 9 (data-side carriers): LaunchDarkly blanks the whole subtree under tokens, credentials, and secret keys and scrubs bare tokens, bearer and assignment carriers, and query tokens out of free text before core_data and analysis files are written", async () => {
+  const canaries = Object.values(LD_DATA_CANARIES);
+  const baselineRun = httpLaunchdarkly(ldFixture());
+  const baselineExport = await exportLaunchdarklyAuditBundle(baselineRun.client, baselineRun.config, createTempBase("grclanker-ld-data-baseline-"), { now: NOW });
+  assertCanaryFixture(assert, canaries, readBundleFiles(baselineExport.outputDir), "data-side canaries");
+
+  const fixture = ldFixture();
+  fixture.integrations.datadog[0] = {
+    ...fixture.integrations.datadog[0],
+    config: {
+      url: `https://hooks.example.com/ingest/${LD_DATA_CANARIES.tokensEntry.slice(0, 8)}`,
+      tokens: [LD_DATA_CANARIES.tokensEntry],
+      credentials: { value: LD_DATA_CANARIES.credentialsValue, kind: "api" },
+      secret: { value: LD_DATA_CANARIES.secretValue },
+      headers: [{ name: "X-Custom-Route", value: LD_DATA_CANARIES.customHeaderValue }],
+    },
+  };
+  fixture.auditLog.recent[0] = {
+    ...fixture.auditLog.recent[0],
+    comment: `rotated the ingest key to ${LD_DATA_CANARIES.commentToken} during the incident`,
+    description: `set header Authorization: Bearer ${LD_DATA_CANARIES.descriptionBearer} on the relay`,
+    title: `pointed the sink at https://api.example.com/v1/x?access_token=${LD_DATA_CANARIES.titleQuery} for a week`,
+    name: `api_key=${LD_DATA_CANARIES.nameAssignment}`,
+  };
+  fixture.customRoles[0] = { ...fixture.customRoles[0], description: `Release role; break-glass token ${LD_DATA_CANARIES.roleDescriptionToken} lives in the vault` };
+
+  const { client, config } = httpLaunchdarkly(fixture);
+  const assessments = await runAllLaunchdarklyAssessments(client);
+  const exported = await exportLaunchdarklyAuditBundle(client, config, createTempBase("grclanker-ld-data-"), { now: NOW });
+  const files = readBundleFiles(exported.outputDir);
+  const entries = readZipEntries(exported.zipPath);
+
+  assertCanaryWindowsAbsent(assert, files, canaries, "bundle file");
+  assertCanaryWindowsAbsent(assert, entries, canaries, "zip entry");
+  assertCanaryWindowsAbsent(assert, new Map([["assess payloads", JSON.stringify(assessments)]]), canaries, "assess payload");
+
+  const subscriptions = JSON.parse(files.get("core_data/integration_subscriptions.json"));
+  const written = subscriptions[0].items[0].config;
+  assert.equal(written.tokens, "[REDACTED]", "a credential-shaped list is blanked whole, not walked");
+  assert.equal(written.credentials, "[REDACTED]", "a credential-shaped object is blanked whole");
+  assert.equal(written.secret, "[REDACTED]");
+  assert.deepEqual(written.headers, [{ name: "X-Custom-Route", value: "[REDACTED]" }], "a header pair loses its value whatever its name");
+  assert.equal(written.url, "https://hooks.example.com", "a URL field keeps scheme and host only");
+  const audit = JSON.parse(files.get("core_data/audit_log_recent.json"));
+  const entry = audit.items[0];
+  assert.equal(entry.comment, "rotated the ingest key to [REDACTED] during the incident", "a bare token in free text is removed and the prose kept");
+  assert.match(entry.description, /^set header Authorization: (Bearer )?\[REDACTED\] on the relay$/, "a bearer carrier in free text loses its value");
+  assert.match(entry.title, /^pointed the sink at https:\/\/api\.example\.com\S* for a week$/, "a query token in free text goes with the URL's query");
+  assert.doesNotMatch(entry.title, /access_token=[^[]/);
+  assert.equal(entry.name, "api_key=[REDACTED]", "an assignment carrier in a name field loses its value");
+  const roles = JSON.parse(files.get("core_data/custom_roles.json"));
+  assert.equal(roles.items[0].description, "Release role; break-glass token [REDACTED] lives in the vault");
+  assert.equal(roles.items[0].key, "release-manager", "an identifier key is untouched");
 });
 
 // ---------------------------------------------------------------------------------------------------------------
