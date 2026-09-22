@@ -316,7 +316,9 @@ test("config loader errors carry fixed text, the path, a validated code, and a s
       canaries: [LOADER_CANARIES.jsonUnquoted],
       // A JSON flow mapping with a bare scalar is valid YAML, so the loader reads it as a
       // setting and the resolver fails later on the missing keys without echoing anything.
+      // JSON.parse is the positive control here: its message quotes a window of the source.
       libraryThrows: false,
+      jsonParseCarriesFragment: true,
       expected: () => "TENABLE_ACCESS_KEY and TENABLE_SECRET_KEY (or access_key and secret_key arguments) are required for Tenable Vulnerability Management.",
     },
     {
@@ -324,6 +326,7 @@ test("config loader errors carry fixed text, the path, a validated code, and a s
       file: write("short.json", `{"token":${LOADER_CANARIES.jsonShort}}`),
       canaries: [LOADER_CANARIES.jsonShort],
       libraryThrows: false,
+      jsonParseCarriesCanary: true,
       expected: () => "TENABLE_ACCESS_KEY and TENABLE_SECRET_KEY (or access_key and secret_key arguments) are required for Tenable Vulnerability Management.",
     },
     {
@@ -363,6 +366,15 @@ test("config loader errors carry fixed text, the path, a validated code, and a s
       // Positive control: the parser's own message quotes the file contents.
       assert.throws(() => parseYaml(readFileSync(entry.file, "utf8")), (error) => {
         assert.ok(entry.canaries.some((canary) => error.message.includes(canary)), `${entry.label}: positive control expected the library message to carry a canary: ${error.message}`);
+        return true;
+      });
+    }
+    if (entry.jsonParseCarriesFragment || entry.jsonParseCarriesCanary) {
+      // Positive control for the JSON shapes: JSON.parse quotes a 10-character window
+      // around the failure, or the whole source of a file this short.
+      assert.throws(() => JSON.parse(readFileSync(entry.file, "utf8")), (error) => {
+        if (entry.jsonParseCarriesCanary) assert.ok(error.message.includes(entry.canaries[0]), `${entry.label}: positive control expected the whole canary: ${error.message}`);
+        if (entry.jsonParseCarriesFragment) assert.ok(error.message.includes(entry.canaries[0].slice(0, 8)), `${entry.label}: positive control expected a canary fragment: ${error.message}`);
         return true;
       });
     }
