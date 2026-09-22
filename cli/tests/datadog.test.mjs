@@ -70,6 +70,7 @@ function sampleConfig(overrides = {}) {
 function jsonResponse(value, options = {}) {
   return new Response(JSON.stringify(value), {
     status: options.status ?? 200,
+    ...(options.statusText ? { statusText: options.statusText } : {}),
     headers: {
       "content-type": "application/json",
       ...(options.headers ?? {}),
@@ -2762,4 +2763,595 @@ test("Datadog tools are registered in the tool catalog under the Datadog group",
     assert.equal(tool.kind, "domain");
     assert.ok(tool.parameterSummaries.some((parameter) => parameter.name === "site"));
   }
+});
+
+// ---------------------------------------------------------------------------------------------------------------
+// Addenda 2, 3, and 5. The fixtures below drive the real DatadogApiClient through an HTTP router that records every
+// request it served, so the status codes and endpoints named in the output can be checked against the requests the
+// run actually made, and a principal fixture plants names that only ever appear in one inventory so their absence
+// under that inventory's denial proves gating.
+// ---------------------------------------------------------------------------------------------------------------
+
+const DD_CANARIES = {
+  bearer: "BEARER_CANARY_9f8e7d6c5b4a3210",
+  cookie: "SESSION_CANARY_0123456789abcdef",
+  apiKey: "APIKEY_CANARY_fedcba9876543210",
+  urlToken: "URLTOKEN_CANARY_1122334455667788",
+  jwt: "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJKV1RfQ0FOQVJZX2FiY2RlZjAxMjM0NTY3ODkifQ.JWT_CANARY_SIGNATURE_abcdef0123456789",
+};
+
+function ddCanaryValues() {
+  return Object.values(DD_CANARIES);
+}
+
+const DD_HTML_ERROR_BODY = `<html><body><h1>502 Bad Gateway</h1><p>upstream sent Authorization: Bearer ${DD_CANARIES.bearer}; Set-Cookie: session=${DD_CANARIES.cookie}; api_key=${DD_CANARIES.apiKey}; retry at https://api.example.com/v1/x?token=${DD_CANARIES.urlToken} later; jwt ${DD_CANARIES.jwt}</p></body></html>`;
+
+/** A proxy error page: non-JSON, carrying every credential class in its body. */
+function htmlGateway() {
+  return () => new Response(DD_HTML_ERROR_BODY, { status: 502, statusText: "Bad Gateway", headers: { "content-type": "text/html; charset=utf-8" } });
+}
+
+/** Datadog's documented JSON error shape whose message embeds a URL with a credential in its query string. */
+function jsonForbiddenWithUrl() {
+  return () => jsonResponse({ errors: [`Forbidden; see https://api.example.com/v1/x?token=${DD_CANARIES.urlToken} for details`] }, { status: 403, statusText: "Forbidden" });
+}
+
+function asArray(value) {
+  return Array.isArray(value) ? value : [];
+}
+
+function listingItems(value) {
+  return Array.isArray(value) ? value : asArray(value?.items ?? value?.data);
+}
+
+function numberedPage(url, list) {
+  const size = Number(url.searchParams.get("page[size]"));
+  const page = Number(url.searchParams.get("page[number]") ?? 0);
+  return { data: list.slice(page * size, (page + 1) * size), meta: { page: { total_count: list.length } } };
+}
+
+/**
+ * Serves a method-level fixture client over HTTP in the envelopes the Datadog API uses (v2 `data`/`meta.page`
+ * paging, v1 arrays, `orgs`, `indexes`, `dashboards`, `accounts`), so the real DatadogApiClient can be exercised
+ * against the same fixtures the assess tests use.
+ */
+function routesFromClient(client) {
+  return {
+    "GET /api/v1/validate": async () => jsonResponse(await client.validateApiKey()),
+    "GET /api/v2/validate_keys": async () => jsonResponse(await client.validateKeyPair()),
+    "GET /api/v1/org": async () => jsonResponse({ orgs: [await client.getOrganization()] }),
+    "GET /api/v2/org_configs": async () => jsonResponse({ data: await client.listOrgConfigs() }),
+    "GET /api/v2/org_connections": async (url) => {
+      const list = listingItems(await client.listOrgConnections(100000));
+      const size = Number(url.searchParams.get("limit"));
+      const offset = Number(url.searchParams.get("offset") ?? 0);
+      return jsonResponse({ data: list.slice(offset, offset + size), meta: { page: { total_count: list.length } } });
+    },
+    "GET /api/v2/users": async (url) => jsonResponse(numberedPage(url, listingItems(await client.listUsers(100000)))),
+    "GET /api/v2/roles": async (url) => jsonResponse(numberedPage(url, listingItems(await client.listRoles(100000)))),
+    "GET /api/v2/roles/{id}/permissions": async (url) => jsonResponse({ data: await client.listRolePermissions(decodeURIComponent(url.pathname.split("/")[4])) }),
+    "GET /api/v2/api_keys": async (url) => jsonResponse(numberedPage(url, listingItems(await client.listApiKeys(100000)))),
+    "GET /api/v2/application_keys": async (url) => {
+      const keys = await client.listApplicationKeys(100000);
+      return jsonResponse({ ...numberedPage(url, asArray(keys.data)), included: asArray(keys.included) });
+    },
+    "GET /api/v2/audit/events": async (url) => jsonResponse({
+      data: listingItems(await client.listAuditEvents({ sort: url.searchParams.get("sort") })).slice(0, Number(url.searchParams.get("page[limit]"))),
+      meta: { page: {} },
+    }),
+    "GET /api/v2/security_monitoring/rules": async (url) => jsonResponse(numberedPage(url, listingItems(await client.listSecurityRules(100000)))),
+    "GET /api/v2/security_monitoring/signals": async (url) => jsonResponse({
+      data: listingItems(await client.listSecuritySignals({ limit: 100000 })).slice(0, Number(url.searchParams.get("page[limit]"))),
+      meta: { page: {} },
+    }),
+    "GET /api/v2/posture_management/findings": async (url) => {
+      const result = await client.listPostureFindings({ evaluation: url.searchParams.get("filter[evaluation]") ?? undefined, limit: 100000 });
+      return jsonResponse({
+        data: asArray(result.data).slice(0, Number(url.searchParams.get("page[limit]"))),
+        meta: { page: { total_filtered_count: result.total_filtered_count ?? undefined } },
+      });
+    },
+    "GET /api/v2/ip_allowlist": async () => jsonResponse(await client.getIpAllowlist()),
+    "GET /api/v2/sensitive-data-scanner/config": async () => jsonResponse(await client.getSensitiveDataScannerConfig()),
+    "GET /api/v1/logs/config/pipelines": async () => jsonResponse(await client.listLogPipelines()),
+    "GET /api/v1/logs/config/indexes": async () => jsonResponse({ indexes: await client.listLogIndexes() }),
+    "GET /api/v2/logs/config/archives": async () => jsonResponse({ data: await client.listLogArchives() }),
+    "GET /api/v1/dashboard": async (url) => {
+      const list = url.searchParams.get("filter[shared]") === "true" ? listingItems(await client.listDashboards({ shared: true, limit: 100000 })) : [];
+      const count = Number(url.searchParams.get("count"));
+      const start = Number(url.searchParams.get("start") ?? 0);
+      return jsonResponse({ dashboards: list.slice(start, start + count) });
+    },
+    "GET /api/v1/monitor": async (url) => {
+      const list = listingItems(await client.listMonitors(100000));
+      const size = Number(url.searchParams.get("page_size"));
+      const page = Number(url.searchParams.get("page") ?? 0);
+      return jsonResponse(list.slice(page * size, (page + 1) * size));
+    },
+    "GET /api/v1/integration/aws": async () => jsonResponse({ accounts: await client.listAwsIntegrations() }),
+    "GET /api/v1/integration/gcp": async () => jsonResponse(await client.listGcpIntegrations()),
+    "GET /api/v1/integration/azure": async () => jsonResponse(await client.listAzureIntegrations()),
+  };
+}
+
+/** Fetch replacement that routes by method and path and records the status of every response it served. */
+function createDatadogRouter(routes, log = []) {
+  return async (input, init = {}) => {
+    const url = new URL(typeof input === "string" ? input : input.toString());
+    const method = init.method ?? "GET";
+    const handler = routes[`${method} ${url.pathname.replace(/^\/api\/v2\/roles\/[^/]+\/permissions$/, "/api/v2/roles/{id}/permissions")}`];
+    if (!handler) throw new Error(`no fixture route for ${method} ${url.pathname}`);
+    const response = await handler(url, init);
+    log.push({ method, url: url.toString(), path: url.pathname, status: response.status });
+    return response;
+  };
+}
+
+function httpClient(routes, log, configOverrides = {}) {
+  const config = sampleConfig({ maxRetries: 0, ...configOverrides });
+  return { config, client: new DatadogApiClient(config, { fetchImpl: createDatadogRouter(routes, log) }) };
+}
+
+function ddMentionedEndpoints(text) {
+  return [...text.matchAll(/\b(GET|POST|PUT|PATCH|DELETE)\s+(\/[A-Za-z0-9_./?=&{}[\]-]+)/g)]
+    .map((match) => ({ method: match[1], path: match[2].split("?")[0].replace(/[.,;:)]+$/, "") }));
+}
+
+function ddMentionedStatusCodes(text) {
+  const codes = new Set();
+  for (const match of text.matchAll(/\b([1-5]\d\d) (?:OK|Forbidden|Unauthorized|Bad Request|Not Found|Too Many Requests|Internal Server Error|Bad Gateway|Service Unavailable|Gateway Timeout|Error)\b/g)) codes.add(Number(match[1]));
+  for (const match of text.matchAll(/request failed \(([1-5]\d\d)\b/g)) codes.add(Number(match[1]));
+  for (const match of text.matchAll(/"(?:http_)?status":\s*([1-5]\d\d)\b/g)) codes.add(Number(match[1]));
+  for (const match of text.matchAll(/\bHTTP ([1-5]\d\d)\b/g)) codes.add(Number(match[1]));
+  return [...codes];
+}
+
+/** Asserts every endpoint and status code named anywhere in `outputs` was requested and observed according to `log`. */
+function assertOutputMatchesRequestLog(outputs, log, label) {
+  const requested = new Set(log.map((entry) => `${entry.method} ${entry.path}`));
+  const statuses = new Set(log.map((entry) => entry.status));
+  let endpointMentions = 0;
+  let statusMentions = 0;
+  for (const [name, text] of outputs) {
+    for (const { method, path } of ddMentionedEndpoints(text)) {
+      endpointMentions += 1;
+      assert.ok(requested.has(`${method} ${path}`), `${label}: ${name} names ${method} ${path} but the run never requested it; requested: ${[...requested].sort().join(", ")}`);
+    }
+    for (const code of ddMentionedStatusCodes(text)) {
+      statusMentions += 1;
+      assert.ok(statuses.has(code), `${label}: ${name} names HTTP ${code} but no request observed it; observed: ${[...statuses]}`);
+    }
+  }
+  return { endpointMentions, statusMentions };
+}
+
+async function runAllAssessments(client) {
+  return Promise.all([
+    assessDatadogIdentity(client, { now: NOW }),
+    assessDatadogAccessControls(client, { now: NOW }),
+    assessDatadogSecurityMonitoring(client, { now: NOW }),
+    assessDatadogDataProtection(client, { now: NOW }),
+  ]);
+}
+
+test("verdict rule 9 / addendum 2: the Datadog bundle, its zip, every assess payload, and the access check never carry canaries from error bodies, and errors carry the status-and-length note", async () => {
+  const routes = routesFromClient(leakyClient());
+  routes["GET /api/v2/ip_allowlist"] = htmlGateway();
+  routes["GET /api/v2/logs/config/archives"] = jsonForbiddenWithUrl();
+  const log = [];
+  const { client, config } = httpClient(routes, log);
+
+  const access = await checkDatadogAccess(client);
+  const result = await exportDatadogAuditBundle(client, config, createTempBase("grclanker-datadog-canary-"), { now: NOW });
+  const assessments = await runAllAssessments(client);
+
+  const files = readBundleFiles(result.outputDir);
+  const entries = readZipEntries(result.zipPath);
+  assert.ok(files.size >= 35 && entries.size === files.size, `expected the zip to mirror ${files.size} files, got ${entries.size}`);
+  const secrets = [...ddCanaryValues(), ...DATADOG_FAKE_SECRETS, config.apiKey, config.appKey];
+  assertSecretsAbsent(assert, files, secrets, "bundle file");
+  assertSecretsAbsent(assert, entries, secrets, "zip entry");
+  assertSecretsAbsent(assert, new Map([["check_access", JSON.stringify(access)], ["assessments", JSON.stringify(assessments)]]), secrets, "tool payload");
+  assert.equal(result.errorCount, 2, `only the two failing surfaces are recorded: ${files.get("_errors.log")}`);
+
+  // The non-JSON body is described by status and length; the JSON error is echoed with its URL query scrubbed.
+  const errors = files.get("_errors.log");
+  assert.match(errors, /^ip_allowlist: Datadog request failed \(502 Bad Gateway\) GET \/api\/v2\/ip_allowlist: 502 Bad Gateway: non-JSON body \(text\/html, \d+ bytes, not echoed\)$/m);
+  assert.match(errors, /^log_archives: Datadog request failed \(403 Forbidden\) GET \/api\/v2\/logs\/config\/archives: Forbidden; see https:\/\/api\.example\.com\/v1\/x\?\[REDACTED\] for details$/m);
+
+  // The observed status flows into the marker, the finding, the access surface, and the collection status; no "403" is
+  // invented for the 502 path.
+  const allowlist = JSON.parse(files.get("core_data/ip_allowlist.json"));
+  assert.deepEqual(
+    { collected: allowlist.collected, status: allowlist.status, endpoint: allowlist.endpoint, permission: allowlist.permission, reason: allowlist.reason },
+    { collected: false, status: 502, endpoint: "GET /api/v2/ip_allowlist", permission: "org_management", reason: "not_readable" },
+  );
+  assert.match(allowlist.error, /non-JSON body \(text\/html/);
+  const findings = JSON.parse(files.get("analysis/findings.json"));
+  const ipAllowlist = findings.find((item) => item.id === "DD-15");
+  assert.equal(ipAllowlist.status, "manual");
+  assert.match(ipAllowlist.summary, /^The IP allowlist \(org_management\) surface was not readable \(Datadog request failed \(502 Bad Gateway\) GET \/api\/v2\/ip_allowlist: 502 Bad Gateway: non-JSON body/);
+  assert.doesNotMatch(ipAllowlist.summary, /403/);
+  assert.deepEqual([ipAllowlist.evidence.enabled, ipAllowlist.evidence.entries, ipAllowlist.evidence.inventory.http_status, ipAllowlist.evidence.inventory.read], [null, null, 502, false]);
+  const archives = findings.find((item) => item.id === "DD-10");
+  assert.equal(archives.status, "manual");
+  assert.match(archives.summary, /Unreadable inventory: log_archives \(GET \/api\/v2\/logs\/config\/archives, logs_read_archives: Datadog request failed \(403 Forbidden\).*\[REDACTED\]/);
+  assert.equal(archives.evidence.archives, null);
+  assert.equal(archives.evidence.archive_destinations, null);
+  assert.equal(archives.evidence.failing_archives, null);
+
+  const allowlistProbe = access.surfaces.find((surface) => surface.name === "ip_allowlist");
+  assert.deepEqual(
+    { status: allowlistProbe.status, collected: allowlistProbe.collected, http_status: allowlistProbe.http_status, count: allowlistProbe.count },
+    { status: "not_readable", collected: false, http_status: 502, count: null },
+  );
+  assert.match(allowlistProbe.error, /502 Bad Gateway: non-JSON body \(text\/html, \d+ bytes, not echoed\)/);
+  const archiveProbe = access.surfaces.find((surface) => surface.name === "log_archives");
+  assert.deepEqual({ status: archiveProbe.status, collected: archiveProbe.collected, http_status: archiveProbe.http_status, count: archiveProbe.count }, { status: "forbidden", collected: false, http_status: 403, count: null });
+  assert.deepEqual(access.missingPermissions, ["logs_read_archives"]);
+  assert.deepEqual(access.permissionStateUnknown, ["ip_allowlist"]);
+  assert.equal(access.status, "limited");
+  assert.ok(access.notes.some((note) => /Permission state unknown for ip_allowlist: the probe failed without a permission denial/.test(note)), access.notes.join("\n"));
+
+  const status = JSON.parse(files.get("core_data/collection_status.json"));
+  const allowlistRow = status.inventories.find((row) => row.inventory === "ip_allowlist");
+  assert.deepEqual(
+    { status: allowlistRow.status, collected: allowlistRow.collected, http_status: allowlistRow.http_status, complete: allowlistRow.complete, truncated: allowlistRow.truncated, seen: allowlistRow.seen, total: allowlistRow.total },
+    { status: "not_readable", collected: false, http_status: 502, complete: null, truncated: null, seen: null, total: null },
+  );
+  assert.equal(status.totals.not_readable, 1);
+  assert.equal(status.totals.forbidden, 1);
+  assert.equal(status.totals.truncation_unknown, 2);
+
+  // The assess tools see the same denials with the same statuses.
+  const accessControls = assessments[1];
+  assert.equal(findingById(accessControls, "DD-15").status, "manual");
+  assert.match(findingById(accessControls, "DD-15").summary, /502 Bad Gateway/);
+  assert.equal(accessControls.summary.ip_allowlist_enabled, null);
+  assert.equal(assessments[3].summary.archives, null);
+});
+
+test("addendum 5: every endpoint and status code named in Datadog output corresponds to a request the run made and observed", async () => {
+  const routes = routesFromClient(healthyClient());
+  routes["GET /api/v2/ip_allowlist"] = htmlGateway();
+  routes["GET /api/v2/logs/config/archives"] = jsonForbiddenWithUrl();
+  routes["GET /api/v1/integration/gcp"] = () => jsonResponse({ errors: ["Forbidden"] }, { status: 403, statusText: "Forbidden" });
+  routes["GET /api/v2/roles/{id}/permissions"] = () => jsonResponse({ errors: ["Forbidden"] }, { status: 403, statusText: "Forbidden" });
+  const log = [];
+  const { client, config } = httpClient(routes, log);
+
+  const access = await checkDatadogAccess(client);
+  const result = await exportDatadogAuditBundle(client, config, createTempBase("grclanker-datadog-request-log-"), { now: NOW });
+  const assessments = await runAllAssessments(client);
+  const outputs = [...readBundleFiles(result.outputDir), ["check_access", JSON.stringify(access)], ["assessments", JSON.stringify(assessments)]];
+
+  const statuses = new Set(log.map((entry) => entry.status));
+  assert.deepEqual([...statuses].sort(), [200, 403, 502], `fixture served 200, 403, and 502; got ${[...statuses]}`);
+  assert.ok(log.some((entry) => entry.path === "/api/v2/roles/role-auditor/permissions" && entry.status === 403), "the per-role permission request was made and denied");
+  const { endpointMentions, statusMentions } = assertOutputMatchesRequestLog(outputs, log, "mixed denials");
+  assert.ok(endpointMentions > 40, `expected endpoint mentions across the bundle, got ${endpointMentions}`);
+  assert.ok(statusMentions > 5, `expected status mentions across the bundle, got ${statusMentions}`);
+
+  // The per-role gap names the request the run made, not the descriptor template.
+  const rbac = findingById(assessments[0], "DD-03");
+  assert.equal(rbac.status, "manual");
+  assert.match(rbac.summary, /Unreadable inventory: role_permissions \(GET \/api\/v2\/roles\/role-auditor\/permissions, user_access_read: Auditor: Datadog request failed \(403 Forbidden\) GET \/api\/v2\/roles\/role-auditor\/permissions: Forbidden\)/);
+  assert.ok(!JSON.stringify(outputs).includes("{id}"), "no templated endpoint reaches the output");
+  const roles = JSON.parse(readFileSync(join(result.outputDir, "core_data", "roles.json"), "utf8"));
+  assert.deepEqual(
+    { collected: roles.permissions_by_role["role-auditor"].collected, status: roles.permissions_by_role["role-auditor"].status, endpoint: roles.permissions_by_role["role-auditor"].endpoint },
+    { collected: false, status: 403, endpoint: "GET /api/v2/roles/role-auditor/permissions" },
+  );
+});
+
+/**
+ * Every list dataset written to core_data, the route that fills it, and the shape a readable-but-empty read leaves
+ * behind (`[]` for a bare list, a `data: []` envelope for application keys and posture findings).
+ */
+const DD_CORE_DATA_DATASETS = [
+  { route: "GET /api/v2/users", datasets: [["users", "core_data/users.json", (json) => json, "array"]] },
+  { route: "GET /api/v2/roles", datasets: [["roles", "core_data/roles.json", (json) => json.roles, "array"]] },
+  { route: "GET /api/v2/org_configs", datasets: [["org_configs", "core_data/org_configs.json", (json) => json, "array"]] },
+  { route: "GET /api/v2/api_keys", datasets: [["api_keys", "core_data/api_keys.json", (json) => json, "array"]] },
+  { route: "GET /api/v2/application_keys", datasets: [["application_keys", "core_data/application_keys.json", (json) => json, "envelope"]] },
+  { route: "GET /api/v1/dashboard", datasets: [["shared_dashboards", "core_data/shared_dashboards.json", (json) => json, "array"]] },
+  { route: "GET /api/v1/integration/aws", datasets: [["aws_integrations", "core_data/cloud_integrations.json", (json) => json.aws, "array"]] },
+  { route: "GET /api/v1/integration/gcp", datasets: [["gcp_integrations", "core_data/cloud_integrations.json", (json) => json.gcp, "array"]] },
+  { route: "GET /api/v1/integration/azure", datasets: [["azure_integrations", "core_data/cloud_integrations.json", (json) => json.azure, "array"]] },
+  { route: "GET /api/v2/security_monitoring/rules", datasets: [["security_rules", "core_data/security_rules.json", (json) => json, "array"]] },
+  { route: "GET /api/v2/security_monitoring/signals", datasets: [["security_signals", "core_data/security_signals.json", (json) => json, "array"]] },
+  {
+    route: "GET /api/v2/posture_management/findings",
+    datasets: [
+      ["posture_findings_fail", "core_data/posture_findings.json", (json) => json.failing, "envelope"],
+      ["posture_findings_pass", "core_data/posture_findings.json", (json) => json.passing, "envelope"],
+    ],
+  },
+  { route: "GET /api/v1/monitor", datasets: [["monitors", "core_data/monitors.json", (json) => json, "array"]] },
+  {
+    route: "GET /api/v2/audit/events",
+    datasets: [
+      ["audit_events_oldest", "core_data/audit_events.json", (json) => json.oldest, "array"],
+      ["audit_events_recent", "core_data/audit_events.json", (json) => json.recent, "array"],
+    ],
+  },
+  { route: "GET /api/v1/logs/config/pipelines", datasets: [["log_pipelines", "core_data/log_pipelines.json", (json) => json, "array"]] },
+  { route: "GET /api/v1/logs/config/indexes", datasets: [["log_indexes", "core_data/log_indexes.json", (json) => json, "array"]] },
+  { route: "GET /api/v2/logs/config/archives", datasets: [["log_archives", "core_data/log_archives.json", (json) => json, "array"]] },
+  { route: "GET /api/v2/org_connections", datasets: [["org_connections", "core_data/org_connections.json", (json) => json, "array"]] },
+];
+
+function isEmptyReadShape(value, shape) {
+  if (shape === "array") return Array.isArray(value) && value.length === 0;
+  return !Array.isArray(value) && value !== null && typeof value === "object" && Array.isArray(value.data) && value.data.length === 0 && value.collected === undefined;
+}
+
+test("addendum 5: under each single-inventory denial the denied dataset's core_data file is a not-collected marker while readable-but-empty datasets stay []", async () => {
+  for (const denial of DD_CORE_DATA_DATASETS) {
+    const routes = routesFromClient(emptyClient());
+    routes[denial.route] = jsonForbiddenWithUrl();
+    const log = [];
+    const { client, config } = httpClient(routes, log);
+    const result = await exportDatadogAuditBundle(client, config, createTempBase("grclanker-datadog-marker-"), { now: NOW });
+    const files = readBundleFiles(result.outputDir);
+    const label = `${denial.route} denied`;
+
+    for (const [inventory, file, select] of denial.datasets) {
+      const marker = select(JSON.parse(files.get(file)));
+      assert.ok(!Array.isArray(marker), `${label}: ${inventory} must be a marker object, never []`);
+      assert.equal(marker.collected, false, `${label}: ${inventory} marker carries collected: false`);
+      assert.equal(marker.status, 403, `${label}: ${inventory} marker carries the observed HTTP status`);
+      assert.equal(marker.endpoint.split(/[ ?]/).slice(0, 2).join(" "), denial.route, `${label}: ${inventory} marker names the endpoint that was requested`);
+      assert.equal(marker.reason, "not_readable");
+      assert.match(marker.error, /Datadog request failed \(403 Forbidden\)/);
+      assert.match(marker.error, /https:\/\/api\.example\.com\/v1\/x\?\[REDACTED\]/, `${label}: the marker error is scrubbed`);
+      assert.equal(typeof marker.permission, "string");
+
+      const row = JSON.parse(files.get("core_data/collection_status.json")).inventories.find((item) => item.inventory === inventory);
+      assert.deepEqual(
+        { status: row.status, collected: row.collected, http_status: row.http_status, complete: row.complete, truncated: row.truncated, seen: row.seen, total: row.total, truncation_reason: row.truncation_reason },
+        { status: "forbidden", collected: false, http_status: 403, complete: null, truncated: null, seen: null, total: null, truncation_reason: null },
+        `${label}: collection_status row for ${inventory}`,
+      );
+    }
+    for (const other of DD_CORE_DATA_DATASETS) {
+      if (other === denial) continue;
+      for (const [inventory, file, select, shape] of other.datasets) {
+        const value = select(JSON.parse(files.get(file)));
+        assert.ok(isEmptyReadShape(value, shape), `${label}: readable-but-empty ${inventory} stays ${shape === "array" ? "[]" : "{ data: [] }"}, got ${JSON.stringify(value)}`);
+      }
+    }
+    if (denial.route === "GET /api/v2/roles") {
+      // No per-role permission request can be made without the role list, so that dataset is marked not attempted
+      // and names no endpoint or status.
+      const permissions = JSON.parse(files.get("core_data/roles.json")).permissions_by_role;
+      assert.deepEqual(
+        { collected: permissions.collected, status: permissions.status, endpoint: permissions.endpoint, reason: permissions.reason },
+        { collected: false, status: "not-collected", endpoint: null, reason: "not_attempted" },
+      );
+    }
+
+    const status = JSON.parse(files.get("core_data/collection_status.json"));
+    assert.equal(status.totals.forbidden, denial.datasets.length, `${label}: totals count the denied inventories as forbidden`);
+    assert.equal(status.totals.truncation_unknown, denial.datasets.length, `${label}: a denied inventory is neither complete nor truncated`);
+    assert.equal(status.totals.readable + status.totals.forbidden, status.totals.inventories);
+    assert.match(files.get("_errors.log"), new RegExp(`^${denial.datasets[0][0]}: Datadog request failed \\(403 Forbidden\\)`, "m"));
+    assertSecretsAbsent(assert, files, ddCanaryValues(), `marker bundle for ${label}`);
+    assertOutputMatchesRequestLog([...files], log, label);
+  }
+});
+
+// ---------------------------------------------------------------------------------------------------------------
+// Addendum 3: single-inventory denial sweep over every finding, assessment summary, and tool payload.
+// ---------------------------------------------------------------------------------------------------------------
+
+/** Names that only ever appear in one fixture inventory; the all-readable baseline names each one, so its absence under that inventory's denial proves gating. */
+const DD_PRINCIPAL_CANARIES = {
+  getOrganization: ["canary-autocreate.example"],
+  listOrgConfigs: ["canary_session_pref"],
+  listOrgConnections: ["sink-canary-org"],
+  listUsers: ["usr-canary-nomfa", "usr-canary-idle", "svc-canary-interactive"],
+  listRoles: ["Role Canary Broad"],
+  listApiKeys: ["apikey-canary-stale"],
+  listApplicationKeys: ["appkey-canary-stale"],
+  listSecurityRules: ["Rule canary-disabled-default"],
+  listSecuritySignals: ["sig-canary-overdue"],
+  getIpAllowlist: ["198.51.100.77/32"],
+  getSensitiveDataScannerConfig: ["Canary Scanner Rule"],
+  listLogIndexes: ["canary-short-index", "drop canary cloudtrail"],
+  listLogArchives: ["canary-archive-failing"],
+  listDashboards: ["Dashboard Canary Public"],
+  listMonitors: ["Security canary silent"],
+  listAwsIntegrations: ["999988887777"],
+};
+
+function principalClient(overrides = {}) {
+  const base = healthyClient();
+  const organization = healthyOrganization();
+  organization.settings.saml_autocreate_users_domains = { enabled: true, domains: ["canary-autocreate.example"] };
+  const scanner = healthySensitiveDataScanner();
+  scanner.included.push({
+    id: "rule-canary",
+    type: "sensitive_data_scanner_rule",
+    attributes: { name: "Canary Scanner Rule", is_enabled: true, tags: ["pii"] },
+    relationships: { standard_pattern: { data: { id: "std-2", type: "sensitive_data_scanner_standard_pattern" } } },
+  });
+  return healthyClient({
+    async getOrganization() {
+      return organization;
+    },
+    async listOrgConfigs() {
+      return [...(await base.listOrgConfigs()), { id: "canary_session_pref", type: "org_configs", attributes: { name: "canary_session_pref", value: "1" } }];
+    },
+    async listOrgConnections() {
+      return [{ id: "c-canary", type: "org_connection", attributes: { connection_types: ["logs"] }, relationships: { sink_org: { data: { id: "sink-canary-org", type: "orgs" } } } }];
+    },
+    async listUsers() {
+      return [
+        ...(await base.listUsers()),
+        user("usr-canary-nomfa", { mfa_enabled: false }),
+        user("usr-canary-idle", { last_login_time: daysAgo(200) }),
+        user("svc-canary-interactive", { service_account: true, last_login_time: daysAgo(1) }),
+      ];
+    },
+    async listRoles() {
+      return [...(await base.listRoles()), role("role-canary-broad", "Role Canary Broad", 1)];
+    },
+    async listRolePermissions(roleId) {
+      return roleId === "role-canary-broad"
+        ? [{ id: "perm-9", type: "permissions", attributes: { name: "user_access_manage" } }]
+        : base.listRolePermissions(roleId);
+    },
+    async listApiKeys() {
+      return [...(await base.listApiKeys()), { id: "key-canary", type: "api_keys", attributes: { name: "apikey-canary-stale", last4: "9999", created_at: daysAgo(400), date_last_used: daysAgo(300) } }];
+    },
+    async listApplicationKeys() {
+      const keys = healthyApplicationKeys();
+      keys.data.push({
+        id: "ak-canary",
+        type: "application_keys",
+        attributes: { name: "appkey-canary-stale", last4: "8888", created_at: daysAgo(400), last_used_at: daysAgo(1), scopes: ["dashboards_read"] },
+        relationships: { owned_by: { data: { id: "svc-terraform", type: "users" } } },
+      });
+      return keys;
+    },
+    async listSecurityRules() {
+      return [...(await base.listSecurityRules()), detectionRule("canary-disabled", ["tactic:TA0006-credential-access"], { name: "Rule canary-disabled-default", isEnabled: false })];
+    },
+    async listSecuritySignals() {
+      return [{ id: "sig-canary-overdue", type: "signal", attributes: { timestamp: hoursAgo(80), message: "Canary brute force", attributes: { status: "critical", workflow: { triage: { state: "open" } } } } }];
+    },
+    async getIpAllowlist() {
+      const allowlist = await base.getIpAllowlist();
+      allowlist.data.attributes.entries.push({ data: { type: "ip_allowlist_entry", id: "e-canary", attributes: { cidr_block: "198.51.100.77/32", note: "canary" } } });
+      return allowlist;
+    },
+    async getSensitiveDataScannerConfig() {
+      return scanner;
+    },
+    async listLogIndexes() {
+      return [
+        ...(await base.listLogIndexes()),
+        { name: "canary-short-index", num_retention_days: 3, exclusion_filters: [{ name: "drop canary cloudtrail", is_enabled: true, filter: { query: "source:cloudtrail", sample_rate: 1 } }] },
+      ];
+    },
+    async listLogArchives() {
+      return [...(await base.listLogArchives()), { id: "a-canary", type: "archives", attributes: { name: "canary-archive-failing", state: "FAILING", destination: { type: "s3" } } }];
+    },
+    async listDashboards() {
+      return [{ id: "dash-canary", title: "Dashboard Canary Public" }];
+    },
+    async listMonitors() {
+      return [...(await base.listMonitors()), { id: 77, name: "Security canary silent", tags: ["team:security"], priority: 1, message: "no handles" }];
+    },
+    async listAwsIntegrations() {
+      return [...(await base.listAwsIntegrations()), { account_id: "999988887777", access_key_id: "AKIACANARY0000000000", cspm_resource_collection_enabled: false }];
+    },
+    ...overrides,
+  });
+}
+
+/** One entry per client read; `controls` are the findings that read the inventory and therefore may not pass while it is denied. */
+const DD_SINGLE_INVENTORY_DENIALS = [
+  { method: "getOrganization", inventory: "organization", path: "/api/v1/org", controls: ["DD-01", "DD-02", "DD-14", "DD-20"] },
+  { method: "listOrgConfigs", inventory: "org_configs", path: "/api/v2/org_configs", controls: ["DD-16"] },
+  { method: "listOrgConnections", inventory: "org_connections", path: "/api/v2/org_connections", controls: ["DD-20"] },
+  { method: "listUsers", inventory: "users", path: "/api/v2/users", controls: ["DD-02", "DD-04", "DD-19"] },
+  { method: "listRoles", inventory: "roles", path: "/api/v2/roles", controls: ["DD-03"] },
+  { method: "listRolePermissions", inventory: "role_permissions", path: "/api/v2/roles/role-auditor/permissions", controls: ["DD-03"] },
+  { method: "listApiKeys", inventory: "api_keys", path: "/api/v2/api_keys", controls: ["DD-05"] },
+  { method: "listApplicationKeys", inventory: "application_keys", path: "/api/v2/application_keys", controls: ["DD-06", "DD-19"] },
+  { method: "listAuditEvents", inventory: "audit_events", path: "/api/v2/audit/events", controls: ["DD-07"] },
+  { method: "listSecurityRules", inventory: "security_rules", path: "/api/v2/security_monitoring/rules", controls: ["DD-08", "DD-09", "DD-12", "DD-13"] },
+  { method: "listSecuritySignals", inventory: "security_signals", path: "/api/v2/security_monitoring/signals", controls: ["DD-09"] },
+  { method: "listPostureFindings", inventory: "posture_findings", path: "/api/v2/posture_management/findings", controls: ["DD-12"] },
+  { method: "getIpAllowlist", inventory: "ip_allowlist", path: "/api/v2/ip_allowlist", controls: ["DD-15"] },
+  { method: "getSensitiveDataScannerConfig", inventory: "sensitive_data_scanner", path: "/api/v2/sensitive-data-scanner/config", controls: ["DD-11"] },
+  { method: "listLogPipelines", inventory: "log_pipelines", path: "/api/v1/logs/config/pipelines", controls: ["DD-10"] },
+  { method: "listLogIndexes", inventory: "log_indexes", path: "/api/v1/logs/config/indexes", controls: ["DD-10", "DD-20"] },
+  { method: "listLogArchives", inventory: "log_archives", path: "/api/v2/logs/config/archives", controls: ["DD-10"] },
+  { method: "listDashboards", inventory: "shared_dashboards", path: "/api/v1/dashboard", controls: ["DD-14"] },
+  { method: "listMonitors", inventory: "monitors", path: "/api/v1/monitor", controls: ["DD-17"] },
+  { method: "listAwsIntegrations", inventory: "aws_integrations", path: "/api/v1/integration/aws", controls: ["DD-12", "DD-18"] },
+  { method: "listGcpIntegrations", inventory: "gcp_integrations", path: "/api/v1/integration/gcp", controls: ["DD-12", "DD-18"] },
+  { method: "listAzureIntegrations", inventory: "azure_integrations", path: "/api/v1/integration/azure", controls: ["DD-12", "DD-18"] },
+];
+
+/** Every leaf of a JSON value with its dotted path; empty arrays and objects are leaves so a `[]` fallback is visible. */
+function leafEntries(value, path = "", output = []) {
+  if (Array.isArray(value)) {
+    if (value.length === 0) output.push([path, "[]"]);
+    value.forEach((entry, index) => leafEntries(entry, path ? `${path}.${index}` : String(index), output));
+  } else if (value !== null && typeof value === "object") {
+    const keys = Object.keys(value);
+    if (keys.length === 0) output.push([path, "{}"]);
+    for (const key of keys) leafEntries(value[key], path ? `${path}.${key}` : key, output);
+  } else {
+    output.push([path, value]);
+  }
+  return output;
+}
+
+function pluckPath(value, path) {
+  return path.split(".").reduce((cursor, key) => (cursor === null || cursor === undefined ? undefined : cursor[key]), value);
+}
+
+const DD_FALLBACK_VALUES = new Set([0, false, "none", "[]", "{}"]);
+
+/** Fields that describe the read itself (readable flags, inventory states, gaps, caveats, status counts) and legitimately flip under a denial. */
+const DD_READ_STATE_PATHS = [/(^|\.)[a-z_]*readable(\.|$)/, /^inventor(y|ies)(\.|$)/, /^unreadable_inventories(\.|$)/, /^manual_evidence(\.|$)/, /^verdict_caveats(\.|$)/, /^users_complete$/, /^(pass|warn|fail|manual)$/];
+
+/** True when a denied-run value is a zero, false, or empty fallback where the all-readable baseline held real data. */
+function isFallback(path, value, baselineValue) {
+  if (!DD_FALLBACK_VALUES.has(value)) return false;
+  if (baselineValue === undefined || baselineValue === null || DD_FALLBACK_VALUES.has(baselineValue)) return false;
+  if (Array.isArray(baselineValue) && baselineValue.length === 0) return false;
+  if (typeof baselineValue === "object" && !Array.isArray(baselineValue) && Object.keys(baselineValue).length === 0) return false;
+  return !DD_READ_STATE_PATHS.some((pattern) => pattern.test(path));
+}
+
+test("addendum 3: under every single-inventory denial no Datadog finding, summary, or tool payload falls back to a zero, false, or empty value, and no principal is named from the denied inventory", async () => {
+  const baseline = await runAllAssessments(principalClient());
+  const baselineText = JSON.stringify(baseline);
+  for (const [method, canaries] of Object.entries(DD_PRINCIPAL_CANARIES)) {
+    for (const canary of canaries) assert.ok(baselineText.includes(canary), `${canary} (${method}) must be named by the all-readable baseline for its gating check to mean anything`);
+  }
+
+  const offenders = [];
+  let comparedLeaves = 0;
+  for (const denial of DD_SINGLE_INVENTORY_DENIALS) {
+    const denied = await runAllAssessments(principalClient({
+      async [denial.method]() {
+        throw forbidden(denial.path);
+      },
+    }));
+    const label = `${denial.inventory} denied`;
+    const deniedText = JSON.stringify(denied);
+    for (const canary of DD_PRINCIPAL_CANARIES[denial.method] ?? []) {
+      assert.ok(!deniedText.includes(canary), `${label}: ${canary} is still named from the denied inventory`);
+    }
+    for (const control of denial.controls) {
+      const item = denied.flatMap((result) => result.findings).find((candidate) => candidate.id === control);
+      assert.notEqual(item.status, "pass", `${label}: ${control} must not pass (${item.summary})`);
+      assert.match(item.summary, /403 Forbidden/, `${label}: ${control} carries the observed error (${item.summary})`);
+    }
+    for (const [areaIndex, result] of denied.entries()) {
+      const baselineResult = baseline[areaIndex];
+      for (const [path, value] of leafEntries(result.summary)) {
+        comparedLeaves += 1;
+        const baselineValue = pluckPath(baselineResult.summary, path);
+        if (isFallback(path, value, baselineValue)) offenders.push(`${label}: ${result.category} summary.${path} = ${JSON.stringify(value)} (baseline ${JSON.stringify(baselineValue)})`);
+      }
+      for (const item of result.findings) {
+        const baselineFinding = findingById(baselineResult, item.id);
+        for (const [path, value] of leafEntries(item.evidence ?? {})) {
+          comparedLeaves += 1;
+          const baselineValue = pluckPath(baselineFinding.evidence ?? {}, path);
+          if (isFallback(path, value, baselineValue)) offenders.push(`${label}: ${item.id} evidence.${path} = ${JSON.stringify(value)} (baseline ${JSON.stringify(baselineValue)})`);
+        }
+      }
+    }
+  }
+  assert.ok(comparedLeaves > 3000, `expected the sweep to compare thousands of leaves, got ${comparedLeaves}`);
+  assert.deepEqual(offenders, [], `values that fell back to zero, false, or empty under a denial:\n${offenders.join("\n")}`);
 });

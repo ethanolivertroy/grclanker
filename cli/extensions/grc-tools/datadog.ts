@@ -674,9 +674,12 @@ export function redactCredentialValues(value: unknown, depth = 0): unknown {
   return redacted;
 }
 
-/** Reduces every URL in the text to scheme, host, and path, dropping userinfo, query, and fragment wherever it appears. */
+/**
+ * Reduces every URL in the text to scheme, host, and path, dropping userinfo, query, and fragment wherever it appears.
+ * An already-scrubbed `?[REDACTED]` tail is consumed whole so a second pass over the same string is a no-op.
+ */
 function scrubUrlsInText(text: string): string {
-  return text.replace(/\b[a-z][a-z0-9+.-]*:\/\/[^\s"'<>)\]]+/gi, (match) => {
+  return text.replace(/\b[a-z][a-z0-9+.-]*:\/\/(?:\[REDACTED\]|[^\s"'<>)\]])+/gi, (match) => {
     try {
       const parsed = new URL(match);
       const hadUserinfo = parsed.username.length > 0 || parsed.password.length > 0;
@@ -1878,6 +1881,16 @@ function truncatedFlag(surface: SurfaceResult<unknown>): boolean | null {
   return surface.value === undefined ? null : surface.truncated === true;
 }
 
+/**
+ * Whether a violation was observed: true when at least one violator was found among the records read (a real
+ * observation), false only when every set that proves the property was read completely, and null when any of them
+ * was partial or unreadable, so "no violation" is never asserted from data that was not fully read.
+ */
+function violationFlag(sources: Array<SurfaceResult<unknown> | boolean>, observed: number): boolean | null {
+  if (observed > 0) return true;
+  return sources.every(completeness) ? false : null;
+}
+
 /** Records an inventory's read state next to the counts derived from it. */
 function inventoryState(inventory: string, surface: SurfaceResult<unknown>): JsonRecord {
   const descriptor = inventoryDescriptor(inventory);
@@ -2132,7 +2145,7 @@ function evaluateMfaControl(snapshot: DatadogIdentitySnapshot, strictSaml: boole
     active_human_users: whenComplete(snapshot.users, activeHumans.length),
     users_without_native_mfa: whenComplete(snapshot.users, withoutMfa.length),
     users_without_native_mfa_sample: whenComplete(snapshot.users, sample(withoutMfa.map((user) => user.handle))),
-    violation_observed: withoutMfa.length > 0,
+    violation_observed: violationFlag([snapshot.users], withoutMfa.length),
     saml_strict_mode: organizationReadable ? strictSaml : null,
     organization_settings_readable: organizationReadable,
     users_inventory_truncated: truncatedFlag(snapshot.users),
@@ -2254,13 +2267,18 @@ function evaluateRbacControl(snapshot: DatadogIdentitySnapshot, maxAdmins: numbe
     )]
     : [];
   // Custom roles in a truncated role list are a partial set: the roles named as over-privileged are real, but
-  // the role population counts are unknown.
+  // the role population counts are unknown. An empty violator list is asserted only when every custom role's
+  // permissions were read; otherwise "none" would be derived from the roles whose reads failed.
+  const permissionsComplete = unresolved.length === 0;
   const evidence = {
     total_roles: whenComplete(snapshot.roles, roles.length),
     roles_returned: roles.length,
     custom_roles: whenComplete(snapshot.roles, customRoles.length),
-    custom_roles_with_admin_equivalent_permissions: whenComplete(snapshot.roles, overPrivileged.map((role) => ({ role: role.name, permissions: role.granted }))),
-    violation_observed: overPrivileged.length > 0,
+    custom_roles_with_admin_equivalent_permissions: whenComplete(
+      snapshot.roles,
+      overPrivileged.length > 0 || permissionsComplete ? overPrivileged.map((role) => ({ role: role.name, permissions: role.granted })) : null,
+    ),
+    violation_observed: violationFlag([snapshot.roles, permissionsComplete], overPrivileged.length),
     admin_role_user_count: adminCount ?? null,
     total_users: totalUsers ?? null,
     max_admins: maxAdmins,
@@ -2296,7 +2314,7 @@ function evaluateRbacControl(snapshot: DatadogIdentitySnapshot, maxAdmins: numbe
       manualFinding(
         3,
         "high",
-        `${unresolved.length}/${customRoles.length} custom roles could not have their permissions read, so admin-equivalent grants could not be ruled out. ${permissionGaps.map(inventoryGapCaveat).join(" ")}`,
+        `${ratioText(snapshot.roles, unresolved.length, customRoles.length)} custom roles${readSuffix(snapshot.roles)} could not have their permissions read, so admin-equivalent grants could not be ruled out. ${permissionGaps.map(inventoryGapCaveat).join(" ")}`,
         [
           `Export the permission list for ${unresolved.map((role) => roleName(role)).slice(0, MAX_EVIDENCE_SAMPLES).join(", ")} from Organization Settings > Roles and confirm none grants ${ADMIN_EQUIVALENT_PERMISSIONS.join(", ")}.`,
         ],
@@ -2354,7 +2372,7 @@ function evaluateUserAccessControl(snapshot: DatadogIdentitySnapshot, now: Date,
     inactive_users: whenComplete(snapshot.users, sample(inactive.map((user) => ({ handle: user.handle, last_login: user.lastLogin?.toISOString() ?? null })))),
     inactive_user_count: whenComplete(snapshot.users, inactive.length),
     stale_pending_invitations: whenComplete(snapshot.users, sample(stalePending.map((user) => user.handle))),
-    violation_observed: inactive.length > 0,
+    violation_observed: violationFlag([snapshot.users], inactive.length),
     active_users_without_login_or_creation_date: whenComplete(snapshot.users, sample(undated.map((user) => user.handle))),
     pending_invitations_without_creation_date: whenComplete(snapshot.users, sample(undatedPending.map((user) => user.handle))),
     users_inventory_truncated: truncatedFlag(snapshot.users),
@@ -2451,7 +2469,7 @@ function evaluateServiceAccountControl(snapshot: DatadogIdentitySnapshot, now: D
     service_account_handles: whenComplete(snapshot.users, sample(serviceAccounts.map((user) => user.handle))),
     non_conforming_names: whenComplete(snapshot.users, sample(nonConforming.map((user) => user.handle))),
     service_accounts_with_login_history: whenComplete(snapshot.users, sample(interactive.map((user) => user.handle))),
-    violation_observed: interactive.length > 0 || staleKeys.length > 0,
+    violation_observed: violationFlag([snapshot.users, keysComplete], interactive.length + staleKeys.length),
     service_account_application_keys: keysComplete ? serviceKeys.length : null,
     application_keys_readable: keysRead,
     stale_service_account_keys: keysComplete ? sample(staleKeys.map(keyLabel)) : null,
@@ -2625,7 +2643,7 @@ function evaluateApiKeyControl(snapshot: DatadogAccessControlSnapshot, now: Date
     keys_with_placeholder_names: whenComplete(snapshot.apiKeys, sample(placeholders.map(keyLabel))),
     keys_without_created_at: whenComplete(snapshot.apiKeys, sample(undated.map(keyLabel))),
     keys_without_created_at_count: whenComplete(snapshot.apiKeys, undated.length),
-    violation_observed: aged.length > 0,
+    violation_observed: violationFlag([snapshot.apiKeys], aged.length),
     api_keys_inventory_truncated: truncatedFlag(snapshot.apiKeys),
     inventory: inventoryState("api_keys", snapshot.apiKeys),
   };
@@ -2711,7 +2729,7 @@ function evaluateApplicationKeyControl(snapshot: DatadogAccessControlSnapshot, n
     keys_without_resolved_owner: whenComplete(surface, ownerUnresolved.length),
     keys_without_resolved_owner_sample: whenComplete(surface, sample(ownerUnresolved.map(keyLabel))),
     keys_without_any_date: whenComplete(surface, sample(undated.map(keyLabel))),
-    violation_observed: orphaned.length > 0,
+    violation_observed: violationFlag([surface], orphaned.length),
     application_keys_inventory_truncated: truncatedFlag(surface),
     inventory: inventoryState("application_keys", surface),
   };
@@ -3483,7 +3501,7 @@ function evaluateMonitorNotificationControl(snapshot: DatadogSecurityMonitoringS
     security_monitors_email_only: whenComplete(surface, sample(emailOnly.map((monitor) => ({ name: monitor.name, handles: monitor.handles })))),
     security_monitors_email_only_count: whenComplete(surface, emailOnly.length),
     security_monitors_with_integration_channels: whenComplete(surface, classified.filter((monitor) => monitor.hasIntegration).length),
-    violation_observed: silent.length > 0,
+    violation_observed: violationFlag([surface], silent.length),
     monitors_inventory_truncated: truncatedFlag(surface),
     inventory: inventoryState("monitors", surface),
   };
