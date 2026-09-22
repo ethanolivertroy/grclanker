@@ -1426,7 +1426,10 @@ test("verdict rule 9: AnsibleAapClient error messages keep the structured detail
     return true;
   });
   await assert.rejects(() => client.get("/api/v2/hosts/"), (error) => {
-    assert.equal(error.message, "AAP request failed: /api/v2/hosts/ (502 Bad Gateway)");
+    assert.equal(error.message, "AAP request failed: /api/v2/hosts/ (502 Bad Gateway): non-JSON body (text/html, 46 bytes)");
+    assert.ok(!error.message.includes("FAKE_SECRET_TOKEN_2"), "no slice of a non-JSON body reaches the error string");
+    assert.equal(error.status, 502);
+    assert.equal(error.endpoint, "/api/v2/hosts/");
     return true;
   });
 });
@@ -1507,7 +1510,7 @@ test("rule 1 corollary: partialNotes caps any pass built on an unreadable view a
   const teams = byControl(forbiddenInventories, 22);
   assert.equal(teams.status, "warn");
   assert.equal(teams.evidence.inventories_readable, false);
-  assert.equal(teams.evidence.total_inventories, undefined);
+  assert.equal(teams.evidence.total_inventories, null, "an unreadable inventory total renders null, never a count");
   assert.ok(teams.evidence.partial_view.some((note) => /^inventories: unreadable \(/.test(note)), JSON.stringify(teams.evidence.partial_view));
   assert.doesNotMatch(teams.summary, /on every inventory\./);
 });

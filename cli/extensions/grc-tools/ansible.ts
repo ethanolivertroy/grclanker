@@ -80,13 +80,28 @@ export interface AnsibleCollection {
 export interface Snapshot<T> {
   data: T;
   error?: string;
+  /** HTTP status the failed read observed; null when the failure was not an HTTP response. Absent when the read succeeded. */
+  status?: number | null;
+  /** Path the failed read requested, without its query string. Absent when the read succeeded. */
+  endpoint?: string;
+}
+
+/** What core_data carries in place of a dataset whose read failed: never an empty list or object. */
+export interface AnsibleNotCollectedMarker {
+  collected: false;
+  status: number | null;
+  endpoint: string;
+  error: string;
 }
 
 export interface AnsibleAccessSurface {
   name: string;
   endpoint: string;
   status: "readable" | "not_readable";
-  count?: number;
+  /** Items the probe counted; null when the probe failed, so a denial never reads as an empty inventory. */
+  count?: number | null;
+  /** HTTP status the failing probe observed; null when the failure was not an HTTP response. */
+  http_status?: number | null;
   error?: string;
 }
 
@@ -638,16 +653,109 @@ async function countFilesRecursively(pathname: string): Promise<number> {
 }
 
 /**
- * Keeps only the structured `detail` or `error` message of a failed AAP
- * response so raw bodies never reach error logs or finding summaries.
+ * Describes a non-JSON body by content type and byte length only. Proxy and
+ * WAF pages can echo request headers, so the body text itself is never kept,
+ * whatever content type the response claimed.
  */
-function responseDetail(text: string): string {
+function describeNonJsonBody(contentType: string | null, rawText: string): string {
+  return `non-JSON body (${contentType?.split(";")[0]?.trim() || "unknown content type"}, ${Buffer.byteLength(rawText, "utf8")} bytes)`;
+}
+
+/**
+ * Keeps only AAP's documented `detail` or `error` field of a failed JSON
+ * response; any body that does not parse as JSON is replaced by its
+ * status-and-length note so no slice of it reaches an error string.
+ */
+function responseDetail(text: string, contentType: string | null): string {
+  if (text.length === 0) return "";
+  let parsed: unknown;
   try {
-    const parsed = asObject(JSON.parse(text));
-    const detail = asString(parsed?.detail) ?? asString(parsed?.error);
-    return detail ? ` ${detail.slice(0, 200)}` : "";
+    parsed = JSON.parse(text);
   } catch {
-    return "";
+    return `: ${describeNonJsonBody(contentType, text)}`;
+  }
+  const object = asObject(parsed);
+  const detail = asString(object?.detail) ?? asString(object?.error);
+  return detail ? ` ${detail}` : "";
+}
+
+const REDACTED_ERROR_VALUE = "[REDACTED]";
+const CONFIGURED_SECRETS = new Set<string>();
+
+/** Secrets the running client was configured with or obtained; every recorded error string is scrubbed of them. */
+function registerConfiguredSecrets(...values: Array<string | undefined>): void {
+  for (const value of values) {
+    if (value && value.length >= 8) CONFIGURED_SECRETS.add(value);
+  }
+}
+
+const ERROR_CREDENTIAL_KEY_PATTERN =
+  "[A-Za-z0-9_.-]*(?:token|secret|passw(?:or)?d|pwd|api[_-]?key|apikey|session(?:[_-]?id)?|sid|cookie|csrftoken|authorization|auth|signature|sig|credentials?|access[_-]?key|private[_-]?key)";
+// A credential value is a single token that is either long or carries a digit; short prose words after a
+// colon (for example "Authentication error: Invalid token") are left alone.
+const ERROR_CREDENTIAL_VALUE_PATTERN = `(?:(?:Bearer|Basic|Digest|Token)\\s+)?(?:(?=[^\\s"'&;,<>]{16,})|(?=[^\\s"'&;,<>]*\\d))[^\\s"'&;,<>]{8,}`;
+
+const ERROR_TEXT_PATTERNS: ReadonlyArray<readonly [RegExp, string]> = [
+  // Authorization scheme values wherever they appear (headers, cookies, HTML, JSON messages); the value must
+  // be long or carry a digit or base64 padding so prose such as "Basic authentication" is left alone.
+  [/\b(Bearer|Basic|Digest|Negotiate|SSWS|Token)\s+(?=[A-Za-z0-9\-._~+/=:]{16,}|[A-Za-z0-9\-._~+/=:]*[\d+/=])[A-Za-z0-9\-._~+/=:]{8,}/gi, `$1 ${REDACTED_ERROR_VALUE}`],
+  // JWT-shaped strings.
+  [/\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}/g, REDACTED_ERROR_VALUE],
+  // AWS access key ids, 40-character secret access keys, long secret-shaped blobs, and hex API keys.
+  [/\b(?:AKIA|ASIA|AROA|AIDA|AGPA|ANPA|ANVA|APKA)[A-Z0-9]{16}\b/g, REDACTED_ERROR_VALUE],
+  [/(?<![A-Za-z0-9/+=])[A-Za-z0-9/+]{40}(?![A-Za-z0-9/+=])/g, REDACTED_ERROR_VALUE],
+  // Long blobs must carry a digit so camelCase identifiers survive.
+  [/(?<![A-Za-z0-9+_=-])(?=[A-Za-z0-9+_-]*\d)[A-Za-z0-9+_-]{40,}={0,2}(?![A-Za-z0-9+_=-])/g, REDACTED_ERROR_VALUE],
+  [/\b[a-f0-9]{32,}\b/gi, REDACTED_ERROR_VALUE],
+  // Cookie headers carry session values in free form.
+  [/\b(set-cookie|cookie)(\s*[:=]\s*)[^\n<>]+/gi, `$1$2${REDACTED_ERROR_VALUE}`],
+  // key=value, key: value, and "key":"value" pairs whose key names a credential.
+  [new RegExp(`\\b(${ERROR_CREDENTIAL_KEY_PATTERN})(["']?\\s*[=:]\\s*["']?)${ERROR_CREDENTIAL_VALUE_PATTERN}`, "gi"), `$1$2${REDACTED_ERROR_VALUE}`],
+];
+
+// URL userinfo and query strings anywhere in the string, not only when the string starts with a URL.
+const ERROR_URL_PATTERN = /\b(https?:\/\/)(?:[^\s/@"'<>]+@)?([^\s?#"'<>]+)(\?[^\s#"'<>]*)?/gi;
+
+/**
+ * Rule 9 sink for error text. AnsibleApiError scrubs its own message and errorMessage(), the only
+ * conversion from a thrown error to recorded text (collection snapshots, object snapshots, access
+ * surfaces, tool results), runs the same pass, so no path can carry a credential echoed by an upstream
+ * error body, a transport error, or a URL into the audit output.
+ */
+export function redactErrorText(text: string): string {
+  let scrubbed = text;
+  for (const secret of CONFIGURED_SECRETS) {
+    scrubbed = scrubbed.split(secret).join(REDACTED_ERROR_VALUE);
+  }
+  scrubbed = scrubbed.replace(ERROR_URL_PATTERN, (_match, scheme: string, hostPath: string, query?: string) =>
+    `${scheme}${hostPath}${query ? `?${REDACTED_ERROR_VALUE}` : ""}`,
+  );
+  for (const [pattern, replacement] of ERROR_TEXT_PATTERNS) {
+    scrubbed = scrubbed.replace(pattern, replacement);
+  }
+  return scrubbed;
+}
+
+export class AnsibleApiError extends Error {
+  /** HTTP status the request observed; undefined for transport failures (timeouts, connection errors). */
+  readonly status: number | undefined;
+  /** Path the request was sent to, without its query string. */
+  readonly endpoint: string;
+
+  constructor(message: string, status: number | undefined, endpoint: string) {
+    super(redactErrorText(message));
+    this.name = "AnsibleApiError";
+    this.status = status;
+    this.endpoint = endpoint;
+  }
+}
+
+/** Path component of a request target, so an error names the endpoint without its query string. */
+function requestPath(target: string): string {
+  try {
+    return new URL(target, "https://aap.invalid").pathname;
+  } catch {
+    return target.split("?")[0] ?? target;
   }
 }
 
@@ -961,6 +1069,7 @@ export class AnsibleAapClient {
   ) {
     this.fetchImpl = options.fetchImpl ?? (config.verifySsl === false ? createTlsOptOutFetch() : fetch);
     this.now = options.now ?? (() => new Date());
+    registerConfiguredSecrets(config.token, config.password);
   }
 
   private resolveUrl(pathOrUrl: string): string {
@@ -999,12 +1108,16 @@ export class AnsibleAapClient {
     }
 
     const loginUrl = this.resolveUrl("/api/login/");
+    const loginPath = requestPath(loginUrl);
+    // Login responses are described by status only: their bodies are HTML pages that echo form values.
     const initial = await this.fetchWithTimeout(loginUrl, {
       method: "GET",
       headers: { accept: "text/html,application/json" },
+    }).catch((error: unknown) => {
+      throw new AnsibleApiError(`AAP login bootstrap failed (network error: ${errorMessage(error)}).`, undefined, loginPath);
     });
     if (!initial.ok) {
-      throw new Error(`AAP login bootstrap failed (${initial.status} ${initial.statusText}).`);
+      throw new AnsibleApiError(`AAP login bootstrap failed (${initial.status} ${initial.statusText}).`, initial.status, loginPath);
     }
 
     const bootstrapCookie = cookieHeaderFromHeaders(initial.headers);
@@ -1024,18 +1137,28 @@ export class AnsibleAapClient {
         referer: loginUrl,
       },
       body,
+    }).catch((error: unknown) => {
+      throw new AnsibleApiError(`AAP session login failed (network error: ${errorMessage(error)}).`, undefined, loginPath);
     });
 
     if (!response.ok) {
-      throw new Error(`AAP session login failed (${response.status} ${response.statusText}).`);
+      throw new AnsibleApiError(`AAP session login failed (${response.status} ${response.statusText}).`, response.status, loginPath);
     }
 
     const loginCookie = cookieHeaderFromHeaders(response.headers);
     this.sessionCookie = [bootstrapCookie, loginCookie].filter(Boolean).join("; ");
     this.csrfToken = csrfTokenFromCookie(this.sessionCookie) ?? csrfToken;
     this.sessionExpiresAt = Date.now() + 60 * 60 * 1000;
+    // The session cookie and CSRF token are credentials for the rest of the run; scrub them from every
+    // error string the way the configured token and password are.
+    registerConfiguredSecrets(bootstrapCookie, loginCookie, this.csrfToken);
   }
 
+  /**
+   * Every failure of a GET surfaces as an AnsibleApiError that names the target, the observed status,
+   * and only AAP's documented `detail`/`error` field; non-JSON bodies (2xx included) become a
+   * status-and-length note and transport failures carry the transport message, all scrubbed.
+   */
   async get<T = unknown>(pathOrUrl: string): Promise<T> {
     await this.ensureSession();
     const headers: Record<string, string> = { accept: "application/json" };
@@ -1046,13 +1169,23 @@ export class AnsibleAapClient {
       if (this.csrfToken) headers["x-csrftoken"] = this.csrfToken;
     }
 
-    const response = await this.fetchWithTimeout(this.resolveUrl(pathOrUrl), { method: "GET", headers });
+    const url = this.resolveUrl(pathOrUrl);
+    const endpoint = requestPath(url);
+    const response = await this.fetchWithTimeout(url, { method: "GET", headers }).catch((error: unknown) => {
+      throw new AnsibleApiError(`AAP request failed: ${pathOrUrl} (network error: ${errorMessage(error)})`, undefined, endpoint);
+    });
+    const contentType = response.headers.get("content-type");
     const text = await response.text();
     if (!response.ok) {
-      throw new Error(`AAP request failed: ${pathOrUrl} (${response.status} ${response.statusText})${responseDetail(text)}`);
+      throw new AnsibleApiError(`AAP request failed: ${pathOrUrl} (${response.status} ${response.statusText})${responseDetail(text, contentType)}`, response.status, endpoint);
     }
 
-    return text.length > 0 ? JSON.parse(text) as T : undefined as T;
+    if (text.length === 0) return undefined as T;
+    try {
+      return JSON.parse(text) as T;
+    } catch {
+      throw new AnsibleApiError(`AAP request failed: ${pathOrUrl} (${response.status} ${response.statusText}): ${describeNonJsonBody(contentType, text)}`, response.status, endpoint);
+    }
   }
 
   async listCollection(
@@ -1136,12 +1269,33 @@ export interface AnsibleClientSurface {
   listCollection?: (path: string, query?: Record<string, string | number | boolean | undefined>, options?: { limit?: number }) => Promise<AnsibleCollection>;
 }
 
+/** The single conversion from a thrown error to recorded text; every message passes through redactErrorText here. */
 function errorMessage(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
+  return redactErrorText(error instanceof Error ? error.message : String(error));
 }
 
-function emptyCollection(): AnsibleCollection {
-  return { items: [], complete: true, total: 0 };
+/** HTTP status a failed read observed, or null when the failure was not an HTTP response. */
+function errorStatus(error: unknown): number | null {
+  return asNumber(asObject(error)?.status) ?? null;
+}
+
+/** Path a failed read requested when the error records one. */
+function errorEndpoint(error: unknown): string | undefined {
+  return asString(asObject(error)?.endpoint);
+}
+
+/**
+ * In-memory placeholder for a collection whose read failed. It is never written to the bundle
+ * (the core_data writer substitutes a not-collected marker) and every consumer checks the
+ * snapshot's readable state before counting its items.
+ */
+function uncollected(): AnsibleCollection {
+  return { items: [], complete: false, total: undefined, truncation: "not collected: the read failed" };
+}
+
+/** Failure fields of a snapshot: the scrubbed error, the observed status, and the path requested. */
+function failedSnapshot(label: string, path: string, error: unknown): Pick<Snapshot<unknown>, "error" | "status" | "endpoint"> {
+  return { error: `${label} (${path}): ${errorMessage(error)}`, status: errorStatus(error), endpoint: errorEndpoint(error) ?? requestPath(path) };
 }
 
 async function collect(
@@ -1166,18 +1320,18 @@ async function collect(
       },
     };
   } catch (error) {
-    return { data: emptyCollection(), error: `${label} (${path}): ${errorMessage(error)}` };
+    return { data: uncollected(), ...failedSnapshot(label, path, error) };
   }
 }
 
 async function fetchObject(client: AnsibleClientSurface, label: string, path: string): Promise<Snapshot<JsonRecord | undefined>> {
   if (typeof client.get !== "function") {
-    return { data: undefined, error: `${label} (${path}): client does not support object reads` };
+    return { data: undefined, error: `${label} (${path}): client does not support object reads`, status: null, endpoint: requestPath(path) };
   }
   try {
     return { data: asObject(await client.get(path)) };
   } catch (error) {
-    return { data: undefined, error: `${label} (${path}): ${errorMessage(error)}` };
+    return { data: undefined, ...failedSnapshot(label, path, error) };
   }
 }
 
@@ -1185,10 +1339,16 @@ interface InventoryView {
   label: string;
   items: JsonRecord[];
   error?: string;
+  /** HTTP status the failed read observed; null for a non-HTTP failure; absent when the read succeeded. */
+  status?: number | null;
+  /** Path the failed read requested; absent when the read succeeded. */
+  endpoint?: string;
   readable: boolean;
   empty: boolean;
-  seen: number;
-  total?: number;
+  /** Items seen; null when the read failed, so an unreadable inventory never renders as zero. */
+  seen: number | null;
+  /** Server-reported total; null when the read failed, undefined when the server reported none. */
+  total: number | null | undefined;
   partial?: string;
 }
 
@@ -1200,21 +1360,29 @@ function inventory(label: string, snapshot: Snapshot<AnsibleCollection>): Invent
     : undefined;
   return {
     label,
-    items: collection.items,
+    items: readable ? collection.items : [],
     error: snapshot.error,
+    status: readable ? undefined : snapshot.status ?? null,
+    endpoint: readable ? undefined : snapshot.endpoint,
     readable,
     empty: readable && collection.items.length === 0,
-    seen: collection.items.length,
-    total: collection.total,
+    seen: readable ? collection.items.length : null,
+    total: readable ? collection.total : null,
     partial,
   };
+}
+
+/** Renders a value derived from an inventory only when that inventory was read; null otherwise. */
+function ifReadable<T>(view: InventoryView, value: () => T): T | null {
+  return view.readable ? value() : null;
 }
 
 export interface AnsibleScope {
   username?: string;
   superuser?: boolean;
   systemAuditor?: boolean;
-  fullVisibility: boolean;
+  /** Whether the audit account sees every object; null when the current user could not be read. */
+  fullVisibility: boolean | null;
   note?: string;
 }
 
@@ -1230,8 +1398,10 @@ async function probeScope(client: AnsibleClientSurface): Promise<Snapshot<Ansibl
   const user = currentUserFromMe(me.data);
   if (me.error || !user) {
     return {
-      data: { fullVisibility: false, note: "current user could not be read, so the visibility of the audit account is unknown" },
+      data: { fullVisibility: null, note: "current user could not be read, so the visibility of the audit account is unknown" },
       error: me.error ?? "current user (/api/v2/me/): no user returned",
+      status: me.error ? me.status ?? null : null,
+      endpoint: me.endpoint ?? "/api/v2/me/",
     };
   }
   const superuser = asBoolean(user.is_superuser);
@@ -1287,13 +1457,23 @@ function finding(
   };
 }
 
-function manualForUnreadable(controlNumber: number, view: InventoryView | { label: string; error?: string }, evidenceToCollect: string): AnsibleFinding {
+/** The read that failed, as evidence: the scrubbed error, the observed status, and the path requested; never a count. */
+function unreadableEvidence(view: { error?: string; status?: number | null; endpoint?: string }): JsonRecord {
+  return { error: view.error ?? null, http_status: view.status ?? null, endpoint: view.endpoint ?? null };
+}
+
+function manualForUnreadable(controlNumber: number, view: InventoryView | { label: string; error?: string; status?: number | null; endpoint?: string }, evidenceToCollect: string): AnsibleFinding {
   return finding(
     controlNumber,
     "manual",
     `${view.label} could not be read (${view.error ?? "unknown error"}), so this control cannot be verified from the API. Collect this evidence manually: ${evidenceToCollect}`,
-    { error: view.error },
+    unreadableEvidence(view),
   );
+}
+
+/** Object-dataset snapshots (settings, survey specs) as the view manualForUnreadable expects. */
+function objectView(label: string, snapshot: Snapshot<JsonRecord | undefined>): { label: string; error?: string; status?: number | null; endpoint?: string } {
+  return { label, error: snapshot.error ?? "no settings object returned", status: snapshot.status ?? null, endpoint: snapshot.endpoint };
 }
 
 function sample(items: JsonRecord[], picker: (item: JsonRecord) => unknown = nameOf, size = 10): unknown[] {
@@ -1353,8 +1533,10 @@ async function readableSurface(client: AnsibleAapClient, name: string, endpoint:
   } catch (error) {
     return {
       name,
-      endpoint,
+      endpoint: errorEndpoint(error) ?? endpoint,
       status: "not_readable",
+      count: null,
+      http_status: errorStatus(error),
       error: errorMessage(error),
     };
   }
@@ -1609,7 +1791,7 @@ export function assessAnsibleJobHealthData(data: JobHealthData, now: Date, optio
   const scheduleMaxJobs = settings ? asNumber(settings.SCHEDULE_MAX_JOBS) : undefined;
   const maxForksSetting = settings ? asNumber(settings.MAX_FORKS) : undefined;
   if (data.jobSettings.error || !settings) {
-    findings.push(manualForUnreadable(28, { label: "job settings", error: data.jobSettings.error ?? "no settings object returned" }, "Settings > Jobs (Maximum Scheduled Jobs, Maximum Forks) and each instance group's Max concurrent jobs and Max forks values"));
+    findings.push(manualForUnreadable(28, objectView("job settings", data.jobSettings), "Settings > Jobs (Maximum Scheduled Jobs, Maximum Forks) and each instance group's Max concurrent jobs and Max forks values"));
   } else if (!groups.readable) {
     findings.push(manualForUnreadable(28, groups, "each instance group's Max concurrent jobs and Max forks values from Administration > Instance Groups"));
   } else if (groups.empty) {
@@ -1650,9 +1832,9 @@ export function assessAnsibleJobHealthData(data: JobHealthData, now: Date, optio
     summary: {
       days: data.days,
       total_jobs: jobs.seen,
-      jobs_total_reported: jobs.total,
-      successful: jobs.items.filter((job) => isSuccessStatus(job.status)).length,
-      failed: jobs.items.filter((job) => isFailureStatus(job.status)).length,
+      jobs_total_reported: jobs.total ?? null,
+      successful: ifReadable(jobs, () => jobs.items.filter((job) => isSuccessStatus(job.status)).length),
+      failed: ifReadable(jobs, () => jobs.items.filter((job) => isFailureStatus(job.status)).length),
       instance_groups: groups.seen,
       full_visibility: data.scope.data.fullVisibility,
       ...counts,
@@ -1773,7 +1955,7 @@ export function assessAnsibleHostCoverageData(data: HostCoverageData, now: Date,
 
     const disabled = hosts.items.filter((host) => asBoolean(host.enabled) === false);
     const unknownEnabled = hosts.items.filter((host) => asBoolean(host.enabled) === undefined);
-    const disabledRate = (disabled.length / hosts.seen) * 100;
+    const disabledRate = (disabled.length / hosts.items.length) * 100;
     findings.push(finding(
       10,
       disabledRate > 5 ? "warn" : unknownEnabled.length > 0 ? "warn" : "pass",
@@ -1911,7 +2093,7 @@ export function assessAnsibleHostCoverageData(data: HostCoverageData, now: Date,
         continue;
       }
       if (!template) {
-        unknown.push({ ...entry, reason: "owning template not in the sampled templates" });
+        unknown.push({ ...entry, reason: templates.readable ? "owning template not in the sampled templates" : `owning template unknown: the job templates list could not be read (${templates.error})` });
         continue;
       }
       if (!lastRun) {
@@ -1984,7 +2166,7 @@ export function assessAnsibleHostCoverageData(data: HostCoverageData, now: Date,
     title: "Ansible AAP host coverage and automation hygiene",
     summary: {
       total_hosts: hosts.seen,
-      hosts_total_reported: hosts.total,
+      hosts_total_reported: hosts.total ?? null,
       inventory_sources: sources.seen,
       job_host_summaries: summaries.seen,
       job_templates: templates.seen,
@@ -2033,7 +2215,8 @@ export function findPlaintextSecrets(text: unknown): string[] {
 }
 
 export interface ProbeCoverage {
-  eligible: number;
+  /** Templates that qualified for the probe; null when the job templates list could not be read. */
+  eligible: number | null;
   probed: number;
 }
 
@@ -2161,14 +2344,14 @@ export async function collectAnsiblePlatformSecurityData(client: AnsibleClientSu
     systemSettings,
     loggingSettings,
     probeCoverage: {
-      surveyTemplates: { eligible: surveyTemplates, probed: Object.keys(surveySpecs).length },
-      criticalTemplates: { eligible: criticalTemplates, probed: Object.keys(templateErrorNotifications).length },
+      surveyTemplates: { eligible: jobTemplates.error ? null : surveyTemplates, probed: Object.keys(surveySpecs).length },
+      criticalTemplates: { eligible: jobTemplates.error ? null : criticalTemplates, probed: Object.keys(templateErrorNotifications).length },
     },
   };
 }
 
 function probeNote(label: string, coverage: ProbeCoverage | undefined): string | undefined {
-  return coverage && coverage.eligible > coverage.probed ? `${label}: ${coverage.probed} of ${coverage.eligible} probed` : undefined;
+  return coverage && coverage.eligible !== null && coverage.eligible > coverage.probed ? `${label}: ${coverage.probed} of ${coverage.eligible} probed` : undefined;
 }
 
 function credentialKind(credential: JsonRecord): string {
@@ -2395,7 +2578,7 @@ export function assessAnsiblePlatformSecurityData(data: PlatformSecurityData, no
         inventories: inventories.seen,
         groups: groups.seen,
         ask_variables_on_launch_templates: launchTimeVariableTemplates.length,
-        vault_credentials: vaultCredentials.map((credential) => ({ name: nameOf(credential), vault_id: vaultId(credential) ?? null })),
+        vault_credentials: ifReadable(credentials, () => vaultCredentials.map((credential) => ({ name: nameOf(credential), vault_id: vaultId(credential) ?? null }))),
       },
       [...partialNotes(data.scope, templates, inventories, groups), ...(surveyProbeNote ? [surveyProbeNote] : [])],
     ));
@@ -2467,11 +2650,14 @@ export function assessAnsiblePlatformSecurityData(data: PlatformSecurityData, no
       const snapshot = data.orgAdmins[String(org.id ?? "")];
       if (!snapshot || snapshot.error) {
         unreadable.push(nameOf(org));
+        // The organization stays in the list with its count null, so a denied admins read never
+        // shrinks the inventory or reads as zero admins.
+        counts.push({ id: org.id, name: nameOf(org), admin_count: null, complete: null, ...unreadableEvidence(snapshot ?? { error: "admins list was not read" }) });
         continue;
       }
       counts.push({ id: org.id, name: nameOf(org), admin_count: snapshot.data.items.length, complete: snapshot.data.complete });
     }
-    const excessive = counts.filter((org) => asNumber(org.admin_count)! > maxOrgAdmins);
+    const excessive = counts.filter((org) => (asNumber(org.admin_count) ?? 0) > maxOrgAdmins);
     findings.push(finding(
       21,
       excessive.length > 0 ? "fail" : unreadable.length > 0 ? "manual" : "pass",
@@ -2487,7 +2673,7 @@ export function assessAnsiblePlatformSecurityData(data: PlatformSecurityData, no
 
   const usersPartial = partialNotes(data.scope, users, teams);
   const probedUserIds = Object.keys(data.userRoles);
-  const roleProbeNote = users.seen > probedUserIds.length ? `user roles: ${probedUserIds.length} of ${users.seen} users probed` : undefined;
+  const roleProbeNote = users.seen !== null && users.seen > probedUserIds.length ? `user roles: ${probedUserIds.length} of ${users.seen} users probed` : undefined;
   if (!teams.readable) {
     findings.push(manualForUnreadable(22, teams, "each team's Roles tab"));
   } else if (teams.empty) {
@@ -2496,7 +2682,7 @@ export function assessAnsiblePlatformSecurityData(data: PlatformSecurityData, no
     const orgAdminTeams: JsonRecord[] = [];
     const inventoryAdminTeams: JsonRecord[] = [];
     const unreadable: string[] = [];
-    const totalInventories = inventories.readable && inventories.total !== undefined ? inventories.total : undefined;
+    const totalInventories = inventories.readable && typeof inventories.total === "number" ? inventories.total : undefined;
     const inventoryScopeNote = inventories.readable
       ? undefined
       : `the inventories list could not be read (${inventories.error}), so inventory-wide Admin roles were not checked`;
@@ -2524,7 +2710,7 @@ export function assessAnsiblePlatformSecurityData(data: PlatformSecurityData, no
           : inventoryScopeNote
             ? `None of the ${teams.seen} teams holds the Admin role on an organization, but ${inventoryScopeNote}.`
             : `None of the ${teams.seen} teams holds the Admin role on an organization or on every inventory.`,
-      { org_admin_teams: orgAdminTeams, inventory_admin_teams: inventoryAdminTeams, unreadable, total_inventories: totalInventories, inventories_readable: inventories.readable },
+      { org_admin_teams: orgAdminTeams, inventory_admin_teams: inventoryAdminTeams, unreadable, total_inventories: totalInventories ?? null, inventories_readable: inventories.readable },
       partialNotes(data.scope, users, teams, inventories),
     ));
   }
@@ -2571,32 +2757,45 @@ export function assessAnsiblePlatformSecurityData(data: PlatformSecurityData, no
 
     if (organizations.readable && !organizations.empty) {
       const systemAuditors = users.items.filter((user) => asBoolean(user.is_system_auditor) === true);
+      const roleSnapshots = [...Object.values(data.userRoles), ...Object.values(data.teamRoles)];
       const auditedOrgs = new Set<string>();
-      for (const snapshot of Object.values(data.userRoles)) {
+      for (const snapshot of roleSnapshots) {
+        if (snapshot.error) continue;
         for (const role of snapshot.data.items) {
           if (roleName(role) === "auditor" && roleResourceType(role) === "organization") auditedOrgs.add(extractText(summaryFields(role).resource_name, String(summaryFields(role).resource_id)));
         }
       }
-      for (const snapshot of Object.values(data.teamRoles)) {
-        for (const role of snapshot.data.items) {
-          if (roleName(role) === "auditor" && roleResourceType(role) === "organization") auditedOrgs.add(extractText(summaryFields(role).resource_name, String(summaryFields(role).resource_id)));
-        }
-      }
-      const uncovered = organizations.items.filter((org) => !auditedOrgs.has(nameOf(org)));
-      const covered = systemAuditors.length > 0 || uncovered.length === 0;
-      const unreadableRoleLists = [...Object.values(data.userRoles), ...Object.values(data.teamRoles)].filter((snapshot) => snapshot.error).length;
+      const unreadableRoleLists = roleSnapshots.filter((snapshot) => snapshot.error).length;
+      // An organization can only be called uncovered when every probed role list was read: the
+      // Auditor that covers it may sit in a list that was denied.
+      const roleCoverageKnown = teams.readable && unreadableRoleLists === 0;
+      const unconfirmed = organizations.items.filter((org) => !auditedOrgs.has(nameOf(org)));
+      const uncovered = roleCoverageKnown ? unconfirmed : null;
+      const covered = systemAuditors.length > 0 || (roleCoverageKnown && unconfirmed.length === 0);
       const auditorGapNote = !teams.readable
         ? `the teams list could not be read (${teams.error}), so team-held Auditor roles were not checked`
         : unreadableRoleLists > 0
           ? `${unreadableRoleLists} user or team role lists could not be read, so their Auditor roles were not checked`
           : undefined;
+      const coverageSentence = roleCoverageKnown
+        ? `${auditedOrgs.size} organizations have an Auditor role holder among the probed users and teams`
+        : `an Auditor role holder was confirmed for ${auditedOrgs.size} of ${organizations.seen} organizations and coverage is unknown for ${unconfirmed.length} organizations because ${auditorGapNote}`;
       findings.push(finding(
         24,
-        covered ? (auditorGapNote ? "warn" : "pass") : "warn",
+        covered ? (auditorGapNote ? "warn" : "pass") : roleCoverageKnown ? "warn" : "manual",
         covered
-          ? `${systemAuditors.length} system auditors exist and ${auditedOrgs.size} organizations have an Auditor role holder among the probed users and teams${auditorGapNote ? `; ${auditorGapNote}` : ""}.`
-          : `No system auditor exists and ${uncovered.length}/${organizations.seen} organizations have no Auditor role holder among the probed users and teams${auditorGapNote ? `; ${auditorGapNote}` : ""}.`,
-        { system_auditors: sample(systemAuditors), audited_organizations: [...auditedOrgs], uncovered: sample(uncovered), teams_readable: teams.readable, unreadable_role_lists: unreadableRoleLists },
+          ? `${systemAuditors.length} system auditors exist and ${coverageSentence}.`
+          : roleCoverageKnown
+            ? `No system auditor exists and ${unconfirmed.length}/${organizations.seen} organizations have no Auditor role holder among the probed users and teams.`
+            : `No system auditor exists; ${coverageSentence}. Review the Access tab of those organizations for Auditor role holders manually.`,
+        {
+          system_auditors: sample(systemAuditors),
+          audited_organizations: [...auditedOrgs],
+          uncovered: uncovered === null ? null : sample(uncovered),
+          coverage_unknown_organizations: roleCoverageKnown ? 0 : unconfirmed.length,
+          teams_readable: teams.readable,
+          unreadable_role_lists: unreadableRoleLists,
+        },
         probePartial,
       ));
     }
@@ -2604,7 +2803,7 @@ export function assessAnsiblePlatformSecurityData(data: PlatformSecurityData, no
 
   const authSettings = data.authSettings.data;
   if (data.authSettings.error || !authSettings) {
-    findings.push(manualForUnreadable(25, { label: "authentication settings", error: data.authSettings.error ?? "no settings object returned" }, "the LDAP, SAML, or OIDC authenticator configuration (Settings > Authentication, or the platform gateway Authentication page on AAP 2.5)"));
+    findings.push(manualForUnreadable(25, objectView("authentication settings", data.authSettings), "the LDAP, SAML, or OIDC authenticator configuration (Settings > Authentication, or the platform gateway Authentication page on AAP 2.5)"));
   } else {
     const externalKeys = Object.keys(authSettings).filter((key) => /ldap|saml|oidc/i.test(key));
     findings.push(
@@ -2626,7 +2825,14 @@ export function assessAnsiblePlatformSecurityData(data: PlatformSecurityData, no
   const activityEnabled = systemSettings ? asBoolean(systemSettings.ACTIVITY_STREAM_ENABLED) : undefined;
   const loggingSettings = data.loggingSettings.data;
   const logAggregatorEnabled = loggingSettings ? asBoolean(loggingSettings.LOG_AGGREGATOR_ENABLED) : undefined;
-  const auditEvidence = { activity_stream_enabled: activityEnabled, log_aggregator_enabled: logAggregatorEnabled, log_aggregator_type: loggingSettings ? asString(loggingSettings.LOG_AGGREGATOR_TYPE) : undefined };
+  // Flags stay null (never false) while the settings object they come from was not read.
+  const auditEvidence = {
+    activity_stream_enabled: activityEnabled ?? null,
+    system_settings_readable: !data.systemSettings.error && systemSettings !== undefined,
+    log_aggregator_enabled: logAggregatorEnabled ?? null,
+    log_aggregator_type: (loggingSettings ? asString(loggingSettings.LOG_AGGREGATOR_TYPE) : undefined) ?? null,
+    logging_settings_readable: !data.loggingSettings.error && loggingSettings !== undefined,
+  };
   const settingsGapNotes = [
     data.systemSettings.error || !systemSettings
       ? `the system settings could not be read (${data.systemSettings.error ?? "no settings object returned"}), so ACTIVITY_STREAM_ENABLED was not confirmed`
@@ -2665,10 +2871,11 @@ export function assessAnsiblePlatformSecurityData(data: PlatformSecurityData, no
     const critical = Object.entries(data.templateErrorNotifications);
     const covered = critical.filter(([, snapshot]) => !snapshot.error && snapshot.data.items.length > 0).length;
     const unreadable = critical.filter(([, snapshot]) => snapshot.error).length;
-    const failedNotifications = notifications.items.filter((item) => String(item.status ?? "").toLowerCase() === "failed").length;
+    const failedNotifications = ifReadable(notifications, () => notifications.items.filter((item) => String(item.status ?? "").toLowerCase() === "failed").length);
     const deliveryNote = notifications.readable
       ? undefined
       : `the notification delivery history could not be read (${notifications.error}), so failed deliveries were not checked`;
+    const deliverySentence = deliveryNote ?? `${failedNotifications} of the last ${notifications.seen} notification deliveries failed`;
     const criticalProbeNote = probeNote("critical templates", data.probeCoverage?.criticalTemplates);
     findings.push(finding(
       27,
@@ -2676,7 +2883,7 @@ export function assessAnsiblePlatformSecurityData(data: PlatformSecurityData, no
         ? "manual"
         : covered === 0
           ? "warn"
-          : failedNotifications > 0
+          : (failedNotifications ?? 0) > 0
             ? "warn"
             : unreadable > 0
               ? "manual"
@@ -2689,13 +2896,15 @@ export function assessAnsiblePlatformSecurityData(data: PlatformSecurityData, no
           : `${notificationTemplates.seen} notification templates exist but the job templates list could not be read (${templates.error}), so critical templates could not be identified; confirm failure notifications on the templates that matter manually.`
         : covered === 0
           ? `${notificationTemplates.seen} notification templates exist but none of the ${critical.length} critical job templates has an error notification attached.`
-          : `${covered}/${critical.length} critical job templates have an error notification attached; ${failedNotifications} of the last ${notifications.seen} notification deliveries failed${unreadable > 0 ? `; ${unreadable} template notification lists could not be read` : ""}${deliveryNote ? `; ${deliveryNote}` : ""}.`,
+          : `${covered}/${critical.length} critical job templates have an error notification attached; ${deliverySentence}${unreadable > 0 ? `; ${unreadable} template notification lists could not be read` : ""}.`,
       {
         notification_template_count: notificationTemplates.seen,
-        critical_templates: critical.length,
-        critical_templates_eligible: data.probeCoverage?.criticalTemplates.eligible ?? critical.length,
-        covered,
-        unreadable,
+        // Critical-template counts derive from the job templates list; they stay null when that list was not read.
+        critical_templates: ifReadable(templates, () => critical.length),
+        critical_templates_eligible: ifReadable(templates, () => data.probeCoverage?.criticalTemplates.eligible ?? critical.length),
+        covered: ifReadable(templates, () => covered),
+        unreadable: ifReadable(templates, () => unreadable),
+        job_templates_readable: templates.readable,
         failed_notifications: failedNotifications,
         notifications_readable: notifications.readable,
       },
@@ -2741,7 +2950,8 @@ export function assessAnsiblePlatformSecurityData(data: PlatformSecurityData, no
       job_templates: templates.seen,
       execution_environments: executionEnvironments.seen,
       notification_templates: notificationTemplates.seen,
-      external_auth: authSettings ? hasExternalAuth(authSettings) : undefined,
+      external_auth: authSettings ? hasExternalAuth(authSettings) : null,
+      auth_settings_readable: !data.authSettings.error && authSettings !== undefined,
       full_visibility: data.scope.data.fullVisibility,
       ...counts,
     },
@@ -2759,8 +2969,10 @@ function formatAccessCheckText(result: AnsibleAccessCheckResult): string {
   const rows = result.surfaces.map((surface) => [
     surface.name,
     surface.status,
-    surface.count === undefined ? "-" : String(surface.count),
-    surface.error ? surface.error.replace(/\s+/g, " ").slice(0, 80) : "",
+    surface.count === undefined || surface.count === null ? "-" : String(surface.count),
+    // Error strings are already scrubbed and bounded (non-JSON bodies are described, not echoed), so the
+    // full text is kept rather than sliced mid-path.
+    surface.error ? surface.error.replace(/\s+/g, " ") : "",
   ]);
   return [
     `Ansible AAP access check: ${result.status}`,
@@ -2909,20 +3121,39 @@ function buildBundleReadme(): string {
   ].join("\n");
 }
 
-function snapshotRecord<T>(snapshots: Record<string, Snapshot<T>>): JsonRecord {
-  return Object.fromEntries(Object.entries(snapshots).map(([key, snapshot]) => [key, { data: snapshot.data, error: snapshot.error }]));
+/** What a failed read leaves in core_data: the marker, never the empty collection it fell back to in memory. */
+function notCollectedMarker(snapshot: Pick<Snapshot<unknown>, "error" | "status" | "endpoint">): AnsibleNotCollectedMarker {
+  return { collected: false, status: snapshot.status ?? null, endpoint: snapshot.endpoint ?? "unknown", error: snapshot.error ?? "the read failed" };
 }
 
-function projectCollectionSnapshot(snapshot: Snapshot<AnsibleCollection>, project: (item: JsonRecord) => JsonRecord): Snapshot<AnsibleCollection> {
-  return { data: { ...snapshot.data, items: snapshot.data.items.map(project) }, error: snapshot.error };
+type CoreDataSnapshot<T> = { data: T } | AnsibleNotCollectedMarker;
+
+/**
+ * A per-item file whose parent list failed was never probed, so it carries one marker naming the
+ * parent read instead of an empty record that would read as "no items had anything to report".
+ */
+function notAttemptedRecord(parent: Snapshot<unknown>): AnsibleNotCollectedMarker {
+  return notCollectedMarker({ ...parent, error: `not attempted: the parent list could not be read (${parent.error ?? "unknown error"})` });
 }
 
-function projectObjectSnapshot(snapshot: Snapshot<JsonRecord | undefined>, project: (value: JsonRecord | undefined) => JsonRecord | undefined): Snapshot<JsonRecord | undefined> {
-  return { data: project(snapshot.data), error: snapshot.error };
+function snapshotRecord<T>(snapshots: Record<string, Snapshot<T>>, parent?: Snapshot<unknown>): JsonRecord | AnsibleNotCollectedMarker {
+  if (parent?.error && Object.keys(snapshots).length === 0) return notAttemptedRecord(parent);
+  return Object.fromEntries(Object.entries(snapshots).map(([key, snapshot]) => [key, snapshot.error ? notCollectedMarker(snapshot) : { data: snapshot.data }]));
 }
 
-function projectCollectionRecord(snapshots: Record<string, Snapshot<AnsibleCollection>>, project: (item: JsonRecord) => JsonRecord): JsonRecord {
-  return snapshotRecord(Object.fromEntries(Object.entries(snapshots).map(([key, snapshot]) => [key, projectCollectionSnapshot(snapshot, project)])));
+function projectCollectionSnapshot(snapshot: Snapshot<AnsibleCollection>, project: (item: JsonRecord) => JsonRecord): CoreDataSnapshot<AnsibleCollection> {
+  if (snapshot.error) return notCollectedMarker(snapshot);
+  return { data: { ...snapshot.data, items: snapshot.data.items.map(project) } };
+}
+
+function projectObjectSnapshot(snapshot: Snapshot<JsonRecord | undefined>, project: (value: JsonRecord | undefined) => JsonRecord | undefined): CoreDataSnapshot<JsonRecord | undefined> {
+  if (snapshot.error) return notCollectedMarker(snapshot);
+  return { data: project(snapshot.data) };
+}
+
+function projectCollectionRecord(snapshots: Record<string, Snapshot<AnsibleCollection>>, project: (item: JsonRecord) => JsonRecord, parent: Snapshot<unknown>): JsonRecord | AnsibleNotCollectedMarker {
+  if (parent.error && Object.keys(snapshots).length === 0) return notAttemptedRecord(parent);
+  return Object.fromEntries(Object.entries(snapshots).map(([key, snapshot]) => [key, projectCollectionSnapshot(snapshot, project)]));
 }
 
 /**
@@ -2951,16 +3182,16 @@ export function buildAnsibleCoreDataFiles(
     ["core_data/schedules.json", projectCollectionSnapshot(hostCoverageData.schedules, projectSchedule)],
     ["core_data/workflow_job_templates.json", projectCollectionSnapshot(hostCoverageData.workflowTemplates, projectTemplate)],
     ["core_data/organizations.json", projectCollectionSnapshot(platformData.organizations, (item) => pick(item, ORGANIZATION_FIELDS))],
-    ["core_data/organization_admins.json", projectCollectionRecord(platformData.orgAdmins, projectUser)],
+    ["core_data/organization_admins.json", projectCollectionRecord(platformData.orgAdmins, projectUser, platformData.organizations)],
     ["core_data/users.json", projectCollectionSnapshot(platformData.users, projectUser)],
-    ["core_data/user_roles.json", projectCollectionRecord(platformData.userRoles, projectRole)],
+    ["core_data/user_roles.json", projectCollectionRecord(platformData.userRoles, projectRole, platformData.users)],
     ["core_data/teams.json", projectCollectionSnapshot(platformData.teams, (item) => pick(item, TEAM_FIELDS))],
-    ["core_data/team_roles.json", projectCollectionRecord(platformData.teamRoles, projectRole)],
+    ["core_data/team_roles.json", projectCollectionRecord(platformData.teamRoles, projectRole, platformData.teams)],
     ["core_data/credentials.json", projectCollectionSnapshot(platformData.credentials, projectCredential)],
     ["core_data/tokens.json", projectCollectionSnapshot(platformData.tokens, projectToken)],
     ["core_data/projects.json", projectCollectionSnapshot(platformData.projects, projectProject)],
-    ["core_data/survey_specs.json", snapshotRecord(Object.fromEntries(Object.entries(platformData.surveySpecs).map(([key, snapshot]) => [key, projectObjectSnapshot(snapshot, projectSurveySpec)])))],
-    ["core_data/template_error_notifications.json", projectCollectionRecord(platformData.templateErrorNotifications, projectNotificationTemplate)],
+    ["core_data/survey_specs.json", snapshotRecord(Object.fromEntries(Object.entries(platformData.surveySpecs).map(([key, snapshot]) => [key, snapshot.error ? snapshot : { data: projectSurveySpec(snapshot.data) }])), platformData.jobTemplates)],
+    ["core_data/template_error_notifications.json", projectCollectionRecord(platformData.templateErrorNotifications, projectNotificationTemplate, platformData.jobTemplates)],
     ["core_data/inventories.json", projectCollectionSnapshot(platformData.inventories, projectInventory)],
     ["core_data/groups.json", projectCollectionSnapshot(platformData.groups, projectGroup)],
     ["core_data/execution_environments.json", projectCollectionSnapshot(platformData.executionEnvironments, (item) => pick(item, EXECUTION_ENVIRONMENT_FIELDS))],
