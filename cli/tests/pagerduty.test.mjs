@@ -2534,7 +2534,30 @@ const PAGERDUTY_CORE_DATA_FILES = {
   "/change_events": "core_data/change_events.json",
 };
 
-function pagerdutyApiFixture({ deny = [], empty = [], truncate = [] } = {}) {
+const PD_CANARY = {
+  bearer: "PDCANARY-BEARER-TOKEN-9f8e7d6c",
+  session: "PDCANARY-SESSION-COOKIE-1a2b3c4d",
+  apiKey: "PDCANARY-API-KEY-55667788",
+  urlToken: "PDCANARY-URL-TOKEN-deadbeef",
+  apiToken: "PDCANARY-REST-API-KEY-0001",
+  clientSecret: "PDCANARY-CLIENT-SECRET-0001",
+  accessToken: "pdcanary-oauth-access-token-0001",
+};
+const PD_CANARY_URL = `https://api.example.com/v1/x?token=${PD_CANARY.urlToken}`;
+
+function pdCanaryHtml() {
+  return [
+    "<html><head><title>502 Bad Gateway</title></head><body>",
+    `<p>The upstream request carried Authorization: Bearer ${PD_CANARY.bearer} and Set-Cookie: session=${PD_CANARY.session}.</p>`,
+    `<p>Retry with x-api-key: ${PD_CANARY.apiKey}; the incident is tracked at ${PD_CANARY_URL} until resolved.</p>`,
+    "</body></html>",
+  ].join("");
+}
+
+// `fail` serves one path with a body that must never be echoed: { path, flavor: "html" | "json" },
+// where html is a 502 proxy page carrying the canaries and json is a 403 PagerDuty error object whose
+// message embeds the canary URL mid-sentence.
+function pagerdutyApiFixture({ deny = [], empty = [], truncate = [], fail } = {}) {
   const fixtures = healthyFixtures();
   const requests = [];
   const listPayload = (key, items, url) => {
@@ -2571,12 +2594,25 @@ function pagerdutyApiFixture({ deny = [], empty = [], truncate = [] } = {}) {
       default: return undefined;
     }
   };
-  const fetchImpl = async (input) => {
+  const fetchImpl = async (input, init = {}) => {
     const url = new URL(typeof input === "string" ? input : input.url);
     const respond = (value, status = 200, statusText = "OK") => {
-      requests.push({ method: "GET", url: url.toString(), path: url.pathname, status });
+      requests.push({ method: init.method ?? "GET", url: url.toString(), path: url.pathname, status });
       return jsonResponse(value, { status, statusText });
     };
+    if (fail && url.pathname === fail.path) {
+      if (fail.flavor === "html") {
+        requests.push({ method: init.method ?? "GET", url: url.toString(), path: url.pathname, status: 502 });
+        return new Response(pdCanaryHtml(), { status: 502, statusText: "Bad Gateway", headers: { "content-type": "text/html; charset=utf-8" } });
+      }
+      if (url.pathname === "/oauth/token") {
+        return respond({ error: "invalid_client", error_description: `client rejected; see ${PD_CANARY_URL} for the registration` }, 403, "Forbidden");
+      }
+      return respond({ error: { message: `Access Denied; see ${PD_CANARY_URL} for the missing scope`, code: 2010, errors: [`scope details at ${PD_CANARY_URL}`] } }, 403, "Forbidden");
+    }
+    if (url.pathname === "/oauth/token") {
+      return respond({ access_token: PD_CANARY.accessToken, token_type: "bearer", expires_in: 3600 });
+    }
     if (deny.includes(url.pathname)) {
       return respond({ error: { message: "Access Denied", code: 2010, errors: ["Access Denied"] } }, 403, "Forbidden");
     }
@@ -2809,7 +2845,145 @@ test("collection status, request matching, and denied-list markers: each endpoin
         assert.equal(oncall.summary[key], null, `${label}: summary ${key} renders null`);
       }
     }
+
+    // Review round item 12: per-item reads keyed on a denied parent list are never issued, and the
+    // dependent dataset is a marker naming the parent instead of a readable-but-empty {} or [].
+    const dependent = PAGERDUTY_DEPENDENT_DATASETS[endpoint];
+    if (dependent) {
+      const skipped = JSON.parse(run.files.get(dependent.file));
+      assert.equal(skipped.collected, false, `${label}: ${dependent.file} carries the not-collected marker`);
+      assert.equal(skipped.status, null, `${label}: a skipped dependent borrows no status from the parent`);
+      assert.equal(skipped.endpoint, null, `${label}: a skipped dependent names no endpoint of its own`);
+      assert.match(skipped.error, new RegExp(`^not requested: the ${endpoint.replace(/\//g, "\\/")} list was not read \\(PagerDuty request failed \\(403 Forbidden\\) for ${endpoint.replace(/\//g, "\\/")}`), `${label}: ${skipped.error}`);
+      assert.ok(!Array.isArray(skipped) && !("items" in skipped), `${label}: a skipped dependent is never an item list`);
+      assert.ok(run.requests.every((request) => !request.path.startsWith(dependent.childPrefix)), `${label}: no ${dependent.childPrefix} request was issued`);
+      const analysis = run.analysis.find((item) => item.category === dependent.category);
+      assert.match(analysis.summary.inventories[dependent.inventory], /^.+: not requested \(the .+ list was not read/, `${label}: inventories.${dependent.inventory}`);
+      assert.ok(run.errors.includes("not requested:"), `${label}: _errors.log records the skipped dependent`);
+      const analysisSnapshot = analysis.snapshots?.[dependent.inventory];
+      if (analysisSnapshot !== undefined) assert.equal(analysisSnapshot.error, skipped.error, `${label}: the analysis snapshot carries the same skip`);
+    }
+    if (endpoint === "/teams") {
+      const accessControl = run.analysis.find((item) => item.category === "access_control");
+      assert.equal(findingById(accessControl, 4).evidence.team_member_lists_truncated, null, `${label}: PD-04 renders no truncation list for lookups that never ran`);
+      assert.equal(findingById(accessControl, 4).evidence.team_manager_assignments, null, label);
+      assert.equal(findingById(accessControl, 4).status, "manual", label);
+    }
+    if (endpoint === "/schedules") {
+      const oncall = run.analysis.find((item) => item.category === "oncall_coverage");
+      for (const key of ["attached_schedules", "schedules_with_gaps", "single_participant_schedules"]) {
+        assert.equal(oncall.summary[key], null, `${label}: summary ${key} renders null`);
+      }
+    }
+    if (endpoint === "/business_services") {
+      const integration = run.analysis.find((item) => item.category === "integration_security");
+      assert.equal(findingById(integration, 21).evidence.unmapped_business_services, null, label);
+      assert.equal(findingById(integration, 21).status, "manual", label);
+    }
   }
+});
+
+const PAGERDUTY_DEPENDENT_DATASETS = {
+  "/teams": { file: "core_data/team_members.json", childPrefix: "/teams/", category: "access_control", inventory: "team_members" },
+  "/schedules": { file: "core_data/schedule_details.json", childPrefix: "/schedules/", category: "oncall_coverage", inventory: "schedule_details" },
+  "/business_services": { file: "core_data/business_service_dependencies.json", childPrefix: "/service_dependencies/", category: "integration_security", inventory: "business_service_dependencies" },
+};
+
+// Addendum 4: on every PagerDuty surface (every access-check probe, every collector, the credential
+// scope read, and the Scoped OAuth token endpoint), a 502 HTML body or a JSON error embedding a
+// credential URL never reaches tool results, findings, summaries, or the bundle, and the recorded
+// error carries a status-and-length note or the redacted URL instead.
+const PAGERDUTY_CANARY_SURFACES = [
+  "/users/me",
+  ...PAGERDUTY_OBJECT_ENDPOINTS,
+  ...PAGERDUTY_LIST_ENDPOINTS.map(([path]) => path),
+];
+
+function assertPdCanariesAbsent(text, context) {
+  for (const [name, value] of Object.entries(PD_CANARY)) {
+    assert.ok(!text.includes(value), `${context}: canary ${name} (${value}) leaked`);
+  }
+}
+
+async function pdCanaryRun(config, fail) {
+  const base = createTempBase("grclanker-pagerduty-canary-");
+  const fixture = pagerdutyApiFixture({ fail });
+  const client = new PagerdutyApiClient(config, { fetchImpl: fixture.fetchImpl, now: () => NOW, sleep: async () => {} });
+  const context = `${fail.path} (${fail.flavor})`;
+  const access = await checkPagerdutyAccess(client);
+  const assessments = (await runAllAssessments(client)).results;
+  const result = await exportPagerdutyAuditBundle(client, config, base, { maxAdmins: 3, coverageDays: 30 });
+  const files = readBundleFiles(result.outputDir);
+  const zipEntries = readZipEntries(result.zipPath);
+  assert.ok(fixture.requests.some((request) => request.path === fail.path), `${context}: the failing surface was requested`);
+
+  assertPdCanariesAbsent(JSON.stringify(access), `${context} check_access`);
+  assertPdCanariesAbsent(JSON.stringify(assessments), `${context} assessments`);
+  for (const [name, content] of files) assertPdCanariesAbsent(content, `${context} bundle ${name}`);
+  for (const [name, content] of zipEntries) assertPdCanariesAbsent(content, `${context} zip ${name}`);
+
+  const errorStrings = [
+    ...access.surfaces.map((surface) => surface.error).filter(Boolean),
+    ...access.notes.filter((note) => /could not be determined/.test(note)),
+    ...assessments.flatMap((assessment) => assessment.errors),
+    ...(files.get("_errors.log") ?? "").split("\n").filter(Boolean),
+  ].filter((text) => !/^not requested:|: not requested: /.test(text));
+  assert.ok(errorStrings.length > 0, `${context}: the failing surface must be exercised by the access check, an assessment, or the export`);
+  for (const errorString of errorStrings) {
+    if (fail.flavor === "html") {
+      assert.match(errorString, /\(502(?: Bad Gateway)?\)[^\n]*: non-JSON body \(text\/html, \d+ bytes\)/, `${context}: ${errorString}`);
+    } else {
+      assert.match(errorString, /\(403(?: Forbidden)?\)[^\n]*https:\/\/api\.example\.com\/v1\/x\?\[REDACTED\]/, `${context}: ${errorString}`);
+      assert.ok(!errorString.includes("token="), `${context}: ${errorString}`);
+    }
+  }
+  return { access, assessments, files, requests: fixture.requests };
+}
+
+test("addendum 4: on every PagerDuty surface a 502 HTML body or a JSON error embedding a credential URL never reaches results or the bundle, and the recorded error carries a status-and-length note", async () => {
+  const config = sampleConfig({ apiToken: PD_CANARY.apiToken });
+  let runs = 0;
+  for (const path of PAGERDUTY_CANARY_SURFACES) {
+    for (const flavor of ["html", "json"]) {
+      const run = await pdCanaryRun(config, { path, flavor });
+      if (path === "/users/me") {
+        assert.match(run.access.notes.find((note) => /Credential scope/.test(note)), flavor === "html" ? /non-JSON body \(text\/html, \d+ bytes\)/ : /\?\[REDACTED\]/);
+      }
+      runs += 1;
+    }
+  }
+  assert.equal(runs, PAGERDUTY_CANARY_SURFACES.length * 2);
+});
+
+test("addendum 4: a Scoped OAuth token endpoint that answers with a 502 HTML page or a JSON error embedding a credential URL never echoes the body, and the obtained bearer token is redacted from every error string", async () => {
+  const config = sampleConfig({
+    authMode: "oauth_client_credentials",
+    apiToken: undefined,
+    clientId: "pd-client-id",
+    clientSecret: PD_CANARY.clientSecret,
+    subdomain: "example",
+  });
+  for (const flavor of ["html", "json"]) {
+    const run = await pdCanaryRun(config, { path: "/oauth/token", flavor });
+    for (const surface of run.access.surfaces) {
+      assert.equal(surface.status, "not_readable");
+      assert.equal(surface.http_status, flavor === "html" ? 502 : 403);
+      assert.match(surface.error, /^PagerDuty OAuth token request failed \(\d{3}\) for \/oauth\/token: /);
+    }
+    assert.ok(run.requests.every((request) => request.path === "/oauth/token"), `${flavor}: no API request is issued without a bearer token`);
+  }
+
+  // With the token endpoint healthy, the bearer it returns is remembered and redacted from a later error.
+  const fixture = pagerdutyApiFixture({ fail: { path: "/users", flavor: "json" } });
+  const client = new PagerdutyApiClient(config, { fetchImpl: fixture.fetchImpl, now: () => NOW, sleep: async () => {} });
+  await assert.rejects(client.listUsers(5), (error) => {
+    assert.ok(!error.message.includes(PD_CANARY.accessToken));
+    assert.ok(!error.message.includes(PD_CANARY.urlToken));
+    return true;
+  });
+  const redacted = client.redact(`header Bearer ${PD_CANARY.accessToken}, key Token token=${PD_CANARY.clientSecret}, at https://u:p@example.com/a?sid=1#frag`);
+  assert.equal(redacted, "header Bearer [REDACTED], key Token token=[REDACTED], at https://[REDACTED]@example.com/a?[REDACTED]#[REDACTED]");
+  assert.match(client.redact("Authorization: Bearer eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.c2lnbmF0dXJl"), /^Authorization: \[REDACTED\]/);
 });
 
 test("collection status: a truncated user directory keeps seen counts, renders principal-derived counts and lists null, and names no user from the partial set", async () => {

@@ -52,6 +52,17 @@ const REDACTED = "[REDACTED]";
 const SECRET_KEY_PATTERN = /secret|password|passwd|token|privatekey|authorization|apikey|accesskey|credential|integrationkey|routingkey|signingkey/;
 const SECRET_KEY_EXCEPTIONS = new Set(["truncatedtoken"]);
 const MAX_REDACTION_DEPTH = 32;
+// PagerDuty REST API keys, OAuth client secrets, and bearer tokens are long; a shorter minimum would
+// remember common words and redact them out of ordinary error text.
+const MIN_REMEMBERED_SECRET_LENGTH = 8;
+/** Every credential literal a client in this process was configured with or obtained from the identity service. */
+const KNOWN_SECRETS = new Set<string>();
+const URL_IN_TEXT_PATTERN = /\b(https?:\/\/)(?:([^\s/?#@"'<>]+)@)?([^\s/?#"'<>]+)([^\s?#"'<>]*)(\?[^\s#"'<>]*)?(#[^\s"'<>]*)?/gi;
+const JWT_PATTERN = /\beyJ[A-Za-z0-9_-]{4,}\.[A-Za-z0-9_-]{4,}\.[A-Za-z0-9_-]*/g;
+const AUTHORIZATION_VALUE_PATTERN = /\b(bearer|basic|digest|negotiate|ntlm)\s+([A-Za-z0-9\-._~+/!]{8,}=*)/gi;
+// Also covers PagerDuty's REST API key scheme, `Authorization: Token token=<key>`.
+const SECRET_ASSIGNMENT_PATTERN = /\b([\w-]*(?:session|token|secret|password|passwd|pwd|api[_-]?key|apikey|credential|assertion|signature|sid|jsessionid)[\w-]*=)([^\s"'&;,<>]+)/gi;
+const SECRET_FIELD_PATTERN = /(?<![\w/.-])((?:api[\s_-]?key|x-api-key|access[_-]?token|refresh[_-]?token|id[_-]?token|auth[_-]?token|session[_-]?token|bearer[_-]?token|token|client[_-]?secret|secret|password|passwd|pwd|authorization|set-cookie|cookie|session[_-]?id|jsessionid|sid|assertion|signature|credential)["']?\s*:\s*["']?)([^\s"'&;,<>]+)/gi;
 const SERVICE_SNAPSHOT_FIELDS = [
   "id",
   "type",
@@ -186,12 +197,20 @@ export interface Snapshot<T> {
   status?: number;
   /** Path of the request that failed, taken from the request that was actually issued. */
   endpoint?: string;
+  /**
+   * Set when the reads behind this snapshot were never issued because the parent list they key on
+   * was not read; names the parent. The snapshot also carries `error` so every consumer treats it
+   * as unread rather than as a readable-but-empty dataset.
+   */
+  skipped?: string;
 }
 
 /**
  * Written to core_data (and carried inside analysis snapshots) in place of a list dataset that was
  * denied, errored, or never collected, so a bundle consumer cannot mistake a denial for an empty
- * inventory. A readable-but-empty dataset keeps its normal shape with an empty item list.
+ * inventory. A readable-but-empty dataset keeps its normal shape with an empty item list. A
+ * dataset whose reads were never requested carries `status: null` and `endpoint: null` rather than
+ * borrowing the parent's, and its error starts with "not requested:" and names the parent read.
  */
 export interface NotCollectedMarker {
   collected: false;
@@ -202,12 +221,23 @@ export interface NotCollectedMarker {
 
 export function notCollected(snapshot: Snapshot<unknown>): NotCollectedMarker | undefined {
   if (!snapshot.error) return undefined;
+  if (snapshot.skipped) return { collected: false, status: null, endpoint: null, error: snapshot.error };
   return {
     collected: false,
     status: snapshot.status ?? requestStatus(snapshot.error) ?? null,
     endpoint: snapshot.endpoint ?? requestEndpoint(snapshot.error) ?? null,
     error: snapshot.error,
   };
+}
+
+/**
+ * The snapshot of per-item reads (team members, schedule details, business service dependencies)
+ * that were never issued because the parent list was not read. Its error names the parent so the
+ * finding gates on the parent's failure and `notCollected` writes a marker instead of `{}` or `[]`.
+ */
+function skippedSnapshot<T>(fallback: T, dependent: string, parentEndpoint: string, parent: Snapshot<unknown>): Snapshot<T> {
+  const reason = `the ${parentEndpoint} list was not read (${parent.error ?? "unknown error"}), so no ${dependent} were requested`;
+  return { data: fallback, error: `not requested: ${reason}`, skipped: reason };
 }
 
 function coreDataValue<T>(snapshot: Snapshot<T>): T | NotCollectedMarker {
@@ -502,6 +532,7 @@ function requestEndpoint(error: string | undefined): string | undefined {
 
 /** Collection state of a snapshot that is not a paged collection (a single object, a map, or a plain list). */
 function describeSnapshot(label: string, snapshot: Snapshot<unknown>, seen: number, truncated: string[] = []): string {
+  if (snapshot.skipped) return `${label}: not requested (${snapshot.skipped})`;
   if (snapshot.error) return `${label}: unread (${snapshot.error})`;
   if (truncated.length > 0) return `${label}: partial (${truncated.join("; ")})`;
   return `${label}: complete (${seen} seen)`;
@@ -744,8 +775,40 @@ function safeDirName(value: string): string {
   return normalized || "pagerduty";
 }
 
+/**
+ * The single point where a thrown error becomes a recorded string (snapshot errors, access-check
+ * surfaces, errors arrays, _errors.log, tool error results). It re-applies the redaction pass so a
+ * message built outside PagerdutyRequestError (a transport error, a timeout, a JSON parse failure)
+ * cannot bypass it.
+ */
 function errorMessage(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
+  return scrubSecretText(error instanceof Error ? error.message : String(error));
+}
+
+/**
+ * The unanchored redaction pass applied to every error string (once in PagerdutyRequestError, again
+ * at errorMessage): every secret any client in this process has seen, then credential shapes (URL
+ * userinfo, query strings, and fragments anywhere in the text, JWT-shaped strings, Authorization
+ * scheme values, and credential-named assignments and fields, which include PagerDuty's `Token token=`).
+ */
+function scrubSecretText(text: string, secrets: Iterable<string | undefined> = []): string {
+  let scrubbed = text;
+  for (const secret of [...secrets, ...KNOWN_SECRETS]) {
+    if (secret && secret.length >= MIN_REMEMBERED_SECRET_LENGTH) scrubbed = scrubbed.split(secret).join(REDACTED);
+  }
+  return scrubbed
+    .replace(URL_IN_TEXT_PATTERN, (_match, scheme: string, userinfo: string | undefined, host: string, path: string, query?: string, fragment?: string) =>
+      `${scheme}${userinfo ? `${REDACTED}@` : ""}${host}${path}${query ? `?${REDACTED}` : ""}${fragment ? `#${REDACTED}` : ""}`)
+    .replace(JWT_PATTERN, REDACTED)
+    .replace(AUTHORIZATION_VALUE_PATTERN, (match: string, scheme: string, value: string) => (/^[a-z]+$/.test(value) ? match : `${scheme} ${REDACTED}`))
+    .replace(SECRET_ASSIGNMENT_PATTERN, (_match, assignment: string) => `${assignment}${REDACTED}`)
+    .replace(SECRET_FIELD_PATTERN, (_match, field: string) => `${field}${REDACTED}`);
+}
+
+function rememberSecrets(...values: Array<string | undefined>): void {
+  for (const value of values) {
+    if (value && value.length >= MIN_REMEMBERED_SECRET_LENGTH) KNOWN_SECRETS.add(value);
+  }
 }
 
 function ensurePrivateDir(pathname: string): void {
@@ -963,10 +1026,11 @@ export function resolvePagerdutyConfiguration(
   };
 }
 
+/** PagerDuty's documented error object (`error.message`, `error.code`, `error.errors[]`); nothing else in a body is echoed. */
 function pagerdutyErrorSummary(payload: unknown): string | undefined {
   const object = asObject(payload);
   const error = asObject(object?.error);
-  if (!error) return asString(object?.message);
+  if (!error) return undefined;
   const parts = [
     asString(error.message),
     asString(error.code) ? `code ${asString(error.code)}` : undefined,
@@ -976,13 +1040,27 @@ function pagerdutyErrorSummary(payload: unknown): string | undefined {
 }
 
 /**
- * A non-JSON error body (a proxy or WAF page) is described by shape only; its text is never
- * copied into an error string because those strings land in the bundle's error log.
+ * An error body that is not JSON (a proxy or WAF page, whatever its content type claims), or JSON
+ * without PagerDuty's documented error fields, is described by status and length only; its text is
+ * never copied into an error string because those strings land in findings and the bundle's error log.
  */
-function describeOpaqueBody(response: Response, rawText: string): string | undefined {
+function describeOpaqueBody(response: Response, rawText: string, parsedJson: boolean): string | undefined {
   if (rawText.length === 0) return undefined;
   const contentType = response.headers.get("content-type")?.split(";")[0]?.trim() || "unknown content type";
-  return `response body omitted (${contentType}, ${rawText.length} characters)`;
+  const bytes = Buffer.byteLength(rawText, "utf8");
+  return parsedJson
+    ? `JSON body without documented error fields (${contentType}, ${bytes} bytes)`
+    : `non-JSON body (${contentType}, ${bytes} bytes)`;
+}
+
+/** Parses a response body as a JSON object; undefined when it is not JSON, so the body is never echoed. */
+function parseJsonBody(rawText: string): JsonRecord | undefined {
+  if (rawText.length === 0) return undefined;
+  try {
+    return asObject(JSON.parse(rawText));
+  } catch {
+    return undefined;
+  }
 }
 
 function requestPath(url: string): string {
@@ -993,13 +1071,18 @@ function requestPath(url: string): string {
   }
 }
 
+/**
+ * The one error class the client throws for HTTP failures. The message is built from the status,
+ * the request path, and either PagerDuty's documented error fields or a status-and-length note for
+ * any other body; the constructor runs the redaction pass over it regardless of how it was built.
+ */
 export class PagerdutyRequestError extends Error {
   readonly status: number;
   /** The request path that produced the response, without the query string. */
   readonly path?: string;
 
   constructor(status: number, message: string, path?: string) {
-    super(message);
+    super(scrubSecretText(message));
     this.name = "PagerdutyRequestError";
     this.status = status;
     this.path = path;
@@ -1033,6 +1116,7 @@ export class PagerdutyApiClient {
       this.bearerToken = config.accessToken;
       this.bearerExpiresAt = Number.MAX_SAFE_INTEGER;
     }
+    rememberSecrets(config.apiToken, config.accessToken, config.clientSecret);
   }
 
   getResolvedConfig(): PagerdutyResolvedConfig {
@@ -1043,12 +1127,13 @@ export class PagerdutyApiClient {
     return this.now();
   }
 
+  /** The redaction pass with this client's own credentials (including short ones) removed first. */
   redact(text: string): string {
     let redacted = text;
     for (const secret of [this.config.apiToken, this.config.accessToken, this.config.clientSecret, this.bearerToken]) {
-      if (secret && secret.length > 0) redacted = redacted.split(secret).join("[REDACTED]");
+      if (secret && secret.length > 0) redacted = redacted.split(secret).join(REDACTED);
     }
-    return redacted;
+    return scrubSecretText(redacted);
   }
 
   private buildUrl(pathOrUrl: string, query: JsonRecord = {}): string {
@@ -1088,18 +1173,23 @@ export class PagerdutyApiClient {
         signal: controller.signal,
       });
       const rawText = await response.text();
-      const payload = rawText.length > 0 ? asObject(JSON.parse(rawText)) ?? {} : {};
+      const parsed = parseJsonBody(rawText);
+      const payload = parsed ?? {};
       if (!response.ok) {
+        // RFC 6749 error and error_description are the documented fields; anything else is described by shape.
+        const detail = asString(payload.error_description) ?? asString(payload.error) ?? describeOpaqueBody(response, rawText, parsed !== undefined) ?? "empty response body";
         throw new PagerdutyRequestError(
           response.status,
-          this.redact(`PagerDuty OAuth token request failed (${response.status}): ${asString(payload.error_description) ?? asString(payload.error) ?? describeOpaqueBody(response, rawText) ?? "empty response body"}`),
+          this.redact(`PagerDuty OAuth token request failed (${response.status}) for ${requestPath(this.config.identityTokenUrl)}: ${detail}`),
+          requestPath(this.config.identityTokenUrl),
         );
       }
       const token = asString(payload.access_token);
-      if (!token) throw new Error("PagerDuty OAuth token response did not include access_token.");
+      if (!token) throw new Error(`PagerDuty OAuth token response did not include access_token (${describeOpaqueBody(response, rawText, parsed !== undefined) ?? "empty response body"}).`);
       const expiresIn = asNumber(payload.expires_in) ?? 3600;
       this.bearerToken = token;
       this.bearerExpiresAt = this.now().getTime() + Math.max((expiresIn - 60) * 1000, 60_000);
+      rememberSecrets(token);
       return token;
     } finally {
       clearTimeout(timeout);
@@ -1146,6 +1236,8 @@ export class PagerdutyApiClient {
       if (this.config.fromEmail) headers.from = this.config.fromEmail;
       return await this.fetchImpl(url, { method: "GET", headers, signal: controller.signal });
     } catch (error) {
+      // A token exchange failure is already a PagerdutyRequestError carrying its status and path.
+      if (error instanceof PagerdutyRequestError) throw error;
       if (error instanceof Error && error.name === "AbortError") {
         throw new Error(`PagerDuty request timed out after ${this.config.timeoutMs}ms: ${requestPath(url)}`);
       }
@@ -1165,16 +1257,10 @@ export class PagerdutyApiClient {
         continue;
       }
       const rawText = await response.text();
-      let payload: JsonRecord = {};
-      if (rawText.length > 0) {
-        try {
-          payload = asObject(JSON.parse(rawText)) ?? {};
-        } catch {
-          payload = {};
-        }
-      }
+      const parsed = parseJsonBody(rawText);
+      const payload: JsonRecord = parsed ?? {};
       if (!response.ok) {
-        const detail = pagerdutyErrorSummary(payload) ?? describeOpaqueBody(response, rawText);
+        const detail = pagerdutyErrorSummary(payload) ?? describeOpaqueBody(response, rawText, parsed !== undefined);
         throw new PagerdutyRequestError(
           response.status,
           this.redact(`PagerDuty request failed (${response.status} ${response.statusText}) for ${path}${detail ? `: ${detail}` : ""}`),
@@ -1613,19 +1699,22 @@ export async function collectPagerdutyAccessControlData(
     capture<PagerdutyCollection>(emptyCollection(), () => client.listTeams(teamLimit)),
   ]);
   const teamMembersTruncated: string[] = [];
-  const teamMembers = await capture<Record<string, JsonRecord[]>>({}, async () => {
-    const entries: Record<string, JsonRecord[]> = {};
-    for (const team of teams.data.items.slice(0, teamLimit)) {
-      const id = asString(team.id);
-      if (!id) continue;
-      const members = await client.listTeamMembers(id);
-      entries[id] = members.items;
-      if (!members.complete) {
-        teamMembersTruncated.push(`${nameOf(team)}: ${members.items.length} members seen of ${members.total ?? "an unknown total"}`);
+  // Member lists are keyed on the teams that were read; without a team list no member request is issued.
+  const teamMembers = teams.error
+    ? skippedSnapshot<Record<string, JsonRecord[]>>({}, "team member lists", "/teams", teams)
+    : await capture<Record<string, JsonRecord[]>>({}, async () => {
+      const entries: Record<string, JsonRecord[]> = {};
+      for (const team of teams.data.items.slice(0, teamLimit)) {
+        const id = asString(team.id);
+        if (!id) continue;
+        const members = await client.listTeamMembers(id);
+        entries[id] = members.items;
+        if (!members.complete) {
+          teamMembersTruncated.push(`${nameOf(team)}: ${members.items.length} members seen of ${members.total ?? "an unknown total"}`);
+        }
       }
-    }
-    return entries;
-  });
+      return entries;
+    });
   return { scope, abilities, users, teams, teamMembers, teamMembersTruncated };
 }
 
@@ -2159,15 +2248,18 @@ export async function collectPagerdutyOncallCoverageData(
     capture<PagerdutyCollection>(emptyCollection(), () => client.listOncalls(now, daysAhead(now, 1))),
     capture<PagerdutyCollection>(emptyCollection(), async () => projectCollection(await client.listUsers(userLimit), projectUser)),
   ]);
-  const scheduleDetails = await capture<JsonRecord[]>([], async () => {
-    const details: JsonRecord[] = [];
-    for (const schedule of schedules.data.items.slice(0, scheduleLimit)) {
-      const id = asString(schedule.id);
-      if (!id) continue;
-      details.push(await client.getSchedule(id, now, until));
-    }
-    return details;
-  });
+  // Detail reads are keyed on the schedules that were read; without a schedule list none is issued.
+  const scheduleDetails = schedules.error
+    ? skippedSnapshot<JsonRecord[]>([], "schedule detail reads", "/schedules", schedules)
+    : await capture<JsonRecord[]>([], async () => {
+      const details: JsonRecord[] = [];
+      for (const schedule of schedules.data.items.slice(0, scheduleLimit)) {
+        const id = asString(schedule.id);
+        if (!id) continue;
+        details.push(await client.getSchedule(id, now, until));
+      }
+      return details;
+    });
   return {
     scope,
     schedules,
@@ -2658,15 +2750,18 @@ export async function collectPagerdutyIntegrationSecurityData(
     capture<PagerdutyCollection>(emptyCollection(), () => client.listBusinessServices(businessServiceLimit)),
     capture<PagerdutyCollection>(emptyCollection(), async () => projectCollection(await client.listChangeEvents(since, now), projectChangeEvent)),
   ]);
-  const businessServiceDependencies = await capture<Record<string, JsonRecord[]>>({}, async () => {
-    const entries: Record<string, JsonRecord[]> = {};
-    for (const businessService of businessServices.data.items.slice(0, businessServiceLimit)) {
-      const id = asString(businessService.id);
-      if (!id) continue;
-      entries[id] = await client.getBusinessServiceDependencies(id);
-    }
-    return entries;
-  });
+  // Dependency reads are keyed on the business services that were read; without that list none is issued.
+  const businessServiceDependencies = businessServices.error
+    ? skippedSnapshot<Record<string, JsonRecord[]>>({}, "business service dependency reads", "/business_services", businessServices)
+    : await capture<Record<string, JsonRecord[]>>({}, async () => {
+      const entries: Record<string, JsonRecord[]> = {};
+      for (const businessService of businessServices.data.items.slice(0, businessServiceLimit)) {
+        const id = asString(businessService.id);
+        if (!id) continue;
+        entries[id] = await client.getBusinessServiceDependencies(id);
+      }
+      return entries;
+    });
   return {
     scope,
     services,
@@ -3131,7 +3226,8 @@ function buildQuickReference(): string {
     "# PagerDuty Audit Bundle Quick Reference",
     "",
     "- `core_data/` contains PagerDuty REST API snapshots captured during this assessment. Credentials are never written: integration keys and inbound integration emails, extension `config` objects, webhook custom header values, and any secret-named field are replaced with `[REDACTED]`; webhook and extension URLs are reduced to scheme and host; users, services, workflows, change events, and audit records are projected to the fields the findings read.",
-    "- A dataset that was denied, errored, or never collected is written as `{ \"collected\": false, \"status\": <http status or null>, \"endpoint\": <path or null>, \"error\": <message> }` instead of an empty list; a readable dataset with no items keeps its normal shape with `items: []`. Counts in `analysis/*.json` that depend on an unread inventory are `null`, and each summary carries an `inventories` map stating whether every source was read to completion.",
+    "- A dataset that was denied, errored, or never collected is written as `{ \"collected\": false, \"status\": <http status or null>, \"endpoint\": <path or null>, \"error\": <message> }` instead of an empty list; a readable dataset with no items keeps its normal shape with `items: []`. Per-item reads that were never issued because their parent list was not read (`team_members.json`, `schedule_details.json`, `business_service_dependencies.json`) carry the same marker with `status: null`, `endpoint: null`, and an error starting `not requested:` that names the parent list. Counts in `analysis/*.json` that depend on an unread inventory are `null`, and each summary carries an `inventories` map stating whether every source was read to completion.",
+    "- Every error string in this bundle (`_errors.log`, `analysis/*.json` errors and summaries, `core_data/access_check.json`) has passed a redaction step: configured credentials, URL userinfo and query strings, JWT-shaped strings, Authorization values, and credential-named assignments are replaced with `[REDACTED]`, and a non-JSON error body is recorded only as its status, content type, and byte length.",
     "- `analysis/` contains normalized findings (`findings.json`) and one JSON summary per assessment category.",
     "- `compliance/` contains the executive summary, the unified matrix, and one report per framework.",
     "- `_errors.log` appears only when some reads failed but the bundle still completed.",
@@ -3481,7 +3577,7 @@ export function registerPagerdutyTools(pi: any): void {
     name: "pagerduty_export_audit_bundle",
     label: "Export PagerDuty audit bundle",
     description:
-      "Export a PagerDuty audit package covering all 25 spec controls with raw API snapshots (core_data/), normalized findings (analysis/), executive summary, unified matrix and per-framework reports (compliance/), QUICK_REFERENCE.md, an _errors.log for partial failures, and a zip archive.",
+      "Export a PagerDuty audit package covering all 25 spec controls with projected and redacted API snapshots plus not-collected markers for denied datasets (core_data/), normalized findings (analysis/), executive summary, unified matrix and per-framework reports (compliance/), QUICK_REFERENCE.md, an _errors.log for partial failures, and a zip archive.",
     parameters: Type.Object({
       ...authParams,
       output_dir: Type.Optional(Type.String({ description: `Output root. Defaults to ${DEFAULT_OUTPUT_DIR}.` })),
