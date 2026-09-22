@@ -879,7 +879,7 @@ test("verdict safety: recording disclaimer distinguishes documented option names
 });
 
 test("checkZoomAccess reports readable Zoom audit surfaces per documented option view", async () => {
-  const result = await checkZoomAccess(compliantClient());
+  const result = await checkZoomAccess(compliantClient(), { now: NOW });
   assert.equal(result.status, "healthy");
   assert.equal(result.surfaces.filter((surface) => surface.status === "readable").length, result.surfaces.length);
   assert.ok(result.surfaces.some((surface) => surface.name === "account_settings:security"));
@@ -890,15 +890,15 @@ test("checkZoomAccess reports readable Zoom audit surfaces per documented option
     async getPhoneAccountSettings() {
       throw new ZoomApiError("Zoom request failed (403 Forbidden): This account does not have Zoom Phone", 403);
     },
-  }));
+  }), { now: NOW });
   assert.equal(phoneOnly.status, "healthy");
   assert.ok(phoneOnly.surfaces.some((surface) => surface.name === "phone_account_settings" && surface.status === "not_readable" && /denied/.test(surface.error)));
 
-  const limited = await checkZoomAccess(partialClient());
+  const limited = await checkZoomAccess(partialClient(), { now: NOW });
   assert.equal(limited.status, "limited");
   assert.ok(limited.surfaces.some((surface) => surface.name === "account_settings:security" && surface.status === "not_readable"));
 
-  const denied = await checkZoomAccess(deniedClient());
+  const denied = await checkZoomAccess(deniedClient(), { now: NOW });
   assert.equal(denied.status, "limited");
   assert.match(denied.recommendedNextStep, /account:read:admin/);
 });
@@ -1363,6 +1363,9 @@ test("review fixes 5, 6, 8: ZOOM_DOCS cites live reference paths, a 429 without 
     { name: "delta seconds", headers: { "retry-after": "3" }, expected: 3000 },
     { name: "unparseable", headers: { "retry-after": "soon" }, expected: 1000 },
     { name: "HTTP-date far in the future is capped", headers: { "retry-after": "Wed, 21 Oct 2099 07:28:00 GMT" }, expected: 30000 },
+    { name: "HTTP-date 90 seconds after the injected clock", headers: { "retry-after": new Date(NOW.getTime() + 90_000).toUTCString() }, expected: 30000 },
+    { name: "HTTP-date 20 seconds after the injected clock", headers: { "retry-after": new Date(NOW.getTime() + 20_000).toUTCString() }, expected: 20000 },
+    { name: "HTTP-date already past the injected clock floors at one second", headers: { "retry-after": new Date(NOW.getTime() - 60_000).toUTCString() }, expected: 1000 },
   ];
   for (const scenario of scenarios) {
     let attempts = 0;
@@ -1372,13 +1375,13 @@ test("review fixes 5, 6, 8: ZOOM_DOCS cites live reference paths, a 429 without 
       if (attempts === 1) return jsonResponse({ code: 429, message: "rate limited" }, { status: 429, headers: scenario.headers });
       return jsonResponse({ security: { sign_in_with_two_factor_auth: "all" } });
     };
-    const client = new ZoomApiClient(sampleConfig(), { fetchImpl, sleep: async (ms) => { sleeps.push(ms); } });
+    const client = new ZoomApiClient(sampleConfig(), { fetchImpl, sleep: async (ms) => { sleeps.push(ms); }, now: () => NOW.getTime() });
     const settings = await client.getAccountSettings("security");
     assert.deepEqual(sleeps, [scenario.expected], scenario.name);
     assert.equal(settings.security.sign_in_with_two_factor_auth, "all", scenario.name);
   }
 
-  const access = await checkZoomAccess(compliantClient());
+  const access = await checkZoomAccess(compliantClient(), { now: NOW });
   const optionViews = access.surfaces.filter((surface) => surface.name.startsWith("account_settings:")).map((surface) => surface.name).sort();
   assert.deepEqual(optionViews, ["account_settings:meeting_authentication", "account_settings:meeting_security", "account_settings:security"]);
   assert.equal(access.surfaces.some((surface) => surface.name.includes("recording_authentication")), false, "recording_authentication is documented but not read by any verdict, so it is not probed");
@@ -1635,10 +1638,15 @@ test("error-body walk: every surface the collectors call, failing in three body 
   const record = new Set();
   const baseline = walkClient({ record });
   const baselineExport = await exportZoomAuditBundle(baseline.client, baseline.config, base, { now: NOW });
-  await checkZoomAccess(baseline.client);
+  await checkZoomAccess(baseline.client, { now: NOW });
   assert.equal(baselineExport.errorCount, 0);
   const surfaces = [...record].sort();
   assert.ok(surfaces.includes("POST /oauth/token"), "the token exchange is part of the walk");
+  assert.deepEqual(
+    surfaces.filter((key) => key.includes("/report/operationlogs")),
+    ["GET /v2/report/operationlogs?from=2026-08-22&to=2026-09-21&page_size=300"],
+    "the operation log window comes from the injected clock, so the surface list is the same on every date",
+  );
   assert.ok(surfaces.filter((key) => key.startsWith("GET /v2/")).length >= 21, `expected at least 21 GET surfaces, saw ${surfaces.join(", ")}`);
 
   const walked = [];
@@ -1657,7 +1665,7 @@ test("error-body walk: every surface the collectors call, failing in three body 
       assert.ok(thrown.message.includes(targetUrl.pathname), `${label}: the thrown message names the endpoint`);
 
       const snapshot = await collectZoomSnapshot(client, { now: NOW });
-      const access = await checkZoomAccess(client);
+      const access = await checkZoomAccess(client, { now: NOW });
       const assessments = [
         assessZoomIdentityFromSnapshot(snapshot, { now: NOW }),
         assessZoomCollaborationGovernanceFromSnapshot(snapshot, { now: NOW }),
