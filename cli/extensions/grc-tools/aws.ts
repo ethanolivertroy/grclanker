@@ -2104,7 +2104,8 @@ export async function assessAwsIdentity(
       ["FedRAMP IA-5(1)", "FedRAMP AC-2(3)", "CMMC 3.5.8", "CIS AWS 1.12"],
       {
         users_readable: !userListRead.error,
-        keys_sampled: ifRead(userListRead, sampledKeys),
+        // Zero keys were sampled because none could be listed, not because none exist, when every key list was unreadable.
+        keys_sampled: users.length > 0 && keysUnreadableUsers.length === users.length ? null : ifRead(userListRead, sampledKeys),
         stale_access_keys: ifRead(userListRead, staleAccessKeys.slice(0, 25).map((key) => ({ userName: key.userName, accessKeyId: maskAccessKeyId(key.accessKeyId), ageDays: key.ageDays }))),
         users_keys_unreadable: ifRead(userListRead, sample(keysUnreadableUsers)),
         keys_last_used_unreadable: ifRead(userListRead, sample(lastUsedUnreadableKeys)),
@@ -2320,6 +2321,8 @@ export async function assessAwsLoggingDetection(client: AwsLoggingDetectionClien
   const goodTrails = trailDetails.filter((trail) => trail.isMultiRegion && trail.validation && trail.isLogging === true);
   const unverifiedTrails = trailDetails.filter((trail) => trail.isMultiRegion && trail.validation && trail.isLogging === undefined);
   const statusUnreadable = trailDetails.filter((trail) => trail.statusError);
+  // A count over per-trail reads is unknown, not zero, when every trail's read failed.
+  const trailStatusAllUnreadable = trailDetails.length > 0 && statusUnreadable.length === trailDetails.length;
   let trailStatus: AwsFinding["status"];
   let trailSummary: string;
   if (trailList.error) {
@@ -2342,6 +2345,7 @@ export async function assessAwsLoggingDetection(client: AwsLoggingDetectionClien
   // Control 19: data events or advanced event selectors on at least one trail.
   const trailsWithDataEvents = trailDetails.filter((trail) => trail.hasDataEvents === true);
   const selectorsUnreadable = trailDetails.filter((trail) => trail.selectorsError);
+  const selectorsAllUnreadable = trailDetails.length > 0 && selectorsUnreadable.length === trailDetails.length;
   let dataEventStatus: AwsFinding["status"];
   let dataEventSummary: string;
   if (trailList.error) {
@@ -2393,6 +2397,7 @@ export async function assessAwsLoggingDetection(client: AwsLoggingDetectionClien
   }));
   const enabledDetectors = detectors.filter((detector) => asString(detector.detail.value?.Status) === "ENABLED");
   const unreadableDetectors = detectors.filter((detector) => detector.detail.error);
+  const detectorsAllUnreadable = detectors.length > 0 && unreadableDetectors.length === detectors.length;
   let detectorStatus: AwsFinding["status"];
   let detectorSummary: string;
   if (detectorIds.error) {
@@ -2463,7 +2468,7 @@ export async function assessAwsLoggingDetection(client: AwsLoggingDetectionClien
       ["FedRAMP AU-12", "CMMC 3.3.1", "SOC 2 CC7.2", "CIS AWS 3.3"],
       {
         trails_readable: !trailList.error,
-        data_event_trails: ifRead(trailList, trailsWithDataEvents.map((trail) => trail.name)),
+        data_event_trails: selectorsAllUnreadable ? null : ifRead(trailList, trailsWithDataEvents.map((trail) => trail.name)),
         selectors_unreadable: ifRead(trailList, selectorsUnreadable.map((trail) => trail.name)),
       },
     ),
@@ -2492,7 +2497,7 @@ export async function assessAwsLoggingDetection(client: AwsLoggingDetectionClien
       {
         detectors_readable: !detectorIds.error,
         detector_count: ifRead(detectorIds, detectorList.length),
-        enabled_detectors: ifRead(detectorIds, enabledDetectors.length),
+        enabled_detectors: detectorsAllUnreadable ? null : ifRead(detectorIds, enabledDetectors.length),
         detectors_unreadable: ifRead(detectorIds, unreadableDetectors.map((detector) => detector.id)),
         detector_list_truncated: truncatedFlag(detectorIds),
       },
@@ -2517,11 +2522,11 @@ export async function assessAwsLoggingDetection(client: AwsLoggingDetectionClien
     title: "AWS logging and detection posture",
     summary: {
       trails: ifRead(trailList, trailDetails.length),
-      compliant_trails: ifRead(trailList, goodTrails.length),
+      compliant_trails: trailStatusAllUnreadable ? null : ifRead(trailList, goodTrails.length),
       security_hub_enabled: ifRead(hub, Boolean(hub.value)),
       security_hub_standards: ifRead(standards, standardList.length),
       guardduty_detectors: ifRead(detectorIds, detectorList.length),
-      enabled_guardduty_detectors: ifRead(detectorIds, enabledDetectors.length),
+      enabled_guardduty_detectors: detectorsAllUnreadable ? null : ifRead(detectorIds, enabledDetectors.length),
       config_recorders: ifRead(recorders, recorderList.length),
       recording_config_recorders: recorders.error || recorderStatuses.error ? null : recordingRecorders.length,
       collection_errors: errors.length,
@@ -2581,6 +2586,8 @@ export async function assessAwsOrgGuardrails(
   const attachedScps = scpTargets.filter((policy) => (policy.targets.value?.items.length ?? 0) > 0);
   const unreadableScps = scpTargets.filter((policy) => policy.targets.error);
   const truncatedScpTargets = scpTargets.filter((policy) => policy.targets.value?.truncated);
+  // The attached count is unknown, not zero, when no SCP's target list could be read.
+  const scpTargetsAllUnreadable = scpTargets.length > 0 && unreadableScps.length === scpTargets.length;
 
   const analyzerList = analyzers.value?.items ?? [];
   const activeAnalyzers = analyzerList.filter((analyzer) => asString(analyzer.status) === "ACTIVE");
@@ -2596,6 +2603,7 @@ export async function assessAwsOrgGuardrails(
   const readableFindingLists = findingLists.filter((item) => !item.findings.error);
   const unreadableFindingLists = findingLists.filter((item) => item.findings.error);
   const truncatedFindingLists = findingLists.filter((item) => item.findings.value?.truncated);
+  const findingListsAllUnreadable = findingLists.length > 0 && unreadableFindingLists.length === findingLists.length;
   const activeExternalFindings: JsonRecord[] = readableFindingLists
     .flatMap((item) => (item.findings.value?.items ?? []).map((entry): JsonRecord => ({ ...entry, analyzer: item.name })))
     .filter((entry) => {
@@ -2739,10 +2747,10 @@ export async function assessAwsOrgGuardrails(
       {
         scps_readable: scps ? !scps.error : null,
         scp_count: ifRead(scps, scpList.length),
-        attached_scp_count: ifRead(scps, attachedScps.length),
+        attached_scp_count: scpTargetsAllUnreadable ? null : ifRead(scps, attachedScps.length),
         scps_targets_unreadable: ifRead(scps, unreadableScps.map((policy) => policy.name)),
         scp_list_truncated: truncatedFlag(scps),
-        sample: ifRead(scps, attachedScps.slice(0, 20).map((policy) => ({ policyId: policy.policyId, name: policy.name, targets: policy.targets.value?.items ?? [] }))),
+        sample: scpTargetsAllUnreadable ? null : ifRead(scps, attachedScps.slice(0, 20).map((policy) => ({ policyId: policy.policyId, name: policy.name, targets: policy.targets.value?.items ?? [] }))),
       },
     ),
     finding(
@@ -2763,7 +2771,7 @@ export async function assessAwsOrgGuardrails(
       ["FedRAMP AC-3", "FedRAMP AC-4", "SOC 2 CC6.6", "CIS AWS 1.16"],
       {
         analyzers_readable: !analyzers.error,
-        analyzers_sampled: ifRead(analyzers, readableFindingLists.map((item) => item.name)),
+        analyzers_sampled: findingListsAllUnreadable ? null : ifRead(analyzers, readableFindingLists.map((item) => item.name)),
         analyzers_findings_unreadable: ifRead(analyzers, unreadableFindingLists.map((item) => item.name)),
         analyzers_findings_truncated: ifRead(analyzers, truncatedFindingLists.map((item) => item.name)),
         active_finding_count: !analyzers.error && readableFindingLists.length > 0 ? activeExternalFindings.length : null,
@@ -2862,7 +2870,7 @@ export async function assessAwsOrgGuardrails(
       organization_visible: ifRead(organization, Boolean(organization.value)),
       accounts: ifRead(accounts, accountList.length),
       scps: ifRead(scps, scpList.length),
-      attached_scps: ifRead(scps, attachedScps.length),
+      attached_scps: scpTargetsAllUnreadable ? null : ifRead(scps, attachedScps.length),
       analyzers: ifRead(analyzers, analyzerList.length),
       active_analyzers: ifRead(analyzers, activeAnalyzers.length),
       active_external_findings: !analyzers.error && readableFindingLists.length > 0 ? activeExternalFindings.length : null,
@@ -3163,6 +3171,8 @@ export async function assessAwsDataProtection(
   const kmsListsAllFailed = regionResults.length > 0 && kmsListErrors.length === regionResults.length;
   const customerKeys = keyRows.filter((key) => key.manager === "CUSTOMER");
   const managerUnknown = keyRows.filter((key) => key.manager === undefined);
+  // Key classification counts are unknown, not zero, when DescribeKey failed for every listed key.
+  const keyMetadataUnknown = kmsListsAllFailed || (keyRows.length > 0 && managerUnknown.length === keyRows.length);
   const eligibleKeys = keyRows.filter((key) => key.eligible);
   const notRotating = eligibleKeys.filter((key) => boolFlag(key.rotation?.value, "KeyRotationEnabled") === false);
   const rotationUnknown = eligibleKeys.filter((key) => boolFlag(key.rotation?.value, "KeyRotationEnabled") === undefined);
@@ -3268,8 +3278,8 @@ export async function assessAwsDataProtection(
       {
         ...scopeEvidence(scope),
         keys: kmsListsAllFailed ? null : keyRows.length,
-        customer_managed_keys: kmsListsAllFailed ? null : customerKeys.length,
-        eligible_keys: kmsListsAllFailed ? null : eligibleKeys.length,
+        customer_managed_keys: keyMetadataUnknown ? null : customerKeys.length,
+        eligible_keys: keyMetadataUnknown ? null : eligibleKeys.length,
         keys_not_rotating: kmsListsAllFailed ? null : sample(notRotating.map((key) => ({ region: key.region, key_id: key.keyId }))),
         keys_rotation_unreadable: kmsListsAllFailed ? null : sample(rotationUnknown.map((key) => ({ region: key.region, key_id: key.keyId }))),
         keys_manager_unreadable: kmsListsAllFailed ? null : sample(managerUnknown.map((key) => ({ region: key.region, key_id: key.keyId }))),
@@ -3301,7 +3311,7 @@ export async function assessAwsDataProtection(
       ebs_regions_without_default_encryption: ebsAllUnknown ? null : ebsOff.length,
       rds_instances: rdsAllFailed ? null : rdsInstances.length,
       rds_unencrypted: rdsAllFailed ? null : rdsUnencrypted.length,
-      customer_managed_keys: kmsListsAllFailed ? null : customerKeys.length,
+      customer_managed_keys: keyMetadataUnknown ? null : customerKeys.length,
       keys_not_rotating: kmsListsAllFailed ? null : notRotating.length,
       collection_errors: errors.length,
     },
