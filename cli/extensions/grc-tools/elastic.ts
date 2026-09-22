@@ -19,7 +19,7 @@ import { homedir } from "node:os";
 import { dirname, join, relative, resolve } from "node:path";
 import { ZipArchive } from "archiver";
 import { Type } from "@sinclair/typebox";
-import { parse as parseYaml } from "yaml";
+import { parse as parseYaml, YAMLParseError } from "yaml";
 import { errorResult, formatTable, textResult } from "./shared.js";
 
 type FetchImpl = typeof fetch;
@@ -435,6 +435,11 @@ function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
+/** Tool-level sink: every message returned by a tool's catch block passes the unanchored scrub, whatever threw it. */
+function toolErrorText(error: unknown): string {
+  return scrubErrorText(errorMessage(error));
+}
+
 function ensurePrivateDir(pathname: string): void {
   mkdirSync(pathname, { recursive: true, mode: 0o700 });
   const realPath = realpathSync(pathname);
@@ -781,9 +786,49 @@ function overlayKeys(source: JsonRecord, ...keys: string[]): unknown {
   return undefined;
 }
 
+const YAML_ERROR_CODE_PATTERN = /^[A-Z_]+$/;
+const ERRNO_CODE_PATTERN = /^E[A-Z]+$/;
+
+/**
+ * Raised when a config file cannot be read or parsed. Config files carry credentials, so the message
+ * is built only from the path, the parser's structured position, and a validated error code: the
+ * parser's own message (which quotes the offending source line) and the file contents never appear.
+ */
+export class ElasticConfigFileError extends Error {
+  readonly path: string;
+  readonly code: string;
+  readonly line: number | undefined;
+  readonly column: number | undefined;
+
+  constructor(path: string, code: string, position?: { line?: number; column?: number }) {
+    const where = position?.line !== undefined ? ` at line ${position.line}${position.column !== undefined ? `, column ${position.column}` : ""}` : "";
+    super(`Elastic config file ${path} could not be loaded (${code}${where}). The parser detail is withheld because config files carry credentials; fix or remove the file and retry.`);
+    this.name = "ElasticConfigFileError";
+    this.path = path;
+    this.code = code;
+    this.line = position?.line;
+    this.column = position?.column;
+  }
+}
+
+function configFileError(location: string, error: unknown): ElasticConfigFileError {
+  if (error instanceof YAMLParseError) {
+    const code = YAML_ERROR_CODE_PATTERN.test(error.code) ? error.code : "INVALID_YAML";
+    const position = error.linePos?.[0];
+    return new ElasticConfigFileError(location, code, position ? { line: position.line, column: position.col } : undefined);
+  }
+  const errno = asString(asObject(error)?.code);
+  return new ElasticConfigFileError(location, errno && ERRNO_CODE_PATTERN.test(errno) ? errno : "INVALID_CONFIG");
+}
+
 function overlayFromConfigFile(location: string): ElasticConfigOverlay | undefined {
   if (!existsSync(location)) return undefined;
-  const parsed = asObject(parseYaml(readFileSync(location, "utf8"))) ?? {};
+  let parsed: JsonRecord;
+  try {
+    parsed = asObject(parseYaml(readFileSync(location, "utf8"))) ?? {};
+  } catch (error) {
+    throw configFileError(location, error);
+  }
   const elasticsearch = asObject(parsed.elasticsearch) ?? {};
   const kibana = asObject(parsed.kibana) ?? {};
   const cloud = asObject(parsed.cloud) ?? {};
@@ -934,7 +979,8 @@ export class ElasticRequestError extends Error {
   readonly target: ElasticTarget;
 
   constructor(message: string, status: number, target: ElasticTarget) {
-    super(message);
+    // The constructor is the last stop before the message can escape, so the unanchored scrub runs here as well as at the sink.
+    super(scrubErrorText(message));
     this.name = "ElasticRequestError";
     this.status = status;
     this.target = target;
@@ -4232,7 +4278,7 @@ function registerAssessmentTool(
         return textResult(formatAssessmentText(result), { tool: definition.name, ...result });
       } catch (error) {
         return errorResult(
-          `${definition.label} failed: ${errorMessage(error)}`,
+          `${definition.label} failed: ${toolErrorText(error)}`,
           { tool: definition.name },
         );
       }
@@ -4254,7 +4300,7 @@ export function registerElasticTools(pi: any): void {
         return textResult(formatAccessCheckText(result), { tool: "elastic_check_access", ...result });
       } catch (error) {
         return errorResult(
-          `Elastic access check failed: ${errorMessage(error)}`,
+          `Elastic access check failed: ${toolErrorText(error)}`,
           { tool: "elastic_check_access" },
         );
       }
@@ -4340,7 +4386,7 @@ export function registerElasticTools(pi: any): void {
         );
       } catch (error) {
         return errorResult(
-          `Elastic audit bundle export failed: ${errorMessage(error)}`,
+          `Elastic audit bundle export failed: ${toolErrorText(error)}`,
           { tool: "elastic_export_audit_bundle" },
         );
       }

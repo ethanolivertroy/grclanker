@@ -530,6 +530,86 @@ test("resolveElasticConfiguration rejects missing URL or credentials", () => {
   );
 });
 
+const CONFIG_FILE_CANARY = "CONFIGFILE_CANARY_7d8e9f0a1b2c3d4e";
+
+/** Malformed YAML shapes; the yaml package quotes the offending source line in its own message for most of them. */
+const MALFORMED_YAML_CONFIGS = [
+  { name: "unterminated quote", code: "MISSING_CHAR", line: 4, content: `url: https://es.example.com:9200\nkibana_url: https://kibana.example.com:5601\napi_key: "${CONFIG_FILE_CANARY}\n` },
+  { name: "bad indent", code: "BAD_INDENT", line: 3, content: `elasticsearch:\n  url: https://es.example.com:9200\n api_key: ${CONFIG_FILE_CANARY}\n` },
+  { name: "duplicate key", code: "DUPLICATE_KEY", line: 3, content: `url: https://es.example.com:9200\napi_key: first-key\napi_key: ${CONFIG_FILE_CANARY}\n` },
+  { name: "trailing comma", code: "UNEXPECTED_TOKEN", line: 1, content: `elasticsearch: { url: https://es.example.com:9200, api_key: ${CONFIG_FILE_CANARY},, }\n` },
+  { name: "tab indentation", code: "TAB_AS_INDENT", line: 2, content: `url: https://es.example.com:9200\n\tapi_key: ${CONFIG_FILE_CANARY}\n` },
+];
+
+test("rule 9 / addendum 6: a malformed config file whose bad line carries a credential yields an error naming only the path, line, and code, from the resolver and from every tool", async () => {
+  const registered = [];
+  registerElasticTools({ registerTool: (tool) => registered.push(tool) });
+  const checkTool = registered.find((tool) => tool.name === "elastic_check_access");
+  const exportTool = registered.find((tool) => tool.name === "elastic_export_audit_bundle");
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = () => { throw new Error("no request may be made while the config file is unreadable"); };
+  try {
+    for (const shape of MALFORMED_YAML_CONFIGS) {
+      const base = createTempBase("elastic-malformed-config-");
+      const configPath = join(base, "config.yaml");
+      writeFileSync(configPath, shape.content, "utf8");
+      const outputDir = join(base, "export");
+
+      let thrown;
+      try {
+        resolveElasticConfiguration({ config_file: configPath }, {}, { homeDir: base });
+      } catch (error) {
+        thrown = error;
+      }
+      assert.ok(thrown, `${shape.name}: the resolver must reject the file`);
+      assert.equal(thrown.name, "ElasticConfigFileError", shape.name);
+      assert.equal(thrown.code, shape.code, `${shape.name}: the validated parser code is carried`);
+      assert.equal(thrown.line, shape.line, `${shape.name}: the parser's structured line position is carried`);
+      assert.equal(typeof thrown.column, "number", shape.name);
+      assert.ok(thrown.message.includes(configPath), `${shape.name}: the message names the file path`);
+      assert.match(thrown.message, new RegExp(`\\(${shape.code} at line ${shape.line}, column \\d+\\)`), `${shape.name}: ${thrown.message}`);
+      assert.ok(!thrown.message.includes(CONFIG_FILE_CANARY), `${shape.name}: the resolver message quotes the credential: ${thrown.message}`);
+      assert.ok(!thrown.message.includes("api_key") && !thrown.message.includes("first-key"), `${shape.name}: no key name or value from the file: ${thrown.message}`);
+
+      const access = await checkTool.execute("call-config", checkTool.prepareArguments({ config_file: configPath }));
+      assert.equal(access.isError, true, shape.name);
+      assert.ok(!JSON.stringify(access).includes(CONFIG_FILE_CANARY), `${shape.name}: the check_access payload quotes the credential`);
+      assert.match(access.content[0].text, new RegExp(`Elastic access check failed: Elastic config file .*config\\.yaml could not be loaded \\(${shape.code} at line ${shape.line}, column \\d+\\)`), shape.name);
+
+      const exported = await exportTool.execute("call-config-export", exportTool.prepareArguments({ config_file: configPath, output_dir: outputDir }));
+      assert.equal(exported.isError, true, shape.name);
+      assert.ok(!JSON.stringify(exported).includes(CONFIG_FILE_CANARY), `${shape.name}: the export payload quotes the credential`);
+      assert.match(exported.content[0].text, new RegExp(`\\(${shape.code} at line ${shape.line}`), shape.name);
+      assert.equal(existsSync(outputDir), false, `${shape.name}: nothing is written when the config file is unreadable`);
+    }
+
+    // A filesystem failure surfaces the errno code only; a file that parses to a scalar carrying the credential is ignored, not echoed.
+    const directoryAsFile = createTempBase("elastic-config-dir-");
+    let fsError;
+    try {
+      resolveElasticConfiguration({ config_file: directoryAsFile }, {}, { homeDir: directoryAsFile });
+    } catch (error) {
+      fsError = error;
+    }
+    assert.equal(fsError.name, "ElasticConfigFileError");
+    assert.equal(fsError.code, "EISDIR");
+    assert.equal(fsError.line, undefined);
+    assert.match(fsError.message, /could not be loaded \(EISDIR\)/);
+    const scalarBase = createTempBase("elastic-config-scalar-");
+    writeFileSync(join(scalarBase, "config.yaml"), `${CONFIG_FILE_CANARY}\n`, "utf8");
+    let scalarError;
+    try {
+      resolveElasticConfiguration({ config_file: join(scalarBase, "config.yaml") }, {}, { homeDir: scalarBase });
+    } catch (error) {
+      scalarError = error;
+    }
+    assert.match(scalarError.message, /Elasticsearch URL is required/);
+    assert.ok(!scalarError.message.includes(CONFIG_FILE_CANARY), "a scalar-valued config file is never echoed");
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
 test("normalizeElasticApiKey encodes id:key pairs and preserves base64 values", () => {
   assert.equal(normalizeElasticApiKey("abc:def"), Buffer.from("abc:def").toString("base64"));
   assert.equal(normalizeElasticApiKey(API_KEY), API_KEY);
@@ -2487,6 +2567,66 @@ test("verdict rule 9: the Elastic bundle, its zip, every assess payload, and the
   const pipelineFinding = assessments[3].findings.find((item) => item.id === "ELASTIC-22");
   assert.equal(pipelineFinding.status, "fail", "the projected pipeline still drives the sensitive-literal verdict");
   assert.deepEqual(pipelineFinding.evidence.pipelines_with_sensitive_set[0].sensitive_set_processors, ["http.request.headers.authorization"]);
+});
+
+/** Every error string an Elastic run can record, gathered from the access check, the assess payloads, and the bundle. */
+function recordedErrorStrings(access, assessments, files) {
+  const strings = [];
+  for (const surface of access.surfaces) if (typeof surface.error === "string") strings.push(surface.error);
+  strings.push(...access.notes);
+  for (const assessment of assessments) {
+    strings.push(...(assessment.errors ?? []));
+    for (const finding of assessment.findings) {
+      strings.push(finding.summary);
+      for (const [, value] of leaves(finding.evidence)) if (typeof value === "string") strings.push(value);
+    }
+  }
+  const errorsLog = files.get("_errors.log");
+  if (errorsLog) strings.push(...errorsLog.split("\n"));
+  return strings;
+}
+
+test("addendum 4: a 502 HTML page or a JSON error message carrying credentials on any Elastic surface never reaches the access check, an assess payload, or the bundle, and every recorded error carries the status-and-length note", async () => {
+  const fixtures = canaryFixtures();
+  const surfaces = Object.keys(healthyRoutes(fixtures));
+  assert.ok(surfaces.length >= 30, `expected every collector and access probe route, got ${surfaces.length}`);
+  const config = sampleConfig({ maxRetries: 0 });
+  const secrets = [...canaryValues(), API_KEY, "audit-secret-value"];
+  const variants = [
+    { name: "html502", handler: htmlGateway, note: /502 Bad Gateway: non-JSON body \(text\/html, \d+ bytes, not echoed\)/ },
+    { name: "json403", handler: jsonErrorWithUrl, note: /403 Forbidden/ },
+  ];
+  let notedSurfaces = 0;
+  for (const surface of surfaces) {
+    for (const variant of variants) {
+      const routes = healthyRoutes(fixtures);
+      routes[surface] = variant.handler();
+      const client = new ElasticApiClient(config, { fetchImpl: createRouter(routes) });
+      const label = `${surface} ${variant.name}`;
+
+      const access = await checkElasticAccess(client);
+      const snapshot = await collectElasticSnapshot(client, ELASTIC_ALL_DATASETS, { sensitiveIndexPatterns: ["customers-*"] });
+      const assessments = ALL_AREAS.map((area) => evaluateElasticArea(area, snapshot, { sensitiveIndexPatterns: ["customers-*"] }, { elasticsearchUrl: config.elasticsearchUrl }));
+      const result = await exportElasticAuditBundle(client, config, createTempBase("elastic-surface-canary-"), { sensitiveIndexPatterns: ["customers-*"] });
+      const files = readBundleFiles(result.outputDir);
+      const entries = readZipEntries(result.zipPath);
+
+      assertSecretsAbsent(assert, files, secrets, `${label} bundle file`);
+      assertSecretsAbsent(assert, entries, secrets, `${label} zip entry`);
+      assertSecretsAbsent(assert, new Map([["access", JSON.stringify(access)], ["assessments", JSON.stringify(assessments)]]), secrets, `${label} tool payload`);
+
+      const [method, path] = surface.split(" ");
+      const aboutSurface = recordedErrorStrings(access, assessments, files).filter((text) => text.includes(`${method} ${path}`) && /failed|returned|timed out/.test(text));
+      if (aboutSurface.length === 0) continue;
+      notedSurfaces += 1;
+      for (const text of aboutSurface) {
+        assert.match(text, variant.note, `${label}: error string lacks the status note: ${text}`);
+        assert.ok(!/<html|Bad Gateway<\/|upstream sent/.test(text), `${label}: error string echoes the body: ${text}`);
+        if (variant.name === "json403") assert.ok(!text.includes(`token=${CANARIES.urlToken}`), `${label}: URL token survives in ${text}`);
+      }
+    }
+  }
+  assert.ok(notedSurfaces >= surfaces.length, `every surface should record its failure at least once across the variants, got ${notedSurfaces} of ${surfaces.length * variants.length}`);
 });
 
 test("verdict rule 10: listApiKeys reports truncation when a full page has no search_after cursor and listFleetOutputs reports the cap and total", async () => {
