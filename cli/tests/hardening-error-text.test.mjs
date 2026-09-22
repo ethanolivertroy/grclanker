@@ -333,6 +333,105 @@ test("credential-named pairs lose any nonempty value whatever its shape, compoun
   }
 });
 
+test("a carrier after a two-character JSON escape is recognised through every entry point, and a raw control inside describeErrorBody's nested strings takes that form", () => {
+  // Review of #78 (gap 2): over JSON-encoded text the line break before a carrier is the two
+  // characters `\n`, and the letter of the escape is not part of the carrier's name.
+  const values = ["hunter2", "letmein2024", "correcthorsebatterystaple", ERROR_CANARY.bearer];
+  const carriers = [
+    (value) => [`api_key=${value}`, `api_key=${REDACTED}`],
+    (value) => [`password: ${value}`, `password: ${REDACTED}`],
+    (value) => [`\\"client_secret\\": \\"${value}\\"`, `\\"client_secret\\": \\"${REDACTED}\\"`],
+    (value) => [`X-Api-Key: ${value}`, `X-Api-Key: ${REDACTED}`],
+    (value) => [`Authorization: Bearer ${value}`, `Authorization: Bearer ${REDACTED}`],
+    (value) => [`X-Auth-Token: \\"${value}\\"`, `X-Auth-Token: \\"${REDACTED}\\"`],
+    (value) => [`Cookie: sid=${value}; Path=/`, `Cookie: ${REDACTED}`],
+    (value) => [`Set-Cookie: session=${value}; HttpOnly`, `Set-Cookie: ${REDACTED}`],
+    (value) => [`client_token=${value}`, `client_token=${REDACTED}`],
+    (value) => [`GITHUB_TOKEN=${value}`, `GITHUB_TOKEN=${REDACTED}`],
+    (value) => [`DB_PASSWORD: ${value}`, `DB_PASSWORD: ${REDACTED}`],
+    (value) => [`/v1/items?token=${value}&limit=5`, `/v1/items?token=${REDACTED}&limit=5`],
+    (value) => [`Bearer ${value} was replayed`, `Bearer ${REDACTED} was replayed`],
+  ];
+  // The escapes as the scrub sees them (two characters, or `\u` and four hex digits), then the
+  // controls every escape must equal: a space, a raw line break, an escaped quote, an escaped backslash.
+  const escapes = ["\\n", "\\r", "\\t", "\\b", "\\f", "\\v", "\\r\\n", "\\u000a", "\\u001b"];
+  const controls = [" ", 'said \\"', "path C:\\\\"];
+  const textScrubs = [
+    ["scrubErrorText", (text) => scrubErrorText(text)],
+    ["scrubDataText", (text) => scrubDataText(text)],
+    ["redactSecretValues", (text) => redactSecretValues(text)],
+  ];
+  const entryPoints = [
+    ...textScrubs,
+    ["errorMessage", (text) => errorMessage(new Error(text))],
+    ["scrubError", (text) => scrubError(new Error(text)).message],
+    ["IntegrationError", (text) => new IntegrationError(text, {}).message],
+  ];
+  let trials = 0;
+  for (const value of values) {
+    for (const carrier of carriers) {
+      const [planted, cleaned] = carrier(value);
+      for (const prefix of [...escapes, ...controls]) {
+        const text = `request failed${prefix}${planted} see the log`;
+        const expected = `request failed${prefix}${cleaned} see the log`;
+        for (const [name, scrub] of entryPoints) {
+          trials += 1;
+          assert.equal(scrub(text), expected, `${name} on ${JSON.stringify(text)}`);
+        }
+      }
+      // A raw line break or tab is the control the escapes must equal; the message entry points fold
+      // it to a space, so they are held to the value's absence and the marker's presence.
+      for (const prefix of ["\n", "\t", "\r\n"]) {
+        const text = `request failed${prefix}${planted} see the log`;
+        const expected = `request failed${prefix}${cleaned} see the log`;
+        for (const [name, scrub] of textScrubs) {
+          assert.equal(scrub(text), expected, `${name} on ${JSON.stringify(text)}`);
+        }
+        for (const [name, scrub] of entryPoints) {
+          const rendered = scrub(text);
+          assertNoFragment(rendered, value, { label: `${name} on ${JSON.stringify(text)}` });
+          assert.ok(rendered.includes(cleaned.replace(/\s+/g, " ")) || rendered.includes(cleaned), `${name} on ${JSON.stringify(text)}: ${rendered}`);
+        }
+      }
+    }
+  }
+  assert.equal(trials, values.length * carriers.length * (escapes.length + controls.length) * entryPoints.length);
+  // Inside describeErrorBody's nested strings a raw control in the inner text is JSON-encoded to the
+  // escape before the scrub reads it; the value goes there too, and through describeFailedResponse.
+  for (const value of values) {
+    for (const carrier of carriers) {
+      const [planted] = carrier(value);
+      const raw = planted.replace(/\\"/g, '"');
+      for (const control of ["\n", "\r", "\t", "\b", "\f", "\v", "\r\n", "\u001b"]) {
+        const inner = `request failed${control}${raw} see the log`;
+        const nested = JSON.stringify({ error: { message: JSON.stringify({ detail: inner }) } });
+        for (const [name, rendered] of [
+          ["describeErrorBody nested", describeErrorBody("application/json", nested)],
+          ["describeErrorBody message", describeErrorBody("application/json", JSON.stringify({ message: inner }))],
+          ["describeFailedResponse", describeFailedResponse({ method: "GET", endpoint: "/v1/users", status: 502, statusText: "Bad Gateway", contentType: "application/json", body: nested })],
+        ]) {
+          assertNoFragment(rendered, value, { label: `${name} for ${JSON.stringify(inner)}` });
+          assert.ok(rendered.includes(REDACTED), `${name} for ${JSON.stringify(inner)}: ${rendered}`);
+          assert.ok(rendered.includes("request failed"), `${name} keeps the prose: ${rendered}`);
+        }
+      }
+    }
+  }
+  // The escape is a boundary, not a carrier: prose after it stays, as after a raw line break.
+  for (const text of [
+    "request failed\\nno token was sent",
+    "request failed\\nBearer token authentication is required",
+    "request failed\\ttokens: 3 of 5 rotated",
+    "request failed\\rInvalidAuthenticationToken: Access token has expired.",
+    "config read from C:\\\\Users\\\\ops\\\\token-store\\\\settings.json",
+    "request failed\\u001b[0m see the log",
+  ]) {
+    for (const [name, scrub] of entryPoints) {
+      assert.equal(scrub(text), text, `${name} changed ${JSON.stringify(text)}`);
+    }
+  }
+});
+
 test("URL scrubbing is idempotent for query-only, fragment-only, and mixed URLs, and every entry point is idempotent over the carrier corpus", () => {
   // Codex finding: a fragment-only URL came back as `#[REDACTED][REDACTED]` on a second pass.
   for (const [text, expected] of [
