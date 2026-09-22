@@ -58,6 +58,7 @@ import { registerVeracodeTools } from "./grc-tools/veracode.js";
 import { registerWebexTools } from "./grc-tools/webex.js";
 import { registerZendeskTools } from "./grc-tools/zendesk.js";
 import { registerZoomTools } from "./grc-tools/zoom.js";
+import { registerZscalerTools } from "./grc-tools/zscaler.js";
 
 /**
  * Domain tool registrars, kept alphabetical by integration. Add a new
@@ -102,6 +103,7 @@ const DOMAIN_TOOL_REGISTRARS: ReadonlyArray<(pi: ExtensionAPI) => void> = [
   registerWebexTools,
   registerZendeskTools,
   registerZoomTools,
+  registerZscalerTools,
 ];
 
 function registerDomainTools(pi: ExtensionAPI): number {

@@ -64,6 +64,7 @@
     "test:zendesk:live": "npm run build && node scripts/zendesk-live-smoke.mjs",
     "test:webex:live": "npm run build && node scripts/webex-live-smoke.mjs",
     "test:zoom:live": "npm run build && node scripts/zoom-live-smoke.mjs",
+    "test:zscaler:live": "npm run build && node scripts/zscaler-live-smoke.mjs",
     "test:isolation": "npm run build && node --test tests/isolation.test.mjs"
   },
   "files": [
