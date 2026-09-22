@@ -1923,7 +1923,10 @@ test("exportZendeskAuditBundle records partial collection failures in _errors.lo
   const errorLog = readFileSync(join(result.outputDir, "_errors.log"), "utf8");
   assert.match(errorLog, /oauth_clients: .*403/);
   assert.match(errorLog, /audit_logs_recent: .*403/);
-  assert.ok(!existsSync(join(result.outputDir, "core_data/oauth_clients.json")), "forbidden snapshots are not written as data");
+  const forbiddenFile = JSON.parse(readFileSync(join(result.outputDir, "core_data/oauth_clients.json"), "utf8"));
+  assert.equal(forbiddenFile.collected, false, "a forbidden snapshot is written as a not-collected marker, never as data or an empty list");
+  assert.equal(forbiddenFile.status, 403);
+  assert.equal(forbiddenFile.dataset_status, "forbidden");
   const executive = readFileSync(join(result.outputDir, "compliance/executive_summary.md"), "utf8");
   assert.match(executive, /## Partial Collection Warnings/);
 });
@@ -2594,4 +2597,198 @@ test("assessment summaries and evidence render unread inventories as null, never
     [0, 0, 1, 1, 0],
     "readable empty inventories still render their real counts",
   );
+});
+
+// ---------------------------------------------------------------------------
+// Collection status, request matching, and denied-list markers (addendum 5)
+// ---------------------------------------------------------------------------
+
+// Every paged read the assessments keep, keyed by the route the HTTP fixture serves,
+// with the core_data/ file each one is written to.
+const LIST_CORE_DATA_FILES = {
+  "/users": "team_members",
+  "/custom_roles": "custom_roles",
+  "/groups": "groups",
+  "/group_memberships": "group_memberships",
+  "/oauth/clients": "oauth_clients",
+  "/oauth/tokens": "oauth_tokens",
+  "/audit_logs?filter[source_type]=apitoken": "api_token_audit_logs",
+  "/audit_logs?sort=-created_at": "audit_logs_recent",
+  "/deletion_schedules": "deletion_schedules",
+  "/suspended_tickets": "suspended_tickets",
+  "/apps/installations": "app_installations",
+  "/apps/owned": "owned_apps",
+  "/brands": "brands",
+  "/sharing_agreements": "sharing_agreements",
+  "/targets": "targets",
+  "/webhooks": "webhooks",
+  "/triggers": "triggers",
+  "/automations": "automations",
+};
+
+const PROBE_NAMES_BY_ROUTE = {
+  "/users": "team_members",
+  "/custom_roles": "custom_roles",
+  "/groups": "groups",
+  "/group_memberships": "group_memberships",
+  "/oauth/clients": "oauth_clients",
+  "/oauth/tokens": "oauth_tokens",
+  "/audit_logs?sort=-created_at": "audit_logs",
+  "/deletion_schedules": "deletion_schedules",
+  "/suspended_tickets": "suspended_tickets",
+  "/apps/installations": "app_installations",
+  "/apps/owned": "owned_apps",
+  "/brands": "brands",
+  "/sharing_agreements": "sharing_agreements",
+  "/targets": "targets",
+  "/webhooks": "webhooks",
+  "/triggers": "triggers",
+  "/automations": "automations",
+};
+
+function forbiddenJsonResponse() {
+  return jsonResponse(
+    { error: "Forbidden", description: "You do not have access to this page. Please contact the account owner of this help desk for further help." },
+    { status: 403, statusText: "Forbidden" },
+  );
+}
+
+function collectionEntry(files, name) {
+  for (const [path, text] of files) {
+    if (!path.startsWith("analysis") || !path.endsWith(".json") || path.endsWith("findings.json")) continue;
+    const entry = JSON.parse(text).summary?.collection?.[name];
+    if (entry) return entry;
+  }
+  return undefined;
+}
+
+test("denied-list markers: a denied list writes a not-collected marker in core_data with the observed status and request while a readable-but-empty list stays a list result", async () => {
+  const routes = await healthyHttpRoutes();
+  const outputRoot = createTempBase("grclanker-zendesk-markers-");
+
+  for (const [route, name] of Object.entries(LIST_CORE_DATA_FILES)) {
+    const client = httpClient(routes, route, forbiddenJsonResponse);
+    const endpoint = `GET /api/v2${route.split("?")[0]}`;
+
+    const access = await checkZendeskAccess(client);
+    const probeName = PROBE_NAMES_BY_ROUTE[route];
+    if (probeName) {
+      const probe = access.surfaces.find((surface) => surface.name === probeName);
+      assert.equal(probe.status, "forbidden", `${route}: the probe reports the refusal`);
+      assert.equal(probe.count, null, `${route}: a refused probe counts nothing`);
+      assert.equal(probe.truncated, null, `${route}: a refused probe has no paging outcome`);
+      assert.equal(probe.httpStatus, 403, `${route}: the probe carries the status the request observed`);
+    }
+
+    const exported = await exportZendeskAuditBundle(client, sampleConfig(), outputRoot, { now: () => NOW });
+    const files = readBundleFiles(exported.outputDir);
+    const marker = JSON.parse(files.get(join("core_data", `${name}.json`)));
+    assert.deepEqual(Object.keys(marker).sort(), ["collected", "dataset_status", "endpoint", "error", "status"], `${route}: the denied list is a marker object, not a list result`);
+    assert.equal(marker.collected, false);
+    assert.equal(marker.status, 403, `${route}: the marker carries the status the request observed`);
+    assert.equal(marker.dataset_status, "forbidden");
+    assert.equal(marker.endpoint, endpoint, `${route}: the marker names the request that actually failed`);
+    assert.match(marker.error, /\(403 Forbidden; Forbidden; You do not have access to this page/, `${route}: the marker carries the scrubbed error`);
+    assert.equal(readZipEntries(exported.zipPath).get(`core_data/${name}.json`), files.get(join("core_data", `${name}.json`)), `${route}: the zip carries the same marker`);
+
+    const status = collectionEntry(files, name);
+    assert.deepEqual(
+      { status: status.status, endpoint: status.endpoint, http_status: status.http_status, seen: status.seen, truncated: status.truncated, pages: status.pages },
+      { status: "forbidden", endpoint, http_status: 403, seen: null, truncated: null, pages: null },
+      `${route}: seen, truncated, and pages stay null for a read that never ran`,
+    );
+    assert.match(status.error, /403 Forbidden/);
+
+    // The healthy fixture serves app installations, owned apps, and targets as readable-but-empty lists.
+    const controlName = name === "targets" ? "app_installations" : "targets";
+    const control = JSON.parse(files.get(join("core_data", `${controlName}.json`)));
+    assert.deepEqual(control, { items: [], truncated: false, pages: 1 }, `${route} denied: a readable-but-empty list is still an empty list result`);
+    const controlStatus = collectionEntry(files, controlName);
+    assert.deepEqual(
+      { status: controlStatus.status, http_status: controlStatus.http_status, seen: controlStatus.seen, truncated: controlStatus.truncated, pages: controlStatus.pages, error: controlStatus.error },
+      { status: "ok", http_status: null, seen: 0, truncated: false, pages: 1, error: null },
+      `${route} denied: the readable-but-empty list reports its real counts`,
+    );
+  }
+
+  // A denied single-object read is written as a marker too, and a read that was never
+  // attempted because its prerequisite failed names the request that actually failed.
+  const client = httpClient(routes, "/security_settings", forbiddenJsonResponse);
+  const exported = await exportZendeskAuditBundle(client, sampleConfig(), outputRoot, { now: () => NOW });
+  const files = readBundleFiles(exported.outputDir);
+  const securityMarker = JSON.parse(files.get(join("core_data", "security_settings.json")));
+  assert.equal(securityMarker.collected, false);
+  assert.equal(securityMarker.status, 403);
+  assert.equal(securityMarker.endpoint, "GET /api/v2/security_settings");
+
+  const auditDenied = httpClient(routes, "/audit_logs?sort=-created_at", forbiddenJsonResponse);
+  const auditExport = await exportZendeskAuditBundle(auditDenied, sampleConfig(), outputRoot, { now: () => NOW });
+  const auditFiles = readBundleFiles(auditExport.outputDir);
+  const oldestMarker = JSON.parse(auditFiles.get(join("core_data", "audit_log_oldest.json")));
+  assert.equal(oldestMarker.collected, false, "the oldest-record lookup that was never attempted is a marker");
+  assert.equal(oldestMarker.endpoint, "GET /api/v2/audit_logs", "it names the recent-log request that actually failed");
+  assert.equal(oldestMarker.status, 403);
+});
+
+function recordingZendeskFetch(routes, failures, log) {
+  return async (url) => {
+    const parsed = new URL(url);
+    const key = zendeskRouteKey(url);
+    const failure = failures[key];
+    const response = failure ? failure() : routes[key] === undefined ? undefined : jsonResponse(routes[key]);
+    if (!response) throw new Error(`unrouted Zendesk request: ${url}`);
+    log.push({ method: "GET", path: parsed.pathname, status: response.status });
+    return response;
+  };
+}
+
+function namedZendeskEndpoints(text) {
+  const endpoints = new Set();
+  for (const match of text.matchAll(/\/api\/v2\/[A-Za-z0-9_/.-]+/g)) endpoints.add(match[0].replace(/[.,;:]+$/, ""));
+  // Finding summaries name the read's path in parentheses without the /api/v2 prefix.
+  for (const match of text.matchAll(/\((\/(?!api\/)[a-z_]+(?:\/[a-z_]+)*)/g)) endpoints.add(`/api/v2${match[1]}`);
+  return endpoints;
+}
+
+function namedZendeskStatusCodes(text) {
+  const codes = new Set();
+  for (const match of text.matchAll(/\((\d{3}) [A-Z][A-Za-z ]*[;)]/g)) codes.add(Number(match[1]));
+  for (const match of text.matchAll(/"(?:http_)?status": ?(\d{3})\b/g)) codes.add(Number(match[1]));
+  for (const match of text.matchAll(/returned (\d{3}) \(/g)) codes.add(Number(match[1]));
+  return codes;
+}
+
+test("request matching: every endpoint path and HTTP status named in any output corresponds to a request the run made and observed", async () => {
+  const routes = await healthyHttpRoutes();
+  const log = [];
+  const failures = {
+    "/oauth/clients": forbiddenJsonResponse,
+    "/webhooks": htmlCanaryResponse,
+    "/deletion_schedules": () => new Response("", { status: 404, statusText: "Not Found" }),
+  };
+  const client = new ZendeskApiClient(sampleConfig(), { fetchImpl: recordingZendeskFetch(routes, failures, log), sleep: async () => {} });
+
+  const outputs = [JSON.stringify(await checkZendeskAccess(client))];
+  for (const result of await runAllAssessments(client)) outputs.push(JSON.stringify(result));
+  const exported = await exportZendeskAuditBundle(client, sampleConfig(), createTempBase("grclanker-zendesk-request-log-"), { now: () => NOW });
+  outputs.push(...readBundleFiles(exported.outputDir).values());
+
+  const requestedPaths = new Set(log.map((entry) => entry.path));
+  const observedStatuses = new Set(log.map((entry) => entry.status));
+  assert.ok(observedStatuses.has(403) && observedStatuses.has(502) && observedStatuses.has(404), "the fixture served every failure status under test");
+
+  const text = outputs.join("\n");
+  const endpoints = namedZendeskEndpoints(text);
+  const statuses = namedZendeskStatusCodes(text);
+  assert.ok(endpoints.has("/api/v2/oauth/clients") && endpoints.has("/api/v2/webhooks") && endpoints.has("/api/v2/deletion_schedules"), `the outputs name the failing endpoints: ${[...endpoints].join(", ")}`);
+  assert.ok(statuses.has(403) && statuses.has(502) && statuses.has(404), `the outputs name the observed failure statuses: ${[...statuses].join(", ")}`);
+  for (const endpoint of endpoints) {
+    assert.ok(requestedPaths.has(endpoint), `endpoint ${endpoint} is named in output but the run never requested it`);
+  }
+  for (const status of statuses) {
+    assert.ok(observedStatuses.has(status), `status ${status} is named in output but no request observed it`);
+  }
+  for (const entry of log) {
+    assert.ok(entry.status === 200 || Object.keys(failures).some((key) => entry.path === `/api/v2${key.split("?")[0]}`), `only the three failing surfaces answered with an error: ${entry.path} ${entry.status}`);
+  }
 });

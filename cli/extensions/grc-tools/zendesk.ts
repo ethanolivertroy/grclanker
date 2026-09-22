@@ -60,7 +60,12 @@ export interface ZendeskSnapshot<T> {
   status: ZendeskSnapshotStatus;
   data?: T;
   error?: string;
+  // The HTTP status the failed request observed; absent when no response arrived.
   httpStatus?: number;
+  // The request behind this snapshot: on failure the request that actually failed
+  // (method and path taken from the thrown ZendeskApiError), otherwise the read's
+  // documented endpoint.
+  endpoint?: string;
 }
 
 export interface ZendeskListResult {
@@ -74,10 +79,15 @@ export interface ZendeskAccessSurface {
   endpoint: string;
   requiredRole: "agent" | "admin" | "admin-enterprise";
   status: "readable" | "forbidden" | "not_found" | "error";
-  count?: number;
-  // True when the probe stopped at its item cap or on a stuck cursor, so count is a
-  // seen count rather than the population.
-  truncated?: boolean;
+  // Items seen by a readable probe; null when the probe did not read anything, so a
+  // refused surface is never mistaken for an empty one.
+  count: number | null;
+  // True when a readable list probe stopped at its item cap or on a stuck cursor (count
+  // is a seen count rather than the population); null when the probe failed; absent for
+  // a readable single-object probe.
+  truncated?: boolean | null;
+  // The HTTP status observed by a failed probe; null when it was readable or no response arrived.
+  httpStatus: number | null;
   error?: string;
 }
 
@@ -428,13 +438,29 @@ function errorMessage(error: unknown): string {
   return redactErrorText(error instanceof Error ? error.message : String(error));
 }
 
+/**
+ * status is the HTTP status the request observed (0 when no response arrived:
+ * timeout, DNS, TLS, or connection failure) and endpoint is "GET <path>" of the
+ * request that actually failed, so a marker or finding built from this error
+ * names only a request the run made.
+ */
 export class ZendeskApiError extends Error {
   readonly status: number;
+  readonly endpoint: string | null;
 
-  constructor(message: string, status: number) {
+  constructor(message: string, status: number, endpoint: string | null = null) {
     super(redactErrorText(message));
     this.name = "ZendeskApiError";
     this.status = status;
+    this.endpoint = endpoint;
+  }
+}
+
+function endpointLabel(url: string): string {
+  try {
+    return `GET ${new URL(url).pathname}`;
+  } catch {
+    return `GET ${url.split("?")[0]}`;
   }
 }
 
@@ -669,7 +695,7 @@ export class ZendeskApiClient {
       });
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
-      throw new Error(this.redact(`Zendesk request failed for ${url}: ${message}`));
+      throw new ZendeskApiError(this.redact(`Zendesk request failed for ${url}: ${message}`), 0, endpointLabel(url));
     } finally {
       clearTimeout(timeout);
     }
@@ -693,6 +719,7 @@ export class ZendeskApiClient {
       throw new ZendeskApiError(
         this.redact(`Zendesk request failed for ${path} (${describeErrorBody(response, rawText)})`),
         response.status,
+        endpointLabel(url),
       );
     }
     if (rawText.length === 0) return {};
@@ -945,33 +972,71 @@ export type ZendeskReadClient = Pick<
   | "listSuspendedTickets"
 >;
 
+type ZendeskReadMethod = Exclude<keyof ZendeskReadClient, "getResolvedConfig">;
+
+// The request each read method makes, recorded in collection status and in the
+// not-collected marker of a read that never produced data. A failed read names the
+// request that actually failed (from ZendeskApiError.endpoint) ahead of this label.
+const READ_ENDPOINTS: Record<ZendeskReadMethod, string> = {
+  getCurrentUser: "GET /api/v2/users/me",
+  getAccountSettings: "GET /api/v2/account/settings",
+  getSecuritySettings: "GET /api/v2/security_settings",
+  listTeamMembers: "GET /api/v2/users",
+  listCustomRoles: "GET /api/v2/custom_roles",
+  listGroups: "GET /api/v2/groups",
+  listGroupMemberships: "GET /api/v2/group_memberships",
+  listRecentAuditLogs: "GET /api/v2/audit_logs",
+  getOldestAuditLog: "GET /api/v2/audit_logs",
+  listApiTokenAuditLogs: "GET /api/v2/audit_logs",
+  listDeletionSchedules: "GET /api/v2/deletion_schedules",
+  listOAuthClients: "GET /api/v2/oauth/clients",
+  listOAuthTokens: "GET /api/v2/oauth/tokens",
+  listAppInstallations: "GET /api/v2/apps/installations",
+  listOwnedApps: "GET /api/v2/apps/owned",
+  listBrands: "GET /api/v2/brands",
+  listWebhooks: "GET /api/v2/webhooks",
+  listTargets: "GET /api/v2/targets",
+  listTriggers: "GET /api/v2/triggers",
+  listAutomations: "GET /api/v2/automations",
+  listSharingAgreements: "GET /api/v2/sharing_agreements",
+  listSuspendedTickets: "GET /api/v2/suspended_tickets",
+};
+
 // Every API read the assessments keep passes through here, so the in-memory
 // snapshot, the core_data/ files, the analysis/ objects, and the tool results
 // all see the redacted copy and never the raw credential values. Error strings
 // pass through the same unanchored scrub as the constructor, so a message built
 // at a throw site cannot reach a finding, summary, _errors.log, or bundle unscrubbed.
-async function snapshot<T>(load: () => Promise<T>): Promise<ZendeskSnapshot<T>> {
+// A failed read records the request that failed and the HTTP status it observed
+// (absent when no response arrived), never a defaulted status.
+async function snapshot<T>(method: ZendeskReadMethod, load: () => Promise<T>): Promise<ZendeskSnapshot<T>> {
+  const endpoint = READ_ENDPOINTS[method];
   try {
-    return { status: "ok", data: redactCredentialProperties(await load()) as T };
+    return { status: "ok", data: redactCredentialProperties(await load()) as T, endpoint };
   } catch (error) {
     const message = errorMessage(error);
     if (error instanceof ZendeskApiError) {
-      if (error.status === 401 || error.status === 403) return { status: "forbidden", error: message, httpStatus: error.status };
-      if (error.status === 404) return { status: "not_found", error: message, httpStatus: error.status };
-      return { status: "error", error: message, httpStatus: error.status };
+      const observed = error.endpoint ?? endpoint;
+      const httpStatus = error.status > 0 ? error.status : undefined;
+      if (error.status === 401 || error.status === 403) return { status: "forbidden", error: message, httpStatus, endpoint: observed };
+      if (error.status === 404) return { status: "not_found", error: message, httpStatus, endpoint: observed };
+      return { status: "error", error: message, httpStatus, endpoint: observed };
     }
-    return { status: "error", error: message };
+    return { status: "error", error: message, endpoint };
   }
 }
 
+// The status named here is the one the failed request observed; forbidden and
+// not_found are only ever assigned from an observed 401, 403, or 404.
 function snapshotCause(name: string, snap: ZendeskSnapshot<unknown>): string {
+  const observed = snap.httpStatus === undefined ? "an error without an HTTP status" : String(snap.httpStatus);
   switch (snap.status) {
     case "ok":
       return `${name} was readable.`;
     case "forbidden":
-      return `${name} returned ${snap.httpStatus ?? 403} (credential lacks permission).`;
+      return `${name} returned ${observed} (credential lacks permission).`;
     case "not_found":
-      return `${name} returned 404 (endpoint unavailable on this account or plan).`;
+      return `${name} returned ${observed} (endpoint unavailable on this account or plan).`;
     case "error":
       return `${name} could not be read: ${snap.error ?? "unknown error"}.`;
     default: {
@@ -979,6 +1044,56 @@ function snapshotCause(name: string, snap: ZendeskSnapshot<unknown>): string {
       return String(exhaustive);
     }
   }
+}
+
+/**
+ * Written to core_data/ and carried in the analysis snapshots in place of a list
+ * or object that was refused, failed, or never produced data, so a bundle
+ * consumer cannot mistake a denial for an empty inventory. status is the HTTP
+ * status the failed request observed (null when no response arrived).
+ */
+function notCollectedMarker(snap: ZendeskSnapshot<unknown>): JsonRecord {
+  return {
+    collected: false,
+    status: snap.httpStatus ?? null,
+    dataset_status: snap.status,
+    endpoint: snap.endpoint ?? null,
+    error: snap.error ?? null,
+  };
+}
+
+function collectedOrMarker(snap: ZendeskSnapshot<unknown>): unknown {
+  return snap.status === "ok" ? snap.data ?? null : notCollectedMarker(snap);
+}
+
+function isListResult(value: unknown): value is ZendeskListResult {
+  const record = asObject(value);
+  return record !== undefined && Array.isArray(record.items) && typeof record.truncated === "boolean";
+}
+
+// Per-read collection status for assessment summaries. seen, truncated, and pages
+// are counts of what the read actually did, so a read that never ran reports null
+// for all three rather than 0, false, or 1.
+function collectionStatusOf(snap: ZendeskSnapshot<unknown>): JsonRecord {
+  const list = snap.status === "ok" && isListResult(snap.data) ? snap.data : undefined;
+  const readObject = snap.status === "ok" && !list;
+  return {
+    status: snap.status,
+    endpoint: snap.endpoint ?? null,
+    http_status: snap.httpStatus ?? null,
+    seen: list ? list.items.length : readObject ? (snap.data === undefined || snap.data === null ? 0 : 1) : null,
+    truncated: list ? list.truncated : readObject ? false : null,
+    pages: list ? list.pages : null,
+    error: snap.error ?? null,
+  };
+}
+
+function collectionSummary(entries: Array<[string, ZendeskSnapshot<unknown>]>): JsonRecord {
+  return Object.fromEntries(entries.map(([name, snap]) => [name, collectionStatusOf(snap)]));
+}
+
+function snapshotsForBundle(entries: Array<[string, ZendeskSnapshot<unknown>]>): Record<string, unknown> {
+  return Object.fromEntries(entries.map(([name, snap]) => [name, collectedOrMarker(snap)]));
 }
 
 function snapshotErrors(entries: Array<[string, ZendeskSnapshot<unknown>]>): string[] {
@@ -1024,6 +1139,15 @@ function listSnapshotItems(snap: ZendeskSnapshot<ZendeskListResult>): JsonRecord
 
 function isTruncated(snap: ZendeskSnapshot<ZendeskListResult>): boolean {
   return snap.data?.truncated === true;
+}
+
+// Evidence truncation flag over one or more inventories: true when any readable one
+// stopped early, null when none did but one was never read (its paging outcome does
+// not exist, so false would be a defaulted flag), false only when every inventory was
+// read to completion.
+function truncationOrNull(...snaps: Array<ZendeskSnapshot<ZendeskListResult>>): boolean | null {
+  if (snaps.some(isTruncated)) return true;
+  return snaps.some((snap) => snap.status !== "ok") ? null : false;
 }
 
 function truncationNote(name: string, snap: ZendeskSnapshot<ZendeskListResult>): string {
@@ -1134,41 +1258,44 @@ function externalNotificationActions(rule: JsonRecord): Array<{ field: string; d
 
 export async function checkZendeskAccess(client: ZendeskReadClient): Promise<ZendeskAccessCheckResult> {
   const config = client.getResolvedConfig();
-  const currentUser = await snapshot(() => client.getCurrentUser());
+  const currentUser = await snapshot("getCurrentUser", () => client.getCurrentUser());
   const currentUserRole = asString(currentUser.data?.role);
 
   const probes: Array<{
     name: string;
     endpoint: string;
     requiredRole: ZendeskAccessSurface["requiredRole"];
+    method: ZendeskReadMethod;
     load: () => Promise<unknown>;
     count?: (value: unknown) => number | undefined;
   }> = [
-    { name: "current_user", endpoint: "/api/v2/users/me", requiredRole: "agent", load: () => client.getCurrentUser(), count: () => 1 },
-    { name: "account_settings", endpoint: "/api/v2/account/settings", requiredRole: "agent", load: () => client.getAccountSettings(), count: () => 1 },
-    { name: "security_settings", endpoint: "/api/v2/security_settings", requiredRole: "admin", load: () => client.getSecuritySettings(), count: () => 1 },
-    { name: "team_members", endpoint: "/api/v2/users?role[]=agent&role[]=admin", requiredRole: "agent", load: () => client.listTeamMembers(200) },
-    { name: "custom_roles", endpoint: "/api/v2/custom_roles", requiredRole: "admin-enterprise", load: () => client.listCustomRoles() },
-    { name: "deletion_schedules", endpoint: "/api/v2/deletion_schedules", requiredRole: "admin", load: () => client.listDeletionSchedules() },
-    { name: "groups", endpoint: "/api/v2/groups", requiredRole: "agent", load: () => client.listGroups(200) },
-    { name: "group_memberships", endpoint: "/api/v2/group_memberships", requiredRole: "agent", load: () => client.listGroupMemberships(200) },
-    { name: "audit_logs", endpoint: "/api/v2/audit_logs", requiredRole: "admin-enterprise", load: () => client.listRecentAuditLogs(1) },
-    { name: "oauth_clients", endpoint: "/api/v2/oauth/clients", requiredRole: "admin", load: () => client.listOAuthClients(100) },
-    { name: "oauth_tokens", endpoint: "/api/v2/oauth/tokens?all=true", requiredRole: "admin", load: () => client.listOAuthTokens(100) },
-    { name: "app_installations", endpoint: "/api/v2/apps/installations", requiredRole: "agent", load: () => client.listAppInstallations() },
-    { name: "owned_apps", endpoint: "/api/v2/apps/owned", requiredRole: "admin", load: () => client.listOwnedApps() },
-    { name: "brands", endpoint: "/api/v2/brands", requiredRole: "admin", load: () => client.listBrands(100) },
-    { name: "webhooks", endpoint: "/api/v2/webhooks", requiredRole: "agent", load: () => client.listWebhooks(100) },
-    { name: "targets", endpoint: "/api/v2/targets", requiredRole: "agent", load: () => client.listTargets() },
-    { name: "triggers", endpoint: "/api/v2/triggers", requiredRole: "agent", load: () => client.listTriggers(100) },
-    { name: "automations", endpoint: "/api/v2/automations", requiredRole: "agent", load: () => client.listAutomations(100) },
-    { name: "sharing_agreements", endpoint: "/api/v2/sharing_agreements", requiredRole: "agent", load: () => client.listSharingAgreements() },
-    { name: "suspended_tickets", endpoint: "/api/v2/suspended_tickets", requiredRole: "admin", load: () => client.listSuspendedTickets(100) },
+    { name: "current_user", endpoint: "/api/v2/users/me", requiredRole: "agent", method: "getCurrentUser", load: () => client.getCurrentUser(), count: () => 1 },
+    { name: "account_settings", endpoint: "/api/v2/account/settings", requiredRole: "agent", method: "getAccountSettings", load: () => client.getAccountSettings(), count: () => 1 },
+    { name: "security_settings", endpoint: "/api/v2/security_settings", requiredRole: "admin", method: "getSecuritySettings", load: () => client.getSecuritySettings(), count: () => 1 },
+    { name: "team_members", endpoint: "/api/v2/users?role[]=agent&role[]=admin", requiredRole: "agent", method: "listTeamMembers", load: () => client.listTeamMembers(200) },
+    { name: "custom_roles", endpoint: "/api/v2/custom_roles", requiredRole: "admin-enterprise", method: "listCustomRoles", load: () => client.listCustomRoles() },
+    { name: "deletion_schedules", endpoint: "/api/v2/deletion_schedules", requiredRole: "admin", method: "listDeletionSchedules", load: () => client.listDeletionSchedules() },
+    { name: "groups", endpoint: "/api/v2/groups", requiredRole: "agent", method: "listGroups", load: () => client.listGroups(200) },
+    { name: "group_memberships", endpoint: "/api/v2/group_memberships", requiredRole: "agent", method: "listGroupMemberships", load: () => client.listGroupMemberships(200) },
+    { name: "audit_logs", endpoint: "/api/v2/audit_logs", requiredRole: "admin-enterprise", method: "listRecentAuditLogs", load: () => client.listRecentAuditLogs(1) },
+    { name: "oauth_clients", endpoint: "/api/v2/oauth/clients", requiredRole: "admin", method: "listOAuthClients", load: () => client.listOAuthClients(100) },
+    { name: "oauth_tokens", endpoint: "/api/v2/oauth/tokens?all=true", requiredRole: "admin", method: "listOAuthTokens", load: () => client.listOAuthTokens(100) },
+    { name: "app_installations", endpoint: "/api/v2/apps/installations", requiredRole: "agent", method: "listAppInstallations", load: () => client.listAppInstallations() },
+    { name: "owned_apps", endpoint: "/api/v2/apps/owned", requiredRole: "admin", method: "listOwnedApps", load: () => client.listOwnedApps() },
+    { name: "brands", endpoint: "/api/v2/brands", requiredRole: "admin", method: "listBrands", load: () => client.listBrands(100) },
+    { name: "webhooks", endpoint: "/api/v2/webhooks", requiredRole: "agent", method: "listWebhooks", load: () => client.listWebhooks(100) },
+    { name: "targets", endpoint: "/api/v2/targets", requiredRole: "agent", method: "listTargets", load: () => client.listTargets() },
+    { name: "triggers", endpoint: "/api/v2/triggers", requiredRole: "agent", method: "listTriggers", load: () => client.listTriggers(100) },
+    { name: "automations", endpoint: "/api/v2/automations", requiredRole: "agent", method: "listAutomations", load: () => client.listAutomations(100) },
+    { name: "sharing_agreements", endpoint: "/api/v2/sharing_agreements", requiredRole: "agent", method: "listSharingAgreements", load: () => client.listSharingAgreements() },
+    { name: "suspended_tickets", endpoint: "/api/v2/suspended_tickets", requiredRole: "admin", method: "listSuspendedTickets", load: () => client.listSuspendedTickets(100) },
   ];
 
+  // A failed probe carries the status its request observed and null for count and
+  // truncated: nothing was read, so nothing is counted and no paging outcome exists.
   const surfaces: ZendeskAccessSurface[] = [];
   for (const probe of probes) {
-    const snap = probe.name === "current_user" ? currentUser : await snapshot(probe.load);
+    const snap = probe.name === "current_user" ? currentUser : await snapshot(probe.method, probe.load);
     const listResult = asObject(snap.data);
     const items = listResult?.items;
     surfaces.push({
@@ -1176,8 +1303,9 @@ export async function checkZendeskAccess(client: ZendeskReadClient): Promise<Zen
       endpoint: probe.endpoint,
       requiredRole: probe.requiredRole,
       status: snap.status === "ok" ? "readable" : snap.status,
-      count: snap.status === "ok" ? (probe.count ? probe.count(snap.data) : Array.isArray(items) ? items.length : undefined) : undefined,
-      ...(snap.status === "ok" && Array.isArray(items) ? { truncated: listResult?.truncated === true } : {}),
+      count: snap.status === "ok" ? (probe.count ? probe.count(snap.data) : Array.isArray(items) ? items.length : undefined) ?? null : null,
+      ...(snap.status === "ok" ? (Array.isArray(items) ? { truncated: listResult?.truncated === true } : {}) : { truncated: null }),
+      httpStatus: snap.httpStatus ?? null,
       error: snap.error,
     });
   }
@@ -1560,10 +1688,10 @@ export async function assessZendeskAuthentication(
 ): Promise<ZendeskAssessmentResult> {
   const config = client.getResolvedConfig();
   const resolved = resolveOptions(options);
-  const currentUserSnap = await snapshot(() => client.getCurrentUser());
-  const settingsSnap = await snapshot(() => client.getAccountSettings());
-  const securitySnap = await snapshot(() => client.getSecuritySettings());
-  const teamSnap = await snapshot(() => client.listTeamMembers(resolved.maxItems));
+  const currentUserSnap = await snapshot("getCurrentUser", () => client.getCurrentUser());
+  const settingsSnap = await snapshot("getAccountSettings", () => client.getAccountSettings());
+  const securitySnap = await snapshot("getSecuritySettings", () => client.getSecuritySettings());
+  const teamSnap = await snapshot("listTeamMembers", () => client.listTeamMembers(resolved.maxItems));
   const apiSettings = asObject(settingsSnap.data?.api) ?? {};
   const security = securitySnap.data ?? {};
   const authentication = asObject(security.authentication) ?? {};
@@ -1598,10 +1726,11 @@ export async function assessZendeskAuthentication(
       current_user_role: asString(currentUserSnap.data?.role) ?? null,
       seen_team_members: countOrNull(teamSnap, teamMembers.length),
       ...summarizeStatuses(finalFindings),
+      collection: collectionSummary(entries),
     },
     findings: finalFindings,
     errors: snapshotErrors(entries),
-    snapshots: Object.fromEntries(entries.map(([name, snap]) => [name, snap.data ?? null])),
+    snapshots: snapshotsForBundle(entries),
   };
 }
 
@@ -1718,15 +1847,15 @@ export async function assessZendeskAccessControl(
   const config = client.getResolvedConfig();
   const resolved = resolveOptions(options);
   const now = resolved.now();
-  const currentUserSnap = await snapshot(() => client.getCurrentUser());
-  const settingsSnap = await snapshot(() => client.getAccountSettings());
-  const teamSnap = await snapshot(() => client.listTeamMembers(resolved.maxItems));
-  const rolesSnap = await snapshot(() => client.listCustomRoles());
-  const groupsSnap = await snapshot(() => client.listGroups(resolved.maxItems));
-  const membershipsSnap = await snapshot(() => client.listGroupMemberships(resolved.maxItems));
-  const clientsSnap = await snapshot(() => client.listOAuthClients(resolved.maxItems));
-  const tokensSnap = await snapshot(() => client.listOAuthTokens(resolved.maxItems));
-  const tokenLogsSnap = await snapshot(() => client.listApiTokenAuditLogs(resolved.maxItems));
+  const currentUserSnap = await snapshot("getCurrentUser", () => client.getCurrentUser());
+  const settingsSnap = await snapshot("getAccountSettings", () => client.getAccountSettings());
+  const teamSnap = await snapshot("listTeamMembers", () => client.listTeamMembers(resolved.maxItems));
+  const rolesSnap = await snapshot("listCustomRoles", () => client.listCustomRoles());
+  const groupsSnap = await snapshot("listGroups", () => client.listGroups(resolved.maxItems));
+  const membershipsSnap = await snapshot("listGroupMemberships", () => client.listGroupMemberships(resolved.maxItems));
+  const clientsSnap = await snapshot("listOAuthClients", () => client.listOAuthClients(resolved.maxItems));
+  const tokensSnap = await snapshot("listOAuthTokens", () => client.listOAuthTokens(resolved.maxItems));
+  const tokenLogsSnap = await snapshot("listApiTokenAuditLogs", () => client.listApiTokenAuditLogs(resolved.maxItems));
 
   const teamMembers = listSnapshotItems(teamSnap).filter(isActiveTeamMember);
   const admins = teamMembers.filter((user) => asString(user.role) === "admin");
@@ -1752,7 +1881,7 @@ export async function assessZendeskAccessControl(
       custom_roles_status: rolesSnap.status,
       custom_roles: listCountOrNull(rolesSnap),
       admin_equivalent_custom_roles: listOrNull(rolesSnap, adminEquivalent.slice(0, 25)),
-      inventory_truncated: isTruncated(teamSnap) || isTruncated(rolesSnap),
+      inventory_truncated: truncationOrNull(teamSnap, rolesSnap),
     };
     if (rolesSnap.status !== "ok") {
       findings.push(manualFinding(6, leastPrivilegeTitle, "critical", `${snapshotCause("Custom roles (/custom_roles, Enterprise plan)", rolesSnap)} Built-in roles seen: ${admins.length} admins, ${agents.length} agents (${unrestrictedAgents.length} unrestricted).`, "capture Admin Center > People > Team > Roles and confirm agents are assigned the least-privileged built-in or custom role.", evidence));
@@ -1778,7 +1907,7 @@ export async function assessZendeskAccessControl(
       admins: admins.slice(0, 50).map(userLabel),
       dormant_admins: loginBuckets.stale.slice(0, 25).map(userLabel),
       admins_without_last_login: loginBuckets.undated.slice(0, 25).map(userLabel),
-      inventory_truncated: isTruncated(teamSnap),
+      inventory_truncated: truncationOrNull(teamSnap),
     };
     if (admins.length > resolved.adminThreshold) {
       findings.push(finding(7, adminTitle, "high", "fail", `${admins.length} active admins exceed the threshold of ${resolved.adminThreshold}.${truncationNote("team member", teamSnap)}`, evidence));
@@ -1803,7 +1932,7 @@ export async function assessZendeskAccessControl(
       private_groups: privateGroups.length,
       seen_memberships: memberships.length,
       groups: groups.slice(0, 50).map((group) => asString(group.name) ?? asString(group.id) ?? "group"),
-      inventory_truncated: isTruncated(groupsSnap) || isTruncated(membershipsSnap),
+      inventory_truncated: truncationOrNull(groupsSnap, membershipsSnap),
     };
     if (groups.length === 1 || memberships.length === 0) {
       findings.push(finding(8, groupsTitle, "medium", "warn", `${groups.length} group(s) and ${memberships.length} memberships were visible, so ticket access is not segmented by group.${truncationNote("group", groupsSnap)}`, evidence));
@@ -1840,7 +1969,7 @@ export async function assessZendeskAccessControl(
       tokens_without_expiry: countOrNull(tokensSnap, nonExpiringTokens.length),
       tokens_unused_over_stale_days: countOrNull(tokensSnap, usage.stale.length),
       tokens_without_used_at: countOrNull(tokensSnap, usage.undated.length),
-      inventory_truncated: isTruncated(clientsSnap) || isTruncated(tokensSnap),
+      inventory_truncated: truncationOrNull(clientsSnap, tokensSnap),
     };
     if (unscoped.length > 0 || insecureRedirects.length > 0) {
       findings.push(finding(14, oauthTitle, "high", "fail", `${unscoped.length}/${clients.length} OAuth clients have no scope restriction and ${insecureRedirects.length} use http:// redirect URIs.${truncationNote("OAuth client", clientsSnap)}`, evidence));
@@ -1886,10 +2015,11 @@ export async function assessZendeskAccessControl(
       oauth_clients: listCountOrNull(clientsSnap),
       oauth_tokens: listCountOrNull(tokensSnap),
       ...summarizeStatuses(finalFindings),
+      collection: collectionSummary(entries),
     },
     findings: finalFindings,
     errors: snapshotErrors(entries),
-    snapshots: Object.fromEntries(entries.map(([name, snap]) => [name, snap.data ?? null])),
+    snapshots: snapshotsForBundle(entries),
   };
 }
 
@@ -1964,7 +2094,7 @@ function assessDeletionPolicies(
     active_by_object: { ...activeByObject, other: otherActive },
     active_without_conditions: activeWithoutConditions,
     default_schedules: defaults,
-    inventory_truncated: isTruncated(deletionSnap),
+    inventory_truncated: truncationOrNull(deletionSnap),
     schedules: schedules.slice(0, 25).map(summarizeDeletionSchedule),
   };
   if (schedules.length === 0) {
@@ -1993,15 +2123,17 @@ export async function assessZendeskDataProtection(
   const config = client.getResolvedConfig();
   const resolved = resolveOptions(options);
   const now = resolved.now();
-  const currentUserSnap = await snapshot(() => client.getCurrentUser());
-  const settingsSnap = await snapshot(() => client.getAccountSettings());
-  const auditSnap = await snapshot(() => client.listRecentAuditLogs(DEFAULT_AUDIT_LOG_SAMPLE));
+  const currentUserSnap = await snapshot("getCurrentUser", () => client.getCurrentUser());
+  const settingsSnap = await snapshot("getAccountSettings", () => client.getAccountSettings());
+  const auditSnap = await snapshot("listRecentAuditLogs", () => client.listRecentAuditLogs(DEFAULT_AUDIT_LOG_SAMPLE));
   const oldestSnap: ZendeskSnapshot<JsonRecord | undefined> = auditSnap.status === "ok"
-    ? await snapshot(() => client.getOldestAuditLog())
-    : { status: auditSnap.status, data: undefined, error: auditSnap.error, httpStatus: auditSnap.httpStatus };
-  const rolesSnap = await snapshot(() => client.listCustomRoles());
-  const deletionSnap = await snapshot(() => client.listDeletionSchedules(resolved.maxItems));
-  const suspendedSnap = await snapshot(() => client.listSuspendedTickets(resolved.maxItems));
+    ? await snapshot("getOldestAuditLog", () => client.getOldestAuditLog())
+    // Not requested: the oldest-record lookup inherits the failure of the recent-log
+    // read, naming that request rather than one that was never made.
+    : { status: auditSnap.status, data: undefined, error: auditSnap.error, httpStatus: auditSnap.httpStatus, endpoint: auditSnap.endpoint };
+  const rolesSnap = await snapshot("listCustomRoles", () => client.listCustomRoles());
+  const deletionSnap = await snapshot("listDeletionSchedules", () => client.listDeletionSchedules(resolved.maxItems));
+  const suspendedSnap = await snapshot("listSuspendedTickets", () => client.listSuspendedTickets(resolved.maxItems));
   const settings = settingsSnap.data ?? {};
   const tickets = asObject(settings.tickets) ?? {};
   const limits = asObject(settings.limits) ?? {};
@@ -2084,7 +2216,7 @@ export async function assessZendeskDataProtection(
       without_created_at: buckets.undated.length,
       age_threshold_days: resolved.suspendedTicketAgeDays,
       causes: [...new Set(suspended.map((ticket) => asString(ticket.cause)).filter(Boolean))].slice(0, 20),
-      inventory_truncated: isTruncated(suspendedSnap),
+      inventory_truncated: truncationOrNull(suspendedSnap),
     };
     if (suspended.length === 0 && isTruncated(suspendedSnap)) {
       findings.push(finding(20, suspendedTitle, "low", "warn", `Zero suspended tickets were seen but the queue read was truncated before completion.${truncationNote("suspended ticket", suspendedSnap)}`, evidence));
@@ -2121,10 +2253,11 @@ export async function assessZendeskDataProtection(
       deletion_schedules: listCountOrNull(deletionSnap),
       suspended_tickets: listCountOrNull(suspendedSnap),
       ...summarizeStatuses(finalFindings),
+      collection: collectionSummary(entries),
     },
     findings: finalFindings,
     errors: snapshotErrors(entries),
-    snapshots: Object.fromEntries(entries.map(([name, snap]) => [name, snap.data ?? null])),
+    snapshots: snapshotsForBundle(entries),
   };
 }
 
@@ -2134,16 +2267,16 @@ export async function assessZendeskIntegrations(
 ): Promise<ZendeskAssessmentResult> {
   const config = client.getResolvedConfig();
   const resolved = resolveOptions(options);
-  const settingsSnap = await snapshot(() => client.getAccountSettings());
-  const currentUserSnap = await snapshot(() => client.getCurrentUser());
-  const installationsSnap = await snapshot(() => client.listAppInstallations());
-  const ownedSnap = await snapshot(() => client.listOwnedApps());
-  const brandsSnap = await snapshot(() => client.listBrands(resolved.maxItems));
-  const sharingSnap = await snapshot(() => client.listSharingAgreements());
-  const targetsSnap = await snapshot(() => client.listTargets());
-  const webhooksSnap = await snapshot(() => client.listWebhooks(resolved.maxItems));
-  const triggersSnap = await snapshot(() => client.listTriggers(resolved.maxItems));
-  const automationsSnap = await snapshot(() => client.listAutomations(resolved.maxItems));
+  const settingsSnap = await snapshot("getAccountSettings", () => client.getAccountSettings());
+  const currentUserSnap = await snapshot("getCurrentUser", () => client.getCurrentUser());
+  const installationsSnap = await snapshot("listAppInstallations", () => client.listAppInstallations());
+  const ownedSnap = await snapshot("listOwnedApps", () => client.listOwnedApps());
+  const brandsSnap = await snapshot("listBrands", () => client.listBrands(resolved.maxItems));
+  const sharingSnap = await snapshot("listSharingAgreements", () => client.listSharingAgreements());
+  const targetsSnap = await snapshot("listTargets", () => client.listTargets());
+  const webhooksSnap = await snapshot("listWebhooks", () => client.listWebhooks(resolved.maxItems));
+  const triggersSnap = await snapshot("listTriggers", () => client.listTriggers(resolved.maxItems));
+  const automationsSnap = await snapshot("listAutomations", () => client.listAutomations(resolved.maxItems));
   const findings: ZendeskFinding[] = [];
 
   const installations = listSnapshotItems(installationsSnap);
@@ -2162,7 +2295,7 @@ export async function assessZendeskIntegrations(
       marketplace_installations: countOrNull(ownedSnap, marketplace.length),
       enabled_marketplace_installations: countOrNull(ownedSnap, enabled.length),
       owned_apps_status: ownedSnap.status,
-      inventory_truncated: isTruncated(installationsSnap) || isTruncated(ownedSnap),
+      inventory_truncated: truncationOrNull(installationsSnap, ownedSnap),
       apps: marketplace.slice(0, 50).map((item) => ({ name: installationName(item), enabled: asBoolean(item.enabled) ?? null, product: asString(item.product) ?? null, role_restrictions: asArray(item.role_restrictions).length, group_restrictions: asArray(item.group_restrictions).length })),
     };
     if (installations.length === 0 && isTruncated(installationsSnap)) {
@@ -2185,7 +2318,7 @@ export async function assessZendeskIntegrations(
     const evidence: JsonRecord = {
       owned_apps: ownedApps.length,
       deprecated_or_obsolete: retired.slice(0, 25).map((app) => asString(app.name) ?? asString(app.id) ?? "app"),
-      inventory_truncated: isTruncated(ownedSnap),
+      inventory_truncated: truncationOrNull(ownedSnap),
       apps: ownedApps.slice(0, 50).map((app) => ({ name: asString(app.name) ?? null, visibility: asString(app.visibility) ?? null, framework_version: asString(app.framework_version) ?? null, parameters: asArray(app.parameters).length })),
     };
     if (ownedApps.length === 0 && isTruncated(ownedSnap)) {
@@ -2225,7 +2358,7 @@ export async function assessZendeskIntegrations(
       help_center_states: states,
       current_user_role: currentRole ?? null,
       brands_detail: brands.slice(0, 50).map((brand) => ({ name: asString(brand.name) ?? null, active: asBoolean(brand.active) ?? null, help_center_state: asString(brand.help_center_state) ?? null, has_help_center: asBoolean(brand.has_help_center) ?? null, host_mapping: asString(brand.host_mapping) ?? null })),
-      inventory_truncated: isTruncated(brandsSnap),
+      inventory_truncated: truncationOrNull(brandsSnap),
     };
     if (brands.length === 0) {
       findings.push(manualFinding(22, brandTitle, "medium", "Zero brands were visible although every account has a default brand, so the view is partial.", "use an admin credential and capture Admin Center > Account > Brand management.", evidence));
@@ -2251,7 +2384,7 @@ export async function assessZendeskIntegrations(
       sharing_agreements: agreements.length,
       active_agreements: active.slice(0, 25).map((item) => ({ name: asString(item.name) ?? null, remote_subdomain: asString(item.remote_subdomain) ?? null, partner_name: asString(item.partner_name) ?? null, status: asString(item.status) ?? null, type: asString(item.type) ?? null })),
       broken_agreements: broken.length,
-      inventory_truncated: isTruncated(sharingSnap),
+      inventory_truncated: truncationOrNull(sharingSnap),
     };
     if (agreements.length === 0 && isTruncated(sharingSnap)) {
       findings.push(finding(23, sharingTitle, "medium", "warn", `Zero sharing agreements were seen but the inventory was truncated before completion.${truncationNote("sharing agreement", sharingSnap)}`, evidence));
@@ -2288,7 +2421,7 @@ export async function assessZendeskIntegrations(
       active_webhooks: countOrNull(webhooksSnap, activeWebhooks.length),
       insecure_webhooks: listOrNull(webhooksSnap, insecureWebhooks.slice(0, 25).map((hook) => asString(hook.name) ?? asString(hook.id) ?? "webhook")),
       webhooks_without_authentication: listOrNull(webhooksSnap, unauthenticatedWebhooks.slice(0, 25).map((hook) => asString(hook.name) ?? asString(hook.id) ?? "webhook")),
-      inventory_truncated: destinationsTruncated,
+      inventory_truncated: truncationOrNull(targetsSnap, webhooksSnap),
     };
     if (insecureTargets.length > 0 || insecureWebhooks.length > 0) {
       findings.push(finding(24, httpsTitle, "high", "fail", `${targetText} and ${webhookText} deliver to non-https endpoints.${truncationNotes}`, evidence));
@@ -2385,10 +2518,11 @@ export async function assessZendeskIntegrations(
       webhooks: listCountOrNull(webhooksSnap),
       targets: listCountOrNull(targetsSnap),
       ...summarizeStatuses(finalFindings),
+      collection: collectionSummary(entries),
     },
     findings: finalFindings,
     errors: snapshotErrors(entries),
-    snapshots: Object.fromEntries(entries.map(([name, snap]) => [name, snap.data ?? null])),
+    snapshots: snapshotsForBundle(entries),
   };
 }
 
@@ -2598,11 +2732,12 @@ export async function exportZendeskAuditBundle(
     error_count: errors.length,
   }));
   await writeSecureTextFile(outputDir, "core_data/access_check.json", serializeJson(access));
+  // Every read gets a core_data/ file: the redacted payload when it was readable,
+  // otherwise the not-collected marker, so a refused list never appears as a
+  // missing file or an empty inventory.
   for (const assessment of assessments) {
     for (const [name, value] of Object.entries(assessment.snapshots)) {
-      if (value !== null && value !== undefined) {
-        await writeSecureTextFile(outputDir, `core_data/${name}.json`, serializeJson(value));
-      }
+      await writeSecureTextFile(outputDir, `core_data/${name}.json`, serializeJson(value ?? null));
     }
     await writeSecureTextFile(outputDir, `analysis/${assessment.category}.json`, serializeJson(assessment));
   }
