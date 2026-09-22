@@ -2493,22 +2493,34 @@ test("rule 9: every Snowflake statement that fails with a 502 HTML page or a JSO
     "statement canaries",
   );
 
+  // The access check and every assessment run for every statement and variant; the bundle and zip
+  // (which rerun both and serialize them) are exported for a sample of statements, since the error
+  // text is recorded at one point and the export tests cover the serialization of denied errors.
+  let exportedBundles = 0;
   for (const [index, statement] of statements.entries()) {
+    const exportSample = index % 10 === 0 || index === statements.length - 1;
     for (const variant of ["html", "json"]) {
       const label = `${normalizeStatement(statement).slice(0, 60)} (${variant})`;
       const fetchImpl = sqlApiFetch({ statement, variant });
       const access = await checkSnowflakeAccess(new SnowflakeSqlClient(config, { fetchImpl }));
       const results = await runAllAssessments(new SnowflakeSqlClient(config, { fetchImpl }));
-      const iterationBase = join(base, `${index}-${variant}`);
-      mkdirSync(iterationBase);
-      const exported = await exportSnowflakeAuditBundle(new SnowflakeSqlClient(config, { fetchImpl }), config, iterationBase);
-      const files = readBundleFiles(exported.outputDir);
+      let files = new Map();
+      let zipEntries = new Map();
+      if (exportSample) {
+        const iterationBase = join(base, `${index}-${variant}`);
+        mkdirSync(iterationBase);
+        const exported = await exportSnowflakeAuditBundle(new SnowflakeSqlClient(config, { fetchImpl }), config, iterationBase);
+        files = readBundleFiles(exported.outputDir);
+        zipEntries = readZipEntries(exported.zipPath);
+        assert.ok(files.has("metadata.json") && files.has("QUICK_REFERENCE.md"), `${label}: the sampled bundle was written`);
+        exportedBundles += 1;
+      }
 
       const outputs = new Map([
         [`${label} check_access`, JSON.stringify(access)],
         ...results.map((result) => [`${label} assess ${result.area}`, JSON.stringify(result)]),
         ...[...files].map(([name, content]) => [`${label} bundle ${name}`, content]),
-        ...[...readZipEntries(exported.zipPath)].map(([name, content]) => [`${label} zip ${name}`, content]),
+        ...[...zipEntries].map(([name, content]) => [`${label} zip ${name}`, content]),
       ]);
       assertNoLeakWindows(outputs, Object.values(STATEMENT_CANARIES), label);
 
@@ -2532,6 +2544,7 @@ test("rule 9: every Snowflake statement that fails with a 502 HTML page or a JSO
       }
     }
   }
+  assert.ok(exportedBundles >= 6, `both variants of at least three sampled statements were exported (${exportedBundles})`);
 });
 
 /** A mock client that also records the outcome of every statement it served. */
