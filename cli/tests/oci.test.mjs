@@ -352,6 +352,34 @@ function byId(result, id) {
   return item;
 }
 
+/**
+ * Uniform null standard: every count and collection flag lives in a nested
+ * evidence node beside the `status` of the read that produced it. This maps
+ * each compartment-scoped finding to the node of the inventory its verdict
+ * reads (compartments_seen, compartments_total, compartments_truncated).
+ */
+const SCOPED_INVENTORY_KEY = {
+  "OCI-IAM-04": "policies",
+  "OCI-LOG-05": "event_rules",
+  "OCI-GRD-01": "security_lists",
+  "OCI-GRD-02": "nsgs",
+  "OCI-GRD-03": "internet_gateways",
+  "OCI-GRD-04": "bastions",
+  "OCI-GRD-05": "vaults",
+  "OCI-GRD-06": "buckets",
+  "OCI-CMP-01": "instances",
+  "OCI-CMP-02": "volumes",
+  "OCI-CMP-03": "boot_volumes",
+};
+
+function scopedEvidence(item) {
+  const key = SCOPED_INVENTORY_KEY[item.id];
+  assert.ok(key, `${item.id} has no compartment-scoped inventory`);
+  const node = item.evidence[key];
+  assert.ok(node && typeof node === "object", `${item.id}: evidence.${key} is missing`);
+  return node;
+}
+
 async function runAllAssessments(client, options = {}) {
   return [
     await assessOciIdentity(client, options),
@@ -520,8 +548,11 @@ test("self-check fixture (c): partial inventories never pass and report seen ver
     const item = findings.find((entry) => entry.id === id);
     assert.notEqual(item.status, "pass", `${id} must not pass on a partial view: ${item.summary}`);
     assert.match(item.summary, /Partial view|Manual/, `${id} must flag the partial view`);
-    assert.equal(item.evidence.compartments_total, 3);
-    assert.ok(item.evidence.compartments_seen < 3);
+    const inventory = scopedEvidence(item);
+    assert.equal(inventory.compartments_total, 3);
+    assert.ok(inventory.compartments_seen < 3);
+    assert.match(inventory.status, /^partial: .*denied or unreadable in 1 compartment\(s\): prod/, `${id}: ${inventory.status}`);
+    assert.deepEqual(inventory.denied_compartments, ["prod"]);
   }
 });
 
@@ -530,10 +561,15 @@ test("compartment cap withholds pass and records truncation", async () => {
   const compute = await assessOciComputeAndStorage(client, { maxCompartments: 1 });
   for (const item of compute.findings) {
     assert.notEqual(item.status, "pass");
-    assert.equal(item.evidence.compartments_truncated, true);
-    assert.equal(item.evidence.compartments_seen, 1);
-    assert.equal(item.evidence.compartments_total, 3);
+    const inventory = scopedEvidence(item);
+    assert.equal(inventory.compartments_truncated, true);
+    assert.equal(inventory.compartments_seen, 1);
+    assert.equal(inventory.compartments_total, 3);
+    assert.match(inventory.status, /^partial: compartment cap hit \(1\/3 compartments inspected by /);
   }
+  assert.match(compute.summary.compartments.status, /^partial: compartment cap 1 hit: 1\/3 active compartments from iam compartment list inspected$/);
+  assert.equal(compute.summary.compartments.compartments_inspected, 1);
+  assert.equal(compute.summary.compartments.compartments_total, 3);
   const collection = await collectAcrossCompartments("x", [ROOT, PROD, APPS], 2, async () => [{ ok: true }]);
   assert.equal(collection.truncated, true);
   assert.equal(scopedStatus(collection, "pass", "manual"), "warn");
@@ -581,14 +617,14 @@ test("undated credentials and unknown MFA flags never count as compliant", async
   assert.equal(byId(result, "OCI-IAM-02").status, "warn");
   assert.match(byId(result, "OCI-IAM-02").summary, /did not report isMfaActivated/);
   assert.equal(byId(result, "OCI-IAM-03").status, "warn");
-  assert.equal(byId(result, "OCI-IAM-03").evidence.undated_credentials.length, 1);
+  assert.equal(byId(result, "OCI-IAM-03").evidence.credential_listings.undated_credentials.length, 1);
 });
 
 test("credential cap and per-user listing errors downgrade the rotation verdict", async () => {
   const client = compliantClient();
   const capped = await assessOciIdentity(client, { maxKeys: 1 });
   assert.equal(byId(capped, "OCI-IAM-03").status, "warn");
-  assert.equal(byId(capped, "OCI-IAM-03").evidence.credential_cap_hit, true);
+  assert.equal(byId(capped, "OCI-IAM-03").evidence.credential_listings.credential_cap_hit, true);
 
   client.listAuthTokens = async () => {
     throw DENIED_ERROR;
@@ -663,9 +699,9 @@ test("assessOciTenancyGuardrails flags exposed network paths, bastions, keys, an
   assert.equal(byId(result, "OCI-GRD-04").status, "fail");
   assert.equal(byId(result, "OCI-GRD-05").status, "fail");
   assert.match(byId(result, "OCI-GRD-05").summary, /1\/1 ENABLED keys judged from Key.keyShape: 1 weak/);
-  assert.equal(byId(result, "OCI-GRD-05").evidence.weak_keys[0].reason, "newest enabled key version older than 365 days");
+  assert.equal(byId(result, "OCI-GRD-05").evidence.keys.weak_keys[0].reason, "newest enabled key version older than 365 days");
   assert.equal(byId(result, "OCI-GRD-06").status, "fail");
-  assert.equal(byId(result, "OCI-GRD-06").evidence.long_lived_pars.length, 1);
+  assert.equal(byId(result, "OCI-GRD-06").evidence.pars.long_lived_pars.length, 1);
 });
 
 test("guardrail sub-reads that fail or lack dates downgrade to warn instead of pass", async () => {
@@ -678,16 +714,16 @@ test("guardrail sub-reads that fail or lack dates downgrade to warn instead of p
   const result = await assessOciTenancyGuardrails(client);
   assert.equal(byId(result, "OCI-GRD-04").status, "warn");
   assert.equal(byId(result, "OCI-GRD-05").status, "warn");
-  assert.equal(byId(result, "OCI-GRD-05").evidence.undated_keys.length, 1);
+  assert.equal(byId(result, "OCI-GRD-05").evidence.keys.undated_keys.length, 1);
   assert.equal(byId(result, "OCI-GRD-06").status, "warn");
-  assert.equal(byId(result, "OCI-GRD-06").evidence.undated_pars.length, 1);
+  assert.equal(byId(result, "OCI-GRD-06").evidence.pars.undated_pars.length, 1);
   const twoBuckets = compliantClient();
   twoBuckets.listBuckets = async (_namespace, compartmentId) => (compartmentId === APPS.id
     ? [{ name: "logs", namespace: "tenantns", compartmentId: APPS.id }, { name: "backups", namespace: "tenantns", compartmentId: APPS.id }]
     : []);
   const capped = await assessOciTenancyGuardrails(twoBuckets, { maxBuckets: 1 });
   assert.equal(byId(capped, "OCI-GRD-06").status, "warn");
-  assert.equal(byId(capped, "OCI-GRD-06").evidence.bucket_cap_hit, true);
+  assert.equal(byId(capped, "OCI-GRD-06").evidence.buckets.bucket_cap_hit, true);
 });
 
 test("judgeKeyShape applies the AES-256 and RSA-4096 byte floors and the documented ECDSA curves", () => {
@@ -713,9 +749,9 @@ test("control 19: an RSA-2048 key fails OCI-GRD-05 while documented strong shape
   const weak = await assessOciTenancyGuardrails(rsa2048);
   const finding = byId(weak, "OCI-GRD-05");
   assert.equal(finding.status, "fail");
-  assert.equal(finding.evidence.keys_judged, 1);
-  assert.equal(finding.evidence.weak_keys[0].lengthBytes, 256);
-  assert.match(finding.evidence.weak_keys[0].reason, /RSA-2048 is below the RSA-4096 floor/);
+  assert.equal(finding.evidence.key_details.keys_judged, 1);
+  assert.equal(finding.evidence.keys.weak_keys[0].lengthBytes, 256);
+  assert.match(finding.evidence.keys.weak_keys[0].reason, /RSA-2048 is below the RSA-4096 floor/);
   assert.match(finding.summary, /1\/1 ENABLED keys judged from Key.keyShape: 1 weak/);
   assert.match(finding.summary, /ECDSA keys pass on any documented KeyShape.curveId/);
   assert.equal(finding.evidence.source, OCI_SURFACE_DOCS.keyDetail.rest);
@@ -734,7 +770,7 @@ test("control 19: an RSA-2048 key fails OCI-GRD-05 while documented strong shape
     strong.getKey = async (_vault, keyId) => ({ id: keyId, lifecycleState: "ENABLED", keyShape: shape });
     const passing = byId(await assessOciTenancyGuardrails(strong), "OCI-GRD-05");
     assert.equal(passing.status, "pass", JSON.stringify(shape));
-    assert.equal(passing.evidence.weak_keys.length, 0);
+    assert.equal(passing.evidence.keys.weak_keys.length, 0);
   }
 
   const noCurve = compliantClient();
@@ -751,8 +787,12 @@ test("control 19: a denied or shapeless key get never passes and names the cause
   assert.equal(single.status, "manual");
   assert.match(single.summary, /none of the 1 ENABLED keys could be read with kms management key get/);
   assert.match(single.summary, /NotAuthorizedOrNotFound/);
-  assert.equal(single.evidence.key_detail_errors, 1);
-  assert.equal(single.evidence.keys_judged, 0);
+  // Every key get failed, so the key-detail read is unreadable and its counts render null beside that status rather than 0.
+  assert.match(single.evidence.key_details.status, /^unreadable: kms management key get failed for every read \(1\/1\): .*NotAuthorizedOrNotFound/);
+  assert.equal(single.evidence.key_details.key_detail_errors, null);
+  assert.equal(single.evidence.key_details.keys_judged, null);
+  assert.match(single.evidence.keys.status, /^complete: kms management key list returned 1 ENABLED keys across 1 vaults$/);
+  assert.equal(single.evidence.keys.keys_total, 1);
 
   const partial = compliantClient();
   partial.listKeys = async () => [
@@ -765,9 +805,10 @@ test("control 19: a denied or shapeless key get never passes and names the cause
   };
   const mixed = byId(await assessOciTenancyGuardrails(partial), "OCI-GRD-05");
   assert.equal(mixed.status, "warn");
-  assert.equal(mixed.evidence.keys_total, 2);
-  assert.equal(mixed.evidence.keys_judged, 1);
-  assert.equal(mixed.evidence.key_detail_errors, 1);
+  assert.equal(mixed.evidence.keys.keys_total, 2);
+  assert.equal(mixed.evidence.key_details.keys_judged, 1);
+  assert.equal(mixed.evidence.key_details.key_detail_errors, 1);
+  assert.match(mixed.evidence.key_details.status, /^partial: kms management key get failed for 1\/2 reads \(kms management key get .*NotAuthorizedOrNotFound.*\); returned keyShape for 1\/2 ENABLED keys$/);
   assert.match(mixed.summary, /1\/2 ENABLED keys judged from Key.keyShape/);
   assert.match(mixed.summary, /1 kms management key get reads failed/);
 
@@ -787,16 +828,18 @@ test("rule 10: the vault key cap reports seen versus total and withholds pass", 
   ];
   const capped = byId(await assessOciTenancyGuardrails(client, { maxKeys: 1 }), "OCI-GRD-05");
   assert.equal(capped.status, "warn");
-  assert.equal(capped.evidence.key_cap_hit, true);
+  assert.equal(capped.evidence.keys.key_cap_hit, true);
   assert.equal(capped.evidence.key_cap, 1);
-  assert.equal(capped.evidence.keys_seen, 1);
-  assert.equal(capped.evidence.keys_total, 2);
+  assert.equal(capped.evidence.keys.keys_seen, 1);
+  assert.equal(capped.evidence.keys.keys_total, 2);
+  assert.match(capped.evidence.keys.status, /^partial: key cap 1 hit: 1\/2 ENABLED keys inspected; 2 ENABLED keys listed across 1 vaults$/);
   assert.match(capped.summary, /Key cap 1 hit: 1\/2 ENABLED keys inspected; a pass verdict is withheld/);
 
   const exact = byId(await assessOciTenancyGuardrails(client, { maxKeys: 2 }), "OCI-GRD-05");
   assert.equal(exact.status, "pass");
-  assert.equal(exact.evidence.key_cap_hit, false);
-  assert.equal(exact.evidence.keys_judged, 2);
+  assert.equal(exact.evidence.keys.key_cap_hit, false);
+  assert.match(exact.evidence.keys.status, /^complete: /, "a false cap flag sits beside a complete status only");
+  assert.equal(exact.evidence.key_details.keys_judged, 2);
 });
 
 test("bastions that combine a world allow list with a long TTL fail instead of warn", async () => {
@@ -804,16 +847,16 @@ test("bastions that combine a world allow list with a long TTL fail instead of w
   exposed.getBastion = async () => ({ id: "bastion-1", name: "ops", lifecycleState: "ACTIVE", maxSessionTtlInSeconds: 86400, clientCidrBlockAllowList: ["0.0.0.0/0"] });
   const failing = byId(await assessOciTenancyGuardrails(exposed), "OCI-GRD-04");
   assert.equal(failing.status, "fail");
-  assert.equal(failing.evidence.exposed_bastions.length, 1);
-  assert.equal(failing.evidence.weak_bastions.length, 0);
+  assert.equal(failing.evidence.bastion_details.exposed_bastions.length, 1);
+  assert.equal(failing.evidence.bastion_details.weak_bastions.length, 0);
   assert.match(failing.summary, /1 bastions combine a world CIDR allow list/);
 
   const worldOnly = compliantClient();
   worldOnly.getBastion = async () => ({ id: "bastion-1", name: "ops", lifecycleState: "ACTIVE", maxSessionTtlInSeconds: 3600, clientCidrBlockAllowList: ["::/0"] });
   const warning = byId(await assessOciTenancyGuardrails(worldOnly), "OCI-GRD-04");
   assert.equal(warning.status, "warn");
-  assert.equal(warning.evidence.exposed_bastions.length, 0);
-  assert.equal(warning.evidence.weak_bastions.length, 1);
+  assert.equal(warning.evidence.bastion_details.exposed_bastions.length, 0);
+  assert.equal(warning.evidence.bastion_details.weak_bastions.length, 1);
 
   const longTtlOnly = compliantClient();
   longTtlOnly.getBastion = async () => ({ id: "bastion-1", name: "ops", lifecycleState: "ACTIVE", maxSessionTtlInSeconds: 86400, clientCidrBlockAllowList: ["203.0.113.0/24"] });
@@ -828,9 +871,9 @@ test("NSG rule evidence carries the documented SecurityRule.isValid flag", async
   ];
   const finding = byId(await assessOciTenancyGuardrails(client), "OCI-GRD-02");
   assert.equal(finding.status, "fail");
-  assert.equal(finding.evidence.nsg_rules_seen, 2);
-  assert.equal(finding.evidence.nsg_rules_is_valid_false, 1);
-  assert.equal(finding.evidence.permissive_nsg_rules[0].isValid, false);
+  assert.equal(finding.evidence.nsg_rules.nsg_rules_seen, 2);
+  assert.equal(finding.evidence.nsg_rules.nsg_rules_is_valid_false, 1);
+  assert.equal(finding.evidence.nsg_rules.permissive_nsg_rules[0].isValid, false);
   assert.ok(OCI_SURFACE_DOCS.networkSecurityGroupRules.fields.includes("isValid"));
 });
 
@@ -848,10 +891,12 @@ test("rule 1 corollary: vacuous NSG and gateway emptiness never passes beside a 
     assert.equal(item.status, "warn", `${id} must not pass beside a partial security list inventory: ${item.summary}`);
     assert.match(item.summary, /1 security lists were readable across 2\/3 compartments/);
     assert.match(item.summary, /The security list inventory is incomplete \(network security-list list denied or unreadable in 1 compartment\(s\): prod\), so a pass verdict is withheld/);
-    assert.equal(item.evidence.security_lists_readable, true);
-    assert.equal(item.evidence.security_lists_partial, true);
-    assert.deepEqual(item.evidence.security_lists_denied_compartments, ["prod"]);
-    assert.equal(item.evidence.security_lists_compartments_truncated, false);
+    const witness = item.evidence.security_list_witness;
+    assert.match(witness.role, /^consulted: /);
+    assert.match(witness.status, /^partial: network security-list list denied or unreadable in 1 compartment\(s\): prod; network security-list list returned 1 record\(s\) across 2\/3 compartments$/);
+    assert.deepEqual(witness.denied_compartments, ["prod"]);
+    assert.equal(witness.compartments_truncated, false, "the cap flag is false because the listing ran to completion without hitting the cap");
+    assert.equal(witness.items_seen, 1);
   }
   assert.ok(denied.errors.some((error) => /network security-list list in compartment prod: ServiceError: 403 NotAllowed/.test(error)));
 
@@ -863,7 +908,8 @@ test("rule 1 corollary: vacuous NSG and gateway emptiness never passes beside a 
     const item = byId(truncated, id);
     assert.equal(item.status, "warn", `${id}: ${item.summary}`);
     assert.match(item.summary, /compartment cap hit \(1\/3 compartments inspected by network security-list list\)/);
-    assert.equal(item.evidence.security_lists_compartments_truncated, true);
+    assert.equal(item.evidence.security_list_witness.compartments_truncated, true);
+    assert.match(item.evidence.security_list_witness.status, /^partial: compartment cap hit \(1\/3 compartments inspected by network security-list list\)/);
   }
 
   const unreadable = compliantClient();
@@ -876,7 +922,13 @@ test("rule 1 corollary: vacuous NSG and gateway emptiness never passes beside a 
     const item = byId(manual, id);
     assert.equal(item.status, "manual", `${id}: ${item.summary}`);
     assert.match(item.summary, /no readable security lists were found \(network security-list list in compartment root: ServiceError: 404 NotAuthorizedOrNotFound/);
-    assert.equal(item.evidence.security_lists_readable, false);
+    const witness = item.evidence.security_list_witness;
+    assert.match(witness.status, /^unreadable: network security-list list in compartment root: .*NotAuthorizedOrNotFound.* and 2 more compartment\(s\)$/);
+    assert.equal(witness.items_seen, null);
+    assert.equal(witness.compartments_seen, null);
+    assert.equal(witness.compartments_truncated, null);
+    assert.equal(witness.compartments_total, 3, "the attempt itself is described: three compartments were tried");
+    assert.deepEqual(witness.denied_compartments, ["root", "prod", "apps"]);
   }
 
   const complete = compliantClient();
@@ -886,8 +938,14 @@ test("rule 1 corollary: vacuous NSG and gateway emptiness never passes beside a 
     const item = byId(passing, id);
     assert.equal(item.status, "pass", `${id}: ${item.summary}`);
     assert.match(item.summary, /1 security lists were readable across 3\/3 compartments/);
-    assert.equal(item.evidence.security_lists_partial, false);
+    assert.match(item.evidence.security_list_witness.status, /^complete: network security-list list returned 1 record\(s\) across 3\/3 compartments$/);
+    assert.equal(item.evidence.security_list_witness.compartments_truncated, false);
   }
+
+  // A populated primary inventory never consults the witness, so its evidence carries the role and no counts at all.
+  const populated = byId(await assessOciTenancyGuardrails(compliantClient()), "OCI-GRD-02");
+  assert.deepEqual(Object.keys(populated.evidence.security_list_witness).sort(), ["role", "surface"]);
+  assert.match(populated.evidence.security_list_witness.role, /^not consulted: network nsg list returned 1 record\(s\), so the verdict rests on network nsg rules list$/);
 });
 
 /**
@@ -975,6 +1033,214 @@ test("per-inventory sweep: every finding that reads an unreadable surface drops 
       }
     }
   }
+});
+
+/**
+ * Uniform null standard sweep (Slack pattern). Statuses follow the vocabulary
+ * `complete: ...`, `partial: ...`, `unreadable: ...`, `not collected: ...`
+ * and name the OCI CLI command; the access check's `not_readable` is treated
+ * as unavailable too so core_data/access.json is held to the same rule.
+ */
+const UNAVAILABLE_STATUS = /^(unreadable|not collected|not_readable|unknown)\b/;
+const COLLECTED_STATUS = /^(complete|partial)\b/;
+const COMMAND_MENTION = new RegExp(`\\b(?:${INVENTORY_SWEEP.map((entry) => entry.command).sort((a, b) => b.length - a.length).join("|")})\\b`, "g");
+
+function isFabricated(value) {
+  return value === 0 || value === false || (Array.isArray(value) && value.length === 0);
+}
+
+/**
+ * A status of unreadable, not collected, or unknown requires a null
+ * companion: no sibling of that status may render 0, [], or false, a
+ * `<name>_status` of that kind requires `<name>` to be null, and the literal
+ * "unknown" placeholder never appears as a value.
+ */
+function assertNoFabricatedValues(value, label, path = "") {
+  if (Array.isArray(value)) {
+    value.forEach((item, index) => assertNoFabricatedValues(item, label, `${path}[${index}]`));
+    return;
+  }
+  if (value === null || typeof value !== "object") return;
+  for (const [key, entry] of Object.entries(value)) {
+    assert.notEqual(entry, "unknown", `${label}: ${path}.${key} is the "unknown" placeholder`);
+    if (typeof entry === "string" && key.endsWith("_status") && UNAVAILABLE_STATUS.test(entry)) {
+      const base = key.slice(0, -"_status".length);
+      if (base in value) assert.equal(value[base], null, `${label}: ${path}.${base} must be null beside status "${entry}"`);
+    }
+    if (key === "status" && typeof entry === "string" && UNAVAILABLE_STATUS.test(entry)) {
+      for (const [sibling, siblingValue] of Object.entries(value)) {
+        assert.ok(!isFabricated(siblingValue), `${label}: ${path}.${sibling} renders ${JSON.stringify(siblingValue)} beside status "${entry}"`);
+      }
+    }
+    assertNoFabricatedValues(entry, label, `${path}.${key}`);
+  }
+}
+
+/**
+ * A complete or partial status may only name commands the recorder saw, and
+ * a false collection flag (cap_hit, compartments_truncated) may only sit
+ * beside a complete or partial status, never beside a read that was denied
+ * or never issued.
+ */
+function assertStatusesMatchRequests(value, requested, label, path = "") {
+  if (Array.isArray(value)) {
+    value.forEach((item, index) => assertStatusesMatchRequests(item, requested, label, `${path}[${index}]`));
+    return;
+  }
+  if (value === null || typeof value !== "object") return;
+  for (const [key, entry] of Object.entries(value)) {
+    if (typeof entry === "string" && (key === "status" || key.endsWith("_status")) && COLLECTED_STATUS.test(entry)) {
+      for (const mention of entry.match(COMMAND_MENTION) ?? []) {
+        assert.ok(requested.has(mention), `${label}: ${path}.${key} says "${entry}" but ${mention} was never requested`);
+      }
+    }
+    if ((key.endsWith("_cap_hit") || key === "compartments_truncated") && entry === false) {
+      assert.match(String(value.status), COLLECTED_STATUS, `${label}: ${path}.${key} is false beside status "${value.status}"; false is only allowed when the read ran`);
+    }
+    assertStatusesMatchRequests(entry, requested, label, `${path}.${key}`);
+  }
+}
+
+/** Wraps every client surface so the sweep knows which OCI CLI commands were actually issued, whether they succeeded or threw. */
+function recordingClient(client) {
+  const requested = new Set();
+  for (const entry of INVENTORY_SWEEP) {
+    const original = client[entry.method];
+    client[entry.method] = async (...args) => {
+      requested.add(entry.command);
+      return original(...args);
+    };
+  }
+  return { client, requested };
+}
+
+/** Every `status` string in a document, so a row can assert that the denied command is named by a demoted (partial, unreadable, or not collected) status. */
+function collectStatuses(value, statuses = []) {
+  if (Array.isArray(value)) value.forEach((item) => collectStatuses(item, statuses));
+  else if (value && typeof value === "object") {
+    for (const [key, entry] of Object.entries(value)) {
+      if (key === "status" && typeof entry === "string") statuses.push(entry);
+      collectStatuses(entry, statuses);
+    }
+  }
+  return statuses;
+}
+
+const DEMOTED_STATUS = /^(partial|unreadable|not collected)\b/;
+
+test("uniform null standard sweep: baseline, every denial row fully and per compartment, the zero-scope rows, and fixtures (b) and (c) render null beside a named status, never 0, [], or false", async () => {
+  const rows = [
+    { label: "baseline (fixture d)", make: () => compliantClient(), expectDemoted: false },
+    { label: "fixture (b): every list empty", make: () => emptyClient(), expectDemoted: "iam compartment list returned no active compartments" },
+    { label: "fixture (c): prod denied for every scoped list", make: () => partialClient(), expectDemoted: "denied or unreadable in 1 compartment(s): prod" },
+    { label: "zero scope: iam compartment list returns no active compartments", make: () => Object.assign(compliantClient(), { listCompartments: async () => [] }), expectDemoted: "iam compartment list returned no active compartments" },
+  ];
+  for (const entry of INVENTORY_SWEEP) {
+    const modes = entry.compartmentArg === undefined ? ["full"] : ["full", "compartment"];
+    for (const mode of modes) {
+      rows.push({ label: `${entry.command} denied (${mode})`, make: () => sweepClient(entry, mode, DENIED_ERROR), expectDemoted: entry.command });
+    }
+  }
+  assert.equal(rows.length, 4 + INVENTORY_SWEEP.length + INVENTORY_SWEEP.filter((entry) => entry.compartmentArg !== undefined).length);
+
+  for (const row of rows) {
+    const recorder = recordingClient(row.make());
+    const results = await runAllAssessments(recorder.client);
+    const statuses = [];
+    for (const result of results) {
+      assertNoFabricatedValues(result.summary, `${row.label}: ${result.title} summary`);
+      assertStatusesMatchRequests(result.summary, recorder.requested, `${row.label}: ${result.title} summary`);
+      collectStatuses(result.summary, statuses);
+      for (const item of result.findings) {
+        assertNoFabricatedValues(item.evidence ?? null, `${row.label}: ${item.id} evidence`);
+        assertStatusesMatchRequests(item.evidence ?? null, recorder.requested, `${row.label}: ${item.id} evidence`);
+        collectStatuses(item.evidence ?? null, statuses);
+      }
+    }
+    const demoted = statuses.filter((status) => DEMOTED_STATUS.test(status));
+    if (row.expectDemoted === false) {
+      assert.deepEqual(demoted, [], "the compliant baseline has no partial, unreadable, or not-collected reads");
+    } else {
+      assert.ok(demoted.some((status) => status.includes(row.expectDemoted)), `${row.label}: a demoted status names the denied read; demoted statuses were: ${demoted.join(" | ")}`);
+    }
+
+    // The bundle runs the access check too, so it gets its own recorder; every JSON document it writes is held to the same two rules.
+    const bundleRecorder = recordingClient(row.make());
+    const base = createTempBase("grclanker-oci-null-standard-");
+    const bundle = await exportOciAuditBundle(bundleRecorder.client, sampleConfig(), base);
+    const jsonFiles = listFilesRecursively(bundle.outputDir).filter((file) => file.endsWith(".json"));
+    assert.ok(jsonFiles.some((file) => file.endsWith("core_data/compartments.json")) && jsonFiles.some((file) => file.endsWith("core_data/access.json")), row.label);
+    for (const file of jsonFiles) {
+      const document = JSON.parse(readFileSync(file, "utf8"));
+      const fileLabel = `${row.label}: ${relative(bundle.outputDir, file)}`;
+      assertNoFabricatedValues(document, fileLabel);
+      assertStatusesMatchRequests(document, bundleRecorder.requested, fileLabel);
+    }
+    rmSync(base, { recursive: true, force: true });
+  }
+});
+
+test("zero-scope row: with iam compartment list denied, every compartment-scoped count and flag renders null beside a not-collected status and core_data/compartments.json is a marker, not []", async () => {
+  const client = sweepClient(INVENTORY_SWEEP.find((entry) => entry.method === "listCompartments"), "full", DENIED_ERROR);
+  const results = await runAllAssessments(client);
+  const scoped = results.flatMap((result) => result.findings).filter((item) => item.id in SCOPED_INVENTORY_KEY);
+  assert.equal(scoped.length, Object.keys(SCOPED_INVENTORY_KEY).length);
+  for (const item of scoped) {
+    const inventory = scopedEvidence(item);
+    assert.match(inventory.status, /^not collected: iam compartment list failed, so [a-z -]+ could not be enumerated: .*NotAuthorizedOrNotFound/, `${item.id}: ${inventory.status}`);
+    for (const key of ["items_seen", "compartments_seen", "compartments_total", "denied_compartments", "compartments_truncated"]) {
+      assert.equal(inventory[key], null, `${item.id}: ${key} must be null when the listing was never issued`);
+    }
+    assert.equal(item.status, "manual");
+  }
+  for (const summary of [results[2].summary.compartments, results[3].summary.compartments]) {
+    assert.match(summary.status, /^unreadable: iam compartment list failed \(.*NotAuthorizedOrNotFound/);
+    assert.equal(summary.compartments_inspected, null);
+    assert.equal(summary.compartments_total, null);
+  }
+  assert.match(results[0].summary.policies.status, /^not collected: iam compartment list failed/);
+  assert.equal(results[0].summary.policies.policies_seen, null);
+  assert.match(results[1].summary.event_rules.status, /^not collected: iam compartment list failed/);
+  assert.equal(results[1].summary.event_rules.critical_event_rules, null);
+  // A dependent read behind a never-issued inventory is itself not collected, so its cap flag is null rather than false.
+  const keys = byId(results[2], "OCI-GRD-05").evidence.keys;
+  assert.match(keys.status, /^not collected: .*kms management key list was not called$/);
+  assert.equal(keys.key_cap_hit, null);
+  assert.equal(byId(results[2], "OCI-GRD-06").evidence.buckets.bucket_cap_hit, null);
+  assert.equal(byId(results[2], "OCI-GRD-04").evidence.bastion_details.bastion_get_errors, null);
+
+  // A verdict that never depended on the compartment scope keeps its real counts (LOG-02 problems beside a complete status, here 0 open problems).
+  assert.equal(byId(results[1], "OCI-LOG-02").status, "pass");
+  assert.match(byId(results[1], "OCI-LOG-02").evidence.problems.status, /^complete: cloud-guard problem list returned 0 problems \(0 OPEN\)$/);
+  assert.equal(results[1].summary.problems.open_cloud_guard_problems, 0);
+
+  const base = createTempBase("grclanker-oci-zero-scope-");
+  const bundle = await exportOciAuditBundle(sweepClient(INVENTORY_SWEEP.find((entry) => entry.method === "listCompartments"), "full", DENIED_ERROR), sampleConfig(), base);
+  const compartments = JSON.parse(readFileSync(join(bundle.outputDir, "core_data", "compartments.json"), "utf8"));
+  assert.equal(Array.isArray(compartments), false, "an unread inventory is never written as []");
+  assert.deepEqual(Object.keys(compartments).sort(), ["endpoint", "error", "records", "status"]);
+  assert.equal(compartments.endpoint, "iam compartment list");
+  assert.equal(compartments.records, null);
+  assert.match(compartments.status, /^unreadable: iam compartment list failed \(.*NotAuthorizedOrNotFound/);
+  assert.match(compartments.error, /NotAuthorizedOrNotFound/);
+  const access = JSON.parse(readFileSync(join(bundle.outputDir, "core_data", "access.json"), "utf8"));
+  assert.equal(access.status, "limited");
+  const compartmentSurface = access.surfaces.find((item) => item.name === "compartments");
+  assert.equal(compartmentSurface.status, "not_readable");
+  assert.equal("count" in compartmentSurface, false);
+  const summaryText = readFileSync(join(bundle.outputDir, "analysis", "summary.md"), "utf8");
+  assert.match(summaryText, /- compartments: unreadable: iam compartment list failed/);
+  assert.match(summaryText, /  - compartments_inspected: null/);
+  assert.doesNotMatch(summaryText, /\[object Object\]/);
+  rmSync(base, { recursive: true, force: true });
+
+  // Readable compartments still write the projected records as an array.
+  const readableBase = createTempBase("grclanker-oci-zero-scope-readable-");
+  const readable = await exportOciAuditBundle(compliantClient(), sampleConfig(), readableBase);
+  const records = JSON.parse(readFileSync(join(readable.outputDir, "core_data", "compartments.json"), "utf8"));
+  assert.equal(Array.isArray(records), true);
+  assert.equal(records.length, 3);
+  rmSync(readableBase, { recursive: true, force: true });
 });
 
 const CANARIES = {
@@ -1352,14 +1618,24 @@ test("assessOciComputeAndStorage requires the documented IMDS and kmsKeyId flags
   };
   const result = await assessOciComputeAndStorage(client);
   assert.equal(byId(result, "OCI-CMP-01").status, "fail");
-  assert.deepEqual(byId(result, "OCI-CMP-01").evidence.legacy_imds_instances, ["inst-2", "inst-3"]);
+  assert.deepEqual(byId(result, "OCI-CMP-01").evidence.instances.legacy_imds_instances, ["inst-2", "inst-3"]);
   assert.equal(byId(result, "OCI-CMP-02").status, "fail");
   assert.equal(byId(result, "OCI-CMP-03").status, "pass");
+  assert.deepEqual(byId(result, "OCI-CMP-03").evidence.availability_domains.availability_domains, ["Uocm:US-ASHBURN-AD-1"]);
 
   client.listAvailabilityDomains = async () => [];
   const noAds = await assessOciComputeAndStorage(client);
-  assert.equal(byId(noAds, "OCI-CMP-03").status, "manual");
-  assert.match(byId(noAds, "OCI-CMP-03").summary, /availability domains/);
+  const noAdBoot = byId(noAds, "OCI-CMP-03");
+  assert.equal(noAdBoot.status, "manual");
+  assert.match(noAdBoot.summary, /availability domains/);
+  // The boot volume listing was never issued, so its counts are null beside a not-collected status naming the blocker.
+  assert.match(noAdBoot.evidence.boot_volumes.status, /^not collected: iam availability-domain list failed, so bv boot-volume list could not be enumerated: no availability domains were returned$/);
+  assert.equal(noAdBoot.evidence.boot_volumes.items_seen, null);
+  assert.equal(noAdBoot.evidence.boot_volumes.compartments_total, null);
+  assert.equal(noAdBoot.evidence.boot_volumes.live_boot_volumes, null);
+  assert.deepEqual(noAdBoot.evidence.availability_domains.availability_domains, [], "an empty list that the read really returned stays an empty list beside its complete status");
+  assert.match(noAds.summary.boot_volumes.status, /^not collected: /);
+  assert.equal(noAds.summary.boot_volumes.live_boot_volumes, null);
 });
 
 test("exportOciAuditBundle writes the shared layout and never overwrites a prior bundle", async () => {
@@ -1402,6 +1678,49 @@ test("exportOciAuditBundle records partial collection in _errors.log", async () 
   assert.match(errorsLog, /NotAuthorizedOrNotFound/);
   const summary = readFileSync(join(result.outputDir, "compliance", "executive_summary.md"), "utf8");
   assert.match(summary, /Partial Collection Warnings/);
+});
+
+test("the bundle sink scrubs in data mode: a compartment named prod-us-east-2026 survives in _errors.log, the per-area errors arrays, and the executive summary while credential shapes are still redacted there", async () => {
+  const REGION_COMPARTMENT = { id: "ocid1.compartment.oc1..produseast", compartmentId: TENANCY, name: "prod-us-east-2026", lifecycleState: "ACTIVE" };
+  // A wrapper label carrying an assignment-shaped credential proves the second layer still runs at the sink without the long-token rule.
+  const SHAPED_COMPARTMENT = { id: "ocid1.compartment.oc1..shaped", compartmentId: TENANCY, name: "team token=FAKE_SINK_TOKEN_1abcdef", lifecycleState: "ACTIVE" };
+  const client = compliantClient();
+  client.listCompartments = async () => [ROOT, REGION_COMPARTMENT, SHAPED_COMPARTMENT, APPS];
+  client.listPolicies = async (compartmentId) => {
+    if (compartmentId === REGION_COMPARTMENT.id || compartmentId === SHAPED_COMPARTMENT.id) throw FORBIDDEN_ERROR;
+    return [{ id: "pol-1", name: "Auditors", lifecycleState: "ACTIVE", statements: ["Allow group Auditors to inspect all-resources in tenancy"] }];
+  };
+  assert.equal(scrubErrorText("iam policy list in compartment prod-us-east-2026: denied"), "iam policy list in compartment [redacted]: denied", "the strict scrub would erase the name, which is why the sink must not use it");
+  assert.equal(redactSensitiveText("iam policy list in compartment prod-us-east-2026: denied"), "iam policy list in compartment prod-us-east-2026: denied");
+
+  const identity = await assessOciIdentity(client);
+  const line = identity.errors.find((error) => error.startsWith("iam policy list in compartment prod-us-east-2026: "));
+  assert.ok(line, `the in-memory errors array names the compartment: ${identity.errors.join(" | ")}`);
+  assert.match(line, /ServiceError: 403 NotAllowed/);
+  assert.match(byId(identity, "OCI-IAM-04").summary, /denied or unreadable in 2 compartment\(s\): prod-us-east-2026, team token=\[redacted\]/);
+
+  const base = createTempBase("grclanker-oci-sink-mode-");
+  const bundle = await exportOciAuditBundle(client, sampleConfig(), base);
+  const errorsLog = readFileSync(join(bundle.outputDir, "_errors.log"), "utf8");
+  assert.match(errorsLog, /^iam policy list in compartment prod-us-east-2026: ServiceError: 403 NotAllowed/m, errorsLog);
+  assert.doesNotMatch(errorsLog, /compartment \[redacted\]/, "the long-token rule must not run at the sink");
+  const identityJson = JSON.parse(readFileSync(join(bundle.outputDir, "analysis", "identity.json"), "utf8"));
+  assert.ok(identityJson.errors.some((error) => error.startsWith("iam policy list in compartment prod-us-east-2026: ")), identityJson.errors.join(" | "));
+  const executive = readFileSync(join(bundle.outputDir, "compliance", "executive_summary.md"), "utf8");
+  assert.match(executive, /## Partial Collection Warnings[\s\S]*- iam policy list in compartment prod-us-east-2026: ServiceError: 403 NotAllowed/);
+  const findings = JSON.parse(readFileSync(join(bundle.outputDir, "analysis", "findings.json"), "utf8"));
+  const policies = findings.find((item) => item.id === "OCI-IAM-04");
+  assert.ok(policies.evidence.policies.denied_compartments.includes("prod-us-east-2026"));
+  assert.match(policies.evidence.policies.status, /^partial: iam policy list denied or unreadable in 2 compartment\(s\): prod-us-east-2026, team token=\[redacted\]; /);
+
+  for (const file of listFilesRecursively(bundle.outputDir)) {
+    assert.doesNotMatch(readFileSync(file, "utf8"), /FAKE_SINK_TOKEN/, `${relative(bundle.outputDir, file)} carries the planted credential shape`);
+  }
+  assert.match(errorsLog, /team token=\[redacted\]: ServiceError: 403 NotAllowed/);
+  for (const entry of readZipEntries(bundle.zipPath)) {
+    assert.doesNotMatch(entry.content, /FAKE_SINK_TOKEN/, `zip entry ${entry.name} carries the planted credential shape`);
+  }
+  rmSync(base, { recursive: true, force: true });
 });
 
 test("redaction keeps field names, drops credential-bearing values, and scrubs key material from text", () => {
@@ -1505,30 +1824,36 @@ test("rule 10: the policy cap reports seen versus total and withholds pass", asy
   const capped = await assessOciIdentity(client, { maxPolicies: 2 });
   const policies = byId(capped, "OCI-IAM-04");
   assert.equal(policies.status, "warn");
-  assert.equal(policies.evidence.policy_cap_hit, true);
-  assert.equal(policies.evidence.policies_seen, 2);
-  assert.equal(policies.evidence.policies_total, 3);
+  assert.equal(policies.evidence.policies.policy_cap_hit, true);
+  assert.equal(policies.evidence.policies.policies_seen, 2);
+  assert.equal(policies.evidence.policies.policies_total, 3);
+  assert.match(policies.evidence.policies.status, /^partial: policy cap 2 hit: 2\/3 ACTIVE policies judged; iam policy list returned 3 record\(s\) across 3\/3 compartments$/);
   assert.match(policies.summary, /Policy cap 2 hit: 2\/3 active policies inspected/);
 
   const uncapped = await assessOciIdentity(client, { maxPolicies: 3 });
   assert.equal(byId(uncapped, "OCI-IAM-04").status, "pass");
-  assert.equal(byId(uncapped, "OCI-IAM-04").evidence.policy_cap_hit, false);
+  assert.equal(byId(uncapped, "OCI-IAM-04").evidence.policies.policy_cap_hit, false);
+  assert.match(byId(uncapped, "OCI-IAM-04").evidence.policies.status, /^complete: /);
 });
 
 test("rule 10: the credential cap stops enumeration and reports users and credentials seen versus total", async () => {
   const capped = await assessOciIdentity(compliantClient(), { maxKeys: 1 });
   const rotation = byId(capped, "OCI-IAM-03");
   assert.equal(rotation.status, "warn");
-  assert.equal(rotation.evidence.credential_cap_hit, true);
-  assert.equal(rotation.evidence.credentials_seen, 1);
-  assert.equal(rotation.evidence.credentials_total, null);
-  assert.equal(rotation.evidence.users_inspected, 1);
-  assert.equal(rotation.evidence.users_total, 2);
+  const listings = rotation.evidence.credential_listings;
+  assert.equal(listings.credential_cap_hit, true);
+  assert.equal(listings.credentials_seen, 1);
+  assert.equal(listings.credentials_total, null);
+  assert.equal(listings.users_inspected, 1);
+  assert.equal(listings.users_total, 2);
+  assert.match(listings.status, /^partial: credential cap 1 hit after 1 credentials across 1\/2 ACTIVE users; 1 credential listings returned 1 ACTIVE credentials$/);
   assert.match(rotation.summary, /Credential cap 1 hit: 1 credentials seen across 1\/2 active users; the total is unknown/);
 
   const exact = await assessOciIdentity(compliantClient(), { maxKeys: 6 });
   assert.equal(byId(exact, "OCI-IAM-03").status, "pass");
-  assert.equal(byId(exact, "OCI-IAM-03").evidence.credentials_total, 6);
+  assert.equal(byId(exact, "OCI-IAM-03").evidence.credential_listings.credentials_total, 6);
+  assert.equal(byId(exact, "OCI-IAM-03").evidence.credential_listings.credential_cap_hit, false);
+  assert.match(byId(exact, "OCI-IAM-03").evidence.credential_listings.status, /^complete: 6 credential listings across 2 ACTIVE users returned 6 ACTIVE credentials$/);
 });
 
 test("rule 10: the bucket cap reports seen versus total and withholds pass", async () => {
@@ -1539,14 +1864,16 @@ test("rule 10: the bucket cap reports seen versus total and withholds pass", asy
   const capped = await assessOciTenancyGuardrails(client, { maxBuckets: 2 });
   const buckets = byId(capped, "OCI-GRD-06");
   assert.equal(buckets.status, "warn");
-  assert.equal(buckets.evidence.bucket_cap_hit, true);
-  assert.equal(buckets.evidence.buckets_seen, 2);
-  assert.equal(buckets.evidence.buckets_total, 3);
+  assert.equal(buckets.evidence.buckets.bucket_cap_hit, true);
+  assert.equal(buckets.evidence.buckets.buckets_seen, 2);
+  assert.equal(buckets.evidence.buckets.buckets_total, 3);
+  assert.match(buckets.evidence.buckets.status, /^partial: bucket cap 2 hit: 2\/3 buckets inspected; os bucket list returned 3 record\(s\) across 3\/3 compartments$/);
   assert.match(buckets.summary, /Bucket cap 2 hit: 2\/3 buckets inspected/);
 
   const uncapped = await assessOciTenancyGuardrails(client, { maxBuckets: 3 });
   assert.equal(byId(uncapped, "OCI-GRD-06").status, "pass");
-  assert.equal(byId(uncapped, "OCI-GRD-06").evidence.bucket_cap_hit, false);
+  assert.equal(byId(uncapped, "OCI-GRD-06").evidence.buckets.bucket_cap_hit, false);
+  assert.match(byId(uncapped, "OCI-GRD-06").evidence.buckets.status, /^complete: /);
 });
 
 test("resolveSecureOutputPath rejects traversal and symlink parents", () => {

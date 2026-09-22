@@ -337,6 +337,18 @@ export interface OciScopedCollection<T> {
   deniedCompartments: string[];
   truncated: boolean;
   errors: string[];
+  /** The upstream command whose failure meant this inventory was never listed (never set when the listing was attempted). */
+  blockedBy?: string;
+}
+
+/**
+ * The collection status of one read, rendered beside every value derived
+ * from it. `ok` is true only when the read produced data (complete or
+ * partial); an unreadable or never-issued read renders its values as null.
+ */
+interface ReadOutcome {
+  ok: boolean;
+  status: string;
 }
 
 function asObject(value: unknown): JsonRecord | undefined {
@@ -532,12 +544,15 @@ function scrubEmbeddedUrl(url: string): string {
 /**
  * A bare `token: user` describes a token type rather than holding one, so the
  * exact key `token` keeps a short lowercase word; every other credential key,
- * and every token-shaped value, is redacted.
+ * and every token-shaped value, is redacted. Sentence punctuation that the
+ * value class swallowed (`token=abc: ServiceError`) is kept after the marker
+ * so the surrounding message stays readable, as scrubEmbeddedUrl does.
  */
 function redactCredentialAssignment(match: string, key: string, value: string): string {
   if (value === REDACTED_MARKER) return match;
   if (key.toLowerCase() === "token" && /^["']?[a-z]{1,11}["']?$/.test(value)) return match;
-  return `${key}=${REDACTED_MARKER}`;
+  const trailing = value.match(/[.:!)]+$/)?.[0] ?? "";
+  return `${key}=${REDACTED_MARKER}${trailing}`;
 }
 
 function redactLongToken(match: string, offset: number, text: string): string {
@@ -747,18 +762,38 @@ async function writeBundleJson(rootDir: string, relativePathname: string, value:
 }
 
 /**
- * Re-runs the creation-time scrubs at the bundle sink: scrubErrorText on every
- * collector error string and the field-aware redaction on every finding, so a
- * string that bypassed errorMessage upstream still cannot reach a bundle file
- * or the zip. Both scrubs are idempotent. Summaries keep resource and
- * compartment names, so they take redactSensitiveText rather than the
- * long-token rule.
+ * Second redaction layer at the bundle sink: the field-aware redaction on
+ * every finding and the data-mode scrub (redactSensitiveText, long-token rule
+ * off) on every summary and collector error string, so a credential shape that
+ * bypassed the creation-time scrub still cannot reach a bundle file or the
+ * zip. The long-token rule stays with the creation-time scrub
+ * (scrubErrorText in OciCommandError and errorMessage) because the sink also
+ * sees the resource and compartment names the collectors wrap around each
+ * cause, and a name such as prod-us-east-2026 must survive in _errors.log,
+ * the per-area errors arrays, and the executive summary. Both scrubs are
+ * idempotent.
  */
 function scrubAssessmentForBundle(result: OciAssessmentResult): OciAssessmentResult {
   return {
     ...result,
     findings: result.findings.map((item) => redactSensitiveValues({ ...item, summary: redactSensitiveText(item.summary) })),
-    errors: result.errors.map(scrubErrorText),
+    errors: result.errors.map(redactSensitiveText),
+  };
+}
+
+/**
+ * The raw compartment snapshot: the projected records when iam compartment
+ * list returned data, otherwise a marker naming the command and the cause
+ * with `records: null`, never an empty array standing in for an unread
+ * inventory.
+ */
+export function compartmentSnapshotDocument(compartments: OciCollected<JsonRecord>): JsonRecord | JsonRecord[] {
+  if (compartments.ok) return compartments.items.map(projectCompartmentSnapshot);
+  return {
+    status: unreadableRead(`iam compartment list failed (${compartments.error ?? "no data was returned"})`).status,
+    endpoint: "iam compartment list",
+    error: compartments.error ?? null,
+    records: null,
   };
 }
 
@@ -1165,7 +1200,12 @@ function blockedCollection<T>(surface: string, blocker: string, cause: string | 
     deniedCompartments: [],
     truncated: false,
     errors: [`${blocker} failed, so ${surface} could not be enumerated: ${cause ?? "no data was returned"}`],
+    blockedBy: blocker,
   };
+}
+
+function activeCompartments(compartments: JsonRecord[]): JsonRecord[] {
+  return compartments.filter((compartment) => asString(compartment.id) && upper(compartment.lifecycleState) !== "DELETED");
 }
 
 /**
@@ -1179,7 +1219,7 @@ export async function collectAcrossCompartments<T>(
   maxCompartments: number,
   load: (compartmentId: string) => Promise<T[]>,
 ): Promise<OciScopedCollection<T>> {
-  const active = compartments.filter((compartment) => asString(compartment.id) && upper(compartment.lifecycleState) !== "DELETED");
+  const active = activeCompartments(compartments);
   const inspected = active.slice(0, maxCompartments);
   const items: T[] = [];
   const deniedCompartments: string[] = [];
@@ -1259,16 +1299,148 @@ export function scopedStatus<T>(
   return status;
 }
 
-function scopeEvidence<T>(collection: OciScopedCollection<T>): JsonRecord {
+/**
+ * Uniform null standard. A count, list, or collection flag is rendered only
+ * when the read it came from produced data; a denied or never-issued read
+ * renders null beside a status string that names the command and the cause
+ * (`unreadable: ...`, `not collected: ...`), never 0, [], or false. A false
+ * flag therefore always means the scan ran to completion and did not trip.
+ */
+function observed<T>(available: boolean, value: T): T | null {
+  return available ? value : null;
+}
+
+function completeRead(detail: string): ReadOutcome {
+  return { ok: true, status: `complete: ${detail}` };
+}
+
+function partialRead(detail: string): ReadOutcome {
+  return { ok: true, status: `partial: ${detail}` };
+}
+
+function unreadableRead(detail: string): ReadOutcome {
+  return { ok: false, status: `unreadable: ${detail}` };
+}
+
+function skippedRead(detail: string): ReadOutcome {
+  return { ok: false, status: `not collected: ${detail}` };
+}
+
+function readDetail(outcome: ReadOutcome): string {
+  return outcome.status.replace(/^(?:complete|partial|unreadable|not collected): /, "");
+}
+
+/** A read that was never issued because the read it depends on produced no usable data. */
+function dependentSkipped(parent: ReadOutcome, surface: string): ReadOutcome {
+  return skippedRead(`${readDetail(parent)}; ${surface} was not called`);
+}
+
+/**
+ * A dependent read with nothing to iterate (no ACTIVE bastions, no ENABLED
+ * keys): vacuously complete, or partial when the parent inventory was. The
+ * status repeats the parent's own result and the reason, and never claims a
+ * result from the dependent command, which was not issued.
+ */
+function vacuousRead(parent: ReadOutcome, reason: string): ReadOutcome {
+  const detail = `${readDetail(parent)}; ${reason}`;
+  return parent.status.startsWith("partial: ") ? partialRead(detail) : completeRead(detail);
+}
+
+/** A dependent read is at most partial when the inventory it iterated was itself partial. */
+function inheritPartial(parent: ReadOutcome, outcome: ReadOutcome): ReadOutcome {
+  if (!outcome.ok || !parent.status.startsWith("partial: ") || !outcome.status.startsWith("complete: ")) return outcome;
+  return partialRead(`${readDetail(outcome)}; its input inventory was partial (${readDetail(parent)})`);
+}
+
+/** Collection status for a single (tenancy-scoped) command wrapped by collect(). */
+function singleRead(surface: string, collected: OciCollected<unknown>, detail?: string): ReadOutcome {
+  if (!collected.ok) return unreadableRead(`${surface} failed (${collected.error ?? "no data was returned"})`);
+  return completeRead(`${surface} ${detail ?? `returned ${collected.items.length} record(s)`}`);
+}
+
+/**
+ * Collection status for a per-item dependent read (key get for every key,
+ * session list for every bastion): not collected when the parent inventory
+ * produced no data, vacuously complete when the parent inventory had nothing
+ * to iterate, unreadable when every read failed, partial when some did.
+ */
+function dependentRead(
+  surface: string,
+  parent: ReadOutcome,
+  vacuousReason: string,
+  reads: number,
+  failures: number,
+  firstFailure: string | undefined,
+  completeDetail: string,
+): ReadOutcome {
+  if (!parent.ok) return dependentSkipped(parent, surface);
+  if (reads === 0 && failures === 0) return vacuousRead(parent, vacuousReason);
+  if (failures >= reads) return unreadableRead(`${surface} failed for every read (${failures}/${Math.max(reads, failures)}): ${firstFailure ?? "no data was returned"}`);
+  if (failures > 0) return partialRead(`${surface} failed for ${failures}/${reads} reads (${firstFailure ?? "see errors"}); ${completeDetail}`);
+  return inheritPartial(parent, completeRead(`${surface} ${completeDetail}`));
+}
+
+/** Collection status for a compartment-scoped inventory, with an optional item-cap detail that also makes the read partial. */
+function scopeRead<T>(collection: OciScopedCollection<T>, capDetail?: string): ReadOutcome {
+  if (collection.blockedBy) return skippedRead(collection.errors[0] ?? `${collection.blockedBy} failed, so ${collection.surface} was not called`);
+  if (collection.totalCompartments === 0) return skippedRead(`iam compartment list returned no active compartments, so ${collection.surface} was not called`);
+  if (!collection.readable) {
+    const remaining = collection.deniedCompartments.length > 1 ? ` and ${collection.deniedCompartments.length - 1} more compartment(s)` : "";
+    const cap = collection.truncated ? `; compartment cap hit (${collection.seenCompartments}/${collection.totalCompartments} compartments inspected by ${collection.surface})` : "";
+    return unreadableRead(`${collection.errors[0] ?? `${collection.surface} returned no data`}${remaining}${cap}`);
+  }
+  const scope = `${collection.surface} returned ${collection.items.length} record(s) across ${collection.seenCompartments}/${collection.totalCompartments} compartments`;
+  const detail = [capDetail, partialDetail(collection)].filter(Boolean).join("; ");
+  return detail ? partialRead(`${detail}; ${scope}`) : completeRead(scope);
+}
+
+/** Values derived from one read; every value is null unless the read produced data. */
+function observedValues(outcome: ReadOutcome, values: JsonRecord): JsonRecord {
+  const rendered: JsonRecord = {};
+  for (const [key, value] of Object.entries(values)) rendered[key] = observed(outcome.ok, value);
+  return rendered;
+}
+
+function readEvidence(surface: string, outcome: ReadOutcome, values: JsonRecord): JsonRecord {
+  return { surface, status: outcome.status, ...observedValues(outcome, values) };
+}
+
+function summaryEntry(outcome: ReadOutcome, values: JsonRecord): JsonRecord {
+  return { status: outcome.status, ...observedValues(outcome, values) };
+}
+
+/**
+ * Evidence for a compartment-scoped inventory. Counts are null unless the
+ * inventory produced data; the compartment total and the denied list are kept
+ * when the listing was attempted (they describe the attempt itself, and a
+ * fully denied attempt lists every denied compartment), and null when the
+ * listing was never issued.
+ */
+function scopeEvidence<T>(collection: OciScopedCollection<T>, values: JsonRecord = {}, capDetail?: string): JsonRecord {
+  const outcome = scopeRead(collection, capDetail);
+  const attempted = collection.blockedBy === undefined && collection.totalCompartments > 0;
   return {
     surface: collection.surface,
-    readable: collection.readable,
-    items_seen: collection.items.length,
-    compartments_seen: collection.seenCompartments,
-    compartments_total: collection.totalCompartments,
-    denied_compartments: collection.deniedCompartments.slice(0, 25),
-    compartments_truncated: collection.truncated,
+    status: outcome.status,
+    items_seen: observed(outcome.ok, collection.items.length),
+    compartments_seen: observed(outcome.ok, collection.seenCompartments),
+    compartments_total: observed(attempted, collection.totalCompartments),
+    denied_compartments: observed(attempted, collection.deniedCompartments.slice(0, 25)),
+    compartments_truncated: observed(outcome.ok, collection.truncated),
+    ...observedValues(outcome, values),
   };
+}
+
+/** The compartment scope shared by every scoped inventory in an assessment, for the summary map. */
+function compartmentScope(compartments: OciCollected<JsonRecord>, maxCompartments: number): JsonRecord {
+  const active = activeCompartments(compartments.items);
+  const inspected = Math.min(active.length, maxCompartments);
+  const outcome = !compartments.ok
+    ? unreadableRead(`iam compartment list failed (${compartments.error ?? "no data was returned"})`)
+    : active.length > inspected
+      ? partialRead(`compartment cap ${maxCompartments} hit: ${inspected}/${active.length} active compartments from iam compartment list inspected`)
+      : completeRead(`iam compartment list returned ${active.length} active compartments, all inspected`);
+  return summaryEntry(outcome, { compartments_inspected: inspected, compartments_total: active.length });
 }
 
 async function surface(
@@ -1686,12 +1858,14 @@ export async function checkOciAccess(client: OciAccessClient): Promise<OciAccess
   ]);
 
   const readableCount = surfaces.filter((item) => item.status === "readable").length;
-  const status = readableCount >= 7 ? "healthy" : "limited";
+  const compartmentsReadable = surfaces.some((item) => item.name === "compartments" && item.status === "readable");
+  const status = readableCount >= 7 && compartmentsReadable ? "healthy" : "limited";
   const notes = [
     `Authenticated via ${describeSourceChain(config)}.`,
     `Using OCI config ${config.configFile} profile ${config.profile}.`,
     `${readableCount}/${surfaces.length} OCI audit surfaces are readable.`,
     "Unreadable surfaces render their controls as manual, never pass.",
+    ...(compartmentsReadable ? [] : ["iam compartment list is not readable, so every compartment-scoped control renders manual and the check is limited."]),
   ];
 
   return {
@@ -1822,6 +1996,7 @@ export async function assessOciIdentity(
   let credentialsSeen = 0;
   let credentialCapHit = false;
   let usersInspected = 0;
+  let credentialListingsRead = 0;
   for (const user of activeUsers) {
     const userOcid = asString(user.id);
     if (!userOcid) continue;
@@ -1846,6 +2021,7 @@ export async function assessOciIdentity(
         credentialErrors.push(`${loader.command} (${loader.kind}) for ${userName}: ${collected.error}`);
         continue;
       }
+      credentialListingsRead += 1;
       for (const item of collected.items.filter(isActiveLifecycle)) {
         if (credentialsSeen >= maxKeys) {
           credentialCapHit = true;
@@ -1910,9 +2086,9 @@ export async function assessOciIdentity(
     policySummary = `None of the ${policies.length} active policies contain tenancy-wide manage statements.${policyCapNote}${partialNote(policyScope)}`;
   }
 
-  const activeCompartments = compartments.items.filter(isActiveLifecycle);
-  const nonRootCompartments = activeCompartments.filter((compartment) => asString(compartment.id) !== asString(compartment.compartmentId) && asString(compartment.compartmentId) !== undefined && parentIsCompartment(compartment, activeCompartments));
-  const maxDepth = computeCompartmentDepth(activeCompartments);
+  const liveCompartments = compartments.items.filter(isActiveLifecycle);
+  const nonRootCompartments = liveCompartments.filter((compartment) => asString(compartment.id) !== asString(compartment.compartmentId) && asString(compartment.compartmentId) !== undefined && parentIsCompartment(compartment, liveCompartments));
+  const maxDepth = computeCompartmentDepth(liveCompartments);
   let compartmentStatus: OciFindingStatus;
   let compartmentSummary: string;
   if (!compartments.ok) {
@@ -1926,6 +2102,29 @@ export async function assessOciIdentity(
     compartmentSummary = `${nonRootCompartments.length} active non-root compartments with maximum observed depth ${maxDepth}.`;
   }
 
+  const authPolicyRead = singleRead("iam authentication-policy get", authPolicy);
+  const usersRead = singleRead("iam user list", users, `returned ${users.items.length} users (${activeUsers.length} ACTIVE)`);
+  const compartmentsRead = singleRead("iam compartment list", compartments, `returned ${compartments.items.length} compartments (${liveCompartments.length} ACTIVE)`);
+  const credentialSurfaces = "iam user api-key list, iam customer-secret-key list, iam auth-token list";
+  const credentialCapDetail = credentialCapHit ? `credential cap ${maxKeys} hit after ${credentialsSeen} credentials across ${usersInspected}/${activeUsers.length} ACTIVE users` : undefined;
+  const credentialErrorDetail = credentialErrors.length > 0 ? `${credentialErrors.length} credential listing(s) failed (${credentialErrors[0]})` : undefined;
+  let credentialRead: ReadOutcome;
+  if (!users.ok) {
+    credentialRead = dependentSkipped(usersRead, credentialSurfaces);
+  } else if (activeUsers.length === 0) {
+    credentialRead = vacuousRead(usersRead, "no ACTIVE users, so there were no credentials to list");
+  } else if (credentialListingsRead === 0 && credentialErrors.length === 0) {
+    credentialRead = skippedRead("iam user list returned ACTIVE users without an id, so no credential listing could be issued");
+  } else if (credentialListingsRead === 0) {
+    credentialRead = unreadableRead(`every credential listing failed (${credentialErrors.length}/${credentialErrors.length}): ${credentialErrors[0]}`);
+  } else if (credentialCapDetail || credentialErrorDetail) {
+    credentialRead = partialRead(`${[credentialCapDetail, credentialErrorDetail].filter(Boolean).join("; ")}; ${credentialListingsRead} credential listings returned ${credentialsSeen} ACTIVE credentials`);
+  } else {
+    credentialRead = completeRead(`${credentialListingsRead} credential listings across ${usersInspected} ACTIVE users returned ${credentialsSeen} ACTIVE credentials`);
+  }
+  const policyCapDetail = policyCapHit ? `policy cap ${maxPolicies} hit: ${policies.length}/${activePolicies.length} ACTIVE policies judged` : undefined;
+  const policiesRead = scopeRead(policyScope, policyCapDetail);
+
   const findings = [
     finding(
       "OCI-IAM-01",
@@ -1934,7 +2133,10 @@ export async function assessOciIdentity(
       passwordStatus,
       passwordSummary,
       ["FedRAMP IA-5", "CMMC L2 3.5.7", "SOC 2 CC6.1", "CIS OCI 1.1", "PCI-DSS 8.3.6", "STIG SRG-APP-000166", "IRAP ISM-0421", "ISMAP AM-03"],
-      { password_policy: passwordPolicy ?? null, source: OCI_SURFACE_DOCS.authenticationPolicy.rest },
+      {
+        authentication_policy: readEvidence("iam authentication-policy get", authPolicyRead, { password_policy: passwordPolicy ?? null }),
+        source: OCI_SURFACE_DOCS.authenticationPolicy.rest,
+      },
     ),
     finding(
       "OCI-IAM-06",
@@ -1952,7 +2154,14 @@ export async function assessOciIdentity(
       mfaStatus,
       mfaSummary,
       ["FedRAMP IA-2(1)", "CMMC L2 3.5.3", "SOC 2 CC6.1", "CIS OCI 1.2", "PCI-DSS 8.4.2", "STIG SRG-APP-000149", "IRAP ISM-1401", "ISMAP AM-04"],
-      { active_users: activeUsers.length, console_users: consoleUsers.length, users_without_mfa: usersWithoutMfa.slice(0, 25), users_with_unknown_mfa: usersWithUnknownMfa.slice(0, 25) },
+      {
+        users: readEvidence("iam user list", usersRead, {
+          active_users: activeUsers.length,
+          console_users: consoleUsers.length,
+          users_without_mfa: usersWithoutMfa.slice(0, 25),
+          users_with_unknown_mfa: usersWithUnknownMfa.slice(0, 25),
+        }),
+      },
     ),
     finding(
       "OCI-IAM-03",
@@ -1962,15 +2171,18 @@ export async function assessOciIdentity(
       credentialSummary,
       ["FedRAMP IA-5(1)", "CMMC L2 3.5.8", "SOC 2 CC6.1", "CIS OCI 1.7", "CIS OCI 1.8", "CIS OCI 1.9", "PCI-DSS 8.6.3", "STIG SRG-APP-000174", "IRAP ISM-1590", "ISMAP AM-05"],
       {
-        credentials_seen: credentialsSeen,
-        credential_cap_hit: credentialCapHit,
+        users: readEvidence("iam user list", usersRead, { active_users: activeUsers.length }),
+        credential_listings: readEvidence(credentialSurfaces, credentialRead, {
+          credentials_seen: credentialsSeen,
+          credential_cap_hit: credentialCapHit,
+          credentials_total: credentialCapHit || credentialErrors.length > 0 ? null : credentialsSeen,
+          users_inspected: usersInspected,
+          users_total: activeUsers.length,
+          stale_credentials: staleCredentials.slice(0, 25),
+          undated_credentials: undatedCredentials.slice(0, 25),
+          listing_errors: credentialErrors.slice(0, 10),
+        }),
         credential_cap: maxKeys,
-        credentials_total: credentialCapHit ? null : credentialsSeen,
-        users_inspected: usersInspected,
-        users_total: activeUsers.length,
-        stale_credentials: staleCredentials.slice(0, 25),
-        undated_credentials: undatedCredentials.slice(0, 25),
-        listing_errors: credentialErrors.slice(0, 10),
       },
     ),
     finding(
@@ -1980,7 +2192,15 @@ export async function assessOciIdentity(
       policyStatus,
       policySummary,
       ["FedRAMP AC-6", "CMMC L2 3.1.5", "SOC 2 CC6.3", "CIS OCI 1.14", "PCI-DSS 7.2.1", "STIG SRG-APP-000340", "IRAP ISM-0432", "ISMAP AC-01"],
-      { ...scopeEvidence(policyScope), policy_cap_hit: policyCapHit, policy_cap: maxPolicies, policies_seen: policies.length, policies_total: activePolicies.length, broad_policies: broadPolicies.slice(0, 25).map((policy) => ({ name: policy.name, statements: policy.statements })) },
+      {
+        policies: scopeEvidence(policyScope, {
+          policies_seen: policies.length,
+          policies_total: activePolicies.length,
+          policy_cap_hit: policyCapHit,
+          broad_policies: broadPolicies.slice(0, 25).map((policy) => ({ name: policy.name, statements: policy.statements })),
+        }, policyCapDetail),
+        policy_cap: maxPolicies,
+      },
     ),
     finding(
       "OCI-IAM-05",
@@ -1989,23 +2209,23 @@ export async function assessOciIdentity(
       compartmentStatus,
       compartmentSummary,
       ["FedRAMP AC-4", "CMMC L2 3.13.1", "SOC 2 CC6.1", "CIS OCI 1.3", "PCI-DSS 1.3.1", "STIG SRG-APP-000039", "IRAP ISM-1416", "ISMAP AC-02"],
-      { active_compartments: activeCompartments.length, non_root_compartments: nonRootCompartments.length, max_depth: maxDepth },
+      {
+        compartments: readEvidence("iam compartment list", compartmentsRead, {
+          active_compartments: liveCompartments.length,
+          non_root_compartments: nonRootCompartments.length,
+          max_depth: maxDepth,
+        }),
+      },
     ),
   ];
 
   return {
     title: "OCI identity posture",
     summary: {
-      active_users: activeUsers.length,
-      console_users: consoleUsers.length,
-      users_without_mfa: usersWithoutMfa.length,
-      credentials_seen: credentialsSeen,
-      stale_credentials: staleCredentials.length,
-      undated_credentials: undatedCredentials.length,
-      policies_seen: policies.length,
-      broad_policies: broadPolicies.length,
-      non_root_compartments: nonRootCompartments.length,
-      max_compartment_depth: maxDepth,
+      users: summaryEntry(usersRead, { active_users: activeUsers.length, console_users: consoleUsers.length, users_without_mfa: usersWithoutMfa.length }),
+      credential_listings: summaryEntry(credentialRead, { credentials_seen: credentialsSeen, stale_credentials: staleCredentials.length, undated_credentials: undatedCredentials.length }),
+      policies: summaryEntry(policiesRead, { policies_seen: policies.length, broad_policies: broadPolicies.length }),
+      compartments: summaryEntry(compartmentsRead, { non_root_compartments: nonRootCompartments.length, max_compartment_depth: maxDepth }),
       collection_errors: errors.length,
     },
     findings,
@@ -2192,6 +2412,15 @@ export async function assessOciLoggingDetection(
     ruleSummary = `${criticalRules.length} enabled ACTIVE rules reference identity, policy, or network event types.${partialNote(ruleScope)}`;
   }
 
+  const cloudGuardRead = singleRead("cloud-guard configuration get", cloudGuardConfig);
+  const targetsRead = singleRead("cloud-guard target list", targets, `returned ${targets.items.length} targets (${activeTargets.length} ACTIVE)`);
+  const problemsRead = singleRead("cloud-guard problem list", problems, `returned ${problems.items.length} problems (${openProblems.length} OPEN)`);
+  const respondersRead = singleRead("cloud-guard responder-recipe list", responderRecipes, `returned ${responderRecipes.items.length} recipes (${activeResponders.length} ACTIVE)`);
+  const auditConfigRead = singleRead("audit config get", auditConfig);
+  const auditEventsRead = singleRead("audit event list", auditEvents, `returned ${auditEvents.items.length} events over ${lookbackDays} days`);
+  const ruleRead = scopeRead(ruleScope);
+  const cloudGuardEvidence = readEvidence("cloud-guard configuration get", cloudGuardRead, { configuration_status: cloudGuardStatus || null });
+
   const findings = [
     finding(
       "OCI-LOG-01",
@@ -2200,7 +2429,10 @@ export async function assessOciLoggingDetection(
       enabledStatus,
       enabledSummary,
       ["FedRAMP SI-4", "CMMC L2 3.14.6", "SOC 2 CC7.2", "CIS OCI 3.1", "PCI-DSS 11.5.1", "STIG SRG-APP-000516", "IRAP ISM-0120", "ISMAP SO-01"],
-      { configuration_status: cloudGuardStatus || null, active_targets: activeTargets.length, total_targets: targets.items.length, targets_readable: targets.ok },
+      {
+        cloud_guard_configuration: cloudGuardEvidence,
+        targets: readEvidence("cloud-guard target list", targetsRead, { active_targets: activeTargets.length, total_targets: targets.items.length }),
+      },
     ),
     finding(
       "OCI-LOG-02",
@@ -2209,7 +2441,10 @@ export async function assessOciLoggingDetection(
       problemStatus,
       problemSummary,
       ["FedRAMP SI-4(5)", "CMMC L2 3.14.7", "SOC 2 CC7.3", "CIS OCI 3.2", "PCI-DSS 11.5.1.1", "STIG SRG-APP-000516", "IRAP ISM-0123", "ISMAP SO-02"],
-      { open_problems: openProblems.length, high_risk_problems: highRiskProblems.length, problems_readable: problems.ok },
+      {
+        problems: readEvidence("cloud-guard problem list", problemsRead, { open_problems: openProblems.length, high_risk_problems: highRiskProblems.length }),
+        cloud_guard_configuration: cloudGuardEvidence,
+      },
     ),
     finding(
       "OCI-LOG-03",
@@ -2218,7 +2453,14 @@ export async function assessOciLoggingDetection(
       responderStatus,
       responderSummary,
       ["FedRAMP IR-4", "CMMC L2 3.6.1", "SOC 2 CC7.4", "CIS OCI 3.3", "PCI-DSS 12.10.5", "STIG SRG-APP-000516", "IRAP ISM-0125", "ISMAP IR-01"],
-      { active_responder_recipes: activeResponders.length, active_recipes_with_enabled_rules: activeRespondersWithRules.length, total_responder_recipes: responderRecipes.items.length },
+      {
+        responder_recipes: readEvidence("cloud-guard responder-recipe list", respondersRead, {
+          active_responder_recipes: activeResponders.length,
+          active_recipes_with_enabled_rules: activeRespondersWithRules.length,
+          total_responder_recipes: responderRecipes.items.length,
+        }),
+        cloud_guard_configuration: cloudGuardEvidence,
+      },
     ),
     finding(
       "OCI-LOG-06",
@@ -2227,7 +2469,11 @@ export async function assessOciLoggingDetection(
       retentionStatus,
       retentionSummary,
       ["FedRAMP AU-11", "CMMC L2 3.3.1", "SOC 2 CC7.2", "CIS OCI 3.4", "PCI-DSS 10.7.1", "STIG SRG-APP-000515", "IRAP ISM-0859", "ISMAP LG-01"],
-      { retention_period_days: retentionDays ?? null, required_days: AUDIT_RETENTION_REQUIRED_DAYS, source: OCI_SURFACE_DOCS.auditConfiguration.rest },
+      {
+        audit_configuration: readEvidence("audit config get", auditConfigRead, { retention_period_days: retentionDays ?? null }),
+        required_days: AUDIT_RETENTION_REQUIRED_DAYS,
+        source: OCI_SURFACE_DOCS.auditConfiguration.rest,
+      },
     ),
     finding(
       "OCI-LOG-04",
@@ -2236,7 +2482,11 @@ export async function assessOciLoggingDetection(
       eventStatus,
       eventSummary,
       [],
-      { audit_events: auditEvents.items.length, dated_audit_events: datedEvents.length, lookback_days: lookbackDays, role: "supporting evidence for control 11; not a spec control, so no framework mappings" },
+      {
+        audit_events: readEvidence("audit event list", auditEventsRead, { audit_events: auditEvents.items.length, dated_audit_events: datedEvents.length }),
+        lookback_days: lookbackDays,
+        role: "supporting evidence for control 11; not a spec control, so no framework mappings",
+      },
     ),
     finding(
       "OCI-LOG-05",
@@ -2245,21 +2495,20 @@ export async function assessOciLoggingDetection(
       ruleStatus,
       ruleSummary,
       ["FedRAMP AU-12", "CMMC L2 3.3.1", "SOC 2 CC7.2", "CIS OCI 3.5", "PCI-DSS 10.6.1", "STIG SRG-APP-000492", "IRAP ISM-0580", "ISMAP LG-02"],
-      { ...scopeEvidence(ruleScope), enabled_rules: enabledRules.length, critical_event_rules: criticalRules.length },
+      { event_rules: scopeEvidence(ruleScope, { enabled_rules: enabledRules.length, critical_event_rules: criticalRules.length }) },
     ),
   ];
 
   return {
     title: "OCI logging and detection posture",
     summary: {
-      cloud_guard_status: cloudGuardStatus || "unknown",
-      active_cloud_guard_targets: activeTargets.length,
-      open_cloud_guard_problems: openProblems.length,
-      high_risk_cloud_guard_problems: highRiskProblems.length,
-      active_responder_recipes: activeResponders.length,
-      audit_retention_days: retentionDays ?? "unknown",
-      audit_events: datedEvents.length,
-      critical_event_rules: criticalRules.length,
+      cloud_guard_configuration: summaryEntry(cloudGuardRead, { configuration_status: cloudGuardStatus || null }),
+      targets: summaryEntry(targetsRead, { active_cloud_guard_targets: activeTargets.length }),
+      problems: summaryEntry(problemsRead, { open_cloud_guard_problems: openProblems.length, high_risk_cloud_guard_problems: highRiskProblems.length }),
+      responder_recipes: summaryEntry(respondersRead, { active_responder_recipes: activeResponders.length }),
+      audit_configuration: summaryEntry(auditConfigRead, { audit_retention_days: retentionDays ?? null }),
+      audit_events: summaryEntry(auditEventsRead, { audit_events: datedEvents.length }),
+      event_rules: summaryEntry(ruleRead, { critical_event_rules: criticalRules.length }),
       collection_errors: errors.length,
     },
     findings,
@@ -2349,11 +2598,13 @@ export async function assessOciTenancyGuardrails(
 
   const permissiveNsgRules: Array<{ nsgId: string; ruleId?: string; source?: string; isValid?: boolean }> = [];
   let nsgRuleErrors = 0;
+  let nsgRuleReads = 0;
   let nsgRulesSeen = 0;
   let nsgInvalidRules = 0;
   for (const nsg of nsgs.items) {
     const nsgId = asString(nsg.id);
     if (!nsgId) continue;
+    nsgRuleReads += 1;
     const rules = await collect(() => client.listNetworkSecurityGroupRules(nsgId));
     if (!rules.ok) {
       nsgRuleErrors += 1;
@@ -2412,13 +2663,26 @@ export async function assessOciTenancyGuardrails(
       : enabledGateways.length > 0
         ? `${enabledGateways.length}/${internetGateways.items.length} internet gateways have isEnabled=true; review the attached subnets' security lists and route tables.${partialNote(internetGateways)}`
         : `${internetGateways.items.length} internet gateways exist but none has isEnabled=true.${partialNote(internetGateways)}`;
-  const securityListWitnessEvidence = {
-    security_lists_readable: securityLists.readable,
-    security_lists_seen: securityLists.items.length,
-    security_lists_partial: isPartial(securityLists),
-    security_lists_denied_compartments: securityLists.deniedCompartments.slice(0, 25),
-    security_lists_compartments_truncated: securityLists.truncated,
+  /**
+   * The security list inventory is consulted only on the vacuous-empty path;
+   * a verdict from a populated NSG or gateway inventory does not read it, so
+   * the evidence carries a `role` saying so (with no counts beside it) instead
+   * of an unrelated inventory's collection state.
+   */
+  const securityListWitnessEvidence = (primary: OciScopedCollection<JsonRecord>, restsOn: string): JsonRecord => {
+    if (!primary.readable) return { surface: securityLists.surface, role: `not consulted: ${primary.surface} produced no readable inventory, so the vacuous-empty check was not reached` };
+    if (primary.items.length > 0) return { surface: securityLists.surface, role: `not consulted: ${primary.surface} returned ${primary.items.length} record(s), so the verdict rests on ${restsOn}` };
+    return { ...scopeEvidence(securityLists), role: `consulted: ${primary.surface} returned no records, so the vacuous-empty verdict rests on this inventory being readable and complete` };
   };
+  const nsgRulesRead = dependentRead(
+    "network nsg rules list",
+    scopeRead(nsgs),
+    "no network security groups, so there were no rules to read",
+    nsgRuleReads,
+    nsgRuleErrors,
+    errors.find((entry) => entry.startsWith("network nsg rules list")),
+    `returned ${nsgRulesSeen} INGRESS rules across ${nsgRuleReads} NSGs`,
+  );
 
   const weakBastions: Array<{ bastionId: string; maxSessionTtlInSeconds?: number; clientCidrBlockAllowList?: unknown[] }> = [];
   const exposedBastions: Array<{ bastionId: string; maxSessionTtlInSeconds?: number; clientCidrBlockAllowList?: unknown[] }> = [];
@@ -2426,9 +2690,13 @@ export async function assessOciTenancyGuardrails(
   const undatedSessions: Array<{ bastionId: string; sessionId?: string }> = [];
   let bastionGetErrors = 0;
   let sessionListErrors = 0;
-  for (const bastionSummary of bastions.items.filter(isActiveLifecycle)) {
+  let bastionDetailReads = 0;
+  let sessionListReads = 0;
+  const activeBastions = bastions.items.filter(isActiveLifecycle);
+  for (const bastionSummary of activeBastions) {
     const bastionId = asString(bastionSummary.id);
     if (!bastionId) continue;
+    bastionDetailReads += 1;
     const detail = await collect(async () => {
       const bastion = await client.getBastion(bastionId);
       return bastion ? [bastion] : [];
@@ -2448,6 +2716,7 @@ export async function assessOciTenancyGuardrails(
         weakBastions.push({ bastionId, maxSessionTtlInSeconds: ttl, clientCidrBlockAllowList: allowList.slice(0, 10) });
       }
     }
+    sessionListReads += 1;
     const sessions = await collect(() => client.listBastionSessions(bastionId));
     if (!sessions.ok) {
       sessionListErrors += 1;
@@ -2486,7 +2755,12 @@ export async function assessOciTenancyGuardrails(
   let keyListErrors = 0;
   let versionListErrors = 0;
   let keyDetailErrors = 0;
-  for (const vault of vaults.items.filter(isActiveLifecycle)) {
+  let keyListReads = 0;
+  let keyDetailReads = 0;
+  let versionListReads = 0;
+  const activeVaults = vaults.items.filter(isActiveLifecycle);
+  for (const vault of activeVaults) {
+    keyListReads += 1;
     const keys = await collect(() => client.listKeys(vault));
     if (!keys.ok) {
       keyListErrors += 1;
@@ -2508,6 +2782,7 @@ export async function assessOciTenancyGuardrails(
         errors.push(`kms management key get skipped: a KeySummary in vault ${label.vault ?? "unknown"} had no id.`);
         continue;
       }
+      keyDetailReads += 1;
       const detail = await collect(async () => {
         const record = await client.getKey(vault, keyId);
         return record ? [record] : [];
@@ -2521,6 +2796,7 @@ export async function assessOciTenancyGuardrails(
         const verdict = judgeKeyShape(shape);
         if (verdict) weakKeys.push({ ...label, ...verdict });
       }
+      versionListReads += 1;
       const versions = await collect(() => client.listKeyVersions(vault, keyId));
       if (!versions.ok) {
         versionListErrors += 1;
@@ -2577,6 +2853,7 @@ export async function assessOciTenancyGuardrails(
   let bucketCapHit = false;
   let bucketGetErrors = 0;
   let parListErrors = 0;
+  let parListReads = 0;
   const namespace = await collect(async () => {
     const value = await client.getObjectStorageNamespace();
     return value ? [value] : [];
@@ -2609,6 +2886,7 @@ export async function assessOciTenancyGuardrails(
           publicBuckets.push({ bucket: bucketName, publicAccessType: access });
         }
       }
+      parListReads += 1;
       const pars = await collect(() => client.listPreauthenticatedRequests(namespaceName, bucketName));
       if (!pars.ok) {
         parListErrors += 1;
@@ -2639,6 +2917,80 @@ export async function assessOciTenancyGuardrails(
       ? `Manual: no buckets exist in the ${buckets.seenCompartments} inspected compartments; confirm Object Storage is out of scope.${partialNote(buckets)}`
       : `${bucketsSeen} buckets inspected: ${publicBuckets.length} with publicAccessType other than NoPublicAccess, ${longLivedPars.length} PARs expiring more than ${PAR_LONG_LIVED_DAYS} days out, ${undatedPars.length} PARs without timeExpires, ${bucketGetErrors} os bucket get reads and ${parListErrors} os preauth-request list reads failed.${bucketCapHit ? ` Bucket cap ${maxBuckets} hit: ${bucketsSeen}/${buckets.items.length} buckets inspected; a pass verdict is withheld.` : ""}${partialNote(buckets)}`;
 
+  const firstError = (prefix: string) => errors.find((entry) => entry.startsWith(prefix));
+  const bastionsRead = scopeRead(bastions);
+  const bastionDetailRead = dependentRead(
+    "bastion bastion get",
+    bastionsRead,
+    "no ACTIVE bastions, so there were no details to read",
+    bastionDetailReads,
+    bastionGetErrors,
+    firstError("bastion bastion get"),
+    `returned ${bastionDetailReads - bastionGetErrors}/${bastionDetailReads} ACTIVE bastions`,
+  );
+  const sessionsRead = dependentRead(
+    "bastion session list",
+    bastionsRead,
+    "no ACTIVE bastions, so there were no sessions to list",
+    sessionListReads,
+    sessionListErrors,
+    firstError("bastion session list"),
+    `returned sessions for ${sessionListReads - sessionListErrors}/${sessionListReads} ACTIVE bastions`,
+  );
+  const vaultsRead = scopeRead(vaults);
+  const keyCapDetail = keyCapHit ? `key cap ${maxKeys} hit: ${keysSeen}/${keysTotal} ENABLED keys inspected` : undefined;
+  let keysRead: ReadOutcome;
+  if (!vaultsRead.ok) {
+    keysRead = dependentSkipped(vaultsRead, "kms management key list");
+  } else if (keyListReads === 0) {
+    keysRead = vacuousRead(vaultsRead, "no ACTIVE vaults, so there were no keys to list");
+  } else if (keyListErrors >= keyListReads) {
+    keysRead = unreadableRead(`kms management key list failed for every vault (${keyListErrors}/${keyListReads}): ${firstError("kms management key list") ?? "no data was returned"}`);
+  } else if (keyListErrors > 0 || keyCapDetail) {
+    const listDetail = keyListErrors > 0 ? `kms management key list failed for ${keyListErrors}/${keyListReads} vaults (${firstError("kms management key list") ?? "see errors"})` : undefined;
+    keysRead = partialRead(`${[keyCapDetail, listDetail].filter(Boolean).join("; ")}; ${keysTotal} ENABLED keys listed across ${keyListReads - keyListErrors} vaults`);
+  } else {
+    keysRead = inheritPartial(vaultsRead, completeRead(`kms management key list returned ${keysTotal} ENABLED keys across ${keyListReads} vaults`));
+  }
+  const keyDetailRead = dependentRead(
+    "kms management key get",
+    keysRead,
+    "no ENABLED keys, so there were no key details to read",
+    keyDetailReads,
+    keyDetailErrors,
+    firstError("kms management key get"),
+    `returned keyShape for ${keysJudged}/${keyDetailReads} ENABLED keys`,
+  );
+  const keyVersionsRead = dependentRead(
+    "kms management key-version list",
+    keysRead,
+    "no ENABLED keys, so there were no key versions to list",
+    versionListReads,
+    versionListErrors,
+    firstError("kms management key-version list"),
+    `returned versions for ${versionListReads - versionListErrors}/${versionListReads} ENABLED keys`,
+  );
+  const bucketCapDetail = bucketCapHit ? `bucket cap ${maxBuckets} hit: ${bucketsSeen}/${buckets.items.length} buckets inspected` : undefined;
+  const bucketsRead = scopeRead(buckets, bucketCapDetail);
+  const bucketDetailRead = dependentRead(
+    "os bucket get",
+    bucketsRead,
+    "no buckets, so there were no details to read",
+    bucketsSeen,
+    bucketGetErrors,
+    firstError("os bucket get"),
+    `returned ${bucketsSeen - bucketGetErrors}/${bucketsSeen} inspected buckets`,
+  );
+  const parsRead = dependentRead(
+    "os preauth-request list",
+    bucketsRead,
+    "no buckets, so there were no pre-authenticated requests to list",
+    parListReads,
+    parListErrors,
+    firstError("os preauth-request list"),
+    `returned pre-authenticated requests for ${parListReads - parListErrors}/${parListReads} inspected buckets`,
+  );
+
   const findings = [
     finding(
       "OCI-GRD-01",
@@ -2647,7 +2999,11 @@ export async function assessOciTenancyGuardrails(
       securityListStatus,
       securityListSummary,
       ["FedRAMP SC-7", "CMMC L2 3.13.1", "SOC 2 CC6.6", "CIS OCI 2.1", "PCI-DSS 1.3.1", "STIG SRG-APP-000142", "IRAP ISM-1416", "ISMAP NW-01"],
-      { ...scopeEvidence(securityLists), permissive_security_lists: permissiveSecurityLists.slice(0, 25).map((item) => asString(item.id) ?? asString(item.displayName)) },
+      {
+        security_lists: scopeEvidence(securityLists, {
+          permissive_security_lists: permissiveSecurityLists.slice(0, 25).map((item) => asString(item.id) ?? asString(item.displayName)),
+        }),
+      },
     ),
     finding(
       "OCI-GRD-02",
@@ -2656,7 +3012,16 @@ export async function assessOciTenancyGuardrails(
       nsgStatus,
       nsgSummary,
       ["FedRAMP SC-7", "CMMC L2 3.13.1", "SOC 2 CC6.6", "CIS OCI 2.2", "PCI-DSS 1.3.2", "STIG SRG-APP-000142", "IRAP ISM-1416", "ISMAP NW-01"],
-      { ...scopeEvidence(nsgs), ...securityListWitnessEvidence, nsg_rules_seen: nsgRulesSeen, nsg_rules_is_valid_false: nsgInvalidRules, permissive_nsg_rules: permissiveNsgRules.slice(0, 25), nsg_rule_errors: nsgRuleErrors },
+      {
+        nsgs: scopeEvidence(nsgs),
+        nsg_rules: readEvidence("network nsg rules list", nsgRulesRead, {
+          nsg_rules_seen: nsgRulesSeen,
+          nsg_rules_is_valid_false: nsgInvalidRules,
+          permissive_nsg_rules: permissiveNsgRules.slice(0, 25),
+          nsg_rule_errors: nsgRuleErrors,
+        }),
+        security_list_witness: securityListWitnessEvidence(nsgs, "network nsg rules list"),
+      },
     ),
     finding(
       "OCI-GRD-03",
@@ -2665,7 +3030,12 @@ export async function assessOciTenancyGuardrails(
       gatewayStatus,
       gatewaySummary,
       ["FedRAMP SC-7(5)", "CMMC L2 3.13.6", "SOC 2 CC6.6", "CIS OCI 2.3", "PCI-DSS 1.3.1", "STIG SRG-APP-000383", "IRAP ISM-1417", "ISMAP NW-02"],
-      { ...scopeEvidence(internetGateways), ...securityListWitnessEvidence, enabled_internet_gateways: enabledGateways.slice(0, 25).map((gateway) => asString(gateway.id)) },
+      {
+        internet_gateways: scopeEvidence(internetGateways, {
+          enabled_internet_gateways: enabledGateways.slice(0, 25).map((gateway) => asString(gateway.id)),
+        }),
+        security_list_witness: securityListWitnessEvidence(internetGateways, "the isEnabled flag of every listed gateway"),
+      },
     ),
     finding(
       "OCI-GRD-04",
@@ -2674,7 +3044,19 @@ export async function assessOciTenancyGuardrails(
       bastionStatus,
       bastionSummary,
       ["FedRAMP AC-17", "FedRAMP AC-17(1)", "CMMC L2 3.1.12", "SOC 2 CC6.1", "SOC 2 CC6.2", "CIS OCI 2.8", "CIS OCI 2.9", "PCI-DSS 8.6.1", "STIG SRG-APP-000190", "IRAP ISM-1506", "ISMAP AC-03"],
-      { ...scopeEvidence(bastions), exposed_bastions: exposedBastions.slice(0, 25), weak_bastions: weakBastions.slice(0, 25), long_running_sessions: longRunningSessions.slice(0, 25), undated_sessions: undatedSessions.slice(0, 25), detail_errors: bastionDetailErrors, bastion_get_errors: bastionGetErrors, session_list_errors: sessionListErrors },
+      {
+        bastions: scopeEvidence(bastions, { active_bastions: activeBastions.length }),
+        bastion_details: readEvidence("bastion bastion get", bastionDetailRead, {
+          exposed_bastions: exposedBastions.slice(0, 25),
+          weak_bastions: weakBastions.slice(0, 25),
+          bastion_get_errors: bastionGetErrors,
+        }),
+        bastion_sessions: readEvidence("bastion session list", sessionsRead, {
+          long_running_sessions: longRunningSessions.slice(0, 25),
+          undated_sessions: undatedSessions.slice(0, 25),
+          session_list_errors: sessionListErrors,
+        }),
+      },
     ),
     finding(
       "OCI-GRD-05",
@@ -2684,20 +3066,20 @@ export async function assessOciTenancyGuardrails(
       keySummary,
       ["FedRAMP SC-12(1)", "FedRAMP SC-13", "CMMC L2 3.13.10", "CMMC L2 3.13.11", "SOC 2 CC6.1", "CIS OCI 4.1", "CIS OCI 4.2", "PCI-DSS 3.6.4", "PCI-DSS 3.6.1", "STIG SRG-APP-000514", "IRAP ISM-0490", "IRAP ISM-0457", "ISMAP CR-01", "ISMAP CR-02"],
       {
-        ...scopeEvidence(vaults),
-        keys_total: keysTotal,
-        keys_seen: keysSeen,
-        keys_judged: keysJudged,
+        vaults: scopeEvidence(vaults, { active_vaults: activeVaults.length }),
+        keys: readEvidence("kms management key list", keysRead, {
+          keys_total: keysTotal,
+          keys_seen: keysSeen,
+          key_cap_hit: keyCapHit,
+          key_list_errors: keyListErrors,
+          weak_keys: weakKeys.slice(0, 25),
+          undated_keys: undatedKeys.slice(0, 25),
+        }),
+        key_details: readEvidence("kms management key get", keyDetailRead, { keys_judged: keysJudged, key_detail_errors: keyDetailErrors }),
+        key_versions: readEvidence("kms management key-version list", keyVersionsRead, { key_version_list_errors: versionListErrors }),
         key_cap: maxKeys,
-        key_cap_hit: keyCapHit,
-        key_detail_errors: keyDetailErrors,
-        key_read_errors: keyReadErrors,
-        key_list_errors: keyListErrors,
-        key_version_list_errors: versionListErrors,
         length_floor_bytes: { ...KEY_MIN_LENGTH_BYTES },
         ecdsa_accepted_curves: [...ECDSA_ACCEPTED_CURVES],
-        weak_keys: weakKeys.slice(0, 25),
-        undated_keys: undatedKeys.slice(0, 25),
         source: OCI_SURFACE_DOCS.keyDetail.rest,
       },
     ),
@@ -2708,24 +3090,31 @@ export async function assessOciTenancyGuardrails(
       bucketStatus,
       bucketSummary,
       ["FedRAMP AC-3", "CMMC L2 3.1.1", "CMMC L2 3.1.2", "SOC 2 CC6.1", "CIS OCI 5.1", "CIS OCI 5.2", "PCI-DSS 1.3.6", "PCI-DSS 7.2.2", "STIG SRG-APP-000033", "IRAP ISM-0405", "ISMAP DS-01", "ISMAP DS-02"],
-      { ...scopeEvidence(buckets), buckets_seen: bucketsSeen, buckets_total: buckets.items.length, bucket_cap: maxBuckets, bucket_cap_hit: bucketCapHit, public_buckets: publicBuckets.slice(0, 25), long_lived_pars: longLivedPars.slice(0, 25), undated_pars: undatedPars.slice(0, 25), detail_errors: bucketDetailErrors, bucket_get_errors: bucketGetErrors, par_list_errors: parListErrors },
+      {
+        buckets: scopeEvidence(buckets, { buckets_seen: bucketsSeen, buckets_total: buckets.items.length, bucket_cap_hit: bucketCapHit }, bucketCapDetail),
+        bucket_details: readEvidence("os bucket get", bucketDetailRead, { public_buckets: publicBuckets.slice(0, 25), bucket_get_errors: bucketGetErrors }),
+        pars: readEvidence("os preauth-request list", parsRead, {
+          long_lived_pars: longLivedPars.slice(0, 25),
+          undated_pars: undatedPars.slice(0, 25),
+          par_list_errors: parListErrors,
+        }),
+        bucket_cap: maxBuckets,
+      },
     ),
   ];
 
   return {
     title: "OCI tenancy guardrails",
     summary: {
-      compartments_inspected: securityLists.seenCompartments,
-      compartments_total: securityLists.totalCompartments,
-      permissive_security_lists: permissiveSecurityLists.length,
-      permissive_nsg_rules: permissiveNsgRules.length,
-      enabled_internet_gateways: enabledGateways.length,
-      exposed_bastions: exposedBastions.length,
-      weak_bastions: weakBastions.length,
-      long_running_sessions: longRunningSessions.length,
-      weak_vault_keys: weakKeys.length,
-      public_buckets: publicBuckets.length,
-      long_lived_pars: longLivedPars.length,
+      compartments: compartmentScope(compartments, maxCompartments),
+      security_lists: summaryEntry(scopeRead(securityLists), { permissive_security_lists: permissiveSecurityLists.length }),
+      nsg_rules: summaryEntry(nsgRulesRead, { permissive_nsg_rules: permissiveNsgRules.length }),
+      internet_gateways: summaryEntry(scopeRead(internetGateways), { enabled_internet_gateways: enabledGateways.length }),
+      bastion_details: summaryEntry(bastionDetailRead, { exposed_bastions: exposedBastions.length, weak_bastions: weakBastions.length }),
+      bastion_sessions: summaryEntry(sessionsRead, { long_running_sessions: longRunningSessions.length }),
+      keys: summaryEntry(keysRead, { weak_vault_keys: weakKeys.length }),
+      bucket_details: summaryEntry(bucketDetailRead, { public_buckets: publicBuckets.length }),
+      pars: summaryEntry(parsRead, { long_lived_pars: longLivedPars.length }),
       collection_errors: errors.length,
     },
     findings,
@@ -2793,6 +3182,7 @@ export async function assessOciComputeAndStorage(
   };
   const blockVolumes = judgeVolumes(volumes, "block volumes");
   const boot = judgeVolumes(bootVolumes, "boot volumes");
+  const availabilityDomainsRead = singleRead("iam availability-domain list", availabilityDomains, `returned ${adNames.length} availability domain(s)`);
 
   const findings = [
     finding(
@@ -2802,7 +3192,13 @@ export async function assessOciComputeAndStorage(
       imdsStatus,
       imdsSummary,
       ["FedRAMP CM-7", "CMMC L2 3.4.7", "SOC 2 CC6.1", "CIS OCI 2.10", "PCI-DSS 2.2.1", "STIG SRG-APP-000141", "IRAP ISM-1418", "ISMAP CM-01"],
-      { ...scopeEvidence(instances), live_instances: liveInstances.length, legacy_imds_instances: legacyImdsInstances.slice(0, 25).map((instance) => asString(instance.id) ?? asString(instance.displayName)), source: OCI_SURFACE_DOCS.instances.rest },
+      {
+        instances: scopeEvidence(instances, {
+          live_instances: liveInstances.length,
+          legacy_imds_instances: legacyImdsInstances.slice(0, 25).map((instance) => asString(instance.id) ?? asString(instance.displayName)),
+        }),
+        source: OCI_SURFACE_DOCS.instances.rest,
+      },
     ),
     finding(
       "OCI-CMP-02",
@@ -2811,7 +3207,10 @@ export async function assessOciComputeAndStorage(
       blockVolumes.status,
       blockVolumes.summary,
       ["FedRAMP SC-28", "CMMC L2 3.13.16", "SOC 2 CC6.1", "CIS OCI 4.3", "PCI-DSS 3.4.1", "STIG SRG-APP-000429", "IRAP ISM-1080", "ISMAP CR-03"],
-      { ...scopeEvidence(volumes), live_volumes: blockVolumes.live, oracle_managed_volumes: blockVolumes.oracleManaged, source: OCI_SURFACE_DOCS.volumes.rest },
+      {
+        volumes: scopeEvidence(volumes, { live_volumes: blockVolumes.live, oracle_managed_volumes: blockVolumes.oracleManaged }),
+        source: OCI_SURFACE_DOCS.volumes.rest,
+      },
     ),
     finding(
       "OCI-CMP-03",
@@ -2820,21 +3219,22 @@ export async function assessOciComputeAndStorage(
       boot.status,
       boot.summary,
       ["FedRAMP SC-28", "CMMC L2 3.13.16", "SOC 2 CC6.1", "CIS OCI 4.3", "PCI-DSS 3.4.1", "STIG SRG-APP-000429", "IRAP ISM-1080", "ISMAP CR-03"],
-      { ...scopeEvidence(bootVolumes), availability_domains: adNames, live_boot_volumes: boot.live, oracle_managed_boot_volumes: boot.oracleManaged, source: OCI_SURFACE_DOCS.bootVolumes.rest },
+      {
+        availability_domains: readEvidence("iam availability-domain list", availabilityDomainsRead, { availability_domains: adNames }),
+        boot_volumes: scopeEvidence(bootVolumes, { live_boot_volumes: boot.live, oracle_managed_boot_volumes: boot.oracleManaged }),
+        source: OCI_SURFACE_DOCS.bootVolumes.rest,
+      },
     ),
   ];
 
   return {
     title: "OCI compute and storage posture",
     summary: {
-      compartments_inspected: instances.seenCompartments,
-      compartments_total: instances.totalCompartments,
-      live_instances: liveInstances.length,
-      legacy_imds_instances: legacyImdsInstances.length,
-      live_block_volumes: blockVolumes.live,
-      oracle_managed_block_volumes: blockVolumes.oracleManaged.length,
-      live_boot_volumes: boot.live,
-      oracle_managed_boot_volumes: boot.oracleManaged.length,
+      compartments: compartmentScope(compartments, maxCompartments),
+      instances: summaryEntry(scopeRead(instances), { live_instances: liveInstances.length, legacy_imds_instances: legacyImdsInstances.length }),
+      volumes: summaryEntry(scopeRead(volumes), { live_block_volumes: blockVolumes.live, oracle_managed_block_volumes: blockVolumes.oracleManaged.length }),
+      availability_domains: summaryEntry(availabilityDomainsRead, { availability_domains: adNames.length }),
+      boot_volumes: summaryEntry(scopeRead(bootVolumes), { live_boot_volumes: boot.live, oracle_managed_boot_volumes: boot.oracleManaged.length }),
       collection_errors: errors.length,
     },
     findings,
@@ -2861,6 +3261,30 @@ function formatAccessCheckText(result: OciAccessCheckResult): string {
   ].join("\n");
 }
 
+function formatSummaryValue(value: unknown): string {
+  if (value === null) return "null";
+  if (typeof value === "number") return String(Number(value.toFixed(2)));
+  if (Array.isArray(value)) return value.length === 0 ? "[]" : value.map(formatSummaryValue).join(", ");
+  return String(value);
+}
+
+/**
+ * Renders one summary entry: a scalar on one line, a read-status entry as its
+ * status line followed by one indented line per value (null values stay
+ * visible as `null` so a reader sees that the read was denied or not issued).
+ */
+function formatSummaryEntry(key: string, value: unknown): string[] {
+  const entry = asObject(value);
+  if (!entry) return [`- ${key}: ${formatSummaryValue(value)}`];
+  const status = typeof entry.status === "string" ? entry.status : undefined;
+  const lines = [status === undefined ? `- ${key}:` : `- ${key}: ${status}`];
+  for (const [field, fieldValue] of Object.entries(entry)) {
+    if (field === "status" && status !== undefined) continue;
+    lines.push(`  - ${field}: ${formatSummaryValue(fieldValue)}`);
+  }
+  return lines;
+}
+
 function formatAssessmentText(result: OciAssessmentResult): string {
   const rows = result.findings.map((item) => [
     item.id,
@@ -2870,7 +3294,7 @@ function formatAssessmentText(result: OciAssessmentResult): string {
     item.summary,
   ]);
   const summary = Object.entries(result.summary)
-    .map(([key, value]) => `- ${key}: ${typeof value === "number" ? Number(value.toFixed(2)) : String(value)}`)
+    .flatMap(([key, value]) => formatSummaryEntry(key, value))
     .join("\n");
   const errorLines = result.errors.length > 0
     ? ["", "Collection errors:", ...result.errors.slice(0, 20).map((error) => `- ${error}`)]
@@ -2979,8 +3403,9 @@ function buildQuickReference(): string {
   return [
     "# OCI Audit Bundle Quick Reference",
     "",
-    "- `core_data/` contains raw OCI CLI JSON snapshots used during this assessment (no credentials are written).",
+    "- `core_data/` contains raw OCI CLI JSON snapshots used during this assessment (no credentials are written); `compartments.json` is a marker object with `records: null` when `iam compartment list` was unreadable.",
     "- `analysis/` contains normalized findings (`findings.json`) and one JSON summary per assessment category.",
+    "- Every count, list, and collection flag in evidence and summaries sits beside a `status` (`complete`, `partial`, `unreadable`, `not collected`) naming the command; values render `null`, never 0, [], or false, when that read was denied or never issued.",
     "- `compliance/` contains the executive summary, unified matrix, and per-framework reports.",
     "- `_errors.log` appears only when some reads fail but the bundle still completes.",
     "- MANUAL findings mark surfaces that were unreadable, out of scope, or not exposed by the API; never treat them as compliant.",
@@ -3007,7 +3432,7 @@ function buildBundleReadme(): string {
     "- `compliance/unified_compliance_matrix.md`: framework mapping matrix",
     "- `compliance/<framework>/*.md`: one report per mapped framework",
     "- `analysis/findings.json` and `analysis/*.json`: normalized findings and assessment details",
-    "- `core_data/*.json`: raw access inventory and compartment snapshot",
+    "- `core_data/*.json`: raw access inventory and compartment snapshot (a `{status, endpoint, error, records: null}` marker when the compartment list was unreadable)",
     "- `metadata.json`: non-secret run metadata (the config file path is redacted; only the profile name is kept)",
     "- `_errors.log`: present only when collection partially failed",
     "",
@@ -3052,7 +3477,7 @@ export async function exportOciAuditBundle(
   const assessments = [identityBundle, loggingDetectionBundle, tenancyGuardrailsBundle, computeStorageBundle];
   const findings = assessments.flatMap((assessment) => assessment.findings);
   const errors = [...new Set(assessments.flatMap((assessment) => assessment.errors))];
-  if (compartments.error) errors.push(scrubErrorText(compartments.error));
+  if (compartments.error) errors.push(redactSensitiveText(compartments.error));
   const targetName = safeDirName(`${config.tenancyOcid}-${config.region}-audit`);
   const outputDir = await nextAvailableAuditDir(outputRoot, targetName);
 
@@ -3061,7 +3486,7 @@ export async function exportOciAuditBundle(
   const bundleAccess: OciAccessCheckResult = {
     ...access,
     notes: access.notes.map((note) => note.replace(/^Using OCI config .* profile /, `Using OCI config ${REDACTED_MARKER} profile `)),
-    surfaces: access.surfaces.map((item) => (item.error === undefined ? item : { ...item, error: scrubErrorText(item.error) })),
+    surfaces: access.surfaces.map((item) => (item.error === undefined ? item : { ...item, error: redactSensitiveText(item.error) })),
   };
   await writeBundleJson(outputDir, "metadata.json", {
     config_file: REDACTED_MARKER,
@@ -3081,7 +3506,7 @@ export async function exportOciAuditBundle(
     },
   });
   await writeBundleJson(outputDir, "core_data/access.json", bundleAccess);
-  await writeBundleJson(outputDir, "core_data/compartments.json", compartments.items.map(projectCompartmentSnapshot));
+  await writeBundleJson(outputDir, "core_data/compartments.json", compartmentSnapshotDocument(compartments));
   await writeBundleJson(outputDir, "analysis/findings.json", findings);
   await writeBundleJson(outputDir, "analysis/identity.json", identityBundle);
   await writeBundleJson(outputDir, "analysis/logging-detection.json", loggingDetectionBundle);
