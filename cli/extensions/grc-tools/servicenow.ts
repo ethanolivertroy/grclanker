@@ -898,13 +898,15 @@ function applyOverlay(base: ConfigOverlay, overlay: ConfigOverlay, source: strin
 
 /**
  * Loads one candidate config file. A default candidate that does not exist is skipped; an explicit
- * path that cannot be read fails with the fixed-text read error (ENOENT included).
+ * path that cannot be read fails with the fixed-text read error (ENOENT included). A file that exists
+ * but holds no YAML mapping (a scalar, a sequence, an empty document) is a config error at any
+ * candidate, never a silent fall-through to the next candidate or the environment.
  */
-function readYamlConfigFile(pathname: string, explicit = false): ConfigOverlay | undefined {
-  if (!explicit && !existsSync(pathname)) return undefined;
+function readYamlConfigFile(pathname: string, explicit = false): ConfigOverlay {
+  if (!explicit && !existsSync(pathname)) return {};
   const parsed = parseConfigFileYaml(pathname, readConfigFileText(pathname));
   const record = asObject(parsed);
-  if (!record) return undefined;
+  if (!record) throw new ServicenowConfigFileError(`Unable to parse ServiceNow config file: ${pathname} must contain a YAML mapping`, "INVALID_YAML");
   const section = asObject(record.servicenow);
   return overlayFromRecord(section ? { ...record, ...section } : record);
 }
@@ -935,14 +937,9 @@ export function resolveServicenowConfiguration(
 
   let overlay: ConfigOverlay = {};
   for (const candidate of configCandidates) {
-    const fileOverlay = readYamlConfigFile(candidate, Boolean(explicitConfigPath));
-    if (fileOverlay) {
-      overlay = applyOverlay(overlay, fileOverlay, `config-file:${candidate}`, sourceChain);
-      break;
-    }
-    if (explicitConfigPath) {
-      throw new ServicenowConfigFileError(`Unable to parse ServiceNow config file: ${candidate} must contain a YAML mapping`, "INVALID_YAML");
-    }
+    if (!explicitConfigPath && !existsSync(candidate)) continue;
+    overlay = applyOverlay(overlay, readYamlConfigFile(candidate, Boolean(explicitConfigPath)), `config-file:${candidate}`, sourceChain);
+    break;
   }
   overlay = applyOverlay(overlay, overlayFromEnv(env), "environment", sourceChain);
   overlay = applyOverlay(overlay, overlayFromRecord({

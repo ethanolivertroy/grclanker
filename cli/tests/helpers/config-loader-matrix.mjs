@@ -41,6 +41,8 @@ export const CONFIG_CANARIES = {
   jsonUnquoted: "hpuW4UpV4EtCNdQ9qY",
   jsonShort: "DC35bwNpKH4",
   jsonTrailingComma: "9GjTEyhTGd6uTguGh3",
+  yamlSequence: "LMVqCdE9Z8jJ3VvdQ4",
+  yamlScalar: "N5BJnVCnk9r6FSZAPt",
 };
 
 assertPlantedValuesWellFormed(assert, CONFIG_CANARIES, [["library wording", LIBRARY_WORDING.join("\n")]]);
@@ -104,6 +106,21 @@ export function configLoaderCases({ format, displayName, fileNoun, extension }) 
     assert.equal(aliasControl.linePos, undefined, "positive control: the ReferenceError has no linePos");
     assert.ok(aliasControl.message.includes(CONFIG_CANARIES.yamlAlias), "positive control: the alias message starts with the alias value");
     cases.push({ name: "yaml unresolved alias", path: aliasPath, expectedMessage: parseMessage(aliasPath, undefined), expectedCode: parseCode });
+
+    // Fourth shape: a document that parses but is not a mapping. yaml.parse returns it without complaint
+    // (positive control), so the loader must refuse it rather than fall through to the environment.
+    const mappingMessage = (path) => `Unable to parse ${displayName} ${fileNoun}: ${path} must contain a YAML mapping`;
+    const sequencePath = join(scratch, `sequence${extension}`);
+    const sequenceText = `- token: ${CONFIG_CANARIES.yamlSequence}\n`;
+    writeFileSync(sequencePath, sequenceText);
+    assert.ok(Array.isArray(parseYaml(sequenceText)), "positive control: a sequence document parses as an array");
+    cases.push({ name: "yaml sequence document", path: sequencePath, expectedMessage: mappingMessage(sequencePath), expectedCode: parseCode });
+
+    const scalarPath = join(scratch, `scalar${extension}`);
+    const scalarText = `${CONFIG_CANARIES.yamlScalar}\n`;
+    writeFileSync(scalarPath, scalarText);
+    assert.equal(parseYaml(scalarText), CONFIG_CANARIES.yamlScalar, "positive control: a scalar document parses as the bare value");
+    cases.push({ name: "yaml scalar document", path: scalarPath, expectedMessage: mappingMessage(scalarPath), expectedCode: parseCode });
   }
 
   if (format === "json") {

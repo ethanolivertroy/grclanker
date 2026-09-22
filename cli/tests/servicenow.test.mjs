@@ -534,7 +534,7 @@ test("resolveServicenowConfiguration rejects missing credentials, missing config
 test("addendum 6b: the YAML config loader reports read and parse failures with fixed text and never quotes the file, the yaml package, or the fs error", async () => {
   const scratch = { cwd: createTempBase("servicenow-loader-cwd-"), homeDir: createTempBase("servicenow-loader-home-") };
   const cases = configLoaderCases({ format: "yaml", displayName: "ServiceNow", fileNoun: "config file", extension: ".yaml" });
-  assert.deepEqual(cases.map((item) => item.name), ["yaml nested mapping", "yaml unresolved alias", "EISDIR", "EACCES", "ENOENT on an explicit path"]);
+  assert.deepEqual(cases.map((item) => item.name), ["yaml nested mapping", "yaml unresolved alias", "yaml sequence document", "yaml scalar document", "EISDIR", "EACCES", "ENOENT on an explicit path"]);
   const registered = [];
   registerServicenowTools({ registerTool: (tool) => registered.push(tool) });
   const checkAccess = registered.find((tool) => tool.name === "servicenow_check_access");
@@ -550,6 +550,20 @@ test("addendum 6b: the YAML config loader reports read and parse failures with f
     assert.equal(error.code, "INVALID_YAML");
     return true;
   });
+  // CodeRabbit (c): a default candidate that exists but is not a mapping is refused too; before, it fell
+  // through to the environment credentials without a word.
+  for (const [shape, text] of [["sequence", "- token: QWJHXVZPKMTRYU1\n"], ["scalar", "QWJHXVZPKMTRYU1\n"], ["empty document", ""]]) {
+    writeFileSync(defaultPath, text);
+    assert.throws(
+      () => resolveServicenowConfiguration({ instance: "acme" }, { SERVICENOW_USERNAME: "svc", SERVICENOW_PASSWORD: "from-env-Password-1234" }, scratch),
+      (error) => {
+        assert.equal(error.message, `Unable to parse ServiceNow config file: ${defaultPath} must contain a YAML mapping`, shape);
+        assert.equal(error.code, "INVALID_YAML");
+        assert.equal(error.message.includes("QWJHXVZPKMTRYU1"), false);
+        return true;
+      },
+    );
+  }
 });
 
 test("ServicenowApiClient shapes Table API queries with basic auth and follows Link pagination to completion", async () => {
