@@ -38,11 +38,16 @@ import { assertSecretsAbsent, readBundleFiles, readZipEntries } from "./helpers/
 import {
   HTML_BODY_NOTE,
   REDACTED_CANARY_URL,
+  SHORT_BODY_CANARY,
+  SHORT_BODY_CONTENT_TYPE,
   assertNoCanaries,
   assertNoCanariesInFiles,
+  assertNoShortBodyFragments,
   assertRedactionCases,
+  assertShortBodyRecordedAsNote,
   htmlCanaryBody,
   jsonCanaryMessage,
+  parserMessageFor,
 } from "./helpers/error-canaries.mjs";
 
 const NOW = new Date("2026-09-21T00:00:00.000Z");
@@ -1966,4 +1971,39 @@ test("config loader errors: a SyntaxError raised by the transport is recorded by
     assert.ok(!text.includes("CANARY-PARSER-SNIPPET") && !/Unexpected token/.test(text), `a slice of the parser's message reached an output: ${text.slice(0, 400)}`);
     assert.ok(text.includes(note), `the output records the parse failure by name: ${text.slice(0, 400)}`);
   }
+});
+
+test("config loader errors: a 200 answer whose body is short non-JSON text is recorded as the non-JSON note only; no 8-character fragment of the body and no parser wording reaches the thrown client error, the access check, an assessment, or the bundle", async () => {
+  // Positive control for the class: V8 quotes the whole source when it is 21 characters or shorter.
+  assert.ok(SHORT_BODY_CANARY.length <= 21 && parserMessageFor(SHORT_BODY_CANARY).includes(SHORT_BODY_CANARY), "the parser's message carries the whole short body");
+
+  const surface = "/api/v2/jobs/";
+  const log = [];
+  const client = aapClient({ ...healthyAapRoutes(), [surface]: () => aapResponse(SHORT_BODY_CANARY, 200, "OK", SHORT_BODY_CONTENT_TYPE) }, log);
+
+  // The thrown client error is fixed text: a scrub at the tool boundary would not protect a caller that logs it.
+  await assert.rejects(() => client.get(surface), (error) => {
+    assert.equal(error.name, "AnsibleApiError");
+    assert.equal(error.status, 200);
+    assert.equal(error.endpoint, surface);
+    assertShortBodyRecordedAsNote(assert, error.message, "thrown client error");
+    assert.equal(error.message, `AAP request failed: ${surface} (200 OK): non-JSON body (${SHORT_BODY_CONTENT_TYPE}, 18 bytes)`);
+    return true;
+  });
+
+  const run = await runEveryAnsibleTool(client, createTempBase("grclanker-ansible-short-body-"));
+  assert.equal(run.accessError, undefined, "the access check completes when a secondary surface fails");
+  assertShortBodyRecordedAsNote(assert, run.access, "check_access");
+  const probe = run.access.surfaces.find((entry) => entry.name === "jobs");
+  assert.ok(probe && probe.status !== "readable", "the jobs probe is not readable");
+  assert.equal(probe.http_status, 200, "the probe records the observed status");
+  assertShortBodyRecordedAsNote(assert, run.assessments[0], `${run.assessments[0].title} assessment`);
+  for (const assessment of run.assessments) assertNoShortBodyFragments(assert, assessment, `${assessment.title} assessment`);
+
+  assert.equal(run.exportError, undefined, "the export completes when a secondary surface fails");
+  const files = readBundleFiles(run.exported.outputDir);
+  for (const [name, text] of files) assertNoShortBodyFragments(assert, text, `bundle ${name}`);
+  for (const [name, text] of readZipEntries(run.exported.zipPath)) assertNoShortBodyFragments(assert, text, `zip ${name}`);
+  assertShortBodyRecordedAsNote(assert, files.get("_errors.log"), "_errors.log");
+  assert.ok(log.some((entry) => entry.path === surface && entry.status === 200), "the 200 answer named in the note was observed");
 });

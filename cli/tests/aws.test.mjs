@@ -1,7 +1,9 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import {
+  chmodSync,
   existsSync,
+  mkdirSync,
   mkdtempSync,
   readdirSync,
   readFileSync,
@@ -49,10 +51,18 @@ import {
   sdkServiceUnavailable,
   sdkThrottled,
   sdkTimeout,
+  shortBodyParseError,
   withSdkRoutes,
 } from "./helpers/aws-sdk-fixture.mjs";
 import { assertSecretsAbsent, readBundleFiles, readZipEntries } from "./helpers/bundle-contents.mjs";
-import { assertRedactionCases } from "./helpers/error-canaries.mjs";
+import {
+  SHORT_BODY_CANARY,
+  SHORT_BODY_CONTENT_TYPE,
+  assertNoShortBodyFragments,
+  assertRedactionCases,
+  assertShortBodyRecordedAsNote,
+  parserMessageFor,
+} from "./helpers/error-canaries.mjs";
 
 function createTempBase(prefix) {
   return mkdtempSync(join(tmpdir(), prefix));
@@ -2391,13 +2401,18 @@ test("rule 9: the aws_check_access tool scrubs the failure of the run's own iden
   }
 });
 
-/** Runs `run` with the shared AWS config and credentials files pointed at fixtures, restoring the environment afterwards. */
+/**
+ * Runs `run` with AWS_SHARED_CREDENTIALS_FILE and AWS_CONFIG_FILE pointed at fixtures, restoring the environment
+ * afterwards. `files.credentials` is either the file's text or a function that prepares the path itself (a
+ * directory, an unreadable file) and returns it.
+ */
 async function withSharedAwsFiles(files, run) {
   const dir = createTempBase("grclanker-aws-creds-");
-  const credentialsFile = join(dir, "credentials");
   const configFile = join(dir, "config");
-  writeFileSync(credentialsFile, files.credentials);
-  writeFileSync(configFile, files.config);
+  writeFileSync(configFile, files.config ?? "");
+  let credentialsFile = join(dir, "credentials");
+  if (typeof files.credentials === "function") credentialsFile = files.credentials(dir);
+  else writeFileSync(credentialsFile, files.credentials);
   const previous = { AWS_SHARED_CREDENTIALS_FILE: process.env.AWS_SHARED_CREDENTIALS_FILE, AWS_CONFIG_FILE: process.env.AWS_CONFIG_FILE, AWS_PROFILE: process.env.AWS_PROFILE };
   process.env.AWS_SHARED_CREDENTIALS_FILE = credentialsFile;
   process.env.AWS_CONFIG_FILE = configFile;
@@ -2412,39 +2427,122 @@ async function withSharedAwsFiles(files, run) {
   }
 }
 
-test("config loader errors: a canary on a malformed line of the AWS_SHARED_CREDENTIALS_FILE never reaches the thrown message or the tool payload, which name only the provider, the SDK error name, and the files to check", async () => {
-  const { registerAwsTools } = await import("../dist/extensions/grc-tools/aws.js");
-  const canary = "CANARY-SHARED-CREDENTIALS-SECRET-31337";
-  // A profile whose secret line is malformed (no "=") and a malformed section header, each carrying the canary.
-  const credentials = ["[audit]", "aws_access_key_id = AKIAEXAMPLE000000001", `aws_secret_access_key ${canary}`, `[${canary}`, ""].join("\n");
-  const config = ["[profile audit]", "region = us-east-1", `output ${canary}`, ""].join("\n");
+const SHARED_CONFIG_CANARY = "CANARY-SHARED-CREDENTIALS-SECRET-31337";
+const SDK_ERROR_NAME_OR_FS_CODE = /^(?:[A-Za-z]+(?:Error|Exception)(?: E[A-Z]+)?|E[A-Z]+)$/;
+/** Node's fs wording ("EISDIR: illegal operation on a directory, read", "EACCES: permission denied, open '<path>'"). */
+const FS_WORDING = /illegal operation|permission denied|no such file|operation not permitted|, open '|, read$|, read /i;
+/** The SDK's own provider messages, which quote profile names and file values. */
+const SDK_PROVIDER_WORDING = /Could not resolve credentials|configuration\/credentials file|Unsupported credential source|invalid SSO credentials|Profile .* could not be found/;
 
-  await withSharedAwsFiles({ credentials, config }, async ({ credentialsFile, configFile }) => {
-    const client = realAwsClient(realAwsConfig({ profile: "audit" }));
-    // The real send(): the provider chain fails while resolving credentials, before any request is signed or sent.
-    await assert.rejects(() => client.getCallerIdentity(), (error) => {
-      assert.ok(error instanceof AwsCredentialProviderError, `the provider failure is wrapped: ${error?.name}: ${error?.message}`);
-      assert.equal(error.name, "AwsCredentialProviderError");
-      assert.equal(error.provider, "fromIni (profile audit)");
-      assert.equal(error.code, "CredentialsProviderError", "the SDK error name is validated and kept as the code");
-      assert.ok(!error.message.includes(canary), `the thrown message carries the canary: ${error.message}`);
-      assert.match(error.message, /^credentials could not be resolved by fromIni \(profile audit\) \(CredentialsProviderError\)\. The provider's message is not recorded/);
-      assert.ok(error.message.includes(credentialsFile) && error.message.includes(configFile), `the message names the files to check: ${error.message}`);
-      return true;
+/** Every path-like token of a message; the only ones allowed are the two documented files. */
+function pathsNamedIn(text) {
+  return [...text.matchAll(/(?:~|\/)[\w.~/-]*[\w~/-]/g)].map((match) => match[0]);
+}
+
+function assertProviderErrorShape(error, { credentialsFile, configFile }, label) {
+  assert.ok(error instanceof AwsCredentialProviderError, `${label}: the provider failure is wrapped: ${error?.name}: ${error?.message}`);
+  assert.equal(error.name, "AwsCredentialProviderError", label);
+  assert.equal(error.provider, "fromIni (profile audit)", label);
+  assert.match(error.code, SDK_ERROR_NAME_OR_FS_CODE, `${label}: the code is an SDK error name or an fs code: ${error.code}`);
+  assert.ok(!error.message.includes(SHARED_CONFIG_CANARY), `${label}: the thrown message carries the canary: ${error.message}`);
+  assert.doesNotMatch(error.message, FS_WORDING, `${label}: fs wording reached the thrown message: ${error.message}`);
+  assert.doesNotMatch(error.message, SDK_PROVIDER_WORDING, `${label}: the provider's own message was interpolated: ${error.message}`);
+  assert.match(error.message, new RegExp(`^credentials could not be resolved by fromIni \\(profile audit\\) \\(${error.code.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\)\\. The provider's message is not recorded`), label);
+  assert.ok(error.message.includes(credentialsFile) && error.message.includes(configFile), `${label}: the message names the files to check: ${error.message}`);
+  for (const named of pathsNamedIn(error.message)) {
+    assert.ok(named === credentialsFile || named === configFile, `${label}: a path other than the two documented files is named: ${named}`);
+  }
+}
+
+/** The shared-config failure shapes; each names the fs positive control or whether the SDK's own message echoes file text. */
+const SHARED_CONFIG_CASES = [
+  {
+    name: "malformed lines carrying the canary",
+    credentials: ["[audit]", "aws_access_key_id = AKIAEXAMPLE000000001", `aws_secret_access_key ${SHARED_CONFIG_CANARY}`, `[${SHARED_CONFIG_CANARY}`, ""].join("\n"),
+    config: ["[profile audit]", "region = us-east-1", `output ${SHARED_CONFIG_CANARY}`, ""].join("\n"),
+    sdkEchoesCanary: false,
+  },
+  {
+    // Positive control: the installed SDK quotes an unsupported credential_source value verbatim, so this is the
+    // shape that proves the wrapper, not the SDK, is what keeps the file's text out of the thrown error.
+    name: "unsupported credential_source value (the SDK echoes it)",
+    credentials: ["[audit]", "role_arn = arn:aws:iam::123456789012:role/audit", `credential_source = ${SHARED_CONFIG_CANARY}`, ""].join("\n"),
+    sdkEchoesCanary: true,
+  },
+  {
+    name: "source_profile naming a missing profile (the SDK echoes it)",
+    credentials: ["[audit]", "role_arn = arn:aws:iam::123456789012:role/audit", `source_profile = ${SHARED_CONFIG_CANARY}`, ""].join("\n"),
+    sdkEchoesCanary: true,
+  },
+  {
+    name: "incomplete SSO profile whose extra key carries the canary (the SDK echoes the keys)",
+    credentials: ["[audit]", "sso_start_url = https://example.awsapps.com/start", `${SHARED_CONFIG_CANARY}_key = 1`, ""].join("\n"),
+    sdkEchoesCanary: true,
+  },
+  {
+    name: "EISDIR: AWS_SHARED_CREDENTIALS_FILE is a directory",
+    credentials: (dir) => {
+      const target = join(dir, "credentials.d");
+      mkdirSync(target);
+      return target;
+    },
+    fsCode: "EISDIR",
+    sdkEchoesCanary: false,
+  },
+  {
+    name: "EACCES: AWS_SHARED_CREDENTIALS_FILE is a mode 000 file",
+    credentials: (dir) => {
+      const target = join(dir, "credentials");
+      writeFileSync(target, ["[audit]", "aws_access_key_id = AKIAEXAMPLE000000001", `aws_secret_access_key = ${SHARED_CONFIG_CANARY}`, ""].join("\n"));
+      chmodSync(target, 0o000);
+      return target;
+    },
+    fsCode: "EACCES",
+    skip: process.getuid?.() === 0 ? "root reads a mode 000 file" : undefined,
+    sdkEchoesCanary: false,
+  },
+];
+
+for (const shape of SHARED_CONFIG_CASES) {
+  test(`config loader errors: ${shape.name}: the thrown client error and the tool payloads name only the provider, an SDK error name or fs code, and the two documented files`, { skip: shape.skip }, async () => {
+    const { registerAwsTools } = await import("../dist/extensions/grc-tools/aws.js");
+    const { fromIni } = await import("@aws-sdk/credential-providers");
+
+    await withSharedAwsFiles(shape, async (files) => {
+      const { credentialsFile } = files;
+      // Positive controls: the fixture really is the failure it claims to be.
+      if (shape.fsCode) assert.throws(() => readFileSync(credentialsFile), { code: shape.fsCode }, `reading the fixture fails with ${shape.fsCode}`);
+      const sdkMessage = await fromIni({ profile: "audit", ignoreCache: true })().then(() => assert.fail("the SDK resolved credentials from the fixture"), (error) => `${error.name}: ${error.message}`);
+      assert.equal(sdkMessage.includes(SHARED_CONFIG_CANARY), shape.sdkEchoesCanary, `the SDK's own message ${shape.sdkEchoesCanary ? "carries" : "does not carry"} the canary: ${sdkMessage}`);
+
+      // The real send(): the provider chain fails while resolving credentials, before any request is signed or sent.
+      const client = realAwsClient(realAwsConfig({ profile: "audit" }));
+      await assert.rejects(() => client.getCallerIdentity(), (error) => {
+        assertProviderErrorShape(error, files, "thrown client error");
+        return true;
+      });
+
+      const registered = [];
+      registerAwsTools({ registerTool: (tool) => registered.push(tool) });
+      for (const name of ["aws_check_access", "aws_assess_identity", "aws_export_audit_bundle"]) {
+        const tool = registered.find((candidate) => candidate.name === name);
+        const payload = await tool.execute("call-1", { region: "us-east-1", profile: "audit", account_id: FIXTURE_ACCOUNT, output_dir: createTempBase("grclanker-aws-creds-export-") });
+        const text = JSON.stringify(payload);
+        assert.ok(!text.includes(SHARED_CONFIG_CANARY), `${name}: the tool payload carries the canary: ${text}`);
+        assert.doesNotMatch(text, FS_WORDING, `${name}: fs wording reached the tool payload: ${text}`);
+        assert.doesNotMatch(text, SDK_PROVIDER_WORDING, `${name}: the provider's own message is interpolated: ${text}`);
+        assert.match(text, /AwsCredentialProviderError: credentials could not be resolved by fromIni \(profile audit\) \((?:[A-Za-z]+(?:Error|Exception)(?: E[A-Z]+)?|E[A-Z]+)\)\. The provider's message is not recorded/, `${name}: the payload names the provider and the SDK error name or fs code only: ${text}`);
+        // The error sentence names the two documented files and nothing else (the payload may name its own output_dir).
+        const sentence = text.match(/AwsCredentialProviderError: credentials could not be resolved[^"]*/)?.[0] ?? "";
+        assert.ok(sentence.includes(credentialsFile) && sentence.includes(files.configFile), `${name}: the payload names the files to check: ${sentence}`);
+        for (const named of pathsNamedIn(sentence)) {
+          assert.ok(named === credentialsFile || named === files.configFile, `${name}: a path other than the two documented files is named: ${named}`);
+        }
+      }
     });
-
-    const registered = [];
-    registerAwsTools({ registerTool: (tool) => registered.push(tool) });
-    for (const name of ["aws_check_access", "aws_assess_identity", "aws_export_audit_bundle"]) {
-      const tool = registered.find((candidate) => candidate.name === name);
-      const payload = await tool.execute("call-1", { region: "us-east-1", profile: "audit", account_id: FIXTURE_ACCOUNT, output_dir: createTempBase("grclanker-aws-creds-export-") });
-      const text = JSON.stringify(payload);
-      assert.ok(!text.includes(canary), `${name}: the tool payload carries the canary: ${text}`);
-      assert.ok(!/Could not resolve credentials|configuration\/credentials file/.test(text), `${name}: the provider's own message is not interpolated: ${text}`);
-      assert.match(text, /AwsCredentialProviderError: credentials could not be resolved by fromIni \(profile audit\) \(CredentialsProviderError\)/, `${name}: the payload names the provider and the SDK error name only: ${text}`);
-    }
   });
-});
+}
+
 
 test("config loader errors: a SyntaxError the SDK raises without attaching the body is recorded by name only, never by the parser's message that quotes the text", async () => {
   const snippet = "<html>CANARY-PARSER-SNIPPET-4242</html>";
@@ -2627,4 +2725,46 @@ test("request matching: every IAM action and HTTP status named in any output cor
   for (const entry of log) {
     assert.equal(entry.region, "us-east-1", `${entry.action}: every request was sent to the configured region`);
   }
+});
+
+test("config loader errors: a 200 answer whose body is short non-JSON text is recorded as the non-JSON note only; no 8-character fragment of the body and no parser wording reaches the thrown client error, the access check, an assessment, or the bundle", async () => {
+  // Positive control for the class: V8 quotes the whole source when it is 21 characters or shorter, and the SDK's error carries that message.
+  assert.ok(SHORT_BODY_CANARY.length <= 21 && parserMessageFor(SHORT_BODY_CANARY).includes(SHORT_BODY_CANARY), "the parser's message carries the whole short body");
+  assert.ok(shortBodyParseError(SHORT_BODY_CANARY).message.includes(SHORT_BODY_CANARY), "the SDK's own error message carries the whole short body");
+
+  const action = "iam:ListUsers";
+  const log = [];
+  const routes = { ...healthySdkRoutes(), [action]: () => { throw shortBodyParseError(SHORT_BODY_CANARY, SHORT_BODY_CONTENT_TYPE); } };
+  const note = `SyntaxError (HTTP 200): non-JSON body (${SHORT_BODY_CONTENT_TYPE}, 18 bytes)`;
+
+  const { outputs, exported } = await withSdkRoutes(routes, log, async () => {
+    const client = realAwsClient();
+    // The thrown client error is fixed text: a scrub at the tool boundary would not protect a caller that logs it.
+    await assert.rejects(() => client.listIamUsers(), (error) => {
+      assert.equal(error.name, "AwsApiError", `the client rethrows the SDK error as fixed text: ${error.name}: ${error.message}`);
+      assert.equal(error.code, "SyntaxError", "the SDK error name is kept as the code");
+      assert.equal(error.httpStatus, 200, "the observed status is kept");
+      assertShortBodyRecordedAsNote(assert, error.message, "thrown client error");
+      assert.equal(error.message, note);
+      assert.equal(isAwsAccessDenied(error), false);
+      return true;
+    });
+    const results = await runAllAssessments(client);
+    return { outputs: results, exported: await exportAwsAuditBundle(client, client.getResolvedConfig(), createTempBase("grclanker-aws-short-body-")) };
+  });
+
+  assertShortBodyRecordedAsNote(assert, outputs.access, "check_access");
+  const probe = outputs.access.surfaces.find((surface) => surface.name === "iam_users");
+  assert.equal(probe.status, "not_readable");
+  assert.equal(probe.error, note, "the probe records the note and the observed status only");
+  assert.equal(probe.http_status, 200);
+  assert.equal(probe.error_code, "SyntaxError");
+  assertShortBodyRecordedAsNote(assert, outputs.identity, "identity assessment");
+  for (const [name, result] of Object.entries(outputs)) assertNoShortBodyFragments(assert, result, `${name} result`);
+
+  const files = readBundleFiles(exported.outputDir);
+  for (const [name, text] of files) assertNoShortBodyFragments(assert, text, `bundle ${name}`);
+  for (const [name, text] of readZipEntries(exported.zipPath)) assertNoShortBodyFragments(assert, text, `zip ${name}`);
+  assertShortBodyRecordedAsNote(assert, files.get("_errors.log"), "_errors.log");
+  assert.ok(log.some((entry) => entry.action === action && entry.status === 200 && entry.code === "SyntaxError"), "the 200 answer named in the note was observed");
 });

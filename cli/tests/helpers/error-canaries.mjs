@@ -49,6 +49,60 @@ export const HTML_BODY_NOTE = /non-JSON body \(text\/html, \d+ bytes\)/;
 /** Matches the redacted form of the canary URL: host and path kept, query replaced. */
 export const REDACTED_CANARY_URL = /https:\/\/api\.example\.com\/v1\/x\?\[REDACTED\]/;
 
+/**
+ * The short-body class (rule 9, config loader errors): V8's JSON.parse quotes a 10-character window around the
+ * failure and the whole source when the input is 21 characters or shorter, so a 200 answer whose body is a short
+ * non-JSON text puts the entire body into the SyntaxError message. The only permitted record of such a body is
+ * the status-and-length note.
+ */
+export const SHORT_BODY_CANARY = "<canary-abc123xyz>";
+export const SHORT_BODY_CONTENT_TYPE = "text/plain";
+export const SHORT_BODY_NOTE = new RegExp(`non-JSON body \\(${SHORT_BODY_CONTENT_TYPE}, ${Buffer.byteLength(SHORT_BODY_CANARY, "utf8")} bytes\\)`);
+
+/** Wording from V8's SyntaxError messages; any of it in an output means a parser message was interpolated. */
+export const PARSER_WORDING = /is not valid JSON|Unexpected token|Unexpected end of JSON|Unexpected non-whitespace|JSON at position|Expected property name|Bad control character/;
+
+/** Positive control for the class: the parser's message really does carry the whole short body. */
+export function parserMessageFor(body) {
+  try {
+    JSON.parse(body);
+  } catch (error) {
+    return error.message;
+  }
+  throw new Error(`${body} parsed as JSON; the fixture must be non-JSON`);
+}
+
+/** A 200 answer whose body is the short canary, served as the content type the note must name. */
+export function shortBodyResponse(status = 200, statusText = "OK") {
+  return new Response(SHORT_BODY_CANARY, { status, statusText, headers: { "content-type": SHORT_BODY_CONTENT_TYPE } });
+}
+
+/** Every window of `length` characters of the body; any longer leaked fragment contains one of them. */
+export function bodyFragments(body = SHORT_BODY_CANARY, length = 8) {
+  const fragments = [];
+  for (let start = 0; start + length <= body.length; start += 1) fragments.push(body.slice(start, start + length));
+  return fragments;
+}
+
+/** Asserts no 8-character fragment of the body and no parser wording reached the value, and that the note did. */
+export function assertShortBodyRecordedAsNote(assert, value, label, body = SHORT_BODY_CANARY) {
+  const text = typeof value === "string" ? value : JSON.stringify(value);
+  for (const fragment of bodyFragments(body)) {
+    assert.ok(!text.includes(fragment), `${label}: body fragment "${fragment}" leaked into ${text.slice(0, 400)}`);
+  }
+  assert.doesNotMatch(text, PARSER_WORDING, `${label}: parser wording leaked into ${text.slice(0, 400)}`);
+  assert.match(text, SHORT_BODY_NOTE, `${label}: the non-JSON note is the record of the body: ${text.slice(0, 400)}`);
+}
+
+/** Same check for a body that must be absent without requiring the note (bundle files that do not record errors). */
+export function assertNoShortBodyFragments(assert, value, label, body = SHORT_BODY_CANARY) {
+  const text = typeof value === "string" ? value : JSON.stringify(value);
+  for (const fragment of bodyFragments(body)) {
+    assert.ok(!text.includes(fragment), `${label}: body fragment "${fragment}" leaked into ${text.slice(0, 400)}`);
+  }
+  assert.doesNotMatch(text, PARSER_WORDING, `${label}: parser wording leaked into ${text.slice(0, 400)}`);
+}
+
 export function assertNoCanaries(assert, value, label) {
   const text = typeof value === "string" ? value : JSON.stringify(value);
   for (const canary of CANARY_VALUES) {

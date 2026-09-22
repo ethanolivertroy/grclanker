@@ -263,6 +263,28 @@ export function proxyHtmlError() {
   return error;
 }
 
+/**
+ * The error the SDK deserializer raises for a 200 answer whose body is a short non-JSON text (a proxy's
+ * interstitial, a placeholder page): V8 quotes the whole source when it is 21 characters or shorter, so the
+ * SyntaxError message carries the entire body, and the SDK attaches the body and the response as well.
+ */
+export function shortBodyParseError(body, contentType = "text/plain") {
+  let parserMessage;
+  try {
+    JSON.parse(body);
+  } catch (error) {
+    parserMessage = error.message;
+  }
+  const error = new SyntaxError(`${parserMessage}\n  Deserialization error: to see the raw response, inspect the hidden field {error}.$response on this object.`);
+  Object.defineProperty(error, "$responseBodyText", { value: body, enumerable: false });
+  Object.defineProperty(error, "$response", {
+    value: { statusCode: 200, reason: "OK", headers: { "content-type": contentType, "content-length": String(Buffer.byteLength(body)) }, body },
+    enumerable: false,
+  });
+  error.$metadata = { httpStatusCode: 200, attempts: 1, totalRetryDelay: 0 };
+  return error;
+}
+
 /** A service error whose message echoes request context: a URL with a token query and key-shaped values. */
 export function contextLeakingDeniedError() {
   const error = new Error(

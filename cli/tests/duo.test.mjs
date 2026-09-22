@@ -33,11 +33,17 @@ import {
   CANARY,
   HTML_BODY_NOTE,
   REDACTED_CANARY_URL,
+  SHORT_BODY_CANARY,
+  SHORT_BODY_CONTENT_TYPE,
   assertNoCanaries,
   assertNoCanariesInFiles,
+  assertNoShortBodyFragments,
   assertRedactionCases,
+  assertShortBodyRecordedAsNote,
   htmlCanaryBody,
   jsonCanaryMessage,
+  parserMessageFor,
+  shortBodyResponse,
 } from "./helpers/error-canaries.mjs";
 
 function createTempBase(prefix) {
@@ -2411,4 +2417,42 @@ test("config loader errors: a SyntaxError raised by the transport is recorded by
     assert.ok(!text.includes("CANARY-PARSER-SNIPPET") && !/Unexpected token/.test(text), `a slice of the parser's message reached an output: ${text.slice(0, 400)}`);
     assert.ok(text.includes(note), `the output records the parse failure by name: ${text.slice(0, 400)}`);
   }
+});
+
+test("config loader errors: a 200 answer whose body is short non-JSON text is recorded as the non-JSON note only; no 8-character fragment of the body and no parser wording reaches the thrown client error, the access check, an assessment, or the bundle", async () => {
+  // Positive control for the class: V8 quotes the whole source when it is 21 characters or shorter.
+  assert.ok(SHORT_BODY_CANARY.length <= 21 && parserMessageFor(SHORT_BODY_CANARY).includes(SHORT_BODY_CANARY), "the parser's message carries the whole short body");
+
+  const config = createSampleConfig();
+  const surface = "/admin/v1/settings";
+  const log = [];
+  const client = new DuoAuditorClient(config, { fetchImpl: recordingFetch({ ...healthyDuoRoutes(), [surface]: () => shortBodyResponse() }, log) });
+
+  // The thrown client error is fixed text: a scrub at the tool boundary would not protect a caller that logs it.
+  await assert.rejects(() => client.getSettings(), (error) => {
+    assert.equal(error.name, "DuoApiError");
+    assert.equal(error.status, 200);
+    assert.equal(error.path, surface);
+    assertShortBodyRecordedAsNote(assert, error.message, "thrown client error");
+    assert.equal(error.message, `Duo API request returned an unexpected payload for ${surface}: non-JSON body (${SHORT_BODY_CONTENT_TYPE}, 18 bytes)`);
+    return true;
+  });
+
+  const access = await runDuoAccessCheck(client, config);
+  assertShortBodyRecordedAsNote(assert, access, "check_access");
+  const probe = access.probes.find((entry) => entry.path === surface);
+  assert.ok(probe && probe.status === "error", "the settings probe is not ok and is not mislabelled as a 401 or 403");
+  assertShortBodyRecordedAsNote(assert, probe.detail, "settings probe detail");
+
+  const authentication = await collectDuoAuthenticationData(client, config.lookbackDays);
+  assertShortBodyRecordedAsNote(assert, authentication.settings.error, "settings dataset error");
+  assert.equal(authentication.settings.status, 200, "the dataset records the observed status");
+  assertShortBodyRecordedAsNote(assert, assessDuoAuthentication(authentication, config), "authentication assessment");
+
+  const exported = await exportDuoAuditBundle(client, config, createTempBase("grclanker-duo-short-body-"));
+  const files = readBundleFiles(exported.outputDir);
+  for (const [name, text] of files) assertNoShortBodyFragments(assert, text, `bundle ${name}`);
+  for (const [name, text] of readZipEntries(exported.zipPath)) assertNoShortBodyFragments(assert, text, `zip ${name}`);
+  assertShortBodyRecordedAsNote(assert, files.get("_errors.log"), "_errors.log");
+  assert.ok(log.some((entry) => entry.path === surface && entry.status === 200), "the 200 answer named in the note was observed");
 });

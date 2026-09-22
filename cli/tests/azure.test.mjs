@@ -36,11 +36,17 @@ import {
   CANARY_URL,
   HTML_BODY_NOTE,
   REDACTED_CANARY_URL,
+  SHORT_BODY_CANARY,
+  SHORT_BODY_CONTENT_TYPE,
   assertNoCanaries,
   assertNoCanariesInFiles,
+  assertNoShortBodyFragments,
   assertRedactionCases,
+  assertShortBodyRecordedAsNote,
   htmlCanaryBody,
   jsonCanaryMessage,
+  parserMessageFor,
+  shortBodyResponse,
 } from "./helpers/error-canaries.mjs";
 import { getRegisteredToolSummaries, groupRegisteredTools } from "../dist/pi/tool-catalog.js";
 import { assertSecretsAbsent, readBundleFiles, readZipEntries } from "./helpers/bundle-contents.mjs";
@@ -1542,4 +1548,39 @@ test("config loader errors: a SyntaxError raised by the transport is recorded by
     assert.ok(!text.includes("CANARY-PARSER-SNIPPET") && !/Unexpected token/.test(text), `a slice of the parser's message reached an output: ${text.slice(0, 400)}`);
     assert.ok(text.includes(note), `the output records the parse failure by name: ${text.slice(0, 400)}`);
   }
+});
+
+test("config loader errors: a 200 answer whose body is short non-JSON text is recorded as the non-JSON note only; no 8-character fragment of the body and no parser wording reaches the thrown client error, the access check, an assessment, or the bundle", async () => {
+  // Positive control for the class: V8 quotes the whole source when it is 21 characters or shorter.
+  assert.ok(SHORT_BODY_CANARY.length <= 21 && parserMessageFor(SHORT_BODY_CANARY).includes(SHORT_BODY_CANARY), "the parser's message carries the whole short body");
+
+  const config = sampleConfig();
+  const surface = "/v1.0/directoryRoles";
+  const seen = new Set();
+  const client = new AzureAuditorClient(config, { fetchImpl: azureRoutedFetch({ ...healthyAzureRoutes(), [surface]: () => shortBodyResponse() }, seen), now: () => NOW });
+
+  // The thrown client error is fixed text: a scrub at the tool boundary would not protect a caller that logs it.
+  await assert.rejects(() => client.listDirectoryRoles(), (error) => {
+    assert.equal(error.name, "AzureApiError");
+    assert.equal(error.status, 200);
+    assert.equal(new URL(error.url).pathname, surface);
+    assertShortBodyRecordedAsNote(assert, error.message, "thrown client error");
+    assert.equal(error.message, `Request returned 200 OK: non-JSON body (${SHORT_BODY_CONTENT_TYPE}, 18 bytes)`);
+    return true;
+  });
+
+  const { access, assessments, exported } = await runEveryAzureTool(client, config, createTempBase("grclanker-azure-short-body-"));
+  assertShortBodyRecordedAsNote(assert, access, "check_access");
+  const probe = access.surfaces.find((entry) => entry.name === "directory_roles");
+  assert.ok(probe && probe.status === "not_readable", "the directory_roles probe is not readable");
+  assert.equal(probe.http_status, 200, "the probe records the observed status");
+  const identity = assessments.find((assessment) => /identity/i.test(assessment.category ?? assessment.title ?? ""));
+  assertShortBodyRecordedAsNote(assert, identity ?? assessments[0], "identity assessment");
+  for (const assessment of assessments) assertNoShortBodyFragments(assert, assessment, `${assessment.category ?? assessment.title} assessment`);
+
+  const files = readBundleFiles(exported.outputDir);
+  for (const [name, text] of files) assertNoShortBodyFragments(assert, text, `bundle ${name}`);
+  for (const [name, text] of readZipEntries(exported.zipPath)) assertNoShortBodyFragments(assert, text, `zip ${name}`);
+  assertShortBodyRecordedAsNote(assert, files.get("_errors.log"), "_errors.log");
+  assert.ok(seen.has(surface), "the surface named in the note was requested");
 });

@@ -451,11 +451,13 @@ function serializeJson(value: unknown): string {
 }
 
 function errorCode(error: unknown): string {
+  if (error instanceof AwsApiError) return error.code;
   const object = asObject(error);
   return asString(object?.name) ?? asString(object?.Code) ?? asString(object?.code) ?? "";
 }
 
 function errorHttpStatus(error: unknown): number | undefined {
+  if (error instanceof AwsApiError) return error.httpStatus;
   const metadata = asObject(asObject(error)?.$metadata);
   return asNumber(metadata?.httpStatusCode);
 }
@@ -558,6 +560,8 @@ const PARSE_ERROR_NOTE = "response could not be parsed as the service protocol; 
  * and status are kept so a failure names what the service answered without repeating request context.
  */
 function describeError(error: unknown): string {
+  // An AwsApiError was built by this function when the client threw it; its message is already the record.
+  if (error instanceof AwsApiError) return error.message;
   const object = asObject(error);
   const code = errorCode(error);
   const status = errorHttpStatus(error);
@@ -573,6 +577,58 @@ function describeError(error: unknown): string {
 /** Message of a tool-level failure, run through the same sink as every recorded read error. */
 function errorMessage(error: unknown): string {
   return describeError(error);
+}
+
+/**
+ * Thrown by every AwsAuditorClient read in place of the SDK's own error (rule 9, fixed-text client errors). The
+ * SDK's message can quote the response body (its deserializer raises V8's SyntaxError, which quotes a window of
+ * the text and the whole source when it is 21 characters or shorter) or echo request context, so a caller that
+ * logs the thrown error would re-emit it; a scrub at the tool boundary does not protect that caller. This error
+ * carries describeError()'s text and only the structured fields the classifiers read: the SDK error name as
+ * `code` and the observed HTTP status. Nothing that can hold body text ($response, $responseBodyText, the
+ * cause) is retained.
+ */
+export class AwsApiError extends Error {
+  /** The SDK error name (for example AccessDeniedException, SyntaxError), or "" when the SDK error had none. */
+  readonly code: string;
+  /** HTTP status the request observed; undefined for transport failures (timeouts, connection errors). */
+  readonly httpStatus: number | undefined;
+  /** Kept in the SDK's shape so callers that read $metadata.httpStatusCode keep working; it holds numbers only. */
+  readonly $metadata: { httpStatusCode?: number };
+
+  constructor(cause: unknown) {
+    super(describeError(cause));
+    this.name = "AwsApiError";
+    this.code = errorCode(cause);
+    this.httpStatus = errorHttpStatus(cause);
+    this.$metadata = this.httpStatus === undefined ? {} : { httpStatusCode: this.httpStatus };
+  }
+}
+
+/** Errors the client throws as-is: already fixed text, and their types are part of the client's contract. */
+function toAwsApiError(error: unknown): Error {
+  if (error instanceof AwsApiError || error instanceof AwsCredentialProviderError) return error;
+  return new AwsApiError(error);
+}
+
+type SdkClient = { send: (...args: any[]) => any };
+
+/**
+ * Overrides send() on one SDK client instance so every error it throws is rethrown as AwsApiError. The
+ * prototype's send is looked up on each call, so the instance keeps following the SDK's implementation (or a
+ * test fixture's patch of it); only the shape of the thrown error changes.
+ */
+function guardSdkClient<T extends SdkClient>(client: T): T {
+  const prototype = Object.getPrototypeOf(client) as SdkClient;
+  const guardedSend = async (...args: unknown[]): Promise<unknown> => {
+    try {
+      return await prototype.send.apply(client, args);
+    } catch (error) {
+      throw toAwsApiError(error);
+    }
+  };
+  Object.defineProperty(client, "send", { value: guardedSend, writable: true, configurable: true });
+  return client;
 }
 
 type AwsCredentialProvider = ReturnType<typeof fromIni>;
@@ -1052,19 +1108,20 @@ export class AwsAuditorClient {
     const credentials = credentialProviderFor(config);
     const clientConfig = { region: config.region, credentials };
     this.credentials = credentials;
-    this.sts = new STSClient(clientConfig);
-    this.iam = new IAMClient(clientConfig);
-    this.cloudTrail = new CloudTrailClient(clientConfig);
-    this.securityHub = new SecurityHubClient(clientConfig);
-    this.configService = new ConfigServiceClient(clientConfig);
-    this.guardDuty = new GuardDutyClient(clientConfig);
-    this.organizations = new OrganizationsClient(clientConfig);
-    this.accessAnalyzer = new AccessAnalyzerClient(clientConfig);
-    this.ssoAdmin = new SSOAdminClient(clientConfig);
-    this.s3 = new S3Client({ ...clientConfig, followRegionRedirects: true });
-    this.s3Control = new S3ControlClient(clientConfig);
-    this.auditManager = new AuditManagerClient(clientConfig);
-    this.account = new AccountClient(clientConfig);
+    // Every SDK client is guarded so the error a read throws is fixed text (AwsApiError), never the SDK's message.
+    this.sts = guardSdkClient(new STSClient(clientConfig));
+    this.iam = guardSdkClient(new IAMClient(clientConfig));
+    this.cloudTrail = guardSdkClient(new CloudTrailClient(clientConfig));
+    this.securityHub = guardSdkClient(new SecurityHubClient(clientConfig));
+    this.configService = guardSdkClient(new ConfigServiceClient(clientConfig));
+    this.guardDuty = guardSdkClient(new GuardDutyClient(clientConfig));
+    this.organizations = guardSdkClient(new OrganizationsClient(clientConfig));
+    this.accessAnalyzer = guardSdkClient(new AccessAnalyzerClient(clientConfig));
+    this.ssoAdmin = guardSdkClient(new SSOAdminClient(clientConfig));
+    this.s3 = guardSdkClient(new S3Client({ ...clientConfig, followRegionRedirects: true }));
+    this.s3Control = guardSdkClient(new S3ControlClient(clientConfig));
+    this.auditManager = guardSdkClient(new AuditManagerClient(clientConfig));
+    this.account = guardSdkClient(new AccountClient(clientConfig));
     this.now = options.now ?? (() => new Date());
   }
 
@@ -1159,7 +1216,7 @@ export class AwsAuditorClient {
   private ec2For(region: string): EC2Client {
     let client = this.ec2Clients.get(region);
     if (!client) {
-      client = new EC2Client({ region, credentials: this.credentials });
+      client = guardSdkClient(new EC2Client({ region, credentials: this.credentials }));
       this.ec2Clients.set(region, client);
     }
     return client;
@@ -1169,7 +1226,7 @@ export class AwsAuditorClient {
     if (region === this.config.region) return this.cloudTrail;
     let client = this.cloudTrailClients.get(region);
     if (!client) {
-      client = new CloudTrailClient({ region, credentials: this.credentials });
+      client = guardSdkClient(new CloudTrailClient({ region, credentials: this.credentials }));
       this.cloudTrailClients.set(region, client);
     }
     return client;
@@ -1178,7 +1235,7 @@ export class AwsAuditorClient {
   private rdsFor(region: string): RDSClient {
     let client = this.rdsClients.get(region);
     if (!client) {
-      client = new RDSClient({ region, credentials: this.credentials });
+      client = guardSdkClient(new RDSClient({ region, credentials: this.credentials }));
       this.rdsClients.set(region, client);
     }
     return client;
@@ -1187,7 +1244,7 @@ export class AwsAuditorClient {
   private kmsFor(region: string): KMSClient {
     let client = this.kmsClients.get(region);
     if (!client) {
-      client = new KMSClient({ region, credentials: this.credentials });
+      client = guardSdkClient(new KMSClient({ region, credentials: this.credentials }));
       this.kmsClients.set(region, client);
     }
     return client;
