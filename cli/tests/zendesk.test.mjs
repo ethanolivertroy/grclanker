@@ -2166,6 +2166,19 @@ function carriersOf(value) {
     [`<p>Cookie: sid="${value}"</p><p>next</p>`, /^<p>Cookie: \[REDACTED\]<\/p><p>next<\/p>$/],
     [`<p>Cookie: sid="${value}</p><p>next="1"</p>`, /^<p>Cookie: \[REDACTED\]<\/p><p>next="1"<\/p>$/],
     [`Cookie: sid="${value}"\nX-Other: keep`, /^Cookie: \[REDACTED\]\nX-Other: keep$/],
+    // Compound lines: a cookie value, quoted or not, ends before the "Name:" token of the next
+    // header on the line, so the following header keeps its name and gets its own carrier
+    // treatment, and a Content-Type after the cookie keeps its name and value.
+    [`Cookie: sid=${value}; X-Api-Key: "${value}"`, /^Cookie: \[REDACTED\]; X-Api-Key: "\[REDACTED\]"$/],
+    [`Cookie: sid="${value}"; X-Api-Key: "${value}"`, /^Cookie: \[REDACTED\]; X-Api-Key: "\[REDACTED\]"$/],
+    [`Cookie: _zendesk_session=${value}; theme=dark; X-Api-Key: "${value}"; Content-Type: "application/json"`, /^Cookie: \[REDACTED\]; X-Api-Key: "\[REDACTED\]"; Content-Type: "application\/json"$/],
+    [`Cookie: sid="${value}", X-ApiKeys: "${value}", Content-Type: "application/json"`, /^Cookie: \[REDACTED\], X-ApiKeys: "\[REDACTED\]", Content-Type: "application\/json"$/],
+    [`Set-Cookie: _zendesk_session=${value}; Path=/; HttpOnly; X-PAN-KEY: "${value}"`, /^Set-Cookie: \[REDACTED\]; X-PAN-KEY: "\[REDACTED\]"$/],
+    [`Cookie: sid=${value}; Content-Type: "application/json"; X-Redlock-Auth: ${value}`, /^Cookie: \[REDACTED\]; Content-Type: "application\/json"; X-Redlock-Auth: \[REDACTED\]$/],
+    [`X-Api-Key: "${value}"; Cookie: sid=${value}; Content-Type: text/plain`, /^X-Api-Key: "\[REDACTED\]"; Cookie: \[REDACTED\]; Content-Type: text\/plain$/],
+    [`{"description":"Cookie: sid=${value}; X-Api-Key: \\"${value}\\"; Content-Type: \\"application/json\\"","error":"InvalidUpstream"}`, /^\{"description":"Cookie: \[REDACTED\]; X-Api-Key: \[REDACTED\]; Content-Type: \\"application\/json\\"","error":"InvalidUpstream"\}$/],
+    [`<p>Cookie: sid="${value}"; X-Api-Key: "${value}"; Content-Type: "text/html"</p><p>next</p>`, /^<p>Cookie: \[REDACTED\]; X-Api-Key: "\[REDACTED\]"; Content-Type: "text\/html"<\/p><p>next<\/p>$/],
+    [`Cookie: sid=${value}; x-auth-token: "${value}", Accept: text/html`, /^Cookie: \[REDACTED\]; x-auth-token: "\[REDACTED\]", Accept: text\/html$/],
     [`session=${value}; Path=/`, /^session=\[REDACTED\]; Path=\/$/],
     [`_zendesk_session=${value} expired`, /^_zendesk_session=\[REDACTED\] expired$/],
     [`JSESSIONID=${value}; Path=/`, /^JSESSIONID=\[REDACTED\]; Path=\/$/],
@@ -2284,6 +2297,15 @@ test("scrub boundary: name-shaped values stay bare in prose, leave every carrier
     "misconfiguration of the Authorization Code flow on misconfigured-support-cluster",
   ]) {
     assert.equal(redactErrorText(text), text, text);
+  }
+  // Compound header lines with no credential carrier keep every name and value in both scrubs.
+  for (const text of [
+    'Content-Type: "application/json"; Accept: application/json, text/plain; X-Request-Id: 7f3a',
+    "Content-Type: text/plain; charset=utf-8, Accept-Encoding: gzip, deflate",
+    '<p>Content-Type: "text/html"; X-Request-Id: "7f3a"</p><p>next</p>',
+  ]) {
+    assert.equal(redactErrorText(text), text, text);
+    assert.equal(redactCredentialValueText(text), text, text);
   }
 
   for (const [key, expected] of [
@@ -2500,12 +2522,14 @@ const CANARY_QUOTED = "sess-qtdv-QCARRY-16180339887498";
 const CANARIES = [CANARY_BEARER, CANARY_SESSION, CANARY_API_KEY, CANARY_URL_TOKEN, CANARY_NAMED, CANARY_PLAIN, CANARY_QUOTED];
 const CANARY_URL = `https://api.example.com/v1/x?token=${CANARY_URL_TOKEN}`;
 // The scrubbed rendering of the JSON canary fields, as every error string must carry it.
-const JSON_CANARY_MARKER = /400 Bad Request; InvalidUpstream; Upstream refused Bearer \[REDACTED\] at https:\/\/api\.example\.com\/v1\/x\?token=\[REDACTED\] mid-sentence; _zendesk_session=\[REDACTED\], api_key=\[REDACTED\], Bearer \[REDACTED\], sid=\[REDACTED\] rejected; Cookie: \[REDACTED\]/;
+const JSON_CANARY_MARKER = /400 Bad Request; InvalidUpstream; Upstream refused Bearer \[REDACTED\] at https:\/\/api\.example\.com\/v1\/x\?token=\[REDACTED\] mid-sentence; _zendesk_session=\[REDACTED\], api_key=\[REDACTED\], Bearer \[REDACTED\], sid=\[REDACTED\] rejected; Cookie: \[REDACTED\]; X-Api-Key: "\[REDACTED\]"; Content-Type: "application\/json"/;
 
 function htmlCanaryResponse() {
   const body = `<html><head><title>502 Bad Gateway</title></head><body><p>Authorization: Bearer ${CANARY_BEARER}</p>`
     + `<p>Set-Cookie: _zendesk_session=${CANARY_SESSION}; Path=/</p><p>X-Api-Key: ${CANARY_API_KEY}</p>`
-    + `<p>Proxy-Authorization: Bearer ${CANARY_PLAIN}</p><p>Cookie: sid=${CANARY_NAMED}</p><p>Cookie: sid="${CANARY_QUOTED}"; theme=dark</p>`
+    + `<p>Proxy-Authorization: Bearer ${CANARY_PLAIN}</p><p>Cookie: sid=${CANARY_NAMED}</p>`
+    + `<p>Cookie: sid="${CANARY_QUOTED}"; theme=dark; X-Api-Key: "${CANARY_QUOTED}"; Content-Type: "text/html"</p>`
+    + `<p>Cookie: sid=${CANARY_SESSION}; x-auth-token: "${CANARY_QUOTED}", Accept: text/html</p>`
     + `<p>The upstream at ${CANARY_URL} did not answer in time, retry later.</p></body></html>`;
   return new Response(body, { status: 502, statusText: "Bad Gateway", headers: { "content-type": "text/html; charset=utf-8" } });
 }
@@ -2514,7 +2538,9 @@ function jsonCanaryResponse() {
   return jsonResponse({
     error: "InvalidUpstream",
     description: `Upstream refused Bearer ${CANARY_BEARER} at ${CANARY_URL} mid-sentence; _zendesk_session=${CANARY_SESSION}, api_key=${CANARY_API_KEY}, Bearer ${CANARY_PLAIN}, sid=${CANARY_NAMED} rejected`,
-    message: `Cookie: sid="${CANARY_QUOTED}"; theme=dark`,
+    // A compound line: the quoted cookie ends at its closing quote, the following quoted
+    // X-Api-Key keeps its name and loses its value, and the Content-Type keeps both.
+    message: `Cookie: sid="${CANARY_QUOTED}"; theme=dark; X-Api-Key: "${CANARY_QUOTED}"; Content-Type: "application/json"`,
   }, { status: 400, statusText: "Bad Request" });
 }
 
@@ -2616,6 +2642,10 @@ test("the HTTP-level healthy fixture reproduces the mocked-client verdicts befor
   }
 });
 
+// Body text the notes must never echo, whatever the shape. The JSON canary's compound line
+// carries a redacted X-Api-Key by design, so only an X-Api-Key whose value survived counts.
+const ECHOED_BODY_TEXT = /<html|Set-Cookie|X-Api-Key: (?!"\[REDACTED\]")|did not answer|Proxy-Authorization/i;
+
 test("error-body canary sweep: every Zendesk surface failing with an HTML 502 or a JSON error body leaks no credential into any tool result, finding, or bundle file", async () => {
   const routes = await healthyHttpRoutes();
   const surfaces = Object.keys(routes);
@@ -2655,7 +2685,7 @@ test("error-body canary sweep: every Zendesk surface failing with an HTML 502 or
       assert.ok(errors.length > 0, `${label}: the failing surface must be recorded as an error`);
       for (const error of errors) {
         assert.match(error, shape.marker, `${label}: every error must carry the note: ${error}`);
-        assert.doesNotMatch(error, /<html|Set-Cookie|X-Api-Key:|did not answer/i, `${label}: body text echoed: ${error}`);
+        assert.doesNotMatch(error, ECHOED_BODY_TEXT, `${label}: body text echoed: ${error}`);
       }
       for (const item of results.flatMap((result) => result.findings)) {
         if (/could not be read|502 Bad Gateway|400 Bad Request/.test(item.summary)) {
@@ -2677,9 +2707,6 @@ test("error-body canary sweep: every Zendesk surface failing with an HTML 502 or
     }
   }
 });
-
-// Body text the notes must never echo, whatever the shape.
-const ECHOED_BODY_TEXT = /<html|Set-Cookie|X-Api-Key:|did not answer|Proxy-Authorization/i;
 
 test("the registered tools scrub error strings end to end over HTTP: access check, every assess tool, and the export", async () => {
   const routes = await healthyHttpRoutes();

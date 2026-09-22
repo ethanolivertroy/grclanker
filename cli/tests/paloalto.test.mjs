@@ -1254,10 +1254,12 @@ const CANARY_NAMED = "sess-canary-COOKIE-31415926535897";
 const CANARY_QUOTED = "sess-qtdv-QCARRY-16180339887498";
 const CANARIES = [CANARY_BEARER, CANARY_SESSION, CANARY_API_KEY, CANARY_URL_TOKEN, CANARY_NAMED, CANARY_QUOTED];
 const CANARY_URL = `https://api.example.com/v1/x?token=${CANARY_URL_TOKEN}`;
-// The quoted cookie comes last because a header line is withheld to the end of the line; the
-// scrubbed sentence stays under the 200-character cut a documented error field gets.
-const CANARY_SENTENCE = `Upstream refused Bearer ${CANARY_BEARER} at ${CANARY_URL} mid-sentence; _upstream_session=${CANARY_SESSION}, api_key=${CANARY_API_KEY}, session=${CANARY_NAMED} rejected; Cookie: sid="${CANARY_QUOTED}"`;
-const SCRUBBED_SENTENCE = "Upstream refused Bearer [REDACTED] at https://api.example.com/v1/x?token=[REDACTED] mid-sentence; _upstream_session=[REDACTED], api_key=[REDACTED], session=[REDACTED] rejected; Cookie: [REDACTED]";
+// The sentence ends in one compound header line: an unquoted cookie carrying the session
+// canary, then a quoted name-shaped X-PAN-KEY value, then a Content-Type that must keep its
+// name and value; the scrubbed sentence stays under the 200-character cut a documented
+// error field gets.
+const CANARY_SENTENCE = `Bearer ${CANARY_BEARER} at ${CANARY_URL} refused; api_key=${CANARY_API_KEY}, session=${CANARY_NAMED}; Cookie: sid=${CANARY_SESSION}; X-PAN-KEY: "${CANARY_QUOTED}"; Content-Type: "application/json"`;
+const SCRUBBED_SENTENCE = 'Bearer [REDACTED] at https://api.example.com/v1/x?token=[REDACTED] refused; api_key=[REDACTED], session=[REDACTED]; Cookie: [REDACTED]; X-PAN-KEY: "[REDACTED]"; Content-Type: "application/json"';
 
 function escapeRegExp(text) {
   return text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
@@ -1281,7 +1283,8 @@ const SHAPED_CREDENTIALS = new Set([CANARY_NAMED, CANARY_QUOTED, FIXTURE_SECRET_
 function htmlCanaryResponse(status = 502) {
   const body = `<!DOCTYPE html><html><head><title>502 Bad Gateway</title></head><body><p>Authorization: Bearer ${CANARY_BEARER}</p>`
     + `<p>Set-Cookie: _upstream_session=${CANARY_SESSION}; Path=/</p><p>X-Api-Key: ${CANARY_API_KEY}</p>`
-    + `<p>Cookie: session=${CANARY_NAMED}</p><p>Cookie: sid="${CANARY_QUOTED}"; theme=dark</p>`
+    + `<p>Cookie: session=${CANARY_NAMED}</p><p>Cookie: sid="${CANARY_QUOTED}"; theme=dark; X-PAN-KEY: "${CANARY_QUOTED}"; Content-Type: "text/html"</p>`
+    + `<p>Cookie: sid=${CANARY_SESSION}; x-redlock-auth: "${CANARY_QUOTED}", Accept: text/html</p>`
     + `<p>The upstream at ${CANARY_URL} did not answer in time, retry later.</p></body></html>`;
   return new Response(body, { status, statusText: status === 200 ? "OK" : "Bad Gateway", headers: { "content-type": "text/html; charset=utf-8", "retry-after": "0.001" } });
 }
@@ -1399,6 +1402,19 @@ function carriersOf(value) {
     [`<p>Cookie: sid="${value}</p><p>next="1"</p>`, /^<p>Cookie: \[REDACTED\]<\/p><p>next="1"<\/p>$/],
     [`<msg>Cookie: sid="${value}"</msg><msg>next</msg>`, /^<msg>Cookie: \[REDACTED\]<\/msg><msg>next<\/msg>$/],
     [`Cookie: sid="${value}"\nX-Other: keep`, /^Cookie: \[REDACTED\]\nX-Other: keep$/],
+    // Compound lines: a cookie value, quoted or not, ends before the "Name:" token of the next
+    // header on the line, so the following header keeps its name and gets its own carrier
+    // treatment, and a Content-Type after the cookie keeps its name and value.
+    [`Cookie: sid=${value}; X-PAN-KEY: "${value}"`, /^Cookie: \[REDACTED\]; X-PAN-KEY: "\[REDACTED\]"$/],
+    [`Cookie: sid="${value}"; X-PAN-KEY: "${value}"`, /^Cookie: \[REDACTED\]; X-PAN-KEY: "\[REDACTED\]"$/],
+    [`Cookie: sid=${value}; theme=dark; X-Api-Key: "${value}"; Content-Type: "application/json"`, /^Cookie: \[REDACTED\]; X-Api-Key: "\[REDACTED\]"; Content-Type: "application\/json"$/],
+    [`Cookie: sid="${value}", X-Redlock-Auth: "${value}", Content-Type: "application/json"`, /^Cookie: \[REDACTED\], X-Redlock-Auth: "\[REDACTED\]", Content-Type: "application\/json"$/],
+    [`Set-Cookie: sid=${value}; Path=/; HttpOnly; X-ApiKeys: "${value}"`, /^Set-Cookie: \[REDACTED\]; X-ApiKeys: "\[REDACTED\]"$/],
+    [`Cookie: sid=${value}; Content-Type: "application/json"; X-PAN-KEY: ${value}`, /^Cookie: \[REDACTED\]; Content-Type: "application\/json"; X-PAN-KEY: \[REDACTED\]$/],
+    [`X-PAN-KEY: "${value}"; Cookie: sid=${value}; Content-Type: text/xml`, /^X-PAN-KEY: "\[REDACTED\]"; Cookie: \[REDACTED\]; Content-Type: text\/xml$/],
+    [`{"detail":"Cookie: sid=${value}; X-PAN-KEY: \\"${value}\\"; Content-Type: \\"application/json\\"","code":401}`, /^\{"detail":"Cookie: \[REDACTED\]; X-PAN-KEY: \[REDACTED\]; Content-Type: \\"application\/json\\"","code":401\}$/],
+    [`<p>Cookie: sid="${value}"; X-PAN-KEY: "${value}"; Content-Type: "text/html"</p><p>next</p>`, /^<p>Cookie: \[REDACTED\]; X-PAN-KEY: "\[REDACTED\]"; Content-Type: "text\/html"<\/p><p>next<\/p>$/],
+    [`Cookie: sid=${value}; X-Redlock-Auth: "${value}", Accept: text/html`, /^Cookie: \[REDACTED\]; X-Redlock-Auth: "\[REDACTED\]", Accept: text\/html$/],
     [`session=${value}; Path=/`, /^session=\[REDACTED\]; Path=\/$/],
     [`_upstream_session=${value} expired`, /^_upstream_session=\[REDACTED\] expired$/],
     [`PHPSESSID=${value}; Path=/`, /^PHPSESSID=\[REDACTED\]; Path=\/$/],
@@ -1515,6 +1531,15 @@ test("scrub boundary: name-shaped values stay bare in prose, leave every carrier
     "misconfiguration of the Authorization Code flow on misconfigured-firewall-cluster",
   ]) {
     assert.equal(redactErrorText(text), text, text);
+  }
+  // Compound header lines with no credential carrier keep every name and value in both scrubs.
+  for (const text of [
+    'Content-Type: "application/json"; Accept: application/json, text/xml; X-Request-Id: 7f3a',
+    "Content-Type: text/xml; charset=utf-8, Accept-Encoding: gzip, deflate",
+    '<p>Content-Type: "text/html"; X-Request-Id: "7f3a"</p><p>next</p>',
+  ]) {
+    assert.equal(redactErrorText(text), text, text);
+    assert.equal(redactCredentialValueText(text), text, text);
   }
 
   for (const [key, expected] of [

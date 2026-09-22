@@ -496,13 +496,20 @@ const QUERY_PAIR_PATTERN = /([?&#])([A-Za-z0-9_.[\]-]+)=((?!\[REDACTED\])[^&#\s"
 // separator are matched here and the value is consumed by headerValueEnd, which carries a
 // quoted value (double, single, or JSON-escaped quotes) through its closing quote, so
 // Cookie: sid="value" loses value and quotes together instead of stopping at the first
-// quote. A value that already opens with a marker is left alone so the rule is idempotent.
-const HEADER_LINE_PATTERN = /\b(authorization|proxy-authorization|cookie|set-cookie|x-api-key|api-key|apikey|x-pan-key|x-redlock-auth|x-auth-token|x-access-token|x-amz-security-token|x-vault-token|private-token|x-goog-api-key|x-csrf-token|x-xsrf-token)(["']?\s*:\s*)/gi;
+// quote, and ends an unquoted value before the next header on a compound line, so the
+// next header keeps its name. A value that already opens with a marker is left alone so
+// the rule is idempotent.
+const HEADER_LINE_PATTERN = /\b(authorization|proxy-authorization|cookie|set-cookie|x-api-key|x-apikeys?|api-key|apikey|x-pan-key|x-redlock-auth|x-auth-token|x-access-token|x-amz-security-token|x-vault-token|private-token|x-goog-api-key|x-csrf-token|x-xsrf-token)(["']?\s*:\s*)/gi;
 // Inside a header value a quote opens a quoted segment only where a value can start: at the
 // start of the value or after "=", ":", ",", ";", "(", or whitespace. Anywhere else it is the
 // quote that closes the text the header line was quoted in.
 const HEADER_VALUE_OPENER_PATTERN = /[=:,;(\s]/;
 const HEADER_VALUE_TERMINATOR_PATTERN = /[\r\n<>]/;
+// The "Name:" token of the next header after ";" or "," on a compound line (the name may be
+// quoted, as in a JSON object); a colon followed by "//" is a URL scheme, not a header. The
+// token is looked for within FOLLOWING_HEADER_LOOKAHEAD characters of the separator.
+const FOLLOWING_HEADER_PATTERN = /^\s*["']?[A-Za-z][A-Za-z0-9-]*["']?\s*:(?!\/\/)/;
+const FOLLOWING_HEADER_LOOKAHEAD = 96;
 // A scheme and its credentials: the value is removed whatever its shape, except the
 // prose words that follow a scheme name in a sentence ("Basic authentication is
 // required", "Bearer token") and a Titlecase word, which makes the scheme name an
@@ -705,8 +712,11 @@ function scrubUrlUserinfo(url: string): string {
 }
 
 // Where the value of a header line that starts at start ends: at the end of the line, at an
-// HTML tag, or at the quote that closes the text the line sits in. A quoted segment
-// ("value", 'value') is carried through its closing quote on the same line; a JSON-escaped
+// HTML tag, at the ";" or "," before the "Name:" token of the next header on a compound line
+// (on "Cookie: sid=value; X-Api-Key: value" the next header keeps its name and gets its own
+// carrier treatment, and a Content-Type after a cookie keeps its name and value), or at the
+// quote that closes the text the line sits in. A quoted segment ("value", 'value') is
+// carried through its closing quote on the same line, whatever it carries; a JSON-escaped
 // quote (\") is content, and once one has been seen the next unescaped quote closes the JSON
 // string the header line is embedded in. Trailing whitespace is not part of the value.
 function headerValueEnd(text: string, start: number): number {
@@ -715,6 +725,7 @@ function headerValueEnd(text: string, start: number): number {
   while (index < text.length) {
     const char = text[index];
     if (HEADER_VALUE_TERMINATOR_PATTERN.test(char)) break;
+    if ((char === ";" || char === ",") && FOLLOWING_HEADER_PATTERN.test(text.slice(index + 1, index + 1 + FOLLOWING_HEADER_LOOKAHEAD))) break;
     if (char === "\\" && (text[index + 1] === '"' || text[index + 1] === "'")) {
       escapedQuotes = true;
       index += 2;
@@ -745,6 +756,8 @@ function enclosingQuote(value: string): string {
 
 // Every credential-bearing header line loses its value whatever the value's shape; a value
 // that is one quoted string keeps its quotes around the marker so quoted text stays quoted.
+// On a compound line each header is its own line: the value of one ends before the name of
+// the next, which is then matched and treated on its own.
 function scrubHeaderLines(text: string): string {
   HEADER_LINE_PATTERN.lastIndex = 0;
   let out = "";

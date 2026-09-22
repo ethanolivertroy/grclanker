@@ -1097,6 +1097,19 @@ function carriersOf(value) {
     [`<p>Cookie: sid="${value}"</p><p>next</p>`, /^<p>Cookie: \[REDACTED\]<\/p><p>next<\/p>$/],
     [`<p>Cookie: sid="${value}</p><p>next="1"</p>`, /^<p>Cookie: \[REDACTED\]<\/p><p>next="1"<\/p>$/],
     [`Cookie: sid="${value}"\nX-Other: keep`, /^Cookie: \[REDACTED\]\nX-Other: keep$/],
+    // Compound lines: a cookie value, quoted or not, ends before the "Name:" token of the next
+    // header on the line, so the following header keeps its name and gets its own carrier
+    // treatment, and a Content-Type after the cookie keeps its name and value.
+    [`Cookie: sid=${value}; X-ApiKeys: "${value}"`, /^Cookie: \[REDACTED\]; X-ApiKeys: "\[REDACTED\]"$/],
+    [`Cookie: sid="${value}"; X-ApiKeys: "${value}"`, /^Cookie: \[REDACTED\]; X-ApiKeys: "\[REDACTED\]"$/],
+    [`Cookie: TNS_SESSIONID=${value}; theme=dark; X-Api-Key: "${value}"; Content-Type: "application/json"`, /^Cookie: \[REDACTED\]; X-Api-Key: "\[REDACTED\]"; Content-Type: "application\/json"$/],
+    [`Cookie: sid="${value}", X-SecurityCenter: "${value}", Content-Type: "application/json"`, /^Cookie: \[REDACTED\], X-SecurityCenter: "\[REDACTED\]", Content-Type: "application\/json"$/],
+    [`Set-Cookie: TNS_SESSIONID=${value}; Path=/; HttpOnly; X-ApiKeys: "accessKey=${value}"`, /^Set-Cookie: \[REDACTED\]; X-ApiKeys: "\[REDACTED\]"$/],
+    [`Cookie: sid=${value}; Content-Type: "application/json"; X-ApiKeys: accessKey=${value};secretKey=${value}`, /^Cookie: \[REDACTED\]; Content-Type: "application\/json"; X-ApiKeys: \[REDACTED\]$/],
+    [`X-ApiKeys: "accessKey=${value}"; Cookie: sid=${value}; Content-Type: text/plain`, /^X-ApiKeys: "\[REDACTED\]"; Cookie: \[REDACTED\]; Content-Type: text\/plain$/],
+    [`{"error_msg":"Cookie: sid=${value}; X-ApiKeys: \\"${value}\\"; Content-Type: \\"application/json\\"","code":401}`, /^\{"error_msg":"Cookie: \[REDACTED\]; X-ApiKeys: \[REDACTED\]; Content-Type: \\"application\/json\\"","code":401\}$/],
+    [`<p>Cookie: sid="${value}"; X-ApiKeys: "${value}"; Content-Type: "text/html"</p><p>next</p>`, /^<p>Cookie: \[REDACTED\]; X-ApiKeys: "\[REDACTED\]"; Content-Type: "text\/html"<\/p><p>next<\/p>$/],
+    [`Cookie: sid=${value}; X-Cookie: "token=${value}", Accept: text/html`, /^Cookie: \[REDACTED\]; X-Cookie: "\[REDACTED\]", Accept: text\/html$/],
     [`accessKey=${value};secretKey=${value}`, /^accessKey=\[REDACTED\];secretKey=\[REDACTED\]$/],
     [`TNS_SESSIONID=${value}; Path=/`, /^TNS_SESSIONID=\[REDACTED\]; Path=\/$/],
     [`session=${value} expired`, /^session=\[REDACTED\] expired$/],
@@ -1216,6 +1229,15 @@ test("scrub boundary: name-shaped values stay bare in prose, leave every carrier
     "arguments-access_key environment-TENABLE_SECRET_KEY config-file-sc_secret_key default-url",
   ]) {
     assert.equal(redactErrorText(text), text, text);
+  }
+  // Compound header lines with no credential carrier keep every name and value in both scrubs.
+  for (const text of [
+    'Content-Type: "application/json"; Accept: application/json, text/plain; X-Request-Id: 7f3a',
+    "Content-Type: text/plain; charset=utf-8, Accept-Encoding: gzip, deflate",
+    '<p>Content-Type: "text/html"; X-Request-Id: "7f3a"</p><p>next</p>',
+  ]) {
+    assert.equal(redactErrorText(text), text, text);
+    assert.equal(redactCredentialValueText(text), text, text);
   }
 
   for (const [key, expected] of [
@@ -1430,7 +1452,8 @@ function htmlCanaryResponse() {
   const body = `<html><head><title>502 Bad Gateway</title></head><body><p>Authorization: Bearer ${CANARY_BEARER}</p>`
     + `<p>Set-Cookie: TNS_SESSIONID=${CANARY_SESSION}; Path=/</p><p>X-ApiKeys: accessKey=${CANARY_API_KEY};secretKey=${CANARY_API_KEY}</p>`
     + `<p>Proxy-Authorization: Bearer ${CANARY_PLAIN}</p><p>Cookie: sid=${CANARY_NAMED}</p>`
-    + `<p>Cookie: sid="${CANARY_QUOTED}"; theme=dark</p><p>X-ApiKeys: accessKey="${CANARY_QUOTED}";secretKey="${CANARY_QUOTED}"</p>`
+    + `<p>Cookie: sid="${CANARY_QUOTED}"; theme=dark; X-ApiKeys: "${CANARY_QUOTED}"; Content-Type: "text/html"</p>`
+    + `<p>Cookie: sid=${CANARY_SESSION}; X-ApiKeys: accessKey="${CANARY_QUOTED}";secretKey="${CANARY_QUOTED}", Accept: text/html</p>`
     + `<p>The upstream at ${CANARY_URL} did not answer in time, retry later.</p></body></html>`;
   // retry-after: 0 keeps the client's 5xx retries instant when the response reaches a real sleep.
   return new Response(body, { status: 502, statusText: "Bad Gateway", headers: { "content-type": "text/html; charset=utf-8", "retry-after": "0" } });
@@ -1439,13 +1462,15 @@ function htmlCanaryResponse() {
 function jsonCanaryResponse() {
   return new Response(JSON.stringify({
     error: `Upstream refused Bearer ${CANARY_BEARER} at ${CANARY_URL} mid-sentence; session=${CANARY_SESSION}, api_key=${CANARY_API_KEY}, Bearer ${CANARY_PLAIN}, sid=${CANARY_NAMED} rejected`,
-    message: `Cookie: sid="${CANARY_QUOTED}"; theme=dark`,
+    // A compound line: the quoted cookie ends at its closing quote, the following quoted
+    // X-Api-Key keeps its name and loses its value, and the Content-Type keeps both.
+    message: `Cookie: sid="${CANARY_QUOTED}"; theme=dark; X-Api-Key: "${CANARY_QUOTED}"; Content-Type: "application/json"`,
     error_msg: `X-Cookie: token="${CANARY_QUOTED}"`,
   }), { status: 400, statusText: "Bad Request", headers: { "content-type": "application/json" } });
 }
 
 // The scrubbed rendering of the JSON canary fields, as every error string must carry it.
-const JSON_CANARY_MARKER = /HTTP 400 Bad Request; Upstream refused Bearer \[REDACTED\] at https:\/\/api\.example\.com\/v1\/x\?token=\[REDACTED\] mid-sentence; session=\[REDACTED\], api_key=\[REDACTED\], Bearer \[REDACTED\], sid=\[REDACTED\] rejected; Cookie: \[REDACTED\]; X-Cookie: \[REDACTED\]/;
+const JSON_CANARY_MARKER = /HTTP 400 Bad Request; Upstream refused Bearer \[REDACTED\] at https:\/\/api\.example\.com\/v1\/x\?token=\[REDACTED\] mid-sentence; session=\[REDACTED\], api_key=\[REDACTED\], Bearer \[REDACTED\], sid=\[REDACTED\] rejected; Cookie: \[REDACTED\]; X-Api-Key: "\[REDACTED\]"; Content-Type: "application\/json"; X-Cookie: \[REDACTED\]/;
 const HTML_CANARY_MARKER = /HTTP 502 Bad Gateway; non-JSON text\/html response body \(\d+ bytes, not echoed\)/;
 
 // The configured secrets of the sweep fixture, echoed bare in prose in every encoded form:
