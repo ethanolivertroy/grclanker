@@ -24,6 +24,7 @@ import {
   redactErrorText,
   redactSecretText,
   redactSecrets,
+  registerSlackTools,
   resolveSecureOutputPath,
   resolveSlackConfiguration,
 } from "../dist/extensions/grc-tools/slack.js";
@@ -1457,11 +1458,44 @@ test("non-JSON response bodies are described, never quoted, and every error stri
   const base = createTempBase("grclanker-slack-config-error-");
   const configPath = join(base, "slack.json");
   writeFileSync(configPath, '{ "token": "xoxp-CANARY-CONFIG-1", ');
+  const parseFailure = /^Unable to parse Slack config file .*slack\.json: the file is not valid JSON \(parser detail withheld because it can quote the file\)$/;
+  const readWording = /Unable to read|EISDIR|EACCES|Unexpected token|JSON\.parse/;
   assert.throws(() => resolveSlackConfiguration({}, { SLACK_CONFIG_FILE: configPath }), (error) => {
     assert.doesNotMatch(error.message, /CANARY-/);
-    assert.match(error.message, /Unable to parse Slack config file .*: the file is not valid JSON \(parser detail withheld because it can quote the file\)/);
+    assert.match(error.message, parseFailure);
+    assert.doesNotMatch(error.message, readWording, "a parse failure never carries the read wording or a parser excerpt");
     return true;
   });
+
+  const directoryPath = join(base, "config-as-directory.json");
+  mkdirSync(directoryPath);
+  assert.throws(() => readFileSync(directoryPath, "utf8"), /EISDIR: illegal operation on a directory/, "positive control: the fs wording the loader must not echo");
+  const readFailure = /^Unable to read Slack config file .*config-as-directory\.json \(EISDIR\)$/;
+  assert.throws(() => resolveSlackConfiguration({}, { SLACK_CONFIG_FILE: directoryPath }), (error) => {
+    assert.match(error.message, readFailure);
+    assert.doesNotMatch(error.message, /illegal operation|Unable to parse/);
+    return true;
+  });
+
+  const tools = new Map();
+  registerSlackTools({ registerTool: (tool) => tools.set(tool.name, tool) });
+  const checkAccess = tools.get("slack_check_access");
+  const previous = process.env.SLACK_CONFIG_FILE;
+  try {
+    process.env.SLACK_CONFIG_FILE = directoryPath;
+    const unreadable = await checkAccess.execute("call-1", checkAccess.prepareArguments({}));
+    assert.equal(unreadable.isError, true);
+    assert.match(unreadable.content[0].text, /^Check Slack audit access failed: Unable to read Slack config file .*config-as-directory\.json \(EISDIR\)$/);
+    assert.doesNotMatch(unreadable.content[0].text, /illegal operation|Unable to parse/);
+    process.env.SLACK_CONFIG_FILE = configPath;
+    const malformed = await checkAccess.execute("call-2", checkAccess.prepareArguments({}));
+    assert.equal(malformed.isError, true);
+    assert.match(malformed.content[0].text, /^Check Slack audit access failed: Unable to parse Slack config file .*slack\.json: the file is not valid JSON \(parser detail withheld because it can quote the file\)$/);
+    assert.doesNotMatch(malformed.content[0].text, /CANARY-|Unable to read|EISDIR/);
+  } finally {
+    if (previous === undefined) delete process.env.SLACK_CONFIG_FILE;
+    else process.env.SLACK_CONFIG_FILE = previous;
+  }
 });
 
 /** Every surface the collectors call, the same list as the reviewer's canary sweep: 16 Web API methods, 3 SCIM paths, 2 Audit Logs paths. */
