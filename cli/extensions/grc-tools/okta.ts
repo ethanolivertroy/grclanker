@@ -240,7 +240,9 @@ function endsClause(text: string, index: number): boolean {
   return CLAUSE_END_PATTERN.test(text);
 }
 
+/** A 40-character base64 run is an AWS secret access key when it is random-looking; a bare path of word segments ("/api/v1/users/<id>/roles") that happens to span 40 characters is a request target and stays. */
 function looksLikeAwsSecret(run: string): boolean {
+  if (run.startsWith("/") || run.split("/").some((segment) => /^(?:[a-z]+|v\d+)$/.test(segment))) return false;
   if (/[/+]/.test(run)) return true;
   return /\d/.test(run) && /[a-z]/.test(run) && /[A-Z]/.test(run);
 }
@@ -4279,7 +4281,7 @@ export function assessOktaMonitoring(
         "OKTA-MON-005",
         "Pass",
         "Zero SSWS API tokens exist while auditing through an OAuth service app; an empty token inventory is compliant by intent because no long-lived static tokens remain.",
-        [`Auth mode: ${config.authMode}`, "Token inventory: empty with no error"],
+        [`Auth mode: ${config.authMode}`, "API token inventory: empty with no error"],
         "Keep using OAuth service apps with scoped short-lived access tokens instead of SSWS tokens.",
       ),
     );
@@ -4365,7 +4367,7 @@ export function assessOktaMonitoring(
         "OKTA-MON-007",
         "Pass",
         "Zero SSWS API tokens exist while auditing through an OAuth service app; an empty token inventory is compliant by intent.",
-        [`Auth mode: ${config.authMode}`, "Token inventory: empty with no error"],
+        [`Auth mode: ${config.authMode}`, "API token inventory: empty with no error"],
         "Keep SSWS token creation restricted and prefer OAuth service apps.",
       ),
     );

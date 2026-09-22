@@ -566,7 +566,7 @@ test("resolveOktaConfiguration follows Okta CLI-style precedence with per-field 
   ]);
 });
 
-/** Canaries planted on malformed config lines; every 8-character window of each is distinct so a partial quote is caught too. */
+/** Canaries planted on malformed config lines: random alphanumerics, so no 6-character window of one occurs in a legitimate fixture value or in another canary. */
 const CONFIG_CANARIES = {
   nestedKey: "Qv7ZkT3mR9pXw2Lc",
   nestedValue: "Hj4NsB8yF6dGa1Ue",
@@ -582,16 +582,41 @@ const LIBRARY_ERROR_WORDING = [
   "not a directory", "Unexpected token", "Missing closing", "Map keys must be unique", "must start at the same column", "DECODER routines",
 ];
 
-function fragmentsOf(value, size = 8) {
-  const fragments = [];
-  for (let index = 0; index + size <= value.length; index += 1) fragments.push(value.slice(index, index + size));
-  return fragments;
+/** Every substring of a planted credential at lengths 6 through 24 (sliding windows), so a partial echo such as a JSON.parse window or a truncated token cannot pass a leak assertion. */
+function windowsOf(value, { min = 6, max = 24 } = {}) {
+  const windows = new Set();
+  for (let size = Math.min(min, value.length); size <= Math.min(max, value.length); size += 1) {
+    for (let index = 0; index + size <= value.length; index += 1) windows.add(value.slice(index, index + size));
+  }
+  return [...windows];
+}
+
+/** The window set of every planted secret, for bundle, zip, and payload scans through assertSecretsAbsent. */
+function leakWindows(secrets) {
+  return [...new Set(secrets.flatMap((secret) => windowsOf(secret)))];
+}
+
+function assertNoWindowOf(text, secret, label) {
+  for (const window of windowsOf(secret)) assert.ok(!text.includes(window), `${label} carries a window (${window}) of the planted credential: ${text.slice(0, 300)}`);
+}
+
+/**
+ * Fixture self-check: the legitimate values of a fixture (everything it serves
+ * with the planted canaries themselves removed) contain no 6-character window
+ * of any canary, so a window hit in an output can only be a leak.
+ */
+function assertFixtureFreeOfCanaryWindows(legitimateText, canaries, label) {
+  let legitimate = legitimateText;
+  for (const canary of [...canaries].sort((a, b) => b.length - a.length)) legitimate = legitimate.split(canary).join("");
+  for (const canary of canaries) {
+    for (const window of windowsOf(canary, { min: 6, max: 6 })) {
+      assert.ok(!legitimate.includes(window), `${label}: legitimate fixture text contains the window ${window} of canary ${canary}`);
+    }
+  }
 }
 
 function assertConfigErrorText(text, { path, code, line, column, canaries }, label) {
-  for (const canary of canaries) {
-    for (const fragment of fragmentsOf(canary)) assert.ok(!text.includes(fragment), `${label} carries a fragment (${fragment}) of ${canary}: ${text}`);
-  }
+  for (const canary of canaries) assertNoWindowOf(text, canary, `${label} (${canary})`);
   for (const wording of LIBRARY_ERROR_WORDING) assert.ok(!text.includes(wording), `${label} repeats library wording "${wording}": ${text}`);
   if (path) assert.ok(text.includes(path), `${label} names the path ${path}: ${text}`);
   assert.ok(text.includes(`(${code})`), `${label} carries the code ${code}: ${text}`);
@@ -639,7 +664,8 @@ test("rule 9: Okta config loader errors carry only the path, position, and code,
     writeFileSync(configFile, testCase.text);
     const library = thrownBy(() => parseYaml(testCase.text));
     assert.match(library.message, testCase.control, `${testCase.name}: positive control uses the library message`);
-    assert.ok(testCase.leaks.some((canary) => fragmentsOf(canary).some((fragment) => library.message.includes(fragment))), `${testCase.name}: positive control, the library message quotes the canary`);
+    assert.ok(testCase.leaks.some((canary) => windowsOf(canary).some((window) => library.message.includes(window))), `${testCase.name}: positive control, the library message quotes the canary`);
+    assertFixtureFreeOfCanaryWindows(testCase.text, allCanaries, `${testCase.name} config fixture`);
 
     const expected = { path: configFile, code: testCase.code, line: testCase.line, column: testCase.column, canaries: allCanaries };
     const thrown = await rejectionOf(resolveOktaConfiguration({ config_file: configFile }, {}, dir, homeDir));
@@ -1441,32 +1467,34 @@ test("self-check (d): compliant-org fixtures pass every automatable finding (29 
   }
 });
 
+/** Planted secrets: random alphanumerics (SSWS tokens keep their 00 prefix and 42-character length), so no 6-character window of one occurs in a legitimate fixture value. */
 const FAKE_SECRETS = {
-  appClientSecret: "FAKE_APP_CLIENT_SECRET_1",
-  swaPassword: "FAKE_SWA_PASSWORD_1",
-  secretHash: "FAKE_SECRET_HASH_1",
-  appNotesSsws: `00${"FAKE_SSWS_SHAPED_1".padEnd(40, "x")}`,
-  jwtPayload: "FAKE_JWT_PAYLOAD_1",
-  acsRelayState: "FAKE_ACS_RELAY_1",
-  idpClientSecret: "FAKE_IDP_CLIENT_SECRET_1",
-  hookPathToken: "FAKE_HOOK_PATH_TOKEN_1",
-  hookQueryToken: "FAKE_HOOK_QUERY_TOKEN_1",
-  hookHeaderValue: "FAKE_HOOK_HEADER_1",
-  hookCustomHeaderValue: "FAKE_HOOK_CUSTOM_HEADER_1",
-  hookAuthValue: "FAKE_HOOK_AUTH_1",
-  hecToken: "FAKE_HEC_TOKEN_1",
-  duoSecretKey: "FAKE_DUO_SECRET_KEY_1",
-  sessionToken: "FAKE_SESSION_TOKEN_1",
-  authnRequestId: "FAKE_AUTHN_REQUEST_1",
-  userPasswordValue: "FAKE_USER_PASSWORD_1",
-  recoveryAnswer: "FAKE_RECOVERY_ANSWER_1",
-  totpSharedSecret: "FAKE_TOTP_SHARED_SECRET_1",
-  sswsToken: "FAKE_SSWS_TOKEN_VALUE_1",
+  appClientSecret: "7Yx5FjWaghuQ55JkgA",
+  swaPassword: "2D2GP46d8TcMvqSPEv",
+  secretHash: "JQqJRUGezzfNVkMgqW",
+  appNotesSsws: "00dGXckREU3aRN3gfL69MYjEFFr9Cj8kfYyFXrZ3e9",
+  jwtPayload: "bFPe4VLM4KyB3nGRjE",
+  jwtSignature: "3JUDFcCTupVYJv58gY",
+  acsRelayState: "DZwS4t79QpHVdCJgUn",
+  idpClientSecret: "y7PFSxdGWneFdx234j",
+  hookPathToken: "98EkVfVxxMHrUjyyWb",
+  hookQueryToken: "TbEkCfZtJFNWNHzjwM",
+  hookHeaderValue: "6cwxPaScwNqhjU8ygX",
+  hookCustomHeaderValue: "qqbfLjKuvqVgNszmj6",
+  hookAuthValue: "nHaCnyfzL5fGnBFXGp",
+  hecToken: "QUXMgWm9fxYpbS3Ewa",
+  duoSecretKey: "jPpMDR6m22qMZCvQHL",
+  sessionToken: "BErgdVeGgbmYWqCxkf",
+  authnRequestId: "eQw65LsRKMVMGfc28K",
+  userPasswordValue: "rcRnVXAexjkGUVsQTy",
+  recoveryAnswer: "XM8GY3mhCW2FpgHn4a",
+  totpSharedSecret: "TZWTvADmT7CSsgrYHD",
+  sswsToken: "00QbNhmq3FzXaXEDy3zZU5fS2EepAmFzLGFkGmhBeB",
 };
 
 function fakeJwt() {
   const encode = (value) => Buffer.from(JSON.stringify(value)).toString("base64url");
-  return `${encode({ alg: "RS256" })}.${encode({ sub: FAKE_SECRETS.jwtPayload, aud: "okta" })}.FAKE_JWT_SIGNATURE_1`;
+  return `${encode({ alg: "RS256" })}.${encode({ sub: FAKE_SECRETS.jwtPayload, aud: "okta" })}.${FAKE_SECRETS.jwtSignature}`;
 }
 
 function secretUser(id, login) {
@@ -1657,18 +1685,37 @@ function createSecretFixtureClient() {
   };
 }
 
+/** The planted secrets whose windows must never appear: every FAKE_SECRETS value and the two variable segments of the fake JWT (its header is the constant RS256 header). */
 function secretValues() {
-  return [...Object.values(FAKE_SECRETS), fakeJwt()];
+  return [...Object.values(FAKE_SECRETS), ...fakeJwt().split(".").slice(1)];
+}
+
+/** Wraps a fixture client so that everything it serves is recorded, for the fixture self-check. */
+function recordingFixtureClient(client) {
+  const served = [];
+  const wrapped = {};
+  for (const [name, member] of Object.entries(client)) {
+    wrapped[name] = typeof member === "function"
+      ? async (...args) => {
+        const value = await member.apply(client, args);
+        served.push(value);
+        return value;
+      }
+      : member;
+  }
+  return { client: wrapped, served };
 }
 
 test("rule 9: exportOktaAuditBundle never writes client secrets, passwords, hook credentials, tokens, or debug URLs", async () => {
   const outputRoot = createTempBase("grclanker-okta-secrets-");
   const config = createSampleConfig({ token: FAKE_SECRETS.sswsToken });
-  const client = createSecretFixtureClient();
-  const secrets = secretValues();
+  const { client, served } = recordingFixtureClient(createSecretFixtureClient());
+  const planted = secretValues();
+  const secrets = leakWindows(planted);
 
   const result = await exportOktaAuditBundle(client, config, outputRoot);
   assert.equal(result.errorCount, 0);
+  assertFixtureFreeOfCanaryWindows(JSON.stringify(served), [...planted, fakeJwt()], "secret fixture");
   const files = readBundleFiles(result.outputDir);
   for (const expected of [
     "core_data/apps.json",
@@ -1698,10 +1745,7 @@ test("rule 9: exportOktaAuditBundle never writes client secrets, passwords, hook
     },
     config,
   );
-  const payloads = JSON.stringify({ results, access });
-  for (const secret of secrets) {
-    assert.ok(!payloads.includes(secret), `${secret} appears in a tool payload`);
-  }
+  assertSecretsAbsent(assert, new Map([["assess results and access check", JSON.stringify({ results, access })]]), secrets, "tool payloads");
   assert.equal(results.monitoring.summary.Fail, 0);
   assert.equal(statusOf(results.integrations, "OKTA-INTEG-006"), "Pass");
   assert.match(findingById(results.monitoring, "OKTA-MON-003").evidence[0], /^ThreatInsight action: block; excluded zones: 1$/);
@@ -1769,7 +1813,7 @@ test("rule 9: exportOktaAuditBundle never writes client secrets, passwords, hook
 });
 
 test("rule 9: OktaAuditorClient error strings drop the request cursor, raw bodies, and the caller's token", async () => {
-  const token = `00${"FAKE_LIVE_SSWS_TOKEN".padEnd(40, "y")}`;
+  const token = "00rffNJ2qLsPW5j9bFB7ZVsGWawJFvjtz2ryUf9WQj";
   const bodies = {
     "/api/v1/apps": () =>
       new Response(`<html>proxy error echoing SSWS ${token} ${"x".repeat(5000)}</html>`, {
@@ -1804,7 +1848,7 @@ test("rule 9: OktaAuditorClient error strings drop the request cursor, raw bodie
     (error) => {
       assert.match(error.message, /^Okta API request failed for \/api\/v1\/apps\?limit=200 \(502 Bad Gateway\): non-JSON error body \(\d+ chars\)$/);
       assert.ok(!error.message.includes("after="));
-      assert.ok(!error.message.includes(token));
+      assertNoWindowOf(error.message, token, "502 HTML error string");
       assert.ok(!error.message.includes("<html>"));
       return true;
     },
@@ -1813,7 +1857,7 @@ test("rule 9: OktaAuditorClient error strings drop the request cursor, raw bodie
     () => client.listGroups(),
     (error) => {
       assert.match(error.message, /\(403 Forbidden\): Rejected credential \[REDACTED\]$/);
-      assert.ok(!error.message.includes(token));
+      assertNoWindowOf(error.message, token, "403 JSON error string");
       return true;
     },
   );
@@ -1821,7 +1865,7 @@ test("rule 9: OktaAuditorClient error strings drop the request cursor, raw bodie
     () => client.listNetworkZones(),
     (error) => {
       assert.match(error.message, /\(500 Internal Server Error\): JSON error body without errorSummary \(\d+ chars\)$/);
-      assert.ok(!error.message.includes(token));
+      assertNoWindowOf(error.message, token, "500 JSON error string");
       return true;
     },
   );
@@ -1829,7 +1873,7 @@ test("rule 9: OktaAuditorClient error strings drop the request cursor, raw bodie
   const access = await runOktaAccessCheck(client, createSampleConfig({ token }));
   assert.equal(access.status, "limited");
   assert.ok(access.probes.every((probe) => probe.status !== "ok"));
-  assert.ok(!JSON.stringify(access).includes(token), "access check payload never echoes the token");
+  assertNoWindowOf(JSON.stringify(access), token, "access check payload");
   assert.ok(!JSON.stringify(access).includes("<html>"), "access check payload never echoes a raw body");
 });
 
@@ -2512,7 +2556,12 @@ test("rule 9: scrub boundary: a name-shaped value stays bare in prose and is rem
     ["Basic authentication is required", "Basic authentication is required"],
     ["InvalidAuthenticationToken: Access token has expired", "InvalidAuthenticationToken: Access token has expired"],
   ];
-  for (const [input, expected] of carriers) assert.equal(scrubErrorText(input), expected, input);
+  for (const [input, expected] of carriers) {
+    const scrubbed = scrubErrorText(input);
+    assert.equal(scrubbed, expected, input);
+    if (input.includes(name) && !expected.includes(name)) assertNoWindowOf(scrubbed, name, `carrier ${input}`);
+  }
+  assertNoWindowOf(scrubErrorText(bare, [name]), name, "configured secret in prose");
   const secret = 'top secret/value+1"x';
   const forms = {
     raw: secret,
@@ -2533,4 +2582,180 @@ test("rule 9: scrub boundary: a name-shaped value stays bare in prose and is rem
     "failed for /api/v1/users/aB3xZ9qL2mN8pR4tV7wY1/factors from /tmp/run-9b6rz9m4l55zg7/config.yaml and https://hooks.example.com/services/T0/[REDACTED]",
     "a token-shaped segment of a bare request target or file path is an identifier the run named; inside a URL it is a webhook token",
   );
+  assert.equal(
+    scrubErrorText("key wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY beside /api/v1/users/00u1abcd2EFGH3ijk4x5/roles"),
+    "key [REDACTED] beside /api/v1/users/00u1abcd2EFGH3ijk4x5/roles",
+    "a random 40-character base64 run is an AWS secret access key; a 40-character bare path of word segments is a request target",
+  );
+
+  // Must-keep table (addendum 7): every identifying string a summary may carry survives alone and inside a realistic sentence.
+  for (const value of OKTA_MUST_KEEP) {
+    assert.equal(scrubErrorText(value), value, `must keep bare: ${value}`);
+    for (const sentence of oktaSummarySentences(value)) assert.equal(scrubErrorText(sentence), sentence, `must keep in a sentence: ${sentence}`);
+  }
+});
+
+/** Every endpoint the Okta collectors request (sample ids in the per-parent paths), tenant names, principals, status text, finding ids. */
+const OKTA_REQUESTED_PATHS = [
+  "/api/v1/api-tokens",
+  "/api/v1/apps?limit=200",
+  "/api/v1/authenticators",
+  "/api/v1/authorizationServers/default",
+  "/api/v1/authorizationServers?limit=200",
+  "/api/v1/behaviors?limit=200",
+  "/api/v1/device-assurances?limit=200",
+  "/api/v1/eventHooks?limit=200",
+  "/api/v1/groups/00g1abcd2EFGH3ijk4x5/roles?limit=200",
+  "/api/v1/groups/00g1abcd2EFGH3ijk4x5/users?limit=200",
+  "/api/v1/groups?limit=200",
+  "/api/v1/groups/rules?limit=200",
+  "/api/v1/iam/assignees/users?limit=200",
+  "/api/v1/iam/assignees/users?limit=1",
+  "/api/v1/idps?limit=200",
+  "/api/v1/logs?limit=1",
+  "/api/v1/logs?since=2026-08-23T00:00:00.000Z&until=2026-09-22T00:00:00.000Z&limit=200",
+  "/api/v1/logStreams?limit=200",
+  "/api/v1/org/contacts",
+  "/api/v1/org/contacts/TECHNICAL",
+  "/api/v1/org/factors?limit=200",
+  "/api/v1/org/orgSettings/thirdPartyAdminSetting",
+  "/api/v1/org/privacy/oktaSupport",
+  "/api/v1/policies/00p1abcd2EFGH3ijk4x5/rules?limit=200",
+  "/api/v1/policies?type=PASSWORD&limit=200",
+  "/api/v1/policies?type=OKTA_SIGN_ON&limit=1",
+  "/api/v1/threats/configuration",
+  "/api/v1/trustedOrigins?limit=200",
+  "/api/v1/users/00u1abcd2EFGH3ijk4x5",
+  "/api/v1/users/00u1abcd2EFGH3ijk4x5/factors",
+  "/api/v1/users/00u1abcd2EFGH3ijk4x5/roles?limit=200",
+  "/api/v1/users?limit=200",
+  "/api/v1/users?limit=1",
+  "/api/v1/zones?limit=200",
+  "/oauth2/v1/token",
+];
+const OKTA_MUST_KEEP = [
+  ...OKTA_REQUESTED_PATHS,
+  ...OKTA_REQUESTED_PATHS.map((path) => `GET ${path}`),
+  "tenant.okta.gov",
+  "https://tenant.okta.gov",
+  "acme-prod-2026.okta.com",
+  "dev-123456.oktapreview.com",
+  "prod-us-east-2026",
+  "audit.bot@tenant.okta.gov",
+  "jane.doe@acme-prod.example.gov",
+  "SUPER_ADMIN",
+  "ORG_ADMIN",
+  "READ_ONLY_ADMIN",
+  "OKTA_SIGN_ON",
+  "ACCESS_POLICY",
+  "401 Unauthorized",
+  "403 Forbidden",
+  "404 Not Found",
+  "429 Too Many Requests",
+  "500 Internal Server Error",
+  "502 Bad Gateway",
+  "503 Service Unavailable",
+  ...OKTA_CHECK_IDS,
+  "home:.okta/okta.yaml",
+  "project:.okta.yaml",
+  "/home/auditor/.okta/okta.yaml",
+  "SSWS",
+  "PrivateKey",
+  "ERR_OSSL_UNSUPPORTED",
+  "INVALID_PRIVATE_KEY",
+  "BLOCK_AS_IMPLICIT_KEY",
+];
+
+/** Realistic Okta summary and error sentences with an identifying value in the slot such a value occupies. */
+function oktaSummarySentences(value) {
+  return [
+    `Certificate-based authentication could not be evaluated because the endpoint returned 403 Forbidden (missing scope or admin role): Okta API request failed for ${value} (403 Forbidden). Collect manually: export ${value} from the Okta admin console.`,
+    `- Auth mode: ${value}\n- API token inventory: empty with no error\n- Organization: ${value}`,
+    `Okta API request failed for ${value} (403 Forbidden): the endpoint returned 403 Forbidden (missing scope or admin role)`,
+    `Not requested: no role lookups were requested because the parent list ${value} was not collected (Okta API request failed for ${value} (403 Forbidden)).`,
+    `IdP data unavailable: ${value} (403 Forbidden)`,
+  ];
+}
+
+/** Every fixed text the Okta integration emits, with sample paths and names, passes its scrubber unchanged (GWS note 1). */
+const OKTA_FIXED_TEXTS = [
+  "Unable to read Okta config file /home/auditor/.okta/okta.yaml (EACCES)",
+  "Unable to read Okta config file /workspace/audit/.okta.yaml (UNREADABLE)",
+  "Unable to parse Okta config file: invalid YAML in /home/auditor/.okta/okta.yaml at line 4, column 12 (BLOCK_AS_IMPLICIT_KEY)",
+  "Unable to parse Okta config file: invalid YAML in /workspace/audit/.okta.yaml (INVALID_YAML)",
+  "Okta org URL is required. Set OKTA_CLIENT_ORGURL, configure .okta.yaml, or pass org_url explicitly.",
+  "Okta SSWS auth requires an API token. Set OKTA_CLIENT_TOKEN, configure token in .okta.yaml, or pass api_token explicitly.",
+  "Okta PrivateKey auth requires client_id. Set OKTA_CLIENT_CLIENTID, configure clientId in .okta.yaml, or pass client_id explicitly.",
+  "Okta PrivateKey auth requires private_key or client_assertion. Set OKTA_CLIENT_PRIVATEKEY, configure privateKey in .okta.yaml, or pass private_key explicitly.",
+  "Okta PrivateKey auth requires client_id plus either private_key or client_assertion.",
+  "Okta PrivateKey auth currently supports RSA private keys directly. For other key types, pass client_assertion explicitly.",
+  "Bearer access tokens are only used for PrivateKey mode.",
+  "the token listing returned zero tokens although the SSWS audit token itself should appear, so the inventory is incomplete",
+  "Zero SSWS API tokens exist while auditing through an OAuth service app; an empty token inventory is compliant by intent because no long-lived static tokens remain.",
+  "Rotate long-lived SSWS tokens and prefer OAuth service apps with scoped short-lived access tokens where possible.",
+  "Auth mode: SSWS",
+  "Auth mode: PrivateKey",
+  "API token inventory: empty with no error",
+  "Okta PrivateKey auth could not load the configured private key (ERR_OSSL_UNSUPPORTED). Provide an unencrypted RSA private key in PEM form.",
+  "Okta PrivateKey auth could not load the configured private key (INVALID_PRIVATE_KEY). Provide an unencrypted RSA private key in PEM form.",
+  "Okta API request failed for /api/v1/apps?limit=200 (502 Bad Gateway): non-JSON error body (5120 chars)",
+  "Okta API request failed for /api/v1/zones?limit=200 (500 Internal Server Error): JSON error body without errorSummary (37 chars)",
+  "Okta API request failed for /api/v1/idps?limit=200 (403 Forbidden): You do not have permission to perform the requested action",
+  "Okta API request failed for /api/v1/logs?limit=1 (429 Too Many Requests)",
+  "Okta API response from /api/v1/users?limit=200 (200) was not JSON (5120 chars)",
+  "Okta OAuth token request failed (401 Unauthorized): invalid_client",
+  "Not requested: no role lookups were requested because the parent list was not collected (Okta API request failed for /api/v1/iam/assignees/users?limit=200 (403 Forbidden)).",
+  "every lookup of the role assignments failed (3 of 3): the endpoint returned 403 Forbidden (missing scope or admin role)",
+  "User population listing is not available on this client.",
+  "Per-user factor listing is not available on this client.",
+  "Certificate-based authentication could not be evaluated because the endpoint returned 403 Forbidden (missing scope or admin role).",
+  "Privileged role assignments could not be evaluated because the endpoint returned 401 Unauthorized (credential rejected).",
+  "ThreatInsight could not be evaluated because the endpoint returned 404 Not Found (feature not enabled on this org edition).",
+  "Log streaming could not be evaluated because the collector did not expose this endpoint.",
+  "Event hooks could not be evaluated because the endpoint request failed.",
+  "Group rules could not be evaluated because the inventory it depends on was not collected, so its request was never issued.",
+  "Collect manually: export the identity providers list from Security > Identity Providers and the authenticators list from Security > Authenticators.",
+  "Cause: the endpoint returned 403 Forbidden (missing scope or admin role).",
+  "Error: Okta API request failed for /api/v1/idps?limit=200 (403 Forbidden): denied",
+  "IdP data unavailable: Okta API request failed for /api/v1/idps?limit=200 (403 Forbidden)",
+  "Org factors were unreadable (not consulted because authenticators were returned): Okta API request failed for /api/v1/org/factors?limit=200 (403 Forbidden)",
+  "Network zones unreadable (custom zone count unknown): Okta API request failed for /api/v1/zones?limit=200 (403 Forbidden)",
+  "sign-on and access policies were unreadable (the endpoint returned 403 Forbidden (missing scope or admin role))",
+  "identity providers and authenticators were unreadable (the endpoint returned 403 Forbidden (missing scope or admin role))",
+  "log streams and event hooks were unreadable (the endpoint returned 403 Forbidden (missing scope or admin role))",
+  "A certificate IdP was found, but the authenticator list was unreadable, so the other half of the certificate inventory could not be verified.",
+  "no ACTIVE certificate-oriented entry was found in the authenticator list while the identity provider list was unreadable (the endpoint returned 403 Forbidden (missing scope or admin role)), so this federal-domain tenant cannot be judged on half of the inventory",
+  "Okta Support access is DISABLED, but the third-party admin setting could not be read because the endpoint returned 404 Not Found (feature not enabled on this org edition).",
+  "Strong authenticators: unknown (authenticator list unreadable)",
+  "Config precedence resolved from: home:.okta/okta.yaml -> project:.okta.yaml -> environment -> arguments",
+  "Credential sources: environment, arguments.",
+  "Unable to allocate output directory under /tmp/okta-export",
+];
+
+test("rule 9: every fixed text the Okta integration emits passes its scrubber unchanged", () => {
+  for (const text of OKTA_FIXED_TEXTS) assert.equal(scrubErrorText(text), text, text);
+  for (const text of OKTA_FIXED_TEXTS) assert.equal(scrubErrorText(text, ["00QbNhmq3FzXaXEDy3zZU5fS2EepAmFzLGFkGmhBeB"]), text, `${text} (with a configured secret registered)`);
+});
+
+test("resolveOktaConfiguration keeps environment credentials when an unrelated argument is passed (GWS note 2)", async () => {
+  const dir = createTempBase("grclanker-okta-env-args-");
+  const homeDir = createTempBase("grclanker-okta-env-args-home-");
+  const env = { OKTA_CLIENT_ORGURL: "https://tenant.okta.gov", OKTA_CLIENT_TOKEN: "00QbNhmq3FzXaXEDy3zZU5fS2EepAmFzLGFkGmhBeB" };
+
+  const ssws = await resolveOktaConfiguration({ scopes: ["okta.users.read"] }, env, dir, homeDir);
+  assert.equal(ssws.token, env.OKTA_CLIENT_TOKEN, "the environment token survives an argument overlay that names no credential");
+  assert.equal(ssws.orgUrl, "https://tenant.okta.gov");
+  assert.deepEqual(ssws.sourceChain, ["environment", "arguments"]);
+
+  const privateKeyEnv = {
+    OKTA_CLIENT_ORGURL: "https://tenant.okta.gov",
+    OKTA_CLIENT_AUTHORIZATIONMODE: "PrivateKey",
+    OKTA_CLIENT_CLIENTID: "0oa1abcd2EFGH3ijk4x5",
+    OKTA_CLIENT_PRIVATEKEY: "-----BEGIN PRIVATE KEY-----\nQbNhmq3FzXaXEDy3zZU5fS2EepAmFzLGFkGmhBeB\n-----END PRIVATE KEY-----",
+  };
+  const privateKey = await resolveOktaConfiguration({ org_url: "https://tenant.okta.gov" }, privateKeyEnv, dir, homeDir);
+  assert.equal(privateKey.privateKey, privateKeyEnv.OKTA_CLIENT_PRIVATEKEY, "the environment private key survives an unrelated org_url argument");
+  assert.equal(privateKey.clientId, "0oa1abcd2EFGH3ijk4x5");
+  assert.equal(privateKey.authMode, "PrivateKey");
+  assert.deepEqual(privateKey.sourceChain, ["environment", "arguments"]);
 });

@@ -415,7 +415,9 @@ function endsClause(text: string, index: number): boolean {
   return CLAUSE_END_PATTERN.test(text);
 }
 
+/** A 40-character base64 run is an AWS secret access key when it is random-looking; a bare path of word segments ("/api/v1/users/<id>/roles") that happens to span 40 characters is a request target and stays. */
 function looksLikeAwsSecret(run: string): boolean {
+  if (run.startsWith("/") || run.split("/").some((segment) => /^(?:[a-z]+|v\d+)$/.test(segment))) return false;
   if (/[/+]/.test(run)) return true;
   return /\d/.test(run) && /[a-z]/.test(run) && /[A-Z]/.test(run);
 }
