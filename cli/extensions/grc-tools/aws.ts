@@ -456,6 +456,8 @@ function errorCode(error: unknown): string {
   return asString(object?.name) ?? asString(object?.Code) ?? asString(object?.code) ?? "";
 }
 
+const UNKNOWN_ERROR_CODE = "UnknownError";
+
 function errorHttpStatus(error: unknown): number | undefined {
   if (error instanceof AwsApiError) return error.httpStatus;
   const metadata = asObject(asObject(error)?.$metadata);
@@ -679,8 +681,9 @@ function describeError(error: unknown): string {
   const object = asObject(error);
   const code = errorCode(error);
   const status = errorHttpStatus(error);
-  const rawMessage = nonJsonBodyNote(object)
-    ?? (isParseError(error) ? PARSE_ERROR_NOTE : error instanceof Error ? error.message : String(error));
+  const rawMessage = asString(object?.$bodyNote)
+    ?? nonJsonBodyNote(object)
+    ?? (isParseError(error) ? PARSE_ERROR_NOTE : error instanceof Error ? error.message : asString(object?.message) ?? String(error));
   const message = code && rawMessage.startsWith(`${code}:`) ? rawMessage.slice(code.length + 1).trim() : rawMessage;
   const prefix = code
     ? (status !== undefined ? `${code} (HTTP ${status})` : code)
@@ -725,20 +728,190 @@ function toAwsApiError(error: unknown): Error {
   return new AwsApiError(error);
 }
 
-type SdkClient = { send: (...args: any[]) => any };
+type SdkClient = { send: (...args: any[]) => any; config?: unknown };
 
 /**
- * Overrides send() on one SDK client instance so every error it throws is rethrown as AwsApiError. The
- * prototype's send is looked up on each call, so the instance keeps following the SDK's implementation (or a
- * test fixture's patch of it); only the shape of the thrown error changes.
+ * The top-level output member each command the client sends is answered with; a list member is present (empty)
+ * even when the account holds nothing. When a command can answer with one of several members, any one counts.
+ * A 2xx whose deserialized output carries none of them was not a service response (a proxy's HTML page, an
+ * empty body the SDK turns into an output without members) and is thrown as IncompleteResponse rather than
+ * read as an empty inventory or a default.
+ */
+export const AWS_REQUIRED_OUTPUT_MEMBERS: Readonly<Record<string, readonly string[]>> = Object.freeze({
+  GetCallerIdentity: ["Account"],
+  GetAccountSummary: ["SummaryMap"],
+  GetAccountPasswordPolicy: ["PasswordPolicy"],
+  ListUsers: ["Users"],
+  ListMFADevices: ["MFADevices"],
+  ListAccessKeys: ["AccessKeyMetadata"],
+  GetAccessKeyLastUsed: ["AccessKeyLastUsed"],
+  GetAccountAuthorizationDetails: ["RoleDetailList", "UserDetailList", "GroupDetailList", "Policies"],
+  ListPolicies: ["Policies"],
+  GetPolicyVersion: ["PolicyVersion"],
+  LookupEvents: ["Events"],
+  DescribeTrails: ["trailList"],
+  GetTrailStatus: ["IsLogging"],
+  GetEventSelectors: ["TrailARN", "EventSelectors", "AdvancedEventSelectors"],
+  DescribeHub: ["HubArn"],
+  GetEnabledStandards: ["StandardsSubscriptions"],
+  DescribeConfigurationRecorders: ["ConfigurationRecorders"],
+  DescribeConfigurationRecorderStatus: ["ConfigurationRecordersStatus"],
+  ListDetectors: ["DetectorIds"],
+  GetDetector: ["Status", "ServiceRole"],
+  DescribeOrganization: ["Organization"],
+  ListAccounts: ["Accounts"],
+  ListTargetsForPolicy: ["Targets"],
+  ListAnalyzers: ["analyzers"],
+  ListFindings: ["findings"],
+  ListInstances: ["Instances"],
+  ListAssessments: ["assessmentMetadata"],
+  GetAlternateContact: ["AlternateContact"],
+  DescribeRegions: ["Regions"],
+  GetPublicAccessBlock: ["PublicAccessBlockConfiguration"],
+  ListBuckets: ["Buckets"],
+  GetBucketPolicyStatus: ["PolicyStatus"],
+  GetBucketEncryption: ["ServerSideEncryptionConfiguration"],
+  GetBucketPolicy: ["Policy"],
+  GetEbsEncryptionByDefault: ["EbsEncryptionByDefault"],
+  DescribeVpcs: ["Vpcs"],
+  DescribeFlowLogs: ["FlowLogs"],
+  DescribeNetworkAcls: ["NetworkAcls"],
+  DescribeSecurityGroups: ["SecurityGroups"],
+  DescribeDBInstances: ["DBInstances"],
+  ListKeys: ["Keys"],
+  DescribeKey: ["KeyMetadata"],
+  GetKeyRotationStatus: ["KeyRotationEnabled"],
+});
+
+const INCOMPLETE_RESPONSE_CODE = "IncompleteResponse";
+
+/** What the raw HTTP response carried, recorded before the SDK deserializer consumed it. */
+interface ObservedResponse {
+  statusCode?: number;
+  contentType?: string;
+  bodyBytes?: number;
+}
+
+type StreamCollector = (stream: unknown) => Promise<Uint8Array>;
+
+function headerValue(headers: unknown, name: string): string | undefined {
+  const record = asObject(headers);
+  if (!record) return undefined;
+  const entry = Object.entries(record).find(([key]) => key.toLowerCase() === name);
+  return asString(entry?.[1]);
+}
+
+/**
+ * Deserialize-step middleware inner to the SDK's deserializer: it sees the raw response first, records its
+ * status, content type, and body length, and hands the deserializer the same bytes. The body itself is never
+ * kept, so the shape guard can describe a 2xx the deserializer emptied by type and length alone.
+ */
+function observeResponseMiddleware(observed: ObservedResponse, streamCollector: StreamCollector | undefined) {
+  return (next: (args: unknown) => Promise<unknown>) => async (args: unknown): Promise<unknown> => {
+    const result = await next(args);
+    const response = asObject(asObject(result)?.response);
+    if (response) {
+      observed.statusCode = asNumber(response.statusCode);
+      observed.contentType = headerValue(response.headers, "content-type")?.split(";")[0]?.trim();
+      const body = response.body;
+      if (body === undefined || body === null) observed.bodyBytes = 0;
+      else if (body instanceof Uint8Array) observed.bodyBytes = body.byteLength;
+      else if (typeof body === "string") observed.bodyBytes = Buffer.byteLength(body, "utf8");
+      else if (streamCollector) {
+        const bytes = await streamCollector(body);
+        observed.bodyBytes = bytes.byteLength;
+        response.body = bytes;
+      }
+    }
+    return result;
+  };
+}
+
+/** The content-type-and-length note for a body the guard refused; "not observed" when no HTTP response was seen (a patched send). */
+function observedBodyNote(observed: ObservedResponse): string {
+  if (observed.bodyBytes === undefined) return "body: not observed";
+  if (observed.bodyBytes === 0) return "body: empty, 0 bytes";
+  return `body: ${observed.contentType ?? "unknown content type"}, ${observed.bodyBytes} bytes`;
+}
+
+/**
+ * A deserializer failure described from the observed response rather than from the SDK error. The SDK's
+ * deserializer raises V8's SyntaxError for a body that is not the service protocol and, in this SDK version,
+ * attaches neither the body nor its content type to it; an HTML page in place of any answer (a proxy's error
+ * page with a 502, an interstitial with a 200) is the same class. Both are recorded as the non-JSON body note
+ * built from the content type and byte length the middleware measured. Any other error passes through as-is.
+ */
+function withObservedBody(error: unknown, observed: ObservedResponse): unknown {
+  if (observed.bodyBytes === undefined || error instanceof AwsApiError || error instanceof AwsCredentialProviderError) return error;
+  const object = asObject(error);
+  if (typeof object?.$responseBodyText === "string") return error;
+  const htmlBody = observed.contentType !== undefined && /^text\/html$/i.test(observed.contentType);
+  if (!isParseError(error) && !htmlBody) return error;
+  const status = errorHttpStatus(error) ?? observed.statusCode;
+  return {
+    name: isParseError(error) ? "SyntaxError" : errorCode(error) || UNKNOWN_ERROR_CODE,
+    $metadata: status === undefined ? {} : { httpStatusCode: status },
+    $bodyNote: `non-JSON body (${observed.contentType ?? "unknown content type"}, ${observed.bodyBytes} bytes)`,
+  };
+}
+
+function commandName(command: unknown): string {
+  const constructor = (command as { constructor?: { name?: unknown } } | null)?.constructor;
+  return (asString(constructor?.name) ?? "").replace(/Command$/, "");
+}
+
+/**
+ * The shape guard at the send boundary: a 2xx output that lacks every member the command is answered with, or
+ * whose body was empty or an HTML page, is an unreadable surface. It is thrown as an SDK-shaped error named
+ * IncompleteResponse (the observed status, the command, the member, and the body note; never the body), which
+ * the caller turns into AwsApiError like any other failure, so the read renders manual or null downstream
+ * instead of an empty inventory or a default.
+ */
+function assertOutputShape(command: unknown, output: unknown, observed: ObservedResponse): void {
+  const name = commandName(command);
+  const required: readonly string[] | undefined = AWS_REQUIRED_OUTPUT_MEMBERS[name];
+  // Every command the client sends is in the table (a test holds it to the source); anything else is not judged.
+  if (!required) return;
+  const record = asObject(output);
+  const status = observed.statusCode ?? asNumber(asObject(record?.$metadata)?.httpStatusCode);
+  const present = required.some((member) => record?.[member] !== undefined);
+  const htmlBody = observed.contentType !== undefined && /^text\/html$/i.test(observed.contentType);
+  if (present && observed.bodyBytes !== 0 && !htmlBody) return;
+  const cause = {
+    name: INCOMPLETE_RESPONSE_CODE,
+    message: `${name} answered without its ${required.join("/")} member (${observedBodyNote(observed)})`,
+    $metadata: status === undefined ? {} : { httpStatusCode: status },
+  };
+  throw new AwsApiError(cause);
+}
+
+/**
+ * Overrides send() on one SDK client instance so every error it throws is rethrown as AwsApiError and every
+ * output it resolves passes the shape guard. The prototype's send is looked up on each call, so the instance
+ * keeps following the SDK's implementation (or a test fixture's patch of it, which the observing middleware
+ * never runs under); only the shape of the thrown error changes.
  */
 function guardSdkClient<T extends SdkClient>(client: T): T {
   const prototype = Object.getPrototypeOf(client) as SdkClient;
-  const guardedSend = async (...args: unknown[]): Promise<unknown> => {
+  const streamCollector = asObject(client.config)?.streamCollector as StreamCollector | undefined;
+  const guardedSend = async (command: unknown, ...rest: unknown[]): Promise<unknown> => {
+    const observed: ObservedResponse = {};
+    const stack = asObject(command)?.middlewareStack as { add?: (middleware: unknown, options: unknown) => void } | undefined;
+    if (typeof stack?.add === "function") {
+      stack.add(observeResponseMiddleware(observed, streamCollector), {
+        step: "deserialize",
+        priority: "low",
+        name: "grclankerObserveResponse",
+        tags: ["GRCLANKER_OBSERVE_RESPONSE"],
+        override: true,
+      });
+    }
     try {
-      return await prototype.send.apply(client, args);
+      const output = await prototype.send.apply(client, [command, ...rest]);
+      assertOutputShape(command, output, observed);
+      return output;
     } catch (error) {
-      throw toAwsApiError(error);
+      throw toAwsApiError(withObservedBody(error, observed));
     }
   };
   Object.defineProperty(client, "send", { value: guardedSend, writable: true, configurable: true });

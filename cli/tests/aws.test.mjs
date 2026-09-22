@@ -10,6 +10,8 @@ import {
   symlinkSync,
   writeFileSync,
 } from "node:fs";
+import dns from "node:dns";
+import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
 
@@ -17,6 +19,8 @@ import {
   AWS_CONTROL_CATALOG,
   AWS_FINDING_CONTROLS,
   AWS_FRAMEWORKS,
+  AWS_REQUIRED_OUTPUT_MEMBERS,
+  AwsApiError,
   AwsCredentialProviderError,
   assessAwsDataProtection,
   assessAwsIdentity,
@@ -42,6 +46,7 @@ import {
   AWS_CANARIES,
   CANARY_URL,
   FIXTURE_ACCOUNT,
+  canaryHtmlBody,
   contextLeakingDeniedError,
   healthySdkRoutes,
   proxyHtmlError,
@@ -2871,4 +2876,310 @@ test("config loader errors: a 200 answer whose body is short non-JSON text is re
   for (const [name, text] of readZipEntries(exported.zipPath)) assertNoShortBodyFragments(assert, text, `zip ${name}`);
   assertShortBodyRecordedAsNote(assert, files.get("_errors.log"), "_errors.log");
   assert.ok(log.some((entry) => entry.action === action && entry.status === 200 && entry.code === "SyntaxError"), "the 200 answer named in the note was observed");
+});
+
+// ---------------------------------------------------------------------------------------------------------------------
+// Real SDK parser path. A local HTTP server answers every request the AWS SDK makes, so each response travels through
+// the SDK's own deserializer (query XML for STS, IAM, and RDS; EC2 XML; restXml for S3; JSON 1.1 and restJson for the
+// rest) before it reaches the client, the guard, and the assessments.
+// ---------------------------------------------------------------------------------------------------------------------
+
+/** Services whose protocol is JSON (1.1 or restJson), by SigV4 signing name; the rest answer in XML. */
+const JSON_PROTOCOL_SERVICES = new Set(["cloudtrail", "securityhub", "organizations", "kms", "config", "guardduty", "access-analyzer", "sso", "auditmanager", "account"]);
+
+/** REST-protocol requests carry no Action field; the method and path name the operation. */
+const REST_ACTIONS = [
+  ["guardduty", /^GET \/detector$/, "ListDetectors"],
+  ["guardduty", /^GET \/detector\/[^/]+$/, "GetDetector"],
+  ["securityhub", /^GET \/accounts$/, "DescribeHub"],
+  ["securityhub", /^POST \/standards\/get$/, "GetEnabledStandards"],
+  ["access-analyzer", /^GET \/analyzer$/, "ListAnalyzers"],
+  ["access-analyzer", /^POST \/finding$/, "ListFindings"],
+  ["auditmanager", /^GET \/assessments$/, "ListAssessments"],
+  ["account", /^POST \/getAlternateContact$/, "GetAlternateContact"],
+  ["s3control", /^GET \/v20180820\/configuration\/publicAccessBlock$/, "GetPublicAccessBlock"],
+  ["s3", /^GET \/$/, "ListBuckets"],
+];
+
+/** The IAM-prefixed action label (iam:ListUsers) the integration records for one signed request. */
+function describeSdkRequest(req, body) {
+  const scope = /Credential=[^/]+\/\d{8}\/[^/]+\/([^/]+)\/aws4_request/.exec(req.headers.authorization ?? "");
+  const signed = scope?.[1] ?? "unsigned";
+  // S3 Control signs as s3; its account-scoped requests carry the account id header and a versioned path.
+  const service = signed === "s3" && req.headers["x-amz-account-id"] ? "s3control" : signed;
+  const path = req.url.split("?")[0];
+  const queryAction = /(?:^|&)Action=([A-Za-z]+)/.exec(body)?.[1];
+  const target = req.headers["x-amz-target"] ? String(req.headers["x-amz-target"]).split(".").pop() : undefined;
+  const rest = REST_ACTIONS.find(([restService, pattern]) => restService === service && pattern.test(`${req.method} ${path}`))?.[2];
+  return { service, action: queryAction ?? target ?? rest ?? `${req.method} ${path}`, label: `${service}:${queryAction ?? target ?? rest ?? `${req.method} ${path}`}` };
+}
+
+const escapeXml = (text) => text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+
+/** A genuine STS answer for the run's own identity, so the access check and the assessments get past their one primary. */
+const STS_IDENTITY_RESPONSE = Object.freeze({
+  status: 200,
+  contentType: "text/xml",
+  body: `<GetCallerIdentityResponse xmlns="https://sts.amazonaws.com/doc/2011-06-15/"><GetCallerIdentityResult><Arn>arn:aws:iam::${FIXTURE_ACCOUNT}:user/auditor</Arn><UserId>AIDAAUDITOR</UserId><Account>${FIXTURE_ACCOUNT}</Account></GetCallerIdentityResult><ResponseMetadata><RequestId>req-sts-identity</RequestId></ResponseMetadata></GetCallerIdentityResponse>`,
+});
+
+/**
+ * Runs `run` with the real AWS SDK sending every request to a local server that answers with respond(request). The
+ * SDK reaches it through AWS_ENDPOINT_URL with static environment credentials and a single attempt per request;
+ * `localhost` and its subdomains resolve to the server for the run (S3 Control prefixes the account id to the
+ * endpoint host). Every request is logged as { service, action, label, status }.
+ */
+async function withLocalAwsEndpoint(respond, run) {
+  const requests = [];
+  const server = createServer((req, res) => {
+    const chunks = [];
+    req.on("data", (chunk) => chunks.push(chunk));
+    req.on("end", () => {
+      const described = describeSdkRequest(req, Buffer.concat(chunks).toString("utf8"));
+      const response = respond(described);
+      requests.push({ ...described, status: response.status });
+      res.writeHead(response.status, { "content-type": response.contentType, "content-length": String(Buffer.byteLength(response.body)) });
+      res.end(response.body);
+    });
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const env = {
+    AWS_ENDPOINT_URL: `http://localhost:${server.address().port}`,
+    AWS_MAX_ATTEMPTS: "1",
+    AWS_RETRY_MODE: "standard",
+    AWS_ACCESS_KEY_ID: "AKIALOCALENDPOINT001",
+    AWS_SECRET_ACCESS_KEY: "local-endpoint-fixture-secret-access-key-2026",
+    AWS_REGION: "us-east-1",
+    AWS_EC2_METADATA_DISABLED: "true",
+    AWS_SHARED_CREDENTIALS_FILE: "/nonexistent/credentials",
+    AWS_CONFIG_FILE: "/nonexistent/config",
+  };
+  const cleared = ["AWS_PROFILE", "AWS_SESSION_TOKEN"];
+  const previous = Object.fromEntries([...Object.keys(env), ...cleared].map((key) => [key, process.env[key]]));
+  for (const key of cleared) delete process.env[key];
+  Object.assign(process.env, env);
+  const originalLookup = dns.lookup;
+  dns.lookup = function lookupLocalEndpoint(hostname, options, callback) {
+    if (typeof options === "function") {
+      callback = options;
+      options = {};
+    }
+    if (hostname === "localhost" || hostname.endsWith(".localhost")) {
+      return options?.all ? callback(null, [{ address: "127.0.0.1", family: 4 }]) : callback(null, "127.0.0.1", 4);
+    }
+    return originalLookup.call(dns, hostname, options, callback);
+  };
+  try {
+    return await run({ requests });
+  } finally {
+    dns.lookup = originalLookup;
+    for (const [key, value] of Object.entries(previous)) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+    await new Promise((resolve) => server.close(resolve));
+  }
+}
+
+/** Every reader the client exposes that takes no inventory-derived argument, one per SDK client and protocol. */
+const LOCAL_AWS_METHODS = [
+  ["getCallerIdentity", "sts", (client) => client.getCallerIdentity()],
+  ["getAccountSummary", "iam", (client) => client.getAccountSummary()],
+  ["listIamUsers", "iam", (client) => client.listIamUsers()],
+  ["getPasswordPolicy", "iam", (client) => client.getPasswordPolicy()],
+  ["getAccountAuthorizationDetails", "iam", (client) => client.getAccountAuthorizationDetails()],
+  ["listCustomerManagedPolicies", "iam", (client) => client.listCustomerManagedPolicies()],
+  ["describeTrails", "cloudtrail", (client) => client.describeTrails()],
+  ["lookupRootEvents", "cloudtrail", (client) => client.lookupRootEvents("us-east-1", new Date("2026-01-01T00:00:00Z"), new Date("2026-04-01T00:00:00Z"))],
+  ["describeSecurityHub", "securityhub", (client) => client.describeSecurityHub()],
+  ["getEnabledSecurityHubStandards", "securityhub", (client) => client.getEnabledSecurityHubStandards()],
+  ["describeConfigurationRecorders", "config", (client) => client.describeConfigurationRecorders()],
+  ["describeConfigurationRecorderStatus", "config", (client) => client.describeConfigurationRecorderStatus()],
+  ["listDetectors", "guardduty", (client) => client.listDetectors()],
+  ["describeOrganization", "organizations", (client) => client.describeOrganization()],
+  ["listAccounts", "organizations", (client) => client.listAccounts()],
+  ["listScps", "organizations", (client) => client.listScps()],
+  ["listAnalyzers", "access-analyzer", (client) => client.listAnalyzers()],
+  ["listIdentityCenterInstances", "sso", (client) => client.listIdentityCenterInstances()],
+  ["listActiveAuditManagerAssessments", "auditmanager", (client) => client.listActiveAuditManagerAssessments()],
+  ["getSecurityAlternateContact", "account", (client) => client.getSecurityAlternateContact()],
+  ["describeRegions", "ec2", (client) => client.describeRegions()],
+  ["getEbsEncryptionByDefault", "ec2", (client) => client.getEbsEncryptionByDefault("us-east-1")],
+  ["describeVpcs", "ec2", (client) => client.describeVpcs("us-east-1")],
+  ["describeFlowLogs", "ec2", (client) => client.describeFlowLogs("us-east-1")],
+  ["describeNetworkAcls", "ec2", (client) => client.describeNetworkAcls("us-east-1")],
+  ["describeSecurityGroups", "ec2", (client) => client.describeSecurityGroups("us-east-1")],
+  ["listBuckets", "s3", (client) => client.listBuckets()],
+  ["getAccountPublicAccessBlock", "s3control", (client) => client.getAccountPublicAccessBlock(FIXTURE_ACCOUNT)],
+  ["describeDbInstances", "rds", (client) => client.describeDbInstances("us-east-1")],
+  ["listKmsKeys", "kms", (client) => client.listKmsKeys("us-east-1")],
+];
+
+/** Everything a caller that logs the thrown error would see: name, message, every own property (enumerable or not), and the stack. */
+function thrownErrorRecord(error) {
+  const own = Object.fromEntries(Object.getOwnPropertyNames(error).map((key) => [key, error[key] instanceof Object ? JSON.stringify(error[key]) : String(error[key])]));
+  return JSON.stringify({ name: error.name, message: error.message, cause: String(error.cause), ...own });
+}
+
+/** Codes the local fixtures never serve; any of them in an output would be a condition the run invented. */
+const UNSERVED_CONDITIONS = /\b(AccessDenied(?:Exception)?|NoSuchEntity(?:Exception)?|ResourceNotFoundException|InvalidAccessException|AWSOrganizationsNotInUseException|UnauthorizedOperation|AuthFailure|ThrottlingException|ServiceUnavailableException|NoSuchBucketPolicy|NoSuchPublicAccessBlockConfiguration)\b/;
+
+async function runAwsTool(name, args) {
+  const { registerAwsTools } = await import("../dist/extensions/grc-tools/aws.js");
+  const registered = [];
+  registerAwsTools({ registerTool: (tool) => registered.push(tool) });
+  const tool = registered.find((item) => item.name === name);
+  assert.ok(tool, `${name} is registered`);
+  try {
+    return JSON.stringify(await tool.execute("call-1", args));
+  } catch (error) {
+    return `threw ${thrownErrorRecord(error)}`;
+  }
+}
+
+const SILENT_SUCCESS_SHAPES = {
+  "200 text/html": { status: 200, contentType: "text/html; charset=utf-8", body: canaryHtmlBody() },
+  "200 empty body": { status: 200, contentType: "text/xml", body: "" },
+};
+
+const INCOMPLETE_RESPONSE_NOTE = /^IncompleteResponse \(HTTP 200\): [A-Za-z]+ answered without its [A-Za-z/]+ member \(body: (?:text\/html, \d+ bytes|empty, 0 bytes)\)$/;
+const HTML_PARSE_NOTE = /^SyntaxError \(HTTP 200\): non-JSON body \(text\/html, \d+ bytes\)$/;
+
+for (const [shape, response] of Object.entries(SILENT_SUCCESS_SHAPES)) {
+  test(`silent success: a ${shape} answer through the real SDK parser path is an unreadable surface on every command, recorded with the status and the body note, never read as a default`, async () => {
+    const healthy = await withSdkRoutes(healthySdkRoutes(), [], () => runAllAssessments(realAwsClient()));
+    let serveIdentity = false;
+    await withLocalAwsEndpoint(
+      ({ action }) => (serveIdentity && action === "GetCallerIdentity" ? STS_IDENTITY_RESPONSE : response),
+      async ({ requests }) => {
+        const client = realAwsClient();
+        // Every reader, the run's own identity included, rejects with the fixed-text guard error.
+        for (const [name, service, call] of LOCAL_AWS_METHODS) {
+          await assert.rejects(() => call(client), (error) => {
+            const record = thrownErrorRecord(error);
+            assert.ok(error instanceof AwsApiError, `${name}: the client throws AwsApiError, not the SDK's error or a resolved default: ${record}`);
+            assert.equal(error.httpStatus, 200, `${name}: the observed status is kept`);
+            if (shape === "200 empty body" || !JSON_PROTOCOL_SERVICES.has(service)) {
+              assert.equal(error.code, "IncompleteResponse", `${name}: an output the deserializer emptied is IncompleteResponse: ${error.message}`);
+              assert.match(error.message, INCOMPLETE_RESPONSE_NOTE, name);
+            } else {
+              // A JSON-protocol deserializer rejects an HTML body outright; that path was already fixed text.
+              assert.equal(error.code, "SyntaxError", `${name}: ${error.message}`);
+              assert.match(error.message, HTML_PARSE_NOTE, name);
+            }
+            assert.deepEqual(
+              Object.getOwnPropertyNames(error).filter((key) => !["stack", "message", "name", "code", "httpStatus", "$metadata"].includes(key)),
+              [],
+              `${name}: nothing that can hold body text is retained on the thrown error`,
+            );
+            assertNoCanaryWindows(assert, record, AWS_PLANTED_CANARIES, `${name} thrown error`);
+            assert.doesNotMatch(record, PARSER_WORDING, `${name}: no parser wording`);
+            return true;
+          });
+        }
+        assert.ok(requests.length >= LOCAL_AWS_METHODS.length && requests.every((request) => request.status === 200), "every request was answered by the local server with 200");
+
+        // With the run's own identity served, the access check, every assessment, and the export see the same 200 answers.
+        serveIdentity = true;
+        const outputs = await runAllAssessments(client);
+        const exported = await exportAwsAuditBundle(client, client.getResolvedConfig(), createTempBase("grclanker-aws-silent-success-"));
+
+        const access = outputs.access;
+        assert.equal(access.status, "limited");
+        assert.equal(access.accountId, FIXTURE_ACCOUNT, "the served identity is read");
+        for (const probe of access.surfaces) {
+          assert.equal(probe.status, "not_readable", `${probe.name}: a 200 that carries nothing is not a readable surface`);
+          assert.equal(probe.count, null, `${probe.name}: no count`);
+          assert.equal(probe.truncated, null, `${probe.name}: no truncation state`);
+          assert.equal(probe.http_status, 200, `${probe.name}: the observed status`);
+          assert.ok(["IncompleteResponse", "SyntaxError"].includes(probe.error_code), `${probe.name}: ${probe.error_code}`);
+          assert.ok(INCOMPLETE_RESPONSE_NOTE.test(probe.error) || HTML_PARSE_NOTE.test(probe.error), `${probe.name}: ${probe.error}`);
+        }
+        assert.ok(access.notes.includes(`0/${access.surfaces.length} AWS audit surfaces are readable.`), access.notes.join(" | "));
+
+        for (const [name, result] of Object.entries(outputs)) {
+          if (name === "access") continue;
+          for (const finding of result.findings) {
+            assert.equal(finding.status, "manual", `${name} ${finding.id}: a finding whose every read answered with nothing renders manual, never pass or fail: ${finding.summary}`);
+          }
+          assertNoDefaultedLeaves(healthy[name], result, `${name} under ${shape}`);
+        }
+        assertNoDefaultedLeaves(healthy.access, access, `access check under ${shape}`);
+
+        const files = readBundleFiles(exported.outputDir);
+        const text = [JSON.stringify(outputs), ...files.values()].join("\n");
+        for (const fragment of ['"users": 0', '"user_inventory_truncated": false', '"security_hub_enabled": true', '"collection_errors": 0', "Root MFA enabled=false", '"status": "pass"', '"status": "fail"']) {
+          assert.ok(!text.includes(fragment), `no output renders the default ${fragment}`);
+        }
+        assert.doesNotMatch(text, UNSERVED_CONDITIONS, "no output names a condition the fixture never served");
+        assert.deepEqual([...namedStatuses(text)], [200], "the only status named anywhere is the one every response carried");
+        const requested = new Set(requests.map((request) => request.label));
+        for (const action of namedActions(text)) {
+          assert.ok(requested.has(action), `action ${action} is named in output but the run never issued it (requested: ${[...requested].join(", ")})`);
+        }
+        assertNoCanaryWindows(assert, text, AWS_PLANTED_CANARIES, `outputs and bundle under ${shape}`);
+        assert.doesNotMatch(text, PARSER_WORDING);
+        for (const [name, entry] of readZipEntries(exported.zipPath)) assertNoCanaryWindows(assert, entry, AWS_PLANTED_CANARIES, `zip ${name}`);
+        assert.match(files.get("_errors.log"), /IncompleteResponse \(HTTP 200\): [A-Za-z]+ answered without its/, "_errors.log records the guard's note");
+        if (shape === "200 text/html") assert.match(files.get("_errors.log"), /SyntaxError \(HTTP 200\): non-JSON body \(text\/html, \d+ bytes\)/);
+      },
+    );
+  });
+}
+
+test("silent success: the shape guard also holds behind a patched send, so a route that answers without the command's member is IncompleteResponse rather than an empty inventory", async () => {
+  const log = [];
+  const routes = { ...healthySdkRoutes(), "iam:ListUsers": () => ({}) };
+  await withSdkRoutes(routes, log, async () => {
+    const client = realAwsClient();
+    await assert.rejects(() => client.listIamUsers(), (error) => {
+      assert.ok(error instanceof AwsApiError);
+      assert.equal(error.code, "IncompleteResponse");
+      assert.equal(error.httpStatus, undefined, "a patched send carries no HTTP response, so no status is invented");
+      assert.equal(error.message, "IncompleteResponse: ListUsers answered without its Users member (body: not observed)");
+      return true;
+    });
+    const access = await checkAwsAccess(client);
+    const probe = access.surfaces.find((surface) => surface.name === "iam_users");
+    assert.equal(probe.status, "not_readable");
+    assert.equal(probe.error_code, "IncompleteResponse");
+    assert.equal(probe.http_status, null);
+    assert.equal(probe.count, null);
+    const identity = await assessAwsIdentity(client);
+    assert.equal(identity.summary.users, null, "the user inventory renders null, not 0");
+    assert.equal(findingById(identity, "AWS-IAM-02").status, "manual");
+  });
+});
+
+test("silent success: the required-member table names every command the client sends and nothing else", () => {
+  const source = readFileSync(new URL("../extensions/grc-tools/aws.ts", import.meta.url), "utf8");
+  const aliases = new Map([...source.matchAll(/(\w+Command) as (\w+Command)/g)].map(([, original, alias]) => [alias, original]));
+  const sent = new Set([...source.matchAll(/new (\w+Command)\(/g)].map(([, name]) => (aliases.get(name) ?? name).replace(/Command$/, "")));
+  assert.deepEqual([...sent].filter((name) => !AWS_REQUIRED_OUTPUT_MEMBERS[name]), [], "every command the client sends has a required-member entry");
+  assert.deepEqual(Object.keys(AWS_REQUIRED_OUTPUT_MEMBERS).filter((name) => !sent.has(name)), [], "no entry names a command the client does not send");
+  for (const [name, members] of Object.entries(AWS_REQUIRED_OUTPUT_MEMBERS)) {
+    assert.ok(members.length > 0 && members.every((member) => /^[A-Za-z]+$/.test(member)), `${name}: member names are identifiers`);
+  }
+});
+
+test("rule 9: a 502 HTML page through the real SDK parser path is recorded on every protocol as the non-JSON body note with the observed status, measured from the response rather than quoted from the SDK error", async () => {
+  const page = { status: 502, contentType: "text/html; charset=utf-8", body: canaryHtmlBody() };
+  await withLocalAwsEndpoint(() => page, async ({ requests }) => {
+    const client = realAwsClient();
+    for (const [name, , call] of LOCAL_AWS_METHODS) {
+      await assert.rejects(() => call(client), (error) => {
+        const record = thrownErrorRecord(error);
+        assert.ok(error instanceof AwsApiError, `${name}: ${record}`);
+        assert.equal(error.httpStatus, 502, name);
+        assert.match(error.message, new RegExp(`^(?:Unknown|SyntaxError) \\(HTTP 502\\): non-JSON body \\(text/html, ${Buffer.byteLength(page.body)} bytes\\)$`), `${name}: ${error.message}`);
+        assertNoCanaryWindows(assert, record, AWS_PLANTED_CANARIES, `${name} thrown error`);
+        assert.doesNotMatch(record, PARSER_WORDING, name);
+        return true;
+      });
+    }
+    assert.ok(requests.length >= LOCAL_AWS_METHODS.length && requests.every((request) => request.status === 502));
+    const text = await runAwsTool("aws_check_access", { region: "us-east-1", account_id: FIXTURE_ACCOUNT });
+    assert.match(text, /AWS access check failed: Unknown \(HTTP 502\): non-JSON body \(text\/html, \d+ bytes\)/);
+    assertNoCanaryWindows(assert, text, AWS_PLANTED_CANARIES, "aws_check_access payload");
+  });
 });
