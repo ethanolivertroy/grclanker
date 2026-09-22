@@ -132,6 +132,29 @@ export interface OktaAccessProbe {
   path: string;
   status: OktaEndpointStatus;
   detail: string;
+  /** HTTP status of the failed probe request; null when the probe was readable or failed without an HTTP status. */
+  httpStatus: number | null;
+}
+
+/** What core_data carries in place of a dataset that was denied, errored, or never requested, so a denial is never mistaken for an empty inventory. */
+export interface OktaNotCollectedMarker {
+  collected: false;
+  status: number | null;
+  endpoint: string | null;
+  error: string;
+}
+
+/** Carries the HTTP status and the request target so collectors can name the request that actually failed. */
+export class OktaApiError extends Error {
+  readonly status: number | null;
+  readonly endpoint: string;
+
+  constructor(message: string, status: number | null, endpoint: string) {
+    super(message);
+    this.name = "OktaApiError";
+    this.status = status;
+    this.endpoint = endpoint;
+  }
 }
 
 export interface OktaAccessCheckResult {
@@ -180,14 +203,20 @@ export interface OktaAssessmentResult {
   findings: OktaFinding[];
   summary: Record<OktaFindingStatus, number>;
   text: string;
-  snapshotSummary: Record<string, number | string>;
+  /** Counts read from a dataset that was not collected render null, never 0. */
+  snapshotSummary: Record<string, number | string | null>;
 }
 
 interface CollectedDataset<T = unknown> {
   data: T;
   error?: string;
-  truncated?: boolean;
+  /** false when the walk finished, true when it stopped early, null when the dataset was not collected. */
+  truncated?: boolean | null;
   truncationNote?: string;
+  /** Set when nothing was collected (denied, errored, unavailable, or not requested): what core_data carries instead of `data`. */
+  notCollected?: OktaNotCollectedMarker;
+  /** Markers for the children of a per-parent collection that were denied or errored, keyed by parent id. */
+  childMarkers?: Record<string, OktaNotCollectedMarker>;
 }
 
 interface PaginatedList {
@@ -1371,10 +1400,20 @@ export class OktaAuditorClient {
       headers.set("authorization", await this.authHeader());
     }
 
-    const response = await this.fetchImpl(makeUrl(this.config, pathOrUrl), {
-      ...init,
-      headers,
-    });
+    const target = describeRequestTarget(this.config, pathOrUrl);
+    let response: Response;
+    try {
+      response = await this.fetchImpl(makeUrl(this.config, pathOrUrl), {
+        ...init,
+        headers,
+      });
+    } catch (error) {
+      throw new OktaApiError(
+        this.redactSecrets(`Okta API request failed for ${target}: ${errorText(error)}`),
+        null,
+        target,
+      );
+    }
 
     if (response.status === 429 && attempt < DEFAULT_RATE_LIMIT_RETRIES) {
       await delay(retryDelayFromResponse(response));
@@ -1389,10 +1428,12 @@ export class OktaAuditorClient {
 
     if (!response.ok) {
       const detail = await readErrorDetail(response);
-      throw new Error(
+      throw new OktaApiError(
         this.redactSecrets(
-          `Okta API request failed for ${describeRequestTarget(this.config, pathOrUrl)} (${response.status} ${response.statusText})${detail ? `: ${detail}` : ""}`,
+          `Okta API request failed for ${target} (${response.status} ${response.statusText})${detail ? `: ${detail}` : ""}`,
         ),
+        response.status,
+        target,
       );
     }
 
@@ -1448,7 +1489,7 @@ export class OktaAuditorClient {
       const response = await this.request(nextUrl);
       const payload = (await response.json()) as unknown;
       if (!Array.isArray(payload)) {
-        throw new Error(`Expected array response from ${target}`);
+        throw new OktaApiError(`Expected array response from ${target}`, null, target);
       }
       items.push(...payload.map((entry) => asRecord(entry)));
       pagesFetched += 1;
@@ -1619,6 +1660,41 @@ function errorText(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
+/** The HTTP status the failed request observed: carried by OktaApiError, otherwise read from the "(403 Forbidden)" text a lightweight client's error names. */
+function errorStatus(error: unknown): number | null {
+  if (error instanceof OktaApiError) return error.status;
+  const match = /\((\d{3}) /.exec(errorText(error));
+  return match ? Number(match[1]) : null;
+}
+
+/** The request target the failure names, so a marker never carries an endpoint the run did not request. */
+function errorEndpoint(error: unknown): string | null {
+  if (error instanceof OktaApiError) return error.endpoint;
+  const text = errorText(error);
+  const match = /request failed for (\S+) \(\d{3} /.exec(text) ?? /request failed for (\S+?): /.exec(text);
+  return match ? match[1] : null;
+}
+
+function notCollectedMarker(error: unknown): OktaNotCollectedMarker {
+  return { collected: false, status: errorStatus(error), endpoint: errorEndpoint(error), error: errorText(error) };
+}
+
+/** A dataset whose request failed: the fallback stays in memory for the verdicts, the marker is what the bundle writes, and truncated is null because no walk ran. */
+function failedDataset<T>(fallback: T, error: unknown): CollectedDataset<T> {
+  return { data: fallback, error: errorText(error), truncated: null, notCollected: notCollectedMarker(error) };
+}
+
+/** A dataset this client cannot read at all (the method is not exposed): recorded as an error the verdicts treat as unreadable, with no HTTP status or endpoint invented. */
+function unavailableDataset<T>(fallback: T, reason: string): CollectedDataset<T> {
+  return { data: fallback, error: reason, truncated: null, notCollected: { collected: false, status: null, endpoint: null, error: reason } };
+}
+
+/** A dataset whose requests were never issued because the inventory it hangs off was not collected: the error names the parent's real failure, and no HTTP status or endpoint of its own is invented. */
+function skippedDataset<T>(fallback: T, reason: string): CollectedDataset<T> {
+  const error = `Not requested: ${reason}`;
+  return { data: fallback, error, truncated: null, notCollected: { collected: false, status: null, endpoint: null, error } };
+}
+
 /** Every list lands here: records are redacted (or projected) before they are kept, and a page-capped walk forwards truncated plus its note. */
 async function collectArrayDataset(
   fetcher: () => Promise<ListResult>,
@@ -1633,7 +1709,7 @@ async function collectArrayDataset(
       truncationNote,
     };
   } catch (error) {
-    return { data: [], error: errorText(error) };
+    return failedDataset([], error);
   }
 }
 
@@ -1645,25 +1721,32 @@ async function collectObjectDataset<T>(
     const data = await fetcher();
     return { data: redactSnapshot(data) as T };
   } catch (error) {
-    return { data: fallback, error: errorText(error) };
+    return failedDataset(fallback, error);
   }
 }
 
 /**
  * Per-parent list loops (rules per policy, roles per user, members per group,
  * factors per user): each child list is normalized, redacted, and its
- * truncation note kept so the consumer can demote.
+ * truncation note kept so the consumer can demote. A child that was denied or
+ * errored is left out of the map (consumers read a missing key as unread, never
+ * as an empty list) and keeps a marker under its parent id for the bundle; when
+ * the parent inventory itself was not collected no child request is issued and
+ * the whole map carries a not-requested marker.
  */
 async function collectRecordMap(
-  parents: JsonRecord[],
+  parents: CollectedDataset<JsonRecord[]>,
   fetcher: (parentId: string) => Promise<ListResult>,
-  onError: "empty" | "omit" = "empty",
 ): Promise<CollectedDataset<Record<string, JsonRecord[]>>> {
+  if (parents.notCollected) {
+    return skippedDataset({}, `the parent list was not collected (${parents.notCollected.error}).`);
+  }
   const data: Record<string, JsonRecord[]> = {};
   const errors: string[] = [];
   const notes: string[] = [];
+  const childMarkers: Record<string, OktaNotCollectedMarker> = {};
 
-  for (const parent of parents) {
+  for (const parent of parents.data) {
     const parentId = asString(parent.id);
     if (!parentId) continue;
     try {
@@ -1673,7 +1756,7 @@ async function collectRecordMap(
       if (note) notes.push(`${parentId}: ${note}`);
     } catch (error) {
       errors.push(`${parentId}: ${errorText(error)}`);
-      if (onError === "empty") data[parentId] = [];
+      childMarkers[parentId] = notCollectedMarker(error);
     }
   }
 
@@ -1682,14 +1765,106 @@ async function collectRecordMap(
     error: errors.length > 0 ? errors.join("; ") : undefined,
     truncated: notes.length > 0,
     truncationNote: joinNotes(notes),
+    ...(errors.length > 0 ? { childMarkers } : {}),
   };
 }
 
 async function collectPolicyRuleMap(
   client: Pick<OktaAuditorClient, "listPolicyRules">,
-  policies: JsonRecord[],
+  policies: CollectedDataset<JsonRecord[]>,
 ): Promise<CollectedDataset<Record<string, JsonRecord[]>>> {
   return collectRecordMap(policies, (policyId) => client.listPolicyRules(policyId));
+}
+
+/**
+ * What core_data carries for a dataset: the data when it was collected, its
+ * marker when nothing was, and, for a per-parent collection, the collected
+ * children plus a marker for every child that failed (array datasets append
+ * the markers with the child key as `id`).
+ */
+function coreDataSnapshot(dataset: CollectedDataset<unknown>): unknown {
+  if (dataset.notCollected) return dataset.notCollected;
+  if (!dataset.childMarkers) return dataset.data;
+  if (Array.isArray(dataset.data)) {
+    return [...dataset.data, ...Object.entries(dataset.childMarkers).map(([id, marker]) => ({ id, ...marker }))];
+  }
+  return { ...asRecord(dataset.data), ...dataset.childMarkers };
+}
+
+/** True when the dataset's request ran and returned, so its counts are real rather than defaults. */
+function wasCollected(dataset: CollectedDataset<unknown>): boolean {
+  return dataset.notCollected === undefined;
+}
+
+/** A count derived from a dataset: null, never 0, when the dataset was not collected. */
+function countIfCollected(count: number, ...datasets: Array<CollectedDataset<unknown>>): number | null {
+  return datasets.every(wasCollected) ? count : null;
+}
+
+/** A label derived from a dataset: "not collected" when the dataset was not collected. */
+function labelIfCollected(label: string, ...datasets: Array<CollectedDataset<unknown>>): string {
+  return datasets.every(wasCollected) ? label : "not collected";
+}
+
+function countNotCollected(datasets: Array<CollectedDataset<unknown>>): number {
+  return datasets.filter((dataset) => !wasCollected(dataset)).length;
+}
+
+/** How a core_data file is shaped: a list of records, a per-parent map of lists, or a single object. */
+type OktaCoreDataShape = "list" | "map" | "object";
+
+type OktaCoreDataFile = [file: string, dataset: CollectedDataset<unknown>, shape: OktaCoreDataShape];
+
+export interface OktaCollectionStatusEntry {
+  file: string;
+  shape: OktaCoreDataShape;
+  /** True when the dataset's own request ran and returned; false when it was denied, errored, unavailable, or never requested. */
+  collected: boolean;
+  /** True when the walk finished and every child request succeeded; null when the dataset was not collected. */
+  complete: boolean | null;
+  /** Items for a list, parents read for a map; null for a single object and whenever the dataset was not collected. */
+  count: number | null;
+  truncated: boolean | null;
+  truncation_note: string | null;
+  /** HTTP status and target of the request that failed; null when the dataset was collected or the failure carried none. */
+  status: number | null;
+  endpoint: string | null;
+  error: string | null;
+}
+
+export interface OktaCollectionStatus {
+  datasets: OktaCollectionStatusEntry[];
+  not_collected: string[];
+  truncated: string[];
+}
+
+/**
+ * core_data/collection_status.json: one row per core_data file. A dataset that
+ * was not collected renders null for every flag and counter (never 0 or false)
+ * and names the HTTP status and endpoint of the request that actually failed.
+ */
+function buildCollectionStatus(files: OktaCoreDataFile[]): OktaCollectionStatus {
+  const datasets = files.map(([file, dataset, shape]): OktaCollectionStatusEntry => {
+    const collected = wasCollected(dataset);
+    const counted = collected && shape !== "object";
+    return {
+      file,
+      shape,
+      collected,
+      complete: collected ? !dataset.error && !dataset.truncated : null,
+      count: counted ? (Array.isArray(dataset.data) ? dataset.data.length : Object.keys(asRecord(dataset.data)).length) : null,
+      truncated: counted ? Boolean(dataset.truncated) : null,
+      truncation_note: collected ? dataset.truncationNote ?? null : null,
+      status: dataset.notCollected?.status ?? null,
+      endpoint: dataset.notCollected?.endpoint ?? null,
+      error: dataset.error ?? null,
+    };
+  });
+  return {
+    datasets,
+    not_collected: datasets.filter((entry) => !entry.collected).map((entry) => entry.file),
+    truncated: datasets.filter((entry) => entry.truncated === true).map((entry) => entry.file),
+  };
 }
 
 export async function collectOktaAuthenticationData(
@@ -1709,9 +1884,9 @@ export async function collectOktaAuthenticationData(
   const mfaPolicies = await collectArrayDataset(() => client.listPolicies("MFA_ENROLL"));
   const accessPolicies = await collectArrayDataset(() => client.listPolicies("ACCESS_POLICY"));
 
-  const signOnPolicyRules = await collectPolicyRuleMap(client, signOnPolicies.data);
-  const passwordPolicyRules = await collectPolicyRuleMap(client, passwordPolicies.data);
-  const accessPolicyRules = await collectPolicyRuleMap(client, accessPolicies.data);
+  const signOnPolicyRules = await collectPolicyRuleMap(client, signOnPolicies);
+  const passwordPolicyRules = await collectPolicyRuleMap(client, passwordPolicies);
+  const accessPolicyRules = await collectPolicyRuleMap(client, accessPolicies);
 
   return {
     signOnPolicies,
@@ -1751,10 +1926,7 @@ async function collectUsersDataset(
   client: OktaAdminAccessClient,
 ): Promise<CollectedDataset<JsonRecord[]>> {
   if (!client.listUsersWithMeta) {
-    return {
-      data: [],
-      error: "User population listing is not available on this client.",
-    };
+    return unavailableDataset([], "User population listing is not available on this client.");
   }
   try {
     const page = toPaginatedList(await client.listUsersWithMeta());
@@ -1767,27 +1939,27 @@ async function collectUsersDataset(
         : undefined,
     };
   } catch (error) {
-    return { data: [], error: errorText(error) };
+    return failedDataset([], error);
   }
 }
 
 async function collectPrivilegedUserFactors(
   client: OktaAdminAccessClient,
-  privilegedUsers: JsonRecord[],
+  privilegedUsers: CollectedDataset<JsonRecord[]>,
 ): Promise<CollectedDataset<Record<string, JsonRecord[]>>> {
   if (!client.listUserFactors) {
-    return { data: {}, error: "Per-user factor listing is not available on this client." };
+    return unavailableDataset({}, "Per-user factor listing is not available on this client.");
   }
-  const scoped = privilegedUsers.slice(0, MAX_PRIVILEGED_FACTOR_LOOKUPS);
-  const factors = await collectRecordMap(scoped, (userId) => client.listUserFactors!(userId), "omit");
-  const truncated = privilegedUsers.length > scoped.length;
+  const scoped = privilegedUsers.data.slice(0, MAX_PRIVILEGED_FACTOR_LOOKUPS);
+  const factors = await collectRecordMap({ ...privilegedUsers, data: scoped }, (userId) => client.listUserFactors!(userId));
+  if (factors.notCollected) return factors;
+  const truncated = privilegedUsers.data.length > scoped.length;
   return {
-    data: factors.data,
-    error: factors.error,
+    ...factors,
     truncated: truncated || factors.truncated,
     truncationNote: joinNotes([
       truncated
-        ? `Factor enrollment was read for ${scoped.length} of ${privilegedUsers.length} privileged users.`
+        ? `Factor enrollment was read for ${scoped.length} of ${privilegedUsers.data.length} privileged users.`
         : undefined,
       factors.truncationNote,
     ]),
@@ -1798,7 +1970,7 @@ export async function collectOktaAdminAccessData(
   client: OktaAdminAccessClient,
 ): Promise<OktaAdminAccessData> {
   const usersWithRoleAssignments = await collectArrayDataset(() => client.listUsersWithRoleAssignments());
-  const userRoles = await collectRecordMap(usersWithRoleAssignments.data, (userId) => client.listUserRoles(userId));
+  const userRoles = await collectRecordMap(usersWithRoleAssignments, (userId) => client.listUserRoles(userId));
 
   const groups = await collectArrayDataset(() => client.listGroups());
   const privilegedGroups = groups.data.filter((group) =>
@@ -1808,33 +1980,35 @@ export async function collectOktaAdminAccessData(
   );
 
   const groupsTruncated = privilegedGroups.length > MAX_PRIVILEGED_GROUP_LOOKUPS;
-  const expandedGroups = privilegedGroups.slice(0, MAX_PRIVILEGED_GROUP_LOOKUPS);
+  const expandedGroups: CollectedDataset<JsonRecord[]> = { ...groups, data: privilegedGroups.slice(0, MAX_PRIVILEGED_GROUP_LOOKUPS) };
   const privilegedGroupRoles = await collectRecordMap(expandedGroups, (groupId) => client.listGroupRoles(groupId));
   const privilegedGroupMembers = await collectRecordMap(expandedGroups, (groupId) => client.listGroupUsers(groupId));
 
   const users = await collectUsersDataset(client);
-  const privilegedUserFactors = await collectPrivilegedUserFactors(client, usersWithRoleAssignments.data);
+  const privilegedUserFactors = await collectPrivilegedUserFactors(client, usersWithRoleAssignments);
   const oktaSupportAccess = client.getOktaSupportSettings
     ? await collectObjectDataset(() => client.getOktaSupportSettings!(), null)
-    : { data: null, error: "Okta Support access settings are not available on this client." };
+    : unavailableDataset<JsonRecord | null>(null, "Okta Support access settings are not available on this client.");
   const thirdPartyAdminSetting = client.getThirdPartyAdminSetting
     ? await collectObjectDataset(() => client.getThirdPartyAdminSetting!(), null)
-    : { data: null, error: "Third-party admin setting is not available on this client." };
+    : unavailableDataset<JsonRecord | null>(null, "Third-party admin setting is not available on this client.");
 
   return {
     usersWithRoleAssignments,
     userRoles,
     groups,
-    privilegedGroups: {
-      data: privilegedGroups,
-      truncated: groupsTruncated || groups.truncated,
-      truncationNote: joinNotes([
-        groupsTruncated
-          ? `Only the first ${MAX_PRIVILEGED_GROUP_LOOKUPS} of ${privilegedGroups.length} admin-like groups were expanded.`
-          : undefined,
-        groups.truncationNote,
-      ]),
-    },
+    privilegedGroups: groups.notCollected
+      ? { ...groups, data: privilegedGroups }
+      : {
+          data: privilegedGroups,
+          truncated: groupsTruncated || groups.truncated,
+          truncationNote: joinNotes([
+            groupsTruncated
+              ? `Only the first ${MAX_PRIVILEGED_GROUP_LOOKUPS} of ${privilegedGroups.length} admin-like groups were expanded.`
+              : undefined,
+            groups.truncationNote,
+          ]),
+        },
     privilegedGroupRoles,
     privilegedGroupMembers,
     users,
@@ -1867,14 +2041,14 @@ export async function collectOktaIntegrationData(
     trustedOrigins: await collectArrayDataset(() => client.listTrustedOrigins()),
     networkZones: await collectArrayDataset(() => client.listNetworkZones()),
     accessPolicies,
-    accessPolicyRules: await collectPolicyRuleMap(client, accessPolicies.data),
+    accessPolicyRules: await collectPolicyRuleMap(client, accessPolicies),
     signOnPolicies,
-    signOnPolicyRules: await collectPolicyRuleMap(client, signOnPolicies.data),
+    signOnPolicyRules: await collectPolicyRuleMap(client, signOnPolicies),
     idps: await collectArrayDataset(() => client.listIdps()),
     authorizationServers: await collectArrayDataset(() => client.listAuthorizationServers()),
     groupRules: client.listGroupRules
       ? await collectArrayDataset(() => client.listGroupRules!())
-      : { data: [], error: "Group rule listing is not available on this client." },
+      : unavailableDataset<JsonRecord[]>([], "Group rule listing is not available on this client."),
   };
 }
 
@@ -1894,12 +2068,13 @@ async function collectOrgContacts(
   client: OktaMonitoringClient,
 ): Promise<CollectedDataset<JsonRecord[]>> {
   if (!client.listOrgContacts || !client.getOrgContactUser) {
-    return { data: [], error: "Org contact listing is not available on this client." };
+    return unavailableDataset<JsonRecord[]>([], "Org contact listing is not available on this client.");
   }
   try {
     const contactTypes = toPaginatedList(await client.listOrgContacts());
     const resolved: JsonRecord[] = [];
     const errors: string[] = [];
+    const childMarkers: Record<string, OktaNotCollectedMarker> = {};
     for (const contact of contactTypes.items) {
       const contactType = asString(contact.contactType);
       if (!contactType) continue;
@@ -1915,6 +2090,7 @@ async function collectOrgContacts(
         });
       } catch (error) {
         errors.push(`${contactType}: ${errorText(error)}`);
+        childMarkers[contactType] = notCollectedMarker(error);
       }
     }
     return {
@@ -1922,9 +2098,10 @@ async function collectOrgContacts(
       error: errors.length > 0 ? errors.join("; ") : undefined,
       truncated: contactTypes.truncated,
       truncationNote: truncationNoteOf(contactTypes),
+      ...(errors.length > 0 ? { childMarkers } : {}),
     };
   } catch (error) {
-    return { data: [], error: errorText(error) };
+    return failedDataset<JsonRecord[]>([], error);
   }
 }
 
@@ -1989,7 +2166,7 @@ function buildAssessmentText(
   title: string,
   organization: string,
   findings: OktaFinding[],
-  snapshotSummary: Record<string, number | string>,
+  snapshotSummary: Record<string, number | string | null>,
 ): string {
   const summary = summarizeFindings(findings);
   const header = [
@@ -1999,7 +2176,7 @@ function buildAssessmentText(
 
   const summaryLines = Object.entries(snapshotSummary).map(([key, value]) => {
     const label = key.replace(/_/g, " ");
-    return `${label}: ${value}`;
+    return `${label}: ${value ?? "not collected"}`;
   });
 
   const rows = findings.map((finding) => [
@@ -2161,6 +2338,7 @@ function userLogin(user: JsonRecord): string {
 }
 
 function describeEndpointError(error: string): string {
+  if (/^Not requested: /.test(error)) return "the inventory it depends on was not collected, so its request was never issued";
   if (/\(403 /.test(error)) return "the endpoint returned 403 Forbidden (missing scope or admin role)";
   if (/\(401 /.test(error)) return "the endpoint returned 401 Unauthorized (credential rejected)";
   if (/\(404 /.test(error)) return "the endpoint returned 404 Not Found (feature not enabled on this org edition)";
@@ -2808,32 +2986,34 @@ export function assessOktaAuthentication(
     );
   }
 
+  const authenticationDatasets = [
+    data.signOnPolicies,
+    data.signOnPolicyRules,
+    data.passwordPolicies,
+    data.passwordPolicyRules,
+    data.mfaPolicies,
+    data.accessPolicies,
+    data.accessPolicyRules,
+    data.authenticators,
+    data.idps,
+    data.authorizationServers,
+    data.defaultAuthorizationServer,
+    data.orgFactors,
+  ];
   const snapshotSummary = {
-    active_authenticators: activeAuthenticators.length,
-    strong_authenticators: strongAuthenticators.length,
-    phishing_resistant_authenticators: phishingResistantAuthenticators.length,
-    restricted_authenticators: restrictedAuthenticators.length,
-    okta_verify_fips_mode: fipsMode ?? "not reported",
-    password_policies: passwordPolicies.length,
-    sign_on_policies: data.signOnPolicies.data.length,
-    access_policies: data.accessPolicies.data.length,
-    admin_dashboard_policies: adminPolicyCount,
-    admin_mfa_rules: adminMfaRules.length,
+    active_authenticators: countIfCollected(activeAuthenticators.length, data.authenticators),
+    strong_authenticators: countIfCollected(strongAuthenticators.length, data.authenticators),
+    phishing_resistant_authenticators: countIfCollected(phishingResistantAuthenticators.length, data.authenticators),
+    restricted_authenticators: countIfCollected(restrictedAuthenticators.length, data.authenticators),
+    okta_verify_fips_mode: labelIfCollected(fipsMode ?? "not reported", data.authenticators),
+    password_policies: countIfCollected(passwordPolicies.length, data.passwordPolicies),
+    sign_on_policies: countIfCollected(data.signOnPolicies.data.length, data.signOnPolicies),
+    access_policies: countIfCollected(data.accessPolicies.data.length, data.accessPolicies),
+    admin_dashboard_policies: countIfCollected(adminPolicyCount, data.signOnPolicies, data.accessPolicies),
+    admin_mfa_rules: countIfCollected(adminMfaRules.length, data.signOnPolicies, data.signOnPolicyRules, data.accessPolicies, data.accessPolicyRules),
     federal_domain: String(isFederalTenant),
-    dataset_errors: listErrors([
-      data.signOnPolicies,
-      data.signOnPolicyRules,
-      data.passwordPolicies,
-      data.passwordPolicyRules,
-      data.mfaPolicies,
-      data.accessPolicies,
-      data.accessPolicyRules,
-      data.authenticators,
-      data.idps,
-      data.authorizationServers,
-      data.defaultAuthorizationServer,
-      data.orgFactors,
-    ]).length,
+    dataset_errors: listErrors(authenticationDatasets).length,
+    datasets_not_collected: countNotCollected(authenticationDatasets),
   };
 
   const demoted = applyTruncationDemotions(findings, data, AUTHENTICATION_FINDING_SOURCES);
@@ -3200,29 +3380,31 @@ export function assessOktaAdminAccess(
     );
   }
 
+  const adminDatasets = [
+    data.usersWithRoleAssignments,
+    data.userRoles,
+    data.groups,
+    data.privilegedGroupRoles,
+    data.privilegedGroupMembers,
+    data.users,
+    data.privilegedUserFactors,
+    data.oktaSupportAccess,
+    data.thirdPartyAdminSetting,
+  ];
   const snapshotSummary = {
-    privileged_users: privilegedUsers.length,
-    super_admins: superAdmins.length,
-    stale_privileged_users: stalePrivileged.length,
-    privileged_users_without_last_login: unknownActivityPrivileged.length,
-    privileged_users_factor_checked: factorsReadCount,
-    privileged_groups_reviewed: privilegedGroups.length,
-    users_listed: users.length,
-    users_listing_truncated: String(Boolean(data.users.truncated)),
-    stale_active_users: staleActiveUsers.length,
-    never_activated_users: neverActivatedUsers.length,
-    okta_support_access: supportState ?? "unknown",
-    dataset_errors: listErrors([
-      data.usersWithRoleAssignments,
-      data.userRoles,
-      data.groups,
-      data.privilegedGroupRoles,
-      data.privilegedGroupMembers,
-      data.users,
-      data.privilegedUserFactors,
-      data.oktaSupportAccess,
-      data.thirdPartyAdminSetting,
-    ]).length,
+    privileged_users: countIfCollected(privilegedUsers.length, data.usersWithRoleAssignments),
+    super_admins: countIfCollected(superAdmins.length, data.usersWithRoleAssignments, data.userRoles),
+    stale_privileged_users: countIfCollected(stalePrivileged.length, data.usersWithRoleAssignments),
+    privileged_users_without_last_login: countIfCollected(unknownActivityPrivileged.length, data.usersWithRoleAssignments),
+    privileged_users_factor_checked: countIfCollected(factorsReadCount, data.privilegedUserFactors),
+    privileged_groups_reviewed: countIfCollected(privilegedGroups.length, data.groups),
+    users_listed: countIfCollected(users.length, data.users),
+    users_listing_truncated: labelIfCollected(String(Boolean(data.users.truncated)), data.users),
+    stale_active_users: countIfCollected(staleActiveUsers.length, data.users),
+    never_activated_users: countIfCollected(neverActivatedUsers.length, data.users),
+    okta_support_access: labelIfCollected(supportState ?? "unknown", data.oktaSupportAccess),
+    dataset_errors: listErrors(adminDatasets).length,
+    datasets_not_collected: countNotCollected(adminDatasets),
   };
 
   const demoted = applyTruncationDemotions(findings, data, ADMIN_ACCESS_FINDING_SOURCES);
@@ -3505,30 +3687,32 @@ export function assessOktaIntegrations(
     );
   }
 
+  const integrationDatasets = [
+    data.apps,
+    data.trustedOrigins,
+    data.networkZones,
+    data.accessPolicies,
+    data.accessPolicyRules,
+    data.signOnPolicies,
+    data.signOnPolicyRules,
+    data.idps,
+    data.authorizationServers,
+    data.groupRules,
+  ];
   const snapshotSummary = {
-    applications: apps.length,
-    active_applications: activeApps.length,
-    risky_oidc_apps: riskyApps.length,
-    trusted_origins: trustedOrigins.length,
-    insecure_trusted_origins: insecureOrigins.length,
-    custom_network_zones: customZones.length,
-    contextual_rules: riskAwareRules.length,
-    inactive_apps: inactiveApps.length,
-    provisioning_apps: provisioningApps.length,
-    deactivation_push_apps: deactivationApps.length,
-    active_group_rules: activeGroupRules.length,
-    dataset_errors: listErrors([
-      data.apps,
-      data.trustedOrigins,
-      data.networkZones,
-      data.accessPolicies,
-      data.accessPolicyRules,
-      data.signOnPolicies,
-      data.signOnPolicyRules,
-      data.idps,
-      data.authorizationServers,
-      data.groupRules,
-    ]).length,
+    applications: countIfCollected(apps.length, data.apps),
+    active_applications: countIfCollected(activeApps.length, data.apps),
+    risky_oidc_apps: countIfCollected(riskyApps.length, data.apps),
+    trusted_origins: countIfCollected(trustedOrigins.length, data.trustedOrigins),
+    insecure_trusted_origins: countIfCollected(insecureOrigins.length, data.trustedOrigins),
+    custom_network_zones: countIfCollected(customZones.length, data.networkZones),
+    contextual_rules: countIfCollected(riskAwareRules.length, data.signOnPolicies, data.signOnPolicyRules, data.accessPolicies, data.accessPolicyRules),
+    inactive_apps: countIfCollected(inactiveApps.length, data.apps),
+    provisioning_apps: countIfCollected(provisioningApps.length, data.apps),
+    deactivation_push_apps: countIfCollected(deactivationApps.length, data.apps),
+    active_group_rules: countIfCollected(activeGroupRules.length, data.groupRules),
+    dataset_errors: listErrors(integrationDatasets).length,
+    datasets_not_collected: countNotCollected(integrationDatasets),
   };
 
   const demoted = applyTruncationDemotions(findings, data, INTEGRATION_FINDING_SOURCES);
@@ -3921,29 +4105,31 @@ export function assessOktaMonitoring(
     ),
   );
 
+  const monitoringDatasets = [
+    data.eventHooks,
+    data.logStreams,
+    data.systemLogs,
+    data.behaviors,
+    data.threatInsight,
+    data.apiTokens,
+    data.deviceAssurance,
+    data.orgContacts,
+  ];
   const snapshotSummary = {
-    active_event_hooks: activeHooks.length,
-    active_log_streams: activeStreams.length,
-    system_log_events: data.systemLogs.data.length,
-    behaviors: data.behaviors.data.length,
-    threat_insight_mode: insightMode,
-    api_tokens: tokens.length,
-    stale_api_tokens: staleTokens.length,
-    undated_api_tokens: undatedTokens.length,
-    unrestricted_api_tokens: unrestrictedTokens.length,
-    expired_api_tokens: expiredTokens.length,
-    device_assurance_policies: data.deviceAssurance.data.length,
-    org_contacts_resolved: contacts.length,
-    dataset_errors: listErrors([
-      data.eventHooks,
-      data.logStreams,
-      data.systemLogs,
-      data.behaviors,
-      data.threatInsight,
-      data.apiTokens,
-      data.deviceAssurance,
-      data.orgContacts,
-    ]).length,
+    active_event_hooks: countIfCollected(activeHooks.length, data.eventHooks),
+    active_log_streams: countIfCollected(activeStreams.length, data.logStreams),
+    system_log_events: countIfCollected(data.systemLogs.data.length, data.systemLogs),
+    behaviors: countIfCollected(data.behaviors.data.length, data.behaviors),
+    threat_insight_mode: labelIfCollected(insightMode, data.threatInsight),
+    api_tokens: countIfCollected(tokens.length, data.apiTokens),
+    stale_api_tokens: countIfCollected(staleTokens.length, data.apiTokens),
+    undated_api_tokens: countIfCollected(undatedTokens.length, data.apiTokens),
+    unrestricted_api_tokens: countIfCollected(unrestrictedTokens.length, data.apiTokens),
+    expired_api_tokens: countIfCollected(expiredTokens.length, data.apiTokens),
+    device_assurance_policies: countIfCollected(data.deviceAssurance.data.length, data.deviceAssurance),
+    org_contacts_resolved: countIfCollected(contacts.length, data.orgContacts),
+    dataset_errors: listErrors(monitoringDatasets).length,
+    datasets_not_collected: countNotCollected(monitoringDatasets),
   };
 
   const demoted = applyTruncationDemotions(findings, data, MONITORING_FINDING_SOURCES);
@@ -3987,18 +4173,16 @@ export async function runOktaAccessCheck(
         path: probe.path,
         status: "ok",
         detail: "readable",
+        httpStatus: null,
       });
     } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
+      const httpStatus = errorStatus(error);
       probes.push({
         key: probe.key,
         path: probe.path,
-        status: /\(403 /.test(message)
-          ? "forbidden"
-          : /\(401 /.test(message)
-            ? "unauthorized"
-            : "error",
-        detail: message,
+        status: httpStatus === 403 ? "forbidden" : httpStatus === 401 ? "unauthorized" : "error",
+        detail: errorText(error),
+        httpStatus,
       });
     }
   }
@@ -4140,6 +4324,8 @@ function buildQuickReference(): string {
     "# Okta Audit Bundle Quick Reference",
     "",
     "- `core_data/` contains the Okta API responses used during this assessment with credential-bearing fields (client secrets, passwords, header values, tokens) replaced by [REDACTED], event hook URIs reduced to scheme and host, and System Log events projected to identity and outcome fields.",
+    "- A core_data file for a dataset that was denied, errored, or never requested holds a marker object ({ collected: false, status, endpoint, error }) rather than an empty list; a readable inventory with no records is written as []. Per-parent files carry a marker under the id of every child list that failed.",
+    "- `core_data/collection_status.json` lists every core_data file with collected, complete, count, truncated, and the failed request's status and endpoint; flags of a dataset that was not collected are null.",
     "- `analysis/` contains normalized findings and category summaries.",
     "- `compliance/` contains the executive summary, unified matrix, and per-framework reports.",
     "- `compliance/fedramp/oscal_assessment_results.json` is an OSCAL 1.1.2 assessment-results document keyed by NIST SP 800-53 objective ids.",
@@ -4403,45 +4589,46 @@ export async function exportOktaAuditBundle(
     outputRoot,
     safeDirName(`${new URL(config.orgUrl).hostname}-audit-bundle`),
   );
-  const coreDataFiles: Array<[string, unknown]> = [
-    ["core_data/sign_on_policies.json", authentication.signOnPolicies.data],
-    ["core_data/sign_on_policy_rules.json", authentication.signOnPolicyRules.data],
-    ["core_data/password_policies.json", authentication.passwordPolicies.data],
-    ["core_data/password_policy_rules.json", authentication.passwordPolicyRules.data],
-    ["core_data/mfa_enrollment_policies.json", authentication.mfaPolicies.data],
-    ["core_data/access_policies.json", authentication.accessPolicies.data],
-    ["core_data/access_policy_rules.json", authentication.accessPolicyRules.data],
-    ["core_data/authenticators.json", authentication.authenticators.data],
-    ["core_data/idps.json", authentication.idps.data],
-    ["core_data/authorization_servers.json", authentication.authorizationServers.data],
-    ["core_data/default_authorization_server.json", authentication.defaultAuthorizationServer.data],
-    ["core_data/org_factors.json", authentication.orgFactors.data],
-    ["core_data/users_with_role_assignments.json", adminAccess.usersWithRoleAssignments.data],
-    ["core_data/user_roles.json", adminAccess.userRoles.data],
-    ["core_data/groups.json", adminAccess.groups.data],
-    ["core_data/privileged_group_roles.json", adminAccess.privilegedGroupRoles.data],
-    ["core_data/privileged_group_members.json", adminAccess.privilegedGroupMembers.data],
-    ["core_data/users.json", adminAccess.users.data],
-    ["core_data/privileged_user_factors.json", adminAccess.privilegedUserFactors.data],
-    ["core_data/okta_support_access.json", adminAccess.oktaSupportAccess.data],
-    ["core_data/third_party_admin_setting.json", adminAccess.thirdPartyAdminSetting.data],
-    ["core_data/apps.json", integrations.apps.data],
-    ["core_data/trusted_origins.json", integrations.trustedOrigins.data],
-    ["core_data/network_zones.json", integrations.networkZones.data],
-    ["core_data/group_rules.json", integrations.groupRules.data],
-    ["core_data/event_hooks.json", monitoring.eventHooks.data],
-    ["core_data/log_streams.json", monitoring.logStreams.data],
-    ["core_data/system_logs_recent.json", monitoring.systemLogs.data],
-    ["core_data/behaviors.json", monitoring.behaviors.data],
-    ["core_data/threat_insight.json", monitoring.threatInsight.data],
-    ["core_data/api_tokens.json", monitoring.apiTokens.data],
-    ["core_data/device_assurance.json", monitoring.deviceAssurance.data],
-    ["core_data/org_contacts.json", monitoring.orgContacts.data],
+  const coreDataFiles: OktaCoreDataFile[] = [
+    ["core_data/sign_on_policies.json", authentication.signOnPolicies, "list"],
+    ["core_data/sign_on_policy_rules.json", authentication.signOnPolicyRules, "map"],
+    ["core_data/password_policies.json", authentication.passwordPolicies, "list"],
+    ["core_data/password_policy_rules.json", authentication.passwordPolicyRules, "map"],
+    ["core_data/mfa_enrollment_policies.json", authentication.mfaPolicies, "list"],
+    ["core_data/access_policies.json", authentication.accessPolicies, "list"],
+    ["core_data/access_policy_rules.json", authentication.accessPolicyRules, "map"],
+    ["core_data/authenticators.json", authentication.authenticators, "list"],
+    ["core_data/idps.json", authentication.idps, "list"],
+    ["core_data/authorization_servers.json", authentication.authorizationServers, "list"],
+    ["core_data/default_authorization_server.json", authentication.defaultAuthorizationServer, "object"],
+    ["core_data/org_factors.json", authentication.orgFactors, "list"],
+    ["core_data/users_with_role_assignments.json", adminAccess.usersWithRoleAssignments, "list"],
+    ["core_data/user_roles.json", adminAccess.userRoles, "map"],
+    ["core_data/groups.json", adminAccess.groups, "list"],
+    ["core_data/privileged_group_roles.json", adminAccess.privilegedGroupRoles, "map"],
+    ["core_data/privileged_group_members.json", adminAccess.privilegedGroupMembers, "map"],
+    ["core_data/users.json", adminAccess.users, "list"],
+    ["core_data/privileged_user_factors.json", adminAccess.privilegedUserFactors, "map"],
+    ["core_data/okta_support_access.json", adminAccess.oktaSupportAccess, "object"],
+    ["core_data/third_party_admin_setting.json", adminAccess.thirdPartyAdminSetting, "object"],
+    ["core_data/apps.json", integrations.apps, "list"],
+    ["core_data/trusted_origins.json", integrations.trustedOrigins, "list"],
+    ["core_data/network_zones.json", integrations.networkZones, "list"],
+    ["core_data/group_rules.json", integrations.groupRules, "list"],
+    ["core_data/event_hooks.json", monitoring.eventHooks, "list"],
+    ["core_data/log_streams.json", monitoring.logStreams, "list"],
+    ["core_data/system_logs_recent.json", monitoring.systemLogs, "list"],
+    ["core_data/behaviors.json", monitoring.behaviors, "list"],
+    ["core_data/threat_insight.json", monitoring.threatInsight, "object"],
+    ["core_data/api_tokens.json", monitoring.apiTokens, "list"],
+    ["core_data/device_assurance.json", monitoring.deviceAssurance, "list"],
+    ["core_data/org_contacts.json", monitoring.orgContacts, "list"],
   ];
 
-  for (const [pathName, value] of coreDataFiles) {
-    await writeSecureTextFile(outputDir, pathName, serializeJson(value));
+  for (const [pathName, dataset] of coreDataFiles) {
+    await writeSecureTextFile(outputDir, pathName, serializeJson(coreDataSnapshot(dataset)));
   }
+  await writeSecureTextFile(outputDir, "core_data/collection_status.json", serializeJson(buildCollectionStatus(coreDataFiles)));
 
   for (const assessment of assessments) {
     await writeSecureTextFile(
