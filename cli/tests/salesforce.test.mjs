@@ -34,6 +34,7 @@ import { getRegisteredToolSummaries } from "../dist/pi/tool-catalog.js";
 import { assertSecretFragmentsAbsent, readBundleFiles, readZipEntries } from "./helpers/bundle-contents.mjs";
 import { CONFIG_CANARIES, assertConfigLoaderMatrix, configLoaderCases } from "./helpers/config-loader-matrix.mjs";
 import { assertFixedTextsSurvive, collectFixedTexts, collectThrownMessage, collectToolTexts, logLines } from "./helpers/fixed-text-survival.mjs";
+import { assertLeavesNullUnderDenial } from "./helpers/leaf-diff.mjs";
 import { assertFragmentsAbsent, assertPlantedValuesWellFormed } from "./helpers/planted-values.mjs";
 import { assertScrubBoundary } from "./helpers/scrub-boundary-matrix.mjs";
 
@@ -1574,6 +1575,59 @@ test("rule 1 corollary: multi-inventory findings never pass when a secondary inv
   }), { now: NOW }), "SF-04");
   assert.equal(noSource.status, "manual");
   assert.match(noSource.summary, /the SecurityHealthCheckRisks query was forbidden/);
+});
+
+test("round 2 SEND BACK 3: leaf diff per denial, the SF-01, SF-09, and SF-11 leaves derived from a denied dataset render null and no other leaf becomes an empty reading", () => {
+  // SF-01 under SecurityHealthCheckRisks denied: the score stays, every risk-derived leaf is null.
+  const platformBaseline = findingById(assessSalesforcePlatformData(goodPlatformData()), "SF-01");
+  const risksDenied = findingById(assessSalesforcePlatformData(goodPlatformData({ healthCheckRisks: forbiddenDataset("SecurityHealthCheckRisks", []) })), "SF-01");
+  assert.deepEqual(platformBaseline.evidence.high_risk_settings, [], "the healthy fixture has no high risk (a complete empty reading)");
+  assert.equal(platformBaseline.evidence.settings_evaluated, 1);
+  assertLeavesNullUnderDenial(assert, {
+    label: "SF-01 under listHealthCheckRisks denied",
+    baseline: platformBaseline.evidence,
+    denied: risksDenied.evidence,
+    nullLeaves: ["high_risk_settings", "medium_risk_settings", "settings_evaluated", "risks_truncated"],
+  });
+  assert.equal(risksDenied.evidence.score, 95, "the readable score is kept");
+  assert.equal(risksDenied.status, "manual");
+  assert.match(risksDenied.summary, /the per-setting risk list could not be read because the SecurityHealthCheckRisks query was forbidden/);
+
+  // SF-09 under PermissionSetAssignment denied, with and without elevated permission sets.
+  const elevatedSets = [{ Id: "PS-god", Name: "God Mode", IsOwnedByProfile: false, PermissionsModifyAllData: true }];
+  for (const [label, overrides] of [
+    ["no elevated set", {}],
+    ["an elevated set", { permissionSets: okDataset("PermissionSet", elevatedSets), assignments: okDataset("PermissionSetAssignment", [{ Id: "A1", AssigneeId: "U2", PermissionSetId: "PS-god", Assignee: { IsActive: true } }]) }],
+  ]) {
+    const identityBaseline = findingById(assessSalesforceIdentityData(goodIdentityData(overrides), { now: NOW }), "SF-09");
+    const assignmentsDenied = findingById(assessSalesforceIdentityData(goodIdentityData({ ...overrides, assignments: forbiddenDataset("PermissionSetAssignment", []) }), { now: NOW }), "SF-09");
+    assert.equal(identityBaseline.evidence.assignments_truncated, false, `${label}: the healthy read is complete`);
+    assertLeavesNullUnderDenial(assert, {
+      label: `SF-09 (${label}) under listPermissionSetAssignments denied`,
+      baseline: identityBaseline.evidence,
+      denied: assignmentsDenied.evidence,
+      nullLeaves: ["assignments_truncated", "elevated_assignments", "distinct_assignees"],
+    });
+    assert.equal(assignmentsDenied.evidence.permission_sets, identityBaseline.evidence.permission_sets, `${label}: the readable permission set count is kept`);
+    assert.equal(assignmentsDenied.evidence.permission_sets_truncated, false, `${label}: the readable list's own flag is kept`);
+  }
+
+  // SF-11 under OauthToken denied: every token-derived count and flag is null; the connected app read keeps its own flag under its own name.
+  const monitoringBaseline = findingById(assessSalesforceMonitoringData(goodMonitoringData()), "SF-11");
+  const tokensDenied = findingById(assessSalesforceMonitoringData(goodMonitoringData({ oauthTokens: forbiddenDataset("OauthToken", []) })), "SF-11");
+  assert.equal(monitoringBaseline.evidence.oauth_tokens, 1);
+  assert.equal(monitoringBaseline.evidence.oauth_tokens_partial_view, false);
+  assert.deepEqual(monitoringBaseline.evidence.tokens_by_app, { Auditor: 1 });
+  assertLeavesNullUnderDenial(assert, {
+    label: "SF-11 under listOauthTokens denied",
+    baseline: monitoringBaseline.evidence,
+    denied: tokensDenied.evidence,
+    nullLeaves: ["oauth_tokens", "oauth_tokens_partial_view", "oauth_tokens_possibly_capped", "oauth_tokens_truncated", "tokens_by_app"],
+  });
+  assert.equal(tokensDenied.evidence.connected_applications_truncated, false, "the connected app list was read completely and its flag names its source");
+  assert.equal("truncated" in tokensDenied.evidence, false, "no bare truncated flag is rendered");
+  assert.equal(tokensDenied.evidence.caller_has_customize_application, monitoringBaseline.evidence.caller_has_customize_application);
+  assert.match(tokensDenied.summary, /OAuth token usage was not checked because the OauthToken query was forbidden/);
 });
 
 test("resolveSecureOutputPath rejects traversal and symlink parents", () => {

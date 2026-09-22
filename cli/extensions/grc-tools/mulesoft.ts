@@ -2399,7 +2399,7 @@ export async function assessMulesoftIdentityAccess(
         const evidence = {
           mfa_exempt_users: sample(exemptFlagged.map(memberLabel)),
           users_returned_without_flag: sample(exemptUnflagged.map(memberLabel)),
-          members_sampled: members.value.items.length,
+          members_sampled: derived(members.value.items.length, members),
           is_federated: isFederated ?? null,
         };
         if (exemptFlagged.length > 0) {
@@ -2429,7 +2429,7 @@ export async function assessMulesoftIdentityAccess(
           admin_users: sample([...adminUsers.values()]),
           admin_user_count: adminUsers.size,
           max_admins: maxAdmins,
-          members_sampled: members.value.items.length,
+          members_sampled: derived(members.value.items.length, members),
         };
         if (roleGroupItems.length === 0) {
           return verdict("manual", "Zero role groups were returned even though the read succeeded; every organization has a built-in Organization Administrators group, so the credential sees a scoped-down view. Zero role groups is treated as manual.", evidence);
@@ -3620,7 +3620,8 @@ export async function assessMulesoftRuntimeInfrastructure(
           environments_with_mq: [...new Set(mqInventory.map((item) => item.environment))],
           queues: allQueues.length,
           unencrypted_queues: sample(unencryptedQueues.map((item) => `${item.environment}/${item.region}: ${asString(item.queue.queueId) ?? "queue"}`)),
-          mq_clients: mqClients.map((item) => ({ environment: item.environment, clients: item.clients.length })),
+          // mqClientSources[index] is the read that produced mqClients[index]; an unread environment renders null, not 0.
+          mq_clients: mqClients.map((item, index) => ({ environment: item.environment, clients: derived(item.clients.length, mqClientSources[index]) })),
         };
         if (mqInventory.length === 0) {
           return verdict("manual", `Anypoint MQ returned zero regions in ${environments.sampled.length} sampled environment(s), so this control is not applicable and is recorded as manual: confirm in Anypoint MQ that no queues or client apps exist.`, evidence);
@@ -3628,7 +3629,8 @@ export async function assessMulesoftRuntimeInfrastructure(
         if (unencryptedQueues.length > 0) {
           return verdict("warn", `${unencryptedQueues.length}/${allQueues.length} Anypoint MQ queue(s) are not encrypted; MQ client apps are environment-scoped by design, so also confirm credentials are not shared across environments.`, evidence);
         }
-        return verdict("manual", `${allQueues.length} queue(s) and ${totalMqClients} MQ client app(s) inventoried per environment. Confirm MQ client app credentials are not reused across environments and MQ roles are environment-scoped in Access Management.`, evidence);
+        const mqClientCount = mqClientSources.every(sourceCollected) ? `${totalMqClients}` : "an unread number of";
+        return verdict("manual", `${allQueues.length} queue(s) and ${mqClientCount} MQ client app(s) inventoried per environment. Confirm MQ client app credentials are not reused across environments and MQ roles are environment-scoped in Access Management.`, evidence);
       },
     ),
     evaluate(

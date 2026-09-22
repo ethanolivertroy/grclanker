@@ -2007,10 +2007,10 @@ export function assessSalesforcePlatformData(data: SalesforcePlatformData): Sale
         : `Health Check score is ${score} with ${highRisks.length} high-risk and ${mediumRisks.length} medium-risk settings out of ${risks.length} evaluated.${partialNote(data.healthCheckRisks)}`,
       {
         score,
-        high_risk_settings: truncateList(highRisks.map((risk) => `${asString(risk.SettingGroup) ?? ""}: ${asString(risk.Setting) ?? ""} = ${asString(risk.OrgValue) ?? ""} (standard ${asString(risk.StandardValue) ?? ""})`)),
-        medium_risk_settings: mediumRisks.length,
-        settings_evaluated: risks.length,
-        risks_truncated: data.healthCheckRisks.truncated,
+        high_risk_settings: whenOk(truncateList(highRisks.map((risk) => `${asString(risk.SettingGroup) ?? ""}: ${asString(risk.Setting) ?? ""} = ${asString(risk.OrgValue) ?? ""} (standard ${asString(risk.StandardValue) ?? ""})`)), data.healthCheckRisks),
+        medium_risk_settings: whenOk(mediumRisks.length, data.healthCheckRisks),
+        settings_evaluated: whenOk(risks.length, data.healthCheckRisks),
+        risks_truncated: whenOk(data.healthCheckRisks.truncated, data.healthCheckRisks),
       },
       !risksReadable ? "Setup > Security > Health Check: export the High-Risk and Medium-Risk setting tables." : undefined,
     ));
@@ -2409,7 +2409,7 @@ export function assessSalesforceIdentityData(data: SalesforceIdentityData, optio
       elevated_permission_sets: truncateList(elevated.map((item) => `${asString(item.set.Name) ?? ""} [${item.perms.join(", ")}]`)),
       elevated_assignments: assignmentsReadable ? activeElevatedAssignments.length : null,
       distinct_assignees: assignmentsReadable ? assignees.size : null,
-      assignments_truncated: data.assignments.truncated,
+      assignments_truncated: whenOk(data.assignments.truncated, data.assignments),
       permission_sets_truncated: data.permissionSets.truncated,
     };
     if (elevated.length === 0) {
@@ -2696,11 +2696,12 @@ export function assessSalesforceMonitoringData(data: SalesforceMonitoringData): 
   const tokenViewNote = `${tokenViewPartial
     ? ` OauthToken shows only the caller's own tokens without Customize Application (caller permission: ${callerPermissionLabel}), so the ${data.oauthTokens.data.length} tokens seen are a partial view.`
     : ""}${tokensReadable ? "" : ` OAuth token usage was not checked because ${unreadableReason(data.oauthTokens)}; review Setup > Connected Apps OAuth Usage manually.`}${tokenCountNote}`;
+  // Every token-derived leaf renders null, not false or 0, when OauthToken was not read.
   const tokenEvidence = {
-    oauth_tokens: tokensReadable ? data.oauthTokens.data.length : null,
-    oauth_tokens_partial_view: tokenViewPartial,
-    oauth_tokens_possibly_capped: tokensPossiblyCapped,
-    oauth_tokens_truncated: tokensTruncated,
+    oauth_tokens: whenOk(data.oauthTokens.data.length, data.oauthTokens),
+    oauth_tokens_partial_view: whenOk(tokenViewPartial, data.oauthTokens),
+    oauth_tokens_possibly_capped: whenOk(tokensPossiblyCapped, data.oauthTokens),
+    oauth_tokens_truncated: whenOk(tokensTruncated, data.oauthTokens),
   };
   if (data.connectedApplications.status !== "ok") {
     findings.push(manualForUnreadable(11, data.connectedApplications, appManual));
@@ -2722,8 +2723,8 @@ export function assessSalesforceMonitoringData(data: SalesforceMonitoringData): 
       apps_without_refresh_token_limit: truncateList(unboundedRefresh.map((app) => asString(app.Name) ?? "")),
       ...tokenEvidence,
       caller_has_customize_application: canSeeAllTokens ?? null,
-      tokens_by_app: tokensReadable ? Object.fromEntries([...tokensByApp.entries()].slice(0, 25)) : null,
-      truncated: data.connectedApplications.truncated,
+      tokens_by_app: whenOk(Object.fromEntries([...tokensByApp.entries()].slice(0, 25)), data.oauthTokens),
+      connected_applications_truncated: whenOk(data.connectedApplications.truncated, data.connectedApplications),
     };
     if (unknownPolicy.length === apps.length) {
       findings.push(finding(11, "manual", `${apps.length} connected apps were returned but none exposed OptionsAllowAdminApprovedUsersOnly, so the pre-authorization policy cannot be confirmed.${tokenViewNote}`, evidence, appManual));

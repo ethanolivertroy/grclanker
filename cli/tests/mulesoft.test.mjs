@@ -36,6 +36,7 @@ import { getRegisteredToolSummaries } from "../dist/pi/tool-catalog.js";
 import { assertSecretFragmentsAbsent, readBundleFiles, readZipEntries } from "./helpers/bundle-contents.mjs";
 import { CONFIG_CANARIES, assertConfigLoaderMatrix, configLoaderCases } from "./helpers/config-loader-matrix.mjs";
 import { assertFixedTextsSurvive, collectFixedTexts, collectThrownMessage, collectToolTexts, logLines } from "./helpers/fixed-text-survival.mjs";
+import { assertLeavesNullUnderDenial } from "./helpers/leaf-diff.mjs";
 import { assertFragmentsAbsent, assertPlantedValuesWellFormed } from "./helpers/planted-values.mjs";
 import { assertScrubBoundary } from "./helpers/scrub-boundary-matrix.mjs";
 
@@ -3290,6 +3291,51 @@ test("review round items 7 and 8: denied Anypoint datasets are written as not-co
   assert.match(findingById(truncatedProviders, "MULESOFT-IAM-01").summary, /Partial view: identity provider list truncated at 1 of 3 total/);
   assert.match(findingById(truncatedProviders, "MULESOFT-IAM-01").summary, /cannot pass on this sample/);
   assert.equal(truncatedProviders.summary.identity_providers_truncated, true);
+});
+
+test("round 2 SEND BACK 3: leaf diff per denial, the members and MQ client leaves of IAM-02, IAM-03, and RT-21 render null under the denial of their source and no other leaf becomes an empty reading", async () => {
+  const membersPath = `/accounts/api/organizations/${ORG_ID}/members`;
+  const identityBaseline = await assessMulesoftIdentityAccess(healthyIdentityClient());
+  const membersDenied = await assessMulesoftIdentityAccess(healthyIdentityClient({ listMembers: forbidden(membersPath) }));
+  for (const id of ["MULESOFT-IAM-02", "MULESOFT-IAM-03"]) {
+    const baseline = findingById(identityBaseline, id);
+    const denied = findingById(membersDenied, id);
+    assert.equal(baseline.evidence.members_sampled, 2, `${id}: the healthy run sampled the fixture's members`);
+    assertLeavesNullUnderDenial(assert, {
+      label: `${id} under listMembers denied`,
+      baseline: baseline.evidence,
+      denied: denied.evidence,
+      nullLeaves: ["members_sampled"],
+      allow: [/^unreadable_sources\[\d+\]$/],
+    });
+    // The member sample is context for these two verdicts, not an input: the status is unchanged and only the count is unread.
+    assert.equal(denied.status, baseline.status, `${id}: the verdict does not read members`);
+  }
+
+  const mqClientsPath = `/mq/admin/api/v1/organizations/${ORG_ID}/environments/env-prod/clients`;
+  const runtimeBaseline = await assessMulesoftRuntimeInfrastructure(healthyRuntimeClient());
+  const mqClientsDenied = await assessMulesoftRuntimeInfrastructure(healthyRuntimeClient({ listMqClients: forbidden(mqClientsPath) }));
+  const rtBaseline = findingById(runtimeBaseline, "MULESOFT-RT-21");
+  const rtDenied = findingById(mqClientsDenied, "MULESOFT-RT-21");
+  assert.deepEqual(rtBaseline.evidence.mq_clients, [{ environment: "Production", clients: 1 }], "the healthy run counted the fixture's MQ client");
+  assertLeavesNullUnderDenial(assert, {
+    label: "MULESOFT-RT-21 under listMqClients denied",
+    baseline: rtBaseline.evidence,
+    denied: rtDenied.evidence,
+    nullLeaves: ["mq_clients[0].clients"],
+    allow: [/^unreadable_sources\[\d+\]$/],
+  });
+  assert.equal(rtDenied.evidence.mq_clients[0].environment, "Production", "the environment name is kept; only the unread count is null");
+  assert.match(rtBaseline.summary, /1 queue\(s\) and 1 MQ client app\(s\) inventoried per environment/);
+  assert.match(rtDenied.summary, /1 queue\(s\) and an unread number of MQ client app\(s\) inventoried per environment/, "the summary does not claim zero clients for an unread list");
+  assert.doesNotMatch(rtDenied.summary, /\b0 MQ client app/, "no zero client count is rendered");
+  assert.equal(mqClientsDenied.summary.inventories.mq_clients.startsWith("unread ("), true);
+
+  // Control: the leaf-diff helper rejects a defaulted leaf and a new empty reading.
+  assert.throws(() => assertLeavesNullUnderDenial(assert, { label: "control", baseline: { a: 3, b: [1] }, denied: { a: 0, b: [1] }, nullLeaves: ["a"] }), /a renders null under the denial, got 0/);
+  assert.throws(() => assertLeavesNullUnderDenial(assert, { label: "control", baseline: { a: 3, b: [1] }, denied: { a: null, b: [] }, nullLeaves: ["a"] }), /b appears under the denial as the empty reading \[\]/);
+  assert.throws(() => assertLeavesNullUnderDenial(assert, { label: "control", baseline: { a: 3, c: true }, denied: { a: null, c: false }, nullLeaves: ["a"] }), /c changed under the denial from true to false/);
+  assertLeavesNullUnderDenial(assert, { label: "control", baseline: { a: 3, c: true }, denied: { a: null, c: true, unreadable_sources: ["x"] }, nullLeaves: ["a"] });
 });
 
 /** Random-looking alphanumeric canaries; the leak assertions check every substring of them at lengths 6 through 24. */
