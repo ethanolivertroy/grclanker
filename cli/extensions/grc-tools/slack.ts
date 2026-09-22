@@ -703,25 +703,95 @@ export class SlackApiError extends Error {
   }
 }
 
-/** Slack documents snake_case error codes; a value of any other shape (for example a token) renders as this placeholder. */
+/** The shape of a Slack error or warning code (snake_case); a second gate behind the documented vocabulary below. */
 const SLACK_ERROR_CODE_PATTERN = /^[a-z][a-z0-9_]{0,63}$/;
-/** Comma-separated scope lists in the documented needed and provided fields (for example admin.users:read). */
-const SLACK_SCOPE_PATTERN = /^[a-z][a-z0-9_.:-]{0,63}$/;
+/**
+ * The shape of a documented OAuth scope, as listed in the needed and provided fields: lowercase words joined by
+ * `.`, `_`, or `-` (admin.app_activities, incoming-webhook), at most two `:` groups (users:read.email,
+ * files:write:user), segments of at most 24 letters, and no digits anywhere. A hex, base32, or base64 credential
+ * carries digits or uppercase and fails the shape; the configured secrets are removed from the list before it is
+ * checked.
+ */
+const SLACK_SCOPE_PATTERN = /^[a-z][a-z_-]{0,23}(?:\.[a-z][a-z_-]{0,23}){0,3}(?::[a-z][a-z_]{0,23}(?:\.[a-z][a-z_]{0,23}){0,3}){0,2}$/;
 export const UNKNOWN_ERROR_CODE = "UnknownError";
 const SCIM_ERROR_SCHEMA = "urn:ietf:params:scim:api:messages:2.0:Error";
-/** RFC 7644 section 3.12 scimType keywords, a short identifier, or a urn; anything else is dropped. */
+/** RFC 7644 section 3.12, Table 9: the scimType keywords. A scimType outside this vocabulary is dropped, whatever its shape. */
 const SCIM_TYPES = new Set(["invalidFilter", "tooMany", "uniqueness", "mutability", "invalidSyntax", "invalidPath", "noTarget", "invalidValue", "invalidVers", "sensitive"]);
-const SCIM_TYPE_PATTERN = /^(?:[a-z][a-zA-Z0-9]{0,31}|urn:[a-z0-9][a-z0-9-]{0,31}:[a-zA-Z0-9._:-]{1,96})$/;
 
-/** A vendor error code copied from a response body is pattern-validated like every other code before it is rendered. */
-export function vendorErrorCode(value: unknown): string {
-  return typeof value === "string" && SLACK_ERROR_CODE_PATTERN.test(value) ? value : UNKNOWN_ERROR_CODE;
+/**
+ * Slack's documented error codes: the common errors table every Web API method page carries, the method-specific
+ * codes of the sixteen methods this module calls (docs.slack.dev/reference/methods/<method>, "Errors"), the
+ * JSON-body errors of the Web API overview (docs.slack.dev/apis/web-api), the conversations-family code the review
+ * named, and the Audit Logs API errors table (docs.slack.dev/reference/audit-logs-api/methods-actions-reference).
+ * A body value outside this vocabulary is not rendered: the method pages say other errors can be returned when the
+ * service is down, and such a value renders as the fixed placeholder rather than verbatim, so a credential that an
+ * endpoint or a proxy returns in the `error` field can never pass as a code.
+ */
+export const SLACK_DOCUMENTED_ERROR_CODES: ReadonlySet<string> = new Set([
+  // Common Web API errors, present on every method page.
+  "access_denied", "accesslimited", "account_inactive", "deprecated_endpoint", "ekm_access_denied",
+  "enterprise_is_restricted", "fatal_error", "internal_error", "invalid_arg_name", "invalid_arguments",
+  "invalid_array_arg", "invalid_auth", "invalid_charset", "invalid_form_data", "invalid_post_type",
+  "method_deprecated", "missing_post_type", "missing_scope", "no_permission", "not_allowed_token_type",
+  "not_authed", "org_login_required", "ratelimited", "request_timeout", "service_unavailable",
+  "team_access_not_granted", "team_added_to_org", "token_expired", "token_revoked", "two_factor_setup_required",
+  // Method-specific errors of the methods this module calls.
+  "admin_unauthorized", "app_management_app_not_installed_on_org", "bots_not_allowed", "channel_not_found",
+  "channel_type_not_supported", "connected_team_passed_in_is_not_top_level_team", "could_not_get_conversation_prefs",
+  "could_not_get_retention", "data_not_available", "default_org_wide_channel", "external_team_not_connected_to_this_org",
+  "failed_to_fetch_info", "feature_not_available", "feature_not_enabled", "file_not_found", "file_not_yet_available",
+  "include_deactivated_user_workspaces_invalid", "invalid_actor", "invalid_cursor", "invalid_date", "invalid_limit",
+  "invalid_search_channel_type", "invalid_sort", "invalid_sort_dir", "invalid_team", "invalid_type", "limit_required",
+  "member_analytics_disabled", "metadata_not_available", "metadata_only_does_not_support_date", "missing_argument",
+  "not_allowed", "not_an_admin", "not_an_enterprise", "org_level_email_display_disabled", "restricted_action",
+  "retention_override_not_allowed", "team_not_found", "too_many_teams_provided", "unknown_method",
+  "user_cannot_manage_public_channels", "user_not_found",
+  // Conversations-family code named in the review.
+  "method_not_supported_for_channel_type",
+  // JSON-body errors from the Web API overview.
+  "invalid_json", "json_not_object",
+  // Audit Logs API errors table.
+  "bad_endpoint", "invalid_action", "invalid_authentication", "invalid_range", "invalid_workspace",
+  "method_not_allowed", "missing_authentication", "rate_limited", "team_not_authorized", "user_not_authorized",
+]);
+
+/** The documented warning codes (charset notes on the Web API pages) beside the error vocabulary, for the `warning` list. */
+const SLACK_DOCUMENTED_WARNING_CODES: ReadonlySet<string> = new Set(["missing_charset", "superfluous_charset", ...SLACK_DOCUMENTED_ERROR_CODES]);
+
+/**
+ * One code copied from a response body, rendered only when the token scrub with the configured secrets leaves it
+ * unchanged, it has the documented shape, and it is in the documented vocabulary; otherwise the fixed placeholder.
+ * The scrub runs first so a configured credential can never survive as a code whatever its shape, and the
+ * vocabulary is what keeps an undocumented value (a credential from an endpoint or a proxy) out of every string.
+ */
+function documentedCode(value: string, pattern: RegExp, vocabulary: ReadonlySet<string> | undefined, secrets: readonly string[]): string {
+  if (redactErrorText(value, secrets) !== value) return UNKNOWN_ERROR_CODE;
+  if (!pattern.test(value)) return UNKNOWN_ERROR_CODE;
+  if (vocabulary !== undefined && !vocabulary.has(value)) return UNKNOWN_ERROR_CODE;
+  return value;
 }
 
-function vendorCodeList(value: unknown, pattern: RegExp): string {
+/** A vendor error code copied from a response body: scrubbed with the configured secrets, then validated against the documented vocabulary. */
+export function vendorErrorCode(value: unknown, secrets: readonly string[] = []): string {
+  return typeof value === "string" ? documentedCode(value, SLACK_ERROR_CODE_PATTERN, SLACK_DOCUMENTED_ERROR_CODES, secrets) : UNKNOWN_ERROR_CODE;
+}
+
+/** Which documented list a comma-separated body field is checked against. */
+type SlackCodeList = "scopes" | "warnings";
+
+function vendorCodeList(value: unknown, list: SlackCodeList, secrets: readonly string[]): string {
   const items = typeof value === "string" ? value.split(",").map((item) => item.trim()).filter((item) => item.length > 0) : [];
   if (items.length === 0) return UNKNOWN_ERROR_CODE;
-  return items.map((item) => (pattern.test(item) ? item : UNKNOWN_ERROR_CODE)).join(",");
+  switch (list) {
+    case "scopes":
+      return items.map((item) => documentedCode(item, SLACK_SCOPE_PATTERN, undefined, secrets)).join(",");
+    case "warnings":
+      return items.map((item) => documentedCode(item, SLACK_ERROR_CODE_PATTERN, SLACK_DOCUMENTED_WARNING_CODES, secrets)).join(",");
+    default: {
+      const exhaustive: never = list;
+      throw new Error(`Unhandled Slack code list ${String(exhaustive)}`);
+    }
+  }
 }
 
 function validHttpStatus(value: unknown): number | undefined {
@@ -730,7 +800,7 @@ function validHttpStatus(value: unknown): number | undefined {
 }
 
 function validScimType(value: unknown): string | undefined {
-  return typeof value === "string" && (SCIM_TYPES.has(value) || SCIM_TYPE_PATTERN.test(value)) ? value : undefined;
+  return typeof value === "string" && SCIM_TYPES.has(value) ? value : undefined;
 }
 
 /**
@@ -750,22 +820,22 @@ function isScimErrorBody(json: JsonRecord): boolean {
 /**
  * Renders only the documented fields of a JSON error body, chosen by the API that was called rather than by the
  * fields the body happens to carry. Web API and Audit Logs bodies (`ok: false` with an `error` code, optional
- * `needed`, `provided`, `warning`): `error` (validated code), `needed` and `provided` (validated scope lists),
- * `warning` (validated code list); a `detail`, `status`, or `scimType` field in such a body is gateway text and is
- * dropped. SCIM bodies: only a body carrying the SCIM 2.0 error schema renders `status` (validated integer),
- * `scimType` (validated keyword, identifier, or urn, else dropped), and `detail` (scrubbed with the configured
- * secrets and cut); a SCIM body without the discriminator is withheld. Every other field, including
- * response_metadata.messages, is dropped rather than echoed.
+ * `needed`, `provided`, `warning`): `error` (a code in the documented vocabulary), `needed` and `provided`
+ * (scope-shaped lists), `warning` (documented code list), each scrubbed with the configured secrets first; a
+ * `detail`, `status`, or `scimType` field in such a body is gateway text and is dropped. SCIM bodies: only a body
+ * carrying the SCIM 2.0 error schema renders `status` (validated integer), `scimType` (RFC 7644 keyword, else
+ * dropped), and `detail` (scrubbed with the configured secrets and cut); a SCIM body without the discriminator is
+ * withheld. Every other field, including response_metadata.messages, is dropped rather than echoed.
  */
 export function describeErrorFields(json: JsonRecord, family: SlackApiFamily, secrets: readonly string[] = []): string {
   const parts: string[] = [];
   switch (family) {
     case "web":
     case "audit":
-      if (json.error !== undefined) parts.push(`error=${vendorErrorCode(json.error)}`);
-      if (json.needed !== undefined) parts.push(`needed=${vendorCodeList(json.needed, SLACK_SCOPE_PATTERN)}`);
-      if (json.provided !== undefined) parts.push(`provided=${vendorCodeList(json.provided, SLACK_SCOPE_PATTERN)}`);
-      if (json.warning !== undefined) parts.push(`warning=${vendorCodeList(json.warning, SLACK_ERROR_CODE_PATTERN)}`);
+      if (json.error !== undefined) parts.push(`error=${vendorErrorCode(json.error, secrets)}`);
+      if (json.needed !== undefined) parts.push(`needed=${vendorCodeList(json.needed, "scopes", secrets)}`);
+      if (json.provided !== undefined) parts.push(`provided=${vendorCodeList(json.provided, "scopes", secrets)}`);
+      if (json.warning !== undefined) parts.push(`warning=${vendorCodeList(json.warning, "warnings", secrets)}`);
       break;
     case "scim": {
       if (!isScimErrorBody(json)) return WITHHELD_ERROR_FIELDS;
@@ -872,7 +942,7 @@ export class SlackApiClient {
       throw new SlackApiError(`${label} failed (HTTP ${response.status}) ${withheldBody(response, text)}`, label, "non_json_body", response.status);
     }
     if (json.ok === false) {
-      const code = json.error === undefined ? "ok_false" : vendorErrorCode(json.error);
+      const code = json.error === undefined ? "ok_false" : vendorErrorCode(json.error, this.knownSecrets());
       throw new SlackApiError(`${label} failed: ${code}`, label, code, response.status);
     }
     return redactSecrets(json, this.knownSecrets());
