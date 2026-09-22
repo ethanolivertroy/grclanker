@@ -314,7 +314,23 @@ test("URL scrubbing is idempotent for query-only, fragment-only, and mixed URLs,
       const once = scrub(text);
       assert.equal(scrub(once), once, `${name} is not idempotent for ${JSON.stringify(text)}: ${JSON.stringify(once)}`);
       assert.equal(scrub(scrub(once)), once, `${name} is not idempotent on the third pass for ${JSON.stringify(text)}`);
+      // Normal composition scrubs twice (a body note inside a response line): every output is a fixed point of both text scrubs.
+      assert.equal(scrubErrorText(once, { secrets }), once, `${name}: scrubErrorText changed its output for ${JSON.stringify(text)}`);
+      assert.equal(scrubDataText(once, { secrets }), once, `${name}: scrubDataText changed its output for ${JSON.stringify(text)}`);
     }
+  }
+  // describeFailedResponse composes describeErrorBody and scrubErrorText: describing a line it already
+  // produced adds only the fixed prefix, and the line is a fixed point of both text scrubs.
+  const prefix = "GET /v1/users failed with 502 Bad Gateway: ";
+  const describe = (text) =>
+    describeFailedResponse({ method: "GET", endpoint: "/v1/users", status: 502, statusText: "Bad Gateway", contentType: "application/json", body: JSON.stringify({ message: text }) }, { secrets });
+  for (const text of corpus) {
+    const once = describe(text);
+    assert.ok(once.startsWith(prefix), `describeFailedResponse for ${JSON.stringify(text)}: ${once}`);
+    const asMessage = once.length <= MAX_VENDOR_MESSAGE_LENGTH ? once : `${once.slice(0, MAX_VENDOR_MESSAGE_LENGTH)} [truncated]`;
+    assert.equal(describe(once), `${prefix}${asMessage}`, `describeFailedResponse changed its own output for ${JSON.stringify(text)}`);
+    assert.equal(scrubErrorText(once, { secrets }), once, `describeFailedResponse: scrubErrorText changed its output for ${JSON.stringify(text)}`);
+    assert.equal(scrubDataText(once, { secrets }), once, `describeFailedResponse: scrubDataText changed its output for ${JSON.stringify(text)}`);
   }
 });
 

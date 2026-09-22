@@ -1,7 +1,17 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 
-import { IntegrationError, REDACTED, errorMessage, redactSecretValues, scrubDataText, scrubError, scrubErrorText } from "../dist/extensions/grc-tools/hardening/error-text.js";
+import {
+  IntegrationError,
+  REDACTED,
+  describeErrorBody,
+  describeFailedResponse,
+  errorMessage,
+  redactSecretValues,
+  scrubDataText,
+  scrubError,
+  scrubErrorText,
+} from "../dist/extensions/grc-tools/hardening/error-text.js";
 import { NAME_SHAPED_VALUES, TOKEN_SHAPED_VALUES, assertCanariesDisjointFromFixture, assertCanaryFixture, assertNoCanaryWindows, leakedCanaryWindow } from "./helpers/error-canaries.mjs";
 import { QUOTED_MUST_KEEP_HEADERS, countQuotedHeaderHits, quotedHeaderCases, unquotedControlCases } from "./helpers/quoted-header-matrix.mjs";
 
@@ -190,5 +200,184 @@ test("quoted carriers: reviewer A's 1872-case matrix has no hit under any scrub,
     const once = scrubErrorText(testCase.text);
     assert.equal(scrubErrorText(once), once, `not idempotent: ${testCase.label}`);
     assert.ok(once.includes(REDACTED), `no marker written: ${testCase.label}`);
+  }
+});
+
+/**
+ * The compound-line rule (reviewer B's early signal on #62, reviewer A's gaps 27 and 28 on #70, the
+ * sweep-wide rule with reviewer A's refinement), identical in every scrubber so they agree before the
+ * batch 1 rewire: a quoted value ends at its closing quote; an unquoted cookie or header value, and a
+ * quoted one that is never closed, ends at the `;` or `,` that introduces the next `Name:` token on the
+ * line, or at the end of the line; the next header on the same line keeps its name and gets its own
+ * carrier treatment. Each row plants two values (`a` in the first carrier, `b` in the second) and states
+ * the exact text expected once both are gone, plus the following header names and values that must
+ * survive. Group A's two edge shapes are the unterminated cookie quote that used to pair with the next
+ * header's opening quote and the cookie attribute loop that used to swallow `; X-Api-Key: ...` as an
+ * attribute; reviewer A's gap 28 is the closed quoted value that holds `; Name:` and is one value.
+ */
+const COMPOUND_LINES = Object.freeze([
+  [
+    "quoted cookie pair, quoted X-Api-Key, quoted Content-Type",
+    (a, b) => `Cookie: sid="${a}"; X-Api-Key: "${b}"; Content-Type: "application/json"`,
+    () => `Cookie: ${REDACTED}; X-Api-Key: "${REDACTED}"; Content-Type: "application/json"`,
+    ["X-Api-Key:", 'Content-Type: "application/json"'],
+  ],
+  [
+    "unquoted cookie pair, quoted X-Api-Key, quoted Content-Type",
+    (a, b) => `Cookie: sid=${a}; X-Api-Key: "${b}"; Content-Type: "application/json"`,
+    () => `Cookie: ${REDACTED}; X-Api-Key: "${REDACTED}"; Content-Type: "application/json"`,
+    ["X-Api-Key:", 'Content-Type: "application/json"'],
+  ],
+  [
+    "every value unquoted",
+    (a, b) => `Cookie: sid=${a}; X-Api-Key: ${b}; Content-Type: application/json`,
+    () => `Cookie: ${REDACTED}; X-Api-Key: ${REDACTED}; Content-Type: application/json`,
+    ["X-Api-Key:", "Content-Type: application/json"],
+  ],
+  [
+    "cookie with attributes, then quoted X-Api-Key and Content-Type (group A edge: the attribute loop)",
+    (a, b) => `Cookie: sid=${a}; Path=/; HttpOnly; X-Api-Key: "${b}"; Content-Type: "application/json"`,
+    () => `Cookie: ${REDACTED}; X-Api-Key: "${REDACTED}"; Content-Type: "application/json"`,
+    ["X-Api-Key:", 'Content-Type: "application/json"'],
+  ],
+  [
+    "cookie with attributes, comma before the next header",
+    (a, b) => `Cookie: sid=${a}; Path=/, X-Api-Key: "${b}"`,
+    () => `Cookie: ${REDACTED}, X-Api-Key: "${REDACTED}"`,
+    ["X-Api-Key:"],
+  ],
+  [
+    "two quoted headers on one line, comma-separated",
+    (a, b) => `X-Api-Key: "${a}", Authorization: Bearer "${b}"`,
+    () => `X-Api-Key: "${REDACTED}", Authorization: Bearer "${REDACTED}"`,
+    ["Authorization: Bearer"],
+  ],
+  [
+    "two quoted headers on one line, scheme inside the quotes",
+    (a, b) => `Authorization: "Bearer ${a}"; X-Api-Key: "${b}"`,
+    () => `Authorization: "Bearer ${REDACTED}"; X-Api-Key: "${REDACTED}"`,
+    ["X-Api-Key:"],
+  ],
+  [
+    "two quoted headers then a plain quoted header",
+    (a, b) => `X-Auth-Token: '${a}'; Cookie: sid='${b}'; Accept: 'text/html'`,
+    () => `X-Auth-Token: '${REDACTED}'; Cookie: ${REDACTED}; Accept: 'text/html'`,
+    ["Cookie:", "Accept: 'text/html'"],
+  ],
+  [
+    "quoted header followed by a JSON fragment",
+    (a) => `X-Api-Key: "${a}" {"status":401,"error":"denied"}`,
+    () => `X-Api-Key: "${REDACTED}" {"status":401,"error":"denied"}`,
+    ['{"status":401,"error":"denied"}'],
+  ],
+  [
+    "unquoted cookie followed by a JSON fragment",
+    (a) => `Cookie: sid=${a} {"error":"invalid session"}`,
+    () => `Cookie: ${REDACTED} {"error":"invalid session"}`,
+    ['{"error":"invalid session"}'],
+  ],
+  [
+    "unquoted header, comma, then a JSON fragment",
+    (a) => `X-Api-Key: ${a}, {"Content-Type":"application/json"}`,
+    () => `X-Api-Key: ${REDACTED}, {"Content-Type":"application/json"}`,
+    ['{"Content-Type":"application/json"}'],
+  ],
+  [
+    "JSON-escaped compound line inside a JSON string",
+    (a, b) => `{"detail":"upstream sent Cookie: sid=\\"${a}\\"; X-Api-Key: \\"${b}\\"; Content-Type: \\"application/json\\""}`,
+    () => `{"detail":"upstream sent Cookie: ${REDACTED}; X-Api-Key: \\"${REDACTED}\\"; Content-Type: \\"application/json\\""}`,
+    ["X-Api-Key:", 'Content-Type: \\"application/json\\"'],
+  ],
+  [
+    "JSON-escaped compound line, unquoted cookie value",
+    (a, b) => `{"detail":"upstream sent Cookie: sid=${a}; X-Api-Key: \\"${b}\\"; Content-Type: \\"application/json\\""}`,
+    () => `{"detail":"upstream sent Cookie: ${REDACTED}; X-Api-Key: \\"${REDACTED}\\"; Content-Type: \\"application/json\\""}`,
+    ["X-Api-Key:", 'Content-Type: \\"application/json\\"'],
+  ],
+  [
+    "unterminated cookie quote, then a quoted header (group A edge: the quote pairing)",
+    (a, b) => `Cookie: sid="${a}; X-Api-Key: "${b}"`,
+    () => `Cookie: ${REDACTED}; X-Api-Key: "${REDACTED}"`,
+    ["X-Api-Key:"],
+  ],
+  [
+    "unterminated cookie quote, a plain header, then a quoted header",
+    (a, b) => `Cookie: sid="${a}; Content-Type: text; X-Api-Key: "${b}"`,
+    () => `Cookie: ${REDACTED}; Content-Type: text; X-Api-Key: "${REDACTED}"`,
+    ["Content-Type: text", "X-Api-Key:"],
+  ],
+  [
+    "unterminated cookie quote, then a JSON-escaped quoted header",
+    (a, b) => `Cookie: sid="${a}; X-Api-Key: \\"${b}\\"`,
+    () => `Cookie: ${REDACTED}; X-Api-Key: \\"${REDACTED}\\"`,
+    ["X-Api-Key:"],
+  ],
+  [
+    "unterminated whole-quoted cookie, then a quoted header",
+    (a, b) => `Cookie: "sid=${a}; X-Api-Key: "${b}"`,
+    () => `Cookie: "${REDACTED}; X-Api-Key: "${REDACTED}"`,
+    ["X-Api-Key:"],
+  ],
+  [
+    "unterminated quoted header, then a quoted Authorization header",
+    (a, b) => `X-Api-Key: "${a}; Authorization: "Bearer ${b}"`,
+    () => `X-Api-Key: "${REDACTED}; Authorization: "Bearer ${REDACTED}"`,
+    ["Authorization:"],
+  ],
+  [
+    "closed quoted value holding `; Name:` is one value (reviewer A's gap 28)",
+    (a, b) => `X-Api-Key: "${a}; note: ${b}" rejected`,
+    () => `X-Api-Key: "${REDACTED}" rejected`,
+    ["rejected"],
+  ],
+  [
+    "closed quoted Content-Type holding `;` before a quoted header",
+    (a) => `Content-Type: "text/html; charset=utf-8"; X-Api-Key: "${a}"`,
+    () => `Content-Type: "text/html; charset=utf-8"; X-Api-Key: "${REDACTED}"`,
+    ['Content-Type: "text/html; charset=utf-8"', "X-Api-Key:"],
+  ],
+]);
+
+/** Pairs of planted values: each value rides in the first carrier once and in the second carrier once. */
+function plantedPairs() {
+  const values = plantedValues();
+  return values.map((value, index) => [value, values[(index + 1) % values.length]]);
+}
+
+test("compound lines fixture: the rows share no 6-character window with the planted values", () => {
+  const legitimate = new Map(COMPOUND_LINES.map(([label, line]) => [label, line("", "")]));
+  assertCanariesDisjointFromFixture(assert, plantedValues(), legitimate, "compound lines");
+  assert.equal(COMPOUND_LINES.length, 20);
+});
+
+test("compound lines: each credential value goes, the following header names and the Content-Type value stay, through every scrub, and a second pass is a no-op", () => {
+  for (const [label, line, expected, keeps] of COMPOUND_LINES) {
+    for (const [a, b] of plantedPairs()) {
+      const input = line(a, b);
+      const planted = [a, b].filter((value) => input.includes(value));
+      for (const [scrubName, scrub] of EXACT_SCRUBS) {
+        const output = scrub(input);
+        assert.equal(output, expected(), `${scrubName}: ${label} with ${a} and ${b}`);
+        for (const text of keeps) assert.ok(output.includes(text), `${scrubName}: ${label}: ${JSON.stringify(text)} did not survive in ${output}`);
+        assertNoCanaryWindows(assert, output, planted, `${scrubName}: ${label}`);
+        assert.equal(scrub(output), output, `${scrubName}: ${label}: a second pass changed the text`);
+      }
+      assertNoCanaryWindows(assert, errorMessage(new Error(input)), planted, `errorMessage: ${label}`);
+    }
+  }
+});
+
+test("compound lines: a documented message field of a 502 body carrying one comes out of describeFailedResponse and describeErrorBody with the same rendering", () => {
+  for (const [label, line, expected] of COMPOUND_LINES) {
+    for (const [a, b] of plantedPairs().slice(0, 4)) {
+      const input = line(a, b);
+      const body = JSON.stringify({ message: `upstream sent ${input}` });
+      const note = describeErrorBody("application/json", body);
+      assert.equal(note, `upstream sent ${expected()}`, `describeErrorBody: ${label}`);
+      const described = describeFailedResponse({ method: "GET", endpoint: "/v1/users", status: 502, statusText: "Bad Gateway", contentType: "application/json", body });
+      assert.equal(described, `GET /v1/users failed with 502 Bad Gateway: upstream sent ${expected()}`, `describeFailedResponse: ${label}`);
+      assertNoCanaryWindows(assert, described, [a, b].filter((value) => input.includes(value)), `describeFailedResponse: ${label}`);
+      assert.equal(scrubErrorText(described), described, `describeFailedResponse: ${label}: a further scrub changed the line`);
+    }
   }
 });

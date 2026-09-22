@@ -17,8 +17,11 @@
  * and query pairs. A quoted value (`X-Api-Key: "value"`, `Cookie: sid='value'`, `Authorization:
  * Bearer "value"`, the JSON pair `"Authorization": "Bearer value"`, and their JSON-escaped forms
  * `\"X-Api-Key\": \"value\"` at any depth) is removed whole up to its closing quote, spaces and all,
- * with the quotes and the scheme word kept; an unterminated quote runs to the end of the line. (2) A
- * configured secret is removed whatever its shape and in its encoded forms.
+ * with the quotes and the scheme word kept. On a compound line (`Cookie: sid=<v>; X-Api-Key: "<v>";
+ * Content-Type: "application/json"`) an unquoted value, or a quoted one that is never closed, ends at
+ * the `;` or `,` that introduces the next `Name:` token, otherwise at the end of the line, and that
+ * header keeps its name and gets its own treatment. (2) A configured secret is removed whatever its
+ * shape and in its encoded forms.
  *
  * Distilled from the New Relic (#30), Qualys (#32), Webex (#48), and group D (#64) scrubbers on top
  * of the Flue redaction primitives in `cli/flue/redact.ts`, which own the credential key heuristic
@@ -125,6 +128,15 @@ const COOKIE_HEADER_PATTERN = new RegExp(String.raw`${NAME_START}(set-cookie|coo
 const COOKIE_PAIR_NAME_PATTERN = /[^\s;,"'<>=()[\]{}\\]+/y;
 const COOKIE_BARE_VALUE_PATTERN = /[^\s;,"'<>()[\]{}\\]*/y;
 const COOKIE_ATTRIBUTE_PATTERN = /;[ \t]*[A-Za-z0-9_-]+/y;
+// The compound-line rule, the same in every scrubber: a quoted value ends at its closing quote; an
+// unquoted cookie or header value, and a quoted one that is never closed, ends at the `;` or `,` that
+// introduces the next `Name:` token on the line (`Cookie: sid=<v>; X-Api-Key: "<v>"; Content-Type:
+// "application/json"`), or at the end of the line; the header after it keeps its name and gets its
+// own carrier treatment. A cookie attribute is `Name` or `Name=value`, never `Name:`, so the token is
+// unambiguous there, and a closed quoted value with a plain `;` or `,` inside (`"text/html;
+// charset=utf-8"`, `"Mon, 22 Sep 2026 12:30:00 GMT"`) or even a `; Name:` inside still ends at its
+// closing quote.
+const FOLLOWING_HEADER_PATTERN = /[;,][ \t]*[A-Za-z][A-Za-z0-9_-]*[ \t]*:/y;
 
 // Headers whose value is a credential in any shape: the standard and vendor names, and any `x-` header
 // whose name carries a credential word unless its last segment says the value is a descriptor
@@ -459,8 +471,13 @@ function backslashRun(text: string, index: number): number {
  * as `depth`, so a run of `r` backslashes before the quote character stands for `(r - depth) /
  * (depth + 1)` literal backslashes: an even number of them means the quote closes the value, an odd
  * number means the quote is content (`"a\"b"`, and its JSON form `\"a\\\"b\"`), and a non-integer means
- * the quote belongs to an enclosing string and the value is unterminated. An unterminated value runs to
- * the enclosing quote or to the end of the line or text, so a truncated carrier still loses its value.
+ * the quote belongs to an enclosing string and the value is unterminated. The closing quote comes
+ * first: a closed value that holds `; Name:` is one value (`X-Api-Key: "<v>; note: x"`). Only an
+ * unterminated value is cut at the compound-line rule: it ends at the first `; Name:` or `, Name:`
+ * token passed on the line, otherwise at the enclosing quote or the end of the line or text. A quote
+ * that stands right after such a token opens that header's value rather than closing this one
+ * (`sid="<v>; X-Api-Key: "<v>"` ends before `; X-Api-Key:`), so a truncated carrier still loses its
+ * value and the header after it keeps its name and gets its own rule.
  */
 function readQuotedValue(text: string, index: number): QuotedValue | null {
   const depth = backslashRun(text, index);
@@ -469,9 +486,24 @@ function readQuotedValue(text: string, index: number): QuotedValue | null {
   const open = text.slice(index, index + depth + 1);
   const start = index + open.length;
   let cursor = start;
+  // The first following-header token passed (where an unterminated value ends) and the index just
+  // past the separator of the latest one (a quote standing there opens that header's value).
+  let firstHeaderCut = -1;
+  let latestHeaderValueStart = -1;
+  const unterminated = (end: number): QuotedValue => {
+    const cut = firstHeaderCut >= 0 && firstHeaderCut < end ? firstHeaderCut : end;
+    return { open, close: "", start, end: cut, after: cut };
+  };
   while (cursor < text.length) {
     const char = text[cursor];
     if (char === "\n" || char === "\r") break;
+    if (char === ";" || char === ",") {
+      const token = stickyExec(FOLLOWING_HEADER_PATTERN, text, cursor);
+      if (token !== null) {
+        if (firstHeaderCut < 0) firstHeaderCut = cursor;
+        latestHeaderValueStart = skipSpaces(text, cursor + token.length);
+      }
+    }
     if (char !== "\\" && char !== quote) {
       cursor += 1;
       continue;
@@ -485,16 +517,16 @@ function readQuotedValue(text: string, index: number): QuotedValue | null {
     }
     const literalBackslashes = (run - depth) / (depth + 1);
     if (run < depth || !Number.isInteger(literalBackslashes)) {
-      const end = cursor + Math.floor(run / (depth + 1)) * (depth + 1);
-      return { open, close: "", start, end, after: end };
+      return unterminated(cursor + Math.floor(run / (depth + 1)) * (depth + 1));
     }
     if (literalBackslashes % 2 === 0) {
+      if (cursor === latestHeaderValueStart) return unterminated(cursor);
       const end = cursor + run - depth;
       return { open, close: text.slice(end, cursor + run + 1), start, end, after: cursor + run + 1 };
     }
     cursor += run + 1;
   }
-  return { open, close: "", start, end: cursor, after: cursor };
+  return unterminated(cursor);
 }
 
 interface ValueReplacement {
@@ -601,7 +633,9 @@ function cookieValueEnd(text: string, index: number): number {
 /**
  * Reads a Cookie or Set-Cookie header value: quoted whole; `name=value` (spaces around "=" allowed)
  * followed by attributes (`; Path=/; HttpOnly`) whose values may themselves be quoted; or a bare run
- * after the singular header name. The whole header value is replaced by one marker.
+ * after the singular header name. The whole header value is replaced by one marker. The value ends at
+ * ",", at a `; Name:` token (the next header on a compound line, which is never a cookie attribute, so
+ * the ";" and the name stay for that header's own rule), or at the line end.
  */
 const readCookieHeaderValue: ValueReader = (text, valueStart, carrier) => {
   const quoted = readQuotedValue(text, valueStart);
@@ -620,8 +654,9 @@ const readCookieHeaderValue: ValueReader = (text, valueStart, carrier) => {
   let cursor = cookieValueEnd(text, skipSpaces(text, separator + 1));
   let attribute: string | null;
   while ((attribute = stickyExec(COOKIE_ATTRIBUTE_PATTERN, text, cursor)) !== null) {
+    const attributeSeparator = skipSpaces(text, cursor + attribute.length);
+    if (text[attributeSeparator] === ":") break;
     cursor += attribute.length;
-    const attributeSeparator = skipSpaces(text, cursor);
     if (text[attributeSeparator] === "=") cursor = cookieValueEnd(text, skipSpaces(text, attributeSeparator + 1));
   }
   return { end: cursor, replacement: REDACTED };
@@ -683,7 +718,9 @@ function replaceGenericCredentialPairs(text: string): string {
  * (the value whatever its shape), compound credential-named pairs (the value when it is shaped like
  * a token), JWTs, AWS key ids and secret keys, well-known vendor token prefixes, and (unless turned
  * off) long token-shaped runs. A quoted carrier value is removed whole, quotes kept, in double or
- * single quotes and JSON-escaped at any depth. Idempotent. Every integration error string passes
+ * single quotes and JSON-escaped at any depth; on a compound line the next header's `Name:` token ends
+ * a cookie's attributes and an unterminated quoted value, so that header keeps its name and gets its
+ * own rule. Idempotent. Every integration error string passes
  * through here at the point it is created; a scrub at the tool boundary is a second layer, not a
  * substitute, because the exported resolvers and collectors throw before the boundary is reached.
  *

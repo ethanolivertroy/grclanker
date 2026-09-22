@@ -5,6 +5,8 @@ import {
   IntegrationError,
   LONG_TOKEN_MIN_LENGTH,
   REDACTED,
+  describeErrorBody,
+  describeFailedResponse,
   errorMessage,
   redactSecretValues,
   scrubDataText,
@@ -242,6 +244,26 @@ test("must-keep: every value survives inside realistic summary sentences through
       for (const [scrubName, scrub] of SCRUBS) {
         assert.equal(scrub(text), text, `${category} ${JSON.stringify(value)} was changed by ${scrubName} inside ${JSON.stringify(text)}`);
       }
+    }
+  }
+});
+
+test("must-keep: every scrub is idempotent over the table and its sentences, and the composed describers hand back fixed points", () => {
+  const texts = MUST_KEEP.flatMap(([, value]) => [value, ...SENTENCES.map((sentence) => sentence(value))]);
+  const composed = [
+    ["describeErrorBody", (text) => describeErrorBody("application/json", JSON.stringify({ message: text }))],
+    ["describeFailedResponse", (text) => describeFailedResponse({ method: "GET", endpoint: text, status: 403, statusText: "Forbidden", contentType: "text/html", body: "<html>denied</html>" })],
+  ];
+  for (const text of texts) {
+    for (const [scrubName, scrub] of SCRUBS) {
+      const once = scrub(text);
+      assert.equal(scrub(once), once, `${scrubName} is not idempotent over ${JSON.stringify(text)}`);
+    }
+    for (const [name, describe] of composed) {
+      const once = describe(text);
+      assert.ok(once.includes(text), `${name} changed the kept value inside ${JSON.stringify(once)}`);
+      assert.equal(scrubErrorText(once), once, `${name}: a second scrub changed ${JSON.stringify(once)}`);
+      assert.equal(scrubDataText(once), once, `${name}: a second data scrub changed ${JSON.stringify(once)}`);
     }
   }
 });
