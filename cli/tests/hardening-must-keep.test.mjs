@@ -135,6 +135,32 @@ const MUST_KEEP = Object.freeze([
   ["camel and acronym word", "InvalidAuthenticationTokenProvided"],
   ["timestamp", "2026-09-22T05:36:00.123Z"],
   ["media type", "application/x-www-form-urlencoded"],
+  // key=value pairs whose value is a name (the AWS secret shape is matched after "=" too; a name is not that shape)
+  ["assignment", "AWS_PROFILE=prod-us-east-2026"],
+  ["assignment", "AWS_REGION=us-east-1"],
+  ["assignment", "GOOGLE_CLOUD_PROJECT=my-project-123456"],
+  ["assignment", "ROLE=OrganizationAccountAccessRole"],
+  ["assignment", "BUCKET=my-bucket-prod-2026-logs"],
+  ["assignment", "x=AWSLambdaBasicExecutionRole"],
+  ["assignment", "policy=AmazonElasticContainerRegistryPublicRead"],
+  ["assignment", "resource=arn:aws:iam::123456789012:role/OrganizationAccountAccessRole"],
+  ["assignment", "max_results_per_page=1000"],
+]);
+
+/** The AWS secret access key canaries: the random-looking one, its slash and plus variants, and the group D value. */
+const AWS_SECRETS = Object.freeze([
+  ERROR_CANARY.awsSecret,
+  `${ERROR_CANARY.awsSecret.slice(0, 13)}/${ERROR_CANARY.awsSecret.slice(14, 21)}/${ERROR_CANARY.awsSecret.slice(22)}`,
+  `${ERROR_CANARY.awsSecret.slice(0, 20)}+${ERROR_CANARY.awsSecret.slice(21)}`,
+  CANARY.awsSecret,
+]);
+
+/** Assignment carriers under a key that does not name a credential, where only the secret's own shape can catch it. */
+const ASSIGNMENT_CARRIERS = Object.freeze([
+  (value) => `x=${value}`,
+  (value) => `ENV_VALUE=${value}`,
+  (value) => `description=${value} rejected`,
+  (value) => `GET /v1/users?x=${value}&page=2 failed with 403 Forbidden: non-JSON body (text/html, 512 bytes)`,
 ]);
 
 /** Realistic summary sentences that place a value where a corollary summary or an error line would. */
@@ -193,7 +219,10 @@ function keepValues() {
 }
 
 test("must-keep fixture: no 6-character window of a planted value occurs in a kept value or a sentence template", () => {
-  assertNoCanaryWindowIn([...keepValues(), ...SENTENCES.map((sentence) => sentence("VALUE"))], [...TOKEN_SHAPED_CANARIES, ENCODED_FORM_SECRET]);
+  assertNoCanaryWindowIn(
+    [...keepValues(), ...SENTENCES.map((sentence) => sentence("VALUE")), ...ASSIGNMENT_CARRIERS.map((carrier) => carrier("VALUE"))],
+    [...TOKEN_SHAPED_CANARIES, ...AWS_SECRETS, ENCODED_FORM_SECRET],
+  );
   assert.ok(MUST_KEEP.some(([, value]) => value.length >= LONG_TOKEN_MIN_LENGTH), "the table must exercise runs the long-token rule judges");
 });
 
@@ -237,6 +266,34 @@ test("must-redact: token-shaped canaries leave no 6- to 24-character fragment, b
         assert.ok(scrubbed.includes("seen 40 of 120") || scrubbed.includes("failed with 403 Forbidden") || scrubbed.includes("not readable") || scrubbed.includes("more pages available"), `${scrubName}: the fixed words around the token must survive: ${scrubbed}`);
       }
     }
+  }
+});
+
+test("must-redact: a 40-character AWS secret after any assignment operator is removed by its shape through every scrub, including the data scrubs", () => {
+  for (const secret of AWS_SECRETS) {
+    assert.equal(secret.length, 40);
+    for (const carrier of ASSIGNMENT_CARRIERS) {
+      const text = carrier(secret);
+      const expected = carrier(REDACTED);
+      for (const [scrubName, scrub] of SCRUBS) {
+        const scrubbed = scrub(text);
+        assertNoFragment(scrubbed, secret, { label: `${scrubName} of ${text}` });
+        assert.equal(scrubbed, expected, `${scrubName}: the key and the fixed words around the marker stay`);
+      }
+      for (const sentence of SENTENCES) {
+        const scrubbed = scrubErrorText(sentence(text));
+        assertNoFragment(scrubbed, secret, { label: `sentence ${text}` });
+        assert.equal(scrubbed, sentence(expected));
+        assertNoFragment(scrubDataText(sentence(text)), secret, { label: `data sentence ${text}` });
+      }
+    }
+    const record = redactSecretValues({ description: `ENV_VALUE=${secret}`, notes: [`x=${secret}`] });
+    assertNoFragment(record, secret, { label: "record values" });
+    assert.deepEqual(record, { description: `ENV_VALUE=${REDACTED}`, notes: [`x=${REDACTED}`] });
+  }
+  for (const scrub of [scrubErrorText, scrubDataText]) {
+    assert.equal(scrub(`secret_access_key=${ERROR_CANARY.awsSecret}`), `secret_access_key=${REDACTED}`, "a credential key of 16 or more characters keeps its name in front of one marker");
+    assert.equal(scrub(`aws_secret_access_key=${CANARY.awsSecret} and more`), `aws_secret_access_key=${REDACTED} and more`);
   }
 });
 
