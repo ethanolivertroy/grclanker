@@ -81,12 +81,23 @@ export interface PaloaltoAccessSurface {
   product: "prisma-cloud" | "prisma-compute" | "pan-os";
   target: string;
   name: string;
+  /** The probe's documented request; for a failed probe, the request that actually failed. */
   endpoint: string;
   status: "readable" | "not_readable" | "not_configured";
-  count?: number;
-  /** True when the probe stopped at its page cap, so count is a lower bound. */
-  partial?: boolean;
+  /** Items the probe read; null when it read nothing, so a refusal is never an empty count. */
+  count: number | null;
+  /** True when a readable probe stopped at its page cap (count is a lower bound); null when the probe failed; absent otherwise. */
+  partial?: boolean | null;
+  /** The HTTP status a failed probe observed; null when it was readable or no response arrived. */
+  httpStatus: number | null;
   error?: string;
+}
+
+/** How a surface read failed: the request that failed and the HTTP status it observed (null when no response arrived). */
+export interface PaloaltoSurfaceFailure {
+  endpoint: string | null;
+  status: number | null;
+  error: string;
 }
 
 export interface PaloaltoAccessCheckResult {
@@ -138,7 +149,11 @@ export interface PanosDeviceSnapshot {
   haState?: XmlNode;
   haStateFailed: boolean;
   config: XmlNode[];
+  /** The xpath each entry of config was read from, in the same order; absent only in hand-built snapshots. */
+  configXpaths?: string[];
   failedXpaths: string[];
+  /** Failure detail per read ("show system info", "show high-availability state", or an xpath); absent only in hand-built snapshots. */
+  failures?: Record<string, PaloaltoSurfaceFailure>;
   errors: string[];
 }
 
@@ -157,6 +172,8 @@ export interface ComputeSnapshot {
   cloudDiscovery: JsonRecord[];
   ciScans: JsonRecord[];
   failed: string[];
+  /** Failure detail per entry of failed; absent only in hand-built snapshots. */
+  failures?: Record<string, PaloaltoSurfaceFailure>;
   truncated: string[];
   /** Why each entry of truncated stopped early (page cap, stuck offset). */
   truncationReasons?: Record<string, string>;
@@ -178,7 +195,8 @@ export interface PrismaSnapshot {
   posture?: JsonRecord;
   alertRules: JsonRecord[];
   alerts: JsonRecord[];
-  alertsTruncated: boolean;
+  /** Whether the alert walk stopped early; null when the alert read failed (no walk happened). */
+  alertsTruncated: boolean | null;
   alertsTruncationReason?: string;
   alertsTotal?: number;
   policies: JsonRecord[];
@@ -187,8 +205,12 @@ export interface PrismaSnapshot {
   userRoles: JsonRecord[];
   integrations: JsonRecord[];
   failed: string[];
+  /** Failure detail per entry of failed; absent only in hand-built snapshots. */
+  failures?: Record<string, PaloaltoSurfaceFailure>;
   compute?: ComputeSnapshot;
   computeUnavailableReason?: string;
+  /** The request that made the Compute console unreachable (CSPM /meta_info), when one was made. */
+  computeUnavailableFailure?: PaloaltoSurfaceFailure;
   errors: string[];
 }
 
@@ -412,6 +434,77 @@ export function redactErrorText(text: string): string {
 /** The single sink every persisted or returned error string passes through. */
 function errorMessage(error: unknown): string {
   return redactErrorText(error instanceof Error ? error.message : String(error));
+}
+
+/**
+ * Every failed Prisma Cloud, Compute, or PAN-OS request is thrown as this
+ * class. status is the HTTP status the request observed (null when no response
+ * arrived: timeout, DNS, TLS, or connection failure) and endpoint names the
+ * request that actually failed ("GET /v2/policy", "POST /login",
+ * "GET /api/v1/defenders", "GET /api/?type=config&action=show&xpath=..."), so
+ * a marker, probe, or finding built from the error never names a request the
+ * run did not make. The message is scrubbed on construction and again at every
+ * sink; it carries the status-and-length note for any non-JSON or non-XML body.
+ */
+export class PaloaltoApiError extends Error {
+  readonly status: number | null;
+  readonly endpoint: string;
+
+  constructor(message: string, status: number | null, endpoint: string) {
+    super(redactErrorText(message));
+    this.name = "PaloaltoApiError";
+    this.status = status;
+    this.endpoint = endpoint;
+  }
+}
+
+/** The failure detail recorded for a surface: the request that failed, the status it observed, and the scrubbed message. */
+function describeFailure(error: unknown): PaloaltoSurfaceFailure {
+  return {
+    endpoint: error instanceof PaloaltoApiError ? error.endpoint : null,
+    status: error instanceof PaloaltoApiError ? error.status : null,
+    error: errorMessage(error),
+  };
+}
+
+/** A hand-built snapshot records which reads failed but not how; the marker then carries no request or status it cannot vouch for. */
+function failureOf(failures: Record<string, PaloaltoSurfaceFailure> | undefined, label: string): PaloaltoSurfaceFailure {
+  return failures?.[label] ?? { endpoint: null, status: null, error: `${label} was not read.` };
+}
+
+type PaloaltoDatasetStatus = "ok" | "forbidden" | "not_found" | "error" | "unavailable";
+
+function datasetStatusOf(status: number | null): PaloaltoDatasetStatus {
+  if (status === 401 || status === 403) return "forbidden";
+  if (status === 404) return "not_found";
+  return "error";
+}
+
+/**
+ * The object written in place of a dataset that was not read, so a refusal is
+ * never an empty array or null: status is the HTTP status the failed request
+ * observed (null when no response arrived) and endpoint the request that failed.
+ */
+function notCollectedMarker(failure: PaloaltoSurfaceFailure, datasetStatus: PaloaltoDatasetStatus = datasetStatusOf(failure.status)): JsonRecord {
+  return {
+    collected: false,
+    status: failure.status,
+    dataset_status: datasetStatus,
+    endpoint: failure.endpoint,
+    error: failure.error,
+  };
+}
+
+/** Collection status of one surface for assessment summaries; a surface that was not read reports null counts, never 0 or false. */
+function surfaceCollectionStatus(endpoint: string | null, failure: PaloaltoSurfaceFailure | undefined, seen: number | null, truncated: boolean | null): JsonRecord {
+  return {
+    status: failure ? datasetStatusOf(failure.status) : "ok",
+    endpoint: failure ? failure.endpoint : endpoint,
+    http_status: failure ? failure.status : null,
+    seen: failure ? null : seen,
+    truncated: failure ? null : truncated,
+    error: failure ? failure.error : null,
+  };
 }
 
 function splitList(value: string | undefined): string[] {
@@ -1004,7 +1097,9 @@ export function createInsecureFetch(): FetchImpl {
   });
 }
 
-async function fetchWithRetry(url: string, init: RequestInit, options: HttpOptions): Promise<Response> {
+// endpoint names the request for the error thrown when no response arrives; the
+// URL is never used for that because a PAN-OS URL carries the API key in its query.
+async function fetchWithRetry(url: string, init: RequestInit, options: HttpOptions, endpoint: string): Promise<Response> {
   let attempt = 0;
   for (;;) {
     const controller = new AbortController();
@@ -1024,7 +1119,7 @@ async function fetchWithRetry(url: string, init: RequestInit, options: HttpOptio
         await (options.sleepImpl ?? sleep)(250 * 2 ** attempt);
         continue;
       }
-      throw new Error(redactSecrets(`Request to ${url} failed: ${errorMessage(error)}`, options.secrets));
+      throw new PaloaltoApiError(redactSecrets(`Request to ${url} failed: ${errorMessage(error)}`, options.secrets), null, endpoint);
     } finally {
       clearTimeout(timeout);
     }
@@ -1100,22 +1195,23 @@ export class PrismaCloudClient {
   }
 
   private async login(): Promise<string> {
+    const endpoint = "POST /login";
     const response = await fetchWithRetry(`${this.config.apiUrl}/login`, {
       method: "POST",
       headers: { "content-type": "application/json", accept: "application/json; charset=UTF-8" },
       body: JSON.stringify({ username: this.config.accessKeyId, password: this.config.secretKey }),
-    }, this.http);
+    }, this.http, endpoint);
     const rawText = await response.text();
     if (!response.ok) {
-      throw new Error(redactSecrets(`Prisma Cloud login failed (${response.status}): ${describePrismaErrorBody(response, rawText)}`, this.http.secrets));
+      throw new PaloaltoApiError(redactSecrets(`Prisma Cloud login failed (${response.status}): ${describePrismaErrorBody(response, rawText)}`, this.http.secrets), response.status, endpoint);
     }
     const parsed = safeJsonParse(rawText);
     if (parsed === undefined) {
-      throw new Error(`Prisma Cloud login returned a ${nonJsonBodyNote(response, rawText)} with status ${response.status}.`);
+      throw new PaloaltoApiError(`Prisma Cloud login returned a ${nonJsonBodyNote(response, rawText)} with status ${response.status}.`, response.status, endpoint);
     }
     const payload = asObject(parsed);
     const token = asString(payload?.token);
-    if (!token) throw new Error("Prisma Cloud login response did not include a token.");
+    if (!token) throw new PaloaltoApiError("Prisma Cloud login response did not include a token.", response.status, endpoint);
     this.prismaId = asString(asRecords(payload?.customerNames)[0]?.prismaId) ?? this.prismaId;
     this.token = token;
     this.tokenExpiresAt = Date.now() + PRISMA_TOKEN_TTL_MS;
@@ -1146,6 +1242,7 @@ export class PrismaCloudClient {
       if (value === undefined || value === null || value === "") continue;
       url.searchParams.set(key, String(value));
     }
+    const endpoint = `${method} ${path.startsWith("/") ? path : `/${path}`}`;
     const response = await fetchWithRetry(url.toString(), {
       method,
       headers: {
@@ -1154,19 +1251,19 @@ export class PrismaCloudClient {
         "x-redlock-auth": await this.getToken(),
       },
       body: body === undefined ? undefined : JSON.stringify(body),
-    }, this.http);
+    }, this.http, endpoint);
     const rawText = await response.text();
     if (response.status === 401 && retryAuth) {
       this.token = undefined;
       return this.request(method, path, query, body, false);
     }
     if (!response.ok) {
-      throw new Error(redactSecrets(`Prisma Cloud ${method} ${path} failed (${response.status}): ${describePrismaErrorBody(response, rawText)}`, this.http.secrets));
+      throw new PaloaltoApiError(redactSecrets(`Prisma Cloud ${method} ${path} failed (${response.status}): ${describePrismaErrorBody(response, rawText)}`, this.http.secrets), response.status, endpoint);
     }
     if (rawText.length === 0) return {};
     const parsed = safeJsonParse(rawText);
     if (parsed === undefined) {
-      throw new Error(`Prisma Cloud ${method} ${path} returned a ${nonJsonBodyNote(response, rawText)} with status ${response.status}.`);
+      throw new PaloaltoApiError(`Prisma Cloud ${method} ${path} returned a ${nonJsonBodyNote(response, rawText)} with status ${response.status}.`, response.status, endpoint);
     }
     return parsed;
   }
@@ -1304,7 +1401,7 @@ export class PrismaComputeClient {
       method: "POST",
       headers: { "content-type": "application/json", accept: "application/json" },
       body: JSON.stringify(this.cspm.credentials),
-    }, this.http);
+    }, this.http, "POST /api/v1/authenticate");
     const rawText = await response.text();
     const token = response.ok ? asString(asObject(safeJsonParse(rawText))?.token) : undefined;
     if (!token) {
@@ -1322,18 +1419,19 @@ export class PrismaComputeClient {
       if (value === undefined || value === null || value === "") continue;
       url.searchParams.set(key, String(value));
     }
+    const endpoint = `GET /api/v1${path.startsWith("/") ? path : `/${path}`}`;
     const response = await fetchWithRetry(url.toString(), {
       method: "GET",
       headers: { accept: "application/json", ...(await this.authHeaders()) },
-    }, this.http);
+    }, this.http, endpoint);
     const rawText = await response.text();
     if (!response.ok) {
-      throw new Error(redactSecrets(`Prisma Cloud Compute GET ${path} failed (${response.status}): ${describePrismaErrorBody(response, rawText)}`, this.http.secrets));
+      throw new PaloaltoApiError(redactSecrets(`Prisma Cloud Compute GET ${path} failed (${response.status}): ${describePrismaErrorBody(response, rawText)}`, this.http.secrets), response.status, endpoint);
     }
     if (rawText.length === 0) return {};
     const parsed = safeJsonParse(rawText);
     if (parsed === undefined) {
-      throw new Error(`Prisma Cloud Compute GET ${path} returned a ${nonJsonBodyNote(response, rawText)} with status ${response.status}.`);
+      throw new PaloaltoApiError(`Prisma Cloud Compute GET ${path} returned a ${nonJsonBodyNote(response, rawText)} with status ${response.status}.`, response.status, endpoint);
     }
     return parsed;
   }
@@ -1462,11 +1560,11 @@ export class PanosApiClient {
    * and length only. Error responses keep the documented msg or line text,
    * scrubbed of any credential-shaped value the device echoed.
    */
-  private parseResponse(response: Response, rawText: string, context: string): XmlNode {
+  private parseResponse(response: Response, rawText: string, context: string, endpoint: string): XmlNode {
     const document = parseXml(rawText);
     const responseNode = xmlChild(document, "response");
     if (!responseNode) {
-      throw new Error(`PAN-OS ${context} returned a non-XML ${responseContentType(response)} response (status ${response.status}, ${rawText.length} bytes, not echoed).`);
+      throw new PaloaltoApiError(`PAN-OS ${context} returned a non-XML ${responseContentType(response)} response (status ${response.status}, ${rawText.length} bytes, not echoed).`, response.status, endpoint);
     }
     if (responseNode.attributes.status !== "success") {
       const message = xmlText(xmlPath(responseNode, ["result", "msg"]))
@@ -1475,27 +1573,28 @@ export class PanosApiClient {
         || "no message";
       const code = /^[a-z0-9_-]{1,16}$/i.test(responseNode.attributes.code ?? "") ? responseNode.attributes.code : "unknown";
       const detail = redactSecrets(message.replace(/\s+/g, " "), this.http.secrets).slice(0, 300);
-      throw new Error(redactSecrets(`PAN-OS ${context} failed (code ${code}, status ${response.status}): ${detail}`, this.http.secrets));
+      throw new PaloaltoApiError(redactSecrets(`PAN-OS ${context} failed (code ${code}, status ${response.status}): ${detail}`, this.http.secrets), response.status, endpoint);
     }
     return responseNode;
   }
 
   private async generateApiKey(): Promise<string> {
+    const endpoint = PANOS_KEYGEN_ENDPOINT;
     if (!this.config.username || !this.config.password) {
-      throw new Error(`PAN-OS ${this.config.host} has no API key and no username/password for keygen.`);
+      throw new PaloaltoApiError(`PAN-OS ${this.config.host} has no API key and no username/password for keygen.`, null, endpoint);
     }
     const body = new URLSearchParams({ type: "keygen", user: this.config.username, password: this.config.password });
     const response = await fetchWithRetry(`${this.config.baseUrl}/api/`, {
       method: "POST",
       headers: { "content-type": "application/x-www-form-urlencoded" },
       body: body.toString(),
-    }, this.http);
+    }, this.http, endpoint);
     const rawText = await response.text();
     if (!response.ok && rawText.length === 0) {
-      throw new Error(`PAN-OS keygen for ${this.config.host} failed (${response.status}).`);
+      throw new PaloaltoApiError(`PAN-OS keygen for ${this.config.host} failed (${response.status}).`, response.status, endpoint);
     }
-    const key = xmlText(xmlPath(this.parseResponse(response, rawText, `keygen for ${this.config.host}`), ["result", "key"]));
-    if (!key) throw new Error(`PAN-OS keygen for ${this.config.host} did not return a key.`);
+    const key = xmlText(xmlPath(this.parseResponse(response, rawText, `keygen for ${this.config.host}`, endpoint), ["result", "key"]));
+    if (!key) throw new PaloaltoApiError(`PAN-OS keygen for ${this.config.host} did not return a key.`, response.status, endpoint);
     this.apiKey = key;
     this.http.secrets.push(key);
     return key;
@@ -1514,15 +1613,16 @@ export class PanosApiClient {
   async request(params: Record<string, string>, context: string): Promise<XmlNode> {
     const url = new URL(`${this.config.baseUrl}/api/`);
     for (const [key, value] of Object.entries(params)) url.searchParams.set(key, value);
+    const endpoint = panosEndpoint("GET", params);
     const response = await fetchWithRetry(url.toString(), {
       method: "GET",
       headers: { "X-PAN-KEY": await this.getApiKey(), accept: "application/xml" },
-    }, this.http);
+    }, this.http, endpoint);
     const rawText = await response.text();
     if (!response.ok && rawText.length === 0) {
-      throw new Error(`PAN-OS ${context} on ${this.config.host} failed (${response.status} ${response.statusText}).`);
+      throw new PaloaltoApiError(`PAN-OS ${context} on ${this.config.host} failed (${response.status} ${response.statusText}).`, response.status, endpoint);
     }
-    return this.parseResponse(response, rawText, `${context} on ${this.config.host}`);
+    return this.parseResponse(response, rawText, `${context} on ${this.config.host}`, endpoint);
   }
 
   async showConfig(xpath: string): Promise<XmlNode> {
@@ -1536,15 +1636,49 @@ export class PanosApiClient {
   }
 
   async showSystemInfo(): Promise<JsonRecord> {
-    const result = await this.op("<show><system><info></info></system></show>");
+    const result = await this.op(PANOS_SHOW_SYSTEM_INFO_CMD);
     const system = xmlChild(result, "system") ?? result;
     return asObject(xmlToJson(system)) ?? {};
   }
 
   async showHighAvailabilityState(): Promise<XmlNode> {
-    return this.op("<show><high-availability><state></state></high-availability></show>");
+    return this.op(PANOS_SHOW_HA_STATE_CMD);
   }
 }
+
+const PANOS_SHOW_SYSTEM_INFO_CMD = "<show><system><info></info></system></show>";
+const PANOS_SHOW_HA_STATE_CMD = "<show><high-availability><state></state></high-availability></show>";
+const PANOS_KEYGEN_ENDPOINT = "POST /api/?type=keygen";
+
+/**
+ * The endpoint label of a PAN-OS XML API request: the /api/ path with the
+ * request's own parameters (type, action, xpath, cmd), never the key or any
+ * credential parameter, so the label can be recorded anywhere.
+ */
+function panosEndpoint(method: string, params: Record<string, string>): string {
+  const query = Object.entries(params)
+    .filter(([name]) => !["key", "user", "password"].includes(name))
+    .map(([name, value]) => `${name}=${value}`)
+    .join("&");
+  return `${method} /api/${query ? `?${query}` : ""}`;
+}
+
+/** The documented request behind a PAN-OS config read, in the same form a failed read reports. */
+export function panosConfigEndpoint(xpath: string): string {
+  return panosEndpoint("GET", { type: "config", action: "show", xpath });
+}
+
+/** The documented request behind a PAN-OS operational command, in the same form a failed read reports. */
+export function panosOpEndpoint(command: string): string {
+  return panosEndpoint("GET", { type: "op", cmd: command });
+}
+
+export const PANOS_SYSTEM_INFO_READ = "show system info";
+export const PANOS_HA_STATE_READ = "show high-availability state";
+const PANOS_READ_ENDPOINTS: Record<string, string> = {
+  [PANOS_SYSTEM_INFO_READ]: panosOpEndpoint(PANOS_SHOW_SYSTEM_INFO_CMD),
+  [PANOS_HA_STATE_READ]: panosOpEndpoint(PANOS_SHOW_HA_STATE_CMD),
+};
 
 function detectPlatform(systemInfo: JsonRecord): "firewall" | "panorama" {
   const model = asString(systemInfo.model) ?? "";
