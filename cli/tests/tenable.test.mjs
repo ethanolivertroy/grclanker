@@ -2525,6 +2525,34 @@ test("reviewer E gap 5: a truncated inventory states seen versus total on the fa
   assert.equal(denied.evidence.records_total, null);
 });
 
+// Advisory A5: a zero-record page renders the total the API reported, never a hard-coded 0,
+// and zero delivered exclusions under a larger reported total is an unread list, not an empty one.
+test("advisory A5: zero-record branches render the observed pagination.total and zero exclusions under a larger total never read as compliant emptiness", async () => {
+  const routes = healthyRoutes();
+  routes["GET /exclusions"] = { exclusions: [], pagination: { total: 5 } };
+  routes["GET /credentials"] = { credentials: [], pagination: { total: 3 } };
+  routes["GET /audit-log/v1/events"] = { events: [], pagination: { total: 4 } };
+  const results = await runAll(clientsFor(routes));
+  const exclusions = byId(results, "TENABLE-13");
+  assert.equal(exclusions.status, "warn", exclusions.summary);
+  assert.equal(exclusions.summary, "GET /exclusions delivered zero exclusions although pagination.total reports 5, so the exclusion list was not reviewed. Only 0 of 5 records were retrieved (only 0 of the reported 5 records were returned), so the verdict is capped at warn.");
+  assert.doesNotMatch(exclusions.summary, /emptiness is compliant|pagination\.total 0/);
+  assertPartialView(exclusions, 0, 5, "only 0 of the reported 5 records were returned");
+  const credentials = byId(results, "TENABLE-12");
+  assert.equal(credentials.status, "manual");
+  assert.match(credentials.summary, /^GET \/credentials returned zero managed credentials \(pagination\.total 3\)\./);
+  assert.equal(credentials.evidence.pagination_total, 3);
+  const auditLog = byId(results, "TENABLE-18");
+  assert.equal(auditLog.status, "warn");
+  assert.match(auditLog.summary, /^The activity log returned zero events for the last 30 days \(pagination\.total 4\);/);
+
+  const empty = await runAll(clientsFor(emptyRoutes()));
+  assert.equal(byId(empty, "TENABLE-13").status, "pass");
+  assert.equal(byId(empty, "TENABLE-13").summary, "GET /exclusions returned zero exclusions (pagination.total 0), so nothing is excluded from scanning; emptiness is compliant for this control.");
+  assert.match(byId(empty, "TENABLE-12").summary, /\(pagination\.total 0\)\./);
+  assert.match(byId(empty, "TENABLE-18").summary, /\(pagination\.total 0\);/);
+});
+
 test("assessment summaries render null, not zero, for every unreadable dataset", async () => {
   const [scan, sensor, access, vuln] = await runAll(clientsFor(healthyRoutes(), { status: 403 }));
   for (const [key, value] of Object.entries(scan.summary)) {

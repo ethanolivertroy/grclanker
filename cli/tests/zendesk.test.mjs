@@ -1644,6 +1644,16 @@ test("self-check (c) variant: an unknown credential role caps verdicts at warn",
     assert.notEqual(status, "pass", `${id} must not pass when the credential role is unknown`);
   }
   assert.ok(results.every((result) => result.errors.some((entry) => entry.startsWith("current_user dataset:"))));
+
+  // Advisory A4: a role that could not be read is not reported as a non-admin role.
+  const brands = results.flatMap((result) => result.findings).find((item) => item.id === "ZD-22");
+  assert.equal(brands.status, "warn", brands.summary);
+  assert.match(brands.summary, /^\d+ brands were visible to a credential whose role could not be read, which may list only the brands the agent belongs to, so cross-brand consistency cannot be confirmed\./);
+  assert.doesNotMatch(brands.summary, /non-admin|role unknown/);
+  assert.equal(brands.evidence.current_user_role, null);
+  const agentBrands = findingById(await assessZendeskIntegrations(healthyClient({ async getCurrentUser() { return { id: 7, email: "agent@example.com", role: "agent" }; } }), { now: () => NOW }), "ZD-22");
+  assert.equal(agentBrands.status, "warn", agentBrands.summary);
+  assert.match(agentBrands.summary, /brands were visible to a non-admin credential \(role agent\), which only lists brands the agent belongs to, so cross-brand consistency cannot be confirmed\./);
 });
 
 test("every finding carries the framework mappings from the spec table", async () => {
@@ -3313,6 +3323,8 @@ test("ZD-25 records unresolved destinations when the target or webhook inventory
   const item = findingById(targetsForbidden, "ZD-25");
   assert.equal(item.status, "warn", item.summary);
   assert.equal(item.evidence.unresolved_destinations, 1);
+  assert.equal(item.evidence.insecure_destinations, null, "advisory A3: with a destination unresolved the insecure count is unknown, not zero");
+  assert.equal(item.evidence.insecure_resolved_destinations, 0);
   assert.equal(item.evidence.targets_status, "forbidden");
   assert.equal(item.evidence.external_notification_actions[0].destination, "target 77");
   assert.equal(item.evidence.external_notification_actions[0].unresolved, true);
@@ -3324,6 +3336,7 @@ test("ZD-25 records unresolved destinations when the target or webhook inventory
   assert.match(capped.summary, /none notify external targets, webhooks, or sharing agreements\. Verdict capped at warn because a secondary inventory could not be read: Webhooks \(\/webhooks, used to resolve notification_webhook destinations\) returned 403/);
   assert.deepEqual(capped.evidence.verdict_capped_by_unreadable, ["Webhooks (/webhooks, used to resolve notification_webhook destinations)"]);
   assert.equal(capped.evidence.unresolved_destinations, 0);
+  assert.equal(capped.evidence.insecure_destinations, 0, "every destination resolved, so the count is known");
 
   const truncatedTargets = await assessZendeskIntegrations(healthyClient({
     async listTargets() {
@@ -3335,7 +3348,26 @@ test("ZD-25 records unresolved destinations when the target or webhook inventory
   }), { now: () => NOW });
   const unseen = findingById(truncatedTargets, "ZD-25");
   assert.equal(unseen.evidence.unresolved_destinations, 1);
+  assert.equal(unseen.evidence.insecure_destinations, null);
   assert.match(unseen.summary, /The target or webhook inventory was truncated/);
+
+  // A resolved http destination beside an unresolved one still fails, and the evidence
+  // keeps the resolved count while the total stays unknown.
+  const mixed = await assessZendeskIntegrations(healthyClient({
+    listTargets: forbidden("/targets"),
+    async listWebhooks() {
+      return list([{ id: "wh9", name: "Legacy", status: "active", endpoint: "http://legacy.example.com/hook", authentication: { type: "basic_auth" } }]);
+    },
+    async listTriggers() {
+      return list([{ id: 9, title: "Post to legacy", active: true, actions: [{ field: "notification_webhook", value: ["wh9", "{{ticket.title}}"] }, { field: "notification_target", value: ["77", "{{ticket.title}}"] }] }]);
+    },
+  }), { now: () => NOW });
+  const mixedItem = findingById(mixed, "ZD-25");
+  assert.equal(mixedItem.status, "fail", mixedItem.summary);
+  assert.match(mixedItem.summary, /^1\/2 external notification actions deliver ticket data to http:\/\/ destinations\. 1 destination\(s\) could not be resolved/);
+  assert.equal(mixedItem.evidence.insecure_destinations, null);
+  assert.equal(mixedItem.evidence.insecure_resolved_destinations, 1);
+  assert.equal(mixedItem.evidence.unresolved_destinations, 1);
 });
 
 test("ZD-15 caps the zero-installation pass when owned apps are unreadable and renders unread marketplace counts as null", async () => {

@@ -3088,7 +3088,9 @@ export async function assessZendeskIntegrations(
     if (brands.length === 0) {
       findings.push(manualFinding(22, brandTitle, "medium", "Zero brands were visible although every account has a default brand, so the view is partial.", "use an admin credential and capture Admin Center > Account > Brand management.", evidence));
     } else if (currentRole !== "admin") {
-      findings.push(finding(22, brandTitle, "medium", "warn", `${brands.length} brands were visible to a non-admin credential (role ${currentRole ?? "unknown"}), which only lists brands the agent belongs to, so cross-brand consistency cannot be confirmed.`, evidence));
+      // A role that could not be read is not a non-admin role; the summary says which.
+      const credential = currentRole === undefined ? "a credential whose role could not be read, which may list only the brands the agent belongs to" : `a non-admin credential (role ${currentRole}), which only lists brands the agent belongs to`;
+      findings.push(finding(22, brandTitle, "medium", "warn", `${brands.length} brands were visible to ${credential}, so cross-brand consistency cannot be confirmed.`, evidence));
     } else if (isTruncated(brandsSnap)) {
       findings.push(finding(22, brandTitle, "medium", "warn", `${brands.length} brands were seen but the inventory was truncated, so cross-brand consistency cannot be confirmed.`, evidence));
     } else if (states.length > 1 || states.includes("unknown")) {
@@ -3196,7 +3198,10 @@ export async function assessZendeskIntegrations(
       active_triggers: listSnapshotItems(triggersSnap).filter((rule) => asBoolean(rule.active) !== false).length,
       active_automations: listSnapshotItems(automationsSnap).filter((rule) => asBoolean(rule.active) !== false).length,
       external_notification_actions: external.slice(0, 50),
-      insecure_destinations: insecure.length,
+      // With a destination left unresolved the insecure count is unknown, not zero; the
+      // count among the destinations that did resolve to a URL is kept beside it.
+      insecure_destinations: unresolved.length > 0 ? null : insecure.length,
+      insecure_resolved_destinations: insecure.length,
       unresolved_destinations: unresolved.length,
       targets_status: targetsSnap.status,
       webhooks_status: webhooksSnap.status,

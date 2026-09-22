@@ -2871,7 +2871,10 @@ export function assessTenableScanProgram(data: TenableScanProgramData, options: 
       exclusions.length === 0 ? capForPartial("pass", data.exclusions) : issues.size === 0 ? capForPartial("pass", data.exclusions) : permanent.length > 0 || broad.length > 0 ? "fail" : "warn",
       "medium",
       exclusions.length === 0
-        ? `${data.exclusions.endpoint} returned pagination.total 0, so nothing is excluded from scanning; emptiness is compliant for this control.${partialNote(data.exclusions)}`
+        ? data.exclusions.truncated
+          // Zero delivered records under a larger reported total is an unread list, not an empty one.
+          ? `${data.exclusions.endpoint} delivered zero exclusions although pagination.total reports ${data.exclusions.total ?? "an unknown count"}, so the exclusion list was not reviewed.${partialNote(data.exclusions)}`
+          : `${data.exclusions.endpoint} returned zero exclusions (pagination.total ${data.exclusions.total ?? "not reported"}), so nothing is excluded from scanning; emptiness is compliant for this control.`
         : issues.size === 0
           ? `All ${exclusions.length} exclusions are scheduled, documented, and scoped to narrow targets.${partialNote(data.exclusions)}`
           : `${issues.size} of ${exclusions.length} exclusions need review: ${permanent.length} always-on (schedule.enabled=false), ${undocumented.length} without a description, ${broad.length} covering /16 or wider ranges.`,
@@ -3598,7 +3601,7 @@ export function assessTenableAccessControl(data: TenableAccessControlData, optio
   if (data.credentials.status !== "ok") {
     findings.push(unreadableFinding(12, "medium", data.credentials, "the managed credential inventory with types, owners, and last use from Settings > Credentials"));
   } else if (data.credentials.data.length === 0) {
-    findings.push(finding(12, "manual", "medium", `${data.credentials.endpoint} returned zero managed credentials (pagination.total 0). Scan-embedded credentials are not listed by the API, so a human must confirm how scan credentials are managed and rotated.`, { credential_count: 0 }));
+    findings.push(finding(12, "manual", "medium", `${data.credentials.endpoint} returned zero managed credentials (pagination.total ${data.credentials.total ?? "not reported"}). Scan-embedded credentials are not listed by the API, so a human must confirm how scan credentials are managed and rotated.`, { credential_count: 0, pagination_total: data.credentials.total ?? null }));
   } else {
     const credentials = data.credentials.data;
     const unused = credentials.filter((credential) => asNumber(asObject(credential.last_used_by)?.id) === undefined);
@@ -3645,7 +3648,7 @@ export function assessTenableAccessControl(data: TenableAccessControlData, optio
     let summary: string;
     if (events.length === 0) {
       status = "warn";
-      summary = `The activity log returned zero events for the last ${lookbackDays} days (pagination.total ${data.auditLog.total ?? 0}); an active tenant should record logins and API calls, so confirm logging and the date filter.`;
+      summary = `The activity log returned zero events for the last ${lookbackDays} days (pagination.total ${data.auditLog.total ?? "not reported"}); an active tenant should record logins and API calls, so confirm logging and the date filter.`;
     } else if (data.auditLog.truncated) {
       status = "warn";
       summary = `Only ${events.length} of ${data.auditLog.total ?? "unknown"} activity log events were retrieved for the last ${lookbackDays} days, so the review is partial; ${sensitive.size} sensitive events were seen.`;
