@@ -801,9 +801,14 @@ test("checkPaloaltoAccess reports healthy access across both products", async ()
   const result = await checkPaloaltoAccess(clients);
   assert.equal(result.status, "healthy");
   assert.deepEqual(result.products, ["prisma-cloud", "prisma-compute", "pan-os"]);
-  assert.equal(result.surfaces.length, 8 + 8 + 2 + 5);
+  assert.equal(result.surfaces.length, 8 + 9 + 2 + 5);
   assert.ok(result.notes.some((note) => note.includes("Compute console: https://compute.example.com")));
   assert.ok(result.surfaces.every((surface) => surface.status === "readable"));
+  // A readable probe reports what it read and no HTTP failure status; every probe names one documented request.
+  assert.ok(result.surfaces.every((surface) => typeof surface.count === "number" && surface.httpStatus === null && surface.partial === undefined), JSON.stringify(result.surfaces));
+  assert.ok(result.surfaces.every((surface) => /^(GET|POST) \//.test(surface.endpoint)), result.surfaces.map((surface) => surface.endpoint).join("\n"));
+  assert.equal(result.surfaces.find((surface) => surface.name === "system_info").endpoint, "GET /api/?type=op&cmd=<show><system><info></info></system></show>");
+  assert.equal(result.surfaces.find((surface) => surface.name === "mgt-config").endpoint, "GET /api/?type=config&action=show&xpath=/config/mgt-config");
   assert.match(result.recommendedNextStep, /paloalto_assess_cloud_posture/);
   assert.ok(result.notes.some((note) => /PA-440/.test(note)));
 });
@@ -815,6 +820,13 @@ test("checkPaloaltoAccess reports degraded access and single-product configurati
   const failed = result.surfaces.filter((surface) => surface.status === "not_readable");
   assert.deepEqual(failed.map((surface) => surface.name).sort(), ["integrations", "mgt-config"]);
   assert.match(failed.find((surface) => surface.name === "mgt-config").error, /Insufficient privileges/);
+  // A failed probe read nothing (null, never 0 or false) and carries the status it observed.
+  for (const surface of failed) {
+    assert.equal(surface.count, null, surface.name);
+    assert.equal(surface.partial, null, surface.name);
+    assert.equal(surface.httpStatus, 403, surface.name);
+  }
+  assert.equal(failed.find((surface) => surface.name === "mgt-config").endpoint, "GET /api/?type=config&action=show&xpath=/config/mgt-config");
 
   const panosOnly = createPaloaltoClients(resolvePaloaltoConfiguration({}, { PANOS_HOST: "fw1.example.com", PANOS_API_KEY: "k" }), mockedFetch());
   const single = await checkPaloaltoAccess(panosOnly);
@@ -1064,18 +1076,20 @@ test("exportPaloaltoAuditBundle never writes PAN-OS credentials into the bundle 
   assertSecretsAbsent(assert, zipEntries, secrets, "zip archive");
 
   const device = JSON.parse(files.get(join("core_data", "panos_fw1.example.com.json")));
-  const mgtConfig = device.config.find((tree) => tree["mgt-config"])["mgt-config"];
+  // config is keyed by the xpath each subtree was read from.
+  assert.deepEqual(Object.keys(device.config), ["/config/devices/entry/vsys", "/config/devices/entry/network", "/config/devices/entry/deviceconfig", "/config/shared", "/config/mgt-config"]);
+  const mgtConfig = device.config["/config/mgt-config"]["mgt-config"];
   assert.equal(mgtConfig.users.entry[0].phash, "[REDACTED]");
   assert.equal(mgtConfig.users.entry[1]["public-key"], "c3NoLXJzYSBBQUFBQjNOemFDMXlj");
   assert.equal(mgtConfig["password-complexity"].enabled, "yes");
-  const shared = device.config.find((tree) => tree.shared).shared;
+  const shared = device.config["/config/shared"].shared;
   assert.equal(shared["server-profile"].radius.entry.server.entry.secret, "[REDACTED]");
   assert.equal(shared["server-profile"].ldap.entry["bind-password"], "[REDACTED]");
   assert.equal(shared.certificate.entry["private-key"], "[REDACTED]");
   assert.equal(shared.integration["@api-key"], "[REDACTED]");
-  const network = device.config.find((tree) => tree.network).network;
+  const network = device.config["/config/devices/entry/network"].network;
   assert.equal(network.ike.gateway.entry.authentication["pre-shared-key"], "[REDACTED]");
-  const deviceconfig = device.config.find((tree) => tree.deviceconfig).deviceconfig;
+  const deviceconfig = device.config["/config/devices/entry/deviceconfig"].deviceconfig;
   assert.equal(deviceconfig.system["snmp-setting"]["access-setting"].version.v2c["snmp-community-string"], "[REDACTED]");
   assert.equal(JSON.stringify(device).split("[REDACTED]").length - 1, 9, "every fixture secret is replaced by one marker");
 
@@ -1276,13 +1290,24 @@ test("exportPaloaltoAuditBundle and the assessment results never carry Prisma Cl
   assert.equal(integration("servicenow").password, "[REDACTED]");
   assert.equal(integration("servicenow").login, "prisma-svc");
   assert.equal(integration("tenable").secretKey, "[REDACTED]");
-  const registry = prisma.compute.registrySettings.specifications[0];
+  const registry = prisma.compute.registry_settings.specifications[0];
   assert.equal(registry.credential, "[REDACTED]");
   assert.equal(registry.credentialID, "reg-cred-1");
   assert.equal(prisma.compute.images[0].secrets, "[REDACTED]");
   assert.equal(prisma.compute.defenders[0].proxy.password, "[REDACTED]");
   assert.equal(prisma.compute.defenders[0].proxy.user, "defender");
-  assert.equal(prisma.compute.cloudDiscovery[0].credential, "[REDACTED]");
+  assert.equal(prisma.compute.cloud_discovery[0].credential, "[REDACTED]");
+  // The healthy bundle reports every CSPM and Compute surface as read, with a documented request and no failure status.
+  for (const [group, block] of [["prisma_cloud", prisma.collection], ["prisma_compute", prisma.compute.collection]]) {
+    assert.ok(Object.keys(block).length >= 8, `${group} lists every surface`);
+    for (const [surface, entry] of Object.entries(block)) {
+      assert.equal(entry.status, "ok", `${group} ${surface}`);
+      assert.equal(entry.http_status, null, `${group} ${surface}`);
+      assert.match(entry.endpoint, /^GET \//, `${group} ${surface}`);
+      assert.equal(typeof entry.seen, "number", `${group} ${surface}`);
+    }
+  }
+  assert.equal(prisma.open_alerts_truncated, false);
 
   const findings = JSON.parse(files.get(join("analysis", "findings.json")));
   for (const id of ["PA-10", "PA-11", "PA-20", "PA-24"]) assert.equal(byId(findings, id).status, "pass", `${id}: ${byId(findings, id).summary}`);
@@ -1357,7 +1382,7 @@ test("the two-device keygen sweep fixture is healthy before the canary sweep rel
   const clients = createPaloaltoClients(sweepConfig(), sweepFetch("none", () => htmlCanaryResponse()));
   const access = await checkPaloaltoAccess(clients);
   assert.equal(access.status, "healthy");
-  assert.equal(access.surfaces.length, 8 + 8 + 2 * 7);
+  assert.equal(access.surfaces.length, 8 + 9 + 2 * 7);
   const result = await exportPaloaltoAuditBundle(clients, createTempBase("grclanker-paloalto-sweep-healthy-"));
   assert.equal(result.errorCount, 0);
   const findings = JSON.parse(readBundleFiles(result.outputDir).get(join("analysis", "findings.json")));
