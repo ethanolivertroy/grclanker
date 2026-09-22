@@ -73,6 +73,10 @@ export interface ZendeskListResult {
   items: JsonRecord[];
   truncated: boolean;
   pages: number;
+  // Why paging stopped before the end when truncated is true: a stalled or repeated
+  // cursor, has_more without a link, the item or page cap, or a server-supplied next link
+  // the client refused to follow (a foreign origin or a link carrying user credentials).
+  truncation_reason?: string;
 }
 
 // One 2xx answer that passed the shape guard: the JSON object it carried and the
@@ -93,10 +97,12 @@ export interface ZendeskAccessSurface {
   // Items seen by a readable probe; null when the probe did not read anything, so a
   // refused surface is never mistaken for an empty one.
   count: number | null;
-  // True when a readable list probe stopped at its item cap or on a stuck cursor (count
-  // is a seen count rather than the population); null when the probe failed; absent for
-  // a readable single-object probe.
+  // True when a readable list probe stopped at its item cap, on a stuck cursor, or at a
+  // next link the client refused to follow (count is a seen count rather than the
+  // population); null when the probe failed; absent for a readable single-object probe.
   truncated?: boolean | null;
+  // Why a truncated list probe stopped early; absent otherwise.
+  truncationReason?: string;
   // The HTTP status observed by a failed probe; null when it was readable or no response arrived.
   httpStatus: number | null;
   error?: string;
@@ -927,6 +933,29 @@ function endpointLabel(url: string): string {
   }
 }
 
+/**
+ * A server-supplied next link (links.next, next_page) the client refused to follow: the
+ * request that would have carried the credential to it never left. The message is fixed
+ * text naming the endpoint being paged, the rejected origin or host, and the configured
+ * origin, never the link's path, query, or user credentials; the list stops there as
+ * truncated with reason as its truncation_reason.
+ */
+class ZendeskNextLinkError extends Error {
+  readonly reason: string;
+
+  constructor(endpoint: string, reason: string) {
+    super(`Zendesk ${endpoint} paging stopped: ${reason}.`);
+    this.name = "ZendeskNextLinkError";
+    this.reason = reason;
+  }
+}
+
+// Truncation reasons for the paging outcomes that do not involve a refused link.
+const STALLED_CURSOR_REASON = "the server promised more items after a page that added none, so the cursor stopped advancing";
+const HAS_MORE_WITHOUT_LINK_REASON = "meta.has_more was true on the last page but no next link or cursor was given";
+const REPEATED_LINK_REASON = "the next link repeated the page just read";
+const ABSOLUTE_LINK_PATTERN = /^(?:https?:)?\/\//i;
+
 // A property name is split into lower-case segments on underscores, hyphens,
 // dots, spaces, and camelCase boundaries, so api_key, apiKey, APIKey, and the
 // header name X-Api-Key all end in ["api", "key"]. The value is a credential when
@@ -1224,6 +1253,34 @@ export class ZendeskApiClient {
   }
 
   /**
+   * The URL a server-supplied next link (links.next, next_page) is followed to, which is
+   * only ever on the configured origin. An absolute or protocol-relative link is resolved
+   * against the configured base URL and must match its origin (scheme, host, and port)
+   * exactly and carry no user credentials; otherwise a ZendeskNextLinkError is thrown
+   * before any request is built, so the credential never leaves for the link, and the
+   * fixed text names only the rejected origin (or the host, for a link carrying user
+   * credentials) and the configured origin. A relative link is a path on the base URL.
+   */
+  private nextLinkUrl(link: string, path: string): string {
+    if (!ABSOLUTE_LINK_PATTERN.test(link)) return this.buildUrl(link);
+    const endpoint = endpointLabel(path);
+    const configuredOrigin = new URL(this.config.baseUrl).origin;
+    let target: URL;
+    try {
+      target = new URL(link, this.config.baseUrl);
+    } catch {
+      throw new ZendeskNextLinkError(endpoint, "the next link was not a valid URL and was not followed");
+    }
+    if (target.username !== "" || target.password !== "") {
+      throw new ZendeskNextLinkError(endpoint, `the next link to ${target.host} carried user credentials in the URL and was not followed`);
+    }
+    if (target.origin !== configuredOrigin) {
+      throw new ZendeskNextLinkError(endpoint, `the next link pointed to ${target.origin}, outside the configured origin ${configuredOrigin}, and was not followed`);
+    }
+    return target.toString();
+  }
+
+  /**
    * One read, with the shape guard every 2xx answer passes: a response whose body is
    * not a JSON object (an empty body, the HTML page a proxy or captive portal serves,
    * a foreign JSON value) is not the documented document. It is thrown as an
@@ -1285,6 +1342,7 @@ export class ZendeskApiClient {
     let nextUrl: string | undefined = this.buildUrl(path, baseQuery);
     let pages = 0;
     let truncated = false;
+    let truncationReason: string | undefined;
 
     while (nextUrl) {
       const document = await this.getDocument(this.buildUrl(nextUrl), nextUrl);
@@ -1306,24 +1364,37 @@ export class ZendeskApiClient {
         // An empty or fully repeated page while the server still promises more is a
         // cursor that stopped advancing, so the inventory is partial rather than complete.
         truncated = hasMore === true || Boolean(continuation);
+        if (truncated) truncationReason = STALLED_CURSOR_REASON;
         break;
       }
       if (!continuation) {
         truncated = hasMore === true;
+        if (truncated) truncationReason = HAS_MORE_WITHOUT_LINK_REASON;
         break;
       }
       if (continuation === nextUrl) {
         truncated = true;
+        truncationReason = REPEATED_LINK_REASON;
         break;
       }
       if (items.length >= maxItems || pages >= DEFAULT_MAX_PAGES) {
         truncated = true;
+        truncationReason = items.length >= maxItems ? `the item cap of ${maxItems} was reached` : `the page cap of ${DEFAULT_MAX_PAGES} was reached`;
         break;
       }
-      nextUrl = continuation;
+      // The link is checked before any request is built for it: a refused link ends the
+      // read here, with the pages already merged kept and the reason recorded.
+      try {
+        nextUrl = this.nextLinkUrl(continuation, path);
+      } catch (error) {
+        if (!(error instanceof ZendeskNextLinkError)) throw error;
+        truncated = true;
+        truncationReason = error.reason;
+        break;
+      }
     }
 
-    return { items, truncated, pages };
+    return { items, truncated, pages, ...(truncationReason === undefined ? {} : { truncation_reason: truncationReason }) };
   }
 
   async listOffset(
@@ -1339,6 +1410,7 @@ export class ZendeskApiClient {
     let nextUrl: string | undefined = this.buildUrl(path, { ...query, per_page: perPage });
     let pages = 0;
     let truncated = false;
+    let truncationReason: string | undefined;
 
     while (nextUrl) {
       const document = await this.getDocument(this.buildUrl(nextUrl), nextUrl);
@@ -1354,21 +1426,33 @@ export class ZendeskApiClient {
         // An empty or replayed page while a continuation still exists is an offset the
         // server ignored, so the inventory is partial rather than complete.
         truncated = Boolean(continuation);
+        if (truncated) truncationReason = STALLED_CURSOR_REASON;
         break;
       }
       if (!continuation) break;
       if (continuation === nextUrl) {
         truncated = true;
+        truncationReason = REPEATED_LINK_REASON;
         break;
       }
       if (items.length >= maxItems || pages >= DEFAULT_MAX_PAGES) {
         truncated = true;
+        truncationReason = items.length >= maxItems ? `the item cap of ${maxItems} was reached` : `the page cap of ${DEFAULT_MAX_PAGES} was reached`;
         break;
       }
-      nextUrl = continuation;
+      // The link is checked before any request is built for it: a refused link ends the
+      // read here, with the pages already merged kept and the reason recorded.
+      try {
+        nextUrl = this.nextLinkUrl(continuation, path);
+      } catch (error) {
+        if (!(error instanceof ZendeskNextLinkError)) throw error;
+        truncated = true;
+        truncationReason = error.reason;
+        break;
+      }
     }
 
-    return { items, truncated, pages };
+    return { items, truncated, pages, ...(truncationReason === undefined ? {} : { truncation_reason: truncationReason }) };
   }
 
   async getCurrentUser(): Promise<JsonRecord> {
@@ -1620,6 +1704,7 @@ function collectionStatusOf(snap: ZendeskSnapshot<unknown>): JsonRecord {
     http_status: snap.httpStatus ?? null,
     seen: list ? list.items.length : readObject ? (snap.data === undefined || snap.data === null ? 0 : 1) : null,
     truncated: list ? list.truncated : readObject ? false : null,
+    truncation_reason: list?.truncation_reason ?? null,
     pages: list ? list.pages : null,
     error: snap.error ?? null,
   };
@@ -1635,11 +1720,15 @@ function snapshotsForBundle(entries: Array<[string, ZendeskSnapshot<unknown>]>):
 
 // The line reads "<name> dataset: <error>", never "<name>: <error>": a dataset named for
 // what it holds (oauth_tokens) followed by a colon is a credential pair to the scrub, and
-// the whole message after it would be replaced.
+// the whole message after it would be replaced. A list read to completion writes nothing;
+// one that stopped early writes the reason paging stopped, so a partial inventory is on
+// record next to the failed reads.
 function snapshotErrors(entries: Array<[string, ZendeskSnapshot<unknown>]>): string[] {
-  return entries
-    .filter(([, snap]) => snap.status !== "ok")
-    .map(([name, snap]) => `${name} dataset: ${snap.error ?? snap.status}`);
+  return entries.flatMap(([name, snap]) => {
+    if (snap.status !== "ok") return [`${name} dataset: ${snap.error ?? snap.status}`];
+    const reason = isListResult(snap.data) && snap.data.truncated ? snap.data.truncation_reason : undefined;
+    return reason === undefined ? [] : [`${name} dataset: partial inventory, paging stopped early because ${reason}`];
+  });
 }
 
 function finding(
@@ -1692,7 +1781,7 @@ function truncationOrNull(...snaps: Array<ZendeskSnapshot<ZendeskListResult>>): 
 
 function truncationNote(name: string, snap: ZendeskSnapshot<ZendeskListResult>): string {
   return isTruncated(snap)
-    ? ` The ${name} inventory was truncated after ${listSnapshotItems(snap).length} items (more pages exist or the cursor stopped advancing), so the verdict is limited to the seen population.`
+    ? ` The ${name} inventory was truncated after ${listSnapshotItems(snap).length} items (${snap.data?.truncation_reason ?? "more pages exist or the cursor stopped advancing"}), so the verdict is limited to the seen population.`
     : "";
 }
 
@@ -1845,6 +1934,7 @@ export async function checkZendeskAccess(client: ZendeskReadClient): Promise<Zen
       status: snap.status === "ok" ? "readable" : snap.status,
       count: snap.status === "ok" ? (probe.count ? probe.count(snap.data) : Array.isArray(items) ? items.length : undefined) ?? null : null,
       ...(snap.status === "ok" ? (Array.isArray(items) ? { truncated: listResult?.truncated === true } : {}) : { truncated: null }),
+      ...(snap.status === "ok" && listResult?.truncated === true && typeof listResult.truncation_reason === "string" ? { truncationReason: listResult.truncation_reason } : {}),
       httpStatus: snap.httpStatus ?? null,
       error: snap.error,
     });
@@ -1878,6 +1968,11 @@ export async function checkZendeskAccess(client: ZendeskReadClient): Promise<Zen
       ...(unavailable.length > 0 ? [`Unavailable on this account or plan: ${unavailable.join(", ")}.`] : []),
       ...(unreadable.length > 0 ? [`Not read (the request failed or answered without the documented JSON document; see the surface errors): ${unreadable.join(", ")}. Their findings render manual or capped until they are readable.`] : []),
       ...(truncatedProbes.length > 0 ? [`Probe counts for ${truncatedProbes.join(", ")} are capped samples (marked +), not the full population; the assessment tools page to max_items.`] : []),
+      // A probe that stopped at a refused next link or a stalled cursor names the reason:
+      // its count is not a sample the cap produced.
+      ...surfaces
+        .filter((surface) => surface.truncated === true && surface.truncationReason !== undefined && !surface.truncationReason.includes(" cap of "))
+        .map((surface) => `The ${surface.name} probe stopped paging early because ${surface.truncationReason}.`),
       ...(currentUserRole && currentUserRole !== "admin" ? ["The credential is not an admin, so admin-only surfaces (security settings, deletion schedules, OAuth clients and tokens, audit logs, owned apps, brands, suspended tickets) will render as manual findings."] : []),
     ],
     recommendedNextStep: status === "healthy"
@@ -3247,7 +3342,7 @@ function buildQuickReference(): string {
     `- \`core_data/\` contains redacted Zendesk API snapshots used during this assessment (credentials are never written: OAuth token values, client secrets, target passwords, app parameters flagged secure, {name, value} pairs with credential names, and other credential-bearing properties are replaced with ${CREDENTIAL_REDACTION_MARKER}; inside every string value, URL userinfo, credential-named or token-shaped query pairs such as ?token=, token-in-path webhook URLs, header, cookie, and scheme carriers, and private PEM blocks are replaced while the scheme, host, and path are kept; the configured API token, OAuth token, and composed Basic credential are removed from every file in every encoded form).`,
     "- `analysis/` contains normalized findings (`findings.json`) and one JSON file per assessment category. Counts derived from an inventory that could not be read render as null, never 0.",
     "- `compliance/` contains the executive summary, the unified matrix, and one report per framework (FedRAMP, CMMC, SOC 2, CIS, PCI-DSS, DISA STIG, IRAP, ISMAP).",
-    "- `_errors.log` appears only when some reads failed but the bundle still completed. Error strings carry the HTTP status and Zendesk's documented error fields only; non-JSON bodies are summarized as a status-and-length note and never echoed.",
+    "- `_errors.log` appears only when some reads failed or stopped paging early but the bundle still completed. Error strings carry the HTTP status and Zendesk's documented error fields only; non-JSON bodies are summarized as a status-and-length note and never echoed. A partial inventory line names why paging stopped (the item or page cap, a stalled cursor, or a next link outside the configured origin that was not followed).",
     "- Manual findings name the Admin Center evidence a reviewer must collect; they never count as passing.",
     "",
     "Recommended reading order:",

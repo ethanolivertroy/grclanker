@@ -2552,6 +2552,9 @@ const CANARY_PLAIN = "jdvdnheoejphwk";
 const CANARY_QUOTED = "sess-qtdv-QCARRY-16180339887498";
 const CANARIES = [CANARY_BEARER, CANARY_SESSION, CANARY_API_KEY, CANARY_URL_TOKEN, CANARY_NAMED, CANARY_PLAIN, CANARY_QUOTED];
 const CANARY_URL = `https://api.example.com/v1/x?token=${CANARY_URL_TOKEN}`;
+// A value only a refused foreign-origin next link carries, in its query and as its
+// password: it proves the link itself is never recorded and never requested.
+const CANARY_NEXT_LINK = "Vq7mR2tZk9XcP4nB6wLd3Y";
 // A JSON text stringified into a string value arrives with its quotes escaped (\"): the
 // header pairs and the credential pair inside it are carriers one level down, and each
 // keeps its escaped quotes around the marker so the text stays well formed.
@@ -2601,7 +2604,7 @@ function assertNoCanary(text, label, canaries = CANARIES) {
 // rules run on their own (hyphenated words with one digit group), the plain lowercase word
 // that only the Bearer scheme gives away, and the Slack path (the documented T/B/secret
 // shape, the whole path being the secret).
-const PLANTED_CREDENTIALS = [...Object.values(LOADER_CANARIES), ...CANARIES, ...Object.values(FAKE_ZENDESK_SECRETS), FIXTURE_API_TOKEN];
+const PLANTED_CREDENTIALS = [...Object.values(LOADER_CANARIES), ...CANARIES, CANARY_NEXT_LINK, ...Object.values(FAKE_ZENDESK_SECRETS), FIXTURE_API_TOKEN];
 const SHAPED_CREDENTIALS = new Set([CANARY_NAMED, CANARY_QUOTED, CANARY_PLAIN, FIXTURE_API_TOKEN, FAKE_ZENDESK_SECRETS.slackWebhookPath]);
 
 // Every HTTP surface ZendeskApiClient reads, keyed by path (the three /audit_logs reads are
@@ -3616,4 +3619,197 @@ test("ZendeskApiClient fails a paged read whose later page or single-object read
     scripted([() => new Response(null, { status: 204, statusText: "No Content" })]).getAccountSettings(),
     /returned 204 No Content with an empty response body where the documented JSON document was expected/,
   );
+});
+
+// ---------------------------------------------------------------------------
+// Foreign-origin next link: a server-supplied links.next or next_page is followed only on
+// the configured subdomain origin
+// ---------------------------------------------------------------------------
+
+// The refused link carries CANARY_NEXT_LINK in its query and (for the userinfo shapes) as
+// the password: no request, result, file, or zip entry may carry it or any window of it.
+const CONFIGURED_ORIGIN = "https://acme.zendesk.com";
+const FOREIGN_HOST_REASON = /^the next link pointed to https:\/\/evil\.example\.com, outside the configured origin https:\/\/acme\.zendesk\.com, and was not followed$/;
+const FOREIGN_PORT_REASON = /^the next link pointed to https:\/\/acme\.zendesk\.com:8443, outside the configured origin https:\/\/acme\.zendesk\.com, and was not followed$/;
+
+// Every shape a foreign next link takes on a paged read of path, with the fixed text the
+// refusal records: the rejected origin (or, for a link carrying user credentials, only its
+// host) and the configured origin, never the link's path, query, or credentials.
+function foreignNextLinks(path) {
+  const rest = `${path}?page%5Bafter%5D=${CANARY_NEXT_LINK}&page=2&per_page=100`;
+  return [
+    ["another host", `https://evil.example.com${rest}`, FOREIGN_HOST_REASON],
+    ["a host that merely starts with the configured one", `https://acme.zendesk.com.evil.example.com${rest}`, /^the next link pointed to https:\/\/acme\.zendesk\.com\.evil\.example\.com, outside the configured origin https:\/\/acme\.zendesk\.com, and was not followed$/],
+    ["another port", `https://acme.zendesk.com:8443${rest}`, FOREIGN_PORT_REASON],
+    ["another scheme", `http://acme.zendesk.com${rest}`, /^the next link pointed to http:\/\/acme\.zendesk\.com, outside the configured origin https:\/\/acme\.zendesk\.com, and was not followed$/],
+    ["the configured host as userinfo before a foreign host", `https://acme.zendesk.com:${CANARY_NEXT_LINK}@evil.example.com${rest}`, /^the next link to evil\.example\.com carried user credentials in the URL and was not followed$/],
+    ["user credentials on the configured host", `https://auditor%40example.com:${CANARY_NEXT_LINK}@acme.zendesk.com${rest}`, /^the next link to acme\.zendesk\.com carried user credentials in the URL and was not followed$/],
+    ["protocol-relative", `//evil.example.com${rest}`, FOREIGN_HOST_REASON],
+  ];
+}
+
+// The two paging loops, each with its first page (carrying the next link under test) and
+// its complete second page.
+const NEXT_LINK_READS = [
+  {
+    label: "listCursor",
+    path: "/api/v2/users",
+    read: (client) => client.listTeamMembers(),
+    firstPage: (next) => jsonResponse({ users: [{ id: 1, role: "admin" }], meta: { has_more: true, after_cursor: "c2" }, links: { next } }),
+    secondPage: () => jsonResponse({ users: [{ id: 2, role: "agent" }], meta: { has_more: false, after_cursor: null }, links: { next: null } }),
+  },
+  {
+    label: "listOffset",
+    path: "/api/v2/targets",
+    read: (client) => client.listTargets(),
+    firstPage: (next) => jsonResponse({ targets: [{ id: 1 }], next_page: next, previous_page: null, count: 2 }),
+    secondPage: () => jsonResponse({ targets: [{ id: 2 }], next_page: null, previous_page: `${CONFIGURED_ORIGIN}/api/v2/targets?page=1`, count: 2 }),
+  },
+];
+
+function nextLinkClient(link, pages, requests) {
+  return new ZendeskApiClient(sampleConfig(), {
+    fetchImpl: async (url, init) => {
+      requests.push({ url, authorization: headerValue(init.headers, "authorization") });
+      return requests.length === 1 ? pages.firstPage(link) : pages.secondPage();
+    },
+    sleep: async () => {},
+  });
+}
+
+test("foreign-origin next link: listCursor and listOffset refuse a links.next or next_page outside the configured origin before any request leaves, keep the page already read, and record the inventory truncated with a fixed-text reason", async () => {
+  for (const pages of NEXT_LINK_READS) {
+    for (const [shape, link, reasonPattern] of foreignNextLinks(pages.path)) {
+      const label = `${pages.label} with ${shape}`;
+      const requests = [];
+      const result = await pages.read(nextLinkClient(link, pages, requests));
+      assert.equal(requests.length, 1, `${label}: no request leaves for the refused link`);
+      assert.ok(requests[0].url.startsWith(`${CONFIGURED_ORIGIN}${pages.path}?`), `${label}: the only request went to the configured origin (${requests[0].url})`);
+      assert.equal(requests[0].authorization, `Basic ${FIXTURE_BASIC_CREDENTIAL}`, `${label}: the credential went to the configured origin only`);
+      assert.equal(result.items.length, 1, `${label}: the page already read is kept`);
+      assert.equal(result.pages, 1, `${label}: the refused link is not a page`);
+      assert.equal(result.truncated, true, `${label}: the inventory is recorded truncated`);
+      assert.match(result.truncation_reason, reasonPattern, `${label}: the reason names the rejected origin or host and the configured origin`);
+      const rendered = JSON.stringify(result);
+      assertNoWindow(rendered, CANARY_NEXT_LINK, `${label}: the link's query and user credentials`);
+      assert.ok(!rendered.includes(`${pages.path}?`) && !rendered.includes("page%5Bafter%5D") && !rendered.includes("per_page"), `${label}: the link's path and query are not recorded`);
+      assert.ok(!rendered.includes("@"), `${label}: no userinfo is recorded`);
+      assert.equal(redactErrorText(result.truncation_reason), result.truncation_reason, `${label}: the reason is fixed text the general scrub leaves alone`);
+      assert.equal(redactCredentialValueText(result.truncation_reason), result.truncation_reason, `${label}: the reason is fixed text the data scrub leaves alone`);
+    }
+
+    // Same-origin controls: an absolute link on the configured origin (as served, with the
+    // default port spelled out, or with the host in another case), a relative path on the
+    // base URL, and a protocol-relative link on the configured host are followed with the
+    // credential, and the read completes untruncated.
+    const relativePath = pages.path.replace(/^\/api\/v2/, "");
+    const controls = [
+      ["an absolute same-origin link", `${CONFIGURED_ORIGIN}${pages.path}?page=2`, `${CONFIGURED_ORIGIN}${pages.path}?page=2`],
+      ["the default port spelled out", `https://acme.zendesk.com:443${pages.path}?page=2`, `${CONFIGURED_ORIGIN}${pages.path}?page=2`],
+      ["the host in another case", `https://ACME.Zendesk.com${pages.path}?page=2`, `${CONFIGURED_ORIGIN}${pages.path}?page=2`],
+      ["a relative path", `${relativePath}?page=2`, `${CONFIGURED_ORIGIN}${pages.path}?page=2`],
+      ["a protocol-relative same-origin link", `//acme.zendesk.com${pages.path}?page=2`, `${CONFIGURED_ORIGIN}${pages.path}?page=2`],
+    ];
+    for (const [shape, link, followed] of controls) {
+      const label = `${pages.label} with ${shape}`;
+      const requests = [];
+      const result = await pages.read(nextLinkClient(link, pages, requests));
+      assert.equal(requests.length, 2, `${label}: the same-origin link is followed`);
+      assert.equal(requests[1].url, followed, `${label}: the second request is the link on the configured origin`);
+      assert.equal(requests[1].authorization, `Basic ${FIXTURE_BASIC_CREDENTIAL}`, `${label}: the credential goes to the configured origin`);
+      assert.deepEqual(result, { items: [{ id: 1, ...(pages.label === "listCursor" ? { role: "admin" } : {}) }, { id: 2, ...(pages.label === "listCursor" ? { role: "agent" } : {}) }], truncated: false, pages: 2 }, `${label}: both pages are merged and the read is complete`);
+    }
+  }
+});
+
+test("foreign-origin next link over HTTP: a refused link demotes the dependent findings, names the reason in the access check, the tool results, core_data, the collection status, _errors.log, and the executive summary, and no request or output carries the link", async () => {
+  const routes = await healthyHttpRoutes();
+  const foreignUsersLink = `https://evil.example.com/api/v2/users?page%5Bafter%5D=${CANARY_NEXT_LINK}`;
+  const foreignTargetsLink = `https://acme.zendesk.com:8443/api/v2/targets?page=2&per_page=${CANARY_NEXT_LINK}`;
+  const target = { id: 5, title: "Ops hook", active: true, target_url: "https://hooks.example.com/ops", type: "url_target_v2" };
+  const log = [];
+  const client = new ZendeskApiClient(sampleConfig(), {
+    fetchImpl: async (url, init) => {
+      log.push({ url, authorization: headerValue(init.headers, "authorization") });
+      const key = zendeskRouteKey(url);
+      if (key === "/users") return jsonResponse({ ...routes["/users"], meta: { has_more: true, after_cursor: "c2" }, links: { next: foreignUsersLink } });
+      if (key === "/targets") return jsonResponse({ targets: [target], next_page: foreignTargetsLink, previous_page: null, count: 2 });
+      const payload = routes[key];
+      if (payload === undefined) throw new Error(`unrouted Zendesk request: ${url}`);
+      return jsonResponse(payload);
+    },
+    sleep: async () => {},
+  });
+  const teamSeen = routes["/users"].users.length;
+
+  const access = await checkZendeskAccess(client);
+  const team = access.surfaces.find((surface) => surface.name === "team_members");
+  assert.equal(team.status, "readable");
+  assert.equal(team.count, teamSeen, "the probe counts the page it read");
+  assert.equal(team.truncated, true, "the probe count is a seen count, not the population");
+  assert.match(team.truncationReason, FOREIGN_HOST_REASON);
+  const targetsSurface = access.surfaces.find((surface) => surface.name === "targets");
+  assert.equal(targetsSurface.truncated, true);
+  assert.match(targetsSurface.truncationReason, FOREIGN_PORT_REASON);
+  assert.equal(access.surfaces.find((surface) => surface.name === "groups").truncated, false, "a list read to completion carries no reason");
+  assert.equal(access.surfaces.find((surface) => surface.name === "groups").truncationReason, undefined);
+  assert.ok(access.notes.some((note) => /^The team_members probe stopped paging early because the next link pointed to https:\/\/evil\.example\.com, outside the configured origin https:\/\/acme\.zendesk\.com, and was not followed\.$/.test(note)), access.notes.join("\n"));
+  assert.ok(access.notes.some((note) => /^The targets probe stopped paging early because the next link pointed to https:\/\/acme\.zendesk\.com:8443, outside/.test(note)), access.notes.join("\n"));
+
+  const results = await runAllAssessments(client);
+  const accessControl = results.find((result) => result.category === "access-control");
+  const admins = findingById(accessControl, "ZD-07");
+  assert.equal(admins.status, "warn", `a finding over the truncated team inventory demotes: ${admins.summary}`);
+  assert.equal(admins.evidence.inventory_truncated, true);
+  assert.match(admins.summary, new RegExp(`The team member inventory was truncated after ${teamSeen} items \\(the next link pointed to https://evil\\.example\\.com, outside the configured origin https://acme\\.zendesk\\.com, and was not followed\\), so the verdict is limited to the seen population\\.`));
+  const destinations = findingById(results.find((result) => result.category === "integrations"), "ZD-24");
+  assert.equal(destinations.status, "warn", `a finding over the truncated target inventory demotes: ${destinations.summary}`);
+  assert.equal(destinations.evidence.inventory_truncated, true);
+  assert.equal(destinations.evidence.active_targets, 1, "the seen target is counted");
+  assert.match(destinations.summary, /The target inventory was truncated after 1 items \(the next link pointed to https:\/\/acme\.zendesk\.com:8443, outside the configured origin https:\/\/acme\.zendesk\.com, and was not followed\)/);
+  assert.deepEqual(accessControl.errors, ["team_members dataset: partial inventory, paging stopped early because the next link pointed to https://evil.example.com, outside the configured origin https://acme.zendesk.com, and was not followed"]);
+  assert.equal(accessControl.summary.collection.team_members.truncated, true);
+  assert.match(accessControl.summary.collection.team_members.truncation_reason, FOREIGN_HOST_REASON);
+  assert.equal(accessControl.summary.collection.team_members.seen, teamSeen);
+  assert.equal(accessControl.summary.collection.groups.truncation_reason, null, "a list read to completion renders a null reason");
+
+  const exported = await exportZendeskAuditBundle(client, sampleConfig(), createTempBase("grclanker-zendesk-next-link-"), { now: () => NOW });
+  const files = readBundleFiles(exported.outputDir);
+  const zip = readZipEntries(exported.zipPath);
+  const teamData = JSON.parse(files.get(join("core_data", "team_members.json")));
+  assert.equal(teamData.truncated, true);
+  assert.equal(teamData.items.length, teamSeen, "the page already read is kept in core_data");
+  assert.match(teamData.truncation_reason, FOREIGN_HOST_REASON);
+  const targetsData = JSON.parse(files.get(join("core_data", "targets.json")));
+  assert.deepEqual({ truncated: targetsData.truncated, items: targetsData.items.length, pages: targetsData.pages }, { truncated: true, items: 1, pages: 1 });
+  assert.match(targetsData.truncation_reason, FOREIGN_PORT_REASON);
+  assert.match(collectionEntry(files, "targets").truncation_reason, FOREIGN_PORT_REASON);
+  const errorLog = files.get("_errors.log");
+  assert.ok(errorLog !== undefined, "_errors.log records the partial inventories");
+  assert.deepEqual(errorLog.trim().split("\n"), [
+    "team_members dataset: partial inventory, paging stopped early because the next link pointed to https://evil.example.com, outside the configured origin https://acme.zendesk.com, and was not followed",
+    "targets dataset: partial inventory, paging stopped early because the next link pointed to https://acme.zendesk.com:8443, outside the configured origin https://acme.zendesk.com, and was not followed",
+  ]);
+  assert.equal(JSON.parse(files.get("metadata.json")).error_count, 2);
+  assert.match(files.get(join("compliance", "executive_summary.md")), /## Partial Collection Warnings\n\n- team_members dataset: partial inventory, paging stopped early because the next link pointed to https:\/\/evil\.example\.com, outside the configured origin https:\/\/acme\.zendesk\.com, and was not followed\n- targets dataset: partial inventory/);
+
+  // No request left for either refused link: every request of the run went to the
+  // configured origin, and only there did the credential go.
+  assert.ok(log.length >= 22, `the run made its reads (${log.length})`);
+  for (const entry of log) {
+    assert.ok(entry.url.startsWith(`${CONFIGURED_ORIGIN}/api/v2/`), `every request went to the configured origin: ${entry.url}`);
+    assert.equal(entry.authorization, `Basic ${FIXTURE_BASIC_CREDENTIAL}`);
+    assertNoWindow(entry.url, CANARY_NEXT_LINK, "the request log");
+  }
+
+  // Every result, file, and zip entry is free of the link's path, query, and credentials,
+  // and the reason is fixed text the scrub leaves alone, so no marker appears where none was
+  // planted (core_data/ carries the fixture's own webhook and target credentials as markers).
+  const outputs = [["check_access", JSON.stringify(access)], ...results.map((result) => [result.category, JSON.stringify(result)]), ...files, ...[...zip].map(([name, text]) => [`zip:${name}`, text])];
+  for (const [name, text] of outputs) {
+    assertNoWindow(text, CANARY_NEXT_LINK, `${name}: the refused link's query and credentials`);
+    assert.ok(!text.includes("evil.example.com/") && !text.includes(":8443/"), `${name}: the refused link's path is not recorded`);
+    assert.equal(redactErrorText(text), text, `${name}: the reason is fixed text the general scrub leaves alone`);
+    if (!name.includes("core_data") && !name.includes("QUICK_REFERENCE.md")) assert.ok(!text.includes("[REDACTED]"), `${name}: carries no marker with nothing planted`);
+  }
 });
