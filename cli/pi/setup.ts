@@ -29,6 +29,10 @@ import {
   DEFAULT_PARALLELS_SOURCE_KIND,
   detectComputeBackendStatuses,
   getComputeBackendChoices,
+  getComputeBackendConfigurationIssues,
+  getComputeBackendShipState,
+  getDefaultComputeProfile,
+  getRoutingBucket,
   isComputeBackendAvailable,
   listParallelsTemplates,
   listParallelsVms,
@@ -556,7 +560,15 @@ async function promptComputeBackendSettings(
   settings: GrclankerSettings,
   computeBackend: ComputeBackendKind,
 ): Promise<Partial<GrclankerSettings>> {
-  const nextSettings: Partial<GrclankerSettings> = { computeBackend };
+  const nextSettings: Partial<GrclankerSettings> = {
+    computeBackend,
+    computeProfile: getDefaultComputeProfile(computeBackend),
+  };
+
+  if (getComputeBackendShipState(computeBackend) === "stub") {
+    console.log("");
+    console.log(`${computeBackend} is not yet available; grclanker will fail fast until the adapter ships.`);
+  }
 
   if (computeBackend === "sandbox-runtime") {
     console.log("");
@@ -648,7 +660,7 @@ function hasAdvancedComputeConfiguration(settings: GrclankerSettings): boolean {
 async function promptAdvancedComputeSetup(settings: GrclankerSettings): Promise<boolean> {
   const defaultValue = hasAdvancedComputeConfiguration(settings);
   return promptYesNo(
-    "Configure advanced compute backend settings (Docker, sandbox-runtime, Parallels)?",
+    "Configure advanced compute backend settings (Docker, sandbox-runtime, Parallels, Modal, RunPod)?",
     defaultValue,
   );
 }
@@ -818,6 +830,38 @@ function describeSkillDiscoveryMode(mode: SkillDiscoveryMode): string {
   return mode === "bundled-and-project"
     ? "Bundled grclanker skills plus discovered project/local Pi skills."
     : "Bundled grclanker skills only.";
+}
+
+export function applyComputeSelection(
+  settings: GrclankerSettings,
+  computeBackend: ComputeBackendKind,
+): GrclankerSettings {
+  return {
+    ...settings,
+    computeBackend,
+    computeProfile: getDefaultComputeProfile(computeBackend),
+  };
+}
+
+export async function runComputeSetup(computeBackend: ComputeBackendKind): Promise<void> {
+  const settingsPath = getGrclankerSettingsPath();
+  const settings = readGrclankerSettings(settingsPath);
+  if (getComputeBackendShipState(computeBackend) === "stub") {
+    throw new GrclankerUserError(
+      `${computeBackend} is not yet available. Run \`grclanker env list\` to see which backends are ready.`,
+    );
+  }
+  const next = applyComputeSelection(settings, computeBackend);
+  writeGrclankerSettings(settingsPath, next);
+  console.log(`Preferred compute backend: ${computeBackend} (${getRoutingBucket(computeBackend)} bucket).`);
+  console.log(`Compute profile: ${next.computeProfile}.`);
+  if (computeBackend !== "host" && !isComputeBackendAvailable(computeBackend)) {
+    console.log(`warning: ${computeBackend} is not detected on this machine yet.`);
+  }
+  for (const issue of getComputeBackendConfigurationIssues(next, computeBackend)) {
+    console.log(`warning: ${issue}`);
+  }
+  console.log("Run `grclanker env doctor` and `grclanker env smoke-test` to validate it.");
 }
 
 export async function ensureCliConfigured(): Promise<void> {

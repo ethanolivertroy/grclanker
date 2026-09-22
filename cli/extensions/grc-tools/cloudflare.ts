@@ -37,6 +37,7 @@ const HSTS_MIN_MAX_AGE_SECONDS = 15_552_000;
 const STALE_IP_RULE_DAYS = 365;
 const CERTIFICATE_EXPIRY_WARNING_DAYS = 30;
 const AUDIT_LOG_LOOKBACK_DAYS = 30;
+const CURSOR_PAGE_BUDGET = 100;
 
 /**
  * Documentation pages on developers.cloudflare.com/api that every request and
@@ -115,8 +116,16 @@ export interface CloudflareAccessSurface {
   name: string;
   scope: "user" | "account" | "zone";
   endpoint: string;
-  status: "readable" | "not_readable" | "not_configured";
-  count?: number;
+  /**
+   * readable: the probe completed; not_readable: the probe itself failed; not_configured: the probe has no
+   * target because a readable parent inventory was empty or no account id is set; not_attempted: the probe
+   * was never sent because its parent inventory could not be read (the error names the parent).
+   */
+  status: "readable" | "not_readable" | "not_configured" | "not_attempted";
+  /** Items the probe saw; null when the probe never completed, so a denial is never mistaken for an empty inventory. */
+  count?: number | null;
+  /** HTTP status the failing probe observed; null when the failure was not an HTTP response. */
+  http_status?: number | null;
   error?: string;
 }
 
@@ -485,12 +494,181 @@ function cloudflareErrorSummary(payload: unknown): string | undefined {
   return errors.length > 0 ? errors.join("; ") : undefined;
 }
 
+/**
+ * Describes a non-JSON body by content type and byte length only. Proxy and
+ * WAF pages can echo request headers, so the body text itself is never kept.
+ */
+function describeNonJsonBody(contentType: string | null, rawText: string): string | undefined {
+  if (rawText.length === 0) return undefined;
+  return `non-JSON body (${contentType?.split(";")[0]?.trim() || "unknown content type"}, ${Buffer.byteLength(rawText, "utf8")} bytes)`;
+}
+
+const REDACTED_ERROR_VALUE = "[REDACTED]";
+const CONFIGURED_SECRETS = new Set<string>();
+const MIN_CONFIGURED_SECRET_LENGTH = 4;
+
+/**
+ * The forms a configured secret can take inside an error string: plain, JSON-escaped, URL-encoded, base64,
+ * and base64url (rule 9 scrub boundary: a configured secret is removed whatever its shape, in every form).
+ */
+function configuredSecretForms(value: string): string[] {
+  const forms = new Set<string>([
+    value,
+    JSON.stringify(value).slice(1, -1),
+    encodeURIComponent(value),
+    Buffer.from(value, "utf8").toString("base64"),
+    Buffer.from(value, "utf8").toString("base64url"),
+  ]);
+  return [...forms].filter((form) => form.length >= MIN_CONFIGURED_SECRET_LENGTH);
+}
+
+/** Secrets the running client was configured with or obtained; every recorded error string is scrubbed of them in every form. */
+function registerConfiguredSecrets(...values: Array<string | undefined>): void {
+  for (const value of values) {
+    if (!value || value.length < MIN_CONFIGURED_SECRET_LENGTH) continue;
+    for (const form of configuredSecretForms(value)) CONFIGURED_SECRETS.add(form);
+  }
+}
+
+function escapeErrorRegExp(text: string): string {
+  return text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+/** Replaces every configured secret form wherever it appears; a form under eight characters only where it stands as a whole token. */
+function scrubConfiguredSecrets(text: string): string {
+  let scrubbed = text;
+  for (const secret of [...CONFIGURED_SECRETS].sort((left, right) => right.length - left.length)) {
+    scrubbed = secret.length >= 8
+      ? scrubbed.split(secret).join(REDACTED_ERROR_VALUE)
+      : scrubbed.replace(new RegExp(`(?<![A-Za-z0-9])${escapeErrorRegExp(secret)}(?![A-Za-z0-9])`, "g"), REDACTED_ERROR_VALUE);
+  }
+  return scrubbed;
+}
+
+const ERROR_CREDENTIAL_KEY_PATTERN =
+  "[A-Za-z0-9_.-]*(?:token|secret|passw(?:or)?d|pwd|api[_-]?key|apikey|session(?:[_-]?id)?|sid|cookie|csrftoken|authorization|auth|signature|sig|nonce|credentials?|access[_-]?key|private[_-]?key|skey)";
+// key=value, key: value, and "key":"value" pairs whose key names a credential; the value's shape decides below.
+const ERROR_CREDENTIAL_PAIR_PATTERN = new RegExp(
+  `\\b(${ERROR_CREDENTIAL_KEY_PATTERN})(["']?\\s*[=:]\\s*["']?)((?:(?:Bearer|Basic|Digest|Token|ApiKey)\\s+)?[^\\s"'&;,<>]+)`,
+  "gi",
+);
+const TRAILING_PUNCTUATION_PATTERN = /[.!?:)]+$/;
+
+/**
+ * A value after a credential-named key is the credential (whatever its shape) when it is at least six
+ * characters and is twelve or longer, carries a digit or a character that is not a letter, or changes case
+ * inside the word. Short plain words after a colon ("InvalidAuthenticationToken: Access token has expired")
+ * are prose and stay.
+ */
+function looksLikeCredentialValue(value: string): boolean {
+  return value.length >= 6 && (value.length >= 12 || /\d/.test(value) || /[^A-Za-z]/.test(value) || /[a-z][A-Z]/.test(value));
+}
+
+function scrubCredentialPairs(text: string): string {
+  return text.replace(ERROR_CREDENTIAL_PAIR_PATTERN, (match: string, key: string, separator: string, value: string) => {
+    // A value the scheme rule already replaced ("Authorization: Bearer [REDACTED]") keeps its scheme name.
+    if (value.includes(REDACTED_ERROR_VALUE)) return match;
+    const core = value.replace(TRAILING_PUNCTUATION_PATTERN, "");
+    return looksLikeCredentialValue(core) ? `${key}${separator}${REDACTED_ERROR_VALUE}${value.slice(core.length)}` : match;
+  });
+}
+
+const ERROR_TEXT_PATTERNS: ReadonlyArray<readonly [RegExp, string]> = [
+  // Authorization scheme values wherever they appear (headers, cookies, HTML, JSON messages); the value must be
+  // long, carry a digit or base64 symbol, or change case inside the word, so prose such as "Basic authentication"
+  // and "Bearer Token" stays.
+  // Case-sensitive so the inner-case-change test means what it says (under /i, [a-z][A-Z] is any two letters).
+  [/\b(Bearer|bearer|BEARER|Basic|basic|BASIC|Digest|digest|Negotiate|negotiate|SSWS|Token|token|TOKEN|ApiKey|apikey|APIKEY|Api-Key|api-key)\s+(?=[A-Za-z0-9\-._~+/=:]{16,}|[A-Za-z0-9\-._~+/=:]*[\d+/=]|[A-Za-z0-9\-._~+/=:]*[a-z][A-Z])[A-Za-z0-9\-._~+/=:]{6,}/g, `$1 ${REDACTED_ERROR_VALUE}`],
+  // JWT-shaped strings.
+  [/\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}/g, REDACTED_ERROR_VALUE],
+  // PEM blocks, whole or cut off.
+  [/-----BEGIN [A-Z0-9 ]+-----[\s\S]*?(?:-----END [A-Z0-9 ]+-----|$)/g, REDACTED_ERROR_VALUE],
+  // AWS access key ids, 40-character secret access keys, long secret-shaped blobs, and hex digests.
+  [/\b(?:AKIA|ASIA|AROA|AIDA|AGPA|ANPA|ANVA|APKA|ABIA|ACCA)[A-Z0-9]{16}\b/g, REDACTED_ERROR_VALUE],
+  [/(?<![A-Za-z0-9/+=])[A-Za-z0-9/+]{40}(?![A-Za-z0-9/+=])/g, REDACTED_ERROR_VALUE],
+  // Long blobs must carry a digit so camelCase identifiers survive.
+  [/(?<![A-Za-z0-9+_=-])(?=[A-Za-z0-9+_-]*\d)[A-Za-z0-9+_-]{40,}={0,2}(?![A-Za-z0-9+_=-])/g, REDACTED_ERROR_VALUE],
+  [/\b[a-f0-9]{32,}\b/gi, REDACTED_ERROR_VALUE],
+  // Cookie headers carry session values in free form.
+  [/\b(set-cookie|cookie)(\s*[:=]\s*)[^\n<>]+/gi, `$1$2${REDACTED_ERROR_VALUE}`],
+];
+
+// URL userinfo and query strings anywhere in the string, not only when the string starts with a URL.
+const ERROR_URL_PATTERN = /\b(https?:\/\/)(?:[^\s/@"'<>]+@)?([^\s?#"'<>]+)(\?[^\s#"'<>]*)?/gi;
+
+/**
+ * Rule 9 scrub boundary for bare values. A run of 16 or more token characters is removed when it is shaped
+ * like a token (base64 symbols, digits scattered through its letters, or casing that breaks into one- and
+ * two-letter camelCase pieces) and kept when it is shaped like a name: "-" or "_" separated segments that are
+ * each letters in any casing, digits alone, or letters with one digit group (`prod-us-east-2026`,
+ * `AWSLambdaBasicExecutionRole`, `sha256`), an uppercase code, or a canonical UUID. "/", ".", ":", "@", and
+ * whitespace end a run, so path segments, hostnames, ARNs, and emails are judged piece by piece. Opaque
+ * identifiers whose shape is a token's are removed from error text as well; they travel in structured fields.
+ */
+const LONG_TOKEN_RUN_PATTERN = /[A-Za-z0-9+_-]{16,}(?:={1,2}(?![A-Za-z0-9&]))?/g;
+const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const UPPERCASE_CODE_PATTERN = /^[A-Z][A-Z_]*$|^[A-Z][A-Z0-9]*(?:[_-][A-Z0-9]+)+$/;
+const MIN_LETTERS_FOR_CASING = 6;
+
+const CAMEL_WORD_PATTERN = /[A-Z]+(?![a-z])|[A-Z]?[a-z]+/g;
+const MAX_SHORT_WORD_LENGTH = 2;
+
+/**
+ * Token-shaped casing. Split at camelCase boundaries, a name is words and acronyms of three letters or more
+ * (`GetAccessKeyLastUsed`, `AWSLambdaBasicExecutionRole`, `getHTTPSUrl`), while a random run breaks into
+ * one- and two-letter pieces (`bPxRfiCYcanaryKEYqm`: b, Px, C, KE). Two or more such pieces making up at
+ * least a third of the words is the token signal; one short word (`GetEbsEncryptionByDefault`) is a name.
+ */
+function hasTokenCasing(letters: string): boolean {
+  if (letters.length < MIN_LETTERS_FOR_CASING) return false;
+  const words = letters.match(CAMEL_WORD_PATTERN) ?? [];
+  const shortWords = words.filter((word) => word.length <= MAX_SHORT_WORD_LENGTH).length;
+  return shortWords >= 2 && shortWords * 3 >= words.length;
+}
+
+/** A "-" or "_" separated segment shaped like part of a name: empty, digits alone, or letters with at most one digit group and no token casing. */
+function isNameSegment(segment: string): boolean {
+  if (segment.length === 0 || /^\d+$/.test(segment)) return true;
+  if (!/^[A-Za-z0-9]+$/.test(segment)) return false;
+  if ((segment.match(/\d+/g) ?? []).length > 1) return false;
+  return !hasTokenCasing(segment.replace(/\d+/g, ""));
+}
+
+function looksLikeToken(run: string): boolean {
+  if (UUID_PATTERN.test(run) || UPPERCASE_CODE_PATTERN.test(run)) return false;
+  if (/[+=]/.test(run)) return true;
+  return run.split(/[-_]/).some((segment) => !isNameSegment(segment));
+}
+
+function scrubLongTokens(text: string): string {
+  return text.replace(LONG_TOKEN_RUN_PATTERN, (run: string) => (looksLikeToken(run) ? REDACTED_ERROR_VALUE : run));
+}
+
+/**
+ * Rule 9 sink for error text. CloudflareApiError scrubs its own message and errorMessage(), the only
+ * conversion from a thrown error to recorded text (read outcomes, access surfaces, zone setting reads,
+ * tool results), runs the same pass, so no path can carry a credential echoed by an upstream error
+ * body, a transport error, or a URL into the audit output.
+ */
+export function redactErrorText(text: string): string {
+  let scrubbed = scrubConfiguredSecrets(text);
+  scrubbed = scrubbed.replace(ERROR_URL_PATTERN, (_match, scheme: string, hostPath: string, query?: string) =>
+    `${scheme}${hostPath}${query ? `?${REDACTED_ERROR_VALUE}` : ""}`,
+  );
+  for (const [pattern, replacement] of ERROR_TEXT_PATTERNS) {
+    scrubbed = scrubbed.replace(pattern, replacement);
+  }
+  scrubbed = scrubCredentialPairs(scrubbed);
+  return scrubLongTokens(scrubbed);
+}
+
 export class CloudflareApiError extends Error {
-  readonly status: number;
+  /** HTTP status the request observed; undefined for transport failures (timeouts, connection errors). */
+  readonly status: number | undefined;
   readonly path: string;
 
-  constructor(message: string, status: number, path: string) {
-    super(message);
+  constructor(message: string, status: number | undefined, path: string) {
+    super(redactErrorText(message));
     this.name = "CloudflareApiError";
     this.status = status;
     this.path = path;
@@ -502,8 +680,27 @@ function errorStatus(error: unknown): number | undefined {
   return asNumber(record?.status) ?? asNumber(record?.statusCode);
 }
 
+/** Path of the request that failed, taken from the observed request rather than a caller's constant. */
+function errorEndpoint(error: unknown): string | undefined {
+  return error instanceof CloudflareApiError ? error.path : undefined;
+}
+
+/**
+ * A parser's message quotes the text it could not parse (V8: `Unexpected token '<', "<html>..." is not valid
+ * JSON`), so a SyntaxError from any parse of a body or document is recorded by name only. Every JSON.parse in
+ * this file already substitutes the status-and-length note in its own catch; this keeps the property even
+ * for a parse failure that escapes one.
+ */
+function isParseError(error: unknown): boolean {
+  return error instanceof SyntaxError || (typeof error === "object" && error !== null && (error as { name?: unknown }).name === "SyntaxError");
+}
+
+const PARSE_ERROR_NOTE = "SyntaxError: response could not be parsed as JSON; the parser's message is not recorded because it quotes the body";
+
+/** The only way a thrown error becomes recorded text. */
 function errorMessage(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
+  if (isParseError(error)) return PARSE_ERROR_NOTE;
+  return redactErrorText(error instanceof Error ? error.message : String(error));
 }
 
 export class CloudflareApiClient implements CloudflareReader {
@@ -521,6 +718,7 @@ export class CloudflareApiClient implements CloudflareReader {
     this.config = config;
     this.fetchImpl = options.fetchImpl ?? fetch;
     this.now = options.now ?? (() => new Date());
+    registerConfiguredSecrets(config.apiToken, config.apiKey);
   }
 
   getResolvedConfig(): CloudflareResolvedConfig {
@@ -552,30 +750,52 @@ export class CloudflareApiClient implements CloudflareReader {
     const timeout = setTimeout(() => controller.abort(), this.config.timeoutMs);
 
     try {
-      const response = await this.fetchImpl(this.buildUrl(path, options.query), {
-        method: "GET",
-        headers: buildHeaders(this.config),
-        signal: controller.signal,
-      });
+      let response: Response;
+      let rawText: string;
+      try {
+        response = await this.fetchImpl(this.buildUrl(path, options.query), {
+          method: "GET",
+          headers: buildHeaders(this.config),
+          signal: controller.signal,
+        });
+        rawText = await response.text();
+      } catch (error) {
+        // Transport failures carry no HTTP status; the message names the path and the timeout budget, never a body.
+        const reason = controller.signal.aborted
+          ? `timed out after ${this.config.timeoutMs} ms`
+          : `network error: ${errorMessage(error)}`;
+        throw new CloudflareApiError(`Cloudflare request failed for ${path} (${reason})`, undefined, path);
+      }
 
-      const rawText = await response.text();
       let payload: JsonRecord = {};
+      let parsed = rawText.length === 0;
       if (rawText.length > 0) {
         try {
           payload = asObject(JSON.parse(rawText)) ?? {};
+          parsed = true;
         } catch {
           payload = {};
         }
       }
+      const contentType = response.headers?.get?.("content-type") ?? null;
 
       if (response.status === 404 && options.allow404) {
         return null;
       }
 
       if (!response.ok) {
-        const detail = cloudflareErrorSummary(payload) ?? rawText.slice(0, 240);
+        const detail = (parsed ? cloudflareErrorSummary(payload) : undefined) ?? describeNonJsonBody(contentType, rawText);
         throw new CloudflareApiError(
           `Cloudflare request failed for ${path} (${response.status} ${response.statusText})${detail ? `: ${detail}` : ""}`,
+          response.status,
+          path,
+        );
+      }
+
+      // A 2xx answer that is not JSON (a proxy login page, an HTML error) is a failed read, not an empty inventory.
+      if (!parsed) {
+        throw new CloudflareApiError(
+          `Cloudflare request returned a non-JSON payload for ${path} (${response.status} ${response.statusText}): ${describeNonJsonBody(contentType, rawText)}`,
           response.status,
           path,
         );
@@ -624,7 +844,13 @@ export class CloudflareApiClient implements CloudflareReader {
         query: { ...options.query, page, per_page: perPage },
         allow404: options.allow404,
       });
-      if (payload === null) return { items: [], truncated: false, totalCount: 0 };
+      if (payload === null) {
+        // A 404 on the first page means the product is not provisioned; a 404
+        // after items were collected means the listing stopped early, so the
+        // collected items are kept and reported as truncated.
+        if (page === 1) return { items: [], truncated: false, totalCount: 0 };
+        return { items, truncated: true, totalCount: undefined };
+      }
 
       const pageItems = extractResultArray(payload);
       const resultInfo = asObject(payload.result_info);
@@ -655,23 +881,30 @@ export class CloudflareApiClient implements CloudflareReader {
   private async listCursorPaginated(path: string, limit: number, perPage: number): Promise<CloudflarePagedList> {
     const items: JsonRecord[] = [];
     let cursor: string | undefined;
-    for (let iteration = 0; iteration < 100; iteration += 1) {
+    for (let iteration = 0; iteration < CURSOR_PAGE_BUDGET; iteration += 1) {
       const payload = await this.requestJson(path, {
         query: { per_page: perPage, cursor },
         allow404: true,
       });
-      if (payload === null) return { items: [], truncated: false, totalCount: 0 };
+      if (payload === null) {
+        if (iteration === 0) return { items: [], truncated: false, totalCount: 0 };
+        return { items, truncated: true, totalCount: undefined };
+      }
       const pageItems = extractResultArray(payload);
       const remaining = limit - items.length;
       items.push(...pageItems.slice(0, remaining));
       if (pageItems.length > remaining) return { items, truncated: true };
 
       const cursors = asObject(asObject(payload.result_info)?.cursors);
-      cursor = asString(cursors?.after);
-      if (!cursor || pageItems.length === 0) break;
+      const nextCursor = asString(cursors?.after);
+      if (!nextCursor) return { items, truncated: false, totalCount: items.length };
+      // A cursor that arrives with an empty page or repeats the one just used
+      // cannot be followed safely; the listing is reported as incomplete.
+      if (pageItems.length === 0 || nextCursor === cursor) return { items, truncated: true, totalCount: undefined };
+      cursor = nextCursor;
       if (items.length >= limit) return { items, truncated: true };
     }
-    return { items, truncated: false, totalCount: items.length };
+    return { items, truncated: true, totalCount: undefined };
   }
 
   private zonePath(zoneId: string, suffix: string): string {
@@ -807,16 +1040,47 @@ export class CloudflareApiClient implements CloudflareReader {
   }
 }
 
+/** A failed read: the scrubbed error plus the HTTP status and path the failing request observed, when it was one. */
+type ReadFailure = { ok: false; error: string; status?: number; endpoint?: string };
+
 type ReadOutcome<T> =
   | { ok: true; value: T }
-  | { ok: false; error: string; status?: number };
+  | ReadFailure;
 
 async function attempt<T>(load: () => Promise<T>): Promise<ReadOutcome<T>> {
   try {
     return { ok: true, value: await load() };
   } catch (error) {
-    return { ok: false, error: errorMessage(error), status: errorStatus(error) };
+    return { ok: false, error: errorMessage(error), status: errorStatus(error), endpoint: errorEndpoint(error) };
   }
+}
+
+/**
+ * Outcome for a read the client cannot perform. It states that no request was made so the
+ * consumer never mistakes the missing reader for a denied or failed endpoint.
+ */
+function notAttempted(method: keyof CloudflareReader): ReadFailure {
+  return { ok: false, error: `not attempted: this client does not expose ${method}, so no request was made` };
+}
+
+/** The list behind a readable outcome; undefined when the read failed or was never attempted, never an empty fallback. */
+function readList(outcome: ReadOutcome<CloudflarePagedList> | undefined): CloudflarePagedList | undefined {
+  return outcome?.ok ? outcome.value : undefined;
+}
+
+/**
+ * Written in place of a list that was denied, errored, or never collected so that `[]` in
+ * core_data always means "read and empty". status and endpoint come from the observed request.
+ */
+export interface CloudflareUncollectedMarker {
+  collected: false;
+  status: number | null;
+  endpoint: string | null;
+  error: string;
+}
+
+function uncollectedMarker(outcome: { error: string; status?: number; endpoint?: string } | undefined, fallbackError: string): CloudflareUncollectedMarker {
+  return { collected: false, status: outcome?.status ?? null, endpoint: outcome?.endpoint ?? null, error: outcome?.error ?? fallbackError };
 }
 
 function asPaged(value: unknown): CloudflarePagedList {
@@ -835,10 +1099,6 @@ function asPaged(value: unknown): CloudflarePagedList {
 async function attemptList(load: () => Promise<unknown>): Promise<ReadOutcome<CloudflarePagedList>> {
   const outcome = await attempt(load);
   return outcome.ok ? { ok: true, value: asPaged(outcome.value) } : outcome;
-}
-
-function listOrEmpty(outcome: ReadOutcome<CloudflarePagedList>): CloudflarePagedList {
-  return outcome.ok ? outcome.value : { items: [], truncated: false, totalCount: 0 };
 }
 
 const STATUS_RANK: Record<CloudflareFindingStatus, number> = { pass: 0, warn: 1, manual: 2, fail: 3 };
@@ -947,12 +1207,18 @@ function finding(
 
 function deriveAccountContext(
   config: CloudflareResolvedConfig,
-  accounts: JsonRecord[],
+  accountsOutcome: ReadOutcome<CloudflarePagedList>,
 ): { accountId?: string; note: string } {
   if (config.accountId) {
     return { accountId: config.accountId, note: `Using configured account ${config.accountId}.` };
   }
 
+  // A denied or failed account list is named as such; it is never reported as "no accounts were visible".
+  if (!accountsOutcome.ok) {
+    return { accountId: undefined, note: `The account list could not be read (${accountsOutcome.endpoint ?? "/accounts"}: ${accountsOutcome.error}); account-scoped checks stay manual until account_id is set.` };
+  }
+
+  const accounts = accountsOutcome.value.items;
   const soleId = asString(accounts[0]?.id);
   if (accounts.length === 1 && soleId) {
     return { accountId: soleId, note: `Using the only visible Cloudflare account ${soleId}.` };
@@ -968,6 +1234,50 @@ function deriveAccountContext(
   };
 }
 
+const ACCOUNT_RECORD_FIELDS = ["id", "name", "type", "created_on"] as const;
+const ACCOUNT_SETTING_FIELDS = ["enforce_twofactor", "api_access_enabled", "access_approval_expiry", "use_account_custom_ns_by_default"] as const;
+const ZONE_RECORD_FIELDS = ["id", "name", "status", "paused", "type", "development_mode", "created_on", "modified_on", "activated_on", "name_servers", "original_name_servers", "original_registrar", "original_dnshost"] as const;
+
+function pickFields(record: JsonRecord, fields: readonly string[]): JsonRecord {
+  const projected: JsonRecord = {};
+  for (const field of fields) {
+    if (field in record) projected[field] = record[field];
+  }
+  return projected;
+}
+
+/**
+ * Projects a GET /accounts record to the fields the verdicts and the account
+ * context read; contact emails and free-form settings are dropped.
+ */
+function projectAccountRecord(account: JsonRecord): JsonRecord {
+  const settings = asObject(account.settings);
+  return {
+    ...pickFields(account, ACCOUNT_RECORD_FIELDS),
+    ...(settings ? { settings: { ...pickFields(settings, ACCOUNT_SETTING_FIELDS), abuse_contact_email_configured: Boolean(asString(settings.abuse_contact_email)) } } : {}),
+  };
+}
+
+/**
+ * Projects a GET /zones record to identity, status, plan, and account
+ * references; the owner email and other contact details are dropped.
+ */
+function projectZoneRecord(zone: JsonRecord): JsonRecord {
+  const plan = asObject(zone.plan);
+  const owner = asObject(zone.owner);
+  const account = asObject(zone.account);
+  return {
+    ...pickFields(zone, ZONE_RECORD_FIELDS),
+    ...(plan ? { plan: pickFields(plan, ["id", "name", "legacy_id", "is_subscribed"]) } : {}),
+    ...(owner ? { owner: pickFields(owner, ["id", "type"]) } : {}),
+    ...(account ? { account: pickFields(account, ["id", "name"]) } : {}),
+  };
+}
+
+function projectPagedList(list: CloudflarePagedList, project: (record: JsonRecord) => JsonRecord): CloudflarePagedList {
+  return { ...list, items: list.items.map((record) => project(record)) };
+}
+
 async function readableSurface(
   name: string,
   scope: CloudflareAccessSurface["scope"],
@@ -981,7 +1291,7 @@ async function readableSurface(
       : value === null ? 0 : 1;
     return { name, scope, endpoint, status: "readable", count };
   } catch (error) {
-    return { name, scope, endpoint, status: "not_readable", error: errorMessage(error) };
+    return { name, scope, endpoint: errorEndpoint(error) ?? endpoint, status: "not_readable", count: null, http_status: errorStatus(error) ?? null, error: errorMessage(error) };
   }
 }
 
@@ -991,7 +1301,25 @@ function notConfiguredSurface(
   endpoint: string,
   error: string,
 ): CloudflareAccessSurface {
-  return { name, scope, endpoint, status: "not_configured", error };
+  return { name, scope, endpoint, status: "not_configured", count: null, error };
+}
+
+/** A probe that was never sent because the inventory it depends on could not be read; carries the parent's status and error. */
+function notAttemptedSurface(
+  name: string,
+  scope: CloudflareAccessSurface["scope"],
+  endpoint: string,
+  parent: { endpoint: string; status?: number; error: string },
+): CloudflareAccessSurface {
+  return {
+    name,
+    scope,
+    endpoint,
+    status: "not_attempted",
+    count: null,
+    http_status: parent.status ?? null,
+    error: `Not attempted: ${parent.endpoint} could not be read (${parent.error})`,
+  };
 }
 
 function zoneName(zone: JsonRecord): string {
@@ -1102,7 +1430,7 @@ function aggregateZoneVerdicts(
   title: string,
   severity: CloudflareFinding["severity"],
   specControl: number | undefined,
-  zones: CloudflarePagedList,
+  zonesOutcome: ReadOutcome<CloudflarePagedList>,
   verdicts: ZoneVerdict[],
   options: {
     emptyStatus: CloudflareFindingStatus;
@@ -1111,11 +1439,25 @@ function aggregateZoneVerdicts(
     extraEvidence?: JsonRecord;
   },
 ): CloudflareFinding {
+  if (!zonesOutcome.ok) {
+    // A denied or failed zone list is not an empty one: the finding names the read that failed and
+    // carries no zone count, total, or truncation flag.
+    return finding(id, title, severity, "manual", manualReason(zonesOutcome.endpoint ?? "/zones", "Zone: Read", "the zone list", zonesOutcome.error), specControl, {
+      zones_seen: null,
+      zones_total: null,
+      zone_inventory_truncated: null,
+      zones_http_status: zonesOutcome.status ?? null,
+      zones_error: zonesOutcome.error,
+      ...options.extraEvidence,
+    });
+  }
+  const zones = zonesOutcome.value;
   const partialNote = partialInventoryNote("zone", zones);
   if (zones.items.length === 0) {
     return finding(id, title, severity, options.emptyStatus, `${options.emptyDetail}${partialNote ? ` ${partialNote}` : ""}`, specControl, {
       zones_seen: 0,
       zones_total: zones.totalCount ?? null,
+      zone_inventory_truncated: zones.truncated,
       ...options.extraEvidence,
     });
   }
@@ -1288,7 +1630,7 @@ function botManagementJudgement(config: JsonRecord | null): { status: Cloudflare
 async function zonePlanNote(client: Partial<Pick<CloudflareReader, "getZoneSubscription">>, zoneId: string): Promise<string> {
   if (!client.getZoneSubscription) return "";
   const subscription = await attempt(() => client.getZoneSubscription!(zoneId));
-  if (!subscription.ok) return ` The zone plan could not be named because /zones/{zone_id}/subscription was not readable (${subscription.error}); zones[].plan is deprecated and is not read.`;
+  if (!subscription.ok) return ` ${zonePlanNoteText(subscription.error)}`;
   const planName = asString(asObject(subscription.value?.rate_plan)?.public_name);
   const state = asString(subscription.value?.state);
   if (!planName) return " The zone subscription returned no rate_plan.public_name, so the plan is not named here.";
@@ -1317,21 +1659,23 @@ export async function checkCloudflareAccess(
     attemptList(() => client.listAccounts()),
     attemptList(() => client.listZones()),
   ]);
-  const accountItems = listOrEmpty(accounts).items;
-  const zoneItems = listOrEmpty(zones).items;
-  const { accountId, note } = deriveAccountContext(config, accountItems);
+  const accountItems = readList(accounts)?.items ?? [];
+  const zoneItems = readList(zones)?.items ?? [];
+  const { accountId, note } = deriveAccountContext(config, accounts);
   const firstZoneId = asString(zoneItems[0]?.id);
 
+  const failedSurface = (name: string, scope: CloudflareAccessSurface["scope"], endpoint: string, outcome: { error: string; status?: number; endpoint?: string }): CloudflareAccessSurface =>
+    ({ name, scope, endpoint: outcome.endpoint ?? endpoint, status: "not_readable", count: null, http_status: outcome.status ?? null, error: outcome.error });
   const surfaces: CloudflareAccessSurface[] = [
     verify.ok
       ? { name: "token_verify", scope: "user", endpoint: "/user/tokens/verify", status: "readable", count: verify.value ? 1 : 0 }
-      : { name: "token_verify", scope: "user", endpoint: "/user/tokens/verify", status: "not_readable", error: verify.error },
+      : failedSurface("token_verify", "user", "/user/tokens/verify", verify),
     accounts.ok
       ? { name: "accounts", scope: "account", endpoint: "/accounts", status: "readable", count: accountItems.length }
-      : { name: "accounts", scope: "account", endpoint: "/accounts", status: "not_readable", error: accounts.error },
+      : failedSurface("accounts", "account", "/accounts", accounts),
     zones.ok
       ? { name: "zones", scope: "zone", endpoint: "/zones", status: "readable", count: zoneItems.length }
-      : { name: "zones", scope: "zone", endpoint: "/zones", status: "not_readable", error: zones.error },
+      : failedSurface("zones", "zone", "/zones", zones),
   ];
 
   if (firstZoneId) {
@@ -1345,7 +1689,11 @@ export async function checkCloudflareAccess(
           scope: "zone",
           endpoint: `/zones/${firstZoneId}/settings/{setting_id}`,
           status: "not_readable",
-          error: settings.ok ? `${settingErrors} zone settings could not be read` : settings.error,
+          count: null,
+          http_status: settings.ok ? asNumber(settings.value.find((item) => asString(item.error))?.status) ?? null : settings.status ?? null,
+          error: settings.ok
+            ? `${settingErrors} of ${settings.value.length} zone settings could not be read: ${settings.value.filter((item) => asString(item.error)).map((item) => `${asString(item.id)}: ${asString(item.error)}`).join("; ")}`
+            : settings.error,
         },
       await readableSurface("dnssec", "zone", `/zones/${firstZoneId}/dnssec`, () => client.getDnssec(firstZoneId)),
     );
@@ -1353,11 +1701,21 @@ export async function checkCloudflareAccess(
       const listZoneRulesets = client.listZoneRulesets.bind(client);
       surfaces.push(await readableSurface("rulesets", "zone", `/zones/${firstZoneId}/rulesets`, () => listZoneRulesets(firstZoneId)));
     }
+  } else if (!zones.ok) {
+    // The zone list itself failed, so nothing zone-scoped was sent: the rows name the parent read and its
+    // status rather than the not_configured rendering a readable-but-empty zone list earns.
+    const parent = { endpoint: zones.endpoint ?? "/zones", status: zones.status, error: zones.error };
+    surfaces.push(
+      notAttemptedSurface("zone_settings", "zone", "/zones/{zone_id}/settings/{setting_id}", parent),
+      notAttemptedSurface("dnssec", "zone", "/zones/{zone_id}/dnssec", parent),
+    );
+    if (client.listZoneRulesets) surfaces.push(notAttemptedSurface("rulesets", "zone", "/zones/{zone_id}/rulesets", parent));
   } else {
     surfaces.push(
       notConfiguredSurface("zone_settings", "zone", "/zones/{zone_id}/settings/{setting_id}", "No visible zones were available."),
       notConfiguredSurface("dnssec", "zone", "/zones/{zone_id}/dnssec", "No visible zones were available."),
     );
+    if (client.listZoneRulesets) surfaces.push(notConfiguredSurface("rulesets", "zone", "/zones/{zone_id}/rulesets", "No visible zones were available."));
   }
 
   if (accountId) {
@@ -1375,7 +1733,11 @@ export async function checkCloudflareAccess(
   }
 
   const readableCount = surfaces.filter((surfaceItem) => surfaceItem.status === "readable").length;
-  const status = readableCount >= 5 ? "healthy" : "limited";
+  const notAttempted = surfaces.filter((surfaceItem) => surfaceItem.status === "not_attempted");
+  const failedCount = surfaces.filter((surfaceItem) => surfaceItem.status === "not_readable").length;
+  // A probe that failed or was never sent keeps the check at limited: not_configured rows (no account id,
+  // readable-but-empty zone list) are the only non-readable rows a healthy check may carry.
+  const status = readableCount >= 5 && failedCount === 0 && notAttempted.length === 0 ? "healthy" : "limited";
 
   return {
     status,
@@ -1386,6 +1748,9 @@ export async function checkCloudflareAccess(
       `Authenticated with ${config.authMethod === "token" ? "an API token" : "a Global API Key"}.`,
       note,
       `${readableCount}/${surfaces.length} Cloudflare audit surfaces are readable.`,
+      ...(!zones.ok && notAttempted.length > 0
+        ? [`${notAttempted.length} zone-scoped surfaces were not attempted because ${zones.endpoint ?? "/zones"} could not be read (${zones.status ?? "no HTTP status"}).`]
+        : []),
     ],
     recommendedNextStep:
       status === "healthy"
@@ -1422,7 +1787,7 @@ export async function assessCloudflareIdentity(
   recordError("/accounts", accounts);
   recordError("/zones", zones);
   recordError("/user/tokens", userTokens);
-  const { accountId, note } = deriveAccountContext(config, listOrEmpty(accounts).items);
+  const { accountId, note } = deriveAccountContext(config, accounts);
 
   const [members, accessApps, accessPolicies, identityProviders, accountTokens] = accountId
     ? await Promise.all([
@@ -1430,9 +1795,11 @@ export async function assessCloudflareIdentity(
       attemptList(() => client.listAccessApplications(accountId)),
       attemptList(() => client.listAccessPolicies(accountId)),
       attemptList(() => client.listIdentityProviders(accountId)),
+      // A client without the account token reader never attempted the read; that is an absent
+      // outcome, not a readable empty list.
       client.listAccountTokens
         ? attemptList(() => client.listAccountTokens!(accountId, tokenLimit))
-        : Promise.resolve<ReadOutcome<CloudflarePagedList>>({ ok: true, value: { items: [], truncated: false, totalCount: 0 } }),
+        : Promise.resolve<ReadOutcome<CloudflarePagedList> | undefined>(undefined),
     ])
     : [undefined, undefined, undefined, undefined, undefined];
   if (accountId) {
@@ -1440,7 +1807,7 @@ export async function assessCloudflareIdentity(
     recordError(`/accounts/${accountId}/access/apps`, accessApps!);
     recordError(`/accounts/${accountId}/access/policies`, accessPolicies!);
     recordError(`/accounts/${accountId}/access/identity_providers`, identityProviders!);
-    recordError(`/accounts/${accountId}/tokens`, accountTokens!);
+    if (accountTokens) recordError(`/accounts/${accountId}/tokens`, accountTokens);
   }
 
   const verified = verify.ok ? verify.value : null;
@@ -1480,8 +1847,13 @@ export async function assessCloudflareIdentity(
       { verified_status: verifiedStatus ?? null }));
   } else if (!tokenDetails || !tokenDetails.ok) {
     findings.push(finding("CF-IAM-02", "Current token verification and scoping", "high", "manual",
-      manualReason(`/user/tokens/${verifiedId ?? "{token_id}"}`, "User API Tokens: Read", "the token permission groups and resource scope", tokenDetails && !tokenDetails.ok ? tokenDetails.error : "token details unavailable"), 12,
-      { verified_status: verifiedStatus, token_id: verifiedId ?? null }));
+      manualReason(
+        tokenDetails && !tokenDetails.ok ? tokenDetails.endpoint ?? `/user/tokens/${verifiedId}` : `/user/tokens/${verifiedId ?? "{token_id}"}`,
+        "User API Tokens: Read",
+        "the token permission groups and resource scope",
+        tokenDetails && !tokenDetails.ok ? tokenDetails.error : notAttempted("getUserToken").error,
+      ), 12,
+      { verified_status: verifiedStatus, token_id: verifiedId ?? null, ...(tokenDetails && !tokenDetails.ok ? { http_status: tokenDetails.status ?? null } : {}) }));
   } else {
     const broadPolicies = policies.filter((policy) => {
       const resources = asObject(policy.resources) ?? {};
@@ -1506,8 +1878,9 @@ export async function assessCloudflareIdentity(
   ];
   const readableTokenLists = tokenSources.filter((source) => source.outcome?.ok);
   const failedTokenLists = tokenSources.filter((source) => source.outcome && !source.outcome.ok);
-  const allTokens = readableTokenLists.flatMap((source) => listOrEmpty(source.outcome!).items);
-  const truncatedTokenLists = readableTokenLists.filter((source) => listOrEmpty(source.outcome!).truncated);
+  const tokensReadable = readableTokenLists.length > 0;
+  const allTokens = readableTokenLists.flatMap((source) => readList(source.outcome)?.items ?? []);
+  const truncatedTokenLists = readableTokenLists.filter((source) => readList(source.outcome)?.truncated);
   const activeTokens = allTokens.filter((token) => asString(token.status) === "active");
   const tokensWithoutExpiry = activeTokens.filter((token) => !asDate(token.expires_on));
   const expiredButActive = activeTokens.filter((token) => {
@@ -1521,7 +1894,15 @@ export async function assessCloudflareIdentity(
   let tokenExpirySummary: string;
   if (readableTokenLists.length === 0) {
     tokenExpiryStatus = "manual";
-    tokenExpirySummary = manualReason("/user/tokens and /accounts/{account_id}/tokens", "User API Tokens: Read and Account API Tokens: Read", "the API token inventory with expiry dates", failedTokenLists.map((source) => source.outcome && !source.outcome.ok ? source.outcome.error : "").filter(Boolean).join("; ") || "no token list readable");
+    // Only the endpoints this run actually requested are named; an account token list that was never
+    // attempted (no account context) is not reported as unreadable.
+    const attemptedEndpoints = failedTokenLists.map((source) => (source.outcome && !source.outcome.ok ? source.outcome.endpoint : undefined) ?? source.label);
+    tokenExpirySummary = manualReason(
+      attemptedEndpoints.join(" and ") || "/user/tokens",
+      "User API Tokens: Read and Account API Tokens: Read",
+      "the API token inventory with expiry dates",
+      failedTokenLists.map((source) => source.outcome && !source.outcome.ok ? source.outcome.error : "").filter(Boolean).join("; ") || "no token list readable",
+    );
   } else if (allTokens.length === 0) {
     tokenExpiryStatus = "manual";
     tokenExpirySummary = "No API tokens were visible to this principal even though it authenticates with one; the inventory is scoped to other users or accounts. Manual review: export the token list from the dashboard (My Profile > API Tokens and Manage Account > API Tokens).";
@@ -1530,27 +1911,41 @@ export async function assessCloudflareIdentity(
     tokenExpirySummary = `${tokensWithoutExpiry.length} of ${activeTokens.length} active API tokens have no expires_on date${expiredButActive.length > 0 ? ` and ${expiredButActive.length} report active past their expiry` : ""}.`;
   } else if (unknownStatusTokens.length > 0 || truncatedTokenLists.length > 0 || failedTokenLists.length > 0) {
     tokenExpiryStatus = "warn";
-    tokenExpirySummary = `${activeTokens.length} active tokens all carry expiry dates, but ${unknownStatusTokens.length} tokens have an undocumented status${truncatedTokenLists.length > 0 ? `, the token list was truncated (${truncatedTokenLists.map((source) => `${source.label}: ${listOrEmpty(source.outcome!).items.length} seen of ${listOrEmpty(source.outcome!).totalCount ?? "unknown"}`).join("; ")})` : ""}${failedTokenLists.length > 0 ? `, and ${failedTokenLists.map((source) => source.label).join(", ")} could not be read` : ""}.`;
+    // Counts are scoped to the sources this run could read; a denied or truncated source is named as the
+    // reason the verdict is capped rather than folded into the tally as zero.
+    const scope = failedTokenLists.length > 0 || truncatedTokenLists.length > 0
+      ? `the ${allTokens.length} readable ${allTokens.length === 1 ? "token" : "tokens"} (${readableTokenLists.map((source) => source.label).join(", ")})`
+      : `all ${allTokens.length} inventoried tokens`;
+    const caveats = [
+      unknownStatusTokens.length > 0 ? `${unknownStatusTokens.length} ${unknownStatusTokens.length === 1 ? "has" : "have"} an undocumented status` : "",
+      truncatedTokenLists.length > 0 ? `the token list was truncated (${truncatedTokenLists.map((source) => `${source.label}: ${readList(source.outcome)?.items.length ?? "unknown"} seen of ${readList(source.outcome)?.totalCount ?? "unknown"}`).join("; ")})` : "",
+      failedTokenLists.length > 0 ? `${failedTokenLists.map((source) => source.label).join(", ")} could not be read, so tokens listed there were not assessed` : "",
+    ].filter(Boolean);
+    tokenExpirySummary = `${activeTokens.length} of ${scope} ${activeTokens.length === 1 ? "is" : "are"} active and every active one carries an expiry date, but ${caveats.join(", and ")}.`;
   } else {
     tokenExpiryStatus = "pass";
     tokenExpirySummary = `All ${activeTokens.length} active API tokens carry an expires_on date (${allTokens.length} tokens inventoried).`;
   }
+  // Every count derived from the token inventory renders null, never zero, when no token list was readable.
   findings.push(finding("CF-IAM-06", "API token expiration", "medium", tokenExpiryStatus, tokenExpirySummary, 13, {
-    tokens_seen: allTokens.length,
-    active_tokens: activeTokens.length,
-    tokens_without_expiry: tokensWithoutExpiry.slice(0, 50).map((token) => asString(token.name) ?? asString(token.id) ?? "unknown"),
-    active_past_expiry: expiredButActive.length,
-    never_used_active_tokens: neverUsedTokens.length,
+    tokens_seen: tokensReadable ? allTokens.length : null,
+    active_tokens: tokensReadable ? activeTokens.length : null,
+    tokens_without_expiry: tokensReadable ? tokensWithoutExpiry.slice(0, 50).map((token) => asString(token.name) ?? asString(token.id) ?? "unknown") : null,
+    active_past_expiry: tokensReadable ? expiredButActive.length : null,
+    never_used_active_tokens: tokensReadable ? neverUsedTokens.length : null,
     sources: tokenSources.map((source) => ({
-      endpoint: source.label,
-      readable: source.outcome?.ok ?? false,
-      seen: source.outcome?.ok ? source.outcome.value.items.length : 0,
+      endpoint: source.outcome && !source.outcome.ok ? source.outcome.endpoint ?? source.label : source.label,
+      readable: source.outcome ? source.outcome.ok : null,
+      attempted: source.outcome !== undefined,
+      seen: source.outcome?.ok ? source.outcome.value.items.length : null,
       total: source.outcome?.ok ? source.outcome.value.totalCount ?? null : null,
-      truncated: source.outcome?.ok ? source.outcome.value.truncated : false,
+      truncated: source.outcome?.ok ? source.outcome.value.truncated : null,
+      http_status: source.outcome && !source.outcome.ok ? source.outcome.status ?? null : null,
+      error: source.outcome && !source.outcome.ok ? source.outcome.error : null,
     })),
   }));
 
-  const memberList = members ? listOrEmpty(members) : undefined;
+  const memberList = readList(members);
   const superAdmins = (memberList?.items ?? []).filter((member) =>
     collectMemberRoleNames(member).some((role) => /super/i.test(role) && /admin/i.test(role)),
   );
@@ -1576,14 +1971,16 @@ export async function assessCloudflareIdentity(
   }
   findings.push(finding("CF-IAM-03", "Account member privilege concentration", "medium", memberStatus, memberSummary, 14, {
     account_id: accountId ?? null,
-    super_admins: superAdmins.length,
-    members_seen: memberList?.items.length ?? 0,
+    super_admins: memberList ? superAdmins.length : null,
+    members_seen: memberList?.items.length ?? null,
     members_total: memberList?.totalCount ?? null,
-    members_without_2fa: membersWithout2fa.length,
+    members_truncated: memberList?.truncated ?? null,
+    members_without_2fa: memberList ? membersWithout2fa.length : null,
+    ...(members && !members.ok ? { members_http_status: members.status ?? null, members_error: members.error } : {}),
   }));
 
-  const apps = accessApps ? listOrEmpty(accessApps) : undefined;
-  const reusablePolicies = accessPolicies ? listOrEmpty(accessPolicies) : undefined;
+  const apps = readList(accessApps);
+  const reusablePolicies = readList(accessPolicies);
   const inlinePolicies = (apps?.items ?? []).flatMap((app) => asRecordArray(app.policies));
   const allPolicies = [...inlinePolicies, ...(reusablePolicies?.items ?? [])];
   const bypassPolicies = allPolicies.filter((policy) => asString(policy.decision) === "bypass");
@@ -1605,21 +2002,34 @@ export async function assessCloudflareIdentity(
   } else if (bypassPolicies.length > 0 || appsWithoutPolicies.length > 0) {
     accessStatus = "fail";
     accessSummary = `${bypassPolicies.length} Access policies use decision bypass and ${appsWithoutPolicies.length} applications have no attached policy.`;
+  } else if (accessPolicies && !accessPolicies.ok) {
+    // Reusable policies are where a bypass decision can hide outside any app's
+    // inline list, so an unreadable policies endpoint blocks the pass.
+    accessStatus = "manual";
+    accessSummary = `${apps!.items.length} Access applications carry ${inlinePolicies.length} inline policies, none with bypass, but the reusable policy list could not be checked. ${manualReason(`/accounts/${accountId}/access/policies`, "Access: Apps and Policies: Read", "the reusable Access policy list and each policy's decision", accessPolicies.error)}`;
   } else {
-    const partial = partialInventoryNote("Access application", apps!);
-    accessStatus = partial ? "warn" : "pass";
-    accessSummary = `${apps!.items.length} Access applications carry ${allPolicies.length} policies (allow, deny, or non_identity), none with bypass.${partial ? ` ${partial}` : ""}`;
+    const partials = [partialInventoryNote("Access application", apps!), partialInventoryNote("reusable Access policy", reusablePolicies!)]
+      .filter((entry): entry is string => Boolean(entry));
+    accessStatus = partials.length > 0 ? "warn" : "pass";
+    accessSummary = `${apps!.items.length} Access applications carry ${allPolicies.length} policies (${inlinePolicies.length} inline, ${reusablePolicies!.items.length} reusable; allow, deny, or non_identity), none with bypass.${partials.length > 0 ? ` ${partials.join(" ")}` : ""}`;
   }
   findings.push(finding("CF-IAM-04", "Zero Trust Access app and policy coverage", "high", accessStatus, accessSummary, 9, {
-    access_apps: apps?.items.length ?? 0,
+    access_apps: apps?.items.length ?? null,
     access_apps_total: apps?.totalCount ?? null,
-    inline_policies: inlinePolicies.length,
-    reusable_policies: reusablePolicies?.items.length ?? 0,
-    bypass_policies: bypassPolicies.length,
-    apps_without_policies: appsWithoutPolicies.slice(0, 25).map((app) => asString(app.name) ?? asString(app.id) ?? "unknown"),
+    access_apps_truncated: apps?.truncated ?? null,
+    inline_policies: apps ? inlinePolicies.length : null,
+    reusable_policies: reusablePolicies?.items.length ?? null,
+    reusable_policies_total: reusablePolicies?.totalCount ?? null,
+    reusable_policies_readable: accessPolicies ? accessPolicies.ok : null,
+    reusable_policies_truncated: reusablePolicies?.truncated ?? null,
+    // Counted over the inline policies plus the reusable list when it was readable; null when no app list was read.
+    bypass_policies: apps ? bypassPolicies.length : null,
+    apps_without_policies: apps ? appsWithoutPolicies.slice(0, 25).map((app) => asString(app.name) ?? asString(app.id) ?? "unknown") : null,
+    ...(accessApps && !accessApps.ok ? { access_apps_http_status: accessApps.status ?? null, access_apps_error: accessApps.error } : {}),
+    ...(accessPolicies && !accessPolicies.ok ? { reusable_policies_http_status: accessPolicies.status ?? null, reusable_policies_error: accessPolicies.error } : {}),
   }));
 
-  const idps = identityProviders ? listOrEmpty(identityProviders) : undefined;
+  const idps = readList(identityProviders);
   const idpTypes = (idps?.items ?? []).map((idp) => asString(idp.type) ?? "unknown");
   const weakIdpTypes = idpTypes.filter((type) => type === "onetimepin");
   let idpStatus: CloudflareFindingStatus;
@@ -1642,24 +2052,26 @@ export async function assessCloudflareIdentity(
     idpSummary = `${idpTypes.length} identity providers configured (${[...new Set(idpTypes)].join(", ")})${weakIdpTypes.length > 0 ? "; One-time PIN remains enabled alongside SSO providers" : ""}.${partial ? ` ${partial}` : ""}`;
   }
   findings.push(finding("CF-IAM-05", "Zero Trust identity provider coverage", "medium", idpStatus, idpSummary, 10, {
-    identity_providers: idpTypes.length,
-    identity_provider_types: [...new Set(idpTypes)],
+    identity_providers: idps ? idpTypes.length : null,
+    identity_provider_types: idps ? [...new Set(idpTypes)] : null,
+    identity_providers_truncated: idps?.truncated ?? null,
+    ...(identityProviders && !identityProviders.ok ? { identity_providers_http_status: identityProviders.status ?? null, identity_providers_error: identityProviders.error } : {}),
   }));
 
-  const zoneList = listOrEmpty(zones);
+  // Summary counts render null, never the zero of an empty fallback, for every inventory whose read failed or never ran.
   return {
     title: "Cloudflare identity posture",
     summary: {
       auth_method: config.authMethod,
       account_id: accountId ?? null,
-      visible_accounts: listOrEmpty(accounts).items.length,
-      sampled_zones: zoneList.items.length,
-      super_admins: superAdmins.length,
-      access_apps: apps?.items.length ?? 0,
-      access_policies: allPolicies.length,
-      identity_providers: idpTypes.length,
-      tokens_seen: allTokens.length,
-      tokens_without_expiry: tokensWithoutExpiry.length,
+      visible_accounts: readList(accounts)?.items.length ?? null,
+      sampled_zones: readList(zones)?.items.length ?? null,
+      super_admins: memberList ? superAdmins.length : null,
+      access_apps: apps?.items.length ?? null,
+      access_policies: apps && reusablePolicies ? allPolicies.length : null,
+      identity_providers: idps ? idpTypes.length : null,
+      tokens_seen: tokensReadable ? allTokens.length : null,
+      tokens_without_expiry: tokensReadable ? tokensWithoutExpiry.length : null,
       manual_findings: findings.filter((item) => item.status === "manual").length,
     },
     findings,
@@ -1679,7 +2091,7 @@ export async function assessCloudflareZoneSecurity(
   const errors: string[] = [];
   const zonesOutcome = await attemptList(() => client.listZones(zoneLimit));
   if (!zonesOutcome.ok) errors.push(`/zones: ${zonesOutcome.error}`);
-  const zones = listOrEmpty(zonesOutcome);
+  const zones = readList(zonesOutcome);
 
   const managedWaf: ZoneVerdict[] = [];
   const customWaf: ZoneVerdict[] = [];
@@ -1696,14 +2108,17 @@ export async function assessCloudflareZoneSecurity(
   const emailObfuscation: ZoneVerdict[] = [];
   const securityHeaders: ZoneVerdict[] = [];
   const dnsExposure: ZoneVerdict[] = [];
-  let legacyFirewallRulesSeen = 0;
+  // The deprecated firewall rules API is consulted only when a managed ruleset read fails; until then its count is unknown.
+  let legacyFirewallRulesSeen: number | null = null;
 
   const entrypoint = (zoneId: string, phase: string): Promise<ReadOutcome<JsonRecord | null>> =>
     client.getZoneEntrypointRuleset
       ? attempt(() => client.getZoneEntrypointRuleset!(zoneId, phase))
-      : Promise.resolve({ ok: false, error: "entry point ruleset reader unavailable" });
+      : Promise.resolve(notAttempted("getZoneEntrypointRuleset"));
+  // The per-hostname association endpoint is documented in CF-ZONE-11 only on a run that requested it.
+  const hostnameAssociationsRequested = Boolean(client.listOriginTlsClientAuthHostnames) && (zones?.items.length ?? 0) > 0;
 
-  for (const zone of zones.items) {
+  for (const zone of zones?.items ?? []) {
     const zoneId = asString(zone.id);
     if (!zoneId) continue;
     const name = zoneName(zone);
@@ -1721,17 +2136,17 @@ export async function assessCloudflareZoneSecurity(
       attempt(() => client.getUniversalSslSettings(zoneId)),
       client.getOriginTlsClientAuthSettings
         ? attempt(() => client.getOriginTlsClientAuthSettings!(zoneId))
-        : Promise.resolve<ReadOutcome<JsonRecord | null>>({ ok: false, error: "origin TLS client auth reader unavailable" }),
+        : Promise.resolve(notAttempted("getOriginTlsClientAuthSettings")),
       client.listOriginTlsClientAuthHostnames
         ? attemptList(() => client.listOriginTlsClientAuthHostnames!(zoneId))
-        : Promise.resolve<ReadOutcome<CloudflarePagedList>>({ ok: false, error: "origin TLS client auth hostname reader unavailable" }),
+        : Promise.resolve(notAttempted("listOriginTlsClientAuthHostnames")),
       attemptList(() => client.listZoneRulesets(zoneId)),
       client.listCertificatePacks
         ? attemptList(() => client.listCertificatePacks!(zoneId))
-        : Promise.resolve<ReadOutcome<CloudflarePagedList>>({ ok: false, error: "certificate pack reader unavailable" }),
+        : Promise.resolve(notAttempted("listCertificatePacks")),
       client.listDnsRecords
         ? attemptList(() => client.listDnsRecords!(zoneId))
-        : Promise.resolve<ReadOutcome<CloudflarePagedList>>({ ok: false, error: "DNS record reader unavailable" }),
+        : Promise.resolve(notAttempted("listDnsRecords")),
     ]);
     zoneErrors("zone settings", settingsOutcome);
     zoneErrors("/dnssec", dnssecOutcome);
@@ -1749,11 +2164,16 @@ export async function assessCloudflareZoneSecurity(
     const settings = settingMap(settingsOutcome.ok ? settingsOutcome.value : []);
     if (!settingsOutcome.ok) {
       for (const settingId of CLOUDFLARE_ZONE_SETTING_IDS) settings.set(settingId, { error: settingsOutcome.error });
+    } else {
+      // getZoneSettings reports each failed per-setting read inline instead of throwing; every one is recorded.
+      for (const [settingId, read] of settings) {
+        if (read.error) errors.push(`${name} /settings/${settingId}: ${read.error}`);
+      }
     }
 
     if (!managedOutcome.ok) {
       const legacy = await attemptList(() => client.listFirewallRules(zoneId));
-      if (legacy.ok) legacyFirewallRulesSeen += legacy.value.items.length;
+      if (legacy.ok) legacyFirewallRulesSeen = (legacyFirewallRulesSeen ?? 0) + legacy.value.items.length;
     }
     managedWaf.push(entrypointVerdict(name, CLOUDFLARE_RULESET_PHASES.firewallManaged, managedOutcome, judgeManagedWaf, "Zone WAF: Read"));
     customWaf.push(entrypointVerdict(name, CLOUDFLARE_RULESET_PHASES.firewallCustom, customOutcome, judgeCustomWaf, "Zone WAF: Read"));
@@ -1845,65 +2265,71 @@ export async function assessCloudflareZoneSecurity(
 
   const emptyZones = { emptyStatus: "manual" as CloudflareFindingStatus, emptyDetail: "No zones were visible to this token, so zone controls cannot be judged; grant Zone: Read or set account_id." };
   const findings = [
-    aggregateZoneVerdicts("CF-ZONE-01", "WAF managed rulesets deployed", "high", 1, zones, managedWaf, {
+    aggregateZoneVerdicts("CF-ZONE-01", "WAF managed rulesets deployed", "high", 1, zonesOutcome, managedWaf, {
       ...emptyZones,
       passDetail: "Every sampled zone executes an enabled WAF managed ruleset in http_request_firewall_managed",
-      extraEvidence: { legacy_firewall_rules_seen: legacyFirewallRulesSeen, legacy_fallback: "GET /zones/{zone_id}/firewall/rules is deprecated and consulted for evidence only when the rulesets API is unreadable." },
+      extraEvidence: {
+        legacy_firewall_rules_seen: legacyFirewallRulesSeen,
+        // The deprecated endpoint is named only on a run that actually requested it.
+        ...(legacyFirewallRulesSeen !== null ? { legacy_fallback: "GET /zones/{zone_id}/firewall/rules is deprecated and was consulted for evidence only because the rulesets API was unreadable." } : {}),
+      },
     }),
-    aggregateZoneVerdicts("CF-ZONE-06", "WAF custom rules with blocking actions", "medium", 2, zones, customWaf, {
+    aggregateZoneVerdicts("CF-ZONE-06", "WAF custom rules with blocking actions", "medium", 2, zonesOutcome, customWaf, {
       ...emptyZones,
       passDetail: "Every sampled zone has enabled custom WAF rules with block or challenge actions",
     }),
-    aggregateZoneVerdicts("CF-ZONE-07", "HTTP DDoS protection sensitivity", "high", 3, zones, ddos, {
+    aggregateZoneVerdicts("CF-ZONE-07", "HTTP DDoS protection sensitivity", "high", 3, zonesOutcome, ddos, {
       ...emptyZones,
       passDetail: "Every sampled zone keeps HTTP DDoS override sensitivity at default or medium",
     }),
-    aggregateZoneVerdicts("CF-ZONE-02", "SSL mode Full (Strict)", "high", 5, zones, strictSsl, {
+    aggregateZoneVerdicts("CF-ZONE-02", "SSL mode Full (Strict)", "high", 5, zonesOutcome, strictSsl, {
       ...emptyZones,
       passDetail: "Every sampled zone enforces Full (Strict) SSL mode",
     }),
-    aggregateZoneVerdicts("CF-ZONE-03", "Minimum TLS version", "medium", 6, zones, minTls, {
+    aggregateZoneVerdicts("CF-ZONE-03", "Minimum TLS version", "medium", 6, zonesOutcome, minTls, {
       ...emptyZones,
       passDetail: "Every sampled zone requires TLS 1.2 or newer",
     }),
-    aggregateZoneVerdicts("CF-ZONE-04", "HSTS enforcement", "medium", 7, zones, hsts, {
+    aggregateZoneVerdicts("CF-ZONE-04", "HSTS enforcement", "medium", 7, zonesOutcome, hsts, {
       ...emptyZones,
       passDetail: "Every sampled zone enables HSTS with max_age of at least six months, include_subdomains, and preload",
     }),
-    aggregateZoneVerdicts("CF-ZONE-08", "Always Use HTTPS", "medium", 21, zones, alwaysHttps, {
+    aggregateZoneVerdicts("CF-ZONE-08", "Always Use HTTPS", "medium", 21, zonesOutcome, alwaysHttps, {
       ...emptyZones,
       passDetail: "Every sampled zone has Always Use HTTPS on",
     }),
-    aggregateZoneVerdicts("CF-ZONE-09", "Automatic HTTPS Rewrites", "low", 22, zones, httpsRewrites, {
+    aggregateZoneVerdicts("CF-ZONE-09", "Automatic HTTPS Rewrites", "low", 22, zonesOutcome, httpsRewrites, {
       ...emptyZones,
       passDetail: "Every sampled zone has Automatic HTTPS Rewrites on",
     }),
-    aggregateZoneVerdicts("CF-ZONE-05", "DNSSEC enabled", "medium", 8, zones, dnssec, {
+    aggregateZoneVerdicts("CF-ZONE-05", "DNSSEC enabled", "medium", 8, zonesOutcome, dnssec, {
       ...emptyZones,
       passDetail: "Every sampled zone has DNSSEC status active",
     }),
-    aggregateZoneVerdicts("CF-ZONE-10", "Universal SSL and certificate validity", "medium", 25, zones, universalSsl, {
+    aggregateZoneVerdicts("CF-ZONE-10", "Universal SSL and certificate validity", "medium", 25, zonesOutcome, universalSsl, {
       ...emptyZones,
       passDetail: "Every sampled zone has Universal SSL enabled with active, unexpired certificate packs",
     }),
-    aggregateZoneVerdicts("CF-ZONE-11", "Authenticated Origin Pulls", "medium", 18, zones, originPulls, {
+    aggregateZoneVerdicts("CF-ZONE-11", "Authenticated Origin Pulls", "medium", 18, zonesOutcome, originPulls, {
       ...emptyZones,
       passDetail: "Every sampled zone enables Authenticated Origin Pulls at the zone level and every per-hostname certificate association is active and enabled",
-      extraEvidence: { per_hostname_source: `GET /zones/{zone_id}/origin_tls_client_auth/hostnames (OpenAPI operation per-hostname-authenticated-origin-pull-list-hostname-associations, per_page 1000, status=all): ${CLOUDFLARE_API_DOCS.originTlsClientAuthHostnamesList}` },
+      extraEvidence: hostnameAssociationsRequested
+        ? { per_hostname_source: `GET /zones/{zone_id}/origin_tls_client_auth/hostnames (OpenAPI operation per-hostname-authenticated-origin-pull-list-hostname-associations, per_page 1000, status=all): ${CLOUDFLARE_API_DOCS.originTlsClientAuthHostnamesList}` }
+        : {},
     }),
-    aggregateZoneVerdicts("CF-ZONE-12", "Browser Integrity Check", "low", 19, zones, browserCheck, {
+    aggregateZoneVerdicts("CF-ZONE-12", "Browser Integrity Check", "low", 19, zonesOutcome, browserCheck, {
       ...emptyZones,
       passDetail: "Every sampled zone has Browser Integrity Check on",
     }),
-    aggregateZoneVerdicts("CF-ZONE-13", "Email Address Obfuscation", "low", 20, zones, emailObfuscation, {
+    aggregateZoneVerdicts("CF-ZONE-13", "Email Address Obfuscation", "low", 20, zonesOutcome, emailObfuscation, {
       ...emptyZones,
       passDetail: "Every sampled zone has Email Address Obfuscation on",
     }),
-    aggregateZoneVerdicts("CF-ZONE-14", "Security headers via transform rules", "medium", 23, zones, securityHeaders, {
+    aggregateZoneVerdicts("CF-ZONE-14", "Security headers via transform rules", "medium", 23, zonesOutcome, securityHeaders, {
       ...emptyZones,
       passDetail: "Every sampled zone sets CSP, X-Frame-Options, X-Content-Type-Options, and Referrer-Policy through http_response_headers_transform rules",
     }),
-    aggregateZoneVerdicts("CF-ZONE-15", "DNS record origin exposure", "low", undefined, zones, dnsExposure, {
+    aggregateZoneVerdicts("CF-ZONE-15", "DNS record origin exposure", "low", undefined, zonesOutcome, dnsExposure, {
       ...emptyZones,
       passDetail: "Every sampled zone proxies all proxiable A/AAAA/CNAME records",
     }),
@@ -1912,9 +2338,10 @@ export async function assessCloudflareZoneSecurity(
   return {
     title: "Cloudflare zone security posture",
     summary: {
-      sampled_zones: zones.items.length,
-      zones_total: zones.totalCount ?? null,
-      zone_inventory_truncated: zones.truncated,
+      sampled_zones: zones?.items.length ?? null,
+      zones_total: zones?.totalCount ?? null,
+      zone_inventory_truncated: zones?.truncated ?? null,
+      ...(zonesOutcome.ok ? {} : { zones_http_status: zonesOutcome.status ?? null, zones_error: zonesOutcome.error }),
       failing_findings: findings.filter((item) => item.status === "fail").length,
       warning_findings: findings.filter((item) => item.status === "warn").length,
       manual_findings: findings.filter((item) => item.status === "manual").length,
@@ -1944,21 +2371,21 @@ export async function assessCloudflareTrafficControls(
   ]);
   if (!accountsOutcome.ok) errors.push(`/accounts: ${accountsOutcome.error}`);
   if (!zonesOutcome.ok) errors.push(`/zones: ${zonesOutcome.error}`);
-  const zones = listOrEmpty(zonesOutcome);
-  const { accountId, note } = deriveAccountContext(config, listOrEmpty(accountsOutcome).items);
+  const zones = readList(zonesOutcome);
+  const { accountId, note } = deriveAccountContext(config, accountsOutcome);
 
   const rateLimiting: ZoneVerdict[] = [];
   const pageRules: ZoneVerdict[] = [];
   const botControls: ZoneVerdict[] = [];
 
-  for (const zone of zones.items) {
+  for (const zone of zones?.items ?? []) {
     const zoneId = asString(zone.id);
     if (!zoneId) continue;
     const name = zoneName(zone);
     const [rateLimitRuleset, pageRuleOutcome, botOutcome] = await Promise.all([
       client.getZoneEntrypointRuleset
         ? attempt(() => client.getZoneEntrypointRuleset!(zoneId, CLOUDFLARE_RULESET_PHASES.rateLimit))
-        : Promise.resolve<ReadOutcome<JsonRecord | null>>({ ok: false, error: "entry point ruleset reader unavailable" }),
+        : Promise.resolve(notAttempted("getZoneEntrypointRuleset")),
       attemptList(() => client.listPageRules(zoneId)),
       attempt(() => client.getBotManagement(zoneId)),
     ]);
@@ -2001,7 +2428,7 @@ export async function assessCloudflareTrafficControls(
       attemptList(() => client.listIpAccessRules(accountId)),
       client.getZeroTrustAccount
         ? attempt(() => client.getZeroTrustAccount!(accountId))
-        : Promise.resolve<ReadOutcome<JsonRecord | null>>({ ok: false, error: "Zero Trust account reader unavailable" }),
+        : Promise.resolve(notAttempted("getZeroTrustAccount")),
     ])
     : [undefined, undefined, undefined, undefined];
   if (accountId) {
@@ -2013,25 +2440,25 @@ export async function assessCloudflareTrafficControls(
 
   const emptyZones = { emptyStatus: "manual" as CloudflareFindingStatus, emptyDetail: "No zones were visible to this token, so zone traffic controls cannot be judged; grant Zone: Read or set account_id." };
   const findings: CloudflareFinding[] = [
-    aggregateZoneVerdicts("CF-TRF-01", "Rate limiting coverage", "medium", 16, zones, rateLimiting, {
+    aggregateZoneVerdicts("CF-TRF-01", "Rate limiting coverage", "medium", 16, zonesOutcome, rateLimiting, {
       ...emptyZones,
       passDetail: "Every sampled zone has enabled rate limiting rules",
     }),
-    aggregateZoneVerdicts("CF-TRF-02", "Page rule security regressions", "medium", 15, zones, pageRules, {
+    aggregateZoneVerdicts("CF-TRF-02", "Page rule security regressions", "medium", 15, zonesOutcome, pageRules, {
       ...emptyZones,
       passDetail: "No sampled zone has page rules that weaken security",
     }),
-    aggregateZoneVerdicts("CF-TRF-03", "Bot and automated traffic controls", "medium", 4, zones, botControls, {
+    aggregateZoneVerdicts("CF-TRF-03", "Bot and automated traffic controls", "medium", 4, zonesOutcome, botControls, {
       ...emptyZones,
       passDetail: "Every sampled zone enforces Bot Fight Mode or Super Bot Fight Mode",
     }),
   ];
 
-  const auditLogs = auditOutcome ? listOrEmpty(auditOutcome) : undefined;
+  const auditLogs = readList(auditOutcome);
   if (!accountId) {
     findings.push(finding("CF-TRF-04", "Account audit log visibility", "high", "manual", `${note} Export the audit log from Manage Account > Audit Log.`, 11, { account_id: null }));
   } else if (!auditOutcome!.ok) {
-    findings.push(finding("CF-TRF-04", "Account audit log visibility", "high", "manual", manualReason(`/accounts/${accountId}/audit_logs`, "Account Settings: Read", `the last ${AUDIT_LOG_LOOKBACK_DAYS} days of audit log events`, auditOutcome!.error), 11, { account_id: accountId }));
+    findings.push(finding("CF-TRF-04", "Account audit log visibility", "high", "manual", manualReason(auditOutcome!.endpoint ?? `/accounts/${accountId}/audit_logs`, "Account Settings: Read", `the last ${AUDIT_LOG_LOOKBACK_DAYS} days of audit log events`, auditOutcome!.error), 11, { account_id: accountId, audit_events: null, http_status: auditOutcome!.status ?? null }));
   } else if (auditLogs!.items.length === 0) {
     findings.push(finding("CF-TRF-04", "Account audit log visibility", "high", "manual", `No audit log events were returned for the last ${AUDIT_LOG_LOOKBACK_DAYS} days; Cloudflare always records account changes, so confirm visibility in Manage Account > Audit Log and check the token scope.`, 11, { account_id: accountId, audit_events: 0 }));
   } else {
@@ -2047,11 +2474,11 @@ export async function assessCloudflareTrafficControls(
     }));
   }
 
-  const ipRules = ipRulesOutcome ? listOrEmpty(ipRulesOutcome) : undefined;
+  const ipRules = readList(ipRulesOutcome);
   if (!accountId) {
     findings.push(finding("CF-TRF-05", "IP access rules", "medium", "manual", `${note} Review Security > WAF > Tools manually.`, 17, { account_id: null }));
   } else if (!ipRulesOutcome!.ok) {
-    findings.push(finding("CF-TRF-05", "IP access rules", "medium", "manual", manualReason(`/accounts/${accountId}/firewall/access_rules/rules`, "Account Firewall Access Rules: Read", "the IP access rule list with notes and modified dates", ipRulesOutcome!.error), 17, { account_id: accountId }));
+    findings.push(finding("CF-TRF-05", "IP access rules", "medium", "manual", manualReason(ipRulesOutcome!.endpoint ?? `/accounts/${accountId}/firewall/access_rules/rules`, "Account Firewall Access Rules: Read", "the IP access rule list with notes and modified dates", ipRulesOutcome!.error), 17, { account_id: accountId, ip_access_rules: null, http_status: ipRulesOutcome!.status ?? null }));
   } else {
     const stale = ipRules!.items.filter((rule) => {
       const modified = asDate(rule.modified_on);
@@ -2073,11 +2500,11 @@ export async function assessCloudflareTrafficControls(
       { account_id: accountId, ip_access_rules: ipRules!.items.length, allow_rules: allowRules.length, stale_rules: stale.length, rules_without_notes: undocumented.length, truncated: ipRules!.truncated }));
   }
 
-  const gatewayRules = gatewayOutcome ? listOrEmpty(gatewayOutcome) : undefined;
+  const gatewayRules = readList(gatewayOutcome);
   if (!accountId) {
     findings.push(finding("CF-TRF-06", "Gateway SWG policies", "medium", "manual", `${note} Review Zero Trust > Gateway > Firewall policies manually.`, 24, { account_id: null }));
   } else if (!gatewayOutcome!.ok) {
-    findings.push(finding("CF-TRF-06", "Gateway SWG policies", "medium", "manual", manualReason(`/accounts/${accountId}/gateway/rules`, "Zero Trust: Read", "the Gateway DNS and HTTP policy list", gatewayOutcome!.error), 24, { account_id: accountId }));
+    findings.push(finding("CF-TRF-06", "Gateway SWG policies", "medium", "manual", manualReason(gatewayOutcome!.endpoint ?? `/accounts/${accountId}/gateway/rules`, "Zero Trust: Read", "the Gateway DNS and HTTP policy list", gatewayOutcome!.error), 24, { account_id: accountId, gateway_rules: null, http_status: gatewayOutcome!.status ?? null }));
   } else {
     const enabled = gatewayRules!.items.filter((rule) => asBoolean(rule.enabled) !== false);
     const filters = new Set(enabled.flatMap((rule) => asArray(rule.filters).map((item) => asString(item) ?? "")));
@@ -2101,11 +2528,13 @@ export async function assessCloudflareTrafficControls(
     title: "Cloudflare traffic controls posture",
     summary: {
       account_id: accountId ?? null,
-      sampled_zones: zones.items.length,
-      zones_total: zones.totalCount ?? null,
-      audit_events: auditLogs?.items.length ?? 0,
-      gateway_rules: gatewayRules?.items.length ?? 0,
-      ip_access_rules: ipRules?.items.length ?? 0,
+      sampled_zones: zones?.items.length ?? null,
+      zones_total: zones?.totalCount ?? null,
+      zone_inventory_truncated: zones?.truncated ?? null,
+      ...(zonesOutcome.ok ? {} : { zones_http_status: zonesOutcome.status ?? null, zones_error: zonesOutcome.error }),
+      audit_events: auditLogs?.items.length ?? null,
+      gateway_rules: gatewayRules?.items.length ?? null,
+      ip_access_rules: ipRules?.items.length ?? null,
       failing_findings: findings.filter((item) => item.status === "fail").length,
       warning_findings: findings.filter((item) => item.status === "warn").length,
       manual_findings: findings.filter((item) => item.status === "manual").length,
@@ -2121,8 +2550,10 @@ function formatAccessCheckText(result: CloudflareAccessCheckResult): string {
     surfaceItem.name,
     surfaceItem.scope,
     surfaceItem.status,
-    surfaceItem.count === undefined ? "-" : String(surfaceItem.count),
-    surfaceItem.error ? surfaceItem.error.replace(/\s+/g, " ").slice(0, 80) : "",
+    surfaceItem.count === undefined || surfaceItem.count === null ? "-" : String(surfaceItem.count),
+    // Error strings are already scrubbed and bounded (non-JSON bodies are described, not echoed), so the
+    // full text is kept rather than sliced mid-path.
+    surfaceItem.error ? surfaceItem.error.replace(/\s+/g, " ") : "",
   ]);
   return [
     `Cloudflare access check: ${result.status}`,
@@ -2222,6 +2653,18 @@ function buildUnifiedMatrix(findings: CloudflareFinding[]): string {
   ].join("\n");
 }
 
+/**
+ * Shortens report cells without splitting a token, so a cut summary never leaves a partial endpoint
+ * path or status behind; the ellipsis marks that the full text lives in analysis/findings.json.
+ */
+function truncateAtWordBoundary(text: string, maxLength: number): string {
+  if (text.length <= maxLength) return text;
+  const head = text.slice(0, maxLength);
+  const boundary = head.lastIndexOf(" ");
+  if (boundary <= 0) return text;
+  return `${head.slice(0, boundary).replace(/[\s(,;:]+$/, "")} …`;
+}
+
 function buildFrameworkReport(framework: { key: keyof ControlMapping; label: string }, findings: CloudflareFinding[], generatedAt: string): string {
   const mapped = findings.filter((item) => frameworkControlFor(item, framework.key) !== "n/a");
   const counts = statusCounts(mapped);
@@ -2230,7 +2673,7 @@ function buildFrameworkReport(framework: { key: keyof ControlMapping; label: str
     item.id,
     item.status.toUpperCase(),
     item.title,
-    item.summary.slice(0, 160),
+    truncateAtWordBoundary(item.summary, 160),
   ]);
   return [
     `# ${framework.label} Compliance Report (Cloudflare)`,
@@ -2374,8 +2817,9 @@ export async function exportCloudflareAuditBundle(
   await writeSecureTextFile(outputDir, "analysis/zone-security.json", serializeJson(zoneSecurity));
   await writeSecureTextFile(outputDir, "analysis/traffic-controls.json", serializeJson(trafficControls));
   await writeSecureTextFile(outputDir, "core_data/access.json", serializeJson(access));
-  await writeSecureTextFile(outputDir, "core_data/accounts.json", serializeJson(accounts.ok ? accounts.value : { error: accounts.error }));
-  await writeSecureTextFile(outputDir, "core_data/zones.json", serializeJson(zones.ok ? zones.value : { error: zones.error }));
+  // A denied or failed list is written as a not-collected marker carrying the observed status and path, never as an empty list.
+  await writeSecureTextFile(outputDir, "core_data/accounts.json", serializeJson(accounts.ok ? projectPagedList(accounts.value, projectAccountRecord) : uncollectedMarker(accounts, "not collected")));
+  await writeSecureTextFile(outputDir, "core_data/zones.json", serializeJson(zones.ok ? projectPagedList(zones.value, projectZoneRecord) : uncollectedMarker(zones, "not collected")));
   if (errors.length > 0) {
     await writeSecureTextFile(outputDir, "_errors.log", `${errors.map((item) => `${generatedAt} ${item}`).join("\n")}\n`);
   }
@@ -2610,4 +3054,55 @@ export function registerCloudflareTools(pi: any): void {
       }
     },
   });
+}
+
+/**
+ * Every fixed-text message this integration emits around a refused, failed, or unparseable read, rendered
+ * with representative observed values by the same constants and helpers the error sink uses (GWS note 1).
+ * Each must survive redactErrorText unchanged, since every recorded string passes through it; the fixed-text
+ * test holds this list to the scrub, and a message that does not survive is reworded rather than exempted.
+ */
+export function cloudflareFixedTexts(): readonly string[] {
+  const html = "<html><head><title>502 Bad Gateway</title></head><body>upstream unavailable</body></html>";
+  const denied = cloudflareErrorSummary({ success: false, errors: [{ code: 10000, message: "Authentication error" }] }) ?? "";
+  const policiesPath = "/accounts/acc-123/access/policies";
+  const zonesDenied = `Cloudflare request failed for /zones (403 Forbidden): ${denied}`;
+  const policiesDenied = `Cloudflare request failed for ${policiesPath} (403 Forbidden): ${denied}`;
+  const subscriptionDenied = `Cloudflare request failed for /zones/zone-1/subscription (403 Forbidden): ${denied}`;
+  const notAttemptedZoneSurface = notAttemptedSurface("zone_dnssec", "zone", "/zones/{zone_id}/dnssec", { endpoint: "/zones", status: 403, error: zonesDenied });
+  return Object.freeze([
+    PARSE_ERROR_NOTE,
+    describeNonJsonBody("text/html; charset=utf-8", html) ?? "",
+    describeNonJsonBody(null, "upstream unavailable") ?? "",
+    denied,
+    zonesDenied,
+    policiesDenied,
+    `Cloudflare request failed for /zones/zone-1/settings/always_use_https (502 Bad Gateway): ${describeNonJsonBody("text/html", html)}`,
+    "Cloudflare request failed for /zones (timed out after 30000 ms)",
+    "Cloudflare request failed for /zones (network error: fetch failed)",
+    `Cloudflare request returned a non-JSON payload for /zones (200 OK): ${describeNonJsonBody("text/html", html)}`,
+    "Cloudflare API reported failure for /zones.",
+    notAttempted("listAccessPolicies").error,
+    notAttemptedZoneSurface.error ?? "",
+    "3 zone-scoped surfaces were not attempted because /zones could not be read (403).",
+    "3 zone-scoped surfaces were not attempted because /zones could not be read (no HTTP status).",
+    "5/7 Cloudflare audit surfaces are readable.",
+    "Provide a read-only API token and, when multiple accounts exist, set account_id to unlock account-scoped Cloudflare checks.",
+    manualReason("/user/tokens/verify", "any valid API token (verify needs no extra permission)", "the token status and permission groups from the dashboard", `Cloudflare request failed for /user/tokens/verify (403 Forbidden): ${denied}`),
+    manualReason(policiesPath, "Access: Apps and Policies: Read", "the reusable Access policy list and each policy's decision", policiesDenied),
+    `2 Access applications carry 3 inline policies, none with bypass, but the reusable policy list could not be checked. ${manualReason(policiesPath, "Access: Apps and Policies: Read", "the reusable Access policy list and each policy's decision", policiesDenied)}`,
+    "The active API token reported status expired instead of active.",
+    "Global API Key auth has no token to verify; create a scoped read-only API token and record its permission groups manually.",
+    partialInventoryNote("Access application", { items: [{}], truncated: true, totalCount: 40 }) ?? "",
+    partialInventoryNote("reusable Access policy", { items: [{}], truncated: true }) ?? "",
+    zonePlanNoteText(subscriptionDenied),
+    "The zone subscription returned no rate_plan.public_name, so the plan is not named here.",
+    "GET /zones/{zone_id}/firewall/rules is deprecated and was consulted for evidence only because the rulesets API was unreadable.",
+    `/user/tokens/verify: ${zonesDenied.replace("/zones", "/user/tokens/verify")}`,
+  ]);
+}
+
+/** The zone-plan note for an unreadable subscription read, as zonePlanNote renders it (without its leading space). */
+function zonePlanNoteText(error: string): string {
+  return `The zone plan could not be named because /zones/{zone_id}/subscription was not readable (${error}); zones[].plan is deprecated and is not read.`;
 }

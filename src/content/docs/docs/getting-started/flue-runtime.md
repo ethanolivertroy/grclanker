@@ -1,6 +1,6 @@
 ---
 title: Flue Runtime
-description: Run the grclanker GRC agent, its 107 domain tools, workflow prompts, and personas under the Flue Framework with grclanker flue run or the official flue run CLI.
+description: Run the grclanker GRC agent, its 241 domain tools, workflow prompts, and personas under the Flue Framework with grclanker flue run or the official flue run CLI.
 ---
 
 grclanker ships as a Pi-based CLI. The same GRC agent can also run as a [Flue Framework](https://flueframework.com/) agent. Flue is itself built on Pi, so the tools and prompts carry over without changing what they do.
@@ -11,7 +11,7 @@ The adapter lives in `cli/flue/` and is additive. Nothing in the Pi CLI path cha
 
 | grclanker asset | Flue surface |
 | --- | --- |
-| 107 native domain tools from `cli/extensions/grc-tools/` | `useTool()` definitions built with `defineTool()` |
+| 241 native domain tools from `cli/extensions/grc-tools/` | `useTool()` definitions built with `defineTool()` |
 | `.grclanker/SYSTEM.md` | The agent function's returned instructions, plus a short Flue runtime note |
 | `prompts/investigate.md`, `audit.md`, `assess.md`, `validate.md` | Skills named `investigate`, `audit`, `assess`, `validate` (activated through Flue's `activate_skill` tool) |
 | `skills/crypto-validation/SKILL.md` | A skill named `crypto-validation` |
@@ -86,4 +86,4 @@ Supported `models.json` entries use the `openai-completions`, `openai-responses`
 npm --prefix cli run test:cli
 ```
 
-`cli/tests/flue.test.mjs` covers the schema conversion, tool bridging for all 107 tools, a differential check of argument handling against the Pi CLI's own `validateToolArguments` for every tool, prompt loading, the hook-level render, the runner and command surface, custom provider registration, and two end-to-end runs on the real Flue runtime: one with a faux model provider and one with a local-first provider against a mock OpenAI-compatible server. No test makes a live model call.
+`cli/tests/flue.test.mjs` covers the schema conversion, tool bridging for all 241 tools, a differential check of argument handling against the Pi CLI's own `validateToolArguments` for every tool, prompt loading, the hook-level render, the runner and command surface, custom provider registration, and two end-to-end runs on the real Flue runtime: one with a faux model provider and one with a local-first provider against a mock OpenAI-compatible server. No test makes a live model call.

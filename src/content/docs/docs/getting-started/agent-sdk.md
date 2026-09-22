@@ -9,7 +9,7 @@ grclanker ships a second run mode next to the Pi terminal CLI: a Cursor Agent SD
 
 | grclanker asset | Agent SDK surface |
 |---|---|
-| 107 domain tools from `cli/extensions/grc-tools/` | Server tools under their native names (`cmvp_search_modules`, `fedramp_check_sources`, `aws_check_access`, ...) |
+| 241 domain tools from `cli/extensions/grc-tools/` | Server tools under their native names (`cmvp_search_modules`, `fedramp_check_sources`, `aws_check_access`, ...) |
 | `cli/.grclanker/SYSTEM.md` | Always-on instructions, followed by a short runtime note |
 | `cli/prompts/{investigate,audit,assess,validate}.md` | On-demand skills named `investigate`, `audit`, `assess`, and `validate` |
 | `cli/skills/crypto-validation/SKILL.md` | Skill named `crypto-validation` |
@@ -22,8 +22,8 @@ Each tool keeps the same behavior as in the CLI:
 - TypeBox parameter schemas are converted to plain JSON Schema at the adapter boundary. Literal unions become `enum`, TypeBox metadata is stripped, and the schema is forwarded to the model unchanged otherwise.
 - Arguments go through the tool's `prepareArguments` shim and Pi's own validator before `execute` runs, so loosely typed calls are normalized the same way the CLI normalizes them.
 - Results keep the text and image content the CLI shows the model; error results keep `isError`.
-- Tools whose name carries a read-only verb (`check`, `assess`, `search`, `get`, `list`, `plan`, `recent`, `review`, `investigate`, `trace`, `validate`) and no write verb (`export`, `generate`, `collect`, `init`, `import`, `create`, `assemble`) declare `effect: "read"`: 85 tools. An Agent SDK dry-run session executes them and stubs the 22 writers (the exporters, generators, evidence collector, and OSCAL workspace commands). The FedRAMP lookups mirror the official catalog to `~/.grclanker/.state/fedramp/`; when the SDK marks a session as a dry run (`ctx.session.dryRun`), the adapter runs them with on-disk caching disabled, so they still return live data while the session leaves `~/.grclanker` (`GRCLANKER_HOME`) untouched. The SDK host still writes its own session state under `.agent-serve/`.
-- The 22 writers set `needsApproval: true`. A model-initiated call to one of them parks until a person approves or denies it from the playground Approve / Deny buttons or `POST /v1/session/:sessionId/approvals/:callId`; the terminal `agent-sdk chat` client shows the parked call but cannot resolve it, so use `agent-sdk:dev` and the playground for turns that export or generate files. Deterministic `agent-sdk call` runs bypass the gate because the caller chose the tool and input.
+- Tools whose name carries a read-only verb (`check`, `assess`, `search`, `get`, `list`, `plan`, `recent`, `review`, `investigate`, `trace`, `validate`) and no write verb (`export`, `generate`, `collect`, `init`, `import`, `create`, `assemble`) declare `effect: "read"`: 199 tools. An Agent SDK dry-run session executes them and stubs the 42 writers (the exporters, generators, evidence collector, and OSCAL workspace commands). The FedRAMP lookups mirror the official catalog to `~/.grclanker/.state/fedramp/`; when the SDK marks a session as a dry run (`ctx.session.dryRun`), the adapter runs them with on-disk caching disabled, so they still return live data while the session leaves `~/.grclanker` (`GRCLANKER_HOME`) untouched. The SDK host still writes its own session state under `.agent-serve/`.
+- The 42 writers set `needsApproval: true`. A model-initiated call to one of them parks until a person approves or denies it from the playground Approve / Deny buttons or `POST /v1/session/:sessionId/approvals/:callId`; the terminal `agent-sdk chat` client shows the parked call but cannot resolve it, so use `agent-sdk:dev` and the playground for turns that export or generate files. Deterministic `agent-sdk call` runs bypass the gate because the caller chose the tool and input.
 
 ## Run it
 
@@ -54,7 +54,7 @@ Session state, traces, and eval batches land in `cli/agent-sdk/.agent-serve/`, w
 
 Server tools run inside the `agent-sdk` process, so a relative `output_dir`, `workspace_dir`, or `zip_path` resolves against that process's working directory (`cli/` when you use the npm scripts), not against the model's session workspace under `~/.cache/agent-serve/agent-sdk/`. The defaults are the same as in the CLI: exporters write under `./export/<domain>/` and the OSCAL tools use `./oscal-workspace/`. Every writer returns the absolute paths it created, and the runtime note tells the model to pass an absolute path when files must land in its workspace. Both directories are gitignored.
 
-`agent-sdk info --json` writes its 107-tool payload with an unawaited stdout write, so pipe it to a file rather than another process (`npm --prefix cli run -s agent-sdk:info -- --json > /tmp/info.json`); a pipe truncates the output at 64 KiB. The `test:agent-sdk:validate` script captures it through a file descriptor for this reason.
+`agent-sdk info --json` writes its 241-tool payload with an unawaited stdout write, so pipe it to a file rather than another process (`npm --prefix cli run -s agent-sdk:info -- --json > /tmp/info.json`); a pipe truncates the output at 64 KiB. The `test:agent-sdk:validate` script captures it through a file descriptor for this reason.
 
 ## Keep the tool entries in sync
 

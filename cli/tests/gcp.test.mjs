@@ -1,24 +1,45 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { createVerify, generateKeyPairSync } from "node:crypto";
 import {
   existsSync,
+  mkdirSync,
   mkdtempSync,
+  readdirSync,
   realpathSync,
   readFileSync,
+  rmSync,
   symlinkSync,
+  writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { basename, join, relative } from "node:path";
+import { inflateRawSync } from "node:zlib";
 
 import {
+  GCP_FRAMEWORKS,
+  GCP_INVENTORIES,
+  GCP_MAX_LIST_PAGES,
+  GcpApiError,
+  GcpAuditorClient,
+  PUBLIC_MEMBER_IAM_QUERY,
+  assessGcpDataProtection,
   assessGcpIdentity,
   assessGcpLoggingDetection,
+  assessGcpNetworkSecurity,
   assessGcpOrgGuardrails,
   checkGcpAccess,
+  createGcpServiceAccountAssertion,
+  credentialValues,
+  exchangeGcpCredentials,
   exportGcpAuditBundle,
+  parseGcpCredentialsJson,
   resolveGcpConfiguration,
   resolveSecureOutputPath,
+  scrubErrorText,
 } from "../dist/extensions/grc-tools/gcp.js";
+
+const NOW = new Date("2026-09-21T00:00:00.000Z");
 
 function createTempBase(prefix) {
   return mkdtempSync(join(tmpdir(), prefix));
@@ -34,212 +55,2098 @@ function sampleConfig(overrides = {}) {
   };
 }
 
-test("resolveGcpConfiguration prefers explicit args over environment defaults", () => {
+function jsonResponse(body, status = 200) {
+  return new Response(JSON.stringify(body), {
+    status,
+    statusText: status === 200 ? "OK" : status === 403 ? "Forbidden" : "Error",
+    headers: { "Content-Type": "application/json" },
+  });
+}
+
+function forbidden() {
+  return jsonResponse({ error: { code: 403, message: "Permission denied", status: "PERMISSION_DENIED" } }, 403);
+}
+
+const COMPLIANT = {
+  organization: { name: "organizations/123456789012", displayName: "Example Org" },
+  projects: {
+    results: [
+      { name: "//cloudresourcemanager.googleapis.com/projects/prod-audit", assetType: "cloudresourcemanager.googleapis.com/Project", project: "projects/111", displayName: "Prod Audit", state: "ACTIVE" },
+    ],
+  },
+  iamPolicies: {
+    results: [
+      {
+        resource: "//cloudresourcemanager.googleapis.com/projects/prod-audit",
+        assetType: "cloudresourcemanager.googleapis.com/Project",
+        project: "projects/111",
+        policy: { bindings: [{ role: "roles/viewer", members: ["user:auditor@example.com", "serviceAccount:svc@prod-audit.iam.gserviceaccount.com"] }] },
+      },
+    ],
+  },
+  publicPolicies: { results: [] },
+  serviceAccounts: { accounts: [{ name: "projects/prod-audit/serviceAccounts/svc@prod-audit.iam.gserviceaccount.com", email: "svc@prod-audit.iam.gserviceaccount.com" }] },
+  keys: { keys: [] },
+  entries: { entries: [{ insertId: "1", timestamp: "2026-09-20T00:00:00Z" }] },
+  sinks: { sinks: [{ name: "audit-sink" }] },
+  logBuckets: {
+    buckets: [
+      { name: "projects/prod-audit/locations/global/buckets/_Default", retentionDays: 90 },
+      { name: "projects/prod-audit/locations/global/buckets/_Required", retentionDays: 400 },
+    ],
+  },
+  settings: { name: "projects/prod-audit/settings" },
+  sccSources: { sources: [{ name: "organizations/123456789012/sources/1" }] },
+  sccFindings: { listFindingsResults: [] },
+  booleanPolicy: { constraint: "constraints/x", booleanPolicy: { enforced: true } },
+  listPolicy: { constraint: "constraints/iam.allowedPolicyMemberDomains", listPolicy: { allowedValues: ["C0abc123"] } },
+  computeProject: { name: "prod-audit", commonInstanceMetadata: { items: [{ key: "enable-oslogin", value: "TRUE" }] } },
+  instances: {
+    items: {
+      "zones/us-central1-a": {
+        instances: [
+          {
+            name: "vm-1",
+            status: "RUNNING",
+            shieldedInstanceConfig: { enableSecureBoot: true, enableVtpm: true, enableIntegrityMonitoring: true },
+            metadata: { items: [] },
+            networkInterfaces: [{ network: "https://www.googleapis.com/compute/v1/projects/prod-audit/global/networks/default", subnetwork: "https://www.googleapis.com/compute/v1/projects/prod-audit/regions/us-central1/subnetworks/default" }],
+          },
+        ],
+      },
+    },
+  },
+  binaryAuthorization: { name: "projects/prod-audit/policy", defaultAdmissionRule: { evaluationMode: "REQUIRE_ATTESTATION", enforcementMode: "ENFORCED_BLOCK_AND_AUDIT_LOG" } },
+  buckets: {
+    items: [
+      { name: "prod-bucket", iamConfiguration: { uniformBucketLevelAccess: { enabled: true }, publicAccessPrevention: "enforced" }, encryption: { defaultKmsKeyName: "projects/prod-audit/locations/us/keyRings/ring/cryptoKeys/key" } },
+    ],
+  },
+  cryptoKeys: {
+    assets: [
+      {
+        name: "//cloudkms.googleapis.com/projects/prod-audit/locations/us/keyRings/ring/cryptoKeys/key",
+        assetType: "cloudkms.googleapis.com/CryptoKey",
+        resource: { data: { name: "projects/prod-audit/locations/us/keyRings/ring/cryptoKeys/key", purpose: "ENCRYPT_DECRYPT", rotationPeriod: "7776000s", nextRotationTime: "2026-12-01T00:00:00Z", primary: { state: "ENABLED" } } },
+      },
+    ],
+  },
+  disks: { items: { "zones/us-central1-a": { disks: [{ name: "disk-1", diskEncryptionKey: { kmsKeyName: "projects/prod-audit/locations/us/keyRings/ring/cryptoKeys/key" } }] } } },
+  managedZones: { managedZones: [{ name: "public-zone", dnsName: "example.com.", visibility: "public", dnssecConfig: { state: "on", defaultKeySpecs: [{ keyType: "keySigning", algorithm: "rsasha256" }] } }] },
+  apiKeys: { keys: [{ name: "projects/111/locations/global/keys/abc", displayName: "maps", restrictions: { apiTargets: [{ service: "maps.googleapis.com" }], serverKeyRestrictions: { allowedIps: ["10.0.0.1"] } } }] },
+  accessPolicies: { accessPolicies: [{ name: "accessPolicies/1", title: "default" }] },
+  servicePerimeters: { servicePerimeters: [{ name: "accessPolicies/1/servicePerimeters/prod", perimeterType: "PERIMETER_TYPE_REGULAR", status: { resources: ["projects/111"], restrictedServices: ["storage.googleapis.com"] } }] },
+  firewalls: { items: [{ name: "allow-internal-ssh", direction: "INGRESS", sourceRanges: ["10.0.0.0/8"], allowed: [{ IPProtocol: "tcp", ports: ["22"] }], network: "global/networks/default" }] },
+  subnetworks: {
+    items: {
+      "regions/us-central1": {
+        subnetworks: [{ name: "default", purpose: "PRIVATE", region: "https://www.googleapis.com/compute/v1/projects/prod-audit/regions/us-central1", network: "https://www.googleapis.com/compute/v1/projects/prod-audit/global/networks/default", logConfig: { enable: true, flowSampling: 0.5 }, privateIpGoogleAccess: true }],
+      },
+    },
+  },
+  routers: { items: { "regions/us-central1": { routers: [{ name: "nat-router", region: "https://www.googleapis.com/compute/v1/projects/prod-audit/regions/us-central1", network: "https://www.googleapis.com/compute/v1/projects/prod-audit/global/networks/default", nats: [{ name: "nat", natIpAllocateOption: "AUTO_ONLY", sourceSubnetworkIpRangesToNat: "ALL_SUBNETWORKS_ALL_IP_RANGES" }] }] } } },
+  sslPolicies: { items: { global: { sslPolicies: [{ name: "strict", minTlsVersion: "TLS_1_2", profile: "RESTRICTED" }] } } },
+  targetHttpsProxies: { items: { global: { targetHttpsProxies: [{ name: "web-proxy", sslPolicy: "https://www.googleapis.com/compute/v1/projects/prod-audit/global/sslPolicies/strict" }] } } },
+  backendServices: { items: { global: { backendServices: [{ name: "web-backend", loadBalancingScheme: "EXTERNAL_MANAGED", protocol: "HTTPS", securityPolicy: "https://www.googleapis.com/compute/v1/projects/prod-audit/global/securityPolicies/armor" }] } } },
+};
+
+function routeCompliant(url, init, data = COMPLIANT) {
+  const method = init?.method ?? "GET";
+  const parsed = new URL(url);
+  const path = parsed.pathname;
+  if (parsed.hostname === "cloudresourcemanager.googleapis.com" && path.startsWith("/v1/organizations/")) return data.organization;
+  if (path.endsWith(":searchAllResources")) {
+    assert.equal(method, "GET");
+    assert.equal(parsed.searchParams.get("assetTypes"), "cloudresourcemanager.googleapis.com/Project");
+    return data.projects;
+  }
+  if (path.endsWith(":searchAllIamPolicies")) {
+    assert.equal(method, "GET");
+    return parsed.searchParams.get("query") === PUBLIC_MEMBER_IAM_QUERY ? data.publicPolicies : data.iamPolicies;
+  }
+  if (path.endsWith("/assets")) {
+    assert.equal(parsed.searchParams.get("contentType"), "RESOURCE");
+    return data.cryptoKeys;
+  }
+  if (path.endsWith("/keys") && parsed.hostname === "iam.googleapis.com") return data.keys;
+  if (path.endsWith("/serviceAccounts")) return data.serviceAccounts;
+  if (path.endsWith("/entries:list")) {
+    assert.equal(method, "POST");
+    return data.entries;
+  }
+  if (path.endsWith("/sinks")) return data.sinks;
+  if (path.endsWith("/buckets") && parsed.hostname === "logging.googleapis.com") return data.logBuckets;
+  if (path.endsWith("/settings")) return data.settings;
+  if (path.endsWith("/sources")) return data.sccSources;
+  if (path.endsWith("/findings")) return data.sccFindings;
+  if (path.endsWith(":getEffectiveOrgPolicy")) {
+    const body = JSON.parse(init.body);
+    return body.constraint === "constraints/iam.allowedPolicyMemberDomains" ? data.listPolicy : data.booleanPolicy;
+  }
+  if (parsed.hostname === "compute.googleapis.com") {
+    if (path.endsWith("/global/firewalls")) return data.firewalls;
+    if (path.endsWith("/aggregated/subnetworks")) return data.subnetworks;
+    if (path.endsWith("/aggregated/routers")) return data.routers;
+    if (path.endsWith("/aggregated/instances")) return data.instances;
+    if (path.endsWith("/aggregated/sslPolicies")) return data.sslPolicies;
+    if (path.endsWith("/aggregated/targetHttpsProxies")) return data.targetHttpsProxies;
+    if (path.endsWith("/aggregated/backendServices")) return data.backendServices;
+    if (path.endsWith("/aggregated/disks")) return data.disks;
+    if (/^\/compute\/v1\/projects\/[^/]+$/.test(path)) return data.computeProject;
+  }
+  if (parsed.hostname === "storage.googleapis.com" && path === "/storage/v1/b") return data.buckets;
+  if (parsed.hostname === "dns.googleapis.com") return data.managedZones;
+  if (parsed.hostname === "apikeys.googleapis.com") return data.apiKeys;
+  if (path === "/v1/accessPolicies") return data.accessPolicies;
+  if (path.endsWith("/servicePerimeters")) return data.servicePerimeters;
+  if (parsed.hostname === "binaryauthorization.googleapis.com") return data.binaryAuthorization;
+  throw new Error(`Unrouted URL in fixture: ${method} ${url}`);
+}
+
+function createClient(fetchImpl, config = sampleConfig()) {
+  return new GcpAuditorClient(config, { fetchImpl, now: () => NOW });
+}
+
+async function runAllAssessments(client, options = {}) {
+  return [
+    await assessGcpIdentity(client, options),
+    await assessGcpLoggingDetection(client, options),
+    await assessGcpOrgGuardrails(client, options),
+    await assessGcpDataProtection(client, options),
+    await assessGcpNetworkSecurity(client, options),
+  ];
+}
+
+function statuses(assessments) {
+  return Object.fromEntries(assessments.flatMap((assessment) => assessment.findings.map((item) => [item.id, item.status])));
+}
+
+test("resolveGcpConfiguration prefers explicit args and accepts the GCP_ORG_ID alias", () => {
   const resolved = resolveGcpConfiguration(
     { organization_id: "123456789012", project_id: "project-a", access_token: "arg-token" },
     { GCP_ORGANIZATION_ID: "999999999999", GCP_PROJECT_ID: "env-project", GCP_ACCESS_TOKEN: "env-token" },
     () => undefined,
+    () => undefined,
   );
-
   assert.equal(resolved.organizationId, "123456789012");
   assert.equal(resolved.projectId, "project-a");
   assert.equal(resolved.accessToken, "arg-token");
-  assert.ok(resolved.sourceChain.includes("arguments-organization"));
-  assert.ok(resolved.sourceChain.includes("arguments-project"));
   assert.ok(resolved.sourceChain.includes("arguments-access-token"));
+
+  const aliased = resolveGcpConfiguration({}, { GCP_ORG_ID: "555555555555", GCP_ACCESS_TOKEN: "env-token" }, () => undefined, () => undefined);
+  assert.equal(aliased.organizationId, "555555555555");
+  assert.ok(aliased.sourceChain.includes("environment-organization"));
 });
 
-test("checkGcpAccess reports readable GCP audit surfaces", async () => {
-  const client = {
-    getResolvedConfig: () => sampleConfig(),
-    async getOrganization() {
-      return { name: "organizations/123456789012", displayName: "Example Org" };
-    },
-    async listProjects() {
-      return [{ projectId: "prod-audit", displayName: "Prod Audit" }];
-    },
-    async searchAllIamPolicies() {
-      return [{ resource: "//cloudresourcemanager.googleapis.com/projects/prod-audit" }];
-    },
-    async getLoggingSettings() {
-      return { storageLocation: "global" };
-    },
-    async listLogSinks() {
-      return [{ name: "audit-sink" }];
-    },
-    async listSccSources() {
-      return [{ name: "organizations/123456789012/sources/1" }];
-    },
-    async getEffectiveOrgPolicy() {
-      return { policy: { booleanPolicy: { enforced: true } } };
-    },
+test("resolveGcpConfiguration discovers service account and ADC credential files before gcloud", () => {
+  const serviceAccount = JSON.stringify({ type: "service_account", client_email: "svc@p.iam.gserviceaccount.com", private_key: "-----BEGIN PRIVATE KEY-----\nabc\n-----END PRIVATE KEY-----\n", token_uri: "https://oauth2.googleapis.com/token", project_id: "file-project" });
+  const resolved = resolveGcpConfiguration(
+    {},
+    { GCP_CREDENTIALS_FILE: "/secure/sa.json", GCP_ORG_ID: "123456789012" },
+    () => { throw new Error("gcloud must not run when a credentials file resolves"); },
+    (pathname) => (pathname === "/secure/sa.json" ? serviceAccount : undefined),
+  );
+  assert.equal(resolved.accessToken, undefined);
+  assert.equal(resolved.credentials.type, "service_account");
+  assert.equal(resolved.projectId, "file-project");
+  assert.ok(resolved.sourceChain.includes("environment-credentials-file"));
+
+  const adc = JSON.stringify({ type: "authorized_user", client_id: "id", client_secret: "secret", refresh_token: "refresh" });
+  const viaAdc = resolveGcpConfiguration({}, { GOOGLE_APPLICATION_CREDENTIALS: "/secure/adc.json", GCP_PROJECT_ID: "p" }, () => undefined, (pathname) => (pathname === "/secure/adc.json" ? adc : undefined));
+  assert.equal(viaAdc.credentials.type, "authorized_user");
+  assert.ok(viaAdc.sourceChain.includes("google-application-credentials"));
+
+  assert.throws(() => resolveGcpConfiguration({}, { GCP_CREDENTIALS_FILE: "/missing.json", GCP_PROJECT_ID: "p" }, () => undefined, () => undefined), /not readable/);
+  assert.throws(() => parseGcpCredentialsJson(JSON.stringify({ type: "external_account" })), /Unsupported credentials type/);
+});
+
+test("service account JWT flow signs RS256 assertions with documented claims and grant type", async () => {
+  const { publicKey, privateKey } = generateKeyPairSync("rsa", { modulusLength: 2048 });
+  const credentials = parseGcpCredentialsJson(JSON.stringify({
+    type: "service_account",
+    client_email: "svc@prod-audit.iam.gserviceaccount.com",
+    private_key: privateKey.export({ type: "pkcs8", format: "pem" }),
+    token_uri: "https://oauth2.googleapis.com/token",
+  }));
+  const assertion = createGcpServiceAccountAssertion(credentials, NOW);
+  const [header, claims, signature] = assertion.split(".");
+  assert.deepEqual(JSON.parse(Buffer.from(header, "base64url").toString()), { alg: "RS256", typ: "JWT" });
+  const decodedClaims = JSON.parse(Buffer.from(claims, "base64url").toString());
+  assert.equal(decodedClaims.iss, "svc@prod-audit.iam.gserviceaccount.com");
+  assert.equal(decodedClaims.aud, "https://oauth2.googleapis.com/token");
+  assert.equal(decodedClaims.scope, "https://www.googleapis.com/auth/cloud-platform");
+  assert.equal(decodedClaims.exp - decodedClaims.iat, 3600);
+  const verifier = createVerify("RSA-SHA256");
+  verifier.update(`${header}.${claims}`);
+  assert.ok(verifier.verify(publicKey, Buffer.from(signature, "base64url")));
+
+  let tokenRequest;
+  const token = await exchangeGcpCredentials(credentials, async (url, init) => {
+    tokenRequest = { url, init, form: new URLSearchParams(init.body) };
+    return jsonResponse({ access_token: "ya29.test", expires_in: 3599, token_type: "Bearer" });
+  }, NOW);
+  assert.equal(token, "ya29.test");
+  assert.equal(tokenRequest.url, "https://oauth2.googleapis.com/token");
+  assert.equal(tokenRequest.init.headers["Content-Type"], "application/x-www-form-urlencoded");
+  assert.equal(tokenRequest.form.get("grant_type"), "urn:ietf:params:oauth:grant-type:jwt-bearer");
+  assert.equal(tokenRequest.form.get("assertion"), assertion);
+
+  const client = createClient(async (url, init) => {
+    if (url === "https://oauth2.googleapis.com/token") return jsonResponse({ access_token: "ya29.client" });
+    assert.equal(init.headers.Authorization, "Bearer ya29.client");
+    return jsonResponse({ name: "organizations/123456789012" });
+  }, sampleConfig({ accessToken: undefined, credentials }));
+  assert.equal((await client.getOrganization()).name, "organizations/123456789012");
+});
+
+test("client encodes documented query parameters and paginates to completion with truncation flags", async () => {
+  const seen = [];
+  const client = createClient(async (url) => {
+    seen.push(url);
+    const parsed = new URL(url);
+    if (parsed.pathname.endsWith(":searchAllIamPolicies")) {
+      return jsonResponse(parsed.searchParams.get("pageToken") ? { results: [{ resource: "b" }] } : { results: [{ resource: "a" }], nextPageToken: "p2" });
+    }
+    if (parsed.pathname.endsWith("/global/firewalls")) {
+      return jsonResponse({ items: [{ name: "fw-1" }], nextPageToken: "more" });
+    }
+    return jsonResponse({});
+  });
+
+  const publicBindings = await client.searchPublicIamBindings(500);
+  assert.equal(publicBindings.items.length, 2);
+  assert.equal(publicBindings.truncated, false);
+  assert.ok(seen[0].endsWith("/v1/organizations/123456789012:searchAllIamPolicies?query=policy%3A%28allUsers+OR+allAuthenticatedUsers%29&pageSize=500"));
+  assert.ok(seen[1].includes("pageToken=p2"));
+
+  const firewalls = await client.listFirewalls("prod-audit", 1);
+  assert.equal(firewalls.truncated, true);
+  assert.ok(seen.at(-1).endsWith("/compute/v1/projects/prod-audit/global/firewalls?maxResults=500"));
+
+  const assets = await client.listCryptoKeys(10);
+  assert.ok(seen.at(-1).endsWith("/v1/organizations/123456789012/assets?contentType=RESOURCE&assetTypes=cloudkms.googleapis.com%2FCryptoKey&pageSize=10"));
+  assert.deepEqual(assets.items, []);
+});
+
+test("self-check (a): every endpoint forbidden yields only manual verdicts", async () => {
+  const client = createClient(async () => forbidden());
+  const assessments = await runAllAssessments(client);
+  const all = statuses(assessments);
+  assert.equal(Object.keys(all).length, 31);
+  for (const [id, status] of Object.entries(all)) {
+    assert.equal(status, "manual", `${id} must be manual when every endpoint is forbidden`);
+  }
+  for (const finding of assessments.flatMap((assessment) => assessment.findings)) {
+    if ("seen" in finding.evidence) assert.equal(finding.evidence.seen, null, `${finding.id} must not render a count from an unreadable inventory`);
+    assert.ok(finding.evidence.unreadable_inventories.length > 0, `${finding.id} must list the unreadable inventories`);
+  }
+  const identity = assessments[0];
+  assert.match(identity.findings[0].summary, /403 Forbidden/);
+  assert.match(identity.findings[0].summary, /Collect manually/);
+  assert.ok(identity.errors.length > 0);
+
+  const access = await checkGcpAccess(client);
+  assert.equal(access.status, "limited");
+  assert.ok(access.surfaces.every((surface) => surface.status === "not_readable"));
+});
+
+test("self-check (b): empty inventories never pass except where emptiness is compliant by intent", async () => {
+  const client = createClient(async (url) => {
+    const parsed = new URL(url);
+    if (parsed.pathname.endsWith(":searchAllResources")) return jsonResponse(COMPLIANT.projects);
+    if (parsed.hostname === "cloudresourcemanager.googleapis.com" && parsed.pathname.startsWith("/v1/organizations/")) return jsonResponse({});
+    return jsonResponse({});
+  });
+  const all = statuses(await runAllAssessments(client));
+  const passing = Object.entries(all).filter(([, status]) => status === "pass").map(([id]) => id);
+  assert.deepEqual(passing, ["GCP-DATA-06"], "only API key restrictions may pass on an empty inventory (no keys exist)");
+  assert.equal(all["GCP-IAM-01"], "manual");
+  assert.equal(all["GCP-IAM-02"], "manual");
+  assert.equal(all["GCP-LOG-04"], "manual");
+  assert.equal(all["GCP-ORG-01"], "warn");
+  assert.equal(all["GCP-DATA-01"], "manual");
+  assert.equal(all["GCP-DATA-07"], "fail");
+  assert.equal(all["GCP-NET-01"], "manual");
+});
+
+test("self-check (b2): an empty project inventory renders every per-project control manual", async () => {
+  const client = createClient(async () => jsonResponse({}));
+  const all = statuses(await runAllAssessments(client));
+  assert.equal(Object.values(all).filter((status) => status === "pass").length, 0);
+  assert.equal(all["GCP-IAM-02"], "manual");
+  assert.equal(all["GCP-DATA-06"], "manual");
+});
+
+test("self-check (c): partial inventories (project cap, denied project) never pass", async () => {
+  const client = createClient(async (url, init) => {
+    const parsed = new URL(url);
+    if (parsed.pathname.endsWith(":searchAllResources")) {
+      return jsonResponse({
+        results: [
+          ...COMPLIANT.projects.results,
+          { name: "//cloudresourcemanager.googleapis.com/projects/denied-project", assetType: "cloudresourcemanager.googleapis.com/Project", project: "projects/222" },
+        ],
+        nextPageToken: "more-projects",
+      });
+    }
+    if (url.includes("denied-project")) return forbidden();
+    return jsonResponse(routeCompliant(url, init, withUnreachableScopes(COMPLIANT, (list) => ({ ...list, unreachables: ["zones/europe-west1-b"] }))));
+  });
+  const assessments = await runAllAssessments(client, { maxProjects: 2 });
+  const all = statuses(assessments);
+  for (const [id, status] of Object.entries(all)) {
+    assert.notEqual(status, "pass", `${id} must not pass on a partial inventory`);
+  }
+  const uniform = assessments[3].findings.find((item) => item.id === "GCP-DATA-01");
+  assert.equal(uniform.status, "warn");
+  // Round 4: a denied project is reported with the dataset and endpoint, not as a bare count.
+  assert.match(uniform.summary, /Partial view: Cloud Storage buckets unreadable for 1 of 2 projects \(denied-project\) via storage\.googleapis\.com\/storage\/v1\/b\?project=\{project\} \(403 Forbidden\)/);
+  assert.equal(uniform.evidence.seen, 1);
+  assert.equal(uniform.evidence.denied_projects, 1);
+  assert.deepEqual(uniform.evidence.unreadable_inventories.map((entry) => [entry.dataset, entry.scope]), [["Cloud Storage buckets", "1 of 2 projects (denied-project)"]]);
+  assert.equal(assessments[0].summary.projects_truncated, true);
+  const flowLogs = assessments[4].findings.find((item) => item.id === "GCP-NET-02");
+  assert.match(flowLogs.summary, /VPC subnetworks unreadable for 1 of 2 projects \(denied-project\) via compute\.googleapis\.com\/compute\/v1\/projects\/\{project\}\/aggregated\/subnetworks \(403 Forbidden\); 1 unreachable scopes not enumerated \(prod-audit: zones\/europe-west1-b\); 1 seen, total unknown \(inventory incomplete\)/);
+});
+
+test("self-check (d): a fully compliant organization passes every automatable control", async () => {
+  const client = createClient(async (url, init) => jsonResponse(routeCompliant(url, init)));
+  const assessments = await runAllAssessments(client);
+  const all = statuses(assessments);
+  const notPassing = Object.entries(all).filter(([, status]) => status !== "pass");
+  assert.deepEqual(notPassing, [], "every control must pass on the documented compliant fixture");
+  assert.equal(Object.keys(all).length, 31);
+  for (const assessment of assessments) {
+    assert.deepEqual(assessment.errors, []);
+    for (const item of assessment.findings) {
+      assert.ok(item.controls.length > 0 && item.mappings.length > 0, `${item.id} needs spec controls and mappings`);
+    }
+  }
+  const access = await checkGcpAccess(client);
+  assert.equal(access.status, "healthy");
+  assert.equal(access.surfaces.length, 10);
+});
+
+test("findings fail on documented violations (firewall, KMS, SSL, DNSSEC, OS Login, buckets)", async () => {
+  const violating = {
+    ...COMPLIANT,
+    firewalls: { items: [{ name: "open-rdp", direction: "INGRESS", sourceRanges: ["0.0.0.0/0"], allowed: [{ IPProtocol: "tcp", ports: ["3380-3390"] }] }, { name: "disabled", disabled: true, sourceRanges: ["0.0.0.0/0"], allowed: [{ IPProtocol: "all" }] }] },
+    cryptoKeys: { assets: [{ name: "k", assetType: "cloudkms.googleapis.com/CryptoKey", resource: { data: { name: "k", purpose: "ENCRYPT_DECRYPT", primary: { state: "ENABLED" } } } }] },
+    targetHttpsProxies: { items: { global: { targetHttpsProxies: [{ name: "legacy", sslPolicy: undefined }] } } },
+    managedZones: { managedZones: [{ name: "zone", visibility: "public", dnssecConfig: { state: "off" } }] },
+    computeProject: { name: "prod-audit", commonInstanceMetadata: { items: [] } },
+    booleanPolicy: { constraint: "constraints/x", booleanPolicy: {} },
+    buckets: { items: [{ name: "legacy-bucket", iamConfiguration: { uniformBucketLevelAccess: { enabled: false } } }] },
+    publicPolicies: { results: [{ resource: "//storage.googleapis.com/legacy-bucket", assetType: "storage.googleapis.com/Bucket", policy: { bindings: [{ role: "roles/storage.objectViewer", members: ["allUsers"] }] } }] },
+    apiKeys: { keys: [{ name: "projects/111/locations/global/keys/open", restrictions: {} }] },
+    binaryAuthorization: { defaultAdmissionRule: { evaluationMode: "ALWAYS_ALLOW", enforcementMode: "ENFORCED_BLOCK_AND_AUDIT_LOG" } },
+    logBuckets: { buckets: [{ name: "projects/prod-audit/locations/global/buckets/_Default", retentionDays: 30 }, { name: "projects/prod-audit/locations/global/buckets/_Required", retentionDays: 400 }] },
   };
-
-  const result = await checkGcpAccess(client);
-  assert.equal(result.status, "healthy");
-  assert.equal(result.surfaces.filter((surface) => surface.status === "readable").length, 7);
-  assert.match(result.recommendedNextStep, /gcp_assess_identity/);
+  const client = createClient(async (url, init) => jsonResponse(routeCompliant(url, init, violating)));
+  const all = statuses(await runAllAssessments(client));
+  assert.equal(all["GCP-NET-01"], "fail");
+  assert.equal(all["GCP-DATA-03"], "fail");
+  assert.equal(all["GCP-NET-05"], "fail");
+  assert.equal(all["GCP-DATA-05"], "fail");
+  assert.equal(all["GCP-ORG-06"], "fail");
+  assert.equal(all["GCP-ORG-07"], "fail");
+  assert.equal(all["GCP-DATA-01"], "fail");
+  assert.equal(all["GCP-DATA-02"], "fail");
+  assert.equal(all["GCP-DATA-06"], "fail");
+  assert.equal(all["GCP-LOG-04"], "fail", "the fixed 400-day _Required bucket must not mask a 30-day _Default bucket");
+  assert.equal(all["GCP-ORG-03"], "fail");
 });
 
-test("assessGcpIdentity flags privileged bindings, stale keys, and default service accounts", async () => {
-  const client = {
-    getNow: () => new Date("2026-04-16T00:00:00.000Z"),
-    async listProjects() {
-      return [{ projectId: "prod-audit", displayName: "Prod Audit" }];
-    },
-    async listServiceAccounts() {
-      return [{ email: "svc@prod-audit.iam.gserviceaccount.com" }];
-    },
-    async listServiceAccountKeys() {
-      return [{ name: "keys/1", validAfterTime: "2025-01-01T00:00:00Z" }];
-    },
-    async searchAllIamPolicies() {
-      return [
-        {
-          resource: "//cloudresourcemanager.googleapis.com/projects/prod-audit",
-          policy: {
-            bindings: [
-              {
-                role: "roles/owner",
-                members: ["serviceAccount:123-compute@developer.gserviceaccount.com"],
-              },
-              {
-                role: "roles/viewer",
-                members: ["serviceAccount:svc@shared-services.iam.gserviceaccount.com"],
-              },
-            ],
-          },
+const COMPUTE_BACKED_FINDINGS = ["GCP-ORG-06", "GCP-ORG-08", "GCP-DATA-04", "GCP-NET-02", "GCP-NET-03", "GCP-NET-04", "GCP-NET-05", "GCP-NET-06"];
+
+function withUnreachableScopes(data, decorate) {
+  const copy = { ...data };
+  for (const key of ["instances", "disks", "subnetworks", "routers", "sslPolicies", "targetHttpsProxies", "backendServices"]) {
+    copy[key] = decorate(structuredClone(data[key]));
+  }
+  return copy;
+}
+
+test("self-check (c2): aggregatedList unreachables[] downgrade every compute-backed finding and name the scope", async () => {
+  const partial = withUnreachableScopes(COMPLIANT, (list) => ({ ...list, unreachables: ["regions/europe-west1"] }));
+  const client = createClient(async (url, init) => jsonResponse(routeCompliant(url, init, partial)));
+  const assessments = await runAllAssessments(client);
+  const all = statuses(assessments);
+  for (const id of COMPUTE_BACKED_FINDINGS) {
+    assert.equal(all[id], "warn", `${id} must not pass when a scope was unreachable`);
+  }
+  const flowLogs = assessments[4].findings.find((item) => item.id === "GCP-NET-02");
+  assert.match(flowLogs.summary, /Partial view: 1 unreachable scopes not enumerated \(prod-audit: regions\/europe-west1\)/);
+  assert.deepEqual(flowLogs.evidence.unreachable_scopes, ["prod-audit: regions/europe-west1"]);
+  assert.equal(flowLogs.evidence.truncated, true);
+  const osLogin = assessments[2].findings.find((item) => item.id === "GCP-ORG-06");
+  assert.match(osLogin.summary, /unreachable scopes not enumerated/);
+  assert.equal(Object.values(all).filter((status) => status === "pass").length, 31 - COMPUTE_BACKED_FINDINGS.length);
+});
+
+test("self-check (c3): a scope answering with warning.code UNREACHABLE is treated as not enumerated", async () => {
+  const partial = withUnreachableScopes(COMPLIANT, (list) => ({
+    ...list,
+    items: { ...list.items, "zones/europe-west1-b": { warning: { code: "UNREACHABLE", message: "Scope unreachable", data: [{ key: "scope", value: "zones/europe-west1-b" }] } } },
+  }));
+  const client = createClient(async (url, init) => jsonResponse(routeCompliant(url, init, partial)));
+  const assessments = await runAllAssessments(client);
+  const all = statuses(assessments);
+  for (const id of COMPUTE_BACKED_FINDINGS) {
+    assert.equal(all[id], "warn", `${id} must not pass when a scope warns UNREACHABLE`);
+  }
+  const shielded = assessments[2].findings.find((item) => item.id === "GCP-ORG-08");
+  assert.deepEqual(shielded.evidence.unreachable_scopes, ["prod-audit: zones/europe-west1-b"]);
+
+  const client2 = createClient(async (url, init) => jsonResponse(routeCompliant(url, init, withUnreachableScopes(COMPLIANT, (list) => ({
+    ...list,
+    items: { ...list.items, "zones/europe-west1-c": { warning: { code: "NO_RESULTS_ON_PAGE", message: "No results" } } },
+  })))));
+  const emptyScope = await client2.listInstances("prod-audit");
+  assert.equal(emptyScope.truncated, false, "an empty scope with NO_RESULTS_ON_PAGE is complete, not unreachable");
+  assert.equal(emptyScope.unreachable, undefined);
+});
+
+test("GCP-NET-05 keys SSL policies by scope so a weak regional policy sharing a global name fails", async () => {
+  const regionalPolicy = {
+    name: "strict",
+    minTlsVersion: "TLS_1_0",
+    profile: "COMPATIBLE",
+    region: "https://www.googleapis.com/compute/v1/projects/prod-audit/regions/europe-west1",
+    selfLink: "https://www.googleapis.com/compute/v1/projects/prod-audit/regions/europe-west1/sslPolicies/strict",
+  };
+  const regionalProxy = {
+    name: "eu-proxy",
+    region: "https://www.googleapis.com/compute/v1/projects/prod-audit/regions/europe-west1",
+    sslPolicy: "https://www.googleapis.com/compute/v1/projects/prod-audit/regions/europe-west1/sslPolicies/strict",
+  };
+  for (const globalFirst of [true, false]) {
+    const globalScope = COMPLIANT.sslPolicies.items.global;
+    const regionalScope = { sslPolicies: [regionalPolicy] };
+    const colliding = {
+      ...COMPLIANT,
+      sslPolicies: { items: globalFirst ? { global: globalScope, "regions/europe-west1": regionalScope } : { "regions/europe-west1": regionalScope, global: globalScope } },
+      targetHttpsProxies: { items: { ...COMPLIANT.targetHttpsProxies.items, "regions/europe-west1": { targetHttpsProxies: [regionalProxy] } } },
+    };
+    const client = createClient(async (url, init) => jsonResponse(routeCompliant(url, init, colliding)));
+    const result = await assessGcpNetworkSecurity(client);
+    const finding = result.findings.find((item) => item.id === "GCP-NET-05");
+    assert.equal(finding.status, "fail", `regional TLS_1_0 policy must fail regardless of scope order (globalFirst=${globalFirst})`);
+    assert.deepEqual(finding.evidence.weak_proxies.map((proxy) => proxy.proxy), ["eu-proxy"]);
+    assert.equal(finding.evidence.weak_proxies[0].sslPolicy, "projects/prod-audit/regions/europe-west1/sslPolicies/strict");
+    assert.deepEqual(finding.evidence.unresolved_proxies, []);
+  }
+});
+
+test("GCP-NET-04 counts DIRECT_IPV6 access configs as external addresses", async () => {
+  const ipv6Only = {
+    ...COMPLIANT,
+    instances: structuredClone(COMPLIANT.instances),
+  };
+  ipv6Only.instances.items["zones/us-central1-a"].instances[0].networkInterfaces[0].ipv6AccessConfigs = [
+    { type: "DIRECT_IPV6", name: "external-ipv6", externalIpv6: "2600:1900:4000::", externalIpv6PrefixLength: 96, networkTier: "PREMIUM" },
+  ];
+  const client = createClient(async (url, init) => jsonResponse(routeCompliant(url, init, ipv6Only)));
+  const result = await assessGcpNetworkSecurity(client);
+  const finding = result.findings.find((item) => item.id === "GCP-NET-04");
+  assert.equal(finding.status, "warn");
+  assert.deepEqual(finding.evidence.instances_with_external_ip, [{ projectId: "prod-audit", instance: "vm-1" }]);
+  assert.equal(result.summary.instances_with_external_ip, 1);
+});
+
+test("GCP-NET-02 reads enableFlowLogs as well as logConfig.enable", async () => {
+  const legacyField = {
+    ...COMPLIANT,
+    subnetworks: { items: { "regions/us-central1": { subnetworks: [{ ...COMPLIANT.subnetworks.items["regions/us-central1"].subnetworks[0], logConfig: undefined, enableFlowLogs: true }] } } },
+  };
+  const client = createClient(async (url, init) => jsonResponse(routeCompliant(url, init, legacyField)));
+  const result = await assessGcpNetworkSecurity(client);
+  assert.equal(result.findings.find((item) => item.id === "GCP-NET-02").status, "pass");
+
+  const neither = {
+    ...COMPLIANT,
+    subnetworks: { items: { "regions/us-central1": { subnetworks: [{ ...COMPLIANT.subnetworks.items["regions/us-central1"].subnetworks[0], logConfig: { enable: false }, enableFlowLogs: false }] } } },
+  };
+  const client2 = createClient(async (url, init) => jsonResponse(routeCompliant(url, init, neither)));
+  const result2 = await assessGcpNetworkSecurity(client2);
+  assert.equal(result2.findings.find((item) => item.id === "GCP-NET-02").status, "fail");
+});
+
+test("GCP-NET-04 judges NAT coverage per subnetwork from sourceSubnetworkIpRangesToNat", async () => {
+  const base = COMPLIANT.subnetworks.items["regions/us-central1"].subnetworks[0];
+  const sibling = { ...base, name: "backend", selfLink: "https://www.googleapis.com/compute/v1/projects/prod-audit/regions/us-central1/subnetworks/backend" };
+  const listOfSubnetworks = {
+    ...COMPLIANT,
+    subnetworks: { items: { "regions/us-central1": { subnetworks: [{ ...base, selfLink: "https://www.googleapis.com/compute/v1/projects/prod-audit/regions/us-central1/subnetworks/default" }, sibling] } } },
+    routers: {
+      items: {
+        "regions/us-central1": {
+          routers: [{
+            ...COMPLIANT.routers.items["regions/us-central1"].routers[0],
+            nats: [{
+              name: "nat",
+              sourceSubnetworkIpRangesToNat: "LIST_OF_SUBNETWORKS",
+              subnetworks: [{ name: "https://www.googleapis.com/compute/v1/projects/prod-audit/regions/us-central1/subnetworks/default", sourceIpRangesToNat: ["ALL_IP_RANGES"] }],
+            }],
+          }],
         },
-      ];
+      },
     },
   };
+  const client = createClient(async (url, init) => jsonResponse(routeCompliant(url, init, listOfSubnetworks)));
+  const result = await assessGcpNetworkSecurity(client);
+  const finding = result.findings.find((item) => item.id === "GCP-NET-04");
+  assert.equal(finding.status, "warn");
+  assert.deepEqual(finding.evidence.subnets_without_nat.map((subnet) => subnet.subnetwork), ["backend"]);
 
-  const result = await assessGcpIdentity(client, { staleDays: 90, maxKeys: 50 });
-  assert.equal(result.findings.find((item) => item.id === "GCP-IAM-01")?.status, "fail");
-  assert.equal(result.findings.find((item) => item.id === "GCP-IAM-02")?.status, "fail");
-  assert.equal(result.findings.find((item) => item.id === "GCP-IAM-03")?.status, "warn");
-  assert.equal(result.findings.find((item) => item.id === "GCP-IAM-04")?.status, "warn");
-  assert.equal(result.findings.find((item) => item.id === "GCP-IAM-05")?.status, "fail");
+  const noOption = structuredClone(listOfSubnetworks);
+  delete noOption.routers.items["regions/us-central1"].routers[0].nats[0].sourceSubnetworkIpRangesToNat;
+  const client2 = createClient(async (url, init) => jsonResponse(routeCompliant(url, init, noOption)));
+  const result2 = await assessGcpNetworkSecurity(client2);
+  assert.deepEqual(
+    result2.findings.find((item) => item.id === "GCP-NET-04").evidence.subnets_without_nat.map((subnet) => subnet.subnetwork),
+    ["default", "backend"],
+    "a NAT without the documented option cannot support coverage (rule 6)",
+  );
 });
 
-test("assessGcpLoggingDetection classifies logging and SCC posture", async () => {
-  const client = {
-    async listProjects() {
-      return [{ projectId: "prod-audit", displayName: "Prod Audit" }];
-    },
-    async getLoggingSettings() {
-      return { storageLocation: "global" };
-    },
-    async listLogSinks() {
-      return [{ name: "audit-sink" }];
-    },
-    async listLogBuckets() {
-      return [{ name: "bucket-1", retentionDays: 90 }];
-    },
-    async listRecentAdminActivity() {
-      return [{ insertId: "1" }];
-    },
-    async listRecentDataAccess() {
-      return [];
-    },
-    async listSccSources() {
-      return [{ name: "organizations/123456789012/sources/1" }];
-    },
-    async listSccFindings() {
-      return [{ finding: { state: "ACTIVE" } }];
-    },
-  };
+test("GCP-ORG-07 evaluates cluster, namespace, service account, and Istio admission rules", async () => {
+  const strictDefault = COMPLIANT.binaryAuthorization.defaultAdmissionRule;
+  const cases = [
+    ["clusterAdmissionRules", "us-central1-a.prod-cluster"],
+    ["kubernetesNamespaceAdmissionRules", "payments"],
+    ["kubernetesServiceAccountAdmissionRules", "payments:deployer"],
+    ["istioServiceIdentityAdmissionRules", "spiffe://example.com/ns/payments/sa/default"],
+  ];
+  for (const [mapName, key] of cases) {
+    const permissive = {
+      ...COMPLIANT,
+      binaryAuthorization: { name: "projects/prod-audit/policy", defaultAdmissionRule: strictDefault, [mapName]: { [key]: { evaluationMode: "ALWAYS_ALLOW", enforcementMode: "ENFORCED_BLOCK_AND_AUDIT_LOG" } } },
+    };
+    const client = createClient(async (url, init) => jsonResponse(routeCompliant(url, init, permissive)));
+    const result = await assessGcpOrgGuardrails(client);
+    const finding = result.findings.find((item) => item.id === "GCP-ORG-07");
+    assert.equal(finding.status, "fail", `${mapName} ALWAYS_ALLOW must fail under a strict default rule`);
+    assert.deepEqual(finding.evidence.permissive_rules, [{ projectId: "prod-audit", rule: `${mapName}[${key}]`, evaluationMode: "ALWAYS_ALLOW" }]);
+  }
 
-  const result = await assessGcpLoggingDetection(client, { maxProjects: 10, maxFindings: 20 });
-  assert.equal(result.findings.find((item) => item.id === "GCP-LOG-01")?.status, "pass");
-  assert.equal(result.findings.find((item) => item.id === "GCP-LOG-02")?.status, "fail");
-  assert.equal(result.findings.find((item) => item.id === "GCP-LOG-03")?.status, "pass");
-  assert.equal(result.findings.find((item) => item.id === "GCP-LOG-04")?.status, "pass");
-  assert.equal(result.findings.find((item) => item.id === "GCP-LOG-05")?.status, "pass");
+  const dryRunCluster = {
+    ...COMPLIANT,
+    binaryAuthorization: { name: "projects/prod-audit/policy", defaultAdmissionRule: strictDefault, clusterAdmissionRules: { "us-central1-a.prod-cluster": { evaluationMode: "REQUIRE_ATTESTATION", enforcementMode: "DRYRUN_AUDIT_LOG_ONLY" } } },
+  };
+  const client = createClient(async (url, init) => jsonResponse(routeCompliant(url, init, dryRunCluster)));
+  const finding = (await assessGcpOrgGuardrails(client)).findings.find((item) => item.id === "GCP-ORG-07");
+  assert.equal(finding.status, "warn");
+  assert.equal(finding.evidence.dry_run_rules[0].rule, "clusterAdmissionRules[us-central1-a.prod-cluster]");
 });
 
-test("assessGcpOrgGuardrails flags missing policy constraints", async () => {
-  const client = {
-    getResolvedConfig: () => sampleConfig(),
-    async getOrganization() {
-      return { displayName: "Example Org" };
-    },
-    async listProjects() {
-      return [{ projectId: "prod-audit", displayName: "Prod Audit" }];
-    },
-    async getEffectiveOrgPolicy(_projectId, constraint) {
-      if (constraint === "constraints/iam.disableServiceAccountKeyCreation") {
-        return { policy: { booleanPolicy: { enforced: true } } };
-      }
-      if (constraint === "constraints/iam.disableServiceAccountKeyUpload") {
-        return { policy: { booleanPolicy: { enforced: false } } };
-      }
-      return null;
-    },
+test("project identifiers come only from the documented full resource name", async () => {
+  const numbered = {
+    ...COMPLIANT,
+    projects: { results: [{ name: "//cloudresourcemanager.googleapis.com/projects/111", assetType: "cloudresourcemanager.googleapis.com/Project", project: "projects/111", displayName: "Prod Audit", state: "ACTIVE", additionalAttributes: { projectId: "ignored-attribute" } }] },
   };
+  const seen = [];
+  const client = createClient(async (url, init) => {
+    seen.push(url);
+    return jsonResponse(routeCompliant(url, init, numbered));
+  });
+  const result = await assessGcpNetworkSecurity(client);
+  assert.deepEqual(result.snapshot.projects, ["111"]);
+  assert.ok(seen.some((url) => url.includes("/compute/v1/projects/111/")));
+  assert.ok(!seen.some((url) => url.includes("ignored-attribute")));
 
+  const singleProject = new GcpAuditorClient(sampleConfig({ organizationId: undefined }), { fetchImpl: async () => jsonResponse({}), now: () => NOW });
+  const inventory = await singleProject.listProjectInventory();
+  assert.deepEqual(inventory.projects, [{ name: "//cloudresourcemanager.googleapis.com/projects/prod-audit", displayName: "prod-audit" }]);
+});
+
+test("GCP-NET-06 treats H2C backend services as HTTP(S) backends", async () => {
+  const h2c = {
+    ...COMPLIANT,
+    backendServices: { items: { global: { backendServices: [{ name: "grpc-web", loadBalancingScheme: "EXTERNAL_MANAGED", protocol: "H2C" }] } } },
+  };
+  const client = createClient(async (url, init) => jsonResponse(routeCompliant(url, init, h2c)));
+  const finding = (await assessGcpNetworkSecurity(client)).findings.find((item) => item.id === "GCP-NET-06");
+  assert.equal(finding.status, "warn");
+  assert.deepEqual(finding.evidence.backends_without_security_policy.map((backend) => backend.backendService), ["grpc-web"]);
+});
+
+test("paginate records truncation when the cursor repeats or the page budget is reached", async () => {
+  const fixedTokenUrls = [];
+  const fixedToken = createClient(async (url) => {
+    fixedTokenUrls.push(url);
+    return jsonResponse({ items: [], nextPageToken: "stuck" });
+  });
+  const stuck = await fixedToken.listFirewalls("prod-audit");
+  assert.deepEqual(stuck.items, []);
+  assert.equal(stuck.truncated, true, "a cursor that stops advancing must be reported as truncation");
+  assert.equal(fixedTokenUrls.length, 2, "the repeated token is fetched once and then abandoned");
+
+  let advancing = 0;
+  const advancingToken = createClient(async () => {
+    advancing += 1;
+    return jsonResponse({ items: [], nextPageToken: `page-${advancing}` });
+  });
+  const budgeted = await advancingToken.listFirewalls("prod-audit");
+  assert.equal(budgeted.truncated, true, "an endless advancing cursor with empty pages must stop at the page budget");
+  assert.equal(advancing, GCP_MAX_LIST_PAGES);
+
+  let capped = 0;
+  const cappedClient = createClient(async () => {
+    capped += 1;
+    return jsonResponse({ accounts: Array.from({ length: 100 }, (_, index) => ({ email: `sa-${capped}-${index}@prod-audit.iam.gserviceaccount.com` })), nextPageToken: `page-${capped}` });
+  });
+  const accounts = await cappedClient.listServiceAccounts("prod-audit", 250);
+  assert.equal(accounts.items.length, 300);
+  assert.equal(accounts.truncated, true, "a cap exit must report truncated");
+  assert.equal(capped, 3);
+});
+
+test("every capped list threads truncation into the verdicts (never-ending sink, bucket, account, source, and perimeter pages)", async () => {
+  let bucketPage = 0;
+  const client = createClient(async (url, init) => {
+    const parsed = new URL(url);
+    const path = parsed.pathname;
+    if (path.endsWith("/sinks")) return jsonResponse({ sinks: [{ name: "audit-sink" }], nextPageToken: "stuck" });
+    if (path.endsWith("/buckets") && parsed.hostname === "logging.googleapis.com") {
+      bucketPage += 1;
+      return jsonResponse({
+        buckets: Array.from({ length: 100 }, (_, index) => ({ name: `projects/prod-audit/locations/global/buckets/custom-${bucketPage}-${index}`, retentionDays: 400 })),
+        nextPageToken: `page-${bucketPage}`,
+      });
+    }
+    if (path.endsWith("/serviceAccounts")) return jsonResponse({ ...COMPLIANT.serviceAccounts, nextPageToken: "stuck" });
+    if (path.endsWith("/sources")) return jsonResponse({ ...COMPLIANT.sccSources, nextPageToken: "stuck" });
+    if (path === "/v1/accessPolicies") return jsonResponse({ ...COMPLIANT.accessPolicies, nextPageToken: "stuck" });
+    if (path.endsWith("/servicePerimeters")) return jsonResponse({ ...COMPLIANT.servicePerimeters, nextPageToken: "stuck" });
+    return jsonResponse(routeCompliant(url, init));
+  });
+  const assessments = await runAllAssessments(client);
+  const all = statuses(assessments);
+  for (const id of ["GCP-LOG-03", "GCP-LOG-04", "GCP-LOG-05", "GCP-IAM-02", "GCP-IAM-03", "GCP-DATA-07"]) {
+    assert.equal(all[id], "warn", `${id} must not pass when its list was cut off by the cap or a stuck cursor`);
+  }
+  const retention = assessments[1].findings.find((item) => item.id === "GCP-LOG-04");
+  assert.equal(retention.evidence.truncated, true);
+  assert.equal(retention.evidence.seen, 5000);
+  assert.match(retention.summary, /Partial view: 5000 seen, total unknown \(inventory incomplete\)/);
+  const sinks = assessments[1].findings.find((item) => item.id === "GCP-LOG-03");
+  assert.match(sinks.summary, /1 seen, total unknown/);
+  assert.equal(assessments[1].snapshot.sinks[0].truncated, true);
+  assert.equal(assessments[1].snapshot.log_buckets[0].buckets.length, 5000);
+  assert.equal(bucketPage, 50, "the bucket cap of 5000 stops after 50 pages of 100");
+});
+
+test("GCP-LOG-03 counts only enabled sinks toward coverage and names disabled sinks", async () => {
+  const enabledClient = createClient(async (url, init) => jsonResponse(routeCompliant(url, init)));
+  const enabled = (await assessGcpLoggingDetection(enabledClient)).findings.find((item) => item.id === "GCP-LOG-03");
+  assert.equal(enabled.status, "pass");
+  assert.deepEqual(enabled.evidence.projects_without_sinks, []);
+  assert.deepEqual(enabled.evidence.disabled_sinks, []);
+  assert.match(enabled.summary, /at least one enabled log sink\./);
+
+  const disabledSink = { name: "audit-sink", destination: "storage.googleapis.com/audit-archive", disabled: true };
+  const disabledClient = createClient(async (url, init) => jsonResponse(routeCompliant(url, init, { ...COMPLIANT, sinks: { sinks: [disabledSink] } })));
+  const result = await assessGcpLoggingDetection(disabledClient);
+  const disabled = result.findings.find((item) => item.id === "GCP-LOG-03");
+  assert.equal(disabled.status, "fail", "a project whose only sink is disabled exports nothing and must not pass");
+  assert.deepEqual(disabled.evidence.projects_without_sinks, ["prod-audit"]);
+  assert.deepEqual(disabled.evidence.disabled_sinks, [{ projectId: "prod-audit", sink: "audit-sink", destination: "storage.googleapis.com/audit-archive" }]);
+  assert.match(disabled.summary, /1 of 1 sampled projects have no enabled log sink \(1 sinks are disabled and export nothing\)/);
+  assert.equal(result.summary.projects_with_log_sinks, 0);
+  assert.equal(result.summary.disabled_log_sinks, 1);
+  assert.deepEqual(result.snapshot.sinks[0].sinks, [{ name: "audit-sink", destination: "storage.googleapis.com/audit-archive", disabled: true }]);
+
+  const mixedClient = createClient(async (url, init) => jsonResponse(routeCompliant(url, init, { ...COMPLIANT, sinks: { sinks: [disabledSink, { name: "org-sink", disabled: false }] } })));
+  const mixed = (await assessGcpLoggingDetection(mixedClient)).findings.find((item) => item.id === "GCP-LOG-03");
+  assert.equal(mixed.status, "pass");
+  assert.match(mixed.summary, /\(1 disabled sinks were not counted\)/);
+  assert.equal(mixed.evidence.disabled_sinks.length, 1);
+});
+
+test("GCP-NET-05 CUSTOM profiles carry the documented customFeatures cipher list for manual review", async () => {
+  const seeded = {
+    ...COMPLIANT,
+    sslPolicies: { items: { global: { sslPolicies: [{ name: "strict", minTlsVersion: "TLS_1_2", profile: "CUSTOM", customFeatures: ["TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384"] }] } } },
+  };
+  const client = createClient(async (url, init) => jsonResponse(routeCompliant(url, init, seeded)));
+  const result = await assessGcpNetworkSecurity(client);
+  const finding = result.findings.find((item) => item.id === "GCP-NET-05");
+  assert.equal(finding.status, "warn");
+  assert.deepEqual(finding.evidence.unresolved_proxies[0].customFeatures, ["TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384"]);
+  assert.deepEqual(result.snapshot.ssl_policies[0].customFeatures, ["TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384"]);
+});
+
+test("org guardrail snapshots and evidence never pass metadata values through", async () => {
+  const secret = "SEEDED-STARTUP-SCRIPT-4c1d2e";
+  const seeded = {
+    ...COMPLIANT,
+    computeProject: {
+      name: "prod-audit",
+      commonInstanceMetadata: { items: [{ key: "enable-oslogin", value: "TRUE" }, { key: "ssh-keys", value: `admin:ssh-rsa ${secret}` }, { key: "db-password", value: secret }] },
+    },
+    instances: structuredClone(COMPLIANT.instances),
+  };
+  seeded.instances.items["zones/us-central1-a"].instances[0].metadata = { items: [{ key: "startup-script", value: secret }, { key: "serial-port-enable", value: "0" }] };
+  seeded.instances.items["zones/us-central1-a"].instances[0].labels = { owner: secret };
+  const client = createClient(async (url, init) => jsonResponse(routeCompliant(url, init, seeded)));
   const result = await assessGcpOrgGuardrails(client);
-  assert.equal(result.findings.find((item) => item.id === "GCP-ORG-01")?.status, "pass");
-  assert.equal(result.findings.find((item) => item.id === "GCP-ORG-02")?.status, "warn");
-  assert.equal(result.findings.find((item) => item.id === "GCP-ORG-03")?.status, "pass");
-  assert.equal(result.findings.find((item) => item.id === "GCP-ORG-04")?.status, "warn");
-  assert.equal(result.findings.find((item) => item.id === "GCP-ORG-05")?.status, "fail");
+  assert.ok(!JSON.stringify(result).includes(secret), "no metadata value may reach the assessment result");
+  assert.deepEqual(result.snapshot.compute_projects, [{ projectId: "prod-audit", name: "prod-audit", enable_oslogin: true }]);
+  assert.deepEqual(result.snapshot.instances, [{
+    projectId: "prod-audit",
+    name: "vm-1",
+    enable_oslogin: null,
+    serial_port_enable: false,
+    shieldedInstanceConfig: { enableSecureBoot: true, enableVtpm: true, enableIntegrityMonitoring: true },
+  }]);
+  assert.deepEqual(Object.keys(result.snapshot.effective_policies.requireOsLogin), ["constraint", "enforced", "booleanPolicy", "listPolicy", "restoreDefault"]);
+  assert.deepEqual(result.snapshot.effective_policies.allowedPolicyMemberDomains.listPolicy, { allValues: null, allowedValues: ["C0abc123"], deniedValues: [] });
+  assert.deepEqual(result.findings.find((item) => item.id === "GCP-ORG-02").evidence.policy.listPolicy.allowedValues, ["C0abc123"]);
+  assert.equal(statuses([result])["GCP-ORG-08"], "pass");
 });
 
-test("exportGcpAuditBundle writes reports, analysis, and archive", async () => {
-  const base = createTempBase("grclanker-gcp-export-");
+test("API key snapshots keep name, displayName, and restrictions but never keyString", async () => {
+  const keyString = "AIzaSEEDED-KEYSTRING-7b2c9d";
+  const seeded = {
+    ...COMPLIANT,
+    apiKeys: { keys: [{ ...COMPLIANT.apiKeys.keys[0], keyString, uid: "uid-1", etag: "etag-1", annotations: { note: keyString } }] },
+  };
+  const client = createClient(async (url, init) => jsonResponse(routeCompliant(url, init, seeded)));
+  const result = await assessGcpDataProtection(client);
+  assert.ok(!JSON.stringify(result).includes(keyString));
+  assert.deepEqual(result.snapshot.api_keys, [{
+    projectId: "prod-audit",
+    name: "projects/111/locations/global/keys/abc",
+    displayName: "maps",
+    restrictions: {
+      apiTargets: [{ service: "maps.googleapis.com", methods: [] }],
+      browserKeyRestrictions: null,
+      serverKeyRestrictions: { allowedIps: 1 },
+      androidKeyRestrictions: null,
+      iosKeyRestrictions: null,
+    },
+  }]);
+  assert.equal(statuses([result])["GCP-DATA-06"], "pass");
+});
+
+function seededSecret(label) {
+  return `SEEDED-${label}-a9f3e1c7`;
+}
+
+function seededFixture() {
+  const secrets = {};
+  const seed = (label) => {
+    secrets[label] = seededSecret(label);
+    return secrets[label];
+  };
+  const data = structuredClone(COMPLIANT);
+  data.organization.description = seed("organization");
+  data.projects.results[0].labels = { owner: seed("project-label") };
+  data.projects.results[0].additionalAttributes = { projectId: seed("project-attribute") };
+  data.iamPolicies.results[0].policy.bindings[0].condition = { expression: seed("iam-condition"), title: "cond" };
+  data.publicPolicies = {
+    results: [{
+      resource: "//storage.googleapis.com/shared-bucket",
+      assetType: "storage.googleapis.com/Bucket",
+      policy: { bindings: [{ role: "roles/storage.objectViewer", members: ["allUsers"], condition: { description: seed("public-condition") } }] },
+    }],
+  };
+  data.serviceAccounts.accounts[0].description = seed("service-account");
+  data.keys = { keys: [{ name: "projects/prod-audit/serviceAccounts/svc/keys/1", validAfterTime: "2026-09-01T00:00:00Z", privateKeyData: seed("service-account-key") }] };
+  data.entries.entries[0].textPayload = seed("log-entry");
+  data.sinks.sinks[0].filter = seed("sink-filter");
+  data.sinks.sinks[0].writerIdentity = seed("sink-writer");
+  data.logBuckets.buckets[0].description = seed("log-bucket");
+  data.settings.kmsServiceAccountId = seed("logging-settings");
+  data.sccSources.sources[0].description = seed("scc-source");
+  data.sccFindings = { listFindingsResults: [{ finding: { name: "organizations/123456789012/sources/1/findings/f1", sourceProperties: { detail: seed("scc-finding") } } }] };
+  data.booleanPolicy.etag = seed("boolean-policy");
+  data.listPolicy.etag = seed("list-policy");
+  data.computeProject.commonInstanceMetadata.items.push({ key: "ssh-keys", value: seed("project-ssh-keys") }, { key: "db-password", value: seed("project-metadata") });
+  const instance = data.instances.items["zones/us-central1-a"].instances[0];
+  instance.metadata = { items: [{ key: "startup-script", value: seed("instance-startup-script") }] };
+  instance.labels = { env: seed("instance-label") };
+  instance.description = seed("instance-description");
+  data.binaryAuthorization.description = seed("binary-authorization");
+  data.buckets.items[0].labels = { team: seed("bucket-label") };
+  data.buckets.items[0].website = { mainPageSuffix: seed("bucket-website") };
+  data.cryptoKeys.assets[0].resource.data.labels = { purpose: seed("crypto-key-label") };
+  data.disks.items["zones/us-central1-a"].disks[0].diskEncryptionKey.rawKey = seed("disk-raw-key");
+  data.disks.items["zones/us-central1-a"].disks[0].description = seed("disk-description");
+  data.managedZones.managedZones[0].description = seed("managed-zone");
+  data.apiKeys.keys[0].keyString = seed("api-key-string");
+  data.accessPolicies.accessPolicies[0].title = seed("access-policy");
+  data.servicePerimeters.servicePerimeters[0].title = seed("perimeter-title");
+  data.servicePerimeters.servicePerimeters[0].description = seed("perimeter-description");
+  data.firewalls.items[0].description = seed("firewall");
+  const subnet = data.subnetworks.items["regions/us-central1"].subnetworks[0];
+  subnet.description = seed("subnetwork");
+  subnet.logConfig.filterExpr = seed("subnetwork-filter");
+  data.routers.items["regions/us-central1"].routers[0].description = seed("router");
+  data.sslPolicies.items.global.sslPolicies[0].description = seed("ssl-policy");
+  data.sslPolicies.items.global.sslPolicies[0].fingerprint = seed("ssl-policy-fingerprint");
+  data.targetHttpsProxies.items.global.targetHttpsProxies[0].description = seed("https-proxy");
+  const backend = data.backendServices.items.global.backendServices[0];
+  backend.description = seed("backend-service");
+  backend.iap = { enabled: true, oauth2ClientId: "client-id", oauth2ClientSecret: seed("backend-iap-secret"), oauth2ClientSecretSha256: seed("backend-iap-sha") };
+  return { data, secrets };
+}
+
+function walkFiles(root) {
+  const files = [];
+  for (const entry of readdirSync(root, { withFileTypes: true })) {
+    const pathname = join(root, entry.name);
+    if (entry.isDirectory()) files.push(...walkFiles(pathname));
+    else files.push(pathname);
+  }
+  return files;
+}
+
+function readZipEntries(zipPath) {
+  const buffer = readFileSync(zipPath);
+  const endOfCentralDirectory = buffer.lastIndexOf(Buffer.from([0x50, 0x4b, 0x05, 0x06]));
+  assert.ok(endOfCentralDirectory >= 0, "zip end of central directory record missing");
+  const entryCount = buffer.readUInt16LE(endOfCentralDirectory + 10);
+  let offset = buffer.readUInt32LE(endOfCentralDirectory + 16);
+  const entries = [];
+  for (let index = 0; index < entryCount; index += 1) {
+    assert.equal(buffer.readUInt32LE(offset), 0x02014b50, "central directory header signature");
+    const method = buffer.readUInt16LE(offset + 10);
+    const compressedSize = buffer.readUInt32LE(offset + 20);
+    const nameLength = buffer.readUInt16LE(offset + 28);
+    const extraLength = buffer.readUInt16LE(offset + 30);
+    const commentLength = buffer.readUInt16LE(offset + 32);
+    const localOffset = buffer.readUInt32LE(offset + 42);
+    const name = buffer.toString("utf8", offset + 46, offset + 46 + nameLength);
+    assert.equal(buffer.readUInt32LE(localOffset), 0x04034b50, "local file header signature");
+    const dataStart = localOffset + 30 + buffer.readUInt16LE(localOffset + 26) + buffer.readUInt16LE(localOffset + 28);
+    const data = buffer.subarray(dataStart, dataStart + compressedSize);
+    entries.push({ name, content: method === 8 ? inflateRawSync(data).toString("utf8") : data.toString("utf8") });
+    offset += 46 + nameLength + extraLength + commentLength;
+  }
+  return entries;
+}
+
+test("exportGcpAuditBundle never writes a seeded secret to any bundle file or zip entry", async () => {
+  const { data, secrets } = seededFixture();
+  const seededValues = Object.values(secrets);
+  assert.ok(seededValues.length >= 40);
+  const base = createTempBase("grclanker-gcp-hygiene-");
+  const client = createClient(async (url, init) => jsonResponse(routeCompliant(url, init, data)));
+  const result = await exportGcpAuditBundle(client, sampleConfig({ accessToken: seededSecret("access-token") }), base, { max_projects: 5 });
+  assert.equal(result.errorCount, 0);
+
+  const files = walkFiles(result.outputDir).map((pathname) => ({ name: relative(result.outputDir, pathname), content: readFileSync(pathname, "utf8") }));
+  assert.ok(files.some((file) => file.name === "core_data/org-guardrails.json"));
+  assert.ok(files.some((file) => file.name === "analysis/findings.json"));
+  const zipEntries = readZipEntries(result.zipPath).filter((entry) => !entry.name.endsWith("/"));
+  assert.equal(zipEntries.length, files.length, "every bundle file must be present in the zip");
+  for (const file of files) {
+    const entry = zipEntries.find((candidate) => candidate.name === file.name);
+    assert.ok(entry, `${file.name} missing from zip`);
+    assert.equal(entry.content, file.content, `${file.name} differs between directory and zip`);
+  }
+
+  const leaks = [];
+  for (const { name, content } of [...files, ...zipEntries]) {
+    for (const [label, value] of Object.entries(secrets)) {
+      if (content.includes(value)) leaks.push(`${label} -> ${name}`);
+    }
+    if (content.includes(seededSecret("access-token"))) leaks.push(`access-token -> ${name}`);
+  }
+  assert.deepEqual(leaks, [], "seeded secrets reached the bundle");
+
+  const everything = files.map((file) => file.content).join("\n");
+  assert.ok(everything.includes("prod-bucket"), "bundle content must still carry resource identifiers");
+  assert.ok(everything.includes("public-zone"));
+  const quickReference = files.find((file) => file.name === "QUICK_REFERENCE.md").content;
+  assert.match(quickReference, /projected API snapshots/);
+  assert.ok(!quickReference.includes("raw API snapshots"));
+});
+
+test("assessGcpIdentity flags stale keys, undated keys, and privileged default service accounts", async () => {
   const client = {
-    getResolvedConfig: () => sampleConfig(),
-    getNow: () => new Date("2026-04-16T00:00:00.000Z"),
-    async getOrganization() {
-      return { displayName: "Example Org" };
-    },
-    async listProjects() {
-      return [{ projectId: "prod-audit", displayName: "Prod Audit" }];
-    },
-    async searchAllIamPolicies() {
-      return [];
-    },
-    async getLoggingSettings() {
-      return { storageLocation: "global" };
-    },
-    async listLogSinks() {
-      return [{ name: "audit-sink" }];
-    },
-    async listSccSources() {
-      return [{ name: "organizations/123456789012/sources/1" }];
-    },
-    async getEffectiveOrgPolicy() {
-      return { policy: { booleanPolicy: { enforced: true } } };
+    getNow: () => NOW,
+    async listProjectInventory() {
+      return { projects: [{ name: "//cloudresourcemanager.googleapis.com/projects/prod-audit" }], truncated: false };
     },
     async listServiceAccounts() {
-      return [];
+      return { items: [{ email: "svc@prod-audit.iam.gserviceaccount.com" }, { email: "other@prod-audit.iam.gserviceaccount.com" }], truncated: false };
     },
-    async listServiceAccountKeys() {
-      return [];
+    async listServiceAccountKeys(_projectId, email) {
+      return email.startsWith("svc") ? [{ name: "keys/1", validAfterTime: "2025-01-01T00:00:00Z" }] : [{ name: "keys/2" }];
     },
-    async listLogBuckets() {
-      return [{ name: "bucket-1", retentionDays: 90 }];
-    },
-    async listRecentAdminActivity() {
-      return [{ insertId: "1" }];
-    },
-    async listRecentDataAccess() {
-      return [{ insertId: "2" }];
-    },
-    async listSccFindings() {
-      return [];
+    async searchAllIamPolicies() {
+      return {
+        items: [{
+          resource: "//cloudresourcemanager.googleapis.com/projects/prod-audit",
+          policy: { bindings: [
+            { role: "roles/owner", members: ["serviceAccount:123-compute@developer.gserviceaccount.com"] },
+            { role: "roles/viewer", members: ["serviceAccount:svc@shared-services.iam.gserviceaccount.com"] },
+          ] },
+        }],
+        truncated: false,
+      };
     },
   };
+  const result = await assessGcpIdentity(client, { staleDays: 90, maxKeys: 50 });
+  const all = statuses([result]);
+  assert.equal(all["GCP-IAM-01"], "fail");
+  assert.equal(all["GCP-IAM-02"], "fail");
+  assert.equal(all["GCP-IAM-03"], "warn");
+  assert.equal(all["GCP-IAM-04"], "warn");
+  assert.equal(all["GCP-IAM-05"], "fail");
+  assert.equal(result.summary.undated_service_account_keys, 1);
+});
 
-  const result = await exportGcpAuditBundle(client, sampleConfig(), base, { max_projects: 5, max_findings: 20 });
+test("exportGcpAuditBundle writes the shared layout, allocates -2 on rerun, and logs errors only when reads fail", async () => {
+  const base = createTempBase("grclanker-gcp-export-");
+  const client = createClient(async (url, init) => jsonResponse(routeCompliant(url, init)));
+  const result = await exportGcpAuditBundle(client, sampleConfig(), base, { max_projects: 5 });
   assert.ok(result.outputDir.startsWith(realpathSync(base)));
+  assert.equal(result.zipPath, `${result.outputDir}.zip`);
   assert.ok(existsSync(result.zipPath));
+  assert.equal(result.errorCount, 0);
+  assert.equal(result.findingCount, 31);
+  for (const file of [
+    "QUICK_REFERENCE.md",
+    "metadata.json",
+    "core_data/access.json",
+    "core_data/identity.json",
+    "core_data/network-security.json",
+    "analysis/findings.json",
+    "analysis/category_summaries.json",
+    "analysis/data-protection.json",
+    "compliance/executive_summary.md",
+    "compliance/unified_compliance_matrix.md",
+    ...GCP_FRAMEWORKS.map((framework) => `compliance/frameworks/${framework.slug}.md`),
+  ]) {
+    assert.ok(existsSync(join(result.outputDir, file)), `${file} missing from bundle`);
+  }
+  assert.equal(GCP_FRAMEWORKS.length, 8);
+  assert.ok(!existsSync(join(result.outputDir, "_errors.log")));
+  const metadata = readFileSync(join(result.outputDir, "metadata.json"), "utf8");
+  assert.ok(!metadata.includes("token"), "metadata must not include the access token value");
+  const findings = JSON.parse(readFileSync(join(result.outputDir, "analysis", "findings.json"), "utf8"));
+  assert.equal(findings.length, 31);
 
-  const executiveSummary = readFileSync(join(result.outputDir, "reports", "executive-summary.md"), "utf8");
-  assert.match(executiveSummary, /GCP Audit Bundle/);
-  const findingsJson = JSON.parse(readFileSync(join(result.outputDir, "analysis", "findings.json"), "utf8"));
-  assert.ok(Array.isArray(findingsJson));
+  const rerun = await exportGcpAuditBundle(client, sampleConfig(), base, { max_projects: 5 });
+  assert.equal(basename(rerun.outputDir), `${basename(result.outputDir)}-2`);
+  assert.equal(rerun.zipPath, `${rerun.outputDir}.zip`);
+
+  const failingClient = createClient(async (url, init) => (new URL(url).hostname === "dns.googleapis.com" ? forbidden() : jsonResponse(routeCompliant(url, init))));
+  const partial = await exportGcpAuditBundle(failingClient, sampleConfig(), base, { max_projects: 5 });
+  assert.ok(partial.errorCount > 0);
+  const errorLog = readFileSync(join(partial.outputDir, "_errors.log"), "utf8");
+  assert.match(errorLog, /\[data-protection\] prod-audit: 403 Forbidden/);
+});
+
+const ALL_FINDING_IDS = [
+  "GCP-IAM-01", "GCP-IAM-02", "GCP-IAM-03", "GCP-IAM-04", "GCP-IAM-05",
+  "GCP-LOG-01", "GCP-LOG-02", "GCP-LOG-03", "GCP-LOG-04", "GCP-LOG-05",
+  "GCP-ORG-01", "GCP-ORG-02", "GCP-ORG-03", "GCP-ORG-04", "GCP-ORG-05", "GCP-ORG-06", "GCP-ORG-07", "GCP-ORG-08",
+  "GCP-DATA-01", "GCP-DATA-02", "GCP-DATA-03", "GCP-DATA-04", "GCP-DATA-05", "GCP-DATA-06", "GCP-DATA-07",
+  "GCP-NET-01", "GCP-NET-02", "GCP-NET-03", "GCP-NET-04", "GCP-NET-05", "GCP-NET-06",
+];
+
+const SECOND_PROJECT = "second-project";
+const TWO_PROJECTS = {
+  ...COMPLIANT,
+  projects: {
+    results: [
+      ...COMPLIANT.projects.results,
+      { name: `//cloudresourcemanager.googleapis.com/projects/${SECOND_PROJECT}`, assetType: "cloudresourcemanager.googleapis.com/Project", project: "projects/222", displayName: "Second", state: "ACTIVE" },
+    ],
+  },
+};
+
+function requestProject(url, init) {
+  const parsed = new URL(url);
+  const fromPath = parsed.pathname.match(/\/projects\/([^/:]+)/)?.[1];
+  const fromQuery = parsed.searchParams.get("project");
+  const body = init?.body ? JSON.parse(init.body) : {};
+  const fromBody = body.resourceNames?.[0]?.replace(/^projects\//, "");
+  return fromPath ?? fromQuery ?? fromBody ?? undefined;
+}
+
+/** Serves the compliant fixture for any project by rewriting the prod-audit references to the requested project. */
+function routeForProject(url, init, data = TWO_PROJECTS) {
+  const projectId = requestProject(url, init);
+  const scoped = projectId && projectId !== "prod-audit" ? JSON.parse(JSON.stringify(data).replaceAll("prod-audit", projectId)) : data;
+  return routeCompliant(url, init, scoped);
+}
+
+function requestFacts(url, init) {
+  const parsed = new URL(url);
+  return { host: parsed.hostname, path: parsed.pathname, query: parsed.searchParams, body: init?.body ? JSON.parse(init.body) : {} };
+}
+
+function denied(status) {
+  return jsonResponse({ error: { code: status, message: "denied", status: status === 500 ? "INTERNAL" : "PERMISSION_DENIED" } }, status);
+}
+
+/** A client that serves two compliant projects except for one inventory, made unreadable fully or for the second project only. */
+function clientWithUnreadable(match, status = 403, mode = "full", data = TWO_PROJECTS) {
+  return createClient(async (url, init) => {
+    if (match(requestFacts(url, init)) && (mode === "full" || requestProject(url, init) === SECOND_PROJECT)) return denied(status);
+    return jsonResponse(routeForProject(url, init, data));
+  });
+}
+
+function findingsById(assessments) {
+  return Object.fromEntries(assessments.flatMap((assessment) => assessment.findings.map((item) => [item.id, item])));
+}
+
+const ORG_POLICY_DEPENDENTS = {
+  "constraints/iam.allowedPolicyMemberDomains": ["GCP-ORG-02"],
+  "constraints/iam.disableServiceAccountKeyCreation": ["GCP-ORG-03"],
+  "constraints/iam.disableServiceAccountKeyUpload": ["GCP-ORG-04"],
+  "constraints/compute.disableSerialPortAccess": ["GCP-ORG-05"],
+  "constraints/compute.requireShieldedVm": ["GCP-ORG-05"],
+  "constraints/compute.requireOsLogin": ["GCP-ORG-06"],
+};
+
+/** The effective org policy is one GCP_INVENTORIES surface read once per constraint; each read gets its own sweep row. */
+function policySurfaceId(constraint) {
+  return `effectiveOrgPolicy:${constraint}`;
+}
+
+/** One sweep row: the GCP_INVENTORIES key it covers, the URL shape that identifies its requests, and its dependents. */
+function surface(key, endpoint, perProject, match, dependents, id = key) {
+  return { key, id, name: GCP_INVENTORIES[key].dataset, endpoint, perProject, match, dependents };
+}
+
+/**
+ * Every inventory the five assessments read, the URL shape that identifies it,
+ * whether it is read per project, and exactly which findings depend on it.
+ * Mirrors the reviewer's corollary harness so the dependency map stays true.
+ */
+const INVENTORY_SURFACES = [
+  surface("organization", "/v1/organizations/{organization}", false, (r) => r.host === "cloudresourcemanager.googleapis.com" && r.path.startsWith("/v1/organizations/"), ["GCP-ORG-01"]),
+  surface("projects", ":searchAllResources", false, (r) => r.path.endsWith(":searchAllResources"), ALL_FINDING_IDS),
+  surface("iamPolicies", ":searchAllIamPolicies", false, (r) => r.path.endsWith(":searchAllIamPolicies") && r.query.get("query") !== PUBLIC_MEMBER_IAM_QUERY, ["GCP-IAM-01", "GCP-IAM-04", "GCP-IAM-05"]),
+  surface("publicBindings", ":searchAllIamPolicies", false, (r) => r.path.endsWith(":searchAllIamPolicies") && r.query.get("query") === PUBLIC_MEMBER_IAM_QUERY, ["GCP-DATA-02"]),
+  surface("cryptoKeys", "/assets", false, (r) => r.path.endsWith("/assets"), ["GCP-DATA-03"]),
+  surface("serviceAccounts", "/serviceAccounts", true, (r) => r.path.endsWith("/serviceAccounts"), ["GCP-IAM-02", "GCP-IAM-03"]),
+  surface("serviceAccountKeys", "/keys", true, (r) => r.host === "iam.googleapis.com" && r.path.endsWith("/keys"), ["GCP-IAM-02", "GCP-IAM-03"]),
+  surface("adminActivity", "entries:list", true, (r) => r.path.endsWith("/entries:list") && /activity/.test(r.body.filter ?? ""), ["GCP-LOG-01"]),
+  surface("dataAccess", "entries:list", true, (r) => r.path.endsWith("/entries:list") && /data_access/.test(r.body.filter ?? ""), ["GCP-LOG-02"]),
+  surface("sinks", "/sinks", true, (r) => r.path.endsWith("/sinks"), ["GCP-LOG-03"]),
+  surface("logBuckets", "/locations/-/buckets", true, (r) => r.host === "logging.googleapis.com" && r.path.endsWith("/buckets"), ["GCP-LOG-04"]),
+  surface("loggingSettings", "/settings", true, (r) => r.path.endsWith("/settings"), []),
+  surface("sccSources", "/sources", false, (r) => r.path.endsWith("/sources"), ["GCP-LOG-05"]),
+  surface("sccFindings", "/sources/-/findings", false, (r) => r.path.endsWith("/findings"), ["GCP-LOG-05"]),
+  ...Object.entries(ORG_POLICY_DEPENDENTS).map(([constraint, dependents]) => ({
+    ...surface("effectiveOrgPolicy", ":getEffectiveOrgPolicy", false, (r) => r.path.endsWith(":getEffectiveOrgPolicy") && r.body.constraint === constraint, dependents, policySurfaceId(constraint)),
+    name: `${GCP_INVENTORIES.effectiveOrgPolicy.dataset} ${constraint}`,
+  })),
+  surface("computeProject", "compute/v1/projects/{project}", true, (r) => r.host === "compute.googleapis.com" && /^\/compute\/v1\/projects\/[^/]+$/.test(r.path), ["GCP-ORG-06"]),
+  surface("instances", "aggregated/instances", true, (r) => r.path.endsWith("/aggregated/instances"), ["GCP-ORG-06", "GCP-ORG-08", "GCP-NET-04"]),
+  surface("binaryAuthorization", "binaryauthorization.googleapis.com/v1/projects/{project}/policy", true, (r) => r.host === "binaryauthorization.googleapis.com", ["GCP-ORG-07"]),
+  surface("buckets", "storage/v1/b", true, (r) => r.host === "storage.googleapis.com", ["GCP-DATA-01", "GCP-DATA-02", "GCP-DATA-04"]),
+  surface("disks", "aggregated/disks", true, (r) => r.path.endsWith("/aggregated/disks"), ["GCP-DATA-04"]),
+  surface("managedZones", "/managedZones", true, (r) => r.host === "dns.googleapis.com", ["GCP-DATA-05"]),
+  surface("apiKeys", "/locations/global/keys", true, (r) => r.host === "apikeys.googleapis.com", ["GCP-DATA-06"]),
+  surface("accessPolicies", "/v1/accessPolicies", false, (r) => r.path === "/v1/accessPolicies", ["GCP-DATA-07"]),
+  surface("servicePerimeters", "/servicePerimeters", false, (r) => r.path.endsWith("/servicePerimeters"), ["GCP-DATA-07"]),
+  surface("firewalls", "global/firewalls", true, (r) => r.path.endsWith("/global/firewalls"), ["GCP-NET-01"]),
+  surface("subnetworks", "aggregated/subnetworks", true, (r) => r.path.endsWith("/aggregated/subnetworks"), ["GCP-NET-02", "GCP-NET-03", "GCP-NET-04"]),
+  surface("routers", "aggregated/routers", true, (r) => r.path.endsWith("/aggregated/routers"), ["GCP-NET-04"]),
+  surface("sslPolicies", "aggregated/sslPolicies", true, (r) => r.path.endsWith("/aggregated/sslPolicies"), ["GCP-NET-05"]),
+  surface("targetHttpsProxies", "aggregated/targetHttpsProxies", true, (r) => r.path.endsWith("/aggregated/targetHttpsProxies"), ["GCP-NET-05"]),
+  surface("backendServices", "aggregated/backendServices", true, (r) => r.path.endsWith("/aggregated/backendServices"), ["GCP-NET-06"]),
+];
+const PER_PROJECT_SURFACE_IDS = new Set(INVENTORY_SURFACES.filter((row) => row.perProject).map((row) => row.id));
+
+/** The one evidence field that grows, rather than nulls, when a read fails: the list of unreadable inventories itself. */
+const ENGINE_EVIDENCE = new Set(["unreadable_inventories"]);
+
+/**
+ * Collection-status fields: each claims that a collection ran (a completeness flag, a denied count, or the
+ * unreachable-scope list). A non-null value may only describe calls the request recorder saw answered.
+ */
+const STATUS_FIELDS = new Set(["truncated", "projects_truncated", "sources_truncated", "findings_truncated", "denied_projects", "unreachable_scopes"]);
+
+/**
+ * Which sweep surfaces each evidence field is derived from. A field derived from a surface
+ * that is unreadable must render null; a field listed with no source is a constant or a flag.
+ * An evidence field missing from this map fails the sweep until it is classified.
+ */
+const KEY_SOURCES = ["serviceAccounts", "serviceAccountKeys"];
+const PERIMETER_SOURCES = ["accessPolicies", "servicePerimeters"];
+
+/**
+ * The engine fields of a finding scored from one primary per-project scan plus dependent scans: seen counts the
+ * primary list, truncated and unreachable_scopes describe every list read (and the project inventory they hang
+ * off), denied_projects describes the project scan as a whole.
+ */
+function scanEngine(primary, ...dependent) {
+  const lists = ["projects", primary, ...dependent];
+  return { seen: [primary], truncated: lists, denied_projects: ["projects"], unreachable_scopes: lists };
+}
+
+/** The engine fields of a finding scored from organization-scoped lists only; no per-project scan status is rendered. */
+function orgEngine(...lists) {
+  return { seen: lists, truncated: ["projects", ...lists] };
+}
+
+const EVIDENCE_SOURCES = {
+  "GCP-IAM-01": { ...orgEngine("iamPolicies"), bindings: ["iamPolicies"], policies_scanned: ["iamPolicies"] },
+  "GCP-IAM-02": {
+    ...scanEngine("serviceAccounts"),
+    seen: KEY_SOURCES,
+    truncated: ["projects", ...KEY_SOURCES],
+    unreachable_scopes: ["projects", ...KEY_SOURCES],
+    stale_keys: KEY_SOURCES,
+    undated_keys: KEY_SOURCES,
+    service_accounts: ["serviceAccounts"],
+    sampled_projects: ["projects"],
+    project_error: [],
+  },
+  "GCP-IAM-03": {
+    ...scanEngine("serviceAccounts"),
+    seen: KEY_SOURCES,
+    truncated: ["projects", ...KEY_SOURCES],
+    unreachable_scopes: ["projects", ...KEY_SOURCES],
+    user_managed_keys: KEY_SOURCES,
+    service_accounts: ["serviceAccounts"],
+  },
+  "GCP-IAM-04": { ...orgEngine("iamPolicies"), cross_project_bindings: ["iamPolicies"] },
+  "GCP-IAM-05": { ...orgEngine("iamPolicies"), privileged_default_service_accounts: ["iamPolicies"] },
+  "GCP-LOG-01": { ...scanEngine("adminActivity"), projects_without_admin_activity: ["adminActivity"], projects_read: ["adminActivity"] },
+  "GCP-LOG-02": { ...scanEngine("dataAccess"), projects_without_data_access: ["dataAccess"], projects_read: ["dataAccess"] },
+  "GCP-LOG-03": { ...scanEngine("sinks"), projects_without_sinks: ["sinks"], disabled_sinks: ["sinks"], projects_read: ["sinks"] },
+  "GCP-LOG-04": { ...scanEngine("logBuckets"), short_retention_buckets: ["logBuckets"], unknown_retention_buckets: ["logBuckets"], buckets_read: ["logBuckets"] },
+  "GCP-LOG-05": { scc_sources: ["sccSources"], sources_truncated: ["sccSources"], scc_findings: ["sccFindings"], findings_truncated: ["sccFindings"] },
+  "GCP-ORG-01": { sampled_projects: ["projects"], projects_truncated: ["projects"], target_project: [] },
+  "GCP-ORG-02": { policy: [policySurfaceId("constraints/iam.allowedPolicyMemberDomains")], partial: [] },
+  "GCP-ORG-03": { policy: [policySurfaceId("constraints/iam.disableServiceAccountKeyCreation")], partial: [] },
+  "GCP-ORG-04": { policy: [policySurfaceId("constraints/iam.disableServiceAccountKeyUpload")], partial: [] },
+  "GCP-ORG-05": { serial_port_policy: [policySurfaceId("constraints/compute.disableSerialPortAccess")], shielded_vm_policy: [policySurfaceId("constraints/compute.requireShieldedVm")], partial: [] },
+  "GCP-ORG-06": {
+    ...scanEngine("computeProject", "instances"),
+    policy: [policySurfaceId("constraints/compute.requireOsLogin")],
+    policy_enforced: [policySurfaceId("constraints/compute.requireOsLogin")],
+    projects_without_os_login: ["computeProject"],
+    instance_overrides: ["instances"],
+    projects_read: ["computeProject"],
+    instances_read: ["instances"],
+  },
+  "GCP-ORG-07": { ...scanEngine("binaryAuthorization"), permissive_rules: ["binaryAuthorization"], dry_run_rules: ["binaryAuthorization"], projects_read: ["binaryAuthorization"] },
+  "GCP-ORG-08": { ...scanEngine("instances"), shielded_violations: ["instances"], shielded_unknown: ["instances"], serial_port_enabled: ["instances"], instances_read: ["instances"] },
+  "GCP-DATA-01": { ...scanEngine("buckets"), non_uniform_buckets: ["buckets"], buckets_read: ["buckets"] },
+  "GCP-DATA-02": {
+    ...scanEngine("buckets"),
+    seen: ["buckets", "publicBindings"],
+    truncated: ["projects", "buckets", "publicBindings"],
+    public_bindings: ["publicBindings"],
+    query: [],
+    policies_matched: ["publicBindings"],
+    buckets_read: ["buckets"],
+  },
+  "GCP-DATA-03": { ...orgEngine("cryptoKeys"), keys_without_rotation: ["cryptoKeys"], overdue_rotation: ["cryptoKeys"], keys_read: ["cryptoKeys"] },
+  "GCP-DATA-04": { ...scanEngine("buckets", "disks"), seen: ["buckets", "disks"], buckets_without_cmek: ["buckets"], disks_without_cmek: ["disks"], buckets_read: ["buckets"], disks_read: ["disks"] },
+  "GCP-DATA-05": { ...scanEngine("managedZones"), zones_without_dnssec: ["managedZones"], public_zones: ["managedZones"], private_zones: ["managedZones"] },
+  "GCP-DATA-06": { ...scanEngine("apiKeys"), unrestricted_keys: ["apiKeys"], keys_read: ["apiKeys"] },
+  "GCP-DATA-07": { ...orgEngine(...PERIMETER_SOURCES), enforced_perimeters: PERIMETER_SOURCES, dry_run_only_perimeters: PERIMETER_SOURCES, access_policies: ["accessPolicies"] },
+  "GCP-NET-01": { ...scanEngine("firewalls"), open_admin_rules: ["firewalls"], firewalls_read: ["firewalls"], admin_ports: [] },
+  "GCP-NET-02": { ...scanEngine("subnetworks"), subnets_without_flow_logs: ["subnetworks"], subnets_read: ["subnetworks"] },
+  "GCP-NET-03": { ...scanEngine("subnetworks"), subnets_without_private_google_access: ["subnetworks"], subnets_read: ["subnetworks"] },
+  "GCP-NET-04": {
+    ...scanEngine("subnetworks", "routers", "instances"),
+    seen: ["subnetworks", "instances"],
+    subnets_without_nat: ["subnetworks", "routers"],
+    subnets_with_unknown_nat: ["subnetworks"],
+    instances_with_external_ip: ["instances"],
+    subnets_read: ["subnetworks"],
+    routers_read: ["routers"],
+    instances_read: ["instances"],
+  },
+  "GCP-NET-05": {
+    ...scanEngine("targetHttpsProxies", "sslPolicies"),
+    weak_proxies: ["targetHttpsProxies", "sslPolicies"],
+    unresolved_proxies: ["targetHttpsProxies"],
+    proxies_read: ["targetHttpsProxies"],
+    ssl_policies_read: ["sslPolicies"],
+  },
+  "GCP-NET-06": { ...scanEngine("backendServices"), backends_without_security_policy: ["backendServices"], external_backends_read: ["backendServices"] },
+};
+
+/** The same classification for every assessment-level summary counter. */
+const SUMMARY_SOURCES = {
+  identity: {
+    sampled_projects: ["projects"],
+    projects_truncated: ["projects"],
+    iam_policies: ["iamPolicies"],
+    service_accounts: ["serviceAccounts"],
+    privileged_bindings: ["iamPolicies"],
+    stale_service_account_keys: KEY_SOURCES,
+    undated_service_account_keys: KEY_SOURCES,
+    user_managed_service_account_keys: KEY_SOURCES,
+    cross_project_service_accounts: ["iamPolicies"],
+    privileged_default_service_accounts: ["iamPolicies"],
+    collection_errors: [],
+  },
+  "logging-detection": {
+    sampled_projects: ["projects"],
+    projects_truncated: ["projects"],
+    projects_with_admin_activity: ["adminActivity"],
+    projects_with_data_access: ["dataAccess"],
+    projects_with_log_sinks: ["sinks"],
+    disabled_log_sinks: ["sinks"],
+    configurable_log_buckets: ["logBuckets"],
+    short_retention_buckets: ["logBuckets"],
+    scc_sources: ["sccSources"],
+    scc_findings: ["sccFindings"],
+    collection_errors: [],
+  },
+  "org-guardrails": {
+    sampled_projects: ["projects"],
+    projects_truncated: ["projects"],
+    organization_visible: ["organization"],
+    target_project: [],
+    domain_restricted_sharing: [policySurfaceId("constraints/iam.allowedPolicyMemberDomains")],
+    service_account_key_creation_disabled: [policySurfaceId("constraints/iam.disableServiceAccountKeyCreation")],
+    service_account_key_upload_disabled: [policySurfaceId("constraints/iam.disableServiceAccountKeyUpload")],
+    serial_port_disabled: [policySurfaceId("constraints/compute.disableSerialPortAccess")],
+    shielded_vm_required: [policySurfaceId("constraints/compute.requireShieldedVm")],
+    os_login_required_by_policy: [policySurfaceId("constraints/compute.requireOsLogin")],
+    instances: ["instances"],
+    binary_authorization_projects: ["binaryAuthorization"],
+    binary_authorization_api_disabled: ["binaryAuthorization"],
+    collection_errors: [],
+  },
+  "data-protection": {
+    sampled_projects: ["projects"],
+    projects_truncated: ["projects"],
+    buckets: ["buckets"],
+    non_uniform_buckets: ["buckets"],
+    public_bindings: ["publicBindings"],
+    crypto_keys: ["cryptoKeys"],
+    keys_without_rotation: ["cryptoKeys"],
+    disks: ["disks"],
+    resources_without_cmek: ["buckets", "disks"],
+    public_dns_zones: ["managedZones"],
+    zones_without_dnssec: ["managedZones"],
+    api_keys: ["apiKeys"],
+    unrestricted_api_keys: ["apiKeys"],
+    enforced_perimeters: PERIMETER_SOURCES,
+    collection_errors: [],
+  },
+  "network-security": {
+    sampled_projects: ["projects"],
+    projects_truncated: ["projects"],
+    firewalls: ["firewalls"],
+    open_admin_rules: ["firewalls"],
+    subnetworks: ["subnetworks"],
+    subnets_without_flow_logs: ["subnetworks"],
+    subnets_without_private_google_access: ["subnetworks"],
+    subnets_without_nat: ["subnetworks", "routers"],
+    subnets_with_unknown_nat: ["subnetworks"],
+    instances_with_external_ip: ["instances"],
+    https_proxies: ["targetHttpsProxies"],
+    weak_ssl_proxies: ["targetHttpsProxies", "sslPolicies"],
+    external_backends: ["backendServices"],
+    backends_without_cloud_armor: ["backendServices"],
+    collection_errors: [],
+  },
+};
+
+const POLICY_SNAPSHOT_SOURCES = Object.fromEntries(
+  Object.keys(ORG_POLICY_DEPENDENTS).map((constraint) => [constraint.replace(/^constraints\/[a-z]+\./, ""), [policySurfaceId(constraint)]]),
+);
+
+/**
+ * Which sweep surfaces each core_data snapshot dataset is read from. A dataset whose surface was denied or never
+ * requested must be written as a {status, dataset, endpoint, scope, error, data: null} marker, never as [] or null.
+ */
+const SNAPSHOT_SOURCES = {
+  identity: { projects: ["projects"], iam_policies: ["iamPolicies"], service_accounts: ["serviceAccounts"], user_managed_keys: KEY_SOURCES },
+  "logging-detection": { projects: ["projects"], logging_settings: ["loggingSettings"], sinks: ["sinks"], log_buckets: ["logBuckets"], scc_sources: ["sccSources"] },
+  "org-guardrails": {
+    organization: ["organization"],
+    projects: ["projects"],
+    effective_policies: POLICY_SNAPSHOT_SOURCES,
+    compute_projects: ["computeProject"],
+    instances: ["instances"],
+    binary_authorization: ["binaryAuthorization"],
+  },
+  "data-protection": {
+    projects: ["projects"],
+    buckets: ["buckets"],
+    public_bindings: ["publicBindings"],
+    crypto_keys: ["cryptoKeys"],
+    disks: ["disks"],
+    managed_zones: ["managedZones"],
+    api_keys: ["apiKeys"],
+    service_perimeters: PERIMETER_SOURCES,
+  },
+  "network-security": {
+    projects: ["projects"],
+    firewalls: ["firewalls"],
+    subnetworks: ["subnetworks"],
+    routers: ["routers"],
+    instances: ["instances"],
+    ssl_policies: ["sslPolicies"],
+    target_https_proxies: ["targetHttpsProxies"],
+    backend_services: ["backendServices"],
+  },
+};
+
+/** Surfaces the request recorder never saw in a run: reads blocked upstream (denied project inventory, denied account list, no project). */
+function blockedSurfaces(requests) {
+  const requested = new Set(requests.flatMap((entry) => entry.surfaces));
+  return new Set(INVENTORY_SURFACES.filter((row) => !requested.has(row.id)).map((row) => row.id));
+}
+
+/** Surfaces the recorder saw answered successfully at least once; only these may be described as complete. */
+function answeredSurfaces(requests) {
+  return new Set(requests.filter((entry) => entry.status < 400).flatMap((entry) => entry.surfaces));
+}
+
+/**
+ * A field derives from the unreadable surface when the denied row is among its sources, or when one of its sources
+ * was never requested in the run because the denied read blocked it (a denied project inventory blocks every
+ * per-project read and, without a configured project, every effective org policy read).
+ */
+function derivedFromUnreadable(sources, row, blocked = new Set()) {
+  return sources.includes(row.id) || sources.some((id) => blocked.has(id));
+}
+
+function isStandInShape(value) {
+  return value === 0 || (Array.isArray(value) && value.length === 0);
+}
+
+const MARKER_STATUSES = new Set(["unreadable", "not_collected"]);
+
+function isMarker(value) {
+  return Boolean(value) && typeof value === "object" && !Array.isArray(value) && MARKER_STATUSES.has(value.status) && value.data === null;
+}
+
+function assertMarker(label, value) {
+  assert.ok(isMarker(value), `${label} must be a {status, dataset, endpoint, scope, error, data: null} marker for a dataset that was denied or not collected, never [] or null (got ${JSON.stringify(value)})`);
+  assert.deepEqual(Object.keys(value).sort(), ["data", "dataset", "endpoint", "error", "scope", "status"], `${label} marker shape`);
+  for (const key of ["dataset", "endpoint", "scope", "error"]) {
+    assert.ok(typeof value[key] === "string" && value[key].length > 0, `${label} marker must carry a non-empty ${key}`);
+  }
+}
+
+/**
+ * Asserts the snapshot contract for one core_data snapshot against its baseline: every dataset is classified, every
+ * dataset derived from the unreadable surface is a marker, and every other dataset is byte-identical to the baseline.
+ */
+function assertSnapshotRendering(label, sources, snapshot, baseline, row, blocked) {
+  for (const [field, value] of Object.entries(snapshot)) {
+    if (field === "unreadable_inventories") continue;
+    const fieldSources = sources[field];
+    assert.ok(fieldSources, `${label}: snapshot dataset "${field}" is not classified in SNAPSHOT_SOURCES`);
+    if (!Array.isArray(fieldSources)) {
+      assertSnapshotRendering(`${label}.${field}`, fieldSources, value, baseline[field], row, blocked);
+      continue;
+    }
+    if (derivedFromUnreadable(fieldSources, row, blocked)) {
+      assertMarker(`${label}: "${field}"`, value);
+    } else {
+      assert.deepEqual(value, baseline[field], `${label}: "${field}" does not read ${row.name}, so its snapshot must match the baseline`);
+    }
+  }
+}
+
+/** All snapshot datasets, including the nested effective policies, as [path, value] pairs. */
+function snapshotLeaves(snapshot, sources, prefix = "") {
+  return Object.entries(snapshot)
+    .filter(([field]) => field !== "unreadable_inventories")
+    .flatMap(([field, value]) => (sources[field] && !Array.isArray(sources[field]) ? snapshotLeaves(value, sources[field], `${prefix}${field}.`) : [[`${prefix}${field}`, value]]));
+}
+
+/** Every classified snapshot dataset as [path, sources] pairs, descending into nested groups such as effective_policies. */
+function classifiedSnapshotPaths(sources, prefix = "") {
+  return Object.entries(sources).flatMap(([field, value]) => (Array.isArray(value) ? [[`${prefix}${field}`, value]] : classifiedSnapshotPaths(value, `${prefix}${field}.`)));
+}
+
+const ENDPOINT_SURFACES = new Map();
+for (const row of INVENTORY_SURFACES) {
+  const endpoint = GCP_INVENTORIES[row.key].endpoint;
+  ENDPOINT_SURFACES.set(endpoint, [...(ENDPOINT_SURFACES.get(endpoint) ?? []), row.id]);
+}
+
+function surfacesForInventory(dataset, endpoint) {
+  return INVENTORY_SURFACES.filter((row) => row.name === dataset && GCP_INVENTORIES[row.key].endpoint === endpoint).map((row) => row.id);
+}
+
+function requestsTo(requests, surfaceIds) {
+  return requests.filter((entry) => entry.surfaces.some((id) => surfaceIds.includes(id)));
+}
+
+function escapeRegExp(text) {
+  return text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+/** The HTTP status named at the start of a request error, optionally behind one identifier prefix such as an email. */
+function leadingStatusCode(error) {
+  const code = error.match(/^(?:[^\s():]+: )?([1-5]\d{2}) [A-Za-z]/)?.[1];
+  return code === undefined ? undefined : Number(code);
+}
+
+/**
+ * Every unreadable-inventory entry or snapshot marker must describe a call the recorder saw: an "unreadable" entry
+ * names an endpoint that was requested and answered with the status it quotes, and a "not_collected" entry names an
+ * endpoint that was never requested at all.
+ */
+function assertInventoryEntriesMatchRequests(label, entries, requests) {
+  for (const entry of entries) {
+    const ids = surfacesForInventory(entry.dataset, entry.endpoint);
+    assert.ok(ids.length > 0, `${label}: "${entry.dataset}" via ${entry.endpoint} is not a sweep surface`);
+    const seen = requestsTo(requests, ids);
+    switch (entry.status) {
+      case "unreadable": {
+        assert.ok(seen.some((request) => request.status >= 400), `${label}: "${entry.dataset}" is marked unreadable but no request to ${entry.endpoint} was answered with an error`);
+        const code = leadingStatusCode(entry.error);
+        assert.ok(code !== undefined, `${label}: an unreadable "${entry.dataset}" must quote the HTTP status of its own request (got ${entry.error})`);
+        assert.ok(seen.some((request) => request.status === code), `${label}: "${entry.dataset}" quotes HTTP ${code} but no request to ${entry.endpoint} was answered with it`);
+        break;
+      }
+      case "not_collected":
+        assert.equal(seen.length, 0, `${label}: "${entry.dataset}" is marked not collected but ${seen.length} requests to ${entry.endpoint} were recorded`);
+        assert.ok(!/^(?:[^\s():]+: )?[1-5]\d{2} /.test(entry.error), `${label}: a not-collected "${entry.dataset}" must not attribute an HTTP status to the call it never made (got ${entry.error})`);
+        break;
+      default:
+        assert.fail(`${label}: "${entry.dataset}" carries unknown inventory status ${JSON.stringify(entry.status)}`);
+    }
+  }
+}
+
+function claimsCompletion(value) {
+  return value === false || value === 0 || (Array.isArray(value) && value.length === 0);
+}
+
+/**
+ * A collection-status field may say complete (false, 0, or []) only about scans the recorder saw answered; a
+ * scan that was denied everywhere or never requested renders null beside its unreadable_inventories entry.
+ */
+function assertStatusFieldsMatchRequests(label, sources, actual, requests) {
+  const answered = answeredSurfaces(requests);
+  for (const field of STATUS_FIELDS) {
+    if (!(field in actual) || !claimsCompletion(actual[field])) continue;
+    const fieldSources = sources[field];
+    assert.ok(fieldSources && fieldSources.length > 0, `${label}: status field "${field}" must be classified against the scans it describes`);
+    for (const id of fieldSources) {
+      assert.ok(answered.has(id), `${label}: "${field}" is ${JSON.stringify(actual[field])}, a completeness claim about ${id}, but no request to it was answered in this run`);
+    }
+  }
+}
+
+/**
+ * Every HTTP status a summary attributes to an endpoint ("via <endpoint> (403 Forbidden)") must have been answered
+ * on a request to that endpoint, every "<endpoint> was not called" clause must be true of the recorder, and every
+ * status code quoted anywhere in the summary must be one some request actually returned.
+ */
+function assertSummaryMatchesRequests(label, summary, requests) {
+  const codesSeen = new Set(requests.map((request) => request.status));
+  for (const match of summary.matchAll(/(?<![\w./:-])([1-5]\d{2}) [A-Z][A-Za-z]+/g)) {
+    assert.ok(codesSeen.has(Number(match[1])), `${label}: summary quotes HTTP ${match[1]} but no request was answered with it: ${summary}`);
+  }
+  for (const [endpoint, ids] of ENDPOINT_SURFACES) {
+    const escaped = escapeRegExp(endpoint);
+    for (const match of summary.matchAll(new RegExp(`via ${escaped} \\((?:[^\\s()]+: )?([1-5]\\d{2}) [A-Za-z]`, "g"))) {
+      const code = Number(match[1]);
+      assert.ok(requestsTo(requests, ids).some((request) => request.status === code), `${label}: summary attributes HTTP ${code} to ${endpoint}, which no request to it returned: ${summary}`);
+    }
+    if (new RegExp(`${escaped}(?: and \\S+)* (?:was|were) not called`).test(summary)) {
+      assert.equal(requestsTo(requests, ids).length, 0, `${label}: summary says ${endpoint} was not called, but the recorder saw requests to it: ${summary}`);
+    } else if (summary.includes(endpoint)) {
+      assert.ok(requestsTo(requests, ids).length > 0, `${label}: summary names ${endpoint} as read, but no request to it was recorded: ${summary}`);
+    }
+  }
+}
+
+/** The status contract for one finding or one assessment summary: status fields, attributed codes, and inventory entries all match the recorder. */
+function assertStatusesMatchRequests(label, sources, actual, summary, requests) {
+  assertStatusFieldsMatchRequests(label, sources, actual, requests);
+  assertSummaryMatchesRequests(label, summary, requests);
+  if (Array.isArray(actual.unreadable_inventories)) assertInventoryEntriesMatchRequests(label, actual.unreadable_inventories, requests);
+}
+
+/** Zero-count clauses such as "none of 0 instances" or "All 0 buckets"; HTTP codes such as 403 do not match. */
+function zeroCountPhrases(summary) {
+  return summary.match(/(?<![\w.])0 [A-Za-z][\w-]*/g) ?? [];
+}
+
+/**
+ * Asserts the null-rendering contract for one object (finding evidence or assessment summary) against its baseline:
+ * every field is classified, fields derived from the unreadable surface are null, and no other field flips from a
+ * non-zero baseline to 0 or [] (a numeric stand-in for data that was not read).
+ */
+function assertNullRendering(label, sources, actual, baseline, row, blocked, skip = ENGINE_EVIDENCE) {
+  for (const [field, value] of Object.entries(actual)) {
+    if (skip.has(field)) continue;
+    const fieldSources = sources[field];
+    assert.ok(fieldSources, `${label}: field "${field}" is not classified in the source map; add it with the surfaces it derives from`);
+    if (derivedFromUnreadable(fieldSources, row, blocked)) {
+      assert.equal(value, null, `${label}: "${field}" derives from ${row.name}, which is unreadable, so it must render null (got ${JSON.stringify(value)})`);
+    } else {
+      assert.ok(!(isStandInShape(value) && !isStandInShape(baseline[field])), `${label}: "${field}" flipped from ${JSON.stringify(baseline[field])} to ${JSON.stringify(value)} while ${row.name} was unreadable; that is a stand-in for unread data`);
+    }
+  }
+}
+
+/** A partial view (one of two projects denied) must render partial values, never null and never a zero stand-in. */
+function assertPartialRendering(label, actual, baseline, skip = new Set()) {
+  for (const [field, value] of Object.entries(actual)) {
+    if (skip.has(field)) continue;
+    const baselineValue = baseline[field];
+    if (typeof baselineValue === "number" || Array.isArray(baselineValue)) {
+      assert.ok(value !== null, `${label}: "${field}" is null although one project still answered; a partial view renders the partial value`);
+    }
+    assert.ok(!(isStandInShape(value) && !isStandInShape(baselineValue)), `${label}: "${field}" flipped from ${JSON.stringify(baselineValue)} to ${JSON.stringify(value)} on a partial view`);
+  }
+}
+
+function assertNoNewZeroPhrases(label, summary, baselineSummary) {
+  const known = new Set(zeroCountPhrases(baselineSummary));
+  for (const phrase of zeroCountPhrases(summary)) {
+    assert.ok(known.has(phrase), `${label}: summary counts "${phrase}" for data that was not read: ${summary}`);
+  }
+}
+
+/** Like clientWithUnreadable, but records which sweep predicates each served request matched and the status it was answered with. */
+function sweepClient(requests, match, status = 403, mode = "full", config = sampleConfig()) {
+  return createClient(async (url, init) => {
+    const facts = requestFacts(url, init);
+    const deniedHere = Boolean(match && match(facts) && (mode === "full" || requestProject(url, init) === SECOND_PROJECT));
+    requests.push({ request: `${facts.host}${facts.path}`, surfaces: INVENTORY_SURFACES.filter((row) => row.match(facts)).map((row) => row.id), status: deniedHere ? status : 200 });
+    return deniedHere ? denied(status) : jsonResponse(routeForProject(url, init));
+  }, config);
+}
+
+function statusText(status) {
+  return status === 403 ? `${status} Forbidden` : `${status} Error`;
+}
+
+function assertEveryRequestClassified(requests, label) {
+  const unclassified = requests.filter((entry) => entry.surfaces.length !== 1).map((entry) => `${entry.request} -> [${entry.surfaces.join(", ")}]`);
+  assert.deepEqual(unclassified, [], `${label}: every request the client issues must match exactly one sweep predicate`);
+}
+
+test("per-inventory sweep covers every GCP_INVENTORIES surface and every request the collectors issue", async () => {
+  assert.deepEqual([...new Set(INVENTORY_SURFACES.map((row) => row.key))].sort(), Object.keys(GCP_INVENTORIES).sort(), "every GCP_INVENTORIES key needs a sweep row and every row a key");
+  const policyRows = INVENTORY_SURFACES.filter((row) => row.key === "effectiveOrgPolicy");
+  assert.equal(policyRows.length, Object.keys(ORG_POLICY_DEPENDENTS).length, "one row per effective org policy constraint the tool reads");
+  assert.equal(INVENTORY_SURFACES.length, Object.keys(GCP_INVENTORIES).length + policyRows.length - 1);
+  assert.equal(new Set(INVENTORY_SURFACES.map((row) => row.id)).size, INVENTORY_SURFACES.length, "row ids are unique");
+  for (const row of INVENTORY_SURFACES) {
+    assert.ok(row.name.startsWith(GCP_INVENTORIES[row.key].dataset), `${row.id} names its dataset`);
+    assert.ok(GCP_INVENTORIES[row.key].endpoint.includes(row.endpoint), `${row.id} endpoint fragment "${row.endpoint}" must be part of ${GCP_INVENTORIES[row.key].endpoint}`);
+  }
+  for (const [id, fields] of Object.entries(EVIDENCE_SOURCES)) {
+    assert.ok(ALL_FINDING_IDS.includes(id), `${id} in EVIDENCE_SOURCES is not a finding`);
+    for (const [field, sources] of Object.entries(fields)) {
+      for (const source of sources) assert.ok(INVENTORY_SURFACES.some((row) => row.id === source), `${id}.${field} names unknown surface ${source}`);
+    }
+  }
+  assert.deepEqual(Object.keys(EVIDENCE_SOURCES).sort(), [...ALL_FINDING_IDS].sort(), "every finding classifies its evidence");
+  for (const fields of Object.values(SUMMARY_SOURCES)) {
+    for (const sources of Object.values(fields)) {
+      for (const source of sources) assert.ok(INVENTORY_SURFACES.some((row) => row.id === source), `summary source ${source} is not a sweep surface`);
+    }
+  }
+  for (const [category, fields] of Object.entries(SNAPSHOT_SOURCES)) {
+    for (const [path, sources] of classifiedSnapshotPaths(fields)) {
+      assert.ok(sources.length > 0, `${category} snapshot dataset ${path} must name the surfaces it is read from`);
+      for (const source of sources) assert.ok(INVENTORY_SURFACES.some((row) => row.id === source), `${category} snapshot source ${source} is not a sweep surface`);
+    }
+  }
+  for (const [owner, fields] of [...Object.entries(EVIDENCE_SOURCES), ...Object.entries(SUMMARY_SOURCES)]) {
+    for (const field of STATUS_FIELDS) {
+      if (field in fields) assert.ok(fields[field].length > 0, `${owner}.${field} is a collection-status field and must name the scans it describes`);
+    }
+  }
+
+  const requests = [];
+  const assessments = await runAllAssessments(sweepClient(requests));
+  assertEveryRequestClassified(requests, "compliant baseline");
+  assert.deepEqual([...blockedSurfaces(requests)], [], "every sweep surface must be requested by a compliant two-project run");
+  assert.ok(requests.every((entry) => entry.status === 200));
+  assert.deepEqual(assessments.map((assessment) => assessment.category).sort(), Object.keys(SUMMARY_SOURCES).sort(), "every assessment summary is classified");
+  for (const assessment of assessments) {
+    assert.deepEqual(Object.keys(assessment.summary).sort(), Object.keys(SUMMARY_SOURCES[assessment.category]).sort(), `${assessment.category} summary fields must all be classified`);
+    assert.deepEqual(
+      snapshotLeaves(assessment.snapshot, SNAPSHOT_SOURCES[assessment.category]).map(([path]) => path).sort(),
+      classifiedSnapshotPaths(SNAPSHOT_SOURCES[assessment.category]).map(([path]) => path).sort(),
+      `${assessment.category} snapshot datasets must all be classified`,
+    );
+    assert.ok(Array.isArray(assessment.snapshot.unreadable_inventories) && assessment.snapshot.unreadable_inventories.length === 0, `${assessment.category} snapshot lists no unreadable inventories on the compliant run`);
+    for (const finding of assessment.findings) {
+      assertStatusesMatchRequests(`${finding.id} (compliant baseline)`, EVIDENCE_SOURCES[finding.id], finding.evidence, finding.summary, requests);
+    }
+    assertStatusesMatchRequests(`${assessment.category} summary (compliant baseline)`, SUMMARY_SOURCES[assessment.category], assessment.summary, "", requests);
+  }
+});
+
+/** The compliant two-project run every sweep row is compared against; the org-only variant backs the zero-scope row. */
+async function sweepBaseline(config = sampleConfig()) {
+  const run = await runAllAssessments(sweepClient([], undefined, 403, "full", config));
+  const all = statuses(run);
+  assert.equal(Object.keys(all).length, 31);
+  assert.deepEqual(Object.entries(all).filter(([, status]) => status !== "pass"), [], "two compliant projects must pass every control before the sweep");
+  return {
+    findings: findingsById(run),
+    summaries: Object.fromEntries(run.map((assessment) => [assessment.category, assessment.summary])),
+    snapshots: Object.fromEntries(run.map((assessment) => [assessment.category, assessment.snapshot])),
+  };
+}
+
+/**
+ * Every assertion for one run in which a surface was unreadable everywhere (or, in the zero-scope row, blocked every
+ * per-project and policy read): verdicts, null rendering, status fields, attributed codes, and core_data markers.
+ */
+function assertFullDenialRun(run, requests, row, status, baseline, mode) {
+  const label = `${row.name} unreadable (${status}, ${mode})`;
+  assertEveryRequestClassified(requests, label);
+  const blocked = blockedSurfaces(requests);
+  assert.ok(!blocked.has(row.id), `${label}: the denied surface itself must have been requested`);
+  const findings = findingsById(run);
+  for (const id of ALL_FINDING_IDS) {
+    const finding = findings[id];
+    const findingLabel = `${id} with ${label}`;
+    if (!row.dependents.includes(id)) {
+      assert.deepEqual(finding.evidence, baseline.findings[id].evidence, `${findingLabel}: a finding that does not read the surface must be unchanged`);
+      assert.equal(finding.summary, baseline.findings[id].summary, `${findingLabel}: summary must be unchanged`);
+      continue;
+    }
+    assert.ok(finding.summary.includes(row.name), `${id} must name "${row.name}" when it is unreadable (${status}); got: ${finding.summary}`);
+    assert.ok(finding.summary.includes(row.endpoint), `${id} must name the endpoint "${row.endpoint}" (${status}); got: ${finding.summary}`);
+    assert.ok(
+      finding.evidence.unreadable_inventories.some((entry) => entry.dataset === row.name && entry.endpoint.includes(row.endpoint)),
+      `${id} evidence.unreadable_inventories must carry ${row.name}`,
+    );
+    if (finding.status === "manual" && "seen" in finding.evidence) {
+      assert.equal(finding.evidence.seen, null, `${findingLabel}: a manual finding has no readable primary inventory, so seen must be null`);
+    }
+    assertNullRendering(findingLabel, EVIDENCE_SOURCES[id], finding.evidence, baseline.findings[id].evidence, row, blocked);
+    assertNoNewZeroPhrases(findingLabel, finding.summary, baseline.findings[id].summary);
+    assertStatusesMatchRequests(findingLabel, EVIDENCE_SOURCES[id], finding.evidence, finding.summary, requests);
+  }
+  for (const assessment of run) {
+    const summaryLabel = `${assessment.category} summary with ${label}`;
+    assertNullRendering(summaryLabel, SUMMARY_SOURCES[assessment.category], assessment.summary, baseline.summaries[assessment.category], row, blocked);
+    assertStatusesMatchRequests(summaryLabel, SUMMARY_SOURCES[assessment.category], assessment.summary, "", requests);
+    const snapshotLabel = `${assessment.category} snapshot with ${label}`;
+    assertSnapshotRendering(snapshotLabel, SNAPSHOT_SOURCES[assessment.category], assessment.snapshot, baseline.snapshots[assessment.category], row, blocked);
+    assertInventoryEntriesMatchRequests(snapshotLabel, assessment.snapshot.unreadable_inventories, requests);
+    const markers = snapshotLeaves(assessment.snapshot, SNAPSHOT_SOURCES[assessment.category]).filter(([, value]) => isMarker(value)).map(([, value]) => value);
+    assertInventoryEntriesMatchRequests(`${snapshotLabel} markers`, markers, requests);
+    for (const marker of markers) {
+      assert.ok(
+        assessment.snapshot.unreadable_inventories.some((entry) => entry.dataset === marker.dataset && entry.endpoint === marker.endpoint && entry.status === marker.status),
+        `${snapshotLabel}: marker for ${marker.dataset} must be listed in snapshot.unreadable_inventories`,
+      );
+    }
+  }
+  return blocked;
+}
+
+test("per-inventory sweep: exactly the dependent findings drop below pass when any inventory is unreadable, fully or for one project, and nothing derived from it renders as 0, [], or a complete status", async () => {
+  const baseline = await sweepBaseline();
+
+  const table = [];
+  for (const row of INVENTORY_SURFACES) {
+    const expected = [...row.dependents].sort();
+    for (const status of [403, 401, 500]) {
+      const requests = [];
+      const full = await runAllAssessments(sweepClient(requests, row.match, status, "full"));
+      const fullStatuses = statuses(full);
+      const demoted = Object.entries(fullStatuses).filter(([, value]) => value !== "pass").map(([id]) => id).sort();
+      assert.deepEqual(demoted, expected, `${row.name} unreadable (${status}, fully) must demote exactly ${expected.join(", ") || "nothing"}`);
+      const blocked = assertFullDenialRun(full, requests, row, status, baseline, "fully");
+      if (row.key === "projects") {
+        assert.deepEqual([...blocked].sort(), [...PER_PROJECT_SURFACE_IDS].sort(), "a denied project inventory blocks exactly the per-project reads while a project is configured");
+      }
+      if (status === 403) table.push({ surface: row.name, mode: "fully", demoted: demoted.map((id) => `${id}=${fullStatuses[id]}`) });
+
+      if (!row.perProject) continue;
+      const partialRequests = [];
+      const partial = await runAllAssessments(sweepClient(partialRequests, row.match, status, "project"));
+      assertEveryRequestClassified(partialRequests, `${row.name} unreadable (${status}, ${SECOND_PROJECT} only)`);
+      assert.deepEqual([...blockedSurfaces(partialRequests)], [], `${row.name} unreadable for one project blocks no other read`);
+      const partialStatuses = statuses(partial);
+      const demotedPartial = Object.entries(partialStatuses).filter(([, value]) => value !== "pass").map(([id]) => id).sort();
+      assert.deepEqual(demotedPartial, expected, `${row.name} unreadable (${status}, ${SECOND_PROJECT} only) must demote exactly ${expected.join(", ") || "nothing"}`);
+      const partialFindings = findingsById(partial);
+      for (const id of ALL_FINDING_IDS) {
+        const finding = partialFindings[id];
+        const label = `${id} with ${row.name} unreadable (${status}, ${SECOND_PROJECT} only)`;
+        if (!row.dependents.includes(id)) {
+          assert.deepEqual(finding.evidence, baseline.findings[id].evidence, `${label}: a finding that does not read the surface must be unchanged`);
+          continue;
+        }
+        assert.equal(finding.status, "warn", `${id} must warn, not pass or go manual, when one of two projects denies ${row.name}`);
+        assert.ok(finding.summary.includes(row.name) && finding.summary.includes(row.endpoint), `${id} must name dataset and endpoint; got: ${finding.summary}`);
+        assert.ok(finding.summary.includes(SECOND_PROJECT), `${id} must name the denied project; got: ${finding.summary}`);
+        assertPartialRendering(label, finding.evidence, baseline.findings[id].evidence, ENGINE_EVIDENCE);
+        assertNoNewZeroPhrases(label, finding.summary, baseline.findings[id].summary);
+        assertStatusesMatchRequests(label, EVIDENCE_SOURCES[id], finding.evidence, finding.summary, partialRequests);
+      }
+      for (const assessment of partial) {
+        const label = `${assessment.category} summary with ${row.name} unreadable (${status}, ${SECOND_PROJECT} only)`;
+        assertPartialRendering(label, assessment.summary, baseline.summaries[assessment.category]);
+        assertStatusesMatchRequests(label, SUMMARY_SOURCES[assessment.category], assessment.summary, "", partialRequests);
+        assertInventoryEntriesMatchRequests(`${assessment.category} snapshot with ${row.name} unreadable (${status}, ${SECOND_PROJECT} only)`, assessment.snapshot.unreadable_inventories, partialRequests);
+        for (const [path, value] of snapshotLeaves(assessment.snapshot, SNAPSHOT_SOURCES[assessment.category])) {
+          assert.ok(!isMarker(value), `${assessment.category} snapshot ${path}: one project still answered, so a partial dataset renders its rows, not a marker`);
+        }
+      }
+      if (status === 403) table.push({ surface: row.name, mode: `${SECOND_PROJECT} only`, demoted: demotedPartial.map((id) => `${id}=${partialStatuses[id]}`) });
+    }
+  }
+  assert.equal(table.length, INVENTORY_SURFACES.length + INVENTORY_SURFACES.filter((row) => row.perProject).length);
+});
+
+const PROJECTS_ROW = INVENTORY_SURFACES.find((row) => row.key === "projects");
+const POLICY_SURFACE_IDS = new Set(INVENTORY_SURFACES.filter((row) => row.key === "effectiveOrgPolicy").map((row) => row.id));
+const ORG_ONLY_CONFIG = sampleConfig({ projectId: undefined });
+
+test("per-inventory sweep, zero-scope row: a denied project inventory with no configured project blocks every per-project and policy read, and nothing claims a call that never happened", async () => {
+  const baseline = await sweepBaseline(ORG_ONLY_CONFIG);
+  for (const status of [403, 401, 500]) {
+    const requests = [];
+    const run = await runAllAssessments(sweepClient(requests, PROJECTS_ROW.match, status, "full", ORG_ONLY_CONFIG));
+    const all = statuses(run);
+    assert.deepEqual(Object.entries(all).filter(([, value]) => value === "pass"), [], `nothing may pass when the project inventory is denied (${status})`);
+    const blocked = assertFullDenialRun(run, requests, PROJECTS_ROW, status, baseline, "zero scope");
+    assert.deepEqual([...blocked].sort(), [...PER_PROJECT_SURFACE_IDS, ...POLICY_SURFACE_IDS].sort(), "without a project, the denied inventory blocks every per-project read and every effective org policy read");
+    assert.ok(requests.every((entry) => !entry.surfaces.some((id) => blocked.has(id))), "no request may reach a blocked surface");
+    assert.ok(requests.some((entry) => entry.surfaces.includes("projects") && entry.status === status));
+
+    const findings = findingsById(run);
+    const policyNotCalled = new RegExp(
+      `not collected for the scope \\(${escapeRegExp(GCP_INVENTORIES.effectiveOrgPolicy.endpoint)} was not called\\): no project could be enumerated because project inventory was unreadable via ${escapeRegExp(GCP_INVENTORIES.projects.endpoint)} \\(${statusText(status)}\\), so no project was available to compute the effective policy\\.`,
+    );
+    for (const id of ["GCP-ORG-02", "GCP-ORG-03", "GCP-ORG-04", "GCP-ORG-05"]) {
+      assert.equal(findings[id].status, "manual", `${id} has no project to resolve the effective policy against (${status})`);
+      assert.match(findings[id].summary, policyNotCalled, `${id} must say the policy read was not attempted and attribute the status to the project inventory (${status})`);
+      assert.doesNotMatch(findings[id].summary, /getEffectiveOrgPolicy \([1-5]\d{2}/, `${id} must not attribute an HTTP status to a call that never happened`);
+      for (const entry of findings[id].evidence.unreadable_inventories.filter((item) => item.endpoint === GCP_INVENTORIES.effectiveOrgPolicy.endpoint)) {
+        assert.equal(entry.status, "not_collected");
+      }
+    }
+    assert.equal(findings["GCP-ORG-06"].status, "manual");
+    assert.match(findings["GCP-ORG-06"].summary, new RegExp(`^Manual: project inventory unreadable for the configured scope via ${escapeRegExp(GCP_INVENTORIES.projects.endpoint)} \\(${statusText(status)}`));
+    assert.equal(findings["GCP-ORG-06"].evidence.policy, null);
+    assert.equal(findings["GCP-ORG-01"].evidence.target_project, null);
+    for (const assessment of run) {
+      assert.equal(assessment.summary.sampled_projects, null);
+      assert.equal(assessment.summary.projects_truncated, null);
+    }
+    const guardrails = run.find((assessment) => assessment.category === "org-guardrails");
+    assert.equal(guardrails.summary.organization_visible, true, "the organization was read and stays a real value");
+    assert.equal(guardrails.summary.target_project, null);
+    for (const value of Object.values(guardrails.snapshot.effective_policies)) {
+      assert.equal(value.status, "not_collected");
+    }
+    for (const assessment of run) {
+      for (const marker of snapshotLeaves(assessment.snapshot, SNAPSHOT_SOURCES[assessment.category]).filter(([, value]) => isMarker(value)).map(([, value]) => value)) {
+        if (marker.dataset === GCP_INVENTORIES.projects.dataset) {
+          assert.equal(marker.status, "unreadable");
+          assert.equal(leadingStatusCode(marker.error), status);
+        } else {
+          assert.equal(marker.status, "not_collected", `${marker.dataset} was never requested, so its marker is not collected rather than unreadable`);
+          assert.ok(marker.error.includes(GCP_INVENTORIES.projects.endpoint), `${marker.dataset} marker must name the upstream project inventory call`);
+        }
+      }
+    }
+  }
+});
+
+/** Every array in a JSON document as path -> length, so a [] stand-in can be compared against the compliant bundle. */
+function arrayLengthsByPath(value, path = "", into = new Map()) {
+  if (Array.isArray(value)) {
+    into.set(path, value.length);
+    value.forEach((item, index) => arrayLengthsByPath(item, `${path}[${index}]`, into));
+  } else if (value && typeof value === "object") {
+    for (const [key, item] of Object.entries(value)) arrayLengthsByPath(item, path ? `${path}.${key}` : key, into);
+  }
+  return into;
+}
+
+function markersIn(value, into = []) {
+  if (isMarker(value)) into.push(value);
+  else if (Array.isArray(value)) value.forEach((item) => markersIn(item, into));
+  else if (value && typeof value === "object") Object.values(value).forEach((item) => markersIn(item, into));
+  return into;
+}
+
+test("exportGcpAuditBundle core_data writes a status marker, never [], for every dataset denied or not collected in the zero-scope row", async () => {
+  const base = createTempBase("grclanker-gcp-zero-scope-");
+  const compliant = await exportGcpAuditBundle(sweepClient([], undefined, 403, "full", ORG_ONLY_CONFIG), ORG_ONLY_CONFIG, base, { max_projects: 5 });
+  assert.equal(compliant.errorCount, 0);
+  const requests = [];
+  const denied = await exportGcpAuditBundle(sweepClient(requests, PROJECTS_ROW.match, 403, "full", ORG_ONLY_CONFIG), ORG_ONLY_CONFIG, base, { max_projects: 5 });
+  assert.ok(denied.errorCount > 0);
+  assertEveryRequestClassified(requests, "zero-scope bundle");
+  const blocked = blockedSurfaces(requests);
+  assert.deepEqual([...blocked].sort(), [...PER_PROJECT_SURFACE_IDS, ...POLICY_SURFACE_IDS].sort());
+  assert.match(readFileSync(join(denied.outputDir, "_errors.log"), "utf8"), /searchAllResources/);
+
+  const coreFiles = readdirSync(join(compliant.outputDir, "core_data")).filter((name) => name.endsWith(".json") && name !== "access.json").sort();
+  assert.deepEqual(coreFiles.map((name) => name.replace(/\.json$/, "")).sort(), Object.keys(SNAPSHOT_SOURCES).sort());
+  let markerCount = 0;
+  for (const name of coreFiles) {
+    const category = name.replace(/\.json$/, "");
+    const baselineLengths = arrayLengthsByPath(JSON.parse(readFileSync(join(compliant.outputDir, "core_data", name), "utf8")));
+    const snapshot = JSON.parse(readFileSync(join(denied.outputDir, "core_data", name), "utf8"));
+    for (const [path, length] of arrayLengthsByPath(snapshot)) {
+      assert.ok(
+        length > 0 || (baselineLengths.get(path) ?? 0) === 0,
+        `core_data/${name} ${path} renders [] although the compliant bundle lists ${baselineLengths.get(path)} rows; a denied or never-collected dataset needs a status marker`,
+      );
+    }
+    const markers = markersIn(snapshot);
+    markerCount += markers.length;
+    for (const marker of markers) assertMarker(`core_data/${name} ${marker.dataset}`, marker);
+    assertInventoryEntriesMatchRequests(`core_data/${name}`, [...markers, ...snapshot.unreadable_inventories], requests);
+    for (const [path, value] of snapshotLeaves(snapshot, SNAPSHOT_SOURCES[category])) {
+      const sources = path.split(".").reduce((node, key) => node[key], SNAPSHOT_SOURCES[category]);
+      if (derivedFromUnreadable(sources, PROJECTS_ROW, blocked)) assertMarker(`core_data/${name} ${path}`, value);
+      else assert.ok(!isMarker(value) && value !== null, `core_data/${name} ${path} was read and must carry its rows`);
+    }
+  }
+  const expectedMarkers = Object.values(SNAPSHOT_SOURCES).flatMap((fields) => classifiedSnapshotPaths(fields)).filter(([, sources]) => derivedFromUnreadable(sources, PROJECTS_ROW, blocked)).length;
+  assert.equal(markerCount, expectedMarkers, "one marker per dataset whose read was denied or blocked, and no other");
+  assert.ok(markerCount >= 30, `the zero-scope row blocks at least 30 datasets (got ${markerCount})`);
+
+  const summaries = JSON.parse(readFileSync(join(denied.outputDir, "analysis", "category_summaries.json"), "utf8"));
+  assert.equal(summaries.length, 5);
+  for (const entry of summaries) {
+    assert.equal(entry.summary.sampled_projects, null, `${entry.category} summary`);
+    assert.equal(entry.summary.projects_truncated, null, `${entry.category} summary`);
+    assertStatusesMatchRequests(`analysis/category_summaries.json ${entry.category}`, SUMMARY_SOURCES[entry.category], entry.summary, "", requests);
+  }
+  const findings = JSON.parse(readFileSync(join(denied.outputDir, "analysis", "findings.json"), "utf8"));
+  assert.equal(findings.length, 31);
+  for (const finding of findings) {
+    assert.notEqual(finding.status, "pass", `${finding.id} must not pass in the zero-scope row`);
+    if (finding.status === "manual" && "seen" in finding.evidence) assert.equal(finding.evidence.seen, null, `${finding.id} seen`);
+    assertStatusesMatchRequests(`analysis/findings.json ${finding.id}`, EVIDENCE_SOURCES[finding.id], finding.evidence, finding.summary, requests);
+  }
+  for (const pathname of walkFiles(denied.outputDir)) {
+    assert.doesNotMatch(readFileSync(pathname, "utf8"), /\b(complete|healthy)\b/i, `${relative(denied.outputDir, pathname)} must not describe a denied scope as complete`);
+  }
+});
+
+test("GCP-ORG-06 demotes and names constraints/compute.requireOsLogin when the effective policy is unreadable (rule 1 corollary)", async () => {
+  const client = clientWithUnreadable((r) => r.path.endsWith(":getEffectiveOrgPolicy") && r.body.constraint === "constraints/compute.requireOsLogin", 403, "full", COMPLIANT);
+  const result = await assessGcpOrgGuardrails(client);
+  const finding = result.findings.find((item) => item.id === "GCP-ORG-06");
+  assert.equal(finding.status, "warn");
+  assert.match(finding.summary, /enable-oslogin=TRUE is set in commonInstanceMetadata for all 1 sampled projects/);
+  assert.match(finding.summary, /Partial view: effective org policy constraints\/compute\.requireOsLogin unreadable for the sampled project prod-audit via cloudresourcemanager\.googleapis\.com\/v1\/projects\/\{project\}:getEffectiveOrgPolicy \(403 Forbidden\)/);
+  assert.equal(finding.evidence.policy, null);
+  assert.equal(finding.evidence.policy_enforced, null);
+  assert.deepEqual(finding.evidence.projects_without_os_login, []);
+  assert.equal(finding.evidence.unreadable_inventories.length, 1);
+  assert.equal(finding.evidence.unreadable_inventories[0].dataset, "effective org policy constraints/compute.requireOsLogin");
+  assert.match(finding.evidence.unreadable_inventories[0].error, /403 Forbidden/);
+  assert.equal(result.summary.os_login_required_by_policy, null);
+  assert.equal(statuses([result])["GCP-ORG-05"], "pass", "other constraints stay readable and pass");
+});
+
+test("GCP-ORG-06 demotes when the instance inventory is unreadable and renders instance overrides as null", async () => {
+  for (const enforced of [true, false]) {
+    const data = { ...COMPLIANT, booleanPolicy: { constraint: "constraints/x", booleanPolicy: { enforced } } };
+    const client = clientWithUnreadable((r) => r.path.endsWith("/aggregated/instances"), 403, "full", data);
+    const result = await assessGcpOrgGuardrails(client);
+    const finding = result.findings.find((item) => item.id === "GCP-ORG-06");
+    assert.equal(finding.status, "warn", `policy enforced=${enforced}`);
+    assert.match(finding.summary, /Partial view: Compute Engine instances unreadable for 1 of 1 projects \(prod-audit\) via compute\.googleapis\.com\/compute\/v1\/projects\/\{project\}\/aggregated\/instances \(403 Forbidden\)/);
+    assert.equal(finding.evidence.instance_overrides, null);
+    assert.equal(finding.evidence.instances_read, null);
+    assert.equal(finding.evidence.policy_enforced, enforced);
+    assert.equal(result.summary.instances, null);
+    const shielded = result.findings.find((item) => item.id === "GCP-ORG-08");
+    assert.equal(shielded.status, "manual");
+    assert.match(shielded.summary, /every sampled project denied the read of Compute Engine instances \(compute\.googleapis\.com\/compute\/v1\/projects\/\{project\}\/aggregated\/instances\)/);
+    assert.equal(shielded.evidence.seen, null);
+  }
+});
+
+test("GCP-ORG-02 through ORG-06 demote and name the project inventory when it is unreadable while a project ID is configured", async () => {
+  const client = clientWithUnreadable((r) => r.path.endsWith(":searchAllResources"), 403, "full", COMPLIANT);
+  const result = await assessGcpOrgGuardrails(client);
+  const byId = findingsById([result]);
+  for (const id of ["GCP-ORG-02", "GCP-ORG-03", "GCP-ORG-04", "GCP-ORG-05"]) {
+    assert.equal(byId[id].status, "warn", `${id} must not pass when the project list could not be read`);
+    assert.match(byId[id].summary, /Partial view: project inventory unreadable for the configured scope via cloudasset\.googleapis\.com\/v1\/\{scope\}:searchAllResources \(403 Forbidden\), so the effective policy was resolved only for the configured project prod-audit/);
+    assert.equal(byId[id].evidence.partial, true);
+    assert.equal(byId[id].evidence.unreadable_inventories[0].dataset, "project inventory");
+  }
+  assert.equal(byId["GCP-ORG-06"].status, "manual");
+  assert.match(byId["GCP-ORG-06"].summary, /Manual: project inventory unreadable for the configured scope via cloudasset\.googleapis\.com\/v1\/\{scope\}:searchAllResources \(403 Forbidden/);
+  assert.equal(byId["GCP-ORG-06"].evidence.seen, null);
+  assert.equal(byId["GCP-ORG-06"].evidence.instance_overrides, null);
+  assert.equal(byId["GCP-ORG-06"].evidence.projects_without_os_login, null);
+  assert.equal(byId["GCP-ORG-01"].status, "manual");
+  assert.match(byId["GCP-ORG-01"].summary, /project inventory unreadable for the configured scope via cloudasset\.googleapis\.com\/v1\/\{scope\}:searchAllResources/);
+  assert.equal(byId["GCP-ORG-01"].evidence.sampled_projects, null);
+
+  assert.equal(Object.values(statuses([result])).filter((status) => status === "pass").length, 0);
+
+  const orgOnlyRequests = [];
+  const orgOnlyClient = createClient(async (url, init) => {
+    orgOnlyRequests.push(url);
+    return requestFacts(url, init).path.endsWith(":searchAllResources") ? denied(403) : jsonResponse(routeCompliant(url, init));
+  }, sampleConfig({ projectId: undefined }));
+  const withoutProjectRun = await assessGcpOrgGuardrails(orgOnlyClient);
+  const withoutProject = findingsById([withoutProjectRun]);
+  assert.ok(!orgOnlyRequests.some((url) => url.includes(":getEffectiveOrgPolicy")), "no effective policy read may be attempted without a project");
+  for (const id of ["GCP-ORG-02", "GCP-ORG-03", "GCP-ORG-04", "GCP-ORG-05", "GCP-ORG-06"]) {
+    assert.equal(withoutProject[id].status, "manual", `${id} has no project to resolve the effective policy against`);
+    assert.match(withoutProject[id].summary, /:searchAllResources \(403 Forbidden/, `${id} must name the failed project inventory and its status`);
+  }
+  for (const id of ["GCP-ORG-02", "GCP-ORG-03", "GCP-ORG-04", "GCP-ORG-05"]) {
+    // Round 6: the policy read was never attempted, so no status is attributed to :getEffectiveOrgPolicy.
+    assert.match(withoutProject[id].summary, /^Manual: effective org policy constraints\/[\w.]+( and effective org policy constraints\/[\w.]+)? not collected for the scope \(cloudresourcemanager\.googleapis\.com\/v1\/projects\/\{project\}:getEffectiveOrgPolicy was not called\): no project could be enumerated because project inventory was unreadable via cloudasset\.googleapis\.com\/v1\/\{scope\}:searchAllResources \(403 Forbidden\), so no project was available to compute the effective policy\. Collect manually:/);
+    assert.doesNotMatch(withoutProject[id].summary, /getEffectiveOrgPolicy \(\d{3}/);
+    const policyField = "policy" in withoutProject[id].evidence ? "policy" : "serial_port_policy";
+    assert.equal(withoutProject[id].evidence[policyField], null, `${id} ${policyField} must render null when the read was not attempted`);
+    assert.ok(withoutProject[id].evidence.unreadable_inventories.some((entry) => entry.status === "not_collected" && entry.endpoint.endsWith(":getEffectiveOrgPolicy")));
+  }
+  assert.equal(withoutProjectRun.summary.target_project, null);
+  assert.equal(withoutProjectRun.summary.projects_truncated, null);
+  assert.equal(withoutProjectRun.snapshot.effective_policies.requireOsLogin.status, "not_collected");
+  assert.equal(withoutProjectRun.snapshot.effective_policies.requireOsLogin.data, null);
+});
+
+test("GCP-LOG-05 demotes when the findings list is unreadable or truncated and never fabricates a zero", async () => {
+  const unreadable = await assessGcpLoggingDetection(clientWithUnreadable((r) => r.path.endsWith("/findings"), 403, "full", COMPLIANT));
+  const finding = unreadable.findings.find((item) => item.id === "GCP-LOG-05");
+  assert.equal(finding.status, "warn");
+  assert.match(finding.summary, /returned 1 sources and an unreadable findings list/);
+  assert.match(finding.summary, /Partial view: Security Command Center findings unreadable for the organization scope via securitycenter\.googleapis\.com\/v1\/organizations\/\{organization\}\/sources\/-\/findings \(403 Forbidden\)\. A partial view cannot pass\./);
+  assert.equal(finding.evidence.scc_findings, null);
+  assert.equal(finding.evidence.unreadable_inventories[0].dataset, "Security Command Center findings");
+  assert.match(finding.evidence.unreadable_inventories[0].error, /403 Forbidden/);
+  assert.equal(unreadable.summary.scc_findings, null);
+  assert.equal(unreadable.summary.scc_sources, 1);
+
+  const truncated = await assessGcpLoggingDetection(createClient(async (url, init) => {
+    const facts = requestFacts(url, init);
+    if (facts.path.endsWith("/findings")) return jsonResponse({ listFindingsResults: [{ finding: { name: "f" } }], nextPageToken: "stuck" });
+    return jsonResponse(routeCompliant(url, init));
+  }));
+  const truncatedFinding = truncated.findings.find((item) => item.id === "GCP-LOG-05");
+  assert.equal(truncatedFinding.status, "warn");
+  assert.match(truncatedFinding.summary, /returned 1 sources and 2\+ findings/, "a stuck cursor exits after two pages and reports the count as a floor");
+  assert.match(truncatedFinding.summary, /Partial view: the findings list was truncated/);
+  assert.equal(truncatedFinding.evidence.findings_truncated, true);
+
+  const sourcesUnreadable = await assessGcpLoggingDetection(clientWithUnreadable((r) => r.path.endsWith("/sources"), 403, "full", COMPLIANT));
+  const manual = sourcesUnreadable.findings.find((item) => item.id === "GCP-LOG-05");
+  assert.equal(manual.status, "manual");
+  assert.match(manual.summary, /Security Command Center sources were not readable via securitycenter\.googleapis\.com\/v1\/organizations\/\{organization\}\/sources \(403 Forbidden/);
+  assert.equal(manual.evidence.scc_sources, null);
+  assert.equal(sourcesUnreadable.summary.scc_sources, null);
+});
+
+test("GCP-ORG-06 fails on existing projects and instances without OS Login even when constraints/compute.requireOsLogin is enforced (rule 6)", async () => {
+  const run = async (computeProject, instances = COMPLIANT.instances) => {
+    const data = { ...COMPLIANT, computeProject, instances };
+    const result = await assessGcpOrgGuardrails(createClient(async (url, init) => jsonResponse(routeCompliant(url, init, data))));
+    return result.findings.find((item) => item.id === "GCP-ORG-06");
+  };
+
+  const disabled = await run({ name: "prod-audit", commonInstanceMetadata: { items: [{ key: "enable-oslogin", value: "FALSE" }] } });
+  assert.equal(disabled.status, "fail", "an enforced constraint never enables OS Login on an existing project with enable-oslogin=FALSE");
+  assert.match(disabled.summary, /1 of 1 sampled projects lack enable-oslogin=TRUE in commonInstanceMetadata \(prod-audit\) and 0 instances override it/);
+  assert.match(disabled.summary, /constraints\/compute\.requireOsLogin is enforced in the effective policy, which protects newly created projects and blocks future disabling but does not enable OS Login on existing resources/);
+  assert.equal(disabled.evidence.policy_enforced, true);
+  assert.deepEqual(disabled.evidence.projects_without_os_login, ["prod-audit"]);
+
+  const absent = await run({ name: "prod-audit", commonInstanceMetadata: { items: [] } });
+  assert.equal(absent.status, "fail", "an absent enable-oslogin key means OS Login is off on an existing project");
+  assert.deepEqual(absent.evidence.projects_without_os_login, ["prod-audit"]);
+
+  const override = await run(COMPLIANT.computeProject, {
+    items: { "zones/us-central1-a": { instances: [{ ...COMPLIANT.instances.items["zones/us-central1-a"].instances[0], metadata: { items: [{ key: "enable-oslogin", value: "false" }] } }] } },
+  });
+  assert.equal(override.status, "fail");
+  assert.match(override.summary, /0 of 1 sampled projects lack enable-oslogin=TRUE in commonInstanceMetadata and 1 instances override it \(prod-audit\/vm-1\)/);
+  assert.deepEqual(override.evidence.instance_overrides, [{ projectId: "prod-audit", instance: "vm-1" }]);
+
+  const compliant = await run(COMPLIANT.computeProject);
+  assert.equal(compliant.status, "pass");
+  assert.match(compliant.summary, /enable-oslogin=TRUE is set in commonInstanceMetadata for all 1 sampled projects with Compute Engine and none of 1 instances overrides it\. constraints\/compute\.requireOsLogin is enforced/);
+  assert.equal(compliant.evidence.policy_enforced, true);
+});
+
+test("multi-inventory findings name the unreadable dataset and endpoint instead of a bare denied count", async () => {
+  const routers = await assessGcpNetworkSecurity(clientWithUnreadable((r) => r.path.endsWith("/aggregated/routers"), 403, "full", COMPLIANT));
+  const nat = routers.findings.find((item) => item.id === "GCP-NET-04");
+  assert.equal(nat.status, "warn");
+  assert.match(nat.summary, /^1 of 1 eligible subnetworks could not be evaluated for Cloud NAT coverage because Cloud Routers were unreadable in their project \(compute\.googleapis\.com\/compute\/v1\/projects\/\{project\}\/aggregated\/routers\)\./);
+  assert.match(nat.summary, /Partial view: Cloud Routers unreadable for 1 of 1 projects \(prod-audit\) via compute\.googleapis\.com\/compute\/v1\/projects\/\{project\}\/aggregated\/routers \(403 Forbidden\)/);
+  assert.doesNotMatch(nat.summary, /not covered by a Cloud NAT/, "a denied router list is not a coverage violation");
+  assert.equal(nat.evidence.subnets_without_nat, null, "coverage cannot be judged without any router list, so the violation list is null rather than an empty list");
+  assert.equal(nat.evidence.subnets_with_unknown_nat.length, 1);
+  assert.match(nat.evidence.subnets_with_unknown_nat[0].reason, /Cloud Routers unreadable in this project/);
+  assert.equal(nat.evidence.routers_read, null);
+  assert.equal(routers.summary.subnets_without_nat, null);
+  assert.equal(routers.summary.subnets_with_unknown_nat, 1);
+
+  const sslPolicies = await assessGcpNetworkSecurity(clientWithUnreadable((r) => r.path.endsWith("/aggregated/sslPolicies"), 403, "full", COMPLIANT));
+  const ssl = sslPolicies.findings.find((item) => item.id === "GCP-NET-05");
+  assert.equal(ssl.status, "warn");
+  assert.match(ssl.summary, /^1 of 1 HTTPS target proxies could not be evaluated: SSL policies unreadable in this project via compute\.googleapis\.com\/compute\/v1\/projects\/\{project\}\/aggregated\/sslPolicies\./);
+  assert.doesNotMatch(ssl.summary, /lacked the documented flag/);
+  assert.match(ssl.evidence.unresolved_proxies[0].reason, /SSL policies unreadable in this project/);
+  assert.equal(ssl.evidence.ssl_policies_read, null);
+
+  const disks = await assessGcpDataProtection(clientWithUnreadable((r) => r.path.endsWith("/aggregated/disks"), 403, "full", COMPLIANT));
+  const cmek = disks.findings.find((item) => item.id === "GCP-DATA-04");
+  assert.equal(cmek.status, "warn");
+  assert.match(cmek.summary, /Partial view: Compute Engine disks unreadable for 1 of 1 projects \(prod-audit\) via compute\.googleapis\.com\/compute\/v1\/projects\/\{project\}\/aggregated\/disks \(403 Forbidden\)/);
+  assert.equal(cmek.evidence.disks_read, null);
+  assert.equal(cmek.evidence.disks_without_cmek, null);
+  assert.equal(cmek.evidence.buckets_read, 1);
+  assert.deepEqual(cmek.evidence.buckets_without_cmek, []);
+  assert.equal(disks.summary.disks, null);
+
+  const keyMatch = (r) => r.host === "iam.googleapis.com" && r.path.endsWith("/keys");
+  const keys = await assessGcpIdentity(clientWithUnreadable(keyMatch, 403, "full", COMPLIANT));
+  for (const id of ["GCP-IAM-02", "GCP-IAM-03"]) {
+    const finding = keys.findings.find((item) => item.id === id);
+    assert.equal(finding.status, "manual", `${id}: keys are the dataset both findings score, so denying every key list leaves nothing to evaluate`);
+    assert.match(finding.summary, /^Manual: service account keys unreadable for 1 of 1 service accounts \(prod-audit\) via iam\.googleapis\.com\/v1\/projects\/\{project\}\/serviceAccounts\/\{account\}\/keys \(svc@prod-audit\.iam\.gserviceaccount\.com: 403 Forbidden/);
+    assert.equal(finding.evidence.seen, null);
+    assert.equal(finding.evidence.unreadable_inventories.length, 1);
+    assert.equal(finding.evidence.unreadable_inventories[0].dataset, "service account keys");
+  }
+  assert.equal(keys.findings.find((item) => item.id === "GCP-IAM-02").evidence.stale_keys, null);
+  assert.equal(keys.findings.find((item) => item.id === "GCP-IAM-03").evidence.user_managed_keys, null);
+
+  const someKeys = await assessGcpIdentity(clientWithUnreadable(keyMatch, 403, "project"));
+  for (const id of ["GCP-IAM-02", "GCP-IAM-03"]) {
+    const finding = someKeys.findings.find((item) => item.id === id);
+    assert.equal(finding.status, "warn", `${id}: one of two service accounts denied its key list is a partial view, not a missing dataset`);
+    assert.match(finding.summary, /Partial view: service account keys unreadable for 1 of 2 service accounts \(second-project\) via iam\.googleapis\.com\/v1\/projects\/\{project\}\/serviceAccounts\/\{account\}\/keys \(403 Forbidden\)/);
+    assert.equal(finding.evidence.unreadable_inventories.length, 1);
+  }
+  assert.deepEqual(someKeys.findings.find((item) => item.id === "GCP-IAM-03").evidence.user_managed_keys, []);
+});
+
+test("GCP-DATA-02 folds bucket list truncation into its partial view", async () => {
+  const client = createClient(async (url, init) => {
+    const facts = requestFacts(url, init);
+    if (facts.host === "storage.googleapis.com") return jsonResponse({ ...COMPLIANT.buckets, nextPageToken: "stuck" });
+    return jsonResponse(routeCompliant(url, init));
+  });
+  const result = await assessGcpDataProtection(client);
+  const exposure = result.findings.find((item) => item.id === "GCP-DATA-02");
+  assert.equal(exposure.status, "warn");
+  assert.equal(exposure.evidence.truncated, true);
+  assert.match(exposure.summary, /seen, total unknown \(inventory incomplete\)/);
+  assert.equal(result.findings.find((item) => item.id === "GCP-DATA-01").status, "warn");
 });
 
 test("resolveSecureOutputPath rejects traversal and symlink parents", () => {
@@ -253,4 +2160,682 @@ test("resolveSecureOutputPath rejects traversal and symlink parents", () => {
   const linked = join(base, "linked");
   symlinkSync(target, linked);
   assert.throws(() => resolveSecureOutputPath(base, "linked/out"), /Refusing to use symlinked parent directory/);
+});
+
+// ---------------------------------------------------------------------------------------------
+// Rule 9, error-body class: a secret an upstream server echoes in an error body, or that a thrown
+// message carries, must never reach a finding, summary, unreadable_inventories entry, not_collected
+// reason, core_data marker, errors array, bundle file, zip entry, or thrown error, and every failure
+// must still be disclosed with status, method, endpoint, and the body's content type and length or
+// its documented google.rpc.Status fields.
+// ---------------------------------------------------------------------------------------------
+
+const ERROR_CANARIES = {
+  bearer: "ya29.a0CANARYBEARER7f3a9c1d7f3a9c1d7f3a9c1d",
+  session: "CANARYSESSION7f3a9c1d7f3a9c1d",
+  apiKey: "AIzaSyCANARYAPIKEY7f3a9c1d000000000000",
+  urlToken: "CANARYURLTOKEN7f3a9c1d7f3a9c1d",
+  clientSecret: "GOCSPX-CANARYCLIENTSECRET7f3a9c1d",
+  refreshToken: "1//0gCANARYREFRESH7f3a9c1d-7f3a9c1d",
+  // 64 characters, the shape of an opaque gateway token, with no header, name, or scheme around it.
+  longToken: `C4NARYL0NGT0KEN${"7f3a9c1d".repeat(6)}0`,
+  // Plain lowercase letters: no header, no name, no token shape. Only the rule that never echoes a body keeps them out.
+  bareHtml: "canaryhtmlbodyzqxwvutsrp",
+};
+
+function canaryHtmlPage() {
+  return `<!DOCTYPE html><html><head><meta charset="utf-8"><title>502 Bad Gateway</title></head><body><h1>502 Bad Gateway ${ERROR_CANARIES.bareHtml}</h1><p>key=${ERROR_CANARIES.apiKey} Authorization: Bearer ${ERROR_CANARIES.bearer}</p><p>Set-Cookie: __Secure-1PSID=${ERROR_CANARIES.session}; Path=/; HttpOnly</p></body></html>`;
+}
+
+/** Fails when any canary, or the first 16 characters of one (a copy cut by a cap), appears in the text. */
+function assertNoCanary(text, label) {
+  for (const [name, canary] of Object.entries(ERROR_CANARIES)) {
+    assert.ok(!text.includes(canary) && !text.includes(canary.slice(0, 16)), `${label}: ${name} canary leaked`);
+  }
+}
+
+test("scrubErrorText redacts every credential shape in free text and leaves benign GCP operator text untouched", () => {
+  const basic = Buffer.from("svc@prod-audit.iam.gserviceaccount.com:s3cret-value-1234").toString("base64");
+  const cases = [
+    { name: "tokenised URL query", input: `see https://iam.googleapis.com/v1/projects/prod-audit/serviceAccounts?access_token=${ERROR_CANARIES.urlToken}&alt=json`, expect: /^see https:\/\/iam\.googleapis\.com\/v1\/projects\/prod-audit\/serviceAccounts\?\[REDACTED\]$/ },
+    { name: "tokenised URL fragment", input: `redirected to https://console.cloud.google.com/#access_token=${ERROR_CANARIES.urlToken}&token_type=bearer`, expect: /^redirected to https:\/\/console\.cloud\.google\.com\/#\[REDACTED\]$/ },
+    { name: "tokenised URL followed by sentence punctuation", input: `visit https://console.developers.google.com/apis/api/compute.googleapis.com/overview?project=123&token=${ERROR_CANARIES.urlToken}; then retry.`, expect: /^visit https:\/\/console\.developers\.google\.com\/apis\/api\/compute\.googleapis\.com\/overview\?\[REDACTED\]; then retry\.$/ },
+    { name: "Bearer", input: `Authorization: Bearer ${ERROR_CANARIES.bearer}`, expect: /^Authorization: Bearer \[REDACTED\]$/ },
+    { name: "Basic", input: `Authorization: Basic ${basic}`, expect: /^Authorization: Basic \[REDACTED\]$/ },
+    { name: "bare ya29 token", input: `token ${ERROR_CANARIES.bearer} expired`, expect: /^token \[REDACTED\] expired$/ },
+    { name: "API key in a query pair", input: `key=${ERROR_CANARIES.apiKey}`, expect: /^key=\[REDACTED\]$/ },
+    { name: "bare API key", input: `API key ${ERROR_CANARIES.apiKey} is restricted`, expect: /^API key \[REDACTED\] is restricted$/ },
+    { name: "API key header", input: `X-Goog-Api-Key: ${ERROR_CANARIES.urlToken}`, expect: /^X-Goog-Api-Key: \[REDACTED\]$/ },
+    { name: "api key quoted", input: `api_key="${ERROR_CANARIES.urlToken}"`, expect: /^api_key="\[REDACTED\]"$/ },
+    { name: "client secret pair", input: `client_secret=${ERROR_CANARIES.clientSecret}`, expect: /^client_secret=\[REDACTED\]$/ },
+    { name: "bare GOCSPX secret", input: `secret ${ERROR_CANARIES.clientSecret} rejected`, expect: /^secret \[REDACTED\] rejected$/ },
+    { name: "client secret JSON", input: `{"client_secret": "${ERROR_CANARIES.urlToken}"}`, expect: /^\{"client_secret": "\[REDACTED\]"\}$/ },
+    { name: "refresh token pair", input: `refresh_token=${ERROR_CANARIES.refreshToken}`, expect: /^refresh_token=\[REDACTED\]$/ },
+    { name: "bare refresh token", input: `token ${ERROR_CANARIES.refreshToken} revoked`, expect: /^token \[REDACTED\] revoked$/ },
+    { name: "JWT assertion", input: "assertion eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdmNAcHJvZC1hdWRpdCJ9.c2lnbmF0dXJlLXNpZ25hdHVyZS1zaWduYXR1cmU rejected", expect: /^assertion \[REDACTED\] rejected$/ },
+    { name: "private key JSON", input: '"private_key": "MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQC7"', expect: /^"private_key": "\[REDACTED\]"$/ },
+    { name: "Cookie", input: `Cookie: __Secure-1PSID=${ERROR_CANARIES.session}; theme=dark`, expect: /^Cookie: \[REDACTED\]$/ },
+    { name: "Set-Cookie", input: `Set-Cookie: __Secure-1PSID=${ERROR_CANARIES.session}; Path=/; HttpOnly`, expect: /^Set-Cookie: \[REDACTED\]$/ },
+    { name: "session id quoted", input: `"session_id": "${ERROR_CANARIES.session}"`, expect: /^"session_id": "\[REDACTED\]"$/ },
+    { name: "password unquoted", input: "password: hunter22seven", expect: /^password: \[REDACTED\]$/ },
+    { name: "password quoted", input: "password='hunter22seven'", expect: /^password='\[REDACTED\]'$/ },
+    { name: "access, refresh, and id tokens", input: "access_token=abcdef123456 refresh_token=abcdef123456 id_token=abcdef123456", expect: /^access_token=\[REDACTED\] refresh_token=\[REDACTED\] id_token=\[REDACTED\]$/ },
+    { name: "HTML page headers", input: canaryHtmlPage(), expect: /<p>key=\[REDACTED\] Authorization: Bearer \[REDACTED\]<\/p><p>Set-Cookie: \[REDACTED\]<\/p>/ },
+    { name: "long token in free text", input: `Backend rejected credential ${ERROR_CANARIES.longToken} for tenant 9f8e7d6c5b4a39281706f5e4d3c2b1a0`, expect: /^Backend rejected credential \[REDACTED\] for tenant \[REDACTED\]$/ },
+  ];
+  for (const item of cases) {
+    const scrubbed = scrubErrorText(item.input);
+    assert.match(scrubbed, item.expect, item.name);
+    assertNoCanary(scrubbed.replace(ERROR_CANARIES.bareHtml, ""), `${item.name} scrub`);
+    assert.doesNotMatch(scrubbed, /hunter22seven|abcdef123456|9f8e7d6c5b4a39281706f5e4d3c2b1a0|c3ZjQHByb2Q|eyJhbGci|MIIEvQIBADAN/, item.name);
+    assert.equal(scrubErrorText(scrubbed), scrubbed, `${item.name}: idempotent`);
+  }
+
+  const secrets = credentialValues(sampleConfig({ accessToken: "opaquesecretvalue" }));
+  assert.deepEqual(secrets, ["opaquesecretvalue"], "the configured access token is an exact secret");
+  assert.deepEqual(credentialValues(sampleConfig()), [], "a short placeholder token is never an exact secret, or the word token would vanish from every summary");
+  const pem = "-----BEGIN PRIVATE KEY-----\nMIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQC7\nAAAAB3NzaC1yc2EAAAADAQABAAABAQC7\n-----END PRIVATE KEY-----\n";
+  const serviceAccount = credentialValues({ credentials: { type: "service_account", clientEmail: "svc@prod-audit.iam.gserviceaccount.com", privateKey: pem, tokenUri: "https://oauth2.googleapis.com/token" } });
+  assert.deepEqual(serviceAccount, [pem, "MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQC7", "AAAAB3NzaC1yc2EAAAADAQABAAABAQC7"], "the PEM and each of its body lines are exact secrets");
+  const user = credentialValues({ credentials: { type: "authorized_user", clientId: "client-id", clientSecret: ERROR_CANARIES.clientSecret, refreshToken: ERROR_CANARIES.refreshToken, tokenUri: "https://oauth2.googleapis.com/token" } });
+  assert.deepEqual(user, [ERROR_CANARIES.clientSecret, ERROR_CANARIES.refreshToken]);
+  assert.equal(scrubErrorText("opaquesecretvalue echoed by the server", secrets), "[REDACTED] echoed by the server", "an exact secret with no token shape is still removed");
+  assert.equal(scrubErrorText("opaquesecretvalue echoed by the server"), "opaquesecretvalue echoed by the server", "without the exact secret the same word is prose");
+
+  const benign = [
+    "403 Forbidden: PERMISSION_DENIED: Permission denied (GET https://dns.googleapis.com/dns/v1/projects/prod-audit/managedZones)",
+    "502 Bad Gateway: non-JSON error body (text/html; 236 bytes) (GET https://iam.googleapis.com/v1/projects/prod-audit/serviceAccounts)",
+    "403 Forbidden: PERMISSION_DENIED: Compute Engine API has not been used in project 123456789012 before or it is disabled.; details ErrorInfo reason SERVICE_DISABLED, Help (GET https://compute.googleapis.com/compute/v1/projects/prod-audit/aggregated/instances)",
+    "details ErrorInfo reason IAM_PERMISSION_DENIED, details ErrorInfo reason ACCESS_TOKEN_SCOPE_INSUFFICIENT",
+    "details PreconditionFailure, LocalizedMessage, ErrorInfo reason FAILED_PRECONDITION",
+    "details BadRequest, QuotaFailure, RetryInfo, DebugInfo, ResourceInfo, RequestInfo, Help; searchAllIamPolicies and allowedPolicyMemberDomains are camelCase",
+    "service accounts unreadable for second-project via iam.googleapis.com/v1/projects/{project}/serviceAccounts (403 Forbidden)",
+    `public IAM binding search not collected for the scope (cloudasset.googleapis.com/v1/{scope}:searchAllIamPolicies?query=${PUBLIC_MEMBER_IAM_QUERY} was not called): project inventory was unreadable`,
+    "constraints/compute.requireOsLogin enforced; constraints/iam.allowedPolicyMemberDomains lists C0abc123",
+    "projects/prod-audit/locations/us/keyRings/ring/cryptoKeys/key rotates every 7776000s",
+    "//cloudresourcemanager.googleapis.com/projects/123456789012 and organizations/123456789012",
+    "svc@prod-audit.iam.gserviceaccount.com, 123-compute@developer.gserviceaccount.com",
+    "token: user",
+    "Bearer authentication is required; basic auth is not accepted",
+    "GET https://cloudasset.googleapis.com/v1/organizations/123456789012:searchAllResources failed before a response arrived: fetch failed",
+    "Partial view: 1 of 2 projects denied; 2 unreachable scopes not enumerated (prod-audit: zones/us-central1-a, prod-audit: regions/us-east1); 5000 seen, total unknown (inventory incomplete)",
+    "2026-09-21T00:00:00.000Z GCP-DATA-07 VPC Service Controls perimeters accessPolicies/1/servicePerimeters/prod",
+    "roles/resourcemanager.organizationAdmin on //cloudresourcemanager.googleapis.com/projects/prod-audit",
+    "credentials_path: /home/auditor/.config/gcloud/application_default_credentials.json",
+    "token_uri: https://oauth2.googleapis.com/token and private_key_id: 3f2a9c1d",
+    "Using GCP organization 123456789012 with project hint prod-audit.",
+  ];
+  for (const text of benign) {
+    assert.equal(scrubErrorText(text), text, `benign text must survive: ${text}`);
+    assert.equal(scrubErrorText(text, secrets), text, `benign text must survive the configured secrets: ${text}`);
+  }
+
+  // The heuristic cannot recognise arbitrary words, which is exactly why no response body is ever echoed.
+  assert.equal(scrubErrorText(ERROR_CANARIES.bareHtml), ERROR_CANARIES.bareHtml);
+  // The PascalCase exemption admits words only: a digit, two adjacent capitals, or hex and base64 material still go.
+  const stillGo = {
+    "PascalCase with a digit": "PreconditionFailure7f3a9c1d",
+    "adjacent capitals without digits": "AbCDefghijklmnopqrstUvwxyz",
+    "ya29 without a shape prefix match": "a0AfH6SMBxCANARY7f3a9c1dZz",
+    "hex": "9f8e7d6c5b4a39281706f5e4d3c2b1a0",
+    "base64": "Q0FOQVJZQkVBUkVSN2YzYTlj",
+    "base64url": "dGhpcyBpcyBhIHRlc3QgdG9rZW4_-",
+  };
+  for (const [name, run] of Object.entries(stillGo)) {
+    assert.equal(scrubErrorText(`credential ${run} rejected`), "credential [REDACTED] rejected", `${name} must still be redacted in error text`);
+  }
+  const keyName = "projects/prod-audit/serviceAccounts/svc@prod-audit.iam.gserviceaccount.com/keys/3f2a9c1d7b4e4c8a9d2e1f0a8b7c6d5e00000001";
+  assert.equal(scrubErrorText(keyName, [], { longTokens: false }), keyName, "data mode keeps key names as evidence");
+  assert.equal(scrubErrorText(keyName), "projects/prod-audit/serviceAccounts/svc@prod-audit.iam.gserviceaccount.com/keys/[REDACTED]", "error mode treats the same run as a token");
+  assert.equal(scrubErrorText(`Authorization: Bearer ${ERROR_CANARIES.bearer} key=${ERROR_CANARIES.apiKey}`, [], { longTokens: false }), "Authorization: Bearer [REDACTED] key=[REDACTED]", "data mode keeps every shape rule");
+});
+
+test("GcpApiError describes a failed response by status, method, endpoint, and the documented google.rpc.Status fields or the body's content type and length, never the body", async () => {
+  const respondWith = (body, init, config = sampleConfig()) => createClient(async () => new Response(body, init), config);
+  const failure = (client, call = (target) => target.listInstances("prod-audit")) => call(client).then(() => null, (error) => error);
+  const instances = "https://compute.googleapis.com/compute/v1/projects/prod-audit/aggregated/instances";
+  const json = { "content-type": "application/json; charset=UTF-8" };
+
+  const envelope = await failure(respondWith(JSON.stringify({
+    error: {
+      code: 403,
+      message: "Permission 'compute.instances.list' denied on project prod-audit",
+      status: "PERMISSION_DENIED",
+      details: [{ "@type": "type.googleapis.com/google.rpc.ErrorInfo", reason: "IAM_PERMISSION_DENIED", domain: "compute.googleapis.com", metadata: { permission: "compute.instances.list", debug: ERROR_CANARIES.longToken } }],
+    },
+  }), { status: 403, statusText: "Forbidden", headers: json }));
+  assert.ok(envelope instanceof GcpApiError);
+  assert.equal(envelope.message, `403 Forbidden: PERMISSION_DENIED: Permission 'compute.instances.list' denied on project prod-audit; details ErrorInfo reason IAM_PERMISSION_DENIED (GET ${instances})`);
+  assert.equal(envelope.status, 403);
+  assert.equal(envelope.endpoint, instances);
+
+  const disabled = await failure(respondWith(JSON.stringify({
+    error: {
+      code: 403,
+      message: `Compute Engine API has not been used in project 123456789012 before or it is disabled. Enable it by visiting https://console.developers.google.com/apis/api/compute.googleapis.com/overview?project=123456789012&token=${ERROR_CANARIES.urlToken} then retry.`,
+      status: "PERMISSION_DENIED",
+      details: [
+        { "@type": "type.googleapis.com/google.rpc.Help", links: [{ description: "Google developers console API activation", url: `https://console.developers.google.com/apis/api/compute.googleapis.com/overview?project=123456789012&token=${ERROR_CANARIES.urlToken}` }] },
+        { "@type": "type.googleapis.com/google.rpc.ErrorInfo", reason: "SERVICE_DISABLED", domain: "googleapis.com", metadata: { service: "compute.googleapis.com", consumer: "projects/123456789012" } },
+      ],
+    },
+  }), { status: 403, statusText: "", headers: json }));
+  assert.equal(disabled.message, `403 Forbidden: PERMISSION_DENIED: Compute Engine API has not been used in project 123456789012 before or it is disabled. Enable it by visiting https://console.developers.google.com/apis/api/compute.googleapis.com/overview?[REDACTED] then retry.; details Help, ErrorInfo reason SERVICE_DISABLED (GET ${instances})`, "an empty reason phrase falls back to the canonical one, the tokenised URL keeps host and path only, and only @type and reason are read from details");
+  const scan = await assessGcpOrgGuardrails(createClient(async (url, init) => (new URL(url).pathname.endsWith("/aggregated/instances")
+    ? new Response(JSON.stringify({ error: { code: 403, message: "x", status: "PERMISSION_DENIED", details: [{ "@type": "type.googleapis.com/google.rpc.ErrorInfo", reason: "SERVICE_DISABLED" }] } }), { status: 403, headers: json })
+    : jsonResponse(routeCompliant(url, init)))), { maxProjects: 5 });
+  assert.equal(scan.findings.find((item) => item.id === "GCP-ORG-08").summary.includes("is not enabled"), true, "the SERVICE_DISABLED reason still drives the API-disabled classification");
+
+  const mismatch = await failure(respondWith(JSON.stringify({ error: { code: 7, status: "PERMISSION_DENIED" } }), { status: 403, statusText: "Forbidden", headers: json }));
+  assert.equal(mismatch.message, `403 Forbidden: code 7; PERMISSION_DENIED (GET ${instances})`, "error.code is echoed only when it differs from the HTTP status");
+
+  const hostile = await failure(respondWith(JSON.stringify({ error: { code: 403, status: `PERMISSION_DENIED ${ERROR_CANARIES.longToken}`, details: [{ "@type": `type.googleapis.com/${ERROR_CANARIES.longToken}`, reason: `denied ${ERROR_CANARIES.longToken}` }] } }), { status: 403, statusText: `Forbidden ${ERROR_CANARIES.longToken}`, headers: json }));
+  assert.equal(hostile.message, `403 Forbidden: google.rpc.Status envelope without status, message, or details (GET ${instances})`, "a status, reason, @type, or reason phrase without its documented shape is dropped, not echoed");
+
+  const other = await failure(respondWith(JSON.stringify({ message: `denied for ${ERROR_CANARIES.bearer}`, token: ERROR_CANARIES.bearer }), { status: 401, statusText: "Unauthorized", headers: json }));
+  assert.equal(other.message, `401 Unauthorized: JSON error body without a google.rpc.Status envelope (application/json; ${Buffer.byteLength(JSON.stringify({ message: `denied for ${ERROR_CANARIES.bearer}`, token: ERROR_CANARIES.bearer }))} bytes) (GET ${instances})`);
+
+  const html = await failure(respondWith(canaryHtmlPage(), { status: 502, statusText: "Bad Gateway", headers: { "content-type": "text/html; charset=utf-8" } }));
+  assert.equal(html.message, `502 Bad Gateway: non-JSON error body (text/html; ${Buffer.byteLength(canaryHtmlPage())} bytes) (GET ${instances})`);
+  assert.equal(html.status, 502);
+
+  const untyped = await failure(respondWith(`Access denied for credential ${ERROR_CANARIES.longToken}`, { status: 403, statusText: "Forbidden" }));
+  assert.match(untyped.message, /^403 Forbidden: non-JSON error body \((?:text\/plain(?:;charset=UTF-8)?|unknown content type); \d+ bytes\) \(GET /, "a text body is never echoed even when it would fit an old byte cap");
+  assertNoCanary(untyped.message, "text body");
+
+  const empty = await failure(respondWith("", { status: 404, statusText: "Not Found" }));
+  assert.equal(empty.message, `404 Not Found (GET ${instances})`);
+
+  const okHtml = await failure(respondWith(canaryHtmlPage(), { status: 200, statusText: "OK", headers: { "content-type": "text/html" } }));
+  assert.equal(okHtml.message, `200 OK: non-JSON response body (text/html; ${Buffer.byteLength(canaryHtmlPage())} bytes) (GET ${instances})`, "a 2xx body that is not JSON never reaches JSON.parse, whose SyntaxError would quote the body");
+  assert.equal(okHtml.status, 200);
+
+  const network = await failure(createClient(async () => {
+    throw new TypeError(`fetch failed: request headers Authorization: Bearer ${ERROR_CANARIES.bearer}`);
+  }));
+  assert.equal(network.message, `GET ${instances} failed before a response arrived: fetch failed: request headers Authorization: Bearer [REDACTED]`);
+  assert.equal(network.status, undefined);
+  assert.equal(network.endpoint, instances);
+
+  const policy = await failure(respondWith("", { status: 403, statusText: "Forbidden" }), (client) => client.getEffectiveOrgPolicy("prod-audit", "constraints/compute.requireOsLogin"));
+  assert.equal(policy.message, "403 Forbidden (POST https://cloudresourcemanager.googleapis.com/v1/projects/prod-audit:getEffectiveOrgPolicy)", "POST reads name their method");
+
+  const exact = await failure(respondWith(JSON.stringify({ error: { code: 401, message: "token opaquesecretvalue was rejected", status: "UNAUTHENTICATED" } }), { status: 401, statusText: "Unauthorized", headers: json }, sampleConfig({ accessToken: "opaquesecretvalue" })));
+  assert.equal(exact.message, `401 Unauthorized: UNAUTHENTICATED: token [REDACTED] was rejected (GET ${instances})`, "the configured access token is removed by exact match even without a token shape");
+
+  const thrownExact = await failure(createClient(async () => {
+    throw new TypeError("fetch failed: proxy rejected header value opaquesecretvalue");
+  }, sampleConfig({ accessToken: "opaquesecretvalue" })));
+  assert.equal(thrownExact.message, `GET ${instances} failed before a response arrived: fetch failed: proxy rejected header value [REDACTED]`, "a shapeless configured token in a thrown message is caught by the constructor's exact-match layer, which describeError alone cannot know");
+});
+
+test("token exchange failures never echo the token endpoint's body and the exchanged token is an exact secret in later errors", async () => {
+  const credentials = { type: "authorized_user", clientId: "client-id", clientSecret: ERROR_CANARIES.clientSecret, refreshToken: ERROR_CANARIES.refreshToken, tokenUri: "https://oauth2.googleapis.com/token" };
+  const exchange = (body, init) => exchangeGcpCredentials(credentials, async () => new Response(body, init), NOW).then(() => null, (error) => error);
+
+  const oauth = await exchange(JSON.stringify({ error: "invalid_grant", error_description: `Token has been expired or revoked: ${ERROR_CANARIES.refreshToken} for client ${ERROR_CANARIES.clientSecret}` }), { status: 400, statusText: "Bad Request", headers: { "content-type": "application/json" } });
+  assert.ok(oauth instanceof GcpApiError);
+  assert.equal(oauth.message, "Token exchange failed: 400 Bad Request: invalid_grant: Token has been expired or revoked: [REDACTED] for client [REDACTED] (POST https://oauth2.googleapis.com/token)");
+  assert.equal(oauth.status, 400);
+  assert.equal(oauth.endpoint, "https://oauth2.googleapis.com/token");
+
+  const html = await exchange(canaryHtmlPage(), { status: 502, statusText: "Bad Gateway", headers: { "content-type": "text/html" } });
+  assert.equal(html.message, `Token exchange failed: 502 Bad Gateway: non-JSON error body (text/html; ${Buffer.byteLength(canaryHtmlPage())} bytes) (POST https://oauth2.googleapis.com/token)`);
+
+  const unexpected = await exchange(JSON.stringify({ token_type: "Bearer", secret: ERROR_CANARIES.bearer }), { status: 200, statusText: "OK", headers: { "content-type": "application/json" } });
+  assert.equal(unexpected.message, "Token exchange response did not include access_token (POST https://oauth2.googleapis.com/token)");
+
+  const opaque = await exchange(canaryHtmlPage(), { status: 200, statusText: "OK", headers: { "content-type": "text/html" } });
+  assert.equal(opaque.message, `Token exchange failed: 200 OK: non-JSON response body (text/html; ${Buffer.byteLength(canaryHtmlPage())} bytes) (POST https://oauth2.googleapis.com/token)`);
+
+  const client = createClient(async (url) => {
+    if (url === "https://oauth2.googleapis.com/token") return jsonResponse({ access_token: "opaqueexchangedtoken", expires_in: 3599, token_type: "Bearer" });
+    return new Response(JSON.stringify({ error: { code: 401, message: "token opaqueexchangedtoken has expired", status: "UNAUTHENTICATED" } }), { status: 401, statusText: "Unauthorized", headers: { "content-type": "application/json" } });
+  }, sampleConfig({ accessToken: undefined, credentials }));
+  const rejected = await client.getOrganization().then(() => null, (error) => error);
+  assert.equal(rejected.message, "401 Unauthorized: UNAUTHENTICATED: token [REDACTED] has expired (GET https://cloudresourcemanager.googleapis.com/v1/organizations/123456789012)");
+  assert.deepEqual(client.getKnownSecrets(), [ERROR_CANARIES.clientSecret, ERROR_CANARIES.refreshToken, "opaqueexchangedtoken"]);
+
+  const failedExchange = createClient(async (url) => {
+    if (url === "https://oauth2.googleapis.com/token") return new Response(JSON.stringify({ error: "invalid_client", error_description: `client ${ERROR_CANARIES.clientSecret} unknown` }), { status: 401, statusText: "Unauthorized", headers: { "content-type": "application/json" } });
+    throw new Error("the API must not be called without a token");
+  }, sampleConfig({ accessToken: undefined, credentials }));
+  const result = await assessGcpOrgGuardrails(failedExchange, { maxProjects: 5 });
+  const organization = result.findings.find((item) => item.id === "GCP-ORG-01");
+  assert.equal(organization.status, "manual");
+  assert.match(organization.summary, /failed before a response arrived: Token exchange failed: 401 Unauthorized: invalid_client: client \[REDACTED\] unknown \(POST https:\/\/oauth2\.googleapis\.com\/token\)/);
+  assertNoCanary(JSON.stringify(result), "org guardrails after a failed token exchange");
+});
+
+const ERROR_BODY_SHAPES = {
+  "502 text/html with bearer, session cookie, and API key canaries": {
+    status: 502,
+    respond: () => new Response(canaryHtmlPage(), { status: 502, statusText: "Bad Gateway", headers: { "content-type": "text/html; charset=utf-8" } }),
+    disclosure: /502 Bad Gateway: non-JSON error body \(text\/html; \d+ bytes\) \((?:GET|POST) https:\/\/[a-z]+\.googleapis\.com\//,
+  },
+  "403 JSON whose error.message embeds a tokenised URL": {
+    status: 403,
+    respond: () => jsonResponse({
+      error: {
+        code: 403,
+        message: `The caller does not have permission; see https://iam.googleapis.com/v1/projects/prod-audit/serviceAccounts?access_token=${ERROR_CANARIES.urlToken}&alt=json`,
+        status: "PERMISSION_DENIED",
+        details: [{ "@type": "type.googleapis.com/google.rpc.ErrorInfo", reason: "IAM_PERMISSION_DENIED", domain: "iam.googleapis.com", metadata: { permission: "iam.serviceAccounts.list", token: ERROR_CANARIES.urlToken } }],
+      },
+    }, 403),
+    disclosure: /403 Forbidden: PERMISSION_DENIED: The caller does not have permission; see https:\/\/iam\.googleapis\.com\/v1\/projects\/prod-audit\/serviceAccounts\?\[REDACTED\]; details ErrorInfo reason IAM_PERMISSION_DENIED \((?:GET|POST) https:\/\/[a-z]+\.googleapis\.com\//,
+  },
+  "500 JSON whose free-text error.message carries a long token": {
+    status: 500,
+    respond: () => new Response(JSON.stringify({ error: { code: 500, message: `Backend rejected credential ${ERROR_CANARIES.longToken} for session ${ERROR_CANARIES.session}`, status: "INTERNAL" } }), { status: 500, statusText: "Internal Server Error", headers: { "content-type": "application/json; charset=UTF-8" } }),
+    disclosure: /500 Internal Server Error: INTERNAL: Backend rejected credential \[REDACTED\] for session \[REDACTED\] \((?:GET|POST) https:\/\/[a-z]+\.googleapis\.com\//,
+  },
+  "thrown network error carrying the Authorization and Cookie headers": {
+    status: undefined,
+    respond: () => {
+      throw new TypeError(`fetch failed: request headers Authorization: Bearer ${ERROR_CANARIES.bearer}; Cookie: __Secure-1PSID=${ERROR_CANARIES.session}`);
+    },
+    disclosure: /(?:GET|POST) https:\/\/[a-z]+\.googleapis\.com\/\S+ failed before a response arrived: fetch failed: request headers Authorization: Bearer \[REDACTED\]; Cookie: \[REDACTED\]/,
+  },
+};
+
+/** The direct client call that reads each sweep row's endpoint, so the thrown error itself can be inspected. */
+const SURFACE_CLIENT_CALLS = {
+  organization: (client) => client.getOrganization(),
+  projects: (client) => client.listProjectInventory(5),
+  iamPolicies: (client) => client.searchAllIamPolicies(20),
+  publicBindings: (client) => client.searchPublicIamBindings(20),
+  cryptoKeys: (client) => client.listCryptoKeys(20),
+  serviceAccounts: (client) => client.listServiceAccounts("prod-audit"),
+  serviceAccountKeys: (client) => client.listServiceAccountKeys("prod-audit", "svc@prod-audit.iam.gserviceaccount.com"),
+  adminActivity: (client) => client.listRecentAdminActivity("prod-audit"),
+  dataAccess: (client) => client.listRecentDataAccess("prod-audit"),
+  sinks: (client) => client.listLogSinks("prod-audit"),
+  logBuckets: (client) => client.listLogBuckets("prod-audit"),
+  loggingSettings: (client) => client.getLoggingSettings("prod-audit"),
+  sccSources: (client) => client.listSccSources(),
+  sccFindings: (client) => client.listSccFindings(20),
+  ...Object.fromEntries(Object.keys(ORG_POLICY_DEPENDENTS).map((constraint) => [policySurfaceId(constraint), (client) => client.getEffectiveOrgPolicy("prod-audit", constraint)])),
+  computeProject: (client) => client.getComputeProject("prod-audit"),
+  instances: (client) => client.listInstances("prod-audit"),
+  binaryAuthorization: (client) => client.getBinaryAuthorizationPolicy("prod-audit"),
+  buckets: (client) => client.listStorageBuckets("prod-audit"),
+  disks: (client) => client.listDisks("prod-audit"),
+  managedZones: (client) => client.listManagedZones("prod-audit"),
+  apiKeys: (client) => client.listApiKeys("prod-audit"),
+  accessPolicies: (client) => client.listAccessPolicies(),
+  servicePerimeters: (client) => client.listServicePerimeters("accessPolicies/1"),
+  firewalls: (client) => client.listFirewalls("prod-audit"),
+  subnetworks: (client) => client.listSubnetworks("prod-audit"),
+  routers: (client) => client.listRouters("prod-audit"),
+  sslPolicies: (client) => client.listSslPolicies("prod-audit"),
+  targetHttpsProxies: (client) => client.listTargetHttpsProxies("prod-audit"),
+  backendServices: (client) => client.listBackendServices("prod-audit"),
+};
+
+test("error-body walk: every GCP_INVENTORIES surface failing in four body shapes leaks no canary and is disclosed with status, method, endpoint, and content type and length or the documented google.rpc.Status fields", async () => {
+  const outputRoot = createTempBase("grclanker-gcp-error-body-walk-");
+  assert.deepEqual(Object.keys(SURFACE_CLIENT_CALLS).sort(), INVENTORY_SURFACES.map((row) => row.id).sort(), "every sweep row has a direct client call in the walk");
+  assert.deepEqual([...new Set(INVENTORY_SURFACES.map((row) => row.key))].sort(), Object.keys(GCP_INVENTORIES).sort(), "the walk covers every GCP_INVENTORIES surface");
+
+  let walked = 0;
+  for (const row of INVENTORY_SURFACES) {
+    for (const [shapeName, shape] of Object.entries(ERROR_BODY_SHAPES)) {
+      const label = `${row.id} [${shapeName}]`;
+      const requested = new Set();
+      const client = createClient(async (url, init) => {
+        requested.add(url.split("?")[0]);
+        return row.match(requestFacts(url, init)) ? shape.respond() : jsonResponse(routeForProject(url, init));
+      });
+
+      const thrown = await SURFACE_CLIENT_CALLS[row.id](client).then(() => null, (error) => error);
+      assert.ok(thrown instanceof GcpApiError, `${label}: the direct client call throws a GcpApiError`);
+      assert.equal(thrown.status, shape.status, `${label}: the error carries the HTTP status`);
+      assert.match(thrown.endpoint, /^https:\/\/[a-z]+\.googleapis\.com\/[^?]+$/, `${label}: the error carries the endpoint without its query string`);
+      assert.ok(thrown.message.includes(thrown.endpoint), `${label}: the message names the endpoint`);
+      assert.match(thrown.message, shape.disclosure, `${label}: the failure is disclosed by status, method, endpoint, and content type and length or the documented fields (${thrown.message})`);
+      assert.doesNotMatch(thrown.message, /<html|<p>|<title|Path=\/|HttpOnly|__Secure|alt=json|"metadata"/, `${label}: no body text is echoed`);
+      assertNoCanary(thrown.message, `${label} thrown message`);
+
+      const results = await runAllAssessments(client, { maxProjects: 5 });
+      const access = await checkGcpAccess(client);
+      assertNoCanary(JSON.stringify(results), `${label} findings, summaries, evidence, unreadable inventories, markers, and errors arrays`);
+      assertNoCanary(JSON.stringify(access), `${label} access check`);
+      const errors = results.flatMap((result) => result.errors);
+      assert.ok(errors.some((entry) => shape.disclosure.test(entry)), `${label}: an assessment errors array discloses the failure (${errors.join(" | ")})`);
+      const byId = findingsById(results);
+      for (const id of row.dependents) {
+        assert.notEqual(byId[id].status, "pass", `${label}: ${id} must not pass`);
+        const entries = byId[id].evidence.unreadable_inventories ?? [];
+        assert.ok(entries.some((entry) => shape.disclosure.test(entry.error)), `${label}: ${id} lists the failure with its disclosure in unreadable_inventories (${JSON.stringify(entries)})`);
+      }
+      // A status-less note is abbreviated at a word boundary, so a summary never quotes a fragment of an endpoint.
+      for (const result of results) {
+        for (const finding of result.findings) {
+          for (const match of finding.summary.matchAll(/\((?:GET|POST) (https:\/\/[^\s()]+?)(?:\.\.\.)?(?: [^()]*)?\)/g)) {
+            assert.ok(requested.has(match[1]), `${label}: ${finding.id} summary quotes a URL fragment (${match[0]})`);
+          }
+        }
+      }
+      for (const result of results) {
+        for (const marker of Object.values(result.snapshot).filter(isMarker)) {
+          assert.doesNotMatch(marker.error, /<html|Path=\/|alt=json/, `${label}: core_data marker echoes body text`);
+        }
+      }
+
+      const exported = await exportGcpAuditBundle(client, sampleConfig(), outputRoot, { max_projects: 5 });
+      assert.ok(exported.errorCount > 0, `${label}: the bundle records the failure`);
+      const files = walkFiles(exported.outputDir).map((pathname) => ({ name: relative(exported.outputDir, pathname), content: readFileSync(pathname, "utf8") }));
+      for (const file of files) assertNoCanary(file.content, `${label} bundle file ${file.name}`);
+      for (const entry of readZipEntries(exported.zipPath)) assertNoCanary(entry.content, `${label} zip entry ${entry.name}`);
+      const errorsLog = files.find((file) => file.name === "_errors.log");
+      assert.ok(errorsLog, `${label}: _errors.log is present`);
+      assert.match(errorsLog.content, shape.disclosure, `${label}: _errors.log discloses the failure with status, endpoint, and content type and length or the documented fields`);
+      rmSync(exported.outputDir, { recursive: true, force: true });
+      rmSync(exported.zipPath, { force: true });
+      walked += 1;
+    }
+  }
+  assert.equal(walked, INVENTORY_SURFACES.length * Object.keys(ERROR_BODY_SHAPES).length);
+});
+
+test("GCP-IAM-02 and GCP-IAM-03 render unreachable_scopes null, not [], when every service account key list is denied", async () => {
+  const keyLists = (r) => r.host === "iam.googleapis.com" && r.path.endsWith("/keys");
+  const denied = findingsById([await assessGcpIdentity(clientWithUnreadable(keyLists), { maxProjects: 5 })]);
+  for (const id of ["GCP-IAM-02", "GCP-IAM-03"]) {
+    assert.equal(denied[id].status, "manual", id);
+    assert.equal(denied[id].evidence.unreachable_scopes, null, `${id} unreachable_scopes describes the key lists too, which never ran to completion`);
+    assert.equal(denied[id].evidence.truncated, null, `${id} truncated`);
+    assert.match(denied[id].summary, /service account keys unreadable for 2 of 2 service accounts/);
+  }
+  const partial = findingsById([await assessGcpIdentity(clientWithUnreadable(keyLists, 403, "partial"), { maxProjects: 5 })]);
+  for (const id of ["GCP-IAM-02", "GCP-IAM-03"]) {
+    assert.deepEqual(partial[id].evidence.unreachable_scopes, [], `${id}: with one project's key lists readable the scan ran, so [] is a true statement`);
+    assert.equal(partial[id].status, "warn", id);
+  }
+});
+
+test("project-only scope: without an organization ID the organization, SCC, and perimeter reads are not attempted, their findings are manual with not_collected entries, and every other control passes", async () => {
+  const requested = [];
+  const config = sampleConfig({ organizationId: undefined });
+  const client = createClient(async (url, init) => {
+    const parsed = new URL(url);
+    requested.push(`${parsed.hostname}${parsed.pathname}`);
+    return jsonResponse(routeCompliant(url, init));
+  }, config);
+  const results = await runAllAssessments(client, { maxProjects: 5 });
+  const byId = findingsById(results);
+  const notCollected = ["GCP-ORG-01", "GCP-LOG-05", "GCP-DATA-07"];
+  for (const id of notCollected) {
+    assert.equal(byId[id].status, "manual", id);
+    const entries = byId[id].evidence.unreadable_inventories.filter((entry) => entry.status === "not_collected");
+    assert.ok(entries.length > 0, `${id} lists a not_collected entry`);
+    assert.match(byId[id].summary, /not collected|was not called|no organization/i, `${id} summary names the skipped read`);
+    assert.doesNotMatch(byId[id].summary, /[1-5]\d{2} [A-Z][a-z]+/, `${id} attributes no HTTP status to a call that was not made`);
+  }
+  for (const id of ALL_FINDING_IDS.filter((id) => !notCollected.includes(id))) {
+    assert.equal(byId[id].status, "pass", `${id}: ${byId[id].summary}`);
+  }
+  assert.equal(requested.filter((request) => /securitycenter\.googleapis\.com|accesscontextmanager\.googleapis\.com|\/v1\/organizations\/|:searchAllResources$/.test(request)).length, 0, "no organization-scoped request is issued");
+  assert.ok(requested.some((request) => request.endsWith("/v1/projects/prod-audit:searchAllIamPolicies")), "IAM policy search is scoped to the project");
+
+  const exported = await exportGcpAuditBundle(client, config, createTempBase("grclanker-gcp-project-only-"), { max_projects: 5 });
+  assert.equal(exported.findingCount, 31);
+  assert.equal(exported.errorCount, 0, "a read that was not attempted is not a collection error");
+  const markers = [];
+  for (const pathname of walkFiles(exported.outputDir).filter((entry) => relative(exported.outputDir, entry).startsWith("core_data") && entry.endsWith(".json"))) {
+    const walk = (value, path) => {
+      if (isMarker(value)) markers.push({ path, dataset: value.dataset, status: value.status });
+      else if (value && typeof value === "object") for (const [key, child] of Object.entries(value)) walk(child, `${path}.${key}`);
+    };
+    walk(JSON.parse(readFileSync(pathname, "utf8")), basename(pathname));
+  }
+  assert.deepEqual(markers.map((marker) => marker.dataset).sort(), ["Security Command Center sources", "VPC Service Controls perimeters", "organization metadata"], "exactly the three organization-scoped datasets carry markers");
+  assert.ok(markers.every((marker) => marker.status === "not_collected"));
+});
+
+test("credential file loaders never echo the parser message, the file text, or the reader error", () => {
+  const keyBody = "MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQC7";
+  const pemHeader = "-----BEGIN PRIVATE KEY-----";
+  // The private_key line lost its opening quote, so the parser stops on the key body itself.
+  const unquoted = `{\n  "type": "service_account",\n  "client_email": "svc@prod-audit.iam.gserviceaccount.com",\n  "private_key": ${keyBody}\\n${pemHeader}\\n${ERROR_CANARIES.bearer}\\n-----END PRIVATE KEY-----\\n",\n  "token_uri": "https://oauth2.googleapis.com/token"\n}`;
+  // The same line lost its trailing comma, so the parser stops after the key material with a position.
+  const missingComma = `{\n  "type": "service_account",\n  "client_email": "svc@prod-audit.iam.gserviceaccount.com",\n  "private_key": "${pemHeader}\\n${keyBody} ${ERROR_CANARIES.bearer}\\n-----END PRIVATE KEY-----\\n"\n  "token_uri": "https://oauth2.googleapis.com/token"\n}`;
+  const parserWording = /Unexpected|token '|not valid JSON|position|line \d|column \d|Expected|property|minus sign/;
+  const fileText = new RegExp(`${keyBody.slice(0, 10)}|PRIVATE KEY|ate_key|service_account|gserviceaccount`);
+
+  assert.throws(() => JSON.parse(unquoted), (error) => error instanceof SyntaxError && /MIIEvQIBAD/.test(error.message), "positive control: V8 quotes the key body from the malformed line");
+  assert.throws(() => JSON.parse(missingComma), (error) => error instanceof SyntaxError && parserWording.test(error.message), "positive control: the parser message carries its own wording");
+
+  for (const [name, text] of Object.entries({ unquoted, missingComma })) {
+    assert.throws(() => parseGcpCredentialsJson(text, "/secure/sa.json"), (error) => {
+      assert.equal(error.message, "invalid JSON in /secure/sa.json", `${name}: a fixed description with the path only (V8 attaches no structured position)`);
+      return true;
+    });
+    assert.throws(() => resolveGcpConfiguration({}, { GCP_CREDENTIALS_FILE: "/secure/sa.json", GCP_PROJECT_ID: "p" }, () => undefined, (pathname) => (pathname === "/secure/sa.json" ? text : undefined)), (error) => {
+      assert.equal(error.message, "invalid JSON in /secure/sa.json", `${name}: the resolver names the file it read`);
+      assertNoCanary(error.message, `${name} resolver`);
+      assert.doesNotMatch(error.message, parserWording, `${name}: no parser wording`);
+      assert.doesNotMatch(error.message, fileText, `${name}: no file text`);
+      return true;
+    });
+  }
+  const throwsMessage = (fn, message, label) => assert.throws(fn, (error) => {
+    assert.equal(error.message, message, label);
+    return true;
+  });
+  throwsMessage(() => parseGcpCredentialsJson(unquoted), "invalid JSON in the credentials file", "without a path the description still names nothing from the file");
+  throwsMessage(() => parseGcpCredentialsJson(unquoted, "/keys/sa-3f2a9c1d7b4e4c8a9d2e1f0a8b7c6d5e.json"), "invalid JSON in /keys/sa-3f2a9c1d7b4e4c8a9d2e1f0a8b7c6d5e.json", "a path is a data value: a hash-named file keeps its name");
+  throwsMessage(() => parseGcpCredentialsJson(unquoted, `/tmp/${ERROR_CANARIES.bearer}/sa.json`), "invalid JSON in /tmp/[REDACTED]", "a path is a data value: a token shape inside it is still scrubbed (the ya29 rule admits / and . as token characters, so the suffix goes with it)");
+  throwsMessage(() => parseGcpCredentialsJson("[1, 2]", "/secure/sa.json"), "/secure/sa.json did not contain a JSON object.");
+  throwsMessage(() => parseGcpCredentialsJson(JSON.stringify({ type: "external_account" }), "/secure/sa.json"), 'Unsupported credentials type "external_account" in /secure/sa.json; expected service_account or authorized_user.', "a documented identifier shape is echoed");
+  throwsMessage(() => parseGcpCredentialsJson(JSON.stringify({ type: `external_account ${ERROR_CANARIES.bearer}` }), "/secure/sa.json"), 'Unsupported credentials type "unknown" in /secure/sa.json; expected service_account or authorized_user.', "a type without the identifier shape is dropped, not echoed");
+
+  const readFailures = {
+    EISDIR: Object.assign(new Error(`EISDIR: illegal operation on a directory, read '/secure/sa.json' ${ERROR_CANARIES.bearer}`), { code: "EISDIR", errno: -21, syscall: "read", path: "/secure/sa.json" }),
+    ENOENT: Object.assign(new Error(`ENOENT: no such file or directory, open '/secure/sa.json' ${ERROR_CANARIES.session}`), { code: "ENOENT", errno: -2, syscall: "open", path: "/secure/sa.json" }),
+  };
+  for (const [code, failure] of Object.entries(readFailures)) {
+    assert.throws(() => resolveGcpConfiguration({}, { GCP_CREDENTIALS_FILE: "/secure/sa.json", GCP_PROJECT_ID: "p" }, () => undefined, () => { throw failure; }), (error) => {
+      assert.equal(error.message, `unable to read /secure/sa.json (${code})`, `${code}: the path and the validated code only`);
+      return true;
+    });
+  }
+  const nonStandard = [
+    { name: "object with a numeric code and a secret message", value: { code: 12345, message: `reader exploded with ${ERROR_CANARIES.bearer}`, body: canaryHtmlPage() } },
+    { name: "string", value: `reader exploded with ${ERROR_CANARIES.apiKey}` },
+    { name: "error whose code is not an identifier", value: Object.assign(new Error(`bad code ${ERROR_CANARIES.session}`), { code: `EACCES ${ERROR_CANARIES.session}` }) },
+    { name: "error whose code is lowercase", value: Object.assign(new Error(`lower ${ERROR_CANARIES.session}`), { code: "eacces" }) },
+    { name: "null", value: null },
+  ];
+  for (const item of nonStandard) {
+    assert.throws(() => resolveGcpConfiguration({}, { GCP_CREDENTIALS_FILE: "/secure/sa.json", GCP_PROJECT_ID: "p" }, () => undefined, () => { throw item.value; }), (error) => {
+      assert.equal(error.message, "unable to read /secure/sa.json", `${item.name}: nothing from the thrown value is rendered`);
+      return true;
+    });
+  }
+  throwsMessage(() => resolveGcpConfiguration({}, { GOOGLE_APPLICATION_CREDENTIALS: "/secure/adc.json", GCP_PROJECT_ID: "p" }, () => undefined, () => { throw readFailures.EISDIR; }), "unable to read /secure/adc.json (EISDIR)", "the ADC path goes through the same reader");
+
+  // The default reader: a directory where the file should be, a malformed file on disk, and a missing file.
+  const base = createTempBase("grclanker-gcp-credentials-");
+  const directory = join(base, "sa.json");
+  mkdirSync(directory);
+  assert.throws(() => resolveGcpConfiguration({}, { GCP_CREDENTIALS_FILE: directory, GCP_PROJECT_ID: "p" }, () => undefined), (error) => {
+    assert.equal(error.message, `unable to read ${directory} (EISDIR)`);
+    return true;
+  });
+  const malformedPath = join(base, "malformed.json");
+  writeFileSync(malformedPath, unquoted, { mode: 0o600 });
+  assert.throws(() => resolveGcpConfiguration({}, { GCP_CREDENTIALS_FILE: malformedPath, GCP_PROJECT_ID: "p" }, () => undefined), (error) => {
+    assert.equal(error.message, `invalid JSON in ${malformedPath}`);
+    return true;
+  });
+  throwsMessage(() => resolveGcpConfiguration({}, { GCP_CREDENTIALS_FILE: join(base, "missing.json"), GCP_PROJECT_ID: "p" }, () => "opaque-gcloud-token"), `Credentials file not readable: ${join(base, "missing.json")}`, "a missing explicit file is reported without a code, since no read was attempted, and never falls through to gcloud");
+});
+
+test("exportGcpAuditBundle scrubs a shapeless configured token and an API key shape that arrive as data from every file and zip entry", async () => {
+  const configuredToken = "opaqueconfiguredtokenvalue";
+  const plantedKey = "AIzaSyCANARYDISPLAYNAME7f3a9c1d00000000";
+  const data = structuredClone(COMPLIANT);
+  data.organization.displayName = `Example Org ${plantedKey} ${configuredToken}`;
+  const config = sampleConfig({ accessToken: configuredToken });
+  const client = createClient(async (url, init) => jsonResponse(routeCompliant(url, init, data)), config);
+
+  const results = await runAllAssessments(client, { maxProjects: 5 });
+  const organization = findingsById(results)["GCP-ORG-01"];
+  assert.equal(organization.status, "pass");
+  assert.ok(organization.summary.includes(plantedKey) && organization.summary.includes(configuredToken), "in memory the display name is data and is kept verbatim; the bundle writer is the layer under test");
+
+  const exported = await exportGcpAuditBundle(client, config, createTempBase("grclanker-gcp-writer-layer-"), { max_projects: 5 });
+  assert.equal(exported.findingCount, 31);
+  assert.equal(exported.errorCount, 0);
+  const files = walkFiles(exported.outputDir).map((pathname) => ({ name: relative(exported.outputDir, pathname), content: readFileSync(pathname, "utf8") }));
+  const entries = readZipEntries(exported.zipPath).filter((entry) => !entry.name.endsWith("/"));
+  assert.ok(files.length >= 30 && entries.length === files.length, "every file is walked and every zip entry is compared");
+  for (const file of files) {
+    assert.ok(!file.content.includes(plantedKey) && !file.content.includes(plantedKey.slice(0, 16)), `${file.name}: the API key shape in a display name reached the bundle`);
+    assert.ok(!file.content.includes(configuredToken), `${file.name}: the configured token in a display name reached the bundle`);
+  }
+  for (const entry of entries) {
+    assert.ok(!entry.content.includes(plantedKey) && !entry.content.includes(configuredToken), `zip entry ${entry.name} carries a planted value`);
+  }
+  const rendered = files.filter((file) => file.content.includes("Example Org [REDACTED] [REDACTED]"));
+  assert.ok(rendered.some((file) => file.name === join("core_data", "org-guardrails.json")), "the snapshot keeps the display name's words and redacts only the planted values");
+  assert.ok(rendered.some((file) => file.name === join("analysis", "findings.json")), "the finding summary keeps the display name's words and redacts only the planted values");
+  assert.ok(rendered.length >= 3, `the display name reaches at least the snapshot, findings.json, and the category file (${rendered.map((file) => file.name).join(", ")})`);
+});
+
+/**
+ * Silent-success class (2xx non-protocol body): a 2xx whose body is not the JSON object the surface documents. The
+ * HTML row is the control the #68 review verified; the empty rows are the branch that used to resolve {} and be read
+ * as an empty inventory. Every surface this client reads documents a JSON object body (the proto3 JSON mapping
+ * encodes an all-default response message and google.protobuf.Empty as {}; Compute and Storage lists carry kind), so
+ * no endpoint is exempt.
+ */
+const SILENT_SUCCESS_SHAPES = {
+  "200 text/html sign-in page (control)": {
+    respond: () => new Response(canaryHtmlPage(), { status: 200, statusText: "OK", headers: { "content-type": "text/html; charset=utf-8" } }),
+    marker: /^(?:[^\s():]+: )*200 OK: non-JSON response body \(text\/html; \d+ bytes\) \((?:GET|POST) https:\/\/[a-z]+\.googleapis\.com\/[^\s?()]+\)$/,
+  },
+  "200 application/json with an empty body": {
+    respond: () => new Response("", { status: 200, statusText: "OK", headers: { "content-type": "application/json; charset=UTF-8" } }),
+    marker: /^(?:[^\s():]+: )*200 OK: empty response body \(application\/json; 0 bytes\) \((?:GET|POST) https:\/\/[a-z]+\.googleapis\.com\/[^\s?()]+\)$/,
+  },
+  "200 with an empty body and no content type": {
+    respond: () => new Response(null, { status: 200, statusText: "OK" }),
+    marker: /^(?:[^\s():]+: )*200 OK: empty response body \(unknown content type; 0 bytes\) \((?:GET|POST) https:\/\/[a-z]+\.googleapis\.com\/[^\s?()]+\)$/,
+  },
+  "200 application/json whose body is only whitespace": {
+    respond: () => new Response("\n \n", { status: 200, statusText: "OK", headers: { "content-type": "application/json" } }),
+    marker: /^(?:[^\s():]+: )*200 OK: empty response body \(application\/json; 3 bytes\) \((?:GET|POST) https:\/\/[a-z]+\.googleapis\.com\/[^\s?()]+\)$/,
+  },
+};
+
+/** The access probe that reads each surface, where one exists. */
+const SURFACE_ACCESS_PROBES = {
+  organization: "organization",
+  projects: "projects",
+  iamPolicies: "iam_policies",
+  loggingSettings: "logging_settings",
+  sinks: "log_sinks",
+  sccSources: "security_command_center",
+  [policySurfaceId("constraints/iam.disableServiceAccountKeyCreation")]: "org_policy",
+  firewalls: "compute_firewalls",
+  buckets: "storage_buckets",
+  cryptoKeys: "kms_crypto_keys",
+};
+
+/** The (surface, finding) pairs the #68 review saw rendered as pass or fail from an empty 200 body. */
+const REVIEWED_SILENT_SUCCESS_PAIRS = [
+  ["projects", "GCP-IAM-01"],
+  ["sinks", "GCP-LOG-03"],
+  [policySurfaceId("constraints/iam.disableServiceAccountKeyCreation"), "GCP-ORG-03"],
+  ["accessPolicies", "GCP-DATA-07"],
+  ["apiKeys", "GCP-DATA-06"],
+  ["serviceAccountKeys", "GCP-IAM-02"],
+  ["serviceAccountKeys", "GCP-IAM-03"],
+];
+
+test("silent-success class: a 200 with an HTML, empty, or whitespace body on every GCP_INVENTORIES surface is an unreadable surface, never an empty inventory: dependents are manual or warn, snapshots carry markers, the access probe is not readable, and no unobserved status is named", async () => {
+  const statusMention = /(?<![\w./:-])([1-5]\d{2}) [A-Z][A-Za-z]+/g;
+  const assertOnlyServedStatuses = (label, text) => {
+    for (const match of text.matchAll(statusMention)) {
+      assert.equal(match[1], "200", `${label}: names HTTP ${match[1]}, which the fixture never served: ${text}`);
+    }
+  };
+  for (const [surfaceId, findingId] of REVIEWED_SILENT_SUCCESS_PAIRS) {
+    const row = INVENTORY_SURFACES.find((candidate) => candidate.id === surfaceId);
+    assert.ok(row && row.dependents.includes(findingId), `${surfaceId} -> ${findingId} is a sweep dependency, so the walk below covers the reviewed pair`);
+  }
+  for (const surfaceId of Object.keys(SURFACE_ACCESS_PROBES)) assert.ok(SURFACE_CLIENT_CALLS[surfaceId], `${surfaceId} is a sweep surface`);
+
+  const verdicts = { manual: 0, warn: 0 };
+  let walked = 0;
+  let markers = 0;
+  for (const row of INVENTORY_SURFACES) {
+    for (const [shapeName, shape] of Object.entries(SILENT_SUCCESS_SHAPES)) {
+      const label = `${row.id} [${shapeName}]`;
+      const requests = [];
+      const client = createClient(async (url, init) => {
+        const facts = requestFacts(url, init);
+        const response = row.match(facts) ? shape.respond() : jsonResponse(routeForProject(url, init));
+        requests.push({ request: `${facts.host}${facts.path}`, surfaces: INVENTORY_SURFACES.filter((candidate) => candidate.match(facts)).map((candidate) => candidate.id), status: response.status });
+        return response;
+      });
+
+      const thrown = await SURFACE_CLIENT_CALLS[row.id](client).then(() => null, (error) => error);
+      assert.ok(thrown instanceof GcpApiError, `${label}: the direct client call throws a GcpApiError instead of resolving an empty inventory`);
+      assert.equal(thrown.status, 200, `${label}: the error carries the observed status`);
+      assert.match(thrown.message, shape.marker, `${label}: the marker names the status, the body state with its content type and length, the method, and the endpoint (${thrown.message})`);
+      assert.ok(thrown.message.endsWith(` ${thrown.endpoint})`), `${label}: the marker ends with the endpoint the client called`);
+      assertNoCanary(thrown.message, `${label} thrown message`);
+
+      const results = await runAllAssessments(client, { maxProjects: 5 });
+      const access = await checkGcpAccess(client);
+      assert.deepEqual([...new Set(requests.map((request) => request.status))], [200], `${label}: the fixture served only 200`);
+      assertNoCanary(JSON.stringify(results), `${label} results`);
+      assertNoCanary(JSON.stringify(access), `${label} access check`);
+
+      const byId = findingsById(results);
+      for (const finding of Object.values(byId)) {
+        assert.notEqual(finding.status, "fail", `${label}: ${finding.id} fails on a compliant fixture, a verdict fabricated from an unread surface (${finding.summary})`);
+        assertOnlyServedStatuses(`${label}: ${finding.id} summary`, finding.summary);
+        for (const entry of finding.evidence.unreadable_inventories ?? []) assertOnlyServedStatuses(`${label}: ${finding.id} unreadable_inventories`, entry.error);
+      }
+      for (const id of row.dependents) {
+        assert.ok(byId[id].status === "manual" || byId[id].status === "warn", `${label}: ${id} depends on the unread surface and must be manual or warn, got ${byId[id].status} (${byId[id].summary})`);
+        verdicts[byId[id].status] += 1;
+        const entries = byId[id].evidence.unreadable_inventories ?? [];
+        assert.ok(entries.length > 0, `${label}: ${id} carries unreadable_inventories`);
+        assert.ok(entries.some((entry) => (entry.status === "unreadable" && shape.marker.test(entry.error)) || entry.status === "not_collected"), `${label}: ${id} lists the surface with its marker, or the read it blocked as not collected (${JSON.stringify(entries)})`);
+      }
+      const errors = results.flatMap((result) => result.errors);
+      assert.ok(errors.some((entry) => shape.marker.test(entry)), `${label}: an assessment errors array carries the marker (${errors.join(" | ")})`);
+      for (const entry of errors) assertOnlyServedStatuses(`${label}: errors`, entry);
+      for (const result of results) {
+        assertOnlyServedStatuses(`${label}: ${result.category} summary`, JSON.stringify(result.summary));
+        for (const [path, value] of snapshotLeaves(result.snapshot, SNAPSHOT_SOURCES[result.category])) {
+          const sources = path.split(".").reduce((node, key) => node[key], SNAPSHOT_SOURCES[result.category]);
+          if (!derivedFromUnreadable(sources, row, blockedSurfaces(requests))) continue;
+          assertMarker(`${label}: core_data ${result.category}.${path}`, value);
+          assertOnlyServedStatuses(`${label}: core_data ${result.category}.${path}`, value.error);
+          assert.doesNotMatch(value.error, /<html|<title|Path=\/|__Secure/, `${label}: the marker echoes body text`);
+          markers += 1;
+        }
+      }
+
+      const probeName = SURFACE_ACCESS_PROBES[row.id];
+      if (probeName) {
+        const probe = access.surfaces.find((item) => item.name === probeName);
+        assert.ok(probe, `${label}: the access check probes ${probeName}`);
+        assert.equal(probe.status, "not_readable", `${label}: the access probe must not count the surface as readable (${JSON.stringify(probe)})`);
+        assert.match(probe.error, shape.marker, `${label}: the access probe carries the marker (${probe.error})`);
+      }
+      for (const probe of access.surfaces) if (probe.error) assertOnlyServedStatuses(`${label}: access probe ${probe.name}`, probe.error);
+      assert.ok(!access.surfaces.some((probe) => probe.status === "readable" && (probe.name === probeName)), `${label}: the failed surface is never readable`);
+      walked += 1;
+    }
+  }
+  assert.equal(walked, INVENTORY_SURFACES.length * Object.keys(SILENT_SUCCESS_SHAPES).length);
+  assert.ok(markers > 0 && verdicts.manual > 0, `the walk visited ${markers} markers and ${verdicts.manual} manual plus ${verdicts.warn} warn verdicts, so the assertions are not vacuous`);
 });

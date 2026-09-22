@@ -157,17 +157,43 @@ export interface DuoAssessmentResult {
   category: CheckDefinition["category"];
   findings: DuoFinding[];
   summary: Record<DuoFindingStatus, number>;
-  snapshotSummary: Record<string, number | string>;
+  snapshotSummary: Record<string, number | string | null>;
   text: string;
 }
 
 export interface CollectedDataset<T = unknown> {
   data: T;
   error?: string;
+  /** Path of the request that failed, taken from the observed request rather than a constant. */
+  endpoint?: string;
+  /** HTTP status the failing request actually returned; absent for transport failures. */
+  status?: number;
   /** Documented metadata.total_objects for the list when the API reported it. */
   total?: number;
   /** False when paging stopped before metadata.next_offset was exhausted or a record cap was hit. */
   complete?: boolean;
+}
+
+/**
+ * Written in place of a dataset that was denied, errored, or never collected so that `[]` in
+ * core_data always means "read and empty". status and endpoint come from the observed request.
+ */
+export interface DuoUncollectedMarker {
+  collected: false;
+  status: number | null;
+  endpoint: string | null;
+  error: string;
+}
+
+export class DuoApiError extends Error {
+  constructor(
+    message: string,
+    readonly path: string,
+    readonly status?: number,
+  ) {
+    super(message);
+    this.name = "DuoApiError";
+  }
 }
 
 export interface DuoCollectionStatus {
@@ -976,20 +1002,27 @@ function clampLookbackDays(value: number | undefined): number {
   return Math.min(180, Math.max(1, raw));
 }
 
+/** A configuration value that is absent, not a string, or blank is "not provided", so it never shadows a lower layer. */
+function providedString(value: unknown): string | undefined {
+  if (typeof value !== "string") return undefined;
+  const trimmed = value.trim();
+  return trimmed.length > 0 ? trimmed : undefined;
+}
+
 function overlayFromArgs(args: RawConfigArgs): DuoConfigOverlay {
   return {
-    apiHost: args.api_host?.trim(),
-    ikey: args.ikey?.trim(),
-    skey: args.skey?.trim(),
+    apiHost: providedString(args.api_host),
+    ikey: providedString(args.ikey),
+    skey: providedString(args.skey),
     lookbackDays: parseOptionalNumber(args.lookback_days),
   };
 }
 
 function overlayFromEnv(env: NodeJS.ProcessEnv): DuoConfigOverlay {
   return {
-    apiHost: env.DUO_API_HOST?.trim(),
-    ikey: env.DUO_IKEY?.trim(),
-    skey: env.DUO_SKEY?.trim(),
+    apiHost: providedString(env.DUO_API_HOST),
+    ikey: providedString(env.DUO_IKEY),
+    skey: providedString(env.DUO_SKEY),
     lookbackDays: parseOptionalNumber(env.DUO_LOOKBACK_DAYS),
   };
 }
@@ -1089,6 +1122,189 @@ function parseDetailFromBody(body: unknown): string | undefined {
   return message ?? detail;
 }
 
+/** Non-JSON error bodies (proxy HTML, plain text) are described by shape, never sliced into the message. */
+function describeNonJsonBody(response: Response, text: string): string | undefined {
+  if (text.trim().length === 0) return undefined;
+  const contentType = response.headers.get("content-type")?.split(";")[0]?.trim() || "unknown content type";
+  return `non-JSON body (${contentType}, ${Buffer.byteLength(text, "utf8")} bytes)`;
+}
+
+const REDACTED_ERROR_VALUE = "[REDACTED]";
+const CONFIGURED_SECRETS = new Set<string>();
+const MIN_CONFIGURED_SECRET_LENGTH = 4;
+
+/**
+ * The forms a configured secret can take inside an error string: plain, JSON-escaped, URL-encoded, base64,
+ * and base64url (rule 9 scrub boundary: a configured secret is removed whatever its shape, in every form).
+ */
+function configuredSecretForms(value: string): string[] {
+  const forms = new Set<string>([
+    value,
+    JSON.stringify(value).slice(1, -1),
+    encodeURIComponent(value),
+    Buffer.from(value, "utf8").toString("base64"),
+    Buffer.from(value, "utf8").toString("base64url"),
+  ]);
+  return [...forms].filter((form) => form.length >= MIN_CONFIGURED_SECRET_LENGTH);
+}
+
+/** Secrets the running client was configured with or obtained; every recorded error string is scrubbed of them in every form. */
+function registerConfiguredSecrets(...values: Array<string | undefined>): void {
+  for (const value of values) {
+    if (!value || value.length < MIN_CONFIGURED_SECRET_LENGTH) continue;
+    for (const form of configuredSecretForms(value)) CONFIGURED_SECRETS.add(form);
+  }
+}
+
+function escapeErrorRegExp(text: string): string {
+  return text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+/** Replaces every configured secret form wherever it appears; a form under eight characters only where it stands as a whole token. */
+function scrubConfiguredSecrets(text: string): string {
+  let scrubbed = text;
+  for (const secret of [...CONFIGURED_SECRETS].sort((left, right) => right.length - left.length)) {
+    scrubbed = secret.length >= 8
+      ? scrubbed.split(secret).join(REDACTED_ERROR_VALUE)
+      : scrubbed.replace(new RegExp(`(?<![A-Za-z0-9])${escapeErrorRegExp(secret)}(?![A-Za-z0-9])`, "g"), REDACTED_ERROR_VALUE);
+  }
+  return scrubbed;
+}
+
+const ERROR_CREDENTIAL_KEY_PATTERN =
+  "[A-Za-z0-9_.-]*(?:token|secret|passw(?:or)?d|pwd|api[_-]?key|apikey|session(?:[_-]?id)?|sid|cookie|csrftoken|authorization|auth|signature|sig|nonce|credentials?|access[_-]?key|private[_-]?key|skey)";
+// key=value, key: value, and "key":"value" pairs whose key names a credential; the value's shape decides below.
+const ERROR_CREDENTIAL_PAIR_PATTERN = new RegExp(
+  `\\b(${ERROR_CREDENTIAL_KEY_PATTERN})(["']?\\s*[=:]\\s*["']?)((?:(?:Bearer|Basic|Digest|Token|ApiKey)\\s+)?[^\\s"'&;,<>]+)`,
+  "gi",
+);
+const TRAILING_PUNCTUATION_PATTERN = /[.!?:)]+$/;
+
+/**
+ * A value after a credential-named key is the credential (whatever its shape) when it is at least six
+ * characters and is twelve or longer, carries a digit or a character that is not a letter, or changes case
+ * inside the word. Short plain words after a colon ("InvalidAuthenticationToken: Access token has expired")
+ * are prose and stay.
+ */
+function looksLikeCredentialValue(value: string): boolean {
+  return value.length >= 6 && (value.length >= 12 || /\d/.test(value) || /[^A-Za-z]/.test(value) || /[a-z][A-Z]/.test(value));
+}
+
+function scrubCredentialPairs(text: string): string {
+  return text.replace(ERROR_CREDENTIAL_PAIR_PATTERN, (match: string, key: string, separator: string, value: string) => {
+    // A value the scheme rule already replaced ("Authorization: Bearer [REDACTED]") keeps its scheme name.
+    if (value.includes(REDACTED_ERROR_VALUE)) return match;
+    const core = value.replace(TRAILING_PUNCTUATION_PATTERN, "");
+    return looksLikeCredentialValue(core) ? `${key}${separator}${REDACTED_ERROR_VALUE}${value.slice(core.length)}` : match;
+  });
+}
+
+const ERROR_TEXT_PATTERNS: ReadonlyArray<readonly [RegExp, string]> = [
+  // Authorization scheme values wherever they appear (headers, cookies, HTML, JSON messages); the value must be
+  // long, carry a digit or base64 symbol, or change case inside the word, so prose such as "Basic authentication"
+  // and "Bearer Token" stays.
+  // Case-sensitive so the inner-case-change test means what it says (under /i, [a-z][A-Z] is any two letters).
+  [/\b(Bearer|bearer|BEARER|Basic|basic|BASIC|Digest|digest|Negotiate|negotiate|SSWS|Token|token|TOKEN|ApiKey|apikey|APIKEY|Api-Key|api-key)\s+(?=[A-Za-z0-9\-._~+/=:]{16,}|[A-Za-z0-9\-._~+/=:]*[\d+/=]|[A-Za-z0-9\-._~+/=:]*[a-z][A-Z])[A-Za-z0-9\-._~+/=:]{6,}/g, `$1 ${REDACTED_ERROR_VALUE}`],
+  // JWT-shaped strings.
+  [/\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}/g, REDACTED_ERROR_VALUE],
+  // PEM blocks, whole or cut off.
+  [/-----BEGIN [A-Z0-9 ]+-----[\s\S]*?(?:-----END [A-Z0-9 ]+-----|$)/g, REDACTED_ERROR_VALUE],
+  // AWS access key ids, 40-character secret access keys, long secret-shaped blobs, and hex digests.
+  [/\b(?:AKIA|ASIA|AROA|AIDA|AGPA|ANPA|ANVA|APKA|ABIA|ACCA)[A-Z0-9]{16}\b/g, REDACTED_ERROR_VALUE],
+  [/(?<![A-Za-z0-9/+=])[A-Za-z0-9/+]{40}(?![A-Za-z0-9/+=])/g, REDACTED_ERROR_VALUE],
+  // Long blobs must carry a digit so camelCase identifiers survive.
+  [/(?<![A-Za-z0-9+_=-])(?=[A-Za-z0-9+_-]*\d)[A-Za-z0-9+_-]{40,}={0,2}(?![A-Za-z0-9+_=-])/g, REDACTED_ERROR_VALUE],
+  [/\b[a-f0-9]{32,}\b/gi, REDACTED_ERROR_VALUE],
+  // Cookie headers carry session values in free form.
+  [/\b(set-cookie|cookie)(\s*[:=]\s*)[^\n<>]+/gi, `$1$2${REDACTED_ERROR_VALUE}`],
+];
+
+// URL userinfo and query strings anywhere in the string, not only when the string starts with a URL.
+const ERROR_URL_PATTERN = /\b(https?:\/\/)(?:[^\s/@"'<>]+@)?([^\s?#"'<>]+)(\?[^\s#"'<>]*)?/gi;
+
+/**
+ * Rule 9 scrub boundary for bare values. A run of 16 or more token characters is removed when it is shaped
+ * like a token (base64 symbols, digits scattered through its letters, or casing that breaks into one- and
+ * two-letter camelCase pieces) and kept when it is shaped like a name: "-" or "_" separated segments that are
+ * each letters in any casing, digits alone, or letters with one digit group (`prod-us-east-2026`,
+ * `AWSLambdaBasicExecutionRole`, `sha256`), an uppercase code, or a canonical UUID. "/", ".", ":", "@", and
+ * whitespace end a run, so path segments, hostnames, ARNs, and emails are judged piece by piece. Opaque
+ * identifiers whose shape is a token's are removed from error text as well; they travel in structured fields.
+ */
+const LONG_TOKEN_RUN_PATTERN = /[A-Za-z0-9+_-]{16,}(?:={1,2}(?![A-Za-z0-9&]))?/g;
+const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const UPPERCASE_CODE_PATTERN = /^[A-Z][A-Z_]*$|^[A-Z][A-Z0-9]*(?:[_-][A-Z0-9]+)+$/;
+const MIN_LETTERS_FOR_CASING = 6;
+
+const CAMEL_WORD_PATTERN = /[A-Z]+(?![a-z])|[A-Z]?[a-z]+/g;
+const MAX_SHORT_WORD_LENGTH = 2;
+
+/**
+ * Token-shaped casing. Split at camelCase boundaries, a name is words and acronyms of three letters or more
+ * (`GetAccessKeyLastUsed`, `AWSLambdaBasicExecutionRole`, `getHTTPSUrl`), while a random run breaks into
+ * one- and two-letter pieces (`bPxRfiCYcanaryKEYqm`: b, Px, C, KE). Two or more such pieces making up at
+ * least a third of the words is the token signal; one short word (`GetEbsEncryptionByDefault`) is a name.
+ */
+function hasTokenCasing(letters: string): boolean {
+  if (letters.length < MIN_LETTERS_FOR_CASING) return false;
+  const words = letters.match(CAMEL_WORD_PATTERN) ?? [];
+  const shortWords = words.filter((word) => word.length <= MAX_SHORT_WORD_LENGTH).length;
+  return shortWords >= 2 && shortWords * 3 >= words.length;
+}
+
+/** A "-" or "_" separated segment shaped like part of a name: empty, digits alone, or letters with at most one digit group and no token casing. */
+function isNameSegment(segment: string): boolean {
+  if (segment.length === 0 || /^\d+$/.test(segment)) return true;
+  if (!/^[A-Za-z0-9]+$/.test(segment)) return false;
+  if ((segment.match(/\d+/g) ?? []).length > 1) return false;
+  return !hasTokenCasing(segment.replace(/\d+/g, ""));
+}
+
+function looksLikeToken(run: string): boolean {
+  if (UUID_PATTERN.test(run) || UPPERCASE_CODE_PATTERN.test(run)) return false;
+  if (/[+=]/.test(run)) return true;
+  return run.split(/[-_]/).some((segment) => !isNameSegment(segment));
+}
+
+function scrubLongTokens(text: string): string {
+  return text.replace(LONG_TOKEN_RUN_PATTERN, (run: string) => (looksLikeToken(run) ? REDACTED_ERROR_VALUE : run));
+}
+
+/**
+ * Rule 9 sink for error text. Every error string passes through here before it is recorded in a
+ * dataset, access probe, finding, summary, tool result, or bundle file, so no path can carry a
+ * credential echoed by an upstream error body, a transport error, or a URL into the audit output.
+ */
+export function redactErrorText(text: string): string {
+  let scrubbed = scrubConfiguredSecrets(text);
+  scrubbed = scrubbed.replace(ERROR_URL_PATTERN, (_match, scheme: string, hostPath: string, query?: string) =>
+    `${scheme}${hostPath}${query ? `?${REDACTED_ERROR_VALUE}` : ""}`,
+  );
+  for (const [pattern, replacement] of ERROR_TEXT_PATTERNS) {
+    scrubbed = scrubbed.replace(pattern, replacement);
+  }
+  scrubbed = scrubCredentialPairs(scrubbed);
+  return scrubLongTokens(scrubbed);
+}
+
+/**
+ * A parser's message quotes the text it could not parse (V8: `Unexpected token '<', "<html>..." is not valid
+ * JSON`), so a SyntaxError from any parse of a body or document is recorded by name only. Every JSON.parse in
+ * this file already substitutes the status-and-length note in its own catch; this keeps the property even
+ * for a parse failure that escapes one.
+ */
+function isParseError(error: unknown): boolean {
+  return error instanceof SyntaxError || (typeof error === "object" && error !== null && (error as { name?: unknown }).name === "SyntaxError");
+}
+
+const PARSE_ERROR_NOTE = "SyntaxError: response could not be parsed as JSON; the parser's message is not recorded because it quotes the body";
+
+/** The only way a thrown error becomes recorded text. */
+function describeThrown(error: unknown): string {
+  if (isParseError(error)) return PARSE_ERROR_NOTE;
+  return redactErrorText(error instanceof Error ? error.message : String(error));
+}
+
 function extractMetadata(payload: unknown): JsonRecord {
   const envelope = asRecord(payload);
   const topLevel = asRecord(envelope.metadata);
@@ -1113,13 +1329,50 @@ function extractArrayPayload(payload: unknown): JsonRecord[] {
   return [];
 }
 
+/**
+ * Cursor value from metadata.next_offset. Offset endpoints (v1 users, admins, bypass codes,
+ * v3 integrations) document an integer; a numeric string is accepted as the same offset so a
+ * tenant that serialises it differently still pages instead of silently stopping.
+ */
 function nextOffsetValue(metadata: JsonRecord, key: "offset" | "next_offset"): string | number | undefined {
   const raw = metadata.next_offset;
   if (raw === undefined || raw === null) return undefined;
-  if (key === "offset" && typeof raw === "number") return raw;
+  if (key === "offset") {
+    if (typeof raw === "number") return raw;
+    if (typeof raw === "string" && /^\d+$/.test(raw.trim())) return Number.parseInt(raw.trim(), 10);
+    return typeof raw === "string" ? raw : undefined;
+  }
   if (typeof raw === "string" || typeof raw === "number") return raw;
   if (Array.isArray(raw)) return raw.map(String).join(",");
   return undefined;
+}
+
+/** True when metadata.next_offset is present in any shape, even one the pager cannot use. */
+function hasNextOffset(metadata: JsonRecord): boolean {
+  return metadata.next_offset !== undefined && metadata.next_offset !== null;
+}
+
+const REDACTED_VALUE = "[REDACTED]";
+/** Integrations v3 records carry secret_key (masked to its last four characters on list, but credential-shaped). */
+const INTEGRATION_SECRET_FIELDS = /^(secret_key|secretkey|skey)$/i;
+/** Retrieve Bypass Codes documents that the code value is omitted; strip it anyway in case a tenant returns it. */
+const BYPASS_CODE_FIELDS = /^(code|bypass_code)$/i;
+
+/** Replaces every value whose key matches `pattern`, recursing through nested objects and arrays. */
+export function redactFields<T>(value: T, pattern: RegExp): T {
+  if (Array.isArray(value)) return value.map((item) => redactFields(item, pattern)) as T;
+  if (typeof value !== "object" || value === null) return value;
+  return Object.fromEntries(
+    Object.entries(value as JsonRecord).map(([key, entry]) => [key, pattern.test(key) ? REDACTED_VALUE : redactFields(entry, pattern)]),
+  ) as T;
+}
+
+export function redactIntegrationRecords(records: JsonRecord[]): JsonRecord[] {
+  return redactFields(records, INTEGRATION_SECRET_FIELDS);
+}
+
+export function redactBypassCodeRecords(records: JsonRecord[]): JsonRecord[] {
+  return redactFields(records, BYPASS_CODE_FIELDS);
 }
 
 export class DuoAuditorClient {
@@ -1130,6 +1383,7 @@ export class DuoAuditorClient {
   constructor(config: DuoResolvedConfig, options?: { fetchImpl?: FetchImpl }) {
     this.config = config;
     this.fetchImpl = options?.fetchImpl ?? fetch;
+    registerConfiguredSecrets(config.ikey, config.skey);
   }
 
   /** Paging outcome of the most recent list call for a documented endpoint path. */
@@ -1204,8 +1458,14 @@ export class DuoAuditorClient {
     }
 
     for (let attempt = 0; attempt <= MAX_RETRIES; attempt += 1) {
-      const response = await this.fetchImpl(url, { method, headers, body: body || undefined });
-      const text = await response.text();
+      let response: Response;
+      let text: string;
+      try {
+        response = await this.fetchImpl(url, { method, headers, body: body || undefined });
+        text = await response.text();
+      } catch (error) {
+        throw new DuoApiError(`Duo API request failed for ${path} (network error: ${describeThrown(error)})`, path);
+      }
       let parsed: JsonRecord | null = null;
 
       if (text.trim().length > 0) {
@@ -1224,24 +1484,29 @@ export class DuoAuditorClient {
         continue;
       }
 
+      // Only the documented message fields of a JSON envelope are quoted; anything else is described by shape.
+      const detail = parsed ? parseDetailFromBody(parsed) : describeNonJsonBody(response, text);
+
       if (!response.ok) {
-        const detail = parseDetailFromBody(parsed ?? text);
-        throw new Error(
-          `Duo API request failed for ${path} (${response.status} ${response.statusText})${detail ? `: ${detail}` : ""}`,
+        throw new DuoApiError(
+          redactErrorText(`Duo API request failed for ${path} (${response.status} ${response.statusText})${detail ? `: ${detail}` : ""}`),
+          path,
+          response.status,
         );
       }
 
       if (!parsed || asString(parsed.stat) !== "OK") {
-        const detail = parseDetailFromBody(parsed ?? text);
-        throw new Error(
-          `Duo API request returned an unexpected payload for ${path}${detail ? `: ${detail}` : ""}`,
+        throw new DuoApiError(
+          redactErrorText(`Duo API request returned an unexpected payload for ${path}${detail ? `: ${detail}` : ""}`),
+          path,
+          response.status,
         );
       }
 
       return parsed;
     }
 
-    throw new Error(`Duo API request exceeded retry budget for ${path}.`);
+    throw new DuoApiError(`Duo API request exceeded retry budget for ${path} (429 Too Many Requests).`, path, 429);
   }
 
   private async request<T>(
@@ -1288,9 +1553,9 @@ export class DuoAuditorClient {
     return this.listOffsetPages(DUO_ENDPOINTS.users, {}, OFFSET_PAGE_SIZE);
   }
 
-  /** Admin API reference: Bypass Codes > Retrieve Bypass Codes. */
+  /** Admin API reference: Bypass Codes > Retrieve Bypass Codes. Code values are stripped before the records are kept. */
   async listBypassCodes(): Promise<JsonRecord[]> {
-    return this.listOffsetPages(DUO_ENDPOINTS.bypassCodes, {}, OFFSET_PAGE_SIZE);
+    return redactBypassCodeRecords(await this.listOffsetPages(DUO_ENDPOINTS.bypassCodes, {}, OFFSET_PAGE_SIZE));
   }
 
   /** Admin API reference: WebAuthn Credentials > Retrieve WebAuthn Credentials (limit max 500). */
@@ -1303,9 +1568,9 @@ export class DuoAuditorClient {
     return this.listOffsetPages(DUO_ENDPOINTS.admins, {}, OFFSET_PAGE_SIZE);
   }
 
-  /** Admin API reference: Integrations > Retrieve Integrations (v3, limit max 500). */
+  /** Admin API reference: Integrations > Retrieve Integrations (v3, limit max 500). secret_key is redacted before the records are kept. */
   async listIntegrations(): Promise<JsonRecord[]> {
-    return this.listOffsetPages(DUO_ENDPOINTS.integrations, {}, OFFSET_PAGE_SIZE, 5);
+    return redactIntegrationRecords(await this.listOffsetPages(DUO_ENDPOINTS.integrations, {}, OFFSET_PAGE_SIZE, 5));
   }
 
   /** Admin API reference: Logs > Authentication Logs (v2, mintime and maxtime in milliseconds). */
@@ -1375,10 +1640,12 @@ export class DuoAuditorClient {
         limit: Math.min(TRUST_MONITOR_PAGE_SIZE, Math.max(1, maxRecords - items.length)),
         offset: cursor,
       });
-      items.push(...extractArrayPayload(envelope.response));
+      const page = extractArrayPayload(envelope.response);
+      items.push(...page);
       const next = nextOffsetValue(extractMetadata(envelope), "next_offset");
       if (next === undefined) break;
-      if (items.length >= maxRecords) {
+      // A cursor that repeats or arrives with an empty page would loop forever; stop and report the walk incomplete.
+      if (items.length >= maxRecords || String(next) === cursor || page.length === 0) {
         complete = false;
         break;
       }
@@ -1407,15 +1674,23 @@ export class DuoAuditorClient {
         { ...params, limit: pageSize, offset },
         signatureVersion ? { signatureVersion } : undefined,
       );
-      items.push(...extractArrayPayload(envelope.response));
+      const page = extractArrayPayload(envelope.response);
+      items.push(...page);
       const metadata = extractMetadata(envelope);
       totalObjects = asNumber(metadata.total_objects) ?? totalObjects;
       const next = nextOffsetValue(metadata, "offset");
+      const hasNext = hasNextOffset(metadata);
       if (maxRecords && items.length >= maxRecords) {
-        complete = typeof next !== "number" && items.length <= maxRecords;
+        complete = !hasNext && items.length <= maxRecords;
         break;
       }
-      if (typeof next !== "number") break;
+      if (!hasNext) break;
+      // next_offset is present but not an offset this pager can send back, repeats the offset just
+      // fetched, or arrived with an empty page: every one of those would loop or skip records.
+      if (typeof next !== "number" || next <= offset || page.length === 0) {
+        complete = false;
+        break;
+      }
       offset = next;
     }
 
@@ -1442,11 +1717,17 @@ export class DuoAuditorClient {
         sort: "ts:desc",
         next_offset: nextOffset,
       });
-      items.push(...extractArrayPayload(envelope.response));
+      const page = extractArrayPayload(envelope.response);
+      items.push(...page);
       const metadata = extractMetadata(envelope);
       totalObjects = asNumber(metadata.total_objects) ?? totalObjects;
       const next = nextOffsetValue(metadata, "next_offset");
       if (next === undefined) break;
+      // A cursor that repeats or arrives with an empty page would loop forever; stop and report the walk incomplete.
+      if (String(next) === nextOffset || page.length === 0) {
+        complete = false;
+        break;
+      }
       nextOffset = String(next);
       if (items.length >= maxRecords) complete = false;
     }
@@ -1512,21 +1793,27 @@ function daysSince(value: unknown): number | null {
 
 type CollectionStatusLookup = Partial<Pick<DuoAuditorClient, "collectionStatus">>;
 
-function collectionStatusFor(client: CollectionStatusLookup, path: string): DuoCollectionStatus | undefined {
-  return typeof client.collectionStatus === "function" ? client.collectionStatus(path) : undefined;
+/**
+ * undefined: the client does not track paging outcomes at all (duck-typed fixtures).
+ * null: the client tracks them but recorded none for this path, so the walk cannot be presumed complete.
+ */
+function collectionStatusFor(client: CollectionStatusLookup, path: string): DuoCollectionStatus | null | undefined {
+  if (typeof client.collectionStatus !== "function") return undefined;
+  return client.collectionStatus(path) ?? null;
 }
 
 async function collectArrayDataset<T extends JsonRecord>(
   loader: () => Promise<T[]>,
-  statusLookup?: () => DuoCollectionStatus | undefined,
+  statusLookup?: () => DuoCollectionStatus | null | undefined,
 ): Promise<CollectedDataset<T[]>> {
   try {
     const data = await loader();
     const status = statusLookup?.();
-    if (!status) return { data };
+    if (status === undefined) return { data };
+    if (status === null) return { data, total: undefined, complete: false };
     return { data, total: status.totalObjects, complete: status.complete };
   } catch (error) {
-    return { data: [], error: error instanceof Error ? error.message : String(error) };
+    return { data: [], ...describeFailedRead(error) };
   }
 }
 
@@ -1537,8 +1824,18 @@ async function collectObjectDataset<T>(
   try {
     return { data: await loader() };
   } catch (error) {
-    return { data: fallback, error: error instanceof Error ? error.message : String(error) };
+    return { data: fallback, ...describeFailedRead(error) };
   }
+}
+
+/** The failure fields of a dataset: the scrubbed message plus the path and status the request actually observed. */
+function describeFailedRead(error: unknown): Pick<CollectedDataset, "error" | "endpoint" | "status"> {
+  const failure: Pick<CollectedDataset, "error" | "endpoint" | "status"> = { error: describeThrown(error) };
+  if (error instanceof DuoApiError) {
+    failure.endpoint = error.path;
+    if (error.status !== undefined) failure.status = error.status;
+  }
+  return failure;
 }
 
 export type DuoAuthenticationClient = Pick<
@@ -1597,7 +1894,7 @@ export async function collectDuoAuthenticationData(
       () =>
         client.listOfflineEnrollmentLogs
           ? client.listOfflineEnrollmentLogs(lookbackDays)
-          : Promise.reject(new Error(`${DUO_ENDPOINTS.offlineEnrollmentLogs} is not available on this client.`)),
+          : Promise.reject(new Error(`${DUO_ENDPOINTS.offlineEnrollmentLogs} was not attempted: this client does not expose it.`)),
       status(DUO_ENDPOINTS.offlineEnrollmentLogs),
     ),
   };
@@ -1632,7 +1929,7 @@ export async function collectDuoIntegrationData(
       () =>
         client.getInfoSummary
           ? client.getInfoSummary()
-          : Promise.reject(new Error(`${DUO_ENDPOINTS.infoSummary} is not available on this client.`)),
+          : Promise.reject(new Error(`${DUO_ENDPOINTS.infoSummary} was not attempted: this client does not expose it.`)),
       null,
     ),
   };
@@ -1666,7 +1963,7 @@ export async function collectDuoMonitoringData(
       () =>
         client.getAuthenticationAttempts
           ? client.getAuthenticationAttempts(lookbackDays)
-          : Promise.reject(new Error(`${DUO_ENDPOINTS.authenticationAttempts} is not available on this client.`)),
+          : Promise.reject(new Error(`${DUO_ENDPOINTS.authenticationAttempts} was not attempted: this client does not expose it.`)),
       null,
     ),
   };
@@ -1709,10 +2006,10 @@ function buildAssessmentText(
   title: string,
   organization: string,
   findings: DuoFinding[],
-  snapshotSummary: Record<string, number | string>,
+  snapshotSummary: Record<string, number | string | null>,
 ): string {
   const summary = summarizeFindings(findings);
-  const summaryLines = Object.entries(snapshotSummary).map(([key, value]) => `${key.replace(/_/g, " ")}: ${value}`);
+  const summaryLines = Object.entries(snapshotSummary).map(([key, value]) => `${key.replace(/_/g, " ")}: ${value ?? "unread"}`);
   const rows = findings.map((finding) => [
     finding.title,
     finding.status,
@@ -1854,6 +2151,79 @@ function listErrors(datasets: Array<CollectedDataset<unknown> | undefined>): str
   return datasets
     .map((dataset) => dataset?.error)
     .filter((item): item is string => Boolean(item));
+}
+
+export interface DuoCollectionStatusEntry {
+  readable: boolean;
+  /** Record count for list endpoints; null when the read failed, absent for single-object reads. */
+  records?: number | null;
+  /** metadata.total_objects when the endpoint reported one; null when the read never completed. */
+  total?: number | null;
+  /** Paging outcome when the client tracked it; false means the walk stopped early, null when the read never ran. */
+  complete?: boolean | null;
+  /** HTTP status the failing request observed; null when the failure was not an HTTP response. */
+  status?: number | null;
+  /** Path of the request that failed, as observed; null when no request reached the API. */
+  endpoint?: string | null;
+  error?: string;
+}
+
+const NOT_COLLECTED = "not collected: this client does not expose the endpoint, so no request was attempted";
+
+function uncollectedMarker(dataset: CollectedDataset<unknown> | undefined): DuoUncollectedMarker {
+  return {
+    collected: false,
+    status: dataset?.status ?? null,
+    endpoint: dataset?.endpoint ?? null,
+    error: dataset?.error ?? NOT_COLLECTED,
+  };
+}
+
+/**
+ * Collection outcome per dataset for core_data/collection_status.json. The raw records already live
+ * in their own core_data files, so only counts, totals, paging outcome, and the error are kept here.
+ */
+export function projectCollectionStatus(
+  datasets: Record<string, CollectedDataset<unknown> | undefined>,
+): Record<string, DuoCollectionStatusEntry> {
+  return Object.fromEntries(
+    Object.entries(datasets).map(([name, dataset]) => {
+      if (!dataset) {
+        return [name, { readable: false, records: null, total: null, complete: null, status: null, endpoint: null, error: NOT_COLLECTED }];
+      }
+      if (dataset.error) {
+        // A read that never completed has no count, total, or paging outcome; the flags stay null
+        // instead of defaulting to 0 / true, and the status and path are the ones the request observed.
+        const failed: DuoCollectionStatusEntry = { readable: false, error: dataset.error, status: dataset.status ?? null, endpoint: dataset.endpoint ?? null };
+        if (Array.isArray(dataset.data)) Object.assign(failed, { records: null, total: null, complete: null });
+        return [name, failed];
+      }
+      const entry: DuoCollectionStatusEntry = { readable: true };
+      if (Array.isArray(dataset.data)) entry.records = dataset.data.length;
+      else if (dataset.data === null || dataset.data === undefined) entry.readable = false;
+      if (dataset.total !== undefined) entry.total = dataset.total;
+      if (dataset.complete !== undefined) entry.complete = dataset.complete;
+      return [name, entry];
+    }),
+  );
+}
+
+/** The client prefixes every failure with the request path; drop it where the endpoint is already named. */
+function describeReadFailure(endpoint: string, error: string): string {
+  const prefix = `Duo API request failed for ${endpoint} `;
+  return `${endpoint} ${error.startsWith(prefix) ? error.slice(prefix.length) : `failed: ${error}`}`;
+}
+
+/** Snapshot count for a list dataset: null (rendered "unread") when the read failed or was never collected. */
+function readCount(dataset: CollectedDataset<unknown[]> | undefined): number | null {
+  if (!dataset || dataset.error) return null;
+  return dataset.data.length;
+}
+
+/** Bundle payload for a dataset: a not-collected marker when the read failed or never ran, never the empty fallback. */
+function readData(dataset: CollectedDataset<unknown> | undefined): unknown {
+  if (!dataset || dataset.error) return uncollectedMarker(dataset);
+  return dataset.data ?? null;
 }
 
 function unavailableEvidence(endpoint: string, permission: string, error: string | undefined, collect: string): string[] {
@@ -2264,13 +2634,22 @@ export function assessDuoAuthentication(
   const verifiedDigits = asNumber(authMethods.verified_push_digits);
   const hasWebAuthn = allowedFactors.some((factor) => factor.includes("webauthn"));
   const allowsPush = allowedFactors.some((factor) => factor.includes("duo-push") || factor.includes("verified_duo_push"));
+  const adminMethods = asRecord(data.allowedAdminAuthMethods.data);
+  const adminMethodsUnreadable = Boolean(data.allowedAdminAuthMethods.error) || Object.keys(adminMethods).length === 0;
   const strongFactorEvidence = [
     hasWebAuthn ? "WebAuthn is allowed in authentication_methods.allowed_auth_list." : undefined,
     allowsPush && requireVerifiedPush ? `Verified Duo Push required (${verifiedDigits ?? 0} digits).` : undefined,
-    data.allowedAdminAuthMethods.data && getBooleanish(data.allowedAdminAuthMethods.data, "webauthn_enabled")
-      ? "Admin auth methods allow WebAuthn."
-      : undefined,
+    !adminMethodsUnreadable && getBooleanish(adminMethods, "webauthn_enabled") ? "Admin auth methods allow WebAuthn." : undefined,
   ].filter((item): item is string => Boolean(item));
+  // Retrieve Allowed Authentication Methods is a supporting read: the verdict rests on the global
+  // policy, so a failed read is named as unread rather than shown as "no WebAuthn for administrators".
+  const adminMethodsEvidence = adminMethodsUnreadable
+    ? `admin_allowed_auth_methods=unread (${
+        data.allowedAdminAuthMethods.error
+          ? describeReadFailure(DUO_ENDPOINTS.adminAllowedAuthMethods, data.allowedAdminAuthMethods.error)
+          : `${DUO_ENDPOINTS.adminAllowedAuthMethods} returned no usable payload`
+      }; requires ${DUO_PERMISSIONS.adminsRead}); administrator WebAuthn posture was not confirmed.`
+    : `admin_allowed_auth_methods.webauthn_enabled=${getBooleanish(adminMethods, "webauthn_enabled") ?? false}`;
 
   const userAuthBehavior = asString(asRecord(getPolicySections(globalPolicy).authentication_policy).user_auth_behavior)?.toLowerCase();
   if (policyUnavailable) {
@@ -2341,7 +2720,7 @@ export function assessDuoAuthentication(
         "DUO-AUTH-001",
         "Pass",
         "The global authentication policy includes phishing-resistant factors.",
-        strongFactorEvidence,
+        [...strongFactorEvidence, adminMethodsEvidence],
         "Keep WebAuthn and Verified Duo Push coverage in policy and enrollment guidance.",
       ),
     );
@@ -2351,7 +2730,10 @@ export function assessDuoAuthentication(
         "DUO-AUTH-001",
         "Partial",
         "Duo Push or administrator hardening exists, but phishing-resistant coverage is incomplete or not enforced globally.",
-        strongFactorEvidence.length > 0 ? strongFactorEvidence : ["No explicit WebAuthn or Verified Duo Push requirement found in the global policy."],
+        [
+          ...(strongFactorEvidence.length > 0 ? strongFactorEvidence : ["No explicit WebAuthn or Verified Duo Push requirement found in the global policy."]),
+          adminMethodsEvidence,
+        ],
         "Prefer WebAuthn and Verified Duo Push as the default factors for regulated tenants.",
       ),
     );
@@ -2361,7 +2743,7 @@ export function assessDuoAuthentication(
         "DUO-AUTH-001",
         "Fail",
         "The global policy does not show phishing-resistant factors.",
-        ["No WebAuthn or Verified Duo Push requirement was detected in the collected policy data."],
+        ["No WebAuthn or Verified Duo Push requirement was detected in the collected policy data.", adminMethodsEvidence],
         "Enable WebAuthn or Verified Duo Push in Duo authentication methods before relying on the tenant for higher-assurance workflows.",
       ),
     );
@@ -2600,6 +2982,12 @@ export function assessDuoAuthentication(
   const helpdeskBypass = asString(asRecord(data.settings.data).helpdesk_bypass)?.toLowerCase();
   const helpdeskBypassExpiration = asNumber(asRecord(data.settings.data).helpdesk_bypass_expiration);
   const bypassReview = reviewBypassCodes(data.bypassCodes.data);
+  // Retrieve Settings supplies the help desk issuance limits; when that read failed, the limits are
+  // unread rather than "unknown", and the empty-inventory verdict cannot rise above Partial.
+  const settingsReadFailure = data.settings.error ? describeReadFailure(DUO_ENDPOINTS.settings, data.settings.error) : undefined;
+  const helpdeskEvidence = settingsReadFailure
+    ? [`helpdesk_bypass=unread (${settingsReadFailure}; requires ${DUO_PERMISSIONS.settings})`, "helpdesk_bypass_expiration=unread"]
+    : [`helpdesk_bypass=${helpdeskBypass ?? "unknown"}`, `helpdesk_bypass_expiration=${helpdeskBypassExpiration ?? "unset"}`];
   const bypassEvidence = [
     `active_bypass_codes=${bypassCount}`,
     `codes_older_than_24_hours=${bypassReview.stale.length}`,
@@ -2607,8 +2995,7 @@ export function assessDuoAuthentication(
     `codes_without_expiration=${bypassReview.neverExpire}`,
     `codes_undated=${bypassReview.undated}`,
     `codes_expired=${bypassReview.expired}`,
-    `helpdesk_bypass=${helpdeskBypass ?? "unknown"}`,
-    `helpdesk_bypass_expiration=${helpdeskBypassExpiration ?? "unset"}`,
+    ...helpdeskEvidence,
     ...bypassReview.stale.slice(0, 5).map((code) =>
       `stale_bypass_code=${code.id} user=${code.user} created=${code.created} age_hours=${code.ageHours}`,
     ),
@@ -2638,10 +3025,14 @@ export function assessDuoAuthentication(
       withInventoryCap(
         buildFinding(
           "DUO-AUTH-006",
-          "Pass",
-          "No active bypass codes were returned.",
-          ["Global bypass code inventory is empty, which is compliant by intent: no outstanding break-glass codes."],
-          "Keep break-glass issuance exceptional and time-bounded.",
+          settingsReadFailure ? "Partial" : "Pass",
+          settingsReadFailure
+            ? `No active bypass codes were returned, but help desk issuance limits could not be read: ${settingsReadFailure}. The zero-code verdict is capped at Partial.`
+            : "No active bypass codes were returned.",
+          ["Global bypass code inventory is empty, which is compliant by intent: no outstanding break-glass codes.", ...helpdeskEvidence],
+          settingsReadFailure
+            ? `Grant the audit principal ${DUO_PERMISSIONS.settings} so helpdesk_bypass and helpdesk_bypass_expiration can be verified alongside the empty inventory.`
+            : "Keep break-glass issuance exceptional and time-bounded.",
         ),
         data.bypassCodes,
       ),
@@ -2694,11 +3085,11 @@ export function assessDuoAuthentication(
   findings.push(...assessUserPopulation(data));
 
   const snapshotSummary = {
-    users: data.users.data.length,
-    active_bypass_codes: bypassCount,
-    webauthn_credentials: data.webauthnCredentials.data.length,
-    auth_logs_collected: data.authenticationLogs.data.length,
-    offline_enrollment_events: data.offlineEnrollmentLogs?.data.length ?? 0,
+    users: readCount(data.users),
+    active_bypass_codes: readCount(data.bypassCodes),
+    webauthn_credentials: readCount(data.webauthnCredentials),
+    auth_logs_collected: readCount(data.authenticationLogs),
+    offline_enrollment_events: readCount(data.offlineEnrollmentLogs),
   };
 
   return {
@@ -3011,12 +3402,13 @@ export function assessDuoAdminAccess(
 
   // Activity logs are collected into core_data as evidence; DUO-MON-004 belongs to the
   // monitoring assessment only, so no finding id is emitted twice across tools.
+  const adminsUnread = Boolean(data.admins.error);
   const snapshotSummary = {
-    admins: admins.length,
-    owners: ownerCount,
-    stale_admins: staleAdmins.length,
-    undated_admins: undatedAdmins.length,
-    activity_logs_collected: data.activityLogs.data.length,
+    admins: readCount(data.admins),
+    owners: adminsUnread ? null : ownerCount,
+    stale_admins: adminsUnread ? null : staleAdmins.length,
+    undated_admins: adminsUnread ? null : undatedAdmins.length,
+    activity_logs_collected: readCount(data.activityLogs),
     activity_logs_readable: data.activityLogs.error ? `no (${data.activityLogs.error})` : "yes",
   };
 
@@ -3463,11 +3855,12 @@ export function assessDuoIntegrations(
   findings.push(assessCriticalApplications(data, integrationsEvidence));
   findings.push(assessDeviceHealthDepth(data));
 
+  const integrationsUnread = Boolean(data.integrations.error);
   const snapshotSummary = {
-    protected_integrations: integrations.length,
-    policies: data.policies.data.length,
-    adminapi_integrations: adminApiIntegrations.length,
-    overprivileged_adminapi_integrations: overPrivilegedAdminApis.length,
+    protected_integrations: integrationsUnread ? null : integrations.length,
+    policies: readCount(data.policies),
+    adminapi_integrations: integrationsUnread ? null : adminApiIntegrations.length,
+    overprivileged_adminapi_integrations: integrationsUnread ? null : overPrivilegedAdminApis.length,
     edition: asString(asRecord(data.infoSummary?.data).edition) ?? "unknown",
   };
 
@@ -3536,7 +3929,7 @@ function assessAuthenticationAnomalies(data: DuoMonitoringData, config: DuoResol
       unavailableEvidence(
         DUO_ENDPOINTS.authenticationAttempts,
         DUO_PERMISSIONS.readInformation,
-        attempts?.error ?? `${DUO_ENDPOINTS.authenticationAttempts} was not collected.`,
+        attempts?.error ?? `${DUO_ENDPOINTS.authenticationAttempts} was not attempted: this client does not expose it.`,
         "Export the Authentication Summary report from the Duo Admin Panel for the review window.",
       ),
       "Grant the audit principal Grant read information so fraud, failure, and error counts can be reviewed.",
@@ -3904,9 +4297,9 @@ export function assessDuoMonitoring(
   }
 
   const snapshotSummary = {
-    auth_logs_collected: authLogs.length,
-    trust_monitor_events: trustMonitorEvents.length,
-    telephony_logs: telephonyLogs.length,
+    auth_logs_collected: readCount(data.authenticationLogs),
+    trust_monitor_events: readCount(data.trustMonitorEvents),
+    telephony_logs: readCount(data.telephonyLogs),
     telephony_credits_remaining: creditsRemaining ?? "unknown",
   };
 
@@ -3952,11 +4345,13 @@ export async function runDuoAccessCheck(
         detail: "Readable",
       });
     } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
+      const message = describeThrown(error);
+      // The probe status comes from the HTTP status the request observed, never from a hard-coded code.
+      const observed = error instanceof DuoApiError ? error.status : undefined;
       probes.push({
         key: probe.key,
-        path: probe.path,
-        status: message.includes("(403 ") ? "forbidden" : message.includes("(401 ") ? "unauthorized" : "error",
+        path: error instanceof DuoApiError ? error.path : probe.path,
+        status: observed === 403 || message.includes("(403 ") ? "forbidden" : observed === 401 || message.includes("(401 ") ? "unauthorized" : "error",
         detail: message,
       });
     }
@@ -4066,7 +4461,8 @@ function buildQuickReference(): string {
   return [
     "# Duo Audit Bundle Quick Reference",
     "",
-    "- `core_data/` contains raw Duo Admin API responses used during this assessment.",
+    "- `core_data/` contains the Duo Admin API responses used during this assessment; integration secret_key values and bypass code values are redacted at collection time.",
+    "- `core_data/collection_status.json` records per-endpoint readability, record counts, total_objects, paging completeness, and the collection error, without repeating the records.",
     "- `analysis/` contains normalized findings and category summaries.",
     "- `compliance/` contains the executive summary, unified matrix, and per-framework reports.",
     "- `_errors.log` appears only when some reads fail but the bundle still completes.",
@@ -4247,32 +4643,33 @@ export async function exportDuoAuditBundle(
     source_chain: config.sourceChain,
   });
 
+  // An unread dataset is written as null, never as its empty fallback; collection_status.json names the error.
   const coreData: Array<[string, unknown]> = [
-    ["core_data/settings.json", authentication.settings.data],
-    ["core_data/policies.json", authentication.policies.data],
-    ["core_data/global_policy.json", authentication.globalPolicy.data],
-    ["core_data/users.json", authentication.users.data],
-    ["core_data/bypass_codes.json", authentication.bypassCodes.data],
-    ["core_data/webauthn_credentials.json", authentication.webauthnCredentials.data],
-    ["core_data/admin_allowed_auth_methods.json", authentication.allowedAdminAuthMethods.data],
-    ["core_data/authentication_logs.json", authentication.authenticationLogs.data],
-    ["core_data/offline_enrollment_logs.json", authentication.offlineEnrollmentLogs?.data ?? []],
-    ["core_data/admins.json", adminAccess.admins.data],
-    ["core_data/activity_logs.json", adminAccess.activityLogs.data],
-    ["core_data/integrations.json", integrations.integrations.data],
-    ["core_data/info_summary.json", monitoring.infoSummary.data],
-    ["core_data/telephony_logs.json", monitoring.telephonyLogs.data],
-    ["core_data/trust_monitor_events.json", monitoring.trustMonitorEvents.data],
-    ["core_data/authentication_attempts.json", monitoring.authenticationAttempts?.data ?? null],
+    ["core_data/settings.json", readData(authentication.settings)],
+    ["core_data/policies.json", readData(authentication.policies)],
+    ["core_data/global_policy.json", readData(authentication.globalPolicy)],
+    ["core_data/users.json", readData(authentication.users)],
+    ["core_data/bypass_codes.json", readData(authentication.bypassCodes)],
+    ["core_data/webauthn_credentials.json", readData(authentication.webauthnCredentials)],
+    ["core_data/admin_allowed_auth_methods.json", readData(authentication.allowedAdminAuthMethods)],
+    ["core_data/authentication_logs.json", readData(authentication.authenticationLogs)],
+    ["core_data/offline_enrollment_logs.json", readData(authentication.offlineEnrollmentLogs)],
+    ["core_data/admins.json", readData(adminAccess.admins)],
+    ["core_data/activity_logs.json", readData(adminAccess.activityLogs)],
+    ["core_data/integrations.json", readData(integrations.integrations)],
+    ["core_data/info_summary.json", readData(monitoring.infoSummary)],
+    ["core_data/telephony_logs.json", readData(monitoring.telephonyLogs)],
+    ["core_data/trust_monitor_events.json", readData(monitoring.trustMonitorEvents)],
+    ["core_data/authentication_attempts.json", readData(monitoring.authenticationAttempts)],
   ];
   for (const [path, value] of coreData) {
     await writeJson(outputDir, path, value);
   }
   await writeJson(outputDir, "core_data/collection_status.json", {
-    authentication,
-    admin_access: adminAccess,
-    integrations,
-    monitoring,
+    authentication: projectCollectionStatus({ ...authentication }),
+    admin_access: projectCollectionStatus({ ...adminAccess }),
+    integrations: projectCollectionStatus({ ...integrations }),
+    monitoring: projectCollectionStatus({ ...monitoring }),
   });
 
   for (const assessment of assessments) {
@@ -4411,7 +4808,7 @@ export function registerDuoTools(pi: any): void {
         return renderAccessCheck(result);
       } catch (error) {
         return errorResult(
-          `Duo access check failed: ${error instanceof Error ? error.message : String(error)}`,
+          `Duo access check failed: ${describeThrown(error)}`,
           { tool: "duo_check_access" },
         );
       }
@@ -4433,7 +4830,7 @@ export function registerDuoTools(pi: any): void {
         return renderAssessmentToolResult(assessDuoAuthentication(data, config));
       } catch (error) {
         return errorResult(
-          `Duo authentication assessment failed: ${error instanceof Error ? error.message : String(error)}`,
+          `Duo authentication assessment failed: ${describeThrown(error)}`,
           { tool: "duo_assess_authentication" },
         );
       }
@@ -4455,7 +4852,7 @@ export function registerDuoTools(pi: any): void {
         return renderAssessmentToolResult(assessDuoAdminAccess(data, config));
       } catch (error) {
         return errorResult(
-          `Duo admin-access assessment failed: ${error instanceof Error ? error.message : String(error)}`,
+          `Duo admin-access assessment failed: ${describeThrown(error)}`,
           { tool: "duo_assess_admin_access" },
         );
       }
@@ -4477,7 +4874,7 @@ export function registerDuoTools(pi: any): void {
         return renderAssessmentToolResult(assessDuoIntegrations(data, config));
       } catch (error) {
         return errorResult(
-          `Duo integration assessment failed: ${error instanceof Error ? error.message : String(error)}`,
+          `Duo integration assessment failed: ${describeThrown(error)}`,
           { tool: "duo_assess_integrations" },
         );
       }
@@ -4499,7 +4896,7 @@ export function registerDuoTools(pi: any): void {
         return renderAssessmentToolResult(assessDuoMonitoring(data, config));
       } catch (error) {
         return errorResult(
-          `Duo monitoring assessment failed: ${error instanceof Error ? error.message : String(error)}`,
+          `Duo monitoring assessment failed: ${describeThrown(error)}`,
           { tool: "duo_assess_monitoring" },
         );
       }
@@ -4536,10 +4933,61 @@ export function registerDuoTools(pi: any): void {
         });
       } catch (error) {
         return errorResult(
-          `Duo audit export failed: ${error instanceof Error ? error.message : String(error)}`,
+          `Duo audit export failed: ${describeThrown(error)}`,
           { tool: "duo_export_audit_bundle" },
         );
       }
     },
   });
+}
+
+/**
+ * Every fixed-text message this integration emits around a refused, failed, or unparseable read, rendered
+ * with representative observed values by the same constants and helpers the error sink uses (GWS note 1).
+ * Each must survive redactErrorText unchanged, since every recorded string passes through it; the fixed-text
+ * test holds this list to the scrub, and a message that does not survive is reworded rather than exempted.
+ */
+export function duoFixedTexts(): readonly string[] {
+  const html = "<html><head><title>502 Bad Gateway</title></head><body>upstream unavailable</body></html>";
+  const htmlResponse = new Response(html, { status: 502, statusText: "Bad Gateway", headers: { "content-type": "text/html; charset=utf-8" } });
+  const plainResponse = new Response("upstream unavailable", { status: 200, statusText: "OK" });
+  const deniedDetail = parseDetailFromBody({ stat: "FAIL", code: 40301, message: "Access forbidden", message_detail: "Insufficient permissions" }) ?? "";
+  const settingsDenied = `Duo API request failed for ${DUO_ENDPOINTS.settings} (403 Forbidden): ${deniedDetail}`;
+  const adminMethodsDenied = `Duo API request failed for ${DUO_ENDPOINTS.adminAllowedAuthMethods} (403 Forbidden): ${deniedDetail}`;
+  const settingsReadFailure = describeReadFailure(DUO_ENDPOINTS.settings, settingsDenied);
+  return Object.freeze([
+    PARSE_ERROR_NOTE,
+    describeNonJsonBody(htmlResponse, html) ?? "",
+    describeNonJsonBody(plainResponse, "upstream unavailable") ?? "",
+    deniedDetail,
+    settingsDenied,
+    adminMethodsDenied,
+    `Duo API request failed for ${DUO_ENDPOINTS.telephonyLogs} (502 Bad Gateway): ${describeNonJsonBody(htmlResponse, html)}`,
+    `Duo API request failed for ${DUO_ENDPOINTS.settings} (network error: fetch failed)`,
+    `Duo API request returned an unexpected payload for ${DUO_ENDPOINTS.settings}: ${describeNonJsonBody(plainResponse, "upstream unavailable")}`,
+    `Duo API request returned an unexpected payload for ${DUO_ENDPOINTS.settings}`,
+    `Duo API request exceeded retry budget for ${DUO_ENDPOINTS.settings} (429 Too Many Requests).`,
+    `${DUO_ENDPOINTS.offlineEnrollmentLogs} was not attempted: this client does not expose it.`,
+    `${DUO_ENDPOINTS.infoSummary} was not attempted: this client does not expose it.`,
+    `${DUO_ENDPOINTS.authenticationAttempts} was not attempted: this client does not expose it.`,
+    uncollectedMarker(undefined).error,
+    settingsReadFailure,
+    describeReadFailure(DUO_ENDPOINTS.settings, "network error: fetch failed"),
+    "users: unread",
+    "bypass codes: unread",
+    `admin_allowed_auth_methods=unread (${describeReadFailure(DUO_ENDPOINTS.adminAllowedAuthMethods, adminMethodsDenied)}; requires ${DUO_PERMISSIONS.adminsRead}); administrator WebAuthn posture was not confirmed.`,
+    `admin_allowed_auth_methods=unread (${DUO_ENDPOINTS.adminAllowedAuthMethods} returned no usable payload; requires ${DUO_PERMISSIONS.adminsRead}); administrator WebAuthn posture was not confirmed.`,
+    `helpdesk_bypass=unread (${settingsReadFailure}; requires ${DUO_PERMISSIONS.settings})`,
+    "helpdesk_bypass_expiration=unread",
+    `No active bypass codes were returned, but help desk issuance limits could not be read: ${settingsReadFailure}. The zero-code verdict is capped at Partial.`,
+    `Grant the audit principal ${DUO_PERMISSIONS.settings} so helpdesk_bypass and helpdesk_bypass_expiration can be verified alongside the empty inventory.`,
+    "Grant the audit principal Grant resource - Read so active bypass codes can be enumerated.",
+    "Global MFA enforcement mode could not be read because the global policy was unavailable.",
+    "Phishing-resistant factor posture could not be read because the global policy was unavailable.",
+    "Authentication method restrictions could not be read because the global policy was unavailable.",
+    "Remembered device posture could not be read because the global policy was unavailable.",
+    "Trusted endpoint posture could not be read because the global policy was unavailable.",
+    "Device health requirements could not be read because the global policy was unavailable.",
+    "Remaining telephony credits could not be read, so telephony capacity cannot be confirmed (unknown credits never support Pass).",
+  ]);
 }
