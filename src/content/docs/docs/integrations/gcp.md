@@ -81,6 +81,8 @@ Every paginated list follows `nextPageToken` until the API stops returning one. 
 
 Every finding also tracks each inventory it depends on. When any of them is unreadable (403, 401, or an error), for the whole scope or for one project, the finding drops below `pass` even if its primary inventory was read completely: `manual` when the unreadable inventory is the one the finding scores, `warn` otherwise. The summary names the dataset and the endpoint, for example `Partial view: Cloud Routers unreadable for 1 of 2 projects (second-project) via compute.googleapis.com/compute/v1/projects/{project}/aggregated/routers (403 Forbidden)`, and `evidence.unreadable_inventories` lists every entry with its scope and error. A count or list that would have been derived from the unreadable inventory is rendered as `null`, never as zero or an empty list, whether that inventory is the one the finding scores or a dependent one; the same rule applies to the assessment-level `summary` counters (`sampled_projects` is `null` when the project inventory itself was unreadable), and a summary sentence names the unreadable dataset instead of counting it (`instance overrides could not be checked because Compute Engine instances were unreadable`, never `none of 0 instances overrides it`).
 
+The collection-status fields follow the same rule. `evidence.truncated`, `denied_projects`, and `unreachable_scopes` on a finding, and `projects_truncated`, `sources_truncated`, and `findings_truncated` in the assessment summaries, are `null` whenever the scan they describe was denied or never ran; `false`, `0`, or `[]` is written only when that scan ran to completion, so no status ever says complete about a call that did not happen. A read that was skipped because its upstream discovery failed is recorded with `status: "not_collected"` rather than `"unreadable"`, and its wording names the upstream call with the status that call actually returned: with no project to resolve an effective org policy against, GCP-ORG-02 through GCP-ORG-05 read `effective org policy constraints/iam.allowedPolicyMemberDomains not collected for the scope (cloudresourcemanager.googleapis.com/v1/projects/{project}:getEffectiveOrgPolicy was not called): no project could be enumerated because project inventory was unreadable via cloudasset.googleapis.com/v1/{scope}:searchAllResources (403 Forbidden)`. An HTTP status is never attributed to an endpoint that was not requested. In `core_data/`, a dataset that was denied or never collected is written as a `{status, dataset, endpoint, scope, error, data: null}` marker in place of the rows, never as `[]`, and the same entry appears in the snapshot's `unreadable_inventories`.
+
 ## Status semantics
 
 | Status | Meaning |
@@ -142,7 +144,8 @@ Every finding carries the spec mapping table entries for its controls. The expor
   QUICK_REFERENCE.md
   README.md
   metadata.json
-  core_data/            projected snapshots: identifiers plus the documented fields each control reads
+  core_data/            projected snapshots: identifiers plus the documented fields each control reads;
+                        a denied or never-collected dataset is a {status, endpoint, error, data: null} marker, never []
   analysis/             findings.json, category_summaries.json, one JSON and markdown per category
   compliance/           executive_summary.md, unified_compliance_matrix.md, frameworks/<framework>.md
   _errors.log           only when collection partially failed
