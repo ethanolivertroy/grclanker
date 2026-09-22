@@ -1,6 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import {
+  chmodSync,
   existsSync,
   mkdirSync,
   mkdtempSync,
@@ -11,6 +12,7 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { parse as parseYaml } from "yaml";
 
 import {
   ELASTIC_ALL_DATASETS,
@@ -534,14 +536,14 @@ const CONFIG_FILE_CANARY = "CONFIGFILE_CANARY_7d8e9f0a1b2c3d4e";
 
 /** Malformed YAML shapes; the yaml package quotes the offending source line in its own message for most of them. */
 const MALFORMED_YAML_CONFIGS = [
-  { name: "unterminated quote", code: "MISSING_CHAR", line: 4, content: `url: https://es.example.com:9200\nkibana_url: https://kibana.example.com:5601\napi_key: "${CONFIG_FILE_CANARY}\n` },
-  { name: "bad indent", code: "BAD_INDENT", line: 3, content: `elasticsearch:\n  url: https://es.example.com:9200\n api_key: ${CONFIG_FILE_CANARY}\n` },
-  { name: "duplicate key", code: "DUPLICATE_KEY", line: 3, content: `url: https://es.example.com:9200\napi_key: first-key\napi_key: ${CONFIG_FILE_CANARY}\n` },
-  { name: "trailing comma", code: "UNEXPECTED_TOKEN", line: 1, content: `elasticsearch: { url: https://es.example.com:9200, api_key: ${CONFIG_FILE_CANARY},, }\n` },
-  { name: "tab indentation", code: "TAB_AS_INDENT", line: 2, content: `url: https://es.example.com:9200\n\tapi_key: ${CONFIG_FILE_CANARY}\n` },
+  { name: "unterminated quote", line: 4, content: `url: https://es.example.com:9200\nkibana_url: https://kibana.example.com:5601\napi_key: "${CONFIG_FILE_CANARY}\n` },
+  { name: "bad indent", line: 3, content: `elasticsearch:\n  url: https://es.example.com:9200\n api_key: ${CONFIG_FILE_CANARY}\n` },
+  { name: "duplicate key", line: 3, content: `url: https://es.example.com:9200\napi_key: first-key\napi_key: ${CONFIG_FILE_CANARY}\n` },
+  { name: "trailing comma", line: 1, content: `elasticsearch: { url: https://es.example.com:9200, api_key: ${CONFIG_FILE_CANARY},, }\n` },
+  { name: "tab indentation", line: 2, content: `url: https://es.example.com:9200\n\tapi_key: ${CONFIG_FILE_CANARY}\n` },
 ];
 
-test("rule 9 / addendum 6: a malformed config file whose bad line carries a credential yields an error naming only the path, line, and code, from the resolver and from every tool", async () => {
+test("rule 9 / addendum 6: a malformed config file whose bad line carries a credential yields fixed text naming only the path and the parser's line, from the resolver and from every tool", async () => {
   const registered = [];
   registerElasticTools({ registerTool: (tool) => registered.push(tool) });
   const checkTool = registered.find((tool) => tool.name === "elastic_check_access");
@@ -554,6 +556,7 @@ test("rule 9 / addendum 6: a malformed config file whose bad line carries a cred
       const configPath = join(base, "config.yaml");
       writeFileSync(configPath, shape.content, "utf8");
       const outputDir = join(base, "export");
+      const expected = `Unable to parse Elastic config file: invalid YAML in ${configPath} at line ${shape.line}`;
 
       let thrown;
       try {
@@ -563,38 +566,26 @@ test("rule 9 / addendum 6: a malformed config file whose bad line carries a cred
       }
       assert.ok(thrown, `${shape.name}: the resolver must reject the file`);
       assert.equal(thrown.name, "ElasticConfigFileError", shape.name);
-      assert.equal(thrown.code, shape.code, `${shape.name}: the validated parser code is carried`);
+      assert.equal(thrown.code, "INVALID_YAML", shape.name);
       assert.equal(thrown.line, shape.line, `${shape.name}: the parser's structured line position is carried`);
-      assert.equal(typeof thrown.column, "number", shape.name);
-      assert.ok(thrown.message.includes(configPath), `${shape.name}: the message names the file path`);
-      assert.match(thrown.message, new RegExp(`\\(${shape.code} at line ${shape.line}, column \\d+\\)`), `${shape.name}: ${thrown.message}`);
+      assert.equal(thrown.path, configPath, shape.name);
+      assert.equal(thrown.message, expected, `${shape.name}: fixed text only`);
       assert.ok(!thrown.message.includes(CONFIG_FILE_CANARY), `${shape.name}: the resolver message quotes the credential: ${thrown.message}`);
       assert.ok(!thrown.message.includes("api_key") && !thrown.message.includes("first-key"), `${shape.name}: no key name or value from the file: ${thrown.message}`);
 
       const access = await checkTool.execute("call-config", checkTool.prepareArguments({ config_file: configPath }));
       assert.equal(access.isError, true, shape.name);
       assert.ok(!JSON.stringify(access).includes(CONFIG_FILE_CANARY), `${shape.name}: the check_access payload quotes the credential`);
-      assert.match(access.content[0].text, new RegExp(`Elastic access check failed: Elastic config file .*config\\.yaml could not be loaded \\(${shape.code} at line ${shape.line}, column \\d+\\)`), shape.name);
+      assert.equal(access.content[0].text, `Elastic access check failed: ${expected}`, shape.name);
 
       const exported = await exportTool.execute("call-config-export", exportTool.prepareArguments({ config_file: configPath, output_dir: outputDir }));
       assert.equal(exported.isError, true, shape.name);
       assert.ok(!JSON.stringify(exported).includes(CONFIG_FILE_CANARY), `${shape.name}: the export payload quotes the credential`);
-      assert.match(exported.content[0].text, new RegExp(`\\(${shape.code} at line ${shape.line}`), shape.name);
+      assert.equal(exported.content[0].text, `Elastic audit bundle export failed: ${expected}`, shape.name);
       assert.equal(existsSync(outputDir), false, `${shape.name}: nothing is written when the config file is unreadable`);
     }
 
-    // A filesystem failure surfaces the errno code only; a file that parses to a scalar carrying the credential is ignored, not echoed.
-    const directoryAsFile = createTempBase("elastic-config-dir-");
-    let fsError;
-    try {
-      resolveElasticConfiguration({ config_file: directoryAsFile }, {}, { homeDir: directoryAsFile });
-    } catch (error) {
-      fsError = error;
-    }
-    assert.equal(fsError.name, "ElasticConfigFileError");
-    assert.equal(fsError.code, "EISDIR");
-    assert.equal(fsError.line, undefined);
-    assert.match(fsError.message, /could not be loaded \(EISDIR\)/);
+    // A file that parses to a scalar carrying the credential is ignored, not echoed.
     const scalarBase = createTempBase("elastic-config-scalar-");
     writeFileSync(join(scalarBase, "config.yaml"), `${CONFIG_FILE_CANARY}\n`, "utf8");
     let scalarError;
@@ -605,6 +596,119 @@ test("rule 9 / addendum 6: a malformed config file whose bad line carries a cred
     }
     assert.match(scalarError.message, /Elasticsearch URL is required/);
     assert.ok(!scalarError.message.includes(CONFIG_FILE_CANARY), "a scalar-valued config file is never echoed");
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+// ---------------------------------------------------------------------------------------------------------------
+// Addendum 6b: config loader errors are fixed text carrying only the path, a validated code, and a line.
+// ---------------------------------------------------------------------------------------------------------------
+
+const ELASTIC_CONFIG_CANARIES = {
+  nestedKey: "CFGA1b2c3d4e5f6g7h8",
+  nestedValue: "CFGB9i0j1k2l3m4n5o6",
+  alias: "CFGC7p8q9r0s1t2u3v4",
+};
+
+const LIBRARY_WORDING = ["Nested mappings", "is not valid JSON", "Unresolved alias", "illegal operation", "permission denied", "no such file"];
+
+function eightCharacterWindows(text) {
+  const windows = [];
+  for (let index = 0; index + 8 <= text.length; index += 1) windows.push(text.slice(index, index + 8));
+  return windows;
+}
+
+/** Asserts a message carries neither a canary, nor any 8-character fragment of one, nor the parser's or filesystem's own wording. */
+function assertFixedTextOnly(message, canaries, label) {
+  for (const canary of canaries) {
+    assert.ok(!message.includes(canary), `${label}: carries the canary: ${message}`);
+    for (const fragment of eightCharacterWindows(canary)) assert.ok(!message.includes(fragment), `${label}: carries the fragment ${fragment}: ${message}`);
+  }
+  for (const wording of LIBRARY_WORDING) assert.ok(!message.includes(wording), `${label}: carries library wording "${wording}": ${message}`);
+}
+
+test("config loader errors: every 8-character window of the Elastic config canaries is distinct", () => {
+  const windows = Object.values(ELASTIC_CONFIG_CANARIES).flatMap(eightCharacterWindows);
+  assert.equal(new Set(windows).size, windows.length);
+});
+
+test("config loader errors: an Elastic config file that cannot be read or parsed yields fixed text with only the path, a validated code, and the parser's line, from the resolver and from check_access", async () => {
+  const registered = [];
+  registerElasticTools({ registerTool: (tool) => registered.push(tool) });
+  const checkTool = registered.find((tool) => tool.name === "elastic_check_access");
+  const exportTool = registered.find((tool) => tool.name === "elastic_export_audit_bundle");
+  const canaries = Object.values(ELASTIC_CONFIG_CANARIES);
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = () => { throw new Error("no request may be made while the config file is unreadable"); };
+  try {
+    const base = createTempBase("elastic-config-errors-");
+    const cases = [];
+
+    // YAML nested mapping: the parser quotes the whole source line, key, value, and bearer token included.
+    const nested = join(base, "nested.yaml");
+    writeFileSync(nested, `api_key: ${ELASTIC_CONFIG_CANARIES.nestedKey}: Bearer ${ELASTIC_CONFIG_CANARIES.nestedValue}\n`, "utf8");
+    assert.throws(() => parseYaml(readFileSync(nested, "utf8")), (error) => error.message.includes(ELASTIC_CONFIG_CANARIES.nestedKey) && error.message.includes("Nested mappings"), "positive control: yaml.parse quotes the line");
+    cases.push({ name: "yaml nested mapping", path: nested, code: "INVALID_YAML", line: 1, message: `Unable to parse Elastic config file: invalid YAML in ${nested} at line 1` });
+
+    // YAML alias: a plain ReferenceError (no linePos) whose message leads with the value and no key name.
+    const alias = join(base, "alias.yaml");
+    writeFileSync(alias, `api_key: *${ELASTIC_CONFIG_CANARIES.alias}\n`, "utf8");
+    assert.throws(() => parseYaml(readFileSync(alias, "utf8")), (error) => error instanceof ReferenceError && error.message.includes(ELASTIC_CONFIG_CANARIES.alias) && error.message.includes("Unresolved alias"), "positive control: yaml.parse throws a ReferenceError carrying the value");
+    cases.push({ name: "yaml alias", path: alias, code: "INVALID_YAML", line: undefined, message: `Unable to parse Elastic config file: invalid YAML in ${alias}` });
+
+    // EISDIR: a directory at the path is a read failure, not a parse failure.
+    const directory = join(base, "config-dir");
+    mkdirSync(directory);
+    assert.throws(() => readFileSync(directory, "utf8"), (error) => error.code === "EISDIR" && /illegal operation/.test(error.message), "positive control: the filesystem message carries its own wording");
+    cases.push({ name: "EISDIR", path: directory, code: "EISDIR", line: undefined, message: `Unable to read Elastic config file ${directory} (EISDIR)` });
+
+    // EACCES: an unreadable file (root reads everything, so the case is skipped when running as root).
+    if (typeof process.getuid === "function" && process.getuid() !== 0) {
+      const unreadable = join(base, "unreadable.yaml");
+      writeFileSync(unreadable, `api_key: ${ELASTIC_CONFIG_CANARIES.alias}\n`, "utf8");
+      chmodSync(unreadable, 0o000);
+      assert.throws(() => readFileSync(unreadable, "utf8"), (error) => error.code === "EACCES" && /permission denied/.test(error.message), "positive control");
+      cases.push({ name: "EACCES", path: unreadable, code: "EACCES", line: undefined, message: `Unable to read Elastic config file ${unreadable} (EACCES)` });
+    }
+
+    // ENOENT on an explicit path: a missing file named by argument or environment is an error, not a silent default.
+    const missing = join(base, "missing.yaml");
+    cases.push({ name: "ENOENT", path: missing, code: "ENOENT", line: undefined, message: `Unable to read Elastic config file ${missing} (ENOENT)` });
+
+    for (const item of cases) {
+      let thrown;
+      try {
+        resolveElasticConfiguration({ config_file: item.path }, {}, { homeDir: base, cwd: base });
+      } catch (error) {
+        thrown = error;
+      }
+      assert.ok(thrown, `${item.name}: the resolver must reject the file`);
+      assert.equal(thrown.name, "ElasticConfigFileError", item.name);
+      assert.equal(thrown.message, item.message, `${item.name}: fixed text only`);
+      assert.equal(thrown.code, item.code, item.name);
+      assert.equal(thrown.line, item.line, item.name);
+      assert.equal(thrown.path, item.path, item.name);
+      assertFixedTextOnly(thrown.message, canaries, `${item.name} resolver`);
+
+      const access = await checkTool.execute("call-config", checkTool.prepareArguments({ config_file: item.path }));
+      assert.equal(access.isError, true, item.name);
+      assert.equal(access.content[0].text, `Elastic access check failed: ${item.message}`, item.name);
+      assertFixedTextOnly(JSON.stringify(access), canaries, `${item.name} check_access`);
+
+      const outputDir = join(base, `export-${item.code}`);
+      const exported = await exportTool.execute("call-config-export", exportTool.prepareArguments({ config_file: item.path, output_dir: outputDir }));
+      assert.equal(exported.isError, true, item.name);
+      assert.equal(exported.content[0].text, `Elastic audit bundle export failed: ${item.message}`, item.name);
+      assert.equal(existsSync(outputDir), false, `${item.name}: nothing is written when the config file is unreadable`);
+    }
+
+    // The environment variable is an explicit path too, and a missing default file is still simply absent.
+    assert.throws(
+      () => resolveElasticConfiguration({ elasticsearch_url: "https://es.example.com:9200", api_key: API_KEY }, { ELASTIC_SEC_INSPECTOR_CONFIG: missing }, { homeDir: base, cwd: base }),
+      { message: `Unable to read Elastic config file ${missing} (ENOENT)` },
+    );
+    assert.equal(resolveElasticConfiguration({ elasticsearch_url: "https://es.example.com:9200", api_key: API_KEY }, {}, { homeDir: base, cwd: base }).apiKey, API_KEY);
   } finally {
     globalThis.fetch = originalFetch;
   }
@@ -2261,13 +2365,16 @@ test("registerElasticTools exposes the check, assessment, and export tools with 
   const fixtures = healthyFixtures();
   const originalFetch = globalThis.fetch;
   globalThis.fetch = createRouter(healthyRoutes(fixtures));
+  // An explicit but missing config path is an error since addendum 6b, so an empty file keeps the home config out of the way.
+  const emptyConfig = join(createTempBase("elastic-no-config-"), "empty.yaml");
+  writeFileSync(emptyConfig, "", "utf8");
   try {
     const kibanaTool = registered.find((tool) => tool.name === "elastic_assess_kibana");
     const result = await kibanaTool.execute("call-1", kibanaTool.prepareArguments({
       elasticsearch_url: "https://es.example.com:9200",
       kibana_url: "https://kibana.example.com:5601",
       api_key: API_KEY,
-      config_file: join(createTempBase("elastic-no-config-"), "missing.yaml"),
+      config_file: emptyConfig,
     }));
     assert.equal(result.isError, undefined);
     assert.match(result.content[0].text, /Elastic Kibana governance and Fleet/);
@@ -2278,7 +2385,7 @@ test("registerElasticTools exposes the check, assessment, and export tools with 
     const checkTool = registered.find((tool) => tool.name === "elastic_check_access");
     const failure = await checkTool.execute("call-2", checkTool.prepareArguments({
       elasticsearch_url: "https://es.example.com:9200",
-      config_file: join(createTempBase("elastic-no-config-"), "missing.yaml"),
+      config_file: emptyConfig,
     }));
     assert.equal(failure.isError, true);
     assert.match(failure.content[0].text, /credentials are required/);
