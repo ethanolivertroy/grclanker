@@ -2088,7 +2088,7 @@ test("redactErrorText and describeErrorBody scrub credential-shaped text regardl
 // whatever its shape, a configured secret is removed in every form whatever its shape, and
 // real token shapes are removed bare.
 // ---------------------------------------------------------------------------
-const NAME_SHAPED_VALUES = ["prod-us-east-2026", "fw-dc1-01", "sess-canary-COOKIE-31415926535897"];
+const NAME_SHAPED_VALUES = ["prod-us-east-2026", "fw-dc1-01", "sess-canary-COOKIE-31415926535897", "my-bucket-prod-2026-logs", "3f2b1c9e-8a7d-4e6f-9b0a-1c2d3e4f5a6b"];
 
 // Neither the canary nor any window of `windowSize` characters of it may survive, so a
 // partial echo (a slice, a split token) is attributable to the canary it came from.

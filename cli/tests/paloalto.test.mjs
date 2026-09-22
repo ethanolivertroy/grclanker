@@ -1282,7 +1282,7 @@ test("redaction helpers scrub credential-shaped text, JSON pairs, URL credential
 // indistinguishable from resource names; the same values are removed from every carrier
 // whatever their shape, a configured secret is removed in every form whatever its shape,
 // and real token shapes are removed bare.
-const NAME_SHAPED_VALUES = ["prod-us-east-2026", "fw-dc1-01", "sess-canary-COOKIE-31415926535897"];
+const NAME_SHAPED_VALUES = ["prod-us-east-2026", "fw-dc1-01", "sess-canary-COOKIE-31415926535897", "my-bucket-prod-2026-logs", "3f2b1c9e-8a7d-4e6f-9b0a-1c2d3e4f5a6b"];
 
 // Every carrier of the ruling with the value in it, and the exact rendering after the scrub.
 function carriersOf(value) {
