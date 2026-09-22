@@ -10,7 +10,10 @@
  *
  * 1. A value inside a carrier is removed whatever its shape: Authorization, Proxy-Authorization, Cookie, Set-Cookie,
  *    x-api-key and similar headers; cookie and session assignments; URL userinfo and query pairs; the schemes Bearer,
- *    Basic, Token, and ApiKey; credential-named key/value pairs (`token=`, `"password":`, `api_key:`).
+ *    Basic, Token, and ApiKey; credential-named key/value pairs (`token=`, `"password":`, `api_key:`). A quoted value
+ *    (`X-Api-Key: "value"`, `Cookie: sid='value'`, `Authorization: Bearer "value"`, the JSON pair
+ *    `"Authorization": "Bearer value"`, and their JSON-escaped forms `\"X-Api-Key\": \"value\"`) is removed whole up to
+ *    its closing quote, spaces and all, with the quotes and the scheme word kept.
  * 2. A configured secret is removed whatever its shape and in its base64, base64url, URL-encoded, form-encoded, and
  *    JSON-escaped forms; the Flue redaction primitives own the encoded forms.
  *
@@ -64,8 +67,8 @@ const PEM_OPEN_PATTERN = /-----BEGIN [A-Z0-9 ]+-----[\s\S]*$/;
 
 // Any scheme-prefixed URL wherever it sits: the userinfo is dropped and the query and fragment are replaced by one
 // marker; the scheme, host, and path stay because they name the surface. An already-scrubbed `?[REDACTED]` tail is
-// consumed whole so a second pass is a no-op.
-const EMBEDDED_URL_PATTERN = /\b[a-z][a-z0-9+.-]*:\/\/(?:\[REDACTED\]|[^\s"'<>()[\]{}])+/gi;
+// consumed whole so a second pass is a no-op. A backslash ends the URL so a JSON-escaped closing quote is kept.
+const EMBEDDED_URL_PATTERN = /\b[a-z][a-z0-9+.-]*:\/\/(?:\[REDACTED\]|[^\s"'<>()[\]{}\\])+/gi;
 const TRAILING_PUNCTUATION_PATTERN = /[.,;:!?]+$/;
 
 // A relative path or bare query string: a credential-named parameter keeps its name and loses its value.
@@ -75,18 +78,26 @@ const QUERY_PAIR_PATTERN = /([?&])([A-Za-z0-9_.[\]-]+)=(?!\[REDACTED\])([^&#\s"'
 // `environment-token`, `settings.token`, and `/_security/api_key:` are names and paths, not carriers.
 const NAME_START = String.raw`(?<![A-Za-z0-9_/.-])`;
 
+// A quote that may close a quoted carrier name in JSON or JSON-escaped text (`"X-Api-Key":`, `\"X-Api-Key\":`), then
+// the separator. Each carrier pattern below matches through the separator only; the value that follows is read by a
+// quote-aware reader (see "Quoted values"), never by the pattern itself.
+const NAME_CLOSE_AND_SEPARATOR = String.raw`(?:\\*["'])?\s*[:=]\s*`;
+
 // Cookie and Set-Cookie headers: every `name=value` pair and every attribute after the first pair is replaced, whatever
 // the values look like, up to the first character that ends the header value in free text.
-const COOKIE_HEADER_PATTERN = new RegExp(
-  String.raw`${NAME_START}(set-cookie|cookie)(\s*[:=]\s*)(?!\[REDACTED\])([^\s;,"'<>=]+=[^\s;,"'<>]*(?:;\s*[A-Za-z0-9_-]+(?:=[^\s;,"'<>]*)?)*)`,
-  "gi",
-);
+const COOKIE_HEADER_PATTERN = new RegExp(String.raw`${NAME_START}(set-cookie|cookie)${NAME_CLOSE_AND_SEPARATOR}`, "gi");
+const COOKIE_PAIR_NAME_PATTERN = /[^\s;,"'<>=\\]+/y;
+const COOKIE_BARE_VALUE_PATTERN = /[^\s;,"'<>\\]*/y;
+const COOKIE_ATTRIBUTE_PATTERN = /;[ \t]*[A-Za-z0-9_-]+/y;
 
 // Session assignments in free text or query strings (`session=...`, `sid=...`, `JSESSIONID=...`), whatever the value.
 const SESSION_ASSIGNMENT_PATTERN = new RegExp(
-  String.raw`${NAME_START}(session(?:[_-]?(?:id|token|key))?|sid|sessid|jsessionid|phpsessid|asp\.net_sessionid|xsrf[_-]?token|csrf[_-]?token)(["']?\s*[:=]\s*["']?)(?!\[REDACTED\])([^\s"',;&}<>]+)`,
+  String.raw`${NAME_START}["']?(session(?:[_-]?(?:id|token|key))?|sid|sessid|jsessionid|phpsessid|asp\.net_sessionid|xsrf[_-]?token|csrf[_-]?token)\b${NAME_CLOSE_AND_SEPARATOR}`,
   "gi",
 );
+// A bare value after a session or credential-named key runs to the first character that ends a value in prose, a
+// header, a query string, or a JSON fragment; a backslash ends it so a JSON-escaped closing quote is kept.
+const PAIR_BARE_VALUE_PATTERN = /[^\s"',;&}<>\\]+/y;
 
 // Header names whose value is a credential in any shape; a scheme word in front of the value is kept so the message
 // still says which scheme was replayed.
@@ -109,24 +120,28 @@ const COMMON_CREDENTIAL_HEADERS: readonly string[] = [
 ];
 // Any `x-` header whose name carries a credential word.
 const GENERIC_CREDENTIAL_HEADER = "x-[a-z0-9-]*(?:key|token|secret|auth|session|password|credential)[a-z0-9-]*";
-const HEADER_SCHEMES = String.raw`(?:bearer|basic|token|apikey|api-key|digest|ssws)\s+`;
-// A value position already holding the marker, with or without a scheme word in front of it, is left alone so a
-// second pass over scrubbed text is a no-op.
-const NOT_ALREADY_SCRUBBED = String.raw`(?!\[REDACTED\]|${HEADER_SCHEMES}\[REDACTED\])`;
+// A scheme word in front of a header or pair value is kept so the message still says which scheme was replayed. The
+// space after it does not cross a line, so a scheme word ending a line is not joined to the next line's first word.
+const HEADER_SCHEME_PATTERN = /(?:bearer|basic|token|apikey|api-key|digest|ssws)[ \t]+/iy;
+// A bare header value runs to the first character that ends a header value in free text; a backslash ends it so a
+// JSON-escaped closing quote is kept.
+const HEADER_BARE_VALUE_PATTERN = /[^\s,;"'<>\\]+/y;
 
 // Authorization scheme values in free text (`Bearer <value>`, `Basic <value>`, `Token <value>`, `ApiKey <value>`):
 // the value goes whatever its shape unless it is one plain word, which is prose ("Basic authentication is disabled",
-// "an Owner token for a complete inventory"). The value starts with a letter or digit and is at least four characters,
-// so an arrow or a dash after the word ("environment-token -> config") is punctuation, not a credential. "Token" and
-// "Basic" are English words as often as schemes, so they count as schemes only in their conventional capitalised
-// spelling ("token canary-noexpiry-token-zq has no expiry" names a token; "Token canary-noexpiry-token-zq" replays one).
-const SCHEME_VALUE_PATTERN = new RegExp(
-  String.raw`${NAME_START}(bearer|basic|token|apikey|api-key)\s+(?!\[REDACTED\])([A-Za-z0-9][A-Za-z0-9._~+/=-]{3,})`,
-  "gi",
-);
+// "an Owner token for a complete inventory"). A bare value starts with a letter or digit and is at least four
+// characters, so an arrow or a dash after the word ("environment-token -> config") is punctuation, not a credential;
+// a quoted value (`Bearer "token"`) is delimited by its quotes and goes whole whatever it holds. "Token" and "Basic"
+// are English words as often as schemes, so they count as schemes only in their conventional capitalised spelling
+// ("token canary-noexpiry-token-zq has no expiry" names a token; "Token canary-noexpiry-token-zq" replays one).
+const SCHEME_WORD_PATTERN = new RegExp(String.raw`${NAME_START}(bearer|basic|token|apikey|api-key)[ \t]+`, "gi");
+const SCHEME_BARE_VALUE_PATTERN = /[A-Za-z0-9][A-Za-z0-9._~+/=-]{3,}/y;
 const CAPITALISED_SCHEMES = new Map([["token", "Token"], ["basic", "Basic"]]);
 const PLAIN_WORD_PATTERN = /^(?:[A-Z]?[a-z]+|[A-Z]+)$/;
 const PLAIN_WORD_MAX_LENGTH = 20;
+// A quoted value after a bare scheme word in prose is a credential when it begins like one; in `"Basic ", "token"`
+// inside a JSON document the quote after the scheme word closes one string rather than opening a value.
+const QUOTED_SCHEME_VALUE_START_PATTERN = /^[A-Za-z0-9]/;
 
 // Credential-named key/value pairs in prose, headers, query strings, and JSON fragments: the key and separator stay,
 // the value goes whatever its shape. A name preceded by "/" is a URL path segment (`GET /_security/api_key: 403`), not
@@ -159,17 +174,15 @@ const CREDENTIAL_PAIR_NAMES: readonly string[] = [
   "signature",
   "sig",
 ];
-const CREDENTIAL_PAIR_PATTERN = new RegExp(
-  String.raw`${NAME_START}(["']?)(${CREDENTIAL_PAIR_NAMES.join("|")})\b(["']?\s*[:=]\s*["']?(?:${HEADER_SCHEMES})?)${NOT_ALREADY_SCRUBBED}([^\s"',;&}<>]+)`,
-  "gi",
-);
+const CREDENTIAL_PAIR_PATTERN = new RegExp(String.raw`${NAME_START}["']?(${CREDENTIAL_PAIR_NAMES.join("|")})\b${NAME_CLOSE_AND_SEPARATOR}`, "gi");
 
 // Every other `key=value`, `key: value`, or `"key":"value"` pair whose key names a credential by the Flue heuristic
 // (`client_token`, `user_session`, `tokens`, `InvalidAuthenticationToken`): the value goes when it is shaped like a
 // credential rather than a prose word, so "InvalidAuthenticationToken: Access token has expired" stays readable. A
-// value does not end in ":" or ".", which close a clause ("sdk-keys: forbidden: Forbidden").
-const GENERIC_PAIR_KEY_PATTERN = new RegExp(String.raw`${NAME_START}(["']?)([A-Za-z][A-Za-z0-9_.-]{0,63})\b(["']?\s*[:=]\s*["']?)`, "g");
-const GENERIC_PAIR_VALUE_PATTERN = /(?!\[REDACTED\])[^\s"',;&}<>]*[^\s"',;&}<>:.]/y;
+// value does not end in ":" or ".", which close a clause ("sdk-keys: forbidden: Forbidden"), and a backslash ends it
+// so a JSON-escaped closing quote is kept.
+const GENERIC_PAIR_KEY_PATTERN = new RegExp(String.raw`${NAME_START}(["']?)([A-Za-z][A-Za-z0-9_.-]{0,63})\b(${NAME_CLOSE_AND_SEPARATOR}(?:\\*["'])?)`, "g");
+const GENERIC_PAIR_VALUE_PATTERN = /(?!\[REDACTED\])[^\s"',;&}<>\\]*[^\s"',;&}<>\\:.]/y;
 
 // JWT and JWE compact serialisations, AWS access key ids, and 40-character AWS secret access keys.
 const JWT_PATTERN = /\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}(?:\.[A-Za-z0-9_-]+)*/g;
@@ -335,6 +348,187 @@ export function looksLikeToken(run: string): boolean {
 }
 
 // ---------------------------------------------------------------------------------------------------------------------
+// Quoted values
+// ---------------------------------------------------------------------------------------------------------------------
+
+interface QuotedValue {
+  /** The opening quote as written: the quote character with the backslashes that escape it (`"`, `'`, `\"`, `\\\"`). */
+  open: string;
+  /** The closing quote as written, or "" when the value runs to the end of the line or of the text. */
+  close: string;
+  /** Index of the first character of the value. */
+  start: number;
+  /** Index just past the last character of the value. */
+  end: number;
+  /** Index just past the closing quote, where scanning resumes. */
+  after: number;
+}
+
+function backslashRun(text: string, index: number): number {
+  let count = 0;
+  while (text[index + count] === "\\") count += 1;
+  return count;
+}
+
+/**
+ * Reads a quoted value opening at `index`: a double or single quote, with any backslashes that escape it in JSON or
+ * JavaScript-escaped text (`\"value\"`, `\\\"value\\\"`). The value ends at the same quote token; a quote escaped one
+ * level deeper is content, a quote escaped less deeply closes an enclosing string and leaves the value unterminated,
+ * and an unterminated value runs to the end of the line or of the text so a truncated carrier still loses its value.
+ */
+function readQuotedValue(text: string, index: number): QuotedValue | null {
+  const depth = backslashRun(text, index);
+  const quote = text[index + depth];
+  if (quote !== '"' && quote !== "'") return null;
+  const open = text.slice(index, index + depth + 1);
+  const start = index + open.length;
+  let cursor = start;
+  while (cursor < text.length) {
+    const char = text[cursor];
+    if (char === "\n" || char === "\r") break;
+    if (char !== "\\" && char !== quote) {
+      cursor += 1;
+      continue;
+    }
+    const run = backslashRun(text, cursor);
+    const next = text[cursor + run];
+    if (next !== quote) {
+      // The run escapes the character after it, unless that is a line end, which the loop then sees.
+      cursor += run + (next === undefined || next === "\n" || next === "\r" ? 0 : 1);
+      continue;
+    }
+    if (run < depth) return { open, close: "", start, end: cursor, after: cursor };
+    if ((run - depth) % 2 === 0) {
+      const end = cursor + run - depth;
+      return { open, close: text.slice(end, cursor + run + 1), start, end, after: cursor + run + 1 };
+    }
+    cursor += run + 1;
+  }
+  return { open, close: "", start, end: cursor, after: cursor };
+}
+
+interface ValueReplacement {
+  /** Index just past the text the replacement covers. */
+  end: number;
+  /** The text written in place of `text.slice(valueStart, end)`. */
+  replacement: string;
+}
+
+/** The value a reader receives: the text and the index just past the carrier's name and separator. */
+type ValueReader = (text: string, valueStart: number, carrier: RegExpExecArray) => ValueReplacement | null;
+
+function stickyExec(pattern: RegExp, text: string, index: number): string | null {
+  pattern.lastIndex = index;
+  return pattern.exec(text)?.[0] ?? null;
+}
+
+/** A value position already holding the marker is left alone so a second pass over scrubbed text is a no-op. */
+function isBlankOrScrubbed(value: string): boolean {
+  const trimmed = value.trim();
+  return trimmed.length === 0 || trimmed === REDACTED;
+}
+
+/**
+ * Replaces the value after every match of `carrierPattern` (a global pattern that matches a carrier's name and
+ * separator) with what `readValue` returns for it, leaving the name and separator in place. A reader that returns
+ * null leaves the text alone and scanning continues after the carrier's name.
+ */
+function replaceCarrierValues(text: string, carrierPattern: RegExp, readValue: ValueReader): string {
+  carrierPattern.lastIndex = 0;
+  let out = "";
+  let last = 0;
+  let match: RegExpExecArray | null;
+  while ((match = carrierPattern.exec(text)) !== null) {
+    if (match[0].length === 0) {
+      carrierPattern.lastIndex += 1;
+      continue;
+    }
+    const valueStart = match.index + match[0].length;
+    const read = readValue(text, valueStart, match);
+    if (read === null) continue;
+    out += `${text.slice(last, valueStart)}${read.replacement}`;
+    last = read.end;
+    carrierPattern.lastIndex = last;
+  }
+  return last === 0 ? text : `${out}${text.slice(last)}`;
+}
+
+/**
+ * Reads the value of a header, session, or credential-named pair: a quoted value goes whole up to its closing quote
+ * with the quotes and a leading scheme word kept (`"Bearer value"` becomes `"Bearer [REDACTED]"`); a bare value may
+ * carry a scheme word in front of it and then either a quoted value (`Bearer "value"`) or a bare run.
+ */
+function readCarrierValue(text: string, valueStart: number, barePattern: RegExp): ValueReplacement | null {
+  const quoted = readQuotedValue(text, valueStart);
+  if (quoted !== null) {
+    const content = text.slice(quoted.start, quoted.end);
+    const scheme = stickyExec(HEADER_SCHEME_PATTERN, content, 0) ?? "";
+    if (isBlankOrScrubbed(content.slice(scheme.length))) return null;
+    return { end: quoted.after, replacement: `${quoted.open}${scheme}${REDACTED}${quoted.close}` };
+  }
+  const scheme = stickyExec(HEADER_SCHEME_PATTERN, text, valueStart) ?? "";
+  const afterScheme = valueStart + scheme.length;
+  const quotedAfterScheme = scheme.length > 0 ? readQuotedValue(text, afterScheme) : null;
+  if (quotedAfterScheme !== null) {
+    if (isBlankOrScrubbed(text.slice(quotedAfterScheme.start, quotedAfterScheme.end))) return null;
+    return { end: quotedAfterScheme.after, replacement: `${scheme}${quotedAfterScheme.open}${REDACTED}${quotedAfterScheme.close}` };
+  }
+  const bare = stickyExec(barePattern, text, afterScheme);
+  if (bare === null || isBlankOrScrubbed(bare)) return null;
+  return { end: afterScheme + bare.length, replacement: `${scheme}${REDACTED}` };
+}
+
+const readHeaderValue: ValueReader = (text, valueStart) => readCarrierValue(text, valueStart, HEADER_BARE_VALUE_PATTERN);
+const readPairValue: ValueReader = (text, valueStart) => readCarrierValue(text, valueStart, PAIR_BARE_VALUE_PATTERN);
+
+/** Index just past a cookie pair's or attribute's value, which may be quoted. */
+function cookieValueEnd(text: string, index: number): number {
+  const quoted = readQuotedValue(text, index);
+  if (quoted !== null) return quoted.after;
+  return index + (stickyExec(COOKIE_BARE_VALUE_PATTERN, text, index)?.length ?? 0);
+}
+
+/**
+ * Reads a Cookie or Set-Cookie header value: quoted whole, or `name=value` followed by attributes (`; Path=/;
+ * HttpOnly`), where each value may itself be quoted. The whole header value is replaced by one marker.
+ */
+const readCookieHeaderValue: ValueReader = (text, valueStart) => {
+  const quoted = readQuotedValue(text, valueStart);
+  if (quoted !== null) {
+    if (isBlankOrScrubbed(text.slice(quoted.start, quoted.end))) return null;
+    return { end: quoted.after, replacement: `${quoted.open}${REDACTED}${quoted.close}` };
+  }
+  const name = stickyExec(COOKIE_PAIR_NAME_PATTERN, text, valueStart);
+  if (name === null || name === REDACTED || text[valueStart + name.length] !== "=") return null;
+  let cursor = cookieValueEnd(text, valueStart + name.length + 1);
+  let attribute: string | null;
+  while ((attribute = stickyExec(COOKIE_ATTRIBUTE_PATTERN, text, cursor)) !== null) {
+    cursor += attribute.length;
+    if (text[cursor] === "=") cursor = cookieValueEnd(text, cursor + 1);
+  }
+  return { end: cursor, replacement: REDACTED };
+};
+
+/**
+ * Reads the value after a bare scheme word in free text: a quoted value goes whole when it begins like a credential;
+ * a bare value goes unless it is one plain word.
+ */
+const readSchemeValue: ValueReader = (text, valueStart, carrier) => {
+  const scheme = carrier[1];
+  const conventional = CAPITALISED_SCHEMES.get(scheme.toLowerCase());
+  if (conventional !== undefined && scheme !== conventional) return null;
+  const quoted = readQuotedValue(text, valueStart);
+  if (quoted !== null) {
+    const content = text.slice(quoted.start, quoted.end);
+    if (isBlankOrScrubbed(content) || !QUOTED_SCHEME_VALUE_START_PATTERN.test(content)) return null;
+    return { end: quoted.after, replacement: `${quoted.open}${REDACTED}${quoted.close}` };
+  }
+  const bare = stickyExec(SCHEME_BARE_VALUE_PATTERN, text, valueStart);
+  if (bare === null || !looksLikeSchemeValue(bare)) return null;
+  return { end: valueStart + bare.length, replacement: REDACTED };
+};
+
+// ---------------------------------------------------------------------------------------------------------------------
 // Replacements
 // ---------------------------------------------------------------------------------------------------------------------
 
@@ -353,12 +547,6 @@ function scrubEmbeddedUrl(match: string): string {
 
 function scrubQueryPair(match: string, separator: string, key: string): string {
   return isCredentialKey(key) ? `${separator}${key}=${REDACTED}` : match;
-}
-
-function scrubSchemeValue(match: string, scheme: string, value: string): string {
-  const conventional = CAPITALISED_SCHEMES.get(scheme.toLowerCase());
-  if (conventional !== undefined && scheme !== conventional) return match;
-  return looksLikeSchemeValue(value) ? `${scheme} ${REDACTED}` : match;
 }
 
 function scrubLongToken(run: string): string {
@@ -406,10 +594,9 @@ export function createCredentialScrubber(options: CredentialScrubberOptions = {}
   const headerNames = [...new Set([...COMMON_CREDENTIAL_HEADERS, ...(options.headers ?? []).map((name) => name.toLowerCase())])]
     .sort((left, right) => right.length - left.length)
     .map((name) => name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"));
-  const headerPattern = new RegExp(
-    String.raw`${NAME_START}(${headerNames.join("|")}|${GENERIC_CREDENTIAL_HEADER})(\s*[:=]\s*)(${HEADER_SCHEMES})?${NOT_ALREADY_SCRUBBED}[^\s,;"'<>]+`,
-    "gi",
-  );
+  // The header carrier: a credential header name, its optional closing quote, and the separator; the value is read
+  // quote-aware by `readHeaderValue`.
+  const headerPattern = new RegExp(String.raw`${NAME_START}(${headerNames.join("|")}|${GENERIC_CREDENTIAL_HEADER})${NAME_CLOSE_AND_SEPARATOR}`, "gi");
   const vendorPatterns = [...COMMON_VENDOR_PATTERNS, ...(options.vendorPatterns ?? [])];
 
   function scrubConfiguredSecrets(text: string): string {
@@ -422,12 +609,12 @@ export function createCredentialScrubber(options: CredentialScrubberOptions = {}
       .replace(PEM_BLOCK_PATTERN, REDACTED)
       .replace(PEM_OPEN_PATTERN, REDACTED)
       .replace(EMBEDDED_URL_PATTERN, scrubEmbeddedUrl)
-      .replace(QUERY_PAIR_PATTERN, scrubQueryPair)
-      .replace(COOKIE_HEADER_PATTERN, `$1$2${REDACTED}`)
-      .replace(headerPattern, `$1$2$3${REDACTED}`)
-      .replace(SCHEME_VALUE_PATTERN, scrubSchemeValue)
-      .replace(SESSION_ASSIGNMENT_PATTERN, `$1$2${REDACTED}`)
-      .replace(CREDENTIAL_PAIR_PATTERN, `$1$2$3${REDACTED}`);
+      .replace(QUERY_PAIR_PATTERN, scrubQueryPair);
+    scrubbed = replaceCarrierValues(scrubbed, COOKIE_HEADER_PATTERN, readCookieHeaderValue);
+    scrubbed = replaceCarrierValues(scrubbed, headerPattern, readHeaderValue);
+    scrubbed = replaceCarrierValues(scrubbed, SCHEME_WORD_PATTERN, readSchemeValue);
+    scrubbed = replaceCarrierValues(scrubbed, SESSION_ASSIGNMENT_PATTERN, readPairValue);
+    scrubbed = replaceCarrierValues(scrubbed, CREDENTIAL_PAIR_PATTERN, readPairValue);
     scrubbed = replaceGenericCredentialPairs(scrubbed)
       .replace(JWT_PATTERN, REDACTED)
       .replace(AWS_ACCESS_KEY_ID_PATTERN, REDACTED)

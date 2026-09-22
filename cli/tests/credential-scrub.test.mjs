@@ -8,7 +8,7 @@ import {
   isCredentialKey,
   looksLikeToken,
 } from "../dist/extensions/grc-tools/credential-scrub.js";
-import { assertCanaryWindowsAbsent } from "./helpers/canary-windows.mjs";
+import { assertCanaryFixture, assertCanaryWindowsAbsent } from "./helpers/canary-windows.mjs";
 import { scrubAlterations } from "./helpers/scrub-survival.mjs";
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -76,8 +76,67 @@ const CARRIERS = [
   ["dd-api-key pair", (value) => `dd-api-key: ${value}`],
 ];
 
+/**
+ * The quoted carrier class (rule 9): a quoted header or pair value is removed whole up to its closing quote, whatever
+ * its shape and whatever it holds, in double or single quotes, with or without spaces around the separator, and in
+ * JSON and JSON-escaped text. A scrubber that stops at the opening quote leaves the value; one that stops at the first
+ * space inside the quotes leaves the rest. Each row wraps a value and states the text expected once it is gone: the
+ * quotes and the scheme word stay so the message still says what was replayed.
+ */
+const QUOTED_CARRIERS = [
+  ["Cookie header, double-quoted pair value", (value) => `Cookie: sid="${value}"`, () => `Cookie: ${REDACTED}`],
+  ["Cookie header, single-quoted pair value with attributes", (value) => `Cookie: sid='${value}'; Path=/; HttpOnly`, () => `Cookie: ${REDACTED}`],
+  ["Cookie header, whole value quoted", (value) => `Cookie: "sid=${value}; Path=/"`, () => `Cookie: "${REDACTED}"`],
+  ["Set-Cookie header, quoted pair value", (value) => `Set-Cookie: JSESSIONID="${value}"; Secure`, () => `Set-Cookie: ${REDACTED}`],
+  ["Cookie JSON pair", (value) => `"Cookie": "sid=${value}"`, () => `"Cookie": "${REDACTED}"`],
+  ["Cookie JSON pair, escaped", (value) => `\\"Cookie\\":\\"sid=${value}\\"`, () => `\\"Cookie\\":\\"${REDACTED}\\"`],
+  ["X-Api-Key header, double quotes", (value) => `X-Api-Key: "${value}"`, () => `X-Api-Key: "${REDACTED}"`],
+  ["X-Api-Key header, no spaces", (value) => `X-Api-Key:"${value}"`, () => `X-Api-Key:"${REDACTED}"`],
+  ["X-Api-Key header, single quotes", (value) => `X-Api-Key: '${value}'`, () => `X-Api-Key: '${REDACTED}'`],
+  ["X-Api-Key header, equals separator", (value) => `X-Api-Key = "${value}"`, () => `X-Api-Key = "${REDACTED}"`],
+  ["X-Api-Key JSON pair", (value) => `"X-Api-Key": "${value}"`, () => `"X-Api-Key": "${REDACTED}"`],
+  ["X-Api-Key JSON pair, escaped", (value) => `\\"X-Api-Key\\": \\"${value}\\"`, () => `\\"X-Api-Key\\": \\"${REDACTED}\\"`],
+  ["X-Api-Key JSON pair, escaped twice", (value) => `\\\\\\"X-Api-Key\\\\\\": \\\\\\"${value}\\\\\\"`, () => `\\\\\\"X-Api-Key\\\\\\": \\\\\\"${REDACTED}\\\\\\"`],
+  ["X-Auth-Token header, quoted", (value) => `X-Auth-Token: "${value}"`, () => `X-Auth-Token: "${REDACTED}"`],
+  ["custom x- credential header, quoted", (value) => `X-Vendor-Session-Key: '${value}'`, () => `X-Vendor-Session-Key: '${REDACTED}'`],
+  ["Authorization header, quoted value after the scheme", (value) => `Authorization: Bearer "${value}"`, () => `Authorization: Bearer "${REDACTED}"`],
+  ["Authorization header, single-quoted value after the scheme", (value) => `Authorization: Bearer '${value}'`, () => `Authorization: Bearer '${REDACTED}'`],
+  ["Authorization header, scheme inside the quotes", (value) => `Authorization: "Bearer ${value}"`, () => `Authorization: "Bearer ${REDACTED}"`],
+  ["Authorization header, Basic quoted", (value) => `Authorization: Basic "${value}"`, () => `Authorization: Basic "${REDACTED}"`],
+  ["Authorization JSON pair", (value) => `"Authorization": "Bearer ${value}"`, () => `"Authorization": "Bearer ${REDACTED}"`],
+  ["Authorization JSON pair, escaped", (value) => `\\"Authorization\\": \\"Bearer ${value}\\"`, () => `\\"Authorization\\": \\"Bearer ${REDACTED}\\"`],
+  ["Authorization JSON pair, escaped, no spaces", (value) => `\\"Authorization\\":\\"Bearer ${value}\\"`, () => `\\"Authorization\\":\\"Bearer ${REDACTED}\\"`],
+  ["Proxy-Authorization header, quoted", (value) => `Proxy-Authorization: 'Basic ${value}'`, () => `Proxy-Authorization: 'Basic ${REDACTED}'`],
+  ["Bearer scheme in prose, quoted", (value) => `upstream rejected Bearer "${value}" mid-sentence`, () => `upstream rejected Bearer "${REDACTED}" mid-sentence`],
+  ["session assignment, quoted", (value) => `session_id: "${value}"`, () => `session_id: "${REDACTED}"`],
+  ["sid JSON pair, escaped", (value) => `\\"sid\\": \\"${value}\\"`, () => `\\"sid\\": \\"${REDACTED}\\"`],
+  ["password JSON pair holding spaces", (value) => `{"password": "${value} with spaces"}`, () => `{"password": "${REDACTED}"}`],
+  ["token pair, escaped", (value) => `\\"token\\":\\"${value}\\"`, () => `\\"token\\":\\"${REDACTED}\\"`],
+  ["unterminated quoted header value", (value) => `X-Api-Key: "${value}`, () => `X-Api-Key: "${REDACTED}`],
+  [
+    "request options echoed as JSON",
+    (value) => `{"headers":{"Authorization":"Bearer ${value}","X-Api-Key":"${value}","Cookie":"sid=${value}","Accept":"application/json"}}`,
+    () => `{"headers":{"Authorization":"Bearer ${REDACTED}","X-Api-Key":"${REDACTED}","Cookie":"${REDACTED}","Accept":"application/json"}}`,
+  ],
+];
+
+/** Alphanumeric random-looking values planted in the quoted carriers; the first is name-shaped and stays bare. */
+const QUOTED_CANARIES = ["RulingNameShapedProbeZq", "BPt5mgDrRZ5YyLTHaQPepJUYQbGYRCjG"];
+
 /** Fixed text every integration emits; the scrubber must return each string unchanged. */
 const MUST_KEEP = [
+  'Content-Type: "application/json"',
+  '"Content-Type": "application/json"',
+  '\\"Content-Type\\": \\"application/json\\"',
+  "Accept: 'application/json'",
+  'Content-Type: "text/html; charset=utf-8"',
+  'User-Agent: "grclanker/1.0"',
+  '"Content-Length": "5120"',
+  'X-Request-Id: "req-2026-09-22-zq"',
+  'X-Rate-Limit-Remaining: "0"',
+  '{"headers":{"Accept":"application/json","Content-Type":"application/json"}}',
+  "the Cookie header was rejected and the Authorization header was missing",
+  '{"type": "Basic ", "scheme": "bearer"}',
   "403 Forbidden: non-JSON body (text/html, 47 bytes, not echoed)",
   "502 Bad Gateway: non-JSON body (text/html, 5120 bytes, not echoed)",
   "403 Forbidden: JSON body without a documented error field (64 bytes, not echoed)",
@@ -171,6 +230,39 @@ test("scrub boundary guard 1: carriers keep their name and scheme so the message
   assert.equal(scrubber.scrub("GET /api/v2/x?token=prod-us-east-2026&env=production"), `GET /api/v2/x?token=${REDACTED}&env=production`);
   assert.equal(scrubber.scrub('{"token":"prod-us-east-2026","env":"production"}'), `{"token":"${REDACTED}","env":"production"}`);
   assert.equal(scrubber.scrub("api_key: prod-us-east-2026, env: production"), `api_key: ${REDACTED}, env: production`);
+});
+
+test("scrub boundary guard 1, quoted carriers: the planted values look random and share no 6-character window with the carriers or the must-keep rows", () => {
+  const legitimate = [...QUOTED_CARRIERS.map(([label, carrier]) => [label, carrier("")]), ...MUST_KEEP.map((text, index) => [`must-keep ${index}`, text])];
+  assertCanaryFixture(assert, QUOTED_CANARIES, legitimate, "quoted carriers");
+});
+
+test("scrub boundary guard 1, quoted carriers: a quoted header or pair value is removed whole, in double or single quotes, with or without spaces, and JSON-escaped", () => {
+  const scrubber = createCredentialScrubber();
+  const [nameShapedCanary] = QUOTED_CANARIES;
+  const bare = `the resource ${nameShapedCanary} was not readable`;
+  assert.equal(scrubber.scrub(bare), bare, "the name-shaped canary stays bare, so only the carrier can remove it");
+  const values = [...QUOTED_CANARIES, ...NAME_SHAPED];
+  for (const [label, carrier, expected] of QUOTED_CARRIERS) {
+    for (const value of values) {
+      const scrubbed = scrubber.scrub(carrier(value));
+      assert.equal(scrubbed, expected(), `${label} with ${value}`);
+      assertCanaryWindowsAbsent(assert, scrubbed, [value], `${label} with ${value}`);
+      assert.equal(scrubber.scrub(scrubbed), scrubbed, `${label} with ${value}: a second pass changed the text`);
+    }
+  }
+});
+
+test("scrub boundary guard 1, quoted carriers: the reported forms, a plain word in quotes included, come out with the value gone and the quotes and scheme kept", () => {
+  const scrubber = createCredentialScrubber();
+  assert.equal(scrubber.scrub('Cookie: sid="prod-cookie"'), `Cookie: ${REDACTED}`);
+  assert.equal(scrubber.scrub('X-Api-Key: "prod-key"'), `X-Api-Key: "${REDACTED}"`);
+  assert.equal(scrubber.scrub('Authorization: Bearer "token"'), `Authorization: Bearer "${REDACTED}"`);
+  assert.equal(scrubber.scrub("Authorization: Bearer 'token'"), `Authorization: Bearer '${REDACTED}'`);
+  assert.equal(scrubber.scrub('Authorization:"Bearer token"'), `Authorization:"Bearer ${REDACTED}"`);
+  assert.equal(scrubber.scrub('\\"Authorization\\": \\"Bearer token\\"'), `\\"Authorization\\": \\"Bearer ${REDACTED}\\"`);
+  assert.equal(scrubber.scrub('X-Api-Key: ""'), 'X-Api-Key: ""', "an empty quoted value has nothing to remove");
+  assert.equal(scrubber.scrub("Bearer token authentication is required"), "Bearer token authentication is required", "a bare plain word after a scheme word is still prose");
 });
 
 test("scrub boundary guard 2: a configured secret is removed whatever its shape and in its base64, base64url, URL-encoded, form-encoded, and JSON-escaped forms", () => {

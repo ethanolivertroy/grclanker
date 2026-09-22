@@ -31,9 +31,11 @@ import {
   redactSecrets,
   resolveBoxConfiguration,
   resolveSecureOutputPath,
+  scrubErrorText,
 } from "../dist/extensions/grc-tools/box.js";
 import { getRegisteredToolSummaries } from "../dist/pi/tool-catalog.js";
 import { assertSecretsAbsent, readBundleFiles, readZipEntries } from "./helpers/bundle-contents.mjs";
+import { assertCanaryWindowsAbsent } from "./helpers/canary-windows.mjs";
 
 const NOW = new Date("2026-09-21T00:00:00Z");
 const FRAMEWORKS = ["FedRAMP", "CMMC", "SOC 2", "CIS", "PCI-DSS", "STIG", "IRAP", "ISMAP"];
@@ -842,6 +844,32 @@ test("BoxApiClient retries 429 and 5xx responses with backoff and redacts secret
   assert.deepEqual(delays, [500, 1000], "5xx retries use exponential backoff until maxRetries is exhausted");
 
   assert.equal(redactSecrets("Authorization: Bearer abc.def-ghi and secret shh-secret-value", ["shh-secret-value", "tiny"]), "Authorization: Bearer [REDACTED] and secret [REDACTED]");
+});
+
+test("Box scrubber: a quoted header value in a recorded error is removed whole, in double or single quotes, with or without spaces, and JSON-escaped", () => {
+  const canary = "RulingNameShapedProbeZq";
+  assert.equal(scrubErrorText(`the resource ${canary} was not readable`), `the resource ${canary} was not readable`, "the name-shaped canary stays bare, so only the carrier removes it");
+  const carriers = [
+    [`Cookie: sid="${canary}"`, "Cookie: [REDACTED]"],
+    [`Cookie: sid='${canary}'; Path=/; HttpOnly`, "Cookie: [REDACTED]"],
+    [`X-Api-Key: "${canary}"`, 'X-Api-Key: "[REDACTED]"'],
+    [`X-Api-Key:'${canary}'`, "X-Api-Key:'[REDACTED]'"],
+    [`Authorization: Bearer "${canary}"`, 'Authorization: Bearer "[REDACTED]"'],
+    [`Authorization: "Bearer ${canary}"`, 'Authorization: "Bearer [REDACTED]"'],
+    [`"Authorization": "Bearer ${canary}"`, '"Authorization": "Bearer [REDACTED]"'],
+    [`\\"Authorization\\":\\"Bearer ${canary}\\"`, '\\"Authorization\\":\\"Bearer [REDACTED]\\"'],
+    [`\\"X-Api-Key\\": \\"${canary}\\"`, '\\"X-Api-Key\\": \\"[REDACTED]\\"'],
+    [`Box request failed (502 Bad Gateway) for GET /2.0/users: upstream echoed {"headers":{"Authorization":"Bearer ${canary}","Cookie":"sid=${canary}","Content-Type":"application/json"}}`, 'Box request failed (502 Bad Gateway) for GET /2.0/users: upstream echoed {"headers":{"Authorization":"Bearer [REDACTED]","Cookie":"[REDACTED]","Content-Type":"application/json"}}'],
+  ];
+  for (const [text, expected] of carriers) {
+    const scrubbed = scrubErrorText(text);
+    assert.equal(scrubbed, expected, text);
+    assertCanaryWindowsAbsent(assert, scrubbed, [canary], text);
+    assert.equal(scrubErrorText(scrubbed), scrubbed, `${text}: a second pass changed the text`);
+  }
+  assert.equal(scrubErrorText('Authorization: Bearer "token"'), 'Authorization: Bearer "[REDACTED]"', "a plain word in quotes is the value and goes");
+  assert.equal(scrubErrorText('Content-Type: "application/json"; Accept: "application/json"'), 'Content-Type: "application/json"; Accept: "application/json"', "quoted non-credential headers stay");
+  assert.equal(redactSecrets(`Cookie: sid="${canary}"`, [canary]), "Cookie: [REDACTED]", "registering the value as a secret changes nothing about the carrier result");
 });
 
 test("BoxApiClient refreshes an expired OAuth token after a 401", async () => {
