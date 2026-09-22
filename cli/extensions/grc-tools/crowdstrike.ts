@@ -147,6 +147,8 @@ const REDACTED = "[REDACTED]";
 // Falcon client secrets and bearer tokens are long; a shorter minimum would remember common words
 // (a fixture token spelled "token") and redact them out of ordinary prose such as "/oauth2/token".
 const MIN_REMEMBERED_SECRET_LENGTH = 8;
+/** Nesting beyond this depth is left as served; parsed API payloads never reach it. */
+const MAX_REDACTION_DEPTH = 32;
 const KNOWN_SECRETS = new Set<string>();
 /** The forms a remembered secret takes in an echoed body (raw, base64, base64url, URL-encoded, JSON-escaped), computed once per secret. */
 const SECRET_FORMS = new Map<string, string[]>();
@@ -774,7 +776,17 @@ function scrubSecretText(text: string, secrets: Iterable<string | undefined> = [
     if (!secret || secret.length < MIN_REMEMBERED_SECRET_LENGTH) continue;
     for (const form of secretForms(secret)) scrubbed = scrubbed.split(form).join(REDACTED);
   }
-  return scrubbed
+  return scrubBareTokens(scrubCarriers(scrubbed));
+}
+
+/**
+ * The carrier stage of the pass: URL userinfo, query strings, and fragments anywhere in the text,
+ * Authorization and cookie headers, credential elements, JWTs and PEM blocks, auth schemes in prose,
+ * credential-named assignments, fields, and command-line flags. It removes a value by the company it
+ * keeps, never by its shape alone.
+ */
+function scrubCarriers(text: string): string {
+  return text
     .replace(PEM_BLOCK_PATTERN, REDACTED)
     .replace(URL_IN_TEXT_PATTERN, (_match, scheme: string, userinfo: string | undefined, host: string, path: string, query?: string, fragment?: string) =>
       `${scheme}${userinfo ? `${REDACTED}@` : ""}${host}${path}${query ? `?${REDACTED}` : ""}${fragment ? `#${REDACTED}` : ""}`)
@@ -787,10 +799,47 @@ function scrubSecretText(text: string, secrets: Iterable<string | undefined> = [
       (isProseAfterScheme(scheme, credential) ? match : `${scheme} ${redactCredentialParameters(credential)}`))
     .replace(SECRET_ASSIGNMENT_PATTERN, (_match, assignment: string) => `${assignment}${REDACTED}`)
     .replace(SECRET_FIELD_PATTERN, (_match, field: string) => `${field}${REDACTED}`)
-    .replace(CLI_SECRET_FLAG_PATTERN, (_match, flag: string) => `${flag}${REDACTED}`)
+    .replace(CLI_SECRET_FLAG_PATTERN, (_match, flag: string) => `${flag}${REDACTED}`);
+}
+
+/** The bare-token stage: real token shapes removed whatever their company (vendor prefixes, hex digests, long runs with base64 symbols, scattered digits, or token casing). */
+function scrubBareTokens(text: string): string {
+  return text
     .replace(VENDOR_TOKEN_PATTERN, REDACTED)
     .replace(HEX_DIGEST_PATTERN, REDACTED)
     .replace(BARE_TOKEN_RUN_PATTERN, redactTokenRun);
+}
+
+/** Every secret any client in this process has seen, in every form it can take in a text. */
+function scrubRememberedSecrets(text: string): string {
+  let scrubbed = text;
+  for (const secret of KNOWN_SECRETS) {
+    for (const form of secretForms(secret)) scrubbed = scrubbed.split(form).join(REDACTED);
+  }
+  return scrubbed;
+}
+
+/**
+ * The data-side pass (rule 9, data-side carrier class) for every string a snapshot, evidence list,
+ * summary, core_data file, or tool payload keeps from an API response: the remembered secrets in every
+ * form, then the carrier stage. It has no bare-token stage, so prose identifiers (a UUID, a sys_id, a
+ * name such as prod-us-east-2026) stay while a header line, URL credential, assignment, or configured
+ * secret embedded in a description, name, or note goes.
+ */
+function scrubDataText(text: string): string {
+  return scrubCarriers(scrubRememberedSecrets(text));
+}
+
+/** A collected value with every string leaf through the data-side pass; arrays and plain objects are rebuilt, other values are kept. */
+function scrubDataStrings<T>(value: T, depth = 0): T {
+  if (typeof value === "string") return scrubDataText(value) as T;
+  if (depth > MAX_REDACTION_DEPTH || value === null || typeof value !== "object") return value;
+  if (Array.isArray(value)) return value.map((item) => scrubDataStrings(item, depth + 1)) as T;
+  const prototype = Object.getPrototypeOf(value);
+  if (prototype !== Object.prototype && prototype !== null) return value;
+  const output: Record<string, unknown> = {};
+  for (const [key, entry] of Object.entries(value as Record<string, unknown>)) output[key] = scrubDataStrings(entry, depth + 1);
+  return output as T;
 }
 
 /** A scheme word standing in prose ("bearer of", "OAuth bearer token.", "Refresh Token Policy") rather than carrying a credential. */
@@ -866,7 +915,7 @@ function isForbiddenOrMissing(dataset: CollectedDataset<unknown>): boolean {
 
 async function collectDataset<T>(load: () => Promise<T>, fallback: T, label: string, endpoint?: string): Promise<CollectedDataset<T>> {
   try {
-    return { data: await load(), label, endpoint };
+    return { data: scrubDataStrings(await load()), label, endpoint };
   } catch (error) {
     const http = error instanceof CrowdstrikeHttpError ? error : undefined;
     return {

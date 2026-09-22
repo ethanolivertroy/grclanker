@@ -32,6 +32,8 @@ const REDACTED = "[REDACTED]";
 // ServiceNow passwords, OAuth client secrets, and bearer tokens are long; a shorter minimum would
 // remember common words and redact them out of ordinary error text.
 const MIN_REMEMBERED_SECRET_LENGTH = 8;
+/** Nesting beyond this depth is left as served; parsed API payloads never reach it. */
+const MAX_REDACTION_DEPTH = 32;
 /** Every credential literal a client in this process was configured with or obtained from oauth_token.do. */
 const KNOWN_SECRETS = new Set<string>();
 /** The forms a remembered secret takes in an echoed body (raw, base64, base64url, URL-encoded, JSON-escaped), computed once per secret. */
@@ -159,6 +161,8 @@ export interface ServicenowResolvedConfig {
   clientId?: string;
   clientSecret?: string;
   accessToken?: string;
+  /** A refresh token issued earlier to the OAuth client; when present the first token exchange uses the refresh_token grant. */
+  refreshToken?: string;
   timeoutMs: number;
   maxRetries: number;
   pageSize: number;
@@ -554,7 +558,17 @@ function scrubSecretText(text: string, secrets: Iterable<string | undefined> = [
     if (!secret || secret.length < MIN_REMEMBERED_SECRET_LENGTH) continue;
     for (const form of secretForms(secret)) scrubbed = scrubbed.split(form).join(REDACTED);
   }
-  return scrubbed
+  return scrubBareTokens(scrubCarriers(scrubbed));
+}
+
+/**
+ * The carrier stage of the pass: URL userinfo, query strings, and fragments anywhere in the text,
+ * Authorization and cookie headers, credential elements, JWTs and PEM blocks, auth schemes in prose,
+ * credential-named assignments, fields, and command-line flags. It removes a value by the company it
+ * keeps, never by its shape alone.
+ */
+function scrubCarriers(text: string): string {
+  return text
     .replace(PEM_BLOCK_PATTERN, REDACTED)
     .replace(URL_IN_TEXT_PATTERN, (_match, scheme: string, userinfo: string | undefined, host: string, path: string, query?: string, fragment?: string) =>
       `${scheme}${userinfo ? `${REDACTED}@` : ""}${host}${path}${query ? `?${REDACTED}` : ""}${fragment ? `#${REDACTED}` : ""}`)
@@ -567,10 +581,47 @@ function scrubSecretText(text: string, secrets: Iterable<string | undefined> = [
       (isProseAfterScheme(scheme, credential) ? match : `${scheme} ${redactCredentialParameters(credential)}`))
     .replace(SECRET_ASSIGNMENT_PATTERN, (_match, assignment: string) => `${assignment}${REDACTED}`)
     .replace(SECRET_FIELD_PATTERN, (_match, field: string) => `${field}${REDACTED}`)
-    .replace(CLI_SECRET_FLAG_PATTERN, (_match, flag: string) => `${flag}${REDACTED}`)
+    .replace(CLI_SECRET_FLAG_PATTERN, (_match, flag: string) => `${flag}${REDACTED}`);
+}
+
+/** The bare-token stage: real token shapes removed whatever their company (vendor prefixes, hex digests, long runs with base64 symbols, scattered digits, or token casing). */
+function scrubBareTokens(text: string): string {
+  return text
     .replace(VENDOR_TOKEN_PATTERN, REDACTED)
     .replace(HEX_DIGEST_PATTERN, REDACTED)
     .replace(BARE_TOKEN_RUN_PATTERN, redactTokenRun);
+}
+
+/** Every secret any client in this process has seen, in every form it can take in a text. */
+function scrubRememberedSecrets(text: string): string {
+  let scrubbed = text;
+  for (const secret of KNOWN_SECRETS) {
+    for (const form of secretForms(secret)) scrubbed = scrubbed.split(form).join(REDACTED);
+  }
+  return scrubbed;
+}
+
+/**
+ * The data-side pass (rule 9, data-side carrier class) for every string a snapshot, evidence list,
+ * summary, core_data file, or tool payload keeps from an API response: the remembered secrets in every
+ * form, then the carrier stage. It has no bare-token stage, so prose identifiers (a UUID, a sys_id, a
+ * name such as prod-us-east-2026) stay while a header line, URL credential, assignment, or configured
+ * secret embedded in a description, name, or note goes.
+ */
+function scrubDataText(text: string): string {
+  return scrubCarriers(scrubRememberedSecrets(text));
+}
+
+/** A collected value with every string leaf through the data-side pass; arrays and plain objects are rebuilt, other values are kept. */
+function scrubDataStrings<T>(value: T, depth = 0): T {
+  if (typeof value === "string") return scrubDataText(value) as T;
+  if (depth > MAX_REDACTION_DEPTH || value === null || typeof value !== "object") return value;
+  if (Array.isArray(value)) return value.map((item) => scrubDataStrings(item, depth + 1)) as T;
+  const prototype = Object.getPrototypeOf(value);
+  if (prototype !== Object.prototype && prototype !== null) return value;
+  const output: Record<string, unknown> = {};
+  for (const [key, entry] of Object.entries(value as Record<string, unknown>)) output[key] = scrubDataStrings(entry, depth + 1);
+  return output as T;
 }
 
 /** A scheme word standing in prose ("bearer of", "OAuth bearer token.", "Refresh Token Policy") rather than carrying a credential. */
@@ -1049,6 +1100,16 @@ export interface ServicenowTableQuery {
   displayValue?: boolean | "all";
 }
 
+/**
+ * Every table read the collectors and the access check make goes through here, so each kept row passes
+ * the data-side pass (remembered secrets and carriers, no bare-token stage) before it reaches a snapshot,
+ * evidence, a summary, core_data, or a tool payload.
+ */
+async function readTable(client: Pick<ServicenowReadClient, "queryTable">, table: string, options: ServicenowTableQuery = {}): Promise<TableSnapshot> {
+  const snapshot = await client.queryTable(table, options);
+  return { ...snapshot, rows: scrubDataStrings(snapshot.rows) };
+}
+
 export interface ServicenowReadClient {
   getResolvedConfig(): ServicenowResolvedConfig;
   getNow(): Date;
@@ -1082,7 +1143,8 @@ export class ServicenowApiClient implements ServicenowReadClient {
       this.accessToken = config.accessToken;
       this.accessTokenExpiresAt = Number.MAX_SAFE_INTEGER;
     }
-    rememberSecrets(config.password, config.clientSecret, config.accessToken);
+    this.refreshToken = config.refreshToken;
+    rememberSecrets(config.password, config.clientSecret, config.accessToken, config.refreshToken);
   }
 
   getResolvedConfig(): ServicenowResolvedConfig {
@@ -1867,17 +1929,17 @@ export async function collectServicenowIdentityData(
   const recordLimit = clampNumber(options.recordLimit, DEFAULT_RECORD_LIMIT, 1, 500_000);
   const roleList = PRIVILEGED_ROLE_NAMES.join(",");
   const [users, privilegedAssignments, roleInheritance, roleInheritanceTotal, properties, passwordPolicies, ssoProviders, ldapServers, certificates, oauthEntities, mfaCriteria] = await Promise.all([
-    client.queryTable("sys_user", { query: "active=true", fields: USER_FIELDS, limit: recordLimit }),
-    client.queryTable("sys_user_has_role", { query: `role.nameIN${roleList}`, fields: USER_ROLE_FIELDS, limit: recordLimit }),
-    client.queryTable("sys_user_role_contains", { query: `contains.nameIN${ELEVATED_ROLE_NAMES.join(",")}`, fields: ROLE_CONTAINS_FIELDS, limit: recordLimit }),
+    readTable(client, "sys_user", { query: "active=true", fields: USER_FIELDS, limit: recordLimit }),
+    readTable(client, "sys_user_has_role", { query: `role.nameIN${roleList}`, fields: USER_ROLE_FIELDS, limit: recordLimit }),
+    readTable(client, "sys_user_role_contains", { query: `contains.nameIN${ELEVATED_ROLE_NAMES.join(",")}`, fields: ROLE_CONTAINS_FIELDS, limit: recordLimit }),
     client.countRecords("sys_user_role_contains"),
-    client.queryTable("sys_properties", { query: `nameIN${IDENTITY_PROPERTY_QUERY_NAMES.join(",")}`, fields: PROPERTY_FIELDS, limit: recordLimit }),
-    client.queryTable("password_policy", { fields: PASSWORD_POLICY_FIELDS, limit: recordLimit }),
-    client.queryTable("sso_properties", { fields: ["sys_id", "name", "active", "default", "auto_redirect_idp", "sys_updated_on"], limit: recordLimit }),
-    client.queryTable("ldap_server_config", { fields: ["sys_id", "name", "active", "sys_updated_on"], limit: recordLimit }),
-    client.queryTable("sys_certificate", { fields: CERTIFICATE_FIELDS, limit: recordLimit }),
-    client.queryTable("oauth_entity", { fields: ["sys_id", "name", "type", "active", "client_id", "sys_updated_on"], limit: recordLimit }),
-    client.queryTable(MFA_CRITERIA_TABLE, { fields: MFA_CRITERIA_FIELDS, displayValue: true, limit: recordLimit }),
+    readTable(client, "sys_properties", { query: `nameIN${IDENTITY_PROPERTY_QUERY_NAMES.join(",")}`, fields: PROPERTY_FIELDS, limit: recordLimit }),
+    readTable(client, "password_policy", { fields: PASSWORD_POLICY_FIELDS, limit: recordLimit }),
+    readTable(client, "sso_properties", { fields: ["sys_id", "name", "active", "default", "auto_redirect_idp", "sys_updated_on"], limit: recordLimit }),
+    readTable(client, "ldap_server_config", { fields: ["sys_id", "name", "active", "sys_updated_on"], limit: recordLimit }),
+    readTable(client, "sys_certificate", { fields: CERTIFICATE_FIELDS, limit: recordLimit }),
+    readTable(client, "oauth_entity", { fields: ["sys_id", "name", "type", "active", "client_id", "sys_updated_on"], limit: recordLimit }),
+    readTable(client, MFA_CRITERIA_TABLE, { fields: MFA_CRITERIA_FIELDS, displayValue: true, limit: recordLimit }),
   ]);
   return {
     users,
@@ -2442,12 +2504,12 @@ export async function collectServicenowHardeningData(
 ): Promise<ServicenowHardeningData> {
   const recordLimit = clampNumber(options.recordLimit, DEFAULT_RECORD_LIMIT, 1, 500_000);
   const [properties, debugProperties, evalScripts, ipAccessRules, ipAuthenticatorPlugin, emailAccounts] = await Promise.all([
-    client.queryTable("sys_properties", { query: `nameIN${HARDENING_PROPERTY_QUERY_NAMES.join(",")}`, fields: PROPERTY_FIELDS, limit: recordLimit }),
-    client.queryTable("sys_properties", { query: "nameLIKEdebug^value=true", fields: PROPERTY_FIELDS, limit: recordLimit }),
-    client.queryTable("sys_script", { query: "active=true^scriptLIKEeval(", fields: ["sys_id", "name", "collection", "sys_updated_on"], limit: recordLimit }),
-    client.queryTable(IP_ACCESS_TABLE, { fields: IP_ACCESS_FIELDS, limit: recordLimit }),
-    client.queryTable("sys_plugins", { query: `source=${IP_AUTHENTICATOR_PLUGIN}`, fields: PLUGIN_FIELDS, limit: recordLimit }),
-    client.queryTable("sys_email_account", { fields: EMAIL_ACCOUNT_FIELDS, displayValue: true, limit: recordLimit }),
+    readTable(client, "sys_properties", { query: `nameIN${HARDENING_PROPERTY_QUERY_NAMES.join(",")}`, fields: PROPERTY_FIELDS, limit: recordLimit }),
+    readTable(client, "sys_properties", { query: "nameLIKEdebug^value=true", fields: PROPERTY_FIELDS, limit: recordLimit }),
+    readTable(client, "sys_script", { query: "active=true^scriptLIKEeval(", fields: ["sys_id", "name", "collection", "sys_updated_on"], limit: recordLimit }),
+    readTable(client, IP_ACCESS_TABLE, { fields: IP_ACCESS_FIELDS, limit: recordLimit }),
+    readTable(client, "sys_plugins", { query: `source=${IP_AUTHENTICATOR_PLUGIN}`, fields: PLUGIN_FIELDS, limit: recordLimit }),
+    readTable(client, "sys_email_account", { fields: EMAIL_ACCOUNT_FIELDS, displayValue: true, limit: recordLimit }),
   ]);
   return {
     properties,
@@ -2788,7 +2850,7 @@ export async function collectServicenowAccessControlData(
   options: ServicenowAccessControlOptions = {},
 ): Promise<ServicenowAccessControlData> {
   const recordLimit = clampNumber(options.recordLimit, DEFAULT_RECORD_LIMIT, 1, 500_000);
-  const rawAcls = await client.queryTable("sys_security_acl", { query: buildSensitiveAclQuery(), fields: ACL_FIELDS, limit: recordLimit });
+  const rawAcls = await readTable(client, "sys_security_acl", { query: buildSensitiveAclQuery(), fields: ACL_FIELDS, limit: recordLimit });
   const acls: TableSnapshot = { ...rawAcls, rows: rawAcls.rows.map(projectAclRow) };
   const aclIds = acls.rows.map((row) => rowString(row, "sys_id")).filter((item): item is string => Boolean(item));
   // The role lookup is keyed on the ACL ids that were read. Without ids no request is issued, and the
@@ -2805,12 +2867,12 @@ export async function collectServicenowAccessControlData(
   });
   const [aclRoles, aclTotal, publicPages] = await Promise.all([
     aclIds.length > 0
-      ? client.queryTable("sys_security_acl_role", { query: `sys_security_aclIN${aclIds.join(",")}`, fields: ACL_ROLE_FIELDS, limit: recordLimit })
+      ? readTable(client, "sys_security_acl_role", { query: `sys_security_aclIN${aclIds.join(",")}`, fields: ACL_ROLE_FIELDS, limit: recordLimit })
       : Promise.resolve(acls.error
         ? skippedRoles(`the ${acls.table} read failed, so there were no ACL ids to look up`, true)
         : skippedRoles(`the ${acls.table} read returned no rows, so there were no ACL ids to look up`, false)),
     client.countRecords("sys_security_acl", "active=true^type=record"),
-    client.queryTable("sys_public", { query: "active=true", fields: ["sys_id", "page", "active", "sys_updated_on"], limit: recordLimit }),
+    readTable(client, "sys_public", { query: "active=true", fields: ["sys_id", "page", "active", "sys_updated_on"], limit: recordLimit }),
   ]);
   return { acls, aclRoles, aclTotal, publicPages };
 }
@@ -3009,18 +3071,18 @@ export async function collectServicenowOperationsData(
     ["sys_security_acl_", "sys_user_role_", "sys_user_role_contains_", "sys_script_", "sys_script_include_", "sys_properties_"].map((prefix) => `nameSTARTSWITH${prefix}`).join("^OR"),
   ].join("^");
   const [encryptionContexts, cryptoModules, encryptedFields, auditDictionary, recentAuditCount, recentTransactionCount, updateSetsInProgress, updateSetTotal, sensitiveUpdateXml, midServers, properties, plugins] = await Promise.all([
-    client.queryTable(LEGACY_ENCRYPTION_CONTEXT_TABLE, { fields: ["sys_id", "name", "type", "sys_updated_on"], limit: recordLimit }),
-    client.queryTable(CRYPTO_MODULE_TABLE, { fields: ["sys_id", "name", "module_name", "state", "sys_scope", "sys_updated_on"], limit: recordLimit }),
-    client.queryTable("sys_dictionary", { query: "internal_type=glide_encrypted^ORinternal_type=password2", fields: ["sys_id", "name", "element", "internal_type"], limit: recordLimit }),
-    client.queryTable("sys_dictionary", { query: `internal_type=collection^nameIN${AUDITED_CRITICAL_TABLES.join(",")}`, fields: ["sys_id", "name", "audit", "attributes"], limit: recordLimit }),
+    readTable(client, LEGACY_ENCRYPTION_CONTEXT_TABLE, { fields: ["sys_id", "name", "type", "sys_updated_on"], limit: recordLimit }),
+    readTable(client, CRYPTO_MODULE_TABLE, { fields: ["sys_id", "name", "module_name", "state", "sys_scope", "sys_updated_on"], limit: recordLimit }),
+    readTable(client, "sys_dictionary", { query: "internal_type=glide_encrypted^ORinternal_type=password2", fields: ["sys_id", "name", "element", "internal_type"], limit: recordLimit }),
+    readTable(client, "sys_dictionary", { query: `internal_type=collection^nameIN${AUDITED_CRITICAL_TABLES.join(",")}`, fields: ["sys_id", "name", "audit", "attributes"], limit: recordLimit }),
     client.countRecords("sys_audit", `sys_created_on>=javascript:gs.daysAgoStart(${AUDIT_LOOKBACK_DAYS})`),
     client.countRecords("syslog_transaction", "sys_created_on>=javascript:gs.daysAgoStart(1)"),
-    client.queryTable("sys_update_set", { query: "state=in progress", fields: ["sys_id", "name", "state", "application", "sys_created_by", "sys_updated_on"], limit: recordLimit }),
+    readTable(client, "sys_update_set", { query: "state=in progress", fields: ["sys_id", "name", "state", "application", "sys_created_by", "sys_updated_on"], limit: recordLimit }),
     client.countRecords("sys_update_set"),
-    client.queryTable("sys_update_xml", { query: sensitiveXmlQuery, fields: ["sys_id", "name", "type", "target_name", "action", "update_set", "update_set.name", "sys_updated_on"], limit: recordLimit }),
-    client.queryTable("ecc_agent", { fields: ["sys_id", "name", "status", "validated", "version", "host_name", "sys_updated_on"], limit: recordLimit }),
-    client.queryTable("sys_properties", { query: `nameIN${MID_PROPERTY_NAMES.join(",")}`, fields: PROPERTY_FIELDS, limit: recordLimit }),
-    client.queryTable("sys_plugins", { fields: PLUGIN_FIELDS, limit: recordLimit }),
+    readTable(client, "sys_update_xml", { query: sensitiveXmlQuery, fields: ["sys_id", "name", "type", "target_name", "action", "update_set", "update_set.name", "sys_updated_on"], limit: recordLimit }),
+    readTable(client, "ecc_agent", { fields: ["sys_id", "name", "status", "validated", "version", "host_name", "sys_updated_on"], limit: recordLimit }),
+    readTable(client, "sys_properties", { query: `nameIN${MID_PROPERTY_NAMES.join(",")}`, fields: PROPERTY_FIELDS, limit: recordLimit }),
+    readTable(client, "sys_plugins", { fields: PLUGIN_FIELDS, limit: recordLimit }),
   ]);
   return {
     encryptionContexts: normalizeMissingTable(encryptionContexts, `${LEGACY_ENCRYPTION_CONTEXT_TABLE} (legacy Column Level Encryption contexts) does not exist on this instance`),
@@ -3350,7 +3412,7 @@ async function probeSurface(
   surface: { name: string; table: string },
 ): Promise<ServicenowAccessSurface> {
   const [snapshot, count] = await Promise.all([
-    client.queryTable(surface.table, { fields: ["sys_id"], limit: 1, pageSize: 1 }),
+    readTable(client, surface.table, { fields: ["sys_id"], limit: 1, pageSize: 1 }),
     client.countRecords(surface.table),
   ]);
   const total = count.count ?? snapshot.total;
@@ -3381,7 +3443,7 @@ export async function checkServicenowAccess(
   client: Pick<ServicenowReadClient, "getResolvedConfig" | "queryTable" | "countRecords">,
 ): Promise<ServicenowAccessCheckResult> {
   const config = client.getResolvedConfig();
-  const whoami = await client.queryTable("sys_user", { query: "sys_id=javascript:gs.getUserID()", fields: ["user_name", "name"], limit: 1, pageSize: 1 });
+  const whoami = await readTable(client, "sys_user", { query: "sys_id=javascript:gs.getUserID()", fields: ["user_name", "name"], limit: 1, pageSize: 1 });
   const identity = whoami.rows[0] ? rowString(whoami.rows[0], "user_name") ?? rowString(whoami.rows[0], "name") : undefined;
   const surfaces = await Promise.all(ACCESS_SURFACES.map((surface) => probeSurface(client, surface)));
   const readable = surfaces.filter((surface) => surface.status === "readable");

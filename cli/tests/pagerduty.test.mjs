@@ -5,6 +5,7 @@ import {
   mkdtempSync,
   readFileSync,
   readdirSync,
+  rmSync,
   symlinkSync,
   writeFileSync,
 } from "node:fs";
@@ -43,6 +44,7 @@ import { assertSecretFragmentsAbsent, readBundleFiles, readZipEntries } from "./
 import { CONFIG_CANARIES, assertConfigLoaderMatrix, configLoaderCases } from "./helpers/config-loader-matrix.mjs";
 import { assertFixedTextsSurvive, collectFixedTexts, collectThrownMessage, collectToolTexts, logLines } from "./helpers/fixed-text-survival.mjs";
 import { assertFragmentsAbsent, assertPlantedValuesWellFormed } from "./helpers/planted-values.mjs";
+import { CONFIGURED_SECRET_CANARIES, assertTextFieldCarriers, carrierSuffix, injectingFetch } from "./helpers/text-field-carriers.mjs";
 import { assertScrubBoundary } from "./helpers/scrub-boundary-matrix.mjs";
 
 const NOW = new Date("2026-09-21T00:00:00.000Z");
@@ -2179,7 +2181,7 @@ test("verdict safety rule 9: redactSnapshot masks secret-named keys, name/value 
   assert.equal(redacted.nested.authorization, "[REDACTED]");
   assert.deepEqual(redacted.nested.custom_headers, [{ name: "X-Api-Key", value: "[REDACTED]" }, { name: "Accept", value: "application/json" }]);
   assert.deepEqual(redacted.inputs, [{ name: "webhook token", value: "[REDACTED]" }]);
-  assert.equal(redacted.html_url, "https://example.pagerduty.com/services/P123?access_token=[REDACTED]&page=2");
+  assert.equal(redacted.html_url, "https://example.pagerduty.com/services/P123?[REDACTED]", "a URL query string is a carrier: it goes whole, the path stays");
   assert.equal(redacted.truncated_token, "abcd", "the vendor-truncated four character suffix PD-13 counts is not a secret");
   assert.equal(redacted.enabled, true);
   assert.equal(redacted.is_secret, false, "boolean flags keep their value even under a secret-named key");
@@ -3009,6 +3011,40 @@ test("addendum 4: on every PagerDuty surface a 502 HTML body or a JSON error emb
     }
   }
   assert.equal(runs, PAGERDUTY_CANARY_SURFACES.length * 2);
+});
+
+/**
+ * Round 4 item 2 (data-side carrier class): the healthy PagerDuty fixture with reviewer B's fifteen carrier
+ * forms, the configured secrets bare in prose, and the must-survive controls appended to every text-like
+ * field of every response. Nothing planted may survive in any 6-to-24-character window of the access
+ * check, the assessments, the bundle files, or the zip entries; the controls (a hostname, a table name,
+ * a UUID, a quoted non-credential header, prose using a scheme word) and the bare token must.
+ */
+test("rule 9 data side: a credential carried in any free-text field of any PagerDuty response never reaches a snapshot, evidence, summary, bundle file, or zip entry, while identifiers in the same fields stay", async () => {
+  const configuredSecrets = [CONFIGURED_SECRET_CANARIES.pagerdutyApiToken];
+  const suffix = carrierSuffix(configuredSecrets);
+  const harvest = async (injected) => {
+    const config = sampleConfig({ apiToken: configuredSecrets[0] });
+    const fixture = pagerdutyApiFixture();
+    const client = new PagerdutyApiClient(config, { fetchImpl: injected ? injectingFetch(fixture.fetchImpl, suffix) : fixture.fetchImpl, now: () => NOW, sleep: async () => {} });
+    const access = await checkPagerdutyAccess(client);
+    const assessments = (await runAllAssessments(client)).results;
+    const base = createTempBase("grclanker-pagerduty-text-fields-");
+    try {
+      const result = await exportPagerdutyAuditBundle(client, config, base, { maxAdmins: 3, coverageDays: 30 });
+      return [
+        ["check_access", JSON.stringify(access)],
+        ["assessments", JSON.stringify(assessments)],
+        ...[...readBundleFiles(result.outputDir)].map(([name, content]) => [`bundle file ${name}`, content]),
+        ...[...readZipEntries(result.zipPath)].map(([name, content]) => [`zip entry ${name}`, content]),
+      ];
+    } finally {
+      rmSync(base, { recursive: true, force: true });
+    }
+  };
+  const healthyTexts = await harvest(false);
+  const texts = await harvest(true);
+  assertTextFieldCarriers(assert, texts, { configuredSecrets, healthyTexts });
 });
 
 test("addendum 4: a Scoped OAuth token endpoint that answers with a 502 HTML page or a JSON error embedding a credential URL never echoes the body, and the obtained bearer token is redacted from every error string", async () => {
