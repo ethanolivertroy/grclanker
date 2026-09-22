@@ -1774,7 +1774,7 @@ function allChildrenFailedDataset<T>(
   errors: string[],
   childMarkers: Record<string, OktaNotCollectedMarker>,
 ): CollectedDataset<T> {
-  const error = `every ${childLabel} lookup failed (${errors.length} of ${errors.length}): ${errors.join("; ")}`;
+  const error = `every lookup of the ${childLabel} failed (${errors.length} of ${errors.length}): ${errors.join("; ")}`;
   return {
     data: fallback,
     error,
@@ -1784,7 +1784,7 @@ function allChildrenFailedDataset<T>(
   };
 }
 
-const ALL_CHILDREN_FAILED_PATTERN = /^every (.+?) lookup failed \((\d+) of \2\): ([\s\S]*)$/;
+const ALL_CHILDREN_FAILED_PATTERN = /^every lookup of the (.+?) failed \((\d+) of \2\): ([\s\S]*)$/;
 
 /** Every list lands here: records are redacted (or projected) before they are kept, and a page-capped walk forwards truncated plus its note. */
 async function collectArrayDataset(
@@ -2195,7 +2195,7 @@ async function collectOrgContacts(
       }
     }
     if (attempted > 0 && errors.length === attempted) {
-      return allChildrenFailedDataset<JsonRecord[]>([], "org contact", errors, childMarkers);
+      return allChildrenFailedDataset<JsonRecord[]>([], "org contact assignments", errors, childMarkers);
     }
     return {
       data: resolved,
@@ -2444,7 +2444,7 @@ function userLogin(user: JsonRecord): string {
 function describeEndpointError(error: string): string {
   const allChildrenFailed = ALL_CHILDREN_FAILED_PATTERN.exec(error);
   if (allChildrenFailed) {
-    return `every ${allChildrenFailed[1]} lookup failed (${allChildrenFailed[2]} of ${allChildrenFailed[2]}): ${describeEndpointError(allChildrenFailed[3])}`;
+    return `every lookup of the ${allChildrenFailed[1]} failed (${allChildrenFailed[2]} of ${allChildrenFailed[2]}): ${describeEndpointError(allChildrenFailed[3])}`;
   }
   if (/^Not requested: /.test(error)) return "the inventory it depends on was not collected, so its request was never issued";
   if (/\(403 /.test(error)) return "the endpoint returned 403 Forbidden (missing scope or admin role)";

@@ -2047,6 +2047,38 @@ test("multi-inventory verdicts name the unreadable secondary source (OKTA-AUTH-0
   assert.equal(bothReadable.status, "Pass");
   assert.equal(bothReadable.summary, "Detected 2 ACTIVE certificate-oriented IdP or authenticator entries.");
 
+  const withoutCertificates = () => {
+    const data = createSampleAuthenticationData();
+    data.idps = dataset([{ id: "idp-2", name: "Corporate SAML", type: "SAML2", status: "ACTIVE" }]);
+    data.authenticators = dataset(data.authenticators.data.filter((auth) => auth.key !== "smart_card_idp"));
+    return data;
+  };
+  for (const orgUrl of ["https://tenant.okta.gov", "https://tenant.okta.com"]) {
+    const tenantConfig = createSampleConfig({ orgUrl });
+    const noCert = findingById(assessOktaAuthentication(withoutCertificates(), tenantConfig), "OKTA-AUTH-008");
+    assert.equal(noCert.status, orgUrl.endsWith(".gov") ? "Fail" : "Manual", `${orgUrl}: both lists readable and empty of certificates keeps the shipped verdict`);
+    assert.deepEqual(noCert.evidence, [`Org URL: ${orgUrl}`]);
+
+    const idpsUnread = withoutCertificates();
+    idpsUnread.idps = dataset([], "Okta API request failed for /api/v1/idps (403 Forbidden): Access denied");
+    const idpsUnreadFinding = findingById(assessOktaAuthentication(idpsUnread, tenantConfig), "OKTA-AUTH-008");
+    assert.equal(idpsUnreadFinding.status, "Manual", `${orgUrl}: nothing found in the authenticator list never yields Fail while the IdP list is unreadable`);
+    assert.match(
+      idpsUnreadFinding.summary,
+      /^Certificate or PIV\/CAC authentication could not be evaluated because no ACTIVE certificate-oriented entry was found in the authenticator list while the identity provider list was unreadable \(the endpoint returned 403 Forbidden \(missing scope or admin role\)\), so (this federal-domain tenant|the tenant) cannot be judged on half of the certificate inventory\.$/,
+    );
+    assert.equal(/federal-domain/.test(idpsUnreadFinding.summary), orgUrl.endsWith(".gov"));
+    assert.ok(idpsUnreadFinding.evidence.some((line) => /^Org URL: .* \| IdP data unavailable: .*\/api\/v1\/idps \(403 Forbidden\)/.test(line)));
+    assert.match(idpsUnreadFinding.manualNote ?? "", /^Collect manually: /);
+
+    const authenticatorsUnread = withoutCertificates();
+    authenticatorsUnread.authenticators = dataset([], "Okta API request failed for /api/v1/authenticators (403 Forbidden): Access denied");
+    const authenticatorsUnreadFinding = findingById(assessOktaAuthentication(authenticatorsUnread, tenantConfig), "OKTA-AUTH-008");
+    assert.equal(authenticatorsUnreadFinding.status, "Manual", `${orgUrl}: nothing found in the IdP list never yields Fail while the authenticator list is unreadable`);
+    assert.match(authenticatorsUnreadFinding.summary, /no ACTIVE certificate-oriented entry was found in the identity provider list while the authenticator list was unreadable/);
+    assert.ok(authenticatorsUnreadFinding.evidence.some((line) => /^Org URL: .* \| Authenticator data unavailable: .*\/api\/v1\/authenticators \(403 Forbidden\)/.test(line)));
+  }
+
   const orgFactorsUnreadable = createSampleAuthenticationData();
   orgFactorsUnreadable.orgFactors = dataset([], "Okta API request failed for /api/v1/org/factors (403 Forbidden): Access denied");
   const phishing = findingById(assessOktaAuthentication(orgFactorsUnreadable, config), "OKTA-AUTH-001");
@@ -2183,15 +2215,25 @@ const OKTA_DATASETS = [
   { name: "org contacts", pattern: /^\/api\/v1\/org\/contacts$/, file: "core_data/org_contacts.json", skipped: [], category: "monitoring", nullCounters: ["org_contacts_resolved"] },
 ];
 
-/** Per-parent child requests: denying one leaves the parent collected and the child recorded under its parent id as a marker, never as an empty list. */
-const OKTA_CHILD_LOOKUPS = [
-  { name: "sign-on rules for signon-1", pattern: /^\/api\/v1\/policies\/signon-1\/rules\?limit=\d+$/, file: "core_data/sign_on_policy_rules.json", key: "signon-1", shape: "map" },
-  { name: "roles for user-1", pattern: /^\/api\/v1\/users\/user-1\/roles\?limit=\d+$/, file: "core_data/user_roles.json", key: "user-1", shape: "map" },
-  { name: "factors for user-1", pattern: /^\/api\/v1\/users\/user-1\/factors$/, file: "core_data/privileged_user_factors.json", key: "user-1", shape: "map" },
-  { name: "roles for group-1", pattern: /^\/api\/v1\/groups\/group-1\/roles\?limit=\d+$/, file: "core_data/privileged_group_roles.json", key: "group-1", shape: "map" },
-  { name: "members of group-1", pattern: /^\/api\/v1\/groups\/group-1\/users\?limit=\d+$/, file: "core_data/privileged_group_members.json", key: "group-1", shape: "map" },
-  { name: "technical contact assignment", pattern: /^\/api\/v1\/org\/contacts\/TECHNICAL$/, file: "core_data/org_contacts.json", key: "TECHNICAL", shape: "list" },
+/**
+ * Per-parent child requests. The recording fixture has one parent per map
+ * (signon-1, pwd-1, access-1, user-1, group-1) and two org contact types, so
+ * denying the single child of a map denies every child of that list, while
+ * denying the TECHNICAL contact alone leaves the BILLING sibling readable.
+ */
+const OKTA_ALL_CHILDREN_DENIED = [
+  { name: "sign-on policy rules", pattern: /^\/api\/v1\/policies\/signon-1\/rules\?limit=\d+$/, file: "core_data/sign_on_policy_rules.json", keys: ["signon-1"], shape: "map", nullCounters: [["authentication", "admin_mfa_rules"], ["integrations", "contextual_rules"]] },
+  { name: "password policy rules", pattern: /^\/api\/v1\/policies\/pwd-1\/rules\?limit=\d+$/, file: "core_data/password_policy_rules.json", keys: ["pwd-1"], shape: "map", nullCounters: [] },
+  { name: "access policy rules", pattern: /^\/api\/v1\/policies\/access-1\/rules\?limit=\d+$/, file: "core_data/access_policy_rules.json", keys: ["access-1"], shape: "map", nullCounters: [["authentication", "admin_mfa_rules"], ["integrations", "contextual_rules"]] },
+  { name: "per-user role lists", pattern: /^\/api\/v1\/users\/user-1\/roles\?limit=\d+$/, file: "core_data/user_roles.json", keys: ["user-1"], shape: "map", nullCounters: [["admin", "super_admins"]], manual: { id: "OKTA-ADMIN-001", category: "admin", summary: /^Super admin concentration could not be evaluated because every lookup of the per-user role lists failed \(1 of 1\): the endpoint returned 403 Forbidden \(missing scope or admin role\)\.$/ } },
+  { name: "privileged user factor lists", pattern: /^\/api\/v1\/users\/user-1\/factors$/, file: "core_data/privileged_user_factors.json", keys: ["user-1"], shape: "map", nullCounters: [["admin", "privileged_users_factor_checked"]], manual: { id: "OKTA-ADMIN-004", category: "admin", summary: /^Privileged user MFA enrollment could not be evaluated because every lookup of the privileged user factor lists failed \(1 of 1\): the endpoint returned 403 Forbidden/ } },
+  { name: "privileged group role lists", pattern: /^\/api\/v1\/groups\/group-1\/roles\?limit=\d+$/, file: "core_data/privileged_group_roles.json", keys: ["group-1"], shape: "map", nullCounters: [] },
+  { name: "privileged group member lists", pattern: /^\/api\/v1\/groups\/group-1\/users\?limit=\d+$/, file: "core_data/privileged_group_members.json", keys: ["group-1"], shape: "map", nullCounters: [] },
+  { name: "org contact assignments", pattern: /^\/api\/v1\/org\/contacts\/[A-Z]+$/, file: "core_data/org_contacts.json", keys: ["BILLING", "TECHNICAL"], shape: "list", nullCounters: [["monitoring", "org_contacts_resolved"]], manual: { id: "OKTA-MON-008", category: "monitoring", summary: /^Security contact routing could not be evaluated because every lookup of the org contact assignments failed \(2 of 2\): the endpoint returned 403 Forbidden/ } },
+  { name: "org contact users", pattern: /^\/api\/v1\/users\/user-\d+$/, file: "core_data/org_contacts.json", keys: ["BILLING", "TECHNICAL"], shape: "list", nullCounters: [["monitoring", "org_contacts_resolved"]], manual: { id: "OKTA-MON-008", category: "monitoring", summary: /every lookup of the org contact assignments failed \(2 of 2\)/ } },
 ];
+
+const OKTA_PARTIAL_CHILD_DENIAL = { name: "technical contact assignment", pattern: /^\/api\/v1\/org\/contacts\/TECHNICAL$/, file: "core_data/org_contacts.json", key: "TECHNICAL" };
 
 const OKTA_MENTIONED_STATUS_PATTERNS = [
   /\((\d{3}) [A-Z]/g,
@@ -2361,38 +2403,91 @@ test("collection status: a denied dataset is written to core_data as a not-colle
   }
 });
 
-test("collection status: a denied child lookup keeps the parent collected and records the child as a marker under its id, never as an empty list", async () => {
-  const base = createTempBase("grclanker-okta-denied-children-");
+test("collection status: when every child lookup of a per-parent list is denied the list is not collected (count and truncated null), the file holds only the per-child markers, its counters render null, and the findings say every lookup failed", async () => {
+  const base = createTempBase("grclanker-okta-all-children-denied-");
 
-  for (const lookup of OKTA_CHILD_LOOKUPS) {
-    const run = await runRecordedOkta([lookup.pattern], join(base, lookup.key.toLowerCase()));
-    const label = `${lookup.name} denied`;
+  for (const lookup of OKTA_ALL_CHILDREN_DENIED) {
+    const run = await runRecordedOkta([lookup.pattern], join(base, lookup.name.replace(/[^a-z0-9]+/gi, "-")));
+    const label = `${lookup.name} all denied`;
+    const denied = run.requests.filter((request) => lookup.pattern.test(request.path));
+    assert.equal(new Set(denied.map((request) => request.path)).size, lookup.keys.length, `${label}: one child request per parent was issued and denied`);
+    assert.ok(denied.every((request) => request.status === 403), label);
+
     const snapshot = JSON.parse(run.files.get(lookup.file));
-    const marker = lookup.shape === "map" ? snapshot[lookup.key] : snapshot.find((entry) => entry.id === lookup.key);
-    assertOktaNotCollectedMarker(marker, `${label} ${lookup.file}[${lookup.key}]`, { status: 403, endpoint: lookup.pattern, error: /\(403 Forbidden\)/ });
     if (lookup.shape === "map") {
-      assert.equal(Object.keys(snapshot).length, 1, `${label}: the only parent's child list is the marker, not []`);
+      assert.deepEqual(Object.keys(snapshot).sort(), [...lookup.keys].sort(), `${label}: the file holds one marker per parent and nothing else`);
+      for (const key of lookup.keys) {
+        assertOktaNotCollectedMarker(snapshot[key], `${label} ${lookup.file}[${key}]`, { status: 403, endpoint: lookup.pattern, error: /\(403 Forbidden\)/ });
+      }
     } else {
-      assert.ok(snapshot.some((entry) => entry.contactType === "BILLING" && entry.userId === "user-9"), `${label}: the readable sibling is still written`);
+      assert.deepEqual(snapshot.map((entry) => entry.id).sort(), [...lookup.keys].sort(), `${label}: the file holds one marker per contact type and no resolved contact`);
+      for (const entry of snapshot) {
+        assertOktaNotCollectedMarker(entry, `${label} ${lookup.file}[${entry.id}]`, { status: 403, endpoint: lookup.pattern, error: /\(403 Forbidden\)/ });
+      }
     }
 
     const status = run.statusOf(lookup.file);
-    assert.equal(status.collected, true, `${label}: the parent walk ran`);
-    assert.equal(status.complete, false, `${label}: a denied child makes the dataset incomplete`);
-    assert.match(status.error, /403 Forbidden/, label);
-    assert.equal(status.status, null, `${label}: the dataset's own request did not fail`);
-    assert.deepEqual(run.collectionStatus.not_collected, [], label);
+    assert.equal(status.collected, false, `${label}: a list none of whose lookups succeeded was not collected`);
+    for (const flag of ["complete", "count", "truncated", "truncation_note"]) {
+      assert.equal(status[flag], null, `${label}: collection_status ${flag} is null, never 0 or false, got ${status[flag]}`);
+    }
+    assert.equal(status.status, null, `${label}: no single status is invented for the whole list`);
+    assert.equal(status.endpoint, null, `${label}: no single endpoint is invented for the whole list`);
+    assert.match(status.error, new RegExp(`^every lookup of the .+ failed \\(${lookup.keys.length} of ${lookup.keys.length}\\): `), label);
+    assert.match(status.error, /\(403 Forbidden\)/, `${label}: the error still names each failed request`);
+    assert.deepEqual(run.collectionStatus.not_collected, [lookup.file], label);
+
+    for (const [category, counter] of lookup.nullCounters) {
+      assert.equal(run.results[category].snapshotSummary[counter], null, `${label}: ${category} snapshot ${counter} renders null, not 0`);
+      assert.ok(run.results[category].snapshotSummary.datasets_not_collected >= 1, `${label}: ${category} counts the list as not collected`);
+    }
+    if (lookup.manual) {
+      const finding = findingById(run.results[lookup.manual.category], lookup.manual.id);
+      assert.equal(finding.status, "Manual", `${label}: ${lookup.manual.id} is Manual, never a verdict on a zero count: ${finding.summary}`);
+      assert.match(finding.summary, lookup.manual.summary, label);
+      assert.doesNotMatch(finding.summary, /\b0 of \d+\b|some .* lookups failed/, `${label}: no bare zero and no "some lookups failed" wording`);
+    }
+
     const mentions = assertOktaOutputsNameOnlyObservedRequests(oktaOutputs(run.access, run.results, run.exported), run.requests, label);
     assert.ok(mentions.statuses > 0 && mentions.endpoints > 0, `${label}: the outputs name the failed status and endpoint`);
   }
 
-  const groupRoles = await runRecordedOkta([OKTA_CHILD_LOOKUPS[3].pattern], join(base, "group-roles-evidence"));
+  const groupRoles = await runRecordedOkta([OKTA_ALL_CHILDREN_DENIED[5].pattern], join(base, "group-roles-evidence"));
   const hygiene = findingById(groupRoles.results.admin, "OKTA-ADMIN-003");
   assert.equal(hygiene.status, "Partial");
   assert.ok(hygiene.evidence.some((line) => /^Admin Team: roles=unread, members=1$/.test(line)), `a denied child reads as unread, not 0: ${hygiene.evidence.join(" | ")}`);
-  assert.deepEqual(Object.keys((await collectOktaAdminAccessData(new OktaAuditorClient(RECORDING_CONFIG, { fetchImpl: recordingOktaFetch({ denied: [OKTA_CHILD_LOOKUPS[3].pattern] }).fetchImpl }))).privilegedGroupRoles.data), [], "the in-memory map omits the denied child instead of holding []");
+  const adminData = await collectOktaAdminAccessData(new OktaAuditorClient(RECORDING_CONFIG, { fetchImpl: recordingOktaFetch({ denied: [OKTA_ALL_CHILDREN_DENIED[5].pattern] }).fetchImpl }));
+  assert.deepEqual(Object.keys(adminData.privilegedGroupRoles.data), [], "the in-memory map omits the denied child instead of holding []");
+  assert.equal(adminData.privilegedGroupRoles.truncated, null, "no walk ran, so truncated is null rather than false");
+  assert.equal(adminData.privilegedGroupRoles.notCollected?.collected, false);
 
-  const contact = findingById((await runRecordedOkta([OKTA_CHILD_LOOKUPS[5].pattern], join(base, "contact-evidence"))).results.monitoring, "OKTA-MON-008");
+  const superAdmins = findingById((await runRecordedOkta([OKTA_ALL_CHILDREN_DENIED[3].pattern], join(base, "super-admin-evidence"))).results.admin, "OKTA-ADMIN-002");
+  assert.equal(superAdmins.status, "Partial");
+  assert.match(superAdmins.summary, /\(every role lookup failed\)\.$/);
+});
+
+test("collection status: denying one child of several keeps the parent collected and records that child as a marker under its id, never as an empty list", async () => {
+  const base = createTempBase("grclanker-okta-denied-child-");
+  const lookup = OKTA_PARTIAL_CHILD_DENIAL;
+  const run = await runRecordedOkta([lookup.pattern], join(base, lookup.key.toLowerCase()));
+  const label = `${lookup.name} denied`;
+  const snapshot = JSON.parse(run.files.get(lookup.file));
+  assertOktaNotCollectedMarker(snapshot.find((entry) => entry.id === lookup.key), `${label} ${lookup.file}[${lookup.key}]`, { status: 403, endpoint: lookup.pattern, error: /\(403 Forbidden\)/ });
+  assert.ok(snapshot.some((entry) => entry.contactType === "BILLING" && entry.userId === "user-9"), `${label}: the readable sibling is still written`);
+
+  const status = run.statusOf(lookup.file);
+  assert.equal(status.collected, true, `${label}: the parent walk ran and one lookup succeeded`);
+  assert.equal(status.complete, false, `${label}: a denied child makes the dataset incomplete`);
+  assert.equal(status.count, 1, `${label}: the count is the contacts actually resolved`);
+  assert.equal(status.truncated, false, label);
+  assert.match(status.error, /^TECHNICAL: .*403 Forbidden/, label);
+  assert.doesNotMatch(status.error, /^every lookup/, `${label}: one failure of two is not every lookup`);
+  assert.equal(status.status, null, `${label}: the dataset's own request did not fail`);
+  assert.deepEqual(run.collectionStatus.not_collected, [], label);
+  assert.equal(run.results.monitoring.snapshotSummary.org_contacts_resolved, 1);
+  const contact = findingById(run.results.monitoring, "OKTA-MON-008");
   assert.equal(contact.status, "Partial");
   assert.match(contact.summary, /technical contact lookup failed/);
+  const mentions = assertOktaOutputsNameOnlyObservedRequests(oktaOutputs(run.access, run.results, run.exported), run.requests, label);
+  assert.ok(mentions.statuses > 0 && mentions.endpoints > 0, `${label}: the outputs name the failed status and endpoint`);
 });
