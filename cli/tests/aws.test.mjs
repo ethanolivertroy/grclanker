@@ -1117,6 +1117,48 @@ test("assessAwsDataProtection fixture (d): compliant account passes every data p
   assert.equal(findingById(result, "AWS-DATA-22").evidence.eligible_keys, 2);
 });
 
+test("AWS-DATA-12 (round 4 item B): the RDS clause counts only the instances that reported StorageEncrypted, so an instance without the flag is named beside the count instead of inside an 'all N' claim", async () => {
+  const result = await assessAwsDataProtection(
+    compliantDataProtectionClient({
+      async describeDbInstances(region) {
+        return {
+          items:
+            region === "us-east-1"
+              ? [{ DBInstanceIdentifier: "orders-db", Engine: "postgres", StorageEncrypted: true }]
+              : [{ DBInstanceIdentifier: "noflag-db", Engine: "mysql" }],
+          truncated: false,
+        };
+      },
+    }),
+  );
+  const encryption = findingById(result, "AWS-DATA-12");
+  assert.equal(encryption.status, "warn", encryption.summary);
+  assert.match(encryption.summary, /1 of 2 RDS instances in the 2 readable region\(s\) report StorageEncrypted=true; 1 did not report the flag/, encryption.summary);
+  assert.doesNotMatch(encryption.summary, /all 2 RDS instances/, "the clause never claims every instance reported the flag");
+  assert.match(encryption.summary, /Downgraded to warn: .*1 RDS instance\(s\) without a StorageEncrypted flag/, encryption.summary);
+  assert.deepEqual(encryption.evidence.rds_without_flag, ["noflag-db"]);
+  assert.deepEqual(encryption.evidence.rds_unencrypted, []);
+  assert.equal(encryption.evidence.rds_instances, 2);
+
+  // Every instance reported the flag: the "all N" wording is kept for that case alone.
+  const complete = findingById(await assessAwsDataProtection(compliantDataProtectionClient()), "AWS-DATA-12");
+  assert.match(complete.summary, /all 1 RDS instances in the 2 readable region\(s\) report StorageEncrypted=true/, complete.summary);
+  assert.doesNotMatch(complete.summary, /did not report the flag/);
+
+  // No instance reported the flag: none is counted as encrypted.
+  const noneReported = findingById(
+    await assessAwsDataProtection(
+      compliantDataProtectionClient({
+        async describeDbInstances(region) {
+          return { items: region === "us-east-1" ? [{ DBInstanceIdentifier: "noflag-db", Engine: "mysql" }] : [], truncated: false };
+        },
+      }),
+    ),
+    "AWS-DATA-12",
+  );
+  assert.match(noneReported.summary, /0 of 1 RDS instances in the 2 readable region\(s\) report StorageEncrypted=true; 1 did not report the flag/, noneReported.summary);
+});
+
 test("assessAwsDataProtection fails on public buckets, disabled encryption defaults, missing TLS policies, and unrotated keys", async () => {
   const client = compliantDataProtectionClient({
     async getAccountPublicAccessBlock() {

@@ -3600,15 +3600,19 @@ export async function assessAwsDataProtection(
     return bucket.encryption.value === null || rules.length === 0 || rules.every((rule) => !asString(asObject(rule)?.SSEAlgorithm));
   });
   const bucketEncryptionUnreadable = bucketDetails.filter((bucket) => bucket.encryption.error);
-  // The RDS clause is worded from what was read: an inventory that could not be listed anywhere is not "all 0 instances".
+  // The RDS clause is worded from what was read: an inventory that could not be listed anywhere is not "all 0 instances",
+  // and an instance that did not report StorageEncrypted is never counted among those that reported it true (round 4 item B).
   const rdsReadableRegions = regionResults.length - rdsErrors.length;
+  const rdsEncrypted = rdsInstances.length - rdsUnencrypted.length - rdsUnknown.length;
   const rdsClause = rdsAllFailed
     ? `RDS instances could not be listed in any of ${regionResults.length} region(s) (${rdsErrors[0]?.rds.error ?? "rds:DescribeDBInstances failed"})`
     : rdsUnencrypted.length > 0
       ? `${rdsUnencrypted.length}/${rdsInstances.length} RDS instances have StorageEncrypted=false`
       : rdsInstances.length === 0
         ? `no RDS instances exist in the ${rdsReadableRegions} readable region(s)`
-        : `all ${rdsInstances.length} RDS instances in the ${rdsReadableRegions} readable region(s) report StorageEncrypted=true`;
+        : rdsUnknown.length === 0
+          ? `all ${rdsInstances.length} RDS instances in the ${rdsReadableRegions} readable region(s) report StorageEncrypted=true`
+          : `${rdsEncrypted} of ${rdsInstances.length} RDS instances in the ${rdsReadableRegions} readable region(s) report StorageEncrypted=true; ${rdsUnknown.length} did not report the flag`;
 
   let encryptionStatus: AwsFinding["status"];
   let encryptionSummary: string;
