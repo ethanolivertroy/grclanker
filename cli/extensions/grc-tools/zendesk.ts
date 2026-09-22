@@ -287,14 +287,49 @@ function normalizeBaseUrl(rawUrl: string): string {
   return parsed.toString().replace(/\/+$/, "");
 }
 
-function readConfigFile(pathname: string): JsonRecord | undefined {
-  if (!existsSync(pathname)) return undefined;
-  const raw = readFileSync(pathname, "utf8");
+const ERRNO_CODE_PATTERN = /^E[A-Z0-9_]{1,30}$/;
+const JSON_POSITION_PATTERN = /at position (\d+)/;
+
+/**
+ * Two-step config loader guard with fixed text per step. Neither the filesystem
+ * message (which echoes the path and the operation) nor the JSON.parse message
+ * (which quotes a window of the source around the failure, or the whole source
+ * of a short file) is ever interpolated: the read step carries the path and a
+ * validated errno code, the parse step carries the path and a line number taken
+ * only through a strict position regex.
+ */
+function readConfigText(pathname: string): string {
+  try {
+    return readFileSync(pathname, "utf8");
+  } catch (error) {
+    const code = asString(asObject(error)?.code);
+    const suffix = code !== undefined && ERRNO_CODE_PATTERN.test(code) ? ` (${code})` : "";
+    throw new Error(`Unable to read Zendesk config file ${pathname}${suffix}`);
+  }
+}
+
+function parseConfigJson(pathname: string, raw: string): unknown {
+  try {
+    return JSON.parse(raw) as unknown;
+  } catch (error) {
+    const position = error instanceof Error ? JSON_POSITION_PATTERN.exec(error.message) : null;
+    const line = position ? raw.slice(0, Number(position[1])).split("\n").length : undefined;
+    throw new Error(`Unable to parse Zendesk config file: invalid JSON in ${pathname}${line === undefined ? "" : ` at line ${line}`} (INVALID_JSON)`);
+  }
+}
+
+/**
+ * An explicitly named file (config_file argument or ZENDESK_CONFIG_FILE) must be
+ * readable, so a missing one surfaces as ENOENT; the default ~/.zendesk/config.json
+ * is optional and is skipped silently when absent.
+ */
+function readConfigFile(pathname: string, explicit: boolean): JsonRecord | undefined {
+  if (!explicit && !existsSync(pathname)) return undefined;
+  const raw = readConfigText(pathname);
   if (raw.trim().length === 0) return undefined;
-  const parsed = JSON.parse(raw) as unknown;
-  const object = asObject(parsed);
+  const object = asObject(parseConfigJson(pathname, raw));
   if (!object) {
-    throw new Error(`Zendesk config file ${pathname} must contain a JSON object.`);
+    throw new Error(`Unable to parse Zendesk config file: ${pathname} must contain a JSON object (INVALID_CONFIG_SHAPE)`);
   }
   return object;
 }
@@ -305,10 +340,9 @@ export function resolveZendeskConfiguration(
   homeDir: string = homedir(),
 ): ZendeskResolvedConfig {
   const sourceChain: string[] = [];
-  const configPath = asString(input.config_file)
-    ?? asString(env.ZENDESK_CONFIG_FILE)
-    ?? join(homeDir, ".zendesk", "config.json");
-  const fileConfig = readConfigFile(configPath) ?? {};
+  const explicitConfigPath = asString(input.config_file) ?? asString(env.ZENDESK_CONFIG_FILE);
+  const configPath = explicitConfigPath ?? join(homeDir, ".zendesk", "config.json");
+  const fileConfig = readConfigFile(configPath, explicitConfigPath !== undefined) ?? {};
   if (Object.keys(fileConfig).length > 0) sourceChain.push(`config:${configPath}`);
 
   const pick = (argKey: string, envKeys: string[], fileKeys: string[]): { value?: string; source?: string } => {

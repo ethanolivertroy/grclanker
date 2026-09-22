@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { existsSync, mkdtempSync, readFileSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
 import { createServer } from "node:http";
@@ -394,6 +394,145 @@ test("resolvePaloaltoConfiguration allows a single product and rejects incomplet
   assert.throws(() => resolvePaloaltoConfiguration({}, { PRISMA_ACCESS_KEY_ID: "k" }), /both PRISMA_ACCESS_KEY_ID and PRISMA_SECRET_KEY/);
   assert.throws(() => resolvePaloaltoConfiguration({}, { PANOS_HOST: "fw.example.com" }), /PANOS_API_KEY or both/);
   assert.throws(() => resolvePaloaltoConfiguration({ config_file: "/nonexistent/paloalto.json" }, {}), /Unable to read Palo Alto config file \/nonexistent\/paloalto\.json \(ENOENT\)/);
+});
+
+// Config loader canaries: no two share an 8-character window, so any fragment a parser
+// quotes from the file is attributable to one fixture. The short canary keeps the JSON
+// short file at 20 characters, within the size at which JSON.parse quotes the whole source.
+const LOADER_CANARIES = {
+  yamlNestedKey: "cnrA1qz8Xw4LpT9vK2mD",
+  yamlNestedBearer: "cnrB5hj3Yn7GsW2rQ8kF",
+  yamlAlias: "cnrC9tb6Um1JdX3eN7wP",
+  jsonUnquoted: "cnrD2vf7Zk5HcR8sL4yG",
+  jsonShort: "cnrE6pm4Qa",
+  jsonMultiline: "cnrF3gk8Wd2ZnT6iM9oJ",
+};
+const LIBRARY_ERROR_WORDING = ["Nested mappings", "is not valid JSON", "Unresolved alias", "illegal operation", "permission denied", "Unexpected token", "Expected ',' or '}'"];
+
+function assertNoLoaderLeak(text, canaries, label) {
+  for (const canary of canaries) {
+    assert.ok(!text.includes(canary), `${label}: canary ${canary} leaked into: ${text}`);
+    for (let index = 0; index + 8 <= canary.length; index += 1) {
+      const fragment = canary.slice(index, index + 8);
+      assert.ok(!text.includes(fragment), `${label}: canary fragment ${fragment} leaked into: ${text}`);
+    }
+  }
+  for (const wording of LIBRARY_ERROR_WORDING) {
+    assert.ok(!text.includes(wording), `${label}: library wording "${wording}" leaked into: ${text}`);
+  }
+}
+
+test("config loader errors carry fixed text, the path, a validated code, and a structured line, never the file contents or library wording", async () => {
+  const base = createTempBase("grclanker-paloalto-loader-errors-");
+  const write = (name, text) => {
+    const pathname = join(base, name);
+    writeFileSync(pathname, text);
+    return pathname;
+  };
+  const tools = new Map();
+  registerPaloaltoTools({ registerTool: (tool) => tools.set(tool.name, tool) });
+  const check = tools.get("paloalto_check_access");
+  const checkAccessText = async (configFile) => JSON.stringify(await check.execute("call-loader", check.prepareArguments({ config_file: configFile })));
+
+  const cases = [
+    {
+      // Not JSON at all: the parser quotes the first characters of the file.
+      label: "YAML nested mapping",
+      file: write("nested.yaml", `key: ${LOADER_CANARIES.yamlNestedKey}: Bearer ${LOADER_CANARIES.yamlNestedBearer}\n`),
+      canaries: [LOADER_CANARIES.yamlNestedKey, LOADER_CANARIES.yamlNestedBearer],
+      libraryThrows: true,
+      expected: (pathname) => `Unable to parse Palo Alto config file: invalid JSON in ${pathname} (INVALID_JSON)`,
+    },
+    {
+      label: "YAML alias",
+      file: write("alias.yaml", `key: *${LOADER_CANARIES.yamlAlias}\n`),
+      canaries: [LOADER_CANARIES.yamlAlias],
+      libraryThrows: true,
+      expected: (pathname) => `Unable to parse Palo Alto config file: invalid JSON in ${pathname} (INVALID_JSON)`,
+    },
+    {
+      // The "Unexpected token" family quotes a 10-character window around the failure.
+      label: "JSON unquoted value",
+      file: write("unquoted.json", `{"PRISMA_SECRET_KEY": ${LOADER_CANARIES.jsonUnquoted}}\n`),
+      canaries: [LOADER_CANARIES.jsonUnquoted],
+      libraryThrows: true,
+      libraryCarriesFragment: true,
+      expected: (pathname) => `Unable to parse Palo Alto config file: invalid JSON in ${pathname} (INVALID_JSON)`,
+    },
+    {
+      // At 20 characters or fewer the whole source is quoted, key on a scrub list or not.
+      label: "JSON short file",
+      file: write("short.json", `{"token":${LOADER_CANARIES.jsonShort}}`),
+      canaries: [LOADER_CANARIES.jsonShort],
+      libraryThrows: true,
+      libraryCarriesCanary: true,
+      expected: (pathname) => `Unable to parse Palo Alto config file: invalid JSON in ${pathname} (INVALID_JSON)`,
+    },
+    {
+      // The structural family reports a position; only that position becomes a line.
+      label: "JSON missing comma",
+      file: write("multiline.json", `{\n  "PANOS_HOST": "fw1.example.com",\n  "PANOS_API_KEY": "${LOADER_CANARIES.jsonMultiline}"\n  "PANOS_VERIFY_TLS": "true"\n}\n`),
+      canaries: [LOADER_CANARIES.jsonMultiline],
+      libraryThrows: true,
+      expected: (pathname) => `Unable to parse Palo Alto config file: invalid JSON in ${pathname} at line 4 (INVALID_JSON)`,
+    },
+    {
+      label: "EISDIR",
+      file: (() => {
+        const pathname = join(base, "config-dir.json");
+        mkdirSync(pathname);
+        return pathname;
+      })(),
+      canaries: [],
+      libraryThrows: false,
+      expected: (pathname) => `Unable to read Palo Alto config file ${pathname} (EISDIR)`,
+    },
+    {
+      label: "ENOENT",
+      file: join(base, "missing.json"),
+      canaries: [],
+      libraryThrows: false,
+      expected: (pathname) => `Unable to read Palo Alto config file ${pathname} (ENOENT)`,
+    },
+    ...(process.getuid?.() === 0 ? [] : [{
+      label: "EACCES",
+      file: (() => {
+        const pathname = write("unreadable.json", JSON.stringify({ PANOS_HOST: "fw1.example.com", PANOS_API_KEY: LOADER_CANARIES.jsonMultiline }));
+        chmodSync(pathname, 0o000);
+        return pathname;
+      })(),
+      canaries: [LOADER_CANARIES.jsonMultiline],
+      libraryThrows: false,
+      expected: (pathname) => `Unable to read Palo Alto config file ${pathname} (EACCES)`,
+    }]),
+  ];
+  assert.ok(readFileSync(cases[3].file, "utf8").length <= 20, "the short JSON fixture stays within the size JSON.parse quotes whole");
+
+  for (const entry of cases) {
+    if (entry.libraryThrows) {
+      // Positive control: JSON.parse's own message quotes the file contents.
+      assert.throws(() => JSON.parse(readFileSync(entry.file, "utf8")), (error) => {
+        if (entry.libraryCarriesCanary) assert.ok(error.message.includes(entry.canaries[0]), `${entry.label}: positive control expected the whole canary: ${error.message}`);
+        if (entry.libraryCarriesFragment) assert.ok(error.message.includes(entry.canaries[0].slice(0, 8)), `${entry.label}: positive control expected a canary fragment: ${error.message}`);
+        return true;
+      });
+    }
+    assert.throws(() => resolvePaloaltoConfiguration({ config_file: entry.file }, {}), (error) => {
+      assert.equal(error.message, entry.expected(entry.file), `${entry.label}: resolver message`);
+      assertNoLoaderLeak(error.message, entry.canaries, `${entry.label} resolver`);
+      return true;
+    });
+    assert.throws(() => resolvePaloaltoConfiguration({}, { PALOALTO_CONFIG_FILE: entry.file }), (error) => {
+      assert.equal(error.message, entry.expected(entry.file), `${entry.label}: PALOALTO_CONFIG_FILE is an explicit path too`);
+      return true;
+    });
+    const toolText = await checkAccessText(entry.file);
+    assertNoLoaderLeak(toolText, entry.canaries, `${entry.label} check_access`);
+    assert.ok(toolText.includes(entry.expected(entry.file)), `${entry.label}: check_access carries the fixed loader text: ${toolText}`);
+  }
+
+  const shape = write("list.json", "[1, 2]");
+  assert.throws(() => resolvePaloaltoConfiguration({ config_file: shape }, {}), new RegExp(`Unable to parse Palo Alto config file: .* must contain a JSON object \\(INVALID_CONFIG_SHAPE\\)`));
 });
 
 test("PrismaCloudClient logs in with the access key, paginates alerts, retries 429, and re-authenticates on 401", async () => {

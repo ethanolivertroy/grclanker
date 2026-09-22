@@ -1,8 +1,9 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { existsSync, mkdtempSync, readdirSync, readFileSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { parse as parseYaml } from "yaml";
 
 import {
   assessTenableAccessControl,
@@ -28,13 +29,18 @@ const RECENT_SECONDS = Math.floor((NOW - 2 * 86_400_000) / 1000);
 const RECENT_ISO = new Date(NOW - 2 * 86_400_000).toISOString();
 const RECENT_PLUGIN_SET = "202609211000";
 const EMPTY_ENV = { HOME: "/nonexistent-home-for-tests" };
+// An explicitly named config file must exist (a missing one is an ENOENT error), so
+// fixtures that want "no file settings" point at a real empty YAML file instead of
+// the developer's ~/.tenable/config.yaml.
+const EMPTY_CONFIG_FILE = join(mkdtempSync(join(tmpdir(), "tenable-empty-config-")), "tenable.yaml");
+writeFileSync(EMPTY_CONFIG_FILE, "");
 
 function jsonResponse(body, status = 200, headers = {}) {
   return new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json", ...headers } });
 }
 
 function vmConfig(extra = {}) {
-  return resolveTenableConfiguration({ access_key: "access-key-123456", secret_key: "secret-key-654321", config_file: "/nonexistent/tenable.yaml", ...extra }, EMPTY_ENV);
+  return resolveTenableConfiguration({ access_key: "access-key-123456", secret_key: "secret-key-654321", config_file: EMPTY_CONFIG_FILE, ...extra }, EMPTY_ENV);
 }
 
 function healthyUsers() {
@@ -233,19 +239,152 @@ test("resolveTenableConfiguration prefers arguments over environment over config
 });
 
 test("resolveTenableConfiguration treats non-cloud URLs as Tenable Security Center and requires keys", () => {
-  const sc = resolveTenableConfiguration({ url: "https://sc.example.internal", access_key: "sc-access-key", secret_key: "sc-secret-key", config_file: "/nonexistent" }, EMPTY_ENV);
+  const sc = resolveTenableConfiguration({ url: "https://sc.example.internal", access_key: "sc-access-key", secret_key: "sc-secret-key", config_file: EMPTY_CONFIG_FILE }, EMPTY_ENV);
   assert.equal(sc.platform, "sc");
   assert.equal(sc.vm, undefined);
   assert.equal(sc.securityCenter.baseUrl, "https://sc.example.internal");
   assert.equal(sc.securityCenter.accessKey, "sc-access-key");
 
-  const both = resolveTenableConfiguration({ config_file: "/nonexistent" }, { ...EMPTY_ENV, TENABLE_ACCESS_KEY: "a-key-123456", TENABLE_SECRET_KEY: "s-key-123456", TENABLE_SC_URL: "https://sc.example.internal", TENABLE_SC_ACCESS_KEY: "sc-a", TENABLE_SC_SECRET_KEY: "sc-s" });
+  const both = resolveTenableConfiguration({ config_file: EMPTY_CONFIG_FILE }, { ...EMPTY_ENV, TENABLE_ACCESS_KEY: "a-key-123456", TENABLE_SECRET_KEY: "s-key-123456", TENABLE_SC_URL: "https://sc.example.internal", TENABLE_SC_ACCESS_KEY: "sc-a", TENABLE_SC_SECRET_KEY: "sc-s" });
   assert.equal(both.platform, "vm");
   assert.equal(both.vm.baseUrl, "https://cloud.tenable.com");
   assert.equal(both.securityCenter.baseUrl, "https://sc.example.internal");
 
-  assert.throws(() => resolveTenableConfiguration({ config_file: "/nonexistent" }, EMPTY_ENV), /TENABLE_ACCESS_KEY and TENABLE_SECRET_KEY/);
-  assert.throws(() => resolveTenableConfiguration({ url: "https://sc.example.internal", config_file: "/nonexistent" }, EMPTY_ENV), /needs API keys/);
+  assert.throws(() => resolveTenableConfiguration({ config_file: EMPTY_CONFIG_FILE }, EMPTY_ENV), /TENABLE_ACCESS_KEY and TENABLE_SECRET_KEY/);
+  assert.throws(() => resolveTenableConfiguration({ url: "https://sc.example.internal", config_file: EMPTY_CONFIG_FILE }, EMPTY_ENV), /needs API keys/);
+});
+
+// Config loader canaries: no two share an 8-character window, so any fragment a parser
+// quotes from the file is attributable to one fixture. The short canary keeps the JSON
+// short file at 20 characters, within the size at which JSON.parse quotes the whole source.
+const LOADER_CANARIES = {
+  yamlNestedKey: "cnrA1qz8Xw4LpT9vK2mD",
+  yamlNestedBearer: "cnrB5hj3Yn7GsW2rQ8kF",
+  yamlAlias: "cnrC9tb6Um1JdX3eN7wP",
+  jsonUnquoted: "cnrD2vf7Zk5HcR8sL4yG",
+  jsonShort: "cnrE6pm4Qa",
+  jsonMultiline: "cnrF3gk8Wd2ZnT6iM9oJ",
+};
+const LIBRARY_ERROR_WORDING = ["Nested mappings", "is not valid JSON", "Unresolved alias", "illegal operation", "permission denied", "Unexpected token", "Expected ',' or '}'"];
+
+function assertNoLoaderLeak(text, canaries, label) {
+  for (const canary of canaries) {
+    assert.ok(!text.includes(canary), `${label}: canary ${canary} leaked into: ${text}`);
+    for (let index = 0; index + 8 <= canary.length; index += 1) {
+      const fragment = canary.slice(index, index + 8);
+      assert.ok(!text.includes(fragment), `${label}: canary fragment ${fragment} leaked into: ${text}`);
+    }
+  }
+  for (const wording of LIBRARY_ERROR_WORDING) {
+    assert.ok(!text.includes(wording), `${label}: library wording "${wording}" leaked into: ${text}`);
+  }
+}
+
+test("config loader errors carry fixed text, the path, a validated code, and a structured line, never the file contents or library wording", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "tenable-loader-errors-"));
+  const write = (name, text) => {
+    const pathname = join(dir, name);
+    writeFileSync(pathname, text);
+    return pathname;
+  };
+  const registered = [];
+  registerTenableTools({ registerTool: (tool) => registered.push(tool) });
+  const check = registered.find((tool) => tool.name === "tenable_check_access");
+  const checkAccessText = async (configFile) => JSON.stringify(await check.execute("call-loader", check.prepareArguments({ config_file: configFile, url: "https://cloud.tenable.com" })));
+
+  const cases = [
+    {
+      label: "YAML nested mapping",
+      file: write("nested.yaml", `key: ${LOADER_CANARIES.yamlNestedKey}: Bearer ${LOADER_CANARIES.yamlNestedBearer}\n`),
+      canaries: [LOADER_CANARIES.yamlNestedKey, LOADER_CANARIES.yamlNestedBearer],
+      libraryThrows: true,
+      libraryCarriesCanary: true,
+      expected: (pathname) => `Unable to parse Tenable config file: invalid YAML in ${pathname} at line 1 (INVALID_YAML)`,
+    },
+    {
+      label: "YAML alias",
+      file: write("alias.yaml", `key: *${LOADER_CANARIES.yamlAlias}\n`),
+      canaries: [LOADER_CANARIES.yamlAlias],
+      libraryThrows: true,
+      libraryCarriesCanary: true,
+      // A ReferenceError, not a YAMLError: no linePos, so no line is claimed.
+      expected: (pathname) => `Unable to parse Tenable config file: invalid YAML in ${pathname} (INVALID_YAML)`,
+    },
+    {
+      label: "JSON unquoted value",
+      file: write("unquoted.json", `{"token": ${LOADER_CANARIES.jsonUnquoted}}\n`),
+      canaries: [LOADER_CANARIES.jsonUnquoted],
+      // A JSON flow mapping with a bare scalar is valid YAML, so the loader reads it as a
+      // setting and the resolver fails later on the missing keys without echoing anything.
+      libraryThrows: false,
+      expected: () => "TENABLE_ACCESS_KEY and TENABLE_SECRET_KEY (or access_key and secret_key arguments) are required for Tenable Vulnerability Management.",
+    },
+    {
+      label: "JSON short file",
+      file: write("short.json", `{"token":${LOADER_CANARIES.jsonShort}}`),
+      canaries: [LOADER_CANARIES.jsonShort],
+      libraryThrows: false,
+      expected: () => "TENABLE_ACCESS_KEY and TENABLE_SECRET_KEY (or access_key and secret_key arguments) are required for Tenable Vulnerability Management.",
+    },
+    {
+      label: "EISDIR",
+      file: (() => {
+        const pathname = join(dir, "config-dir.yaml");
+        mkdirSync(pathname);
+        return pathname;
+      })(),
+      canaries: [],
+      libraryThrows: false,
+      expected: (pathname) => `Unable to read Tenable config file ${pathname} (EISDIR)`,
+    },
+    {
+      label: "ENOENT",
+      file: join(dir, "missing.yaml"),
+      canaries: [],
+      libraryThrows: false,
+      expected: (pathname) => `Unable to read Tenable config file ${pathname} (ENOENT)`,
+    },
+    ...(process.getuid?.() === 0 ? [] : [{
+      label: "EACCES",
+      file: (() => {
+        const pathname = write("unreadable.yaml", `access_key: ${LOADER_CANARIES.jsonMultiline}\n`);
+        chmodSync(pathname, 0o000);
+        return pathname;
+      })(),
+      canaries: [LOADER_CANARIES.jsonMultiline],
+      libraryThrows: false,
+      expected: (pathname) => `Unable to read Tenable config file ${pathname} (EACCES)`,
+    }]),
+  ];
+  assert.ok(readFileSync(cases[3].file, "utf8").length <= 20, "the short JSON fixture stays within the size JSON.parse quotes whole");
+
+  for (const entry of cases) {
+    if (entry.libraryThrows) {
+      // Positive control: the parser's own message quotes the file contents.
+      assert.throws(() => parseYaml(readFileSync(entry.file, "utf8")), (error) => {
+        assert.ok(entry.canaries.some((canary) => error.message.includes(canary)), `${entry.label}: positive control expected the library message to carry a canary: ${error.message}`);
+        return true;
+      });
+    }
+    assert.throws(() => resolveTenableConfiguration({ config_file: entry.file, url: "https://cloud.tenable.com" }, EMPTY_ENV), (error) => {
+      assert.equal(error.message, entry.expected(entry.file), `${entry.label}: resolver message`);
+      assertNoLoaderLeak(error.message, entry.canaries, `${entry.label} resolver`);
+      return true;
+    });
+    const toolText = await checkAccessText(entry.file);
+    assertNoLoaderLeak(toolText, entry.canaries, `${entry.label} check_access`);
+    assert.ok(toolText.includes(entry.expected(entry.file)), `${entry.label}: check_access carries the fixed loader text: ${toolText}`);
+  }
+
+  // A key on a scrub list does not rescue a message that quotes the source: the fixed
+  // text never depends on which key the file used.
+  const bearerLine = write("bearer.yaml", `secret_key: ${LOADER_CANARIES.yamlNestedKey}: Bearer ${LOADER_CANARIES.yamlNestedBearer}\n`);
+  assert.throws(() => resolveTenableConfiguration({ config_file: bearerLine }, EMPTY_ENV), (error) => {
+    assert.equal(error.message, `Unable to parse Tenable config file: invalid YAML in ${bearerLine} at line 1 (INVALID_YAML)`);
+    return true;
+  });
+  const shape = write("list.yaml", "- just\n- a list\n");
+  assert.throws(() => resolveTenableConfiguration({ config_file: shape }, EMPTY_ENV), new RegExp(`Unable to parse Tenable config file: .* must contain a YAML mapping of settings \\(INVALID_CONFIG_SHAPE\\)`));
 });
 
 test("TenableApiClient sends the X-ApiKeys header, walks pagination, and redacts keys from errors", async () => {
@@ -735,7 +874,7 @@ test("Security Center controls become manual naming the missing URL when not con
   }
 
   const log = [];
-  const config = resolveTenableConfiguration({ url: "https://sc.example.internal", access_key: "sc-access-key", secret_key: "sc-secret-key", config_file: "/nonexistent" }, EMPTY_ENV);
+  const config = resolveTenableConfiguration({ url: "https://sc.example.internal", access_key: "sc-access-key", secret_key: "sc-secret-key", config_file: EMPTY_CONFIG_FILE }, EMPTY_ENV);
   const clients = createTenableClients(config, {
     fetchImpl: async (url, init) => {
       log.push({ url: String(url), headers: init.headers });
@@ -926,7 +1065,7 @@ test("export polling, vendor reason strings, Security Center error_msg, and time
   assert.equal(sensor.findings.find((item) => item.id === "TENABLE-03").status, "manual");
   assert.equal(sensor.summary.exported_assets, null);
 
-  const scConfig = resolveTenableConfiguration({ url: "https://sc.example.internal", access_key: "sc-access-key", secret_key: "sc-secret-key", config_file: "/nonexistent" }, EMPTY_ENV);
+  const scConfig = resolveTenableConfiguration({ url: "https://sc.example.internal", access_key: "sc-access-key", secret_key: "sc-secret-key", config_file: EMPTY_CONFIG_FILE }, EMPTY_ENV);
   const sc = createTenableClients(scConfig, {
     fetchImpl: async () => jsonResponse({ error_code: 143, error_msg: `Cookie TNS_SESSIONID=${CANARY_SESSION} is not authorized for ${CANARY_URL}; Authorization: Bearer ${CANARY_BEARER}` }),
     sleepImpl: async () => {},
@@ -1228,9 +1367,9 @@ test("registerTenableTools registers the read-only tool set with TypeBox schemas
   globalThis.fetch = routerFetch(healthyRoutes());
   try {
     const check = registered.find((tool) => tool.name === "tenable_check_access");
-    const result = await check.execute("call-1", check.prepareArguments({ access_key: "access-key-123456", secret_key: "secret-key-654321", config_file: "/nonexistent" }));
+    const result = await check.execute("call-1", check.prepareArguments({ access_key: "access-key-123456", secret_key: "secret-key-654321", config_file: EMPTY_CONFIG_FILE }));
     assert.ok(result.content[0].text.includes("healthy"), result.content[0].text);
-    const failure = await check.execute("call-2", check.prepareArguments({ config_file: "/nonexistent-tenable-config", url: "https://cloud.tenable.com" }));
+    const failure = await check.execute("call-2", check.prepareArguments({ config_file: EMPTY_CONFIG_FILE, url: "https://cloud.tenable.com" }));
     assert.ok(JSON.stringify(failure).includes("TENABLE_ACCESS_KEY"));
   } finally {
     globalThis.fetch = originalFetch;

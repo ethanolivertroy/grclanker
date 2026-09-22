@@ -18,7 +18,7 @@ import { homedir } from "node:os";
 import { dirname, join, relative, resolve } from "node:path";
 import { ZipArchive } from "archiver";
 import { Type } from "@sinclair/typebox";
-import { parse as parseYaml, YAMLParseError } from "yaml";
+import { parse as parseYaml, YAMLError } from "yaml";
 import { errorResult, formatTable, textResult } from "./shared.js";
 
 type FetchImpl = typeof fetch;
@@ -586,45 +586,50 @@ async function countFilesRecursively(rootDir: string): Promise<number> {
   return total;
 }
 
-const YAML_ERROR_CODE = /^[A-Z_]+$/;
-const ERRNO_CODE = /^E[A-Z]+$/;
+const ERRNO_CODE_PATTERN = /^E[A-Z0-9_]{1,30}$/;
 
 /**
- * The yaml parser quotes the offending source line in its message and the
- * filesystem echoes the path it was given, so neither message is ever
- * interpolated. The thrown text carries only the file path, the parser's
- * structured line and column, and an error code validated against a strict
- * pattern (the parser's own code, a Node errno code, or a fixed code of ours).
+ * Two-step config loader guard with fixed text per step. Neither the filesystem
+ * message (which echoes the path and the operation) nor the parser message is
+ * ever interpolated: the yaml parser quotes the offending source line, and an
+ * unresolved alias (`token: *VALUE`) throws a plain ReferenceError whose message
+ * starts with the value itself. The read step carries the path and a validated
+ * errno code; the parse step catches every thrown value and carries the path plus
+ * a line number taken only from a YAMLError's structured linePos.
  */
-function configFileError(resolvedPath: string, error: unknown): Error {
-  const record = asObject(error) ?? {};
-  const rawCode = asString(record.code);
-  const linePos = Array.isArray(record.linePos) ? asObject(record.linePos[0]) : undefined;
-  const line = asNumber(linePos?.line);
-  const column = asNumber(linePos?.col);
-  const position = line === undefined ? "" : ` at line ${line}${column === undefined ? "" : `, column ${column}`}`;
-  if (error instanceof YAMLParseError || (rawCode !== undefined && YAML_ERROR_CODE.test(rawCode) && linePos !== undefined)) {
-    const code = rawCode !== undefined && YAML_ERROR_CODE.test(rawCode) ? rawCode : "INVALID_YAML";
-    return new Error(`Tenable config file ${resolvedPath} is not valid YAML (${code}${position}); fix the file or point TENABLE_CONFIG_FILE elsewhere.`);
+function readConfigText(resolvedPath: string): string {
+  try {
+    return readFileSync(resolvedPath, "utf8");
+  } catch (error) {
+    const code = asString(asObject(error)?.code);
+    const suffix = code !== undefined && ERRNO_CODE_PATTERN.test(code) ? ` (${code})` : "";
+    throw new Error(`Unable to read Tenable config file ${resolvedPath}${suffix}`);
   }
-  const code = rawCode !== undefined && ERRNO_CODE.test(rawCode) ? rawCode : "UNREADABLE";
-  return new Error(`Tenable config file ${resolvedPath} could not be read (${code}); fix the file or point TENABLE_CONFIG_FILE elsewhere.`);
 }
 
-function readConfigFile(pathname: string | undefined): { values: JsonRecord; source?: string } {
-  if (!pathname) return { values: {} };
-  const resolvedPath = pathname.startsWith("~") ? join(homedir(), pathname.slice(1)) : resolve(pathname);
-  if (!existsSync(resolvedPath)) return { values: {} };
-  let parsed: unknown;
+function parseConfigYaml(resolvedPath: string, raw: string): unknown {
   try {
-    parsed = parseYaml(readFileSync(resolvedPath, "utf8"));
+    return parseYaml(raw) as unknown;
   } catch (error) {
-    throw configFileError(resolvedPath, error);
+    const linePos = error instanceof YAMLError && Array.isArray(error.linePos) ? asObject(error.linePos[0]) : undefined;
+    const line = asNumber(linePos?.line);
+    throw new Error(`Unable to parse Tenable config file: invalid YAML in ${resolvedPath}${line === undefined ? "" : ` at line ${line}`} (INVALID_YAML)`);
   }
+}
+
+/**
+ * An explicitly named file (config_file argument or TENABLE_CONFIG_FILE) must be
+ * readable, so a missing one surfaces as ENOENT; the default ~/.tenable/config.yaml
+ * is optional and is skipped silently when absent.
+ */
+function readConfigFile(pathname: string, explicit: boolean): { values: JsonRecord; source?: string } {
+  const resolvedPath = pathname.startsWith("~") ? join(homedir(), pathname.slice(1)) : resolve(pathname);
+  if (!explicit && !existsSync(resolvedPath)) return { values: {} };
+  const parsed = parseConfigYaml(resolvedPath, readConfigText(resolvedPath));
   if (parsed === null || parsed === undefined) return { values: {}, source: `config:${resolvedPath}` };
   const values = asObject(parsed);
   if (!values) {
-    throw new Error(`Tenable config file ${resolvedPath} must contain a YAML mapping of settings (INVALID_CONFIG_SHAPE); fix the file or point TENABLE_CONFIG_FILE elsewhere.`);
+    throw new Error(`Unable to parse Tenable config file: ${resolvedPath} must contain a YAML mapping of settings (INVALID_CONFIG_SHAPE)`);
   }
   return { values, source: `config:${resolvedPath}` };
 }
@@ -650,8 +655,8 @@ export function resolveTenableConfiguration(
   env: NodeJS.ProcessEnv = process.env,
 ): TenableResolvedConfig {
   const sourceChain: string[] = [];
-  const configPath = asString(input.config_file) ?? asString(env.TENABLE_CONFIG_FILE) ?? join(homedir(), ".tenable", "config.yaml");
-  const file = readConfigFile(configPath);
+  const explicitConfigPath = asString(input.config_file) ?? asString(env.TENABLE_CONFIG_FILE);
+  const file = readConfigFile(explicitConfigPath ?? join(homedir(), ".tenable", "config.yaml"), explicitConfigPath !== undefined);
   if (file.source) sourceChain.push(file.source);
 
   const url = pick(input, env, file.values, ["url", "base_url"], ["TENABLE_URL", "TENABLE_BASE_URL"], ["url", "base_url"]);
