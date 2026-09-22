@@ -198,15 +198,22 @@ const JSON_LITERAL_PATTERN = /^(?:null|true|false)$/;
 // letters in one casing (the longest, "authentication", has 14) or a hyphenated compound of lowercase
 // words ("OAuth sign-in", "OAuth service-app"), a dotted version ("OAuth 2.0"), or an auth-param of a
 // challenge (`Bearer realm="api"`, `error="invalid_token"`). A value with a digit, a symbol, or mixed
-// casing inside a word is never prose. "Token", "Basic", and "Digest" are English words as often as
-// schemes, so they count as schemes only in their conventional spellings ("token
-// canary-noexpiry-token-zq has no expiry" names a token; "Token canary-noexpiry-token-zq" replays
-// one). A quoted value is delimited by its quotes and goes whole when it begins like a credential; in
-// `"Basic ", "token"` inside a JSON document the quote after the scheme word closes one string rather
-// than opening a value.
-const SCHEME_WORD_PATTERN = new RegExp(String.raw`${NAME_START}(?:Bearer|BEARER|bearer|Basic|BASIC|Token|TOKEN|Digest|OAuth|Negotiate|NTLM|SSWS|ApiKey|Apikey|apikey|APIKEY|Api-Key|api-key|Splunk)[ \t]+`, "g");
+// casing inside a word is never prose. "token", "basic", "digest", "oauth", and "splunk" in lowercase
+// are English words as often as schemes ("token canary-noexpiry-token-zq has no expiry" names a
+// LaunchDarkly token; "basic authentication is disabled"), yet a peer's error text may spell a scheme
+// in lowercase (Codex P1 on #78: "replayed basic dXNlcjpwYXNz upstream"), so the lowercase spellings
+// are weaker carriers: the value goes only when it cannot be a word or a name, that is when it carries
+// a digit, a symbol, or mixed casing inside the word, and is at least `LOWERCASE_SCHEME_VALUE_MIN_LENGTH`
+// characters (main's floor at 02967cc); a word in either casing or a hyphenated lowercase compound of
+// any length after them is prose. Every one of the 103 distinct continuations after these spellings in
+// the sources is prose under this rule. A quoted value is delimited by its quotes and goes whole when
+// it begins like a credential; in `"Basic ", "token"` inside a JSON document the quote after the
+// scheme word closes one string rather than opening a value.
+const SCHEME_WORD_PATTERN = new RegExp(String.raw`${NAME_START}(?:Bearer|BEARER|bearer|Basic|BASIC|basic|Token|TOKEN|token|Digest|digest|OAuth|oauth|Negotiate|NTLM|SSWS|ApiKey|Apikey|apikey|APIKEY|Api-Key|api-key|Splunk|splunk)[ \t]+`, "g");
+const LOWERCASE_SCHEME_WORDS = new Set(["basic", "token", "digest", "oauth", "splunk"]);
 const SCHEME_BARE_VALUE_PATTERN = /[A-Za-z0-9][A-Za-z0-9._~+/=-]{3,}/y;
 const SCHEME_VALUE_MIN_LENGTH = 4;
+const LOWERCASE_SCHEME_VALUE_MIN_LENGTH = 8;
 const QUOTED_SCHEME_VALUE_START_PATTERN = /^[A-Za-z0-9]/;
 const PLAIN_WORD_PATTERN = /^(?:[A-Z]?[a-z]+(?:-[a-z]+)*|[A-Z]+)$/;
 const PLAIN_WORD_MAX_LENGTH = 20;
@@ -450,8 +457,9 @@ function continuesAsProse(text: string, separator: string, value: string, valueE
  * credential made only of lowercase letters and hyphens and shorter than 20 characters, which is a
  * passphrase rather than an issued token; anything with a digit, a symbol, or mixed casing goes.
  */
-function looksLikeSchemeValue(value: string): boolean {
-  if (PLAIN_WORD_PATTERN.test(value) && value.length < PLAIN_WORD_MAX_LENGTH) return false;
+function looksLikeSchemeValue(value: string, lowercaseScheme = false): boolean {
+  if (lowercaseScheme && value.length < LOWERCASE_SCHEME_VALUE_MIN_LENGTH) return false;
+  if (PLAIN_WORD_PATTERN.test(value) && (lowercaseScheme || value.length < PLAIN_WORD_MAX_LENGTH)) return false;
   return !VERSION_PATTERN.test(value) && !AUTH_PARAM_PATTERN.test(value);
 }
 
@@ -802,18 +810,22 @@ const readCookieHeaderValue: ValueReader = (text, valueStart, carrier) => {
 /**
  * Reads the value after a bare scheme word in free text: a quoted value goes whole when it begins like
  * a credential; a bare value goes unless it is one of the prose shapes (see `looksLikeSchemeValue`).
+ * After a lowercase English-word spelling (`basic`, `token`, `digest`, `oauth`, `splunk`) a bare or
+ * quoted value goes only when it cannot be a word or a name.
  */
-const readSchemeValue: ValueReader = (text, valueStart) => {
+const readSchemeValue: ValueReader = (text, valueStart, carrier) => {
+  const lowercaseScheme = LOWERCASE_SCHEME_WORDS.has(carrier[0].trim());
   const quoted = readQuotedValue(text, valueStart);
   if (quoted !== null) {
     const content = text.slice(quoted.start, quoted.end);
     if (isBlankOrScrubbed(content) || !QUOTED_SCHEME_VALUE_START_PATTERN.test(content)) return null;
+    if (lowercaseScheme && !looksLikeSchemeValue(content, true)) return null;
     return { end: quoted.after, replacement: `${quoted.open}${REDACTED}${quoted.close}` };
   }
   const bare = stickyExec(SCHEME_BARE_VALUE_PATTERN, text, valueStart);
   if (bare === null) return null;
   const value = bare.replace(CLAUSE_PUNCTUATION_PATTERN, "");
-  if (value.length < SCHEME_VALUE_MIN_LENGTH || !looksLikeSchemeValue(value)) return null;
+  if (value.length < SCHEME_VALUE_MIN_LENGTH || !looksLikeSchemeValue(value, lowercaseScheme)) return null;
   return { end: valueStart + value.length, replacement: REDACTED };
 };
 

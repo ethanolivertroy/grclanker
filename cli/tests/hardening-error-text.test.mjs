@@ -233,6 +233,36 @@ test("scheme-carried values are removed whatever their casing or entropy; the pr
     assert.equal(scrubErrorText(prose), prose);
     assert.equal(scrubDataText(prose), prose);
   }
+  // Codex P1 on #78 (r4076357751): a peer may spell a scheme in lowercase, so `basic`, `token`,
+  // `digest`, `oauth`, and `splunk` carry a value too, but as English words they take only a value
+  // that cannot be a word or a name (a digit, a symbol, or mixed casing inside the word, at least 8
+  // characters, main's floor); a word in either casing or a hyphenated lowercase name after them stays.
+  for (const value of ["dXNlcjpwYXNz", CANARY.basic, "5d41402abc4b2a76b9719d911017c592", "ya29abcdefghijklmnop", "Kq7Zx2Vw9Lm4Tp8R", "abc-DEF-123", "expiresAt", "abcd_efgh", "abcd.efgh", "00abcDEF"]) {
+    for (const [scheme, tail] of [["basic", " upstream"], ["token", " expired"], ["digest", " mismatch"], ["oauth", " failed"], ["splunk", "."]]) {
+      const text = `replayed ${scheme} ${value}${tail}`;
+      assert.equal(scrubErrorText(text), `replayed ${scheme} ${REDACTED}${tail}`, text);
+      assert.equal(scrubDataText(text), `replayed ${scheme} ${REDACTED}${tail}`, text);
+      assert.equal(scrubErrorText(`replayed ${scheme} "${value}"${tail}`), `replayed ${scheme} "${REDACTED}"${tail}`, `quoted ${text}`);
+    }
+  }
+  assert.equal(scrubErrorText("replayed basic dXNlcjpwYXNz upstream"), `replayed basic ${REDACTED} upstream`, "the reported case");
+  for (const prose of [
+    "team canary-empty-team-zq has no custom role; token canary-noexpiry-token-zq has no expiry",
+    "basic authentication is disabled",
+    "token request failed",
+    "oauth 2.0 client-credentials flow",
+    "splunk 9.1.2 Enterprise",
+    "token IDs were rotated",
+    "token Manager rejected",
+    "the token abc123 expired",
+    'basic realm="api" challenge',
+    'basic "authentication" is on',
+    "digest access authentication",
+    "a splunk deployment-server role",
+  ]) {
+    assert.equal(scrubErrorText(prose), prose, prose);
+    assert.equal(scrubDataText(prose), prose, prose);
+  }
 });
 
 test("credential-named pairs lose any nonempty value whatever its shape, compound and env-style keys included; the one exemption is a word that continues as prose", () => {
