@@ -769,6 +769,28 @@ export function redactErrorText(text: string): string {
   return scrubLongTokens(scrubbed);
 }
 
+/** Keeps only the first and last four characters of an identifier, the way access key ids are masked elsewhere. */
+export function maskIdentifier(id: string): string {
+  if (id.length <= 8) return "****";
+  return `${id.slice(0, 4)}****${id.slice(-4)}`;
+}
+
+/**
+ * A server-assigned identifier for a sentence, kept whole when the error-text scrub keeps it and otherwise
+ * masked. A Cloudflare account, zone, or token id is 32 hex characters, a hex digest to the scrub, and would
+ * render as [REDACTED] in a summary or an access note, which loses the resource and reads as though a secret
+ * had been recorded; the masked form still names it. Structured fields (accountId, endpoint, account_id,
+ * record ids) carry the id whole and are never passed through this.
+ */
+export function labelIdentifier(id: string): string {
+  return redactErrorText(id) === id ? id : maskIdentifier(id);
+}
+
+/** A request path for a sentence: each segment goes through labelIdentifier, so `/accounts/<32 hex>/members` names the account by its masked id. */
+export function displayPath(path: string): string {
+  return path.split("/").map((segment) => (segment.length === 0 ? segment : labelIdentifier(segment))).join("/");
+}
+
 export class CloudflareApiError extends Error {
   /** HTTP status the request observed; undefined for transport failures (timeouts, connection errors). */
   readonly status: number | undefined;
@@ -871,7 +893,7 @@ export class CloudflareApiClient implements CloudflareReader {
         const reason = controller.signal.aborted
           ? `timed out after ${this.config.timeoutMs} ms`
           : `network error: ${errorMessage(error)}`;
-        throw new CloudflareApiError(`Cloudflare request failed for ${path} (${reason})`, undefined, path);
+        throw new CloudflareApiError(`Cloudflare request failed for ${displayPath(path)} (${reason})`, undefined, path);
       }
 
       let payload: JsonRecord = {};
@@ -893,7 +915,7 @@ export class CloudflareApiClient implements CloudflareReader {
       if (!response.ok) {
         const detail = (parsed ? cloudflareErrorSummary(payload) : undefined) ?? describeNonJsonBody(contentType, rawText);
         throw new CloudflareApiError(
-          `Cloudflare request failed for ${path} (${response.status} ${response.statusText})${detail ? `: ${detail}` : ""}`,
+          `Cloudflare request failed for ${displayPath(path)} (${response.status} ${response.statusText})${detail ? `: ${detail}` : ""}`,
           response.status,
           path,
         );
@@ -902,14 +924,14 @@ export class CloudflareApiClient implements CloudflareReader {
       // A 2xx answer that is not JSON (a proxy login page, an HTML error) is a failed read, not an empty inventory.
       if (!parsed) {
         throw new CloudflareApiError(
-          `Cloudflare request returned a non-JSON payload for ${path} (${response.status} ${response.statusText}): ${describeNonJsonBody(contentType, rawText)}`,
+          `Cloudflare request returned a non-JSON payload for ${displayPath(path)} (${response.status} ${response.statusText}): ${describeNonJsonBody(contentType, rawText)}`,
           response.status,
           path,
         );
       }
 
       if (payload.success === false) {
-        throw new CloudflareApiError(cloudflareErrorSummary(payload) ?? `Cloudflare API reported failure for ${path}.`, response.status, path);
+        throw new CloudflareApiError(cloudflareErrorSummary(payload) ?? `Cloudflare API reported failure for ${displayPath(path)}.`, response.status, path);
       }
 
       return payload;
@@ -1219,7 +1241,7 @@ function capStatus(status: CloudflareFindingStatus, cap: CloudflareFindingStatus
 }
 
 function manualReason(endpoint: string, permission: string, evidence: string, error?: string): string {
-  return `Manual review required: ${endpoint} could not be read${error ? ` (${error})` : ""}. Grant ${permission} to the audit token, or collect ${evidence} manually.`;
+  return `Manual review required: ${displayPath(endpoint)} could not be read${error ? ` (${error})` : ""}. Grant ${permission} to the audit token, or collect ${evidence} manually.`;
 }
 
 function partialInventoryNote(label: string, list: CloudflarePagedList): string | undefined {
@@ -1317,18 +1339,18 @@ function deriveAccountContext(
   accountsOutcome: ReadOutcome<CloudflarePagedList>,
 ): { accountId?: string; note: string } {
   if (config.accountId) {
-    return { accountId: config.accountId, note: `Using configured account ${config.accountId}.` };
+    return { accountId: config.accountId, note: `Using configured account ${labelIdentifier(config.accountId)}.` };
   }
 
   // A denied or failed account list is named as such; it is never reported as "no accounts were visible".
   if (!accountsOutcome.ok) {
-    return { accountId: undefined, note: `The account list could not be read (${accountsOutcome.endpoint ?? "/accounts"}: ${accountsOutcome.error}); account-scoped checks stay manual until account_id is set.` };
+    return { accountId: undefined, note: `The account list could not be read (${displayPath(accountsOutcome.endpoint ?? "/accounts")}: ${accountsOutcome.error}); account-scoped checks stay manual until account_id is set.` };
   }
 
   const accounts = accountsOutcome.value.items;
   const soleId = asString(accounts[0]?.id);
   if (accounts.length === 1 && soleId) {
-    return { accountId: soleId, note: `Using the only visible Cloudflare account ${soleId}.` };
+    return { accountId: soleId, note: `Using the only visible Cloudflare account ${labelIdentifier(soleId)}.` };
   }
 
   if (accounts.length === 0) {
@@ -1425,7 +1447,7 @@ function notAttemptedSurface(
     status: "not_attempted",
     count: null,
     http_status: parent.status ?? null,
-    error: `Not attempted: ${parent.endpoint} could not be read (${parent.error})`,
+    error: `Not attempted: ${displayPath(parent.endpoint)} could not be read (${parent.error})`,
   };
 }
 
@@ -1856,7 +1878,7 @@ export async function checkCloudflareAccess(
       note,
       `${readableCount}/${surfaces.length} Cloudflare audit surfaces are readable.`,
       ...(!zones.ok && notAttempted.length > 0
-        ? [`${notAttempted.length} zone-scoped surfaces were not attempted because ${zones.endpoint ?? "/zones"} could not be read (${zones.status ?? "no HTTP status"}).`]
+        ? [`${notAttempted.length} zone-scoped surfaces were not attempted because ${displayPath(zones.endpoint ?? "/zones")} could not be read (${zones.status ?? "no HTTP status"}).`]
         : []),
     ],
     recommendedNextStep:
@@ -1881,7 +1903,7 @@ export async function assessCloudflareIdentity(
   const zoneLimit = clampNumber(options.zoneLimit, DEFAULT_ZONE_LIMIT, 1, 500);
   const errors: string[] = [];
   const recordError = <T>(label: string, outcome: ReadOutcome<T>): void => {
-    if (!outcome.ok) errors.push(`${label}: ${outcome.error}`);
+    if (!outcome.ok) errors.push(`${displayPath(label)}: ${outcome.error}`);
   };
 
   const [verify, accounts, zones, userTokens] = await Promise.all([
@@ -2539,10 +2561,11 @@ export async function assessCloudflareTrafficControls(
     ])
     : [undefined, undefined, undefined, undefined];
   if (accountId) {
-    if (!auditOutcome!.ok) errors.push(`/accounts/${accountId}/audit_logs: ${auditOutcome!.error}`);
-    if (!gatewayOutcome!.ok) errors.push(`/accounts/${accountId}/gateway/rules: ${gatewayOutcome!.error}`);
-    if (!gatewayAccountOutcome!.ok) errors.push(`/accounts/${accountId}/gateway: ${gatewayAccountOutcome!.error}`);
-    if (!ipRulesOutcome!.ok) errors.push(`/accounts/${accountId}/firewall/access_rules/rules: ${ipRulesOutcome!.error}`);
+    const accountLabel = displayPath(`/accounts/${accountId}`);
+    if (!auditOutcome!.ok) errors.push(`${accountLabel}/audit_logs: ${auditOutcome!.error}`);
+    if (!gatewayOutcome!.ok) errors.push(`${accountLabel}/gateway/rules: ${gatewayOutcome!.error}`);
+    if (!gatewayAccountOutcome!.ok) errors.push(`${accountLabel}/gateway: ${gatewayAccountOutcome!.error}`);
+    if (!ipRulesOutcome!.ok) errors.push(`${accountLabel}/firewall/access_rules/rules: ${ipRulesOutcome!.error}`);
   }
 
   const emptyZones = { emptyStatus: "manual" as CloudflareFindingStatus, emptyDetail: "No zones were visible to this token, so zone traffic controls cannot be judged; grant Zone: Read or set account_id." };

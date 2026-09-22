@@ -81,9 +81,12 @@ import {
   parserSnippetBody,
 } from "./helpers/error-canaries.mjs";
 import {
+  MASKED_HEX_ID_GROUP,
   QUOTED_NON_CREDENTIAL_GROUP,
+  SERVER_ASSIGNED_HEX_IDS,
   assertCredentialPairValuesRemoved,
   assertFixedTextsSurvive,
+  assertHexIdentifierPolicy,
   assertIdentifierKeyRows,
   assertMustKeepRows,
   assertMustRedactRowsBesideMustKeep,
@@ -669,6 +672,36 @@ test("rule 1 corollary: assessAwsLoggingDetection never passes a control whose p
   }));
   assertOnlyDemoted(detectorAll, { "AWS-LOG-04": "manual" }, "GetDetector denied for every detector");
   assert.match(findingById(detectorAll, "AWS-LOG-04").summary, /GetDetector could not be read for 2 of them \(guardduty:GetDetector detector-1: AccessDenied/);
+
+  // Round 4 open ruling: a real 32-hex detector id is named by its masked form in the read label and every
+  // sentence built from it, and kept whole in the structured detectors_unreadable list.
+  const realDetector = SERVER_ASSIGNED_HEX_IDS.find((entry) => entry.label === "GuardDuty detector id");
+  const realDetectorDenied = await assessAwsLoggingDetection(compliantLoggingClient({
+    async listDetectors() {
+      return paged([realDetector.id, "detector-1"]);
+    },
+    async getDetector(detectorId) {
+      if (detectorId === realDetector.id) throw accessDenied();
+      return { Status: "ENABLED" };
+    },
+  }));
+  const realDetectorFinding = findingById(realDetectorDenied, "AWS-LOG-04");
+  assert.equal(realDetectorFinding.status, "warn", realDetectorFinding.summary);
+  assert.deepEqual(realDetectorFinding.evidence.detectors_unreadable, [realDetector.id], "the structured list carries the real id whole");
+  assert.equal(realDetectorFinding.evidence.detector_count, 2);
+  const realDetectorLine = realDetectorDenied.errors.find((line) => line.startsWith("guardduty:GetDetector "));
+  assert.match(realDetectorLine, /^guardduty:GetDetector 12ab\*\*\*\*89f0: AccessDenied/, `the read label names the detector by its masked id: ${realDetectorLine}`);
+  assertNoCanaryWindows(assert, [realDetectorFinding.summary, ...realDetectorDenied.errors].join("\n"), [realDetector.id], "LOG-04 sentences");
+  const realDetectorAllDenied = await assessAwsLoggingDetection(compliantLoggingClient({
+    async listDetectors() {
+      return paged([realDetector.id]);
+    },
+    async getDetector() {
+      throw accessDenied();
+    },
+  }));
+  assert.match(findingById(realDetectorAllDenied, "AWS-LOG-04").summary, /GetDetector could not be read for 1 of them \(guardduty:GetDetector 12ab\*\*\*\*89f0: AccessDenied/);
+  assertNoCanaryWindows(assert, JSON.stringify(findingById(realDetectorAllDenied, "AWS-LOG-04").summary), [realDetector.id], "LOG-04 manual summary");
 
   const recorderStatus = await assessAwsLoggingDetection(compliantLoggingClient({
     async describeConfigurationRecorderStatus() {
@@ -2513,6 +2546,7 @@ test("rule 9 fixed texts (GWS note 1): every fixed-text message the integration 
   assert.equal(labelIdentifier("12abc34d567e8fa901bc2d34e56789f0"), "12ab****89f0");
   assert.equal(redactErrorText(`guardduty:GetDetector ${labelIdentifier("12abc34d567e8fa901bc2d34e56789f0")}: AccessDenied (${denied})`), `guardduty:GetDetector 12ab****89f0: AccessDenied (${denied})`);
   assert.equal(redactErrorText("guardduty:GetDetector 12abc34d567e8fa901bc2d34e56789f0"), "guardduty:GetDetector [REDACTED]", "negative control: the bare 32-hex id is a hex digest to the scrub");
+  assertHexIdentifierPolicy(assert, redactErrorText, { mask: labelIdentifier });
 
   // The renderings the client throws, built by AwsApiError and AwsCredentialProviderError, survive too.
   const thrown = [
@@ -2629,6 +2663,7 @@ test("rule 9 must-keep and must-redact table (addendum 7): every command with it
       sentence: (value) => `AWS-IAM-04 ${value}`,
     },
     QUOTED_NON_CREDENTIAL_GROUP,
+    MASKED_HEX_ID_GROUP,
   ];
   assertMustKeepRows(assert, redactErrorText, groups);
   assertMustRedactRowsBesideMustKeep(assert, redactErrorText, groups);

@@ -18,7 +18,9 @@ import {
   assessCloudflareZoneSecurity,
   checkCloudflareAccess,
   cloudflareFixedTexts,
+  displayPath,
   exportCloudflareAuditBundle,
+  labelIdentifier,
   redactErrorText,
   resolveCloudflareConfiguration,
   resolveSecureOutputPath,
@@ -47,9 +49,12 @@ import {
   shortBodyResponse,
 } from "./helpers/error-canaries.mjs";
 import {
+  MASKED_HEX_ID_GROUP,
   QUOTED_NON_CREDENTIAL_GROUP,
+  SERVER_ASSIGNED_HEX_IDS,
   assertCredentialPairValuesRemoved,
   assertFixedTextsSurvive,
+  assertHexIdentifierPolicy,
   assertIdentifierKeyRows,
   assertMustKeepRows,
   assertMustRedactRowsBesideMustKeep,
@@ -1411,6 +1416,7 @@ test("rule 9 must-keep and must-redact table (addendum 7): every endpoint path, 
       sentence: (value) => `CF-IAM-04: ${value}`,
     },
     QUOTED_NON_CREDENTIAL_GROUP,
+    MASKED_HEX_ID_GROUP,
   ];
   assertMustKeepRows(assert, redactErrorText, groups);
   assertMustRedactRowsBesideMustKeep(assert, redactErrorText, groups);
@@ -1479,50 +1485,50 @@ const ACCOUNT = "acc-123";
  * the /client/v4 prefix; the fallback routes (/firewall/rules, /rate_limits, /subscription) are
  * included so a run that reaches them is still served.
  */
-function healthyCloudflareRoutes() {
+function healthyCloudflareRoutes(account = ACCOUNT, zone = ZONE) {
   const routes = {
     "/user/tokens/verify": cloudflareOk({ id: "tok-current", status: "active", expires_on: FUTURE, not_before: "2026-01-01T00:00:00Z" }),
-    "/user/tokens/tok-current": cloudflareOk({ id: "tok-current", status: "active", expires_on: FUTURE, policies: [{ id: "p1", effect: "allow", permission_groups: [{ id: "pg1", name: "Zone Read" }], resources: { "com.cloudflare.api.account.zone.zone-1": "*" } }] }),
+    "/user/tokens/tok-current": cloudflareOk({ id: "tok-current", status: "active", expires_on: FUTURE, policies: [{ id: "p1", effect: "allow", permission_groups: [{ id: "pg1", name: "Zone Read" }], resources: { [`com.cloudflare.api.account.zone.${zone}`]: "*" } }] }),
     "/user/tokens": cloudflareOk([
       { id: "tok-1", name: "audit", status: "active", expires_on: FUTURE, last_used_on: RECENT, issued_on: "2026-01-01T00:00:00Z", policies: [] },
       { id: "tok-2", name: "old", status: "expired", expires_on: "2025-01-01T00:00:00Z", policies: [] },
     ]),
-    "/accounts": cloudflareOk([{ id: ACCOUNT, name: "Example", type: "standard", settings: { enforce_twofactor: true } }]),
-    "/zones": cloudflareOk([{ id: ZONE, name: "one.example", status: "active" }]),
-    [`/accounts/${ACCOUNT}/tokens`]: cloudflareOk([{ id: "atok-1", name: "ci", status: "active", expires_on: FUTURE, last_used_on: RECENT, policies: [] }]),
-    [`/accounts/${ACCOUNT}/members`]: cloudflareOk([
+    "/accounts": cloudflareOk([{ id: account, name: "Example", type: "standard", settings: { enforce_twofactor: true } }]),
+    "/zones": cloudflareOk([{ id: zone, name: "one.example", status: "active" }]),
+    [`/accounts/${account}/tokens`]: cloudflareOk([{ id: "atok-1", name: "ci", status: "active", expires_on: FUTURE, last_used_on: RECENT, policies: [] }]),
+    [`/accounts/${account}/members`]: cloudflareOk([
       { id: "m1", status: "accepted", user: { email: "owner@example.com", two_factor_authentication_enabled: true }, roles: [{ id: "r1", name: "Super Administrator - All Privileges" }] },
       { id: "m2", status: "accepted", user: { email: "auditor@example.com", two_factor_authentication_enabled: true }, roles: [{ id: "r2", name: "Administrator Read Only" }] },
     ]),
-    [`/accounts/${ACCOUNT}/access/apps`]: cloudflareOk([{ id: "app-1", name: "Admin", type: "self_hosted", domain: "admin.one.example", policies: [{ id: "pol-1", decision: "allow", include: [{ email_domain: { domain: "example.com" } }] }] }]),
-    [`/accounts/${ACCOUNT}/access/policies`]: cloudflareOk([{ id: "pol-2", name: "Staff", decision: "allow", reusable: true, include: [] }]),
-    [`/accounts/${ACCOUNT}/access/identity_providers`]: cloudflareOk([{ id: "idp-1", name: "Okta", type: "okta" }]),
-    [`/accounts/${ACCOUNT}/audit_logs`]: cloudflareOk([{ id: "evt-1", when: RECENT, action: { type: "change_setting", result: true }, actor: { email: "admin@example.com" } }]),
-    [`/accounts/${ACCOUNT}/gateway/rules`]: cloudflareOk([{ id: "gw-1", name: "Block malware", action: "block", enabled: true, filters: ["dns"] }, { id: "gw-2", name: "Isolate", action: "isolate", enabled: true, filters: ["http"] }]),
-    [`/accounts/${ACCOUNT}/gateway`]: cloudflareOk({ id: ACCOUNT, gateway_tag: "gw-tag-1", provider_name: "Cloudflare" }),
-    [`/accounts/${ACCOUNT}/firewall/access_rules/rules`]: cloudflareOk([{ id: "ip-1", mode: "block", notes: "Known scanner", modified_on: RECENT, configuration: { target: "ip", value: "198.51.100.1" } }]),
-    [`/zones/${ZONE}/dnssec`]: cloudflareOk({ status: "active", algorithm: "13" }),
-    [`/zones/${ZONE}/rulesets`]: cloudflareOk([
+    [`/accounts/${account}/access/apps`]: cloudflareOk([{ id: "app-1", name: "Admin", type: "self_hosted", domain: "admin.one.example", policies: [{ id: "pol-1", decision: "allow", include: [{ email_domain: { domain: "example.com" } }] }] }]),
+    [`/accounts/${account}/access/policies`]: cloudflareOk([{ id: "pol-2", name: "Staff", decision: "allow", reusable: true, include: [] }]),
+    [`/accounts/${account}/access/identity_providers`]: cloudflareOk([{ id: "idp-1", name: "Okta", type: "okta" }]),
+    [`/accounts/${account}/audit_logs`]: cloudflareOk([{ id: "evt-1", when: RECENT, action: { type: "change_setting", result: true }, actor: { email: "admin@example.com" } }]),
+    [`/accounts/${account}/gateway/rules`]: cloudflareOk([{ id: "gw-1", name: "Block malware", action: "block", enabled: true, filters: ["dns"] }, { id: "gw-2", name: "Isolate", action: "isolate", enabled: true, filters: ["http"] }]),
+    [`/accounts/${account}/gateway`]: cloudflareOk({ id: account, gateway_tag: "gw-tag-1", provider_name: "Cloudflare" }),
+    [`/accounts/${account}/firewall/access_rules/rules`]: cloudflareOk([{ id: "ip-1", mode: "block", notes: "Known scanner", modified_on: RECENT, configuration: { target: "ip", value: "198.51.100.1" } }]),
+    [`/zones/${zone}/dnssec`]: cloudflareOk({ status: "active", algorithm: "13" }),
+    [`/zones/${zone}/rulesets`]: cloudflareOk([
       { id: "rs-managed", kind: "zone", phase: CLOUDFLARE_RULESET_PHASES.firewallManaged, name: "zone", version: "1" },
       { id: "rs-ddos", kind: "managed", phase: CLOUDFLARE_RULESET_PHASES.ddosL7, name: "DDoS L7 ruleset", version: "1" },
     ]),
-    [`/zones/${ZONE}/ssl/universal/settings`]: cloudflareOk({ enabled: true }),
-    [`/zones/${ZONE}/origin_tls_client_auth/settings`]: cloudflareOk({ enabled: true }),
-    [`/zones/${ZONE}/origin_tls_client_auth/hostnames`]: cloudflareOk([{ cert_id: "cert-aop-1", created_at: "2026-01-01T00:00:00Z", enabled: true, hostname: "app.one.example", status: "active", updated_at: RECENT }]),
-    [`/zones/${ZONE}/ssl/certificate_packs`]: cloudflareOk([{ id: "pack-1", type: "universal", status: "active", hosts: ["one.example"], certificates: [{ id: "cert-1", status: "active", expires_on: FUTURE, hosts: ["one.example"] }] }]),
-    [`/zones/${ZONE}/dns_records`]: cloudflareOk([
+    [`/zones/${zone}/ssl/universal/settings`]: cloudflareOk({ enabled: true }),
+    [`/zones/${zone}/origin_tls_client_auth/settings`]: cloudflareOk({ enabled: true }),
+    [`/zones/${zone}/origin_tls_client_auth/hostnames`]: cloudflareOk([{ cert_id: "cert-aop-1", created_at: "2026-01-01T00:00:00Z", enabled: true, hostname: "app.one.example", status: "active", updated_at: RECENT }]),
+    [`/zones/${zone}/ssl/certificate_packs`]: cloudflareOk([{ id: "pack-1", type: "universal", status: "active", hosts: ["one.example"], certificates: [{ id: "cert-1", status: "active", expires_on: FUTURE, hosts: ["one.example"] }] }]),
+    [`/zones/${zone}/dns_records`]: cloudflareOk([
       { id: "rec-1", type: "A", name: "one.example", content: "203.0.113.10", proxied: true, proxiable: true, ttl: 1 },
       { id: "rec-2", type: "TXT", name: "one.example", content: "v=spf1 -all", proxied: false, proxiable: false, ttl: 300 },
     ]),
-    [`/zones/${ZONE}/pagerules`]: cloudflareOk([{ id: "pr-1", status: "active", priority: 1, targets: [{ target: "url", constraint: { operator: "matches", value: "one.example/static/*" } }], actions: [{ id: "browser_cache_ttl", value: 14400 }] }]),
-    [`/zones/${ZONE}/bot_management`]: cloudflareOk({ fight_mode: true }),
-    [`/zones/${ZONE}/subscription`]: cloudflareOk({ id: "sub-1", state: "Paid", rate_plan: { id: "cf_pro", public_name: "Pro Website", currency: "USD" } }),
-    [`/zones/${ZONE}/firewall/rules`]: cloudflareOk([]),
-    [`/zones/${ZONE}/rate_limits`]: cloudflareOk([]),
+    [`/zones/${zone}/pagerules`]: cloudflareOk([{ id: "pr-1", status: "active", priority: 1, targets: [{ target: "url", constraint: { operator: "matches", value: "one.example/static/*" } }], actions: [{ id: "browser_cache_ttl", value: 14400 }] }]),
+    [`/zones/${zone}/bot_management`]: cloudflareOk({ fight_mode: true }),
+    [`/zones/${zone}/subscription`]: cloudflareOk({ id: "sub-1", state: "Paid", rate_plan: { id: "cf_pro", public_name: "Pro Website", currency: "USD" } }),
+    [`/zones/${zone}/firewall/rules`]: cloudflareOk([]),
+    [`/zones/${zone}/rate_limits`]: cloudflareOk([]),
   };
-  for (const setting of compliantSettings()) routes[`/zones/${ZONE}/settings/${setting.id}`] = cloudflareOk(setting);
+  for (const setting of compliantSettings()) routes[`/zones/${zone}/settings/${setting.id}`] = cloudflareOk(setting);
   for (const phase of [CLOUDFLARE_RULESET_PHASES.firewallManaged, CLOUDFLARE_RULESET_PHASES.firewallCustom, CLOUDFLARE_RULESET_PHASES.ddosL7, CLOUDFLARE_RULESET_PHASES.responseHeadersTransform, CLOUDFLARE_RULESET_PHASES.rateLimit]) {
-    routes[`/zones/${ZONE}/rulesets/phases/${phase}/entrypoint`] = cloudflareOk(compliantEntrypoint(phase));
+    routes[`/zones/${zone}/rulesets/phases/${phase}/entrypoint`] = cloudflareOk(compliantEntrypoint(phase));
   }
   return routes;
 }
@@ -1899,4 +1905,91 @@ test("config loader errors: a 200 answer whose body is short non-JSON text is re
   for (const [name, text] of readZipEntries(exported.zipPath)) assertNoShortBodyFragments(assert, text, `zip ${name}`);
   assertShortBodyRecordedAsNote(assert, files.get("_errors.log"), "_errors.log");
   assert.ok(log.some((entry) => entry.path === surface && entry.status === 200), "the 200 answer named in the note was observed");
+});
+
+test("rule 9 server-assigned 32-hex ids (round 4 open ruling): a real Cloudflare account or zone id is removed from error text bare, named by its masked form in every sentence that names its endpoint or account, and kept whole in every structured field", async () => {
+  const account = SERVER_ASSIGNED_HEX_IDS.find((entry) => entry.label === "Cloudflare account id");
+  const zone = SERVER_ASSIGNED_HEX_IDS.find((entry) => entry.label === "Cloudflare zone id");
+  assertHexIdentifierPolicy(assert, redactErrorText, { mask: labelIdentifier });
+  assert.equal(displayPath(`/accounts/${account.id}/members`), `/accounts/${account.masked}/members`);
+  assert.equal(displayPath(`/zones/${zone.id}/rulesets/phases/http_request_firewall_custom/entrypoint`), `/zones/${zone.masked}/rulesets/phases/http_request_firewall_custom/entrypoint`);
+  assert.equal(displayPath("/accounts/acc-123/access/policies"), "/accounts/acc-123/access/policies", "a name-shaped placeholder path is unchanged");
+  assert.equal(displayPath("/zones/{zone_id}/settings/{setting_id}"), "/zones/{zone_id}/settings/{setting_id}", "a documented path template is unchanged");
+  assert.equal(redactErrorText(`Cloudflare request failed for /accounts/${account.id}/members (403 Forbidden)`), "Cloudflare request failed for /accounts/[REDACTED]/members (403 Forbidden)", "negative control: the raw id in error text is a hex digest to the scrub");
+
+  // The real client under a real-shaped account and zone, with the members list and the DNSSEC read denied.
+  const routes = healthyCloudflareRoutes(account.id, zone.id);
+  routes[`/accounts/${account.id}/members`] = () => cloudflareForbidden();
+  routes[`/zones/${zone.id}/dnssec`] = () => cloudflareForbidden();
+  const log = [];
+  const client = new CloudflareApiClient(sampleConfig({ accountId: account.id }), { fetchImpl: cloudflareRoutedFetch(routes, log) });
+  const { access, assessments, exported } = await runEveryCloudflareTool(client, createTempBase("grclanker-cloudflare-hex-ids-"));
+  assert.ok(log.some((entry) => entry.path === `/accounts/${account.id}/members` && entry.status === 403), "the denied members request went to the real account path");
+  assert.ok(log.some((entry) => entry.path === `/zones/${zone.id}/dnssec` && entry.status === 403), "the denied DNSSEC request went to the real zone path");
+
+  // Structured fields keep the ids whole.
+  assert.equal(access.accountId, account.id);
+  const members = access.surfaces.find((entry) => entry.name === "members");
+  const dnssec = access.surfaces.find((entry) => entry.name === "dnssec");
+  assert.deepEqual(
+    { status: members.status, endpoint: members.endpoint, http_status: members.http_status, count: members.count },
+    { status: "not_readable", endpoint: `/accounts/${account.id}/members`, http_status: 403, count: null },
+  );
+  assert.deepEqual(
+    { status: dnssec.status, endpoint: dnssec.endpoint, http_status: dnssec.http_status },
+    { status: "not_readable", endpoint: `/zones/${zone.id}/dnssec`, http_status: 403 },
+  );
+  for (const surface of access.surfaces.filter((entry) => entry.scope === "account" && entry.endpoint !== "/accounts")) {
+    assert.ok(surface.endpoint.startsWith(`/accounts/${account.id}/`), `structured endpoint carries the real account id: ${surface.endpoint}`);
+  }
+  const [identity, zoneSecurity, traffic] = assessments;
+  assert.equal(identity.summary.account_id, account.id);
+  assert.equal(traffic.summary.account_id, account.id);
+  for (const item of traffic.findings) {
+    if (item.evidence && "account_id" in item.evidence) assert.equal(item.evidence.account_id, account.id, `${item.id} evidence names the real account id`);
+  }
+
+  // Sentences name the resource by its masked id and never carry a window of the raw one.
+  assert.equal(members.error, `Cloudflare request failed for /accounts/${account.masked}/members (403 Forbidden): Authentication error`);
+  assert.equal(dnssec.error, `Cloudflare request failed for /zones/${zone.masked}/dnssec (403 Forbidden): Authentication error`);
+  assert.ok(access.notes.includes(`Using configured account ${account.masked}.`), `the account note names the masked id: ${JSON.stringify(access.notes)}`);
+  const memberFinding = byId(identity, "CF-IAM-03");
+  assert.equal(memberFinding.status, "manual", memberFinding.summary);
+  assert.equal(
+    memberFinding.summary,
+    `Manual review required: /accounts/${account.masked}/members could not be read (Cloudflare request failed for /accounts/${account.masked}/members (403 Forbidden): Authentication error). Grant Account Settings: Read to the audit token, or collect the account member and role list manually.`,
+  );
+  assert.ok(identity.errors.includes(`/accounts/${account.masked}/members: Cloudflare request failed for /accounts/${account.masked}/members (403 Forbidden): Authentication error`), `the errors line names the masked account: ${JSON.stringify(identity.errors)}`);
+  const dnssecFinding = zoneSecurity.findings.find((item) => item.status === "manual" && /dnssec/i.test(item.summary));
+  assert.ok(dnssecFinding, `a zone finding went manual on the denied DNSSEC read: ${JSON.stringify(zoneSecurity.findings.map((item) => [item.id, item.status]))}`);
+  assert.match(dnssecFinding.summary, new RegExp(`/zones/${zone.masked.replace(/\*/g, "\\*")}/dnssec`), dnssecFinding.summary);
+  const sentences = [
+    ...access.surfaces.map((entry) => entry.error).filter(Boolean),
+    ...access.notes,
+    access.recommendedNextStep,
+    ...assessments.flatMap((assessment) => [...assessment.errors, ...assessment.findings.map((item) => item.summary)]),
+    ...recordedCloudflareErrors(assessments),
+  ];
+  assertNoCanaryWindows(assert, sentences.join("\n"), [account.id, zone.id], "sentences about requests and accounts");
+  assert.ok(sentences.some((text) => text.includes(account.masked)) && sentences.some((text) => text.includes(zone.masked)), "the sentences still name both resources by their masked ids");
+
+  // The bundle: structured files keep the ids, _errors.log lines mask them, and the ids are absent from no structured field.
+  const files = readBundleFiles(exported.outputDir);
+  const metadata = JSON.parse(files.get("metadata.json"));
+  assert.equal(metadata.account_id, account.id);
+  assert.equal(JSON.parse(files.get("core_data/accounts.json")).items[0].id, account.id);
+  assert.equal(JSON.parse(files.get("core_data/zones.json")).items[0].id, zone.id);
+  assert.equal(JSON.parse(files.get("core_data/access.json")).accountId, account.id);
+  const errorsLog = files.get("_errors.log");
+  assert.match(errorsLog, new RegExp(`/accounts/${account.masked.replace(/\*/g, "\\*")}/members: Cloudflare request failed`));
+  assertNoCanaryWindows(assert, errorsLog, [account.id, zone.id], "_errors.log");
+  for (const [name, text] of files) {
+    if (name.endsWith(".json")) continue;
+    // Markdown reports render the field lines (Account: <id>, Bundle: <dir>, - account_id: <id>) as they are and every sentence masked.
+    for (const line of text.split("\n")) {
+      if (/^(Account: |Bundle: |- account_id: )/.test(line)) continue;
+      assertNoCanaryWindows(assert, line, [account.id, zone.id], `${name}: ${line}`);
+    }
+  }
+  assert.ok(files.get("compliance/executive_summary.md").includes(`Account: ${account.id}`), "the executive summary's account line is a field rendering and keeps the id whole");
 });

@@ -193,6 +193,64 @@ export function assertIdentifierKeyRows(assert, redact, rows = IDENTIFIER_KEY_RO
 }
 
 /**
+ * Round 4 open ruling on server-assigned 32-hex ids, resolved as: masked in sentences, kept whole in structured
+ * fields. A GuardDuty detector id and a Cloudflare account, zone, or token id are 32 hex characters, a hex
+ * digest to the scrub, so error text removes them bare and they travel whole in the structured fields
+ * (`detectors_unreadable`, `accountId`, `endpoint`, `account_id`, record ids); a sentence the integration
+ * composes that names one (a read label, an endpoint in a summary, an access note, an errors line) masks it
+ * to its first and last four characters, so the line still names the resource instead of reading as though
+ * a secret had been recorded. The placeholders the fixtures use elsewhere (`detector-1`, `acc-123`, `zone-1`,
+ * `tok-current`) are name-shaped and stay, which is why they never exercised the real shape.
+ */
+export const SERVER_ASSIGNED_HEX_IDS = Object.freeze([
+  Object.freeze({ label: "GuardDuty detector id", id: "12abc34d567e8fa901bc2d34e56789f0", masked: "12ab****89f0", sentence: (value) => `guardduty:GetDetector ${value}: AccessDenied (User is not authorized to perform this operation)` }),
+  Object.freeze({ label: "Cloudflare account id", id: "023e105f4ecef8ad9ca31a8372d0c353", masked: "023e****c353", sentence: (value) => `Cloudflare request failed for /accounts/${value}/members (403 Forbidden): Authentication error` }),
+  Object.freeze({ label: "Cloudflare zone id", id: "9a7806061c88ada191ed06f989cc3dac", masked: "9a78****3dac", sentence: (value) => `Manual review required: /zones/${value}/dnssec could not be read (403 Forbidden). Grant Zone: Read to the audit token, or collect the DNSSEC status manually.` }),
+  Object.freeze({ label: "Cloudflare token id", id: "ed17574386854bf78a67040be0a770b0", masked: "ed17****70b0", sentence: (value) => `/user/tokens/${value}: Cloudflare request failed for /user/tokens/${value} (403 Forbidden): Authentication error` }),
+]);
+
+/** The name-shaped placeholders the group D fixtures use for the same ids; no rule touches them. */
+export const HEX_ID_PLACEHOLDERS = Object.freeze(["detector-1", "acc-123", "zone-1", "tok-current"]);
+
+/**
+ * Must-keep group for the integrations whose sentences name a 32-hex id: the masked forms survive the scrub
+ * alone and inside the sentence that names the resource, beside every canary carrier.
+ * @type {MustKeepGroup}
+ */
+export const MASKED_HEX_ID_GROUP = Object.freeze({
+  label: "masked 32-hex ids (round 4 open ruling)",
+  values: SERVER_ASSIGNED_HEX_IDS.map((entry) => entry.masked),
+  sentence: (value) => SERVER_ASSIGNED_HEX_IDS.find((entry) => entry.masked === value).sentence(value),
+});
+
+/**
+ * Asserts the scrub side of the 32-hex policy for one redactErrorText: the real id is removed bare and inside
+ * the sentence that names its endpoint (no 6-to-24 window survives, and nothing else in the sentence changes),
+ * the masked form survives bare and inside the same sentence, and the placeholders survive. `mask`, when given,
+ * is the integration's labelIdentifier: it must produce the masked form for the real id, return a placeholder
+ * unchanged, and its output must survive the scrub.
+ */
+export function assertHexIdentifierPolicy(assert, redact, { mask } = {}) {
+  for (const { label, id, masked, sentence } of SERVER_ASSIGNED_HEX_IDS) {
+    assert.match(id, /^[0-9a-f]{32}$/, `${label}: the fixture id has the real 32-hex shape`);
+    assert.equal(redact(id), "[REDACTED]", `${label}: the bare 32-hex id is a hex digest to the scrub`);
+    const output = redact(sentence(id));
+    assertNoCanaryWindows(assert, output, [id], `${label} inside ${sentence(id)}`);
+    assert.equal(output, sentence("[REDACTED]"), `${label}: only the id is removed from the sentence that names it`);
+    assert.equal(redact(masked), masked, `${label}: the masked form survives the scrub bare`);
+    assert.equal(redact(sentence(masked)), sentence(masked), `${label}: the masked form survives inside the sentence`);
+    if (mask) {
+      assert.equal(mask(id), masked, `${label}: labelIdentifier masks the real id to its first and last four characters`);
+      assert.equal(redact(mask(id)), mask(id), `${label}: the label survives the scrub`);
+    }
+  }
+  for (const placeholder of HEX_ID_PLACEHOLDERS) {
+    assert.equal(redact(placeholder), placeholder, `placeholder ${placeholder} is name-shaped and stays`);
+    if (mask) assert.equal(mask(placeholder), placeholder, `labelIdentifier keeps the placeholder ${placeholder} whole`);
+  }
+}
+
+/**
  * Asserts every fixed-text message an integration emits survives the scrub unchanged (GWS note 1). The list
  * is exported by the integration itself and rendered from the same constants and helpers its error sink
  * uses, so a reworded message is judged here without a test copy drifting from the source.
