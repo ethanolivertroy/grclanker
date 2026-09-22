@@ -3079,7 +3079,7 @@ async function assessGuarded(client, label) {
   };
   assertNoFabricatedValues(rendered, label);
   assertStatusesMatchRequests(rendered, recorder.requested, label);
-  return { results, findings, requested: recorder.requested };
+  return { results, findings, requested: recorder.requested, rendered };
 }
 
 test("rule 1 corollary: the corollary baseline passes every pass-capable finding with no collection errors", async () => {
@@ -3437,6 +3437,247 @@ test("rule 1 corollary bundle check: findings.json never carries NR-04, 09, 10, 
   const workloadsFile = JSON.parse(readFileSync(join(result.outputDir, "core_data", "workloads.json"), "utf8"));
   assert.match(workloadsFile.status, /^unreadable \(entitySearch\.workloads: /);
   assert.equal(workloadsFile.records, null);
+});
+
+// Round 5: a zero-scope collection is not collected. With actor.accounts unreadable (or answering zero accounts) and
+// no account_ids configured, no account-scoped query runs, so every account-scoped inventory is recorded as not
+// collected naming actor.accounts and the skipped query, never as a complete empty listing that 0 and [] fall out of.
+const ACCOUNT_SCOPED_SOURCES = COROLLARY_INVENTORIES.filter((row) => row.scope === "account" || row.scope === "monitor").map((row) => row.source);
+const ACCOUNT_SCOPED_FINDINGS = [4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17].map(controlId);
+const ZERO_SCOPE_PASS = [1, 2, 3, 19, 20].map(controlId);
+const OLD_ZERO_SCOPE_NOTE = "no scopes were available to query";
+// The two governance surfaces that are not account scoped: they answer even when no account resolved.
+const GLOBAL_GOVERNANCE_FILES = ["core_data/pipeline_cloud_rules.json", "core_data/dashboard_live_urls.json"];
+
+/** The corollary tenant with no configured account_ids and actor.accounts unreadable (`denied`) or answering zero accounts (`empty`). */
+function zeroScopeClient(mode) {
+  return corollaryClient({
+    getResolvedConfig: () => sampleConfig({ accountIds: [] }),
+    async resolveAccountIds() {
+      if (mode === "empty") throw new NewrelicNoAccountsError("No New Relic accounts were visible to the API key. Set NEW_RELIC_ACCOUNT_ID explicitly.");
+      throw forbidden("actor.accounts");
+    },
+    async listAccounts() {
+      if (mode === "empty") return [];
+      throw forbidden("actor.accounts");
+    },
+  });
+}
+
+/** Every never-collected core_data value is a marker with null records; nested markers (composite files) are checked the same way. */
+function assertNotCollectedMarkers(coreData, label, allowedArrays = []) {
+  for (const [file, value] of Object.entries(coreData)) {
+    if (Array.isArray(value)) {
+      assert.ok(allowedArrays.includes(file), `${label}: ${file} is written as an array (${value.length} rows) although its query never ran`);
+      continue;
+    }
+    const markers = "status" in value ? [value] : Object.values(value);
+    for (const marker of markers) {
+      // The script scan is derived twice over (monitor listing, then accounts), so its compacted cause keeps the path only.
+      assert.match(marker.status, /^not collected \(\S+ was not queried for any (account|monitor): .*actor\.accounts/, `${label}: ${file}`);
+      assert.equal(marker.records, null, `${label}: ${file} carries records beside a not-collected status`);
+    }
+  }
+}
+
+test("round 5 zero scope: with actor.accounts unreadable and no account_ids, account-scoped inventories are not collected and no account-scoped finding passes or fails", async () => {
+  for (const mode of ["denied", "empty"]) {
+    const label = `zero scope (${mode})`;
+    const { results, findings, requested, rendered } = await assessGuarded(zeroScopeClient(mode), label);
+    const cause = mode === "denied"
+      ? "actor\\.accounts was unreadable \\(NerdGraph returned errors: Not authorized \\(at actor\\.accounts\\)\\) and no account_ids were configured"
+      : "actor\\.accounts returned zero accounts and no account_ids were configured";
+
+    // actor.accounts was asked; nothing account or monitor scoped was.
+    assert.ok(requested.has("actor.accounts"), label);
+    assert.deepEqual(ACCOUNT_SCOPED_SOURCES.filter((source) => requested.has(source)), [], `${label}: account-scoped queries were issued without an account`);
+    assert.ok(!JSON.stringify(rendered).includes(OLD_ZERO_SCOPE_NOTE), `${label}: a zero-scope collection is still rendered as complete`);
+
+    // Only the findings that never read account-scoped data keep their verdicts; the rest are manual or warn, never fail.
+    assert.deepEqual(passing(findings).sort(), [...ZERO_SCOPE_PASS].sort(), `${label}: pass set`);
+    assert.deepEqual(findings.filter((item) => item.status === "fail").map((item) => item.id), [], `${label}: a verdict failed on never-collected data`);
+    for (const id of ACCOUNT_SCOPED_FINDINGS) {
+      const item = findingById({ findings }, id);
+      belowPass(item, label);
+      assert.ok(item.summary.includes("actor.accounts"), `${id} does not name actor.accounts ${label}: ${item.summary}`);
+    }
+
+    // NR-12 was the false HIGH FAIL: its primary inventory was never collected, so it is manual and names both queries.
+    const obfuscation = findingById({ findings }, controlId(12));
+    assert.equal(obfuscation.status, "manual", `${label}: ${obfuscation.summary}`);
+    assert.match(obfuscation.summary, /logConfigurations\.obfuscationRules/);
+    assert.doesNotMatch(obfuscation.summary, /across 0 accounts|No obfuscation rule with enabled = true exists/);
+    assert.equal(obfuscation.evidence.obfuscation_rules, null);
+    assert.match(obfuscation.evidence.obfuscation_rules_status, new RegExp(`^not collected \\(logConfigurations\\.obfuscationRules was not queried for any account: ${cause}\\)$`));
+    assert.equal(obfuscation.evidence.enabled_obfuscation_rules, null);
+    assert.equal(obfuscation.evidence.legacy_drop_rules, null);
+    assert.equal(obfuscation.evidence.log_events_last_day, null);
+    assert.equal(obfuscation.evidence.attribute_drop_rules, null, "the derived total is null when one of its inputs was never collected");
+    assert.match(obfuscation.evidence.attribute_drop_rules_status, /^not collected \(nrqlDropRules\.list was not queried for any account: actor\.accounts /);
+    assert.equal(obfuscation.evidence.pipeline_cloud_rules, 1, "the organization-wide cloud rule query ran and keeps its count");
+    assert.equal(obfuscation.evidence.pipeline_cloud_rules_status, "complete (entityManagement.pipelineCloudRules)");
+
+    // Every account-scoped category says the account scope is unknown and why.
+    for (const result of results.slice(1)) {
+      assert.equal(result.summary.accounts_in_scope, null, `${result.category} ${label}`);
+      assert.match(result.summary.accounts_in_scope_status, new RegExp(`^unknown \\(${cause}\\)$`), `${result.category} ${label}`);
+      assert.ok(result.errors.some((error) => error.includes("actor.accounts")), `${result.category} discloses actor.accounts in its errors ${label}`);
+    }
+    const [, accessControl, alerting, governance] = results;
+    assert.equal(alerting.summary.policies, null);
+    assert.match(alerting.summary.policies_status, /^not collected \(alerts\.policiesSearch was not queried for any account: actor\.accounts /);
+    assert.equal(governance.summary.enabled_obfuscation_rules, null);
+    assert.equal(governance.summary.log_events_last_day, null);
+    assert.equal(accessControl.summary.api_key_audit_events, null);
+    assert.match(accessControl.summary.api_key_audit_events_status, /^not collected \(nrql\.NrAuditEvent\.api_key_actor was not queried for any account: actor\.accounts /);
+
+    // core_data files for never-collected surfaces are markers, not [].
+    assertNotCollectedMarkers(alerting.coreData, `alerting ${label}`);
+    assertNotCollectedMarkers(governance.coreData, `data_governance ${label}`, GLOBAL_GOVERNANCE_FILES);
+    assert.equal(Object.keys(alerting.coreData).length, 7);
+    assert.equal(Object.keys(governance.coreData).length, 13);
+    assert.equal(governance.coreData["core_data/pipeline_cloud_rules.json"].length, 1);
+  }
+
+  // The exported bundle carries the same shape and the executive summary headlines no fail built on never-collected data.
+  const base = createTempBase("grclanker-newrelic-zero-scope-");
+  const result = await exportNewrelicAuditBundle(zeroScopeClient("denied"), sampleConfig({ accountIds: [] }), base, { now: NOW });
+  assert.equal(result.findingCount, 20);
+  const findings = JSON.parse(readFileSync(join(result.outputDir, "analysis", "findings.json"), "utf8"));
+  const byControl = (control) => findings.find((item) => item.control === control);
+  assert.equal(byControl(12).status, "manual", byControl(12).summary);
+  assert.deepEqual(findings.filter((item) => item.status === "fail"), []);
+  assert.deepEqual(findings.filter((item) => item.status === "pass").map((item) => item.control).sort((a, b) => a - b), [1, 2, 3, 19, 20]);
+  const executive = readFileSync(join(result.outputDir, "compliance", "executive_summary.md"), "utf8");
+  assert.match(executive, /^- Failed controls: 0$/m);
+  assert.match(executive, /^Accounts: none resolved$/m);
+  assert.doesNotMatch(executive, /across 0 accounts|No obfuscation rule with enabled = true exists|FAIL\)/);
+  assert.match(executive, /^- NR-12-LOG-OBFUSCATION: Partial view: .*logConfigurations\.obfuscationRules/m);
+  const obfuscationFile = JSON.parse(readFileSync(join(result.outputDir, "core_data", "obfuscation_rules.json"), "utf8"));
+  assert.match(obfuscationFile.status, /^not collected \(logConfigurations\.obfuscationRules was not queried for any account: actor\.accounts was unreadable/);
+  assert.equal(obfuscationFile.records, null);
+  const governanceJson = JSON.parse(readFileSync(join(result.outputDir, "analysis", "data_governance.json"), "utf8"));
+  assert.equal(governanceJson.summary.accounts_in_scope, null);
+  assert.equal(governanceJson.summary.enabled_obfuscation_rules, null);
+  const errorsLog = readFileSync(join(result.outputDir, "_errors.log"), "utf8");
+  assert.match(errorsLog, /^actor\.accounts: NerdGraph returned errors: Not authorized \(at actor\.accounts\)$/m);
+  assert.match(errorsLog, /^logConfigurations\.obfuscationRules was not queried for any account: actor\.accounts was unreadable/m);
+  assert.ok(!errorsLog.includes(OLD_ZERO_SCOPE_NOTE));
+});
+
+test("round 5 script scan: the synthetic script scan takes its status from the monitor listing it is computed from", async () => {
+  // Monitor search unreadable everywhere: no script was fetched, so the scan is not collected and every scan value is null.
+  const denied = await assessGuarded(denyInventories(corollaryClient(), [["entitySearch synthetic monitors", "full"]]), "monitor search denied");
+  assert.ok(!denied.requested.has("synthetics.script"), "no script query was issued without a monitor listing");
+  const monitorsDenied = findingById(denied, controlId(13));
+  assert.equal(monitorsDenied.status, "manual", monitorsDenied.summary);
+  assert.equal(monitorsDenied.evidence.monitors, null);
+  assert.equal(monitorsDenied.evidence.scripts_sampled, null);
+  assert.equal(monitorsDenied.evidence.scripts_sample_complete, null);
+  assert.equal(monitorsDenied.evidence.scripts_with_secret_indicators, null);
+  assert.equal(monitorsDenied.evidence.scripts_using_secure_credentials, null);
+  // Both accounts' monitor searches failed, so the compacted cause keeps the first path and counts the other scope.
+  assert.match(
+    monitorsDenied.evidence.scripts_status,
+    /^not collected \(synthetics\.script was not queried for any monitor: entitySearch\.syntheticMonitors was unreadable .*\(at actor\.entitySearch\); 1 more scope failed and is listed in the errors array\)$/,
+  );
+  assert.equal(monitorsDenied.evidence.scripts_sampled_status, monitorsDenied.evidence.scripts_status);
+  const governanceDenied = denied.results[3];
+  assert.equal(governanceDenied.summary.scripts_with_secret_indicators, null);
+  assert.equal(governanceDenied.summary.scripts_with_secret_indicators_status, monitorsDenied.evidence.scripts_status);
+  assert.deepEqual(governanceDenied.coreData["core_data/synthetic_script_scan.json"], { status: monitorsDenied.evidence.scripts_status, records: null });
+  assert.ok(governanceDenied.coverage.some((note) => note.startsWith("synthetic scripts: not collected (synthetics.script was not queried for any monitor: ")), JSON.stringify(governanceDenied.coverage));
+
+  // One account's monitor search unreadable: the scan over the readable monitors is partial, named after the denied scope.
+  const partial = await assessGuarded(denyInventories(corollaryClient(), [["entitySearch synthetic monitors", "partial"]]), "monitor search denied for one account");
+  const monitorsPartial = findingById(partial, controlId(13));
+  belowPass(monitorsPartial, "with one account's monitor search denied");
+  assert.equal(monitorsPartial.evidence.scripts_sampled, null);
+  assert.equal(monitorsPartial.evidence.scripts_sample_complete, null);
+  assert.match(monitorsPartial.evidence.scripts_status, /^partial: derived from entitySearch\.syntheticMonitors: 1 scope unreadable \(entitySearch\.syntheticMonitors: account 222: /);
+  assert.match(monitorsPartial.summary, /^Partial view: /);
+
+  // A complete listing without a scripted monitor: no script query is needed, and the status says what the empty scan rests on.
+  const baseClient = corollaryClient();
+  const unscripted = await assessGuarded({
+    ...baseClient,
+    async searchEntities(query) {
+      if (query.includes("MONITOR")) return [{ guid: "mon-111", name: "Ping 111", domain: "SYNTH", type: "MONITOR", monitorType: "SIMPLE", accountId: 111 }];
+      return baseClient.searchEntities(query);
+    },
+  }, "no scripted monitors");
+  assert.ok(!unscripted.requested.has("synthetics.script"));
+  const noScripts = findingById(unscripted, controlId(13));
+  assert.equal(noScripts.status, "manual", noScripts.summary);
+  assert.equal(noScripts.evidence.scripted_monitors, 0);
+  assert.equal(noScripts.evidence.scripts_sampled, 0);
+  assert.equal(noScripts.evidence.scripts_status, "complete (entitySearch.syntheticMonitors listed no scripted monitor, so no script was fetched)");
+});
+
+test("round 5 derived totals and option-derived lists carry their own status and render null when an input is unavailable", async () => {
+  const baseline = await assessGuarded(corollaryClient(), "derived totals baseline");
+  const obfuscation = findingById(baseline, controlId(12));
+  // One cloud rule deleting an attribute plus one DROP_ATTRIBUTES drop rule per account.
+  assert.equal(obfuscation.evidence.attribute_drop_rules, 3);
+  assert.equal(obfuscation.evidence.attribute_drop_rules_status, "complete (entityManagement.pipelineCloudRules, nrqlDropRules.list)");
+  assert.equal(baseline.results[3].summary.attribute_drop_rules, 3);
+  assert.equal(baseline.results[3].summary.attribute_drop_rules_status, obfuscation.evidence.attribute_drop_rules_status);
+  const channels = findingById(baseline, controlId(10));
+  assert.deepEqual(channels.evidence.approved_email_domains, ["example.com"]);
+  assert.equal(channels.evidence.approved_email_domains_status, "complete (actor.user)");
+  // Every count, list, map, or flag in the alerting and data governance summaries carries a status (region and the
+  // run's own error and limitation counts are not inventory values).
+  for (const result of baseline.results.slice(2)) {
+    for (const [key, value] of Object.entries(result.summary)) {
+      if (key.endsWith("_status") || ["region", "collection_errors", "coverage_limitations"].includes(key)) continue;
+      assert.ok(`${key}_status` in result.summary, `${result.category}.${key} (${JSON.stringify(value)}) has no status`);
+    }
+  }
+
+  // The cloud rule query denied: the derived total is null with a status naming the unreadable input, the drop rule count stays.
+  const cloudDenied = await assessGuarded(denyInventories(corollaryClient(), [["entityManagement.pipelineCloudRules", "full"]]), "cloud rules denied");
+  const cloudObfuscation = findingById(cloudDenied, controlId(12));
+  assert.equal(cloudObfuscation.status, "warn", cloudObfuscation.summary);
+  assert.equal(cloudObfuscation.evidence.attribute_drop_rules, null);
+  assert.match(cloudObfuscation.evidence.attribute_drop_rules_status, /^unreadable \(entityManagement\.pipelineCloudRules: .*\(at actor\.entityManagement\.entitySearch\)\)$/);
+  assert.equal(cloudObfuscation.evidence.legacy_drop_rules, 2);
+  assert.equal(cloudDenied.results[3].summary.attribute_drop_rules, null);
+
+  // actor.user denied: the approved domain list derived from it is null with its status, and NR-10 is limited naming the path.
+  const userDenied = await assessGuarded(denyInventories(corollaryClient(), [["actor.user", "full"]]), "actor.user denied");
+  const userChannels = findingById(userDenied, controlId(10));
+  assert.equal(userChannels.status, "warn", userChannels.summary);
+  assert.match(userChannels.summary, /actor\.user/);
+  assert.equal(userChannels.evidence.approved_email_domains, null);
+  assert.match(userChannels.evidence.approved_email_domains_status, /^unreadable \(actor\.user: .*\(at actor\.user\)\)$/);
+  assert.equal(userChannels.evidence.current_user_status, userChannels.evidence.approved_email_domains_status);
+  // Passing the option makes the list independent of actor.user.
+  const client = denyInventories(corollaryClient(), [["actor.user", "full"]]);
+  const withOption = await assessNewrelicAlerting(client, { approvedEmailDomains: ["example.com"] });
+  const optionChannels = findingById(withOption, controlId(10));
+  assert.deepEqual(optionChannels.evidence.approved_email_domains, ["example.com"]);
+  assert.equal(optionChannels.evidence.approved_email_domains_status, "complete (approved_email_domains option)");
+});
+
+test("round 5 partial denials: a partly readable inventory renders null beside a partial status naming the scope and path, and the gap leads the summary", async () => {
+  const cases = [
+    ["alerts.policiesSearch", 10, "alert_policies", /^partial: 1 scope unreadable \(alerts\.policiesSearch: account 222: NerdGraph returned errors: Not authorized \(at actor\.account\.alerts\.policiesSearch\)\)$/],
+    ["logConfigurations.obfuscationRules", 12, "enabled_obfuscation_rules", /^partial: 1 scope unreadable \(logConfigurations\.obfuscationRules: account 222: .*\(at actor\.account\.logConfigurations\.obfuscationRules\)\)$/],
+    ["entitySearch alertable entities", 9, "uncovered_entities", /^partial: 1 scope unreadable \(entitySearch\.alertable: account 222: .*\(at actor\.entitySearch\)\)$/],
+    ["userManagement.users", 19, "inactive_users", /^partial: 1 scope unreadable \(userManagement\.users: authentication domain Contractors: .*\(at actor\.organization\.userManagement\.authenticationDomains\.users\)\)$/],
+    ["dataManagement.eventRetentionRules", 11, "short_retention_rules", /^partial: 1 scope unreadable \(dataManagement\.eventRetentionRules: account 222: .*\(at actor\.account\.dataManagement\.eventRetentionRules\)\)$/],
+  ];
+  for (const [inventory, control, field, status] of cases) {
+    const context = `with ${inventory} denied for one scope`;
+    const { findings } = await assessGuarded(denyInventories(corollaryClient(), [[inventory, "partial"]]), context);
+    const item = findingById({ findings }, controlId(control));
+    belowPass(item, context);
+    assert.equal(item.evidence[field], null, `${item.id}.${field} renders a readable-scope value ${context}`);
+    assert.match(item.evidence[`${field}_status`], status, `${item.id}.${field}_status ${context}`);
+    // The incompleteness note comes first; no count from the readable scopes precedes it.
+    assert.match(item.summary, /^Partial view: [^.]*1 scope unreadable/, `${item.id} ${context}: ${item.summary}`);
+    assert.ok(item.summary.indexOf("Partial view") < item.summary.search(/\b\d+ /), `${item.id} states a count before the gap ${context}: ${item.summary}`);
+  }
 });
 
 test("exportNewrelicAuditBundle writes core data, analysis, compliance reports, and a zip archive", async () => {
