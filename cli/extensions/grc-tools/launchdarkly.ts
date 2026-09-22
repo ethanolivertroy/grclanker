@@ -1276,12 +1276,22 @@ function extractItems(payload: JsonRecord): JsonRecord[] {
 }
 
 // Only LaunchDarkly's documented JSON error fields (code, message) are quoted; anything else is described, never echoed,
-// so no reflected header or token from a proxy or WAF page can reach the bundle.
-function launchdarklyErrorDetail(response: Response, payload: JsonRecord | undefined, rawText: string): string | undefined {
+// so no reflected header or token from a proxy or WAF page can reach the bundle. The message is redacted before it is
+// cut to length: cutting first could leave the tail of a token that the whole-value scrub no longer recognizes.
+function launchdarklyErrorDetail(
+  response: Response,
+  payload: JsonRecord | undefined,
+  rawText: string,
+  redact: (text: string) => string,
+): string | undefined {
   if (rawText.trim().length === 0) return undefined;
   if (payload) {
-    const code = asString(payload.code);
-    const message = asString(payload.message)?.replace(/\s+/g, " ").slice(0, 300);
+    // LaunchDarkly's error codes are short identifiers (forbidden, unauthorized, rate_limited); anything else in the
+    // field is not the documented shape and is not quoted.
+    const rawCode = asString(payload.code);
+    const code = rawCode && /^[a-z0-9_-]{1,64}$/i.test(rawCode) ? rawCode : undefined;
+    const rawMessage = asString(payload.message);
+    const message = rawMessage === undefined ? undefined : scrubErrorText(redact(rawMessage)).replace(/\s+/g, " ").slice(0, 300);
     if (code && message) return `${code}: ${message}`;
     if (message) return message;
     if (code) return code;
@@ -1479,7 +1489,7 @@ export class LaunchdarklyApiClient {
 
       const payload = parseJsonSafely(rawText);
       if (!response.ok) {
-        const detail = launchdarklyErrorDetail(response, payload, rawText);
+        const detail = launchdarklyErrorDetail(response, payload, rawText, (text) => this.redact(text));
         throw new LaunchdarklyApiError(
           this.redact(`LaunchDarkly request failed (${statusLine(response)}) for ${endpoint}${detail ? `: ${detail}` : ""}`),
           response.status,
@@ -3741,9 +3751,11 @@ export async function assessLaunchdarklyFlagHygiene(
 
     const flagCreation = new Map(result.flags.map((flag) => [flagKey(flag), asTimestamp(flag.creationDate)]));
     const archivedFlags = new Set(result.flags.filter((flag) => asBoolean(flag.archived) === true).map(flagKey));
+    // A stale claim needs the flag's own record (archived state, creation date): a status whose flag was not in the
+    // readable flag listing (denied, truncated, or archived) is not judged.
     for (const status of result.statuses) {
       const key = flagStatusKey(status);
-      if (!key || archivedFlags.has(key)) continue;
+      if (!key || archivedFlags.has(key) || !flagCreation.has(key)) continue;
       const statusName = asString(status.name)?.toLowerCase();
       const lastRequested = asTimestamp(status.lastRequested);
       const created = flagCreation.get(key);
@@ -4422,7 +4434,7 @@ function buildQuickReference(): string {
     "- `core_data/collection_status.json` records, per listing (`inventories[]`), whether the read completed, the request and HTTP status of a failed read, how the read ended (complete or truncated at a cap), how many records were loaded, and the server total when the API exposes one; every flag and count is `null` for a read that did not complete, and `totals` counts those reads as unknown rather than as complete or untruncated.",
     "- Error strings in every file are scrubbed before they are recorded (LaunchDarkly key shapes, authorization and cookie values, credential-shaped key/value pairs, JWTs, and URL userinfo and query strings anywhere in the text); non-JSON error bodies are described by status, content type, and length, never echoed.",
     "- Finding evidence, assessment summaries, and analysis snapshots render `null` (never 0, [], or \"none\") for any count, list, or flag derived from an inventory that was not read; lists of named members, tokens, roles, environments, or flags are populated only from inventories that were actually read, and an empty list is asserted only from complete reads.",
-    "- Every HTTP status code and `GET /path` named in a finding, summary, access check surface, or error string is the request the run actually made and the response it observed.",
+    "- Every HTTP status code and request label (method plus path and query) named in a finding, summary, access check surface, or error string is the request the run actually made and the response it observed.",
     "- `analysis/` contains normalized findings plus one JSON summary per assessment category.",
     "- `compliance/` contains the executive summary, unified matrix, and per-framework reports (FedRAMP, CMMC, SOC 2, CIS, PCI-DSS, STIG, IRAP, ISMAP).",
     "- `_errors.log` appears only when some reads fail but the bundle still completes.",
