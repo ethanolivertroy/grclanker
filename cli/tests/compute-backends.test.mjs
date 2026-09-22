@@ -4,6 +4,7 @@ import { spawnSync } from "node:child_process";
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 
 import {
   COMPUTE_BACKEND_KINDS,
@@ -96,6 +97,10 @@ const RUNPOD_POD_JSON = JSON.stringify({
 // A profile path that never exists, so a real ~/.modal.toml on the test host cannot change
 // what the "no Modal credentials" cases observe.
 const MISSING_MODAL_CONFIG_PATH = join(tmpdir(), "grclanker-no-modal-profile-3f9c1a", ".modal.toml");
+
+// This repository's own ignore rules, copied into the temp repos so the planted secrets are
+// ignored files that were force-added, exactly the case the deny list exists for.
+const REPO_GITIGNORE = join(dirname(fileURLToPath(import.meta.url)), "..", "..", ".gitignore");
 
 function createFakeRunner(handler) {
   const calls = [];
@@ -944,6 +949,125 @@ test("runpod pod staging uploads the git index only and never a planted secret",
       assert.equal(isSensitiveStagingPath(path), false, path);
     }
     assert.ok(RUNPOD_STAGING_DENYLIST.includes("*service-account*.json"));
+  } finally {
+    rmSync(repo, { recursive: true, force: true });
+  }
+});
+
+test("runpod pod staging denies the whole .env family and every gitignore secret name even when force-added", async () => {
+  const repo = mkdtempSync(join(tmpdir(), "grclanker-pod-deny-"));
+  // Every path below is ignored by this repository's own .gitignore and then force-added, the way
+  // a credential file lands in the index by mistake. Each carries a distinct canary.
+  const forceAdded = {
+    ".envrc": "export PLANTED=fake-envrc-canary-a1\n",
+    ".env.local": "PLANTED=fake-env-local-canary-b2\n",
+    ".env.production": "PLANTED=fake-env-production-canary-c3\n",
+    ".environment": "PLANTED=fake-environment-canary-d4\n",
+    "nested/dir/.envrc": "export PLANTED=fake-nested-envrc-canary-e5\n",
+    "nested/.envs/token.txt": "fake-env-directory-canary-f6\n",
+    "deploy/my.service-account.v2.json": "{\"private_key\":\"fake-service-account-v2-canary-g7\"}\n",
+    "deploy/service-account.json": "{\"private_key\":\"fake-service-account-plain-canary-h8\"}\n",
+    "ops/.okta.yaml": "okta:\n  token: fake-okta-canary-i9\n",
+    "data/export/x.zip": "fake-export-canary-j0\n",
+    "audits/oscal-workspace/y.json": "{\"token\":\"fake-oscal-canary-k1\"}\n",
+    "config/client_secret.json": "{\"client_secret\":\"fake-client-secret-canary-l2\"}\n",
+    "config/app-client_secret.prod.json": "{\"client_secret\":\"fake-client-secret-glob-canary-m3\"}\n",
+    "config/app-client-secret.json": "{\"client_secret\":\"fake-client-secret-dash-canary-n4\"}\n",
+    "svc/prod.credentials.json": "{\"secret\":\"fake-credentials-suffix-canary-o5\"}\n",
+    "svc/robot.sa.json": "{\"private_key\":\"fake-sa-json-canary-p6\"}\n",
+    "legacy/Credentials.JSON": "{\"secret\":\"fake-case-canary-q7\"}\n",
+    ".dev.vars": "PLANTED=fake-dev-vars-canary-r8\n",
+    ".dev.vars.production": "PLANTED=fake-dev-vars-production-canary-s9\n",
+    ".secrets/token.txt": "fake-secrets-dir-canary-t0\n",
+    "keys/id_rsa": "fake-id-rsa-canary-u1\n",
+    "keys/server.key": "fake-server-key-canary-v2\n",
+    "keys/apns.p8": "fake-p8-canary-w3\n",
+    "keys/putty.ppk": "fake-ppk-canary-x4\n",
+    "keys/store.jks": "fake-jks-canary-y5\n",
+    "keys/store.keystore": "fake-keystore-canary-z6\n",
+    "keys/bundle.p12": "fake-p12-canary-a7\n",
+  };
+  // Ordinary tracked files, including names that merely contain "env", the negated
+  // `.dev.vars.example` template, and a public key half, must still stage.
+  const ordinary = {
+    "README.md": "# tracked\n",
+    "environment.md": "# environment notes\n",
+    "config/envelope.ts": "export const envelope = true;\n",
+    "guides/env.md": "# env guide\n",
+    "src/exporter.ts": "export const exporter = true;\n",
+    ".dev.vars.example": "PLANTED=replace-me\n",
+    "keys/id_ed25519.pub": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIPublicHalfOnly comment\n",
+  };
+  try {
+    git(repo, "init", "-q");
+    plant(repo, ".gitignore", readFileSync(REPO_GITIGNORE, "utf8"));
+    for (const [relativePath, contents] of Object.entries(ordinary)) plant(repo, relativePath, contents);
+    git(repo, "add", ".gitignore", ...Object.keys(ordinary));
+    for (const [relativePath, contents] of Object.entries(forceAdded)) plant(repo, relativePath, contents);
+    git(repo, "add", "-f", ...Object.keys(forceAdded));
+    git(repo, "-c", "user.email=test@example.invalid", "-c", "user.name=test", "commit", "-q", "-m", "force-added secrets");
+
+    // Everything planted is in the index now, so only the deny layer can keep it local.
+    const index = git(repo, "ls-files", "--cached").split("\n").filter(Boolean);
+    for (const relativePath of Object.keys(forceAdded)) assert.ok(index.includes(relativePath), `${relativePath} should be tracked`);
+    const expectedFiles = [".gitignore", ...Object.keys(ordinary)].sort();
+
+    const plan = await planPodWorkspaceStaging(repo, createProcessCommandRunner());
+    assert.deepEqual([...plan.files].sort(), expectedFiles);
+    assert.deepEqual([...plan.excluded].sort(), Object.keys(forceAdded).sort());
+    assert.deepEqual(plan.skipped, []);
+
+    const realRunner = createProcessCommandRunner();
+    let uploaded;
+    const { runner, calls } = createFakeRunner(async (executable, args) => {
+      if (executable === "git") return realRunner(executable, args);
+      if (executable === "scp") {
+        const stageRoot = args.at(-2).slice(0, -2);
+        const files = listFilesRecursively(stageRoot);
+        uploaded = { files, contents: Object.fromEntries(files.map((file) => [file, readFileSync(join(stageRoot, file), "utf8")])) };
+      }
+      return { exitCode: 0 };
+    });
+    await withEnv({ RUNPOD_API_KEY: "rpa_podkey_ABCDEFG", RUNPOD_POD_ID: "pod42" }, async () => {
+      const backend = createRunpodPodBackend({ fetch: async () => new Response(RUNPOD_POD_JSON, { status: 200 }), runner });
+      const staged = await backend.stageWorkspace({ localPath: repo, sessionId: "sess" });
+      assert.match(staged.detail, new RegExp(`^copied ${expectedFiles.length} tracked files \\(${Object.keys(forceAdded).length} sensitive paths excluded, `));
+    });
+
+    assert.deepEqual(uploaded.files, expectedFiles);
+    for (const [relativePath, contents] of Object.entries(ordinary)) assert.equal(uploaded.contents[relativePath], contents);
+    const remoteArgs = calls.filter((call) => call.executable !== "git").flatMap((call) => call.args);
+    assert.deepEqual(calls.map((call) => call.executable), ["git", "ssh", "scp"]);
+    const stagedText = Object.values(uploaded.contents).join("\n") + remoteArgs.join("\n");
+    for (const [relativePath, contents] of Object.entries(forceAdded)) {
+      const canary = /fake-[a-z0-9-]+/.exec(contents)[0];
+      assert.ok(!uploaded.files.includes(relativePath), `${relativePath} reached the materialized copy`);
+      assert.ok(!remoteArgs.some((arg) => arg.includes(relativePath)), `${relativePath} appeared in an ssh or scp argument`);
+      assert.ok(!stagedText.includes(canary), `canary ${canary} from ${relativePath} reached the upload`);
+    }
+
+    // The predicate itself, including the flip of `.envrc` from allowed to denied and the names
+    // that were re-checked against .gitignore and AGENTS.md.
+    for (const path of [
+      ".envrc", ".env.local", ".env.production", ".environment", ".ENV", "nested/dir/.envrc", "a/.envs/b.txt",
+      "deploy/my.service-account.v2.json", "acme-service-account.json", "service-account.json", "Service-Account.JSON",
+      "ops/.okta.yaml", "data/export/x.zip", "deep/oscal-workspace/y", ".secrets/x", ".secrets",
+      ".dev.vars", ".dev.vars.local", "worker/.dev.vars",
+      "x/prod.credentials.json", "x/robot.sa.json", "x/app-client-secret.json", "x/app-client_secret.v2.json", "legacy/Credentials.JSON",
+      "k/apns.p8", "k/putty.ppk", "k/store.jks", "k/store.keystore", "k/bundle.p12", "k/bundle.pfx", "k/server.PEM", "k/id_ecdsa",
+    ]) {
+      assert.equal(isSensitiveStagingPath(path), true, path);
+    }
+    for (const path of [
+      "README.md", "src/exporter.ts", "environment.md", "id_ed25519.pub", "docs/env.md", "config/envelope.ts",
+      ".dev.vars.example", "env/config.ts", "envrc", "export.ts", "my-export/x.txt", "exports/x.txt", "secrets/x.txt", "keys/notes.txt",
+    ]) {
+      assert.equal(isSensitiveStagingPath(path), false, path);
+    }
+    for (const entry of [".env*", ".dev.vars*", "!.dev.vars.example", ".secrets/", "*.credentials.json", "*client-secret*.json", "*.sa.json", "*.p8", "*.ppk"]) {
+      assert.ok(RUNPOD_STAGING_DENYLIST.includes(entry), entry);
+    }
+    assert.ok(!RUNPOD_STAGING_DENYLIST.includes(".env.*"), "the narrow .env.* entry is replaced by the .env* family");
   } finally {
     rmSync(repo, { recursive: true, force: true });
   }

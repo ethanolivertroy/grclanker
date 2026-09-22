@@ -322,49 +322,90 @@ export type PodStagingPlan = {
 
 // The staged set is the git index (`git ls-files --cached`), never a directory walk, so ignored
 // files (.env, credentials.json, export/, oscal-workspace/, ...) cannot reach the pod. The deny
-// list below is applied on top of that for the paths this repository's .gitignore and AGENTS.md
-// name as secrets, so a copy that was committed by mistake stays local too. Documented as
-// RUNPOD_STAGING_DENYLIST in the compute backends guide.
+// list below is applied on top of that for every path this repository's .gitignore and AGENTS.md
+// name as a secret or a local artifact, so a copy that was committed or force-added by mistake
+// stays local too. Matching is case-insensitive, which is stricter than git's default
+// case-sensitive ignore rules: the list is a safety net, so over-excluding `Credentials.JSON` is
+// the safe direction. Documented as RUNPOD_STAGING_DENYLIST in the compute backends guide.
 export const RUNPOD_STAGING_DENYLIST: readonly string[] = [
-  ".env",
-  ".env.*",
+  ".env*",
+  ".dev.vars*",
+  "!.dev.vars.example",
+  ".secrets/",
   ".okta.yaml",
   "credentials.json",
+  "*.credentials.json",
   "client_secret.json",
+  "*client_secret*.json",
+  "*client-secret*.json",
+  "service-account.json",
   "*service-account*.json",
+  "*.sa.json",
   "export/",
   "oscal-workspace/",
   "*.pem",
   "*.key",
   "*.p12",
   "*.pfx",
+  "*.p8",
+  "*.ppk",
+  "*.jks",
+  "*.keystore",
   "id_rsa",
   "id_dsa",
   "id_ecdsa",
   "id_ed25519",
 ];
 
-const SENSITIVE_DIRECTORY_SEGMENTS = new Set(["export", "oscal-workspace"]);
+// Directory names that mark everything below them as sensitive (`export/`, `oscal-workspace/`,
+// `.secrets/` in .gitignore), plus the `.env*` and `.dev.vars*` families when used as directories.
+const SENSITIVE_DIRECTORY_SEGMENTS = new Set(["export", "oscal-workspace", ".secrets"]);
 const SENSITIVE_BASENAMES = new Set([
   ".okta.yaml",
+  ".secrets",
   "credentials.json",
   "client_secret.json",
+  "service-account.json",
   "id_rsa",
   "id_dsa",
   "id_ecdsa",
   "id_ed25519",
 ]);
-const SENSITIVE_BASENAME_PATTERNS = [/^\.env(\.|$)/, /service-account.*\.json$/i, /\.(pem|key|p12|pfx)$/i];
+// The whole `.env*` family: .env, .envrc, .env.local, .env.production, .environment, and any
+// other name that starts with `.env`. Names that merely contain "env" (environment.md,
+// config/envelope.ts, docs/env.md) do not start with `.env` and stay eligible.
+const ENV_FAMILY_PATTERN = /^\.env/;
+// Cloudflare `.dev.vars*` secrets; .gitignore negates the committed template with
+// `!.dev.vars.example`, so that one name is allowed through.
+const DEV_VARS_PATTERN = /^\.dev\.vars/;
+const DEV_VARS_TEMPLATE = ".dev.vars.example";
+const SENSITIVE_BASENAME_PATTERNS = [
+  /service-account.*\.json$/,
+  /client[_-]secret.*\.json$/,
+  /\.credentials\.json$/,
+  /\.sa\.json$/,
+  // Private key material: PEM, generic .key, PKCS#12, PKCS#8, PuTTY, and Java keystores. Public
+  // halves (`id_ed25519.pub`) stay eligible.
+  /\.(pem|key|p12|pfx|p8|ppk|jks|keystore)$/,
+];
+
+function isSensitiveFamilyName(name: string): boolean {
+  if (ENV_FAMILY_PATTERN.test(name)) return true;
+  return DEV_VARS_PATTERN.test(name) && name !== DEV_VARS_TEMPLATE;
+}
 
 export function isSensitiveStagingPath(relativePath: string): boolean {
-  const segments = relativePath.split("/").filter((segment) => segment.length > 0);
+  const segments = relativePath
+    .split("/")
+    .filter((segment) => segment.length > 0)
+    .map((segment) => segment.toLowerCase());
   if (segments.length === 0) return false;
   const basename = segments[segments.length - 1]!;
   const directories = segments.slice(0, -1);
-  if (directories.some((segment) => SENSITIVE_DIRECTORY_SEGMENTS.has(segment) || /^\.env(\.|$)/.test(segment))) {
+  if (directories.some((segment) => SENSITIVE_DIRECTORY_SEGMENTS.has(segment) || isSensitiveFamilyName(segment))) {
     return true;
   }
-  if (SENSITIVE_BASENAMES.has(basename)) return true;
+  if (SENSITIVE_BASENAMES.has(basename) || isSensitiveFamilyName(basename)) return true;
   return SENSITIVE_BASENAME_PATTERNS.some((pattern) => pattern.test(basename));
 }
 
