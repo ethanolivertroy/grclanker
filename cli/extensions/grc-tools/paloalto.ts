@@ -1742,6 +1742,8 @@ export class PrismaCloudClient {
     this.prismaId = asString(asRecords(payload?.customerNames)[0]?.prismaId) ?? this.prismaId;
     this.token = token;
     this.tokenExpiresAt = Date.now() + PRISMA_TOKEN_TTL_MS;
+    // The session token is a secret this client now holds, for guard 2 at every sink.
+    if (!this.http.secrets.includes(token)) this.http.secrets.push(token);
     return token;
   }
 
@@ -1938,6 +1940,7 @@ export class PrismaComputeClient {
     }
     this.bearer = token;
     this.bearerExpiresAt = Date.now() + PRISMA_TOKEN_TTL_MS;
+    if (!this.http.secrets.includes(token)) this.http.secrets.push(token);
     return { authorization: `Bearer ${token}` };
   }
 

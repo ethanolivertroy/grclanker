@@ -1505,6 +1505,36 @@ test("describePrismaErrorBody and PanosApiClient.parseResponse describe non-JSON
   });
 });
 
+test("the session tokens the clients obtain join the configured secrets, so a name-shaped token echoed bare in an error body still goes", async () => {
+  // Both tokens are name-shaped on purpose: no carrier or token-shape rule would touch
+  // them bare in prose, so their absence proves guard 2 learned them at login.
+  const sessionToken = "session-fixture-lantern-2026";
+  const computeToken = "compute-fixture-harbor-2026";
+  const client = new PrismaCloudClient({ apiUrl: "https://api2.prismacloud.io", accessKeyId: "k", secretKey: "s" }, {
+    fetchImpl: async (input) => {
+      const { pathname } = new URL(input);
+      if (pathname === "/login") return jsonResponse({ token: sessionToken });
+      if (pathname === "/api/v1/authenticate") return jsonResponse({ token: computeToken });
+      const echoed = pathname.startsWith("/api/v1") ? computeToken : sessionToken;
+      return jsonResponse({ message: `upstream rejected ${echoed} for this tenant` }, { status: 403 });
+    },
+    retryAttempts: 0,
+  });
+  assert.ok(!client.knownSecrets.includes(sessionToken), "the token is not known before login");
+  await assert.rejects(client.listPolicies(), (error) => {
+    assert.equal(error.message, "Prisma Cloud GET /v2/policy failed (403): upstream rejected [REDACTED] for this tenant");
+    return true;
+  });
+  assert.ok(client.knownSecrets.includes(sessionToken), "the session token is a known secret after login");
+  const compute = new PrismaComputeClient("https://console.example.com", client);
+  await assert.rejects(compute.get("/defenders"), (error) => {
+    assert.equal(error.message, "Prisma Cloud Compute GET /defenders failed (403): upstream rejected [REDACTED] for this tenant");
+    return true;
+  });
+  assert.ok(client.knownSecrets.includes(computeToken), "the Compute token is a known secret after authenticate");
+  assert.equal(new Set(client.knownSecrets).size, client.knownSecrets.length, "a refreshed token is registered once");
+});
+
 test("exportPaloaltoAuditBundle and the assessment results never carry Prisma Cloud or Compute credentials while verdicts still read the same evidence", async () => {
   const base = createTempBase("grclanker-paloalto-prisma-secrets-");
   const secrets = Object.values(FAKE_PRISMA_SECRETS);
