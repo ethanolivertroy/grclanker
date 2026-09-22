@@ -21,24 +21,42 @@
  * forms are computed here, independently of the implementation.
  */
 import assert from "node:assert/strict";
+import { assertFragmentsAbsent, shortestWindows } from "./planted-values.mjs";
 
 export const REDACTED = "[REDACTED]";
 
-/** Name-shaped (the ruling's own example): three word segments and one numeric segment. */
-export const NAME_SHAPED_CANARY = "sess-canary-COOKIE-31415926535897";
+/**
+ * Name-shaped like the ruling's own example (sess-canary-COOKIE-31415926535897): three word segments
+ * and one numeric segment, but random-looking so no 6-character window of it can coincide with a
+ * carrier label or ordinary prose. Its removal from a carrier can only come from the carrier guard.
+ */
+export const NAME_SHAPED_CANARY = "vqzk-xwjr-HTBM-40928375611";
 
 /**
  * Two secrets to register: one name-shaped, so its bare removal can only come from registration,
  * and one whose every encoded form differs from the raw form.
  */
 export const REGISTERED_SECRETS = {
-  nameShaped: "registered-secret-canary-2026",
-  symbolic: 'can@ry+secret/value="2026"',
+  nameShaped: "qhvz-wkxj-YRPL-7261",
+  symbolic: 'Vq7@kZ+2/wP="9rT4x"',
 };
+
+(() => {
+  const owners = new Map();
+  for (const [name, value] of [["NAME_SHAPED_CANARY", NAME_SHAPED_CANARY], ...Object.entries(REGISTERED_SECRETS)]) {
+    for (const window of shortestWindows(value)) {
+      const owner = owners.get(window);
+      assert.equal(owner, undefined, `window ${window} appears in both ${owner} and ${name}`);
+      owners.set(window, name);
+      assert.equal(window.includes(REDACTED.slice(0, 3)), false, `window ${window} of ${name} overlaps the redaction marker`);
+    }
+  }
+})();
 
 /** Bare name-shaped values and ordinary operator prose that must come through verbatim. */
 export const MUST_KEEP = [
   "Region prod-us-east-2026 rejected the request",
+  "session sess-canary-COOKIE-31415926535897 closed",
   `session ${NAME_SHAPED_CANARY} closed`,
   "table sys_user_has_role and sys_user_grmember were read for Acme_Production_Org",
   "cipher TLS_AES_256_GCM_SHA384 on acme-corp-dev12345.example.com with oauth2-client-credentials",
@@ -142,8 +160,9 @@ export function encodedForms(secret) {
   assert.equal(encodedForms(REGISTERED_SECRETS.nameShaped).length, 3, "the name-shaped secret has distinct base64 and base64url forms only");
 })();
 
+/** Removed means no substring of the value at lengths 6 through 24 survives and the marker took its place. */
 function assertRemoved(output, value, label) {
-  assert.equal(output.includes(value), false, `${label}: value survived: ${JSON.stringify(output)}`);
+  assertFragmentsAbsent(assert, output, [value], `${label}: output ${JSON.stringify(output)}`);
   assert.ok(output.includes(REDACTED), `${label}: no redaction marker: ${JSON.stringify(output)}`);
 }
 

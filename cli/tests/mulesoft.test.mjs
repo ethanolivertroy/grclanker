@@ -33,8 +33,9 @@ import {
   resolveSecureOutputPath,
 } from "../dist/extensions/grc-tools/mulesoft.js";
 import { getRegisteredToolSummaries } from "../dist/pi/tool-catalog.js";
-import { assertSecretsAbsent, readBundleFiles, readZipEntries } from "./helpers/bundle-contents.mjs";
-import { assertConfigLoaderMatrix, configLoaderCases } from "./helpers/config-loader-matrix.mjs";
+import { assertSecretFragmentsAbsent, readBundleFiles, readZipEntries } from "./helpers/bundle-contents.mjs";
+import { CONFIG_CANARIES, assertConfigLoaderMatrix, configLoaderCases } from "./helpers/config-loader-matrix.mjs";
+import { assertFragmentsAbsent, assertPlantedValuesWellFormed } from "./helpers/planted-values.mjs";
 import { assertScrubBoundary } from "./helpers/scrub-boundary-matrix.mjs";
 
 const DAY_MS = 24 * 60 * 60 * 1000;
@@ -48,13 +49,23 @@ function isoDaysFromNow(days) {
   return new Date(Date.now() + days * DAY_MS).toISOString();
 }
 
+/** The configured bearer token and the credentials echoed by fixtures: planted, so random-looking (see the planted-values self-check). */
+const SAMPLE_TOKEN = "zS8UnCR3BnceRQyrBb";
+const PLANTED = {
+  echoedClientSecret: "HmRgJvEWE6WKZWgN3j",
+  bearer: "6aqyv2X4mZXxphbTmg",
+  clientSecret: "h2fpZsVuYwfaNAVJZv",
+  password: "5BL3GwUzeH3x5BGRGE",
+  configuredSecret: "9dUvtkD5mgQkKTzZvj",
+};
+
 function sampleConfig(overrides = {}) {
   return {
     organizationId: ORG_ID,
     controlPlane: "us",
     baseUrl: "https://anypoint.mulesoft.com",
     authMode: "token",
-    token: "anypoint-token",
+    token: SAMPLE_TOKEN,
     environmentFilter: [],
     timeoutMs: 30000,
     sourceChain: ["tests"],
@@ -554,7 +565,7 @@ test("MulesoftApiClient uses a pre-issued token without exchanging credentials",
   assert.equal(organization.name, "Acme");
   assert.equal(seen.length, 1);
   assert.equal(seen[0].pathname, `/accounts/api/organizations/${ORG_ID}`);
-  assert.equal(seen[0].auth, "Bearer anypoint-token");
+  assert.equal(seen[0].auth, `Bearer ${SAMPLE_TOKEN}`);
 });
 
 test("MulesoftApiClient retries 429 and 5xx responses with backoff", async () => {
@@ -585,7 +596,7 @@ test("MulesoftApiClient retries 429 and 5xx responses with backoff", async () =>
 test("MulesoftApiClient surfaces non-retryable errors with status and redacted secrets", async () => {
   const sleeps = [];
   const fetchImpl = async () => jsonResponse(
-    { error: "forbidden", message: "Not allowed for client_secret=top-secret-value with Bearer anypoint-token" },
+    { error: "forbidden", message: `Not allowed for client_secret=${PLANTED.echoedClientSecret} with Bearer ${SAMPLE_TOKEN}` },
     { status: 403, statusText: "Forbidden" },
   );
   const client = new MulesoftApiClient(sampleConfig(), {
@@ -602,8 +613,7 @@ test("MulesoftApiClient surfaces non-retryable errors with status and redacted s
       assert.equal(error.status, 403);
       assert.match(error.message, /403/);
       assert.match(error.message, /\/accounts\/api\/organizations\/org-1\/members/);
-      assert.doesNotMatch(error.message, /top-secret-value/);
-      assert.doesNotMatch(error.message, /anypoint-token/);
+      assertFragmentsAbsent(assert, error.message, [PLANTED.echoedClientSecret, SAMPLE_TOKEN], "403 error message echoing credentials");
       return true;
     },
   );
@@ -640,11 +650,8 @@ test("redaction helpers mask secret-bearing keys and token text", () => {
   assert.equal(redacted.nested[0].name, "ok");
   assert.equal(redacted.authorization, "[REDACTED]");
 
-  const text = redactSecretText("Authorization: Bearer abc.def-ghi, client_secret=super-secret, \"password\": \"pw123\" body my-token-value", ["my-token-value"]);
-  assert.doesNotMatch(text, /abc\.def-ghi/);
-  assert.doesNotMatch(text, /super-secret/);
-  assert.doesNotMatch(text, /pw123/);
-  assert.doesNotMatch(text, /my-token-value/);
+  const text = redactSecretText(`Authorization: Bearer ${PLANTED.bearer}, client_secret=${PLANTED.clientSecret}, "password": "${PLANTED.password}" body ${PLANTED.configuredSecret}`, [PLANTED.configuredSecret]);
+  assertFragmentsAbsent(assert, text, [PLANTED.bearer, PLANTED.clientSecret, PLANTED.password, PLANTED.configuredSecret], "redactSecretText output");
 });
 
 test("checkMulesoftAccess reports a healthy organization when every surface is readable", async () => {
@@ -2591,26 +2598,27 @@ test("optional: AUD-17 records the audit log retention period as evidence withou
 
 // Verdict safety rules 9 and 10 (export credential hygiene and pagination truncation), plus the rule 1 corollary.
 
+/** Random-looking alphanumeric planted secrets; the bundle and zip scans check every substring of them at lengths 6 through 24. */
 const FAKE_MULESOFT_SECRETS = {
-  connectedAppSecret: "FAKE-MULESOFT-CONNECTED-APP-SECRET-01",
-  oidcClientSecret: "FAKE-MULESOFT-OIDC-CLIENT-SECRET-02",
-  mqClientSecret: "FAKE-MULESOFT-MQ-CLIENT-SECRET-03",
-  cloudhubApiKey: "FAKE-MULESOFT-CLOUDHUB-API-KEY-04",
-  cloudhubJdbcPassword: "FAKE-MULESOFT-JDBC-PASSWORD-05",
-  cloudhubPlainProperty: "FAKE-MULESOFT-PLAIN-PROPERTY-VALUE-06",
-  policyTextKey: "FAKE-MULESOFT-JWT-TEXT-KEY-07",
-  policyHeaderValue: "FAKE-MULESOFT-HEADER-BEARER-08",
-  policyClientSecret: "FAKE-MULESOFT-POLICY-CLIENT-SECRET-09",
-  auditPayloadSecret: "FAKE-MULESOFT-AUDIT-PAYLOAD-SECRET-10",
-  exchangeUrlToken: "FAKE-MULESOFT-EXCHANGE-URL-TOKEN-11",
-  alertWebhookToken: "FAKE-MULESOFT-ALERT-WEBHOOK-TOKEN-12",
-  secretGroupValue: "FAKE-MULESOFT-SECRET-GROUP-VALUE-13",
-  loadBalancerPrivateKey: "FAKE-MULESOFT-DLB-PRIVATE-KEY-14",
-  organizationAccessKey: "FAKE-MULESOFT-ORGANIZATION-ACCESS-KEY-15",
-  serverCredential: "FAKE-MULESOFT-HYBRID-SERVER-CREDENTIAL-16",
-  vpnPresharedKey: "FAKE-MULESOFT-VPN-PRESHARED-KEY-17",
-  serverRegistrationKey: "FAKE-MULESOFT-SERVER-REGISTRATION-KEY-18",
-  alertWebhookPathToken: "FAKE-MULESOFT-ALERT-WEBHOOK-PATH-TOKEN-19",
+  connectedAppSecret: "wUVX8UCFMdjtBgL4TL",
+  oidcClientSecret: "TscV6cNhpsMdCpaFuP",
+  mqClientSecret: "5jvpnK4cuqE5bd8ESd",
+  cloudhubApiKey: "J8srNkQC7YrwHjF5eY",
+  cloudhubJdbcPassword: "82BzRHwkheLNAwayXu",
+  cloudhubPlainProperty: "eEYxETD3E7ucsEBmZ2",
+  policyTextKey: "KCFpPdp6JcCkEKxWtV",
+  policyHeaderValue: "TCVqBTy5UMeLQhJ4kU",
+  policyClientSecret: "bmreKj2rqjDtkNE4Hz",
+  auditPayloadSecret: "GgJvJG5gjJqDXc5hLN",
+  exchangeUrlToken: "sz8rQcmHDrurRdFAeQ",
+  alertWebhookToken: "DVc8cAxc3V73Vqt6e7",
+  secretGroupValue: "pZvH4eWJ57cMuBga5N",
+  loadBalancerPrivateKey: "zfRMRp7nDygejtnkdm",
+  organizationAccessKey: "BeZzmaRmeqXpKGLa5k",
+  serverCredential: "SCRragWfu3gVEZWS7v",
+  vpnPresharedKey: "7Ns9b9DJjEj8cJj9cM",
+  serverRegistrationKey: "tF7Yvm3gKVjL4eyXvG",
+  alertWebhookPathToken: "QWFbud4ugH3fGdPzv8",
 };
 
 function secretBearingBundleClient() {
@@ -2820,10 +2828,10 @@ test("verdict safety rule 9: exportMulesoftAuditBundle never writes connected ap
   ]) {
     assert.ok(files.has(file), `expected ${file} in ${[...files.keys()].join(", ")}`);
   }
-  assertSecretsAbsent(assert, files, secrets, "bundle directory");
+  assertSecretFragmentsAbsent(assert, files, secrets, "bundle directory");
   const zipEntries = readZipEntries(result.zipPath);
   assert.equal(zipEntries.size, files.size, "the zip carries exactly the written files");
-  assertSecretsAbsent(assert, zipEntries, secrets, "zip archive");
+  assertSecretFragmentsAbsent(assert, zipEntries, secrets, "zip archive");
 
   const payloads = JSON.stringify([
     await checkMulesoftAccess(client),
@@ -3139,11 +3147,15 @@ test("review round items 7 and 8: denied Anypoint datasets are written as not-co
   assert.equal(truncatedProviders.summary.identity_providers_truncated, true);
 });
 
+/** Random-looking alphanumeric canaries; the leak assertions check every substring of them at lengths 6 through 24. */
 const MS_CANARY = {
-  bearer: "MSCANARY-BEARER-TOKEN-ab12cd34ef56",
-  cookie: "MSCANARY-SESSION-COOKIE-9f8e7d6c5b4a",
-  apiKey: "MSCANARY-API-KEY-1122334455aabb",
-  urlToken: "MSCANARY-URL-TOKEN-ccddeeff0011",
+  bearer: "84mB6BU92Uw8NYAD4Z",
+  cookie: "8hHTkNDdRNVq6273cm",
+  apiKey: "puGsP4hvM4Gp6YaHTw",
+  urlToken: "WJ4yHcfVzvCgStgZAx",
+  // The configured connected-app secret of the canary client and the bearer its token endpoint issues.
+  clientSecret: "5FYVrSz8PxBN9R3U8m",
+  accessToken: "nMyDpGtQfqmSt3xNY4",
 };
 const MS_CANARY_VALUES = Object.values(MS_CANARY);
 const MS_CANARY_URL = `https://api.example.com/v1/x?token=${MS_CANARY.urlToken}`;
@@ -3213,7 +3225,7 @@ function msCanaryFetch(failing) {
   };
   const loadBalancer = { id: "lb-1", name: "prod-dlb", domain: "prod-dlb.lb.anypointdns.net", vpcId: "vpc-1", httpMode: "redirect", tlsv1: false, tlsv13: true, state: "STARTED", defaultCipherSuite: STRONG_CIPHER_SUITE };
   const healthy = {
-    "oauth2/token": () => jsonResponse({ access_token: "live-anypoint-token-0123456789", expires_in: 3600 }),
+    "oauth2/token": () => jsonResponse({ access_token: MS_CANARY.accessToken, expires_in: 3600 }),
     me: () => jsonResponse({ user: { id: "u1", username: "alice" } }),
     organization: () => jsonResponse({ id: ORG_ID, name: "Acme", isFederated: true, entitlements: { createSubOrgs: true } }),
     hierarchy: () => jsonResponse({ id: ORG_ID, isRoot: true, subOrganizations: [{ id: "bg-1", name: "Payments" }] }),
@@ -3273,9 +3285,9 @@ function msCanaryFetch(failing) {
   };
 }
 
+/** No canary survives in any substring at lengths 6 through 24. */
 function assertMsCanariesAbsent(text, label) {
-  for (const value of MS_CANARY_VALUES) assert.ok(!text.includes(value), `${label} leaked canary ${value}`);
-  assert.ok(!text.includes("token=MSCANARY"), `${label} leaked the URL query string`);
+  assertFragmentsAbsent(assert, text, MS_CANARY_VALUES, label);
 }
 
 test("rule 9 error strings: on every Anypoint surface a 502 HTML body or a JSON error embedding a credential URL never reaches results or the bundle", async () => {
@@ -3283,7 +3295,7 @@ test("rule 9 error strings: on every Anypoint surface a 502 HTML body or a JSON 
   let exercised = 0;
   for (const surface of MS_CANARY_SURFACES) {
     for (const flavor of ["html", "json"]) {
-      const config = sampleConfig({ authMode: "connected_app", clientId: "client-1", clientSecret: "MSCANARY-CLIENT-SECRET-77889900", token: undefined });
+      const config = sampleConfig({ authMode: "connected_app", clientId: "client-1", clientSecret: MS_CANARY.clientSecret, token: undefined });
       const client = new MulesoftApiClient(config, {
         fetchImpl: msCanaryFetch({ surface, flavor }),
         sleepImpl: async () => {},
@@ -3306,7 +3318,6 @@ test("rule 9 error strings: on every Anypoint surface a 502 HTML body or a JSON 
       assertMsCanariesAbsent(JSON.stringify(assessments), `${label} assessments`);
       for (const [path, content] of files) assertMsCanariesAbsent(content, `${label} bundle file ${path}`);
       for (const [path, content] of zipEntries) assertMsCanariesAbsent(content, `${label} zip entry ${path}`);
-      assert.ok(!JSON.stringify([access, assessments]).includes("MSCANARY-CLIENT-SECRET"), `${label} leaked the configured client secret`);
       const surfaceErrors = [
         ...access.surfaces.filter((item) => item.error).map((item) => item.error),
         ...assessments.flatMap((assessment) => assessment.errors),
@@ -3326,6 +3337,38 @@ test("rule 9 error strings: on every Anypoint surface a 502 HTML body or a JSON 
   }
   assert.equal(exercised, MS_CANARY_SURFACES.length * 2, "every surface and both flavors were exercised");
   assertMsCanariesAbsent(errorStrings.join("\n"), "collected error strings");
+});
+
+test("planted values self-check: every canary and planted secret is alphanumeric, distinct in every 6-character window, and no window occurs in the healthy fixtures, the sample configuration, or a healthy bundle", async () => {
+  const client = new MulesoftApiClient(sampleConfig(), {
+    fetchImpl: msCanaryFetch({ surface: "no-surface-fails", flavor: "json" }),
+    sleepImpl: async () => {},
+    maxRetries: 0,
+    certificateProbe: async (host, _timeoutMs, servername = host) => ({ host, servername, subject: "*.example.com", issuer: "Example CA", validFrom: isoDaysFromNow(-100), validTo: isoDaysFromNow(200), authorized: true }),
+  });
+  const payloads = [
+    await checkMulesoftAccess(client),
+    await assessMulesoftIdentityAccess(client),
+    await assessMulesoftApiGateway(client),
+    await assessMulesoftRuntimeInfrastructure(client),
+    await assessMulesoftAuditMonitoring(client),
+  ];
+  const liveBundle = await exportMulesoftAuditBundle(client, sampleConfig(), createTempBase("grclanker-mulesoft-planted-self-check-"));
+  assert.equal(liveBundle.errorCount, 0);
+  const mockBundle = await exportMulesoftAuditBundle(healthyBundleClient(), sampleConfig(), createTempBase("grclanker-mulesoft-planted-self-check-mock-"));
+  assert.equal(mockBundle.errorCount, 0);
+  assertPlantedValuesWellFormed(assert, {
+    ...Object.fromEntries(Object.entries(MS_CANARY).map(([name, value]) => [`MS_CANARY.${name}`, value])),
+    ...Object.fromEntries(Object.entries(FAKE_MULESOFT_SECRETS).map(([name, value]) => [`FAKE_MULESOFT_SECRETS.${name}`, value])),
+    ...Object.fromEntries(Object.entries(PLANTED).map(([name, value]) => [`PLANTED.${name}`, value])),
+    ...Object.fromEntries(Object.entries(CONFIG_CANARIES).map(([name, value]) => [`CONFIG_CANARIES.${name}`, value])),
+    SAMPLE_TOKEN,
+  }, [
+    ["sample configuration", JSON.stringify({ ...sampleConfig(), token: null })],
+    ["healthy tool payloads", JSON.stringify(payloads)],
+    ...[...readBundleFiles(liveBundle.outputDir)].map(([name, content]) => [`healthy bundle ${name}`, content]),
+    ...[...readBundleFiles(mockBundle.outputDir)].map(([name, content]) => [`mock-client bundle ${name}`, content]),
+  ]);
 });
 
 test("scrub boundary: bare name-shaped values stay, carriers and registered secrets (in every encoded form) and real token shapes go, on redactSecretText, in MulesoftApiError, and on client.redact", () => {

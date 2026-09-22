@@ -7,14 +7,15 @@
  * around the failure (or the whole source when it is 21 characters or shorter), and Node's fs errors
  * carry their own wording and path. Every case here runs the library directly first as a positive
  * control, then asserts the loader's thrown message and the check_access tool result carry the
- * fixed text (path, code, line where available) and none of the planted canaries, no 8-character
- * fragment of them, and none of the library wording.
+ * fixed text (path, code, line where available) and none of the planted canaries, no substring of
+ * them at lengths 6 through 24, and none of the library wording.
  */
 import assert from "node:assert/strict";
 import { chmodSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { parse as parseYaml } from "yaml";
+import { assertFragmentsAbsent, assertPlantedValuesWellFormed } from "./planted-values.mjs";
 
 export const LIBRARY_WORDING = [
   "Nested mappings",
@@ -27,46 +28,29 @@ export const LIBRARY_WORDING = [
   "Expected double-quoted",
 ];
 
-/** Distinct in every 8-character window across the whole set (asserted below at import time). */
+/**
+ * Random-looking alphanumeric canaries, distinct in every 6-character window across the whole set
+ * (asserted below at import time). The short JSON canary keeps `{"token":<canary>}` at 21 characters
+ * or fewer so JSON.parse quotes the whole source; the JSON canaries start with a letter so the
+ * failure lands on the value rather than on a number.
+ */
 export const CONFIG_CANARIES = {
-  yamlNestedKey: "QWJHXVZPKMTRYU1",
-  yamlNestedBearer: "GBDLNSCFWOAE2XZ",
-  yamlAlias: "MZTXQ9RLPVWBHKD",
-  jsonUnquoted: "KVRPWLXTHBQNZMY",
-  jsonShort: "HXQWZTPRVKL",
-  jsonTrailingComma: "NBVCXZLKJHGFDSA",
+  yamlNestedKey: "K7Pkdu8HLvR9BFwPEh",
+  yamlNestedBearer: "jXaswFsNVus93BnWZU",
+  yamlAlias: "CGNdWx9azWXqn7awEg",
+  jsonUnquoted: "hpuW4UpV4EtCNdQ9qY",
+  jsonShort: "DC35bwNpKH4",
+  jsonTrailingComma: "9GjTEyhTGd6uTguGh3",
 };
 
-const WINDOW = 8;
-
-function windowsOf(text) {
-  const windows = [];
-  for (let index = 0; index + WINDOW <= text.length; index += 1) windows.push(text.slice(index, index + WINDOW));
-  return windows;
-}
-
-(() => {
-  const seen = new Map();
-  for (const [name, canary] of Object.entries(CONFIG_CANARIES)) {
-    for (const window of windowsOf(canary)) {
-      const owner = seen.get(window);
-      assert.equal(owner, undefined, `canary window ${window} appears in both ${owner} and ${name}`);
-      seen.set(window, name);
-    }
-  }
-})();
+assertPlantedValuesWellFormed(assert, CONFIG_CANARIES, [["library wording", LIBRARY_WORDING.join("\n")]]);
 
 const FS_CODE = /^E[A-Z0-9_]{1,30}$/;
 
-/** Asserts a rendered string carries no canary, no 8-character fragment of one, and no library wording. */
+/** Asserts a rendered string carries no canary, no substring of one at lengths 6 through 24, and no library wording. */
 export function assertConfigErrorTextClean(text, label) {
   assert.equal(typeof text, "string", `${label} is a string`);
-  for (const [name, canary] of Object.entries(CONFIG_CANARIES)) {
-    assert.equal(text.includes(canary), false, `${label} carries canary ${name}: ${text}`);
-    for (const window of windowsOf(canary)) {
-      assert.equal(text.includes(window), false, `${label} carries fragment ${window} of canary ${name}: ${text}`);
-    }
-  }
+  assertFragmentsAbsent(assert, text, Object.values(CONFIG_CANARIES), label);
   for (const wording of LIBRARY_WORDING) {
     assert.equal(text.includes(wording), false, `${label} carries library wording "${wording}": ${text}`);
   }

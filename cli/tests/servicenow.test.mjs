@@ -31,8 +31,9 @@ import {
   resolveServicenowConfiguration,
 } from "../dist/extensions/grc-tools/servicenow.js";
 import { getRegisteredToolSummaries } from "../dist/pi/tool-catalog.js";
-import { assertSecretsAbsent, readBundleFiles, readZipEntries } from "./helpers/bundle-contents.mjs";
-import { assertConfigLoaderMatrix, configLoaderCases } from "./helpers/config-loader-matrix.mjs";
+import { assertSecretFragmentsAbsent, readBundleFiles, readZipEntries } from "./helpers/bundle-contents.mjs";
+import { CONFIG_CANARIES, assertConfigLoaderMatrix, configLoaderCases } from "./helpers/config-loader-matrix.mjs";
+import { assertFragmentsAbsent, assertPlantedValuesWellFormed } from "./helpers/planted-values.mjs";
 import { assertScrubBoundary } from "./helpers/scrub-boundary-matrix.mjs";
 
 const FIXED_NOW = new Date("2026-09-21T00:00:00Z");
@@ -43,13 +44,16 @@ function createTempBase(prefix) {
   return mkdtempSync(join(tmpdir(), prefix));
 }
 
+/** The configured basic-auth password: a planted credential, so random-looking (see the planted-values self-check). */
+const SAMPLE_PASSWORD = "Ka4pnBxqUxmU8PgZhf";
+
 function sampleConfig(overrides = {}) {
   return {
     instanceUrl: "https://dev12345.service-now.com",
     instanceName: "dev12345",
     authMode: "basic",
     username: "audit.reader",
-    password: "s3cret-pass-word",
+    password: SAMPLE_PASSWORD,
     timeoutMs: 30000,
     maxRetries: 3,
     pageSize: 500,
@@ -75,16 +79,26 @@ function forbiddenResponse() {
   return jsonResponse({ error: { message: "Insufficient rights to query records", detail: "Field(s) present in the query do not have permission to be read" }, status: "failure" }, { status: 403 });
 }
 
+/** Random-looking alphanumeric canaries; the leak assertions check every substring of them at lengths 6 through 24. */
 const SNOW_CANARY = {
-  bearer: "SNOWCANARY-BEARER-TOKEN-9f8e7d6c",
-  session: "SNOWCANARY-SESSION-COOKIE-1a2b3c4d",
-  apiKey: "SNOWCANARY-API-KEY-55667788",
-  urlToken: "SNOWCANARY-URL-TOKEN-deadbeef",
-  password: "SNOWCANARY-BASIC-PASSWORD-0001",
-  clientSecret: "SNOWCANARY-CLIENT-SECRET-0001",
-  accessToken: "snowcanary-oauth-access-token-0001",
+  bearer: "mfuQzWnTyV9scxqkWy",
+  session: "UJg6tnwe5nP7EwdYya",
+  apiKey: "jG9FmV3axD4A7pcZdp",
+  urlToken: "bGnrbF6YU5UQUxDu2u",
+  password: "CFe6ahZBmU4AsbZt4J",
+  clientSecret: "gjbPA9KryHPaZwmf9C",
+  accessToken: "QAK8MsfbqRnUyzYNfP",
 };
 const SNOW_CANARY_URL = `https://api.example.com/v1/x?token=${SNOW_CANARY.urlToken}`;
+
+/** Planted in every fixture column that can carry a secret on a real instance (secretLadenFixture). */
+const FAKE_SNOW_SECRETS = {
+  passwordHash: "vdKjWDw6FPzcNrMpAF",
+  secretToken1: "pSxb8eQAKJZumEpGEB",
+  secretToken2: "vUySfhtReYjPs6gxE5",
+  privateKey: "hLWJHSGAZrhB4j8z7e",
+  scriptLiteral: "7CKYRgHmrmuQhNJsdp",
+};
 
 /**
  * `fail` serves one table (Table API and Aggregate API) or one path with a body that must never be
@@ -555,7 +569,7 @@ test("ServicenowApiClient shapes Table API queries with basic auth and follows L
   assert.equal(first.searchParams.get("sysparm_fields"), "sys_id,user_name");
   assert.equal(first.searchParams.get("sysparm_limit"), "2");
   assert.equal(first.searchParams.get("sysparm_exclude_reference_link"), "true");
-  const expectedAuth = `Basic ${Buffer.from("audit.reader:s3cret-pass-word").toString("base64")}`;
+  const expectedAuth = `Basic ${Buffer.from(`audit.reader:${SAMPLE_PASSWORD}`).toString("base64")}`;
   for (const call of calls) {
     assert.equal(call.init.headers.get("authorization"), expectedAuth);
     assert.equal(call.init.headers.get("accept"), "application/json");
@@ -646,7 +660,7 @@ test("ServicenowApiClient uses the OAuth password grant when a user credential i
   await client.queryTable("sys_user_role");
   assert.equal(tokenCalls[0].get("grant_type"), "password");
   assert.equal(tokenCalls[0].get("username"), "audit.reader");
-  assert.equal(tokenCalls[0].get("password"), "s3cret-pass-word");
+  assert.equal(tokenCalls[0].get("password"), SAMPLE_PASSWORD);
   assert.equal(inner.calls[0].init.headers.get("authorization"), "Bearer password-grant-token");
 });
 
@@ -684,10 +698,10 @@ test("ServicenowApiClient gives up after max retries and reports the failing sta
 });
 
 test("ServicenowApiClient redacts credentials from error messages", async () => {
-  const fetchImpl = async () => jsonResponse({ error: { message: "Bad credential s3cret-pass-word for audit.reader" } }, { status: 400 });
+  const fetchImpl = async () => jsonResponse({ error: { message: `Bad credential ${SAMPLE_PASSWORD} for audit.reader` } }, { status: 400 });
   const snapshot = await createClient(fetchImpl).queryTable("sys_user");
   assert.match(snapshot.error, /\[REDACTED\]/);
-  assert.equal(snapshot.error.includes("s3cret-pass-word"), false);
+  assertFragmentsAbsent(assert, snapshot.error, [SAMPLE_PASSWORD], "error string from a body echoing the password");
   assert.equal(redactSecrets("token abc123def", ["abc123def", undefined, "ab"]), "token [REDACTED]");
 });
 
@@ -1360,7 +1374,7 @@ test("ServiceNow tools are registered in the tool catalog under the ServiceNow g
   assert.ok(tools.every((tool) => tool.group === "ServiceNow"));
 });
 
-const FAKE_SECRETS = ["FAKE_HASH_1", "FAKE_SECRET_TOKEN_1", "FAKE_SECRET_TOKEN_2", "FAKE_PRIVATE_KEY_1", "FAKE_SCRIPT_LITERAL_1"];
+const FAKE_SECRETS = Object.values(FAKE_SNOW_SECRETS);
 
 /**
  * The healthy fixture with a distinctive fake secret planted in every column
@@ -1372,19 +1386,19 @@ const FAKE_SECRETS = ["FAKE_HASH_1", "FAKE_SECRET_TOKEN_1", "FAKE_SECRET_TOKEN_2
  */
 function secretLadenFixture() {
   const fixture = healthyFixture();
-  fixture.tables.sys_user = fixture.tables.sys_user.map((row) => ({ ...row, user_password: "FAKE_HASH_1", password_needs_reset: "false" }));
-  fixture.tables.sys_user_has_role = fixture.tables.sys_user_has_role.map((row) => ({ ...row, "user.user_password": "FAKE_HASH_1" }));
+  fixture.tables.sys_user = fixture.tables.sys_user.map((row) => ({ ...row, user_password: FAKE_SNOW_SECRETS.passwordHash, password_needs_reset: "false" }));
+  fixture.tables.sys_user_has_role = fixture.tables.sys_user_has_role.map((row) => ({ ...row, "user.user_password": FAKE_SNOW_SECRETS.passwordHash }));
   fixture.tables.sys_properties = [
-    ...fixture.tables.sys_properties.map((row) => ({ ...row, description: `Rotated with FAKE_SECRET_TOKEN_2 on ${row.sys_updated_on}` })),
-    property("my.integration.api_token", "FAKE_SECRET_TOKEN_2"),
+    ...fixture.tables.sys_properties.map((row) => ({ ...row, description: `Rotated with ${FAKE_SNOW_SECRETS.secretToken2} on ${row.sys_updated_on}` })),
+    property("my.integration.api_token", FAKE_SNOW_SECRETS.secretToken2),
   ];
-  fixture.tables.password_policy = fixture.tables.password_policy.map((row) => ({ ...row, description: "Seeded via FAKE_SECRET_TOKEN_1", lockout_message: "Call the helpdesk quoting FAKE_SECRET_TOKEN_1" }));
-  fixture.tables.multi_factor_criteria = fixture.tables.multi_factor_criteria.map((row) => ({ ...row, description: "Bootstrap secret FAKE_SECRET_TOKEN_1", condition: "gs.getProperty('mfa.seed') == 'FAKE_SECRET_TOKEN_1'" }));
-  fixture.tables.ldap_server_config = [{ sys_id: "ldap-1", name: "Corporate LDAP", active: "true", server_url: "ldaps://ldap.example.com", rdn: "cn=bind,dc=example,dc=com", password: "FAKE_SECRET_TOKEN_1", sys_updated_on: "2026-01-01 00:00:00" }];
-  fixture.tables.sys_certificate = fixture.tables.sys_certificate.map((row) => ({ ...row, key_store_password: "FAKE_SECRET_TOKEN_1", pem_certificate: "-----BEGIN PRIVATE KEY-----\nFAKE_PRIVATE_KEY_1\n-----END PRIVATE KEY-----" }));
-  fixture.tables.oauth_entity = fixture.tables.oauth_entity.map((row) => ({ ...row, client_secret: "FAKE_SECRET_TOKEN_1", redirect_url: "https://app.example.com/callback?state=FAKE_SECRET_TOKEN_1" }));
-  fixture.tables.sys_email_account = fixture.tables.sys_email_account.map((row) => ({ ...row, user_name: "smtp-relay", password: "FAKE_SECRET_TOKEN_1" }));
-  fixture.tables.sys_encryption_context = [{ sys_id: "ctx-1", name: "PII context", type: "AES256", encryption_key: "FAKE_SECRET_TOKEN_1", sys_updated_on: "2026-01-01 00:00:00" }];
+  fixture.tables.password_policy = fixture.tables.password_policy.map((row) => ({ ...row, description: `Seeded via ${FAKE_SNOW_SECRETS.secretToken1}`, lockout_message: `Call the helpdesk quoting ${FAKE_SNOW_SECRETS.secretToken1}` }));
+  fixture.tables.multi_factor_criteria = fixture.tables.multi_factor_criteria.map((row) => ({ ...row, description: `Bootstrap secret ${FAKE_SNOW_SECRETS.secretToken1}`, condition: `gs.getProperty('mfa.seed') == '${FAKE_SNOW_SECRETS.secretToken1}'` }));
+  fixture.tables.ldap_server_config = [{ sys_id: "ldap-1", name: "Corporate LDAP", active: "true", server_url: "ldaps://ldap.example.com", rdn: "cn=bind,dc=example,dc=com", password: FAKE_SNOW_SECRETS.secretToken1, sys_updated_on: "2026-01-01 00:00:00" }];
+  fixture.tables.sys_certificate = fixture.tables.sys_certificate.map((row) => ({ ...row, key_store_password: FAKE_SNOW_SECRETS.secretToken1, pem_certificate: `-----BEGIN PRIVATE KEY-----\n${FAKE_SNOW_SECRETS.privateKey}\n-----END PRIVATE KEY-----` }));
+  fixture.tables.oauth_entity = fixture.tables.oauth_entity.map((row) => ({ ...row, client_secret: FAKE_SNOW_SECRETS.secretToken1, redirect_url: `https://app.example.com/callback?state=${FAKE_SNOW_SECRETS.secretToken1}` }));
+  fixture.tables.sys_email_account = fixture.tables.sys_email_account.map((row) => ({ ...row, user_name: "smtp-relay", password: FAKE_SNOW_SECRETS.secretToken1 }));
+  fixture.tables.sys_encryption_context = [{ sys_id: "ctx-1", name: "PII context", type: "AES256", encryption_key: FAKE_SNOW_SECRETS.secretToken1, sys_updated_on: "2026-01-01 00:00:00" }];
   fixture.tables.sys_update_xml = [{
     sys_id: "ux-1",
     name: "sys_properties_abc",
@@ -1394,29 +1408,29 @@ function secretLadenFixture() {
     update_set: "us-open",
     "update_set.name": "Security tweaks",
     "update_set.state": "in progress",
-    payload: "<record_update><sys_properties><value>FAKE_SECRET_TOKEN_1</value></sys_properties></record_update>",
+    payload: `<record_update><sys_properties><value>${FAKE_SNOW_SECRETS.secretToken1}</value></sys_properties></record_update>`,
   }];
   fixture.tables.sys_script = [
     ...fixture.tables.sys_script,
-    { sys_id: "br-2", name: "Dynamic eval", collection: "incident", active: "true", script: "eval(current.script); var key = 'FAKE_SCRIPT_LITERAL_1';" },
+    { sys_id: "br-2", name: "Dynamic eval", collection: "incident", active: "true", script: `eval(current.script); var key = '${FAKE_SNOW_SECRETS.scriptLiteral}';` },
   ];
   fixture.tables.sys_security_acl = fixture.tables.sys_security_acl.map((row) => (row.operation === "read"
-    ? { ...row, condition: "gs.getProperty('acl.seed') == 'FAKE_SCRIPT_LITERAL_1'", script: "answer = current.token == 'FAKE_SCRIPT_LITERAL_1';" }
+    ? { ...row, condition: `gs.getProperty('acl.seed') == '${FAKE_SNOW_SECRETS.scriptLiteral}'`, script: `answer = current.token == '${FAKE_SNOW_SECRETS.scriptLiteral}';` }
     : row));
-  fixture.tables.ecc_agent = fixture.tables.ecc_agent.map((row) => ({ ...row, mid_credential: "FAKE_SECRET_TOKEN_1" }));
+  fixture.tables.ecc_agent = fixture.tables.ecc_agent.map((row) => ({ ...row, mid_credential: FAKE_SNOW_SECRETS.secretToken1 }));
   return fixture;
 }
 
 test("ServicenowApiClient projects rows to the requested fields even when the server ignores sysparm_fields (rule 9)", async () => {
   const fixture = healthyFixture();
-  fixture.tables.sys_user = fixture.tables.sys_user.map((row) => ({ ...row, user_password: "FAKE_HASH_1" }));
+  fixture.tables.sys_user = fixture.tables.sys_user.map((row) => ({ ...row, user_password: FAKE_SNOW_SECRETS.passwordHash }));
   const { fetchImpl, calls } = fixtureFetch(fixture);
 
   const projected = await createClient(fetchImpl).queryTable("sys_user", { fields: ["sys_id", "user_name"] });
   assert.equal(projected.rows.length, 4);
   for (const row of projected.rows) assert.deepEqual(Object.keys(row).sort(), ["sys_id", "user_name"]);
   assert.equal(calls[0].url.searchParams.get("sysparm_fields"), "sys_id,user_name");
-  assert.equal(JSON.stringify(projected).includes("FAKE_HASH_1"), false);
+  assert.equal(JSON.stringify(projected).includes(FAKE_SNOW_SECRETS.passwordHash), false);
 
   const dotted = await createClient(fetchImpl).queryTable("sys_user_has_role", { fields: ["sys_id", "user.user_name", "role.name"] });
   assert.deepEqual(Object.keys(dotted.rows[0]).sort(), ["role.name", "sys_id", "user.user_name"], "dot-walked columns are kept under their dotted key");
@@ -1443,11 +1457,10 @@ test("exportServicenowAuditBundle never writes planted secrets to any bundle fil
   assert.ok(files.has("core_data/sys_encryption_context.json"));
   assert.ok(files.has("core_data/ldap_server_config.json"));
   assert.ok(files.has("core_data/access_check.json"));
-  assertSecretsAbsent(assert, files, FAKE_SECRETS, "bundle directory");
-  assertSecretsAbsent(assert, files, [sampleConfig().password], "bundle directory");
+  assertSecretFragmentsAbsent(assert, files, [...FAKE_SECRETS, sampleConfig().password], "bundle directory");
   const entries = readZipEntries(result.zipPath);
   assert.equal(entries.size, files.size, "the zip carries every bundle file");
-  assertSecretsAbsent(assert, entries, FAKE_SECRETS, "zip archive");
+  assertSecretFragmentsAbsent(assert, entries, [...FAKE_SECRETS, sampleConfig().password], "zip archive");
 
   const rows = (relativePath) => JSON.parse(files.get(relativePath)).rows;
   const users = rows("core_data/sys_user.json");
@@ -1494,12 +1507,12 @@ test("exportServicenowAuditBundle never writes planted secrets to any bundle fil
 });
 
 test("ServicenowApiClient describes non-JSON error bodies by shape and logs only the pathname on timeout (rule 9)", async () => {
-  const gatewayPage = "<html><body>502 upstream; request headers: authorization: Basic FAKE_SECRET_TOKEN_1</body></html>";
+  const gatewayPage = `<html><body>502 upstream; request headers: authorization: Basic ${FAKE_SNOW_SECRETS.secretToken1}</body></html>`;
   const gatewayFetch = async () => new Response(gatewayPage, { status: 502, statusText: "Bad Gateway", headers: { "content-type": "text/html" } });
   const snapshot = await createClient(gatewayFetch, { maxRetries: 0 }).queryTable("sys_user", { query: "active=true", fields: ["sys_id"] });
   assert.equal(snapshot.statusCode, 502);
   assert.match(snapshot.error, /502 Bad Gateway\) for \/api\/now\/table\/sys_user: non-JSON body \(text\/html, \d+ bytes\)$/);
-  assert.equal(snapshot.error.includes("FAKE_SECRET_TOKEN_1"), false);
+  assertFragmentsAbsent(assert, snapshot.error, [FAKE_SNOW_SECRETS.secretToken1], "502 HTML error string");
   assert.equal(snapshot.error.includes("<html>"), false);
 
   const tokenFetch = async (input) => {
@@ -1509,7 +1522,7 @@ test("ServicenowApiClient describes non-JSON error bodies by shape and logs only
   const oauth = createClient(tokenFetch, { authMode: "oauth", username: undefined, password: undefined, clientId: "client-id", clientSecret: "client-secret" });
   const tokenFailure = await oauth.queryTable("sys_user", { fields: ["sys_id"] });
   assert.match(tokenFailure.error, /OAuth token request failed \(502 Bad Gateway\) for \/oauth_token\.do: non-JSON body \(text\/html, \d+ bytes\)$/);
-  assert.equal(tokenFailure.error.includes("FAKE_SECRET_TOKEN_1"), false);
+  assertFragmentsAbsent(assert, tokenFailure.error, [FAKE_SNOW_SECRETS.secretToken1], "token endpoint 502 HTML error string");
 
   const hangingFetch = (input, init) => new Promise((_, reject) => {
     init.signal.addEventListener("abort", () => reject(new Error("aborted")));
@@ -2093,11 +2106,9 @@ test("review round item 13: absence-driven fails on a partial ACL, plugin, or pr
   assert.match(findingsById(completeProperties).get("SNOW-07").summary, /has no sys_properties row; the documented default is false/);
 });
 
+/** No canary survives in any substring at lengths 6 through 24, and no HTML body was echoed. */
 function assertSnowCanariesAbsent(text, context) {
-  for (const [name, value] of Object.entries(SNOW_CANARY)) {
-    assert.ok(!text.includes(value), `${context}: canary ${name} (${value}) leaked`);
-  }
-  assert.ok(!text.includes("token=SNOWCANARY"), `${context}: the canary URL query survived`);
+  assertFragmentsAbsent(assert, text, Object.values(SNOW_CANARY), context);
   assert.ok(!text.includes("<html>"), `${context}: an HTML body was echoed`);
 }
 
@@ -2158,7 +2169,7 @@ async function snowCanaryRun(configOverrides, fail, fixtureOptions = {}) {
     } else {
       assert.match(errorString, /\(403 Forbidden\) for \/[^\s:]+: [^\n]*https:\/\/api\.example\.com\/v1\/x\?\[REDACTED\]/, `${context}: ${errorString}`);
       assert.ok(!errorString.includes("token="), `${context}: ${errorString}`);
-      assert.ok(!errorString.includes("Bearer SNOWCANARY"), `${context}: ${errorString}`);
+      assertFragmentsAbsent(assert, errorString, [SNOW_CANARY.bearer], `${context}: bearer in the JSON detail field`);
     }
   }
   return { access, assessments, files, requests };
@@ -2201,9 +2212,25 @@ test("addendum 4: an OAuth token endpoint that answers with a 502 HTML page or a
   const snapshot = await client.queryTable("sys_user", { fields: ["sys_id"] });
   assert.equal(snapshot.statusCode, 403);
   assertSnowCanariesAbsent(snapshot.error, "post-exchange error");
-  assert.equal(client.redact(`Authorization: Bearer ${SNOW_CANARY.accessToken}; client_secret=${SNOW_CANARY.clientSecret}; ${SNOW_CANARY_URL}`).includes("SNOWCANARY"), false);
+  assertFragmentsAbsent(assert, client.redact(`Authorization: Bearer ${SNOW_CANARY.accessToken}; client_secret=${SNOW_CANARY.clientSecret}; ${SNOW_CANARY_URL}`), [SNOW_CANARY.accessToken, SNOW_CANARY.clientSecret, SNOW_CANARY.urlToken], "client.redact over the obtained bearer, the client secret, and the canary URL");
   assert.equal(redactSecrets(`header Bearer ${SNOW_CANARY.bearer}, cookie JSESSIONID=${SNOW_CANARY.session}, at https://u:p@example.com/a?sid=1#frag`, []), "header Bearer [REDACTED], cookie JSESSIONID=[REDACTED], at https://[REDACTED]@example.com/a?[REDACTED]#[REDACTED]");
   assert.match(redactSecrets("Authorization: Bearer eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.c2lnbmF0dXJl", []), /^Authorization: \[REDACTED\]/);
+});
+
+test("planted values self-check: every canary and planted secret is alphanumeric, distinct in every 6-character window, and no window occurs in the healthy fixture, the sample configuration, or a healthy bundle", async () => {
+  const healthy = await exportWithFixture();
+  assert.equal(healthy.result.errorCount, 0);
+  assertPlantedValuesWellFormed(assert, {
+    ...Object.fromEntries(Object.entries(SNOW_CANARY).map(([name, value]) => [`SNOW_CANARY.${name}`, value])),
+    ...Object.fromEntries(Object.entries(FAKE_SNOW_SECRETS).map(([name, value]) => [`FAKE_SNOW_SECRETS.${name}`, value])),
+    ...Object.fromEntries(Object.entries(CONFIG_CANARIES).map(([name, value]) => [`CONFIG_CANARIES.${name}`, value])),
+    SAMPLE_PASSWORD,
+  }, [
+    ["healthy fixture", JSON.stringify(healthyFixture())],
+    ["sample configuration", JSON.stringify({ ...sampleConfig(), password: null })],
+    ["healthy tool payloads", JSON.stringify(healthy.payloads)],
+    ...[...healthy.files].map(([name, content]) => [`healthy bundle ${name}`, content]),
+  ]);
 });
 
 test("scrub boundary: bare name-shaped values stay, carriers and registered secrets (in every encoded form) and real token shapes go, on redactSecrets and in ServicenowApiError", () => {

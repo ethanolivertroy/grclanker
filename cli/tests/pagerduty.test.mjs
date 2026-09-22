@@ -39,8 +39,9 @@ import {
   scheduleCoverageGaps,
 } from "../dist/extensions/grc-tools/pagerduty.js";
 import { getRegisteredToolSummaries } from "../dist/pi/tool-catalog.js";
-import { assertSecretsAbsent, readBundleFiles, readZipEntries } from "./helpers/bundle-contents.mjs";
-import { assertConfigLoaderMatrix, configLoaderCases } from "./helpers/config-loader-matrix.mjs";
+import { assertSecretFragmentsAbsent, readBundleFiles, readZipEntries } from "./helpers/bundle-contents.mjs";
+import { CONFIG_CANARIES, assertConfigLoaderMatrix, configLoaderCases } from "./helpers/config-loader-matrix.mjs";
+import { assertFragmentsAbsent, assertPlantedValuesWellFormed } from "./helpers/planted-values.mjs";
 import { assertScrubBoundary } from "./helpers/scrub-boundary-matrix.mjs";
 
 const NOW = new Date("2026-09-21T00:00:00.000Z");
@@ -63,10 +64,13 @@ function createTempBase(prefix) {
   return mkdtempSync(join(tmpdir(), prefix));
 }
 
+/** The configured REST API key: a planted credential, so random-looking (see the planted-values self-check). */
+const SAMPLE_API_TOKEN = "WjB6eRwTvdctKEemdV";
+
 function sampleConfig(overrides = {}) {
   return {
     authMode: "api_token",
-    apiToken: "pd-secret-token",
+    apiToken: SAMPLE_API_TOKEN,
     region: "us",
     baseUrl: "https://api.pagerduty.com",
     identityTokenUrl: "https://identity.pagerduty.com/oauth/token",
@@ -555,7 +559,7 @@ test("PagerdutyApiClient sends the versioned Accept header, Token auth, and foll
   assert.equal(seen.length, 2);
   assert.equal(seen[0].pathname, "/users");
   assert.equal(seen[0].accept, "application/vnd.pagerduty+json;version=2");
-  assert.equal(seen[0].auth, "Token token=pd-secret-token");
+  assert.equal(seen[0].auth, `Token token=${SAMPLE_API_TOKEN}`);
   assert.equal(seen[0].params.offset, "0");
   assert.equal(seen[0].params.total, "true");
   assert.equal(seen[1].params.offset, "1");
@@ -615,7 +619,7 @@ test("PagerdutyApiClient retries 429 and 5xx responses using ratelimit headers",
 test("PagerdutyApiClient surfaces API errors with redacted tokens", async () => {
   const fetchImpl = async () =>
     jsonResponse(
-      { error: { message: "Access denied for token pd-secret-token", code: 2010, errors: ["insufficient scope"] } },
+      { error: { message: `Access denied for token ${SAMPLE_API_TOKEN}`, code: 2010, errors: ["insufficient scope"] } },
       { status: 403, statusText: "Forbidden" },
     );
 
@@ -624,7 +628,7 @@ test("PagerdutyApiClient surfaces API errors with redacted tokens", async () => 
     assert.equal(error.status, 403);
     assert.match(error.message, /403 Forbidden/);
     assert.match(error.message, /insufficient scope/);
-    assert.ok(!error.message.includes("pd-secret-token"));
+    assertFragmentsAbsent(assert, error.message, [SAMPLE_API_TOKEN], "error message echoing the API key");
     assert.ok(error.message.includes("[REDACTED]"));
     return true;
   });
@@ -1962,8 +1966,8 @@ test("exportPagerdutyAuditBundle writes core data, analysis, compliance reports,
   assert.match(matrix, /PD-01/);
   assert.match(matrix, /PD-25/);
   const summary = readFileSync(join(result.outputDir, "compliance", "executive_summary.md"), "utf8");
-  assert.ok(!summary.includes("pd-secret-token"));
-  assert.ok(!readFileSync(join(result.outputDir, "core_data", "access_check.json"), "utf8").includes("pd-secret-token"));
+  assertFragmentsAbsent(assert, summary, [SAMPLE_API_TOKEN], "executive summary");
+  assertFragmentsAbsent(assert, readFileSync(join(result.outputDir, "core_data", "access_check.json"), "utf8"), [SAMPLE_API_TOKEN], "access_check.json");
 });
 
 test("exportPagerdutyAuditBundle records partial collection failures in _errors.log", async () => {
@@ -2036,22 +2040,27 @@ test("PagerDuty tools are registered in the tool catalog under the PagerDuty gro
 
 // Verdict safety rules 9 and 10 (export credential hygiene and pagination truncation), plus the rule 1 corollary.
 
+/**
+ * Random-looking alphanumeric planted secrets; the bundle and zip scans check every substring of them at
+ * lengths 6 through 24. The inbound email's local part and the Slack webhook path's secret segment are the
+ * planted values; their fixed surroundings (`@example.pagerduty.com`, `T0FAKE/B0FAKE/`) are added at the plant site.
+ */
 const FAKE_PAGERDUTY_SECRETS = {
-  integrationKey: "FAKE_PD_INTEGRATION_KEY_5f3a9c1e",
-  integrationEmail: "fake-pd-inbound-7c2d@example.pagerduty.com",
-  slackWebhookPath: "T0FAKE/B0FAKE/FAKE_PD_SLACK_PATH_SECRET",
-  extensionUrlToken: "FAKE_PD_EXTENSION_URL_TOKEN",
-  snowPassword: "FAKE_PD_SNOW_PASSWORD_9e8d",
-  webhookPathSecret: "FAKE_PD_WEBHOOK_PATH_SECRET",
-  webhookHeader: "FAKE_PD_WEBHOOK_HEADER_SECRET",
-  deliverySecret: "FAKE_PD_DELIVERY_SIGNING_SECRET",
-  workflowUrlToken: "FAKE_PD_WORKFLOW_URL_TOKEN",
-  workflowHeader: "FAKE_PD_WORKFLOW_AUTH_HEADER",
-  changeEventApiKey: "FAKE_PD_CHANGE_EVENT_API_KEY",
-  changeEventLinkToken: "FAKE_PD_CHANGE_LINK_TOKEN",
-  auditFieldUrlSecret: "FAKE_PD_AUDIT_FIELD_URL_SECRET",
-  phoneNumber: "15550100FAKE",
-  pushAddress: "FAKE_PD_PUSH_DEVICE_ADDRESS",
+  integrationKey: "3XnuC3YjgaXwrN8krz",
+  integrationEmail: "D7ePYs8LEMsRqFTwy8",
+  slackWebhookPath: "gRGTPKptPmUt9CkWQP",
+  extensionUrlToken: "BWf7DSVupXeuZRagtp",
+  snowPassword: "jFQbwYfhySPpDdR8jg",
+  webhookPathSecret: "ZKGD9nYbzN8SWnFdLs",
+  webhookHeader: "Ayz7WucqBw89qWnmb5",
+  deliverySecret: "tvurJUAQrzbu3GJ5XN",
+  workflowUrlToken: "xYtFC7ZxDzSt3vPHs4",
+  workflowHeader: "SZ6rTaBn7xLdkpPXLw",
+  changeEventApiKey: "g7Y5mqtqHaU98JFu73",
+  changeEventLinkToken: "7ATZj5mshYWwkGmdma",
+  auditFieldUrlSecret: "yPynAQd8eG9pNR7Z4c",
+  phoneNumber: "ek6KS4LYkZArQXRe8a",
+  pushAddress: "tUCgjfzM7pMFTtHg4U",
 };
 
 function secretBearingPagerdutyClient() {
@@ -2073,7 +2082,7 @@ function secretBearingPagerdutyClient() {
         service("svc-1", {
           integrations: [
             { id: "svc-1-int", summary: "Events API v2", type: "events_api_v2_inbound_integration", integration_key: secrets.integrationKey },
-            { id: "svc-1-email", summary: "Email", type: "generic_email_inbound_integration", email_filter_mode: "or-rules-email", integration_email: secrets.integrationEmail },
+            { id: "svc-1-email", summary: "Email", type: "generic_email_inbound_integration", email_filter_mode: "or-rules-email", integration_email: `${secrets.integrationEmail}@example.pagerduty.com` },
           ],
         }),
         service("svc-2", { incident_urgency_rule: { type: "constant", urgency: "high" } }),
@@ -2084,7 +2093,7 @@ function secretBearingPagerdutyClient() {
         {
           id: "ext-1",
           summary: "Slack",
-          endpoint_url: `https://hooks.slack.com/services/${secrets.slackWebhookPath}`,
+          endpoint_url: `https://hooks.slack.com/services/T0FAKE/B0FAKE/${secrets.slackWebhookPath}`,
           extension_schema: { summary: "Slack V2" },
           config: { channel: "#alerts", snow_user: "pagerduty", snow_password: secrets.snowPassword },
         },
@@ -2210,10 +2219,10 @@ test("verdict safety rule 9: exportPagerdutyAuditBundle never writes integration
   ]) {
     assert.ok(files.has(file), `expected ${file} in ${[...files.keys()].join(", ")}`);
   }
-  assertSecretsAbsent(assert, files, secrets, "bundle directory");
+  assertSecretFragmentsAbsent(assert, files, secrets, "bundle directory");
   const zipEntries = readZipEntries(result.zipPath);
   assert.equal(zipEntries.size, files.size, "the zip carries exactly the written files");
-  assertSecretsAbsent(assert, zipEntries, secrets, "zip archive");
+  assertSecretFragmentsAbsent(assert, zipEntries, secrets, "zip archive");
 
   const { results } = await runAllAssessments(client);
   const payloads = JSON.stringify([await checkPagerdutyAccess(client), ...results]);
@@ -2573,14 +2582,15 @@ const PAGERDUTY_CORE_DATA_FILES = {
   "/change_events": "core_data/change_events.json",
 };
 
+/** Random-looking alphanumeric canaries; the leak assertions check every substring of them at lengths 6 through 24. */
 const PD_CANARY = {
-  bearer: "PDCANARY-BEARER-TOKEN-9f8e7d6c",
-  session: "PDCANARY-SESSION-COOKIE-1a2b3c4d",
-  apiKey: "PDCANARY-API-KEY-55667788",
-  urlToken: "PDCANARY-URL-TOKEN-deadbeef",
-  apiToken: "PDCANARY-REST-API-KEY-0001",
-  clientSecret: "PDCANARY-CLIENT-SECRET-0001",
-  accessToken: "pdcanary-oauth-access-token-0001",
+  bearer: "TC9fpcVv34JXGcK2hF",
+  session: "saMVDPH9QJLhc9E4pT",
+  apiKey: "sgBL63d4Me6NjrukVb",
+  urlToken: "6CLuXRpZNQfQZzyfkG",
+  apiToken: "5bGHanNnsgV3Vay9SY",
+  clientSecret: "L2ZmNtntFXSxpXDBgy",
+  accessToken: "VP6RDnThNgGxBpL42W",
 };
 const PD_CANARY_URL = `https://api.example.com/v1/x?token=${PD_CANARY.urlToken}`;
 
@@ -2938,10 +2948,9 @@ const PAGERDUTY_CANARY_SURFACES = [
   ...PAGERDUTY_LIST_ENDPOINTS.map(([path]) => path),
 ];
 
+/** No canary survives in any substring at lengths 6 through 24. */
 function assertPdCanariesAbsent(text, context) {
-  for (const [name, value] of Object.entries(PD_CANARY)) {
-    assert.ok(!text.includes(value), `${context}: canary ${name} (${value}) leaked`);
-  }
+  assertFragmentsAbsent(assert, text, Object.values(PD_CANARY), context);
 }
 
 async function pdCanaryRun(config, fail) {
@@ -3016,13 +3025,28 @@ test("addendum 4: a Scoped OAuth token endpoint that answers with a 502 HTML pag
   const fixture = pagerdutyApiFixture({ fail: { path: "/users", flavor: "json" } });
   const client = new PagerdutyApiClient(config, { fetchImpl: fixture.fetchImpl, now: () => NOW, sleep: async () => {} });
   await assert.rejects(client.listUsers(5), (error) => {
-    assert.ok(!error.message.includes(PD_CANARY.accessToken));
-    assert.ok(!error.message.includes(PD_CANARY.urlToken));
+    assertFragmentsAbsent(assert, error.message, [PD_CANARY.accessToken, PD_CANARY.urlToken, PD_CANARY.clientSecret], "post-exchange error message");
     return true;
   });
   const redacted = client.redact(`header Bearer ${PD_CANARY.accessToken}, key Token token=${PD_CANARY.clientSecret}, at https://u:p@example.com/a?sid=1#frag`);
   assert.equal(redacted, "header Bearer [REDACTED], key Token token=[REDACTED], at https://[REDACTED]@example.com/a?[REDACTED]#[REDACTED]");
   assert.match(client.redact("Authorization: Bearer eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.c2lnbmF0dXJl"), /^Authorization: \[REDACTED\]/);
+});
+
+test("planted values self-check: every canary and planted secret is alphanumeric, distinct in every 6-character window, and no window occurs in the healthy fixtures, the sample configuration, or a healthy bundle", async () => {
+  const healthy = await exportWithFixture({});
+  assert.equal(healthy.result.errorCount, 0);
+  assertPlantedValuesWellFormed(assert, {
+    ...Object.fromEntries(Object.entries(PD_CANARY).map(([name, value]) => [`PD_CANARY.${name}`, value])),
+    ...Object.fromEntries(Object.entries(FAKE_PAGERDUTY_SECRETS).map(([name, value]) => [`FAKE_PAGERDUTY_SECRETS.${name}`, value])),
+    ...Object.fromEntries(Object.entries(CONFIG_CANARIES).map(([name, value]) => [`CONFIG_CANARIES.${name}`, value])),
+    SAMPLE_API_TOKEN,
+  }, [
+    ["healthy fixtures", JSON.stringify(healthyFixtures())],
+    ["sample configuration", JSON.stringify({ ...sampleConfig(), apiToken: null })],
+    ["healthy tool payloads", JSON.stringify(healthy.payloads)],
+    ...[...healthy.files].map(([name, content]) => [`healthy bundle ${name}`, content]),
+  ]);
 });
 
 test("scrub boundary: bare name-shaped values stay, carriers and registered secrets (in every encoded form) and real token shapes go, in PagerdutyRequestError and on client.redact", () => {

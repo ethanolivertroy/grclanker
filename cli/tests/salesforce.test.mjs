@@ -30,8 +30,9 @@ import {
   resolveSecureOutputPath,
 } from "../dist/extensions/grc-tools/salesforce.js";
 import { getRegisteredToolSummaries } from "../dist/pi/tool-catalog.js";
-import { assertSecretsAbsent, readBundleFiles, readZipEntries } from "./helpers/bundle-contents.mjs";
-import { assertConfigLoaderMatrix, configLoaderCases } from "./helpers/config-loader-matrix.mjs";
+import { assertSecretFragmentsAbsent, readBundleFiles, readZipEntries } from "./helpers/bundle-contents.mjs";
+import { CONFIG_CANARIES, assertConfigLoaderMatrix, configLoaderCases } from "./helpers/config-loader-matrix.mjs";
+import { assertFragmentsAbsent, assertPlantedValuesWellFormed } from "./helpers/planted-values.mjs";
 import { assertScrubBoundary } from "./helpers/scrub-boundary-matrix.mjs";
 
 const { privateKey: TEST_PRIVATE_KEY, publicKey: TEST_PUBLIC_KEY } = generateKeyPairSync("rsa", {
@@ -57,13 +58,16 @@ function xmlResponse(body, status = 200) {
   return new Response(body, { status, headers: { "content-type": "text/xml" } });
 }
 
+/** The configured access token: a planted credential, so random-looking (see the planted-values self-check). */
+const SAMPLE_ACCESS_TOKEN = "aYQEGbnRuCrFfp76eu";
+
 function sampleConfig(overrides = {}) {
   return {
     authMode: "access-token",
     loginUrl: "https://login.salesforce.com",
     instanceUrl: "https://acme.my.salesforce.com",
     apiVersion: "64.0",
-    accessToken: "token-abc123",
+    accessToken: SAMPLE_ACCESS_TOKEN,
     timeoutMs: 30000,
     maxRetries: 2,
     sourceChain: ["tests"],
@@ -261,7 +265,7 @@ function createFullMockClient(overrides = {}) {
   return {
     getResolvedConfig: () => sampleConfig(),
     getNow: () => NOW,
-    async getSession() { return { accessToken: "token-abc123", instanceUrl: "https://acme.my.salesforce.com" }; },
+    async getSession() { return { accessToken: SAMPLE_ACCESS_TOKEN, instanceUrl: "https://acme.my.salesforce.com" }; },
     async getLimits() { return { DailyApiRequests: { Max: 100000, Remaining: 99000 } }; },
     async getOrganization() { return goodOrganization; },
     async getHealthCheck() { return { Score: 95 }; },
@@ -575,14 +579,14 @@ test("SalesforceApiClient reads SecuritySettings through Metadata API readMetada
   assert.equal(requests[0].pathname, "/services/Soap/m/64.0");
   assert.match(requests[0].contentType, /text\/xml/);
   assert.match(requests[0].body, /<met:type>SecuritySettings<\/met:type><met:fullNames>Security<\/met:fullNames>/);
-  assert.match(requests[0].body, /<met:sessionId>token-abc123<\/met:sessionId>/);
+  assert.ok(requests[0].body.includes(`<met:sessionId>${SAMPLE_ACCESS_TOKEN}</met:sessionId>`));
   assert.equal(settings.sessionSettings.sessionTimeout, "TwelveHours");
   assert.equal(settings.passwordPolicies.minimumPasswordLength, "8");
   assert.equal(settings.networkAccess.ipRanges.length, 2);
 
   await assert.rejects(() => client.readMyDomainSettings(), (error) => {
     assert.equal(error.errorCode, "INSUFFICIENT_ACCESS");
-    assert.ok(!error.message.includes("token-abc123"));
+    assertFragmentsAbsent(assert, error.message, [SAMPLE_ACCESS_TOKEN], "SOAP fault error message");
     return true;
   });
 
@@ -1312,7 +1316,7 @@ test("exportSalesforceAuditBundle writes core_data, analysis, compliance reports
   assert.equal(findings.find((item) => item.id === "SF-16").status, "manual");
   assert.match(readFileSync(join(result.outputDir, "_errors.log"), "utf8"), /TenantSecret: forbidden/);
   const bundleText = JSON.stringify(readdirSync(result.outputDir, { recursive: true }));
-  assert.ok(!readFileSync(join(result.outputDir, "metadata.json"), "utf8").includes("token-abc123"));
+  assertFragmentsAbsent(assert, readFileSync(join(result.outputDir, "metadata.json"), "utf8"), [SAMPLE_ACCESS_TOKEN], "metadata.json");
   assert.ok(bundleText.length > 0);
 
   const rerun = await exportSalesforceAuditBundle(client, sampleConfig(), base, { now: NOW });
@@ -1323,17 +1327,18 @@ test("exportSalesforceAuditBundle writes core_data, analysis, compliance reports
   assert.ok(existsSync(rerun.zipPath));
 });
 
+/** Random-looking alphanumeric planted secrets; the bundle and zip scans check every substring of them at lengths 6 through 24. */
 const FAKE_SALESFORCE_SECRETS = {
-  accessToken: "FAKE_ACCESS_TOKEN_1",
-  consumerSecret: "FAKE_CONSUMER_SECRET_1",
-  privateKey: "FAKE_PRIVATE_KEY_1",
-  sessionSecret: "FAKE_SECRET_TOKEN_1",
-  samlCertificate: "FAKE_SECRET_TOKEN_2",
-  domainSuffix: "FAKE_SECRET_TOKEN_3",
-  ipRangeDescription: "FAKE_COMMUNITY_1",
-  profileHash: "FAKE_HASH_1",
-  loginSid: "FAKE_SESSION_SID_1",
-  startUrlKey: "FAKE_START_URL_KEY_1",
+  accessToken: "qnHCnRw8pYkatSZNXj",
+  consumerSecret: "deg982tgLeJyLWypFZ",
+  privateKey: "6H9X9nDrdanEaDShqe",
+  sessionSecret: "bzG37r6jxUXAkc56md",
+  samlCertificate: "RCqRLjqNBpR5fGgkQb",
+  domainSuffix: "7kLrq8MRAcTg64rfGM",
+  ipRangeDescription: "ZXgcx84vAq2twxrCf3",
+  profileHash: "xgFzukmt8W36KEYLc6",
+  loginSid: "yjRfDyYNx4DgeApW7t",
+  startUrlKey: "AHj4JRZH2pFB6rJ2dV",
 };
 
 test("rule 9: exportSalesforceAuditBundle projects Metadata API trees so fake secrets never reach the bundle directory or the zip", async () => {
@@ -1377,10 +1382,10 @@ test("rule 9: exportSalesforceAuditBundle projects Metadata API trees so fake se
   for (const relativePath of ["core_data/security_settings.json", "core_data/my_domain_settings.json", "core_data/profile_metadata.json", "analysis/platform_security.json", "analysis/identity_access.json", "QUICK_REFERENCE.md"]) {
     assert.ok(files.has(join(...relativePath.split("/"))), `expected ${relativePath}`);
   }
-  assertSecretsAbsent(assert, files, secrets, "bundle directory");
+  assertSecretFragmentsAbsent(assert, files, secrets, "bundle directory");
   const zipEntries = readZipEntries(result.zipPath);
   assert.equal(zipEntries.size, files.size, "the zip carries exactly the written files");
-  assertSecretsAbsent(assert, zipEntries, secrets, "zip archive");
+  assertSecretFragmentsAbsent(assert, zipEntries, secrets, "zip archive");
 
   const settings = JSON.parse(files.get(join("core_data", "security_settings.json"))).data;
   assert.equal(settings.sessionSettings.sessionTimeout, "TwoHours");
@@ -1416,12 +1421,11 @@ test("rule 9: exportSalesforceAuditBundle projects Metadata API trees so fake se
 });
 
 test("rule 9: SalesforceApiClient never echoes a non-JSON error body into error messages", async () => {
-  const fetchImpl = async () => new Response(`<html>gateway down FAKE_SECRET_TOKEN_1 Bearer ${sampleConfig().accessToken}</html>`, { status: 502, headers: { "content-type": "text/html" } });
+  const fetchImpl = async () => new Response(`<html>gateway down ${FAKE_SALESFORCE_SECRETS.sessionSecret} Bearer ${sampleConfig().accessToken}</html>`, { status: 502, headers: { "content-type": "text/html" } });
   const client = new SalesforceApiClient(sampleConfig({ maxRetries: 0 }), { fetchImpl });
   await assert.rejects(() => client.getLimits(), (error) => {
     assert.equal(error.status, 502);
-    assert.ok(!error.message.includes("FAKE_SECRET_TOKEN_1"), error.message);
-    assert.ok(!error.message.includes("token-abc123"), error.message);
+    assertFragmentsAbsent(assert, error.message, [FAKE_SALESFORCE_SECRETS.sessionSecret, SAMPLE_ACCESS_TOKEN], "502 HTML error message");
     assert.ok(!error.message.includes("gateway down"), error.message);
     assert.match(error.message, /non-JSON body \(text\/html, \d+ bytes\)/);
     return true;
@@ -1724,11 +1728,16 @@ test("review round item 9: denied Salesforce datasets are written as not-collect
   assert.equal(metadataMarker.http_status, 403, "the marker carries the parent's status");
 });
 
+/** Random-looking alphanumeric canaries; the leak assertions check every substring of them at lengths 6 through 24. */
 const SF_CANARY = {
-  bearer: "SFCANARY_BEARER_a1b2c3d4e5f6g7h8",
-  cookie: "SFCANARY_SID_00Dxx0000001gPFsid9",
-  apiKey: "SFCANARY_APIKEY_9f8e7d6c5b4a",
-  urlToken: "SFCANARY_URLTOKEN_q1w2e3r4",
+  bearer: "kgzGTsB2sU5cCUKCXz",
+  cookie: "FYGJh9Bzbd35bRrBPs",
+  apiKey: "KM9PbWt6WxhFxCkaJf",
+  urlToken: "nL9EVdZszdTMtgLeS4",
+  // The configured password-grant credentials of the canary client, remembered by the constructor.
+  password: "Yk63nyEVp6krSwMWtv",
+  securityToken: "k2DAkV4Bbutx9hV3YH",
+  consumerSecret: "jPuTG7AJfujrN9L4nJ",
 };
 const SF_CANARY_VALUES = Object.values(SF_CANARY);
 const SF_CANARY_URL = `https://api.example.com/v1/x?token=${SF_CANARY.urlToken}`;
@@ -1812,9 +1821,9 @@ const SF_CANARY_SURFACES = [
   ...["Organization", "SecurityHealthCheck", "SecurityHealthCheckRisks", "User", "Profile", "PermissionSet", "PermissionSetAssignment", "TwoFactorMethodsInfo", "FieldPermissions", "TenantSecret", "Certificate", "ConnectedApplication", "OauthToken", "UserPermissionAccess", "LoginHistory", "SetupAuditTrail", "EventLogFile"].map((object) => `query:${object}`),
 ];
 
+/** No canary survives in any substring at lengths 6 through 24. */
 function assertSfCanariesAbsent(text, label) {
-  for (const value of SF_CANARY_VALUES) assert.ok(!text.includes(value), `${label} leaked canary ${value}`);
-  assert.ok(!text.includes("token=SFCANARY"), `${label} leaked the URL query string`);
+  assertFragmentsAbsent(assert, text, SF_CANARY_VALUES, label);
 }
 
 test("rule 9 error strings: on every Salesforce surface a 502 HTML body or a JSON error embedding a credential URL never reaches results or the bundle", async () => {
@@ -1822,7 +1831,7 @@ test("rule 9 error strings: on every Salesforce surface a 502 HTML body or a JSO
   let surfacesWithErrors = 0;
   for (const surface of SF_CANARY_SURFACES) {
     for (const flavor of ["html", "json"]) {
-      const client = new SalesforceApiClient(sampleConfig({ authMode: "password", username: "auditor@acme.example", password: "pw-secret-1", securityToken: "tok-secret-2", consumerKey: "ck", consumerSecret: "cs-secret-3" }), { fetchImpl: sfCanaryFetch({ surface, flavor }), sleep: async () => {}, now: () => NOW });
+      const client = new SalesforceApiClient(sampleConfig({ authMode: "password", username: "auditor@acme.example", password: SF_CANARY.password, securityToken: SF_CANARY.securityToken, consumerKey: "ck", consumerSecret: SF_CANARY.consumerSecret }), { fetchImpl: sfCanaryFetch({ surface, flavor }), sleep: async () => {}, now: () => NOW });
       const access = await checkSalesforceAccess(client);
       const assessments = [];
       for (const assess of [assessSalesforcePlatformSecurity, assessSalesforceIdentityAccess, assessSalesforceDataProtection, assessSalesforceMonitoringIntegrations]) {
@@ -1858,6 +1867,26 @@ test("rule 9 error strings: on every Salesforce surface a 502 HTML body or a JSO
   }
   assert.equal(surfacesWithErrors, SF_CANARY_SURFACES.length * 2, "every surface and both flavors were exercised");
   assertSfCanariesAbsent(errorStrings.join("\n"), "collected error strings");
+});
+
+test("planted values self-check: every canary and planted secret is alphanumeric, distinct in every 6-character window, and no window occurs in the healthy fixtures, the sample configuration, or a healthy bundle", async () => {
+  const base = createTempBase("grclanker-sf-planted-self-check-");
+  const result = await exportSalesforceAuditBundle(createFullMockClient(), sampleConfig(), base, { now: NOW });
+  assert.equal(result.errorCount, 0);
+  assertPlantedValuesWellFormed(assert, {
+    ...Object.fromEntries(Object.entries(SF_CANARY).map(([name, value]) => [`SF_CANARY.${name}`, value])),
+    ...Object.fromEntries(Object.entries(FAKE_SALESFORCE_SECRETS).map(([name, value]) => [`FAKE_SALESFORCE_SECRETS.${name}`, value])),
+    ...Object.fromEntries(Object.entries(CONFIG_CANARIES).map(([name, value]) => [`CONFIG_CANARIES.${name}`, value])),
+    SAMPLE_ACCESS_TOKEN,
+  }, [
+    ["identity fixture", JSON.stringify(goodIdentityData())],
+    ["platform fixture", JSON.stringify(goodPlatformData())],
+    ["data protection fixture", JSON.stringify(goodDataProtectionData())],
+    ["monitoring fixture", JSON.stringify(goodMonitoringData())],
+    ["security settings fixture", JSON.stringify(securitySettingsFixture())],
+    ["sample configuration", JSON.stringify({ ...sampleConfig(), accessToken: null })],
+    ...[...readBundleFiles(result.outputDir)].map(([name, content]) => [`healthy bundle ${name}`, content]),
+  ]);
 });
 
 test("scrub boundary: bare name-shaped values stay, carriers and registered secrets (in every encoded form) and real token shapes go, in SalesforceApiError's message and errorCode", () => {

@@ -31,8 +31,9 @@ import {
   runAllCrowdstrikeAssessments,
 } from "../dist/extensions/grc-tools/crowdstrike.js";
 import { getRegisteredToolSummaries } from "../dist/pi/tool-catalog.js";
-import { assertSecretsAbsent, readBundleFiles, readZipEntries } from "./helpers/bundle-contents.mjs";
-import { assertConfigLoaderMatrix, configLoaderCases } from "./helpers/config-loader-matrix.mjs";
+import { assertSecretFragmentsAbsent, readBundleFiles, readZipEntries } from "./helpers/bundle-contents.mjs";
+import { CONFIG_CANARIES, assertConfigLoaderMatrix, configLoaderCases } from "./helpers/config-loader-matrix.mjs";
+import { assertFragmentsAbsent, assertPlantedValuesWellFormed } from "./helpers/planted-values.mjs";
 import { assertScrubBoundary } from "./helpers/scrub-boundary-matrix.mjs";
 
 const ALL_CONTROL_IDS = Array.from({ length: 25 }, (_, index) => `CS-${String(index + 1).padStart(2, "0")}`);
@@ -50,10 +51,13 @@ function createTempBase(prefix) {
   return mkdtempSync(join(tmpdir(), prefix));
 }
 
+/** The configured API client secret: a planted credential, so random-looking (see the planted-values self-check). */
+const SAMPLE_CLIENT_SECRET = "845kpNMHDNTcWGMC2A";
+
 function sampleConfig(overrides = {}) {
   return {
     clientId: "client-id",
-    clientSecret: "client-secret-value",
+    clientSecret: SAMPLE_CLIENT_SECRET,
     baseUrl: "https://api.crowdstrike.com",
     cloud: "us-1",
     timeoutMs: 30000,
@@ -573,7 +577,7 @@ test("CrowdstrikeApiClient exchanges OAuth2 client credentials and paginates off
   assert.equal(seen[0].method, "POST");
   const tokenBody = new URLSearchParams(seen[0].body);
   assert.equal(tokenBody.get("client_id"), "client-id");
-  assert.equal(tokenBody.get("client_secret"), "client-secret-value");
+  assert.equal(tokenBody.get("client_secret"), SAMPLE_CLIENT_SECRET);
   assert.equal(tokenBody.get("member_cid"), "child-cid");
   assert.equal(seen[1].auth, "Bearer token-1");
   assert.equal(seen[1].pathname, "/policy/combined/prevention/v1");
@@ -719,7 +723,7 @@ test("CrowdstrikeApiClient redacts secrets in errors and gives up after the retr
   const leakyFetch = async (input) => {
     const url = new URL(typeof input === "string" ? input : input.toString());
     if (url.pathname === "/oauth2/token") {
-      return jsonResponse({ errors: [{ code: 403, message: "invalid client client-secret-value" }] }, { status: 403 });
+      return jsonResponse({ errors: [{ code: 403, message: `invalid client ${SAMPLE_CLIENT_SECRET}` }] }, { status: 403 });
     }
     return jsonResponse({});
   };
@@ -727,7 +731,7 @@ test("CrowdstrikeApiClient redacts secrets in errors and gives up after the retr
   await assert.rejects(client.listPreventionPolicies(), (error) => {
     assert.ok(error instanceof CrowdstrikeHttpError);
     assert.equal(error.status, 403);
-    assert.doesNotMatch(error.message, /client-secret-value/);
+    assertFragmentsAbsent(assert, error.message, [SAMPLE_CLIENT_SECRET], "error message echoing the client secret");
     assert.match(error.message, /\[REDACTED\]/);
     return true;
   });
@@ -1641,7 +1645,7 @@ test("exportCrowdstrikeAuditBundle writes the audit layout, framework reports, a
   const metadata = JSON.parse(readFileSync(join(result.outputDir, "metadata.json"), "utf8"));
   assert.equal(metadata.base_url, "https://api.crowdstrike.com");
   assert.equal(metadata.controls_evaluated, 25);
-  assert.ok(!JSON.stringify(metadata).includes("client-secret-value"));
+  assertFragmentsAbsent(assert, JSON.stringify(metadata), [SAMPLE_CLIENT_SECRET], "metadata.json");
 
   const findings = JSON.parse(readFileSync(join(result.outputDir, "analysis", "findings.json"), "utf8"));
   assert.equal(findings.length, 25);
@@ -1679,23 +1683,28 @@ test("exportCrowdstrikeAuditBundle records partial collection failures in _error
 
 // Verdict safety rules 9 and 10: export credential hygiene and pagination truncation.
 
+/**
+ * Random-looking alphanumeric planted secrets; the bundle and zip scans check every substring of them at
+ * lengths 6 through 24. Each is planted inside the field or carrier named by its key (an alert command line,
+ * an RTR command string, an exclusion regex or path, a comment URL query).
+ */
 const FAKE_CROWDSTRIKE_SECRETS = {
-  alertCmdlinePassword: "Hunter2-Backup-Pass-4471",
-  alertParentEncodedCommand: "RW5jb2RlZFBhcmVudFNlY3JldC05OTEy",
-  alertGrandparentToken: "grandparent-api-token-0f9e8d",
-  alertDescriptionToken: "ghp_alertDescriptionToken0000000000001",
-  alertIocValue: "ioc-secret-blob-7f3a9c",
-  alertBearer: "eyJhbGciOiJIUzI1NiJ9.fake-alert-bearer.c2VjcmV0",
-  rtrRunscriptSecret: "RtrInlineSecret-2026-Q3",
-  rtrPutCommand: "put creds-export-9a8b7c.txt",
-  rtrStdoutSecret: "rtr-stdout-secret-5561",
+  alertCmdlinePassword: "cN4rGYkQv4MsftpRf4",
+  alertParentEncodedCommand: "KUS9kRX89Vepjnxd6G",
+  alertGrandparentToken: "Sx5T2uSUa7nwunm5AF",
+  alertDescriptionToken: "QY5PHe53gd9h8xy26c",
+  alertIocValue: "Ecx39uZd3gTpKECnQh",
+  alertBearer: "ve7dGCwYPnpHkFKtNZ",
+  rtrRunscriptSecret: "6hPpZYXUCsPxCUgGxP",
+  rtrPutCommand: "dhgLG3kLCfvdtHtuLG",
+  rtrStdoutSecret: "fanNHJPRQ8hTdrQe84",
   // Free-text exclusion carriers (review round item 6): command-line and image regexes, paths, and notes.
-  ioaClRegexToken: "IoaClRegexToken-71c2e9",
-  ioaIfnRegexKey: "IoaIfnApiKey-33ab90",
-  ioaDescriptionBearer: "eyJhbGciOiJIUzI1NiJ9.ioa-description-bearer.c2VjcmV0",
-  mlValuePassword: "MlValuePassword-58d1f4",
-  svValueSecret: "SvValueSecret-9e0b2a",
-  svCommentUrlToken: "SvCommentUrlToken-4477cc",
+  ioaClRegexToken: "GnLNeK7BVWATB8vrSR",
+  ioaIfnRegexKey: "BhdHYLvSUmsyvG5TQk",
+  ioaDescriptionBearer: "MnKdD9NCNVyrvmBuWn",
+  mlValuePassword: "Y9yWFGgBas8nujKGLs",
+  svValueSecret: "y6RWbfHqmHfduL8VUr",
+  svCommentUrlToken: "47xGMHC5Z8gJUckTyB",
 };
 
 function secretBearingCrowdstrikeClient() {
@@ -1776,7 +1785,7 @@ function secretBearingCrowdstrikeClient() {
         duration: 600,
         commands: [
           { base_command: "runscript", command_string: `runscript -Raw=\`\`\`$cred = ConvertTo-SecureString '${fake.rtrRunscriptSecret}'\`\`\``, status: "complete" },
-          { base_command: "put", command_string: fake.rtrPutCommand, status: "complete" },
+          { base_command: "put", command_string: `put ${fake.rtrPutCommand}.txt`, status: "complete" },
           { base_command: "ls", command_string: "ls C:\\Users", status: "complete" },
         ],
         logs: [{ stdout: `PASSWORD=${fake.rtrStdoutSecret}`, stderr: "" }],
@@ -1812,15 +1821,13 @@ test("verdict safety rule 9: exportCrowdstrikeAuditBundle never writes alert com
   ]) {
     assert.ok(files.has(file), `expected ${file} in ${[...files.keys()].join(", ")}`);
   }
-  assertSecretsAbsent(assert, files, secrets, "bundle directory");
+  assertSecretFragmentsAbsent(assert, files, secrets, "bundle directory");
   const zipEntries = readZipEntries(result.zipPath);
   assert.equal(zipEntries.size, files.size, "the zip carries exactly the written files");
-  assertSecretsAbsent(assert, zipEntries, secrets, "zip archive");
+  assertSecretFragmentsAbsent(assert, zipEntries, secrets, "zip archive");
 
   const payloads = JSON.stringify([await checkCrowdstrikeAccess(client), ...(await runAllCrowdstrikeAssessments(client))]);
-  for (const secret of secrets) {
-    assert.ok(!payloads.includes(secret), `tool payloads must not carry ${secret}`);
-  }
+  assertFragmentsAbsent(assert, payloads, secrets, "tool payloads");
 
   const alerts = JSON.parse(files.get("core_data/response_readiness/alerts.json"));
   assert.equal(alerts.length, 2);
@@ -2206,13 +2213,14 @@ test("review round item 5: a capped prevention policy list never asserts platfor
 // Addendum 4: on every Falcon surface, a 502 HTML body or a JSON error embedding a credential URL never reaches
 // tool results, findings, summaries, or the bundle; the recorded error carries a status-and-length note instead.
 
+/** Random-looking alphanumeric canaries; the leak assertions check every substring of them at lengths 6 through 24. */
 const CS_CANARY = {
-  bearer: "CSCANARY-BEARER-TOKEN-9f8e7d6c",
-  session: "CSCANARY-SESSION-COOKIE-1a2b3c4d",
-  apiKey: "CSCANARY-API-KEY-55667788",
-  urlToken: "CSCANARY-URL-TOKEN-deadbeef",
-  clientSecret: "CSCANARY-CLIENT-SECRET-0001",
-  accessToken: "cs-canary-access-token-0001",
+  bearer: "wzqUxGCZDwhWFQjgJ2",
+  session: "u2UxNASwxbcU4UVgq8",
+  apiKey: "rh5SzQeu7bq3ypyZtP",
+  urlToken: "k2va2LcNRQ8MpbvEZs",
+  clientSecret: "8y6YfvKmNBqS3ynUq3",
+  accessToken: "R7cQYACujPskMA2jJD",
 };
 const CS_CANARY_URL = `https://api.example.com/v1/x?token=${CS_CANARY.urlToken}`;
 
@@ -2297,10 +2305,9 @@ function csCanaryFetch(failing) {
   };
 }
 
+/** No canary survives in any substring at lengths 6 through 24. */
 function assertCsCanariesAbsent(text, context) {
-  for (const [name, value] of Object.entries(CS_CANARY)) {
-    assert.ok(!text.includes(value), `${context}: canary ${name} (${value}) leaked`);
-  }
+  assertFragmentsAbsent(assert, text, Object.values(CS_CANARY), context);
 }
 
 test("addendum 4: on every Falcon surface a 502 HTML body or a JSON error embedding a credential URL never reaches results or the bundle, and the recorded error carries a status-and-length note", async () => {
@@ -2339,6 +2346,26 @@ test("addendum 4: on every Falcon surface a 502 HTML body or a JSON error embedd
     }
   }
   assert.equal(runs.length, CS_CANARY_SURFACES.length * 2);
+});
+
+test("planted values self-check: every canary and planted secret is alphanumeric, distinct in every 6-character window, and no window occurs in the healthy fixtures, the sample configuration, or a healthy bundle", async () => {
+  const base = createTempBase("grclanker-cs-planted-self-check-");
+  const client = new CrowdstrikeApiClient(sampleConfig(), { fetchImpl: csCanaryFetch({ path: "/no-surface-fails", flavor: "json" }), sleep: async () => {}, retryLimit: 0 });
+  const payloads = [await checkCrowdstrikeAccess(client), ...(await runAllCrowdstrikeAssessments(client))];
+  const result = await exportCrowdstrikeAuditBundle(client, sampleConfig(), base);
+  assert.equal(result.errorCount, 0);
+  const fakeBundle = await exportCrowdstrikeAuditBundle(createFakeClient(), sampleConfig(), createTempBase("grclanker-cs-planted-self-check-fake-"));
+  assertPlantedValuesWellFormed(assert, {
+    ...Object.fromEntries(Object.entries(CS_CANARY).map(([name, value]) => [`CS_CANARY.${name}`, value])),
+    ...Object.fromEntries(Object.entries(FAKE_CROWDSTRIKE_SECRETS).map(([name, value]) => [`FAKE_CROWDSTRIKE_SECRETS.${name}`, value])),
+    ...Object.fromEntries(Object.entries(CONFIG_CANARIES).map(([name, value]) => [`CONFIG_CANARIES.${name}`, value])),
+    SAMPLE_CLIENT_SECRET,
+  }, [
+    ["sample configuration", JSON.stringify({ ...sampleConfig(), clientSecret: null })],
+    ["healthy tool payloads", JSON.stringify(payloads)],
+    ...[...readBundleFiles(result.outputDir)].map(([name, content]) => [`healthy bundle ${name}`, content]),
+    ...[...readBundleFiles(fakeBundle.outputDir)].map(([name, content]) => [`fake-client bundle ${name}`, content]),
+  ]);
 });
 
 test("scrub boundary: bare name-shaped values stay, carriers and registered secrets (in every encoded form) and real token shapes go, in CrowdstrikeHttpError", () => {
