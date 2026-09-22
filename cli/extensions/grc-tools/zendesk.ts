@@ -485,13 +485,17 @@ const QUERY_PAIR_PATTERN = /([?&#])([A-Za-z0-9_.[\]-]+)=((?!\[REDACTED\])[^&#\s"
 const HEADER_LINE_PATTERN = /\b(authorization|proxy-authorization|cookie|set-cookie|x-api-key|api-key|apikey|x-pan-key|x-redlock-auth|x-auth-token|x-access-token|x-amz-security-token|x-vault-token|private-token|x-goog-api-key|x-csrf-token|x-xsrf-token)(["']?\s*:\s*)(?![^\r\n<>"']*\[REDACTED\])[^\r\n<>"']*[^\s\r\n<>"']/gi;
 // A scheme and its credentials: the value is removed whatever its shape, except the
 // prose words that follow a scheme name in a sentence ("Basic authentication is
-// required", "Bearer token"). "Token" is also this module's own noun ("Token hygiene",
-// "token inventory"), so after it any plain lowercase word shorter than
-// LONG_TOKEN_MIN_LENGTH is prose. OAuth 1.0 carries its credentials as key="value"
-// attributes, which the attribute rule removes, so OAuth is not a scheme here and
-// "OAuth clients" stays.
+// required", "Bearer token") and a Titlecase word, which makes the scheme name an
+// adjective in a title ("Basic Network Scan", "Bearer Token", "Token Hygiene"): a Basic
+// credential is base64 and a bearer token or API key carries digits, symbols, or token
+// casing, so neither is ever one capitalized word of letters. "Token" is also this
+// module's own noun ("Token hygiene", "token inventory"), so after it any plain
+// lowercase word shorter than LONG_TOKEN_MIN_LENGTH is prose. OAuth 1.0 carries its
+// credentials as key="value" attributes, which the attribute rule removes, so OAuth is
+// not a scheme here and "OAuth clients" stays.
 const SCHEME_VALUE_PATTERN = /\b(Bearer|Basic|Digest|Token|Negotiate|NTLM|SSWS|ApiKey|Api-Key)\s+((?!\[REDACTED\])[A-Za-z0-9._~+/=-]{4,})/gi;
 const PLAIN_WORD_PATTERN = /^[a-z]+$/;
+const TITLE_WORD_PATTERN = /^[A-Z][a-z]{1,19}$/;
 const SCHEME_PROSE_WORDS = new Set([
   "authentication", "authorization", "auth", "token", "tokens", "credential", "credentials", "scheme", "schemes", "header", "headers",
   "realm", "challenge", "access", "mode", "method", "login", "flow", "grant", "type", "string", "value", "values", "user", "users",
@@ -557,6 +561,10 @@ const STRUCTURAL_VALUE_PATTERN = /^(?:[{[]|\{\}|\[\]|true|false|null)$/;
 // a count, this module's own summary vocabulary, not a credential.
 const PLURAL_CREDENTIAL_WORDS = new Set(["tokens", "secrets", "keys", "cookies", "passwords", "credentials"]);
 const COUNT_VALUE_PATTERN = /^\d+(?:\s|$)/;
+// "code" names a credential only behind one of these words (registration_code,
+// activation_code, authorization_code, recovery_code); status_code, error_code, and
+// country_code stay evidence.
+const CREDENTIAL_CODE_QUALIFIERS = new Set(["registration", "activation", "linking", "auth", "authorization", "access", "verification", "recovery", "backup", "security", "mfa", "otp", "pairing", "enrollment", "license"]);
 
 function credentialKeyWord(segment: string): boolean {
   return CREDENTIAL_KEY_WORDS.has(segment) || CREDENTIAL_KEY_SUFFIX_PATTERN.test(segment);
@@ -574,6 +582,7 @@ export function isCredentialKey(key: string): boolean {
   const last = words[words.length - 1];
   if (last === undefined || BOUND_KEY_SEGMENTS.has(words[0])) return false;
   if ((last === "key" || last === "keys") && words.length > 1 && NON_CREDENTIAL_KEY_QUALIFIERS.has(words[words.length - 2])) return false;
+  if (last === "code" || last === "codes") return words.length > 1 && CREDENTIAL_CODE_QUALIFIERS.has(words[words.length - 2]);
   if (credentialKeyWord(last)) return true;
   return CREDENTIAL_VALUE_FORM_WORDS.has(last) && words.slice(0, -1).some(credentialKeyWord);
 }
@@ -639,9 +648,11 @@ function isTokenShapedValue(value: string): boolean {
   return TOKEN_VALUE_PATTERN.test(value) && looksLikeToken(value);
 }
 
-// The word after a scheme name is prose when it is a plain lowercase word from the list
-// above, or, after "Token", any plain lowercase word too short to be a real token.
+// The word after a scheme name is prose when it is a Titlecase word, a plain lowercase
+// word from the list above, or, after "Token", any plain lowercase word too short to be
+// a real token.
 function isSchemeProse(scheme: string, value: string): boolean {
+  if (TITLE_WORD_PATTERN.test(value)) return true;
   if (!PLAIN_WORD_PATTERN.test(value)) return false;
   if (SCHEME_PROSE_WORDS.has(value)) return true;
   return scheme.toLowerCase() === "token" && value.length < LONG_TOKEN_MIN_LENGTH;

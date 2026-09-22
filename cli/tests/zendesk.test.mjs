@@ -2191,6 +2191,10 @@ test("scrub boundary: name-shaped values stay bare in prose, leave every carrier
     ["Token hygiene could not be judged; token inventory read; Token count 3", "Token hygiene could not be judged; token inventory read; Token count 3"],
     ["OAuth clients all declare scopes; an OAuth bearer token; OAuth abcdefghijklmnop", "OAuth clients all declare scopes; an OAuth bearer token; OAuth abcdefghijklmnop"],
     ["API token basic auth; Bearer tokens expire; Basic credential; Basic authentication is required", "API token basic auth; Bearer tokens expire; Basic credential; Basic authentication is required"],
+    // A Titlecase word makes the scheme name an adjective in a title; a digit, a symbol,
+    // token casing, or a run longer than a word still marks a credential.
+    ["plans: Basic Support Plan, Bearer Token rotation, Token Hygiene, ApiKey Rotation", "plans: Basic Support Plan, Bearer Token rotation, Token Hygiene, ApiKey Rotation"],
+    ["Basic Canary2026 rejected; Basic dXNlcjpwYXNz rejected; Bearer Abcdefghijklmnopqrstu rejected; Basic Canary-Basic rejected", "Basic [REDACTED] rejected; Basic [REDACTED] rejected; Bearer [REDACTED] rejected; Basic [REDACTED] rejected"],
   ]) {
     assert.equal(redactErrorText(text), expected);
     assert.equal(redactCredentialValueText(text), expected);
@@ -2235,6 +2239,8 @@ test("scrub boundary: name-shaped values stay bare in prose, leave every carrier
     ["login", false], ["max_keys", false], ["auth_mode", false], ["password_policy", false], ["two_factor_auth", true],
     ["pass_rate", false], ["pass", false], ["access_key_id", false], ["monkey", false], ["oauth", false], ["sessions", false],
     ["session_timeout_minutes", false], ["credentials_file", false], ["passwordPolicy", false], ["webhookUrl", false], ["target_url", false],
+    ["registration_code", true], ["activation_code", true], ["authorization_code", true], ["recovery_codes", true],
+    ["status_code", false], ["error_code", false], ["country_code", false], ["code", false],
   ]) {
     assert.equal(isCredentialKey(key), expected, key);
   }

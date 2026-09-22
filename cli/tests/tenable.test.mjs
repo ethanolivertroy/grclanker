@@ -1,11 +1,13 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, symlinkSync, writeFileSync } from "node:fs";
+import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { parse as parseYaml } from "yaml";
 
 import {
+  TenableApiError,
   assessTenableAccessControl,
   assessTenableScanProgram,
   assessTenableSensorCoverage,
@@ -15,8 +17,17 @@ import {
   collectTenableScanProgramData,
   collectTenableSensorCoverageData,
   collectTenableVulnerabilityData,
+  configuredTenableSecrets,
   createTenableClients,
+  describeErrorBody,
   exportTenableAuditBundle,
+  isCredentialKey,
+  propertyNameIsCredential,
+  redactConfiguredSecrets,
+  redactCredentialProperties,
+  redactCredentialValueText,
+  redactErrorText,
+  redactSecrets,
   registerTenableTools,
   resolveSecureOutputPath,
   resolveTenableConfiguration,
@@ -35,12 +46,34 @@ const EMPTY_ENV = { HOME: "/nonexistent-home-for-tests" };
 const EMPTY_CONFIG_FILE = join(mkdtempSync(join(tmpdir(), "tenable-empty-config-")), "tenable.yaml");
 writeFileSync(EMPTY_CONFIG_FILE, "");
 
+// The configured API keys of the fixtures, which only the configured-secret pass (guard 2)
+// removes: they are deliberately name-shaped, so bare in prose no carrier or token-shape
+// rule touches them and their absence proves that pass ran. Their words appear nowhere in
+// the module's own vocabulary, and no 8-character window of them does either.
+const FIXTURE_ACCESS_KEY = "fixture-amber-quarry-2026";
+const FIXTURE_SECRET_KEY = "fixture-cobalt-meadow-2026";
+
+// The forms a configured secret can be echoed in: as is, JSON-escaped, URL-encoded, base64, base64url.
+function secretForms(value) {
+  return [...new Set([value, JSON.stringify(value).slice(1, -1), encodeURIComponent(value), Buffer.from(value).toString("base64"), Buffer.from(value).toString("base64url")])];
+}
+
+// Neither the canary nor any window of `windowSize` characters of it may survive, so a
+// partial echo (a slice, a split token) is attributable to the canary it came from.
+function assertNoWindow(text, canary, windowSize, label) {
+  assert.ok(!text.includes(canary), `${label}: ${canary} leaked`);
+  for (let index = 0; index + windowSize <= canary.length; index += 1) {
+    const fragment = canary.slice(index, index + windowSize);
+    assert.ok(!text.includes(fragment), `${label}: fragment ${fragment} of ${canary} leaked`);
+  }
+}
+
 function jsonResponse(body, status = 200, headers = {}) {
   return new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json", ...headers } });
 }
 
 function vmConfig(extra = {}) {
-  return resolveTenableConfiguration({ access_key: "access-key-123456", secret_key: "secret-key-654321", config_file: EMPTY_CONFIG_FILE, ...extra }, EMPTY_ENV);
+  return resolveTenableConfiguration({ access_key: FIXTURE_ACCESS_KEY, secret_key: FIXTURE_SECRET_KEY, config_file: EMPTY_CONFIG_FILE, ...extra }, EMPTY_ENV);
 }
 
 function healthyUsers() {
@@ -427,31 +460,32 @@ test("TenableApiClient sends the X-ApiKeys header, walks pagination, and redacts
   assert.equal(page.items.length, 2);
   assert.equal(page.total, 3);
   assert.equal(page.truncated, true);
-  assert.equal(log[0].headers["X-ApiKeys"], "accessKey=access-key-123456;secretKey=secret-key-654321");
+  assert.equal(log[0].headers["X-ApiKeys"], `accessKey=${FIXTURE_ACCESS_KEY};secretKey=${FIXTURE_SECRET_KEY}`);
   assert.ok(log[0].url.includes("limit=200"), log[0].url);
   assert.ok(log.some((entry) => entry.url.includes("offset=2")), "second page requested");
 
+  const deniedBody = `denied for accessKey=${FIXTURE_ACCESS_KEY};secretKey=${FIXTURE_SECRET_KEY}`;
   const failing = createTenableClients(vmConfig(), {
-    fetchImpl: async () => new Response("denied for accessKey=access-key-123456;secretKey=secret-key-654321", { status: 403 }),
+    fetchImpl: async () => new Response(deniedBody, { status: 403 }),
     sleepImpl: async () => {},
   });
   await assert.rejects(() => failing.vm.listScans(), (error) => {
     assert.equal(error.status, 403);
-    assert.ok(!error.message.includes("secret-key-654321"), error.message);
+    for (const secret of [FIXTURE_ACCESS_KEY, FIXTURE_SECRET_KEY]) assertNoWindow(error.message, secret, 8, "non-JSON denial");
     assert.ok(!error.message.includes("denied for"), `non-JSON bodies are never echoed: ${error.message}`);
-    assert.match(error.message, /403[^;]*; non-JSON text\/plain response body \(66 bytes, not echoed\)/);
+    assert.match(error.message, new RegExp(`403[^;]*; non-JSON text/plain response body \\(${deniedBody.length} bytes, not echoed\\)`));
     return true;
   });
 
   const jsonFailure = createTenableClients(vmConfig(), {
-    fetchImpl: async () => jsonResponse({ error: "invalid credentials accessKey=access-key-123456;secretKey=secret-key-654321" }, 401),
+    fetchImpl: async () => jsonResponse({ error: `invalid credentials accessKey=${FIXTURE_ACCESS_KEY};secretKey=${FIXTURE_SECRET_KEY}` }, 401),
     sleepImpl: async () => {},
   });
   await assert.rejects(() => jsonFailure.vm.listScans(), (error) => {
     assert.equal(error.status, 401);
     assert.ok(error.message.includes("invalid credentials"), "documented JSON error fields are kept");
-    assert.ok(!error.message.includes("secret-key-654321"), error.message);
-    assert.ok(error.message.includes("[REDACTED]"), error.message);
+    for (const secret of [FIXTURE_ACCESS_KEY, FIXTURE_SECRET_KEY]) assertNoWindow(error.message, secret, 8, "JSON denial");
+    assert.equal(error.message, "Tenable request GET /scans failed (HTTP 401; invalid credentials accessKey=[REDACTED];secretKey=[REDACTED])", "both halves of the echoed header go, the key names stay");
     return true;
   });
 });
@@ -958,7 +992,7 @@ test("exportTenableAuditBundle writes the documented layout, a paired zip, and n
   }
   assert.equal(existsSync(join(first.outputDir, "_errors.log")), false);
   const rawUsers = readFileSync(join(first.outputDir, "core_data/users.json"), "utf8");
-  assert.ok(!rawUsers.includes("secret-key-654321"));
+  assert.ok(!rawUsers.includes(FIXTURE_SECRET_KEY));
   assert.ok(first.findingCount >= 20);
 
   const second = await exportTenableAuditBundle(clients, root, { now: NOW });
@@ -987,28 +1021,295 @@ test("exportTenableAuditBundle records _errors.log when collection partially fai
   assert.equal(findings.find((item) => item.id === "TENABLE-13").status, "manual");
 });
 
+// ---------------------------------------------------------------------------
+// Scrub boundary ruling: a name-shaped value bare in prose stays, a carrier loses its value
+// whatever its shape, a configured secret is removed in every form whatever its shape, and
+// real token shapes are removed bare.
+// ---------------------------------------------------------------------------
+const NAME_SHAPED_VALUES = ["prod-us-east-2026", "fw-dc1-01", "sess-canary-COOKIE-31415926535897"];
+
+// Every carrier of the ruling with the value in it, and the exact rendering after the scrub.
+function carriersOf(value) {
+  return [
+    [`Authorization: Bearer ${value}`, /^Authorization: (?:Bearer )?\[REDACTED\]$/],
+    [`Proxy-Authorization: Basic ${value}`, /^Proxy-Authorization: (?:Basic )?\[REDACTED\]$/],
+    [`Cookie: TNS_SESSIONID=${value}; theme=dark`, /^Cookie: \[REDACTED\]$/],
+    [`Set-Cookie: TNS_SESSIONID=${value}; Path=/; HttpOnly`, /^Set-Cookie: \[REDACTED\]$/],
+    [`X-ApiKeys: accessKey=${value};secretKey=${value}`, /^X-ApiKeys: \[REDACTED\]$/],
+    [`x-apikey: accesskey=${value}; secretkey=${value};`, /^x-apikey: \[REDACTED\]$/],
+    [`X-SecurityCenter: ${value}`, /^X-SecurityCenter: \[REDACTED\]$/],
+    [`X-Cookie: token=${value}`, /^X-Cookie: \[REDACTED\]$/],
+    [`X-Api-Key: ${value}`, /^X-Api-Key: \[REDACTED\]$/],
+    [`<p>X-ApiKeys: accessKey=${value};secretKey=${value}</p><p>next</p>`, /^<p>X-ApiKeys: \[REDACTED\]<\/p><p>next<\/p>$/],
+    [`accessKey=${value};secretKey=${value}`, /^accessKey=\[REDACTED\];secretKey=\[REDACTED\]$/],
+    [`TNS_SESSIONID=${value}; Path=/`, /^TNS_SESSIONID=\[REDACTED\]; Path=\/$/],
+    [`session=${value} expired`, /^session=\[REDACTED\] expired$/],
+    [`https://svc:${value}@proxy.example.com/x`, /^https:\/\/\[REDACTED\]@proxy\.example\.com\/x$/],
+    [`https://hooks.example.com/tenable?token=${value}&channel=ops`, /^https:\/\/hooks\.example\.com\/tenable\?token=\[REDACTED\]&channel=ops$/],
+    [`https://x.example.com/cb?state=1&api_key=${value}`, /^https:\/\/x\.example\.com\/cb\?state=1&api_key=\[REDACTED\]$/],
+    [`GET /login?user=a&pass=${value}`, /^GET \/login\?user=a&pass=\[REDACTED\]$/],
+    [`https://x.example.com/cb#access_token=${value}&state=1`, /^https:\/\/x\.example\.com\/cb#access_token=\[REDACTED\]&state=1$/],
+    [`https://hooks.slack.com/services/${value}`, /^https:\/\/hooks\.slack\.com\/services\/\[REDACTED\]$/],
+    [`Bearer ${value}`, /^Bearer \[REDACTED\]$/],
+    [`Basic ${value}`, /^Basic \[REDACTED\]$/],
+    [`Token ${value}`, /^Token \[REDACTED\]$/],
+    [`ApiKey ${value}`, /^ApiKey \[REDACTED\]$/],
+    [`password=${value}`, /^password=\[REDACTED\]$/],
+    [`password: ${value}`, /^password: \[REDACTED\]$/],
+    [`registration_code: ${value} and more words`, /^registration_code: \[REDACTED\]$/],
+    [`linking_key=${value}&name=x`, /^linking_key=\[REDACTED\]&name=x$/],
+    [`{"secretKey":"${value}","name":"svc"}`, /^\{"secretKey":"\[REDACTED\]","name":"svc"\}$/],
+    [`{"private_key": "${value}", "id": 7}`, /^\{"private_key": "\[REDACTED\]", "id": 7\}$/],
+    [`<scanner name="s1" key="${value}"/>`, /^<scanner name="s1" key="\[REDACTED\]"\/>$/],
+    [`<field name='pw' password='${value}'/>`, /^<field name='pw' password='\[REDACTED\]'\/>$/],
+  ];
+}
+
+test("scrub boundary: name-shaped values stay bare in prose, leave every carrier whatever their shape, and go as configured secrets in every form", () => {
+  for (const value of NAME_SHAPED_VALUES) {
+    for (const prose of [`inventory ${value} was not read`, `${value}`, `scanner ${value} reported 12 of 40 agents`, `path /var/lib/${value}/state`]) {
+      assert.equal(redactErrorText(prose), prose, `${value} stays bare in error text`);
+      assert.equal(redactCredentialValueText(prose), prose, `${value} stays bare in a data value`);
+    }
+    for (const [text, expected] of carriersOf(value)) {
+      for (const scrub of [redactErrorText, redactCredentialValueText]) {
+        const out = scrub(text);
+        assert.match(out, expected, `${scrub.name}(${JSON.stringify(text)}) -> ${JSON.stringify(out)}`);
+        assertNoWindow(out, value, 6, `${scrub.name} ${text}`);
+        assert.equal(scrub(out), out, `${scrub.name} is idempotent on ${out}`);
+      }
+    }
+    // A configured secret goes bare and in every encoded form, however name-shaped it is.
+    for (const form of secretForms(value)) {
+      assert.equal(redactSecrets(`login rejected for ${form} by upstream`, [value]), "login rejected for [REDACTED] by upstream", `configured ${value} as ${form}`);
+      assert.equal(redactConfiguredSecrets(`login rejected for ${form} by upstream`, [value]), "login rejected for [REDACTED] by upstream", `guard 2 alone on ${form}`);
+    }
+  }
+  // Both halves of each configured key pair are secrets; the Security Center pair joins when configured.
+  assert.deepEqual(configuredTenableSecrets(vmConfig()), [FIXTURE_ACCESS_KEY, FIXTURE_SECRET_KEY]);
+  assert.deepEqual(
+    configuredTenableSecrets(vmConfig({ sc_url: "https://sc.example.internal", sc_access_key: "sc-fixture-access-2026", sc_secret_key: "sc-fixture-secret-2026" })),
+    [FIXTURE_ACCESS_KEY, FIXTURE_SECRET_KEY, "sc-fixture-access-2026", "sc-fixture-secret-2026"],
+  );
+  assert.deepEqual(configuredTenableSecrets(resolveTenableConfiguration({ url: "https://sc.example.internal", access_key: "sc-access-key", secret_key: "sc-secret-key", config_file: EMPTY_CONFIG_FILE }, EMPTY_ENV)), ["sc-access-key", "sc-secret-key"]);
+  const header = `X-ApiKeys: accessKey=${FIXTURE_ACCESS_KEY};secretKey=${FIXTURE_SECRET_KEY}`;
+  assert.equal(redactConfiguredSecrets(header, configuredTenableSecrets(vmConfig())), "X-ApiKeys: accessKey=[REDACTED];secretKey=[REDACTED]", "the composed header value is covered by its halves");
+  assert.equal(redactConfiguredSecrets("a pin 4711 and pin 47110", ["4711"]), "a pin [REDACTED] and pin 47110", "a short secret is removed as a whole token only");
+  assert.equal(redactConfiguredSecrets("too short abc", ["abc"]), "too short abc", "below the minimum length nothing is scrubbed");
+
+  // Real token shapes go bare from error text, and stay in data values where they are identifiers.
+  for (const [text, expected] of [
+    ["bare Kq7Zx2Vw9Lm4Tp8R token", "bare [REDACTED] token"],
+    ["digest 0f9e8d7c6b5a4938 shown", "digest [REDACTED] shown"],
+    ["hash 3a7bd3e2360a3d29eea436fcfb7e44c735d117c42d1c1835420b6b9942dd4f1b shown", "hash [REDACTED] shown"],
+    ["jwt eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0In0.abcdefghijk expired", "jwt [REDACTED] expired"],
+    ["bare dXNlcjpwYXNzd29yZA== padded", "bare [REDACTED] padded"],
+    ["akid AKIAIOSFODNN7EXAMPLE shown", "akid [REDACTED] shown"],
+    ["panos LUFRPT1234567890abcdefghijklmnop shown", "panos [REDACTED] shown"],
+    ["-----BEGIN RSA PRIVATE KEY-----\nMIIEfake\n-----END RSA PRIVATE KEY-----", "[REDACTED]"],
+    ["-----BEGIN CERTIFICATE-----\nMIIEfake\n-----END CERTIFICATE-----", "[REDACTED]"],
+    ["truncated -----BEGIN PRIVATE KEY-----\nMIIEfake", "truncated [REDACTED]"],
+  ]) {
+    assert.equal(redactErrorText(text), expected);
+    assert.equal(redactErrorText(expected), expected, "idempotent");
+  }
+  // After a scheme the value goes whatever its shape, a plain lowercase word included,
+  // unless it is one of the listed prose words; after the noun "Token" any short plain
+  // lowercase word is prose.
+  for (const [text, expected] of [
+    ["Bearer abcdefghijklmnop rejected", "Bearer [REDACTED] rejected"],
+    ["Basic canarybasic rejected", "Basic [REDACTED] rejected"],
+    ["ApiKey canaryapikey rejected", "ApiKey [REDACTED] rejected"],
+    ["Token abcdefghijklmnopq expired", "Token [REDACTED] expired"],
+    ["Token hygiene could not be judged; token inventory read; Token count 3", "Token hygiene could not be judged; token inventory read; Token count 3"],
+    ["API key basic auth; Bearer tokens expire; Basic credential; Basic authentication is required", "API key basic auth; Bearer tokens expire; Basic credential; Basic authentication is required"],
+    // A Titlecase word makes the scheme name an adjective in a title; a digit, a symbol,
+    // token casing, or a run longer than a word still marks a credential.
+    ["templates: Basic Network Scan, Basic Agent Scan, Advanced Scan; Bearer Token rotation; Token Hygiene; ApiKey Rotation", "templates: Basic Network Scan, Basic Agent Scan, Advanced Scan; Bearer Token rotation; Token Hygiene; ApiKey Rotation"],
+    ["Basic Canary2026 rejected; Basic dXNlcjpwYXNz rejected; Bearer Abcdefghijklmnopqrstu rejected; Basic Canary-Basic rejected", "Basic [REDACTED] rejected; Basic [REDACTED] rejected; Bearer [REDACTED] rejected; Basic [REDACTED] rejected"],
+  ]) {
+    assert.equal(redactErrorText(text), expected);
+    assert.equal(redactCredentialValueText(text), expected);
+  }
+  // A digit string under a singular credential word is still a credential (a PIN, a numeric token).
+  assert.equal(redactErrorText('"pin": 4711, "token": 12345678, otp=123456, "api_keys": 2'), '"pin": [REDACTED], "token": [REDACTED], otp=[REDACTED], "api_keys": 2');
+  assert.equal(redactCredentialValueText("bare Kq7Zx2Vw9Lm4Tp8R id"), "bare Kq7Zx2Vw9Lm4Tp8R id", "an opaque identifier in evidence is not a secret");
+  assert.equal(redactCredentialValueText("plugin set 202609211000 loaded"), "plugin set 202609211000 loaded", "a plugin set is a digit string, a name");
+  const certificate = "-----BEGIN CERTIFICATE-----\nMIIEfake\n-----END CERTIFICATE-----";
+  assert.equal(redactCredentialValueText(certificate), certificate, "a public certificate is evidence");
+  assert.equal(redactCredentialValueText("-----BEGIN PRIVATE KEY-----\nMIIEfake\n-----END PRIVATE KEY-----"), "[REDACTED]");
+  assert.equal(redactCredentialValueText(`${certificate}\n-----BEGIN EC PRIVATE KEY-----\nMHcC`), `${certificate}\n[REDACTED]`, "a truncated private block after a kept certificate");
+
+  // Names, prose, and this module's own vocabulary survive.
+  for (const text of [
+    "Tenable request GET /scans failed (HTTP 403 Forbidden)",
+    "Tenable request GET /scanners/null/agents failed (HTTP 502 Bad Gateway; non-JSON text/html response body (1234 bytes, not echoed))",
+    "GET /assets/export/asset-export-1/chunks/1 replayed the same page at offset 200, so the walk could not advance",
+    "Export 550e8400-e29b-41d4-a716-446655440000 ended with status TIMEOUT(PROCESSING): the last GET /vulns/export/550e8400-e29b-41d4-a716-446655440000/status poll reported PROCESSING.",
+    "credentialed scan ratio 0.8; credential inventory read 12 of 40; managed credentials: 12; credential_threshold=0.8",
+    "TENABLE_ACCESS_KEY and TENABLE_SECRET_KEY (or access_key and secret_key arguments) are required for Tenable Vulnerability Management.",
+    "Tenable Security Center GET /rest/scan returned error_code 143: not authorized",
+    "Unable to read Tenable config file /etc/tenable.yaml (EACCES)",
+    "Unable to parse Tenable config file: invalid YAML in /etc/tenable.yaml at line 3",
+    "/tmp/tenable-loader-errors-Ab3xY9/nested.yaml",
+    "policy 550e8400-e29b-41d4-a716-446655440000 unified_compliance_matrix ENOENT PCI-DSS-4 FREQ=WEEKLY;INTERVAL=1;BYDAY=MO",
+    "Basic authentication is required; the Bearer token is missing; token expired, retry later",
+    '"pass": 12, "pass_rate": 95, "two_factor": {"sms_enabled": 1}, "password": {"min_length": 12}, "last_apikey_access": 1726920000000',
+    '"api_keys": 3, "secrets": 0, "credentials": 12; keys=3 tokens: 7 cookies: 0',
+    "agent_offline_days=7 auth_type=saml credentials_file=/etc/x access_key_id=AKIA plugin_set=202609211000 loaded_plugin_set=202609211000",
+    "arguments-access_key environment-TENABLE_SECRET_KEY config-file-sc_secret_key default-url",
+  ]) {
+    assert.equal(redactErrorText(text), text, text);
+  }
+
+  for (const [key, expected] of [
+    ["key", true], ["token", true], ["accessKey", true], ["secretKey", true], ["api_key", true], ["X-ApiKeys", true], ["Set-Cookie", true],
+    ["TNS_SESSIONID", true], ["session_id", true], ["JSESSIONID", true], ["password1", true], ["authtoken", true],
+    ["sharedsecret", true], ["privatekey", true], ["password_hash", true], ["token_value", true], ["authorization_header", true],
+    ["registration_code", true], ["linking_key", true], ["license_key", true], ["client_secret", true], ["sid", true], ["sig", true],
+    ["last_apikey_access", false], ["public_key", false], ["tokenCount", false], ["scopes", false], ["client_id", false], ["user", false],
+    ["login", false], ["max_keys", false], ["auth_type", false], ["password_policy", false], ["two_factor", false],
+    ["pass_rate", false], ["pass", false], ["access_key_id", false], ["monkey", false], ["oauth", false], ["sessions", false],
+    ["credential_threshold", false], ["credentials_file", false], ["credentialed_ratio", false], ["plugin_set", false], ["loaded_plugin_set", false],
+    ["activation_code", true], ["authorization_code", true], ["recovery_codes", true], ["status_code", false], ["error_code", false], ["country_code", false], ["code", false],
+  ]) {
+    assert.equal(isCredentialKey(key), expected, key);
+  }
+  // Property names in payloads follow Tenable's data model: a bare key is a tag key, not a credential.
+  for (const [name, expected] of [
+    ["password", true], ["secretKey", true], ["accessKey", true], ["registration_code", true], ["linking_key", true], ["linkingkey", true],
+    ["clientSecret", true], ["private_key", true], ["api_token", true], ["TNS_SESSIONID", true], ["key", false], ["value", false],
+    ["last_apikey_access", false], ["credentials", false], ["two_factor", false], ["plugin_set", false],
+  ]) {
+    assert.equal(propertyNameIsCredential(name), expected, name);
+  }
+});
+
+test("no window of a carried or configured canary survives, for every canary length from 6 to 24", () => {
+  // A deterministic generator so a failure reproduces; one digit is forced so the value
+  // never falls under a prose exception after a scheme.
+  let seed = 0x2545f491;
+  const next = () => {
+    seed = (seed * 1103515245 + 12345) % 0x80000000;
+    return seed;
+  };
+  const alphabet = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+  const canary = (length) => {
+    let value = "";
+    for (let index = 0; index < length; index += 1) value += alphabet[next() % alphabet.length];
+    return `${value.slice(0, -1)}${next() % 10}`;
+  };
+  for (let length = 6; length <= 24; length += 1) {
+    for (let sample = 0; sample < 3; sample += 1) {
+      const value = canary(length);
+      for (const [text] of carriersOf(value)) {
+        for (const scrub of [redactErrorText, redactCredentialValueText]) {
+          assertNoWindow(scrub(text), value, Math.min(6, length), `${scrub.name} ${text}`);
+        }
+      }
+      for (const form of secretForms(value)) {
+        assertNoWindow(redactSecrets(`upstream echoed ${form} in a ${length}-character reply`, [value]), value, Math.min(6, length), `configured ${value} as ${form}`);
+      }
+    }
+  }
+});
+
+test("the healthy bundle is fixed text the scrubs leave untouched, so every marker in a bundle is attributable to a credential or an echo", async () => {
+  const clients = clientsFor(healthyRoutes());
+  const bundle = await exportTenableAuditBundle(clients, mkdtempSync(join(tmpdir(), "tenable-fixed-text-")), { now: NOW });
+  const files = readBundleFiles(bundle.outputDir);
+  assert.ok(files.size >= 20);
+  for (const [name, content] of files) {
+    if (name.startsWith("core_data/") && name.endsWith(".json")) {
+      // core_data/ is the vendor payload after the data scrub, where a {key, value} tag
+      // pair is evidence: it is fixed under the data scrub it was written through, while
+      // the whole-text scrubs, which no sink applies to a payload, would read the
+      // serialized "key": pair as a carrier.
+      const payload = JSON.parse(content);
+      assert.deepEqual(redactCredentialProperties(payload), payload, `${name} is fixed under the data scrub`);
+    } else {
+      assert.equal(redactErrorText(content), content, `${name} is fixed text redactErrorText leaves alone`);
+      assert.equal(redactCredentialValueText(content), content, `${name} is fixed text redactCredentialValueText leaves alone`);
+    }
+    assert.equal(redactConfiguredSecrets(content, configuredTenableSecrets(vmConfig())), content, `${name} carries no configured secret`);
+    // QUICK_REFERENCE.md describes the marker; every other file is marker-free on a healthy tenant.
+    if (name !== "QUICK_REFERENCE.md") assert.ok(!content.includes("[REDACTED]"), `${name} carries no marker on a healthy tenant`);
+  }
+  const access = await checkTenableAccess(clients);
+  const results = await runAll(clients, { expectedAssetCount: 2 });
+  for (const [label, text] of [["access check", JSON.stringify(access)], ["assessments", JSON.stringify(results)]]) {
+    assert.equal(redactErrorText(text), text, `${label} is fixed text`);
+    assert.ok(!text.includes("[REDACTED]"), `${label} carries no marker on a healthy tenant`);
+  }
+});
+
+test("a documented error field is scrubbed of the configured secrets before it is shortened, so the 200-character cut never leaves a fragment of a secret", async () => {
+  const forms = [...secretForms(FIXTURE_ACCESS_KEY), ...secretForms(FIXTURE_SECRET_KEY)];
+  for (const form of forms) {
+    // The form straddles the 200-character boundary of the shortened field: scrubbing
+    // after the cut would leave its head behind.
+    const error = `${"x".repeat(200 - Math.floor(form.length / 2))} ${form} was rejected by the upstream identity provider`;
+    const body = JSON.stringify({ error });
+    const clients = createTenableClients(vmConfig(), {
+      fetchImpl: async () => new Response(body, { status: 403, statusText: "Forbidden", headers: { "content-type": "application/json" } }),
+      sleepImpl: async () => {},
+    });
+    await assert.rejects(clients.vm.listScans(), (thrown) => {
+      assertNoWindow(thrown.message, form, 8, `straddling ${form}`);
+      assert.match(thrown.message, /HTTP 403 Forbidden; x{20,} \[REDACTED\]/, thrown.message);
+      return true;
+    });
+    // The helper on its own, with the default scrub, keeps the same guarantee for the
+    // shapes the general scrub knows (the form itself is name-shaped, so only the caller's
+    // configured-secret scrub removes it).
+    const response = new Response(body, { status: 403, statusText: "Forbidden", headers: { "content-type": "application/json" } });
+    assertNoWindow(describeErrorBody(response, body, (text) => redactSecrets(text, [FIXTURE_ACCESS_KEY, FIXTURE_SECRET_KEY])), form, 8, `describeErrorBody ${form}`);
+  }
+});
+
+// Canary values that must never survive into any tool result, finding, summary, or bundle file.
 const CANARY_BEARER = "CANARY-BEARER-9f8e7d6c5b4a3210";
 const CANARY_SESSION = "CANARY-SESSION-0a1b2c3d4e5f6789";
 const CANARY_API_KEY = "CANARY-APIKEY-1122334455667788";
 const CANARY_URL_TOKEN = "CANARY-URLTOKEN-99aa88bb77cc66dd";
-const CANARIES = [CANARY_BEARER, CANARY_SESSION, CANARY_API_KEY, CANARY_URL_TOKEN];
+// A name-shaped value (the ruling's own example) that only its carrier, a cookie
+// assignment, gives away, and a plain lowercase word that only the Bearer scheme does.
+const CANARY_NAMED = "sess-canary-COOKIE-31415926535897";
+const CANARY_PLAIN = "canaryplainbearerword";
+const CANARIES = [CANARY_BEARER, CANARY_SESSION, CANARY_API_KEY, CANARY_URL_TOKEN, CANARY_NAMED, CANARY_PLAIN];
 const CANARY_URL = `https://api.example.com/v1/x?token=${CANARY_URL_TOKEN}`;
 
 function htmlCanaryResponse() {
   const body = `<html><head><title>502 Bad Gateway</title></head><body><p>Authorization: Bearer ${CANARY_BEARER}</p>`
     + `<p>Set-Cookie: TNS_SESSIONID=${CANARY_SESSION}; Path=/</p><p>X-ApiKeys: accessKey=${CANARY_API_KEY};secretKey=${CANARY_API_KEY}</p>`
+    + `<p>Proxy-Authorization: Bearer ${CANARY_PLAIN}</p><p>Cookie: sid=${CANARY_NAMED}</p>`
     + `<p>The upstream at ${CANARY_URL} did not answer in time, retry later.</p></body></html>`;
-  return new Response(body, { status: 502, headers: { "content-type": "text/html; charset=utf-8" } });
+  // retry-after: 0 keeps the client's 5xx retries instant when the response reaches a real sleep.
+  return new Response(body, { status: 502, statusText: "Bad Gateway", headers: { "content-type": "text/html; charset=utf-8", "retry-after": "0" } });
 }
 
 function jsonCanaryResponse() {
-  return jsonResponse({
-    error: `Upstream refused Bearer ${CANARY_BEARER} when calling ${CANARY_URL} mid-sentence; session=${CANARY_SESSION} and api_key=${CANARY_API_KEY} were rejected`,
-  }, 400);
+  return new Response(JSON.stringify({
+    error: `Upstream refused Bearer ${CANARY_BEARER} at ${CANARY_URL} mid-sentence; session=${CANARY_SESSION}, api_key=${CANARY_API_KEY}, Bearer ${CANARY_PLAIN}, sid=${CANARY_NAMED} rejected`,
+  }), { status: 400, statusText: "Bad Request", headers: { "content-type": "application/json" } });
 }
 
-function assertNoCanary(text, label) {
-  for (const canary of CANARIES) assert.ok(!text.includes(canary), `${label}: ${canary} leaked`);
+// The scrubbed rendering of the JSON canary sentence, as every error string must carry it.
+const JSON_CANARY_MARKER = /HTTP 400 Bad Request; Upstream refused Bearer \[REDACTED\] at https:\/\/api\.example\.com\/v1\/x\?token=\[REDACTED\] mid-sentence; session=\[REDACTED\], api_key=\[REDACTED\], Bearer \[REDACTED\], sid=\[REDACTED\] rejected/;
+const HTML_CANARY_MARKER = /HTTP 502 Bad Gateway; non-JSON text\/html response body \(\d+ bytes, not echoed\)/;
+
+// The configured secrets of the sweep fixture, echoed bare in prose in every encoded form:
+// nothing but the configured-secret pass (guard 2) removes a name-shaped key, so their
+// absence proves that pass ran at every sink.
+const ECHOED_FORMS = [...secretForms(FIXTURE_ACCESS_KEY), ...secretForms(FIXTURE_SECRET_KEY)];
+const ECHOED_MARKER = /HTTP 400 Bad Request; credentials(?: \[REDACTED\])+ rejected/;
+
+function echoedSecretsResponse() {
+  return new Response(JSON.stringify({ error: `credentials ${ECHOED_FORMS.join(" ")} rejected` }), { status: 400, statusText: "Bad Request", headers: { "content-type": "application/json" } });
+}
+
+function assertNoCanary(text, label, canaries = CANARIES) {
+  for (const canary of canaries) assertNoWindow(text, canary, 8, label);
 }
 
 function canaryClients(routes, surfaceKey, makeResponse) {
@@ -1027,44 +1328,164 @@ function canaryClients(routes, surfaceKey, makeResponse) {
   });
 }
 
+// Body text the notes must never echo, whatever the shape (the status text itself is part of the note).
+const ECHOED_BODY_TEXT = /<html|Set-Cookie|X-ApiKeys:|TNS_SESSIONID|did not answer|Proxy-Authorization/i;
+
 test("error-body canary sweep: every Tenable surface failing with an HTML 502 or a JSON error body leaks no credential into any tool result, finding, or bundle file", async () => {
   const surfaces = Object.keys(healthyRoutes());
   assert.ok(surfaces.length >= 25, `expected every collector surface to be enumerated, found ${surfaces.length}`);
   const shapes = [
-    { name: "html-502", make: htmlCanaryResponse, marker: /non-JSON text\/html response body \(\d+ bytes, not echoed\)/ },
-    { name: "json-400", make: jsonCanaryResponse, marker: /\[REDACTED\]/ },
+    { name: "html-502", make: htmlCanaryResponse, marker: HTML_CANARY_MARKER, canaries: CANARIES },
+    { name: "json-400", make: jsonCanaryResponse, marker: JSON_CANARY_MARKER, canaries: CANARIES },
+    { name: "echoed-secrets", make: echoedSecretsResponse, marker: ECHOED_MARKER, canaries: ECHOED_FORMS },
   ];
+  // Fixture self-check: each body carries every canary or form verbatim before the scrubs see it.
+  for (const shape of shapes) {
+    const body = await shape.make().text();
+    for (const canary of shape.canaries) assert.ok(body.includes(canary), `fixture self-check: ${shape.name} carries ${canary}`);
+  }
   for (const shape of shapes) {
     for (const surface of surfaces) {
       const label = `${shape.name} on ${surface}`;
       const clients = canaryClients(healthyRoutes(), surface, shape.make);
+      const noCanary = (text, where) => assertNoCanary(text, where, shape.canaries);
 
       const access = await checkTenableAccess(clients);
-      assertNoCanary(JSON.stringify(access), `${label} access check`);
+      noCanary(JSON.stringify(access), `${label} access check`);
       const probed = access.surfaces.find((entry) => entry.endpoint === surface);
       if (probed) {
         assert.notEqual(probed.status, "readable", `${label}: surface should not be readable`);
-        assert.match(probed.error ?? "", shape.marker, `${label}: access error must carry the note`);
+        assert.match(probed.error ?? "", shape.marker, `${label}: access error must carry the note: ${probed.error}`);
       }
 
       const results = await runAll(clients, { expectedAssetCount: 2 });
       const serialized = JSON.stringify(results);
-      assertNoCanary(serialized, `${label} assessments`);
+      noCanary(serialized, `${label} assessments`);
       const errors = results.flatMap((result) => result.errors);
       assert.ok(errors.length > 0, `${label}: the failing surface must be recorded as an error`);
       assert.ok(errors.some((error) => shape.marker.test(error)), `${label}: errors must carry the note: ${JSON.stringify(errors)}`);
-      for (const error of errors) assert.ok(!/<html|Bad Gateway|Set-Cookie|TNS_SESSIONID/i.test(error), `${label}: body text echoed: ${error}`);
+      for (const error of errors) assert.doesNotMatch(error, ECHOED_BODY_TEXT, `${label}: body text echoed: ${error}`);
 
       const bundle = await exportTenableAuditBundle(clients, mkdtempSync(join(tmpdir(), "tenable-canary-")), { now: NOW });
       const files = readBundleFiles(bundle.outputDir);
       const zipEntries = readZipEntries(bundle.zipPath);
       assert.ok(files.size >= 20 && zipEntries.size >= 20, `${label}: bundle and zip were written`);
-      assertSecretsAbsent(assert, files, CANARIES, `${label} bundle`);
-      assertSecretsAbsent(assert, zipEntries, CANARIES, `${label} zip`);
+      assertSecretsAbsent(assert, files, shape.canaries, `${label} bundle`);
+      assertSecretsAbsent(assert, zipEntries, shape.canaries, `${label} zip`);
+      for (const [name, content] of files) noCanary(content, `${label} ${name}`);
       const errorLog = files.get("_errors.log");
       assert.ok(errorLog !== undefined, `${label}: _errors.log must exist`);
       assert.match(errorLog, shape.marker, `${label}: _errors.log must carry the note`);
     }
+  }
+});
+
+test("the registered tools scrub error strings end to end over HTTP: access check, every assess tool, and the export", async () => {
+  // A local server is not a Tenable cloud host, so the resolver treats it as Tenable
+  // Security Center: the registered tools run the Security Center surfaces over the real
+  // fetch, the real retry path, and the real config resolver, with the API keys supplied by
+  // a YAML config file rather than arguments so the tool boundary must learn them from the
+  // resolved configuration. The Vulnerability Management surfaces are covered by the
+  // mocked sweep above through the same client and sink code.
+  const scUser = { id: "1", username: "auditor", role: { id: "1", name: "Security Manager" }, lastLogin: String(Math.floor(NOW / 1000) - 3600) };
+  const scRoutes = {
+    "GET /rest/currentUser": { error_code: 0, response: scUser },
+    "GET /rest/scan": { error_code: 0, response: { usable: [{ id: "1", name: "Weekly", status: "completed", schedule: { type: "ical", repeatRule: "FREQ=WEEKLY" }, policy: { id: "1" }, credentials: [{ id: "1" }], modifiedTime: String(Math.floor(NOW / 1000) - 3600) }], manageable: [] } },
+    "GET /rest/scanResult": { error_code: 0, response: { usable: [{ id: "1", name: "Weekly", status: "Completed", startTime: String(Math.floor(NOW / 1000) - 7200), finishTime: String(Math.floor(NOW / 1000) - 3600), scannedIPs: "10", totalIPs: "10" }], manageable: [] } },
+    "GET /rest/scanner": { error_code: 0, response: { usable: [{ id: "1", name: "sc-scanner", status: "1", enabled: "true", version: "10.8.0", pluginSet: RECENT_PLUGIN_SET, loadedPluginSet: RECENT_PLUGIN_SET, lastCheckinTime: String(Math.floor(NOW / 1000) - 600) }], manageable: [] } },
+    "GET /rest/user": { error_code: 0, response: { usable: [{ ...scUser, status: "0", locked: "false", failedLogins: "0", authType: "tns" }], manageable: [] } },
+    "GET /rest/feed": { error_code: 0, response: { active: { updateTime: String(Math.floor(NOW / 1000) - 3600), stale: "false" } } },
+  };
+  const failing = new Map();
+  const server = createServer((request, response) => {
+    const key = `${request.method} ${new URL(`http://127.0.0.1${request.url}`).pathname}`;
+    const upstream = failing.has(key)
+      ? failing.get(key)()
+      : scRoutes[key] !== undefined
+        ? jsonResponse(scRoutes[key])
+        : jsonResponse({ error_code: 146, error_msg: `unrouted ${key}` }, 404);
+    upstream.text().then((text) => {
+      response.writeHead(upstream.status, Object.fromEntries(upstream.headers));
+      response.end(text);
+    });
+  });
+  await new Promise((resolveListen) => server.listen(0, "127.0.0.1", resolveListen));
+  const { port } = server.address();
+  const configFile = join(mkdtempSync(join(tmpdir(), "tenable-tool-config-")), "config.yaml");
+  writeFileSync(configFile, `url: http://127.0.0.1:${port}\naccess_key: ${FIXTURE_ACCESS_KEY}\nsecret_key: ${FIXTURE_SECRET_KEY}\n`);
+
+  const tools = new Map();
+  registerTenableTools({ registerTool: (tool) => tools.set(tool.name, tool) });
+  const run = async (name, extra = {}) => {
+    const tool = tools.get(name);
+    return tool.execute("call-tools", tool.prepareArguments({ config_file: configFile, ...extra }));
+  };
+  const assessTools = ["tenable_assess_scan_program", "tenable_assess_sensor_coverage", "tenable_assess_access_control", "tenable_assess_vulnerability_management"];
+  const failingSurfaces = { "GET /rest/scan": "sc_scans", "GET /rest/user": "sc_users" };
+
+  try {
+    const healthy = await run("tenable_check_access");
+    assert.notEqual(healthy.isError, true, healthy.content[0].text);
+    assert.equal(healthy.details.platform, `Tenable Security Center http://127.0.0.1:${port}`, "the local server resolves as Security Center");
+    // Security Center alone: its surfaces read, the Vulnerability Management ones are not configured.
+    const scProbes = healthy.details.surfaces.filter((probe) => probe.name.startsWith("sc_"));
+    assert.ok(scProbes.length >= 4 && scProbes.every((probe) => probe.status === "readable"), JSON.stringify(healthy.details.surfaces));
+    assert.ok(healthy.details.surfaces.every((probe) => probe.name.startsWith("sc_") || probe.status === "not_configured"), JSON.stringify(healthy.details.surfaces));
+    assert.deepEqual(Object.values(failingSurfaces).filter((name) => !scProbes.some((probe) => probe.name === name)), [], "the failing surfaces are probed by name");
+    for (const secret of [FIXTURE_ACCESS_KEY, FIXTURE_SECRET_KEY]) assertNoWindow(JSON.stringify(healthy), secret, 8, "healthy access check");
+
+    for (const shape of [
+      { name: "html-502", make: htmlCanaryResponse, marker: HTML_CANARY_MARKER, canaries: [...CANARIES, ...ECHOED_FORMS] },
+      { name: "json-400", make: jsonCanaryResponse, marker: JSON_CANARY_MARKER, canaries: [...CANARIES, ...ECHOED_FORMS] },
+      { name: "echoed-secrets", make: echoedSecretsResponse, marker: ECHOED_MARKER, canaries: ECHOED_FORMS },
+    ]) {
+      failing.clear();
+      for (const surface of Object.keys(failingSurfaces)) failing.set(surface, shape.make);
+      const noCanary = (text, where) => { for (const canary of shape.canaries) assertNoWindow(text, canary, 8, where); };
+
+      const access = await run("tenable_check_access");
+      noCanary(JSON.stringify(access), `${shape.name} tenable_check_access`);
+      assert.notEqual(access.isError, true, access.content[0].text);
+      const failedProbes = access.details.surfaces.filter((probe) => probe.status !== "readable" && probe.status !== "not_configured");
+      assert.deepEqual(failedProbes.map((probe) => probe.name).sort(), Object.values(failingSurfaces).sort(), `${shape.name}: exactly the failing surfaces probe as unreadable`);
+      for (const probe of failedProbes) {
+        assert.equal(probe.status, "not_readable");
+        assert.equal(probe.count, null);
+        assert.match(probe.error, shape.marker, `${shape.name}: ${probe.name}: ${probe.error}`);
+        assert.equal(probe.httpStatus, shape.name === "html-502" ? 502 : 400, `${shape.name}: the probe carries the observed status`);
+      }
+      assert.doesNotMatch(access.content[0].text, ECHOED_BODY_TEXT);
+
+      const recorded = [];
+      for (const name of assessTools) {
+        const result = await run(name);
+        noCanary(JSON.stringify(result), `${shape.name} ${name}`);
+        assert.notEqual(result.isError, true, result.content[0].text);
+        assert.equal(result.details.tool, name);
+        for (const error of result.details.errors) {
+          assert.doesNotMatch(error, ECHOED_BODY_TEXT, error);
+          if (shape.marker.test(error)) recorded.push(error);
+        }
+        assert.doesNotMatch(result.content[0].text, ECHOED_BODY_TEXT);
+      }
+      assert.ok(recorded.length >= Object.keys(failingSurfaces).length, `${shape.name}: every failing surface is recorded with the note by the assessment that reads it: ${JSON.stringify(recorded)}`);
+
+      const exported = await run("tenable_export_audit_bundle", { output_dir: mkdtempSync(join(tmpdir(), "tenable-tool-export-")) });
+      noCanary(JSON.stringify(exported), `${shape.name} tenable_export_audit_bundle`);
+      assert.notEqual(exported.isError, true, exported.content[0].text);
+      assert.ok(exported.details.error_count >= Object.keys(failingSurfaces).length, `${shape.name}: the export counts the failed reads`);
+      const files = readBundleFiles(exported.details.output_dir);
+      const zipEntries = readZipEntries(exported.details.zip_path);
+      assert.ok(files.size >= 20 && zipEntries.size === files.size, `${shape.name}: bundle and zip were written`);
+      for (const [name, text] of files) noCanary(text, `${shape.name} tool bundle ${name}`);
+      for (const [name, text] of zipEntries) noCanary(text, `${shape.name} tool zip ${name}`);
+      assert.ok(files.get("_errors.log").split("\n").some((line) => shape.marker.test(line)), `${shape.name}: _errors.log carries the note`);
+      // The keys came from the config file alone: metadata names the file, never the values.
+      const metadata = JSON.parse(files.get("metadata.json"));
+      assert.ok(metadata.source_chain.some((entry) => entry === `config:${configFile}`), JSON.stringify(metadata.source_chain));
+    }
+  } finally {
+    server.close();
   }
 });
 
@@ -1496,7 +1917,7 @@ test("registerTenableTools registers the read-only tool set with TypeBox schemas
   globalThis.fetch = routerFetch(healthyRoutes());
   try {
     const check = registered.find((tool) => tool.name === "tenable_check_access");
-    const result = await check.execute("call-1", check.prepareArguments({ access_key: "access-key-123456", secret_key: "secret-key-654321", config_file: EMPTY_CONFIG_FILE }));
+    const result = await check.execute("call-1", check.prepareArguments({ access_key: FIXTURE_ACCESS_KEY, secret_key: FIXTURE_SECRET_KEY, config_file: EMPTY_CONFIG_FILE }));
     assert.ok(result.content[0].text.includes("healthy"), result.content[0].text);
     const failure = await check.execute("call-2", check.prepareArguments({ config_file: EMPTY_CONFIG_FILE, url: "https://cloud.tenable.com" }));
     assert.ok(JSON.stringify(failure).includes("TENABLE_ACCESS_KEY"));
