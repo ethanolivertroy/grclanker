@@ -2212,7 +2212,7 @@ test("review round item 5: a capped prevention policy list never asserts platfor
 });
 
 /** Wording that asserts an absence across rows the finding did not read; a capped list must never carry it. */
-const UNIVERSAL_ABSENCE = /\bNo user\b|\bevery dated admin login\b|\breturned no hosts\b|\bno active containment\b|\bemptiness is compliant\b|\bnothing to\b/;
+const UNIVERSAL_ABSENCE = /\bNo user\b|\bevery dated admin login\b|\breturned no hosts\b|\bno active containment\b|\bemptiness is compliant\b|\bemptiness fails\b|\bnothing to\b|\breturned zero\b|\bzero rules exist\b|\bno detection logic\b|\bno machine learning coverage\b|\bnothing is hidden\b/;
 
 test("round 2 SEND BACK 5: under a capped list CS-17 and CS-23 scope their sentences to the rows that were read and never assert a universal absence; a complete read keeps its counts and the emptiness sentence", async () => {
   // CS-17 under CAP listUserUuids: 1 of 43 user uuids visible, the visible user an admin with a fresh login.
@@ -2285,6 +2285,152 @@ test("round 2 SEND BACK 5: under a capped list CS-17 and CS-23 scope their sente
     assert.doesNotMatch(item.summary, UNIVERSAL_ABSENCE, `${id} under the partial client: ${item.summary}`);
     assert.match(item.summary, /Partial inventory: only \d+ of \d+ /);
   }
+});
+
+/** Every paged read reports rows it did not return: a truncated page with zero visible rows. */
+function createTruncatedEmptyClient(total = 40) {
+  const overrides = {};
+  for (const name of PAGED_METHODS) overrides[name] = async () => truncatedPage([], total);
+  return createFakeClient(overrides);
+}
+
+function truncatedBeforeVisibleSentence(read, row, property) {
+  return `The ${read} read was truncated before any ${row} was visible, so ${property} cannot be confirmed or ruled out from the visible rows.`;
+}
+
+function escapeRegExp(text) {
+  return text.replace(/[.*+?^${}()|[\]\\/]/g, "\\$&");
+}
+
+/** Ruling (a): emptiness is compliant only for a complete read, so a truncated page with no visible row renders warn. */
+const EMPTINESS_RULE_CASES = [
+  { id: "CS-19", read: "IOA exclusions", row: "exclusion", property: "suppression of detection logic", countLeaf: "exclusions", assess: assessCrowdstrikeAccessGovernance, method: "listIoaExclusions", emptiness: /returned zero exclusions; no detection logic is being suppressed, so emptiness is compliant/ },
+  { id: "CS-20", read: "ML exclusions", row: "exclusion", property: "suppression of machine learning coverage", countLeaf: "exclusions", assess: assessCrowdstrikeAccessGovernance, method: "listMlExclusions", emptiness: /returned zero exclusions; no machine learning coverage is being suppressed, so emptiness is compliant/ },
+  { id: "CS-21", read: "sensor visibility exclusions", row: "exclusion", property: "paths hidden from the sensor", countLeaf: "exclusions", assess: assessCrowdstrikeAccessGovernance, method: "listSensorVisibilityExclusions", emptiness: /returned zero exclusions; nothing is hidden from the sensor, so emptiness is compliant/ },
+  { id: "CS-22", read: "critical/high alerts", row: "dated alert", property: "response within the SLA", countLeaf: "alerts_reviewed", assess: assessCrowdstrikeResponseReadiness, method: "listAlerts", emptiness: /returned no dated critical or high alerts created in the last 30 days \(window stated\), so there was nothing to respond to; emptiness is compliant/ },
+];
+
+/** Ruling (b): a fail asserted from zero visible rows of a truncated list is a claim about unread rows, so it renders manual. */
+const EMPTY_FAIL_RULE_CASES = [
+  { id: "CS-13", read: "hosts", row: "host", property: "sensor deployment coverage", countLeaf: "sampled_hosts", assess: assessCrowdstrikeSensorCoverage, method: "listHosts", emptiness: /returned zero hosts, so no sensor deployment coverage can be demonstrated; emptiness fails this control/ },
+  { id: "CS-14", read: "host groups", row: "host group", property: "policy assignment coverage", countLeaf: "host_groups", assess: assessCrowdstrikeSensorCoverage, method: "listHostGroups", emptiness: /returned zero host groups, so no policy assignment coverage can be demonstrated; emptiness fails this control/ },
+  { id: "CS-24", read: "Identity Protection policy rules", row: "rule", property: "identity-based lateral movement prevention", countLeaf: "rules", assess: assessCrowdstrikeAccessGovernance, method: "listIdentityProtectionRules", emptiness: /zero rules exist, so identity-based lateral movement is not being prevented; emptiness fails this control/ },
+];
+
+test("round 3 rulings (a) and (b): a truncated page with zero visible rows never passes CS-19, CS-20, CS-21, or CS-22 and never fails CS-13, CS-14, or CS-24; the sentence says the property cannot be confirmed or ruled out from the visible rows, and a complete empty read keeps its emptiness verdict", async () => {
+  // Every paged read truncated at zero visible rows of 40.
+  const truncatedEmpty = (await runAllCrowdstrikeAssessments(createTruncatedEmptyClient())).flatMap((assessment) => assessment.findings);
+  const byId = (findings, id) => {
+    const item = findings.find((entry) => entry.id === id);
+    assert.ok(item, `expected finding ${id}`);
+    return item;
+  };
+
+  // (a) The four emptiness findings render warn with the scoped sentence and the seen-versus-total clause.
+  for (const item of EMPTINESS_RULE_CASES) {
+    const found = byId(truncatedEmpty, item.id);
+    assert.equal(found.status, "warn", `${item.id} on a truncated page with zero visible rows`);
+    assert.equal(
+      found.summary,
+      `${truncatedBeforeVisibleSentence(item.read, item.row, item.property)} Partial inventory: only 0 of 40 ${item.read} were read (sampled or truncated), so this verdict cannot exceed warn.`,
+    );
+    assert.doesNotMatch(found.summary, UNIVERSAL_ABSENCE);
+    assert.deepEqual(found.evidence.partial_inventory, [{ dataset: item.read, seen: 0, total: 40 }]);
+    assert.equal(found.evidence[item.countLeaf], 0, `${item.id} counts the visible rows`);
+    assert.equal(found.evidence.absence_claim, undefined, `${item.id} does not fail, so it carries no absence claim`);
+
+    // The single-dataset cap: only this read truncated at zero rows, the rest of the fixture healthy.
+    const single = byId((await item.assess(createFakeClient({ [item.method]: async () => truncatedPage([], 40) }))).findings, item.id);
+    assert.equal(single.status, "warn", `${item.id} under a single truncated empty read`);
+    assert.match(single.summary, new RegExp(`^${escapeRegExp(truncatedBeforeVisibleSentence(item.read, item.row, item.property))} Partial inventory: only 0 of 40 `));
+    assert.doesNotMatch(single.summary, UNIVERSAL_ABSENCE);
+  }
+
+  // (b) The three empty-fail findings render manual through absence_claim, never fail.
+  for (const item of EMPTY_FAIL_RULE_CASES) {
+    const found = byId(truncatedEmpty, item.id);
+    assert.equal(found.status, "manual", `${item.id} on a truncated page with zero visible rows`);
+    assert.notEqual(found.status, "fail");
+    assert.equal(found.evidence.absence_claim, true, `${item.id} marks the fail as an absence claim`);
+    assert.match(found.summary, new RegExp(`^${escapeRegExp(truncatedBeforeVisibleSentence(item.read, item.row, item.property))} Partial inventory: only 0 of 40 `));
+    assert.match(found.summary, /so the absence this verdict rests on cannot be asserted for the unread rows\. Verdict: manual \(unknown\)\.$/);
+    assert.doesNotMatch(found.summary, UNIVERSAL_ABSENCE);
+    assert.equal(found.evidence[item.countLeaf], 0, `${item.id} counts the visible rows`);
+    assert.ok(found.evidence.partial_inventory.some((partial) => partial.dataset === item.read && partial.seen === 0 && partial.total === 40));
+
+    const single = byId((await item.assess(createFakeClient({ [item.method]: async () => truncatedPage([], 40) }))).findings, item.id);
+    assert.equal(single.status, "manual", `${item.id} under a single truncated empty read`);
+    assert.equal(single.evidence.absence_claim, true);
+    assert.equal(
+      single.summary,
+      `${truncatedBeforeVisibleSentence(item.read, item.row, item.property)} Partial inventory: only 0 of 40 ${item.read} were read (sampled or truncated), so the absence this verdict rests on cannot be asserted for the unread rows. Verdict: manual (unknown).`,
+    );
+  }
+  assert.equal(byId(truncatedEmpty, "CS-14").summary, "The host groups read was truncated before any host group was visible, so policy assignment coverage cannot be confirmed or ruled out from the visible rows. Partial inventory: only 0 of 40 hosts; 0 of 40 host groups were read (sampled or truncated), so the absence this verdict rests on cannot be asserted for the unread rows. Verdict: manual (unknown).");
+
+  // CS-14 rests on whichever list is empty: zero hosts of a truncated host list with a complete group list is the
+  // absence claim (manual); a complete empty group list is a real fail even when the host list is partial.
+  const emptyHosts = findingById(await assessCrowdstrikeSensorCoverage(createFakeClient({ listHosts: async () => truncatedPage([], 40) })), "CS-14");
+  assert.equal(emptyHosts.status, "manual");
+  assert.equal(emptyHosts.evidence.absence_claim, true);
+  assert.equal(emptyHosts.summary, "The hosts read was truncated before any host was visible, so host group assignment coverage cannot be confirmed or ruled out from the visible rows. Partial inventory: only 0 of 40 hosts were read (sampled or truncated), so the absence this verdict rests on cannot be asserted for the unread rows. Verdict: manual (unknown).");
+  const noGroups = findingById(await assessCrowdstrikeSensorCoverage(createFakeClient({ listHostGroups: async () => [], listHosts: async () => truncatedPage([host()], 41) })), "CS-14");
+  assert.equal(noGroups.status, "fail", "zero host groups on a complete read is a fail whatever the host list did");
+  assert.equal(noGroups.evidence.absence_claim, undefined);
+  assert.equal(noGroups.summary, "The host groups endpoint was readable but returned zero host groups, so no policy assignment coverage can be demonstrated; emptiness fails this control. Partial inventory: only 1 of 41 hosts were read (sampled or truncated), so this verdict cannot exceed warn.");
+
+  // CS-22 with one visible but undated alert of 40: no dated alert is visible, so the scoped sentence carries the
+  // undated clause and the partial clause, and the verdict is warn.
+  const undatedAlerts = findingById(await assessCrowdstrikeResponseReadiness(createFakeClient({ listAlerts: async () => truncatedPage([{ composite_id: "a-9", severity: 90, status: "new" }], 40) })), "CS-22");
+  assert.equal(undatedAlerts.status, "warn");
+  assert.equal(undatedAlerts.summary, "The critical/high alerts read was truncated before any dated alert was visible, so response within the SLA cannot be confirmed or ruled out from the visible rows. 1 alerts have no created_timestamp timestamp; they were excluded from freshness counts and cap this verdict at warn. Partial inventory: only 1 of 40 critical/high alerts were read (sampled or truncated), so this verdict cannot exceed warn.");
+  assert.doesNotMatch(undatedAlerts.summary, UNIVERSAL_ABSENCE);
+
+  // Control: a complete empty read keeps the emptiness verdict and sentence with no partial clause and no absence claim.
+  const completeEmpty = (await runAllCrowdstrikeAssessments(createEmptyClient())).flatMap((assessment) => assessment.findings);
+  for (const item of EMPTINESS_RULE_CASES) {
+    const found = byId(completeEmpty, item.id);
+    assert.equal(found.status, "pass", `${item.id} on a complete empty read`);
+    assert.match(found.summary, item.emptiness);
+    assert.doesNotMatch(found.summary, /Partial inventory:|cannot be confirmed or ruled out/);
+    assert.equal(found.evidence.partial_inventory, undefined);
+  }
+  for (const item of EMPTY_FAIL_RULE_CASES) {
+    const found = byId(completeEmpty, item.id);
+    assert.equal(found.status, "fail", `${item.id} on a complete empty read`);
+    assert.match(found.summary, item.emptiness);
+    assert.doesNotMatch(found.summary, /Partial inventory:|cannot be confirmed or ruled out/);
+    assert.equal(found.evidence.absence_claim, undefined, `${item.id} on a complete read carries no absence claim`);
+    assert.equal(found.evidence.partial_inventory, undefined);
+  }
+
+  // Control: a complete healthy read carries neither the scoped sentence nor an absence claim on any of the seven.
+  const healthy = (await runAllCrowdstrikeAssessments(createFakeClient())).flatMap((assessment) => assessment.findings);
+  for (const item of [...EMPTINESS_RULE_CASES, ...EMPTY_FAIL_RULE_CASES]) {
+    const found = byId(healthy, item.id);
+    assert.doesNotMatch(found.summary, /cannot be confirmed or ruled out|Partial inventory:/);
+    assert.equal(found.evidence.absence_claim, undefined);
+    assert.equal(found.evidence.partial_inventory, undefined);
+  }
+
+  // Control: a truncated page with visible rows keeps the count-scoped sentence over the visible rows (warn, never pass).
+  const truncatedVisible = (await runAllCrowdstrikeAssessments(createPartialClient())).flatMap((assessment) => assessment.findings);
+  for (const item of [...EMPTINESS_RULE_CASES, ...EMPTY_FAIL_RULE_CASES]) {
+    const found = byId(truncatedVisible, item.id);
+    assert.notEqual(found.status, "pass", `${item.id} under a truncated page with visible rows`);
+    assert.doesNotMatch(found.summary, /cannot be confirmed or ruled out|emptiness/);
+    assert.match(found.summary, /Partial inventory: only \d+ of \d+ /);
+  }
+
+  // Invariant over the whole run: a finding whose partial inventory shows zero visible rows is neither pass nor fail.
+  let zeroRowFindings = 0;
+  for (const found of truncatedEmpty) {
+    const partials = found.evidence?.partial_inventory;
+    if (!Array.isArray(partials) || !partials.some((partial) => partial.seen === 0)) continue;
+    zeroRowFindings += 1;
+    assert.ok(found.status === "warn" || found.status === "manual", `${found.id} renders ${found.status} from a truncated page with zero visible rows: ${found.summary}`);
+  }
+  assert.ok(zeroRowFindings >= 7, `the truncated empty run exercised the zero-row shape on ${zeroRowFindings} findings`);
 });
 
 // Addendum 4: on every Falcon surface, a 502 HTML body or a JSON error embedding a credential URL never reaches
@@ -2510,6 +2656,15 @@ const CROWDSTRIKE_FIXED_TEXTS = [
   "the prevention policies list was not read, so CS-01 is manual and the enabled policy count renders null",
   "1 of 3 sampled hosts (srv-01) run a sensor build older than n-2; the host list was truncated at 500 of 5000, so the unread hosts are not counted",
   "alice@example.com holds Falcon Administrator and has not logged in for 120 days; admin users from a partial read are not named",
+  // The zero-visible-rows sentences of a truncated page (round 3 rulings a and b).
+  "The hosts read was truncated before any host was visible, so sensor deployment coverage cannot be confirmed or ruled out from the visible rows.",
+  "The host groups read was truncated before any host group was visible, so policy assignment coverage cannot be confirmed or ruled out from the visible rows.",
+  "The IOA exclusions read was truncated before any exclusion was visible, so suppression of detection logic cannot be confirmed or ruled out from the visible rows.",
+  "The ML exclusions read was truncated before any exclusion was visible, so suppression of machine learning coverage cannot be confirmed or ruled out from the visible rows.",
+  "The sensor visibility exclusions read was truncated before any exclusion was visible, so paths hidden from the sensor cannot be confirmed or ruled out from the visible rows.",
+  "The critical/high alerts read was truncated before any dated alert was visible, so response within the SLA cannot be confirmed or ruled out from the visible rows.",
+  "The Identity Protection policy rules read was truncated before any rule was visible, so identity-based lateral movement prevention cannot be confirmed or ruled out from the visible rows.",
+  "The containment status filter read was truncated before any matching host was visible, so active containment cannot be confirmed or ruled out from the visible rows; document each containment and its incident reference.",
 ];
 
 /** Addendum 7 must-keep table for CrowdStrike: paths and datasets, clouds and tenants, principals, finding ids, and the standing fixed texts. */
@@ -2641,6 +2796,8 @@ test("round 7 note 1: every fixed-text message CrowdStrike emits (loader, opaque
     };
   }
   await assessAndExport(partial, sampleConfig(), texts);
+  // Every paged read truncated at zero visible rows renders the cannot-be-confirmed-or-ruled-out sentences live.
+  await assessAndExport(createTruncatedEmptyClient(), sampleConfig(), texts);
 
   // The timeout wording through the real client.
   const timingOut = new CrowdstrikeApiClient(sampleConfig({ timeoutMs: 1000 }), {
@@ -2662,6 +2819,7 @@ test("round 7 note 1: every fixed-text message CrowdStrike emits (loader, opaque
   assert.ok([...texts].some((text) => /non-JSON body \(text\/html, \d+ bytes\)/.test(text)), "the harvest rendered a status-and-length note");
   assert.ok([...texts].some((text) => /JSON body without a documented error field \(application\/json, \d+ bytes\)/.test(text)), "the harvest rendered an opaque JSON note");
   assert.ok([...texts].some((text) => /timed out after \d+ms/.test(text)), "the harvest rendered the timeout wording");
+  assert.ok([...texts].some((text) => /^The hosts read was truncated before any host was visible, so sensor deployment coverage cannot be confirmed or ruled out from the visible rows\. Partial inventory: only 0 of 40 hosts/.test(text)), "the harvest rendered a zero-visible-rows sentence live");
 });
 
 test("round 7 note 2: credentials and the config file path set through the environment survive an unrelated argument, and the source chain names the environment", () => {

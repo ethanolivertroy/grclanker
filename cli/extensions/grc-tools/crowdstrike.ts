@@ -924,6 +924,14 @@ function partialInventory(page: CrowdstrikePage<unknown>, dataset: string): Part
 }
 
 /**
+ * The sentence for a truncated page that showed no matching row: emptiness is compliant (or failing)
+ * only for a complete read, so the property is neither confirmed nor ruled out from the visible rows.
+ */
+function truncatedBeforeVisible(read: string, row: string, property: string): string {
+  return `The ${read} read was truncated before any ${row} was visible, so ${property} cannot be confirmed or ruled out from the visible rows.`;
+}
+
+/**
  * A sampled or truncated inventory caps pass at warn. A fail that rests on the absence of something in
  * the visible rows (no enabled and assigned policy, no policy container) is provable only against the
  * rows that were not read, so it renders manual instead of fail.
@@ -2213,12 +2221,17 @@ function evaluateDetectionSla(alerts: CollectedDataset<CrowdstrikePage<JsonRecor
   const openWithinSla = Math.max(0, dated - resolvedCount - openBreaches);
   const compliant = withinSla + openWithinSla;
   const pct = percentage(compliant, dated);
-  const status: CrowdstrikeFinding["status"] = dated === 0 ? "pass" : pct >= 95 ? "pass" : pct >= 80 ? "warn" : "fail";
+  const partial = partialInventory(alerts.data, "critical/high alerts");
+  // Emptiness is compliant only for a complete read; a truncated page with no dated alert visible cannot
+  // rule breaches out for the unread rows.
+  const status: CrowdstrikeFinding["status"] = dated === 0 ? (partial ? "warn" : "pass") : pct >= 95 ? "pass" : pct >= 80 ? "warn" : "fail";
   const base = finding(
     "CS-22",
     status,
     dated === 0
-      ? `The alerts endpoint was readable and returned no dated critical or high alerts created in the last ${lookbackDays} days (window stated), so there was nothing to respond to; emptiness is compliant for this control.`
+      ? partial
+        ? truncatedBeforeVisible("critical/high alerts", "dated alert", "response within the SLA")
+        : `The alerts endpoint was readable and returned no dated critical or high alerts created in the last ${lookbackDays} days (window stated), so there was nothing to respond to; emptiness is compliant for this control.`
       : `${pct}% of ${dated} dated critical/high alerts from the last ${lookbackDays} days were resolved (or remain open) within the ${CRITICAL_SLA_HOURS}h critical / ${HIGH_SLA_HOURS}h high SLA; ${breaches.length} breached the SLA.`,
     {
       lookback_days: lookbackDays,
@@ -2230,7 +2243,7 @@ function evaluateDetectionSla(alerts: CollectedDataset<CrowdstrikePage<JsonRecor
       breach_samples: breaches.slice(0, 15),
     },
   );
-  return withPartialInventory(withUndatedItems(base, undated, "alerts", "created_timestamp"), [partialInventory(alerts.data, "critical/high alerts")]);
+  return withPartialInventory(withUndatedItems(base, undated, "alerts", "created_timestamp"), [partial]);
 }
 
 const CONTAINMENT_CONSOLE_EVIDENCE = "export the contained host list from Falcon console > Host setup and management > Host management filtered by containment status, with containment start dates and incident references.";
@@ -2798,6 +2811,10 @@ function evaluateDeploymentCompleteness(hosts: CollectedDataset<CrowdstrikePage<
     versions.set(version, (versions.get(version) ?? 0) + 1);
   }
   const pct = percentage(active.length, dated.length);
+  const partial = partialInventory(hosts.data, "hosts");
+  // A fail asserted from zero visible rows of a truncated list is a claim about rows that were not read;
+  // `absence_claim` lets withPartialInventory render it manual. A complete empty read still fails.
+  const emptyPartial = items.length === 0 && partial !== undefined;
   const status: CrowdstrikeFinding["status"] = items.length === 0
     ? "fail"
     : dated.length === 0
@@ -2811,11 +2828,14 @@ function evaluateDeploymentCompleteness(hosts: CollectedDataset<CrowdstrikePage<
     "CS-13",
     status,
     items.length === 0
-      ? "The Hosts API was readable but returned zero hosts, so no sensor deployment coverage can be demonstrated; emptiness fails this control."
+      ? emptyPartial
+        ? truncatedBeforeVisible("hosts", "host", "sensor deployment coverage")
+        : "The Hosts API was readable but returned zero hosts, so no sensor deployment coverage can be demonstrated; emptiness fails this control."
       : dated.length === 0
         ? `None of the ${items.length} sampled hosts carries a last_seen timestamp, so sensor freshness cannot be demonstrated from the API.`
         : `${pct}% of ${dated.length} dated hosts (${items.length} sampled) reported to Falcon within the last ${staleDays} days; ${stale.length} are stale, ${undated} have no last_seen, and ${rfm.length} run in reduced functionality mode.`,
     {
+      ...(emptyPartial ? { absence_claim: true } : {}),
       sampled_hosts: items.length,
       reported_total_hosts: hosts.data.total,
       active_hosts: active.length,
@@ -2827,7 +2847,7 @@ function evaluateDeploymentCompleteness(hosts: CollectedDataset<CrowdstrikePage<
       stale_samples: stale.slice(0, 25).map((host) => ({ hostname: asString(host.hostname), last_seen: asString(host.last_seen), platform: asString(host.platform_name) })),
     },
   );
-  return withPartialInventory(withUndatedItems(base, undated, "hosts", "last_seen"), [partialInventory(hosts.data, "hosts")]);
+  return withPartialInventory(withUndatedItems(base, undated, "hosts", "last_seen"), [partial]);
 }
 
 const HOST_GROUP_CONSOLE_EVIDENCE = "export host group membership from Falcon console > Host setup and management > Host groups and confirm every managed host belongs to at least one policy-bearing group.";
@@ -2847,16 +2867,27 @@ function evaluateHostGroupAssignment(hosts: CollectedDataset<CrowdstrikePage<Jso
     const type = asString(group.group_type) ?? "unknown";
     groupTypes.set(type, (groupTypes.get(type) ?? 0) + 1);
   }
+  const hostPartial = partialInventory(hosts.data, "hosts");
+  const groupPartial = partialInventory(groups.data, "host groups");
+  // The empty list that the fail rests on decides: zero rows of a truncated list is a claim about unread
+  // rows (`absence_claim`, rendered manual by withPartialInventory); zero rows of a complete list fails.
+  const emptyPartialGroups = groups.data.items.length === 0 && groupPartial !== undefined;
+  const emptyPartialHosts = groups.data.items.length > 0 && items.length === 0 && hostPartial !== undefined;
   const status: CrowdstrikeFinding["status"] = items.length === 0 || groups.data.items.length === 0 ? "fail" : pct >= 95 ? "pass" : pct >= 80 ? "warn" : "fail";
   const base = finding(
     "CS-14",
     status,
     groups.data.items.length === 0
-      ? "The host groups endpoint was readable but returned zero host groups, so no policy assignment coverage can be demonstrated; emptiness fails this control."
+      ? emptyPartialGroups
+        ? truncatedBeforeVisible("host groups", "host group", "policy assignment coverage")
+        : "The host groups endpoint was readable but returned zero host groups, so no policy assignment coverage can be demonstrated; emptiness fails this control."
       : items.length === 0
-        ? "The Hosts API was readable but returned zero hosts, so host group assignment coverage cannot be demonstrated; emptiness fails this control."
+        ? emptyPartialHosts
+          ? truncatedBeforeVisible("hosts", "host", "host group assignment coverage")
+          : "The Hosts API was readable but returned zero hosts, so host group assignment coverage cannot be demonstrated; emptiness fails this control."
         : `${pct}% of ${items.length} sampled hosts belong to at least one of ${groups.data.items.length} host groups.`,
     {
+      ...(emptyPartialGroups || emptyPartialHosts ? { absence_claim: true } : {}),
       sampled_hosts: items.length,
       reported_total_hosts: hosts.data.total,
       assigned_hosts: assigned.length,
@@ -2866,7 +2897,7 @@ function evaluateHostGroupAssignment(hosts: CollectedDataset<CrowdstrikePage<Jso
       unassigned_samples: items.filter((host) => asArray(host.groups).length === 0).slice(0, 25).map((host) => ({ hostname: asString(host.hostname), platform: asString(host.platform_name) })),
     },
   );
-  return withPartialInventory(base, [partialInventory(hosts.data, "hosts"), partialInventory(groups.data, "host groups")]);
+  return withPartialInventory(base, [hostPartial, groupPartial]);
 }
 
 const DISCOVER_CONSOLE_EVIDENCE = "provide the Falcon Discover unmanaged asset report (Falcon console > Exposure management > Assets) or an equivalent network discovery inventory for the review period.";
@@ -3347,15 +3378,19 @@ function evaluateIoaExclusions(exclusions: CollectedDataset<CrowdstrikePage<Json
   }));
   const broad = views.filter((view) => view.broad);
   const broadGlobal = broad.filter((view) => view.applied_globally);
-  const status: CrowdstrikeFinding["status"] = broadGlobal.length > 0 ? "fail" : broad.length > 0 ? "warn" : "pass";
+  const partial = partialInventory(exclusions.data, "IOA exclusions");
+  // Emptiness is compliant only for a complete read (the CS-23 rule).
+  const status: CrowdstrikeFinding["status"] = views.length === 0 ? (partial ? "warn" : "pass") : broadGlobal.length > 0 ? "fail" : broad.length > 0 ? "warn" : "pass";
   return withPartialInventory(finding(
     "CS-19",
     status,
     views.length === 0
-      ? "The IOA exclusions endpoint was readable and returned zero exclusions; no detection logic is being suppressed, so emptiness is compliant for this control."
+      ? partial
+        ? truncatedBeforeVisible("IOA exclusions", "exclusion", "suppression of detection logic")
+        : "The IOA exclusions endpoint was readable and returned zero exclusions; no detection logic is being suppressed, so emptiness is compliant for this control."
       : `${views.length} IOA exclusions reviewed; ${broad.length} use wildcard-only image or command line patterns (${broadGlobal.length} applied globally).`,
     { exclusions: views.length, reported_total_exclusions: exclusions.data.total, broad_exclusions: broad.slice(0, 25), globally_applied: views.filter((view) => view.applied_globally).length, listing: views.slice(0, 100) },
-  ), [partialInventory(exclusions.data, "IOA exclusions")]);
+  ), [partial]);
 }
 
 function isSensitivePath(value: string | undefined): boolean {
@@ -3379,15 +3414,18 @@ function evaluateMlExclusions(exclusions: CollectedDataset<CrowdstrikePage<JsonR
   }));
   const sensitive = views.filter((view) => view.sensitive);
   const sensitiveGlobal = sensitive.filter((view) => view.applied_globally);
-  const status: CrowdstrikeFinding["status"] = sensitiveGlobal.length > 0 ? "fail" : sensitive.length > 0 ? "warn" : "pass";
+  const partial = partialInventory(exclusions.data, "ML exclusions");
+  const status: CrowdstrikeFinding["status"] = views.length === 0 ? (partial ? "warn" : "pass") : sensitiveGlobal.length > 0 ? "fail" : sensitive.length > 0 ? "warn" : "pass";
   return withPartialInventory(finding(
     "CS-20",
     status,
     views.length === 0
-      ? "The ML exclusions endpoint was readable and returned zero exclusions; no machine learning coverage is being suppressed, so emptiness is compliant for this control."
+      ? partial
+        ? truncatedBeforeVisible("ML exclusions", "exclusion", "suppression of machine learning coverage")
+        : "The ML exclusions endpoint was readable and returned zero exclusions; no machine learning coverage is being suppressed, so emptiness is compliant for this control."
       : `${views.length} ML exclusions reviewed; ${sensitive.length} cover system, program, user, or temp directories or broad wildcards (${sensitiveGlobal.length} applied globally).`,
     { exclusions: views.length, reported_total_exclusions: exclusions.data.total, sensitive_exclusions: sensitive.slice(0, 25), globally_applied: views.filter((view) => view.applied_globally).length, listing: views.slice(0, 100) },
-  ), [partialInventory(exclusions.data, "ML exclusions")]);
+  ), [partial]);
 }
 
 function hidesDirectory(value: string | undefined): boolean {
@@ -3410,15 +3448,18 @@ function evaluateSensorVisibilityExclusions(exclusions: CollectedDataset<Crowdst
   }));
   const hiding = views.filter((view) => view.hides_directory);
   const hidingGlobal = hiding.filter((view) => view.applied_globally);
-  const status: CrowdstrikeFinding["status"] = hidingGlobal.length > 0 ? "fail" : hiding.length > 0 ? "warn" : "pass";
+  const partial = partialInventory(exclusions.data, "sensor visibility exclusions");
+  const status: CrowdstrikeFinding["status"] = views.length === 0 ? (partial ? "warn" : "pass") : hidingGlobal.length > 0 ? "fail" : hiding.length > 0 ? "warn" : "pass";
   return withPartialInventory(finding(
     "CS-21",
     status,
     views.length === 0
-      ? "The sensor visibility exclusions endpoint was readable and returned zero exclusions; nothing is hidden from the sensor, so emptiness is compliant for this control."
+      ? partial
+        ? truncatedBeforeVisible("sensor visibility exclusions", "exclusion", "paths hidden from the sensor")
+        : "The sensor visibility exclusions endpoint was readable and returned zero exclusions; nothing is hidden from the sensor, so emptiness is compliant for this control."
       : `${views.length} sensor visibility exclusions reviewed; ${hiding.length} hide entire directories or sensitive paths from the sensor (${hidingGlobal.length} applied globally).`,
     { exclusions: views.length, reported_total_exclusions: exclusions.data.total, directory_exclusions: hiding.slice(0, 25), globally_applied: views.filter((view) => view.applied_globally).length, listing: views.slice(0, 100) },
-  ), [partialInventory(exclusions.data, "sensor visibility exclusions")]);
+  ), [partial]);
 }
 
 const IDENTITY_CONSOLE_EVIDENCE = "capture the Identity Protection policy rule list (enabled, enforcement action, simulation mode) from Falcon console > Identity protection > Policy management, or provide evidence of an equivalent identity threat protection control.";
@@ -3446,15 +3487,21 @@ function evaluateIdentityProtection(rules: CollectedDataset<CrowdstrikePage<Json
   });
   const active = views.filter((view) => view.enabled && !view.simulation_mode);
   const enforcing = views.filter((view) => view.enforcing);
+  const partial = partialInventory(rules.data, "Identity Protection policy rules");
+  // Zero visible rules of a truncated list is a claim about the unread rules (`absence_claim`, rendered
+  // manual by withPartialInventory); zero rules on a complete read fails.
+  const emptyPartial = views.length === 0 && partial !== undefined;
   const status: CrowdstrikeFinding["status"] = views.length === 0 ? "fail" : enforcing.length > 0 ? "pass" : active.length > 0 ? "warn" : "fail";
   return withPartialInventory(finding(
     "CS-24",
     status,
     views.length === 0
-      ? "Identity Protection policy rules were readable but zero rules exist, so identity-based lateral movement is not being prevented; emptiness fails this control."
+      ? emptyPartial
+        ? truncatedBeforeVisible("Identity Protection policy rules", "rule", "identity-based lateral movement prevention")
+        : "Identity Protection policy rules were readable but zero rules exist, so identity-based lateral movement is not being prevented; emptiness fails this control."
       : `${enforcing.length} of ${views.length} Identity Protection policy rules actively enforce (block, MFA, or verification) outside simulation mode; ${active.length} rules are enabled in total.`,
-    { rules: views.length, active_rules: active.length, enforcing_rules: enforcing.length, listing: views.slice(0, 50) },
-  ), [partialInventory(rules.data, "Identity Protection policy rules")]);
+    { ...(emptyPartial ? { absence_claim: true } : {}), rules: views.length, active_rules: active.length, enforcing_rules: enforcing.length, listing: views.slice(0, 50) },
+  ), [partial]);
 }
 
 const USER_CONSOLE_EVIDENCE = "export the user list with roles and last login dates from Falcon console > Users and roles and count Falcon Administrator grants.";
