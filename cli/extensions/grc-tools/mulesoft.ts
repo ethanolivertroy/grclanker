@@ -3280,6 +3280,11 @@ export async function assessMulesoftRuntimeInfrastructure(
   const loadBalancerDetailNote = loadBalancerDetailsSource.error
     ? `${describeFailure(loadBalancerDetailsSource)}, so SSL endpoints carried only by the detail record were not probed`
     : undefined;
+  // The probes are scoped by the load balancer list: when that list was not read, no probe was requested,
+  // and the certificates snapshot is a not-requested marker naming the parent rather than an empty list.
+  const certificateSource: Collected<undefined> = sourceCollected(loadBalancerSource)
+    ? readySource("load_balancer_certificates")
+    : skippedSource("load_balancer_certificates", loadBalancerSource, undefined);
   const certificateProbes: CertificateProbeRecord[] = [];
   for (const loadBalancer of loadBalancers) {
     const host = asString(loadBalancer.domain);
@@ -3721,7 +3726,7 @@ export async function assessMulesoftRuntimeInfrastructure(
       })), applicationSources),
       vpcs: snapshotOf(vpcSummaries, vpcs),
       load_balancers: snapshotOf(loadBalancerSource, loadBalancers),
-      load_balancer_certificates: certificateResults,
+      load_balancer_certificates: sourceCollected(certificateSource) ? certificateResults : notCollectedMarker(certificateSource),
       hybrid_servers: snapshotOf(serversSource, servers.map((item) => ({ environment: environmentLabel(item.environment), server: item.server })), serverSources),
       mq_queues: snapshotOf(mqQueuesSource, mqInventory, mqQueueSources),
       mq_clients: snapshotOf(mqClientsSource, mqClients, mqClientSources),

@@ -3293,6 +3293,43 @@ test("review round items 7 and 8: denied Anypoint datasets are written as not-co
   assert.equal(truncatedProviders.summary.identity_providers_truncated, true);
 });
 
+test("round 2 SEND BACK 4: under a listLoadBalancers denial the certificate probes are never requested, and core_data/load_balancer_certificates.json and snapshots.load_balancer_certificates are the not-requested marker naming the parent read", async () => {
+  const endpoint = `/cloudhub/api/organizations/${ORG_ID}/loadbalancers`;
+  const denied = healthyBundleClient({ listLoadBalancers: forbidden(endpoint) });
+
+  // The assessment result: the snapshot is a marker, RT-16 is manual through the denied parent, and no probe ran.
+  const runtime = await assessMulesoftRuntimeInfrastructure(denied);
+  const snapshotMarker = assertNotCollectedMarker(runtime.snapshots.load_balancer_certificates, "load_balancer_certificates", "snapshots.load_balancer_certificates");
+  assert.equal(snapshotMarker.status, 403);
+  assert.match(snapshotMarker.error, /^not requested: the load_balancers read failed \(Anypoint request failed \(403 Forbidden\) for .*loadbalancers.*\), so there were no load_balancers to scope the load_balancer_certificates read$/);
+  assertNotCollectedMarker(runtime.snapshots.load_balancers, "load_balancers", "snapshots.load_balancers");
+  assert.equal(statusOf(runtime, "MULESOFT-RT-16"), "manual");
+  assert.match(findingById(runtime, "MULESOFT-RT-16").summary, /^Could not evaluate: load_balancers could not be read, the credential lacks permission \(HTTP 403\)/);
+  assert.equal(findingById(runtime, "MULESOFT-RT-16").evidence.certificates, undefined, "no certificate list is claimed for a list that was never read");
+  assert.equal(runtime.summary.load_balancers, null);
+
+  // The bundle and the zip carry the same marker; no file renders [] for the unrequested probes.
+  const exported = await exportMulesoftAuditBundle(denied, sampleConfig(), createTempBase("grclanker-mulesoft-lb-certs-"));
+  const files = readBundleFiles(exported.outputDir);
+  const fileMarker = assertNotCollectedMarker(JSON.parse(files.get("core_data/load_balancer_certificates.json")), "load_balancer_certificates", "core_data/load_balancer_certificates.json");
+  assert.deepEqual(fileMarker, snapshotMarker);
+  assertNotCollectedMarker(JSON.parse(readZipEntries(exported.zipPath).get("core_data/load_balancer_certificates.json")), "load_balancer_certificates", "zip core_data/load_balancer_certificates.json");
+  const analysis = JSON.parse(files.get("analysis/runtime_infrastructure.json"));
+  assert.match(analysis.summary.inventories.load_balancers, /^unread \(/);
+  for (const [name, content] of files) {
+    if (!name.startsWith("core_data/") || !name.endsWith(".json")) continue;
+    const parsed = JSON.parse(content);
+    if (Array.isArray(parsed)) assert.notEqual(name, "core_data/load_balancer_certificates.json", "the certificates file is not an empty array");
+  }
+
+  // Controls: a readable list keeps the array shape, including a readable list with zero load balancers.
+  const healthy = await assessMulesoftRuntimeInfrastructure(healthyBundleClient());
+  assert.ok(Array.isArray(healthy.snapshots.load_balancer_certificates) && healthy.snapshots.load_balancer_certificates.length === 1, "the healthy fixture probes its one load balancer");
+  const none = await assessMulesoftRuntimeInfrastructure(healthyBundleClient({ async listLoadBalancers() { return []; } }));
+  assert.deepEqual(none.snapshots.load_balancer_certificates, [], "a complete empty list keeps its array shape");
+  assert.equal(statusOf(none, "MULESOFT-RT-16"), "manual");
+});
+
 test("round 2 SEND BACK 3: leaf diff per denial, the members and MQ client leaves of IAM-02, IAM-03, and RT-21 render null under the denial of their source and no other leaf becomes an empty reading", async () => {
   const membersPath = `/accounts/api/organizations/${ORG_ID}/members`;
   const identityBaseline = await assessMulesoftIdentityAccess(healthyIdentityClient());
