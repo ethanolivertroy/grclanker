@@ -75,6 +75,16 @@ export interface ZendeskListResult {
   pages: number;
 }
 
+// One 2xx answer that passed the shape guard: the JSON object it carried and the
+// response it came from, kept so a missing documented member can be described by the
+// status, media type, and size the request observed.
+interface ZendeskDocument {
+  payload: JsonRecord;
+  response: Response;
+  rawText: string;
+  url: string;
+}
+
 export interface ZendeskAccessSurface {
   name: string;
   endpoint: string;
@@ -93,6 +103,8 @@ export interface ZendeskAccessSurface {
 }
 
 export interface ZendeskAccessCheckResult {
+  // healthy only when every surface was read: a refused, failed, or 2xx-without-document
+  // surface makes the check limited, since it produced no data to assess.
   status: "healthy" | "limited";
   subdomain: string;
   authMode: ZendeskAuthMode;
@@ -919,6 +931,31 @@ function zendeskErrorFields(payload: unknown): string[] {
   return [...new Set(parts)];
 }
 
+// The media type of a response is server-controlled text: it is quoted only when it has
+// the shape of a media type, otherwise it is described as unknown.
+const MEDIA_TYPE_PATTERN = /^[a-z0-9][a-z0-9!#$&^_.+-]{0,31}\/[a-z0-9][a-z0-9!#$&^_.+-]{0,39}$/;
+
+function mediaTypeOf(response: Response): string {
+  const value = response.headers.get("content-type")?.split(";")[0].trim().toLowerCase() ?? "";
+  return MEDIA_TYPE_PATTERN.test(value) ? value : "unknown";
+}
+
+// JSON.parse's own message quotes a window of the source, so it is never kept: a body
+// that is not JSON parses to undefined and is described by media type and size only.
+function parseJsonBody(rawText: string): { parsed: unknown } | undefined {
+  try {
+    return { parsed: JSON.parse(rawText) };
+  } catch {
+    return undefined;
+  }
+}
+
+function jsonValueKind(value: unknown): string {
+  if (value === null) return "null";
+  if (Array.isArray(value)) return "array";
+  return typeof value;
+}
+
 // Non-JSON bodies (HTML proxy pages, SSO interstitials, rate-limit pages) are described
 // by status, content type, and length only; JSON bodies contribute Zendesk's documented
 // error fields, each scrubbed before it is shortened, with the caller's scrub when it
@@ -926,16 +963,28 @@ function zendeskErrorFields(payload: unknown): string[] {
 export function describeErrorBody(response: Response, rawText: string, scrub: (text: string) => string = redactErrorText): string {
   const base = `${response.status} ${response.statusText}`.trim();
   if (rawText.length === 0) return base;
-  const contentType = response.headers.get("content-type")?.split(";")[0].trim().toLowerCase() || "unknown";
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(rawText);
-  } catch {
-    return `${base}; non-JSON ${contentType} response body (${rawText.length} bytes, not echoed)`;
-  }
-  const fields = zendeskErrorFields(parsed);
+  const body = parseJsonBody(rawText);
+  if (body === undefined) return `${base}; non-JSON ${mediaTypeOf(response)} response body (${rawText.length} bytes, not echoed)`;
+  const fields = zendeskErrorFields(body.parsed);
   if (fields.length === 0) return `${base}; JSON response body without documented error fields (${rawText.length} bytes, not echoed)`;
   return `${base}; ${fields.map((field) => scrub(field.replace(/\s+/g, " ")).slice(0, 200)).join("; ")}`;
+}
+
+/**
+ * A 2xx answer whose body is not the documented JSON document (an empty body, the HTML
+ * page a proxy or captive portal serves in place of the API, a foreign JSON value) is
+ * described like an error body, by status, media type, and size only, and is recorded
+ * as an unreadable surface: its missing members are never read as an empty inventory or
+ * a disabled setting. `member` names the documented member a JSON object lacked.
+ */
+export function describeNonDocumentBody(response: Response, rawText: string, member?: { key: string; kind: "array" | "object" }): string {
+  const base = `${response.status} ${response.statusText}`.trim();
+  const size = `${rawText.length} bytes, not echoed`;
+  if (member) return `${base} with a JSON response body without the documented "${member.key}" ${member.kind} (${size})`;
+  if (rawText.length === 0) return `${base} with an empty response body where the documented JSON document was expected`;
+  const body = parseJsonBody(rawText);
+  if (body === undefined) return `${base} with a non-JSON ${mediaTypeOf(response)} response body (${size}) where the documented JSON document was expected`;
+  return `${base} with a JSON ${jsonValueKind(body.parsed)} response body (${size}) where the documented JSON document was expected`;
 }
 
 function retryDelayMs(response: Response): number {
@@ -1039,7 +1088,17 @@ export class ZendeskApiClient {
   }
 
   async get(path: string, query: JsonRecord = {}): Promise<JsonRecord> {
-    const url = this.buildUrl(path, query);
+    return (await this.getDocument(this.buildUrl(path, query), path)).payload;
+  }
+
+  /**
+   * One read, with the shape guard every 2xx answer passes: a response whose body is
+   * not a JSON object (an empty body, the HTML page a proxy or captive portal serves,
+   * a foreign JSON value) is not the documented document. It is thrown as an
+   * unreadable surface carrying the status the request observed, so the collectors
+   * record it as an error with that status and never as an empty inventory.
+   */
+  private async getDocument(url: string, path: string): Promise<ZendeskDocument> {
     const response = await this.request(url);
     const rawText = await response.text();
     if (!response.ok) {
@@ -1049,12 +1108,31 @@ export class ZendeskApiClient {
         endpointLabel(url),
       );
     }
-    if (rawText.length === 0) return {};
-    try {
-      return asObject(JSON.parse(rawText)) ?? {};
-    } catch {
-      return {};
+    const payload = rawText.length === 0 ? undefined : asObject(parseJsonBody(rawText)?.parsed);
+    if (payload === undefined) {
+      throw new ZendeskApiError(this.redact(`Zendesk request ${endpointLabel(url)} returned ${describeNonDocumentBody(response, rawText)}`), response.status, endpointLabel(url));
     }
+    return { payload, response, rawText, url };
+  }
+
+  // The documented collection member must be an array on every page; a 2xx page without
+  // it is a foreign document, not an empty page.
+  private documentedArray(document: ZendeskDocument, key: string): JsonRecord[] {
+    const { payload, response, rawText, url } = document;
+    if (!Array.isArray(payload[key])) {
+      throw new ZendeskApiError(this.redact(`Zendesk request ${endpointLabel(url)} returned ${describeNonDocumentBody(response, rawText, { key, kind: "array" })}`), response.status, endpointLabel(url));
+    }
+    return asRecordArray(payload[key]);
+  }
+
+  // The documented object member must be present; a 2xx document without it is foreign.
+  private async documentedObject(path: string, key: string, query: JsonRecord = {}): Promise<JsonRecord> {
+    const document = await this.getDocument(this.buildUrl(path, query), path);
+    const value = asObject(document.payload[key]);
+    if (value === undefined) {
+      throw new ZendeskApiError(this.redact(`Zendesk request ${endpointLabel(document.url)} returned ${describeNonDocumentBody(document.response, document.rawText, { key, kind: "object" })}`), document.response.status, endpointLabel(document.url));
+    }
+    return value;
   }
 
   async listCursor(
@@ -1077,9 +1155,10 @@ export class ZendeskApiClient {
     let truncated = false;
 
     while (nextUrl) {
-      const payload: JsonRecord = await this.get(nextUrl);
+      const document = await this.getDocument(this.buildUrl(nextUrl), nextUrl);
+      const payload = document.payload;
       pages += 1;
-      const pageItems = asRecordArray(payload[collectionKey]);
+      const pageItems = this.documentedArray(document, collectionKey);
       const added = appendUnique(items, seen, pageItems);
       const meta = asObject(payload.meta);
       const hasMore = asBoolean(meta?.has_more);
@@ -1130,9 +1209,10 @@ export class ZendeskApiClient {
     let truncated = false;
 
     while (nextUrl) {
-      const payload: JsonRecord = await this.get(nextUrl);
+      const document = await this.getDocument(this.buildUrl(nextUrl), nextUrl);
+      const payload = document.payload;
       pages += 1;
-      const pageItems = asRecordArray(payload[collectionKey]);
+      const pageItems = this.documentedArray(document, collectionKey);
       const added = appendUnique(items, seen, pageItems);
       // next_page=null is the documented end marker; an absent next_page after a full
       // page means the endpoint did not paginate itself, so the next offset is requested.
@@ -1160,18 +1240,15 @@ export class ZendeskApiClient {
   }
 
   async getCurrentUser(): Promise<JsonRecord> {
-    const payload = await this.get("/users/me");
-    return asObject(payload.user) ?? {};
+    return this.documentedObject("/users/me", "user");
   }
 
   async getAccountSettings(): Promise<JsonRecord> {
-    const payload = await this.get("/account/settings");
-    return asObject(payload.settings) ?? {};
+    return this.documentedObject("/account/settings", "settings");
   }
 
   async getSecuritySettings(): Promise<JsonRecord> {
-    const payload = await this.get("/security_settings");
-    return asObject(payload.security_settings) ?? {};
+    return this.documentedObject("/security_settings", "security_settings");
   }
 
   async listTeamMembers(maxItems?: number): Promise<ZendeskListResult> {
@@ -1196,8 +1273,9 @@ export class ZendeskApiClient {
   }
 
   async getOldestAuditLog(): Promise<JsonRecord | undefined> {
-    const payload = await this.get("/audit_logs", { sort: "created_at", "page[size]": 1 });
-    return asRecordArray(payload.audit_logs)[0];
+    const path = "/audit_logs";
+    const document = await this.getDocument(this.buildUrl(path, { sort: "created_at", "page[size]": 1 }), path);
+    return this.documentedArray(document, "audit_logs")[0];
   }
 
   async listApiTokenAuditLogs(maxItems?: number): Promise<ZendeskListResult> {
@@ -1644,8 +1722,12 @@ export async function checkZendeskAccess(client: ZendeskReadClient): Promise<Zen
     .filter((surface) => surface.status === "forbidden")
     .map((surface) => `${surface.name} requires ${surface.requiredRole === "agent" ? "an agent" : surface.requiredRole === "admin" ? "an admin" : "an Enterprise admin"} credential (${surface.endpoint}).`);
   const unavailable = surfaces.filter((surface) => surface.status === "not_found").map((surface) => surface.name);
+  // A surface that failed or answered a 2xx without the documented document produced no
+  // data, so the check is limited: a healthy verdict is never rendered over a surface
+  // the run could not read.
+  const unreadable = surfaces.filter((surface) => surface.status === "error").map((surface) => surface.name);
   const readableCount = surfaces.filter((surface) => surface.status === "readable").length;
-  const status = coreReadable && missingPermissions.length === 0 ? "healthy" : "limited";
+  const status = coreReadable && missingPermissions.length === 0 && unreadable.length === 0 ? "healthy" : "limited";
 
   return {
     status,
@@ -1659,12 +1741,15 @@ export async function checkZendeskAccess(client: ZendeskReadClient): Promise<Zen
       `Authenticated as ${currentUser.status === "ok" ? `${userLabel(currentUser.data ?? {})} (role: ${currentUserRole ?? "unknown"})` : "an unknown principal (current user lookup failed)"}.`,
       `${readableCount}/${surfaces.length} Zendesk audit surfaces are readable.`,
       ...(unavailable.length > 0 ? [`Unavailable on this account or plan: ${unavailable.join(", ")}.`] : []),
+      ...(unreadable.length > 0 ? [`Not read (the request failed or answered without the documented JSON document; see the surface errors): ${unreadable.join(", ")}. Their findings render manual or capped until they are readable.`] : []),
       ...(truncatedProbes.length > 0 ? [`Probe counts for ${truncatedProbes.join(", ")} are capped samples (marked +), not the full population; the assessment tools page to max_items.`] : []),
       ...(currentUserRole && currentUserRole !== "admin" ? ["The credential is not an admin, so admin-only surfaces (security settings, deletion schedules, OAuth clients and tokens, audit logs, owned apps, brands, suspended tickets) will render as manual findings."] : []),
     ],
     recommendedNextStep: status === "healthy"
       ? "Run zendesk_assess_authentication, zendesk_assess_access_control, zendesk_assess_data_protection, zendesk_assess_integrations, or zendesk_export_audit_bundle."
-      : "Use an admin API token or OAuth token with read scope so the admin-only surfaces become readable, then rerun zendesk_check_access.",
+      : missingPermissions.length > 0
+        ? "Use an admin API token or OAuth token with read scope so the admin-only surfaces become readable, then rerun zendesk_check_access."
+        : "Check the network path to the Zendesk API (a proxy or sign-in page answering in place of it, or an outage) for the surfaces that were not read, then rerun zendesk_check_access.",
   };
 }
 

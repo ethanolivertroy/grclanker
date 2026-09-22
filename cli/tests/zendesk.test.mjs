@@ -3196,3 +3196,170 @@ test("request matching: every endpoint path and HTTP status named in any output 
     assert.ok(entry.status === 200 || Object.keys(failures).some((key) => entry.path === `/api/v2${key.split("?")[0]}`), `only the three failing surfaces answered with an error: ${entry.path} ${entry.status}`);
   }
 });
+
+// ---------------------------------------------------------------------------
+// Silent-success class: a 2xx answer without the documented JSON document
+// ---------------------------------------------------------------------------
+
+// Wording that must never leave the client: the page itself and V8's parser message,
+// which quotes a window of the body.
+const NON_DOCUMENT_ECHO = /Captive portal canary page|Unexpected token|is not valid JSON|Unexpected end of JSON/;
+
+// Every body a proxy, captive portal, sign-in page, or misrouted request can serve with
+// a 2xx status in place of the documented document, driven through the real client
+// parser path (a fixture that throws for a non-protocol body could not see the class).
+// The page carries two carried canaries so an echo would show; the last shape carries
+// a content type that is not shaped like a media type, which is never quoted.
+const SILENT_SUCCESS_SHAPES = [
+  {
+    name: "200-html",
+    make: () => new Response(
+      `<html><head><title>Captive portal canary page</title></head><body><p>Authorization: Bearer ${CANARY_BEARER}</p><p>Cookie: sid=${CANARY_NAMED}</p></body></html>`,
+      { status: 200, statusText: "OK", headers: { "content-type": "text/html; charset=utf-8" } },
+    ),
+    note: /200 OK with a non-JSON text\/html response body \(\d+ bytes, not echoed\) where the documented JSON document was expected/,
+  },
+  {
+    name: "200-empty",
+    make: () => new Response("", { status: 200, statusText: "OK", headers: { "content-type": "application/json" } }),
+    note: /200 OK with an empty response body where the documented JSON document was expected/,
+  },
+  {
+    name: "200-json-array",
+    make: () => new Response("[]", { status: 200, statusText: "OK", headers: { "content-type": "application/json" } }),
+    note: /200 OK with a JSON array response body \(2 bytes, not echoed\) where the documented JSON document was expected/,
+  },
+  {
+    name: "200-foreign-object",
+    make: () => new Response(JSON.stringify({ status: "ok", region: "prod-us-east-2026" }), { status: 200, statusText: "OK", headers: { "content-type": "application/json" } }),
+    note: /200 OK with a JSON response body without the documented "[a-z_]+" (?:array|object) \(\d+ bytes, not echoed\)/,
+  },
+  {
+    name: "200-hostile-media-type",
+    make: () => new Response("<html>Captive portal canary page</html>", { status: 200, statusText: "OK", headers: { "content-type": `Bearer ${CANARY_BEARER}` } }),
+    note: /200 OK with a non-JSON unknown response body \(\d+ bytes, not echoed\) where the documented JSON document was expected/,
+  },
+];
+
+const OBJECT_PROBE_NAMES = { "/users/me": "current_user", "/account/settings": "account_settings", "/security_settings": "security_settings" };
+
+test("silent-success class: a 2xx answer without the documented JSON document on any surface is an unreadable surface with the observed status, never an empty inventory, a readable probe, a healthy check, or a hard verdict", async () => {
+  const routes = await healthyHttpRoutes();
+  const surfaces = Object.keys(routes);
+  const baseline = statusMap(await runAllAssessments(httpClient(routes)));
+
+  // Positive control: the parser's own message quotes the page, so only the fixed note keeps it out.
+  const htmlBody = await SILENT_SUCCESS_SHAPES[0].make().text();
+  assert.throws(() => JSON.parse(htmlBody), (error) => /Unexpected token|is not valid JSON/.test(error.message));
+  for (const shape of SILENT_SUCCESS_SHAPES) assert.equal(shape.make().status, 200, `${shape.name} is served as a success`);
+
+  for (const surface of surfaces) {
+    // A 2xx without the document demotes exactly the verdicts a refusal of the same surface demotes.
+    const refused = statusMap(await runAllAssessments(httpClient(routes, surface, forbiddenJsonResponse)));
+    const dependents = [...baseline.keys()].filter((id) => refused.get(id) !== baseline.get(id));
+    const coreDataName = LIST_CORE_DATA_FILES[surface];
+    const probeName = PROBE_NAMES_BY_ROUTE[surface] ?? OBJECT_PROBE_NAMES[surface];
+
+    for (const shape of SILENT_SUCCESS_SHAPES) {
+      const label = `${shape.name} on ${surface}`;
+      const log = [];
+      const client = new ZendeskApiClient(sampleConfig(), { fetchImpl: recordingZendeskFetch(routes, { [surface]: shape.make }, log), sleep: async () => {} });
+
+      const access = await checkZendeskAccess(client);
+      const accessText = JSON.stringify(access);
+      assertNoCanary(accessText, `${label} access check`);
+      assert.doesNotMatch(accessText, NON_DOCUMENT_ECHO, `${label}: the page or the parser message reached the access check`);
+      if (probeName) {
+        const probe = access.surfaces.find((entry) => entry.name === probeName);
+        assert.equal(probe.status, "error", `${label}: the probe does not count the surface as readable`);
+        assert.equal(probe.httpStatus, 200, `${label}: the probe carries the status the request observed`);
+        assert.equal(probe.count, null, `${label}: nothing was read, so nothing is counted`);
+        assert.equal(probe.truncated, null, `${label}: no paging outcome exists`);
+        assert.match(probe.error, shape.note, `${label}: ${probe.error}`);
+        assert.equal(access.status, "limited", `${label}: a surface that produced no data is not a healthy check`);
+        assert.ok(access.notes.some((note) => note.startsWith("Not read (") && note.includes(probeName)), `${label}: the notes name the surface: ${access.notes.join(" | ")}`);
+        assert.match(access.recommendedNextStep, /network path/, `${label}: the next step names the network, not the credential`);
+        assert.equal(access.surfaces.filter((entry) => entry.status !== "readable").length, 1, `${label}: only the failing surface is unreadable`);
+      } else {
+        assert.equal(access.status, "healthy", `${label}: the access check does not read this surface`);
+      }
+
+      const results = await runAllAssessments(client);
+      const resultsText = JSON.stringify(results);
+      assertNoCanary(resultsText, `${label} assessments`);
+      assert.doesNotMatch(resultsText, NON_DOCUMENT_ECHO, `${label}: the page or the parser message reached an assessment`);
+      const errors = results.flatMap((result) => result.errors);
+      assert.ok(errors.length > 0, `${label}: the surface is recorded as a collection error`);
+      for (const error of errors) assert.match(error, shape.note, `${label}: ${error}`);
+      for (const [id, status] of statusMap(results)) {
+        assert.equal(status, refused.get(id), `${label}: ${id} renders ${status} where a refused read of the same surface renders ${refused.get(id)}`);
+        if (dependents.includes(id)) assert.ok(["warn", "manual"].includes(status), `${label}: dependent ${id} rendered the hard verdict ${status}`);
+      }
+      for (const code of namedZendeskStatusCodes(`${accessText}\n${resultsText}`)) {
+        assert.equal(code, 200, `${label}: status ${code} is named in output but the fixture served only 200`);
+      }
+
+      const exported = await exportZendeskAuditBundle(client, sampleConfig(), createTempBase("grclanker-zendesk-silent-success-"), { now: () => NOW });
+      const files = readBundleFiles(exported.outputDir);
+      for (const [name, content] of files) {
+        assertNoCanary(content, `${label} ${name}`);
+        assert.doesNotMatch(content, NON_DOCUMENT_ECHO, `${label}: the page or the parser message reached ${name}`);
+      }
+      assert.match(files.get("_errors.log"), shape.note, `${label}: _errors.log carries the note`);
+      if (coreDataName) {
+        const marker = JSON.parse(files.get(join("core_data", `${coreDataName}.json`)));
+        assert.deepEqual(
+          { collected: marker.collected, status: marker.status, dataset_status: marker.dataset_status },
+          { collected: false, status: 200, dataset_status: "error" },
+          `${label}: the dataset is a marker carrying the observed status, not an empty list`,
+        );
+        assert.match(marker.error, shape.note, `${label}: the marker carries the note`);
+        const entry = collectionEntry(files, coreDataName);
+        assert.deepEqual(
+          { status: entry.status, http_status: entry.http_status, seen: entry.seen, truncated: entry.truncated },
+          { status: "error", http_status: 200, seen: null, truncated: null },
+          `${label}: the collection status carries the observed 200 and no counts`,
+        );
+      }
+      assert.ok(log.every((entry) => entry.status === 200), `${label}: every request in the run observed a 2xx`);
+    }
+  }
+});
+
+test("ZendeskApiClient fails a paged read whose later page or single-object read lacks the documented member instead of returning a shorter complete inventory", async () => {
+  const usersUrl = (after) => `https://acme.zendesk.com/api/v2/users?page%5Bsize%5D=100&include_boundary_indicators=true&page%5Bafter%5D=${after}&role%5B%5D=agent&role%5B%5D=admin`;
+  const scripted = (responses) => {
+    let index = 0;
+    return new ZendeskApiClient(sampleConfig(), { fetchImpl: async (url) => responses[Math.min(index++, responses.length - 1)](url), sleep: async () => {} });
+  };
+
+  await assert.rejects(
+    scripted([
+      () => jsonResponse({ users: [{ id: 1 }], meta: { has_more: true, after_cursor: "c2" }, links: { next: usersUrl("c2") } }, { statusText: "OK" }),
+      () => jsonResponse({ meta: { has_more: false } }, { statusText: "OK" }),
+    ]).listTeamMembers(),
+    (error) => {
+      assert.ok(error instanceof ZendeskApiError);
+      assert.equal(error.status, 200);
+      assert.equal(error.endpoint, "GET /api/v2/users");
+      assert.match(error.message, /^Zendesk request GET \/api\/v2\/users returned 200 OK with a JSON response body without the documented "users" array \(\d+ bytes, not echoed\)$/);
+      return true;
+    },
+  );
+  await assert.rejects(
+    scripted([() => jsonResponse({ user: [] }, { statusText: "OK" })]).getCurrentUser(),
+    /Zendesk request GET \/api\/v2\/users\/me returned 200 OK with a JSON response body without the documented "user" object \(\d+ bytes, not echoed\)$/,
+  );
+  await assert.rejects(
+    scripted([() => jsonResponse({ audit_logs: { id: 1 } }, { statusText: "OK" })]).getOldestAuditLog(),
+    /returned 200 OK with a JSON response body without the documented "audit_logs" array/,
+  );
+  // The documented empty document is still an empty, complete inventory.
+  const empty = await scripted([() => jsonResponse({ targets: [], next_page: null, previous_page: null, count: 0 })]).listTargets();
+  assert.deepEqual(empty, { items: [], truncated: false, pages: 1 });
+  // A 204 is not a documented answer to any read here and carries no document.
+  await assert.rejects(
+    scripted([() => new Response(null, { status: 204, statusText: "No Content" })]).getAccountSettings(),
+    /returned 204 No Content with an empty response body where the documented JSON document was expected/,
+  );
+});
