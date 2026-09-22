@@ -33,7 +33,7 @@ import {
 import { getRegisteredToolSummaries } from "../dist/pi/tool-catalog.js";
 import { assertSecretFragmentsAbsent, readBundleFiles, readZipEntries } from "./helpers/bundle-contents.mjs";
 import { CONFIG_CANARIES, assertConfigLoaderMatrix, configLoaderCases } from "./helpers/config-loader-matrix.mjs";
-import { assertFixedTextsSurvive, collectFixedTexts, logLines } from "./helpers/fixed-text-survival.mjs";
+import { assertFixedTextsSurvive, collectFixedTexts, collectThrownMessage, collectToolTexts, logLines } from "./helpers/fixed-text-survival.mjs";
 import { assertFragmentsAbsent, assertPlantedValuesWellFormed } from "./helpers/planted-values.mjs";
 import { assertScrubBoundary } from "./helpers/scrub-boundary-matrix.mjs";
 
@@ -2240,6 +2240,13 @@ test("planted values self-check: every canary and planted secret is alphanumeric
  * skipped wordings, the inventory states, the withheld notes, and the corollary summary templates.
  */
 const SERVICENOW_FIXED_TEXTS = [
+  // The resolver's own messages, which reach check_access, assess, and export results live.
+  "SERVICENOW_URL or SERVICENOW_INSTANCE (or an instance_url / instance argument) is required.",
+  "ServiceNow credentials are required. Set SERVICENOW_USERNAME plus SERVICENOW_PASSWORD for basic auth, SERVICENOW_CLIENT_ID plus SERVICENOW_CLIENT_SECRET (optionally with username and password for the password grant) for OAuth, or SERVICENOW_ACCESS_TOKEN for a pre-issued bearer token.",
+  "ServiceNow basic auth requires SERVICENOW_USERNAME and SERVICENOW_PASSWORD.",
+  "ServiceNow OAuth requires SERVICENOW_CLIENT_ID and SERVICENOW_CLIENT_SECRET (or SERVICENOW_ACCESS_TOKEN).",
+  "ServiceNow mutual TLS is recognized but not supported by this runtime's fetch client; set SERVICENOW_AUTH_METHOD to basic or oauth.",
+  "Pre-issued OAuth bearer token. Defaults to SERVICENOW_ACCESS_TOKEN.",
   "Unable to read ServiceNow config file /home/svc/.servicenow.yaml (ENOENT)",
   "Unable to read ServiceNow config file /tmp/grclanker-servicenow-loader-Ab3dEf/directory.yaml (EISDIR)",
   "Unable to read ServiceNow config file /tmp/grclanker-servicenow-loader-Ab3dEf/locked.yaml (EACCES)",
@@ -2352,6 +2359,25 @@ test("round 7 note 1: every fixed-text message ServiceNow emits (loader, opaque 
       return true;
     });
   }
+
+  // The resolver's own messages on the real path, with an empty environment and no config file: no
+  // instance, no credentials, and each auth method named without its credentials (mTLS included).
+  const resolverMessages = [
+    collectThrownMessage(texts, () => resolveServicenowConfiguration({}, {}, scratch), "no instance"),
+    collectThrownMessage(texts, () => resolveServicenowConfiguration({ instance: "acme" }, {}, scratch), "no credentials"),
+    collectThrownMessage(texts, () => resolveServicenowConfiguration({ instance: "acme", auth_method: "basic" }, {}, scratch), "basic without credentials"),
+    collectThrownMessage(texts, () => resolveServicenowConfiguration({ instance: "acme", auth_method: "oauth" }, {}, scratch), "oauth without credentials"),
+    collectThrownMessage(texts, () => resolveServicenowConfiguration({ instance: "acme", auth_method: "mtls" }, {}, scratch), "mtls"),
+  ];
+  assert.ok(resolverMessages.some((message) => /credentials are required/.test(message)), "the resolver rendered its credentials-required message");
+  assert.ok(resolverMessages.some((message) => /mutual TLS/.test(message)), "the resolver rendered its mTLS message");
+
+  // Every tool label, description, and argument description the integration registers.
+  const registered = [];
+  registerServicenowTools({ registerTool: (tool) => registered.push(tool) });
+  const toolTexts = collectToolTexts(registered);
+  assert.ok([...toolTexts].some((text) => /bearer token/.test(text)), "the tool schemas carry the bearer token argument description");
+  for (const text of toolTexts) texts.add(text);
 
   // The error constructor's opaque-body notes and describeStatus text on real responses.
   const opaque = createClient(async (input) => {

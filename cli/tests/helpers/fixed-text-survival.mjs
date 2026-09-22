@@ -52,6 +52,48 @@ export function collectFixedTexts(value, out = new Set(), inside = false) {
   return out;
 }
 
+/**
+ * Renders the message a resolver (or any other thunk) throws for one argument shape and adds it to
+ * the harvest. The configuration resolvers' own messages (credentials required, what each auth mode
+ * needs, an unsupported mode or region) reach tool results live, so they must be in the set the
+ * scrubber runs over even when the standing list forgets one.
+ */
+export function collectThrownMessage(out, thunk, label) {
+  let thrown;
+  assert.throws(() => thunk(), (error) => {
+    thrown = error;
+    return true;
+  }, `${label}: throws`);
+  assert.equal(typeof thrown?.message, "string", `${label}: the thrown value carries a message`);
+  assert.ok(thrown.message.length > 0, `${label}: the thrown message is not empty`);
+  out.add(thrown.message);
+  return thrown.message;
+}
+
+/** Keys on a registered tool and its parameter schema whose strings are shown to the operator. */
+export const TOOL_TEXT_KEYS = new Set(["description", "label", "title"]);
+
+/**
+ * Collects every tool label and description and every parameter description from the tools an
+ * integration registers: a tool-argument description such as "Pre-issued OAuth bearer token." is
+ * fixed text the integration emits.
+ */
+export function collectToolTexts(tools, out = new Set()) {
+  const walk = (value) => {
+    if (Array.isArray(value)) {
+      for (const item of value) walk(item);
+      return;
+    }
+    if (!value || typeof value !== "object") return;
+    for (const [key, child] of Object.entries(value)) {
+      if (TOOL_TEXT_KEYS.has(key) && typeof child === "string" && child.length > 0) out.add(child);
+      else if (child && typeof child === "object") walk(child);
+    }
+  };
+  walk(tools);
+  return out;
+}
+
 /** Splits an `_errors.log` (or any line-oriented file) into its non-empty lines. */
 export function logLines(text) {
   return (text ?? "").split("\n").map((line) => line.trim()).filter((line) => line.length > 0);

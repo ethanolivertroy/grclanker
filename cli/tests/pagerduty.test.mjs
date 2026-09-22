@@ -41,7 +41,7 @@ import {
 import { getRegisteredToolSummaries } from "../dist/pi/tool-catalog.js";
 import { assertSecretFragmentsAbsent, readBundleFiles, readZipEntries } from "./helpers/bundle-contents.mjs";
 import { CONFIG_CANARIES, assertConfigLoaderMatrix, configLoaderCases } from "./helpers/config-loader-matrix.mjs";
-import { assertFixedTextsSurvive, collectFixedTexts, logLines } from "./helpers/fixed-text-survival.mjs";
+import { assertFixedTextsSurvive, collectFixedTexts, collectThrownMessage, collectToolTexts, logLines } from "./helpers/fixed-text-survival.mjs";
 import { assertFragmentsAbsent, assertPlantedValuesWellFormed } from "./helpers/planted-values.mjs";
 import { assertScrubBoundary } from "./helpers/scrub-boundary-matrix.mjs";
 
@@ -3074,6 +3074,11 @@ const PD_SAMPLE_DENIAL = "PagerDuty request failed (403 Forbidden) for /users: A
  * Each must come back from PagerdutyRequestError's pass and client.redact unchanged.
  */
 const PAGERDUTY_FIXED_TEXTS = [
+  // The resolver's own messages, which reach check_access, assess, and export results live.
+  "PagerDuty credentials are required: set PAGERDUTY_API_TOKEN (account or user REST API key), PAGERDUTY_ACCESS_TOKEN (OAuth bearer token), or PAGERDUTY_CLIENT_ID, PAGERDUTY_CLIENT_SECRET, and PAGERDUTY_SUBDOMAIN (Scoped OAuth app credentials).",
+  "Unsupported PagerDuty service region \"mars\". Use \"us\" or \"eu\".",
+  "Pre-issued PagerDuty OAuth bearer token. Defaults to PAGERDUTY_ACCESS_TOKEN.",
+  "Assess PagerDuty audit logging (spec controls 11-13): audit record availability, retention against the documented 12 months, and API key rotation evidence derived from audit record token usage.",
   "Unable to read PagerDuty config file /home/svc/.config/grclanker/pagerduty.json (ENOENT)",
   "Unable to read PagerDuty config file /tmp/grclanker-pagerduty-loader-Ab3dEf/directory.json (EISDIR)",
   "Unable to read PagerDuty config file /tmp/grclanker-pagerduty-loader-Ab3dEf/locked.json (EACCES)",
@@ -3180,6 +3185,25 @@ test("round 7 note 1: every fixed-text message PagerDuty emits (loader, opaque b
       return true;
     });
   }
+
+  // The resolver's own messages on the real path with an empty environment and an explicit config file
+  // that holds no credentials (so the default location under the real home is never consulted): no
+  // credentials, and credentials with an unsupported service region.
+  const emptyConfigPath = join(createTempBase("grclanker-pd-fixed-text-config-"), "config.json");
+  writeFileSync(emptyConfigPath, "{}\n");
+  const resolverMessages = [
+    collectThrownMessage(texts, () => resolvePagerdutyConfiguration({ config_file: emptyConfigPath }, {}), "no credentials"),
+    collectThrownMessage(texts, () => resolvePagerdutyConfiguration({ config_file: emptyConfigPath, api_token: "rest-api-key", region: "mars" }, {}), "unsupported region"),
+  ];
+  assert.ok(resolverMessages.some((message) => /^PagerDuty credentials are required: set PAGERDUTY_API_TOKEN/.test(message)), "the resolver rendered its credentials-required message");
+  assert.ok(resolverMessages.some((message) => /^Unsupported PagerDuty service region "mars"\./.test(message)), "the resolver rendered its region message");
+
+  // Every tool label, description, and argument description the integration registers.
+  const registered = [];
+  registerPagerdutyTools({ registerTool: (tool) => registered.push(tool) });
+  const toolTexts = collectToolTexts(registered);
+  assert.ok([...toolTexts].some((text) => /OAuth bearer token/.test(text)), "the tool schemas carry the bearer token argument description");
+  for (const text of toolTexts) texts.add(text);
 
   // Every surface under three credential-free failure flavors (plain proxy page, unrecognized JSON shape, documented
   // error), then every endpoint denied, every list empty, and every list truncated: the access check, the five

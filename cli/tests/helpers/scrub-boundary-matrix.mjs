@@ -16,6 +16,12 @@
  * Real token shapes (16 or more characters with base64 symbols, scattered digits, or token casing,
  * hex digests, vendor prefixes, JWTs, PEM blocks) are still removed bare.
  *
+ * A scheme word standing in prose is not a carrier: a lowercase scheme followed by a plain word, a
+ * short acronym, or an environment variable name ("the bearer token is missing", "JWT bearer
+ * (SF_CONSUMER_KEY,"), or a capitalized scheme followed by the capitalized next word of a title
+ * ("Refresh Token Policy"), with punctuation around the word, stays; anything else after a scheme
+ * word is its credential and goes.
+ *
  * The matrix drives one integration's pass through `scrub(text)`; `registerSecret(secret)` registers
  * a credential through the integration's real path (constructing a client with it). The encoded
  * forms are computed here, independently of the implementation.
@@ -33,6 +39,19 @@ export const REDACTED = "[REDACTED]";
 export const NAME_SHAPED_CANARY = "vqzk-xwjr-HTBM-40928375611";
 
 /**
+ * Shaped like an environment variable name (upper-case segments joined by underscores). After a
+ * lowercase scheme word it reads as prose ("JWT bearer (SF_CONSUMER_KEY,") and stays; after a
+ * capitalized scheme it is the credential and goes, whatever its shape.
+ */
+export const UPPER_NAME_SHAPED_CANARY = "QXKV_JRWX_MBTH_58273940116";
+
+/**
+ * Too short for the bare token-run rule and token-cased with digits, so after a scheme word (even a
+ * lowercase one in prose) only the scheme guard can remove it.
+ */
+export const SHORT_TOKEN_CANARY = "Xk9QzPw2Rt";
+
+/**
  * Two secrets to register: one name-shaped, so its bare removal can only come from registration,
  * and one whose every encoded form differs from the raw form.
  */
@@ -43,7 +62,7 @@ export const REGISTERED_SECRETS = {
 
 (() => {
   const owners = new Map();
-  for (const [name, value] of [["NAME_SHAPED_CANARY", NAME_SHAPED_CANARY], ...Object.entries(REGISTERED_SECRETS)]) {
+  for (const [name, value] of [["NAME_SHAPED_CANARY", NAME_SHAPED_CANARY], ["UPPER_NAME_SHAPED_CANARY", UPPER_NAME_SHAPED_CANARY], ["SHORT_TOKEN_CANARY", SHORT_TOKEN_CANARY], ...Object.entries(REGISTERED_SECRETS)]) {
     for (const window of shortestWindows(value)) {
       const owner = owners.get(window);
       assert.equal(owner, undefined, `window ${window} appears in both ${owner} and ${name}`);
@@ -72,6 +91,16 @@ export const MUST_KEEP = [
   "CSRF flags enableCSRFOnGet and enableCSRFOnPost were not exposed by SecuritySettings; connectedAppOAuth and sessionTimeoutSAML were read",
   "None of the enabled prevention policies expose ScriptBasedExecutionMonitoring, InterpreterProtection, EngineProtectionV2",
   "OAuth token usage was not checked because the OauthToken read was forbidden; the bearer token was refreshed",
+  // A scheme word in prose may be followed by a word wrapped in punctuation, an environment variable name, or the
+  // capitalized next word of a title; none of those is its credential.
+  "credentials are required: set the API key (account or user REST API key), the access token (OAuth bearer token), or the client id and secret (Scoped OAuth app credentials).",
+  "JWT bearer (SF_CONSUMER_KEY, SF_USERNAME, SF_PRIVATE_KEY_FILE), username-password (SF_USERNAME, SF_PASSWORD), a refresh token, or an access token with SF_INSTANCE_URL.",
+  "Pre-issued OAuth bearer token. Defaults to the ACCESS_TOKEN variable; PEM private key path for the JWT bearer flow.",
+  "for each app record Permitted Users, IP Relaxation, Refresh Token Policy, and OAuth scopes; no refresh token expiry.",
+  "Pre-issued access token (requires instance_url); rotation evidence derived from audit record token usage.",
+  `JWT bearer (${UPPER_NAME_SHAPED_CANARY}, SF_USERNAME) reads as prose after a lowercase scheme`,
+  // Non-credential assignments are worded without `=` so the credential pair rule cannot take them for a pair.
+  "mutual TLS is not supported by this runtime; set the AUTH_METHOD variable to basic or oauth; the TLS probe connects with rejectUnauthorized set to false",
 ];
 
 /**
@@ -106,6 +135,15 @@ export function carrierCases(canary = NAME_SHAPED_CANARY) {
     { name: "ApiKey scheme in prose", text: `ApiKey ${canary}`, keeps: ["ApiKey "] },
     { name: "Token token= in prose", text: `Token token=${canary}`, keeps: ["Token token="] },
     { name: "lowercase bearer scheme", text: `bearer ${canary}`, keeps: ["bearer "] },
+    // Punctuation around a credential does not turn it into prose, and after a capitalized scheme an
+    // upper-case underscore value is the credential, not an environment variable name.
+    { name: "Bearer scheme before a sentence end", text: `Bearer ${canary}.`, keeps: ["Bearer "] },
+    { name: "Token scheme inside parentheses", text: `(Token ${canary})`, keeps: ["(Token "] },
+    { name: "lowercase bearer scheme before a sentence end", text: `bearer ${canary}.`, keeps: ["bearer "] },
+    { name: "Bearer scheme before an upper-case underscore value", text: `Bearer ${UPPER_NAME_SHAPED_CANARY}`, value: UPPER_NAME_SHAPED_CANARY, keeps: ["Bearer "] },
+    { name: "lowercase bearer scheme before a short token-cased value", text: `the bearer ${SHORT_TOKEN_CANARY} was sent`, value: SHORT_TOKEN_CANARY, keeps: ["the bearer ", " was sent"] },
+    { name: "lowercase token scheme before a short token-cased value in parentheses", text: `(token ${SHORT_TOKEN_CANARY}) expired`, value: SHORT_TOKEN_CANARY, keeps: ["(token ", " expired"] },
+    { name: "Authorization Basic header with an upper-case underscore value", text: `Authorization: Basic ${UPPER_NAME_SHAPED_CANARY}`, value: UPPER_NAME_SHAPED_CANARY, keeps: ["Authorization: "] },
     { name: "client_secret assignment", text: `client_secret=${canary}`, keeps: ["client_secret="] },
     { name: "password field", text: `password: ${canary}`, keeps: ["password: "] },
     { name: "refresh_token JSON field", text: `"refresh_token": "${canary}"`, keeps: ["refresh_token"] },
@@ -283,7 +321,7 @@ export function assertScrubBoundary({ scrub, registerSecret, mustKeep = [], keep
 
   for (const item of carrierCases()) {
     const output = scrub(item.text);
-    assertRemoved(output, NAME_SHAPED_CANARY, `carrier ${item.name}`);
+    assertRemoved(output, item.value ?? NAME_SHAPED_CANARY, `carrier ${item.name}`);
     for (const kept of item.keeps) assert.ok(output.includes(kept), `carrier ${item.name}: label ${JSON.stringify(kept)} must stay: ${JSON.stringify(output)}`);
   }
 

@@ -35,7 +35,7 @@ import {
 import { getRegisteredToolSummaries } from "../dist/pi/tool-catalog.js";
 import { assertSecretFragmentsAbsent, readBundleFiles, readZipEntries } from "./helpers/bundle-contents.mjs";
 import { CONFIG_CANARIES, assertConfigLoaderMatrix, configLoaderCases } from "./helpers/config-loader-matrix.mjs";
-import { assertFixedTextsSurvive, collectFixedTexts, logLines } from "./helpers/fixed-text-survival.mjs";
+import { assertFixedTextsSurvive, collectFixedTexts, collectThrownMessage, collectToolTexts, logLines } from "./helpers/fixed-text-survival.mjs";
 import { assertFragmentsAbsent, assertPlantedValuesWellFormed } from "./helpers/planted-values.mjs";
 import { assertScrubBoundary } from "./helpers/scrub-boundary-matrix.mjs";
 
@@ -2319,7 +2319,7 @@ test("review fix 9: IAM-19 warns as the documented expected outcome when the pub
   assert.match(finding.summary, /record the last-used dates manually/);
   assert.equal(finding.evidence.apps_with_usage_data, 0);
   assert.deepEqual(finding.evidence.apps_without_usage_date, ["Auditor", "CI deployer"]);
-  assert.match(finding.evidence.usage_data_source, /includeUsage=true; not part of the published schema, so absence is expected/);
+  assert.match(finding.evidence.usage_data_source, /connectedApplications with includeUsage=true; not part of the published schema, so absence is expected/);
   assert.ok(seen.find((item) => item.pathname.endsWith("/connectedApplications")).search.includes("includeUsage=true"));
   assert.equal(seen.some((item) => item.pathname.includes("/connectedApplications/authorizations")), false, "the per-user authorizations view is not read");
 
@@ -2480,7 +2480,7 @@ test("review fix 5: RT-16 caps at warn when a dated certificate chain does not v
   const certificate = findingById(untrusted, "MULESOFT-RT-16").evidence.certificates[0];
   assert.equal(certificate.authorized, false);
   assert.equal(certificate.authorization_error, "DEPTH_ZERO_SELF_SIGNED_CERT");
-  assert.match(findingById(untrusted, "MULESOFT-RT-16").evidence.probe_note, /rejectUnauthorized=false/);
+  assert.match(findingById(untrusted, "MULESOFT-RT-16").evidence.probe_note, /rejectUnauthorized set to false/);
 
   const unreported = await assessMulesoftRuntimeInfrastructure(healthyRuntimeClient({
     async probeCertificate(host) {
@@ -3448,6 +3448,13 @@ const MS_SAMPLE_APIS_SKIP = `the environments read failed (${MS_SAMPLE_ENVIRONME
  * client.redact unchanged.
  */
 const MULESOFT_FIXED_TEXTS = [
+  // The resolver's own messages, which reach check_access, assess, and export results live.
+  "ANYPOINT_ORG_ID, an organization_id argument, or org_id in config.toml is required.",
+  "Provide connected app credentials (ANYPOINT_CLIENT_ID and ANYPOINT_CLIENT_SECRET), username and password (ANYPOINT_USERNAME and ANYPOINT_PASSWORD), a pre-issued ANYPOINT_TOKEN, or the matching arguments or config.toml keys.",
+  "Unsupported MuleSoft control plane \"mars\". Use us, eu, or gov, or pass base_url.",
+  "Pre-issued Anypoint bearer token. Defaults to ANYPOINT_TOKEN.",
+  "The TLS probe connects with rejectUnauthorized set to false so untrusted chains can still be read; authorized and authorization_error record whether each chain validated against the auditor's trust store.",
+  "last_used, lastUsed, last_used_at, or usage.* on GET /organizations/{orgId}/connectedApplications with includeUsage=true; not part of the published schema, so absence is expected",
   "Unable to read MuleSoft config file /home/svc/.config/mulesoft-sec-inspector/config.toml (ENOENT)",
   "Unable to read MuleSoft config file /tmp/grclanker-mulesoft-loader-Ab3dEf/directory.toml (EISDIR)",
   "Unable to read MuleSoft config file /tmp/grclanker-mulesoft-loader-Ab3dEf/locked.toml (EACCES)",
@@ -3586,6 +3593,24 @@ test("round 7 note 1: every fixed-text message MuleSoft emits (loader, opaque bo
     texts.add(error.message);
     return true;
   });
+
+  // The resolver's own messages on the real path with an empty environment and an empty home: no
+  // organization, an organization without credentials, and credentials with an unsupported control plane.
+  const emptyHome = { homeDir: createTempBase("grclanker-mulesoft-fixed-text-home-") };
+  const resolverMessages = [
+    collectThrownMessage(texts, () => resolveMulesoftConfiguration({}, {}, emptyHome), "no organization"),
+    collectThrownMessage(texts, () => resolveMulesoftConfiguration({ organization_id: "org-1" }, {}, emptyHome), "no credentials"),
+    collectThrownMessage(texts, () => resolveMulesoftConfiguration({ organization_id: "org-1", token: "anypoint-token", control_plane: "mars" }, {}, emptyHome), "unsupported control plane"),
+  ];
+  assert.ok(resolverMessages.some((message) => /^Provide connected app credentials \(ANYPOINT_CLIENT_ID and ANYPOINT_CLIENT_SECRET\)/.test(message)), "the resolver rendered its credentials-required message");
+  assert.ok(resolverMessages.some((message) => /^Unsupported MuleSoft control plane "mars"\./.test(message)), "the resolver rendered its control plane message");
+
+  // Every tool label, description, and argument description the integration registers.
+  const registered = [];
+  registerMulesoftTools({ registerTool: (tool) => registered.push(tool) });
+  const toolTexts = collectToolTexts(registered);
+  assert.ok([...toolTexts].some((text) => /Anypoint bearer token/.test(text)), "the tool schemas carry the bearer token argument description");
+  for (const text of toolTexts) texts.add(text);
 
   // Every surface under three credential-free failure flavors (plain proxy page, unrecognized JSON shape, documented
   // error): the access check, the four assessments, the analysis and core_data files, and the error log render the

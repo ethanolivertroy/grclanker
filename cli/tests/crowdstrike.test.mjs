@@ -33,7 +33,7 @@ import {
 import { getRegisteredToolSummaries } from "../dist/pi/tool-catalog.js";
 import { assertSecretFragmentsAbsent, readBundleFiles, readZipEntries } from "./helpers/bundle-contents.mjs";
 import { CONFIG_CANARIES, assertConfigLoaderMatrix, configLoaderCases } from "./helpers/config-loader-matrix.mjs";
-import { assertFixedTextsSurvive, collectFixedTexts, logLines } from "./helpers/fixed-text-survival.mjs";
+import { assertFixedTextsSurvive, collectFixedTexts, collectThrownMessage, collectToolTexts, logLines } from "./helpers/fixed-text-survival.mjs";
 import { assertFragmentsAbsent, assertPlantedValuesWellFormed } from "./helpers/planted-values.mjs";
 import { assertScrubBoundary } from "./helpers/scrub-boundary-matrix.mjs";
 
@@ -2394,6 +2394,10 @@ const CS_SAMPLE_DENIAL = "CrowdStrike request failed for /policy/combined/preven
  * notes, and the corollary summary templates. Each must come back from CrowdstrikeHttpError's pass unchanged.
  */
 const CROWDSTRIKE_FIXED_TEXTS = [
+  // The resolver's own messages, which reach check_access, assess, and export results live.
+  "CrowdStrike API credentials are required. Set CS_CLIENT_ID and CS_CLIENT_SECRET, configure ~/.crowdstrike/config.json, or pass client_id and client_secret explicitly.",
+  "Unknown CrowdStrike cloud \"mars-1\". Use one of: us-1, us-2, eu-1, us-gov-1, us-gov-2.",
+  "Falcon API client secret. Defaults to CS_CLIENT_SECRET (or FALCON_CLIENT_SECRET), then the config file.",
   "Unable to read CrowdStrike config file /home/svc/.crowdstrike/config.json (ENOENT)",
   "Unable to read CrowdStrike config file /tmp/grclanker-crowdstrike-loader-Ab3dEf/directory.json (EISDIR)",
   "Unable to read CrowdStrike config file /tmp/grclanker-crowdstrike-loader-Ab3dEf/locked.json (EACCES)",
@@ -2516,6 +2520,23 @@ test("round 7 note 1: every fixed-text message CrowdStrike emits (loader, opaque
     texts.add(error.message);
     return true;
   });
+
+  // The resolver's own messages on the real path with an empty environment and an empty home: no
+  // credentials, and credentials with an unknown cloud alias.
+  const emptyHome = createTempBase("grclanker-cs-fixed-text-home-");
+  const resolverMessages = [
+    collectThrownMessage(texts, () => resolveCrowdstrikeConfiguration({}, {}, emptyHome), "no credentials"),
+    collectThrownMessage(texts, () => resolveCrowdstrikeConfiguration({ client_id: "falcon-client", client_secret: "falcon-client-secret", cloud: "mars-1" }, {}, emptyHome), "unknown cloud"),
+  ];
+  assert.ok(resolverMessages.some((message) => /^CrowdStrike API credentials are required\./.test(message)), "the resolver rendered its credentials-required message");
+  assert.ok(resolverMessages.some((message) => /^Unknown CrowdStrike cloud "mars-1"\. Use one of: /.test(message)), "the resolver rendered its unknown-cloud message");
+
+  // Every tool label, description, and argument description the integration registers.
+  const registered = [];
+  registerCrowdstrikeTools({ registerTool: (tool) => registered.push(tool) });
+  const toolTexts = collectToolTexts(registered);
+  assert.ok([...toolTexts].some((text) => /CS_CLIENT_SECRET/.test(text)), "the tool schemas carry the client secret argument description");
+  for (const text of toolTexts) texts.add(text);
 
   // Every surface under three credential-free failure flavors (plain proxy page, unrecognized JSON shape, documented
   // error): the access check, every assessment, the analysis and core_data files, and the error log render the

@@ -65,6 +65,13 @@ const AUTHORIZATION_HEADER_PATTERN = new RegExp(
 const COOKIE_HEADER_PATTERN = new RegExp(String.raw`\b(set-cookie|cookie)(${HEADER_SEPARATOR})([^\r\n"'<>\\]+)`, "gi");
 // A scheme standing in prose (`Bearer x`, `Token token=x`, `ApiKey x`).
 const AUTH_SCHEME_PATTERN = new RegExp(String.raw`\b(${PROSE_AUTH_SCHEMES})\s+(${CREDENTIAL_PARAMETERS}|${CREDENTIAL_TOKEN})`, "gi");
+// What follows a scheme word in prose rather than as its credential: after a lowercase scheme, a word without
+// digits (lowercase, Capitalized, camelCase with up to three humps, a short acronym, or an acronym-led word such
+// as OAuth) or an environment variable name ("bearer of", "OAuth bearer token.", "access token (OAuth bearer
+// token)", "JWT bearer (SF_CONSUMER_KEY,"); after a capitalized scheme, only the capitalized next word of a title
+// ("Refresh Token Policy"). Wrapping punctuation belongs to the prose, so it is allowed around the word.
+const PROSE_AFTER_LOWERCASE_SCHEME_PATTERN = /^\(?(?:[A-Z]?[a-z]+(?:[A-Z][a-z]+){0,3}|[A-Z]{2,5}(?:[a-z]+)?|[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)+)[).:!?]*$/;
+const PROSE_AFTER_CAPITALIZED_SCHEME_PATTERN = /^\(?[A-Z][a-z]+[).:!?]*$/;
 const CREDENTIAL_PARAMETER_PATTERN = new RegExp(String.raw`([\w-]+=)${CREDENTIAL_PARAMETER_VALUE}`, "g");
 // Credential-named assignments (`client_secret=x`, `JSESSIONID=x`, `connect.sid=x`, `--token=x`).
 const SECRET_ASSIGNMENT_PATTERN = /(?<![\w.-])([\w.-]*(?:sess|sid|token|secret|passw|passphrase|pwd|passcode|api[_-]?key|apikey|access[_-]?key|private[_-]?key|credential|assertion|signature|auth|cookie|otp)[\w.-]*=)([^\s"'&;,<>\\]+)/gi;
@@ -539,14 +546,20 @@ function scrubSecretText(text: string, secrets: Iterable<string | undefined> = [
     .replace(CREDENTIAL_ELEMENT_PATTERN, (_match, element: string, attributes: string | undefined) => `<${element}${attributes ?? ""}>${REDACTED}</${element}>`)
     .replace(JWT_PATTERN, REDACTED)
     .replace(AUTH_SCHEME_PATTERN, (match: string, scheme: string, credential: string) =>
-      // A lowercase scheme word followed by a plain lowercase word is prose ("bearer of", "token request", "basic auth").
-      (/^[a-z]+$/.test(scheme) && /^[a-z]+$/.test(credential) ? match : `${scheme} ${redactCredentialParameters(credential)}`))
+      (isProseAfterScheme(scheme, credential) ? match : `${scheme} ${redactCredentialParameters(credential)}`))
     .replace(SECRET_ASSIGNMENT_PATTERN, (_match, assignment: string) => `${assignment}${REDACTED}`)
     .replace(SECRET_FIELD_PATTERN, (_match, field: string) => `${field}${REDACTED}`)
     .replace(CLI_SECRET_FLAG_PATTERN, (_match, flag: string) => `${flag}${REDACTED}`)
     .replace(VENDOR_TOKEN_PATTERN, REDACTED)
     .replace(HEX_DIGEST_PATTERN, REDACTED)
     .replace(BARE_TOKEN_RUN_PATTERN, redactTokenRun);
+}
+
+/** A scheme word standing in prose ("bearer of", "OAuth bearer token.", "Refresh Token Policy") rather than carrying a credential. */
+function isProseAfterScheme(scheme: string, credential: string): boolean {
+  return /^[a-z]+$/.test(scheme)
+    ? PROSE_AFTER_LOWERCASE_SCHEME_PATTERN.test(credential)
+    : PROSE_AFTER_CAPITALIZED_SCHEME_PATTERN.test(credential);
 }
 
 /** A parameter list (`token=k`, `username="u", response="r"`) keeps its parameter names; a single credential is replaced whole. */
@@ -890,7 +903,7 @@ export function resolveServicenowConfiguration(
       break;
     case "mtls":
       throw new Error(
-        "ServiceNow mutual TLS is recognized but not supported by this runtime's fetch client; use SERVICENOW_AUTH_METHOD=basic or oauth.",
+        "ServiceNow mutual TLS is recognized but not supported by this runtime's fetch client; set SERVICENOW_AUTH_METHOD to basic or oauth.",
       );
     default: {
       const exhaustive: never = authMode;

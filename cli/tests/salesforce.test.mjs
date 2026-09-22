@@ -33,7 +33,7 @@ import {
 import { getRegisteredToolSummaries } from "../dist/pi/tool-catalog.js";
 import { assertSecretFragmentsAbsent, readBundleFiles, readZipEntries } from "./helpers/bundle-contents.mjs";
 import { CONFIG_CANARIES, assertConfigLoaderMatrix, configLoaderCases } from "./helpers/config-loader-matrix.mjs";
-import { assertFixedTextsSurvive, collectFixedTexts, logLines } from "./helpers/fixed-text-survival.mjs";
+import { assertFixedTextsSurvive, collectFixedTexts, collectThrownMessage, collectToolTexts, logLines } from "./helpers/fixed-text-survival.mjs";
 import { assertFragmentsAbsent, assertPlantedValuesWellFormed } from "./helpers/planted-values.mjs";
 import { assertScrubBoundary } from "./helpers/scrub-boundary-matrix.mjs";
 
@@ -1911,6 +1911,15 @@ const SF_SAMPLE_DENIAL = "Salesforce request /services/data/v64.0/query failed (
  * templates. Each must come back from SalesforceApiError's pass unchanged.
  */
 const SALESFORCE_FIXED_TEXTS = [
+  // The resolver's own messages, which reach check_access, assess, and export results live.
+  "Salesforce credentials are required: JWT bearer (SF_CONSUMER_KEY, SF_USERNAME, SF_PRIVATE_KEY_FILE), username-password (SF_USERNAME, SF_PASSWORD, SF_SECURITY_TOKEN, SF_CONSUMER_KEY, SF_CONSUMER_SECRET), a refresh token, an access token with SF_INSTANCE_URL, or SF_CREDENTIALS_FILE.",
+  "JWT bearer flow requires SF_CONSUMER_KEY, SF_USERNAME, and SF_PRIVATE_KEY_FILE (or SF_PRIVATE_KEY).",
+  "Username-password flow requires SF_USERNAME, SF_PASSWORD, SF_CONSUMER_KEY, and SF_CONSUMER_SECRET (SF_SECURITY_TOKEN when the login IP is not trusted).",
+  "Refresh token flow requires SF_REFRESH_TOKEN and SF_CONSUMER_KEY (plus SF_CONSUMER_SECRET unless the connected app skips the secret).",
+  "Access token mode requires SF_ACCESS_TOKEN and SF_INSTANCE_URL.",
+  "PEM private key path for the JWT bearer flow. Defaults to SF_PRIVATE_KEY_FILE.",
+  "Pre-issued access token (requires instance_url). Defaults to SF_ACCESS_TOKEN.",
+  "Setup > Apps > Connected Apps > Manage Connected Apps: for each app record Permitted Users, IP Relaxation, Refresh Token Policy, and OAuth scopes; Setup > Connected Apps OAuth Usage: review apps with active tokens.",
   "Unable to read Salesforce credentials file /home/svc/.salesforce/credentials.json (ENOENT)",
   "Unable to read Salesforce credentials file /tmp/grclanker-salesforce-loader-Ab3dEf/directory.json (EISDIR)",
   "Unable to read Salesforce credentials file /tmp/grclanker-salesforce-loader-Ab3dEf/locked.json (EACCES)",
@@ -2067,6 +2076,27 @@ test("round 7 note 1: every fixed-text message Salesforce emits (loader, opaque 
     texts.add(error.message);
     return true;
   });
+
+  // The resolver's own messages on the real path with an empty environment: no credentials at all, each
+  // grant type named without its credentials, an unsupported grant type, and a malformed API version.
+  const resolverMessages = [
+    collectThrownMessage(texts, () => resolveSalesforceConfiguration({}, {}), "no credentials"),
+    collectThrownMessage(texts, () => resolveSalesforceConfiguration({ grant_type: "jwt-bearer" }, {}), "jwt-bearer without credentials"),
+    collectThrownMessage(texts, () => resolveSalesforceConfiguration({ grant_type: "password" }, {}), "password without credentials"),
+    collectThrownMessage(texts, () => resolveSalesforceConfiguration({ grant_type: "refresh-token" }, {}), "refresh-token without credentials"),
+    collectThrownMessage(texts, () => resolveSalesforceConfiguration({ grant_type: "access-token" }, {}), "access-token without credentials"),
+    collectThrownMessage(texts, () => resolveSalesforceConfiguration({ grant_type: "device-code" }, {}), "unsupported grant type"),
+    collectThrownMessage(texts, () => resolveSalesforceConfiguration({ api_version: "latest" }, {}), "malformed api version"),
+  ];
+  assert.ok(resolverMessages.some((message) => /^Salesforce credentials are required: JWT bearer \(SF_CONSUMER_KEY,/.test(message)), "the resolver rendered its credentials-required message");
+  assert.ok(resolverMessages.some((message) => /^Username-password flow requires/.test(message)), "the resolver rendered its username-password message");
+
+  // Every tool label, description, and argument description the integration registers.
+  const registered = [];
+  registerSalesforceTools({ registerTool: (tool) => registered.push(tool) });
+  const toolTexts = collectToolTexts(registered);
+  assert.ok([...toolTexts].some((text) => /JWT bearer flow/.test(text)), "the tool schemas carry the private key argument description");
+  for (const text of toolTexts) texts.add(text);
 
   // Every surface under three credential-free failure flavors (plain proxy page, unrecognized JSON shape, documented
   // error): the access check, the four assessments, the analysis files, and the error log render the opaque-body

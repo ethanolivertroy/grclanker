@@ -166,6 +166,13 @@ const AUTHORIZATION_HEADER_PATTERN = new RegExp(
 const COOKIE_HEADER_PATTERN = new RegExp(String.raw`\b(set-cookie|cookie)(${HEADER_SEPARATOR})([^\r\n"'<>\\]+)`, "gi");
 // A scheme standing in prose (`Bearer x`, `Token token=x`, `ApiKey x`).
 const AUTH_SCHEME_PATTERN = new RegExp(String.raw`\b(${PROSE_AUTH_SCHEMES})\s+(${CREDENTIAL_PARAMETERS}|${CREDENTIAL_TOKEN})`, "gi");
+// What follows a scheme word in prose rather than as its credential: after a lowercase scheme, a word without
+// digits (lowercase, Capitalized, camelCase with up to three humps, a short acronym, or an acronym-led word such
+// as OAuth) or an environment variable name ("bearer of", "OAuth bearer token.", "access token (OAuth bearer
+// token)", "JWT bearer (SF_CONSUMER_KEY,"); after a capitalized scheme, only the capitalized next word of a title
+// ("Refresh Token Policy"). Wrapping punctuation belongs to the prose, so it is allowed around the word.
+const PROSE_AFTER_LOWERCASE_SCHEME_PATTERN = /^\(?(?:[A-Z]?[a-z]+(?:[A-Z][a-z]+){0,3}|[A-Z]{2,5}(?:[a-z]+)?|[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)+)[).:!?]*$/;
+const PROSE_AFTER_CAPITALIZED_SCHEME_PATTERN = /^\(?[A-Z][a-z]+[).:!?]*$/;
 const CREDENTIAL_PARAMETER_PATTERN = new RegExp(String.raw`([\w-]+=)${CREDENTIAL_PARAMETER_VALUE}`, "g");
 // Credential-named assignments (`client_secret=x`, `JSESSIONID=x`, `connect.sid=x`, `--token=x`).
 const SECRET_ASSIGNMENT_PATTERN = /(?<![\w.-])([\w.-]*(?:sess|sid|token|secret|passw|passphrase|pwd|passcode|api[_-]?key|apikey|access[_-]?key|private[_-]?key|credential|assertion|signature|auth|cookie|otp)[\w.-]*=)([^\s"'&;,<>\\]+)/gi;
@@ -550,14 +557,20 @@ function scrubErrorText(text: string, secrets: Iterable<string | undefined> = KN
     .replace(CREDENTIAL_ELEMENT_PATTERN, (_match, element: string, attributes: string | undefined) => `<${element}${attributes ?? ""}>${REDACTED}</${element}>`)
     .replace(JWT_PATTERN, REDACTED)
     .replace(AUTH_SCHEME_PATTERN, (match: string, scheme: string, credential: string) =>
-      // A lowercase scheme word followed by a plain lowercase word is prose ("bearer of", "token request", "basic auth").
-      (/^[a-z]+$/.test(scheme) && /^[a-z]+$/.test(credential) ? match : `${scheme} ${redactCredentialParameters(credential)}`))
+      (isProseAfterScheme(scheme, credential) ? match : `${scheme} ${redactCredentialParameters(credential)}`))
     .replace(SECRET_ASSIGNMENT_PATTERN, (_match, assignment: string) => `${assignment}${REDACTED}`)
     .replace(SECRET_FIELD_PATTERN, (_match, field: string) => `${field}${REDACTED}`)
     .replace(CLI_SECRET_FLAG_PATTERN, (_match, flag: string) => `${flag}${REDACTED}`)
     .replace(VENDOR_TOKEN_PATTERN, REDACTED)
     .replace(HEX_DIGEST_PATTERN, REDACTED)
     .replace(BARE_TOKEN_RUN_PATTERN, redactTokenRun);
+}
+
+/** A scheme word standing in prose ("bearer of", "OAuth bearer token.", "Refresh Token Policy") rather than carrying a credential. */
+function isProseAfterScheme(scheme: string, credential: string): boolean {
+  return /^[a-z]+$/.test(scheme)
+    ? PROSE_AFTER_LOWERCASE_SCHEME_PATTERN.test(credential)
+    : PROSE_AFTER_CAPITALIZED_SCHEME_PATTERN.test(credential);
 }
 
 /** A parameter list (`token=k`, `username="u", response="r"`) keeps its parameter names; a single credential is replaced whole. */
@@ -2501,7 +2514,7 @@ export async function assessMulesoftIdentityAccess(
           managed_apps_included: true,
           apps_with_usage_data: appsWithUsageDate.length,
           apps_without_usage_date: sample(appsWithoutUsageDate.map(connectedAppName)),
-          usage_data_source: "last_used, lastUsed, last_used_at, or usage.* on GET /organizations/{orgId}/connectedApplications?includeUsage=true; not part of the published schema, so absence is expected",
+          usage_data_source: "last_used, lastUsed, last_used_at, or usage.* on GET /organizations/{orgId}/connectedApplications with includeUsage=true; not part of the published schema, so absence is expected",
           stale_apps: sample(staleApps.map(connectedAppName)),
           disabled_apps: sample(disabledApps.map(connectedAppName)),
           stale_days: staleDays,
@@ -3511,7 +3524,7 @@ export async function assessMulesoftRuntimeInfrastructure(
           load_balancers: loadBalancers.length,
           fail_days: DEFAULT_CERTIFICATE_FAIL_DAYS,
           warning_days: certificateWarningDays,
-          probe_note: "The TLS probe connects with rejectUnauthorized=false so untrusted chains can still be read; authorized and authorization_error record whether each chain validated against the auditor's trust store.",
+          probe_note: "The TLS probe connects with rejectUnauthorized set to false so untrusted chains can still be read; authorized and authorization_error record whether each chain validated against the auditor's trust store.",
         };
         if (loadBalancers.length === 0) return verdict("manual", noLoadBalancerSummary, evidence);
         if (expiringCertificates.length > 0) {
