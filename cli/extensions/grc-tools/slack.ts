@@ -11,7 +11,6 @@ import {
   existsSync,
   lstatSync,
   mkdirSync,
-  readFileSync,
   realpathSync,
 } from "node:fs";
 import { chmod, readdir, writeFile } from "node:fs/promises";
@@ -19,6 +18,7 @@ import { homedir } from "node:os";
 import { dirname, join, relative, resolve } from "node:path";
 import { ZipArchive } from "archiver";
 import { Type } from "@sinclair/typebox";
+import { ConfigFileError, readConfigText } from "./hardening/index.js";
 import { errorResult, formatTable, textResult } from "./shared.js";
 
 const DEFAULT_TIMEOUT_MS = 30_000;
@@ -344,6 +344,25 @@ function parseTimeoutSeconds(value: number | undefined): number {
   return clampNumber(value, DEFAULT_TIMEOUT_MS / 1000, 1, 300) * 1000;
 }
 
+const CONFIG_FILE_OPTIONS = { label: "Slack" } as const;
+
+/**
+ * The shared read guard renders `Unable to read Slack config file <path> (<CODE>)` from the path and the errno code
+ * only, never the filesystem wording. The path has been checked with existsSync, so the missing-file result is a race
+ * with a deletion and is reported as the read failure it is. Every error string this module creates passes through
+ * redactErrorText at the point of creation, this one included.
+ */
+function readConfigFileText(candidate: string): string {
+  try {
+    const read = readConfigText(candidate, CONFIG_FILE_OPTIONS);
+    if (read.ok) return read.value;
+    throw new ConfigFileError({ kind: "read", path: candidate, code: "ENOENT", label: CONFIG_FILE_OPTIONS.label });
+  } catch (error) {
+    if (!(error instanceof ConfigFileError)) throw error;
+    throw new Error(redactErrorText(error.message));
+  }
+}
+
 function readConfigFile(env: NodeJS.ProcessEnv): { values: JsonRecord; path?: string } {
   const configured = asString(env.SLACK_CONFIG_FILE);
   const candidate = configured ?? DEFAULT_CONFIG_FILE;
@@ -351,13 +370,7 @@ function readConfigFile(env: NodeJS.ProcessEnv): { values: JsonRecord; path?: st
     if (configured) throw new Error(`SLACK_CONFIG_FILE does not exist: ${configured}`);
     return { values: {} };
   }
-  let text: string;
-  try {
-    text = readFileSync(candidate, "utf8");
-  } catch (error) {
-    const code = systemErrorCode(error);
-    throw new Error(redactErrorText(`Unable to read Slack config file ${candidate}${code ? ` (${code})` : ""}`));
-  }
+  const text = readConfigFileText(candidate);
   let parsed: unknown;
   try {
     parsed = JSON.parse(text);
@@ -365,12 +378,6 @@ function readConfigFile(env: NodeJS.ProcessEnv): { values: JsonRecord; path?: st
     throw new Error(`Unable to parse Slack config file ${candidate}: the file is not valid JSON (parser detail withheld because it can quote the file)`);
   }
   return { values: asObject(parsed) ?? {}, path: candidate };
-}
-
-/** A Node system error code such as EISDIR or EACCES; the error message and any other thrown value are never rendered. */
-function systemErrorCode(error: unknown): string | undefined {
-  const code = asObject(error)?.code;
-  return typeof code === "string" && /^E[A-Z0-9_]{1,30}$/.test(code) ? code : undefined;
 }
 
 function pickSource(

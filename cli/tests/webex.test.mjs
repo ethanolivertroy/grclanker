@@ -572,16 +572,19 @@ test("config loader canary: neither the YAML parser message, the JSON parser win
   assert.match(yamlControl.message, /Nested mappings .* line 2/);
   assert.ok(yamlControl.message.includes(tokenCanary) && yamlControl.message.includes(bearerCanary), "positive control: yaml.parse quotes the whole line, both canaries included");
   assert.equal(yamlControl.linePos?.[0]?.line, 2, "the structured position is what the loader may use");
+  const [{ line: yamlLine, col: yamlColumn }] = yamlControl.linePos;
+  assert.match(yamlControl.code, /^[A-Z][A-Z0-9_]{1,40}$/, "the structured parser code is the other field the loader may use");
+  const referenceMessage = `Unable to parse Webex config file: invalid YAML in ${referencePath} at line ${yamlLine}, column ${yamlColumn} (${yamlControl.code})`;
 
   const viaArgument = thrownBy(() => resolveWebexConfiguration({ config_file: referencePath }, {}, { homeDir: home }));
   assert.ok(viaArgument instanceof Error);
-  assert.match(viaArgument.message, /^Unable to parse Webex config file: invalid YAML in .*config\.yaml at line 2$/);
+  assert.equal(viaArgument.message, referenceMessage);
   assertClean(viaArgument.message, "resolver (config_file route)");
   const viaEnv = thrownBy(() => resolveWebexConfiguration({}, { WEBEX_CONFIG_FILE: referencePath }, { homeDir: home }));
   assert.ok(viaEnv instanceof Error);
   assert.equal(viaEnv.message, viaArgument.message, "the WEBEX_CONFIG_FILE route throws the same fixed description");
   const toolViaArgument = toolText(await checkAccessThroughTool({ config_file: referencePath }));
-  assert.match(toolViaArgument, /^Webex access check failed: Unable to parse Webex config file: invalid YAML in .*config\.yaml at line 2$/);
+  assert.equal(toolViaArgument, `Webex access check failed: ${referenceMessage}`);
   assertClean(toolViaArgument, "webex_check_access (config_file route)");
   const toolViaEnv = toolText(await checkAccessThroughTool({}, referencePath));
   assert.equal(toolViaEnv, toolViaArgument);
@@ -597,7 +600,7 @@ test("config loader canary: neither the YAML parser message, the JSON parser win
   assert.equal(aliasControl.linePos, undefined);
   const aliasThrown = thrownBy(() => resolveWebexConfiguration({ config_file: aliasPath }, {}, { homeDir: home }));
   assert.ok(aliasThrown instanceof Error);
-  assert.match(aliasThrown.message, /^Unable to parse Webex config file: invalid YAML in .*alias\.yml$/, "no line number because the thrown value is not a structured YAMLError");
+  assert.equal(aliasThrown.message, `Unable to parse Webex config file: invalid YAML in ${aliasPath} (INVALID_YAML)`, "no position because the thrown value is not a structured YAMLError; the fixed code stands in for the parser's");
   assertClean(aliasThrown.message, "resolver (alias shape)");
   assertClean(toolText(await checkAccessThroughTool({ config_file: aliasPath })), "webex_check_access (alias shape)");
 
@@ -611,7 +614,7 @@ test("config loader canary: neither the YAML parser message, the JSON parser win
   assert.ok(jsonControl.message.includes(jsonCanary.slice(0, 10)), `positive control: JSON.parse quotes the first ten characters of the value: ${jsonControl.message}`);
   const jsonThrown = thrownBy(() => resolveWebexConfiguration({ config_file: jsonPath }, {}, { homeDir: home }));
   assert.ok(jsonThrown instanceof Error);
-  assert.match(jsonThrown.message, /^Unable to parse Webex config file: invalid JSON in .*config\.json$/);
+  assert.equal(jsonThrown.message, `Unable to parse Webex config file: invalid JSON in ${jsonPath} (INVALID_JSON)`, "no position because the quoted-window message carries no offset");
   assert.ok(!jsonThrown.message.includes(jsonCanary.slice(0, 10)), "the ten-character fragment is absent");
   assertClean(jsonThrown.message, "resolver (JSON shape)");
   const jsonTool = toolText(await checkAccessThroughTool({ config_file: jsonPath }));

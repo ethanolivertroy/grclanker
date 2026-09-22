@@ -20,6 +20,7 @@ import { STATUS_CODES } from "node:http";
 import { basename, dirname, join, relative, resolve } from "node:path";
 import { ZipArchive } from "archiver";
 import { Type } from "@sinclair/typebox";
+import { systemErrorCode } from "./hardening/index.js";
 import { errorResult, formatTable, textResult } from "./shared.js";
 
 type JsonRecord = Record<string, unknown>;
@@ -1390,19 +1391,14 @@ export class GitHubHttpError extends Error {
   }
 }
 
-/** The shape of a Node system error `code` (ENOENT, EACCES, EISDIR): a fixed identifier, never a message. */
-const SYSTEM_ERROR_CODE_PATTERN = /^E[A-Z0-9_]{1,30}$/;
-
-function systemErrorCode(error: unknown): string | undefined {
-  const code = asRecord(error).code;
-  return typeof code === "string" && SYSTEM_ERROR_CODE_PATTERN.test(code) ? code : undefined;
-}
-
 /**
  * Reads the GitHub App private key file named by GITHUB_APP_PRIVATE_KEY_PATH or app_private_key_path.
  * The read error is never interpolated: a Node fs message carries library wording and whatever a
  * non-standard thrown value's `String(error)` yields, and scrubErrorText has nothing to remove from
- * either, so the thrown text is a fixed description with the path and the system error code only.
+ * either, so the thrown text is a fixed description with the path and the system error code only
+ * (the shared `systemErrorCode` guard). The loader stays local rather than using `readConfigText`:
+ * a key file is not a config overlay, so a missing file is a failure here, not the missing-file
+ * result, and the accepted text names a private key file, not a config file.
  */
 function readPrivateKeyFile(pathname: string): string {
   const resolvedPath = resolve(pathname);
