@@ -302,8 +302,9 @@ test("listPaginated marks a walk that exhausts maxPages on full pages without pa
   const capped = createTenableClients(vmConfig(), { fetchImpl: fullPageFetch("networks", 2), sleepImpl: async () => {} });
   const cappedPage = await capped.vm.listPaginated("/networks", "networks", {}, { pageLimit: 2, maxPages: 3 });
   assert.equal(cappedPage.items.length, 6, "every permitted page was fetched");
-  assert.equal(cappedPage.total, undefined);
+  assert.equal(cappedPage.total, null, "no total was reported, so the page carries null rather than a number");
   assert.equal(cappedPage.truncated, true, "leaving the loop at the page cap is a partial inventory");
+  assert.match(cappedPage.reason, /stopped at the 3-page cap/);
 
   const short = createTenableClients(vmConfig(), { fetchImpl: fullPageFetch("networks", 2, { shortPageAt: 2 }), sleepImpl: async () => {} });
   const shortPage = await short.vm.listPaginated("/networks", "networks", {}, { pageLimit: 2, maxPages: 3 });
@@ -331,13 +332,13 @@ test("a page-capped inventory without pagination.total demotes the finding inste
   assert.equal(data.networks.status, "ok");
   assert.equal(data.networks.truncated, true);
   assert.equal(data.networks.seen, 200 * 50, "the walk stopped at the default page cap");
-  assert.equal(data.networks.total, undefined, "no total was reported, so none is invented");
+  assert.equal(data.networks.total, null, "no total was reported, so none is invented");
 
   const result = assessTenableSensorCoverage(data, { now: NOW });
   const networks = result.findings.find((item) => item.id === "TENABLE-09");
   assert.equal(networks.status, "warn", networks.summary);
-  assert.match(networks.summary, /Only 10000 of unknown records were retrieved, so the verdict is capped at warn/);
-  assert.ok(result.errors.some((error) => error.includes("partial view (10000 of unknown records retrieved)")), JSON.stringify(result.errors));
+  assert.match(networks.summary, /Only 10000 of unknown records were retrieved \(the walk stopped at the 200-page cap\), so the verdict is capped at warn/);
+  assert.ok(result.errors.some((error) => error.includes("partial view (10000 of unknown records retrieved; the walk stopped at the 200-page cap)")), JSON.stringify(result.errors));
 });
 
 test("TenableApiClient retries 429 and 5xx responses honoring retry-after", async () => {
@@ -912,7 +913,11 @@ test("export polling, vendor reason strings, Security Center error_msg, and time
   stuck["GET /assets/export/asset-export-1/status"] = { status: "PROCESSING", chunks_available: [] };
   const slow = createTenableClients(vmConfig(), { fetchImpl: routerFetch(stuck), sleepImpl: async () => {}, exportPollMs: 0, exportTimeoutMs: 0 });
   const timedOut = await slow.vm.exportAssets();
-  assert.equal(timedOut.truncated, true);
+  assert.equal(timedOut.truncated, null, "a walk that never observed a chunk list has no truncation flag to report");
+  assert.equal(timedOut.fetchedChunks, null);
+  assert.equal(timedOut.totalChunks, null);
+  assert.equal(timedOut.exportUuid, "asset-export-1", "the export id stays with the result");
+  assert.equal(timedOut.endpoint, "GET /assets/export/asset-export-1/status", "the last poll is the request that reported the state");
   assert.match(timedOut.status, /^TIMEOUT\(PROCESSING\)$/);
   const sensorData = await collectTenableSensorCoverageData(slow, { now: NOW });
   assert.equal(sensorData.assetExport.status, "error");
@@ -1100,7 +1105,7 @@ test("rule 1 corollary: a pass never survives an unreadable secondary inventory 
   const templates = await runAll(clientsFor(forbidding("GET /editor/scan/templates")), { expectedAssetCount: 2 });
   const scanPolicy = byId(templates, "TENABLE-01");
   assert.equal(scanPolicy.status, "warn", scanPolicy.summary);
-  assert.match(scanPolicy.summary, /GET \/editor\/scan\/templates could not be read .*discovery-only scan detection was not possible/);
+  assert.match(scanPolicy.summary, /GET \/editor\/scan\/templates refused the API key with HTTP 403 .*discovery-only scan detection was not possible/);
   assert.equal(scanPolicy.evidence.scan_templates_in_use, null);
   assert.equal(scanPolicy.evidence.policy_templates, null);
   assert.equal(scanPolicy.evidence.discovery_only_scans, null);
@@ -1110,7 +1115,7 @@ test("rule 1 corollary: a pass never survives an unreadable secondary inventory 
   const agents = await runAll(clientsFor(forbidding("GET /scanners/null/agents")), { expectedAssetCount: 2 });
   const pluginCurrency = byId(agents, "TENABLE-08");
   assert.equal(pluginCurrency.status, "warn", pluginCurrency.summary);
-  assert.match(pluginCurrency.summary, /GET \/scanners\/null\/agents could not be read .*agent plugin currency is unknown/);
+  assert.match(pluginCurrency.summary, /GET \/scanners\/null\/agents refused the API key with HTTP 403 .*agent plugin currency is unknown/);
   assert.equal(pluginCurrency.evidence.stale_online_agents, null);
   assert.equal(pluginCurrency.evidence.agents_status, "forbidden");
   assert.equal(byId(agents, "TENABLE-07").status, "pass", "scanner health does not read the agent list");
@@ -1121,7 +1126,7 @@ test("rule 1 corollary: a pass never survives an unreadable secondary inventory 
   const networks = await runAll(clientsFor(forbidding("GET /networks")), { expectedAssetCount: 2 });
   const coverage = byId(networks, "TENABLE-03");
   assert.equal(coverage.status, "warn", coverage.summary);
-  assert.match(coverage.summary, /GET \/networks could not be read/);
+  assert.match(coverage.summary, /GET \/networks refused the API key with HTTP 403/);
   assert.equal(coverage.evidence.networks_without_assets, null);
   assert.equal(coverage.evidence.networks_status, "forbidden");
   assert.equal(byId(networks, "TENABLE-09").status, "manual");
@@ -1130,13 +1135,13 @@ test("rule 1 corollary: a pass never survives an unreadable secondary inventory 
   const tagValues = await runAll(clientsFor(forbidding("GET /tags/values")), { expectedAssetCount: 2 });
   const tagging = byId(tagValues, "TENABLE-16");
   assert.equal(tagging.status, "warn", tagging.summary);
-  assert.match(tagging.summary, /GET \/tags\/values could not be read/);
+  assert.match(tagging.summary, /GET \/tags\/values refused the API key with HTTP 403/);
   assert.equal(tagging.evidence.tag_value_count, null);
 
   const serverProperties = await runAll(clientsFor(forbidding("GET /server/properties")));
   const agentHealth = byId(serverProperties, "TENABLE-05");
   assert.equal(agentHealth.status, "warn", agentHealth.summary);
-  assert.match(agentHealth.summary, /GET \/server\/properties \(license\.agents\) could not be read/);
+  assert.match(agentHealth.summary, /GET \/server\/properties refused the API key with HTTP 403 .*licensed agent count \(license\.agents\) is unknown/);
   assert.equal(agentHealth.evidence.licensed_agents, null);
   assert.equal(byId(serverProperties, "TENABLE-08").status, "manual");
 
@@ -1149,13 +1154,13 @@ test("rule 1 corollary: a pass never survives an unreadable secondary inventory 
   const roles = await runAll(clientsFor(forbidding("GET /access-control/v1/roles")));
   const userAccess = byId(roles, "TENABLE-10");
   assert.equal(userAccess.status, "warn", userAccess.summary);
-  assert.match(userAccess.summary, /GET \/access-control\/v1\/roles could not be read/);
+  assert.match(userAccess.summary, /GET \/access-control\/v1\/roles refused the API key with HTTP 403/);
   assert.equal(userAccess.evidence.custom_roles, null);
 
   const groups = await runAll(clientsFor(forbidding("GET /groups")));
   const permissions = byId(groups, "TENABLE-11");
   assert.equal(permissions.status, "warn", permissions.summary);
-  assert.match(permissions.summary, /GET \/groups could not be read/);
+  assert.match(permissions.summary, /GET \/groups refused the API key with HTTP 403/);
   assert.equal(permissions.evidence.user_groups, null);
 
   const accessGroups = await runAll(clientsFor(forbidding("GET /v2/access-groups")));
@@ -1167,7 +1172,7 @@ test("rule 1 corollary: a pass never survives an unreadable secondary inventory 
   const jobs = await runAll(clientsFor(forbidding("GET /assets/export/status")));
   const automation = byId(jobs, "TENABLE-19");
   assert.equal(automation.status, "warn", automation.summary);
-  assert.match(automation.summary, /GET \/assets\/export\/status could not be read/);
+  assert.match(automation.summary, /GET \/assets\/export\/status refused the API key with HTTP 403/);
   assert.equal(automation.evidence.asset_export_jobs_listed, null);
   assert.equal(automation.evidence.vuln_export_jobs_listed, 2);
 
