@@ -1260,10 +1260,12 @@ export class ServicenowApiClient implements ServicenowReadClient {
     const payload: JsonRecord = parsed ?? {};
     if (!response.ok) {
       const detail = servicenowErrorDetail(payload) ?? asString(payload.error) ?? (rawText.length > 0 ? describeOpaqueBody(response, rawText, parsed !== undefined) : undefined);
+      // detail passes through the client's redact too: it knows the configured credentials, including
+      // ones shorter than the remembered-secret minimum that the constructor's pass cannot see.
       throw new ServicenowApiError(
         this.redact(`ServiceNow OAuth token request failed (${describeStatus(response)}) for /oauth_token.do${detail ? `: ${detail}` : ""}`),
         response.status,
-        detail,
+        detail === undefined ? undefined : this.redact(detail),
       );
     }
     const accessToken = asString(payload.access_token);
@@ -1327,7 +1329,7 @@ export class ServicenowApiClient implements ServicenowReadClient {
       throw new ServicenowApiError(
         this.redact(`ServiceNow request failed (${describeStatus(response)}) for ${new URL(url).pathname}${detail ? `: ${detail}` : ""}`),
         response.status,
-        detail,
+        detail === undefined ? undefined : this.redact(detail),
       );
     }
   }

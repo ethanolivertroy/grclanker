@@ -1537,6 +1537,46 @@ test("ServicenowApiClient describes non-JSON error bodies by shape and logs only
   assert.equal(timedOut.error.includes("alice.admin"), false);
 });
 
+test("ServicenowApiError.detail is redacted through the client's own credentials at both throw sites, so a 4-to-7-character password or client secret echoed by the server never survives (CodeRabbit b)", async () => {
+  // Below the remembered-secret minimum (8), so only the client's redact knows these values.
+  const shortSecrets = { password: "Zq7pV", clientSecret: "k3Xw9Rt", refreshToken: "Hb2n" };
+  const echo = (text) => new Response(
+    JSON.stringify({ error: { message: `Invalid credentials for audit.reader with password ${text}`, detail: `password=${text}; client_secret=${shortSecrets.clientSecret}; refresh_token=${shortSecrets.refreshToken}` }, status: "failure" }),
+    { status: 401, statusText: "Unauthorized", headers: { "content-type": "application/json" } },
+  );
+  const assertShortSecretsAbsent = (text, label) => {
+    for (const [name, secret] of Object.entries(shortSecrets)) {
+      assertFragmentsAbsent(assert, text, [secret], `${label}: ${name}`);
+      assert.equal(text.includes(secret), false, `${label}: ${name} echo survives: ${text}`);
+    }
+  };
+
+  const tableClient = createClient(async () => echo(shortSecrets.password), { maxRetries: 0, password: shortSecrets.password, clientSecret: shortSecrets.clientSecret, refreshToken: shortSecrets.refreshToken });
+  const tableError = await tableClient.requestJson(`${sampleConfig().instanceUrl}/api/now/table/sys_user`).then(() => assert.fail("expected a rejection"), (error) => error);
+  assert.ok(tableError instanceof ServicenowApiError);
+  assert.equal(tableError.status, 401);
+  assert.match(tableError.message, /^ServiceNow request failed \(401 Unauthorized\) for \/api\/now\/table\/sys_user: Invalid credentials for audit.reader with password \[REDACTED\]/);
+  assertShortSecretsAbsent(tableError.message, "table request message");
+  assertShortSecretsAbsent(tableError.detail, "table request detail");
+  assert.ok(tableError.detail.includes("[REDACTED]"), "the detail keeps its marker");
+
+  const tokenFetch = async (input) => {
+    assert.equal(new URL(String(input)).pathname, "/oauth_token.do");
+    return echo(shortSecrets.password);
+  };
+  const oauth = createClient(tokenFetch, { authMode: "oauth", clientId: "client-id", clientSecret: shortSecrets.clientSecret, password: shortSecrets.password, refreshToken: shortSecrets.refreshToken });
+  const tokenError = await oauth.requestJson(`${sampleConfig().instanceUrl}/api/now/table/sys_user`).then(() => assert.fail("expected a rejection"), (error) => error);
+  assert.ok(tokenError instanceof ServicenowApiError);
+  assert.match(tokenError.message, /^ServiceNow OAuth token request failed \(401 Unauthorized\) for \/oauth_token\.do: /);
+  assertShortSecretsAbsent(tokenError.message, "token request message");
+  assertShortSecretsAbsent(tokenError.detail, "token request detail");
+
+  // Positive control for the class: the constructor's pass alone (no client) cannot see a short secret
+  // echoed bare in prose, which is why both throw sites redact the detail through the client first.
+  const constructedOnly = new ServicenowApiError("m", 401, `Invalid credentials for audit.reader with password ${shortSecrets.password}`);
+  assert.ok(constructedOnly.detail.includes(shortSecrets.password), "the constructor alone leaves a bare short echo: the client's redact is the guard");
+});
+
 function overrideTablePage(inner, table, respond) {
   return async (input, init) => {
     const url = new URL(String(input));
