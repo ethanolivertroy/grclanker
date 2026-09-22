@@ -713,7 +713,7 @@ test("CrowdstrikeApiClient redacts secrets in errors and gives up after the retr
   };
   const opaqueClient = new CrowdstrikeApiClient(sampleConfig(), { fetchImpl: opaqueBodyFetch, sleep: async () => {}, retryLimit: 0 });
   await assert.rejects(opaqueClient.listHostGroups(), (error) => {
-    assert.match(error.message, /\(502\): response body omitted \(text\/html, 62 characters\)/);
+    assert.match(error.message, /\(502\): non-JSON body \(text\/html, 62 bytes\)/);
     assert.doesNotMatch(error.message, /FAKE_PROXY_ECHOED_SECRET/, "a non-JSON error body is never copied into the error string");
     return true;
   });
