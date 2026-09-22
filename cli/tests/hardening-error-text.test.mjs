@@ -944,6 +944,116 @@ test("isCredentialKey covers the Flue heuristic plus bare and signed-URL names",
   for (const key of ["webhook_url", "webhookUrl", "WEBHOOK_URL", "webhook", "webhooks", "slack_webhook", "webhook_count", "slack_hook_url", "incoming-hook-url", "callback_url", "oauth_callback_url", "session_id", "sessionId", "user_session_id", "PHPSESSID", "JSESSIONID", "ASP.NET_SessionId", "sid"]) {
     assert.ok(isCredentialKey(key), `${key} stays a credential key whatever its suffix`);
   }
+  // CodeRabbit (#78) secret_id: the Vault AppRole secret id is the bearer half of the pair, so a key
+  // ending in `secret_id` is a credential key in any prefix, casing, or separator; the identifier half
+  // (`role_id`) and the other identifier keys stay settings.
+  for (const key of ["secret_id", "SECRET_ID", "VAULT_SECRET_ID", "role_secret_id", "secretId", "roleSecretId", "secret-id", "vault.approle.secret_id", "X-Vault-Secret-Id", "secretid"]) {
+    assert.ok(isCredentialKey(key), `${key} is the bearer secret id`);
+  }
+  for (const key of ["role_id", "VAULT_ROLE_ID", "roleId", "key_id", "access_key_id", "private_key_id", "secret_name", "client_id", "tenant_id", "user_name", "secret_id_count"]) {
+    assert.ok(!isCredentialKey(key), `${key} is an identifier or a setting`);
+  }
+});
+
+test("CodeRabbit (#78) secret_id: a UUID or random value under a key ending in secret_id goes through every entry point in every form and frame, and client_id and tenant_id UUIDs stay", () => {
+  // Review of e848385: `secret_id`, `VAULT_SECRET_ID`, and `role_secret_id` had become settings
+  // through the `id` suffix, and a UUID-shaped Vault AppRole secret id (which `UUID_PATTERN` keeps off
+  // the long-token rule) passed every scrub where main at 02967cc redacted it through the `secret`
+  // word. The key alone must carry the value, so the shortest value here is six characters, below any
+  // shape rule, and the nine-letter one is a plain word: the secret id is an explicit credential pair
+  // name like the session names, so the prose exemption of the generic rule does not apply to it.
+  const keys = ["secret_id", "VAULT_SECRET_ID", "role_secret_id", "secretId", "secret-id", "roleSecretId"];
+  const values = ["3f6c1e2a-8b4d-4c7e-9a1f-2d5e6b7c8d9e", "9B2E4F6A-1C3D-4E5F-8A9B-0C1D2E3F4A5B", "k7Qm2xZp9vLw4nRt8sYb", "x7Kp2q", "qzvkwpmtr"];
+  const roleId = "5d1a2b3c-4e5f-4a6b-8c7d-9e0f1a2b3c4d";
+  const controls = [
+    ["client_id", UUID],
+    ["tenant_id", "2f3c1a9e-7b6d-4c5e-8f9a-0b1c2d3e4f5a"],
+    ["role_id", roleId],
+    ["VAULT_ROLE_ID", roleId],
+  ];
+  const forms = [
+    ["eq", (key, value) => `${key}=${value}`, (key) => `${key}=${REDACTED}`],
+    ["colon_space", (key, value) => `${key}: ${value}`, (key) => `${key}: ${REDACTED}`],
+    ["json", (key, value) => `{"${key}":"${value}"}`, (key) => `{"${key}":"${REDACTED}"}`],
+    ["json_escaped", (key, value) => `\\"${key}\\":\\"${value}\\"`, (key) => `\\"${key}\\":\\"${REDACTED}\\"`],
+    ["eq_quoted", (key, value) => `${key}="${value}"`, (key) => `${key}="${REDACTED}"`],
+    ["query", (key, value) => `/v1/auth/approle/login?${key}=${value}&page=2`, (key) => `/v1/auth/approle/login?${key}=${REDACTED}&page=2`],
+  ];
+  const frames = [
+    ["bare", (pair) => pair],
+    ["sentence", (pair) => `the upstream rejected the request with ${pair} and closed the connection`],
+    ["multiline", (pair) => `request failed\n${pair}\nsee the log`],
+    ["escaped_line", (pair) => `request failed\\n${pair}\\nsee the log`],
+  ];
+  const textScrubs = [
+    ["scrubErrorText", (text) => scrubErrorText(text)],
+    ["scrubDataText", (text) => scrubDataText(text)],
+    ["redactSecretValues", (text) => redactSecretValues(text)],
+  ];
+  const entryPoints = [
+    ...textScrubs,
+    ["errorMessage", (text) => errorMessage(new Error(text))],
+    ["scrubError", (text) => scrubError(new Error(text)).message],
+    ["IntegrationError", (text) => new IntegrationError(text, {}).message],
+    ["describeErrorBody message", (text) => describeErrorBody("application/json", JSON.stringify({ message: text }))],
+    ["describeErrorBody nested", (text) => describeErrorBody("application/json", JSON.stringify({ error: { message: JSON.stringify({ detail: text }) } }))],
+    ["describeFailedResponse", (text) => describeFailedResponse({ method: "POST", endpoint: "/v1/auth/approle/login", status: 400, statusText: "Bad Request", contentType: "application/json", body: JSON.stringify({ message: text }) })],
+  ];
+  let trials = 0;
+  for (const key of keys) {
+    for (const value of values) {
+      for (const [formName, form, cleaned] of forms) {
+        // The exact rendering of the bare pair under the three text scrubs: the key stays, the value is
+        // one marker, and nothing else on the line moves.
+        for (const [name, scrub] of textScrubs) {
+          assert.equal(scrub(form(key, value)), cleaned(key), `${name}: ${formName} of ${key}=${value}`);
+        }
+        for (const [frameName, frame] of frames) {
+          const text = frame(form(key, value));
+          for (const [name, entryPoint] of entryPoints) {
+            trials += 1;
+            const rendered = entryPoint(text);
+            assertNoFragment(rendered, value, { label: `${name}: ${key} ${formName} ${frameName}` });
+            assert.ok(rendered.includes(REDACTED), `${name}: ${key} ${formName} ${frameName} left no marker in ${JSON.stringify(rendered)}`);
+            assert.ok(rendered.includes(key), `${name}: ${key} ${formName} ${frameName} lost the key in ${JSON.stringify(rendered)}`);
+          }
+        }
+      }
+      assert.deepEqual(redactSecretValues({ [key]: value, role_id: roleId }), { [key]: REDACTED, role_id: roleId }, `${key} as a record entry`);
+      assert.deepEqual(redactSecretValues({ vault: { approle: { role_id: roleId, [key]: value } } }), { vault: { approle: { role_id: roleId, [key]: REDACTED } } }, `${key} nested in a record`);
+    }
+  }
+  assert.equal(trials, keys.length * values.length * forms.length * frames.length * entryPoints.length);
+  // The identifier half of the pair and the other identifier keys keep a UUID in every form, frame,
+  // and entry point.
+  for (const [key, value] of controls) {
+    for (const [formName, form] of forms) {
+      for (const [name, scrub] of textScrubs) {
+        assert.equal(scrub(form(key, value)), form(key, value), `${name}: ${formName} of ${key} changed`);
+      }
+      for (const [frameName, frame] of frames) {
+        const text = frame(form(key, value));
+        for (const [name, entryPoint] of entryPoints) {
+          assert.ok(entryPoint(text).includes(value), `${name}: ${key} ${formName} ${frameName} lost the identifier in ${JSON.stringify(entryPoint(text))}`);
+        }
+      }
+    }
+    assert.deepEqual(redactSecretValues({ [key]: value }), { [key]: value }, `${key} as a record entry`);
+  }
+  // The AppRole login as Vault clients log it: the role id stays, the secret id goes, in a JSON body, an
+  // environment dump, and a curl line.
+  const secretId = values[0];
+  for (const [text, expected] of [
+    [`POST /v1/auth/approle/login {"role_id":"${roleId}","secret_id":"${secretId}"} returned 400`, `POST /v1/auth/approle/login {"role_id":"${roleId}","secret_id":"${REDACTED}"} returned 400`],
+    [`environment: VAULT_ADDR=https://vault.example.com:8200 VAULT_ROLE_ID=${roleId} VAULT_SECRET_ID=${secretId} HOME=/root`, `environment: VAULT_ADDR=https://vault.example.com:8200 VAULT_ROLE_ID=${roleId} VAULT_SECRET_ID=${REDACTED} HOME=/root`],
+    [`curl -d '{"role_id":"${roleId}","secret_id":"${secretId}"}' https://vault.example.com:8200/v1/auth/approle/login`, `curl -d '{"role_id":"${roleId}","secret_id":"${REDACTED}"}' https://vault.example.com:8200/v1/auth/approle/login`],
+    [`vault write auth/approle/login role_id=${roleId} secret_id=${secretId}`, `vault write auth/approle/login role_id=${roleId} secret_id=${REDACTED}`],
+  ]) {
+    for (const [name, scrub] of textScrubs) {
+      assert.equal(scrub(text), expected, `${name}: ${text}`);
+      assert.equal(scrub(expected), expected, `${name}: a second pass changed ${expected}`);
+    }
+  }
 });
 
 test("mediaTypeOf lowercases and strips parameters, and answers unknown for anything malformed", () => {

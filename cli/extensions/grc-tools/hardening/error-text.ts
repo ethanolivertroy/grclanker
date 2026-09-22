@@ -238,7 +238,8 @@ const AUTH_PARAM_PATTERN = /^(?:realm|error|error_description|error_uri|scope|ch
 // `InvalidAuthenticationToken`) are handled by the generic pair rule below under the same ruling,
 // with the one prose exemption described there, and a compound key whose final segment is a setting
 // suffix (`token_url`, `auth_method`, `client_id`) is a setting, not a credential key (see
-// `SETTING_SUFFIXES`).
+// `SETTING_SUFFIXES`). The secret id (`secret_id`, `VAULT_SECRET_ID`, `role_secret_id`) is a bearer
+// name like the session names, so it is explicit here with any prefix and takes any value.
 const CREDENTIAL_PAIR_NAMES: readonly string[] = [
   "api[_-]?key",
   "app[_-]?key",
@@ -253,6 +254,7 @@ const CREDENTIAL_PAIR_NAMES: readonly string[] = [
   "passphrase",
   "passcode",
   "secret",
+  "[a-z0-9_-]*secret[_-]?id",
   "token",
   "access[_-]?token",
   "refresh[_-]?token",
@@ -367,17 +369,22 @@ const EXTRA_CREDENTIAL_KEY_SEGMENTS = new Set(["sid", "sig", "pwd", "passwd", "p
 // `key_name`). Its value stays unless it is token-shaped (the long-token decision, which the data
 // scrubs apply to the value under such a key even though their long-token rule is otherwise off, so
 // a 40-character `private_key_id` still goes) or a registered secret, and a URL value passes the URL
-// rule like any other (userinfo and query removed, path kept). Two families stay credential keys
+// rule like any other (userinfo and query removed, path kept). Three families stay credential keys
 // whatever their suffix: the webhook and callback keys (`webhook*`, `*hook_url`, `callback_url`; rule
 // 9 names webhook URLs with embedded tokens, `webhook_url=https://hooks.example.com/services/<token>`
-// loses its whole value), and the session identifiers (`session_id`, `sid`, `PHPSESSID`,
+// loses its whole value); the session identifiers (`session_id`, `sid`, `PHPSESSID`,
 // `ASP.NET_SessionId`), which are bearer credentials, not identifiers, and are explicit credential
-// pair names. Both patterns and `SESSION_ID_KEY_PATTERN` read the key in its segment form
-// (`webhookUrl` and `WEBHOOK_URL` are `webhook_url`).
+// pair names; and the secret id (`secret_id`, `VAULT_SECRET_ID`, `role_secret_id`, `secretId`), the
+// Vault AppRole bearer half whose UUID shape keeps it off the long-token rule, so the key alone must
+// carry it (CodeRabbit on #78; main redacted it through the `secret` word). The two identifier
+// families the suffix rule keeps are the ones whose value names something (`client_id`, `key_id`,
+// `access_key_id`, `tenant_id`, `private_key_id`, `secret_name`, `user_name`). The three patterns read
+// the key in its segment form (`webhookUrl` and `WEBHOOK_URL` are `webhook_url`).
 const SETTING_SUFFIXES = new Set(["url", "uri", "endpoint", "method", "algorithm", "audience", "issuer", "shape", "type", "mode", "path", "file", "dir", "limit", "count", "id", "name", "days", "hours", "minutes", "seconds"]);
 const THRESHOLD_KEY_PATTERN = /^(?:max|min)[_-]/i;
 const WEBHOOK_KEY_PATTERN = /(?:^|_)webhooks?(?:_|$)|hook_url$|callback_url$/;
 const SESSION_ID_KEY_PATTERN = /(?:^|_)(?:sid|sessid|jsessionid|phpsessid|session_id)$/;
+const SECRET_ID_KEY_PATTERN = /secret_id$/;
 const EXTRA_CREDENTIAL_KEYS = new Set([
   "x-amz-signature",
   "x-amz-credential",
@@ -430,12 +437,12 @@ function isSettingKey(key: string): boolean {
  * argument-key heuristic (`token`, `secret`, `password`, `api_key`, `authorization`, `cookie`, ...)
  * plus the bare and signed-URL names it does not cover. A key whose final segment is a setting suffix
  * (`token_url`, `auth_method`, `client_id`, `credentials_file`, see `SETTING_SUFFIXES`) is a setting
- * and is not a credential key; the webhook, callback, and session-identifier keys are credential keys
- * whatever their suffix.
+ * and is not a credential key; the webhook and callback keys, the session identifiers, and a key
+ * ending in `secret_id` (any prefix, casing, or separator) are credential keys whatever their suffix.
  */
 export function isCredentialKey(key: string): boolean {
   const joined = keySegments(key).join("_");
-  if (WEBHOOK_KEY_PATTERN.test(joined) || SESSION_ID_KEY_PATTERN.test(joined)) return true;
+  if (WEBHOOK_KEY_PATTERN.test(joined) || SESSION_ID_KEY_PATTERN.test(joined) || SECRET_ID_KEY_PATTERN.test(joined)) return true;
   if (isSettingKey(key)) return false;
   return namesCredential(key);
 }
@@ -443,10 +450,11 @@ export function isCredentialKey(key: string): boolean {
 /**
  * A setting whose earlier segments name a credential (`token_url`, `BOX_AUTH_METHOD`, `private_key_id`,
  * `api_key_name`): the value is a setting and stays, except that a token-shaped run inside it goes
- * under every scrub, the data scrubs included (see `SETTING_SUFFIXES`).
+ * under every scrub, the data scrubs included (see `SETTING_SUFFIXES`). A key the bearer overrides
+ * keep as a credential key (`session_id`, `secret_id`) is never a setting.
  */
 function isCredentialWordSetting(key: string): boolean {
-  if (!isSettingKey(key)) return false;
+  if (!isSettingKey(key) || isCredentialKey(key)) return false;
   const segments = keySegments(key);
   return segments.length > 1 && namesCredential(segments.slice(0, -1).join("_"));
 }

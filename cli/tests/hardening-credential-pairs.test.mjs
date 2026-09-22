@@ -406,6 +406,82 @@ test("settings: the exceptions stay credential keys whatever their suffix and lo
   }
 });
 
+/**
+ * CodeRabbit (#78) secret_id: the Vault AppRole secret id is a bearer credential with an identifier
+ * suffix, and its UUID shape keeps it off the long-token rule, so the setting-suffix ruling had turned
+ * `secret_id`, `VAULT_SECRET_ID`, and `role_secret_id` into settings whose UUID value passed every
+ * scrub where main at 02967cc redacted it through the `secret` word. A key ending in `secret_id` is a
+ * credential key again whatever its prefix, casing, or separator, and an explicit credential pair name
+ * like the session names, so even a plain word under `Key: ` that continues as prose goes; the
+ * identifier half of the pair (`role_id`) and the other identifier keys keep a UUID.
+ */
+const SECRET_ID_ROWS = Object.freeze([
+  ["secret_id", "3f6c1e2a-8b4d-4c7e-9a1f-2d5e6b7c8d9e"],
+  ["secret_id", "k7Qm2xZp9vLw4nRt8sYb"],
+  ["secret_id", "x7Kp2q"],
+  ["secret_id", "qzvkwpmtr"],
+  ["VAULT_SECRET_ID", "9B2E4F6A-1C3D-4E5F-8A9B-0C1D2E3F4A5B"],
+  ["VAULT_SECRET_ID", "k7Qm2xZp9vLw4nRt8sYb"],
+  ["VAULT_SECRET_ID", "x7Kp2q"],
+  ["VAULT_SECRET_ID", "qzvkwpmtr"],
+  ["role_secret_id", "3f6c1e2a-8b4d-4c7e-9a1f-2d5e6b7c8d9e"],
+  ["role_secret_id", "k7Qm2xZp9vLw4nRt8sYb"],
+  ["role_secret_id", "x7Kp2q"],
+  ["role_secret_id", "qzvkwpmtr"],
+  ["secretId", "3f6c1e2a-8b4d-4c7e-9a1f-2d5e6b7c8d9e"],
+  ["secret-id", "3f6c1e2a-8b4d-4c7e-9a1f-2d5e6b7c8d9e"],
+  ["roleSecretId", "9B2E4F6A-1C3D-4E5F-8A9B-0C1D2E3F4A5B"],
+]);
+
+const IDENTIFIER_UUID_CONTROLS = Object.freeze([
+  ["client_id", "123e4567-e89b-12d3-a456-426614174000"],
+  ["tenant_id", "2f3c1a9e-7b6d-4c5e-8f9a-0b1c2d3e4f5a"],
+  ["role_id", "5d1a2b3c-4e5f-4a6b-8c7d-9e0f1a2b3c4d"],
+  ["VAULT_ROLE_ID", "5d1a2b3c-4e5f-4a6b-8c7d-9e0f1a2b3c4d"],
+]);
+
+test("CodeRabbit (#78) secret_id: a key ending in secret_id loses a UUID, random, or plain-word value in every form, frame, and sink, main classified every such key too, and client_id and tenant_id UUIDs stay", () => {
+  let trials = 0;
+  for (const [key, value] of SECRET_ID_ROWS) {
+    assert.ok(isCredentialKey(key), `${key} is the bearer secret id`);
+    assert.ok(mainCredentialKey(key), `${key}: main at 02967cc classified it too, so redacting it narrows nothing`);
+    for (const [formName, form] of FORMS) {
+      for (const [frameName, frame] of FRAMES) {
+        const text = frame(form(key, value));
+        for (const [sinkName, sink] of SINKS) {
+          trials += 1;
+          const output = sink(text);
+          assert.ok(!leaked(output, value), `${key}=${value} ${formName} ${frameName} leaked through ${sinkName}`);
+          const rendered = typeof output === "string" ? output : JSON.stringify(output);
+          assert.ok(rendered.includes(REDACTED), `${key}=${value} ${formName} ${frameName} left no marker through ${sinkName}: ${rendered}`);
+        }
+      }
+    }
+    assert.deepEqual(redactSecretValues({ [key]: value }), { [key]: REDACTED }, `${key} as a record entry`);
+  }
+  assert.equal(trials, SECRET_ID_ROWS.length * FORMS.length * FRAMES.length * SINKS.length);
+  for (const [key, value] of IDENTIFIER_UUID_CONTROLS) {
+    assert.ok(!isCredentialKey(key), `${key} is an identifier`);
+    for (const [formName, form] of FORMS) {
+      for (const [frameName, frame] of FRAMES) {
+        const text = frame(form(key, value));
+        for (const [sinkName, sink] of SINKS) {
+          const output = sink(text);
+          const rendered = typeof output === "string" ? output : JSON.stringify(output);
+          assert.ok(rendered.includes(value), `${key}=${value} must survive ${formName} ${frameName} through ${sinkName}: ${rendered}`);
+        }
+      }
+    }
+    assert.deepEqual(redactSecretValues({ [key]: value }), { [key]: value }, `${key} as a record entry`);
+  }
+  // The pair as a Vault client logs it: the identifier half stays beside the marker.
+  const [[, roleId]] = IDENTIFIER_UUID_CONTROLS.slice(2);
+  const [[, secretId]] = SECRET_ID_ROWS;
+  assert.equal(scrubErrorText(`{"role_id":"${roleId}","secret_id":"${secretId}"}`), `{"role_id":"${roleId}","secret_id":"${REDACTED}"}`);
+  assert.equal(scrubDataText(`VAULT_ROLE_ID=${roleId} VAULT_SECRET_ID=${secretId}`), `VAULT_ROLE_ID=${roleId} VAULT_SECRET_ID=${REDACTED}`);
+  assert.deepEqual(redactSecretValues({ role_id: roleId, secret_id: secretId }), { role_id: roleId, secret_id: REDACTED });
+});
+
 test("settings: a token-shaped value under a setting key beside a credential word goes by shape through every sink, the data scrubs included, and only that run goes", () => {
   for (const value of ["Kq7Zx2Vw9Lm4Tp8RwQ12", "0f9e8d7c6b5a49382716f5e4d3c2b1a09f8e7d6c", "tnAki87T1HyQxV2b"]) {
     for (const [key, prefix] of [
