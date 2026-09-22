@@ -9,7 +9,9 @@
  * 1. a value inside any carrier (Authorization, Cookie, Set-Cookie, x-api-key and similar headers;
  *    cookie or session assignments; URL userinfo and query pairs; the schemes Bearer, Basic, Digest,
  *    Token, ApiKey; credential-named key-value pairs; SOAP session elements) is removed whatever its
- *    shape;
+ *    shape, bare or quoted (`Cookie: sid="x"`, `X-Api-Key: 'x'`, `Authorization: Bearer "x"`, with any
+ *    spacing and in JSON-escaped form), while a quoted non-credential header (`Content-Type:
+ *    "application/json"`) stays;
  * 2. a registered secret (KNOWN_SECRETS, that is the client's own credentials) is removed whatever
  *    its shape and in its base64, base64url, URL-encoded, and JSON-escaped forms.
  *
@@ -101,6 +103,20 @@ export const MUST_KEEP = [
   `JWT bearer (${UPPER_NAME_SHAPED_CANARY}, SF_USERNAME) reads as prose after a lowercase scheme`,
   // Non-credential assignments are worded without `=` so the credential pair rule cannot take them for a pair.
   "mutual TLS is not supported by this runtime; set the AUTH_METHOD variable to basic or oauth; the TLS probe connects with rejectUnauthorized set to false",
+  // Quoted non-credential headers, in header-line, JSON, JSON-escaped, and assignment form, alone and in a sentence.
+  'Content-Type: "application/json"',
+  "Content-Type: 'text/html; charset=utf-8'",
+  '"Content-Type": "application/json"',
+  '\\"Content-Type\\":\\"application/json\\"',
+  'Content-Type = "application/json"',
+  'Accept: "application/vnd.pagerduty+json;version=2"',
+  'User-Agent: "grclanker/1.0"',
+  'Cache-Control: "no-store"',
+  'Retry-After: "120"',
+  'Content-Length: "5120"',
+  'Location: "/api/now/table/sys_user"',
+  'X-RateLimit-Remaining: "0"',
+  'the proxy echoed Content-Type: "text/html" and Retry-After: "120" for prod-us-east-2026',
 ];
 
 /**
@@ -155,6 +171,59 @@ export function carrierCases(canary = NAME_SHAPED_CANARY) {
     { name: "SOAP sessionId element", text: `<sessionId>${canary}</sessionId>`, keeps: ["<sessionId>", "</sessionId>"] },
     { name: "namespaced SOAP sessionId element", text: `<urn:sessionId>${canary}</urn:sessionId>`, keeps: ["<urn:sessionId>", "</urn:sessionId>"] },
     { name: "SOAP password element", text: `<password>${canary}</password>`, keeps: ["<password>", "</password>"] },
+    ...quotedCarrierCases(canary),
+    ...quotedCarrierCases(SHORT_TOKEN_CANARY).filter((item) => item.pinnedForShortToken).map((item) => ({ ...item, name: `${item.name} (short token)`, value: SHORT_TOKEN_CANARY })),
+  ];
+}
+
+/**
+ * Quoted header values (pinned carrier cases). Quotes around a credential belong to its carrier: the value
+ * goes whole whatever its shape, in double or single quotes, with any spacing around the separator, and
+ * in the JSON and JSON-escaped forms a headers object takes; the header after a Cookie or Authorization
+ * header in the same JSON object stays. `pinnedForShortToken` marks the headline forms that are also run
+ * with the short token-cased value, which no bare rule can remove.
+ */
+export function quotedCarrierCases(canary) {
+  return [
+    { name: "Cookie pair in double quotes", text: `Cookie: sid="${canary}"`, keeps: ["Cookie: "], pinnedForShortToken: true },
+    { name: "Cookie pair in single quotes", text: `Cookie: sid='${canary}'`, keeps: ["Cookie: "] },
+    { name: "Cookie pair with spaces around =", text: `Cookie: sid = "${canary}"`, keeps: ["Cookie: "] },
+    { name: "Cookie pair without a space after the colon", text: `Cookie:sid="${canary}"`, keeps: ["Cookie:"] },
+    { name: "Cookie whole value quoted", text: `Cookie: "sid=${canary}"`, keeps: ['Cookie: "'] },
+    { name: "Cookie quoted pair followed by another pair", text: `Cookie: sid="${canary}"; theme=dark`, keeps: ["Cookie: "] },
+    { name: "Set-Cookie quoted pair with attributes", text: `Set-Cookie: sid="${canary}"; Path=/; HttpOnly`, keeps: ["Set-Cookie: "] },
+    { name: "Cookie in a JSON headers object with escaped inner quotes", text: `"Cookie": "sid=\\"${canary}\\"; theme=dark", "Accept": "application/json"`, keeps: ['"Cookie": "', '"Accept": "application/json"'] },
+    { name: "Cookie in a JSON headers object before another header", text: `"Cookie": "sid=${canary}", "Content-Type": "application/json"`, keeps: ['"Cookie": "', '"Content-Type": "application/json"'] },
+    { name: "JSON-escaped Cookie header", text: `\\"Cookie\\":\\"sid=${canary}\\"`, keeps: ["Cookie"] },
+    { name: "X-Api-Key in double quotes", text: `X-Api-Key: "${canary}"`, keeps: ['X-Api-Key: "'], pinnedForShortToken: true },
+    { name: "X-Api-Key in single quotes", text: `X-Api-Key: '${canary}'`, keeps: ["X-Api-Key: '"] },
+    { name: "X-Api-Key without a space after the colon", text: `X-Api-Key:"${canary}"`, keeps: ['X-Api-Key:"'] },
+    { name: "X-Api-Key with a space before the colon", text: `X-Api-Key : "${canary}"`, keeps: ['X-Api-Key : "'] },
+    { name: "x-api-key quoted assignment", text: `x-api-key="${canary}"`, keeps: ["x-api-key="] },
+    { name: "X-Api-Key in a JSON headers object", text: `"X-Api-Key": "${canary}"`, keeps: ["X-Api-Key"] },
+    { name: "JSON-escaped X-Api-Key header", text: `\\"X-Api-Key\\":\\"${canary}\\"`, keeps: ["X-Api-Key"] },
+    { name: "JSON-escaped X-Api-Key header with a space", text: `\\"X-Api-Key\\": \\"${canary}\\"`, keeps: ["X-Api-Key"] },
+    { name: "Authorization Bearer with a double-quoted credential", text: `Authorization: Bearer "${canary}"`, keeps: ["Authorization: "], pinnedForShortToken: true },
+    { name: "Authorization Bearer with a single-quoted credential", text: `Authorization: Bearer '${canary}'`, keeps: ["Authorization: "] },
+    { name: "Authorization Basic with a double-quoted credential", text: `Authorization: Basic "${canary}"`, keeps: ["Authorization: "] },
+    { name: "Authorization Bearer quoted without a space after the colon", text: `Authorization:Bearer "${canary}"`, keeps: ["Authorization:"] },
+    { name: "Authorization whole value quoted", text: `Authorization: "Bearer ${canary}"`, keeps: ['Authorization: "'] },
+    // The assignment rule folds the quoted marker left by the header rule, so the quotes go with the value.
+    { name: "authorization assignment in single quotes", text: `authorization='Bearer ${canary}'`, keeps: ["authorization="] },
+    { name: "Authorization Token token= with a quoted parameter", text: `Authorization: Token token="${canary}"`, keeps: ["Authorization: "] },
+    { name: "Authorization Bearer quoted before trailing prose", text: `Authorization: Bearer "${canary}" for /api/now/table/sys_user`, keeps: ["Authorization: ", " for /api/now/table/sys_user"] },
+    { name: "Authorization in a JSON headers object with escaped inner quotes", text: `"Authorization": "Bearer \\"${canary}\\"", "Content-Type": "application/json"`, keeps: ['"Authorization": "', '"Content-Type": "application/json"'] },
+    { name: "JSON-escaped Authorization header with a space", text: `\\"Authorization\\": \\"Bearer ${canary}\\"`, keeps: ["Authorization"] },
+    { name: "Bearer scheme in prose with a double-quoted credential", text: `Bearer "${canary}".`, keeps: ["Bearer "], pinnedForShortToken: true },
+    { name: "Token scheme in prose with a single-quoted credential", text: `(Token '${canary}') expired`, keeps: ["(Token ", " expired"] },
+    { name: "Digest parameters in single quotes", text: `Digest username='svc', response='${canary}'`, keeps: ["Digest username=", "response="] },
+    { name: "client_secret quoted assignment", text: `client_secret="${canary}"`, keeps: ["client_secret="], pinnedForShortToken: true },
+    { name: "client_secret assignment with spaces around =", text: `client_secret = ${canary} in prose`, keeps: ["client_secret = ", " in prose"] },
+    { name: "password single-quoted assignment", text: `password='${canary}'; other=1`, keeps: ["password=", "; other=1"] },
+    { name: "sid quoted assignment", text: `sid="${canary}"`, keeps: ["sid="] },
+    { name: "JSON-escaped quoted assignment", text: `client_secret=\\"${canary}\\"`, keeps: ["client_secret="] },
+    { name: "command-line token flag with a quoted value", text: `--token "${canary}" --org acme`, keeps: ["--token ", " --org acme"] },
+    { name: "command-line password flag with a single-quoted value", text: `--password '${canary}'`, keeps: ["--password "] },
   ];
 }
 
