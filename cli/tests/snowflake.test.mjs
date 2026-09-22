@@ -870,7 +870,8 @@ test("rule 9: scrub boundary: a name-shaped value stays bare in prose and is rem
     ["Bearer prod-us-east-2026 rejected", "Bearer [REDACTED] rejected"],
     ["SSWS prod-us-east-2026 rejected", "SSWS [REDACTED] rejected"],
     ["Basic authentication is required", "Basic authentication is required"],
-    ["InvalidAuthenticationToken: Access token has expired", "InvalidAuthenticationToken: Access token has expired"],
+    // Reviewer C, item G: the word after a credential-named "key:" is the pair's value whatever its shape, prose included.
+    ["InvalidAuthenticationToken: Access token has expired", "InvalidAuthenticationToken: [REDACTED] token has expired"],
   ];
   const name = "prod-us-east-2026";
   for (const [input, expected] of carriers) {
@@ -1038,6 +1039,116 @@ const SNOWFLAKE_REQUESTED_STATEMENTS = [
   SNOWFLAKE_STATEMENTS.loginOutcomes(30),
   SNOWFLAKE_STATEMENTS.failedLogins(30),
 ];
+
+/** Reviewer C's 15 value shape classes (item G): the plain words that no shape rule catches are the point of the pair rule. */
+const PAIR_VALUE_SHAPES = [
+  "hunter2", "Summer2026!", "correcthorsebatterystaple", "letmein2024", "monkey", "qwerty", "letmein", "iloveyou",
+  "football", "Sunshine", "starwarsfan", "footballteam", "abc12", "p@ss", "guest",
+];
+/** The pair forms of item G: "=", ": ", ":", compact JSON, and spaced JSON. */
+const PAIR_FORMS = [
+  (key, value) => `${key}=${value}`,
+  (key, value) => `${key}: ${value}`,
+  (key, value) => `${key}:${value}`,
+  (key, value) => `{"${key}":"${value}"}`,
+  (key, value) => `{"${key}": "${value}"}`,
+];
+/** The frames of item G: a bare line, prose, a colon-terminated banner with the pair on the next line, a JSON string member, a 502 JSON body, and a double-escaped raw member. */
+const PAIR_FRAMES = [
+  ["line", (pair) => pair],
+  ["sentence", (pair) => `Vendor request failed (502 Bad Gateway) for /api/v1/items: upstream echoed ${pair} while proxying`],
+  ["502-text", (pair) => `Vendor request failed (502 Bad Gateway) for /api/v1/items: Environment as echoed by the proxy:\n${pair}`],
+  ["json-escaped", (pair) => `{"message":${JSON.stringify(pair)}}`],
+  ["502-json", (pair) => `{"status":502,"error":"Bad Gateway","message":${JSON.stringify(`The upstream rejected the request; environment: ${pair}`)},"request":{"env":${JSON.stringify(pair)}}}`],
+  ["502-json-raw", (pair) => `{"status":502,"raw":${JSON.stringify(JSON.stringify({ env: [pair] }))}}`],
+];
+const SAMPLE_UUID = "3f2504e0-4f89-11d3-9a0c-0305e82c3301";
+
+test("reviewer C final verdict, item G: the value under a credential-named key is removed whatever its shape in every pair form and frame; settings, identifiers, bearer ids, and webhooks follow the key classes", () => {
+  const credentialKeys = [
+    "DB_PASSWORD", "API_KEY", "client_secret", "access_token", "password", "AUTH_TOKEN",
+    "SNOWFLAKE_TOKEN", "SNOWFLAKE_OAUTH_TOKEN", "SNOWFLAKE_PRIVATE_KEY", "SNOWFLAKE_PRIVATE_KEY_RAW", "SNOWFLAKE_PRIVATE_KEY_PASSPHRASE", "OKTA_CLIENT_TOKEN", "SPLUNK_PASSWORD", "SUMOLOGIC_ACCESS_KEY", "VERACODE_API_KEY_SECRET",
+  ];
+  for (const key of credentialKeys) {
+    for (const value of PAIR_VALUE_SHAPES) {
+      for (const form of PAIR_FORMS) {
+        const pair = form(key, value);
+        for (const [frameName, frame] of PAIR_FRAMES) {
+          // The JSON forms inside the double-escaped raw member sit at quote depth 2; the quote-aware reader (item F) covers them.
+          if (frameName === "502-json-raw" && pair.startsWith("{")) continue;
+          const input = frame(pair);
+          const scrubbed = redactSecrets(input);
+          const label = `${frameName}: ${input}`;
+          assertNoWindowOf(scrubbed, value, label);
+          assert.ok(scrubbed.includes(key), `the key name stays in ${label} -> ${scrubbed}`);
+          assert.ok(scrubbed.includes("[REDACTED]"), `the value is replaced by the marker in ${label} -> ${scrubbed}`);
+          if (frameName === "sentence") assert.ok(scrubbed.endsWith(" while proxying"), `the prose after the pair stays in ${label} -> ${scrubbed}`);
+          assert.equal(redactSecrets(scrubbed), scrubbed, `second pass over ${label}`);
+        }
+      }
+      assert.equal(redactSecrets(`${key}=${value}`), `${key}=[REDACTED]`);
+      assert.equal(redactSecrets(`${key}: ${value}`), `${key}: [REDACTED]`);
+      assert.equal(redactSecrets(`{"${key}": "${value}"}`), `{"${key}": "[REDACTED]"}`);
+    }
+  }
+
+  // Bearer ids: a key ending in secret_id or naming a session id loses its value whatever the shape, a UUID included, in every form.
+  for (const key of ["secret_id", "VAULT_SECRET_ID", "role_secret_id", "secretId", "secret-id", "session_id", "sessionId", "sid", "JSESSIONID", "PHPSESSID"]) {
+    for (const value of [SAMPLE_UUID, "xKqZvBnMwLpRtYsHdG", "monkey", "hunter2"]) {
+      for (const form of PAIR_FORMS) {
+        const scrubbed = redactSecrets(form(key, value));
+        assertNoWindowOf(scrubbed, value, `bearer id ${form(key, value)}`);
+        assert.ok(scrubbed.includes(key), `bearer id key stays: ${scrubbed}`);
+      }
+    }
+  }
+
+  // Identifiers: a key without a credential word is not a pair under the rule; its value is judged by shape alone, so a UUID or a name stays.
+  for (const key of ["OKTA_CLIENT_ID", "OKTA_CLIENT_CLIENTID", "client_id", "SUMO_ACCESS_ID", "SUMOLOGIC_ACCESS_ID", "SNOWFLAKE_ACCOUNT", "SNOWFLAKE_USER", "SPLUNK_USERNAME", "X-Request-Id", "request_id", "user_id", "kid"]) {
+    for (const value of [SAMPLE_UUID, "acme-prod-2026", "audit.bot"]) {
+      for (const form of PAIR_FORMS) assert.equal(redactSecrets(form(key, value)), form(key, value), `identifier kept: ${form(key, value)}`);
+    }
+  }
+
+  // Settings: a credential-named key whose final segment names a setting keeps a value that is not token-shaped, in every form; a token-shaped value still goes.
+  const settingPairs = [
+    ["token_endpoint", "https://example.okta.com/oauth2/v1/token"],
+    ["token_uri", "https://example.okta.com/oauth2/v1/token"],
+    ["auth_method", "private_key_jwt"],
+    ["token_endpoint_auth_method", "private_key_jwt"],
+    ["signing_algorithm", "RS256"],
+    ["token_audience", "api://default"],
+    ["token_issuer", "https://example.okta.com/oauth2/default"],
+    ["key_shape", "rsa"],
+    ["token_type", "Bearer"],
+    ["SNOWFLAKE_TOKEN_TYPE", "KEYPAIR_JWT"],
+    ["X-Snowflake-Authorization-Token-Type", "KEYPAIR_JWT"],
+    ["credential_mode", "PrivateKey"],
+    ["token_limit", "200"],
+    ["token_count", "3"],
+    ["api_key_id", SAMPLE_UUID],
+    ["VERACODE_API_KEY_ID", SAMPLE_UUID],
+    ["OKTA_CLIENT_PRIVATEKEYID", "kid-2026-primary"],
+    ["token_name", "audit-token"],
+    ["api_key_name", "primary-key-2026"],
+  ];
+  for (const [key, value] of settingPairs) {
+    for (const form of PAIR_FORMS) assert.equal(redactSecrets(form(key, value)), form(key, value), `setting kept: ${form(key, value)}`);
+    for (const shape of PAIR_VALUE_SHAPES) assert.equal(redactSecrets(`${key}=${shape}`), `${key}=${shape}`, `a plain setting value stays: ${key}=${shape}`);
+  }
+  for (const [key, value] of [["token_type", "QmFzZTY0K1N5bWJvbHM="], ["api_key_id", "xKqZvBnMwLpRtYsHdG"], ["token_name", "aB3xZ9qL2mN8pR4tV7wY1"]]) {
+    for (const form of PAIR_FORMS) assertNoWindowOf(redactSecrets(form(key, value)), value, `token-shaped setting value ${form(key, value)}`);
+  }
+
+  // Webhooks: webhook*, *hook_url, and callback_url keep the origin and lose the path and query; a webhook secret goes whole.
+  const webhookPath = "services/T0AB12CD/B0EF34GH/xKqZvBnMwLpRtYsHdG";
+  assert.equal(redactSecrets(`webhook_url=https://hooks.example.com/${webhookPath}`), "webhook_url=https://hooks.example.com/[REDACTED]");
+  assert.equal(redactSecrets(`webhookUrl: https://hooks.example.com/${webhookPath}?token=abc`), "webhookUrl: https://hooks.example.com/[REDACTED]");
+  assert.equal(redactSecrets(`slack_hook_url: "https://hooks.example.com/${webhookPath}"`), 'slack_hook_url: "https://hooks.example.com/[REDACTED]"');
+  assert.equal(redactSecrets("callback_url: https://app.example.com/oauth/callback?code=abc123def456"), "callback_url: https://app.example.com/[REDACTED]");
+  assert.equal(redactSecrets("webhook_secret=monkey"), "webhook_secret=[REDACTED]");
+  for (const line of ["webhook_url=https://hooks.example.com/[REDACTED]", "callback_url: https://app.example.com/[REDACTED]"]) assert.equal(redactSecrets(line), line, `second pass over ${line}`);
+});
 
 /** Quoted non-credential headers (the Codex P1 must-keep rows): a quote alone never makes a header value a credential. */
 const SNOWFLAKE_QUOTED_HEADERS_KEPT = [

@@ -206,6 +206,24 @@ export interface VeracodeNotCollectedMarker {
 // /api/v1/users/<id>/factors or a config file path) is an identifier the run itself named and stays
 // so the endpoint reported is the one requested; inside a URL with a scheme every path segment keeps
 // the rule because webhook URLs carry their token there.
+//
+// The pair rule (reviewer C, item G): the value under a credential-named key (a credential word
+// anywhere in the name, compound and vendor environment names included: DB_PASSWORD,
+// SPLUNK_PASSWORD, OKTA_CLIENT_TOKEN) is removed whatever its shape and length in the "key=value",
+// "key: value", "key:value", and JSON forms, in prose and inside a JSON string alike; no plain-word
+// shape exempts it. Three key classes refine that:
+// - bearer ids: a key ending in "secret_id" (VAULT_SECRET_ID, role_secret_id, secretId) or naming a
+//   session id (session_id, sid, jsessionid, phpsessid, sessid) carries a bearer credential, so its
+//   value goes whatever the shape, a UUID included; this is decided before the setting test;
+// - settings: a credential-named key whose final segment is url, uri, endpoint, method, algorithm,
+//   audience, issuer, shape, type, mode, path, file, dir, limit, count, id, name, policy, or policies
+//   (token_endpoint, auth_method, token_type, api_key_id, password_policies,
+//   X-Snowflake-Authorization-Token-Type) names a setting, and
+//   its value stays unless it is token-shaped or a configured secret;
+// - webhooks: webhook*, *hook_url, and callback_url values lose their path and query and keep the
+//   origin, because the token of a webhook URL sits in its path.
+// Identifier keys without a credential word (OKTA_CLIENT_ID, SUMO_ACCESS_ID, SNOWFLAKE_ACCOUNT,
+// X-Request-Id) are not pairs under this rule; their values are judged by shape only.
 // ---------------------------------------------------------------------------------------------
 
 const MIN_CONFIGURED_SECRET_LENGTH = 4;
@@ -238,8 +256,11 @@ const SCHEME_TOKEN_PATTERN = /^(\s+)(?!\[REDACTED\])(\\?["']?)([^\s"'<>;,()[\]{}
 // A pair key or value may sit in plain, single, or JSON-escaped quotes; the value ends at a quote or the escaping backslash.
 const ASSIGNMENT_KEY_PATTERN = /(\\?["']?)\b([A-Za-z][A-Za-z0-9_.-]{0,63})\b(\\?["']?\s*([:=])\s*(\\?["']?))/g;
 const ASSIGNMENT_VALUE_PATTERN = /(?!\[REDACTED\])[^\s"'<>;,&()[\]{}\\]+/y;
-const CLAUSE_END_PATTERN = /(?:[)\]}]|[.,;!?](?=\s|$)|[ \t]*(?:\r?\n|$))/y;
-const HEADER_NAME_PATTERN = /^(?:[A-Za-z0-9]+(?:-[A-Za-z0-9]+)+|authorization|cookies?)$/i;
+const URL_ORIGIN_PATTERN = /^[a-z][a-z0-9+.-]*:\/\/[^\s/?#@"'<>]+(?=[/?#]|$)/i;
+const SINGLE_RUN_PATTERN = /^[A-Za-z0-9+=_-]+$/;
+const BEARER_ID_KEY_PATTERN = /(?:secret|session)[_.-]?id$/i;
+const BEARER_ID_KEY_SEGMENTS = new Set(["sid", "jsessionid", "phpsessid", "sessid"]);
+const SETTING_KEY_SUFFIXES = new Set(["url", "uri", "endpoint", "method", "algorithm", "audience", "issuer", "shape", "type", "mode", "path", "file", "dir", "limit", "count", "id", "name", "policy", "policies"]);
 const JWT_IN_TEXT_PATTERN = /\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}(?:\.[A-Za-z0-9_-]+)*/g;
 const AWS_ACCESS_KEY_ID_PATTERN = /\b(?:AKIA|ASIA|AROA|AIDA|AGPA|ANPA|ANVA|APKA|ABIA|ACCA)[A-Z0-9]{16}\b/g;
 const AWS_SECRET_PATTERN = /(?<![A-Za-z0-9/+=])[A-Za-z0-9/+]{40}(?![A-Za-z0-9/+=])/g;
@@ -266,7 +287,9 @@ const LONG_TOKEN_RUN_PATTERN = new RegExp(`[A-Za-z0-9+_-]{${LONG_TOKEN_MIN_LENGT
 const DIGIT_GROUP_PATTERN = /\d+/g;
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const SAFE_KEY_SHAPE_PATTERN = /^(?:max|min)[_-]|[_-](?:limit|days|hours|minutes|seconds|count|path|file|dir)$/i;
-const EXTRA_CREDENTIAL_KEY_SEGMENTS = new Set(["sid", "sig", "pwd", "passwd", "pass", "session", "sessid", "phpsessid", "auth", "nonce", "sas"]);
+const EXTRA_CREDENTIAL_KEY_SEGMENTS = new Set(["sid", "sig", "pwd", "passwd", "pass", "sessid", "phpsessid", "auth", "nonce", "sas"]);
+// "session" carries a credential only as the final segment (session=, user_session=); session_context and session_policy name settings.
+const FINAL_CREDENTIAL_KEY_SEGMENTS = new Set(["session"]);
 const EXTRA_CREDENTIAL_KEYS = new Set(["x-amz-signature", "x-amz-credential", "x-amz-security-token", "x-goog-signature", "x-goog-credential", "oauth_signature", "oauth_token", "oauth_verifier", "proxy-authorization"]);
 
 function keySegments(key: string): string[] {
@@ -282,20 +305,50 @@ function isCredentialCarrierKey(key: string): boolean {
   if (isSensitiveArgumentKey(key)) return true;
   if (SAFE_KEY_SHAPE_PATTERN.test(key)) return false;
   if (EXTRA_CREDENTIAL_KEYS.has(key.toLowerCase())) return true;
-  return keySegments(key).some((segment) => EXTRA_CREDENTIAL_KEY_SEGMENTS.has(segment));
+  const segments = keySegments(key);
+  if (FINAL_CREDENTIAL_KEY_SEGMENTS.has(segments[segments.length - 1] ?? "")) return true;
+  return segments.some((segment) => EXTRA_CREDENTIAL_KEY_SEGMENTS.has(segment));
 }
 
-/** An unquoted value after `word:` is the credential unless it is a short plain word inside running prose ("InvalidAuthenticationToken: Access token has expired"). */
-function looksLikeCredentialValue(value: string): boolean {
-  if (value.length < 6) return false;
-  if (/\d/.test(value) || value.length >= 12 || /[^A-Za-z]/.test(value)) return true;
-  return /[a-z][A-Z]/.test(value);
+type PairRule = "credential" | "setting" | "webhook" | "none";
+
+/** A key ending in "secret_id" or naming a session id carries a bearer credential whatever the value's shape. */
+function isBearerIdKey(key: string, segments: readonly string[]): boolean {
+  if (BEARER_ID_KEY_PATTERN.test(key)) return true;
+  const tail = segments.slice(-2).join("_");
+  return tail === "secret_id" || tail === "session_id" || BEARER_ID_KEY_SEGMENTS.has(segments[segments.length - 1] ?? "");
 }
 
-/** True when only a closing bracket, clause punctuation, or the end of the line follows `index`, so the word before it stands as a pair value rather than as prose. */
-function endsClause(text: string, index: number): boolean {
-  CLAUSE_END_PATTERN.lastIndex = index;
-  return CLAUSE_END_PATTERN.test(text);
+/** webhook*, *hook_url, and callback_url name a URL whose path carries the token. */
+function isWebhookKey(segments: readonly string[]): boolean {
+  if (segments[0] === "webhook") return true;
+  const tail = segments.slice(-2).join("_");
+  return tail === "hook_url" || tail === "callback_url";
+}
+
+/** The final segment names a setting; a concatenated key id or key name (OKTA_CLIENT_PRIVATEKEYID) counts as one. */
+function isSettingSegment(segment: string): boolean {
+  return SETTING_KEY_SUFFIXES.has(segment) || /key(?:id|name)$/.test(segment);
+}
+
+/** How the value of a `key=value` or `key: value` pair is treated; see the pair rule above. */
+function pairRuleFor(key: string): PairRule {
+  const segments = keySegments(key);
+  if (isBearerIdKey(key, segments)) return "credential";
+  if (isWebhookKey(segments)) return "webhook";
+  if (!isCredentialCarrierKey(key)) return "none";
+  return isSettingSegment(segments[segments.length - 1] ?? "") ? "setting" : "credential";
+}
+
+/** A setting value is removed only when it is a single run with a real token shape (base64 symbols, scattered digits, or token casing); a UUID, a scheme word, a mode name, or a URL stays for the later shape rules to judge. */
+function isTokenShapedValue(value: string): boolean {
+  return SINGLE_RUN_PATTERN.test(value) && looksLikeToken(value);
+}
+
+/** A webhook value keeps its origin and loses its path and query; a value that is not a URL goes whole. */
+function webhookReplacement(value: string): string {
+  const origin = URL_ORIGIN_PATTERN.exec(value)?.[0];
+  return origin === undefined ? REDACTED : `${origin}/${REDACTED}`;
 }
 
 /** A 40-character base64 run is an AWS secret access key when it is random-looking; a bare path of word segments ("/api/v1/users/<id>/roles") that happens to span 40 characters is a request target and stays. */
@@ -387,15 +440,13 @@ function scrubSchemeValue(match: string, scheme: string, quote: string, value: s
 }
 
 /**
- * Replaces the value of every credential-named pair: `key=value`, `"key": "value"`, and
- * `Header-Name: value`. Inside a carrier the value goes whatever its shape (an `=` pair, a quoted
- * value, a header name, or a scheme word such as `Authorization: Bearer <token>`, where the scheme is
- * kept and the token removed); only an unquoted word after a plain `name:` that runs on into more
- * prose is judged by shape, so "InvalidAuthenticationToken: Access token has expired" stays legible
- * while "(session_id: value)" and "token: value" at the end of a clause lose the value. The last
- * segment of a bare path used as a label ("/api/authn/v2/api_credentials: <detail>") is a request
- * target, not a pair key, so the text after it is kept; inside a URL with a scheme the pair rule
- * still applies.
+ * Replaces the value of every credential-named pair: `key=value`, `key: value`, `"key": "value"`,
+ * and `Header-Name: value`. The value goes whatever its shape (an `=` pair, a quoted value, a header
+ * value, a plain word in prose, or a scheme word such as `Authorization: Bearer <token>`, where the
+ * scheme is kept and the token removed). A setting key keeps a value that is not token-shaped, a
+ * bearer-id key loses a UUID, and a webhook key keeps only the origin. The last segment of a bare
+ * path used as a label ("/api/authn/v2/api_credentials: <detail>") is a request target, not a pair
+ * key, so the text after it is kept; inside a URL with a scheme the pair rule still applies.
  */
 function replaceCredentialAssignments(text: string): string {
   const urlSpans = [...text.matchAll(EMBEDDED_URL_PATTERN)].map((match) => [match.index ?? 0, (match.index ?? 0) + match[0].length] as const);
@@ -404,12 +455,13 @@ function replaceCredentialAssignments(text: string): string {
   let last = 0;
   let match: RegExpExecArray | null;
   while ((match = ASSIGNMENT_KEY_PATTERN.exec(text)) !== null) {
-    const [whole, openingQuote, key, separator, separatorChar, valueQuote] = match;
+    const [whole, openingQuote, key, separator, separatorChar] = match;
     if (whole.length === 0) {
       ASSIGNMENT_KEY_PATTERN.lastIndex += 1;
       continue;
     }
-    if (!isCredentialCarrierKey(key)) continue;
+    const rule = pairRuleFor(key);
+    if (rule === "none") continue;
     if (openingQuote === "" && separatorChar === ":" && isBarePathSegment(text, match.index, urlSpans)) continue;
     const valueStart = match.index + whole.length;
     ASSIGNMENT_VALUE_PATTERN.lastIndex = valueStart;
@@ -417,21 +469,19 @@ function replaceCredentialAssignments(text: string): string {
     if (value === undefined) continue;
     let kept = "";
     let consumed = value.length;
+    let replacement = REDACTED;
     if (SCHEME_WORD_PATTERN.test(value)) {
       const token = SCHEME_TOKEN_PATTERN.exec(text.slice(valueStart + value.length));
       if (!token) continue;
       kept = `${value}${token[1]}${token[2]}`;
       consumed += token[0].length;
-    } else if (
-      separatorChar === ":" &&
-      valueQuote === "" &&
-      !HEADER_NAME_PATTERN.test(key) &&
-      !looksLikeCredentialValue(value) &&
-      !endsClause(text, valueStart + value.length)
-    ) {
-      continue;
+    } else if (rule === "setting") {
+      if (!isTokenShapedValue(value)) continue;
+    } else if (rule === "webhook") {
+      replacement = webhookReplacement(value);
+      if (text.startsWith(REDACTED, valueStart + consumed)) consumed += REDACTED.length;
     }
-    out += `${text.slice(last, match.index)}${openingQuote}${key}${separator}${kept}${REDACTED}`;
+    out += `${text.slice(last, match.index)}${openingQuote}${key}${separator}${kept}${replacement}`;
     last = valueStart + consumed;
     ASSIGNMENT_KEY_PATTERN.lastIndex = last;
   }
@@ -1180,6 +1230,7 @@ function knownTotal(list: HalListResult): number | null {
   return list.totalElements ?? (list.complete ? list.items.length : null);
 }
 
+/** A per-item error line; the item's name sits in parentheses so a tenant name ending in a credential word is never read as a pair key by the scrubber. */
 function surfaceErrors(name: string, item: Surface<unknown>): string[] {
   return item.status === "error" ? [`${name}: ${item.error}`] : [];
 }
@@ -1639,7 +1690,7 @@ async function evaluateSandboxUsage(client: ClientLike, snapshot: ApplicationSna
     guid: applicationGuid(app) ?? "",
     sandboxes: await surface(() => client.listSandboxes(applicationGuid(app) ?? "")),
   })));
-  const errors = results.flatMap((item) => surfaceErrors(`sandboxes ${item.application}`, item.sandboxes));
+  const errors = results.flatMap((item) => surfaceErrors(`sandboxes (${item.application})`, item.sandboxes));
   const unreadable = results.filter((item) => item.sandboxes.status === "error");
   const withoutSandboxes = results.filter((item) => item.sandboxes.status === "ok" && item.sandboxes.value.items.length === 0).map((item) => item.application);
   const withSandboxes = results.filter((item) => item.sandboxes.status === "ok" && item.sandboxes.value.items.length > 0).length;
@@ -2570,7 +2621,7 @@ async function evaluateApiCredentials(client: ClientLike, snapshot: IdentitySnap
   if (apiUsers.length === 0) return { finding: manualFinding(9, "high", "No active API service accounts were returned even though this request is authenticated with API credentials, so the credential inventory is unverifiable.", manualEvidence, { users_seen: snapshot.users.value.items.length }), raw: skipped("the user list carried no active API account, so no credential record was requested."), errors: [] };
   const sampled = apiUsers.slice(0, 200);
   const results = await Promise.all(sampled.map(async (user) => ({ user: userLabel(user), userId: asString(user.user_id) ?? "", credentials: await surface(() => client.getUserApiCredentials(asString(user.user_id) ?? "")) })));
-  const errors = results.flatMap((item) => surfaceErrors(`api credentials ${item.user}`, item.credentials));
+  const errors = results.flatMap((item) => surfaceErrors(`api credentials (${item.user})`, item.credentials));
   const readable = results.filter((item) => item.credentials.status === "ok");
   const unreadable = results.filter((item) => item.credentials.status === "error");
   const aged: Array<{ user: string; api_id: string | null; age_days: number }> = [];

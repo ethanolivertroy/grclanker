@@ -1698,7 +1698,8 @@ test("rule 9: scrub boundary: a name-shaped value stays bare in prose and is rem
     [`Bearer ${name} rejected`, "Bearer [REDACTED] rejected"],
     [`SSWS ${name} rejected`, "SSWS [REDACTED] rejected"],
     ["Basic authentication is required", "Basic authentication is required"],
-    ["InvalidAuthenticationToken: Access token has expired", "InvalidAuthenticationToken: Access token has expired"],
+    // Reviewer C, item G: the word after a credential-named "key:" is the pair's value whatever its shape, prose included.
+    ["InvalidAuthenticationToken: Access token has expired", "InvalidAuthenticationToken: [REDACTED] token has expired"],
   ];
   for (const [input, expected] of carriers) {
     const scrubbed = scrubErrorText(input);
@@ -1851,6 +1852,116 @@ test("rule 9: scrub boundary: a name-shaped value stays bare in prose and is rem
   }
 });
 
+/** Reviewer C's 15 value shape classes (item G): the plain words that no shape rule catches are the point of the pair rule. */
+const PAIR_VALUE_SHAPES = [
+  "hunter2", "Summer2026!", "correcthorsebatterystaple", "letmein2024", "monkey", "qwerty", "letmein", "iloveyou",
+  "football", "Sunshine", "starwarsfan", "footballteam", "abc12", "p@ss", "guest",
+];
+/** The pair forms of item G: "=", ": ", ":", compact JSON, and spaced JSON. */
+const PAIR_FORMS = [
+  (key, value) => `${key}=${value}`,
+  (key, value) => `${key}: ${value}`,
+  (key, value) => `${key}:${value}`,
+  (key, value) => `{"${key}":"${value}"}`,
+  (key, value) => `{"${key}": "${value}"}`,
+];
+/** The frames of item G: a bare line, prose, a colon-terminated banner with the pair on the next line, a JSON string member, a 502 JSON body, and a double-escaped raw member. */
+const PAIR_FRAMES = [
+  ["line", (pair) => pair],
+  ["sentence", (pair) => `Vendor request failed (502 Bad Gateway) for /api/v1/items: upstream echoed ${pair} while proxying`],
+  ["502-text", (pair) => `Vendor request failed (502 Bad Gateway) for /api/v1/items: Environment as echoed by the proxy:\n${pair}`],
+  ["json-escaped", (pair) => `{"message":${JSON.stringify(pair)}}`],
+  ["502-json", (pair) => `{"status":502,"error":"Bad Gateway","message":${JSON.stringify(`The upstream rejected the request; environment: ${pair}`)},"request":{"env":${JSON.stringify(pair)}}}`],
+  ["502-json-raw", (pair) => `{"status":502,"raw":${JSON.stringify(JSON.stringify({ env: [pair] }))}}`],
+];
+const SAMPLE_UUID = "3f2504e0-4f89-11d3-9a0c-0305e82c3301";
+
+test("reviewer C final verdict, item G: the value under a credential-named key is removed whatever its shape in every pair form and frame; settings, identifiers, bearer ids, and webhooks follow the key classes", () => {
+  const credentialKeys = [
+    "DB_PASSWORD", "API_KEY", "client_secret", "access_token", "password", "AUTH_TOKEN",
+    "VERACODE_API_KEY_SECRET", "OKTA_CLIENT_TOKEN", "OKTA_CLIENT_PRIVATEKEY", "SPLUNK_PASSWORD", "SUMOLOGIC_ACCESS_KEY", "SNOWFLAKE_TOKEN", "SNOWFLAKE_PRIVATE_KEY_PASSPHRASE",
+  ];
+  for (const key of credentialKeys) {
+    for (const value of PAIR_VALUE_SHAPES) {
+      for (const form of PAIR_FORMS) {
+        const pair = form(key, value);
+        for (const [frameName, frame] of PAIR_FRAMES) {
+          // The JSON forms inside the double-escaped raw member sit at quote depth 2; the quote-aware reader (item F) covers them.
+          if (frameName === "502-json-raw" && pair.startsWith("{")) continue;
+          const input = frame(pair);
+          const scrubbed = scrubErrorText(input);
+          const label = `${frameName}: ${input}`;
+          assertNoWindowOf(scrubbed, value, label);
+          assert.ok(scrubbed.includes(key), `the key name stays in ${label} -> ${scrubbed}`);
+          assert.ok(scrubbed.includes("[REDACTED]"), `the value is replaced by the marker in ${label} -> ${scrubbed}`);
+          if (frameName === "sentence") assert.ok(scrubbed.endsWith(" while proxying"), `the prose after the pair stays in ${label} -> ${scrubbed}`);
+          assert.equal(scrubErrorText(scrubbed), scrubbed, `second pass over ${label}`);
+        }
+      }
+      assert.equal(scrubErrorText(`${key}=${value}`), `${key}=[REDACTED]`);
+      assert.equal(scrubErrorText(`${key}: ${value}`), `${key}: [REDACTED]`);
+      assert.equal(scrubErrorText(`{"${key}": "${value}"}`), `{"${key}": "[REDACTED]"}`);
+    }
+  }
+
+  // Bearer ids: a key ending in secret_id or naming a session id loses its value whatever the shape, a UUID included, in every form.
+  for (const key of ["secret_id", "VAULT_SECRET_ID", "role_secret_id", "secretId", "secret-id", "session_id", "sessionId", "sid", "JSESSIONID", "PHPSESSID"]) {
+    for (const value of [SAMPLE_UUID, "xKqZvBnMwLpRtYsHdG", "monkey", "hunter2"]) {
+      for (const form of PAIR_FORMS) {
+        const scrubbed = scrubErrorText(form(key, value));
+        assertNoWindowOf(scrubbed, value, `bearer id ${form(key, value)}`);
+        assert.ok(scrubbed.includes(key), `bearer id key stays: ${scrubbed}`);
+      }
+    }
+  }
+
+  // Identifiers: a key without a credential word is not a pair under the rule; its value is judged by shape alone, so a UUID or a name stays.
+  for (const key of ["OKTA_CLIENT_ID", "OKTA_CLIENT_CLIENTID", "client_id", "SUMO_ACCESS_ID", "SUMOLOGIC_ACCESS_ID", "SNOWFLAKE_ACCOUNT", "SNOWFLAKE_USER", "SPLUNK_USERNAME", "X-Request-Id", "request_id", "user_id", "kid"]) {
+    for (const value of [SAMPLE_UUID, "acme-prod-2026", "audit.bot"]) {
+      for (const form of PAIR_FORMS) assert.equal(scrubErrorText(form(key, value)), form(key, value), `identifier kept: ${form(key, value)}`);
+    }
+  }
+
+  // Settings: a credential-named key whose final segment names a setting keeps a value that is not token-shaped, in every form; a token-shaped value still goes.
+  const settingPairs = [
+    ["token_endpoint", "https://example.okta.com/oauth2/v1/token"],
+    ["token_uri", "https://example.okta.com/oauth2/v1/token"],
+    ["auth_method", "private_key_jwt"],
+    ["token_endpoint_auth_method", "private_key_jwt"],
+    ["signing_algorithm", "RS256"],
+    ["token_audience", "api://default"],
+    ["token_issuer", "https://example.okta.com/oauth2/default"],
+    ["key_shape", "rsa"],
+    ["token_type", "Bearer"],
+    ["SNOWFLAKE_TOKEN_TYPE", "KEYPAIR_JWT"],
+    ["X-Snowflake-Authorization-Token-Type", "KEYPAIR_JWT"],
+    ["credential_mode", "PrivateKey"],
+    ["token_limit", "200"],
+    ["token_count", "3"],
+    ["api_key_id", SAMPLE_UUID],
+    ["VERACODE_API_KEY_ID", SAMPLE_UUID],
+    ["OKTA_CLIENT_PRIVATEKEYID", "kid-2026-primary"],
+    ["token_name", "audit-token"],
+    ["api_key_name", "primary-key-2026"],
+  ];
+  for (const [key, value] of settingPairs) {
+    for (const form of PAIR_FORMS) assert.equal(scrubErrorText(form(key, value)), form(key, value), `setting kept: ${form(key, value)}`);
+    for (const shape of PAIR_VALUE_SHAPES) assert.equal(scrubErrorText(`${key}=${shape}`), `${key}=${shape}`, `a plain setting value stays: ${key}=${shape}`);
+  }
+  for (const [key, value] of [["token_type", "QmFzZTY0K1N5bWJvbHM="], ["api_key_id", "xKqZvBnMwLpRtYsHdG"], ["token_name", "aB3xZ9qL2mN8pR4tV7wY1"]]) {
+    for (const form of PAIR_FORMS) assertNoWindowOf(scrubErrorText(form(key, value)), value, `token-shaped setting value ${form(key, value)}`);
+  }
+
+  // Webhooks: webhook*, *hook_url, and callback_url keep the origin and lose the path and query; a webhook secret goes whole.
+  const webhookPath = "services/T0AB12CD/B0EF34GH/xKqZvBnMwLpRtYsHdG";
+  assert.equal(scrubErrorText(`webhook_url=https://hooks.example.com/${webhookPath}`), "webhook_url=https://hooks.example.com/[REDACTED]");
+  assert.equal(scrubErrorText(`webhookUrl: https://hooks.example.com/${webhookPath}?token=abc`), "webhookUrl: https://hooks.example.com/[REDACTED]");
+  assert.equal(scrubErrorText(`slack_hook_url: "https://hooks.example.com/${webhookPath}"`), 'slack_hook_url: "https://hooks.example.com/[REDACTED]"');
+  assert.equal(scrubErrorText("callback_url: https://app.example.com/oauth/callback?code=abc123def456"), "callback_url: https://app.example.com/[REDACTED]");
+  assert.equal(scrubErrorText("webhook_secret=monkey"), "webhook_secret=[REDACTED]");
+  for (const line of ["webhook_url=https://hooks.example.com/[REDACTED]", "callback_url: https://app.example.com/[REDACTED]"]) assert.equal(scrubErrorText(line), line, `second pass over ${line}`);
+});
+
 /** Every endpoint the Veracode client requests (applications, identity, SCA Agent, and Dynamic Analysis APIs), with the sample identifiers the fixtures use. */
 const VERACODE_REQUESTED_PATHS = [
   "/api/authn/v2/users/self",
@@ -1915,8 +2026,8 @@ function veracodeSummarySentences(kind, value) {
         `Veracode request failed (403 Forbidden) for ${value}: role Security Insights required`,
         `Veracode request failed (403 Forbidden) for ${value}: Insufficient privileges for this operation`,
         `The ${value} endpoint was forbidden (403), so the control could not be verified: Veracode request failed (403 Forbidden) for ${value}`,
-        `sandboxes Payments: Veracode request failed (403 Forbidden) for ${value}`,
-        `2026-09-21T12:00:00.000Z api credentials svc-api: Veracode request failed (403 Forbidden) for ${value}`,
+        `sandboxes (Payments): Veracode request failed (403 Forbidden) for ${value}`,
+        `2026-09-21T12:00:00.000Z api credentials (svc-api): Veracode request failed (403 Forbidden) for ${value}`,
       ];
     case "host":
       return [`Using Veracode API base ${value} (region us, credentials from environment-api-key-id -> environment-api-key-secret -> region-us).`, `Veracode request failed for ${value}/appsec/v1/applications: fetch failed`];
@@ -1925,7 +2036,7 @@ function veracodeSummarySentences(kind, value) {
         `Authenticated as ${value} with roles ${value}, Administrator.`,
         `Only 2 of 6 ${value} were read (1/3 pages), so the verdict reflects a partial inventory.`,
         `Not requested: the ${value} inventory was not readable, so no per-application list was requested.`,
-        `sandboxes ${value}: Veracode request failed (403 Forbidden) for /appsec/v1/applications/app-1/sandboxes`,
+        `sandboxes (${value}): Veracode request failed (403 Forbidden) for /appsec/v1/applications/app-1/sandboxes`,
         `Optional license-gated surfaces not readable: ${value} (their controls will render as manual).`,
         `Grant the API service account the missing roles (${value}) and confirm the region matches the account.`,
       ];
@@ -1998,8 +2109,8 @@ const VERACODE_FIXED_TEXTS = [
   "No Dynamic Analysis configurations exist, so there is no DAST configuration to evaluate; the empty inventory is treated as not applicable rather than compliant.",
   "No Dynamic Analysis scan configuration could be read, so authentication and crawl settings are unknown.",
   "No open vulnerability issues were returned, but no libraries were readable in the sampled workspaces, so it is unknown whether any scan has populated them.",
-  "sandboxes Payments: Veracode request failed (403 Forbidden) for /appsec/v1/applications/app-1/sandboxes",
-  "api credentials svc-api: Veracode request failed (403 Forbidden) for /api/authn/v2/api_credentials/user_id/u-2",
+  "sandboxes (Payments): Veracode request failed (403 Forbidden) for /appsec/v1/applications/app-1/sandboxes",
+  "api credentials (svc-api): Veracode request failed (403 Forbidden) for /api/authn/v2/api_credentials/user_id/u-2",
   "dynamic scan configuration scan-1: Veracode request failed (403 Forbidden) for /was/configservice/v1/scans/scan-1/configuration",
   "sca workspaces: Veracode request failed (403 Forbidden) for /srcclr/v3/workspaces",
   "self: Veracode request failed (401 Unauthorized) for /api/authn/v2/users/self",
