@@ -1002,20 +1002,27 @@ function clampLookbackDays(value: number | undefined): number {
   return Math.min(180, Math.max(1, raw));
 }
 
+/** A configuration value that is absent, not a string, or blank is "not provided", so it never shadows a lower layer. */
+function providedString(value: unknown): string | undefined {
+  if (typeof value !== "string") return undefined;
+  const trimmed = value.trim();
+  return trimmed.length > 0 ? trimmed : undefined;
+}
+
 function overlayFromArgs(args: RawConfigArgs): DuoConfigOverlay {
   return {
-    apiHost: args.api_host?.trim(),
-    ikey: args.ikey?.trim(),
-    skey: args.skey?.trim(),
+    apiHost: providedString(args.api_host),
+    ikey: providedString(args.ikey),
+    skey: providedString(args.skey),
     lookbackDays: parseOptionalNumber(args.lookback_days),
   };
 }
 
 function overlayFromEnv(env: NodeJS.ProcessEnv): DuoConfigOverlay {
   return {
-    apiHost: env.DUO_API_HOST?.trim(),
-    ikey: env.DUO_IKEY?.trim(),
-    skey: env.DUO_SKEY?.trim(),
+    apiHost: providedString(env.DUO_API_HOST),
+    ikey: providedString(env.DUO_IKEY),
+    skey: providedString(env.DUO_SKEY),
     lookbackDays: parseOptionalNumber(env.DUO_LOOKBACK_DAYS),
   };
 }

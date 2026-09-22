@@ -283,6 +283,33 @@ test("resolveAwsConfiguration prefers explicit args over environment defaults", 
   assert.ok(resolved.sourceChain.includes("arguments-profile"));
 });
 
+test("config resolution: the profile, region, and account set through the environment survive an argument overlay that carries every key as undefined and names only an unrelated argument, the source chain names the environment, and static environment credentials still sign the request through the real SDK", async () => {
+  // Every documented key present as undefined (the shape an argument overlay emits), one unrelated argument set.
+  const overlay = { region: undefined, profile: undefined, account_id: undefined, region_limit: 1 };
+
+  const profile = resolveAwsConfiguration(overlay, { AWS_PROFILE: "audit-env-profile", AWS_REGION: "eu-west-1", AWS_ACCOUNT_ID: "123456789012" });
+  assert.deepEqual({ region: profile.region, profile: profile.profile, accountId: profile.accountId }, { region: "eu-west-1", profile: "audit-env-profile", accountId: "123456789012" }, "the environment values resolve");
+  assert.deepEqual(profile.sourceChain, ["environment-region", "environment-profile", "environment-account"], "the source chain names the environment");
+
+  const defaultRegion = resolveAwsConfiguration(overlay, { AWS_DEFAULT_REGION: "ap-southeast-2" });
+  assert.equal(defaultRegion.region, "ap-southeast-2", "AWS_DEFAULT_REGION resolves when AWS_REGION is unset");
+  assert.deepEqual(defaultRegion.sourceChain, ["environment-region"]);
+
+  // A blank string argument is "not provided" as well: it never shadows the environment value.
+  const blank = resolveAwsConfiguration({ ...overlay, profile: "", region: "  " }, { AWS_PROFILE: "audit-env-profile", AWS_REGION: "eu-west-1" });
+  assert.deepEqual({ region: blank.region, profile: blank.profile }, { region: "eu-west-1", profile: "audit-env-profile" }, "blank arguments do not erase the environment values");
+
+  // The credential itself is the SDK's: with no profile resolved, the default chain reads the static environment key and signs with it.
+  await withLocalAwsEndpoint(() => STS_IDENTITY_RESPONSE, async ({ requests }) => {
+    const config = resolveAwsConfiguration(overlay, process.env);
+    assert.equal(config.profile, undefined, "no profile is resolved, so the default credential chain is used");
+    assert.deepEqual(config.sourceChain, ["environment-region"]);
+    const identity = await realAwsClient(config).getCallerIdentity();
+    assert.equal(identity.Account, FIXTURE_ACCOUNT, "the identity read completes with the environment credential");
+    assert.deepEqual(requests.map((entry) => [entry.label, entry.accessKeyId]), [["sts:GetCallerIdentity", process.env.AWS_ACCESS_KEY_ID]], "the request was signed with the environment access key id");
+  });
+});
+
 test("checkAwsAccess reports readable AWS audit surfaces", async () => {
   const client = {
     getResolvedConfig: () => sampleConfig(),
@@ -2904,15 +2931,16 @@ const REST_ACTIONS = [
 
 /** The IAM-prefixed action label (iam:ListUsers) the integration records for one signed request. */
 function describeSdkRequest(req, body) {
-  const scope = /Credential=[^/]+\/\d{8}\/[^/]+\/([^/]+)\/aws4_request/.exec(req.headers.authorization ?? "");
-  const signed = scope?.[1] ?? "unsigned";
+  const scope = /Credential=([^/]+)\/\d{8}\/[^/]+\/([^/]+)\/aws4_request/.exec(req.headers.authorization ?? "");
+  const accessKeyId = scope?.[1];
+  const signed = scope?.[2] ?? "unsigned";
   // S3 Control signs as s3; its account-scoped requests carry the account id header and a versioned path.
   const service = signed === "s3" && req.headers["x-amz-account-id"] ? "s3control" : signed;
   const path = req.url.split("?")[0];
   const queryAction = /(?:^|&)Action=([A-Za-z]+)/.exec(body)?.[1];
   const target = req.headers["x-amz-target"] ? String(req.headers["x-amz-target"]).split(".").pop() : undefined;
   const rest = REST_ACTIONS.find(([restService, pattern]) => restService === service && pattern.test(`${req.method} ${path}`))?.[2];
-  return { service, action: queryAction ?? target ?? rest ?? `${req.method} ${path}`, label: `${service}:${queryAction ?? target ?? rest ?? `${req.method} ${path}`}` };
+  return { service, action: queryAction ?? target ?? rest ?? `${req.method} ${path}`, label: `${service}:${queryAction ?? target ?? rest ?? `${req.method} ${path}`}`, accessKeyId };
 }
 
 const escapeXml = (text) => text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");

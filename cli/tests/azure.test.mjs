@@ -204,6 +204,36 @@ test("resolveAzureConfiguration prefers explicit args over environment defaults"
   assert.ok(resolved.sourceChain.includes("arguments-subscription"));
 });
 
+test("config resolution: credentials set through the environment survive an argument overlay that carries every credential key as undefined and names only an unrelated argument, the source chain names the environment, and az is never run", () => {
+  const secret = "Zt6Kq9Xw3Mp7Vr2Lc8Nd4Hb5";
+  const graphToken = "Gq4Wt7Zx2Kp9Mr5Lc3Nv8Hd6";
+  const managementToken = "Mw8Kt3Zq6Xp2Vr9Lc4Nb7Hd5";
+  // Every documented credential key present as undefined (the shape an argument overlay emits), one unrelated argument set.
+  const overlay = { tenant_id: undefined, subscription_id: undefined, client_id: undefined, client_secret: undefined, graph_token: undefined, management_token: undefined, authority_host: undefined, output_dir: "bundles" };
+  const commands = [];
+  const runner = (command, args) => { commands.push([command, ...args].join(" ")); return undefined; };
+
+  const credentials = resolveAzureConfiguration(overlay, { AZURE_TENANT_ID: "tenant-env", AZURE_SUBSCRIPTION_ID: "sub-env", AZURE_CLIENT_ID: "client-env", AZURE_CLIENT_SECRET: secret }, runner);
+  assert.deepEqual(credentials.clientCredentials, { clientId: "client-env", clientSecret: secret }, "the environment client credentials resolve");
+  assert.deepEqual({ tenantId: credentials.tenantId, subscriptionId: credentials.subscriptionId }, { tenantId: "tenant-env", subscriptionId: "sub-env" });
+  assert.deepEqual(credentials.sourceChain, ["environment-tenant", "environment-subscription", "client-credentials"], "the source chain names the environment");
+
+  const tokens = resolveAzureConfiguration(overlay, { AZURE_TENANT_ID: "tenant-env", AZURE_SUBSCRIPTION_ID: "sub-env", AZURE_GRAPH_TOKEN: graphToken, AZURE_MANAGEMENT_TOKEN: managementToken }, runner);
+  assert.deepEqual({ graphToken: tokens.graphToken, managementToken: tokens.managementToken }, { graphToken, managementToken }, "the environment tokens resolve");
+  assert.deepEqual(tokens.sourceChain, ["environment-tenant", "environment-subscription", "environment-graph-token", "environment-management-token"], "the source chain names the environment for every value");
+
+  const accessToken = resolveAzureConfiguration(overlay, { AZURE_TENANT_ID: "tenant-env", AZURE_SUBSCRIPTION_ID: "sub-env", AZURE_GRAPH_TOKEN: graphToken, AZURE_ACCESS_TOKEN: managementToken }, runner);
+  assert.equal(accessToken.managementToken, managementToken, "AZURE_ACCESS_TOKEN resolves as the management token");
+  assert.ok(accessToken.sourceChain.includes("environment-management-token"));
+
+  // A blank string argument is "not provided" as well: it never shadows the environment value.
+  const blank = resolveAzureConfiguration({ ...overlay, client_secret: "", tenant_id: "  " }, { AZURE_TENANT_ID: "tenant-env", AZURE_SUBSCRIPTION_ID: "sub-env", AZURE_CLIENT_ID: "client-env", AZURE_CLIENT_SECRET: secret }, runner);
+  assert.deepEqual(blank.clientCredentials, { clientId: "client-env", clientSecret: secret }, "a blank secret argument does not erase the environment secret");
+  assert.equal(blank.tenantId, "tenant-env", "a blank tenant argument does not erase the environment tenant");
+
+  assert.deepEqual(commands, [], "az was never run while the environment supplied every value");
+});
+
 test("resolveAzureConfiguration accepts client credentials without az CLI and maps sovereign clouds", () => {
   let cliCalls = 0;
   const resolved = resolveAzureConfiguration(

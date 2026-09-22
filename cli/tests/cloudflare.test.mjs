@@ -298,6 +298,30 @@ test("resolveCloudflareConfiguration prefers explicit arguments over environment
   assert.ok(resolved.sourceChain.includes("arguments-api-token"));
 });
 
+test("config resolution: credentials set through the environment survive an argument overlay that carries every credential key as undefined and names only an unrelated argument, and the source chain names the environment", () => {
+  const env = { CLOUDFLARE_API_TOKEN: "vN8kQ3xT7mWp2Zr9Lc4Hd6Fs", CLOUDFLARE_ACCOUNT_ID: "acc-env-123", CLOUDFLARE_API_KEY: "Xr4Tq9Vw2Kp7Mz3Nb8Lc5Hd1", CLOUDFLARE_EMAIL: "auditor@example.com" };
+  // Every documented credential key present as undefined (the shape an argument overlay emits), one unrelated argument set.
+  const overlay = { api_token: undefined, token: undefined, api_key: undefined, email: undefined, account_id: undefined, base_url: undefined, timeout_seconds: 12 };
+
+  const token = resolveCloudflareConfiguration(overlay, { CLOUDFLARE_API_TOKEN: env.CLOUDFLARE_API_TOKEN, CLOUDFLARE_ACCOUNT_ID: env.CLOUDFLARE_ACCOUNT_ID });
+  assert.equal(token.apiToken, env.CLOUDFLARE_API_TOKEN, "the environment token resolves");
+  assert.equal(token.accountId, env.CLOUDFLARE_ACCOUNT_ID, "the environment account id resolves");
+  assert.equal(token.authMethod, "token");
+  assert.equal(token.timeoutMs, 12_000, "the unrelated argument is applied");
+  assert.deepEqual(token.sourceChain, ["environment-api-token", "environment-account-id", "default-base-url"], "the source chain names the environment");
+
+  const pair = resolveCloudflareConfiguration(overlay, { CLOUDFLARE_API_KEY: env.CLOUDFLARE_API_KEY, CLOUDFLARE_EMAIL: env.CLOUDFLARE_EMAIL });
+  assert.equal(pair.apiKey, env.CLOUDFLARE_API_KEY, "the environment global key resolves");
+  assert.equal(pair.email, env.CLOUDFLARE_EMAIL, "the environment email resolves");
+  assert.equal(pair.authMethod, "global_key");
+  assert.deepEqual(pair.sourceChain, ["environment-api-key", "environment-email", "default-base-url"], "the source chain names the environment for the pair");
+
+  // A blank string argument is "not provided" as well: it never shadows the environment value.
+  const blank = resolveCloudflareConfiguration({ ...overlay, api_token: "", token: "  " }, { CLOUDFLARE_API_TOKEN: env.CLOUDFLARE_API_TOKEN });
+  assert.equal(blank.apiToken, env.CLOUDFLARE_API_TOKEN, "a blank token argument does not erase the environment token");
+  assert.deepEqual(blank.sourceChain, ["environment-api-token", "default-base-url"]);
+});
+
 test("checkCloudflareAccess reports readable Cloudflare surfaces", async () => {
   const result = await checkCloudflareAccess(fixtureClient("compliant"));
   assert.equal(result.status, "healthy");

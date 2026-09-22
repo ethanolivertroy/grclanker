@@ -1230,6 +1230,31 @@ test("assessDuoMonitoring caps log-backed findings at Partial when the log sampl
   }
 });
 
+test("config resolution: credentials set through the environment survive an argument overlay that carries every credential key as undefined and names only an unrelated argument, and the source chain names the environment", () => {
+  const env = { DUO_API_HOST: "api-env.duosecurity.com", DUO_IKEY: "DIENV7KQ2XW9MP4ZR6LC", DUO_SKEY: "Rk7Xq2Vw9Mt4Zp8Lc3Nb6Hd5Fs1Gy0Jv" };
+  // Every documented credential key present as undefined (the shape an argument overlay emits), one unrelated argument set.
+  const overlay = { api_host: undefined, ikey: undefined, skey: undefined, output_dir: "bundles" };
+
+  const resolved = resolveDuoConfiguration(overlay, env);
+  assert.deepEqual({ apiHost: resolved.apiHost, ikey: resolved.ikey, skey: resolved.skey }, { apiHost: env.DUO_API_HOST, ikey: env.DUO_IKEY, skey: env.DUO_SKEY }, "the environment credentials resolve");
+  assert.deepEqual(resolved.sourceChain, ["environment"], "the source chain names the environment and not the overlay of undefined keys");
+
+  const withLookback = resolveDuoConfiguration({ ...overlay, lookback_days: 30 }, env);
+  assert.equal(withLookback.skey, env.DUO_SKEY, "a non-credential argument does not erase the environment secret");
+  assert.equal(withLookback.lookbackDays, 30);
+  assert.deepEqual(withLookback.sourceChain, ["environment", "arguments"], "the source chain names both layers when the arguments carry a value");
+
+  // A blank string argument is "not provided" as well: it never shadows the environment value, including when it
+  // rides along with a set argument (the case where the overlay is applied and a blank could overwrite the layer below).
+  const blank = resolveDuoConfiguration({ ...overlay, skey: "", ikey: "  ", api_host: "" }, env);
+  assert.deepEqual({ apiHost: blank.apiHost, ikey: blank.ikey, skey: blank.skey }, { apiHost: env.DUO_API_HOST, ikey: env.DUO_IKEY, skey: env.DUO_SKEY }, "blank arguments do not erase the environment credentials");
+  assert.deepEqual(blank.sourceChain, ["environment"]);
+  const blankBesideSet = resolveDuoConfiguration({ ...overlay, skey: "", ikey: "  ", api_host: "", lookback_days: 30 }, env);
+  assert.deepEqual({ apiHost: blankBesideSet.apiHost, ikey: blankBesideSet.ikey, skey: blankBesideSet.skey }, { apiHost: env.DUO_API_HOST, ikey: env.DUO_IKEY, skey: env.DUO_SKEY }, "blank credentials beside a set argument do not erase the environment credentials");
+  assert.equal(blankBesideSet.lookbackDays, 30);
+  assert.deepEqual(blankBesideSet.sourceChain, ["environment", "arguments"]);
+});
+
 test("resolveDuoConfiguration prefers explicit args over environment values", () => {
   const base = resolveDuoConfiguration(
     {},

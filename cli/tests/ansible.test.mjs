@@ -317,6 +317,29 @@ test("resolveAnsibleConfiguration prefers explicit non-secret args and keeps pas
   );
 });
 
+test("config resolution: credentials set through the environment survive an argument overlay that carries every credential key as undefined and names only an unrelated argument, and the source chain names the environment", () => {
+  const env = { AAP_URL: "https://env-aap.example.com", AAP_TOKEN: "hQ2vT8mKp4Xw9ZrLc6Nd", AAP_USERNAME: "env-user", AAP_PASSWORD: "Wq7Lm3Zx8Rt2Vk5Pn9Yb" };
+  // The shape createClient hands the resolver: every documented key present, only the unrelated one carrying a value.
+  const overlay = { url: undefined, username: undefined, token: undefined, timeout_seconds: 12, verify_ssl: undefined };
+
+  const token = resolveAnsibleConfiguration(overlay, { AAP_URL: env.AAP_URL, AAP_TOKEN: env.AAP_TOKEN });
+  assert.equal(token.token, env.AAP_TOKEN, "the environment token resolves");
+  assert.equal(token.baseUrl, env.AAP_URL, "the environment URL resolves");
+  assert.equal(token.timeoutMs, 12_000, "the unrelated argument is applied");
+  assert.deepEqual(token.sourceChain, ["environment"], "the source chain names the environment");
+
+  const session = resolveAnsibleConfiguration(overlay, { AAP_URL: env.AAP_URL, AAP_USERNAME: env.AAP_USERNAME, AAP_PASSWORD: env.AAP_PASSWORD });
+  assert.equal(session.username, env.AAP_USERNAME, "the environment username resolves");
+  assert.equal(session.password, env.AAP_PASSWORD, "the environment password resolves");
+  assert.deepEqual(session.sourceChain, ["environment", "environment-password"], "the source chain names the environment for both");
+
+  // A blank string argument is "not provided" as well: it never shadows the environment value.
+  const blank = resolveAnsibleConfiguration({ ...overlay, url: "", token: "  " }, { AAP_URL: env.AAP_URL, AAP_TOKEN: env.AAP_TOKEN });
+  assert.equal(blank.token, env.AAP_TOKEN, "a blank token argument does not erase the environment token");
+  assert.equal(blank.baseUrl, env.AAP_URL, "a blank url argument does not erase the environment URL");
+  assert.deepEqual(blank.sourceChain, ["environment"]);
+});
+
 test("resolveAnsibleConfiguration reads AAP_VERIFY_SSL and lets verify_ssl override it", () => {
   const env = { AAP_URL: "https://aap.example.com", AAP_TOKEN: "t", AAP_VERIFY_SSL: "false" };
   assert.equal(resolveAnsibleConfiguration({}, env).verifySsl, false);
