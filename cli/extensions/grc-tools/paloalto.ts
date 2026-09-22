@@ -21,6 +21,7 @@ import { homedir } from "node:os";
 import { basename, dirname, join, relative, resolve } from "node:path";
 import { ZipArchive } from "archiver";
 import { Type } from "@sinclair/typebox";
+import { REDACTED_VALUE, isSensitiveArgumentKey, scrubSensitiveValues } from "../../flue/redact.js";
 import { errorResult, formatTable, textResult } from "./shared.js";
 
 type FetchImpl = typeof fetch;
@@ -406,31 +407,261 @@ function safeDirName(value: string): string {
 
 export const REDACTION_MARKER = "[REDACTED]";
 
-// Unanchored patterns for credential-shaped text that an upstream body, proxy page, or
-// transport error may echo regardless of what this tool sent: bearer and basic tokens,
-// header lines, key=value or key: value pairs with a credential word in the key, JSON
-// pairs quoted inside a message ("password":"..."), PAN-OS API keys (LUFRPT...), JWTs,
-// and URL userinfo. Applied to every error string in redactSecrets (the client throw
-// sites) and again in errorMessage (the sink every collector, access probe, and tool
-// catch block reads through). Redaction always runs before any length cap so a value
-// cut by the cap can never survive as a prefix.
-const ERROR_TEXT_PATTERNS: Array<[RegExp, string]> = [
-  [/\b(bearer|basic|digest|negotiate)\s+[a-z0-9._~+/=-]{8,}/gi, `$1 ${REDACTION_MARKER}`],
-  [/\b(authorization|proxy-authorization|x-api-key|x-auth-token|x-pan-key|x-redlock-auth|set-cookie|cookie)\s*:\s*[^\r\n]+/gi, `$1: ${REDACTION_MARKER}`],
-  [/\b([a-z0-9_-]*(?:session|token|secret|password|passwd|passphrase|phash|api[_-]?key|accesskey|secretkey|access_key|secret_key|private_key|shared_key|signature|authorization|credential)[a-z0-9_-]*)\s*[=:]\s*["']?(?!\[REDACTED\])[^\s"';,&<>]{4,}/gi, `$1=${REDACTION_MARKER}`],
-  [/\b(key|auth|sig|sid|pwd|pin|otp)\s*[=:]\s*["']?(?!\[REDACTED\])[^\s"';,&<>]{4,}/gi, `$1=${REDACTION_MARKER}`],
-  [/("[a-z0-9_-]*(?:session|token|secret|password|passwd|passphrase|phash|api[_-]?key|accesskey|secretkey|access_key|secret_key|private_key|shared_key|signature|authorization|credential)[a-z0-9_-]*"\s*:\s*")(?!\[REDACTED\])[^"]+(")/gi, `$1${REDACTION_MARKER}$2`],
-  [/\bLUFRPT[a-z0-9+/=_-]{16,}/gi, REDACTION_MARKER],
-  [/\beyJ[a-z0-9_-]{8,}\.[a-z0-9_-]{8,}(?:\.[a-z0-9_-]{8,})?/gi, REDACTION_MARKER],
-  [/(https?:\/\/)[^\s/@"'<>]+:[^\s/@"'<>]+@/gi, `$1${REDACTION_MARKER}@`],
-];
+/**
+ * Scrub boundary. A bare value shaped like a name (words joined by hyphens or
+ * underscores with at most one digit group per segment: prod-us-east-2026,
+ * fw-dc1-01, sess-canary-COOKIE-31415926535897) standing alone in prose is
+ * indistinguishable from a resource name and stays, because a summary that names
+ * the unread inventory is itself a verdict-safety requirement. Two guards make
+ * that safe and both hold by construction:
+ *
+ * 1. A value inside a carrier is removed whatever its shape: the Authorization,
+ *    Proxy-Authorization, Cookie, Set-Cookie, X-Api-Key, X-PAN-KEY, x-redlock-auth
+ *    and similar header lines to the end of the line; the userinfo of every
+ *    embedded URL; credential-named query and fragment pairs of every URL and bare
+ *    query string (the PAN-OS key= parameter included) and any query value shaped
+ *    like a token; the schemes Bearer, Basic, Digest, Token, OAuth, Negotiate,
+ *    NTLM, SSWS, and ApiKey (one plain lowercase word after the scheme, "Basic
+ *    authentication", is prose); credential-named key=value pairs (to the next
+ *    delimiter), key: value pairs (to the end of the line), "key":"value" pairs,
+ *    and key="value" XML or HTML attributes; and webhook services whose URL path is
+ *    the secret. Nothing this module renders puts a credential word in front of a
+ *    colon or an equals sign, so every fixed text survives the scrub.
+ * 2. A configured secret (the Prisma Cloud access key ID and secret key, the PAN-OS
+ *    API key, the keygen password, and the key keygen returns) is removed whatever
+ *    its shape and in every encoded form (JSON-escaped, URL-encoded, form-encoded,
+ *    base64, base64url, re-flowed PEM lines), down to MIN_CONFIGURED_SECRET_LENGTH
+ *    (cli/flue/redact.ts owns the forms). redactSecrets applies it at every client
+ *    throw site; the tool boundary and the bundle writer apply it to the whole
+ *    payload and every written file.
+ *
+ * Real token shapes are still removed bare: PEM blocks, JWTs, LUFRPT-prefixed
+ * PAN-OS keys, AWS access key ids, and (in error text) any run of
+ * LONG_TOKEN_MIN_LENGTH or more token characters that carries base64 symbols,
+ * digits scattered through its letters (0f9e8d7c6b5a4938), or token casing
+ * (Kq7Zx2Vw9Lm4Tp8R). The rule is path-safe: "/", ".", ":", "@", "=", and
+ * whitespace end a run, so URL path segments, dotted hostnames, colon-separated
+ * ARNs, and the two sides of a key=value pair are judged piece by piece, while
+ * "-" and "_" split a run into name segments; uppercase codes (ENOENT, PCI-DSS-4),
+ * digit strings, and canonical UUIDs are names outright. Data values and bundle
+ * content go through redactCredentialValueText, every carrier rule without the
+ * long-token one (an opaque identifier in evidence is not a secret) and with
+ * public PEM blocks (certificates, public keys, CSRs) kept as evidence. Every rule
+ * is unanchored and idempotent.
+ */
+export const MIN_CONFIGURED_SECRET_LENGTH = 4;
+export const LONG_TOKEN_MIN_LENGTH = 16;
 
-export function redactErrorText(text: string): string {
-  let redacted = text;
-  for (const [pattern, replacement] of ERROR_TEXT_PATTERNS) {
-    redacted = redacted.replace(pattern, replacement);
+// Which PEM blocks a scrub removes: every block in error text, where a block is never
+// evidence; only non-public blocks in data values, where a certificate is.
+type PemScope = "all" | "private";
+
+const PEM_BLOCK_PATTERN = /-----BEGIN ([A-Z0-9 ]+)-----[\s\S]*?-----END [A-Z0-9 ]+-----/g;
+// A block whose END was cut off (a truncated message) runs to the end of the text.
+const PEM_OPEN_PATTERN = /-----BEGIN ([A-Z0-9 ]+)-----(?:(?!-----END )[\s\S])*$/;
+// Labels of PEM blocks that carry public material only; every other label (PRIVATE KEY,
+// ENCRYPTED PRIVATE KEY, RSA/EC/DSA/OPENSSH PRIVATE KEY, PGP PRIVATE KEY BLOCK) is a secret.
+const PUBLIC_PEM_LABELS = new Set(["CERTIFICATE", "TRUSTED CERTIFICATE", "X509 CRL", "CERTIFICATE REQUEST", "NEW CERTIFICATE REQUEST", "PUBLIC KEY", "RSA PUBLIC KEY", "PKCS7", "CMS"]);
+// Any scheme-prefixed URL: the userinfo is dropped; its query and fragment pairs are
+// judged by the pair rule below, so the scheme, host, path, and ordinary pairs stay.
+const EMBEDDED_URL_PATTERN = /\b[a-z][a-z0-9+.-]*:\/\/[^\s"'<>()[\]{}]+/gi;
+const URL_USERINFO_PATTERN = /^([a-z][a-z0-9+.-]*:\/\/)[^\s/@"'<>]+@/i;
+// A query or fragment pair, in a URL or a bare query string: a credential-named pair or a
+// token-shaped value loses the value.
+const QUERY_PAIR_PATTERN = /([?&#])([A-Za-z0-9_.[\]-]+)=((?!\[REDACTED\])[^&#\s"'<>]+)/g;
+// A credential-bearing header line: the whole value goes, whatever its shape. A line that
+// already carries a marker is left alone so the rule is idempotent.
+const HEADER_LINE_PATTERN = /\b(authorization|proxy-authorization|cookie|set-cookie|x-api-key|api-key|apikey|x-pan-key|x-redlock-auth|x-auth-token|x-access-token|x-amz-security-token|x-vault-token|private-token|x-goog-api-key|x-csrf-token|x-xsrf-token)(["']?\s*:\s*)(?![^\r\n<>"']*\[REDACTED\])[^\r\n<>"']*[^\s\r\n<>"']/gi;
+// A scheme and its credentials; one plain lowercase word after the scheme ("Basic
+// authentication", "Bearer token") is prose.
+const SCHEME_VALUE_PATTERN = /\b(Bearer|Basic|Digest|Token|OAuth|Negotiate|NTLM|SSWS|ApiKey|Api-Key)\s+((?!\[REDACTED\])[A-Za-z0-9._~+/=-]{4,})/gi;
+const PLAIN_WORD_PATTERN = /^[a-z]{1,20}$/;
+// "key":"value" and key="value" carriers keep the whole quoted value together so a
+// value with spaces is removed as one; the unquoted pair rule below takes the rest.
+// Keys may start with "_" (_upstream_session, _token), so a key begins wherever no key
+// character precedes it rather than at a word boundary.
+const JSON_QUOTED_PAIR_PATTERN = /"([A-Za-z_][A-Za-z0-9_.-]{0,63})"\s*:\s*"((?!\[REDACTED\])[^"\r\n]+)"/g;
+const QUOTED_ATTRIBUTE_PATTERN = /(?<![A-Za-z0-9_.:-])([A-Za-z_][A-Za-z0-9_.:-]{0,63})\s*=\s*(["'])((?!\[REDACTED\])[^"'\r\n]+)\2/g;
+// An unquoted pair: key=value runs to the next delimiter, key: value (a header or
+// YAML-style line) to the end of the line.
+const ASSIGNMENT_KEY_PATTERN = /(?<![A-Za-z0-9_.-])(["']?)([A-Za-z_][A-Za-z0-9_.-]{0,63})(["']?\s*([:=])\s*["']?)/g;
+const DELIMITED_VALUE_PATTERN = /(?!\[REDACTED\])[^\s"'<>;,&]+/y;
+const LINE_VALUE_PATTERN = /(?!\[REDACTED\])[^\r\n<>"',;]*[^\s\r\n<>"',;]/y;
+const TOKEN_IN_PATH_WEBHOOK_PATTERN = /(https?:\/\/(?:hooks\.slack\.com\/services|discord(?:app)?\.com\/api\/webhooks|[a-z0-9.-]*webhook\.office\.com\/webhookb2)\/)(?!\[REDACTED\])[^\s"'<>]+/gi;
+const JWT_PATTERN = /\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}(?:\.[A-Za-z0-9_-]+)*/g;
+const PANOS_API_KEY_PATTERN = /\bLUFRPT[A-Za-z0-9+/=_-]{16,}/g;
+const AWS_ACCESS_KEY_ID_PATTERN = /\b(?:AKIA|ASIA|AROA|AIDA|AGPA|ANPA|ANVA|APKA|ABIA|ACCA)[A-Z0-9]{16}\b/g;
+const LONG_TOKEN_RUN_PATTERN = /[A-Za-z0-9+_-]{16,}(?:={1,2}(?![A-Za-z0-9&]))?/g;
+const TOKEN_VALUE_PATTERN = /^[A-Za-z0-9+_-]{16,}={0,2}$/;
+const UPPERCASE_CODE_PATTERN = /^[A-Z][A-Z_]*$|^[A-Z][A-Z0-9]*(?:[_-][A-Z0-9]+)+$/;
+const DIGITS_ONLY_PATTERN = /^\d+$/;
+const DIGIT_GROUP_PATTERN = /\d+/g;
+const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+// Below this many letters a segment's casing is not judged: eBay, iOS, McD are names.
+const MIN_LETTERS_FOR_CASING = 6;
+// A segment this long that is not name-shaped makes the whole run a token on its own.
+const MIN_TOKEN_SEGMENT_LENGTH = 8;
+// A key whose last segment names a reference, threshold, count, mode, or file is never a
+// credential carrier (credentialID, keyId, tokenCount, session_timeout_minutes, auth_mode,
+// credentials_file, passwordPolicy, webhookUrl), nor is a max/min bound.
+const SAFE_LAST_KEY_SEGMENTS = new Set([
+  "id", "ids", "name", "names", "url", "urls", "uri", "host", "type", "types", "count", "limit", "days", "hours", "minutes", "seconds",
+  "path", "file", "dir", "mode", "method", "scheme", "status", "state", "source", "length", "age", "policy", "enabled", "required",
+  "expiry", "expires", "expiration", "version", "scope", "scopes", "label", "manager", "prefix", "suffix", "format", "hint", "ref",
+]);
+const BOUND_KEY_SEGMENTS = new Set(["max", "min"]);
+// Bare and PAN-OS credential words the Flue heuristic does not cover.
+const EXTRA_CREDENTIAL_KEY_SEGMENTS = new Set(["sid", "sig", "pwd", "passwd", "pass", "session", "sessid", "auth", "nonce", "sas", "phash", "community", "authpwd", "privpwd"]);
+const EXTRA_CREDENTIAL_KEYS = new Set(["x-pan-key", "x-redlock-auth", "proxy-authorization", "x-amz-signature", "x-amz-credential", "x-amz-security-token", "oauth_signature", "oauth_token", "oauth_verifier"]);
+
+/** True when a name in a query string, header, attribute, or name-value pair carries a credential. */
+export function isCredentialKey(key: string): boolean {
+  const segments = propertyNameSegments(key);
+  const last = segments[segments.length - 1];
+  if (last === undefined || SAFE_LAST_KEY_SEGMENTS.has(last) || BOUND_KEY_SEGMENTS.has(segments[0])) return false;
+  if ((last === "key" || last === "keys") && segments.length > 1 && NON_CREDENTIAL_KEY_QUALIFIERS.has(segments[segments.length - 2])) return false;
+  if (isSensitiveArgumentKey(key) || EXTRA_CREDENTIAL_KEYS.has(key.toLowerCase())) return true;
+  return segments.some((segment) => EXTRA_CREDENTIAL_KEY_SEGMENTS.has(segment));
+}
+
+// Token-shaped casing: the case changes more often than once every three letters
+// (bPxRfiCYcanaryKEY); words, acronyms, camelCase, and PascalCase change case at word
+// boundaries only (AWSLambdaBasicExecutionRole).
+function hasTokenCasing(letters: string): boolean {
+  if (letters.length < MIN_LETTERS_FOR_CASING) return false;
+  let changes = 0;
+  for (let index = 1; index < letters.length; index += 1) {
+    const previousLower = letters[index - 1] >= "a" && letters[index - 1] <= "z";
+    const currentLower = letters[index] >= "a" && letters[index] <= "z";
+    if (previousLower !== currentLower) changes += 1;
   }
-  return redacted;
+  return changes * 3 > letters.length;
+}
+
+// A "-" or "_" separated segment shaped like part of a name: empty, digits alone, or letters
+// with at most one digit group (west2, sha256, vsys1, ethernet1) whose casing is not token-shaped.
+function isNameSegment(segment: string): boolean {
+  if (segment.length === 0 || DIGITS_ONLY_PATTERN.test(segment)) return true;
+  const digitGroups = segment.match(DIGIT_GROUP_PATTERN) ?? [];
+  if (digitGroups.length > 1) return false;
+  return !hasTokenCasing(segment.replace(DIGIT_GROUP_PATTERN, ""));
+}
+
+// A run is a token when it carries base64 symbols ("+" anywhere; "=" padding only where the
+// run is base64-shaped: a multiple of four characters with no "-" or "_", so "key=" left
+// in front of a marker is never padding and the rule stays idempotent), or when a
+// segment of MIN_TOKEN_SEGMENT_LENGTH or more is not name-shaped, or when at least half
+// of its segments are not. One short random-looking segment beside several names (the
+// six-character mkdtemp suffix of a temp path, a build id) does not make a token.
+function looksLikeToken(run: string): boolean {
+  const padding = /=+$/.exec(run)?.[0] ?? "";
+  const body = run.slice(0, run.length - padding.length);
+  if (UPPERCASE_CODE_PATTERN.test(body) || DIGITS_ONLY_PATTERN.test(body) || UUID_PATTERN.test(body)) return false;
+  if (body.includes("+")) return true;
+  if (padding.length > 0) return run.length % 4 === 0 && !/[-_]/.test(body);
+  const segments = body.split(/[-_]/).filter((segment) => segment.length > 0);
+  const tokenSegments = segments.filter((segment) => !isNameSegment(segment));
+  if (tokenSegments.length === 0) return false;
+  return tokenSegments.some((segment) => segment.length >= MIN_TOKEN_SEGMENT_LENGTH) || tokenSegments.length * 2 >= segments.length;
+}
+
+// A whole query value that is one token-shaped run (no path, dot, or percent escape inside).
+function isTokenShapedValue(value: string): boolean {
+  return TOKEN_VALUE_PATTERN.test(value) && looksLikeToken(value);
+}
+
+function isPublicPemLabel(label: string): boolean {
+  return PUBLIC_PEM_LABELS.has(label.trim());
+}
+
+function scrubPem(text: string, scope: PemScope): string {
+  const keeps = (label: string): boolean => {
+    switch (scope) {
+      case "all":
+        return false;
+      case "private":
+        return isPublicPemLabel(label);
+      default: {
+        const exhaustive: never = scope;
+        return exhaustive;
+      }
+    }
+  };
+  return text
+    .replace(PEM_BLOCK_PATTERN, (match, label: string) => (keeps(label) ? match : REDACTION_MARKER))
+    .replace(PEM_OPEN_PATTERN, (match, label: string) => (keeps(label) ? match : REDACTION_MARKER));
+}
+
+function scrubUrlUserinfo(url: string): string {
+  return url.replace(URL_USERINFO_PATTERN, `$1${REDACTION_MARKER}@`);
+}
+
+// The key and separator are matched on their own and the value is consumed only when the
+// key names a credential, so the value of an ordinary pair is rescanned and a credential
+// pair nested inside it (data=token=...) is still caught.
+function replaceCredentialAssignments(text: string): string {
+  ASSIGNMENT_KEY_PATTERN.lastIndex = 0;
+  let out = "";
+  let last = 0;
+  let match: RegExpExecArray | null;
+  while ((match = ASSIGNMENT_KEY_PATTERN.exec(text)) !== null) {
+    const [whole, openingQuote, key, separator, operator] = match;
+    if (!isCredentialKey(key)) continue;
+    const valuePattern = operator === ":" ? LINE_VALUE_PATTERN : DELIMITED_VALUE_PATTERN;
+    valuePattern.lastIndex = match.index + whole.length;
+    const value = valuePattern.exec(text)?.[0];
+    if (value === undefined) continue;
+    out += `${text.slice(last, match.index)}${openingQuote}${key}${separator}${REDACTION_MARKER}`;
+    last = match.index + whole.length + value.length;
+    ASSIGNMENT_KEY_PATTERN.lastIndex = last;
+  }
+  return last === 0 ? text : `${out}${text.slice(last)}`;
+}
+
+/** Every carrier rule (guard 1) plus the token shapes a prefix identifies on its own; the long-token rule is left to redactErrorText. */
+function scrubCarriers(text: string, pemScope: PemScope): string {
+  const scrubbed = scrubPem(text, pemScope)
+    .replace(TOKEN_IN_PATH_WEBHOOK_PATTERN, `$1${REDACTION_MARKER}`)
+    .replace(EMBEDDED_URL_PATTERN, scrubUrlUserinfo)
+    .replace(QUERY_PAIR_PATTERN, (match, separator: string, key: string, value: string) => (isCredentialKey(key) || isTokenShapedValue(value) ? `${separator}${key}=${REDACTION_MARKER}` : match))
+    .replace(HEADER_LINE_PATTERN, `$1$2${REDACTION_MARKER}`)
+    .replace(SCHEME_VALUE_PATTERN, (match, scheme: string, value: string) => (PLAIN_WORD_PATTERN.test(value) ? match : `${scheme} ${REDACTION_MARKER}`))
+    .replace(JSON_QUOTED_PAIR_PATTERN, (match, key: string) => (isCredentialKey(key) ? `"${key}":"${REDACTION_MARKER}"` : match))
+    .replace(QUOTED_ATTRIBUTE_PATTERN, (match, key: string, quote: string) => (isCredentialKey(key) ? `${key}=${quote}${REDACTION_MARKER}${quote}` : match));
+  return replaceCredentialAssignments(scrubbed)
+    .replace(JWT_PATTERN, REDACTION_MARKER)
+    .replace(PANOS_API_KEY_PATTERN, REDACTION_MARKER)
+    .replace(AWS_ACCESS_KEY_ID_PATTERN, REDACTION_MARKER);
+}
+
+/** The general scrub for error text: every carrier rule, every PEM block, and the long-token rule. Idempotent. */
+export function redactErrorText(text: string): string {
+  return scrubCarriers(text, "all").replace(LONG_TOKEN_RUN_PATTERN, (run) => (looksLikeToken(run) ? REDACTION_MARKER : run));
+}
+
+/** Guard 2 on its own: every configured secret in every encoded form, for whole payloads and bundle files where the general scrub would remove evidence. */
+export function redactConfiguredSecrets(text: string, secrets: ReadonlyArray<string | undefined>): string {
+  const values = secrets.filter((value): value is string => typeof value === "string" && value.length >= MIN_CONFIGURED_SECRET_LENGTH);
+  if (values.length === 0) return text;
+  return scrubSensitiveValues(text, values).split(REDACTED_VALUE).join(REDACTION_MARKER);
+}
+
+/**
+ * Every string inside a tool result or other plain value, with the configured secrets
+ * removed; a number whose decimal form is a configured secret becomes the marker too.
+ * Structure is never touched, so a short secret that matches a whole token (a PIN, a
+ * word) cannot break the JSON the value is serialized to.
+ */
+function sealValue<T>(value: T, secrets: ReadonlyArray<string | undefined>): T {
+  if (typeof value === "string") return redactConfiguredSecrets(value, secrets) as T;
+  if (typeof value === "number") return (secrets.includes(String(value)) ? REDACTION_MARKER : value) as T;
+  if (Array.isArray(value)) return value.map((item) => sealValue(item, secrets)) as T;
+  if (value && typeof value === "object" && Object.getPrototypeOf(value) === Object.prototype) {
+    const output: JsonRecord = {};
+    for (const [key, entry] of Object.entries(value as JsonRecord)) output[key] = sealValue(entry, secrets);
+    return output as T;
+  }
+  return value;
 }
 
 /** The single sink every persisted or returned error string passes through. */
@@ -520,13 +751,9 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolvePromise) => setTimeout(resolvePromise, ms));
 }
 
-export function redactSecrets(message: string, secrets: Array<string | undefined>): string {
-  let output = message.replace(/([?&](?:key|password|secret|token)=)[^&\s"']+/gi, `$1${REDACTION_MARKER}`);
-  for (const secret of secrets) {
-    if (!secret || secret.length < 4) continue;
-    output = output.split(secret).join(REDACTION_MARKER);
-  }
-  return redactErrorText(output);
+/** The client-side scrub for a thrown message: the configured secrets in every form (guard 2), then the general scrub. */
+export function redactSecrets(message: string, secrets: ReadonlyArray<string | undefined>): string {
+  return redactErrorText(redactConfiguredSecrets(message, secrets));
 }
 
 // A JSON property name is split into lower-case segments on underscores, hyphens,
@@ -547,21 +774,17 @@ const NON_CREDENTIAL_KEY_QUALIFIERS = new Set(["public"]);
 const CREDENTIAL_PAIR_LABEL_KEYS = ["key", "name", "header"];
 const CREDENTIAL_PAIR_VALUE_KEYS = new Set(["value", "default", "default_value"]);
 
-// Credentials carried inside string values rather than under a credential-named key:
-// URL query parameters (?token=, &api_key=), URL userinfo (https://user:pass@host),
-// webhook services whose URL path is the secret (Slack, Discord, Microsoft Teams), and
-// JSON encoded as a string. Applied to every string kept in a snapshot.
-const URL_QUERY_CREDENTIAL_PATTERN = /([?&](?:token|key|api_key|apikey|secret|password|passwd|access_token|refresh_token|auth|auth_token|signature|sig|client_secret|access_key|secret_key|private_token|integration_key)=)[^&#\s"'<>]+/gi;
-const URL_USERINFO_PATTERN = /(https?:\/\/)[^\s/@"'<>]+:[^\s/@"'<>]+@/gi;
-const TOKEN_IN_PATH_WEBHOOK_PATTERN = /(https?:\/\/(?:hooks\.slack\.com\/services|discord(?:app)?\.com\/api\/webhooks|[a-z0-9.-]*webhook\.office\.com\/webhookb2)\/)[^\s"'<>]+/gi;
-const JSON_STRING_CREDENTIAL_PATTERN = /("(?:token|auth_token|authToken|refresh_token|access_token|secret|client_secret|clientSecret|signing_secret|password|passwd|passphrase|api_key|apiKey|private_key|privateKey|secret_key|secretKey|access_key|integration_key|integrationKey|authorization)"\s*:\s*")[^"]*(")/gi;
-
+/**
+ * The scrub for credentials carried inside string values rather than under a
+ * credential-named key: every carrier rule of redactErrorText (URL userinfo and
+ * credential query pairs; webhook services whose URL path is the secret; header,
+ * cookie, scheme, and credential-pair carriers; JSON encoded as a string; private
+ * PEM blocks) without the long-token rule, because a policy id, resource id, or hash
+ * in evidence is not a secret, and with public PEM blocks kept because a certificate
+ * is evidence. Applied to every string kept in a snapshot.
+ */
 export function redactCredentialValueText(text: string): string {
-  return text
-    .replace(URL_QUERY_CREDENTIAL_PATTERN, `$1${REDACTION_MARKER}`)
-    .replace(URL_USERINFO_PATTERN, `$1${REDACTION_MARKER}@`)
-    .replace(TOKEN_IN_PATH_WEBHOOK_PATTERN, `$1${REDACTION_MARKER}`)
-    .replace(JSON_STRING_CREDENTIAL_PATTERN, `$1${REDACTION_MARKER}$2`);
+  return scrubCarriers(text, "private");
 }
 
 function propertyNameSegments(name: string): string[] {
@@ -675,10 +898,17 @@ async function nextAvailableAuditDir(root: string, preferredName: string): Promi
   throw new Error(`Unable to allocate output directory under ${root}`);
 }
 
-async function writeSecureTextFile(rootDir: string, relativePathname: string, content: string): Promise<void> {
+/** Writes one bundle file; every configured secret is removed from the content first, in every encoded form (guard 2). */
+async function writeSecureTextFile(rootDir: string, relativePathname: string, content: string, secrets: ReadonlyArray<string | undefined> = []): Promise<void> {
   const destination = resolveSecureOutputPath(rootDir, relativePathname);
   ensurePrivateDir(dirname(destination));
-  await writeFile(destination, content, { encoding: "utf8", mode: 0o600 });
+  await writeFile(destination, redactConfiguredSecrets(content, secrets), { encoding: "utf8", mode: 0o600 });
+}
+
+/** Writes one JSON bundle file; the configured secrets are removed value by value before serialization so the file stays valid JSON. */
+async function writeSecureJsonFile(rootDir: string, relativePathname: string, value: unknown, secrets: ReadonlyArray<string | undefined>): Promise<void> {
+  const plain: unknown = JSON.parse(JSON.stringify(value));
+  await writeSecureTextFile(rootDir, relativePathname, serializeJson(sealValue(plain, secrets)));
 }
 
 async function createZipArchive(sourceDir: string, zipPath: string): Promise<void> {
@@ -1401,6 +1631,11 @@ export class PrismaCloudClient {
     return this.config.apiUrl;
   }
 
+  /** The credentials this client was configured with, for the boundary scrub (guard 2). */
+  get knownSecrets(): string[] {
+    return this.http.secrets.filter((secret): secret is string => typeof secret === "string");
+  }
+
   private async login(): Promise<string> {
     const endpoint = "POST /login";
     const response = await fetchWithRetry(`${this.config.apiUrl}/login`, {
@@ -1761,6 +1996,11 @@ export class PanosApiClient {
     return this.verifyTls;
   }
 
+  /** The credentials this client holds, including the key keygen returned, for the boundary scrub (guard 2). */
+  get knownSecrets(): string[] {
+    return this.http.secrets.filter((secret): secret is string => typeof secret === "string");
+  }
+
   /**
    * A body without a <response> element (an HTML proxy or captive-portal page,
    * a JSON error from a load balancer) is described by status, content type,
@@ -2103,6 +2343,23 @@ export function createPaloaltoClients(config: PaloaltoResolvedConfig, fetchImpl?
     compute: prisma && config.computeUrl ? new PrismaComputeClient(config.computeUrl, prisma) : undefined,
     panos: config.panos.map((host) => new PanosApiClient(host, { ...options, verifyTls: config.verifyTls })),
   };
+}
+
+/**
+ * Every configured credential the clients hold (the Prisma Cloud access key ID and
+ * secret key, each PAN-OS API key and keygen password, and the key keygen returned),
+ * for the tool boundary and the bundle writer, which remove them from the whole
+ * payload in every encoded form (guard 2).
+ */
+export function configuredSecrets(clients: PaloaltoClients): string[] {
+  const values = [
+    clients.config.prisma?.accessKeyId,
+    clients.config.prisma?.secretKey,
+    ...clients.config.panos.flatMap((host) => [host.apiKey, host.password]),
+    ...(clients.prisma?.knownSecrets ?? []),
+    ...clients.panos.flatMap((client) => client.knownSecrets ?? []),
+  ];
+  return [...new Set(values.filter((value): value is string => typeof value === "string" && value.length >= MIN_CONFIGURED_SECRET_LENGTH))];
 }
 
 /**
@@ -3839,9 +4096,13 @@ export async function exportPaloaltoAuditBundle(
   ensurePrivateDir(outputRoot);
   const label = safeDirName(config.prisma ? new URL(config.prisma.apiUrl).hostname : config.panos[0]?.host ?? "paloalto");
   const outputDir = await nextAvailableAuditDir(outputRoot, `${label}-audit-bundle`);
+  // Collected after the reads so the key PAN-OS keygen returned is included.
+  const secrets = configuredSecrets(clients);
+  const write = (relativePathname: string, content: string) => writeSecureTextFile(outputDir, relativePathname, content, secrets);
+  const writeJson = (relativePathname: string, value: unknown) => writeSecureJsonFile(outputDir, relativePathname, value, secrets);
 
-  await writeSecureTextFile(outputDir, "QUICK_REFERENCE.md", `${buildQuickReference(access, assessments)}\n`);
-  await writeSecureTextFile(outputDir, "metadata.json", serializeJson({
+  await write("QUICK_REFERENCE.md", `${buildQuickReference(access, assessments)}\n`);
+  await writeJson("metadata.json", {
     generated_at: new Date().toISOString(),
     prisma_api_url: config.prisma?.apiUrl ?? null,
     prisma_compute_url: prismaSnapshot?.compute?.consoleUrl ?? null,
@@ -3849,26 +4110,26 @@ export async function exportPaloaltoAuditBundle(
     tls_verification: config.verifyTls,
     tls_verification_scope: config.verifyTls ? "all requests" : "disabled for PAN-OS requests only",
     source_chain: config.sourceChain,
-  }));
-  await writeSecureTextFile(outputDir, "core_data/access.json", serializeJson(access));
+  });
+  await writeJson("core_data/access.json", access);
   if (prismaSnapshot) {
-    await writeSecureTextFile(outputDir, "core_data/prisma_cloud.json", serializeJson(prismaSnapshotToJson(prismaSnapshot)));
+    await writeJson("core_data/prisma_cloud.json", prismaSnapshotToJson(prismaSnapshot));
   }
   for (const snapshot of deviceSnapshots) {
-    await writeSecureTextFile(outputDir, `core_data/panos_${safeDirName(snapshot.host)}.json`, serializeJson(panosSnapshotToJson(snapshot)));
+    await writeJson(`core_data/panos_${safeDirName(snapshot.host)}.json`, panosSnapshotToJson(snapshot));
   }
-  await writeSecureTextFile(outputDir, "analysis/findings.json", serializeJson(findings));
+  await writeJson("analysis/findings.json", findings);
   const analysisNames = ["cloud_posture", "firewall_policy", "threat_prevention", "device_hardening"];
   for (const [index, assessment] of assessments.entries()) {
-    await writeSecureTextFile(outputDir, `analysis/${analysisNames[index]}.json`, serializeJson(assessment));
+    await writeJson(`analysis/${analysisNames[index]}.json`, assessment);
   }
-  await writeSecureTextFile(outputDir, "compliance/executive_summary.md", `${buildExecutiveSummary(config, assessments)}\n`);
-  await writeSecureTextFile(outputDir, "compliance/unified_compliance_matrix.md", `${buildComplianceMatrix(findings)}\n`);
+  await write("compliance/executive_summary.md", `${buildExecutiveSummary(config, assessments)}\n`);
+  await write("compliance/unified_compliance_matrix.md", `${buildComplianceMatrix(findings)}\n`);
   for (const framework of FRAMEWORK_ORDER) {
-    await writeSecureTextFile(outputDir, `compliance/${FRAMEWORK_FILES[framework]}`, `${buildFrameworkReport(framework, findings)}\n`);
+    await write(`compliance/${FRAMEWORK_FILES[framework]}`, `${buildFrameworkReport(framework, findings)}\n`);
   }
   if (errors.length > 0) {
-    await writeSecureTextFile(outputDir, "_errors.log", `${errors.join("\n")}\n`);
+    await write("_errors.log", `${errors.join("\n")}\n`);
   }
 
   const zipPath = resolveSecureOutputPath(outputRoot, `${basename(outputDir)}.zip`);
@@ -3938,8 +4199,44 @@ const authParams = {
   timeout_seconds: Type.Optional(Type.Number({ description: "HTTP timeout in seconds. Defaults to 30.", default: 30 })),
 };
 
-function toolError(tool: string, label: string, error: unknown) {
+type ToolResult = ReturnType<typeof textResult> & { isError?: boolean };
+
+function toolError(tool: string, label: string, error: unknown): ToolResult {
   return errorResult(`${label} failed: ${errorMessage(error)}`, { tool });
+}
+
+/** Credentials passed as arguments or present in the environment, known before the clients exist. */
+function argumentSecrets(args: AuthArgs): string[] {
+  return [
+    args.prisma_access_key_id,
+    args.prisma_secret_key,
+    args.panos_api_key,
+    args.panos_password,
+    process.env.PRISMA_ACCESS_KEY_ID,
+    process.env.PRISMA_SECRET_KEY,
+    process.env.PANOS_API_KEY,
+    process.env.PANOS_PASSWORD,
+  ].filter((value): value is string => typeof value === "string");
+}
+
+/**
+ * Runs one tool and removes every configured secret from the whole result (guard 2):
+ * the text rendering and the structured details alike, whether the run succeeded or
+ * the catch block rendered the error. The secrets are gathered after the run so the
+ * key PAN-OS keygen returned is included.
+ */
+async function runSealed(tool: string, label: string, args: AuthArgs, run: (clients: PaloaltoClients) => Promise<ToolResult>): Promise<ToolResult> {
+  const secrets = new Set<string>(argumentSecrets(args));
+  let clients: PaloaltoClients | undefined;
+  try {
+    clients = createClients(args);
+    const result = await run(clients);
+    for (const secret of configuredSecrets(clients)) secrets.add(secret);
+    return sealValue(result, [...secrets]);
+  } catch (error) {
+    for (const secret of clients ? configuredSecrets(clients) : []) secrets.add(secret);
+    return sealValue(toolError(tool, label, error), [...secrets]);
+  }
 }
 
 export function registerPaloaltoTools(pi: any): void {
@@ -3951,12 +4248,10 @@ export function registerPaloaltoTools(pi: any): void {
     parameters: Type.Object(authParams),
     prepareArguments: normalizeAuthArgs,
     async execute(_toolCallId: string, args: AuthArgs) {
-      try {
-        const result = await checkPaloaltoAccess(createClients(args));
+      return runSealed("paloalto_check_access", "Palo Alto access check", args, async (clients) => {
+        const result = await checkPaloaltoAccess(clients);
         return textResult(formatAccessCheckText(result), { tool: "paloalto_check_access", ...result });
-      } catch (error) {
-        return toolError("paloalto_check_access", "Palo Alto access check", error);
-      }
+      });
     },
   });
 
@@ -3972,15 +4267,13 @@ export function registerPaloaltoTools(pi: any): void {
     }),
     prepareArguments: normalizeCloudPostureArgs,
     async execute(_toolCallId: string, args: CloudPostureArgs) {
-      try {
-        const result = await assessPaloaltoCloudPosture(createClients(args), {
+      return runSealed("paloalto_assess_cloud_posture", "Palo Alto cloud posture assessment", args, async (clients) => {
+        const result = await assessPaloaltoCloudPosture(clients, {
           alertLimit: args.alert_limit,
           minCompliancePassRate: args.min_compliance_pass_rate,
         });
         return textResult(formatAssessmentText(result), { tool: "paloalto_assess_cloud_posture", ...result });
-      } catch (error) {
-        return toolError("paloalto_assess_cloud_posture", "Palo Alto cloud posture assessment", error);
-      }
+      });
     },
   });
 
@@ -3992,12 +4285,10 @@ export function registerPaloaltoTools(pi: any): void {
     parameters: Type.Object(authParams),
     prepareArguments: normalizeAuthArgs,
     async execute(_toolCallId: string, args: AuthArgs) {
-      try {
-        const result = await assessPaloaltoFirewallPolicy(createClients(args));
+      return runSealed("paloalto_assess_firewall_policy", "Palo Alto firewall policy assessment", args, async (clients) => {
+        const result = await assessPaloaltoFirewallPolicy(clients);
         return textResult(formatAssessmentText(result), { tool: "paloalto_assess_firewall_policy", ...result });
-      } catch (error) {
-        return toolError("paloalto_assess_firewall_policy", "Palo Alto firewall policy assessment", error);
-      }
+      });
     },
   });
 
@@ -4009,12 +4300,10 @@ export function registerPaloaltoTools(pi: any): void {
     parameters: Type.Object(authParams),
     prepareArguments: normalizeAuthArgs,
     async execute(_toolCallId: string, args: AuthArgs) {
-      try {
-        const result = await assessPaloaltoThreatPrevention(createClients(args));
+      return runSealed("paloalto_assess_threat_prevention", "Palo Alto threat prevention assessment", args, async (clients) => {
+        const result = await assessPaloaltoThreatPrevention(clients);
         return textResult(formatAssessmentText(result), { tool: "paloalto_assess_threat_prevention", ...result });
-      } catch (error) {
-        return toolError("paloalto_assess_threat_prevention", "Palo Alto threat prevention assessment", error);
-      }
+      });
     },
   });
 
@@ -4029,12 +4318,10 @@ export function registerPaloaltoTools(pi: any): void {
     }),
     prepareArguments: normalizeDeviceHardeningArgs,
     async execute(_toolCallId: string, args: DeviceHardeningArgs) {
-      try {
-        const result = await assessPaloaltoDeviceHardening(createClients(args), { maxSuperusers: args.max_superusers });
+      return runSealed("paloalto_assess_device_hardening", "Palo Alto device hardening assessment", args, async (clients) => {
+        const result = await assessPaloaltoDeviceHardening(clients, { maxSuperusers: args.max_superusers });
         return textResult(formatAssessmentText(result), { tool: "paloalto_assess_device_hardening", ...result });
-      } catch (error) {
-        return toolError("paloalto_assess_device_hardening", "Palo Alto device hardening assessment", error);
-      }
+      });
     },
   });
 
@@ -4052,8 +4339,7 @@ export function registerPaloaltoTools(pi: any): void {
     }),
     prepareArguments: normalizeExportArgs,
     async execute(_toolCallId: string, args: ExportAuditBundleArgs) {
-      try {
-        const clients = createClients(args);
+      return runSealed("paloalto_export_audit_bundle", "Palo Alto audit bundle export", args, async (clients) => {
         const outputRoot = resolve(process.cwd(), args.output_dir?.trim() || DEFAULT_OUTPUT_DIR);
         const result = await exportPaloaltoAuditBundle(clients, outputRoot, {
           alertLimit: args.alert_limit,
@@ -4078,9 +4364,7 @@ export function registerPaloaltoTools(pi: any): void {
             error_count: result.errorCount,
           },
         );
-      } catch (error) {
-        return toolError("paloalto_export_audit_bundle", "Palo Alto audit bundle export", error);
-      }
+      });
     },
   });
 }

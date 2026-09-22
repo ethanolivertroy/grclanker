@@ -53,6 +53,12 @@ import { assertSecretsAbsent, readBundleFiles, readZipEntries } from "./helpers/
 
 const noSleep = async () => {};
 
+// The configured Prisma Cloud secret key of every fixture. It is a configured secret, so
+// the tool boundary and the bundle writer remove it wherever it appears (guard 2); a
+// realistic shape keeps it from colliding with a JSON property name such as "secret",
+// which a whole-token match on a short word would erase from the written files.
+const FIXTURE_SECRET_KEY = "fixture-secret-key-Q7wR2tY8uI3o";
+
 function createTempBase(prefix) {
   return mkdtempSync(join(tmpdir(), prefix));
 }
@@ -820,7 +826,7 @@ function bothProductsConfig() {
   return resolvePaloaltoConfiguration({}, {
     PRISMA_API_URL: "https://api2.prismacloud.io",
     PRISMA_ACCESS_KEY_ID: "key",
-    PRISMA_SECRET_KEY: "secret",
+    PRISMA_SECRET_KEY: FIXTURE_SECRET_KEY,
     PANOS_HOST: "fw1.example.com",
     PANOS_API_KEY: "LUFRPT-key",
   });
@@ -1387,7 +1393,7 @@ function sweepConfig() {
     ...resolvePaloaltoConfiguration({}, {
       PRISMA_API_URL: "https://api2.prismacloud.io",
       PRISMA_ACCESS_KEY_ID: "key",
-      PRISMA_SECRET_KEY: "secret",
+      PRISMA_SECRET_KEY: FIXTURE_SECRET_KEY,
       PANOS_HOST: PANOS_SWEEP_HOSTS.join(","),
       PANOS_USERNAME: "auditor",
       PANOS_PASSWORD: "hunter2",
@@ -1515,7 +1521,7 @@ test("the registered tools scrub error strings end to end over HTTP: access chec
   const baseArgs = {
     prisma_api_url: `http://127.0.0.1:${port}/prisma`,
     prisma_access_key_id: "key",
-    prisma_secret_key: "secret",
+    prisma_secret_key: FIXTURE_SECRET_KEY,
     panos_hosts: `http://127.0.0.1:${port}/panos`,
     panos_api_key: "LUFRPT-key",
   };
@@ -2060,7 +2066,7 @@ test("PrismaComputeClient authenticates with a Compute token, falls back to the 
     }
     return jsonResponse({});
   };
-  const cspm = new PrismaCloudClient({ apiUrl: "https://api2.prismacloud.io", accessKeyId: "key", secretKey: "secret" }, { fetchImpl });
+  const cspm = new PrismaCloudClient({ apiUrl: "https://api2.prismacloud.io", accessKeyId: "key", secretKey: FIXTURE_SECRET_KEY }, { fetchImpl });
   const compute = new PrismaComputeClient("https://compute.example.com/", cspm);
   const defenders = await compute.listDefenders();
   assert.equal(defenders.items.length, 51);
@@ -2276,7 +2282,7 @@ function twoDeviceConfig(extra = {}) {
     ...resolvePaloaltoConfiguration({}, {
       PRISMA_API_URL: "https://api2.prismacloud.io",
       PRISMA_ACCESS_KEY_ID: "key",
-      PRISMA_SECRET_KEY: "secret",
+      PRISMA_SECRET_KEY: FIXTURE_SECRET_KEY,
       PANOS_HOST: "fw1.example.com,fw2.example.com",
       PANOS_API_KEY: "LUFRPT-key",
       ...extra,
@@ -2409,7 +2415,7 @@ test("review fix 3: PA-08 and PA-09 gate on the Defender population and never pa
 test("review fix 4: integrations are read from the tenant-scoped microservice path when login returns a prismaId", async () => {
   const calls = [];
   const client = new PrismaCloudClient(
-    { apiUrl: "https://api2.prismacloud.io", accessKeyId: "key", secretKey: "secret" },
+    { apiUrl: "https://api2.prismacloud.io", accessKeyId: "key", secretKey: FIXTURE_SECRET_KEY },
     {
       fetchImpl: async (input) => {
         const url = new URL(input);
@@ -2428,7 +2434,7 @@ test("review fix 4: integrations are read from the tenant-scoped microservice pa
   assert.ok(!calls.includes("/integration"));
 
   const fallback = new PrismaCloudClient(
-    { apiUrl: "https://api2.prismacloud.io", accessKeyId: "key", secretKey: "secret" },
+    { apiUrl: "https://api2.prismacloud.io", accessKeyId: "key", secretKey: FIXTURE_SECRET_KEY },
     {
       fetchImpl: async (input) => {
         const url = new URL(input);
