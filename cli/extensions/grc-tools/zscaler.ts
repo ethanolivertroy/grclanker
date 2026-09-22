@@ -12,7 +12,6 @@ import {
   existsSync,
   lstatSync,
   mkdirSync,
-  readFileSync,
   realpathSync,
 } from "node:fs";
 import { chmod, readdir, writeFile } from "node:fs/promises";
@@ -20,7 +19,7 @@ import { homedir } from "node:os";
 import { basename, dirname, join, relative, resolve } from "node:path";
 import { ZipArchive } from "archiver";
 import { Type } from "@sinclair/typebox";
-import { YAMLError, parse as parseYaml } from "yaml";
+import { ConfigFileError, readYamlConfig } from "./hardening/index.js";
 import { errorResult, formatTable, textResult } from "./shared.js";
 
 type FetchImpl = typeof fetch;
@@ -548,41 +547,20 @@ function overlayFromEnv(env: NodeJS.ProcessEnv): ConfigOverlay {
   };
 }
 
-const SYSTEM_ERROR_CODE = /^E[A-Z0-9_]{1,30}$/;
-
-/** The `code` of a Node system error (EACCES, EISDIR, ENOENT): a fixed identifier, never the message. */
-function systemErrorCode(error: unknown): string | undefined {
-  const code = asObject(error)?.code;
-  return typeof code === "string" && SYSTEM_ERROR_CODE.test(code) ? code : undefined;
-}
-
-/** The first line the YAML parser points at, when it reports one (an unresolved alias throws a plain ReferenceError). */
-function yamlErrorLine(error: unknown): number | undefined {
-  return error instanceof YAMLError ? error.linePos?.[0]?.line : undefined;
-}
+const CONFIG_FILE_OPTIONS = { label: "Zscaler" } as const;
 
 /**
- * Reads and parses the config file without interpolating either library message: the YAML parser quotes the offending
- * source line, which for a malformed `apiKey:` line is the credential itself, and the filesystem message carries its
- * own wording and the path. The thrown text is fixed, plus the path, the parser's line number when it gives one, and
- * the system error code when the read failed.
+ * Reads and parses the config file through the shared loader, which interpolates neither library message: the YAML
+ * parser quotes the offending source line, which for a malformed `apiKey:` line is the credential itself, and the
+ * filesystem message carries its own wording and the path. The thrown text is fixed, plus the path, the parser's
+ * structured position and code when it gives them, and the system error code when the read failed. The caller has
+ * already checked the path exists, so the missing-file result is a race with a deletion and is reported as the read
+ * failure it is.
  */
 function readConfigFile(pathname: string): JsonRecord {
-  let text: string;
-  try {
-    text = readFileSync(pathname, "utf8");
-  } catch (error) {
-    const code = systemErrorCode(error);
-    throw new Error(`Unable to read Zscaler config file ${pathname}${code ? ` (${code})` : ""}`);
-  }
-  let parsed: unknown;
-  try {
-    parsed = parseYaml(text);
-  } catch (error) {
-    const line = yamlErrorLine(error);
-    throw new Error(`Unable to parse Zscaler config file: invalid YAML in ${pathname}${line === undefined ? "" : ` at line ${line}`}`);
-  }
-  return asObject(parsed) ?? {};
+  const read = readYamlConfig(pathname, CONFIG_FILE_OPTIONS);
+  if (!read.ok) throw new ConfigFileError({ kind: "read", path: pathname, code: "ENOENT", label: CONFIG_FILE_OPTIONS.label });
+  return asObject(read.value) ?? {};
 }
 
 function overlayFromConfigFile(pathname: string): ConfigOverlay {
