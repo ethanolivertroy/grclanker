@@ -7,6 +7,7 @@ import {
   formatSystemResources,
   getComputeBackendConfigurationIssues,
   getComputeBackendLabel,
+  getComputeProfileIssues,
   getParallelsTemplateInfo,
   getParallelsVmInfo,
   listParallelsTemplates,
@@ -80,7 +81,10 @@ export async function runComputeDoctor(): Promise<void> {
     console.log(`     ${status.detail}`);
   }
 
-  const configurationIssues = getComputeBackendConfigurationIssues(settings, preferredBackend);
+  const configurationIssues = [
+    ...getComputeBackendConfigurationIssues(settings, preferredBackend),
+    ...getComputeProfileIssues(settings),
+  ];
   if (configurationIssues.length > 0) {
     console.log("");
     console.log("Configuration issues:");
