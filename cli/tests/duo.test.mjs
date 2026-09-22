@@ -20,6 +20,7 @@ import {
   collectDuoAdminAccessData,
   collectDuoIntegrationData,
   collectDuoMonitoringData,
+  duoFixedTexts,
   projectCollectionStatus,
   redactBypassCodeRecords,
   redactErrorText,
@@ -53,6 +54,7 @@ import {
   parserSnippetBody,
   shortBodyResponse,
 } from "./helpers/error-canaries.mjs";
+import { assertFixedTextsSurvive, assertMustKeepRows, assertMustRedactRowsBesideMustKeep } from "./helpers/redaction-table.mjs";
 
 function createTempBase(prefix) {
   return mkdtempSync(join(tmpdir(), prefix));
@@ -1916,6 +1918,7 @@ test("rule 9 scrub boundary: name-shaped values stay bare, any value in a carrie
       "bypass code inventory is empty but GET /admin/v1/settings could not be read (403 Forbidden)",
       "allowed_auth_methods could not be read from GET /admin/v1/settings",
       "policy Global-Policy-2026 allows sms_passcodes",
+      ...duoFixedTexts(),
     ],
   });
   for (const form of encodedFormsOf(DUO_IKEY_CANARY)) {
@@ -1923,6 +1926,125 @@ test("rule 9 scrub boundary: name-shaped values stay bare, any value in a carrie
     assert.equal(output, "Duo rejected integration [REDACTED] for this host", `the integration key is a configured secret removed whatever its shape: ${form}`);
     assertNoCanaryWindows(assert, output, [DUO_IKEY_CANARY], `integration key form ${form}`);
   }
+});
+
+test("rule 9 fixed texts (GWS note 1): every fixed-text message the integration emits survives redactErrorText unchanged, from the SyntaxError and non-JSON notes through the was not attempted and not collected wordings to the unread evidence lines and the capped-verdict prose", () => {
+  const texts = duoFixedTexts();
+  assertFixedTextsSurvive(assert, redactErrorText, texts, { minimum: 30 });
+  for (const required of [
+    "SyntaxError: response could not be parsed as JSON; the parser's message is not recorded because it quotes the body",
+    "/admin/v1/logs/offline_enrollment was not attempted: this client does not expose it.",
+    "/admin/v1/info/summary was not attempted: this client does not expose it.",
+    "not collected: this client does not expose the endpoint, so no request was attempted",
+    "Access forbidden: Insufficient permissions",
+    "Duo API request failed for /admin/v1/settings (403 Forbidden): Access forbidden: Insufficient permissions",
+    "Duo API request failed for /admin/v1/settings (network error: fetch failed)",
+    "Duo API request returned an unexpected payload for /admin/v1/settings",
+    "Duo API request exceeded retry budget for /admin/v1/settings (429 Too Many Requests).",
+    "/admin/v1/settings (403 Forbidden): Access forbidden: Insufficient permissions",
+    "users: unread",
+    "bypass codes: unread",
+    "helpdesk_bypass_expiration=unread",
+    "Remaining telephony credits could not be read, so telephony capacity cannot be confirmed (unknown credits never support Pass).",
+  ]) {
+    assert.ok(texts.includes(required), `the fixed-text list carries: ${required}`);
+  }
+  assert.ok(texts.some((text) => HTML_BODY_NOTE.test(text)), "the fixed-text list carries the non-JSON body note");
+  assert.ok(texts.some((text) => /^No active bypass codes were returned, but help desk issuance limits could not be read: \/admin\/v1\/settings \(403 Forbidden\): .* The zero-code verdict is capped at Partial\.$/.test(text)), "the capped zero-code verdict wording is in the list");
+  assert.ok(texts.some((text) => /^admin_allowed_auth_methods=unread \(\/admin\/v1\/admins\/allowed_auth_methods \(403 Forbidden\): .*; requires Grant administrators - Read\); administrator WebAuthn posture was not confirmed\.$/.test(text)), "the unread admin auth-methods evidence line is in the list");
+
+  // The renderings the client throws, built the way requestJson and parseDetailFromBody build them, survive too.
+  const thrown = [
+    "Duo API request failed for /admin/v1/settings (403 Forbidden): Access forbidden: Insufficient permissions",
+    "Duo API request failed for /admin/v2/logs/telephony (502 Bad Gateway): non-JSON body (text/html, 5120 bytes)",
+    "Duo API request returned an unexpected payload for /admin/v1/settings: non-JSON body (text/plain, 21 bytes)",
+    "Duo API request failed for /admin/v1/users (401 Unauthorized): Invalid signature in request credentials",
+  ];
+  for (const message of thrown) {
+    assert.equal(redactErrorText(message), message, `the thrown rendering survives the scrub: ${message}`);
+  }
+});
+
+test("rule 9 must-keep and must-redact table (addendum 7): every endpoint path, name, principal, status text, finding id, and fixed text the summaries, markers, probes, and evidence rely on survives redactErrorText alone and inside a realistic summary sentence, and every canary planted in every carrier beside one of them is removed while the row survives (extends the rule 9 scrub boundary fixed texts)", () => {
+  const groups = [
+    {
+      label: "endpoint paths",
+      values: [
+        "/admin/v1/settings",
+        "/admin/v1/info/summary",
+        "/admin/v1/info/authentication_attempts",
+        "/admin/v1/admins/allowed_auth_methods",
+        "/admin/v1/admins",
+        "/admin/v1/users",
+        "/admin/v1/bypass_codes",
+        "/admin/v1/webauthncredentials",
+        "/admin/v1/logs/offline_enrollment",
+        "/admin/v1/trust_monitor/events",
+        "/admin/v2/policies/global",
+        "/admin/v2/policies",
+        "/admin/v2/logs/authentication",
+        "/admin/v2/logs/activity",
+        "/admin/v2/logs/telephony",
+        "/admin/v3/integrations",
+        "GET /admin/v1/admins/allowed_auth_methods",
+        "https://api-example.duosecurity.com/admin/v1/settings",
+      ],
+      sentence: (value) => `Duo API request failed for ${value} (403 Forbidden): Access forbidden: Insufficient permissions`,
+    },
+    {
+      label: "names",
+      values: [
+        "api-example.duosecurity.com",
+        "Global Policy",
+        "Global-Policy-2026",
+        "prod-us-east-2026",
+        "Read-only Admin API",
+        "grclanker audit",
+        "Security key",
+        "VPN",
+        "helpdesk_bypass",
+        "helpdesk_bypass_expiration",
+        "allowed_auth_methods",
+        "sms_passcodes",
+        "Grant administrators - Read",
+        "Grant resource - Read",
+        "Grant settings",
+      ],
+      sentence: (value) => `${value} could not be read (403 Forbidden); it is rendered unread, its count is null, and the verdict is capped at Partial.`,
+    },
+    {
+      label: "principals",
+      values: ["owner@example.gov", "helpdesk@example.gov", "break-glass@example.gov", "jsmith", "svc-deploy", "Owner", "Help Desk"],
+      sentence: (value) => `Administrator ${value} could not be checked because /admin/v1/admins/allowed_auth_methods returned 403 Forbidden; the WebAuthn posture is unread.`,
+    },
+    {
+      label: "status text",
+      values: [
+        "401 Unauthorized",
+        "403 Forbidden",
+        "429 Too Many Requests",
+        "502 Bad Gateway",
+        "200 OK",
+        "network error: fetch failed",
+        "Access forbidden: Insufficient permissions",
+        "Invalid signature in request credentials",
+        "non-JSON body (text/html, 5120 bytes)",
+      ],
+      sentence: (value) => `GET /admin/v1/settings returned ${value}, so help desk issuance limits must be collected manually.`,
+    },
+    {
+      label: "finding ids",
+      values: ["DUO-AUTH-001", "DUO-AUTH-006", "DUO-AUTH-010", "DUO-ADMIN-002", "DUO-INTEGRATIONS-003", "DUO-MON-005"],
+      sentence: (value) => `${value} /admin/v1/settings: 403 Forbidden`,
+    },
+    {
+      label: "fixed texts",
+      values: duoFixedTexts(),
+      sentence: (value) => `DUO-AUTH-006 ${value}`,
+    },
+  ];
+  assertMustKeepRows(assert, redactErrorText, groups);
+  assertMustRedactRowsBesideMustKeep(assert, redactErrorText, groups);
 });
 
 const DUO_ACCESS_PROBE_PATHS = new Set([

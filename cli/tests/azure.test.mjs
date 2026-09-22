@@ -21,6 +21,7 @@ import {
   assessAzureMonitoring,
   assessAzureNetworkAndPolicy,
   assessAzureSubscriptionGuardrails,
+  azureFixedTexts,
   checkAzureAccess,
   describeErrorBody,
   exportAzureAuditBundle,
@@ -56,6 +57,7 @@ import {
   parserSnippetBody,
   shortBodyResponse,
 } from "./helpers/error-canaries.mjs";
+import { assertFixedTextsSurvive, assertMustKeepRows, assertMustRedactRowsBesideMustKeep } from "./helpers/redaction-table.mjs";
 import { getRegisteredToolSummaries, groupRegisteredTools } from "../dist/pi/tool-catalog.js";
 import { readBundleFiles, readZipEntries } from "./helpers/bundle-contents.mjs";
 
@@ -527,8 +529,128 @@ test("rule 9 scrub boundary: name-shaped values stay bare, any value in a carrie
       "GET /subscriptions/sub-123/providers/Microsoft.KeyVault/vaults (502 Bad Gateway): non-JSON body (text/html, 5120 bytes)",
       "SyntaxError: response could not be parsed as JSON; the parser's message is not recorded because it quotes the body",
       "mailbox settings for user-2026@contoso.example could not be read (ErrorAccessDenied: MailboxSettings.Read)",
+      ...azureFixedTexts(),
     ],
   });
+});
+
+test("rule 9 fixed texts (GWS note 1): every fixed-text message the integration emits survives redactErrorText unchanged, from the SyntaxError and non-JSON notes through the token-failure and not-attempted wordings to every AzureApiError rendering the client throws", () => {
+  const texts = azureFixedTexts();
+  assertFixedTextsSurvive(assert, redactErrorText, texts, { minimum: 40 });
+  for (const required of [
+    "SyntaxError: response could not be parsed as JSON; the parser's message is not recorded because it quotes the body",
+    "not attempted: the token request failed, so no Microsoft Graph request was made",
+    "not attempted: the token request failed, so no Azure Resource Manager request was made",
+    "not attempted: this client does not expose listNetworkWatchers, so no request was made.",
+    "Token request failed: 403 Forbidden",
+    "Token response did not include access_token.",
+    "401 Unauthorized",
+    "403 Forbidden",
+    "402 Payment Required (license)",
+  ]) {
+    assert.ok(texts.includes(required), `the fixed-text list carries: ${required}`);
+  }
+  assert.ok(texts.some((text) => HTML_BODY_NOTE.test(text)), "the fixed-text list carries the non-JSON body note");
+  assert.ok(texts.some((text) => /^POST \/tenant-123\/oauth2\/v2\.0\/token returned 403 Forbidden, so no Azure Resource Manager request was made for this finding\./.test(text)), "the token-failure finding summary is in the list");
+  assert.ok(texts.some((text) => /^AZURE-ID-01 POST \/tenant-123\/oauth2\/v2\.0\/token: 401 Unauthorized; no Microsoft Graph request was made$/.test(text)), "the token-failure error-log line is in the list");
+
+  // The renderings the client throws, built the way getToken, requestJson, and parseJsonBody build them.
+  const tokenUrl = "https://login.microsoftonline.com/tenant-123/oauth2/v2.0/token";
+  const thrown = [
+    new AzureApiError(`Token request failed: 401 Unauthorized: ${describeErrorBody(JSON.stringify({ error: "invalid_client", error_description: "AADSTS7000215: Invalid client secret provided." }), "application/json")}`, tokenUrl, 401),
+    new AzureApiError(`403 Forbidden: ${describeErrorBody(JSON.stringify({ error: { code: "Authorization_RequestDenied", message: "Insufficient privileges to complete the operation." } }), "application/json")}`, "https://graph.microsoft.com/v1.0/directoryRoles", 403),
+    new AzureApiError(`502 Bad Gateway: ${describeErrorBody("<html><body>Bad Gateway</body></html>", "text/html")}`, "https://management.azure.com/subscriptions/sub-123/providers/Microsoft.KeyVault/vaults", 502),
+    new AzureApiError(`Request returned 200 OK: ${describeErrorBody("<html><body>login</body></html>", "text/html")}`, "https://graph.microsoft.com/v1.0/organization", 200),
+    new AzureApiError("Token response did not include access_token.", tokenUrl),
+  ];
+  for (const error of thrown) {
+    assert.equal(error.name, "AzureApiError");
+    assert.equal(redactErrorText(error.message), error.message, `the thrown rendering survives the scrub: ${error.message}`);
+  }
+});
+
+test("rule 9 must-keep and must-redact table (addendum 7): every endpoint path, name, principal, status text, finding id, and fixed text the summaries, markers, probes, and evidence rely on survives redactErrorText alone and inside a realistic summary sentence, and every canary planted in every carrier beside one of them is removed while the row survives (extends the rule 9 scrub boundary fixed texts)", () => {
+  const groups = [
+    {
+      label: "endpoint paths",
+      values: [
+        "GET /v1.0/users?$filter=userType eq 'Member'",
+        "GET /v1.0/users?$filter=userType eq 'Guest'",
+        "GET /v1.0/policies/identitySecurityDefaultsEnforcementPolicy",
+        "GET /v1.0/identity/conditionalAccess/policies",
+        "GET /v1.0/directoryRoles/{id}/members",
+        "GET /v1.0/users/{id}/mailFolders/inbox/messageRules",
+        "GET /v1.0/reports/authenticationMethods/userRegistrationDetails",
+        "GET /v1.0/roleManagement/directory/roleEligibilitySchedules",
+        "GET /v1.0/security/alerts_v2",
+        "GET /v1.0/auditLogs/signIns",
+        "GET /beta/security/informationProtection/sensitivityLabels",
+        "GET /subscriptions/sub-123/providers/Microsoft.Security/pricings",
+        "GET /subscriptions/sub-123/providers/Microsoft.Authorization/roleDefinitions/role-pra",
+        "GET /subscriptions/sub-123/resourceGroups/NetworkWatcherRG/providers/Microsoft.Network/networkWatchers/NetworkWatcher_eastus/flowLogs",
+        "POST /tenant-123/oauth2/v2.0/token",
+        "/v1.0/users",
+        "/subscriptions/sub-123/providers/Microsoft.Network/networkSecurityGroups",
+        "https://graph.microsoft.com/v1.0/identity/conditionalAccess/policies",
+        "https://login.microsoftonline.com/tenant-123/oauth2/v2.0/token",
+      ],
+      sentence: (value) => `${value} returned 403 Forbidden. Grant Policy.Read.All, or collect the Conditional Access policy export from the Entra admin center manually.`,
+    },
+    {
+      label: "names",
+      values: [
+        "NetworkWatcher_eastus",
+        "NetworkWatcherRG",
+        "role-pra",
+        "rg-prod-2026",
+        "prod-us-east-2026",
+        "sub-123",
+        "tenant-123",
+        "client-123",
+        "contoso.example",
+        "eastus",
+        "identitySecurityDefaultsEnforcementPolicy",
+        "Authorization_RequestDenied",
+        "AADSTS7000215",
+        "Policy.Read.All",
+        "MailboxSettings.Read (application)",
+        "Microsoft.Network/networkWatchers",
+      ],
+      sentence: (value) => `${value} could not be read (403 Forbidden); it is listed with a null count and the verdict is manual.`,
+    },
+    {
+      label: "principals",
+      values: ["user-2026@contoso.example", "Global Administrator", "svc-deploy", "3fa85f64-5717-4562-b3fc-2c963f66afa6", "Security Reader"],
+      sentence: (value) => `Mailbox settings for ${value} could not be read (403 Forbidden); the mailbox is listed with a null rule count.`,
+    },
+    {
+      label: "status text",
+      values: [
+        "401 Unauthorized",
+        "403 Forbidden",
+        "402 Payment Required (license)",
+        "404 Not Found",
+        "502 Bad Gateway",
+        "200 OK",
+        "Authorization_RequestDenied: Insufficient privileges to complete the operation.",
+        "invalid_client: AADSTS7000215: Invalid client secret provided.",
+        "ErrorAccessDenied: Access is denied. Check credentials and try again.",
+      ],
+      sentence: (value) => `GET /v1.0/directoryRoles returned ${value}, so the privileged role membership export must be collected manually.`,
+    },
+    {
+      label: "finding ids",
+      values: ["AZURE-ID-01", "AZURE-ID-02", "AZURE-ID-08", "AZURE-MON-04", "AZURE-DP-06", "AZURE-NP-02"],
+      sentence: (value) => `${value} GET /v1.0/policies/identitySecurityDefaultsEnforcementPolicy: 403 Forbidden`,
+    },
+    {
+      label: "fixed texts",
+      values: azureFixedTexts(),
+      sentence: (value) => `AZURE-ID-01 ${value}`,
+    },
+  ];
+  assertMustKeepRows(assert, redactErrorText, groups);
+  assertMustRedactRowsBesideMustKeep(assert, redactErrorText, groups);
 });
 
 test("rule 9: service principal and application credential records keep only schedule fields at collection time", async () => {

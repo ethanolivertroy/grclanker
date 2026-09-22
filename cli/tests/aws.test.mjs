@@ -27,10 +27,12 @@ import {
   assessAwsLoggingDetection,
   assessAwsNetworkSecurity,
   assessAwsOrgGuardrails,
+  awsFixedTexts,
   buildAwsMappings,
   checkAwsAccess,
   exportAwsAuditBundle,
   isAwsAccessDenied,
+  labelIdentifier,
   maskAccessKeyId,
   normalizePolicyDocument,
   paginateAwsList,
@@ -78,6 +80,7 @@ import {
   parserMessageFor,
   parserSnippetBody,
 } from "./helpers/error-canaries.mjs";
+import { assertFixedTextsSurvive, assertMustKeepRows, assertMustRedactRowsBesideMustKeep } from "./helpers/redaction-table.mjs";
 
 function createTempBase(prefix) {
   return mkdtempSync(join(tmpdir(), prefix));
@@ -2410,8 +2413,175 @@ test("rule 9 scrub boundary: name-shaped values stay bare, any value in a carrie
       "arn:aws:cloudtrail:us-east-1:123456789012:trail/management-events-2026",
       "only 1 of 17 regions assessed (ec2:DescribeRegions us-east-1: AccessDeniedException (HTTP 403))",
       "bucket cloudtrail-logs-123456789012-us-east-1 has no bucket policy (s3:GetBucketPolicy NoSuchBucketPolicy (HTTP 404))",
+      ...awsFixedTexts(),
     ],
   });
+});
+
+test("rule 9 fixed texts (GWS note 1): every fixed-text message the integration emits survives redactErrorText unchanged, from the SyntaxError and non-JSON notes through every AwsApiError, IncompleteResponse, and AwsCredentialProviderError rendering to the region-scope, not_readable, and downgrade wordings", () => {
+  const texts = awsFixedTexts();
+  assertFixedTextsSurvive(assert, redactErrorText, texts, { minimum: 45 });
+  const denied = "AccessDeniedException (HTTP 403): User is not authorized to perform this operation";
+  for (const required of [
+    "response could not be parsed as the service protocol; the parser's message is not recorded because it quotes the body",
+    "SyntaxError: response could not be parsed as the service protocol; the parser's message is not recorded because it quotes the body",
+    "SyntaxError (HTTP 502): non-JSON body (text/html, 89 bytes)",
+    "body: not observed",
+    "body: empty, 0 bytes",
+    "body: text/html, 512 bytes",
+    denied,
+    `NoSuchEntity (HTTP 404): The Access Key with id ${maskAccessKeyId("AKIAEXAMPLE000000001")} cannot be found.`,
+    "TimeoutError: Request did not complete within 10000 ms",
+    "HTTP 403",
+    "UnknownError (HTTP 403): rejected",
+    "UnknownError",
+    "IncompleteResponse (HTTP 200): ListUsers answered without its Users member (body: empty, 0 bytes)",
+    "IncompleteResponse (HTTP 200): GetCallerIdentity answered without its Account member (body: text/html, 512 bytes)",
+    "IncompleteResponse: GetAccountSummary answered without its SummaryMap member (body: not observed)",
+    `iam:ListUsers: AccessDenied (${denied})`,
+    `ec2:DescribeVpcs us-east-1: error (IncompleteResponse (HTTP 200): DescribeVpcs answered without its Vpcs member (body: text/xml, 240 bytes))`,
+    `guardduty:GetDetector 12ab****89f0: AccessDenied (${denied})`,
+    `guardduty:GetDetector detector-1: AccessDenied (${denied})`,
+    "Region scope truncated to 1 of 17 regions by region_limit.",
+    "only 1 of 17 regions assessed",
+    "Current AWS account could not be determined.",
+    "14/15 AWS audit surfaces are readable.",
+    "Grant read-only access for the audit principal to the surfaces marked not_readable (iam, ec2); unreadable surfaces render manual findings, never pass.",
+  ]) {
+    assert.ok(texts.includes(required), `the fixed-text list carries: ${required}`);
+  }
+  assert.ok(texts.some((text) => /^credentials could not be resolved by fromIni \(profile audit\) \(CredentialsProviderError ENOENT\)\. The provider's message is not recorded because it can quote the shared config or credentials file; check the profile in .+ and .+\.$/.test(text)), "the credential-provider rendering is in the list");
+  assert.ok(texts.some((text) => /^credentials could not be resolved by fromNodeProviderChain \(default credential chain\) \(UnknownError\)\./.test(text)), "the default-chain rendering with a nameless cause is in the list");
+  assert.ok(texts.some((text) => /^Last-used dates could not be read for any of the 2 sampled access key\(s\) \(iam:GetAccessKeyLastUsed AKIA\*{4}[0-9A-Z]{4}: AccessDenied .*\); no key was judged\./.test(text)), "the no-key-judged wording is in the list");
+
+  // A nameless, message-less SDK error renders as its status alone, never as "[object Object]".
+  assert.equal(new AwsApiError({ $metadata: { httpStatusCode: 403 } }).message, "HTTP 403");
+  assert.ok(!texts.some((text) => text.includes("[object Object]")), "no fixed text stringifies an object");
+
+  // The read label keeps a server-assigned id whole when the scrub keeps it and masks it otherwise, so a
+  // 32-hex GuardDuty detector id (a hex digest to the scrub) still names the detector in the recorded line.
+  assert.equal(labelIdentifier("detector-1"), "detector-1");
+  assert.equal(labelIdentifier("12abc34d567e8fa901bc2d34e56789f0"), "12ab****89f0");
+  assert.equal(redactErrorText(`guardduty:GetDetector ${labelIdentifier("12abc34d567e8fa901bc2d34e56789f0")}: AccessDenied (${denied})`), `guardduty:GetDetector 12ab****89f0: AccessDenied (${denied})`);
+  assert.equal(redactErrorText("guardduty:GetDetector 12abc34d567e8fa901bc2d34e56789f0"), "guardduty:GetDetector [REDACTED]", "negative control: the bare 32-hex id is a hex digest to the scrub");
+
+  // The renderings the client throws, built by AwsApiError and AwsCredentialProviderError, survive too.
+  const thrown = [
+    new AwsApiError({ name: "AccessDeniedException", message: "User is not authorized to perform this operation", $metadata: { httpStatusCode: 403 } }),
+    new AwsApiError({ name: "SyntaxError", $metadata: { httpStatusCode: 502 }, $bodyNote: "non-JSON body (text/html, 5120 bytes)" }),
+    new AwsApiError(new SyntaxError("Unexpected token '<', \"<html>\" is not valid JSON")),
+    new AwsApiError({ name: "TimeoutError", message: "Request did not complete within 10000 ms" }),
+    new AwsCredentialProviderError("fromIni (profile audit)", { name: "CredentialsProviderError", code: "ENOENT" }),
+  ];
+  for (const error of thrown) {
+    assert.equal(redactErrorText(error.message), error.message, `the thrown rendering survives the scrub: ${error.message}`);
+  }
+});
+
+test("rule 9 must-keep and must-redact table (addendum 7): every command with its region or identifier, name, principal, status text, finding id, and fixed text the summaries, markers, probes, and evidence rely on survives redactErrorText alone and inside a realistic summary sentence, and every canary planted in every carrier beside one of them is removed while the row survives (extends the rule 9 scrub boundary fixed texts)", () => {
+  const denied = "AccessDeniedException (HTTP 403): User is not authorized to perform this operation";
+  const groups = [
+    {
+      label: "commands",
+      values: [
+        "iam:ListUsers",
+        "iam:GetAccountSummary",
+        "iam:GetAccountPasswordPolicy",
+        `iam:GetAccessKeyLastUsed ${MASKED_ACCESS_KEY_ID}`,
+        "iam:ListMFADevices svc-deploy",
+        "iam:ListAccessKeys alice",
+        "iam:GetPolicyVersion arn:aws:iam::123456789012:policy/ReadOnlyAudit",
+        "sts:GetCallerIdentity",
+        "ec2:DescribeVpcs us-east-1",
+        "ec2:DescribeRegions us-east-1",
+        "ec2:DescribeSecurityGroups us-west-2",
+        "ec2:DescribeFlowLogs us-east-1",
+        "rds:DescribeDBInstances us-east-1",
+        "kms:DescribeKey us-east-1/1234abcd-12ab-34cd-56ef-1234567890ab",
+        "kms:ListKeys us-east-1",
+        "s3:GetBucketPolicy cloudtrail-logs-123456789012-us-east-1",
+        "s3:GetBucketEncryption audit-logs",
+        "s3control:GetPublicAccessBlock",
+        "cloudtrail:GetTrailStatus arn:aws:cloudtrail:us-east-1:123456789012:trail/management-events-2026",
+        "cloudtrail:DescribeTrails",
+        "config:DescribeConfigurationRecorders",
+        "guardduty:GetDetector detector-1",
+        `guardduty:GetDetector ${labelIdentifier("12abc34d567e8fa901bc2d34e56789f0")}`,
+        "securityhub:DescribeHub",
+        "organizations:ListAccounts",
+        "organizations:ListTargetsForPolicy DenyRegions",
+        "access-analyzer:ListFindings arn:aws:access-analyzer:us-east-1:123456789012:analyzer/prod-analyzer",
+        "sso:ListInstances",
+      ],
+      sentence: (value) => `${value}: AccessDenied (${denied})`,
+    },
+    {
+      label: "names",
+      values: [
+        "us-east-1",
+        "us-west-2",
+        "prod-us-east-2026",
+        "management-events-2026",
+        "cloudtrail-logs-123456789012-us-east-1",
+        "audit-logs",
+        "orders-db",
+        "detector-1",
+        "DenyRegions",
+        "ReadOnlyAudit",
+        "region_limit",
+        "not_readable",
+        "SummaryMap",
+        "AccountMFAEnabled",
+        "arn:aws:securityhub:::standards/cis-aws-foundations-benchmark/v/1.4.0",
+        "arn:aws:kms:us-east-1:123456789012:key/1234abcd-12ab-34cd-56ef-1234567890ab",
+      ],
+      sentence: (value) => `${value} could not be read (${denied}); its count is null, the surface is marked not_readable, and the verdict is manual.`,
+    },
+    {
+      label: "principals",
+      values: [
+        "svc-deploy",
+        "alice",
+        "arn:aws:iam::123456789012:user/svc-deploy",
+        "arn:aws:iam::123456789012:user/auditor",
+        "arn:aws:iam::123456789012:role/AuditRole",
+        "arn:aws:iam::aws:policy/AdministratorAccess",
+        "123456789012",
+        MASKED_ACCESS_KEY_ID,
+      ],
+      sentence: (value) => `Caller ${value} could not read iam:ListUsers (${denied}); the IAM user inventory is null and AWS-IAM-02 is manual.`,
+    },
+    {
+      label: "status text",
+      values: [
+        "AccessDeniedException (HTTP 403)",
+        "NoSuchEntity (HTTP 404)",
+        "NoSuchBucketPolicy (HTTP 404)",
+        "IncompleteResponse (HTTP 200)",
+        "SyntaxError (HTTP 502)",
+        "TimeoutError",
+        "UnknownError",
+        "HTTP 403",
+        "CredentialsProviderError ENOENT",
+        "User is not authorized to perform this operation",
+        "body: empty, 0 bytes",
+        "non-JSON body (text/html, 89 bytes)",
+      ],
+      sentence: (value) => `iam:ListUsers: error (${value}), so the IAM user inventory is null and the dependent findings are manual.`,
+    },
+    {
+      label: "finding ids",
+      values: ["AWS-IAM-01", "AWS-IAM-04", "AWS-LOG-01", "AWS-ORG-04", "AWS-DATA-12", "AWS-NET-14"],
+      sentence: (value) => `${value} is manual because iam:ListUsers returned ${denied}.`,
+    },
+    {
+      label: "fixed texts",
+      values: awsFixedTexts(),
+      sentence: (value) => `AWS-IAM-04 ${value}`,
+    },
+  ];
+  assertMustKeepRows(assert, redactErrorText, groups);
+  assertMustRedactRowsBesideMustKeep(assert, redactErrorText, groups);
 });
 
 test("rule 9: redactErrorText scrubs authorization values, JWTs, AWS key ids and secrets, cookie and api key pairs, and URL userinfo and query strings anywhere in the text", () => {

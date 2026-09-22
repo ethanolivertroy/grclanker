@@ -19,6 +19,7 @@ import {
   ANSIBLE_CONTROLS,
   ANSIBLE_REDACTION_MARKER,
   AnsibleAapClient,
+  ansibleFixedTexts,
   assessAnsibleHostCoverage,
   assessAnsibleJobHealth,
   assessAnsiblePlatformSecurity,
@@ -57,6 +58,7 @@ import {
   parserMessageFor,
   parserSnippetBody,
 } from "./helpers/error-canaries.mjs";
+import { assertFixedTextsSurvive, assertMustKeepRows, assertMustRedactRowsBesideMustKeep } from "./helpers/redaction-table.mjs";
 
 const NOW = new Date("2026-09-21T00:00:00.000Z");
 const SUPERUSER = { id: 1, username: "auditor", is_superuser: true, is_system_auditor: false };
@@ -1694,8 +1696,129 @@ test("rule 9 scrub boundary: name-shaped values stay bare, any value in a carrie
       "inventories: unreadable (AAP request failed: /api/v2/inventories/ (403 Forbidden))",
       "ACTIVITY_STREAM_ENABLED not readable; records under one day old cannot prove the stream is on",
       "organization Default-Org-2026 has 3 teams with Admin on every inventory",
+      ...ansibleFixedTexts(),
     ],
   });
+});
+
+test("rule 9 fixed texts (GWS note 1): every fixed-text message the integration emits survives redactErrorText unchanged, from the SyntaxError and non-JSON notes through the not attempted marker and unreadable-view wordings to the session-login and manual-review prose", () => {
+  const texts = ansibleFixedTexts();
+  assertFixedTextsSurvive(assert, redactErrorText, texts, { minimum: 30 });
+  const deniedDetail = "You do not have permission to perform this action.";
+  for (const required of [
+    "SyntaxError: response could not be parsed as JSON; the parser's message is not recorded because it quotes the body",
+    `not attempted: the parent list could not be read (AAP request failed: /api/v2/inventories/ (403 Forbidden) ${deniedDetail})`,
+    "the read failed",
+    "unknown",
+    `inventories: unreadable (AAP request failed: /api/v2/inventories/ (403 Forbidden) ${deniedDetail})`,
+    "hosts: 1 of 40 seen (page cap reached)",
+    "current user could not be read, so the visibility of the audit account is unknown",
+    "current user (/api/v2/me/): no user returned",
+    "AAP request failed: /api/v2/ping/ (network error: fetch failed)",
+    "AAP request failed: /api/v2/ping/ (network error: This operation was aborted)",
+    "AAP session login failed (network error: fetch failed).",
+    "AAP session login failed (401 Unauthorized).",
+    "AAP session auth requires AAP_USERNAME and AAP_PASSWORD.",
+    "ACTIVITY_STREAM_ENABLED is not exposed by the system settings, so it was not confirmed",
+  ]) {
+    assert.ok(texts.includes(required), `the fixed-text list carries: ${required}`);
+  }
+  assert.ok(texts.some((text) => HTML_BODY_NOTE.test(text)), "the fixed-text list carries the non-JSON body note");
+  assert.ok(texts.some((text) => /^inventories could not be read \(AAP request failed: \/api\/v2\/inventories\/ \(403 Forbidden\) .*\), so this control cannot be verified from the API\. Collect this evidence manually: /.test(text)), "the manual-for-unreadable summary is in the list");
+  assert.ok(texts.some((text) => /^No team holds the Admin role on every inventory\. Downgraded from pass to warn because the inventory is partial or unreadable: current user could not be read, so the visibility of the audit account is unknown; inventories: unreadable \(/.test(text)), "the warn-capped pass summary built on an unreadable view is in the list");
+
+  // The renderings the client throws, built the way requestJson and responseDetail build them, survive too.
+  const thrown = [
+    `AAP request failed: /api/v2/settings/system/ (403 Forbidden) ${deniedDetail}`,
+    "AAP request failed: /api/v2/hosts/ (502 Bad Gateway): non-JSON body (text/html, 46 bytes)",
+    "AAP request failed: /api/v2/ping/ (200 OK): non-JSON body (text/plain, 21 bytes)",
+    "AAP request failed: /api/v2/tokens/ (401 Unauthorized) Authentication credentials were not provided.",
+  ];
+  for (const message of thrown) {
+    assert.equal(redactErrorText(message), message, `the thrown rendering survives the scrub: ${message}`);
+  }
+});
+
+test("rule 9 must-keep and must-redact table (addendum 7): every endpoint path, name, principal, status text, control id, and fixed text the summaries, markers, probes, and evidence rely on survives redactErrorText alone and inside a realistic summary sentence, and every canary planted in every carrier beside one of them is removed while the row survives (extends the rule 9 scrub boundary fixed texts)", () => {
+  const deniedDetail = "You do not have permission to perform this action.";
+  const groups = [
+    {
+      label: "endpoint paths",
+      values: [
+        "/api/v2/ping/",
+        "/api/v2/me/",
+        "/api/v2/inventories/",
+        "/api/v2/hosts/",
+        "/api/v2/users/3/roles/",
+        "/api/v2/teams/1/roles/",
+        "/api/v2/organizations/1/admins/",
+        "/api/v2/job_templates/10/notification_templates_error/",
+        "/api/v2/settings/system/",
+        "/api/v2/settings/logging/",
+        "/api/v2/settings/authentication/",
+        "/api/v2/notifications/",
+        "/api/v2/notification_templates/",
+        "/api/v2/credentials/",
+        "/api/v2/activity_stream/",
+        "/api/v2/execution_environments/",
+        "/api/v2/tokens/",
+        "https://aap.example.com/api/v2/ping/",
+      ],
+      sentence: (value) => `AAP request failed: ${value} (403 Forbidden) ${deniedDetail}`,
+    },
+    {
+      label: "names",
+      values: [
+        "Default",
+        "Default-Org-2026",
+        "prod-us-east-2026",
+        "ops-team",
+        "prod vault",
+        "default-ee",
+        "controller-1",
+        "aap.example.com",
+        "Patch and validate",
+        "weekly harden",
+        "ACTIVITY_STREAM_ENABLED",
+        "LOG_AGGREGATOR_ENABLED",
+        "AAP_USERNAME and AAP_PASSWORD",
+      ],
+      sentence: (value) => `${value} could not be read (403 Forbidden), so this control cannot be verified from the API; its count is null and the verdict is manual.`,
+    },
+    {
+      label: "principals",
+      values: ["auditor", "deploy", "svc-deploy", "reviewer", "ansible", "System Auditor", "Admin"],
+      sentence: (value) => `${value} could not be checked because /api/v2/users/3/roles/ returned 403 Forbidden; the role count is null.`,
+    },
+    {
+      label: "status text",
+      values: [
+        "403 Forbidden",
+        "401 Unauthorized",
+        "502 Bad Gateway",
+        "200 OK",
+        "network error: fetch failed",
+        "network error: This operation was aborted",
+        deniedDetail,
+        "non-JSON body (text/html, 46 bytes)",
+        "no user returned",
+        "page cap reached",
+      ],
+      sentence: (value) => `the inventories list could not be read (${value}), so inventory-wide Admin roles were not checked`,
+    },
+    {
+      label: "control ids",
+      values: ["AAP-AUDIT-01", "AAP-CRED-01", "AAP-HOST-01", "AAP-JOB-01", "AAP-PLAT-01", "AAP-RBAC-02", "AAP-SCHED-01", "AAP-TMPL-03"],
+      sentence: (value) => `${value} is manual because /api/v2/inventories/ was not readable (403 Forbidden).`,
+    },
+    {
+      label: "fixed texts",
+      values: ansibleFixedTexts(),
+      sentence: (value) => `AAP-RBAC-02: ${value}`,
+    },
+  ];
+  assertMustKeepRows(assert, redactErrorText, groups);
+  assertMustRedactRowsBesideMustKeep(assert, redactErrorText, groups);
 });
 
 test("fixture self-check: every planted canary is alphanumeric and random-looking, and no 6-to-24-character window of any canary occurs in the healthy fixture's legitimate values, so a windowed leak assertion can fail only on a real echo", async () => {

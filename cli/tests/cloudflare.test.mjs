@@ -17,6 +17,7 @@ import {
   assessCloudflareTrafficControls,
   assessCloudflareZoneSecurity,
   checkCloudflareAccess,
+  cloudflareFixedTexts,
   exportCloudflareAuditBundle,
   redactErrorText,
   resolveCloudflareConfiguration,
@@ -45,6 +46,7 @@ import {
   parserSnippetBody,
   shortBodyResponse,
 } from "./helpers/error-canaries.mjs";
+import { assertFixedTextsSurvive, assertMustKeepRows, assertMustRedactRowsBesideMustKeep } from "./helpers/redaction-table.mjs";
 
 function createTempBase(prefix) {
   return mkdtempSync(join(tmpdir(), prefix));
@@ -1287,8 +1289,123 @@ test("rule 9 scrub boundary: name-shaped values stay bare, any value in a carrie
       "SyntaxError: response could not be parsed as JSON; the parser's message is not recorded because it quotes the body",
       "Cloudflare API token verification failed for tok-current: token status is expired",
       "reusable policies not readable (GET /accounts/acc-123/access/policies: 403 Forbidden)",
+      ...cloudflareFixedTexts(),
     ],
   });
+});
+
+test("rule 9 fixed texts (GWS note 1): every fixed-text message the integration emits survives redactErrorText unchanged, from the SyntaxError and non-JSON notes through the not attempted and Not attempted wordings to the manual-review, partial-inventory, and zone-plan prose", () => {
+  const texts = cloudflareFixedTexts();
+  assertFixedTextsSurvive(assert, redactErrorText, texts, { minimum: 25 });
+  for (const required of [
+    "SyntaxError: response could not be parsed as JSON; the parser's message is not recorded because it quotes the body",
+    "not attempted: this client does not expose listAccessPolicies, so no request was made",
+    "Not attempted: /zones could not be read (Cloudflare request failed for /zones (403 Forbidden): Authentication error)",
+    "3 zone-scoped surfaces were not attempted because /zones could not be read (403).",
+    "Cloudflare request failed for /zones (timed out after 30000 ms)",
+    "Cloudflare request failed for /zones (network error: fetch failed)",
+    "Cloudflare API reported failure for /zones.",
+    "The active API token reported status expired instead of active.",
+    "Global API Key auth has no token to verify; create a scoped read-only API token and record its permission groups manually.",
+  ]) {
+    assert.ok(texts.includes(required), `the fixed-text list carries: ${required}`);
+  }
+  assert.ok(texts.some((text) => HTML_BODY_NOTE.test(text)), "the fixed-text list carries the non-JSON body note");
+  assert.ok(texts.some((text) => /^Manual review required: \/accounts\/acc-123\/access\/policies could not be read \(Cloudflare request failed for .* Grant Access: Apps and Policies: Read to the audit token/.test(text)), "the manual-review reason is in the list");
+  assert.ok(texts.some((text) => /^Partial Access application inventory: 1 seen of 40 total; unseen items were not assessed\.$/.test(text)), "the partial-inventory note is in the list");
+  assert.ok(texts.some((text) => text.startsWith("The zone plan could not be named because /zones/{zone_id}/subscription was not readable (")), "the zone-plan note is in the list");
+
+  // The renderings the client throws, built the way requestJson builds them, survive too.
+  const thrown = [
+    "Cloudflare request failed for /accounts/acc-123/access/policies (403 Forbidden): Authentication error",
+    "Cloudflare request failed for /zones/zone-1/settings/always_use_https (502 Bad Gateway): non-JSON body (text/html, 5120 bytes)",
+    "Cloudflare request returned a non-JSON payload for /zones (200 OK): non-JSON body (text/plain, 21 bytes)",
+    "Cloudflare request failed for /user/tokens/verify (timed out after 30000 ms)",
+  ];
+  for (const message of thrown) {
+    assert.equal(redactErrorText(message), message, `the thrown rendering survives the scrub: ${message}`);
+  }
+});
+
+test("rule 9 must-keep and must-redact table (addendum 7): every endpoint path, name, principal, status text, finding id, and fixed text the summaries, markers, probes, and evidence rely on survives redactErrorText alone and inside a realistic summary sentence, and every canary planted in every carrier beside one of them is removed while the row survives (extends the rule 9 scrub boundary fixed texts)", () => {
+  const groups = [
+    {
+      label: "endpoint paths",
+      values: [
+        "/zones",
+        "/zones/zone-1/dnssec",
+        "/zones/{zone_id}/dnssec",
+        "/zones/zone-1/settings/always_use_https",
+        "/zones/zone-1/settings/min_tls_version",
+        "/zones/zone-1/rulesets/phases/http_request_firewall_custom/entrypoint",
+        "/zones/zone-1/ssl/universal/settings",
+        "/zones/zone-1/origin_tls_client_auth/settings",
+        "/zones/zone-1/subscription",
+        "/zones/{zone_id}/firewall/rules",
+        "/accounts/acc-123/access/policies",
+        "/accounts/acc-123/access/apps",
+        "/accounts/acc-123/access/identity_providers",
+        "/accounts/acc-123/members",
+        "/accounts/acc-123/tokens",
+        "/accounts/acc-123/audit_logs",
+        "/accounts/acc-123/gateway/rules",
+        "/user/tokens/verify",
+        "/user/tokens/tok-current",
+        "GET /accounts/acc-123/access/policies",
+        "https://api.cloudflare.com/client/v4/zones/zone-1/dnssec",
+      ],
+      sentence: (value) => `Cloudflare request failed for ${value} (403 Forbidden): Authentication error`,
+    },
+    {
+      label: "names",
+      values: [
+        "zone-1",
+        "acc-123",
+        "one.example",
+        "prod-us-east-2026",
+        "tok-current",
+        "http_request_firewall_custom",
+        "always_use_https",
+        "min_tls_version",
+        "strict_transport_security",
+        "Zone Read",
+        "Access: Apps and Policies: Read",
+      ],
+      sentence: (value) => `${value} was not readable (403 Forbidden); its count is null, the surface is listed as not_readable, and the verdict is manual.`,
+    },
+    {
+      label: "principals",
+      values: ["tok-current", "svc-deploy", "auditor@example.com", "owner@example.com", "Super Administrator - All Privileges", "Administrator Read Only"],
+      sentence: (value) => `Account member ${value} could not be checked because /accounts/acc-123/members returned 403 Forbidden; the member count is null.`,
+    },
+    {
+      label: "status text",
+      values: [
+        "403 Forbidden",
+        "404 Not Found",
+        "502 Bad Gateway",
+        "200 OK",
+        "timed out after 30000 ms",
+        "network error: fetch failed",
+        "Authentication error",
+        "token status is expired",
+        "non-JSON body (text/html, 5120 bytes)",
+      ],
+      sentence: (value) => `GET /accounts/acc-123/access/policies returned ${value}, so the reusable Access policy list must be collected manually.`,
+    },
+    {
+      label: "finding ids",
+      values: ["CF-IAM-01", "CF-IAM-04", "CF-IAM-06", "CF-ZONE-07", "CF-ZONE-11", "CF-TRF-03", "CF-TRF-06"],
+      sentence: (value) => `${value} is manual because /zones/zone-1/dnssec was not readable (403 Forbidden).`,
+    },
+    {
+      label: "fixed texts",
+      values: cloudflareFixedTexts(),
+      sentence: (value) => `CF-IAM-04: ${value}`,
+    },
+  ];
+  assertMustKeepRows(assert, redactErrorText, groups);
+  assertMustRedactRowsBesideMustKeep(assert, redactErrorText, groups);
 });
 
 const CLOUDFLARE_JSON_HEADERS = { "content-type": "application/json" };

@@ -4940,3 +4940,54 @@ export function registerDuoTools(pi: any): void {
     },
   });
 }
+
+/**
+ * Every fixed-text message this integration emits around a refused, failed, or unparseable read, rendered
+ * with representative observed values by the same constants and helpers the error sink uses (GWS note 1).
+ * Each must survive redactErrorText unchanged, since every recorded string passes through it; the fixed-text
+ * test holds this list to the scrub, and a message that does not survive is reworded rather than exempted.
+ */
+export function duoFixedTexts(): readonly string[] {
+  const html = "<html><head><title>502 Bad Gateway</title></head><body>upstream unavailable</body></html>";
+  const htmlResponse = new Response(html, { status: 502, statusText: "Bad Gateway", headers: { "content-type": "text/html; charset=utf-8" } });
+  const plainResponse = new Response("upstream unavailable", { status: 200, statusText: "OK" });
+  const deniedDetail = parseDetailFromBody({ stat: "FAIL", code: 40301, message: "Access forbidden", message_detail: "Insufficient permissions" }) ?? "";
+  const settingsDenied = `Duo API request failed for ${DUO_ENDPOINTS.settings} (403 Forbidden): ${deniedDetail}`;
+  const adminMethodsDenied = `Duo API request failed for ${DUO_ENDPOINTS.adminAllowedAuthMethods} (403 Forbidden): ${deniedDetail}`;
+  const settingsReadFailure = describeReadFailure(DUO_ENDPOINTS.settings, settingsDenied);
+  return Object.freeze([
+    PARSE_ERROR_NOTE,
+    describeNonJsonBody(htmlResponse, html) ?? "",
+    describeNonJsonBody(plainResponse, "upstream unavailable") ?? "",
+    deniedDetail,
+    settingsDenied,
+    adminMethodsDenied,
+    `Duo API request failed for ${DUO_ENDPOINTS.telephonyLogs} (502 Bad Gateway): ${describeNonJsonBody(htmlResponse, html)}`,
+    `Duo API request failed for ${DUO_ENDPOINTS.settings} (network error: fetch failed)`,
+    `Duo API request returned an unexpected payload for ${DUO_ENDPOINTS.settings}: ${describeNonJsonBody(plainResponse, "upstream unavailable")}`,
+    `Duo API request returned an unexpected payload for ${DUO_ENDPOINTS.settings}`,
+    `Duo API request exceeded retry budget for ${DUO_ENDPOINTS.settings} (429 Too Many Requests).`,
+    `${DUO_ENDPOINTS.offlineEnrollmentLogs} was not attempted: this client does not expose it.`,
+    `${DUO_ENDPOINTS.infoSummary} was not attempted: this client does not expose it.`,
+    `${DUO_ENDPOINTS.authenticationAttempts} was not attempted: this client does not expose it.`,
+    uncollectedMarker(undefined).error,
+    settingsReadFailure,
+    describeReadFailure(DUO_ENDPOINTS.settings, "network error: fetch failed"),
+    "users: unread",
+    "bypass codes: unread",
+    `admin_allowed_auth_methods=unread (${describeReadFailure(DUO_ENDPOINTS.adminAllowedAuthMethods, adminMethodsDenied)}; requires ${DUO_PERMISSIONS.adminsRead}); administrator WebAuthn posture was not confirmed.`,
+    `admin_allowed_auth_methods=unread (${DUO_ENDPOINTS.adminAllowedAuthMethods} returned no usable payload; requires ${DUO_PERMISSIONS.adminsRead}); administrator WebAuthn posture was not confirmed.`,
+    `helpdesk_bypass=unread (${settingsReadFailure}; requires ${DUO_PERMISSIONS.settings})`,
+    "helpdesk_bypass_expiration=unread",
+    `No active bypass codes were returned, but help desk issuance limits could not be read: ${settingsReadFailure}. The zero-code verdict is capped at Partial.`,
+    `Grant the audit principal ${DUO_PERMISSIONS.settings} so helpdesk_bypass and helpdesk_bypass_expiration can be verified alongside the empty inventory.`,
+    "Grant the audit principal Grant resource - Read so active bypass codes can be enumerated.",
+    "Global MFA enforcement mode could not be read because the global policy was unavailable.",
+    "Phishing-resistant factor posture could not be read because the global policy was unavailable.",
+    "Authentication method restrictions could not be read because the global policy was unavailable.",
+    "Remembered device posture could not be read because the global policy was unavailable.",
+    "Trusted endpoint posture could not be read because the global policy was unavailable.",
+    "Device health requirements could not be read because the global policy was unavailable.",
+    "Remaining telephony credits could not be read, so telephony capacity cannot be confirmed (unknown credits never support Pass).",
+  ]);
+}

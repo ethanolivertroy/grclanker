@@ -691,9 +691,10 @@ function describeError(error: unknown): string {
   const object = asObject(error);
   const code = errorCode(error);
   const status = errorHttpStatus(error);
+  // An object without a message contributes nothing (never its "[object Object]" rendering); a primitive is its text.
   const rawMessage = asString(object?.$bodyNote)
     ?? nonJsonBodyNote(object)
-    ?? (isParseError(error) ? PARSE_ERROR_NOTE : error instanceof Error ? error.message : asString(object?.message) ?? String(error));
+    ?? (isParseError(error) ? PARSE_ERROR_NOTE : error instanceof Error ? error.message : asString(object?.message) ?? (object ? "" : String(error)));
   const message = code && rawMessage.startsWith(`${code}:`) ? rawMessage.slice(code.length + 1).trim() : rawMessage;
   const prefix = code
     ? (status !== undefined ? `${code} (HTTP ${status})` : code)
@@ -997,6 +998,11 @@ function credentialProviderFor(config: AwsResolvedConfig): AwsCredentialProvider
     : guardCredentialProvider("fromNodeProviderChain (default credential chain)", fromNodeProviderChain({ clientConfig: { region: config.region } }));
 }
 
+/** The recorded line for a failed read: the command label, whether it was a denial, and the scrubbed error text. */
+function readFailureLine(label: string, error: unknown): string {
+  return `${label}: ${isAwsAccessDenied(error) ? "AccessDenied" : "error"} (${describeError(error)})`;
+}
+
 /** Run one read and classify the outcome instead of throwing. */
 export async function attemptAwsRead<T>(
   label: string,
@@ -1007,7 +1013,7 @@ export async function attemptAwsRead<T>(
     return { value: await loader() };
   } catch (error) {
     const denied = isAwsAccessDenied(error);
-    const message = `${label}: ${denied ? "AccessDenied" : "error"} (${describeError(error)})`;
+    const message = readFailureLine(label, error);
     errors.push(message);
     return { error: message, denied, errorCode: errorCode(error) || undefined, httpStatus: errorHttpStatus(error) };
   }
@@ -1070,6 +1076,16 @@ export async function paginateAwsList<T>(
 export function maskAccessKeyId(accessKeyId: string): string {
   if (accessKeyId.length <= 8) return "****";
   return `${accessKeyId.slice(0, 4)}****${accessKeyId.slice(-4)}`;
+}
+
+/**
+ * A server-assigned identifier for a read label, kept whole when the error-text scrub keeps it and otherwise
+ * masked the way access key ids are. A GuardDuty detector id is 32 hex characters, a hex digest to the scrub,
+ * and would render as [REDACTED] in the recorded line, which loses the detector and reads as though a secret
+ * had been recorded; the masked form still names it.
+ */
+export function labelIdentifier(id: string): string {
+  return redactErrorText(id) === id ? id : maskAccessKeyId(id);
 }
 
 async function mapWithConcurrency<T, R>(
@@ -2841,7 +2857,7 @@ export async function assessAwsLoggingDetection(client: AwsLoggingDetectionClien
   const detectorList = detectorIds.value?.items ?? [];
   const detectors = await mapWithConcurrency(detectorList, DEFAULT_CONCURRENCY, async (detectorId) => ({
     id: detectorId,
-    detail: await attemptAwsRead(`guardduty:GetDetector ${detectorId}`, () => client.getDetector(detectorId), errors),
+    detail: await attemptAwsRead(`guardduty:GetDetector ${labelIdentifier(detectorId)}`, () => client.getDetector(detectorId), errors),
   }));
   const enabledDetectors = detectors.filter((detector) => asString(detector.detail.value?.Status) === "ENABLED");
   const unreadableDetectors = detectors.filter((detector) => detector.detail.error);
@@ -4742,4 +4758,87 @@ export function registerAwsTools(pi: any): void {
       }
     },
   });
+}
+
+/** The IncompleteResponse error the shape guard throws for a command, produced by the guard itself. */
+function incompleteResponseError(command: string, observed: ObservedResponse): AwsApiError {
+  try {
+    assertOutputShape({ constructor: { name: `${command}Command` } }, { $metadata: { httpStatusCode: observed.statusCode } }, observed);
+  } catch (error) {
+    if (error instanceof AwsApiError) return error;
+  }
+  throw new Error(`the shape guard did not refuse ${command}`);
+}
+
+/**
+ * Every fixed-text message this integration emits around a refused, failed, or unparseable read, rendered
+ * with representative observed values by the same constants, error classes, and helpers the error sink uses
+ * (GWS note 1). Each must survive redactErrorText unchanged, since every recorded string passes through it;
+ * the fixed-text test holds this list to the scrub, and a message that does not survive is reworded rather
+ * than exempted. AwsCredentialProviderError names the shared files from the environment at render time.
+ */
+export function awsFixedTexts(): readonly string[] {
+  const html = "<html><head><title>502 Bad Gateway</title></head><body>upstream unavailable</body></html>";
+  const maskedKey = maskAccessKeyId("AKIAEXAMPLE000000001");
+  const denied = { name: "AccessDeniedException", message: "User is not authorized to perform this operation", $metadata: { httpStatusCode: 403 } };
+  const noSuchEntity = { name: "NoSuchEntity", message: `The Access Key with id ${maskedKey} cannot be found.`, $metadata: { httpStatusCode: 404 } };
+  const noBucketPolicy = { name: "NoSuchBucketPolicy", message: "The bucket policy does not exist", $metadata: { httpStatusCode: 404 } };
+  const htmlPage = { name: "SyntaxError", $metadata: { httpStatusCode: 502 }, $bodyNote: `non-JSON body (text/html, ${Buffer.byteLength(html, "utf8")} bytes)` };
+  const timeout = { name: "TimeoutError", message: "Request did not complete within 10000 ms" };
+  const deniedError = new AwsApiError(denied);
+  const notFoundError = new AwsApiError(noSuchEntity);
+  const emptyBody = incompleteResponseError("ListUsers", { statusCode: 200, bodyBytes: 0 });
+  const htmlBody = incompleteResponseError("GetCallerIdentity", { statusCode: 200, contentType: "text/html", bodyBytes: 512 });
+  const missingMember = incompleteResponseError("DescribeVpcs", { statusCode: 200, contentType: "text/xml", bodyBytes: 240 });
+  const unobserved = incompleteResponseError("GetAccountSummary", {});
+  return Object.freeze([
+    PARSE_ERROR_NOTE,
+    nonJsonBodyNote({ $responseBodyText: html, $response: { headers: { "content-type": "text/html; charset=utf-8" } } }) ?? "",
+    nonJsonBodyNote({ message: '<?xml version="1.0" encoding="UTF-8"?><Error/>' }) ?? "",
+    observedBodyNote({}),
+    observedBodyNote({ bodyBytes: 0 }),
+    observedBodyNote({ contentType: "text/html", bodyBytes: 512 }),
+    observedBodyNote({ bodyBytes: 512 }),
+    deniedError.message,
+    notFoundError.message,
+    new AwsApiError(noBucketPolicy).message,
+    new AwsApiError(htmlPage).message,
+    new AwsApiError(new SyntaxError("Unexpected token '<', \"<html>\" is not valid JSON")).message,
+    new AwsApiError(timeout).message,
+    new AwsApiError({ $metadata: { httpStatusCode: 403 } }).message,
+    new AwsApiError({ name: "not a code", message: "rejected", $metadata: { httpStatusCode: 403 } }).message,
+    UNKNOWN_ERROR_CODE,
+    emptyBody.message,
+    htmlBody.message,
+    missingMember.message,
+    unobserved.message,
+    new AwsCredentialProviderError("fromIni (profile audit)", { name: "CredentialsProviderError", code: "ENOENT" }).message,
+    new AwsCredentialProviderError("fromIni (profile audit)", { name: "CredentialsProviderError", code: "EISDIR" }).message,
+    new AwsCredentialProviderError("fromNodeProviderChain (default credential chain)", new Error("Could not load credentials from any providers")).message,
+    readFailureLine("iam:ListUsers", deniedError),
+    readFailureLine(`iam:GetAccessKeyLastUsed ${maskedKey}`, notFoundError),
+    readFailureLine("ec2:DescribeVpcs us-east-1", missingMember),
+    readFailureLine("ec2:DescribeRegions us-east-1", deniedError),
+    readFailureLine("s3:GetBucketPolicy cloudtrail-logs-123456789012-us-east-1", new AwsApiError(noBucketPolicy)),
+    readFailureLine("organizations:ListAccounts", new AwsApiError(htmlPage)),
+    readFailureLine("sts:GetCallerIdentity", new AwsApiError(timeout)),
+    readFailureLine("iam:GetAccountSummary", unobserved),
+    readFailureLine(`guardduty:GetDetector ${labelIdentifier("12abc34d567e8fa901bc2d34e56789f0")}`, deniedError),
+    readFailureLine(`guardduty:GetDetector ${labelIdentifier("detector-1")}`, deniedError),
+    `Region scope fell back to us-east-1 only: ${readFailureLine("ec2:DescribeRegions", deniedError)}`,
+    "Region scope truncated to 1 of 17 regions by region_limit.",
+    `only us-east-1 was assessed because the enabled-region list could not be read (${readFailureLine("ec2:DescribeRegions", deniedError)})`,
+    "only 1 of 17 regions assessed",
+    `Downgraded to warn: only 1 of 17 regions assessed; ${readFailureLine(`iam:GetAccessKeyLastUsed ${maskedKey}`, deniedError)}.`,
+    `MFA devices could not be listed for any of the 3 sampled IAM users (${readFailureLine("iam:ListMFADevices svc-deploy", deniedError)}); review MFA coverage in the IAM credential report.`,
+    `Access keys could not be listed for any of the 3 sampled IAM users (${readFailureLine("iam:ListAccessKeys svc-deploy", deniedError)}); review key age in the IAM credential report.`,
+    `Last-used dates could not be read for any of the 2 sampled access key(s) (${readFailureLine(`iam:GetAccessKeyLastUsed ${maskedKey}`, deniedError)}); no key was judged. Review key age and last use in the IAM credential report.`,
+    `member accounts unreadable (${readFailureLine("organizations:ListAccounts", deniedError)})`,
+    `RDS instances could not be listed in any of 1 region(s) (${readFailureLine("rds:DescribeDBInstances us-east-1", deniedError)})`,
+    `No customer-managed KMS key could be confirmed: KeyManager could not be read for 2 of 2 key(s) (${readFailureLine("kms:DescribeKey us-east-1", deniedError)}); verify customer-managed key rotation in the KMS console.`,
+    "Current AWS account could not be determined.",
+    "14/15 AWS audit surfaces are readable.",
+    "Requested account hint 123456789012 does not match caller account 210987654321.",
+    "Grant read-only access for the audit principal to the surfaces marked not_readable (iam, ec2); unreadable surfaces render manual findings, never pass.",
+  ]);
 }

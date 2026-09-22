@@ -1630,7 +1630,7 @@ function botManagementJudgement(config: JsonRecord | null): { status: Cloudflare
 async function zonePlanNote(client: Partial<Pick<CloudflareReader, "getZoneSubscription">>, zoneId: string): Promise<string> {
   if (!client.getZoneSubscription) return "";
   const subscription = await attempt(() => client.getZoneSubscription!(zoneId));
-  if (!subscription.ok) return ` The zone plan could not be named because /zones/{zone_id}/subscription was not readable (${subscription.error}); zones[].plan is deprecated and is not read.`;
+  if (!subscription.ok) return ` ${zonePlanNoteText(subscription.error)}`;
   const planName = asString(asObject(subscription.value?.rate_plan)?.public_name);
   const state = asString(subscription.value?.state);
   if (!planName) return " The zone subscription returned no rate_plan.public_name, so the plan is not named here.";
@@ -3054,4 +3054,55 @@ export function registerCloudflareTools(pi: any): void {
       }
     },
   });
+}
+
+/**
+ * Every fixed-text message this integration emits around a refused, failed, or unparseable read, rendered
+ * with representative observed values by the same constants and helpers the error sink uses (GWS note 1).
+ * Each must survive redactErrorText unchanged, since every recorded string passes through it; the fixed-text
+ * test holds this list to the scrub, and a message that does not survive is reworded rather than exempted.
+ */
+export function cloudflareFixedTexts(): readonly string[] {
+  const html = "<html><head><title>502 Bad Gateway</title></head><body>upstream unavailable</body></html>";
+  const denied = cloudflareErrorSummary({ success: false, errors: [{ code: 10000, message: "Authentication error" }] }) ?? "";
+  const policiesPath = "/accounts/acc-123/access/policies";
+  const zonesDenied = `Cloudflare request failed for /zones (403 Forbidden): ${denied}`;
+  const policiesDenied = `Cloudflare request failed for ${policiesPath} (403 Forbidden): ${denied}`;
+  const subscriptionDenied = `Cloudflare request failed for /zones/zone-1/subscription (403 Forbidden): ${denied}`;
+  const notAttemptedZoneSurface = notAttemptedSurface("zone_dnssec", "zone", "/zones/{zone_id}/dnssec", { endpoint: "/zones", status: 403, error: zonesDenied });
+  return Object.freeze([
+    PARSE_ERROR_NOTE,
+    describeNonJsonBody("text/html; charset=utf-8", html) ?? "",
+    describeNonJsonBody(null, "upstream unavailable") ?? "",
+    denied,
+    zonesDenied,
+    policiesDenied,
+    `Cloudflare request failed for /zones/zone-1/settings/always_use_https (502 Bad Gateway): ${describeNonJsonBody("text/html", html)}`,
+    "Cloudflare request failed for /zones (timed out after 30000 ms)",
+    "Cloudflare request failed for /zones (network error: fetch failed)",
+    `Cloudflare request returned a non-JSON payload for /zones (200 OK): ${describeNonJsonBody("text/html", html)}`,
+    "Cloudflare API reported failure for /zones.",
+    notAttempted("listAccessPolicies").error,
+    notAttemptedZoneSurface.error ?? "",
+    "3 zone-scoped surfaces were not attempted because /zones could not be read (403).",
+    "3 zone-scoped surfaces were not attempted because /zones could not be read (no HTTP status).",
+    "5/7 Cloudflare audit surfaces are readable.",
+    "Provide a read-only API token and, when multiple accounts exist, set account_id to unlock account-scoped Cloudflare checks.",
+    manualReason("/user/tokens/verify", "any valid API token (verify needs no extra permission)", "the token status and permission groups from the dashboard", `Cloudflare request failed for /user/tokens/verify (403 Forbidden): ${denied}`),
+    manualReason(policiesPath, "Access: Apps and Policies: Read", "the reusable Access policy list and each policy's decision", policiesDenied),
+    `2 Access applications carry 3 inline policies, none with bypass, but the reusable policy list could not be checked. ${manualReason(policiesPath, "Access: Apps and Policies: Read", "the reusable Access policy list and each policy's decision", policiesDenied)}`,
+    "The active API token reported status expired instead of active.",
+    "Global API Key auth has no token to verify; create a scoped read-only API token and record its permission groups manually.",
+    partialInventoryNote("Access application", { items: [{}], truncated: true, totalCount: 40 }) ?? "",
+    partialInventoryNote("reusable Access policy", { items: [{}], truncated: true }) ?? "",
+    zonePlanNoteText(subscriptionDenied),
+    "The zone subscription returned no rate_plan.public_name, so the plan is not named here.",
+    "GET /zones/{zone_id}/firewall/rules is deprecated and was consulted for evidence only because the rulesets API was unreadable.",
+    `/user/tokens/verify: ${zonesDenied.replace("/zones", "/user/tokens/verify")}`,
+  ]);
+}
+
+/** The zone-plan note for an unreadable subscription read, as zonePlanNote renders it (without its leading space). */
+function zonePlanNoteText(error: string): string {
+  return `The zone plan could not be named because /zones/{zone_id}/subscription was not readable (${error}); zones[].plan is deprecated and is not read.`;
 }

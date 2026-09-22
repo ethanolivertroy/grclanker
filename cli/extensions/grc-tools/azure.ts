@@ -3014,3 +3014,73 @@ export function registerAzureTools(pi: any): void {
     },
   });
 }
+
+/**
+ * Every fixed-text message this integration emits around a refused, failed, or unparseable read, rendered
+ * with representative observed values by the same constants and helpers the error sink uses (GWS note 1).
+ * Each must survive redactErrorText unchanged, since every recorded string passes through it; the fixed-text
+ * test holds this list to the scrub, and a message that does not survive is reworded rather than exempted.
+ */
+export function azureFixedTexts(): readonly string[] {
+  const tokenUrl = "https://login.microsoftonline.com/tenant-123/oauth2/v2.0/token";
+  const html = "<html><head><title>502 Bad Gateway</title></head><body>upstream unavailable</body></html>";
+  const graphDeniedBody = JSON.stringify({ error: { code: "Authorization_RequestDenied", message: "Insufficient privileges to complete the operation." } });
+  const mailboxDeniedBody = JSON.stringify({ error: { code: "ErrorAccessDenied", message: "Access is denied. Check credentials and try again." } });
+  const invalidClientBody = JSON.stringify({ error: "invalid_client", error_description: "AADSTS7000215: Invalid client secret provided." });
+  const graphDenied = { error: `403 Forbidden: ${describeErrorBody(graphDeniedBody, "application/json")}`, status: 403, url: "https://graph.microsoft.com/v1.0/identity/conditionalAccess/policies" };
+  const mailboxDenied = { error: `403 Forbidden: ${describeErrorBody(mailboxDeniedBody, "application/json")}`, status: 403, url: "https://graph.microsoft.com/v1.0/users/user-2026@contoso.example/mailFolders/inbox/messageRules" };
+  const mailboxMissing = { error: `404 Not Found: ${describeErrorBody(JSON.stringify({ error: { code: "ErrorItemNotFound", message: "The specified object was not found in the store." } }), "application/json")}`, status: 404 };
+  const tokenDenied = { error: "Token request failed: 403 Forbidden", status: 403, url: tokenUrl };
+  const tokenInvalid = { error: `Token request failed: 401 Unauthorized: ${describeErrorBody(invalidClientBody, "application/json")}`, status: 401, url: tokenUrl };
+  const conditionalAccess = "GET /v1.0/identity/conditionalAccess/policies";
+  const pricings = "GET /subscriptions/sub-123/providers/Microsoft.Security/pricings";
+  const errors: string[] = [];
+  const evidence = "the Conditional Access policy export from the Entra admin center";
+  const findings = [
+    manualForError("AZURE-ID-01", 1, "Conditional Access MFA baseline", "high", conditionalAccess, "Policy.Read.All", evidence, graphDenied, AZURE_ENDPOINT_DOCS.conditionalAccess, errors),
+    manualForError("AZURE-ID-01", 1, "Conditional Access MFA baseline", "high", conditionalAccess, "Policy.Read.All", evidence, tokenInvalid, AZURE_ENDPOINT_DOCS.conditionalAccess, errors),
+    manualForError("AZURE-MON-05", 10, "Defender for Cloud plans", "high", pricings, "Security Reader", "the Defender for Cloud plan list", tokenDenied, AZURE_ENDPOINT_DOCS.defenderPricings, errors),
+    manualForError("AZURE-DP-06", 20, "Inbox forwarding rules", "high", MESSAGE_RULES_ENDPOINT, MAILBOX_RULES_PERMISSION, "the inbox rule export for every mailbox", mailboxDenied, AZURE_ENDPOINT_DOCS.messageRules, errors),
+  ];
+  const surfaceNames = ["organization", "conditional_access", "directory_roles", "secure_scores", "defender_pricings", "role_assignments", "diagnostic_settings", "security_contacts"];
+  return Object.freeze([
+    PARSE_ERROR_NOTE,
+    describeErrorBody(html, "text/html; charset=utf-8"),
+    describeErrorBody("upstream unavailable", null),
+    describeErrorBody("{}", "application/json"),
+    graphDenied.error,
+    mailboxDenied.error,
+    mailboxMissing.error,
+    tokenDenied.error,
+    tokenInvalid.error,
+    `Token request failed: 502 Bad Gateway: ${describeErrorBody(html, "text/html")}`,
+    "Token response did not include access_token.",
+    `Request returned 200 OK: ${describeErrorBody(html, "text/html")}`,
+    `Token request returned 200 OK: ${describeErrorBody(html, "text/html")}`,
+    "No graph token or client credentials are available.",
+    describeFailure({ error: "", status: 401 }),
+    describeFailure({ error: "", status: 403 }),
+    describeFailure({ error: "", status: 402 }),
+    tokenFailureText(tokenDenied, conditionalAccess).marker,
+    tokenFailureText(tokenDenied, pricings).marker,
+    failedReadNote(graphDenied, SECURITY_DEFAULTS_ENDPOINT),
+    failedReadNote(tokenDenied, SECURITY_DEFAULTS_ENDPOINT),
+    failedReadNote(tokenInvalid, SECURITY_DEFAULTS_ENDPOINT),
+    ...findings.map((item) => item.summary),
+    ...errors,
+    `Security defaults could not be read (${SECURITY_DEFAULTS_ENDPOINT} returned ${describeFailure(graphDenied)}).`,
+    `Security defaults could not be read (${failedReadNote(tokenDenied, SECURITY_DEFAULTS_ENDPOINT)}).`,
+    `AZURE-DP-06 ${MESSAGE_RULES_ENDPOINT}: ${describeFailure(mailboxDenied)} on 3 of 12 mailboxes`,
+    `3 denied with ${describeFailure(mailboxDenied)}, so ${MAILBOX_RULES_PERMISSION} is missing for those mailboxes and their rules were not inspected`,
+    `2 returned a non-permission error (${describeFailure(mailboxMissing)}; commonly users without an Exchange mailbox)`,
+    "not attempted: this client does not expose listNetworkWatchers, so no request was made.",
+    partialNote({ items: [], seen: 100, total: undefined, truncated: true }, "Conditional Access policies").trim(),
+    partialNote({ items: [], seen: 25, total: 40, truncated: true }, "role assignments").trim(),
+    "Member inventory is partial; verdict capped at warn.",
+    "6/8 Azure audit surfaces are readable.",
+    `${tokenRequestLabel(tokenDenied)} returned ${describeTokenFailure(tokenDenied)}; no resource request was made for ${surfaceNames.join(", ")}.`,
+    "Probe counts for role_assignments stopped at the probe page cap and are lower bounds, not inventory sizes.",
+    "Fix the app registration's client credentials (tenant id, client id, client secret) so the token request succeeds, then re-run the access check.",
+    "Grant Microsoft Graph read permissions and Azure Reader/Security Reader roles for the audit principal.",
+  ]);
+}

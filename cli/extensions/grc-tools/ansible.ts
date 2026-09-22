@@ -3714,3 +3714,55 @@ export function registerAnsibleTools(pi: any): void {
     },
   });
 }
+
+/**
+ * Every fixed-text message this integration emits around a refused, failed, or unparseable read, rendered
+ * with representative observed values by the same constants and helpers the error sink uses (GWS note 1).
+ * Each must survive redactErrorText unchanged, since every recorded string passes through it; the fixed-text
+ * test holds this list to the scrub, and a message that does not survive is reworded rather than exempted.
+ */
+export function ansibleFixedTexts(): readonly string[] {
+  const html = "<html><head><title>502 Bad Gateway</title></head><body>upstream unavailable</body></html>";
+  const deniedBody = JSON.stringify({ detail: "You do not have permission to perform this action." });
+  const inventoriesDenied = `AAP request failed: /api/v2/inventories/ (403 Forbidden)${responseDetail(deniedBody, "application/json")}`;
+  const settingsDenied = `AAP request failed: /api/v2/settings/system/ (403 Forbidden)${responseDetail(deniedBody, "application/json")}`;
+  const templatesDenied = `AAP request failed: /api/v2/job_templates/ (403 Forbidden)${responseDetail(deniedBody, "application/json")}`;
+  const notificationsDenied = `AAP request failed: /api/v2/notifications/ (403 Forbidden)${responseDetail(deniedBody, "application/json")}`;
+  const parentFailed: Snapshot<AnsibleCollection> = { data: { items: [], complete: false }, error: inventoriesDenied, status: 403, endpoint: "/api/v2/inventories/" };
+  const inventories = inventory("inventories", parentFailed);
+  const unknownScope: Snapshot<AnsibleScope> = { data: { fullVisibility: null, note: "current user could not be read, so the visibility of the audit account is unknown" }, error: "current user (/api/v2/me/): no user returned", status: null, endpoint: "/api/v2/me/" };
+  return Object.freeze([
+    PARSE_ERROR_NOTE,
+    describeNonJsonBody("text/html; charset=utf-8", html),
+    describeNonJsonBody(null, "upstream unavailable"),
+    inventoriesDenied,
+    settingsDenied,
+    `AAP request failed: /api/v2/hosts/ (502 Bad Gateway)${responseDetail(html, "text/html")}`,
+    `AAP request failed: /api/v2/ping/ (200 OK): ${describeNonJsonBody("text/plain", "upstream unavailable")}`,
+    "AAP request failed: /api/v2/ping/ (network error: fetch failed)",
+    "AAP request failed: /api/v2/ping/ (network error: This operation was aborted)",
+    "AAP session login failed (network error: fetch failed).",
+    "AAP session login failed (401 Unauthorized).",
+    "AAP session auth requires AAP_USERNAME and AAP_PASSWORD.",
+    ...partialNotes(unknownScope, inventories, inventory("hosts", { data: { items: [{}], complete: false, total: 40, truncation: "page cap reached" } })),
+    finding(22, "pass", "No team holds the Admin role on every inventory.", undefined, partialNotes(unknownScope, inventories)).summary,
+    unknownScope.error ?? "",
+    manualForUnreadable(22, inventories, "the Teams list with each team's roles and the inventories each Admin role covers").summary,
+    manualForUnreadable(26, { label: "activity stream", error: `AAP request failed: /api/v2/activity_stream/ (403 Forbidden)${responseDetail(deniedBody, "application/json")}`, status: 403, endpoint: "/api/v2/activity_stream/" }, "the Activity Stream page showing entries from the last 24 hours and Settings > System (Enable Activity Stream)").summary,
+    notCollectedMarker({}).error,
+    notCollectedMarker({}).endpoint,
+    notAttemptedRecord(parentFailed).error,
+    `the system settings could not be read (${settingsDenied}), so ACTIVITY_STREAM_ENABLED was not confirmed`,
+    "ACTIVITY_STREAM_ENABLED is not exposed by the system settings, so it was not confirmed",
+    "ACTIVITY_STREAM_ENABLED is false, so platform changes are not being recorded.",
+    `the logging settings could not be read (no settings object returned), so external log aggregation was not confirmed`,
+    `the inventories list could not be read (${inventoriesDenied}), so inventory-wide Admin roles were not checked`,
+    `the job templates list could not be read (${templatesDenied}), so last-run ages were not checked`,
+    `owning template unknown: the job templates list could not be read (${templatesDenied})`,
+    `the notification delivery history could not be read (${notificationsDenied}), so failed deliveries were not checked`,
+    "No notification templates exist, so job failures cannot alert anyone. An empty notification inventory is treated as fail for this control.",
+    "None of the 3 teams holds the Admin role on an organization or on every inventory.",
+    `Vault credential usage could not be read (credentials: AAP request failed: /api/v2/credentials/ (403 Forbidden)${responseDetail(deniedBody, "application/json")}), so encrypted variable coverage was not checked.`,
+    "3 credentials expose no owners summary and their owner_users/owner_teams endpoints could not be read; review their Access tab manually.",
+  ]);
+}
