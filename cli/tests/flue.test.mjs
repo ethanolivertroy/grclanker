@@ -910,9 +910,9 @@ test("credential-bearing tool arguments are redacted before serialization, at an
   };
   for (const parameters of collectToolParameterSchemas().values()) walk(parameters);
   const credentialKeys = [
-    "access_key", "access_token", "api_key", "api_token", "app_key", "app_private_key", "client_assertion", "client_secret",
-    "consumer_key", "credentials_json", "graph_token", "ikey", "management_token", "prisma_access_key_id", "private_key",
-    "sc_access_key", "scim_token", "skey", "token",
+    "access_key", "access_token", "api_key", "api_token", "app_key", "app_private_key", "bot_token", "client_assertion",
+    "client_secret", "consumer_key", "credentials_json", "graph_token", "ikey", "management_token", "prisma_access_key_id",
+    "private_key", "sc_access_key", "scim_token", "skey", "token", "zia_api_key", "zia_password", "zpa_client_secret",
   ];
   for (const key of credentialKeys) {
     assert.ok(declaredKeys.has(key), `${key} is still a declared tool parameter`);
@@ -971,13 +971,16 @@ test("credential-bearing tool arguments are redacted before serialization, at an
     "max_concurrent_sessions", // count threshold
     "max_credential_age_days", // duration threshold
     "max_enrollment_keys_per_policy", // count threshold
+    "max_key_age_days", // duration threshold (New Relic user API key age)
     "max_keys", // count threshold
     "max_password_age_days", // duration threshold
     "max_session_hours", // duration threshold
     "max_session_idle_minutes", // duration threshold
+    "max_session_inactivity_minutes", // duration threshold (Zoom inactivity sign-out period)
     "max_session_minutes", // duration threshold
     "max_session_timeout_minutes", // duration threshold
     "max_token_age_days", // duration threshold
+    "min_auth_scan_percent", // percentage threshold (Qualys authenticated-scan share)
     "min_compliance_pass_rate", // percentage threshold
     "min_password_length", // count threshold
     "min_posture_pass_rate", // ratio threshold
@@ -986,10 +989,12 @@ test("credential-bearing tool arguments are redacted before serialization, at an
     "private_key_path", // path to the key file, not the key
     "project_keys", // LaunchDarkly project identifiers, not credentials
     "sdk_key_max_age_days", // duration threshold
+    "session_sample", // count of Slack users whose session settings are sampled, not a session identifier
     "session_timeout_minutes", // duration threshold
     "stale_credential_days", // age threshold
     "stale_token_days", // age threshold
     "token_limit", // count threshold
+    "use_oauth", // boolean selecting the Qualys gateway JWT flow over basic auth, not a credential
     "webhook_limit", // count threshold
   ]);
   const unclassified = [...declaredKeys].filter(

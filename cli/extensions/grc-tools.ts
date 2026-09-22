@@ -15,9 +15,8 @@ import {
   buildComputeBackendSystemPromptNote,
   resolveComputeBackendExecution,
 } from "../pi/backend-exec.js";
-import { getComputeBackendConfigurationIssues, resolveComputeBackend } from "../pi/compute.js";
-import { cleanupParallelsSandboxes } from "../pi/parallels-sandbox.js";
-import { resetSandboxRuntime } from "../pi/sandbox.js";
+import { getComputeBackendConfigurationIssues } from "../pi/compute.js";
+import { shutdownComputeSessions } from "../pi/compute-shutdown.js";
 import { executeComputeAwareGrep } from "../pi/search-tools.js";
 import { readGrclankerSettings } from "../pi/settings.js";
 import { registerAnsibleTools } from "./grc-tools/ansible.js";
@@ -40,11 +39,13 @@ import { registerKevsTools } from "./grc-tools/kevs.js";
 import { registerKnowbe4Tools } from "./grc-tools/knowbe4.js";
 import { registerLaunchdarklyTools } from "./grc-tools/launchdarkly.js";
 import { registerMulesoftTools } from "./grc-tools/mulesoft.js";
+import { registerNewrelicTools } from "./grc-tools/newrelic.js";
 import { registerOktaTools } from "./grc-tools/okta.js";
 import { registerOciTools } from "./grc-tools/oci.js";
 import { registerOscalTools } from "./grc-tools/oscal.js";
 import { registerPagerdutyTools } from "./grc-tools/pagerduty.js";
 import { registerPaloaltoTools } from "./grc-tools/paloalto.js";
+import { registerQualysTools } from "./grc-tools/qualys.js";
 import { registerSalesforceTools } from "./grc-tools/salesforce.js";
 import { registerScfTools } from "./grc-tools/scf.js";
 import { registerServicenowTools } from "./grc-tools/servicenow.js";
@@ -58,6 +59,7 @@ import { registerVeracodeTools } from "./grc-tools/veracode.js";
 import { registerWebexTools } from "./grc-tools/webex.js";
 import { registerZendeskTools } from "./grc-tools/zendesk.js";
 import { registerZoomTools } from "./grc-tools/zoom.js";
+import { registerZscalerTools } from "./grc-tools/zscaler.js";
 
 /**
  * Domain tool registrars, kept alphabetical by integration. Add a new
@@ -84,11 +86,13 @@ const DOMAIN_TOOL_REGISTRARS: ReadonlyArray<(pi: ExtensionAPI) => void> = [
   registerKnowbe4Tools,
   registerLaunchdarklyTools,
   registerMulesoftTools,
+  registerNewrelicTools,
   registerOciTools,
   registerOktaTools,
   registerOscalTools,
   registerPagerdutyTools,
   registerPaloaltoTools,
+  registerQualysTools,
   registerSalesforceTools,
   registerScfTools,
   registerServicenowTools,
@@ -102,6 +106,7 @@ const DOMAIN_TOOL_REGISTRARS: ReadonlyArray<(pi: ExtensionAPI) => void> = [
   registerWebexTools,
   registerZendeskTools,
   registerZoomTools,
+  registerZscalerTools,
 ];
 
 function registerDomainTools(pi: ExtensionAPI): number {
@@ -299,12 +304,6 @@ export default function grcTools(pi: ExtensionAPI): void {
   });
 
   pi.on("session_shutdown", async () => {
-    const settings = getSettings();
-    if (resolveComputeBackend(settings) === "sandbox-runtime") {
-      await resetSandboxRuntime();
-    }
-    if (resolveComputeBackend(settings) === "parallels-vm") {
-      await cleanupParallelsSandboxes();
-    }
+    await shutdownComputeSessions(getSettings());
   });
 }

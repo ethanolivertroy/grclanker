@@ -2,13 +2,20 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname } from "node:path";
 import {
   DEFAULT_COMPUTE_BACKEND,
+  isComputeBackendKind,
+  isComputeProfile,
   normalizeComputeBackend,
+  normalizeComputeDefaults,
   type ComputeBackendKind,
+  type ComputeDefaults,
+  type ComputeProfile,
   type ParallelsSourceKind,
   normalizeParallelsSourceKind,
 } from "./compute.js";
 
 export type SkillDiscoveryMode = "bundled-only" | "bundled-and-project";
+
+export const COMPUTE_BACKEND_OVERRIDE_ENV = "GRCLANKER_COMPUTE_BACKEND_OVERRIDE";
 
 export type GrclankerSettings = Record<string, unknown> & {
   defaultProvider?: string;
@@ -18,6 +25,8 @@ export type GrclankerSettings = Record<string, unknown> & {
   providerBaseUrl?: string;
   skillDiscoveryMode?: SkillDiscoveryMode;
   computeBackend?: ComputeBackendKind;
+  computeProfile?: ComputeProfile;
+  computeDefaults?: ComputeDefaults;
   dockerImage?: string;
   dockerWorkspacePath?: string;
   parallelsSourceKind?: ParallelsSourceKind;
@@ -69,6 +78,12 @@ export function normalizeGrclankerSettings(
   settings.computeBackend = normalizeComputeBackend(
     (settings.computeBackend as unknown) ?? DEFAULT_COMPUTE_BACKEND,
   );
+  settings.computeProfile = isComputeProfile(settings.computeProfile)
+    ? settings.computeProfile
+    : undefined;
+  settings.computeDefaults = settings.computeDefaults === undefined
+    ? undefined
+    : normalizeComputeDefaults(settings.computeDefaults);
   const normalizedParallelsBaseVmName =
     normalizeOptionalString(settings.parallelsBaseVmName)
     ?? normalizeOptionalString(settings.parallelsVmName);
@@ -87,8 +102,20 @@ export function normalizeGrclankerSettings(
   writeFileSync(settingsPath, JSON.stringify(settings, null, 2) + "\n", "utf8");
 }
 
+export function applyComputeBackendOverride(
+  settings: GrclankerSettings,
+  kind: ComputeBackendKind | undefined,
+): GrclankerSettings {
+  if (!kind) return settings;
+  return { ...settings, computeBackend: kind };
+}
+
 export function readGrclankerSettings(path: string): GrclankerSettings {
-  return readJson(path) as GrclankerSettings;
+  const settings = readJson(path) as GrclankerSettings;
+  const override = process.env[COMPUTE_BACKEND_OVERRIDE_ENV];
+  return isComputeBackendKind(override)
+    ? applyComputeBackendOverride(settings, override)
+    : settings;
 }
 
 export function writeGrclankerSettings(
