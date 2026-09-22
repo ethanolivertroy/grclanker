@@ -775,6 +775,88 @@ test("rule 9: CLI stderr is scrubbed where the error is built, so no thrown mess
   assert.doesNotMatch(JSON.stringify(check), leak);
 });
 
+test("rule 9: the --version line is scrubbed and projected to the documented gws <version> shape before it reaches gws_ops_check_cli", async () => {
+  const envToken = "PLANTEDr5-version-env-token-0123";
+  const leak = /PLANTED/;
+  const env = { PATH: process.env.PATH, GOOGLE_WORKSPACE_CLI_TOKEN: envToken };
+  const probeOk = `echo '{"items":[]}'`;
+  const scripted = (label, versionLine) => createScriptedBinary(
+    createTempBase(`grclanker-gws-ops-version-${label}-`),
+    `if [ "$1" = "--version" ]; then ${versionLine}; exit 0; fi\n${probeOk}`,
+  );
+  const withheld = "gws 0.22.5 (the rest of the --version output did not match the documented `gws <version>` line and is not repeated here)";
+
+  // The binary echoes its own credential and a bearer token after the version: the version survives, the rest is withheld.
+  const echoing = scripted("echo", `echo "gws 0.22.5 PLANTEDr5versionword token=$GOOGLE_WORKSPACE_CLI_TOKEN Bearer ya29.PLANTEDr5versionbearer0123"`);
+  const result = await checkGwsCliAccess({ gwsBin: echoing }, defaultGwsCliRunner, env);
+  assert.equal(result.version, withheld);
+  assert.doesNotMatch(JSON.stringify(result), leak);
+
+  // Only the credential: no version number is found, so the line is dropped behind a descriptor that counts the printed characters.
+  const tokenOnly = await checkGwsCliAccess({ gwsBin: scripted("token", `echo "$GOOGLE_WORKSPACE_CLI_TOKEN"`) }, defaultGwsCliRunner, env);
+  assert.equal(tokenOnly.version, `unrecognized (--version printed ${envToken.length} character(s) without a version number; the output is not repeated here)`);
+  const silent = await checkGwsCliAccess({ gwsBin: scripted("silent", "true") }, defaultGwsCliRunner, env);
+  assert.equal(silent.version, "unknown (--version printed nothing)");
+
+  // Documented shapes render as `gws <semver>`, including a v prefix and a short pre-release suffix.
+  assert.equal((await checkGwsCliAccess({ gwsBin: scripted("plain", `echo "gws 0.22.5"`) }, defaultGwsCliRunner, env)).version, "gws 0.22.5");
+  assert.equal((await checkGwsCliAccess({ gwsBin: scripted("pre", `echo "gws v1.2.3-beta.1"`) }, defaultGwsCliRunner, env)).version, "gws 1.2.3-beta.1");
+  assert.equal((await checkGwsCliAccess({ gwsBin: scripted("name", `echo "google-workspace-cli 0.22.5"`) }, defaultGwsCliRunner, env)).version, withheld);
+  // A short credential in the pre-release position fits the documented grammar, so the scrub is the layer that removes it (negative control for scrubCliText here).
+  const shortToken = { PATH: process.env.PATH, GOOGLE_WORKSPACE_CLI_TOKEN: "PLANTEDr5tok" };
+  const suffixed = await checkGwsCliAccess({ gwsBin: scripted("suffix", `echo "gws 0.22.5-$GOOGLE_WORKSPACE_CLI_TOKEN"`) }, defaultGwsCliRunner, shortToken);
+  assert.equal(suffixed.version, withheld);
+  const longSuffix = await checkGwsCliAccess({ gwsBin: scripted("long", `echo "gws 0.22.5-${"a".repeat(21)}"`) }, defaultGwsCliRunner, env);
+  assert.equal(longSuffix.version, withheld, "a pre-release suffix longer than 20 characters is not rendered");
+
+  // The registered tool reads the real environment; its text and JSON carry the projected version only.
+  const previous = process.env.GOOGLE_WORKSPACE_CLI_TOKEN;
+  process.env.GOOGLE_WORKSPACE_CLI_TOKEN = envToken;
+  try {
+    const tool = await registeredTools().run("gws_ops_check_cli", { gws_bin: echoing });
+    assert.equal(tool.isError, undefined);
+    assert.equal(tool.details.version, withheld);
+    assert.match(tool.content[0].text, /^Version: gws 0\.22\.5 \(the rest of the --version output/m);
+    assert.doesNotMatch(JSON.stringify(tool), leak, JSON.stringify(tool));
+    assert.equal(JSON.stringify(tool).includes(envToken), false);
+  } finally {
+    if (previous === undefined) delete process.env.GOOGLE_WORKSPACE_CLI_TOKEN;
+    else process.env.GOOGLE_WORKSPACE_CLI_TOKEN = previous;
+  }
+});
+
+test("rule 9: GwsCliCommandError scrubs its message in the constructor, independently of the runner", async () => {
+  const envToken = "PLANTEDr5-ctor-env-token-0123";
+  const leak = /PLANTED/;
+  const raw = `token ${envToken} rejected; retry with Bearer ya29.PLANTEDr5ctorbearer0123 or access_token=PLANTEDr5ctorpair0123 via https://accounts.example/x?code=PLANTEDr5ctorcode`;
+
+  // Constructed directly, bypassing the runner: the known value, both token shapes, and the URL query are gone from .message.
+  const direct = new GwsCliCommandError("api", raw, "gws admin-reports activities list", 1, [envToken]);
+  assert.equal(direct.message, "token [REDACTED] rejected; retry with Bearer [REDACTED] or access_token=[REDACTED] via https://accounts.example/x");
+  assert.equal(direct.kind, "api");
+  assert.equal(direct.exitCode, 1);
+  // Without known values the shape scrub still applies; the env value then relies on the caller passing it.
+  const shapesOnly = new GwsCliCommandError("api", raw, "gws x", 1);
+  assert.equal(shapesOnly.message, `token ${envToken} rejected; retry with Bearer [REDACTED] or access_token=[REDACTED] via https://accounts.example/x`);
+
+  // The stdout-only error path: nothing on stderr, so the runner's stderr scrub never runs and the constructor is the only layer before the exit.
+  const env = { PATH: process.env.PATH, GOOGLE_WORKSPACE_CLI_TOKEN: envToken };
+  const stdoutOnly = createScriptedBinary(
+    createTempBase("grclanker-gws-ops-ctor-stdout-"),
+    `if [ "$1" = "--version" ]; then echo "gws 0.22.5"; exit 0; fi\necho "${raw}"\nexit 1`,
+  );
+  await assert.rejects(
+    () => traceGwsAdminActivity({ gwsBin: stdoutOnly }, defaultGwsCliRunner, env),
+    (error) => {
+      assert.ok(error instanceof GwsCliCommandError);
+      assert.equal(error.kind, "api");
+      assert.doesNotMatch(error.message, leak, `thrown message leaked: ${error.message}`);
+      assert.match(error.message, /^token \[REDACTED\] rejected; retry with Bearer \[REDACTED\] or access_token=\[REDACTED\] via https:\/\/accounts\.example\/x$/);
+      return true;
+    },
+  );
+});
+
 test("verdict rule 8: re-running the evidence bundle allocates -2 and never overwrites the earlier bundle or zip", async () => {
   const base = createTempBase("grclanker-gws-ops-rerun-");
   const fake = createFakeBinary(base);

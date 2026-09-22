@@ -35,6 +35,12 @@ const MAX_RESULTS_LIMIT = 250;
 const GWS_BIN_ENV_KEYS = ["GRCLANKER_GWS_BIN"] as const;
 const CAPTURE_PROJECTION_NOTE =
   "The stored capture is projected to the documented Reports API activity fields (id, actor, ipAddress, events[].type and name); event parameters are not stored and credential-like values are redacted. Re-run the recorded command for parameter detail.";
+/**
+ * The README documents `gws --version` as a plain-text version line; the binary name plus a semver-like token (with at most a
+ * short pre-release suffix) is the only shape rendered whole. Anything else yields the bare version core or a descriptor.
+ */
+const VERSION_LINE_PATTERN = /^gws\s+v?(\d+\.\d+\.\d+(?:-[0-9A-Za-z.]{1,20})?)$/;
+const VERSION_CORE_PATTERN = /\d+\.\d+\.\d+/;
 
 /**
  * The one scrub every CLI-produced string passes through before it can become an error message, a tool result, or a
@@ -453,16 +459,35 @@ async function runGwsVersion(
   if (!executable.installed) {
     throw new GwsCliCommandError("missing", buildGwsCliInstallGuidance(), executable.displayExecutable);
   }
+  const runnerEnv = buildRunnerEnv(args, env);
   const result = await runner({
     executable,
     args: ["--version"],
-    env: buildRunnerEnv(args, env),
+    env: runnerEnv,
     expectJson: false,
   });
   return {
-    version: result.stdout.trim() || "unknown",
+    version: projectVersionOutput(result.stdout, knownSecretValues(runnerEnv)),
     command: result.command,
   };
+}
+
+/**
+ * The version is the one CLI-produced string that reaches a tool result without a JSON projection, so it passes through
+ * scrubCliText and is then validated against the documented shape; anything else the binary printed is withheld behind a
+ * descriptor rather than rendered.
+ */
+function projectVersionOutput(stdout: string, knownSecrets: string[]): string {
+  const printed = stdout.trim();
+  const scrubbed = scrubCliText(printed, knownSecrets);
+  if (scrubbed.length === 0) return "unknown (--version printed nothing)";
+  const documented = VERSION_LINE_PATTERN.exec(scrubbed);
+  if (documented) return `gws ${documented[1]}`;
+  const core = VERSION_CORE_PATTERN.exec(scrubbed);
+  if (core) {
+    return `gws ${core[0]} (the rest of the --version output did not match the documented \`gws <version>\` line and is not repeated here)`;
+  }
+  return `unrecognized (--version printed ${printed.length} character(s) without a version number; the output is not repeated here)`;
 }
 
 function isoLookback(days: number): string {
