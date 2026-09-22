@@ -33,13 +33,18 @@ const SERVICE_PREFIXES = {
 export const FIXTURE_ACCOUNT = "123456789012";
 export const FIXTURE_NOW = new Date("2026-04-16T00:00:00.000Z");
 
+/**
+ * Credential-shaped canaries, alphanumeric and random-looking so no 6-character window of them occurs in the
+ * fixture's legitimate values (the aws test's fixture self-check asserts it); each travels in the carrier its
+ * name says, and the key id and secret keep the AKIA prefix and 40-character shape those rules key on.
+ */
 export const AWS_CANARIES = {
-  bearer: "cnry-bearer-9f8e7d6c5b4a39281706f5e4d3c2b1a0",
-  session: "cnry-session-1a2b3c4d5e6f7a8b9c0d",
-  apiKey: "cnry-apikey-0011223344556677",
-  urlToken: "cnry-url-token-7788",
-  accessKeyId: "AKIACANARY0000000001",
-  secretKey: "CANARYSECRET0123456789abcdefghijklmnopqr",
+  bearer: "wK2kypVFjDA4rjxzRzL5QHTnMKaZtPy3",
+  session: "rwfx9tWvvz458GCrFtwaX9cXXMVy",
+  apiKey: "PMZ4hQaDC37k7PXPKkdSzUg6vD4H",
+  urlToken: "QrNKBjvvWTSh7JRk6Eux",
+  accessKeyId: "AKIAZZSK7Q46ALH3TEZ5",
+  secretKey: "qNBXsx64Xxg9ux7wejCurgQsZArbXcGkbUN4ZfdY",
 };
 export const CANARY_URL = `https://api.example.com/v1/x?token=${AWS_CANARIES.urlToken}`;
 
@@ -50,8 +55,10 @@ function commandAction(client, command) {
 }
 
 /**
- * Runs `run` while every SDK request is answered by routes[action](input, region); each request is appended to
- * `log` as { action, region, status, code }. The shared prototype is restored even when the run throws.
+ * Runs `run` while every SDK request is answered by routes[action](input, region, sdk); each request is appended
+ * to `log` as { action, region, status, code }. `sdk.resolveCredentials()` runs the client's real credential
+ * provider (the guarded chain the integration built), which a patched send otherwise never reaches. The shared
+ * prototype is restored even when the run throws.
  */
 export async function withSdkRoutes(routes, log, run) {
   const original = SMITHY_CLIENT_PROTOTYPE.send;
@@ -61,7 +68,7 @@ export async function withSdkRoutes(routes, log, run) {
     const route = routes[action];
     if (!route) throw new Error(`Unexpected SDK request: ${action}`);
     try {
-      const output = await route(command.input, region);
+      const output = await route(command.input, region, { resolveCredentials: () => this.config.credentials() });
       log.push({ action, region, status: 200, code: null });
       return output;
     } catch (error) {

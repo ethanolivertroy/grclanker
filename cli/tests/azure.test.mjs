@@ -34,22 +34,29 @@ import {
 } from "../dist/extensions/grc-tools/azure.js";
 import {
   CANARY_URL,
+  CANARY_VALUES,
+  ENCODED_FORM_SECRET,
   HTML_BODY_NOTE,
+  PARSER_SNIPPET_CANARY,
+  PARSER_WORDING,
   REDACTED_CANARY_URL,
   SHORT_BODY_CANARY,
   SHORT_BODY_CONTENT_TYPE,
-  assertNoCanaries,
-  assertNoCanariesInFiles,
+  assertCanaryFixture,
+  assertNoCanaryWindows,
+  assertNoCanaryWindowsInFiles,
   assertNoShortBodyFragments,
   assertRedactionCases,
+  assertScrubBoundary,
   assertShortBodyRecordedAsNote,
   htmlCanaryBody,
   jsonCanaryMessage,
   parserMessageFor,
+  parserSnippetBody,
   shortBodyResponse,
 } from "./helpers/error-canaries.mjs";
 import { getRegisteredToolSummaries, groupRegisteredTools } from "../dist/pi/tool-catalog.js";
-import { assertSecretsAbsent, readBundleFiles, readZipEntries } from "./helpers/bundle-contents.mjs";
+import { readBundleFiles, readZipEntries } from "./helpers/bundle-contents.mjs";
 
 const NOW = new Date("2026-04-16T00:00:00.000Z");
 const ASSESSORS = [
@@ -446,7 +453,7 @@ test("rule 9: API error bodies are reduced to the documented error envelope befo
     "AzureApiError scrubs its own message",
   );
 
-  const leakedMarker = "LEAKED-REQUEST-CONTEXT";
+  const leakedMarker = AZURE_ERROR_CONTEXT_CANARY;
   const fetchImpl = async (url) => {
     if (url.endsWith("/oauth2/v2.0/token")) {
       return new Response(JSON.stringify({ error: "invalid_client", error_description: "AADSTS7000215: Invalid client secret provided.", trace_id: leakedMarker }), { status: 401, statusText: "Unauthorized" });
@@ -458,25 +465,44 @@ test("rule 9: API error bodies are reduced to the documented error envelope befo
     assert.equal(error.name, "AzureApiError");
     assert.equal(error.status, 403);
     assert.equal(error.message, "403 Forbidden: Authorization_RequestDenied: Insufficient privileges to complete the operation.");
-    assert.ok(!error.message.includes(leakedMarker));
+    assertNoCanaryWindows(assert, error.message, [leakedMarker], "undocumented error field");
     return true;
   });
   const credentialConfig = resolveAzureConfiguration(
     {},
-    { AZURE_TENANT_ID: "tenant-1", AZURE_SUBSCRIPTION_ID: "sub-1", AZURE_CLIENT_ID: "client-1", AZURE_CLIENT_SECRET: "secret-value-1" },
+    { AZURE_TENANT_ID: "tenant-1", AZURE_SUBSCRIPTION_ID: "sub-1", AZURE_CLIENT_ID: "client-1", AZURE_CLIENT_SECRET: AZURE_TOKEN_TEST_SECRET_CANARY },
     () => undefined,
   );
   await assert.rejects(new AzureAuditorClient(credentialConfig, { fetchImpl, now: () => NOW }).getOrganization(), (error) => {
     assert.equal(error.message, "Token request failed: 401 Unauthorized: invalid_client: AADSTS7000215: Invalid client secret provided.");
-    assert.ok(!error.message.includes(leakedMarker));
-    assert.ok(!error.message.includes("secret-value-1"));
+    assertNoCanaryWindows(assert, error.message, [leakedMarker, AZURE_TOKEN_TEST_SECRET_CANARY], "token endpoint error");
     return true;
   });
 });
 
+test("rule 9 scrub boundary: name-shaped values stay bare, any value in a carrier is removed, token-shaped values are removed bare, the configured secret is removed in every encoded form, and the integration's fixed texts survive", () => {
+  const config = resolveAzureConfiguration(
+    {},
+    { AZURE_TENANT_ID: "tenant-123", AZURE_SUBSCRIPTION_ID: "sub-123", AZURE_CLIENT_ID: "client-123", AZURE_CLIENT_SECRET: ENCODED_FORM_SECRET },
+    () => undefined,
+  );
+  new AzureAuditorClient(config, { fetchImpl: async () => new Response("{}"), now: () => NOW });
+  assertScrubBoundary(assert, redactErrorText, {
+    configuredSecret: ENCODED_FORM_SECRET,
+    mustKeep: [
+      "403 Forbidden: Authorization_RequestDenied: Insufficient privileges to complete the operation.",
+      "Token request failed: 401 Unauthorized: invalid_client: AADSTS7000215: Invalid client secret provided.",
+      "GET /v1.0/policies/identitySecurityDefaultsEnforcementPolicy (403 Forbidden): security defaults could not be read",
+      "GET /subscriptions/sub-123/providers/Microsoft.KeyVault/vaults (502 Bad Gateway): non-JSON body (text/html, 5120 bytes)",
+      "SyntaxError: response could not be parsed as JSON; the parser's message is not recorded because it quotes the body",
+      "mailbox settings for user-2026@contoso.example could not be read (ErrorAccessDenied: MailboxSettings.Read)",
+    ],
+  });
+});
+
 test("rule 9: service principal and application credential records keep only schedule fields at collection time", async () => {
-  const rawCredential = { keyId: "k1", displayName: "automation", hint: "Abc", secretText: "FAKE-SECRET-TEXT", customKeyIdentifier: "Y3Vz", startDateTime: "2026-01-01T00:00:00Z", endDateTime: "2026-12-01T00:00:00Z" };
-  const rawKey = { keyId: "k2", displayName: "cert", type: "AsymmetricX509Cert", usage: "Verify", key: "FAKE-KEY-BLOB", customKeyIdentifier: "dGh1bWI=", startDateTime: "2026-01-01T00:00:00Z", endDateTime: "2027-01-01T00:00:00Z" };
+  const rawCredential = { keyId: "k1", displayName: "automation", hint: "Abc", secretText: AZURE_RAW_CREDENTIAL_CANARIES.secretText, customKeyIdentifier: "Y3Vz", startDateTime: "2026-01-01T00:00:00Z", endDateTime: "2026-12-01T00:00:00Z" };
+  const rawKey = { keyId: "k2", displayName: "cert", type: "AsymmetricX509Cert", usage: "Verify", key: AZURE_RAW_CREDENTIAL_CANARIES.keyBlob, customKeyIdentifier: "dGh1bWI=", startDateTime: "2026-01-01T00:00:00Z", endDateTime: "2027-01-01T00:00:00Z" };
   const projected = projectCredentialCarrier({ id: "sp-1", displayName: "App", appId: "app-1", passwordCredentials: [rawCredential], keyCredentials: [rawKey] });
   assert.deepEqual(projected, {
     id: "sp-1",
@@ -491,8 +517,9 @@ test("rule 9: service principal and application credential records keep only sch
   const client = new AzureAuditorClient(sampleConfig(), { fetchImpl, now: () => NOW });
   for (const page of [await client.listServicePrincipals(), await client.listApplications()]) {
     const serialized = JSON.stringify(page);
-    for (const secret of ["Abc", "FAKE-SECRET-TEXT", "FAKE-KEY-BLOB", "hint", "secretText", "customKeyIdentifier"]) {
-      assert.ok(!serialized.includes(secret), `${secret} survived collection`);
+    assertNoCanaryWindows(assert, serialized, Object.values(AZURE_RAW_CREDENTIAL_CANARIES), "collected credential carrier");
+    for (const field of ["Abc", "hint", "secretText", "customKeyIdentifier"]) {
+      assert.ok(!serialized.includes(field), `${field} survived collection`);
     }
     assert.equal(page.items[0].passwordCredentials[0].endDateTime, "2026-12-01T00:00:00Z");
   }
@@ -1128,15 +1155,37 @@ test("exportAzureAuditBundle writes the shared layout, compliance reports, and a
   assert.doesNotMatch(readFileSync(join(result.outputDir, "core_data", "metadata.json"), "utf8"), /graph-token|arm-token/);
 });
 
+/**
+ * Planted values that must never reach the bundle, alphanumeric and random-looking so no 6-character window of
+ * them occurs in the fixture's legitimate values (see the fixture self-check).
+ */
 const FAKE_AZURE_SECRETS = {
-  clientSecret: "FAKE-CLIENT-SECRET-g7h8i9",
-  graphToken: "FAKE-GRAPH-TOKEN-a1b2c3",
-  managementToken: "FAKE-ARM-TOKEN-d4e5f6",
-  passwordHint: "FAKEHINT9",
-  secretText: "FAKE-SECRET-TEXT-j0k1l2",
-  keyBlob: "FAKE-KEY-BLOB-m3n4o5",
-  errorEcho: "FAKE-ERROR-ECHO-p6q7r8",
+  clientSecret: "mrL5GAh6R6FUeSpZvVJpxy6M",
+  graphToken: "x8kNSPJe6DYbDUGBgw58Q9HW",
+  managementToken: "ygYBdUkafMHfu87FTKCPTkzt",
+  passwordHint: "MURGpGyTZd7W",
+  secretText: "ucgh9GJ7npBbuFxYTK87GKj7",
+  keyBlob: "b5V3vQtHa4NrCTQWuG2gcdgw",
+  errorEcho: "VfJMPfscEyhjZXVPUZ5MgCPy",
 };
+
+/** Other planted credentials: the canary run's client secret, the token-endpoint test's secret and echoed context, and raw credential fields. */
+const AZURE_CANARY_CLIENT_SECRET = "rnsaRgwdFnwJc2MF8bmjNe3Z";
+const AZURE_TOKEN_TEST_SECRET_CANARY = "sFXt44aupQwvh8RLjhga";
+const AZURE_ERROR_CONTEXT_CANARY = "MktQKNS2S2U5grndhkrZ";
+const AZURE_RAW_CREDENTIAL_CANARIES = Object.freeze({ secretText: "pauZH8n84TFXKVtF", keyBlob: "HeHjgjBksw7D6H8g" });
+
+/** Every planted canary an Azure output is swept for, window by window. */
+const AZURE_PLANTED_CANARIES = Object.freeze([
+  ...CANARY_VALUES,
+  SHORT_BODY_CANARY,
+  PARSER_SNIPPET_CANARY,
+  ...Object.values(FAKE_AZURE_SECRETS),
+  AZURE_CANARY_CLIENT_SECRET,
+  AZURE_TOKEN_TEST_SECRET_CANARY,
+  AZURE_ERROR_CONTEXT_CANARY,
+  ...Object.values(AZURE_RAW_CREDENTIAL_CANARIES),
+]);
 
 /** Routes a real AzureAuditorClient through Graph and ARM responses that carry every fake secret above. */
 function secretBearingFetch() {
@@ -1178,8 +1227,8 @@ test("rule 9: the exported bundle and its zip never contain tokens, the client s
   const zipEntries = readZipEntries(result.zipPath);
   assert.ok(files.size >= 20, `bundle wrote ${files.size} files`);
   assert.equal(zipEntries.size, files.size, "every bundle file is in the archive");
-  assertSecretsAbsent(assert, files, Object.values(FAKE_AZURE_SECRETS), "bundle file");
-  assertSecretsAbsent(assert, zipEntries, Object.values(FAKE_AZURE_SECRETS), "zip entry");
+  assertNoCanaryWindowsInFiles(assert, files, Object.values(FAKE_AZURE_SECRETS), "bundle file");
+  assertNoCanaryWindowsInFiles(assert, zipEntries, Object.values(FAKE_AZURE_SECRETS), "zip entry");
   for (const [name, text] of files) {
     assert.ok(!/"(hint|secretText|key|customKeyIdentifier)"\s*:/.test(text), `${name} carries a raw credential property`);
   }
@@ -1281,7 +1330,7 @@ function canaryJsonResponse(key) {
 function canaryConfig() {
   return resolveAzureConfiguration(
     {},
-    { AZURE_TENANT_ID: "tenant-123", AZURE_SUBSCRIPTION_ID: "sub-123", AZURE_CLIENT_ID: "client-123", AZURE_CLIENT_SECRET: "canary-client-secret-value-1" },
+    { AZURE_TENANT_ID: "tenant-123", AZURE_SUBSCRIPTION_ID: "sub-123", AZURE_CLIENT_ID: "client-123", AZURE_CLIENT_SECRET: AZURE_CANARY_CLIENT_SECRET },
     () => undefined,
   );
 }
@@ -1293,6 +1342,19 @@ async function runEveryAzureTool(client, config, outputRoot) {
   const exported = await exportAzureAuditBundle(client, config, outputRoot);
   return { access, assessments, exported };
 }
+
+test("fixture self-check: every planted canary is alphanumeric and random-looking, and no 6-to-24-character window of any canary occurs in the healthy fixture's legitimate values, so a windowed leak assertion can fail only on a real echo", async () => {
+  const legitimate = new Map();
+  for (const [key, route] of Object.entries(healthyAzureRoutes())) legitimate.set(`route ${key}`, await route().text());
+  const config = sampleConfig();
+  const run = await runEveryAzureTool(new AzureAuditorClient(config, { fetchImpl: azureRoutedFetch(healthyAzureRoutes()), now: () => NOW }), config, createTempBase("grclanker-azure-self-check-"));
+  legitimate.set("check_access", run.access);
+  for (const assessment of run.assessments) legitimate.set(assessment.title, assessment);
+  for (const [name, text] of readBundleFiles(run.exported.outputDir)) legitimate.set(`bundle ${name}`, text);
+  for (const [name, text] of readZipEntries(run.exported.zipPath)) legitimate.set(`zip ${name}`, text);
+  legitimate.set("sample config", config);
+  assertCanaryFixture(assert, AZURE_PLANTED_CANARIES, legitimate, "azure fixture");
+});
 
 test("rule 9: a 502 HTML page or a JSON error message carrying credentials on any surface never reaches a probe, finding, summary, or bundle file", async () => {
   const config = canaryConfig();
@@ -1322,7 +1384,7 @@ test("rule 9: a 502 HTML page or a JSON error message carrying credentials on an
       const client = new AzureAuditorClient(config, { fetchImpl: azureRoutedFetch({ ...healthyAzureRoutes(), [surface]: response }), now: () => NOW });
       const { access, assessments, exported } = await runEveryAzureTool(client, config, createTempBase("grclanker-azure-canary-"));
 
-      assertNoCanaries(assert, access, `${label} check_access`);
+      assertNoCanaryWindows(assert, access, AZURE_PLANTED_CANARIES, `${label} check_access`);
       if (accessSurfaces.has(surface)) {
         const failed = access.surfaces.filter((entry) => entry.status === "not_readable");
         assert.ok(failed.length > 0, `${label}: the access check records the failing surface`);
@@ -1331,7 +1393,7 @@ test("rule 9: a 502 HTML page or a JSON error message carrying credentials on an
 
       const recorded = [];
       for (const assessment of assessments) {
-        assertNoCanaries(assert, assessment, `${label} ${assessment.title}`);
+        assertNoCanaryWindows(assert, assessment, AZURE_PLANTED_CANARIES, `${label} ${assessment.title}`);
         recorded.push(...assessment.errors);
         for (const finding of assessment.findings) {
           for (const evidenceError of [finding.evidence?.error, finding.evidence?.alerts_error, finding.evidence?.permission_failure?.error, finding.evidence?.other_failure?.error]) {
@@ -1352,8 +1414,8 @@ test("rule 9: a 502 HTML page or a JSON error message carrying credentials on an
       }
 
       const files = readBundleFiles(exported.outputDir);
-      assertNoCanariesInFiles(assert, files, `${label} bundle`);
-      assertNoCanariesInFiles(assert, readZipEntries(exported.zipPath), `${label} zip`);
+      assertNoCanaryWindowsInFiles(assert, files, AZURE_PLANTED_CANARIES, `${label} bundle`);
+      assertNoCanaryWindowsInFiles(assert, readZipEntries(exported.zipPath), AZURE_PLANTED_CANARIES, `${label} zip`);
       if (recorded.length > 0) {
         assert.ok(exported.errorCount > 0, `${label}: the export logs the failed read`);
         if (variant === "html") assert.match(files.get("_errors.log"), /502 Bad Gateway: non-JSON body \(text\/html, \d+ bytes\)/);
@@ -1528,7 +1590,7 @@ test("resolveSecureOutputPath rejects traversal and symlink parents", () => {
 });
 
 test("config loader errors: a SyntaxError raised by the transport is recorded by name only, never by the parser's message that quotes the body", async () => {
-  const snippet = "<html>CANARY-PARSER-SNIPPET-4242</html>";
+  const snippet = parserSnippetBody();
   const fetchImpl = async () => {
     throw new SyntaxError(`Unexpected token '<', "${snippet}"... is not valid JSON`);
   };
@@ -1545,12 +1607,13 @@ test("config loader errors: a SyntaxError raised by the transport is recorded by
 
   const outputs = [JSON.stringify(access), JSON.stringify(await assessAzureIdentity(client))];
   for (const text of outputs) {
-    assert.ok(!text.includes("CANARY-PARSER-SNIPPET") && !/Unexpected token/.test(text), `a slice of the parser's message reached an output: ${text.slice(0, 400)}`);
+    assertNoCanaryWindows(assert, text, [PARSER_SNIPPET_CANARY], "tool output");
+    assert.doesNotMatch(text, PARSER_WORDING, `a slice of the parser's message reached an output: ${text.slice(0, 400)}`);
     assert.ok(text.includes(note), `the output records the parse failure by name: ${text.slice(0, 400)}`);
   }
 });
 
-test("config loader errors: a 200 answer whose body is short non-JSON text is recorded as the non-JSON note only; no 8-character fragment of the body and no parser wording reaches the thrown client error, the access check, an assessment, or the bundle", async () => {
+test("config loader errors: a 200 answer whose body is short non-JSON text is recorded as the non-JSON note only; no 6-to-24-character window of the body and no parser wording reaches the thrown client error, the access check, an assessment, or the bundle", async () => {
   // Positive control for the class: V8 quotes the whole source when it is 21 characters or shorter.
   assert.ok(SHORT_BODY_CANARY.length <= 21 && parserMessageFor(SHORT_BODY_CANARY).includes(SHORT_BODY_CANARY), "the parser's message carries the whole short body");
 

@@ -22,20 +22,27 @@ import {
   resolveCloudflareConfiguration,
   resolveSecureOutputPath,
 } from "../dist/extensions/grc-tools/cloudflare.js";
-import { assertSecretsAbsent, readBundleFiles, readZipEntries } from "./helpers/bundle-contents.mjs";
+import { readBundleFiles, readZipEntries } from "./helpers/bundle-contents.mjs";
 import {
+  CANARY_VALUES,
+  ENCODED_FORM_SECRET,
   HTML_BODY_NOTE,
+  PARSER_SNIPPET_CANARY,
+  PARSER_WORDING,
   REDACTED_CANARY_URL,
   SHORT_BODY_CANARY,
   SHORT_BODY_CONTENT_TYPE,
-  assertNoCanaries,
-  assertNoCanariesInFiles,
+  assertCanaryFixture,
+  assertNoCanaryWindows,
+  assertNoCanaryWindowsInFiles,
   assertNoShortBodyFragments,
   assertRedactionCases,
+  assertScrubBoundary,
   assertShortBodyRecordedAsNote,
   htmlCanaryBody,
   jsonCanaryMessage,
   parserMessageFor,
+  parserSnippetBody,
   shortBodyResponse,
 } from "./helpers/error-canaries.mjs";
 
@@ -1107,13 +1114,35 @@ test("rule 1 corollary: multi-inventory findings never pass when only a secondar
   assert.match(gateway.summary, /\/accounts\/\{account_id\}\/gateway could not be read \(.*403/);
 });
 
+/**
+ * Planted values that must never reach the bundle, alphanumeric and random-looking so no 6-character window of
+ * them occurs in the fixture's legitimate values (see the fixture self-check). A contact email's canary is its
+ * local part; the domain is legitimate text.
+ */
 const FAKE_CLOUDFLARE_SECRETS = {
-  tokenValue: "FAKE_SECRET_TOKEN_1_v4Qy8tRz",
-  abuseContactEmail: "FAKE_SECRET_ABUSE_2@example.test",
-  zoneOwnerEmail: "FAKE_SECRET_OWNER_3@example.test",
-  memberEmail: "FAKE_SECRET_MEMBER_4@example.test",
-  accountFreeformSetting: "FAKE_SECRET_SETTING_5_ghp_abc",
+  tokenValue: "YYSQRQdqSqf9TtSkHKPxfKXQ",
+  abuseContactEmail: "d4gLMFRxxvB3@example.test",
+  zoneOwnerEmail: "d39crtHdJgRw@example.test",
+  memberEmail: "WPHygAMNBYa8@example.test",
+  accountFreeformSetting: "GhCYt6r7rzqWqPKCzb9k",
 };
+const FAKE_CLOUDFLARE_CANARIES = Object.values(FAKE_CLOUDFLARE_SECRETS).map((value) => value.split("@")[0]);
+
+/** Other planted credentials: the header echoed by a proxy page, a configured token, and the canary run's token. */
+const CLOUDFLARE_HEADER_ECHO_CANARY = "aJagv77Dvu2evcFMM4NP";
+const CLOUDFLARE_CONFIGURED_TOKEN_CANARY = "dcgqmL3afrWE64EJTmzpzEjb";
+const CLOUDFLARE_RUN_TOKEN_CANARY = "BhK5xQdrtGjV39mFJaKvKeRV";
+
+/** Every planted canary a Cloudflare output is swept for, window by window. */
+const CLOUDFLARE_PLANTED_CANARIES = Object.freeze([
+  ...CANARY_VALUES,
+  SHORT_BODY_CANARY,
+  PARSER_SNIPPET_CANARY,
+  ...FAKE_CLOUDFLARE_CANARIES,
+  CLOUDFLARE_HEADER_ECHO_CANARY,
+  CLOUDFLARE_CONFIGURED_TOKEN_CANARY,
+  CLOUDFLARE_RUN_TOKEN_CANARY,
+]);
 
 test("verdict rule 9: exportCloudflareAuditBundle never writes token values, contact emails, or unprojected account settings into the bundle or its zip", async () => {
   const base = createTempBase("grclanker-cloudflare-secrets-");
@@ -1159,8 +1188,8 @@ test("verdict rule 9: exportCloudflareAuditBundle never writes token values, con
   const entries = readZipEntries(result.zipPath);
   assert.ok(files.size > 10);
   assert.equal(entries.size, files.size, "every written file is in the zip");
-  assertSecretsAbsent(assert, files, Object.values(FAKE_CLOUDFLARE_SECRETS), "bundle files");
-  assertSecretsAbsent(assert, entries, Object.values(FAKE_CLOUDFLARE_SECRETS), "zip entries");
+  assertNoCanaryWindowsInFiles(assert, files, FAKE_CLOUDFLARE_CANARIES, "bundle files");
+  assertNoCanaryWindowsInFiles(assert, entries, FAKE_CLOUDFLARE_CANARIES, "zip entries");
 
   const accounts = JSON.parse(files.get("core_data/accounts.json"));
   assert.deepEqual(Object.keys(accounts.items[0]).sort(), ["id", "name", "settings", "type"]);
@@ -1172,7 +1201,7 @@ test("verdict rule 9: exportCloudflareAuditBundle never writes token values, con
 });
 
 test("verdict rule 9: non-JSON error bodies are described, never echoed, in CloudflareApiError messages", async () => {
-  const leaked = "FAKE_SECRET_HEADER_ECHO_6";
+  const leaked = CLOUDFLARE_HEADER_ECHO_CANARY;
   const fetchImpl = async () => ({
     ok: false,
     status: 502,
@@ -1186,7 +1215,7 @@ test("verdict rule 9: non-JSON error bodies are described, never echoed, in Clou
   await assert.rejects(client.listMembers("acc-123"), (error) => {
     assert.equal(error.status, 502);
     assert.equal(error.path, "/accounts/acc-123/members");
-    assert.ok(!error.message.includes(leaked), error.message);
+    assertNoCanaryWindows(assert, error.message, [leaked], "CloudflareApiError message");
     assert.match(error.message, /\(502 Bad Gateway\): non-JSON body \(text\/html, \d+ bytes\)/);
     return true;
   });
@@ -1197,7 +1226,7 @@ test("verdict rule 9: non-JSON error bodies are described, never echoed, in Clou
   });
   await assert.rejects(okHtml.listMembers("acc-123"), (error) => {
     assert.equal(error.status, 200);
-    assert.ok(!error.message.includes(leaked), error.message);
+    assertNoCanaryWindows(assert, error.message, [leaked], "CloudflareApiError message");
     assert.match(error.message, /non-JSON payload for \/accounts\/acc-123\/members \(200 OK\): non-JSON body \(text\/html, \d+ bytes\)/);
     return true;
   });
@@ -1212,7 +1241,7 @@ test("verdict rule 9: non-JSON error bodies are described, never echoed, in Clou
     assert.equal(error.status, undefined);
     assert.equal(error.path, "/user/tokens/verify");
     assert.match(error.message, /timed out after 5 ms/);
-    assert.ok(!error.message.includes(leaked), error.message);
+    assertNoCanaryWindows(assert, error.message, [leaked], "CloudflareApiError message");
     return true;
   });
 });
@@ -1220,8 +1249,22 @@ test("verdict rule 9: non-JSON error bodies are described, never echoed, in Clou
 test("rule 9: redactErrorText scrubs every credential shape anywhere in an error string and leaves prose alone", () => {
   assertRedactionCases(assert, redactErrorText);
   // The configured token is scrubbed wherever an upstream error echoes it.
-  new CloudflareApiClient(sampleConfig({ apiToken: "FAKE_SECRET_CONFIGURED_TOKEN_7" }), { fetchImpl: async () => new Response("{}") });
-  assert.equal(redactErrorText("proxy replayed FAKE_SECRET_CONFIGURED_TOKEN_7 upstream"), "proxy replayed [REDACTED] upstream");
+  new CloudflareApiClient(sampleConfig({ apiToken: CLOUDFLARE_CONFIGURED_TOKEN_CANARY }), { fetchImpl: async () => new Response("{}") });
+  assert.equal(redactErrorText(`proxy replayed ${CLOUDFLARE_CONFIGURED_TOKEN_CANARY} upstream`), "proxy replayed [REDACTED] upstream");
+});
+
+test("rule 9 scrub boundary: name-shaped values stay bare, any value in a carrier is removed, token-shaped values are removed bare, the configured secret is removed in every encoded form, and the integration's fixed texts survive", () => {
+  new CloudflareApiClient(sampleConfig({ apiToken: ENCODED_FORM_SECRET }), { fetchImpl: async () => new Response("{}") });
+  assertScrubBoundary(assert, redactErrorText, {
+    configuredSecret: ENCODED_FORM_SECRET,
+    mustKeep: [
+      "GET /accounts/acc-123/access/policies (403 Forbidden): Authentication error (code 10000)",
+      "GET /zones/zone-1/settings/always_use_https (502 Bad Gateway): non-JSON body (text/html, 5120 bytes)",
+      "SyntaxError: response could not be parsed as JSON; the parser's message is not recorded because it quotes the body",
+      "Cloudflare API token verification failed for tok-current: token status is expired",
+      "reusable policies not readable (GET /accounts/acc-123/access/policies: 403 Forbidden)",
+    ],
+  });
 });
 
 const CLOUDFLARE_JSON_HEADERS = { "content-type": "application/json" };
@@ -1350,8 +1393,25 @@ function recordedCloudflareErrors(assessments) {
   return recorded;
 }
 
+test("fixture self-check: every planted canary is alphanumeric and random-looking, and no 6-to-24-character window of any canary occurs in the healthy fixture's legitimate values, so a windowed leak assertion can fail only on a real echo", async () => {
+  const legitimate = new Map();
+  for (const [path, route] of Object.entries(healthyCloudflareRoutes())) {
+    legitimate.set(`route ${path}`, await route(new URL(`https://api.cloudflare.com/client/v4${path}`)).text());
+  }
+  const run = await runEveryCloudflareTool(
+    new CloudflareApiClient(sampleConfig(), { fetchImpl: cloudflareRoutedFetch(healthyCloudflareRoutes()) }),
+    createTempBase("grclanker-cloudflare-self-check-"),
+  );
+  legitimate.set("check_access", run.access);
+  for (const assessment of run.assessments) legitimate.set(assessment.title, assessment);
+  for (const [name, text] of readBundleFiles(run.exported.outputDir)) legitimate.set(`bundle ${name}`, text);
+  for (const [name, text] of readZipEntries(run.exported.zipPath)) legitimate.set(`zip ${name}`, text);
+  legitimate.set("sample config", sampleConfig());
+  assertCanaryFixture(assert, CLOUDFLARE_PLANTED_CANARIES, legitimate, "cloudflare fixture");
+});
+
 test("rule 9: a 502 HTML page or a JSON error message carrying credentials on any surface never reaches a probe, finding, summary, or bundle file", async () => {
-  const config = sampleConfig({ apiToken: "FAKE_SECRET_CANARY_RUN_TOKEN_8" });
+  const config = sampleConfig({ apiToken: CLOUDFLARE_RUN_TOKEN_CANARY });
   const outputRoot = createTempBase("grclanker-cloudflare-canary-");
 
   // The healthy run proves the route table is the surface list: every route is requested and nothing else is.
@@ -1378,7 +1438,7 @@ test("rule 9: a 502 HTML page or a JSON error message carrying credentials on an
       const client = new CloudflareApiClient(config, { fetchImpl: cloudflareRoutedFetch({ ...healthyCloudflareRoutes(), [surface]: response }) });
       const { access, assessments, exported } = await runEveryCloudflareTool(client, createTempBase("grclanker-cloudflare-canary-"));
 
-      assertNoCanaries(assert, access, `${label} check_access`);
+      assertNoCanaryWindows(assert, access, CLOUDFLARE_PLANTED_CANARIES, `${label} check_access`);
       if (probed.has(surface)) {
         const failed = access.surfaces.filter((entry) => entry.status === "not_readable");
         assert.ok(failed.length > 0, `${label}: the access check records the failing surface`);
@@ -1390,7 +1450,7 @@ test("rule 9: a 502 HTML page or a JSON error message carrying credentials on an
       }
 
       const recorded = recordedCloudflareErrors(assessments);
-      for (const assessment of assessments) assertNoCanaries(assert, assessment, `${label} ${assessment.title}`);
+      for (const assessment of assessments) assertNoCanaryWindows(assert, assessment, CLOUDFLARE_PLANTED_CANARIES, `${label} ${assessment.title}`);
       assert.ok(recorded.length > 0, `${label}: the failing surface is recorded by an assessment`);
       if (variant === "html") {
         for (const error of recorded) assert.match(error, HTML_BODY_NOTE, `${label}: "${error}" carries the status-and-length note`);
@@ -1400,8 +1460,8 @@ test("rule 9: a 502 HTML page or a JSON error message carrying credentials on an
       }
 
       const files = readBundleFiles(exported.outputDir);
-      assertNoCanariesInFiles(assert, files, `${label} bundle`);
-      assertNoCanariesInFiles(assert, readZipEntries(exported.zipPath), `${label} zip`);
+      assertNoCanaryWindowsInFiles(assert, files, CLOUDFLARE_PLANTED_CANARIES, `${label} bundle`);
+      assertNoCanaryWindowsInFiles(assert, readZipEntries(exported.zipPath), CLOUDFLARE_PLANTED_CANARIES, `${label} zip`);
       assert.ok(exported.errorCount > 0, `${label}: the export logs the failed read`);
       if (variant === "html") assert.match(files.get("_errors.log"), /502 Bad Gateway\): non-JSON body \(text\/html, \d+ bytes\)/);
     }
@@ -1602,7 +1662,7 @@ test("request matching: every endpoint path and HTTP status named in any output 
 });
 
 test("config loader errors: a SyntaxError raised by the transport is recorded by name only, never by the parser's message that quotes the body", async () => {
-  const snippet = "<html>CANARY-PARSER-SNIPPET-4242</html>";
+  const snippet = parserSnippetBody();
   const fetchImpl = async () => {
     throw new SyntaxError(`Unexpected token '<', "${snippet}"... is not valid JSON`);
   };
@@ -1611,7 +1671,8 @@ test("config loader errors: a SyntaxError raised by the transport is recorded by
 
   await assert.rejects(() => client.listAccounts(), (error) => {
     assert.equal(error.name, "CloudflareApiError");
-    assert.ok(!error.message.includes("CANARY-PARSER-SNIPPET") && !/Unexpected token/.test(error.message), `the parser's message was interpolated: ${error.message}`);
+    assertNoCanaryWindows(assert, error.message, [PARSER_SNIPPET_CANARY], "thrown client error");
+    assert.doesNotMatch(error.message, PARSER_WORDING, `the parser's message was interpolated: ${error.message}`);
     assert.equal(error.message, `Cloudflare request failed for /accounts (network error: ${note})`);
     return true;
   });
@@ -1621,12 +1682,13 @@ test("config loader errors: a SyntaxError raised by the transport is recorded by
     JSON.stringify(await assessCloudflareIdentity(client)),
   ];
   for (const text of outputs) {
-    assert.ok(!text.includes("CANARY-PARSER-SNIPPET") && !/Unexpected token/.test(text), `a slice of the parser's message reached an output: ${text.slice(0, 400)}`);
+    assertNoCanaryWindows(assert, text, [PARSER_SNIPPET_CANARY], "tool output");
+    assert.doesNotMatch(text, PARSER_WORDING, `a slice of the parser's message reached an output: ${text.slice(0, 400)}`);
     assert.ok(text.includes(note), `the output records the parse failure by name: ${text.slice(0, 400)}`);
   }
 });
 
-test("config loader errors: a 200 answer whose body is short non-JSON text is recorded as the non-JSON note only; no 8-character fragment of the body and no parser wording reaches the thrown client error, the access check, an assessment, or the bundle", async () => {
+test("config loader errors: a 200 answer whose body is short non-JSON text is recorded as the non-JSON note only; no 6-to-24-character window of the body and no parser wording reaches the thrown client error, the access check, an assessment, or the bundle", async () => {
   // Positive control for the class: V8 quotes the whole source when it is 21 characters or shorter.
   assert.ok(SHORT_BODY_CANARY.length <= 21 && parserMessageFor(SHORT_BODY_CANARY).includes(SHORT_BODY_CANARY), "the parser's message carries the whole short body");
 

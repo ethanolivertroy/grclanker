@@ -476,33 +476,145 @@ function isErrorCode(error: unknown, ...codes: string[]): boolean {
 }
 
 const REDACTED_ERROR_VALUE = "[REDACTED]";
+const CONFIGURED_SECRETS = new Set<string>();
+const MIN_CONFIGURED_SECRET_LENGTH = 4;
+
+/**
+ * The forms a configured secret can take inside an error string: plain, JSON-escaped, URL-encoded, base64,
+ * and base64url (rule 9 scrub boundary: a configured secret is removed whatever its shape, in every form).
+ */
+function configuredSecretForms(value: string): string[] {
+  const forms = new Set<string>([
+    value,
+    JSON.stringify(value).slice(1, -1),
+    encodeURIComponent(value),
+    Buffer.from(value, "utf8").toString("base64"),
+    Buffer.from(value, "utf8").toString("base64url"),
+  ]);
+  return [...forms].filter((form) => form.length >= MIN_CONFIGURED_SECRET_LENGTH);
+}
+
+/** Secrets the running client was configured with or obtained; every recorded error string is scrubbed of them in every form. */
+function registerConfiguredSecrets(...values: Array<string | undefined>): void {
+  for (const value of values) {
+    if (!value || value.length < MIN_CONFIGURED_SECRET_LENGTH) continue;
+    for (const form of configuredSecretForms(value)) CONFIGURED_SECRETS.add(form);
+  }
+}
+
+function escapeErrorRegExp(text: string): string {
+  return text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+/** Replaces every configured secret form wherever it appears; a form under eight characters only where it stands as a whole token. */
+function scrubConfiguredSecrets(text: string): string {
+  let scrubbed = text;
+  for (const secret of [...CONFIGURED_SECRETS].sort((left, right) => right.length - left.length)) {
+    scrubbed = secret.length >= 8
+      ? scrubbed.split(secret).join(REDACTED_ERROR_VALUE)
+      : scrubbed.replace(new RegExp(`(?<![A-Za-z0-9])${escapeErrorRegExp(secret)}(?![A-Za-z0-9])`, "g"), REDACTED_ERROR_VALUE);
+  }
+  return scrubbed;
+}
 
 const ERROR_CREDENTIAL_KEY_PATTERN =
-  "[A-Za-z0-9_.-]*(?:token|secret|passw(?:or)?d|pwd|api[_-]?key|apikey|session(?:[_-]?id)?|sid|cookie|csrftoken|authorization|auth|signature|sig|credentials?|access[_-]?key|private[_-]?key)";
-// A credential value is a single token that is either long or carries a digit; short prose words after a
-// colon (for example "Authentication error: Invalid token") are left alone.
-const ERROR_CREDENTIAL_VALUE_PATTERN = `(?:(?:Bearer|Basic|Digest|Token)\\s+)?(?:(?=[^\\s"'&;,<>]{16,})|(?=[^\\s"'&;,<>]*\\d))[^\\s"'&;,<>]{8,}`;
+  "[A-Za-z0-9_.-]*(?:token|secret|passw(?:or)?d|pwd|api[_-]?key|apikey|session(?:[_-]?id)?|sid|cookie|csrftoken|authorization|auth|signature|sig|nonce|credentials?|access[_-]?key|private[_-]?key|skey)";
+// key=value, key: value, and "key":"value" pairs whose key names a credential; the value's shape decides below.
+const ERROR_CREDENTIAL_PAIR_PATTERN = new RegExp(
+  `\\b(${ERROR_CREDENTIAL_KEY_PATTERN})(["']?\\s*[=:]\\s*["']?)((?:(?:Bearer|Basic|Digest|Token|ApiKey)\\s+)?[^\\s"'&;,<>]+)`,
+  "gi",
+);
+const TRAILING_PUNCTUATION_PATTERN = /[.!?:)]+$/;
+
+/**
+ * A value after a credential-named key is the credential (whatever its shape) when it is at least six
+ * characters and is twelve or longer, carries a digit or a character that is not a letter, or changes case
+ * inside the word. Short plain words after a colon ("InvalidAuthenticationToken: Access token has expired")
+ * are prose and stay.
+ */
+function looksLikeCredentialValue(value: string): boolean {
+  return value.length >= 6 && (value.length >= 12 || /\d/.test(value) || /[^A-Za-z]/.test(value) || /[a-z][A-Z]/.test(value));
+}
+
+function scrubCredentialPairs(text: string): string {
+  return text.replace(ERROR_CREDENTIAL_PAIR_PATTERN, (match: string, key: string, separator: string, value: string) => {
+    // A value the scheme rule already replaced ("Authorization: Bearer [REDACTED]") keeps its scheme name.
+    if (value.includes(REDACTED_ERROR_VALUE)) return match;
+    const core = value.replace(TRAILING_PUNCTUATION_PATTERN, "");
+    return looksLikeCredentialValue(core) ? `${key}${separator}${REDACTED_ERROR_VALUE}${value.slice(core.length)}` : match;
+  });
+}
 
 const ERROR_TEXT_PATTERNS: ReadonlyArray<readonly [RegExp, string]> = [
-  // Authorization scheme values wherever they appear (headers, cookies, HTML, JSON messages); the value must
-  // be long or carry a digit or base64 padding so prose such as "Basic authentication" is left alone.
-  [/\b(Bearer|Basic|Digest|Negotiate|SSWS|Token)\s+(?=[A-Za-z0-9\-._~+/=:]{16,}|[A-Za-z0-9\-._~+/=:]*[\d+/=])[A-Za-z0-9\-._~+/=:]{8,}/gi, `$1 ${REDACTED_ERROR_VALUE}`],
+  // Authorization scheme values wherever they appear (headers, cookies, HTML, JSON messages); the value must be
+  // long, carry a digit or base64 symbol, or change case inside the word, so prose such as "Basic authentication"
+  // and "Bearer Token" stays.
+  // Case-sensitive so the inner-case-change test means what it says (under /i, [a-z][A-Z] is any two letters).
+  [/\b(Bearer|bearer|BEARER|Basic|basic|BASIC|Digest|digest|Negotiate|negotiate|SSWS|Token|token|TOKEN|ApiKey|apikey|APIKEY|Api-Key|api-key)\s+(?=[A-Za-z0-9\-._~+/=:]{16,}|[A-Za-z0-9\-._~+/=:]*[\d+/=]|[A-Za-z0-9\-._~+/=:]*[a-z][A-Z])[A-Za-z0-9\-._~+/=:]{6,}/g, `$1 ${REDACTED_ERROR_VALUE}`],
   // JWT-shaped strings.
   [/\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}/g, REDACTED_ERROR_VALUE],
-  // AWS access key ids, 40-character secret access keys, long secret-shaped blobs, and hex API keys.
-  [/\b(?:AKIA|ASIA|AROA|AIDA|AGPA|ANPA|ANVA|APKA)[A-Z0-9]{16}\b/g, REDACTED_ERROR_VALUE],
+  // PEM blocks, whole or cut off.
+  [/-----BEGIN [A-Z0-9 ]+-----[\s\S]*?(?:-----END [A-Z0-9 ]+-----|$)/g, REDACTED_ERROR_VALUE],
+  // AWS access key ids, 40-character secret access keys, long secret-shaped blobs, and hex digests.
+  [/\b(?:AKIA|ASIA|AROA|AIDA|AGPA|ANPA|ANVA|APKA|ABIA|ACCA)[A-Z0-9]{16}\b/g, REDACTED_ERROR_VALUE],
   [/(?<![A-Za-z0-9/+=])[A-Za-z0-9/+]{40}(?![A-Za-z0-9/+=])/g, REDACTED_ERROR_VALUE],
   // Long blobs must carry a digit so camelCase identifiers survive.
   [/(?<![A-Za-z0-9+_=-])(?=[A-Za-z0-9+_-]*\d)[A-Za-z0-9+_-]{40,}={0,2}(?![A-Za-z0-9+_=-])/g, REDACTED_ERROR_VALUE],
   [/\b[a-f0-9]{32,}\b/gi, REDACTED_ERROR_VALUE],
   // Cookie headers carry session values in free form.
   [/\b(set-cookie|cookie)(\s*[:=]\s*)[^\n<>]+/gi, `$1$2${REDACTED_ERROR_VALUE}`],
-  // key=value, key: value, and "key":"value" pairs whose key names a credential.
-  [new RegExp(`\\b(${ERROR_CREDENTIAL_KEY_PATTERN})(["']?\\s*[=:]\\s*["']?)${ERROR_CREDENTIAL_VALUE_PATTERN}`, "gi"), `$1$2${REDACTED_ERROR_VALUE}`],
 ];
 
 // URL userinfo and query strings anywhere in the string, not only when the string starts with a URL.
 const ERROR_URL_PATTERN = /\b(https?:\/\/)(?:[^\s/@"'<>]+@)?([^\s?#"'<>]+)(\?[^\s#"'<>]*)?/gi;
+
+/**
+ * Rule 9 scrub boundary for bare values. A run of 16 or more token characters is removed when it is shaped
+ * like a token (base64 symbols, digits scattered through its letters, or casing that changes more often than
+ * once every three letters) and kept when it is shaped like a name: "-" or "_" separated segments that are
+ * each letters in any casing, digits alone, or letters with one digit group (`prod-us-east-2026`,
+ * `AWSLambdaBasicExecutionRole`, `sha256`), an uppercase code, or a canonical UUID. "/", ".", ":", "@", and
+ * whitespace end a run, so path segments, hostnames, ARNs, and emails are judged piece by piece. Opaque
+ * identifiers whose shape is a token's are removed from error text as well; they travel in structured fields.
+ */
+const LONG_TOKEN_RUN_PATTERN = /[A-Za-z0-9+_-]{16,}(?:={1,2}(?![A-Za-z0-9&]))?/g;
+const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const UPPERCASE_CODE_PATTERN = /^[A-Z][A-Z_]*$|^[A-Z][A-Z0-9]*(?:[_-][A-Z0-9]+)+$/;
+const MIN_LETTERS_FOR_CASING = 6;
+
+const CAMEL_WORD_PATTERN = /[A-Z]+(?![a-z])|[A-Z]?[a-z]+/g;
+const MAX_SHORT_WORD_LENGTH = 2;
+
+/**
+ * Token-shaped casing. Split at camelCase boundaries, a name is words and acronyms of three letters or more
+ * (`GetAccessKeyLastUsed`, `AWSLambdaBasicExecutionRole`, `getHTTPSUrl`), while a random run breaks into
+ * one- and two-letter pieces (`bPxRfiCYcanaryKEYqm`: b, Px, C, KE). Two or more such pieces making up at
+ * least a third of the words is the token signal; one short word (`GetEbsEncryptionByDefault`) is a name.
+ */
+function hasTokenCasing(letters: string): boolean {
+  if (letters.length < MIN_LETTERS_FOR_CASING) return false;
+  const words = letters.match(CAMEL_WORD_PATTERN) ?? [];
+  const shortWords = words.filter((word) => word.length <= MAX_SHORT_WORD_LENGTH).length;
+  return shortWords >= 2 && shortWords * 3 >= words.length;
+}
+
+/** A "-" or "_" separated segment shaped like part of a name: empty, digits alone, or letters with at most one digit group and no token casing. */
+function isNameSegment(segment: string): boolean {
+  if (segment.length === 0 || /^\d+$/.test(segment)) return true;
+  if (!/^[A-Za-z0-9]+$/.test(segment)) return false;
+  if ((segment.match(/\d+/g) ?? []).length > 1) return false;
+  return !hasTokenCasing(segment.replace(/\d+/g, ""));
+}
+
+function looksLikeToken(run: string): boolean {
+  if (UUID_PATTERN.test(run) || UPPERCASE_CODE_PATTERN.test(run)) return false;
+  if (/[+=]/.test(run)) return true;
+  return run.split(/[-_]/).some((segment) => !isNameSegment(segment));
+}
+
+function scrubLongTokens(text: string): string {
+  return text.replace(LONG_TOKEN_RUN_PATTERN, (run: string) => (looksLikeToken(run) ? REDACTED_ERROR_VALUE : run));
+}
 
 /**
  * Rule 9 sink for error text. describeError() (every attemptAwsRead failure and every access probe) and
@@ -511,13 +623,15 @@ const ERROR_URL_PATTERN = /\b(https?:\/\/)(?:[^\s/@"'<>]+@)?([^\s?#"'<>]+)(\?[^\
  * a URL into findings, summaries, access checks, or the bundle.
  */
 export function redactErrorText(text: string): string {
-  let scrubbed = text.replace(ERROR_URL_PATTERN, (_match, scheme: string, hostPath: string, query?: string) =>
+  let scrubbed = scrubConfiguredSecrets(text);
+  scrubbed = scrubbed.replace(ERROR_URL_PATTERN, (_match, scheme: string, hostPath: string, query?: string) =>
     `${scheme}${hostPath}${query ? `?${REDACTED_ERROR_VALUE}` : ""}`,
   );
   for (const [pattern, replacement] of ERROR_TEXT_PATTERNS) {
     scrubbed = scrubbed.replace(pattern, replacement);
   }
-  return scrubbed;
+  scrubbed = scrubCredentialPairs(scrubbed);
+  return scrubLongTokens(scrubbed);
 }
 
 /** Content type of the response an SDK error carries, when the SDK attached one. */
@@ -671,14 +785,21 @@ export class AwsCredentialProviderError extends Error {
   }
 }
 
-/** Wraps a provider so every failure while resolving credentials surfaces as AwsCredentialProviderError. */
+/**
+ * Wraps a provider so every failure while resolving credentials surfaces as AwsCredentialProviderError, and
+ * registers the resolved secret access key and session token as configured secrets so an error string that
+ * echoes either (whatever its shape, in any encoded form) is scrubbed.
+ */
 function guardCredentialProvider(provider: string, resolve: AwsCredentialProvider): AwsCredentialProvider {
   return async (options) => {
+    let credentials;
     try {
-      return await resolve(options);
+      credentials = await resolve(options);
     } catch (error) {
       throw new AwsCredentialProviderError(provider, error);
     }
+    registerConfiguredSecrets(credentials.secretAccessKey, credentials.sessionToken);
+    return credentials;
   };
 }
 

@@ -28,21 +28,28 @@ import {
   resolveSecureOutputPath,
   runDuoAccessCheck,
 } from "../dist/extensions/grc-tools/duo.js";
-import { assertSecretsAbsent, readBundleFiles, readZipEntries } from "./helpers/bundle-contents.mjs";
+import { readBundleFiles, readZipEntries } from "./helpers/bundle-contents.mjs";
 import {
   CANARY,
+  CANARY_VALUES,
+  ENCODED_FORM_SECRET,
   HTML_BODY_NOTE,
+  PARSER_SNIPPET_CANARY,
+  PARSER_WORDING,
   REDACTED_CANARY_URL,
   SHORT_BODY_CANARY,
   SHORT_BODY_CONTENT_TYPE,
-  assertNoCanaries,
-  assertNoCanariesInFiles,
+  assertCanaryFixture,
+  assertNoCanaryWindows,
+  assertNoCanaryWindowsInFiles,
   assertNoShortBodyFragments,
   assertRedactionCases,
+  assertScrubBoundary,
   assertShortBodyRecordedAsNote,
   htmlCanaryBody,
   jsonCanaryMessage,
   parserMessageFor,
+  parserSnippetBody,
   shortBodyResponse,
 } from "./helpers/error-canaries.mjs";
 
@@ -54,11 +61,18 @@ function dataset(data, error) {
   return error ? { data, error } : { data };
 }
 
+/**
+ * The configured Duo credentials, alphanumeric and random-looking so no 6-character window of them occurs in the
+ * fixture's legitimate values (see the fixture self-check); both are kept out of every output.
+ */
+const DUO_IKEY_CANARY = "DI3QW3S5UJCSFJFV7VMU";
+const DUO_SKEY_CANARY = "H3kzAfks4jCg3VzH9uLuQdH38trqd9uqyzAvJZjd";
+
 function createSampleConfig() {
   return {
     apiHost: "api-example.duosecurity.com",
-    ikey: "DIXXXXXXXXXXXXXXXXXX",
-    skey: "super-secret-key",
+    ikey: DUO_IKEY_CANARY,
+    skey: DUO_SKEY_CANARY,
     lookbackDays: 30,
     sourceChain: ["tests"],
   };
@@ -1766,8 +1780,19 @@ test("rule 9: projectCollectionStatus keeps counts, totals, paging outcome, and 
   assert.equal(JSON.stringify(projected).includes("alice@example.gov"), false);
 });
 
-const INTEGRATION_SECRET = "sk-integration-plaintext-9f8e7d6c";
-const BYPASS_CODE_VALUE = "402938475661";
+const INTEGRATION_SECRET = "Z8NuV9GgLCQwL2THRTgLkmzsLgf6bbScBFMZ9NWd";
+const BYPASS_CODE_VALUE = "837488763496";
+
+/** Every planted canary a Duo output is swept for, window by window. */
+const DUO_PLANTED_CANARIES = Object.freeze([
+  ...CANARY_VALUES,
+  SHORT_BODY_CANARY,
+  PARSER_SNIPPET_CANARY,
+  DUO_IKEY_CANARY,
+  DUO_SKEY_CANARY,
+  INTEGRATION_SECRET,
+  BYPASS_CODE_VALUE,
+]);
 
 /** Every documented endpoint the client reads, answered healthily; each key is one surface. */
 function healthyDuoRoutes() {
@@ -1819,8 +1844,8 @@ test("rule 9: the exported bundle and its zip never contain the skey, integratio
   const files = readBundleFiles(result.outputDir);
   const zipEntries = readZipEntries(result.zipPath);
   const secrets = [config.skey, config.ikey, INTEGRATION_SECRET, BYPASS_CODE_VALUE];
-  assertSecretsAbsent(assert, files, secrets, "bundle directory");
-  assertSecretsAbsent(assert, zipEntries, secrets, "bundle zip");
+  assertNoCanaryWindowsInFiles(assert, files, secrets, "bundle directory");
+  assertNoCanaryWindowsInFiles(assert, zipEntries, secrets, "bundle zip");
   assert.ok(zipEntries.size >= files.size, "every bundle file is inside the zip");
 
   const integrations = JSON.parse(files.get("core_data/integrations.json"));
@@ -1854,6 +1879,21 @@ test("rule 9: redactErrorText scrubs every credential shape anywhere in an error
   assert.equal(redactErrorText(`skey ${createSampleConfig().skey} echoed`), "skey [REDACTED] echoed", "the configured skey is scrubbed wherever it appears");
 });
 
+test("rule 9 scrub boundary: name-shaped values stay bare, any value in a carrier is removed, token-shaped values are removed bare, the configured secret is removed in every encoded form, and the integration's fixed texts survive", () => {
+  new DuoAuditorClient({ ...createSampleConfig(), skey: ENCODED_FORM_SECRET }, { fetchImpl: async () => new Response("{}") });
+  assertScrubBoundary(assert, redactErrorText, {
+    configuredSecret: ENCODED_FORM_SECRET,
+    mustKeep: [
+      "GET /admin/v1/settings (403 Forbidden): Access denied (Insufficient permissions)",
+      "GET /admin/v2/logs/telephony (502 Bad Gateway): non-JSON body (text/html, 5120 bytes)",
+      "SyntaxError: response could not be parsed as JSON; the parser's message is not recorded because it quotes the body",
+      "bypass code inventory is empty but GET /admin/v1/settings could not be read (403 Forbidden)",
+      "allowed_auth_methods could not be read from GET /admin/v1/settings",
+      "policy Global-Policy-2026 allows sms_passcodes",
+    ],
+  });
+});
+
 const DUO_ACCESS_PROBE_PATHS = new Set([
   "/admin/v1/settings",
   "/admin/v1/users",
@@ -1874,6 +1914,34 @@ function canaryJsonResponse() {
   );
 }
 
+test("fixture self-check: every planted canary is alphanumeric and random-looking, and no 6-to-24-character window of any canary occurs in the healthy fixture's legitimate values, so a windowed leak assertion can fail only on a real echo", async () => {
+  const config = createSampleConfig();
+  const legitimate = new Map();
+  // The healthy routes carry the two bundle secrets by design (the bundle test proves they are redacted); everything else in them is legitimate.
+  const plantedInRoutes = [INTEGRATION_SECRET, BYPASS_CODE_VALUE];
+  for (const [path, route] of Object.entries(healthyDuoRoutes())) {
+    const body = await route().text();
+    legitimate.set(`route ${path}`, plantedInRoutes.reduce((text, planted) => text.replaceAll(planted, ""), body));
+  }
+  const client = new DuoAuditorClient(config, { fetchImpl: routedFetch(healthyDuoRoutes()) });
+  legitimate.set("check_access", await runDuoAccessCheck(client, config));
+  const datasets = [
+    await collectDuoAuthenticationData(client, config.lookbackDays),
+    await collectDuoAdminAccessData(client, config.lookbackDays),
+    await collectDuoIntegrationData(client),
+    await collectDuoMonitoringData(client, config.lookbackDays),
+  ];
+  legitimate.set("authentication assessment", assessDuoAuthentication(datasets[0], config));
+  legitimate.set("admin access assessment", assessDuoAdminAccess(datasets[1], config));
+  legitimate.set("integrations assessment", assessDuoIntegrations(datasets[2], config));
+  legitimate.set("monitoring assessment", assessDuoMonitoring(datasets[3], config));
+  const exported = await exportDuoAuditBundle(client, config, createTempBase("grclanker-duo-self-check-"));
+  for (const [name, text] of readBundleFiles(exported.outputDir)) legitimate.set(`bundle ${name}`, text);
+  for (const [name, text] of readZipEntries(exported.zipPath)) legitimate.set(`zip ${name}`, text);
+  legitimate.set("api host and lookback", { apiHost: config.apiHost, lookbackDays: config.lookbackDays });
+  assertCanaryFixture(assert, DUO_PLANTED_CANARIES, legitimate, "duo fixture");
+});
+
 test("rule 9: a 502 HTML page or a JSON error message carrying credentials on any surface never reaches a probe, finding, summary, or bundle file", async () => {
   const config = createSampleConfig();
   const outputRoot = createTempBase("grclanker-duo-canary-");
@@ -1889,7 +1957,7 @@ test("rule 9: a 502 HTML page or a JSON error message carrying credentials on an
       const client = new DuoAuditorClient(config, { fetchImpl: routedFetch({ ...healthyDuoRoutes(), [surface]: response }) });
 
       const access = await runDuoAccessCheck(client, config);
-      assertNoCanaries(assert, access, `${label} check_access`);
+      assertNoCanaryWindows(assert, access, DUO_PLANTED_CANARIES, `${label} check_access`);
       if (DUO_ACCESS_PROBE_PATHS.has(surface)) {
         const probe = access.probes.find((entry) => entry.path === surface);
         assert.ok(probe && probe.status !== "ok", `${label}: the probe for the failing surface is not ok`);
@@ -1911,17 +1979,17 @@ test("rule 9: a 502 HTML page or a JSON error message carrying credentials on an
       const recordedErrors = datasets.flatMap((data) => Object.values(data).flatMap((dataset) => (dataset?.error ? [dataset.error] : [])));
       assert.ok(recordedErrors.length > 0, `${label}: the failing surface records an error`);
       for (const error of recordedErrors) {
-        assertNoCanaries(assert, error, `${label} dataset error`);
+        assertNoCanaryWindows(assert, error, DUO_PLANTED_CANARIES, `${label} dataset error`);
         assert.match(error, expectedNote, `${label}: dataset error carries the expected note`);
       }
       for (const assessment of assessments) {
-        assertNoCanaries(assert, assessment, `${label} ${assessment.category} assessment`);
+        assertNoCanaryWindows(assert, assessment, DUO_PLANTED_CANARIES, `${label} ${assessment.category} assessment`);
       }
 
       const exported = await exportDuoAuditBundle(client, config, outputRoot);
       const files = readBundleFiles(exported.outputDir);
-      assertNoCanariesInFiles(assert, files, `${label} bundle`);
-      assertNoCanariesInFiles(assert, readZipEntries(exported.zipPath), `${label} zip`);
+      assertNoCanaryWindowsInFiles(assert, files, DUO_PLANTED_CANARIES, `${label} bundle`);
+      assertNoCanaryWindowsInFiles(assert, readZipEntries(exported.zipPath), DUO_PLANTED_CANARIES, `${label} zip`);
       assert.ok(exported.errorCount > 0, `${label}: the export records the failed read`);
       assert.match(files.get("_errors.log"), expectedNote, `${label}: _errors.log carries the expected note`);
       if (variant === "html") assert.match(files.get("_errors.log"), /502 Bad Gateway\): non-JSON body \(text\/html/);
@@ -2394,7 +2462,7 @@ test("rule 1 corollary: DUO-AUTH-006 keeps reading bypass codes when settings ar
 });
 
 test("config loader errors: a SyntaxError raised by the transport is recorded by name only, never by the parser's message that quotes the body", async () => {
-  const snippet = "<html>CANARY-PARSER-SNIPPET-4242</html>";
+  const snippet = parserSnippetBody();
   const fetchImpl = async () => {
     throw new SyntaxError(`Unexpected token '<', "${snippet}"... is not valid JSON`);
   };
@@ -2404,7 +2472,8 @@ test("config loader errors: a SyntaxError raised by the transport is recorded by
 
   await assert.rejects(() => client.getSettings(), (error) => {
     assert.equal(error.name, "DuoApiError");
-    assert.ok(!error.message.includes("CANARY-PARSER-SNIPPET") && !/Unexpected token/.test(error.message), `the parser's message was interpolated: ${error.message}`);
+    assertNoCanaryWindows(assert, error.message, [PARSER_SNIPPET_CANARY], "thrown client error");
+    assert.doesNotMatch(error.message, PARSER_WORDING, `the parser's message was interpolated: ${error.message}`);
     assert.equal(error.message, `Duo API request failed for /admin/v1/settings (network error: ${note})`);
     return true;
   });
@@ -2414,12 +2483,13 @@ test("config loader errors: a SyntaxError raised by the transport is recorded by
     JSON.stringify(assessDuoAuthentication(await collectDuoAuthenticationData(client, config.lookbackDays), config)),
   ];
   for (const text of outputs) {
-    assert.ok(!text.includes("CANARY-PARSER-SNIPPET") && !/Unexpected token/.test(text), `a slice of the parser's message reached an output: ${text.slice(0, 400)}`);
+    assertNoCanaryWindows(assert, text, [PARSER_SNIPPET_CANARY], "tool output");
+    assert.doesNotMatch(text, PARSER_WORDING, `a slice of the parser's message reached an output: ${text.slice(0, 400)}`);
     assert.ok(text.includes(note), `the output records the parse failure by name: ${text.slice(0, 400)}`);
   }
 });
 
-test("config loader errors: a 200 answer whose body is short non-JSON text is recorded as the non-JSON note only; no 8-character fragment of the body and no parser wording reaches the thrown client error, the access check, an assessment, or the bundle", async () => {
+test("config loader errors: a 200 answer whose body is short non-JSON text is recorded as the non-JSON note only; no 6-to-24-character window of the body and no parser wording reaches the thrown client error, the access check, an assessment, or the bundle", async () => {
   // Positive control for the class: V8 quotes the whole source when it is 21 characters or shorter.
   assert.ok(SHORT_BODY_CANARY.length <= 21 && parserMessageFor(SHORT_BODY_CANARY).includes(SHORT_BODY_CANARY), "the parser's message carries the whole short body");
 

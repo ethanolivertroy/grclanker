@@ -34,20 +34,28 @@ import {
   resolveSecureOutputPath,
   sanitizeScmUrl,
 } from "../dist/extensions/grc-tools/ansible.js";
-import { assertSecretsAbsent, readBundleFiles, readZipEntries } from "./helpers/bundle-contents.mjs";
+import { readBundleFiles, readZipEntries } from "./helpers/bundle-contents.mjs";
 import {
+  CANARY_VALUES,
+  ENCODED_FORM_SECRET,
   HTML_BODY_NOTE,
+  PARSER_SNIPPET_CANARY,
+  PARSER_WORDING,
   REDACTED_CANARY_URL,
   SHORT_BODY_CANARY,
   SHORT_BODY_CONTENT_TYPE,
+  assertCanaryFixture,
   assertNoCanaries,
-  assertNoCanariesInFiles,
+  assertNoCanaryWindows,
+  assertNoCanaryWindowsInFiles,
   assertNoShortBodyFragments,
   assertRedactionCases,
+  assertScrubBoundary,
   assertShortBodyRecordedAsNote,
   htmlCanaryBody,
   jsonCanaryMessage,
   parserMessageFor,
+  parserSnippetBody,
 } from "./helpers/error-canaries.mjs";
 
 const NOW = new Date("2026-09-21T00:00:00.000Z");
@@ -1122,7 +1130,7 @@ test("exportAnsibleAuditBundle writes the shared layout with compliance reports 
   const client = createMockClient();
   const config = {
     baseUrl: "https://aap.example.com",
-    token: "aap-token",
+    token: ANSIBLE_EXPORT_TOKEN_CANARY,
     timeoutMs: 30_000,
     verifySsl: true,
     sourceChain: ["tests"],
@@ -1171,7 +1179,7 @@ test("exportAnsibleAuditBundle writes the shared layout with compliance reports 
   assert.equal(metadata.controls_assessed, 30);
   assert.equal(metadata.verify_ssl, true);
   const rawBundle = readFileSync(join(result.outputDir, "core_data", "credentials.json"), "utf8");
-  assert.ok(!rawBundle.includes("aap-token"));
+  assertNoCanaryWindows(assert, rawBundle, [ANSIBLE_EXPORT_TOKEN_CANARY], "core_data/credentials.json");
 });
 
 test("exportAnsibleAuditBundle writes _errors.log when some reads fail but the bundle completes", async () => {
@@ -1211,39 +1219,48 @@ test("verdict rule 8: re-running the export allocates a new directory and never 
   );
 });
 
+/**
+ * Planted values that must never reach the bundle, alphanumeric and random-looking so no 6-character window of
+ * them occurs in the fixture's legitimate values (see the fixture self-check).
+ */
 const FAKE_ANSIBLE_SECRETS = {
-  jobVar: "FAKE_SECRET_JOB_VAR_1",
-  templateVar: "FAKE_SECRET_TEMPLATE_VAR_1",
-  workflowVar: "FAKE_SECRET_WORKFLOW_VAR_1",
-  scheduleVar: "FAKE_SECRET_SCHEDULE_VAR_1",
-  hostVar: "FAKE_SECRET_HOST_VAR_1",
-  sourceVar: "FAKE_SECRET_SOURCE_VAR_1",
-  inventoryVar: "FAKE_SECRET_INVENTORY_VAR_1",
-  groupVar: "FAKE_SECRET_GROUP_VAR_1",
-  proxyPassword: "FAKE_SECRET_PROXY_1",
-  galaxyToken: "FAKE_SECRET_GALAXY_1",
-  webhookPath: "FAKE_SECRET_WEBHOOK_1",
-  errorWebhookPath: "FAKE_SECRET_ERROR_WEBHOOK_1",
-  headerValue: "FAKE_SECRET_HEADER_1",
-  pairHeaderValue: "FAKE_SECRET_PAIR_HEADER_1",
-  slackToken: "FAKE_SECRET_SLACK_TOKEN_1",
-  scmToken: "FAKE_SECRET_SCM_TOKEN_1",
-  activityChange: "FAKE_SECRET_ACTIVITY_1",
-  surveyDefault: "FAKE_SECRET_SURVEY_DEFAULT_1",
-  credentialInput: "FAKE_SECRET_CRED_INPUT_1",
-  tokenValue: "FAKE_SECRET_TOKEN_VALUE_1",
-  refreshToken: "FAKE_SECRET_REFRESH_1",
-  ldapBind: "FAKE_SECRET_LDAP_BIND_1",
-  samlKey: "FAKE_PRIVATE_KEY_SAML_1",
-  oauthSecret: "FAKE_SECRET_OAUTH_1",
-  redhatPassword: "FAKE_SECRET_REDHAT_1",
-  licenseKey: "FAKE_SECRET_LICENSE_1",
-  loggingPassword: "FAKE_SECRET_LOGGING_1",
-  userHash: "FAKE_HASH_USER_1",
-  meHash: "FAKE_HASH_ME_1",
-  podSpec: "FAKE_SECRET_POD_SPEC_1",
-  notificationBody: "FAKE_SECRET_NOTIFICATION_BODY_1",
+  jobVar: "VGXeGJApvMQs9N9Y",
+  templateVar: "jBq3DGELKj3xDV8H",
+  workflowVar: "CMdZGBb9hMDPcVpZ",
+  scheduleVar: "Y8gNVnxh6p7QBk5U",
+  hostVar: "bUwvuYPqv7yeHWfK",
+  sourceVar: "vu2F9nhApyBVTj8X",
+  inventoryVar: "k4wMSMDh5DKqUQRA",
+  groupVar: "RQ2avbAVnVWzCv9W",
+  proxyPassword: "xTMeP8Wvx92YAXw8",
+  galaxyToken: "Rrv2Mnx7EX7KgtTz",
+  webhookPath: "w5Mv8GTS59UdHUAR",
+  errorWebhookPath: "aHBxdNsXyU59Ckeq",
+  headerValue: "bSvyaK4E7sDNdZqy",
+  pairHeaderValue: "pr5yrQe2qGeJBP3f",
+  slackToken: "uUVRsNMEa9w6DN2K",
+  scmToken: "X89StUkLvF4K83bS",
+  activityChange: "QWK8kfEm8Gd6DXVn",
+  surveyDefault: "qQp96Geme6eWUxjR",
+  credentialInput: "Pj8nfpDspLwLrnSD",
+  tokenValue: "JSPjcxzMspntP5VF",
+  refreshToken: "hGcSb2PCzW26RTva",
+  ldapBind: "KhwadpYp5MPJkFDF",
+  samlKey: "Y5GNkYQtTmcrkMM4",
+  oauthSecret: "wU4Gga3pBBcjBCtv",
+  redhatPassword: "vLcMQ4fU9Ckw4k2y",
+  licenseKey: "c9nD6HXEBzhV9Th5",
+  loggingPassword: "cWqm4dQNJrBzMMJY",
+  userHash: "jgN3H9xRJb3Dnatz",
+  meHash: "aS3Hte3RFCkaP2es",
+  podSpec: "ZWGCgMMzLwj5zm3p",
+  notificationBody: "yzdzMCH3vcrj7LK6",
 };
+
+/** The export tests' configured token and the current user's email local part, both kept out of the bundle. */
+const ANSIBLE_EXPORT_TOKEN_CANARY = "VqAngJDvPREAn5FP2K3M";
+const ANSIBLE_AUDITOR_LOCAL_PART_CANARY = "KE9cNJeCaYuq";
+const ANSIBLE_AUDITOR_EMAIL = `${ANSIBLE_AUDITOR_LOCAL_PART_CANARY}@example.com`;
 
 function secretBearingRoutes() {
   const secrets = FAKE_ANSIBLE_SECRETS;
@@ -1275,9 +1292,9 @@ function secretBearingRoutes() {
       { id: 1, name: "weekly patch", unified_job_template: 10, enabled: true, next_run: "2026-09-27T00:00:00Z", rrule: "DTSTART:20260101T000000Z RRULE:FREQ=WEEKLY;INTERVAL=1", extra_data: { api_token: secrets.scheduleVar } },
     ],
     "/api/v2/workflow_job_templates/": [{ id: 1, name: "Patch and validate", description: "", extra_vars: `{"client_secret": "${secrets.workflowVar}"}` }],
-    "/api/v2/organizations/1/admins/": [{ id: 1, username: "auditor", password: secrets.userHash, email: "auditor@example.com" }],
+    "/api/v2/organizations/1/admins/": [{ id: 1, username: "auditor", password: secrets.userHash, email: ANSIBLE_AUDITOR_EMAIL }],
     "/api/v2/users/": [
-      { ...SUPERUSER, password: secrets.userHash, email: "auditor@example.com", ldap_dn: "cn=auditor,dc=example" },
+      { ...SUPERUSER, password: secrets.userHash, email: ANSIBLE_AUDITOR_EMAIL, ldap_dn: "cn=auditor,dc=example" },
       { ...LIMITED_USER, password: secrets.userHash },
       { id: 3, username: "reviewer", is_superuser: false, is_system_auditor: true, password: secrets.userHash },
     ],
@@ -1307,8 +1324,8 @@ function secretBearingRoutes() {
 test("verdict rule 9: exportAnsibleAuditBundle never writes variables bodies, credential inputs, tokens, webhook secrets, or settings secrets into the bundle or its zip", async () => {
   const base = createTempBase("grclanker-ansible-export-secrets-");
   const secrets = Object.values(FAKE_ANSIBLE_SECRETS);
-  const client = createMockClient({ routes: secretBearingRoutes(), me: { ...SUPERUSER, password: FAKE_ANSIBLE_SECRETS.meHash, email: "auditor@example.com" } });
-  const config = { baseUrl: "https://aap.example.com", token: "aap-token", timeoutMs: 30_000, verifySsl: true, sourceChain: ["tests"] };
+  const client = createMockClient({ routes: secretBearingRoutes(), me: { ...SUPERUSER, password: FAKE_ANSIBLE_SECRETS.meHash, email: ANSIBLE_AUDITOR_EMAIL } });
+  const config = { baseUrl: "https://aap.example.com", token: ANSIBLE_EXPORT_TOKEN_CANARY, timeoutMs: 30_000, verifySsl: true, sourceChain: ["tests"] };
 
   const result = await exportAnsibleAuditBundle(client, config, base, {});
   assert.equal(result.findingCount, 30);
@@ -1316,17 +1333,15 @@ test("verdict rule 9: exportAnsibleAuditBundle never writes variables bodies, cr
   for (const relativePath of ["core_data/jobs.json", "core_data/job_settings.json", "core_data/credentials.json", "core_data/tokens.json", "core_data/projects.json", "core_data/notification_templates.json", "core_data/template_error_notifications.json", "core_data/survey_specs.json", "core_data/activity_stream.json", "core_data/settings_authentication.json", "analysis/platform-security.json"]) {
     assert.ok(files.has(join(...relativePath.split("/"))), `expected ${relativePath}`);
   }
-  assertSecretsAbsent(assert, files, [...secrets, "aap-token", "auditor@example.com"], "bundle directory");
+  assertNoCanaryWindowsInFiles(assert, files, [...secrets, ANSIBLE_EXPORT_TOKEN_CANARY, ANSIBLE_AUDITOR_LOCAL_PART_CANARY], "bundle directory");
   const zipEntries = readZipEntries(result.zipPath);
   assert.equal(zipEntries.size, files.size, "the zip carries exactly the written files");
-  assertSecretsAbsent(assert, zipEntries, [...secrets, "aap-token"], "zip archive");
+  assertNoCanaryWindowsInFiles(assert, zipEntries, [...secrets, ANSIBLE_EXPORT_TOKEN_CANARY, ANSIBLE_AUDITOR_LOCAL_PART_CANARY], "zip archive");
 
   const assessments = await runAllAssessments(client);
   const access = await checkAnsibleAccess(client);
-  for (const secret of [...secrets, "auditor@example.com"]) {
-    assert.ok(!JSON.stringify(assessments).includes(secret), `${secret} appears in an assessment result`);
-    assert.ok(!JSON.stringify(access).includes(secret), `${secret} appears in the access check result`);
-  }
+  assertNoCanaryWindows(assert, assessments, [...secrets, ANSIBLE_AUDITOR_LOCAL_PART_CANARY], "assessment results");
+  assertNoCanaryWindows(assert, access, [...secrets, ANSIBLE_AUDITOR_LOCAL_PART_CANARY], "access check result");
   const plaintext = byId(assessments[2], "AAP-CRED-04");
   assert.equal(plaintext.status, "fail", "the in-memory scanner still sees the raw variables");
   assert.deepEqual(plaintext.evidence.hits.map((hit) => hit.type).sort(), ["group", "inventory", "job_template", "survey_spec"]);
@@ -1419,30 +1434,31 @@ test("verdict rule 9: redaction helpers cover camelCase keys, pair shapes, envir
 });
 
 test("verdict rule 9: AnsibleAapClient error messages keep the structured detail and never echo raw response bodies", async () => {
+  const htmlBody = `<html>gateway error ${ANSIBLE_ERROR_BODY_CANARIES.html}</html>`;
   const client = new AnsibleAapClient(
     { baseUrl: "https://aap.example.com", token: "aap-token", timeoutMs: 30_000, verifySsl: true, sourceChain: ["tests"] },
     {
       fetchImpl: async (input) => {
         const url = new URL(typeof input === "string" ? input : input.toString());
         if (url.pathname === "/api/v2/jobs/") {
-          return new Response(JSON.stringify({ detail: "You do not have permission to perform this action.", token: "FAKE_SECRET_TOKEN_1" }), {
+          return new Response(JSON.stringify({ detail: "You do not have permission to perform this action.", token: ANSIBLE_ERROR_BODY_CANARIES.json }), {
             status: 403,
             statusText: "Forbidden",
             headers: { "content-type": "application/json" },
           });
         }
-        return new Response("<html>gateway error FAKE_SECRET_TOKEN_2</html>", { status: 502, statusText: "Bad Gateway", headers: { "content-type": "text/html" } });
+        return new Response(htmlBody, { status: 502, statusText: "Bad Gateway", headers: { "content-type": "text/html" } });
       },
     },
   );
   await assert.rejects(() => client.get("/api/v2/jobs/"), (error) => {
     assert.match(error.message, /\/api\/v2\/jobs\/ \(403 Forbidden\) You do not have permission/);
-    assert.ok(!error.message.includes("FAKE_SECRET_TOKEN_1"));
+    assertNoCanaryWindows(assert, error.message, [ANSIBLE_ERROR_BODY_CANARIES.json], "JSON error body field");
     return true;
   });
   await assert.rejects(() => client.get("/api/v2/hosts/"), (error) => {
-    assert.equal(error.message, "AAP request failed: /api/v2/hosts/ (502 Bad Gateway): non-JSON body (text/html, 46 bytes)");
-    assert.ok(!error.message.includes("FAKE_SECRET_TOKEN_2"), "no slice of a non-JSON body reaches the error string");
+    assert.equal(error.message, `AAP request failed: /api/v2/hosts/ (502 Bad Gateway): non-JSON body (text/html, ${Buffer.byteLength(htmlBody, "utf8")} bytes)`);
+    assertNoCanaryWindows(assert, error.message, [ANSIBLE_ERROR_BODY_CANARIES.html], "non-JSON body");
     assert.equal(error.status, 502);
     assert.equal(error.endpoint, "/api/v2/hosts/");
     return true;
@@ -1532,7 +1548,23 @@ test("rule 1 corollary: partialNotes caps any pass built on an unreadable view a
 
 // Fixtures over the real AnsibleAapClient: the error constructor, the request wrapper, the login
 // path, and every collector catch block are the code under test, not the mock client above.
-const AAP_CLIENT_CONFIG = { baseUrl: "https://aap.example.com", token: "FAKE_SECRET_AAP_RUN_TOKEN_90210", timeoutMs: 30_000, verifySsl: true, sourceChain: ["tests"] };
+/** Planted credentials for the client tests: the run token and the values an error body echoes. */
+const ANSIBLE_RUN_TOKEN_CANARY = "VJQu6BSFDkFPS2g6GsLGSMsg";
+const ANSIBLE_ERROR_BODY_CANARIES = Object.freeze({ json: "Uw34sFSRwES87v9q", html: "PYZakdJQxmAaNZv7" });
+
+/** Every planted canary an Ansible output is swept for, window by window. */
+const ANSIBLE_PLANTED_CANARIES = Object.freeze([
+  ...CANARY_VALUES,
+  SHORT_BODY_CANARY,
+  PARSER_SNIPPET_CANARY,
+  ...Object.values(FAKE_ANSIBLE_SECRETS),
+  ANSIBLE_EXPORT_TOKEN_CANARY,
+  ANSIBLE_AUDITOR_LOCAL_PART_CANARY,
+  ANSIBLE_RUN_TOKEN_CANARY,
+  ...Object.values(ANSIBLE_ERROR_BODY_CANARIES),
+]);
+
+const AAP_CLIENT_CONFIG = { baseUrl: "https://aap.example.com", token: ANSIBLE_RUN_TOKEN_CANARY, timeoutMs: 30_000, verifySsl: true, sourceChain: ["tests"] };
 
 function aapResponse(body, status, statusText, contentType) {
   return new Response(body, { status, statusText, headers: { "content-type": contentType } });
@@ -1621,6 +1653,37 @@ test("rule 9: redactErrorText scrubs every credential shape in the shared cases 
   assert.equal(redactErrorText(`login failed with token ${AAP_CLIENT_CONFIG.token}`), "login failed with token [REDACTED]", "the configured token is a registered secret once a client exists");
 });
 
+test("rule 9 scrub boundary: name-shaped values stay bare, any value in a carrier is removed, token-shaped values are removed bare, the configured secret is removed in every encoded form, and the integration's fixed texts survive", () => {
+  new AnsibleAapClient({ ...AAP_CLIENT_CONFIG, token: ENCODED_FORM_SECRET }, { fetchImpl: async () => new Response("{}"), now: () => NOW });
+  assertScrubBoundary(assert, redactErrorText, {
+    configuredSecret: ENCODED_FORM_SECRET,
+    mustKeep: [
+      "AAP request failed: /api/v2/settings/system/ (403 Forbidden): You do not have permission to perform this action.",
+      "AAP request failed: /api/v2/hosts/ (502 Bad Gateway): non-JSON body (text/html, 46 bytes)",
+      "SyntaxError: response could not be parsed as JSON; the parser's message is not recorded because it quotes the body",
+      "inventories: unreadable (AAP request failed: /api/v2/inventories/ (403 Forbidden))",
+      "ACTIVITY_STREAM_ENABLED not readable; records under one day old cannot prove the stream is on",
+      "organization Default-Org-2026 has 3 teams with Admin on every inventory",
+    ],
+  });
+});
+
+test("fixture self-check: every planted canary is alphanumeric and random-looking, and no 6-to-24-character window of any canary occurs in the healthy fixture's legitimate values, so a windowed leak assertion can fail only on a real echo", async () => {
+  const legitimate = new Map();
+  for (const [path, route] of Object.entries(healthyAapRoutes())) {
+    legitimate.set(`route ${path}`, await route(new URL(`https://aap.example.com${path}`)).text());
+  }
+  const run = await runEveryAnsibleTool(aapClient(healthyAapRoutes()), createTempBase("grclanker-ansible-self-check-"));
+  assert.equal(run.accessError, undefined);
+  assert.equal(run.exportError, undefined);
+  legitimate.set("check_access", run.access);
+  for (const assessment of run.assessments) legitimate.set(assessment.title, assessment);
+  for (const [name, text] of readBundleFiles(run.exported.outputDir)) legitimate.set(`bundle ${name}`, text);
+  for (const [name, text] of readZipEntries(run.exported.zipPath)) legitimate.set(`zip ${name}`, text);
+  legitimate.set("users", [SUPERUSER, LIMITED_USER]);
+  assertCanaryFixture(assert, ANSIBLE_PLANTED_CANARIES, legitimate, "ansible fixture");
+});
+
 test("rule 9: a 502 HTML page or a JSON error message carrying credentials on any AAP surface never reaches a probe, finding, summary, or bundle file", async () => {
   const outputRoot = createTempBase("grclanker-ansible-canary-");
 
@@ -1648,10 +1711,10 @@ test("rule 9: a 502 HTML page or a JSON error message carrying credentials on an
 
       if (surface === "/api/v2/me/") {
         assert.ok(run.accessError, `${label}: the access check fails outright when the current user cannot be read`);
-        assertNoCanaries(assert, run.accessError, `${label} check_access error`);
+        assertNoCanaryWindows(assert, run.accessError, ANSIBLE_PLANTED_CANARIES, `${label} check_access error`);
         assert.match(run.accessError, expectedNote, `${label}: the thrown text carries the expected note`);
       } else {
-        assertNoCanaries(assert, run.access, `${label} check_access`);
+        assertNoCanaryWindows(assert, run.access, ANSIBLE_PLANTED_CANARIES, `${label} check_access`);
         if (probed.has(surface) && surface !== "/api/v2/ping/") {
           const failed = run.access.surfaces.filter((entry) => entry.status === "not_readable");
           assert.deepEqual(failed.map((entry) => entry.endpoint), [surface], `${label}: the access check records exactly the failing surface`);
@@ -1663,7 +1726,7 @@ test("rule 9: a 502 HTML page or a JSON error message carrying credentials on an
         }
       }
 
-      for (const assessment of run.assessments) assertNoCanaries(assert, assessment, `${label} ${assessment.title}`);
+      for (const assessment of run.assessments) assertNoCanaryWindows(assert, assessment, ANSIBLE_PLANTED_CANARIES, `${label} ${assessment.title}`);
       const recorded = recordedAnsibleErrors(run.assessments);
       if (surface !== "/api/v2/ping/") {
         assert.ok(recorded.length > 0, `${label}: the failing surface is recorded by an assessment`);
@@ -1675,13 +1738,12 @@ test("rule 9: a 502 HTML page or a JSON error message carrying credentials on an
 
       if (run.exportError !== undefined) {
         assert.equal(surface, "/api/v2/me/", `${label}: only an unreadable current user fails the export outright (${run.exportError})`);
-        assertNoCanaries(assert, run.exportError, `${label} export error`);
+        assertNoCanaryWindows(assert, run.exportError, ANSIBLE_PLANTED_CANARIES, `${label} export error`);
         continue;
       }
       const files = readBundleFiles(run.exported.outputDir);
-      assertNoCanariesInFiles(assert, files, `${label} bundle`);
-      assertNoCanariesInFiles(assert, readZipEntries(run.exported.zipPath), `${label} zip`);
-      for (const [name, text] of files) assert.ok(!text.includes(AAP_CLIENT_CONFIG.token), `${label}: the configured token leaked into ${name}`);
+      assertNoCanaryWindowsInFiles(assert, files, ANSIBLE_PLANTED_CANARIES, `${label} bundle`);
+      assertNoCanaryWindowsInFiles(assert, readZipEntries(run.exported.zipPath), ANSIBLE_PLANTED_CANARIES, `${label} zip`);
       if (surface !== "/api/v2/ping/") {
         assert.ok(run.exported.errorCount > 0, `${label}: the export logs the failed read`);
         assert.match(files.get("_errors.log"), expectedNote, `${label}: _errors.log carries the expected note`);
@@ -1949,7 +2011,7 @@ test("resolveSecureOutputPath rejects traversal and symlink parents", () => {
 });
 
 test("config loader errors: a SyntaxError raised by the transport is recorded by name only, never by the parser's message that quotes the body", async () => {
-  const snippet = "<html>CANARY-PARSER-SNIPPET-4242</html>";
+  const snippet = parserSnippetBody();
   const fetchImpl = async () => {
     throw new SyntaxError(`Unexpected token '<', "${snippet}"... is not valid JSON`);
   };
@@ -1958,7 +2020,8 @@ test("config loader errors: a SyntaxError raised by the transport is recorded by
 
   await assert.rejects(() => client.get("/api/v2/me/"), (error) => {
     assert.equal(error.name, "AnsibleApiError");
-    assert.ok(!error.message.includes("CANARY-PARSER-SNIPPET") && !/Unexpected token/.test(error.message), `the parser's message was interpolated: ${error.message}`);
+    assertNoCanaryWindows(assert, error.message, [PARSER_SNIPPET_CANARY], "thrown client error");
+    assert.doesNotMatch(error.message, PARSER_WORDING, `the parser's message was interpolated: ${error.message}`);
     assert.equal(error.message, `AAP request failed: /api/v2/me/ (network error: ${note})`);
     return true;
   });
@@ -1968,12 +2031,13 @@ test("config loader errors: a SyntaxError raised by the transport is recorded by
     JSON.stringify(await assessAnsibleJobHealth(client)),
   ];
   for (const text of outputs) {
-    assert.ok(!text.includes("CANARY-PARSER-SNIPPET") && !/Unexpected token/.test(text), `a slice of the parser's message reached an output: ${text.slice(0, 400)}`);
+    assertNoCanaryWindows(assert, text, [PARSER_SNIPPET_CANARY], "tool output");
+    assert.doesNotMatch(text, PARSER_WORDING, `a slice of the parser's message reached an output: ${text.slice(0, 400)}`);
     assert.ok(text.includes(note), `the output records the parse failure by name: ${text.slice(0, 400)}`);
   }
 });
 
-test("config loader errors: a 200 answer whose body is short non-JSON text is recorded as the non-JSON note only; no 8-character fragment of the body and no parser wording reaches the thrown client error, the access check, an assessment, or the bundle", async () => {
+test("config loader errors: a 200 answer whose body is short non-JSON text is recorded as the non-JSON note only; no 6-to-24-character window of the body and no parser wording reaches the thrown client error, the access check, an assessment, or the bundle", async () => {
   // Positive control for the class: V8 quotes the whole source when it is 21 characters or shorter.
   assert.ok(SHORT_BODY_CANARY.length <= 21 && parserMessageFor(SHORT_BODY_CANARY).includes(SHORT_BODY_CANARY), "the parser's message carries the whole short body");
 

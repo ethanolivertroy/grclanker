@@ -54,19 +54,32 @@ import {
   shortBodyParseError,
   withSdkRoutes,
 } from "./helpers/aws-sdk-fixture.mjs";
-import { assertSecretsAbsent, readBundleFiles, readZipEntries } from "./helpers/bundle-contents.mjs";
+import { readBundleFiles, readZipEntries } from "./helpers/bundle-contents.mjs";
 import {
+  CANARY,
+  ENCODED_FORM_SECRET,
+  PARSER_SNIPPET_CANARY,
+  PARSER_WORDING,
   SHORT_BODY_CANARY,
   SHORT_BODY_CONTENT_TYPE,
+  assertCanaryFixture,
+  assertNoCanaryWindows,
+  assertNoCanaryWindowsInFiles,
   assertNoShortBodyFragments,
   assertRedactionCases,
+  assertScrubBoundary,
   assertShortBodyRecordedAsNote,
   parserMessageFor,
+  parserSnippetBody,
 } from "./helpers/error-canaries.mjs";
 
 function createTempBase(prefix) {
   return mkdtempSync(join(tmpdir(), prefix));
 }
+
+/** A raw access key id the fixtures return; only its masked form (first and last four characters) may reach an output. */
+const RAW_ACCESS_KEY_ID = "AKIA3HPK8LPDA53DZLCF";
+const MASKED_ACCESS_KEY_ID = `AKIA****${RAW_ACCESS_KEY_ID.slice(-4)}`;
 
 function accessDenied(code = "AccessDeniedException") {
   const error = new Error(`User is not authorized to perform this operation (${code})`);
@@ -393,7 +406,7 @@ test("assessAwsIdentity flags root, MFA, password, key, and boundary issues", as
     },
     async listAccessKeys(userName) {
       if (userName === "bob") {
-        return [{ AccessKeyId: "AKIAIOSFODNN7EXAMPLE", CreateDate: "2025-01-01T00:00:00Z" }];
+        return [{ AccessKeyId: RAW_ACCESS_KEY_ID, CreateDate: "2025-01-01T00:00:00Z" }];
       }
       return [];
     },
@@ -418,8 +431,8 @@ test("assessAwsIdentity flags root, MFA, password, key, and boundary issues", as
   assert.equal(result.findings.find((item) => item.id === "AWS-IAM-05")?.status, "warn");
   assert.equal(result.findings.find((item) => item.id === "AWS-IAM-06")?.status, "warn");
   const staleKeys = findingById(result, "AWS-IAM-04").evidence.stale_access_keys;
-  assert.deepEqual(staleKeys.map((key) => key.accessKeyId), ["AKIA****MPLE"], "access key ids are masked in evidence");
-  assert.ok(!JSON.stringify(result).includes("AKIAIOSFODNN7EXAMPLE"), "the raw access key id never reaches the assessment output");
+  assert.deepEqual(staleKeys.map((key) => key.accessKeyId), [MASKED_ACCESS_KEY_ID], "access key ids are masked in evidence");
+  assertNoCanaryWindows(assert, result, [RAW_ACCESS_KEY_ID], "the raw access key id never reaches the assessment output");
 });
 
 test("paginateAwsList stops at the limit, on a repeated token, and on the page budget, reporting each as truncated", async () => {
@@ -443,7 +456,7 @@ test("paginateAwsList stops at the limit, on a repeated token, and on the page b
 });
 
 test("maskAccessKeyId keeps only the prefix and suffix of a key id", () => {
-  assert.equal(maskAccessKeyId("AKIAIOSFODNN7EXAMPLE"), "AKIA****MPLE");
+  assert.equal(maskAccessKeyId(RAW_ACCESS_KEY_ID), MASKED_ACCESS_KEY_ID);
   assert.equal(maskAccessKeyId("short"), "****");
 });
 
@@ -2019,19 +2032,22 @@ test("rule 1 corollary: assessAwsIdentity never passes a user control whose per-
 
   const lastUsed = await assessAwsIdentity(compliantIdentityClient({
     async listAccessKeys() {
-      return [{ AccessKeyId: "AKIAIOSFODNN7EXAMPLE", CreateDate: "2026-04-01T00:00:00Z" }];
+      return [{ AccessKeyId: RAW_ACCESS_KEY_ID, CreateDate: "2026-04-01T00:00:00Z" }];
     },
     async getAccessKeyLastUsed() {
       throw accessDenied();
     },
   }));
   assertOnlyDemoted(lastUsed, { "AWS-IAM-04": "manual" }, "GetAccessKeyLastUsed denied for the only sampled key");
-  assert.match(findingById(lastUsed, "AWS-IAM-04").summary, /Last-used dates could not be read for any of the 1 sampled access key\(s\) \(iam:GetAccessKeyLastUsed AKIA\*\*\*\*MPLE: AccessDenied/);
+  assert.ok(
+    findingById(lastUsed, "AWS-IAM-04").summary.startsWith(`Last-used dates could not be read for any of the 1 sampled access key(s) (iam:GetAccessKeyLastUsed ${MASKED_ACCESS_KEY_ID}: AccessDenied`),
+    findingById(lastUsed, "AWS-IAM-04").summary,
+  );
   assert.match(findingById(lastUsed, "AWS-IAM-04").summary, /no key was judged/);
-  assert.deepEqual(findingById(lastUsed, "AWS-IAM-04").evidence.keys_last_used_unreadable, ["AKIA****MPLE"]);
+  assert.deepEqual(findingById(lastUsed, "AWS-IAM-04").evidence.keys_last_used_unreadable, [MASKED_ACCESS_KEY_ID]);
   assert.deepEqual(findingById(lastUsed, "AWS-IAM-04").evidence.stale_access_keys, [], "an unjudged key is never listed as stale");
-  assert.ok(lastUsed.errors.some((line) => /^iam:GetAccessKeyLastUsed AKIA\*\*\*\*MPLE: AccessDenied/.test(line)), "the error line carries the masked key id only");
-  assert.ok(!JSON.stringify(lastUsed).includes("AKIAIOSFODNN7EXAMPLE"));
+  assert.ok(lastUsed.errors.some((line) => line.startsWith(`iam:GetAccessKeyLastUsed ${MASKED_ACCESS_KEY_ID}: AccessDenied`)), "the error line carries the masked key id only");
+  assertNoCanaryWindows(assert, lastUsed, [RAW_ACCESS_KEY_ID], "last-used evidence");
 
   // The review-round fixture: svc-deploy holds a key older than the threshold whose last use is denied. The creation
   // date must not stand in for the denied last-used date, so the user is never failed on evidence the run did not see.
@@ -2043,11 +2059,11 @@ test("rule 1 corollary: assessAwsIdentity never passes a user control whose per-
       ]);
     },
     async listAccessKeys(userName) {
-      if (userName === "svc-deploy") return [{ AccessKeyId: "AKIAIOSFODNN7EXAMPLE", CreateDate: "2024-01-01T00:00:00Z" }];
+      if (userName === "svc-deploy") return [{ AccessKeyId: RAW_ACCESS_KEY_ID, CreateDate: "2024-01-01T00:00:00Z" }];
       return [{ AccessKeyId: "AKIAALICEKEY00000001", CreateDate: "2026-04-01T00:00:00Z" }];
     },
     async getAccessKeyLastUsed(accessKeyId) {
-      if (accessKeyId === "AKIAIOSFODNN7EXAMPLE") throw accessDenied();
+      if (accessKeyId === RAW_ACCESS_KEY_ID) throw accessDenied();
       return { LastUsedDate: "2026-04-15T00:00:00Z" };
     },
   }));
@@ -2055,9 +2071,12 @@ test("rule 1 corollary: assessAwsIdentity never passes a user control whose per-
   const oldKeyFinding = findingById(oldKeyDenied, "AWS-IAM-04");
   assert.notEqual(oldKeyFinding.status, "fail", "a user is never failed on a key whose last use was unreadable");
   assert.deepEqual(oldKeyFinding.evidence.stale_access_keys, [], "the 2024 key is not judged stale by its creation date");
-  assert.deepEqual(oldKeyFinding.evidence.keys_last_used_unreadable, ["AKIA****MPLE"]);
-  assert.match(oldKeyFinding.summary, /No sampled access key exceeded the 90-day staleness threshold\. Downgraded to warn: GetAccessKeyLastUsed unreadable for 1 key\(s\) \(AKIA\*\*\*\*MPLE\); those keys were not judged and need a manual last-used review/);
-  assert.ok(!JSON.stringify(oldKeyDenied).includes("AKIAIOSFODNN7EXAMPLE"));
+  assert.deepEqual(oldKeyFinding.evidence.keys_last_used_unreadable, [MASKED_ACCESS_KEY_ID]);
+  assert.ok(
+    oldKeyFinding.summary.includes(`No sampled access key exceeded the 90-day staleness threshold. Downgraded to warn: GetAccessKeyLastUsed unreadable for 1 key(s) (${MASKED_ACCESS_KEY_ID}); those keys were not judged and need a manual last-used review`),
+    oldKeyFinding.summary,
+  );
+  assertNoCanaryWindows(assert, oldKeyDenied, [RAW_ACCESS_KEY_ID], "denied last-used evidence");
 });
 
 test("assessAwsIdentity renders manual, never fail, when a primary IAM read is denied", async () => {
@@ -2121,13 +2140,19 @@ test("assessAwsNetworkSecurity names the DescribeRegions failure when the scope 
   assert.ok(result.errors.some((line) => /^Region scope fell back to us-east-1 only: ec2:DescribeRegions: AccessDenied/.test(line)));
 });
 
+/**
+ * Planted values that must never reach the bundle, alphanumeric and random-looking so no 6-character window of
+ * them occurs in the fixture's legitimate values (see the fixture self-check). The contact email's canary is its
+ * local part and the phone's is its digits; the domain and the dialing prefix are legitimate text.
+ */
 const FAKE_AWS_SECRETS = {
-  accessKeyId: "AKIAFAKESECRETKEYID01",
-  contactName: "FAKE_SECRET_CONTACT_NAME_2",
-  contactTitle: "FAKE_SECRET_CONTACT_TITLE_3",
-  contactEmail: "FAKE_SECRET_CONTACT_4@example.test",
-  contactPhone: "+1 555 0199 FAKE5",
+  accessKeyId: RAW_ACCESS_KEY_ID,
+  contactName: "UzJmyw4Cp8MNezmK",
+  contactTitle: "v2rpGAgG74uwFcGs",
+  contactEmail: "VyrQ3HB5ZSp2@example.test",
+  contactPhone: "+1 555 5835367",
 };
+const FAKE_AWS_CANARIES = Object.values(FAKE_AWS_SECRETS).map((value) => value.split("@")[0].replace(/^\+1 555 /, ""));
 
 test("verdict rule 9: exportAwsAuditBundle never writes access key ids or the security contact's identity into the bundle or its zip", async () => {
   const base = createTempBase("grclanker-aws-secrets-");
@@ -2154,13 +2179,13 @@ test("verdict rule 9: exportAwsAuditBundle never writes access key ids or the se
   const entries = readZipEntries(result.zipPath);
   assert.ok(files.size > 10);
   assert.equal(entries.size, files.size, "every written file is in the zip");
-  assertSecretsAbsent(assert, files, Object.values(FAKE_AWS_SECRETS), "bundle files");
-  assertSecretsAbsent(assert, entries, Object.values(FAKE_AWS_SECRETS), "zip entries");
+  assertNoCanaryWindowsInFiles(assert, files, FAKE_AWS_CANARIES, "bundle files");
+  assertNoCanaryWindowsInFiles(assert, entries, FAKE_AWS_CANARIES, "zip entries");
 
   const findings = JSON.parse(files.get("analysis/findings.json"));
   const keyRotation = findings.find((item) => item.id === "AWS-IAM-04");
   assert.equal(keyRotation.status, "fail", "the stale key is still reported");
-  assert.deepEqual(keyRotation.evidence.stale_access_keys.map((key) => key.accessKeyId), ["AKIA****ID01"]);
+  assert.deepEqual(keyRotation.evidence.stale_access_keys.map((key) => key.accessKeyId), [MASKED_ACCESS_KEY_ID]);
   const contact = findings.find((item) => item.id === "AWS-ORG-07");
   assert.equal(contact.status, "pass");
   assert.equal(contact.evidence.email_domain, "@example.test");
@@ -2289,31 +2314,71 @@ function assertNoDefaultedLeaves(healthyOutputs, degradedOutputs, label) {
   assert.deepEqual(defaulted.map(([path, value]) => `${path} -> ${value}`), [], `${label}: leaves defaulted to an empty-dataset value instead of null`);
 }
 
+/** Planted credentials of the must-keep redaction text: a Basic password, a URL userinfo password, and a signature query value. */
+const AWS_MUST_KEEP_CANARIES = Object.freeze({ basicPassword: "MCuGTqGBG8dmEzse", userinfoPassword: "b4usg7S4JD6bbWTW", signature: "yMsNMGW3jpjWBk5MznMJ" });
+
+/** The secret planted on the malformed line of every shared-config fixture. */
+const SHARED_CONFIG_CANARY = "qf9apUYznyvTJPXKF2dreQwY";
+
+/** Every planted canary an AWS output is swept for, window by window. */
+const AWS_PLANTED_CANARIES = Object.freeze([
+  ...Object.values(AWS_CANARIES),
+  ...Object.values(CANARY),
+  SHORT_BODY_CANARY,
+  PARSER_SNIPPET_CANARY,
+  ...FAKE_AWS_CANARIES,
+  ...Object.values(AWS_MUST_KEEP_CANARIES),
+  SHARED_CONFIG_CANARY,
+]);
+
 function assertNoCanaries(text, label) {
-  for (const [name, canary] of Object.entries(AWS_CANARIES)) {
-    assert.ok(!text.includes(canary), `${label}: canary ${name} (${canary}) leaked into the output`);
-  }
-  assert.ok(!text.includes("token=cnry"), `${label}: the URL token query leaked into the output`);
+  assertNoCanaryWindows(assert, text, AWS_PLANTED_CANARIES, label);
 }
+
+test("rule 9 scrub boundary: name-shaped values stay bare, any value in a carrier is removed, token-shaped values are removed bare, the resolved secret access key is a configured secret removed in every encoded form, and the fixed texts survive", async () => {
+  // The secret arrives the way a real run's does: resolved by the guarded fromIni provider from the shared credentials file.
+  await withSharedAwsFiles({ credentials: ["[audit]", "aws_access_key_id = AKIAEXAMPLE000000001", `aws_secret_access_key = ${ENCODED_FORM_SECRET}`, ""].join("\n") }, async () => {
+    let resolved;
+    const routes = {
+      ...healthySdkRoutes(),
+      "sts:GetCallerIdentity": async (input, region, sdk) => {
+        resolved = await sdk.resolveCredentials();
+        return healthySdkRoutes()["sts:GetCallerIdentity"]();
+      },
+    };
+    await withSdkRoutes(routes, [], () => realAwsClient(realAwsConfig({ profile: "audit" })).getCallerIdentity());
+    assert.equal(resolved?.secretAccessKey, ENCODED_FORM_SECRET, "positive control: the provider resolved the planted secret verbatim");
+  });
+  assertScrubBoundary(assert, redactErrorText, {
+    configuredSecret: ENCODED_FORM_SECRET,
+    mustKeep: [
+      `iam:GetAccessKeyLastUsed ${MASKED_ACCESS_KEY_ID}: AccessDenied (AccessDeniedException (HTTP 403): User is not authorized to perform this operation (AccessDeniedException))`,
+      "credentials could not be resolved by fromIni (profile audit) (CredentialsProviderError ENOENT). The provider's message is not recorded because it can quote the shared config or credentials file; check the profile in ~/.aws/credentials and ~/.aws/config.",
+      "SyntaxError (HTTP 502): non-JSON body (text/html, 5120 bytes)",
+      "SyntaxError: response could not be parsed as the service protocol; the parser's message is not recorded because it quotes the body",
+      "arn:aws:cloudtrail:us-east-1:123456789012:trail/management-events-2026",
+      "only 1 of 17 regions assessed (ec2:DescribeRegions us-east-1: AccessDeniedException (HTTP 403))",
+      "bucket cloudtrail-logs-123456789012-us-east-1 has no bucket policy (s3:GetBucketPolicy NoSuchBucketPolicy (HTTP 404))",
+    ],
+  });
+});
 
 test("rule 9: redactErrorText scrubs authorization values, JWTs, AWS key ids and secrets, cookie and api key pairs, and URL userinfo and query strings anywhere in the text", () => {
   assertRedactionCases(assert, redactErrorText);
 
   // The AWS-specific shapes: an SDK message that echoes the signing identity, request context, and a
   // proxy header block, with the cookie header on its own line as HTTP writes it.
-  const jwt = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJhdWRpdG9yIn0.c2lnbmF0dXJlLXZhbHVlLWhlcmU";
+  const basic = Buffer.from(`auditor:${AWS_MUST_KEEP_CANARIES.basicPassword}`).toString("base64");
   const text = [
-    `Authorization: Bearer ${AWS_CANARIES.bearer} was rejected; Basic ${Buffer.from("auditor:s3cr3t-pass-99").toString("base64")} also failed. Token ${jwt} expired.`,
+    `Authorization: Bearer ${AWS_CANARIES.bearer} was rejected; Basic ${basic} also failed. Token ${CANARY.jwt} expired.`,
     `Signed with ${AWS_CANARIES.accessKeyId} and ${AWS_CANARIES.secretKey}; x-api-key: ${AWS_CANARIES.apiKey}; session_id=${AWS_CANARIES.session}.`,
-    `Retry at ${CANARY_URL} or https://auditor:hunter2-pass@api.example.com/v1/y?sig=abcdef0123456789 later.`,
+    `Retry at ${CANARY_URL} or https://auditor:${AWS_MUST_KEEP_CANARIES.userinfoPassword}@api.example.com/v1/y?sig=${AWS_MUST_KEEP_CANARIES.signature} later.`,
     `Set-Cookie: AWSALB=${AWS_CANARIES.session}; Path=/`,
   ].join("\n");
 
   const scrubbed = redactErrorText(text);
   assertNoCanaries(scrubbed, "redactErrorText");
-  for (const secret of [jwt, "hunter2-pass", "auditor:hunter2-pass", "sig=abcdef0123456789", Buffer.from("auditor:s3cr3t-pass-99").toString("base64")]) {
-    assert.ok(!scrubbed.includes(secret), `${secret} survived redaction: ${scrubbed}`);
-  }
+  assertNoCanaryWindows(assert, scrubbed, [basic], "redactErrorText Basic value");
   assert.match(scrubbed, /Bearer \[REDACTED\] was rejected/);
   assert.match(scrubbed, /Basic \[REDACTED\] also failed/);
   assert.match(scrubbed, /Signed with \[REDACTED\] and \[REDACTED\]; x-api-key: \[REDACTED\]; session_id=\[REDACTED\]/, "AWS key ids, secrets, api key and session pairs are replaced in place");
@@ -2321,6 +2386,29 @@ test("rule 9: redactErrorText scrubs authorization values, JWTs, AWS key ids and
   assert.match(scrubbed, /https:\/\/api\.example\.com\/v1\/y\?\[REDACTED\] later\./, "URL userinfo is dropped and the query replaced even mid-sentence");
   assert.match(scrubbed, /Set-Cookie: \[REDACTED\]$/, "the cookie header keeps its name and loses its whole value");
   assert.equal(redactErrorText("Basic authentication is required; Invalid token."), "Basic authentication is required; Invalid token.", "prose after a scheme word or credential noun is left alone");
+});
+
+test("fixture self-check: every planted canary is alphanumeric and random-looking, and no 6-to-24-character window of any canary occurs in the healthy fixture's legitimate values, so a windowed leak assertion can fail only on a real echo", async () => {
+  const legitimate = new Map();
+  for (const [action, route] of Object.entries(healthySdkRoutes())) {
+    try {
+      legitimate.set(`route ${action}`, await route({}, "us-east-1"));
+    } catch {
+      // A route that needs a real input is exercised by the healthy run below.
+    }
+  }
+  const { outputs, exported } = await withSdkRoutes(healthySdkRoutes(), [], async () => {
+    const client = realAwsClient();
+    const results = await runAllAssessments(client);
+    return { outputs: results, exported: await exportAwsAuditBundle(client, client.getResolvedConfig(), createTempBase("grclanker-aws-self-check-")) };
+  });
+  for (const [name, result] of Object.entries(outputs)) legitimate.set(name, result);
+  for (const [name, text] of readBundleFiles(exported.outputDir)) legitimate.set(`bundle ${name}`, text);
+  for (const [name, text] of readZipEntries(exported.zipPath)) legitimate.set(`zip ${name}`, text);
+  legitimate.set("config", realAwsConfig());
+  legitimate.set("shared config fixture lines", ["[audit]", "aws_access_key_id = AKIAEXAMPLE000000001", "credential_source = Environment"]);
+  // The contact phone's digits are the shortest canary (seven digits behind the dialing prefix).
+  assertCanaryFixture(assert, AWS_PLANTED_CANARIES, legitimate, "aws fixture", { minLength: 7 });
 });
 
 test("rule 9: a 502 HTML proxy body on any surface never carries credentials into the access check, assess results, bundle files, or zip entries, and the error string carries the status-and-length note", async () => {
@@ -2406,8 +2494,23 @@ test("rule 9: the aws_check_access tool scrubs the failure of the run's own iden
  * afterwards. `files.credentials` is either the file's text or a function that prepares the path itself (a
  * directory, an unreadable file) and returns it.
  */
+let sharedAwsFixtureSequence = 0;
+
+/**
+ * A fresh directory whose path is name-shaped (letters, hyphens, and one number per segment), so the scrub
+ * boundary's long-token rule leaves it in the provider error that names the two documented files; mkdtemp's
+ * random suffix is token-shaped often enough to be redacted, which is correct for a real path of that shape
+ * but would make the "names the files" assertion depend on the draw.
+ */
+function createNameShapedFixtureDir() {
+  sharedAwsFixtureSequence += 1;
+  const dir = join(tmpdir(), "grclanker-aws-creds-fixture", `${process.pid}-${sharedAwsFixtureSequence}`);
+  mkdirSync(dir, { recursive: true });
+  return dir;
+}
+
 async function withSharedAwsFiles(files, run) {
-  const dir = createTempBase("grclanker-aws-creds-");
+  const dir = createNameShapedFixtureDir();
   const configFile = join(dir, "config");
   writeFileSync(configFile, files.config ?? "");
   let credentialsFile = join(dir, "credentials");
@@ -2427,7 +2530,6 @@ async function withSharedAwsFiles(files, run) {
   }
 }
 
-const SHARED_CONFIG_CANARY = "CANARY-SHARED-CREDENTIALS-SECRET-31337";
 const SDK_ERROR_NAME_OR_FS_CODE = /^(?:[A-Za-z]+(?:Error|Exception)(?: E[A-Z]+)?|E[A-Z]+)$/;
 /** Node's fs wording ("EISDIR: illegal operation on a directory, read", "EACCES: permission denied, open '<path>'"). */
 const FS_WORDING = /illegal operation|permission denied|no such file|operation not permitted|, open '|, read$|, read /i;
@@ -2444,7 +2546,7 @@ function assertProviderErrorShape(error, { credentialsFile, configFile }, label)
   assert.equal(error.name, "AwsCredentialProviderError", label);
   assert.equal(error.provider, "fromIni (profile audit)", label);
   assert.match(error.code, SDK_ERROR_NAME_OR_FS_CODE, `${label}: the code is an SDK error name or an fs code: ${error.code}`);
-  assert.ok(!error.message.includes(SHARED_CONFIG_CANARY), `${label}: the thrown message carries the canary: ${error.message}`);
+  assertNoCanaryWindows(assert, error.message, [SHARED_CONFIG_CANARY], `${label}: the thrown message`);
   assert.doesNotMatch(error.message, FS_WORDING, `${label}: fs wording reached the thrown message: ${error.message}`);
   assert.doesNotMatch(error.message, SDK_PROVIDER_WORDING, `${label}: the provider's own message was interpolated: ${error.message}`);
   assert.match(error.message, new RegExp(`^credentials could not be resolved by fromIni \\(profile audit\\) \\(${error.code.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\)\\. The provider's message is not recorded`), label);
@@ -2528,7 +2630,7 @@ for (const shape of SHARED_CONFIG_CASES) {
         const tool = registered.find((candidate) => candidate.name === name);
         const payload = await tool.execute("call-1", { region: "us-east-1", profile: "audit", account_id: FIXTURE_ACCOUNT, output_dir: createTempBase("grclanker-aws-creds-export-") });
         const text = JSON.stringify(payload);
-        assert.ok(!text.includes(SHARED_CONFIG_CANARY), `${name}: the tool payload carries the canary: ${text}`);
+        assertNoCanaryWindows(assert, text, [SHARED_CONFIG_CANARY], `${name}: the tool payload`);
         assert.doesNotMatch(text, FS_WORDING, `${name}: fs wording reached the tool payload: ${text}`);
         assert.doesNotMatch(text, SDK_PROVIDER_WORDING, `${name}: the provider's own message is interpolated: ${text}`);
         assert.match(text, /AwsCredentialProviderError: credentials could not be resolved by fromIni \(profile audit\) \((?:[A-Za-z]+(?:Error|Exception)(?: E[A-Z]+)?|E[A-Z]+)\)\. The provider's message is not recorded/, `${name}: the payload names the provider and the SDK error name or fs code only: ${text}`);
@@ -2545,7 +2647,7 @@ for (const shape of SHARED_CONFIG_CASES) {
 
 
 test("config loader errors: a SyntaxError the SDK raises without attaching the body is recorded by name only, never by the parser's message that quotes the text", async () => {
-  const snippet = "<html>CANARY-PARSER-SNIPPET-4242</html>";
+  const snippet = parserSnippetBody();
   const bareParseError = () => new SyntaxError(`Unexpected token '<', "${snippet}"... is not valid JSON`);
   const { registerAwsTools } = await import("../dist/extensions/grc-tools/aws.js");
   const registered = [];
@@ -2554,7 +2656,8 @@ test("config loader errors: a SyntaxError the SDK raises without attaching the b
 
   const identityResult = await withSdkRoutes({ ...healthySdkRoutes(), "sts:GetCallerIdentity": () => { throw bareParseError(); } }, [], () => checkAccess.execute("call-1", { region: "us-east-1" }));
   const identityText = JSON.stringify(identityResult);
-  assert.ok(!identityText.includes("CANARY-PARSER-SNIPPET") && !/Unexpected token/.test(identityText), `the parser's message reached the tool payload: ${identityText}`);
+  assertNoCanaryWindows(assert, identityText, [PARSER_SNIPPET_CANARY], "aws_check_access payload");
+  assert.doesNotMatch(identityText, PARSER_WORDING, `the parser's message reached the tool payload: ${identityText}`);
   assert.match(identityText, /AWS access check failed: SyntaxError: response could not be parsed as the service protocol; the parser's message is not recorded/);
 
   for (const action of ["iam:ListUsers", "cloudtrail:DescribeTrails", "s3:GetBucketPolicy"]) {
@@ -2565,7 +2668,8 @@ test("config loader errors: a SyntaxError the SDK raises without attaching the b
       return { outputs: results, exported: await exportAwsAuditBundle(client, client.getResolvedConfig(), createTempBase("grclanker-aws-parse-error-")) };
     });
     const text = [JSON.stringify(outputs), ...readBundleFiles(exported.outputDir).values(), ...readZipEntries(exported.zipPath).values()].join("\n");
-    assert.ok(!text.includes("CANARY-PARSER-SNIPPET") && !/Unexpected token/.test(text), `${action}: a slice of the parser's message survived`);
+    assertNoCanaryWindows(assert, text, [PARSER_SNIPPET_CANARY], `${action}: outputs and bundle`);
+    assert.doesNotMatch(text, PARSER_WORDING, `${action}: a slice of the parser's message survived`);
     const lines = [...Object.values(outputs).flatMap((result) => result.errors ?? []), ...outputs.access.surfaces.map((surface) => surface.error ?? "")].filter((line) => line.includes(action.split(":")[1]));
     assert.ok(lines.length > 0, `${action}: the failure is recorded against the command`);
     for (const line of lines) assert.match(line, /SyntaxError: response could not be parsed as the service protocol; the parser's message is not recorded because it quotes the body/, `${action}: ${line}`);
@@ -2727,7 +2831,7 @@ test("request matching: every IAM action and HTTP status named in any output cor
   }
 });
 
-test("config loader errors: a 200 answer whose body is short non-JSON text is recorded as the non-JSON note only; no 8-character fragment of the body and no parser wording reaches the thrown client error, the access check, an assessment, or the bundle", async () => {
+test("config loader errors: a 200 answer whose body is short non-JSON text is recorded as the non-JSON note only; no 6-to-24-character window of the body and no parser wording reaches the thrown client error, the access check, an assessment, or the bundle", async () => {
   // Positive control for the class: V8 quotes the whole source when it is 21 characters or shorter, and the SDK's error carries that message.
   assert.ok(SHORT_BODY_CANARY.length <= 21 && parserMessageFor(SHORT_BODY_CANARY).includes(SHORT_BODY_CANARY), "the parser's message carries the whole short body");
   assert.ok(shortBodyParseError(SHORT_BODY_CANARY).message.includes(SHORT_BODY_CANARY), "the SDK's own error message carries the whole short body");
