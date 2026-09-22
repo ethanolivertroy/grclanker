@@ -11,7 +11,6 @@ import {
   existsSync,
   lstatSync,
   mkdirSync,
-  readFileSync,
   realpathSync,
 } from "node:fs";
 import { chmod, readdir, writeFile } from "node:fs/promises";
@@ -19,7 +18,7 @@ import { homedir } from "node:os";
 import { basename, dirname, join, relative, resolve } from "node:path";
 import { ZipArchive } from "archiver";
 import { Type } from "@sinclair/typebox";
-import { YAMLError, parse as parseYaml } from "yaml";
+import { ConfigFileError, parseJsonConfigText, parseYamlConfigText, readConfigText } from "./hardening/index.js";
 import { errorResult, formatTable, textResult } from "./shared.js";
 
 type FetchImpl = typeof fetch;
@@ -704,53 +703,39 @@ function describeErrorBody(payload: JsonRecord | undefined, rawText: string, con
   return webexErrorSummary(payload) ?? `JSON error body without a message field (${bytes} bytes)`;
 }
 
-/** The `code` of a Node system error (EACCES, EISDIR, ENOENT): a fixed identifier, never the message. */
-function systemErrorCode(error: unknown): string | undefined {
-  const code = asObject(error)?.code;
-  return typeof code === "string" && /^E[A-Z0-9_]{1,30}$/.test(code) ? code : undefined;
+const CONFIG_FILE_OPTIONS = { label: "Webex" } as const;
+
+/**
+ * Reads and parses the config file through the shared loaders, whose errors
+ * are fixed text plus the path, the parser's structured position, and a code
+ * (never the filesystem wording, the YAML parser's quoted source line, the
+ * alias ReferenceError, or the ten-character JSON.parse window). The format
+ * follows the extension: `.json` is JSON, everything else YAML.
+ * `discoverConfigFile` has already checked the path exists, so the missing-file
+ * result is a race with a deletion and is reported as the read failure it is.
+ */
+function readConfigValue(pathname: string): unknown {
+  const read = readConfigText(pathname, CONFIG_FILE_OPTIONS);
+  if (!read.ok) throw new ConfigFileError({ kind: "read", path: pathname, code: "ENOENT", label: CONFIG_FILE_OPTIONS.label });
+  return pathname.endsWith(".json")
+    ? parseJsonConfigText(read.value, pathname, CONFIG_FILE_OPTIONS)
+    : parseYamlConfigText(read.value, pathname, CONFIG_FILE_OPTIONS);
 }
 
 /**
- * The first line the YAML parser points at, taken only from a structured
- * YAMLError. An unresolved alias throws a plain ReferenceError whose message
- * is the alias name itself, so nothing is read from any other thrown value.
+ * Every error string this module creates passes through scrubErrorText at the
+ * point of creation, the config-file errors included: the path is their one
+ * free-text field.
  */
-function yamlErrorLine(error: unknown): number | undefined {
-  return error instanceof YAMLError ? error.linePos?.[0]?.line : undefined;
-}
-
-/**
- * Reads the config file without interpolating the filesystem message, which
- * carries the path and OS wording (`EACCES: permission denied, open '...'`).
- */
-function readConfigText(pathname: string): string {
-  try {
-    return readFileSync(pathname, "utf8");
-  } catch (error) {
-    const code = systemErrorCode(error);
-    throw new Error(scrubErrorText(`Unable to read Webex config file ${pathname}${code ? ` (${code})` : ""}`));
-  }
-}
-
-/**
- * Parses the config file without interpolating the parser message: the YAML
- * parser quotes the offending source line (for a malformed `token:` line that
- * is the credential itself), an unresolved alias names its value, and
- * JSON.parse quotes a ten-character window of the source. The thrown text is a
- * fixed description with the path and, for YAML, the line number.
- */
-function parseConfigText(pathname: string, text: string): unknown {
-  const format = pathname.endsWith(".json") ? "JSON" : "YAML";
-  try {
-    return format === "JSON" ? JSON.parse(text) : parseYaml(text);
-  } catch (error) {
-    const line = format === "YAML" ? yamlErrorLine(error) : undefined;
-    throw new Error(scrubErrorText(`Unable to parse Webex config file: invalid ${format} in ${pathname}${line === undefined ? "" : ` at line ${line}`}`));
-  }
-}
-
 function loadConfigFile(pathname: string): JsonRecord {
-  const object = asObject(parseConfigText(pathname, readConfigText(pathname)));
+  let parsed: unknown;
+  try {
+    parsed = readConfigValue(pathname);
+  } catch (error) {
+    if (!(error instanceof ConfigFileError)) throw error;
+    throw new Error(scrubErrorText(error.message));
+  }
+  const object = asObject(parsed);
   if (!object) throw new Error(scrubErrorText(`Webex config file ${pathname} must contain an object.`));
   return object;
 }

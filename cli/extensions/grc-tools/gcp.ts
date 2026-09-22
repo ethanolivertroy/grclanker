@@ -20,6 +20,7 @@ import { homedir } from "node:os";
 import { dirname, join, relative, resolve } from "node:path";
 import { ZipArchive } from "archiver";
 import { Type } from "@sinclair/typebox";
+import { REDACTED, seenVersusTotal, systemErrorCode } from "./hardening/index.js";
 import { errorResult, formatTable, textResult } from "./shared.js";
 
 type JsonRecord = Record<string, unknown>;
@@ -361,9 +362,13 @@ function daysBetween(later: Date, earlierIso?: string): number | undefined {
 // pattern is unanchored so an embedded URL, header, or name-value pair anywhere in free text is
 // caught. The bundle writer applies the same rules once more to every file, without the long-token
 // heuristic, because project ids, resource names, key names, and policy names are evidence.
+//
+// The scrub stays local rather than delegating to the shared hardening scrubber: the shared
+// credential-key rule has no exemption for the Google credential-file field names that carry no
+// secret (token_uri, private_key_id, token_type), and its data mode has no rule for the GOCSPX-
+// client secret and 1// refresh token shapes that the bundle writer relies on.
 // ---------------------------------------------------------------------------------------------
 
-const REDACTED = "[REDACTED]";
 /** Longest scrubbed google.rpc.Status message echoed in an error string; the cap runs after the scrub. */
 const MAX_ERROR_MESSAGE_CHARS = 300;
 /** Everything from the first ? of a scheme-prefixed URL found anywhere in the text; the host and path stay because they name the surface. */
@@ -627,7 +632,7 @@ function redactSecrets(value: unknown): unknown {
   if (!record) return value;
   const output: JsonRecord = {};
   for (const [key, entry] of Object.entries(record)) {
-    output[key] = /token|secret|private_key|privatekey|password|credential/i.test(key) ? "[REDACTED]" : redactSecrets(entry);
+    output[key] = /token|secret|private_key|privatekey|password|credential/i.test(key) ? REDACTED : redactSecrets(entry);
   }
   return output;
 }
@@ -738,15 +743,11 @@ function defaultFileReader(pathname: string): string | undefined {
   return existsSync(pathname) ? readFileSync(pathname, "utf8") : undefined;
 }
 
-/** The `code` of a Node system error (ENOENT, EACCES, EISDIR): a fixed identifier, never the message. */
-function systemErrorCode(error: unknown): string | undefined {
-  const code = asObject(error)?.code;
-  return typeof code === "string" && /^E[A-Z0-9_]{1,30}$/.test(code) ? code : undefined;
-}
-
 /**
  * A structured parse position, when the runtime attaches one to the SyntaxError. V8 attaches none (its position
- * lives in the message text, which is never read), so on Node the description carries the path alone.
+ * lives in the message text, which is never read), so on Node the description carries the path alone. The
+ * shared hardening loader derives a position from the message text through a strict regex instead, which this
+ * module deliberately does not do, so the loader keeps its own position and message shape.
  */
 function jsonErrorPosition(error: unknown): string | undefined {
   const record = asObject(error);
@@ -1191,7 +1192,14 @@ export class GcpAuditorClient {
       const body = describeGoogleErrorBody(text, contentType, response.status, secrets);
       throw new GcpApiError(`${httpStatusLine(response)}${body ? `: ${body}` : ""} (${method} ${endpoint})`, endpoint, response.status, secrets);
     }
-    if (text.trim().length === 0) return {};
+    // Every surface this client reads answers with a JSON object: the proto3 JSON mapping encodes a response message
+    // whose fields all hold defaults, and google.protobuf.Empty itself, as `{}` (protobuf.dev/programming-guides/json,
+    // "An empty JSON object"), and the Compute and Storage list responses always carry `kind`. A 2xx with nothing in
+    // it is a proxy, captive portal, or gateway answering in the service's place, so it is an unreadable surface,
+    // never an empty inventory.
+    if (text.trim().length === 0) {
+      throw new GcpApiError(`${httpStatusLine(response)}: ${describeOpaqueBody(text, contentType, "empty response body")} (${method} ${endpoint})`, endpoint, response.status, secrets);
+    }
     const payload = parseJsonObject(text);
     if (!payload) {
       throw new GcpApiError(`${httpStatusLine(response)}: ${describeOpaqueBody(text, contentType, "non-JSON response body")} (${method} ${endpoint})`, endpoint, response.status, secrets);
@@ -1780,7 +1788,7 @@ function partialNote(input: PartialViewInput): string {
   if (unreachable.length > 0) {
     notes.push(`${unreachable.length} unreachable scopes not enumerated (${unreachable.slice(0, 5).join(", ")}${unreachable.length > 5 ? ", ..." : ""})`);
   }
-  if (input.truncated) notes.push(`${input.total} seen, total unknown (inventory incomplete)`);
+  if (input.truncated) notes.push(`${seenVersusTotal(input.total, null)} (inventory incomplete)`);
   return notes.length > 0 ? ` Partial view: ${notes.join("; ")}.` : "";
 }
 

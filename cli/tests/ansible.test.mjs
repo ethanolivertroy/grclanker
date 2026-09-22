@@ -17,7 +17,9 @@ import { join } from "node:path";
 
 import {
   ANSIBLE_CONTROLS,
+  ANSIBLE_REDACTION_MARKER,
   AnsibleAapClient,
+  ansibleFixedTexts,
   assessAnsibleHostCoverage,
   assessAnsibleJobHealth,
   assessAnsiblePlatformSecurity,
@@ -26,9 +28,37 @@ import {
   exportAnsibleAuditBundle,
   findPlaintextSecrets,
   parseRruleInterval,
+  redactCredentialTree,
+  redactErrorText,
+  redactVariables,
   resolveAnsibleConfiguration,
   resolveSecureOutputPath,
+  sanitizeScmUrl,
 } from "../dist/extensions/grc-tools/ansible.js";
+import { readBundleFiles, readZipEntries } from "./helpers/bundle-contents.mjs";
+import {
+  CANARY_VALUES,
+  ENCODED_FORM_SECRET,
+  HTML_BODY_NOTE,
+  PARSER_SNIPPET_CANARY,
+  PARSER_WORDING,
+  REDACTED_CANARY_URL,
+  SHORT_BODY_CANARY,
+  SHORT_BODY_CONTENT_TYPE,
+  assertCanaryFixture,
+  assertNoCanaries,
+  assertNoCanaryWindows,
+  assertNoCanaryWindowsInFiles,
+  assertNoShortBodyFragments,
+  assertRedactionCases,
+  assertScrubBoundary,
+  assertShortBodyRecordedAsNote,
+  htmlCanaryBody,
+  jsonCanaryMessage,
+  parserMessageFor,
+  parserSnippetBody,
+} from "./helpers/error-canaries.mjs";
+import { assertFixedTextsSurvive, assertMustKeepRows, assertMustRedactRowsBesideMustKeep } from "./helpers/redaction-table.mjs";
 
 const NOW = new Date("2026-09-21T00:00:00.000Z");
 const SUPERUSER = { id: 1, username: "auditor", is_superuser: true, is_system_auditor: false };
@@ -179,7 +209,7 @@ function forbidden(path) {
  * - forbidden: every endpoint except /api/v2/me/ returns 403
  * - empty: every list is empty and every settings object is {}
  */
-function createMockClient({ now = NOW, routes = {}, me = SUPERUSER, mode = "normal", counts = {} } = {}) {
+function createMockClient({ now = NOW, routes = {}, me = SUPERUSER, mode = "normal", counts = {}, forbiddenPaths = [] } = {}) {
   const resolvedRoutes = { ...HEALTHY_ROUTES, ...routes };
   const requested = [];
   const client = {
@@ -188,7 +218,7 @@ function createMockClient({ now = NOW, routes = {}, me = SUPERUSER, mode = "norm
     async get(path) {
       requested.push(path);
       if (path === "/api/v2/me/") return { count: 1, results: [me] };
-      if (mode === "forbidden") forbidden(path);
+      if (mode === "forbidden" || forbiddenPaths.includes(path)) forbidden(path);
       if (path === "/api/v2/ping/") return { version: "4.6.0", active_node: "controller-1" };
       if (mode === "empty") return {};
       const value = resolvedRoutes[path];
@@ -197,7 +227,7 @@ function createMockClient({ now = NOW, routes = {}, me = SUPERUSER, mode = "norm
     },
     async listCollection(path, _query = {}, options = {}) {
       requested.push(path);
-      if (mode === "forbidden") forbidden(path);
+      if (mode === "forbidden" || forbiddenPaths.includes(path)) forbidden(path);
       if (mode === "empty") return { items: [], complete: true, total: 0 };
       const value = resolvedRoutes[path];
       if (value === undefined) throw new Error(`AAP request failed: ${path} (404 Not Found)`);
@@ -216,7 +246,7 @@ function createMockClient({ now = NOW, routes = {}, me = SUPERUSER, mode = "norm
       return (await client.listCollection(path, query, options)).items;
     },
     async count(path) {
-      if (mode === "forbidden") forbidden(path);
+      if (mode === "forbidden" || forbiddenPaths.includes(path)) forbidden(path);
       if (path in counts) return counts[path];
       const value = resolvedRoutes[path];
       if (Array.isArray(value)) return mode === "empty" ? 0 : value.length;
@@ -287,6 +317,29 @@ test("resolveAnsibleConfiguration prefers explicit non-secret args and keeps pas
     () => resolveAnsibleConfiguration({ url: "https://aap.example.com", password: "nope" }, {}),
     /AAP_PASSWORD must be provided via environment/,
   );
+});
+
+test("config resolution: credentials set through the environment survive an argument overlay that carries every credential key as undefined and names only an unrelated argument, and the source chain names the environment", () => {
+  const env = { AAP_URL: "https://env-aap.example.com", AAP_TOKEN: "hQ2vT8mKp4Xw9ZrLc6Nd", AAP_USERNAME: "env-user", AAP_PASSWORD: "Wq7Lm3Zx8Rt2Vk5Pn9Yb" };
+  // The shape createClient hands the resolver: every documented key present, only the unrelated one carrying a value.
+  const overlay = { url: undefined, username: undefined, token: undefined, timeout_seconds: 12, verify_ssl: undefined };
+
+  const token = resolveAnsibleConfiguration(overlay, { AAP_URL: env.AAP_URL, AAP_TOKEN: env.AAP_TOKEN });
+  assert.equal(token.token, env.AAP_TOKEN, "the environment token resolves");
+  assert.equal(token.baseUrl, env.AAP_URL, "the environment URL resolves");
+  assert.equal(token.timeoutMs, 12_000, "the unrelated argument is applied");
+  assert.deepEqual(token.sourceChain, ["environment"], "the source chain names the environment");
+
+  const session = resolveAnsibleConfiguration(overlay, { AAP_URL: env.AAP_URL, AAP_USERNAME: env.AAP_USERNAME, AAP_PASSWORD: env.AAP_PASSWORD });
+  assert.equal(session.username, env.AAP_USERNAME, "the environment username resolves");
+  assert.equal(session.password, env.AAP_PASSWORD, "the environment password resolves");
+  assert.deepEqual(session.sourceChain, ["environment", "environment-password"], "the source chain names the environment for both");
+
+  // A blank string argument is "not provided" as well: it never shadows the environment value.
+  const blank = resolveAnsibleConfiguration({ ...overlay, url: "", token: "  " }, { AAP_URL: env.AAP_URL, AAP_TOKEN: env.AAP_TOKEN });
+  assert.equal(blank.token, env.AAP_TOKEN, "a blank token argument does not erase the environment token");
+  assert.equal(blank.baseUrl, env.AAP_URL, "a blank url argument does not erase the environment URL");
+  assert.deepEqual(blank.sourceChain, ["environment"]);
 });
 
 test("resolveAnsibleConfiguration reads AAP_VERIFY_SSL and lets verify_ssl override it", () => {
@@ -439,6 +492,53 @@ test("verdict rule 7: AnsibleAapClient records truncation when a limit stops bef
   const full = await client.listCollection("/api/v2/hosts/");
   assert.equal(full.items.length, 300);
   assert.equal(full.complete, true);
+});
+
+test("verdict rule 10: listCollection reports a trimmed last page, a repeated next link, an empty page with next, and a count mismatch as incomplete", async () => {
+  const makeClient = (fetchImpl) => new AnsibleAapClient(
+    { baseUrl: "https://aap.example.com", token: "aap-token", timeoutMs: 30_000, verifySsl: true, sourceChain: ["tests"] },
+    { fetchImpl },
+  );
+
+  const trimmedLastPage = makeClient(async () => jsonResponse({
+    count: 120,
+    next: null,
+    results: Array.from({ length: 120 }, (_, index) => ({ id: index + 1 })),
+  }));
+  const trimmed = await trimmedLastPage.listCollection("/api/v2/activity_stream/", {}, { limit: 10 });
+  assert.equal(trimmed.items.length, 10);
+  assert.equal(trimmed.complete, false, "a limit below the page size must not report the collection complete");
+  assert.equal(trimmed.total, 120);
+  assert.match(trimmed.truncation, /stopped at the requested limit of 10; 110 items on the last page were not collected/);
+
+  let repeatedCalls = 0;
+  const repeatedNext = makeClient(async () => {
+    repeatedCalls += 1;
+    return jsonResponse({ count: 500, next: "/api/v2/organizations/?page=2&page_size=100", results: Array.from({ length: 100 }, (_, index) => ({ id: index + 1 })) });
+  });
+  const repeated = await repeatedNext.listCollection("/api/v2/organizations/");
+  assert.equal(repeated.complete, false);
+  assert.equal(repeatedCalls, 2, "a repeated next link exits after the first repeat instead of looping");
+  assert.match(repeated.truncation, /repeated the same next page link/);
+
+  const emptyWithNext = makeClient(async (input) => {
+    const url = new URL(typeof input === "string" ? input : input.toString());
+    const page = Number(url.searchParams.get("page") ?? "1");
+    return jsonResponse({ count: 200, next: `/api/v2/users/?page=${page + 1}&page_size=100`, results: page === 1 ? [{ id: 1 }] : [] });
+  });
+  const stalled = await emptyWithNext.listCollection("/api/v2/users/");
+  assert.equal(stalled.items.length, 1);
+  assert.equal(stalled.complete, false);
+  assert.match(stalled.truncation, /empty page while advertising a next page/);
+
+  const shortCount = makeClient(async () => jsonResponse({ count: 7, next: null, results: [{ id: 1 }, { id: 2 }] }));
+  const mismatch = await shortCount.listCollection("/api/v2/teams/");
+  assert.equal(mismatch.complete, false);
+  assert.equal(mismatch.total, 7);
+  assert.match(mismatch.truncation, /reported 7 items but only 2 were returned/);
+
+  const noCount = makeClient(async () => jsonResponse({ results: [{ id: 1 }] }));
+  assert.equal(await noCount.count("/api/v2/teams/"), undefined, "a missing count is reported as unknown, not as the probe page size");
 });
 
 test("checkAnsibleAccess reports readable AAP audit surfaces and visibility", async () => {
@@ -1055,7 +1155,7 @@ test("exportAnsibleAuditBundle writes the shared layout with compliance reports 
   const client = createMockClient();
   const config = {
     baseUrl: "https://aap.example.com",
-    token: "aap-token",
+    token: ANSIBLE_EXPORT_TOKEN_CANARY,
     timeoutMs: 30_000,
     verifySsl: true,
     sourceChain: ["tests"],
@@ -1104,7 +1204,7 @@ test("exportAnsibleAuditBundle writes the shared layout with compliance reports 
   assert.equal(metadata.controls_assessed, 30);
   assert.equal(metadata.verify_ssl, true);
   const rawBundle = readFileSync(join(result.outputDir, "core_data", "credentials.json"), "utf8");
-  assert.ok(!rawBundle.includes("aap-token"));
+  assertNoCanaryWindows(assert, rawBundle, [ANSIBLE_EXPORT_TOKEN_CANARY], "core_data/credentials.json");
 });
 
 test("exportAnsibleAuditBundle writes _errors.log when some reads fail but the bundle completes", async () => {
@@ -1144,6 +1244,911 @@ test("verdict rule 8: re-running the export allocates a new directory and never 
   );
 });
 
+/**
+ * Planted values that must never reach the bundle, alphanumeric and random-looking so no 6-character window of
+ * them occurs in the fixture's legitimate values (see the fixture self-check).
+ */
+const FAKE_ANSIBLE_SECRETS = {
+  jobVar: "VGXeGJApvMQs9N9Y",
+  templateVar: "jBq3DGELKj3xDV8H",
+  workflowVar: "CMdZGBb9hMDPcVpZ",
+  scheduleVar: "Y8gNVnxh6p7QBk5U",
+  hostVar: "bUwvuYPqv7yeHWfK",
+  sourceVar: "vu2F9nhApyBVTj8X",
+  inventoryVar: "k4wMSMDh5DKqUQRA",
+  groupVar: "RQ2avbAVnVWzCv9W",
+  proxyPassword: "xTMeP8Wvx92YAXw8",
+  galaxyToken: "Rrv2Mnx7EX7KgtTz",
+  webhookPath: "w5Mv8GTS59UdHUAR",
+  errorWebhookPath: "aHBxdNsXyU59Ckeq",
+  headerValue: "bSvyaK4E7sDNdZqy",
+  pairHeaderValue: "pr5yrQe2qGeJBP3f",
+  slackToken: "uUVRsNMEa9w6DN2K",
+  scmToken: "X89StUkLvF4K83bS",
+  activityChange: "QWK8kfEm8Gd6DXVn",
+  surveyDefault: "qQp96Geme6eWUxjR",
+  credentialInput: "Pj8nfpDspLwLrnSD",
+  tokenValue: "JSPjcxzMspntP5VF",
+  refreshToken: "hGcSb2PCzW26RTva",
+  ldapBind: "KhwadpYp5MPJkFDF",
+  samlKey: "Y5GNkYQtTmcrkMM4",
+  oauthSecret: "wU4Gga3pBBcjBCtv",
+  redhatPassword: "vLcMQ4fU9Ckw4k2y",
+  licenseKey: "c9nD6HXEBzhV9Th5",
+  loggingPassword: "cWqm4dQNJrBzMMJY",
+  userHash: "jgN3H9xRJb3Dnatz",
+  meHash: "aS3Hte3RFCkaP2es",
+  podSpec: "ZWGCgMMzLwj5zm3p",
+  notificationBody: "yzdzMCH3vcrj7LK6",
+};
+
+/** The export tests' configured token and the current user's email local part, both kept out of the bundle. */
+const ANSIBLE_EXPORT_TOKEN_CANARY = "VqAngJDvPREAn5FP2K3M";
+const ANSIBLE_AUDITOR_LOCAL_PART_CANARY = "KE9cNJeCaYuq";
+const ANSIBLE_AUDITOR_EMAIL = `${ANSIBLE_AUDITOR_LOCAL_PART_CANARY}@example.com`;
+
+function secretBearingRoutes() {
+  const secrets = FAKE_ANSIBLE_SECRETS;
+  const webhook = (path, headers) => ({
+    id: 1,
+    name: "slack alerts",
+    notification_type: "webhook",
+    organization: 1,
+    notification_configuration: { url: `https://hooks.slack.com/services/${path}`, headers, token: secrets.slackToken, http_method: "POST" },
+  });
+  return {
+    "/api/v2/jobs/": HEALTHY_ROUTES["/api/v2/jobs/"].map((entry, index) => (index === 0 ? { ...entry, extra_vars: `---\ndb_password: ${secrets.jobVar}\nregion: us-east-1` } : entry)),
+    "/api/v2/settings/jobs/": {
+      SCHEDULE_MAX_JOBS: 10,
+      MAX_FORKS: 200,
+      AWX_TASK_ENV: { HTTPS_PROXY: `http://svc:${secrets.proxyPassword}@proxy.example.com:3128` },
+      GALAXY_TASK_ENV: { ANSIBLE_GALAXY_SERVER_TOKEN: secrets.galaxyToken },
+    },
+    "/api/v2/instance_groups/": [{ id: 1, name: "default", max_concurrent_jobs: 0, max_forks: 100, pod_spec_override: `env:\n  - name: API_TOKEN\n    value: ${secrets.podSpec}` }],
+    "/api/v2/hosts/": [{ ...host(1, "web-1", "2026-09-20T00:10:00Z"), variables: `---\nansible_password: ${secrets.hostVar}` }],
+    "/api/v2/inventory_sources/": [{ id: 1, name: "aws", status: "successful", last_update_failed: false, last_updated: "2026-09-20T00:00:00Z", source_vars: `---\naws_secret_key: ${secrets.sourceVar}` }],
+    "/api/v2/job_templates/": [
+      jobTemplate(10, "Patch Linux", { extra_vars: `---\napi_token: ${secrets.templateVar}\nregion: us-east-1` }),
+      jobTemplate(11, "Survey Template", { survey_enabled: true }),
+    ],
+    "/api/v2/job_templates/11/survey_spec/": { name: "", spec: [{ variable: "api_token", type: "text", default: secrets.surveyDefault, required: true }] },
+    "/api/v2/job_templates/10/notification_templates_error/": [webhook(secrets.errorWebhookPath, { "X-Api-Key": secrets.headerValue })],
+    "/api/v2/schedules/": [
+      { id: 1, name: "weekly patch", unified_job_template: 10, enabled: true, next_run: "2026-09-27T00:00:00Z", rrule: "DTSTART:20260101T000000Z RRULE:FREQ=WEEKLY;INTERVAL=1", extra_data: { api_token: secrets.scheduleVar } },
+    ],
+    "/api/v2/workflow_job_templates/": [{ id: 1, name: "Patch and validate", description: "", extra_vars: `{"client_secret": "${secrets.workflowVar}"}` }],
+    "/api/v2/organizations/1/admins/": [{ id: 1, username: "auditor", password: secrets.userHash, email: ANSIBLE_AUDITOR_EMAIL }],
+    "/api/v2/users/": [
+      { ...SUPERUSER, password: secrets.userHash, email: ANSIBLE_AUDITOR_EMAIL, ldap_dn: "cn=auditor,dc=example" },
+      { ...LIMITED_USER, password: secrets.userHash },
+      { id: 3, username: "reviewer", is_superuser: false, is_system_auditor: true, password: secrets.userHash },
+    ],
+    "/api/v2/credentials/": [
+      { id: 1, name: "machine", kind: "ssh", managed: false, modified: "2026-09-01T00:00:00Z", inputs: { username: "ansible", password: secrets.credentialInput }, summary_fields: { owners: [{ type: "user", name: "auditor" }] } },
+    ],
+    "/api/v2/tokens/": [{ id: 1, created: "2026-09-01T00:00:00Z", expires: "2026-12-01T00:00:00Z", token: secrets.tokenValue, refresh_token: secrets.refreshToken, scope: "read" }],
+    "/api/v2/projects/": [{ id: 1, name: "playbooks", scm_type: "git", scm_url: `https://svc:${secrets.scmToken}@git.example.com/org/playbooks.git`, last_update_failed: false, last_updated: "2026-09-20T00:00:00Z" }],
+    "/api/v2/inventories/": [{ id: 1, name: "prod", variables: `---\nvault_password: ${secrets.inventoryVar}` }],
+    "/api/v2/groups/": [{ id: 1, name: "web", variables: `{"service_token": "${secrets.groupVar}"}` }],
+    "/api/v2/notification_templates/": [webhook(secrets.webhookPath, [{ name: "Authorization", value: secrets.pairHeaderValue }])],
+    "/api/v2/notifications/": [{ id: 1, status: "successful", body: `token=${secrets.notificationBody}` }],
+    "/api/v2/activity_stream/": [{ id: 1, timestamp: "2026-09-20T22:00:00Z", operation: "update", object1: "job_template", changes: { extra_vars: ["---", `db_password: ${secrets.activityChange}`] }, summary_fields: { actor: { id: 1, username: "auditor", email: "auditor@example.com" } } }],
+    "/api/v2/settings/authentication/": {
+      AUTH_LDAP_SERVER_URI: "ldaps://ldap.example.com",
+      AUTH_LDAP_BIND_DN: "cn=svc,dc=example",
+      AUTH_LDAP_BIND_PASSWORD: secrets.ldapBind,
+      SOCIAL_AUTH_SAML_SP_PRIVATE_KEY: secrets.samlKey,
+      SOCIAL_AUTH_GITHUB_SECRET: secrets.oauthSecret,
+      SOCIAL_AUTH_SAML_ENABLED_IDPS: { okta: { entity_id: "https://idp.example.com", url: `https://idp.example.com/sso?token=${secrets.oauthSecret}` } },
+    },
+    "/api/v2/settings/system/": { ACTIVITY_STREAM_ENABLED: true, REDHAT_PASSWORD: secrets.redhatPassword, LICENSE: { license_key: secrets.licenseKey, subscription_name: "AAP" } },
+    "/api/v2/settings/logging/": { LOG_AGGREGATOR_ENABLED: true, LOG_AGGREGATOR_TYPE: "splunk", LOG_AGGREGATOR_PASSWORD: secrets.loggingPassword },
+  };
+}
+
+test("verdict rule 9: exportAnsibleAuditBundle never writes variables bodies, credential inputs, tokens, webhook secrets, or settings secrets into the bundle or its zip", async () => {
+  const base = createTempBase("grclanker-ansible-export-secrets-");
+  const secrets = Object.values(FAKE_ANSIBLE_SECRETS);
+  const client = createMockClient({ routes: secretBearingRoutes(), me: { ...SUPERUSER, password: FAKE_ANSIBLE_SECRETS.meHash, email: ANSIBLE_AUDITOR_EMAIL } });
+  const config = { baseUrl: "https://aap.example.com", token: ANSIBLE_EXPORT_TOKEN_CANARY, timeoutMs: 30_000, verifySsl: true, sourceChain: ["tests"] };
+
+  const result = await exportAnsibleAuditBundle(client, config, base, {});
+  assert.equal(result.findingCount, 30);
+  const files = readBundleFiles(result.outputDir);
+  for (const relativePath of ["core_data/jobs.json", "core_data/job_settings.json", "core_data/credentials.json", "core_data/tokens.json", "core_data/projects.json", "core_data/notification_templates.json", "core_data/template_error_notifications.json", "core_data/survey_specs.json", "core_data/activity_stream.json", "core_data/settings_authentication.json", "analysis/platform-security.json"]) {
+    assert.ok(files.has(join(...relativePath.split("/"))), `expected ${relativePath}`);
+  }
+  assertNoCanaryWindowsInFiles(assert, files, [...secrets, ANSIBLE_EXPORT_TOKEN_CANARY, ANSIBLE_AUDITOR_LOCAL_PART_CANARY], "bundle directory");
+  const zipEntries = readZipEntries(result.zipPath);
+  assert.equal(zipEntries.size, files.size, "the zip carries exactly the written files");
+  assertNoCanaryWindowsInFiles(assert, zipEntries, [...secrets, ANSIBLE_EXPORT_TOKEN_CANARY, ANSIBLE_AUDITOR_LOCAL_PART_CANARY], "zip archive");
+
+  const assessments = await runAllAssessments(client);
+  const access = await checkAnsibleAccess(client);
+  assertNoCanaryWindows(assert, assessments, [...secrets, ANSIBLE_AUDITOR_LOCAL_PART_CANARY], "assessment results");
+  assertNoCanaryWindows(assert, access, [...secrets, ANSIBLE_AUDITOR_LOCAL_PART_CANARY], "access check result");
+  const plaintext = byId(assessments[2], "AAP-CRED-04");
+  assert.equal(plaintext.status, "fail", "the in-memory scanner still sees the raw variables");
+  assert.deepEqual(plaintext.evidence.hits.map((hit) => hit.type).sort(), ["group", "inventory", "job_template", "survey_spec"]);
+
+  const read = (name) => JSON.parse(files.get(join("core_data", name)));
+  assert.equal(read("jobs.json").data.items[0].extra_vars, `${ANSIBLE_REDACTION_MARKER} (variable names: db_password, region)`);
+  assert.equal(read("jobs.json").data.items[0].status, "running");
+  assert.equal(read("job_templates.json").data.items[0].extra_vars, `${ANSIBLE_REDACTION_MARKER} (variable names: api_token, region)`);
+  assert.deepEqual(read("job_templates.json").data.items[0].summary_fields.credentials, [{ id: 1, name: "machine", kind: "ssh" }]);
+  assert.equal(read("workflow_job_templates.json").data.items[0].extra_vars, `${ANSIBLE_REDACTION_MARKER} (variable names: client_secret)`);
+  assert.equal(read("schedules.json").data.items[0].extra_data, `${ANSIBLE_REDACTION_MARKER} (variable names: api_token)`);
+  assert.equal(read("schedules.json").data.items[0].rrule, "DTSTART:20260101T000000Z RRULE:FREQ=WEEKLY;INTERVAL=1");
+  assert.equal(read("hosts.json").data.items[0].variables, `${ANSIBLE_REDACTION_MARKER} (variable names: ansible_password)`);
+  assert.equal(read("hosts.json").data.items[0].summary_fields.last_job.status, "successful");
+  assert.equal(read("inventory_sources.json").data.items[0].source_vars, `${ANSIBLE_REDACTION_MARKER} (variable names: aws_secret_key)`);
+  assert.equal(read("inventories.json").data.items[0].variables, `${ANSIBLE_REDACTION_MARKER} (variable names: vault_password)`);
+  assert.equal(read("groups.json").data.items[0].variables, `${ANSIBLE_REDACTION_MARKER} (variable names: service_token)`);
+  const jobSettings = read("job_settings.json").data;
+  assert.deepEqual(jobSettings, {
+    SCHEDULE_MAX_JOBS: 10,
+    MAX_FORKS: 200,
+    AWX_TASK_ENV: { HTTPS_PROXY: ANSIBLE_REDACTION_MARKER },
+    GALAXY_TASK_ENV: { ANSIBLE_GALAXY_SERVER_TOKEN: ANSIBLE_REDACTION_MARKER },
+  });
+  assert.ok(!("pod_spec_override" in read("instance_groups.json").data.items[0]));
+  assert.deepEqual(read("credentials.json").data.items[0].inputs, { username: ANSIBLE_REDACTION_MARKER, password: ANSIBLE_REDACTION_MARKER });
+  assert.deepEqual(read("credentials.json").data.items[0].summary_fields.owners, [{ type: "user", name: "auditor" }]);
+  assert.equal(read("tokens.json").data.items[0].token, ANSIBLE_REDACTION_MARKER);
+  assert.equal(read("tokens.json").data.items[0].refresh_token, ANSIBLE_REDACTION_MARKER);
+  assert.equal(read("tokens.json").data.items[0].scope, "read");
+  assert.equal(read("projects.json").data.items[0].scm_url, "https://git.example.com/org/playbooks.git");
+  const notification = read("notification_templates.json").data.items[0];
+  assert.equal(notification.notification_configuration.url, "https://hooks.slack.com");
+  assert.equal(notification.notification_configuration.token, ANSIBLE_REDACTION_MARKER);
+  assert.deepEqual(notification.notification_configuration.headers, [{ name: "Authorization", value: ANSIBLE_REDACTION_MARKER }]);
+  const errorNotification = read("template_error_notifications.json")["10"].data.items[0];
+  assert.equal(errorNotification.notification_configuration.url, "https://hooks.slack.com");
+  assert.deepEqual(errorNotification.notification_configuration.headers, { "X-Api-Key": ANSIBLE_REDACTION_MARKER });
+  const survey = read("survey_specs.json")["11"].data.spec[0];
+  assert.deepEqual(survey, { variable: "api_token", type: "text", required: true, default: ANSIBLE_REDACTION_MARKER });
+  assert.equal(read("activity_stream.json").data.items[0].changes, `${ANSIBLE_REDACTION_MARKER} (variable names: extra_vars)`);
+  assert.deepEqual(read("activity_stream.json").data.items[0].summary_fields.actor, { id: 1, username: "auditor" });
+  const authSettings = read("settings_authentication.json").data;
+  assert.equal(authSettings.AUTH_LDAP_SERVER_URI, "ldaps://ldap.example.com");
+  assert.equal(authSettings.AUTH_LDAP_BIND_DN, "cn=svc,dc=example");
+  assert.equal(authSettings.AUTH_LDAP_BIND_PASSWORD, ANSIBLE_REDACTION_MARKER);
+  assert.equal(authSettings.SOCIAL_AUTH_SAML_SP_PRIVATE_KEY, ANSIBLE_REDACTION_MARKER);
+  assert.equal(authSettings.SOCIAL_AUTH_SAML_ENABLED_IDPS.okta.url, "https://idp.example.com/sso", "URL query strings are dropped from settings values");
+  assert.deepEqual(read("settings_system.json").data, { ACTIVITY_STREAM_ENABLED: true, REDHAT_PASSWORD: ANSIBLE_REDACTION_MARKER, LICENSE: { license_key: ANSIBLE_REDACTION_MARKER, subscription_name: "AAP" } });
+  assert.equal(read("settings_logging.json").data.LOG_AGGREGATOR_PASSWORD, ANSIBLE_REDACTION_MARKER);
+  assert.equal(read("settings_logging.json").data.LOG_AGGREGATOR_TYPE, "splunk");
+  assert.deepEqual(Object.keys(read("users.json").data.items[0]).sort(), ["id", "is_superuser", "is_system_auditor", "username"]);
+  assert.deepEqual(read("access.json").currentUser, { id: 1, username: "auditor", is_superuser: true, is_system_auditor: false });
+  assert.deepEqual(Object.keys(read("notifications.json").data.items[0]).sort(), ["id", "status"]);
+  assert.match(files.get("QUICK_REFERENCE.md"), /\[REDACTED\]/);
+});
+
+test("verdict rule 9: redaction helpers cover camelCase keys, pair shapes, environment dictionaries, and URL userinfo", () => {
+  assert.deepEqual(redactCredentialTree({
+    apiKey: "FAKE_SECRET_TOKEN_1",
+    refreshToken: "FAKE_SECRET_TOKEN_2",
+    "X-Auth-Token": "FAKE_SECRET_TOKEN_3",
+    AUTH_LDAP_BIND_DN: "cn=svc",
+    nested: { client_secret: "FAKE_SECRET_TOKEN_4", enabled: true, empty: "", missing: null },
+    headers: [{ name: "Authorization", value: "FAKE_SECRET_TOKEN_5" }, { key: "X-Tenant", value: "acme" }],
+    AWX_TASK_ENV: { HTTP_PROXY: "http://user:FAKE_SECRET_TOKEN_6@proxy:3128", NO_PROXY: "localhost" },
+    endpoint: "https://user:FAKE_SECRET_TOKEN_7@api.example.com/v1?sig=FAKE_SECRET_TOKEN_8#frag",
+    list: ["plain", { token: "FAKE_SECRET_TOKEN_9" }],
+  }), {
+    apiKey: "[REDACTED]",
+    refreshToken: "[REDACTED]",
+    "X-Auth-Token": "[REDACTED]",
+    AUTH_LDAP_BIND_DN: "cn=svc",
+    nested: { client_secret: "[REDACTED]", enabled: true, empty: "", missing: null },
+    headers: [{ name: "Authorization", value: "[REDACTED]" }, { key: "X-Tenant", value: "[REDACTED]" }],
+    AWX_TASK_ENV: { HTTP_PROXY: "[REDACTED]", NO_PROXY: "[REDACTED]" },
+    endpoint: "https://api.example.com/v1",
+    list: ["plain", { token: "[REDACTED]" }],
+  });
+  assert.equal(redactVariables(`---\ndb_password: x\nregion: us-east-1\n  nested: y`), "[REDACTED] (variable names: db_password, region)");
+  assert.equal(redactVariables('{"api_token": "x", "count": 1}'), "[REDACTED] (variable names: api_token, count)");
+  assert.equal(redactVariables({ vault_pass: "x" }), "[REDACTED] (variable names: vault_pass)");
+  assert.equal(redactVariables("hunter22"), "[REDACTED]");
+  assert.equal(redactVariables(""), "");
+  assert.equal(redactVariables(null), null);
+  assert.equal(sanitizeScmUrl("https://svc:FAKE_SECRET_TOKEN_1@git.example.com/org/repo.git?token=FAKE_SECRET_TOKEN_2"), "https://git.example.com/org/repo.git");
+  assert.equal(sanitizeScmUrl("git@github.com:org/repo.git"), "git@github.com:org/repo.git");
+  assert.equal(sanitizeScmUrl("svc:FAKE_SECRET_TOKEN_1@git.example.com:org/repo.git"), "[REDACTED]");
+  assert.equal(sanitizeScmUrl(""), "");
+});
+
+test("verdict rule 9: AnsibleAapClient error messages keep the structured detail and never echo raw response bodies", async () => {
+  const htmlBody = `<html>gateway error ${ANSIBLE_ERROR_BODY_CANARIES.html}</html>`;
+  const client = new AnsibleAapClient(
+    { baseUrl: "https://aap.example.com", token: "aap-token", timeoutMs: 30_000, verifySsl: true, sourceChain: ["tests"] },
+    {
+      fetchImpl: async (input) => {
+        const url = new URL(typeof input === "string" ? input : input.toString());
+        if (url.pathname === "/api/v2/jobs/") {
+          return new Response(JSON.stringify({ detail: "You do not have permission to perform this action.", token: ANSIBLE_ERROR_BODY_CANARIES.json }), {
+            status: 403,
+            statusText: "Forbidden",
+            headers: { "content-type": "application/json" },
+          });
+        }
+        return new Response(htmlBody, { status: 502, statusText: "Bad Gateway", headers: { "content-type": "text/html" } });
+      },
+    },
+  );
+  await assert.rejects(() => client.get("/api/v2/jobs/"), (error) => {
+    assert.match(error.message, /\/api\/v2\/jobs\/ \(403 Forbidden\) You do not have permission/);
+    assertNoCanaryWindows(assert, error.message, [ANSIBLE_ERROR_BODY_CANARIES.json], "JSON error body field");
+    return true;
+  });
+  await assert.rejects(() => client.get("/api/v2/hosts/"), (error) => {
+    assert.equal(error.message, `AAP request failed: /api/v2/hosts/ (502 Bad Gateway): non-JSON body (text/html, ${Buffer.byteLength(htmlBody, "utf8")} bytes)`);
+    assertNoCanaryWindows(assert, error.message, [ANSIBLE_ERROR_BODY_CANARIES.html], "non-JSON body");
+    assert.equal(error.status, 502);
+    assert.equal(error.endpoint, "/api/v2/hosts/");
+    return true;
+  });
+});
+
+test("verdict rule 10: survey spec and error notification probes capped at 50 templates demote controls 18 and 27 with seen versus total", async () => {
+  const templates = Array.from({ length: 60 }, (_, index) => jobTemplate(100 + index, `Patch Server ${index}`, { survey_enabled: true }));
+  const routes = { "/api/v2/job_templates/": templates };
+  for (const template of templates) {
+    routes[`/api/v2/job_templates/${template.id}/survey_spec/`] = { name: "", spec: [{ variable: "target", type: "text", default: "web" }] };
+    routes[`/api/v2/job_templates/${template.id}/notification_templates_error/`] = [{ id: 1, name: "slack alerts" }];
+  }
+  const result = await assessAnsiblePlatformSecurity(createMockClient({ routes }));
+
+  const plaintext = byId(result, "AAP-CRED-04");
+  assert.equal(plaintext.status, "warn");
+  assert.equal(plaintext.evidence.surveys_scanned, 50);
+  assert.equal(plaintext.evidence.survey_templates_eligible, 60);
+  assert.ok(plaintext.evidence.partial_view.some((note) => /survey specs: 50 of 60 probed/.test(note)), plaintext.summary);
+  assert.match(plaintext.summary, /survey specs: 50 of 60 probed/);
+
+  const notifications = byId(result, "AAP-AUDIT-02");
+  assert.equal(notifications.status, "warn");
+  assert.equal(notifications.evidence.critical_templates, 50);
+  assert.equal(notifications.evidence.critical_templates_eligible, 60);
+  assert.match(notifications.summary, /critical templates: 50 of 60 probed/);
+
+  const underCap = await assessAnsiblePlatformSecurity(createMockClient({ routes: {
+    ...routes,
+    "/api/v2/job_templates/": templates.slice(0, 50),
+  } }));
+  assert.equal(byId(underCap, "AAP-CRED-04").status, "pass");
+  assert.equal(byId(underCap, "AAP-AUDIT-02").status, "pass");
+});
+
+test("rule 1 corollary: multi-inventory findings never pass when a secondary inventory returns 403 and name the unreadable inventory", async () => {
+  const cases = [
+    { control: 12, assess: assessAnsibleHostCoverage, forbidden: "/api/v2/schedules/", names: /schedules could not be read/ },
+    { control: 13, assess: assessAnsibleHostCoverage, forbidden: "/api/v2/job_templates/", names: /job templates list could not be read/ },
+    { control: 18, assess: assessAnsiblePlatformSecurity, forbidden: "/api/v2/credentials/", names: /Vault credential usage could not be read \(credentials: /, expected: "warn" },
+    { control: 18, assess: assessAnsiblePlatformSecurity, forbidden: "/api/v2/inventories/", names: /variable sources \(inventories\) could not be read/, expected: "manual" },
+    { control: 21, assess: assessAnsiblePlatformSecurity, forbidden: "/api/v2/organizations/1/admins/", names: /admins list of 1 organizations \(Default\) could not be read/, expected: "manual" },
+    { control: 22, assess: assessAnsiblePlatformSecurity, forbidden: "/api/v2/inventories/", names: /inventories list could not be read/, expected: "warn", partialView: /^inventories: unreadable \(inventories \(\/api\/v2\/inventories\/\): / },
+    { control: 22, assess: assessAnsiblePlatformSecurity, forbidden: "/api/v2/teams/1/roles/", names: /roles of 1 teams could not be read/, expected: "manual" },
+    { control: 23, assess: assessAnsiblePlatformSecurity, forbidden: "/api/v2/users/2/roles/", names: /roles of 1 users could not be read/, expected: "manual" },
+    { control: 24, assess: assessAnsiblePlatformSecurity, forbidden: "/api/v2/teams/", names: /teams list could not be read/, expected: "warn" },
+    { control: 24, assess: assessAnsiblePlatformSecurity, forbidden: "/api/v2/users/3/roles/", names: /1 user or team role lists could not be read/, expected: "warn" },
+    { control: 26, assess: assessAnsiblePlatformSecurity, forbidden: "/api/v2/settings/system/", names: /system settings could not be read/, expected: "warn" },
+    { control: 26, assess: assessAnsiblePlatformSecurity, forbidden: "/api/v2/settings/logging/", names: /logging settings could not be read/, expected: "warn" },
+    { control: 27, assess: assessAnsiblePlatformSecurity, forbidden: "/api/v2/notifications/", names: /notification delivery history could not be read/, expected: "warn", partialView: /^notifications: unreadable \(notifications \(\/api\/v2\/notifications\/\): / },
+    { control: 27, assess: assessAnsiblePlatformSecurity, forbidden: "/api/v2/job_templates/", names: /job templates list could not be read/, expected: "manual" },
+    { control: 28, assess: assessAnsibleJobHealth, forbidden: "/api/v2/instance_groups/", names: /instance groups could not be read/, expected: "manual" },
+    { control: 28, assess: assessAnsibleJobHealth, forbidden: "/api/v2/settings/jobs/", names: /job settings could not be read/, expected: "manual" },
+    { control: 30, assess: assessAnsiblePlatformSecurity, forbidden: "/api/v2/execution_environments/", names: /Execution environments could not be read/, expected: "manual" },
+  ];
+  for (const testCase of cases) {
+    const result = await testCase.assess(createMockClient({ forbiddenPaths: [testCase.forbidden] }));
+    const finding = byControl(result, testCase.control);
+    assert.notEqual(finding.status, "pass", `control ${testCase.control} passed with ${testCase.forbidden} forbidden: ${finding.summary}`);
+    if (testCase.expected) assert.equal(finding.status, testCase.expected, `control ${testCase.control} with ${testCase.forbidden} forbidden: ${finding.summary}`);
+    assert.match(finding.summary, testCase.names, `control ${testCase.control} with ${testCase.forbidden} forbidden`);
+    if (testCase.partialView) {
+      assert.ok(finding.evidence.partial_view.some((note) => testCase.partialView.test(note)), `control ${testCase.control}: partial_view names the unreadable inventory: ${JSON.stringify(finding.evidence.partial_view)}`);
+    }
+    assert.ok(result.errors.some((error) => error.includes(testCase.forbidden)), `control ${testCase.control}: errors array names ${testCase.forbidden}`);
+  }
+  const healthy = await runAllAssessments(createMockClient());
+  assert.equal(healthy.flatMap((result) => result.findings).filter((item) => item.status !== "pass").length, 0, "the healthy fixture still passes every control");
+});
+
+test("rule 1 corollary: partialNotes caps any pass built on an unreadable view at warn without a per-control branch", async () => {
+  const forbiddenNotifications = await assessAnsiblePlatformSecurity(createMockClient({ forbiddenPaths: ["/api/v2/notifications/"] }));
+  const notifications = byControl(forbiddenNotifications, 27);
+  assert.equal(notifications.status, "warn");
+  assert.ok(notifications.evidence.partial_view.some((note) => /^notifications: unreadable \(/.test(note)), JSON.stringify(notifications.evidence.partial_view));
+  assert.equal(notifications.evidence.notifications_readable, false);
+
+  const forbiddenInventories = await assessAnsiblePlatformSecurity(createMockClient({ forbiddenPaths: ["/api/v2/inventories/"] }));
+  const teams = byControl(forbiddenInventories, 22);
+  assert.equal(teams.status, "warn");
+  assert.equal(teams.evidence.inventories_readable, false);
+  assert.equal(teams.evidence.total_inventories, null, "an unreadable inventory total renders null, never a count");
+  assert.ok(teams.evidence.partial_view.some((note) => /^inventories: unreadable \(/.test(note)), JSON.stringify(teams.evidence.partial_view));
+  assert.doesNotMatch(teams.summary, /on every inventory\./);
+});
+
+// Fixtures over the real AnsibleAapClient: the error constructor, the request wrapper, the login
+// path, and every collector catch block are the code under test, not the mock client above.
+/** Planted credentials for the client tests: the run token and the values an error body echoes. */
+const ANSIBLE_RUN_TOKEN_CANARY = "VJQu6BSFDkFPS2g6GsLGSMsg";
+const ANSIBLE_ERROR_BODY_CANARIES = Object.freeze({ json: "Uw34sFSRwES87v9q", html: "PYZakdJQxmAaNZv7" });
+
+/**
+ * A 2xx body that is valid JSON but not the documented object (a JSON string or array): 19 characters plus
+ * the quotes make the 21-character body the reviewer measured leaking in full through a TypeError message.
+ */
+const ANSIBLE_PRIMITIVE_BODY_CANARY = "kR7dQx2mVt9HpZ4wLc3";
+
+/** Every planted canary an Ansible output is swept for, window by window. */
+const ANSIBLE_PLANTED_CANARIES = Object.freeze([
+  ...CANARY_VALUES,
+  SHORT_BODY_CANARY,
+  PARSER_SNIPPET_CANARY,
+  ...Object.values(FAKE_ANSIBLE_SECRETS),
+  ANSIBLE_EXPORT_TOKEN_CANARY,
+  ANSIBLE_AUDITOR_LOCAL_PART_CANARY,
+  ANSIBLE_RUN_TOKEN_CANARY,
+  ...Object.values(ANSIBLE_ERROR_BODY_CANARIES),
+  ANSIBLE_PRIMITIVE_BODY_CANARY,
+]);
+
+const AAP_CLIENT_CONFIG = { baseUrl: "https://aap.example.com", token: ANSIBLE_RUN_TOKEN_CANARY, timeoutMs: 30_000, verifySsl: true, sourceChain: ["tests"] };
+
+function aapResponse(body, status, statusText, contentType) {
+  return new Response(body, { status, statusText, headers: { "content-type": contentType } });
+}
+
+function aapPage(items) {
+  return { count: items.length, next: null, previous: null, results: items };
+}
+
+function aapForbidden() {
+  return aapResponse(JSON.stringify({ detail: "You do not have permission to perform this action." }), 403, "Forbidden", "application/json");
+}
+
+function aapNotFound() {
+  return aapResponse(JSON.stringify({ detail: "Not found." }), 404, "Not Found", "application/json");
+}
+
+function aapCanaryHtml() {
+  return aapResponse(htmlCanaryBody(), 502, "Bad Gateway", "text/html");
+}
+
+function aapCanaryJson() {
+  return aapResponse(JSON.stringify({ detail: jsonCanaryMessage() }), 403, "Forbidden", "application/json");
+}
+
+function healthyAapRoutes() {
+  const routes = {
+    "/api/v2/me/": () => jsonResponse({ count: 1, results: [SUPERUSER] }),
+    "/api/v2/ping/": () => jsonResponse({ version: "4.6.0", active_node: "controller-1" }),
+  };
+  for (const [path, value] of Object.entries(HEALTHY_ROUTES)) {
+    routes[path] = Array.isArray(value) ? () => jsonResponse(aapPage(value)) : () => jsonResponse(value);
+  }
+  return routes;
+}
+
+function aapRoutedFetch(routes, log) {
+  return async (input, init) => {
+    const url = new URL(typeof input === "string" ? input : input.toString());
+    const route = routes[url.pathname];
+    if (!route) throw new Error(`Unexpected request: ${url.pathname}`);
+    const response = await route(url);
+    log?.push({ method: init?.method ?? "GET", path: url.pathname, status: response.status });
+    return response;
+  };
+}
+
+function aapClient(routes, log) {
+  return new AnsibleAapClient(AAP_CLIENT_CONFIG, { fetchImpl: aapRoutedFetch(routes, log), now: () => NOW });
+}
+
+/** Runs the access check, the three assessments, and the export, keeping the thrown text when a step fails outright. */
+async function runEveryAnsibleTool(client, outputRoot) {
+  const run = { access: undefined, accessError: undefined, assessments: [], exported: undefined, exportError: undefined };
+  try {
+    run.access = await checkAnsibleAccess(client);
+  } catch (error) {
+    run.accessError = error.message;
+  }
+  run.assessments = await runAllAssessments(client);
+  try {
+    run.exported = await exportAnsibleAuditBundle(client, AAP_CLIENT_CONFIG, outputRoot);
+  } catch (error) {
+    run.exportError = error.message;
+  }
+  return run;
+}
+
+/** Every string an assessment records about a failed read: the errors array plus evidence error fields and partial-view notes. */
+function recordedAnsibleErrors(assessments) {
+  const recorded = [];
+  for (const assessment of assessments) {
+    recorded.push(...assessment.errors);
+    for (const item of assessment.findings) {
+      if (typeof item.evidence?.error === "string") recorded.push(item.evidence.error);
+      for (const note of item.evidence?.partial_view ?? []) {
+        if (/unreadable \(/.test(note)) recorded.push(note);
+      }
+    }
+  }
+  return recorded;
+}
+
+test("rule 9: redactErrorText scrubs every credential shape in the shared cases and leaves prose diagnosable", () => {
+  assertRedactionCases(assert, redactErrorText);
+  assert.equal(redactErrorText(`login failed with token ${AAP_CLIENT_CONFIG.token}`), "login failed with token [REDACTED]", "the configured token is a registered secret once a client exists");
+});
+
+test("rule 9 scrub boundary: name-shaped values stay bare, any value in a carrier is removed, token-shaped values are removed bare, the configured secret is removed in every encoded form, and the integration's fixed texts survive", () => {
+  new AnsibleAapClient({ ...AAP_CLIENT_CONFIG, token: ENCODED_FORM_SECRET }, { fetchImpl: async () => new Response("{}"), now: () => NOW });
+  assertScrubBoundary(assert, redactErrorText, {
+    configuredSecret: ENCODED_FORM_SECRET,
+    mustKeep: [
+      "AAP request failed: /api/v2/settings/system/ (403 Forbidden): You do not have permission to perform this action.",
+      "AAP request failed: /api/v2/hosts/ (502 Bad Gateway): non-JSON body (text/html, 46 bytes)",
+      "SyntaxError: response could not be parsed as JSON; the parser's message is not recorded because it quotes the body",
+      "inventories: unreadable (AAP request failed: /api/v2/inventories/ (403 Forbidden))",
+      "ACTIVITY_STREAM_ENABLED not readable; records under one day old cannot prove the stream is on",
+      "organization Default-Org-2026 has 3 teams with Admin on every inventory",
+      ...ansibleFixedTexts(),
+    ],
+  });
+});
+
+test("rule 9 fixed texts (GWS note 1): every fixed-text message the integration emits survives redactErrorText unchanged, from the SyntaxError and non-JSON notes through the not attempted marker and unreadable-view wordings to the session-login and manual-review prose", () => {
+  const texts = ansibleFixedTexts();
+  assertFixedTextsSurvive(assert, redactErrorText, texts, { minimum: 30 });
+  const deniedDetail = "You do not have permission to perform this action.";
+  for (const required of [
+    "SyntaxError: response could not be parsed as JSON; the parser's message is not recorded because it quotes the body",
+    `not attempted: the parent list could not be read (AAP request failed: /api/v2/inventories/ (403 Forbidden) ${deniedDetail})`,
+    "the read failed",
+    "unknown",
+    `inventories: unreadable (AAP request failed: /api/v2/inventories/ (403 Forbidden) ${deniedDetail})`,
+    "hosts: 1 of 40 seen (page cap reached)",
+    "current user could not be read, so the visibility of the audit account is unknown",
+    "current user (/api/v2/me/): no user returned",
+    "AAP request failed: /api/v2/ping/ (network error: fetch failed)",
+    "AAP request failed: /api/v2/ping/ (network error: This operation was aborted)",
+    "AAP session login failed (network error: fetch failed).",
+    "AAP session login failed (401 Unauthorized).",
+    "AAP session auth requires AAP_USERNAME and AAP_PASSWORD.",
+    "ACTIVITY_STREAM_ENABLED is not exposed by the system settings, so it was not confirmed",
+  ]) {
+    assert.ok(texts.includes(required), `the fixed-text list carries: ${required}`);
+  }
+  assert.ok(texts.some((text) => HTML_BODY_NOTE.test(text)), "the fixed-text list carries the non-JSON body note");
+  assert.ok(texts.some((text) => /^inventories could not be read \(AAP request failed: \/api\/v2\/inventories\/ \(403 Forbidden\) .*\), so this control cannot be verified from the API\. Collect this evidence manually: /.test(text)), "the manual-for-unreadable summary is in the list");
+  assert.ok(texts.some((text) => /^No team holds the Admin role on every inventory\. Downgraded from pass to warn because the inventory is partial or unreadable: current user could not be read, so the visibility of the audit account is unknown; inventories: unreadable \(/.test(text)), "the warn-capped pass summary built on an unreadable view is in the list");
+
+  // The renderings the client throws, built the way requestJson and responseDetail build them, survive too.
+  const thrown = [
+    `AAP request failed: /api/v2/settings/system/ (403 Forbidden) ${deniedDetail}`,
+    "AAP request failed: /api/v2/hosts/ (502 Bad Gateway): non-JSON body (text/html, 46 bytes)",
+    "AAP request failed: /api/v2/ping/ (200 OK): non-JSON body (text/plain, 21 bytes)",
+    "AAP request failed: /api/v2/tokens/ (401 Unauthorized) Authentication credentials were not provided.",
+  ];
+  for (const message of thrown) {
+    assert.equal(redactErrorText(message), message, `the thrown rendering survives the scrub: ${message}`);
+  }
+});
+
+test("rule 9 must-keep and must-redact table (addendum 7): every endpoint path, name, principal, status text, control id, and fixed text the summaries, markers, probes, and evidence rely on survives redactErrorText alone and inside a realistic summary sentence, and every canary planted in every carrier beside one of them is removed while the row survives (extends the rule 9 scrub boundary fixed texts)", () => {
+  const deniedDetail = "You do not have permission to perform this action.";
+  const groups = [
+    {
+      label: "endpoint paths",
+      values: [
+        "/api/v2/ping/",
+        "/api/v2/me/",
+        "/api/v2/inventories/",
+        "/api/v2/hosts/",
+        "/api/v2/users/3/roles/",
+        "/api/v2/teams/1/roles/",
+        "/api/v2/organizations/1/admins/",
+        "/api/v2/job_templates/10/notification_templates_error/",
+        "/api/v2/settings/system/",
+        "/api/v2/settings/logging/",
+        "/api/v2/settings/authentication/",
+        "/api/v2/notifications/",
+        "/api/v2/notification_templates/",
+        "/api/v2/credentials/",
+        "/api/v2/activity_stream/",
+        "/api/v2/execution_environments/",
+        "/api/v2/tokens/",
+        "https://aap.example.com/api/v2/ping/",
+      ],
+      sentence: (value) => `AAP request failed: ${value} (403 Forbidden) ${deniedDetail}`,
+    },
+    {
+      label: "names",
+      values: [
+        "Default",
+        "Default-Org-2026",
+        "prod-us-east-2026",
+        "ops-team",
+        "prod vault",
+        "default-ee",
+        "controller-1",
+        "aap.example.com",
+        "Patch and validate",
+        "weekly harden",
+        "ACTIVITY_STREAM_ENABLED",
+        "LOG_AGGREGATOR_ENABLED",
+        "AAP_USERNAME and AAP_PASSWORD",
+      ],
+      sentence: (value) => `${value} could not be read (403 Forbidden), so this control cannot be verified from the API; its count is null and the verdict is manual.`,
+    },
+    {
+      label: "principals",
+      values: ["auditor", "deploy", "svc-deploy", "reviewer", "ansible", "System Auditor", "Admin"],
+      sentence: (value) => `${value} could not be checked because /api/v2/users/3/roles/ returned 403 Forbidden; the role count is null.`,
+    },
+    {
+      label: "status text",
+      values: [
+        "403 Forbidden",
+        "401 Unauthorized",
+        "502 Bad Gateway",
+        "200 OK",
+        "network error: fetch failed",
+        "network error: This operation was aborted",
+        deniedDetail,
+        "non-JSON body (text/html, 46 bytes)",
+        "no user returned",
+        "page cap reached",
+      ],
+      sentence: (value) => `the inventories list could not be read (${value}), so inventory-wide Admin roles were not checked`,
+    },
+    {
+      label: "control ids",
+      values: ["AAP-AUDIT-01", "AAP-CRED-01", "AAP-HOST-01", "AAP-JOB-01", "AAP-PLAT-01", "AAP-RBAC-02", "AAP-SCHED-01", "AAP-TMPL-03"],
+      sentence: (value) => `${value} is manual because /api/v2/inventories/ was not readable (403 Forbidden).`,
+    },
+    {
+      label: "fixed texts",
+      values: ansibleFixedTexts(),
+      sentence: (value) => `AAP-RBAC-02: ${value}`,
+    },
+  ];
+  assertMustKeepRows(assert, redactErrorText, groups);
+  assertMustRedactRowsBesideMustKeep(assert, redactErrorText, groups);
+});
+
+test("fixture self-check: every planted canary is alphanumeric and random-looking, and no 6-to-24-character window of any canary occurs in the healthy fixture's legitimate values, so a windowed leak assertion can fail only on a real echo", async () => {
+  const legitimate = new Map();
+  for (const [path, route] of Object.entries(healthyAapRoutes())) {
+    legitimate.set(`route ${path}`, await route(new URL(`https://aap.example.com${path}`)).text());
+  }
+  const run = await runEveryAnsibleTool(aapClient(healthyAapRoutes()), createTempBase("grclanker-ansible-self-check-"));
+  assert.equal(run.accessError, undefined);
+  assert.equal(run.exportError, undefined);
+  legitimate.set("check_access", run.access);
+  for (const assessment of run.assessments) legitimate.set(assessment.title, assessment);
+  for (const [name, text] of readBundleFiles(run.exported.outputDir)) legitimate.set(`bundle ${name}`, text);
+  for (const [name, text] of readZipEntries(run.exported.zipPath)) legitimate.set(`zip ${name}`, text);
+  legitimate.set("users", [SUPERUSER, LIMITED_USER]);
+  assertCanaryFixture(assert, ANSIBLE_PLANTED_CANARIES, legitimate, "ansible fixture");
+});
+
+test("rule 9: a 502 HTML page or a JSON error message carrying credentials on any AAP surface never reaches a probe, finding, summary, or bundle file", async () => {
+  const outputRoot = createTempBase("grclanker-ansible-canary-");
+
+  // The healthy run proves the route table is the surface list: every route is requested and nothing else is.
+  const healthyLog = [];
+  const healthyRun = await runEveryAnsibleTool(aapClient(healthyAapRoutes(), healthyLog), outputRoot);
+  assert.equal(healthyRun.accessError, undefined);
+  assert.equal(healthyRun.exported.errorCount, 0, "the healthy fixture records no errors");
+  for (const assessment of healthyRun.assessments) {
+    for (const item of assessment.findings) assert.equal(item.status, "pass", `${item.id}: ${item.summary}`);
+  }
+  const surfaces = Object.keys(healthyAapRoutes());
+  assert.deepEqual([...new Set(healthyLog.map((entry) => entry.path))].sort(), [...surfaces].sort(), "every documented surface is exercised by the access check, the assessments, or the export");
+  const accessLog = [];
+  await checkAnsibleAccess(aapClient(healthyAapRoutes(), accessLog));
+  const probed = new Set(accessLog.map((entry) => entry.path));
+
+  for (const surface of surfaces) {
+    for (const [variant, response, expectedNote, expectedStatus] of [
+      ["html", aapCanaryHtml, HTML_BODY_NOTE, 502],
+      ["json", aapCanaryJson, REDACTED_CANARY_URL, 403],
+    ]) {
+      const label = `${surface} (${variant})`;
+      const run = await runEveryAnsibleTool(aapClient({ ...healthyAapRoutes(), [surface]: response }), createTempBase("grclanker-ansible-canary-"));
+
+      if (surface === "/api/v2/me/") {
+        assert.ok(run.accessError, `${label}: the access check fails outright when the current user cannot be read`);
+        assertNoCanaryWindows(assert, run.accessError, ANSIBLE_PLANTED_CANARIES, `${label} check_access error`);
+        assert.match(run.accessError, expectedNote, `${label}: the thrown text carries the expected note`);
+      } else {
+        assertNoCanaryWindows(assert, run.access, ANSIBLE_PLANTED_CANARIES, `${label} check_access`);
+        if (probed.has(surface) && surface !== "/api/v2/ping/") {
+          const failed = run.access.surfaces.filter((entry) => entry.status === "not_readable");
+          assert.deepEqual(failed.map((entry) => entry.endpoint), [surface], `${label}: the access check records exactly the failing surface`);
+          for (const entry of failed) {
+            assert.match(entry.error, expectedNote, `${label}: probe ${entry.name} carries the expected note`);
+            assert.equal(entry.count, null, `${label}: probe ${entry.name} renders no count`);
+            assert.equal(entry.http_status, expectedStatus, `${label}: probe ${entry.name} records the observed status`);
+          }
+        }
+      }
+
+      for (const assessment of run.assessments) assertNoCanaryWindows(assert, assessment, ANSIBLE_PLANTED_CANARIES, `${label} ${assessment.title}`);
+      const recorded = recordedAnsibleErrors(run.assessments);
+      if (surface !== "/api/v2/ping/") {
+        assert.ok(recorded.length > 0, `${label}: the failing surface is recorded by an assessment`);
+        for (const error of recorded) assert.match(error, expectedNote, `${label}: "${error}" carries the expected note`);
+        if (variant === "html") {
+          assert.ok(recorded.some((error) => /\(502 Bad Gateway\): non-JSON body \(text\/html, \d+ bytes\)/.test(error)), `${label}: the note names the observed status`);
+        }
+      }
+
+      if (run.exportError !== undefined) {
+        assert.equal(surface, "/api/v2/me/", `${label}: only an unreadable current user fails the export outright (${run.exportError})`);
+        assertNoCanaryWindows(assert, run.exportError, ANSIBLE_PLANTED_CANARIES, `${label} export error`);
+        continue;
+      }
+      const files = readBundleFiles(run.exported.outputDir);
+      assertNoCanaryWindowsInFiles(assert, files, ANSIBLE_PLANTED_CANARIES, `${label} bundle`);
+      assertNoCanaryWindowsInFiles(assert, readZipEntries(run.exported.zipPath), ANSIBLE_PLANTED_CANARIES, `${label} zip`);
+      if (surface !== "/api/v2/ping/") {
+        assert.ok(run.exported.errorCount > 0, `${label}: the export logs the failed read`);
+        assert.match(files.get("_errors.log"), expectedNote, `${label}: _errors.log carries the expected note`);
+      }
+    }
+  }
+});
+
+/**
+ * Single-surface denials with the core_data file the denied list is written to and the summary or
+ * evidence fields a consumer reads for that inventory. Every listed field must render null, never
+ * the zero or empty list of an in-memory fallback.
+ */
+const ANSIBLE_DENIAL_TABLE = [
+  { surface: "/api/v2/jobs/", file: "core_data/jobs.json", summary: [0, ["total_jobs", "jobs_total_reported", "successful", "failed"]] },
+  { surface: "/api/v2/instance_groups/", file: "core_data/instance_groups.json", summary: [0, ["instance_groups"]] },
+  { surface: "/api/v2/hosts/", file: "core_data/hosts.json", summary: [1, ["total_hosts", "hosts_total_reported"]] },
+  { surface: "/api/v2/inventory_sources/", file: "core_data/inventory_sources.json", summary: [1, ["inventory_sources"]] },
+  { surface: "/api/v2/job_host_summaries/", file: "core_data/job_host_summaries.json", summary: [1, ["job_host_summaries"]] },
+  {
+    surface: "/api/v2/job_templates/",
+    file: "core_data/job_templates.json",
+    summary: [1, ["job_templates"]],
+    evidence: ["AAP-AUDIT-02", ["critical_templates", "critical_templates_eligible", "covered", "unreadable"]],
+    alsoSummary: [2, ["job_templates"]],
+  },
+  { surface: "/api/v2/schedules/", file: "core_data/schedules.json", summary: [1, ["schedules"]] },
+  { surface: "/api/v2/workflow_job_templates/", file: "core_data/workflow_job_templates.json", summary: [1, ["workflow_job_templates"]] },
+  { surface: "/api/v2/organizations/", file: "core_data/organizations.json", summary: [2, ["organizations"]] },
+  { surface: "/api/v2/users/", file: "core_data/users.json", summary: [2, ["users"]] },
+  { surface: "/api/v2/teams/", file: "core_data/teams.json", summary: [2, ["teams"]] },
+  { surface: "/api/v2/credentials/", file: "core_data/credentials.json", summary: [2, ["credentials"]], evidence: ["AAP-CRED-04", ["vault_credentials"]] },
+  { surface: "/api/v2/tokens/", file: "core_data/tokens.json", summary: [2, ["tokens"]] },
+  { surface: "/api/v2/projects/", file: "core_data/projects.json", summary: [2, ["projects"]] },
+  { surface: "/api/v2/inventories/", file: "core_data/inventories.json", evidence: ["AAP-CRED-04", ["inventories"]] },
+  { surface: "/api/v2/groups/", file: "core_data/groups.json", evidence: ["AAP-CRED-04", ["groups"]] },
+  { surface: "/api/v2/execution_environments/", file: "core_data/execution_environments.json", summary: [2, ["execution_environments"]] },
+  { surface: "/api/v2/notification_templates/", file: "core_data/notification_templates.json", summary: [2, ["notification_templates"]] },
+  { surface: "/api/v2/notifications/", file: "core_data/notifications.json", evidence: ["AAP-AUDIT-02", ["failed_notifications"]] },
+  { surface: "/api/v2/activity_stream/", file: "core_data/activity_stream.json", evidence: ["AAP-AUDIT-01", ["error"]], evidenceNotNull: true },
+];
+
+function assertNotCollectedMarker(marker, surface, label) {
+  assert.deepEqual(Object.keys(marker).sort(), ["collected", "endpoint", "error", "status"], `${label}: the denied dataset is a marker object, not an empty collection`);
+  assert.equal(marker.collected, false);
+  assert.equal(marker.status, 403, `${label}: the marker carries the status the request observed`);
+  assert.equal(marker.endpoint, surface, `${label}: the marker names the path the request actually used`);
+  assert.match(marker.error, /\(403 Forbidden\) You do not have permission to perform this action\./);
+}
+
+test("denied-list markers: a denied list writes a not-collected marker in core_data with the observed status and path, every dependent summary field renders null, and a readable-but-empty list keeps its empty collection", async () => {
+  // Each export gets its own base: the allocator caps re-runs of the same target name (rule 8).
+  const outputRoot = () => createTempBase("grclanker-ansible-markers-");
+
+  for (const testCase of ANSIBLE_DENIAL_TABLE) {
+    const { surface, file } = testCase;
+    // One other list is served readable-but-empty as the control: its file keeps the collection shape.
+    const control = surface === "/api/v2/workflow_job_templates/" ? "/api/v2/tokens/" : "/api/v2/workflow_job_templates/";
+    const controlFile = control === "/api/v2/tokens/" ? "core_data/tokens.json" : "core_data/workflow_job_templates.json";
+    const client = aapClient({ ...healthyAapRoutes(), [surface]: aapForbidden, [control]: () => jsonResponse(aapPage([])) });
+    const assessments = await runAllAssessments(client);
+    const exported = await exportAnsibleAuditBundle(client, AAP_CLIENT_CONFIG, outputRoot());
+    const files = readBundleFiles(exported.outputDir);
+
+    assertNotCollectedMarker(JSON.parse(files.get(file)), surface, surface);
+    assert.deepEqual(JSON.parse(files.get(controlFile)), { data: { items: [], complete: true, total: 0 } }, `${surface} denied: a readable-but-empty list is still an empty, complete collection`);
+
+    for (const [index, keys] of [testCase.summary, testCase.alsoSummary].filter(Boolean)) {
+      for (const key of keys) {
+        assert.equal(assessments[index].summary[key], null, `${surface} denied: summary.${key} renders null, not ${JSON.stringify(assessments[index].summary[key])}`);
+      }
+    }
+    if (testCase.evidence) {
+      const [id, keys] = testCase.evidence;
+      const item = assessments.flatMap((assessment) => assessment.findings).find((candidate) => candidate.id === id);
+      assert.notEqual(item.status, "pass", `${surface} denied: ${id} never passes (${item.summary})`);
+      for (const key of keys) {
+        if (testCase.evidenceNotNull) {
+          assert.match(String(item.evidence[key]), /403 Forbidden/, `${surface} denied: ${id} evidence.${key} names the denial`);
+          assert.equal(item.evidence.http_status, 403, `${surface} denied: ${id} evidence carries the observed status`);
+          assert.equal(item.evidence.endpoint, surface, `${surface} denied: ${id} evidence names the denied path`);
+        } else {
+          assert.equal(item.evidence[key], null, `${surface} denied: ${id} evidence.${key} renders null, not ${JSON.stringify(item.evidence[key])}`);
+        }
+      }
+    }
+    const denied = assessments.flatMap((assessment) => assessment.errors).filter((error) => error.includes(surface));
+    assert.ok(denied.length > 0, `${surface} denied: the errors array names the denied endpoint`);
+    assert.ok(files.get("_errors.log").includes(surface), `${surface} denied: _errors.log names the denied endpoint`);
+  }
+
+  // Per-item lists: the denied item is a marker beside its readable siblings, and the finding keeps the item with a null count.
+  const perItem = aapClient({
+    ...healthyAapRoutes(),
+    "/api/v2/users/3/roles/": aapForbidden,
+    "/api/v2/teams/1/roles/": aapForbidden,
+    "/api/v2/organizations/1/admins/": aapForbidden,
+    "/api/v2/job_templates/10/notification_templates_error/": aapForbidden,
+  });
+  const perItemAssessments = await runAllAssessments(perItem);
+  const perItemFiles = readBundleFiles((await exportAnsibleAuditBundle(perItem, AAP_CLIENT_CONFIG, outputRoot())).outputDir);
+  const userRoles = JSON.parse(perItemFiles.get("core_data/user_roles.json"));
+  assertNotCollectedMarker(userRoles["3"], "/api/v2/users/3/roles/", "user_roles.json[3]");
+  assert.equal(userRoles["1"].data.items.length, 1, "a readable sibling keeps its projected items");
+  assert.equal(userRoles["1"].collected, undefined, "a readable sibling carries no marker keys");
+  assertNotCollectedMarker(JSON.parse(perItemFiles.get("core_data/team_roles.json"))["1"], "/api/v2/teams/1/roles/", "team_roles.json[1]");
+  assertNotCollectedMarker(JSON.parse(perItemFiles.get("core_data/organization_admins.json"))["1"], "/api/v2/organizations/1/admins/", "organization_admins.json[1]");
+  const errorNotifications = JSON.parse(perItemFiles.get("core_data/template_error_notifications.json"));
+  assertNotCollectedMarker(errorNotifications["10"], "/api/v2/job_templates/10/notification_templates_error/", "template_error_notifications.json[10]");
+  assert.equal(errorNotifications["11"].data.items.length, 1);
+  const orgAdmins = byId(perItemAssessments[2], "AAP-RBAC-01");
+  assert.equal(orgAdmins.status, "manual");
+  assert.deepEqual(orgAdmins.evidence.organizations.map((org) => [org.name, org.admin_count, org.complete, org.http_status, org.endpoint]), [["Default", null, null, 403, "/api/v2/organizations/1/admins/"]], "the organization stays listed with a null admin count and the denial beside it");
+  const coverage = byId(perItemAssessments[2], "AAP-AUDIT-02");
+  assert.equal(coverage.evidence.unreadable, 1);
+  assert.equal(coverage.evidence.covered, 1);
+
+  // Per-item files whose parent list was denied were never probed: one not-attempted marker names the parent read.
+  const parentDenied = aapClient({ ...healthyAapRoutes(), "/api/v2/users/": aapForbidden, "/api/v2/job_templates/": aapForbidden });
+  const parentFiles = readBundleFiles((await exportAnsibleAuditBundle(parentDenied, AAP_CLIENT_CONFIG, outputRoot())).outputDir);
+  for (const [file, parent] of [
+    ["core_data/user_roles.json", "/api/v2/users/"],
+    ["core_data/template_error_notifications.json", "/api/v2/job_templates/"],
+    ["core_data/survey_specs.json", "/api/v2/job_templates/"],
+  ]) {
+    const marker = JSON.parse(parentFiles.get(file));
+    assert.deepEqual(Object.keys(marker).sort(), ["collected", "endpoint", "error", "status"], `${file}: a per-item file under a denied parent is a marker, not {}`);
+    assert.equal(marker.collected, false);
+    assert.equal(marker.status, 403);
+    assert.equal(marker.endpoint, parent, `${file}: the marker names the parent list that was denied`);
+    assert.match(marker.error, /^not attempted: the parent list could not be read \(/);
+  }
+  const teamRoles = JSON.parse(parentFiles.get("core_data/team_roles.json"));
+  assert.equal(teamRoles["1"].data.items.length, 1, "a per-item file whose parent was readable keeps its record shape");
+
+  // Object datasets: settings and job settings write the same marker, and the flags they feed stay null.
+  const objectDenied = aapClient({
+    ...healthyAapRoutes(),
+    "/api/v2/settings/system/": aapForbidden,
+    "/api/v2/settings/logging/": aapForbidden,
+    "/api/v2/settings/authentication/": aapForbidden,
+    "/api/v2/settings/jobs/": aapForbidden,
+  });
+  const objectAssessments = await runAllAssessments(objectDenied);
+  const objectFiles = readBundleFiles((await exportAnsibleAuditBundle(objectDenied, AAP_CLIENT_CONFIG, outputRoot())).outputDir);
+  for (const [file, surface] of [
+    ["core_data/settings_system.json", "/api/v2/settings/system/"],
+    ["core_data/settings_logging.json", "/api/v2/settings/logging/"],
+    ["core_data/settings_authentication.json", "/api/v2/settings/authentication/"],
+    ["core_data/job_settings.json", "/api/v2/settings/jobs/"],
+  ]) {
+    assertNotCollectedMarker(JSON.parse(objectFiles.get(file)), surface, file);
+  }
+  const audit = byId(objectAssessments[2], "AAP-AUDIT-01");
+  assert.equal(audit.status, "warn");
+  assert.deepEqual(
+    { enabled: audit.evidence.activity_stream_enabled, system: audit.evidence.system_settings_readable, aggregator: audit.evidence.log_aggregator_enabled, type: audit.evidence.log_aggregator_type, logging: audit.evidence.logging_settings_readable },
+    { enabled: null, system: false, aggregator: null, type: null, logging: false },
+    "settings-derived flags render null with their readable flags false",
+  );
+  assert.equal(objectAssessments[2].summary.external_auth, null);
+  assert.equal(objectAssessments[2].summary.auth_settings_readable, false);
+  const concurrency = byControl(objectAssessments[0], 28);
+  assert.equal(concurrency.status, "manual");
+  assert.deepEqual(concurrency.evidence, { error: concurrency.evidence.error, http_status: 403, endpoint: "/api/v2/settings/jobs/" });
+
+  // The scope probe renders visibility as unknown, never false, when the current user cannot be read.
+  const meDenied = aapClient({ ...healthyAapRoutes(), "/api/v2/me/": aapForbidden });
+  const meAssessments = await runAllAssessments(meDenied);
+  for (const assessment of meAssessments) {
+    assert.equal(assessment.summary.full_visibility, null, `${assessment.category}: full_visibility is null while the current user is unread`);
+  }
+});
+
+test("AAP-RBAC-05 never names an organization as uncovered while any probed role list was denied", async () => {
+  const noSystemAuditor = { "/api/v2/users/": [SUPERUSER, LIMITED_USER, { id: 3, username: "reviewer", is_superuser: false, is_system_auditor: false }] };
+
+  const readable = byId(await assessAnsiblePlatformSecurity(createMockClient({ routes: noSystemAuditor })), "AAP-RBAC-05");
+  assert.equal(readable.status, "pass");
+  assert.deepEqual(readable.evidence.audited_organizations, ["Default"]);
+  assert.deepEqual(readable.evidence.uncovered, []);
+  assert.equal(readable.evidence.coverage_unknown_organizations, 0);
+
+  const roleDenied = byId(await assessAnsiblePlatformSecurity(createMockClient({ routes: noSystemAuditor, forbiddenPaths: ["/api/v2/users/3/roles/"] })), "AAP-RBAC-05");
+  assert.equal(roleDenied.status, "manual", roleDenied.summary);
+  assert.deepEqual(roleDenied.evidence.audited_organizations, []);
+  assert.equal(roleDenied.evidence.uncovered, null, "no organization is called uncovered when the list that would show its auditor was denied");
+  assert.equal(roleDenied.evidence.coverage_unknown_organizations, 1);
+  assert.equal(roleDenied.evidence.unreadable_role_lists, 1);
+  assert.match(roleDenied.summary, /coverage is unknown for 1 organizations because 1 user or team role lists could not be read/);
+  assert.doesNotMatch(roleDenied.summary, /Default/);
+
+  const teamsDenied = byId(await assessAnsiblePlatformSecurity(createMockClient({ routes: noSystemAuditor, forbiddenPaths: ["/api/v2/teams/"] })), "AAP-RBAC-05");
+  assert.equal(teamsDenied.status, "warn", teamsDenied.summary);
+  assert.equal(teamsDenied.evidence.uncovered, null);
+  assert.match(teamsDenied.summary, /the teams list could not be read/);
+
+  const withSystemAuditor = byId(await assessAnsiblePlatformSecurity(createMockClient({ forbiddenPaths: ["/api/v2/users/3/roles/"] })), "AAP-RBAC-05");
+  assert.equal(withSystemAuditor.status, "warn", "a system auditor keeps the control at warn while the role list gap is named");
+  assert.equal(withSystemAuditor.evidence.uncovered, null);
+  assert.match(withSystemAuditor.summary, /1 system auditors exist and an Auditor role holder was confirmed for 0 of 1 organizations and coverage is unknown for 1 organizations/);
+
+  const trulyUncovered = byId(await assessAnsiblePlatformSecurity(createMockClient({ routes: { ...noSystemAuditor, "/api/v2/users/3/roles/": [] } })), "AAP-RBAC-05");
+  assert.equal(trulyUncovered.status, "warn");
+  assert.deepEqual(trulyUncovered.evidence.uncovered, ["Default"], "with every role list readable, an organization without an auditor is named");
+  assert.match(trulyUncovered.summary, /1\/1 organizations have no Auditor role holder/);
+});
+
+function namedAapEndpoints(text) {
+  return new Set(text.match(/\/api\/v2\/[A-Za-z0-9_/-]+/g) ?? []);
+}
+
+function namedAapStatusCodes(text) {
+  const codes = new Set();
+  for (const match of text.matchAll(/\((\d{3}) (?:[A-Z][A-Za-z]*(?: |\)))/g)) codes.add(Number(match[1]));
+  for (const match of text.matchAll(/"(?:http_)?status": ?(\d{3})\b/g)) codes.add(Number(match[1]));
+  return codes;
+}
+
+test("request matching: every endpoint path and HTTP status named in any output corresponds to a request the run made and observed", async () => {
+  const outputRoot = createTempBase("grclanker-ansible-request-log-");
+  const log = [];
+  const client = aapClient({
+    ...healthyAapRoutes(),
+    "/api/v2/jobs/": aapForbidden,
+    "/api/v2/credentials/": aapCanaryHtml,
+    "/api/v2/settings/logging/": aapNotFound,
+  }, log);
+
+  const outputs = [JSON.stringify(await checkAnsibleAccess(client))];
+  for (const assessment of await runAllAssessments(client)) outputs.push(JSON.stringify(assessment));
+  const exported = await exportAnsibleAuditBundle(client, AAP_CLIENT_CONFIG, outputRoot);
+  outputs.push(...readBundleFiles(exported.outputDir).values());
+
+  const requestedPaths = new Set(log.map((entry) => entry.path));
+  const observedStatuses = new Set(log.map((entry) => entry.status));
+  assert.ok(observedStatuses.has(403) && observedStatuses.has(502) && observedStatuses.has(404), "the fixture served every failure status under test");
+
+  const text = outputs.join("\n");
+  const endpoints = namedAapEndpoints(text);
+  const statuses = namedAapStatusCodes(text);
+  assert.ok(endpoints.has("/api/v2/jobs/") && endpoints.has("/api/v2/credentials/") && endpoints.has("/api/v2/settings/logging/"), "the outputs name the failing endpoints");
+  assert.ok(statuses.has(403) && statuses.has(502) && statuses.has(404), "the outputs name the observed failure statuses");
+  for (const endpoint of endpoints) {
+    assert.ok(requestedPaths.has(endpoint), `endpoint ${endpoint} is named in output but the run never requested it`);
+  }
+  for (const status of statuses) {
+    assert.ok(observedStatuses.has(status), `status ${status} is named in output but no request observed it`);
+  }
+  assertNoCanaries(assert, text, "request matching run");
+});
+
 test("resolveSecureOutputPath rejects traversal and symlink parents", () => {
   const base = createTempBase("grclanker-ansible-paths-");
   const outside = createTempBase("grclanker-ansible-outside-");
@@ -1156,4 +2161,111 @@ test("resolveSecureOutputPath rejects traversal and symlink parents", () => {
   symlinkSync(outside, symlinkParent);
 
   assert.throws(() => resolveSecureOutputPath(base, "symlink-parent/file.txt"), /symlinked parent directory/);
+});
+
+test("config loader errors: a SyntaxError raised by the transport is recorded by name only, never by the parser's message that quotes the body", async () => {
+  const snippet = parserSnippetBody();
+  const fetchImpl = async () => {
+    throw new SyntaxError(`Unexpected token '<', "${snippet}"... is not valid JSON`);
+  };
+  const note = "SyntaxError: response could not be parsed as JSON; the parser's message is not recorded because it quotes the body";
+  const client = new AnsibleAapClient(AAP_CLIENT_CONFIG, { fetchImpl, now: () => NOW });
+
+  await assert.rejects(() => client.get("/api/v2/me/"), (error) => {
+    assert.equal(error.name, "AnsibleApiError");
+    assertNoCanaryWindows(assert, error.message, [PARSER_SNIPPET_CANARY], "thrown client error");
+    assert.doesNotMatch(error.message, PARSER_WORDING, `the parser's message was interpolated: ${error.message}`);
+    assert.equal(error.message, `AAP request failed: /api/v2/me/ (network error: ${note})`);
+    return true;
+  });
+
+  const outputs = [
+    await checkAnsibleAccess(client).then((result) => JSON.stringify(result), (error) => error.message),
+    JSON.stringify(await assessAnsibleJobHealth(client)),
+  ];
+  for (const text of outputs) {
+    assertNoCanaryWindows(assert, text, [PARSER_SNIPPET_CANARY], "tool output");
+    assert.doesNotMatch(text, PARSER_WORDING, `a slice of the parser's message reached an output: ${text.slice(0, 400)}`);
+    assert.ok(text.includes(note), `the output records the parse failure by name: ${text.slice(0, 400)}`);
+  }
+});
+
+test("config loader errors: a 200 answer whose body is short non-JSON text is recorded as the non-JSON note only; no 6-to-24-character window of the body and no parser wording reaches the thrown client error, the access check, an assessment, or the bundle", async () => {
+  // Positive control for the class: V8 quotes the whole source when it is 21 characters or shorter.
+  assert.ok(SHORT_BODY_CANARY.length <= 21 && parserMessageFor(SHORT_BODY_CANARY).includes(SHORT_BODY_CANARY), "the parser's message carries the whole short body");
+
+  const surface = "/api/v2/jobs/";
+  const log = [];
+  const client = aapClient({ ...healthyAapRoutes(), [surface]: () => aapResponse(SHORT_BODY_CANARY, 200, "OK", SHORT_BODY_CONTENT_TYPE) }, log);
+
+  // The thrown client error is fixed text: a scrub at the tool boundary would not protect a caller that logs it.
+  await assert.rejects(() => client.get(surface), (error) => {
+    assert.equal(error.name, "AnsibleApiError");
+    assert.equal(error.status, 200);
+    assert.equal(error.endpoint, surface);
+    assertShortBodyRecordedAsNote(assert, error.message, "thrown client error");
+    assert.equal(error.message, `AAP request failed: ${surface} (200 OK): non-JSON body (${SHORT_BODY_CONTENT_TYPE}, 18 bytes)`);
+    return true;
+  });
+
+  const run = await runEveryAnsibleTool(client, createTempBase("grclanker-ansible-short-body-"));
+  assert.equal(run.accessError, undefined, "the access check completes when a secondary surface fails");
+  assertShortBodyRecordedAsNote(assert, run.access, "check_access");
+  const probe = run.access.surfaces.find((entry) => entry.name === "jobs");
+  assert.ok(probe && probe.status !== "readable", "the jobs probe is not readable");
+  assert.equal(probe.http_status, 200, "the probe records the observed status");
+  assertShortBodyRecordedAsNote(assert, run.assessments[0], `${run.assessments[0].title} assessment`);
+  for (const assessment of run.assessments) assertNoShortBodyFragments(assert, assessment, `${assessment.title} assessment`);
+
+  assert.equal(run.exportError, undefined, "the export completes when a secondary surface fails");
+  const files = readBundleFiles(run.exported.outputDir);
+  for (const [name, text] of files) assertNoShortBodyFragments(assert, text, `bundle ${name}`);
+  for (const [name, text] of readZipEntries(run.exported.zipPath)) assertNoShortBodyFragments(assert, text, `zip ${name}`);
+  assertShortBodyRecordedAsNote(assert, files.get("_errors.log"), "_errors.log");
+  assert.ok(log.some((entry) => entry.path === surface && entry.status === 200), "the 200 answer named in the note was observed");
+});
+
+const PRIMITIVE_BODY_WORDING = /Cannot use 'in' operator|TypeError|is not an object/;
+
+test("rule 9: a 200 answer whose body is a JSON string or array on /api/v2/ping/ or /api/v2/me/ is not the documented object and is dropped; no 6-to-24-character window of it and no TypeError wording reaches the access check, an assessment, or the bundle", async () => {
+  // Positive control for the class: the `in` operator on a primitive quotes the whole value in its TypeError message.
+  assert.throws(() => "version" in ANSIBLE_PRIMITIVE_BODY_CANARY, (error) => error instanceof TypeError && error.message.includes(ANSIBLE_PRIMITIVE_BODY_CANARY));
+  const stringBody = JSON.stringify(ANSIBLE_PRIMITIVE_BODY_CANARY);
+  assert.equal(stringBody.length, 21, "the string body is the 21-character shape the reviewer measured");
+
+  for (const [surface, body] of [
+    ["/api/v2/ping/", stringBody],
+    ["/api/v2/ping/", JSON.stringify([ANSIBLE_PRIMITIVE_BODY_CANARY])],
+    ["/api/v2/me/", stringBody],
+  ]) {
+    const label = `${surface} ${body[0] === "[" ? "array" : "string"} body`;
+    const log = [];
+    const client = aapClient({ ...healthyAapRoutes(), [surface]: () => aapResponse(body, 200, "OK", "application/json") }, log);
+    const run = await runEveryAnsibleTool(client, createTempBase("grclanker-ansible-primitive-body-"));
+
+    assert.equal(run.accessError, undefined, `${label}: the access check completes`);
+    if (surface === "/api/v2/ping/") {
+      assert.equal(run.access.ping, undefined, `${label}: a body that is not the ping object is dropped, not projected`);
+      assert.equal(run.access.status, "healthy", `${label}: the ping body does not change the verdict of the readable surfaces`);
+    } else {
+      assert.equal(run.access.currentUser, undefined, `${label}: a body that is not the user object yields no current user`);
+      assert.ok(run.access.notes.includes("Authentication succeeded but /api/v2/me/ did not return a recognizable user."), `${label}: the access check says the user was not recognizable`);
+      assert.equal(run.access.status, "limited", `${label}: no current user caps the access verdict`);
+    }
+    assertNoCanaryWindows(assert, run.access, [ANSIBLE_PRIMITIVE_BODY_CANARY], `${label} check_access`);
+    assert.doesNotMatch(JSON.stringify(run.access), PRIMITIVE_BODY_WORDING, `${label}: no TypeError wording reaches check_access`);
+    for (const assessment of run.assessments) {
+      assertNoCanaryWindows(assert, assessment, [ANSIBLE_PRIMITIVE_BODY_CANARY], `${label} ${assessment.title}`);
+      assert.doesNotMatch(JSON.stringify(assessment), PRIMITIVE_BODY_WORDING, `${label}: no TypeError wording reaches ${assessment.title}`);
+    }
+
+    assert.equal(run.exportError, undefined, `${label}: the export completes`);
+    const files = readBundleFiles(run.exported.outputDir);
+    assertNoCanaryWindowsInFiles(assert, files, [ANSIBLE_PRIMITIVE_BODY_CANARY], `${label} bundle`);
+    assertNoCanaryWindowsInFiles(assert, readZipEntries(run.exported.zipPath), [ANSIBLE_PRIMITIVE_BODY_CANARY], `${label} zip`);
+    for (const [name, text] of files) assert.doesNotMatch(text, PRIMITIVE_BODY_WORDING, `${label}: no TypeError wording reaches bundle ${name}`);
+    const accessFile = JSON.parse(files.get("core_data/access.json"));
+    if (surface === "/api/v2/ping/") assert.equal(accessFile.ping, undefined, `${label}: access.json carries no ping`);
+    assert.ok(log.some((entry) => entry.path === surface && entry.status === 200), `${label}: the 200 answer was observed`);
+  }
 });

@@ -11,7 +11,6 @@ import {
   existsSync,
   lstatSync,
   mkdirSync,
-  readFileSync,
   realpathSync,
 } from "node:fs";
 import { chmod, readdir, writeFile } from "node:fs/promises";
@@ -19,6 +18,7 @@ import { homedir } from "node:os";
 import { basename, dirname, join, relative, resolve } from "node:path";
 import { ZipArchive } from "archiver";
 import { Type } from "@sinclair/typebox";
+import { ConfigFileError, readJsonConfig } from "./hardening/index.js";
 import { errorResult, formatTable, textResult } from "./shared.js";
 
 type FetchImpl = typeof fetch;
@@ -750,31 +750,28 @@ function errorMessage(error: unknown): string {
   return scrubErrorText(error instanceof Error ? error.message : String(error));
 }
 
-/** Only a Node system error code (ENOENT, EISDIR, EACCES) is echoed, never the message or the object itself. */
-function systemErrorCode(error: unknown): string | undefined {
-  const code = asObject(error)?.code;
-  return typeof code === "string" && /^E[A-Z0-9_]{1,30}$/.test(code) ? code : undefined;
-}
+const CONFIG_FILE_OPTIONS = { label: "Zoom" } as const;
 
 /**
- * Two guarded steps. The filesystem message carries the path and its own
- * wording, and JSON.parse quotes a 10-character source window (or the whole
- * file when it is 21 characters or shorter), which for an unquoted credential
- * value is the start of the credential. Neither message is echoed.
+ * Two guarded steps through the shared loader. The filesystem message carries
+ * the path and its own wording, and JSON.parse quotes a 10-character source
+ * window (or the whole file when it is 21 characters or shorter), which for an
+ * unquoted credential value is the start of the credential. Neither message is
+ * echoed: the loader renders fixed text plus the path, the errno or fixed
+ * code, and the offset-derived position only. Like every other error string
+ * this module creates, the result passes through scrubErrorText, path included.
+ * The path has already been checked with existsSync, so the missing-file
+ * result is a race with a deletion and is reported as the read failure it is.
  */
 function readConfigFile(pathname: string): JsonRecord {
-  let raw: string;
-  try {
-    raw = readFileSync(pathname, "utf8");
-  } catch (error) {
-    const code = systemErrorCode(error);
-    throw new Error(scrubErrorText(`Unable to read Zoom config file ${pathname}${code ? ` (${code})` : ""}`));
-  }
   let parsed: unknown;
   try {
-    parsed = JSON.parse(raw);
-  } catch {
-    throw new Error(scrubErrorText(`Unable to parse Zoom config file: invalid JSON in ${pathname}`));
+    const read = readJsonConfig(pathname, CONFIG_FILE_OPTIONS);
+    if (!read.ok) throw new ConfigFileError({ kind: "read", path: pathname, code: "ENOENT", label: CONFIG_FILE_OPTIONS.label });
+    parsed = read.value;
+  } catch (error) {
+    if (!(error instanceof ConfigFileError)) throw error;
+    throw new Error(scrubErrorText(error.message));
   }
   const object = asObject(parsed);
   if (!object) {

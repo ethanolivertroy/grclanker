@@ -232,25 +232,32 @@ test("config file loader never echoes the parser message for a malformed credent
       assert.ok(!text.includes(fragment), `${label} must not carry ${JSON.stringify(fragment)}: ${text}`);
     }
   };
-  const expected = /^Unable to parse Zscaler config file: invalid YAML in .*inspector\.yaml at line 4$/;
+  // The loader renders the parser's structured position and code, and nothing else of its message.
+  const [{ line: parserLine, col: parserColumn }] = parserError.linePos;
+  assert.equal(parserLine, 4);
+  assert.match(parserError.code, /^[A-Z][A-Z0-9_]{1,40}$/);
+  const positionText = `at line ${parserLine}, column ${parserColumn} (${parserError.code})`;
+  const expected = `Unable to parse Zscaler config file: invalid YAML in ${configPath} ${positionText}`;
+  // The tool boundary scrubs the whole message, so the random mkdtemp segment of the path may be redacted by the long-token rule; the file name and suffix survive.
+  const expectedViaTool = new RegExp(`^Zscaler access check failed: Unable to parse Zscaler config file: invalid YAML in .*inspector\\.yaml ${positionText.replace(/[()]/g, "\\$&")}$`);
 
   const viaArgument = thrownBy(() => resolveZscalerConfiguration({ config_file: configPath }, {}));
   assert.ok(viaArgument instanceof Error, "the config_file route throws");
-  assert.match(viaArgument.message, expected);
+  assert.equal(viaArgument.message, expected);
   assertClean(viaArgument.message, "resolver (config_file)");
 
   const viaEnv = thrownBy(() => resolveZscalerConfiguration({}, { ZSCALER_CONFIG_FILE: configPath }));
   assert.ok(viaEnv instanceof Error, "the ZSCALER_CONFIG_FILE route throws");
-  assert.match(viaEnv.message, expected);
+  assert.equal(viaEnv.message, expected);
   assertClean(viaEnv.message, "resolver (ZSCALER_CONFIG_FILE)");
 
   const checkAccess = registeredZscalerTool("zscaler_check_access");
   const argumentResult = await checkAccess({ config_file: configPath });
-  assert.match(argumentResult.text, /^Zscaler access check failed: Unable to parse Zscaler config file: invalid YAML in .*inspector\.yaml at line 4$/);
+  assert.match(argumentResult.text, expectedViaTool);
   assertClean(argumentResult.serialized, "zscaler_check_access (config_file)");
 
   const envResult = await withProcessEnv({ ZSCALER_CONFIG_FILE: configPath }, () => checkAccess({}));
-  assert.match(envResult.text, /^Zscaler access check failed: Unable to parse Zscaler config file: invalid YAML in .*inspector\.yaml at line 4$/);
+  assert.match(envResult.text, expectedViaTool);
   assertClean(envResult.serialized, "zscaler_check_access (ZSCALER_CONFIG_FILE)");
 });
 
@@ -269,9 +276,9 @@ test("config file loader reports an unresolved alias and a failed read with fixe
   const checkAccess = registeredZscalerTool("zscaler_check_access");
   const aliasError = thrownBy(() => resolveZscalerConfiguration({ config_file: aliasPath }, {}));
   assert.ok(aliasError instanceof Error, "the alias shape throws");
-  assert.match(aliasError.message, /^Unable to parse Zscaler config file: invalid YAML in .*alias\.yaml$/);
+  assert.equal(aliasError.message, `Unable to parse Zscaler config file: invalid YAML in ${aliasPath} (INVALID_YAML)`, "no position because the thrown value is not a structured YAMLError; the fixed code stands in for the parser's");
   const aliasResult = await checkAccess({ config_file: aliasPath });
-  assert.match(aliasResult.text, /^Zscaler access check failed: Unable to parse Zscaler config file: invalid YAML in .*alias\.yaml$/);
+  assert.match(aliasResult.text, /^Zscaler access check failed: Unable to parse Zscaler config file: invalid YAML in .*alias\.yaml \(INVALID_YAML\)$/);
   for (const text of [aliasError.message, aliasResult.serialized]) {
     for (const fragment of [aliasCanary, "ALCANARY", "Unresolved alias", "anchor"]) {
       assert.ok(!text.includes(fragment), `must not carry ${JSON.stringify(fragment)}: ${text}`);
