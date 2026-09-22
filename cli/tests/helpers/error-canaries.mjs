@@ -3,28 +3,40 @@
  * body (a proxy's 502 HTML page) that carries credential-shaped values, or with a JSON error whose
  * message embeds a URL with a token in its query string. No canary may survive into a tool result,
  * finding, summary, dataset error, access probe, bundle file, or inflated zip entry.
+ *
+ * Every canary is alphanumeric and random-looking (a JWT keeps its dot separators), so no window of
+ * CANARY_WINDOW_MIN characters of any canary occurs in a fixture's legitimate values, and every leak
+ * assertion checks every window of the canary from CANARY_WINDOW_MIN to CANARY_WINDOW_MAX characters
+ * rather than the whole value: a partial echo (a JSON.parse window, a truncated token) cannot pass.
  */
 
 export const CANARY = Object.freeze({
-  bearer: "canary-bearer-TOKEN-0f9e8d7c6b5a4938",
-  sessionCookie: "sess-canary-COOKIE-31415926535897",
-  apiKey: "ak_canary_APIKEY_2718281828459045",
-  urlToken: "CANARY-url-token-1618033988749",
-  basic: "Y2FuYXJ5OnBhc3N3MHJkLTI3MTgyODE4Mjg=",
-  jwt: "eyJhbGciOiJIUzI1NiJ9.eyJjYW5hcnkiOiJKV1QtNjAyMjE0MDc2In0.c2lnLWNhbmFyeS0xMDA0NTM0NTY3ODk",
-  awsAccessKeyId: "AKIACANARY7EXAMPLE99",
-  awsSecret: "wJalrXUtnFEMI/K7MDENG/bPxRfiCYcanaryKEY0",
+  bearer: "VFq5FSBbZgeS4UFPQzLp7ux43fPT8nzu",
+  sessionCookie: "dJtCVy8yDXQmC7VJkqmKyeKc9PH8",
+  apiKey: "z8MbGj5JMM5dyEKMYGUYcVkAFnv3",
+  urlToken: "cPWqj5swNXPywURtfydcFhDW",
+  basic: "ABc5e5LhrRjGmSFYasDXvAk6GwNwxH9S",
+  jwt: "eyJhbGciOiJIUzI1NiIsImtpZCI6Ill0SzZrTUFQZ1haayJ9.eyJzdWIiOiJEY1J3OFJoZUViVEoifQ.hLyJhJZMRGcb3BUkmTgFbpjpjt6UvCJh",
+  awsAccessKeyId: "AKIAT8Q56XX8D53AZ3JQ",
+  awsSecret: "YWm6RTrMRVZq3cfs9sQG5ePFDTtHv5syKsSCRKv6",
 });
 
 export const CANARY_URL = `https://api.example.com/v1/x?token=${CANARY.urlToken}`;
 
-/** Substrings that must never appear in any recorded output. */
+/**
+ * Values that must never appear in any recorded output. Checked window by window (see
+ * assertNoCanaryWindows), so the `token=<urlToken>` compound of earlier revisions is covered by the
+ * urlToken windows and is no longer listed: its own 6-character window "token=" is legitimate text.
+ */
 export const CANARY_VALUES = Object.freeze([
   CANARY.bearer,
   CANARY.sessionCookie,
   CANARY.apiKey,
   CANARY.urlToken,
-  `token=${CANARY.urlToken}`,
+  CANARY.basic,
+  CANARY.jwt,
+  CANARY.awsAccessKeyId,
+  CANARY.awsSecret,
 ]);
 
 /** A proxy error page with every canary embedded mid-sentence. */
@@ -50,12 +62,117 @@ export const HTML_BODY_NOTE = /non-JSON body \(text\/html, \d+ bytes\)/;
 export const REDACTED_CANARY_URL = /https:\/\/api\.example\.com\/v1\/x\?\[REDACTED\]/;
 
 /**
+ * Sliding-window leak checks (rule 9, config loader errors, Qualys tightening). A leak assertion against a
+ * planted credential checks every substring of the credential from CANARY_WINDOW_MIN to CANARY_WINDOW_MAX
+ * characters, not the whole value and not one fixed width, so a partial echo such as JSON.parse's
+ * 10-character window or a truncated token cannot pass. A value shorter than CANARY_WINDOW_MIN is checked
+ * whole.
+ */
+export const CANARY_WINDOW_MIN = 6;
+export const CANARY_WINDOW_MAX = 24;
+
+/** Every substring of the value whose length lies in [minLength, maxLength], clamped to the value's length. */
+export function canaryWindows(value, minLength = CANARY_WINDOW_MIN, maxLength = CANARY_WINDOW_MAX) {
+  const shortest = Math.min(minLength, value.length);
+  const longest = Math.min(maxLength, value.length);
+  const windows = [];
+  for (let length = shortest; length <= longest; length += 1) {
+    for (let start = 0; start + length <= value.length; start += 1) windows.push(value.slice(start, start + length));
+  }
+  return windows;
+}
+
+/**
+ * The longest window of the canary (lengths minLength..maxLength) that occurs in the text, or undefined when
+ * none does. Every window of every length is covered: a text that contains any window of length L >=
+ * minLength contains that window's first minLength characters, which is itself a minLength window, so the
+ * minLength pass is the exhaustive test and the longer lengths only refine the report.
+ */
+export function leakedCanaryWindow(text, value, minLength = CANARY_WINDOW_MIN, maxLength = CANARY_WINDOW_MAX) {
+  const shortest = Math.min(minLength, value.length);
+  if (!canaryWindows(value, shortest, shortest).some((window) => text.includes(window))) return undefined;
+  for (let length = Math.min(maxLength, value.length); length > shortest; length -= 1) {
+    const window = canaryWindows(value, length, length).find((candidate) => text.includes(candidate));
+    if (window) return window;
+  }
+  return canaryWindows(value, shortest, shortest).find((window) => text.includes(window));
+}
+
+function textOf(value) {
+  return typeof value === "string" ? value : JSON.stringify(value);
+}
+
+/** Asserts no window of any canary occurs in the value (a string, or anything JSON.stringify renders). */
+export function assertNoCanaryWindows(assert, value, canaries, label) {
+  const text = textOf(value);
+  for (const canary of canaries) {
+    const window = leakedCanaryWindow(text, canary);
+    assert.equal(window, undefined, `${label}: window "${window}" of canary ${canary} leaked into ${text.slice(0, 400)}`);
+  }
+}
+
+/** Same check over a Map of file or zip-entry name to contents. */
+export function assertNoCanaryWindowsInFiles(assert, contents, canaries, label) {
+  for (const [name, text] of contents) assertNoCanaryWindows(assert, text, canaries, `${label} ${name}`);
+}
+
+/**
+ * Fixture self-check. A canary is alphanumeric segments joined by dots (a JWT), long enough to carry several
+ * windows, and random-looking (no character repeated three times in a row); no two canaries share a window,
+ * and no window of any canary occurs in the fixture's legitimate values, so a windowed leak assertion can
+ * fail only on a real echo of the planted value.
+ */
+export const CANARY_SHAPE = /^[A-Za-z0-9]+(?:\.[A-Za-z0-9_-]+)*$/;
+
+export function assertCanaryShape(assert, value, label, { minLength = 12 } = {}) {
+  assert.match(value, CANARY_SHAPE, `${label}: canary ${value} is not alphanumeric`);
+  assert.ok(value.length >= minLength, `${label}: canary ${value} is shorter than ${minLength} characters`);
+  assert.doesNotMatch(value, /(.)\1\1/, `${label}: canary ${value} repeats a character three times, which is not random-looking`);
+}
+
+export function assertCanariesDisjointFromFixture(assert, canaries, legitimateTexts, label) {
+  const named = legitimateTexts instanceof Map ? [...legitimateTexts] : [...legitimateTexts].map((text, index) => [`#${index}`, text]);
+  for (const [name, value] of named) {
+    const text = textOf(value);
+    for (const canary of canaries) {
+      const window = leakedCanaryWindow(text, canary);
+      assert.equal(window, undefined, `${label}: window "${window}" of canary ${canary} occurs in legitimate value ${name}`);
+    }
+  }
+}
+
+/** Runs the whole self-check: every canary's shape, pairwise disjointness, and disjointness from the fixture. */
+export function assertCanaryFixture(assert, canaries, legitimateTexts, label, options = {}) {
+  const unique = [...new Set(canaries)];
+  for (const canary of unique) assertCanaryShape(assert, canary, label, options);
+  for (const canary of unique) {
+    for (const other of unique) {
+      if (other === canary) continue;
+      const window = leakedCanaryWindow(other, canary);
+      assert.equal(window, undefined, `${label}: canaries ${canary} and ${other} share the window "${window}"`);
+    }
+  }
+  assertCanariesDisjointFromFixture(assert, unique, legitimateTexts, label);
+}
+
+/**
+ * The parser-snippet class (rule 9, config loader errors): V8's JSON.parse quotes a window of the source in
+ * its SyntaxError message, so a transport that hands back a non-JSON body must never interpolate that message.
+ */
+export const PARSER_SNIPPET_CANARY = "A4wGMxZMnRHFb6PWdLT58NNw";
+
+/** A non-JSON body with the parser-snippet canary at the position JSON.parse quotes. */
+export function parserSnippetBody() {
+  return `<html>${PARSER_SNIPPET_CANARY}</html>`;
+}
+
+/**
  * The short-body class (rule 9, config loader errors): V8's JSON.parse quotes a 10-character window around the
  * failure and the whole source when the input is 21 characters or shorter, so a 200 answer whose body is a short
  * non-JSON text puts the entire body into the SyntaxError message. The only permitted record of such a body is
  * the status-and-length note.
  */
-export const SHORT_BODY_CANARY = "<canary-abc123xyz>";
+export const SHORT_BODY_CANARY = "X3VHr2P9LeybLxNpqr";
 export const SHORT_BODY_CONTENT_TYPE = "text/plain";
 export const SHORT_BODY_NOTE = new RegExp(`non-JSON body \\(${SHORT_BODY_CONTENT_TYPE}, ${Buffer.byteLength(SHORT_BODY_CANARY, "utf8")} bytes\\)`);
 
@@ -77,37 +194,28 @@ export function shortBodyResponse(status = 200, statusText = "OK") {
   return new Response(SHORT_BODY_CANARY, { status, statusText, headers: { "content-type": SHORT_BODY_CONTENT_TYPE } });
 }
 
-/** Every window of `length` characters of the body; any longer leaked fragment contains one of them. */
-export function bodyFragments(body = SHORT_BODY_CANARY, length = 8) {
-  const fragments = [];
-  for (let start = 0; start + length <= body.length; start += 1) fragments.push(body.slice(start, start + length));
-  return fragments;
+/** Every window of the body from minLength to maxLength characters; any leaked fragment of that size is one of them. */
+export function bodyFragments(body = SHORT_BODY_CANARY, minLength = CANARY_WINDOW_MIN, maxLength = CANARY_WINDOW_MAX) {
+  return canaryWindows(body, minLength, maxLength);
 }
 
-/** Asserts no 8-character fragment of the body and no parser wording reached the value, and that the note did. */
+/** Asserts no window of the body and no parser wording reached the value, and that the note did. */
 export function assertShortBodyRecordedAsNote(assert, value, label, body = SHORT_BODY_CANARY) {
-  const text = typeof value === "string" ? value : JSON.stringify(value);
-  for (const fragment of bodyFragments(body)) {
-    assert.ok(!text.includes(fragment), `${label}: body fragment "${fragment}" leaked into ${text.slice(0, 400)}`);
-  }
+  const text = textOf(value);
+  assertNoCanaryWindows(assert, text, [body], label);
   assert.doesNotMatch(text, PARSER_WORDING, `${label}: parser wording leaked into ${text.slice(0, 400)}`);
   assert.match(text, SHORT_BODY_NOTE, `${label}: the non-JSON note is the record of the body: ${text.slice(0, 400)}`);
 }
 
 /** Same check for a body that must be absent without requiring the note (bundle files that do not record errors). */
 export function assertNoShortBodyFragments(assert, value, label, body = SHORT_BODY_CANARY) {
-  const text = typeof value === "string" ? value : JSON.stringify(value);
-  for (const fragment of bodyFragments(body)) {
-    assert.ok(!text.includes(fragment), `${label}: body fragment "${fragment}" leaked into ${text.slice(0, 400)}`);
-  }
+  const text = textOf(value);
+  assertNoCanaryWindows(assert, text, [body], label);
   assert.doesNotMatch(text, PARSER_WORDING, `${label}: parser wording leaked into ${text.slice(0, 400)}`);
 }
 
 export function assertNoCanaries(assert, value, label) {
-  const text = typeof value === "string" ? value : JSON.stringify(value);
-  for (const canary of CANARY_VALUES) {
-    assert.ok(!text.includes(canary), `${label}: canary ${canary} leaked`);
-  }
+  assertNoCanaryWindows(assert, value, CANARY_VALUES, label);
 }
 
 export function assertNoCanariesInFiles(assert, contents, label) {
@@ -167,14 +275,115 @@ export const REDACTION_CASES = Object.freeze([
   },
 ]);
 
+/** The absent values are checked window by window; the present values must survive whole. */
 export function assertRedactionCases(assert, redact) {
   for (const testCase of REDACTION_CASES) {
     const output = redact(testCase.input);
-    for (const value of testCase.absent) {
-      assert.ok(!output.includes(value), `${testCase.name}: ${value} survived in "${output}"`);
-    }
+    assertNoCanaryWindows(assert, output, testCase.absent, testCase.name);
     for (const value of testCase.present ?? []) {
       assert.ok(output.includes(value), `${testCase.name}: expected "${value}" in "${output}"`);
     }
+  }
+}
+
+/**
+ * Scrub boundary (coordinator ruling). A bare value shaped like a name, words joined by hyphens or underscores
+ * with at most one numeric segment per word, is indistinguishable from a resource name and stays. Two guards
+ * make that safe: a value inside any carrier is removed whatever its shape, and a configured secret is removed
+ * whatever its shape and in its encoded forms. Real token shapes are removed bare.
+ */
+export const NAME_SHAPED_VALUES = Object.freeze([
+  "prod-us-east-2026",
+  "my-project-123456",
+  "sess-canary-COOKIE-31415926535897",
+  "AWSLambdaBasicExecutionRole",
+  "identitySecurityDefaultsEnforcementPolicy",
+  "Authorization_RequestDenied",
+  "ACTIVITY_STREAM_ENABLED",
+  "3fa85f64-5717-4562-b3fc-2c963f66afa6",
+  "ec2-54-123-45-67",
+  "arn:aws:iam::123456789012:role/AWSServiceRoleForConfig",
+  "/subscriptions/3fa85f64-5717-4562-b3fc-2c963f66afa6/resourceGroups/rg-prod-2026",
+]);
+
+/** Values shaped like tokens: base64 symbols, digits scattered through letters, token casing, a hex digest, a JWT. */
+export const TOKEN_SHAPED_VALUES = Object.freeze([
+  CANARY.bearer,
+  "0f9e8d7c6b5a4938a1b2c3d4",
+  "Kq7Zx2Vw9Lm4Tp8R",
+  "bPxRfiCYcanaryKEYqm",
+  "dGhpcyBpcyBhIHNlY3JldA==",
+  CANARY.jwt,
+]);
+
+/**
+ * A configured secret with the characters the encoded forms change (space, quote, slash, plus, equals, at,
+ * ampersand), so its JSON-escaped, URL-encoded, base64, and base64url forms all differ from the plain one.
+ */
+export const ENCODED_FORM_SECRET = 'p@ss "w0rd"/Zq7+Vx=Kn2&Rt9';
+
+/** The plain, JSON-escaped, URL-encoded, base64, and base64url forms of a value. */
+export function encodedFormsOf(value) {
+  return [...new Set([
+    value,
+    JSON.stringify(value).slice(1, -1),
+    encodeURIComponent(value),
+    Buffer.from(value, "utf8").toString("base64"),
+    Buffer.from(value, "utf8").toString("base64url"),
+  ])];
+}
+
+/** Every carrier a value can ride in, with the text expected after the scrub. */
+export function carrierCases(value) {
+  return [
+    ["Authorization header", `Authorization: Bearer ${value} was rejected`, "Authorization: Bearer [REDACTED] was rejected"],
+    ["Basic scheme", `proxy replayed Basic ${value} upstream`, "proxy replayed Basic [REDACTED] upstream"],
+    ["Token scheme", `Token ${value} expired`, "Token [REDACTED] expired"],
+    ["ApiKey scheme", `ApiKey ${value} rejected`, "ApiKey [REDACTED] rejected"],
+    ["Cookie header", `Cookie: session=${value}; theme=dark`, "Cookie: [REDACTED]"],
+    ["Set-Cookie header", `Set-Cookie: sid=${value}; Path=/; HttpOnly`, "Set-Cookie: [REDACTED]"],
+    ["x-api-key header", `x-api-key: ${value} was invalid`, "x-api-key: [REDACTED] was invalid"],
+    ["session assignment", `session_id=${value} is stale`, "session_id=[REDACTED] is stale"],
+    ["credential-named pair", `api_key=${value} too`, "api_key=[REDACTED] too"],
+    ["quoted JSON pair", `{"client_secret":"${value}"}`, '{"client_secret":"[REDACTED]"}'],
+    ["password pair", `password: ${value}.`, "password: [REDACTED]."],
+    ["URL query pair", `see https://api.example.com/v1/x?token=${value} for details`, "see https://api.example.com/v1/x?[REDACTED] for details"],
+    ["URL userinfo", `see https://auditor:${value}@api.example.com/v1/x for details`, "see https://api.example.com/v1/x for details"],
+  ];
+}
+
+/**
+ * Asserts the scrub boundary for one integration's redactErrorText: name-shaped values stay bare in prose,
+ * a name-shaped value inside every carrier is removed, token-shaped values are removed bare, the configured
+ * secret (registered by the caller before this runs) is removed in every encoded form, and the integration's
+ * own fixed texts survive unchanged.
+ */
+export function assertScrubBoundary(assert, redact, { configuredSecret, mustKeep = [] } = {}) {
+  for (const name of NAME_SHAPED_VALUES) {
+    const text = `resource ${name} was not found`;
+    assert.equal(redact(text), text, `name-shaped value stays bare: ${name}`);
+  }
+  for (const name of ["prod-us-east-2026", "sess-canary-COOKIE-31415926535897"]) {
+    for (const [carrier, input, expected] of carrierCases(name)) {
+      const output = redact(input);
+      assert.equal(output, expected, `${carrier}: a name-shaped value inside a carrier is removed`);
+      assertNoCanaryWindows(assert, output, [name], carrier);
+    }
+  }
+  for (const token of TOKEN_SHAPED_VALUES) {
+    const output = redact(`rejected ${token} upstream`);
+    assert.equal(output, "rejected [REDACTED] upstream", `token-shaped value is removed bare: ${token}`);
+  }
+  if (configuredSecret !== undefined) {
+    const forms = encodedFormsOf(configuredSecret);
+    assert.ok(forms.length >= 4, "the configured secret has distinct encoded forms");
+    for (const form of forms) {
+      const output = redact(`upstream echoed ${form} in its message`);
+      assert.equal(output, "upstream echoed [REDACTED] in its message", `configured secret form is removed: ${form}`);
+      assertNoCanaryWindows(assert, output, forms, `configured secret form ${form}`);
+    }
+  }
+  for (const text of mustKeep) {
+    assert.equal(redact(text), text, `fixed text survives the scrub: ${text}`);
   }
 }
