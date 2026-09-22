@@ -42,10 +42,13 @@ function createTempBase(prefix) {
   return mkdtempSync(join(tmpdir(), prefix));
 }
 
+/** The configured access key: random alphanumerics so every 6 to 24 character window of it is a leak signal. */
+const SAMPLE_ACCESS_KEY = "TTmF84rGQ5FKybBUS7CJkEnq";
+
 function sampleConfig(overrides = {}) {
   return {
     accessId: "suABCDEF",
-    accessKey: "secret-access-key-value",
+    accessKey: SAMPLE_ACCESS_KEY,
     baseUrl: "https://api.us2.sumologic.com/api",
     deployment: "us2",
     timeoutMs: 30000,
@@ -277,7 +280,7 @@ test("resolveSumologicConfiguration prefers args over env over config file and m
   assert.throws(() => resolveSumologicConfiguration({}, { SUMOLOGIC_CONFIG_FILE: join(dir, "missing.yaml") }), /SUMOLOGIC_ACCESS_ID/);
 });
 
-/** Canaries planted on malformed config lines; every 8-character window of each is distinct so a partial quote is caught too. */
+/** Canaries planted on malformed config lines: random alphanumerics, so no 6-character window of one occurs in a legitimate fixture value or in another canary. */
 const CONFIG_CANARIES = {
   nestedKey: "Qv7ZkT3mR9pXw2Lc",
   nestedValue: "Hj4NsB8yF6dGa1Ue",
@@ -292,16 +295,41 @@ const LIBRARY_ERROR_WORDING = [
   "not a directory", "Unexpected token", "Missing closing", "Map keys must be unique", "must start at the same column",
 ];
 
-function fragmentsOf(value, size = 8) {
-  const fragments = [];
-  for (let index = 0; index + size <= value.length; index += 1) fragments.push(value.slice(index, index + size));
-  return fragments;
+/** Every substring of a planted credential at lengths 6 through 24 (sliding windows), so a partial echo such as a JSON.parse window or a truncated token cannot pass a leak assertion. */
+function windowsOf(value, { min = 6, max = 24 } = {}) {
+  const windows = new Set();
+  for (let size = Math.min(min, value.length); size <= Math.min(max, value.length); size += 1) {
+    for (let index = 0; index + size <= value.length; index += 1) windows.add(value.slice(index, index + size));
+  }
+  return [...windows];
+}
+
+/** The window set of every planted secret, for bundle, zip, and payload scans through assertSecretsAbsent. */
+function leakWindows(secrets) {
+  return [...new Set(secrets.flatMap((secret) => windowsOf(secret)))];
+}
+
+function assertNoWindowOf(text, secret, label) {
+  for (const window of windowsOf(secret)) assert.ok(!text.includes(window), `${label} carries a window (${window}) of the planted credential: ${text.slice(0, 300)}`);
+}
+
+/**
+ * Fixture self-check: the legitimate values of a fixture (everything it serves
+ * with the planted canaries themselves removed, longest first) contain no
+ * 6-character window of any canary, so a window hit in an output can only be a leak.
+ */
+function assertFixtureFreeOfCanaryWindows(legitimateText, canaries, label) {
+  let legitimate = legitimateText;
+  for (const canary of [...canaries].sort((a, b) => b.length - a.length)) legitimate = legitimate.split(canary).join("");
+  for (const canary of canaries) {
+    for (const window of windowsOf(canary, { min: 6, max: 6 })) {
+      assert.ok(!legitimate.includes(window), `${label}: legitimate fixture text contains the window ${window} of canary ${canary}`);
+    }
+  }
 }
 
 function assertConfigErrorText(text, { path, code, line, column, canaries }, label) {
-  for (const canary of canaries) {
-    for (const fragment of fragmentsOf(canary)) assert.ok(!text.includes(fragment), `${label} carries a fragment (${fragment}) of ${canary}: ${text}`);
-  }
+  for (const canary of canaries) assertNoWindowOf(text, canary, `${label} (${canary})`);
   for (const wording of LIBRARY_ERROR_WORDING) assert.ok(!text.includes(wording), `${label} repeats library wording "${wording}": ${text}`);
   assert.ok(text.includes(path), `${label} names the path ${path}: ${text}`);
   assert.ok(text.includes(`(${code})`), `${label} carries the code ${code}: ${text}`);
@@ -338,7 +366,8 @@ test("rule 9: Sumo Logic config loader errors carry only the path, position, and
     writeFileSync(configFile, testCase.text);
     const library = thrownBy(() => parseYaml(testCase.text));
     assert.match(library.message, testCase.control, `${testCase.name}: positive control uses the library message`);
-    assert.ok(testCase.leaks.some((canary) => fragmentsOf(canary).some((fragment) => library.message.includes(fragment))), `${testCase.name}: positive control, the library message quotes the canary`);
+    assert.ok(testCase.leaks.some((canary) => windowsOf(canary).some((window) => library.message.includes(window))), `${testCase.name}: positive control, the library message quotes the canary`);
+    assertFixtureFreeOfCanaryWindows(testCase.text, allCanaries, `${testCase.name} config fixture`);
 
     const expected = { path: configFile, code: testCase.code, line: testCase.line, column: testCase.column, canaries: allCanaries };
     const thrown = thrownBy(() => resolveSumologicConfiguration({}, { SUMOLOGIC_CONFIG_FILE: configFile }));
@@ -423,7 +452,7 @@ test("SumologicApiClient sends basic auth, follows token pagination, retries 429
       return jsonResponse({ data: [{ id: "u2" }], next: null });
     }
     if (url.pathname === "/api/v1/roles") {
-      return jsonResponse({ errors: [{ code: "forbidden", message: "secret-access-key-value should not leak" }] }, { status: 403 });
+      return jsonResponse({ errors: [{ code: "forbidden", message: `${SAMPLE_ACCESS_KEY} should not leak` }] }, { status: 403 });
     }
     return jsonResponse({});
   };
@@ -433,7 +462,7 @@ test("SumologicApiClient sends basic auth, follows token pagination, retries 429
   assert.equal(users.ok, true);
   assert.equal(users.complete, true);
   assert.deepEqual(users.data.map((user) => user.id), ["u1", "u2"]);
-  assert.equal(seen[0].auth, `Basic ${Buffer.from("suABCDEF:secret-access-key-value").toString("base64")}`);
+  assert.equal(seen[0].auth, `Basic ${Buffer.from(`suABCDEF:${SAMPLE_ACCESS_KEY}`).toString("base64")}`);
   assert.deepEqual(sleeps.slice(0, 2), [1000, 500]);
   assert.ok(seen.some((item) => item.search.includes("token=page-2")));
   assert.ok(seen.every((item) => item.pathname !== "/api/v1/users" || item.search.includes("limit=1000")));
@@ -441,7 +470,7 @@ test("SumologicApiClient sends basic auth, follows token pagination, retries 429
   const roles = await client.listRoles();
   assert.equal(roles.ok, false);
   assert.equal(roles.httpStatus, 403);
-  assert.doesNotMatch(roles.error, /secret-access-key-value/);
+  assertNoWindowOf(roles.error, SAMPLE_ACCESS_KEY, "403 error string");
   assert.match(roles.error, /\[REDACTED\]/);
 });
 
@@ -1004,7 +1033,7 @@ test("exportSumologicAuditBundle writes the bundle layout, zip, and error log, a
   assert.equal(metadata.deployment, "us2");
   assert.equal(metadata.access_id_prefix, "suAB");
   const bundleText = readFileSync(join(first.outputDir, "core_data", "access-control.json"), "utf8");
-  assert.doesNotMatch(bundleText, /secret-access-key-value/);
+  assertNoWindowOf(bundleText, SAMPLE_ACCESS_KEY, "core_data/access-control.json");
   assert.match(readFileSync(join(first.outputDir, "_errors.log"), "utf8"), /collectors/);
   const findings = JSON.parse(readFileSync(join(first.outputDir, "analysis", "findings.json"), "utf8"));
   assert.equal(findings.find((item) => item.id === "SUMO-12").status, "manual");
@@ -1018,6 +1047,27 @@ test("exportSumologicAuditBundle writes the bundle layout, zip, and error log, a
   assert.ok(existsSync(first.zipPath));
 });
 
+/** Planted secrets for every credential-capable record: random alphanumerics, so no 6-character window of one occurs in a legitimate fixture value. */
+const CARRIER = {
+  webhookPathToken: "WLfKnscQU649TkVynC",
+  webhookQueryToken: "kUkFvcpgZrvBNHV7BL",
+  headerSecret: "uG8dhJSjYWYbStMXmJ",
+  customHeaderSecret: "GS5CL3ytUXgqZSKXgn",
+  routingKey: "FmEP7cQrCjqKDbBCpd",
+  resolutionKey: "mLngURgY387cwCdzVN",
+  snowUsername: "wwjh6rn7AsBB2VRJ8A",
+  payloadOverride: "FRJXxnhkLKwZZhbP9X",
+  resolutionOverride: "W4KfHSa7U9UU4AcSza",
+  emailBodySecret: "WncUw2Cm8x2LECdwny",
+  accessIdTail: "mkG5MhpSyKcnGS6yMw",
+  x509Cert: "hX2twH7S4Sxg69PxqJ",
+  spCert: "TWZw7cVFdCdgYs3NVg",
+  dashboardQuery: "4HALeAXa7dmLqyGBbC",
+  collectorField: "YZrCrYKnGMTHpg5bdm",
+  folderDescription: "8GqWwDdtBBCjVFfkq6",
+  policyLeaf: "LHKdcnVjcv57K5Z5mq",
+};
+
 function secretCarrierData() {
   const data = healthyData();
   data.connections = [
@@ -1026,64 +1076,47 @@ function secretCarrierData() {
       name: "pagerduty-hook",
       type: "WebhookConnection",
       webhookType: "PagerDuty",
-      url: "https://hooks.example.com/services/FAKE_WEBHOOK_PATH_TOKEN_1?token=FAKE_WEBHOOK_QUERY_TOKEN_1",
-      headers: [{ name: "Authorization", value: "Bearer FAKE_HEADER_SECRET_1" }],
-      customHeaders: [{ name: "X-Api-Key", value: "FAKE_CUSTOM_HEADER_SECRET_1" }],
-      defaultPayload: "{\"routing_key\":\"FAKE_ROUTING_KEY_1\"}",
-      resolutionPayload: "{\"routing_key\":\"FAKE_RESOLUTION_KEY_1\"}",
+      url: `https://hooks.example.com/services/${CARRIER.webhookPathToken}?token=${CARRIER.webhookQueryToken}`,
+      headers: [{ name: "Authorization", value: `Bearer ${CARRIER.headerSecret}` }],
+      customHeaders: [{ name: "X-Api-Key", value: CARRIER.customHeaderSecret }],
+      defaultPayload: `{"routing_key":"${CARRIER.routingKey}"}`,
+      resolutionPayload: `{"routing_key":"${CARRIER.resolutionKey}"}`,
     },
-    { id: "c2", name: "servicenow", type: "ServiceNowConnection", url: "https://example.service-now.com/api", username: "FAKE_SNOW_USERNAME_1" },
+    { id: "c2", name: "servicenow", type: "ServiceNowConnection", url: "https://example.service-now.com/api", username: CARRIER.snowUsername },
   ];
   data.monitors[0].notifications.push({
-    notification: { connectionType: "PagerDuty", connectionId: "c1", payloadOverride: "{\"routing_key\":\"FAKE_PAYLOAD_OVERRIDE_1\"}", resolutionPayloadOverride: "FAKE_RESOLUTION_OVERRIDE_1" },
+    notification: { connectionType: "PagerDuty", connectionId: "c1", payloadOverride: `{"routing_key":"${CARRIER.payloadOverride}"}`, resolutionPayloadOverride: CARRIER.resolutionOverride },
     runForTriggerTypes: ["Critical"],
   });
-  data.monitors[0].notifications[0].notification.messageBody = "FAKE_EMAIL_BODY_SECRET_1";
-  data.accessKeys = [{ id: "suAKFAKE_ACCESS_ID_TAIL_1", label: "ci-key", disabled: false, createdAt: FRESH, lastUsed: FRESH, corsHeaders: ["https://app.example.com"] }];
-  data.identityProviders[0].x509cert1 = "FAKE_X509_CERT_1";
-  data.identityProviders[0].certificate = "FAKE_SP_CERT_1";
-  data.dashboards[0].panels = [{ queryString: "FAKE_DASHBOARD_QUERY_1" }];
-  data.collectors[0].fields = { token: "FAKE_COLLECTOR_FIELD_1" };
-  data.personalFolder.children[0].description = "FAKE_FOLDER_DESCRIPTION_1";
-  data.passwordPolicy.futureSecretSetting = "FAKE_POLICY_LEAF_1";
+  data.monitors[0].notifications[0].notification.messageBody = CARRIER.emailBodySecret;
+  data.accessKeys = [{ id: `suAK${CARRIER.accessIdTail}`, label: "ci-key", disabled: false, createdAt: FRESH, lastUsed: FRESH, corsHeaders: ["https://app.example.com"] }];
+  data.identityProviders[0].x509cert1 = CARRIER.x509Cert;
+  data.identityProviders[0].certificate = CARRIER.spCert;
+  data.dashboards[0].panels = [{ queryString: CARRIER.dashboardQuery }];
+  data.collectors[0].fields = { token: CARRIER.collectorField };
+  data.personalFolder.children[0].description = CARRIER.folderDescription;
+  data.passwordPolicy.futureSecretSetting = CARRIER.policyLeaf;
   return data;
 }
 
-const CARRIER_SECRETS = [
-  "FAKE_WEBHOOK_PATH_TOKEN_1",
-  "FAKE_WEBHOOK_QUERY_TOKEN_1",
-  "FAKE_HEADER_SECRET_1",
-  "FAKE_CUSTOM_HEADER_SECRET_1",
-  "FAKE_ROUTING_KEY_1",
-  "FAKE_RESOLUTION_KEY_1",
-  "FAKE_SNOW_USERNAME_1",
-  "FAKE_PAYLOAD_OVERRIDE_1",
-  "FAKE_RESOLUTION_OVERRIDE_1",
-  "FAKE_EMAIL_BODY_SECRET_1",
-  "FAKE_ACCESS_ID_TAIL_1",
-  "FAKE_X509_CERT_1",
-  "FAKE_SP_CERT_1",
-  "FAKE_DASHBOARD_QUERY_1",
-  "FAKE_COLLECTOR_FIELD_1",
-  "FAKE_FOLDER_DESCRIPTION_1",
-  "FAKE_POLICY_LEAF_1",
-  "secret-access-key-value",
-];
+const CARRIER_SECRETS = [...Object.values(CARRIER), SAMPLE_ACCESS_KEY];
 
 test("rule 9: the exported bundle, the zip, and the assess tool payloads never carry connection, monitor, key, or configuration secrets", async () => {
   const base = createTempBase("grclanker-sumo-secrets-");
   const data = secretCarrierData();
   const reader = readerFrom(data);
+  assertFixtureFreeOfCanaryWindows(JSON.stringify({ data, config: sampleConfig() }), CARRIER_SECRETS, "secret carrier fixture");
+  const secrets = leakWindows(CARRIER_SECRETS);
 
   const result = await exportSumologicAuditBundle(reader, sampleConfig(), base, { now: NOW, approvedDestinationDomains: ["example.com", "service-now.com"] });
   const files = readBundleFiles(result.outputDir);
   assert.ok(files.has(join("core_data", "data-governance.json")));
   assert.ok(files.has(join("core_data", "content-sharing.json")));
-  assertSecretsAbsent(assert, files, CARRIER_SECRETS, "bundle directory");
+  assertSecretsAbsent(assert, files, secrets, "bundle directory");
   const zipEntries = readZipEntries(result.zipPath);
   assert.equal(zipEntries.size, files.size, "the zip carries exactly the written files");
   assert.ok(zipEntries.has("core_data/data-governance.json"));
-  assertSecretsAbsent(assert, zipEntries, CARRIER_SECRETS, "zip archive");
+  assertSecretsAbsent(assert, zipEntries, secrets, "zip archive");
 
   // Evidence stays legible: field names survive with markers, hosts survive without paths.
   const governance = JSON.parse(files.get(join("core_data", "data-governance.json")));
@@ -1123,41 +1156,45 @@ test("rule 9: the exported bundle, the zip, and the assess tool payloads never c
     ["data-governance", JSON.stringify(governanceResult)],
     ["content-sharing", JSON.stringify(contentResult)],
   ]);
-  assertSecretsAbsent(assert, payloads, CARRIER_SECRETS, "assess tool payload");
+  assertSecretsAbsent(assert, payloads, secrets, "assess tool payload");
   assert.equal(byId(governanceResult, "SUMO-10").status, "pass");
   assert.deepEqual(byId(governanceResult, "SUMO-10").evidence.destinations.map((item) => item.host), ["hooks.example.com", "example.service-now.com"]);
   assert.equal(byId(contentResult, "SUMO-20").status, "pass");
 });
 
-const ERROR_BODY_CANARIES = [
-  "CANARY_BEARER_HTML_1",
-  "CANARY_SESSION_HTML_1",
-  "CANARY_APIKEY_HTML_1",
-  "CANARY_URL_TOKEN_1",
-  "CANARY_HTML_200_1",
-  "CANARY_BEARER_JSON_2",
-  "CANARY_APIKEY_JSON_2",
-  "CANARY_SESSION_JSON_2",
-  "CANARY_JWT_HEADER.CANARY_JWT_PAYLOAD_PART.CANARY_JWT_SIGNATURE",
-];
+/** Canaries planted in error bodies, each inside a carrier: random alphanumerics (the JWT keeps its eyJ header prefix and dotted shape). */
+const ERROR_BODY = {
+  bearerHtml: "tx4FsTaeQaHcbpGqB8",
+  sessionHtml: "Ac89VDAd87GTPyz6Kr",
+  apiKeyHtml: "hCddmrYzWJjBh9vUZq",
+  urlToken: "G9zQNG7PXy37LgyAxr",
+  html200: "mhBvKXUqmGBFpj6sAv",
+  bearerJson: "PGvs3cKbU67hQtJcQU",
+  apiKeyJson: "yc9gR8yHAwPbKEwkuA",
+  sessionJson: "WVm4VnFUkDndLbNWGY",
+  jwtHeader: "PkX7AwSVwuqDhutSUs",
+  jwtPayload: "L9ZwDpETBGnMMZ8CZV",
+  jwtSignature: "dN3pEfdd6jrnCd5RRM",
+};
+const ERROR_BODY_CANARIES = Object.values(ERROR_BODY);
+const ERROR_BODY_HTML = `<html><body><h1>502 Bad Gateway</h1><p>Authorization: Bearer ${ERROR_BODY.bearerHtml}</p><p>Set-Cookie: JSESSIONID=${ERROR_BODY.sessionHtml}; Path=/</p><p>api_key=${ERROR_BODY.apiKeyHtml}</p><p>Retry at https://api.example.com/v1/x?token=${ERROR_BODY.urlToken} later.</p></body></html>`;
+const ERROR_BODY_JSON = {
+  errors: [{
+    code: "forbidden",
+    message: `Denied while fetching https://api.example.com/v1/x?token=${ERROR_BODY.urlToken} for this key, sent with Authorization: Bearer ${ERROR_BODY.bearerJson}, api_key=${ERROR_BODY.apiKeyJson} (session_id: ${ERROR_BODY.sessionJson}) and eyJ${ERROR_BODY.jwtHeader}.${ERROR_BODY.jwtPayload}.${ERROR_BODY.jwtSignature}`,
+  }],
+};
+const ERROR_BODY_HTML_200 = `<html><body>Sign in. session=${ERROR_BODY.html200}</body></html>`;
 
 function errorBodyFetch() {
-  const html = `<html><body><h1>502 Bad Gateway</h1><p>Authorization: Bearer CANARY_BEARER_HTML_1</p><p>Set-Cookie: JSESSIONID=CANARY_SESSION_HTML_1; Path=/</p><p>api_key=CANARY_APIKEY_HTML_1</p><p>Retry at https://api.example.com/v1/x?token=CANARY_URL_TOKEN_1 later.</p></body></html>`;
   return async (input) => {
     const url = new URL(typeof input === "string" ? input : input.toString());
     if (url.pathname === "/api/v1/connections") {
-      return new Response(html, { status: 502, statusText: "Bad Gateway", headers: { "content-type": "text/html; charset=utf-8" } });
+      return new Response(ERROR_BODY_HTML, { status: 502, statusText: "Bad Gateway", headers: { "content-type": "text/html; charset=utf-8" } });
     }
-    if (url.pathname === "/api/v1/roles") {
-      return jsonResponse({
-        errors: [{
-          code: "forbidden",
-          message: "Denied while fetching https://api.example.com/v1/x?token=CANARY_URL_TOKEN_1 for this key, sent with Authorization: Bearer CANARY_BEARER_JSON_2, api_key=CANARY_APIKEY_JSON_2 (session_id: CANARY_SESSION_JSON_2) and eyJCANARY_JWT_HEADER.CANARY_JWT_PAYLOAD_PART.CANARY_JWT_SIGNATURE",
-        }],
-      }, { status: 403 });
-    }
+    if (url.pathname === "/api/v1/roles") return jsonResponse(ERROR_BODY_JSON, { status: 403 });
     if (url.pathname === "/api/v1/collectors") {
-      return new Response("<html><body>Sign in. session=CANARY_HTML_200_1</body></html>", { status: 200, statusText: "OK", headers: { "content-type": "text/html" } });
+      return new Response(ERROR_BODY_HTML_200, { status: 200, statusText: "OK", headers: { "content-type": "text/html" } });
     }
     if (url.pathname === "/api/v1/users") return jsonResponse({ data: healthyData().users });
     return jsonResponse({ data: [] });
@@ -1166,6 +1203,12 @@ function errorBodyFetch() {
 
 test("rule 9: error bodies and vendor messages are scrubbed at the record point, so a 502 HTML page or a URL with a token never reaches the bundle, the zip, the assess payloads, or the access check", async () => {
   const client = new SumologicApiClient(sampleConfig(), { fetchImpl: errorBodyFetch(), sleepImpl: async () => {}, maxRetries: 1 });
+  assertFixtureFreeOfCanaryWindows(
+    JSON.stringify({ data: healthyData(), config: sampleConfig(), bodies: [ERROR_BODY_HTML, ERROR_BODY_JSON, ERROR_BODY_HTML_200] }),
+    ERROR_BODY_CANARIES,
+    "error body fixture",
+  );
+  const secrets = leakWindows(ERROR_BODY_CANARIES);
 
   const connections = await client.listConnections();
   assert.equal(connections.ok, false);
@@ -1182,11 +1225,11 @@ test("rule 9: error bodies and vendor messages are scrubbed at the record point,
   const connectionSurface = access.surfaces.find((surface) => surface.name === "connections");
   assert.equal(connectionSurface.status, "not_readable");
   assert.match(connectionSurface.error, /502 Bad Gateway\): non-JSON body \(text\/html, \d+ bytes\)/);
-  assertSecretsAbsent(assert, new Map([["check_access", JSON.stringify(access)]]), ERROR_BODY_CANARIES, "access check result");
+  assertSecretsAbsent(assert, new Map([["check_access", JSON.stringify(access)]]), secrets, "access check result");
 
   const results = await allAssessments(client);
   const payloads = new Map(results.map((result) => [result.area, JSON.stringify(result)]));
-  assertSecretsAbsent(assert, payloads, ERROR_BODY_CANARIES, "assess tool payload");
+  assertSecretsAbsent(assert, payloads, secrets, "assess tool payload");
   const governance = results[2];
   assert.equal(byId(governance, "SUMO-10").status, "manual");
   assert.match(byId(governance, "SUMO-10").summary, /non-JSON body \(text\/html, \d+ bytes\)/, "the finding carries the status-and-length note instead of the body");
@@ -1198,16 +1241,18 @@ test("rule 9: error bodies and vendor messages are scrubbed at the record point,
   assert.ok(files.has("_errors.log"));
   assert.match(files.get("_errors.log"), /connections: Sumo Logic request to \/v1\/connections failed \(502 Bad Gateway\): non-JSON body \(text\/html, \d+ bytes\)/);
   assert.match(files.get("_errors.log"), /collectors: Sumo Logic request to \/v1\/collectors returned an unreadable response \(200 OK\): non-JSON body/);
-  assertSecretsAbsent(assert, files, ERROR_BODY_CANARIES, "bundle directory");
-  assertSecretsAbsent(assert, readZipEntries(exported.zipPath), ERROR_BODY_CANARIES, "zip archive");
+  assertSecretsAbsent(assert, files, secrets, "bundle directory");
+  assertSecretsAbsent(assert, readZipEntries(exported.zipPath), secrets, "zip archive");
 });
 
-const SURFACE_CANARIES = ["CANARY_BEARER_S1", "CANARY_SESSION_S1", "CANARY_APIKEY_S1", "CANARY_URL_TOKEN_S1"];
-const SURFACE_HTML_BODY = "<html><body><h1>502 Bad Gateway</h1><p>Authorization: Bearer CANARY_BEARER_S1</p><p>Set-Cookie: JSESSIONID=CANARY_SESSION_S1; Path=/</p><p>api_key=CANARY_APIKEY_S1</p><p>Retry at https://api.example.com/v1/x?token=CANARY_URL_TOKEN_S1 later.</p></body></html>";
+/** Canaries planted in the failing surface's body, each inside a carrier: random alphanumerics. */
+const SURFACE = { bearer: "rK4xXESacBR3fCZe6q", session: "3LJPkrKeAW4cNBHswF", apiKey: "hFUY8WTsSwjWGwETqw", urlToken: "DNEFcZkeyYdm3WhqWS" };
+const SURFACE_CANARIES = Object.values(SURFACE);
+const SURFACE_HTML_BODY = `<html><body><h1>502 Bad Gateway</h1><p>Authorization: Bearer ${SURFACE.bearer}</p><p>Set-Cookie: JSESSIONID=${SURFACE.session}; Path=/</p><p>api_key=${SURFACE.apiKey}</p><p>Retry at https://api.example.com/v1/x?token=${SURFACE.urlToken} later.</p></body></html>`;
 const SURFACE_JSON_BODY = {
   errors: [{
     code: "forbidden",
-    message: "Denied while fetching https://api.example.com/v1/x?token=CANARY_URL_TOKEN_S1 for this key; Authorization: Bearer CANARY_BEARER_S1; api_key=CANARY_APIKEY_S1; session_id=CANARY_SESSION_S1",
+    message: `Denied while fetching https://api.example.com/v1/x?token=${SURFACE.urlToken} for this key; Authorization: Bearer ${SURFACE.bearer}; api_key=${SURFACE.apiKey}; session_id=${SURFACE.session}`,
   }],
 };
 
@@ -1287,6 +1332,12 @@ test("rule 9: every Sumo Logic surface that fails with a 502 HTML page or a JSON
   const base = createTempBase("grclanker-sumo-surface-canaries-");
   const healthy = await checkSumologicAccess(new SumologicApiClient(sampleConfig(), { fetchImpl: surfaceCanaryFetch([], "html"), maxRetries: 0 }));
   assert.equal(healthy.surfaces.filter((surface) => surface.status !== "readable").length, 0, "the healthy route table serves every probe");
+  assertFixtureFreeOfCanaryWindows(
+    JSON.stringify({ routes: healthyRoutes(), config: sampleConfig(), bodies: [SURFACE_HTML_BODY, SURFACE_JSON_BODY] }),
+    SURFACE_CANARIES,
+    "surface canary fixture",
+  );
+  const secrets = leakWindows(SURFACE_CANARIES);
 
   for (const [surface, paths] of SUMOLOGIC_SURFACES) {
     for (const variant of ["html", "json"]) {
@@ -1303,7 +1354,7 @@ test("rule 9: every Sumo Logic surface that fails with a 502 HTML page or a JSON
         ...[...files].map(([name, content]) => [`${label} bundle ${name}`, content]),
         ...[...readZipEntries(exported.zipPath)].map(([name, content]) => [`${label} zip ${name}`, content]),
       ]);
-      assertSecretsAbsent(assert, outputs, SURFACE_CANARIES, label);
+      assertSecretsAbsent(assert, outputs, secrets, label);
 
       const errorStrings = [
         ...access.surfaces.filter((item) => item.status === "not_readable").map((item) => item.error),
@@ -1776,7 +1827,12 @@ test("rule 9: scrub boundary: a name-shaped value stays bare in prose and is rem
     ["Basic authentication is required", "Basic authentication is required"],
     ["InvalidAuthenticationToken: Access token has expired", "InvalidAuthenticationToken: Access token has expired"],
   ];
-  for (const [input, expected] of carriers) assert.equal(scrubErrorText(input), expected, input);
+  for (const [input, expected] of carriers) {
+    const scrubbed = scrubErrorText(input);
+    assert.equal(scrubbed, expected, input);
+    if (input.includes(name) && !expected.includes(name)) assertNoWindowOf(scrubbed, name, `carrier ${input}`);
+  }
+  assertNoWindowOf(scrubErrorText(bare, [name]), name, "configured secret in prose");
   const secret = 'top secret/value+1"x';
   const forms = {
     raw: secret,
@@ -1797,4 +1853,159 @@ test("rule 9: scrub boundary: a name-shaped value stays bare in prose and is rem
     "failed for /api/v1/users/aB3xZ9qL2mN8pR4tV7wY1/factors from /tmp/run-9b6rz9m4l55zg7/config.yaml and https://hooks.example.com/services/T0/[REDACTED]",
     "a token-shaped segment of a bare request target or file path is an identifier the run named; inside a URL it is a webhook token",
   );
+  assert.equal(
+    scrubErrorText("key wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY beside /v2/content/folders/personal/children/000000000ABCDEF1/permissions"),
+    "key [REDACTED] beside /v2/content/folders/personal/children/000000000ABCDEF1/permissions",
+    "a random 40-character base64 run is an AWS secret access key; a bare path of word segments is a request target",
+  );
+
+  // Must-keep table (addendum 7): every identifying string a summary may carry survives alone and inside a realistic sentence.
+  for (const value of SUMOLOGIC_MUST_KEEP) {
+    assert.equal(scrubErrorText(value), value, `must keep bare: ${value}`);
+    for (const sentence of sumologicSummarySentences(value)) assert.equal(scrubErrorText(sentence), sentence, `must keep in a sentence: ${sentence}`);
+  }
+});
+
+/** Every request target the Sumo Logic client names in an error (the paths the probes and collectors request) plus the same paths as the route table sees them. */
+const SUMOLOGIC_REQUESTED_PATHS = [
+  ...SUMOLOGIC_SURFACES.flatMap(([, paths]) => paths),
+  ...SUMOLOGIC_SURFACES.flatMap(([, paths]) => paths.map((path) => path.replace(/^\/api/, ""))),
+  "/v1/users?limit=1000",
+  "/v1/policies/searchAudit",
+  "/v1/policies/shareDashboardsOutsideOrganization",
+  "/v1/policies/dataAccessLevel",
+  "/v1/policies/userConcurrentSessionsLimit",
+  "/v1/policies/maxUserSessionTimeout",
+  "/v1/policies/accessKeysLifetime",
+  "/v2/dashboards?limit=100",
+  "/v2/content/000000000ABCDEF1/permissions",
+];
+const SUMOLOGIC_MUST_KEEP = [
+  ...SUMOLOGIC_REQUESTED_PATHS,
+  ...SUMOLOGIC_REQUESTED_PATHS.map((path) => `GET ${path}`),
+  "api.us2.sumologic.com",
+  "https://api.us2.sumologic.com/api",
+  "https://api.fed.sumologic.com/api",
+  "acme-prod.us2.sumologic.com",
+  "https://acme-prod.us2.sumologic.com/api",
+  "prod-us-east-2026",
+  "us2",
+  "fed",
+  "admin@example.com",
+  "secops@example.com",
+  "jane.doe@acme-prod.example.gov",
+  "Administrator",
+  "Analyst",
+  "manageUsersAndRoles",
+  "manageAccessKeys (falls back to createAccessKeys for personal keys)",
+  "viewMonitorsV2",
+  "suAB...",
+  "sumologic_audit_events",
+  "_index=sumologic_audit_events",
+  "_sourceCategory=prod",
+  "200 OK",
+  "401 Unauthorized",
+  "403 Forbidden",
+  "404 Not Found",
+  "429 Too Many Requests",
+  "500 Internal Server Error",
+  "502 Bad Gateway",
+  "503 Service Unavailable",
+  ...Array.from({ length: 20 }, (_, index) => `SUMO-${String(index + 1).padStart(2, "0")}`),
+  "environment-access-id",
+  "environment-access-key",
+  "config-file-endpoint",
+  "default-endpoint",
+  "/home/auditor/.sumologic/config.yaml",
+  "BLOCK_AS_IMPLICIT_KEY",
+  "EACCES",
+];
+
+/** Realistic Sumo Logic summary and error sentences with an identifying value in the slot such a value occupies. */
+function sumologicSummarySentences(value) {
+  return [
+    `Sumo Logic request to ${value} failed (403 Forbidden forbidden): the access key lacks the role capability`,
+    `Unknown: ${value} could not be read because the endpoint returned an error (Sumo Logic request to ${value} failed (502 Bad Gateway): non-JSON body (text/html, 5120 bytes)). Collect manually: export ${value} with created dates.`,
+    `Not requested: no content permission lookups were issued because the personal folder could not be read (Sumo Logic request to ${value} failed (403 forbidden)).`,
+    `Access ID suAB... resolved from ${value}, default-endpoint.`,
+    `Sumo Logic access check: limited\n\n| Surface | Status | Count | Capability |\n| access_keys | not_readable | - | needs ${value} |\n\nNext: Grant the access key owner a role with: ${value}. Unreadable surfaces render as manual findings, never as passes.`,
+  ];
+}
+
+/** Every fixed text the Sumo Logic integration emits, with sample paths and names, passes its scrubber unchanged (GWS note 1). */
+const SUMOLOGIC_FIXED_TEXTS = [
+  "Unable to read Sumo Logic config file /home/auditor/.sumologic/config.yaml (EACCES)",
+  "Unable to read Sumo Logic config file /home/auditor/.sumologic/config.yaml (UNREADABLE)",
+  "Unable to parse Sumo Logic config file: invalid YAML in /home/auditor/.sumologic/config.yaml at line 2, column 13 (BLOCK_AS_IMPLICIT_KEY)",
+  "Unable to parse Sumo Logic config file: invalid YAML in /home/auditor/.sumologic/config.yaml (INVALID_YAML)",
+  "SUMOLOGIC_ACCESS_ID and SUMOLOGIC_ACCESS_KEY (or access_id and access_key arguments, or a config file) are required.",
+  "Unknown Sumo Logic deployment: mars",
+  "Sumo Logic request to /v1/connections failed (502 Bad Gateway): non-JSON body (text/html, 5120 bytes)",
+  "Sumo Logic request to /v1/collectors returned an unreadable response (200 OK): non-JSON body (text/html, 5120 bytes)",
+  "Sumo Logic request to /v1/collectors returned an unreadable response (200 OK): non-JSON body (unknown content type, 0 bytes)",
+  "Sumo Logic request to /v1/roles failed (403 Forbidden forbidden): the access key lacks the role capability",
+  "Sumo Logic request to /v1/users failed (401 Unauthorized): credentials were rejected",
+  "Sumo Logic request to /v1/users failed: fetch failed",
+  "Sumo Logic request to /v1/users failed: The operation was aborted due to timeout",
+  "Not requested: no content permission lookups were issued because the personal folder could not be read (Sumo Logic request to /v2/content/folders/personal failed (403 Forbidden forbidden)).",
+  "every content permission lookup failed (2 of 2): Search A: Sumo Logic request to /v2/content/c1/permissions failed (403 Forbidden forbidden); Search B: Sumo Logic request to /v2/content/c2/permissions failed (403 Forbidden forbidden)",
+  "Unknown: SAML identity providers could not be read because the access key lacks the role capability (403). Collect manually: export Administration > Security > SAML and confirm 'Require SAML sign-in' is enabled.",
+  "Unknown: the password policy could not be read because credentials were rejected (401). Collect manually: screenshot Administration > Security > Password Policy showing length, complexity, and lockout settings.",
+  "Unknown: the role list could not be read because the endpoint returned an error (Sumo Logic request to /v1/roles failed (502 Bad Gateway): non-JSON body (text/html, 5120 bytes)). Collect manually: export Administration > Users and Roles > Roles with capabilities and member counts.",
+  "Unknown: the access key inventory could not be read because the access key lacks the role capability (403). Collect manually: export Administration > Security > Access Keys with created dates.",
+  "Unknown: the audit policy could not be read because the access key lacks the role capability (403). Collect manually: screenshot Administration > Security > Policies > Audit and run `_index=sumologic_audit_events` for the last 24 hours.",
+  "Unknown: the monitor and content inventories could not be read because the access key lacks the role capability (403). Collect manually: list scheduled searches and monitors with their owners and runAs identities, and confirm none run under shared administrator accounts.",
+  "Role least privilege holds for 2 roles. Not checked: the user list could not be read because the access key lacks the role capability (403); collect manually: export the user list with last login dates",
+  "The access key lifetime policy was unreadable (Sumo Logic request to /v1/policies/accessKeysLifetime failed (403 Forbidden forbidden)).",
+  "Pagination stopped before the last page, so only 100 items were seen and the population is incomplete.",
+  "per-user MFA status is unknown because the user list could not be read (the access key lacks the role capability (403))",
+  "The password policy was unreadable, so org-wide MFA enforcement is unknown; per-user MFA status is unknown because the user list could not be read (the access key lacks the role capability (403)). Confirm Require MFA in Administration > Security > Password Policy.",
+  "Require MFA is enabled, but the user list was unreadable (Sumo Logic request to /v1/users failed (403 Forbidden forbidden)), so per-user coverage cannot be confirmed; export the user list with MFA status.",
+  "Require MFA is enabled, but zero users were returned, which indicates a capability-limited key; export the user list with MFA status.",
+  "the user list was unreadable, so admin member activity could not be checked",
+  "Login allowlisting is enabled but the CIDR list was unreadable (Sumo Logic request to /v1/serviceAllowlist/addresses failed (403 Forbidden forbidden)); export the allowlist entries manually.",
+  "The maxUserSessionTimeout policy did not return a parsable value, so session timeout is unknown; confirm it in Administration > Security > Policies.",
+  "The audit policy is enabled but the partition list was unreadable (Sumo Logic request to /v1/partitions failed (403 Forbidden forbidden)), so the audit index state is unverified; run `_index=sumologic_audit_events` for the last 24 hours to prove events flow.",
+  "the personal folder could not be read, so no items were sampled",
+  "The Data Access Level policy is enabled, but content permissions could not be sampled because the personal folder could not be read; review Library sharing for org-wide shares manually.",
+  "The Data Access Level policy is enabled, but content permissions could not be sampled (2 lookups failed, 2 items sampled); review Library sharing for org-wide shares manually. 2 content permission lookup(s) failed (Search A: Sumo Logic request to /v2/content/c1/permissions failed (403 Forbidden forbidden); Search B: Sumo Logic request to /v2/content/c2/permissions failed (403 Forbidden forbidden)), so those items were not checked.",
+  "the monitor list could not be read",
+  "the personal folder could not be read so no scheduled searches were sampled",
+  "the personal folder could not be read, so no lookup tables were sampled",
+  "the dashboard list could not be read (the access key lacks the role capability (403)), so per-dashboard exposure is unknown",
+  "External dashboard sharing is disabled at the policy level, but the dashboard list was unreadable (Sumo Logic request to /v2/dashboards failed (403 Forbidden forbidden)); review dashboard sharing in the Library manually.",
+  "External dashboard sharing is disabled at the policy level, but zero dashboards were viewable by the key owner, so per-dashboard sharing could not be sampled; review Library dashboards manually.",
+  "3 notification(s) across 1 monitors were seen, but no org email domains could be derived (user list unreadable and no approved_email_domains supplied), so recipient review is manual.",
+  "Using Sumo Logic API https://api.us2.sumologic.com/api (deployment us2).",
+  "Access ID suAB... resolved from environment-access-id, environment-access-key, config-file-endpoint.",
+  "17/24 Sumo Logic audit surfaces are readable.",
+  "Run sumologic_assess_identity, sumologic_assess_access_control, sumologic_assess_data_governance, sumologic_assess_content_sharing, or sumologic_export_audit_bundle.",
+  "Grant the access key owner a role with: manageUsersAndRoles, manageSaml, manageAccessKeys (falls back to createAccessKeys for personal keys). Unreadable surfaces render as manual findings, never as passes.",
+  "needs manageUsersAndRoles",
+  "- `_errors.log`: present only when some API surfaces could not be collected",
+  "- MANUAL: unreadable endpoint, not applicable, or outside API scope; the summary names the evidence to collect",
+];
+
+test("rule 9: every fixed text the Sumo Logic integration emits passes its scrubber unchanged", () => {
+  for (const text of SUMOLOGIC_FIXED_TEXTS) assert.equal(scrubErrorText(text), text, text);
+  for (const text of SUMOLOGIC_FIXED_TEXTS) assert.equal(scrubErrorText(text, [SAMPLE_ACCESS_KEY, "suABCDEF"]), text, `${text} (with the configured credentials registered)`);
+});
+
+test("resolveSumologicConfiguration keeps environment credentials when an unrelated argument is passed (GWS note 2)", () => {
+  const dir = createTempBase("grclanker-sumo-env-args-");
+  const configFile = join(dir, "config.yaml");
+  writeFileSync(configFile, "endpoint: eu\n");
+  const env = { SUMOLOGIC_CONFIG_FILE: configFile, SUMOLOGIC_ACCESS_ID: "suENVID1", SUMOLOGIC_ACCESS_KEY: SAMPLE_ACCESS_KEY };
+
+  const resolved = resolveSumologicConfiguration({ timeout_seconds: 9 }, env);
+  assert.equal(resolved.accessId, "suENVID1", "the environment access id survives an argument overlay that names no credential");
+  assert.equal(resolved.accessKey, SAMPLE_ACCESS_KEY, "the environment access key survives an argument overlay that names no credential");
+  assert.equal(resolved.baseUrl, "https://api.eu.sumologic.com/api", "the config file named through the environment still supplies the endpoint");
+  assert.equal(resolved.timeoutMs, 9000);
+  assert.deepEqual(resolved.sourceChain, ["environment-access-id", "environment-access-key", "config-file-endpoint"]);
+
+  const withUndefinedArguments = resolveSumologicConfiguration({ access_id: undefined, access_key: undefined, endpoint: undefined }, env);
+  assert.equal(withUndefinedArguments.accessId, "suENVID1", "an argument overlay whose credential keys are undefined does not shadow the environment");
+  assert.equal(withUndefinedArguments.accessKey, SAMPLE_ACCESS_KEY);
+  assert.deepEqual(withUndefinedArguments.sourceChain, ["environment-access-id", "environment-access-key", "config-file-endpoint"]);
 });
