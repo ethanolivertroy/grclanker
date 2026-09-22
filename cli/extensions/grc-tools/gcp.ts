@@ -350,8 +350,247 @@ function daysBetween(later: Date, earlierIso?: string): number | undefined {
   return (later.getTime() - earlier.getTime()) / (24 * 60 * 60 * 1000);
 }
 
+// ---------------------------------------------------------------------------------------------
+// Rule 9, error-body class. Every error string this module creates passes through scrubErrorText:
+// GcpApiError, the only error the client throws, scrubs in its constructor with the configured
+// credentials as exact secrets, and describeError scrubs every other thrown value before it becomes
+// a surface error, an unreadable_inventories[].error, a not_collected reason, a core_data marker, or
+// an errors[] entry. A response body is never echoed: a non-JSON body contributes its content type
+// and byte length, and a JSON body contributes only the documented google.rpc.Status fields. Every
+// pattern is unanchored so an embedded URL, header, or name-value pair anywhere in free text is
+// caught. The bundle writer applies the same rules once more to every file, without the long-token
+// heuristic, because project ids, resource names, key names, and policy names are evidence.
+// ---------------------------------------------------------------------------------------------
+
+const REDACTED = "[REDACTED]";
+/** Longest scrubbed google.rpc.Status message echoed in an error string; the cap runs after the scrub. */
+const MAX_ERROR_MESSAGE_CHARS = 300;
+/** Everything from the first ? of a scheme-prefixed URL found anywhere in the text; the host and path stay because they name the surface. */
+const EMBEDDED_URL_QUERY_PATTERN = /(\b[a-z][a-z0-9+.-]*:\/\/[^\s"'<>()?#]+\?)[^\s"'<>()#]*/gi;
+/** A fragment carrying name=value pairs (implicit-flow tokens); plain anchors stay. */
+const EMBEDDED_URL_FRAGMENT_PATTERN = /(\b[a-z][a-z0-9+.-]*:\/\/[^\s"'<>()#]+#)[^\s"'<>()]*=[^\s"'<>()]*/gi;
+/**
+ * Sentence punctuation that follows an embedded URL is not part of a credential (no token, key, or JWT ends in
+ * it), so it is kept outside the redaction. This also makes the scrub idempotent: "?[REDACTED]; details" scrubbed
+ * again stays "?[REDACTED]; details" instead of losing its separator.
+ */
+const TRAILING_PUNCTUATION_PATTERN = /[;,.:!]+$/;
+
+function redactUrlTail(match: string, prefix: string): string {
+  const trailing = match.slice(prefix.length).match(TRAILING_PUNCTUATION_PATTERN)?.[0] ?? "";
+  return `${prefix}${REDACTED}${trailing}`;
+}
+/** A plain lowercase word after the scheme ("bearer authentication", "basic auth") is prose, not a credential. */
+const BEARER_PATTERN = /\b([Bb]earer)\s+(?![a-z]+\b)[A-Za-z0-9._~+/=-]{8,}/g;
+const BASIC_AUTH_PATTERN = /\b([Bb]asic)\s+(?![a-z]+\b)[A-Za-z0-9+/=]{16,}/g;
+const COOKIE_HEADER_PATTERN = /\b(set-cookie|cookie)(["']?\s*[:=]\s*)(?!\[REDACTED\])[^\s<>"'][^\r\n<>"']*/gi;
+/** Google credential shapes: OAuth access tokens, API keys, OAuth client secrets, refresh tokens, and JWT assertions. */
+const GOOGLE_ACCESS_TOKEN_PATTERN = /\bya29\.[A-Za-z0-9._~+/=-]{8,}/g;
+const GOOGLE_API_KEY_PATTERN = /\bAIza[A-Za-z0-9_-]{20,}/g;
+const GOOGLE_CLIENT_SECRET_PATTERN = /\bGOCSPX-[A-Za-z0-9_-]{8,}/g;
+const GOOGLE_REFRESH_TOKEN_PATTERN = /(?<![A-Za-z0-9/])1\/\/[A-Za-z0-9_-]{10,}/g;
+const JWT_PATTERN = /\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}/g;
+/**
+ * key=value, key: value, or "key": "value" where the key names a credential (api key, access, refresh, and id
+ * tokens, client secret, private key, password, session, cookie, signature, authorization, assertion), quoted or
+ * not. A short plain value such as "token: user" is prose, and a key that names a path, file, URI, type, count,
+ * or identifier (credentials_path, token_uri, private_key_id) carries no credential and survives.
+ */
+const CREDENTIAL_KEY_WORDS = "token|secret|passw(?:or)?d|passphrase|passcode|pwd|session|api[_-]?key|apikey|key[_-]?string|private[_-]?key|signature|credential|cookie|authorization|assertion";
+const CREDENTIAL_ASSIGNMENT_PATTERN = new RegExp(
+  `\\b([a-z0-9_-]*(?:${CREDENTIAL_KEY_WORDS})[a-z0-9_-]*)(["']?\\s*[:=]\\s*)(["']?)(?!bearer\\b|basic\\b|\\[REDACTED\\])[^\\s"'<>;,&]{6,}`,
+  "gi",
+);
+const NON_CREDENTIAL_KEY_SUFFIX_PATTERN = /(?:[_-]|[a-z](?=[A-Z]))(?:path|file|uri|url|type|kind|count|source|chain|status|names?|ids?)$/i;
+/**
+ * "/", ".", ":", and "=" are not run characters, so endpoint paths, JWT segments, timestamps, and query pairs
+ * split into short pieces that are judged on their own; base64url and hex material never contains them.
+ */
+const LONG_TOKEN_RUN_PATTERN = /[A-Za-z0-9+_-]{16,}/g;
+const UPPERCASE_CODE_PATTERN = /^[A-Z][A-Z_-]*$/;
+const WORD_SEGMENT_PATTERN = /^(?:[A-Z]?[a-z]+|[A-Z]+|[a-z]+(?:[A-Z][a-z]+)+)$/;
+
+function hasTokenShape(value: string): boolean {
+  return /\d/.test(value) || (/[a-z]/.test(value) && /[A-Z]/.test(value));
+}
+
+/**
+ * A run of 16 or more token characters is a credential when it carries a digit or mixed case and is not made
+ * of words: google.rpc codes and reasons (IAM_PERMISSION_DENIED), snake_case and camelCase identifiers
+ * (searchAllIamPolicies, allowedPolicyMemberDomains), and Header-Style names are left alone.
+ */
+function looksLikeToken(run: string): boolean {
+  if (UPPERCASE_CODE_PATTERN.test(run)) return false;
+  if (run.split(/[-_]/).every((segment) => WORD_SEGMENT_PATTERN.test(segment))) return false;
+  return hasTokenShape(run);
+}
+
+export interface ScrubErrorTextOptions {
+  /**
+   * On by default because error text is the only place a bare token can arrive; data values and the bundle
+   * writer turn it off because project ids, key names, and resource names are evidence, not secrets.
+   */
+  longTokens?: boolean;
+}
+
+/** Exact credential values known to this process: the configured access token and the credentials file material. */
+export function credentialValues(config: Pick<GcpResolvedConfig, "accessToken" | "credentials">): string[] {
+  const values: Array<string | undefined> = [config.accessToken];
+  const credentials = config.credentials;
+  switch (credentials?.type) {
+    case "service_account":
+      values.push(credentials.privateKey, ...credentials.privateKey.split(/\r?\n/).filter((line) => !line.startsWith("-----")));
+      break;
+    case "authorized_user":
+      values.push(credentials.clientSecret, credentials.refreshToken);
+      break;
+    case undefined:
+      break;
+    default: {
+      const exhaustive: never = credentials;
+      throw new Error(`Unsupported credentials ${String(exhaustive)}`);
+    }
+  }
+  return [...new Set(values.filter((value): value is string => typeof value === "string" && value.trim().length >= 8))];
+}
+
+export function scrubErrorText(text: string, secrets: string[] = [], options: ScrubErrorTextOptions = {}): string {
+  let scrubbed = text;
+  for (const secret of secrets) {
+    if (secret.trim().length >= 8) scrubbed = scrubbed.split(secret).join(REDACTED);
+  }
+  scrubbed = scrubbed
+    .replace(EMBEDDED_URL_QUERY_PATTERN, redactUrlTail)
+    .replace(EMBEDDED_URL_FRAGMENT_PATTERN, redactUrlTail)
+    .replace(BEARER_PATTERN, `$1 ${REDACTED}`)
+    .replace(BASIC_AUTH_PATTERN, (match, scheme: string) => (hasTokenShape(match.slice(scheme.length)) ? `${scheme} ${REDACTED}` : match))
+    .replace(GOOGLE_ACCESS_TOKEN_PATTERN, REDACTED)
+    .replace(GOOGLE_API_KEY_PATTERN, REDACTED)
+    .replace(GOOGLE_CLIENT_SECRET_PATTERN, REDACTED)
+    .replace(GOOGLE_REFRESH_TOKEN_PATTERN, REDACTED)
+    .replace(JWT_PATTERN, REDACTED)
+    .replace(COOKIE_HEADER_PATTERN, `$1$2${REDACTED}`)
+    .replace(CREDENTIAL_ASSIGNMENT_PATTERN, (match, key: string, separator: string, quote: string) => (
+      NON_CREDENTIAL_KEY_SUFFIX_PATTERN.test(key) ? match : `${key}${separator}${quote}${REDACTED}`
+    ));
+  if (options.longTokens === false) return scrubbed;
+  return scrubbed.replace(LONG_TOKEN_RUN_PATTERN, (run) => (looksLikeToken(run) ? REDACTED : run));
+}
+
+/** Data values and bundle content: every rule except the long-token heuristic (see ScrubErrorTextOptions). */
+function scrubDataText(text: string, secrets: string[]): string {
+  return scrubErrorText(text, secrets, { longTokens: false });
+}
+
+/**
+ * The one error the client throws. Every failed request builds its message here, so no downstream consumer
+ * (errors arrays, unreadable_inventories, not_collected reasons, finding summaries, core_data markers,
+ * access.json, _errors.log, compliance reports) ever receives an unscrubbed string.
+ */
+export class GcpApiError extends Error {
+  /** The HTTP status the endpoint answered with; undefined when no response arrived. */
+  readonly status: number | undefined;
+  readonly endpoint: string;
+
+  constructor(message: string, endpoint: string, status: number | undefined, secrets: string[] = []) {
+    super(scrubErrorText(message, secrets));
+    this.name = "GcpApiError";
+    this.status = status;
+    this.endpoint = endpoint;
+  }
+}
+
+/** Every thrown value that becomes an error string goes through here, so an error raised outside the client gets the same treatment. */
 function describeError(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
+  return scrubErrorText(error instanceof Error ? error.message : String(error));
+}
+
+const HTTP_STATUS_PHRASES: Record<number, string> = {
+  400: "Bad Request",
+  401: "Unauthorized",
+  403: "Forbidden",
+  404: "Not Found",
+  409: "Conflict",
+  429: "Too Many Requests",
+  500: "Internal Server Error",
+  502: "Bad Gateway",
+  503: "Service Unavailable",
+  504: "Gateway Timeout",
+};
+
+/** "403 Forbidden": the status with its reason phrase when the server sent a plain one, else the canonical phrase. */
+function httpStatusLine(response: Pick<Response, "status" | "statusText">): string {
+  const phrase = /^[A-Za-z][A-Za-z '-]{0,39}$/.test(response.statusText) ? response.statusText : HTTP_STATUS_PHRASES[response.status] ?? "HTTP Error";
+  return `${response.status} ${phrase}`;
+}
+
+function mediaType(contentType: string | null): string {
+  const type = contentType?.split(";")[0].trim().toLowerCase();
+  return type ? type : "unknown content type";
+}
+
+/** What a response body contributes when it carries no recognised envelope: its content type and byte length, never the body. */
+function describeOpaqueBody(text: string, contentType: string | null, description: string): string {
+  return `${description} (${mediaType(contentType)}; ${Buffer.byteLength(text, "utf8")} bytes)`;
+}
+
+function parseJsonObject(text: string): JsonRecord | undefined {
+  try {
+    return asObject(JSON.parse(text)) ?? undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/** The documented detail type URL, type.googleapis.com/<package>.<Type>; only the type name (ErrorInfo, Help, BadRequest) is echoed. */
+const GOOGLE_TYPE_URL_PATTERN = /^type\.googleapis\.com\/(?:[a-z][a-z0-9_]*\.)+([A-Z][A-Za-z0-9]*)$/;
+
+/**
+ * The documented google.rpc.Status envelope: error.code, error.status (a google.rpc.Code name), error.message
+ * (free text, scrubbed before it is capped), and error.details[] with @type and reason (google.rpc.ErrorInfo,
+ * UPPER_SNAKE_CASE). Every other field, a field without its documented shape, and any body that is not this
+ * envelope are never echoed.
+ */
+function describeGoogleErrorBody(text: string, contentType: string | null, httpStatus: number, secrets: string[]): string {
+  if (text.length === 0) return "";
+  const payload = parseJsonObject(text);
+  if (!payload) return describeOpaqueBody(text, contentType, "non-JSON error body");
+  const error = asObject(payload.error);
+  if (!error) return describeOpaqueBody(text, contentType, "JSON error body without a google.rpc.Status envelope");
+  const parts: string[] = [];
+  const code = typeof error.code === "number" ? error.code : undefined;
+  if (code !== undefined && code !== httpStatus) parts.push(`code ${code}`);
+  const status = asString(error.status);
+  const message = asString(error.message)?.replace(/\s+/g, " ").trim();
+  const head = [
+    status && /^[A-Z][A-Z_]*$/.test(status) ? status : undefined,
+    message ? scrubErrorText(message, secrets).slice(0, MAX_ERROR_MESSAGE_CHARS) : undefined,
+  ].filter((part): part is string => Boolean(part)).join(": ");
+  if (head) parts.push(head);
+  const details = asObjectArray(error.details)
+    .map((detail) => {
+      const type = asString(detail["@type"])?.match(GOOGLE_TYPE_URL_PATTERN)?.[1];
+      const reason = asString(detail.reason);
+      const reasonText = reason && /^[A-Z][A-Z0-9_]*$/.test(reason) ? `reason ${reason}` : undefined;
+      return [type, reasonText].filter(Boolean).join(" ");
+    })
+    .filter((detail) => detail.length > 0);
+  if (details.length > 0) parts.push(`details ${details.join(", ")}`);
+  return parts.length > 0 ? parts.join("; ") : "google.rpc.Status envelope without status, message, or details";
+}
+
+/** The documented OAuth 2.0 error response (RFC 6749 section 5.2): error and error_description (scrubbed before it is capped), never the raw body. */
+function describeOAuthErrorBody(text: string, contentType: string | null, secrets: string[]): string {
+  if (text.length === 0) return "";
+  const payload = parseJsonObject(text);
+  if (!payload) return describeOpaqueBody(text, contentType, "non-JSON error body");
+  const code = asString(payload.error);
+  const description = asString(payload.error_description)?.replace(/\s+/g, " ").trim();
+  const envelope = [
+    code && /^[a-z_]+$/.test(code) ? code : undefined,
+    description ? scrubErrorText(description, secrets).slice(0, MAX_ERROR_MESSAGE_CHARS) : undefined,
+  ].filter((part): part is string => Boolean(part)).join(": ");
+  return envelope || describeOpaqueBody(text, contentType, "JSON error body without an OAuth error envelope");
 }
 
 function isPermissionError(message: string): boolean {
@@ -563,19 +802,30 @@ export function createGcpServiceAccountAssertion(
   return `${header}.${claims}.${base64Url(signature)}`;
 }
 
-async function postTokenRequest(tokenUri: string, form: URLSearchParams, fetchImpl: FetchImpl): Promise<string> {
-  const response = await fetchImpl(tokenUri, {
-    method: "POST",
-    headers: { "Content-Type": "application/x-www-form-urlencoded" },
-    body: form.toString(),
-  });
-  const text = await response.text().catch(() => "");
-  if (!response.ok) {
-    throw new Error(`Token exchange failed: ${response.status} ${response.statusText}${text ? `: ${text.slice(0, 160)}` : ""}`);
+/** Every failure of the token endpoint is a GcpApiError built from the documented OAuth error fields or the body's content type and length. */
+async function postTokenRequest(tokenUri: string, form: URLSearchParams, fetchImpl: FetchImpl, secrets: string[]): Promise<string> {
+  let response: Response;
+  try {
+    response = await fetchImpl(tokenUri, {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: form.toString(),
+    });
+  } catch (error) {
+    throw new GcpApiError(`Token exchange failed before a response arrived: ${describeError(error)} (POST ${tokenUri})`, tokenUri, undefined, secrets);
   }
-  const payload = asObject(JSON.parse(text));
-  const accessToken = asString(payload?.access_token);
-  if (!accessToken) throw new Error("Token exchange response did not include access_token.");
+  const text = await response.text().catch(() => "");
+  const contentType = response.headers.get("content-type");
+  if (!response.ok) {
+    const body = describeOAuthErrorBody(text, contentType, secrets);
+    throw new GcpApiError(`Token exchange failed: ${httpStatusLine(response)}${body ? `: ${body}` : ""} (POST ${tokenUri})`, tokenUri, response.status, secrets);
+  }
+  const payload = parseJsonObject(text);
+  if (!payload) {
+    throw new GcpApiError(`Token exchange failed: ${httpStatusLine(response)}: ${describeOpaqueBody(text, contentType, "non-JSON response body")} (POST ${tokenUri})`, tokenUri, response.status, secrets);
+  }
+  const accessToken = asString(payload.access_token);
+  if (!accessToken) throw new GcpApiError(`Token exchange response did not include access_token (POST ${tokenUri})`, tokenUri, response.status, secrets);
   return accessToken;
 }
 
@@ -589,13 +839,14 @@ export async function exchangeGcpCredentials(
   fetchImpl: FetchImpl = fetch,
   now: Date = new Date(),
 ): Promise<string> {
+  const secrets = credentialValues({ credentials });
   switch (credentials.type) {
     case "service_account": {
       const form = new URLSearchParams({
         grant_type: "urn:ietf:params:oauth:grant-type:jwt-bearer",
         assertion: createGcpServiceAccountAssertion(credentials, now),
       });
-      return postTokenRequest(credentials.tokenUri, form, fetchImpl);
+      return postTokenRequest(credentials.tokenUri, form, fetchImpl, secrets);
     }
     case "authorized_user": {
       const form = new URLSearchParams({
@@ -604,7 +855,7 @@ export async function exchangeGcpCredentials(
         client_secret: credentials.clientSecret,
         refresh_token: credentials.refreshToken,
       });
-      return postTokenRequest(credentials.tokenUri, form, fetchImpl);
+      return postTokenRequest(credentials.tokenUri, form, fetchImpl, secrets);
     }
     default: {
       const exhaustive: never = credentials;
@@ -816,6 +1067,7 @@ export class GcpAuditorClient {
   private readonly fetchImpl: FetchImpl;
   private readonly now: () => Date;
   private tokenPromise?: Promise<string>;
+  private exchangedToken?: string;
 
   constructor(
     private readonly config: GcpResolvedConfig,
@@ -833,30 +1085,57 @@ export class GcpAuditorClient {
     return this.now();
   }
 
+  /** Exact secrets scrubbed from every error this client creates: the configured credentials plus any token it exchanged them for. */
+  getKnownSecrets(): string[] {
+    return [...new Set([...credentialValues(this.config), ...(this.exchangedToken ? [this.exchangedToken] : [])])];
+  }
+
   async getAccessToken(): Promise<string> {
     if (this.config.accessToken) return this.config.accessToken;
     if (!this.config.credentials) throw new Error("No GCP access token or credentials file was resolved.");
-    this.tokenPromise ??= exchangeGcpCredentials(this.config.credentials, this.fetchImpl, this.now());
+    this.tokenPromise ??= exchangeGcpCredentials(this.config.credentials, this.fetchImpl, this.now()).then((token) => {
+      this.exchangedToken = token;
+      return token;
+    });
     return this.tokenPromise;
   }
 
+  /**
+   * The single point where a request failure becomes an error string. The message carries the HTTP status,
+   * method, and endpoint (the URL without its query); the body contributes only what describeGoogleErrorBody
+   * admits, and the GcpApiError constructor scrubs the whole message with the known secrets.
+   */
   private async requestJson(url: string, init: { method?: string; body?: unknown } = {}): Promise<JsonRecord> {
-    const token = await this.getAccessToken();
-    const response = await this.fetchImpl(url, {
-      method: init.method ?? "GET",
-      headers: {
-        Authorization: `Bearer ${token}`,
-        Accept: "application/json",
-        ...(init.body === undefined ? {} : { "Content-Type": "application/json" }),
-      },
-      body: init.body === undefined ? undefined : JSON.stringify(init.body),
-    });
-    if (!response.ok) {
-      const text = await response.text().catch(() => "");
-      throw new Error(`${response.status} ${response.statusText}${text ? `: ${text.slice(0, 200)}` : ""} (${url.split("?")[0]})`);
+    const method = init.method ?? "GET";
+    const endpoint = url.split("?")[0];
+    let response: Response;
+    try {
+      const token = await this.getAccessToken();
+      response = await this.fetchImpl(url, {
+        method,
+        headers: {
+          Authorization: `Bearer ${token}`,
+          Accept: "application/json",
+          ...(init.body === undefined ? {} : { "Content-Type": "application/json" }),
+        },
+        body: init.body === undefined ? undefined : JSON.stringify(init.body),
+      });
+    } catch (error) {
+      throw new GcpApiError(`${method} ${endpoint} failed before a response arrived: ${describeError(error)}`, endpoint, undefined, this.getKnownSecrets());
     }
-    const text = await response.text();
-    return text.trim().length > 0 ? (JSON.parse(text) as JsonRecord) : {};
+    const secrets = this.getKnownSecrets();
+    const text = await response.text().catch(() => "");
+    const contentType = response.headers.get("content-type");
+    if (!response.ok) {
+      const body = describeGoogleErrorBody(text, contentType, response.status, secrets);
+      throw new GcpApiError(`${httpStatusLine(response)}${body ? `: ${body}` : ""} (${method} ${endpoint})`, endpoint, response.status, secrets);
+    }
+    if (text.trim().length === 0) return {};
+    const payload = parseJsonObject(text);
+    if (!payload) {
+      throw new GcpApiError(`${httpStatusLine(response)}: ${describeOpaqueBody(text, contentType, "non-JSON response body")} (${method} ${endpoint})`, endpoint, response.status, secrets);
+    }
+    return payload;
   }
 
   private async paginate(
@@ -2079,6 +2358,8 @@ export async function assessGcpIdentity(
     ...accountBase,
     inventoryError: accountBase.inventoryError ?? (keysReadable ? undefined : keyReadsUnreadable[0]),
     truncated: anyTruncated([projectsTruncated(context), scanTruncation(accountScan), keyTruncation]),
+    /** The key lists are part of the scan these findings describe, so their status is unknown when every key read failed. */
+    unreachableScopes: keysReadable ? accountBase.unreachableScopes : null,
     unreadable: [
       ...unreadableScans(accountScan),
       ...(keysUnreadable?.status === "not_collected" ? [keysUnreadable] : []),
@@ -3691,6 +3972,7 @@ function buildQuickReference(assessments: GcpAssessmentResult[]): string {
     "- `compliance/frameworks/<framework>.md`: one report per framework in the spec mapping table",
     "- `_errors.log`: present only when some reads failed; every failed read keeps each dependent finding below pass (manual when the primary inventory is unreadable, warn otherwise), names the dataset and endpoint in the summary, lists it under `evidence.unreadable_inventories`, and renders every count or list derived from it as null, never as 0 or []",
     "- collection status: `truncated`, `denied_projects`, `unreachable_scopes`, `projects_truncated`, `sources_truncated`, and `findings_truncated` are null whenever the scan they describe was denied or never ran; `false`, `0`, or `[]` is written only when that scan ran to completion. A read skipped because its upstream discovery failed (for example an effective org policy read with no project to resolve it against) is listed with `status: not_collected` naming the upstream call and its status, and no HTTP status is ever attributed to a call that was not made",
+    "- error text: a failed request is described by its HTTP status, method, and endpoint plus the documented google.rpc.Status fields (status, message, details reason and type) or, for any other body, the content type and byte length; a response body is never copied into an error, and every error string and every bundle file is scrubbed of bearer, cookie, API key, client secret, refresh token, tokenised URL, and credential name-value shapes",
     "- `metadata.json`: non-secret run metadata",
     "",
     "## Status Semantics",
@@ -3714,7 +3996,8 @@ export async function exportGcpAuditBundle(
     & Parameters<typeof assessGcpLoggingDetection>[0]
     & Parameters<typeof assessGcpOrgGuardrails>[0]
     & Parameters<typeof assessGcpDataProtection>[0]
-    & Parameters<typeof assessGcpNetworkSecurity>[0],
+    & Parameters<typeof assessGcpNetworkSecurity>[0]
+    & Partial<Pick<GcpAuditorClient, "getKnownSecrets">>,
   config: GcpResolvedConfig,
   outputRoot: string,
   options: ExportAuditBundleArgs = {},
@@ -3732,10 +4015,18 @@ export async function exportGcpAuditBundle(
   const errors = assessments.flatMap((assessment) => assessment.errors.map((error) => `[${assessment.category}] ${error}`));
   const targetName = safeDirName(`${config.organizationId ?? config.projectId ?? "gcp-scope"}-audit`);
   const outputDir = await nextAvailableAuditDir(outputRoot, targetName);
+  /**
+   * Second layer for every bundle file, .md files and _errors.log included: the same rules the error constructor
+   * applies, with the configured credentials and any exchanged token as exact secrets and without the long-token
+   * heuristic (project ids, key names, and resource names are evidence). The first layer is the constructor plus
+   * the per-control projection of every snapshot.
+   */
+  const secrets = [...new Set([...credentialValues(config), ...(client.getKnownSecrets?.() ?? [])])];
+  const write = (relativePathname: string, content: string) => writeSecureTextFile(outputDir, relativePathname, scrubDataText(content, secrets));
 
-  await writeSecureTextFile(outputDir, "QUICK_REFERENCE.md", buildQuickReference(assessments));
-  await writeSecureTextFile(outputDir, "README.md", buildQuickReference(assessments));
-  await writeSecureTextFile(outputDir, "metadata.json", serializeJson({
+  await write("QUICK_REFERENCE.md", buildQuickReference(assessments));
+  await write("README.md", buildQuickReference(assessments));
+  await write("metadata.json", serializeJson({
     organization_id: config.organizationId ?? null,
     project_id: config.projectId ?? null,
     source_chain: config.sourceChain,
@@ -3749,29 +4040,29 @@ export async function exportGcpAuditBundle(
       max_assets: options.max_assets ?? DEFAULT_MAX_ASSETS,
     },
   }));
-  await writeSecureTextFile(outputDir, "core_data/access.json", serializeJson(redactSecrets(access)));
+  await write("core_data/access.json", serializeJson(redactSecrets(access)));
   for (const assessment of assessments) {
-    await writeSecureTextFile(outputDir, `core_data/${assessment.category}.json`, serializeJson(redactSecrets(assessment.snapshot)));
-    await writeSecureTextFile(outputDir, `analysis/${assessment.category}.json`, serializeJson(redactSecrets({
+    await write(`core_data/${assessment.category}.json`, serializeJson(redactSecrets(assessment.snapshot)));
+    await write(`analysis/${assessment.category}.json`, serializeJson(redactSecrets({
       title: assessment.title,
       category: assessment.category,
       summary: assessment.summary,
       findings: assessment.findings,
       errors: assessment.errors,
     })));
-    await writeSecureTextFile(outputDir, `analysis/${assessment.category}.md`, formatAssessmentText(assessment));
+    await write(`analysis/${assessment.category}.md`, formatAssessmentText(assessment));
   }
-  await writeSecureTextFile(outputDir, "analysis/findings.json", serializeJson(redactSecrets(findings)));
-  await writeSecureTextFile(outputDir, "analysis/category_summaries.json", serializeJson(redactSecrets(
+  await write("analysis/findings.json", serializeJson(redactSecrets(findings)));
+  await write("analysis/category_summaries.json", serializeJson(redactSecrets(
     assessments.map((assessment) => ({ category: assessment.category, title: assessment.title, counts: countStatuses(assessment.findings), summary: assessment.summary })),
   )));
-  await writeSecureTextFile(outputDir, "compliance/executive_summary.md", buildExecutiveSummary(config, assessments, errors));
-  await writeSecureTextFile(outputDir, "compliance/unified_compliance_matrix.md", buildUnifiedMatrix(findings));
+  await write("compliance/executive_summary.md", buildExecutiveSummary(config, assessments, errors));
+  await write("compliance/unified_compliance_matrix.md", buildUnifiedMatrix(findings));
   for (const framework of GCP_FRAMEWORKS) {
-    await writeSecureTextFile(outputDir, `compliance/frameworks/${framework.slug}.md`, buildFrameworkReport(framework, findings));
+    await write(`compliance/frameworks/${framework.slug}.md`, buildFrameworkReport(framework, findings));
   }
   if (errors.length > 0) {
-    await writeSecureTextFile(outputDir, "_errors.log", `${errors.join("\n")}\n`);
+    await write("_errors.log", `${errors.join("\n")}\n`);
   }
 
   const zipPath = `${outputDir}.zip`;

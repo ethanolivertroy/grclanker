@@ -7,6 +7,7 @@ import {
   readdirSync,
   realpathSync,
   readFileSync,
+  rmSync,
   symlinkSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -17,6 +18,7 @@ import {
   GCP_FRAMEWORKS,
   GCP_INVENTORIES,
   GCP_MAX_LIST_PAGES,
+  GcpApiError,
   GcpAuditorClient,
   PUBLIC_MEMBER_IAM_QUERY,
   assessGcpDataProtection,
@@ -26,11 +28,13 @@ import {
   assessGcpOrgGuardrails,
   checkGcpAccess,
   createGcpServiceAccountAssertion,
+  credentialValues,
   exchangeGcpCredentials,
   exportGcpAuditBundle,
   parseGcpCredentialsJson,
   resolveGcpConfiguration,
   resolveSecureOutputPath,
+  scrubErrorText,
 } from "../dist/extensions/grc-tools/gcp.js";
 
 const NOW = new Date("2026-09-21T00:00:00.000Z");
@@ -1191,13 +1195,21 @@ const EVIDENCE_SOURCES = {
     ...scanEngine("serviceAccounts"),
     seen: KEY_SOURCES,
     truncated: ["projects", ...KEY_SOURCES],
+    unreachable_scopes: ["projects", ...KEY_SOURCES],
     stale_keys: KEY_SOURCES,
     undated_keys: KEY_SOURCES,
     service_accounts: ["serviceAccounts"],
     sampled_projects: ["projects"],
     project_error: [],
   },
-  "GCP-IAM-03": { ...scanEngine("serviceAccounts"), seen: KEY_SOURCES, truncated: ["projects", ...KEY_SOURCES], user_managed_keys: KEY_SOURCES, service_accounts: ["serviceAccounts"] },
+  "GCP-IAM-03": {
+    ...scanEngine("serviceAccounts"),
+    seen: KEY_SOURCES,
+    truncated: ["projects", ...KEY_SOURCES],
+    unreachable_scopes: ["projects", ...KEY_SOURCES],
+    user_managed_keys: KEY_SOURCES,
+    service_accounts: ["serviceAccounts"],
+  },
   "GCP-IAM-04": { ...orgEngine("iamPolicies"), cross_project_bindings: ["iamPolicies"] },
   "GCP-IAM-05": { ...orgEngine("iamPolicies"), privileged_default_service_accounts: ["iamPolicies"] },
   "GCP-LOG-01": { ...scanEngine("adminActivity"), projects_without_admin_activity: ["adminActivity"], projects_read: ["adminActivity"] },
@@ -2146,4 +2158,410 @@ test("resolveSecureOutputPath rejects traversal and symlink parents", () => {
   const linked = join(base, "linked");
   symlinkSync(target, linked);
   assert.throws(() => resolveSecureOutputPath(base, "linked/out"), /Refusing to use symlinked parent directory/);
+});
+
+// ---------------------------------------------------------------------------------------------
+// Rule 9, error-body class: a secret an upstream server echoes in an error body, or that a thrown
+// message carries, must never reach a finding, summary, unreadable_inventories entry, not_collected
+// reason, core_data marker, errors array, bundle file, zip entry, or thrown error, and every failure
+// must still be disclosed with status, method, endpoint, and the body's content type and length or
+// its documented google.rpc.Status fields.
+// ---------------------------------------------------------------------------------------------
+
+const ERROR_CANARIES = {
+  bearer: "ya29.a0CANARYBEARER7f3a9c1d7f3a9c1d7f3a9c1d",
+  session: "CANARYSESSION7f3a9c1d7f3a9c1d",
+  apiKey: "AIzaSyCANARYAPIKEY7f3a9c1d000000000000",
+  urlToken: "CANARYURLTOKEN7f3a9c1d7f3a9c1d",
+  clientSecret: "GOCSPX-CANARYCLIENTSECRET7f3a9c1d",
+  refreshToken: "1//0gCANARYREFRESH7f3a9c1d-7f3a9c1d",
+  // 64 characters, the shape of an opaque gateway token, with no header, name, or scheme around it.
+  longToken: `C4NARYL0NGT0KEN${"7f3a9c1d".repeat(6)}0`,
+  // Plain lowercase letters: no header, no name, no token shape. Only the rule that never echoes a body keeps them out.
+  bareHtml: "canaryhtmlbodyzqxwvutsrp",
+};
+
+function canaryHtmlPage() {
+  return `<!DOCTYPE html><html><head><meta charset="utf-8"><title>502 Bad Gateway</title></head><body><h1>502 Bad Gateway ${ERROR_CANARIES.bareHtml}</h1><p>key=${ERROR_CANARIES.apiKey} Authorization: Bearer ${ERROR_CANARIES.bearer}</p><p>Set-Cookie: __Secure-1PSID=${ERROR_CANARIES.session}; Path=/; HttpOnly</p></body></html>`;
+}
+
+/** Fails when any canary, or the first 16 characters of one (a copy cut by a cap), appears in the text. */
+function assertNoCanary(text, label) {
+  for (const [name, canary] of Object.entries(ERROR_CANARIES)) {
+    assert.ok(!text.includes(canary) && !text.includes(canary.slice(0, 16)), `${label}: ${name} canary leaked`);
+  }
+}
+
+test("scrubErrorText redacts every credential shape in free text and leaves benign GCP operator text untouched", () => {
+  const basic = Buffer.from("svc@prod-audit.iam.gserviceaccount.com:s3cret-value-1234").toString("base64");
+  const cases = [
+    { name: "tokenised URL query", input: `see https://iam.googleapis.com/v1/projects/prod-audit/serviceAccounts?access_token=${ERROR_CANARIES.urlToken}&alt=json`, expect: /^see https:\/\/iam\.googleapis\.com\/v1\/projects\/prod-audit\/serviceAccounts\?\[REDACTED\]$/ },
+    { name: "tokenised URL fragment", input: `redirected to https://console.cloud.google.com/#access_token=${ERROR_CANARIES.urlToken}&token_type=bearer`, expect: /^redirected to https:\/\/console\.cloud\.google\.com\/#\[REDACTED\]$/ },
+    { name: "tokenised URL followed by sentence punctuation", input: `visit https://console.developers.google.com/apis/api/compute.googleapis.com/overview?project=123&token=${ERROR_CANARIES.urlToken}; then retry.`, expect: /^visit https:\/\/console\.developers\.google\.com\/apis\/api\/compute\.googleapis\.com\/overview\?\[REDACTED\]; then retry\.$/ },
+    { name: "Bearer", input: `Authorization: Bearer ${ERROR_CANARIES.bearer}`, expect: /^Authorization: Bearer \[REDACTED\]$/ },
+    { name: "Basic", input: `Authorization: Basic ${basic}`, expect: /^Authorization: Basic \[REDACTED\]$/ },
+    { name: "bare ya29 token", input: `token ${ERROR_CANARIES.bearer} expired`, expect: /^token \[REDACTED\] expired$/ },
+    { name: "API key in a query pair", input: `key=${ERROR_CANARIES.apiKey}`, expect: /^key=\[REDACTED\]$/ },
+    { name: "bare API key", input: `API key ${ERROR_CANARIES.apiKey} is restricted`, expect: /^API key \[REDACTED\] is restricted$/ },
+    { name: "API key header", input: `X-Goog-Api-Key: ${ERROR_CANARIES.urlToken}`, expect: /^X-Goog-Api-Key: \[REDACTED\]$/ },
+    { name: "api key quoted", input: `api_key="${ERROR_CANARIES.urlToken}"`, expect: /^api_key="\[REDACTED\]"$/ },
+    { name: "client secret pair", input: `client_secret=${ERROR_CANARIES.clientSecret}`, expect: /^client_secret=\[REDACTED\]$/ },
+    { name: "bare GOCSPX secret", input: `secret ${ERROR_CANARIES.clientSecret} rejected`, expect: /^secret \[REDACTED\] rejected$/ },
+    { name: "client secret JSON", input: `{"client_secret": "${ERROR_CANARIES.urlToken}"}`, expect: /^\{"client_secret": "\[REDACTED\]"\}$/ },
+    { name: "refresh token pair", input: `refresh_token=${ERROR_CANARIES.refreshToken}`, expect: /^refresh_token=\[REDACTED\]$/ },
+    { name: "bare refresh token", input: `token ${ERROR_CANARIES.refreshToken} revoked`, expect: /^token \[REDACTED\] revoked$/ },
+    { name: "JWT assertion", input: "assertion eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdmNAcHJvZC1hdWRpdCJ9.c2lnbmF0dXJlLXNpZ25hdHVyZS1zaWduYXR1cmU rejected", expect: /^assertion \[REDACTED\] rejected$/ },
+    { name: "private key JSON", input: '"private_key": "MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQC7"', expect: /^"private_key": "\[REDACTED\]"$/ },
+    { name: "Cookie", input: `Cookie: __Secure-1PSID=${ERROR_CANARIES.session}; theme=dark`, expect: /^Cookie: \[REDACTED\]$/ },
+    { name: "Set-Cookie", input: `Set-Cookie: __Secure-1PSID=${ERROR_CANARIES.session}; Path=/; HttpOnly`, expect: /^Set-Cookie: \[REDACTED\]$/ },
+    { name: "session id quoted", input: `"session_id": "${ERROR_CANARIES.session}"`, expect: /^"session_id": "\[REDACTED\]"$/ },
+    { name: "password unquoted", input: "password: hunter22seven", expect: /^password: \[REDACTED\]$/ },
+    { name: "password quoted", input: "password='hunter22seven'", expect: /^password='\[REDACTED\]'$/ },
+    { name: "access, refresh, and id tokens", input: "access_token=abcdef123456 refresh_token=abcdef123456 id_token=abcdef123456", expect: /^access_token=\[REDACTED\] refresh_token=\[REDACTED\] id_token=\[REDACTED\]$/ },
+    { name: "HTML page headers", input: canaryHtmlPage(), expect: /<p>key=\[REDACTED\] Authorization: Bearer \[REDACTED\]<\/p><p>Set-Cookie: \[REDACTED\]<\/p>/ },
+    { name: "long token in free text", input: `Backend rejected credential ${ERROR_CANARIES.longToken} for tenant 9f8e7d6c5b4a39281706f5e4d3c2b1a0`, expect: /^Backend rejected credential \[REDACTED\] for tenant \[REDACTED\]$/ },
+  ];
+  for (const item of cases) {
+    const scrubbed = scrubErrorText(item.input);
+    assert.match(scrubbed, item.expect, item.name);
+    assertNoCanary(scrubbed.replace(ERROR_CANARIES.bareHtml, ""), `${item.name} scrub`);
+    assert.doesNotMatch(scrubbed, /hunter22seven|abcdef123456|9f8e7d6c5b4a39281706f5e4d3c2b1a0|c3ZjQHByb2Q|eyJhbGci|MIIEvQIBADAN/, item.name);
+    assert.equal(scrubErrorText(scrubbed), scrubbed, `${item.name}: idempotent`);
+  }
+
+  const secrets = credentialValues(sampleConfig({ accessToken: "opaquesecretvalue" }));
+  assert.deepEqual(secrets, ["opaquesecretvalue"], "the configured access token is an exact secret");
+  assert.deepEqual(credentialValues(sampleConfig()), [], "a short placeholder token is never an exact secret, or the word token would vanish from every summary");
+  const pem = "-----BEGIN PRIVATE KEY-----\nMIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQC7\nAAAAB3NzaC1yc2EAAAADAQABAAABAQC7\n-----END PRIVATE KEY-----\n";
+  const serviceAccount = credentialValues({ credentials: { type: "service_account", clientEmail: "svc@prod-audit.iam.gserviceaccount.com", privateKey: pem, tokenUri: "https://oauth2.googleapis.com/token" } });
+  assert.deepEqual(serviceAccount, [pem, "MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQC7", "AAAAB3NzaC1yc2EAAAADAQABAAABAQC7"], "the PEM and each of its body lines are exact secrets");
+  const user = credentialValues({ credentials: { type: "authorized_user", clientId: "client-id", clientSecret: ERROR_CANARIES.clientSecret, refreshToken: ERROR_CANARIES.refreshToken, tokenUri: "https://oauth2.googleapis.com/token" } });
+  assert.deepEqual(user, [ERROR_CANARIES.clientSecret, ERROR_CANARIES.refreshToken]);
+  assert.equal(scrubErrorText("opaquesecretvalue echoed by the server", secrets), "[REDACTED] echoed by the server", "an exact secret with no token shape is still removed");
+  assert.equal(scrubErrorText("opaquesecretvalue echoed by the server"), "opaquesecretvalue echoed by the server", "without the exact secret the same word is prose");
+
+  const benign = [
+    "403 Forbidden: PERMISSION_DENIED: Permission denied (GET https://dns.googleapis.com/dns/v1/projects/prod-audit/managedZones)",
+    "502 Bad Gateway: non-JSON error body (text/html; 236 bytes) (GET https://iam.googleapis.com/v1/projects/prod-audit/serviceAccounts)",
+    "403 Forbidden: PERMISSION_DENIED: Compute Engine API has not been used in project 123456789012 before or it is disabled.; details ErrorInfo reason SERVICE_DISABLED, Help (GET https://compute.googleapis.com/compute/v1/projects/prod-audit/aggregated/instances)",
+    "details ErrorInfo reason IAM_PERMISSION_DENIED, details ErrorInfo reason ACCESS_TOKEN_SCOPE_INSUFFICIENT",
+    "service accounts unreadable for second-project via iam.googleapis.com/v1/projects/{project}/serviceAccounts (403 Forbidden)",
+    `public IAM binding search not collected for the scope (cloudasset.googleapis.com/v1/{scope}:searchAllIamPolicies?query=${PUBLIC_MEMBER_IAM_QUERY} was not called): project inventory was unreadable`,
+    "constraints/compute.requireOsLogin enforced; constraints/iam.allowedPolicyMemberDomains lists C0abc123",
+    "projects/prod-audit/locations/us/keyRings/ring/cryptoKeys/key rotates every 7776000s",
+    "//cloudresourcemanager.googleapis.com/projects/123456789012 and organizations/123456789012",
+    "svc@prod-audit.iam.gserviceaccount.com, 123-compute@developer.gserviceaccount.com",
+    "token: user",
+    "Bearer authentication is required; basic auth is not accepted",
+    "GET https://cloudasset.googleapis.com/v1/organizations/123456789012:searchAllResources failed before a response arrived: fetch failed",
+    "Partial view: 1 of 2 projects denied; 2 unreachable scopes not enumerated (prod-audit: zones/us-central1-a, prod-audit: regions/us-east1); 5000 seen, total unknown (inventory incomplete)",
+    "2026-09-21T00:00:00.000Z GCP-DATA-07 VPC Service Controls perimeters accessPolicies/1/servicePerimeters/prod",
+    "roles/resourcemanager.organizationAdmin on //cloudresourcemanager.googleapis.com/projects/prod-audit",
+    "credentials_path: /home/auditor/.config/gcloud/application_default_credentials.json",
+    "token_uri: https://oauth2.googleapis.com/token and private_key_id: 3f2a9c1d",
+    "Using GCP organization 123456789012 with project hint prod-audit.",
+  ];
+  for (const text of benign) {
+    assert.equal(scrubErrorText(text), text, `benign text must survive: ${text}`);
+    assert.equal(scrubErrorText(text, secrets), text, `benign text must survive the configured secrets: ${text}`);
+  }
+
+  // The heuristic cannot recognise arbitrary words, which is exactly why no response body is ever echoed.
+  assert.equal(scrubErrorText(ERROR_CANARIES.bareHtml), ERROR_CANARIES.bareHtml);
+  const keyName = "projects/prod-audit/serviceAccounts/svc@prod-audit.iam.gserviceaccount.com/keys/3f2a9c1d7b4e4c8a9d2e1f0a8b7c6d5e00000001";
+  assert.equal(scrubErrorText(keyName, [], { longTokens: false }), keyName, "data mode keeps key names as evidence");
+  assert.equal(scrubErrorText(keyName), "projects/prod-audit/serviceAccounts/svc@prod-audit.iam.gserviceaccount.com/keys/[REDACTED]", "error mode treats the same run as a token");
+  assert.equal(scrubErrorText(`Authorization: Bearer ${ERROR_CANARIES.bearer} key=${ERROR_CANARIES.apiKey}`, [], { longTokens: false }), "Authorization: Bearer [REDACTED] key=[REDACTED]", "data mode keeps every shape rule");
+});
+
+test("GcpApiError describes a failed response by status, method, endpoint, and the documented google.rpc.Status fields or the body's content type and length, never the body", async () => {
+  const respondWith = (body, init, config = sampleConfig()) => createClient(async () => new Response(body, init), config);
+  const failure = (client, call = (target) => target.listInstances("prod-audit")) => call(client).then(() => null, (error) => error);
+  const instances = "https://compute.googleapis.com/compute/v1/projects/prod-audit/aggregated/instances";
+  const json = { "content-type": "application/json; charset=UTF-8" };
+
+  const envelope = await failure(respondWith(JSON.stringify({
+    error: {
+      code: 403,
+      message: "Permission 'compute.instances.list' denied on project prod-audit",
+      status: "PERMISSION_DENIED",
+      details: [{ "@type": "type.googleapis.com/google.rpc.ErrorInfo", reason: "IAM_PERMISSION_DENIED", domain: "compute.googleapis.com", metadata: { permission: "compute.instances.list", debug: ERROR_CANARIES.longToken } }],
+    },
+  }), { status: 403, statusText: "Forbidden", headers: json }));
+  assert.ok(envelope instanceof GcpApiError);
+  assert.equal(envelope.message, `403 Forbidden: PERMISSION_DENIED: Permission 'compute.instances.list' denied on project prod-audit; details ErrorInfo reason IAM_PERMISSION_DENIED (GET ${instances})`);
+  assert.equal(envelope.status, 403);
+  assert.equal(envelope.endpoint, instances);
+
+  const disabled = await failure(respondWith(JSON.stringify({
+    error: {
+      code: 403,
+      message: `Compute Engine API has not been used in project 123456789012 before or it is disabled. Enable it by visiting https://console.developers.google.com/apis/api/compute.googleapis.com/overview?project=123456789012&token=${ERROR_CANARIES.urlToken} then retry.`,
+      status: "PERMISSION_DENIED",
+      details: [
+        { "@type": "type.googleapis.com/google.rpc.Help", links: [{ description: "Google developers console API activation", url: `https://console.developers.google.com/apis/api/compute.googleapis.com/overview?project=123456789012&token=${ERROR_CANARIES.urlToken}` }] },
+        { "@type": "type.googleapis.com/google.rpc.ErrorInfo", reason: "SERVICE_DISABLED", domain: "googleapis.com", metadata: { service: "compute.googleapis.com", consumer: "projects/123456789012" } },
+      ],
+    },
+  }), { status: 403, statusText: "", headers: json }));
+  assert.equal(disabled.message, `403 Forbidden: PERMISSION_DENIED: Compute Engine API has not been used in project 123456789012 before or it is disabled. Enable it by visiting https://console.developers.google.com/apis/api/compute.googleapis.com/overview?[REDACTED] then retry.; details Help, ErrorInfo reason SERVICE_DISABLED (GET ${instances})`, "an empty reason phrase falls back to the canonical one, the tokenised URL keeps host and path only, and only @type and reason are read from details");
+  const scan = await assessGcpOrgGuardrails(createClient(async (url, init) => (new URL(url).pathname.endsWith("/aggregated/instances")
+    ? new Response(JSON.stringify({ error: { code: 403, message: "x", status: "PERMISSION_DENIED", details: [{ "@type": "type.googleapis.com/google.rpc.ErrorInfo", reason: "SERVICE_DISABLED" }] } }), { status: 403, headers: json })
+    : jsonResponse(routeCompliant(url, init)))), { maxProjects: 5 });
+  assert.equal(scan.findings.find((item) => item.id === "GCP-ORG-08").summary.includes("is not enabled"), true, "the SERVICE_DISABLED reason still drives the API-disabled classification");
+
+  const mismatch = await failure(respondWith(JSON.stringify({ error: { code: 7, status: "PERMISSION_DENIED" } }), { status: 403, statusText: "Forbidden", headers: json }));
+  assert.equal(mismatch.message, `403 Forbidden: code 7; PERMISSION_DENIED (GET ${instances})`, "error.code is echoed only when it differs from the HTTP status");
+
+  const hostile = await failure(respondWith(JSON.stringify({ error: { code: 403, status: `PERMISSION_DENIED ${ERROR_CANARIES.longToken}`, details: [{ "@type": `type.googleapis.com/${ERROR_CANARIES.longToken}`, reason: `denied ${ERROR_CANARIES.longToken}` }] } }), { status: 403, statusText: `Forbidden ${ERROR_CANARIES.longToken}`, headers: json }));
+  assert.equal(hostile.message, `403 Forbidden: google.rpc.Status envelope without status, message, or details (GET ${instances})`, "a status, reason, @type, or reason phrase without its documented shape is dropped, not echoed");
+
+  const other = await failure(respondWith(JSON.stringify({ message: `denied for ${ERROR_CANARIES.bearer}`, token: ERROR_CANARIES.bearer }), { status: 401, statusText: "Unauthorized", headers: json }));
+  assert.equal(other.message, `401 Unauthorized: JSON error body without a google.rpc.Status envelope (application/json; ${Buffer.byteLength(JSON.stringify({ message: `denied for ${ERROR_CANARIES.bearer}`, token: ERROR_CANARIES.bearer }))} bytes) (GET ${instances})`);
+
+  const html = await failure(respondWith(canaryHtmlPage(), { status: 502, statusText: "Bad Gateway", headers: { "content-type": "text/html; charset=utf-8" } }));
+  assert.equal(html.message, `502 Bad Gateway: non-JSON error body (text/html; ${Buffer.byteLength(canaryHtmlPage())} bytes) (GET ${instances})`);
+  assert.equal(html.status, 502);
+
+  const untyped = await failure(respondWith(`Access denied for credential ${ERROR_CANARIES.longToken}`, { status: 403, statusText: "Forbidden" }));
+  assert.match(untyped.message, /^403 Forbidden: non-JSON error body \((?:text\/plain(?:;charset=UTF-8)?|unknown content type); \d+ bytes\) \(GET /, "a text body is never echoed even when it would fit an old byte cap");
+  assertNoCanary(untyped.message, "text body");
+
+  const empty = await failure(respondWith("", { status: 404, statusText: "Not Found" }));
+  assert.equal(empty.message, `404 Not Found (GET ${instances})`);
+
+  const okHtml = await failure(respondWith(canaryHtmlPage(), { status: 200, statusText: "OK", headers: { "content-type": "text/html" } }));
+  assert.equal(okHtml.message, `200 OK: non-JSON response body (text/html; ${Buffer.byteLength(canaryHtmlPage())} bytes) (GET ${instances})`, "a 2xx body that is not JSON never reaches JSON.parse, whose SyntaxError would quote the body");
+  assert.equal(okHtml.status, 200);
+
+  const network = await failure(createClient(async () => {
+    throw new TypeError(`fetch failed: request headers Authorization: Bearer ${ERROR_CANARIES.bearer}`);
+  }));
+  assert.equal(network.message, `GET ${instances} failed before a response arrived: fetch failed: request headers Authorization: Bearer [REDACTED]`);
+  assert.equal(network.status, undefined);
+  assert.equal(network.endpoint, instances);
+
+  const policy = await failure(respondWith("", { status: 403, statusText: "Forbidden" }), (client) => client.getEffectiveOrgPolicy("prod-audit", "constraints/compute.requireOsLogin"));
+  assert.equal(policy.message, "403 Forbidden (POST https://cloudresourcemanager.googleapis.com/v1/projects/prod-audit:getEffectiveOrgPolicy)", "POST reads name their method");
+
+  const exact = await failure(respondWith(JSON.stringify({ error: { code: 401, message: "token opaquesecretvalue was rejected", status: "UNAUTHENTICATED" } }), { status: 401, statusText: "Unauthorized", headers: json }, sampleConfig({ accessToken: "opaquesecretvalue" })));
+  assert.equal(exact.message, `401 Unauthorized: UNAUTHENTICATED: token [REDACTED] was rejected (GET ${instances})`, "the configured access token is removed by exact match even without a token shape");
+
+  const thrownExact = await failure(createClient(async () => {
+    throw new TypeError("fetch failed: proxy rejected header value opaquesecretvalue");
+  }, sampleConfig({ accessToken: "opaquesecretvalue" })));
+  assert.equal(thrownExact.message, `GET ${instances} failed before a response arrived: fetch failed: proxy rejected header value [REDACTED]`, "a shapeless configured token in a thrown message is caught by the constructor's exact-match layer, which describeError alone cannot know");
+});
+
+test("token exchange failures never echo the token endpoint's body and the exchanged token is an exact secret in later errors", async () => {
+  const credentials = { type: "authorized_user", clientId: "client-id", clientSecret: ERROR_CANARIES.clientSecret, refreshToken: ERROR_CANARIES.refreshToken, tokenUri: "https://oauth2.googleapis.com/token" };
+  const exchange = (body, init) => exchangeGcpCredentials(credentials, async () => new Response(body, init), NOW).then(() => null, (error) => error);
+
+  const oauth = await exchange(JSON.stringify({ error: "invalid_grant", error_description: `Token has been expired or revoked: ${ERROR_CANARIES.refreshToken} for client ${ERROR_CANARIES.clientSecret}` }), { status: 400, statusText: "Bad Request", headers: { "content-type": "application/json" } });
+  assert.ok(oauth instanceof GcpApiError);
+  assert.equal(oauth.message, "Token exchange failed: 400 Bad Request: invalid_grant: Token has been expired or revoked: [REDACTED] for client [REDACTED] (POST https://oauth2.googleapis.com/token)");
+  assert.equal(oauth.status, 400);
+  assert.equal(oauth.endpoint, "https://oauth2.googleapis.com/token");
+
+  const html = await exchange(canaryHtmlPage(), { status: 502, statusText: "Bad Gateway", headers: { "content-type": "text/html" } });
+  assert.equal(html.message, `Token exchange failed: 502 Bad Gateway: non-JSON error body (text/html; ${Buffer.byteLength(canaryHtmlPage())} bytes) (POST https://oauth2.googleapis.com/token)`);
+
+  const unexpected = await exchange(JSON.stringify({ token_type: "Bearer", secret: ERROR_CANARIES.bearer }), { status: 200, statusText: "OK", headers: { "content-type": "application/json" } });
+  assert.equal(unexpected.message, "Token exchange response did not include access_token (POST https://oauth2.googleapis.com/token)");
+
+  const opaque = await exchange(canaryHtmlPage(), { status: 200, statusText: "OK", headers: { "content-type": "text/html" } });
+  assert.equal(opaque.message, `Token exchange failed: 200 OK: non-JSON response body (text/html; ${Buffer.byteLength(canaryHtmlPage())} bytes) (POST https://oauth2.googleapis.com/token)`);
+
+  const client = createClient(async (url) => {
+    if (url === "https://oauth2.googleapis.com/token") return jsonResponse({ access_token: "opaqueexchangedtoken", expires_in: 3599, token_type: "Bearer" });
+    return new Response(JSON.stringify({ error: { code: 401, message: "token opaqueexchangedtoken has expired", status: "UNAUTHENTICATED" } }), { status: 401, statusText: "Unauthorized", headers: { "content-type": "application/json" } });
+  }, sampleConfig({ accessToken: undefined, credentials }));
+  const rejected = await client.getOrganization().then(() => null, (error) => error);
+  assert.equal(rejected.message, "401 Unauthorized: UNAUTHENTICATED: token [REDACTED] has expired (GET https://cloudresourcemanager.googleapis.com/v1/organizations/123456789012)");
+  assert.deepEqual(client.getKnownSecrets(), [ERROR_CANARIES.clientSecret, ERROR_CANARIES.refreshToken, "opaqueexchangedtoken"]);
+
+  const failedExchange = createClient(async (url) => {
+    if (url === "https://oauth2.googleapis.com/token") return new Response(JSON.stringify({ error: "invalid_client", error_description: `client ${ERROR_CANARIES.clientSecret} unknown` }), { status: 401, statusText: "Unauthorized", headers: { "content-type": "application/json" } });
+    throw new Error("the API must not be called without a token");
+  }, sampleConfig({ accessToken: undefined, credentials }));
+  const result = await assessGcpOrgGuardrails(failedExchange, { maxProjects: 5 });
+  const organization = result.findings.find((item) => item.id === "GCP-ORG-01");
+  assert.equal(organization.status, "manual");
+  assert.match(organization.summary, /failed before a response arrived: Token exchange failed: 401 Unauthorized: invalid_client: client \[REDACTED\] unknown \(POST https:\/\/oauth2\.googleapis\.com\/token\)/);
+  assertNoCanary(JSON.stringify(result), "org guardrails after a failed token exchange");
+});
+
+const ERROR_BODY_SHAPES = {
+  "502 text/html with bearer, session cookie, and API key canaries": {
+    status: 502,
+    respond: () => new Response(canaryHtmlPage(), { status: 502, statusText: "Bad Gateway", headers: { "content-type": "text/html; charset=utf-8" } }),
+    disclosure: /502 Bad Gateway: non-JSON error body \(text\/html; \d+ bytes\) \((?:GET|POST) https:\/\/[a-z]+\.googleapis\.com\//,
+  },
+  "403 JSON whose error.message embeds a tokenised URL": {
+    status: 403,
+    respond: () => jsonResponse({
+      error: {
+        code: 403,
+        message: `The caller does not have permission; see https://iam.googleapis.com/v1/projects/prod-audit/serviceAccounts?access_token=${ERROR_CANARIES.urlToken}&alt=json`,
+        status: "PERMISSION_DENIED",
+        details: [{ "@type": "type.googleapis.com/google.rpc.ErrorInfo", reason: "IAM_PERMISSION_DENIED", domain: "iam.googleapis.com", metadata: { permission: "iam.serviceAccounts.list", token: ERROR_CANARIES.urlToken } }],
+      },
+    }, 403),
+    disclosure: /403 Forbidden: PERMISSION_DENIED: The caller does not have permission; see https:\/\/iam\.googleapis\.com\/v1\/projects\/prod-audit\/serviceAccounts\?\[REDACTED\]; details ErrorInfo reason IAM_PERMISSION_DENIED \((?:GET|POST) https:\/\/[a-z]+\.googleapis\.com\//,
+  },
+  "500 JSON whose free-text error.message carries a long token": {
+    status: 500,
+    respond: () => new Response(JSON.stringify({ error: { code: 500, message: `Backend rejected credential ${ERROR_CANARIES.longToken} for session ${ERROR_CANARIES.session}`, status: "INTERNAL" } }), { status: 500, statusText: "Internal Server Error", headers: { "content-type": "application/json; charset=UTF-8" } }),
+    disclosure: /500 Internal Server Error: INTERNAL: Backend rejected credential \[REDACTED\] for session \[REDACTED\] \((?:GET|POST) https:\/\/[a-z]+\.googleapis\.com\//,
+  },
+  "thrown network error carrying the Authorization and Cookie headers": {
+    status: undefined,
+    respond: () => {
+      throw new TypeError(`fetch failed: request headers Authorization: Bearer ${ERROR_CANARIES.bearer}; Cookie: __Secure-1PSID=${ERROR_CANARIES.session}`);
+    },
+    disclosure: /(?:GET|POST) https:\/\/[a-z]+\.googleapis\.com\/\S+ failed before a response arrived: fetch failed: request headers Authorization: Bearer \[REDACTED\]; Cookie: \[REDACTED\]/,
+  },
+};
+
+/** The direct client call that reads each sweep row's endpoint, so the thrown error itself can be inspected. */
+const SURFACE_CLIENT_CALLS = {
+  organization: (client) => client.getOrganization(),
+  projects: (client) => client.listProjectInventory(5),
+  iamPolicies: (client) => client.searchAllIamPolicies(20),
+  publicBindings: (client) => client.searchPublicIamBindings(20),
+  cryptoKeys: (client) => client.listCryptoKeys(20),
+  serviceAccounts: (client) => client.listServiceAccounts("prod-audit"),
+  serviceAccountKeys: (client) => client.listServiceAccountKeys("prod-audit", "svc@prod-audit.iam.gserviceaccount.com"),
+  adminActivity: (client) => client.listRecentAdminActivity("prod-audit"),
+  dataAccess: (client) => client.listRecentDataAccess("prod-audit"),
+  sinks: (client) => client.listLogSinks("prod-audit"),
+  logBuckets: (client) => client.listLogBuckets("prod-audit"),
+  loggingSettings: (client) => client.getLoggingSettings("prod-audit"),
+  sccSources: (client) => client.listSccSources(),
+  sccFindings: (client) => client.listSccFindings(20),
+  ...Object.fromEntries(Object.keys(ORG_POLICY_DEPENDENTS).map((constraint) => [policySurfaceId(constraint), (client) => client.getEffectiveOrgPolicy("prod-audit", constraint)])),
+  computeProject: (client) => client.getComputeProject("prod-audit"),
+  instances: (client) => client.listInstances("prod-audit"),
+  binaryAuthorization: (client) => client.getBinaryAuthorizationPolicy("prod-audit"),
+  buckets: (client) => client.listStorageBuckets("prod-audit"),
+  disks: (client) => client.listDisks("prod-audit"),
+  managedZones: (client) => client.listManagedZones("prod-audit"),
+  apiKeys: (client) => client.listApiKeys("prod-audit"),
+  accessPolicies: (client) => client.listAccessPolicies(),
+  servicePerimeters: (client) => client.listServicePerimeters("accessPolicies/1"),
+  firewalls: (client) => client.listFirewalls("prod-audit"),
+  subnetworks: (client) => client.listSubnetworks("prod-audit"),
+  routers: (client) => client.listRouters("prod-audit"),
+  sslPolicies: (client) => client.listSslPolicies("prod-audit"),
+  targetHttpsProxies: (client) => client.listTargetHttpsProxies("prod-audit"),
+  backendServices: (client) => client.listBackendServices("prod-audit"),
+};
+
+test("error-body walk: every GCP_INVENTORIES surface failing in four body shapes leaks no canary and is disclosed with status, method, endpoint, and content type and length or the documented google.rpc.Status fields", async () => {
+  const outputRoot = createTempBase("grclanker-gcp-error-body-walk-");
+  assert.deepEqual(Object.keys(SURFACE_CLIENT_CALLS).sort(), INVENTORY_SURFACES.map((row) => row.id).sort(), "every sweep row has a direct client call in the walk");
+  assert.deepEqual([...new Set(INVENTORY_SURFACES.map((row) => row.key))].sort(), Object.keys(GCP_INVENTORIES).sort(), "the walk covers every GCP_INVENTORIES surface");
+
+  let walked = 0;
+  for (const row of INVENTORY_SURFACES) {
+    for (const [shapeName, shape] of Object.entries(ERROR_BODY_SHAPES)) {
+      const label = `${row.id} [${shapeName}]`;
+      const client = createClient(async (url, init) => (row.match(requestFacts(url, init)) ? shape.respond() : jsonResponse(routeForProject(url, init))));
+
+      const thrown = await SURFACE_CLIENT_CALLS[row.id](client).then(() => null, (error) => error);
+      assert.ok(thrown instanceof GcpApiError, `${label}: the direct client call throws a GcpApiError`);
+      assert.equal(thrown.status, shape.status, `${label}: the error carries the HTTP status`);
+      assert.match(thrown.endpoint, /^https:\/\/[a-z]+\.googleapis\.com\/[^?]+$/, `${label}: the error carries the endpoint without its query string`);
+      assert.ok(thrown.message.includes(thrown.endpoint), `${label}: the message names the endpoint`);
+      assert.match(thrown.message, shape.disclosure, `${label}: the failure is disclosed by status, method, endpoint, and content type and length or the documented fields (${thrown.message})`);
+      assert.doesNotMatch(thrown.message, /<html|<p>|<title|Path=\/|HttpOnly|__Secure|alt=json|"metadata"/, `${label}: no body text is echoed`);
+      assertNoCanary(thrown.message, `${label} thrown message`);
+
+      const results = await runAllAssessments(client, { maxProjects: 5 });
+      const access = await checkGcpAccess(client);
+      assertNoCanary(JSON.stringify(results), `${label} findings, summaries, evidence, unreadable inventories, markers, and errors arrays`);
+      assertNoCanary(JSON.stringify(access), `${label} access check`);
+      const errors = results.flatMap((result) => result.errors);
+      assert.ok(errors.some((entry) => shape.disclosure.test(entry)), `${label}: an assessment errors array discloses the failure (${errors.join(" | ")})`);
+      const byId = findingsById(results);
+      for (const id of row.dependents) {
+        assert.notEqual(byId[id].status, "pass", `${label}: ${id} must not pass`);
+        const entries = byId[id].evidence.unreadable_inventories ?? [];
+        assert.ok(entries.some((entry) => shape.disclosure.test(entry.error)), `${label}: ${id} lists the failure with its disclosure in unreadable_inventories (${JSON.stringify(entries)})`);
+      }
+      for (const result of results) {
+        for (const marker of Object.values(result.snapshot).filter(isMarker)) {
+          assert.doesNotMatch(marker.error, /<html|Path=\/|alt=json/, `${label}: core_data marker echoes body text`);
+        }
+      }
+
+      const exported = await exportGcpAuditBundle(client, sampleConfig(), outputRoot, { max_projects: 5 });
+      assert.ok(exported.errorCount > 0, `${label}: the bundle records the failure`);
+      const files = walkFiles(exported.outputDir).map((pathname) => ({ name: relative(exported.outputDir, pathname), content: readFileSync(pathname, "utf8") }));
+      for (const file of files) assertNoCanary(file.content, `${label} bundle file ${file.name}`);
+      for (const entry of readZipEntries(exported.zipPath)) assertNoCanary(entry.content, `${label} zip entry ${entry.name}`);
+      const errorsLog = files.find((file) => file.name === "_errors.log");
+      assert.ok(errorsLog, `${label}: _errors.log is present`);
+      assert.match(errorsLog.content, shape.disclosure, `${label}: _errors.log discloses the failure with status, endpoint, and content type and length or the documented fields`);
+      rmSync(exported.outputDir, { recursive: true, force: true });
+      rmSync(exported.zipPath, { force: true });
+      walked += 1;
+    }
+  }
+  assert.equal(walked, INVENTORY_SURFACES.length * Object.keys(ERROR_BODY_SHAPES).length);
+});
+
+test("GCP-IAM-02 and GCP-IAM-03 render unreachable_scopes null, not [], when every service account key list is denied", async () => {
+  const keyLists = (r) => r.host === "iam.googleapis.com" && r.path.endsWith("/keys");
+  const denied = findingsById([await assessGcpIdentity(clientWithUnreadable(keyLists), { maxProjects: 5 })]);
+  for (const id of ["GCP-IAM-02", "GCP-IAM-03"]) {
+    assert.equal(denied[id].status, "manual", id);
+    assert.equal(denied[id].evidence.unreachable_scopes, null, `${id} unreachable_scopes describes the key lists too, which never ran to completion`);
+    assert.equal(denied[id].evidence.truncated, null, `${id} truncated`);
+    assert.match(denied[id].summary, /service account keys unreadable for 2 of 2 service accounts/);
+  }
+  const partial = findingsById([await assessGcpIdentity(clientWithUnreadable(keyLists, 403, "partial"), { maxProjects: 5 })]);
+  for (const id of ["GCP-IAM-02", "GCP-IAM-03"]) {
+    assert.deepEqual(partial[id].evidence.unreachable_scopes, [], `${id}: with one project's key lists readable the scan ran, so [] is a true statement`);
+    assert.equal(partial[id].status, "warn", id);
+  }
+});
+
+test("project-only scope: without an organization ID the organization, SCC, and perimeter reads are not attempted, their findings are manual with not_collected entries, and every other control passes", async () => {
+  const requested = [];
+  const config = sampleConfig({ organizationId: undefined });
+  const client = createClient(async (url, init) => {
+    const parsed = new URL(url);
+    requested.push(`${parsed.hostname}${parsed.pathname}`);
+    return jsonResponse(routeCompliant(url, init));
+  }, config);
+  const results = await runAllAssessments(client, { maxProjects: 5 });
+  const byId = findingsById(results);
+  const notCollected = ["GCP-ORG-01", "GCP-LOG-05", "GCP-DATA-07"];
+  for (const id of notCollected) {
+    assert.equal(byId[id].status, "manual", id);
+    const entries = byId[id].evidence.unreadable_inventories.filter((entry) => entry.status === "not_collected");
+    assert.ok(entries.length > 0, `${id} lists a not_collected entry`);
+    assert.match(byId[id].summary, /not collected|was not called|no organization/i, `${id} summary names the skipped read`);
+    assert.doesNotMatch(byId[id].summary, /[1-5]\d{2} [A-Z][a-z]+/, `${id} attributes no HTTP status to a call that was not made`);
+  }
+  for (const id of ALL_FINDING_IDS.filter((id) => !notCollected.includes(id))) {
+    assert.equal(byId[id].status, "pass", `${id}: ${byId[id].summary}`);
+  }
+  assert.equal(requested.filter((request) => /securitycenter\.googleapis\.com|accesscontextmanager\.googleapis\.com|\/v1\/organizations\/|:searchAllResources$/.test(request)).length, 0, "no organization-scoped request is issued");
+  assert.ok(requested.some((request) => request.endsWith("/v1/projects/prod-audit:searchAllIamPolicies")), "IAM policy search is scoped to the project");
+
+  const exported = await exportGcpAuditBundle(client, config, createTempBase("grclanker-gcp-project-only-"), { max_projects: 5 });
+  assert.equal(exported.findingCount, 31);
+  assert.equal(exported.errorCount, 0, "a read that was not attempted is not a collection error");
+  const markers = [];
+  for (const pathname of walkFiles(exported.outputDir).filter((entry) => relative(exported.outputDir, entry).startsWith("core_data") && entry.endsWith(".json"))) {
+    const walk = (value, path) => {
+      if (isMarker(value)) markers.push({ path, dataset: value.dataset, status: value.status });
+      else if (value && typeof value === "object") for (const [key, child] of Object.entries(value)) walk(child, `${path}.${key}`);
+    };
+    walk(JSON.parse(readFileSync(pathname, "utf8")), basename(pathname));
+  }
+  assert.deepEqual(markers.map((marker) => marker.dataset).sort(), ["Security Command Center sources", "VPC Service Controls perimeters", "organization metadata"], "exactly the three organization-scoped datasets carry markers");
+  assert.ok(markers.every((marker) => marker.status === "not_collected"));
 });
