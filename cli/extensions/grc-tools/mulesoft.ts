@@ -863,11 +863,30 @@ async function countFilesRecursively(rootDir: string): Promise<number> {
   return total;
 }
 
-function stripTomlComment(line: string): string {
+/** A TOML line the simple reader cannot accept; it records the line number only, never the line. */
+export class MulesoftTomlSyntaxError extends Error {
+  readonly line: number;
+
+  constructor(line: number) {
+    super(`Invalid TOML at line ${line}`);
+    this.name = "MulesoftTomlSyntaxError";
+    this.line = line;
+  }
+}
+
+/**
+ * Drops a trailing comment. A quote that is still open at the end of the line (a multi-line string
+ * opener, or a value that never closes) is a syntax error, so the line is never read as a value.
+ */
+function stripTomlComment(line: string, lineNumber: number): string {
   let quote: string | undefined;
   for (let index = 0; index < line.length; index += 1) {
     const character = line[index];
     if (quote) {
+      if (quote === "\"" && character === "\\") {
+        index += 1;
+        continue;
+      }
       if (character === quote) quote = undefined;
       continue;
     }
@@ -877,7 +896,20 @@ function stripTomlComment(line: string): string {
     }
     if (character === "#") return line.slice(0, index);
   }
+  if (quote) throw new MulesoftTomlSyntaxError(lineNumber);
   return line;
+}
+
+/** Index of the quote that closes the string opened at index 0, honoring backslash escapes in basic strings. */
+function closingQuoteIndex(value: string, quote: string): number {
+  for (let index = 1; index < value.length; index += 1) {
+    if (quote === "\"" && value[index] === "\\") {
+      index += 1;
+      continue;
+    }
+    if (value[index] === quote) return index;
+  }
+  return -1;
 }
 
 function unquoteTomlString(value: string): string {
@@ -921,33 +953,62 @@ function splitTomlArray(value: string): string[] {
   return items;
 }
 
-function parseTomlValue(raw: string): unknown {
+/**
+ * Parses one value: a single-line array of scalars, a string closed on the same line (basic, literal,
+ * or a one-line triple-quoted string), a boolean, or a number; any other quoted or bracketed shape is
+ * a syntax error at this line. A bare word stays a string, as in the Snowflake reader.
+ */
+function parseTomlValue(raw: string, lineNumber: number): unknown {
   const value = raw.trim();
-  if (value.startsWith("[") && value.endsWith("]")) {
-    return splitTomlArray(value.slice(1, -1)).map((item) => parseTomlValue(item));
+  if (value.length === 0) throw new MulesoftTomlSyntaxError(lineNumber);
+  if (value.startsWith("[")) {
+    if (!value.endsWith("]")) throw new MulesoftTomlSyntaxError(lineNumber);
+    return splitTomlArray(value.slice(1, -1)).map((item) => parseTomlValue(item, lineNumber));
   }
-  if (value.startsWith("\"") || value.startsWith("'")) return unquoteTomlString(value);
+  for (const delimiter of ["\"\"\"", "'''"]) {
+    if (!value.startsWith(delimiter)) continue;
+    if (value.length < delimiter.length * 2 || value.indexOf(delimiter, delimiter.length) !== value.length - delimiter.length) {
+      throw new MulesoftTomlSyntaxError(lineNumber);
+    }
+    return value.slice(delimiter.length, -delimiter.length);
+  }
+  if (value.startsWith("\"") || value.startsWith("'")) {
+    if (closingQuoteIndex(value, value[0]) !== value.length - 1) throw new MulesoftTomlSyntaxError(lineNumber);
+    return unquoteTomlString(value);
+  }
   if (/^(true|false)$/i.test(value)) return value.toLowerCase() === "true";
   const numeric = Number(value.replace(/_/g, ""));
-  if (value.length > 0 && Number.isFinite(numeric)) return numeric;
+  if (Number.isFinite(numeric)) return numeric;
   return value;
 }
 
+const TOML_TABLE_HEADER_PATTERN = /^\[([^[\]]+)\]$/;
+const TOML_KEY_VALUE_PATTERN = /^("[^"]*"|'[^']*'|[A-Za-z0-9_.-]+)\s*=\s*(.+)$/;
+
+/**
+ * Reads the subset of TOML the config file uses: blank lines, `#` comments, `[table]` headers, and
+ * single-line `key = value` pairs. Any other line (a bare value, an array of tables, a continued
+ * array or string), and any quote that does not close on its own line, throws a
+ * MulesoftTomlSyntaxError carrying the line number only, so a stray credential line is never
+ * skipped, never read as a value, and never quoted.
+ */
 export function parseSimpleToml(contents: string): Record<string, unknown> {
   const result: Record<string, unknown> = {};
   let section = "";
-  for (const rawLine of contents.split(/\r?\n/)) {
-    const line = stripTomlComment(rawLine).trim();
+  const lines = contents.split(/\r?\n/);
+  for (let index = 0; index < lines.length; index += 1) {
+    const lineNumber = index + 1;
+    const line = stripTomlComment(lines[index], lineNumber).trim();
     if (line.length === 0) continue;
-    const sectionMatch = /^\[([^\]]+)\]$/.exec(line);
+    const sectionMatch = TOML_TABLE_HEADER_PATTERN.exec(line);
     if (sectionMatch) {
       section = sectionMatch[1].trim().replace(/^["']|["']$/g, "");
       continue;
     }
-    const separator = line.indexOf("=");
-    if (separator === -1) continue;
-    const key = unquoteTomlString(line.slice(0, separator).trim());
-    const value = parseTomlValue(line.slice(separator + 1));
+    const pairMatch = TOML_KEY_VALUE_PATTERN.exec(line);
+    if (!pairMatch) throw new MulesoftTomlSyntaxError(lineNumber);
+    const key = unquoteTomlString(pairMatch[1]);
+    const value = parseTomlValue(pairMatch[2], lineNumber);
     result[section ? `${section}.${key}` : key] = value;
   }
   return result;
@@ -993,12 +1054,16 @@ function readConfigFileText(path: string): string {
   }
 }
 
-/** Parse step of the config loader: every thrown value is caught and replaced with fixed text. */
+/**
+ * Parse step of the config loader: every thrown value is caught and replaced with fixed text carrying
+ * the path, the line number when the reader reported one, and the code; never the line itself.
+ */
 function parseConfigFileToml(path: string, text: string): Record<string, unknown> {
   try {
     return parseSimpleToml(text);
-  } catch {
-    throw new MulesoftConfigFileError(`Unable to parse MuleSoft config file: invalid TOML in ${path}`, "INVALID_TOML");
+  } catch (error) {
+    const where = error instanceof MulesoftTomlSyntaxError ? ` at line ${error.line}` : "";
+    throw new MulesoftConfigFileError(`Unable to parse MuleSoft config file: invalid TOML in ${path}${where} (INVALID_TOML)`, "INVALID_TOML");
   }
 }
 

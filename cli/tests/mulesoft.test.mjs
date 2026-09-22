@@ -60,6 +60,13 @@ const PLANTED = {
   configuredSecret: "9dUvtkD5mgQkKTzZvj",
 };
 
+/** Credentials planted on the malformed TOML lines the strict reader must stop on (see the planted-values self-check). */
+const TOML_CANARIES = {
+  bareLine: "jLBw6AEIKfPbU6CUxx",
+  unterminatedQuote: "SuENX6SvYS1MCVBZue",
+  multiLineString: "RltxNPr3Iga7jo7PLG",
+};
+
 function sampleConfig(overrides = {}) {
   return {
     organizationId: ORG_ID,
@@ -331,6 +338,56 @@ test("parseSimpleToml handles sections, comments, arrays, and quoted values", ()
   assert.equal(parsed.verbose, true);
   assert.equal(parsed["auth.client_id"], "file-client");
   assert.deepEqual(parsed["auth.environments"], ["Production", "Sandbox"]);
+
+  // The accepted subset also covers quoted keys, one-line triple-quoted strings, escaped quotes, empty
+  // arrays, bare words, and a `#` inside a string.
+  const edges = parseSimpleToml([
+    "\"quoted key\" = 'v'",
+    "triple = \"\"\"a \"b\" c\"\"\"",
+    "escaped = \"say \\\"hi\\\" # not a comment\"",
+    "empty = []",
+    "bare = eu",
+    "[\"dotted.section\"]",
+    "n = 1_000",
+  ].join("\n"));
+  assert.equal(edges["quoted key"], "v");
+  assert.equal(edges.triple, "a \"b\" c");
+  assert.equal(edges.escaped, "say \"hi\" # not a comment");
+  assert.deepEqual(edges.empty, []);
+  assert.equal(edges.bare, "eu");
+  assert.equal(edges["dotted.section.n"], 1000);
+});
+
+test("parseSimpleToml is strict: any line that is not blank, a comment, a [table] header, or a single-line key = value pair, and any quote that does not close on its line, throws with the line number only", () => {
+  const rejected = [
+    ["bare value line", ["org_id = \"o\"", "stray-value", "x = 1"], 2],
+    ["unclosed table header", ["[anypoint", "x = 1"], 1],
+    ["array of tables", ["[[servers]]", "x = 1"], 1],
+    ["missing value", ["x =", "y = 1"], 1],
+    ["missing value after a comment", ["x = # nothing", "y = 1"], 1],
+    ["unterminated basic string", ["a = 1", "x = \"open"], 2],
+    ["unterminated literal string", ["x = 'open"], 1],
+    ["escaped closing quote only", ["x = \"open\\\""], 1],
+    ["multi-line basic string opener", ["a = 1", "b = 2", "x = \"\"\"", "value", "\"\"\""], 3],
+    ["multi-line literal string opener", ["x = '''"], 1],
+    ["continued array", ["x = [", "1,", "]"], 1],
+    ["text after a closed string", ["x = \"a\" b"], 1],
+    ["unclosed quote in a bare value", ["x = it's"], 1],
+    ["key with spaces", ["my key = 1"], 1],
+    ["key without separator", ["client_secret"], 1],
+    ["equals only", ["="], 1],
+    ["nested array", ["x = [[1, 2], [3]]"], 1],
+  ];
+  for (const [name, lines, expectedLine] of rejected) {
+    assert.throws(() => parseSimpleToml(lines.join("\n")), (error) => {
+      assert.equal(error.name, "MulesoftTomlSyntaxError", name);
+      assert.equal(error.line, expectedLine, `${name}: line number`);
+      assert.equal(error.message, `Invalid TOML at line ${expectedLine}`, `${name}: the message carries the line number only`);
+      return true;
+    }, name);
+  }
+  // CRLF files count lines the same way.
+  assert.throws(() => parseSimpleToml("a = 1\r\nb = 2\r\nstray\r\n"), (error) => error.line === 3);
 });
 
 test("resolveMulesoftConfiguration prefers explicit args over environment and config file", () => {
@@ -411,15 +468,102 @@ test("addendum 6b: the TOML config loader reports read failures with fixed text 
       return true;
     });
   }
-  // The hand-rolled TOML parser never throws on content, so a malformed file with a planted secret
-  // resolves without echoing it: the value is taken as a string and never reaches an error message.
+  // A malformed file stops the loader at the first line the strict reader cannot accept (here the
+  // unclosed table header), with fixed text naming the path and line; the planted values on the
+  // following line are never read, so no window of them can reach the message.
   const malformed = join(home, "malformed.toml");
-  writeFileSync(malformed, "[anypoint\nclient_secret = QWJHXVZPKMTRYU1: Bearer GBDLNSCFWOAE2XZ\n");
+  writeFileSync(malformed, `[anypoint\nclient_secret = ${TOML_CANARIES.bareLine}: Bearer ${TOML_CANARIES.unterminatedQuote}\n`);
   assert.throws(() => resolveMulesoftConfiguration({ config_file: malformed }, {}, { homeDir: home }), (error) => {
-    assert.equal(error.message.includes("QWJHXVZPKMTRYU1"), false);
-    assert.equal(error.message.includes("GBDLNSCFWOAE2XZ"), false);
+    assert.equal(error.message, `Unable to parse MuleSoft config file: invalid TOML in ${malformed} at line 1 (INVALID_TOML)`);
+    assert.equal(error.code, "INVALID_TOML");
+    assertFragmentsAbsent(assert, String(error), Object.values(TOML_CANARIES), "malformed config resolver error");
     return true;
   });
+});
+
+test("round 2 BLOCKING: the strict TOML reader stops on a bare credential line, an unterminated quote, and a multi-line string with fixed text naming the line, and no 6-to-24-character window of the planted credential reaches the reader, the resolver, check_access, the export result, or an output root", async () => {
+  const home = createTempBase("grclanker-mulesoft-toml-strict-home-");
+  const registered = [];
+  registerMulesoftTools({ registerTool: (tool) => registered.push(tool) });
+  const checkAccess = registered.find((tool) => tool.name === "mulesoft_check_access");
+  const exportTool = registered.find((tool) => tool.name === "mulesoft_export_audit_bundle");
+  const shapes = [
+    {
+      name: "bare credential line",
+      canary: TOML_CANARIES.bareLine,
+      text: `org_id = "org-1"\nclient_id = "client-1"\n${TOML_CANARIES.bareLine}\ncontrol_plane = "us"\n`,
+      line: 3,
+    },
+    {
+      name: "unterminated quote",
+      canary: TOML_CANARIES.unterminatedQuote,
+      text: `org_id = "org-1"\nclient_secret = "${TOML_CANARIES.unterminatedQuote}\ncontrol_plane = "us"\n`,
+      line: 2,
+    },
+    {
+      name: "multi-line string",
+      canary: TOML_CANARIES.multiLineString,
+      text: `[anypoint]\norg_id = "org-1"\nclient_secret = """\n${TOML_CANARIES.multiLineString}\n"""\n`,
+      line: 3,
+    },
+  ];
+  const textOf = (result) => result.content.map((part) => part.text ?? "").join("\n");
+  for (const shape of shapes) {
+    const label = shape.name;
+    // Positive control: the reader itself stops at the malformed line (the lenient reader skipped or
+    // swallowed it), and its own message carries the line number only.
+    assert.throws(() => parseSimpleToml(shape.text), (error) => {
+      assert.equal(error.name, "MulesoftTomlSyntaxError", `${label}: reader error class`);
+      assert.equal(error.line, shape.line, `${label}: reader line`);
+      assert.equal(error.message, `Invalid TOML at line ${shape.line}`, `${label}: reader message`);
+      assertFragmentsAbsent(assert, String(error), [shape.canary], `${label}: reader String(error)`);
+      return true;
+    }, label);
+
+    const path = join(home, `${shape.name.replace(/ /g, "-")}.toml`);
+    writeFileSync(path, shape.text);
+    assert.ok(readFileSync(path, "utf8").includes(shape.canary), `${label}: the file on disk carries the credential`);
+    const expected = `Unable to parse MuleSoft config file: invalid TOML in ${path} at line ${shape.line} (INVALID_TOML)`;
+
+    // The exported resolver throws the fixed text, whether the path arrives as an argument or through either environment variable.
+    for (const [source, args, env] of [
+      ["argument", { config_file: path }, {}],
+      ["MULESOFT_SEC_INSPECTOR_CONFIG", {}, { MULESOFT_SEC_INSPECTOR_CONFIG: path }],
+      ["ANYPOINT_CONFIG_FILE", {}, { ANYPOINT_CONFIG_FILE: path }],
+    ]) {
+      assert.throws(() => resolveMulesoftConfiguration(args, env, { homeDir: home }), (error) => {
+        assert.equal(error.message, expected, `${label} via ${source}: fixed text`);
+        assert.equal(error.code, "INVALID_TOML", `${label} via ${source}: code`);
+        assert.equal(error.name, "MulesoftConfigFileError", `${label} via ${source}: class`);
+        assertFragmentsAbsent(assert, String(error), [shape.canary], `${label} via ${source}: resolver String(error)`);
+        assertFragmentsAbsent(assert, JSON.stringify({ ...error, message: error.message, stack: error.stack }), [shape.canary], `${label} via ${source}: resolver error fields`);
+        return true;
+      }, `${label} via ${source}`);
+    }
+
+    // check_access returns the fixed text and nothing from the file.
+    const access = await checkAccess.execute("call-toml-access", checkAccess.prepareArguments({ config_file: path }));
+    assert.equal(access.isError, true, `${label}: check_access reports an error`);
+    assert.ok(textOf(access).includes(expected), `${label}: check_access carries the fixed text: ${textOf(access)}`);
+    assertFragmentsAbsent(assert, textOf(access), [shape.canary], `${label}: check_access text`);
+    assertFragmentsAbsent(assert, JSON.stringify(access.details ?? {}), [shape.canary], `${label}: check_access details`);
+
+    // The export stops before an output directory or zip exists, so the bundle cannot carry the credential:
+    // the tool result is the fixed text and the output root stays empty.
+    const outputRoot = createTempBase("grclanker-mulesoft-toml-strict-out-");
+    const exported = await exportTool.execute("call-toml-export", exportTool.prepareArguments({ config_file: path, output_dir: outputRoot }));
+    assert.equal(exported.isError, true, `${label}: export reports an error`);
+    assert.ok(textOf(exported).includes(expected), `${label}: export carries the fixed text: ${textOf(exported)}`);
+    assertFragmentsAbsent(assert, textOf(exported), [shape.canary], `${label}: export text`);
+    assertFragmentsAbsent(assert, JSON.stringify(exported.details ?? {}), [shape.canary], `${label}: export details`);
+    assert.deepEqual(readdirSync(outputRoot), [], `${label}: no bundle directory or zip is written under the output root`);
+  }
+
+  // Fixed text on the malformed-line class survives every MuleSoft redaction pass unchanged.
+  const samplePath = join(home, "bare-credential-line.toml");
+  const sample = `Unable to parse MuleSoft config file: invalid TOML in ${samplePath} at line 3 (INVALID_TOML)`;
+  assert.equal(redactSecretText(sample), sample);
+  assert.equal(new MulesoftApiError(502, sample, "/x").message, sample);
 });
 
 test("resolveMulesoftConfiguration reads the default config.toml location under the home directory", () => {
@@ -3367,6 +3511,7 @@ test("planted values self-check: every canary and planted secret is alphanumeric
     ...Object.fromEntries(Object.entries(FAKE_MULESOFT_SECRETS).map(([name, value]) => [`FAKE_MULESOFT_SECRETS.${name}`, value])),
     ...Object.fromEntries(Object.entries(PLANTED).map(([name, value]) => [`PLANTED.${name}`, value])),
     ...Object.fromEntries(Object.entries(CONFIG_CANARIES).map(([name, value]) => [`CONFIG_CANARIES.${name}`, value])),
+    ...Object.fromEntries(Object.entries(TOML_CANARIES).map(([name, value]) => [`TOML_CANARIES.${name}`, value])),
     SAMPLE_TOKEN,
   }, [
     ["sample configuration", JSON.stringify({ ...sampleConfig(), token: null })],
@@ -3459,7 +3604,8 @@ const MULESOFT_FIXED_TEXTS = [
   "Unable to read MuleSoft config file /tmp/grclanker-mulesoft-loader-Ab3dEf/directory.toml (EISDIR)",
   "Unable to read MuleSoft config file /tmp/grclanker-mulesoft-loader-Ab3dEf/locked.toml (EACCES)",
   "Unable to read MuleSoft config file /tmp/grclanker-mulesoft-loader-Ab3dEf/config.toml",
-  "Unable to parse MuleSoft config file: invalid TOML in /tmp/grclanker-mulesoft-loader-Ab3dEf/config.toml",
+  "Unable to parse MuleSoft config file: invalid TOML in /tmp/grclanker-mulesoft-loader-Ab3dEf/config.toml at line 3 (INVALID_TOML)",
+  "Unable to parse MuleSoft config file: invalid TOML in /home/svc/.config/mulesoft-sec-inspector/config.toml at line 12 (INVALID_TOML)",
   "ANYPOINT_ORG_ID, an organization_id argument, or org_id in config.toml is required.",
   "Provide connected app credentials (ANYPOINT_CLIENT_ID and ANYPOINT_CLIENT_SECRET), username and password (ANYPOINT_USERNAME and ANYPOINT_PASSWORD), a pre-issued ANYPOINT_TOKEN, or the matching arguments or config.toml keys.",
   'Unsupported MuleSoft control plane "apac". Use us, eu, or gov, or pass base_url.',
@@ -3540,7 +3686,7 @@ test("scrub boundary: bare name-shaped values stay, carriers and registered secr
     "Anypoint request failed (502 Bad Gateway) for /accounts/api/organizations/org-1/members: non-JSON body (text/html, 5120 bytes)",
     "Anypoint request failed (403 Forbidden) for /cloudhub/api/v2/applications: JSON body without documented error fields (application/json, 42 bytes)",
     "Unable to read MuleSoft config file /home/svc/.anypoint/config.toml (ENOENT)",
-    "Unable to parse MuleSoft config file: invalid TOML in /tmp/grclanker-mulesoft-loader-Ab3dEf/config.toml at line 3",
+    "Unable to parse MuleSoft config file: invalid TOML in /tmp/grclanker-mulesoft-loader-Ab3dEf/config.toml at line 3 (INVALID_TOML)",
     "environment Production-US-East-2026 and business group Acme_Platform_Team on control plane us",
   ];
   const sourceLabels = [...new Set((await msAssessAll(healthyBundleClient())).flatMap((assessment) => Object.keys(assessment.summary.inventories)))];
@@ -3593,6 +3739,11 @@ test("round 7 note 1: every fixed-text message MuleSoft emits (loader, opaque bo
     texts.add(error.message);
     return true;
   });
+  // The parse message on a real malformed file (a multi-line string opener on line 2).
+  const malformedPath = join(scratch, "malformed.toml");
+  writeFileSync(malformedPath, `org_id = "org-1"\nclient_secret = """\n${TOML_CANARIES.multiLineString}\n"""\n`);
+  const parseMessage = collectThrownMessage(texts, () => resolveMulesoftConfiguration({ config_file: malformedPath }, {}), "invalid TOML");
+  assert.equal(parseMessage, `Unable to parse MuleSoft config file: invalid TOML in ${malformedPath} at line 2 (INVALID_TOML)`);
 
   // The resolver's own messages on the real path with an empty environment and an empty home: no
   // organization, an organization without credentials, and credentials with an unsupported control plane.
