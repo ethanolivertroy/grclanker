@@ -1735,11 +1735,12 @@ async function collectObjectDataset<T>(
  * the whole map carries a not-requested marker.
  */
 async function collectRecordMap(
+  childLabel: string,
   parents: CollectedDataset<JsonRecord[]>,
   fetcher: (parentId: string) => Promise<ListResult>,
 ): Promise<CollectedDataset<Record<string, JsonRecord[]>>> {
   if (parents.notCollected) {
-    return skippedDataset({}, `the parent list was not collected (${parents.notCollected.error}).`);
+    return skippedDataset({}, `no ${childLabel} were requested because the parent list was not collected (${parents.notCollected.error}).`);
   }
   const data: Record<string, JsonRecord[]> = {};
   const errors: string[] = [];
@@ -1772,8 +1773,9 @@ async function collectRecordMap(
 async function collectPolicyRuleMap(
   client: Pick<OktaAuditorClient, "listPolicyRules">,
   policies: CollectedDataset<JsonRecord[]>,
+  policyLabel: string,
 ): Promise<CollectedDataset<Record<string, JsonRecord[]>>> {
-  return collectRecordMap(policies, (policyId) => client.listPolicyRules(policyId));
+  return collectRecordMap(`${policyLabel} rules`, policies, (policyId) => client.listPolicyRules(policyId));
 }
 
 /**
@@ -1884,9 +1886,9 @@ export async function collectOktaAuthenticationData(
   const mfaPolicies = await collectArrayDataset(() => client.listPolicies("MFA_ENROLL"));
   const accessPolicies = await collectArrayDataset(() => client.listPolicies("ACCESS_POLICY"));
 
-  const signOnPolicyRules = await collectPolicyRuleMap(client, signOnPolicies);
-  const passwordPolicyRules = await collectPolicyRuleMap(client, passwordPolicies);
-  const accessPolicyRules = await collectPolicyRuleMap(client, accessPolicies);
+  const signOnPolicyRules = await collectPolicyRuleMap(client, signOnPolicies, "sign-on policy");
+  const passwordPolicyRules = await collectPolicyRuleMap(client, passwordPolicies, "password policy");
+  const accessPolicyRules = await collectPolicyRuleMap(client, accessPolicies, "access policy");
 
   return {
     signOnPolicies,
@@ -1951,7 +1953,7 @@ async function collectPrivilegedUserFactors(
     return unavailableDataset({}, "Per-user factor listing is not available on this client.");
   }
   const scoped = privilegedUsers.data.slice(0, MAX_PRIVILEGED_FACTOR_LOOKUPS);
-  const factors = await collectRecordMap({ ...privilegedUsers, data: scoped }, (userId) => client.listUserFactors!(userId));
+  const factors = await collectRecordMap("privileged user factor lists", { ...privilegedUsers, data: scoped }, (userId) => client.listUserFactors!(userId));
   if (factors.notCollected) return factors;
   const truncated = privilegedUsers.data.length > scoped.length;
   return {
@@ -1970,7 +1972,7 @@ export async function collectOktaAdminAccessData(
   client: OktaAdminAccessClient,
 ): Promise<OktaAdminAccessData> {
   const usersWithRoleAssignments = await collectArrayDataset(() => client.listUsersWithRoleAssignments());
-  const userRoles = await collectRecordMap(usersWithRoleAssignments, (userId) => client.listUserRoles(userId));
+  const userRoles = await collectRecordMap("per-user role lists", usersWithRoleAssignments, (userId) => client.listUserRoles(userId));
 
   const groups = await collectArrayDataset(() => client.listGroups());
   const privilegedGroups = groups.data.filter((group) =>
@@ -1981,8 +1983,8 @@ export async function collectOktaAdminAccessData(
 
   const groupsTruncated = privilegedGroups.length > MAX_PRIVILEGED_GROUP_LOOKUPS;
   const expandedGroups: CollectedDataset<JsonRecord[]> = { ...groups, data: privilegedGroups.slice(0, MAX_PRIVILEGED_GROUP_LOOKUPS) };
-  const privilegedGroupRoles = await collectRecordMap(expandedGroups, (groupId) => client.listGroupRoles(groupId));
-  const privilegedGroupMembers = await collectRecordMap(expandedGroups, (groupId) => client.listGroupUsers(groupId));
+  const privilegedGroupRoles = await collectRecordMap("privileged group role lists", expandedGroups, (groupId) => client.listGroupRoles(groupId));
+  const privilegedGroupMembers = await collectRecordMap("privileged group member lists", expandedGroups, (groupId) => client.listGroupUsers(groupId));
 
   const users = await collectUsersDataset(client);
   const privilegedUserFactors = await collectPrivilegedUserFactors(client, usersWithRoleAssignments);
@@ -2041,9 +2043,9 @@ export async function collectOktaIntegrationData(
     trustedOrigins: await collectArrayDataset(() => client.listTrustedOrigins()),
     networkZones: await collectArrayDataset(() => client.listNetworkZones()),
     accessPolicies,
-    accessPolicyRules: await collectPolicyRuleMap(client, accessPolicies),
+    accessPolicyRules: await collectPolicyRuleMap(client, accessPolicies, "access policy"),
     signOnPolicies,
-    signOnPolicyRules: await collectPolicyRuleMap(client, signOnPolicies),
+    signOnPolicyRules: await collectPolicyRuleMap(client, signOnPolicies, "sign-on policy"),
     idps: await collectArrayDataset(() => client.listIdps()),
     authorizationServers: await collectArrayDataset(() => client.listAuthorizationServers()),
     groupRules: client.listGroupRules

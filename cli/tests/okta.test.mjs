@@ -1935,3 +1935,314 @@ test("multi-inventory verdicts name the unreadable secondary source (OKTA-AUTH-0
   unassigned.orgContacts = dataset([{ contactType: "BILLING", userId: "user-9", userStatus: "ACTIVE", userLogin: "billing@example.gov" }]);
   assert.equal(statusOf(assessOktaMonitoring(unassigned, config), "OKTA-MON-008"), "Fail", "a readable list without TECHNICAL is still a real gap");
 });
+
+/** Serves the sample fixtures at the Management API paths the real client requests; null (the sample's absent default authorization server) is served as a 404. */
+async function oktaFixtureBody(sample, url) {
+  const path = url.pathname;
+  const segment = (pattern) => pattern.exec(path)?.[1];
+  if (path === "/api/v1/policies") return sample.listPolicies(url.searchParams.get("type"));
+  const rulesPolicy = segment(/^\/api\/v1\/policies\/([^/]+)\/rules$/);
+  if (rulesPolicy) return sample.listPolicyRules(rulesPolicy);
+  if (path === "/api/v1/authenticators") return sample.listAuthenticators();
+  if (path === "/api/v1/idps") return sample.listIdps();
+  if (path === "/api/v1/authorizationServers") return sample.listAuthorizationServers();
+  if (path === "/api/v1/authorizationServers/default") return sample.getDefaultAuthorizationServer();
+  if (path === "/api/v1/org/factors") return sample.listOrgFactors();
+  if (path === "/api/v1/iam/assignees/users") return sample.listUsersWithRoleAssignments();
+  const rolesUser = segment(/^\/api\/v1\/users\/([^/]+)\/roles$/);
+  if (rolesUser) return sample.listUserRoles(rolesUser);
+  const factorsUser = segment(/^\/api\/v1\/users\/([^/]+)\/factors$/);
+  if (factorsUser) return sample.listUserFactors(factorsUser);
+  const user = segment(/^\/api\/v1\/users\/([^/]+)$/);
+  if (user) return sample.getUser(user);
+  if (path === "/api/v1/users") return (await sample.listUsersWithMeta()).items;
+  if (path === "/api/v1/groups/rules") return sample.listGroupRules();
+  if (path === "/api/v1/groups") return sample.listGroups();
+  const groupRoles = segment(/^\/api\/v1\/groups\/([^/]+)\/roles$/);
+  if (groupRoles) return sample.listGroupRoles(groupRoles);
+  const groupUsers = segment(/^\/api\/v1\/groups\/([^/]+)\/users$/);
+  if (groupUsers) return sample.listGroupUsers(groupUsers);
+  if (path === "/api/v1/org/privacy/oktaSupport") return sample.getOktaSupportSettings();
+  if (path === "/api/v1/org/orgSettings/thirdPartyAdminSetting") return sample.getThirdPartyAdminSetting();
+  if (path === "/api/v1/apps") return sample.listApps();
+  if (path === "/api/v1/trustedOrigins") return sample.listTrustedOrigins();
+  if (path === "/api/v1/zones") return sample.listNetworkZones();
+  if (path === "/api/v1/eventHooks") return sample.listEventHooks();
+  if (path === "/api/v1/logStreams") return sample.listLogStreams();
+  if (path === "/api/v1/logs") return sample.listSystemLogs();
+  if (path === "/api/v1/behaviors") return sample.listBehaviors();
+  if (path === "/api/v1/threats/configuration") return sample.getThreatInsight();
+  if (path === "/api/v1/api-tokens") return sample.listApiTokens();
+  if (path === "/api/v1/device-assurances") return sample.listDeviceAssurancePolicies();
+  if (path === "/api/v1/org/contacts") return sample.listOrgContacts();
+  const contactType = segment(/^\/api\/v1\/org\/contacts\/([^/]+)$/);
+  if (contactType) return sample.getOrgContactUser(contactType);
+  return undefined;
+}
+
+/**
+ * A fetch that records every request as the client describes it (path plus
+ * query without the cursor) and the status it served, denying the paths that
+ * match `denied` with a 403 so a test can check that every status code and
+ * endpoint named in an output was really observed.
+ */
+function recordingOktaFetch({ denied = [] } = {}) {
+  const sample = createSampleClient();
+  const requests = [];
+  const fetchImpl = async (input, init = {}) => {
+    const url = new URL(input.toString());
+    url.searchParams.delete("after");
+    const path = `${url.pathname}${url.search}`;
+    const respond = (status, body) => {
+      requests.push({ method: init.method ?? "GET", path, status });
+      const statusText = { 200: "OK", 403: "Forbidden", 404: "Not Found" }[status];
+      return new Response(JSON.stringify(body), { status, statusText, headers: { "content-type": "application/json" } });
+    };
+    if (denied.some((pattern) => pattern.test(path))) {
+      return respond(403, { errorCode: "E0000006", errorSummary: "You do not have permission to access the feature you are requesting" });
+    }
+    const body = await oktaFixtureBody(sample, url);
+    if (body === null || body === undefined) return respond(404, { errorCode: "E0000007", errorSummary: "Not found" });
+    return respond(200, body);
+  };
+  return { fetchImpl, requests };
+}
+
+const RECORDING_CONFIG = { orgUrl: "https://tenant.example.okta.com", authMode: "SSWS", token: "okta-test-token", scopes: [], sourceChain: ["tests"] };
+
+/** Every top-level Okta dataset: the request that produces it, its core_data file, the per-parent files that are never requested when it is denied, the assess category that reads it, the snapshot counters that must render null, and the access probe that reads the same surface. */
+const OKTA_DATASETS = [
+  { name: "sign-on policies", pattern: /^\/api\/v1\/policies\?type=OKTA_SIGN_ON&limit=\d+$/, file: "core_data/sign_on_policies.json", skipped: ["core_data/sign_on_policy_rules.json"], category: "authentication", nullCounters: ["sign_on_policies", "admin_dashboard_policies", "admin_mfa_rules"], probe: "policies" },
+  { name: "password policies", pattern: /^\/api\/v1\/policies\?type=PASSWORD&limit=\d+$/, file: "core_data/password_policies.json", skipped: ["core_data/password_policy_rules.json"], category: "authentication", nullCounters: ["password_policies"] },
+  { name: "MFA enrollment policies", pattern: /^\/api\/v1\/policies\?type=MFA_ENROLL&limit=\d+$/, file: "core_data/mfa_enrollment_policies.json", skipped: [], category: "authentication", nullCounters: [] },
+  { name: "access policies", pattern: /^\/api\/v1\/policies\?type=ACCESS_POLICY&limit=\d+$/, file: "core_data/access_policies.json", skipped: ["core_data/access_policy_rules.json"], category: "authentication", nullCounters: ["access_policies", "admin_dashboard_policies", "admin_mfa_rules"] },
+  { name: "authenticators", pattern: /^\/api\/v1\/authenticators$/, file: "core_data/authenticators.json", skipped: [], category: "authentication", nullCounters: ["active_authenticators", "strong_authenticators", "phishing_resistant_authenticators", "restricted_authenticators"], nullLabels: ["okta_verify_fips_mode"] },
+  { name: "identity providers", pattern: /^\/api\/v1\/idps\?limit=\d+$/, file: "core_data/idps.json", skipped: [], category: "authentication", nullCounters: [] },
+  { name: "authorization servers", pattern: /^\/api\/v1\/authorizationServers\?limit=\d+$/, file: "core_data/authorization_servers.json", skipped: [], category: "authentication", nullCounters: [] },
+  { name: "default authorization server", pattern: /^\/api\/v1\/authorizationServers\/default$/, file: "core_data/default_authorization_server.json", skipped: [], category: "authentication", nullCounters: [] },
+  { name: "org factors", pattern: /^\/api\/v1\/org\/factors\?limit=\d+$/, file: "core_data/org_factors.json", skipped: [], category: "authentication", nullCounters: [] },
+  { name: "role assignees", pattern: /^\/api\/v1\/iam\/assignees\/users\?limit=\d+$/, file: "core_data/users_with_role_assignments.json", skipped: ["core_data/user_roles.json", "core_data/privileged_user_factors.json"], category: "admin", nullCounters: ["privileged_users", "super_admins", "stale_privileged_users", "privileged_users_without_last_login", "privileged_users_factor_checked"], probe: "roles" },
+  { name: "groups", pattern: /^\/api\/v1\/groups\?limit=\d+$/, file: "core_data/groups.json", skipped: ["core_data/privileged_group_roles.json", "core_data/privileged_group_members.json"], category: "admin", nullCounters: ["privileged_groups_reviewed"] },
+  { name: "users", pattern: /^\/api\/v1\/users\?limit=\d+$/, file: "core_data/users.json", skipped: [], category: "admin", nullCounters: ["users_listed", "stale_active_users", "never_activated_users"], nullLabels: ["users_listing_truncated"], probe: "users" },
+  { name: "Okta Support access", pattern: /^\/api\/v1\/org\/privacy\/oktaSupport$/, file: "core_data/okta_support_access.json", skipped: [], category: "admin", nullCounters: [], nullLabels: ["okta_support_access"] },
+  { name: "third-party admin setting", pattern: /^\/api\/v1\/org\/orgSettings\/thirdPartyAdminSetting$/, file: "core_data/third_party_admin_setting.json", skipped: [], category: "admin", nullCounters: [] },
+  { name: "apps", pattern: /^\/api\/v1\/apps\?limit=\d+$/, file: "core_data/apps.json", skipped: [], category: "integrations", nullCounters: ["applications", "active_applications", "risky_oidc_apps", "inactive_apps", "provisioning_apps", "deactivation_push_apps"] },
+  { name: "trusted origins", pattern: /^\/api\/v1\/trustedOrigins\?limit=\d+$/, file: "core_data/trusted_origins.json", skipped: [], category: "integrations", nullCounters: ["trusted_origins", "insecure_trusted_origins"] },
+  { name: "network zones", pattern: /^\/api\/v1\/zones\?limit=\d+$/, file: "core_data/network_zones.json", skipped: [], category: "integrations", nullCounters: ["custom_network_zones"] },
+  { name: "group rules", pattern: /^\/api\/v1\/groups\/rules\?limit=\d+$/, file: "core_data/group_rules.json", skipped: [], category: "integrations", nullCounters: ["active_group_rules"] },
+  { name: "event hooks", pattern: /^\/api\/v1\/eventHooks\?limit=\d+$/, file: "core_data/event_hooks.json", skipped: [], category: "monitoring", nullCounters: ["active_event_hooks"] },
+  { name: "log streams", pattern: /^\/api\/v1\/logStreams\?limit=\d+$/, file: "core_data/log_streams.json", skipped: [], category: "monitoring", nullCounters: ["active_log_streams"] },
+  { name: "system logs", pattern: /^\/api\/v1\/logs\?/, file: "core_data/system_logs_recent.json", skipped: [], category: "monitoring", nullCounters: ["system_log_events"], probe: "logs" },
+  { name: "behaviors", pattern: /^\/api\/v1\/behaviors\?limit=\d+$/, file: "core_data/behaviors.json", skipped: [], category: "monitoring", nullCounters: ["behaviors"] },
+  { name: "ThreatInsight", pattern: /^\/api\/v1\/threats\/configuration$/, file: "core_data/threat_insight.json", skipped: [], category: "monitoring", nullCounters: [], nullLabels: ["threat_insight_mode"] },
+  { name: "API tokens", pattern: /^\/api\/v1\/api-tokens$/, file: "core_data/api_tokens.json", skipped: [], category: "monitoring", nullCounters: ["api_tokens", "stale_api_tokens", "undated_api_tokens", "unrestricted_api_tokens", "expired_api_tokens"], probe: "api_tokens" },
+  { name: "device assurance", pattern: /^\/api\/v1\/device-assurances\?limit=\d+$/, file: "core_data/device_assurance.json", skipped: [], category: "monitoring", nullCounters: ["device_assurance_policies"] },
+  { name: "org contacts", pattern: /^\/api\/v1\/org\/contacts$/, file: "core_data/org_contacts.json", skipped: [], category: "monitoring", nullCounters: ["org_contacts_resolved"] },
+];
+
+/** Per-parent child requests: denying one leaves the parent collected and the child recorded under its parent id as a marker, never as an empty list. */
+const OKTA_CHILD_LOOKUPS = [
+  { name: "sign-on rules for signon-1", pattern: /^\/api\/v1\/policies\/signon-1\/rules\?limit=\d+$/, file: "core_data/sign_on_policy_rules.json", key: "signon-1", shape: "map" },
+  { name: "roles for user-1", pattern: /^\/api\/v1\/users\/user-1\/roles\?limit=\d+$/, file: "core_data/user_roles.json", key: "user-1", shape: "map" },
+  { name: "factors for user-1", pattern: /^\/api\/v1\/users\/user-1\/factors$/, file: "core_data/privileged_user_factors.json", key: "user-1", shape: "map" },
+  { name: "roles for group-1", pattern: /^\/api\/v1\/groups\/group-1\/roles\?limit=\d+$/, file: "core_data/privileged_group_roles.json", key: "group-1", shape: "map" },
+  { name: "members of group-1", pattern: /^\/api\/v1\/groups\/group-1\/users\?limit=\d+$/, file: "core_data/privileged_group_members.json", key: "group-1", shape: "map" },
+  { name: "technical contact assignment", pattern: /^\/api\/v1\/org\/contacts\/TECHNICAL$/, file: "core_data/org_contacts.json", key: "TECHNICAL", shape: "list" },
+];
+
+const OKTA_MENTIONED_STATUS_PATTERNS = [
+  /\((\d{3}) [A-Z]/g,
+  /\breturned (\d{3})\b/g,
+  /"(?:status|httpStatus)":\s*(\d{3})\b/g,
+];
+const OKTA_MENTIONED_ENDPOINT_PATTERN = /\/api\/v1\/[A-Za-z0-9_\-./]+(?:\?[A-Za-z0-9_=&%\-.:+]*)?/g;
+
+/**
+ * Every 4xx or 5xx status code and every Management API path named anywhere
+ * in the outputs must belong to a request the fixture actually served: a code
+ * or endpoint that never appears in the request log is a claim the run did
+ * not observe.
+ */
+function assertOktaOutputsNameOnlyObservedRequests(outputs, requests, label) {
+  const observedStatuses = new Set(requests.map((request) => request.status));
+  const observedPaths = new Set(requests.map((request) => request.path));
+  const mentions = { statuses: 0, endpoints: 0 };
+  for (const [name, text] of outputs) {
+    for (const pattern of OKTA_MENTIONED_STATUS_PATTERNS) {
+      for (const match of text.matchAll(pattern)) {
+        const status = Number(match[1]);
+        if (status < 400 || status > 599) continue;
+        mentions.statuses += 1;
+        assert.ok(observedStatuses.has(status), `${label} ${name}: mentions status ${status} but the run observed only ${[...observedStatuses].join(", ")} (in: ${match[0]})`);
+      }
+    }
+    for (const match of text.matchAll(OKTA_MENTIONED_ENDPOINT_PATTERN)) {
+      const mention = match[0].replace(/[.,;:)]+$/, "");
+      mentions.endpoints += 1;
+      assert.ok(observedPaths.has(mention), `${label} ${name}: names endpoint ${mention} but the run requested only ${[...observedPaths].join(", ")}`);
+    }
+  }
+  return mentions;
+}
+
+function oktaOutputs(access, results, exported) {
+  return new Map([
+    ["check_access", JSON.stringify(access)],
+    ...Object.entries(results).map(([category, result]) => [`assess ${category}`, JSON.stringify(result)]),
+    ...[...readBundleFiles(exported.outputDir)].map(([name, content]) => [`bundle ${name}`, content]),
+  ]);
+}
+
+function assertOktaNotCollectedMarker(entry, label, expected) {
+  assert.ok(entry && typeof entry === "object" && !Array.isArray(entry), `${label}: a dataset that was not collected is never written as an array or scalar, got ${JSON.stringify(entry)}`);
+  assert.equal(entry.collected, false, `${label}: carries collected: false`);
+  assert.equal(entry.status, expected.status, `${label}: status is the observed HTTP status or null`);
+  if (expected.endpoint) assert.match(entry.endpoint, expected.endpoint, `${label}: names the endpoint whose request failed, got ${entry.endpoint}`);
+  else assert.equal(entry.endpoint, null, `${label}: names no endpoint when no request was issued`);
+  assert.match(entry.error, expected.error, `${label}: carries the recorded error`);
+}
+
+async function runRecordedOkta(denied, outputRoot) {
+  const { fetchImpl, requests } = recordingOktaFetch({ denied });
+  const client = new OktaAuditorClient(RECORDING_CONFIG, { fetchImpl });
+  const access = await runOktaAccessCheck(client, RECORDING_CONFIG);
+  const results = await runAllAssessments(client, RECORDING_CONFIG);
+  const exported = await exportOktaAuditBundle(client, RECORDING_CONFIG, outputRoot);
+  const files = readBundleFiles(exported.outputDir);
+  const collectionStatus = JSON.parse(files.get("core_data/collection_status.json"));
+  return { requests, access, results, exported, files, collectionStatus, statusOf: (file) => collectionStatus.datasets.find((entry) => entry.file === file) };
+}
+
+test("collection status: a fully readable org records every dataset as collected, keeps readable-but-empty lists as [], and names only requested endpoints", async () => {
+  const run = await runRecordedOkta([], createTempBase("grclanker-okta-collected-"));
+
+  assert.deepEqual(run.collectionStatus.not_collected, []);
+  assert.deepEqual(run.collectionStatus.truncated, []);
+  assert.equal(run.collectionStatus.datasets.length, 33);
+  for (const entry of run.collectionStatus.datasets) {
+    assert.equal(entry.collected, true, entry.file);
+    assert.equal(entry.complete, true, entry.file);
+    assert.equal(entry.error, null, entry.file);
+    assert.equal(entry.status, null, entry.file);
+    assert.equal(entry.endpoint, null, entry.file);
+    if (entry.shape === "object") {
+      assert.equal(entry.count, null, `${entry.file}: a single object has no item count`);
+      assert.equal(entry.truncated, null, `${entry.file}: a single object is never paginated`);
+    } else {
+      assert.equal(typeof entry.count, "number", entry.file);
+      assert.equal(entry.truncated, false, entry.file);
+    }
+  }
+  assert.deepEqual(JSON.parse(run.files.get("core_data/authorization_servers.json")), [], "a readable list with no records stays []");
+  assert.deepEqual(JSON.parse(run.files.get("core_data/org_factors.json")), []);
+  assert.equal(run.statusOf("core_data/authorization_servers.json").count, 0);
+  assert.equal(run.statusOf("core_data/user_roles.json").count, 1, "a per-parent map counts the parents read");
+  assert.equal(JSON.parse(run.files.get("core_data/default_authorization_server.json")), null, "an absent (404) single object is written as null, not as a denial");
+  assert.equal(run.exported.errorCount, 0);
+  assert.ok(run.access.probes.every((probe) => probe.status === "ok" && probe.httpStatus === null), "readable probes carry no HTTP status");
+  for (const result of Object.values(run.results)) {
+    assert.equal(result.snapshotSummary.datasets_not_collected, 0, result.category);
+    assert.equal(result.snapshotSummary.dataset_errors, 0, result.category);
+    assert.ok(Object.values(result.snapshotSummary).every((value) => value !== null), `${result.category}: every counter is real when every dataset was collected`);
+  }
+  assertOktaOutputsNameOnlyObservedRequests(oktaOutputs(run.access, run.results, run.exported), run.requests, "all readable");
+});
+
+test("collection status: a denied dataset is written to core_data as a not-collected marker, never-requested per-parent files carry a not-requested marker, its counters render null, and every status code and endpoint named in any output was actually observed", async () => {
+  const base = createTempBase("grclanker-okta-denied-markers-");
+
+  for (const dataset of OKTA_DATASETS) {
+    const run = await runRecordedOkta([dataset.pattern], join(base, dataset.name.replace(/[^a-z0-9]+/gi, "-")));
+    const label = `${dataset.name} denied`;
+
+    const snapshot = JSON.parse(run.files.get(dataset.file));
+    assertOktaNotCollectedMarker(snapshot, `${label} ${dataset.file}`, { status: 403, endpoint: dataset.pattern, error: /^Okta API request failed for \/api\/v1\/.* \(403 Forbidden\): You do not have permission/ });
+    assert.ok(run.requests.some((request) => dataset.pattern.test(request.path) && request.status === 403), `${label}: the denied request was actually issued`);
+
+    const status = run.statusOf(dataset.file);
+    assert.equal(status.collected, false, label);
+    for (const flag of ["complete", "count", "truncated", "truncation_note"]) {
+      assert.equal(status[flag], null, `${label}: collection_status ${flag} is null, not a default`);
+    }
+    assert.equal(status.status, 403, label);
+    assert.match(status.endpoint, dataset.pattern, label);
+    assert.match(status.error, /403 Forbidden/, label);
+    assert.ok(run.collectionStatus.not_collected.includes(dataset.file), label);
+
+    for (const skippedFile of dataset.skipped) {
+      const skipped = JSON.parse(run.files.get(skippedFile));
+      assertOktaNotCollectedMarker(skipped, `${label} never-requested ${skippedFile}`, { status: null, endpoint: null, error: /^Not requested: no [a-z -]+ were requested because the parent list was not collected \(Okta API request failed for \/api\/v1\/.* \(403 Forbidden\)/ });
+      const skippedStatus = run.statusOf(skippedFile);
+      assert.equal(skippedStatus.collected, false, `${label}: ${skippedFile}`);
+      assert.equal(skippedStatus.count, null, `${label}: ${skippedFile}`);
+      assert.equal(skippedStatus.status, null, `${label}: ${skippedFile} invents no HTTP status`);
+      assert.equal(skippedStatus.endpoint, null, `${label}: ${skippedFile} invents no endpoint`);
+      assert.ok(run.collectionStatus.not_collected.includes(skippedFile), label);
+    }
+    assert.equal(run.collectionStatus.not_collected.length, 1 + dataset.skipped.length, `${label}: only the denied dataset and the files it gates are not collected`);
+
+    const emptyFile = dataset.file === "core_data/authorization_servers.json" ? "core_data/org_factors.json" : "core_data/authorization_servers.json";
+    assert.deepEqual(JSON.parse(run.files.get(emptyFile)), [], `${label}: a readable list with no records stays []`);
+    assert.equal(run.statusOf(emptyFile).collected, true, label);
+    assert.equal(run.statusOf(emptyFile).count, 0, label);
+
+    const summary = run.results[dataset.category].snapshotSummary;
+    assert.ok(summary.datasets_not_collected >= 1, `${label}: ${dataset.category} counts the dataset as not collected`);
+    for (const counter of dataset.nullCounters) {
+      assert.equal(summary[counter], null, `${label}: ${dataset.category} snapshot ${counter} renders null, not 0`);
+    }
+    for (const key of dataset.nullLabels ?? []) {
+      assert.equal(summary[key], "not collected", `${label}: ${dataset.category} snapshot ${key}`);
+    }
+    assert.match(run.results[dataset.category].text, /not collected/, `${label}: the assessment text says so`);
+
+    if (dataset.probe) {
+      const probe = run.access.probes.find((item) => item.key === dataset.probe);
+      assert.equal(probe.status, "forbidden", label);
+      assert.equal(probe.httpStatus, 403, `${label}: the probe carries the observed HTTP status`);
+      assert.match(probe.path, dataset.pattern, label);
+      assert.match(probe.detail, /\(403 Forbidden\)/, label);
+      assert.ok(run.access.probes.filter((item) => item.key !== dataset.probe).every((item) => item.httpStatus === null), `${label}: readable probes carry no HTTP status`);
+    }
+
+    assert.match(run.files.get("_errors.log"), /\(403 Forbidden\)/, label);
+    const mentions = assertOktaOutputsNameOnlyObservedRequests(oktaOutputs(run.access, run.results, run.exported), run.requests, label);
+    assert.ok(mentions.statuses > 0 && mentions.endpoints > 0, `${label}: the outputs name the failed status and endpoint (found ${mentions.statuses} statuses, ${mentions.endpoints} endpoints)`);
+  }
+});
+
+test("collection status: a denied child lookup keeps the parent collected and records the child as a marker under its id, never as an empty list", async () => {
+  const base = createTempBase("grclanker-okta-denied-children-");
+
+  for (const lookup of OKTA_CHILD_LOOKUPS) {
+    const run = await runRecordedOkta([lookup.pattern], join(base, lookup.key.toLowerCase()));
+    const label = `${lookup.name} denied`;
+    const snapshot = JSON.parse(run.files.get(lookup.file));
+    const marker = lookup.shape === "map" ? snapshot[lookup.key] : snapshot.find((entry) => entry.id === lookup.key);
+    assertOktaNotCollectedMarker(marker, `${label} ${lookup.file}[${lookup.key}]`, { status: 403, endpoint: lookup.pattern, error: /\(403 Forbidden\)/ });
+    if (lookup.shape === "map") {
+      assert.equal(Object.keys(snapshot).length, 1, `${label}: the only parent's child list is the marker, not []`);
+    } else {
+      assert.ok(snapshot.some((entry) => entry.contactType === "BILLING" && entry.userId === "user-9"), `${label}: the readable sibling is still written`);
+    }
+
+    const status = run.statusOf(lookup.file);
+    assert.equal(status.collected, true, `${label}: the parent walk ran`);
+    assert.equal(status.complete, false, `${label}: a denied child makes the dataset incomplete`);
+    assert.match(status.error, /403 Forbidden/, label);
+    assert.equal(status.status, null, `${label}: the dataset's own request did not fail`);
+    assert.deepEqual(run.collectionStatus.not_collected, [], label);
+    const mentions = assertOktaOutputsNameOnlyObservedRequests(oktaOutputs(run.access, run.results, run.exported), run.requests, label);
+    assert.ok(mentions.statuses > 0 && mentions.endpoints > 0, `${label}: the outputs name the failed status and endpoint`);
+  }
+
+  const groupRoles = await runRecordedOkta([OKTA_CHILD_LOOKUPS[3].pattern], join(base, "group-roles-evidence"));
+  const hygiene = findingById(groupRoles.results.admin, "OKTA-ADMIN-003");
+  assert.equal(hygiene.status, "Partial");
+  assert.ok(hygiene.evidence.some((line) => /^Admin Team: roles=unread, members=1$/.test(line)), `a denied child reads as unread, not 0: ${hygiene.evidence.join(" | ")}`);
+  assert.deepEqual(Object.keys((await collectOktaAdminAccessData(new OktaAuditorClient(RECORDING_CONFIG, { fetchImpl: recordingOktaFetch({ denied: [OKTA_CHILD_LOOKUPS[3].pattern] }).fetchImpl }))).privilegedGroupRoles.data), [], "the in-memory map omits the denied child instead of holding []");
+
+  const contact = findingById((await runRecordedOkta([OKTA_CHILD_LOOKUPS[5].pattern], join(base, "contact-evidence"))).results.monitoring, "OKTA-MON-008");
+  assert.equal(contact.status, "Partial");
+  assert.match(contact.summary, /technical contact lookup failed/);
+});
