@@ -66,6 +66,12 @@ export const MUST_KEEP = [
   "Unable to read config file /tmp/grclanker-loader-Ab3dEf/nested-mapping.yaml (EISDIR)",
   "Unable to parse config file: invalid JSON in /tmp/grclanker-loader-x9Q2zR/credentials.json at line 3",
   "Metadata read of SecurityHealthCheckRisks and TwoFactorMethodsInfo failed",
+  // A credential word in a hyphenated name (access-token) or a lowercase scheme word before a lowercase word is prose, not a carrier.
+  "Auth mode access-token against https://login.salesforce.com, instance https://acme.my.salesforce.com, API v64.0.",
+  // camelCase identifiers may carry short acronyms and version suffixes.
+  "CSRF flags enableCSRFOnGet and enableCSRFOnPost were not exposed by SecuritySettings; connectedAppOAuth and sessionTimeoutSAML were read",
+  "None of the enabled prevention policies expose ScriptBasedExecutionMonitoring, InterpreterProtection, EngineProtectionV2",
+  "OAuth token usage was not checked because the OauthToken read was forbidden; the bearer token was refreshed",
 ];
 
 /**

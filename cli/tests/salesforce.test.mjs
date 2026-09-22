@@ -21,6 +21,7 @@ import {
   collectProfileMetadata,
   decodeJwtClaims,
   exportSalesforceAuditBundle,
+  isSalesforceRecordId,
   parseSimpleXml,
   projectMyDomainSettings,
   projectProfileMetadata,
@@ -32,6 +33,7 @@ import {
 import { getRegisteredToolSummaries } from "../dist/pi/tool-catalog.js";
 import { assertSecretFragmentsAbsent, readBundleFiles, readZipEntries } from "./helpers/bundle-contents.mjs";
 import { CONFIG_CANARIES, assertConfigLoaderMatrix, configLoaderCases } from "./helpers/config-loader-matrix.mjs";
+import { assertFixedTextsSurvive, collectFixedTexts, logLines } from "./helpers/fixed-text-survival.mjs";
 import { assertFragmentsAbsent, assertPlantedValuesWellFormed } from "./helpers/planted-values.mjs";
 import { assertScrubBoundary } from "./helpers/scrub-boundary-matrix.mjs";
 
@@ -1314,7 +1316,7 @@ test("exportSalesforceAuditBundle writes core_data, analysis, compliance reports
   const findings = JSON.parse(readFileSync(join(result.outputDir, "analysis", "findings.json"), "utf8"));
   assert.equal(findings.length, 20);
   assert.equal(findings.find((item) => item.id === "SF-16").status, "manual");
-  assert.match(readFileSync(join(result.outputDir, "_errors.log"), "utf8"), /TenantSecret: forbidden/);
+  assert.match(readFileSync(join(result.outputDir, "_errors.log"), "utf8"), /TenantSecret read: forbidden/);
   const bundleText = JSON.stringify(readdirSync(result.outputDir, { recursive: true }));
   assertFragmentsAbsent(assert, readFileSync(join(result.outputDir, "metadata.json"), "utf8"), [SAMPLE_ACCESS_TOKEN], "metadata.json");
   assert.ok(bundleText.length > 0);
@@ -1551,7 +1553,7 @@ test("rule 1 corollary: multi-inventory findings never pass when a secondary inv
       assert.notEqual(item.status, "pass", `${id} must not pass when ${name} is forbidden (baseline ${baseline.status}): ${item.summary}`);
       assert.ok(item.summary.includes(`the ${name} query was forbidden`), `${id} summary must name ${name}: ${item.summary}`);
       assert.ok(item.manualEvidence, `${id} must tell a human what to collect when ${name} is forbidden`);
-      assert.ok(result.errors.some((error) => error.startsWith(`${name}: forbidden`)), `${id} errors must disclose ${name}`);
+      assert.ok(result.errors.some((error) => error.startsWith(`${name} read: forbidden`)), `${id} errors must disclose ${name}`);
       checked.push(`${id}/${name}`);
     }
   }
@@ -1699,8 +1701,8 @@ test("review round item 9: denied Salesforce datasets are written as not-collect
   for (const key of ["users", "users_total", "active_users", "users_truncated"]) assert.equal(identity.summary[key], null, `identity summary ${key} renders null under the User denial`);
   assert.equal(identity.summary.profiles, goodProfiles.length, "a readable dataset keeps its count");
   assert.equal(identity.summary.sensitive_profiles_read, null);
-  assert.match(identity.summary.inventories.User, /^User: unread \(forbidden: /);
-  assert.match(identity.summary.inventories.Profile, /^Profile: complete \(\d+ rows\)$/);
+  assert.match(identity.summary.inventories.User, /^User read: unread \(forbidden: /);
+  assert.match(identity.summary.inventories.Profile, /^Profile read: complete \(\d+ rows\)$/);
   for (const id of ["SF-04", "SF-07", "SF-09", "SF-10", "SF-13"]) {
     const item = identity.findings.find((finding) => finding.id === id);
     assert.equal(item.status, "manual", `${id} is manual under the User denial`);
@@ -1782,6 +1784,10 @@ function sfCanaryFetch(failing) {
   const fail = (surface) => {
     if (failing.surface !== surface) return undefined;
     if (failing.flavor === "html") return new Response(sfCanaryHtml(), { status: 502, statusText: "Bad Gateway", headers: { "content-type": "text/html; charset=utf-8" } });
+    // Credential-free failure flavors for the fixed-text harvest: a plain proxy page, an unrecognized JSON shape, a documented error.
+    if (failing.flavor === "plainHtml") return new Response("<html><head><title>502 Bad Gateway</title></head><body>upstream unavailable</body></html>", { status: 502, statusText: "Bad Gateway", headers: { "content-type": "text/html; charset=utf-8" } });
+    if (failing.flavor === "opaqueJson") return jsonResponse({ unexpected: { shape: true } }, { status: 403 });
+    if (failing.flavor === "plainJson") return jsonResponse([{ errorCode: "INSUFFICIENT_ACCESS", message: "insufficient access rights on object id" }], { status: 403 });
     return jsonResponse([{ errorCode: "SERVER_ERROR", message: `Upstream failed; retry at ${SF_CANARY_URL} with Bearer ${SF_CANARY.bearer} (sid=${SF_CANARY.cookie})` }], { status: 403 });
   };
   const soapResult = (operation, records) => xmlResponse(`${SOAP_ENVELOPE_OPEN}<${operation}Response><result>${records}</result></${operation}Response>${SOAP_ENVELOPE_CLOSE}`);
@@ -1889,7 +1895,115 @@ test("planted values self-check: every canary and planted secret is alphanumeric
   ]);
 });
 
-test("scrub boundary: bare name-shaped values stay, carriers and registered secrets (in every encoded form) and real token shapes go, in SalesforceApiError's message and errorCode", () => {
+/** Every SOQL object and metadata type the Salesforce collectors read, as the summaries name them. */
+const SALESFORCE_DATASETS = [
+  "Organization", "SecurityHealthCheck", "SecurityHealthCheckRisks", "User", "Profile", "PermissionSet", "PermissionSetAssignment",
+  "TwoFactorMethodsInfo", "FieldPermissions", "TenantSecret", "Certificate", "ConnectedApplication", "OauthToken", "UserPermissionAccess",
+  "LoginHistory", "SetupAuditTrail", "EventLogFile", "SecuritySettings", "MyDomainSettings", "ProfileMetadata",
+];
+
+const SF_SAMPLE_DENIAL = "Salesforce request /services/data/v64.0/query failed (403) INSUFFICIENT_ACCESS: insufficient access rights on object id";
+
+/**
+ * The standing fixed texts Salesforce emits, rendered with sample paths and names: the credentials loader
+ * read and parse messages, the non-JSON, non-SOAP, and opaque-body notes, the timeout, the `read:` dataset
+ * states, the `not requested:` and withheld wordings, the access-check notes, and the corollary summary
+ * templates. Each must come back from SalesforceApiError's pass unchanged.
+ */
+const SALESFORCE_FIXED_TEXTS = [
+  "Unable to read Salesforce credentials file /home/svc/.salesforce/credentials.json (ENOENT)",
+  "Unable to read Salesforce credentials file /tmp/grclanker-salesforce-loader-Ab3dEf/directory.json (EISDIR)",
+  "Unable to read Salesforce credentials file /tmp/grclanker-salesforce-loader-Ab3dEf/locked.json (EACCES)",
+  "Unable to parse Salesforce credentials file: invalid JSON in /tmp/grclanker-salesforce-loader-Ab3dEf/short.json",
+  "Unable to parse Salesforce credentials file: invalid JSON in /tmp/grclanker-salesforce-loader-Ab3dEf/trailing-comma.json at line 3",
+  "Unable to parse Salesforce credentials file: /home/svc/.salesforce/credentials.json must contain a JSON object",
+  "Unable to read Salesforce private key file /home/svc/.salesforce/server.key (ENOENT)",
+  "Salesforce request /services/data/v64.0/query failed (502): non-JSON body (text/html, 5120 bytes)",
+  "Salesforce request /services/data/v64.0/sobjects/User/describe failed (403): JSON body without a recognized error field (application/json, 27 bytes)",
+  "Salesforce request /services/data/v64.0/limits returned a non-JSON body (text/html, 5120 bytes) with status 200",
+  "Salesforce token request failed (502): non-JSON body (text/html, 5120 bytes)",
+  "Salesforce token request failed (400) invalid_grant: authentication failure",
+  "Salesforce Metadata API readMetadata(SecuritySettings) failed (502): non-SOAP body (text/html, 5120 bytes)",
+  "Salesforce Metadata API listMetadata(Profile) failed (403): SOAP body without a fault string (text/xml, 210 bytes)",
+  "Salesforce Metadata API readMetadata(Profile) failed (500) INSUFFICIENT_ACCESS: insufficient access rights",
+  "Salesforce request to /services/data/v64.0/query timed out after 30000 ms",
+  SF_SAMPLE_DENIAL,
+  `User read: unread (forbidden: ${SF_SAMPLE_DENIAL})`,
+  `TenantSecret read: unread (forbidden: ${SF_SAMPLE_DENIAL})`,
+  `TenantSecret read: forbidden (${SF_SAMPLE_DENIAL})`,
+  "OauthToken read: partial (2000 of an unknown total of rows)",
+  "SetupAuditTrail read: partial (2000 of 48213 rows)",
+  "Profile read: complete (12 rows)",
+  "Organization read: complete (1 row)",
+  "ProfileMetadata read: error (not requested: the Profile list was not readable (forbidden), so there were no sensitive profiles to read)",
+  "not requested: the Profile list was not readable (forbidden), so there were no sensitive profiles to read",
+  "the User query was forbidden (401/403 or INSUFFICIENT_ACCESS)",
+  "the EventLogFile object or field is unavailable in this org (INVALID_TYPE)",
+  "the SetupAuditTrail query failed (unknown error)",
+  "Only 3 of 4000 User records were read, so the verdict is downgraded.",
+  "MFA is required for direct UI logins, but per-user enrollment could not be verified because the TwoFactorMethodsInfo query was forbidden (401/403 or INSUFFICIENT_ACCESS); TwoFactorMethodsInfo requires the Manage MFA in API permission.",
+  "MFA enforcement could not be verified because the SecuritySettings query was forbidden (401/403 or INSUFFICIENT_ACCESS) and Health Check exposed no MFA setting.",
+  "Health Check score is 95, but the per-setting risk list could not be read because the SecurityHealthCheckRisks query was forbidden (401/403 or INSUFFICIENT_ACCESS).",
+  "12 permission sets grant elevated permissions, but assignments could not be read because the PermissionSetAssignment query was forbidden (401/403 or INSUFFICIENT_ACCESS).",
+  "the OauthToken query was forbidden (401/403 or INSUFFICIENT_ACCESS), so assignment coverage of the permission sets that were read was not checked and the verdict is capped at warn.",
+  "OAuth token usage was not checked because the OauthToken query was forbidden (401/403 or INSUFFICIENT_ACCESS); review Setup > Connected Apps OAuth Usage manually.",
+  "ConnectedApplication returned zero apps; apps without org-managed policies do not appear here, so OAuth usage must be reviewed manually.",
+  "Only 50 of 4000 TwoFactorMethodsInfo records were read; users without a registered method are not named from a partial read",
+  "Caller permissions could not be read from UserPermissionAccess (forbidden); OauthToken visibility (Customize Application) and user visibility (View All Users) are unknown.",
+  "Auth mode access-token against https://login.salesforce.com, instance https://acme.my.salesforce.com, API v64.0.",
+  "Auth mode jwt-bearer against https://test.salesforce.com, instance https://acme--uat.sandbox.my.salesforce.com, API v64.0.",
+  "Org Acme Production (Enterprise Edition, sandbox=false).",
+  "Organization record was not readable.",
+  "16/17 Salesforce audit surfaces are readable.",
+  "Likely missing permissions: View All Users (Manage Users read); Manage MFA in API; Customize Application (without it only the caller's own tokens are returned).",
+  "Grant the auditing user View Setup and Configuration, View Health Check, API Enabled, View All Users, Customize Application, Manage MFA in API, and Modify Metadata Through Metadata API Functions, then re-run salesforce_check_access.",
+];
+
+/** Addendum 7 must-keep table for Salesforce: paths and datasets, tenants, principals, finding ids, and the standing fixed texts. */
+function salesforceKeepTable(findingIds) {
+  return {
+    paths: [
+      "/services/oauth2/token",
+      "/services/data/v64.0/limits",
+      "/services/data/v64.0/query",
+      "/services/data/v64.0/tooling/query",
+      "/services/data/v64.0/sobjects/User/describe",
+      "/services/data/v64.0/sobjects/TenantSecret/describe",
+      "/services/Soap/m/64.0",
+      "/services/data/v64.0/query (Organization)",
+      "/services/Soap/m/64.0 readMetadata(SecuritySettings)",
+      "/services/Soap/m/64.0 listMetadata(Profile) + readMetadata(Profile)",
+    ],
+    tables: SALESFORCE_DATASETS,
+    tenants: [
+      "acme.my.salesforce.com",
+      "https://acme.my.salesforce.com",
+      "acme--uat.sandbox.my.salesforce.com",
+      "https://login.salesforce.com",
+      "https://test.salesforce.com",
+      "00D5f000001AbCdEAK",
+      "Acme_Production_Org",
+      "prod-us-east-2026",
+    ],
+    principals: [
+      "bob.user@acme.example",
+      "admin@acme.example",
+      "auditor@acme.example.uat",
+      "svc-integration-2026@acme.example",
+      "System Administrator",
+      "Standard User",
+      "Modify_All_Data_Ops",
+      // 18-character record Ids with valid case checksums (user 005, permission set 0PS).
+      "0055f000009XyZwAAK",
+      "0PS5f000000LmNoGAK",
+      "005A0000001kbNzIAI",
+    ],
+    findingIds,
+    fixedTexts: SALESFORCE_FIXED_TEXTS,
+  };
+}
+
+test("scrub boundary: bare name-shaped values stay, carriers and registered secrets (in every encoded form) and real token shapes go, in SalesforceApiError's message and errorCode; the addendum 7 must-keep table survives in isolation and in sentences", async () => {
   const fetchImpl = async () => jsonResponse({});
   const mustKeep = [
     "Salesforce request failed (502 Bad Gateway) for /services/data/v64.0/query: non-JSON body (text/html, 5120 bytes)",
@@ -1898,11 +2012,141 @@ test("scrub boundary: bare name-shaped values stay, carriers and registered secr
     "Unable to parse Salesforce credentials file: invalid JSON in /tmp/grclanker-salesforce-loader-Ab3dEf/short.json",
     "Metadata read of SecurityHealthCheckRisks, TwoFactorMethodsInfo, and SetupAuditTrail failed for Acme_Production_Org",
   ];
+  const healthy = createFullMockClient();
+  const findingIds = [];
+  for (const assess of [assessSalesforcePlatformSecurity, assessSalesforceIdentityAccess, assessSalesforceDataProtection, assessSalesforceMonitoringIntegrations]) {
+    findingIds.push(...(await assess(healthy, { now: NOW })).findings.map((item) => item.id));
+  }
+  const keepTable = salesforceKeepTable([...new Set(findingIds)]);
+  assert.equal(keepTable.findingIds.length, 20, "every Salesforce finding id is in the table");
+  assert.ok(keepTable.findingIds.includes("SF-11"));
   // The client constructor is the registration path (rememberSecrets on the configured password); the error constructor is the pass.
   assertScrubBoundary({
     scrub: (text) => new SalesforceApiError(text).message,
     registerSecret: (secret) => new SalesforceApiClient(sampleConfig({ password: secret }), { fetchImpl }),
     mustKeep,
+    keepTable,
   });
-  assertScrubBoundary({ scrub: (text) => new SalesforceApiError("request failed", { status: 502, errorCode: text }).errorCode, mustKeep });
+  assertScrubBoundary({ scrub: (text) => new SalesforceApiError("request failed", { status: 502, errorCode: text }).errorCode, mustKeep, keepTable });
+
+  // A Salesforce Id stays bare only with a valid checksum; the same eighteen characters with a wrong suffix, or a
+  // valid Id inside a carrier or registered as a secret, still go.
+  const scrub = (text) => new SalesforceApiError(text).message;
+  assert.equal(isSalesforceRecordId("0055f000009XyZwAAK"), true);
+  assert.equal(isSalesforceRecordId("0055f000009XyZwAAO"), false);
+  assert.equal(isSalesforceRecordId("001A0000006Vm9rIAC"), true, "the documented 15-to-18 example");
+  assert.equal(scrub("insufficient access rights on cross-reference id: 0055f000009XyZwAAK"), "insufficient access rights on cross-reference id: 0055f000009XyZwAAK");
+  assert.equal(scrub("insufficient access rights on cross-reference id: 0055f000009XyZwAAO"), "insufficient access rights on cross-reference id: [REDACTED]");
+  assert.equal(scrub("Authorization: Bearer 0055f000009XyZwAAK"), "Authorization: [REDACTED]");
+  assert.equal(scrub("https://api.example.com/v1/x?sid=0055f000009XyZwAAK"), "https://api.example.com/v1/x?[REDACTED]");
+  assert.equal(scrub("profile 00e5f000001MnopAAC was read"), "profile 00e5f000001MnopAAC was read");
+  new SalesforceApiClient(sampleConfig({ password: "00e5f000001MnopAAC" }), { fetchImpl });
+  assert.equal(scrub("profile 00e5f000001MnopAAC was read"), "profile [REDACTED] was read", "a registered secret goes whatever its shape");
+});
+
+test("round 7 note 1: every fixed-text message Salesforce emits (loader, opaque body, timeout, read: states, not requested, withheld, access-check notes, corollary summaries) comes back from SalesforceApiError's pass unchanged", async () => {
+  const texts = new Set(SALESFORCE_FIXED_TEXTS);
+  const scrub = (text) => new SalesforceApiError(text).message;
+
+  // The loader's own read and parse messages on real failing files, plus the shape and private key guards.
+  for (const item of configLoaderCases({ format: "json", displayName: "Salesforce", fileNoun: "credentials file", extension: ".json" })) {
+    if (item.skip) continue;
+    assert.throws(() => resolveSalesforceConfiguration({ credentials_file: item.path }, {}), (error) => {
+      texts.add(error.message);
+      return true;
+    });
+  }
+  const scratch = createTempBase("grclanker-sf-fixed-text-");
+  const arrayPath = join(scratch, "credentials.json");
+  writeFileSync(arrayPath, "[]\n");
+  assert.throws(() => resolveSalesforceConfiguration({ credentials_file: arrayPath }, {}), (error) => {
+    texts.add(error.message);
+    return true;
+  });
+  assert.throws(() => resolveSalesforceConfiguration({ grant_type: "jwt-bearer", consumer_key: "consumer-key", username: "user@acme.example", private_key_file: join(scratch, "missing.key") }, {}), (error) => {
+    texts.add(error.message);
+    return true;
+  });
+
+  // Every surface under three credential-free failure flavors (plain proxy page, unrecognized JSON shape, documented
+  // error): the access check, the four assessments, the analysis files, and the error log render the opaque-body
+  // notes, the read: states, the manual-review and demotion templates, and the access-check notes on real paths.
+  for (const surface of SF_CANARY_SURFACES) {
+    for (const flavor of ["plainHtml", "opaqueJson", "plainJson"]) {
+      const client = new SalesforceApiClient(sampleConfig({ authMode: "password", username: "auditor@acme.example", password: "file-password", securityToken: "file-token", consumerKey: "ck", consumerSecret: "file-secret" }), { fetchImpl: sfCanaryFetch({ surface, flavor }), sleep: async () => {}, now: () => NOW });
+      collectFixedTexts(await checkSalesforceAccess(client), texts);
+      for (const assess of [assessSalesforcePlatformSecurity, assessSalesforceIdentityAccess, assessSalesforceDataProtection, assessSalesforceMonitoringIntegrations]) {
+        collectFixedTexts(await assess(client, { now: NOW }), texts);
+      }
+      const exported = await exportSalesforceAuditBundle(client, client.getResolvedConfig(), createTempBase("grclanker-sf-fixed-text-bundle-"), { now: NOW });
+      const files = readBundleFiles(exported.outputDir);
+      for (const line of logLines(files.get("_errors.log"))) texts.add(line);
+      for (const [name, content] of files) {
+        if (name.startsWith("analysis/") && name.endsWith(".json")) collectFixedTexts(JSON.parse(content), texts);
+      }
+    }
+  }
+
+  // The fake clients: healthy, every read forbidden, and the timeout wording through the real error class.
+  for (const client of [createFullMockClient(), forbiddenClient()]) {
+    collectFixedTexts(await checkSalesforceAccess(client), texts);
+    for (const assess of [assessSalesforcePlatformSecurity, assessSalesforceIdentityAccess, assessSalesforceDataProtection, assessSalesforceMonitoringIntegrations]) {
+      collectFixedTexts(await assess(client, { now: NOW }), texts);
+    }
+  }
+  const timingOut = new SalesforceApiClient(sampleConfig({ timeoutMs: 1000, maxRetries: 0 }), {
+    fetchImpl: async (_input, init) => new Promise((_resolve, reject) => init?.signal?.addEventListener("abort", () => reject(new DOMException("aborted", "AbortError")))),
+    sleep: async () => {},
+    now: () => NOW,
+  });
+  await assert.rejects(timingOut.getLimits(), (error) => {
+    texts.add(error.message);
+    return true;
+  });
+
+  const checked = assertFixedTextsSurvive(scrub, texts, "Salesforce fixed texts");
+  assert.ok(checked >= SALESFORCE_FIXED_TEXTS.length + 40, `the harvest rendered texts beyond the standing list (${checked})`);
+  assert.ok([...texts].some((text) => / read: unread \(forbidden: /.test(text)), "the harvest rendered a forbidden read: state");
+  assert.ok([...texts].some((text) => /^not requested: /.test(text)), "the harvest rendered a not requested dataset error");
+  assert.ok([...texts].some((text) => /non-JSON body \(text\/html, \d+ bytes\)/.test(text)), "the harvest rendered a status-and-length note");
+  assert.ok([...texts].some((text) => /non-SOAP body \(/.test(text)), "the harvest rendered a non-SOAP body note");
+  assert.ok([...texts].some((text) => /timed out after \d+ ms/.test(text)), "the harvest rendered the timeout wording");
+  assert.ok([...texts].some((text) => /could not be verified because the /.test(text)), "the harvest rendered a manual-review template");
+});
+
+test("round 7 note 2: credentials and the credentials file path set through the environment survive an unrelated argument, and the source chain names the environment", () => {
+  const base = createTempBase("grclanker-sf-env-survives-");
+  const credentialsPath = join(base, "salesforce-credentials.json");
+  writeFileSync(credentialsPath, JSON.stringify({ grant_type: "password", username: "file@acme.example", password: "file-password", consumer_key: "file-key", consumer_secret: "file-secret", instance_url: "https://file.my.salesforce.com" }));
+  const env = {
+    SF_CREDENTIALS_FILE: credentialsPath,
+    SF_USERNAME: "env@acme.example",
+    SF_PASSWORD: "env-password-value",
+    SF_CONSUMER_KEY: "env-consumer-key",
+    SF_CONSUMER_SECRET: "env-consumer-secret",
+  };
+  for (const [label, unrelated] of [
+    ["api_version", { api_version: "v63.0" }],
+    ["timeout_seconds", { timeout_seconds: 9 }],
+    ["max_retries", { max_retries: 1 }],
+    ["sandbox", { sandbox: false }],
+  ]) {
+    const resolved = resolveSalesforceConfiguration(unrelated, env);
+    assert.equal(resolved.authMode, "password", label);
+    assert.equal(resolved.username, "env@acme.example", `${label}: the environment username resolves over the file`);
+    assert.equal(resolved.password, "env-password-value", `${label}: the environment password resolves over the file`);
+    assert.equal(resolved.consumerKey, "env-consumer-key", label);
+    assert.equal(resolved.consumerSecret, "env-consumer-secret", label);
+    assert.equal(resolved.instanceUrl, "https://file.my.salesforce.com", `${label}: the file value not set elsewhere still applies`);
+    for (const key of ["environment-SF_USERNAME", "environment-SF_PASSWORD", "environment-SF_CONSUMER_KEY", "environment-SF_CONSUMER_SECRET", "credentials-file:salesforce-credentials.json", "credentials-file-instance-url"]) {
+      assert.ok(resolved.sourceChain.includes(key), `${label}: the source chain names ${key}: ${JSON.stringify(resolved.sourceChain)}`);
+    }
+    assert.ok(!resolved.sourceChain.includes("arguments-username"), `${label}: the unrelated argument does not claim the username`);
+  }
+  // An argument object whose credential keys are present but undefined must not shadow the environment.
+  const shadowed = resolveSalesforceConfiguration({ username: undefined, password: undefined, api_version: "v63.0" }, env);
+  assert.equal(shadowed.username, "env@acme.example");
+  assert.equal(shadowed.password, "env-password-value");
+  assert.equal(shadowed.apiVersion, "63.0");
+  assert.ok(shadowed.sourceChain.includes("environment-SF_USERNAME"));
 });
