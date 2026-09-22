@@ -26,12 +26,16 @@ import { createDockerBackend } from "./docker.js";
 import { createHostBackend, createSandboxRuntimeBackend } from "./local.js";
 import { createModalBackend } from "./modal.js";
 import { createParallelsBackend } from "./parallels.js";
-import { createRunpodPodBackend, createRunpodServerlessBackend } from "./runpod.js";
+import { createRunpodPodBackend, createRunpodServerlessBackend, type LocalDirectoryRemover } from "./runpod.js";
 
 export type ExecutionBackendDependencies = {
   runner?: CommandRunner;
   syncRunner?: CommandRunnerSync;
   fetch?: FetchLike;
+  /** Removes local staging copies (runpod-pod); injected by tests, defaults to `fs.rmSync`. */
+  removeLocalDirectory?: LocalDirectoryRemover;
+  /** Receives non-fatal staging warnings (already scrubbed); defaults to a line on stderr. */
+  warn?: (message: string) => void;
 };
 
 const STUB_DETAILS: Record<Extract<ExecutionBackendKind, "cloudflare-sandbox" | "vercel-sandbox">, string> = {
@@ -130,6 +134,7 @@ export function createExecutionBackend(
         runner: deps.runner,
         syncRunner: deps.syncRunner,
         workspacePath: typeof settings.runpodWorkspacePath === "string" ? settings.runpodWorkspacePath : undefined,
+        removeLocalDirectory: deps.removeLocalDirectory,
       });
     case "runpod-serverless":
       return createRunpodServerlessBackend({

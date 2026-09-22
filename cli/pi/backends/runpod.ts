@@ -15,6 +15,7 @@ import {
   ExecutionBackendUnsupportedError,
   normalizeExitCode,
   readProviderBody,
+  redactErrorMessage,
   requireEnv,
   summarizeJsonBody,
   type CommandRunner,
@@ -82,7 +83,11 @@ export type RunpodPodOptions = {
   syncRunner?: CommandRunnerSync;
   workspacePath?: string;
   sshUser?: string;
+  /** Removes the private local staging copy after the upload; defaults to a recursive `fs.rmSync`. */
+  removeLocalDirectory?: LocalDirectoryRemover;
 };
+
+export type LocalDirectoryRemover = (path: string) => void;
 
 function authHeaders(apiKey: string): Record<string, string> {
   return {
@@ -459,9 +464,36 @@ export async function planPodWorkspaceStaging(localRoot: string, runner: Command
   return plan;
 }
 
+export function removeLocalDirectorySync(path: string): void {
+  rmSync(path, { recursive: true, force: true });
+}
+
+// Removes the private staging copy without ever throwing: a locked or unremovable temp directory
+// is a local remnant to report, never a reason to discard the outcome of the remote upload. The
+// returned text carries the path and the errno code only (config-loader style, no fs message).
+export function removeLocalStagingCopy(stageRoot: string, remove: LocalDirectoryRemover = removeLocalDirectorySync): string | undefined {
+  try {
+    remove(stageRoot);
+    return undefined;
+  } catch (error) {
+    const code = systemErrorCode(error);
+    return redactErrorMessage(`The local staging copy ${stageRoot} could not be removed${code ? ` (${code})` : ""}; delete it by hand.`);
+  }
+}
+
+// The remnant is appended to the failure that was already being reported, so the original error
+// keeps its type (an ExecutionBackendCleanupError still marks remote state) and its message.
+function appendLocalRemnant(error: unknown, remnant: string): unknown {
+  if (error instanceof Error) {
+    error.message = `${error.message}\n${remnant}`;
+    return error;
+  }
+  return new ExecutionBackendError(`${String(error)}\n${remnant}`);
+}
+
 // Copies the planned files into a private temp directory that scp then uploads with `-r`, so the
 // upload preserves the directory layout and file modes while containing nothing but the plan.
-export function materializePodStagingPlan(plan: PodStagingPlan): string {
+export function materializePodStagingPlan(plan: PodStagingPlan, remove: LocalDirectoryRemover = removeLocalDirectorySync): string {
   const stageRoot = mkdtempSync(join(tmpdir(), "grclanker-runpod-stage-"));
   try {
     for (const relativePath of plan.files) {
@@ -470,9 +502,10 @@ export function materializePodStagingPlan(plan: PodStagingPlan): string {
       copyFileSync(join(plan.localRoot, relativePath), destination);
     }
   } catch (error) {
-    rmSync(stageRoot, { recursive: true, force: true });
     const code = systemErrorCode(error);
-    throw new ExecutionBackendError(`Could not build the local staging copy of ${plan.localRoot}${code ? ` (${code})` : ""}.`);
+    const failure = new ExecutionBackendError(`Could not build the local staging copy of ${plan.localRoot}${code ? ` (${code})` : ""}.`);
+    const remnant = removeLocalStagingCopy(stageRoot, remove);
+    throw remnant ? appendLocalRemnant(failure, remnant) : failure;
   }
   return stageRoot;
 }
@@ -487,6 +520,7 @@ export function createRunpodPodBackend(options: RunpodPodOptions = {}): Executio
   const syncRunner = options.syncRunner ?? createProcessCommandRunnerSync();
   const workspacePath = options.workspacePath ?? DEFAULT_RUNPOD_WORKSPACE_PATH;
   const sshUser = options.sshUser ?? "root";
+  const removeLocalDirectory = options.removeLocalDirectory ?? removeLocalDirectorySync;
   const stagedSessions = new Set<string>();
   let cachedPod: RunpodPod | undefined;
 
@@ -508,6 +542,42 @@ export function createRunpodPodBackend(options: RunpodPodOptions = {}): Executio
 
   function podId(): string {
     return cachedPod?.id ?? process.env.RUNPOD_POD_ID ?? "(unknown)";
+  }
+
+  // Creates the session directory and uploads the staging copy into it. The session is tracked
+  // from the moment the directory exists; a failed copy removes it again (or, if that removal
+  // fails too, keeps the session tracked and names the remnant).
+  async function uploadStagingCopy(sessionId: string, stageRoot: string, remotePath: string, target: PodSshTarget): Promise<void> {
+    const prepare = await runner("ssh", buildPodSshArgs(target, `mkdir -p -- ${quoteForBash(remotePath)}`));
+    if (prepare.exitCode !== 0) {
+      throw new ExecutionBackendError(`Could not prepare ${remotePath} on the pod. ${prepare.stderr}`);
+    }
+    stagedSessions.add(sessionId);
+    const copy = await runner("scp", [
+      "-o",
+      "BatchMode=yes",
+      "-o",
+      "StrictHostKeyChecking=accept-new",
+      "-P",
+      String(target.port),
+      "-r",
+      `${stageRoot}/.`,
+      `${target.user}@${target.host}:${remotePath}`,
+    ]);
+    if (copy.exitCode === 0) return;
+    // The upload may be partial, so the directory is removed before the copy failure is reported.
+    // If the removal fails too, the session stays in stagedSessions so teardown retries it, and
+    // the error names the remnant instead of untracking it.
+    const cleanup = await removePodSessionDirectory(runner, target, remotePath);
+    if (!cleanup.removed) {
+      throw new ExecutionBackendCleanupError(
+        "runpod-pod",
+        describePodRemnant(podId(), target, remotePath),
+        `The workspace copy failed (scp exited ${copy.exitCode ?? "null"}${copy.stderr.trim() ? `: ${copy.stderr.trim()}` : ""}) and the partial upload could not be removed (${cleanup.detail}).`,
+      );
+    }
+    stagedSessions.delete(sessionId);
+    throw new ExecutionBackendError(`Could not copy the workspace to the pod. ${copy.stderr}`);
   }
 
   return {
@@ -533,46 +603,26 @@ export function createRunpodPodBackend(options: RunpodPodOptions = {}): Executio
       const localRoot = resolve(input.localPath);
       const plan = await planPodWorkspaceStaging(localRoot, runner);
       const target = await sshTarget();
-      const stageRoot = materializePodStagingPlan(plan);
+      const stageRoot = materializePodStagingPlan(plan, removeLocalDirectory);
+      // The upload outcome is settled first and the local copy is removed afterwards, outside any
+      // try/finally: a failure to delete the temp directory is reported as a remnant next to the
+      // real outcome and never replaces it, so the contract adapter still sees the staged session
+      // (and its remote state) exactly as the ssh and scp results left it.
+      let uploadError: unknown;
       try {
-        const prepare = await runner("ssh", buildPodSshArgs(target, `mkdir -p -- ${quoteForBash(remotePath)}`));
-        if (prepare.exitCode !== 0) {
-          throw new ExecutionBackendError(`Could not prepare ${remotePath} on the pod. ${prepare.stderr}`);
-        }
-        stagedSessions.add(input.sessionId);
-        const copy = await runner("scp", [
-          "-o",
-          "BatchMode=yes",
-          "-o",
-          "StrictHostKeyChecking=accept-new",
-          "-P",
-          String(target.port),
-          "-r",
-          `${stageRoot}/.`,
-          `${target.user}@${target.host}:${remotePath}`,
-        ]);
-        if (copy.exitCode !== 0) {
-          // The upload may be partial, so the directory is removed before the copy failure is
-          // reported. If the removal fails too, the session stays in stagedSessions so teardown
-          // retries it, and the error names the remnant instead of untracking it.
-          const cleanup = await removePodSessionDirectory(runner, target, remotePath);
-          if (!cleanup.removed) {
-            throw new ExecutionBackendCleanupError(
-              "runpod-pod",
-              describePodRemnant(podId(), target, remotePath),
-              `The workspace copy failed (scp exited ${copy.exitCode ?? "null"}${copy.stderr.trim() ? `: ${copy.stderr.trim()}` : ""}) and the partial upload could not be removed (${cleanup.detail}).`,
-            );
-          }
-          stagedSessions.delete(input.sessionId);
-          throw new ExecutionBackendError(`Could not copy the workspace to the pod. ${copy.stderr}`);
-        }
-      } finally {
-        rmSync(stageRoot, { recursive: true, force: true });
+        await uploadStagingCopy(input.sessionId, stageRoot, remotePath, target);
+      } catch (error) {
+        uploadError = error;
+      }
+      const remnant = removeLocalStagingCopy(stageRoot, removeLocalDirectory);
+      if (uploadError !== undefined) {
+        throw remnant ? appendLocalRemnant(uploadError, remnant) : uploadError;
       }
       return {
         sessionId: input.sessionId,
         remotePath,
         detail: `copied ${describePodStagingPlan(plan)} from ${localRoot} to ${target.host}:${remotePath} over scp`,
+        ...(remnant ? { warnings: [remnant] } : {}),
       };
     },
     async exec(request: ExecutionRequest): Promise<ExecutionResult> {

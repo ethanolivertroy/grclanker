@@ -828,6 +828,143 @@ test("runpod pod cleanup keeps the session tracked until the removal is confirme
   });
 });
 
+test("runpod pod staging keeps the remote session state when the local temp copy cannot be removed", async () => {
+  await withEnv({ RUNPOD_API_KEY: "rpa_podkey_ABCDEFG", RUNPOD_POD_ID: "pod42" }, async () => {
+    const fetchMock = async () => new Response(RUNPOD_POD_JSON, { status: 200 });
+    const isRemoval = (call) => call.executable === "ssh" && String(call.args.at(-1)).startsWith("rm -rf");
+    const removals = (calls) => calls.filter(isRemoval);
+    // A remover that behaves like a Windows file lock: it throws with an errno code and a message
+    // that must never be interpolated. The copies it refused to delete are removed by the test.
+    const lockedCopies = [];
+    const lockedRemover = (path) => {
+      lockedCopies.push(path);
+      throw Object.assign(new Error("EBUSY: resource busy or locked, rmdir rpa_podkey_ABCDEFG"), { code: "EBUSY" });
+    };
+    const remnantPattern = (path) => new RegExp(`^The local staging copy ${path.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")} could not be removed \\(EBUSY\\); delete it by hand\\.$`);
+    try {
+      // Adapter level, successful upload: the staged workspace is returned with the remnant as a
+      // warning that names the temp path and the code only, and the session stays staged.
+      const adapter = createFakeRunner(async () => ({ exitCode: 0 }));
+      const backend = createRunpodPodBackend({ fetch: fetchMock, runner: adapter.runner, removeLocalDirectory: lockedRemover });
+      const staged = await backend.stageWorkspace({ localPath: "/repo", sessionId: "sess" });
+      assert.equal(staged.remotePath, "/workspace/sess");
+      assert.equal(lockedCopies.length, 1);
+      assert.match(lockedCopies[0], /grclanker-runpod-stage-/);
+      assert.ok(existsSync(lockedCopies[0]), "the stubbed remover left the copy in place");
+      assert.equal(staged.warnings.length, 1);
+      assert.match(staged.warnings[0], remnantPattern(lockedCopies[0]));
+      assert.ok(!staged.warnings[0].includes("resource busy"), "the fs message is not interpolated");
+      assert.ok(!staged.warnings[0].includes("rpa_podkey_ABCDEFG"));
+      assert.deepEqual(adapter.calls.map((call) => call.executable), ["git", "ssh", "scp"]);
+      await backend.teardown("sess");
+      assert.equal(removals(adapter.calls).length, 1, "the session was still staged, so teardown removed the remote directory");
+      await backend.teardown("sess");
+      assert.equal(removals(adapter.calls).length, 1, "exit code 0 untracked it");
+
+      // Runtime level: the contract adapter sees a successful stage, registers the session, hands
+      // the warning to the sink, and teardown reaches backend.teardown (remoteStateMayRemain).
+      const warnings = [];
+      const runtime = createFakeRunner(async () => ({ exitCode: 0, stdout: "ok\n" }));
+      assert.equal(activeComputeSessionCount(), 0);
+      const execution = resolveComputeBackendExecution("/repo", { computeBackend: "runpod-pod" }, {
+        fetch: fetchMock,
+        runner: runtime.runner,
+        removeLocalDirectory: lockedRemover,
+        warn: (message) => warnings.push(message),
+      });
+      const result = await execution.bashOperations.exec("true", "/repo", { onData: () => {} });
+      assert.equal(result.exitCode, 0);
+      assert.equal(activeComputeSessionCount(), 1, "the session stays registered");
+      assert.equal(lockedCopies.length, 2);
+      assert.deepEqual(warnings.length, 1);
+      assert.match(warnings[0], remnantPattern(lockedCopies[1]));
+      assert.equal(removals(runtime.calls).length, 0);
+      await execution.teardown();
+      assert.equal(removals(runtime.calls).length, 1, "teardown issued the remote removal");
+      assert.equal(activeComputeSessionCount(), 0, "exit code 0 untracked the session");
+
+      // Without an injected sink the warning is one scrubbed line on stderr.
+      const written = [];
+      const originalWrite = process.stderr.write;
+      process.stderr.write = (chunk) => {
+        written.push(String(chunk));
+        return true;
+      };
+      try {
+        const defaultSink = resolveComputeBackendExecution("/repo", { computeBackend: "runpod-pod" }, {
+          fetch: fetchMock,
+          runner: createFakeRunner(async () => ({ exitCode: 0 })).runner,
+          removeLocalDirectory: lockedRemover,
+        });
+        await defaultSink.bashOperations.exec("true", "/repo", { onData: () => {} });
+        await defaultSink.teardown();
+      } finally {
+        process.stderr.write = originalWrite;
+      }
+      assert.equal(lockedCopies.length, 3);
+      assert.ok(
+        written.includes(`The local staging copy ${lockedCopies[2]} could not be removed (EBUSY); delete it by hand.\n`),
+        `stderr got: ${JSON.stringify(written)}`,
+      );
+      assert.equal(activeComputeSessionCount(), 0);
+
+      // Failed upload: the original error keeps its type and message, the remnant is appended,
+      // and nothing stays tracked because the remote removal succeeded.
+      const failing = createFakeRunner(async (executable) => (executable === "scp" ? { exitCode: 1, stderr: "lost connection" } : { exitCode: 0 }));
+      const failingBackend = createRunpodPodBackend({ fetch: fetchMock, runner: failing.runner, removeLocalDirectory: lockedRemover });
+      await assert.rejects(
+        () => failingBackend.stageWorkspace({ localPath: "/repo", sessionId: "fail" }),
+        (error) => {
+          assert.ok(error instanceof ExecutionBackendError);
+          assert.ok(!(error instanceof ExecutionBackendCleanupError), "no remote remnant, so not a cleanup error");
+          const [first, second, ...rest] = error.message.split("\n");
+          assert.equal(first, "Compute backend error: Could not copy the workspace to the pod. lost connection");
+          assert.match(second, remnantPattern(lockedCopies[3]));
+          assert.deepEqual(rest, []);
+          return true;
+        },
+      );
+      assert.equal(removals(failing.calls).length, 1);
+      await failingBackend.teardown("fail");
+      assert.equal(removals(failing.calls).length, 1, "the failed upload's session is not tracked");
+
+      // Failed upload whose remote removal fails too: the cleanup error type survives (so the
+      // adapter marks remote state), the remnant is appended, and the session stays staged.
+      let stuckRemovalExit = 1;
+      const stuck = createFakeRunner(async (executable, args) => {
+        if (executable === "scp") return { exitCode: 1, stderr: "lost connection" };
+        if (String(args.at(-1)).startsWith("rm -rf")) return { exitCode: stuckRemovalExit, stderr: stuckRemovalExit ? "busy" : "" };
+        return { exitCode: 0 };
+      });
+      const stuckExecution = resolveComputeBackendExecution("/repo", { computeBackend: "runpod-pod" }, {
+        fetch: fetchMock,
+        runner: stuck.runner,
+        removeLocalDirectory: lockedRemover,
+        warn: (message) => warnings.push(message),
+      });
+      await assert.rejects(
+        () => stuckExecution.bashOperations.exec("true", "/repo", { onData: () => {} }),
+        (error) => {
+          assert.ok(error instanceof ExecutionBackendCleanupError);
+          const lines = error.message.split("\n");
+          assert.match(lines[0], /^Compute backend error: runpod-pod could not remove \/workspace\/grclanker-[0-9a-z-]+ on RunPod pod pod42 .*The workspace copy failed \(scp exited 1: lost connection\) and the partial upload could not be removed \(rm -rf exited 1 on 2 attempts: busy\)\.$/);
+          assert.match(lines[1], remnantPattern(lockedCopies[4]));
+          assert.equal(lines.length, 2);
+          return true;
+        },
+      );
+      assert.equal(warnings.length, 1, "a failed stage reports the remnant in the error, not as a warning");
+      assert.equal(activeComputeSessionCount(), 1, "the partial upload keeps the session tracked");
+      stuckRemovalExit = 0;
+      await stuckExecution.teardown();
+      assert.equal(activeComputeSessionCount(), 0);
+      assert.equal(removals(stuck.calls).length, RUNPOD_CLEANUP_ATTEMPTS + 1);
+    } finally {
+      for (const path of lockedCopies) rmSync(path, { recursive: true, force: true });
+    }
+  });
+});
+
 function git(cwd, ...args) {
   const result = spawnSync("git", ["-C", cwd, ...args], { encoding: "utf8" });
   assert.equal(result.status, 0, `git ${args.join(" ")} failed: ${result.stderr}`);
