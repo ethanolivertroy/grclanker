@@ -2544,7 +2544,8 @@ test("verdict rule 9: redactSecrets scrubs configured secrets and every credenti
   }
   assert.match(scrubbed, /GET \/_security\/user failed \(502 Bad Gateway\)/, "the request line and status stay readable");
   assert.match(scrubbed, /https:\/\/api\.example\.com\/v1\/x\?\[REDACTED\]/, "URLs keep scheme, host, and path but lose userinfo, query, and fragment");
-  assert.match(scrubbed, /Authorization: \[REDACTED\]/);
+  assert.match(scrubbed, /Authorization: Bearer \[REDACTED\]/, "the header keeps its scheme so the message still says what was replayed");
+  assert.match(scrubbed, /ApiKey \[REDACTED\] and Basic \[REDACTED\]/);
 });
 
 test("verdict rule 9: redactSensitiveValues masks whole subtrees, plural and camelCase keys, and deep nesting while keeping booleans", () => {

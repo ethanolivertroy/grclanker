@@ -20,6 +20,7 @@ import { dirname, join, relative, resolve } from "node:path";
 import { ZipArchive } from "archiver";
 import { Type } from "@sinclair/typebox";
 import { parse as parseYaml, YAMLError } from "yaml";
+import { createCredentialScrubber } from "./credential-scrub.js";
 import { errorResult, formatTable, textResult } from "./shared.js";
 
 type FetchImpl = typeof fetch;
@@ -567,49 +568,44 @@ export function normalizeElasticApiKey(rawValue: string): string {
   return value;
 }
 
-/** Reduces every URL in the text to scheme and host, dropping userinfo, path, query, and fragment wherever it appears. */
-function scrubUrlsInText(text: string): string {
-  return text.replace(/\b[a-z][a-z0-9+.-]*:\/\/[^\s"'<>)\]]+/gi, (match) => {
-    try {
-      const parsed = new URL(match);
-      const hadUserinfo = parsed.username.length > 0 || parsed.password.length > 0;
-      const hadDetail = parsed.search.length > 0 || parsed.hash.length > 0 || hadUserinfo;
-      return hadDetail ? `${parsed.protocol}//${parsed.host}${parsed.pathname}?${REDACTED}` : match;
-    } catch {
-      return REDACTED;
-    }
-  });
-}
+/**
+ * The module's credential scrubber (see credential-scrub.ts for the boundary): carriers whatever the value's shape,
+ * every configured secret registered by a client in every encoded form, real token shapes bare, and Elastic Cloud
+ * API keys by their prefix.
+ */
+const credentialScrubber = createCredentialScrubber({ vendorPatterns: [/\bessu_[A-Za-z0-9+/=_-]{16,}/g] });
 
 /**
- * Configuration-independent scrub applied to every error string before it is
- * recorded: authorization values, session and cookie values, JWT-shaped
- * strings, credential-shaped key/value pairs, and URL userinfo and query strings
- * anywhere in the text.
+ * The scrub applied to every error string before it is recorded anywhere (findings, summaries, analysis objects,
+ * access surfaces, the bundle, tool results). Unanchored, idempotent, and independent of which client threw.
  */
 export function scrubErrorText(text: string): string {
-  return scrubUrlsInText(text)
-    .replace(/\b(authorization|proxy-authorization)\b(\s*[:=]\s*)(?:apikey|basic|bearer|token|digest)?\s*[^\s,;"']+/gi, `$1$2${REDACTED}`)
-    .replace(/\b(bearer|basic|apikey)\s+[A-Za-z0-9+/=_.:-]{8,}/gi, `$1 ${REDACTED}`)
-    .replace(/\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}(?:\.[A-Za-z0-9_-]+)?/g, REDACTED)
-    .replace(/\b((?:set-)?cookie|session(?:[_-]?(?:id|token))?|sid|jsessionid|xsrf[_-]?token|csrf[_-]?token)(["']?\s*[:=]\s*["']?)([^"';,\s}]+)/gi, `$1$2${REDACTED}`)
-    .replace(/\b((?:api[_-]?key|x-api-key|access[_-]?key|secret[_-]?key|client[_-]?secret|password|passwd|secret|token|access[_-]?token|refresh[_-]?token|private[_-]?key|credentials?)["']?\s*[:=]\s*["']?)([^"',;\s}]+)/gi, `$1${REDACTED}`);
+  return credentialScrubber.scrub(text);
 }
 
-export function redactSecrets(text: string, config: Pick<ElasticResolvedConfig, "apiKey" | "password" | "bearerToken" | "cloudApiKey" | "username">): string {
-  let output = text;
-  const secrets = [
+type ElasticSecretConfig = Pick<ElasticResolvedConfig, "apiKey" | "password" | "bearerToken" | "cloudApiKey" | "username">;
+
+/**
+ * Registers a configuration's secrets with the module scrubber: the API key as configured, the secret half of its
+ * decoded `id:api_key` form, the password, the bearer token, the cloud API key, and the `user:password` pair whose
+ * base64 form is the Basic authorization value. The scrubber derives the base64, base64url, URL-encoded, and
+ * JSON-escaped forms of each.
+ */
+function registerConfiguredSecrets(config: ElasticSecretConfig): void {
+  credentialScrubber.registerSecrets([
     config.apiKey,
     config.password,
     config.bearerToken,
     config.cloudApiKey,
-    config.username && config.password ? encodeBase64(`${config.username}:${config.password}`) : undefined,
+    config.username && config.password ? `${config.username}:${config.password}` : undefined,
     config.apiKey ? decodeBase64(config.apiKey)?.split(":")[1] : undefined,
-  ].filter((item): item is string => Boolean(item && item.length >= 4));
-  for (const secret of secrets) {
-    output = output.split(secret).join(REDACTED);
-  }
-  return scrubErrorText(output);
+  ]);
+}
+
+/** Scrubs an error string with the configuration's secrets registered first, so the text loses them in every form. */
+export function redactSecrets(text: string, config: ElasticSecretConfig): string {
+  registerConfiguredSecrets(config);
+  return scrubErrorText(text);
 }
 
 function isSecretKey(key: string, parentKey: string | undefined): boolean {
@@ -1068,6 +1064,8 @@ export class ElasticApiClient {
     this.config = config;
     this.fetchImpl = options.fetchImpl ?? fetch;
     this.sleepImpl = options.sleepImpl ?? ((ms: number) => new Promise((resolvePromise) => setTimeout(resolvePromise, ms)));
+    // The configured secrets are scrubbed from every recorded error string in every encoded form from here on.
+    registerConfiguredSecrets(config);
   }
 
   getResolvedConfig(): ElasticResolvedConfig {

@@ -18,6 +18,7 @@ import { homedir } from "node:os";
 import { basename, dirname, join, relative, resolve } from "node:path";
 import { ZipArchive } from "archiver";
 import { Type } from "@sinclair/typebox";
+import { REDACTED, createCredentialScrubber } from "./credential-scrub.js";
 import { errorResult, formatTable, textResult } from "./shared.js";
 
 type FetchImpl = typeof fetch;
@@ -629,39 +630,21 @@ function safeDirName(value: string): string {
   return normalized || "launchdarkly";
 }
 
-const REDACTED = "[REDACTED]";
-
 /**
- * Reduces every URL in the text to scheme, host, and path, dropping userinfo, query, and fragment wherever it appears.
- * An already-scrubbed `?[REDACTED]` tail is consumed whole so a second pass over the same string is a no-op.
+ * The module's credential scrubber (see credential-scrub.ts for the boundary): carriers whatever the value's shape,
+ * every configured token registered by a client in every encoded form, real token shapes bare, and LaunchDarkly's own
+ * key shapes (api- access tokens, sdk- server keys, mob- mobile keys, rel- relay keys, all with a UUID body).
  */
-function scrubUrlsInText(text: string): string {
-  return text.replace(/\b[a-z][a-z0-9+.-]*:\/\/(?:\[REDACTED\]|[^\s"'<>)\]])+/gi, (match) => {
-    try {
-      const parsed = new URL(match);
-      const hadUserinfo = parsed.username.length > 0 || parsed.password.length > 0;
-      const hadDetail = parsed.search.length > 0 || parsed.hash.length > 0 || hadUserinfo;
-      return hadDetail ? `${parsed.protocol}//${parsed.host}${parsed.pathname}?${REDACTED}` : match;
-    } catch {
-      return REDACTED;
-    }
-  });
-}
+const credentialScrubber = createCredentialScrubber({
+  vendorPatterns: [/\b(?:api|sdk|mob|rel)-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b/gi],
+});
 
 /**
- * Configuration-independent scrub applied to every error string before it is recorded anywhere (findings, summaries,
- * analysis objects, access surfaces, the bundle): LaunchDarkly key shapes, authorization values, session and cookie
- * values, JWT-shaped strings, credential-shaped key/value pairs, and URL userinfo and query strings anywhere in the text.
+ * The scrub applied to every error string before it is recorded anywhere (findings, summaries, analysis objects,
+ * access surfaces, the bundle, tool results). Unanchored, idempotent, and independent of which client threw.
  */
 export function scrubErrorText(text: string): string {
-  return scrubUrlsInText(text)
-    .replace(/\b(?:api|sdk|mob|rel)-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b/gi, REDACTED)
-    .replace(/\bapi-[A-Za-z0-9-]{8,}/g, `api-${REDACTED}`)
-    .replace(/\b(authorization|proxy-authorization|x-api-key)\b(\s*[:=]\s*)(?:apikey|basic|bearer|token|digest)?\s*[^\s,;"']+/gi, `$1$2${REDACTED}`)
-    .replace(/\b(bearer|basic|apikey)\s+[A-Za-z0-9+/=_.:-]{8,}/gi, `$1 ${REDACTED}`)
-    .replace(/\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}(?:\.[A-Za-z0-9_-]+)?/g, REDACTED)
-    .replace(/\b((?:set-)?cookie|session(?:[_-]?(?:id|token))?|sid|jsessionid|xsrf[_-]?token|csrf[_-]?token)(["']?\s*[:=]\s*["']?)([^"';,\s}]+)/gi, `$1$2${REDACTED}`)
-    .replace(/\b((?:api[_-]?key|x-api-key|app[_-]?key|application[_-]?key|access[_-]?key|secret[_-]?key|client[_-]?secret|password|passwd|secret|token|access[_-]?token|refresh[_-]?token|private[_-]?key|credentials?)["']?\s*[:=]\s*["']?)([^"',;\s}]+)/gi, `$1${REDACTED}`);
+  return credentialScrubber.scrub(text);
 }
 
 const PARSE_ERROR_NOTE = "SyntaxError: response could not be parsed as JSON; the parser's message is not recorded because it quotes the body";
@@ -887,12 +870,10 @@ export function projectFlag(flag: JsonRecord): JsonRecord {
   };
 }
 
+/** Removes the client's own token wherever it appears verbatim; the shared scrub then removes it in every encoded form. */
 function redactTokenText(message: string, token?: string): string {
-  let redacted = message.replace(/api-[A-Za-z0-9-]{8,}/g, "api-[REDACTED]");
-  if (token && token.length > 0) {
-    redacted = redacted.split(token).join("[REDACTED]");
-  }
-  return redacted;
+  if (token && token.length > 0) return message.split(token).join(REDACTED);
+  return message;
 }
 
 function buildRegex(pattern: string | undefined, fallback: string): RegExp {
@@ -1392,6 +1373,8 @@ export class LaunchdarklyApiClient {
     this.fetchImpl = options.fetchImpl ?? fetch;
     this.sleep = options.sleep ?? defaultSleep;
     this.maxRetries = clampNumber(options.maxRetries, DEFAULT_MAX_RETRIES, 0, 10);
+    // The configured token is scrubbed from every recorded error string in every encoded form from here on.
+    credentialScrubber.registerSecrets([config.token]);
   }
 
   getResolvedConfig(): LaunchdarklyResolvedConfig {

@@ -21,6 +21,7 @@ import { dirname, join, relative, resolve } from "node:path";
 import { ZipArchive } from "archiver";
 import { Type } from "@sinclair/typebox";
 import { parse as parseYaml, YAMLError } from "yaml";
+import { createCredentialScrubber } from "./credential-scrub.js";
 import { errorResult, formatTable, textResult } from "./shared.js";
 
 type FetchImpl = typeof fetch;
@@ -972,34 +973,18 @@ function retryDelayMs(retryAfter: string | null, attempt: number): number {
 }
 
 /**
- * Reduces every URL in the text to scheme, host, and path, dropping userinfo, query, and fragment wherever it appears.
- * An already-scrubbed `?[REDACTED]` tail is consumed whole so a second pass over the same string is a no-op.
+ * The module's credential scrubber (see credential-scrub.ts for the boundary): carriers whatever the value's shape,
+ * every configured token registered by a client in every encoded form, real token shapes bare, and KnowBe4's own
+ * PhishER token header.
  */
-function scrubUrlsInText(text: string): string {
-  return text.replace(/\b[a-z][a-z0-9+.-]*:\/\/(?:\[REDACTED\]|[^\s"'<>)\]])+/gi, (match) => {
-    try {
-      const parsed = new URL(match);
-      const hadUserinfo = parsed.username.length > 0 || parsed.password.length > 0;
-      const hadDetail = parsed.search.length > 0 || parsed.hash.length > 0 || hadUserinfo;
-      return hadDetail ? `${parsed.protocol}//${parsed.host}${parsed.pathname}?${REDACTED}` : match;
-    } catch {
-      return REDACTED;
-    }
-  });
-}
+const credentialScrubber = createCredentialScrubber({ headers: ["x-phisher-token"] });
 
 /**
- * Configuration-independent scrub applied to every error string before it is recorded anywhere (findings,
- * summaries, analysis objects, access surfaces, the bundle): authorization values, session and cookie values,
- * JWT-shaped strings, credential-shaped key/value pairs, and URL userinfo and query strings anywhere in the text.
+ * The scrub applied to every error string before it is recorded anywhere (findings, summaries, analysis objects,
+ * access surfaces, the bundle, tool results). Unanchored, idempotent, and independent of which client threw.
  */
 export function scrubErrorText(text: string): string {
-  return scrubUrlsInText(text)
-    .replace(/\b(authorization|proxy-authorization|x-api-key|x-phisher-token)\b(\s*[:=]\s*)(?:apikey|basic|bearer|token|digest)?\s*[^\s,;"']+/gi, `$1$2${REDACTED}`)
-    .replace(/\b(bearer|basic|apikey)\s+[A-Za-z0-9+/=_.:-]{8,}/gi, `$1 ${REDACTED}`)
-    .replace(/\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}(?:\.[A-Za-z0-9_-]+)?/g, REDACTED)
-    .replace(/\b((?:set-)?cookie|session(?:[_-]?(?:id|token))?|sid|jsessionid|xsrf[_-]?token|csrf[_-]?token)(["']?\s*[:=]\s*["']?)([^"';,\s}]+)/gi, `$1$2${REDACTED}`)
-    .replace(/\b((?:api[_-]?key|x-api-key|app[_-]?key|application[_-]?key|access[_-]?key|secret[_-]?key|client[_-]?secret|password|passwd|secret|token|access[_-]?token|refresh[_-]?token|private[_-]?key|credentials?)["']?\s*[:=]\s*["']?)([^"',;\s}]+)/gi, `$1${REDACTED}`);
+  return credentialScrubber.scrub(text);
 }
 
 const PARSE_ERROR_NOTE = "SyntaxError: response could not be parsed as JSON; the parser's message is not recorded because it quotes the body";
@@ -1163,6 +1148,8 @@ export class Knowbe4ApiClient {
     this.sleepImpl = options.sleepImpl ?? ((ms) => new Promise((resolvePromise) => setTimeout(resolvePromise, ms)));
     this.maxRetries = clampInteger(options.maxRetries, DEFAULT_MAX_RETRIES, 0, 10);
     this.minRequestIntervalMs = clampInteger(options.minRequestIntervalMs, MIN_REQUEST_INTERVAL_MS, 0, 10_000);
+    // The configured tokens are scrubbed from every recorded error string in every encoded form from here on.
+    credentialScrubber.registerSecrets([config.apiToken, config.phisherApiToken]);
   }
 
   getResolvedConfig(): Knowbe4ResolvedConfig {

@@ -36,6 +36,7 @@ import {
 import { getRegisteredToolSummaries } from "../dist/pi/tool-catalog.js";
 import { readBundleFiles, readZipEntries } from "./helpers/bundle-contents.mjs";
 import { assertCanaryFixture, assertCanaryWindowsAbsent } from "./helpers/canary-windows.mjs";
+import { scrubAlterations } from "./helpers/scrub-survival.mjs";
 
 const NOW = Date.parse("2026-09-21T00:00:00Z");
 const RECENT = "2026-09-15T00:00:00Z";
@@ -2992,7 +2993,7 @@ test("round 7a: every fixed-text message the LaunchDarkly integration emits surv
     runs.push(httpLaunchdarkly(fixture, { routes: { [denial.route]: ldDenyDataset(ldRoutes(fixture), denial) } }));
   }
   let checked = 0;
-  const altered = [];
+  const altered = new Set();
   for (const { client, config } of runs) {
     const access = await checkLaunchdarklyAccess(client);
     const assessments = await runAllLaunchdarklyAssessments(client);
@@ -3003,14 +3004,11 @@ test("round 7a: every fixed-text message the LaunchDarkly integration emits surv
       ...[...files].filter(([name]) => !name.startsWith("core_data/")).map(([, text]) => text),
       ...ldLeafEntries(assessments).map(([, value]) => value).filter((value) => typeof value === "string"),
     ];
-    for (const text of texts) {
-      checked += 1;
-      const scrubbed = scrubErrorText(text);
-      if (scrubbed !== text) altered.push(`${text.slice(0, 160)} -> ${scrubbed.slice(0, 160)}`);
-    }
+    checked += texts.length;
+    for (const alteration of scrubAlterations(texts, scrubErrorText)) altered.add(alteration);
   }
   assert.ok(checked > 2000, `expected thousands of recorded strings, got ${checked}`);
-  assert.deepEqual([...new Set(altered)], [], `legitimate run text altered by the scrubber:\n${[...new Set(altered)].join("\n")}`);
+  assert.deepEqual([...altered], [], `legitimate run text altered by the scrubber:\n${[...altered].join("\n")}`);
 });
 
 test("round 7b: resolveLaunchdarklyConfiguration keeps env-provided credentials and config path when an unrelated argument is passed, and the tool sends the env token", async () => {

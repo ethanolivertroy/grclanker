@@ -18,6 +18,7 @@ import { homedir } from "node:os";
 import { basename, dirname, join, relative, resolve } from "node:path";
 import { ZipArchive } from "archiver";
 import { Type } from "@sinclair/typebox";
+import { createCredentialScrubber } from "./credential-scrub.js";
 import { errorResult, formatTable, textResult } from "./shared.js";
 
 type FetchImpl = typeof fetch;
@@ -675,34 +676,18 @@ export function redactCredentialValues(value: unknown, depth = 0): unknown {
 }
 
 /**
- * Reduces every URL in the text to scheme, host, and path, dropping userinfo, query, and fragment wherever it appears.
- * An already-scrubbed `?[REDACTED]` tail is consumed whole so a second pass over the same string is a no-op.
+ * The module's credential scrubber (see credential-scrub.ts for the boundary): carriers whatever the value's shape,
+ * every configured key registered by a client in every encoded form, real token shapes bare (Datadog API and
+ * application keys are hex digests), and Datadog's own key headers.
  */
-function scrubUrlsInText(text: string): string {
-  return text.replace(/\b[a-z][a-z0-9+.-]*:\/\/(?:\[REDACTED\]|[^\s"'<>)\]])+/gi, (match) => {
-    try {
-      const parsed = new URL(match);
-      const hadUserinfo = parsed.username.length > 0 || parsed.password.length > 0;
-      const hadDetail = parsed.search.length > 0 || parsed.hash.length > 0 || hadUserinfo;
-      return hadDetail ? `${parsed.protocol}//${parsed.host}${parsed.pathname}?${REDACTED}` : match;
-    } catch {
-      return REDACTED;
-    }
-  });
-}
+const credentialScrubber = createCredentialScrubber({ headers: ["dd-api-key", "dd-application-key"] });
 
 /**
- * Configuration-independent scrub applied to every error string before it is recorded anywhere (findings,
- * summaries, analysis objects, access surfaces, the bundle): authorization values, session and cookie values,
- * JWT-shaped strings, credential-shaped key/value pairs, and URL userinfo and query strings anywhere in the text.
+ * The scrub applied to every error string before it is recorded anywhere (findings, summaries, analysis objects,
+ * access surfaces, the bundle, tool results). Unanchored, idempotent, and independent of which client threw.
  */
 export function scrubErrorText(text: string): string {
-  return scrubUrlsInText(text)
-    .replace(/\b(authorization|proxy-authorization|dd-api-key|dd-application-key)\b(\s*[:=]\s*)(?:apikey|basic|bearer|token|digest)?\s*[^\s,;"']+/gi, `$1$2${REDACTED}`)
-    .replace(/\b(bearer|basic|apikey)\s+[A-Za-z0-9+/=_.:-]{8,}/gi, `$1 ${REDACTED}`)
-    .replace(/\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}(?:\.[A-Za-z0-9_-]+)?/g, REDACTED)
-    .replace(/\b((?:set-)?cookie|session(?:[_-]?(?:id|token))?|sid|jsessionid|xsrf[_-]?token|csrf[_-]?token)(["']?\s*[:=]\s*["']?)([^"';,\s}]+)/gi, `$1$2${REDACTED}`)
-    .replace(/\b((?:api[_-]?key|x-api-key|app[_-]?key|application[_-]?key|access[_-]?key|secret[_-]?key|client[_-]?secret|password|passwd|secret|token|access[_-]?token|refresh[_-]?token|private[_-]?key|credentials?)["']?\s*[:=]\s*["']?)([^"',;\s}]+)/gi, `$1${REDACTED}`);
+  return credentialScrubber.scrub(text);
 }
 
 function pick(record: JsonRecord, keys: string[]): JsonRecord {
@@ -1170,6 +1155,8 @@ export class DatadogApiClient {
     this.config = config;
     this.fetchImpl = options.fetchImpl ?? fetch;
     this.sleepImpl = options.sleepImpl ?? defaultSleep;
+    // The configured keys are scrubbed from every recorded error string in every encoded form from here on.
+    credentialScrubber.registerSecrets([config.apiKey, config.appKey]);
   }
 
   getResolvedConfig(): DatadogResolvedConfig {
