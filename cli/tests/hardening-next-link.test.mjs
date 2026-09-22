@@ -53,6 +53,7 @@ const LEGITIMATE = Object.freeze([
   "was not followed because it carries userinfo (configured origin",
   "was not followed because it could not be parsed against the configured origin",
   "configured origin could not be parsed as an absolute URL",
+  "configured origin must be an http or https URL",
   "rather than the configured origin and was not followed",
   "carried userinfo and was not followed",
   "could not be parsed and was not followed",
@@ -173,19 +174,52 @@ test("an empty, blank, malformed, or non-string next link throws as unparseable 
   }
 });
 
-test("a configured base that is not an absolute URL is rejected with fixed text that does not echo it", () => {
-  for (const base of ["", "api.example.com", `/v1/${LINK_CANARY.base}`, `not a url ${LINK_CANARY.base}`]) {
+function assertInvalidBase(base, message, label = JSON.stringify(base) ?? String(base)) {
+  for (const candidate of ["/api/v2/users?page=2", `https://api.example.com${TAIL}`, `blob:https://api.example.com/${LINK_CANARY.path}`]) {
     let thrown;
     try {
-      resolveSameOriginUrl("/api/v2/users?page=2", base);
+      resolveSameOriginUrl(candidate, base);
     } catch (error) {
       thrown = error;
     }
-    assert.ok(thrown instanceof IntegrationError, `${JSON.stringify(base)}: IntegrationError`);
-    assert.ok(!(thrown instanceof NextLinkError), `${JSON.stringify(base)}: a bad base is not a next-link rejection`);
-    assert.equal(thrown.code, INVALID_CONFIGURED_ORIGIN_CODE);
-    assert.equal(thrown.message, "configured origin could not be parsed as an absolute URL");
-    for (const [name, text] of Object.entries(renderings(thrown))) assertNoFragments(text, CANARIES, { label: `base ${JSON.stringify(base)} ${name}` });
+    assert.ok(thrown instanceof IntegrationError, `${label}: IntegrationError`);
+    assert.ok(!(thrown instanceof NextLinkError), `${label}: a bad base is not a next-link rejection`);
+    assert.equal(thrown.code, INVALID_CONFIGURED_ORIGIN_CODE, label);
+    assert.equal(thrown.message, message, label);
+    for (const [name, text] of Object.entries(renderings(thrown))) assertNoFragments(text, CANARIES, { label: `base ${label} ${name}` });
+    assert.equal(scrubErrorText(thrown.message), thrown.message, `${label}: the fixed text survives scrubErrorText`);
+    assert.equal(scrubDataText(thrown.message), thrown.message, `${label}: the fixed text survives scrubDataText`);
+  }
+}
+
+test("a configured base that is not an absolute URL is rejected with fixed text that does not echo it", () => {
+  for (const base of ["", "api.example.com", `/v1/${LINK_CANARY.base}`, `not a url ${LINK_CANARY.base}`]) {
+    assertInvalidBase(base, "configured origin could not be parsed as an absolute URL");
+  }
+});
+
+test("a configured base whose scheme is not http or https is rejected, as a string and as a URL, so hostless schemes cannot share an origin", () => {
+  // CodeRabbit on #78: `blob:https://a/...` and `blob:https://b/...` have the same (empty) host, so
+  // an origin comparison of scheme and host would pass a foreign embedded origin; only an http or
+  // https base is a configured origin.
+  const bases = [
+    `blob:https://api.example.com/${LINK_CANARY.base}`,
+    `blob:${LINK_CANARY.base}`,
+    `javascript:alert('${LINK_CANARY.base}')`,
+    `data:text/plain,${LINK_CANARY.base}`,
+    `file:///etc/${LINK_CANARY.base}`,
+    `ftp://api.example.com/${LINK_CANARY.base}`,
+    `ws://api.example.com/${LINK_CANARY.base}`,
+    `mailto:ops@api.example.com`,
+    `HTTPX://api.example.com/`,
+  ];
+  for (const base of bases) {
+    assertInvalidBase(base, "configured origin must be an http or https URL");
+    assertInvalidBase(new URL(base), "configured origin must be an http or https URL", `URL(${JSON.stringify(base)})`);
+  }
+  // The http and https bases pass as strings and as URL instances, whatever the case of the scheme.
+  for (const base of ["https://api.example.com/api/", "HTTPS://API.EXAMPLE.COM/api/", "http://api.example.com:8080/", new URL("https://api.example.com/api/")]) {
+    assert.equal(resolveSameOriginUrl("/api/v2/users?page=2", base).pathname, "/api/v2/users", String(base));
   }
 });
 

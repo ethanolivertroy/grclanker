@@ -323,6 +323,29 @@ test("every NextLinkError message and next-link pagination note survives the scr
   assert.ok(rendered >= 100, `expected the full matrix, rendered ${rendered}`);
 });
 
+test("both invalid-configured-origin texts survive the scrub and echo nothing of the base", () => {
+  const cases = [
+    ["not a url ZmFrZS1jb25maWctdG9rZW4", "configured origin could not be parsed as an absolute URL"],
+    ["blob:https://api.example.com/ZmFrZS1jb25maWctdG9rZW4", "configured origin must be an http or https URL"],
+    ["javascript:alert(1)", "configured origin must be an http or https URL"],
+    [new URL("data:text/plain,ZmFrZS1jb25maWctdG9rZW4"), "configured origin must be an http or https URL"],
+  ];
+  for (const [base, expected] of cases) {
+    let error;
+    try {
+      resolveSameOriginUrl("/api/v2/users?page=2", base);
+    } catch (thrown) {
+      error = thrown;
+    }
+    assert.ok(error instanceof IntegrationError && !(error instanceof NextLinkError), String(base));
+    assert.equal(error.code, "INVALID_CONFIGURED_ORIGIN");
+    assert.equal(error.message, expected);
+    assert.ok(!error.message.includes("ZmFrZS1"), String(base));
+    assertSurvivesScrub(error.message, `invalid base ${String(base)}`);
+    assertSurvivesScrub(errorMessage(error), `invalid base ${String(base)} folded`);
+  }
+});
+
 test("marker error text survives the scrub for every inventory label, including credential-named inventories", () => {
   const line = describeFailedResponse({ method: "GET", endpoint: "/v1/roles", status: 403, statusText: "Forbidden", contentType: "text/html", body: "<html>denied</html>" });
   for (const label of DATASET_LABELS) {

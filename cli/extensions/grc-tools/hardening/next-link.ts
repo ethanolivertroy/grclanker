@@ -22,8 +22,13 @@ export type NextLinkRejection = "foreign_origin" | "userinfo" | "unparseable";
 /** The `code` of every `NextLinkError`. */
 export const NEXT_LINK_REJECTED_CODE = "NEXT_LINK_REJECTED";
 
-/** The `code` of the error thrown when the configured base itself is not an absolute URL. */
+/** The `code` of the error thrown when the configured base itself is not an absolute http or https URL. */
 export const INVALID_CONFIGURED_ORIGIN_CODE = "INVALID_CONFIGURED_ORIGIN";
+
+// The origin comparison is scheme, host, and port, which distinguishes two http or https origins and
+// nothing else: hostless schemes (`blob:`, `data:`, `javascript:`) share an empty host whatever they
+// embed, so only an http or https base is a configured origin (CodeRabbit on #78).
+const HTTP_PROTOCOLS: ReadonlySet<string> = new Set(["http:", "https:"]);
 
 /**
  * The origin of a URL as this module names it: scheme, host, and port (`https://api.example.com`,
@@ -67,13 +72,15 @@ function nextLinkMessage(reason: NextLinkRejection, configuredOrigin: string, re
 }
 
 function parseBase(base: string | URL): URL {
-  if (base instanceof URL) return base;
+  let parsed: URL;
   try {
-    return new URL(base);
+    parsed = base instanceof URL ? base : new URL(base);
   } catch {
     // The base is the integration's own configuration, not server text, but a config value can hold a token too, so it is never echoed.
     throw new IntegrationError("configured origin could not be parsed as an absolute URL", { code: INVALID_CONFIGURED_ORIGIN_CODE });
   }
+  if (!HTTP_PROTOCOLS.has(parsed.protocol)) throw new IntegrationError("configured origin must be an http or https URL", { code: INVALID_CONFIGURED_ORIGIN_CODE });
+  return parsed;
 }
 
 /**
@@ -84,8 +91,10 @@ function parseBase(base: string | URL): URL {
  * link to another host, an IP literal that is not the configured host, a link carrying userinfo
  * (`https://user:secret@host/...`), and a link that does not parse (an empty string included) throw
  * `NextLinkError` with fixed text that names only the configured origin and, for a foreign origin,
- * the rejected origin. The returned URL is the one to request; the caller still sends it through the
- * scrub before recording it anywhere, since its query may carry a token.
+ * the rejected origin. The base must be an absolute http or https URL (a `URL` instance included);
+ * any other base throws an `IntegrationError` with `INVALID_CONFIGURED_ORIGIN_CODE` and fixed text
+ * that does not echo it. The returned URL is the one to request; the caller still sends it through
+ * the scrub before recording it anywhere, since its query may carry a token.
  */
 export function resolveSameOriginUrl(candidate: string, base: string | URL): URL {
   const baseUrl = parseBase(base);
