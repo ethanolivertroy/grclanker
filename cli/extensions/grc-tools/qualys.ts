@@ -11,7 +11,6 @@ import {
   existsSync,
   lstatSync,
   mkdirSync,
-  readFileSync,
   realpathSync,
 } from "node:fs";
 import { chmod, readdir, writeFile } from "node:fs/promises";
@@ -19,6 +18,7 @@ import { homedir } from "node:os";
 import { dirname, join, relative, resolve } from "node:path";
 import { ZipArchive } from "archiver";
 import { Type } from "@sinclair/typebox";
+import { readConfigText } from "./hardening/index.js";
 import { errorResult, formatTable, textResult } from "./shared.js";
 
 type FetchImpl = typeof fetch;
@@ -646,29 +646,20 @@ export function resolveQualysPlatform(value: string | undefined, source = "the p
   return { platform: "custom", baseUrl, gatewayUrl: `https://${gatewayHost}` };
 }
 
-/** The `code` of a Node system error (ENOENT, EACCES, EISDIR): a fixed identifier, never the message. */
-function systemErrorCode(error: unknown): string | undefined {
-  const code = asObject(error)?.code;
-  return typeof code === "string" && /^E[A-Z0-9_]{1,30}$/.test(code) ? code : undefined;
-}
-
 /**
- * Reads the optional key=value config file. The read error is never interpolated: a Node fs error names the path
- * and operation, and a non-standard thrown value contributes whatever its `toString()` yields, so the thrown text is
- * a fixed description with the path and the validated system error code, scrubbed like every other error here. The
- * parser below is a hand-rolled loop that cannot throw, so it has no error path to guard.
+ * Reads the optional key=value config file. A missing file is an empty config (the existsSync check is kept in
+ * front of the read: it is the first unguarded call in every tool handler and the tests probe the handlers' catch
+ * blocks through it). The read itself goes through the shared `readConfigText` guard, so any failure is a
+ * `ConfigFileError` whose message is the fixed `Unable to read Qualys config file <path> (<CODE>)`, built from the
+ * path and the validated system error code only; neither a Node fs message nor a non-standard thrown value's
+ * `toString()` can reach it. The parser below is a hand-rolled loop that cannot throw, so it has no parse guard.
  */
 export function readQualysConfigFile(pathname: string | undefined): Record<string, string> {
   if (!pathname || !existsSync(pathname)) return {};
+  const read = readConfigText(pathname, { label: "Qualys" });
+  if (!read.ok) return {};
   const values: Record<string, string> = {};
-  let content: string;
-  try {
-    content = readFileSync(pathname, "utf8");
-  } catch (error) {
-    const code = systemErrorCode(error);
-    throw new Error(scrubErrorText(`Unable to read Qualys config file ${pathname}${code ? ` (${code})` : ""}`));
-  }
-  for (const rawLine of content.split(/\r?\n/)) {
+  for (const rawLine of read.value.split(/\r?\n/)) {
     const line = rawLine.trim();
     if (!line || line.startsWith("#") || line.startsWith(";") || line.startsWith("[")) continue;
     const separator = line.indexOf("=");
