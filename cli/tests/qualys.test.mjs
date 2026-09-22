@@ -7,7 +7,10 @@ import { tmpdir } from "node:os";
 import { join, relative } from "node:path";
 import { inflateRawSync } from "node:zlib";
 
+import { assertNoCanaryWindows } from "./helpers/error-canaries.mjs";
 import {
+  QPS_DOCUMENTED_RESPONSE_CODES,
+  QUALYS_DOCUMENTED_ERROR_CODES,
   QUALYS_PLATFORMS,
   QualysApiClient,
   QualysApiError,
@@ -31,6 +34,7 @@ import {
   resolveSecureOutputPath,
   resolveViewScope,
   scrubErrorText,
+  vendorErrorCode,
   xmlToRecord,
 } from "../dist/extensions/grc-tools/qualys.js";
 import { getRegisteredToolSummaries } from "../dist/pi/tool-catalog.js";
@@ -3239,6 +3243,192 @@ test("vendor error codes: a token in CODE, ERROR number, RETURN number, or respo
   await assert.rejects(() => numeric.listHosts(100), { message: "Qualys request failed (403) for /api/2.0/fo/asset/host/: code 1905: Denied" });
   await assert.rejects(() => numeric.listScans(), { message: "Qualys request failed (403) for /api/2.0/fo/scan/: error 2010: Denied" });
   await assert.rejects(() => numeric.searchUsers(), { message: "Qualys QPS request failed (403) for /qps/rest/2.0/search/am/user/: responseCode UNAUTHORIZED: Denied" });
+});
+
+// Credential-shaped values that pass the syntax the module used to accept: a six-digit one-time passcode has the
+// numeric shape of a CODE, ERROR number, or RETURN number, and a letters-only base32 fragment (16 and 32 characters,
+// no digits) has the uppercase-constant shape of a responseCode, which the long-token rule also exempts as a code.
+// Only the documented vocabulary keeps them out. No window of 6 to 24 characters of any of them occurs in the
+// compliant fixtures.
+const SHAPE_CANARIES = {
+  passcode: "482913",
+  base32Short: "JBSWYDPEHPKPXPAB",
+  base32Long: "JBSWYDPEHPKPXPABQMZKVTRNGLCWYHFD",
+};
+
+const SHAPE_ROWS = [
+  {
+    name: "SIMPLE_RETURN CODE carrying a six-digit passcode",
+    endpoint: "/api/2.0/fo/asset/host/",
+    canary: SHAPE_CANARIES.passcode,
+    body: () => `<?xml version="1.0" encoding="UTF-8"?><SIMPLE_RETURN><RESPONSE><DATETIME>${daysAgo(0)}</DATETIME><CODE>${SHAPE_CANARIES.passcode}</CODE><TEXT>Denied</TEXT></RESPONSE></SIMPLE_RETURN>`,
+    respond: (body) => xmlResponse(body, { status: 403 }),
+    call: (client) => client.listHosts(100),
+    expected: "Qualys request failed (403) for /api/2.0/fo/asset/host/: code UnknownError: Denied",
+    assessTool: "qualys_assess_scan_coverage",
+  },
+  {
+    name: "/msp/ ERROR number carrying a six-digit passcode",
+    endpoint: "/msp/user_list.php",
+    canary: SHAPE_CANARIES.passcode,
+    body: () => `<?xml version="1.0" encoding="UTF-8"?><USER_LIST_OUTPUT><ERROR number="${SHAPE_CANARIES.passcode}">Denied</ERROR></USER_LIST_OUTPUT>`,
+    respond: (body) => xmlResponse(body, { status: 200 }),
+    call: (client) => client.listUsers(),
+    expected: "Qualys request failed (200) for /msp/user_list.php: error UnknownError: Denied",
+    assessTool: "qualys_assess_administration",
+  },
+  {
+    name: "GENERIC_RETURN RETURN number carrying a six-digit passcode",
+    endpoint: "/api/2.0/fo/asset/host/",
+    canary: SHAPE_CANARIES.passcode,
+    body: () => `<?xml version="1.0" encoding="UTF-8"?><GENERIC_RETURN><RETURN status="FAILED" number="${SHAPE_CANARIES.passcode}">Denied</RETURN></GENERIC_RETURN>`,
+    respond: (body) => xmlResponse(body, { status: 403 }),
+    call: (client) => client.listHosts(100),
+    expected: "Qualys request failed (403) for /api/2.0/fo/asset/host/: error UnknownError: Denied",
+    assessTool: "qualys_assess_scan_coverage",
+  },
+  {
+    name: "QPS responseCode carrying a 16-letter base32 fragment",
+    endpoint: "/qps/rest/2.0/search/am/user/",
+    canary: SHAPE_CANARIES.base32Short,
+    body: () => JSON.stringify({ ServiceResponse: { responseCode: SHAPE_CANARIES.base32Short, responseErrorDetails: { errorMessage: "Denied" } } }),
+    respond: (body) => new Response(body, { status: 403, headers: { "content-type": "application/json" } }),
+    call: (client) => client.searchUsers(),
+    expected: "Qualys QPS request failed (403) for /qps/rest/2.0/search/am/user/: responseCode UnknownError: Denied",
+    assessTool: "qualys_assess_administration",
+  },
+  {
+    name: "QPS responseCode carrying a 32-letter base32 fragment at HTTP 200",
+    endpoint: "/qps/rest/3.0/search/was/webapp",
+    canary: SHAPE_CANARIES.base32Long,
+    body: () => JSON.stringify({ ServiceResponse: { responseCode: SHAPE_CANARIES.base32Long, responseErrorDetails: { errorMessage: "Denied" } } }),
+    respond: (body) => new Response(body, { status: 200, headers: { "content-type": "application/json" } }),
+    call: (client) => client.searchWebApps(),
+    expected: "Qualys QPS request failed (200) for /qps/rest/3.0/search/was/webapp: responseCode UnknownError: Denied",
+    assessTool: "qualys_assess_administration",
+  },
+];
+
+test("vendor error codes: a six-digit passcode in CODE, ERROR number, or RETURN number and a letters-only base32 fragment in responseCode render as UnknownError at every 6-to-24 window, a documented code still renders, and a configured secret never renders as a code", async () => {
+  // Positive controls: every planted value has the shape the old validator accepted, and the shared scrub keeps it.
+  assert.match(SHAPE_CANARIES.passcode, /^\d{1,6}$/, "control: the passcode has the old numeric shape");
+  for (const value of [SHAPE_CANARIES.base32Short, SHAPE_CANARIES.base32Long]) {
+    assert.match(value, /^[A-Z][A-Z_]{0,63}$/, "control: the fragment has the old constant shape");
+    assert.match(value, /^[A-Z2-7]+$/, "control: the fragment is base32");
+    assert.equal(scrubErrorText(value), value, "control: the token scrub alone keeps an uppercase run");
+  }
+  assert.equal(scrubErrorText(SHAPE_CANARIES.passcode), SHAPE_CANARIES.passcode, "control: the token scrub alone keeps six digits");
+
+  // The vocabularies: every entry has the documented shape, the values the module and its tests rely on are present,
+  // and the gate is the vocabulary, not the shape.
+  for (const code of QUALYS_DOCUMENTED_ERROR_CODES) assert.match(code, /^\d{3,4}$/, `${code} has the documented numeric shape`);
+  for (const code of QPS_DOCUMENTED_RESPONSE_CODES) assert.match(code, /^[A-Z][A-Z_]{0,31}$/, `${code} has the documented constant shape`);
+  for (const code of ["999", "1901", "1903", "1905", "1920", "1960", "1965", "1999", "2000", "2002", "2003", "2010", "2011", "2012"]) {
+    assert.ok(QUALYS_DOCUMENTED_ERROR_CODES.has(code), `${code} is documented`);
+    assert.equal(vendorErrorCode(code, "xml"), code);
+    assert.equal(vendorErrorCode(` ${code} `, "xml"), code, "surrounding whitespace is trimmed");
+  }
+  for (const code of ["SUCCESS", "INVALID_REQUEST", "INVALID_CREDENTIALS", "UNAUTHORIZED", "INVALID_API_VERSION", "NOT_FOUND", "OTHER_ERROR", "UNAUTHORIZED_DESTINATION_APPS"]) {
+    assert.ok(QPS_DOCUMENTED_RESPONSE_CODES.has(code), `${code} is documented`);
+    assert.equal(vendorErrorCode(code, "qps"), code);
+  }
+  for (const value of [SHAPE_CANARIES.passcode, "000000", "19050", "01905", "1234567", "12345678901234567890", "99", "1905a", "-1905", "1905.0"]) {
+    assert.equal(vendorErrorCode(value, "xml"), "UnknownError", JSON.stringify(value));
+  }
+  for (const value of [SHAPE_CANARIES.base32Short, SHAPE_CANARIES.base32Long, "INTERNAL_ERROR", "SECRET_KEY_VALUE", "Unauthorized", "UN AUTHORIZED", "JBSWY3DPEHPK3PXP", "A".repeat(65), "1905"]) {
+    assert.equal(vendorErrorCode(value, "qps"), "UnknownError", JSON.stringify(value));
+  }
+  assert.equal(vendorErrorCode("UNAUTHORIZED", "xml"), "UnknownError", "a constant is not a numeric code");
+  assert.equal(vendorErrorCode(undefined, "xml"), undefined);
+  assert.equal(vendorErrorCode("   ", "qps"), undefined);
+  assert.throws(() => vendorErrorCode("1905", "json"), /Unhandled Qualys vendor code kind json/);
+  // The configured secrets are removed first, so a credential that collides with a documented code renders the placeholder.
+  assert.equal(vendorErrorCode("1905", "xml", ["1905"]), "UnknownError");
+  assert.equal(vendorErrorCode("UNAUTHORIZED", "qps", ["UNAUTHORIZED"]), "UnknownError");
+  assert.equal(vendorErrorCode("1905", "xml", ["s3cret-value"]), "1905", "an unrelated secret leaves a documented code alone");
+
+  const outputRoot = createTempBase("qualys-shape-code-");
+  const tools = registeredQualysTools();
+  const toolArgs = { config_file: join(outputRoot, "missing.qcrc"), username: "acme_api", password: "s3cret-value", platform: "US1" };
+  const canaries = Object.values(SHAPE_CANARIES);
+
+  for (const row of SHAPE_ROWS) {
+    const body = row.body();
+    assert.ok(body.includes(row.canary), `${row.name}: positive control, the raw envelope carries the canary`);
+    const router = async (url, init) => (new URL(url).pathname === row.endpoint ? row.respond(body) : compliantRouter(url, init));
+    const client = routedClient(router);
+
+    const thrown = await row.call(client).then(() => null, (error) => error);
+    assert.ok(thrown instanceof QualysApiError, row.name);
+    assert.equal(thrown.endpoint, row.endpoint, row.name);
+    assert.equal(thrown.message, row.expected, row.name);
+    assertNoCanaryWindows(assert, thrown.message, canaries, `${row.name} thrown message`);
+
+    const results = await runAllAssessments(client);
+    const access = await checkQualysAccess(client);
+    assertNoCanaryWindows(assert, results, canaries, `${row.name} findings, summaries, evidence, sources, and errors arrays`);
+    assertNoCanaryWindows(assert, access, canaries, `${row.name} access check`);
+    assert.ok(results.flatMap((result) => result.errors).some((entry) => entry.endsWith(row.expected)), `${row.name}: an errors array carries the UnknownError disclosure`);
+    assert.ok(allFindings(results).some((item) => item.summary.includes("UnknownError")), `${row.name}: a finding summary names the UnknownError code`);
+    assert.ok(JSON.stringify(access).includes("UnknownError"), `${row.name}: the access check names the UnknownError code`);
+
+    const exported = await exportQualysAuditBundle(client, client.getResolvedConfig(), outputRoot);
+    for (const file of walkFiles(exported.outputDir)) assertNoCanaryWindows(assert, file.content, canaries, `${row.name} bundle file ${file.name}`);
+    for (const member of readZipMembers(exported.zipPath)) assertNoCanaryWindows(assert, member.content, canaries, `${row.name} zip member ${member.name}`);
+    assert.ok(readFileSync(join(exported.outputDir, "_errors.log"), "utf8").includes(row.expected), `${row.name}: _errors.log carries the disclosure`);
+    rmSync(exported.outputDir, { recursive: true, force: true });
+    rmSync(exported.zipPath, { force: true });
+
+    // The registered tools build their own client on the global fetch, so the same router is installed there.
+    const realFetch = globalThis.fetch;
+    globalThis.fetch = async (url, init) => router(String(url), init ?? {});
+    try {
+      const toolOutput = join(outputRoot, "tool-export");
+      for (const [name, args] of [
+        ["qualys_check_access", toolArgs],
+        [row.assessTool, toolArgs],
+        ["qualys_export_audit_bundle", { ...toolArgs, output_dir: toolOutput }],
+      ]) {
+        const result = await tools.get(name).execute("call", args);
+        assert.notEqual(result.isError, true, `${name}: ${row.name} is a disclosed collection failure, not a tool failure`);
+        assertNoCanaryWindows(assert, result, canaries, `${row.name} ${name} result`);
+        if (name !== "qualys_export_audit_bundle") assert.ok(JSON.stringify(result).includes("UnknownError"), `${row.name}: ${name} names the UnknownError code`);
+      }
+      const toolFiles = walkFiles(toolOutput);
+      for (const file of toolFiles) assertNoCanaryWindows(assert, file.content, canaries, `${row.name} tool bundle file ${file.name}`);
+      assert.ok(toolFiles.some((file) => file.name.endsWith("_errors.log") && file.content.includes(row.expected)), `${row.name}: the tool bundle's _errors.log carries the disclosure`);
+      rmSync(toolOutput, { recursive: true, force: true });
+    } finally {
+      globalThis.fetch = realFetch;
+    }
+  }
+
+  // A configured credential that collides with a documented code renders the placeholder through the client too.
+  const collidingPassword = routedClient(async (url, init) => {
+    const pathname = new URL(url).pathname;
+    if (pathname === "/api/2.0/fo/asset/host/") return xmlResponse("<SIMPLE_RETURN><RESPONSE><CODE>1905</CODE><TEXT>Denied</TEXT></RESPONSE></SIMPLE_RETURN>", { status: 403 });
+    if (pathname === "/qps/rest/2.0/search/am/user/") return jsonResponse({ ServiceResponse: { responseCode: "UNAUTHORIZED", responseErrorDetails: { errorMessage: "Denied" } } }, { status: 403 });
+    return compliantRouter(url, init);
+  }, { password: "1905", token: "UNAUTHORIZED" });
+  await assert.rejects(() => collidingPassword.listHosts(100), { message: "Qualys request failed (403) for /api/2.0/fo/asset/host/: code UnknownError: Denied" });
+  await assert.rejects(() => collidingPassword.searchUsers(), { message: "Qualys QPS request failed (403) for /qps/rest/2.0/search/am/user/: responseCode UnknownError: Denied" });
+
+  // Documented codes still render through every path, including the /msp/ envelope at HTTP 200.
+  const documented = routedClient(async (url, init) => {
+    const pathname = new URL(url).pathname;
+    if (pathname === "/msp/user_list.php") return xmlResponse('<USER_LIST_OUTPUT><ERROR number="2012">Denied</ERROR></USER_LIST_OUTPUT>', { status: 200 });
+    if (pathname === "/api/2.0/fo/asset/host/") return xmlResponse("<SIMPLE_RETURN><RESPONSE><CODE>2000</CODE><TEXT>Bad Login/Password</TEXT></RESPONSE></SIMPLE_RETURN>", { status: 401 });
+    if (pathname === "/api/2.0/fo/scan/") return xmlResponse('<GENERIC_RETURN><RETURN status="FAILED" number="1905">Denied</RETURN></GENERIC_RETURN>', { status: 400 });
+    if (pathname === "/qps/rest/3.0/search/was/webapp") return jsonResponse({ ServiceResponse: { responseCode: "NOT_FOUND", responseErrorDetails: { errorMessage: "Denied" } } }, { status: 404 });
+    return compliantRouter(url, init);
+  });
+  await assert.rejects(() => documented.listUsers(), { message: "Qualys request failed (200) for /msp/user_list.php: error 2012: Denied" });
+  await assert.rejects(() => documented.listHosts(100), { message: "Qualys request failed (401) for /api/2.0/fo/asset/host/: code 2000: Bad Login/Password" });
+  await assert.rejects(() => documented.listScans(), { message: "Qualys request failed (400) for /api/2.0/fo/scan/: error 1905: Denied" });
+  await assert.rejects(() => documented.searchWebApps(), { message: "Qualys QPS request failed (404) for /qps/rest/3.0/search/was/webapp: responseCode NOT_FOUND: Denied" });
+  const documentedResults = await runAllAssessments(documented);
+  assert.ok(documentedResults.flatMap((result) => result.errors).some((entry) => entry.includes("error 2012: Denied")), "the documented /msp/ code reaches the errors array");
+  assert.ok(documentedResults.flatMap((result) => result.errors).some((entry) => entry.includes("responseCode NOT_FOUND: Denied")), "the documented QPS code reaches the errors array");
 });
 
 // ---------------------------------------------------------------------------------------------
