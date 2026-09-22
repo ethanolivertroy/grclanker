@@ -1110,6 +1110,15 @@ function carriersOf(value) {
     [`{"error_msg":"Cookie: sid=${value}; X-ApiKeys: \\"${value}\\"; Content-Type: \\"application/json\\"","code":401}`, /^\{"error_msg":"Cookie: \[REDACTED\]; X-ApiKeys: \\"\[REDACTED\]\\"; Content-Type: \\"application\/json\\"","code":401\}$/],
     [`<p>Cookie: sid="${value}"; X-ApiKeys: "${value}"; Content-Type: "text/html"</p><p>next</p>`, /^<p>Cookie: \[REDACTED\]; X-ApiKeys: "\[REDACTED\]"; Content-Type: "text\/html"<\/p><p>next<\/p>$/],
     [`Cookie: sid=${value}; X-Cookie: "token=${value}", Accept: text/html`, /^Cookie: \[REDACTED\]; X-Cookie: "\[REDACTED\]", Accept: text\/html$/],
+    // The shared end-at-separator rule, edge by edge: a quoted value ends at its closing
+    // quote even with "; Name:" inside; cookie attributes before the next header go with the
+    // cookie; an unterminated quoted value ends before the next header; Content-Type and
+    // Date after a cookie keep their names and values.
+    [`Cookie: "sid=${value}; X-ApiKeys: ${value}"`, /^Cookie: "\[REDACTED\]"$/],
+    [`Set-Cookie: TNS_SESSIONID=${value}; Path=/; HttpOnly; X-ApiKeys: accessKey=${value}`, /^Set-Cookie: \[REDACTED\]; X-ApiKeys: \[REDACTED\]$/],
+    [`Set-Cookie: TNS_SESSIONID=${value}; Expires=Wed, 21 Oct 2026 07:28:00 GMT; Path=/; X-ApiKeys: ${value}`, /^Set-Cookie: \[REDACTED\]; X-ApiKeys: \[REDACTED\]$/],
+    [`Cookie: "sid=${value}; X-ApiKeys: ${value}`, /^Cookie: \[REDACTED\]; X-ApiKeys: \[REDACTED\]$/],
+    [`Cookie: sid=${value}; Content-Type: application/json; Date: Tue, 22 Sep 2026 18:00:00 GMT`, /^Cookie: \[REDACTED\]; Content-Type: application\/json; Date: Tue, 22 Sep 2026 18:00:00 GMT$/],
     // JSON-escaped carriers at any depth: a header pair, a credential pair, an attribute, and
     // an assignment inside a JSON text stringified into a string value (one and two levels
     // down) lose their values and keep their escaped quotes, so the JSON stays well formed.
@@ -1248,6 +1257,8 @@ test("scrub boundary: name-shaped values stay bare in prose, leave every carrier
   for (const text of [
     'Content-Type: "application/json"; Accept: application/json, text/plain; X-Request-Id: 7f3a',
     "Content-Type: text/plain; charset=utf-8, Accept-Encoding: gzip, deflate",
+    "Date: Tue, 22 Sep 2026 18:00:00 GMT; Content-Type: application/json",
+    "Content-Type: application/json, Date: Tue, 22 Sep 2026 18:00:00 GMT",
     '<p>Content-Type: "text/html"; X-Request-Id: "7f3a"</p><p>next</p>',
     '{"detail":"{\\"Content-Type\\": \\"application/json\\", \\"Date\\": \\"Tue, 22 Sep 2026 18:00:00 GMT\\"}"}',
     '{"detail":"{\\"user\\": \\"auditor\\", \\"name\\": \\"s1\\", \\"tokens\\": 2}"}',

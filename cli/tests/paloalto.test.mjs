@@ -1426,6 +1426,15 @@ function carriersOf(value) {
     [`{"detail":"Cookie: sid=${value}; X-PAN-KEY: \\"${value}\\"; Content-Type: \\"application/json\\"","code":401}`, /^\{"detail":"Cookie: \[REDACTED\]; X-PAN-KEY: \\"\[REDACTED\]\\"; Content-Type: \\"application\/json\\"","code":401\}$/],
     [`<p>Cookie: sid="${value}"; X-PAN-KEY: "${value}"; Content-Type: "text/html"</p><p>next</p>`, /^<p>Cookie: \[REDACTED\]; X-PAN-KEY: "\[REDACTED\]"; Content-Type: "text\/html"<\/p><p>next<\/p>$/],
     [`Cookie: sid=${value}; X-Redlock-Auth: "${value}", Accept: text/html`, /^Cookie: \[REDACTED\]; X-Redlock-Auth: "\[REDACTED\]", Accept: text\/html$/],
+    // The shared end-at-separator rule, edge by edge: a quoted value ends at its closing
+    // quote even with "; Name:" inside; cookie attributes before the next header go with the
+    // cookie; an unterminated quoted value ends before the next header; Content-Type and
+    // Date after a cookie keep their names and values.
+    [`Cookie: "sid=${value}; X-PAN-KEY: ${value}"`, /^Cookie: "\[REDACTED\]"$/],
+    [`Set-Cookie: sid=${value}; Path=/; HttpOnly; X-PAN-KEY: ${value}`, /^Set-Cookie: \[REDACTED\]; X-PAN-KEY: \[REDACTED\]$/],
+    [`Set-Cookie: sid=${value}; Expires=Wed, 21 Oct 2026 07:28:00 GMT; Path=/; X-PAN-KEY: ${value}`, /^Set-Cookie: \[REDACTED\]; X-PAN-KEY: \[REDACTED\]$/],
+    [`Cookie: "sid=${value}; X-PAN-KEY: ${value}`, /^Cookie: \[REDACTED\]; X-PAN-KEY: \[REDACTED\]$/],
+    [`Cookie: sid=${value}; Content-Type: text/xml; Date: Tue, 22 Sep 2026 18:00:00 GMT`, /^Cookie: \[REDACTED\]; Content-Type: text\/xml; Date: Tue, 22 Sep 2026 18:00:00 GMT$/],
     // JSON-escaped carriers at any depth: a header pair, a credential pair, an attribute, and
     // an assignment inside a JSON text stringified into a string value (one and two levels
     // down) lose their values and keep their escaped quotes, so the JSON stays well formed.
@@ -1561,6 +1570,8 @@ test("scrub boundary: name-shaped values stay bare in prose, leave every carrier
   for (const text of [
     'Content-Type: "application/json"; Accept: application/json, text/xml; X-Request-Id: 7f3a',
     "Content-Type: text/xml; charset=utf-8, Accept-Encoding: gzip, deflate",
+    "Date: Tue, 22 Sep 2026 18:00:00 GMT; Content-Type: text/xml",
+    "Content-Type: text/xml, Date: Tue, 22 Sep 2026 18:00:00 GMT",
     '<p>Content-Type: "text/html"; X-Request-Id: "7f3a"</p><p>next</p>',
     '{"detail":"{\\"Content-Type\\": \\"application/json\\", \\"Date\\": \\"Tue, 22 Sep 2026 18:00:00 GMT\\"}"}',
     '{"detail":"{\\"user\\": \\"auditor\\", \\"name\\": \\"fw1\\", \\"tokens\\": 2}"}',
