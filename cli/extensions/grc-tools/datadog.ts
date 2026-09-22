@@ -690,6 +690,19 @@ export function scrubErrorText(text: string): string {
   return credentialScrubber.scrub(text);
 }
 
+const PARSE_ERROR_NOTE = "SyntaxError: response could not be parsed as JSON; the parser's message is not recorded because it quotes the body";
+
+/** JSON.parse quotes a window of the text it rejected, so a SyntaxError is recorded by name only, never by its message. */
+function isParseError(error: unknown): boolean {
+  return error instanceof SyntaxError || (error instanceof Error && error.name === "SyntaxError");
+}
+
+/** The message of any thrown value with the structural parse-error guard applied, before scrubbing. */
+function describeThrown(error: unknown): string {
+  if (isParseError(error)) return PARSE_ERROR_NOTE;
+  return error instanceof Error ? error.message : String(error);
+}
+
 function pick(record: JsonRecord, keys: string[]): JsonRecord {
   const projected: JsonRecord = {};
   for (const key of keys) {
@@ -1215,8 +1228,7 @@ export class DatadogApiClient {
       if (controller.signal.aborted) {
         throw new Error(this.redact(`Datadog request timed out after ${this.config.timeoutMs}ms: ${method} ${new URL(url).pathname}`));
       }
-      const message = error instanceof Error ? error.message : String(error);
-      throw new Error(this.redact(`Datadog request failed: ${method} ${new URL(url).pathname}: ${message}`));
+      throw new Error(this.redact(`Datadog request failed: ${method} ${new URL(url).pathname}: ${describeThrown(error)}`));
     } finally {
       clearTimeout(timeout);
     }
@@ -1656,7 +1668,7 @@ type BundleReader = IdentityReader & AccessControlReader & SecurityMonitoringRea
 
 /** The single point where an error becomes a recorded string: every caller gets the configuration-independent scrub. */
 function errorMessage(error: unknown): string {
-  return scrubErrorText(error instanceof Error ? error.message : String(error));
+  return scrubErrorText(describeThrown(error));
 }
 
 function isForbidden(error: unknown): boolean {

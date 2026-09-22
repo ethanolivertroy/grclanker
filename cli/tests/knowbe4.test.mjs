@@ -37,7 +37,8 @@ import {
   scrubErrorText,
 } from "../dist/extensions/grc-tools/knowbe4.js";
 import { getRegisteredToolSummaries } from "../dist/pi/tool-catalog.js";
-import { assertSecretsAbsent, readBundleFiles, readZipEntries } from "./helpers/bundle-contents.mjs";
+import { readBundleFiles, readZipEntries } from "./helpers/bundle-contents.mjs";
+import { assertCanaryFixture, assertCanaryWindowsAbsent } from "./helpers/canary-windows.mjs";
 import { scrubAlterations } from "./helpers/scrub-survival.mjs";
 
 const NOW = new Date("2026-09-21T12:00:00Z");
@@ -1827,16 +1828,19 @@ test("verdict rule 9: redactCredentialValues masks credential-shaped keys and re
   assert.deepEqual(Object.keys(projected), ["id", "email", "joined_on"]);
 });
 
+// Credential values planted in collected objects, in order: policy URL signature, user custom field, user comment,
+// account shared secret, webhook URL path, recipient user custom field, name/value pair setting, policy password,
+// PhishER attachment URL token. Alphanumeric and random-looking so that every 6-to-24-character window can be asserted absent.
 const KNOWBE4_FAKE_SECRETS = [
-  "FAKE_POLICY_URL_SIGNATURE_1",
-  "FAKE_USER_CUSTOM_FIELD_SECRET_2",
-  "FAKE_USER_COMMENT_SECRET_3",
-  "FAKE_ACCOUNT_SHARED_SECRET_4",
-  "FAKE_WEBHOOK_URL_TOKEN_5",
-  "FAKE_RECIPIENT_USER_CUSTOM_SECRET_6",
-  "FAKE_NAME_VALUE_PAIR_SECRET_7",
-  "FAKE_POLICY_PASSWORD_8",
-  "FAKE_PHISHER_ATTACHMENT_URL_TOKEN_9",
+  "X3FbUbhhGiSFX6sHkNrUAhpHF8a6TnB8",
+  "QDSPmGmVxtX97SmGyfKAmDW86Uf5CoVK",
+  "toTBF45nFScEQMMpSQdrJ7xiAYW6dhSR",
+  "jeWBe7qRoxo2ECEUbwRNb99qKecZ7Pzu",
+  "nNfBgmJKWaZ5uxWc8bpWgV7XNkUFPbfp",
+  "J5tUD9FFHNhjFCYQKUWBAaRpeq3p4Q9T",
+  "X7dGVP2XHLR6Na7nD3e8vgwAJUvL34bA",
+  "tUYsX4ybRbBMD9qRG6Jsc8nLQRGTEKaB",
+  "QVzH3EeJNJyVKuza4iSEnrasY5UxSheU",
 ];
 
 function secretBearingKnowbe4Fixture() {
@@ -1855,7 +1859,12 @@ function secretBearingKnowbe4Fixture() {
 
 test("verdict rule 9: the KnowBe4 bundle and its zip never carry credential-shaped values, token-bearing URLs, or free-form user fields", async () => {
   const base = createTempBase("grclanker-knowbe4-secrets-");
-  const client = mockClient(secretBearingKnowbe4Fixture(), { phisher: true });
+  const tokens = { apiToken: KB_TEST_TOKEN, phisherApiToken: KB_PHISHER_TOKEN };
+  // Self-check: the planted values share no 6-character window with each other or with the healthy fixture's own output.
+  const baseline = await exportKnowbe4AuditBundle(mockClient(healthyFixture(), { phisher: true, config: tokens }), sampleConfig(tokens), createTempBase("grclanker-knowbe4-secrets-baseline-"), { now: NOW });
+  assertCanaryFixture(assert, [...KNOWBE4_FAKE_SECRETS, KB_TEST_TOKEN, KB_PHISHER_TOKEN], readBundleFiles(baseline.outputDir), "collected-object canaries");
+
+  const client = mockClient(secretBearingKnowbe4Fixture(), { phisher: true, config: tokens });
   const result = await exportKnowbe4AuditBundle(client, client.getResolvedConfig(), base, { now: NOW });
 
   assert.equal(result.findingCount, 20);
@@ -1863,9 +1872,9 @@ test("verdict rule 9: the KnowBe4 bundle and its zip never carry credential-shap
   const entries = readZipEntries(result.zipPath);
   assert.ok(files.size >= 30, "the bundle directory was written");
   assert.equal(entries.size, files.size, "the zip archive carries every bundle file");
-  const secrets = [...KNOWBE4_FAKE_SECRETS, "reporting-token", "phisher-token"];
-  assertSecretsAbsent(assert, files, secrets, "bundle file");
-  assertSecretsAbsent(assert, entries, secrets, "zip entry");
+  const planted = [...KNOWBE4_FAKE_SECRETS, KB_TEST_TOKEN, KB_PHISHER_TOKEN];
+  assertCanaryWindowsAbsent(assert, files, planted, "bundle file");
+  assertCanaryWindowsAbsent(assert, entries, planted, "zip entry");
 
   const purchases = JSON.parse(files.get(join("core_data", "store_purchases.json")));
   assert.equal(purchases[0].policy_url, "https://policies.knowbe4.example", "the policy download URL keeps only scheme and host");
@@ -1894,15 +1903,22 @@ test("verdict rule 9: the KnowBe4 bundle and its zip never carry credential-shap
 // Addenda 2 to 6: the real client over an HTTP router that records every request the run makes.
 // ---------------------------------------------------------------------------------------------------------------
 
+// Every planted credential is alphanumeric and random-looking; helpers/canary-windows.mjs asserts every 6-to-24-character
+// window of each one absent, and the fixture self-check below proves no window occurs in the fixture's own values.
+const KB_TEST_TOKEN = "tTy4it2NbNVWLjmDrDgg4E5wiQxg7SDp";
+const KB_PHISHER_TOKEN = "4WVSdSG5bXWSpcsYrJWDqWoVbkoC6E6v";
 const KB_CANARIES = {
-  bearer: "BEARER_CANARY_9f8e7d6c5b4a3210",
-  cookie: "SESSION_CANARY_0123456789abcdef",
-  apiKey: "APIKEY_CANARY_fedcba9876543210",
-  urlToken: "URLTOKEN_CANARY_1122334455667788",
-  jwt: "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJKV1RfQ0FOQVJZX2FiY2RlZjAxMjM0NTY3ODkifQ.JWT_CANARY_SIGNATURE_abcdef0123456789",
+  bearer: "4GMSvvHWpGX5UfGVS2GiWLCeUno3jBeN",
+  cookie: "ShdPECF3iZ73AsrqRCDSNBJndtHq8LUs",
+  apiKey: "CUD9ejYDya5wZQ7QnHUY2WsuhQQM8F3X",
+  urlToken: "zgLBVJZ37SdoNdbZfBfHeSQAkGYNYYfj",
+  jwtHeader: "hiEroWQpcidJArLSq7tEQG4LQt9AvEAR",
+  jwtPayload: "wVHitqDurMm9EnikZhoLd42URdFJbT6j",
+  jwtSignature: "JPrA66Ms5PDVBbHkKWRXnQVa4UwknUbW",
 };
+const KB_JWT_CANARY = `eyJ${KB_CANARIES.jwtHeader}.${KB_CANARIES.jwtPayload}.${KB_CANARIES.jwtSignature}`;
 
-const KB_HTML_ERROR_BODY = `<html><body><h1>502 Bad Gateway</h1><p>upstream sent Authorization: Bearer ${KB_CANARIES.bearer}; Set-Cookie: session=${KB_CANARIES.cookie}; api_key=${KB_CANARIES.apiKey}; retry at https://api.example.com/v1/x?token=${KB_CANARIES.urlToken} later; jwt ${KB_CANARIES.jwt}</p></body></html>`;
+const KB_HTML_ERROR_BODY = `<html><body><h1>502 Bad Gateway</h1><p>upstream sent Authorization: Bearer ${KB_CANARIES.bearer}; Set-Cookie: session=${KB_CANARIES.cookie}; api_key=${KB_CANARIES.apiKey}; retry at https://api.example.com/v1/x?token=${KB_CANARIES.urlToken} later; jwt ${KB_JWT_CANARY}</p></body></html>`;
 
 /** A proxy error page: non-JSON, carrying every credential class in its body. */
 function htmlGateway() {
@@ -1970,7 +1986,7 @@ function httpKnowbe4(fixture, options = {}) {
     log.push({ method, path: url.pathname, url: url.toString(), status: response.status });
     return response;
   };
-  const config = sampleConfig({ phisherApiToken: options.phisher === false ? undefined : "phisher-token", ...(options.config ?? {}) });
+  const config = sampleConfig({ apiToken: KB_TEST_TOKEN, phisherApiToken: options.phisher === false ? undefined : KB_PHISHER_TOKEN, ...(options.config ?? {}) });
   const client = new Knowbe4ApiClient(config, { fetchImpl, sleepImpl: async () => {}, maxRetries: 0, minRequestIntervalMs: 0 });
   return { client, config, log };
 }
@@ -2060,7 +2076,24 @@ function kbRecordedErrorStrings(access, assessments, files) {
   return strings;
 }
 
-test("verdict rule 9 / addendum 2: the KnowBe4 bundle, its zip, every assess payload, and the access check never carry canaries from error bodies, and errors carry the status-and-length note", async () => {
+test("canary fixture self-check: every planted KnowBe4 credential is alphanumeric, random-looking, and shares no 6-character window with the fixture's legitimate values", async () => {
+  const { client, config } = httpKnowbe4(healthyFixture());
+  const access = await checkKnowbe4Access(client);
+  const assessments = await runAllKnowbe4Assessments(client);
+  const exported = await exportKnowbe4AuditBundle(client, config, createTempBase("grclanker-knowbe4-self-check-"), { now: NOW });
+  const legitimate = new Map([
+    ...readBundleFiles(exported.outputDir),
+    ["fixture", JSON.stringify(healthyFixture())],
+    ["principal fixture", JSON.stringify(principalFixture())],
+    ["check_access", JSON.stringify(access)],
+    ["assessments", JSON.stringify(assessments)],
+    ["config", JSON.stringify({ ...config, apiToken: null, phisherApiToken: null })],
+  ]);
+  const canaries = [...Object.values(KB_CANARIES), KB_TEST_TOKEN, KB_PHISHER_TOKEN, ...KNOWBE4_FAKE_SECRETS, ...Object.values(KB_CONFIG_CANARIES), KB_PARSER_SNIPPET_CANARY];
+  assertCanaryFixture(assert, canaries, legitimate, "KnowBe4 canaries");
+});
+
+test("verdict rule 9 / addendum 2: the KnowBe4 bundle, its zip, every assess payload, and the access check never carry any window of a canary from an error body, and errors carry the status-and-length note", async () => {
   const { client, config, log } = httpKnowbe4(healthyFixture(), {
     routes: { "GET /v1/groups": htmlGateway(), "GET /v1/training/store_purchases": jsonForbiddenWithUrl() },
   });
@@ -2072,10 +2105,10 @@ test("verdict rule 9 / addendum 2: the KnowBe4 bundle, its zip, every assess pay
   const files = readBundleFiles(result.outputDir);
   const entries = readZipEntries(result.zipPath);
   assert.ok(files.size >= 25 && entries.size === files.size, `expected the zip to mirror ${files.size} files, got ${entries.size}`);
-  const secrets = [...Object.values(KB_CANARIES), config.apiToken, config.phisherApiToken];
-  assertSecretsAbsent(assert, files, secrets, "bundle file");
-  assertSecretsAbsent(assert, entries, secrets, "zip entry");
-  assertSecretsAbsent(assert, new Map([["check_access", JSON.stringify(access)], ["assessments", JSON.stringify(assessments)]]), secrets, "tool payload");
+  const planted = [...Object.values(KB_CANARIES), KB_JWT_CANARY, config.apiToken, config.phisherApiToken];
+  assertCanaryWindowsAbsent(assert, files, planted, "bundle file");
+  assertCanaryWindowsAbsent(assert, entries, planted, "zip entry");
+  assertCanaryWindowsAbsent(assert, new Map([["check_access", JSON.stringify(access)], ["assessments", JSON.stringify(assessments)]]), planted, "tool payload");
   assert.ok(log.some((entry) => entry.status === 502) && log.some((entry) => entry.status === 403), "both failing surfaces were requested");
 
   // The non-JSON body is described by status and length; the JSON error is quoted with its URL query scrubbed.
@@ -2213,7 +2246,7 @@ test("addendum 5: under each single-inventory denial the denied dataset's core_d
     assert.equal(denied.status, 403, `${label}: the marker carries the observed status`);
     assert.equal(denied.reason, "not_readable", label);
     assert.match(denied.error, /KnowBe4 request failed \(403 Forbidden\)/, label);
-    assert.ok(!denied.error.includes(KB_CANARIES.urlToken), `${label}: the URL token in the error body is scrubbed`);
+    assertCanaryWindowsAbsent(assert, JSON.stringify(denied), [KB_CANARIES.urlToken], `${label} marker`);
     const requested = new Set(log.filter((entry) => entry.status === 403).map((entry) => `${entry.method} ${entry.path}`));
     for (const endpoint of denied.endpoint.split(", ")) {
       assert.ok(requested.has(endpoint.split("?")[0].replace(/ phisherMessages$/, "")), `${label}: marker names ${endpoint}, which was not the denied request (${[...requested].join(", ")})`);
@@ -2423,7 +2456,7 @@ test("addendum 4: a 502 HTML page or a JSON error message carrying credentials o
     for (const variant of variants) {
       const { client, config } = httpKnowbe4(healthyFixture(), { routes: { [surface]: variant.handler() } });
       const label = `${surface} ${variant.name}`;
-      const secrets = [...Object.values(KB_CANARIES), config.apiToken, config.phisherApiToken];
+      const planted = [...Object.values(KB_CANARIES), KB_JWT_CANARY, config.apiToken, config.phisherApiToken];
 
       const access = await checkKnowbe4Access(client);
       const assessments = await runAllKnowbe4Assessments(client);
@@ -2431,9 +2464,9 @@ test("addendum 4: a 502 HTML page or a JSON error message carrying credentials o
       const files = readBundleFiles(result.outputDir);
       const entries = readZipEntries(result.zipPath);
 
-      assertSecretsAbsent(assert, files, secrets, `${label} bundle file`);
-      assertSecretsAbsent(assert, entries, secrets, `${label} zip entry`);
-      assertSecretsAbsent(assert, new Map([["check_access", JSON.stringify(access)], ["assessments", JSON.stringify(assessments)]]), secrets, `${label} tool payload`);
+      assertCanaryWindowsAbsent(assert, files, planted, `${label} bundle file`);
+      assertCanaryWindowsAbsent(assert, entries, planted, `${label} zip entry`);
+      assertCanaryWindowsAbsent(assert, new Map([["check_access", JSON.stringify(access)], ["assessments", JSON.stringify(assessments)]]), planted, `${label} tool payload`);
 
       const pattern = kbSurfacePattern(surface);
       const aboutSurface = kbRecordedErrorStrings(access, assessments, files).filter((text) => pattern.test(text) && /request failed|timed out/.test(text));
@@ -2442,7 +2475,7 @@ test("addendum 4: a 502 HTML page or a JSON error message carrying credentials o
       for (const text of aboutSurface) {
         assert.match(text, variant.note, `${label}: error string lacks the status note: ${text}`);
         assert.ok(!/<html|Bad Gateway<\/|upstream sent/.test(text), `${label}: error string echoes the body: ${text}`);
-        if (variant.name === "json403") assert.ok(!text.includes(`token=${KB_CANARIES.urlToken}`), `${label}: URL token survives in ${text}`);
+        if (variant.name === "json403") assertCanaryWindowsAbsent(assert, text, [KB_CANARIES.urlToken], `${label} error string`);
       }
     }
   }
@@ -2454,32 +2487,20 @@ test("addendum 4: a 502 HTML page or a JSON error message carrying credentials o
 // ---------------------------------------------------------------------------------------------------------------
 
 const KB_CONFIG_CANARIES = {
-  nestedKey: "CFGA1b2c3d4e5f6g7h8",
-  nestedValue: "CFGB9i0j1k2l3m4n5o6",
-  alias: "CFGC7p8q9r0s1t2u3v4",
+  nestedKey: "UfJ5c4A7p6pL5VJpnbCyGKExThjgzGZV",
+  nestedValue: "Wi2seuvnQDjpk2UxuJBrwco7B4tCrzqN",
+  alias: "sehnBAdXx2kHYN8SfAk9HfdMM6UEYrnS",
+  unreadable: "9WWhhs4NH3gsi2oJGCcfZkWbDMrPq7jB",
 };
+const KB_PARSER_SNIPPET_CANARY = "sFp3XJQYXRyCxM7KH9e4mnZXTzaHVQQk";
 
 const LIBRARY_WORDING = ["Nested mappings", "is not valid JSON", "Unresolved alias", "illegal operation", "permission denied", "no such file"];
 
-function eightCharacterWindows(text) {
-  const windows = [];
-  for (let index = 0; index + 8 <= text.length; index += 1) windows.push(text.slice(index, index + 8));
-  return windows;
-}
-
-/** Asserts a message carries neither a canary, nor any 8-character fragment of one, nor the parser's or filesystem's own wording. */
+/** Asserts a message carries neither any window of a canary nor the parser's or filesystem's own wording. */
 function assertFixedTextOnly(message, canaries, label) {
-  for (const canary of canaries) {
-    assert.ok(!message.includes(canary), `${label}: carries the canary: ${message}`);
-    for (const fragment of eightCharacterWindows(canary)) assert.ok(!message.includes(fragment), `${label}: carries the fragment ${fragment}: ${message}`);
-  }
+  assertCanaryWindowsAbsent(assert, message, canaries, label);
   for (const wording of LIBRARY_WORDING) assert.ok(!message.includes(wording), `${label}: carries library wording "${wording}": ${message}`);
 }
-
-test("config loader errors: every 8-character window of the config canaries is distinct", () => {
-  const windows = Object.values(KB_CONFIG_CANARIES).flatMap(eightCharacterWindows);
-  assert.equal(new Set(windows).size, windows.length);
-});
 
 test("config loader errors: a KnowBe4 config file that cannot be read or parsed yields fixed text with only the path, a validated code, and the parser's line, from the resolver and from check_access", async () => {
   const registered = [];
@@ -2514,7 +2535,7 @@ test("config loader errors: a KnowBe4 config file that cannot be read or parsed 
     // EACCES: an unreadable file (root reads everything, so the case is skipped when running as root).
     if (typeof process.getuid === "function" && process.getuid() !== 0) {
       const unreadable = join(base, "unreadable.yaml");
-      writeFileSync(unreadable, `api_token: ${KB_CONFIG_CANARIES.alias}\n`, "utf8");
+      writeFileSync(unreadable, `api_token: ${KB_CONFIG_CANARIES.unreadable}\n`, "utf8");
       chmodSync(unreadable, 0o000);
       assert.throws(() => readFileSync(unreadable, "utf8"), (error) => error.code === "EACCES" && /permission denied/.test(error.message), "positive control");
       cases.push({ name: "EACCES", path: unreadable, code: "EACCES", line: undefined, message: `Unable to read KnowBe4 config file ${unreadable} (EACCES)` });
@@ -2560,7 +2581,7 @@ test("config loader errors: a KnowBe4 config file that cannot be read or parsed 
 });
 
 test("config loader errors: a SyntaxError raised by the transport is recorded by name only, never by the parser's message that quotes the body", async () => {
-  const snippet = "<html>PARSER-SNIPPET-CANARY-4242</html>";
+  const snippet = `<html>${KB_PARSER_SNIPPET_CANARY}</html>`;
   const client = new Knowbe4ApiClient(sampleConfig(), {
     fetchImpl: async () => { throw new SyntaxError(`Unexpected token '<', "${snippet}"... is not valid JSON`); },
     minRequestIntervalMs: 0,
@@ -2572,10 +2593,11 @@ test("config loader errors: a SyntaxError raised by the transport is recorded by
     return true;
   });
   const access = await checkKnowbe4Access(client);
-  assert.ok(!JSON.stringify(access).includes("PARSER-SNIPPET"), "the access check never carries the snippet");
+  assertCanaryWindowsAbsent(assert, JSON.stringify(access), [KB_PARSER_SNIPPET_CANARY], "check_access");
   assert.ok(access.surfaces.every((surface) => surface.status !== "readable" || surface.name === "phisher_messages"));
   const snapshot = await collectKnowbe4Snapshot(client, { scopes: ["risk"], now: NOW });
-  assert.ok(snapshot.errors.length > 0 && snapshot.errors.every((text) => text.includes("SyntaxError: response could not be parsed as JSON") && !text.includes("PARSER-SNIPPET")), snapshot.errors.join("\n"));
+  assert.ok(snapshot.errors.length > 0 && snapshot.errors.every((text) => text.includes("SyntaxError: response could not be parsed as JSON")), snapshot.errors.join("\n"));
+  assertCanaryWindowsAbsent(assert, JSON.stringify(snapshot), [KB_PARSER_SNIPPET_CANARY], "snapshot");
 });
 
 // ---------------------------------------------------------------------------------------------------------------

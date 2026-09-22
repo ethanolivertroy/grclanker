@@ -38,11 +38,15 @@ import {
   scrubErrorText,
 } from "../dist/extensions/grc-tools/elastic.js";
 import { getRegisteredToolSummaries } from "../dist/pi/tool-catalog.js";
-import { assertSecretsAbsent, readBundleFiles, readZipEntries } from "./helpers/bundle-contents.mjs";
+import { readBundleFiles, readZipEntries } from "./helpers/bundle-contents.mjs";
+import { assertCanaryFixture, assertCanaryWindowsAbsent } from "./helpers/canary-windows.mjs";
 import { scrubAlterations } from "./helpers/scrub-survival.mjs";
 
 const DAY_MS = 86_400_000;
-const API_KEY = Buffer.from("audit-id:audit-secret-value").toString("base64");
+// The configured API key: its base64 form and the secret half of its decoded id:api_key form are both alphanumeric and
+// random-looking so that every 6-to-24-character window of each can be asserted absent (helpers/canary-windows.mjs).
+const API_KEY_SECRET = "pf4bJ2aaYRdRv9UBB5ZkrDKRUzxMhBa7";
+const API_KEY = Buffer.from(`audit-key-id:${API_KEY_SECRET}`).toString("base64");
 
 function createTempBase(prefix) {
   return mkdtempSync(join(tmpdir(), prefix));
@@ -534,7 +538,7 @@ test("resolveElasticConfiguration rejects missing URL or credentials", () => {
   );
 });
 
-const CONFIG_FILE_CANARY = "CONFIGFILE_CANARY_7d8e9f0a1b2c3d4e";
+const CONFIG_FILE_CANARY = "RKnRPLu6AhK3iGHdJCCo4EAup4Gw9IDW";
 
 /** Malformed YAML shapes; the yaml package quotes the offending source line in its own message for most of them. */
 const MALFORMED_YAML_CONFIGS = [
@@ -572,17 +576,17 @@ test("rule 9 / addendum 6: a malformed config file whose bad line carries a cred
       assert.equal(thrown.line, shape.line, `${shape.name}: the parser's structured line position is carried`);
       assert.equal(thrown.path, configPath, shape.name);
       assert.equal(thrown.message, expected, `${shape.name}: fixed text only`);
-      assert.ok(!thrown.message.includes(CONFIG_FILE_CANARY), `${shape.name}: the resolver message quotes the credential: ${thrown.message}`);
+      assertCanaryWindowsAbsent(assert, thrown.message, [CONFIG_FILE_CANARY], `${shape.name} resolver message`);
       assert.ok(!thrown.message.includes("api_key") && !thrown.message.includes("first-key"), `${shape.name}: no key name or value from the file: ${thrown.message}`);
 
       const access = await checkTool.execute("call-config", checkTool.prepareArguments({ config_file: configPath }));
       assert.equal(access.isError, true, shape.name);
-      assert.ok(!JSON.stringify(access).includes(CONFIG_FILE_CANARY), `${shape.name}: the check_access payload quotes the credential`);
+      assertCanaryWindowsAbsent(assert, JSON.stringify(access), [CONFIG_FILE_CANARY], `${shape.name} check_access payload`);
       assert.equal(access.content[0].text, `Elastic access check failed: ${expected}`, shape.name);
 
       const exported = await exportTool.execute("call-config-export", exportTool.prepareArguments({ config_file: configPath, output_dir: outputDir }));
       assert.equal(exported.isError, true, shape.name);
-      assert.ok(!JSON.stringify(exported).includes(CONFIG_FILE_CANARY), `${shape.name}: the export payload quotes the credential`);
+      assertCanaryWindowsAbsent(assert, JSON.stringify(exported), [CONFIG_FILE_CANARY], `${shape.name} export payload`);
       assert.equal(exported.content[0].text, `Elastic audit bundle export failed: ${expected}`, shape.name);
       assert.equal(existsSync(outputDir), false, `${shape.name}: nothing is written when the config file is unreadable`);
     }
@@ -597,7 +601,7 @@ test("rule 9 / addendum 6: a malformed config file whose bad line carries a cred
       scalarError = error;
     }
     assert.match(scalarError.message, /Elasticsearch URL is required/);
-    assert.ok(!scalarError.message.includes(CONFIG_FILE_CANARY), "a scalar-valued config file is never echoed");
+    assertCanaryWindowsAbsent(assert, scalarError.message, [CONFIG_FILE_CANARY], "scalar-valued config file");
   } finally {
     globalThis.fetch = originalFetch;
   }
@@ -607,33 +611,22 @@ test("rule 9 / addendum 6: a malformed config file whose bad line carries a cred
 // Addendum 6b: config loader errors are fixed text carrying only the path, a validated code, and a line.
 // ---------------------------------------------------------------------------------------------------------------
 
+// Alphanumeric and random-looking so that every 6-to-24-character window can be asserted absent (helpers/canary-windows.mjs).
 const ELASTIC_CONFIG_CANARIES = {
-  nestedKey: "CFGA1b2c3d4e5f6g7h8",
-  nestedValue: "CFGB9i0j1k2l3m4n5o6",
-  alias: "CFGC7p8q9r0s1t2u3v4",
+  nestedKey: "h7nLwCmVUWbZdsum53HeFFT3vpneLNMZ",
+  nestedValue: "aJJarKiYeinNFRWUyCByEx3DbWg8qCDw",
+  alias: "BnfQbGSUVRi9bLDovUZBoStTChiFLaH5",
+  unreadable: "dGsYY9jcfAHYM5mTc4LeUL3H4ycW5WRZ",
 };
+const ES_PARSER_SNIPPET_CANARY = "eJSJDuDHDVYbBbBu2pt8VPomHyvFAuTz";
 
 const LIBRARY_WORDING = ["Nested mappings", "is not valid JSON", "Unresolved alias", "illegal operation", "permission denied", "no such file"];
 
-function eightCharacterWindows(text) {
-  const windows = [];
-  for (let index = 0; index + 8 <= text.length; index += 1) windows.push(text.slice(index, index + 8));
-  return windows;
-}
-
-/** Asserts a message carries neither a canary, nor any 8-character fragment of one, nor the parser's or filesystem's own wording. */
+/** Asserts a message carries neither any window of a canary nor the parser's or filesystem's own wording. */
 function assertFixedTextOnly(message, canaries, label) {
-  for (const canary of canaries) {
-    assert.ok(!message.includes(canary), `${label}: carries the canary: ${message}`);
-    for (const fragment of eightCharacterWindows(canary)) assert.ok(!message.includes(fragment), `${label}: carries the fragment ${fragment}: ${message}`);
-  }
+  assertCanaryWindowsAbsent(assert, message, canaries, label);
   for (const wording of LIBRARY_WORDING) assert.ok(!message.includes(wording), `${label}: carries library wording "${wording}": ${message}`);
 }
-
-test("config loader errors: every 8-character window of the Elastic config canaries is distinct", () => {
-  const windows = Object.values(ELASTIC_CONFIG_CANARIES).flatMap(eightCharacterWindows);
-  assert.equal(new Set(windows).size, windows.length);
-});
 
 test("config loader errors: an Elastic config file that cannot be read or parsed yields fixed text with only the path, a validated code, and the parser's line, from the resolver and from check_access", async () => {
   const registered = [];
@@ -668,7 +661,7 @@ test("config loader errors: an Elastic config file that cannot be read or parsed
     // EACCES: an unreadable file (root reads everything, so the case is skipped when running as root).
     if (typeof process.getuid === "function" && process.getuid() !== 0) {
       const unreadable = join(base, "unreadable.yaml");
-      writeFileSync(unreadable, `api_key: ${ELASTIC_CONFIG_CANARIES.alias}\n`, "utf8");
+      writeFileSync(unreadable, `api_key: ${ELASTIC_CONFIG_CANARIES.unreadable}\n`, "utf8");
       chmodSync(unreadable, 0o000);
       assert.throws(() => readFileSync(unreadable, "utf8"), (error) => error.code === "EACCES" && /permission denied/.test(error.message), "positive control");
       cases.push({ name: "EACCES", path: unreadable, code: "EACCES", line: undefined, message: `Unable to read Elastic config file ${unreadable} (EACCES)` });
@@ -714,6 +707,27 @@ test("config loader errors: an Elastic config file that cannot be read or parsed
   } finally {
     globalThis.fetch = originalFetch;
   }
+});
+
+test("config loader errors: a SyntaxError raised by the transport is recorded by name only, never by the parser's message that quotes the body", async () => {
+  const snippet = `<html>${ES_PARSER_SNIPPET_CANARY}</html>`;
+  const config = sampleConfig({ maxRetries: 0 });
+  const client = new ElasticApiClient(config, {
+    fetchImpl: async () => { throw new SyntaxError(`Unexpected token '<', "${snippet}"... is not valid JSON`); },
+    sleepImpl: async () => {},
+  });
+  await assert.rejects(() => client.listUsers(), (error) => {
+    assert.equal(error.message, "elasticsearch request GET /_security/user failed: SyntaxError: response could not be parsed as JSON; the parser's message is not recorded because it quotes the body");
+    return true;
+  });
+  const access = await checkElasticAccess(client);
+  assertCanaryWindowsAbsent(assert, JSON.stringify(access), [ES_PARSER_SNIPPET_CANARY], "check_access");
+  assert.ok(access.surfaces.every((surface) => surface.status !== "readable"), "no surface reads through a transport that cannot be parsed");
+  const snapshot = await collectElasticSnapshot(client, ELASTIC_ALL_DATASETS, {});
+  const assessments = ALL_AREAS.map((area) => evaluateElasticArea(area, snapshot, {}, { elasticsearchUrl: config.elasticsearchUrl }));
+  const errors = assessments.flatMap((assessment) => assessment.errors ?? []);
+  assert.ok(errors.length > 0 && errors.every((text) => text.includes("SyntaxError: response could not be parsed as JSON")), errors.join("\n"));
+  assertCanaryWindowsAbsent(assert, JSON.stringify(assessments), [ES_PARSER_SNIPPET_CANARY], "assess payload");
 });
 
 test("normalizeElasticApiKey encodes id:key pairs and preserves base64 values", () => {
@@ -2422,25 +2436,30 @@ test("Elastic tools appear in the tool catalog under the Elastic group", () => {
 // denied-list markers.
 // ---------------------------------------------------------------------------
 
+// Every planted credential is alphanumeric and random-looking; helpers/canary-windows.mjs asserts every 6-to-24-character
+// window of each one absent, and the fixture self-check below proves no window occurs in the fixture's own values.
 const CANARIES = {
-  bearer: "BEARER_CANARY_9f8e7d6c5b4a3210",
-  cookie: "SESSION_CANARY_0123456789abcdef",
-  apiKey: "APIKEY_CANARY_fedcba9876543210",
-  urlToken: "URLTOKEN_CANARY_1122334455667788",
-  jwt: "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJKV1RfQ0FOQVJZX2FiY2RlZjAxMjM0NTY3ODkifQ.JWT_CANARY_SIGNATURE_abcdef0123456789",
-  privateKey: "PRIVATEKEY_CANARY_a1b2c3d4e5f60718",
-  bindPassword: "BINDPASSWORD_CANARY_2233445566778899",
-  connectorSecret: "CONNECTORSECRET_CANARY_33445566778899aa",
-  watchPassword: "WATCHPASSWORD_CANARY_445566778899aabb",
-  pipelineLiteral: "PIPELINE_LITERAL_CANARY_5566778899aabbcc",
-  enrollmentKey: "ENROLLMENT_CANARY_66778899aabbccdd",
-  outputKey: "OUTPUTKEY_CANARY_778899aabbccddee",
-  headerToken: "HEADERTOKEN_CANARY_8899aabbccddeeff",
-  urlPath: "URLPATH_CANARY_99aabbccddeeff00",
+  bearer: "KV3PDsExQn2buYHteENDtKHoF75wU56R",
+  cookie: "fc8LS4ZkLg8o2K2ESNUKtMgakj8WsGzL",
+  apiKey: "AaB6wvMiGMD7ReAp6tKkmeQD9QWYFmuM",
+  urlToken: "TrRpRjXEmKud7cZtPAgpAWkRGDofqgAU",
+  jwtHeader: "GXUKHX6WPPhMwBy7ioU2NGJV5v7EzQA4",
+  jwtPayload: "gUW9vPruHKyYYnVZMBZs8RJ5zhEKZCsu",
+  jwtSignature: "jwsQai2T465DcCfuENuALQ5pL6UPcCxB",
+  privateKey: "RH6KajwLmtW4pn5csRcoGWhqC5nM2GFw",
+  bindPassword: "csbj7LDHYpDgAsPDECbjN4Gh6iykWaJj",
+  connectorSecret: "4DwXTMoA5vB7sAEpZsJQyU7vVXvL5sbF",
+  watchPassword: "m8zZdEUbAErhQC8WXbaTYdXutb7uG7zG",
+  pipelineLiteral: "8acNmFonH3gV9L5WMe68ZvLDDJDLwQJx",
+  enrollmentKey: "e3mNEELYbK9PcGrRFHn4KTRDadLwdn3a",
+  outputKey: "2xp33ZaXQ83GeheL5KqCzkZdKRLubJQw",
+  headerToken: "t8eA28gPGYmT7Y6c7fXedGwoMyHbavaB",
+  urlPath: "4YcuDZFGa9BFBXKWJfQWCEag6MriQbKm",
 };
+const JWT_CANARY = `eyJ${CANARIES.jwtHeader}.${CANARIES.jwtPayload}.${CANARIES.jwtSignature}`;
 
 function canaryValues() {
-  return Object.values(CANARIES);
+  return [...Object.values(CANARIES), JWT_CANARY];
 }
 
 function canaryFixtures(now = Date.now()) {
@@ -2497,7 +2516,7 @@ function canaryFixtures(now = Date.now()) {
   return fixtures;
 }
 
-const HTML_ERROR_BODY = `<html><body><h1>502 Bad Gateway</h1><p>upstream sent Authorization: Bearer ${CANARIES.bearer}; Set-Cookie: session=${CANARIES.cookie}; api_key=${CANARIES.apiKey}; retry at https://api.example.com/v1/x?token=${CANARIES.urlToken} later; jwt ${CANARIES.jwt}</p></body></html>`;
+const HTML_ERROR_BODY = `<html><body><h1>502 Bad Gateway</h1><p>upstream sent Authorization: Bearer ${CANARIES.bearer}; Set-Cookie: session=${CANARIES.cookie}; api_key=${CANARIES.apiKey}; retry at https://api.example.com/v1/x?token=${CANARIES.urlToken} later; jwt ${JWT_CANARY}</p></body></html>`;
 
 function htmlGateway() {
   return () => new Response(HTML_ERROR_BODY, { status: 502, statusText: "Bad Gateway", headers: { "content-type": "text/html; charset=utf-8" } });
@@ -2537,13 +2556,12 @@ test("verdict rule 9: redactSecrets scrubs configured secrets and every credenti
     `elasticsearch request GET /_security/user failed (502 Bad Gateway): proxy said Authorization: Bearer ${CANARIES.bearer}`,
     `and ApiKey ${API_KEY} and Basic dXNlcjpwYXNzd29yZA== then Set-Cookie: session=${CANARIES.cookie}; Path=/`,
     `api_key="${CANARIES.apiKey}" token=${CANARIES.urlToken} secret: ${CANARIES.connectorSecret}`,
-    `retry at https://user:${CANARIES.bindPassword}@api.example.com/v1/x?token=${CANARIES.urlToken}#frag mid sentence and ${CANARIES.jwt} as jwt`,
-    "the raw secret audit-secret-value must go too",
+    `retry at https://user:${CANARIES.bindPassword}@api.example.com/v1/x?token=${CANARIES.urlToken}#frag mid sentence and ${JWT_CANARY} as jwt`,
+    `the raw secret ${API_KEY_SECRET} must go too`,
   ].join(" ");
   const scrubbed = redactSecrets(text, config);
-  for (const canary of [...canaryValues(), API_KEY, "audit-secret-value", "dXNlcjpwYXNzd29yZA=="]) {
-    assert.ok(!scrubbed.includes(canary), `${canary} survived redaction in: ${scrubbed}`);
-  }
+  assertCanaryWindowsAbsent(assert, scrubbed, [CANARIES.bearer, CANARIES.cookie, CANARIES.apiKey, CANARIES.urlToken, CANARIES.connectorSecret, CANARIES.bindPassword, JWT_CANARY, API_KEY, API_KEY_SECRET], "redactSecrets output");
+  assert.ok(!scrubbed.includes("dXNlcjpwYXNzd29yZA=="), `the Basic value survived redaction in: ${scrubbed}`);
   assert.match(scrubbed, /GET \/_security\/user failed \(502 Bad Gateway\)/, "the request line and status stay readable");
   assert.match(scrubbed, /https:\/\/api\.example\.com\/v1\/x\?\[REDACTED\]/, "URLs keep scheme, host, and path but lose userinfo, query, and fragment");
   assert.match(scrubbed, /Authorization: Bearer \[REDACTED\]/, "the header keeps its scheme so the message still says what was replayed");
@@ -2608,15 +2626,14 @@ test("verdict rule 9: ElasticApiClient describes non-JSON bodies by status and l
     assert.ok(error instanceof ElasticRequestError);
     assert.equal(error.status, 502);
     assert.match(error.message, /GET \/_security\/user failed \(502 Bad Gateway\): 502 Bad Gateway: non-JSON body \(text\/html, \d+ bytes, not echoed\)/);
-    for (const canary of canaryValues()) assert.ok(!error.message.includes(canary), `${canary} leaked into ${error.message}`);
+    assertCanaryWindowsAbsent(assert, error.message, canaryValues(), "502 error message");
     return true;
   });
   await assert.rejects(client.listRoleMappings(), (error) => {
     assert.equal(error.status, 403);
     assert.match(error.message, /security_exception/);
     assert.match(error.message, /https:\/\/api\.example\.com\/v1\/x\?\[REDACTED\]/, "a URL embedded mid-message loses its query string");
-    assert.ok(!error.message.includes(CANARIES.urlToken));
-    assert.ok(!error.message.includes(CANARIES.bearer), "undocumented header fields are never echoed");
+    assertCanaryWindowsAbsent(assert, error.message, [CANARIES.urlToken, CANARIES.bearer], "403 error message (undocumented header fields are never echoed)");
     return true;
   });
   await assert.rejects(client.getLicense(), (error) => {
@@ -2628,12 +2645,31 @@ test("verdict rule 9: ElasticApiClient describes non-JSON bodies by status and l
   await assert.rejects(client.getIlmStatus(), (error) => {
     assert.equal(error.status, 500);
     assert.match(error.message, /500 Internal Server Error: JSON body without a documented error field \(application\/json, \d+ bytes, not echoed\)/);
-    assert.ok(!error.message.includes(CANARIES.apiKey));
+    assertCanaryWindowsAbsent(assert, error.message, [CANARIES.apiKey], "500 error message");
     return true;
   });
 });
 
-test("verdict rule 9: the Elastic bundle, its zip, every assess payload, and the access check never carry canaries from bodies or collected objects", async () => {
+test("canary fixture self-check: every planted Elastic credential is alphanumeric, random-looking, and shares no 6-character window with the fixture's legitimate values", async () => {
+  const config = sampleConfig({ maxRetries: 0 });
+  const client = new ElasticApiClient(config, { fetchImpl: createRouter(healthyRoutes(healthyFixtures())) });
+  const access = await checkElasticAccess(client);
+  const result = await exportElasticAuditBundle(client, config, createTempBase("elastic-self-check-"), { sensitiveIndexPatterns: ["customers-*"] });
+  const snapshot = await collectElasticSnapshot(client, ELASTIC_ALL_DATASETS, {});
+  const assessments = ALL_AREAS.map((area) => evaluateElasticArea(area, snapshot, {}, { elasticsearchUrl: config.elasticsearchUrl }));
+  const legitimate = new Map([
+    ...readBundleFiles(result.outputDir),
+    ["fixture", JSON.stringify(healthyFixtures())],
+    ["principal fixture", JSON.stringify(principalFixtures())],
+    ["access", JSON.stringify(access)],
+    ["assessments", JSON.stringify(assessments)],
+    ["config", JSON.stringify({ ...config, apiKey: null })],
+  ]);
+  const canaries = [...Object.values(CANARIES), API_KEY, API_KEY_SECRET, CONFIG_FILE_CANARY, ...Object.values(ELASTIC_CONFIG_CANARIES), ES_PARSER_SNIPPET_CANARY];
+  assertCanaryFixture(assert, canaries, legitimate, "Elastic canaries");
+});
+
+test("verdict rule 9: the Elastic bundle, its zip, every assess payload, and the access check never carry any window of a canary from bodies or collected objects", async () => {
   const fixtures = canaryFixtures();
   const routes = healthyRoutes(fixtures);
   routes["GET /_security/role_mapping"] = htmlGateway();
@@ -2650,10 +2686,10 @@ test("verdict rule 9: the Elastic bundle, its zip, every assess payload, and the
   const files = readBundleFiles(result.outputDir);
   const entries = readZipEntries(result.zipPath);
   assert.ok(files.size > 20 && entries.size === files.size, `expected the zip to mirror ${files.size} files, got ${entries.size}`);
-  const secrets = [...canaryValues(), API_KEY, "audit-secret-value", "enrollment-secret"];
-  assertSecretsAbsent(assert, files, secrets, "bundle file");
-  assertSecretsAbsent(assert, entries, secrets, "zip entry");
-  assertSecretsAbsent(assert, new Map([["access", JSON.stringify(access)], ["assessments", JSON.stringify(assessments)]]), secrets, "tool payload");
+  const planted = [...canaryValues(), API_KEY, API_KEY_SECRET];
+  assertCanaryWindowsAbsent(assert, files, planted, "bundle file");
+  assertCanaryWindowsAbsent(assert, entries, planted, "zip entry");
+  assertCanaryWindowsAbsent(assert, new Map([["access", JSON.stringify(access)], ["assessments", JSON.stringify(assessments)]]), planted, "tool payload");
 
   const errors = files.get("_errors.log");
   assert.match(errors, /role_mappings \(GET \/_security\/role_mapping\): elasticsearch request GET \/_security\/role_mapping failed \(502 Bad Gateway\): 502 Bad Gateway: non-JSON body \(text\/html, \d+ bytes, not echoed\)/);
@@ -2701,7 +2737,7 @@ test("addendum 4: a 502 HTML page or a JSON error message carrying credentials o
   const surfaces = Object.keys(healthyRoutes(fixtures));
   assert.ok(surfaces.length >= 30, `expected every collector and access probe route, got ${surfaces.length}`);
   const config = sampleConfig({ maxRetries: 0 });
-  const secrets = [...canaryValues(), API_KEY, "audit-secret-value"];
+  const planted = [...canaryValues(), API_KEY, API_KEY_SECRET];
   const variants = [
     { name: "html502", handler: htmlGateway, note: /502 Bad Gateway: non-JSON body \(text\/html, \d+ bytes, not echoed\)/ },
     { name: "json403", handler: jsonErrorWithUrl, note: /403 Forbidden/ },
@@ -2721,9 +2757,9 @@ test("addendum 4: a 502 HTML page or a JSON error message carrying credentials o
       const files = readBundleFiles(result.outputDir);
       const entries = readZipEntries(result.zipPath);
 
-      assertSecretsAbsent(assert, files, secrets, `${label} bundle file`);
-      assertSecretsAbsent(assert, entries, secrets, `${label} zip entry`);
-      assertSecretsAbsent(assert, new Map([["access", JSON.stringify(access)], ["assessments", JSON.stringify(assessments)]]), secrets, `${label} tool payload`);
+      assertCanaryWindowsAbsent(assert, files, planted, `${label} bundle file`);
+      assertCanaryWindowsAbsent(assert, entries, planted, `${label} zip entry`);
+      assertCanaryWindowsAbsent(assert, new Map([["access", JSON.stringify(access)], ["assessments", JSON.stringify(assessments)]]), planted, `${label} tool payload`);
 
       const [method, path] = surface.split(" ");
       const aboutSurface = recordedErrorStrings(access, assessments, files).filter((text) => text.includes(`${method} ${path}`) && /failed|returned|timed out/.test(text));
@@ -2732,7 +2768,7 @@ test("addendum 4: a 502 HTML page or a JSON error message carrying credentials o
       for (const text of aboutSurface) {
         assert.match(text, variant.note, `${label}: error string lacks the status note: ${text}`);
         assert.ok(!/<html|Bad Gateway<\/|upstream sent/.test(text), `${label}: error string echoes the body: ${text}`);
-        if (variant.name === "json403") assert.ok(!text.includes(`token=${CANARIES.urlToken}`), `${label}: URL token survives in ${text}`);
+        if (variant.name === "json403") assertCanaryWindowsAbsent(assert, text, [CANARIES.urlToken], `${label} error string`);
       }
     }
   }
@@ -3023,7 +3059,7 @@ test("addendum 5: denied list datasets write a not-collected marker in core_data
       assert.ok(isEmptyNativeShape(readable.data, shape), `${other}: readable-but-empty stays ${shape === "array" ? "[]" : "{}"}, got ${JSON.stringify(readable.data)} (route ${otherRoute})`);
       assert.equal(readable.data.collected, undefined, `${other}: an empty inventory never carries a marker field`);
     }
-    for (const canary of canaryValues()) assertSecretsAbsent(assert, files, [canary], `marker bundle for ${dataset}`);
+    assertCanaryWindowsAbsent(assert, files, canaryValues(), `marker bundle for ${dataset}`);
   }
 });
 

@@ -432,7 +432,16 @@ function safeDirName(value: string): string {
   return normalized || "elastic";
 }
 
+const PARSE_ERROR_NOTE = "SyntaxError: response could not be parsed as JSON; the parser's message is not recorded because it quotes the body";
+
+/** JSON.parse quotes a window of the text it rejected, so a SyntaxError is recorded by name only, never by its message. */
+function isParseError(error: unknown): boolean {
+  return error instanceof SyntaxError || (error instanceof Error && error.name === "SyntaxError");
+}
+
+/** The message of any thrown value with the structural parse-error guard applied, before scrubbing. */
 function errorMessage(error: unknown): string {
+  if (isParseError(error)) return PARSE_ERROR_NOTE;
   return error instanceof Error ? error.message : String(error);
 }
 

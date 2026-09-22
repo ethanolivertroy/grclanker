@@ -43,7 +43,8 @@ import {
   scrubErrorText,
 } from "../dist/extensions/grc-tools/datadog.js";
 import { getRegisteredToolSummaries } from "../dist/pi/tool-catalog.js";
-import { assertSecretsAbsent, readBundleFiles, readZipEntries } from "./helpers/bundle-contents.mjs";
+import { readBundleFiles, readZipEntries } from "./helpers/bundle-contents.mjs";
+import { assertCanaryFixture, assertCanaryWindowsAbsent } from "./helpers/canary-windows.mjs";
 import { scrubAlterations } from "./helpers/scrub-survival.mjs";
 
 const NOW = new Date("2026-09-21T00:00:00.000Z");
@@ -2514,32 +2515,34 @@ test("DatadogApiClient stops on a repeated cursor or repeated empty pages and re
 // zip entry: keys through the key projection, cloud credentials through the integration projection, signal, audit,
 // monitor, dashboard, and posture payloads through their projections, and the verbatim configuration exports
 // (organization, org configs, pipelines, archives, scanner, rules) through the credential-key redactor.
-const DATADOG_FAKE_SECRETS = [
-  "dd-api-key-value-FAKE0001",
-  "dd-app-key-value-FAKE0002",
-  "AKIAFAKEACCESSKEY0003",
-  "aws-secret-access-key-FAKE0004",
-  "gcp-private-key-FAKE0005",
-  "azure-client-secret-FAKE0006",
-  "signal-authorization-header-FAKE0007",
-  "audit-request-header-FAKE0008",
-  "org-setting-token-FAKE0009",
-  "pipeline-processor-token-FAKE0010",
-  "archive-secret-FAKE0011",
-  "scanner-api-key-FAKE0012",
-  "org-config-value-FAKE0013",
-  "monitor-query-secret-FAKE0014",
-  "dashboard-url-secret-FAKE0015",
-  "posture-resource-secret-FAKE0016",
-  "rule-signing-secret-FAKE0017",
-  "index-webhook-secret-FAKE0018",
-];
+// Alphanumeric and random-looking so that every 6-to-24-character window of each value can be asserted absent.
+const DATADOG_FAKE_SECRETS = {
+  apiKeyValue: "D7SHc4Mn7XCp7pyHXrojnpAXwYbKtSoY",
+  appKeyValue: "9dreg9dLZ54JQKyVRhtGmn9CFQhxQSqE",
+  awsAccessKeyId: "rgixzrCZoyfur3VHVLoEbHkR5HPoRkGV",
+  awsSecretAccessKey: "kfQBxTvN3PZcoECfREZy5PhSEERq6BsQ",
+  gcpPrivateKey: "LWRwKrhD8Fads9LWU7V3snTayZGtwe9y",
+  azureClientSecret: "utwtgBfyJYQsMvPogB9BZaLatvQDZNE6",
+  signalAuthorizationHeader: "V4uJTHExphnZG85Yfpin3TRW6KZ863Y2",
+  auditRequestHeader: "oEGzm8gGDwqKb32uhMQiFkWd6ZrGVwun",
+  orgSettingToken: "Q8nRGc7bNtAPvaVQvP22ECELERX8ZNuX",
+  pipelineProcessorToken: "Sw8ZTJvncn5FXpWrzH6LbvA5C36KHGDG",
+  archiveSecret: "iTFB9rmbfzgVmtI6CPgQrb5kDcDDjusS",
+  scannerApiKey: "wohBNFgejWm8mOLSpTTRxLJz2itHjTeF",
+  orgConfigValue: "FNjRSjCfCZAArOSBJRCdkGAvSxH8jQ1y",
+  monitorQuerySecret: "d7866h7kagjaaxz9xrfhkp8tC5804cDK",
+  dashboardUrlSecret: "O80TVzLOWaz7VQTsJMfQkrT1HUNyXwrT",
+  postureResourceSecret: "Lc02gQBuvRIfLEfN9Pim1azA32YSTHQz",
+  ruleSigningSecret: "5ItglOYb4TaBATDAJP0skzvKTx7gUFVC",
+  indexWebhookSecret: "EsQPhEMyzMYKNAT8TQm1zYWBfpESb7Jm",
+};
 
 function leakyClient() {
+  const secrets = DATADOG_FAKE_SECRETS;
   const organization = healthyOrganization();
-  organization.settings.saml_idp_endpoint = "https://idp.example.com/sso?token=org-setting-token-FAKE0009";
+  organization.settings.saml_idp_endpoint = `https://idp.example.com/sso?token=${secrets.orgSettingToken}`;
   const scanner = healthySensitiveDataScanner();
-  scanner.included[0].attributes.api_key = "scanner-api-key-FAKE0012";
+  scanner.included[0].attributes.api_key = secrets.scannerApiKey;
   return healthyClient({
     async getOrganization() {
       return organization;
@@ -2547,29 +2550,29 @@ function leakyClient() {
     async listOrgConfigs() {
       return [
         { id: "monitor_timezone", type: "org_configs", attributes: { name: "monitor_timezone", value: "UTC" } },
-        { id: "api_token", type: "org_configs", attributes: { name: "api_token", value: "org-config-value-FAKE0013" } },
+        { id: "api_token", type: "org_configs", attributes: { name: "api_token", value: secrets.orgConfigValue } },
       ];
     },
     async listApiKeys() {
-      return [{ id: "key-1", type: "api_keys", attributes: { name: "prod-agent", key: "dd-api-key-value-FAKE0001", last4: "0001", created_at: daysAgo(10), date_last_used: daysAgo(1) } }];
+      return [{ id: "key-1", type: "api_keys", attributes: { name: "prod-agent", key: secrets.apiKeyValue, last4: "0001", created_at: daysAgo(10), date_last_used: daysAgo(1) } }];
     },
     async listApplicationKeys() {
       const keys = healthyApplicationKeys();
-      keys.data[0].attributes.key = "dd-app-key-value-FAKE0002";
+      keys.data[0].attributes.key = secrets.appKeyValue;
       return keys;
     },
     async listAwsIntegrations() {
-      return [{ account_id: "123456789012", access_key_id: "AKIAFAKEACCESSKEY0003", secret_access_key: "aws-secret-access-key-FAKE0004", cspm_resource_collection_enabled: true }];
+      return [{ account_id: "123456789012", access_key_id: secrets.awsAccessKeyId, secret_access_key: secrets.awsSecretAccessKey, cspm_resource_collection_enabled: true }];
     },
     async listGcpIntegrations() {
-      return [{ project_id: "p1", client_email: "dd@p1.iam.gserviceaccount.com", private_key: "gcp-private-key-FAKE0005", is_cspm_enabled: true }];
+      return [{ project_id: "p1", client_email: "dd@p1.iam.gserviceaccount.com", private_key: secrets.gcpPrivateKey, is_cspm_enabled: true }];
     },
     async listAzureIntegrations() {
-      return [{ tenant_name: "t1", client_id: "cid", client_secret: "azure-client-secret-FAKE0006", cspm_enabled: true }];
+      return [{ tenant_name: "t1", client_id: "cid", client_secret: secrets.azureClientSecret, cspm_enabled: true }];
     },
     async listSecurityRules() {
       const rules = await healthyClient().listSecurityRules();
-      rules[0].options = { signing_secret: "rule-signing-secret-FAKE0017", evaluationWindow: 300 };
+      rules[0].options = { signing_secret: secrets.ruleSigningSecret, evaluationWindow: 300 };
       return rules;
     },
     async listSecuritySignals() {
@@ -2579,47 +2582,51 @@ function leakyClient() {
         attributes: {
           timestamp: hoursAgo(1),
           message: "Brute force",
-          attributes: { status: "high", workflow: { triage: { state: "open" } }, custom: { request: { headers: { authorization: "signal-authorization-header-FAKE0007" } } } },
+          attributes: { status: "high", workflow: { triage: { state: "open" } }, custom: { request: { headers: { authorization: secrets.signalAuthorizationHeader } } } },
         },
       }];
     },
     async listPostureFindings(options = {}) {
       return {
-        data: [{ id: "f1", attributes: { evaluation: options.evaluation, resource_configuration: { policy: "posture-resource-secret-FAKE0016" } } }],
+        data: [{ id: "f1", attributes: { evaluation: options.evaluation, resource_configuration: { policy: secrets.postureResourceSecret } } }],
         total_filtered_count: options.evaluation === "fail" ? 10 : 90,
       };
     },
     async listAuditEvents(options = {}) {
-      const headers = { cookie: "audit-request-header-FAKE0008" };
+      const headers = { cookie: secrets.auditRequestHeader };
       if (options.sort === "timestamp") {
         return [{ id: "evt-old", type: "audit", attributes: { timestamp: daysAgo(100), service: "audit", attributes: { http: { request: { headers } } } } }];
       }
       return [{ id: "evt-1", type: "audit", attributes: { timestamp: hoursAgo(2), attributes: { http: { request: { headers } } } } }];
     },
     async listLogPipelines() {
-      return [{ id: "p1", name: "cloudtrail", is_enabled: true, filter: { query: "source:cloudtrail" }, processors: [{ type: "lookup-processor", api_token: "pipeline-processor-token-FAKE0010" }] }];
+      return [{ id: "p1", name: "cloudtrail", is_enabled: true, filter: { query: "source:cloudtrail" }, processors: [{ type: "lookup-processor", api_token: secrets.pipelineProcessorToken }] }];
     },
     async listLogIndexes() {
-      return [{ name: "main", num_retention_days: 30, exclusion_filters: [], daily_limit_reset: { webhook_secret: "index-webhook-secret-FAKE0018" } }];
+      return [{ name: "main", num_retention_days: 30, exclusion_filters: [], daily_limit_reset: { webhook_secret: secrets.indexWebhookSecret } }];
     },
     async listLogArchives() {
-      return [{ id: "a1", type: "archives", attributes: { name: "s3-archive", state: "WORKING", destination: { type: "s3", integration: { account_id: "123456789012", secret_access_key: "archive-secret-FAKE0011" } } } }];
+      return [{ id: "a1", type: "archives", attributes: { name: "s3-archive", state: "WORKING", destination: { type: "s3", integration: { account_id: "123456789012", secret_access_key: secrets.archiveSecret } } } }];
     },
     async getSensitiveDataScannerConfig() {
       return scanner;
     },
     async listDashboards() {
-      return [{ id: "d1", title: "Shared", url: "https://app.datadoghq.com/dashboard/d1?token=dashboard-url-secret-FAKE0015", author_handle: "alice@acme.example" }];
+      return [{ id: "d1", title: "Shared", url: `https://app.datadoghq.com/dashboard/d1?token=${secrets.dashboardUrlSecret}`, author_handle: "alice@acme.example" }];
     },
     async listMonitors() {
-      return [{ id: 1, name: "Security: root login", tags: ["team:security"], priority: 1, message: "@pagerduty-security", query: "logs(\"monitor-query-secret-FAKE0014\")" }];
+      return [{ id: 1, name: "Security: root login", tags: ["team:security"], priority: 1, message: "@pagerduty-security", query: `logs("${secrets.monitorQuerySecret}")` }];
     },
   });
 }
 
 test("exportDatadogAuditBundle never writes credential material from any collected surface into the bundle or its zip", async () => {
   const base = createTempBase("grclanker-datadog-export-secrets-");
-  const config = sampleConfig();
+  const config = sampleConfig({ apiKey: DD_TEST_API_KEY, appKey: DD_TEST_APP_KEY });
+  // Self-check: the planted values share no 6-character window with each other or with the healthy fixture's own output.
+  const baseline = await exportDatadogAuditBundle(healthyClient(), config, createTempBase("grclanker-datadog-export-secrets-baseline-"), { now: NOW });
+  assertCanaryFixture(assert, [...Object.values(DATADOG_FAKE_SECRETS), config.apiKey, config.appKey], readBundleFiles(baseline.outputDir), "collected-object canaries");
+
   const result = await exportDatadogAuditBundle(leakyClient(), config, base, { now: NOW });
   assert.equal(result.findingCount, 20);
 
@@ -2627,9 +2634,9 @@ test("exportDatadogAuditBundle never writes credential material from any collect
   assert.ok(files.size >= 35, `bundle has ${files.size} files`);
   const entries = readZipEntries(result.zipPath);
   assert.ok(entries.size >= 35, `zip has ${entries.size} entries`);
-  const secrets = [...DATADOG_FAKE_SECRETS, config.apiKey, config.appKey];
-  assertSecretsAbsent(assert, files, secrets, "bundle file");
-  assertSecretsAbsent(assert, entries, secrets, "zip entry");
+  const planted = [...Object.values(DATADOG_FAKE_SECRETS), config.apiKey, config.appKey];
+  assertCanaryWindowsAbsent(assert, files, planted, "bundle file");
+  assertCanaryWindowsAbsent(assert, entries, planted, "zip entry");
 
   const apiKeys = JSON.parse(files.get("core_data/api_keys.json"));
   assert.equal(apiKeys[0].attributes.key, undefined);
@@ -2778,19 +2785,26 @@ test("Datadog tools are registered in the tool catalog under the Datadog group",
 // under that inventory's denial proves gating.
 // ---------------------------------------------------------------------------------------------------------------
 
+// Every planted credential is alphanumeric and random-looking; helpers/canary-windows.mjs asserts every 6-to-24-character
+// window of each one absent, and the fixture self-check below proves no window occurs in the fixture's own values.
+const DD_TEST_API_KEY = "2RvBvXQvD5Q3nXeXYMx8dsCqRzzWejV2";
+const DD_TEST_APP_KEY = "2m8GreSvHjjjksfPfpAyyLSYq6VQTFvK";
 const DD_CANARIES = {
-  bearer: "BEARER_CANARY_9f8e7d6c5b4a3210",
-  cookie: "SESSION_CANARY_0123456789abcdef",
-  apiKey: "APIKEY_CANARY_fedcba9876543210",
-  urlToken: "URLTOKEN_CANARY_1122334455667788",
-  jwt: "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJKV1RfQ0FOQVJZX2FiY2RlZjAxMjM0NTY3ODkifQ.JWT_CANARY_SIGNATURE_abcdef0123456789",
+  bearer: "PKVKod7EcXyCJXz2HymDp83HrdJL83oU",
+  cookie: "gBQCfaMBS2WuVKe7xdVnQVS6tUEKipDC",
+  apiKey: "98sHDuRibZ2CmnHqch66LJFGaoMg5Phh",
+  urlToken: "8GQxdZDYuhs7BTwe2iu6JjepD7bpn3yo",
+  jwtHeader: "hfnMYs72XnZ6yVbCNwL853cyAvaGLxLZ",
+  jwtPayload: "XFE8HB5mF4gDC2co4yQEqTKqv7MHaZLT",
+  jwtSignature: "EDLnqauWP2Mo2DhhY4FvAYgqY6tpwytb",
 };
+const DD_JWT_CANARY = `eyJ${DD_CANARIES.jwtHeader}.${DD_CANARIES.jwtPayload}.${DD_CANARIES.jwtSignature}`;
 
 function ddCanaryValues() {
-  return Object.values(DD_CANARIES);
+  return [...Object.values(DD_CANARIES), DD_JWT_CANARY];
 }
 
-const DD_HTML_ERROR_BODY = `<html><body><h1>502 Bad Gateway</h1><p>upstream sent Authorization: Bearer ${DD_CANARIES.bearer}; Set-Cookie: session=${DD_CANARIES.cookie}; api_key=${DD_CANARIES.apiKey}; retry at https://api.example.com/v1/x?token=${DD_CANARIES.urlToken} later; jwt ${DD_CANARIES.jwt}</p></body></html>`;
+const DD_HTML_ERROR_BODY = `<html><body><h1>502 Bad Gateway</h1><p>upstream sent Authorization: Bearer ${DD_CANARIES.bearer}; Set-Cookie: session=${DD_CANARIES.cookie}; api_key=${DD_CANARIES.apiKey}; retry at https://api.example.com/v1/x?token=${DD_CANARIES.urlToken} later; jwt ${DD_JWT_CANARY}</p></body></html>`;
 
 /** A proxy error page: non-JSON, carrying every credential class in its body. */
 function htmlGateway() {
@@ -2894,7 +2908,7 @@ function createDatadogRouter(routes, log = []) {
 }
 
 function httpClient(routes, log, configOverrides = {}) {
-  const config = sampleConfig({ maxRetries: 0, ...configOverrides });
+  const config = sampleConfig({ maxRetries: 0, apiKey: DD_TEST_API_KEY, appKey: DD_TEST_APP_KEY, ...configOverrides });
   return { config, client: new DatadogApiClient(config, { fetchImpl: createDatadogRouter(routes, log) }) };
 }
 
@@ -2940,7 +2954,27 @@ async function runAllAssessments(client) {
   ]);
 }
 
-test("verdict rule 9 / addendum 2: the Datadog bundle, its zip, every assess payload, and the access check never carry canaries from error bodies, and errors carry the status-and-length note", async () => {
+test("canary fixture self-check: every planted Datadog credential is alphanumeric, random-looking, and shares no 6-character window with the fixture's legitimate values", async () => {
+  const log = [];
+  const { client, config } = httpClient(routesFromClient(healthyClient()), log);
+  const access = await checkDatadogAccess(client);
+  const assessments = await runAllAssessments(client);
+  const exported = await exportDatadogAuditBundle(client, config, createTempBase("grclanker-datadog-self-check-"), { now: NOW });
+  const principal = httpClient(routesFromClient(principalClient()), []);
+  const principalBundle = await exportDatadogAuditBundle(principal.client, principal.config, createTempBase("grclanker-datadog-self-check-principal-"), { now: NOW });
+  const legitimate = new Map([
+    ...readBundleFiles(exported.outputDir),
+    ...[...readBundleFiles(principalBundle.outputDir)].map(([name, text]) => [`principal ${name}`, text]),
+    ["check_access", JSON.stringify(access)],
+    ["assessments", JSON.stringify(assessments)],
+    ["config", JSON.stringify({ ...config, apiKey: null, appKey: null })],
+    ["request log", JSON.stringify(log)],
+  ]);
+  const canaries = [...Object.values(DD_CANARIES), DD_TEST_API_KEY, DD_TEST_APP_KEY, ...Object.values(DATADOG_FAKE_SECRETS), DOGRC_CANARY, DOGRC_READ_CANARY, DD_PARSER_SNIPPET_CANARY];
+  assertCanaryFixture(assert, canaries, legitimate, "Datadog canaries");
+});
+
+test("verdict rule 9 / addendum 2: the Datadog bundle, its zip, every assess payload, and the access check never carry any window of a canary from an error body, and errors carry the status-and-length note", async () => {
   const routes = routesFromClient(leakyClient());
   routes["GET /api/v2/ip_allowlist"] = htmlGateway();
   routes["GET /api/v2/logs/config/archives"] = jsonForbiddenWithUrl();
@@ -2954,10 +2988,10 @@ test("verdict rule 9 / addendum 2: the Datadog bundle, its zip, every assess pay
   const files = readBundleFiles(result.outputDir);
   const entries = readZipEntries(result.zipPath);
   assert.ok(files.size >= 35 && entries.size === files.size, `expected the zip to mirror ${files.size} files, got ${entries.size}`);
-  const secrets = [...ddCanaryValues(), ...DATADOG_FAKE_SECRETS, config.apiKey, config.appKey];
-  assertSecretsAbsent(assert, files, secrets, "bundle file");
-  assertSecretsAbsent(assert, entries, secrets, "zip entry");
-  assertSecretsAbsent(assert, new Map([["check_access", JSON.stringify(access)], ["assessments", JSON.stringify(assessments)]]), secrets, "tool payload");
+  const planted = [...ddCanaryValues(), ...Object.values(DATADOG_FAKE_SECRETS), config.apiKey, config.appKey];
+  assertCanaryWindowsAbsent(assert, files, planted, "bundle file");
+  assertCanaryWindowsAbsent(assert, entries, planted, "zip entry");
+  assertCanaryWindowsAbsent(assert, new Map([["check_access", JSON.stringify(access)], ["assessments", JSON.stringify(assessments)]]), planted, "tool payload");
   assert.equal(result.errorCount, 2, `only the two failing surfaces are recorded: ${files.get("_errors.log")}`);
 
   // The non-JSON body is described by status and length; the JSON error is echoed with its URL query scrubbed.
@@ -3142,7 +3176,7 @@ test("addendum 5: under each single-inventory denial the denied dataset's core_d
     assert.equal(status.totals.truncation_unknown, denial.datasets.length, `${label}: a denied inventory is neither complete nor truncated`);
     assert.equal(status.totals.readable + status.totals.forbidden, status.totals.inventories);
     assert.match(files.get("_errors.log"), new RegExp(`^${denial.datasets[0][0]}: Datadog request failed \\(403 Forbidden\\)`, "m"));
-    assertSecretsAbsent(assert, files, ddCanaryValues(), `marker bundle for ${label}`);
+    assertCanaryWindowsAbsent(assert, files, ddCanaryValues(), `marker bundle for ${label}`);
     assertOutputMatchesRequestLog([...files], log, label);
   }
 });
@@ -3397,7 +3431,7 @@ test("addendum 4: a 502 HTML page or a JSON error message carrying credentials o
       routes[surface] = variant.handler();
       const { client, config } = httpClient(routes, []);
       const label = `${surface} ${variant.name}`;
-      const secrets = [...ddCanaryValues(), ...DATADOG_FAKE_SECRETS, config.apiKey, config.appKey];
+      const planted = [...ddCanaryValues(), ...Object.values(DATADOG_FAKE_SECRETS), config.apiKey, config.appKey];
 
       const access = await checkDatadogAccess(client);
       const assessments = await runAllAssessments(client);
@@ -3405,9 +3439,9 @@ test("addendum 4: a 502 HTML page or a JSON error message carrying credentials o
       const files = readBundleFiles(result.outputDir);
       const entries = readZipEntries(result.zipPath);
 
-      assertSecretsAbsent(assert, files, secrets, `${label} bundle file`);
-      assertSecretsAbsent(assert, entries, secrets, `${label} zip entry`);
-      assertSecretsAbsent(assert, new Map([["check_access", JSON.stringify(access)], ["assessments", JSON.stringify(assessments)]]), secrets, `${label} tool payload`);
+      assertCanaryWindowsAbsent(assert, files, planted, `${label} bundle file`);
+      assertCanaryWindowsAbsent(assert, entries, planted, `${label} zip entry`);
+      assertCanaryWindowsAbsent(assert, new Map([["check_access", JSON.stringify(access)], ["assessments", JSON.stringify(assessments)]]), planted, `${label} tool payload`);
 
       const [method, path] = surface.split(" ");
       const aboutSurface = ddRecordedErrorStrings(access, assessments, files).filter((text) => text.includes(`${method} ${path}`) && /request failed|timed out/.test(text));
@@ -3416,7 +3450,7 @@ test("addendum 4: a 502 HTML page or a JSON error message carrying credentials o
       for (const text of aboutSurface) {
         assert.match(text, variant.note, `${label}: error string lacks the status note: ${text}`);
         assert.ok(!/<html|Bad Gateway<\/|upstream sent/.test(text), `${label}: error string echoes the body: ${text}`);
-        if (variant.name === "json403") assert.ok(!text.includes(`token=${DD_CANARIES.urlToken}`), `${label}: URL token survives in ${text}`);
+        if (variant.name === "json403") assertCanaryWindowsAbsent(assert, text, [DD_CANARIES.urlToken], `${label} error string`);
       }
     }
   }
@@ -3427,7 +3461,7 @@ test("addendum 4: a 502 HTML page or a JSON error message carrying credentials o
 // Addendum 6: config loader errors never quote the file.
 // ---------------------------------------------------------------------------------------------------------------
 
-const DOGRC_CANARY = "DOGRC_CANARY_7d8e9f0a1b2c3d4e";
+const DOGRC_CANARY = "kCGX9RPD4eQcsCohbHB7Za4TV94njgzY";
 
 /** Malformed dogshell INI shapes with the canary on the bad line; the parser skips or keeps the line but never quotes it. */
 const MALFORMED_DOGRC_FILES = [
@@ -3461,18 +3495,18 @@ test("rule 9 / addendum 6: a malformed .dogrc whose bad line carries a credentia
       }
       if (resolverMessage !== undefined) {
         assert.match(resolverMessage, /DD_API_KEY|DD_APP_KEY/, `${shape.name}: a skipped line surfaces as the missing-key message`);
-        assert.ok(!resolverMessage.includes(DOGRC_CANARY), `${shape.name}: the resolver message quotes the credential: ${resolverMessage}`);
+        assertCanaryWindowsAbsent(assert, resolverMessage, [DOGRC_CANARY], `${shape.name} resolver message`);
       }
 
       const access = await checkTool.execute("call-dogrc", checkTool.prepareArguments({ config_file: configPath }));
-      assert.ok(!JSON.stringify(access).includes(DOGRC_CANARY), `${shape.name}: the check_access payload quotes the credential: ${access.content[0].text}`);
+      assertCanaryWindowsAbsent(assert, JSON.stringify(access), [DOGRC_CANARY], `${shape.name} check_access payload`);
       // The export records unreachable surfaces as collection errors rather than failing, so whatever it wrote is scanned.
       const exported = await exportTool.execute("call-dogrc-export", exportTool.prepareArguments({ config_file: configPath, output_dir: outputDir }));
-      assert.ok(!JSON.stringify(exported).includes(DOGRC_CANARY), `${shape.name}: the export payload quotes the credential`);
+      assertCanaryWindowsAbsent(assert, JSON.stringify(exported), [DOGRC_CANARY], `${shape.name} export payload`);
       if (existsSync(outputDir)) {
         for (const entry of readdirSync(outputDir)) {
           if (entry.endsWith(".zip")) continue;
-          assertSecretsAbsent(assert, readBundleFiles(join(outputDir, entry)), [DOGRC_CANARY], `${shape.name} bundle file`);
+          assertCanaryWindowsAbsent(assert, readBundleFiles(join(outputDir, entry)), [DOGRC_CANARY], `${shape.name} bundle file`);
         }
       }
     }
@@ -3500,24 +3534,17 @@ test("rule 9 / addendum 6: a malformed .dogrc whose bad line carries a credentia
 // catch-everything rule; the dogshell INI parser has no structured position, so no line is ever reported.
 // ---------------------------------------------------------------------------------------------------------------
 
-const DOGRC_READ_CANARY = "CFGD5w6x7y8z9a0b1c2";
+const DOGRC_READ_CANARY = "HNhLJVQpXmSfduwQgqMFhpbs3H4RkCJY";
+const DD_PARSER_SNIPPET_CANARY = "iCcmaJztd8isvS42sBQdAKneJw98dd4Z";
 const FS_WORDING = ["illegal operation", "permission denied", "no such file", "Nested mappings", "is not valid JSON", "Unresolved alias"];
 
-function eightCharacterWindows(text) {
-  const windows = [];
-  for (let index = 0; index + 8 <= text.length; index += 1) windows.push(text.slice(index, index + 8));
-  return windows;
-}
-
-/** Asserts a message carries neither the canary, nor any 8-character fragment of it, nor the filesystem's own wording. */
+/** Asserts a message carries neither any window of the canary nor the filesystem's own wording. */
 function assertFixedTextOnly(message, label) {
-  assert.ok(!message.includes(DOGRC_READ_CANARY), `${label}: carries the canary: ${message}`);
-  for (const fragment of eightCharacterWindows(DOGRC_READ_CANARY)) assert.ok(!message.includes(fragment), `${label}: carries the fragment ${fragment}: ${message}`);
+  assertCanaryWindowsAbsent(assert, message, [DOGRC_READ_CANARY], label);
   for (const wording of FS_WORDING) assert.ok(!message.includes(wording), `${label}: carries library wording "${wording}": ${message}`);
 }
 
 test("config loader errors: a .dogrc that cannot be read yields fixed text with only the path and a validated errno code, from the resolver and from check_access, and an explicit missing path is an error", async () => {
-  assert.equal(new Set(eightCharacterWindows(DOGRC_READ_CANARY)).size, eightCharacterWindows(DOGRC_READ_CANARY).length, "canary windows are distinct");
   const registered = [];
   registerDatadogTools({ registerTool: (tool) => registered.push(tool) });
   const checkTool = registered.find((tool) => tool.name === "datadog_check_access");
@@ -3586,6 +3613,24 @@ test("config loader errors: a .dogrc that cannot be read yields fixed text with 
   } finally {
     globalThis.fetch = originalFetch;
   }
+});
+
+test("config loader errors: a SyntaxError raised by the transport is recorded by name only, never by the parser's message that quotes the body", async () => {
+  const snippet = `<html>${DD_PARSER_SNIPPET_CANARY}</html>`;
+  const client = new DatadogApiClient(sampleConfig({ maxRetries: 0 }), {
+    fetchImpl: async () => { throw new SyntaxError(`Unexpected token '<', "${snippet}"... is not valid JSON`); },
+    sleepImpl: async () => {},
+  });
+  await assert.rejects(() => client.validateApiKey(), (error) => {
+    assert.equal(error.message, "Datadog request failed: GET /api/v1/validate: SyntaxError: response could not be parsed as JSON; the parser's message is not recorded because it quotes the body");
+    return true;
+  });
+  const access = await checkDatadogAccess(client);
+  assertCanaryWindowsAbsent(assert, JSON.stringify(access), [DD_PARSER_SNIPPET_CANARY], "check_access");
+  assert.ok(access.surfaces.every((surface) => surface.status !== "readable"), "no surface reads through a transport that cannot be parsed");
+  const identity = await assessDatadogIdentity(client, { now: NOW });
+  assert.ok(identity.errors.length > 0 && identity.errors.every((text) => text.includes("SyntaxError: response could not be parsed as JSON")), identity.errors.join("\n"));
+  assertCanaryWindowsAbsent(assert, JSON.stringify(identity), [DD_PARSER_SNIPPET_CANARY], "assess payload");
 });
 
 // ---------------------------------------------------------------------------------------------------------------
