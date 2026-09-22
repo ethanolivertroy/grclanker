@@ -267,6 +267,8 @@ export interface BoxNotCollectedMarker {
   endpoint: string | null;
   error: string | null;
   reason: "not_readable" | "not_requested";
+  /** For a per-parent child map none of whose reads completed: the marker of every failed child read, keyed by parent id. */
+  failed_reads?: Record<string, BoxNotCollectedMarker>;
 }
 
 /** Per-policy assignment (or per-barrier segment) lists keyed by the parent id; a denied child read carries a marker. */
@@ -1778,15 +1780,21 @@ function isNotCollectedMarker(value: unknown): value is BoxNotCollectedMarker {
   return asObject(value)?.collected === false;
 }
 
-/** The marker written for a dataset whose read did not complete, or that was never requested. */
+/**
+ * The marker written for a dataset whose read did not complete, or that was never requested. A child map none of
+ * whose reads completed carries every child's own marker under failed_reads, so the per-parent status and request
+ * survive alongside the first failure the top-level fields name.
+ */
 function notReadableMarker(dataset: CollectedDataset<unknown>): BoxNotCollectedMarker {
   if (dataset.notRequested) return notRequestedMarker();
+  const failedReads = Object.entries(asObject(dataset.data) ?? {}).filter((entry): entry is [string, BoxNotCollectedMarker] => isNotCollectedMarker(entry[1]));
   return {
     collected: false,
     status: dataset.statusCode ?? "error",
     endpoint: dataset.request ?? null,
     error: dataset.error ?? null,
     reason: "not_readable",
+    ...(failedReads.length > 0 ? { failed_reads: Object.fromEntries(failedReads) } : {}),
   };
 }
 
@@ -2602,7 +2610,8 @@ export function assessBoxSharingCollaborationData(data: BoxSharingData, options:
           ? finding(5, externalStatus === "limit_collaboration_to_allowlisted_domains" ? "warn" : "pass", entries.length === 0 && externalStatus === "limit_collaboration_to_allowlisted_domains" ? "The allowlist is empty while collaboration is limited to allowlisted domains." : "No collaboration allowlist entries exist to audit.", allowlistEvidence)
           : allowlistReviewReasons.length > 0
             ? finding(5, "warn", `${allowlistReviewReasons.join("; ")}; review them for continued need.`, allowlistEvidence, "Confirm with content owners that each stale, undated, or exempt entry still has an active business relationship, and record the creation date of any undated entry from the Admin Console export.")
-            : finding(5, "pass", `${entries.length} allowlist entries are dated, recent, non-public domains with no user exemptions.`, allowlistEvidence),
+            // The absence of exemptions is stated only from an exempt-target listing that was read; otherwise it is unread.
+            : finding(5, "pass", `${entries.length} allowlist entries are dated, recent, non-public domains${isRead(data.exemptTargets) ? " with no user exemptions" : "; the user exemption list is unread"}.`, allowlistEvidence),
     [exemptTargetsUnreadable, collaborationConfigUnreadable],
     allowlistManualEvidence,
   ));
@@ -3089,7 +3098,8 @@ export function assessBoxShieldMonitoringData(data: BoxShieldData): BoxAssessmen
       : enabledWithSegments.length > 0
         ? finding(15, "pass", `${enabledWithSegments.length} enabled information barriers have segments defined.`, barrierEvidence)
         : enabledBarriers.length > 0
-          ? finding(15, "warn", `${enabledBarriers.length} information barriers are enabled but have no visible segments.`, barrierEvidence)
+          // "No segments" is asserted only from segment reads that completed; a denied segment read leaves them unread.
+          ? finding(15, "warn", `${enabledBarriers.length} information barriers are enabled but ${isRead(data.barrierSegments) ? "have no visible segments" : "their segments could not be read"}.`, barrierEvidence)
           : barriers.length > 0
             ? finding(15, "warn", `${barriers.length} information barriers exist but none are enabled.`, barrierEvidence)
             : finding(15, "warn", "No information barriers are configured; confirm segregation between groups is not required.", barrierEvidence, "Document whether regulatory or conflict-of-interest requirements call for information barriers between business units."),
@@ -3132,7 +3142,7 @@ export function assessBoxShieldMonitoringData(data: BoxShieldData): BoxAssessmen
     !eventsReadable && !shieldReadable
       ? finding(25, "manual", "Neither enterprise events nor Shield rules could be read, so content access monitoring cannot be confirmed from the API.", monitoringEvidence, monitoringManualEvidence)
       : anomalyRules.length > 0 || anomalyEvents.length > 0
-        ? finding(25, "pass", `${anomalyRules.length} Shield anomaly detection rules and ${anomalyEvents.length} Shield alert or block events show content access monitoring is active.`, monitoringEvidence)
+        ? finding(25, "pass", `${shieldReadable ? String(anomalyRules.length) : "unread"} Shield anomaly detection rules and ${countOrUnread(data.events, anomalyEvents.length)} Shield alert or block events show content access monitoring is active.`, monitoringEvidence)
         : !shieldReadable
           ? finding(25, "warn", `Shield rule configuration could not be read because ${shieldUnreadableReason}, and no Shield alert or block events were observed among ${accessEvents.length} download and preview events; detection may depend on external analytics.`, monitoringEvidence, monitoringManualEvidence)
           : !eventsReadable
@@ -3476,13 +3486,14 @@ function snapshotValue(dataset: CollectedDataset<unknown>): unknown {
 }
 
 /**
- * True for a per-parent child map whose parent listing was read but some child reads failed: the map itself is the
- * truthful snapshot, since every denied child already carries its own marker.
+ * True for a per-parent child map whose parent listing was read and some, but not all, child reads completed: the map
+ * itself is the truthful snapshot, since every denied child already carries its own marker. A map none of whose reads
+ * completed is not partial; it is written as a single marker so no flag or count defaults from it.
  */
 function isPartialChildMap(dataset: CollectedDataset<unknown>): boolean {
   if (isRead(dataset) || dataset.notRequested) return false;
   const values = Object.values(asObject(dataset.data) ?? {});
-  return values.length > 0 && values.every((value) => Array.isArray(value) || isNotCollectedMarker(value));
+  return values.some((value) => Array.isArray(value)) && values.every((value) => Array.isArray(value) || isNotCollectedMarker(value));
 }
 
 type CollectionStatusLabel = "collected" | "truncated" | "partial" | "denied" | "error" | "not-requested";
