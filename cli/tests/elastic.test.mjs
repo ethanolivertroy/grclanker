@@ -2760,6 +2760,24 @@ function recordedErrorStrings(access, assessments, files) {
   return strings;
 }
 
+/** A 403 body echoing weak human-chosen pairs (no digits, symbols, or length a shape gate would catch) under vendor env names and a config key. */
+const WEAK_PAIR_BODY = "Access denied: LAUNCHDARKLY_API_TOKEN=monkey LD_ACCESS_TOKEN=Sunshine DB_PASSWORD=letmein DD_APP_KEY=p@ss BOX_CLIENT_SECRET=football KNOWBE4_API_TOKEN=qwerty ELASTIC_PASSWORD=iloveyou developer_token: letmein2024";
+const WEAK_PAIR_VALUES = ["monkey", "Sunshine", "letmein", "p@ss", "football", "qwerty", "iloveyou", "letmein2024"];
+const WEAK_PAIR_KEYS = ["LAUNCHDARKLY_API_TOKEN", "LD_ACCESS_TOKEN", "DB_PASSWORD", "DD_APP_KEY", "BOX_CLIENT_SECRET", "KNOWBE4_API_TOKEN", "ELASTIC_PASSWORD", "developer_token"];
+
+test("row (a): an Elastic 403 body echoing weak values under credential-named keys reaches the access check with every value gone and every key kept", async () => {
+  const routes = healthyRoutes(healthyFixtures());
+  routes["GET /_ssl/certificates"] = () => jsonResponse({ error: { type: "security_exception", reason: WEAK_PAIR_BODY }, status: 403 }, { status: 403, statusText: "Forbidden" });
+  const seen = [];
+  const client = new ElasticApiClient(sampleConfig({ maxRetries: 0 }), { fetchImpl: createRouter(routes, seen) });
+  const access = await checkElasticAccess(client);
+  const certificates = access.surfaces.find((surface) => surface.name === "ssl_certificates");
+  assert.equal(certificates.status, "not_readable");
+  assert.match(certificates.error, /^elasticsearch request GET \/_ssl\/certificates failed \(403 Forbidden\): .*Access denied: /);
+  for (const key of WEAK_PAIR_KEYS) assert.ok(certificates.error.includes(`${key}=[REDACTED]`) || certificates.error.includes(`${key}: [REDACTED]`), `${key} keeps its name and gets the marker: ${certificates.error}`);
+  assertCanaryWindowsAbsent(assert, JSON.stringify(access), WEAK_PAIR_VALUES, "check_access payload");
+});
+
 test("addendum 4: a 502 HTML page or a JSON error message carrying credentials on any Elastic surface never reaches the access check, an assess payload, or the bundle, and every recorded error carries the status-and-length note", async () => {
   const fixtures = canaryFixtures();
   const surfaces = Object.keys(healthyRoutes(fixtures));

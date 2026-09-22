@@ -2184,6 +2184,24 @@ test("verdict rule 9 / addendum 2: the KnowBe4 bundle, its zip, every assess pay
   assert.deepEqual({ status: groupsState.status, read: groupsState.read, http_status: groupsState.http_status, endpoint: groupsState.endpoint }, { status: "not_readable", read: false, http_status: 502, endpoint: "GET /v1/groups" });
 });
 
+/** A 403 body echoing weak human-chosen pairs (no digits, symbols, or length a shape gate would catch) under vendor env names and a config key. */
+const WEAK_PAIR_BODY = "Access denied: LAUNCHDARKLY_API_TOKEN=monkey LD_ACCESS_TOKEN=Sunshine DB_PASSWORD=letmein DD_APP_KEY=p@ss BOX_CLIENT_SECRET=football KNOWBE4_API_TOKEN=qwerty ELASTIC_PASSWORD=iloveyou developer_token: letmein2024";
+const WEAK_PAIR_VALUES = ["monkey", "Sunshine", "letmein", "p@ss", "football", "qwerty", "iloveyou", "letmein2024"];
+const WEAK_PAIR_KEYS = ["LAUNCHDARKLY_API_TOKEN", "LD_ACCESS_TOKEN", "DB_PASSWORD", "DD_APP_KEY", "BOX_CLIENT_SECRET", "KNOWBE4_API_TOKEN", "ELASTIC_PASSWORD", "developer_token"];
+
+test("row (a): a KnowBe4 403 body echoing weak values under credential-named keys reaches the access check with every value gone and every key kept", async () => {
+  const { client, log } = httpKnowbe4(healthyFixture(), {
+    routes: { "GET /v1/training/store_purchases": () => jsonResponse({ message: WEAK_PAIR_BODY }, { status: 403, statusText: "Forbidden" }) },
+  });
+  const access = await checkKnowbe4Access(client);
+  const purchases = access.surfaces.find((surface) => surface.name === "store_purchases");
+  assert.equal(purchases.http_status, 403);
+  assert.ok(log.some((entry) => entry.status === 403), "the 403 was observed on the wire");
+  assert.match(purchases.error, /KnowBe4 request failed \(403 Forbidden\) GET \/v1\/training\/store_purchases: Access denied: /);
+  for (const key of WEAK_PAIR_KEYS) assert.ok(purchases.error.includes(`${key}=[REDACTED]`) || purchases.error.includes(`${key}: [REDACTED]`), `${key} keeps its name and gets the marker: ${purchases.error}`);
+  assertCanaryWindowsAbsent(assert, JSON.stringify(access), WEAK_PAIR_VALUES, "check_access payload");
+});
+
 test("addendum 5: every endpoint and status code named in KnowBe4 output corresponds to a request the run made and observed", async () => {
   const fixture = healthyFixture();
   const base = kbRoutes(fixture);

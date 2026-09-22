@@ -3073,6 +3073,25 @@ test("verdict rule 9 / addendum 2: the Datadog bundle, its zip, every assess pay
   assert.equal(assessments[3].summary.archives, null);
 });
 
+/** A 403 body echoing weak human-chosen pairs (no digits, symbols, or length a shape gate would catch) under vendor env names and a config key. */
+const WEAK_PAIR_BODY = "Access denied: LAUNCHDARKLY_API_TOKEN=monkey LD_ACCESS_TOKEN=Sunshine DB_PASSWORD=letmein DD_APP_KEY=p@ss BOX_CLIENT_SECRET=football KNOWBE4_API_TOKEN=qwerty ELASTIC_PASSWORD=iloveyou developer_token: letmein2024";
+const WEAK_PAIR_VALUES = ["monkey", "Sunshine", "letmein", "p@ss", "football", "qwerty", "iloveyou", "letmein2024"];
+const WEAK_PAIR_KEYS = ["LAUNCHDARKLY_API_TOKEN", "LD_ACCESS_TOKEN", "DB_PASSWORD", "DD_APP_KEY", "BOX_CLIENT_SECRET", "KNOWBE4_API_TOKEN", "ELASTIC_PASSWORD", "developer_token"];
+
+test("row (a): a Datadog 403 body echoing weak values under credential-named keys reaches the access check with every value gone and every key kept", async () => {
+  const routes = routesFromClient(healthyClient());
+  routes["GET /api/v2/logs/config/archives"] = () => jsonResponse({ errors: [WEAK_PAIR_BODY] }, { status: 403, statusText: "Forbidden" });
+  const log = [];
+  const { client } = httpClient(routes, log);
+  const access = await checkDatadogAccess(client);
+  const archives = access.surfaces.find((surface) => surface.name === "log_archives");
+  assert.equal(archives.http_status, 403);
+  assert.ok(log.some((entry) => entry.status === 403), "the 403 was observed on the wire");
+  assert.match(archives.error, /Datadog request failed \(403 Forbidden\) GET \/api\/v2\/logs\/config\/archives: Access denied: /);
+  for (const key of WEAK_PAIR_KEYS) assert.ok(archives.error.includes(`${key}=[REDACTED]`) || archives.error.includes(`${key}: [REDACTED]`), `${key} keeps its name and gets the marker: ${archives.error}`);
+  assertCanaryWindowsAbsent(assert, JSON.stringify(access), WEAK_PAIR_VALUES, "check_access payload");
+});
+
 test("addendum 5: every endpoint and status code named in Datadog output corresponds to a request the run made and observed", async () => {
   const routes = routesFromClient(healthyClient());
   routes["GET /api/v2/ip_allowlist"] = htmlGateway();

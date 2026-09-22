@@ -114,11 +114,12 @@ const IDENTIFIER_KEY_SEGMENTS = new Set(["id", "ids", "uuid", "uuids", "guid", "
 // word that makes it one (`api_key`, `private_keys`, `client_key`); a bare `key`, `keys`, or `id` is an identifier.
 const CREDENTIAL_DATA_LAST_SEGMENTS = new Set([
   "token", "tokens", "secret", "secrets", "password", "passwords", "passwd", "pwd", "passphrase", "passphrases", "apikey",
-  "apikeys", "authorization", "credential", "credentials", "bearer", "privatekey", "privatekeys",
+  "apikeys", "appkey", "appkeys", "applicationkey", "applicationkeys", "authorization", "credential", "credentials", "bearer",
+  "privatekey", "privatekeys",
 ]);
 const CREDENTIAL_DATA_KEY_QUALIFIERS = new Set([
-  "api", "private", "secret", "signing", "access", "shared", "encryption", "session", "master", "client", "auth", "sdk",
-  "mobile", "relay", "service", "license", "ssh", "hmac", "enrollment",
+  "api", "app", "application", "private", "secret", "signing", "access", "shared", "encryption", "session", "master", "client",
+  "auth", "sdk", "mobile", "relay", "service", "license", "ssh", "hmac", "enrollment",
 ]);
 
 /** True for a record key whose whole value is a credential under the conservative rule above. */
@@ -302,13 +303,35 @@ const CREDENTIAL_PAIR_NAMES: readonly string[] = [
 ];
 const CREDENTIAL_PAIR_PATTERN = new RegExp(String.raw`${NAME_START}["']?(${CREDENTIAL_PAIR_NAMES.join("|")})\b${NAME_CLOSE_AND_SEPARATOR}`, "gi");
 
-// Every other `key=value`, `key: value`, or `"key":"value"` pair whose key names a credential by the Flue heuristic
-// (`client_token`, `user_session`, `tokens`, `InvalidAuthenticationToken`): the value goes when it is shaped like a
-// credential rather than a prose word, so "InvalidAuthenticationToken: Access token has expired" stays readable. A
-// value does not end in ":" or ".", which close a clause ("sdk-keys: forbidden: Forbidden"), and a backslash ends it
-// so a JSON-escaped closing quote is kept.
-const GENERIC_PAIR_KEY_PATTERN = new RegExp(String.raw`${NAME_START}(["']?)([A-Za-z][A-Za-z0-9_.-]{0,63})\b(${NAME_CLOSE_AND_SEPARATOR}(?:\\*["'])?)`, "g");
+// Every other `key=value`, `key: value`, or `"key":"value"` pair whose key carries a credential word anywhere
+// (`BOX_CLIENT_SECRET`, `developer_token`, `cloudApiKey`, `user_session`): the value goes whatever its shape and
+// length when the pair is a tight assignment (`=`), a quoted or JSON value, or a `:` or spaced `=` pair under a
+// singular key, or under any key when the value stands alone on the line or is followed by the next pair. A plural
+// inventory label or a PascalCase code whose `:` value opens a clause is prose, not an assignment
+// ("InvalidAuthenticationToken: Access token has expired", "access_tokens: LaunchDarkly request failed",
+// "sdk_keys:web/production: ..."), so only a token-shaped first word is removed there. A bare value does not end in
+// ":" or ".", which close a clause, and a backslash ends it so a JSON-escaped closing quote is kept.
+const GENERIC_PAIR_KEY_PATTERN = new RegExp(String.raw`${NAME_START}(["']?)([A-Za-z][A-Za-z0-9_.-]{0,63})\b(${NAME_CLOSE_AND_SEPARATOR})`, "g");
 const GENERIC_PAIR_VALUE_PATTERN = /(?!\[REDACTED\])[^\s"',;&}<>\\]*[^\s"',;&}<>\\:.]/y;
+// After a bare `:` value: the next pair on the line (`password: x client_secret: y`), which makes the value an assignment.
+const FOLLOWING_PAIR_PATTERN = /[A-Za-z][A-Za-z0-9_.-]{0,63}\s*[:=]/y;
+// A bare `:` value that ends a sentence (`developer_token: letmein.`) stands alone as well.
+const SENTENCE_END_PATTERN = /\.(?:\s|$)/y;
+// An unquoted JSON, YAML, or report literal after `:` carries no secret text: `"has_private_key": true`,
+// `"api_keys_total": 2`, `"authorization_realms": null`, `Pass: 7`. A quoted or `=` value of the same spelling goes.
+const UNQUOTED_LITERAL_PATTERN = /^(?:true|false|null|-?\d+(?:\.\d+)?(?:e[+-]?\d+)?)$/i;
+// The labels that open a clause in prose: a key with a plural credential word (`access_tokens: LaunchDarkly request
+// failed`, `api_keys: 3 of 5 keys have no expiry`, `Access tokens: name, role or custom role`, the Datadog permission
+// `org_app_keys_read: Datadog request failed`), a verdict count under a plural subject (`posture_findings_pass: Datadog
+// request failed`), or a PascalCase error code (`InvalidAuthenticationToken: Access token has expired`). A singular
+// key followed by words (`developer_token: letmein was rejected`) is a config or env pair quoted mid-sentence and goes.
+const PLURAL_LABEL_SEGMENTS = new Set(["tokens", "keys", "secrets", "passwords", "credentials", "sessions", "passphrases", "signatures", "cookies", "apikeys"]);
+const VERDICT_COUNT_LAST_SEGMENTS = new Set(["pass"]);
+const PLURAL_SUBJECT_PATTERN = /^[a-z]{2,}[a-rt-z]s$/;
+const PASCAL_CASE_CODE_PATTERN = /^[A-Z][a-z0-9]+(?:[A-Z][a-z0-9]*)+$/;
+// A tight `=` (`BOX_CLIENT_SECRET=v`) is an assignment whatever follows; a spaced `=` (TOML, INI, prose such as
+// "a key = value pair") is judged like `:`.
+const WHITESPACE_PATTERN = /\s/;
 
 // JWT and JWE compact serialisations, AWS access key ids, and 40-character AWS secret access keys.
 const JWT_PATTERN = /\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}(?:\.[A-Za-z0-9_-]+)*/g;
@@ -346,13 +369,41 @@ const MIN_LETTERS_FOR_CASING = 7;
 // Below this length a segment's digit scatter is not judged either: `a1B2c3` is the suffix `mkdtemp` gives a directory,
 // `v1a2` a version, `ip10` a label. A token that hides in segments this short is caught where a carrier names it.
 const MIN_SEGMENT_FOR_DIGIT_SCATTER = 8;
-// A value after a compound credential-named key is judged for token shape only from this length.
+// The first word of a clause after a credential-named label is judged for token shape only from this length.
 const MIN_CREDENTIAL_VALUE_LENGTH = 8;
 
-// Names that carry a credential in query strings beyond the Flue heuristic: bare `sid`, `sig`, `pwd`, `session`, `auth`,
-// and the signed-URL parameters of S3 and GCS. Thresholds, counts, and file references are exempt.
-const SAFE_KEY_SHAPE_PATTERN = /^(?:max|min)[_-]|[_-](?:limit|days|hours|minutes|seconds|count|path|file|dir)$/i;
-const EXTRA_CREDENTIAL_KEY_SEGMENTS = new Set(["sid", "sig", "pwd", "passwd", "pass", "session", "sessid", "auth", "nonce", "sas"]);
+// A key whose final segment names a setting is a setting, not a credential key, even when an earlier segment is a
+// credential word: `BOX_AUTH_METHOD=ccg`, `BOX_TOKEN_URL`, `BOX_JWT_ALGORITHM`, `BOX_JWT_AUDIENCE`,
+// `LAUNCHDARKLY_KEY_SHAPE`, `token_limit`, `client_id`, `key_name`. Its value stays unless it is token-shaped or a
+// registered secret, and a URL value still passes the URL rule (userinfo and query removed, path kept).
+const SETTING_KEY_SUFFIXES = new Set([
+  "url", "uri", "endpoint", "method", "algorithm", "audience", "issuer", "shape", "type", "mode",
+  "path", "file", "dir", "limit", "count", "id", "name",
+  // Thresholds, timestamps, and labels under a credential-named prefix (`stale_token_days`, `token_created_at`,
+  // `key_expiry`, `token_inventory_scope`, `caller_token_role`, `key_status`).
+  "days", "hours", "minutes", "seconds", "ttl", "at", "date", "time", "timestamp", "expiry", "expiration", "expires", "version",
+  "scope", "role", "status", "state", "kind", "label", "title", "description", "owner",
+]);
+const THRESHOLD_KEY_PREFIX_PATTERN = /^(?:max|min)[_-]/i;
+// A `key` without a credential qualifier names an identifier as often as a credential (`key`, `integrationKey`,
+// `flagKey`, `projectKey`), so it keeps a name-shaped value and loses a token-shaped one, as the data side already
+// rules; `api_key`, `sdk_key`, `client_key`, and the other qualified spellings are credentials outright.
+function isUnqualifiedKeyName(key: string): boolean {
+  const segments = keySegments(key);
+  const last = segments[segments.length - 1];
+  return (last === "key" || last === "keys") && !isCredentialDataKey(key);
+}
+// Incoming-webhook and callback URLs carry their credential in the path (rule 9), so these stay credential keys
+// whatever their suffix: `webhook_url`, `webhookUrl`, `slack_hook_url`, `callback_url`. Their URL value keeps only its
+// origin and loses its path and query; a value that is not a URL (a webhook's name) has nothing to lose.
+const WEBHOOK_KEY_LAST_SEGMENTS = new Set(["url", "uri"]);
+
+// Names that carry a credential in query strings and pairs beyond the Flue heuristic: bare `sid`, `sig`, `pwd`,
+// `session`, `auth`, the concatenated application-key spellings (`appkey` in `~/.dogrc`), and the signed-URL parameters
+// of S3 and GCS.
+const EXTRA_CREDENTIAL_KEY_SEGMENTS = new Set([
+  "sid", "sig", "pwd", "passwd", "pass", "session", "sessid", "auth", "nonce", "sas", "appkey", "appkeys", "applicationkey", "applicationkeys",
+]);
 const EXTRA_CREDENTIAL_KEYS = new Set([
   "x-amz-signature",
   "x-amz-credential",
@@ -377,14 +428,34 @@ function keySegments(key: string): string[] {
     .filter(Boolean);
 }
 
+/** True for `webhook*`, `*hook_url`, `*hook_uri`, and `callback_url` keys, whose URL value carries a credential in its path. */
+export function isWebhookKey(key: string): boolean {
+  const segments = keySegments(key);
+  if (segments.length === 0) return false;
+  if (segments[0].startsWith("webhook")) return true;
+  if (segments.length < 2 || !WEBHOOK_KEY_LAST_SEGMENTS.has(segments[segments.length - 1])) return false;
+  const qualifier = segments[segments.length - 2];
+  return qualifier.endsWith("hook") || qualifier === "callback";
+}
+
+/** True when the key's final segment names a setting (`token_url`, `auth_method`, `client_id`) or a threshold (`max_keys`). */
+export function isSettingKey(key: string): boolean {
+  const segments = keySegments(key);
+  if (segments.length < 2) return false;
+  if (THRESHOLD_KEY_PREFIX_PATTERN.test(key) || segments[0] === "max" || segments[0] === "min") return true;
+  return SETTING_KEY_SUFFIXES.has(segments[segments.length - 1]);
+}
+
 /**
- * True when a name in a query string, header, or name/value pair carries a credential: the Flue argument-key heuristic
- * (`token`, `secret`, `password`, `api_key`, `authorization`, `cookie`, ...) plus the bare and signed-URL names it does
- * not cover, under the same exemption for thresholds, counts, and file references.
+ * True when a name in a query string or name/value pair carries a credential: a webhook or callback URL key first
+ * (whatever its suffix); then a setting key is never a credential key; then the Flue argument-key heuristic (`token`,
+ * `secret`, `password`, `api_key`, `authorization`, `cookie`, ... anywhere in the name) plus the bare and signed-URL
+ * names it does not cover.
  */
 export function isCredentialKey(key: string): boolean {
+  if (isWebhookKey(key)) return true;
+  if (isSettingKey(key)) return false;
   if (isSensitiveArgumentKey(key)) return true;
-  if (SAFE_KEY_SHAPE_PATTERN.test(key)) return false;
   const normalized = key.toLowerCase();
   if (EXTRA_CREDENTIAL_KEYS.has(normalized)) return true;
   return keySegments(key).some((segment) => EXTRA_CREDENTIAL_KEY_SEGMENTS.has(segment));
@@ -399,11 +470,11 @@ function looksLikeSchemeValue(value: string): boolean {
 }
 
 /**
- * A value after a compound credential-named key (`sdk_keys`, `client_token`, `user_session`) is the credential when
- * it is at least eight characters and shaped like a token: base64 symbols, or a segment between "-", "_", "/", ".",
- * or ":" that is not shaped like part of a name. Words, scopes, counts, and labels after such a key are prose
- * ("InvalidAuthenticationToken: Access token has expired", "access_tokens: LaunchDarkly request failed",
- * "sdk_keys:web/production").
+ * The first word of a clause after a credential-named label (`InvalidAuthenticationToken: Access token has expired`,
+ * `access_tokens: LaunchDarkly request failed`, `sdk_keys:web/production`) is a credential only when it is at least
+ * eight characters and shaped like a token: base64 symbols, or a segment between "-", "_", "/", ".", or ":" that is
+ * not shaped like part of a name. This test never applies to an assignment, a quoted value, or a `:` value that stands
+ * alone: those go whatever their shape (see `replaceCompoundCredentialPairs`).
  */
 function looksLikeCredentialValue(value: string): boolean {
   if (value.length < MIN_CREDENTIAL_VALUE_LENGTH) return false;
@@ -459,9 +530,10 @@ function isNameSegment(segment: string): boolean {
 
 /**
  * The long-token rule's decision: a run is a token when it carries the base64 symbol "+", when it is standard base64
- * with "=" padding (no "-" or "_" in the body, so `Proxy-Authorization=` is a name followed by an assignment), or when
- * any of its "-" or "_" separated segments is not shaped like part of a name. Uppercase codes, digit strings, and
- * canonical UUIDs are names outright.
+ * with "=" padding (no "-" or "_" in the body) whose body is not itself shaped like a name (so `Proxy-Authorization=`
+ * and `InvalidAuthenticationToken=` are names followed by an assignment, while `QUJDREVGR0hJSktMTU5PUA==` is a token
+ * by its digit scatter), or when any of its "-" or "_" separated segments is not shaped like part of a name.
+ * Uppercase codes, digit strings, and canonical UUIDs are names outright.
  */
 export function looksLikeToken(run: string): boolean {
   if (run.length < LONG_TOKEN_MIN_LENGTH) return false;
@@ -469,7 +541,7 @@ export function looksLikeToken(run: string): boolean {
   if (UPPERCASE_CODE_PATTERN.test(body) || DIGITS_ONLY_PATTERN.test(body) || UUID_PATTERN.test(body)) return false;
   if (/\+/.test(body)) return true;
   const segments = body.split(/[-_]/);
-  if (body.length < run.length && segments.length === 1) return true;
+  if (body.length < run.length && segments.length === 1) return !isNameSegment(body);
   return !segments.every(isNameSegment);
 }
 
@@ -695,11 +767,63 @@ function scrubAwsSecret(run: string): string {
 }
 
 /**
- * Replaces the value of every compound credential-named pair. The key and separator are matched on their own and the
- * value is consumed only when the key names a credential and the value is shaped like one, so the value of an
- * ordinary pair is rescanned and a credential pair nested inside it is still caught.
+ * True for a key that labels a clause in prose rather than naming one credential: a plural credential word in any
+ * segment, a verdict count under a plural subject, or a PascalCase code.
  */
-function replaceGenericCredentialPairs(text: string): string {
+function isClauseLabel(key: string): boolean {
+  if (PASCAL_CASE_CODE_PATTERN.test(key)) return true;
+  const segments = keySegments(key);
+  if (segments.some((segment) => PLURAL_LABEL_SEGMENTS.has(segment))) return true;
+  return segments.length >= 2 && VERDICT_COUNT_LAST_SEGMENTS.has(segments[segments.length - 1]) && PLURAL_SUBJECT_PATTERN.test(segments[segments.length - 2]);
+}
+
+/**
+ * Whether a bare value after a `:` separator stands alone as an assignment (`developer_token: letmein`, end of the
+ * line, `;`, `}`, or the next pair after it) or opens a clause (`access_tokens: LaunchDarkly request failed`,
+ * `Access tokens: name, role or custom role`, `sdk_keys:web/production: ...`), in which case it is a label's first
+ * word. Only the first word is judged; the words after it are prose either way. A clause after a singular key is
+ * not an exemption: only `isClauseLabel` keys open one, and a label chain (`sdk_keys:web/production: ...`) is a chain
+ * only under such a key, so `developer_token: letmein: security_exception` is an assignment whose value is followed
+ * by a colon.
+ */
+function bareValueOpensClause(text: string, key: string, valueEnd: number): boolean {
+  if (!isClauseLabel(key)) return false;
+  // A label chain: the value is itself followed by a `:` and its own clause.
+  if (text[valueEnd] === ":") return true;
+  let index = valueEnd;
+  while (text[index] === " " || text[index] === "\t") index += 1;
+  if (index >= text.length) return false;
+  const next = text[index];
+  if (next === "\n" || next === "\r" || next === ";" || next === "}" || next === ")" || next === "]" || next === "&" || next === "|" || next === "\\" || next === '"' || next === "'") return false;
+  if (next === ".") return stickyExec(SENTENCE_END_PATTERN, text, index) === null;
+  if (next === ",") {
+    index += 1;
+    while (text[index] === " " || text[index] === "\t") index += 1;
+    if (index >= text.length || text[index] === "\n" || text[index] === "\r") return false;
+  }
+  // The next pair on the line makes the value an assignment; any other word continues a clause.
+  return stickyExec(FOLLOWING_PAIR_PATTERN, text, index) === null;
+}
+
+/** A webhook or callback URL keeps its origin and loses its path and query; a value that is not a URL is left to the other rules. */
+function webhookValueReplacement(value: string): string | null {
+  if (!/^https?:\/\//i.test(value)) return null;
+  try {
+    const parsed = new URL(value);
+    return `${parsed.protocol}//${parsed.host}/${REDACTED}`;
+  } catch {
+    return REDACTED;
+  }
+}
+
+/**
+ * Replaces the value of every compound credential-named pair (`BOX_CLIENT_SECRET=v`, `developer_token: v`,
+ * `"cloudApiKey": "v"`). The key and separator are matched on their own; a quoted value goes whole up to its closing
+ * quote (a leading scheme word kept), a bare value after `=` or a bare `:` value that stands alone goes whatever its
+ * shape, and the first word of a clause after a credential-named label goes only when it is token-shaped. The value of
+ * an ordinary pair is rescanned, so a credential pair nested inside it is still caught.
+ */
+function replaceCompoundCredentialPairs(text: string): string {
   GENERIC_PAIR_KEY_PATTERN.lastIndex = 0;
   let out = "";
   let last = 0;
@@ -711,11 +835,55 @@ function replaceGenericCredentialPairs(text: string): string {
       continue;
     }
     if (!isCredentialKey(key)) continue;
-    GENERIC_PAIR_VALUE_PATTERN.lastIndex = match.index + whole.length;
-    const value = GENERIC_PAIR_VALUE_PATTERN.exec(text)?.[0];
-    if (value === undefined || !looksLikeCredentialValue(value)) continue;
-    out += `${text.slice(last, match.index)}${openingQuote}${key}${separator}${REDACTED}`;
-    last = match.index + whole.length + value.length;
+    const valueStart = match.index + whole.length;
+    const webhook = isWebhookKey(key);
+    // An unqualified `key` keeps the identifier treatment: only a token-shaped value goes.
+    const shapeGated = isUnqualifiedKeyName(key);
+    const quoted = readQuotedValue(text, valueStart);
+    let replacement: string;
+    let end: number;
+    if (quoted !== null) {
+      const content = text.slice(quoted.start, quoted.end);
+      if (webhook) {
+        const reduced = webhookValueReplacement(content);
+        if (reduced === null) continue;
+        replacement = `${quoted.open}${reduced}${quoted.close}`;
+      } else {
+        const scheme = stickyExec(HEADER_SCHEME_PATTERN, content, 0) ?? "";
+        if (isBlankOrScrubbed(content.slice(scheme.length))) continue;
+        if (shapeGated && !looksLikeCredentialValue(content.slice(scheme.length))) continue;
+        replacement = `${quoted.open}${scheme}${REDACTED}${quoted.close}`;
+      }
+      end = quoted.after;
+    } else {
+      // A scheme word in front of the value stays, as in a header (`auth_header: Bearer "v"`, `Authorization: Bearer v`).
+      const scheme = webhook ? "" : stickyExec(HEADER_SCHEME_PATTERN, text, valueStart) ?? "";
+      const afterScheme = valueStart + scheme.length;
+      const quotedAfterScheme = scheme.length > 0 ? readQuotedValue(text, afterScheme) : null;
+      if (quotedAfterScheme !== null) {
+        if (isBlankOrScrubbed(text.slice(quotedAfterScheme.start, quotedAfterScheme.end))) continue;
+        replacement = `${scheme}${quotedAfterScheme.open}${REDACTED}${quotedAfterScheme.close}`;
+        end = quotedAfterScheme.after;
+      } else {
+        const value = stickyExec(GENERIC_PAIR_VALUE_PATTERN, text, afterScheme);
+        // A container opener is rescanned element by element; an unquoted literal after `:` carries no secret text.
+        if (value === null || value.startsWith("[") || value.startsWith("{")) continue;
+        if (!separator.includes("=") && UNQUOTED_LITERAL_PATTERN.test(value)) continue;
+        end = afterScheme + value.length;
+        if (webhook) {
+          const reduced = webhookValueReplacement(value);
+          if (reduced === null) continue;
+          replacement = reduced;
+        } else {
+          const tightAssignment = separator.includes("=") && !WHITESPACE_PATTERN.test(separator);
+          const assignment = !shapeGated && (tightAssignment || scheme.length > 0 || !bareValueOpensClause(text, key, end));
+          if (!assignment && !looksLikeCredentialValue(value)) continue;
+          replacement = `${scheme}${REDACTED}`;
+        }
+      }
+    }
+    out += `${text.slice(last, match.index)}${openingQuote}${key}${separator}${replacement}`;
+    last = end;
     GENERIC_PAIR_KEY_PATTERN.lastIndex = last;
   }
   return last === 0 ? text : `${out}${text.slice(last)}`;
@@ -756,7 +924,7 @@ export function createCredentialScrubber(options: CredentialScrubberOptions = {}
     scrubbed = replaceCarrierValues(scrubbed, SCHEME_WORD_PATTERN, readSchemeValue);
     scrubbed = replaceCarrierValues(scrubbed, SESSION_ASSIGNMENT_PATTERN, readPairValue);
     scrubbed = replaceCarrierValues(scrubbed, CREDENTIAL_PAIR_PATTERN, readPairValue);
-    scrubbed = replaceGenericCredentialPairs(scrubbed)
+    scrubbed = replaceCompoundCredentialPairs(scrubbed)
       .replace(JWT_PATTERN, REDACTED)
       .replace(AWS_ACCESS_KEY_ID_PATTERN, REDACTED);
     if (shapes) scrubbed = scrubbed.replace(AWS_SECRET_PATTERN, scrubAwsSecret).replace(HEX_DIGEST_PATTERN, REDACTED);

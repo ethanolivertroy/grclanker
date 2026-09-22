@@ -9,7 +9,13 @@ import {
   isCredentialKey,
   looksLikeToken,
 } from "../dist/extensions/grc-tools/credential-scrub.js";
-import { assertCanaryFixture, assertCanaryWindowsAbsent } from "./helpers/canary-windows.mjs";
+import { isSettingKey, isWebhookKey } from "../dist/extensions/grc-tools/credential-scrub.js";
+import { redactCredentialValues as redactBoxValues, scrubErrorText as scrubBoxErrorText } from "../dist/extensions/grc-tools/box.js";
+import { redactCredentialValues as redactLaunchdarklyValues, scrubErrorText as scrubLaunchdarklyErrorText } from "../dist/extensions/grc-tools/launchdarkly.js";
+import { redactCredentialValues as redactKnowbe4Values, scrubErrorText as scrubKnowbe4ErrorText } from "../dist/extensions/grc-tools/knowbe4.js";
+import { redactCredentialValues as redactDatadogValues, scrubErrorText as scrubDatadogErrorText } from "../dist/extensions/grc-tools/datadog.js";
+import { redactSensitiveValues as redactElasticValues, scrubErrorText as scrubElasticErrorText } from "../dist/extensions/grc-tools/elastic.js";
+import { assertCanaryFixture, assertCanaryWindowsAbsent, canaryWindows } from "./helpers/canary-windows.mjs";
 import { scrubAlterations } from "./helpers/scrub-survival.mjs";
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -468,6 +474,7 @@ test("looksLikeToken judges runs by base64 symbols, digit scatter, and token cas
     "grclanker-launchdarkly-2026-09-22",
     "elastic-malformed-config-SeSovG",
     "Proxy-Authorization=",
+    "InvalidAuthenticationToken=",
     "short-run",
   ]) {
     assert.ok(!looksLikeToken(run), `expected name: ${run}`);
@@ -481,6 +488,200 @@ test("isCredentialKey covers the Flue heuristic plus bare and signed-URL names, 
   for (const key of ["before", "after", "env", "expand", "limit", "offset", "page", "per_page", "fields", "include_defaults", "flat_settings", "with_limited_by", "stale_token_days", "max_keys", "token_limit", "credentials_file", "showAll", "status"]) {
     assert.ok(!isCredentialKey(key), `expected ordinary key: ${key}`);
   }
+});
+
+// ---------------------------------------------------------------------------------------------------------------
+// Row (a): a value under a credential-named key goes whatever its shape and length, through every entry point. The
+// key rule sees a credential word anywhere in the name, so every vendor env name and every compound config key the
+// five modules read is covered, and no shape gate applies to an assignment, a quoted value, or a `:` pair.
+// ---------------------------------------------------------------------------------------------------------------
+
+/** Every credential env name and config-file key the five modules read, plus group D's cross-check keys. */
+const COMPOUND_CREDENTIAL_KEYS = [...new Set([
+  "BOX_CLIENT_SECRET", "BOX_ACCESS_TOKEN", "BOX_REFRESH_TOKEN", "BOX_TOKEN", "BOX_DEVELOPER_TOKEN", "BOX_JWT_PASSPHRASE",
+  "LAUNCHDARKLY_API_TOKEN", "LD_ACCESS_TOKEN",
+  "DD_API_KEY", "DD_APP_KEY", "DD_APPLICATION_KEY", "DATADOG_API_KEY", "DATADOG_APP_KEY",
+  "KNOWBE4_API_TOKEN", "KNOWBE4_PHISHER_API_TOKEN",
+  "ELASTIC_API_KEY", "ELASTIC_CLOUD_API_KEY", "ELASTIC_PASSWORD", "ELASTIC_BEARER_TOKEN",
+  "DB_PASSWORD", "password", "client_secret",
+  "clientSecret", "access_token", "accessToken", "refresh_token", "refreshToken", "developer_token", "jwt_passphrase", "passphrase",
+  "privateKey", "token", "secret", "api_key", "apikey",
+  "api_token",
+  "apiKey", "appKey", "appkey", "private_key",
+  "apiToken", "phisher_api_token", "phisherApiToken",
+  "api-key", "bearer_token", "bearer-token", "bearerToken", "cloud_api_key", "cloud-api-key", "cloudApiKey",
+])];
+
+/** Human-chosen values: the four that pass a digit, symbol, or length test and the eight a shape gate would keep. */
+const WEAK_VALUES = ["hunter2", "Summer2026!", "letmein2024", "correcthorsebatterystaple", "letmein", "Sunshine", "abc12", "p@ss", "monkey", "qwerty", "iloveyou", "football"];
+
+/** Every form a pair takes in an error body, a config echo, or a sentence. */
+const PAIR_FORMS = [
+  ["assignment", (key, value) => `${key}=${value}`],
+  ["colon space", (key, value) => `${key}: ${value}`],
+  ["colon tight", (key, value) => `${key}:${value}`],
+  ["double quoted", (key, value) => `${key}="${value}"`],
+  ["single quoted", (key, value) => `${key}='${value}'`],
+  ["JSON", (key, value) => `{"${key}": "${value}"}`],
+  ["JSON tight", (key, value) => `{"${key}":"${value}"}`],
+  ["JSON escaped", (key, value) => `\\"${key}\\": \\"${value}\\"`],
+  ["assignment in a sentence", (key, value) => `the upstream echoed ${key}=${value} back in its error body`],
+  ["colon pair in a sentence", (key, value) => `the config line ${key}: ${value} was rejected by the loader`],
+  ["spaced assignment on its own line", (key, value) => `[auth]\n${key} = ${value}\nregion = us`],
+  ["YAML line", (key, value) => `region: us\n${key}: ${value}\nlimit: 10`],
+];
+
+/** The eleven entry points: the shared text and data scrubbers, each module's error text scrubber, each module's record walker. */
+const ENTRY_POINTS = [
+  ["shared scrub", (text) => createCredentialScrubber().scrub(text)],
+  ["shared scrubData", (text) => JSON.stringify(createCredentialScrubber().scrubData({ note: text }))],
+  ["box scrubErrorText", scrubBoxErrorText],
+  ["launchdarkly scrubErrorText", scrubLaunchdarklyErrorText],
+  ["knowbe4 scrubErrorText", scrubKnowbe4ErrorText],
+  ["datadog scrubErrorText", scrubDatadogErrorText],
+  ["elastic scrubErrorText", scrubElasticErrorText],
+  ["box redactCredentialValues", (text) => JSON.stringify(redactBoxValues({ note: text }))],
+  ["launchdarkly redactCredentialValues", (text) => JSON.stringify(redactLaunchdarklyValues({ note: text }))],
+  ["knowbe4 redactCredentialValues", (text) => JSON.stringify(redactKnowbe4Values({ note: text }))],
+  ["datadog redactCredentialValues", (text) => JSON.stringify(redactDatadogValues({ note: text }))],
+  ["elastic redactSensitiveValues", (text) => JSON.stringify(redactElasticValues({ note: text }))],
+];
+
+/** Asserts the value is gone whole and in every 6-to-24 window, while the key survives and the marker was written. */
+function assertPairValueGone(scrubbed, key, value, label) {
+  assert.ok(!scrubbed.includes(value), `${label}: value survived: ${scrubbed}`);
+  for (const fragment of canaryWindows(value)) assert.ok(!scrubbed.includes(fragment), `${label}: fragment "${fragment}" survived: ${scrubbed}`);
+  assert.ok(scrubbed.includes(key), `${label}: key lost: ${scrubbed}`);
+  assert.ok(scrubbed.includes(REDACTED), `${label}: no marker written: ${scrubbed}`);
+}
+
+test("row (a): every credential-named key the five modules read loses a human-chosen value whatever its shape, in every pair form, through every entry point", () => {
+  assert.equal(COMPOUND_CREDENTIAL_KEYS.length, 50);
+  for (const key of COMPOUND_CREDENTIAL_KEYS) assert.ok(isCredentialKey(key), `key rule misses ${key}`);
+  let cells = 0;
+  for (const [entryLabel, entry] of ENTRY_POINTS) {
+    for (const key of COMPOUND_CREDENTIAL_KEYS) {
+      for (const value of WEAK_VALUES) {
+        for (const [formLabel, form] of PAIR_FORMS) {
+          const scrubbed = entry(form(key, value));
+          assertPairValueGone(scrubbed, key, value, `${entryLabel}, ${formLabel}, ${key}=${value}`);
+          cells += 1;
+        }
+      }
+    }
+  }
+  assert.equal(cells, ENTRY_POINTS.length * COMPOUND_CREDENTIAL_KEYS.length * WEAK_VALUES.length * PAIR_FORMS.length);
+});
+
+test("row (a): the key, separator, and quoting survive so the text still says which pair was replaced, and several pairs on one line each lose their own value", () => {
+  const scrubber = createCredentialScrubber();
+  assert.equal(scrubber.scrub("BOX_CLIENT_SECRET=football"), `BOX_CLIENT_SECRET=${REDACTED}`);
+  assert.equal(scrubber.scrub("developer_token: letmein"), `developer_token: ${REDACTED}`);
+  assert.equal(scrubber.scrub("cloud_api_key:p@ss"), `cloud_api_key:${REDACTED}`);
+  assert.equal(scrubber.scrub('jwt_passphrase="Sunshine"'), `jwt_passphrase="${REDACTED}"`);
+  assert.equal(scrubber.scrub("phisherApiToken='abc12'"), `phisherApiToken='${REDACTED}'`);
+  assert.equal(scrubber.scrub('{"cloudApiKey": "monkey", "region": "us"}'), `{"cloudApiKey": "${REDACTED}", "region": "us"}`);
+  assert.equal(scrubber.scrub('\\"DD_APP_KEY\\": \\"qwerty\\"'), `\\"DD_APP_KEY\\": \\"${REDACTED}\\"`);
+  assert.equal(scrubber.scrub("the config line developer_token: letmein was rejected"), `the config line developer_token: ${REDACTED} was rejected`);
+  assert.equal(
+    scrubber.scrub("LAUNCHDARKLY_API_TOKEN=monkey LD_ACCESS_TOKEN=Sunshine DB_PASSWORD=letmein DD_APP_KEY=p@ss BOX_CLIENT_SECRET=football"),
+    `LAUNCHDARKLY_API_TOKEN=${REDACTED} LD_ACCESS_TOKEN=${REDACTED} DB_PASSWORD=${REDACTED} DD_APP_KEY=${REDACTED} BOX_CLIENT_SECRET=${REDACTED}`,
+  );
+  assert.equal(scrubber.scrub("developer_token: hunter2, client_token: letmein; user_session: monkey"), `developer_token: ${REDACTED}, client_token: ${REDACTED}; user_session: ${REDACTED}`);
+  assert.equal(scrubber.scrub("auth_header: Bearer letmein"), `auth_header: Bearer ${REDACTED}`);
+  assert.equal(scrubber.scrub("developer_token: letmein."), `developer_token: ${REDACTED}.`);
+});
+
+test("row (a), identifiers and settings: a key whose final segment names a setting keeps a name-shaped value, a URL value still passes the URL rule, and only a token-shaped or registered value goes", () => {
+  const kept = [
+    "BOX_AUTH_METHOD=ccg",
+    "BOX_TOKEN_URL=https://api.box.com/oauth2/token",
+    "BOX_JWT_ALGORITHM=RS512",
+    "BOX_JWT_AUDIENCE=https://api.box.com/oauth2/token",
+    "LAUNCHDARKLY_KEY_SHAPE=sdk-uuid",
+    "BOX_CLIENT_ID=acme-audit-app",
+    "ELASTIC_USERNAME=elastic",
+    "client_id: acme-audit-app",
+    "token_type=Bearer",
+    "grant_type=client_credentials",
+    "auth_mode: oauth token_limit=10 max_keys=500 stale_token_days=90 key_name=deploy",
+    "token_created_at: 2026-09-22T10:00:00Z key_expiry: 2027-01-01 token_inventory_scope: full caller_token_role: admin",
+    'LAUNCHDARKLY_KEY_SHAPE: "sdk-uuid"',
+    '{"BOX_AUTH_METHOD": "ccg", "BOX_TOKEN_URL": "https://api.box.com/oauth2/token"}',
+  ];
+  const scrubber = createCredentialScrubber();
+  assert.deepEqual(scrubAlterations(kept, scrubber.scrub), []);
+  for (const scrubErrorText of [scrubBoxErrorText, scrubLaunchdarklyErrorText, scrubKnowbe4ErrorText, scrubDatadogErrorText, scrubElasticErrorText]) {
+    assert.deepEqual(scrubAlterations(kept, scrubErrorText), []);
+  }
+  for (const key of ["BOX_AUTH_METHOD", "BOX_TOKEN_URL", "BOX_JWT_ALGORITHM", "BOX_JWT_AUDIENCE", "LAUNCHDARKLY_KEY_SHAPE", "BOX_CLIENT_ID", "client_id", "token_type", "auth_mode", "key_name", "token_created_at", "maxKeys", "redirect_uri", "authorization_endpoint", "password_file", "private_key_path"]) {
+    assert.ok(isSettingKey(key) && !isCredentialKey(key), `expected a setting key: ${key}`);
+  }
+  // The URL rule still applies to a setting's URL value: userinfo and query go, the path stays.
+  assert.equal(scrubber.scrub("BOX_TOKEN_URL=https://svc:pw@api.box.com/oauth2/token?client_secret=football"), `BOX_TOKEN_URL=https://api.box.com/oauth2/token?${REDACTED}`);
+  // Token-shaped and registered values go under a setting key as anywhere else.
+  assert.equal(scrubber.scrub(`BOX_CLIENT_ID=${TOKEN_SHAPED.tokenCasing}`), `BOX_CLIENT_ID=${REDACTED}`);
+  assert.equal(scrubber.scrub(`BOX_ENTERPRISE_ID=${TOKEN_SHAPED.md5}`), `BOX_ENTERPRISE_ID=${REDACTED}`);
+  assert.equal(scrubber.scrub(`LAUNCHDARKLY_KEY_SHAPE=${TOKEN_SHAPED.scatteredDigits}`), `LAUNCHDARKLY_KEY_SHAPE=${REDACTED}`);
+  const registered = createCredentialScrubber();
+  registered.registerSecrets(["ccg-secret-value-zq"]);
+  assert.equal(registered.scrub("BOX_AUTH_METHOD=ccg-secret-value-zq"), `BOX_AUTH_METHOD=${REDACTED}`);
+  assert.equal(registered.scrub("BOX_TOKEN_URL=https://api.box.com/ccg-secret-value-zq/token"), `BOX_TOKEN_URL=https://api.box.com/${REDACTED}/token`);
+});
+
+test("row (a), webhooks: a webhook or callback URL key stays a credential key whatever its suffix and its value keeps only the origin, while a webhook's name is a name", () => {
+  const scrubber = createCredentialScrubber();
+  for (const key of ["webhook_url", "webhookUrl", "webhook", "webhooks", "slack_hook_url", "hook_url", "incomingHookUri", "callback_url", "callbackUrl"]) {
+    assert.ok(isWebhookKey(key) && isCredentialKey(key), `expected a webhook key: ${key}`);
+  }
+  assert.equal(scrubber.scrub("webhook_url=https://hooks.example.com/services/foo/bar/abcdefghijkl"), `webhook_url=https://hooks.example.com/${REDACTED}`);
+  assert.equal(scrubber.scrub('"webhookUrl": "https://hooks.example.com/services/foo/bar/abcdefghijkl"'), `"webhookUrl": "https://hooks.example.com/${REDACTED}"`);
+  assert.equal(scrubber.scrub("slack_hook_url: https://hooks.slack.com/services/T000/B000/xyz"), `slack_hook_url: https://hooks.slack.com/${REDACTED}`);
+  assert.equal(scrubber.scrub("callback_url=https://app.example.com/oauth/cb?code=abc&state=xyz"), `callback_url=https://app.example.com/${REDACTED}`);
+  assert.equal(scrubber.scrub("see https://api.example.com/v1/x?webhook_url=https://hooks.example.com/services/a/b/c for details"), `see https://api.example.com/v1/x?${REDACTED} for details`);
+  for (const text of ['"webhook": "canary-insecure-hook-zq"', "webhook_name: nightly-sync", "webhooks: 3 configured, 1 insecure"]) {
+    assert.equal(scrubber.scrub(text), text, `a webhook name is not a URL and stays: ${text}`);
+  }
+});
+
+test("row (a), prose: a plural inventory label or PascalCase code followed by a clause, an unquoted JSON literal, an unqualified key, and a spaced `=` in a syntax description all survive; the same spellings as assignments go", () => {
+  const scrubber = createCredentialScrubber();
+  const kept = [
+    "InvalidAuthenticationToken: Access token has expired.",
+    "access_tokens: LaunchDarkly request failed (403 Forbidden) for GET /api/v2/tokens?showAll=true: forbidden: Forbidden",
+    "api_keys: 3 of 5 keys have no expiry; tokens: none are stale",
+    "Authorization > Access tokens: name, role or custom role, owner, expiry, and last used date of every token",
+    "sdk_keys:web/production: LaunchDarkly request failed (403 Forbidden)",
+    "application_keys (GET /api/v2/application_keys, org_app_keys_read: Datadog request failed (403 Forbidden) GET /api/v2/application_keys: Forbidden)",
+    "posture_findings_pass: Datadog request failed (403 Forbidden) GET /api/v2/posture_management/findings: Forbidden",
+    "user-session: 3 active sessions",
+    "- Pass: 7\n- Warn: 3\n- Fail: 7\n- Manual: 3",
+    "Pass: 7, Warn: 3, Fail: 7, Manual: 3",
+    "Invalid TOML at line 3: expected a comment, a [table] header, or a key = value pair",
+    '"has_private_key": true, "api_keys_total": 2, "api_keys_complete": null, "authorization_realms": [], "enrollment_keys": 6',
+    '"password_hashing_explicit": true, "token_service_enabled": false, "tokens_without_expiry": 1',
+    '"integrationKey": "datadog", "key": "checkout-v2", "flagKey": "new-checkout", "projectKey": "web"',
+    "key = value pair",
+  ];
+  assert.deepEqual(scrubAlterations(kept, scrubber.scrub), []);
+  // The same spellings as assignments, quoted values, or under a qualified key go.
+  assert.equal(scrubber.scrub("developer_token: Access was denied"), `developer_token: ${REDACTED} was denied`);
+  assert.equal(scrubber.scrub("InvalidAuthenticationToken=Sunshine"), `InvalidAuthenticationToken=${REDACTED}`);
+  assert.equal(scrubber.scrub('"access_tokens": "Sunshine"'), `"access_tokens": "${REDACTED}"`);
+  assert.equal(scrubber.scrub("api_keys: Sunshine"), `api_keys: ${REDACTED}`);
+  assert.equal(scrubber.scrub("api_keys: Sunshine; tokens: monkey"), `api_keys: ${REDACTED}; tokens: ${REDACTED}`);
+  assert.equal(scrubber.scrub("org_app_keys_read: Sunshine"), `org_app_keys_read: ${REDACTED}`);
+  assert.equal(scrubber.scrub("posture_findings_pass=Sunshine"), `posture_findings_pass=${REDACTED}`);
+  assert.equal(scrubber.scrub("db_pass: Sunshine was rejected"), `db_pass: ${REDACTED} was rejected`);
+  // A colon after the value chains labels only under a clause label; under a singular key it is an assignment.
+  assert.equal(scrubber.scrub("developer_token: letmein2024: security_exception"), `developer_token: ${REDACTED}: security_exception`);
+  assert.equal(scrubber.scrub("api_key: Sunshine:monkey"), `api_key: ${REDACTED}`);
+  assert.equal(scrubber.scrub("sdk_keys:web/production: LaunchDarkly request failed (403 Forbidden)"), "sdk_keys:web/production: LaunchDarkly request failed (403 Forbidden)");
+  assert.equal(scrubber.scrub('"has_private_key": "hunter2"'), `"has_private_key": "${REDACTED}"`);
+  assert.equal(scrubber.scrub("has_private_key=true"), `has_private_key=${REDACTED}`);
+  assert.equal(scrubber.scrub('"sdk_key": "letmein", "api_key": "hunter2"'), `"sdk_key": "${REDACTED}", "api_key": "${REDACTED}"`);
+  assert.equal(scrubber.scrub(`"key": "${TOKEN_SHAPED.tokenCasing}"`), `"key": "${REDACTED}"`);
+  assert.equal(scrubber.scrub("[auth]\ndeveloper_token = letmein\nregion = us"), `[auth]\ndeveloper_token = ${REDACTED}\nregion = us`);
 });
 
 const DATA_CANARIES = {

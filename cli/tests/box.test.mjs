@@ -2341,6 +2341,29 @@ const BOX_DATA_CANARIES = {
   bioBearer: "rzzeFBvjaahfmRUPxGGsEEbvHRPmKXN3",
 };
 
+/** A 403 body echoing weak human-chosen pairs (no digits, symbols, or length a shape gate would catch) under vendor env names and a config key. */
+const WEAK_PAIR_BODY = "Access denied: LAUNCHDARKLY_API_TOKEN=monkey LD_ACCESS_TOKEN=Sunshine DB_PASSWORD=letmein DD_APP_KEY=p@ss BOX_CLIENT_SECRET=football KNOWBE4_API_TOKEN=qwerty ELASTIC_PASSWORD=iloveyou developer_token: letmein2024";
+const WEAK_PAIR_VALUES = ["monkey", "Sunshine", "letmein", "p@ss", "football", "qwerty", "iloveyou", "letmein2024"];
+const WEAK_PAIR_KEYS = ["LAUNCHDARKLY_API_TOKEN", "LD_ACCESS_TOKEN", "DB_PASSWORD", "DD_APP_KEY", "BOX_CLIENT_SECRET", "KNOWBE4_API_TOKEN", "ELASTIC_PASSWORD", "developer_token"];
+
+test("row (a): a Box 403 body echoing weak values under credential-named keys reaches the access check with every value gone and every key kept", async () => {
+  const { client, log } = httpBox(hardenedFixture(), {
+    routes: {
+      "GET /2.0/retention_policies": () => jsonResponse(
+        { type: "error", status: 403, code: "access_denied_insufficient_permissions", message: WEAK_PAIR_BODY, request_id: "req-weak" },
+        { status: 403, statusText: "Forbidden" },
+      ),
+    },
+  });
+  const access = await checkBoxAccess(client);
+  const retention = access.surfaces.find((surface) => surface.name === "retention_policies");
+  assert.deepEqual({ status: retention.status, httpStatus: retention.httpStatus }, { status: "not_readable", httpStatus: 403 });
+  assert.ok(log.some((entry) => entry.status === 403), "the 403 was observed on the wire");
+  assert.match(retention.error, /^Box request failed \(403\) for GET \/2\.0\/retention_policies\?[^:]*: Access denied: /);
+  for (const key of WEAK_PAIR_KEYS) assert.ok(retention.error.includes(`${key}=[REDACTED]`) || retention.error.includes(`${key}: [REDACTED]`), `${key} keeps its name and gets the marker: ${retention.error}`);
+  assertCanaryWindowsAbsent(assert, JSON.stringify(access), WEAK_PAIR_VALUES, "check_access payload");
+});
+
 test("verdict rule 9 (data-side carriers): Box blanks the whole subtree under tokens, keys, and credentials keys, scrubs mid-string URL queries, webhook-style paths, bearer carriers, and bare or hex tokens out of free text, and projects terms of service to the fields the verdicts read", async () => {
   const canaries = Object.values(BOX_DATA_CANARIES);
   const baselineExport = await exportBoxAuditBundle(httpBox(hardenedFixture()).client, sampleConfig(), createTempBase("grclanker-box-data-baseline-"));

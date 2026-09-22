@@ -2623,6 +2623,24 @@ test("verdict rule 9 / addendum 2: the LaunchDarkly bundle, its zip, every asses
   assert.equal(assessments[1].summary.wildcard_roles, null);
 });
 
+/** A 403 body echoing weak human-chosen pairs (no digits, symbols, or length a shape gate would catch) under vendor env names and a config key. */
+const WEAK_PAIR_BODY = "Access denied: LAUNCHDARKLY_API_TOKEN=monkey LD_ACCESS_TOKEN=Sunshine DB_PASSWORD=letmein DD_APP_KEY=p@ss BOX_CLIENT_SECRET=football KNOWBE4_API_TOKEN=qwerty ELASTIC_PASSWORD=iloveyou developer_token: letmein2024";
+const WEAK_PAIR_VALUES = ["monkey", "Sunshine", "letmein", "p@ss", "football", "qwerty", "iloveyou", "letmein2024"];
+const WEAK_PAIR_KEYS = ["LAUNCHDARKLY_API_TOKEN", "LD_ACCESS_TOKEN", "DB_PASSWORD", "DD_APP_KEY", "BOX_CLIENT_SECRET", "KNOWBE4_API_TOKEN", "ELASTIC_PASSWORD", "developer_token"];
+
+test("row (a): a LaunchDarkly 403 body echoing weak values under credential-named keys reaches the access check with every value gone and every key kept", async () => {
+  const { client, log } = httpLaunchdarkly(ldFixture(), {
+    routes: { "GET /api/v2/roles": () => jsonResponse({ code: "forbidden", message: WEAK_PAIR_BODY }, { status: 403, statusText: "Forbidden" }) },
+  });
+  const access = await checkLaunchdarklyAccess(client);
+  const roles = access.surfaces.find((surface) => surface.name === "custom_roles");
+  assert.deepEqual({ status: roles.status, http_status: roles.http_status }, { status: "not_readable", http_status: 403 });
+  assert.ok(log.some((entry) => entry.status === 403), "the 403 was observed on the wire");
+  assert.match(roles.error, /LaunchDarkly request failed \(403 Forbidden\) for GET \/api\/v2\/roles: forbidden: Access denied: /);
+  for (const key of WEAK_PAIR_KEYS) assert.ok(roles.error.includes(`${key}=[REDACTED]`) || roles.error.includes(`${key}: [REDACTED]`), `${key} keeps its name and gets the marker: ${roles.error}`);
+  assertCanaryWindowsAbsent(assert, JSON.stringify(access), WEAK_PAIR_VALUES, "check_access payload");
+});
+
 test("addendum 5: every request label and status code named in LaunchDarkly output corresponds to a request the run made and observed", async () => {
   const fixture = ldFixture();
   const base = ldRoutes(fixture);
