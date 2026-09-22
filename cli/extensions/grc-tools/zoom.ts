@@ -432,7 +432,8 @@ const EMBEDDED_URL_QUERY_PATTERN = /(\b[a-z][a-z0-9+.-]*:\/\/[^\s"'<>()?#]+)\?[^
 const EMBEDDED_URL_FRAGMENT_PATTERN = /(\b[a-z][a-z0-9+.-]*:\/\/[^\s"'<>()#]+#)[^\s"'<>()]*=[^\s"'<>()]*/gi;
 const BASIC_AUTH_PATTERN = /\bBasic\s+(?=[A-Za-z0-9+/=]*[0-9+/=])[A-Za-z0-9+/=]{16,}/g;
 const COOKIE_HEADER_PATTERN = /\b(set-cookie|cookie)(["']?\s*[:=]\s*)(?!\s*\[REDACTED\])[^\s<>"'][^\r\n<>"']*/gi;
-const CREDENTIAL_ASSIGNMENT_PATTERN = /\b((?:[a-z0-9_-]*(?:token|secret|password|passwd|passcode|session[_-]?id|sessionid|private[_-]?key|signature))|x-api-key|x-auth-token|api[_-]?key|apikey|authorization|jsessionid|session|pwd|sig|zak|tk)(["']?\s*[:=]\s*)(["']?)(?!Bearer\b|Basic\b)[^\s"'<>;,&]{6,}/gi;
+// client_id and clientId are listed because credentialValues() treats the resolved client id as a secret; the two lists must agree.
+const CREDENTIAL_ASSIGNMENT_PATTERN = /\b((?:[a-z0-9_-]*(?:token|secret|password|passwd|passcode|session[_-]?id|sessionid|private[_-]?key|signature))|x-api-key|x-auth-token|api[_-]?key|apikey|client[_-]?id|clientid|authorization|jsessionid|session|pwd|sig|zak|tk)(["']?\s*[:=]\s*)(["']?)(?!Bearer\b|Basic\b)[^\s"'<>;,&]{6,}/gi;
 // "/" is not a run character so URL and endpoint paths split into short segments; base64url, hex, and JWT material never contains it and Basic values have their own rule.
 const LONG_TOKEN_RUN_PATTERN = /[A-Za-z0-9+=_-]{16,}/g;
 const UPPERCASE_CODE_PATTERN = /^[A-Z][A-Z_]*$/;
@@ -749,13 +750,37 @@ function errorMessage(error: unknown): string {
   return scrubErrorText(error instanceof Error ? error.message : String(error));
 }
 
+/** Only a Node system error code (ENOENT, EISDIR, EACCES) is echoed, never the message or the object itself. */
+function systemErrorCode(error: unknown): string | undefined {
+  const code = asObject(error)?.code;
+  return typeof code === "string" && /^E[A-Z0-9_]{1,30}$/.test(code) ? code : undefined;
+}
+
+/**
+ * Two guarded steps. The filesystem message carries the path and its own
+ * wording, and JSON.parse quotes a 10-character source window (or the whole
+ * file when it is 21 characters or shorter), which for an unquoted credential
+ * value is the start of the credential. Neither message is echoed.
+ */
 function readConfigFile(pathname: string): JsonRecord {
-  const raw = readFileSync(pathname, "utf8");
-  const parsed = asObject(JSON.parse(raw));
-  if (!parsed) {
+  let raw: string;
+  try {
+    raw = readFileSync(pathname, "utf8");
+  } catch (error) {
+    const code = systemErrorCode(error);
+    throw new Error(scrubErrorText(`Unable to read Zoom config file ${pathname}${code ? ` (${code})` : ""}`));
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    throw new Error(scrubErrorText(`Unable to parse Zoom config file: invalid JSON in ${pathname}`));
+  }
+  const object = asObject(parsed);
+  if (!object) {
     throw new Error(`Zoom config file ${pathname} must contain a JSON object.`);
   }
-  return parsed;
+  return object;
 }
 
 function discoverConfigFile(input: JsonRecord, env: NodeJS.ProcessEnv): string | undefined {

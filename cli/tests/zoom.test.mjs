@@ -2,6 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import {
   existsSync,
+  mkdirSync,
   mkdtempSync,
   readFileSync,
   readdirSync,
@@ -27,6 +28,7 @@ import {
   checkZoomAccess,
   collectZoomSnapshot,
   exportZoomAuditBundle,
+  registerZoomTools,
   resolveSecureOutputPath,
   resolveZoomConfiguration,
   scrubErrorText,
@@ -484,6 +486,102 @@ test("resolveZoomConfiguration discovers a JSON config file after arguments and 
   assert.deepEqual(resolved.sourceChain, ["config-file-account-id", "environment-client-id", "config-file-client-secret"]);
 
   assert.throws(() => resolveZoomConfiguration({}, { ZOOM_CONFIG_FILE: join(base, "missing.json") }), /config file not found/);
+});
+
+function zoomTool(name) {
+  const tools = new Map();
+  registerZoomTools({ registerTool(tool) { tools.set(tool.name, tool); } });
+  const tool = tools.get(name);
+  assert.ok(tool, `${name} is registered`);
+  return tool;
+}
+
+async function runZoomTool(tool, args) {
+  const prepared = tool.prepareArguments ? tool.prepareArguments(args) : args;
+  return tool.execute("call-1", prepared);
+}
+
+/** Runs `fn` with ZOOM_CONFIG_FILE set in the real process environment (the tool handler resolves from process.env) and restores it. */
+async function withConfigFileEnv(pathname, fn) {
+  const previous = process.env.ZOOM_CONFIG_FILE;
+  process.env.ZOOM_CONFIG_FILE = pathname;
+  try {
+    return await fn();
+  } finally {
+    if (previous === undefined) delete process.env.ZOOM_CONFIG_FILE;
+    else process.env.ZOOM_CONFIG_FILE = previous;
+  }
+}
+
+test("readConfigFile never echoes the JSON.parse window or the filesystem message, on the config_file and ZOOM_CONFIG_FILE routes and through zoom_check_access", async () => {
+  const base = createTempBase("grclanker-zoom-config-canary-");
+  const checkAccess = zoomTool("zoom_check_access");
+  const malformed = [
+    { name: "unquoted client_secret", canary: "JSCANARYb2n4m6v8c0x1z3l5k7", text: (canary) => `{"account_id": "acct-1", "client_id": "file-client", "client_secret": ${canary}}` },
+    { name: "unquoted client_id", canary: "IDCANARYe9f8g7h6j5k4l3m2", text: (canary) => `{"account_id": "acct-1", "client_id": ${canary}, "client_secret": "file-secret"}` },
+    { name: "short whole file", canary: "SHCANARY4x2", text: (canary) => `{"token":${canary}}` },
+  ];
+  for (const shape of malformed) {
+    const pathname = join(base, `${shape.name.replace(/\W+/g, "-")}.json`);
+    const text = shape.text(shape.canary);
+    writeFileSync(pathname, text);
+    const fragment = shape.canary.slice(0, 8);
+
+    // Positive control: the parser's own message quotes the source window that carries the credential fragment.
+    assert.throws(() => JSON.parse(text), (error) => error instanceof SyntaxError && error.message.includes(fragment) && /is not valid JSON/.test(error.message), `${shape.name}: JSON.parse control`);
+
+    // The template is scrubbed like every other error string, so the random mkdtemp segment of the fixture path may be redacted by the long-token rule; the file name itself survives.
+    const expected = scrubErrorText(`Unable to parse Zoom config file: invalid JSON in ${pathname}`);
+    assert.match(expected, /^Unable to parse Zoom config file: invalid JSON in \S+\/[a-z_-]+\.json$/);
+    const routes = [
+      { name: "config_file argument", run: () => resolveZoomConfiguration({ config_file: pathname }, {}) },
+      { name: "ZOOM_CONFIG_FILE", run: () => resolveZoomConfiguration({}, { ZOOM_CONFIG_FILE: pathname }) },
+    ];
+    for (const route of routes) {
+      const thrown = (() => { try { route.run(); return null; } catch (error) { return error; } })();
+      assert.ok(thrown instanceof Error, `${shape.name} via ${route.name}: throws`);
+      assert.equal(thrown.message, expected, `${shape.name} via ${route.name}: fixed message`);
+      assert.ok(!thrown.message.includes(fragment), `${shape.name} via ${route.name}: fragment leaked`);
+      assert.doesNotMatch(thrown.message, /is not valid JSON|Unexpected token|SyntaxError/, `${shape.name} via ${route.name}: parser wording leaked`);
+    }
+
+    const viaArgument = await runZoomTool(checkAccess, { config_file: pathname });
+    const viaEnv = await withConfigFileEnv(pathname, () => runZoomTool(checkAccess, {}));
+    for (const [routeName, result] of [["config_file argument", viaArgument], ["ZOOM_CONFIG_FILE", viaEnv]]) {
+      const rendered = JSON.stringify(result);
+      assert.ok(rendered.includes(`Zoom access check failed: ${expected}`), `${shape.name} via ${routeName}: tool result names the file with the fixed message`);
+      assert.ok(!rendered.includes(fragment), `${shape.name} via ${routeName}: fragment reached the tool result`);
+      assert.doesNotMatch(rendered, /is not valid JSON|Unexpected token/, `${shape.name} via ${routeName}: parser wording reached the tool result`);
+    }
+  }
+
+  const directory = join(base, "config-dir.json");
+  mkdirSync(directory);
+  for (const route of [
+    { name: "config_file argument", run: () => resolveZoomConfiguration({ config_file: directory }, {}) },
+    { name: "ZOOM_CONFIG_FILE", run: () => resolveZoomConfiguration({}, { ZOOM_CONFIG_FILE: directory }) },
+  ]) {
+    assert.throws(route.run, (error) => {
+      assert.match(error.message, /^Unable to read Zoom config file .* \(EISDIR\)$/, route.name);
+      assert.doesNotMatch(error.message, /illegal operation/, `${route.name}: fs wording leaked`);
+      return true;
+    });
+  }
+  const eisdirResult = JSON.stringify(await runZoomTool(checkAccess, { config_file: directory }));
+  assert.match(eisdirResult, /Unable to read Zoom config file .* \(EISDIR\)/);
+  assert.doesNotMatch(eisdirResult, /illegal operation/);
+
+  // A well-formed file still resolves, so the guard did not change the happy path.
+  const valid = join(base, "valid.json");
+  writeFileSync(valid, JSON.stringify({ account_id: "acct-file", client_id: "file-client", client_secret: "file-secret" }));
+  assert.equal(resolveZoomConfiguration({ config_file: valid }, {}).clientSecret, "file-secret");
+  assert.throws(() => resolveZoomConfiguration({ config_file: (writeFileSync(join(base, "array.json"), "[1]"), join(base, "array.json")) }, {}), /must contain a JSON object/);
+
+  // credentialValues() treats the client id as a secret, so the assignment scrub agrees.
+  assert.equal(scrubErrorText("client_id=IDCANARYe9f8g7h6j5k4l3m2"), "client_id=[REDACTED]");
+  assert.equal(scrubErrorText('{"client_id": "IDCANARYe9f8g7h6j5k4l3m2"}', [], { longTokens: false }), '{"client_id": "[REDACTED]"}');
+  assert.equal(scrubErrorText("clientId: IDCANARYe9f8g7h6j5k4l3m2", [], { longTokens: false }), "clientId: [REDACTED]");
+  assert.equal(scrubErrorText("client_id=short"), "client_id=short", "short benign values stay, matching the other keys");
 });
 
 test("ZoomApiClient exchanges Server-to-Server OAuth credentials, paginates with next_page_token, and sends documented query parameters", async () => {
