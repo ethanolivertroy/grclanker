@@ -9,6 +9,7 @@ import {
   createProcessCommandRunner,
   createProcessCommandRunnerSync,
   describeEndpoint,
+  ExecutionBackendCleanupError,
   ExecutionBackendError,
   ExecutionBackendTimeoutError,
   ExecutionBackendUnsupportedError,
@@ -271,6 +272,44 @@ export function buildPodSessionPath(workspacePath: string, sessionId: string): s
   return `${workspacePath.replace(/\/+$/, "")}/${assertSafeSessionId(sessionId)}`;
 }
 
+type PodSshTarget = { host: string; port: number; user: string };
+
+export const RUNPOD_CLEANUP_ATTEMPTS = 2;
+
+export type PodCleanupOutcome = { removed: true } | { removed: false; detail: string };
+
+export function buildPodRemovalCommand(remotePath: string): string {
+  return `rm -rf -- ${quoteForBash(remotePath)}`;
+}
+
+// Names the remnant and the exact command that deletes it, for the operator, when the adapter
+// could not remove the session directory itself.
+export function describePodRemnant(podId: string, target: PodSshTarget, remotePath: string): string {
+  return `${remotePath} on RunPod pod ${podId} (delete it with: ssh -p ${target.port} ${target.user}@${target.host} ${quoteForBash(buildPodRemovalCommand(remotePath))})`;
+}
+
+function describeRemovalFailure(result: CommandRunnerResult | undefined, attempts: number): string {
+  const stderr = result?.stderr.trim();
+  return `rm -rf exited ${result?.exitCode ?? "null"} on ${attempts} attempt${attempts === 1 ? "" : "s"}${stderr ? `: ${stderr}` : ""}`;
+}
+
+// The runner resolves with the exit code instead of rejecting, so a `.catch()` on the removal
+// never fires; the result has to be inspected. `rm -rf` exits 0 when the path is gone (or never
+// existed), so anything else means the directory, and possibly the upload, is still on the pod.
+export async function removePodSessionDirectory(
+  runner: CommandRunner,
+  target: PodSshTarget,
+  remotePath: string,
+  attempts: number = RUNPOD_CLEANUP_ATTEMPTS,
+): Promise<PodCleanupOutcome> {
+  let last: CommandRunnerResult | undefined;
+  for (let attempt = 0; attempt < attempts; attempt += 1) {
+    last = await runner("ssh", buildPodSshArgs(target, buildPodRemovalCommand(remotePath)));
+    if (last.exitCode === 0) return { removed: true };
+  }
+  return { removed: false, detail: describeRemovalFailure(last, attempts) };
+}
+
 export type PodStagingPlan = {
   localRoot: string;
   /** Tracked regular files that will be uploaded, as forward-slash paths relative to localRoot. */
@@ -422,8 +461,12 @@ export function createRunpodPodBackend(options: RunpodPodOptions = {}): Executio
     return cachedPod;
   }
 
-  async function sshTarget(): Promise<{ host: string; port: number; user: string }> {
+  async function sshTarget(): Promise<PodSshTarget> {
     return resolvePodSshTarget(cachedPod ?? await fetchPod(), sshUser);
+  }
+
+  function podId(): string {
+    return cachedPod?.id ?? process.env.RUNPOD_POD_ID ?? "(unknown)";
   }
 
   return {
@@ -468,7 +511,17 @@ export function createRunpodPodBackend(options: RunpodPodOptions = {}): Executio
           `${target.user}@${target.host}:${remotePath}`,
         ]);
         if (copy.exitCode !== 0) {
-          await runner("ssh", buildPodSshArgs(target, `rm -rf -- ${quoteForBash(remotePath)}`)).catch(() => undefined);
+          // The upload may be partial, so the directory is removed before the copy failure is
+          // reported. If the removal fails too, the session stays in stagedSessions so teardown
+          // retries it, and the error names the remnant instead of untracking it.
+          const cleanup = await removePodSessionDirectory(runner, target, remotePath);
+          if (!cleanup.removed) {
+            throw new ExecutionBackendCleanupError(
+              "runpod-pod",
+              describePodRemnant(podId(), target, remotePath),
+              `The workspace copy failed (scp exited ${copy.exitCode ?? "null"}${copy.stderr.trim() ? `: ${copy.stderr.trim()}` : ""}) and the partial upload could not be removed (${cleanup.detail}).`,
+            );
+          }
           stagedSessions.delete(input.sessionId);
           throw new ExecutionBackendError(`Could not copy the workspace to the pod. ${copy.stderr}`);
         }
@@ -514,17 +567,25 @@ export function createRunpodPodBackend(options: RunpodPodOptions = {}): Executio
       const remotePath = buildPodSessionPath(workspacePath, sessionId);
       if (!stagedSessions.has(sessionId)) return;
       const target = await sshTarget();
-      try {
-        await runner("ssh", buildPodSshArgs(target, `rm -rf -- ${quoteForBash(remotePath)}`));
-      } finally {
-        stagedSessions.delete(sessionId);
+      const cleanup = await removePodSessionDirectory(runner, target, remotePath);
+      if (!cleanup.removed) {
+        // Still tracked: the next teardown call (or the shutdown sweep) retries the removal.
+        throw new ExecutionBackendCleanupError("runpod-pod", describePodRemnant(podId(), target, remotePath), cleanup.detail);
       }
+      stagedSessions.delete(sessionId);
     },
     teardownSync(sessionId: string) {
       const remotePath = buildPodSessionPath(workspacePath, sessionId);
       if (!stagedSessions.has(sessionId) || !cachedPod) return;
+      const target = resolvePodSshTarget(cachedPod, sshUser);
+      const result = syncRunner("ssh", buildPodSshArgs(target, buildPodRemovalCommand(remotePath)));
+      if (result.exitCode !== 0) {
+        // The process is exiting, so nothing can retry this; the operator gets the remnant's
+        // location and the delete command. The message is scrubbed by the error constructor.
+        process.stderr.write(`${new ExecutionBackendCleanupError("runpod-pod", describePodRemnant(podId(), target, remotePath), describeRemovalFailure(result, 1)).message}\n`);
+        return;
+      }
       stagedSessions.delete(sessionId);
-      syncRunner("ssh", buildPodSshArgs(resolvePodSshTarget(cachedPod, sshUser), `rm -rf -- ${quoteForBash(remotePath)}`));
     },
   };
 }

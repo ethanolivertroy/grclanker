@@ -44,6 +44,7 @@ import {
   isSensitiveStagingPath,
   parseRunpodWorkerOutput,
   planPodWorkspaceStaging,
+  RUNPOD_CLEANUP_ATTEMPTS,
   RUNPOD_STAGING_DENYLIST,
 } from "../dist/pi/backends/runpod.js";
 import { activeComputeSessionCount } from "../dist/pi/compute-sessions.js";
@@ -63,6 +64,7 @@ import {
   createProcessCommandRunner,
   createRedactingSink,
   describeEndpoint,
+  ExecutionBackendCleanupError,
   ExecutionBackendError,
   ExecutionBackendTimeoutError,
   REDACTING_SINK_MAX_HELD_CHARS,
@@ -655,6 +657,155 @@ test("runpod pod adapter removes the directory it created when scp fails", async
     assert.match(calls[3].args.at(-1), /^rm -rf -- '\/workspace\/sess'$/);
     await backend.teardown("sess");
     assert.equal(calls.length, 4);
+  });
+});
+
+test("runpod pod cleanup keeps the session tracked until the removal is confirmed", async () => {
+  await withEnv({ RUNPOD_API_KEY: "rpa_podkey_ABCDEFG", RUNPOD_POD_ID: "pod42" }, async () => {
+    const fetchMock = async () => new Response(RUNPOD_POD_JSON, { status: 200 });
+    const isRemoval = (call) => call.executable === "ssh" && String(call.args.at(-1)).startsWith("rm -rf");
+    const removals = (calls) => calls.filter(isRemoval);
+    const stuck = { exitCode: 1, stderr: "rm: cannot remove '/workspace/sess': Device or resource busy rpa_podkey_ABCDEFG" };
+
+    // Adapter level: the runner resolves with exit code 1 (it never rejects), so the result has
+    // to be inspected. The removal is retried, the session stays staged, and the error names the
+    // pod, the path, and the delete command without the API key that the remote echoed.
+    let removalExit = 1;
+    const adapter = createFakeRunner(async (_executable, args) => (
+      String(args.at(-1)).startsWith("rm -rf") ? (removalExit === 0 ? { exitCode: 0 } : stuck) : { exitCode: 0, stdout: "ok\n" }
+    ));
+    const backend = createRunpodPodBackend({ fetch: fetchMock, runner: adapter.runner });
+    await backend.stageWorkspace({ localPath: "/repo", sessionId: "sess" });
+    await assert.rejects(
+      () => backend.teardown("sess"),
+      (error) => {
+        assert.ok(error instanceof ExecutionBackendCleanupError, "typed cleanup error");
+        assert.match(error.message, /runpod-pod could not remove \/workspace\/sess on RunPod pod pod42/);
+        assert.ok(
+          error.message.includes(`(delete it with: ssh -p 22022 root@203.0.113.10 ${quoteForBash("rm -rf -- '/workspace/sess'")})`),
+          `delete command named: ${error.message}`,
+        );
+        assert.match(error.message, /rm -rf exited 1 on 2 attempts: rm: cannot remove/);
+        assert.ok(!error.message.includes("rpa_podkey_ABCDEFG"), "the remote's stderr is scrubbed");
+        assert.match(error.resource, /\/workspace\/sess on RunPod pod pod42/);
+        return true;
+      },
+    );
+    assert.equal(removals(adapter.calls).length, RUNPOD_CLEANUP_ATTEMPTS, "the removal is retried before giving up");
+    // Still staged: a second teardown retries instead of returning early, and exit code 0 untracks.
+    removalExit = 0;
+    await backend.teardown("sess");
+    assert.equal(removals(adapter.calls).length, RUNPOD_CLEANUP_ATTEMPTS + 1);
+    await backend.teardown("sess");
+    assert.equal(removals(adapter.calls).length, RUNPOD_CLEANUP_ATTEMPTS + 1, "untracked after the confirmed removal");
+
+    // Runtime level: the registry keeps the session while the removal fails, the failure is the
+    // result of withComputeBackendExecution on the success path, and a later sweep retries it.
+    const settings = { computeBackend: "runpod-pod", computeProfile: "persistent-remote" };
+    let runtimeRemovalExit = 1;
+    const runtime = createFakeRunner(async (_executable, args) => (
+      String(args.at(-1)).startsWith("rm -rf") ? { exitCode: runtimeRemovalExit, stderr: runtimeRemovalExit ? "busy" : "" } : { exitCode: 0, stdout: "ok\n" }
+    ));
+    assert.equal(activeComputeSessionCount(), 0);
+    await assert.rejects(
+      () => withComputeBackendExecution("/repo", settings, async (execution) => {
+        await execution.bashOperations.exec("true", "/repo", { onData: () => {} });
+        return "done";
+      }, { fetch: fetchMock, runner: runtime.runner }),
+      (error) => error instanceof ExecutionBackendCleanupError && /on RunPod pod pod42/.test(error.message),
+    );
+    assert.equal(activeComputeSessionCount(), 1, "the session stays tracked after a failed removal");
+    assert.equal(removals(runtime.calls).length, RUNPOD_CLEANUP_ATTEMPTS);
+
+    // The shutdown sweep reports the failure and keeps the handle; once rm exits 0 it is gone.
+    await assert.rejects(
+      () => shutdownComputeSessions({ computeBackend: "host" }),
+      (error) => {
+        assert.equal(error.name, "ComputeSessionTeardownError");
+        assert.match(error.message, /1 compute session could not be torn down and stays tracked:\n- Compute backend error: runpod-pod could not remove/);
+        return true;
+      },
+    );
+    assert.equal(activeComputeSessionCount(), 1);
+    assert.equal(removals(runtime.calls).length, RUNPOD_CLEANUP_ATTEMPTS * 2);
+    runtimeRemovalExit = 0;
+    await shutdownComputeSessions({ computeBackend: "host" });
+    assert.equal(activeComputeSessionCount(), 0, "exit code 0 untracks the session");
+    assert.equal(removals(runtime.calls).length, RUNPOD_CLEANUP_ATTEMPTS * 2 + 1);
+
+    // Throw path: the run's own error stays primary and keeps its type; the cleanup failure is
+    // appended rather than lost, and the session stays tracked.
+    class ToolError extends Error {}
+    let throwPathRemovalExit = 1;
+    const throwPath = createFakeRunner(async (_executable, args) => (
+      String(args.at(-1)).startsWith("rm -rf") ? { exitCode: throwPathRemovalExit, stderr: "" } : { exitCode: 0, stdout: "" }
+    ));
+    await assert.rejects(
+      () => withComputeBackendExecution("/repo", settings, async (execution) => {
+        await execution.bashOperations.exec("true", "/repo", { onData: () => {} });
+        throw new ToolError("tool blew up");
+      }, { fetch: fetchMock, runner: throwPath.runner }),
+      (error) => {
+        assert.ok(error instanceof ToolError);
+        assert.match(error.message, /^tool blew up\nCleanup also failed: Compute backend error: runpod-pod could not remove \/workspace\/grclanker-[0-9a-z-]+ on RunPod pod pod42/);
+        return true;
+      },
+    );
+    assert.equal(activeComputeSessionCount(), 1);
+    throwPathRemovalExit = 0;
+    await shutdownComputeSessions({ computeBackend: "host" });
+    assert.equal(activeComputeSessionCount(), 0);
+
+    // Staging failure whose own cleanup fails: the partial upload is named, the session stays
+    // tracked (adapter and registry), and the sweep retries the removal.
+    let stagingRemovalExit = 1;
+    const staging = createFakeRunner(async (executable, args) => {
+      if (executable === "scp") return { exitCode: 1, stderr: "lost connection" };
+      if (String(args.at(-1)).startsWith("rm -rf")) return { exitCode: stagingRemovalExit, stderr: stagingRemovalExit ? "busy" : "" };
+      return { exitCode: 0, stdout: "" };
+    });
+    const execution = resolveComputeBackendExecution("/repo", settings, { fetch: fetchMock, runner: staging.runner });
+    await assert.rejects(
+      () => execution.bashOperations.exec("true", "/repo", { onData: () => {} }),
+      (error) => {
+        assert.ok(error instanceof ExecutionBackendCleanupError);
+        assert.match(error.message, /The workspace copy failed \(scp exited 1: lost connection\) and the partial upload could not be removed \(rm -rf exited 1 on 2 attempts: busy\)/);
+        return true;
+      },
+    );
+    assert.equal(activeComputeSessionCount(), 1, "a partial upload keeps the session tracked");
+    assert.deepEqual(staging.calls.map((call) => call.executable), ["git", "ssh", "scp", "ssh", "ssh"]);
+    stagingRemovalExit = 0;
+    await execution.teardown();
+    assert.equal(activeComputeSessionCount(), 0);
+    assert.equal(removals(staging.calls).length, RUNPOD_CLEANUP_ATTEMPTS + 1);
+    assert.equal(staging.calls.filter((call) => call.executable === "scp").length, 1, "teardown does not re-stage");
+
+    // The synchronous exit hook inspects the exit code too and tells the operator about the remnant.
+    const syncCalls = [];
+    const syncBackend = createRunpodPodBackend({
+      fetch: fetchMock,
+      runner: async (_executable, args) => (String(args.at(-1)).startsWith("rm -rf") ? { exitCode: 1, stderr: "" } : { exitCode: 0, stdout: "" }),
+      syncRunner: (executable, args) => {
+        syncCalls.push({ executable, args });
+        return { exitCode: 1, stdout: "", stderr: "busy" };
+      },
+    });
+    await syncBackend.stageWorkspace({ localPath: "/repo", sessionId: "sync" });
+    const written = [];
+    const originalWrite = process.stderr.write;
+    process.stderr.write = (chunk) => {
+      written.push(String(chunk));
+      return true;
+    };
+    try {
+      syncBackend.teardownSync("sync");
+      syncBackend.teardownSync("sync");
+    } finally {
+      process.stderr.write = originalWrite;
+    }
+    assert.equal(syncCalls.length, 2, "the session stays staged after a failed synchronous removal");
+    assert.match(written.join(""), /runpod-pod could not remove \/workspace\/sync on RunPod pod pod42/);
   });
 });
 

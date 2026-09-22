@@ -21,7 +21,7 @@ import {
   type ComputeBackendKind,
   type ComputeBackendStatus,
 } from "./compute.js";
-import { redactErrorMessage, redactSecrets } from "./execution-backend.js";
+import { ExecutionBackendCleanupError, redactErrorMessage, redactSecrets } from "./execution-backend.js";
 import { joinBashArgs, quoteForBash } from "./shell.js";
 import { GrclankerUserError } from "./setup.js";
 import {
@@ -241,7 +241,14 @@ async function withEnvExecution<T>(
 ): Promise<T> {
   const settings = getEffectiveSettings(options);
   ensureBackendIsRunnable(settings);
-  return withComputeBackendExecution(options.cwd, settings, run);
+  try {
+    return await withComputeBackendExecution(options.cwd, settings, run);
+  } catch (error) {
+    // A remnant the backend could not remove is an operator message (pod id, path, and the
+    // delete command), not a stack trace.
+    if (error instanceof ExecutionBackendCleanupError) throw new GrclankerUserError(error.message);
+    throw error;
+  }
 }
 
 async function executeOnBackend(

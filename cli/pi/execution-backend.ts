@@ -145,6 +145,19 @@ export class ExecutionBackendNotAvailableError extends ExecutionBackendError {
   }
 }
 
+// A remote resource the adapter created survived its removal command. The session that owns it
+// stays tracked so the next teardown retries the removal, and the message names the resource so
+// an operator can delete it by hand if the retries keep failing.
+export class ExecutionBackendCleanupError extends ExecutionBackendError {
+  readonly resource: string;
+
+  constructor(kind: ExecutionBackendKind, resource: string, detail: string) {
+    super(`${kind} could not remove ${resource}. ${detail}`);
+    this.name = "ExecutionBackendCleanupError";
+    this.resource = redactErrorMessage(resource);
+  }
+}
+
 const SECRET_ENV_KEYS = [
   "MODAL_TOKEN_SECRET",
   "MODAL_TOKEN_ID",

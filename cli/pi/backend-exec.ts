@@ -30,6 +30,7 @@ import {
   assertExhaustive,
   createRedactingSink,
   createSessionId,
+  ExecutionBackendCleanupError,
   ExecutionBackendError,
   type ExecutionBackend,
 } from "./execution-backend.js";
@@ -542,19 +543,34 @@ function createContractCommandAdapter(
   const sessionId = createSessionId();
   let stagedPromise: Promise<string> | undefined;
   let unregister: (() => void) | undefined;
+  // True while the backend may hold remote state for this session: after staging succeeded, or
+  // after a staging failure whose own cleanup did not complete. Cleared only once
+  // backend.teardown resolves, so a failed removal keeps the session registered (visible in
+  // activeComputeSessionCount and retried by the next teardown or the shutdown sweep).
+  let remoteStateMayRemain = false;
+
+  const release = (): void => {
+    unregister?.();
+    unregister = undefined;
+  };
 
   const teardown = async (): Promise<void> => {
     const pending = stagedPromise;
     stagedPromise = undefined;
-    unregister?.();
-    unregister = undefined;
-    if (!pending) return;
-    try {
-      await pending;
-    } catch {
+    if (pending) {
+      try {
+        await pending;
+      } catch {
+        // The staging failure was already reported to the caller that triggered it.
+      }
+    }
+    if (!remoteStateMayRemain) {
+      release();
       return;
     }
     await backend.teardown(sessionId);
+    remoteStateMayRemain = false;
+    release();
   };
 
   const stage = async (): Promise<string> => {
@@ -565,20 +581,25 @@ function createContractCommandAdapter(
       if (adapterOptions.unavailableMessage) throw formatBackendError(adapterOptions.unavailableMessage);
       throw error;
     }
-    const staged = await backend.stageWorkspace({ localPath: localCwd, sessionId });
-    return staged.remotePath;
+    try {
+      const staged = await backend.stageWorkspace({ localPath: localCwd, sessionId });
+      remoteStateMayRemain = true;
+      return staged.remotePath;
+    } catch (error) {
+      if (error instanceof ExecutionBackendCleanupError) remoteStateMayRemain = true;
+      throw error;
+    }
   };
 
   const ensureStaged = (): Promise<string> => {
     if (!stagedPromise) {
-      unregister = registerComputeSession({
+      unregister ??= registerComputeSession({
         teardown,
         teardownSync: () => backend.teardownSync?.(sessionId),
       });
       stagedPromise = stage().catch((error: unknown) => {
         stagedPromise = undefined;
-        unregister?.();
-        unregister = undefined;
+        if (!remoteStateMayRemain) release();
         throw error;
       });
     }
@@ -828,11 +849,31 @@ export async function withComputeBackendExecution<T>(
   deps: ExecutionBackendDependencies = {},
 ): Promise<T> {
   const execution = resolveComputeBackendExecution(localCwd, settings, deps);
+  let result: T;
   try {
-    return await run(execution);
-  } finally {
-    await execution.teardown();
+    result = await run(execution);
+  } catch (error) {
+    try {
+      await execution.teardown();
+    } catch (teardownError) {
+      throw appendCleanupFailure(error, teardownError);
+    }
+    throw error;
   }
+  // On the success path a failed cleanup is the result: the caller sees the remnant.
+  await execution.teardown();
+  return result;
+}
+
+// The run's own failure stays the primary error and keeps its type (a GrclankerUserError still
+// prints as one); the cleanup failure is appended to its message so neither is lost.
+function appendCleanupFailure(error: unknown, teardownError: unknown): unknown {
+  const cleanupMessage = teardownError instanceof Error ? teardownError.message : String(teardownError);
+  if (error instanceof Error) {
+    error.message = `${error.message}\nCleanup also failed: ${cleanupMessage}`;
+    return error;
+  }
+  return new ExecutionBackendError(`${String(error)}\nCleanup also failed: ${cleanupMessage}`);
 }
 
 export function buildComputeBackendSystemPromptNote(
