@@ -27,11 +27,15 @@ import {
   assessElasticTransportSecurity,
   checkElasticAccess,
   collectElasticSnapshot,
+  describeResponseShape,
   evaluateElasticArea,
   exportElasticAuditBundle,
+  matchesResponseShape,
   normalizeElasticApiKey,
+  projectDataset,
   redactSecrets,
   redactSensitiveValues,
+  reduceUrlsToOrigin,
   registerElasticTools,
   resolveElasticConfiguration,
   resolveSecureOutputPath,
@@ -796,7 +800,7 @@ test("ElasticApiClient adds kbn-xsrf and space-aware paths for Kibana requests",
   const fetchImpl = createRouter({
     "GET /s/audit-space/api/spaces/space": [{ id: "audit-space" }],
     "GET /api/spaces/space": [{ id: "default" }],
-    "GET /api/status": { status: { overall: { level: "available" } } },
+    "GET /api/status": { name: "kibana", uuid: "kb-1", version: { number: "8.15.0" }, status: { overall: { level: "available" } } },
   }, seen);
 
   const spaced = new ElasticApiClient(sampleConfig({ kibanaSpaceId: "audit-space" }), { fetchImpl });
@@ -2632,7 +2636,10 @@ test("verdict rule 9: redactSensitiveValues masks whole subtrees, plural and cam
   assert.equal(redacted.has_private_key, true);
   assert.deepEqual(redacted.fine, { name: "ok", count: 2 });
   assert.ok(!JSON.stringify(redacted).includes("deep-40"), "values past the depth cap are replaced, never copied through");
-  assert.match(JSON.stringify(redacted), /\[REDACTED\]: nesting deeper than 32 levels/);
+  let level = redacted.deep;
+  for (let depth = 1; depth <= 31; depth += 1) level = level.child;
+  assert.equal(level.level, 31);
+  assert.equal(level.child, "[REDACTED]", "the container past the depth cap becomes the uniform marker, the same shape Box and LaunchDarkly render");
 });
 
 test("verdict rule 9: ElasticApiClient describes non-JSON bodies by status and length and echoes only documented JSON error fields", async () => {
@@ -2686,7 +2693,7 @@ test("canary fixture self-check: every planted Elastic credential is alphanumeri
     ["assessments", JSON.stringify(assessments)],
     ["config", JSON.stringify({ ...config, apiKey: null })],
   ]);
-  const canaries = [...Object.values(CANARIES), API_KEY, API_KEY_SECRET, CONFIG_FILE_CANARY, ...Object.values(ELASTIC_CONFIG_CANARIES), ES_PARSER_SNIPPET_CANARY];
+  const canaries = [...Object.values(CANARIES), API_KEY, API_KEY_SECRET, CONFIG_FILE_CANARY, ...Object.values(ELASTIC_CONFIG_CANARIES), ES_PARSER_SNIPPET_CANARY, ...Object.values(DATA_CARRIERS)];
   assertCanaryFixture(assert, canaries, legitimate, "Elastic canaries");
 });
 
@@ -2829,6 +2836,338 @@ test("verdict rule 10: listApiKeys reports truncation when a full page has no se
   const outputsUncapped = await client.listFleetOutputs(10);
   assert.equal(outputsUncapped.seen, 3);
   assert.equal(outputsUncapped.truncated, true, "fewer items than the advertised total is still truncated");
+});
+
+/**
+ * The data-side carrier classes of the batch 1 review, one random canary each: userinfo in URL values, bearer tokens
+ * and query-string tokens in free text, webhook-style paths, assignment pairs, name/value pairs, and bare tokens in
+ * notes, spread over the 19 core_data files the review found them in. Each is planted in a field no verdict reads, so
+ * the projection drops it, or in a field a verdict reads, so the scrub reduces it (URL origin, marker).
+ */
+const DATA_CARRIERS = {
+  csUserinfo: "Rp3LnrUG21ICji5YWmflylRgTp9ap9DZ",
+  csBareToken: "z4vwczZ3wciSgujZu5okOpC2GOSEUuse",
+  csSettingBare: "AdwT3zlaOPYAi0yrQjj1IONiXyirPEGe",
+  nsExporterUserinfo: "4EBlZ2FPRmPnySVsr9aI3zH8v4bxfoLK",
+  nsIdpQuery: "ri5FXoBzHS5jVwzWfC0COiylvlDTLiou",
+  authMetaPairValue: "qykqlQJBFt8Qlt48qnH43GKBnUsakj9Y",
+  userMetaPasswordPair: "6WHC8a6NVk0LTUArutZ7wjhnNauZpeGY",
+  userNameValuePair: "KNWNIhmQKQyTTAAYr1AM7XMUqyDfWJFY",
+  roleMetaQuery: "mih3m7UmTYdLoJRiTeELoTju2XgOTGWQ",
+  rmMetaBearer: "X9mgImalhvj3pbHpeVU2QDK9oS8Vuv1x",
+  keyWebhookPath: "pAK0qHjsDBBWtEz4cMrnJV3AjvBcXOAH",
+  keyKvPair: "OGYVOxq9KdXXf8ZYGZxfnFRw3TbLqyIE",
+  keyMetaBare: "qcTKOOqVk8geD6X6NGQMozTRCHnNSf2A",
+  ilmMetaPair: "4RvwTbXIjoxFqtYApreI4F22QqT24DW6",
+  slmMetaPair: "3EQvuCdpDeV2SrI7fBTYxX1tOkyhnzm0",
+  repoUrlUserinfo: "IiPGt54CgFZHFlohCAiD8xC6l3QKymeu",
+  pipeDescBearer: "bYJO5Wq4hEluvgAV2Ynr7IkWDod23xt0",
+  kroleMetaQuery: "qX7og8AH9m46LFVd5ubAB2diwbARVEdv",
+  spaceDescBare: "vpF1PmhUr3SpBBpDyaC31nEFPj6cdqqW",
+  policyDescQuery: "L1JSRmj5KRdCYW6DOkX3HjXm91HRmjwo",
+  policyOverrideUserinfo: "CfhpPnzvqOU7TVH7PGPjC85OcWw1kuRa",
+  outputHostUserinfo: "bBOot5m30grizlyJE8cpVlQFl9m8I1Ka",
+  outputYamlPassphrase: "GkU7jb9kicZPJXiy1r9pqZ5LnQBYlES2",
+  fshUserinfo: "2i4U8v0meo6Ixf6VsTOBLMZ5FdIfhvz6",
+  ruleDescBearer: "kLfqQ3gD1RB3FDkbiUbp9GlBdQT6uKMq",
+  ruleQueryBearer: "BOBA20w5EpfCLZM13iHBEYBHbzV5oe4q",
+  ruleNoteQuery: "5Rl51PAsJk2xt68K4MTbCuQyX8x3j5Ha",
+  ruleRefQuery: "0xDUAHLWpxtrnRfcnilsuH8A3GE6ndrx",
+  alertParamUrl: "glLU0tXx0SuALE0U5HqjLoXa54dOeVsw",
+  ruleActionPath: "JDhScRQydwDgA8MZxAR0CHJYXKorioMp",
+  alertActionBodyPair: "mtyvwwtn6VwgP8p5MuNz9nDIODvSgSsB",
+  cloudMetaBare: "9UqnjUhcKnCrs0XYA1bz5d4Gy2SV0iYJ",
+};
+
+/** The healthy fixture with every DATA_CARRIERS class planted; the verdicts must not move. */
+function carrierFixtures(now = Date.now()) {
+  const C = DATA_CARRIERS;
+  const fixtures = healthyFixtures(now);
+  const node = fixtures.nodeSettings.nodes["node-1"];
+  fixtures.clusterSettings.persistent["xpack.security.authc.realms.ldap.ldap1.url"] = `ldaps://svc:${C.csUserinfo}@ldap.example.com:636`;
+  fixtures.clusterSettings.persistent["xpack.security.authc.realms.saml.corp_sso.attributes.mail"] = C.csSettingBare;
+  fixtures.clusterSettings.persistent["cluster.metadata.owner_note"] = `rotate with ${C.csBareToken} on request`;
+  node.settings["xpack.monitoring.exporters.cloud.host"] = [`https://svc:${C.nsExporterUserinfo}@monitor.example.com:9243`];
+  node.settings["xpack.security.authc.realms.saml.corp_sso.idp.metadata.path"] = `https://idp.example.com/metadata?token=${C.nsIdpQuery}`;
+  fixtures.authenticate.metadata = { headers: [{ name: "X-Api-Key", value: C.authMetaPairValue }] };
+  fixtures.users.auditor.metadata = { note: `password=${C.userMetaPasswordPair}`, attributes: [{ name: "api_token", value: C.userNameValuePair }] };
+  fixtures.roles.analyst_fls.metadata = { docs: `https://wiki.example.com/roles?token=${C.roleMetaQuery}` };
+  fixtures.roleMappings.saml_users.metadata = { note: `upstream sends Authorization: Bearer ${C.rmMetaBearer}` };
+  fixtures.apiKeys[0].metadata = { webhook: `https://hooks.slack.com/services/T000/B000/${C.keyWebhookPath}`, pairs: [{ name: "secret", value: C.keyKvPair }], note: C.keyMetaBare };
+  fixtures.ilmPolicies["logs-retention"].policy._meta = { managed: false, note: `token=${C.ilmMetaPair}` };
+  fixtures.slmPolicies.nightly.policy = { indices: ["*"], config: { indices: ["*"], metadata: { note: `secret=${C.slmMetaPair}` } } };
+  fixtures.snapshotRepositories.offsite = { type: "s3", settings: { bucket: "es-offsite", server_side_encryption: true, endpoint: `https://svc:${C.repoUrlUserinfo}@s3.example.com/snapshots` } };
+  fixtures.ingestPipelines["logs-enrich"].description = `enrich; the upstream proxy sends Authorization: Bearer ${C.pipeDescBearer}`;
+  fixtures.kibanaRoles[1].metadata = { docs: `https://wiki.example.com/kibana?token=${C.kroleMetaQuery}` };
+  fixtures.spaces[1].description = C.spaceDescBare;
+  fixtures.agentPolicies[0].description = `see https://wiki.example.com/fleet?token=${C.policyDescQuery}`;
+  fixtures.agentPolicies[0].overrides = { outputs: { default: { hosts: [`https://svc:${C.policyOverrideUserinfo}@es.example.com:9200`] } } };
+  fixtures.fleetOutputs[0].hosts = [`https://svc:${C.outputHostUserinfo}@es.example.com:9200`];
+  fixtures.fleetOutputs[0].config_yaml = `ssl.key_passphrase: ${C.outputYamlPassphrase}\n`;
+  fixtures.fleetServerHosts[0].host_urls = [`https://agent:${C.fshUserinfo}@fleet.example.com:8220`];
+  fixtures.detectionRules[0].description = `Detects replay of Authorization: Bearer ${C.ruleDescBearer}`;
+  fixtures.detectionRules[0].query = `http.request.headers.authorization:"Bearer ${C.ruleQueryBearer}"`;
+  fixtures.detectionRules[0].note = `Runbook https://runbook.example.com/login?token=${C.ruleNoteQuery}`;
+  fixtures.detectionRules[0].references = [`https://ref.example.com/x?token=${C.ruleRefQuery}`];
+  fixtures.alertingRules[0].params = { url: `https://hook.example.com/notify?token=${C.alertParamUrl}` };
+  fixtures.alertingRules[0].actions[0].params = { path: `/services/T000/B000/${C.ruleActionPath}`, body: `{"token":"${C.alertActionBodyPair}"}` };
+  fixtures.cloudDeployments[0].metadata = { tags: [{ key: "note", value: C.cloudMetaBare }] };
+  return fixtures;
+}
+
+test("verdict rule 9: every collected dataset is projected to the fields its verdicts read and scrubbed before it is assessed or written, so userinfo, free-text tokens, webhook paths, pairs, and bare tokens in 19 core_data files never reach the bundle, the zip, an assess payload, or the access check, and the verdicts do not move", async () => {
+  const config = sampleConfig({ maxRetries: 0, cloudApiKey: "cloud-key" });
+  const options = { sensitiveIndexPatterns: ["customers-*"] };
+  const baseline = new ElasticApiClient(config, { fetchImpl: createRouter(healthyRoutes(healthyFixtures())) });
+  const baselineStatuses = Object.fromEntries((await assessAll(baseline, options)).map((finding) => [finding.id, finding.status]));
+
+  const client = new ElasticApiClient(config, { fetchImpl: createRouter(healthyRoutes(carrierFixtures())) });
+  const access = await checkElasticAccess(client);
+  const snapshot = await collectElasticSnapshot(client, ELASTIC_ALL_DATASETS, options);
+  const assessments = ALL_AREAS.map((area) => evaluateElasticArea(area, snapshot, options, { elasticsearchUrl: config.elasticsearchUrl }));
+  const result = await exportElasticAuditBundle(client, config, createTempBase("elastic-carriers-"), options);
+  const files = readBundleFiles(result.outputDir);
+  const entries = readZipEntries(result.zipPath);
+  const planted = Object.values(DATA_CARRIERS);
+
+  const coreFiles = [...files.keys()].filter((name) => name.startsWith("core_data/"));
+  assert.ok(coreFiles.length >= 29, `expected every dataset in core_data, got ${coreFiles.length}`);
+  assertCanaryWindowsAbsent(assert, files, planted, "bundle file");
+  assertCanaryWindowsAbsent(assert, entries, planted, "zip entry");
+  assertCanaryWindowsAbsent(assert, new Map([["access", JSON.stringify(access)], ["assessments", JSON.stringify(assessments)], ["snapshot", JSON.stringify(snapshot)]]), planted, "tool payload");
+
+  const statuses = Object.fromEntries(assessments.flatMap((assessment) => assessment.findings).map((finding) => [finding.id, finding.status]));
+  assert.deepEqual(statuses, baselineStatuses, "carriers in fields no verdict reads do not move a verdict, and the projection keeps every field the verdicts read");
+  assert.equal(access.status, "healthy");
+
+  const core = (name) => JSON.parse(files.get(`core_data/${name}.json`)).data;
+  assert.equal(core("cluster_settings").persistent["xpack.security.authc.realms.ldap.ldap1.url"], "ldaps://ldap.example.com:636", "a URL setting keeps scheme and host only");
+  assert.equal(core("cluster_settings").persistent["xpack.security.authc.realms.saml.corp_sso.attributes.mail"], "[REDACTED]", "a bare token in a kept setting is the marker");
+  assert.equal(core("cluster_settings").persistent["cluster.metadata.owner_note"], undefined, "settings outside xpack.security are not written");
+  assert.equal(core("node_settings").nodes["node-1"].settings["xpack.security.authc.realms.saml.corp_sso.idp.metadata.path"], "https://idp.example.com");
+  assert.equal(core("node_settings").nodes["node-1"].settings["xpack.monitoring.exporters.cloud.host"], undefined);
+  assert.deepEqual(core("authenticate"), { username: "grc-auditor", roles: ["grc_auditor"], enabled: true, authentication_type: "api_key", authentication_realm: { name: "native1", type: "native" }, lookup_realm: { name: "native1", type: "native" } });
+  assert.deepEqual(core("users").auditor, { username: "auditor", roles: ["analyst_fls"], enabled: true, metadata: {} }, "user metadata keeps only its reserved flags");
+  assert.deepEqual(core("roles").analyst_fls.metadata, {});
+  assert.deepEqual(core("role_mappings").saml_users, { enabled: true, roles: ["kibana_user"], rules: { field: { "realm.name": "corp_sso" } }, metadata: {} });
+  assert.deepEqual(core("api_keys")[0].metadata, {});
+  assert.deepEqual(core("ilm_policies")["logs-retention"].policy._meta, { managed: false });
+  assert.deepEqual(core("ilm_policies")["logs-retention"].policy.phases, { hot: { min_age: "0ms", actions: { rollover: { max_age: "7d" } } }, delete: { min_age: "365d", actions: { delete: {} } } });
+  assert.deepEqual(core("slm_policies").nightly.policy, { config: { indices: ["*"] } });
+  assert.deepEqual(core("snapshot_repositories").offsite, { type: "s3", settings: { bucket: "es-offsite", server_side_encryption: true, endpoint: "https://s3.example.com" } });
+  assert.deepEqual(
+    redactSensitiveValues(projectDataset("snapshot_repositories", { mirror: { type: "url", settings: { url: `https://svc:${DATA_CARRIERS.repoUrlUserinfo}@repo.example.com/snapshots?sig=${DATA_CARRIERS.repoUrlUserinfo}`, readonly: true } } })),
+    { mirror: { type: "url", settings: { readonly: true, url: "https://repo.example.com" } } },
+    "a read-only URL repository keeps scheme and host only",
+  );
+  assert.equal(core("ingest_pipelines")["logs-enrich"].has_description, true);
+  assert.equal(core("ingest_pipelines")["logs-enrich"].description, undefined);
+  assert.deepEqual(core("kibana_roles")[1].metadata, {});
+  assert.deepEqual(core("kibana_spaces")[1], { id: "security-team", name: "Security", disabledFeatures: ["ml"] });
+  assert.deepEqual(core("fleet_agent_policies")[0], { id: "policy-1", name: "Linux servers", namespace: "default", is_protected: true });
+  assert.deepEqual(core("fleet_outputs")[0].hosts, ["https://es.example.com:9200"], "output hosts keep scheme and host only");
+  assert.equal(core("fleet_outputs")[0].config_yaml, undefined);
+  assert.deepEqual(core("fleet_server_hosts")[0].host_urls, ["https://fleet.example.com:8220"]);
+  assert.deepEqual(core("detection_rules")[0], { id: "rule-1", name: "Suspicious login", enabled: true, actions: [] });
+  assert.deepEqual(core("alerting_rules")[0], { id: "alert-1", name: "CPU high", enabled: true, actions: [{ id: "connector-1", group: "default" }] });
+  assert.deepEqual(core("cloud_deployments")[0], { id: "deployment-1", name: "prod", metadata: {} });
+
+  // The plain-http verdicts still read the reduced hosts.
+  const plain = principalFixtures();
+  plain.fleetOutputs[1].hosts = [`http://svc:${DATA_CARRIERS.outputHostUserinfo}@es-plain.example.com:9200`];
+  const plainClient = new ElasticApiClient(config, { fetchImpl: createRouter(healthyRoutes(plain)) });
+  const plainFindings = await assessAll(plainClient, options);
+  const fleet = plainFindings.find((finding) => finding.id === "ELASTIC-21");
+  assert.equal(fleet.status, "fail");
+  assert.deepEqual(fleet.evidence.insecure_outputs, ["output-canary-plain"]);
+  assertCanaryWindowsAbsent(assert, JSON.stringify(plainFindings), [DATA_CARRIERS.outputHostUserinfo], "plain-http verdict payload");
+});
+
+test("verdict rule 9: reduceUrlsToOrigin reduces a URL value and every URL embedded in free text to scheme and host, and redactSensitiveValues applies it to every collected string", () => {
+  assert.equal(reduceUrlsToOrigin("https://user:pw@host.example.com:9243/path/x?token=abc#frag"), "https://host.example.com:9243");
+  assert.equal(reduceUrlsToOrigin("  ldaps://svc:pw@ldap.example.com:636 "), "ldaps://ldap.example.com:636");
+  assert.equal(reduceUrlsToOrigin("see https://a.example.com/x?token=abc, then http://b.example.com/y#f."), "see https://a.example.com, then http://b.example.com.");
+  assert.equal(reduceUrlsToOrigin("no url here"), "no url here");
+  assert.equal(reduceUrlsToOrigin("http://"), "[REDACTED]", "a URL that does not parse is the marker rather than copied");
+  const scrubbed = redactSensitiveValues({
+    hosts: ["https://svc:pw@es.example.com:9200"],
+    note: "docs at https://wiki.example.com/x?token=abc",
+    nested: { url: "https://u:p@h.example.com/a" },
+    id: "https://id.example.com/x?token=abc",
+  });
+  assert.deepEqual(scrubbed, {
+    hosts: ["https://es.example.com:9200"],
+    note: "docs at https://wiki.example.com",
+    nested: { url: "https://h.example.com" },
+    id: "https://id.example.com",
+  });
+});
+
+test("verdict rule 9: a configured secret straddling the 240-character error detail cut is scrubbed at full length before the cut in every encoding, so no fragment survives in the error, a tool payload, or the bundle", async () => {
+  // Each encoding is the secret as the body carries it; the JSON-escaped fragment wraps the plain secret in an escaped
+  // JSON pair, the way a proxy quotes the request body it rejected.
+  const base64Secret = Buffer.from(API_KEY_SECRET, "utf8").toString("base64");
+  const base64urlKey = Buffer.from(API_KEY, "utf8").toString("base64url");
+  const encodings = {
+    plain_secret: { text: API_KEY_SECRET, canary: API_KEY_SECRET },
+    configured_key: { text: API_KEY, canary: API_KEY },
+    base64_secret: { text: base64Secret, canary: base64Secret },
+    base64url_key: { text: base64urlKey, canary: base64urlKey },
+    url_encoded_key: { text: encodeURIComponent(`${API_KEY}=`), canary: API_KEY },
+    json_escaped_fragment: { text: `{\\"api_key\\":\\"${API_KEY_SECRET}\\"}`, canary: API_KEY_SECRET },
+  };
+  const planted = [API_KEY_SECRET, API_KEY, base64Secret, base64urlKey];
+  const config = sampleConfig({ maxRetries: 0 });
+  for (const [encoding, { text, canary }] of Object.entries(encodings)) {
+    for (const offset of [225, 235, 239, 240]) {
+      const reason = `${"denied ".repeat(50).slice(0, offset)}${text} was rejected by the proxy`;
+      const routes = healthyRoutes(healthyFixtures());
+      routes["GET /_security/user"] = () => jsonResponse({ error: { type: "security_exception", reason }, status: 403 }, { status: 403, statusText: "Forbidden" });
+      const client = new ElasticApiClient(config, { fetchImpl: createRouter(routes) });
+      await assert.rejects(client.listUsers(), (error) => {
+        const label = `${encoding} at offset ${offset}`;
+        assertCanaryWindowsAbsent(assert, error.message, [...planted, canary], label);
+        assert.match(error.message, /^elasticsearch request GET \/_security\/user failed \(403 Forbidden\): \(detail truncated to 240 characters\) denied /, `${label}: the documented message is still quoted up to the cut, behind the truncation note`);
+        assert.ok(error.message.length <= 360, `${label}: the detail is still cut (${error.message.length} characters)`);
+        return true;
+      });
+    }
+  }
+
+  const routes = healthyRoutes(healthyFixtures());
+  const reason = `${"denied ".repeat(50).slice(0, 235)}${API_KEY_SECRET} was rejected by the proxy`;
+  routes["GET /_security/user"] = () => jsonResponse({ error: { type: "security_exception", reason }, status: 403 }, { status: 403, statusText: "Forbidden" });
+  const client = new ElasticApiClient(config, { fetchImpl: createRouter(routes) });
+  const access = await checkElasticAccess(client);
+  const snapshot = await collectElasticSnapshot(client, ELASTIC_ALL_DATASETS, {});
+  const assessments = ALL_AREAS.map((area) => evaluateElasticArea(area, snapshot, {}, { elasticsearchUrl: config.elasticsearchUrl }));
+  const result = await exportElasticAuditBundle(client, config, createTempBase("elastic-secret-cut-"), {});
+  const files = readBundleFiles(result.outputDir);
+  assertCanaryWindowsAbsent(assert, files, planted, "bundle file");
+  assertCanaryWindowsAbsent(assert, readZipEntries(result.zipPath), planted, "zip entry");
+  assertCanaryWindowsAbsent(assert, new Map([["access", JSON.stringify(access)], ["assessments", JSON.stringify(assessments)]]), planted, "tool payload");
+  assert.match(files.get("_errors.log"), /users \(GET \/_security\/user\): elasticsearch request GET \/_security\/user failed \(403 Forbidden\): \(detail truncated to 240 characters\) denied /);
+});
+
+const ELASTIC_SILENT_BODIES = [
+  ["empty", () => new Response("", { status: 200, statusText: "OK" }), /returned a 200 OK: empty body \(0 bytes\); the endpoint is not serving the JSON API$/],
+  ["html", () => new Response("<html><body>Sign in to Kibana</body></html>", { status: 200, statusText: "OK", headers: { "content-type": "text/html" } }), /returned a 200 OK: non-JSON body \(text\/html, \d+ bytes, not echoed\); the endpoint is not serving the JSON API$/],
+  ["foreign", () => jsonResponse({ status: "ok", service: "status-page" }), /returned a 200 OK: JSON body that is not the documented JSON (object|array)[^;]*\(application\/json, \d+ bytes, not echoed\); the endpoint is not serving the JSON API$/],
+];
+
+test("silent success: matchesResponseShape accepts only the documented container of each Elastic response", () => {
+  assert.equal(matchesResponseShape({ username: "u", roles: [] }, { kind: "object", keys: ["username", "roles"] }), true);
+  assert.equal(matchesResponseShape({ status: "ok" }, { kind: "object", keys: ["username", "roles"] }), false, "an object without a documented key is foreign");
+  assert.equal(matchesResponseShape([], { kind: "object", keys: ["username"] }), false);
+  assert.equal(matchesResponseShape({ name: "kibana", uuid: "kb-1", version: { number: "8.15.0" }, status: { overall: { level: "available" } } }, { kind: "object", keys: ["name", "uuid", "version", "status"], all: true }), true);
+  assert.equal(matchesResponseShape({ status: "ok", service: "status-page" }, { kind: "object", keys: ["name", "uuid", "version", "status"], all: true }), false, "a status page sharing one common key with the Kibana status document is foreign");
+  assert.equal(matchesResponseShape({ name: "kibana", uuid: "kb-1", version: { number: "8.15.0" } }, { kind: "object", keys: ["name", "uuid", "version", "status"], all: true }), false, "an all-keys shape needs every key");
+  assert.equal(describeResponseShape({ kind: "object", keys: ["name", "uuid", "version", "status"], all: true }), "JSON object with all of name, uuid, version, status");
+  assert.equal(matchesResponseShape({}, { kind: "map", entryKeys: ["username"] }), true, "an empty map is a documented answer (no mappings, no repositories)");
+  assert.equal(matchesResponseShape({ elastic: { username: "elastic" } }, { kind: "map", entryKeys: ["username", "roles"] }), true);
+  assert.equal(matchesResponseShape({ message: "ok" }, { kind: "map", entryKeys: ["username"] }), false, "a map whose entry is not an object is foreign");
+  assert.equal(matchesResponseShape({ foo: { bar: 1 } }, { kind: "map", entryKeys: ["username"] }), false, "a map whose entry carries no documented key is foreign");
+  assert.equal(matchesResponseShape([], { kind: "array" }), true);
+  assert.equal(matchesResponseShape([{ id: "x" }], { kind: "array" }), true);
+  assert.equal(matchesResponseShape([1, 2], { kind: "array" }), false);
+  assert.equal(matchesResponseShape({ items: [] }, { kind: "array" }), false);
+  assert.equal(matchesResponseShape({ items: [] }, { kind: "list", key: "items" }), true);
+  assert.equal(matchesResponseShape({ items: {} }, { kind: "list", key: "items" }), false);
+  assert.equal(matchesResponseShape({}, { kind: "list", key: "api_keys" }), false, "a bare object is not an empty listing");
+  assert.equal(describeResponseShape({ kind: "list", key: "api_keys" }), "JSON object with an array under api_keys");
+  assert.equal(describeResponseShape({ kind: "map", entryKeys: ["username", "roles"] }), "JSON object of named entries each carrying any of username, roles");
+  for (const shape of [{ kind: "object", keys: ["license"] }, { kind: "map", entryKeys: ["policy", "version"] }, { kind: "array" }, { kind: "list", key: "items" }]) {
+    const text = describeResponseShape(shape);
+    assert.equal(scrubErrorText(text), text, `the shape description is fixed text the scrubber leaves alone: ${text}`);
+  }
+});
+
+test("silent success: a 2xx whose body is empty, an HTML page, or JSON of another shape on any Elastic surface is a failed read with http_status 200, a marker in core_data, and only manual or warn movement in the findings, never an empty inventory", async () => {
+  const config = sampleConfig({ maxRetries: 0, cloudApiKey: "cloud-key" });
+  const options = { sensitiveIndexPatterns: ["customers-*"] };
+  const surfaces = Object.keys(healthyRoutes(healthyFixtures()));
+  assert.ok(surfaces.length >= 30, `expected every collector and access probe route, got ${surfaces.length}`);
+  const baselineClient = new ElasticApiClient(config, { fetchImpl: createRouter(healthyRoutes(healthyFixtures())) });
+  const baseline = Object.fromEntries((await assessAll(baselineClient, options)).map((finding) => [finding.id, finding.status]));
+
+  // Every surface, every body: the surface is not readable with the 200 the server sent, the error is fixed text that
+  // survives the scrubber, and no finding moves anywhere but manual or warn.
+  for (const surface of surfaces) {
+    for (const [kind, body, expected] of ELASTIC_SILENT_BODIES) {
+      const label = `${surface} served a ${kind} 200`;
+      const routes = healthyRoutes(healthyFixtures());
+      routes[surface] = body;
+      const client = new ElasticApiClient(config, { fetchImpl: createRouter(routes) });
+      const access = await checkElasticAccess(client);
+      const row = access.surfaces.find((entry) => entry.endpoint === surface || (entry.endpoint !== null && entry.endpoint.startsWith(`${surface}?`)));
+      if (row) {
+        assert.deepEqual({ status: row.status, collected: row.collected, http_status: row.http_status, count: row.count, truncated: row.truncated }, { status: "not_readable", collected: false, http_status: 200, count: null, truncated: null }, label);
+        assert.match(row.error, expected, label);
+        assert.equal(scrubErrorText(row.error), row.error, `${label}: the recorded error is fixed text`);
+        assert.ok(!/status-page|Sign in/.test(row.error), `${label}: the body is not echoed`);
+      } else {
+        assert.equal(surface, "POST /_security/user/_has_privileges", `${label}: only the privilege probe has no surface row`);
+        assert.equal(access.privilegeProbe, "not_readable", label);
+        assert.match(access.notes.find((note) => note.startsWith("Privilege probe failed")), expected, label);
+      }
+      const findings = await assessAll(client, options);
+      for (const finding of findings) {
+        if (baseline[finding.id] === finding.status) continue;
+        assert.ok(["manual", "warn"].includes(finding.status), `${label}: ${finding.id} moved ${baseline[finding.id]} -> ${finding.status}; only manual or warn may follow an unobserved read: ${finding.summary}`);
+        assert.ok(!/full inventory visibility/.test(finding.summary), `${label}: ${finding.id} claims full visibility of an unobserved inventory: ${finding.summary}`);
+      }
+    }
+  }
+
+  // The reviewer's shapes, end to end: an empty API key listing rendered ELASTIC-09/10 pass on zero keys, and an empty
+  // or foreign body rendered ELASTIC-17/18/23 fail and ELASTIC-06/22 pass on data that was never observed.
+  for (const [kind, body, expected] of ELASTIC_SILENT_BODIES) {
+    const routes = healthyRoutes(healthyFixtures());
+    routes["POST /_security/_query/api_key"] = body;
+    const client = new ElasticApiClient(config, { fetchImpl: createRouter(routes) });
+    const exported = await exportElasticAuditBundle(client, config, createTempBase("elastic-silent-"), options);
+    const files = readBundleFiles(exported.outputDir);
+    const label = `api_keys served a ${kind} 200`;
+    const row = JSON.parse(files.get("collection_status.json")).datasets.find((entry) => entry.name === "api_keys");
+    assert.deepEqual({ status: row.status, collected: row.collected, http_status: row.http_status, count: row.count, paged: row.paged, truncated: row.truncated, seen: row.seen, total: row.total }, { status: "not_readable", collected: false, http_status: 200, count: null, paged: null, truncated: null, seen: null, total: null }, label);
+    assert.match(row.error, expected, label);
+    const written = JSON.parse(files.get("core_data/api_keys.json"));
+    assert.deepEqual({ collected: written.collected, status: written.status, reason: written.reason, page: written.page }, { collected: false, status: 200, reason: "not_readable", page: null }, `${label}: core_data carries a marker, not []`);
+    assert.deepEqual(written.data, { collected: false, status: 200, endpoint: "POST /_security/_query/api_key?with_limited_by=true", target: "elasticsearch", error: written.error, reason: "not_readable" }, label);
+    const findings = JSON.parse(files.get("analysis/findings.json"));
+    for (const id of ["ELASTIC-09", "ELASTIC-10"]) {
+      const finding = findings.find((item) => item.id === id);
+      assert.equal(finding.status, "manual", `${label}: ${id} is ${finding.status}: ${finding.summary}`);
+      assert.match(finding.summary, /api_keys \(POST \/_security\/_query\/api_key\?with_limited_by=true\)/, `${label}: ${id} names the unread inventory`);
+      assert.equal(finding.evidence.inventory.read, false, label);
+      assert.equal(finding.evidence.inventory.status, "not_readable", label);
+    }
+    assert.match(files.get("_errors.log"), new RegExp(expected.source, "m"), label);
+
+    // Every endpoint silent: nothing was observed, so no finding may pass or fail.
+    const silentRoutes = Object.fromEntries(surfaces.map((route) => [route, body]));
+    const silentClient = new ElasticApiClient(config, { fetchImpl: createRouter(silentRoutes) });
+    const silentAccess = await checkElasticAccess(silentClient);
+    assert.equal(silentAccess.status, "limited", `${kind} on every endpoint: the access check is limited`);
+    assert.ok(silentAccess.surfaces.every((entry) => entry.status === "not_readable" && entry.http_status === 200), `${kind} on every endpoint: every surface is a failed read with the observed 200`);
+    for (const finding of await assessAll(silentClient, options)) {
+      assert.equal(finding.status, "manual", `${kind} on every endpoint: ${finding.id} is ${finding.status}: ${finding.summary}`);
+    }
+  }
+
+  // Documented empty containers stay readable: an empty map is no role mappings or repositories, an empty array is no
+  // connectors, and an empty listing is zero watches; the emptiness rules, not the shape guard, judge them.
+  const emptyRoutes = healthyRoutes(healthyFixtures());
+  emptyRoutes["GET /_security/role_mapping"] = {};
+  emptyRoutes["GET /_snapshot/_all"] = {};
+  emptyRoutes["GET /api/actions/connectors"] = [];
+  emptyRoutes["POST /_watcher/_query/watches"] = { count: 0, watches: [] };
+  const emptyClient = new ElasticApiClient(config, { fetchImpl: createRouter(emptyRoutes) });
+  const emptyAccess = await checkElasticAccess(emptyClient);
+  for (const name of ["role_mappings", "snapshot_repositories", "connectors", "watches"]) {
+    const row = emptyAccess.surfaces.find((entry) => entry.name === name);
+    assert.deepEqual({ status: row.status, collected: row.collected, http_status: row.http_status, count: row.count }, { status: "readable", collected: true, http_status: null, count: 0 }, `${name}: a documented empty container is a readable zero-entry inventory`);
+  }
 });
 
 const ELASTIC_MULTI_INVENTORY = [
@@ -3161,6 +3500,13 @@ const ELASTIC_FIXED_TEXT_MESSAGES = [
   "elasticsearch request GET /_ssl/certificates failed (403 Forbidden): security_exception: unauthorized; see https://api.example.com/v1/x?[REDACTED] for details",
   "kibana request GET /api/fleet/outputs failed (403 Forbidden): Forbidden: missing fleet read",
   "elasticsearch request GET /_security/user returned a 200 OK: non-JSON body (text/html, 1024 bytes, not echoed); the endpoint is not serving the JSON API",
+  "elasticsearch request GET /_security/user returned a 200 OK: empty body (0 bytes); the endpoint is not serving the JSON API",
+  "elasticsearch request GET /_security/user failed (403 Forbidden): (detail truncated to 240 characters) security_exception: action [cluster:admin/xpack/security/user/get] is unauthorized for user [grc-auditor]",
+  "elasticsearch request POST /_security/_query/api_key returned a 200 OK: JSON body that is not the documented JSON object with an array under api_keys (application/json, 41 bytes, not echoed); the endpoint is not serving the JSON API",
+  "elasticsearch request GET /_security/user returned a 200 OK: JSON body that is not the documented JSON object of named entries each carrying any of username, roles, enabled (application/json, 41 bytes, not echoed); the endpoint is not serving the JSON API",
+  "elasticsearch request GET /_security/role_mapping returned a 200 OK: JSON body that is not the documented JSON object of named entries each carrying any of enabled, roles, role_templates, rules, metadata (application/json, 41 bytes, not echoed); the endpoint is not serving the JSON API",
+  "kibana request GET /api/spaces/space returned a 200 OK: JSON body that is not the documented JSON array of objects (application/json, 41 bytes, not echoed); the endpoint is not serving the JSON API",
+  "elasticsearch request GET /_license returned a 200 OK: JSON body that is not the documented JSON object with any of license (application/json, 41 bytes, not echoed); the endpoint is not serving the JSON API",
   "elasticsearch request POST /_security/_query/api_key timed out after 30000ms",
   "elasticsearch request GET /_cluster/settings failed: SyntaxError: response could not be parsed as JSON; the parser's message is not recorded because it quotes the body",
   "Using Elasticsearch https://es.example.com:9200 with api_key authentication.",
