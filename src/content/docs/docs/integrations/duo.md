@@ -18,7 +18,7 @@ export DUO_API_HOST=api-XXXXXXXX.duosecurity.com
 export DUO_LOOKBACK_DAYS=30   # optional, 1 to 180
 ```
 
-Each tool also accepts `api_host`, `ikey`, `skey`, and `lookback_days` arguments that override the environment. Requests are signed with HMAC-SHA512. The endpoints the reference marks as v5-only (`/admin/v2/policies` and `/admin/v2/policies/global` in the Policies section, `/admin/v3/integrations` in the Integrations section) use the seven-line v5 canonical string: date, method, host, path, sorted query string, SHA-512 of the request body (the empty string for GET), and SHA-512 of the additional `X-Duo-*` headers (none are sent). Every other `/admin/v1` and `/admin/v2` endpoint keeps the legacy v2 canonical string.
+Each tool also accepts `api_host`, `ikey`, `skey`, and `lookback_days` arguments that override the environment. Only an argument that is actually provided overrides: a blank or missing `ikey`, `skey`, or `api_host` beside another argument (for example `lookback_days` alone) leaves the environment value in place, and the resolved configuration's `sourceChain` keeps `environment` ahead of `arguments`. Requests are signed with HMAC-SHA512. The endpoints the reference marks as v5-only (`/admin/v2/policies` and `/admin/v2/policies/global` in the Policies section, `/admin/v3/integrations` in the Integrations section) use the seven-line v5 canonical string: date, method, host, path, sorted query string, SHA-512 of the request body (the empty string for GET), and SHA-512 of the additional `X-Duo-*` headers (none are sent). Every other `/admin/v1` and `/admin/v2` endpoint keeps the legacy v2 canonical string.
 
 Grant the Admin API application these read-only permissions:
 
@@ -52,11 +52,11 @@ Do not grant any write permission. The tools never call a mutating endpoint.
 | `GET /admin/v1/info/authentication_attempts` | Account Info, Authentication Attempts Report | `mintime` and `maxtime` in Unix seconds; `authentication_attempts.{ERROR,FAILURE,FRAUD,SUCCESS}` |
 | `GET /admin/v2/policies/global` and `GET /admin/v2/policies` | Policies | `sections.authentication_policy.user_auth_behavior`, `authentication_methods`, `new_user`, `remembered_devices`, `trusted_endpoints`, `health_checks`, `duo_desktop`, `operating_systems`, `full_disk_encryption`, `screen_lock` |
 | `GET /admin/v1/users` | Users, Retrieve Users | `status`, `is_enrolled`, `last_login`, `phones`, `tokens`, `u2f_tokens`, `webauthncredentials`; `limit` max 300, paged with `metadata.next_offset` |
-| `GET /admin/v1/bypass_codes` | Bypass Codes, Retrieve Bypass Codes | `bypass_code_id`, `created` (older than 24 hours is flagged), `expiration` (`null` never expires), `reuse_count` (`null` unlimited uses), `user` |
+| `GET /admin/v1/bypass_codes` | Bypass Codes, Retrieve Bypass Codes | `bypass_code_id`, `created` (older than 24 hours is flagged), `expiration` (`null` never expires), `reuse_count` (`null` unlimited uses), `user`; any `code` or `bypass_code` value is redacted before the record is kept |
 | `GET /admin/v1/webauthncredentials` | WebAuthn Credentials, Retrieve WebAuthn Credentials | `uv_capable`, `user`; `limit` max 500 |
 | `GET /admin/v1/admins` | Administrators, Retrieve Administrators | `role`, `status`, `last_login` |
 | `GET /admin/v1/admins/allowed_auth_methods` | Administrators, Retrieve Allowed Authentication Methods | `verified_push_enabled`, `webauthn_enabled`, `sms_enabled`, `voice_enabled` |
-| `GET /admin/v3/integrations` | Integrations, Retrieve Integrations | `type`, `policy_key`, `user_access`, `sensitivity_level`, `compliance_requirements`, `prompt_v4_enabled`, `frameless_auth_prompt_enabled`, `self_service_allowed`, `adminapi_*`; `limit` max 500; v5 signing |
+| `GET /admin/v3/integrations` | Integrations, Retrieve Integrations | `type`, `policy_key`, `user_access`, `sensitivity_level`, `compliance_requirements`, `prompt_v4_enabled`, `frameless_auth_prompt_enabled`, `self_service_allowed`, `adminapi_*`; `limit` max 500; v5 signing; `secret_key` is redacted before the record is kept |
 | `GET /admin/v2/logs/authentication` | Logs, Authentication Logs | `mintime` and `maxtime` in milliseconds, `next_offset` cursor; `result`, `factor`, `timestamp`, `user.key`, `access_device.location.country` |
 | `GET /admin/v2/logs/activity`, `GET /admin/v2/logs/telephony` | Logs | activity log evidence; telephony usage (`type` sms or phone) |
 | `GET /admin/v1/logs/offline_enrollment` | Logs, Offline Enrollment Logs | `mintime` in Unix seconds; returns the 1000 earliest events per call, so full pages are followed by advancing `mintime` to the newest `timestamp` plus one (capped at 5000 events, reported incomplete beyond that); `action`, `description.factor` |
@@ -70,7 +70,7 @@ Status semantics: `Pass` means the documented setting or population meets the co
 |---|---|---|---|
 | 1 | Global MFA policy | DUO-AUTH-007 (enforcement mode), DUO-AUTH-001 (phishing-resistant factors) | Automated |
 | 2 | User enrollment completeness | DUO-AUTH-008 | Automated (`status`, `is_enrolled`) |
-| 3 | Bypass code audit | DUO-AUTH-006 | Automated |
+| 3 | Bypass code audit | DUO-AUTH-006 | Automated; an empty inventory is capped at Partial when `/admin/v1/settings` (help desk issuance limits) could not be read |
 | 4 | Inactive user detection | DUO-AUTH-009 | Automated (`last_login` over 90 days; null bucketed, capped at Partial) |
 | 5 | Admin role review | DUO-ADMIN-001 | Automated |
 | 6 | Trusted endpoint policy | DUO-AUTH-005 | Automated |
@@ -91,6 +91,18 @@ Status semantics: `Pass` means the documented setting or population meets the co
 
 Supporting findings without a spec control number: DUO-ADMIN-002 (administrator MFA strength), DUO-ADMIN-003 (help desk bypass governance), DUO-ADMIN-004 (stale administrators), DUO-INTEGRATIONS-002 (Universal Prompt adoption), DUO-MON-004 (notifications).
 
+### Verdict safety rules
+
+- **Secondary reads are named, never assumed.** When a finding combines a deciding read with a supporting one, a failed supporting read is reported as `unread` with the endpoint, the HTTP status, and the permission to grant; it is never rendered as a configuration fact. DUO-AUTH-006 caps an empty bypass code inventory at Partial when `/admin/v1/settings` (help desk issuance limits) failed. DUO-AUTH-001 keeps its global policy verdict but records `admin_allowed_auth_methods=unread` when `/admin/v1/admins/allowed_auth_methods` failed, and an unread payload never softens a Fail into Partial. DUO-AUTH-010 records `webauthn_inventory_error` when `/admin/v1/webauthncredentials` failed instead of reporting a zero credential count.
+- **Every pager exits when it cannot advance.** Offset endpoints stop, and report the walk incomplete, when `metadata.next_offset` repeats or moves backwards, is a value the pager cannot send back, or arrives with an empty page; a numeric string `next_offset` is accepted as the documented integer. The authentication, activity, and telephony log cursors and the Trust Monitor cursor stop on a repeated cursor or an empty page with a cursor. An incomplete walk caps every dependent finding at Partial with `inventory_seen`, `inventory_total`, and `collection_cap` evidence.
+- **Unknown paging is not complete paging.** A client that tracks paging outcomes but recorded none for a list marks that list incomplete, so the dependent findings cannot pass on an unverified walk.
+
+### Bundle redaction
+
+- `core_data/integrations.json` carries `secret_key` as `[REDACTED]`, and `core_data/bypass_codes.json` carries any `code` or `bypass_code` value as `[REDACTED]`; both are stripped at collection time, so the values never reach assessment memory, evidence, or the zip.
+- `core_data/collection_status.json` is a projection: per dataset it records `readable`, `records`, `total`, `complete`, and `error`, without repeating the records that already live in their own `core_data` files.
+- The Duo secret key is used only to sign requests and is never written; `config.json` holds the API host, lookback window, and configuration source chain. Failure text is limited to the documented `message` and `message_detail` fields of the Admin API error envelope; a non-JSON body is described by content type and byte length, and a `SyntaxError` reaching the error sink from any path is recorded by name only (`SyntaxError: response could not be parsed as JSON; the parser's message is not recorded because it quotes the body`), because V8's parse message quotes a snippet of the rejected text. The scrub follows one boundary. A value inside any carrier (an `Authorization`, `Cookie`, `Set-Cookie`, or `x-api-key` header, a `Bearer`, `Basic`, `Token`, or `ApiKey` scheme, a session or cookie assignment, a URL's userinfo or a query pair, a key-value pair whose key names a credential) is removed whatever its shape. The configured secret key and integration key are removed whatever their shape and in their JSON-escaped, URL-encoded, base64, and base64url forms. A bare run of 16 or more characters shaped like a token (base64 symbols, digits scattered through letters, camelCase pieces of one or two letters, hex digests, AWS key ids, JWTs, PEM blocks) is removed. A bare value shaped like a name (hyphen- or underscore-joined words with at most one digit group each, such as `prod-us-east-2026`, uppercase codes, UUIDs, camelCase identifiers such as `GetAccessKeyLastUsed`) stays, because in prose it is indistinguishable from a resource name; opaque identifiers whose shape is a token's are therefore removed from error text and travel in structured fields (`endpoint`, `status`). The tools read no configuration file: every setting comes from tool arguments and environment variables. Every fixed-text message the integration emits (the parse and non-JSON notes, the `was not attempted` and `not collected` wordings, the `unread` evidence lines, the capped-verdict and manual-review prose) is held to the scrub by a test and survives it unchanged.
+
 ## Framework mappings
 
 Every finding carries FedRAMP, CMMC, SOC 2, CIS, PCI-DSS, DISA STIG, IRAP, and ISMAP identifiers from the mapping table in `specs/duo-sec-inspector.spec.md`. The bundle writes one report per framework under `compliance/` and a unified matrix in `compliance/unified_compliance_matrix.md`.
@@ -101,7 +113,7 @@ Every finding carries FedRAMP, CMMC, SOC 2, CIS, PCI-DSS, DISA STIG, IRAP, and I
 <api-host>_<timestamp>/
   QUICK_REFERENCE.md
   config.json
-  core_data/          raw Admin API payloads plus collection_status.json
+  core_data/          Admin API payloads (integration secret keys and bypass code values redacted) plus collection_status.json
   analysis/           one JSON per assessment plus findings.json
   compliance/         executive_summary.md, unified_compliance_matrix.md, <framework>/<report>.md
   _errors.log         only when a read failed but the bundle still completed

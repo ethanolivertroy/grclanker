@@ -46,11 +46,13 @@ const DOMAIN_GROUPS: Array<[prefix: string, label: string]> = [
   ["knowbe4_", "KnowBe4"],
   ["launchdarkly_", "LaunchDarkly"],
   ["mulesoft_", "MuleSoft"],
+  ["newrelic_", "New Relic"],
   ["oci_", "OCI"],
   ["okta_", "Okta"],
   ["oscal_", "OSCAL"],
   ["pagerduty_", "PagerDuty"],
   ["paloalto_", "Palo Alto Networks"],
+  ["qualys_", "Qualys"],
   ["salesforce_", "Salesforce"],
   ["scf_", "SCF"],
   ["servicenow_", "ServiceNow"],
@@ -64,6 +66,7 @@ const DOMAIN_GROUPS: Array<[prefix: string, label: string]> = [
   ["webex_", "Webex"],
   ["zendesk_", "Zendesk"],
   ["zoom_", "Zoom"],
+  ["zscaler_", "Zscaler"],
 ];
 
 export function resolveToolGroup(name: string): { group: string; kind: RegisteredToolSummary["kind"] } {

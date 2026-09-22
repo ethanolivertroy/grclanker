@@ -2,16 +2,26 @@ import { unlink, writeFile } from "node:fs/promises";
 import { basename, dirname, resolve } from "node:path";
 import { getGrclankerSettingsPath } from "../config/paths.js";
 import {
-  resolveComputeBackendExecution,
+  withComputeBackendExecution,
   type ResolvedComputeBackendExecution,
 } from "./backend-exec.js";
-import { cleanupParallelsSandboxes } from "./parallels-sandbox.js";
 import {
+  COMPUTE_BACKEND_KINDS,
+  describeNetworkPolicy,
+  detectComputeBackendStatuses,
   getComputeBackendConfigurationIssues,
   getComputeBackendLabel,
+  getComputeBackendShipState,
+  getComputeProfileIssues,
+  getRoutingBucket,
+  parseComputeBackendKind,
   resolveComputeBackend,
+  resolveComputeDefaults,
+  resolveComputeProfile,
   type ComputeBackendKind,
+  type ComputeBackendStatus,
 } from "./compute.js";
+import { redactErrorMessage, redactSecrets } from "./execution-backend.js";
 import { joinBashArgs, quoteForBash } from "./shell.js";
 import { GrclankerUserError } from "./setup.js";
 import {
@@ -31,23 +41,115 @@ type ParsedEnvCommand = {
   commandArgs: string[];
 };
 
+export type ComputeBackendListEntry = {
+  kind: ComputeBackendKind;
+  label: string;
+  bucket: string;
+  readiness: "ready" | "not detected" | "needs configuration" | "not available";
+  preferred: boolean;
+  detail: string;
+};
+
 function parseBackendFlag(value: string): ComputeBackendKind | undefined {
-  switch (value.trim().toLowerCase()) {
-    case "host":
-      return "host";
-    case "sandbox-runtime":
-    case "sandbox":
-    case "srt":
-      return "sandbox-runtime";
-    case "docker":
-      return "docker";
-    case "parallels-vm":
-    case "parallels":
-    case "vm":
-      return "parallels-vm";
-    default:
-      return undefined;
+  return parseComputeBackendKind(value);
+}
+
+export function parseComputeFlag(value: string): ComputeBackendKind {
+  const kind = parseComputeBackendKind(value);
+  if (!kind) {
+    throw new GrclankerUserError(
+      `Unknown compute backend: ${value}. Expected one of: ${COMPUTE_BACKEND_KINDS.join(", ")}.`,
+    );
   }
+  return kind;
+}
+
+export function extractComputeFlag(args: string[]): { compute?: ComputeBackendKind; rest: string[] } {
+  const rest: string[] = [];
+  let compute: ComputeBackendKind | undefined;
+  for (let index = 0; index < args.length; index += 1) {
+    const arg = args[index]!;
+    if (arg === "--compute") {
+      const value = args[index + 1];
+      if (!value) throw new GrclankerUserError("Missing value for --compute.");
+      compute = parseComputeFlag(value);
+      index += 1;
+      continue;
+    }
+    if (arg.startsWith("--compute=")) {
+      compute = parseComputeFlag(arg.slice("--compute=".length));
+      continue;
+    }
+    rest.push(arg);
+  }
+  return { compute, rest };
+}
+
+export function buildComputeBackendList(
+  settings: GrclankerSettings,
+  statuses: ComputeBackendStatus[] = detectComputeBackendStatuses(),
+): ComputeBackendListEntry[] {
+  const preferred = resolveComputeBackend(settings);
+  return COMPUTE_BACKEND_KINDS.map((kind) => {
+    const status = statuses.find((entry) => entry.kind === kind);
+    const issues = getComputeBackendConfigurationIssues(settings, kind);
+    const readiness: ComputeBackendListEntry["readiness"] = getComputeBackendShipState(kind) === "stub"
+      ? "not available"
+      : !status?.available
+        ? "not detected"
+        : issues.length > 0
+          ? "needs configuration"
+          : "ready";
+    return {
+      kind,
+      label: getComputeBackendLabel(kind),
+      bucket: getRoutingBucket(kind),
+      readiness,
+      preferred: kind === preferred,
+      detail: issues[0] ?? status?.detail ?? "",
+    };
+  });
+}
+
+export function formatComputeBackendList(
+  entries: ComputeBackendListEntry[],
+  settings: GrclankerSettings,
+): string {
+  const defaults = resolveComputeDefaults(settings);
+  const lines = [
+    "",
+    "grclanker env list",
+    "",
+    `Preferred compute backend: ${resolveComputeBackend(settings)}`,
+    `Compute profile:           ${resolveComputeProfile(settings)}`,
+    `Network policy default:    ${describeNetworkPolicy(defaults.networkPolicy)}`,
+    `Workspace mount mode:      ${defaults.workspaceMountMode}`,
+    "",
+    `  ${"backend".padEnd(20)} ${"bucket".padEnd(18)} ${"readiness".padEnd(20)} detail`,
+  ];
+  for (const entry of entries) {
+    const marker = entry.preferred ? "*" : " ";
+    lines.push(
+      `${marker} ${entry.kind.padEnd(20)} ${entry.bucket.padEnd(18)} ${entry.readiness.padEnd(20)} ${entry.detail}`,
+    );
+  }
+  const profileIssues = getComputeProfileIssues(settings);
+  if (profileIssues.length > 0) {
+    lines.push("", "Profile issues:");
+    for (const issue of profileIssues) lines.push(`  - ${issue}`);
+  }
+  lines.push("", "* marks the preferred backend from settings.json (override per run with --compute <kind>).", "");
+  return lines.join("\n");
+}
+
+export async function runComputeList(rawArgs: string[]): Promise<void> {
+  const settings = readGrclankerSettings(getGrclankerSettingsPath());
+  const entries = buildComputeBackendList(settings);
+  if (rawArgs.includes("--json")) {
+    console.log(JSON.stringify(entries, null, 2));
+    return;
+  }
+  console.log(formatComputeBackendList(entries, settings));
 }
 
 function parseTimeoutFlag(value: string): number {
@@ -77,7 +179,7 @@ function parseEnvCommandArgs(rawArgs: string[]): ParsedEnvCommand {
       continue;
     }
 
-    if (parsingFlags && (arg === "--backend" || arg === "-b")) {
+    if (parsingFlags && (arg === "--backend" || arg === "-b" || arg === "--compute")) {
       const value = rawArgs[index + 1];
       if (!value) throw new GrclankerUserError("Missing value for --backend.");
       const backend = parseBackendFlag(value);
@@ -133,27 +235,25 @@ function getErrorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
-function getResolvedExecution(
+async function withEnvExecution<T>(
   options: EnvCommandOptions,
-): { settings: GrclankerSettings; execution: ResolvedComputeBackendExecution } {
+  run: (execution: ResolvedComputeBackendExecution) => Promise<T>,
+): Promise<T> {
   const settings = getEffectiveSettings(options);
   ensureBackendIsRunnable(settings);
-  return {
-    settings,
-    execution: resolveComputeBackendExecution(options.cwd, settings),
-  };
+  return withComputeBackendExecution(options.cwd, settings, run);
 }
 
 async function executeOnBackend(
   command: string,
   options: EnvCommandOptions,
+  execution: ResolvedComputeBackendExecution,
 ): Promise<{
   backend: ComputeBackendKind;
   label: string;
   summary: string;
   exitCode: number | null;
 }> {
-  const { execution } = getResolvedExecution(options);
   let result: { exitCode: number | null };
   try {
     result = await execution.bashOperations.exec(command, options.cwd, {
@@ -163,7 +263,7 @@ async function executeOnBackend(
       },
     });
   } catch (error) {
-    throw new GrclankerUserError(getErrorMessage(error));
+    throw new GrclankerUserError(redactErrorMessage(getErrorMessage(error)));
   }
 
   return {
@@ -211,8 +311,10 @@ async function removeProbeFile(
   }
 }
 
-async function runBackendToolSmokeTest(options: EnvCommandOptions): Promise<void> {
-  const { execution } = getResolvedExecution(options);
+async function runBackendToolSmokeTest(
+  options: EnvCommandOptions,
+  execution: ResolvedComputeBackendExecution,
+): Promise<void> {
   if (
     !execution.readOperations ||
     !execution.writeOperations ||
@@ -257,8 +359,10 @@ async function runBackendToolSmokeTest(options: EnvCommandOptions): Promise<void
   }
 }
 
-async function runBackendSearchSmokeTest(options: EnvCommandOptions): Promise<void> {
-  const { execution } = getResolvedExecution(options);
+async function runBackendSearchSmokeTest(
+  options: EnvCommandOptions,
+  execution: ResolvedComputeBackendExecution,
+): Promise<void> {
   if (!execution.findOperations || !execution.grepOperations) {
     console.log("tool_find=skipped");
     console.log("tool_grep=skipped");
@@ -308,7 +412,7 @@ Usage:
   grclanker env smoke-test [--backend <kind>] [--cwd <path>] [--timeout <seconds>]
 
 Options:
-  --backend, -b   host | sandbox-runtime | docker | parallels-vm
+  --backend, -b   host | sandbox-runtime | docker | parallels-vm | modal | runpod-pod | runpod-serverless (alias: --compute)
   --cwd           Working directory to validate on the selected backend
   --timeout, -t   Command timeout in seconds (default: 30)
 `);
@@ -323,7 +427,7 @@ Usage:
   grclanker env exec [--backend <kind>] [--cwd <path>] [--timeout <seconds>] <command>
 
 Options:
-  --backend, -b   host | sandbox-runtime | docker | parallels-vm
+  --backend, -b   host | sandbox-runtime | docker | parallels-vm | modal | runpod-pod | runpod-serverless (alias: --compute)
   --cwd           Working directory to execute from on the selected backend
   --timeout, -t   Command timeout in seconds
 `);
@@ -364,10 +468,15 @@ export async function runComputeSmokeTest(rawArgs: string[]): Promise<void> {
   console.log(`CWD: ${options.cwd}`);
   console.log("");
 
-  try {
-    const result = await executeOnBackend(buildSmokeTestCommand(), options);
-    await runBackendToolSmokeTest(options);
-    await runBackendSearchSmokeTest(options);
+  await withEnvExecution(options, async (execution) => {
+    const result = await executeOnBackend(buildSmokeTestCommand(), options, execution);
+    const snapshotId = await runBackendSnapshotSmokeTest(execution);
+    await runBackendToolSmokeTest(options, execution);
+    await runBackendSearchSmokeTest(options, execution);
+    if (snapshotId && execution.backend) {
+      await execution.backend.restore(execution.sessionId, snapshotId);
+      console.log("restore=ok");
+    }
     console.log("");
     console.log(`Result: ${result.summary}`);
     console.log(`Exit code: ${result.exitCode ?? "null"}`);
@@ -375,11 +484,19 @@ export async function runComputeSmokeTest(rawArgs: string[]): Promise<void> {
     if ((result.exitCode ?? 1) !== 0) {
       throw new GrclankerUserError(`Smoke test failed with exit code ${result.exitCode}.`);
     }
-  } finally {
-    if (backend === "parallels-vm") {
-      await cleanupParallelsSandboxes();
-    }
+  });
+}
+
+async function runBackendSnapshotSmokeTest(
+  execution: ResolvedComputeBackendExecution,
+): Promise<string | undefined> {
+  if (!execution.backend?.capabilities.snapshot || !execution.backend.capabilities.restore) {
+    console.log("snapshot=skipped");
+    return undefined;
   }
+  const snapshotId = await execution.backend.snapshot(execution.sessionId);
+  console.log(`snapshot=ok ${snapshotId}`);
+  return snapshotId;
 }
 
 export async function runComputeExec(rawArgs: string[]): Promise<void> {
@@ -400,16 +517,12 @@ export async function runComputeExec(rawArgs: string[]): Promise<void> {
 
   console.log(`\nbackend: ${getComputeBackendLabel(backend)} (${backend})`);
   console.log(`cwd: ${options.cwd}`);
-  console.log(`command: ${command}\n`);
+  console.log(`command: ${redactSecrets(command)}\n`);
 
-  try {
-    const result = await executeOnBackend(command, options);
+  await withEnvExecution(options, async (execution) => {
+    const result = await executeOnBackend(command, options, execution);
     if ((result.exitCode ?? 1) !== 0) {
       throw new GrclankerUserError(`Command failed with exit code ${result.exitCode}.`);
     }
-  } finally {
-    if (backend === "parallels-vm") {
-      await cleanupParallelsSandboxes();
-    }
-  }
+  });
 }
