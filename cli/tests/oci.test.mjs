@@ -7,9 +7,10 @@ import {
   readFileSync,
   rmSync,
   symlinkSync,
+  writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { join, relative } from "node:path";
+import { delimiter, join, relative } from "node:path";
 import { inflateRawSync } from "node:zlib";
 
 import {
@@ -1887,4 +1888,145 @@ test("resolveSecureOutputPath rejects traversal and symlink parents", () => {
 
   const safe = resolveSecureOutputPath(base, join("reports", "safe.txt"));
   assert.match(safe, /reports\/safe\.txt$/);
+});
+
+/**
+ * Silent-success class: exit 0 with stdout that is not the documented
+ * `{ "data": ... }` document. The three shapes the #68 review found read as
+ * empty inventories, plus the HTML page that was already handled, kept as the
+ * control. Each shape's marker names the command and the observed stdout
+ * state and nothing else.
+ */
+const SILENT_SUCCESS_SHAPES = {
+  empty: /^oci [a-z -]+ exited 0 with empty stdout \(no JSON document\)$/,
+  whitespace: /^oci [a-z -]+ exited 0 with whitespace-only stdout \(6 bytes, no JSON document\)$/,
+  foreign: /^oci [a-z -]+ exited 0 with a JSON document that has no data member \(\d+ bytes\)$/,
+  html: /^oci [a-z -]+ exited 0 but printed \d+ bytes of non-JSON stdout \(withheld\)$/,
+};
+const UNOBSERVED_CONDITION = /status=|ServiceError|NotAuthorizedOrNotFound|NotAllowed|\b(?:40[0-9]|50[0-9])\b|CANARY-|<html>|Oracle-Python/;
+/** The surfaces and hard verdicts the #68 review reproduced (report internal/review-pr68-helper-rewire.md, item 5 and F2). */
+const SILENT_SUCCESS_ROWS = [
+  ["listCompartments", "OCI-IAM-05"],
+  ["listApiKeys", "OCI-IAM-03"],
+  ["listCustomerSecretKeys", "OCI-IAM-03"],
+  ["listAuthTokens", "OCI-IAM-03"],
+  ["listCloudGuardTargets", "OCI-LOG-01"],
+  ["listResponderRecipes", "OCI-LOG-03"],
+  ["listEventRules", "OCI-LOG-05"],
+  ["listNetworkSecurityGroups", "OCI-GRD-02"],
+  ["listNetworkSecurityGroupRules", "OCI-GRD-02"],
+];
+
+/**
+ * Puts a fake `oci` first on PATH so the default execFileSync runner (no
+ * injected exec) spawns it; OCI_FAKE_STDOUT selects the stdout shape and the
+ * process always exits 0. Restores PATH and removes the directory afterwards.
+ */
+function installFakeOci() {
+  const dir = mkdtempSync(join(tmpdir(), "grclanker-oci-fake-cli-"));
+  const script = [
+    "#!/bin/sh",
+    'case "$OCI_FAKE_STDOUT" in',
+    "  empty) exit 0 ;;",
+    "  whitespace) printf '  \\n\\t \\n'; exit 0 ;;",
+    "  foreign) printf '%s' '{\"items\": [], \"opc-request-id\": \"6B5074A48E0B435699E3CF5EC923D475\"}'; exit 0 ;;",
+    '  html) printf \'%s\' "$OCI_FAKE_HTML"; exit 0 ;;',
+    "esac",
+    'echo "unexpected OCI_FAKE_STDOUT=$OCI_FAKE_STDOUT" >&2',
+    "exit 3",
+    "",
+  ].join("\n");
+  writeFileSync(join(dir, "oci"), script, { mode: 0o755 });
+  const previousPath = process.env.PATH;
+  process.env.PATH = `${dir}${delimiter}${previousPath ?? ""}`;
+  process.env.OCI_FAKE_HTML = GATEWAY_PAGE;
+  return {
+    restore() {
+      process.env.PATH = previousPath;
+      delete process.env.OCI_FAKE_HTML;
+      delete process.env.OCI_FAKE_STDOUT;
+      rmSync(dir, { recursive: true, force: true });
+    },
+  };
+}
+
+const POSIX_ONLY = process.platform === "win32" ? "the fake oci is a POSIX shell script" : false;
+
+test("silent success: empty, whitespace-only, and foreign-JSON stdout on exit 0 render every surface unreadable through the real runner, never as an empty inventory (HTML stdout is the control)", { skip: POSIX_ONLY }, async () => {
+  const fake = installFakeOci();
+  try {
+    for (const [shape, marker] of Object.entries(SILENT_SUCCESS_SHAPES)) {
+      process.env.OCI_FAKE_STDOUT = shape;
+      const real = new OciAuditorClient(sampleConfig(), undefined, { now: () => NOW });
+      await assert.rejects(real.listCompartments(), (error) => {
+        assert.ok(error instanceof OciCommandError, shape);
+        assert.equal(error.exitCode, 0);
+        assert.equal(error.serviceError, undefined);
+        assert.match(error.message, marker, `${shape}: ${error.message}`);
+        assert.match(error.message, /^oci iam compartment list exited 0/);
+        assert.doesNotMatch(error.message, UNOBSERVED_CONDITION);
+        return true;
+      });
+
+      const access = await checkOciAccess(real);
+      assert.equal(access.status, "limited", shape);
+      assert.equal(access.surfaces.length, 10, shape);
+      for (const surface of access.surfaces) {
+        assert.equal(surface.status, "not_readable", `${shape}: ${surface.name} must not count as readable`);
+        assert.equal("count" in surface, false, `${shape}: ${surface.name} must not render a count`);
+        assert.match(surface.error, new RegExp(marker.source.slice(1, -1)), `${shape}: ${surface.name}: ${surface.error}`);
+        assert.doesNotMatch(surface.error, UNOBSERVED_CONDITION, `${shape}: ${surface.name}: ${surface.error}`);
+      }
+
+      const results = await runAllAssessments(real);
+      const findings = results.flatMap((result) => result.findings);
+      assert.equal(findings.length, 21, shape);
+      for (const item of findings) {
+        assert.ok(item.status !== "pass" && item.status !== "fail", `${shape}: ${item.id} rendered ${item.status}: ${item.summary}`);
+        assert.doesNotMatch(item.summary, UNOBSERVED_CONDITION, `${shape}: ${item.id}: ${item.summary}`);
+      }
+      const errors = results.flatMap((result) => result.errors);
+      assert.ok(errors.length > 0, shape);
+      for (const error of errors) {
+        assert.match(error, new RegExp(marker.source.slice(1, -1)), `${shape}: ${error}`);
+        assert.doesNotMatch(error, UNOBSERVED_CONDITION, `${shape}: ${error}`);
+      }
+      assert.ok(errors.some((error) => /oci iam compartment list exited 0 with/.test(error) || /oci iam compartment list exited 0 but printed/.test(error)), `${shape}: ${errors.join(" | ")}`);
+      for (const result of results) {
+        assertNoFabricatedValues(result.summary, `${shape}: ${result.title} summary`);
+        for (const item of result.findings) assertNoFabricatedValues(item.evidence ?? null, `${shape}: ${item.id} evidence`);
+      }
+    }
+  } finally {
+    fake.restore();
+  }
+});
+
+test("silent success per surface: each shape on each surface the #68 review names renders the dependent finding manual or warn, never pass or fail, with a marker naming the command and the stdout state", { skip: POSIX_ONLY }, async () => {
+  const fake = installFakeOci();
+  try {
+    for (const [method, findingId] of SILENT_SUCCESS_ROWS) {
+      const entry = INVENTORY_SWEEP.find((candidate) => candidate.method === method);
+      assert.ok(entry, method);
+      for (const [shape, marker] of Object.entries(SILENT_SUCCESS_SHAPES)) {
+        process.env.OCI_FAKE_STDOUT = shape;
+        const real = new OciAuditorClient(sampleConfig(), undefined, { now: () => NOW });
+        const client = compliantClient();
+        client[method] = (...args) => real[method](...args);
+        const results = await runAllAssessments(client);
+        const finding = results.flatMap((result) => result.findings).find((item) => item.id === findingId);
+        assert.ok(finding, `${method}/${shape}: ${findingId}`);
+        assert.ok(finding.status !== "pass" && finding.status !== "fail", `${method}/${shape}: ${findingId} rendered ${finding.status}: ${finding.summary}`);
+        assert.ok(finding.summary.includes(entry.command), `${method}/${shape}: the summary names ${entry.command}: ${finding.summary}`);
+        assert.doesNotMatch(finding.summary, UNOBSERVED_CONDITION, `${method}/${shape}: ${finding.summary}`);
+        const errors = results.flatMap((result) => result.errors);
+        const recorded = errors.find((error) => error.includes(`oci ${entry.command} exited 0`));
+        assert.ok(recorded, `${method}/${shape}: no error names oci ${entry.command}; errors were: ${errors.join(" | ")}`);
+        assert.match(recorded, new RegExp(marker.source.slice(1, -1)), `${method}/${shape}: ${recorded}`);
+        assert.doesNotMatch(recorded, UNOBSERVED_CONDITION, `${method}/${shape}: ${recorded}`);
+      }
+    }
+  } finally {
+    fake.restore();
+  }
 });
