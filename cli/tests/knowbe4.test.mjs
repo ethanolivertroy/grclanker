@@ -602,7 +602,7 @@ test("Knowbe4ApiClient stops retrying after max retries and redacts tokens in er
     minRequestIntervalMs: 0,
   });
   await assert.rejects(() => leaking.getAccount(), (error) => {
-    assert.match(error.message, /KnowBe4 request to \/v1\/account failed/);
+    assert.match(error.message, /KnowBe4 request failed: GET \/v1\/account/);
     assert.ok(!error.message.includes("super-secret-token"));
     assert.ok(!error.message.includes("phisher-secret"));
     assert.match(error.message, /\[REDACTED\]/);
@@ -1017,11 +1017,15 @@ test("assessKnowbe4TrainingProgram degrades remedial training to warn when tests
   assert.equal(item.evidence.remediated_users, 1);
   assert.equal(item.evidence.remediated_pct, 100);
 
-  // With only the newest test sampled there are no observed failures, which still cannot pass on a partial sample.
+  // With only the newest test sampled there are no observed failures, which still cannot pass on a partial sample, and
+  // the window-wide failure count is unknown rather than 0 because two tests were never read.
   const thinSnapshot = await collectKnowbe4Snapshot(mockClient(fixture), { scopes: ["training"], now: NOW, securityTestSampleLimit: 1 });
   const thin = findingFor(assessKnowbe4TrainingProgram(thinSnapshot, { now: NOW }), 10);
   assert.equal(thin.status, "warn");
-  assert.equal(thin.evidence.failed_users_in_window, 0);
+  assert.equal(thin.evidence.failed_users_in_window, null);
+  assert.equal(thin.evidence.failed_users_in_sampled_tests, 0);
+  assert.equal(thin.evidence.recipient_reads_complete, false);
+  assert.equal(thin.evidence.violation_observed, null);
   assert.equal(thin.evidence.unsampled_security_tests, 2);
   assert.match(thin.summary, /2 additional tests in the window were not sampled/);
 
@@ -1087,11 +1091,15 @@ test("assessKnowbe4TrainingProgram never passes compliance completion computed o
   assert.equal(truncated.status, "warn");
   assert.match(truncated.summary, /truncated at enrollment_limit \(3\)/);
   assert.match(truncated.summary, /cannot be verified/);
-  assert.equal(truncated.evidence.topics[0].enrollments, 3);
-  assert.equal(truncated.evidence.topics[0].completion_pct, 100);
+  // Population figures are unknown over a truncated list; only the "_loaded" figures describe the records read.
+  assert.equal(truncated.evidence.topics[0].enrollments, null);
+  assert.equal(truncated.evidence.topics[0].completion_pct, null);
+  assert.equal(truncated.evidence.topics[0].enrollments_loaded, 3);
+  assert.equal(truncated.evidence.topics[0].completion_pct_loaded, 100);
   assert.equal(truncated.evidence.enrollment_limit_reached, true);
   assert.equal(truncated.evidence.completion_data_partial, true);
-  assert.deepEqual(truncated.evidence.topics_without_enrollments, []);
+  assert.equal(truncated.evidence.topics_without_enrollments, null);
+  assert.deepEqual(truncated.evidence.topics_without_loaded_enrollments, []);
 
   // Without the cap the same topic is measured at 50% and warns on low completion instead.
   const fullSnapshot = await collectKnowbe4Snapshot(mockClient(fixture), { scopes: ["training"], now: NOW });
@@ -1099,6 +1107,8 @@ test("assessKnowbe4TrainingProgram never passes compliance completion computed o
   assert.equal(full.status, "warn");
   assert.match(full.summary, /below 90%/);
   assert.equal(full.evidence.topics[0].completion_pct, 50);
+  assert.equal(full.evidence.topics[0].enrollments, 6);
+  assert.deepEqual(full.evidence.topics_without_enrollments, []);
   assert.equal(full.evidence.completion_data_partial, false);
 
   // The auto-detect path is guarded the same way.
@@ -1214,7 +1224,19 @@ test("collectKnowbe4Snapshot flags user_limit truncation and user-set controls d
   assert.equal(findingFor(phishing, 1).status, "pass");
   assert.equal(findingFor(phishing, 20).status, "pass");
   assert.equal(findingFor(risk, 8).status, "pass");
-  assert.equal(findingFor(phishing, 2).evidence.coverage_pct, 100);
+  // Coverage over a capped user list is unknown; only the figures over the users actually read render.
+  const coverage = findingFor(phishing, 2);
+  assert.equal(coverage.evidence.coverage_pct, null);
+  assert.equal(coverage.evidence.active_users, null);
+  assert.equal(coverage.evidence.tested_users, null);
+  assert.equal(coverage.evidence.users_read, 5);
+  assert.equal(coverage.evidence.tested_users_in_read_samples, 5);
+  assert.equal(coverage.evidence.untested_user_sample, null);
+  assert.match(coverage.summary, /5 of the 5 active users read appear in the 3 sampled security tests, so coverage over the full population is unknown\. Truncated listing: users \(5 of unknown loaded, truncated at user_limit \(5\)\)/);
+  assert.equal(findingFor(risk, 18).evidence.inactive_users, null);
+  assert.equal(findingFor(risk, 18).evidence.inactive_user_sample, null);
+  assert.equal(findingFor(risk, 5).evidence.users_scored, null);
+  assert.equal(findingFor(risk, 5).evidence.users_scored_read, 5);
 });
 
 test("assessKnowbe4AccountGovernance passes admin hygiene and callback tests while flagging manual controls", async () => {
@@ -1459,10 +1481,21 @@ test("exportKnowbe4AuditBundle records partial collection failures and honors PI
   assert.equal(findings.find((item) => item.control === 3).status, "warn", "reported completion still judges the campaigns; the missing enrollment fallback demotes");
   assert.ok(!JSON.stringify(findings).includes("@acme.example"));
   const status = JSON.parse(readFileSync(join(result.outputDir, "core_data", "collection_status.json"), "utf8"));
-  assert.equal(status.find((row) => row.inventory === "training_enrollments").readable, false);
-  assert.match(status.find((row) => row.inventory === "training_enrollments").error, /500/);
-  assert.equal(status.find((row) => row.inventory === "users").readable, true);
-  assert.equal(status.find((row) => row.inventory === "users").truncated, false);
+  const enrollmentRow = status.inventories.find((row) => row.inventory === "training_enrollments");
+  assert.equal(enrollmentRow.readable, false);
+  assert.match(enrollmentRow.error, /500/);
+  // Nothing about the failed read defaults: completeness, truncation, and counts are unknown, not false or 0.
+  assert.deepEqual(
+    { collected: enrollmentRow.collected, complete: enrollmentRow.complete, truncated: enrollmentRow.truncated, seen: enrollmentRow.seen, total: enrollmentRow.total },
+    { collected: false, complete: null, truncated: null, seen: null, total: null },
+  );
+  const usersRow = status.inventories.find((row) => row.inventory === "users");
+  assert.equal(usersRow.readable, true);
+  assert.equal(usersRow.truncated, false);
+  assert.equal(usersRow.seen, 10);
+  assert.equal(status.totals.not_readable, 2);
+  assert.equal(status.totals.not_requested, 1, "PhishER was not configured, so its inventory was never requested");
+  assert.equal(status.totals.truncation_unknown, 3, "denied and never-requested inventories are neither complete nor truncated");
 
   const second = await exportKnowbe4AuditBundle(client, client.getResolvedConfig(), base, { now: NOW });
   assert.match(second.outputDir, /acme-corp-knowbe4-audit-bundle-2$/);
@@ -1525,7 +1558,7 @@ const KNOWBE4_MULTI_INVENTORY_CASES = [
   { control: 10, area: "training", secondary: "training_enrollments", failure: "listTrainingEnrollments", path: "/v1/training/enrollments", status: "manual", names: /^Unreadable inventory: training_enrollments \(GET \/v1\/training\/enrollments: .*403 Forbidden/ },
   { control: 10, area: "training", secondary: "security_test_recipients", failure: "listSecurityTestRecipients", path: "/v1/phishing/security_tests/900/recipients", status: "warn", names: /had recipient results available.*Unreadable inventory: security_test_recipients \(GET \/v1\/phishing\/security_tests\/\{pst_id\}\/recipients: .*403 Forbidden/ },
   { control: 10, area: "training", secondary: "training_campaigns", failure: "listTrainingCampaigns", path: "/v1/training/campaigns", status: "warn", names: /were enrolled in training after the failure.*Unreadable inventory: training_campaigns \(GET \/v1\/training\/campaigns: .*403 Forbidden.*\), so auto-enroll remedial campaigns were not listed/ },
-  { control: 11, area: "training", secondary: "store_purchases", failure: "listStorePurchases", path: "/v1/training/store_purchases", status: "warn", names: /none are retired.*Unreadable inventory: store_purchases \(GET \/v1\/training\/store_purchases: .*403 Forbidden.*\), so assigned modules were not cross-checked against the ModStore catalog/ },
+  { control: 11, area: "training", secondary: "store_purchases", failure: "listStorePurchases", path: "/v1/training/store_purchases", status: "warn", names: /none are marked retired in the campaign content; the ModStore catalog was not read.*Unreadable inventory: store_purchases \(GET \/v1\/training\/store_purchases: .*403 Forbidden.*\), so assigned modules were not cross-checked against the ModStore catalog/ },
   { control: 17, area: "training", secondary: "training_enrollments", failure: "listTrainingEnrollments", path: "/v1/training/enrollments", status: "warn", names: /enrollment data is unavailable.*Unreadable inventory: training_enrollments \(GET \/v1\/training\/enrollments: .*403 Forbidden/ },
   { control: 17, area: "training", secondary: "training_policies", failure: "listTrainingPolicies", path: "/v1/training/policies", status: "warn", names: /completion at or above 90%.*Unreadable inventory: training_policies \(GET \/v1\/training\/policies: .*403 Forbidden.*\), so uploaded policy documents were not counted/ },
   { control: 5, area: "risk", secondary: "account", failure: "getAccount", path: "/v1/account", status: "warn", names: /mean user risk score is 25\.5.*Unreadable inventory: account \(GET \/v1\/account: .*403 Forbidden.*\), so the organization risk score was not attached/ },
@@ -1700,14 +1733,23 @@ test("verdict rule 10: truncated KnowBe4 inventories demote the findings that ju
   assert.equal(reportRate.evidence.phisher.truncated, true);
 
   const status = knowbe4CollectionStatus(snapshot);
-  assert.deepEqual(status.map((row) => row.inventory), KNOWBE4_INVENTORIES);
-  const tests = status.find((row) => row.inventory === "security_tests");
+  assert.deepEqual(status.inventories.map((row) => row.inventory), KNOWBE4_INVENTORIES);
+  const tests = status.inventories.find((row) => row.inventory === "security_tests");
   assert.equal(tests.truncated, true);
+  assert.equal(tests.complete, false);
   assert.equal(tests.seen, 12);
   assert.equal(tests.limit, 20000);
-  const phisher = status.find((row) => row.inventory === "phisher_messages");
+  const phisher = status.inventories.find((row) => row.inventory === "phisher_messages");
   assert.deepEqual({ seen: phisher.seen, total: phisher.total, limit: phisher.limit, limit_argument: phisher.limit_argument }, { seen: 2, total: 1500, limit: 1000, limit_argument: "phisher_message_limit" });
-  assert.equal(status.find((row) => row.inventory === "training_enrollments").collected, false);
+  // The phishing scope never requested enrollments: no endpoint, status, or flag is invented for that inventory.
+  const enrollments = status.inventories.find((row) => row.inventory === "training_enrollments");
+  assert.deepEqual(
+    { status: enrollments.status, collected: enrollments.collected, readable: enrollments.readable, endpoint: enrollments.endpoint, complete: enrollments.complete, truncated: enrollments.truncated, seen: enrollments.seen, limit: enrollments.limit },
+    { status: "not_requested", collected: false, readable: null, endpoint: null, complete: null, truncated: null, seen: null, limit: null },
+  );
+  assert.equal(status.totals.truncated, 2);
+  assert.equal(status.totals.not_requested, 5);
+  assert.equal(status.totals.truncation_unknown, 5);
 
   // Only the enrichment inventory truncated: the report rate still stands on the test counters but says what was cut.
   const enrichmentOnly = mockClient(healthyFixture(), { phisher: true });
@@ -1726,9 +1768,11 @@ test("verdict rule 9: Knowbe4ApiClient describes non-JSON error bodies instead o
     minRequestIntervalMs: 0,
   });
   await assert.rejects(() => client.getAccount(), (error) => {
-    assert.match(error.message, /KnowBe4 request failed \(403 Forbidden\) for \/v1\/account: non-JSON text\/html response body \(\d+ bytes, not echoed\)/);
+    assert.match(error.message, /^KnowBe4 request failed \(403 Forbidden\) GET \/v1\/account: 403 Forbidden: non-JSON body \(text\/html, \d+ bytes, not echoed\)$/);
     assert.ok(!error.message.includes("Bearer"), "the reflected header is not echoed");
     assert.ok(!error.message.includes("<html>"));
+    assert.equal(error.status, 403);
+    assert.equal(error.endpoint, "GET /v1/account");
     return true;
   });
 
