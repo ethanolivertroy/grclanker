@@ -35,9 +35,11 @@ import {
   registerElasticTools,
   resolveElasticConfiguration,
   resolveSecureOutputPath,
+  scrubErrorText,
 } from "../dist/extensions/grc-tools/elastic.js";
 import { getRegisteredToolSummaries } from "../dist/pi/tool-catalog.js";
 import { assertSecretsAbsent, readBundleFiles, readZipEntries } from "./helpers/bundle-contents.mjs";
+import { scrubAlterations } from "./helpers/scrub-survival.mjs";
 
 const DAY_MS = 86_400_000;
 const API_KEY = Buffer.from("audit-id:audit-secret-value").toString("base64");
@@ -3082,4 +3084,80 @@ test("addendum 5: every endpoint and status code named in Elastic output corresp
       assert.ok(noKibanaRequested.has(`${method} ${path}`), `${name} names ${method} ${path} although Kibana was never requested`);
     }
   }
+});
+
+// ---------------------------------------------------------------------------------------------------------------
+// Scrub boundary: fixed message text and every string a run records about legitimate data survive the scrubber.
+// ---------------------------------------------------------------------------------------------------------------
+
+/** Every fixed-text message the Elastic integration emits that a fixture run does not already produce. */
+const ELASTIC_FIXED_TEXT_MESSAGES = [
+  "Unable to read Elastic config file /home/auditor/.elastic-sec-inspector/config.yaml (ENOENT)",
+  "Unable to read Elastic config file /home/auditor/.elastic-sec-inspector/config.yaml (EACCES)",
+  "Unable to parse Elastic config file: invalid YAML in /home/auditor/.elastic-sec-inspector/config.yaml at line 3",
+  "Unable to parse Elastic config file: invalid YAML in /home/auditor/.elastic-sec-inspector/config.yaml",
+  "Elasticsearch URL is required. Set ELASTIC_URL, configure url in ~/.elastic-sec-inspector/config.yaml, or pass elasticsearch_url explicitly.",
+  "KIBANA_URL is not configured.",
+  "502 Bad Gateway: non-JSON body (text/html, 5120 bytes, not echoed)",
+  "403 Forbidden: JSON body without a documented error field (application/json, 64 bytes, not echoed)",
+  "elasticsearch request GET /_security/role_mapping failed (502 Bad Gateway): 502 Bad Gateway: non-JSON body (text/html, 5120 bytes, not echoed)",
+  "elasticsearch request GET /_ssl/certificates failed (403 Forbidden): security_exception: unauthorized; see https://api.example.com/v1/x?[REDACTED] for details",
+  "kibana request GET /api/fleet/outputs failed (403 Forbidden): Forbidden: missing fleet read",
+  "elasticsearch request GET /_security/user returned a 200 OK: non-JSON body (text/html, 1024 bytes, not echoed); the endpoint is not serving the JSON API",
+  "elasticsearch request POST /_security/_query/api_key timed out after 30000ms",
+  "elasticsearch request GET /_cluster/settings failed: SyntaxError: response could not be parsed as JSON; the parser's message is not recorded because it quotes the body",
+  "Using Elasticsearch https://es.example.com:9200 with api_key authentication.",
+  "Kibana https://kibana.example.com:5601 (space audit) is configured.",
+  "Kibana is not configured (set KIBANA_URL to enable Kibana checks).",
+  "Privilege probe failed, so missing privileges are unknown: elasticsearch request POST /_security/user/_has_privileges failed (502 Bad Gateway): 502 Bad Gateway: non-JSON body (text/html, 5120 bytes, not echoed)",
+  "Grant the auditing principal the monitor, read_security (or manage_security), manage_api_key, read_pipeline, monitor_snapshot, read_ilm, read_slm, and monitor_watcher cluster privileges, and set KIBANA_URL for Kibana checks.",
+  "Verdict is unknown because required evidence could not be read: role_mappings (GET /_security/role_mapping): elasticsearch request GET /_security/role_mapping failed (403 Forbidden): security_exception: action [cluster:admin/xpack/security/role_mapping/get] is unauthorized for user [grc-auditor]. Observed from readable sources: no superuser role mappings",
+  "Additional sources were unreadable or partial: xpack_usage (GET /_xpack/usage): request getXpackUsage failed (403 Forbidden)",
+  "the watch definitions (POST /_watcher/_query/watches) and the Kibana connector inventory from every space (configure KIBANA_URL so the connectors API can be queried, or export the connectors from each space), then confirm webhook destinations use https and credentials are stored as secrets.",
+  "Kibana evidence manually or set KIBANA_URL so the Kibana API can be queried:",
+  "Only the default space exists, so Kibana space isolation between teams is not in use; confirm whether multi-team separation is required.",
+  "api_keys inventory was not fully read (2 key(s) seen of 5000 total), so violators are neither counted nor named",
+  "api_keys (POST /_security/_query/api_key?with_limited_by=true): truncated after 2 of 5000",
+  JSON.stringify({ collected: false, status: 403, endpoint: "GET /_security/role_mapping", error: "elasticsearch request GET /_security/role_mapping failed (403 Forbidden): security_exception: unauthorized", reason: "not_readable" }),
+  JSON.stringify({ collected: false, status: "not-collected", endpoint: null, error: "KIBANA_URL is not configured", reason: "not_configured" }),
+];
+
+test("scrub boundary: every fixed-text message the Elastic integration emits survives its own scrubber unchanged, including every string a healthy or partially denied run records", async () => {
+  for (const message of ELASTIC_FIXED_TEXT_MESSAGES) {
+    assert.equal(scrubErrorText(message), message, `fixed text was altered by the scrubber: ${message}`);
+  }
+
+  // Every string a run writes about legitimate data is fixed text from the run's point of view: the scrubber must not
+  // rewrite a finding summary, a manual-evidence instruction, an inventory gap, or a bundle document. The principal
+  // fixture is served over HTTP and every surface is denied in turn, so every named user, role, mapping, key, output,
+  // connector, policy, and watch the run can mention is swept, beside every denial message the run can record.
+  const config = sampleConfig({ maxRetries: 0 });
+  const options = { sensitiveIndexPatterns: ["customers-*"], tenantIndexPatterns: ["tenant-*"] };
+  const surfaces = Object.keys(healthyRoutes(principalFixtures()));
+  const runs = [healthyRoutes(principalFixtures())];
+  for (const surface of surfaces) {
+    const routes = healthyRoutes(principalFixtures());
+    routes[surface] = jsonErrorWithUrl();
+    runs.push(routes);
+  }
+  let checked = 0;
+  const altered = new Set();
+  for (const routes of runs) {
+    const client = new ElasticApiClient(config, { fetchImpl: createRouter(routes) });
+    const access = await checkElasticAccess(client);
+    const snapshot = await collectElasticSnapshot(client, ELASTIC_ALL_DATASETS, options);
+    const assessments = ALL_AREAS.map((area) => evaluateElasticArea(area, snapshot, options, { elasticsearchUrl: config.elasticsearchUrl }));
+    const exported = await exportElasticAuditBundle(client, config, createTempBase("elastic-scrub-survival-"), options);
+    const files = readBundleFiles(exported.outputDir);
+    const texts = [
+      ...recordedErrorStrings(access, assessments, files),
+      ...[...files].filter(([name]) => !name.startsWith("core_data/")).map(([, text]) => text),
+      ...leaves(assessments).map(([, value]) => value).filter((value) => typeof value === "string"),
+    ];
+    checked += texts.length;
+    for (const alteration of scrubAlterations(texts, scrubErrorText)) altered.add(alteration);
+  }
+  assert.ok(surfaces.length >= 30, `expected every collector and access probe route, got ${surfaces.length}`);
+  assert.ok(checked > 2000, `expected thousands of recorded strings, got ${checked}`);
+  assert.deepEqual([...altered], [], `legitimate run text altered by the scrubber:\n${[...altered].join("\n")}`);
 });

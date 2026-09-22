@@ -40,9 +40,11 @@ import {
   registerDatadogTools,
   resolveDatadogConfiguration,
   resolveSecureOutputPath,
+  scrubErrorText,
 } from "../dist/extensions/grc-tools/datadog.js";
 import { getRegisteredToolSummaries } from "../dist/pi/tool-catalog.js";
 import { assertSecretsAbsent, readBundleFiles, readZipEntries } from "./helpers/bundle-contents.mjs";
+import { scrubAlterations } from "./helpers/scrub-survival.mjs";
 
 const NOW = new Date("2026-09-21T00:00:00.000Z");
 
@@ -3584,4 +3586,70 @@ test("config loader errors: a .dogrc that cannot be read yields fixed text with 
   } finally {
     globalThis.fetch = originalFetch;
   }
+});
+
+// ---------------------------------------------------------------------------------------------------------------
+// Scrub boundary: fixed message text and every string a run records about legitimate data survive the scrubber.
+// ---------------------------------------------------------------------------------------------------------------
+
+/** Every fixed-text message the Datadog integration emits that a fixture run does not already produce. */
+const DD_FIXED_TEXT_MESSAGES = [
+  "Unable to read Datadog config file /home/auditor/.dogrc (ENOENT)",
+  "Unable to read Datadog config file /home/auditor/.dogrc (EACCES)",
+  "Unable to parse Datadog config file: invalid INI in /home/auditor/.dogrc",
+  "DD_API_KEY (or an api_key argument, or apikey in ~/.dogrc) is required.",
+  "502 Bad Gateway: non-JSON body (text/html, 5120 bytes, not echoed)",
+  "403 Forbidden: JSON body without a documented error field (application/json, 64 bytes, not echoed)",
+  "Datadog request failed (502 Bad Gateway) GET /api/v2/ip_allowlist: 502 Bad Gateway: non-JSON body (text/html, 5120 bytes, not echoed)",
+  "Datadog request failed (403 Forbidden) GET /api/v2/logs/config/archives: Forbidden; see https://api.example.com/v1/x?[REDACTED] for details",
+  "Datadog request failed (403 Forbidden) GET /api/v2/roles/role-auditor/permissions: Forbidden",
+  "Datadog request timed out after 30000ms: GET /api/v2/users",
+  "Datadog request failed: GET /api/v1/validate: SyntaxError: response could not be parsed as JSON; the parser's message is not recorded because it quotes the body",
+  "Using Datadog site datadoghq.com (https://api.datadoghq.com).",
+  "Verify DD_API_KEY and DD_APP_KEY belong to the same organization and that DD_SITE matches the org region.",
+  "Permission state unknown for ip_allowlist: the probe failed without a permission denial, so the permission was neither confirmed nor found missing.",
+  "Unreadable inventory: role_permissions (GET /api/v2/roles/role-auditor/permissions, user_access_read: Auditor: Datadog request failed (403 Forbidden) GET /api/v2/roles/role-auditor/permissions: Forbidden)",
+  "Organization Settings > Users: MFA status of every user; Organization Settings > Login Methods: SAML strict mode",
+  "Organization Settings > API Keys: name, creation date, and last-used date of every API key",
+  JSON.stringify({ collected: false, status: "not-collected", endpoint: null, error: null, reason: "not_attempted" }),
+  JSON.stringify({ collected: false, status: 403, endpoint: "GET /api/v2/api_keys?page[size]=100&page[number]=0", error: "Datadog request failed (403 Forbidden) GET /api/v2/api_keys: Forbidden", reason: "not_readable", permission: "api_keys_read" }),
+];
+
+/** The fixture route that serves a denial entry's request; per-role permission reads are routed through one template. */
+function ddRouteFor(denial) {
+  return `GET ${denial.path.replace(/^\/api\/v2\/roles\/[^/]+\/permissions$/, "/api/v2/roles/{id}/permissions")}`;
+}
+
+test("scrub boundary: every fixed-text message the Datadog integration emits survives its own scrubber unchanged, including every string a healthy or partially denied run records", async () => {
+  for (const message of DD_FIXED_TEXT_MESSAGES) {
+    assert.equal(scrubErrorText(message), message, `fixed text was altered by the scrubber: ${message}`);
+  }
+
+  // Every string a run writes about legitimate data is fixed text from the run's point of view: the scrubber must not
+  // rewrite a finding summary, a manual-evidence instruction, an inventory gap, or a bundle document. The principal
+  // fixture is served over HTTP so every named user, key, role, rule, and integration the run can mention is swept.
+  const runs = [httpClient(routesFromClient(principalClient()), [])];
+  for (const denial of DD_SINGLE_INVENTORY_DENIALS) {
+    const routes = routesFromClient(principalClient());
+    assert.ok(routes[ddRouteFor(denial)], `${denial.inventory}: no fixture route ${ddRouteFor(denial)}`);
+    routes[ddRouteFor(denial)] = jsonForbiddenWithUrl();
+    runs.push(httpClient(routes, []));
+  }
+  let checked = 0;
+  const altered = new Set();
+  for (const { client, config } of runs) {
+    const access = await checkDatadogAccess(client);
+    const assessments = await runAllAssessments(client);
+    const exported = await exportDatadogAuditBundle(client, config, createTempBase("grclanker-datadog-scrub-survival-"), { now: NOW });
+    const files = readBundleFiles(exported.outputDir);
+    const texts = [
+      ...ddRecordedErrorStrings(access, assessments, files),
+      ...[...files].filter(([name]) => !name.startsWith("core_data/")).map(([, text]) => text),
+      ...leafEntries(assessments).map(([, value]) => value).filter((value) => typeof value === "string"),
+    ];
+    checked += texts.length;
+    for (const alteration of scrubAlterations(texts, scrubErrorText)) altered.add(alteration);
+  }
+  assert.ok(checked > 2000, `expected thousands of recorded strings, got ${checked}`);
+  assert.deepEqual([...altered], [], `legitimate run text altered by the scrubber:\n${[...altered].join("\n")}`);
 });

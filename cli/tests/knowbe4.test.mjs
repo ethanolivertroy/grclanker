@@ -34,9 +34,11 @@ import {
   registerKnowbe4Tools,
   resolveKnowbe4Configuration,
   resolveSecureOutputPath,
+  scrubErrorText,
 } from "../dist/extensions/grc-tools/knowbe4.js";
 import { getRegisteredToolSummaries } from "../dist/pi/tool-catalog.js";
 import { assertSecretsAbsent, readBundleFiles, readZipEntries } from "./helpers/bundle-contents.mjs";
+import { scrubAlterations } from "./helpers/scrub-survival.mjs";
 
 const NOW = new Date("2026-09-21T12:00:00Z");
 const DAY_MS = 86_400_000;
@@ -2574,4 +2576,63 @@ test("config loader errors: a SyntaxError raised by the transport is recorded by
   assert.ok(access.surfaces.every((surface) => surface.status !== "readable" || surface.name === "phisher_messages"));
   const snapshot = await collectKnowbe4Snapshot(client, { scopes: ["risk"], now: NOW });
   assert.ok(snapshot.errors.length > 0 && snapshot.errors.every((text) => text.includes("SyntaxError: response could not be parsed as JSON") && !text.includes("PARSER-SNIPPET")), snapshot.errors.join("\n"));
+});
+
+// ---------------------------------------------------------------------------------------------------------------
+// Scrub boundary: fixed message text and every string a run records about legitimate data survive the scrubber.
+// ---------------------------------------------------------------------------------------------------------------
+
+/** Every fixed-text message the KnowBe4 integration emits that a fixture run does not already produce. */
+const KB_FIXED_TEXT_MESSAGES = [
+  "Unable to read KnowBe4 config file /home/auditor/.knowbe4-inspector/config.yaml (ENOENT)",
+  "Unable to read KnowBe4 config file /home/auditor/.knowbe4-inspector/config.yaml (EACCES)",
+  "Unable to parse KnowBe4 config file: invalid YAML in /home/auditor/.knowbe4-inspector/config.yaml at line 3",
+  "Unable to parse KnowBe4 config file: invalid YAML in /home/auditor/.knowbe4-inspector/config.yaml",
+  "KnowBe4 Reporting API token is required. Pass api_token, set KNOWBE4_API_TOKEN, or add api_token to ~/.knowbe4-inspector/config.yaml.",
+  'Unsupported KnowBe4 region "mars". Use one of: us, eu, ca, uk, de.',
+  "502 Bad Gateway: non-JSON body (text/html, 5120 bytes, not echoed)",
+  "403 Forbidden: JSON body without a documented error field (64 bytes, not echoed)",
+  "KnowBe4 request failed (502 Bad Gateway) GET /v1/groups: 502 Bad Gateway: non-JSON body (text/html, 5120 bytes, not echoed)",
+  "KnowBe4 request failed (403 Forbidden) GET /v1/training/store_purchases: Forbidden; see https://api.example.com/v1/x?[REDACTED] for details",
+  "KnowBe4 request timed out after 30000ms: GET /v1/users?page=1&per_page=500",
+  "KnowBe4 request failed: GET /v1/account: SyntaxError: response could not be parsed as JSON; the parser's message is not recorded because it quotes the body",
+  "Using KnowBe4 region us (https://us.api.knowbe4.com).",
+  "Regenerate the Reporting API key in the KnowBe4 console (Account Settings, API section) and confirm the region matches where the account is hosted.",
+  "Config precedence resolved from: environment-api-token -> config-region -> config-file-present.",
+  "Account Settings > API: the Reporting API key's creation date and the admin who owns it",
+  "Users > Groups: membership of every console group targeted by a phishing or training campaign",
+  JSON.stringify({ collected: false, status: "not-collected", endpoint: null, error: null, reason: "not_requested" }),
+  JSON.stringify({ collected: false, status: 403, endpoint: "GET /v1/groups", error: "KnowBe4 request failed (403 Forbidden) GET /v1/groups: Forbidden", reason: "not_readable" }),
+];
+
+test("scrub boundary: every fixed-text message the KnowBe4 integration emits survives its own scrubber unchanged, including every string a healthy or partially denied run records", async () => {
+  for (const message of KB_FIXED_TEXT_MESSAGES) {
+    assert.equal(scrubErrorText(message), message, `fixed text was altered by the scrubber: ${message}`);
+  }
+
+  // Every string a run writes about legitimate data is fixed text from the run's point of view: the scrubber must not
+  // rewrite a finding summary, a manual-evidence instruction, an inventory gap, or a bundle document. The principal
+  // fixture is used so every named user, group, campaign, and test the run can mention is part of the sweep.
+  const runs = [httpKnowbe4(principalFixture())];
+  for (const denial of KB_SINGLE_INVENTORY_DENIALS) {
+    const fixture = principalFixture();
+    runs.push(httpKnowbe4(fixture, { routes: { [denial.route]: denyDataset(kbRoutes(fixture), denial) } }));
+  }
+  let checked = 0;
+  const altered = new Set();
+  for (const { client, config } of runs) {
+    const access = await checkKnowbe4Access(client);
+    const assessments = await runAllKnowbe4Assessments(client);
+    const exported = await exportKnowbe4AuditBundle(client, config, createTempBase("grclanker-knowbe4-scrub-survival-"), { now: NOW });
+    const files = readBundleFiles(exported.outputDir);
+    const texts = [
+      ...kbRecordedErrorStrings(access, assessments, files),
+      ...[...files].filter(([name]) => !name.startsWith("core_data/")).map(([, text]) => text),
+      ...leafEntries(assessments).map(([, value]) => value).filter((value) => typeof value === "string"),
+    ];
+    checked += texts.length;
+    for (const alteration of scrubAlterations(texts, scrubErrorText)) altered.add(alteration);
+  }
+  assert.ok(checked > 2000, `expected thousands of recorded strings, got ${checked}`);
+  assert.deepEqual([...altered], [], `legitimate run text altered by the scrubber:\n${[...altered].join("\n")}`);
 });
