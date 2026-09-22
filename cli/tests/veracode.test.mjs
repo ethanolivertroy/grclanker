@@ -978,6 +978,10 @@ const FAKE_SECRETS = {
   scanListSession: "U3SWh2gaRXQEmg2KpWxWEHb2gezPMAa3KPwNf2sf",
   scanRequestPassword: "F9UDKhAWZvwMQdLNHh",
   apiSecret: "Gy4Sr2nthWewBaLdX3CNSKuSQ2dajbJh5ht77mWw",
+  pairAccessKey: "Z7J4pAhJr9F4H33emp2fLkHuUV68ZpbKGfuenF6G",
+  pairSecretKey: "cTEF3JvzumskuFUSrpnujEU2Xjf9jPqXnj9Px23p",
+  settingsAccessKey: "A4urKDYCG35ubTm9v54aKCfTwDUYD4r5YFP7Lr99",
+  settingsSecretKey: "6mckJxBg2BmjE9GKTpz5KeWXxHXcHtwkSm8Le9Gj",
 };
 
 /** Every collected object that can carry a credential per the vendor API carries a distinctive fake one. */
@@ -989,6 +993,13 @@ function secretFixture() {
   ];
   fixture.applications[0].profile.git_repo_url = `https://svc:${FAKE_SECRETS.repoUserinfoToken}@git.example.com/org/payments.git`;
   fixture.applications[1].profile.git_repo_url = `https://git.example.com/org/portal.git?access_token=${FAKE_SECRETS.repoQueryToken}`;
+  // Keys whose normalized form ends in `accesskey` or `secretkey`, in pair shape (space- and underscore-separated names) and as direct keys.
+  fixture.applications[1].profile.custom_fields = [
+    { name: "AWS Access Key", value: FAKE_SECRETS.pairAccessKey },
+    { name: "deploy_secret_key", value: FAKE_SECRETS.pairSecretKey },
+    { name: "Cost Center", value: "CC-4410" },
+  ];
+  fixture.applications[1].profile.settings = { sca_enabled: true, access_key: FAKE_SECRETS.settingsAccessKey, "secret-key": FAKE_SECRETS.settingsSecretKey };
   fixture.scans = [{
     scan_id: "scan-1",
     analysis_id: "an-1",
@@ -1047,6 +1058,12 @@ test("rule 9: the exported bundle, the zip, the assess payloads, and the access 
   ], "credential-named and JWT-shaped custom field values are redacted while the field names stay legible");
   assert.equal(payments.profile.git_repo_url, "https://[REDACTED]@git.example.com/org/payments.git");
   assert.equal(portal.profile.git_repo_url, "https://git.example.com/org/portal.git?[REDACTED]");
+  assert.deepEqual(portal.profile.custom_fields, [
+    { name: "AWS Access Key", value: "[REDACTED]" },
+    { name: "deploy_secret_key", value: "[REDACTED]" },
+    { name: "Cost Center", value: "CC-4410" },
+  ], "pair names that normalize to accesskey or secretkey are credential-shaped, and a non-credential pair keeps its value");
+  assert.deepEqual(portal.profile.settings, { sca_enabled: true, access_key: "[REDACTED]", "secret-key": "[REDACTED]" }, "access_key and secret-key are redacted as direct keys with the key names kept");
   assert.equal(payments.profile.name, "Payments", "non-credential profile fields stay verbatim");
   const [configuration] = scanCoverage.dynamic_analysis.scan_configurations;
   assert.deepEqual(configuration, {

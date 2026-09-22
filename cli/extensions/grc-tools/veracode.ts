@@ -2907,12 +2907,18 @@ const REDACTED = "[REDACTED]";
  * while catching password, api_token, client_secret, login_script_data, and
  * certificate material wherever an operator-authored record carries them.
  */
-const CREDENTIAL_KEY_PATTERN = /(password|passwd|passphrase|secret|token|apikey|privatekey|scriptdata|scriptbody|certificate)$/;
+/**
+ * Matched against the normalized key (lowercase, separators removed), so the
+ * suffixes must be spelled the way they read after normalization: `secret_key`
+ * and `access_key` become `secretkey` and `accesskey`, which `secret` alone
+ * would miss.
+ */
+const CREDENTIAL_KEY_PATTERN = /(password|passwd|passphrase|secret|token|scriptdata|scriptbody|certificate|(api|private|secret|access|auth|signing|encryption|session)key)$/;
 
 const JWT_PATTERN = /^eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\./;
 
 function isCredentialKey(key: string): boolean {
-  return CREDENTIAL_KEY_PATTERN.test(key.toLowerCase().replace(/[._-]/g, ""));
+  return CREDENTIAL_KEY_PATTERN.test(key.toLowerCase().replace(/[\s._-]/g, ""));
 }
 
 /** Rewrites only URLs whose userinfo or query string could carry a token (git_repo_url with user:token@, target URLs with session parameters). */
