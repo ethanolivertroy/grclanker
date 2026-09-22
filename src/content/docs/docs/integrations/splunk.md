@@ -66,7 +66,7 @@ Precedence is explicit tool arguments, then environment variables, then the JSON
 | `SPLUNK_TIMEOUT` | `timeout_seconds` | HTTP timeout in seconds (default 30) |
 | `SPLUNK_CONFIG_FILE` | n/a | Alternate config file path |
 
-Either `SPLUNK_TOKEN` or both `SPLUNK_USERNAME` and `SPLUNK_PASSWORD` are required. TLS verification opt-out is implemented with a per-request `node:https` agent (`rejectUnauthorized: false`); the inspector never sets `process.env.NODE_TLS_REJECT_UNAUTHORIZED`, so other tools in the same process keep verifying certificates. Tokens and session keys are redacted from error messages.
+Either `SPLUNK_TOKEN` or both `SPLUNK_USERNAME` and `SPLUNK_PASSWORD` are required. TLS verification opt-out is implemented with a per-request `node:https` agent (`rejectUnauthorized: false`); the inspector never sets `process.env.NODE_TLS_REJECT_UNAUTHORIZED`, so other tools in the same process keep verifying certificates. Error messages are scrubbed as described under Export bundle layout.
 
 ## Tools
 
@@ -94,8 +94,10 @@ Each assessment returns findings shaped as `{ id, control, title, severity, stat
 - `analysis/findings.json`, one JSON file per assessment area, and `analysis/summary.md`, all passed through the same redactor
 - `compliance/executive_summary.md`, `compliance/unified_compliance_matrix.md`, and one report per framework (`fedramp.md`, `cmmc.md`, `soc2.md`, `cis.md`, `pci.md`, `stig.md`, `irap.md`, `ismap.md`)
 - `QUICK_REFERENCE.md`
-- `_errors.log` when any collection step failed, one `<dataset>: <error>` line per failed read (tokens, session keys, and the ACS token are removed from every message)
+- `_errors.log` when any collection step failed, one `<dataset>: <error>` line per failed read, every message scrubbed by the error text rule below
 - a `.zip` archive named after the allocated directory
+
+Error text follows its own rule, applied when an API error is constructed and again wherever an error string is recorded (marker objects, `_errors.log`, finding evidence, the access check, and tool error payloads). A value inside a carrier is removed whatever its shape: the value of a credential-named header (`Authorization`, `Cookie`, `Set-Cookie`, `X-Api-Key`, and similar, so `Authorization: Splunk <session key>` keeps the scheme word and loses the key), a cookie or session assignment, URL userinfo and query pairs (the query string collapses to `?[REDACTED]`), the value after the `Bearer`, `Basic`, `Digest`, `Token`, `OAuth`, `Negotiate`, `NTLM`, `SSWS`, and `ApiKey` schemes (the scheme word stays), and the value of every credential-named `key=value` or `key: value` pair. A configured secret (the token, the password, the ACS token, and the session key obtained by logging in) is removed whatever its shape, in its raw, JSON-escaped, URL-encoded, base64, and base64url forms. A value with a real token shape is removed bare: PEM blocks, JWTs, AWS key IDs and secrets, other vendor-prefixed tokens, hex digests of 32 or more characters, and runs of 16 or more characters that carry a base64 symbol, more than one digit group, or token casing. A bare value shaped like a name (words joined by hyphens or underscores with at most one digit group, such as `prod-us-east-2026`) is indistinguishable from a resource name and stays, and so does a token-shaped segment of a bare request path or file path (`/servicesNS/-/-/saved/searches`, the config file path), so the endpoint or file an error names is the one the run used; inside a URL with a scheme every path segment keeps the rule because webhook URLs carry their token there.
 
 Output paths are resolved with traversal and symlink-parent protection; a path that escapes `output_dir` is rejected.
 
