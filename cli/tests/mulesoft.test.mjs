@@ -28,11 +28,13 @@ import {
   parseSimpleToml,
   redactSecretText,
   redactSnapshot,
+  registerMulesoftTools,
   resolveMulesoftConfiguration,
   resolveSecureOutputPath,
 } from "../dist/extensions/grc-tools/mulesoft.js";
 import { getRegisteredToolSummaries } from "../dist/pi/tool-catalog.js";
 import { assertSecretsAbsent, readBundleFiles, readZipEntries } from "./helpers/bundle-contents.mjs";
+import { assertConfigLoaderMatrix, configLoaderCases } from "./helpers/config-loader-matrix.mjs";
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 const ORG_ID = "org-1";
@@ -374,6 +376,37 @@ test("resolveMulesoftConfiguration prefers explicit args over environment and co
   assert.deepEqual(fromFile.environmentFilter, ["FileEnv"]);
   assert.equal(fromFile.timeoutMs, 45000);
   assert.ok(fromFile.sourceChain.includes("config-organization"));
+});
+
+test("addendum 6b: the TOML config loader reports read failures with fixed text and never quotes the fs error", async () => {
+  const home = createTempBase("grclanker-mulesoft-loader-home-");
+  const cases = configLoaderCases({ format: "toml", displayName: "MuleSoft", fileNoun: "config file", extension: ".toml" });
+  assert.deepEqual(cases.map((item) => item.name), ["EISDIR", "EACCES", "ENOENT on an explicit path"]);
+  const registered = [];
+  registerMulesoftTools({ registerTool: (tool) => registered.push(tool) });
+  const checkAccess = registered.find((tool) => tool.name === "mulesoft_check_access");
+  await assertConfigLoaderMatrix(cases, {
+    resolve: (path) => resolveMulesoftConfiguration({ config_file: path }, {}, { homeDir: home }),
+    checkAccess: (path) => checkAccess.execute("call-config", checkAccess.prepareArguments({ config_file: path })),
+  });
+  // The env-pointed paths are explicit as well: a missing file is a read error, not a silent skip.
+  const absent = join(home, "absent.toml");
+  for (const env of [{ MULESOFT_SEC_INSPECTOR_CONFIG: absent }, { ANYPOINT_CONFIG_FILE: absent }]) {
+    assert.throws(() => resolveMulesoftConfiguration({}, env, { homeDir: home }), (error) => {
+      assert.equal(error.message, `Unable to read MuleSoft config file ${absent} (ENOENT)`);
+      assert.equal(error.code, "ENOENT");
+      return true;
+    });
+  }
+  // The hand-rolled TOML parser never throws on content, so a malformed file with a planted secret
+  // resolves without echoing it: the value is taken as a string and never reaches an error message.
+  const malformed = join(home, "malformed.toml");
+  writeFileSync(malformed, "[anypoint\nclient_secret = QWJHXVZPKMTRYU1: Bearer GBDLNSCFWOAE2XZ\n");
+  assert.throws(() => resolveMulesoftConfiguration({ config_file: malformed }, {}, { homeDir: home }), (error) => {
+    assert.equal(error.message.includes("QWJHXVZPKMTRYU1"), false);
+    assert.equal(error.message.includes("GBDLNSCFWOAE2XZ"), false);
+    return true;
+  });
 });
 
 test("resolveMulesoftConfiguration reads the default config.toml location under the home directory", () => {

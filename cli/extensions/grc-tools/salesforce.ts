@@ -501,6 +501,10 @@ const JWT_PATTERN = /\beyJ[A-Za-z0-9_-]{4,}\.[A-Za-z0-9_-]{4,}\.[A-Za-z0-9_-]*/g
 const AUTHORIZATION_VALUE_PATTERN = /\b(bearer|basic|digest|negotiate|ntlm)\s+([A-Za-z0-9\-._~+/!]{8,}=*)/gi;
 const SECRET_ASSIGNMENT_PATTERN = /\b([\w-]*(?:session|token|secret|password|passwd|pwd|api[_-]?key|apikey|credential|assertion|signature|sid|jsessionid)[\w-]*=)([^\s"'&;,<>]+)/gi;
 const SECRET_FIELD_PATTERN = /(?<![\w/.-])((?:api[\s_-]?key|x-api-key|access[_-]?token|refresh[_-]?token|id[_-]?token|auth[_-]?token|session[_-]?token|bearer[_-]?token|token|client[_-]?secret|secret|password|passwd|pwd|authorization|set-cookie|cookie|session[_-]?id|jsessionid|sid|assertion|signature|credential)["']?\s*:\s*["']?)([^\s"'&;,<>]+)/gi;
+// Node fs error codes (ENOENT, EACCES, EISDIR); anything else on error.code is not echoed.
+const FS_ERROR_CODE_PATTERN = /^E[A-Z0-9_]{1,30}$/;
+// The only part of a JSON.parse message that is taken; the rest quotes the source.
+const JSON_POSITION_PATTERN = /at position (\d+)/;
 const SESSION_ID_ELEMENT_PATTERN = /<([\w:]*sessionId)>[^<]*<\/[\w:]*sessionId>/gi;
 
 /**
@@ -620,15 +624,52 @@ function isUnavailableError(error: unknown): boolean {
   return /INVALID_TYPE|INVALID_FIELD|NOT_FOUND|INVALID_TYPE_FOR_OPERATION|sObject type .* is not supported|No such column|UNKNOWN_EXCEPTION/i.test(`${error.errorCode ?? ""} ${error.message}`);
 }
 
+/**
+ * Thrown by the credentials file loader. The message is fixed text carrying only the path, the fs
+ * error code, and the line: neither Node's fs message (which quotes its own wording and path) nor
+ * V8's JSON.parse message (which quotes a window of the source, or the whole source when it is
+ * short) is ever interpolated, because the file holds the client secret, password, or private key.
+ */
+export class SalesforceConfigFileError extends Error {
+  readonly code: string;
+
+  constructor(message: string, code: string) {
+    super(message);
+    this.name = "SalesforceConfigFileError";
+    this.code = code;
+  }
+}
+
+/** Read step of the loader: any failure (ENOENT included) becomes fixed text with the validated fs code. */
+function readCredentialsFileText(pathname: string): string {
+  try {
+    return readFileSync(pathname, "utf8");
+  } catch (error) {
+    const rawCode = (error as { code?: unknown } | null)?.code;
+    const code = typeof rawCode === "string" && FS_ERROR_CODE_PATTERN.test(rawCode) ? rawCode : undefined;
+    throw new SalesforceConfigFileError(`Unable to read Salesforce credentials file ${pathname}${code ? ` (${code})` : ""}`, code ?? "EUNKNOWN");
+  }
+}
+
+/**
+ * Parse step of the loader: every thrown value is caught and only a position taken through the
+ * strict `at position N` pattern is kept, converted to the line it falls on.
+ */
+function parseCredentialsFileJson(pathname: string, text: string): unknown {
+  try {
+    return JSON.parse(text) as unknown;
+  } catch (error) {
+    const position = error instanceof Error ? JSON_POSITION_PATTERN.exec(error.message) : null;
+    const line = position ? text.slice(0, Number(position[1])).split("\n").length : undefined;
+    throw new SalesforceConfigFileError(`Unable to parse Salesforce credentials file: invalid JSON in ${pathname}${line ? ` at line ${line}` : ""}`, "INVALID_JSON");
+  }
+}
+
 function readCredentialsFile(pathname: string): JsonRecord {
   const resolved = resolve(pathname);
-  if (!existsSync(resolved)) {
-    throw new Error(`Salesforce credentials file not found: ${resolved}`);
-  }
-  const parsed = JSON.parse(readFileSync(resolved, "utf8")) as unknown;
-  const object = asObject(parsed);
+  const object = asObject(parseCredentialsFileJson(resolved, readCredentialsFileText(resolved)));
   if (!object) {
-    throw new Error(`Salesforce credentials file must contain a JSON object: ${resolved}`);
+    throw new SalesforceConfigFileError(`Unable to parse Salesforce credentials file: ${resolved} must contain a JSON object`, "INVALID_JSON");
   }
   return object;
 }
@@ -637,10 +678,13 @@ function loadPrivateKey(inline: string | undefined, pathname: string | undefined
   if (inline) return inline.replace(/\\n/g, "\n");
   if (!pathname) return undefined;
   const resolved = resolve(pathname);
-  if (!existsSync(resolved)) {
-    throw new Error(`Salesforce private key file not found: ${resolved}`);
+  try {
+    return readFileSync(resolved, "utf8");
+  } catch (error) {
+    const rawCode = (error as { code?: unknown } | null)?.code;
+    const code = typeof rawCode === "string" && FS_ERROR_CODE_PATTERN.test(rawCode) ? rawCode : undefined;
+    throw new SalesforceConfigFileError(`Unable to read Salesforce private key file ${resolved}${code ? ` (${code})` : ""}`, code ?? "EUNKNOWN");
   }
-  return readFileSync(resolved, "utf8");
 }
 
 function looksLikeSandbox(instanceUrl: string | undefined, loginUrl: string | undefined): boolean {

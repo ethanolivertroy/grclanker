@@ -25,12 +25,14 @@ import {
   assessCrowdstrikeSensorCoverage,
   checkCrowdstrikeAccess,
   exportCrowdstrikeAuditBundle,
+  registerCrowdstrikeTools,
   resolveCrowdstrikeConfiguration,
   resolveSecureOutputPath,
   runAllCrowdstrikeAssessments,
 } from "../dist/extensions/grc-tools/crowdstrike.js";
 import { getRegisteredToolSummaries } from "../dist/pi/tool-catalog.js";
 import { assertSecretsAbsent, readBundleFiles, readZipEntries } from "./helpers/bundle-contents.mjs";
+import { assertConfigLoaderMatrix, configLoaderCases } from "./helpers/config-loader-matrix.mjs";
 
 const ALL_CONTROL_IDS = Array.from({ length: 25 }, (_, index) => `CS-${String(index + 1).padStart(2, "0")}`);
 const EXPECTED_TOOLS = [
@@ -482,6 +484,40 @@ test("resolveCrowdstrikeConfiguration prefers explicit args over environment and
   assert.equal(fromArgs.memberCid, "arg-cid");
   assert.equal(fromArgs.timeoutMs, 9000);
   assert.ok(fromArgs.sourceChain.includes("arguments-client-id"));
+});
+
+test("addendum 6b: the JSON config loader reports read and parse failures with fixed text and never quotes the file, JSON.parse, or the fs error", async () => {
+  const home = createTempBase("grclanker-cs-home-loader-");
+  const cases = configLoaderCases({ format: "json", displayName: "CrowdStrike", fileNoun: "config file", extension: ".json" });
+  assert.deepEqual(cases.map((item) => item.name), [
+    "json unquoted value",
+    "json short source",
+    "json trailing comma with position",
+    "EISDIR",
+    "EACCES",
+    "ENOENT on an explicit path",
+  ]);
+  const registered = [];
+  registerCrowdstrikeTools({ registerTool: (tool) => registered.push(tool) });
+  const checkAccess = registered.find((tool) => tool.name === "crowdstrike_check_access");
+  await assertConfigLoaderMatrix(cases, {
+    resolve: (path) => resolveCrowdstrikeConfiguration({ config_file: path }, {}, home),
+    checkAccess: (path) => checkAccess.execute("call-config", checkAccess.prepareArguments({ config_file: path })),
+  });
+  // The same defect at the default location (~/.crowdstrike/config.json) is a parse failure too.
+  mkdirSync(join(home, ".crowdstrike"), { recursive: true });
+  const defaultPath = join(home, ".crowdstrike", "config.json");
+  writeFileSync(defaultPath, "{\n  \"client_secret\": KVRPWLXTHBQNZMY\n}\n");
+  assert.throws(() => resolveCrowdstrikeConfiguration({}, {}, home), (error) => {
+    assert.equal(error.message, `Unable to parse CrowdStrike config file: invalid JSON in ${defaultPath}`);
+    assert.equal(error.code, "INVALID_JSON");
+    return true;
+  });
+  // The env-pointed path is explicit as well: a missing file is a read error, not a silent skip.
+  assert.throws(() => resolveCrowdstrikeConfiguration({}, { CS_CONFIG_FILE: join(home, "absent.json") }, home), (error) => {
+    assert.equal(error.message, `Unable to read CrowdStrike config file ${join(home, "absent.json")} (ENOENT)`);
+    return true;
+  });
 });
 
 test("resolveCrowdstrikeConfiguration defaults to us-1, accepts FalconPy env names, and rejects bad input", () => {

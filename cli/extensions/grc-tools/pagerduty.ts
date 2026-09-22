@@ -63,6 +63,10 @@ const AUTHORIZATION_VALUE_PATTERN = /\b(bearer|basic|digest|negotiate|ntlm)\s+([
 // Also covers PagerDuty's REST API key scheme, `Authorization: Token token=<key>`.
 const SECRET_ASSIGNMENT_PATTERN = /\b([\w-]*(?:session|token|secret|password|passwd|pwd|api[_-]?key|apikey|credential|assertion|signature|sid|jsessionid)[\w-]*=)([^\s"'&;,<>]+)/gi;
 const SECRET_FIELD_PATTERN = /(?<![\w/.-])((?:api[\s_-]?key|x-api-key|access[_-]?token|refresh[_-]?token|id[_-]?token|auth[_-]?token|session[_-]?token|bearer[_-]?token|token|client[_-]?secret|secret|password|passwd|pwd|authorization|set-cookie|cookie|session[_-]?id|jsessionid|sid|assertion|signature|credential)["']?\s*:\s*["']?)([^\s"'&;,<>]+)/gi;
+// Node fs error codes (ENOENT, EACCES, EISDIR); anything else on error.code is not echoed.
+const FS_ERROR_CODE_PATTERN = /^E[A-Z0-9_]{1,30}$/;
+// The only part of a JSON.parse message that is taken; the rest quotes the source.
+const JSON_POSITION_PATTERN = /at position (\d+)/;
 const SERVICE_SNAPSHOT_FIELDS = [
   "id",
   "type",
@@ -904,13 +908,54 @@ async function countFilesRecursively(rootDir: string): Promise<number> {
   return total;
 }
 
-function readConfigFile(pathname: string | undefined): JsonRecord {
-  if (!pathname || !existsSync(pathname)) return {};
-  try {
-    return asObject(JSON.parse(readFileSync(pathname, "utf8"))) ?? {};
-  } catch (error) {
-    throw new Error(`Unable to parse PagerDuty config file ${pathname}: ${errorMessage(error)}`);
+/**
+ * Thrown by the config loader. The message is fixed text carrying only the path, the fs error code,
+ * and the line: neither Node's fs message (which quotes its own wording and path) nor V8's
+ * JSON.parse message (which quotes a window of the source, or the whole source when it is short)
+ * is ever interpolated.
+ */
+export class PagerdutyConfigFileError extends Error {
+  readonly code: string;
+
+  constructor(message: string, code: string) {
+    super(message);
+    this.name = "PagerdutyConfigFileError";
+    this.code = code;
   }
+}
+
+/** Read step of the config loader: any failure becomes fixed text with the validated fs code. */
+function readConfigFileText(pathname: string): string {
+  try {
+    return readFileSync(pathname, "utf8");
+  } catch (error) {
+    const rawCode = (error as { code?: unknown } | null)?.code;
+    const code = typeof rawCode === "string" && FS_ERROR_CODE_PATTERN.test(rawCode) ? rawCode : undefined;
+    throw new PagerdutyConfigFileError(`Unable to read PagerDuty config file ${pathname}${code ? ` (${code})` : ""}`, code ?? "EUNKNOWN");
+  }
+}
+
+/**
+ * Parse step of the config loader: every thrown value is caught and only a position taken through
+ * the strict `at position N` pattern is kept, converted to the line it falls on.
+ */
+function parseConfigFileJson(pathname: string, text: string): unknown {
+  try {
+    return JSON.parse(text) as unknown;
+  } catch (error) {
+    const position = error instanceof Error ? JSON_POSITION_PATTERN.exec(error.message) : null;
+    const line = position ? text.slice(0, Number(position[1])).split("\n").length : undefined;
+    throw new PagerdutyConfigFileError(`Unable to parse PagerDuty config file: invalid JSON in ${pathname}${line ? ` at line ${line}` : ""}`, "INVALID_JSON");
+  }
+}
+
+/**
+ * Loads the config file. The default location is skipped when absent; an explicit path that cannot
+ * be read fails with the fixed-text read error (ENOENT included).
+ */
+function readConfigFile(pathname: string, explicit: boolean): JsonRecord {
+  if (!explicit && !existsSync(pathname)) return {};
+  return asObject(parseConfigFileJson(pathname, readConfigFileText(pathname))) ?? {};
 }
 
 function normalizeRegion(value: string | undefined): PagerdutyRegion | undefined {
@@ -941,10 +986,9 @@ export function resolvePagerdutyConfiguration(
   input: JsonRecord = {},
   env: NodeJS.ProcessEnv = process.env,
 ): PagerdutyResolvedConfig {
-  const configPath = asString(input.config_file)
-    ?? asString(env.PAGERDUTY_CONFIG_FILE)
-    ?? join(homedir(), DEFAULT_CONFIG_FILE);
-  const file = readConfigFile(configPath);
+  const explicitConfigPath = asString(input.config_file) ?? asString(env.PAGERDUTY_CONFIG_FILE);
+  const configPath = explicitConfigPath ?? join(homedir(), DEFAULT_CONFIG_FILE);
+  const file = readConfigFile(configPath, explicitConfigPath !== undefined);
   const sourceChain: string[] = [];
 
   const pick = (argKeys: string[], envKeys: string[], fileKeys: string[], label: string): string | undefined => {

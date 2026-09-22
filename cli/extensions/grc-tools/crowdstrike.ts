@@ -153,6 +153,10 @@ const JWT_PATTERN = /\beyJ[A-Za-z0-9_-]{4,}\.[A-Za-z0-9_-]{4,}\.[A-Za-z0-9_-]*/g
 const AUTHORIZATION_VALUE_PATTERN = /\b(bearer|basic|digest|negotiate|ntlm)\s+([A-Za-z0-9\-._~+/!]{8,}=*)/gi;
 const SECRET_ASSIGNMENT_PATTERN = /\b([\w-]*(?:session|token|secret|password|passwd|pwd|api[_-]?key|apikey|credential|assertion|signature|sid|jsessionid)[\w-]*=)([^\s"'&;,<>]+)/gi;
 const SECRET_FIELD_PATTERN = /(?<![\w/.-])((?:api[\s_-]?key|x-api-key|access[_-]?token|refresh[_-]?token|id[_-]?token|auth[_-]?token|session[_-]?token|bearer[_-]?token|token|client[_-]?secret|secret|password|passwd|pwd|authorization|set-cookie|cookie|session[_-]?id|jsessionid|sid|assertion|signature|credential)["']?\s*:\s*["']?)([^\s"'&;,<>]+)/gi;
+// Node fs error codes (ENOENT, EACCES, EISDIR); anything else on error.code is not echoed.
+const FS_ERROR_CODE_PATTERN = /^E[A-Z0-9_]{1,30}$/;
+// The only part of a JSON.parse message that is taken; the rest quotes the source.
+const JSON_POSITION_PATTERN = /at position (\d+)/;
 // Command-line shapes (IOA exclusion cl_regex values are command-line regexes): `--token VALUE`, `-password VALUE`.
 const CLI_SECRET_FLAG_PATTERN = /(--?(?:token|password|passwd|pwd|secret|api[_-]?key|apikey|access[_-]?key|client[_-]?secret|credential|auth|bearer)\s+)([^\s"'&;,<>-][^\s"'&;,<>]*)/gi;
 // Exclusion fields that carry free text authored by operators (command-line and image regexes, paths, notes).
@@ -847,12 +851,56 @@ function withUnreadableSecondary(item: CrowdstrikeFinding, dataset: string, erro
   };
 }
 
-function readJsonConfigFile(location: string): JsonRecord | undefined {
-  if (!existsSync(location)) return undefined;
-  const raw = readFileSync(location, "utf8");
-  const parsed = asObject(JSON.parse(raw) as unknown);
+/**
+ * Thrown by the config loader. The message is fixed text carrying only the path, the fs error code,
+ * and the line: neither Node's fs message (which quotes its own wording and path) nor V8's
+ * JSON.parse message (which quotes a window of the source, or the whole source when it is short)
+ * is ever interpolated.
+ */
+export class CrowdstrikeConfigFileError extends Error {
+  readonly code: string;
+
+  constructor(message: string, code: string) {
+    super(message);
+    this.name = "CrowdstrikeConfigFileError";
+    this.code = code;
+  }
+}
+
+/** Read step of the config loader: any failure becomes fixed text with the validated fs code. */
+function readConfigFileText(location: string): string {
+  try {
+    return readFileSync(location, "utf8");
+  } catch (error) {
+    const rawCode = (error as { code?: unknown } | null)?.code;
+    const code = typeof rawCode === "string" && FS_ERROR_CODE_PATTERN.test(rawCode) ? rawCode : undefined;
+    throw new CrowdstrikeConfigFileError(`Unable to read CrowdStrike config file ${location}${code ? ` (${code})` : ""}`, code ?? "EUNKNOWN");
+  }
+}
+
+/**
+ * Parse step of the config loader: every thrown value is caught and only a position taken through
+ * the strict `at position N` pattern is kept, converted to the line it falls on.
+ */
+function parseConfigFileJson(location: string, text: string): unknown {
+  try {
+    return JSON.parse(text) as unknown;
+  } catch (error) {
+    const position = error instanceof Error ? JSON_POSITION_PATTERN.exec(error.message) : null;
+    const line = position ? text.slice(0, Number(position[1])).split("\n").length : undefined;
+    throw new CrowdstrikeConfigFileError(`Unable to parse CrowdStrike config file: invalid JSON in ${location}${line ? ` at line ${line}` : ""}`, "INVALID_JSON");
+  }
+}
+
+/**
+ * Loads the config file. The default location is skipped when absent; an explicit path that cannot
+ * be read fails with the fixed-text read error (ENOENT included).
+ */
+function readJsonConfigFile(location: string, explicit = false): JsonRecord | undefined {
+  if (!explicit && !existsSync(location)) return undefined;
+  const parsed = asObject(parseConfigFileJson(location, readConfigFileText(location)));
   if (!parsed) {
-    throw new Error(`CrowdStrike config file ${location} must contain a JSON object.`);
+    throw new CrowdstrikeConfigFileError(`Unable to parse CrowdStrike config file: ${location} must contain a JSON object`, "INVALID_JSON");
   }
   return parsed;
 }
@@ -872,10 +920,9 @@ export function resolveCrowdstrikeConfiguration(
   homeDir: string = homedir(),
 ): CrowdstrikeResolvedConfig {
   const sourceChain: string[] = [];
-  const configPath = asString(input.config_file)
-    ?? asString(env.CS_CONFIG_FILE)
-    ?? join(homeDir, ".crowdstrike", "config.json");
-  const fileConfig = readJsonConfigFile(configPath);
+  const explicitConfigPath = asString(input.config_file) ?? asString(env.CS_CONFIG_FILE);
+  const configPath = explicitConfigPath ?? join(homeDir, ".crowdstrike", "config.json");
+  const fileConfig = readJsonConfigFile(configPath, explicitConfigPath !== undefined);
   if (fileConfig) {
     sourceChain.push(`config:${configPath}`);
   }

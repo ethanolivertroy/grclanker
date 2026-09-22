@@ -25,11 +25,13 @@ import {
   projectAclRow,
   projectRows,
   redactSecrets,
+  registerServicenowTools,
   resolveSecureOutputPath,
   resolveServicenowConfiguration,
 } from "../dist/extensions/grc-tools/servicenow.js";
 import { getRegisteredToolSummaries } from "../dist/pi/tool-catalog.js";
 import { assertSecretsAbsent, readBundleFiles, readZipEntries } from "./helpers/bundle-contents.mjs";
+import { assertConfigLoaderMatrix, configLoaderCases } from "./helpers/config-loader-matrix.mjs";
 
 const FIXED_NOW = new Date("2026-09-21T00:00:00Z");
 const RECENT_LOGIN = "2026-09-20 08:15:00";
@@ -458,9 +460,34 @@ test("resolveServicenowConfiguration rejects missing credentials, missing config
   const scratch = { cwd: createTempBase("servicenow-empty-"), homeDir: createTempBase("servicenow-home-") };
   assert.throws(() => resolveServicenowConfiguration({ instance: "acme" }, {}, scratch), /credentials are required/);
   assert.throws(() => resolveServicenowConfiguration({}, { SERVICENOW_USERNAME: "u", SERVICENOW_PASSWORD: "p" }, scratch), /SERVICENOW_URL or SERVICENOW_INSTANCE/);
-  assert.throws(() => resolveServicenowConfiguration({ instance: "acme", config_file: join(scratch.cwd, "missing.yaml") }, {}, scratch), /config file was not found/);
+  assert.throws(() => resolveServicenowConfiguration({ instance: "acme", config_file: join(scratch.cwd, "missing.yaml") }, {}, scratch), (error) => {
+    assert.equal(error.message, `Unable to read ServiceNow config file ${join(scratch.cwd, "missing.yaml")} (ENOENT)`);
+    assert.equal(error.code, "ENOENT");
+    return true;
+  });
   assert.throws(() => resolveServicenowConfiguration({ instance: "acme", auth_method: "mtls" }, {}, scratch), /mutual TLS/);
   assert.throws(() => resolveServicenowConfiguration({ instance: "acme", auth_method: "basic", username: "u" }, {}, scratch), /basic auth requires/);
+});
+
+test("addendum 6b: the YAML config loader reports read and parse failures with fixed text and never quotes the file, the yaml package, or the fs error", async () => {
+  const scratch = { cwd: createTempBase("servicenow-loader-cwd-"), homeDir: createTempBase("servicenow-loader-home-") };
+  const cases = configLoaderCases({ format: "yaml", displayName: "ServiceNow", fileNoun: "config file", extension: ".yaml" });
+  assert.deepEqual(cases.map((item) => item.name), ["yaml nested mapping", "yaml unresolved alias", "EISDIR", "EACCES", "ENOENT on an explicit path"]);
+  const registered = [];
+  registerServicenowTools({ registerTool: (tool) => registered.push(tool) });
+  const checkAccess = registered.find((tool) => tool.name === "servicenow_check_access");
+  await assertConfigLoaderMatrix(cases, {
+    resolve: (path) => resolveServicenowConfiguration({ instance: "acme", config_file: path }, {}, scratch),
+    checkAccess: (path) => checkAccess.execute("call-config", checkAccess.prepareArguments({ instance: "acme", config_file: path })),
+  });
+  // The same file at the default location is a parse failure too, not a silent skip.
+  const defaultPath = join(scratch.cwd, ".servicenow.yaml");
+  writeFileSync(defaultPath, "servicenow:\n  token: *QWJHXVZPKMTRYU1\n");
+  assert.throws(() => resolveServicenowConfiguration({ instance: "acme" }, {}, scratch), (error) => {
+    assert.equal(error.message, `Unable to parse ServiceNow config file: invalid YAML in ${defaultPath}`);
+    assert.equal(error.code, "INVALID_YAML");
+    return true;
+  });
 });
 
 test("ServicenowApiClient shapes Table API queries with basic auth and follows Link pagination to completion", async () => {
@@ -1427,7 +1454,7 @@ test("ServicenowApiClient describes non-JSON error bodies by shape and logs only
   const gatewayFetch = async () => new Response(gatewayPage, { status: 502, statusText: "Bad Gateway", headers: { "content-type": "text/html" } });
   const snapshot = await createClient(gatewayFetch, { maxRetries: 0 }).queryTable("sys_user", { query: "active=true", fields: ["sys_id"] });
   assert.equal(snapshot.statusCode, 502);
-  assert.match(snapshot.error, /502 Bad Gateway\) for \/api\/now\/table\/sys_user: non-JSON response body \(text\/html, \d+ bytes\)$/);
+  assert.match(snapshot.error, /502 Bad Gateway\) for \/api\/now\/table\/sys_user: non-JSON body \(text\/html, \d+ bytes\)$/);
   assert.equal(snapshot.error.includes("FAKE_SECRET_TOKEN_1"), false);
   assert.equal(snapshot.error.includes("<html>"), false);
 
@@ -1437,7 +1464,7 @@ test("ServicenowApiClient describes non-JSON error bodies by shape and logs only
   };
   const oauth = createClient(tokenFetch, { authMode: "oauth", username: undefined, password: undefined, clientId: "client-id", clientSecret: "client-secret" });
   const tokenFailure = await oauth.queryTable("sys_user", { fields: ["sys_id"] });
-  assert.match(tokenFailure.error, /OAuth token request failed \(502 Bad Gateway\): non-JSON response body \(text\/html, \d+ bytes\)$/);
+  assert.match(tokenFailure.error, /OAuth token request failed \(502 Bad Gateway\) for \/oauth_token\.do: non-JSON body \(text\/html, \d+ bytes\)$/);
   assert.equal(tokenFailure.error.includes("FAKE_SECRET_TOKEN_1"), false);
 
   const hangingFetch = (input, init) => new Promise((_, reject) => {

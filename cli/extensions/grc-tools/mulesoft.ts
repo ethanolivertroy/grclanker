@@ -130,6 +130,8 @@ const SECRET_KEY_PATTERN = /secret|password|passwd|token|privatekey|authorizatio
 // Keys whose string values are URLs (alert webhookUrl, callback and redirect targets); the exported value keeps scheme and host only
 // because tokens travel in the path and query of such targets.
 const URL_KEY_PATTERN = /(url|uri)s?$/;
+// Node fs error codes (ENOENT, EACCES, EISDIR); anything else on error.code is not echoed.
+const FS_ERROR_CODE_PATTERN = /^E[A-Z0-9_]{1,30}$/;
 const REDACTED = "[REDACTED]";
 const MIN_REMEMBERED_SECRET_LENGTH = 4;
 const KNOWN_SECRETS = new Set<string>();
@@ -844,13 +846,48 @@ function configFileValue(values: Record<string, unknown> | undefined, keys: stri
   return undefined;
 }
 
-function loadConfigFile(path: string): Record<string, unknown> | undefined {
-  if (!existsSync(path)) return undefined;
-  try {
-    return parseSimpleToml(readFileSync(path, "utf8"));
-  } catch (error) {
-    throw new Error(`Unable to read MuleSoft config file ${path}: ${errorMessage(error)}`);
+/**
+ * Thrown by the config loader. The message is fixed text carrying only the path and the fs error
+ * code: Node's fs message (which quotes its own wording and path) is never interpolated, and the
+ * TOML parser's output is never quoted either, because the file holds the client secret.
+ */
+export class MulesoftConfigFileError extends Error {
+  readonly code: string;
+
+  constructor(message: string, code: string) {
+    super(message);
+    this.name = "MulesoftConfigFileError";
+    this.code = code;
   }
+}
+
+/** Read step of the config loader: any failure becomes fixed text with the validated fs code. */
+function readConfigFileText(path: string): string {
+  try {
+    return readFileSync(path, "utf8");
+  } catch (error) {
+    const rawCode = (error as { code?: unknown } | null)?.code;
+    const code = typeof rawCode === "string" && FS_ERROR_CODE_PATTERN.test(rawCode) ? rawCode : undefined;
+    throw new MulesoftConfigFileError(`Unable to read MuleSoft config file ${path}${code ? ` (${code})` : ""}`, code ?? "EUNKNOWN");
+  }
+}
+
+/** Parse step of the config loader: every thrown value is caught and replaced with fixed text. */
+function parseConfigFileToml(path: string, text: string): Record<string, unknown> {
+  try {
+    return parseSimpleToml(text);
+  } catch {
+    throw new MulesoftConfigFileError(`Unable to parse MuleSoft config file: invalid TOML in ${path}`, "INVALID_TOML");
+  }
+}
+
+/**
+ * Loads the config file. The default location is skipped when absent; an explicit path that cannot
+ * be read fails with the fixed-text read error (ENOENT included).
+ */
+function loadConfigFile(path: string, explicit: boolean): Record<string, unknown> | undefined {
+  if (!explicit && !existsSync(path)) return undefined;
+  return parseConfigFileToml(path, readConfigFileText(path));
 }
 
 type ConfigSource = "arguments" | "environment" | "config";
@@ -912,11 +949,11 @@ export function resolveMulesoftConfiguration(
 ): MulesoftResolvedConfig {
   const sourceChain: string[] = [];
   const homeDir = options.homeDir ?? homedir();
-  const configPath = asString(input.config_file)
+  const explicitConfigPath = asString(input.config_file)
     ?? asString(env.MULESOFT_SEC_INSPECTOR_CONFIG)
-    ?? asString(env.ANYPOINT_CONFIG_FILE)
-    ?? join(homeDir, ...DEFAULT_CONFIG_FILE_SEGMENTS);
-  const fileValues = loadConfigFile(configPath);
+    ?? asString(env.ANYPOINT_CONFIG_FILE);
+  const configPath = explicitConfigPath ?? join(homeDir, ...DEFAULT_CONFIG_FILE_SEGMENTS);
+  const fileValues = loadConfigFile(configPath, explicitConfigPath !== undefined);
   if (fileValues) sourceChain.push(`config:${configPath}`);
 
   const record = (resolved: ResolvedValue, label: string): string | undefined => {

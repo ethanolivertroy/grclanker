@@ -24,11 +24,13 @@ import {
   projectMyDomainSettings,
   projectProfileMetadata,
   projectSecuritySettings,
+  registerSalesforceTools,
   resolveSalesforceConfiguration,
   resolveSecureOutputPath,
 } from "../dist/extensions/grc-tools/salesforce.js";
 import { getRegisteredToolSummaries } from "../dist/pi/tool-catalog.js";
 import { assertSecretsAbsent, readBundleFiles, readZipEntries } from "./helpers/bundle-contents.mjs";
+import { assertConfigLoaderMatrix, configLoaderCases } from "./helpers/config-loader-matrix.mjs";
 
 const { privateKey: TEST_PRIVATE_KEY, publicKey: TEST_PUBLIC_KEY } = generateKeyPairSync("rsa", {
   modulusLength: 2048,
@@ -356,6 +358,44 @@ test("resolveSalesforceConfiguration prefers explicit args over env and env over
   assert.equal(fromArgs.timeoutMs, 9000);
   assert.ok(fromArgs.sourceChain.includes("arguments-username"));
   assert.ok(fromArgs.sourceChain.includes("login-host-explicit"));
+});
+
+test("addendum 6b: the JSON credentials loader reports read and parse failures with fixed text and never quotes the file, JSON.parse, or the fs error", async () => {
+  const cases = configLoaderCases({ format: "json", displayName: "Salesforce", fileNoun: "credentials file", extension: ".json" });
+  assert.deepEqual(cases.map((item) => item.name), [
+    "json unquoted value",
+    "json short source",
+    "json trailing comma with position",
+    "EISDIR",
+    "EACCES",
+    "ENOENT on an explicit path",
+  ]);
+  const registered = [];
+  registerSalesforceTools({ registerTool: (tool) => registered.push(tool) });
+  const checkAccess = registered.find((tool) => tool.name === "salesforce_check_access");
+  await assertConfigLoaderMatrix(cases, {
+    resolve: (path) => resolveSalesforceConfiguration({ credentials_file: path }, {}),
+    checkAccess: (path) => checkAccess.execute("call-config", checkAccess.prepareArguments({ credentials_file: path })),
+  });
+  // The env-pointed path takes the same guard.
+  const [unquoted] = cases;
+  assert.throws(() => resolveSalesforceConfiguration({}, { SF_CREDENTIALS_FILE: unquoted.path }), (error) => {
+    assert.equal(error.message, unquoted.expectedMessage);
+    assert.equal(error.code, "INVALID_JSON");
+    return true;
+  });
+  // The private key file read carries the same fixed-text read error.
+  const keyDirectory = createTempBase("grclanker-sf-key-dir-");
+  assert.throws(() => resolveSalesforceConfiguration({
+    grant_type: "jwt-bearer",
+    consumer_key: "consumer-key",
+    username: "user@acme.example",
+    private_key_file: keyDirectory,
+  }, {}), (error) => {
+    assert.equal(error.message, `Unable to read Salesforce private key file ${keyDirectory} (EISDIR)`);
+    assert.equal(error.code, "EISDIR");
+    return true;
+  });
 });
 
 test("resolveSalesforceConfiguration selects JWT bearer, sandbox flag, access token, and rejects incomplete credentials", () => {

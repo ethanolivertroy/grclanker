@@ -19,7 +19,7 @@ import { homedir } from "node:os";
 import { basename, dirname, join, relative, resolve } from "node:path";
 import { ZipArchive } from "archiver";
 import { Type } from "@sinclair/typebox";
-import { parse as parseYaml } from "yaml";
+import { YAMLError, parse as parseYaml } from "yaml";
 import { errorResult, formatTable, textResult } from "./shared.js";
 
 type FetchImpl = typeof fetch;
@@ -28,6 +28,19 @@ type JsonRecord = Record<string, unknown>;
 const DEFAULT_OUTPUT_DIR = "./export/servicenow";
 const DEFAULT_CONFIG_DIR = ".servicenow-sec-inspector";
 const DEFAULT_CONFIG_FILE = "config.yaml";
+const REDACTED = "[REDACTED]";
+// ServiceNow passwords, OAuth client secrets, and bearer tokens are long; a shorter minimum would
+// remember common words and redact them out of ordinary error text.
+const MIN_REMEMBERED_SECRET_LENGTH = 8;
+/** Every credential literal a client in this process was configured with or obtained from oauth_token.do. */
+const KNOWN_SECRETS = new Set<string>();
+const URL_IN_TEXT_PATTERN = /\b(https?:\/\/)(?:([^\s/?#@"'<>]+)@)?([^\s/?#"'<>]+)([^\s?#"'<>]*)(\?[^\s#"'<>]*)?(#[^\s"'<>]*)?/gi;
+const JWT_PATTERN = /\beyJ[A-Za-z0-9_-]{4,}\.[A-Za-z0-9_-]{4,}\.[A-Za-z0-9_-]*/g;
+const AUTHORIZATION_VALUE_PATTERN = /\b(bearer|basic|digest|negotiate|ntlm)\s+([A-Za-z0-9\-._~+/!]{8,}=*)/gi;
+const SECRET_ASSIGNMENT_PATTERN = /\b([\w-]*(?:session|token|secret|password|passwd|pwd|api[_-]?key|apikey|credential|assertion|signature|sid|jsessionid)[\w-]*=)([^\s"'&;,<>]+)/gi;
+const SECRET_FIELD_PATTERN = /(?<![\w/.-])((?:api[\s_-]?key|x-api-key|access[_-]?token|refresh[_-]?token|id[_-]?token|auth[_-]?token|session[_-]?token|bearer[_-]?token|token|client[_-]?secret|secret|password|passwd|pwd|authorization|set-cookie|cookie|session[_-]?id|jsessionid|sid|assertion|signature|credential)["']?\s*:\s*["']?)([^\s"'&;,<>]+)/gi;
+// Node fs error codes (ENOENT, EACCES, EISDIR); anything else on error.code is not echoed.
+const FS_ERROR_CODE_PATTERN = /^E[A-Z0-9_]{1,30}$/;
 const DEFAULT_TIMEOUT_MS = 30_000;
 const DEFAULT_MAX_RETRIES = 3;
 const DEFAULT_PAGE_SIZE = 500;
@@ -442,8 +455,80 @@ function describeStatus(response: Response): string {
   return response.statusText ? `${response.status} ${response.statusText}` : String(response.status);
 }
 
+/**
+ * The single point where a thrown error becomes a recorded string (table and count snapshot errors,
+ * access-check surfaces, errors arrays, _errors.log, tool error results). It re-applies the redaction
+ * pass so a message built outside ServicenowApiError (a transport error, a timeout, a token response
+ * without access_token) cannot bypass it.
+ */
 function errorMessage(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
+  return scrubSecretText(error instanceof Error ? error.message : String(error));
+}
+
+/**
+ * The unanchored redaction pass applied to every error string (once in ServicenowApiError, again at
+ * errorMessage): every secret any client in this process has seen, then credential shapes (URL
+ * userinfo, query strings, and fragments anywhere in the text, JWT-shaped strings, Authorization
+ * scheme values, and credential-named assignments and fields).
+ */
+function scrubSecretText(text: string, secrets: Iterable<string | undefined> = []): string {
+  let scrubbed = text;
+  for (const secret of [...secrets, ...KNOWN_SECRETS]) {
+    if (secret && secret.length >= MIN_REMEMBERED_SECRET_LENGTH) scrubbed = scrubbed.split(secret).join(REDACTED);
+  }
+  return scrubbed
+    .replace(URL_IN_TEXT_PATTERN, (_match, scheme: string, userinfo: string | undefined, host: string, path: string, query?: string, fragment?: string) =>
+      `${scheme}${userinfo ? `${REDACTED}@` : ""}${host}${path}${query ? `?${REDACTED}` : ""}${fragment ? `#${REDACTED}` : ""}`)
+    .replace(JWT_PATTERN, REDACTED)
+    .replace(AUTHORIZATION_VALUE_PATTERN, (match: string, scheme: string, value: string) => (/^[a-z]+$/.test(value) ? match : `${scheme} ${REDACTED}`))
+    .replace(SECRET_ASSIGNMENT_PATTERN, (_match, assignment: string) => `${assignment}${REDACTED}`)
+    .replace(SECRET_FIELD_PATTERN, (_match, field: string) => `${field}${REDACTED}`);
+}
+
+function rememberSecrets(...values: Array<string | undefined>): void {
+  for (const value of values) {
+    if (value && value.length >= MIN_REMEMBERED_SECRET_LENGTH) KNOWN_SECRETS.add(value);
+  }
+}
+
+/**
+ * Thrown by the config loader. The message is fixed text carrying only the path, the fs error code,
+ * and the line: neither Node's fs message (which quotes its own wording and path) nor the yaml
+ * parser's message (which quotes the offending source line, or for an unresolved alias starts with
+ * the alias value) is ever interpolated.
+ */
+export class ServicenowConfigFileError extends Error {
+  readonly code: string;
+
+  constructor(message: string, code: string) {
+    super(message);
+    this.name = "ServicenowConfigFileError";
+    this.code = code;
+  }
+}
+
+/** Read step of the config loader: any failure becomes fixed text with the validated fs code. */
+function readConfigFileText(pathname: string): string {
+  try {
+    return readFileSync(pathname, "utf8");
+  } catch (error) {
+    const rawCode = (error as { code?: unknown } | null)?.code;
+    const code = typeof rawCode === "string" && FS_ERROR_CODE_PATTERN.test(rawCode) ? rawCode : undefined;
+    throw new ServicenowConfigFileError(`Unable to read ServiceNow config file ${pathname}${code ? ` (${code})` : ""}`, code ?? "EUNKNOWN");
+  }
+}
+
+/**
+ * Parse step of the config loader: every thrown value is caught (the yaml package throws a plain
+ * ReferenceError, not a YAMLError, for an unresolved alias) and only a YAMLError's line is kept.
+ */
+function parseConfigFileYaml(pathname: string, text: string): unknown {
+  try {
+    return parseYaml(text);
+  } catch (error) {
+    const line = error instanceof YAMLError ? error.linePos?.[0]?.line : undefined;
+    throw new ServicenowConfigFileError(`Unable to parse ServiceNow config file: invalid YAML in ${pathname}${line ? ` at line ${line}` : ""}`, "INVALID_YAML");
+  }
 }
 
 function truncateList<T>(items: T[], max = 25): T[] {
@@ -613,9 +698,13 @@ function applyOverlay(base: ConfigOverlay, overlay: ConfigOverlay, source: strin
   return merged;
 }
 
-function readYamlConfigFile(pathname: string): ConfigOverlay | undefined {
-  if (!existsSync(pathname)) return undefined;
-  const parsed = parseYaml(readFileSync(pathname, "utf8"));
+/**
+ * Loads one candidate config file. A default candidate that does not exist is skipped; an explicit
+ * path that cannot be read fails with the fixed-text read error (ENOENT included).
+ */
+function readYamlConfigFile(pathname: string, explicit = false): ConfigOverlay | undefined {
+  if (!explicit && !existsSync(pathname)) return undefined;
+  const parsed = parseConfigFileYaml(pathname, readConfigFileText(pathname));
   const record = asObject(parsed);
   if (!record) return undefined;
   const section = asObject(record.servicenow);
@@ -648,13 +737,13 @@ export function resolveServicenowConfiguration(
 
   let overlay: ConfigOverlay = {};
   for (const candidate of configCandidates) {
-    const fileOverlay = readYamlConfigFile(candidate);
+    const fileOverlay = readYamlConfigFile(candidate, Boolean(explicitConfigPath));
     if (fileOverlay) {
       overlay = applyOverlay(overlay, fileOverlay, `config-file:${candidate}`, sourceChain);
       break;
     }
     if (explicitConfigPath) {
-      throw new Error(`ServiceNow config file was not found: ${candidate}`);
+      throw new ServicenowConfigFileError(`Unable to parse ServiceNow config file: ${candidate} must contain a YAML mapping`, "INVALID_YAML");
     }
   }
   overlay = applyOverlay(overlay, overlayFromEnv(env), "environment", sourceChain);
@@ -717,27 +806,39 @@ export function resolveServicenowConfiguration(
   };
 }
 
+/** The client's own credentials (including short ones) removed first, then the shared redaction pass. */
 export function redactSecrets(message: string, secrets: Array<string | undefined>): string {
   let redacted = message;
   for (const secret of secrets) {
     if (!secret || secret.length < 4) continue;
-    redacted = redacted.split(secret).join("[REDACTED]");
+    redacted = redacted.split(secret).join(REDACTED);
   }
-  return redacted;
+  return scrubSecretText(redacted);
 }
 
+/**
+ * The one error class the client throws for HTTP failures. The message is built from the status,
+ * the request path, and either ServiceNow's documented error fields or a status-and-length note for
+ * any other body; the constructor runs the redaction pass over the message and the detail
+ * regardless of how they were built.
+ */
 export class ServicenowApiError extends Error {
   readonly status: number;
   readonly detail?: string;
 
   constructor(message: string, status: number, detail?: string) {
-    super(message);
+    super(scrubSecretText(message));
     this.name = "ServicenowApiError";
     this.status = status;
-    this.detail = detail;
+    this.detail = detail === undefined ? undefined : scrubSecretText(detail);
   }
 }
 
+/**
+ * ServiceNow's documented error fields (`error.message`, `error.detail`, `status` on Table and
+ * Aggregate API errors; `error` and `error_description` on oauth_token.do); nothing else in a body
+ * is echoed.
+ */
 function servicenowErrorDetail(payload: JsonRecord): string | undefined {
   const error = asObject(payload.error);
   return [asString(error?.message), asString(error?.detail), asString(payload.error_description), asString(payload.status)]
@@ -759,12 +860,27 @@ export function parseLinkNext(header: string | null | undefined): string | undef
 }
 
 /**
- * Error strings land in access_check.json, analysis errors, and _errors.log,
- * so a non-JSON body (proxy or gateway error page that may echo request
- * headers) is described by shape only and never quoted.
+ * Error strings land in access_check.json, analysis errors, and _errors.log, so an error body that
+ * is not JSON (a proxy or gateway page that may echo request headers, whatever its content type
+ * claims), or JSON without ServiceNow's documented error fields, is described by status, content
+ * type, and byte length only and never quoted.
  */
-function describeNonJsonBody(response: Response, rawText: string): string {
-  return `non-JSON response body (${response.headers.get("content-type") ?? "unknown content type"}, ${rawText.length} bytes)`;
+function describeOpaqueBody(response: Response, rawText: string, parsedJson: boolean): string {
+  const contentType = response.headers.get("content-type")?.split(";")[0]?.trim() || "unknown content type";
+  const bytes = Buffer.byteLength(rawText, "utf8");
+  return parsedJson
+    ? `JSON body without documented error fields (${contentType}, ${bytes} bytes)`
+    : `non-JSON body (${contentType}, ${bytes} bytes)`;
+}
+
+/** Parses a response body as a JSON object; undefined when it is not JSON, so the body is never echoed. */
+function parseJsonBody(rawText: string): JsonRecord | undefined {
+  if (rawText.length === 0) return undefined;
+  try {
+    return asObject(JSON.parse(rawText));
+  } catch {
+    return undefined;
+  }
 }
 
 function requestPathname(url: string): string {
@@ -827,6 +943,7 @@ export class ServicenowApiClient implements ServicenowReadClient {
       this.accessToken = config.accessToken;
       this.accessTokenExpiresAt = Number.MAX_SAFE_INTEGER;
     }
+    rememberSecrets(config.password, config.clientSecret, config.accessToken);
   }
 
   getResolvedConfig(): ServicenowResolvedConfig {
@@ -927,28 +1044,25 @@ export class ServicenowApiClient implements ServicenowReadClient {
       body: body.toString(),
     });
     const rawText = await response.text();
-    let payload: JsonRecord = {};
-    try {
-      payload = asObject(JSON.parse(rawText)) ?? {};
-    } catch {
-      payload = { raw: describeNonJsonBody(response, rawText) };
-    }
+    const parsed = parseJsonBody(rawText);
+    const payload: JsonRecord = parsed ?? {};
     if (!response.ok) {
-      const detail = servicenowErrorDetail(payload) ?? asString(payload.error) ?? asString(payload.raw);
+      const detail = servicenowErrorDetail(payload) ?? asString(payload.error) ?? (rawText.length > 0 ? describeOpaqueBody(response, rawText, parsed !== undefined) : undefined);
       throw new ServicenowApiError(
-        this.redact(`ServiceNow OAuth token request failed (${describeStatus(response)})${detail ? `: ${detail}` : ""}`),
+        this.redact(`ServiceNow OAuth token request failed (${describeStatus(response)}) for /oauth_token.do${detail ? `: ${detail}` : ""}`),
         response.status,
         detail,
       );
     }
     const accessToken = asString(payload.access_token);
     if (!accessToken) {
-      throw new Error("ServiceNow OAuth token response did not include access_token.");
+      throw new Error(`ServiceNow OAuth token response did not include access_token (${rawText.length > 0 ? describeOpaqueBody(response, rawText, parsed !== undefined) : "empty response body"}).`);
     }
     const expiresIn = asNumber(payload.expires_in) ?? 1800;
     this.accessToken = accessToken;
     this.accessTokenExpiresAt = Date.now() + Math.max((expiresIn - 60) * 1000, 60_000);
     this.refreshToken = asString(payload.refresh_token) ?? this.refreshToken;
+    rememberSecrets(accessToken, this.refreshToken);
     return accessToken;
   }
 
@@ -979,14 +1093,8 @@ export class ServicenowApiClient implements ServicenowReadClient {
 
       const response = await this.fetchWithTimeout(url, { ...init, headers });
       const rawText = await response.text();
-      let payload: JsonRecord = {};
-      if (rawText.length > 0) {
-        try {
-          payload = asObject(JSON.parse(rawText)) ?? {};
-        } catch {
-          payload = { raw: describeNonJsonBody(response, rawText) };
-        }
-      }
+      const parsed = parseJsonBody(rawText);
+      const payload: JsonRecord = parsed ?? {};
 
       if (response.ok) return { payload, headers: response.headers, status: response.status };
 
@@ -1003,7 +1111,7 @@ export class ServicenowApiClient implements ServicenowReadClient {
         continue;
       }
 
-      const detail = servicenowErrorDetail(payload) ?? asString(payload.raw);
+      const detail = servicenowErrorDetail(payload) ?? (rawText.length > 0 ? describeOpaqueBody(response, rawText, parsed !== undefined) : undefined);
       throw new ServicenowApiError(
         this.redact(`ServiceNow request failed (${describeStatus(response)}) for ${new URL(url).pathname}${detail ? `: ${detail}` : ""}`),
         response.status,
