@@ -38,6 +38,8 @@ const MIN_REQUEST_INTERVAL_MS = 250;
 const DEFAULT_MAX_RETRIES = 3;
 const DEFAULT_RETRY_BASE_MS = 1_000;
 const MAX_RETRY_DELAY_MS = 60_000;
+/** Documented JSON error detail is kept to this many characters, after the scrub has run over it at full length. */
+const MAX_ERROR_DETAIL_CHARS = 300;
 const DEFAULT_USER_LIMIT = 5_000;
 const DEFAULT_ENROLLMENT_LIMIT = 20_000;
 const DEFAULT_LIST_LIMIT = 20_000;
@@ -483,12 +485,32 @@ function clampInteger(value: number | undefined, fallback: number, min: number, 
   return Math.trunc(clampNumber(value, fallback, min, max));
 }
 
+/**
+ * Scheme, host, and path only. A `user:password@` userinfo would otherwise be stored in the resolved config and echoed
+ * by every request label and error message, so it is dropped here and its password registered as a configured secret
+ * in case the caller's text carries it anywhere else.
+ */
 function normalizeBaseUrl(rawUrl: string): string {
   const parsed = new URL(rawUrl.trim());
+  if (parsed.username || parsed.password) {
+    const password = safeDecodeComponent(parsed.password);
+    const username = safeDecodeComponent(parsed.username);
+    credentialScrubber.registerSecrets([password, username && password ? `${username}:${password}` : undefined]);
+    parsed.username = "";
+    parsed.password = "";
+  }
   parsed.hash = "";
   parsed.search = "";
   parsed.pathname = parsed.pathname.replace(/\/+$/, "");
   return parsed.toString().replace(/\/+$/, "");
+}
+
+function safeDecodeComponent(text: string): string {
+  try {
+    return decodeURIComponent(text);
+  } catch {
+    return text;
+  }
 }
 
 function normalizeRegion(value: string | undefined): Knowbe4Region | undefined {
@@ -643,28 +665,18 @@ function reduceUrl(value: string): string {
 }
 
 /**
- * Defense-in-depth pass over everything written to core_data/: the value under any credential-shaped key becomes
- * [REDACTED] whether it is a string, a list, or a nested object (the key survives so an auditor can see the field
- * existed), URL-shaped keys keep only scheme and host, and {name, value} pairs whose name is credential-shaped lose
- * their value. Booleans, numbers, and nulls pass through, and other nested values recurse.
+ * Data-side pass over everything written to core_data/ and everything a finding reads: the value under any
+ * credential-shaped key becomes [REDACTED] whether it is a string, a list, or a nested object (the key survives so an
+ * auditor can see the field existed), URL-shaped keys keep only scheme and host, {name, value} pairs whose name is
+ * credential-shaped lose their value, and every other string gets the shared scrubber's pattern pass (query tokens
+ * anywhere in the text, bearer and assignment carriers, real token shapes, configured secrets). Booleans, numbers,
+ * and nulls pass through.
  */
 export function redactCredentialValues(value: unknown): unknown {
-  if (Array.isArray(value)) return value.map(redactCredentialValues);
-  const record = asObject(value);
-  if (!record) return value;
-  const pairName = asString(record.name);
-  const redacted: JsonRecord = {};
-  for (const [key, entry] of Object.entries(record)) {
-    const credential = isCredentialKey(key) || (key === "value" && pairName !== undefined && isCredentialKey(pairName));
-    if (credential && (typeof entry === "string" || (typeof entry === "object" && entry !== null))) {
-      redacted[key] = REDACTED;
-    } else if (typeof entry === "string") {
-      redacted[key] = isUrlKey(key) ? reduceUrl(entry) : entry;
-    } else {
-      redacted[key] = redactCredentialValues(entry);
-    }
-  }
-  return redacted;
+  return credentialScrubber.scrubData(value, {
+    isCredentialKey,
+    transformString: (text, key) => (key !== undefined && isUrlKey(key) ? reduceUrl(text) : text),
+  });
 }
 
 /** Drops the free-form user fields (comment, custom fields and dates) at collection time; nothing downstream reads them. */
@@ -1049,6 +1061,55 @@ function describeOpaqueBody(response: Response, rawText: string): string {
   return `${statusLine(response)}: non-JSON body (${contentType}, ${Buffer.byteLength(rawText, "utf8")} bytes, not echoed)`;
 }
 
+/**
+ * The documented shape of a successful body: the Reporting API lists are bare JSON arrays, its single resources
+ * (`/v1/account`) are objects with at least one field, and the PhishER GraphQL endpoint answers with an object
+ * carrying `data` or `errors`. A 2xx whose body has another shape is a failed read, not an empty inventory.
+ */
+type Knowbe4ResponseShape =
+  | { kind: "array" }
+  | { kind: "object"; documentedKeys: readonly string[] }
+  | { kind: "graphql" };
+
+const ARRAY_SHAPE: Knowbe4ResponseShape = { kind: "array" };
+const GRAPHQL_SHAPE: Knowbe4ResponseShape = { kind: "graphql" };
+// The account record as documented for GET /v1/account; a body carrying none of these is some other service's JSON.
+const ACCOUNT_SHAPE: Knowbe4ResponseShape = { kind: "object", documentedKeys: ["name", "type", "domains", "admins", "subscription_level", "subscription_end_date", "number_of_seats", "current_risk_score"] };
+
+function matchesResponseShape(payload: unknown, shape: Knowbe4ResponseShape): boolean {
+  switch (shape.kind) {
+    case "array":
+      return Array.isArray(payload);
+    case "object": {
+      const record = asObject(payload);
+      return record !== undefined && shape.documentedKeys.some((key) => key in record);
+    }
+    case "graphql": {
+      const record = asObject(payload);
+      return record !== undefined && ("data" in record || "errors" in record);
+    }
+    default: {
+      const exhaustive: never = shape;
+      return exhaustive;
+    }
+  }
+}
+
+function describeResponseShape(shape: Knowbe4ResponseShape): string {
+  switch (shape.kind) {
+    case "array":
+      return "JSON array";
+    case "object":
+      return `JSON object (one of ${shape.documentedKeys.join(", ")})`;
+    case "graphql":
+      return "GraphQL response object (data or errors)";
+    default: {
+      const exhaustive: never = shape;
+      return exhaustive;
+    }
+  }
+}
+
 // Only the documented JSON error fields (message, error, errors[].message) are quoted; anything else is described.
 function knowbe4ErrorDetail(response: Response, rawText: string): string | undefined {
   if (rawText.length === 0) return undefined;
@@ -1059,7 +1120,9 @@ function knowbe4ErrorDetail(response: Response, rawText: string): string | undef
       asString(payload?.error),
       ...asRecordArray(payload?.errors).map((item) => asString(item.message)),
     ].filter((item): item is string => Boolean(item));
-    if (detail.length > 0) return detail.join("; ").replace(/\s+/g, " ").slice(0, 300);
+    // Scrub first, cut second: a cut through a configured token would leave a fragment the whole-value rule no longer
+    // matches, so the detail loses its credentials at full length and is truncated afterwards.
+    if (detail.length > 0) return scrubErrorText(detail.join("; ").replace(/\s+/g, " ")).slice(0, MAX_ERROR_DETAIL_CHARS);
     return `${statusLine(response)}: JSON body without a documented error field (${Buffer.byteLength(rawText, "utf8")} bytes, not echoed)`;
   } catch {
     return describeOpaqueBody(response, rawText);
@@ -1195,7 +1258,7 @@ export class Knowbe4ApiClient {
    * status it observed (null for a timeout or transport failure), so the surfaces and findings downstream never
    * have to name an endpoint or status from a constant.
    */
-  private async request(url: string, init: RequestInit, token: string, label?: string): Promise<unknown> {
+  private async request(url: string, init: RequestInit, token: string, shape: Knowbe4ResponseShape, label?: string): Promise<unknown> {
     const method = init.method ?? "GET";
     const endpoint = `${method} ${new URL(url).pathname}`;
     const target = label ? `${endpoint} (${label})` : endpoint;
@@ -1232,22 +1295,40 @@ export class Knowbe4ApiClient {
           endpoint,
         );
       }
-      if (rawText.length === 0) return {};
+      // A success status is not a success by itself. An empty body, a login or proxy page, or JSON of some other shape
+      // (a status page, a different API behind the same host) is not an empty inventory; each is recorded as a failed
+      // read of this request with the status the server sent, so the dependents go manual instead of passing or
+      // failing on data that was never observed.
+      if (rawText.length === 0) {
+        throw new Knowbe4ApiError(
+          this.redact(`KnowBe4 request ${target} returned ${statusLine(response)} with an empty body (0 bytes); the endpoint is not serving the JSON API`),
+          response.status,
+          endpoint,
+        );
+      }
+      let payload: unknown;
       try {
-        return JSON.parse(rawText) as unknown;
+        payload = JSON.parse(rawText) as unknown;
       } catch {
-        // A login page or proxy page served with a success status is not an empty inventory; it is an error.
         throw new Knowbe4ApiError(
           this.redact(`KnowBe4 request ${target} returned a ${describeOpaqueBody(response, rawText)}; the endpoint is not serving the JSON API`),
           response.status,
           endpoint,
         );
       }
+      if (!matchesResponseShape(payload, shape)) {
+        throw new Knowbe4ApiError(
+          this.redact(`KnowBe4 request ${target} returned ${statusLine(response)} with a JSON body that is not the documented ${describeResponseShape(shape)} (${Buffer.byteLength(rawText, "utf8")} bytes, not echoed); the endpoint is not serving the JSON API`),
+          response.status,
+          endpoint,
+        );
+      }
+      return payload;
     }
   }
 
-  async get(path: string, query: JsonRecord = {}): Promise<unknown> {
-    return this.request(this.buildUrl(path, query), { method: "GET" }, this.config.apiToken);
+  async get(path: string, query: JsonRecord = {}, shape: Knowbe4ResponseShape = ARRAY_SHAPE): Promise<unknown> {
+    return this.request(this.buildUrl(path, query), { method: "GET" }, this.config.apiToken, shape);
   }
 
   /**
@@ -1268,7 +1349,7 @@ export class Knowbe4ApiClient {
     const endpoint = `GET ${path}${describeQuery(query)}`;
 
     for (let page = 1; ; page += 1) {
-      const payload = await this.get(path, { ...query, page, per_page: pageSize });
+      const payload = await this.get(path, { ...query, page, per_page: pageSize }, ARRAY_SHAPE);
       pages += 1;
       const pageItems = asRecordArray(payload);
       const room = limit - items.length;
@@ -1292,7 +1373,7 @@ export class Knowbe4ApiClient {
   }
 
   async getAccount(): Promise<JsonRecord> {
-    return asObject(await this.get("/v1/account")) ?? {};
+    return asObject(await this.get("/v1/account", {}, ACCOUNT_SHAPE)) ?? {};
   }
 
   async getAccountRiskScoreHistory(full = true): Promise<Knowbe4Listing> {
@@ -1360,6 +1441,7 @@ export class Knowbe4ApiClient {
         body: JSON.stringify({ query, variables }),
       },
       this.config.phisherApiToken,
+      GRAPHQL_SHAPE,
       "PhishER GraphQL",
     )) ?? {};
     const errors = asRecordArray(payload.errors);

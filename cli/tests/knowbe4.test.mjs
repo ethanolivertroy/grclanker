@@ -2658,3 +2658,113 @@ test("scrub boundary: every fixed-text message the KnowBe4 integration emits sur
   assert.ok(checked > 2000, `expected thousands of recorded strings, got ${checked}`);
   assert.deepEqual([...altered], [], `legitimate run text altered by the scrubber:\n${[...altered].join("\n")}`);
 });
+
+// ---------------------------------------------------------------------------------------------------------------
+// Review round 1: base URL userinfo, scrub before the detail cut, silent success.
+// ---------------------------------------------------------------------------------------------------------------
+
+const KB_USERINFO_PASSWORD = "Wq7pLz3KfR9vT2mXc8NbH4yJ";
+
+test("rule 9: a user:password@ userinfo in the base URL is dropped at resolution and its password reaches no surface, request label, or bundle file", async () => {
+  const config = resolveKnowbe4Configuration(
+    { base_url: `https://audit:${KB_USERINFO_PASSWORD}@us.api.knowbe4.com/` },
+    { KNOWBE4_API_TOKEN: KB_TEST_TOKEN, KNOWBE4_REGION: "us" },
+    createTempBase("grclanker-knowbe4-userinfo-home-"),
+  );
+  assert.equal(config.baseUrl, "https://us.api.knowbe4.com", "scheme and host only");
+  assertCanaryWindowsAbsent(assert, JSON.stringify(config), [KB_USERINFO_PASSWORD], "resolved configuration");
+
+  // Every read fails with a body that echoes the request URL with its userinfo, the way a proxy would.
+  const fixture = healthyFixture();
+  const routes = Object.fromEntries(Object.keys(kbRoutes(fixture)).map((route) => [route, () => jsonResponse({ message: `denied for https://audit:${KB_USERINFO_PASSWORD}@us.api.knowbe4.com/v1/users` }, { status: 403, statusText: "Forbidden" })]));
+  const { client, log } = httpKnowbe4(fixture, { routes, config: { baseUrl: config.baseUrl } });
+  const access = await checkKnowbe4Access(client);
+  const assessments = await runAllKnowbe4Assessments(client);
+  const exported = await exportKnowbe4AuditBundle(client, client.getResolvedConfig(), createTempBase("grclanker-knowbe4-userinfo-"), { now: NOW });
+  const files = readBundleFiles(exported.outputDir);
+  assert.ok(log.length > 0 && log.every((entry) => !entry.url.includes("@")), "no request carried the userinfo");
+  assertCanaryWindowsAbsent(assert, JSON.stringify(access), [KB_USERINFO_PASSWORD], "check_access result");
+  assertCanaryWindowsAbsent(assert, JSON.stringify(assessments), [KB_USERINFO_PASSWORD], "assess results");
+  for (const [name, text] of files) assertCanaryWindowsAbsent(assert, text, [KB_USERINFO_PASSWORD], `bundle file ${name}`);
+  for (const [name, text] of readZipEntries(exported.zipPath)) assertCanaryWindowsAbsent(assert, text, [KB_USERINFO_PASSWORD], `zip entry ${name}`);
+});
+
+test("rule 9: a configured token straddling the 300-character error detail cut is scrubbed at full length before the cut, so no fragment survives", async () => {
+  for (const offset of [290, 295, 299, 300]) {
+    const message = `${"denied ".repeat(60).slice(0, offset)}${KB_TEST_TOKEN} was rejected by the Reporting API`;
+    const { client } = httpKnowbe4(healthyFixture(), { routes: { "GET /v1/users": () => jsonResponse({ message }, { status: 403, statusText: "Forbidden" }) } });
+    await assert.rejects(() => client.listUsers(), (error) => {
+      assertCanaryWindowsAbsent(assert, error.message, [KB_TEST_TOKEN], `detail cut at offset ${offset}`);
+      assert.match(error.message, /^KnowBe4 request failed \(403 Forbidden\) GET \/v1\/users: denied /, "the documented message is still quoted up to the cut");
+      assert.ok(error.message.length <= 120 + MAX_KB_DETAIL, `the detail is still cut (${error.message.length} characters)`);
+      return true;
+    });
+  }
+});
+const MAX_KB_DETAIL = 300;
+
+const KB_SILENT_BODIES = [
+  ["empty", () => new Response("", { status: 200, statusText: "OK" }), /returned 200 OK with an empty body \(0 bytes\)/],
+  ["html", () => new Response("<html><body>Sign in to KnowBe4</body></html>", { status: 200, statusText: "OK", headers: { "content-type": "text/html" } }), /returned a 200 OK: non-JSON body \(text\/html, \d+ bytes, not echoed\)/],
+  ["foreign", () => jsonResponse({ status: "ok", service: "status-page" }), /returned 200 OK with a JSON body that is not the documented JSON array \(\d+ bytes, not echoed\)/],
+];
+
+test("silent success: a 2xx whose body is empty, an HTML page, or JSON of another shape is a failed read with http_status 200, a marker in core_data, and manual dependents, never an empty inventory", async () => {
+  const healthy = httpKnowbe4(healthyFixture());
+  const baselineExport = await exportKnowbe4AuditBundle(healthy.client, healthy.config, createTempBase("grclanker-knowbe4-silent-baseline-"), { now: NOW });
+  const baseline = JSON.parse(readBundleFiles(baselineExport.outputDir).get("analysis/findings.json"));
+  for (const [kind, body, expected] of KB_SILENT_BODIES) {
+    const fixture = healthyFixture();
+    const { client, config, log } = httpKnowbe4(fixture, { routes: { "GET /v1/users": body } });
+    const label = `users served a ${kind} 200`;
+    const access = await checkKnowbe4Access(client);
+    const usersSurface = access.surfaces.find((surface) => /users/i.test(surface.name) || /\/v1\/users/.test(surface.endpoint ?? ""));
+    assert.ok(usersSurface, `${label}: an access surface reads /v1/users`);
+    assert.equal(usersSurface.status, "not_readable", `${label}: the surface is not readable`);
+    assert.match(usersSurface.error, expected, label);
+    assert.equal(usersSurface.http_status, 200, `${label}: the observed status is the 200 the server sent`);
+
+    const exported = await exportKnowbe4AuditBundle(client, config, createTempBase("grclanker-knowbe4-silent-"), { now: NOW });
+    const files = readBundleFiles(exported.outputDir);
+    const status = JSON.parse(files.get("core_data/collection_status.json"));
+    const row = status.inventories.find((entry) => entry.inventory === "users");
+    assert.deepEqual({ status: row.status, collected: row.collected, readable: row.readable, http_status: row.http_status, complete: row.complete, truncated: row.truncated, seen: row.seen }, { status: "not_readable", collected: false, readable: false, http_status: 200, complete: null, truncated: null, seen: null }, label);
+    const written = JSON.parse(files.get("core_data/users_active.json"));
+    assert.deepEqual({ collected: written.collected, status: written.status, reason: written.reason }, { collected: false, status: 200, reason: "not_readable" }, `${label}: core_data carries a marker, not []`);
+    assert.match(written.error, expected, label);
+
+    // Against the all-readable baseline, a finding may only move to manual or warn; the reviewer's false fails
+    // (KNOWBE4-01/02/09/20 and KNOWBE4-16 on unobserved data) go manual.
+    const findings = JSON.parse(files.get("analysis/findings.json"));
+    for (const finding of findings) {
+      const before = baseline.find((item) => item.control === finding.control);
+      if (before.status === finding.status) continue;
+      assert.ok(["manual", "warn"].includes(finding.status), `${label}: KNOWBE4-${finding.control} moved ${before.status} -> ${finding.status}; only manual or warn may follow an unobserved read: ${finding.summary}`);
+    }
+    const moved = findings.filter((finding) => baseline.find((item) => item.control === finding.control).status !== finding.status);
+    assert.ok(moved.length >= 3, `${label}: the user-dependent findings demote (${moved.length} moved)`);
+    assert.ok(log.some((entry) => entry.path === "/v1/users" && entry.status === 200), `${label}: the 200 was observed`);
+
+    // Every endpoint silent: nothing was observed, so no finding may pass or fail; the reviewer's false fails
+    // (KNOWBE4-01/02/09/20 on empty lists, KNOWBE4-16 on an unobserved account) are manual.
+    const silentRoutes = Object.fromEntries(Object.keys(kbRoutes(healthyFixture())).map((route) => [route, body]));
+    const allSilent = httpKnowbe4(healthyFixture(), { routes: silentRoutes });
+    const allExport = await exportKnowbe4AuditBundle(allSilent.client, allSilent.config, createTempBase("grclanker-knowbe4-silent-all-"), { now: NOW });
+    const allFiles = readBundleFiles(allExport.outputDir);
+    const allFindings = JSON.parse(allFiles.get("analysis/findings.json"));
+    for (const finding of allFindings) {
+      assert.equal(finding.status, "manual", `${label} on every endpoint: KNOWBE4-${finding.control} is ${finding.status}: ${finding.summary}`);
+    }
+    const allStatus = JSON.parse(allFiles.get("core_data/collection_status.json"));
+    for (const row of allStatus.inventories) {
+      if (row.status === "not_configured" || row.status === "not_requested") continue;
+      assert.deepEqual({ status: row.status, http_status: row.http_status, seen: row.seen }, { status: "not_readable", http_status: 200, seen: null }, `${label} on every endpoint: ${row.inventory}`);
+    }
+  }
+
+  // A single resource (the account) and the PhishER GraphQL endpoint apply the same guard with their own documented shapes.
+  const account = httpKnowbe4(healthyFixture(), { routes: { "GET /v1/account": () => jsonResponse({}) } });
+  await assert.rejects(() => account.client.getAccount(), /returned 200 OK with a JSON body that is not the documented JSON object \(one of name, type, domains, admins, subscription_level, subscription_end_date, number_of_seats, current_risk_score\) \(\d+ bytes, not echoed\)/);
+  const phisher = httpKnowbe4(healthyFixture(), { routes: { [KB_PHISHER_ROUTE]: () => jsonResponse({ hello: "world" }) } });
+  await assert.rejects(() => phisher.client.graphql("query { x }"), /returned 200 OK with a JSON body that is not the documented GraphQL response object \(data or errors\) \(\d+ bytes, not echoed\)/);
+});

@@ -21,11 +21,20 @@
  * letters, or token casing; hex digests; JWTs; AWS access key ids and secret keys; PEM blocks; and well-known vendor
  * prefixes. Every rule is unanchored so a carrier embedded mid-sentence is caught, and every replacement is idempotent:
  * scrubbed text comes back unchanged because `[REDACTED]` matches none of the rules.
+ *
+ * The same rules run over collected data (`scrubData`): every string in every record written to core_data, an analysis
+ * object, or finding evidence gets the pattern pass above, so a query token, a bearer value, an assignment pair, or a
+ * bare token inside free text (a terms-of-service body, an audit comment, a monitor note, a settings value) goes the
+ * way it would in an error message; and the whole subtree under a credential-shaped key is replaced, arrays and
+ * nested objects included, so `tokens: ["..."]` and `credentials: { value }` cannot keep what their key names.
  */
 import { REDACTED_VALUE, isSensitiveArgumentKey, scrubSensitiveValues } from "../../flue/redact.js";
 
 /** The marker every scrub writes; the Flue marker is folded into it so one message carries one marker. */
 export const REDACTED = "[REDACTED]";
+
+// A control-character sentinel no API text carries; it parks a pre-existing Flue marker across a secret scrub.
+const PRESERVED_MARKER_SENTINEL = "\u0000\u0001redacted\u0001\u0000";
 
 /**
  * Configured secrets shorter than this are never scrubbed by value because a two-character value would match ordinary
@@ -44,9 +53,42 @@ export interface CredentialScrubberOptions {
   vendorPatterns?: readonly RegExp[];
 }
 
+export interface ScrubTextOptions {
+  /**
+   * Whether bare values are judged by shape (the long-token, hex digest, and AWS secret rules). Off for a string
+   * stored under an identifier key, where a base64 API key id or a cluster UUID is a name, not a credential; carriers,
+   * configured secrets, JWTs, PEM blocks, and vendor prefixes are removed either way.
+   */
+  shapes?: boolean;
+}
+
+export interface ScrubDataOptions {
+  /**
+   * True for a key whose whole subtree is a credential (`token`, `tokens`, `credentials`, `client_secret`, ...). The
+   * module's own key rule when given, so vendor field names are honoured (a LaunchDarkly flag `key` or an Elastic
+   * `api_keys` inventory container is not a credential); `isCredentialDataKey` otherwise. The header and query rule
+   * `isCredentialKey` is deliberately not used here: it treats a bare `key` as sensitive, which is right for a query
+   * string and wrong for a record.
+   */
+  isCredentialKey?: (key: string) => boolean;
+  /**
+   * Rewrites a string before the pattern pass, given the key it is stored under (undefined inside an array or at the
+   * root): the module's URL-key reduction, request-label allowances, and similar field-aware rules.
+   */
+  transformString?: (value: string, key: string | undefined) => string;
+  /** Nesting deeper than this is replaced by the marker. */
+  maxDepth?: number;
+}
+
 export interface CredentialScrubber {
   /** Removes credential material from error text under every rule of this module. Idempotent. */
-  scrub(text: string): string;
+  scrub(text: string, options?: ScrubTextOptions): string;
+  /**
+   * Data-side scrub for a collected record (see `scrubDataValue`): the whole subtree under a credential-shaped key
+   * becomes the marker, `{name, value}` pairs with a credential-shaped name lose their value, and every string runs
+   * through `scrub`, with shape rules off under identifier keys. Shape is otherwise preserved.
+   */
+  scrubData(value: unknown, options?: ScrubDataOptions): unknown;
   /**
    * Registers configured secret values (API keys, tokens, passwords, private keys); each is removed from every string
    * scrubbed from then on, in every encoded form. Entries shorter than `MIN_CONFIGURED_SECRET_LENGTH`, undefined, and
@@ -55,6 +97,78 @@ export interface CredentialScrubber {
   registerSecrets(values: ReadonlyArray<string | undefined | null>): void;
   /** The configured secrets registered so far, in their plain form. */
   readonly secrets: ReadonlySet<string>;
+}
+
+/** Default nesting cap for `scrubData`. */
+export const DEFAULT_DATA_SCRUB_DEPTH = 24;
+
+// Keys whose string value names a thing rather than proving possession of it: an API key id, a cluster or node UUID,
+// a digest, an etag. Shape rules are off under them; carriers and configured secrets still apply.
+const IDENTIFIER_KEY_SEGMENTS = new Set(["id", "ids", "uuid", "uuids", "guid", "guids", "sha", "sha1", "sha256", "sha512", "md5", "hash", "digest", "fingerprint", "etag", "checksum"]);
+
+// The conservative record-key rule: the last segment names a credential outright, or is `key`/`keys` qualified by a
+// word that makes it one (`api_key`, `private_keys`, `client_key`); a bare `key`, `keys`, or `id` is an identifier.
+const CREDENTIAL_DATA_LAST_SEGMENTS = new Set([
+  "token", "tokens", "secret", "secrets", "password", "passwords", "passwd", "pwd", "passphrase", "passphrases", "apikey",
+  "apikeys", "authorization", "credential", "credentials", "bearer", "privatekey", "privatekeys",
+]);
+const CREDENTIAL_DATA_KEY_QUALIFIERS = new Set([
+  "api", "private", "secret", "signing", "access", "shared", "encryption", "session", "master", "client", "auth", "sdk",
+  "mobile", "relay", "service", "license", "ssh", "hmac", "enrollment",
+]);
+
+/** True for a record key whose whole value is a credential under the conservative rule above. */
+export function isCredentialDataKey(key: string): boolean {
+  const segments = keySegments(key);
+  const last = segments[segments.length - 1];
+  if (!last) return false;
+  if (CREDENTIAL_DATA_LAST_SEGMENTS.has(last)) return true;
+  if (last === "key" || last === "keys") return segments.slice(0, -1).some((segment) => CREDENTIAL_DATA_KEY_QUALIFIERS.has(segment));
+  return false;
+}
+
+/** True when the last segment of the key names an identifier or digest. */
+export function isIdentifierKey(key: string): boolean {
+  const segments = keySegments(key);
+  const last = segments[segments.length - 1];
+  return last !== undefined && IDENTIFIER_KEY_SEGMENTS.has(last) && !isCredentialDataKey(key);
+}
+
+function isNameValuePair(record: Record<string, unknown>): string | undefined {
+  if (!("value" in record)) return undefined;
+  const name = record.name ?? record.key;
+  return typeof name === "string" ? name : undefined;
+}
+
+/**
+ * Walks a collected record. Under a credential-shaped key the whole entry goes, whether it is a string, an array
+ * (`tokens: ["..."]`), or an object (`credentials: { value }`), so no nested container keeps a value its key names as
+ * a credential; the key itself survives so a reader sees the field existed. Booleans, numbers, and nulls pass through
+ * because they carry no secret (`serviceToken: true`).
+ */
+function scrubDataValue(value: unknown, scrubText: (text: string, options?: ScrubTextOptions) => string, options: ScrubDataOptions, key: string | undefined, depth: number): unknown {
+  const maxDepth = options.maxDepth ?? DEFAULT_DATA_SCRUB_DEPTH;
+  if (depth > maxDepth) return value !== null && typeof value === "object" ? REDACTED : value;
+  if (typeof value === "string") {
+    const transformed = options.transformString ? options.transformString(value, key) : value;
+    return scrubText(transformed, { shapes: key === undefined || !isIdentifierKey(key) });
+  }
+  if (Array.isArray(value)) return value.map((entry) => scrubDataValue(entry, scrubText, options, key, depth + 1));
+  if (value === null || typeof value !== "object") return value;
+  const record = value as Record<string, unknown>;
+  const pairName = isNameValuePair(record);
+  const credentialKey = options.isCredentialKey ?? isCredentialDataKey;
+  const out: Record<string, unknown> = {};
+  for (const [entryKey, entry] of Object.entries(record)) {
+    if (entry === null || entry === undefined || typeof entry === "boolean" || typeof entry === "number") {
+      out[entryKey] = entry;
+    } else if (credentialKey(entryKey) || (entryKey === "value" && pairName !== undefined && credentialKey(pairName))) {
+      out[entryKey] = REDACTED;
+    } else {
+      out[entryKey] = scrubDataValue(entry, scrubText, options, entryKey, depth + 1);
+    }
+  }
+  return out;
 }
 
 // ---------------------------------------------------------------------------------------------------------------------
@@ -532,6 +646,11 @@ const readSchemeValue: ValueReader = (text, valueStart, carrier) => {
 // Replacements
 // ---------------------------------------------------------------------------------------------------------------------
 
+// Incoming-webhook URLs carry the credential in the path: Slack `/services/T.../B.../<token>`, Discord and Microsoft
+// Teams `/api/webhooks/<id>/<token>` and `/webhookb2/<id>@<tenant>/IncomingWebhook/<id>/<token>`, Google Chat
+// `/v1/spaces/<space>/messages` with `key` and `token` in the query (already a query rule). The last segment goes.
+const WEBHOOK_PATH_PATTERN = /^(\/services\/T[A-Z0-9]+\/B[A-Z0-9]+\/|\/api\/webhooks\/\d+\/|\/webhookb2\/[^/]+\/IncomingWebhook\/[^/]+\/)[^/]+/i;
+
 function scrubEmbeddedUrl(match: string): string {
   const trailing = TRAILING_PUNCTUATION_PATTERN.exec(match)?.[0] ?? "";
   const url = match.slice(0, match.length - trailing.length);
@@ -539,7 +658,9 @@ function scrubEmbeddedUrl(match: string): string {
     const parsed = new URL(url);
     const hadUserinfo = parsed.username.length > 0 || parsed.password.length > 0;
     const hadDetail = parsed.search.length > 0 || parsed.hash.length > 0 || hadUserinfo || url.endsWith("?") || url.endsWith("#");
-    return hadDetail ? `${parsed.protocol}//${parsed.host}${parsed.pathname}?${REDACTED}${trailing}` : match;
+    const pathname = parsed.pathname.replace(WEBHOOK_PATH_PATTERN, `$1${REDACTED}`);
+    if (hadDetail) return `${parsed.protocol}//${parsed.host}${pathname}?${REDACTED}${trailing}`;
+    return pathname === parsed.pathname ? match : `${parsed.protocol}//${parsed.host}${pathname}${trailing}`;
   } catch {
     return `${REDACTED}${trailing}`;
   }
@@ -599,12 +720,16 @@ export function createCredentialScrubber(options: CredentialScrubberOptions = {}
   const headerPattern = new RegExp(String.raw`${NAME_START}(${headerNames.join("|")}|${GENERIC_CREDENTIAL_HEADER})${NAME_CLOSE_AND_SEPARATOR}`, "gi");
   const vendorPatterns = [...COMMON_VENDOR_PATTERNS, ...(options.vendorPatterns ?? [])];
 
+  // The Flue marker is folded into this module's marker only where Flue wrote it: a `[redacted]` already in the text
+  // (KnowBe4's PII mask uses the same spelling) is parked behind a sentinel first and restored afterwards.
   function scrubConfiguredSecrets(text: string): string {
     if (secrets.size === 0) return text;
-    return scrubSensitiveValues(text, [...secrets]).split(REDACTED_VALUE).join(REDACTED);
+    const parked = text.split(REDACTED_VALUE).join(PRESERVED_MARKER_SENTINEL);
+    return scrubSensitiveValues(parked, [...secrets]).split(REDACTED_VALUE).join(REDACTED).split(PRESERVED_MARKER_SENTINEL).join(REDACTED_VALUE);
   }
 
-  function scrub(text: string): string {
+  function scrub(text: string, textOptions: ScrubTextOptions = {}): string {
+    const shapes = textOptions.shapes ?? true;
     let scrubbed = scrubConfiguredSecrets(text)
       .replace(PEM_BLOCK_PATTERN, REDACTED)
       .replace(PEM_OPEN_PATTERN, REDACTED)
@@ -617,11 +742,14 @@ export function createCredentialScrubber(options: CredentialScrubberOptions = {}
     scrubbed = replaceCarrierValues(scrubbed, CREDENTIAL_PAIR_PATTERN, readPairValue);
     scrubbed = replaceGenericCredentialPairs(scrubbed)
       .replace(JWT_PATTERN, REDACTED)
-      .replace(AWS_ACCESS_KEY_ID_PATTERN, REDACTED)
-      .replace(AWS_SECRET_PATTERN, scrubAwsSecret)
-      .replace(HEX_DIGEST_PATTERN, REDACTED);
+      .replace(AWS_ACCESS_KEY_ID_PATTERN, REDACTED);
+    if (shapes) scrubbed = scrubbed.replace(AWS_SECRET_PATTERN, scrubAwsSecret).replace(HEX_DIGEST_PATTERN, REDACTED);
     for (const pattern of vendorPatterns) scrubbed = scrubbed.replace(pattern, REDACTED);
-    return scrubbed.replace(LONG_TOKEN_RUN_PATTERN, scrubLongToken);
+    return shapes ? scrubbed.replace(LONG_TOKEN_RUN_PATTERN, scrubLongToken) : scrubbed;
+  }
+
+  function scrubData(value: unknown, dataOptions: ScrubDataOptions = {}): unknown {
+    return scrubDataValue(value, scrub, dataOptions, undefined, 0);
   }
 
   function registerSecrets(values: ReadonlyArray<string | undefined | null>): void {
@@ -630,5 +758,5 @@ export function createCredentialScrubber(options: CredentialScrubberOptions = {}
     }
   }
 
-  return { scrub, registerSecrets, secrets };
+  return { scrub, scrubData, registerSecrets, secrets };
 }
