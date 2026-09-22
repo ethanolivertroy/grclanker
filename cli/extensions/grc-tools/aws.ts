@@ -450,13 +450,23 @@ function serializeJson(value: unknown): string {
   return `${JSON.stringify(value, null, 2)}\n`;
 }
 
+/** Shape of an error code (AccessDeniedException, NoSuchEntity, ENOTFOUND, com.amazonaws.x#Fault): one identifier, at most 64 characters. */
+const ERROR_CODE_PATTERN = /^[A-Za-z][A-Za-z0-9._:-]{0,63}$/;
+const UNKNOWN_ERROR_CODE = "UnknownError";
+
+/**
+ * The SDK error name. For a service error it is the response's <Code> element or __type field, so it is text
+ * the server controls: it is accepted only when it is shaped like a code and survives the error-text scrub
+ * unchanged (a bearer value or a token in that slot is neither), otherwise it renders as UnknownError. "" when
+ * the error carries no name at all.
+ */
 function errorCode(error: unknown): string {
   if (error instanceof AwsApiError) return error.code;
   const object = asObject(error);
-  return asString(object?.name) ?? asString(object?.Code) ?? asString(object?.code) ?? "";
+  const raw = asString(object?.name) ?? asString(object?.Code) ?? asString(object?.code) ?? "";
+  if (raw === "") return "";
+  return ERROR_CODE_PATTERN.test(raw) && redactErrorText(raw) === raw ? raw : UNKNOWN_ERROR_CODE;
 }
-
-const UNKNOWN_ERROR_CODE = "UnknownError";
 
 function errorHttpStatus(error: unknown): number | undefined {
   if (error instanceof AwsApiError) return error.httpStatus;

@@ -74,6 +74,7 @@ import {
   assertRedactionCases,
   assertScrubBoundary,
   assertShortBodyRecordedAsNote,
+  jsonCanaryMessage,
   parserMessageFor,
   parserSnippetBody,
 } from "./helpers/error-canaries.mjs";
@@ -3160,6 +3161,70 @@ test("silent success: the required-member table names every command the client s
   for (const [name, members] of Object.entries(AWS_REQUIRED_OUTPUT_MEMBERS)) {
     assert.ok(members.length > 0 && members.every((member) => /^[A-Za-z]+$/.test(member)), `${name}: member names are identifiers`);
   }
+});
+
+/** A 403 whose error code slot carries a credential-shaped value, in each protocol's error shape. */
+function deniedWithCanaryCode({ service }) {
+  const message = jsonCanaryMessage();
+  if (JSON_PROTOCOL_SERVICES.has(service)) {
+    return { status: 403, contentType: "application/x-amz-json-1.1", body: JSON.stringify({ __type: CANARY.sessionCookie, message }) };
+  }
+  const code = `Bearer ${CANARY.bearer}`;
+  if (service === "s3" || service === "s3control") {
+    return { status: 403, contentType: "application/xml", body: `<?xml version="1.0" encoding="UTF-8"?><Error><Code>${escapeXml(code)}</Code><Message>${escapeXml(message)}</Message><RequestId>req-1</RequestId><HostId>host-1</HostId></Error>` };
+  }
+  if (service === "ec2") {
+    return { status: 403, contentType: "text/xml;charset=UTF-8", body: `<?xml version="1.0" encoding="UTF-8"?><Response><Errors><Error><Code>${escapeXml(code)}</Code><Message>${escapeXml(message)}</Message></Error></Errors><RequestID>req-1</RequestID></Response>` };
+  }
+  return { status: 403, contentType: "text/xml", body: `<ErrorResponse xmlns="https://${service}.amazonaws.com/doc/2011-06-15/"><Error><Type>Sender</Type><Code>${escapeXml(code)}</Code><Message>${escapeXml(message)}</Message></Error><RequestId>req-1</RequestId></ErrorResponse>` };
+}
+
+test("rule 9: a server-controlled error code (<Code>Bearer …</Code>, a __type carrying a token) renders as UnknownError with the observed status; no 6-to-24-character window of it survives in the thrown client error, the access check, the tool payloads, or the bundle", async () => {
+  // Positive control: both planted codes are what the SDK would hand back, and both fail the code shape or the scrub.
+  assert.ok(redactErrorText(CANARY.sessionCookie) !== CANARY.sessionCookie, "the __type token is token-shaped, so the scrub changes it");
+  assert.ok(!/^[A-Za-z][A-Za-z0-9._:-]{0,63}$/.test(`Bearer ${CANARY.bearer}`), "the XML code carries a space");
+
+  let serveIdentity = false;
+  await withLocalAwsEndpoint(
+    (request) => (serveIdentity && request.action === "GetCallerIdentity" ? STS_IDENTITY_RESPONSE : deniedWithCanaryCode(request)),
+    async ({ requests }) => {
+      const client = realAwsClient();
+      for (const [name, , call] of LOCAL_AWS_METHODS) {
+        await assert.rejects(() => call(client), (error) => {
+          const record = thrownErrorRecord(error);
+          assert.ok(error instanceof AwsApiError, `${name}: ${record}`);
+          assert.equal(error.code, "UnknownError", `${name}: the server's code slot is not accepted`);
+          assert.equal(error.httpStatus, 403, name);
+          assert.ok(error.message.startsWith("UnknownError (HTTP 403)"), `${name}: ${error.message}`);
+          assert.equal(isAwsAccessDenied(error), true, `${name}: the observed 403 still classifies as a denial`);
+          assertNoCanaryWindows(assert, record, [...AWS_PLANTED_CANARIES, `Bearer ${CANARY.bearer}`], `${name} thrown error`);
+          return true;
+        });
+      }
+      assert.ok(requests.every((request) => request.status === 403), "every request observed the 403");
+
+      serveIdentity = true;
+      const outputs = await runAllAssessments(client);
+      for (const probe of outputs.access.surfaces) {
+        assert.equal(probe.status, "not_readable", probe.name);
+        assert.equal(probe.error_code, "UnknownError", probe.name);
+        assert.equal(probe.http_status, 403, probe.name);
+      }
+      const outputDir = createTempBase("grclanker-aws-canary-code-");
+      const exported = await exportAwsAuditBundle(client, client.getResolvedConfig(), outputDir);
+      const payloads = [];
+      for (const tool of ["aws_check_access", "aws_assess_identity", "aws_export_audit_bundle"]) {
+        payloads.push(await runAwsTool(tool, { region: "us-east-1", account_id: FIXTURE_ACCOUNT, output_dir: createTempBase("grclanker-aws-canary-code-tool-") }));
+      }
+      const text = [JSON.stringify(outputs), ...payloads, ...readBundleFiles(exported.outputDir).values(), ...[...readZipEntries(exported.zipPath)].map(([, entry]) => entry)].join("\n");
+      assertNoCanaryWindows(assert, text, AWS_PLANTED_CANARIES, "outputs, tool payloads, and bundle");
+      assert.match(text, /UnknownError \(HTTP 403\)/);
+      assert.deepEqual([...namedStatuses(text)], [403], "the only status named is the one every failing response carried");
+      for (const result of Object.values(outputs)) {
+        for (const finding of result.findings ?? []) assert.ok(!["pass", "fail"].includes(finding.status), `${finding.id}: ${finding.status}`);
+      }
+    },
+  );
 });
 
 test("rule 9: a 502 HTML page through the real SDK parser path is recorded on every protocol as the non-JSON body note with the observed status, measured from the response rather than quoted from the SDK error", async () => {
