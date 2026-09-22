@@ -1,6 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import {
+  chmodSync,
   existsSync,
   mkdirSync,
   mkdtempSync,
@@ -10,6 +11,7 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { parse as parseYaml } from "yaml";
 
 import {
   OKTA_CHECK_IDS,
@@ -25,6 +27,7 @@ import {
   collectOktaIntegrationData,
   collectOktaMonitoringData,
   exportOktaAuditBundle,
+  registerOktaTools,
   resolveOktaConfiguration,
   resolveSecureOutputPath,
   runOktaAccessCheck,
@@ -560,6 +563,135 @@ test("resolveOktaConfiguration follows Okta CLI-style precedence with per-field 
     "environment",
     "arguments",
   ]);
+});
+
+/** Canaries planted on malformed config lines; every 8-character window of each is distinct so a partial quote is caught too. */
+const CONFIG_CANARIES = {
+  nestedKey: "Qv7ZkT3mR9pXw2Lc",
+  nestedValue: "Hj4NsB8yF6dGa1Ue",
+  alias: "Wm2PxK9rT5vLq7Zb",
+  unterminated: "Lf9BwD4sN7hVe3Ky",
+  indent: "Tn3XcM6zP8gQb5Rw",
+  duplicate: "Rk8VqL2tY7jCn4Fs",
+  readable: "Zx4HnV7qK2mYt9Pw",
+  privateKey: "Bp6TzX3kW9nQ2sRc",
+};
+const LIBRARY_ERROR_WORDING = [
+  "Nested mappings", "is not valid JSON", "Unresolved alias", "illegal operation", "permission denied", "no such file",
+  "not a directory", "Unexpected token", "Missing closing", "Map keys must be unique", "must start at the same column", "DECODER routines",
+];
+
+function fragmentsOf(value, size = 8) {
+  const fragments = [];
+  for (let index = 0; index + size <= value.length; index += 1) fragments.push(value.slice(index, index + size));
+  return fragments;
+}
+
+function assertConfigErrorText(text, { path, code, line, column, canaries }, label) {
+  for (const canary of canaries) {
+    for (const fragment of fragmentsOf(canary)) assert.ok(!text.includes(fragment), `${label} carries a fragment (${fragment}) of ${canary}: ${text}`);
+  }
+  for (const wording of LIBRARY_ERROR_WORDING) assert.ok(!text.includes(wording), `${label} repeats library wording "${wording}": ${text}`);
+  if (path) assert.ok(text.includes(path), `${label} names the path ${path}: ${text}`);
+  assert.ok(text.includes(`(${code})`), `${label} carries the code ${code}: ${text}`);
+  if (line) assert.ok(text.includes(` at line ${line}${column ? `, column ${column}` : ""}`), `${label} carries the position line ${line}: ${text}`);
+  else assert.doesNotMatch(text, / at line \d+/, `${label} invents no line: ${text}`);
+}
+
+function thrownBy(fn) {
+  try {
+    fn();
+  } catch (error) {
+    return error;
+  }
+  assert.fail("expected the call to throw");
+}
+
+async function rejectionOf(promise) {
+  try {
+    await promise;
+  } catch (error) {
+    return error;
+  }
+  assert.fail("expected the promise to reject");
+}
+
+test("rule 9: Okta config loader errors carry only the path, position, and code, never a config line, an alias name, or filesystem wording", async () => {
+  const dir = createTempBase("grclanker-okta-config-errors-");
+  const homeDir = createTempBase("grclanker-okta-config-errors-home-");
+  const registered = [];
+  registerOktaTools({ registerTool: (tool) => registered.push(tool) });
+  const checkAccess = registered.find((tool) => tool.name === "okta_check_access");
+  const exportBundle = registered.find((tool) => tool.name === "okta_export_audit_bundle");
+  const allCanaries = Object.values(CONFIG_CANARIES);
+  const head = "okta:\n  client:\n    orgUrl: https://tenant.example.okta.com\n";
+
+  const parseCases = [
+    { name: "nested mapping", file: "nested.yaml", text: `${head}    token: ${CONFIG_CANARIES.nestedKey}: Bearer ${CONFIG_CANARIES.nestedValue}\n`, leaks: [CONFIG_CANARIES.nestedKey, CONFIG_CANARIES.nestedValue], control: /Nested mappings/, code: "BLOCK_AS_IMPLICIT_KEY", line: 4, column: 12 },
+    { name: "alias", file: "alias.yaml", text: `${head}    token: *${CONFIG_CANARIES.alias}\n`, leaks: [CONFIG_CANARIES.alias], control: /Unresolved alias/, code: "INVALID_YAML" },
+    { name: "unterminated quote", file: "quote.yaml", text: `${head}    token: "${CONFIG_CANARIES.unterminated}\n`, leaks: [CONFIG_CANARIES.unterminated], control: /Missing closing/, code: "MISSING_CHAR", line: 5, column: 1 },
+    { name: "bad indent", file: "indent.yaml", text: `${head}   token: ${CONFIG_CANARIES.indent}\n`, leaks: [CONFIG_CANARIES.indent], control: /same column/, code: "BAD_INDENT", line: 4, column: 1 },
+    { name: "duplicate key", file: "duplicate.yaml", text: `okta:\n  client:\n    token: one\n    token: ${CONFIG_CANARIES.duplicate}\n`, leaks: [CONFIG_CANARIES.duplicate], control: /Map keys must be unique/, code: "DUPLICATE_KEY", line: 4, column: 5 },
+  ];
+  for (const testCase of parseCases) {
+    const configFile = join(dir, testCase.file);
+    writeFileSync(configFile, testCase.text);
+    const library = thrownBy(() => parseYaml(testCase.text));
+    assert.match(library.message, testCase.control, `${testCase.name}: positive control uses the library message`);
+    assert.ok(testCase.leaks.some((canary) => fragmentsOf(canary).some((fragment) => library.message.includes(fragment))), `${testCase.name}: positive control, the library message quotes the canary`);
+
+    const expected = { path: configFile, code: testCase.code, line: testCase.line, column: testCase.column, canaries: allCanaries };
+    const thrown = await rejectionOf(resolveOktaConfiguration({ config_file: configFile }, {}, dir, homeDir));
+    assert.match(thrown.message, /^Unable to parse Okta config file: invalid YAML in /, testCase.name);
+    assertConfigErrorText(thrown.message, expected, `${testCase.name} resolver error`);
+    const fromArgs = await rejectionOf(resolveOktaConfiguration({ config_file: configFile, org_url: "https://tenant.example.okta.com", token: "arg-token" }, {}, dir, homeDir));
+    assertConfigErrorText(fromArgs.message, expected, `${testCase.name} resolver error with credentials in arguments`);
+
+    const result = await checkAccess.execute("call", checkAccess.prepareArguments({ config_file: configFile }));
+    assertConfigErrorText(JSON.stringify(result), expected, `${testCase.name} check_access payload`);
+  }
+
+  const outputRoot = join(dir, "export");
+  const exported = await exportBundle.execute("call", exportBundle.prepareArguments({ config_file: join(dir, "alias.yaml"), output_dir: outputRoot }));
+  assertConfigErrorText(JSON.stringify(exported), { path: join(dir, "alias.yaml"), code: "INVALID_YAML", canaries: allCanaries }, "export payload");
+  assert.equal(existsSync(outputRoot), false, "a config error writes no bundle");
+
+  const readCases = [
+    { name: "EISDIR", path: join(dir, "directory.yaml"), setup: (path) => mkdirSync(path), control: /illegal operation/ },
+    { name: "ENOTDIR", path: join(dir, "plain-file", "okta.yaml"), setup: () => writeFileSync(join(dir, "plain-file"), `${head}    token: ${CONFIG_CANARIES.readable}\n`), control: /not a directory/ },
+  ];
+  if (process.getuid?.() !== 0) {
+    readCases.push({ name: "EACCES", path: join(dir, "locked.yaml"), setup: (path) => { writeFileSync(path, `${head}    token: ${CONFIG_CANARIES.readable}\n`); chmodSync(path, 0o000); }, control: /permission denied/ });
+  }
+  for (const testCase of readCases) {
+    testCase.setup(testCase.path);
+    assert.match(thrownBy(() => readFileSync(testCase.path, "utf8")).message, testCase.control, `${testCase.name}: positive control uses the filesystem message`);
+    const expected = { path: testCase.path, code: testCase.name, canaries: allCanaries };
+    const thrown = await rejectionOf(resolveOktaConfiguration({ config_file: testCase.path }, {}, dir, homeDir));
+    assert.equal(thrown.message, `Unable to read Okta config file ${testCase.path} (${testCase.name})`);
+    assertConfigErrorText(thrown.message, expected, `${testCase.name} resolver error`);
+    const result = await checkAccess.execute("call", checkAccess.prepareArguments({ config_file: testCase.path }));
+    assertConfigErrorText(JSON.stringify(result), expected, `${testCase.name} check_access payload`);
+  }
+
+  const missing = join(dir, "missing.yaml");
+  const absent = await rejectionOf(resolveOktaConfiguration({ config_file: missing }, {}, dir, homeDir));
+  assert.match(absent.message, /Okta org URL is required/, "a missing config file is absent, not a read failure");
+  for (const wording of LIBRARY_ERROR_WORDING) assert.ok(!absent.message.includes(wording));
+  const absentResult = JSON.stringify(await checkAccess.execute("call", checkAccess.prepareArguments({ config_file: missing })));
+  assert.ok(absentResult.includes("Okta org URL is required"));
+  for (const wording of LIBRARY_ERROR_WORDING) assert.ok(!absentResult.includes(wording));
+
+  const badKey = await checkAccess.execute("call", checkAccess.prepareArguments({
+    org_url: "https://tenant.example.okta.com",
+    auth_mode: "PrivateKey",
+    client_id: "0oa-client",
+    scopes: "okta.users.read",
+    private_key: `-----BEGIN PRIVATE KEY-----\n${CONFIG_CANARIES.privateKey}\n-----END PRIVATE KEY-----`,
+  }));
+  const badKeyText = JSON.stringify(badKey);
+  assert.match(badKeyText, /Okta PrivateKey auth could not load the configured private key \((ERR_[A-Z0-9_]+|INVALID_PRIVATE_KEY)\)\./, "an unloadable key names a validated code only");
+  assertConfigErrorText(badKeyText, { code: /ERR_/.test(badKeyText) ? badKeyText.match(/\((ERR_[A-Z0-9_]+)\)/)[1] : "INVALID_PRIVATE_KEY", canaries: allCanaries }, "PrivateKey payload");
 });
 
 test("OktaAuditorClient handles OAuth token refresh, rate limits, and pagination", async () => {

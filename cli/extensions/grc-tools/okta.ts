@@ -5,7 +5,7 @@
  * older okta-inspector project while staying aligned with the official
  * okta-cli-client configuration model and Okta Management API coverage.
  */
-import { createHash, createPrivateKey, randomUUID, sign as signData } from "node:crypto";
+import { createHash, createPrivateKey, randomUUID, sign as signData, type KeyObject } from "node:crypto";
 import {
   createWriteStream,
   existsSync,
@@ -18,7 +18,7 @@ import { homedir } from "node:os";
 import { basename, dirname, join, relative, resolve } from "node:path";
 import { ZipArchive } from "archiver";
 import { Type } from "@sinclair/typebox";
-import { parse as parseYaml } from "yaml";
+import { parseDocument as parseYamlDocument, YAMLError } from "yaml";
 import { errorResult, formatTable, textResult } from "./shared.js";
 
 type JsonRecord = Record<string, unknown>;
@@ -1021,7 +1021,14 @@ function buildClientAssertion(config: OktaResolvedConfig): string {
     );
   }
 
-  const privateKey = createPrivateKey(decodePemEscapes(config.privateKey));
+  let privateKey: KeyObject;
+  try {
+    privateKey = createPrivateKey(decodePemEscapes(config.privateKey));
+  } catch (error) {
+    throw new Error(
+      `Okta PrivateKey auth could not load the configured private key (${thrownCode(error, CRYPTO_ERROR_CODE_PATTERN) ?? "INVALID_PRIVATE_KEY"}). Provide an unencrypted RSA private key in PEM form.`,
+    );
+  }
   if (privateKey.asymmetricKeyType !== "rsa") {
     throw new Error(
       "Okta PrivateKey auth currently supports RSA private keys directly. For other key types, pass client_assertion explicitly.",
@@ -1100,11 +1107,70 @@ function overlayFromEnv(env: NodeJS.ProcessEnv): OktaConfigOverlay {
   };
 }
 
+const FS_ERROR_CODE_PATTERN = /^E[A-Z0-9_]{1,30}$/;
+const YAML_ERROR_CODE_PATTERN = /^[A-Z_]+$/;
+const CRYPTO_ERROR_CODE_PATTERN = /^ERR_[A-Z0-9_]{1,60}$/;
+
+interface ConfigFilePosition {
+  line: number;
+  column?: number;
+}
+
+function thrownCode(error: unknown, pattern: RegExp): string | undefined {
+  const code = typeof error === "object" && error !== null ? (error as { code?: unknown }).code : undefined;
+  return typeof code === "string" && pattern.test(code) ? code : undefined;
+}
+
+/**
+ * Read step of the config loader: a missing file is simply absent, every
+ * other failure is reported by path and errno code only, never by the
+ * filesystem's own wording.
+ */
+async function readConfigFileText(pathname: string): Promise<string | undefined> {
+  try {
+    return await readFile(pathname, "utf8");
+  } catch (error) {
+    const code = thrownCode(error, FS_ERROR_CODE_PATTERN);
+    if (code === "ENOENT") return undefined;
+    throw new Error(`Unable to read Okta config file ${pathname} (${code ?? "UNREADABLE"})`);
+  }
+}
+
+/** Parse step: fixed text plus path, position, and validated code; nothing the parser said, quoted, or named. */
+function configFileParseError(pathname: string, code: string, position: ConfigFilePosition | undefined): Error {
+  const where = position ? ` at line ${position.line}${position.column ? `, column ${position.column}` : ""}` : "";
+  return new Error(`Unable to parse Okta config file: invalid YAML in ${pathname}${where} (${code})`);
+}
+
+/** The yaml package's own error code when the thrown value is a YAMLError (an unresolved alias throws a plain ReferenceError), otherwise a fixed code. */
+function yamlErrorCode(error: unknown): string {
+  return error instanceof YAMLError && YAML_ERROR_CODE_PATTERN.test(error.code) ? error.code : "INVALID_YAML";
+}
+
+function yamlErrorPosition(error: unknown): ConfigFilePosition | undefined {
+  if (!(error instanceof YAMLError)) return undefined;
+  const start = error.linePos?.[0];
+  if (!start || !Number.isInteger(start.line) || start.line < 1) return undefined;
+  return { line: start.line, column: Number.isInteger(start.col) && start.col > 0 ? start.col : undefined };
+}
+
+/** Parses config YAML without logging warnings (their pretty text quotes the source line) and throws the document's first error. */
+function parseConfigYaml(text: string): unknown {
+  const document = parseYamlDocument(text);
+  if (document.errors.length > 0) throw document.errors[0];
+  return document.toJS();
+}
+
 async function readOktaYamlOverlay(location: string): Promise<OktaConfigOverlay | undefined> {
-  if (!existsSync(location)) return undefined;
-  const raw = await readFile(location, "utf8");
-  const parsed = parseYaml(raw) as JsonRecord;
-  const client = asRecord(asRecord(parsed.okta).client);
+  const raw = await readConfigFileText(location);
+  if (raw === undefined) return undefined;
+  let parsed: unknown;
+  try {
+    parsed = parseConfigYaml(raw);
+  } catch (error) {
+    throw configFileParseError(location, yamlErrorCode(error), yamlErrorPosition(error));
+  }
+  const client = asRecord(asRecord(asRecord(parsed).okta).client);
   return {
     orgUrl: asString(client.orgUrl),
     authMode: normalizeAuthMode(asString(client.authorizationMode)),

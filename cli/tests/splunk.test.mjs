@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { existsSync, mkdtempSync, readFileSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -14,6 +14,7 @@ import {
   assessSplunkPlatformHardening,
   checkSplunkAccess,
   exportSplunkAuditBundle,
+  registerSplunkTools,
   resolveSecureOutputPath,
   resolveSplunkConfiguration,
 } from "../dist/extensions/grc-tools/splunk.js";
@@ -238,6 +239,115 @@ test("resolveSplunkConfiguration prefers explicit args over env over config file
 
   assert.throws(() => resolveSplunkConfiguration({ config_file: join(base, "missing.json") }, {}), /SPLUNK_URL/);
   assert.throws(() => resolveSplunkConfiguration({ config_file: join(base, "missing.json"), url: "https://x.example.com:8089" }, {}), /SPLUNK_TOKEN or both/);
+});
+
+/** Canaries planted on malformed config lines; every 8-character window of each is distinct so a partial quote is caught too. */
+const CONFIG_CANARIES = {
+  unquoted: "Yc6RtV3nJ8kMp4Sd",
+  short: "Gz5Kq8Wn2Xt",
+  trailingComma: "Lf9BwD4sN7hVe3Ky",
+  unterminated: "Tn3XcM6zP8gQb5Rw",
+  singleQuoted: "Rk8VqL2tY7jCn4Fs",
+  readable: "Zx4HnV7qK2mYt9Pw",
+};
+const LIBRARY_ERROR_WORDING = [
+  "Nested mappings", "is not valid JSON", "Unresolved alias", "illegal operation", "permission denied", "no such file",
+  "not a directory", "Unexpected token", "Expected double-quoted", "Bad control character", "at position",
+];
+
+function fragmentsOf(value, size = 8) {
+  const fragments = [];
+  for (let index = 0; index + size <= value.length; index += 1) fragments.push(value.slice(index, index + size));
+  return fragments;
+}
+
+function assertConfigErrorText(text, { path, code, line, column, canaries }, label) {
+  for (const canary of canaries) {
+    for (const fragment of fragmentsOf(canary)) assert.ok(!text.includes(fragment), `${label} carries a fragment (${fragment}) of ${canary}: ${text}`);
+  }
+  for (const wording of LIBRARY_ERROR_WORDING) assert.ok(!text.includes(wording), `${label} repeats library wording "${wording}": ${text}`);
+  assert.ok(text.includes(path), `${label} names the path ${path}: ${text}`);
+  assert.ok(text.includes(`(${code})`), `${label} carries the code ${code}: ${text}`);
+  if (line) assert.ok(text.includes(` at line ${line}, column ${column}`), `${label} carries the position line ${line}, column ${column}: ${text}`);
+  else assert.doesNotMatch(text, / at line \d+/, `${label} invents no line: ${text}`);
+}
+
+function thrownBy(fn) {
+  try {
+    fn();
+  } catch (error) {
+    return error;
+  }
+  assert.fail("expected the call to throw");
+}
+
+test("rule 9: Splunk config loader errors carry only the path, position, and code, never the JSON.parse window or filesystem wording", async () => {
+  const dir = createTempBase("grclanker-splunk-config-errors-");
+  const registered = [];
+  registerSplunkTools({ registerTool: (tool) => registered.push(tool) });
+  const checkAccess = registered.find((tool) => tool.name === "splunk_check_access");
+  const exportBundle = registered.find((tool) => tool.name === "splunk_export_audit_bundle");
+  const allCanaries = Object.values(CONFIG_CANARIES);
+  const url = "\"url\": \"https://splunk.example.com:8089\"";
+
+  const parseCases = [
+    { name: "unquoted value", file: "unquoted.json", text: `{\n  ${url},\n  "token": ${CONFIG_CANARIES.unquoted}\n}\n`, leaks: [CONFIG_CANARIES.unquoted], control: /Unexpected token/ },
+    { name: "short file", file: "short.json", text: `{"token":${CONFIG_CANARIES.short}}`, leaks: [CONFIG_CANARIES.short], control: /Unexpected token/, maxLength: 21 },
+    { name: "single-quoted value", file: "single.json", text: `{\n  ${url},\n  "token": '${CONFIG_CANARIES.singleQuoted}'\n}\n`, leaks: [CONFIG_CANARIES.singleQuoted], control: /Unexpected token/ },
+    { name: "trailing comma", file: "trailing.json", text: `{\n  ${url},\n  "token": "${CONFIG_CANARIES.trailingComma}",\n}\n`, leaks: [], control: /at position 77 \(line 4 column 1\)/, line: 4, column: 1 },
+    { name: "unterminated string", file: "unterminated.json", text: `{\n  ${url},\n  "token": "${CONFIG_CANARIES.unterminated}\n}\n`, leaks: [], control: /at position 74 \(line 3 column 29\)/, line: 3, column: 29 },
+  ];
+  for (const testCase of parseCases) {
+    const configFile = join(dir, testCase.file);
+    writeFileSync(configFile, testCase.text);
+    if (testCase.maxLength) assert.ok(testCase.text.length <= testCase.maxLength, `${testCase.name}: JSON.parse quotes the whole source of a file this short`);
+    const library = thrownBy(() => JSON.parse(testCase.text));
+    assert.match(library.message, testCase.control, `${testCase.name}: positive control uses the JSON.parse message`);
+    for (const canary of testCase.leaks) {
+      assert.ok(fragmentsOf(canary).some((fragment) => library.message.includes(fragment)), `${testCase.name}: positive control, JSON.parse quotes a window of the canary`);
+    }
+
+    const expected = { path: configFile, code: "INVALID_JSON", line: testCase.line, column: testCase.column, canaries: allCanaries };
+    const thrown = thrownBy(() => resolveSplunkConfiguration({ config_file: configFile }, {}));
+    assert.match(thrown.message, /^Unable to parse Splunk config file: invalid JSON in /, testCase.name);
+    assertConfigErrorText(thrown.message, expected, `${testCase.name} resolver error`);
+    const fromArgs = thrownBy(() => resolveSplunkConfiguration({ config_file: configFile, url: "https://arg.example.com:8089", token: "arg-token" }, {}));
+    assertConfigErrorText(fromArgs.message, expected, `${testCase.name} resolver error with credentials in arguments`);
+
+    const result = await checkAccess.execute("call", checkAccess.prepareArguments({ config_file: configFile }));
+    assertConfigErrorText(JSON.stringify(result), expected, `${testCase.name} check_access payload`);
+  }
+
+  const outputRoot = join(dir, "export");
+  const exported = await exportBundle.execute("call", exportBundle.prepareArguments({ config_file: join(dir, "unquoted.json"), output_dir: outputRoot }));
+  assertConfigErrorText(JSON.stringify(exported), { path: join(dir, "unquoted.json"), code: "INVALID_JSON", canaries: allCanaries }, "export payload");
+  assert.equal(existsSync(outputRoot), false, "a config error writes no bundle");
+
+  const readCases = [
+    { name: "EISDIR", path: join(dir, "directory.json"), setup: (path) => mkdirSync(path), control: /illegal operation/ },
+    { name: "ENOTDIR", path: join(dir, "plain-file", "splunk.json"), setup: () => writeFileSync(join(dir, "plain-file"), `{"token":"${CONFIG_CANARIES.readable}"}`), control: /not a directory/ },
+  ];
+  if (process.getuid?.() !== 0) {
+    readCases.push({ name: "EACCES", path: join(dir, "locked.json"), setup: (path) => { writeFileSync(path, `{"token":"${CONFIG_CANARIES.readable}"}`); chmodSync(path, 0o000); }, control: /permission denied/ });
+  }
+  for (const testCase of readCases) {
+    testCase.setup(testCase.path);
+    assert.match(thrownBy(() => readFileSync(testCase.path, "utf8")).message, testCase.control, `${testCase.name}: positive control uses the filesystem message`);
+    const expected = { path: testCase.path, code: testCase.name, canaries: allCanaries };
+    const thrown = thrownBy(() => resolveSplunkConfiguration({ config_file: testCase.path }, {}));
+    assert.equal(thrown.message, `Unable to read Splunk config file ${testCase.path} (${testCase.name})`);
+    assertConfigErrorText(thrown.message, expected, `${testCase.name} resolver error`);
+    const result = await checkAccess.execute("call", checkAccess.prepareArguments({ config_file: testCase.path }));
+    assertConfigErrorText(JSON.stringify(result), expected, `${testCase.name} check_access payload`);
+  }
+
+  const missing = join(dir, "missing.json");
+  const absent = thrownBy(() => resolveSplunkConfiguration({ config_file: missing }, {}));
+  assert.match(absent.message, /SPLUNK_URL/, "a missing config file is absent, not a read failure");
+  for (const wording of LIBRARY_ERROR_WORDING) assert.ok(!absent.message.includes(wording));
+  const absentResult = JSON.stringify(await checkAccess.execute("call", checkAccess.prepareArguments({ config_file: missing })));
+  assert.ok(absentResult.includes("SPLUNK_URL"));
+  for (const wording of LIBRARY_ERROR_WORDING) assert.ok(!absentResult.includes(wording));
 });
 
 test("SplunkApiClient sends bearer tokens, output_mode=json, and pages with count/offset until paging.total", async () => {

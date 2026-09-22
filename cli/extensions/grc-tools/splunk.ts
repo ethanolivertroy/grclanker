@@ -460,13 +460,66 @@ async function countFilesRecursively(rootDir: string): Promise<number> {
   return total;
 }
 
-function readConfigFile(pathname: string | undefined): JsonRecord {
-  if (!pathname || !existsSync(pathname)) return {};
+const FS_ERROR_CODE_PATTERN = /^E[A-Z0-9_]{1,30}$/;
+const JSON_ERROR_POSITION_PATTERN = /\bat position (\d+)\b/;
+
+interface ConfigFilePosition {
+  line: number;
+  column: number;
+}
+
+function thrownCode(error: unknown, pattern: RegExp): string | undefined {
+  const code = typeof error === "object" && error !== null ? (error as { code?: unknown }).code : undefined;
+  return typeof code === "string" && pattern.test(code) ? code : undefined;
+}
+
+/**
+ * Read step of the config loader: a missing file is simply absent, every
+ * other failure is reported by path and errno code only, never by the
+ * filesystem's own wording.
+ */
+function readConfigFileText(pathname: string): string | undefined {
   try {
-    return asObject(JSON.parse(readFileSync(pathname, "utf8"))) ?? {};
+    return readFileSync(pathname, "utf8");
   } catch (error) {
-    throw new Error(`Unable to parse Splunk config file ${pathname}: ${errorMessage(error)}`);
+    const code = thrownCode(error, FS_ERROR_CODE_PATTERN);
+    if (code === "ENOENT") return undefined;
+    throw new Error(`Unable to read Splunk config file ${pathname} (${code ?? "UNREADABLE"})`);
   }
+}
+
+/**
+ * JSON.parse messages quote a window of the source (or all of it when the
+ * file is short), so only an offset matched by a strict pattern is taken
+ * from them, and it is turned into a line and column over the text we read.
+ */
+function jsonErrorPosition(error: unknown, text: string): ConfigFilePosition | undefined {
+  if (!(error instanceof SyntaxError)) return undefined;
+  const match = JSON_ERROR_POSITION_PATTERN.exec(error.message);
+  if (!match) return undefined;
+  const offset = Math.min(Number(match[1]), text.length);
+  const before = text.slice(0, offset);
+  const lineStart = before.lastIndexOf("\n") + 1;
+  return { line: before.split("\n").length, column: offset - lineStart + 1 };
+}
+
+/** Parse step: fixed text plus path, position, and a fixed code; nothing JSON.parse said or quoted. */
+function configFileParseError(pathname: string, position: ConfigFilePosition | undefined): Error {
+  const where = position ? ` at line ${position.line}, column ${position.column}` : "";
+  return new Error(`Unable to parse Splunk config file: invalid JSON in ${pathname}${where} (INVALID_JSON)`);
+}
+
+function readConfigFile(pathname: string | undefined): JsonRecord {
+  if (!pathname) return {};
+  const text = readConfigFileText(pathname);
+  if (text === undefined) return {};
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(text);
+  } catch (error) {
+    throw configFileParseError(pathname, jsonErrorPosition(error, text));
+  }
+  return asObject(parsed) ?? {};
 }
 
 function pickSetting(
