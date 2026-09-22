@@ -511,8 +511,13 @@ const QUERY_PAIR_PATTERN = /([?&#])([A-Za-z0-9_.[\]-]+)=((?!\[REDACTED\])[^&#\s"
 // the same depth, so Cookie: sid="value" loses value and quotes together instead of
 // stopping at the first quote, and ends an unquoted value before the next header on a
 // compound line, so the next header keeps its name. A value that already opens with a
-// marker is left alone so the rule is idempotent.
-const HEADER_LINE_PATTERN = /\b(authorization|proxy-authorization|cookie|set-cookie|x-api-key|x-apikeys?|api-key|apikey|x-pan-key|x-redlock-auth|x-auth-token|x-access-token|x-amz-security-token|x-vault-token|private-token|x-goog-api-key|x-csrf-token|x-xsrf-token)((?:\\*["'])?\s*:\s*)/gi;
+// marker is left alone so the rule is idempotent. The name starts where no word character
+// precedes it, or right after a JSON string escape left in place by one stringify (\n, \r,
+// \t, \b, \f, \v, \0, \uXXXX, \xHH): "request failed\nX-SecurityCenter: value" is a header
+// line inside a JSON string, and the escape letter is not part of the name that follows it.
+const HEADER_LINE_PATTERN = /(?:(?<![A-Za-z0-9_])|(?<=\\[nrtbfv0]|\\u[0-9A-Fa-f]{4}|\\x[0-9A-Fa-f]{2}))(authorization|proxy-authorization|cookie|set-cookie|x-cookie|x-api-key|x-apikeys?|api-key|apikey|x-securitycenter|x-pan-key|x-redlock-auth|x-auth-token|x-access-token|x-amz-security-token|x-vault-token|private-token|x-goog-api-key|x-csrf-token|x-xsrf-token)((?:\\*["'])?\s*:\s*)/gi;
+// The escape letters that can sit between a backslash and the key or header name after it.
+const ESCAPE_LETTER_PATTERN = /^(?:[nrtbfv0]|u[0-9A-Fa-f]{4}|x[0-9A-Fa-f]{2})/;
 // Inside a header value a quote opens a quoted segment only where a value can start: at the
 // start of the value or after "=", ":", ",", ";", "(", or whitespace. Anywhere else it is the
 // quote that closes the text the header line was quoted in.
@@ -566,8 +571,11 @@ const QUOTED_ATTRIBUTE_PATTERN = /(?<![A-Za-z0-9_.:-])([A-Za-z_][A-Za-z0-9_.:-]{
 // never taken for a value. The key and the value may be quoted with the quotes escaped to
 // any depth; a value never runs into the escaped quote that closes it.
 const ASSIGNMENT_KEY_PATTERN = /(?<![A-Za-z0-9_.-])((?:\\*["'])?)([A-Za-z_][A-Za-z0-9_.-]{0,63})((?:\\*["'])?\s*([:=])\s*(?:\\*["'])?)/g;
-const DELIMITED_VALUE_PATTERN = /(?!\[REDACTED\])(?:(?!\\+["'])[^\s"'<>;,&])+/y;
-const LINE_VALUE_PATTERN = /(?!\[REDACTED\])(?:(?!\\+["'])[^\r\n<>"',;{}[\]])*(?!\\+["'])[^\s\r\n<>"',;{}[\]]/y;
+// A value also ends at a line break left escaped by one stringify (\n, \r, \u000a, \u000d),
+// as it does at the raw character, so the header or pair on the next escaped line is read
+// on its own.
+const DELIMITED_VALUE_PATTERN = /(?!\[REDACTED\])(?:(?!\\+["'])(?!\\(?:[nr]|u000[adAD]))[^\s"'<>;,&])+/y;
+const LINE_VALUE_PATTERN = /(?!\[REDACTED\])(?:(?!\\+["'])(?!\\(?:[nr]|u000[adAD]))[^\r\n<>"',;{}[\]])*(?!\\+["'])(?!\\(?:[nr]|u000[adAD]))[^\s\r\n<>"',;{}[\]]/y;
 const TOKEN_IN_PATH_WEBHOOK_PATTERN = /(https?:\/\/(?:hooks\.slack\.com\/services|discord(?:app)?\.com\/api\/webhooks|[a-z0-9.-]*webhook\.office\.com\/webhookb2)\/)(?!\[REDACTED\])[^\s"'<>]+/gi;
 const JWT_PATTERN = /\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}(?:\.[A-Za-z0-9_-]+)*/g;
 const PANOS_API_KEY_PATTERN = /\bLUFRPT[A-Za-z0-9+/=_-]{16,}/g;
@@ -757,6 +765,27 @@ function lineEndFrom(text: string, start: number): number {
   return terminator ? start + terminator.index : text.length;
 }
 
+// True at a line break left escaped by one stringify (\n, \r, \u000a, \u000d behind an
+// odd run of backslashes): a line end for an unquoted header value, as the raw character is.
+function escapedLineBreakAt(text: string, index: number): boolean {
+  const run = backslashRun(text, index);
+  if (run === 0 || run % 2 === 0) return false;
+  const letter = text[index + run];
+  if (letter === "n" || letter === "r") return true;
+  return letter === "u" && /^000[ad]$/i.test(text.slice(index + run + 1, index + run + 5));
+}
+
+// The key without the escape letter in front of it: after an escaping backslash the letter
+// belongs to the escape (\napi_key is a newline and then api_key), not to the key. Only the
+// credential test uses the result; the text itself is left as it arrived.
+function keyAfterEscape(text: string, keyStart: number, key: string): string {
+  let run = 0;
+  while (keyStart - 1 - run >= 0 && text[keyStart - 1 - run] === "\\") run += 1;
+  if (run % 2 === 0) return key;
+  const letter = ESCAPE_LETTER_PATTERN.exec(key);
+  return letter ? key.slice(letter[0].length) : key;
+}
+
 // The index of the token that closes a quoted segment opened with token, before limit, or
 // -1. A token at a deeper depth (more backslashes) is content of the segment; a token nearer
 // the surface closes the text the segment sits in, so the segment is unterminated.
@@ -782,10 +811,11 @@ function closingQuoteIndex(text: string, from: number, token: string, limit: num
 // at an HTML tag, at the ";" or "," before the "Name:" token of the next header on a
 // compound line (on "Cookie: sid=value; X-Api-Key: value" the next header keeps its name
 // and gets its own carrier treatment, and a Content-Type or Date after a cookie keeps its
-// name and value), or at the quote that closes the text the line sits in. Inside an
-// unquoted value a quote where a value can start opens a quoted segment carried through its
-// closing token; a quote anywhere else closes the enclosing text. Trailing whitespace is not
-// part of the value.
+// name and value), at a line break left escaped inside a JSON string (\n, \r, \u000a), or
+// at the quote that closes the text the line sits in. Inside an unquoted value a quote
+// where a value can start opens a quoted segment carried through its closing token; a
+// quote anywhere else closes the enclosing text. Trailing whitespace is not part of the
+// value.
 function headerValueEnd(text: string, start: number): number {
   const limit = lineEndFrom(text, start);
   const opening = quoteTokenAt(text, start);
@@ -797,6 +827,7 @@ function headerValueEnd(text: string, start: number): number {
   while (index < limit) {
     const char = text[index];
     if ((char === ";" || char === ",") && FOLLOWING_HEADER_PATTERN.test(text.slice(index + 1, index + 1 + FOLLOWING_HEADER_LOOKAHEAD))) break;
+    if (char === "\\" && escapedLineBreakAt(text, index)) break;
     const token = quoteTokenAt(text, index);
     if (token === undefined) {
       index += char === "\\" ? backslashRun(text, index) : 1;
@@ -850,11 +881,12 @@ function replaceCredentialAssignments(text: string): string {
   let match: RegExpExecArray | null;
   while ((match = ASSIGNMENT_KEY_PATTERN.exec(text)) !== null) {
     const [whole, openingQuote, key, separator, operator] = match;
-    if (!(operator === "=" ? isCredentialAssignmentKey(key) : isCredentialKey(key))) continue;
+    const name = keyAfterEscape(text, match.index + openingQuote.length, key);
+    if (!(operator === "=" ? isCredentialAssignmentKey(name) : isCredentialKey(name))) continue;
     const valuePattern = operator === ":" ? LINE_VALUE_PATTERN : DELIMITED_VALUE_PATTERN;
     valuePattern.lastIndex = match.index + whole.length;
     const value = valuePattern.exec(text)?.[0];
-    if (value === undefined || STRUCTURAL_VALUE_PATTERN.test(value) || isCountValue(key, value)) continue;
+    if (value === undefined || STRUCTURAL_VALUE_PATTERN.test(value) || isCountValue(name, value)) continue;
     out += `${text.slice(last, match.index)}${openingQuote}${key}${separator}${CREDENTIAL_REDACTION_MARKER}`;
     last = match.index + whole.length + value.length;
     ASSIGNMENT_KEY_PATTERN.lastIndex = last;
@@ -871,7 +903,7 @@ function scrubCarriers(text: string, pemScope: PemScope): string {
     .replace(SCHEME_VALUE_PATTERN, (match, scheme: string, value: string) => (isSchemeProse(scheme, value) ? match : `${scheme} ${CREDENTIAL_REDACTION_MARKER}`))
     .replace(JSON_QUOTED_PAIR_PATTERN, (match, key: string, separator: string, value: string) => (isCredentialKey(key) && !isCountValue(key, value) ? `"${key}"${separator}"${CREDENTIAL_REDACTION_MARKER}"` : match))
     .replace(JSON_ESCAPED_PAIR_PATTERN, (match, run: string, key: string, separator: string, value: string) => (isCredentialKey(key) && !isCountValue(key, value) ? `${run}"${key}${run}"${separator}${run}"${CREDENTIAL_REDACTION_MARKER}${run}"` : match))
-    .replace(QUOTED_ATTRIBUTE_PATTERN, (match, key: string, quote: string) => (isCredentialKey(key) ? `${key}=${quote}${CREDENTIAL_REDACTION_MARKER}${quote}` : match));
+    .replace(QUOTED_ATTRIBUTE_PATTERN, (match, key: string, quote: string, _value: string, offset: number, whole: string) => (isCredentialKey(keyAfterEscape(whole, offset, key)) ? `${key}=${quote}${CREDENTIAL_REDACTION_MARKER}${quote}` : match));
   return replaceCredentialAssignments(scrubbed)
     .replace(JWT_PATTERN, CREDENTIAL_REDACTION_MARKER)
     .replace(PANOS_API_KEY_PATTERN, CREDENTIAL_REDACTION_MARKER)

@@ -1476,6 +1476,76 @@ function carriersOf(value) {
   ];
 }
 
+// Reviewer E gap 9: inside a JSON string that was stringified once, a line break or a tab
+// arrives as the two characters \n, \r, \t (or the six of \u000a, \u0009), and the header
+// name after it has no word boundary in front of it ("\nX-SecurityCenter" reads as one
+// word), so the header rule missed it and the pair rule read "nX-SecurityCenter" as a key
+// naming nothing. Every credential header the three integrations send, after every escape,
+// bare, as a JSON string member, and followed by more escaped text, loses its value in both
+// scrubs; the Content-Type and Date on the next escaped line keep their names and values;
+// the pair rule reads the key after the escape the same way; the result is a fixed point.
+const GAP9_VALUE = "sess-escn-NLINE-27182818284590";
+const GAP9_HEADERS = [
+  ["X-SecurityCenter", (value) => `X-SecurityCenter: ${value}`],
+  ["X-ApiKeys", (value) => `X-ApiKeys: accessKey=${value}; secretKey=${value}`],
+  ["X-Cookie", (value) => `X-Cookie: token=${value}`],
+  ["X-PAN-KEY", (value) => `X-PAN-KEY: ${value}`],
+  ["x-redlock-auth", (value) => `x-redlock-auth: ${value}`],
+  ["Authorization Bearer", (value) => `Authorization: Bearer ${value}`],
+  ["Authorization Basic", (value) => `Authorization: Basic ${value}`],
+  ["Cookie", (value) => `Cookie: sid=${value}`],
+  ["Set-Cookie", (value) => `Set-Cookie: session=${value}; Path=/; HttpOnly`],
+  ["quoted X-SecurityCenter", (value) => `X-SecurityCenter: "${value}"`],
+  ["quoted Cookie", (value) => `Cookie: sid="${value}"; theme=dark`],
+];
+const GAP9_ESCAPES = ["\\n", "\\r\\n", "\\r", "\\t", "\\b", "\\f", "\\v", "\\u000a", "\\u0009", "\\\""];
+const GAP9_FOLLOWING = "\\nContent-Type: application/json\\r\\nDate: Tue, 22 Sep 2026 18:00:00 GMT";
+const GAP9_CONTEXTS = [
+  ["bare", (escape, line) => `request failed${escape}${line}`],
+  ["JSON member", (escape, line) => `{"detail":"request failed${escape}${line}","code":403}`],
+  ["followed by escaped text", (escape, line) => `request failed${escape}${line}${GAP9_FOLLOWING}`],
+];
+const GAP9_PAIRS = [
+  (value) => `\\nkey=${value}&x=1`, (value) => `\\nauth: ${value}`, (value) => `\\nsid=${value}; path=/`, (value) => `\\npin=${value}`,
+  (value) => `\\u000atoken=${value}`, (value) => `\\tpassword: ${value}`, (value) => `\\r\\nsecret='${value}'`, (value) => `\\nkey="${value}"`,
+  (value) => `\\u0009otp=${value}`, (value) => `\\bapi_key=${value}`,
+];
+const GAP9_CONTROLS = [
+  "request failed\\nContent-Type: application/json\\nDate: Tue, 22 Sep 2026 18:00:00 GMT\\nX-Total-Count: 3",
+  '{"detail":"request failed\\nContent-Length: 42\\r\\nAccept: text/html\\tX-Request-Id: 7d2f4e6a"}',
+  "\\napi_keys: 3\\nkeys=2\\ncookies: 0",
+  "The upstream\\nrequested the token inventory\\nand the cookie count is 3",
+];
+
+test("reviewer E gap 9: every credential header and pair key after a JSON string escape loses its value in both scrubs, bare, as a JSON member, and followed by more escaped text, while the headers on the next escaped line keep their names", () => {
+  let cases = 0;
+  for (const scrub of [redactErrorText, redactCredentialValueText]) {
+    for (const [name, line] of GAP9_HEADERS) for (const escape of GAP9_ESCAPES) for (const [context, wrap] of GAP9_CONTEXTS) {
+      const text = wrap(escape, line(GAP9_VALUE));
+      const out = scrub(text);
+      const label = `reviewer E gap 9: ${scrub.name} ${name} after ${JSON.stringify(escape)} ${context}`;
+      assertNoWindow(out, GAP9_VALUE, label);
+      assert.ok(out.includes("[REDACTED]"), `${label}: no marker in ${out}`);
+      if (context === "followed by escaped text") assert.ok(out.endsWith(GAP9_FOLLOWING), `${label}: the following headers lost a name or a value: ${out}`);
+      if (context === "JSON member") assert.ok(out.endsWith('","code":403}'), `${label}: the JSON member lost its closing text: ${out}`);
+      assert.equal(scrub(out), out, `${label}: not idempotent on ${out}`);
+      cases += 1;
+    }
+    for (const pair of GAP9_PAIRS) for (const [context, wrap] of GAP9_CONTEXTS) {
+      const text = wrap("", pair(GAP9_VALUE));
+      const out = scrub(text);
+      const label = `reviewer E gap 9: ${scrub.name} pair ${JSON.stringify(pair(GAP9_VALUE))} ${context}`;
+      assertNoWindow(out, GAP9_VALUE, label);
+      assert.ok(out.includes("[REDACTED]"), `${label}: no marker in ${out}`);
+      if (context === "followed by escaped text") assert.ok(out.endsWith(GAP9_FOLLOWING), `${label}: the following headers lost a name or a value: ${out}`);
+      assert.equal(scrub(out), out, `${label}: not idempotent on ${out}`);
+      cases += 1;
+    }
+    for (const text of GAP9_CONTROLS) assert.equal(scrub(text), text, `reviewer E gap 9: ${scrub.name} changed a control: ${text}`);
+  }
+  assert.equal(cases, 2 * (GAP9_HEADERS.length * GAP9_ESCAPES.length + GAP9_PAIRS.length) * GAP9_CONTEXTS.length);
+});
+
 test("scrub boundary: name-shaped values stay bare in prose, leave every carrier whatever their shape, and go as configured secrets in every form", () => {
   for (const value of NAME_SHAPED_VALUES) {
     for (const prose of [`device ${value} was not read`, `${value}`, `inventory ${value} read 12 of 40 resources`, `path /var/lib/${value}/state`]) {

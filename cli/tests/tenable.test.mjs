@@ -1135,6 +1135,18 @@ function carriersOf(value) {
     [`{"detail":"<scanner name=\\"s1\\" key=\\"${value}\\"/>"}`, /^\{"detail":"<scanner name=\\"s1\\" key=\\"\[REDACTED\]\\"\/>"\}$/],
     [`{"detail":"password: \\"${value}\\" rejected"}`, /^\{"detail":"password: \\"\[REDACTED\]\\" rejected"\}$/],
     [`{"detail":"registration_code=\\"${value}\\" rejected"}`, /^\{"detail":"registration_code=\\"\[REDACTED\]\\" rejected"\}$/],
+    // Reviewer E gap 9: a header name or a pair key right after a JSON string escape left by
+    // one stringify (\n, \t, \r\n, \u000a, \u0009) is a carrier as it is at a word boundary,
+    // bare, inside a JSON string member, and nested one level down; an unquoted value ends at
+    // the next escaped line break, so the header after it keeps its name and a Content-Type
+    // or Date keeps name and value, and a quoted value still ends at its closing quote.
+    [`request failed\\napi_key=${value}; \\nX-SecurityCenter: ${value}\\nContent-Type: application/json`, /^request failed\\napi_key=\[REDACTED\]; \\nX-SecurityCenter: \[REDACTED\]\\nContent-Type: application\/json$/],
+    [`{"detail":"request failed\\napi_key=${value}; \\nX-SecurityCenter: ${value}\\nContent-Type: application/json"}`, /^\{"detail":"request failed\\napi_key=\[REDACTED\]; \\nX-SecurityCenter: \[REDACTED\]\\nContent-Type: application\/json"\}$/],
+    [`upstream said {"headers":"\\r\\nX-SecurityCenter: ${value}\\r\\nAuthorization: Bearer ${value}\\r\\nX-Cookie: token=${value}\\u000aCookie: sid=${value}"}`, /^upstream said \{"headers":"\\r\\nX-SecurityCenter: \[REDACTED\]\\r\\nAuthorization: \[REDACTED\]\\r\\nX-Cookie: \[REDACTED\]\\u000aCookie: \[REDACTED\]"\}$/],
+    [`\\tX-SecurityCenter: "${value}"\\u0009X-ApiKeys: accessKey=${value};secretKey=${value}\\r\\nDate: Tue, 22 Sep 2026 18:00:00 GMT`, /^\\tX-SecurityCenter: "\[REDACTED\]"\\u0009X-ApiKeys: \[REDACTED\]\\r\\nDate: Tue, 22 Sep 2026 18:00:00 GMT$/],
+    [`\\nX-PAN-KEY: ${value}\\nx-redlock-auth: ${value}\\nSet-Cookie: session=${value}; Path=/\\nX-Total-Count: 3`, /^\\nX-PAN-KEY: \[REDACTED\]\\nx-redlock-auth: \[REDACTED\]\\nSet-Cookie: \[REDACTED\]\\nX-Total-Count: 3$/],
+    [`\\tpassword: ${value}\\nkey=${value}&x=1\\u000apin=${value}\\nContent-Length: 42`, /^\\tpassword: \[REDACTED\]\\nkey=\[REDACTED\]&x=1\\u000apin=\[REDACTED\]\\nContent-Length: 42$/],
+    [`{"detail":"login failed\\nAuthorization: Basic ${value}\\nsid=${value}; \\nauth: ${value}"}`, /^\{"detail":"login failed\\nAuthorization: \[REDACTED\]\\nsid=\[REDACTED\]; \\nauth: \[REDACTED\]"\}$/],
     [`accessKey=${value};secretKey=${value}`, /^accessKey=\[REDACTED\];secretKey=\[REDACTED\]$/],
     [`TNS_SESSIONID=${value}; Path=/`, /^TNS_SESSIONID=\[REDACTED\]; Path=\/$/],
     [`session=${value} expired`, /^session=\[REDACTED\] expired$/],
@@ -1158,6 +1170,76 @@ function carriersOf(value) {
     [`<field name='pw' password='${value}'/>`, /^<field name='pw' password='\[REDACTED\]'\/>$/],
   ];
 }
+
+// Reviewer E gap 9: inside a JSON string that was stringified once, a line break or a tab
+// arrives as the two characters \n, \r, \t (or the six of \u000a, \u0009), and the header
+// name after it has no word boundary in front of it ("\nX-SecurityCenter" reads as one
+// word), so the header rule missed it and the pair rule read "nX-SecurityCenter" as a key
+// naming nothing. Every credential header the three integrations send, after every escape,
+// bare, as a JSON string member, and followed by more escaped text, loses its value in both
+// scrubs; the Content-Type and Date on the next escaped line keep their names and values;
+// the pair rule reads the key after the escape the same way; the result is a fixed point.
+const GAP9_VALUE = "sess-escn-NLINE-27182818284590";
+const GAP9_HEADERS = [
+  ["X-SecurityCenter", (value) => `X-SecurityCenter: ${value}`],
+  ["X-ApiKeys", (value) => `X-ApiKeys: accessKey=${value}; secretKey=${value}`],
+  ["X-Cookie", (value) => `X-Cookie: token=${value}`],
+  ["X-PAN-KEY", (value) => `X-PAN-KEY: ${value}`],
+  ["x-redlock-auth", (value) => `x-redlock-auth: ${value}`],
+  ["Authorization Bearer", (value) => `Authorization: Bearer ${value}`],
+  ["Authorization Basic", (value) => `Authorization: Basic ${value}`],
+  ["Cookie", (value) => `Cookie: sid=${value}`],
+  ["Set-Cookie", (value) => `Set-Cookie: session=${value}; Path=/; HttpOnly`],
+  ["quoted X-SecurityCenter", (value) => `X-SecurityCenter: "${value}"`],
+  ["quoted Cookie", (value) => `Cookie: sid="${value}"; theme=dark`],
+];
+const GAP9_ESCAPES = ["\\n", "\\r\\n", "\\r", "\\t", "\\b", "\\f", "\\v", "\\u000a", "\\u0009", "\\\""];
+const GAP9_FOLLOWING = "\\nContent-Type: application/json\\r\\nDate: Tue, 22 Sep 2026 18:00:00 GMT";
+const GAP9_CONTEXTS = [
+  ["bare", (escape, line) => `request failed${escape}${line}`],
+  ["JSON member", (escape, line) => `{"detail":"request failed${escape}${line}","code":403}`],
+  ["followed by escaped text", (escape, line) => `request failed${escape}${line}${GAP9_FOLLOWING}`],
+];
+const GAP9_PAIRS = [
+  (value) => `\\nkey=${value}&x=1`, (value) => `\\nauth: ${value}`, (value) => `\\nsid=${value}; path=/`, (value) => `\\npin=${value}`,
+  (value) => `\\u000atoken=${value}`, (value) => `\\tpassword: ${value}`, (value) => `\\r\\nsecret='${value}'`, (value) => `\\nkey="${value}"`,
+  (value) => `\\u0009otp=${value}`, (value) => `\\bapi_key=${value}`,
+];
+const GAP9_CONTROLS = [
+  "request failed\\nContent-Type: application/json\\nDate: Tue, 22 Sep 2026 18:00:00 GMT\\nX-Total-Count: 3",
+  '{"detail":"request failed\\nContent-Length: 42\\r\\nAccept: text/html\\tX-Request-Id: 7d2f4e6a"}',
+  "\\napi_keys: 3\\nkeys=2\\ncookies: 0",
+  "The upstream\\nrequested the token inventory\\nand the cookie count is 3",
+];
+
+test("reviewer E gap 9: every credential header and pair key after a JSON string escape loses its value in both scrubs, bare, as a JSON member, and followed by more escaped text, while the headers on the next escaped line keep their names", () => {
+  let cases = 0;
+  for (const scrub of [redactErrorText, redactCredentialValueText]) {
+    for (const [name, line] of GAP9_HEADERS) for (const escape of GAP9_ESCAPES) for (const [context, wrap] of GAP9_CONTEXTS) {
+      const text = wrap(escape, line(GAP9_VALUE));
+      const out = scrub(text);
+      const label = `reviewer E gap 9: ${scrub.name} ${name} after ${JSON.stringify(escape)} ${context}`;
+      assertNoWindow(out, GAP9_VALUE, label);
+      assert.ok(out.includes("[REDACTED]"), `${label}: no marker in ${out}`);
+      if (context === "followed by escaped text") assert.ok(out.endsWith(GAP9_FOLLOWING), `${label}: the following headers lost a name or a value: ${out}`);
+      if (context === "JSON member") assert.ok(out.endsWith('","code":403}'), `${label}: the JSON member lost its closing text: ${out}`);
+      assert.equal(scrub(out), out, `${label}: not idempotent on ${out}`);
+      cases += 1;
+    }
+    for (const pair of GAP9_PAIRS) for (const [context, wrap] of GAP9_CONTEXTS) {
+      const text = wrap("", pair(GAP9_VALUE));
+      const out = scrub(text);
+      const label = `reviewer E gap 9: ${scrub.name} pair ${JSON.stringify(pair(GAP9_VALUE))} ${context}`;
+      assertNoWindow(out, GAP9_VALUE, label);
+      assert.ok(out.includes("[REDACTED]"), `${label}: no marker in ${out}`);
+      if (context === "followed by escaped text") assert.ok(out.endsWith(GAP9_FOLLOWING), `${label}: the following headers lost a name or a value: ${out}`);
+      assert.equal(scrub(out), out, `${label}: not idempotent on ${out}`);
+      cases += 1;
+    }
+    for (const text of GAP9_CONTROLS) assert.equal(scrub(text), text, `reviewer E gap 9: ${scrub.name} changed a control: ${text}`);
+  }
+  assert.equal(cases, 2 * (GAP9_HEADERS.length * GAP9_ESCAPES.length + GAP9_PAIRS.length) * GAP9_CONTEXTS.length);
+});
 
 test("scrub boundary: name-shaped values stay bare in prose, leave every carrier whatever their shape, and go as configured secrets in every form", () => {
   for (const value of NAME_SHAPED_VALUES) {
@@ -1515,6 +1597,11 @@ const CANARY_PLAIN = "uhfsumxscmhlzj";
 // that carries a quoted value through its closing quote, so its absence proves that rule ran.
 const CANARY_QUOTED = "sess-qtdv-QCARRY-16180339887498";
 const CANARIES = [CANARY_BEARER, CANARY_SESSION, CANARY_API_KEY, CANARY_URL_TOKEN, CANARY_NAMED, CANARY_PLAIN, CANARY_QUOTED];
+// Reviewer E gap 9: a third name-shaped value that travels only as the X-SecurityCenter
+// session token after a JSON string escape (\nX-SecurityCenter: value), so nothing but a
+// header rule that recognises the name after the escape removes it.
+const CANARY_ESCAPED_HEADER = "sess-escn-NLINE-27182818284590";
+const ESCAPED_CANARIES = [CANARY_ESCAPED_HEADER, CANARY_BEARER, CANARY_API_KEY];
 // The secret of a user-and-secret prefix on a configured URL (rule 9: a configured URL is
 // written as scheme and host only).
 const CANARY_USERINFO = "Uq7pXw2ZmK9vT4bR3sN8Lc";
@@ -1550,6 +1637,21 @@ function jsonCanaryResponse() {
     error_msg: `${CANARY_ESCAPED_NOTE}; X-Cookie: token="${CANARY_QUOTED}"`,
   }), { status: 400, statusText: "Bad Request", headers: { "content-type": "application/json" } });
 }
+
+// Reviewer E gap 9: a 403 whose documented fields carry header lines behind the two- and
+// six-character escapes one stringify leaves in a JSON string (\n, \r\n, \t, \u000a, \u0009),
+// bare, nested in a stringified request dump, and followed by more escaped text.
+function escapedHeaderCanaryResponse() {
+  return new Response(JSON.stringify({
+    error: `request failed\\napi_key=${CANARY_API_KEY}; \\nX-SecurityCenter: ${CANARY_ESCAPED_HEADER}\\nContent-Type: application/json`,
+    message: `upstream said {"headers":"\\r\\nX-SecurityCenter: ${CANARY_ESCAPED_HEADER}\\r\\nAuthorization: Bearer ${CANARY_BEARER}\\r\\nX-Cookie: token=${CANARY_ESCAPED_HEADER}\\u000aCookie: sid=${CANARY_ESCAPED_HEADER}"}`,
+    error_msg: `\\tX-SecurityCenter: "${CANARY_ESCAPED_HEADER}"\\u0009X-ApiKeys: accessKey=${CANARY_API_KEY};secretKey=${CANARY_API_KEY}\\r\\nDate: Tue, 22 Sep 2026 18:00:00 GMT`,
+  }), { status: 403, statusText: "Forbidden", headers: { "content-type": "application/json" } });
+}
+const ESCAPED_HEADER_MARKER = new RegExp(escapeRegExp('HTTP 403 Forbidden; request failed\\napi_key=[REDACTED]; \\nX-SecurityCenter: [REDACTED]\\nContent-Type: application/json; upstream said {"headers":"\\r\\nX-SecurityCenter: [REDACTED]\\r\\nAuthorization: [REDACTED]\\r\\nX-Cookie: [REDACTED]\\u000aCookie: [REDACTED]"}; \\tX-SecurityCenter: "[REDACTED]"\\u0009X-ApiKeys: [REDACTED]\\r\\nDate: Tue, 22 Sep 2026 18:00:00 GMT'));
+// The header names of the escaped shape are the documented fields' own text, so only the
+// HTML body's text counts as echoed there.
+const ESCAPED_ECHOED_BODY_TEXT = /<html|Set-Cookie|TNS_SESSIONID|did not answer|Proxy-Authorization/i;
 
 // The scrubbed rendering of the JSON canary fields, as every error string must carry it.
 const JSON_CANARY_MARKER = new RegExp(`HTTP 400 Bad Request; Upstream refused Bearer \\[REDACTED\\] at https://api\\.example\\.com/v1/x\\?token=\\[REDACTED\\] mid-sentence; session=\\[REDACTED\\], api_key=\\[REDACTED\\], Bearer \\[REDACTED\\], sid=\\[REDACTED\\] rejected; Cookie: \\[REDACTED\\]; X-Api-Key: "\\[REDACTED\\]"; Content-Type: "application/json"; ${escapeRegExp(SCRUBBED_ESCAPED_NOTE)}; X-Cookie: \\[REDACTED\\]`);
@@ -1595,6 +1697,8 @@ test("error-body canary sweep: every Tenable surface failing with an HTML 502 or
     { name: "html-502", make: htmlCanaryResponse, marker: HTML_CANARY_MARKER, canaries: CANARIES },
     { name: "json-400", make: jsonCanaryResponse, marker: JSON_CANARY_MARKER, canaries: CANARIES },
     { name: "echoed-secrets", make: echoedSecretsResponse, marker: ECHOED_MARKER, canaries: ECHOED_FORMS },
+    // Reviewer E gap 9: header lines behind JSON string escapes in a 403's documented fields.
+    { name: "json-403-escaped-headers", make: escapedHeaderCanaryResponse, marker: ESCAPED_HEADER_MARKER, canaries: ESCAPED_CANARIES, echoed: ESCAPED_ECHOED_BODY_TEXT },
   ];
   // Fixture self-check: each body carries every canary or form verbatim before the scrubs see it.
   for (const shape of shapes) {
@@ -1621,7 +1725,7 @@ test("error-body canary sweep: every Tenable surface failing with an HTML 502 or
       const errors = results.flatMap((result) => result.errors);
       assert.ok(errors.length > 0, `${label}: the failing surface must be recorded as an error`);
       assert.ok(errors.some((error) => shape.marker.test(error)), `${label}: errors must carry the note: ${JSON.stringify(errors)}`);
-      for (const error of errors) assert.doesNotMatch(error, ECHOED_BODY_TEXT, `${label}: body text echoed: ${error}`);
+      for (const error of errors) assert.doesNotMatch(error, shape.echoed ?? ECHOED_BODY_TEXT, `${label}: body text echoed: ${error}`);
 
       const bundle = await exportTenableAuditBundle(clients, mkdtempSync(join(tmpdir(), "tenable-canary-")), { now: NOW });
       const files = readBundleFiles(bundle.outputDir);
@@ -1969,8 +2073,8 @@ test("exportTenableAuditBundle never writes policy credentials, scanner linking 
 // shape are the name-shaped values that prove the configured-secret pass and the carrier
 // rules run on their own (hyphenated words with one digit group) and the plain lowercase
 // word that only the Bearer scheme gives away.
-const PLANTED_CREDENTIALS = [...Object.values(LOADER_CANARIES), ...CANARIES, CANARY_USERINFO, ...Object.values(FAKE_TENABLE_SECRETS), FIXTURE_ACCESS_KEY, FIXTURE_SECRET_KEY];
-const SHAPED_CREDENTIALS = new Set([CANARY_NAMED, CANARY_QUOTED, CANARY_PLAIN, FIXTURE_ACCESS_KEY, FIXTURE_SECRET_KEY]);
+const PLANTED_CREDENTIALS = [...Object.values(LOADER_CANARIES), ...CANARIES, CANARY_ESCAPED_HEADER, CANARY_USERINFO, ...Object.values(FAKE_TENABLE_SECRETS), FIXTURE_ACCESS_KEY, FIXTURE_SECRET_KEY];
+const SHAPED_CREDENTIALS = new Set([CANARY_NAMED, CANARY_QUOTED, CANARY_ESCAPED_HEADER, CANARY_PLAIN, FIXTURE_ACCESS_KEY, FIXTURE_SECRET_KEY]);
 
 test("fixture self-check: planted credentials are alphanumeric and random-looking, share no 6-character window with each other, and no 6-character window of any occurs in the fixtures' legitimate text", async () => {
   const owners = new Map();
