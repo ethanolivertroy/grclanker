@@ -932,6 +932,40 @@ function requestPath(target: string): string {
   }
 }
 
+/** Why a server-supplied link is not followed. Each class renders as fixed text that never carries the link. */
+type NextLinkRefusal = "foreign_origin" | "userinfo" | "unparseable";
+
+/**
+ * Same-origin rule for every URL taken from a response (a list page's `next`): resolved against the configured
+ * base the way a browser would, so AAP's root-relative `/api/v2/...?page=2` links land on the base and a
+ * protocol-relative `//host/...` link names its own host, the link must keep the base's scheme, host, and port
+ * and carry no userinfo. Anything else is refused before a request (and the token or session cookie) leaves for it.
+ */
+function nextLinkRefusal(target: string, base: string): NextLinkRefusal | undefined {
+  let baseUrl: URL;
+  let resolved: URL;
+  try {
+    baseUrl = new URL(base);
+    resolved = new URL(target, baseUrl);
+  } catch {
+    return "unparseable";
+  }
+  if (resolved.username !== "" || resolved.password !== "") return "userinfo";
+  if (resolved.origin === "null" || resolved.origin !== baseUrl.origin) return "foreign_origin";
+  return undefined;
+}
+
+const NEXT_LINK_REFUSAL_NOTES: Readonly<Record<NextLinkRefusal, string>> = Object.freeze({
+  foreign_origin: "the API advertised a next page on another origin (scheme, host, or port), so the walk was stopped; the link was not followed and no request was made for it",
+  userinfo: "the API advertised a next page link carrying userinfo, so the walk was stopped; the link was not followed and no request was made for it",
+  unparseable: "the API advertised a next page link that could not be parsed, so the walk was stopped; the link was not followed and no request was made for it",
+});
+
+/** Rendering of a request refused by the same-origin rule before it was made; the target itself is never recorded. */
+const REQUEST_REFUSED_NOTE = "AAP request refused: the target is not on the configured origin, so no request was made.";
+/** The `endpoint` of a refused request: none was sent, and the refused target must not be named. */
+const REFUSED_ENDPOINT = "not requested";
+
 function normalizeKeyName(key: string): string {
   return key.toLowerCase().replace(/[^a-z0-9]/g, "");
 }
@@ -1413,6 +1447,12 @@ export class AnsibleAapClient {
    * status-and-length note and transport failures carry the transport message, all scrubbed.
    */
   async get<T = unknown>(pathOrUrl: string): Promise<T> {
+    // The same-origin rule sits in front of the transport (and of the session login), so no target that left the
+    // configured base can be fetched with the token or session cookie, whichever path handed it in. The error
+    // names neither the target nor its path.
+    if (nextLinkRefusal(pathOrUrl, this.config.baseUrl)) {
+      throw new AnsibleApiError(REQUEST_REFUSED_NOTE, undefined, REFUSED_ENDPOINT);
+    }
     await this.ensureSession();
     const headers: Record<string, string> = { accept: "application/json" };
     if (this.config.token) {
@@ -1460,7 +1500,14 @@ export class AnsibleAapClient {
       const remaining = limit - items.length;
       if (results.length > remaining) dropped += results.length - remaining;
       items.push(...results.slice(0, remaining));
-      const following: string | null = Array.isArray(page) ? null : page.next ?? null;
+      const following: string | null = Array.isArray(page) ? null : typeof page.next === "string" ? page.next : null;
+      // A next link that leaves the configured origin is refused here, before get() would attach the credential
+      // to it; the collection records the refusal as its truncation reason and the link itself is never recorded.
+      const refusal = following ? nextLinkRefusal(following, this.config.baseUrl) : undefined;
+      if (refusal) {
+        stalled = NEXT_LINK_REFUSAL_NOTES[refusal];
+        break;
+      }
       if (following && following === next) {
         stalled = "the API repeated the same next page link, so the walk was stopped";
         break;
@@ -3894,6 +3941,10 @@ export function ansibleFixedTexts(): readonly string[] {
     "AAP session login failed (401 Unauthorized).",
     "AAP session auth requires AAP_USERNAME and AAP_PASSWORD.",
     ...partialNotes(unknownScope, inventories, inventory("hosts", { data: { items: [{}], complete: false, total: 40, truncation: "page cap reached" } })),
+    ...Object.values(NEXT_LINK_REFUSAL_NOTES),
+    inventory("users", { data: { items: [{}], complete: false, total: 2, truncation: NEXT_LINK_REFUSAL_NOTES.foreign_origin } }).partial ?? "",
+    REQUEST_REFUSED_NOTE,
+    REFUSED_ENDPOINT,
     finding(22, "pass", "No team holds the Admin role on every inventory.", undefined, partialNotes(unknownScope, inventories)).summary,
     unknownScope.error ?? "",
     manualForUnreadable(22, inventories, "the Teams list with each team's roles and the inventories each Admin role covers").summary,

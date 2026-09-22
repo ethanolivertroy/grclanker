@@ -471,6 +471,186 @@ test("rule 10: a next link that repeats or arrives with an empty page exits as t
   assert.equal(guardrails.findings.find((item) => item.id === "AZURE-SUB-01").status, "warn");
 });
 
+// A next link the server controls: its path segment, its query token, a userinfo password, the id of the only
+// item the foreign page would serve, and two name-shaped parts that the token scrub would keep, so they vanish only
+// when nothing echoes the link itself.
+const NEXT_LINK_PATH_CANARY = "Hq7vTm3KpXw9ZbLn2Rf";
+const NEXT_LINK_QUERY_CANARY = "Wn4kJd8VqRz2TxPy6Mc";
+const NEXT_LINK_USERINFO_CANARY = "Fy9bNs2LtKp7WqXm4Vd";
+const FOREIGN_PAGE_ITEM_CANARY = "Zc3tRv8HnQm5KwYp7Lb";
+const NEXT_LINK_PATH_NAME = "offsite-hop-segment";
+const NEXT_LINK_QUERY_NAME = "offsite-query-marker";
+const NEXT_LINK_CANARIES = Object.freeze([NEXT_LINK_PATH_CANARY, NEXT_LINK_QUERY_CANARY, NEXT_LINK_USERINFO_CANARY, FOREIGN_PAGE_ITEM_CANARY, NEXT_LINK_PATH_NAME, NEXT_LINK_QUERY_NAME]);
+const FOREIGN_NEXT_HOST = "offsite.example.net";
+const AZURE_CONFIGURED_ORIGINS = new Set(["https://login.microsoftonline.com", "https://graph.microsoft.com", "https://management.azure.com"]);
+
+/**
+ * Every shape a server-supplied next link can take off the configured origin, each with the refusal class its
+ * truncation reason must name, plus the two same-origin controls (absolute, and relative to the base) that must
+ * still be followed. `legitUrl` is the first page's URL; `extraQuery` carries ARM's api-version.
+ */
+function nextLinkVariants(legitUrl, queryKey, extraQuery = "") {
+  const legit = new URL(legitUrl);
+  const path = `/${NEXT_LINK_PATH_CANARY}/${NEXT_LINK_PATH_NAME}/page2`;
+  const query = `${queryKey}=${NEXT_LINK_QUERY_CANARY}&hop=${NEXT_LINK_QUERY_NAME}${extraQuery}`;
+  return {
+    refused: {
+      host: [`https://${FOREIGN_NEXT_HOST}${path}?${query}`, /another origin \(scheme, host, or port\)/],
+      port: [`${legit.protocol}//${legit.hostname}:8443${path}?${query}`, /another origin \(scheme, host, or port\)/],
+      scheme: [`http://${legit.hostname}${path}?${query}`, /another origin \(scheme, host, or port\)/],
+      userinfo: [`https://intruder:${NEXT_LINK_USERINFO_CANARY}@${legit.hostname}${path}?${query}`, /carrying userinfo/],
+      protocol_relative: [`//${FOREIGN_NEXT_HOST}${path}?${query}`, /another origin \(scheme, host, or port\)/],
+      unparseable: [`https://[${NEXT_LINK_PATH_CANARY}${path}?${query}`, /could not be parsed/],
+    },
+    followed: {
+      absolute_same_origin: `${legit.origin}${legit.pathname}?${queryKey}=ctrl-page-2${extraQuery}`,
+      relative_same_origin: `${legit.pathname}?${queryKey}=ctrl-page-2${extraQuery}`,
+    },
+  };
+}
+
+function requestOrigin(url) {
+  try {
+    return new URL(url).origin;
+  } catch {
+    return "unparseable";
+  }
+}
+
+/**
+ * Transport for a planted next link: the first page carries the link, a same-origin control page serves one control
+ * item, and any request that leaves the configured origins is answered with a page carrying the foreign item so a
+ * followed link shows up as inventory poisoning as well as in the request log.
+ */
+function plantedNextLinkFetch(firstPagePath, linkField, link, calls) {
+  return async (url, init) => {
+    calls.push({ url, authorization: init?.headers?.Authorization ?? null });
+    if (!AZURE_CONFIGURED_ORIGINS.has(requestOrigin(url))) {
+      return new Response(JSON.stringify({ value: [{ id: FOREIGN_PAGE_ITEM_CANARY, displayName: FOREIGN_PAGE_ITEM_CANARY, properties: { roleDefinitionId: FOREIGN_PAGE_ITEM_CANARY, principalType: "User" } }] }), { status: 200 });
+    }
+    const parsed = new URL(url);
+    if (parsed.searchParams.get("$skiptoken") === "ctrl-page-2") {
+      return new Response(JSON.stringify({ value: [{ id: "ctrl-page-2-item", displayName: "control", properties: { roleDefinitionId: "role-reader", principalType: "User" } }] }), { status: 200 });
+    }
+    if (parsed.pathname === firstPagePath) {
+      return new Response(JSON.stringify({ value: [{ id: "page-1-item", properties: { roleDefinitionId: "role-owner", principalType: "User" } }], [linkField]: link }), { status: 200 });
+    }
+    throw new Error(`Unexpected Azure request: ${parsed.pathname}`);
+  };
+}
+
+test("rule 9: a next link that leaves the configured origin is refused before any request is made for it, recorded as the page's truncation reason, and never echoed", async () => {
+  const graphFirstPage = "https://graph.microsoft.com/v1.0/identity/conditionalAccess/policies";
+  const armFirstPage = "https://management.azure.com/subscriptions/sub-123/providers/Microsoft.Authorization/roleAssignments";
+  const walks = [
+    ["Graph @odata.nextLink", graphFirstPage, "@odata.nextLink", (client) => client.listConditionalAccessPolicies(), ""],
+    ["ARM nextLink", armFirstPage, "nextLink", (client) => client.listRoleAssignments(), `&api-version=${AZURE_ARM_API_VERSIONS.roleAssignments}`],
+  ];
+  for (const [walk, firstPage, linkField, list, extraQuery] of walks) {
+    const variants = nextLinkVariants(firstPage, "$skiptoken", extraQuery);
+    for (const [variant, [link, reason]] of Object.entries(variants.refused)) {
+      const label = `${walk} (${variant})`;
+      const calls = [];
+      const client = new AzureAuditorClient(sampleConfig(), { fetchImpl: plantedNextLinkFetch(new URL(firstPage).pathname, linkField, link, calls), now: () => NOW });
+      const page = await list(client);
+      assert.equal(calls.length, 1, `${label}: only the first page is requested; the planted link never reaches the transport`);
+      assert.equal(new URL(calls[0].url).pathname, new URL(firstPage).pathname, `${label}: the one request is the first page`);
+      assert.deepEqual(page.items.map((item) => item.id), ["page-1-item"], `${label}: the inventory is the first page only, nothing merged from the link`);
+      assert.equal(page.truncated, true, `${label}: the walk is reported truncated`);
+      assert.equal(page.seen, 1, `${label}: seen counts the first page`);
+      assert.match(page.truncation ?? "", reason, `${label}: the truncation reason names the refusal class`);
+      assert.match(page.truncation, /not followed and no request was made for it/, `${label}: the reason states that no request left`);
+      assertNoCanaryWindows(assert, page, NEXT_LINK_CANARIES, `${label} page`);
+      assert.ok(!JSON.stringify(page).includes(FOREIGN_NEXT_HOST), `${label}: the reason is fixed text without the link's host`);
+    }
+    for (const [variant, link] of Object.entries(variants.followed)) {
+      const label = `${walk} (${variant})`;
+      const calls = [];
+      const client = new AzureAuditorClient(sampleConfig(), { fetchImpl: plantedNextLinkFetch(new URL(firstPage).pathname, linkField, link, calls), now: () => NOW });
+      const page = await list(client);
+      assert.equal(calls.length, 2, `${label}: the same-origin control page is followed`);
+      assert.equal(new URL(calls[1].url).origin, new URL(firstPage).origin, `${label}: the control request stays on the configured origin`);
+      assert.equal(new URL(calls[1].url).searchParams.get("$skiptoken"), "ctrl-page-2", `${label}: the control link is requested as served (a relative link resolves onto the base)`);
+      assert.deepEqual(page.items.map((item) => item.id), ["page-1-item", "ctrl-page-2-item"], `${label}: both pages are merged`);
+      assert.equal(page.truncated, false, `${label}: a complete same-origin walk is not truncated`);
+      assert.equal(page.truncation, undefined, `${label}: a complete walk carries no reason`);
+    }
+  }
+
+  // The rule also sits in front of the transport itself, so a URL that reaches the request path from anywhere else
+  // is refused with fixed text naming the configured base, not the target, and no request (token included) is made.
+  let transportCalls = 0;
+  const guarded = new AzureAuditorClient(sampleConfig(), { fetchImpl: async () => { transportCalls += 1; return new Response("{}", { status: 200 }); }, now: () => NOW });
+  for (const [resource, base] of [["graph", "https://graph.microsoft.com"], ["management", "https://management.azure.com"]]) {
+    const foreign = `https://${FOREIGN_NEXT_HOST}/${NEXT_LINK_PATH_CANARY}?$skiptoken=${NEXT_LINK_QUERY_CANARY}`;
+    const error = await guarded.requestJson(foreign, resource).then(() => undefined, (thrown) => thrown);
+    assert.ok(error instanceof AzureApiError, `${resource}: the refusal is an AzureApiError`);
+    assert.equal(error.message, "Request refused: the target is not on the configured origin, so no request was made.");
+    assert.equal(error.url, base, `${resource}: the error names the configured base, not the target`);
+    assert.equal(error.status, undefined, `${resource}: no HTTP status, because no request was made`);
+    assertNoCanaryWindows(assert, { message: error.message, url: error.url }, NEXT_LINK_CANARIES, `${resource} refusal`);
+  }
+  assert.equal(transportCalls, 0, "a refused target never reaches the transport");
+  assert.ok(azureFixedTexts().includes("Request refused: the target is not on the configured origin, so no request was made."), "the refusal text is in the fixed-text list");
+});
+
+test("rule 9: a refused next link on a probed surface leaves the access check, the verdicts, and the bundle without any part of the link, with the count as a floor and the reason recorded", async () => {
+  const config = canaryConfig();
+  const graphVariants = nextLinkVariants("https://graph.microsoft.com/v1.0/identity/conditionalAccess/policies", "$skiptoken");
+  const armVariants = nextLinkVariants("https://management.azure.com/subscriptions/sub-123/providers/Microsoft.Authorization/roleAssignments", "$skiptoken", `&api-version=${AZURE_ARM_API_VERSIONS.roleAssignments}`);
+  const [graphLink] = graphVariants.refused.host;
+  const [armLink] = armVariants.refused.userinfo;
+  const routes = {
+    ...healthyAzureRoutes(),
+    "/v1.0/identity/conditionalAccess/policies": () => new Response(JSON.stringify({ value: [CA_MFA, CA_LEGACY, CA_SIGNIN_RISK, CA_USER_RISK, CA_COMPLIANT_DEVICE], "@odata.nextLink": graphLink }), { status: 200 }),
+    [`${AZURE_SUB}/providers/Microsoft.Authorization/roleAssignments`]: () => new Response(JSON.stringify({ value: [{ properties: { roleDefinitionId: "role-owner", principalType: "User" } }], nextLink: armLink }), { status: 200 }),
+  };
+  const foreignRequests = [];
+  const routed = azureRoutedFetch(routes);
+  const fetchImpl = async (url, init) => {
+    if (!AZURE_CONFIGURED_ORIGINS.has(requestOrigin(url))) {
+      foreignRequests.push({ url, credential: Boolean(init?.headers?.Authorization) });
+      return new Response(JSON.stringify({ value: [{ id: FOREIGN_PAGE_ITEM_CANARY, properties: { roleDefinitionId: FOREIGN_PAGE_ITEM_CANARY, principalType: "User" } }] }), { status: 200 });
+    }
+    return routed(url, init);
+  };
+  const client = new AzureAuditorClient(config, { fetchImpl, now: () => NOW });
+  const { access, assessments, exported } = await runEveryAzureTool(client, config, createTempBase("grclanker-azure-next-link-"));
+
+  assert.deepEqual(foreignRequests, [], "no request leaves the configured origins, credentialed or not");
+  const conditionalAccess = access.surfaces.find((entry) => entry.name === "conditional_access");
+  assert.equal(conditionalAccess.status, "readable");
+  assert.equal(conditionalAccess.count, 5, "the probe count is the first page, a floor");
+  assert.equal(conditionalAccess.truncated, true);
+  assert.match(conditionalAccess.truncation, /another origin \(scheme, host, or port\)/);
+  const roleAssignments = access.surfaces.find((entry) => entry.name === "role_assignments");
+  assert.deepEqual({ status: roleAssignments.status, count: roleAssignments.count, truncated: roleAssignments.truncated }, { status: "readable", count: 1, truncated: true });
+  assert.match(roleAssignments.truncation, /carrying userinfo/);
+  assert.ok(access.notes.some((note) => /Probe counts for conditional_access are lower bounds, not inventory sizes: the API advertised a next page on another origin/.test(note)), `the access note carries the reason: ${JSON.stringify(access.notes)}`);
+  assert.ok(access.notes.some((note) => /Probe counts for role_assignments are lower bounds, not inventory sizes: the API advertised a next page link carrying userinfo/.test(note)));
+  assert.ok(!access.notes.some((note) => /probe page cap/.test(note)), "a refused link is not described as a page cap");
+  assertNoCanaryWindows(assert, access, NEXT_LINK_CANARIES, "check_access");
+
+  const identity = assessments.find((assessment) => assessment.findings.some((item) => item.id === "AZURE-ID-01"));
+  const mfaBaseline = identity.findings.find((item) => item.id === "AZURE-ID-01");
+  assert.equal(mfaBaseline.status, "warn", "a verdict over the truncated page is capped at warn");
+  assert.match(mfaBaseline.summary, /Inventory of Conditional Access policies is partial \(5 seen of unknown total; the API advertised a next page on another origin/);
+  assert.deepEqual({ seen: mfaBaseline.evidence.seen, truncated: mfaBaseline.evidence.truncated }, { seen: 5, truncated: true });
+  assert.match(mfaBaseline.evidence.truncation, /another origin/);
+  const guardrails = assessments.find((assessment) => assessment.findings.some((item) => item.id === "AZURE-SUB-01"));
+  const owners = guardrails.findings.find((item) => item.id === "AZURE-SUB-01");
+  assert.equal(owners.status, "warn");
+  assert.match(owners.summary, /partial \(1 seen of unknown total; the API advertised a next page link carrying userinfo/);
+  for (const assessment of assessments) assertNoCanaryWindows(assert, assessment, NEXT_LINK_CANARIES, assessment.title);
+
+  const files = readBundleFiles(exported.outputDir);
+  assertNoCanaryWindowsInFiles(assert, files, NEXT_LINK_CANARIES, "bundle");
+  assertNoCanaryWindowsInFiles(assert, readZipEntries(exported.zipPath), NEXT_LINK_CANARIES, "zip");
+  const allText = [...files.values()].join("\n");
+  assert.ok(!allText.includes(FOREIGN_NEXT_HOST), "the bundle never names the link's host");
+  assert.match(allText, /the API advertised a next page on another origin/, "the bundle records the refusal as the truncation reason");
+});
+
 test("rule 9: API error bodies are reduced to the documented error envelope before they reach messages, evidence, or logs", async () => {
   assert.equal(describeErrorBody(""), "");
   assert.equal(describeErrorBody(JSON.stringify({ error: { code: "Authorization_RequestDenied", message: "Insufficient privileges to complete the operation.", innerError: { "request-id": "req-1", date: "2026-04-16" } } })), "Authorization_RequestDenied: Insufficient privileges to complete the operation.");

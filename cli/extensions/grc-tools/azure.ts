@@ -235,6 +235,8 @@ export interface AzureAccessSurface {
   count?: number | null;
   /** True when the probe stopped at its page cap, so `count` is a floor rather than the inventory size; null when the probe never completed. */
   truncated?: boolean | null;
+  /** Why a truncated probe stopped when the stop was not the page cap (a refused next link); fixed text. */
+  truncation?: string;
   /** HTTP status the failing probe observed; null when the failure was not an HTTP response. */
   http_status?: number | null;
   /** URL (without query) of the request that failed, taken from the observed request. */
@@ -284,6 +286,8 @@ export interface AzurePage {
   truncated: boolean;
   seen: number;
   total?: number;
+  /** Why the walk stopped early when the stop was not the item cap: fixed text, never the link that caused it. */
+  truncation?: string;
 }
 
 type CheckAccessArgs = {
@@ -428,11 +432,13 @@ export function toPage(value: unknown): AzurePage {
   const record = asObject(value);
   if (record && Array.isArray(record.items)) {
     const items = asRecords(record.items);
+    const truncation = asString(record.truncation);
     return {
       items,
       truncated: record.truncated === true,
       seen: asNumber(record.seen) ?? items.length,
       total: asNumber(record.total),
+      ...(truncation ? { truncation } : {}),
     };
   }
   return { items: [], truncated: false, seen: 0 };
@@ -728,6 +734,42 @@ function observedRequestUrl(error: unknown): string | undefined {
   return redactErrorText(error.url.split("?")[0]);
 }
 
+/** Why a server-supplied link is not followed. Each class renders as fixed text that never carries the link. */
+type NextLinkRefusal = "foreign_origin" | "userinfo" | "unparseable";
+
+/**
+ * Same-origin rule for every URL taken from a response (`@odata.nextLink`, `nextLink`): resolved against the
+ * configured base the way a browser would, so a relative link lands on the base and a protocol-relative
+ * `//host/...` link names its own host, the link must keep the base's scheme, host, and port and carry no
+ * userinfo. Anything else is refused before a request (and the bearer token) leaves for it.
+ */
+function nextLinkRefusal(target: string, base: string): NextLinkRefusal | undefined {
+  let baseUrl: URL;
+  let resolved: URL;
+  try {
+    baseUrl = new URL(base);
+    resolved = new URL(target, baseUrl);
+  } catch {
+    return "unparseable";
+  }
+  if (resolved.username !== "" || resolved.password !== "") return "userinfo";
+  if (resolved.origin === "null" || resolved.origin !== baseUrl.origin) return "foreign_origin";
+  return undefined;
+}
+
+const NEXT_LINK_REFUSAL_NOTES: Readonly<Record<NextLinkRefusal, string>> = Object.freeze({
+  foreign_origin: "the API advertised a next page on another origin (scheme, host, or port), so the link was not followed and no request was made for it",
+  userinfo: "the API advertised a next page link carrying userinfo, so the link was not followed and no request was made for it",
+  unparseable: "the API advertised a next page link that could not be parsed, so the link was not followed and no request was made for it",
+});
+
+/** Rendering of a request refused by the same-origin rule before it was made; the target itself is never recorded. */
+const REQUEST_REFUSED_NOTE = "Request refused: the target is not on the configured origin, so no request was made.";
+
+function resourceBase(cloud: AzureCloudEndpoints, resource: "graph" | "management"): string {
+  return resource === "graph" ? cloud.graphBaseUrl : cloud.managementBaseUrl;
+}
+
 async function attempt<T>(load: () => Promise<T>): Promise<Attempt<T>> {
   try {
     return { ok: true, value: await load() };
@@ -898,7 +940,8 @@ function manualForError(
 function partialNote(page: AzurePage, label: string): string {
   if (!page.truncated) return "";
   const total = page.total !== undefined ? String(page.total) : "unknown";
-  return ` Inventory of ${label} is partial (${page.seen} seen of ${total} total); verdict capped at warn.`;
+  const reason = page.truncation ? `; ${page.truncation}` : "";
+  return ` Inventory of ${label} is partial (${page.seen} seen of ${total} total${reason}); verdict capped at warn.`;
 }
 
 function capForPartial(status: AzureFindingStatus, ...pages: AzurePage[]): AzureFindingStatus {
@@ -907,7 +950,7 @@ function capForPartial(status: AzureFindingStatus, ...pages: AzurePage[]): Azure
 }
 
 function pageEvidence(page: AzurePage): JsonRecord {
-  return { seen: page.seen, total: page.total ?? null, truncated: page.truncated };
+  return { seen: page.seen, total: page.total ?? null, truncated: page.truncated, ...(page.truncation ? { truncation: page.truncation } : {}) };
 }
 
 function serializeJson(value: unknown): string {
@@ -1154,7 +1197,7 @@ function roleDefinitionIdTail(value: string | undefined): string | undefined {
   return value?.split("/").at(-1)?.toLowerCase();
 }
 
-type SurfaceSummary = { count?: number; truncated?: boolean };
+type SurfaceSummary = { count?: number; truncated?: boolean; truncation?: string };
 
 async function surface(
   name: string,
@@ -1171,6 +1214,7 @@ async function surface(
       status: "readable",
       count: summary.count,
       ...(summary.truncated ? { truncated: true } : {}),
+      ...(summary.truncated && summary.truncation ? { truncation: summary.truncation } : {}),
     };
   } catch (error) {
     // A probe that never completed has no count or paging outcome; both stay null and the
@@ -1193,7 +1237,24 @@ function pageSummary(value: unknown): SurfaceSummary {
   if (Array.isArray(value)) return { count: value.length };
   const page = asObject(value);
   if (!page || !Array.isArray(page.items)) return {};
-  return { count: page.items.length, truncated: page.truncated === true };
+  return { count: page.items.length, truncated: page.truncated === true, truncation: asString(page.truncation) };
+}
+
+/**
+ * One note per way the probes stopped short: surfaces that hit the probe page cap share the cap note, and
+ * surfaces whose walk stopped for a recorded reason (a refused next link) share a note carrying that reason.
+ */
+function truncatedProbeNotes(surfaces: AzureAccessSurface[]): string[] {
+  const capped = surfaces.filter((item) => item.truncated && !item.truncation).map((item) => item.name);
+  const byReason = new Map<string, string[]>();
+  for (const item of surfaces) {
+    if (!item.truncated || !item.truncation) continue;
+    byReason.set(item.truncation, [...(byReason.get(item.truncation) ?? []), item.name]);
+  }
+  return [
+    ...(capped.length > 0 ? [`Probe counts for ${capped.join(", ")} stopped at the probe page cap and are lower bounds, not inventory sizes.`] : []),
+    ...[...byReason.entries()].map(([reason, names]) => `Probe counts for ${names.join(", ")} are lower bounds, not inventory sizes: ${reason}.`),
+  ];
 }
 
 /**
@@ -1378,6 +1439,11 @@ export class AzureAuditorClient {
   }
 
   private async requestJson(url: string, resource: "graph" | "management", init: { method?: string; headers?: Record<string, string>; body?: string } = {}): Promise<JsonRecord> {
+    // The same-origin rule sits in front of the transport, so no URL that left the configured Graph or ARM
+    // origin can be fetched with the bearer token, whichever path handed it in. The error names the configured
+    // base, not the target.
+    const base = resourceBase(this.cloud, resource);
+    if (nextLinkRefusal(url, base)) throw new AzureApiError(REQUEST_REFUSED_NOTE, base);
     const token = await this.getToken(resource);
     const response = await this.send(url, {
       method: init.method ?? "GET",
@@ -1399,11 +1465,14 @@ export class AzureAuditorClient {
 
   /**
    * Shared next-link walk for Graph and ARM. Every early exit reports `truncated: true`:
-   * the item cap, a next link that repeats the page just fetched, and an empty page that
-   * still advertises a next link (both would otherwise loop forever).
+   * the item cap, a next link that repeats the page just fetched, an empty page that
+   * still advertises a next link (both would otherwise loop forever), and a next link that
+   * leaves the configured origin, which is refused before any request is made for it and
+   * recorded as the page's `truncation` reason.
    */
   private async collectPages(
     firstUrl: string,
+    base: string,
     limit: number,
     fetchPage: (url: string) => Promise<JsonRecord>,
     nextLinkOf: (response: JsonRecord) => string | undefined,
@@ -1418,8 +1487,14 @@ export class AzureAuditorClient {
       if (totalOf) total ??= totalOf(response);
       const pageItems = asRecords(response.value);
       items.push(...pageItems);
-      nextUrl = nextLinkOf(response);
-      if (!nextUrl) break;
+      const nextLink = nextLinkOf(response);
+      if (!nextLink) break;
+      const refusal = nextLinkRefusal(nextLink, base);
+      if (refusal) {
+        return { items: items.slice(0, limit), truncated: true, seen: Math.min(items.length, limit), total, truncation: NEXT_LINK_REFUSAL_NOTES[refusal] };
+      }
+      // Passed the rule, so it resolves onto the configured base (a relative link becomes absolute there).
+      nextUrl = new URL(nextLink, base).toString();
       const stalled = nextUrl === currentUrl || pageItems.length === 0;
       if (stalled || items.length >= limit) {
         return { items: items.slice(0, limit), truncated: true, seen: Math.min(items.length, limit), total };
@@ -1432,6 +1507,7 @@ export class AzureAuditorClient {
   private async collectGraph(path: string, limit = 5000, headers: Record<string, string> = {}): Promise<AzurePage> {
     return this.collectPages(
       path.startsWith("http") ? path : `${this.cloud.graphBaseUrl}${path}`,
+      this.cloud.graphBaseUrl,
       limit,
       (url) => this.requestJson(url, "graph", { headers }),
       (response) => asString(response["@odata.nextLink"]),
@@ -1443,6 +1519,7 @@ export class AzureAuditorClient {
   private async collectArm(path: string, limit = 5000): Promise<AzurePage> {
     return this.collectPages(
       path.startsWith("http") ? path : `${this.cloud.managementBaseUrl}${path}`,
+      this.cloud.managementBaseUrl,
       limit,
       (url) => this.requestJson(url, "management"),
       (response) => asString(response.nextLink),
@@ -1691,7 +1768,6 @@ export async function checkAzureAccess(
 
   const readableCount = surfaces.filter((item) => item.status === "readable").length;
   const status = readableCount >= 6 ? "healthy" : "limited";
-  const truncatedSurfaces = surfaces.filter((item) => item.truncated).map((item) => item.name);
   // A probe that failed at the token request never reached its resource; the note names the request that was made.
   const tokenFailures = surfaces.filter((item) => item.status === "not_readable" && isTokenRequestFailure({ url: item.request_url ?? undefined }));
   const tokenFailure = tokenFailures[0]
@@ -1704,9 +1780,7 @@ export async function checkAzureAccess(
     `Authenticated against ${describeSourceChain(config)}.`,
     `${readableCount}/${surfaces.length} Azure audit surfaces are readable.`,
     ...(tokenNote ? [tokenNote] : []),
-    ...(truncatedSurfaces.length > 0
-      ? [`Probe counts for ${truncatedSurfaces.join(", ")} stopped at the probe page cap and are lower bounds, not inventory sizes.`]
-      : []),
+    ...truncatedProbeNotes(surfaces),
   ];
 
   return {
@@ -2566,11 +2640,13 @@ export function parseNetworkWatcherId(id: unknown): { resourceGroupName: string;
 
 function combinePages(pages: AzurePage[]): AzurePage {
   const totals = pages.map((page) => page.total);
+  const truncation = pages.map((page) => page.truncation).find((reason): reason is string => Boolean(reason));
   return {
     items: pages.flatMap((page) => page.items),
     truncated: pages.some((page) => page.truncated),
     seen: pages.reduce((sum, page) => sum + page.seen, 0),
     total: totals.every((total): total is number => total !== undefined) ? totals.reduce((sum, total) => sum + total, 0) : undefined,
+    ...(truncation ? { truncation } : {}),
   };
 }
 
@@ -3257,6 +3333,13 @@ export function azureFixedTexts(): readonly string[] {
     "not attempted: this client does not expose listNetworkWatchers, so no request was made.",
     partialNote({ items: [], seen: 100, total: undefined, truncated: true }, "Conditional Access policies").trim(),
     partialNote({ items: [], seen: 25, total: 40, truncated: true }, "role assignments").trim(),
+    ...Object.values(NEXT_LINK_REFUSAL_NOTES),
+    REQUEST_REFUSED_NOTE,
+    partialNote({ items: [], seen: 5, total: undefined, truncated: true, truncation: NEXT_LINK_REFUSAL_NOTES.foreign_origin }, "Conditional Access policies").trim(),
+    ...truncatedProbeNotes([
+      { name: "conditional_access", service: "graph", status: "readable", count: 5, truncated: true, truncation: NEXT_LINK_REFUSAL_NOTES.foreign_origin },
+      { name: "role_assignments", service: "arm", status: "readable", count: 1, truncated: true, truncation: NEXT_LINK_REFUSAL_NOTES.userinfo },
+    ]),
     "Member inventory is partial; verdict capped at warn.",
     "6/8 Azure audit surfaces are readable.",
     `${tokenRequestLabel(tokenDenied)} returned ${describeTokenFailure(tokenDenied)}; no resource request was made for ${surfaceNames.join(", ")}.`,

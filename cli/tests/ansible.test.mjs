@@ -544,6 +544,158 @@ test("verdict rule 10: listCollection reports a trimmed last page, a repeated ne
   assert.equal(await noCount.count("/api/v2/teams/"), undefined, "a missing count is reported as unknown, not as the probe page size");
 });
 
+// A `next` link the server controls: its path segment, its query token, a userinfo password, the username of the
+// only user the foreign page would serve, and two name-shaped parts the token scrub would keep, so they vanish only
+// when nothing echoes the link itself.
+const NEXT_LINK_PATH_CANARY = "Hq7vTm3KpXw9ZbLn2Rf";
+const NEXT_LINK_QUERY_CANARY = "Wn4kJd8VqRz2TxPy6Mc";
+const NEXT_LINK_USERINFO_CANARY = "Fy9bNs2LtKp7WqXm4Vd";
+const FOREIGN_PAGE_USER_CANARY = "Zc3tRv8HnQm5KwYp7Lb";
+const NEXT_LINK_PATH_NAME = "offsite-hop-segment";
+const NEXT_LINK_QUERY_NAME = "offsite-query-marker";
+const NEXT_LINK_CANARIES = Object.freeze([NEXT_LINK_PATH_CANARY, NEXT_LINK_QUERY_CANARY, NEXT_LINK_USERINFO_CANARY, FOREIGN_PAGE_USER_CANARY, NEXT_LINK_PATH_NAME, NEXT_LINK_QUERY_NAME]);
+const FOREIGN_NEXT_HOST = "offsite.example.net";
+/** Origin of AAP_CLIENT_CONFIG.baseUrl, spelled out because that config is declared further down the file. */
+const AAP_ORIGIN = "https://aap.example.com";
+
+/**
+ * Every shape a server-supplied `next` link can take off the configured base, each with the refusal class its
+ * truncation reason must name, plus the same-origin controls (AAP's real root-relative form and the absolute form)
+ * that must still be followed.
+ */
+function aapNextLinkVariants(listPath) {
+  const path = `/${NEXT_LINK_PATH_CANARY}/${NEXT_LINK_PATH_NAME}/page2`;
+  const query = `page=2&page_size=100&token=${NEXT_LINK_QUERY_CANARY}&hop=${NEXT_LINK_QUERY_NAME}`;
+  return {
+    refused: {
+      host: [`https://${FOREIGN_NEXT_HOST}${path}?${query}`, /another origin \(scheme, host, or port\)/],
+      port: [`${AAP_ORIGIN}:8443${path}?${query}`, /another origin \(scheme, host, or port\)/],
+      scheme: [`${AAP_ORIGIN.replace("https://", "http://")}${path}?${query}`, /another origin \(scheme, host, or port\)/],
+      userinfo: [`${AAP_ORIGIN.replace("https://", `https://intruder:${NEXT_LINK_USERINFO_CANARY}@`)}${path}?${query}`, /carrying userinfo/],
+      protocol_relative: [`//${FOREIGN_NEXT_HOST}${path}?${query}`, /another origin \(scheme, host, or port\)/],
+      unparseable: [`https://[${NEXT_LINK_PATH_CANARY}${path}?${query}`, /could not be parsed/],
+    },
+    followed: {
+      relative_same_origin: `${listPath}?page=2&page_size=100&token=ctrl-page-2`,
+      absolute_same_origin: `${AAP_ORIGIN}${listPath}?page=2&page_size=100&token=ctrl-page-2`,
+    },
+  };
+}
+
+function requestOrigin(url) {
+  try {
+    return new URL(url).origin;
+  } catch {
+    return "unparseable";
+  }
+}
+
+/**
+ * Transport for a planted `next` link on the users list: page one carries the link, the same-origin control page
+ * serves one control user, and any request that leaves the configured base is answered with a page carrying the
+ * foreign superuser so a followed link shows up as inventory poisoning as well as in the request log.
+ */
+function plantedNextLinkFetch(routes, listPath, link, calls) {
+  const routed = aapRoutedFetch(routes);
+  return async (url, init) => {
+    calls.push({ url, credential: Boolean(init?.headers?.authorization || init?.headers?.cookie) });
+    if (requestOrigin(url) !== AAP_ORIGIN) {
+      return jsonResponse({ count: 1, next: null, previous: null, results: [{ id: 999, username: FOREIGN_PAGE_USER_CANARY, is_superuser: true, is_system_auditor: false }] });
+    }
+    const parsed = new URL(url);
+    if (parsed.pathname === listPath && parsed.searchParams.get("token") === "ctrl-page-2") {
+      return jsonResponse({ count: 4, next: null, previous: `${listPath}?page_size=100`, results: [{ id: 42, username: "ctrl-page-2-user", is_superuser: false, is_system_auditor: false }] });
+    }
+    if (parsed.pathname === listPath && !parsed.searchParams.get("page")) {
+      const firstPage = await routes[listPath](parsed).json();
+      return jsonResponse({ ...firstPage, count: firstPage.results.length + 1, next: link });
+    }
+    return routed(url, init);
+  };
+}
+
+test("rule 9: a next link that leaves the configured base is refused before any request is made for it, recorded as the collection's truncation reason, and never echoed", async () => {
+  const listPath = "/api/v2/users/";
+  assert.equal(new URL(AAP_CLIENT_CONFIG.baseUrl).origin, AAP_ORIGIN, "the planted links are built against the configured base");
+  const variants = aapNextLinkVariants(listPath);
+  for (const [variant, [link, reason]] of Object.entries(variants.refused)) {
+    const label = `next (${variant})`;
+    const calls = [];
+    const client = new AnsibleAapClient(AAP_CLIENT_CONFIG, { fetchImpl: plantedNextLinkFetch(healthyAapRoutes(), listPath, link, calls), now: () => NOW });
+    const collection = await client.listCollection(listPath);
+    assert.equal(calls.length, 1, `${label}: only page one is requested; the planted link never reaches the transport`);
+    assert.equal(new URL(calls[0].url).pathname, listPath, `${label}: the one request is the list itself`);
+    assert.deepEqual(collection.items.map((user) => user.username), ["auditor", "ops", "reviewer"], `${label}: the inventory is page one only, nothing merged from the link`);
+    assert.equal(collection.complete, false, `${label}: the collection is reported incomplete`);
+    assert.equal(collection.total, 4, `${label}: the API's count is kept as the total`);
+    assert.match(collection.truncation ?? "", reason, `${label}: the truncation reason names the refusal class`);
+    assert.match(collection.truncation, /so the walk was stopped; the link was not followed and no request was made for it/, `${label}: the reason states that no request left`);
+    assertNoCanaryWindows(assert, collection, NEXT_LINK_CANARIES, `${label} collection`);
+    assert.ok(!JSON.stringify(collection).includes(FOREIGN_NEXT_HOST), `${label}: the reason is fixed text without the link's host`);
+  }
+  for (const [variant, link] of Object.entries(variants.followed)) {
+    const label = `next (${variant})`;
+    const calls = [];
+    const client = new AnsibleAapClient(AAP_CLIENT_CONFIG, { fetchImpl: plantedNextLinkFetch(healthyAapRoutes(), listPath, link, calls), now: () => NOW });
+    const collection = await client.listCollection(listPath);
+    assert.equal(calls.length, 2, `${label}: the same-origin control page is followed`);
+    assert.equal(requestOrigin(calls[1].url), AAP_ORIGIN, `${label}: the control request stays on the configured base`);
+    assert.equal(new URL(calls[1].url).searchParams.get("token"), "ctrl-page-2", `${label}: the control link is requested as served`);
+    assert.deepEqual(collection.items.map((user) => user.username), ["auditor", "ops", "reviewer", "ctrl-page-2-user"], `${label}: both pages are merged`);
+    assert.equal(collection.complete, true, `${label}: a complete same-origin walk is complete`);
+    assert.equal(collection.truncation, undefined, `${label}: a complete walk carries no reason`);
+  }
+
+  // The rule also sits in front of the transport itself, ahead of the session login, so a target that reaches get()
+  // from anywhere else is refused with fixed text and no request (login bootstrap included) is made for it.
+  for (const config of [AAP_CLIENT_CONFIG, { ...AAP_CLIENT_CONFIG, token: undefined, username: "auditor", password: "session-password-for-tests-1" }]) {
+    let transportCalls = 0;
+    const guarded = new AnsibleAapClient(config, { fetchImpl: async () => { transportCalls += 1; return jsonResponse({}); }, now: () => NOW });
+    for (const [variant, [link]] of Object.entries(variants.refused)) {
+      const error = await guarded.get(link).then(() => undefined, (thrown) => thrown);
+      assert.equal(error?.name, "AnsibleApiError", `${variant}: the refusal is an AnsibleApiError`);
+      assert.equal(error.message, "AAP request refused: the target is not on the configured origin, so no request was made.");
+      assert.equal(error.endpoint, "not requested", `${variant}: the endpoint field never carries the refused target's path`);
+      assert.equal(error.status, undefined, `${variant}: no HTTP status, because no request was made`);
+      assertNoCanaryWindows(assert, { message: error.message, endpoint: error.endpoint }, NEXT_LINK_CANARIES, `${variant} refusal`);
+    }
+    assert.equal(transportCalls, 0, `${config.token ? "token" : "session"} auth: a refused target never reaches the transport`);
+  }
+  for (const text of ["AAP request refused: the target is not on the configured origin, so no request was made.", "not requested"]) {
+    assert.ok(ansibleFixedTexts().includes(text), `"${text}" is in the fixed-text list`);
+  }
+});
+
+test("rule 9: a refused next link on the users list leaves the access check, the verdicts, and the bundle without any part of the link or the foreign principal, with the reason recorded", async () => {
+  const listPath = "/api/v2/users/";
+  const [link] = aapNextLinkVariants(listPath).refused.host;
+  const calls = [];
+  const client = new AnsibleAapClient(AAP_CLIENT_CONFIG, { fetchImpl: plantedNextLinkFetch(healthyAapRoutes(), listPath, link, calls), now: () => NOW });
+  const run = await runEveryAnsibleTool(client, createTempBase("grclanker-ansible-next-link-"));
+
+  assert.deepEqual(calls.filter((call) => requestOrigin(call.url) !== AAP_ORIGIN), [], "no request leaves the configured base, credentialed or not");
+  assert.equal(run.accessError, undefined);
+  assert.equal(run.access.surfaces.find((surface) => surface.name === "users").status, "readable");
+  assertNoCanaryWindows(assert, run.access, NEXT_LINK_CANARIES, "check_access");
+
+  const rbac = run.assessments.flatMap((assessment) => assessment.findings).find((item) => item.control === 23);
+  assert.equal(rbac.status, "warn", "a verdict over the truncated users list is downgraded from pass");
+  assert.equal(rbac.evidence.probed_users, 3, "only the users of page one were probed");
+  assert.ok(rbac.evidence.partial_view.some((note) => /^users: 3 of 4 seen \(the API advertised a next page on another origin \(scheme, host, or port\), so the walk was stopped; the link was not followed and no request was made for it\)$/.test(note)), `the partial view carries the reason: ${JSON.stringify(rbac.evidence.partial_view)}`);
+  for (const assessment of run.assessments) assertNoCanaryWindows(assert, assessment, NEXT_LINK_CANARIES, assessment.title);
+
+  assert.equal(run.exportError, undefined);
+  const files = readBundleFiles(run.exported.outputDir);
+  assertNoCanaryWindowsInFiles(assert, files, NEXT_LINK_CANARIES, "bundle");
+  assertNoCanaryWindowsInFiles(assert, readZipEntries(run.exported.zipPath), NEXT_LINK_CANARIES, "zip");
+  const users = JSON.parse(files.get("core_data/users.json"));
+  assert.equal(users.data.complete, false);
+  assert.match(users.data.truncation, /another origin/);
+  assert.deepEqual(users.data.items.map((user) => user.username), ["auditor", "ops", "reviewer"], "the dataset holds page one only");
+  const allText = [...files.values()].join("\n");
+  assert.ok(!allText.includes(FOREIGN_NEXT_HOST), "the bundle never names the link's host");
+});
+
 test("checkAnsibleAccess reports readable AAP audit surfaces and visibility", async () => {
   const counts = {
     "/api/v2/organizations/": 2,
