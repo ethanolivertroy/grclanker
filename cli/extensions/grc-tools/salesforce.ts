@@ -3003,7 +3003,7 @@ export async function checkSalesforceAccess(client: ReadClient): Promise<Salesfo
     await probeSurface("connected_applications", `/services/data/v${version}/query (ConnectedApplication)`, "View Setup and Configuration", () => client.listConnectedApplications(50), queryCount),
     await probeSurface("oauth_tokens", `/services/data/v${version}/query (OauthToken)`, "Customize Application (without it only the caller's own tokens are returned)", () => client.listOauthTokens(50), queryCount),
     await probeSurface("event_log_files", `/services/data/v${version}/query (EventLogFile)`, "View Event Log Files (Event Monitoring license)", () => client.listEventLogFiles(1, 10), queryCount),
-    { name: "caller_permissions", endpoint: `/services/data/v${version}/query (UserPermissionAccess)`, status: callerPermissions.status === "ok" && callerPermissions.data ? "readable" : "not_readable", count: callerPermissions.status === "ok" ? callerPermissions.seen : undefined, error: callerPermissions.error, permissionHint: "API Enabled" },
+    { name: "caller_permissions", endpoint: `/services/data/v${version}/query (UserPermissionAccess)`, status: callerPermissions.status === "ok" && callerPermissions.data ? "readable" : "not_readable", count: callerPermissions.status === "ok" && callerPermissions.data ? callerPermissions.seen : undefined, error: callerPermissions.error, permissionHint: "API Enabled" },
   ];
 
   const deniedCallerPermissions = CALLER_PERMISSION_FIELDS

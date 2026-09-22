@@ -1176,6 +1176,13 @@ test("review fix 8: OauthToken is a partial view without Customize Application a
   assert.equal(tokenSurface.status, "readable");
   assert.match(tokenSurface.permissionHint, /Customize Application/);
   assert.ok(access.surfaces.some((surface) => surface.name === "caller_permissions" && surface.status === "readable"));
+
+  // CodeRabbit (#62): a UserPermissionAccess query that answers with no row is "not_readable", and the count
+  // guard matches the status guard, so the surface carries no count (never 0) alongside that status.
+  const noRow = await checkSalesforceAccess(createFullMockClient({ async getCallerPermissions() { return undefined; } }));
+  const noRowSurface = noRow.surfaces.find((surface) => surface.name === "caller_permissions");
+  assert.equal(noRowSurface.status, "not_readable");
+  assert.equal(noRowSurface.count, undefined, "no count is rendered for a surface reported not readable");
 });
 
 test("review round 2 fix 1: control 6 requires every weekday to be bounded and never passes a profile that restricts a single day", () => {
@@ -1959,10 +1966,17 @@ test("rule 9 error strings: on every Salesforce surface a 502 HTML body or a JSO
       for (const assess of [assessSalesforcePlatformSecurity, assessSalesforceIdentityAccess, assessSalesforceDataProtection, assessSalesforceMonitoringIntegrations]) {
         assessments.push(await assess(client, { now: NOW }));
       }
+      // The export stays inside the loop: the bundle and zip assertions below are about this failing surface.
       const base = createTempBase("grclanker-sf-canary-");
-      const exported = await exportSalesforceAuditBundle(client, client.getResolvedConfig(), base, { now: NOW });
-      const files = readBundleFiles(exported.outputDir);
-      const zipEntries = readZipEntries(exported.zipPath);
+      let files;
+      let zipEntries;
+      try {
+        const exported = await exportSalesforceAuditBundle(client, client.getResolvedConfig(), base, { now: NOW });
+        files = readBundleFiles(exported.outputDir);
+        zipEntries = readZipEntries(exported.zipPath);
+      } finally {
+        rmSync(base, { recursive: true, force: true });
+      }
       const label = `${surface}/${flavor}`;
       assertSfCanariesAbsent(JSON.stringify(access), `${label} check_access`);
       assertSfCanariesAbsent(JSON.stringify(assessments), `${label} assessments`);
@@ -2233,6 +2247,7 @@ test("round 7 note 1: every fixed-text message Salesforce emits (loader, opaque 
     texts.add(error.message);
     return true;
   });
+  rmSync(scratch, { recursive: true, force: true });
 
   // The resolver's own messages on the real path with an empty environment: no credentials at all, each
   // grant type named without its credentials, an unsupported grant type, and a malformed API version.
@@ -2256,21 +2271,34 @@ test("round 7 note 1: every fixed-text message Salesforce emits (loader, opaque 
   for (const text of toolTexts) texts.add(text);
 
   // Every surface under three credential-free failure flavors (plain proxy page, unrecognized JSON shape, documented
-  // error): the access check, the four assessments, the analysis files, and the error log render the opaque-body
-  // notes, the read: states, the manual-review and demotion templates, and the access-check notes on real paths.
+  // error): the access check and the four assessments render the opaque-body notes, the read: states, the
+  // manual-review and demotion templates, and the access-check notes on real paths. The bundle's own texts (the
+  // error log lines and the analysis files) do not vary by surface, so the export runs once per flavor on a
+  // representative surface (the metadata listing, whose failure also leaves the profile reads not requested)
+  // instead of once per surface, and each export directory is removed when it has been read.
+  const fixedTextClient = (surface, flavor) => new SalesforceApiClient(sampleConfig({ authMode: "password", username: "auditor@acme.example", password: "file-password", securityToken: "file-token", consumerKey: "ck", consumerSecret: "file-secret" }), { fetchImpl: sfCanaryFetch({ surface, flavor }), sleep: async () => {}, now: () => NOW });
+  const fixedTextFlavors = ["plainHtml", "opaqueJson", "plainJson"];
   for (const surface of SF_CANARY_SURFACES) {
-    for (const flavor of ["plainHtml", "opaqueJson", "plainJson"]) {
-      const client = new SalesforceApiClient(sampleConfig({ authMode: "password", username: "auditor@acme.example", password: "file-password", securityToken: "file-token", consumerKey: "ck", consumerSecret: "file-secret" }), { fetchImpl: sfCanaryFetch({ surface, flavor }), sleep: async () => {}, now: () => NOW });
+    for (const flavor of fixedTextFlavors) {
+      const client = fixedTextClient(surface, flavor);
       collectFixedTexts(await checkSalesforceAccess(client), texts);
       for (const assess of [assessSalesforcePlatformSecurity, assessSalesforceIdentityAccess, assessSalesforceDataProtection, assessSalesforceMonitoringIntegrations]) {
         collectFixedTexts(await assess(client, { now: NOW }), texts);
       }
-      const exported = await exportSalesforceAuditBundle(client, client.getResolvedConfig(), createTempBase("grclanker-sf-fixed-text-bundle-"), { now: NOW });
+    }
+  }
+  for (const flavor of fixedTextFlavors) {
+    const client = fixedTextClient("soap:listMetadata", flavor);
+    const base = createTempBase("grclanker-sf-fixed-text-bundle-");
+    try {
+      const exported = await exportSalesforceAuditBundle(client, client.getResolvedConfig(), base, { now: NOW });
       const files = readBundleFiles(exported.outputDir);
       for (const line of logLines(files.get("_errors.log"))) texts.add(line);
       for (const [name, content] of files) {
         if (name.startsWith("analysis/") && name.endsWith(".json")) collectFixedTexts(JSON.parse(content), texts);
       }
+    } finally {
+      rmSync(base, { recursive: true, force: true });
     }
   }
 
