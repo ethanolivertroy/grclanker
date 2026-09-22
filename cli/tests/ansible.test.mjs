@@ -31,12 +31,14 @@ import {
   parseRruleInterval,
   projectPing,
   projectUser,
+  redactCarrierText,
   redactCredentialTree,
   redactErrorText,
   redactVariables,
   resolveAnsibleConfiguration,
   resolveSecureOutputPath,
   sanitizeScmUrl,
+  scrubSnapshotValue,
 } from "../dist/extensions/grc-tools/ansible.js";
 import { readBundleFiles, readZipEntries } from "./helpers/bundle-contents.mjs";
 import {
@@ -62,15 +64,21 @@ import {
   parserSnippetBody,
 } from "./helpers/error-canaries.mjs";
 import {
+  DEPTH_CONTROL,
+  DEPTH_CONTROL_CANARIES,
   ESCAPED_HEADER_LINES,
   JSON_ESCAPES,
   QUOTED_NON_CREDENTIAL_GROUP,
+  assertCarrierTextScrub,
   assertCredentialPairValuesRemoved,
+  assertDepthControl,
+  assertDepthControlOutputs,
   assertEscapedHeaderCarriers,
   assertFixedTextsSurvive,
   assertIdentifierKeyRows,
   assertMustKeepRows,
   assertMustRedactRowsBesideMustKeep,
+  withPlantedRoutes,
 } from "./helpers/redaction-table.mjs";
 
 const NOW = new Date("2026-09-21T00:00:00.000Z");
@@ -2009,6 +2017,55 @@ test("rule 9 escapes (reviewer D round 5 escapes): a header carrier after a two-
   assert.equal(failed.status, "not_readable");
   assert.ok(failed.error.includes(expectedTail), `both carriers are removed whole after their escapes: ${failed.error}`);
   assertNoCanaryWindows(assert, access, [tracker, globalKey], "check_access after escaped headers");
+});
+
+test("rule 9 depth control (reviewer D round 5 depth control): every string a snapshot keeps passes the data-side carrier scrub at every depth in place, a credential-keyed value is the marker in place with its benign sibling kept, and a container nested past the cap of 32 is the marker, on redactCredentialTree and scrubSnapshotValue and end to end through a nested settings tree into core_data, the zip, and every tool payload", async () => {
+  assert.equal(DEPTH_CONTROL.cap, 32);
+  // The exported walkers: level k of the tree handed to the walker sits at depth k, so levels 1 to 32 are in place and level 33 is the marker.
+  assertDepthControl(assert, (tree) => redactCredentialTree(tree), { label: "ansible.redactCredentialTree", marker: ANSIBLE_REDACTION_MARKER });
+  assertDepthControl(assert, scrubSnapshotValue, { label: "ansible.scrubSnapshotValue" });
+  assertDepthControl(assert, (tree) => scrubSnapshotValue([tree])[0], { label: "ansible.scrubSnapshotValue on a record list", rootDepth: 2 });
+  assertDepthControl(assert, (tree) => redactCredentialTree({ record: tree }).record, { label: "ansible.redactCredentialTree under a benign key", rootDepth: 2, marker: ANSIBLE_REDACTION_MARKER });
+  // The string half on its own: carriers go, identifiers stay, the configured token goes in every form.
+  aapClient(healthyAapRoutes());
+  assertCarrierTextScrub(assert, redactCarrierText, { label: "ansible.redactCarrierText", configuredSecret: AAP_CLIENT_CONFIG.token });
+
+  // End to end: the tree planted on every body and in every record and nested record of every healthy route. The
+  // AAP settings API returns arbitrary nested values, so the settings files carry the tree as data, and the cap
+  // counts containers from the root of the written file: `{ data: <settings> }` is depth 1, the settings object
+  // depth 2, the planted tree's level 1 its member at depth 3, so level 30 sits at the cap in place and level 31 is
+  // the marker. Every other writer projects documented fields, so no other file carries a trace of the tree.
+  const planted = { count: 0 };
+  const log = [];
+  const run = await runEveryAnsibleTool(aapClient(withPlantedRoutes(healthyAapRoutes(), { planted }), log), createTempBase("grclanker-ansible-depth-"));
+  assert.ok(planted.count >= Object.keys(healthyAapRoutes()).length, `the fixture planted the tree into ${planted.count} objects`);
+  assert.equal(run.accessError, undefined, "the access check reads the planted fixture");
+  assert.equal(run.exportError, undefined, "the export reads the planted fixture");
+  assert.equal(run.exported.errorCount, 0, "the planted tree causes no read to fail");
+  const files = readBundleFiles(run.exported.outputDir);
+  const zipEntries = readZipEntries(run.exported.zipPath);
+  const carrying = assertDepthControlOutputs(
+    assert,
+    { files, zipEntries, outputs: [run.access, ...run.assessments] },
+    { label: "ansible", treeExpected: true, marker: ANSIBLE_REDACTION_MARKER },
+  );
+  const settingsFiles = ["core_data/settings_system.json", "core_data/settings_authentication.json", "core_data/settings_logging.json"];
+  assert.deepEqual(carrying.filter((entry) => entry.startsWith("file ")).sort(), settingsFiles.map((name) => `file ${name}`).sort(), "exactly the three settings files carry the nested tree with the cap applied");
+  for (const name of settingsFiles) {
+    assert.ok(carrying.some((entry) => entry.startsWith("zip ") && entry.endsWith(name)), `the zip entry for ${name} carries it too`);
+    const settings = JSON.parse(files.get(name));
+    let node = settings.data.x_deep_probe;
+    let level = 0;
+    while (node && typeof node === "object") {
+      level += 1;
+      node = node.child;
+    }
+    assert.equal(level, DEPTH_CONTROL.cap - 2, `${name}: levels 1 to ${DEPTH_CONTROL.cap - 2} sit in place below the wrapper and the settings object`);
+    assert.equal(node, ANSIBLE_REDACTION_MARKER, `${name}: level ${DEPTH_CONTROL.cap - 1} (depth ${DEPTH_CONTROL.cap + 1}) is the marker`);
+  }
+  assert.ok(!JSON.stringify([run.access, ...run.assessments]).includes("benign-note-"), "no tool payload copies the settings tree");
+  assertNoCanaryWindows(assert, run.access, DEPTH_CONTROL_CANARIES, "check_access");
+  for (const assessment of run.assessments) assertNoCanaryWindows(assert, assessment, DEPTH_CONTROL_CANARIES, assessment.title);
 });
 
 test("rule 9 credential-named pairs (reviewer D round 5 baseline): a value under a credential-named key is removed whatever its shape and length, unquoted as well as quoted, in every form the pair takes, while identifier-named keys keep their values unless the value's own shape removes it", () => {

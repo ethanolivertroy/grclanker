@@ -306,6 +306,232 @@ export function assertEscapedHeaderCarriers(assert, redact, { lines = ESCAPED_HE
 }
 
 /**
+ * reviewer D round 5 depth control. The data walkers removed a credential-keyed value at every depth but left a
+ * carrier inside a benign-keyed string untouched at every depth, and the AAP settings API returns arbitrary
+ * nested values, so a bearer inside a nested setting reached core_data. The rule has two halves: every string a
+ * snapshot keeps passes the data-side carrier scrub at every depth, in place, with its siblings kept; and an
+ * object or array nested past the cap becomes the marker. The canaries' 6-windows occur in no fixture.
+ */
+export const DEPTH_CONTROL = Object.freeze({
+  cap: 32,
+  levels: 40,
+  keyedCanary: "Qv7Tz3Km9Rb2Wn5Xp8Lc4Hd6Jf1Gs",
+  carrierCanary: "Yt3Rq8Zm2Vk7Lp4Nx9Wc6Hb1Jd5Fs",
+});
+
+/**
+ * Reviewer D's 40-deep tree: each level `{ level, note, secret_key, detail, quoted, child }`, the keyed value
+ * under `secret_key`, a bearer carrier under the benign key `detail`, and the quoted name-shaped bearer under
+ * `quoted`. Level 1 is the value returned; level k sits k - 1 containers below it.
+ */
+export function deepProbeTree({ levels = DEPTH_CONTROL.levels, keyedCanary = DEPTH_CONTROL.keyedCanary, carrierCanary = DEPTH_CONTROL.carrierCanary } = {}) {
+  let child;
+  for (let level = levels; level >= 1; level -= 1) {
+    child = {
+      level,
+      note: `benign-note-${level}`,
+      secret_key: `SK_${keyedCanary}`,
+      detail: `Authorization: Bearer ${carrierCanary}`,
+      quoted: 'token was "Bearer prod-token"',
+      ...(child === undefined ? {} : { child }),
+    };
+  }
+  return child;
+}
+
+/** The canaries the depth tree plants, for a windowed scan of any output that might carry it. */
+export const DEPTH_CONTROL_CANARIES = Object.freeze([DEPTH_CONTROL.keyedCanary, DEPTH_CONTROL.carrierCanary]);
+
+/**
+ * Asserts both halves on one walker: `walk(tree)` returns the tree as the walker leaves it. `rootDepth` is the
+ * depth the walker assigns to level 1 (1 when the tree is the value handed to it, 2 when it is wrapped in a list
+ * or a record first). At every level up to the cap the container keeps its shape and its benign sibling, the
+ * credential-keyed value is the marker in place, and both carrier strings are scrubbed in place; the first level
+ * past the cap is the marker; no 6-to-24 window of either canary survives anywhere in the output. Returns the
+ * number of levels found in place.
+ */
+export function assertDepthControl(assert, walk, { label, rootDepth = 1, cap = DEPTH_CONTROL.cap, levels = DEPTH_CONTROL.levels, marker = "[REDACTED]" } = {}) {
+  return assertWalkedTree(assert, walk(deepProbeTree({ levels })), { label, rootDepth, cap, levels, marker });
+}
+
+/**
+ * Asserts both halves on a walked tree whose level 1 sits at `rootDepth`: every level up to the cap is in place
+ * (shape, benign sibling, keyed value the marker, both carriers scrubbed, exactly its keys), the first level past
+ * the cap is the marker, and no 6-to-24 window of either canary survives. Returns the number of levels in place.
+ */
+export function assertWalkedTree(assert, output, { label, rootDepth = 1, cap = DEPTH_CONTROL.cap, levels = DEPTH_CONTROL.levels, marker = "[REDACTED]" }) {
+  const inPlace = cap - rootDepth + 1;
+  assert.ok(inPlace >= 1 && inPlace < levels, `${label}: the tree reaches past the cap (${inPlace} levels in place from depth ${rootDepth})`);
+  let node = output;
+  for (let level = 1; level <= inPlace; level += 1) {
+    assert.equal(typeof node, "object", `${label}: level ${level} (depth ${level + rootDepth - 1}) keeps its shape`);
+    assert.equal(node.level, level, `${label}: level ${level} is the level it was`);
+    assert.equal(node.note, `benign-note-${level}`, `${label}: level ${level} keeps its benign sibling`);
+    assert.equal(node.secret_key, marker, `${label}: level ${level} removes the credential-keyed value in place`);
+    assert.equal(node.detail, "Authorization: Bearer [REDACTED]", `${label}: level ${level} scrubs the bearer carrier in the benign-keyed string in place`);
+    assert.equal(node.quoted, 'token was "Bearer [REDACTED]"', `${label}: level ${level} scrubs the quoted name-shaped bearer in place`);
+    assert.deepEqual(Object.keys(node).sort(), ["child", "detail", "level", "note", "quoted", "secret_key"], `${label}: level ${level} keeps exactly its keys`);
+    node = node.child;
+  }
+  assert.equal(node, marker, `${label}: level ${inPlace + 1} (depth ${cap + 1}, past the cap) is the marker`);
+  assertNoCanaryWindows(assert, JSON.stringify(output), DEPTH_CONTROL_CANARIES, `${label}: the walked tree`);
+  return inPlace;
+}
+
+/** Every planted tree in a parsed document with the depth of its level 1 (the document's root is depth 1) and its path. */
+export function findPlantedTrees(value, key = "x_deep_probe", depth = 1, path = "$") {
+  if (value === null || typeof value !== "object") return [];
+  if (Array.isArray(value)) return value.flatMap((entry, index) => findPlantedTrees(entry, key, depth + 1, `${path}[${index}]`));
+  const found = [];
+  for (const [name, entry] of Object.entries(value)) {
+    if (name === key) found.push({ path: `${path}.${name}`, depth: depth + 1, tree: entry });
+    else found.push(...findPlantedTrees(entry, key, depth + 1, `${path}.${name}`));
+  }
+  return found;
+}
+
+/** Identifier shapes a snapshot names its resources by; the data-side scrub keeps every one bare and beside a label. */
+export const SNAPSHOT_IDENTIFIER_ROWS = Object.freeze([
+  "4f1c2f7a9b3d4e5f8a7b6c5d4e3f2a1b",
+  "AKIAEXAMPLE000000001",
+  "62e90394-69f5-4237-9190-012177145e10",
+  "arn:aws:iam::123456789012:role/Deploy",
+  "sha256:9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08",
+  "AROAEXAMPLE000000001:session-name",
+  "https://aap.example.com/api/v2/hosts/",
+]);
+
+/**
+ * The data-side string scrub (redactCarrierText): a value is removed for what carries it, an identifier stays for
+ * what it is. Carriers: a header line, an authorization scheme, a cookie, URL userinfo and query, a credential-named
+ * pair, a quoted scheme phrase, and the configured secret when one is given. Kept: the identifier rows above, since
+ * a snapshot names its resources by them and the bare-shape rules belong to error text only.
+ */
+export function assertCarrierTextScrub(assert, redact, { label = "redactCarrierText", configuredSecret } = {}) {
+  const canary = DEPTH_CONTROL.carrierCanary;
+  const cases = [
+    [`Authorization: Bearer ${canary}`, "Authorization: Bearer [REDACTED]"],
+    [`X-Auth-Key: ${canary}`, "X-Auth-Key: [REDACTED]"],
+    [`Cookie: sid=${canary}; theme=dark`, "Cookie: [REDACTED]"],
+    [`https://user:${canary}@example.com/api/?token=${canary}`, "https://example.com/api/?[REDACTED]"],
+    [`password=${canary}`, "password=[REDACTED]"],
+    [`"api_key": "${canary}"`, '"api_key": "[REDACTED]"'],
+    ['token was "Bearer prod-token"', 'token was "Bearer [REDACTED]"'],
+    [`Basic ${canary}==`, "Basic [REDACTED]"],
+    ...(configuredSecret ? [[`note: ${configuredSecret}`, "note: [REDACTED]"]] : []),
+  ];
+  for (const [text, expected] of cases) {
+    assert.equal(redact(text), expected, `${label} removes the carried value: ${text}`);
+    assert.equal(redact(expected), expected, `${label} is idempotent: ${expected}`);
+  }
+  for (const row of SNAPSHOT_IDENTIFIER_ROWS) {
+    assert.equal(redact(row), row, `${label} keeps the identifier bare: ${row}`);
+    assert.equal(redact(`resource ${row} read`), `resource ${row} read`, `${label} keeps the identifier in a sentence: ${row}`);
+  }
+  assertNoCanaryWindows(assert, cases.map(([text]) => redact(text)).join("\n"), [canary], `${label} cases`);
+}
+
+/**
+ * Plants the depth tree as `key` on an object and on every object nested up to `maxDepth` containers below it (a
+ * page's records and their nested records), the way reviewer D's probe plants it, in place; returns the number of
+ * objects planted into. The tree itself is never planted into.
+ */
+export function plantDeepProbe(container, { key = "x_deep_probe", depth = 0, maxDepth = 3 } = {}) {
+  if (depth > maxDepth || container === null || typeof container !== "object") return 0;
+  if (Array.isArray(container)) return container.reduce((count, entry) => count + plantDeepProbe(entry, { key, depth: depth + 1, maxDepth }), 0);
+  let count = 1;
+  for (const value of Object.values(container)) count += plantDeepProbe(value, { key, depth: depth + 1, maxDepth });
+  container[key] = deepProbeTree();
+  return count;
+}
+
+/**
+ * Wraps a fixture's routes so every JSON response carries the depth tree on its body and in every record and
+ * nested record (plantDeepProbe); `skip` lists paths left alone (a token endpoint). Non-JSON responses pass
+ * through. `planted` counts the objects planted into, so a test can prove the fixture carried the tree.
+ */
+export function withPlantedRoutes(routes, { key = "x_deep_probe", skip = [], planted = { count: 0 } } = {}) {
+  const wrapped = {};
+  for (const [path, route] of Object.entries(routes)) {
+    wrapped[path] = skip.includes(path)
+      ? route
+      : async (...args) => {
+          const response = await route(...args);
+          const text = await response.text();
+          const init = { status: response.status, statusText: response.statusText, headers: response.headers };
+          let body;
+          try {
+            body = JSON.parse(text);
+          } catch {
+            return new Response(text, init);
+          }
+          planted.count += plantDeepProbe(body, { key });
+          return new Response(JSON.stringify(body), init);
+        };
+  }
+  return wrapped;
+}
+
+/**
+ * AWS: an unknown output member is dropped by the SDK's typed deserializer, so the tree travels inside the two
+ * policy documents the code parses (iam:GetPolicyVersion `Document`, URL-encoded, and s3:GetBucketPolicy
+ * `Policy`) as a statement whose `Sid` carries the bearer, whose `Condition` carries the quoted name-shaped bearer
+ * and the tree, both real string positions in a policy. Returns the document text with the statement added.
+ */
+export function plantDeepProbeInPolicyDocument(text, { encoded = false } = {}) {
+  const document = JSON.parse(encoded ? decodeURIComponent(text) : text);
+  const statements = Array.isArray(document.Statement) ? document.Statement : document.Statement === undefined ? [] : [document.Statement];
+  statements.push({
+    Sid: `Authorization: Bearer ${DEPTH_CONTROL.carrierCanary}`,
+    Effect: "Deny",
+    Action: "s3:DeleteBucket",
+    Resource: "*",
+    Condition: { StringEquals: { "aws:PrincipalTag/note": 'token was "Bearer prod-token"', x_deep_probe: deepProbeTree() } },
+  });
+  const planted = JSON.stringify({ ...document, Statement: statements });
+  return encoded ? encodeURIComponent(planted) : planted;
+}
+
+/**
+ * Asserts the end-to-end half on a bundle: no 6-to-24 window of either depth canary in any file, zip entry, or
+ * serialized output, and no name-shaped bearer either. With `treeExpected` false, no trace of the planted tree
+ * (`benign-note-`) anywhere, since the integration's documented-field projection drops an unknown member before it
+ * is written. With `treeExpected` true, every planted tree in every JSON file and zip entry is judged where it
+ * stands: the file's root is depth 1, so a tree whose level 1 sits at depth d keeps levels 1 to cap - d + 1 in
+ * place (note kept, keyed value the marker, both carriers scrubbed) and its next level is the marker. Returns
+ * the names of the files and zip entries carrying the tree.
+ */
+export function assertDepthControlOutputs(assert, { files, zipEntries, outputs = [] }, { label, treeExpected, cap = DEPTH_CONTROL.cap, marker = "[REDACTED]", key = "x_deep_probe" }) {
+  assertNoCanaryWindows(assert, [...files.values()].join("\n"), DEPTH_CONTROL_CANARIES, `${label} bundle files`);
+  assertNoCanaryWindows(assert, [...zipEntries.values()].join("\n"), DEPTH_CONTROL_CANARIES, `${label} zip entries`);
+  for (const output of outputs) assertNoCanaryWindows(assert, JSON.stringify(output), DEPTH_CONTROL_CANARIES, `${label} output`);
+  const everything = [...[...files].map(([name, text]) => [`file ${name}`, text]), ...[...zipEntries].map(([name, text]) => [`zip ${name}`, text])];
+  for (const [name, text] of everything) assert.ok(!text.includes("Bearer prod-token"), `${label}: ${name} carries no quoted name-shaped bearer`);
+  for (const output of outputs) assert.ok(!JSON.stringify(output).includes("Bearer prod-token"), `${label}: no output carries the quoted name-shaped bearer`);
+  if (!treeExpected) {
+    for (const [name, text] of everything) assert.ok(!text.includes("benign-note-"), `${label}: ${name} carries no trace of the planted tree (dropped by projection)`);
+    for (const output of outputs) assert.ok(!JSON.stringify(output).includes("benign-note-"), `${label}: no output carries the planted tree`);
+    return [];
+  }
+  const carrying = [];
+  for (const [name, text] of everything) {
+    if (!text.includes("benign-note-")) continue;
+    let document;
+    try {
+      document = JSON.parse(text);
+    } catch {
+      assert.fail(`${label}: ${name} carries the planted tree but is not a JSON document`);
+    }
+    const trees = findPlantedTrees(document, key);
+    assert.ok(trees.length > 0, `${label}: ${name} carries the tree under its planted key`);
+    for (const { path, depth, tree } of trees) assertWalkedTree(assert, tree, { label: `${label} ${name} at ${path}`, rootDepth: depth, cap, marker });
+    carrying.push(name);
+  }
+  assert.ok(carrying.length > 0, `${label}: at least one written file carries the planted tree`);
+  return carrying;
+}
+
+/**
  * Round 4 open ruling on server-assigned 32-hex ids, resolved as: masked in sentences, kept whole in structured
  * fields. A GuardDuty detector id and a Cloudflare account, zone, or token id are 32 hex characters, a hex
  * digest to the scrub, so error text removes them bare and they travel whole in the structured fields

@@ -21,9 +21,11 @@ import {
   displayPath,
   exportCloudflareAuditBundle,
   labelIdentifier,
+  redactCarrierText,
   redactErrorText,
   resolveCloudflareConfiguration,
   resolveSecureOutputPath,
+  scrubSnapshotValue,
 } from "../dist/extensions/grc-tools/cloudflare.js";
 import { readBundleFiles, readZipEntries } from "./helpers/bundle-contents.mjs";
 import {
@@ -49,18 +51,23 @@ import {
   shortBodyResponse,
 } from "./helpers/error-canaries.mjs";
 import {
+  DEPTH_CONTROL,
   ESCAPED_HEADER_LINES,
   JSON_ESCAPES,
   MASKED_HEX_ID_GROUP,
   QUOTED_NON_CREDENTIAL_GROUP,
   SERVER_ASSIGNED_HEX_IDS,
+  assertCarrierTextScrub,
   assertCredentialPairValuesRemoved,
+  assertDepthControl,
+  assertDepthControlOutputs,
   assertEscapedHeaderCarriers,
   assertFixedTextsSurvive,
   assertHexIdentifierPolicy,
   assertIdentifierKeyRows,
   assertMustKeepRows,
   assertMustRedactRowsBesideMustKeep,
+  withPlantedRoutes,
 } from "./helpers/redaction-table.mjs";
 
 function createTempBase(prefix) {
@@ -1329,6 +1336,38 @@ test("rule 9 escapes (reviewer D round 5 escapes): a header carrier after a two-
   assert.equal(members.status, "not_readable");
   assert.ok(members.error.includes("\\nCookie: [REDACTED]\\u000aX-Auth-Key: [REDACTED]"), `both carriers are removed whole after their escapes: ${members.error}`);
   assertNoCanaryWindows(assert, access, [tracker, globalKey], "check_access after escaped headers");
+});
+
+test("rule 9 depth control (reviewer D round 5 depth control): every string a snapshot keeps passes the data-side carrier scrub at every depth in place, a credential-keyed value is the marker in place with its benign sibling kept, and a container nested past the cap of 32 is the marker, on scrubSnapshotValue and end to end through every healthy route into the bundle, the zip, and every tool payload", async () => {
+  assert.equal(DEPTH_CONTROL.cap, 32);
+  // The exported walker: level k of the tree handed to it sits at depth k, so levels 1 to 32 are in place and level 33 is the marker.
+  assertDepthControl(assert, scrubSnapshotValue, { label: "cloudflare.scrubSnapshotValue" });
+  assertDepthControl(assert, (tree) => scrubSnapshotValue([tree])[0], { label: "cloudflare.scrubSnapshotValue on a record list", rootDepth: 2 });
+  assertDepthControl(assert, (tree) => scrubSnapshotValue({ result: [{ settings: tree }] }).result[0].settings, { label: "cloudflare.scrubSnapshotValue under an envelope", rootDepth: 4 });
+  // The string half on its own: carriers go, identifiers stay (a 32-hex account id among them), the configured token goes in every form.
+  const config = sampleConfig({ apiToken: CLOUDFLARE_RUN_TOKEN_CANARY });
+  new CloudflareApiClient(config, { fetchImpl: cloudflareRoutedFetch(healthyCloudflareRoutes()) });
+  assertCarrierTextScrub(assert, redactCarrierText, { label: "cloudflare.redactCarrierText", configuredSecret: CLOUDFLARE_RUN_TOKEN_CANARY });
+  for (const { label, id } of SERVER_ASSIGNED_HEX_IDS) {
+    assert.equal(redactCarrierText(`/accounts/${id}/members read`), `/accounts/${id}/members read`, `a snapshot keeps a ${label} whole`);
+  }
+
+  // End to end: the tree planted on every envelope and in every record and nested record of every healthy route.
+  // Every Cloudflare writer projects documented fields, so no bundle file, zip entry, or tool payload carries a trace of it.
+  const planted = { count: 0 };
+  const log = [];
+  const run = await runEveryCloudflareTool(
+    new CloudflareApiClient(config, { fetchImpl: cloudflareRoutedFetch(withPlantedRoutes(healthyCloudflareRoutes(), { planted }), log) }),
+    createTempBase("grclanker-cloudflare-depth-"),
+  );
+  assert.ok(planted.count >= Object.keys(healthyCloudflareRoutes()).length, `the fixture planted the tree into ${planted.count} objects`);
+  assert.equal(run.exported.errorCount, 0, "the planted tree causes no read to fail");
+  assert.ok(run.access.surfaces.every((surface) => surface.status === "readable"), "every surface reads the planted fixture");
+  assertDepthControlOutputs(
+    assert,
+    { files: readBundleFiles(run.exported.outputDir), zipEntries: readZipEntries(run.exported.zipPath), outputs: [run.access, ...run.assessments] },
+    { label: "cloudflare", treeExpected: false },
+  );
 });
 
 test("rule 9 fixed texts (GWS note 1): every fixed-text message the integration emits survives redactErrorText unchanged, from the SyntaxError and non-JSON notes through the not attempted and Not attempted wordings to the manual-review, partial-inventory, and zone-plan prose", () => {

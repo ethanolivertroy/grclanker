@@ -23,11 +23,14 @@ import {
   duoFixedTexts,
   projectCollectionStatus,
   redactBypassCodeRecords,
+  redactCarrierText,
   redactErrorText,
+  redactFields,
   redactIntegrationRecords,
   resolveDuoConfiguration,
   resolveSecureOutputPath,
   runDuoAccessCheck,
+  scrubSnapshotValue,
 } from "../dist/extensions/grc-tools/duo.js";
 import { readBundleFiles, readZipEntries } from "./helpers/bundle-contents.mjs";
 import {
@@ -55,15 +58,20 @@ import {
   shortBodyResponse,
 } from "./helpers/error-canaries.mjs";
 import {
+  DEPTH_CONTROL,
   ESCAPED_HEADER_LINES,
   JSON_ESCAPES,
   QUOTED_NON_CREDENTIAL_GROUP,
+  assertCarrierTextScrub,
   assertCredentialPairValuesRemoved,
+  assertDepthControl,
+  assertDepthControlOutputs,
   assertEscapedHeaderCarriers,
   assertFixedTextsSurvive,
   assertIdentifierKeyRows,
   assertMustKeepRows,
   assertMustRedactRowsBesideMustKeep,
+  withPlantedRoutes,
 } from "./helpers/redaction-table.mjs";
 
 function createTempBase(prefix) {
@@ -2080,6 +2088,64 @@ test("rule 9 escapes (reviewer D round 5 escapes): a header carrier after a two-
   assert.ok(probe && probe.status !== "ok", `the probe for ${surface} is not ok`);
   assert.ok(probe.detail.includes(expectedTail), `both carriers are removed whole after their escapes: ${probe.detail}`);
   assertNoCanaryWindows(assert, access, [tracker, globalKey], "check_access after escaped headers");
+});
+
+test("rule 9 depth control (reviewer D round 5 depth control): every string a snapshot keeps passes the data-side carrier scrub at every depth in place, a credential-keyed value is the marker in place with its benign sibling kept, and a container nested past the cap of 32 is the marker, on redactFields, redactIntegrationRecords, and scrubSnapshotValue and end to end through every healthy route into the bundle, the zip, and every tool payload", async () => {
+  assert.equal(DEPTH_CONTROL.cap, 32);
+  // The exported walkers: level k of the tree handed to the walker sits at depth k, so levels 1 to 32 are in place and level 33 is the marker.
+  assertDepthControl(assert, (tree) => redactFields(tree, /^(secret_key|secretkey|skey)$/i), { label: "duo.redactFields (integration pattern)" });
+  assertDepthControl(assert, (tree) => redactIntegrationRecords([tree])[0], { label: "duo.redactIntegrationRecords", rootDepth: 2 });
+  assertDepthControl(assert, scrubSnapshotValue, { label: "duo.scrubSnapshotValue" });
+  assertDepthControl(assert, (tree) => scrubSnapshotValue({ response: [tree] }).response[0], { label: "duo.scrubSnapshotValue under an envelope", rootDepth: 3 });
+  // redactBypassCodeRecords keys on `code`, not `secret_key`, so only the string half and the cap apply to it.
+  const bypassWalked = redactBypassCodeRecords([{ code: "123456", note: `Authorization: Bearer ${DEPTH_CONTROL.carrierCanary}` }])[0];
+  assert.deepEqual(bypassWalked, { code: "[REDACTED]", note: "Authorization: Bearer [REDACTED]" });
+  // The string half on its own: carriers go, identifiers stay, the configured skey goes in every form.
+  const config = createSampleConfig();
+  new DuoAuditorClient(config, { fetchImpl: routedFetch(healthyDuoRoutes()) });
+  assertCarrierTextScrub(assert, redactCarrierText, { label: "duo.redactCarrierText", configuredSecret: config.skey });
+
+  // End to end: the tree planted on every envelope and in every record and nested record of every healthy route.
+  // Duo keeps its core_data records whole (the Admin API returns arbitrary nested values in policies and logs), so
+  // the files carry the tree as data with the cap counted from the file's root: in a record list the tree's level 1
+  // sits at depth 3 (list, record, member) and level 30 is the last in place; in an object file at depth 2 and level
+  // 31 is. The datasets a collector returns are the same snapshots, so no function result carries a canary either.
+  const planted = { count: 0 };
+  const client = new DuoAuditorClient(config, { fetchImpl: routedFetch(withPlantedRoutes(healthyDuoRoutes(), { planted })) });
+  const access = await runDuoAccessCheck(client, config);
+  const datasets = [
+    await collectDuoAuthenticationData(client, config.lookbackDays),
+    await collectDuoAdminAccessData(client, config.lookbackDays),
+    await collectDuoIntegrationData(client),
+    await collectDuoMonitoringData(client, config.lookbackDays),
+  ];
+  const assessments = [
+    assessDuoAuthentication(datasets[0], config),
+    assessDuoAdminAccess(datasets[1], config),
+    assessDuoIntegrations(datasets[2], config),
+    assessDuoMonitoring(datasets[3], config),
+  ];
+  const exported = await exportDuoAuditBundle(client, config, createTempBase("grclanker-duo-depth-"));
+  assert.ok(planted.count >= Object.keys(healthyDuoRoutes()).length, `the fixture planted the tree into ${planted.count} objects`);
+  assert.equal(exported.errorCount, 0, "the planted tree causes no read to fail");
+  assert.ok(access.probes.every((probe) => probe.status === "ok"), "every probe reads the planted fixture");
+  const files = readBundleFiles(exported.outputDir);
+  const carrying = assertDepthControlOutputs(
+    assert,
+    { files, zipEntries: readZipEntries(exported.zipPath), outputs: [access, ...datasets, ...assessments] },
+    { label: "duo", treeExpected: true },
+  );
+  for (const [name, levelAtCap] of [["core_data/users.json", DEPTH_CONTROL.cap - 2], ["core_data/settings.json", DEPTH_CONTROL.cap - 1]]) {
+    assert.ok(carrying.includes(`file ${name}`), `${name} carries the tree with the cap applied`);
+    assert.ok(carrying.some((entry) => entry.startsWith("zip ") && entry.endsWith(name)), `the zip entry for ${name} carries it too`);
+    const text = files.get(name);
+    assert.ok(text.includes(`"benign-note-${levelAtCap}"`) && !text.includes(`"benign-note-${levelAtCap + 1}"`), `${name}: level ${levelAtCap} is the last in place`);
+  }
+  assert.ok(!JSON.stringify(assessments).includes("benign-note-"), "no assessment copies a record tree into its evidence");
+  // The dataset a collector returns is already the snapshot: the same tree, capped, with no canary.
+  const settingsDataset = datasets[0].settings.data;
+  assert.equal(settingsDataset.x_deep_probe.secret_key, "[REDACTED]");
+  assert.equal(settingsDataset.x_deep_probe.detail, "Authorization: Bearer [REDACTED]");
 });
 
 test("rule 9 credential-named pairs (reviewer D round 5 baseline): a value under a credential-named key is removed whatever its shape and length, unquoted as well as quoted, in every form the pair takes, while identifier-named keys keep their values unless the value's own shape removes it", () => {

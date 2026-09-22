@@ -1214,6 +1214,14 @@ const ERROR_QUOTED_CREDENTIAL_PATTERN = new RegExp(
 // `"settings.token":`) is a pair the rule above already handled.
 const ERROR_QUOTED_SCHEME_PATTERN = new RegExp(String.raw`(?<!["'\\./-])\b(${ERROR_SCHEME_PATTERN})(\s*)${ERROR_QUOTED_VALUE_PATTERN}`, "gi");
 const QUOTED_VALUE_REPLACEMENT = `$1$2$3${REDACTED_ERROR_VALUE}$5`;
+/**
+ * A quoted phrase that is a scheme word and one value (`"Bearer prod-token"`, `\"Token prod-key\"`, `'Basic abc'`):
+ * the quotes delimit a header value being quoted, so the value goes whatever its shape (reviewer D round 5 depth
+ * control, the quoted name-shaped bearer), where the same phrase bare in prose (`sent as Bearer prod-token`) is
+ * judged by the scheme rule's shape test. A quoted phrase of several words after the scheme is prose and stays.
+ */
+const ERROR_QUOTED_SCHEME_PHRASE_PATTERN = new RegExp(String.raw`(\\?(["']))(${ERROR_SCHEME_PATTERN})(\s+)((?:(?!\\?\2)[^\s"'\\])+)(\\?\2)`, "gi");
+const QUOTED_SCHEME_PHRASE_REPLACEMENT = `$1$3$4${REDACTED_ERROR_VALUE}$6`;
 
 const CREDENTIAL_KEY_WORD_PATTERN = new RegExp(`(?:${ERROR_CREDENTIAL_WORDS})$`, "i");
 // Credential words that end too many ordinary words to count when glued to a lowercase prefix (`oauth`, `ssid`).
@@ -1315,12 +1323,16 @@ function scrubHeaderCarriers(text: string): string {
   return scrubbed + text.slice(cursor);
 }
 
-const ERROR_TEXT_PATTERNS: ReadonlyArray<readonly [RegExp, string]> = [
-  // The free-form header carriers (Cookie, Set-Cookie, X-Auth-Key, X-Auth-Email) run first in scrubHeaderCarriers,
-  // so the shape rules below only ever see the marker.
-  // Quoted header and pair values next, whatever their shape, so the scheme and pair rules see the marker.
+/**
+ * Carrier rules: a value is removed because of what carries it (a quoted header or pair value, an authorization
+ * scheme, a JWT or PEM shape), not because of its own shape. The free-form header carriers (Cookie, Set-Cookie,
+ * X-Auth-Key, X-Auth-Email) run first in scrubHeaderCarriers, so these only ever see the marker.
+ */
+const CARRIER_TEXT_PATTERNS: ReadonlyArray<readonly [RegExp, string]> = [
+  // Quoted header and pair values first, whatever their shape, so the scheme and pair rules see the marker.
   [ERROR_QUOTED_CREDENTIAL_PATTERN, QUOTED_VALUE_REPLACEMENT],
   [ERROR_QUOTED_SCHEME_PATTERN, QUOTED_VALUE_REPLACEMENT],
+  [ERROR_QUOTED_SCHEME_PHRASE_PATTERN, QUOTED_SCHEME_PHRASE_REPLACEMENT],
   // Authorization scheme values wherever they appear (headers, cookies, HTML, JSON messages); the value must be
   // long, carry a digit or base64 symbol, or change case inside the word, so prose such as "Basic authentication"
   // and "Bearer Token" stays.
@@ -1330,6 +1342,10 @@ const ERROR_TEXT_PATTERNS: ReadonlyArray<readonly [RegExp, string]> = [
   [/\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}/g, REDACTED_ERROR_VALUE],
   // PEM blocks, whole or cut off.
   [/-----BEGIN [A-Z0-9 ]+-----[\s\S]*?(?:-----END [A-Z0-9 ]+-----|$)/g, REDACTED_ERROR_VALUE],
+];
+
+/** Bare-shape rules: a value is removed for its own shape, wherever it stands. Error text only; a snapshot keeps its identifiers. */
+const BARE_SHAPE_PATTERNS: ReadonlyArray<readonly [RegExp, string]> = [
   // AWS access key ids, 40-character secret access keys, long secret-shaped blobs, and hex digests.
   [/\b(?:AKIA|ASIA|AROA|AIDA|AGPA|ANPA|ANVA|APKA|ABIA|ACCA)[A-Z0-9]{16}\b/g, REDACTED_ERROR_VALUE],
   [/(?<![A-Za-z0-9/+=])[A-Za-z0-9/+]{40}(?![A-Za-z0-9/+=])/g, REDACTED_ERROR_VALUE],
@@ -1337,6 +1353,8 @@ const ERROR_TEXT_PATTERNS: ReadonlyArray<readonly [RegExp, string]> = [
   [/(?<![A-Za-z0-9+_=-])(?=[A-Za-z0-9+_-]*\d)[A-Za-z0-9+_-]{40,}={0,2}(?![A-Za-z0-9+_=-])/g, REDACTED_ERROR_VALUE],
   [/\b[a-f0-9]{32,}\b/gi, REDACTED_ERROR_VALUE],
 ];
+
+const ERROR_TEXT_PATTERNS: ReadonlyArray<readonly [RegExp, string]> = [...CARRIER_TEXT_PATTERNS, ...BARE_SHAPE_PATTERNS];
 
 // URL userinfo and query strings anywhere in the string, not only when the string starts with a URL.
 const ERROR_URL_PATTERN = /\b(https?:\/\/)(?:[^\s/@"'<>]+@)?([^\s?#"'<>]+)(\?[^\s#"'<>]*)?/gi;
@@ -1397,16 +1415,76 @@ function scrubLongTokens(text: string): string {
  * credential echoed by an upstream error body, a transport error, or a URL into the audit output.
  */
 export function redactErrorText(text: string): string {
+  let scrubbed = scrubCarriers(text);
+  for (const [pattern, replacement] of BARE_SHAPE_PATTERNS) {
+    scrubbed = scrubbed.replace(pattern, replacement);
+  }
+  scrubbed = scrubCredentialPairs(scrubbed);
+  return scrubLongTokens(scrubbed);
+}
+
+/** The carrier passes shared by error text and snapshot strings: configured secrets, URL userinfo and query, header carriers, quoted values, schemes, JWT and PEM shapes. */
+function scrubCarriers(text: string): string {
   let scrubbed = scrubConfiguredSecrets(text);
   scrubbed = scrubbed.replace(ERROR_URL_PATTERN, (_match, scheme: string, hostPath: string, query?: string) =>
     `${scheme}${hostPath}${query ? `?${REDACTED_ERROR_VALUE}` : ""}`,
   );
   scrubbed = scrubHeaderCarriers(scrubbed);
-  for (const [pattern, replacement] of ERROR_TEXT_PATTERNS) {
+  for (const [pattern, replacement] of CARRIER_TEXT_PATTERNS) {
     scrubbed = scrubbed.replace(pattern, replacement);
   }
-  scrubbed = scrubCredentialPairs(scrubbed);
-  return scrubLongTokens(scrubbed);
+  return scrubbed;
+}
+
+/**
+ * Rule 9 data-side scrub for a string kept in a snapshot (reviewer D round 5 depth control): the carrier rules of
+ * redactErrorText (the configured secrets in every encoded form, URL userinfo and query strings, the free-form
+ * header carriers, quoted header and pair values, authorization schemes, JWT and PEM shapes, and credential-named
+ * pairs) without its bare-shape rules, so a value is removed for what carries it and an identifier, a digest, or a
+ * key id that is data stays data.
+ */
+export function redactCarrierText(text: string): string {
+  return scrubCredentialPairs(scrubCarriers(text));
+}
+
+/** Nesting past which an object or array in a snapshot is replaced by the marker; the value handed to the walker is depth 1. */
+const SNAPSHOT_DEPTH_CAP = 32;
+/**
+ * Field names whose value in API data is a secret whatever its shape. Exact names, not the suffix rule of the error
+ * text pair rule: a snapshot's own keys name collections about credentials (`tokens`, `credentials`,
+ * `passwordCredentials`, `webauthncredentials`, `hardtoken`) that carry metadata, and those stay.
+ */
+const SNAPSHOT_SECRET_KEY_PATTERN =
+  /^(?:secret[_-]?key|skey|secret|client[_-]?secret|api[_-]?secret|password|passwd|passphrase|private[_-]?key|access[_-]?token|refresh[_-]?token|id[_-]?token|authorization|cookie|set-cookie|x-auth-key|api[_-]?key|x-api-key)$/i;
+
+/** The snapshot walk behind scrubSnapshotValue and the integration's own data walkers: one key rule, one string rule, one cap. */
+function scrubSnapshotTree(value: unknown, isSecretKey: (key: string) => boolean, depth: number): unknown {
+  if (typeof value === "string") return redactCarrierText(value);
+  if (value === null || typeof value !== "object") return value;
+  if (value instanceof Date) return value;
+  if (depth > SNAPSHOT_DEPTH_CAP) return REDACTED_ERROR_VALUE;
+  if (Array.isArray(value)) return value.map((entry) => scrubSnapshotTree(entry, isSecretKey, depth + 1));
+  const output: Record<string, unknown> = {};
+  for (const [key, entry] of Object.entries(value as Record<string, unknown>)) {
+    output[key] = isSecretKey(key) ? snapshotMarkerFor(entry) : scrubSnapshotTree(entry, isSecretKey, depth + 1);
+  }
+  return output;
+}
+
+/** An absent or empty secret stays as it is (it reports that nothing was set); anything else is the marker. */
+function snapshotMarkerFor(entry: unknown): unknown {
+  return entry === undefined || entry === null || entry === "" ? entry : REDACTED_ERROR_VALUE;
+}
+
+/**
+ * Rule 9 walk over a value about to be written to a bundle file or returned as data (reviewer D round 5 depth
+ * control). Every string at every depth goes through redactCarrierText, so a carrier inside a benign-keyed string
+ * (`detail: "Authorization: Bearer ..."`) is scrubbed in place with its siblings kept; a value under a secret
+ * field name is the marker; an object or array nested past SNAPSHOT_DEPTH_CAP is the marker, so the depth of a
+ * server-supplied tree bounds the work and nothing deeper than the cap is copied.
+ */
+export function scrubSnapshotValue(value: unknown): unknown {
+  return scrubSnapshotTree(value, (key) => SNAPSHOT_SECRET_KEY_PATTERN.test(key), 1);
 }
 
 /**
@@ -1480,13 +1558,13 @@ const INTEGRATION_SECRET_FIELDS = /^(secret_key|secretkey|skey)$/i;
 /** Retrieve Bypass Codes documents that the code value is omitted; strip it anyway in case a tenant returns it. */
 const BYPASS_CODE_FIELDS = /^(code|bypass_code)$/i;
 
-/** Replaces every value whose key matches `pattern`, recursing through nested objects and arrays. */
+/**
+ * Replaces every value whose key matches `pattern`, recursing through nested objects and arrays; the snapshot walk
+ * behind it also scrubs every string at every depth for carriers and replaces a container nested past the cap
+ * with the marker (reviewer D round 5 depth control).
+ */
 export function redactFields<T>(value: T, pattern: RegExp): T {
-  if (Array.isArray(value)) return value.map((item) => redactFields(item, pattern)) as T;
-  if (typeof value !== "object" || value === null) return value;
-  return Object.fromEntries(
-    Object.entries(value as JsonRecord).map(([key, entry]) => [key, pattern.test(key) ? REDACTED_VALUE : redactFields(entry, pattern)]),
-  ) as T;
+  return scrubSnapshotTree(value, (key) => pattern.test(key), 1) as T;
 }
 
 export function redactIntegrationRecords(records: JsonRecord[]): JsonRecord[] {
@@ -1924,12 +2002,17 @@ function collectionStatusFor(client: CollectionStatusLookup, path: string): DuoC
   return client.collectionStatus(path) ?? null;
 }
 
+/**
+ * A dataset is the snapshot a collector returns, the assessments read, and the export writes, so its records go
+ * through the snapshot walk as they are kept (reviewer D round 5 depth control): every string scrubbed for carriers
+ * at every depth, a secret field the marker, a container past the cap the marker. Nothing deeper is copied.
+ */
 async function collectArrayDataset<T extends JsonRecord>(
   loader: () => Promise<T[]>,
   statusLookup?: () => DuoCollectionStatus | null | undefined,
 ): Promise<CollectedDataset<T[]>> {
   try {
-    const data = await loader();
+    const data = scrubSnapshotValue(await loader()) as T[];
     const status = statusLookup?.();
     if (status === undefined) return { data };
     if (status === null) return { data, total: undefined, complete: false };
@@ -1944,7 +2027,7 @@ async function collectObjectDataset<T>(
   fallback: T,
 ): Promise<CollectedDataset<T>> {
   try {
-    return { data: await loader() };
+    return { data: scrubSnapshotValue(await loader()) as T };
   } catch (error) {
     return { data: fallback, ...describeFailedRead(error) };
   }
@@ -4656,9 +4739,10 @@ function ensureUniqueRelativePath(root: string, preferredName: string): string {
   throw new Error(`Unable to allocate unique output path for ${preferredName}`);
 }
 
+/** Every JSON file the bundle writes goes through the snapshot walk first (rule 9 at every depth, with the cap). */
 async function writeJson(rootDir: string, relativePathname: string, value: unknown): Promise<void> {
   const destination = resolveSecureOutputPath(rootDir, relativePathname);
-  await writeFile(destination, `${JSON.stringify(value, null, 2)}\n`, "utf8");
+  await writeFile(destination, `${JSON.stringify(scrubSnapshotValue(value), null, 2)}\n`, "utf8");
 }
 
 async function writeText(rootDir: string, relativePathname: string, value: string): Promise<void> {

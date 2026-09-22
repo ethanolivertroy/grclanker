@@ -28,10 +28,12 @@ import {
   isExposedAdminRule,
   parseNetworkWatcherId,
   projectCredentialCarrier,
+  redactCarrierText,
   resolveAzureCloud,
   resolveAzureConfiguration,
   redactErrorText,
   resolveSecureOutputPath,
+  scrubSnapshotValue,
   toPage,
 } from "../dist/extensions/grc-tools/azure.js";
 import {
@@ -59,15 +61,20 @@ import {
   shortBodyResponse,
 } from "./helpers/error-canaries.mjs";
 import {
+  DEPTH_CONTROL,
   ESCAPED_HEADER_LINES,
   JSON_ESCAPES,
   QUOTED_NON_CREDENTIAL_GROUP,
+  assertCarrierTextScrub,
   assertCredentialPairValuesRemoved,
+  assertDepthControl,
+  assertDepthControlOutputs,
   assertEscapedHeaderCarriers,
   assertFixedTextsSurvive,
   assertIdentifierKeyRows,
   assertMustKeepRows,
   assertMustRedactRowsBesideMustKeep,
+  withPlantedRoutes,
 } from "./helpers/redaction-table.mjs";
 import { getRegisteredToolSummaries, groupRegisteredTools } from "../dist/pi/tool-catalog.js";
 import { readBundleFiles, readZipEntries } from "./helpers/bundle-contents.mjs";
@@ -889,6 +896,36 @@ test("rule 9 escapes (reviewer D round 5 escapes): a header carrier after a two-
   assert.ok(failed.length > 0, "the access check records the failing surface");
   assert.ok(failed.some((entry) => entry.error.includes(expectedTail)), `both carriers are removed whole after their escapes: ${JSON.stringify(failed.map((entry) => entry.error))}`);
   assertNoCanaryWindows(assert, access, [tracker, globalKey], "check_access after escaped headers");
+});
+
+test("rule 9 depth control (reviewer D round 5 depth control): every string a snapshot keeps passes the data-side carrier scrub at every depth in place, a credential-keyed value is the marker in place with its benign sibling kept, and a container nested past the cap of 32 is the marker, on scrubSnapshotValue and end to end through every healthy Graph and ARM route into the bundle, the zip, and every tool payload", async () => {
+  assert.equal(DEPTH_CONTROL.cap, 32);
+  // The exported walker: level k of the tree handed to it sits at depth k, so levels 1 to 32 are in place and level 33 is the marker.
+  assertDepthControl(assert, scrubSnapshotValue, { label: "azure.scrubSnapshotValue" });
+  assertDepthControl(assert, (tree) => scrubSnapshotValue({ value: [tree] }).value[0], { label: "azure.scrubSnapshotValue under a Graph page", rootDepth: 3 });
+  // The string half on its own: carriers go, identifiers stay (a tenant or role template UUID among them), the configured tokens go in every form.
+  const config = sampleConfig({ graphToken: "GraphTok3nQz8Nv3Tm5Rk2Wy7Lp4", managementToken: "ArmTok3nHx9Pl2Vt7Rb4Kn6Mc1" });
+  new AzureAuditorClient(config, { fetchImpl: azureRoutedFetch(healthyAzureRoutes()), now: () => NOW });
+  assertCarrierTextScrub(assert, redactCarrierText, { label: "azure.redactCarrierText", configuredSecret: config.graphToken });
+  assert.equal(redactCarrierText(`note: ${config.managementToken}`), "note: [REDACTED]", "the ARM token is a configured secret too");
+
+  // End to end: the tree planted on every Graph page, ARM list, and object body and in every record and nested
+  // record of every healthy route (the token endpoint left alone). Every Azure writer projects documented fields,
+  // so no bundle file, zip entry, or tool payload carries a trace of it.
+  const planted = { count: 0 };
+  const run = await runEveryAzureTool(
+    new AzureAuditorClient(config, { fetchImpl: azureRoutedFetch(withPlantedRoutes(healthyAzureRoutes(), { planted, skip: [AZURE_TOKEN_PATH] })), now: () => NOW }),
+    config,
+    createTempBase("grclanker-azure-depth-"),
+  );
+  assert.ok(planted.count >= Object.keys(healthyAzureRoutes()).length - 1, `the fixture planted the tree into ${planted.count} objects`);
+  assert.equal(run.exported.errorCount, 0, "the planted tree causes no read to fail");
+  assert.ok(run.access.surfaces.every((surface) => surface.status === "readable"), "every surface reads the planted fixture");
+  assertDepthControlOutputs(
+    assert,
+    { files: readBundleFiles(run.exported.outputDir), zipEntries: readZipEntries(run.exported.zipPath), outputs: [run.access, ...run.assessments] },
+    { label: "azure", treeExpected: false },
+  );
 });
 
 test("rule 9 credential-named pairs (reviewer D round 5 baseline): a value under a credential-named key is removed whatever its shape and length, unquoted as well as quoted, in every form the pair takes, while identifier-named keys keep their values unless the value's own shape removes it", () => {

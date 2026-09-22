@@ -37,10 +37,12 @@ import {
   normalizePolicyDocument,
   paginateAwsList,
   permissiveNaclEntries,
+  redactCarrierText,
   redactErrorText,
   resolveAwsConfiguration,
   resolveRegionScope,
   resolveSecureOutputPath,
+  scrubSnapshotValue,
   statementDeniesInsecureTransport,
   unrestrictedSecurityGroupRules,
 } from "../dist/extensions/grc-tools/aws.js";
@@ -81,18 +83,23 @@ import {
   parserSnippetBody,
 } from "./helpers/error-canaries.mjs";
 import {
+  DEPTH_CONTROL,
   ESCAPED_HEADER_LINES,
   JSON_ESCAPES,
   MASKED_HEX_ID_GROUP,
   QUOTED_NON_CREDENTIAL_GROUP,
   SERVER_ASSIGNED_HEX_IDS,
+  assertCarrierTextScrub,
   assertCredentialPairValuesRemoved,
+  assertDepthControl,
+  assertDepthControlOutputs,
   assertEscapedHeaderCarriers,
   assertFixedTextsSurvive,
   assertHexIdentifierPolicy,
   assertIdentifierKeyRows,
   assertMustKeepRows,
   assertMustRedactRowsBesideMustKeep,
+  plantDeepProbeInPolicyDocument,
 } from "./helpers/redaction-table.mjs";
 
 function createTempBase(prefix) {
@@ -2702,6 +2709,68 @@ test("rule 9 escapes (reviewer D round 5 escapes): a header carrier after a two-
       });
     }
   });
+});
+
+test("rule 9 depth control (reviewer D round 5 depth control): every string a snapshot keeps passes the data-side carrier scrub at every depth in place, a credential-keyed value is the marker in place with its benign sibling kept, and a container nested past the cap of 32 is the marker, on scrubSnapshotValue and end to end with the tree planted inside the two policy documents the code parses, through every assessment and the export into the bundle, the zip, and every tool payload", async () => {
+  assert.equal(DEPTH_CONTROL.cap, 32);
+  // The exported walker: level k of the tree handed to it sits at depth k, so levels 1 to 32 are in place and level 33 is the marker.
+  assertDepthControl(assert, scrubSnapshotValue, { label: "aws.scrubSnapshotValue" });
+  assertDepthControl(assert, (tree) => scrubSnapshotValue({ Statement: [{ Condition: tree }] }).Statement[0].Condition, { label: "aws.scrubSnapshotValue under a policy statement", rootDepth: 4 });
+  // The string half on its own: carriers go, identifiers stay (an access key id, an ARN, a GuardDuty detector id among them).
+  assertCarrierTextScrub(assert, redactCarrierText, { label: "aws.redactCarrierText" });
+  for (const { label, id } of SERVER_ASSIGNED_HEX_IDS) {
+    assert.equal(redactCarrierText(`detector ${id} read`), `detector ${id} read`, `a snapshot keeps a ${label} whole`);
+  }
+
+  // End to end. An unknown output member is dropped by the SDK's typed deserializer and cannot arrive, so the tree
+  // travels inside the two policy documents the code parses (iam:GetPolicyVersion Document, URL-encoded, and
+  // s3:GetBucketPolicy Policy) as a statement whose Sid carries the bearer and whose Condition carries the quoted
+  // name-shaped bearer and the tree. Statements are normalized to derived facts and never echoed, so no bundle
+  // file, zip entry, or tool payload carries a trace of it.
+  const healthy = healthySdkRoutes();
+  const planted = { iam: 0, s3: 0 };
+  const routes = {
+    ...healthy,
+    "iam:GetPolicyVersion": async (...args) => {
+      const output = await healthy["iam:GetPolicyVersion"](...args);
+      planted.iam += 1;
+      return { ...output, PolicyVersion: { ...output.PolicyVersion, Document: plantDeepProbeInPolicyDocument(output.PolicyVersion.Document, { encoded: true }) } };
+    },
+    "s3:GetBucketPolicy": async (...args) => {
+      const output = await healthy["s3:GetBucketPolicy"](...args);
+      planted.s3 += 1;
+      return { ...output, Policy: plantDeepProbeInPolicyDocument(output.Policy) };
+    },
+  };
+  // Fixture self-check: both planted documents carry the canaries and the tree as real statement strings.
+  const iamDocument = decodeURIComponent((await routes["iam:GetPolicyVersion"]({}, "us-east-1")).PolicyVersion.Document);
+  const s3Document = (await routes["s3:GetBucketPolicy"]({}, "us-east-1")).Policy;
+  for (const [name, text] of [["iam:GetPolicyVersion Document", iamDocument], ["s3:GetBucketPolicy Policy", s3Document]]) {
+    assert.ok(text.includes(DEPTH_CONTROL.carrierCanary) && text.includes(DEPTH_CONTROL.keyedCanary) && text.includes("benign-note-40"), `${name} carries both canaries and the whole tree`);
+    assert.ok(JSON.parse(text).Statement.some((statement) => statement.Sid === `Authorization: Bearer ${DEPTH_CONTROL.carrierCanary}`), `${name} carries the bearer in a Sid`);
+  }
+  planted.iam = 0;
+  planted.s3 = 0;
+
+  const log = [];
+  const { outputs, exported } = await withSdkRoutes(routes, log, async () => {
+    const client = realAwsClient();
+    const results = await runAllAssessments(client);
+    return { outputs: results, exported: await exportAwsAuditBundle(client, client.getResolvedConfig(), createTempBase("grclanker-aws-depth-")) };
+  });
+  assert.ok(planted.iam > 0 && planted.s3 > 0, `both planted documents were read (${planted.iam} policy versions, ${planted.s3} bucket policies)`);
+  assert.ok(log.every((entry) => entry.status === 200), "the planted documents cause no read to fail");
+  assert.equal(exported.errorCount, 0, "the export records no failed read");
+  assertDepthControlOutputs(
+    assert,
+    { files: readBundleFiles(exported.outputDir), zipEntries: readZipEntries(exported.zipPath), outputs: Object.values(outputs) },
+    { label: "aws", treeExpected: false },
+  );
+  // The verdicts that read the documents still hold: the planted Deny statements grant nothing and the TLS-only deny stays.
+  for (const [name, result] of Object.entries(outputs)) {
+    if (name === "access") continue;
+    for (const item of result.findings) assert.equal(item.status, "pass", `${item.id} still passes with the planted statements: ${item.summary}`);
+  }
 });
 
 test("rule 9 credential-named pairs (reviewer D round 5 baseline): a value under a credential-named key is removed whatever its shape and length, unquoted as well as quoted, in every form the pair takes, while identifier-named keys keep their values unless the value's own shape removes it", () => {
