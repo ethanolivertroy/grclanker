@@ -142,24 +142,31 @@ const NAME_CLOSE_AND_SEPARATOR = String.raw`(?:\\*["'])?\s*[:=]\s*`;
 // run after the singular header name (`cookies: enabled` is prose). No cookie name or value begins at
 // a bracket, so a JSON array or object after `"cookies":` is left to the rules that read inside it.
 const COOKIE_HEADER_PATTERN = new RegExp(String.raw`${NAME_START}(set-cookie|cookies?)${NAME_CLOSE_AND_SEPARATOR}`, "gi");
-const COOKIE_PAIR_NAME_PATTERN = /[^\s;,"'<>=()[\]{}\\]+/y;
-const COOKIE_BARE_VALUE_PATTERN = /[^\s;,"'<>()[\]{}\\]*/y;
-// A later pair or attribute name after `;`: the pair-name class less `:`, so an RFC 6265 token
-// character continues the scan (`my.sid`, `ASP.NET_SessionId`, `.AspNetCore.Session`, `~sid!`) and a
-// `; Name:` token still ends the value for the next header on a compound line (CodeRabbit on #78).
-// The one token character left out of the name and value classes is `'`: a header line is often
-// quoted whole in single quotes (`-H 'Cookie: sid=<v>; HttpOnly'`, a Python dict repr), and a name or
-// value that ran through the `'` would take that closing quote with it.
-const COOKIE_ATTRIBUTE_PATTERN = /;[ \t]*[^\s;,:"'<>=()[\]{}\\]+/y;
+// A cookie pair name, a later pair or attribute name after `;` (the name class less `:`, so a
+// `; Name:` token still ends the value for the next header on a compound line), and a bare cookie
+// value take every RFC 6265 token character (`!#$%&'*+-.^_` + "`|~" and alphanumerics: `my.sid`,
+// `ASP.NET_SessionId`, `.AspNetCore.Session`, `~sid!`; CodeRabbit on #78), the apostrophe included when
+// it stands inside the token (`my'pref`, `sid=O'<v>`, `x&'*y`). A header line is often quoted whole in
+// single quotes (`-H 'Cookie: sid=<v>; HttpOnly'`, a Python dict repr, a sentence that ends after the
+// quote), so an apostrophe followed by a space, a bracket, sentence punctuation, or the end closes
+// that quote rather than continuing the name or value; a name may also end in one right before `=`.
+const COOKIE_NAME_CHARACTER = String.raw`[^\s;,"'<>=()[\]{}\\]`;
+const COOKIE_VALUE_CHARACTER = String.raw`[^\s;,"'<>()[\]{}\\]`;
+const COOKIE_ATTRIBUTE_CHARACTER = String.raw`[^\s;,:"'<>=()[\]{}\\]`;
+const cookieToken = (character: string): string => String.raw`${character}+(?:'(?![.:!?])${character}+)*`;
+const NAME_FINAL_APOSTROPHE = String.raw`(?:'(?=[ \t]*=))?`;
+const COOKIE_PAIR_NAME_PATTERN = new RegExp(String.raw`${cookieToken(COOKIE_NAME_CHARACTER)}${NAME_FINAL_APOSTROPHE}`, "y");
+const COOKIE_BARE_VALUE_PATTERN = new RegExp(String.raw`(?:${cookieToken(COOKIE_VALUE_CHARACTER)})?`, "y");
+const COOKIE_ATTRIBUTE_PATTERN = new RegExp(String.raw`;[ \t]*${cookieToken(COOKIE_ATTRIBUTE_CHARACTER)}${NAME_FINAL_APOSTROPHE}`, "y");
 // The compound-line rule, the same in every scrubber: a quoted value ends at its closing quote; an
 // unquoted cookie or header value, and a quoted one that is never closed, ends at the `;` or `,` that
 // introduces the next `Name:` token on the line (`Cookie: sid=<v>; X-Api-Key: "<v>"; Content-Type:
 // "application/json"`), or at the end of the line; the header after it keeps its name and gets its
-// own carrier treatment. A cookie attribute is `Name` or `Name=value`, never `Name:`, so the token is
-// unambiguous there, and a closed quoted value with a plain `;` or `,` inside (`"text/html;
-// charset=utf-8"`, `"Mon, 22 Sep 2026 12:30:00 GMT"`) or even a `; Name:` inside still ends at its
-// closing quote.
-const FOLLOWING_HEADER_PATTERN = /[;,][ \t]*[A-Za-z][A-Za-z0-9_-]*[ \t]*:/y;
+// own carrier treatment. A header name may hold a `.` (`X.Api.Key:`, an RFC 7230 token character).
+// A cookie attribute is `Name` or `Name=value`, never `Name:`, so the token is unambiguous there, and
+// a closed quoted value with a plain `;` or `,` inside (`"text/html; charset=utf-8"`, `"Mon, 22 Sep
+// 2026 12:30:00 GMT"`) or even a `; Name:` inside still ends at its closing quote.
+const FOLLOWING_HEADER_PATTERN = /[;,][ \t]*[A-Za-z][A-Za-z0-9_.-]*[ \t]*:/y;
 
 // Headers whose value is a credential in any shape: the standard and vendor names, and any `x-` header
 // whose name carries a credential word unless its last segment says the value is a descriptor
@@ -786,9 +793,10 @@ function cookieValueEnd(text: string, index: number): number {
 /**
  * Reads a Cookie or Set-Cookie header value: quoted whole; `name=value` (spaces around "=" allowed)
  * followed by attributes (`; Path=/; HttpOnly`) whose values may themselves be quoted; or a bare run
- * after the singular header name. The whole header value is replaced by one marker. The value ends at
- * ",", at a `; Name:` token (the next header on a compound line, which is never a cookie attribute, so
- * the ";" and the name stay for that header's own rule), or at the line end.
+ * after the singular header name. The whole header value is replaced by one marker, a marker an
+ * earlier rule left at its end (`Cookie: &sid=[REDACTED]` after the query rule) folded in. The value
+ * ends at ",", at a `; Name:` token (the next header on a compound line, which is never a cookie
+ * attribute, so the ";" and the name stay for that header's own rule), or at the line end.
  */
 const readCookieHeaderValue: ValueReader = (text, valueStart, carrier) => {
   const quoted = readQuotedValue(text, valueStart);
@@ -812,7 +820,7 @@ const readCookieHeaderValue: ValueReader = (text, valueStart, carrier) => {
     cursor += attribute.length;
     if (text[attributeSeparator] === "=") cursor = cookieValueEnd(text, skipSpaces(text, attributeSeparator + 1));
   }
-  return { end: cursor, replacement: REDACTED };
+  return { end: absorbMarkers(text, cursor), replacement: REDACTED };
 };
 
 /**

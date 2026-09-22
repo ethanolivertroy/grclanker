@@ -488,20 +488,93 @@ test("CodeRabbit (#78): a later cookie name with a dot or any RFC 6265 token cha
 });
 
 /**
- * `'` is the one RFC 6265 token character the cookie name and value classes leave out: a header line
- * is often quoted whole in single quotes (a curl `-H` argument, a Python dict repr, a sentence that
- * ends after the quote), and a name or value that ran through the `'` would take the closing quote
- * with it. Each row plants the value in the cookie; the text after the closing quote must survive.
+ * Leak-probe harness class 3 (apostrophe and dotted cookie names): `'` is an RFC 6265 token character,
+ * so a cookie name or value may hold one (`my'pref`, `sid=O'<v>`, a name made of every token
+ * character), and a scrubber whose classes leave it out ends the name or value at the apostrophe and
+ * leaves the rest (`Cookie: [REDACTED]'<v>`). An apostrophe followed by another token character is
+ * part of the name or value; one followed by a space, a bracket, sentence punctuation, or the end
+ * closes a header line quoted whole in single quotes (see `SINGLE_QUOTED_HEADER_ROWS`). A following
+ * header name may hold a `.` (`X.Api.Key:`), after a bare and after an unterminated quoted value; a
+ * marker the query rule leaves under `&sid=` folds into the cookie's own marker.
+ */
+const APOSTROPHE_COOKIE_ROWS = Object.freeze([
+  ["apostrophe in the first pair name, then the credential pair", (a) => `Cookie: my'pref=dark; sid=${a}`, () => `Cookie: ${REDACTED}`, []],
+  ["apostrophe in a later pair name carrying the value", (a) => `Cookie: theme=dark; my'sid=${a}`, () => `Cookie: ${REDACTED}`, []],
+  ["apostrophe inside the value", (a) => `Cookie: sid=O'${a}`, () => `Cookie: ${REDACTED}`, []],
+  ["apostrophe inside the value, then attributes", (a) => `Cookie: sid=O'${a}; Path=/; HttpOnly`, () => `Cookie: ${REDACTED}`, []],
+  ["apostrophe inside a Set-Cookie value with attributes", (a) => `Set-Cookie: sid=O'${a}; HttpOnly; SameSite=Lax`, () => `Set-Cookie: ${REDACTED}`, []],
+  ["apostrophe inside an attribute value", (a) => `Set-Cookie: sid=${a}; Domain=o'reilly.example; Secure`, () => `Set-Cookie: ${REDACTED}`, []],
+  ["apostrophe at the end of a name before =", (a) => `Cookie: sid'=${a}; Path=/`, () => `Cookie: ${REDACTED}`, []],
+  ["every RFC 6265 token character, the apostrophe included, in the first name", (a, b) => `Cookie: !#$%&'*+^\`|~=${a}; X-Api-Key: ${b}`, () => `Cookie: ${REDACTED}; X-Api-Key: ${REDACTED}`, ["X-Api-Key:"]],
+  ["every RFC 6265 token character, the apostrophe included, in a later name", (a) => `Cookie: theme=dark; a!b#c$d%e&f'g*h+i-j.k^l_m\`n|o~p=${a}`, () => `Cookie: ${REDACTED}`, []],
+  ["query-rule marker under an ampersand name folded into one", (a) => `Cookie: &sid=${a}`, () => `Cookie: ${REDACTED}`, []],
+  ["ampersand and hash names with JSON-escaped quoted values", (a, b) => `{"Cookie": "&sid=\\"${a}\\"; #tok=\\"${b}\\""}`, () => `{"Cookie": "${REDACTED}"}`, []],
+  [
+    "compound control: apostrophe value, then a dotted header and a Content-Type",
+    (a, b) => `Cookie: sid=O'${a}; X.Api.Key: ${b}; Content-Type: text/html`,
+    () => `Cookie: ${REDACTED}; X.Api.Key: ${REDACTED}; Content-Type: text/html`,
+    ["X.Api.Key:", "Content-Type: text/html"],
+  ],
+  [
+    "compound control: unterminated quoted value, then a dotted header and a Content-Type",
+    (a, b) => `Cookie: sid="${a}; X.Api.Key: ${b}; Content-Type: text/html`,
+    () => `Cookie: ${REDACTED}; X.Api.Key: ${REDACTED}; Content-Type: text/html`,
+    ["X.Api.Key:", "Content-Type: text/html"],
+  ],
+  [
+    "compound control: unterminated quoted header value, then a dotted header and a Date",
+    (a, b) => `X-Api-Key: "${a}; X.Api.Key: ${b}; Date: Mon, 22 Sep 2026 12:30:00 GMT`,
+    () => `X-Api-Key: "${REDACTED}; X.Api.Key: ${REDACTED}; Date: Mon, 22 Sep 2026 12:30:00 GMT`,
+    ["X.Api.Key:", "Date: Mon, 22 Sep 2026 12:30:00 GMT"],
+  ],
+]);
+
+test("leak-probe class 3: an apostrophe inside a cookie name or value is part of it, a name of every RFC 6265 token character carries its value, and a dotted following header keeps its name", () => {
+  const legitimate = new Map(APOSTROPHE_COOKIE_ROWS.map(([label, line]) => [label, line("", "")]));
+  assertCanariesDisjointFromFixture(assert, plantedValues(), legitimate, "apostrophe cookie rows");
+  for (const [label, line, expected, keeps] of APOSTROPHE_COOKIE_ROWS) {
+    for (const [a, b] of plantedPairs()) {
+      const input = line(a, b);
+      const planted = [a, b].filter((value) => input.includes(value));
+      for (const [scrubName, scrub] of EXACT_SCRUBS) {
+        const output = scrub(input);
+        assert.equal(output, expected(), `${scrubName}: ${label} with ${a} and ${b}`);
+        for (const text of keeps) assert.ok(output.includes(text), `${scrubName}: ${label}: ${JSON.stringify(text)} did not survive in ${output}`);
+        assertNoCanaryWindows(assert, output, planted, `${scrubName}: ${label}`);
+        assert.equal(scrub(output), output, `${scrubName}: ${label}: a second pass changed the text`);
+      }
+      assertNoCanaryWindows(assert, errorMessage(new Error(input)), planted, `errorMessage: ${label}`);
+      const body = JSON.stringify({ message: `upstream sent ${input}` });
+      assert.equal(describeErrorBody("application/json", body), `upstream sent ${expected()}`, `describeErrorBody: ${label}`);
+      const described = describeFailedResponse({ method: "GET", endpoint: "/v1/users", status: 502, statusText: "Bad Gateway", contentType: "application/json", body });
+      assert.equal(described, `GET /v1/users failed with 502 Bad Gateway: upstream sent ${expected()}`, `describeFailedResponse: ${label}`);
+      assertNoCanaryWindows(assert, described, planted, `describeFailedResponse: ${label}`);
+    }
+  }
+  // The literal renderings the class was reported with.
+  assert.equal(scrubErrorText("Cookie: sid=O'hunter2"), `Cookie: ${REDACTED}`);
+  assert.equal(scrubErrorText("Cookie: my'pref=dark; sid=hunter2"), `Cookie: ${REDACTED}`);
+  assert.equal(scrubErrorText("Cookie: theme=dark; my'pref=hunter2"), `Cookie: ${REDACTED}`);
+});
+
+/**
+ * A header line quoted whole in single quotes (a curl `-H` argument, a Python dict repr, a sentence
+ * that ends after the quote) keeps its closing quote: the apostrophe that closes it is followed by a
+ * space, a bracket, sentence punctuation, or the end, which is where a cookie name or value ends.
+ * Each row plants the value in the cookie; the text after the closing quote must survive.
  */
 const SINGLE_QUOTED_HEADER_ROWS = Object.freeze([
   ["curl argument then a URL", (a) => `curl -H 'Cookie: sid=${a}; HttpOnly' https://api.example.com`, () => `curl -H 'Cookie: ${REDACTED}' https://api.example.com`, ["' https://api.example.com"]],
   ["curl argument that ends a sentence", (a) => `header -H 'Cookie: sid=${a}; HttpOnly'. Retry later`, () => `header -H 'Cookie: ${REDACTED}'. Retry later`, ["'. Retry later"]],
+  ["curl argument whose value ends the quote and the sentence", (a) => `header -H 'Cookie: sid=${a}'. Retry later`, () => `header -H 'Cookie: ${REDACTED}'. Retry later`, ["'. Retry later"]],
+  ["curl argument whose value ends the quote before a comma", (a) => `sent 'Cookie: sid=${a}', then 'Accept: text/html'`, () => `sent 'Cookie: ${REDACTED}', then 'Accept: text/html'`, ["', then 'Accept: text/html'"]],
   ["Python dict repr with a quoted value", (a) => `headers={'Cookie': 'sid=${a}; Path=/'}`, () => `headers={'Cookie': '${REDACTED}'}`, ["'}"]],
   ["Set-Cookie with attributes inside single quotes", (a) => `sent 'Set-Cookie: sid=${a}; Path=/; HttpOnly' and failed`, () => `sent 'Set-Cookie: ${REDACTED}' and failed`, ["' and failed"]],
   ["later dot name inside single quotes", (a) => `sent 'Cookie: theme=dark; my.sid=${a}; Secure' and failed`, () => `sent 'Cookie: ${REDACTED}' and failed`, ["' and failed"]],
+  ["apostrophe value inside single quotes", (a) => `sent 'Cookie: sid=O'${a}; Secure' and failed`, () => `sent 'Cookie: ${REDACTED}' and failed`, ["' and failed"]],
 ]);
 
-test("a header line quoted whole in single quotes keeps its closing quote, since the cookie name and value classes leave `'` out", () => {
+test("a header line quoted whole in single quotes keeps its closing quote, which a space, a bracket, punctuation, or the end follows", () => {
   const legitimate = new Map(SINGLE_QUOTED_HEADER_ROWS.map(([label, line]) => [label, line("")]));
   assertCanariesDisjointFromFixture(assert, plantedValues(), legitimate, "single-quoted header lines");
   for (const [label, line, expected, keeps] of SINGLE_QUOTED_HEADER_ROWS) {
