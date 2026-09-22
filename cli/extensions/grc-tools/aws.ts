@@ -773,65 +773,92 @@ function toAwsApiError(error: unknown): Error {
 type SdkClient = { send: (...args: any[]) => any; config?: unknown };
 
 /**
- * The top-level output member each command the client sends is answered with; a list member is present (empty)
- * even when the account holds nothing. When a command can answer with one of several members, any one counts.
- * A 2xx whose deserialized output carries none of them was not a service response (a proxy's HTML page, an
- * empty body the SDK turns into an output without members) and is thrown as IncompleteResponse rather than
- * read as an empty inventory or a default.
+ * The documented shape of a top-level output member: a list, a map or structure (which the service never answers
+ * empty), a non-empty string, a boolean, or a string that is a JSON policy document carrying a Statement.
  */
-export const AWS_REQUIRED_OUTPUT_MEMBERS: Readonly<Record<string, readonly string[]>> = Object.freeze({
-  GetCallerIdentity: ["Account"],
-  GetAccountSummary: ["SummaryMap"],
-  GetAccountPasswordPolicy: ["PasswordPolicy"],
-  ListUsers: ["Users"],
-  ListMFADevices: ["MFADevices"],
-  ListAccessKeys: ["AccessKeyMetadata"],
-  GetAccessKeyLastUsed: ["AccessKeyLastUsed"],
-  GetAccountAuthorizationDetails: ["RoleDetailList", "UserDetailList", "GroupDetailList", "Policies"],
-  ListPolicies: ["Policies"],
-  GetPolicyVersion: ["PolicyVersion"],
-  LookupEvents: ["Events"],
-  DescribeTrails: ["trailList"],
-  GetTrailStatus: ["IsLogging"],
-  GetEventSelectors: ["TrailARN", "EventSelectors", "AdvancedEventSelectors"],
-  DescribeHub: ["HubArn"],
-  GetEnabledStandards: ["StandardsSubscriptions"],
-  DescribeConfigurationRecorders: ["ConfigurationRecorders"],
-  DescribeConfigurationRecorderStatus: ["ConfigurationRecordersStatus"],
-  ListDetectors: ["DetectorIds"],
-  GetDetector: ["Status", "ServiceRole"],
-  DescribeOrganization: ["Organization"],
-  ListAccounts: ["Accounts"],
-  ListTargetsForPolicy: ["Targets"],
-  ListAnalyzers: ["analyzers"],
-  ListFindings: ["findings"],
-  ListInstances: ["Instances"],
-  ListAssessments: ["assessmentMetadata"],
-  GetAlternateContact: ["AlternateContact"],
-  DescribeRegions: ["Regions"],
-  GetPublicAccessBlock: ["PublicAccessBlockConfiguration"],
-  ListBuckets: ["Buckets"],
-  GetBucketPolicyStatus: ["PolicyStatus"],
-  GetBucketEncryption: ["ServerSideEncryptionConfiguration"],
-  GetBucketPolicy: ["Policy"],
-  GetEbsEncryptionByDefault: ["EbsEncryptionByDefault"],
-  DescribeVpcs: ["Vpcs"],
-  DescribeFlowLogs: ["FlowLogs"],
-  DescribeNetworkAcls: ["NetworkAcls"],
-  DescribeSecurityGroups: ["SecurityGroups"],
-  DescribeDBInstances: ["DBInstances"],
-  ListKeys: ["Keys"],
-  DescribeKey: ["KeyMetadata"],
-  GetKeyRotationStatus: ["KeyRotationEnabled"],
+export type AwsOutputMemberKind = "list" | "map" | "structure" | "string" | "boolean" | "policyDocument";
+
+/**
+ * The top-level output member each command the client sends is answered with, and its documented shape; a list
+ * member is present (empty) even when the account holds nothing. When a command can answer with one of several
+ * members, any one counts, and every one that is present must have its documented shape. A 2xx whose deserialized
+ * output carries none of them, or carries one in another shape (a string where a list is documented, an empty
+ * structure, bare text inside an XML list element the deserializer read as empty, a Policy that is not a policy
+ * document), was not a service response (a proxy's HTML page, an empty body the SDK turns into an output without
+ * members, a foreign document bound to a payload member) and is thrown as IncompleteResponse rather than read as
+ * an empty inventory or a default (round 4 item A).
+ */
+export const AWS_REQUIRED_OUTPUT_MEMBERS: Readonly<Record<string, Readonly<Record<string, AwsOutputMemberKind>>>> = Object.freeze({
+  GetCallerIdentity: { Account: "string" },
+  GetAccountSummary: { SummaryMap: "map" },
+  GetAccountPasswordPolicy: { PasswordPolicy: "structure" },
+  ListUsers: { Users: "list" },
+  ListMFADevices: { MFADevices: "list" },
+  ListAccessKeys: { AccessKeyMetadata: "list" },
+  GetAccessKeyLastUsed: { AccessKeyLastUsed: "structure" },
+  GetAccountAuthorizationDetails: { RoleDetailList: "list", UserDetailList: "list", GroupDetailList: "list", Policies: "list" },
+  ListPolicies: { Policies: "list" },
+  GetPolicyVersion: { PolicyVersion: "structure" },
+  LookupEvents: { Events: "list" },
+  DescribeTrails: { trailList: "list" },
+  GetTrailStatus: { IsLogging: "boolean" },
+  GetEventSelectors: { TrailARN: "string", EventSelectors: "list", AdvancedEventSelectors: "list" },
+  DescribeHub: { HubArn: "string" },
+  GetEnabledStandards: { StandardsSubscriptions: "list" },
+  DescribeConfigurationRecorders: { ConfigurationRecorders: "list" },
+  DescribeConfigurationRecorderStatus: { ConfigurationRecordersStatus: "list" },
+  ListDetectors: { DetectorIds: "list" },
+  GetDetector: { Status: "string", ServiceRole: "string" },
+  DescribeOrganization: { Organization: "structure" },
+  ListAccounts: { Accounts: "list" },
+  ListTargetsForPolicy: { Targets: "list" },
+  ListAnalyzers: { analyzers: "list" },
+  ListFindings: { findings: "list" },
+  ListInstances: { Instances: "list" },
+  ListAssessments: { assessmentMetadata: "list" },
+  GetAlternateContact: { AlternateContact: "structure" },
+  DescribeRegions: { Regions: "list" },
+  GetPublicAccessBlock: { PublicAccessBlockConfiguration: "structure" },
+  ListBuckets: { Buckets: "list" },
+  GetBucketPolicyStatus: { PolicyStatus: "structure" },
+  GetBucketEncryption: { ServerSideEncryptionConfiguration: "structure" },
+  GetBucketPolicy: { Policy: "policyDocument" },
+  GetEbsEncryptionByDefault: { EbsEncryptionByDefault: "boolean" },
+  DescribeVpcs: { Vpcs: "list" },
+  DescribeFlowLogs: { FlowLogs: "list" },
+  DescribeNetworkAcls: { NetworkAcls: "list" },
+  DescribeSecurityGroups: { SecurityGroups: "list" },
+  DescribeDBInstances: { DBInstances: "list" },
+  ListKeys: { Keys: "list" },
+  DescribeKey: { KeyMetadata: "structure" },
+  GetKeyRotationStatus: { KeyRotationEnabled: "boolean" },
+});
+
+/**
+ * The XML element that carries a member when it is not the member's own name. Only the EC2 query protocol renames
+ * its top-level members on the wire; the IAM, STS, and RDS query protocol and the S3 REST-XML protocol use the
+ * member name.
+ */
+const EC2_XML_ELEMENT_NAMES: Readonly<Record<string, string>> = Object.freeze({
+  Regions: "regionInfo",
+  Vpcs: "vpcSet",
+  FlowLogs: "flowLogSet",
+  NetworkAcls: "networkAclSet",
+  SecurityGroups: "securityGroupInfo",
+  EbsEncryptionByDefault: "ebsEncryptionByDefault",
 });
 
 const INCOMPLETE_RESPONSE_CODE = "IncompleteResponse";
 
-/** What the raw HTTP response carried, recorded before the SDK deserializer consumed it. */
+/**
+ * What the raw HTTP response carried, recorded before the SDK deserializer consumed it. The body is held only until
+ * the shape guard has inspected it for the request it belongs to and never enters an error.
+ */
 interface ObservedResponse {
   statusCode?: number;
   contentType?: string;
   bodyBytes?: number;
+  body?: Uint8Array | string;
 }
 
 type StreamCollector = (stream: unknown) => Promise<Uint8Array>;
@@ -845,8 +872,9 @@ function headerValue(headers: unknown, name: string): string | undefined {
 
 /**
  * Deserialize-step middleware inner to the SDK's deserializer: it sees the raw response first, records its
- * status, content type, and body length, and hands the deserializer the same bytes. The body itself is never
- * kept, so the shape guard can describe a 2xx the deserializer emptied by type and length alone.
+ * status, content type, body length, and the body bytes, and hands the deserializer the same bytes. The shape
+ * guard describes a 2xx the deserializer emptied by type and length alone and reads the body only to tell a list
+ * element the deserializer read as empty from one that held bare text; the observation is dropped with the send.
  */
 function observeResponseMiddleware(observed: ObservedResponse, streamCollector: StreamCollector | undefined) {
   return (next: (args: unknown) => Promise<unknown>) => async (args: unknown): Promise<unknown> => {
@@ -857,11 +885,16 @@ function observeResponseMiddleware(observed: ObservedResponse, streamCollector: 
       observed.contentType = headerValue(response.headers, "content-type")?.split(";")[0]?.trim();
       const body = response.body;
       if (body === undefined || body === null) observed.bodyBytes = 0;
-      else if (body instanceof Uint8Array) observed.bodyBytes = body.byteLength;
-      else if (typeof body === "string") observed.bodyBytes = Buffer.byteLength(body, "utf8");
-      else if (streamCollector) {
+      else if (body instanceof Uint8Array) {
+        observed.bodyBytes = body.byteLength;
+        observed.body = body;
+      } else if (typeof body === "string") {
+        observed.bodyBytes = Buffer.byteLength(body, "utf8");
+        observed.body = body;
+      } else if (streamCollector) {
         const bytes = await streamCollector(body);
         observed.bodyBytes = bytes.byteLength;
+        observed.body = bytes;
         response.body = bytes;
       }
     }
@@ -877,24 +910,49 @@ function observedBodyNote(observed: ObservedResponse): string {
 }
 
 /**
+ * Whether an error was raised by the SDK's deserializer for a response that was not a service error: the
+ * deserialize step attaches the response to whatever it throws, and a service error (modeled or default) is
+ * the only thing it throws that carries a fault. The type checks the deserializer runs on a documented member
+ * (expectBoolean, expectString, parseBoolean, the XML parser) quote the offending value in their message.
+ */
+function isDeserializationFailure(error: unknown): boolean {
+  const object = asObject(error);
+  if (!object || object.$fault !== undefined) return false;
+  return isParseError(error) || error instanceof TypeError || Object.prototype.hasOwnProperty.call(object, "$response");
+}
+
+/**
  * A deserializer failure described from the observed response rather than from the SDK error. The SDK's
  * deserializer raises V8's SyntaxError for a body that is not the service protocol and, in this SDK version,
  * attaches neither the body nor its content type to it; an HTML page in place of any answer (a proxy's error
  * page with a 502, an interstitial with a 200) is the same class. Both are recorded as the non-JSON body note
- * built from the content type and byte length the middleware measured. Any other error passes through as-is.
+ * built from the content type and byte length the middleware measured. A member the deserializer refused to
+ * read as its documented type (a string where a boolean is written, text inside a boolean element) is the
+ * same failure as the shape guard's, named IncompleteResponse with the command and the body note; the SDK's
+ * message, which quotes the value, is never recorded. Any other error passes through as-is.
  */
-function withObservedBody(error: unknown, observed: ObservedResponse): unknown {
+function withObservedBody(error: unknown, observed: ObservedResponse, command: unknown): unknown {
   if (observed.bodyBytes === undefined || error instanceof AwsApiError || error instanceof AwsCredentialProviderError) return error;
   const object = asObject(error);
   if (typeof object?.$responseBodyText === "string") return error;
   const htmlBody = observed.contentType !== undefined && /^text\/html$/i.test(observed.contentType);
-  if (!isParseError(error) && !htmlBody) return error;
   const status = errorHttpStatus(error) ?? observed.statusCode;
-  return {
-    name: isParseError(error) ? "SyntaxError" : errorCode(error) || UNKNOWN_ERROR_CODE,
-    $metadata: status === undefined ? {} : { httpStatusCode: status },
-    $bodyNote: `non-JSON body (${observed.contentType ?? "unknown content type"}, ${observed.bodyBytes} bytes)`,
-  };
+  const metadata = status === undefined ? {} : { httpStatusCode: status };
+  if (isParseError(error) || htmlBody) {
+    return {
+      name: isParseError(error) ? "SyntaxError" : errorCode(error) || UNKNOWN_ERROR_CODE,
+      $metadata: metadata,
+      $bodyNote: `non-JSON body (${observed.contentType ?? "unknown content type"}, ${observed.bodyBytes} bytes)`,
+    };
+  }
+  if (isDeserializationFailure(error)) {
+    return {
+      name: INCOMPLETE_RESPONSE_CODE,
+      $metadata: metadata,
+      $bodyNote: `${commandName(command)} answered with a value outside its documented shape (${observedBodyNote(observed)})`,
+    };
+  }
+  return error;
 }
 
 function commandName(command: unknown): string {
@@ -902,26 +960,170 @@ function commandName(command: unknown): string {
   return (asString(constructor?.name) ?? "").replace(/Command$/, "");
 }
 
+/** The shape of a deserialized value in fixed words (never its content), for the guard's message. */
+function describeValueShape(value: unknown): string {
+  if (value === null) return "null";
+  if (Array.isArray(value)) return value.length === 0 ? "an empty list" : "a list";
+  switch (typeof value) {
+    case "string":
+      return value.length === 0 ? "an empty string" : "a string";
+    case "boolean":
+      return "a boolean";
+    case "number":
+    case "bigint":
+      return "a number";
+    case "object":
+      return Object.keys(value as object).length === 0 ? "an empty structure" : "a structure";
+    default:
+      return typeof value;
+  }
+}
+
+/** A documented member kind in fixed words, for the guard's message. */
+function describeMemberKind(kind: AwsOutputMemberKind): string {
+  switch (kind) {
+    case "list":
+      return "a list";
+    case "map":
+      return "a map";
+    case "structure":
+      return "a structure";
+    case "string":
+      return "a string";
+    case "boolean":
+      return "a boolean";
+    case "policyDocument":
+      return "a policy document";
+    default: {
+      const exhaustive: never = kind;
+      throw new Error(`unhandled output member kind ${String(exhaustive)}`);
+    }
+  }
+}
+
+/** Whether a string is a JSON policy document carrying a Statement (a list or a single statement). */
+function isPolicyDocument(text: string): boolean {
+  try {
+    const statement = asObject(JSON.parse(text))?.Statement;
+    return Array.isArray(statement) || asObject(statement) !== undefined;
+  } catch {
+    return false;
+  }
+}
+
+/** Whether a deserialized member has its documented shape. */
+function hasDocumentedShape(value: unknown, kind: AwsOutputMemberKind): boolean {
+  switch (kind) {
+    case "list":
+      return Array.isArray(value);
+    case "map":
+    case "structure":
+      return asObject(value) !== undefined && !Array.isArray(value) && Object.keys(value as object).length > 0;
+    case "string":
+      return typeof value === "string" && value.length > 0;
+    case "boolean":
+      return typeof value === "boolean";
+    case "policyDocument":
+      return typeof value === "string" && isPolicyDocument(value);
+    default: {
+      const exhaustive: never = kind;
+      throw new Error(`unhandled output member kind ${String(exhaustive)}`);
+    }
+  }
+}
+
+const UTF8_BOM = [0xef, 0xbb, 0xbf];
+const XML_WHITESPACE = new Set([0x20, 0x09, 0x0a, 0x0d]);
+
+/** The observed body as text when it opens as an XML document; undefined for any other body (JSON is never decoded) or when none was observed. */
+function observedXmlText(observed: ObservedResponse): string | undefined {
+  const body = observed.body;
+  if (body === undefined) return undefined;
+  if (typeof body === "string") return /^\uFEFF?\s*</.test(body) ? body : undefined;
+  let offset = UTF8_BOM.every((byte, index) => body[index] === byte) ? UTF8_BOM.length : 0;
+  while (offset < body.length && XML_WHITESPACE.has(body[offset] as number)) offset += 1;
+  if (body[offset] !== 0x3c) return undefined;
+  return Buffer.from(body.buffer, body.byteOffset, body.byteLength).toString("utf8");
+}
+
+/** The content of the first `<name>` element in an XML document: "" when it is empty or self-closing, undefined when absent. */
+function xmlElementContent(xml: string, name: string): string | undefined {
+  const open = new RegExp(`<${name}(?:\\s[^>]*?)?(/?)>`).exec(xml);
+  if (!open) return undefined;
+  if (open[1] === "/") return "";
+  const start = open.index + open[0].length;
+  const end = xml.indexOf(`</${name}>`, start);
+  return end === -1 ? undefined : xml.slice(start, end);
+}
+
 /**
- * The shape guard at the send boundary: a 2xx output that lacks every member the command is answered with, or
- * whose body was empty or an HTML page, is an unreadable surface. It is thrown as an SDK-shaped error named
- * IncompleteResponse (the observed status, the command, the member, and the body note; never the body), which
- * the caller turns into AwsApiError like any other failure, so the read renders manual or null downstream
- * instead of an empty inventory or a default.
+ * Whether an XML body wrote a member the way its kind is documented. The SDK's XML deserializer reads bare text
+ * inside a list element as an empty list, inside a map or structure element as an empty structure, and inside a
+ * boolean element as false, so those shapes are only visible in the body: a list, map, or structure element must
+ * be empty or hold child elements, and a boolean element must hold true or false. An element that is absent from
+ * the body (a member the deserializer did not read from it) is not judged here.
+ */
+function xmlMemberHasDocumentedShape(xml: string, member: string, kind: AwsOutputMemberKind): boolean {
+  const content = xmlElementContent(xml, EC2_XML_ELEMENT_NAMES[member] ?? member)?.trim();
+  if (content === undefined) return true;
+  switch (kind) {
+    case "list":
+    case "map":
+    case "structure":
+      return content === "" || /^<(?!!\[CDATA\[)/.test(content);
+    case "boolean":
+      return /^(?:true|false)$/i.test(content);
+    case "string":
+    case "policyDocument":
+      return true;
+    default: {
+      const exhaustive: never = kind;
+      throw new Error(`unhandled output member kind ${String(exhaustive)}`);
+    }
+  }
+}
+
+/**
+ * The shape guard at the send boundary: a 2xx output that lacks every member the command is answered with, whose
+ * body was empty or an HTML page, or whose present members are not in their documented shape (a string where a
+ * list is documented, an empty structure, bare text inside an XML container or boolean element, a Policy that is
+ * not a policy document) is an unreadable surface. It is thrown as an SDK-shaped error named IncompleteResponse
+ * (the observed status, the command, the member, the shapes in fixed words, and the body note; never the body or
+ * the value), which the caller turns into AwsApiError like any other failure, so the read renders manual or null
+ * downstream instead of an empty inventory or a default.
  */
 function assertOutputShape(command: unknown, output: unknown, observed: ObservedResponse): void {
   const name = commandName(command);
-  const required: readonly string[] | undefined = AWS_REQUIRED_OUTPUT_MEMBERS[name];
+  const required = AWS_REQUIRED_OUTPUT_MEMBERS[name];
   // Every command the client sends is in the table (a test holds it to the source); anything else is not judged.
   if (!required) return;
   const record = asObject(output);
   const status = observed.statusCode ?? asNumber(asObject(record?.$metadata)?.httpStatusCode);
-  const present = required.some((member) => record?.[member] !== undefined);
+  const members = Object.keys(required);
+  const present = members.filter((member) => record?.[member] !== undefined);
   const htmlBody = observed.contentType !== undefined && /^text\/html$/i.test(observed.contentType);
-  if (present && observed.bodyBytes !== 0 && !htmlBody) return;
+  let reason: string | undefined;
+  if (present.length === 0 || observed.bodyBytes === 0 || htmlBody) {
+    reason = `answered without its ${members.join("/")} member`;
+  } else {
+    const xml = observedXmlText(observed);
+    for (const member of present) {
+      const kind = required[member];
+      const value = record?.[member];
+      if (!hasDocumentedShape(value, kind)) {
+        reason = `answered with its ${member} member as ${describeValueShape(value)} where ${describeMemberKind(kind)} is documented`;
+        break;
+      }
+      if (xml !== undefined && !xmlMemberHasDocumentedShape(xml, member, kind)) {
+        reason = `answered with bare text in its ${member} element where ${describeMemberKind(kind)} is documented`;
+        break;
+      }
+    }
+  }
+  if (reason === undefined) return;
   const cause = {
     name: INCOMPLETE_RESPONSE_CODE,
-    message: `${name} answered without its ${required.join("/")} member (${observedBodyNote(observed)})`,
+    message: `${name} ${reason} (${observedBodyNote(observed)})`,
     $metadata: status === undefined ? {} : { httpStatusCode: status },
   };
   throw new AwsApiError(cause);
@@ -953,7 +1155,9 @@ function guardSdkClient<T extends SdkClient>(client: T): T {
       assertOutputShape(command, output, observed);
       return output;
     } catch (error) {
-      throw toAwsApiError(withObservedBody(error, observed));
+      throw toAwsApiError(withObservedBody(error, observed, command));
+    } finally {
+      observed.body = undefined;
     }
   };
   Object.defineProperty(client, "send", { value: guardedSend, writable: true, configurable: true });
@@ -4796,9 +5000,9 @@ export function registerAwsTools(pi: any): void {
 }
 
 /** The IncompleteResponse error the shape guard throws for a command, produced by the guard itself. */
-function incompleteResponseError(command: string, observed: ObservedResponse): AwsApiError {
+function incompleteResponseError(command: string, observed: ObservedResponse, members: JsonRecord = {}): AwsApiError {
   try {
-    assertOutputShape({ constructor: { name: `${command}Command` } }, { $metadata: { httpStatusCode: observed.statusCode } }, observed);
+    assertOutputShape({ constructor: { name: `${command}Command` } }, { $metadata: { httpStatusCode: observed.statusCode }, ...members }, observed);
   } catch (error) {
     if (error instanceof AwsApiError) return error;
   }
@@ -4826,6 +5030,16 @@ export function awsFixedTexts(): readonly string[] {
   const htmlBody = incompleteResponseError("GetCallerIdentity", { statusCode: 200, contentType: "text/html", bodyBytes: 512 });
   const missingMember = incompleteResponseError("DescribeVpcs", { statusCode: 200, contentType: "text/xml", bodyBytes: 240 });
   const unobserved = incompleteResponseError("GetAccountSummary", {});
+  const stringList = incompleteResponseError("DescribeTrails", { statusCode: 200, contentType: "application/x-amz-json-1.1", bodyBytes: 33 }, { trailList: "not a list" });
+  const emptyStructure = incompleteResponseError("GetPublicAccessBlock", { statusCode: 200, contentType: "application/xml", bodyBytes: 214 }, { PublicAccessBlockConfiguration: {} });
+  const textInList = incompleteResponseError("ListUsers", { statusCode: 200, contentType: "text/xml", bodyBytes: 240, body: "<ListUsersResponse><ListUsersResult><Users>text</Users></ListUsersResult></ListUsersResponse>" }, { Users: [] });
+  const textInBoolean = incompleteResponseError("GetEbsEncryptionByDefault", { statusCode: 200, contentType: "text/xml", bodyBytes: 180, body: "<GetEbsEncryptionByDefaultResponse><ebsEncryptionByDefault>text</ebsEncryptionByDefault></GetEbsEncryptionByDefaultResponse>" }, { EbsEncryptionByDefault: false });
+  const notPolicy = incompleteResponseError("GetBucketPolicy", { statusCode: 200, bodyBytes: 512 }, { Policy: "<html></html>" });
+  const refusedByDeserializer = toAwsApiError(withObservedBody(
+    Object.defineProperty(new TypeError("Expected boolean, got string: value"), "$response", { value: {} }),
+    { statusCode: 200, contentType: "application/x-amz-json-1.1", bodyBytes: 33 },
+    { constructor: { name: "GetTrailStatusCommand" } },
+  ));
   return Object.freeze([
     PARSE_ERROR_NOTE,
     nonJsonBodyNote({ $responseBodyText: html, $response: { headers: { "content-type": "text/html; charset=utf-8" } } }) ?? "",
@@ -4847,6 +5061,12 @@ export function awsFixedTexts(): readonly string[] {
     htmlBody.message,
     missingMember.message,
     unobserved.message,
+    stringList.message,
+    emptyStructure.message,
+    textInList.message,
+    textInBoolean.message,
+    notPolicy.message,
+    refusedByDeserializer.message,
     new AwsCredentialProviderError("fromIni (profile audit)", { name: "CredentialsProviderError", code: "ENOENT" }).message,
     new AwsCredentialProviderError("fromIni (profile audit)", { name: "CredentialsProviderError", code: "EISDIR" }).message,
     new AwsCredentialProviderError("fromNodeProviderChain (default credential chain)", new Error("Could not load credentials from any providers")).message,

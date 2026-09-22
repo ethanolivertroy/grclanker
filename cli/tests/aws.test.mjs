@@ -3160,6 +3160,14 @@ const REST_ACTIONS = [
   ["s3", /^GET \/$/, "ListBuckets"],
 ];
 
+/** S3 bucket subresources, named by the query key the SDK sends (virtual-hosted `<bucket>.localhost` or path-style). */
+const S3_BUCKET_SUBRESOURCES = [
+  ["publicAccessBlock", "GetPublicAccessBlock"],
+  ["policyStatus", "GetBucketPolicyStatus"],
+  ["encryption", "GetBucketEncryption"],
+  ["policy", "GetBucketPolicy"],
+];
+
 /** The IAM-prefixed action label (iam:ListUsers) the integration records for one signed request. */
 function describeSdkRequest(req, body) {
   const scope = /Credential=([^/]+)\/\d{8}\/[^/]+\/([^/]+)\/aws4_request/.exec(req.headers.authorization ?? "");
@@ -3167,11 +3175,16 @@ function describeSdkRequest(req, body) {
   const signed = scope?.[2] ?? "unsigned";
   // S3 Control signs as s3; its account-scoped requests carry the account id header and a versioned path.
   const service = signed === "s3" && req.headers["x-amz-account-id"] ? "s3control" : signed;
-  const path = req.url.split("?")[0];
+  const [path, query = ""] = req.url.split("?");
+  const hostBucket = /^(.+)\.localhost(?::\d+)?$/.exec(String(req.headers.host ?? ""))?.[1];
+  const pathBucket = /^\/([^/]+)/.exec(path)?.[1];
+  const bucket = service === "s3" ? hostBucket ?? (path !== "/" ? pathBucket : undefined) : undefined;
   const queryAction = /(?:^|&)Action=([A-Za-z]+)/.exec(body)?.[1];
   const target = req.headers["x-amz-target"] ? String(req.headers["x-amz-target"]).split(".").pop() : undefined;
-  const rest = REST_ACTIONS.find(([restService, pattern]) => restService === service && pattern.test(`${req.method} ${path}`))?.[2];
-  return { service, action: queryAction ?? target ?? rest ?? `${req.method} ${path}`, label: `${service}:${queryAction ?? target ?? rest ?? `${req.method} ${path}`}`, accessKeyId };
+  const subresource = bucket ? S3_BUCKET_SUBRESOURCES.find(([key]) => new RegExp(`(?:^|&)${key}(?:=|&|$)`).test(query))?.[1] : undefined;
+  const rest = subresource ?? (bucket ? undefined : REST_ACTIONS.find(([restService, pattern]) => restService === service && pattern.test(`${req.method} ${path}`))?.[2]);
+  const action = queryAction ?? target ?? rest ?? `${req.method} ${path}`;
+  return { service, action, label: `${service}:${action}`, accessKeyId, bucket };
 }
 
 const escapeXml = (text) => text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
@@ -3196,9 +3209,17 @@ async function withLocalAwsEndpoint(respond, run) {
     req.on("data", (chunk) => chunks.push(chunk));
     req.on("end", () => {
       const described = describeSdkRequest(req, Buffer.concat(chunks).toString("utf8"));
-      const response = respond(described);
+      let response;
+      try {
+        response = respond(described);
+      } catch (error) {
+        // A fixture without an answer for this request must fail the test, not leave the SDK waiting on an open socket.
+        response = { status: 599, contentType: "text/plain", body: `fixture error for ${described.label}: ${error.message}` };
+      }
       requests.push({ ...described, status: response.status });
-      res.writeHead(response.status, { "content-type": response.contentType, "content-length": String(Buffer.byteLength(response.body)) });
+      const headers = { "content-length": String(Buffer.byteLength(response.body)) };
+      if (response.contentType !== undefined) headers["content-type"] = response.contentType;
+      res.writeHead(response.status, headers);
       res.end(response.body);
     });
   });
@@ -3417,8 +3438,327 @@ test("silent success: the required-member table names every command the client s
   const sent = new Set([...source.matchAll(/new (\w+Command)\(/g)].map(([, name]) => (aliases.get(name) ?? name).replace(/Command$/, "")));
   assert.deepEqual([...sent].filter((name) => !AWS_REQUIRED_OUTPUT_MEMBERS[name]), [], "every command the client sends has a required-member entry");
   assert.deepEqual(Object.keys(AWS_REQUIRED_OUTPUT_MEMBERS).filter((name) => !sent.has(name)), [], "no entry names a command the client does not send");
+  const kinds = new Set(["list", "map", "structure", "string", "boolean", "policyDocument"]);
   for (const [name, members] of Object.entries(AWS_REQUIRED_OUTPUT_MEMBERS)) {
-    assert.ok(members.length > 0 && members.every((member) => /^[A-Za-z]+$/.test(member)), `${name}: member names are identifiers`);
+    const entries = Object.entries(members);
+    assert.ok(entries.length > 0 && entries.every(([member]) => /^[A-Za-z]+$/.test(member)), `${name}: member names are identifiers`);
+    assert.ok(entries.every(([, kind]) => kinds.has(kind)), `${name}: every member carries a documented kind (${entries.map(([, kind]) => kind).join(", ")})`);
+  }
+  // The S3 REST-XML payload operations bind the whole body to one member; each is judged as a structure or a policy document.
+  assert.deepEqual(
+    [AWS_REQUIRED_OUTPUT_MEMBERS.GetPublicAccessBlock, AWS_REQUIRED_OUTPUT_MEMBERS.GetBucketPolicyStatus, AWS_REQUIRED_OUTPUT_MEMBERS.GetBucketEncryption, AWS_REQUIRED_OUTPUT_MEMBERS.GetBucketPolicy],
+    [{ PublicAccessBlockConfiguration: "structure" }, { PolicyStatus: "structure" }, { ServerSideEncryptionConfiguration: "structure" }, { Policy: "policyDocument" }],
+  );
+});
+
+// ---------------------------------------------------------------------------------------------------------------------
+// Round 4 item A: a 200 whose required member is present in another shape (a string where a list is documented, bare
+// text inside an XML container the deserializer reads as empty, a foreign document bound to an S3 payload member).
+// ---------------------------------------------------------------------------------------------------------------------
+
+/** The 21-character text planted where a documented member should be; the same length the reviewer measured. */
+const UNDOCUMENTED_SHAPE_TEXT = "BdeUYKVakcjwaWzzvP3gS";
+const FIXTURE_BUCKET = "app-data";
+const FIXTURE_DETECTOR_ID = "12abc34d567e8fa901bc2d34e56789f0";
+const FIXTURE_KEY_ID = "1234abcd-12ab-34cd-56ef-1234567890ab";
+const FIXTURE_VPC_ID = "vpc-0a1b2c3d4e5f60718";
+const REST_JSON_SERVICES = new Set(["securityhub", "guardduty", "access-analyzer", "auditmanager", "account"]);
+const QUERY_XML_NAMESPACES = { sts: "https://sts.amazonaws.com/doc/2011-06-15/", iam: "https://iam.amazonaws.com/doc/2010-05-08/", rds: "http://rds.amazonaws.com/doc/2014-10-31/" };
+const S3_XMLNS = "http://s3.amazonaws.com/doc/2006-03-01/";
+
+const queryXml = (service, action, inner) => ({ status: 200, contentType: "text/xml", body: `<${action}Response xmlns="${QUERY_XML_NAMESPACES[service]}"><${action}Result>${inner}</${action}Result><ResponseMetadata><RequestId>req-1</RequestId></ResponseMetadata></${action}Response>` });
+const ec2Xml = (action, inner) => ({ status: 200, contentType: "text/xml", body: `<${action}Response xmlns="http://ec2.amazonaws.com/doc/2016-11-15/"><requestId>req-1</requestId>${inner}</${action}Response>` });
+const restXml = (body) => ({ status: 200, contentType: "application/xml", body });
+const jsonBody = (service, body) => ({ status: 200, contentType: REST_JSON_SERVICES.has(service) ? "application/json" : "application/x-amz-json-1.1", body: JSON.stringify(body) });
+const PAB_XML = (xmlns) => `<PublicAccessBlockConfiguration xmlns="${xmlns}"><BlockPublicAcls>true</BlockPublicAcls><IgnorePublicAcls>true</IgnorePublicAcls><BlockPublicPolicy>true</BlockPublicPolicy><RestrictPublicBuckets>true</RestrictPublicBuckets></PublicAccessBlockConfiguration>`;
+const foreignXmlDocument = () => ({ status: 200, contentType: "text/xml", body: `<?xml version="1.0" encoding="UTF-8"?><ForeignDocument xmlns="urn:example:foreign"><Item>ok</Item><Token>${CANARY.apiKey}</Token><Session>${CANARY.sessionCookie}</Session></ForeignDocument>` });
+const foreignJsonDocument = () => ({ status: 200, contentType: "application/json", body: JSON.stringify({ message: "ok", items: [], token: CANARY.apiKey, nested: { session: CANARY.sessionCookie } }) });
+const htmlWithoutContentType = () => ({ status: 200, contentType: undefined, body: canaryHtmlBody() });
+
+/**
+ * A documented, healthy answer to every command the client sends, in each service's own wire protocol, so the real
+ * deserializer produces the SDK output a compliant single-region account would: a root with MFA and no access keys, one
+ * user with an MFA device and a fresh key, one multi-region logging trail with data events, a hub, a recorder, a
+ * detector, an organization with an attached SCP, an analyzer, an instance, an assessment, a security contact, one
+ * region with a flow-logged VPC and unremarkable NACL and security group, one bucket that is blocked, encrypted, and
+ * TLS-only, one encrypted RDS instance, and one rotated customer-managed key.
+ */
+function documentedLocalResponse({ service, action }) {
+  const account = FIXTURE_ACCOUNT;
+  switch (`${service}:${action}`) {
+    case "sts:GetCallerIdentity": return STS_IDENTITY_RESPONSE;
+    case "iam:GetAccountSummary": return queryXml("iam", action, "<SummaryMap><entry><key>AccountMFAEnabled</key><value>1</value></entry><entry><key>AccountAccessKeysPresent</key><value>0</value></entry><entry><key>Users</key><value>1</value></entry></SummaryMap>");
+    case "iam:GetAccountPasswordPolicy": return queryXml("iam", action, "<PasswordPolicy><MinimumPasswordLength>16</MinimumPasswordLength><RequireSymbols>true</RequireSymbols><RequireNumbers>true</RequireNumbers><RequireUppercaseCharacters>true</RequireUppercaseCharacters><RequireLowercaseCharacters>true</RequireLowercaseCharacters><AllowUsersToChangePassword>true</AllowUsersToChangePassword><ExpirePasswords>false</ExpirePasswords></PasswordPolicy>");
+    case "iam:ListUsers": return queryXml("iam", action, `<Users><member><Path>/</Path><UserName>svc-deploy</UserName><UserId>AIDASVCDEPLOY0000001</UserId><Arn>arn:aws:iam::${account}:user/svc-deploy</Arn><CreateDate>2025-01-01T00:00:00Z</CreateDate><PasswordLastUsed>2026-04-14T00:00:00Z</PasswordLastUsed></member></Users><IsTruncated>false</IsTruncated>`);
+    case "iam:ListMFADevices": return queryXml("iam", action, `<MFADevices><member><UserName>svc-deploy</UserName><SerialNumber>arn:aws:iam::${account}:mfa/svc-deploy</SerialNumber><EnableDate>2025-01-01T00:00:00Z</EnableDate></member></MFADevices><IsTruncated>false</IsTruncated>`);
+    case "iam:ListAccessKeys": return queryXml("iam", action, "<AccessKeyMetadata><member><UserName>svc-deploy</UserName><AccessKeyId>AKIAALICEKEY00000001</AccessKeyId><Status>Active</Status><CreateDate>2026-04-01T00:00:00Z</CreateDate></member></AccessKeyMetadata><IsTruncated>false</IsTruncated>");
+    case "iam:GetAccessKeyLastUsed": return queryXml("iam", action, "<UserName>svc-deploy</UserName><AccessKeyLastUsed><LastUsedDate>2026-04-15T00:00:00Z</LastUsedDate><ServiceName>s3</ServiceName><Region>us-east-1</Region></AccessKeyLastUsed>");
+    case "iam:GetAccountAuthorizationDetails": return queryXml("iam", action, "<UserDetailList/><GroupDetailList/><RoleDetailList/><Policies/><IsTruncated>false</IsTruncated>");
+    case "iam:ListPolicies": return queryXml("iam", action, `<Policies><member><PolicyName>ReadOnlyAudit</PolicyName><PolicyId>ANPAREADONLYAUDIT0001</PolicyId><Arn>arn:aws:iam::${account}:policy/ReadOnlyAudit</Arn><Path>/</Path><DefaultVersionId>v2</DefaultVersionId><AttachmentCount>1</AttachmentCount><PermissionsBoundaryUsageCount>0</PermissionsBoundaryUsageCount><IsAttachable>true</IsAttachable><CreateDate>2025-01-01T00:00:00Z</CreateDate><UpdateDate>2025-01-01T00:00:00Z</UpdateDate></member></Policies><IsTruncated>false</IsTruncated>`);
+    case "iam:GetPolicyVersion": return queryXml("iam", action, `<PolicyVersion><Document>${encodeURIComponent(JSON.stringify({ Version: "2012-10-17", Statement: [{ Effect: "Allow", Action: ["s3:GetObject"], Resource: "arn:aws:s3:::audit/*" }] }))}</Document><VersionId>v2</VersionId><IsDefaultVersion>true</IsDefaultVersion><CreateDate>2025-01-01T00:00:00Z</CreateDate></PolicyVersion>`);
+    case "cloudtrail:LookupEvents": return jsonBody(service, { Events: [] });
+    case "cloudtrail:DescribeTrails": return jsonBody(service, { trailList: [{ Name: "org-trail", TrailARN: `arn:aws:cloudtrail:us-east-1:${account}:trail/org-trail`, IsMultiRegionTrail: true, LogFileValidationEnabled: true, HomeRegion: "us-east-1", S3BucketName: "audit-logs", IsOrganizationTrail: false }] });
+    case "cloudtrail:GetTrailStatus": return jsonBody(service, { IsLogging: true, LatestDeliveryTime: 1776297600 });
+    case "cloudtrail:GetEventSelectors": return jsonBody(service, { TrailARN: `arn:aws:cloudtrail:us-east-1:${account}:trail/org-trail`, AdvancedEventSelectors: [{ Name: "data-events", FieldSelectors: [{ Field: "eventCategory", Equals: ["Data"] }] }] });
+    case "securityhub:DescribeHub": return jsonBody(service, { HubArn: `arn:aws:securityhub:us-east-1:${account}:hub/default`, SubscribedAt: "2025-01-01T00:00:00.000Z", AutoEnableControls: true });
+    case "securityhub:GetEnabledStandards": return jsonBody(service, { StandardsSubscriptions: [{ StandardsSubscriptionArn: `arn:aws:securityhub:us-east-1:${account}:subscription/cis-aws-foundations-benchmark/v/1.4.0`, StandardsArn: "arn:aws:securityhub:::standards/cis-aws-foundations-benchmark/v/1.4.0", StandardsInput: {}, StandardsStatus: "READY" }] });
+    case "config:DescribeConfigurationRecorders": return jsonBody(service, { ConfigurationRecorders: [{ name: "default", roleARN: `arn:aws:iam::${account}:role/config`, recordingGroup: { allSupported: true, includeGlobalResourceTypes: true } }] });
+    case "config:DescribeConfigurationRecorderStatus": return jsonBody(service, { ConfigurationRecordersStatus: [{ name: "default", recording: true, lastStatus: "SUCCESS" }] });
+    case "guardduty:ListDetectors": return jsonBody(service, { detectorIds: [FIXTURE_DETECTOR_ID] });
+    case "guardduty:GetDetector": return jsonBody(service, { createdAt: "2025-01-01T00:00:00.000Z", findingPublishingFrequency: "FIFTEEN_MINUTES", serviceRole: `arn:aws:iam::${account}:role/aws-service-role/guardduty.amazonaws.com/AWSServiceRoleForAmazonGuardDuty`, status: "ENABLED" });
+    case "organizations:DescribeOrganization": return jsonBody(service, { Organization: { Id: "o-exampleorgid", Arn: `arn:aws:organizations::${account}:organization/o-exampleorgid`, FeatureSet: "ALL", MasterAccountArn: `arn:aws:organizations::${account}:account/o-exampleorgid/${account}`, MasterAccountId: account, MasterAccountEmail: "aws-root@example.com" } });
+    case "organizations:ListAccounts": return jsonBody(service, { Accounts: [{ Id: account, Arn: `arn:aws:organizations::${account}:account/o-exampleorgid/${account}`, Email: "aws-root@example.com", Name: "audit", Status: "ACTIVE", JoinedMethod: "INVITED", JoinedTimestamp: 1735689600 }] });
+    case "organizations:ListPolicies": return jsonBody(service, { Policies: [{ Id: "p-examplescp1", Arn: `arn:aws:organizations::${account}:policy/o-exampleorgid/service_control_policy/p-examplescp1`, Name: "DenyRegions", Description: "Deny unapproved regions", Type: "SERVICE_CONTROL_POLICY", AwsManaged: false }] });
+    case "organizations:ListTargetsForPolicy": return jsonBody(service, { Targets: [{ TargetId: "r-exam", Arn: `arn:aws:organizations::${account}:root/o-exampleorgid/r-exam`, Name: "Root", Type: "ROOT" }] });
+    case "access-analyzer:ListAnalyzers": return jsonBody(service, { analyzers: [{ arn: `arn:aws:access-analyzer:us-east-1:${account}:analyzer/org`, name: "org", type: "ORGANIZATION", status: "ACTIVE", createdAt: "2026-01-01T00:00:00Z" }] });
+    case "access-analyzer:ListFindings": return jsonBody(service, { findings: [] });
+    case "sso:ListInstances": return jsonBody(service, { Instances: [{ InstanceArn: "arn:aws:sso:::instance/ssoins-1234567890abcdef", IdentityStoreId: "d-1234567890" }] });
+    case "auditmanager:ListAssessments": return jsonBody(service, { assessmentMetadata: [{ id: "a1b2c3d4-0000-4000-8000-000000000001", name: "FedRAMP Moderate", status: "ACTIVE", complianceType: "FedRAMP", creationTime: 1767225600, lastUpdated: 1775001600 }] });
+    case "account:GetAlternateContact": return jsonBody(service, { AlternateContact: { AlternateContactType: "SECURITY", Name: "Security Team", Title: "CISO", EmailAddress: "security@example.com", PhoneNumber: "+1 555 0100" } });
+    case "ec2:DescribeRegions": return ec2Xml(action, "<regionInfo><item><regionName>us-east-1</regionName><regionEndpoint>ec2.us-east-1.amazonaws.com</regionEndpoint><optInStatus>opt-in-not-required</optInStatus></item></regionInfo>");
+    case "ec2:GetEbsEncryptionByDefault": return ec2Xml(action, "<ebsEncryptionByDefault>true</ebsEncryptionByDefault><sseType>sse-kms</sseType>");
+    case "ec2:DescribeVpcs": return ec2Xml(action, `<vpcSet><item><vpcId>${FIXTURE_VPC_ID}</vpcId><ownerId>${account}</ownerId><state>available</state><cidrBlock>10.0.0.0/16</cidrBlock><isDefault>false</isDefault></item></vpcSet>`);
+    case "ec2:DescribeFlowLogs": return ec2Xml(action, `<flowLogSet><item><flowLogId>fl-0a1b2c3d4e5f60718</flowLogId><resourceId>${FIXTURE_VPC_ID}</resourceId><flowLogStatus>ACTIVE</flowLogStatus><trafficType>ALL</trafficType><logDestinationType>s3</logDestinationType><logDestination>arn:aws:s3:::audit-logs</logDestination><deliverLogsStatus>SUCCESS</deliverLogsStatus></item></flowLogSet>`);
+    case "ec2:DescribeNetworkAcls": return ec2Xml(action, `<networkAclSet><item><networkAclId>acl-0a1b2c3d4e5f60718</networkAclId><vpcId>${FIXTURE_VPC_ID}</vpcId><default>true</default><entrySet><item><ruleNumber>100</ruleNumber><protocol>6</protocol><ruleAction>allow</ruleAction><egress>false</egress><cidrBlock>10.0.0.0/8</cidrBlock><portRange><from>22</from><to>22</to></portRange></item><item><ruleNumber>110</ruleNumber><protocol>6</protocol><ruleAction>allow</ruleAction><egress>false</egress><cidrBlock>0.0.0.0/0</cidrBlock><portRange><from>443</from><to>443</to></portRange></item><item><ruleNumber>100</ruleNumber><protocol>-1</protocol><ruleAction>allow</ruleAction><egress>true</egress><cidrBlock>0.0.0.0/0</cidrBlock></item><item><ruleNumber>32767</ruleNumber><protocol>-1</protocol><ruleAction>deny</ruleAction><egress>false</egress><cidrBlock>0.0.0.0/0</cidrBlock></item></entrySet></item></networkAclSet>`);
+    case "ec2:DescribeSecurityGroups": return ec2Xml(action, `<securityGroupInfo><item><ownerId>${account}</ownerId><groupId>sg-0a1b2c3d4e5f60718</groupId><groupName>web</groupName><groupDescription>web tier</groupDescription><vpcId>${FIXTURE_VPC_ID}</vpcId><ipPermissions><item><ipProtocol>tcp</ipProtocol><fromPort>443</fromPort><toPort>443</toPort><ipRanges><item><cidrIp>0.0.0.0/0</cidrIp></item></ipRanges><ipv6Ranges><item><cidrIpv6>::/0</cidrIpv6></item></ipv6Ranges></item><item><ipProtocol>tcp</ipProtocol><fromPort>22</fromPort><toPort>22</toPort><ipRanges><item><cidrIp>203.0.113.0/24</cidrIp></item></ipRanges></item></ipPermissions></item></securityGroupInfo>`);
+    case "s3control:GetPublicAccessBlock": return restXml(PAB_XML("http://awss3control.amazonaws.com/doc/2018-08-20/"));
+    case "s3:ListBuckets": return restXml(`<ListAllMyBucketsResult xmlns="${S3_XMLNS}"><Owner><ID>owner-canonical-id</ID><DisplayName>owner</DisplayName></Owner><Buckets><Bucket><Name>${FIXTURE_BUCKET}</Name><CreationDate>2025-06-01T00:00:00.000Z</CreationDate><BucketRegion>us-east-1</BucketRegion></Bucket></Buckets></ListAllMyBucketsResult>`);
+    case "s3:GetPublicAccessBlock": return restXml(PAB_XML(S3_XMLNS));
+    case "s3:GetBucketPolicyStatus": return restXml(`<PolicyStatus xmlns="${S3_XMLNS}"><IsPublic>false</IsPublic></PolicyStatus>`);
+    case "s3:GetBucketEncryption": return restXml(`<ServerSideEncryptionConfiguration xmlns="${S3_XMLNS}"><Rule><ApplyServerSideEncryptionByDefault><SSEAlgorithm>aws:kms</SSEAlgorithm><KMSMasterKeyID>arn:aws:kms:us-east-1:${account}:key/${FIXTURE_KEY_ID}</KMSMasterKeyID></ApplyServerSideEncryptionByDefault><BucketKeyEnabled>true</BucketKeyEnabled></Rule></ServerSideEncryptionConfiguration>`);
+    case "s3:GetBucketPolicy": return { status: 200, contentType: "application/json", body: TLS_ONLY_POLICY.replaceAll("arn:aws:s3:::bucket", `arn:aws:s3:::${FIXTURE_BUCKET}`) };
+    case "rds:DescribeDBInstances": return queryXml("rds", action, `<DBInstances><DBInstance><DBInstanceIdentifier>orders-db</DBInstanceIdentifier><DBInstanceArn>arn:aws:rds:us-east-1:${account}:db:orders-db</DBInstanceArn><Engine>postgres</Engine><DBInstanceStatus>available</DBInstanceStatus><StorageEncrypted>true</StorageEncrypted><KmsKeyId>arn:aws:kms:us-east-1:${account}:key/${FIXTURE_KEY_ID}</KmsKeyId></DBInstance></DBInstances>`);
+    case "kms:ListKeys": return jsonBody(service, { Keys: [{ KeyId: FIXTURE_KEY_ID, KeyArn: `arn:aws:kms:us-east-1:${account}:key/${FIXTURE_KEY_ID}` }], Truncated: false });
+    case "kms:DescribeKey": return jsonBody(service, { KeyMetadata: { AWSAccountId: account, KeyId: FIXTURE_KEY_ID, Arn: `arn:aws:kms:us-east-1:${account}:key/${FIXTURE_KEY_ID}`, CreationDate: 1735689600, Enabled: true, KeyUsage: "ENCRYPT_DECRYPT", KeyState: "Enabled", Origin: "AWS_KMS", KeyManager: "CUSTOMER", KeySpec: "SYMMETRIC_DEFAULT", MultiRegion: false } });
+    case "kms:GetKeyRotationStatus": return jsonBody(service, { KeyRotationEnabled: true, RotationPeriodInDays: 365 });
+    default: throw new Error(`no documented local response for ${service}:${action}`);
+  }
+}
+
+/**
+ * The same 200 with the correct content type, but the command's required member written in another shape: the planted
+ * text where the protocol documents a list, map, structure, or boolean (bare text inside the XML element, a JSON string
+ * in place of the array or object), and for the S3 payload operations a body that is not the documented document.
+ */
+function undocumentedShapeResponse({ service, action }) {
+  const text = UNDOCUMENTED_SHAPE_TEXT;
+  switch (`${service}:${action}`) {
+    case "sts:GetCallerIdentity": return queryXml("sts", action, "<Account></Account>");
+    case "iam:GetAccountSummary": return queryXml("iam", action, `<SummaryMap>${text}</SummaryMap>`);
+    case "iam:GetAccountPasswordPolicy": return queryXml("iam", action, `<PasswordPolicy>${text}</PasswordPolicy>`);
+    case "iam:ListUsers": return queryXml("iam", action, `<Users>${text}</Users><IsTruncated>false</IsTruncated>`);
+    case "iam:ListMFADevices": return queryXml("iam", action, `<MFADevices>${text}</MFADevices>`);
+    case "iam:ListAccessKeys": return queryXml("iam", action, `<AccessKeyMetadata>${text}</AccessKeyMetadata>`);
+    case "iam:GetAccessKeyLastUsed": return queryXml("iam", action, `<AccessKeyLastUsed>${text}</AccessKeyLastUsed>`);
+    case "iam:GetAccountAuthorizationDetails": return queryXml("iam", action, `<RoleDetailList>${text}</RoleDetailList>`);
+    case "iam:ListPolicies": return queryXml("iam", action, `<Policies>${text}</Policies>`);
+    case "iam:GetPolicyVersion": return queryXml("iam", action, `<PolicyVersion>${text}</PolicyVersion>`);
+    case "cloudtrail:LookupEvents": return jsonBody(service, { Events: text });
+    case "cloudtrail:DescribeTrails": return jsonBody(service, { trailList: text });
+    case "cloudtrail:GetTrailStatus": return jsonBody(service, { IsLogging: text });
+    case "cloudtrail:GetEventSelectors": return jsonBody(service, { TrailARN: "", EventSelectors: text, AdvancedEventSelectors: { nested: text } });
+    case "securityhub:DescribeHub": return jsonBody(service, { HubArn: "" });
+    case "securityhub:GetEnabledStandards": return jsonBody(service, { StandardsSubscriptions: text });
+    case "config:DescribeConfigurationRecorders": return jsonBody(service, { ConfigurationRecorders: text });
+    case "config:DescribeConfigurationRecorderStatus": return jsonBody(service, { ConfigurationRecordersStatus: text });
+    case "guardduty:ListDetectors": return jsonBody(service, { detectorIds: text });
+    case "guardduty:GetDetector": return jsonBody(service, { status: "", serviceRole: "" });
+    case "organizations:DescribeOrganization": return jsonBody(service, { Organization: text });
+    case "organizations:ListAccounts": return jsonBody(service, { Accounts: text });
+    case "organizations:ListPolicies": return jsonBody(service, { Policies: text });
+    case "organizations:ListTargetsForPolicy": return jsonBody(service, { Targets: text });
+    case "access-analyzer:ListAnalyzers": return jsonBody(service, { analyzers: text });
+    case "access-analyzer:ListFindings": return jsonBody(service, { findings: text });
+    case "sso:ListInstances": return jsonBody(service, { Instances: text });
+    case "auditmanager:ListAssessments": return jsonBody(service, { assessmentMetadata: text });
+    case "account:GetAlternateContact": return jsonBody(service, { AlternateContact: text });
+    case "ec2:DescribeRegions": return ec2Xml(action, `<regionInfo>${text}</regionInfo>`);
+    case "ec2:GetEbsEncryptionByDefault": return ec2Xml(action, `<ebsEncryptionByDefault>${text}</ebsEncryptionByDefault>`);
+    case "ec2:DescribeVpcs": return ec2Xml(action, `<vpcSet>${text}</vpcSet>`);
+    case "ec2:DescribeFlowLogs": return ec2Xml(action, `<flowLogSet>${text}</flowLogSet>`);
+    case "ec2:DescribeNetworkAcls": return ec2Xml(action, `<networkAclSet>${text}</networkAclSet>`);
+    case "ec2:DescribeSecurityGroups": return ec2Xml(action, `<securityGroupInfo>${text}</securityGroupInfo>`);
+    case "s3control:GetPublicAccessBlock": return restXml(`<PublicAccessBlockConfiguration xmlns="http://awss3control.amazonaws.com/doc/2018-08-20/">${text}</PublicAccessBlockConfiguration>`);
+    case "s3:ListBuckets": return restXml(`<ListAllMyBucketsResult xmlns="${S3_XMLNS}"><Buckets>${text}</Buckets></ListAllMyBucketsResult>`);
+    case "s3:GetPublicAccessBlock": return restXml(`<PublicAccessBlockConfiguration xmlns="${S3_XMLNS}">${text}</PublicAccessBlockConfiguration>`);
+    case "s3:GetBucketPolicyStatus": return restXml(`<PolicyStatus xmlns="${S3_XMLNS}">${text}</PolicyStatus>`);
+    case "s3:GetBucketEncryption": return restXml(`<ServerSideEncryptionConfiguration xmlns="${S3_XMLNS}">${text}</ServerSideEncryptionConfiguration>`);
+    case "s3:GetBucketPolicy": return { status: 200, contentType: "application/json", body: text };
+    case "rds:DescribeDBInstances": return queryXml("rds", action, `<DBInstances>${text}</DBInstances>`);
+    case "kms:ListKeys": return jsonBody(service, { Keys: text, Truncated: false });
+    case "kms:DescribeKey": return jsonBody(service, { KeyMetadata: text });
+    case "kms:GetKeyRotationStatus": return jsonBody(service, { KeyRotationEnabled: text });
+    default: throw new Error(`no undocumented-shape local response for ${service}:${action}`);
+  }
+}
+
+/** Readers that take an inventory-derived argument, exercised with the fixture's own identifiers. */
+const LOCAL_AWS_ARGUMENT_METHODS = [
+  ["listMfaDevices", "iam", (client) => client.listMfaDevices("svc-deploy")],
+  ["listAccessKeys", "iam", (client) => client.listAccessKeys("svc-deploy")],
+  ["getAccessKeyLastUsed", "iam", (client) => client.getAccessKeyLastUsed("AKIAALICEKEY00000001")],
+  ["getPolicyVersionDocument", "iam", (client) => client.getPolicyVersionDocument(`arn:aws:iam::${FIXTURE_ACCOUNT}:policy/ReadOnlyAudit`, "v2")],
+  ["getTrailStatus", "cloudtrail", (client) => client.getTrailStatus("org-trail")],
+  ["getEventSelectors", "cloudtrail", (client) => client.getEventSelectors("org-trail")],
+  ["getDetector", "guardduty", (client) => client.getDetector(FIXTURE_DETECTOR_ID)],
+  ["listPolicyTargets", "organizations", (client) => client.listPolicyTargets("p-examplescp1")],
+  ["listAccessAnalyzerFindings", "access-analyzer", (client) => client.listAccessAnalyzerFindings(`arn:aws:access-analyzer:us-east-1:${FIXTURE_ACCOUNT}:analyzer/org`)],
+  ["getBucketPublicAccessBlock", "s3", (client) => client.getBucketPublicAccessBlock(FIXTURE_BUCKET)],
+  ["getBucketPolicyStatus", "s3", (client) => client.getBucketPolicyStatus(FIXTURE_BUCKET)],
+  ["getBucketEncryption", "s3", (client) => client.getBucketEncryption(FIXTURE_BUCKET)],
+  ["getBucketPolicy", "s3", (client) => client.getBucketPolicy(FIXTURE_BUCKET)],
+  ["describeKmsKey", "kms", (client) => client.describeKmsKey("us-east-1", FIXTURE_KEY_ID)],
+  ["getKeyRotationStatus", "kms", (client) => client.getKeyRotationStatus("us-east-1", FIXTURE_KEY_ID)],
+];
+
+const UNDOCUMENTED_SHAPE_NOTE = /^IncompleteResponse \(HTTP 200\): [A-Za-z]+ answered (?:with its [A-Za-z]+ member as (?:a string|an empty string|an empty structure|a structure|a number|an empty list|a list|a boolean|null) where (?:a list|a map|a structure|a string|a boolean|a policy document) is documented|with bare text in its [A-Za-z]+ element where (?:a list|a map|a structure|a boolean) is documented|with a value outside its documented shape|without its [A-Za-z/]+ member) \(body: [a-z0-9/.+-]+(?: content type)?, \d+ bytes\)$/;
+
+test("silent success (round 4 item A): a 200 whose required member is present in another shape, through the real SDK parser path, is IncompleteResponse on every reader and every S3 payload operation, recorded in fixed words with the observed status and never as a default, a TypeError, or the planted text", async () => {
+  // Positive control: the healthy protocol bodies resolve on every reader, so the guard is judging shape and not the fixture.
+  await withLocalAwsEndpoint(documentedLocalResponse, async ({ requests }) => {
+    const client = realAwsClient();
+    for (const [name, , call] of [...LOCAL_AWS_METHODS, ...LOCAL_AWS_ARGUMENT_METHODS]) {
+      const value = await call(client);
+      assert.ok(value !== null && value !== undefined, `${name}: the documented body resolves`);
+    }
+    assert.ok(requests.every((request) => request.status === 200));
+    assert.deepEqual(requests.filter((request) => request.action.startsWith("GET ") || request.action.startsWith("POST ")).map((request) => request.label), [], "every request the fixture saw is labelled by its operation");
+  });
+
+  const healthy = await withSdkRoutes(healthySdkRoutes(), [], () => runAllAssessments(realAwsClient()));
+  let serveDocumented = false;
+  await withLocalAwsEndpoint(
+    (request) => (serveDocumented && request.action === "GetCallerIdentity" ? STS_IDENTITY_RESPONSE : undocumentedShapeResponse(request)),
+    async ({ requests }) => {
+      const client = realAwsClient();
+      for (const [name, , call] of [...LOCAL_AWS_METHODS, ...LOCAL_AWS_ARGUMENT_METHODS]) {
+        await assert.rejects(() => call(client), (error) => {
+          const record = thrownErrorRecord(error);
+          assert.ok(error instanceof AwsApiError, `${name}: the client throws AwsApiError, not a TypeError or a resolved default: ${record}`);
+          assert.equal(error.code, "IncompleteResponse", `${name}: ${error.message}`);
+          assert.equal(error.httpStatus, 200, `${name}: the observed status is kept`);
+          assert.match(error.message, UNDOCUMENTED_SHAPE_NOTE, `${name}: ${error.message}`);
+          assert.ok(!record.includes(UNDOCUMENTED_SHAPE_TEXT), `${name}: the planted text never enters the error`);
+          assert.doesNotMatch(record, /TypeError|is not a function|Cannot read properties/, `${name}: no TypeError text`);
+          assertNoCanaryWindows(assert, record, AWS_PLANTED_CANARIES, `${name} thrown error`);
+          return true;
+        });
+      }
+      assert.ok(requests.length >= LOCAL_AWS_METHODS.length + LOCAL_AWS_ARGUMENT_METHODS.length && requests.every((request) => request.status === 200), "every request was answered 200 by the local server");
+
+      serveDocumented = true;
+      const outputs = await runAllAssessments(client);
+      const exported = await exportAwsAuditBundle(client, client.getResolvedConfig(), createTempBase("grclanker-aws-undocumented-shape-"));
+      const access = outputs.access;
+      assert.equal(access.status, "limited");
+      for (const probe of access.surfaces) {
+        assert.equal(probe.status, "not_readable", `${probe.name}: a 200 in another shape is not a readable surface`);
+        assert.equal(probe.http_status, 200, `${probe.name}: the observed 200, never null`);
+        assert.equal(probe.error_code, "IncompleteResponse", `${probe.name}: ${probe.error}`);
+        assert.equal(probe.count, null, probe.name);
+        assert.match(probe.error, UNDOCUMENTED_SHAPE_NOTE, `${probe.name}: ${probe.error}`);
+      }
+      for (const [name, result] of Object.entries(outputs)) {
+        if (name === "access") continue;
+        for (const finding of result.findings) {
+          assert.equal(finding.status, "manual", `${name} ${finding.id}: every read answered in another shape, so the finding is manual: ${finding.summary}`);
+        }
+        assertNoDefaultedLeaves(healthy[name], result, `${name} under undocumented shapes`);
+      }
+      const text = [JSON.stringify(outputs), ...readBundleFiles(exported.outputDir).values()].join("\n");
+      for (const fragment of ["Root MFA enabled=false", "Minimum length 0", "All 0 sampled IAM users", '"users": 0', '"user_count": 0', "TypeError", "is not a function", '"http_status": null', "EBS default encryption disabled", "lack default server-side encryption", "have no policy statement denying", "Block Public Access is incomplete", '"status": "pass"', '"status": "fail"']) {
+        assert.ok(!text.includes(fragment), `no output renders ${fragment}`);
+      }
+      assert.ok(!text.includes(UNDOCUMENTED_SHAPE_TEXT), "the planted text reaches no output");
+      assert.doesNotMatch(text, UNSERVED_CONDITIONS, "no output names a condition the fixture never served");
+      assert.deepEqual([...namedStatuses(text)], [200], "the only status named anywhere is the one every response carried");
+      assertNoCanaries(text, "outputs and bundle under undocumented shapes");
+      for (const [name, entry] of readZipEntries(exported.zipPath)) assertNoCanaries(entry, `zip ${name}`);
+    },
+  );
+});
+
+/**
+ * One read answered in another shape inside an otherwise documented account (the reviewer's `mixed` and `s3mix`
+ * fixtures): the finding it feeds and the verdict it must not fabricate.
+ */
+const MIXED_UNDOCUMENTED_ROWS = [
+  { label: "GetAccountSummary as bare text", match: (r) => r.label === "iam:GetAccountSummary", shape: undocumentedShapeResponse, tool: "identity", finding: "AWS-IAM-01", status: "manual", surface: "iam_summary", never: ["Root MFA enabled=false"] },
+  { label: "GetAccountPasswordPolicy as bare text", match: (r) => r.label === "iam:GetAccountPasswordPolicy", shape: undocumentedShapeResponse, tool: "identity", finding: "AWS-IAM-03", status: "manual", never: ["Minimum length 0"] },
+  { label: "ListUsers as bare text", match: (r) => r.label === "iam:ListUsers", shape: undocumentedShapeResponse, tool: "identity", finding: "AWS-IAM-02", status: "manual", surface: "iam_users", never: ["All 0 sampled IAM users", '"users": 0', '"user_count": 0'] },
+  { label: "ListMFADevices as bare text", match: (r) => r.label === "iam:ListMFADevices", shape: undocumentedShapeResponse, tool: "identity", finding: "AWS-IAM-02", status: "manual", never: ["1/1 IAM users are missing MFA", '"users_without_mfa": [\n        "svc-deploy"'] },
+  { label: "DescribeTrails as a string", match: (r) => r.label === "cloudtrail:DescribeTrails", shape: undocumentedShapeResponse, tool: "logging-detection", finding: "AWS-LOG-01", status: "manual", surface: "cloudtrail", never: ["TypeError", "is not a function"] },
+  { label: "GetTrailStatus as a string", match: (r) => r.label === "cloudtrail:GetTrailStatus", shape: undocumentedShapeResponse, tool: "logging-detection", finding: "AWS-LOG-01", status: "manual", never: ["TypeError", '"IsLogging": "'] },
+  { label: "ListKeys as a string", match: (r) => r.label === "kms:ListKeys", shape: undocumentedShapeResponse, tool: "data-protection", finding: "AWS-DATA-22", status: "manual", surface: "kms_keys", never: ["TypeError", "is not a function"] },
+  { label: "GetEbsEncryptionByDefault as bare text", match: (r) => r.label === "ec2:GetEbsEncryptionByDefault", shape: undocumentedShapeResponse, tool: "data-protection", finding: "AWS-DATA-12", status: "manual", never: ["EBS default encryption disabled in 1/1", "EBS default encryption is disabled"] },
+  { label: "account GetPublicAccessBlock as a foreign XML document", match: (r) => r.label === "s3control:GetPublicAccessBlock", shape: foreignXmlDocument, tool: "data-protection", finding: "AWS-DATA-11", status: "manual", never: ["Block Public Access is incomplete", "BlockPublicAcls=unset"] },
+  { label: "account GetPublicAccessBlock as an HTML page without a content type", match: (r) => r.label === "s3control:GetPublicAccessBlock", shape: htmlWithoutContentType, tool: "data-protection", finding: "AWS-DATA-11", status: "manual", never: ["Block Public Access is incomplete", "BlockPublicAcls=unset"] },
+  { label: "account GetPublicAccessBlock as bare text", match: (r) => r.label === "s3control:GetPublicAccessBlock", shape: undocumentedShapeResponse, tool: "data-protection", finding: "AWS-DATA-11", status: "manual", never: ["Block Public Access is incomplete", "BlockPublicAcls=unset"] },
+  { label: "bucket GetBucketEncryption as a foreign XML document", match: (r) => r.label === "s3:GetBucketEncryption", shape: foreignXmlDocument, tool: "data-protection", finding: "AWS-DATA-12", status: "warn", never: ["1/1 buckets lack default server-side encryption"] },
+  { label: "bucket GetBucketEncryption as an HTML page without a content type", match: (r) => r.label === "s3:GetBucketEncryption", shape: htmlWithoutContentType, tool: "data-protection", finding: "AWS-DATA-12", status: "warn", never: ["1/1 buckets lack default server-side encryption"] },
+  { label: "bucket GetBucketEncryption as bare text", match: (r) => r.label === "s3:GetBucketEncryption", shape: undocumentedShapeResponse, tool: "data-protection", finding: "AWS-DATA-12", status: "warn", never: ["1/1 buckets lack default server-side encryption"] },
+  { label: "bucket GetBucketPolicy as an HTML page without a content type", match: (r) => r.label === "s3:GetBucketPolicy", shape: htmlWithoutContentType, tool: "data-protection", finding: "AWS-DATA-13", status: "warn", never: ["1/1 buckets have no policy statement denying"] },
+  { label: "bucket GetBucketPolicy as a foreign JSON document", match: (r) => r.label === "s3:GetBucketPolicy", shape: foreignJsonDocument, tool: "data-protection", finding: "AWS-DATA-13", status: "warn", never: ["1/1 buckets have no policy statement denying"] },
+  { label: "bucket GetBucketPolicyStatus as a foreign XML document", match: (r) => r.label === "s3:GetBucketPolicyStatus", shape: foreignXmlDocument, tool: "data-protection", finding: "AWS-DATA-11", status: "warn", never: ['"IsPublic": true'] },
+  { label: "bucket GetPublicAccessBlock as an HTML page without a content type", match: (r) => r.label === "s3:GetPublicAccessBlock", shape: htmlWithoutContentType, tool: "data-protection", finding: "AWS-DATA-11", status: "warn", never: ["1/1 buckets lack a full bucket-level block"] },
+];
+
+test("silent success (round 4 item A): one read answered in another shape inside a documented account demotes only the verdict it feeds, marks its probe not_readable on the observed 200, and renders no fabricated pass or fail; the documented account itself passes every control the fixture satisfies", async () => {
+  const control = await withLocalAwsEndpoint(documentedLocalResponse, async () => {
+    const client = realAwsClient();
+    const outputs = await runAllAssessments(client);
+    assert.equal(outputs.access.status, "healthy", outputs.access.notes.join(" | "));
+    assert.equal(outputs.access.surfaces.filter((probe) => probe.status === "readable").length, outputs.access.surfaces.length, "control: every surface is readable through the real parser");
+    for (const id of ["AWS-IAM-01", "AWS-IAM-02", "AWS-IAM-03"]) assert.equal(findingById(outputs.identity, id).status, "pass", `control ${id}: ${findingById(outputs.identity, id).summary}`);
+    for (const id of ["AWS-DATA-11", "AWS-DATA-12", "AWS-DATA-13", "AWS-DATA-22"]) assert.equal(findingById(outputs["data-protection"], id).status, "pass", `control ${id}: ${findingById(outputs["data-protection"], id).summary}`);
+    assert.equal(findingById(outputs["logging-detection"], "AWS-LOG-01").status, "pass", `control AWS-LOG-01: ${findingById(outputs["logging-detection"], "AWS-LOG-01").summary}`);
+    assert.equal(findingById(outputs["network-security"], "AWS-NET-14").status, "pass", `control AWS-NET-14: ${findingById(outputs["network-security"], "AWS-NET-14").summary}`);
+    return outputs;
+  });
+
+  for (const row of MIXED_UNDOCUMENTED_ROWS) {
+    await withLocalAwsEndpoint(
+      (request) => (row.match(request) ? row.shape(request) : documentedLocalResponse(request)),
+      async ({ requests }) => {
+        const client = realAwsClient();
+        const outputs = await runAllAssessments(client);
+        const exported = await exportAwsAuditBundle(client, client.getResolvedConfig(), createTempBase("grclanker-aws-mixed-shape-"));
+        assert.ok(requests.some((request) => row.match(request)), `${row.label}: the planted read was requested`);
+        assert.ok(requests.every((request) => request.status === 200), `${row.label}: every answer was a 200`);
+
+        const finding = findingById(outputs[row.tool], row.finding);
+        assert.equal(finding.status, row.status, `${row.label}: ${row.finding} renders ${row.status}, never the fabricated verdict: ${finding.summary}`);
+        assert.match(finding.summary, /IncompleteResponse \(HTTP 200\)|SyntaxError \(HTTP 200\)|Error \(HTTP 200\)|unreadable|could not be read|could not be listed/, `${row.label}: the summary names the refused read: ${finding.summary}`);
+        if (row.surface) {
+          const probe = outputs.access.surfaces.find((surface) => surface.name === row.surface);
+          assert.ok(probe, `${row.label}: surface ${row.surface} exists (${outputs.access.surfaces.map((surface) => surface.name).join(", ")})`);
+          assert.equal(probe.status, "not_readable", `${row.label}: ${row.surface}`);
+          assert.equal(probe.http_status, 200, `${row.label}: the probe keeps the observed 200`);
+          assert.equal(probe.error_code, "IncompleteResponse", `${row.label}: ${probe.error_code} ${probe.error}`);
+          assert.equal(probe.count, null, row.label);
+        }
+        const text = [JSON.stringify(outputs, null, 2), ...readBundleFiles(exported.outputDir).values()].join("\n");
+        for (const fragment of row.never) assert.ok(!text.includes(fragment), `${row.label}: no output renders ${fragment}`);
+        assert.doesNotMatch(text, /TypeError|is not a function|Cannot read properties/, `${row.label}: no TypeError text`);
+        assert.ok(!text.includes(UNDOCUMENTED_SHAPE_TEXT), `${row.label}: the planted text reaches no output`);
+        assert.ok(!/"http_status": null/.test(text), `${row.label}: no probe loses the observed 200`);
+        assertNoCanaries(text, `${row.label}: outputs and bundle`);
+        for (const [name, entry] of readZipEntries(exported.zipPath)) assertNoCanaries(entry, `${row.label}: zip ${name}`);
+        assert.deepEqual([...namedStatuses(text)].filter((status) => status !== 200), [], `${row.label}: no status other than the observed 200 is named`);
+        assert.doesNotMatch(text, UNSERVED_CONDITIONS, `${row.label}: no condition the fixture never served`);
+
+        // Every verdict the planted read does not feed keeps the control's status; none flips to a pass or fail it did not have.
+        for (const [tool, result] of Object.entries(outputs)) {
+          if (tool === "access") continue;
+          for (const item of result.findings) {
+            if (item.id === row.finding) continue;
+            const before = findingById(control[tool], item.id);
+            assert.ok(item.status !== "fail" || before.status === "fail", `${row.label}: ${item.id} ${before.status} -> ${item.status} is a fabricated fail: ${item.summary}`);
+            assert.ok(item.status !== "pass" || before.status === "pass", `${row.label}: ${item.id} ${before.status} -> ${item.status} is a fabricated pass: ${item.summary}`);
+          }
+        }
+      },
+    );
   }
 });
 
