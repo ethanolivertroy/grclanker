@@ -43,7 +43,7 @@ import {
 } from "../dist/extensions/grc-tools/elastic.js";
 import { getRegisteredToolSummaries } from "../dist/pi/tool-catalog.js";
 import { readBundleFiles, readZipEntries } from "./helpers/bundle-contents.mjs";
-import { assertCanaryFixture, assertCanaryWindowsAbsent } from "./helpers/canary-windows.mjs";
+import { assertCanaryFixture, assertCanaryWindowsAbsent, assertDepthCapPins } from "./helpers/canary-windows.mjs";
 import { scrubAlterations } from "./helpers/scrub-survival.mjs";
 
 const DAY_MS = 86_400_000;
@@ -2640,6 +2640,10 @@ test("verdict rule 9: redactSensitiveValues masks whole subtrees, plural and cam
   for (let depth = 1; depth <= 31; depth += 1) level = level.child;
   assert.equal(level.level, 31);
   assert.equal(level.child, "[REDACTED]", "the container past the depth cap becomes the uniform marker, the same shape Box and LaunchDarkly render");
+});
+
+test("gap 36: Elastic redactSensitiveValues keeps and scrubs a string at depth 31 and 32 and masks strings and containers at depth 33 and 34", () => {
+  assertDepthCapPins(assert, redactSensitiveValues, 32, "Elastic walker");
 });
 
 test("verdict rule 9: ElasticApiClient describes non-JSON bodies by status and length and echoes only documented JSON error fields", async () => {

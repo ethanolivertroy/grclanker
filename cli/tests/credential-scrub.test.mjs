@@ -1,21 +1,23 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import {
+  DEFAULT_DATA_SCRUB_DEPTH,
   LONG_TOKEN_MIN_LENGTH,
   MIN_CONFIGURED_SECRET_LENGTH,
   REDACTED,
   createCredentialScrubber,
   isCredentialDataKey,
   isCredentialKey,
+  isSettingKey,
+  isWebhookKey,
   looksLikeToken,
 } from "../dist/extensions/grc-tools/credential-scrub.js";
-import { isSettingKey, isWebhookKey } from "../dist/extensions/grc-tools/credential-scrub.js";
 import { redactCredentialValues as redactBoxValues, scrubErrorText as scrubBoxErrorText } from "../dist/extensions/grc-tools/box.js";
 import { redactCredentialValues as redactLaunchdarklyValues, scrubErrorText as scrubLaunchdarklyErrorText } from "../dist/extensions/grc-tools/launchdarkly.js";
 import { redactCredentialValues as redactKnowbe4Values, scrubErrorText as scrubKnowbe4ErrorText } from "../dist/extensions/grc-tools/knowbe4.js";
 import { redactCredentialValues as redactDatadogValues, scrubErrorText as scrubDatadogErrorText } from "../dist/extensions/grc-tools/datadog.js";
 import { redactSensitiveValues as redactElasticValues, scrubErrorText as scrubElasticErrorText } from "../dist/extensions/grc-tools/elastic.js";
-import { assertCanaryFixture, assertCanaryWindowsAbsent, canaryWindows } from "./helpers/canary-windows.mjs";
+import { assertCanaryFixture, assertCanaryWindowsAbsent, assertDepthCapPins, canaryWindows } from "./helpers/canary-windows.mjs";
 import { scrubAlterations } from "./helpers/scrub-survival.mjs";
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -746,4 +748,12 @@ test("scrubData: the module key rule sees the enclosing key, pair values go by n
   assert.equal(level.child.child, REDACTED, "a container past the cap becomes the marker");
   assertCanaryWindowsAbsent(assert, JSON.stringify(out), Object.values(DATA_CANARIES), "scrubData output");
   assert.deepEqual(scrubber.scrubData(out, { isCredentialKey: isModuleCredentialKey, maxDepth: 10 }), out, "the data-side scrub is idempotent");
+});
+
+test("gap 36: scrubData at the default cap of 24 keeps and scrubs a string at depth 23 and 24 and masks strings and containers at depth 25 and 26, and the same pins hold at 32 and 64", () => {
+  const scrubber = createCredentialScrubber();
+  assertDepthCapPins(assert, (value) => scrubber.scrubData(value), DEFAULT_DATA_SCRUB_DEPTH, "shared scrubData, default cap");
+  assert.equal(DEFAULT_DATA_SCRUB_DEPTH, 24);
+  assertDepthCapPins(assert, (value) => scrubber.scrubData(value, { maxDepth: 32 }), 32, "shared scrubData, cap 32");
+  assertDepthCapPins(assert, (value) => scrubber.scrubData(value, { maxDepth: 64 }), 64, "shared scrubData, cap 64");
 });

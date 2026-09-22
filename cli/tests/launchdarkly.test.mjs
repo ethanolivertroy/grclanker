@@ -30,6 +30,7 @@ import {
   checkLaunchdarklyAccess,
   exportLaunchdarklyAuditBundle,
   parseSimpleToml,
+  redactCredentialValues,
   registerLaunchdarklyTools,
   resolveLaunchdarklyConfiguration,
   resolveSecureOutputPath,
@@ -37,7 +38,7 @@ import {
 } from "../dist/extensions/grc-tools/launchdarkly.js";
 import { getRegisteredToolSummaries } from "../dist/pi/tool-catalog.js";
 import { readBundleFiles, readZipEntries } from "./helpers/bundle-contents.mjs";
-import { assertCanaryFixture, assertCanaryWindowsAbsent } from "./helpers/canary-windows.mjs";
+import { assertCanaryFixture, assertCanaryWindowsAbsent, assertDepthCapPins } from "./helpers/canary-windows.mjs";
 import { scrubAlterations } from "./helpers/scrub-survival.mjs";
 
 const NOW = Date.parse("2026-09-21T00:00:00Z");
@@ -3060,6 +3061,10 @@ const LD_DATA_CANARIES = {
   nameAssignment: "LR53Hd7BzBVfXcjtksAYPnwYLg79V4xf",
   roleDescriptionToken: "gG8UG456pXwM9PVP6LAeK9KXvPEJbo7v",
 };
+
+test("gap 36: LaunchDarkly redactCredentialValues keeps and scrubs a string at depth 23 and 24 and masks strings and containers at depth 25 and 26", () => {
+  assertDepthCapPins(assert, redactCredentialValues, 24, "LaunchDarkly walker");
+});
 
 test("verdict rule 9 (data-side carriers): LaunchDarkly blanks the whole subtree under tokens, credentials, and secret keys and scrubs bare tokens, bearer and assignment carriers, and query tokens out of free text before core_data and analysis files are written", async () => {
   const canaries = Object.values(LD_DATA_CANARIES);

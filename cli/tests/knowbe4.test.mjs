@@ -38,7 +38,7 @@ import {
 } from "../dist/extensions/grc-tools/knowbe4.js";
 import { getRegisteredToolSummaries } from "../dist/pi/tool-catalog.js";
 import { readBundleFiles, readZipEntries } from "./helpers/bundle-contents.mjs";
-import { assertCanaryFixture, assertCanaryWindowsAbsent } from "./helpers/canary-windows.mjs";
+import { assertCanaryFixture, assertCanaryWindowsAbsent, assertDepthCapPins } from "./helpers/canary-windows.mjs";
 import { scrubAlterations } from "./helpers/scrub-survival.mjs";
 
 const NOW = new Date("2026-09-21T12:00:00Z");
@@ -1847,6 +1847,10 @@ test("verdict rule 9: redactCredentialValues masks credential-shaped keys and re
 
   const projected = projectKnowbe4User({ id: 1, email: "user1@acme.example", comment: "vpn pw FAKE", custom_field_1: "FAKE", custom_date_1: "2026-01-01", joined_on: "2024-01-15" });
   assert.deepEqual(Object.keys(projected), ["id", "email", "joined_on"]);
+});
+
+test("gap 36: KnowBe4 redactCredentialValues keeps and scrubs a string at depth 23 and 24 and masks strings and containers at depth 25 and 26", () => {
+  assertDepthCapPins(assert, redactCredentialValues, 24, "KnowBe4 walker");
 });
 
 // Credential values planted in collected objects, in order: policy URL signature, user custom field, user comment,

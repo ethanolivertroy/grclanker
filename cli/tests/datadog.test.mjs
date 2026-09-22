@@ -44,7 +44,7 @@ import {
 } from "../dist/extensions/grc-tools/datadog.js";
 import { getRegisteredToolSummaries } from "../dist/pi/tool-catalog.js";
 import { readBundleFiles, readZipEntries } from "./helpers/bundle-contents.mjs";
-import { assertCanaryFixture, assertCanaryWindowsAbsent } from "./helpers/canary-windows.mjs";
+import { assertCanaryFixture, assertCanaryWindowsAbsent, assertDepthCapPins } from "./helpers/canary-windows.mjs";
 import { scrubAlterations } from "./helpers/scrub-survival.mjs";
 
 const NOW = new Date("2026-09-21T00:00:00.000Z");
@@ -2333,6 +2333,10 @@ test("isCredentialKey, reduceUrl, and redactCredentialValues cover nested, plura
   }
   assert.equal(cursor, "[REDACTED]", "nesting beyond the depth cap collapses to [REDACTED]");
   assert.ok(steps <= 66 && steps >= 60, `redaction recursed ${steps} levels before capping`);
+});
+
+test("gap 36: Datadog redactCredentialValues keeps and scrubs a string at depth 63 and 64 and masks strings and containers at depth 65 and 66", () => {
+  assertDepthCapPins(assert, redactCredentialValues, 64, "Datadog walker");
 });
 
 test("projection helpers keep only assessment fields and drop key values, cloud credentials, signal payloads, and configuration bodies", () => {

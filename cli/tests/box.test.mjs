@@ -28,6 +28,7 @@ import {
   listBoxControls,
   mappingsForControl,
   parseDurationHours,
+  redactCredentialValues,
   redactSecrets,
   resolveBoxConfiguration,
   resolveSecureOutputPath,
@@ -35,7 +36,7 @@ import {
 } from "../dist/extensions/grc-tools/box.js";
 import { getRegisteredToolSummaries } from "../dist/pi/tool-catalog.js";
 import { assertSecretsAbsent, readBundleFiles, readZipEntries } from "./helpers/bundle-contents.mjs";
-import { assertCanaryFixture, assertCanaryWindowsAbsent } from "./helpers/canary-windows.mjs";
+import { assertCanaryFixture, assertCanaryWindowsAbsent, assertDepthCapPins } from "./helpers/canary-windows.mjs";
 
 const NOW = new Date("2026-09-21T00:00:00Z");
 const FRAMEWORKS = ["FedRAMP", "CMMC", "SOC 2", "CIS", "PCI-DSS", "STIG", "IRAP", "ISMAP"];
@@ -1830,6 +1831,10 @@ test("exportBoxAuditBundle records truncated snapshots without counting them as 
   assert.match(executive, /## Truncated Datasets/);
   assert.match(executive, /raise user_limit/);
   assert.doesNotMatch(executive, /Partial Collection Warnings/);
+});
+
+test("gap 36: Box redactCredentialValues keeps and scrubs a string at depth 23 and 24 and masks strings and containers at depth 25 and 26", () => {
+  assertDepthCapPins(assert, redactCredentialValues, 24, "Box walker");
 });
 
 const MULTI_INVENTORY_CASES = [

@@ -62,6 +62,49 @@ export function assertCanaryWindowsAbsent(assert, contents, canaries, label) {
   }
 }
 
+/** Token-shaped canaries planted one per depth; each is distinct in every 6-character window from the others. */
+const DEPTH_CANARIES = ["Kq7Zx2Vw9Lm4Tp8RfiCY", "bPxRfiCYwQmZkTnHvJdLsG", "Hn4Vq8Wz2Rt6Yp3LkMxSb", "Zt9Lm3Kp7Rx2Vw5QnHyGd"];
+
+/**
+ * A chain of nested records for the depth-cap pins: the record at nesting level k (the root is level 0) holds a fixed
+ * `plain` string and a token-shaped `bare` canary, both at depth k + 1, and its `child` record at depth k + 1. The
+ * canaries sit at depths cap - 1, cap, cap + 1, and cap + 2, in that order.
+ */
+export function depthCapChain(cap) {
+  const canaryDepths = new Map([[cap - 1, DEPTH_CANARIES[0]], [cap, DEPTH_CANARIES[1]], [cap + 1, DEPTH_CANARIES[2]], [cap + 2, DEPTH_CANARIES[3]]]);
+  const root = { plain: "depth-1-plain", bare: canaryDepths.get(1) ?? "bare-1" };
+  let cursor = root;
+  for (let level = 1; level <= cap + 2; level += 1) {
+    const depth = level + 1;
+    cursor.child = { plain: `depth-${depth}-plain`, bare: canaryDepths.get(depth) ?? `bare-${depth}` };
+    cursor = cursor.child;
+  }
+  return { root, canaries: [...canaryDepths.values()] };
+}
+
+/**
+ * Pins a data-side walker's depth cap: a string at depth cap - 1 and at depth cap is kept and still gets the pattern
+ * pass (the token-shaped canary there becomes the marker), while a string and a container at depth cap + 1 become the
+ * marker and nothing from depth cap + 2 survives in any window.
+ */
+export function assertDepthCapPins(assert, redact, cap, label) {
+  const { root, canaries } = depthCapChain(cap);
+  const out = redact(root);
+  let record = out;
+  for (let level = 1; level <= cap - 2; level += 1) record = record.child;
+  // record is the level cap - 2 record: its strings sit at depth cap - 1, its child's strings at depth cap.
+  assert.equal(record.plain, `depth-${cap - 1}-plain`, `${label}: a string at depth ${cap - 1} (cap - 1) is kept`);
+  assert.equal(record.bare, "[REDACTED]", `${label}: a token-shaped string at depth ${cap - 1} still gets the pattern pass`);
+  assert.equal(record.child.plain, `depth-${cap}-plain`, `${label}: a string at depth ${cap} (the cap) is kept`);
+  assert.equal(record.child.bare, "[REDACTED]", `${label}: a token-shaped string at depth ${cap} still gets the pattern pass`);
+  const atCap = record.child.child;
+  assert.equal(atCap.plain, "[REDACTED]", `${label}: a string at depth ${cap + 1} (cap + 1) becomes the marker instead of being copied through`);
+  assert.equal(atCap.bare, "[REDACTED]", `${label}: a canary at depth ${cap + 1} becomes the marker`);
+  assert.equal(atCap.child, "[REDACTED]", `${label}: the container at depth ${cap + 1} becomes the marker, so depth ${cap + 2} is never copied`);
+  assertCanaryWindowsAbsent(assert, JSON.stringify(out), canaries, `${label}: depth-cap canaries`);
+  assert.ok(!JSON.stringify(out).includes(`depth-${cap + 1}-plain`) && !JSON.stringify(out).includes(`depth-${cap + 2}-plain`), `${label}: no string past the cap is copied through`);
+}
+
 /**
  * Fixture self-check: every canary has the alphanumeric random-looking shape, no 6-character window of one canary occurs
  * in another, and no 6-character window of any canary occurs in the fixture's legitimate values (`legitimate` takes the
