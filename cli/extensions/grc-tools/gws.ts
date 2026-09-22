@@ -435,13 +435,41 @@ type GwsTokenCacheEntry = {
 const tokenCache = new Map<string, GwsTokenCacheEntry>();
 /** Every access token minted in this process, kept even after a 401 evicts it from the cache so a late echo is still scrubbed. */
 const mintedTokens = new Set<string>();
+/** Every credential a resolved configuration in this process holds (direct bearer, service-account key), registered when the configuration is resolved. */
+const configuredSecrets = new Set<string>();
+
+function rememberConfigSecrets(config: GwsResolvedConfig): void {
+  for (const value of [config.accessToken, config.serviceAccountPrivateKey]) {
+    if (typeof value === "string" && value.length > 0) configuredSecrets.add(value);
+  }
+}
+
+/** The credential values this process holds right now: registered configuration secrets, every minted token, and the live cache. */
+function knownRunSecretValues(): string[] {
+  const values: Array<string | undefined> = [...configuredSecrets, ...mintedTokens];
+  for (const entry of tokenCache.values()) {
+    values.push(entry.token);
+  }
+  return values.filter((value): value is string => typeof value === "string" && value.length > 0);
+}
+
+/**
+ * The one scrub every error string passes through at the point it is created: free-text credential shapes, credential
+ * `key=value` pairs, and URL query strings are removed, then every credential this run holds is replaced wherever it
+ * appears. `GwsApiError` applies it in its constructor and `summarizeError` applies it to every other error, so the
+ * dataset statuses, evidence lines, access probes, and tool error results built from them inherit it.
+ */
+function scrubErrorText(text: string): string {
+  return redactKnownValues(scrubText(text), knownRunSecretValues()) as string;
+}
 
 export class GwsApiError extends Error {
   status: number;
   url: string;
 
+  /** The message is scrubbed at construction, so `error.message` is already safe for every consumer. */
   constructor(status: number, message: string, url: string) {
-    super(message);
+    super(scrubErrorText(message));
     this.name = "GwsApiError";
     this.status = status;
     this.url = url;
@@ -885,8 +913,9 @@ function normalizeString(value: unknown): string | undefined {
   return asString(value)?.trim();
 }
 
+/** Every error rendered anywhere goes through here, so a transport or parser message carrying a credential is scrubbed before it becomes text. */
 function summarizeError(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
+  return scrubErrorText(error instanceof Error ? error.message : String(error));
 }
 
 function base64Url(input: string | Buffer): string {
@@ -1326,13 +1355,27 @@ function buildAssessmentText(
   ].join("\n");
 }
 
-function renderAssessmentToolResult(result: GwsAssessmentResult) {
+/**
+ * The tool path applies the same object-level redaction the bundle applies before any rendering, so a tool result can
+ * never carry a value a bundle file would have withheld; the error strings inside were already scrubbed at creation.
+ */
+function scrubToolPayload<T>(value: T, config: GwsResolvedConfig): T {
+  return redactKnownValues(redactSecrets(value), knownGwsSecretValues(config)) as T;
+}
+
+function renderAssessmentToolResult(assessment: GwsAssessmentResult, config: GwsResolvedConfig) {
+  const result = scrubToolPayload(assessment, config);
   return textResult(result.text, {
     category: result.category,
     findings: result.findings,
     summary: result.summary,
     snapshot_summary: result.snapshotSummary,
   });
+}
+
+/** Every tool catch block exits through here, so the rendered message is scrubbed once more where the result is built. */
+function renderToolError(prefix: string, error: unknown, tool: string) {
+  return errorResult(scrubErrorText(`${prefix}: ${summarizeError(error)}`), { tool });
 }
 
 function probeTable(probes: GwsAccessProbe[]): string {
@@ -1342,7 +1385,8 @@ function probeTable(probes: GwsAccessProbe[]): string {
   );
 }
 
-function renderAccessCheck(result: GwsAccessCheckResult) {
+function renderAccessCheck(check: GwsAccessCheckResult, config: GwsResolvedConfig) {
+  const result = scrubToolPayload(check, config);
   return textResult(
     [
       `Google Workspace access check for ${result.organization}`,
@@ -1933,11 +1977,8 @@ async function writeSecureTextFile(rootDir: string, relativePathname: string, co
 
 /** The credential values this run holds (direct bearer, service-account key, minted tokens), so any echo of them is scrubbed. */
 function knownGwsSecretValues(config: GwsResolvedConfig): string[] {
-  const values: Array<string | undefined> = [config.accessToken, config.serviceAccountPrivateKey, ...mintedTokens];
-  for (const entry of tokenCache.values()) {
-    values.push(entry.token);
-  }
-  return values.filter((value): value is string => typeof value === "string" && value.length > 0);
+  rememberConfigSecrets(config);
+  return knownRunSecretValues();
 }
 
 /** Every bundle file passes through here, so no rendered text reaches disk without free-text scrubbing and known-value replacement. */
@@ -1986,8 +2027,9 @@ function parseServiceAccount(contents: string, label: string): ServiceAccountCre
   let parsed: unknown;
   try {
     parsed = JSON.parse(contents);
-  } catch (error) {
-    throw new Error(`Failed to parse service account JSON from ${label}: ${summarizeError(error)}`);
+  } catch {
+    // The parser's own message quotes the first characters of the input, which here is credential material.
+    throw new Error(`Failed to parse service account JSON from ${label}: the contents are not valid JSON (${contents.length} character(s); the contents are not repeated here).`);
   }
   const record = asRecord(parsed);
   const clientEmail = asString(record.client_email);
@@ -2124,15 +2166,41 @@ export async function resolveGwsConfiguration(
   };
 }
 
+/**
+ * Reads a response body as text and parses the JSON itself, so a body that is not JSON yields a fixed description (the
+ * content type and byte count) instead of the parser's message, which quotes the first characters of the body.
+ */
+async function readJsonBody(response: Response): Promise<{ payload: JsonRecord; failure?: undefined } | { payload?: undefined; failure: string }> {
+  const contentType = response.headers.get("content-type")?.split(";")[0]?.trim().toLowerCase() || "untyped";
+  let text: string;
+  try {
+    text = await response.text();
+  } catch {
+    return { failure: `unreadable ${contentType} body withheld` };
+  }
+  try {
+    return { payload: asRecord(JSON.parse(text)) };
+  } catch {
+    return { failure: `non-JSON ${contentType} body (${Buffer.byteLength(text, "utf8")} bytes) withheld` };
+  }
+}
+
 export class GoogleWorkspaceAuditorClient implements GwsAuditCollector {
   constructor(
     private readonly config: GwsResolvedConfig,
     private readonly fetchImpl: FetchImpl = fetch,
-  ) {}
+  ) {
+    rememberConfigSecrets(config);
+  }
 
+  /** A successful status with a body that is not JSON is an explicit error naming the status, content type, and size; the body is never quoted. */
   async fetchJson(url: string, scopes: string[] = GWS_READ_SCOPES): Promise<JsonRecord> {
     const response = await this.request(url, scopes);
-    return asRecord(await response.json());
+    const body = await readJsonBody(response);
+    if (body.failure !== undefined) {
+      throw new GwsApiError(response.status, `${httpStatusLabel(response.status)} with ${body.failure}`, url);
+    }
+    return body.payload;
   }
 
   async probe(url: string, scopes: string[] = GWS_READ_SCOPES): Promise<GwsAccessProbe> {
@@ -2324,13 +2392,9 @@ export class GoogleWorkspaceAuditorClient implements GwsAuditCollector {
   /** Renders the HTTP status plus documented identifiers only; the body's free-text message is never kept (see describeErrorReasons). */
   private async readError(response: Response): Promise<string> {
     const base = httpStatusLabel(response.status);
-    let payload: JsonRecord;
-    try {
-      payload = asRecord(await response.json());
-    } catch {
-      return base;
-    }
-    const reasons = describeErrorReasons(payload);
+    const body = await readJsonBody(response);
+    if (body.failure !== undefined) return base;
+    const reasons = describeErrorReasons(body.payload);
     return reasons.length > 0 ? `${base} (${reasons.join(", ")})` : base;
   }
 
@@ -2385,7 +2449,11 @@ export class GoogleWorkspaceAuditorClient implements GwsAuditCollector {
       throw new Error(`Failed to obtain Google access token: ${await this.readError(response)}`);
     }
 
-    const payload = asRecord(await response.json());
+    const body = await readJsonBody(response);
+    if (body.failure !== undefined) {
+      throw new Error(`Google token exchange returned ${httpStatusLabel(response.status)} with ${body.failure}.`);
+    }
+    const payload = body.payload;
     const accessToken = asString(payload.access_token);
     const expiresIn = asNumber(payload.expires_in) ?? 3600;
     if (!accessToken) {
@@ -2406,6 +2474,7 @@ function sleep(ms: number): Promise<void> {
 export function clearGwsTokenCacheForTests(): void {
   tokenCache.clear();
   mintedTokens.clear();
+  configuredSecrets.clear();
 }
 
 export async function runGwsAccessCheck(
@@ -3966,12 +4035,9 @@ export function registerGwsTools(pi: any): void {
         const config = await resolveGwsConfiguration(args);
         const client = new GoogleWorkspaceAuditorClient(config);
         const result = await runGwsAccessCheck(client, config);
-        return renderAccessCheck(result);
+        return renderAccessCheck(result, config);
       } catch (error) {
-        return errorResult(
-          `Google Workspace access check failed: ${summarizeError(error)}`,
-          { tool: "gws_check_access" },
-        );
+        return renderToolError("Google Workspace access check failed", error, "gws_check_access");
       }
     },
   });
@@ -3988,12 +4054,9 @@ export function registerGwsTools(pi: any): void {
         const config = await resolveGwsConfiguration(args);
         const client = new GoogleWorkspaceAuditorClient(config);
         const data = await collectGwsIdentityData(client);
-        return renderAssessmentToolResult(assessGwsIdentity(data, config));
+        return renderAssessmentToolResult(assessGwsIdentity(data, config), config);
       } catch (error) {
-        return errorResult(
-          `Google Workspace identity assessment failed: ${summarizeError(error)}`,
-          { tool: "gws_assess_identity" },
-        );
+        return renderToolError("Google Workspace identity assessment failed", error, "gws_assess_identity");
       }
     },
   });
@@ -4010,12 +4073,9 @@ export function registerGwsTools(pi: any): void {
         const config = await resolveGwsConfiguration(args);
         const client = new GoogleWorkspaceAuditorClient(config);
         const data = await collectGwsAdminAccessData(client);
-        return renderAssessmentToolResult(assessGwsAdminAccess(data, config));
+        return renderAssessmentToolResult(assessGwsAdminAccess(data, config), config);
       } catch (error) {
-        return errorResult(
-          `Google Workspace admin-access assessment failed: ${summarizeError(error)}`,
-          { tool: "gws_assess_admin_access" },
-        );
+        return renderToolError("Google Workspace admin-access assessment failed", error, "gws_assess_admin_access");
       }
     },
   });
@@ -4032,12 +4092,9 @@ export function registerGwsTools(pi: any): void {
         const config = await resolveGwsConfiguration(args);
         const client = new GoogleWorkspaceAuditorClient(config);
         const data = await collectGwsIntegrationData(client);
-        return renderAssessmentToolResult(assessGwsIntegrations(data, config));
+        return renderAssessmentToolResult(assessGwsIntegrations(data, config), config);
       } catch (error) {
-        return errorResult(
-          `Google Workspace integrations assessment failed: ${summarizeError(error)}`,
-          { tool: "gws_assess_integrations" },
-        );
+        return renderToolError("Google Workspace integrations assessment failed", error, "gws_assess_integrations");
       }
     },
   });
@@ -4054,12 +4111,9 @@ export function registerGwsTools(pi: any): void {
         const config = await resolveGwsConfiguration(args);
         const client = new GoogleWorkspaceAuditorClient(config);
         const data = await collectGwsMonitoringData(client);
-        return renderAssessmentToolResult(assessGwsMonitoring(data, config));
+        return renderAssessmentToolResult(assessGwsMonitoring(data, config), config);
       } catch (error) {
-        return errorResult(
-          `Google Workspace monitoring assessment failed: ${summarizeError(error)}`,
-          { tool: "gws_assess_monitoring" },
-        );
+        return renderToolError("Google Workspace monitoring assessment failed", error, "gws_assess_monitoring");
       }
     },
   });
@@ -4104,10 +4158,7 @@ export function registerGwsTools(pi: any): void {
           frameworks: result.frameworks,
         });
       } catch (error) {
-        return errorResult(
-          `Google Workspace audit export failed: ${summarizeError(error)}`,
-          { tool: "gws_export_audit_bundle" },
-        );
+        return renderToolError("Google Workspace audit export failed", error, "gws_export_audit_bundle");
       }
     },
   });

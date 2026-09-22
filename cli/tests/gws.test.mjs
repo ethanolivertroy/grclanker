@@ -31,6 +31,7 @@ import {
   projectAlertSnapshot,
   redactKnownValues,
   redactSecrets,
+  registerGwsTools,
   resolveGwsConfiguration,
   resolveSecureOutputPath,
   runGwsAccessCheck,
@@ -1591,6 +1592,199 @@ test("rule 9: a service-account token evicted by a 401 mid-run is still scrubbed
   }
   const users = JSON.parse(readFileSync(join(result.outputDir, "core_data", "users.json"), "utf8"));
   assert.equal(users.data[0].orgUnitPath, "/ou-[REDACTED]");
+  clearGwsTokenCacheForTests();
+});
+
+/** Registers the inspector tools against a stand-in host and returns them keyed by name, applying prepareArguments the way the host does. */
+function registeredTools() {
+  const tools = new Map();
+  registerGwsTools({ registerTool: (definition) => tools.set(definition.name, definition) });
+  return {
+    run: async (name, rawArgs) => {
+      const definition = tools.get(name);
+      assert.ok(definition, `tool ${name} is registered`);
+      const result = await definition.execute("call-1", definition.prepareArguments(rawArgs));
+      return { ...result, text: result.content.map((part) => part.text ?? "").join("\n"), json: JSON.stringify(result.details ?? {}) };
+    },
+  };
+}
+
+/** The registered tools build their client on the global fetch, so the route stands in for it for the duration of the callback. */
+async function withRoutedFetch(route, callback) {
+  const original = globalThis.fetch;
+  globalThis.fetch = route;
+  try {
+    return await callback();
+  } finally {
+    globalThis.fetch = original;
+  }
+}
+
+/** Every endpoint answers with an empty but well-formed page unless `overrides` supplies its own handler keyed by a pathname test. */
+function routeEndpoints(overrides = []) {
+  return async (input) => {
+    const url = new URL(typeof input === "string" ? input : input.toString());
+    for (const [matches, handler] of overrides) {
+      if (matches(url)) return handler(url);
+    }
+    if (url.pathname === "/admin/directory/v1/users") return jsonResponse({ users: createUsers() });
+    if (url.pathname.endsWith("/roles")) return jsonResponse({ items: createRoles() });
+    if (url.pathname.endsWith("/roleassignments")) return jsonResponse({ items: createRoleAssignments() });
+    if (url.pathname.startsWith("/admin/reports/v1/activity/")) return jsonResponse({ items: [] });
+    if (url.pathname === "/v1beta1/alerts") return jsonResponse({ alerts: [] });
+    if (url.pathname === "/v1/policies") return jsonResponse({ policies: [] });
+    if (url.pathname.endsWith("/tokens")) return jsonResponse({ items: [] });
+    return jsonResponse({ error: { code: 404, message: `unexpected URL ${url}`, status: "NOT_FOUND" } }, 404);
+  };
+}
+
+const INSPECTOR_TOOLS = ["gws_check_access", "gws_assess_identity", "gws_assess_admin_access", "gws_assess_integrations", "gws_assess_monitoring"];
+/** The tools whose collection reads Directory roles.list, so a roles.list failure reaches their text and snapshot. */
+const ROLE_READING_TOOLS = ["gws_check_access", "gws_assess_identity", "gws_assess_admin_access", "gws_assess_integrations"];
+
+test("rule 9 (tool path): a transport error carrying credentials is scrubbed where the error is created, so every tool result and snapshot_summary reads [REDACTED]", async () => {
+  clearGwsTokenCacheForTests();
+  // The run credential has no Google shape, so only the known-value layer can remove it (negative control for that layer on the tool path).
+  const runToken = "PLANTEDr5-run-token-0123456789abcdef";
+  const thrown = `proxy CONNECT failed for Bearer ya29.PLANTEDr5bearer0123456789; access_token=PLANTEDr5pair0123456789; echo ${runToken}; see https://proxy.example/x?sig=PLANTEDr5sig0123`;
+  const leak = /PLANTED/;
+  const failRoles = [(url) => url.pathname.endsWith("/roles"), () => { throw new Error(thrown); }];
+  const toolArgs = { auth_mode: "access_token", access_token: runToken, domain: "example.com" };
+  const scrubbed = "proxy CONNECT failed for Bearer [REDACTED]; access_token=[REDACTED]; echo [REDACTED]; see https://proxy.example/x";
+  const scrubbedPattern = new RegExp(scrubbed.replace(/[.()[\]]/g, "\\$&"));
+
+  // The error class and summarizeError scrub at creation, so the library surfaces are already clean.
+  const apiError = new GwsApiError(502, "upstream said Bearer ya29.PLANTEDr5ctor0123456789 at https://proxy.example/y?token=PLANTEDr5query0123", "https://admin.googleapis.com/x");
+  assert.equal(apiError.message, "upstream said Bearer [REDACTED] at https://proxy.example/y");
+  const data = await collectGwsAuditData(createFakeCollector({ collectRoles: async () => { throw new Error(thrown); } }));
+  assert.equal(data.identity.roles.error, scrubbed.replace("echo [REDACTED]", `echo ${runToken}`), "a run that registered no configuration applies the shape scrub only");
+
+  const tools = registeredTools();
+  await withRoutedFetch(routeEndpoints([failRoles]), async () => {
+    for (const name of INSPECTOR_TOOLS) {
+      const result = await tools.run(name, toolArgs);
+      assert.doesNotMatch(result.text, leak, `${name} text leaked`);
+      assert.doesNotMatch(result.json, leak, `${name} details leaked`);
+      if (ROLE_READING_TOOLS.includes(name)) {
+        assert.match(result.text, scrubbedPattern, `${name} text must carry the scrubbed error`);
+        assert.match(result.json, scrubbedPattern, `${name} details must carry the scrubbed error`);
+      }
+    }
+    const adminAccess = await tools.run("gws_assess_admin_access", toolArgs);
+    assert.match(adminAccess.text, new RegExp(`^- privileged_users_status: unreadable: Directory roles\\.list \\(${scrubbed.replace(/[.()[\]]/g, "\\$&")}\\)$`, "m"));
+    assert.equal(adminAccess.details.snapshot_summary.privileged_users, null);
+    assert.equal(adminAccess.details.snapshot_summary.privileged_users_status, `unreadable: Directory roles.list (${scrubbed})`);
+    assert.ok(findingById(adminAccess.details, "GWS-ADMIN-001").evidence.some((line) => line.includes(scrubbed)), "the evidence names the scrubbed failure");
+    const access = await tools.run("gws_check_access", toolArgs);
+    const rolesProbe = access.details.probes.find((probe) => probe.key === "roles");
+    assert.equal(rolesProbe.status, "error");
+    assert.equal(rolesProbe.detail, scrubbed);
+    assert.match(access.text, /roles\s+│\s+error\s+│\s+proxy CONNECT failed for Bearer \[REDACTED\]; access_token=\[REDACTED\]; echo \[REDACTED\]; see https:\/\/proxy\.example\/x/);
+  });
+
+  // A documented free-text field echoing credentials reaches INTEG-002 evidence only through the tool payload scrub (the bundle's redactSecrets layer).
+  const displayToken = [(url) => url.pathname === "/admin/directory/v1/users/delegated%40example.com/tokens", () => jsonResponse({
+    items: [{ clientId: "client-1", displayText: `Drive Syncer token=PLANTEDr5display0123456789 https://app.test/cb?code=PLANTEDr5code0123 ${runToken}`, scopes: ["https://www.googleapis.com/auth/drive"], userKey: "u-delegated" }],
+  })];
+  await withRoutedFetch(routeEndpoints([displayToken]), async () => {
+    const integrations = await tools.run("gws_assess_integrations", toolArgs);
+    assert.doesNotMatch(integrations.text, leak, integrations.text);
+    assert.doesNotMatch(integrations.json, leak);
+    assert.ok(findingById(integrations.details, "GWS-INTEG-002").evidence.includes("Privileged token clients: Drive Syncer token=[REDACTED] https://app.test/cb [REDACTED] (client-1)"), integrations.text);
+  });
+
+  // Every request throwing: all five tools render every unreadable read with the scrubbed message and nothing else.
+  await withRoutedFetch(async () => { throw new Error(thrown); }, async () => {
+    for (const name of INSPECTOR_TOOLS) {
+      const result = await tools.run(name, toolArgs);
+      assert.doesNotMatch(result.text, leak, `${name} text leaked`);
+      assert.doesNotMatch(result.json, leak, `${name} details leaked`);
+      assert.match(result.text, scrubbedPattern, `${name} text must carry the scrubbed error`);
+      assert.equal(result.isError, undefined, `${name} reports unreadable reads as findings, not as a tool error`);
+    }
+  });
+
+  // The tool catch block inherits the scrub, and the credentials parser never quotes its input.
+  const badJson = await tools.run("gws_assess_identity", { auth_mode: "service_account", credentials_json: `ya29.PLANTEDr5notjson0123456789 ${"x".repeat(40)}`, admin_email: "admin@example.com" });
+  assert.equal(badJson.isError, true);
+  assert.doesNotMatch(badJson.text, leak, badJson.text);
+  assert.equal(badJson.text, "Google Workspace identity assessment failed: Failed to parse service account JSON from credentials_json: the contents are not valid JSON (72 character(s); the contents are not repeated here).");
+  clearGwsTokenCacheForTests();
+});
+
+test("rule 9 (tool path): a 200 body that is not JSON is described by content type and size, never quoted, in tool results and every bundle file", async () => {
+  clearGwsTokenCacheForTests();
+  const base = createTempBase("grclanker-gws-nonjson-");
+  const bodyCanary = "ya29.PLANTEDr5okbody0123456789";
+  const html = `<html><body>PLANTEDr5plainword ${bodyCanary} access_token=PLANTEDr5htmlpair0123</body></html>`;
+  const leak = /PLANTED/;
+  const htmlRoles = [(url) => url.pathname.endsWith("/roles"), () => new Response(html, { status: 200, headers: { "content-type": "text/html; charset=utf-8" } })];
+  const described = `200 OK with non-JSON text/html body (${Buffer.byteLength(html, "utf8")} bytes) withheld`;
+  const toolArgs = { auth_mode: "access_token", access_token: "ya29.PLANTEDr5nonjsonrun0123456789", domain: "example.com" };
+
+  // The client raises an explicit error naming status, content type, and size; the parser's quoting message never forms.
+  const config = createSampleConfig();
+  const client = new GoogleWorkspaceAuditorClient(config, routeEndpoints([htmlRoles]));
+  await assert.rejects(client.collectRoles(), (error) => {
+    assert.ok(error instanceof GwsApiError);
+    assert.equal(error.status, 200);
+    assert.equal(error.message, described);
+    return true;
+  });
+  const untyped = new GoogleWorkspaceAuditorClient(config, async () => new Response(html, { status: 200 }));
+  await assert.rejects(untyped.collectRoles(), (error) => {
+    assert.equal(error.message, `200 OK with non-JSON text/plain body (${Buffer.byteLength(html, "utf8")} bytes) withheld`, "undici labels a string Response body text/plain");
+    return true;
+  });
+  const empty = new GoogleWorkspaceAuditorClient(config, async () => new Response("", { status: 200, headers: { "content-type": "application/json" } }));
+  await assert.rejects(empty.collectRoles(), { message: "200 OK with non-JSON application/json body (0 bytes) withheld" });
+
+  const tools = registeredTools();
+  await withRoutedFetch(routeEndpoints([htmlRoles]), async () => {
+    for (const name of INSPECTOR_TOOLS) {
+      const result = await tools.run(name, toolArgs);
+      assert.doesNotMatch(result.text, leak, `${name} text quoted the body`);
+      assert.doesNotMatch(result.json, leak, `${name} details quoted the body`);
+      assert.doesNotMatch(result.text + result.json, /is not valid JSON|Unexpected token/, `${name} carries a parser message`);
+    }
+    const adminAccess = await tools.run("gws_assess_admin_access", toolArgs);
+    assert.equal(adminAccess.details.snapshot_summary.privileged_users_status, `unreadable: Directory roles.list (${described})`);
+    assert.equal(findingById(adminAccess.details, "GWS-ADMIN-001").status, "Manual");
+  });
+
+  // The bundle exported from the same client carries the description and nothing from the body, in the directory and the zip.
+  const result = await exportGwsAuditBundle(client, config, base);
+  assert.equal(result.errorCount, 1);
+  const files = listFilesRecursively(result.outputDir);
+  for (const file of files) {
+    const content = readFileSync(file, "utf8");
+    assert.doesNotMatch(content, leak, `${relative(result.outputDir, file)} quoted the body`);
+    assert.doesNotMatch(content, /is not valid JSON|Unexpected token/, `${relative(result.outputDir, file)} carries a parser message`);
+  }
+  for (const [name, content] of readZipEntries(result.zipPath)) {
+    assert.doesNotMatch(content, leak, `zip entry ${name} quoted the body`);
+  }
+  assert.equal(readFileSync(join(result.outputDir, "_errors.log"), "utf8"), `roles.list: ${described}\n`);
+  const roles = JSON.parse(readFileSync(join(result.outputDir, "core_data", "roles.json"), "utf8"));
+  assert.equal(roles.error, described);
+  assert.equal(roles.errorKind, "error");
+  assert.equal(roles.data, null);
+
+  // The token exchange applies the same rule to its own 200 body.
+  const { privateKey } = generateKeyPairSync("rsa", { modulusLength: 2048 });
+  const serviceAccount = createSampleConfig({
+    authMode: "service_account",
+    accessToken: undefined,
+    serviceAccountEmail: "svc@example-project.iam.gserviceaccount.com",
+    serviceAccountPrivateKey: privateKey.export({ type: "pkcs8", format: "pem" }).toString(),
+  });
+  const exchangeBody = `${bodyCanary} PLANTEDr5exchangebody`;
+  const exchange = new GoogleWorkspaceAuditorClient(serviceAccount, async () => new Response(exchangeBody, { status: 200, headers: { "content-type": "text/plain" } }));
+  await assert.rejects(exchange.collectRoles(), (error) => {
+    assert.doesNotMatch(error.message, leak);
+    assert.equal(error.message, `Google token exchange returned 200 OK with non-JSON text/plain body (${Buffer.byteLength(exchangeBody, "utf8")} bytes) withheld.`);
+    return true;
+  });
   clearGwsTokenCacheForTests();
 });
 
