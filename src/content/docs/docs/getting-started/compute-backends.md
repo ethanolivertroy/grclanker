@@ -16,7 +16,7 @@ The compute backend is where tool execution happens.
 - `docker`: run `bash`, `read`, `write`, `edit`, `ls`, `grep`, and `find` inside a local container with the repo bind-mounted into it.
 - `parallels-vm`: deploy a disposable Parallels sandbox from either a dedicated template or a stopped base VM, attach the repo share, and run the same tool surface inside that sandbox via `prlctl exec`.
 - `modal`: run each command one-shot inside a Modal container through the `modal shell` CLI, optionally with a GPU.
-- `runpod-pod`: copy the repo into a persistent RunPod pod you already own and run the tool surface over SSH.
+- `runpod-pod`: copy the tracked files of the repo into a persistent RunPod pod you already own and run the tool surface over SSH.
 - `runpod-serverless`: dispatch each command as a job to a RunPod serverless endpoint that runs the grclanker worker contract.
 - `vercel-sandbox` and `cloudflare-sandbox`: reserved kinds that fail fast today (see the backend matrix below).
 
@@ -31,7 +31,7 @@ Model/provider settings still decide which LLM answers questions. Compute backen
 | `docker` | sandboxed | shipped | contract adapter (`docker run` args unchanged from phase 1) | no | no | bind mount | bind mount |
 | `parallels-vm` | sandboxed | shipped | contract adapter (disposable clone, `prlctl exec`) | yes (`prlctl snapshot`, `prlctl snapshot-switch`), exercised by `env smoke-test` | no | shared folder | shared folder |
 | `modal` | gpu-burst | shipped (CLI) | contract adapter over `modal shell` | no | yes | `--add-local` copy per command | not available |
-| `runpod-pod` | persistent-remote | shipped | contract adapter over the REST API plus `ssh`/`scp` | no | yes | `scp` into a per-session directory | `scp` (manual) |
+| `runpod-pod` | persistent-remote | shipped | contract adapter over the REST API plus `ssh`/`scp` | no | yes | `scp` of the git index (tracked files minus the deny list) into a per-session directory | `scp` (manual) |
 | `runpod-serverless` | gpu-burst | shipped | contract adapter over the serverless HTTP API | no | yes | worker image must contain the workspace | artifact paths reported by the worker |
 | `vercel-sandbox` | sandboxed | stub | fails fast | no | no | no | no |
 | `cloudflare-sandbox` | sandboxed | stub | fails fast | no | no | no | no |
@@ -384,11 +384,13 @@ Limits: no workspace upload, no snapshots, and artifact sync-back is limited to 
 
 State: shipped for pods you already created. grclanker never creates, stops, or deletes pods; it only reads pod metadata and works inside a per-session directory that it removes on teardown.
 
-Credentials: `RUNPOD_API_KEY` and `RUNPOD_POD_ID`, plus an SSH key that the pod accepts and a local `ssh`/`scp` client.
+Credentials: `RUNPOD_API_KEY` and `RUNPOD_POD_ID`, plus an SSH key that the pod accepts and local `ssh`, `scp`, and `git` clients.
 
 Requests: `GET https://rest.runpod.io/v1/pods/{podId}` with `Authorization: Bearer <RUNPOD_API_KEY>`, reading `desiredStatus`, `publicIp`, and `portMappings["22"]` as documented at [Find a Pod by ID](https://docs.runpod.io/api-reference/pods/GET/pods/podId). RunPod marks REST API v1 as deprecated with retirement on 2026-11-15 ([API overview](https://docs.runpod.io/api-reference/overview)); the base URL lives in one constant so the v2 move is a one-line change.
 
-What runs where: `stageWorkspace` runs `ssh ... mkdir -p -- <runpodWorkspacePath>/<sessionId>` followed by `scp -r <repo>/. root@<publicIp>:<runpodWorkspacePath>/<sessionId>`; if the copy fails, the adapter removes the directory it just created before raising. Every command runs as `ssh -p <port> root@<publicIp> "cd -- <cwd> && <command>"`, and teardown removes the session directory (`rm -rf -- <runpodWorkspacePath>/<sessionId>`). Session ids are validated at the adapter boundary (letters, digits, `.`, `_`, `-`, no `..`), so no caller can turn the removal into a traversal. The pod must expose TCP port 22 publicly.
+What is staged: exactly the files in the git index of the workspace (`git -C <repo> ls-files --cached -z`), copied with their current working-tree content and file modes, minus a fixed deny list. Nothing else leaves the machine: untracked files, everything `.gitignore` ignores, the `.git` directory itself, symlinks, and submodule contents are never uploaded, and a tracked file whose path matches the deny list is excluded even though it is tracked. The deny list (`RUNPOD_STAGING_DENYLIST` in `cli/pi/backends/runpod.ts`) is `.env`, `.env.*`, `.okta.yaml`, `credentials.json`, `client_secret.json`, `*service-account*.json`, any `export/` or `oscal-workspace/` directory at any depth, `*.pem`, `*.key`, `*.p12`, `*.pfx`, `id_rsa`, `id_dsa`, `id_ecdsa`, and `id_ed25519`. Run `git add` on a new file that should reach the pod; a workspace that is not inside a git work tree is refused with a clear error (`git ls-files exited 128 ... runpod-pod stages tracked files only`) rather than copied blindly, and `git` must be on PATH.
+
+What runs where: `stageWorkspace` lists the index, copies the planned files into a private temp directory, runs `ssh ... mkdir -p -- <runpodWorkspacePath>/<sessionId>`, then `scp -r <temp>/. root@<publicIp>:<runpodWorkspacePath>/<sessionId>`, and removes the temp directory whether or not the upload succeeded; if the copy fails, the adapter removes the remote directory it just created before raising. The staging detail reports the counts (`copied 42 tracked files (2 sensitive paths excluded, 0 non-regular or missing entries skipped)`). Every command runs as `ssh -p <port> root@<publicIp> "cd -- <cwd> && <command>"`, and teardown removes the session directory (`rm -rf -- <runpodWorkspacePath>/<sessionId>`). Session ids are validated at the adapter boundary (letters, digits, `.`, `_`, `-`, no `..`), so no caller can turn the removal into a traversal. The pod must expose TCP port 22 publicly.
 
 Limits: no snapshots through the API, and sync-back means copying the session directory back with `scp` yourself.
 

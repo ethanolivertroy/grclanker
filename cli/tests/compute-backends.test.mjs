@@ -1,9 +1,9 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 
 import {
   COMPUTE_BACKEND_KINDS,
@@ -40,7 +40,10 @@ import {
   createRunpodPodBackend,
   createRunpodServerlessBackend,
   DEFAULT_RUNPOD_JOB_TIMEOUT_MS,
+  isSensitiveStagingPath,
   parseRunpodWorkerOutput,
+  planPodWorkspaceStaging,
+  RUNPOD_STAGING_DENYLIST,
 } from "../dist/pi/backends/runpod.js";
 import { activeComputeSessionCount } from "../dist/pi/compute-sessions.js";
 import { shutdownComputeSessions } from "../dist/pi/compute-shutdown.js";
@@ -456,9 +459,10 @@ test("runpod pod adapter reads the documented pod fields and execs over ssh", as
 
     const staged = await backend.stageWorkspace({ localPath: "/repo", sessionId: "sess" });
     assert.equal(staged.remotePath, "/workspace/sess");
-    assert.equal(calls[0].executable, "ssh");
-    assert.equal(calls[1].executable, "scp");
-    assert.ok(calls[1].args.includes("root@203.0.113.10:/workspace/sess"));
+    assert.deepEqual(calls.map((call) => call.executable), ["git", "ssh", "scp"]);
+    assert.deepEqual(calls[0].args, ["-C", "/repo", "ls-files", "--cached", "-z"]);
+    assert.ok(calls[2].args.includes("root@203.0.113.10:/workspace/sess"));
+    assert.match(calls[2].args.at(-2), /grclanker-runpod-stage-[^/]+\/\.$/, "scp uploads the private staging copy, not the repo root");
 
     const result = await backend.exec({ sessionId: "sess", command: ["uname -a"], cwd: "/workspace/sess" });
     assert.equal(result.stdout, "ok\n");
@@ -639,12 +643,138 @@ test("runpod pod adapter removes the directory it created when scp fails", async
       runner,
     });
     await assert.rejects(() => backend.stageWorkspace({ localPath: "/repo", sessionId: "sess" }), /Could not copy/);
-    assert.deepEqual(calls.map((call) => call.executable), ["ssh", "scp", "ssh"]);
-    assert.match(calls[0].args.at(-1), /^mkdir -p -- '\/workspace\/sess'$/);
-    assert.match(calls[2].args.at(-1), /^rm -rf -- '\/workspace\/sess'$/);
+    assert.deepEqual(calls.map((call) => call.executable), ["git", "ssh", "scp", "ssh"]);
+    assert.match(calls[1].args.at(-1), /^mkdir -p -- '\/workspace\/sess'$/);
+    assert.match(calls[3].args.at(-1), /^rm -rf -- '\/workspace\/sess'$/);
     await backend.teardown("sess");
-    assert.equal(calls.length, 3);
+    assert.equal(calls.length, 4);
   });
+});
+
+function git(cwd, ...args) {
+  const result = spawnSync("git", ["-C", cwd, ...args], { encoding: "utf8" });
+  assert.equal(result.status, 0, `git ${args.join(" ")} failed: ${result.stderr}`);
+  return result.stdout;
+}
+
+function plant(root, relativePath, contents) {
+  mkdirSync(join(root, dirname(relativePath)), { recursive: true });
+  writeFileSync(join(root, relativePath), contents);
+}
+
+function listFilesRecursively(root, prefix = "") {
+  const entries = [];
+  for (const entry of readdirSync(join(root, prefix), { withFileTypes: true })) {
+    const relativePath = prefix ? `${prefix}/${entry.name}` : entry.name;
+    if (entry.isDirectory()) entries.push(...listFilesRecursively(root, relativePath));
+    else entries.push(relativePath);
+  }
+  return entries.sort();
+}
+
+test("runpod pod staging uploads the git index only and never a planted secret", async () => {
+  const repo = mkdtempSync(join(tmpdir(), "grclanker-pod-stage-"));
+  const secrets = {
+    ".env": "PLANTED_SECRET_ENV=fake-env-secret-1a2b3c\n",
+    "credentials.json": "{\"secret\":\"fake-credentials-secret-4d5e6f\"}\n",
+    "client_secret.json": "{\"client_secret\":\"fake-client-secret-7g8h9i\"}\n",
+    "acme-service-account.json": "{\"private_key\":\"fake-service-account-secret-0j1k2l\"}\n",
+    "export/bundle.zip": "fake-export-bundle-secret-3m4n5o\n",
+    "oscal-workspace/x.json": "{\"token\":\"fake-oscal-workspace-secret-6p7q8r\"}\n",
+  };
+  try {
+    git(repo, "init", "-q");
+    plant(repo, "README.md", "# tracked\n");
+    plant(repo, "src/index.ts", "export const tracked = true;\n");
+    plant(repo, "scripts/run.sh", "#!/bin/sh\necho tracked\n");
+    chmodSync(join(repo, "scripts/run.sh"), 0o755);
+    git(repo, "add", "README.md", "src/index.ts", "scripts/run.sh");
+    git(repo, "-c", "user.email=test@example.invalid", "-c", "user.name=test", "commit", "-q", "-m", "init");
+    for (const [relativePath, contents] of Object.entries(secrets)) plant(repo, relativePath, contents);
+    // A sensitive file that was committed by mistake must still stay local.
+    plant(repo, "config/credentials.json", "{\"secret\":\"fake-committed-secret-9s0t1u\"}\n");
+    git(repo, "add", "-f", "config/credentials.json");
+    // A tracked file modified after the commit is uploaded with its working-tree content.
+    plant(repo, "README.md", "# tracked and modified\n");
+    plant(repo, "untracked-note.md", "not added yet\n");
+
+    const plan = await planPodWorkspaceStaging(repo, createProcessCommandRunner());
+    assert.deepEqual(plan.files, ["README.md", "scripts/run.sh", "src/index.ts"]);
+    assert.deepEqual(plan.excluded, ["config/credentials.json"]);
+    assert.deepEqual(plan.skipped, []);
+
+    const realRunner = createProcessCommandRunner();
+    let uploaded;
+    const { runner, calls } = createFakeRunner(async (executable, args) => {
+      if (executable === "git") return realRunner(executable, args);
+      if (executable === "scp") {
+        const source = args.at(-2);
+        assert.ok(source.endsWith("/."), source);
+        const stageRoot = source.slice(0, -2);
+        uploaded = {
+          files: listFilesRecursively(stageRoot),
+          contents: Object.fromEntries(listFilesRecursively(stageRoot).map((file) => [file, readFileSync(join(stageRoot, file), "utf8")])),
+          runMode: statSync(join(stageRoot, "scripts/run.sh")).mode & 0o777,
+        };
+      }
+      return { exitCode: 0 };
+    });
+    await withEnv({ RUNPOD_API_KEY: "rpa_podkey_ABCDEFG", RUNPOD_POD_ID: "pod42" }, async () => {
+      const backend = createRunpodPodBackend({ fetch: async () => new Response(RUNPOD_POD_JSON, { status: 200 }), runner });
+      const staged = await backend.stageWorkspace({ localPath: repo, sessionId: "sess" });
+      assert.match(staged.detail, /^copied 3 tracked files \(1 sensitive path excluded, 0 non-regular or missing entries skipped\) from /);
+    });
+
+    assert.deepEqual(uploaded.files, ["README.md", "scripts/run.sh", "src/index.ts"]);
+    assert.equal(uploaded.contents["README.md"], "# tracked and modified\n");
+    assert.equal(uploaded.runMode, 0o755, "file modes survive the staging copy");
+    const remoteArgs = calls.filter((call) => call.executable !== "git").flatMap((call) => call.args);
+    assert.deepEqual(calls.map((call) => call.executable), ["git", "ssh", "scp"]);
+    for (const relativePath of [...Object.keys(secrets), "config/credentials.json", "untracked-note.md"]) {
+      assert.ok(!uploaded.files.includes(relativePath), `${relativePath} reached the staged set`);
+      assert.ok(!remoteArgs.some((arg) => arg.includes(relativePath)), `${relativePath} appeared in an ssh or scp argument`);
+    }
+    const stagedText = Object.values(uploaded.contents).join("\n") + remoteArgs.join("\n");
+    const markers = [...Object.values(secrets), "fake-committed-secret-9s0t1u", "not added yet"]
+      .map((contents) => /fake-[a-z0-9-]+/.exec(contents)?.[0] ?? contents.trim());
+    assert.equal(markers.length, 8);
+    for (const marker of markers) {
+      assert.ok(!stagedText.includes(marker), `secret ${marker} reached the upload`);
+    }
+    assert.ok(!remoteArgs.some((arg) => arg.startsWith(`${repo}/`) || arg === `${repo}/.`), "scp never points at the repo root");
+
+    // The staging copy is private and removed after the upload.
+    const stageRoot = calls.find((call) => call.executable === "scp").args.at(-2).slice(0, -2);
+    assert.ok(!existsSync(stageRoot), "the temp staging copy is removed after scp");
+
+    // A workspace outside any git work tree is refused, never copied blindly.
+    const plain = mkdtempSync(join(tmpdir(), "grclanker-pod-plain-"));
+    try {
+      plant(plain, ".env", "PLANTED=fake-plain-secret\n");
+      const plainCalls = createFakeRunner(async (executable, args) => (executable === "git" ? realRunner(executable, args) : { exitCode: 0 }));
+      await withEnv({ RUNPOD_API_KEY: "rpa_podkey_ABCDEFG", RUNPOD_POD_ID: "pod42" }, async () => {
+        const backend = createRunpodPodBackend({ fetch: async () => new Response(RUNPOD_POD_JSON, { status: 200 }), runner: plainCalls.runner });
+        await assert.rejects(
+          () => backend.stageWorkspace({ localPath: plain, sessionId: "sess" }),
+          /git ls-files exited 128 for .*runpod-pod stages tracked files only/,
+        );
+      });
+      assert.deepEqual(plainCalls.calls.map((call) => call.executable), ["git"], "no ssh or scp call is made for a non-git workspace");
+    } finally {
+      rmSync(plain, { recursive: true, force: true });
+    }
+
+    for (const path of Object.keys(secrets)) assert.equal(isSensitiveStagingPath(path), true, path);
+    for (const path of ["nested/.env.local", "a/export/b.txt", "deep/oscal-workspace/y", "keys/server.pem", "id_ed25519", ".env/config"]) {
+      assert.equal(isSensitiveStagingPath(path), true, path);
+    }
+    for (const path of ["README.md", "src/exporter.ts", "environment.md", "id_ed25519.pub", "docs/env.md"]) {
+      assert.equal(isSensitiveStagingPath(path), false, path);
+    }
+    assert.ok(RUNPOD_STAGING_DENYLIST.includes("*service-account*.json"));
+  } finally {
+    rmSync(repo, { recursive: true, force: true });
+  }
 });
 
 test("runpod pod adapter rejects empty and traversal session ids at the boundary", async () => {
