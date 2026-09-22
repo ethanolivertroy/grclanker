@@ -1826,8 +1826,11 @@ function recordingCollector(overrides = {}) {
   };
 }
 
+const STATUS_TEXT = /^(complete|partial|unreadable|not collected|unknown)\b/;
+
 /**
- * No count or list renders 0, [], or "unknown" beside a status that says the data was unreadable, not collected, or unknown.
+ * No count or list renders 0, [], or "unknown" beside a status that says the data was unreadable, not collected, or unknown,
+ * a `<key>_status` never stands without its `<key>`, and a null beside a status must be explained by it (never `complete`).
  * Objects follow the `<key>` plus `<key>_status` and nested `status` conventions; evidence lines are checked as `Label: value`.
  */
 function assertNoFabricatedValues(value, label, path = "") {
@@ -1847,9 +1850,18 @@ function assertNoFabricatedValues(value, label, path = "") {
   if (value === null || typeof value !== "object") return;
   for (const [key, entry] of Object.entries(value)) {
     assert.notEqual(entry, "unknown", `${label}: ${path}.${key} is the "unknown" placeholder`);
-    if (typeof entry === "string" && UNAVAILABLE_STATUS.test(entry) && key.endsWith("_status")) {
+    if (typeof entry === "string" && STATUS_TEXT.test(entry) && key.endsWith("_status")) {
       const base = key.slice(0, -"_status".length);
-      if (base in value) assert.equal(value[base], null, `${label}: ${path}.${base} must be null beside status "${entry}"`);
+      assert.ok(base in value, `${label}: ${path}.${key} is a status without its count ${base}`);
+      if (UNAVAILABLE_STATUS.test(entry)) assert.equal(value[base], null, `${label}: ${path}.${base} must be null beside status "${entry}"`);
+    }
+    if (entry === null) {
+      const companion = value[`${key}_status`];
+      if (typeof companion === "string") {
+        assert.match(companion, UNAVAILABLE_STATUS, `${label}: ${path}.${key} is null but "${companion}" does not explain it`);
+      } else if (typeof value.status === "string") {
+        assert.doesNotMatch(value.status, /^complete: /, `${label}: ${path}.${key} is null beside a complete status "${value.status}"`);
+      }
     }
     if (key === "status" && typeof entry === "string" && UNAVAILABLE_STATUS.test(entry)) {
       for (const [sibling, siblingValue] of Object.entries(value)) {
@@ -1857,6 +1869,52 @@ function assertNoFabricatedValues(value, label, path = "") {
       }
     }
     assertNoFabricatedValues(entry, label, `${path}.${key}`);
+  }
+}
+
+/**
+ * The explicit count-to-status map: every count each snapshot summary carries, each paired with `<key>_status`; identity and
+ * admin_access also carry the `users_seen_partial_view` flag. `alerts_without_status` is itself a count, paired with
+ * `alerts_without_status_status`. A new snapshot field must be registered here before the sweep accepts it.
+ */
+const SNAPSHOT_COUNT_KEYS = {
+  identity: ["active_users", "privileged_users", "super_admins", "users_enforced_in_2sv", "dormant_active_users", "users_without_last_login", "two_step_policies"],
+  admin_access: ["privileged_users", "super_admins", "delegated_admins", "stale_privileged_users", "privileged_users_without_last_login", "group_role_assignments"],
+  integrations: ["sampled_users", "active_user_population", "privileged_users", "token_records", "privileged_token_records", "high_scope_token_records", "token_read_failures", "token_activity_records"],
+  monitoring: ["login_activity_records", "suspicious_login_signals", "admin_activity_records", "token_activity_records", "alerts_collected", "open_alerts", "alerts_without_status"],
+};
+const PARTIAL_VIEW_FLAG = "users_seen_partial_view";
+const PARTIAL_VIEW_CATEGORIES = new Set(["identity", "admin_access"]);
+
+/**
+ * Reads the snapshot from both sides: every key is a mapped count, that count's `_status` companion, or the partial-view flag;
+ * every mapped count is present as a number or null with its companion present; a null carries an unreadable or not-collected
+ * status and a number carries `complete` or `partial: at least N`. An orphan count, an orphan status, or an unmapped key fails.
+ */
+function assertSnapshotPaired(category, summary, label) {
+  const counts = SNAPSHOT_COUNT_KEYS[category];
+  assert.ok(counts, `${label}: ${category} has no entry in the count-to-status map`);
+  const companion = (key) => `${key}_status`;
+  const known = new Set([...counts, ...counts.map(companion), ...(PARTIAL_VIEW_CATEGORIES.has(category) ? [PARTIAL_VIEW_FLAG] : [])]);
+  for (const key of Object.keys(summary)) {
+    assert.ok(known.has(key), `${label}: ${category}.${key} is not in the count-to-status map (an orphan count or status)`);
+  }
+  for (const key of counts) {
+    assert.ok(key in summary, `${label}: ${category}.${key} is missing`);
+    const value = summary[key];
+    const status = summary[companion(key)];
+    assert.equal(typeof status, "string", `${label}: ${category}.${key} has no ${companion(key)} companion`);
+    assert.match(status, STATUS_TEXT, `${label}: ${category}.${companion(key)} = "${status}" is not a status`);
+    if (value === null) {
+      assert.match(status, UNAVAILABLE_STATUS, `${label}: ${category}.${key} is null but "${status}" does not explain it`);
+    } else {
+      assert.equal(typeof value, "number", `${label}: ${category}.${key} = ${JSON.stringify(value)} is neither a count nor null`);
+      if (status.startsWith("partial")) assert.match(status, new RegExp(`^partial: at least ${value}; `), `${label}: ${category}.${key} = ${value} but its bound reads "${status}"`);
+      else assert.match(status, /^complete: /, `${label}: ${category}.${key} = ${value} beside "${status}" (a count needs a complete or partial status)`);
+    }
+  }
+  if (PARTIAL_VIEW_CATEGORIES.has(category)) {
+    assert.match(summary[PARTIAL_VIEW_FLAG], /^(yes|no|unreadable \(|not collected \()/, `${label}: ${category}.${PARTIAL_VIEW_FLAG} = ${JSON.stringify(summary[PARTIAL_VIEW_FLAG])}`);
   }
 }
 
@@ -1886,30 +1944,85 @@ function assertStatusesMatchRequests(value, requested, label, path = "") {
   }
 }
 
-/** Evidence labels whose count is derived from each inventory; when that inventory failed, none of them may render an exact number. */
-const DIRECTORY_LABELS = [
-  "Privileged users", "Privileged users with isEnforcedIn2Sv=true", "Super admins", "Super admins with isEnforcedIn2Sv=true", "Super admins identified",
-  "Privileged users reviewed", "Suspended or archived privileged users", "Delegated admin users identified", "Total privileged users", "Privileged users identified",
-];
-const TOKEN_LABELS = ["Token records collected", "Privileged third-party tokens", "Third-party clients observed", "High-scope token records"];
-const EVIDENCE_LABELS_BY_SOURCE = {
-  users: [
-    "Users collected", "Active users", "Active users reviewed", "Users with isEnforcedIn2Sv=true", "Users with isEnrolledIn2Sv=true", "Users with isAdmin=true",
-    "Active users with no parseable lastLoginTime (reported separately, never counted as fresh)", "Users sampled for token inventory", ...DIRECTORY_LABELS, ...TOKEN_LABELS,
-  ],
-  roles: DIRECTORY_LABELS,
-  roleAssignments: ["Role assignments collected", "Role assignments reviewed", "Group role assignments", ...DIRECTORY_LABELS],
-  login: ["Login activity records collected", "Suspicious login signals"],
-  admin: ["Admin activities collected", "Admin activity records collected"],
-  token: ["Token activity records collected"],
-  alerts: ["Alerts collected", "Open alerts (metadata.status NOT_STARTED or IN_PROGRESS)", "Closed alerts (metadata.status CLOSED)", "Alerts without metadata.status (reported separately, never counted as closed)"],
-  policies: ["Policies returned", "Enforcement policies returned", "Enforcement policies with enforcedFrom at or before now", "Enrollment policies with allowEnrollment=false"],
-  tokens: TOKEN_LABELS,
+/**
+ * The explicit map for evidence: every label that renders a count, keyed to the inventories the count is derived from (an empty
+ * list marks a count of the run's own failed reads, which no denial can bound). A count line whose label is outside the map is an
+ * orphan; when a mapped label's inventory failed, its line may only render a bound or a status.
+ */
+const DIRECTORY_SOURCES = ["users", "roles", "roleAssignments"];
+const TOKEN_SOURCES = ["users", "tokens"];
+const EVIDENCE_COUNT_SOURCES = {
+  "Users collected": ["users"],
+  "Active users": ["users"],
+  "Active users reviewed": ["users"],
+  "Users with isEnforcedIn2Sv=true": ["users"],
+  "Users with isEnrolledIn2Sv=true": ["users"],
+  "Users with isAdmin=true": ["users"],
+  "Active users with no parseable lastLoginTime (reported separately, never counted as fresh)": ["users"],
+  "Dormant active users (lastLoginTime older than 90 days)": ["users"],
+  "Users sampled for token inventory": ["users"],
+  "Privileged users": DIRECTORY_SOURCES,
+  "Privileged users with isEnforcedIn2Sv=true": DIRECTORY_SOURCES,
+  "Super admins": DIRECTORY_SOURCES,
+  "Super admins with isEnforcedIn2Sv=true": DIRECTORY_SOURCES,
+  "Super admins identified": DIRECTORY_SOURCES,
+  "Privileged users reviewed": DIRECTORY_SOURCES,
+  "Suspended or archived privileged users": DIRECTORY_SOURCES,
+  "Delegated admin users identified": DIRECTORY_SOURCES,
+  "Total privileged users": DIRECTORY_SOURCES,
+  "Privileged users identified": DIRECTORY_SOURCES,
+  "Privileged users sampled": DIRECTORY_SOURCES,
+  "Privileged users with readable tokens.list": DIRECTORY_SOURCES,
+  "Role assignments pointing at users outside the collected listing": ["users", "roleAssignments"],
+  "Role assignments collected": ["roleAssignments"],
+  "Role assignments reviewed": ["roleAssignments"],
+  "Group role assignments": ["roleAssignments"],
+  "Token records collected": TOKEN_SOURCES,
+  "Privileged third-party tokens": TOKEN_SOURCES,
+  "Third-party clients observed": TOKEN_SOURCES,
+  "High-scope token records": TOKEN_SOURCES,
+  "Per-user token reads that failed": [],
+  "Login activity records collected": ["login"],
+  "Suspicious login signals": ["login"],
+  "Admin activities collected": ["admin"],
+  "Admin activity records collected": ["admin"],
+  "Admin activity pages read": ["admin"],
+  "Token activity records collected": ["token"],
+  "Alerts collected": ["alerts"],
+  "Alert pages read": ["alerts"],
+  "Open alerts (metadata.status NOT_STARTED or IN_PROGRESS)": ["alerts"],
+  "Closed alerts (metadata.status CLOSED)": ["alerts"],
+  "Alerts without metadata.status (reported separately, never counted as closed)": ["alerts"],
+  "Policies returned": ["policies"],
+  "Enforcement policies returned": ["policies"],
+  "Enforcement policies with enforcedFrom at or before now": ["policies"],
+  "Enrollment policies with allowEnrollment=false": ["policies"],
 };
+/** The map read from the source side: the labels whose count depends on each inventory. */
+const EVIDENCE_LABELS_BY_SOURCE = Object.entries(EVIDENCE_COUNT_SOURCES).reduce((bySource, [evidenceLabel, sources]) => {
+  for (const source of sources) (bySource[source] ??= []).push(evidenceLabel);
+  return bySource;
+}, {});
+/** A count line: a bare number (`4`, `2 of 4`) or a bound (`at least 4 (...)`). */
+const COUNT_VALUE = /^(\d+(\s|$)|at least \d+)/;
+/** `<endpoint> error: 403 Forbidden (...)` is the projected error of an unreadable finding; its value begins with an HTTP status, not a count. */
+const ERROR_LINE_LABEL = /\berror$/;
+
+/** Every evidence line that renders a count carries a label registered in the count-to-source map, so no count can appear that no denial scenario governs. */
+function assertEvidenceCountsMapped(findings, label) {
+  for (const finding of findings) {
+    for (const line of finding.evidence) {
+      const match = EVIDENCE_LINE.exec(line);
+      if (!match || ERROR_LINE_LABEL.test(match[1]) || !COUNT_VALUE.test(match[2])) continue;
+      assert.ok(match[1] in EVIDENCE_COUNT_SOURCES, `${label}: ${finding.id} renders the count line "${line}" whose label is not in the count-to-source map`);
+    }
+  }
+}
 
 /** Every evidence line whose label depends on the failed inventory reads `at least N (...)`, `unreadable (...)`, or `not collected (...)`, never a bare number. */
 function assertDependentLinesAreBounded(findings, source, label) {
   const labels = new Set(EVIDENCE_LABELS_BY_SOURCE[source]);
+  assert.ok(labels.size > 0, `${label}: no evidence label is mapped to ${source}`);
   for (const finding of findings) {
     for (const line of finding.evidence) {
       const match = EVIDENCE_LINE.exec(line);
@@ -2023,16 +2136,15 @@ test("null standard: every snapshot count derived from a denied inventory render
     assert.match(snapshotSummary.token_read_failures_status, /^complete: Directory tokens\.list was attempted for 4 sampled user\(s\) of 4 active users$/, source);
   }
 
-  // The readable baseline keeps exact counts, a complete status on every field, and `no` for the partial-view flag.
-  // A status key is `<field>_status` for a field that exists; `alerts_without_status` is itself a count.
+  // The readable baseline keeps exact counts, a complete status on every mapped field, and `no` for the partial-view flag.
   const baseline = snapshotByCategory(assessAll(await collectGwsAuditData(createFakeCollector()), config));
   for (const [category, assessment] of Object.entries(baseline)) {
-    for (const [key, value] of Object.entries(assessment.snapshotSummary)) {
-      const isStatusKey = key.endsWith("_status") && key.slice(0, -"_status".length) in assessment.snapshotSummary;
-      if (isStatusKey) assert.match(value, /^complete: /, `${category}.${key}`);
-      else if (key === "users_seen_partial_view") assert.equal(value, "no", `${category}.${key}`);
-      else assert.equal(typeof value, "number", `${category}.${key} = ${JSON.stringify(value)}`);
+    assertSnapshotPaired(category, assessment.snapshotSummary, "baseline");
+    for (const key of SNAPSHOT_COUNT_KEYS[category]) {
+      assert.equal(typeof assessment.snapshotSummary[key], "number", `${category}.${key} = ${JSON.stringify(assessment.snapshotSummary[key])}`);
+      assert.match(assessment.snapshotSummary[`${key}_status`], /^complete: /, `${category}.${key}_status`);
     }
+    if (PARTIAL_VIEW_CATEGORIES.has(category)) assert.equal(assessment.snapshotSummary.users_seen_partial_view, "no", category);
   }
   assert.equal(baseline.monitoring.snapshotSummary.alerts_without_status, 0);
   assert.match(baseline.monitoring.snapshotSummary.alerts_without_status_status, /^complete: Alert Center alerts\.list returned/);
@@ -2196,6 +2308,9 @@ test("null standard sweep: 34 denial scenarios render no fabricated value and no
     const findings = assessments.flatMap((assessment) => assessment.findings);
     assertNoFabricatedValues(assessments.map((assessment) => assessment.snapshotSummary), `${label}: snapshots`);
     assertNoFabricatedValues(findings.map((finding) => finding.evidence), `${label}: evidence`);
+    // Both directions: every count has its status and every status has its count, in the snapshots and in the evidence.
+    for (const assessment of assessments) assertSnapshotPaired(assessment.category, assessment.snapshotSummary, `${label}: snapshots`);
+    assertEvidenceCountsMapped(findings, `${label}: evidence`);
     assertStatusesMatchRequests(assessments.map((assessment) => assessment.snapshotSummary), requested, `${label}: snapshots`);
     assertStatusesMatchRequests(findings.map((finding) => finding.evidence), requested, `${label}: evidence`);
     for (const [name, file] of coreData) {
@@ -2250,6 +2365,8 @@ test("null standard sweep: 34 denial scenarios render no fabricated value and no
   const withoutPolicies = assessGwsIdentity({ ...baselineData.identity, twoStepPolicies: undefined }, config);
   assertNoFabricatedValues([withoutPolicies.snapshotSummary], "policy dataset undefined: snapshot");
   assertNoFabricatedValues(withoutPolicies.findings.map((finding) => finding.evidence), "policy dataset undefined: evidence");
+  assertSnapshotPaired("identity", withoutPolicies.snapshotSummary, "policy dataset undefined: snapshot");
+  assertEvidenceCountsMapped(withoutPolicies.findings, "policy dataset undefined: evidence");
   assert.equal(withoutPolicies.snapshotSummary.two_step_policies, null);
   assert.equal(withoutPolicies.snapshotSummary.two_step_policies_status, "not collected: Cloud Identity policies.list was not queried in this run");
   assert.equal(findingById(withoutPolicies, "GWS-ID-005").status, "Manual");
@@ -2262,6 +2379,24 @@ test("null standard sweep: 34 denial scenarios render no fabricated value and no
   assert.throws(() => assertNoFabricatedValues([["Token records collected: 0 (unreadable Directory tokens.list)"]], "old line shape"), /renders a value beside an unavailable status/);
   assert.throws(() => assertStatusesMatchRequests([{ sampled_users_status: `complete: ${ENDPOINT.tokens} was attempted for 4 sampled user(s)` }], new Set([ENDPOINT.users]), "unrequested"), /was never requested/);
   assert.throws(() => assertDependentLinesAreBounded([{ id: "X", evidence: ["Token records collected: 0"] }], "tokens", "bare zero"), /renders "Token records collected: 0" while tokens failed/);
+
+  // The guards read from the count side too: an orphan count, an orphan status, a null with a complete status, and an unmapped evidence count all fail.
+  const monitoring = snapshotByCategory(baselineAssessments).monitoring.snapshotSummary;
+  assert.throws(() => assertSnapshotPaired("monitoring", { ...monitoring, alerts_probe_count: 0 }, "orphan count"), /alerts_probe_count is not in the count-to-status map/);
+  assert.throws(() => assertSnapshotPaired("monitoring", { orphan_count: 0 }, "orphan only"), /orphan_count is not in the count-to-status map/);
+  const { alerts_collected_status: droppedStatus, ...withoutStatus } = monitoring;
+  assert.throws(() => assertSnapshotPaired("monitoring", withoutStatus, "count without status"), /alerts_collected has no alerts_collected_status companion/);
+  const { alerts_collected: droppedCount, ...withoutCount } = monitoring;
+  assert.throws(() => assertSnapshotPaired("monitoring", withoutCount, "status without count"), /alerts_collected is missing/);
+  assert.throws(() => assertNoFabricatedValues([{ renamed_count: 0, active_users_status: `unreadable: ${ENDPOINT.users} (403)` }], "renamed"), /active_users_status is a status without its count active_users/);
+  assert.throws(() => assertSnapshotPaired("monitoring", { ...monitoring, alerts_collected: null }, "null with complete"), /alerts_collected is null but "complete: .*" does not explain it/);
+  assert.throws(() => assertNoFabricatedValues([{ active_users: null, active_users_status: `complete: ${ENDPOINT.users} returned 4 record(s)` }], "null with complete"), /active_users is null but "complete: .*" does not explain it/);
+  assert.throws(() => assertNoFabricatedValues([{ status: `complete: ${ENDPOINT.users} returned 4 record(s)`, data: null }], "null core_data with complete"), /data is null beside a complete status/);
+  assert.throws(() => assertSnapshotPaired("monitoring", { ...monitoring, alerts_collected: 3, alerts_collected_status: `unreadable: ${ENDPOINT.alerts} (403)` }, "count with unreadable"), /alerts_collected = 3 beside "unreadable/);
+  assert.throws(() => assertSnapshotPaired("monitoring", { ...monitoring, alerts_collected: 3, alerts_collected_status: `partial: at least 2; ${ENDPOINT.alerts} stopped` }, "bound mismatch"), /alerts_collected = 3 but its bound reads/);
+  assert.throws(() => assertEvidenceCountsMapped([{ id: "X", evidence: ["Alert probes attempted: 0"] }], "orphan line"), /"Alert probes attempted: 0" whose label is not in the count-to-source map/);
+  assert.equal(typeof droppedStatus, "string");
+  assert.equal(typeof droppedCount, "number");
 });
 
 test("resolveSecureOutputPath rejects traversal and symlink parents", () => {
