@@ -570,8 +570,8 @@ const ERROR_URL_PATTERN = /\b(https?:\/\/)(?:[^\s/@"'<>]+@)?([^\s?#"'<>]+)(\?[^\
 
 /**
  * Rule 9 scrub boundary for bare values. A run of 16 or more token characters is removed when it is shaped
- * like a token (base64 symbols, digits scattered through its letters, or casing that changes more often than
- * once every three letters) and kept when it is shaped like a name: "-" or "_" separated segments that are
+ * like a token (base64 symbols, digits scattered through its letters, or casing that breaks into one- and
+ * two-letter camelCase pieces) and kept when it is shaped like a name: "-" or "_" separated segments that are
  * each letters in any casing, digits alone, or letters with one digit group (`prod-us-east-2026`,
  * `AWSLambdaBasicExecutionRole`, `sha256`), an uppercase code, or a canonical UUID. "/", ".", ":", "@", and
  * whitespace end a run, so path segments, hostnames, ARNs, and emails are judged piece by piece. Opaque
