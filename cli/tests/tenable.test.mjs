@@ -324,7 +324,10 @@ test("resolveTenableConfiguration treats non-cloud URLs as Tenable Security Cent
   assert.equal(both.securityCenter.baseUrl, "https://sc.example.internal");
 
   assert.throws(() => resolveTenableConfiguration({ config_file: EMPTY_CONFIG_FILE }, EMPTY_ENV), /TENABLE_ACCESS_KEY and TENABLE_SECRET_KEY/);
-  assert.throws(() => resolveTenableConfiguration({ url: "https://sc.example.internal", config_file: EMPTY_CONFIG_FILE }, EMPTY_ENV), /needs API keys/);
+  assert.throws(() => resolveTenableConfiguration({ url: "https://sc.example.internal", config_file: EMPTY_CONFIG_FILE }, EMPTY_ENV), (error) => {
+    assert.equal(error.message, "Tenable Security Center at https://sc.example.internal needs API keys. Set TENABLE_SC_ACCESS_KEY and TENABLE_SC_SECRET_KEY (or TENABLE_ACCESS_KEY and TENABLE_SECRET_KEY when TENABLE_URL points at Security Center).");
+    return true;
+  });
 });
 
 test("round 7(b): environment credentials survive an argument overlay that carries unrelated or undefined keys, and the source chain names the environment", () => {
@@ -1409,6 +1412,34 @@ test("round 7(a): every fixed text emitted on refused, unavailable, failed, capp
       corpus.push(error.message);
       return true;
     });
+  }
+
+  // Reviewer E gap 3: the resolver texts name the variables to set, and "keys: set ..." read
+  // as a credential pair once, so the remediation sentence was withheld from the operator.
+  // Each resolver text is the identity under both scrubs and reaches the tool result whole.
+  const scNoKeys = "Tenable Security Center at https://sc.example.internal needs API keys. Set TENABLE_SC_ACCESS_KEY and TENABLE_SC_SECRET_KEY (or TENABLE_ACCESS_KEY and TENABLE_SECRET_KEY when TENABLE_URL points at Security Center).";
+  const vmNoKeys = "TENABLE_ACCESS_KEY and TENABLE_SECRET_KEY (or access_key and secret_key arguments) are required for Tenable Vulnerability Management.";
+  const noPlatform = "No Tenable platform resolved. Set TENABLE_URL to cloud.tenable.com, fedcloud.tenable.com, or a Tenable Security Center URL.";
+  for (const text of [scNoKeys, vmNoKeys, noPlatform]) {
+    assert.equal(redactErrorText(text), text, `resolver text survives the general scrub: ${text}`);
+    assert.equal(redactCredentialValueText(text), text, `resolver text survives the data scrub: ${text}`);
+    corpus.push(text);
+  }
+  const registeredTools = [];
+  registerTenableTools({ registerTool: (tool) => registeredTools.push(tool) });
+  const checkAccessTool = registeredTools.find((tool) => tool.name === "tenable_check_access");
+  for (const [args, text] of [
+    [{ url: "https://sc.example.internal", config_file: EMPTY_CONFIG_FILE }, scNoKeys],
+    [{ url: "https://cloud.tenable.com", config_file: EMPTY_CONFIG_FILE }, vmNoKeys],
+  ]) {
+    assert.throws(() => resolveTenableConfiguration(args, EMPTY_ENV), (error) => {
+      assert.equal(error.message, text);
+      return true;
+    });
+    const result = await checkAccessTool.execute("call-resolver-text", checkAccessTool.prepareArguments(args));
+    assert.equal(result.isError, true);
+    assert.ok(JSON.stringify(result).includes(JSON.stringify(`Tenable access check failed: ${text}`).slice(1, -1)), `the tool result carries the whole resolver text: ${JSON.stringify(result)}`);
+    assert.ok(!JSON.stringify(result).includes("[REDACTED]"), "no marker with nothing planted");
   }
 
   // Positive controls: the fixtures reach every family of fixed text the rule names.

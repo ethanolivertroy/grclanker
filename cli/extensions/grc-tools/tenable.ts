@@ -1251,7 +1251,9 @@ export function resolveTenableConfiguration(
     const scAccess = scAccessKey.value ?? (primaryIsCloud ? undefined : accessKey.value);
     const scSecret = scSecretKey.value ?? (primaryIsCloud ? undefined : secretKey.value);
     if (!scAccess || !scSecret) {
-      throw new Error(`Tenable Security Center at ${resolvedScUrl} needs API keys: set TENABLE_SC_ACCESS_KEY and TENABLE_SC_SECRET_KEY (or TENABLE_ACCESS_KEY and TENABLE_SECRET_KEY when TENABLE_URL points at Security Center).`);
+      // A full stop, not a colon, after "keys": the pair rule reads "keys: <text>" as a
+      // credential assignment and would withhold the remediation sentence.
+      throw new Error(`Tenable Security Center at ${resolvedScUrl} needs API keys. Set TENABLE_SC_ACCESS_KEY and TENABLE_SC_SECRET_KEY (or TENABLE_ACCESS_KEY and TENABLE_SECRET_KEY when TENABLE_URL points at Security Center).`);
     }
     if (scUrl.source) sourceChain.push(scUrl.source);
     sourceChain.push(scAccessKey.source ?? accessKey.source ?? "", scSecretKey.source ?? secretKey.source ?? "");
