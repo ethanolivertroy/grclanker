@@ -46,7 +46,7 @@ import {
   parserSnippetBody,
   shortBodyResponse,
 } from "./helpers/error-canaries.mjs";
-import { assertFixedTextsSurvive, assertMustKeepRows, assertMustRedactRowsBesideMustKeep } from "./helpers/redaction-table.mjs";
+import { QUOTED_NON_CREDENTIAL_GROUP, assertFixedTextsSurvive, assertMustKeepRows, assertMustRedactRowsBesideMustKeep } from "./helpers/redaction-table.mjs";
 
 function createTempBase(prefix) {
   return mkdtempSync(join(tmpdir(), prefix));
@@ -1403,6 +1403,7 @@ test("rule 9 must-keep and must-redact table (addendum 7): every endpoint path, 
       values: cloudflareFixedTexts(),
       sentence: (value) => `CF-IAM-04: ${value}`,
     },
+    QUOTED_NON_CREDENTIAL_GROUP,
   ];
   assertMustKeepRows(assert, redactErrorText, groups);
   assertMustRedactRowsBesideMustKeep(assert, redactErrorText, groups);

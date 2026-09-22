@@ -722,13 +722,35 @@ function scrubConfiguredSecrets(text: string): string {
 }
 
 const ERROR_CREDENTIAL_KEY_PATTERN =
-  "[A-Za-z0-9_.-]*(?:token|secret|passw(?:or)?d|pwd|api[_-]?key|apikey|session(?:[_-]?id)?|sid|cookie|csrftoken|authorization|auth|signature|sig|nonce|credentials?|access[_-]?key|private[_-]?key|skey)";
+  "[A-Za-z0-9_.-]*(?:token|secret|passw(?:or)?d|pwd|api[_-]?key|apikey|auth[_-]?key|auth[_-]?email|session(?:[_-]?id)?|sid|cookie|csrftoken|authorization|auth|signature|sig|nonce|credentials?|access[_-]?key|private[_-]?key|skey)";
 // key=value, key: value, and "key":"value" pairs whose key names a credential; the value's shape decides below.
 const ERROR_CREDENTIAL_PAIR_PATTERN = new RegExp(
   `\\b(${ERROR_CREDENTIAL_KEY_PATTERN})(["']?\\s*[=:]\\s*["']?)((?:(?:Bearer|Basic|Digest|Token|ApiKey)\\s+)?[^\\s"'&;,<>]+)`,
   "gi",
 );
 const TRAILING_PUNCTUATION_PATTERN = /[.!?:)]+$/;
+
+const ERROR_SCHEME_PATTERN = "(?:Bearer|Basic|Digest|Negotiate|SSWS|Token|ApiKey|Api-Key)";
+/**
+ * A quoted value: the opening quote (plain, or JSON-escaped when the message was itself serialized) with its
+ * quote character captured, the value up to the matching close quote (so it may hold spaces and the other quote
+ * character), and the close quote. Both patterns below place it after two capturing groups, so the quote
+ * character is group 4 and the close quote group 5.
+ */
+const ERROR_QUOTED_VALUE_PATTERN = String.raw`(\\?(["']))(?:(?!\\?\4)[^\n\\])+(\\?\4)`;
+/**
+ * Codex P1 (quoted header value). `X-Api-Key: "value"`, `Cookie: sid='value'`, `Authorization: Bearer "value"`,
+ * `\"X-Auth-Key\":\"value\"`: with or without spaces, single or double quotes, plain or JSON-escaped. The quotes
+ * delimit the carrier, so the quoted value is removed whole whatever its shape; the pair rule above stops at the
+ * opening quote and would judge a short or name-shaped value ("key", "prod-key") as prose. The header name, the
+ * separator, the scheme, and the quotes stay so the message remains diagnosable.
+ */
+const ERROR_QUOTED_CREDENTIAL_PATTERN = new RegExp(
+  String.raw`\b(${ERROR_CREDENTIAL_KEY_PATTERN})((?:\\?["'])?\s*[=:]\s*(?:${ERROR_SCHEME_PATTERN}\s+)?)${ERROR_QUOTED_VALUE_PATTERN}`,
+  "gi",
+);
+const ERROR_QUOTED_SCHEME_PATTERN = new RegExp(String.raw`\b(${ERROR_SCHEME_PATTERN})(\s+)${ERROR_QUOTED_VALUE_PATTERN}`, "gi");
+const QUOTED_VALUE_REPLACEMENT = `$1$2$3${REDACTED_ERROR_VALUE}$5`;
 
 /**
  * A value after a credential-named key is the credential (whatever its shape) when it is at least six
@@ -750,6 +772,16 @@ function scrubCredentialPairs(text: string): string {
 }
 
 const ERROR_TEXT_PATTERNS: ReadonlyArray<readonly [RegExp, string]> = [
+  // Carriers first, whatever the value's shape, so the shape rules below only ever see the marker. Cookie headers
+  // carry session values in free form and are consumed through the end of the line; Cloudflare's legacy
+  // X-Auth-Key / X-Auth-Email pair (the global API key and its account) is consumed the same way, quotes
+  // included (round 4 item F). Both rules skip a value that is already the marker so a second pass over a
+  // scrubbed message leaves the text after the marker alone.
+  [/\b(set-cookie|cookie)(\s*[:=]\s*)(?!\s*\[REDACTED\])[^\n<>]+/gi, `$1$2${REDACTED_ERROR_VALUE}`],
+  [/\b(x-auth-(?:key|email))(\s*[:=]\s*)(?!\s*\[REDACTED\])[^\n<>]+/gi, `$1$2${REDACTED_ERROR_VALUE}`],
+  // Quoted header and pair values next, whatever their shape, so the scheme and pair rules see the marker.
+  [ERROR_QUOTED_CREDENTIAL_PATTERN, QUOTED_VALUE_REPLACEMENT],
+  [ERROR_QUOTED_SCHEME_PATTERN, QUOTED_VALUE_REPLACEMENT],
   // Authorization scheme values wherever they appear (headers, cookies, HTML, JSON messages); the value must be
   // long, carry a digit or base64 symbol, or change case inside the word, so prose such as "Basic authentication"
   // and "Bearer Token" stays.
@@ -765,8 +797,6 @@ const ERROR_TEXT_PATTERNS: ReadonlyArray<readonly [RegExp, string]> = [
   // Long blobs must carry a digit so camelCase identifiers survive.
   [/(?<![A-Za-z0-9+_=-])(?=[A-Za-z0-9+_-]*\d)[A-Za-z0-9+_-]{40,}={0,2}(?![A-Za-z0-9+_=-])/g, REDACTED_ERROR_VALUE],
   [/\b[a-f0-9]{32,}\b/gi, REDACTED_ERROR_VALUE],
-  // Cookie headers carry session values in free form.
-  [/\b(set-cookie|cookie)(\s*[:=]\s*)[^\n<>]+/gi, `$1$2${REDACTED_ERROR_VALUE}`],
 ];
 
 // URL userinfo and query strings anywhere in the string, not only when the string starts with a URL.

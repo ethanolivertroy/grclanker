@@ -57,7 +57,7 @@ import {
   parserSnippetBody,
   shortBodyResponse,
 } from "./helpers/error-canaries.mjs";
-import { assertFixedTextsSurvive, assertMustKeepRows, assertMustRedactRowsBesideMustKeep } from "./helpers/redaction-table.mjs";
+import { QUOTED_NON_CREDENTIAL_GROUP, assertFixedTextsSurvive, assertMustKeepRows, assertMustRedactRowsBesideMustKeep } from "./helpers/redaction-table.mjs";
 import { getRegisteredToolSummaries, groupRegisteredTools } from "../dist/pi/tool-catalog.js";
 import { readBundleFiles, readZipEntries } from "./helpers/bundle-contents.mjs";
 
@@ -648,6 +648,7 @@ test("rule 9 must-keep and must-redact table (addendum 7): every endpoint path, 
       values: azureFixedTexts(),
       sentence: (value) => `AZURE-ID-01 ${value}`,
     },
+    QUOTED_NON_CREDENTIAL_GROUP,
   ];
   assertMustKeepRows(assert, redactErrorText, groups);
   assertMustRedactRowsBesideMustKeep(assert, redactErrorText, groups);

@@ -58,7 +58,7 @@ import {
   parserMessageFor,
   parserSnippetBody,
 } from "./helpers/error-canaries.mjs";
-import { assertFixedTextsSurvive, assertMustKeepRows, assertMustRedactRowsBesideMustKeep } from "./helpers/redaction-table.mjs";
+import { QUOTED_NON_CREDENTIAL_GROUP, assertFixedTextsSurvive, assertMustKeepRows, assertMustRedactRowsBesideMustKeep } from "./helpers/redaction-table.mjs";
 
 const NOW = new Date("2026-09-21T00:00:00.000Z");
 const SUPERUSER = { id: 1, username: "auditor", is_superuser: true, is_system_auditor: false };
@@ -1816,6 +1816,7 @@ test("rule 9 must-keep and must-redact table (addendum 7): every endpoint path, 
       values: ansibleFixedTexts(),
       sentence: (value) => `AAP-RBAC-02: ${value}`,
     },
+    QUOTED_NON_CREDENTIAL_GROUP,
   ];
   assertMustKeepRows(assert, redactErrorText, groups);
   assertMustRedactRowsBesideMustKeep(assert, redactErrorText, groups);

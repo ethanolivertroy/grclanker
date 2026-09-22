@@ -9,7 +9,7 @@
  * beside a must-keep row inside one sentence, and the canary must vanish window by window while the row and
  * the rest of the sentence survive whole.
  */
-import { CANARY_VALUES, assertNoCanaryWindows, carrierCases } from "./error-canaries.mjs";
+import { CANARY_VALUES, QUOTED_NON_CREDENTIAL_TEXTS, assertNoCanaryWindows, carrierCases } from "./error-canaries.mjs";
 
 /**
  * @typedef {object} MustKeepGroup
@@ -17,6 +17,17 @@ import { CANARY_VALUES, assertNoCanaryWindows, carrierCases } from "./error-cana
  * @property {readonly string[]} values distinct must-keep rows
  * @property {(value: string) => string} sentence a realistic summary sentence that embeds one row
  */
+
+/**
+ * Must-keep group shared by every integration (Codex P1 control): quoted header and JSON values that name no
+ * credential survive, while the quoted credential carriers in carrierCases are removed beside them.
+ * @type {MustKeepGroup}
+ */
+export const QUOTED_NON_CREDENTIAL_GROUP = Object.freeze({
+  label: "quoted non-credential headers (Codex P1 control)",
+  values: QUOTED_NON_CREDENTIAL_TEXTS,
+  sentence: (value) => `the 502 response carried ${value} and a non-JSON body (text/html, 5120 bytes)`,
+});
 
 /** Asserts each must-keep row survives the scrub unchanged, in isolation and inside its group's sentence. */
 export function assertMustKeepRows(assert, redact, groups) {
