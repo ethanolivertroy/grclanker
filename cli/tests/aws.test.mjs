@@ -49,6 +49,7 @@ import {
   withSdkRoutes,
 } from "./helpers/aws-sdk-fixture.mjs";
 import { assertSecretsAbsent, readBundleFiles, readZipEntries } from "./helpers/bundle-contents.mjs";
+import { assertRedactionCases } from "./helpers/error-canaries.mjs";
 
 function createTempBase(prefix) {
   return mkdtempSync(join(tmpdir(), prefix));
@@ -1791,7 +1792,7 @@ test("rule 1 corollary: assessAwsOrgGuardrails never passes a control whose seco
   assertOnlyDemoted(findingsAll, { "AWS-ORG-04": "manual" }, "ListFindings denied for the only analyzer");
   assert.match(findingById(findingsAll, "AWS-ORG-04").summary, /Findings could not be read for any of the 1 active analyzer\(s\) \(access-analyzer:ListFindings org-analyzer: AccessDenied/);
   assert.doesNotMatch(findingById(findingsAll, "AWS-ORG-04").summary, /No active Access Analyzer findings/);
-  assert.deepEqual(findingById(findingsAll, "AWS-ORG-04").evidence.analyzers_sampled, []);
+  assert.equal(findingById(findingsAll, "AWS-ORG-04").evidence.analyzers_sampled, null, "no analyzer was sampled, so the list is unread rather than empty");
   assert.deepEqual(findingById(findingsAll, "AWS-ORG-04").evidence.analyzers_findings_unreadable, ["org-analyzer"]);
   assert.equal(findingById(findingsAll, "AWS-ORG-03").status, "pass", "the analyzer list itself stays readable evidence");
 
@@ -2283,24 +2284,29 @@ function assertNoCanaries(text, label) {
 }
 
 test("rule 9: redactErrorText scrubs authorization values, JWTs, AWS key ids and secrets, cookie and api key pairs, and URL userinfo and query strings anywhere in the text", () => {
+  assertRedactionCases(assert, redactErrorText);
+
+  // The AWS-specific shapes: an SDK message that echoes the signing identity, request context, and a
+  // proxy header block, with the cookie header on its own line as HTTP writes it.
   const jwt = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJhdWRpdG9yIn0.c2lnbmF0dXJlLXZhbHVlLWhlcmU";
   const text = [
-    `Authorization: Bearer ${AWS_CANARIES.bearer} was rejected; Basic ${Buffer.from("auditor:s3cr3t-pass-99").toString("base64")} also failed.`,
-    `Token ${jwt} expired.`,
+    `Authorization: Bearer ${AWS_CANARIES.bearer} was rejected; Basic ${Buffer.from("auditor:s3cr3t-pass-99").toString("base64")} also failed. Token ${jwt} expired.`,
     `Signed with ${AWS_CANARIES.accessKeyId} and ${AWS_CANARIES.secretKey}; x-api-key: ${AWS_CANARIES.apiKey}; session_id=${AWS_CANARIES.session}.`,
-    `Set-Cookie: AWSALB=${AWS_CANARIES.session}; Path=/`,
     `Retry at ${CANARY_URL} or https://auditor:hunter2-pass@api.example.com/v1/y?sig=abcdef0123456789 later.`,
-  ].join(" ");
+    `Set-Cookie: AWSALB=${AWS_CANARIES.session}; Path=/`,
+  ].join("\n");
 
   const scrubbed = redactErrorText(text);
   assertNoCanaries(scrubbed, "redactErrorText");
   for (const secret of [jwt, "hunter2-pass", "auditor:hunter2-pass", "sig=abcdef0123456789", Buffer.from("auditor:s3cr3t-pass-99").toString("base64")]) {
     assert.ok(!scrubbed.includes(secret), `${secret} survived redaction: ${scrubbed}`);
   }
-  assert.match(scrubbed, /Bearer \[REDACTED\]/);
-  assert.match(scrubbed, /Basic \[REDACTED\]/);
-  assert.match(scrubbed, /https:\/\/api\.example\.com\/v1\/x\?\[REDACTED\]/, "the URL host and path survive while the query is replaced");
-  assert.match(scrubbed, /https:\/\/api\.example\.com\/v1\/y\?\[REDACTED\]/, "URL userinfo is dropped and the query replaced even mid-sentence");
+  assert.match(scrubbed, /Bearer \[REDACTED\] was rejected/);
+  assert.match(scrubbed, /Basic \[REDACTED\] also failed/);
+  assert.match(scrubbed, /Signed with \[REDACTED\] and \[REDACTED\]; x-api-key: \[REDACTED\]; session_id=\[REDACTED\]/, "AWS key ids, secrets, api key and session pairs are replaced in place");
+  assert.match(scrubbed, /https:\/\/api\.example\.com\/v1\/x\?\[REDACTED\] or/, "the URL host and path survive while the query is replaced");
+  assert.match(scrubbed, /https:\/\/api\.example\.com\/v1\/y\?\[REDACTED\] later\./, "URL userinfo is dropped and the query replaced even mid-sentence");
+  assert.match(scrubbed, /Set-Cookie: \[REDACTED\]$/, "the cookie header keeps its name and loses its whole value");
   assert.equal(redactErrorText("Basic authentication is required; Invalid token."), "Basic authentication is required; Invalid token.", "prose after a scheme word or credential noun is left alone");
 });
 
@@ -2472,9 +2478,14 @@ test("rule 1 corollary: AWS-DATA-11 renders null, a marker, and no uncovered buc
 
   const unset = await withSdkRoutes({ ...healthySdkRoutes(), "s3control:GetPublicAccessBlock": () => { throw sdkAccessDenied("NoSuchPublicAccessBlockConfiguration", 404); } }, [], () => assessAwsDataProtection(realAwsClient()));
   const unsetFinding = findingById(unset, "AWS-DATA-11");
-  assert.equal(unsetFinding.status, "pass", "a readable NoSuchPublicAccessBlockConfiguration is a fact; every bucket carries its own full block here");
+  assert.equal(unsetFinding.status, "fail", "a readable NoSuchPublicAccessBlockConfiguration is a fact about the account block, so the control fails on evidence");
+  assert.match(unsetFinding.summary, /^Account-level S3 Block Public Access is not configured \(S3 Control returned NoSuchPublicAccessBlockConfiguration\); 0\/1 buckets lack a full bucket-level block/);
+  assert.equal(unsetFinding.evidence.account_block_readable, true, "a NoSuchPublicAccessBlockConfiguration answer is a completed read");
   assert.equal(unsetFinding.evidence.account_block_configured, false);
-  assert.deepEqual(unsetFinding.evidence.buckets_without_full_block, []);
+  assert.equal(unsetFinding.evidence.account_flags.collected, undefined, "a completed read is not a not-collected marker");
+  assert.ok(Object.values(unsetFinding.evidence.account_flags).every((flag) => flag === undefined), "no flag is set when the configuration is absent");
+  assert.deepEqual(unsetFinding.evidence.buckets_without_full_block, [], "the coverage list is a real empty list here: every bucket carries its own full block");
+  assert.equal(unset.summary.buckets_without_full_block, 0);
 });
 
 function recordedActions(log) {
@@ -2515,7 +2526,9 @@ test("request matching: every IAM action and HTTP status named in any output cor
   const text = [JSON.stringify(outputs), ...readBundleFiles(exported.outputDir).values()].join("\n");
   const actions = namedActions(text);
   const statuses = namedStatuses(text);
-  assert.ok(actions.size >= 20, `the outputs name the commands the run issued, saw ${actions.size}`);
+  for (const action of [...Object.keys(ACCESS_PROBES), "iam:ListAccessKeys", "kms:ListKeys", "organizations:ListAccounts", "ec2:DescribeFlowLogs"]) {
+    assert.ok(actions.has(action), `the outputs name ${action}: every probe carries its command and every failed read names the command that failed`);
+  }
   assert.ok(statuses.has(403) && statuses.has(502) && statuses.has(503), "the outputs name the observed failure statuses");
   assert.ok(!statuses.has(200), "successful responses are not described as failures");
   const requested = recordedActions(log);
