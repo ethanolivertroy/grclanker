@@ -23,6 +23,7 @@ import {
   exportServicenowAuditBundle,
   listServicenowControls,
   mappingsForControl,
+  FOREIGN_NEXT_LINK_REASON,
   parseLinkNext,
   projectAclRow,
   projectRows,
@@ -1597,6 +1598,39 @@ test("ServicenowApiClient stops on a Link rel=next whose offset does not advance
   assert.ok(result.errors.some((issue) => /offset did not advance/.test(issue)));
 });
 
+test("ServicenowApiClient never follows a Link rel=next that points at another origin: no request leaves with the credential and the read is truncated with the reason (CodeRabbit a)", async () => {
+  const fixture = healthyFixture();
+  fixture.tables.sys_user = Array.from({ length: 6 }, (_, index) => user(`u-${index}`, `user${index}`));
+  const inner = fixtureFetch(fixture);
+  const hosts = new Set();
+  const paged = overrideTablePage(inner, "sys_user", (url) => {
+    if (url.searchParams.get("sysparm_offset") !== "0") return undefined;
+    const foreign = new URL(url);
+    foreign.host = "collector.attacker.example";
+    foreign.searchParams.set("sysparm_offset", "2");
+    return jsonResponse({ result: fixture.tables.sys_user.slice(0, 2) }, { headers: { "X-Total-Count": "6", Link: `<${foreign.toString()}>;rel="next"` } });
+  });
+  const fetchImpl = (input, init) => {
+    hosts.add(new URL(String(input)).host);
+    return paged(input, init);
+  };
+
+  const snapshot = await createClient(fetchImpl, { pageSize: 2 }).queryTable("sys_user", { fields: ["sys_id", "user_name"], limit: 100 });
+  assert.deepEqual([...hosts], ["dev12345.service-now.com"], "the only host requested is the configured instance");
+  assert.equal(snapshot.pages, 1);
+  assert.equal(snapshot.rows.length, 2);
+  assert.equal(snapshot.truncated, true);
+  assert.equal(snapshot.truncationReason, FOREIGN_NEXT_LINK_REASON);
+  assert.equal(snapshot.error, undefined, "a foreign link is a truncation, not a read failure");
+
+  const result = await assessServicenowIdentityAccess(createClient(fetchImpl, { pageSize: 2 }));
+  const review = findingsById(result).get("SNOW-04");
+  assert.equal(review.status, "warn");
+  assert.match(review.summary, /sys_user was truncated at 2 of 6 rows \(Link rel=next pointed at another origin; not followed\)/);
+  assert.equal(review.evidence.inputs[0].truncation_reason, FOREIGN_NEXT_LINK_REASON);
+  assert.deepEqual([...hosts], ["dev12345.service-now.com"], "the assessment did not request the foreign host either");
+});
+
 test("ServicenowApiClient marks a non-empty read without X-Total-Count as total unknown so dependent findings cannot pass (rule 10)", async () => {
   const { fetchImpl } = fixtureFetch(healthyFixture(), { omitTotalCount: true });
   const snapshot = await createClient(fetchImpl).queryTable("sys_user", { query: "active=true", fields: ["sys_id", "user_name"] });
@@ -2281,6 +2315,9 @@ test("planted values self-check: every canary and planted secret is alphanumeric
  * skipped wordings, the inventory states, the withheld notes, and the corollary summary templates.
  */
 const SERVICENOW_FIXED_TEXTS = [
+  // A next link off the instance origin is never requested; the read is truncated with this reason.
+  "Link rel=next pointed at another origin; not followed",
+  "sys_user was truncated at 2 of 6 rows (Link rel=next pointed at another origin; not followed)",
   // The resolver's own messages, which reach check_access, assess, and export results live.
   "SERVICENOW_URL or SERVICENOW_INSTANCE (or an instance_url / instance argument) is required.",
   "ServiceNow credentials are required. Set SERVICENOW_USERNAME plus SERVICENOW_PASSWORD for basic auth, SERVICENOW_CLIENT_ID plus SERVICENOW_CLIENT_SECRET (optionally with username and password for the password grant) for OAuth, or SERVICENOW_ACCESS_TOKEN for a pre-issued bearer token.",

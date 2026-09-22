@@ -1048,6 +1048,9 @@ function isRetryableStatus(status: number): boolean {
   return status === 429 || status >= 500;
 }
 
+/** Truncation reason recorded when a `Link rel=next` points off the instance's origin; the link is never requested. */
+export const FOREIGN_NEXT_LINK_REASON = "Link rel=next pointed at another origin; not followed";
+
 export function parseLinkNext(header: string | null | undefined): string | undefined {
   if (!header) return undefined;
   for (const part of header.split(",")) {
@@ -1370,6 +1373,13 @@ export class ServicenowApiClient implements ServicenowReadClient {
           break;
         }
         const nextUrl = new URL(next, this.config.instanceUrl);
+        // A next link is followed on the instance's own origin only: requestJson attaches the
+        // Authorization header to whatever it fetches, so an absolute link elsewhere would carry the
+        // credential to a foreign host. The read stops here and is reported truncated with the reason.
+        if (nextUrl.origin !== new URL(this.config.instanceUrl).origin) {
+          truncationReason = FOREIGN_NEXT_LINK_REASON;
+          break;
+        }
         const nextOffset = asNumber(nextUrl.searchParams.get("sysparm_offset"));
         if (total !== undefined && nextOffset !== undefined && nextOffset >= total) break;
         const nextUrlText = nextUrl.toString();

@@ -6,6 +6,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import {
+  FOREIGN_NEXT_RECORDS_REASON,
+  FOREIGN_URL_MESSAGE,
   SalesforceApiClient,
   SalesforceApiError,
   assessSalesforceDataProtection,
@@ -1491,6 +1493,65 @@ test("rule 10: SalesforceApiClient reports truncated with an unknown total on st
   assert.match(findingById(identity, "SF-13").summary, /Only 3 of unknown users were read/);
 });
 
+test("SalesforceApiClient never follows a nextRecordsUrl or request URL that points at another origin: no request leaves with the token and the read is truncated with the reason (CodeRabbit a)", async () => {
+  const hosts = new Set();
+  const pages = new Map();
+  const fetchImpl = async (input) => {
+    const url = new URL(input);
+    hosts.add(url.host);
+    const key = url.pathname.endsWith("/query") ? `${url.pathname}?${url.searchParams.get("q")}` : url.pathname;
+    const page = pages.get(key);
+    return page ? jsonResponse(page) : jsonResponse([{ message: `no fixture for ${key}`, errorCode: "NOT_FOUND" }], { status: 404 });
+  };
+  const client = new SalesforceApiClient(sampleConfig({ maxRetries: 0 }), { fetchImpl });
+  const query = "/services/data/v64.0/query";
+
+  pages.set(`${query}?SELECT Id FROM Foreign`, { totalSize: 10, done: false, nextRecordsUrl: `https://collector.attacker.example${query}/01g-2000`, records: [{ Id: "1" }, { Id: "2" }] });
+  const foreign = await client.query("SELECT Id FROM Foreign");
+  assert.deepEqual(foreign.records.map((record) => record.Id), ["1", "2"], "the rows already read are kept");
+  assert.equal(foreign.pages, 1, "the foreign cursor is not fetched");
+  assert.equal(foreign.done, false);
+  assert.equal(foreign.truncated, true);
+  assert.equal(foreign.truncationReason, FOREIGN_NEXT_RECORDS_REASON);
+
+  pages.set(`${query}?SELECT Id FROM Scheme`, { totalSize: 10, done: false, nextRecordsUrl: `http://acme.my.salesforce.com${query}/01g-2000`, records: [{ Id: "1" }] });
+  const scheme = await client.query("SELECT Id FROM Scheme");
+  assert.equal(scheme.truncationReason, FOREIGN_NEXT_RECORDS_REASON, "a scheme change is another origin");
+
+  pages.set(`${query}?SELECT Id FROM Relative`, { totalSize: 3, done: false, nextRecordsUrl: `${query}/relative-2`, records: [{ Id: "1" }, { Id: "2" }] });
+  pages.set(`${query}/relative-2`, { totalSize: 3, done: true, records: [{ Id: "3" }] });
+  const relative = await client.query("SELECT Id FROM Relative");
+  assert.equal(relative.pages, 2, "a relative cursor on the instance is followed");
+  assert.equal(relative.truncated, false);
+
+  pages.set(`${query}?SELECT Id FROM Absolute`, { totalSize: 3, done: false, nextRecordsUrl: `https://acme.my.salesforce.com${query}/absolute-2`, records: [{ Id: "1" }, { Id: "2" }] });
+  pages.set(`${query}/absolute-2`, { totalSize: 3, done: true, records: [{ Id: "3" }] });
+  const absolute = await client.query("SELECT Id FROM Absolute");
+  assert.equal(absolute.pages, 2, "an absolute cursor on the instance origin is followed");
+  assert.equal(absolute.truncated, false);
+
+  await assert.rejects(
+    client.getJson(`https://collector.attacker.example${query}/01g-2000`),
+    (error) => error instanceof SalesforceApiError && error.message === FOREIGN_URL_MESSAGE,
+    "getJson refuses a foreign absolute URL before any request",
+  );
+  assert.deepEqual([...hosts], ["acme.my.salesforce.com"], "the only host requested is the instance");
+
+  // The reason reaches the dataset line an auditor reads.
+  const collectorFetch = async (input) => {
+    const url = new URL(input);
+    hosts.add(url.host);
+    const soql = url.searchParams.get("q") ?? "";
+    if (url.pathname.endsWith("/query") && /FROM User\b/.test(soql) && !soql.includes("WHERE")) {
+      return jsonResponse({ totalSize: 4000, done: false, nextRecordsUrl: `https://collector.attacker.example${query}/01g-2000`, records: goodUsers });
+    }
+    return fetchImpl(input);
+  };
+  const identity = await assessSalesforceIdentityAccess(new SalesforceApiClient(sampleConfig({ maxRetries: 0 }), { fetchImpl: collectorFetch }));
+  assert.match(identity.summary.inventories.User, /^User read: partial \(3 of 4000 rows; nextRecordsUrl pointed at another origin; not followed\)$/);
+  assert.deepEqual([...hosts], ["acme.my.salesforce.com"], "the assessment did not request the foreign host either");
+});
+
 test("rule 10: SF-07, SF-09, and SF-10 demote when a secondary list is truncated and state seen versus total", () => {
   const truncated = (name, data, total) => okDataset(name, data, { truncated: true, seen: data.length, total });
   const elevatedSets = [{ Id: "PS-elevated", Name: "Elevated", IsOwnedByProfile: false, PermissionsModifyAllData: true }];
@@ -2003,6 +2064,10 @@ const SF_SAMPLE_DENIAL = "Salesforce request /services/data/v64.0/query failed (
  * templates. Each must come back from SalesforceApiError's pass unchanged.
  */
 const SALESFORCE_FIXED_TEXTS = [
+  // A request URL or nextRecordsUrl off the instance origin is never requested.
+  "Salesforce request URL pointed at another origin than the instance URL; the request was not sent.",
+  "User read: partial (3 of 4000 rows; nextRecordsUrl pointed at another origin; not followed)",
+  "OauthToken read: partial (2000 of an unknown total of rows; more records promised without a nextRecordsUrl)",
   // The resolver's own messages, which reach check_access, assess, and export results live.
   "Salesforce credentials are required: JWT bearer (SF_CONSUMER_KEY, SF_USERNAME, SF_PRIVATE_KEY_FILE), username-password (SF_USERNAME, SF_PASSWORD, SF_SECURITY_TOKEN, SF_CONSUMER_KEY, SF_CONSUMER_SECRET), a refresh token, an access token with SF_INSTANCE_URL, or SF_CREDENTIALS_FILE.",
   "JWT bearer flow requires SF_CONSUMER_KEY, SF_USERNAME, and SF_PRIVATE_KEY_FILE (or SF_PRIVATE_KEY).",

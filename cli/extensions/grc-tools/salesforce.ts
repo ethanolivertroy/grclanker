@@ -103,6 +103,8 @@ export interface SalesforceQueryResult {
   truncated: boolean;
   pages: number;
   omittedFields?: string[];
+  /** Why the read stopped short, when it did (a stalled or foreign cursor, an empty page, the record limit). */
+  truncationReason?: string;
 }
 
 export interface SalesforceDataset<T> {
@@ -111,6 +113,8 @@ export interface SalesforceDataset<T> {
   data: T;
   error?: string;
   truncated: boolean;
+  /** Why a truncated read stopped short; absent when the read was complete or failed. */
+  truncationReason?: string;
   seen: number;
   total?: number;
   omittedFields?: string[];
@@ -381,6 +385,15 @@ function normalizeBaseUrl(rawUrl: string): string {
   parsed.search = "";
   parsed.pathname = parsed.pathname.replace(/\/+$/, "");
   return parsed.toString().replace(/\/+$/, "");
+}
+
+/** Fixed text for a request whose URL resolved off the session's instance origin; the request is never sent. */
+export const FOREIGN_URL_MESSAGE = "Salesforce request URL pointed at another origin than the instance URL; the request was not sent.";
+/** Truncation reason recorded when a query's nextRecordsUrl points off the instance origin; the cursor is never requested. */
+export const FOREIGN_NEXT_RECORDS_REASON = "nextRecordsUrl pointed at another origin; not followed";
+
+function isSameOrigin(url: URL, instanceUrl: string): boolean {
+  return url.origin === new URL(instanceUrl).origin;
 }
 
 function serializeJson(value: unknown): string {
@@ -1311,7 +1324,10 @@ export class SalesforceApiClient {
 
   async getJson(pathOrUrl: string, query: Record<string, string> = {}): Promise<unknown> {
     const session = await this.getSession();
-    const url = new URL(pathOrUrl.startsWith("http") ? pathOrUrl : `${session.instanceUrl}${pathOrUrl}`);
+    // Every request resolves against the session's instance URL and must stay on its origin: the
+    // Bearer token goes on the request, so a server-supplied absolute URL elsewhere is never fetched.
+    const url = new URL(pathOrUrl, session.instanceUrl);
+    if (!isSameOrigin(url, session.instanceUrl)) throw new SalesforceApiError(FOREIGN_URL_MESSAGE);
     for (const [key, value] of Object.entries(query)) url.searchParams.set(key, value);
     const response = await this.fetchWithRetry(url.toString(), {
       method: "GET",
@@ -1350,12 +1366,22 @@ export class SalesforceApiClient {
     // A missing done flag is only trusted as "complete" when no further page is promised.
     let done = doneFlag ?? nextUrl === undefined;
     let stalled = false;
+    let truncationReason: string | undefined;
     records.push(...asRecords(payload.records));
 
     while (!done && records.length < recordLimit) {
       // More records promised but no cursor, or a cursor that stopped advancing: exit and report truncated.
       if (!nextUrl || visitedCursors.has(nextUrl)) {
         stalled = true;
+        truncationReason = nextUrl ? "nextRecordsUrl did not advance" : "more records promised without a nextRecordsUrl";
+        break;
+      }
+      // The cursor is followed on the instance's own origin only; an absolute URL elsewhere would carry
+      // the Bearer token to a foreign host, so it is never requested and the read is reported truncated.
+      const { instanceUrl } = await this.getSession();
+      if (!isSameOrigin(new URL(nextUrl, instanceUrl), instanceUrl)) {
+        stalled = true;
+        truncationReason = FOREIGN_NEXT_RECORDS_REASON;
         break;
       }
       visitedCursors.add(nextUrl);
@@ -1368,13 +1394,21 @@ export class SalesforceApiClient {
       done = doneFlag ?? nextUrl === undefined;
       if (pageRecords.length === 0 && !done) {
         stalled = true;
+        truncationReason = "empty page returned with more records promised";
         break;
       }
     }
 
     const complete = done && !stalled && records.length <= recordLimit
       && (totalSize === undefined ? doneFlag === true : totalSize <= records.length);
-    return { records: records.slice(0, recordLimit), totalSize, done: done && !stalled, truncated: !complete, pages };
+    return {
+      records: records.slice(0, recordLimit),
+      totalSize,
+      done: done && !stalled,
+      truncated: !complete,
+      pages,
+      ...(truncationReason ? { truncationReason } : {}),
+    };
   }
 
   async query(soql: string, limit = DEFAULT_RECORD_LIMIT): Promise<SalesforceQueryResult> {
@@ -1669,6 +1703,7 @@ async function collectRecords(name: string, load: () => Promise<SalesforceQueryR
       status: "ok",
       data: records,
       truncated: result.truncated,
+      ...(result.truncationReason ? { truncationReason: result.truncationReason } : {}),
       seen: records.length,
       total: result.totalSize,
       omittedFields: result.omittedFields,
@@ -1702,7 +1737,7 @@ function whenOk<T>(value: T, ...datasets: Array<SalesforceDataset<unknown>>): T 
  */
 function describeDataset(dataset: SalesforceDataset<unknown>): string {
   if (dataset.status !== "ok") return `${dataset.name} read: unread (${dataset.status}${dataset.error ? `: ${dataset.error}` : ""})`;
-  if (dataset.truncated) return `${dataset.name} read: partial (${dataset.seen} of ${dataset.total ?? "an unknown total of"} rows)`;
+  if (dataset.truncated) return `${dataset.name} read: partial (${dataset.seen} of ${dataset.total ?? "an unknown total of"} rows${dataset.truncationReason ? `; ${dataset.truncationReason}` : ""})`;
   return `${dataset.name} read: complete (${dataset.seen} row${dataset.seen === 1 ? "" : "s"})`;
 }
 
