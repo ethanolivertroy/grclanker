@@ -56,6 +56,8 @@ sc_secret_key: "..."
 
 Precedence is explicit tool arguments, then environment variables, then the config file.
 
+A file named explicitly (the `config_file` argument or `TENABLE_CONFIG_FILE`) must be readable and parse; the default path is skipped silently when absent, and an empty file contributes no settings. Loader errors use fixed text and never quote the file: a read failure reports `Unable to read Tenable config file <path> (<CODE>)` with only the errno code (`ENOENT`, `EACCES`, `EISDIR`), a parse failure reports `Unable to parse Tenable config file: invalid YAML in <path> at line N (INVALID_YAML)` with the line taken only from the parser's structured position (omitted when the parser throws something else, such as the plain error an unresolved alias `key: *value` produces), and a file that is not a mapping reports `INVALID_CONFIG_SHAPE`. Neither the filesystem message nor the parser message (which quotes the offending source line, or the alias value itself) is ever interpolated, so a misplaced key in a malformed file cannot leak through the error.
+
 ## Tools
 
 | Tool | Purpose |
