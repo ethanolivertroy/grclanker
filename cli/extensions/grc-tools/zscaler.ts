@@ -20,7 +20,7 @@ import { homedir } from "node:os";
 import { basename, dirname, join, relative, resolve } from "node:path";
 import { ZipArchive } from "archiver";
 import { Type } from "@sinclair/typebox";
-import { parse as parseYaml } from "yaml";
+import { YAMLError, parse as parseYaml } from "yaml";
 import { errorResult, formatTable, textResult } from "./shared.js";
 
 type FetchImpl = typeof fetch;
@@ -315,8 +315,10 @@ function safeDirName(value: string): string {
   return normalized || "zscaler";
 }
 
+// Every tool catch, access probe, and collected dataset error renders through here, so error text raised anywhere in
+// the module (config loading, path validation, fetch failures, the clients' own messages) is scrubbed at one point.
 function errorMessage(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
+  return scrubErrorText(error instanceof Error ? error.message : String(error));
 }
 
 function truncateList<T>(items: T[], max = 25): T[] {
@@ -546,8 +548,45 @@ function overlayFromEnv(env: NodeJS.ProcessEnv): ConfigOverlay {
   };
 }
 
+const SYSTEM_ERROR_CODE = /^E[A-Z0-9_]{1,30}$/;
+
+/** The `code` of a Node system error (EACCES, EISDIR, ENOENT): a fixed identifier, never the message. */
+function systemErrorCode(error: unknown): string | undefined {
+  const code = asObject(error)?.code;
+  return typeof code === "string" && SYSTEM_ERROR_CODE.test(code) ? code : undefined;
+}
+
+/** The first line the YAML parser points at, when it reports one (an unresolved alias throws a plain ReferenceError). */
+function yamlErrorLine(error: unknown): number | undefined {
+  return error instanceof YAMLError ? error.linePos?.[0]?.line : undefined;
+}
+
+/**
+ * Reads and parses the config file without interpolating either library message: the YAML parser quotes the offending
+ * source line, which for a malformed `apiKey:` line is the credential itself, and the filesystem message carries its
+ * own wording and the path. The thrown text is fixed, plus the path, the parser's line number when it gives one, and
+ * the system error code when the read failed.
+ */
+function readConfigFile(pathname: string): JsonRecord {
+  let text: string;
+  try {
+    text = readFileSync(pathname, "utf8");
+  } catch (error) {
+    const code = systemErrorCode(error);
+    throw new Error(`Unable to read Zscaler config file ${pathname}${code ? ` (${code})` : ""}`);
+  }
+  let parsed: unknown;
+  try {
+    parsed = parseYaml(text);
+  } catch (error) {
+    const line = yamlErrorLine(error);
+    throw new Error(`Unable to parse Zscaler config file: invalid YAML in ${pathname}${line === undefined ? "" : ` at line ${line}`}`);
+  }
+  return asObject(parsed) ?? {};
+}
+
 function overlayFromConfigFile(pathname: string): ConfigOverlay {
-  const parsed = asObject(parseYaml(readFileSync(pathname, "utf8"))) ?? {};
+  const parsed = readConfigFile(pathname);
   const zia = asObject(asObject(parsed.zia)?.client) ?? asObject(parsed.zia) ?? {};
   const zpa = asObject(asObject(parsed.zpa)?.client) ?? asObject(parsed.zpa) ?? {};
   const oneApi = asObject(asObject(parsed.zscaler)?.client) ?? asObject(parsed.zscaler) ?? {};
@@ -709,6 +748,35 @@ function scrubEchoedText(text: string): string {
     .replace(ECHOED_SECRET_ASSIGNMENT, "$1[REDACTED]")
     .replace(ECHOED_LONG_TOKEN, (token) => (ERROR_CODE_SHAPE.test(token) ? token : "[REDACTED]"))
     .slice(0, ECHOED_ERROR_MAX_LENGTH);
+}
+
+const ERROR_BEARER_TOKEN = /\b(Bearer|Basic)\s+[A-Za-z0-9._~+/=-]{8,}/g;
+const ERROR_SESSION_COOKIE = /JSESSIONID=[^;\s"]+/g;
+// "/" and "." are not run characters, so API paths, hostnames, and file paths split into their segments.
+const ERROR_TOKEN_RUN = /[A-Za-z0-9+=_-]{16,}/g;
+// Uppercase codes (INVALID_INPUT_ARGUMENT, ZPN_STATUS_AUTHENTICATED) and hyphenated identifiers such as finding ids.
+const UPPERCASE_CODE = /^[A-Z][A-Z_]*$|^[A-Z][A-Z0-9]*(?:[_-][A-Z0-9]+)+$/;
+// camelCase and PascalCase schema identifiers (urlFilteringRules, authenticatedSession, ServiceEdgeGroup).
+const CASED_IDENTIFIER = /^[a-z]+(?:[A-Z][a-z0-9]*)+$|^(?:[A-Z][a-z]+){2,}$/;
+
+// A run of 16 or more token characters is a credential when it carries a digit or mixed case, except for the shapes
+// that are identifiers rather than secrets: uppercase codes, runs of digits alone (customer ids, timestamps), and
+// camelCase or PascalCase schema names, which is what the module's own messages contain.
+function looksLikeToken(run: string): boolean {
+  if (UPPERCASE_CODE.test(run) || /^\d+$/.test(run)) return false;
+  if (/\d/.test(run)) return true;
+  return /[a-z]/.test(run) && /[A-Z]/.test(run) && !CASED_IDENTIFIER.test(run);
+}
+
+// The single scrub behind errorMessage: credential name-value pairs, Bearer and Basic values, session cookies, and
+// long token-like runs are removed from any error text regardless of where it was raised. Idempotent, so text the
+// clients already redacted comes back unchanged. Configured secrets are removed by the clients' own redact step.
+function scrubErrorText(text: string): string {
+  return text
+    .replace(ECHOED_SECRET_ASSIGNMENT, "$1[REDACTED]")
+    .replace(ERROR_BEARER_TOKEN, "$1 [REDACTED]")
+    .replace(ERROR_SESSION_COOKIE, "JSESSIONID=[REDACTED]")
+    .replace(ERROR_TOKEN_RUN, (run) => (looksLikeToken(run) ? "[REDACTED]" : run));
 }
 
 function errorDetail(payload: unknown, rawText: string): string | undefined {

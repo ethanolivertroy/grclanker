@@ -1,9 +1,10 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { existsSync, mkdtempSync, readdirSync, readFileSync, symlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, relative } from "node:path";
 import { inflateRawSync } from "node:zlib";
+import { parse as parseYaml } from "yaml";
 
 import {
   ZiaApiClient,
@@ -24,6 +25,7 @@ import {
   obfuscateZiaApiKey,
   redactForExport,
   redactSecrets,
+  registerZscalerTools,
   resolveSecureOutputPath,
   resolveZiaBaseUrl,
   resolveZpaBaseUrl,
@@ -166,6 +168,152 @@ test("resolveZscalerConfiguration prefers args over env over config file and map
   const zpaOnly = resolveZscalerConfiguration({}, { ZPA_CLIENT_ID: "c", ZPA_CLIENT_SECRET: "s", ZPA_CUSTOMER_ID: "1" });
   assert.equal(zpaOnly.zia, undefined);
   assert.equal(zpaOnly.zpa.cloud, "PRODUCTION");
+});
+
+/** Captures the tool definitions through a fake pi and returns a runner that renders one tool the way the agent sees it. */
+function registeredZscalerTool(name) {
+  const definitions = new Map();
+  registerZscalerTools({ registerTool(definition) { definitions.set(definition.name, definition); } });
+  const tool = definitions.get(name);
+  assert.ok(tool, `${name} is registered`);
+  return async (args) => {
+    const prepared = tool.prepareArguments ? tool.prepareArguments(args) : args;
+    const result = await tool.execute("call-1", prepared);
+    return { text: result.content.map((entry) => entry.text ?? "").join("\n"), serialized: JSON.stringify(result) };
+  };
+}
+
+function thrownBy(run) {
+  try {
+    run();
+    return undefined;
+  } catch (error) {
+    return error;
+  }
+}
+
+async function withProcessEnv(overrides, run) {
+  const previous = Object.fromEntries(Object.keys(overrides).map((key) => [key, process.env[key]]));
+  const apply = (values) => {
+    for (const [key, value] of Object.entries(values)) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+  };
+  apply(overrides);
+  try {
+    return await run();
+  } finally {
+    apply(previous);
+  }
+}
+
+const ZIA_ARGS = { zia_cloud: "zscalerthree", zia_api_key: "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123", zia_username: "auditor@example.com", zia_password: "s3cret-pass", max_retries: 0 };
+
+test("config file loader never echoes the parser message for a malformed credential line, through both routes, resolver and tool (rule 9)", async () => {
+  const configDir = createTempBase("grclanker-zscaler-config-malformed-");
+  const apiKeyCanary = "TOKCANARYqz8m2v4x7k1p3w5n9r";
+  const bearerCanary = "BRCANARYh6j2f8d4s0a1g3l5";
+  const malformedLine = `    apiKey: ${apiKeyCanary}: Bearer ${bearerCanary}`;
+  const configText = ["zia:", "  client:", "    cloud: zscalerthree", malformedLine, "    username: auditor@example.com", ""].join("\n");
+  const configPath = join(configDir, "inspector.yaml");
+  writeFileSync(configPath, configText);
+
+  // Positive control: the parser's own message quotes the offending source line, so interpolating it leaks both values.
+  const parserError = thrownBy(() => parseYaml(configText));
+  assert.ok(parserError instanceof Error, "control: yaml.parse throws on the nested mapping");
+  assert.match(parserError.message, /Nested mappings/);
+  assert.match(parserError.message, /line 4/);
+  assert.ok(parserError.message.includes(apiKeyCanary) && parserError.message.includes(bearerCanary), "control: the parser message carries both canaries");
+
+  const forbidden = [apiKeyCanary, bearerCanary, "TOKCANARY", "BRCANARY", "Bearer", "Nested mappings", malformedLine.trim(), ":\n"];
+  const assertClean = (text, label) => {
+    for (const fragment of forbidden) {
+      assert.ok(!text.includes(fragment), `${label} must not carry ${JSON.stringify(fragment)}: ${text}`);
+    }
+  };
+  const expected = /^Unable to parse Zscaler config file: invalid YAML in .*inspector\.yaml at line 4$/;
+
+  const viaArgument = thrownBy(() => resolveZscalerConfiguration({ config_file: configPath }, {}));
+  assert.ok(viaArgument instanceof Error, "the config_file route throws");
+  assert.match(viaArgument.message, expected);
+  assertClean(viaArgument.message, "resolver (config_file)");
+
+  const viaEnv = thrownBy(() => resolveZscalerConfiguration({}, { ZSCALER_CONFIG_FILE: configPath }));
+  assert.ok(viaEnv instanceof Error, "the ZSCALER_CONFIG_FILE route throws");
+  assert.match(viaEnv.message, expected);
+  assertClean(viaEnv.message, "resolver (ZSCALER_CONFIG_FILE)");
+
+  const checkAccess = registeredZscalerTool("zscaler_check_access");
+  const argumentResult = await checkAccess({ config_file: configPath });
+  assert.match(argumentResult.text, /^Zscaler access check failed: Unable to parse Zscaler config file: invalid YAML in .*inspector\.yaml at line 4$/);
+  assertClean(argumentResult.serialized, "zscaler_check_access (config_file)");
+
+  const envResult = await withProcessEnv({ ZSCALER_CONFIG_FILE: configPath }, () => checkAccess({}));
+  assert.match(envResult.text, /^Zscaler access check failed: Unable to parse Zscaler config file: invalid YAML in .*inspector\.yaml at line 4$/);
+  assertClean(envResult.serialized, "zscaler_check_access (ZSCALER_CONFIG_FILE)");
+});
+
+test("config file loader reports an unresolved alias and a failed read with fixed text and the system error code only (rule 9)", async () => {
+  const configDir = createTempBase("grclanker-zscaler-config-alias-");
+  const aliasCanary = "ALCANARYu3y7e1t9r5w";
+  const aliasText = ["zia:", "  client:", `    apiKey: *${aliasCanary}`, ""].join("\n");
+  const aliasPath = join(configDir, "alias.yaml");
+  writeFileSync(aliasPath, aliasText);
+
+  // Positive control: an unresolved alias is a plain ReferenceError (no linePos) whose message carries the value.
+  const parserError = thrownBy(() => parseYaml(aliasText));
+  assert.ok(parserError instanceof Error, "control: yaml.parse throws on the unresolved alias");
+  assert.ok(parserError.message.includes(aliasCanary), "control: the parser message carries the alias value");
+
+  const checkAccess = registeredZscalerTool("zscaler_check_access");
+  const aliasError = thrownBy(() => resolveZscalerConfiguration({ config_file: aliasPath }, {}));
+  assert.ok(aliasError instanceof Error, "the alias shape throws");
+  assert.match(aliasError.message, /^Unable to parse Zscaler config file: invalid YAML in .*alias\.yaml$/);
+  const aliasResult = await checkAccess({ config_file: aliasPath });
+  assert.match(aliasResult.text, /^Zscaler access check failed: Unable to parse Zscaler config file: invalid YAML in .*alias\.yaml$/);
+  for (const text of [aliasError.message, aliasResult.serialized]) {
+    for (const fragment of [aliasCanary, "ALCANARY", "Unresolved alias", "anchor"]) {
+      assert.ok(!text.includes(fragment), `must not carry ${JSON.stringify(fragment)}: ${text}`);
+    }
+  }
+
+  const directoryPath = join(configDir, "config-as-directory.yaml");
+  mkdirSync(directoryPath);
+  const readError = thrownBy(() => resolveZscalerConfiguration({ config_file: directoryPath }, {}));
+  assert.ok(readError instanceof Error, "a directory at the config path throws");
+  assert.match(readError.message, /^Unable to read Zscaler config file .*config-as-directory\.yaml \(EISDIR\)$/);
+  const readResult = await checkAccess({ config_file: directoryPath });
+  assert.match(readResult.text, /^Zscaler access check failed: Unable to read Zscaler config file .*config-as-directory\.yaml \(EISDIR\)$/);
+  for (const text of [readError.message, readResult.serialized]) {
+    assert.ok(!text.includes("illegal operation"), `fs wording must not reach the caller: ${text}`);
+  }
+});
+
+test("tool catch blocks render scrubbed text: a planted bearer thrown inside the tool never reaches the result (rule 9)", async () => {
+  const bearerCanary = "BRCANARYh6j2f8d4s0a1g3l5";
+  const checkAccess = registeredZscalerTool("zscaler_check_access");
+
+  // Control: the cloud validation interpolates the caller's value, so the raw error thrown inside the tool's try block carries it.
+  const control = thrownBy(() => resolveZiaBaseUrl(`Bearer ${bearerCanary}`));
+  assert.ok(control instanceof Error && control.message.includes(bearerCanary), "control: the raw error carries the planted bearer");
+
+  const cloudResult = await checkAccess({ ...ZIA_ARGS, zia_cloud: `Bearer ${bearerCanary}` });
+  assert.match(cloudResult.text, /^Zscaler access check failed: Unknown ZIA cloud "Bearer \[REDACTED\]"\. Expected one of zscaler, /);
+  assert.ok(!cloudResult.serialized.includes(bearerCanary) && !cloudResult.serialized.includes("BRCANARY"), cloudResult.serialized);
+
+  // A transport error raised by fetch inside the clients follows the same errorMessage route into the access probes.
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async () => {
+    throw new Error(`socket closed while sending Authorization: Bearer ${bearerCanary}`);
+  };
+  try {
+    const probeResult = await checkAccess(ZIA_ARGS);
+    assert.match(probeResult.text, /ZIA request failed: socket closed while sending Authorization: Bearer \[REDACTED\]/);
+    assert.ok(!probeResult.serialized.includes(bearerCanary) && !probeResult.serialized.includes("BRCANARY"), probeResult.serialized);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
 });
 
 test("obfuscateZiaApiKey follows the documented timestamp algorithm", () => {
