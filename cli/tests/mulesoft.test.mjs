@@ -4023,3 +4023,57 @@ test("round 7 note 2: credentials and the config file path set through the envir
   assert.equal(connected.clientSecret, "env-client-secret-value");
   assert.deepEqual(connected.sourceChain, ["environment-organization", "environment-client-id", "environment-client-secret"]);
 });
+
+test("reviewer B round 4 verdict N3: MULESOFT-IAM-01 is manual, not fail, on an identity provider page truncated before any provider was visible, with the partial-view sentence and its absence evidence null; summary.identity_providers is null under any partial read; a complete empty read still fails", async () => {
+  const truncated = await assessMulesoftIdentityAccess(healthyIdentityClient({
+    async listIdentityProviders() {
+      return truncatedPage([], 40);
+    },
+  }));
+  const provider = findingById(truncated, "MULESOFT-IAM-01");
+  assert.equal(provider.status, "manual");
+  assert.match(provider.summary, /identityProviders read was truncated before any provider was visible/);
+  assert.match(provider.summary, /Partial view: identity provider list truncated at 0 of 40 total/);
+  assert.match(provider.summary, /cannot be asserted for the items that were not read, so the verdict is manual \(unknown\)/);
+  assert.match(provider.summary, /Export Access Management > Identity Providers/);
+  assert.doesNotMatch(provider.summary, /treated as fail/);
+  assert.equal(provider.evidence.identity_providers, null, "an empty list from a truncated page is an absence claim");
+  assert.equal(provider.evidence.active_identity_providers, null, "a zero from a truncated page is an absence claim");
+  assert.equal(provider.evidence.is_federated, true, "a positive sighting from a complete read stays");
+  assert.deepEqual(provider.evidence.partial_view, ["identity provider list truncated at 0 of 40 total"]);
+  assert.equal(truncated.summary.identity_providers, null);
+  assert.equal(truncated.summary.identity_providers_seen, 0);
+  assert.equal(truncated.summary.identity_providers_total, 40);
+  assert.equal(truncated.summary.identity_providers_truncated, true);
+
+  // A partial read with a visible provider: the bare count is unknown too, the seen and total counts carry the sample, and the verdict stops at warn.
+  const partial = await assessMulesoftIdentityAccess(healthyIdentityClient({
+    async listIdentityProviders() {
+      return truncatedPage([{ provider_id: "idp-1", name: "Okta SAML", type: { name: "saml" } }], 3);
+    },
+  }));
+  assert.equal(statusOf(partial, "MULESOFT-IAM-01"), "warn");
+  assert.equal(partial.summary.identity_providers, null);
+  assert.equal(partial.summary.identity_providers_seen, 1);
+  assert.equal(partial.summary.identity_providers_total, 3);
+  assert.equal(partial.summary.identity_providers_truncated, true);
+
+  // A complete empty read still fails with the bare zero.
+  const empty = await assessMulesoftIdentityAccess(emptyIdentityClient());
+  assert.equal(statusOf(empty, "MULESOFT-IAM-01"), "fail");
+  assert.match(findingById(empty, "MULESOFT-IAM-01").summary, /Zero providers is treated as fail/);
+  assert.equal(findingById(empty, "MULESOFT-IAM-01").evidence.active_identity_providers, 0);
+  assert.equal(empty.summary.identity_providers, 0);
+  assert.equal(empty.summary.identity_providers_seen, 0);
+  assert.equal(empty.summary.identity_providers_truncated, false);
+
+  // A fail that does not rest on an absence keeps failing under a partial view: every visible provider disabled.
+  const disabled = await assessMulesoftIdentityAccess(healthyIdentityClient({
+    async listIdentityProviders() {
+      return truncatedPage([{ provider_id: "idp-1", name: "Okta SAML", type: { name: "saml" }, enabled: false }], 3);
+    },
+  }));
+  const disabledFinding = findingById(disabled, "MULESOFT-IAM-01");
+  assert.equal(disabledFinding.status, "fail", disabledFinding.summary);
+  assert.match(disabledFinding.summary, /Partial view: identity provider list truncated at 1 of 3 total/);
+});

@@ -2407,3 +2407,79 @@ test("round 7 note 2: credentials and the credentials file path set through the 
   assert.equal(shadowed.apiVersion, "63.0");
   assert.ok(shadowed.sourceChain.includes("environment-SF_USERNAME"));
 });
+
+test("reviewer B round 4 verdict N3: SF-16 is manual, not fail, on a TenantSecret read truncated before any secret was visible; summary.tenant_secrets is null and tenant_secret_status is partial under any partial read; SF-15 states EventLogFile emptiness only from a complete read", () => {
+  const truncatedSecrets = assessSalesforceDataProtectionData(goodDataProtectionData({
+    tenantSecrets: okDataset("TenantSecret", [], { truncated: true, total: 40, truncationReason: "stopped at the requested limit of 0 with more results available" }),
+  }));
+  const encryption = findingById(truncatedSecrets, "SF-16");
+  assert.equal(encryption.status, "manual");
+  assert.match(encryption.summary, /The TenantSecret read was truncated before any tenant secret was visible \(0 of 40 rows; stopped at the requested limit of 0 with more results available\)/);
+  assert.match(encryption.summary, /whether Shield Platform Encryption has active keys cannot be confirmed or ruled out from the visible rows\. The verdict is manual \(unknown\)\./);
+  assert.doesNotMatch(encryption.summary, /no tenant secrets exist/);
+  assert.equal(encryption.evidence.tenant_secrets, null, "a zero from a truncated read is an absence claim");
+  assert.equal(encryption.evidence.tenant_secrets_total, 40);
+  assert.equal(encryption.evidence.tenant_secrets_truncated, true);
+  assert.match(encryption.manualEvidence, /Key Management/);
+  assert.equal(truncatedSecrets.summary.tenant_secrets, null);
+  assert.equal(truncatedSecrets.summary.tenant_secrets_seen, 0);
+  assert.equal(truncatedSecrets.summary.tenant_secrets_total, 40);
+  assert.equal(truncatedSecrets.summary.tenant_secret_status, "partial");
+  assert.match(truncatedSecrets.summary.inventories.TenantSecret, /^TenantSecret read: partial \(0 of 40 rows/);
+
+  // A partial read with a visible secret: the bare count is unknown too, the seen and total counts carry the sample, the state is partial, and the verdict stops at warn.
+  const partialSecrets = assessSalesforceDataProtectionData(goodDataProtectionData({
+    tenantSecrets: okDataset("TenantSecret", [{ Id: "T1", Status: "Active", Type: "Data", Version: 3, CreatedDate: "2026-06-01T00:00:00Z" }], { truncated: true, total: 5 }),
+  }));
+  assert.equal(findingById(partialSecrets, "SF-16").status, "warn");
+  assert.equal(partialSecrets.summary.tenant_secrets, null);
+  assert.equal(partialSecrets.summary.tenant_secrets_seen, 1);
+  assert.equal(partialSecrets.summary.tenant_secrets_total, 5);
+  assert.equal(partialSecrets.summary.tenant_secret_status, "partial");
+
+  // A complete empty read still fails with the bare zero and the ok state.
+  const emptySecrets = assessSalesforceDataProtectionData(goodDataProtectionData({ tenantSecrets: okDataset("TenantSecret", []) }));
+  assert.equal(findingById(emptySecrets, "SF-16").status, "fail");
+  assert.match(findingById(emptySecrets, "SF-16").summary, /no tenant secrets exist/);
+  assert.equal(findingById(emptySecrets, "SF-16").evidence.tenant_secrets, 0);
+  assert.equal(emptySecrets.summary.tenant_secrets, 0);
+  assert.equal(emptySecrets.summary.tenant_secret_status, "ok");
+
+  // A fail that does not rest on an absence keeps failing under a partial read: a visible secret that is not Active.
+  const inactivePartial = assessSalesforceDataProtectionData(goodDataProtectionData({
+    tenantSecrets: okDataset("TenantSecret", [{ Id: "T1", Status: "Archived", Type: "Data", Version: 3, CreatedDate: "2026-06-01T00:00:00Z" }], { truncated: true, total: 5 }),
+  }));
+  assert.equal(findingById(inactivePartial, "SF-16").status, "fail");
+  assert.match(findingById(inactivePartial, "SF-16").summary, /none are Active/);
+
+  // SF-15: the EventLogFile emptiness sentence is stated only from a complete read; a truncated read carries the partial view instead.
+  const truncatedEvents = assessSalesforceMonitoringData(goodMonitoringData({ eventLogFiles: okDataset("EventLogFile", [], { truncated: true, total: 40 }) }));
+  const audit = findingById(truncatedEvents, "SF-15");
+  assert.notEqual(audit.status, "fail");
+  assert.doesNotMatch(audit.summary, /exposed 0 EventLogFile rows/);
+  assert.match(audit.summary, /Event Monitoring exposed no EventLogFile row among the visible rows, which the partial read cannot confirm for the unread rows: the EventLogFile read was truncated before any row was visible \(0 of 40 rows\)/);
+  assert.equal(audit.evidence.event_monitoring.event_log_files_last_7_days, null, "a zero from a truncated read is an absence claim");
+  assert.equal(audit.evidence.event_monitoring.event_log_files_total, 40);
+  assert.equal(audit.evidence.event_monitoring.event_types, null);
+  assert.equal(audit.evidence.event_monitoring.truncated, true);
+  assert.equal(truncatedEvents.summary.event_log_files, null);
+  assert.equal(truncatedEvents.summary.event_log_files_seen, 0);
+  assert.equal(truncatedEvents.summary.event_log_files_total, 40);
+  assert.equal(truncatedEvents.summary.event_log_status, "partial");
+
+  const partialEvents = assessSalesforceMonitoringData(goodMonitoringData({
+    eventLogFiles: okDataset("EventLogFile", [{ Id: "E1", EventType: "Login", LogDate: "2026-09-20T00:00:00Z" }], { truncated: true, total: 40, truncationReason: "stopped at the requested limit of 1 with more results available" }),
+  }));
+  assert.match(findingById(partialEvents, "SF-15").summary, /Event Monitoring exposed 1 of 40 EventLogFile rows in 7 days \(the read was truncated: stopped at the requested limit of 1 with more results available, so the visible rows are not the full set\)/);
+  assert.equal(findingById(partialEvents, "SF-15").evidence.event_monitoring.event_log_files_last_7_days, 1);
+  assert.deepEqual(findingById(partialEvents, "SF-15").evidence.event_monitoring.event_types, ["Login"]);
+  assert.equal(partialEvents.summary.event_log_files, null);
+  assert.equal(partialEvents.summary.event_log_files_seen, 1);
+  assert.equal(partialEvents.summary.event_log_status, "partial");
+
+  const completeEmptyEvents = assessSalesforceMonitoringData(goodMonitoringData({ eventLogFiles: okDataset("EventLogFile", []) }));
+  assert.match(findingById(completeEmptyEvents, "SF-15").summary, /Event Monitoring exposed 0 EventLogFile rows in 7 days\./);
+  assert.equal(findingById(completeEmptyEvents, "SF-15").evidence.event_monitoring.event_log_files_last_7_days, 0);
+  assert.equal(completeEmptyEvents.summary.event_log_files, 0);
+  assert.equal(completeEmptyEvents.summary.event_log_status, "ok");
+});

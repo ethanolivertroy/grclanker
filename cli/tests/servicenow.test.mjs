@@ -2768,3 +2768,50 @@ test("review round item 13, extended: SNOW-08 and SNOW-17 do not assert the abse
   assert.equal(findingsById(completePlugins).get("SNOW-17").status, "fail");
   assert.match(findingsById(completePlugins).get("SNOW-17").summary, /has no row in sys_plugins/);
 });
+
+test("reviewer B round 4 verdict N3: SNOW-06 is manual, not fail, on a password_policy read that showed no row while partial (truncated, ACL-hidden, or visibility unproven), with the partial-view sentence and policy_count null; a complete empty read still fails", async () => {
+  const emptyPolicies = healthyFixture();
+  emptyPolicies.tables.password_policy = [];
+
+  // The reviewer's shape: an empty page served with X-Total-Count 40 and a Link rel=next, so the client stops on the empty page.
+  const { fetchImpl } = fixtureFetch(emptyPolicies);
+  const truncatedFetch = async (input, init) => {
+    const url = new URL(String(input));
+    if (url.pathname !== "/api/now/table/password_policy") return fetchImpl(input, init);
+    const nextUrl = new URL(url);
+    nextUrl.searchParams.set("sysparm_offset", String(Number(url.searchParams.get("sysparm_offset") ?? "0") + Number(url.searchParams.get("sysparm_limit") ?? "500")));
+    return jsonResponse({ result: [] }, { headers: { "X-Total-Count": "40", Link: `<${nextUrl.toString()}>;rel="next"` } });
+  };
+  const truncated = findingsById(await assessServicenowIdentityAccess(createClient(truncatedFetch))).get("SNOW-06");
+  assert.equal(truncated.status, "manual");
+  assert.match(truncated.summary, /No password_policy rows are visible/);
+  assert.match(truncated.summary, /Partial view: password_policy was truncated at 0 of 40 rows/);
+  assert.match(truncated.summary, /cannot be asserted for the rows that were not read, so the verdict is manual \(unknown\)/);
+  assert.equal(truncated.evidence.policy_count, null, "a zero from a truncated read is an absence claim");
+  assert.ok(truncated.manualEvidence, "the manual verdict names the evidence to collect");
+
+  // ACL-hidden rows (X-Total-Count above the zero visible rows) and a zero-row read without X-Total-Count are partial reads too.
+  const hidden = findingsById(await assessServicenowIdentityAccess(createClient(fixtureFetch(emptyPolicies, { inflateTotals: { password_policy: 40 } }).fetchImpl))).get("SNOW-06");
+  assert.equal(hidden.status, "manual");
+  assert.match(hidden.summary, /password_policy returned 0 of 40 rows \(ACL-filtered or hidden rows\)/);
+  assert.match(hidden.summary, /manual \(unknown\)/);
+  assert.equal(hidden.evidence.policy_count, null);
+  const unproven = findingsById(await assessServicenowIdentityAccess(createClient(fixtureFetch(emptyPolicies, { omitTotalCount: true }).fetchImpl))).get("SNOW-06");
+  assert.equal(unproven.status, "manual");
+  assert.match(unproven.summary, /password_policy returned 0 rows without an X-Total-Count header \(visibility unproven\)/);
+
+  // A complete empty read (X-Total-Count 0, no next link) still fails with the bare zero.
+  const complete = findingsById(await assessServicenowIdentityAccess(createClient(fixtureFetch(emptyPolicies).fetchImpl))).get("SNOW-06");
+  assert.equal(complete.status, "fail");
+  assert.match(complete.summary, /No password_policy rows are visible/);
+  assert.doesNotMatch(complete.summary, /Partial view/);
+  assert.equal(complete.evidence.policy_count, 0);
+
+  // A fail that does not rest on an absence keeps failing under a partial read: a visible weak policy with hidden rows.
+  const weakPolicies = healthyFixture();
+  weakPolicies.tables.password_policy = [{ sys_id: "pp-default", name: "Default", minimum_password_length: "6", require_uppercase: "false", require_lowercase: "true", require_digit: "false" }];
+  const weakPartial = findingsById(await assessServicenowIdentityAccess(createClient(fixtureFetch(weakPolicies, { inflateTotals: { password_policy: 3 } }).fetchImpl))).get("SNOW-06");
+  assert.equal(weakPartial.status, "fail");
+  assert.match(weakPartial.summary, /fall below the threshold/);
+  assert.match(weakPartial.summary, /Partial view: password_policy returned 1 of 4 rows/);
+});

@@ -1750,6 +1750,26 @@ function whenOk<T>(value: T, ...datasets: Array<SalesforceDataset<unknown>>): T 
   return datasets.every((dataset) => dataset.status === "ok") ? value : null;
 }
 
+/** A bare count of a dataset's records (not a `seen` count): unknown, so null, unless the dataset was read to completion. */
+function completeCount(value: number, dataset: SalesforceDataset<unknown>): number | null {
+  return dataset.status === "ok" && !dataset.truncated ? value : null;
+}
+
+/** The dataset's read state for a summary: `partial` for a truncated read, never `ok` beside a partial inventory line. */
+function datasetState(dataset: SalesforceDataset<unknown>): DatasetStatus | "partial" {
+  return dataset.status === "ok" && dataset.truncated ? "partial" : dataset.status;
+}
+
+/** A partial read that showed no record: the absence the verdict would rest on is a claim about the unread records. */
+function truncatedBeforeVisible(dataset: SalesforceDataset<JsonRecord[]>): boolean {
+  return dataset.status === "ok" && dataset.truncated && dataset.data.length === 0;
+}
+
+/** The partial-view clause for a read truncated before any record was visible. */
+function truncatedBeforeVisibleNote(dataset: SalesforceDataset<JsonRecord[]>, record: string, property: string): string {
+  return `The ${dataset.name} read was truncated before any ${record} was visible (0 of ${dataset.total ?? "an unknown total of"} rows${dataset.truncationReason ? `; ${dataset.truncationReason}` : ""}), so ${property} cannot be confirmed or ruled out from the visible rows.`;
+}
+
 /** One line per dataset stating whether it was read completely, partially, or not at all. */
 /**
  * Renders one dataset state as `<name> read: <state> (<detail>)`. The word `read` keeps a
@@ -2706,6 +2726,9 @@ export function assessSalesforceDataProtectionData(data: SalesforceDataProtectio
     findings.push(finding(16, "manual", `Shield Platform Encryption is not applicable or not visible: ${unreadableReason(data.tenantSecrets)}. This is a not-applicable or scoped-out result, not a pass.`, { dataset_status: data.tenantSecrets.status, error: data.tenantSecrets.error ?? null }, encryptionManual));
   } else if (data.tenantSecrets.status !== "ok") {
     findings.push(manualForUnreadable(16, data.tenantSecrets, encryptionManual));
+  } else if (truncatedBeforeVisible(data.tenantSecrets)) {
+    // Zero visible secrets of a truncated read is an absence claim over the unread rows: manual, with the count unknown.
+    findings.push(finding(16, "manual", `${truncatedBeforeVisibleNote(data.tenantSecrets, "tenant secret", "whether Shield Platform Encryption has active keys")} The verdict is manual (unknown).`, { tenant_secrets: null, tenant_secrets_total: data.tenantSecrets.total ?? null, tenant_secrets_truncated: true, truncation_reason: data.tenantSecrets.truncationReason ?? null }, encryptionManual));
   } else if (secrets.length === 0) {
     findings.push(finding(16, "fail", "TenantSecret is readable but no tenant secrets exist, so Shield Platform Encryption has no active keys and no fields are encrypted.", { tenant_secrets: 0 }, encryptionManual));
   } else {
@@ -2769,8 +2792,11 @@ export function assessSalesforceDataProtectionData(data: SalesforceDataProtectio
     title: "Salesforce data protection",
     summary: {
       sensitive_field_grants: whenOk(fieldPermissions.length, data.fieldPermissions),
-      tenant_secrets: whenOk(secrets.length, data.tenantSecrets),
-      tenant_secret_status: data.tenantSecrets.status,
+      // A bare count of the org's tenant secrets is unknown from a partial read; the read state says `partial` there.
+      tenant_secrets: completeCount(secrets.length, data.tenantSecrets),
+      tenant_secrets_seen: whenOk(data.tenantSecrets.seen, data.tenantSecrets),
+      tenant_secrets_total: whenOk(data.tenantSecrets.total ?? null, data.tenantSecrets),
+      tenant_secret_status: datasetState(data.tenantSecrets),
       certificates: whenOk(certificates.length, data.certificates),
       organization_readable: data.organization.status === "ok",
       inventories: Object.fromEntries([data.fieldPermissions, data.tenantSecrets, data.certificates, data.organization].map((dataset) => [dataset.name, describeDataset(dataset)])),
@@ -2920,6 +2946,7 @@ export function assessSalesforceMonitoringData(data: SalesforceMonitoringData): 
     const undated = trail.filter((row) => asDate(row.CreatedDate) === undefined);
     const actors = [...new Set(highRisk.map((row) => asString(asObject(row.CreatedBy)?.Username) ?? asString(row.CreatedById) ?? "unknown"))];
     const eventLogReadable = data.eventLogFiles.status === "ok";
+    const eventLogComplete = eventLogReadable && !data.eventLogFiles.truncated;
     const eventTypes = [...new Set(data.eventLogFiles.data.map((row) => asString(row.EventType) ?? ""))].filter(Boolean);
     const evidence = {
       audit_rows: trail.length,
@@ -2928,15 +2955,26 @@ export function assessSalesforceMonitoringData(data: SalesforceMonitoringData): 
       high_risk_actors: truncateList(actors),
       sample_high_risk_changes: truncateList(highRisk.map((row) => `${asString(row.CreatedDate) ?? "?"} ${asString(row.Section) ?? ""}/${asString(row.Action) ?? ""}: ${asString(row.Display) ?? ""}`), 15),
       rows_without_created_date: undated.length,
+      // A zero from a truncated EventLogFile read is an absence claim over the unread rows and renders null.
       event_monitoring: eventLogReadable
-        ? { event_log_files_last_7_days: data.eventLogFiles.data.length, event_types: eventTypes, truncated: data.eventLogFiles.truncated }
+        ? {
+          event_log_files_last_7_days: eventLogComplete || data.eventLogFiles.data.length > 0 ? data.eventLogFiles.data.length : null,
+          event_log_files_total: data.eventLogFiles.total ?? null,
+          event_types: eventLogComplete || eventTypes.length > 0 ? eventTypes : null,
+          truncated: data.eventLogFiles.truncated,
+        }
         : { status: data.eventLogFiles.status, error: data.eventLogFiles.error ?? null },
       truncated: data.setupAuditTrail.truncated,
     };
     const status: SalesforceFindingStatus = data.setupAuditTrail.truncated || undated.length > 0 || highRisk.length > 0 ? "warn" : withUnreadableDowngrade("pass", data.eventLogFiles);
-    const eventNote = eventLogReadable
-      ? `exposed ${data.eventLogFiles.data.length} EventLogFile rows in 7 days`
-      : `was not checked because ${unreadableReason(data.eventLogFiles)}, so the verdict is capped at warn`;
+    // The emptiness sentence is stated only from a complete read; a truncated read carries the partial-view clause.
+    const eventNote = !eventLogReadable
+      ? `was not checked because ${unreadableReason(data.eventLogFiles)}, so the verdict is capped at warn`
+      : eventLogComplete
+        ? `exposed ${data.eventLogFiles.data.length} EventLogFile rows in 7 days`
+        : data.eventLogFiles.data.length === 0
+          ? `exposed no EventLogFile row among the visible rows, which the partial read cannot confirm for the unread rows: the EventLogFile read was truncated before any row was visible (0 of ${data.eventLogFiles.total ?? "an unknown total of"} rows${data.eventLogFiles.truncationReason ? `; ${data.eventLogFiles.truncationReason}` : ""})`
+          : `exposed ${data.eventLogFiles.data.length} of ${data.eventLogFiles.total ?? "an unknown total of"} EventLogFile rows in 7 days (the read was truncated${data.eventLogFiles.truncationReason ? `: ${data.eventLogFiles.truncationReason}` : ""}, so the visible rows are not the full set)`;
     const eventManual = eventLogReadable ? "" : " Setup > Event Manager and the EventLogFile browser: confirm Event Monitoring log files are being generated and retained.";
     findings.push(finding(15, status, `${trail.length} setup changes in ${data.auditTrailDays} days with ${highRisk.length} high-risk security changes by ${actors.length} actors; Event Monitoring ${eventNote}.${partialNote(data.setupAuditTrail)}`, evidence, status === "pass" ? undefined : `${auditManual}${eventManual}`));
   }
@@ -2955,8 +2993,11 @@ export function assessSalesforceMonitoringData(data: SalesforceMonitoringData): 
       login_history_days: data.loginHistoryDays,
       audit_rows: whenOk(trail.length, data.setupAuditTrail),
       audit_trail_days: data.auditTrailDays,
-      event_log_files: whenOk(data.eventLogFiles.data.length, data.eventLogFiles),
-      event_log_status: data.eventLogFiles.status,
+      // A bare count of the org's EventLogFile rows is unknown from a partial read; the read state says `partial` there.
+      event_log_files: completeCount(data.eventLogFiles.data.length, data.eventLogFiles),
+      event_log_files_seen: whenOk(data.eventLogFiles.seen, data.eventLogFiles),
+      event_log_files_total: whenOk(data.eventLogFiles.total ?? null, data.eventLogFiles),
+      event_log_status: datasetState(data.eventLogFiles),
       inventories: Object.fromEntries([data.connectedApplications, data.oauthTokens, data.callerPermissions, data.loginHistory, data.setupAuditTrail, data.eventLogFiles].map((dataset) => [dataset.name, describeDataset(dataset)])),
     },
     findings: findings.sort((left, right) => left.control - right.control),

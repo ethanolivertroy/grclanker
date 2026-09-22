@@ -2000,6 +2000,13 @@ interface Verdict {
   status: MulesoftFindingStatus;
   summary: string;
   evidence?: JsonRecord;
+  /**
+   * A fail that rests on the absence of an item among the visible items of a truncated page (zero
+   * providers before the page was cut). The absence is provable only against the items that were not
+   * read, so `evaluate` renders the verdict manual and its absence-valued evidence (0, [], {}) null; the
+   * compute sets it only when the list itself was truncated, so a complete empty read still fails.
+   */
+  absenceClaim?: boolean;
 }
 
 interface EvaluationInputs {
@@ -2090,6 +2097,28 @@ function verdict(status: MulesoftFindingStatus, summary: string, evidence?: Json
   return { status, summary, evidence };
 }
 
+/** A fail resting on the absence of an item among the visible items of a truncated page; `evaluate` renders it manual. */
+function absenceVerdict(summary: string, evidence?: JsonRecord): Verdict {
+  return { status: "fail", summary, evidence, absenceClaim: true };
+}
+
+function isAbsenceValue(value: unknown): boolean {
+  if (value === 0) return true;
+  if (Array.isArray(value)) return value.length === 0;
+  if (value !== null && typeof value === "object") return Object.keys(value as object).length === 0;
+  return false;
+}
+
+/** Under a partial view, evidence values that assert absence (0, [], {}) render null because the unread items could hold the item. */
+function withoutAbsenceClaims(evidence: JsonRecord): JsonRecord {
+  return Object.fromEntries(Object.entries(evidence).map(([key, value]) => [key, isAbsenceValue(value) ? null : value]));
+}
+
+/** A count of the items of a paged list, unknown (null) unless the list was read to completion. */
+function completeCount(value: number, source: Collected<MulesoftPage>): number | null {
+  return sourceCollected(source) && !source.value.truncated ? value : null;
+}
+
 function evaluate(
   number: number,
   inputs: EvaluationInputs,
@@ -2116,9 +2145,20 @@ function evaluate(
   }
 
   const result = compute();
-  const evidence: JsonRecord = { ...(result.evidence ?? {}) };
+  // A fail resting on an absence among the visible items is a claim about the unread items under a partial view.
+  const absenceUnderPartialView = result.status === "fail" && result.absenceClaim === true && partialView.length > 0;
+  const evidence: JsonRecord = absenceUnderPartialView ? withoutAbsenceClaims(result.evidence ?? {}) : { ...(result.evidence ?? {}) };
   if (unreadableSources.length > 0) evidence.unreadable_sources = unreadableSources;
   if (partialView.length > 0) evidence.partial_view = partialView;
+
+  if (absenceUnderPartialView) {
+    return finding(
+      number,
+      "manual",
+      `${result.summary} Partial view: ${partialView.join("; ")}. The absence this verdict rests on cannot be asserted for the items that were not read, so the verdict is manual (unknown). ${evidenceToCollect}`,
+      evidence,
+    );
+  }
 
   if (secondaryFailures.length > 0) {
     const causes = secondaryFailures.map(describeFailure).join("; ");
@@ -2465,6 +2505,11 @@ export async function assessMulesoftIdentityAccess(
           allow_new_non_sso_users: allowNewNonSsoUsers ?? null,
         };
         if (providers.length === 0) {
+          // A truncated page with zero visible providers is an absence claim over the unread providers and renders
+          // manual (evaluate); a complete empty read fails, whatever the business-group scope of the credential.
+          if (identityProviders.value.truncated) {
+            return absenceVerdict("No external identity provider was among the visible providers (the identityProviders read was truncated before any provider was visible), so whether one is configured cannot be confirmed or ruled out from the visible items.", evidence);
+          }
           return verdict("fail", "No external identity provider is configured (the identityProviders read succeeded and returned zero providers); users authenticate with Anypoint Platform passwords. Zero providers is treated as fail.", evidence);
         }
         if (activeProviders.length === 0) {
@@ -2720,10 +2765,13 @@ export async function assessMulesoftIdentityAccess(
   return {
     category: "identity_access",
     title: "MuleSoft identity and access posture",
-    // Counts derived from a list that was not read render null rather than the empty fallback's zero.
+    // Counts derived from a list that was not read render null rather than the empty fallback's zero; the
+    // identity provider count is a bare count of the tenant's providers, unknown from a truncated page.
     summary: {
       organization_id: config.organizationId,
-      identity_providers: derived(providers.length, identityProviders),
+      identity_providers: completeCount(providers.length, identityProviders),
+      identity_providers_seen: derived(providers.length, identityProviders),
+      identity_providers_total: derived(identityProviders.value.total ?? null, identityProviders),
       identity_providers_truncated: derived(identityProviders.value.truncated, identityProviders),
       members_sampled: derived(members.value.items.length, members),
       members_total: derived(members.value.total ?? null, members),

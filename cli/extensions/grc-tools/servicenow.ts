@@ -1669,6 +1669,12 @@ interface Evaluation {
   principals?: Record<string, unknown[] | number>;
   /** Thresholds and options echoed into evidence verbatim; they describe the run, not the tenant, so they are never gated. */
   parameters?: JsonRecord;
+  /**
+   * A fail that rests on the absence of a row among the visible rows (no policy row, no provider row).
+   * Under a partial read the absence is provable only against the rows that were not read, so the
+   * verdict renders manual instead of fail; a complete empty read still fails.
+   */
+  absenceClaim?: boolean;
 }
 
 /** Under a partial read, evidence values that assert absence (0, [], {}) render null because the missing rows could hold the item. */
@@ -1745,8 +1751,17 @@ function gatedFinding(
         evidence,
         manualEvidence,
       });
-    case "warn":
     case "fail":
+      if (evaluation.absenceClaim) {
+        return finding(controlNumber, {
+          status: "manual",
+          summary: `${evaluation.summary} ${partialSummary} The absence this verdict rests on cannot be asserted for the rows that were not read, so the verdict is manual (unknown).`,
+          evidence,
+          manualEvidence,
+        });
+      }
+      return finding(controlNumber, { ...evaluation, summary: `${evaluation.summary} ${partialSummary}`, evidence });
+    case "warn":
       return finding(controlNumber, { ...evaluation, summary: `${evaluation.summary} ${partialSummary}`, evidence });
     case "manual":
       return finding(controlNumber, { ...evaluation, summary: `${evaluation.summary} ${partialSummary}`, evidence, manualEvidence: evaluation.manualEvidence ?? manualEvidence });
@@ -2202,10 +2217,13 @@ export function assessServicenowIdentityAccessData(data: ServicenowIdentityData)
       return { status: "fail", summary: "glide.enable.password_policy is set to false, so the password_policy table is not enforced.", evidence };
     }
     if (policies.length === 0) {
+      // A complete empty read fails; a truncated, ACL-filtered, or visibility-unproven zero-row read is an
+      // absence claim over the unread rows and renders manual (gatedFinding).
       return {
         status: "fail",
         summary: "No password_policy rows are visible; the baseline Default policy should exist, so either the policy was removed or the credential cannot read it.",
         evidence,
+        absenceClaim: true,
       };
     }
     const evaluated = policies.map((policy) => ({

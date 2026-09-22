@@ -3397,3 +3397,164 @@ test("collection status: a truncated user directory keeps seen counts, renders p
   assert.equal(findingById(oncall, 18).evidence.oncall_email_only, null);
   assertMentionsMatchRequests([run.analysis, run.accessCheck, run.payloads, run.errors], run.requests, "truncated users");
 });
+
+test("reviewer B round 4 verdict N3: PD-04, PD-20, and PD-21 are manual, not fail, on a page truncated before any item was visible, with the partial-view sentence; PD-10, PD-11, and PD-12 state emptiness only from a complete read or with the partial-view clause; complete empty lists still fail", () => {
+  const fixtures = healthyFixtures();
+  const truncatedTeams = assessPagerdutyAccessControl({
+    scope: accountScope(),
+    abilities: snapshot(fixtures.abilities),
+    users: list(fixtures.users),
+    teams: partialList([], 40),
+    teamMembers: snapshot({}),
+  }, { maxAdmins: 3 });
+  const teamScoping = findingById(truncatedTeams, 4);
+  assert.equal(teamScoping.status, "manual");
+  assert.match(teamScoping.summary, /^GET \/teams was truncated before any team was visible \(teams: 0 of 40 seen \(stopped at the requested limit of 0 with more results available\)\), so whether access is scoped by team cannot be confirmed or ruled out from the visible rows; the verdict is manual \(unknown\)\. Review Teams in the web app/);
+  assert.doesNotMatch(teamScoping.summary, /empty team list fails/);
+  assert.equal(teamScoping.evidence.teams_seen, 0);
+  assert.equal(teamScoping.evidence.teams_total, 40);
+  assert.equal(teamScoping.evidence.team_member_lists_truncated, null, "an empty list from a truncated teams page is an absence claim");
+  assert.deepEqual(teamScoping.evidence.partial_view, ["teams: 0 of 40 seen (stopped at the requested limit of 0 with more results available)"]);
+
+  // An absent "teams" ability is a complete observation: it fails even beside the truncated page, and the sentence names both.
+  const truncatedTeamsNoAbility = assessPagerdutyAccessControl({
+    scope: accountScope(),
+    abilities: snapshot(["sso"]),
+    users: list(fixtures.users),
+    teams: partialList([], 40),
+    teamMembers: snapshot({}),
+  }, { maxAdmins: 3 });
+  assertStatuses(truncatedTeamsNoAbility, { 4: "fail" });
+  assert.match(findingById(truncatedTeamsNoAbility, 4).summary, /GET \/teams returned 0 teams \(teams: 0 of 40 seen \(stopped at the requested limit of 0 with more results available\)\) and the "teams" ability is absent from GET \/abilities, so access is not scoped by team; the absent teams ability fails this control\./);
+
+  // A complete empty team list still fails.
+  const emptyTeams = assessPagerdutyAccessControl({
+    scope: accountScope(),
+    abilities: snapshot(fixtures.abilities),
+    users: list(fixtures.users),
+    teams: list([]),
+    teamMembers: snapshot({}),
+  }, { maxAdmins: 3 });
+  assertStatuses(emptyTeams, { 4: "fail" });
+  assert.match(findingById(emptyTeams, 4).summary, /GET \/teams returned 0 teams, so access is not scoped by team; an empty team list fails this control\./);
+  assert.deepEqual(findingById(emptyTeams, 4).evidence.team_member_lists_truncated, []);
+
+  const truncatedPriorities = assessPagerdutyIncidentResponse({
+    scope: accountScope(),
+    services: list(fixtures.services),
+    escalationPolicies: list(fixtures.escalationPolicies),
+    priorities: partialList([], 40),
+    incidentWorkflows: list(fixtures.incidentWorkflows),
+    workflowTriggers: list(fixtures.incidentWorkflowTriggers),
+  });
+  const priorities = findingById(truncatedPriorities, 20);
+  assert.equal(priorities.status, "manual");
+  assert.match(priorities.summary, /^GET \/priorities was truncated before any priority was visible \(priorities: 0 of 40 seen \(stopped at the requested limit of 0 with more results available\)\), so whether custom incident priorities are defined cannot be confirmed or ruled out from the visible rows; the verdict is manual \(unknown\)\. Record the incident priority levels/);
+  assert.doesNotMatch(priorities.summary, /emptiness fails/);
+  assert.equal(priorities.evidence.priorities, null);
+  assert.equal(priorities.evidence.priorities_seen, 0);
+  assert.deepEqual(priorities.evidence.partial_view, ["priorities: 0 of 40 seen (stopped at the requested limit of 0 with more results available)"]);
+  const emptyPriorities = assessPagerdutyIncidentResponse({
+    scope: accountScope(),
+    services: list(fixtures.services),
+    escalationPolicies: list(fixtures.escalationPolicies),
+    priorities: list([]),
+    incidentWorkflows: list(fixtures.incidentWorkflows),
+    workflowTriggers: list(fixtures.incidentWorkflowTriggers),
+  });
+  assertStatuses(emptyPriorities, { 20: "fail" });
+  assert.match(findingById(emptyPriorities, 20).summary, /returned zero priorities.*emptiness fails this control/);
+
+  // PD-10: the response-play count is stated bare only from a complete service read.
+  const truncatedServices = assessPagerdutyIncidentResponse({
+    scope: accountScope(),
+    services: partialList([], 40),
+    escalationPolicies: list(fixtures.escalationPolicies),
+    priorities: list(fixtures.priorities),
+    incidentWorkflows: list(fixtures.incidentWorkflows),
+    workflowTriggers: list(fixtures.incidentWorkflowTriggers),
+  });
+  const automation = findingById(truncatedServices, 10);
+  assert.notEqual(automation.status, "fail");
+  assert.doesNotMatch(automation.summary, /0 services still reference one/);
+  assert.match(automation.summary, /0 of the 0 visible services still reference one \(services: 0 of 40 seen \(stopped at the requested limit of 0 with more results available\); the unread services are not counted\)/);
+  assert.equal(automation.evidence.services_with_legacy_response_plays, null);
+  const truncatedServicesNoAutomation = assessPagerdutyIncidentResponse({
+    scope: accountScope(),
+    services: partialList([], 40),
+    escalationPolicies: list(fixtures.escalationPolicies),
+    priorities: list(fixtures.priorities),
+    incidentWorkflows: list([]),
+    workflowTriggers: list([]),
+  });
+  assertStatuses(truncatedServicesNoAutomation, { 10: "fail" });
+  assert.doesNotMatch(findingById(truncatedServicesNoAutomation, 10).summary, /no service references a response play/);
+  assert.match(findingById(truncatedServicesNoAutomation, 10).summary, /0 of the 0 visible services reference deprecated response plays \(services: 0 of 40 seen/);
+  const completeServices = assessPagerdutyIncidentResponse({
+    scope: accountScope(),
+    services: list(fixtures.services),
+    escalationPolicies: list(fixtures.escalationPolicies),
+    priorities: list(fixtures.priorities),
+    incidentWorkflows: list(fixtures.incidentWorkflows),
+    workflowTriggers: list(fixtures.incidentWorkflowTriggers),
+  });
+  assert.match(findingById(completeServices, 10).summary, /; 0 services still reference one\)/);
+
+  const truncatedBusinessServices = assessPagerdutyIntegrationSecurity({
+    scope: accountScope(),
+    services: list([service("svc-1")]),
+    extensions: list([{ id: "ext-1", summary: "Slack", endpoint_url: "https://hooks.example.com/slack", extension_schema: { summary: "Slack V2" } }]),
+    webhookSubscriptions: list([{ id: "wh-1", active: true, delivery_method: { url: "https://siem.example.com/pd" } }]),
+    businessServices: partialList([], 40),
+    businessServiceDependencies: snapshot({}),
+    changeEvents: list([{ id: "chg-1", timestamp: "2026-09-15T00:00:00Z", services: [{ id: "svc-1" }] }]),
+    changeWindow: CHANGE_WINDOW,
+  });
+  const dependencies = findingById(truncatedBusinessServices, 21);
+  assert.equal(dependencies.status, "manual");
+  assert.match(dependencies.summary, /^GET \/business_services was truncated before any business service was visible \(business services: 0 of 40 seen \(stopped at the requested limit of 0 with more results available\)\), so whether service dependencies are mapped for impact analysis cannot be confirmed or ruled out from the visible rows; the verdict is manual \(unknown\)\. Record the business services/);
+  assert.doesNotMatch(dependencies.summary, /emptiness fails/);
+  assert.equal(dependencies.evidence.business_services_seen, 0);
+  assert.equal(dependencies.evidence.unmapped_business_services, null);
+  assert.deepEqual(dependencies.evidence.partial_view, ["business services: 0 of 40 seen (stopped at the requested limit of 0 with more results available)"]);
+  const emptyBusinessServices = assessPagerdutyIntegrationSecurity({
+    scope: accountScope(),
+    services: list([service("svc-1")]),
+    extensions: list([]),
+    webhookSubscriptions: list([]),
+    businessServices: list([]),
+    businessServiceDependencies: snapshot({}),
+    changeEvents: list([]),
+    changeWindow: CHANGE_WINDOW,
+  });
+  assertStatuses(emptyBusinessServices, { 21: "fail" });
+  assert.match(findingById(emptyBusinessServices, 21).summary, /returned zero business services.*emptiness fails this control/);
+
+  // PD-11 and PD-12 stay at warn on a truncated empty page, and their sentences carry the partial view instead of the emptiness claim.
+  const truncatedAudit = assessPagerdutyAuditLogging({
+    scope: accountScope(),
+    recentRecords: partialList([], 40),
+    retentionProbe: partialList([], 40),
+    windows: AUDIT_WINDOWS,
+  });
+  assertStatuses(truncatedAudit, { 11: "warn", 12: "warn", 13: "manual" });
+  const logging = findingById(truncatedAudit, 11);
+  assert.doesNotMatch(logging.summary, /returned zero records/);
+  assert.match(logging.summary, /^The audit records API is readable but the read was truncated before any record between \S+ and \S+ was visible \(audit records: 0 of 40 seen \(stopped at the requested limit of 0 with more results available\)\), so whether logging is active cannot be confirmed or ruled out from the visible records; confirm recent configuration changes appear in the web app audit trail\.$/);
+  assert.equal(logging.evidence.records_returned, 0);
+  assert.equal(logging.evidence.records_dated_in_window, null);
+  const retention = findingById(truncatedAudit, 12);
+  assert.doesNotMatch(retention.summary, /No audit records were returned/);
+  assert.match(retention.summary, /^The retention probe was truncated before any record for \S+ to \S+ was visible \(retention probe records: 0 of 40 seen \(stopped at the requested limit of 0 with more results available\)\), so retention cannot be confirmed or ruled out from the visible records\. PagerDuty documents 12 months of retention\.$/);
+  assert.equal(retention.evidence.probe_records_returned, 0);
+  assert.equal(retention.evidence.probe_records_dated_in_window, null);
+  const quietAudit = assessPagerdutyAuditLogging({
+    scope: accountScope(),
+    recentRecords: list([]),
+    retentionProbe: list([]),
+    windows: AUDIT_WINDOWS,
+  });
+  assertStatuses(quietAudit, { 11: "warn", 12: "warn" });
+  assert.match(findingById(quietAudit, 11).summary, /returned zero records/);
+  assert.match(findingById(quietAudit, 12).summary, /No audit records were returned/);
+});

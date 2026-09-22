@@ -542,6 +542,24 @@ function unreadable(view: InventoryView, evidenceToCollect: string): string {
   return `${view.label} could not be read (${view.error ?? "no response"}). ${evidenceToCollect}`;
 }
 
+/**
+ * A readable list that was truncated before any item was visible (an empty page served with `more: true`
+ * or a cursor, or a limit of zero). Its emptiness is a claim about the unread items, so a verdict that would
+ * rest on it renders manual rather than fail, and a sentence that speaks of it carries the partial view.
+ */
+function truncatedBeforeVisible(view: InventoryView): boolean {
+  return view.readable && !view.complete && view.seen === 0;
+}
+
+function partialDescription(view: InventoryView): string {
+  return view.partial ?? `${view.label}: collection incomplete`;
+}
+
+/** The manual sentence for a verdict that would rest on the emptiness of a page truncated before any item was visible. */
+function truncatedBeforeVisibleSummary(view: InventoryView, endpoint: string, item: string, property: string, evidenceToCollect: string): string {
+  return `${endpoint} was truncated before any ${item} was visible (${partialDescription(view)}), so ${property} cannot be confirmed or ruled out from the visible rows; the verdict is manual (unknown). ${evidenceToCollect}`;
+}
+
 type InventoryState = "complete" | "partial" | "unread";
 
 function inventoryState(view: InventoryView): InventoryState {
@@ -2083,34 +2101,44 @@ export function assessPagerdutyAccessControl(
     ),
     finding(
       4,
+      // An absent "teams" ability is a complete observation and fails; a team page truncated before any team
+      // was visible is an absence claim over the unread teams and renders manual; a complete empty list fails.
       userDirectoryStatus()
         ?? (!teams.readable
           ? "manual"
-          : teams.empty || teamsAbilityKnownAbsent
+          : teamsAbilityKnownAbsent
             ? "fail"
-            : usersWithoutTeams.length === 0
-              ? abilitiesUnavailable
-                ? "warn"
-                : "pass"
-              : usersWithoutTeams.length / users.seen > 0.5
+            : truncatedBeforeVisible(teams)
+              ? "manual"
+              : teams.empty
                 ? "fail"
-                : "warn"),
+                : usersWithoutTeams.length === 0
+                  ? abilitiesUnavailable
+                    ? "warn"
+                    : "pass"
+                  : usersWithoutTeams.length / users.seen > 0.5
+                    ? "fail"
+                    : "warn"),
       userDirectoryStatus()
         ? userDirectorySummary("Review Teams in the web app and confirm every responder belongs to at least one team.")
         : !teams.readable
           ? unreadable(teams, "Review Teams in the web app and confirm every responder belongs to at least one team.")
-          : teams.empty || teamsAbilityKnownAbsent
-            ? `GET /teams returned ${teams.seen} teams${teamsAbilityKnownAbsent ? " and the \"teams\" ability is absent" : ""}, so access is not scoped by team; an empty team list fails this control.`
-            : usersWithoutTeams.length === 0
-              ? `${countSeen(teams)} are configured and every one of ${countSeen(users)} belongs to at least one team (${teamMembershipSample}).${teamsAbilityNote}`
-              : `${usersWithoutTeams.length} of ${countSeen(users)} do not belong to any team.${teamsAbilityNote}`,
+          : teamsAbilityKnownAbsent
+            ? `GET /teams returned ${teams.seen} teams${teams.complete ? "" : ` (${partialDescription(teams)})`} and the "teams" ability is absent from GET /abilities, so access is not scoped by team; ${teams.empty && teams.complete ? "an empty team list fails this control, as does the absent teams ability" : "the absent teams ability fails this control"}.`
+            : truncatedBeforeVisible(teams)
+              ? truncatedBeforeVisibleSummary(teams, "GET /teams", "team", "whether access is scoped by team", "Review Teams in the web app and confirm every responder belongs to at least one team.")
+              : teams.empty
+                ? `GET /teams returned ${teams.seen} teams, so access is not scoped by team; an empty team list fails this control.`
+                : usersWithoutTeams.length === 0
+                  ? `${countSeen(teams)} are configured and every one of ${countSeen(users)} belongs to at least one team (${teamMembershipSample}).${teamsAbilityNote}`
+                  : `${usersWithoutTeams.length} of ${countSeen(users)} do not belong to any team.${teamsAbilityNote}`,
       {
         teams_ability: abilitiesUnavailable ? null : teamsAbility,
         abilities_status: abilitiesUnavailable ?? "readable",
         teams_seen: seenCount(teams),
         teams_total: totalCount(teams),
         team_manager_assignments: teamManagerAssignments,
-        team_member_lists_truncated: teamMembersReadable ? truncatedTeamMembers : null,
+        team_member_lists_truncated: teamMembersReadable ? derived(truncatedTeamMembers, teams) : null,
         ...principalEvidence({ users_without_teams: usersWithoutTeams.slice(0, 25).map(userLabel) }, users),
       },
       partialNotes(data.scope, users, teams),
@@ -2260,12 +2288,17 @@ export function assessPagerdutyIncidentResponse(data: PagerdutyIncidentResponseD
   const automationVerified = enabledWorkflows.length > 0 && enabledTriggers.length > 0 && unresolvedTriggers.length === 0;
   const triggerCounts = `${countSeen(triggers)} (${enabledTriggers.length} enabled, ${disabledTriggers.length} disabled, ${unresolvedTriggers.length} unresolved)`;
   const legacyResponsePlays = services.items.filter((service) => asArray(service.response_play).length > 0 || asObject(service.response_play));
-  const responsePlayCount = services.readable
-    ? `${legacyResponsePlays.length} services still reference one`
-    : `services could not be read (${services.error}), so services still referencing one could not be counted`;
-  const responsePlayReferences = services.readable
-    ? `${legacyResponsePlays.length} services reference deprecated response plays`
-    : `response play references could not be checked because services could not be read (${services.error})`;
+  // A response-play count is stated bare only from a complete service read; a partial read names the visible set.
+  const responsePlayCount = !services.readable
+    ? `services could not be read (${services.error}), so services still referencing one could not be counted`
+    : services.complete
+      ? `${legacyResponsePlays.length} services still reference one`
+      : `${legacyResponsePlays.length} of the ${services.seen} visible services still reference one (${partialDescription(services)}; the unread services are not counted)`;
+  const responsePlayReferences = !services.readable
+    ? `response play references could not be checked because services could not be read (${services.error})`
+    : services.complete
+      ? `${legacyResponsePlays.length} services reference deprecated response plays`
+      : `${legacyResponsePlays.length} of the ${services.seen} visible services reference deprecated response plays (${partialDescription(services)}; the unread services are not counted)`;
   const urgencyModes = active.map(urgencySummary);
   const constantHighOnly = urgencyModes.length > 0 && urgencyModes.every((mode) => mode === "constant:high");
   const missingUrgency = active.filter((service) => !asObject(service.incident_urgency_rule));
@@ -2363,7 +2396,7 @@ export function assessPagerdutyIncidentResponse(data: PagerdutyIncidentResponseD
             ? `${enabledWorkflows.length} incident workflows with is_enabled true (of ${countSeen(workflows)}) and ${enabledTriggers.length} enabled triggers (of ${countSeen(triggers)}; ${enabledTriggers.length - triggersVerifiedByParent} verified by is_disabled false, ${triggersVerifiedByParent} by the parent workflow's is_enabled) are configured (response plays are deprecated in the REST API; ${responsePlayCount}).${services.readable ? "" : " The verdict cannot exceed warn until the service directory is readable."}`
             : workflows.items.length > 0 || triggers.items.length > 0 || legacyResponsePlays.length > 0
               ? `${countSeen(workflows)} (${enabledWorkflows.length} with is_enabled true) and ${triggerCounts} were read, so automated incident response is not verified${unresolvedTriggers.length > 0 ? " because a trigger without the is_disabled flag could not be matched to a returned workflow with an is_enabled value" : ""}; ${responsePlayReferences}. Confirm workflow and trigger state in Automation > Incident Workflows.`
-              : services.readable
+              : services.readable && services.complete
                 ? `The Incident Workflows API is readable and returned zero workflows and zero triggers, and no service references a response play, so no automated incident response is configured; emptiness fails this control.`
                 : `The Incident Workflows API is readable and returned zero workflows and zero triggers, so no workflow automation is configured; ${responsePlayReferences}. Emptiness fails this control.`,
       {
@@ -2399,14 +2432,17 @@ export function assessPagerdutyIncidentResponse(data: PagerdutyIncidentResponseD
     ),
     finding(
       20,
-      !priorities.readable ? "manual" : priorities.empty ? "fail" : "pass",
+      // A priority page truncated before any priority was visible cannot prove emptiness: manual, not fail.
+      !priorities.readable ? "manual" : truncatedBeforeVisible(priorities) ? "manual" : priorities.empty ? "fail" : "pass",
       !priorities.readable
         ? isPlanError(priorities.error)
           ? `The Priorities API is not available on this account's plan (${priorities.error}); record the incident priority scheme from Account Settings > Incident Priority once licensed.`
           : unreadable(priorities, "Record the incident priority levels from Account Settings > Incident Priority.")
-        : priorities.empty
-          ? "GET /priorities is readable and returned zero priorities, so no custom incident priorities are defined; emptiness fails this control."
-          : `${countSeen(priorities)} are defined (${priorities.items.slice(0, 10).map(nameOf).join(", ")}); confirm they are applied to incidents during postmortem review.`,
+        : truncatedBeforeVisible(priorities)
+          ? truncatedBeforeVisibleSummary(priorities, "GET /priorities", "priority", "whether custom incident priorities are defined", "Record the incident priority levels from Account Settings > Incident Priority.")
+          : priorities.empty
+            ? "GET /priorities is readable and returned zero priorities, so no custom incident priorities are defined; emptiness fails this control."
+            : `${countSeen(priorities)} are defined (${priorities.items.slice(0, 10).map(nameOf).join(", ")}); confirm they are applied to incidents during postmortem review.`,
       { priorities: derived(priorities.items.slice(0, 10).map(nameOf), priorities), priorities_seen: seenCount(priorities) },
       partialNotes(data.scope, priorities),
     ),
@@ -2884,7 +2920,9 @@ export function assessPagerdutyAuditLogging(
           ? `${recentDated.dated.length} audit records with an execution_time inside ${data.windows.recent.since} to ${data.windows.recent.until} were retrieved (${recent.seen} returned in total).${undatedNote}`
           : records.length > 0
             ? `${records.length} audit records were returned but none carries an execution_time inside ${data.windows.recent.since} to ${data.windows.recent.until}, so recent logging activity cannot be confirmed.${undatedNote}`
-            : `The audit records API is readable but returned zero records between ${data.windows.recent.since} and ${data.windows.recent.until}; an empty audit trail cannot demonstrate active logging, so confirm recent configuration changes appear in the web app audit trail.`,
+            : recent.complete
+              ? `The audit records API is readable but returned zero records between ${data.windows.recent.since} and ${data.windows.recent.until}; an empty audit trail cannot demonstrate active logging, so confirm recent configuration changes appear in the web app audit trail.`
+              : `The audit records API is readable but the read was truncated before any record between ${data.windows.recent.since} and ${data.windows.recent.until} was visible (${partialDescription(recent)}), so whether logging is active cannot be confirmed or ruled out from the visible records; confirm recent configuration changes appear in the web app audit trail.`,
       {
         window: data.windows.recent,
         records_returned: seenCount(recent),
@@ -2918,7 +2956,9 @@ export function assessPagerdutyAuditLogging(
               ? `${probeDated.dated.length} audit records dated inside ${data.windows.retention.since} to ${data.windows.retention.until} were retrievable (sample of up to 25), consistent with the documented 12-month retention and the ${minRetentionDays}-day requirement.`
               : probe.seen > 0
                 ? `${probe.seen} records were returned for the retention probe but none carries an execution_time inside ${data.windows.retention.since} to ${data.windows.retention.until}, so retention cannot be confirmed from them.`
-                : `No audit records were returned for ${data.windows.retention.since} to ${data.windows.retention.until}; the account may be younger than 12 months or had no configuration changes then. PagerDuty documents 12 months of retention.`,
+                : probe.complete
+                  ? `No audit records were returned for ${data.windows.retention.since} to ${data.windows.retention.until}; the account may be younger than 12 months or had no configuration changes then. PagerDuty documents 12 months of retention.`
+                  : `The retention probe was truncated before any record for ${data.windows.retention.since} to ${data.windows.retention.until} was visible (${partialDescription(probe)}), so retention cannot be confirmed or ruled out from the visible records. PagerDuty documents 12 months of retention.`,
       {
         documented_retention_days: 365,
         required_retention_days: minRetentionDays,
@@ -3194,22 +3234,27 @@ export function assessPagerdutyIntegrationSecurity(data: PagerdutyIntegrationSec
     ),
     finding(
       21,
+      // A business service page truncated before any item was visible cannot prove emptiness: manual, not fail.
       !businessServices.readable
         ? "manual"
-        : businessServices.empty
-          ? "fail"
-          : unmappedBusinessServices.length === 0 && !data.businessServiceDependencies.error
-            ? "pass"
-            : "warn",
+        : truncatedBeforeVisible(businessServices)
+          ? "manual"
+          : businessServices.empty
+            ? "fail"
+            : unmappedBusinessServices.length === 0 && !data.businessServiceDependencies.error
+              ? "pass"
+              : "warn",
       !businessServices.readable
         ? isPlanError(businessServices.error)
           ? `Business services are not available on this account's plan (${businessServices.error}), so dependency mapping cannot be evaluated through the API and this control is not applicable until the feature is licensed. Record any service dependency documentation kept outside PagerDuty.`
           : unreadable(businessServices, "Record the business services and their supporting technical services from Service Directory > Business Services.")
-        : businessServices.empty
-          ? "GET /business_services is readable and returned zero business services, so service dependencies are not mapped for impact analysis; emptiness fails this control."
-          : unmappedBusinessServices.length === 0 && !data.businessServiceDependencies.error
-            ? `All ${countSeen(businessServices)} have at least one mapped dependency.`
-            : `${unmappedBusinessServices.length} of ${countSeen(businessServices)} have no mapped dependencies${data.businessServiceDependencies.error ? ` (dependency listing failed: ${data.businessServiceDependencies.error})` : ""}.`,
+        : truncatedBeforeVisible(businessServices)
+          ? truncatedBeforeVisibleSummary(businessServices, "GET /business_services", "business service", "whether service dependencies are mapped for impact analysis", "Record the business services and their supporting technical services from Service Directory > Business Services.")
+          : businessServices.empty
+            ? "GET /business_services is readable and returned zero business services, so service dependencies are not mapped for impact analysis; emptiness fails this control."
+            : unmappedBusinessServices.length === 0 && !data.businessServiceDependencies.error
+              ? `All ${countSeen(businessServices)} have at least one mapped dependency.`
+              : `${unmappedBusinessServices.length} of ${countSeen(businessServices)} have no mapped dependencies${data.businessServiceDependencies.error ? ` (dependency listing failed: ${data.businessServiceDependencies.error})` : ""}.`,
       {
         business_services_seen: seenCount(businessServices),
         unmapped_business_services: data.businessServiceDependencies.error
