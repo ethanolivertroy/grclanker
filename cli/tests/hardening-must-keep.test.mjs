@@ -195,14 +195,15 @@ const OPAQUE_IDENTIFIERS = Object.freeze([
 ]);
 
 /**
- * Canaries shaped like names: words joined by separators with one numeric segment. Bare, they are
- * indistinguishable from `my-bucket-prod-2026-logs`, so the path-safe long-token rule keeps them and
- * they are caught only where a carrier names them, which is where the shared cases plant them.
+ * Canaries shaped like names: words joined by separators with one numeric segment (the shapes the
+ * group D fixture planted before it moved to random-looking values; these literals are this test's own
+ * fixtures). Bare, they are indistinguishable from `my-bucket-prod-2026-logs`, so the path-safe
+ * long-token rule keeps them and they are caught only where a carrier names them.
  */
 const NAME_SHAPED_CANARIES = Object.freeze([
-  [CANARY.sessionCookie, `Set-Cookie: session=${CANARY.sessionCookie}; Path=/`],
-  [CANARY.apiKey, `x-api-key: ${CANARY.apiKey} for the caller`],
-  [CANARY.urlToken, `retry at https://api.example.com/v1/x?token=${CANARY.urlToken} later`],
+  ["sess-canary-COOKIE-31415926535897", "Set-Cookie: session=sess-canary-COOKIE-31415926535897; Path=/"],
+  ["ak_canary_APIKEY_2718281828459045", "x-api-key: ak_canary_APIKEY_2718281828459045 for the caller"],
+  ["CANARY-url-token-1618033988749", "retry at https://api.example.com/v1/x?token=CANARY-url-token-1618033988749 later"],
 ]);
 
 const TOKEN_SHAPED_CANARIES = Object.freeze([
