@@ -506,8 +506,9 @@ const VENDOR_TOKEN_PATTERNS: readonly RegExp[] = [
   /\bSG\.[A-Za-z0-9_-]{16,}\.[A-Za-z0-9_-]{16,}/g,
 ];
 // "/", ".", ":", "@", "=", and whitespace end a run, so URL path segments, dotted hostnames, and the
-// two sides of a pair are judged on their own; "=" joins a run only as trailing base64 padding.
-const LONG_TOKEN_RUN_PATTERN = new RegExp(`[A-Za-z0-9+_-]{${LONG_TOKEN_MIN_LENGTH},}(?:={1,2}(?![A-Za-z0-9&]))?`, "g");
+// two sides of a pair are judged on their own; "=" joins a run only as trailing base64 padding, so a
+// key whose value was already replaced ("httpEventCollectorToken=[REDACTED]") keeps its name.
+const LONG_TOKEN_RUN_PATTERN = new RegExp(`[A-Za-z0-9+_-]{${LONG_TOKEN_MIN_LENGTH},}(?:={1,2}(?![A-Za-z0-9&\\[]))?`, "g");
 const DIGIT_GROUP_PATTERN = /\d+/g;
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const SAFE_KEY_SHAPE_PATTERN = /^(?:max|min)[_-]|[_-](?:limit|days|hours|minutes|seconds|count|path|file|dir)$/i;
@@ -555,7 +556,16 @@ function looksLikeHexDigest(run: string): boolean {
   return /[A-Fa-f]/.test(run) && /\d/.test(run);
 }
 
-/** Token casing changes more often than once every three letters; words, acronyms, and camelCase change at word boundaries only. */
+// camelCase and PascalCase identifiers: an optional lowercase head, capitalized words, and at most a
+// short trailing acronym ("frozenTimePeriodInSecs", "maxTotalDataSizeMB").
+const CAMEL_CASE_PATTERN = /^[a-z]*(?:[A-Z][a-z]+)*[A-Z]{0,4}$/;
+
+/**
+ * Token casing changes more often than once every three letters. Words and acronyms change at word
+ * boundaries only, and a camelCase identifier whose words average three or more letters is a name
+ * even when its case changes often ("frozenTimePeriodInSecs"); an alternating run of capitalized
+ * one- or two-letter fragments ("xKqZvBnMwLpRtYsHdG") has no such word structure and is a token.
+ */
 function hasTokenCasing(letters: string): boolean {
   if (letters.length < MIN_LETTERS_FOR_CASING) return false;
   let changes = 0;
@@ -564,7 +574,10 @@ function hasTokenCasing(letters: string): boolean {
     const currentLower = letters[index] >= "a" && letters[index] <= "z";
     if (previousLower !== currentLower) changes += 1;
   }
-  return changes * 3 > letters.length;
+  if (changes * 3 <= letters.length) return false;
+  if (!CAMEL_CASE_PATTERN.test(letters)) return true;
+  const words = (letters.match(/[A-Z]/g) ?? []).length + (/^[a-z]/.test(letters) ? 1 : 0);
+  return words * 3 > letters.length;
 }
 
 /** The long-token rule: a UUID is an identifier; a base64 symbol, a second digit group anywhere in the run, or a "-" or "_" separated segment with token casing makes a token; words joined by "-" or "_" with at most one digit group are a name. */
