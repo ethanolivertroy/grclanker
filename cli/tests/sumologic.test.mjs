@@ -1857,7 +1857,7 @@ test("rule 9: scrub boundary: a name-shaped value stays bare in prose and is rem
     (value, separator) => `Authorization${separator}${value}`,
     (value, separator) => `Authorization${separator}Bearer ${value}`,
     (value, separator) => `Authorization${separator}Basic ${value}`,
-    (value, separator) => `Authorization${separator}Basic ${value}`,
+    (value, separator, raw, quote) => `Authorization${separator}${quote}Basic ${raw}${quote}`,
     (value, separator) => `Proxy-Authorization${separator}Bearer ${value}`,
     (value, separator, raw, quote) => `Authorization${separator}${quote}Bearer ${raw}${quote}`,
   ];
