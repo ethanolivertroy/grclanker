@@ -1481,7 +1481,7 @@ function assertOutputsNameOnlyObservedRequests(outputs, requests, label) {
     }
     for (const match of text.matchAll(MENTIONED_ENDPOINT_PATTERN)) {
       const mention = match[0].replace(/[.)]+$/, "");
-      const template = new RegExp(`${mention.replace(/[.*+?^$()|[\\]\\\\]/g, "\\$&").replace(/\\\{[^}]*\\\}|\{[^}]*\}/g, "[^/]+")}$`);
+      const template = new RegExp(`${mention.replace(/[.*+?^$()|[\]\\]/g, "\\$&").replace(/\\\{[^}]*\\\}|\{[^}]*\}/g, "[^/]+")}$`);
       assert.ok(observedPaths.some((path) => template.test(path)), `${label} ${name}: names endpoint ${mention} but the run requested only ${[...new Set(observedPaths)].join(", ")}`);
     }
   }
