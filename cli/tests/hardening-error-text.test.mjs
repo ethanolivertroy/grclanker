@@ -353,6 +353,13 @@ test("credential-named pairs lose any nonempty value whatever its shape, compoun
   for (const text of ["token_type: Bearer", '{"access_token":"abc","token_type":"Bearer","expires_in":3600}', "X-Token-Type: Bearer"]) {
     assert.equal(scrubErrorText(text), text.replace('"abc"', `"${REDACTED}"`), text);
   }
+  // A comparison after a credential-word name assigns nothing: the run after the first "=" is the rest
+  // of the operator, not a value (a base64 value never starts with "=").
+  for (const text of ["tokens == 3", "tokens==3", 'tokensSnap.status === "ok" ? 1 : 2', "if tokens_status == 3 then", "password != rotated", "tokens = = 3"]) {
+    assert.equal(scrubErrorText(text), text, text);
+    assert.equal(scrubDataText(text), text, text);
+  }
+  assert.equal(scrubErrorText("tokens=3"), `tokens=${REDACTED}`);
   // A key whose final segment is a setting suffix is a setting, not a credential key (coordinator
   // ruling): `x-auth-mode`, `token_type`, `BOX_TOKEN_URL` keep their values in every scrub, a URL value
   // still loses its query, and a token-shaped value goes by shape, in the data scrubs too. The

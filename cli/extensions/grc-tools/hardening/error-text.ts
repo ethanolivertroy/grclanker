@@ -694,13 +694,14 @@ function replaceCarrierValues(text: string, carrierPattern: RegExp, readValue: V
 
 /**
  * The bare value at `index` under a header or pair carrier, without the clause punctuation that may
- * follow it; null when there is none to remove (nothing, the marker, or a JSON literal).
+ * follow it; null when there is none to remove (nothing, the marker, a JSON literal, or the rest of a
+ * comparison operator: `tokens == 3` and `tokensSnap.status === "ok"` compare, they assign nothing).
  */
 function readBareValue(text: string, index: number, barePattern: RegExp): string | null {
   const bare = stickyExec(barePattern, text, index);
   if (bare === null) return null;
   const value = bare.replace(CLAUSE_PUNCTUATION_PATTERN, "");
-  if (value.length === 0 || isBlankOrScrubbed(value) || JSON_LITERAL_PATTERN.test(value)) return null;
+  if (value.length === 0 || value.startsWith("=") || isBlankOrScrubbed(value) || JSON_LITERAL_PATTERN.test(value)) return null;
   return value;
 }
 
