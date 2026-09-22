@@ -112,12 +112,33 @@ const STATUSES = Object.freeze([
 
 const DATASET_LABELS = Object.freeze(["roles", "users", "credentials", "secrets", "tokens", "api keys", "service account keys", "sessions", "OAuth clients", "password policies", "signing keys"]);
 /**
- * Labels that are themselves a credential-named pair key (`credentials`, and any other word of the
- * scrub's `CREDENTIAL_PAIR_NAMES`) cannot stand in front of a colon in a note: the pair rule takes
- * whatever follows as the value whatever its shape (coordinator ruling on the Codex P2). A plural or
- * compound label (`secrets`, `tokens`, `api keys`, `sessions`) is not such a key and survives.
+ * Labels whose last word is a credential word of the scrub's `CREDENTIAL_PAIR_NAMES` (`credentials`)
+ * cannot stand in front of a colon in a note at all: the explicit pair rule takes whatever follows as
+ * the value whatever its shape (coordinator ruling on the Codex P2). Labels whose last word
+ * `isCredentialKey` classifies by the Flue heuristic (`secrets`, `tokens`, `api keys`, `signing
+ * keys`) are carriers of the generic pair rule under the same ruling (review of #78, gap 1): the word
+ * after the colon goes unless it continues as prose, so `secrets: seen 40 of 120`, `secrets: not
+ * collected`, and `secrets: unreadable (...)` survive and `secrets: truncated` loses its word. A
+ * label whose last word is plain (`sessions`, `OAuth clients`, `password policies`) survives whole.
  */
 const PAIR_KEY_LABELS = Object.freeze(["credentials"]);
+const GENERIC_KEY_LABELS = Object.freeze(["secrets", "tokens", "api keys", "service account keys", "signing keys"]);
+/** Phrases the generic pair rule's prose exemption keeps; each is pinned here so a narrowing of the exemption is seen. */
+const PROSE_CONTINUATION_PHRASES = Object.freeze([
+  "InvalidAuthenticationToken: Access token has expired.",
+  "InvalidAuthenticationToken: Access token has expired. Basic authentication is disabled for this tenant.",
+  "TokenExpired: The token has expired",
+  "access_tokens: seen 40 of 120",
+  "tokens: 3 of 5 rotated",
+  "tokens: none are stale",
+  "api keys: 40 seen, total unknown",
+  "secrets: not collected",
+  "secrets: unreadable (GET /v1/secrets failed with 403 Forbidden: non-JSON body (text/html, 19 bytes))",
+  "token_type: Bearer token expected",
+  "token_type: Bearer",
+  '{"token_type":"Bearer","expires_in":3600}',
+  "user_session: 3 active sessions",
+]);
 
 function bodyNotes() {
   const notes = [];
@@ -322,17 +343,40 @@ test("marker error text survives the scrub for every inventory label, including 
       `${label}: truncated`,
     ];
     const gated = gatedPrincipals({ admins_without_mfa: ["alice"], admin_count: 1 }, false, notes);
+    // The caller's notes, not the library's. A safe label is written without the colon or with a plain word before it.
+    const withoutColon = notes.map((note) => note.replace(`${label}: `, `${label} `));
+    assertSurvivesScrub(gatedPrincipals({ admin_count: 1 }, false, withoutColon).principals_withheld, `${label} principals_withheld without a colon`);
+    assertSurvivesScrub(gatedPrincipals({ admin_count: 1 }, false, notes.map((note) => note.replace(`${label}: `, `${label} inventory: `))).principals_withheld, `${label} principals_withheld with a compound label`);
     if (PAIR_KEY_LABELS.includes(label)) {
-      // The caller's note, not the library's: a credential pair key before a colon loses the word after it, so such a label is written without the colon.
+      // A credential pair word before a colon loses whatever follows it.
       assert.equal(scrubErrorText(gated.principals_withheld), notes.map((note) => note.replace(/^credentials: \S+/, `credentials: ${REDACTED}`)).join("; "), `${label} principals_withheld with a colon`);
-      const withoutColon = notes.map((note) => note.replace(`${label}: `, `${label} `));
-      assertSurvivesScrub(gatedPrincipals({ admin_count: 1 }, false, withoutColon).principals_withheld, `${label} principals_withheld without a colon`);
-      assertSurvivesScrub(gatedPrincipals({ admin_count: 1 }, false, notes.map((note) => note.replace(`${label}: `, `${label} inventory: `))).principals_withheld, `${label} principals_withheld with a compound label`);
+      continue;
+    }
+    if (GENERIC_KEY_LABELS.includes(label)) {
+      // A label the Flue heuristic classifies loses a bare word after the colon and keeps a value that continues as prose.
+      assert.equal(scrubErrorText(gated.principals_withheld), notes.map((note) => (note.endsWith(": truncated") ? `${label}: ${REDACTED}` : note)).join("; "), `${label} principals_withheld with a colon`);
+      assert.equal(scrubDataText(gated.principals_withheld), scrubErrorText(gated.principals_withheld), `${label} principals_withheld: both scrubs agree`);
       continue;
     }
     assertSurvivesScrub(gated.principals_withheld, `${label} principals_withheld`);
   }
   assertSurvivesScrub(notCollected(line).error, "not collected without status");
+});
+
+test("the prose-continuation phrases the generic pair rule exempts survive the scrub, and a bare word after such a key does not", () => {
+  for (const phrase of PROSE_CONTINUATION_PHRASES) {
+    assertSurvivesScrub(phrase, phrase);
+    assertSurvivesScrub(scrubError(new Error(phrase)).message, `${phrase} through scrubError`);
+    assertSurvivesScrub(describeErrorBody("application/json", JSON.stringify({ message: phrase })), `${phrase} through describeErrorBody`);
+  }
+  for (const [text, expected] of [
+    ["secrets: truncated", `secrets: ${REDACTED}`],
+    ["client_token: expired", `client_token: ${REDACTED}`],
+    ["Authorization_RequestDenied: Insufficient privileges to complete the operation.", `Authorization_RequestDenied: ${REDACTED} privileges to complete the operation.`],
+    ["signing keys: rotated", `signing keys: ${REDACTED}`],
+  ]) {
+    assert.equal(scrubErrorText(text), expected, text);
+  }
 });
 
 test("the scrubError fixed texts for a value that yields no message survive the scrub, including under a Proxy whose every trap throws", () => {

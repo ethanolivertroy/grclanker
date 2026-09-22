@@ -186,15 +186,13 @@ const PLAIN_WORD_MAX_LENGTH = 20;
 const VERSION_PATTERN = /^\d+(?:\.\d+)+$/;
 const AUTH_PARAM_PATTERN = /^(?:realm|error|error_description|error_uri|scope|charset|algorithm|qop|stale|domain|opaque|title|resource|client_id|authorization_uri|as_uri|ticket)=/i;
 
-// A value after a compound credential-named key is judged for token shape only from this length.
-const MIN_CREDENTIAL_VALUE_LENGTH = 8;
-
 // Credential-named pairs in prose, headers, query strings, and JSON fragments: the key and separator
 // stay, the value goes whatever its shape (coordinator ruling on the Codex P2: any nonempty value
 // under a credential-classified key is redacted regardless of shape). The names are the credential
 // words themselves, the session names, the signed-URL and OAuth 1 parameters, and Duo's key names;
-// compound keys the Flue heuristic classifies (`client_token`, `InvalidAuthenticationToken`) are
-// handled by the generic pair rule below, which keeps prose after them.
+// compound keys the Flue heuristic classifies (`client_token`, `DB_PASSWORD`, `clientToken`,
+// `InvalidAuthenticationToken`) are handled by the generic pair rule below under the same ruling,
+// with the one prose exemption described there.
 const CREDENTIAL_PAIR_NAMES: readonly string[] = [
   "api[_-]?key",
   "app[_-]?key",
@@ -247,13 +245,26 @@ const CREDENTIAL_PAIR_NAMES: readonly string[] = [
 const CREDENTIAL_PAIR_PATTERN = new RegExp(String.raw`${NAME_START}(?:${CREDENTIAL_PAIR_NAMES.join("|")})\b${NAME_CLOSE_AND_SEPARATOR}`, "gi");
 
 // Every other `key=value`, `key: value`, `"key":"value"`, or `Header-Name: value` pair whose key names
-// a credential by the Flue heuristic (`client_token`, `user_session`, `tokens`,
-// `InvalidAuthenticationToken`): the value goes when it is shaped like a credential rather than a
-// prose word, so "InvalidAuthenticationToken: Access token has expired" stays readable. The value
-// does not end in ":" or ".", which close a clause, and a backslash ends it so a JSON-escaped closing
-// quote is kept.
-const GENERIC_PAIR_KEY_PATTERN = new RegExp(String.raw`${NAME_START}([A-Za-z][A-Za-z0-9_.-]{0,63})\b(?:${NAME_CLOSE_AND_SEPARATOR}(?:\\*["'])?)`, "g");
-const GENERIC_PAIR_VALUE_PATTERN = /(?!\[REDACTED\])[^\s"',;&<>()[\]{}\\]*[^\s"',;&<>()[\]{}\\:.]/y;
+// a credential by the Flue heuristic (`client_token`, `DB_PASSWORD`, `clientToken`, `user_session`,
+// `tokens`, `InvalidAuthenticationToken`): the key and separator stay and the value goes whatever its
+// shape, as under `CREDENTIAL_PAIR_PATTERN` (a human-chosen password under `DB_PASSWORD=` or
+// `admin_password:` is a credential as much as an issued token). The separator is captured because
+// the one exemption, a value that continues as prose, is read only after `Key: ` (see
+// `continuesAsProse`); `=` is an assignment and its value is always the credential.
+const GENERIC_PAIR_KEY_PATTERN = new RegExp(String.raw`${NAME_START}([A-Za-z][A-Za-z0-9_.-]{0,63})\b(?:\\*["'])?(\s*[:=]\s*)`, "g");
+// The prose exemption of the generic pair rule: a value continues as prose when it is one plain word
+// of letters (lowercase or capitalised, at most `PROSE_WORD_MAX_LENGTH` letters) or a count of at
+// most five digits, followed on the same line by a space and another word, number, or parenthesis,
+// as in "InvalidAuthenticationToken: Access token has expired", "TokenExpired: The token has
+// expired", "access_tokens: seen 40 of 120", "tokens: 3 of 5 rotated", or "secrets: unreadable (GET
+// /v1/secrets failed with 403 Forbidden)". The shape is no wider than the rule main shipped at
+// 02967cc (a value of six characters or more with a digit, a symbol, a case change inside the word,
+// or twelve characters redacts); the continuation requirement is new, so a word standing alone after
+// the separator (`client_token: expired`, `secrets: truncated`) is the value and goes.
+const PROSE_WORD_PATTERN = /^(?:[a-z]+|[A-Z][a-z]*|\d{1,5})$/;
+const PROSE_WORD_MAX_LENGTH = 11;
+const PROSE_SEPARATOR_PATTERN = /:[ \t]+$/;
+const PROSE_CONTINUATION_PATTERN = /[ \t]+[A-Za-z0-9(]/y;
 
 // JWT and JWE compact serialisations, AWS access key ids, and 40-character AWS secret access keys.
 // The secret shape is matched after any assignment operator too: `=` is not in the lookbehind, since
@@ -345,17 +356,14 @@ export function isCredentialKey(key: string): boolean {
 }
 
 /**
- * A value after a compound credential-named key (`client_token`, `user_session`, `access_tokens`,
- * `InvalidAuthenticationToken`) is the credential when it is at least eight characters and shaped
- * like a token: base64 or percent symbols, or a segment between "-", "_", "/", ".", or ":" that is not
- * shaped like part of a name (see `isNameSegment`). Words, codes, counts, and labels after such a key
- * are prose and stay ("InvalidAuthenticationToken: Access token has expired",
- * "Authorization_RequestDenied: Insufficient privileges", "access_tokens: seen 40 of 120").
+ * The prose exemption of the generic pair rule (see `PROSE_WORD_PATTERN`): true when the bare value
+ * that starts after `separator` is one plain word that another word or number follows on the same
+ * line. `valueEnd` is the index just past the value.
  */
-function looksLikeCredentialValue(value: string): boolean {
-  if (value.length < MIN_CREDENTIAL_VALUE_LENGTH) return false;
-  if (/[+=%]/.test(value)) return true;
-  return !value.split(/[-_/.:]/).every(isNameSegment);
+function continuesAsProse(text: string, separator: string, value: string, valueEnd: number): boolean {
+  if (!PROSE_SEPARATOR_PATTERN.test(separator)) return false;
+  if (value.length > PROSE_WORD_MAX_LENGTH || !PROSE_WORD_PATTERN.test(value)) return false;
+  return stickyExec(PROSE_CONTINUATION_PATTERN, text, valueEnd) !== null;
 }
 
 /**
@@ -597,9 +605,11 @@ function readBareValue(text: string, index: number, barePattern: RegExp): string
  * Reads the value of a header or credential-named pair: a quoted value goes whole up to its closing
  * quote with the quotes and a leading scheme word kept (`"Bearer value"` becomes `"Bearer
  * [REDACTED]"`); a bare value may carry a scheme word in front of it and then either a quoted value
- * (`Bearer "value"`) or a bare run.
+ * (`Bearer "value"`) or a bare run. A bare run is kept when `keepBare` says so (the generic pair
+ * rule's prose exemption, which reads the word after a scheme word too so `token_type: Bearer token
+ * expected` stays); a quoted value is never prose.
  */
-function readCarrierValue(text: string, valueStart: number, barePattern: RegExp): ValueReplacement | null {
+function readCarrierValue(text: string, valueStart: number, barePattern: RegExp, keepBare?: (value: string, valueEnd: number) => boolean): ValueReplacement | null {
   const quoted = readQuotedValue(text, valueStart);
   if (quoted !== null) {
     const content = text.slice(quoted.start, quoted.end);
@@ -616,7 +626,9 @@ function readCarrierValue(text: string, valueStart: number, barePattern: RegExp)
   }
   const value = readBareValue(text, afterScheme, barePattern);
   if (value === null) return null;
-  return { end: afterScheme + value.length, replacement: `${scheme}${REDACTED}` };
+  const valueEnd = afterScheme + value.length;
+  if (keepBare?.(value, valueEnd)) return null;
+  return { end: valueEnd, replacement: `${scheme}${REDACTED}` };
 }
 
 /** A credential header's value, unless the header name says the value is a descriptor (`...-token-type`). */
@@ -682,9 +694,12 @@ const readSchemeValue: ValueReader = (text, valueStart) => {
 
 /**
  * Replaces the value of every compound credential-named pair (the generic rule, see
- * `GENERIC_PAIR_KEY_PATTERN`). The key and separator are matched on their own and the value is consumed
- * only when the key names a credential and the value is shaped like one, so the value of an ordinary
- * pair is rescanned and a credential pair nested inside it (`data=token=...`) is still caught.
+ * `GENERIC_PAIR_KEY_PATTERN`). The key and separator are matched on their own and the value is
+ * consumed only when the key names a credential, so the value of an ordinary pair is rescanned from
+ * its second character and a credential pair nested inside it (`data=token=...`) or starting one
+ * character later (`\napi_key=...`, where the pattern first takes `napi_key`) is still caught. The
+ * value is read like a header's or an explicit credential pair's and goes whatever its shape, except
+ * a bare word after `Key: ` that continues as prose (see `continuesAsProse`).
  */
 function replaceGenericCredentialPairs(text: string): string {
   GENERIC_PAIR_KEY_PATTERN.lastIndex = 0;
@@ -692,17 +707,20 @@ function replaceGenericCredentialPairs(text: string): string {
   let last = 0;
   let match: RegExpExecArray | null;
   while ((match = GENERIC_PAIR_KEY_PATTERN.exec(text)) !== null) {
-    const [whole, key] = match;
+    const [whole, key, separator] = match;
     if (whole.length === 0) {
       GENERIC_PAIR_KEY_PATTERN.lastIndex += 1;
       continue;
     }
-    if (!isCredentialKey(key)) continue;
+    if (!isCredentialKey(key)) {
+      GENERIC_PAIR_KEY_PATTERN.lastIndex = match.index + 1;
+      continue;
+    }
     const valueStart = match.index + whole.length;
-    const value = stickyExec(GENERIC_PAIR_VALUE_PATTERN, text, valueStart);
-    if (value === null || !looksLikeCredentialValue(value)) continue;
-    out += `${text.slice(last, valueStart)}${REDACTED}`;
-    last = valueStart + value.length;
+    const read = readCarrierValue(text, valueStart, PAIR_BARE_VALUE_PATTERN, (value, valueEnd) => continuesAsProse(text, separator, value, valueEnd));
+    if (read === null) continue;
+    out += `${text.slice(last, valueStart)}${read.replacement}`;
+    last = read.end;
     GENERIC_PAIR_KEY_PATTERN.lastIndex = last;
   }
   return last === 0 ? text : `${out}${text.slice(last)}`;
@@ -715,8 +733,10 @@ function replaceGenericCredentialPairs(text: string): string {
  * Proxy-Authorization, x-api-key and the like, a scheme word in front of the value kept),
  * authorization scheme values in free text (Bearer, Basic, Digest, Token, OAuth, Negotiate, NTLM,
  * SSWS, ApiKey, Splunk), credential-named pairs in prose, headers, query strings, and JSON fragments
- * (the value whatever its shape), compound credential-named pairs (the value when it is shaped like
- * a token), JWTs, AWS key ids and secret keys, well-known vendor token prefixes, and (unless turned
+ * (the value whatever its shape, under the credential words themselves and under every compound or
+ * env-style key `isCredentialKey` classifies, `DB_PASSWORD`, `client_token`, `clientToken`; the one
+ * exemption is a plain word after `Key: ` that continues as prose, see `continuesAsProse`), JWTs,
+ * AWS key ids and secret keys, well-known vendor token prefixes, and (unless turned
  * off) long token-shaped runs. A quoted carrier value is removed whole, quotes kept, in double or
  * single quotes and JSON-escaped at any depth; on a compound line the next header's `Name:` token ends
  * a cookie's attributes and an unterminated quoted value, so that header keeps its name and gets its
@@ -732,8 +752,11 @@ function replaceGenericCredentialPairs(text: string): string {
  * account credentials: <path>` loses the path; `Token: non-JSON body` loses `non-JSON`;
  * `credentials: seen 40 of 120` loses `seen`); a path or other free value is rendered after a plain
  * word and a space (`config file <path>`, `in <path>`), never as the value of such a pair; an
- * inventory whose label is a credential word is labelled with a plural or compound word (`tokens`,
- * `api keys`, `secrets`) or followed by something other than a colon; server text that could end in
+ * inventory whose label `isCredentialKey` classifies (`tokens`, `secrets`, `api keys`) is followed
+ * by a colon only when the text after it continues as prose (`tokens: seen 40 of 120`, `secrets:
+ * unreadable (GET /v1/secrets failed with 403 Forbidden)`, `tokens: not collected`), never by a
+ * colon and one bare word (`secrets: truncated` loses `truncated`; write `secrets truncated` or
+ * `secrets inventory: truncated`); server text that could end in
  * a credential word is validated before it is placed in front of a colon (`reasonPhrase`); a scheme
  * word (`Bearer`, `Basic`, `Token`, `OAuth`, `Splunk`, ...) is followed only by a single plain word
  * or a hyphenated compound of lowercase words (`OAuth sign-in`), a dotted version (`OAuth 2.0`), a

@@ -234,7 +234,7 @@ test("scheme-carried values are removed whatever their casing or entropy; the pr
   }
 });
 
-test("credential-named pairs lose any nonempty value whatever its shape; compound credential keys keep prose and lose tokens", () => {
+test("credential-named pairs lose any nonempty value whatever its shape, compound and env-style keys included; the one exemption is a word that continues as prose", () => {
   // Codex P2 (credential-labelled pair with a short lowercase word value): guard 1 as written, no shape gate.
   for (const [text, expected] of [
     ["password: hunter2xyz", `password: ${REDACTED}`],
@@ -258,17 +258,77 @@ test("credential-named pairs lose any nonempty value whatever its shape; compoun
     assert.equal(scrubDataText(text), expected, text);
     assert.equal(redactSecretValues(text), expected, text);
   }
-  // A compound key the Flue heuristic classifies keeps a prose value and loses a token-shaped one.
-  for (const prose of ["InvalidAuthenticationToken: Access token has expired.", "access_tokens: seen 40 of 120", "user_session: 3 active sessions", "client_token: expired", "Authorization_RequestDenied: Insufficient privileges", "tokens: none are stale"]) {
+  // A compound or env-style key the Flue heuristic classifies is a carrier like the credential words
+  // themselves (review of #78, gap 1): the value goes whatever its shape, a human-chosen password
+  // included, in every separator and quoting form.
+  for (const [text, expected] of [
+    ["DB_PASSWORD=hunter2", `DB_PASSWORD=${REDACTED}`],
+    ["SPLUNK_PASSWORD=Summer2026!", `SPLUNK_PASSWORD=${REDACTED}`],
+    ["admin_password=correcthorsebatterystaple", `admin_password=${REDACTED}`],
+    ["GITHUB_TOKEN=letmein2024", `GITHUB_TOKEN=${REDACTED}`],
+    ["client_token=voxkqrrijhpp", `client_token=${REDACTED}`],
+    ["ZIA_PASSWORD=changeme", `ZIA_PASSWORD=${REDACTED}`],
+    ["DB_PASSWORD: P@ssw0rd", `DB_PASSWORD: ${REDACTED}`],
+    ["DB_PASSWORD=abc12", `DB_PASSWORD=${REDACTED}`],
+    ['{"client_token":"letmein2024"}', `{"client_token":"${REDACTED}"}`],
+    ['{"client_token":"expired"}', `{"client_token":"${REDACTED}"}`],
+    ['\\"clientToken\\": \\"hunter2\\"', `\\"clientToken\\": \\"${REDACTED}\\"`],
+    ["client-token='changeme'", `client-token='${REDACTED}'`],
+    ["client_token: expired", `client_token: ${REDACTED}`],
+    ["client_token: expired.", `client_token: ${REDACTED}.`],
+    ["client_token: expired, retry later", `client_token: ${REDACTED}, retry later`],
+    ["client_token=expired and more", `client_token=${REDACTED} and more`],
+    ["environment-token: present", `environment-token: ${REDACTED}`],
+    ["settings.token: enabled", `settings.token: ${REDACTED}`],
+    ["secrets: truncated", `secrets: ${REDACTED}`],
+    ["x-auth-mode: legacy", `x-auth-mode: ${REDACTED}`],
+    ["client_token: Bearer abcdef", `client_token: Bearer ${REDACTED}`],
+    ["client_token: Kq7Zx2Vw9Lm4Tp8R rejected", `client_token: ${REDACTED} rejected`],
+    ["user_session: 0f9e8d7c6b5a4938 rejected", `user_session: ${REDACTED} rejected`],
+    ["access_tokens: dGhpcyBpcyBh== rejected", `access_tokens: ${REDACTED} rejected`],
+    ["X-Vendor-Auth: a1b2c3d4e5f6 rejected", `X-Vendor-Auth: ${REDACTED} rejected`],
+    // The shapes main's rule at 02967cc redacted (a digit, a symbol, a case change, twelve characters) go here too.
+    ["client_token: LaunchDarkly request failed", `client_token: ${REDACTED} request failed`],
+    ["Authorization_RequestDenied: Insufficient privileges to complete the operation.", `Authorization_RequestDenied: ${REDACTED} privileges to complete the operation.`],
+    ["client_token: expired2 now", `client_token: ${REDACTED} now`],
+    ["client_token: OPENSESAME now", `client_token: ${REDACTED} now`],
+  ]) {
+    assert.equal(scrubErrorText(text), expected, text);
+    assert.equal(scrubDataText(text), expected, text);
+    assert.equal(redactSecretValues(text), expected, text);
+  }
+  // The one exemption: after `Key: `, one plain word (or a count under six digits) that another word,
+  // number, or parenthesis follows on the same line is prose. Its shape is no wider than main's at
+  // 02967cc (under six characters, or letters only under twelve with no case change inside the
+  // word); the continuation requirement is new. Each exempted phrase is pinned again in
+  // hardening-fixed-text.test.mjs.
+  for (const prose of [
+    "InvalidAuthenticationToken: Access token has expired.",
+    "TokenExpired: The token has expired",
+    "access_tokens: seen 40 of 120",
+    "tokens: 3 of 5 rotated",
+    "tokens: none are stale",
+    "user_session: 3 active sessions",
+    "token_type: Bearer token expected",
+    "secrets: unreadable (GET /v1/secrets failed with 403 Forbidden)",
+    "secrets: not collected",
+    "sdk-keys: 3 of 5 rotated",
+    "DB_PASSWORD: admin was rejected",
+  ]) {
     assert.equal(scrubErrorText(prose), prose);
     assert.equal(scrubDataText(prose), prose);
   }
-  for (const [key, value] of [["client_token", "Kq7Zx2Vw9Lm4Tp8R"], ["user_session", "0f9e8d7c6b5a4938"], ["access_tokens", "dGhpcyBpcyBh=="], ["X-Vendor-Auth", "a1b2c3d4e5f6"]]) {
-    assert.equal(scrubDataText(`${key}: ${value} rejected`), `${key}: ${REDACTED} rejected`, `${key} with a token-shaped value`);
+  // A scheme word standing alone after such a key is the whole value and stays (`token_type: Bearer`).
+  for (const text of ["token_type: Bearer", '{"access_token":"abc","token_type":"Bearer","expires_in":3600}', "X-Token-Type: Bearer"]) {
+    assert.equal(scrubErrorText(text), text.replace('"abc"', `"${REDACTED}"`), text);
   }
-  // A credential word inside a longer name, a path, or a dotted key is not a carrier.
-  for (const text of ["sdk-keys: 3 of 5 rotated", "environment-token: present", "settings.token: enabled", "GET /_security/api_key: 403 Forbidden", "the token: yes, but not this one"]) {
-    const expected = text === "the token: yes, but not this one" ? `the token: ${REDACTED}, but not this one` : text;
+  // A credential word inside a longer name, a path, or a dotted key is not one of the credential words
+  // (`NAME_START`), so the explicit pair rule leaves it to the generic rule, whose value is a status
+  // line here; a credential word after an article is the explicit pair.
+  for (const [text, expected] of [
+    ["GET /_security/api_key: 403 Forbidden", "GET /_security/api_key: 403 Forbidden"],
+    ["the token: yes, but not this one", `the token: ${REDACTED}, but not this one`],
+  ]) {
     assert.equal(scrubErrorText(text), expected, text);
   }
 });

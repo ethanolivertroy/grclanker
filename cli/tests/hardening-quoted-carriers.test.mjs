@@ -83,7 +83,6 @@ const MUST_KEEP = Object.freeze([
   '"Content-Length": "5120"',
   'X-Request-Id: "req-2026-09-22-zq"',
   'X-Rate-Limit-Remaining: "0"',
-  'X-Snowflake-Authorization-Token-Type: "KEYPAIR_JWT"',
   '{"headers":{"Accept":"application/json","Content-Type":"application/json"}}',
   "the Cookie header was rejected and the Authorization header was missing",
   '{"type": "Basic ", "scheme": "bearer"}',
@@ -91,7 +90,6 @@ const MUST_KEEP = Object.freeze([
   'X-Api-Key: ""',
   "Authorization: Bearer",
   '"cookies": ["consent", "theme"]',
-  "cookies: enabled",
   "Basic authentication is disabled for this deployment",
   "Bearer token authentication is required",
   "Bearer token-based auth is required",
@@ -175,6 +173,17 @@ test("quoted carriers: every must-keep row comes back unchanged from every scrub
   for (const text of MUST_KEEP) {
     for (const [scrubName, scrub] of EXACT_SCRUBS) {
       assert.equal(scrub(text), text, `${scrubName} changed ${JSON.stringify(text)}`);
+    }
+  }
+  // A quoted or bare value under a header or key that `isCredentialKey` classifies is a carrier value
+  // whatever its shape (review of #78, gap 1; main at 02967cc redacted both of these too), even when
+  // the header rule alone would keep it as a descriptor.
+  for (const [text, expected] of [
+    ['X-Snowflake-Authorization-Token-Type: "KEYPAIR_JWT"', `X-Snowflake-Authorization-Token-Type: "${REDACTED}"`],
+    ["cookies: enabled", `cookies: ${REDACTED}`],
+  ]) {
+    for (const [scrubName, scrub] of EXACT_SCRUBS) {
+      assert.equal(scrub(text), expected, `${scrubName} on ${JSON.stringify(text)}`);
     }
   }
 });
