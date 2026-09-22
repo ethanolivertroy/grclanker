@@ -19,7 +19,8 @@ import { homedir } from "node:os";
 import { basename, dirname, join, relative, resolve } from "node:path";
 import { ZipArchive } from "archiver";
 import { Type } from "@sinclair/typebox";
-import { parse as parseYaml } from "yaml";
+import { parse as parseYaml, YAMLError } from "yaml";
+import { createCredentialScrubber } from "./credential-scrub.js";
 import { errorResult, formatTable, textResult } from "./shared.js";
 
 type FetchImpl = typeof fetch;
@@ -187,10 +188,17 @@ export interface BoxResolvedConfig {
 
 export interface BoxAccessSurface {
   name: string;
-  endpoint: string;
+  /**
+   * The path the probe requested when it was readable, the failed request's label (method, path, query) when it was
+   * not, and null when no request was made for it.
+   */
+  endpoint: string | null;
   status: "readable" | "not_readable" | "not_configured";
-  count?: number;
+  /** Records the probe returned; null when the probe was not readable. */
+  count: number | null;
   error?: string;
+  /** The HTTP status a failed probe observed; null when the probe was readable or the failure produced no response. */
+  httpStatus: number | null;
 }
 
 export interface BoxAccessCheckResult {
@@ -239,9 +247,30 @@ export interface BoxListPage {
 export interface CollectedDataset<T> {
   data: T;
   error?: string;
+  /** The HTTP status the failed read observed; absent when the read completed or produced no response. */
   statusCode?: number;
+  /** The label of the request whose failure is recorded in `error`, when the client named one. */
+  request?: string;
+  /** True when no request was made because a dataset it depends on could not be read. */
+  notRequested?: boolean;
   truncated?: boolean;
 }
+
+/**
+ * Written in place of a list or record that was denied, errored, timed out, or never requested, so a bundle consumer
+ * cannot mistake a denial for an empty inventory. `status` is the HTTP status the failed request observed, "error"
+ * when the failure produced no response, and "not-collected" when no request was made.
+ */
+export interface BoxNotCollectedMarker {
+  collected: false;
+  status: number | "error" | "not-collected";
+  endpoint: string | null;
+  error: string | null;
+  reason: "not_readable" | "not_requested";
+}
+
+/** Per-policy assignment (or per-barrier segment) lists keyed by the parent id; a denied child read carries a marker. */
+export type BoxAssignmentMap = Record<string, JsonRecord[] | BoxNotCollectedMarker>;
 
 type AuthArgs = {
   auth_method?: string;
@@ -456,8 +485,12 @@ function clampNumber(value: number | undefined, fallback: number, min: number, m
   return Math.min(Math.max(parsed, min), max);
 }
 
+// The base URL keeps only scheme, host, and path: userinfo, query, and fragment would otherwise ride along into every
+// request label and error string.
 function normalizeBaseUrl(rawUrl: string): string {
   const parsed = new URL(rawUrl.trim());
+  parsed.username = "";
+  parsed.password = "";
   parsed.hash = "";
   parsed.search = "";
   parsed.pathname = parsed.pathname.replace(/\/+$/, "");
@@ -492,9 +525,31 @@ function daysBetween(later: Date, earlier: Date): number {
   return Math.floor((later.getTime() - earlier.getTime()) / 86_400_000);
 }
 
-function errorMessage(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
+/**
+ * The module's credential scrubber (see credential-scrub.ts for the boundary): carriers whatever the value's shape,
+ * every configured secret registered by a client in every encoded form, and real token shapes bare.
+ */
+const credentialScrubber = createCredentialScrubber();
+
+/**
+ * The scrub applied to every error string before it is recorded anywhere (findings, summaries, analysis objects,
+ * access surfaces, the bundle, tool results). Unanchored, idempotent, and independent of which client threw.
+ */
+export function scrubErrorText(text: string): string {
+  return credentialScrubber.scrub(text);
 }
+
+/**
+ * The single point where a thrown value becomes recorded text: every dataset error, access surface error, `_errors.log`
+ * line, and tool failure passes through here, so no path can record an unscrubbed message. A `SyntaxError` is named
+ * by class only because its message quotes the text that failed to parse.
+ */
+function errorMessage(error: unknown): string {
+  if (error instanceof SyntaxError) return PARSE_ERROR_NOTE;
+  return scrubErrorText(error instanceof Error ? error.message : String(error));
+}
+
+const PARSE_ERROR_NOTE = "SyntaxError: response could not be parsed as JSON; the parser's message is not recorded because it quotes the body";
 
 function truncateList<T>(items: T[], max = 25): T[] {
   return items.slice(0, max);
@@ -695,10 +750,72 @@ function applyOverlay(base: ConfigOverlay, overlay: ConfigOverlay): ConfigOverla
   return merged;
 }
 
-function readYamlConfigFile(pathname: string): ConfigOverlay | undefined {
-  if (!existsSync(pathname)) return undefined;
-  const parsed = parseYaml(readFileSync(pathname, "utf8"));
-  const record = asObject(parsed);
+/** Thrown when a Box config file cannot be read or parsed; the message is fixed text carrying only the path, an fs code, and a parser position. */
+export class BoxConfigFileError extends Error {
+  readonly path: string;
+  readonly code?: string;
+
+  constructor(message: string, path: string, code?: string) {
+    super(message);
+    this.name = "BoxConfigFileError";
+    this.path = path;
+    this.code = code;
+  }
+}
+
+const FS_ERROR_CODE_PATTERN = /^E[A-Z0-9_]{1,30}$/;
+const JSON_POSITION_PATTERN = /at position (\d+)/;
+
+function fsErrorCode(error: unknown): string | undefined {
+  const code = asObject(error)?.code;
+  return typeof code === "string" && FS_ERROR_CODE_PATTERN.test(code) ? code : undefined;
+}
+
+/**
+ * Read step of the two-step config loader: the filesystem's own wording (which can quote the path twice or describe
+ * the operation) is never interpolated; only the validated error code is. A missing file at a path the caller did not
+ * name explicitly is not an error and yields undefined.
+ */
+function readConfigFileText(pathname: string, label: string, required: boolean): string | undefined {
+  try {
+    return readFileSync(pathname, "utf8");
+  } catch (error) {
+    const code = fsErrorCode(error);
+    if (!required && code === "ENOENT") return undefined;
+    throw new BoxConfigFileError(`Unable to read ${label} ${pathname}${code ? ` (${code})` : ""}`, pathname, code);
+  }
+}
+
+/**
+ * Parse step for YAML: every thrown value is caught (yaml.parse throws a plain ReferenceError for an unresolved alias,
+ * whose message starts with the aliased value) and the line is taken only from a YAMLError's own position.
+ */
+function parseConfigYaml(text: string, pathname: string, label: string): unknown {
+  try {
+    return parseYaml(text);
+  } catch (error) {
+    const line = error instanceof YAMLError ? error.linePos?.[0]?.line : undefined;
+    throw new BoxConfigFileError(`Unable to parse ${label}: invalid YAML in ${pathname}${line ? ` at line ${line}` : ""}`, pathname, "INVALID_YAML");
+  }
+}
+
+/**
+ * Parse step for JSON: JSON.parse quotes a window of the source (or the whole source when it is short) in its message,
+ * so the message is never interpolated; the failure position is taken only through a strict pattern.
+ */
+function parseConfigJson(text: string, pathname: string, label: string): unknown {
+  try {
+    return JSON.parse(text);
+  } catch (error) {
+    const position = error instanceof SyntaxError ? JSON_POSITION_PATTERN.exec(error.message)?.[1] : undefined;
+    throw new BoxConfigFileError(`Unable to parse ${label}: invalid JSON in ${pathname}${position ? ` at position ${position}` : ""}`, pathname, "INVALID_JSON");
+  }
+}
+
+function readYamlConfigFile(pathname: string, required: boolean): ConfigOverlay | undefined {
+  const text = readConfigFileText(pathname, "Box config file", required);
+  if (text === undefined) return undefined;
+  const record = asObject(parseConfigYaml(text, pathname, "Box config file"));
   if (!record) return undefined;
   const boxSection = asObject(record.box);
   return overlayFromRecord(boxSection ? { ...record, ...boxSection } : record);
@@ -712,10 +829,8 @@ function readJwtConfigFile(pathname: string): {
   passphrase?: string;
   publicKeyId?: string;
 } {
-  if (!existsSync(pathname)) {
-    throw new Error(`Box JWT config file was not found: ${pathname}`);
-  }
-  const parsed = asObject(JSON.parse(readFileSync(pathname, "utf8"))) ?? {};
+  const text = readConfigFileText(pathname, "Box JWT config file", true) ?? "";
+  const parsed = asObject(parseConfigJson(text, pathname, "Box JWT config file")) ?? {};
   const appSettings = asObject(parsed.boxAppSettings) ?? {};
   const appAuth = asObject(appSettings.appAuth) ?? {};
   return {
@@ -753,12 +868,12 @@ export function resolveBoxConfiguration(
   const resolvedConfigPath = configPath
     ? resolve(cwd, configPath)
     : join(homeDir, DEFAULT_CONFIG_DIR, DEFAULT_CONFIG_FILE);
-  const fileOverlay = readYamlConfigFile(resolvedConfigPath);
+  const fileOverlay = readYamlConfigFile(resolvedConfigPath, Boolean(configPath));
   if (fileOverlay && overlayHasValues(fileOverlay)) {
     merged = applyOverlay(merged, fileOverlay);
     sourceChain.push(configPath ? `config:${relative(cwd, resolvedConfigPath) || resolvedConfigPath}` : `home:${DEFAULT_CONFIG_DIR}/${DEFAULT_CONFIG_FILE}`);
   } else if (configPath) {
-    throw new Error(`Box config file was not found or was empty: ${resolvedConfigPath}`);
+    throw new BoxConfigFileError(`Box config file did not contain any Box settings: ${resolvedConfigPath}`, resolvedConfigPath, "EMPTY_CONFIG");
   }
 
   const envOverlay = overlayFromEnv(env);
@@ -847,13 +962,13 @@ export function resolveBoxConfiguration(
   };
 }
 
+/**
+ * Registers the given secrets with the module scrubber and scrubs the message under every rule of credential-scrub.ts:
+ * the secrets in every encoded form, carriers whatever the value's shape, and real token shapes bare.
+ */
 export function redactSecrets(message: string, secrets: Array<string | undefined>): string {
-  let redacted = message.replace(/Bearer\s+[A-Za-z0-9._~+/=-]+/g, "Bearer [REDACTED]");
-  for (const secret of secrets) {
-    if (!secret || secret.length < 6) continue;
-    redacted = redacted.split(secret).join("[REDACTED]");
-  }
-  return redacted;
+  credentialScrubber.registerSecrets(secrets);
+  return scrubErrorText(message);
 }
 
 function keySegments(name: string): string[] {
@@ -938,14 +1053,26 @@ export function projectEnterpriseEvent(event: JsonRecord): JsonRecord {
 
 interface UnreadableInventory {
   name: string;
-  endpoint: string;
+  /** The request whose failure made the inventory unreadable, or null when the client did not name one. */
+  endpoint: string | null;
+  /** The HTTP status that request observed, or null when the failure produced no response. */
+  status: number | null;
   reason: string;
   unchecked: string;
 }
 
-function unreadableInventory(name: string, endpoint: string, dataset: CollectedDataset<unknown>, unchecked: string): UnreadableInventory | undefined {
+/**
+ * The gap a finding records for an inventory it reads that could not be collected. The endpoint and status are the
+ * ones the failed request observed; nothing is named from a constant.
+ */
+function unreadableInventory(name: string, dataset: CollectedDataset<unknown>, unchecked: string): UnreadableInventory | undefined {
   if (!dataset.error) return undefined;
-  return { name, endpoint, reason: unreadableReason(dataset), unchecked };
+  return { name, endpoint: dataset.request ?? null, status: dataset.statusCode ?? null, reason: unreadableReason(dataset), unchecked };
+}
+
+/** "collaboration_allowlist_entries (GET /collaboration_whitelist_entries?limit=500)" or just the name when no request was recorded. */
+function describeInventory(name: string, dataset: CollectedDataset<unknown>): string {
+  return dataset.request ? `${name} (${dataset.request})` : name;
 }
 
 /**
@@ -958,11 +1085,11 @@ function capForUnreadableInventories(item: BoxFinding, inventories: Array<Unread
   if (unreadable.length === 0) return item;
   const evidence = {
     ...(item.evidence ?? {}),
-    unreadable_inventories: unreadable.map(({ name, endpoint, reason }) => ({ name, endpoint, reason })),
+    unreadable_inventories: unreadable.map(({ name, endpoint, status, reason }) => ({ name, endpoint, status, reason })),
   };
   if (item.status !== "pass" && item.status !== "warn") return { ...item, evidence };
   const described = unreadable
-    .map((entry) => `${entry.name} (${entry.endpoint}) could not be read because ${entry.reason}, so ${entry.unchecked}`)
+    .map((entry) => `${entry.name}${entry.endpoint ? ` (${entry.endpoint})` : ""} could not be read because ${entry.reason}, so ${entry.unchecked}`)
     .join("; ");
   return {
     ...item,
@@ -1019,30 +1146,82 @@ function signatureDigest(algorithm: JwtAlgorithm): string {
   }
 }
 
+/**
+ * A Box response with a non-2xx status. `request` is the label of the request that observed it (method, path, and
+ * query, without the origin), so every endpoint and status a finding or summary names is one the run actually saw.
+ */
 export class BoxApiError extends Error {
   readonly status: number;
   readonly code?: string;
   readonly requestId?: string;
+  readonly request?: string;
 
-  constructor(message: string, status: number, code?: string, requestId?: string) {
+  constructor(message: string, status: number, code?: string, requestId?: string, request?: string) {
     super(message);
     this.name = "BoxApiError";
     this.status = status;
     this.code = code;
     this.requestId = requestId;
+    this.request = request;
   }
 }
 
-function boxErrorSummary(payload: unknown): { message?: string; code?: string; requestId?: string } {
+/** A request that produced no response (timeout, connection failure); it carries the request label but no status. */
+export class BoxTransportError extends Error {
+  readonly request: string;
+
+  constructor(message: string, request: string) {
+    super(message);
+    this.name = "BoxTransportError";
+    this.request = request;
+  }
+}
+
+/** The request label of a thrown value, when the client recorded one. */
+function requestOf(error: unknown): string | undefined {
+  return error instanceof BoxApiError || error instanceof BoxTransportError ? error.request : undefined;
+}
+
+/** "GET /users?fields=id,login&limit=100": the method plus the path and query of a request, without the origin. */
+export function describeBoxRequest(method: string, url: string): string {
+  try {
+    const parsed = new URL(url);
+    return `${method.toUpperCase()} ${parsed.pathname}${parsed.search}`;
+  } catch {
+    return `${method.toUpperCase()} ${url}`;
+  }
+}
+
+/** "403 Forbidden", or just "403" when the response carried no status text. */
+function statusLine(response: Response): string {
+  return response.statusText ? `${response.status} ${response.statusText}` : String(response.status);
+}
+
+// Box's documented error codes are short identifiers (access_denied_insufficient_permissions, rate_limit_exceeded);
+// anything else in the field is not the documented shape and is not quoted.
+const ERROR_CODE_PATTERN = /^[a-z0-9_-]{1,80}$/i;
+const MAX_ERROR_DETAIL_LENGTH = 300;
+
+/**
+ * Only Box's documented JSON error fields (message, error_description, error, context_info.message, code, request_id)
+ * are quoted, each scrubbed before it is cut to length: cutting first could leave the tail of a token that the
+ * whole-value scrub no longer recognizes.
+ */
+function boxErrorSummary(payload: unknown, redact: (text: string) => string): { message?: string; code?: string; requestId?: string } {
   const object = asObject(payload);
   if (!object) return {};
   const contextMessage = asString(asObject(object.context_info)?.message);
+  const message = [asString(object.message), asString(object.error_description), asString(object.error), contextMessage]
+    .filter((item): item is string => Boolean(item))
+    .map((item) => redact(item).replace(/\s+/g, " "))
+    .join("; ")
+    .slice(0, MAX_ERROR_DETAIL_LENGTH);
+  const rawCode = asString(object.code) ?? asString(object.error);
+  const rawRequestId = asString(object.request_id);
   return {
-    message: [asString(object.message), asString(object.error_description), asString(object.error), contextMessage]
-      .filter((item): item is string => Boolean(item))
-      .join("; ") || undefined,
-    code: asString(object.code) ?? asString(object.error),
-    requestId: asString(object.request_id),
+    message: message.length > 0 ? message : undefined,
+    code: rawCode && ERROR_CODE_PATTERN.test(rawCode) ? rawCode : undefined,
+    requestId: rawRequestId && ERROR_CODE_PATTERN.test(rawRequestId) ? rawRequestId : undefined,
   };
 }
 
@@ -1107,6 +1286,15 @@ export class BoxApiClient implements BoxReadClient {
       this.accessToken = config.accessToken;
       this.accessTokenExpiresAt = Number.MAX_SAFE_INTEGER;
     }
+    // The configured secrets are scrubbed from every recorded error string in every encoded form from here on; tokens
+    // issued later are registered as they arrive.
+    credentialScrubber.registerSecrets([
+      config.clientSecret,
+      config.accessToken,
+      config.refreshToken,
+      config.jwt?.passphrase,
+      config.jwt?.privateKey,
+    ]);
   }
 
   getResolvedConfig(): BoxResolvedConfig {
@@ -1117,20 +1305,8 @@ export class BoxApiClient implements BoxReadClient {
     return this.now();
   }
 
-  private secrets(): Array<string | undefined> {
-    return [
-      this.config.clientSecret,
-      this.config.accessToken,
-      this.config.refreshToken,
-      this.config.jwt?.passphrase,
-      this.config.jwt?.privateKey,
-      this.accessToken,
-      this.refreshToken,
-    ];
-  }
-
   private redact(message: string): string {
-    return redactSecrets(message, this.secrets());
+    return scrubErrorText(message);
   }
 
   private buildUrl(pathOrUrl: string, query: JsonRecord = {}): string {
@@ -1146,16 +1322,16 @@ export class BoxApiClient implements BoxReadClient {
     return url.toString();
   }
 
-  private async fetchWithTimeout(url: string, init: RequestInit): Promise<Response> {
+  private async fetchWithTimeout(url: string, init: RequestInit, request: string): Promise<Response> {
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), this.config.timeoutMs);
     try {
       return await this.fetchImpl(url, { ...init, signal: controller.signal });
     } catch (error) {
       if (controller.signal.aborted) {
-        throw new Error(`Box request timed out after ${this.config.timeoutMs}ms: ${this.redact(url)}`);
+        throw new BoxTransportError(`Box request timed out after ${this.config.timeoutMs}ms: ${request}`, request);
       }
-      throw new Error(`Box request failed: ${this.redact(errorMessage(error))}`);
+      throw new BoxTransportError(`Box request failed: ${request}: ${errorMessage(error)}`, request);
     } finally {
       clearTimeout(timeout);
     }
@@ -1176,6 +1352,7 @@ export class BoxApiClient implements BoxReadClient {
   ): Promise<JsonRecord> {
     let attempt = 0;
     let refreshed = false;
+    const request = describeBoxRequest(init.method ?? "GET", url);
     for (;;) {
       const headers = new Headers(init.headers ?? {});
       if (!headers.has("accept")) headers.set("accept", "application/json");
@@ -1183,19 +1360,21 @@ export class BoxApiClient implements BoxReadClient {
         headers.set("authorization", `Bearer ${await this.getAccessToken()}`);
       }
 
-      const response = await this.fetchWithTimeout(url, { ...init, headers });
+      const response = await this.fetchWithTimeout(url, { ...init, headers }, request);
       const rawText = await response.text();
-      let payload: JsonRecord = {};
-      let nonJsonDetail: string | undefined;
+      let payload: JsonRecord | undefined;
+      let bodyNote: string | undefined;
       if (rawText.length > 0) {
         try {
-          payload = asObject(JSON.parse(rawText)) ?? {};
+          payload = asObject(JSON.parse(rawText));
         } catch {
-          nonJsonDetail = `non-JSON ${response.headers.get("content-type") ?? "unknown content type"} response body (${rawText.length} bytes, not echoed)`;
+          // A body that is not JSON (an HTML proxy page, a WAF block) can reflect the request, including its
+          // Authorization header, so it is described by content type and length and never echoed.
+          bodyNote = `non-JSON ${response.headers.get("content-type") ?? "unknown content type"} response body (${rawText.length} bytes, not echoed)`;
         }
       }
 
-      if (response.ok) return payload;
+      if (response.ok) return payload ?? {};
 
       if (response.status === 401 && !refreshed && options.allowRefresh !== false && !options.skipAuth && this.canRefresh()) {
         refreshed = true;
@@ -1210,13 +1389,17 @@ export class BoxApiClient implements BoxReadClient {
         continue;
       }
 
-      const summary = boxErrorSummary(payload);
-      const detail = summary.message ?? nonJsonDetail;
+      const summary = boxErrorSummary(payload, (text) => this.redact(text));
+      if (payload !== undefined && summary.message === undefined && rawText.length > 0) {
+        bodyNote = `JSON body without a documented error field (${rawText.length} bytes, not echoed)`;
+      }
+      const detail = summary.message ?? bodyNote;
       throw new BoxApiError(
-        this.redact(`Box request failed (${response.status} ${response.statusText})${detail ? `: ${detail}` : ""}`),
+        this.redact(`Box request failed (${statusLine(response)}) for ${request}${detail ? `: ${detail}` : ""}`),
         response.status,
         summary.code,
         summary.requestId,
+        request,
       );
     }
   }
@@ -1299,6 +1482,7 @@ export class BoxApiClient implements BoxReadClient {
     this.accessTokenExpiresAt = this.now().getTime() + Math.max((expiresIn - 60) * 1000, 60_000);
     const nextRefreshToken = asString(payload.refresh_token);
     if (nextRefreshToken) this.refreshToken = nextRefreshToken;
+    credentialScrubber.registerSecrets([accessToken, nextRefreshToken]);
     return accessToken;
   }
 
@@ -1541,6 +1725,7 @@ async function collect<T>(loader: () => Promise<T>, fallback: T): Promise<Collec
       data: fallback,
       error: errorMessage(error),
       statusCode: error instanceof BoxApiError ? error.status : undefined,
+      request: requestOf(error),
     };
   }
 }
@@ -1551,21 +1736,83 @@ async function collectList(loader: () => Promise<BoxListPage>): Promise<Collecte
     data: collected.data.items,
     error: collected.error,
     statusCode: collected.statusCode,
-    truncated: collected.data.truncated,
+    request: collected.request,
+    truncated: collected.error ? undefined : collected.data.truncated,
   };
+}
+
+/** True when the read completed; a dataset that was denied, errored, or timed out proves nothing about its inventory. */
+function isRead(dataset: CollectedDataset<unknown>): boolean {
+  return dataset.error === undefined;
+}
+
+/** True when the read completed without stopping at a cap, so counts and names derived from it are complete. */
+function isComplete(dataset: CollectedDataset<unknown>): boolean {
+  return isRead(dataset) && dataset.truncated !== true;
+}
+
+/** A value derived from a dataset renders only when the dataset was read at all. */
+function whenRead<T>(dataset: CollectedDataset<unknown>, value: T): T | null {
+  return isRead(dataset) ? value : null;
+}
+
+/** A value joined across several datasets renders only when every one of them was read. */
+function whenAllRead<T>(datasets: Array<CollectedDataset<unknown>>, value: T): T | null {
+  return datasets.every(isRead) ? value : null;
+}
+
+/**
+ * A list of records observed to hold a property: the records found are real observations and always render, while an
+ * empty list renders `[]` only when every dataset that could have revealed one was read completely, and null otherwise.
+ */
+function observedList<T>(sources: Array<CollectedDataset<unknown>>, items: T[]): T[] | null {
+  return items.length > 0 || sources.every(isComplete) ? items : null;
+}
+
+/** The count of records observed to hold a property, with the same rule as observedList: zero is asserted only from complete reads. */
+function observedCount(sources: Array<CollectedDataset<unknown>>, count: number): number | null {
+  return count > 0 || sources.every(isComplete) ? count : null;
+}
+
+function isNotCollectedMarker(value: unknown): value is BoxNotCollectedMarker {
+  return asObject(value)?.collected === false;
+}
+
+/** The marker written for a dataset whose read did not complete, or that was never requested. */
+function notReadableMarker(dataset: CollectedDataset<unknown>): BoxNotCollectedMarker {
+  if (dataset.notRequested) return notRequestedMarker();
+  return {
+    collected: false,
+    status: dataset.statusCode ?? "error",
+    endpoint: dataset.request ?? null,
+    error: dataset.error ?? null,
+    reason: "not_readable",
+  };
+}
+
+/** The marker written for a dataset that was never requested. */
+function notRequestedMarker(): BoxNotCollectedMarker {
+  return { collected: false, status: "not-collected", endpoint: null, error: null, reason: "not_requested" };
+}
+
+/** The child list read for one parent id, or undefined when that read was denied or never made. */
+function childList(map: BoxAssignmentMap, parentId: string | undefined): JsonRecord[] | undefined {
+  const entry = parentId === undefined ? undefined : map[parentId];
+  return Array.isArray(entry) ? entry : undefined;
 }
 
 function datasetErrors(label: string, dataset: CollectedDataset<unknown>): string[] {
   return dataset.error ? [`${label}: ${dataset.error}`] : [];
 }
 
+/** Records loaded by a read: array length, the summed length of the child lists that were read, or 1 for a record. */
 function datasetRecordCount(data: unknown): number | null {
   if (Array.isArray(data)) return data.length;
   const record = asObject(data);
   if (!record) return null;
   const values = Object.values(record);
-  if (values.length > 0 && values.every((value) => Array.isArray(value))) {
-    return values.reduce((total, items) => total + (items as unknown[]).length, 0);
+  if (values.length > 0 && values.every((value) => Array.isArray(value) || isNotCollectedMarker(value))) {
+    return values.reduce<number>((total, items) => total + (Array.isArray(items) ? items.length : 0), 0);
   }
   return values.length > 0 ? 1 : 0;
 }
@@ -1638,6 +1885,19 @@ function unusedSettings(settings: ConfigSettings, keys: string[] = Object.keys(s
 
 function hasUnusedSettings(unused: JsonRecord): boolean {
   return Object.keys(unused).length > 0;
+}
+
+/**
+ * The is_used states and unused settings a finding records for a configuration category; both render null when the
+ * category could not be read so a denied configuration never looks like one with every setting in use.
+ */
+function settingsEvidence(readable: boolean, settings: ConfigSettings, unused: JsonRecord): { is_used: Record<string, boolean | null> | null; unused_settings: JsonRecord | null } {
+  return { is_used: readable ? isUsedStates(settings) : null, unused_settings: readable ? unused : null };
+}
+
+/** "N" for a dataset that was read, "unread" for one that was not, so a sentence never states a zero from a denied read. */
+function countOrUnread(dataset: CollectedDataset<unknown>, count: number): string {
+  return isRead(dataset) ? String(count) : "unread";
 }
 
 function unusedSettingsSummary(unused: JsonRecord, consequence: string): string {
@@ -1827,9 +2087,9 @@ export interface BoxGovernanceData {
   classificationTemplate: CollectedDataset<JsonRecord>;
   metadataTemplates: CollectedDataset<JsonRecord[]>;
   retentionPolicies: CollectedDataset<JsonRecord[]>;
-  retentionAssignments: CollectedDataset<Record<string, JsonRecord[]>>;
+  retentionAssignments: CollectedDataset<BoxAssignmentMap>;
   legalHoldPolicies: CollectedDataset<JsonRecord[]>;
-  legalHoldAssignments: CollectedDataset<Record<string, JsonRecord[]>>;
+  legalHoldAssignments: CollectedDataset<BoxAssignmentMap>;
   configuration: CollectedDataset<JsonRecord>;
 }
 
@@ -1837,7 +2097,7 @@ export interface BoxShieldData {
   enterpriseId?: string;
   configuration: CollectedDataset<JsonRecord>;
   barriers: CollectedDataset<JsonRecord[]>;
-  barrierSegments: CollectedDataset<Record<string, JsonRecord[]>>;
+  barrierSegments: CollectedDataset<BoxAssignmentMap>;
   shieldLists: CollectedDataset<JsonRecord[]>;
   events: CollectedDataset<JsonRecord[]>;
   lookbackDays: number;
@@ -1903,7 +2163,14 @@ export function assessBoxIdentityAccessData(data: BoxIdentityData, options: BoxI
   const activeUsers = users.filter(isActiveHumanUser);
   const usersTruncated = data.users.truncated === true;
   const inventoryGap = usersReadable ? userInventoryGap(users, usersTruncated) : undefined;
-  const inventoryEvidence = { sampled_users: users.length, admin_users: admins.length, users_truncated: usersTruncated, inventory_gap: inventoryGap ?? null };
+  // Every count and name below is gated on the dataset that proves it: a denied user listing renders null, never 0 or
+  // [], and a user is named as holding a property only from a record that was actually read.
+  const inventoryEvidence = {
+    sampled_users: whenRead(data.users, users.length),
+    admin_users: whenRead(data.users, admins.length),
+    users_truncated: whenRead(data.users, usersTruncated),
+    inventory_gap: inventoryGap ?? null,
+  };
   const inventoryManualEvidence = "Admin Console > Users & Groups: export the full managed user list (including the primary admin) and confirm the count matches the API inventory before relying on user-level findings.";
 
   const findings: BoxFinding[] = [];
@@ -1913,8 +2180,7 @@ export function assessBoxIdentityAccessData(data: BoxIdentityData, options: BoxI
   const ssoEvidence = {
     is_enterprise_sso_required: ssoRequired ?? null,
     is_enterprise_sso_in_testing: ssoTesting ?? null,
-    is_used: isUsedStates(ssoSettings),
-    unused_settings: ssoUnused,
+    ...settingsEvidence(userSettingsReadable, ssoSettings, ssoUnused),
   };
   const ssoManualEvidence = "Admin Console > Enterprise Settings > User Settings > Configure Single Sign On (SSO): confirm SSO is set to Required, not Enabled (optional) or Test mode, and record the identity provider.";
   findings.push(
@@ -1942,10 +2208,9 @@ export function assessBoxIdentityAccessData(data: BoxIdentityData, options: BoxI
     is_multi_factor_auth_required: mfaRequired ?? null,
     multi_factor_auth_type: mfaType ?? null,
     is_enterprise_sso_required: ssoRequired ?? null,
-    is_used: isUsedStates(mfaSettings),
-    unused_settings: mfaUnused,
-    privileged_users: privileged.length,
-    exempt_privileged_users: truncateList(exemptPrivileged.map(userLabel)),
+    ...settingsEvidence(securityReadable, mfaSettings, mfaUnused),
+    privileged_users: whenRead(data.users, privileged.length),
+    exempt_privileged_users: observedList([data.users], truncateList(exemptPrivileged.map(userLabel))),
     ...inventoryEvidence,
   };
   const adminMfaManualEvidence = "Admin Console > Enterprise Settings > Security > 2-Step Verification: confirm 2-step verification is required for all managed users, and open each admin and co-admin user record to confirm the 'Exempt from 2-step verification' option is not set.";
@@ -1975,9 +2240,8 @@ export function assessBoxIdentityAccessData(data: BoxIdentityData, options: BoxI
     is_multi_factor_auth_required: mfaRequired ?? null,
     multi_factor_auth_type: mfaType ?? null,
     is_enterprise_sso_required: ssoRequired ?? null,
-    is_used: isUsedStates(mfaSettings),
-    unused_settings: mfaUnused,
-    exempt_users: truncateList(exemptUsers.map(userLabel)),
+    ...settingsEvidence(securityReadable, mfaSettings, mfaUnused),
+    exempt_users: observedList([data.users], truncateList(exemptUsers.map(userLabel))),
     ...inventoryEvidence,
   };
   const userMfaManualEvidence = "Admin Console > Enterprise Settings > Security > 2-Step Verification: confirm 2-step verification is required for all users, including external collaborators.";
@@ -2005,10 +2269,10 @@ export function assessBoxIdentityAccessData(data: BoxIdentityData, options: BoxI
 
   const adminRoleChanges = events.filter((event) => eventType(event) === "CHANGE_ADMIN_ROLE");
   const adminCountEvidence = {
-    admins: truncateList(admins.map(userLabel)),
-    coadmins: truncateList(coAdmins.map(userLabel)),
+    admins: observedList([data.users], truncateList(admins.map(userLabel))),
+    coadmins: observedList([data.users], truncateList(coAdmins.map(userLabel))),
     max_admins: maxAdmins,
-    admin_role_change_events: adminRoleChanges.length,
+    admin_role_change_events: observedCount([data.events], adminRoleChanges.length),
     ...inventoryEvidence,
   };
   findings.push(
@@ -2027,7 +2291,7 @@ export function assessBoxIdentityAccessData(data: BoxIdentityData, options: BoxI
       : coAdmins.length > 0
         ? finding(18, "manual", `${coAdmins.length} co-admin accounts exist; the Box API does not expose individual co-admin permission sets, so scoping must be confirmed in the Admin Console.`, { coadmins: truncateList(coAdmins.map(userLabel)), ...inventoryEvidence }, "Admin Console > Users & Groups > (each co-admin) > Edit User Access Permissions: confirm each co-admin has only the permission categories they need (for example Users and Groups, Reports, Content) and no co-admin holds the full set equivalent to a primary admin.")
         : inventoryGap
-          ? finding(18, "warn", `Co-admin permission scoping could not be assessed because ${inventoryGap}.`, { coadmins: 0, ...inventoryEvidence }, inventoryManualEvidence)
+          ? finding(18, "warn", `Co-admin permission scoping could not be assessed because ${inventoryGap}.`, { coadmins: observedCount([data.users], 0), ...inventoryEvidence }, inventoryManualEvidence)
           : finding(18, "pass", "No co-admin accounts exist, so there are no delegated permission sets to scope.", { coadmins: 0, ...inventoryEvidence }),
   );
 
@@ -2059,8 +2323,7 @@ export function assessBoxIdentityAccessData(data: BoxIdentityData, options: BoxI
     is_password_leak_detection_enabled: passwordLeakDetection ?? null,
     password_reset_frequency: passwordResetFrequency ?? null,
     previous_password_reuse_limit: passwordReuseLimit ?? null,
-    is_used: isUsedStates(passwordSettings),
-    unused_settings: unusedSettings(passwordSettings),
+    ...settingsEvidence(securityReadable, passwordSettings, unusedSettings(passwordSettings)),
     required_min_length: minPasswordLength,
   };
   const passwordManualEvidence = "Admin Console > Enterprise Settings > Security > Password Requirements: record minimum length, character class rules, weak password prevention, reset frequency, and reuse limits.";
@@ -2091,8 +2354,7 @@ export function assessBoxIdentityAccessData(data: BoxIdentityData, options: BoxI
     session_hours: sessionHours === undefined || !Number.isFinite(sessionHours) ? null : sessionHours,
     is_custom_session_duration_enabled: customSessionEnabled ?? null,
     custom_session_duration_value: customSessionValue ?? null,
-    is_used: isUsedStates(sessionSettings),
-    unused_settings: unusedSettings(sessionSettings),
+    ...settingsEvidence(securityReadable, sessionSettings, unusedSettings(sessionSettings)),
     max_session_hours: maxSessionHours,
   };
   const sessionManualEvidence = "Admin Console > Enterprise Settings > Security > Session Duration: record the inactivity timeout and any custom group durations.";
@@ -2126,7 +2388,7 @@ export function assessBoxIdentityAccessData(data: BoxIdentityData, options: BoxI
         : data.shieldLists.error
           ? `Shield lists could not be read (${unreadableReason(data.shieldLists)}) and the Box API does not expose enterprise IP allowlisting settings.`
           : "No Shield IP lists exist and the Box API does not expose enterprise IP allowlisting settings.",
-      { shield_ip_lists: truncateList(ipLists.map((list) => asString(list.name) ?? asString(list.id) ?? "list")), shield_lists_error: data.shieldLists.error ?? null },
+      { shield_ip_lists: whenRead(data.shieldLists, truncateList(ipLists.map((list) => asString(list.name) ?? asString(list.id) ?? "list"))), shield_lists_error: data.shieldLists.error ?? null },
       "Admin Console > Enterprise Settings > Security > Allowed IP addresses (or Box Shield > Access Policies > Session and location rules): record the enforced IP ranges and which user populations they apply to.",
     ),
   );
@@ -2146,16 +2408,19 @@ export function assessBoxIdentityAccessData(data: BoxIdentityData, options: BoxI
   const inactiveWithFailedLogins = inactiveCandidates.filter((user) => failedLoginActorIds.has(asString(user.id) ?? ""));
   const eventsTruncated = data.events.truncated === true;
   const inactiveRatio = activeUsers.length > 0 ? inactiveCandidates.length / activeUsers.length : 0;
+  // Inactivity is the absence of an event, so a user is named inactive only when the event stream was read completely
+  // and the user's own record was read; a capped stream renders the candidates as unknown.
+  const inactivityProven = usersReadable && isComplete(data.events);
   const inactivityEvidence = {
     lookback_days: data.lookbackDays,
-    active_users: activeUsers.length,
-    inactive_candidates: truncateList(inactiveCandidates.map(userLabel)),
-    inactive_candidates_with_failed_logins: truncateList(inactiveWithFailedLogins.map(userLabel)),
-    sampled_events: events.length,
-    activity_events: activityEvents.length,
-    failed_login_events: failedLogins.length,
+    active_users: whenRead(data.users, activeUsers.length),
+    inactive_candidates: inactivityProven ? truncateList(inactiveCandidates.map(userLabel)) : null,
+    inactive_candidates_with_failed_logins: inactivityProven ? truncateList(inactiveWithFailedLogins.map(userLabel)) : null,
+    sampled_events: whenRead(data.events, events.length),
+    activity_events: whenRead(data.events, activityEvents.length),
+    failed_login_events: whenRead(data.events, failedLogins.length),
     event_limit: data.eventLimit,
-    events_truncated: eventsTruncated,
+    events_truncated: whenRead(data.events, eventsTruncated),
     ...inventoryEvidence,
   };
   const inactivityManualEvidence = `Admin Console > Reports > User Activity (or the Users report with last login): identify users with no login in the last ${data.lookbackDays} days and confirm deactivation decisions.`;
@@ -2180,16 +2445,16 @@ export function assessBoxIdentityAccessData(data: BoxIdentityData, options: BoxI
     title: "Box identity and access posture",
     summary: {
       enterprise_id: data.enterpriseId ?? null,
-      sampled_users: users.length,
-      admins: admins.length,
-      coadmins: coAdmins.length,
-      exempt_privileged_users: exemptPrivileged.length,
+      sampled_users: whenRead(data.users, users.length),
+      admins: whenRead(data.users, admins.length),
+      coadmins: whenRead(data.users, coAdmins.length),
+      exempt_privileged_users: observedCount([data.users], exemptPrivileged.length),
       sso_required: ssoRequired ?? null,
       mfa_required: mfaRequired ?? null,
       password_min_length: passwordMinLength ?? null,
       session_duration: sessionDuration ?? null,
-      inactive_candidates: inactiveCandidates.length,
-      sampled_events: events.length,
+      inactive_candidates: inactivityProven ? inactiveCandidates.length : null,
+      sampled_events: whenRead(data.events, events.length),
       lookback_days: data.lookbackDays,
     },
     findings: sortFindings(findings),
@@ -2272,28 +2537,27 @@ export function assessBoxSharingCollaborationData(data: BoxSharingData, options:
   const externalUnused = unusedSettings(externalSettings, ["external_collaboration_status"]);
   const externalEvidence = {
     external_collaboration_status: externalStatus ?? null,
-    collaboration_restrictions: collaborationRestrictions,
-    allowlist_entries: entries.length,
-    allowlist_exempt_users: exemptTargets.length + allowlistUsers.length,
-    is_used: isUsedStates(externalSettings),
-    unused_settings: externalUnused,
+    collaboration_restrictions: configReadable ? collaborationRestrictions : null,
+    allowlist_entries: whenRead(data.allowlistEntries, entries.length),
+    allowlist_exempt_users: configReadable && isRead(data.exemptTargets) ? exemptTargets.length + allowlistUsers.length : null,
+    ...settingsEvidence(configReadable, externalSettings, externalUnused),
   };
   const externalManualEvidence = "Admin Console > Enterprise Settings > Content & Sharing > Collaboration: record whether external collaboration is enabled for everyone, restricted to allowlisted domains, or disabled.";
-  const allowlistUnreadable = unreadableInventory("collaboration_allowlist_entries", "/collaboration_whitelist_entries", data.allowlistEntries, "the permitted external domains were not checked");
-  const exemptTargetsUnreadable = unreadableInventory("collaboration_allowlist_exempt_targets", "/collaboration_whitelist_exempt_targets", data.exemptTargets, "users exempt from the domain restriction were not checked");
-  const collaborationConfigUnreadable = unreadableInventory("enterprise_configuration (content_and_sharing)", "/enterprise_configurations/{enterprise_id}", data.configuration, "the external collaboration mode that decides whether an empty allowlist is compliant was not checked");
+  const allowlistUnreadable = unreadableInventory("collaboration_allowlist_entries", data.allowlistEntries, "the permitted external domains were not checked");
+  const exemptTargetsUnreadable = unreadableInventory("collaboration_allowlist_exempt_targets", data.exemptTargets, "users exempt from the domain restriction were not checked");
+  const collaborationConfigUnreadable = unreadableInventory("enterprise_configuration (content_and_sharing)", data.configuration, "the external collaboration mode that decides whether an empty allowlist is compliant was not checked");
   findings.push(capForUnreadableInventories(
     !configReadable
       ? allowlistReadable && entries.length > 0
         ? finding(4, "warn", `${entries.length} collaboration allowlist domains exist, but the enterprise external collaboration mode could not be read (${configUnreadableReason}).`, externalEvidence, "Admin Console > Enterprise Settings > Content & Sharing > Collaboration: confirm external collaboration is limited to allowlisted domains or disabled.")
         : finding(4, "manual", `External collaboration settings could not be read because ${configUnreadableReason}.`, externalEvidence, externalManualEvidence)
       : hasUnusedSettings(externalUnused)
-        ? finding(4, "warn", unusedSettingsSummary(externalUnused, `the external collaboration mode cannot be treated as enforced (${entries.length} allowlist entries visible)`), externalEvidence, externalManualEvidence)
+        ? finding(4, "warn", unusedSettingsSummary(externalUnused, `the external collaboration mode cannot be treated as enforced (${countOrUnread(data.allowlistEntries, entries.length)} allowlist entries visible)`), externalEvidence, externalManualEvidence)
         : externalStatus === "limit_collaboration_to_users_within_enterprise"
         ? finding(4, "pass", "External collaboration is limited to users within the enterprise.", externalEvidence)
         : externalStatus === "limit_collaboration_to_allowlisted_domains"
           ? !allowlistReadable
-            ? finding(4, "warn", `External collaboration is limited to allowlisted domains, but the collaboration allowlist (/collaboration_whitelist_entries) could not be read because ${unreadableReason(data.allowlistEntries)}, so the permitted domains were not checked.`, externalEvidence, "Admin Console > Enterprise Settings > Content & Sharing > Collaboration > Allowlisted domains: export the domain list and confirm each entry is a business partner.")
+            ? finding(4, "warn", `External collaboration is limited to allowlisted domains, but the ${describeInventory("collaboration allowlist", data.allowlistEntries)} could not be read because ${unreadableReason(data.allowlistEntries)}, so the permitted domains were not checked.`, externalEvidence, "Admin Console > Enterprise Settings > Content & Sharing > Collaboration > Allowlisted domains: export the domain list and confirm each entry is a business partner.")
             : entries.length > 0
               ? finding(4, "pass", `External collaboration is limited to allowlisted domains (${entries.length} domain entries visible).`, externalEvidence)
               : finding(4, "warn", "External collaboration is limited to allowlisted domains, but the allowlist is empty, which may block all external work or indicate an incomplete rollout.", externalEvidence)
@@ -2312,14 +2576,14 @@ export function assessBoxSharingCollaborationData(data: BoxSharingData, options:
   });
   const bothDirectionEntries = entries.filter((entry) => asString(entry.direction) === "both");
   const allowlistEvidence = {
-    allowlist_entries: truncateList(entries.map((entry) => `${asString(entry.domain) ?? "domain"} (${asString(entry.direction) ?? "direction"})`)),
-    public_email_domains: publicDomainEntries.map((entry) => asString(entry.domain)),
-    stale_entries: truncateList(staleEntries.map((entry) => asString(entry.domain))),
-    undated_entries: truncateList(undatedEntries.map((entry) => `${asString(entry.domain) ?? asString(entry.id) ?? "entry"} (created_at: ${entry.created_at === undefined ? "missing" : JSON.stringify(entry.created_at)})`)),
-    both_direction_entries: bothDirectionEntries.length,
-    exempt_targets: exemptTargets.length,
+    allowlist_entries: observedList([data.allowlistEntries], truncateList(entries.map((entry) => `${asString(entry.domain) ?? "domain"} (${asString(entry.direction) ?? "direction"})`))),
+    public_email_domains: observedList([data.allowlistEntries], publicDomainEntries.map((entry) => asString(entry.domain))),
+    stale_entries: observedList([data.allowlistEntries], truncateList(staleEntries.map((entry) => asString(entry.domain)))),
+    undated_entries: observedList([data.allowlistEntries], truncateList(undatedEntries.map((entry) => `${asString(entry.domain) ?? asString(entry.id) ?? "entry"} (created_at: ${entry.created_at === undefined ? "missing" : JSON.stringify(entry.created_at)})`))),
+    both_direction_entries: observedCount([data.allowlistEntries], bothDirectionEntries.length),
+    exempt_targets: observedCount([data.exemptTargets], exemptTargets.length),
     stale_days: staleDays,
-    allowlist_truncated: allowlistTruncated,
+    allowlist_truncated: whenAllRead([data.allowlistEntries, data.exemptTargets], allowlistTruncated),
   };
   const allowlistManualEvidence = "Admin Console > Enterprise Settings > Content & Sharing > Collaboration > Allowlisted domains: export the domain list and review each entry for business justification, direction, and age.";
   const allowlistReviewReasons = [
@@ -2333,7 +2597,7 @@ export function assessBoxSharingCollaborationData(data: BoxSharingData, options:
       : publicDomainEntries.length > 0
         ? finding(5, "fail", `${publicDomainEntries.length} allowlisted domains are public consumer email providers, which effectively allow anyone to collaborate.`, allowlistEvidence)
         : allowlistTruncated
-          ? finding(5, "warn", `The collaboration allowlist collection stopped at the cap (${entries.length} entries and ${exemptTargets.length} exempt users retrieved) while Box reported more records, so unreviewed public, stale, or exempt entries may remain; raise list_limit and rerun.`, allowlistEvidence, allowlistManualEvidence)
+          ? finding(5, "warn", `The collaboration allowlist collection stopped at the cap (${entries.length} entries and ${countOrUnread(data.exemptTargets, exemptTargets.length)} exempt users retrieved) while Box reported more records, so unreviewed public, stale, or exempt entries may remain; raise list_limit and rerun.`, allowlistEvidence, allowlistManualEvidence)
         : entries.length === 0
           ? finding(5, externalStatus === "limit_collaboration_to_allowlisted_domains" ? "warn" : "pass", entries.length === 0 && externalStatus === "limit_collaboration_to_allowlisted_domains" ? "The allowlist is empty while collaboration is limited to allowlisted domains." : "No collaboration allowlist entries exist to audit.", allowlistEvidence)
           : allowlistReviewReasons.length > 0
@@ -2351,8 +2615,7 @@ export function assessBoxSharingCollaborationData(data: BoxSharingData, options:
     shared_link_default_access: sharedLinkDefault ?? null,
     shared_link_access: sharedLinkAllowed ?? null,
     shared_link_company_definition: configString(configuration, "content_and_sharing", "shared_link_company_definition") ?? null,
-    is_used: isUsedStates(linkSettings),
-    unused_settings: linkUnused,
+    ...settingsEvidence(configReadable, linkSettings, linkUnused),
   };
   const linkManualEvidence = "Admin Console > Enterprise Settings > Content & Sharing > Shared Links: record the default link access level and whether open (public) links are permitted.";
   findings.push(
@@ -2387,8 +2650,7 @@ export function assessBoxSharingCollaborationData(data: BoxSharingData, options:
     is_public_shared_links_expiration_enabled: publicExpirationEnabled ?? null,
     public_shared_links_expiration_days: publicExpirationDays ?? null,
     shared_expiration_target: configString(configuration, "content_and_sharing", "shared_expiration_target") ?? null,
-    is_used: isUsedStates(expirationSettings),
-    unused_settings: unusedSettings(expirationSettings),
+    ...settingsEvidence(configReadable, expirationSettings, unusedSettings(expirationSettings)),
   };
   const expirationManualEvidence = "Admin Console > Enterprise Settings > Content & Sharing > Shared Links: confirm automatic expiration is enabled and record the day count.";
   findings.push(
@@ -2427,8 +2689,7 @@ export function assessBoxSharingCollaborationData(data: BoxSharingData, options:
   const watermarkEvidence = {
     is_watermarking_enterprise_feature_enabled: watermarkingEnabled ?? null,
     watermark_feature_states: watermarkFeatures.map((setting) => asString(setting.state) ?? "unknown"),
-    is_used: isUsedStates(watermarkSettings),
-    unused_settings: watermarkUnused,
+    ...settingsEvidence(configReadable, watermarkSettings, watermarkUnused),
   };
   const watermarkManualEvidence = "Admin Console > Enterprise Settings > Content & Sharing > Watermarking: confirm watermarking is enabled and which folders or classifications apply it.";
   findings.push(
@@ -2449,8 +2710,13 @@ export function assessBoxSharingCollaborationData(data: BoxSharingData, options:
     finding(
       19,
       "manual",
-      `${appEvents.length} app authorization or creation events occurred in the last ${data.lookbackDays} days and ${integrationLists.length} Shield integration lists exist; the Box API does not expose the app approval policy itself.`,
-      { app_events: countEventTypes(appEvents), integration_shield_lists: integrationLists.map((list) => asString(list.name) ?? asString(list.id) ?? "list"), events_error: data.events.error ?? null },
+      `${countOrUnread(data.events, appEvents.length)} app authorization or creation events occurred in the last ${data.lookbackDays} days and ${countOrUnread(data.shieldLists, integrationLists.length)} Shield integration lists exist; the Box API does not expose the app approval policy itself.`,
+      {
+        app_events: whenRead(data.events, countEventTypes(appEvents)),
+        integration_shield_lists: whenRead(data.shieldLists, integrationLists.map((list) => asString(list.name) ?? asString(list.id) ?? "list")),
+        events_error: data.events.error ?? null,
+        shield_lists_error: data.shieldLists.error ?? null,
+      },
       "Admin Console > Apps > Custom Apps Manager and Individual Application Controls: confirm unpublished and third-party apps are disabled by default and require admin approval, and reconcile the authorized app list against the events above.",
     ),
   );
@@ -2459,9 +2725,9 @@ export function assessBoxSharingCollaborationData(data: BoxSharingData, options:
   const externalTerms = data.termsOfServices.data.filter((terms) => asString(terms.tos_type) === "external");
   const enabledManaged = managedTerms.filter((terms) => asString(terms.status) === "enabled");
   const tosEvidence = {
-    managed_terms: managedTerms.map((terms) => ({ id: asString(terms.id), status: asString(terms.status), modified_at: asString(terms.modified_at) })),
-    external_terms: externalTerms.map((terms) => ({ id: asString(terms.id), status: asString(terms.status) })),
-    terms_accept_events: events.filter((event) => eventType(event) === "TERMS_OF_SERVICE_ACCEPT").length,
+    managed_terms: whenRead(data.termsOfServices, managedTerms.map((terms) => ({ id: asString(terms.id), status: asString(terms.status), modified_at: asString(terms.modified_at) }))),
+    external_terms: whenRead(data.termsOfServices, externalTerms.map((terms) => ({ id: asString(terms.id), status: asString(terms.status) }))),
+    terms_accept_events: observedCount([data.events], events.filter((event) => eventType(event) === "TERMS_OF_SERVICE_ACCEPT").length),
   };
   findings.push(
     data.termsOfServices.error
@@ -2479,16 +2745,16 @@ export function assessBoxSharingCollaborationData(data: BoxSharingData, options:
     summary: {
       enterprise_id: data.enterpriseId ?? null,
       external_collaboration_status: externalStatus ?? null,
-      allowlist_entries: entries.length,
-      public_email_domains: publicDomainEntries.length,
-      stale_allowlist_entries: staleEntries.length,
-      undated_allowlist_entries: undatedEntries.length,
-      exempt_targets: exemptTargets.length,
+      allowlist_entries: whenRead(data.allowlistEntries, entries.length),
+      public_email_domains: observedCount([data.allowlistEntries], publicDomainEntries.length),
+      stale_allowlist_entries: observedCount([data.allowlistEntries], staleEntries.length),
+      undated_allowlist_entries: observedCount([data.allowlistEntries], undatedEntries.length),
+      exempt_targets: whenRead(data.exemptTargets, exemptTargets.length),
       shared_link_default_access: sharedLinkDefault ?? null,
       shared_links_expiration_enabled: expirationEnabled ?? null,
       watermarking_enabled: watermarkingEnabled ?? null,
-      managed_terms_enabled: enabledManaged.length,
-      app_events: appEvents.length,
+      managed_terms_enabled: whenRead(data.termsOfServices, enabledManaged.length),
+      app_events: whenRead(data.events, appEvents.length),
       lookback_days: data.lookbackDays,
     },
     findings: sortFindings(findings),
@@ -2515,26 +2781,48 @@ export async function assessBoxSharingCollaboration(
   return assessBoxSharingCollaborationData(await collectBoxSharingData(client, options), options);
 }
 
+/**
+ * Reads one child list per parent record. A denied child read is recorded as a marker under the parent's id (never
+ * an empty list), the first failure's status and request are carried on the dataset, and the parents beyond the
+ * per-run cap are reported as truncation. A parent listing that was not itself read yields no child reads at all.
+ */
 async function collectAssignments(
-  policies: JsonRecord[],
-  loader: (policyId: string) => Promise<BoxListPage>,
-): Promise<CollectedDataset<Record<string, JsonRecord[]>>> {
-  const result: Record<string, JsonRecord[]> = {};
+  parents: CollectedDataset<JsonRecord[]>,
+  loader: (parentId: string) => Promise<BoxListPage>,
+): Promise<CollectedDataset<BoxAssignmentMap>> {
+  if (!isRead(parents)) {
+    return { data: {}, error: "not requested because the parent listing could not be read", notRequested: true };
+  }
+  const result: BoxAssignmentMap = {};
   const errors: string[] = [];
-  let truncated = policies.length > MAX_ASSIGNMENT_POLICIES;
-  for (const policy of policies.slice(0, MAX_ASSIGNMENT_POLICIES)) {
-    const policyId = asString(policy.id);
-    if (!policyId) continue;
+  let firstFailure: CollectedDataset<unknown> | undefined;
+  let truncated = parents.data.length > MAX_ASSIGNMENT_POLICIES;
+  for (const parent of parents.data.slice(0, MAX_ASSIGNMENT_POLICIES)) {
+    const parentId = asString(parent.id);
+    if (!parentId) continue;
     try {
-      const page = await loader(policyId);
-      result[policyId] = page.items;
+      const page = await loader(parentId);
+      result[parentId] = page.items;
       truncated = truncated || page.truncated;
     } catch (error) {
-      result[policyId] = [];
-      errors.push(`${policyId}: ${errorMessage(error)}`);
+      const failed: CollectedDataset<unknown> = {
+        data: undefined,
+        error: errorMessage(error),
+        statusCode: error instanceof BoxApiError ? error.status : undefined,
+        request: requestOf(error),
+      };
+      firstFailure = firstFailure ?? failed;
+      result[parentId] = notReadableMarker(failed);
+      errors.push(`${parentId}: ${failed.error}`);
     }
   }
-  return { data: result, error: errors.length > 0 ? errors.join("; ") : undefined, truncated };
+  return {
+    data: result,
+    error: errors.length > 0 ? errors.join("; ") : undefined,
+    statusCode: firstFailure?.statusCode,
+    request: firstFailure?.request,
+    truncated: errors.length > 0 ? undefined : truncated,
+  };
 }
 
 export async function collectBoxGovernanceData(
@@ -2552,8 +2840,8 @@ export async function collectBoxGovernanceData(
     collectList(() => client.listLegalHoldPolicies(listLimit)),
   ]);
   const [retentionAssignments, legalHoldAssignments] = await Promise.all([
-    collectAssignments(retentionPolicies.data, (policyId) => client.listRetentionPolicyAssignments(policyId, listLimit)),
-    collectAssignments(legalHoldPolicies.data, (policyId) => client.listLegalHoldPolicyAssignments(policyId, listLimit)),
+    collectAssignments(retentionPolicies, (policyId) => client.listRetentionPolicyAssignments(policyId, listLimit)),
+    collectAssignments(legalHoldPolicies, (policyId) => client.listLegalHoldPolicyAssignments(policyId, listLimit)),
   ]);
   return {
     enterpriseId,
@@ -2568,10 +2856,25 @@ export async function collectBoxGovernanceData(
   };
 }
 
-function assignmentCountTotal(policy: JsonRecord): number {
+/** The total of a policy's own assignment_counts, or null when the record carries none. */
+function assignmentCountTotal(policy: JsonRecord): number | null {
   const counts = asObject(policy.assignment_counts);
-  if (!counts) return 0;
+  if (!counts) return null;
   return Object.values(counts).reduce<number>((total, value) => total + (asNumber(value) ?? 0), 0);
+}
+
+/**
+ * Assignments a policy is known to have: the child listing when it was read, otherwise the policy's own
+ * assignment_counts total, otherwise null. Zero is stated only from a source that was read.
+ */
+function knownAssignments(policy: JsonRecord, assignments: BoxAssignmentMap): number | null {
+  const listed = childList(assignments, asString(policy.id));
+  if (listed !== undefined) return listed.length > 0 ? listed.length : (assignmentCountTotal(policy) ?? 0);
+  return assignmentCountTotal(policy);
+}
+
+function hasKnownAssignments(policy: JsonRecord, assignments: BoxAssignmentMap): boolean {
+  return (knownAssignments(policy, assignments) ?? 0) > 0;
 }
 
 function classificationOptions(template: JsonRecord): string[] {
@@ -2587,8 +2890,8 @@ export function assessBoxDataGovernanceData(data: BoxGovernanceData): BoxAssessm
   const pins = data.devicePinners.data;
   const pinProducts = countEventTypesBy(pins, (pin) => asString(pin.product_name) ?? "unknown");
   const deviceEvidence = {
-    device_pins: pins.length,
-    device_pin_products: pinProducts,
+    device_pins: whenRead(data.devicePinners, pins.length),
+    device_pin_products: whenRead(data.devicePinners, pinProducts),
     is_device_limit_exemption_enabled_for_new_users: configBool(configuration, "user_settings", "is_device_limit_exemption_enabled_for_new_users") ?? null,
     is_box_sync_restricted_for_new_users: configBool(configuration, "user_settings", "is_box_sync_restricted_for_new_users") ?? null,
   };
@@ -2601,10 +2904,12 @@ export function assessBoxDataGovernanceData(data: BoxGovernanceData): BoxAssessm
   );
 
   const templates = data.metadataTemplates.data;
-  const classifications = data.classificationTemplate.error ? [] : classificationOptions(data.classificationTemplate.data);
+  // A 404 is Box saying no classification template exists, which is a readable answer of zero labels.
+  const classificationReadable = isRead(data.classificationTemplate) || data.classificationTemplate.statusCode === 404;
+  const classifications = isRead(data.classificationTemplate) ? classificationOptions(data.classificationTemplate.data) : [];
   const classificationEvidence = {
-    classifications,
-    enterprise_metadata_templates: templates.length,
+    classifications: classificationReadable ? classifications : null,
+    enterprise_metadata_templates: whenRead(data.metadataTemplates, templates.length),
     classification_error: data.classificationTemplate.error ?? null,
   };
   findings.push(
@@ -2617,21 +2922,18 @@ export function assessBoxDataGovernanceData(data: BoxGovernanceData): BoxAssessm
 
   const retentionPolicies = data.retentionPolicies.data;
   const activeRetention = retentionPolicies.filter((policy) => (asString(policy.status) ?? "active") === "active");
-  const assignedRetention = activeRetention.filter((policy) => {
-    const policyId = asString(policy.id) ?? "";
-    return (data.retentionAssignments.data[policyId]?.length ?? 0) > 0 || assignmentCountTotal(policy) > 0;
-  });
+  const assignedRetention = activeRetention.filter((policy) => hasKnownAssignments(policy, data.retentionAssignments.data));
   const retentionEvidence = {
-    retention_policies: truncateList(retentionPolicies.map((policy) => ({
+    retention_policies: whenRead(data.retentionPolicies, truncateList(retentionPolicies.map((policy) => ({
       name: asString(policy.policy_name),
       status: asString(policy.status),
       type: asString(policy.policy_type),
       retention_length: asString(policy.retention_length),
       disposition_action: asString(policy.disposition_action),
-      assignments: (data.retentionAssignments.data[asString(policy.id) ?? ""]?.length ?? 0) || assignmentCountTotal(policy),
-    }))),
-    active_policies: activeRetention.length,
-    assigned_policies: assignedRetention.length,
+      assignments: knownAssignments(policy, data.retentionAssignments.data),
+    })))),
+    active_policies: whenRead(data.retentionPolicies, activeRetention.length),
+    assigned_policies: observedCount([data.retentionPolicies, data.retentionAssignments], assignedRetention.length),
   };
   const retentionManualEvidence = "Admin Console > Governance > Retention: record each policy, its retention length, disposition action, and the folders or metadata it is assigned to.";
   findings.push(capForUnreadableInventories(
@@ -2642,24 +2944,21 @@ export function assessBoxDataGovernanceData(data: BoxGovernanceData): BoxAssessm
         : activeRetention.length > 0
           ? finding(12, "warn", `${activeRetention.length} active retention policies exist but none have visible assignments.`, retentionEvidence)
           : finding(12, "fail", "No active retention policies exist.", retentionEvidence),
-    [unreadableInventory("retention_policy_assignments", "/retention_policies/{policy_id}/assignments", data.retentionAssignments, "the folders and metadata each policy is assigned to were not checked (only the policy's own assignment_counts were read)")],
+    [unreadableInventory("retention_policy_assignments", data.retentionAssignments, "the folders and metadata each policy is assigned to were not checked (only the policy's own assignment_counts were read)")],
     retentionManualEvidence,
   ));
 
   const legalHolds = data.legalHoldPolicies.data;
   const activeHolds = legalHolds.filter((policy) => ["active", "applying"].includes(asString(policy.status) ?? ""));
-  const assignedHolds = activeHolds.filter((policy) => {
-    const policyId = asString(policy.id) ?? "";
-    return (data.legalHoldAssignments.data[policyId]?.length ?? 0) > 0 || assignmentCountTotal(policy) > 0;
-  });
+  const assignedHolds = activeHolds.filter((policy) => hasKnownAssignments(policy, data.legalHoldAssignments.data));
   const holdEvidence = {
-    legal_hold_policies: truncateList(legalHolds.map((policy) => ({
+    legal_hold_policies: whenRead(data.legalHoldPolicies, truncateList(legalHolds.map((policy) => ({
       name: asString(policy.policy_name),
       status: asString(policy.status),
-      assignments: (data.legalHoldAssignments.data[asString(policy.id) ?? ""]?.length ?? 0) || assignmentCountTotal(policy),
-    }))),
-    active_policies: activeHolds.length,
-    assigned_policies: assignedHolds.length,
+      assignments: knownAssignments(policy, data.legalHoldAssignments.data),
+    })))),
+    active_policies: whenRead(data.legalHoldPolicies, activeHolds.length),
+    assigned_policies: observedCount([data.legalHoldPolicies, data.legalHoldAssignments], assignedHolds.length),
   };
   const holdManualEvidence = "Admin Console > Governance > Legal Holds: record each policy, its custodians or folders, and confirm the legal team's hold process is documented.";
   findings.push(capForUnreadableInventories(
@@ -2670,7 +2969,7 @@ export function assessBoxDataGovernanceData(data: BoxGovernanceData): BoxAssessm
         : activeHolds.length > 0
           ? finding(13, "warn", `${activeHolds.length} active legal hold policies exist without visible assignments.`, holdEvidence)
           : finding(13, "warn", "No legal hold policies exist; confirm a documented process exists to create holds when litigation is anticipated.", holdEvidence, "Obtain the legal team's hold procedure and confirm Box Governance is licensed so holds can be applied when required."),
-    [unreadableInventory("legal_hold_policy_assignments", "/legal_hold_policy_assignments", data.legalHoldAssignments, "the custodians and content each hold covers were not checked (only the policy's own assignment_counts were read)")],
+    [unreadableInventory("legal_hold_policy_assignments", data.legalHoldAssignments, "the custodians and content each hold covers were not checked (only the policy's own assignment_counts were read)")],
     holdManualEvidence,
   ));
 
@@ -2679,13 +2978,13 @@ export function assessBoxDataGovernanceData(data: BoxGovernanceData): BoxAssessm
     title: "Box data governance posture",
     summary: {
       enterprise_id: data.enterpriseId ?? null,
-      device_pins: pins.length,
-      classifications: classifications.length,
-      metadata_templates: templates.length,
-      retention_policies: retentionPolicies.length,
-      assigned_retention_policies: assignedRetention.length,
-      legal_hold_policies: legalHolds.length,
-      assigned_legal_hold_policies: assignedHolds.length,
+      device_pins: whenRead(data.devicePinners, pins.length),
+      classifications: classificationReadable ? classifications.length : null,
+      metadata_templates: whenRead(data.metadataTemplates, templates.length),
+      retention_policies: whenRead(data.retentionPolicies, retentionPolicies.length),
+      assigned_retention_policies: observedCount([data.retentionPolicies, data.retentionAssignments], assignedRetention.length),
+      legal_hold_policies: whenRead(data.legalHoldPolicies, legalHolds.length),
+      assigned_legal_hold_policies: observedCount([data.legalHoldPolicies, data.legalHoldAssignments], assignedHolds.length),
     },
     findings: sortFindings(findings),
     errors: [
@@ -2743,7 +3042,7 @@ export async function collectBoxShieldData(
       limit: eventLimit,
     })),
   ]);
-  const barrierSegments = await collectAssignments(barriers.data, (barrierId) => client.listShieldInformationBarrierSegments(barrierId));
+  const barrierSegments = await collectAssignments(barriers, (barrierId) => client.listShieldInformationBarrierSegments(barrierId));
   return { enterpriseId, configuration, barriers, barrierSegments, shieldLists, events, lookbackDays, eventLimit, now };
 }
 
@@ -2759,10 +3058,10 @@ export function assessBoxShieldMonitoringData(data: BoxShieldData): BoxAssessmen
 
   const ruleCategories = countEventTypesBy(shieldRules, (rule) => asString(rule.rule_category) ?? "unknown");
   const ruleEvidence = {
-    shield_rules: truncateList(shieldRules.map((rule) => ({ name: asString(rule.name), category: asString(rule.rule_category), priority: asString(rule.priority) }))),
-    rule_categories: ruleCategories,
-    shield_lists: data.shieldLists.data.length,
-    shield_events: Object.fromEntries(Object.entries(eventCounts).filter(([type]) => type.startsWith("SHIELD_"))),
+    shield_rules: shieldReadable ? truncateList(shieldRules.map((rule) => ({ name: asString(rule.name), category: asString(rule.rule_category), priority: asString(rule.priority) }))) : null,
+    rule_categories: shieldReadable ? ruleCategories : null,
+    shield_lists: whenRead(data.shieldLists, data.shieldLists.data.length),
+    shield_events: whenRead(data.events, Object.fromEntries(Object.entries(eventCounts).filter(([type]) => type.startsWith("SHIELD_")))),
   };
   findings.push(
     !shieldReadable
@@ -2775,14 +3074,14 @@ export function assessBoxShieldMonitoringData(data: BoxShieldData): BoxAssessmen
   const barriers = data.barriers.data;
   const enabledBarriers = barriers.filter((barrier) => asString(barrier.status) === "enabled");
   const barrierEvidence = {
-    barriers: truncateList(barriers.map((barrier) => ({
+    barriers: whenRead(data.barriers, truncateList(barriers.map((barrier) => ({
       id: asString(barrier.id),
       status: asString(barrier.status),
-      segments: data.barrierSegments.data[asString(barrier.id) ?? ""]?.length ?? 0,
-    }))),
-    enabled_barriers: enabledBarriers.length,
+      segments: childList(data.barrierSegments.data, asString(barrier.id))?.length ?? null,
+    })))),
+    enabled_barriers: whenRead(data.barriers, enabledBarriers.length),
   };
-  const enabledWithSegments = enabledBarriers.filter((barrier) => (data.barrierSegments.data[asString(barrier.id) ?? ""]?.length ?? 0) > 0);
+  const enabledWithSegments = enabledBarriers.filter((barrier) => (childList(data.barrierSegments.data, asString(barrier.id))?.length ?? 0) > 0);
   const barrierManualEvidence = "Admin Console > Shield > Information Barriers: record each barrier, its segments, and the restrictions between segments, or confirm barriers are not required for this enterprise.";
   findings.push(capForUnreadableInventories(
     data.barriers.error
@@ -2794,13 +3093,13 @@ export function assessBoxShieldMonitoringData(data: BoxShieldData): BoxAssessmen
           : barriers.length > 0
             ? finding(15, "warn", `${barriers.length} information barriers exist but none are enabled.`, barrierEvidence)
             : finding(15, "warn", "No information barriers are configured; confirm segregation between groups is not required.", barrierEvidence, "Document whether regulatory or conflict-of-interest requirements call for information barriers between business units."),
-    [unreadableInventory("shield_information_barrier_segments", "/shield_information_barrier_segments", data.barrierSegments, "the segments behind the enabled barriers were not checked")],
+    [unreadableInventory("shield_information_barrier_segments", data.barrierSegments, "the segments behind the enabled barriers were not checked")],
     barrierManualEvidence,
   ));
 
   const streamEvidence = {
-    sampled_events: events.length,
-    event_types: eventCounts,
+    sampled_events: whenRead(data.events, events.length),
+    event_types: whenRead(data.events, eventCounts),
     lookback_days: data.lookbackDays,
     events_error: data.events.error ?? null,
     verified_scope: "admin_logs stream readability only",
@@ -2819,16 +3118,16 @@ export function assessBoxShieldMonitoringData(data: BoxShieldData): BoxAssessmen
   const accessEvents = events.filter((event) => /^(DOWNLOAD|PREVIEW|FILE_WATERMARKED_DOWNLOAD)$/.test(eventType(event)));
   const anomalyRules = shieldRules.filter((rule) => /anomal|threat|download|session|location|malicious/i.test(`${asString(rule.rule_category) ?? ""} ${asString(rule.name) ?? ""}`));
   const monitoringEvidence = {
-    anomaly_events: anomalyEvents.length,
-    content_access_events: accessEvents.length,
+    anomaly_events: whenRead(data.events, anomalyEvents.length),
+    content_access_events: whenRead(data.events, accessEvents.length),
     anomaly_detection_rules: shieldReadable ? anomalyRules.length : null,
     shield_rules_error: shieldReadable ? null : shieldUnreadableReason,
     events_error: data.events.error ?? null,
     lookback_days: data.lookbackDays,
   };
   const monitoringManualEvidence = "Admin Console > Shield > Threat Detection: confirm anomalous download, session, and location detection rules are enabled and alerts route to the security team.";
-  const shieldConfigUnreadable = unreadableInventory("enterprise_configuration (shield)", "/enterprise_configurations/{enterprise_id}", data.configuration, "the configured Shield anomaly detection rules were not checked");
-  const monitoringEventsUnreadable = unreadableInventory("enterprise_events", "/events?stream_type=admin_logs", data.events, "Shield alert and block events were not checked");
+  const shieldConfigUnreadable = unreadableInventory("enterprise_configuration (shield)", data.configuration, "the configured Shield anomaly detection rules were not checked");
+  const monitoringEventsUnreadable = unreadableInventory("enterprise_events", data.events, "Shield alert and block events were not checked");
   findings.push(capForUnreadableInventories(
     !eventsReadable && !shieldReadable
       ? finding(25, "manual", "Neither enterprise events nor Shield rules could be read, so content access monitoring cannot be confirmed from the API.", monitoringEvidence, monitoringManualEvidence)
@@ -2852,12 +3151,12 @@ export function assessBoxShieldMonitoringData(data: BoxShieldData): BoxAssessmen
     title: "Box Shield and monitoring posture",
     summary: {
       enterprise_id: data.enterpriseId ?? null,
-      shield_rules: shieldRules.length,
-      information_barriers: barriers.length,
-      enabled_information_barriers: enabledBarriers.length,
-      shield_lists: data.shieldLists.data.length,
-      sampled_events: events.length,
-      anomaly_events: anomalyEvents.length,
+      shield_rules: shieldReadable ? shieldRules.length : null,
+      information_barriers: whenRead(data.barriers, barriers.length),
+      enabled_information_barriers: whenRead(data.barriers, enabledBarriers.length),
+      shield_lists: whenRead(data.shieldLists, data.shieldLists.data.length),
+      sampled_events: whenRead(data.events, events.length),
+      anomaly_events: whenRead(data.events, anomalyEvents.length),
       lookback_days: data.lookbackDays,
     },
     findings: sortFindings(findings),
@@ -2891,9 +3190,18 @@ async function readableSurface(
 ): Promise<BoxAccessSurface> {
   try {
     const value = await load();
-    return { name, endpoint, status: "readable", count: countResolver?.(value) };
+    return { name, endpoint, status: "readable", count: countResolver?.(value) ?? null, httpStatus: null };
   } catch (error) {
-    return { name, endpoint, status: "not_readable", error: errorMessage(error) };
+    // Only a request the run actually issued may be named, so the label travels on the error; a failure raised before
+    // any request (for example an unresolved enterprise ID) leaves the endpoint and status null.
+    return {
+      name,
+      endpoint: requestOf(error) ?? null,
+      status: "not_readable",
+      count: null,
+      error: errorMessage(error),
+      httpStatus: error instanceof BoxApiError ? error.status : null,
+    };
   }
 }
 
@@ -2937,9 +3245,11 @@ export async function checkBoxAccess(
   } else {
     surfaces.push({
       name: "enterprise_configuration",
-      endpoint: "/enterprise_configurations/{enterprise_id}",
+      endpoint: null,
       status: "not_configured",
+      count: null,
       error: "Enterprise ID could not be resolved; set BOX_ENTERPRISE_ID.",
+      httpStatus: null,
     });
   }
   surfaces.push(
@@ -3148,12 +3458,62 @@ function projectEventDataset(dataset: CollectedDataset<JsonRecord[]>): Collected
   return { ...dataset, data: dataset.data.map(projectEnterpriseEvent) };
 }
 
+/**
+ * The value a core_data snapshot file carries: the records when the read completed (a readable-but-empty list stays
+ * []), and the not-collected marker when the read was denied, errored, or never requested, so a bundle consumer cannot
+ * mistake a denial for an empty inventory.
+ */
+function snapshotValue(dataset: CollectedDataset<unknown>): unknown {
+  return isRead(dataset) || isPartialChildMap(dataset) ? dataset.data : notReadableMarker(dataset);
+}
+
+/**
+ * True for a per-parent child map whose parent listing was read but some child reads failed: the map itself is the
+ * truthful snapshot, since every denied child already carries its own marker.
+ */
+function isPartialChildMap(dataset: CollectedDataset<unknown>): boolean {
+  if (isRead(dataset) || dataset.notRequested) return false;
+  const values = Object.values(asObject(dataset.data) ?? {});
+  return values.length > 0 && values.every((value) => Array.isArray(value) || isNotCollectedMarker(value));
+}
+
+type CollectionStatusLabel = "collected" | "truncated" | "partial" | "denied" | "error" | "not-requested";
+
+function collectionStatusLabel(dataset: CollectedDataset<unknown>): CollectionStatusLabel {
+  if (dataset.notRequested) return "not-requested";
+  if (isPartialChildMap(dataset)) return "partial";
+  if (!isRead(dataset)) return dataset.statusCode === 401 || dataset.statusCode === 403 ? "denied" : "error";
+  return dataset.truncated === true ? "truncated" : "collected";
+}
+
+/**
+ * One collection_status.json row. Count, complete, and truncated describe a read that happened; a read that was denied,
+ * errored, or never requested renders them null behind an explicit collected: false so no flag defaults, and a child
+ * map with some denied children reports the records it did observe as partial.
+ */
+function collectionStatusEntry(pathname: string, dataset: CollectedDataset<unknown>): JsonRecord {
+  const read = isRead(dataset);
+  const partial = isPartialChildMap(dataset);
+  return {
+    file: pathname,
+    collected: read || partial,
+    status: collectionStatusLabel(dataset),
+    count: read || partial ? datasetRecordCount(dataset.data) : null,
+    complete: read ? dataset.truncated !== true : partial ? false : null,
+    truncated: read ? dataset.truncated === true : null,
+    error: dataset.error ?? null,
+    status_code: dataset.statusCode ?? null,
+    endpoint: dataset.request ?? null,
+  };
+}
+
 function buildQuickReference(): string {
   return [
     "# Box Audit Bundle Quick Reference",
     "",
     "- `core_data/` contains the Box API responses used during this assessment; enterprise events are projected to the actor, source, and timing fields the verdicts read, and any credential-shaped field (token, secret, password, api key) is replaced with [REDACTED] before it is written.",
-    "- `core_data/collection_status.json` records, per snapshot file, the record count, any read error, and whether the list was truncated at its cap; truncated lists never support a PASS that depends on the absence of a record.",
+    "- `core_data/collection_status.json` records, per snapshot file, whether the read happened, the record count, any read error, and whether the list was truncated at its cap; truncated lists never support a PASS that depends on the absence of a record.",
+    "- A snapshot whose read was denied, failed, or was never requested is written as a marker object (`collected: false` with the observed status, request, and error) rather than an empty list, so a denial is never mistaken for an empty inventory; a readable-but-empty inventory stays `[]`.",
     "- `analysis/` contains normalized findings and per-area assessment summaries.",
     "- `compliance/` contains the executive summary, unified matrix, and per-framework reports.",
     "- `_errors.log` appears only when some reads fail but the bundle still completes.",
@@ -3241,31 +3601,32 @@ export async function exportBoxAuditBundle(
     ["core_data/terms_of_services.json", sharingData.termsOfServices],
   ];
   const configurationDatasets = [identityData.configuration, sharingData.configuration, governanceData.configuration, shieldData.configuration];
-  const mergedConfiguration: JsonRecord = Object.assign({}, ...configurationDatasets.map((dataset) => dataset.data));
-  const configurationErrors = configurationDatasets.map((dataset) => dataset.error).filter((error): error is string => Boolean(error));
+  const readConfigurations = configurationDatasets.filter(isRead);
+  const mergedConfiguration: JsonRecord = Object.assign({}, ...readConfigurations.map((dataset) => dataset.data));
+  const configurationErrors = [...new Set(configurationDatasets.map((dataset) => dataset.error).filter((error): error is string => Boolean(error)))];
+  const failedConfiguration = configurationDatasets.find((dataset) => !isRead(dataset));
   const coreDataFiles: Array<[string, unknown]> = [
     ["core_data/access_check.json", access],
-    ["core_data/enterprise_configuration.json", mergedConfiguration],
-    ...coreDatasets.map(([pathname, dataset]): [string, unknown] => [pathname, dataset.data]),
+    // A configuration none of the four category reads could fetch is written as a marker, never as {}.
+    ["core_data/enterprise_configuration.json", readConfigurations.length > 0 || !failedConfiguration ? mergedConfiguration : notReadableMarker(failedConfiguration)],
+    ...coreDatasets.map(([pathname, dataset]): [string, unknown] => [pathname, snapshotValue(dataset)]),
     ["core_data/collection_status.json", {
       generated_at: new Date().toISOString(),
       datasets: [
         {
           file: "core_data/enterprise_configuration.json",
-          count: Object.keys(mergedConfiguration).length,
-          complete: configurationErrors.length === 0,
-          truncated: false,
-          error: configurationErrors.length > 0 ? [...new Set(configurationErrors)].join("; ") : null,
-          status_code: configurationDatasets.find((dataset) => dataset.statusCode !== undefined)?.statusCode ?? null,
+          collected: readConfigurations.length > 0,
+          status: readConfigurations.length === 0 && failedConfiguration
+            ? collectionStatusLabel(failedConfiguration)
+            : configurationErrors.length > 0 ? "partial" : "collected",
+          count: readConfigurations.length > 0 ? Object.keys(mergedConfiguration).length : null,
+          complete: readConfigurations.length > 0 ? configurationErrors.length === 0 : null,
+          truncated: readConfigurations.length > 0 ? false : null,
+          error: configurationErrors.length > 0 ? configurationErrors.join("; ") : null,
+          status_code: failedConfiguration?.statusCode ?? null,
+          endpoint: failedConfiguration?.request ?? null,
         },
-        ...coreDatasets.map(([pathname, dataset]) => ({
-          file: pathname,
-          count: datasetRecordCount(dataset.data),
-          complete: !dataset.error && dataset.truncated !== true,
-          truncated: dataset.truncated === true,
-          error: dataset.error ?? null,
-          status_code: dataset.statusCode ?? null,
-        })),
+        ...coreDatasets.map(([pathname, dataset]) => collectionStatusEntry(pathname, dataset)),
       ],
       truncated_datasets: truncated,
     }],

@@ -497,7 +497,10 @@ test("resolveBoxConfiguration supports JWT config files, CCG env vars, OAuth tok
   assert.throws(() => resolveBoxConfiguration({}, {}, { homeDir: base }), /Box credentials are required/);
   assert.throws(() => resolveBoxConfiguration({}, { BOX_CLIENT_ID: "only-client", BOX_CLIENT_SECRET: "only-secret", BOX_AUTH_METHOD: "ccg" }, { homeDir: base }), /BOX_ENTERPRISE_ID/);
   assert.throws(() => resolveBoxConfiguration({ auth_method: "saml" }, {}, { homeDir: base }), /Unsupported Box auth method/);
-  assert.throws(() => resolveBoxConfiguration({ config_path: join(base, "missing.yaml") }, {}, { homeDir: base, cwd: base }), /not found or was empty/);
+  assert.throws(
+    () => resolveBoxConfiguration({ config_path: join(base, "missing.yaml") }, {}, { homeDir: base, cwd: base }),
+    (error) => error.name === "BoxConfigFileError" && error.code === "ENOENT" && /^Unable to read Box config file .*missing\.yaml \(ENOENT\)$/.test(error.message),
+  );
 });
 
 test("BoxApiClient signs a JWT assertion, exchanges it for a token, and calls the API", async () => {
@@ -1555,7 +1558,9 @@ test("assessBoxShieldMonitoring fails when Shield rules and monitoring signals a
     "BOX-25": "manual",
   });
   assert.match(findingById(unreadable, "BOX-16").manualEvidence, /SIEM/);
-  assert.equal(unreadable.errors.length, 3);
+  // Three denied reads plus the segment reads that were never requested because the barrier listing was denied.
+  assert.equal(unreadable.errors.length, 4);
+  assert.ok(unreadable.errors.some((entry) => /^shield_information_barrier_segments: not requested because the parent listing could not be read$/.test(entry)));
 });
 
 test("exportBoxAuditBundle writes core data, analysis, compliance reports, and a zip archive", async () => {
@@ -1680,10 +1685,13 @@ test("exportBoxAuditBundle records partial collection failures in _errors.log", 
 
   assert.ok(existsSync(result.zipPath));
   assert.equal(result.findingCount, 25);
-  assert.equal(result.errorCount, 2);
+  // Two denied reads plus the two child reads that were never requested because their parent listing was denied.
+  assert.equal(result.errorCount, 4);
   const errorLog = readFileSync(join(result.outputDir, "_errors.log"), "utf8");
   assert.match(errorLog, /retention_policies: .*manage_data_retention/);
+  assert.match(errorLog, /retention_policy_assignments: not requested because the parent listing could not be read/);
   assert.match(errorLog, /shield_information_barriers: /);
+  assert.match(errorLog, /shield_information_barrier_segments: not requested because the parent listing could not be read/);
 
   const findings = JSON.parse(readFileSync(join(result.outputDir, "analysis/findings.json"), "utf8"));
   assert.equal(findings.find((entry) => entry.id === "BOX-12").status, "manual");
@@ -1694,9 +1702,24 @@ test("exportBoxAuditBundle records partial collection failures in _errors.log", 
 
   const collectionStatus = JSON.parse(readFileSync(join(result.outputDir, "core_data/collection_status.json"), "utf8"));
   const retentionStatus = collectionStatus.datasets.find((entry) => entry.file === "core_data/retention_policies.json");
-  assert.equal(retentionStatus.complete, false);
+  assert.equal(retentionStatus.collected, false);
+  assert.equal(retentionStatus.status, "denied");
+  assert.equal(retentionStatus.complete, null);
+  assert.equal(retentionStatus.truncated, null);
+  assert.equal(retentionStatus.count, null);
   assert.equal(retentionStatus.status_code, 403);
   assert.match(retentionStatus.error, /manage_data_retention/);
+  const assignmentStatus = collectionStatus.datasets.find((entry) => entry.file === "core_data/retention_policy_assignments.json");
+  assert.equal(assignmentStatus.collected, false);
+  assert.equal(assignmentStatus.status, "not-requested");
+  assert.equal(assignmentStatus.count, null);
+
+  const deniedSnapshot = JSON.parse(readFileSync(join(result.outputDir, "core_data/retention_policies.json"), "utf8"));
+  assert.equal(deniedSnapshot.collected, false);
+  assert.equal(deniedSnapshot.status, 403);
+  assert.equal(deniedSnapshot.reason, "not_readable");
+  const notRequestedSnapshot = JSON.parse(readFileSync(join(result.outputDir, "core_data/retention_policy_assignments.json"), "utf8"));
+  assert.deepEqual(notRequestedSnapshot, { collected: false, status: "not-collected", endpoint: null, error: null, reason: "not_requested" });
 });
 
 test("exportBoxAuditBundle records truncated snapshots without counting them as errors", async () => {
@@ -1739,14 +1762,16 @@ const MULTI_INVENTORY_CASES = [
   { id: "BOX-03", assess: assessBoxIdentityAccess, secondary: "getEnterpriseConfiguration", names: /MFA settings/ },
   { id: "BOX-24", assess: assessBoxIdentityAccess, secondary: "listEnterpriseEvents", names: /events were unreadable/ },
   { id: "BOX-24", assess: assessBoxIdentityAccess, secondary: "listUsers", names: /users were unreadable/ },
-  { id: "BOX-04", assess: assessBoxSharingCollaboration, secondary: "listCollaborationAllowlistEntries", names: /collaboration allowlist \(\/collaboration_whitelist_entries\)/ },
-  { id: "BOX-05", assess: assessBoxSharingCollaboration, secondary: "listCollaborationAllowlistExemptTargets", names: /collaboration_allowlist_exempt_targets \(\/collaboration_whitelist_exempt_targets\)/ },
-  { id: "BOX-05", assess: assessBoxSharingCollaboration, secondary: "getEnterpriseConfiguration", names: /enterprise_configuration \(content_and_sharing\)/ },
-  { id: "BOX-12", assess: assessBoxDataGovernance, secondary: "listRetentionPolicyAssignments", names: /retention_policy_assignments \(\/retention_policies\/\{policy_id\}\/assignments\)/ },
-  { id: "BOX-13", assess: assessBoxDataGovernance, secondary: "listLegalHoldPolicyAssignments", names: /legal_hold_policy_assignments \(\/legal_hold_policy_assignments\)/ },
-  { id: "BOX-15", assess: assessBoxShieldMonitoring, secondary: "listShieldInformationBarrierSegments", names: /shield_information_barrier_segments \(\/shield_information_barrier_segments\)/ },
-  { id: "BOX-25", assess: assessBoxShieldMonitoring, secondary: "getEnterpriseConfiguration", names: /enterprise_configuration \(shield\)/ },
-  { id: "BOX-25", assess: assessBoxShieldMonitoring, secondary: "listEnterpriseEvents", names: /enterprise_events \(\/events\?stream_type=admin_logs\)/ },
+  // The stub client's errors carry no request label, so the summaries name the inventory alone; the endpoint text
+  // appears only when a real request failed (covered by the HTTP fixture tests below).
+  { id: "BOX-04", assess: assessBoxSharingCollaboration, secondary: "listCollaborationAllowlistEntries", names: /collaboration_allowlist_entries could not be read/ },
+  { id: "BOX-05", assess: assessBoxSharingCollaboration, secondary: "listCollaborationAllowlistExemptTargets", names: /collaboration_allowlist_exempt_targets could not be read/ },
+  { id: "BOX-05", assess: assessBoxSharingCollaboration, secondary: "getEnterpriseConfiguration", names: /enterprise_configuration \(content_and_sharing\) could not be read/ },
+  { id: "BOX-12", assess: assessBoxDataGovernance, secondary: "listRetentionPolicyAssignments", names: /retention_policy_assignments could not be read/ },
+  { id: "BOX-13", assess: assessBoxDataGovernance, secondary: "listLegalHoldPolicyAssignments", names: /legal_hold_policy_assignments could not be read/ },
+  { id: "BOX-15", assess: assessBoxShieldMonitoring, secondary: "listShieldInformationBarrierSegments", names: /shield_information_barrier_segments could not be read/ },
+  { id: "BOX-25", assess: assessBoxShieldMonitoring, secondary: "getEnterpriseConfiguration", names: /enterprise_configuration \(shield\) could not be read/ },
+  { id: "BOX-25", assess: assessBoxShieldMonitoring, secondary: "listEnterpriseEvents", names: /enterprise_events could not be read/ },
 ];
 
 test("verdict rule 1 corollary: Box findings that read several inventories never pass while a secondary inventory is forbidden", async () => {
