@@ -84,6 +84,8 @@ export interface PaloaltoAccessSurface {
   endpoint: string;
   status: "readable" | "not_readable" | "not_configured";
   count?: number;
+  /** True when the probe stopped at its page cap, so count is a lower bound. */
+  partial?: boolean;
   error?: string;
 }
 
@@ -156,7 +158,20 @@ export interface ComputeSnapshot {
   ciScans: JsonRecord[];
   failed: string[];
   truncated: string[];
+  /** Why each entry of truncated stopped early (page cap, stuck offset). */
+  truncationReasons?: Record<string, string>;
   errors: string[];
+}
+
+/** A paged collection; truncated is true whenever the loop exited before the cursor ended. */
+export interface PagedResult {
+  items: JsonRecord[];
+  truncated: boolean;
+  truncationReason?: string;
+}
+
+export interface AlertPage extends PagedResult {
+  totalRows?: number;
 }
 
 export interface PrismaSnapshot {
@@ -164,6 +179,7 @@ export interface PrismaSnapshot {
   alertRules: JsonRecord[];
   alerts: JsonRecord[];
   alertsTruncated: boolean;
+  alertsTruncationReason?: string;
   alertsTotal?: number;
   policies: JsonRecord[];
   cloudAccounts: JsonRecord[];
@@ -364,8 +380,35 @@ function safeDirName(value: string): string {
   return normalized || "paloalto";
 }
 
+export const REDACTION_MARKER = "[REDACTED]";
+
+// Unanchored patterns for credential-shaped text that an upstream body, proxy page, or
+// transport error may echo regardless of what this tool sent: bearer and basic tokens,
+// header lines, key=value or key: value pairs with a credential word in the key, PAN-OS
+// API keys (LUFRPT...), JWTs, and URL userinfo. Applied to every error string in
+// redactSecrets (the client throw sites) and again in errorMessage (the sink every
+// collector, access probe, and tool catch block reads through).
+const ERROR_TEXT_PATTERNS: Array<[RegExp, string]> = [
+  [/\b(bearer|basic|digest|negotiate)\s+[a-z0-9._~+/=-]{8,}/gi, `$1 ${REDACTION_MARKER}`],
+  [/\b(authorization|proxy-authorization|x-api-key|x-auth-token|x-pan-key|x-redlock-auth|set-cookie|cookie)\s*:\s*[^\r\n]+/gi, `$1: ${REDACTION_MARKER}`],
+  [/\b([a-z0-9_-]*(?:session|token|secret|password|passwd|passphrase|phash|api[_-]?key|accesskey|secretkey|access_key|secret_key|private_key|shared_key|signature|authorization|credential)[a-z0-9_-]*)\s*[=:]\s*["']?(?!\[REDACTED\])[^\s"';,&<>]{4,}/gi, `$1=${REDACTION_MARKER}`],
+  [/\b(key|auth|sig|sid|pwd|pin|otp)\s*[=:]\s*["']?(?!\[REDACTED\])[^\s"';,&<>]{4,}/gi, `$1=${REDACTION_MARKER}`],
+  [/\bLUFRPT[a-z0-9+/=_-]{16,}/gi, REDACTION_MARKER],
+  [/\beyJ[a-z0-9_-]{8,}\.[a-z0-9_-]{8,}(?:\.[a-z0-9_-]{8,})?/gi, REDACTION_MARKER],
+  [/(https?:\/\/)[^\s/@"'<>]+:[^\s/@"'<>]+@/gi, `$1${REDACTION_MARKER}@`],
+];
+
+export function redactErrorText(text: string): string {
+  let redacted = text;
+  for (const [pattern, replacement] of ERROR_TEXT_PATTERNS) {
+    redacted = redacted.replace(pattern, replacement);
+  }
+  return redacted;
+}
+
+/** The single sink every persisted or returned error string passes through. */
 function errorMessage(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
+  return redactErrorText(error instanceof Error ? error.message : String(error));
 }
 
 function splitList(value: string | undefined): string[] {
@@ -380,12 +423,109 @@ function sleep(ms: number): Promise<void> {
 }
 
 export function redactSecrets(message: string, secrets: Array<string | undefined>): string {
-  let output = message.replace(/([?&](?:key|password|secret|token)=)[^&\s"']+/gi, "$1[redacted]");
+  let output = message.replace(/([?&](?:key|password|secret|token)=)[^&\s"']+/gi, `$1${REDACTION_MARKER}`);
   for (const secret of secrets) {
     if (!secret || secret.length < 4) continue;
-    output = output.split(secret).join("[redacted]");
+    output = output.split(secret).join(REDACTION_MARKER);
+  }
+  return redactErrorText(output);
+}
+
+// A JSON property name is split into lower-case segments on underscores, hyphens,
+// dots, spaces, and camelCase boundaries, so api_key, apiKey, APIKey, and the header
+// name X-Api-Key all end in ["api", "key"]. The value is a credential when the last
+// segment is one of these words (authToken, integrationKey, password, clientSecret,
+// secrets, credential) or a qualified key such as api_key, private_key, or secret_key.
+// A bare key (Prisma header pairs use key as the header name), public_key, and every
+// id, url, name, type, or flag are kept: credentialID, hostUrl, and login never match.
+const CREDENTIAL_LAST_SEGMENTS = new Set([
+  "token", "tokens", "secret", "secrets", "password", "passwords", "passwd", "pwd", "passphrase", "phash",
+  "apikey", "authorization", "credential", "credentials",
+]);
+const NON_CREDENTIAL_KEY_QUALIFIERS = new Set(["public"]);
+// Header pairs ({key, value, secure} in Prisma Cloud webhook integrations) are credential
+// pairs when flagged secure: true or when the label names a credential (Authorization,
+// X-Api-Key); only the value is replaced so the label and flags stay readable.
+const CREDENTIAL_PAIR_LABEL_KEYS = ["key", "name", "header"];
+const CREDENTIAL_PAIR_VALUE_KEYS = new Set(["value", "default", "default_value"]);
+
+// Credentials carried inside string values rather than under a credential-named key:
+// URL query parameters (?token=, &api_key=), URL userinfo (https://user:pass@host),
+// webhook services whose URL path is the secret (Slack, Discord, Microsoft Teams), and
+// JSON encoded as a string. Applied to every string kept in a snapshot.
+const URL_QUERY_CREDENTIAL_PATTERN = /([?&](?:token|key|api_key|apikey|secret|password|passwd|access_token|refresh_token|auth|auth_token|signature|sig|client_secret|access_key|secret_key|private_token|integration_key)=)[^&#\s"'<>]+/gi;
+const URL_USERINFO_PATTERN = /(https?:\/\/)[^\s/@"'<>]+:[^\s/@"'<>]+@/gi;
+const TOKEN_IN_PATH_WEBHOOK_PATTERN = /(https?:\/\/(?:hooks\.slack\.com\/services|discord(?:app)?\.com\/api\/webhooks|[a-z0-9.-]*webhook\.office\.com\/webhookb2)\/)[^\s"'<>]+/gi;
+const JSON_STRING_CREDENTIAL_PATTERN = /("(?:token|auth_token|authToken|refresh_token|access_token|secret|client_secret|clientSecret|signing_secret|password|passwd|passphrase|api_key|apiKey|private_key|privateKey|secret_key|secretKey|access_key|integration_key|integrationKey|authorization)"\s*:\s*")[^"]*(")/gi;
+
+export function redactCredentialValueText(text: string): string {
+  return text
+    .replace(URL_QUERY_CREDENTIAL_PATTERN, `$1${REDACTION_MARKER}`)
+    .replace(URL_USERINFO_PATTERN, `$1${REDACTION_MARKER}@`)
+    .replace(TOKEN_IN_PATH_WEBHOOK_PATTERN, `$1${REDACTION_MARKER}`)
+    .replace(JSON_STRING_CREDENTIAL_PATTERN, `$1${REDACTION_MARKER}$2`);
+}
+
+function propertyNameSegments(name: string): string[] {
+  return name
+    .replace(/([a-z0-9])([A-Z])/g, "$1_$2")
+    .replace(/([A-Z]+)([A-Z][a-z])/g, "$1_$2")
+    .toLowerCase()
+    .split(/[^a-z0-9]+/)
+    .filter((segment) => segment.length > 0);
+}
+
+export function isCredentialPropertyName(name: string): boolean {
+  const segments = propertyNameSegments(name);
+  const last = segments[segments.length - 1];
+  if (last === undefined) return false;
+  if (CREDENTIAL_LAST_SEGMENTS.has(last)) return true;
+  if (last === "key" && segments.length > 1) return !NON_CREDENTIAL_KEY_QUALIFIERS.has(segments[segments.length - 2]);
+  return false;
+}
+
+function isCredentialJsonPair(record: JsonRecord): boolean {
+  if (record.secure === true) return true;
+  const label = CREDENTIAL_PAIR_LABEL_KEYS.map((key) => record[key]).find((value): value is string => typeof value === "string");
+  return label !== undefined
+    && isCredentialPropertyName(label)
+    && [...CREDENTIAL_PAIR_VALUE_KEYS].some((key) => key in record);
+}
+
+function carriesValue(value: unknown): boolean {
+  if (typeof value === "string") return value.length > 0;
+  if (typeof value === "number") return true;
+  if (Array.isArray(value)) return value.length > 0;
+  const record = asObject(value);
+  return record !== undefined && Object.keys(record).length > 0;
+}
+
+function redactCredentialNode(value: unknown): unknown {
+  if (typeof value === "string") return redactCredentialValueText(value);
+  if (Array.isArray(value)) return value.map(redactCredentialNode);
+  const record = asObject(value);
+  if (!record) return value;
+  const credentialPair = isCredentialJsonPair(record);
+  const output: JsonRecord = {};
+  for (const [key, entry] of Object.entries(record)) {
+    const credentialName = isCredentialPropertyName(key) || (credentialPair && CREDENTIAL_PAIR_VALUE_KEYS.has(key));
+    // The whole value collapses, so a credential container (Compute registry
+    // credential: {secret: {plain}}, image secrets[]) never leaks a nested child.
+    output[key] = credentialName && carriesValue(entry) ? REDACTION_MARKER : redactCredentialNode(entry);
   }
   return output;
+}
+
+/**
+ * Returns a deep copy of a Prisma Cloud or Compute payload with every
+ * credential-bearing property (string, number, array, or object) replaced by
+ * REDACTION_MARKER and every remaining string scrubbed of URL query credentials,
+ * URL userinfo, token-in-path webhook URLs, and JSON-encoded credential fields.
+ * Identifiers, credential references (credentialID), hosts, names, types, flags,
+ * and counts are kept, so the assessments read the redacted copy unchanged.
+ */
+export function redactCredentialProperties<T>(value: T): T {
+  return redactCredentialNode(value) as T;
 }
 
 function ensurePrivateDir(pathname: string): void {
@@ -613,19 +753,26 @@ export function xmlToJson(node: XmlNode): unknown {
   return output;
 }
 
-export const XML_REDACTION_MARKER = "[REDACTED]";
+export const XML_REDACTION_MARKER = REDACTION_MARKER;
 
 // PAN-OS stores secrets as leaf elements whose names end in one of these words:
 // phash (admin password hashes), bind-password, secret and shared-secret (RADIUS,
 // TACACS+, LDAP), pre-shared-key and key (IKE, IPSec, HA encryption), private-key
 // (certificates), passphrase, authpwd and privpwd (SNMPv3), snmp-community-string,
-// api-key and token (integrations). Names are matched on their last hyphenated
-// segment, so password-complexity, key-usage, and credential-enforcement are kept.
-const CREDENTIAL_XML_NAME_PATTERN = /(?:^|-)(?:password|passwd|pwd|passphrase|phash|hash|secret|key|token|community|community-string|credential|credentials|authpwd|privpwd)$/;
-const NON_CREDENTIAL_XML_NAMES = new Set(["public-key"]);
+// api-key and token (integrations), plus plural containers (keys, secrets, tokens,
+// passwords) and one-time codes (pin, otp). Names are matched on their last
+// segment after underscores and camelCase boundaries are normalized to hyphens
+// (apiKey, preSharedKey, and bind_password all match), so password-complexity,
+// key-usage, and credential-enforcement are kept.
+const CREDENTIAL_XML_NAME_PATTERN = /(?:^|-)(?:password|passwords|passwd|pwd|passphrase|phash|hash|secret|secrets|key|keys|token|tokens|community|community-string|credential|credentials|authpwd|privpwd|pin|otp)$/;
+const NON_CREDENTIAL_XML_NAMES = new Set(["public-key", "public-keys"]);
 
 export function isCredentialXmlName(name: string): boolean {
-  const normalized = name.trim().toLowerCase().replace(/_/g, "-");
+  const normalized = name
+    .trim()
+    .replace(/([a-z0-9])([A-Z])/g, "$1-$2")
+    .toLowerCase()
+    .replace(/_/g, "-");
   if (NON_CREDENTIAL_XML_NAMES.has(normalized)) return false;
   return CREDENTIAL_XML_NAME_PATTERN.test(normalized);
 }
@@ -633,7 +780,7 @@ export function isCredentialXmlName(name: string): boolean {
 function redactXmlAttributes(attributes: Record<string, string>): Record<string, string> {
   const output: Record<string, string> = {};
   for (const [key, value] of Object.entries(attributes)) {
-    output[key] = isCredentialXmlName(key) && value.length > 0 ? XML_REDACTION_MARKER : value;
+    output[key] = isCredentialXmlName(key) && value.length > 0 ? XML_REDACTION_MARKER : redactCredentialValueText(value);
   }
   return output;
 }
@@ -641,9 +788,10 @@ function redactXmlAttributes(attributes: Record<string, string>): Record<string,
 /**
  * Returns a deep copy of an XML tree with every credential-bearing node
  * collapsed to XML_REDACTION_MARKER (the whole subtree, so a container such as
- * pre-shared-key never leaks a differently named child). The source tree is not
- * mutated: assessments keep reading raw values in memory, only what is written
- * to disk is redacted.
+ * pre-shared-key never leaks a differently named child) and every remaining
+ * text or attribute value scrubbed of URL query credentials and userinfo. The
+ * source tree is not mutated: assessments keep reading raw values in memory,
+ * only what is written to disk is redacted.
  */
 export function redactXmlCredentials(node: XmlNode): XmlNode {
   if (isCredentialXmlName(node.name)) {
@@ -654,7 +802,7 @@ export function redactXmlCredentials(node: XmlNode): XmlNode {
     name: node.name,
     attributes: redactXmlAttributes(node.attributes),
     children: node.children.map(redactXmlCredentials),
-    text: node.text,
+    text: redactCredentialValueText(node.text),
   };
 }
 
@@ -663,23 +811,52 @@ export function panosSnapshotToJson(snapshot: PanosDeviceSnapshot): JsonRecord {
   return {
     host: snapshot.host,
     platform: snapshot.platform,
-    system_info: snapshot.systemInfo,
+    system_info: redactCredentialProperties(snapshot.systemInfo),
     ha_state: snapshot.haState ? xmlToJson(redactXmlCredentials(snapshot.haState)) : null,
     config: snapshot.config.map((tree) => xmlToJson(redactXmlCredentials(tree))),
   };
 }
 
-function readConfigFile(pathname: string | undefined): JsonRecord {
-  const candidate = pathname ?? DEFAULT_CONFIG_FILE;
-  if (!existsSync(candidate)) {
-    if (pathname) throw new Error(`Palo Alto config file not found: ${pathname}`);
-    return {};
-  }
+const ERRNO_CODE_PATTERN = /^E[A-Z0-9_]{1,30}$/;
+const JSON_POSITION_PATTERN = /at position (\d+)/;
+
+/**
+ * Two-step config loader guard with fixed text per step. Neither the filesystem
+ * message (which echoes the path and the operation) nor the JSON.parse message
+ * (which quotes a window of the source around the failure, or the whole source
+ * of a short file) is ever interpolated: the read step carries the path and a
+ * validated errno code, the parse step carries the path and a line number taken
+ * only through a strict position regex.
+ */
+function readConfigText(pathname: string): string {
   try {
-    return asObject(JSON.parse(readFileSync(candidate, "utf8"))) ?? {};
+    return readFileSync(pathname, "utf8");
   } catch (error) {
-    throw new Error(`Unable to parse Palo Alto config file ${candidate}: ${errorMessage(error)}`);
+    const code = asString(asObject(error)?.code);
+    const suffix = code !== undefined && ERRNO_CODE_PATTERN.test(code) ? ` (${code})` : "";
+    throw new Error(`Unable to read Palo Alto config file ${pathname}${suffix}`);
   }
+}
+
+function parseConfigJson(pathname: string, raw: string): unknown {
+  try {
+    return JSON.parse(raw) as unknown;
+  } catch (error) {
+    const position = error instanceof Error ? JSON_POSITION_PATTERN.exec(error.message) : null;
+    const line = position ? raw.slice(0, Number(position[1])).split("\n").length : undefined;
+    throw new Error(`Unable to parse Palo Alto config file: invalid JSON in ${pathname}${line === undefined ? "" : ` at line ${line}`} (INVALID_JSON)`);
+  }
+}
+
+function readConfigFile(pathname: string | undefined): JsonRecord {
+  if (!pathname && !existsSync(DEFAULT_CONFIG_FILE)) return {};
+  const candidate = pathname ?? DEFAULT_CONFIG_FILE;
+  const parsed = parseConfigJson(candidate, readConfigText(candidate));
+  const values = asObject(parsed);
+  if (!values) {
+    throw new Error(`Unable to parse Palo Alto config file: ${candidate} must contain a JSON object (INVALID_CONFIG_SHAPE)`);
+  }
+  return values;
 }
 
 export function resolvePaloaltoConfiguration(
@@ -851,19 +1028,46 @@ async function fetchWithRetry(url: string, init: RequestInit, options: HttpOptio
   }
 }
 
-function prismaErrorSummary(response: Response, rawText: string): string {
+function responseContentType(response: Response): string {
+  return response.headers.get("content-type")?.split(";")[0].trim().toLowerCase() || "unknown";
+}
+
+/** Status-and-length note for a body that is not the JSON the API documents; the body is never echoed. */
+function nonJsonBodyNote(response: Response, rawText: string): string {
+  return `non-JSON ${responseContentType(response)} response body (${rawText.length} bytes, not echoed)`;
+}
+
+// Prisma Cloud's documented error fields: the x-redlock-status header (a JSON array of
+// {i18nKey, severity, subject}) and body message or i18nKey fields; Compute answers with
+// {err}. Anything else in a body is described by length only.
+function prismaErrorFields(payload: unknown): string[] {
+  const record = asObject(payload);
+  const fields = [
+    ...(record ? [asString(record.message), asString(record.i18nKey), asString(record.err), asString(asObject(record.error)?.message)] : []),
+    ...asRecords(payload).flatMap((item) => [asString(item.i18nKey), asString(item.message), asString(item.subject)]),
+  ];
+  return [...new Set(fields.filter((field): field is string => Boolean(field)))];
+}
+
+export function describePrismaErrorBody(response: Response, rawText: string): string {
+  const parts: string[] = [];
   const header = response.headers.get("x-redlock-status");
-  const parsed = (() => {
-    try {
-      return JSON.parse(rawText) as unknown;
-    } catch {
-      return undefined;
+  if (header) {
+    const headerFields = prismaErrorFields(safeJsonParse(header));
+    parts.push(headerFields.length > 0 ? `x-redlock-status ${headerFields.join(", ")}` : "x-redlock-status header present (not echoed)");
+  }
+  if (rawText.length === 0) {
+    parts.push("empty response body");
+  } else {
+    const parsed = safeJsonParse(rawText);
+    if (parsed === undefined) {
+      parts.push(nonJsonBodyNote(response, rawText));
+    } else {
+      const fields = prismaErrorFields(parsed);
+      parts.push(fields.length > 0 ? fields.join("; ") : `JSON response body without documented error fields (${rawText.length} bytes, not echoed)`);
     }
-  })();
-  const detail = asString(asObject(parsed)?.message)
-    ?? asRecords(parsed).map((item) => asString(item.i18nKey) ?? asString(item.message)).filter(Boolean).join("; ")
-    ?? undefined;
-  return header ?? detail ?? rawText.slice(0, 200);
+  }
+  return redactErrorText(parts.map((part) => part.replace(/\s+/g, " ").slice(0, 200)).join("; "));
 }
 
 export class PrismaCloudClient {
@@ -900,9 +1104,13 @@ export class PrismaCloudClient {
     }, this.http);
     const rawText = await response.text();
     if (!response.ok) {
-      throw new Error(redactSecrets(`Prisma Cloud login failed (${response.status}): ${prismaErrorSummary(response, rawText)}`, this.http.secrets));
+      throw new Error(redactSecrets(`Prisma Cloud login failed (${response.status}): ${describePrismaErrorBody(response, rawText)}`, this.http.secrets));
     }
-    const payload = asObject(JSON.parse(rawText));
+    const parsed = safeJsonParse(rawText);
+    if (parsed === undefined) {
+      throw new Error(`Prisma Cloud login returned a ${nonJsonBodyNote(response, rawText)} with status ${response.status}.`);
+    }
+    const payload = asObject(parsed);
     const token = asString(payload?.token);
     if (!token) throw new Error("Prisma Cloud login response did not include a token.");
     this.prismaId = asString(asRecords(payload?.customerNames)[0]?.prismaId) ?? this.prismaId;
@@ -950,9 +1158,14 @@ export class PrismaCloudClient {
       return this.request(method, path, query, body, false);
     }
     if (!response.ok) {
-      throw new Error(redactSecrets(`Prisma Cloud ${method} ${path} failed (${response.status}): ${prismaErrorSummary(response, rawText)}`, this.http.secrets));
+      throw new Error(redactSecrets(`Prisma Cloud ${method} ${path} failed (${response.status}): ${describePrismaErrorBody(response, rawText)}`, this.http.secrets));
     }
-    return rawText.length > 0 ? JSON.parse(rawText) as unknown : {};
+    if (rawText.length === 0) return {};
+    const parsed = safeJsonParse(rawText);
+    if (parsed === undefined) {
+      throw new Error(`Prisma Cloud ${method} ${path} returned a ${nonJsonBodyNote(response, rawText)} with status ${response.status}.`);
+    }
+    return parsed;
   }
 
   async get(path: string, query: JsonRecord = {}): Promise<unknown> {
@@ -967,11 +1180,19 @@ export class PrismaCloudClient {
     return asRecords(await this.get("/v2/alert/rule"));
   }
 
-  async collectOpenAlerts(limit = DEFAULT_ALERT_LIMIT): Promise<{ items: JsonRecord[]; truncated: boolean; totalRows?: number }> {
+  /**
+   * Walks GET /v2/alert with its nextPageToken cursor. The collection is
+   * truncated, with the reason recorded, whenever the loop exits for any
+   * reason other than the cursor ending: the alert_limit cap, an empty page
+   * that still carries a token, a token that repeats (stuck cursor), or a
+   * totalRows count larger than what the cursor delivered.
+   */
+  async collectOpenAlerts(limit = DEFAULT_ALERT_LIMIT): Promise<AlertPage> {
     const items: JsonRecord[] = [];
+    const seenTokens = new Set<string>();
     let pageToken: string | undefined;
     let totalRows: number | undefined;
-    let truncated = false;
+    let truncationReason: string | undefined;
     for (;;) {
       const payload = asObject(await this.get("/v2/alert", {
         "alert.status": "open",
@@ -984,15 +1205,29 @@ export class PrismaCloudClient {
       })) ?? {};
       const pageItems = asRecords(payload.items);
       totalRows = asNumber(payload.totalRows) ?? totalRows;
-      items.push(...pageItems.slice(0, Math.max(limit - items.length, 0)));
-      pageToken = asString(payload.nextPageToken);
-      if (!pageToken || pageItems.length === 0) break;
-      if (items.length >= limit) {
-        truncated = true;
+      const room = Math.max(limit - items.length, 0);
+      items.push(...pageItems.slice(0, room));
+      const nextToken = asString(payload.nextPageToken);
+      if (pageItems.length > room || (nextToken !== undefined && items.length >= limit)) {
+        truncationReason = `alert_limit ${limit} reached while GET /v2/alert still had alerts to return; raise alert_limit`;
         break;
       }
+      if (!nextToken) break;
+      if (pageItems.length === 0) {
+        truncationReason = "GET /v2/alert returned an empty page while still returning a nextPageToken, so the remaining alerts were not read";
+        break;
+      }
+      if (nextToken === pageToken || seenTokens.has(nextToken)) {
+        truncationReason = "GET /v2/alert repeated a nextPageToken (stuck cursor), so the remaining alerts were not read";
+        break;
+      }
+      seenTokens.add(nextToken);
+      pageToken = nextToken;
     }
-    return { items, truncated, totalRows };
+    if (truncationReason === undefined && totalRows !== undefined && items.length < totalRows) {
+      truncationReason = `GET /v2/alert reported totalRows ${totalRows} but the cursor ended after ${items.length} alerts`;
+    }
+    return { items, truncated: truncationReason !== undefined, truncationReason, totalRows };
   }
 
   async listOpenAlerts(limit = DEFAULT_ALERT_LIMIT): Promise<JsonRecord[]> {
@@ -1090,20 +1325,38 @@ export class PrismaComputeClient {
     }, this.http);
     const rawText = await response.text();
     if (!response.ok) {
-      throw new Error(redactSecrets(`Prisma Cloud Compute GET ${path} failed (${response.status}): ${prismaErrorSummary(response, rawText)}`, this.http.secrets));
+      throw new Error(redactSecrets(`Prisma Cloud Compute GET ${path} failed (${response.status}): ${describePrismaErrorBody(response, rawText)}`, this.http.secrets));
     }
-    return rawText.length > 0 ? safeJsonParse(rawText) : {};
+    if (rawText.length === 0) return {};
+    const parsed = safeJsonParse(rawText);
+    if (parsed === undefined) {
+      throw new Error(`Prisma Cloud Compute GET ${path} returned a ${nonJsonBodyNote(response, rawText)} with status ${response.status}.`);
+    }
+    return parsed;
   }
 
-  async listPaged(path: string, limit: number): Promise<{ items: JsonRecord[]; truncated: boolean }> {
+  /**
+   * Walks an offset-paged Compute list. A full page followed by the same page
+   * again means the console ignored the offset (stuck offset); that and the
+   * record cap both end the walk as truncated with the reason recorded.
+   */
+  async listPaged(path: string, limit: number): Promise<PagedResult> {
     const items: JsonRecord[] = [];
     let offset = 0;
+    let previousSignature: string | undefined;
     for (;;) {
       const page = asRecords(await this.get(path, { limit: DEFAULT_COMPUTE_PAGE_SIZE, offset }));
+      const signature = page.length > 0 ? JSON.stringify(page[0]) : undefined;
+      if (signature !== undefined && signature === previousSignature) {
+        return { items, truncated: true, truncationReason: `GET /api/v1${path} returned the same page for offset ${offset} as for the previous offset (stuck offset), so the remaining records were not read` };
+      }
       items.push(...page);
       if (page.length < DEFAULT_COMPUTE_PAGE_SIZE) return { items, truncated: false };
+      if (items.length >= limit) {
+        return { items, truncated: true, truncationReason: `GET /api/v1${path} capped at ${limit} records while full pages were still being returned` };
+      }
+      previousSignature = signature;
       offset += page.length;
-      if (items.length >= limit) return { items, truncated: true };
     }
   }
 
@@ -1112,7 +1365,7 @@ export class PrismaComputeClient {
     return asString(payload) ?? asString(asObject(payload)?.version) ?? "unknown";
   }
 
-  async listDefenders(limit = DEFAULT_COMPUTE_LIMIT): Promise<{ items: JsonRecord[]; truncated: boolean }> {
+  async listDefenders(limit = DEFAULT_COMPUTE_LIMIT): Promise<PagedResult> {
     return this.listPaged("/defenders", limit);
   }
 
@@ -1136,11 +1389,11 @@ export class PrismaComputeClient {
     return asObject(await this.get("/settings/registry")) ?? {};
   }
 
-  async listRegistryScans(limit = DEFAULT_COMPUTE_LIMIT): Promise<{ items: JsonRecord[]; truncated: boolean }> {
+  async listRegistryScans(limit = DEFAULT_COMPUTE_LIMIT): Promise<PagedResult> {
     return this.listPaged("/registry", limit);
   }
 
-  async listImages(limit = DEFAULT_COMPUTE_LIMIT): Promise<{ items: JsonRecord[]; truncated: boolean }> {
+  async listImages(limit = DEFAULT_COMPUTE_LIMIT): Promise<PagedResult> {
     return this.listPaged("/images", limit);
   }
 
@@ -1152,11 +1405,11 @@ export class PrismaComputeClient {
     return asObject(await this.get("/stats/compliance")) ?? {};
   }
 
-  async listCloudDiscovery(limit = DEFAULT_COMPUTE_LIMIT): Promise<{ items: JsonRecord[]; truncated: boolean }> {
+  async listCloudDiscovery(limit = DEFAULT_COMPUTE_LIMIT): Promise<PagedResult> {
     return this.listPaged("/cloud/discovery", limit);
   }
 
-  async listCiScans(limit = DEFAULT_COMPUTE_LIMIT): Promise<{ items: JsonRecord[]; truncated: boolean }> {
+  async listCiScans(limit = DEFAULT_COMPUTE_LIMIT): Promise<PagedResult> {
     return this.listPaged("/scans", limit);
   }
 }
@@ -1200,19 +1453,27 @@ export class PanosApiClient {
     return this.verifyTls;
   }
 
-  private parseResponse(rawText: string, context: string): XmlNode {
+  /**
+   * A body without a <response> element (an HTML proxy or captive-portal page,
+   * a JSON error from a load balancer) is described by status, content type,
+   * and length only. Error responses keep the documented msg or line text,
+   * scrubbed of any credential-shaped value the device echoed.
+   */
+  private parseResponse(response: Response, rawText: string, context: string): XmlNode {
     const document = parseXml(rawText);
-    const response = xmlChild(document, "response");
-    if (!response) {
-      throw new Error(`PAN-OS ${context} returned a non-XML response: ${redactSecrets(rawText.slice(0, 160), this.http.secrets)}`);
+    const responseNode = xmlChild(document, "response");
+    if (!responseNode) {
+      throw new Error(`PAN-OS ${context} returned a non-XML ${responseContentType(response)} response (status ${response.status}, ${rawText.length} bytes, not echoed).`);
     }
-    if (response.attributes.status !== "success") {
-      const message = xmlText(xmlPath(response, ["result", "msg"]))
-        ?? xmlFindAll(response, "line").map(xmlText).filter(Boolean).join("; ")
-        ?? xmlText(xmlChild(response, "msg"));
-      throw new Error(redactSecrets(`PAN-OS ${context} failed (code ${response.attributes.code ?? "unknown"}): ${message ?? "no message"}`, this.http.secrets));
+    if (responseNode.attributes.status !== "success") {
+      const message = xmlText(xmlPath(responseNode, ["result", "msg"]))
+        || xmlFindAll(responseNode, "line").map(xmlText).filter(Boolean).join("; ")
+        || xmlText(xmlChild(responseNode, "msg"))
+        || "no message";
+      const code = /^[a-z0-9_-]{1,16}$/i.test(responseNode.attributes.code ?? "") ? responseNode.attributes.code : "unknown";
+      throw new Error(redactSecrets(`PAN-OS ${context} failed (code ${code}, status ${response.status}): ${message.replace(/\s+/g, " ").slice(0, 300)}`, this.http.secrets));
     }
-    return response;
+    return responseNode;
   }
 
   private async generateApiKey(): Promise<string> {
@@ -1229,7 +1490,7 @@ export class PanosApiClient {
     if (!response.ok && rawText.length === 0) {
       throw new Error(`PAN-OS keygen for ${this.config.host} failed (${response.status}).`);
     }
-    const key = xmlText(xmlPath(this.parseResponse(rawText, "keygen"), ["result", "key"]));
+    const key = xmlText(xmlPath(this.parseResponse(response, rawText, `keygen for ${this.config.host}`), ["result", "key"]));
     if (!key) throw new Error(`PAN-OS keygen for ${this.config.host} did not return a key.`);
     this.apiKey = key;
     this.http.secrets.push(key);
@@ -1257,7 +1518,7 @@ export class PanosApiClient {
     if (!response.ok && rawText.length === 0) {
       throw new Error(`PAN-OS ${context} on ${this.config.host} failed (${response.status} ${response.statusText}).`);
     }
-    return this.parseResponse(rawText, `${context} on ${this.config.host}`);
+    return this.parseResponse(response, rawText, `${context} on ${this.config.host}`);
   }
 
   async showConfig(xpath: string): Promise<XmlNode> {
@@ -1337,22 +1598,32 @@ export async function collectPanosSnapshot(client: Pick<PanosApiClient, "host" |
 
 type ComputeSource = Pick<PrismaComputeClient, "baseUrl" | "listDefenders" | "getRuntimeContainerPolicy" | "getComplianceContainerPolicy" | "getComplianceHostPolicy" | "getVulnerabilityImagePolicy" | "getRegistrySettings" | "listRegistryScans" | "listImages" | "getVulnerabilityStats" | "getComplianceStats" | "listCloudDiscovery" | "listCiScans">;
 
+/**
+ * Every Compute payload is redacted as it is collected (credential-named
+ * properties such as registry credential blocks, image secrets, and webhook
+ * tokens are replaced), so assessments, tool payloads, and the bundle all read
+ * the same redacted copy and the raw response is never retained.
+ */
 export async function collectComputeSnapshot(client: ComputeSource): Promise<ComputeSnapshot> {
   const errors: string[] = [];
   const failed: string[] = [];
   const truncated: string[] = [];
+  const truncationReasons: Record<string, string> = {};
   const guard = async <T>(label: string, fallback: T, load: () => Promise<T>): Promise<T> => {
     try {
-      return await load();
+      return redactCredentialProperties(await load());
     } catch (error) {
       failed.push(label);
       errors.push(`prisma-compute: ${label} failed: ${errorMessage(error)}`);
       return fallback;
     }
   };
-  const paged = async (label: string, load: () => Promise<{ items: JsonRecord[]; truncated: boolean }>): Promise<JsonRecord[]> => {
-    const result = await guard(label, { items: [] as JsonRecord[], truncated: false }, load);
-    if (result.truncated) truncated.push(label);
+  const paged = async (label: string, load: () => Promise<PagedResult>): Promise<JsonRecord[]> => {
+    const result = await guard(label, { items: [] as JsonRecord[], truncated: false } as PagedResult, load);
+    if (result.truncated) {
+      truncated.push(label);
+      truncationReasons[label] = result.truncationReason ?? `capped at ${DEFAULT_COMPUTE_LIMIT} records`;
+    }
     return result.items;
   };
   const defenders = await paged("defenders", () => client.listDefenders());
@@ -1383,12 +1654,19 @@ export async function collectComputeSnapshot(client: ComputeSource): Promise<Com
     ciScans,
     failed,
     truncated,
+    truncationReasons,
     errors,
   };
 }
 
 type PrismaSource = Pick<PrismaCloudClient, "getCompliancePosture" | "listAlertRules" | "collectOpenAlerts" | "listPolicies" | "listCloudAccounts" | "listAccountGroups" | "listUserRoles" | "listIntegrations">;
 
+/**
+ * Every CSPM payload is redacted as it is collected: integrations[]
+ * integrationConfig (auth tokens, API keys, passwords, secure header pairs,
+ * webhook URLs with tokens) and any other credential-named property are
+ * replaced before the snapshot exists, so no consumer can reach the raw value.
+ */
 export async function collectPrismaSnapshot(
   client: PrismaSource,
   alertLimit = DEFAULT_ALERT_LIMIT,
@@ -1398,7 +1676,7 @@ export async function collectPrismaSnapshot(
   const failed: string[] = [];
   const guard = async <T>(label: string, fallback: T, load: () => Promise<T>): Promise<T> => {
     try {
-      return await load();
+      return redactCredentialProperties(await load());
     } catch (error) {
       failed.push(label);
       errors.push(`prisma-cloud: ${label} failed: ${errorMessage(error)}`);
@@ -1407,7 +1685,7 @@ export async function collectPrismaSnapshot(
   };
   const posture = await guard("compliance posture", undefined as JsonRecord | undefined, () => client.getCompliancePosture());
   const alertRules = await guard("alert rules", [] as JsonRecord[], () => client.listAlertRules());
-  const alertPage = await guard("open alerts", { items: [] as JsonRecord[], truncated: false, totalRows: undefined as number | undefined }, () => client.collectOpenAlerts(alertLimit));
+  const alertPage = await guard("open alerts", { items: [] as JsonRecord[], truncated: false } as AlertPage, () => client.collectOpenAlerts(alertLimit));
   const policies = await guard("policies", [] as JsonRecord[], () => client.listPolicies());
   const cloudAccounts = await guard("cloud accounts", [] as JsonRecord[], () => client.listCloudAccounts());
   const accountGroups = await guard("account groups", [] as JsonRecord[], () => client.listAccountGroups());
@@ -1421,6 +1699,7 @@ export async function collectPrismaSnapshot(
     alertRules,
     alerts: alertPage.items,
     alertsTruncated: alertPage.truncated,
+    alertsTruncationReason: alertPage.truncationReason,
     alertsTotal: alertPage.totalRows,
     policies,
     cloudAccounts,
@@ -1517,8 +1796,9 @@ function gate(result: PaloaltoFinding, gateInfo: EvidenceGate, evidenceInstructi
 function prismaGate(snapshot: PrismaSnapshot, surfaces: string[]): EvidenceGate {
   const unreadable = surfaces.filter((surface) => snapshot.failed.includes(surface)).map((surface) => `prisma-cloud ${surface} unreadable`);
   const partial: string[] = [];
-  if (surfaces.includes("open alerts") && snapshot.alertsTruncated) {
-    partial.push(`open alerts truncated at ${snapshot.alerts.length}${snapshot.alertsTotal !== undefined ? ` of ${snapshot.alertsTotal}` : ""} (raise alert_limit)`);
+  if (surfaces.includes("open alerts") && snapshot.alertsTruncated && !snapshot.failed.includes("open alerts")) {
+    const reach = `${snapshot.alerts.length}${snapshot.alertsTotal !== undefined ? ` of ${snapshot.alertsTotal}` : ""}`;
+    partial.push(`open alerts truncated at ${reach} (${snapshot.alertsTruncationReason ?? "raise alert_limit"})`);
   }
   return { unreadable, partial };
 }
@@ -1526,8 +1806,26 @@ function prismaGate(snapshot: PrismaSnapshot, surfaces: string[]): EvidenceGate 
 function computeGate(snapshot: ComputeSnapshot, surfaces: string[]): EvidenceGate {
   return {
     unreadable: surfaces.filter((surface) => snapshot.failed.includes(surface)).map((surface) => `prisma-compute ${surface} unreadable`),
-    partial: surfaces.filter((surface) => snapshot.truncated.includes(surface)).map((surface) => `prisma-compute ${surface} truncated at ${DEFAULT_COMPUTE_LIMIT} records`),
+    partial: surfaces
+      .filter((surface) => snapshot.truncated.includes(surface) && !snapshot.failed.includes(surface))
+      .map((surface) => {
+        const reason = snapshot.truncationReasons?.[surface];
+        return reason ? `prisma-compute ${surface} truncated (${reason})` : `prisma-compute ${surface} truncated at ${DEFAULT_COMPUTE_LIMIT} records`;
+      }),
   };
+}
+
+/** True when every named CSPM surface was read; evidence derived from a failed surface renders null. */
+function prismaReadable(snapshot: PrismaSnapshot, ...surfaces: string[]): boolean {
+  return surfaces.every((surface) => !snapshot.failed.includes(surface));
+}
+
+function computeReadable(snapshot: ComputeSnapshot, ...surfaces: string[]): boolean {
+  return surfaces.every((surface) => !snapshot.failed.includes(surface));
+}
+
+function nullUnless<T>(readable: boolean, value: T): T | null {
+  return readable ? value : null;
 }
 
 function panosGate(snapshots: PanosDeviceSnapshot[], xpathFragments: string[], options: { needsHaState?: boolean } = {}): EvidenceGate {
@@ -1551,10 +1849,18 @@ function mergeGates(...gates: Array<EvidenceGate | undefined>): EvidenceGate {
   };
 }
 
+/** True when every device answered show system info and none of the named subtrees failed. */
+function panosReadable(snapshots: PanosDeviceSnapshot[], xpathFragments: string[], options: { needsHaState?: boolean } = {}): boolean {
+  return panosGate(snapshots, xpathFragments, options).unreadable.length === 0;
+}
+
 const POLICY_XPATHS = ["/vsys", "/device-group", "/config/shared"];
 const ZONE_XPATHS = ["/network", "/template"];
 const DEVICE_XPATHS = ["/deviceconfig", "/mgt-config", "/config/shared", "/template", "/config/panorama"];
 const GLOBALPROTECT_XPATHS = ["/vsys", "/network", "/template"];
+// Authentication profiles (and the MFA flag PA-15 reads) live under vsys, templates,
+// and /config/shared, so the shared tree gates that finding as well.
+const AUTHENTICATION_PROFILE_XPATHS = [...GLOBALPROTECT_XPATHS, "/config/shared"];
 
 function finding(
   control: number,
@@ -1623,7 +1929,9 @@ const NETWORK_EXPOSURE_PATTERN = /public|internet|0\.0\.0\.0|::\/0|exposed|open 
 const ENCRYPTION_PATTERN = /encrypt|kms|cmk|customer.managed key/i;
 const DLP_PATTERN = /\bdlp\b|data loss|sensitive data|pii|data classification|data security/i;
 
-function summarizeAlerts(alerts: JsonRecord[]): JsonRecord {
+/** Alert counts, or the same shape with every value null when the alert list was not read. */
+function summarizeAlerts(alerts: JsonRecord[], readable = true): JsonRecord {
+  if (!readable) return { count: null, critical: null, high: null, top_policies: null };
   const byPolicy = new Map<string, number>();
   for (const alert of alerts) byPolicy.set(policyName(alert), (byPolicy.get(policyName(alert)) ?? 0) + 1);
   return {
@@ -1640,6 +1948,12 @@ export function assessPrismaCloudPosture(
 ): PaloaltoFinding[] {
   const minPassRate = clampNumber(options.minCompliancePassRate, DEFAULT_MIN_COMPLIANCE_PASS_RATE, 1, 100);
   const findings: PaloaltoFinding[] = [];
+  const postureReadable = prismaReadable(snapshot, "compliance posture");
+  const rulesReadable = prismaReadable(snapshot, "alert rules");
+  const alertsReadable = prismaReadable(snapshot, "open alerts");
+  const policiesReadable = prismaReadable(snapshot, "policies");
+  const accountsReadable = prismaReadable(snapshot, "cloud accounts");
+  const groupsReadable = prismaReadable(snapshot, "account groups");
 
   const summary = asObject(snapshot.posture?.summary) ?? snapshot.posture ?? {};
   const passed = asNumber(summary.passedResources) ?? 0;
@@ -1656,10 +1970,10 @@ export function assessPrismaCloudPosture(
       : `${passRate}% of ${total} evaluated resources passed across ${standards.length} compliance standards (threshold ${minPassRate}%).`,
     {
       pass_rate: passRate ?? null,
-      passed_resources: passed,
-      failed_resources: failed,
+      passed_resources: nullUnless(postureReadable, passed),
+      failed_resources: nullUnless(postureReadable, failed),
       high_severity_failed: asNumber(summary.highSeverityFailedResources) ?? null,
-      standards: standards.slice(0, 25).map((item) => ({ name: asString(item.name), passed: asNumber(item.passedResources), failed: asNumber(item.failedResources) })),
+      standards: nullUnless(postureReadable, standards.slice(0, 25).map((item) => ({ name: asString(item.name), passed: asNumber(item.passedResources), failed: asNumber(item.failedResources) }))),
     },
   ), prismaGate(snapshot, ["compliance posture"]), "export the Prisma Cloud compliance dashboard with per-standard pass rates."));
 
@@ -1676,10 +1990,10 @@ export function assessPrismaCloudPosture(
         ? "No alert rule reports enabled=true, so policy violations will not generate alerts or notifications."
         : `${enabledRules.length} alert rules report enabled=true (${disabledRules.length} disabled or without an explicit enabled flag); ${openCritical} open critical alerts in the last 30 days.`,
     {
-      enabled_rules: enabledRules.map((rule) => asString(rule.name)).slice(0, 25),
-      disabled_rules: disabledRules.map((rule) => asString(rule.name)).slice(0, 25),
-      rules_with_notifications: snapshot.alertRules.filter((rule) => asArray(rule.alertRuleNotificationConfig).length > 0).length,
-      open_alerts: summarizeAlerts(snapshot.alerts),
+      enabled_rules: nullUnless(rulesReadable, enabledRules.map((rule) => asString(rule.name)).slice(0, 25)),
+      disabled_rules: nullUnless(rulesReadable, disabledRules.map((rule) => asString(rule.name)).slice(0, 25)),
+      rules_with_notifications: nullUnless(rulesReadable, snapshot.alertRules.filter((rule) => asArray(rule.alertRuleNotificationConfig).length > 0).length),
+      open_alerts: summarizeAlerts(snapshot.alerts, alertsReadable),
     },
   ), prismaGate(snapshot, ["alert rules", "open alerts"]), "export Alerts > Alert Rules showing enabled rules and their notification channels."));
 
@@ -1697,7 +2011,11 @@ export function assessPrismaCloudPosture(
         : iamAlerts.length > 0
           ? `${iamAlerts.length} open IAM alerts indicate overprivileged or risky identities.`
           : `${iamEnabled.length} IAM policies report enabled=true with no open IAM alerts in the sampled window.`,
-    { iam_policies: iamPolicies.length, iam_policies_enabled: iamEnabled.length, iam_alerts: summarizeAlerts(iamAlerts) },
+    {
+      iam_policies: nullUnless(policiesReadable, iamPolicies.length),
+      iam_policies_enabled: nullUnless(policiesReadable, iamEnabled.length),
+      iam_alerts: summarizeAlerts(iamAlerts, alertsReadable),
+    },
   ), prismaGate(snapshot, ["policies", "open alerts"]), "export the IAM Security policy list and open identity alerts."));
 
   const enabledAccounts = snapshot.cloudAccounts.filter((account) => asBoolean(account.enabled) === true);
@@ -1712,11 +2030,11 @@ export function assessPrismaCloudPosture(
       ? "Zero cloud accounts are onboarded or visible to the access key; emptiness is treated as fail because nothing is being monitored."
       : `${snapshot.cloudAccounts.length} cloud accounts across ${snapshot.accountGroups.length} account groups; ${enabledAccounts.length} report enabled=true, ${disabledAccounts.length} disabled or without an explicit flag, ${ungroupedAccounts.length} without account groups, ${erroredAccounts.length} reporting errors.`,
     {
-      accounts: snapshot.cloudAccounts.length,
-      account_groups: snapshot.accountGroups.length,
-      disabled_accounts: disabledAccounts.map((account) => asString(account.name)).slice(0, 25),
-      ungrouped_accounts: ungroupedAccounts.map((account) => asString(account.name)).slice(0, 25),
-      errored_accounts: erroredAccounts.map((account) => `${asString(account.name)}: ${asString(account.status)}`).slice(0, 25),
+      accounts: nullUnless(accountsReadable, snapshot.cloudAccounts.length),
+      account_groups: nullUnless(groupsReadable, snapshot.accountGroups.length),
+      disabled_accounts: nullUnless(accountsReadable, disabledAccounts.map((account) => asString(account.name)).slice(0, 25)),
+      ungrouped_accounts: nullUnless(accountsReadable, ungroupedAccounts.map((account) => asString(account.name)).slice(0, 25)),
+      errored_accounts: nullUnless(accountsReadable, erroredAccounts.map((account) => `${asString(account.name)}: ${asString(account.status)}`).slice(0, 25)),
     },
   ), prismaGate(snapshot, ["cloud accounts", "account groups"]), "export Settings > Cloud Accounts with status and account group membership."));
 
@@ -1732,7 +2050,7 @@ export function assessPrismaCloudPosture(
       : networkAlerts.length === 0
         ? `No open network exposure alerts across ${networkPolicies.length} enabled network policies in the sampled window; emptiness is compliant here because detection policies are active and alerts were readable.`
         : `${networkAlerts.length} open network exposure alerts (${networkHighOrCritical.length} critical or high).`,
-    { network_policies_enabled: networkPolicies.length, ...summarizeAlerts(networkAlerts) },
+    { network_policies_enabled: nullUnless(policiesReadable, networkPolicies.length), ...summarizeAlerts(networkAlerts, alertsReadable) },
   ), prismaGate(snapshot, ["policies", "open alerts"]), "export open network exposure alerts and the enabled network policy list."));
 
   const encryptionPolicies = snapshot.policies.filter((policy) => ENCRYPTION_PATTERN.test(policyLabels(policy)));
@@ -1745,7 +2063,11 @@ export function assessPrismaCloudPosture(
     encryptionEnabled.length === 0
       ? "No encryption-at-rest policies report enabled=true; emptiness is treated as fail because unencrypted storage would go undetected."
       : `${encryptionEnabled.length}/${encryptionPolicies.length} encryption policies report enabled=true with ${encryptionAlerts.length} open encryption alerts.`,
-    { encryption_policies: encryptionPolicies.length, encryption_policies_enabled: encryptionEnabled.length, encryption_alerts: summarizeAlerts(encryptionAlerts) },
+    {
+      encryption_policies: nullUnless(policiesReadable, encryptionPolicies.length),
+      encryption_policies_enabled: nullUnless(policiesReadable, encryptionEnabled.length),
+      encryption_alerts: summarizeAlerts(encryptionAlerts, alertsReadable),
+    },
   ), prismaGate(snapshot, ["policies", "open alerts"]), "export enabled encryption policies and their open alerts."));
 
   return findings;
@@ -1856,6 +2178,7 @@ export function assessPrismaCompute(snapshot: PrismaSnapshot | undefined): Paloa
     return CWPP_EVIDENCE.map((item) => computeManual(item.control, item.severity, reason));
   }
   const findings: PaloaltoFinding[] = [];
+  const readable = (...surfaces: string[]) => computeReadable(compute, ...surfaces);
 
   const vulnPolicyRules = enabledPolicyRules(compute.vulnerabilityImagePolicy);
   const blockingRules = vulnPolicyRules.filter((rule) => ruleEffect(rule).includes("block") || ruleEffect(rule).includes("prevent"));
@@ -1863,6 +2186,9 @@ export function assessPrismaCompute(snapshot: PrismaSnapshot | undefined): Paloa
   const criticalCves = cveStats.critical;
   const highCves = cveStats.high;
   const imagesWithoutScanTime = compute.images.filter((image) => !asString(image.scanTime));
+  const vulnPolicyReadable = readable("vulnerability image policy");
+  const imagesReadable = readable("images");
+  const cveStatsReadable = readable("vulnerability stats", "images");
   findings.push(gate(finding(
     7,
     "high",
@@ -1887,14 +2213,14 @@ export function assessPrismaCompute(snapshot: PrismaSnapshot | undefined): Paloa
                 ? "Neither /stats/vulnerabilities nor the image scan results exposed severity distributions, so the environment-wide CVE exposure is unknown."
                 : `${blockingRules.length} blocking image vulnerability rules enforce thresholds; ${compute.images.length} scanned images, ${criticalCves} critical and ${highCves ?? "unknown"} high CVEs reported (${cveStats.source}).`,
     {
-      vulnerability_rules_enabled: vulnPolicyRules.length,
-      blocking_rules: blockingRules.map((rule) => asString(rule.name)).slice(0, 25),
-      images_scanned: compute.images.length,
-      images_without_scan_time: imagesWithoutScanTime.map((image) => asString(image.id) ?? asString(asObject(image.repoTag)?.repo)).slice(0, 25),
-      critical_cves: criticalCves ?? null,
-      high_cves: highCves ?? null,
-      cve_stats_by_resource: cveStats.byResource,
-      cve_stats_source: cveStats.source,
+      vulnerability_rules_enabled: nullUnless(vulnPolicyReadable, vulnPolicyRules.length),
+      blocking_rules: nullUnless(vulnPolicyReadable, blockingRules.map((rule) => asString(rule.name)).slice(0, 25)),
+      images_scanned: nullUnless(imagesReadable, compute.images.length),
+      images_without_scan_time: nullUnless(imagesReadable, imagesWithoutScanTime.map((image) => asString(image.id) ?? asString(asObject(image.repoTag)?.repo)).slice(0, 25)),
+      critical_cves: cveStatsReadable ? criticalCves ?? null : null,
+      high_cves: cveStatsReadable ? highCves ?? null : null,
+      cve_stats_by_resource: nullUnless(cveStatsReadable, cveStats.byResource),
+      cve_stats_source: nullUnless(cveStatsReadable, cveStats.source),
     },
   ), computeGate(compute, ["vulnerability image policy", "images", "vulnerability stats"]), CWPP_EVIDENCE[0].instruction));
 
@@ -1903,6 +2229,8 @@ export function assessPrismaCompute(snapshot: PrismaSnapshot | undefined): Paloa
   const compliance = summarizeComplianceStats(compute.complianceStats);
   const complianceRate = compliance.rate;
   const connectedDefenders = compute.defenders.filter((defender) => asBoolean(defender.connected) === true).length;
+  const defendersReadable = readable("defenders");
+  const complianceStatsReadable = readable("compliance stats");
   findings.push(gate(finding(
     8,
     "medium",
@@ -1927,14 +2255,14 @@ export function assessPrismaCompute(snapshot: PrismaSnapshot | undefined): Paloa
             ? `${hostRules.length} host and ${containerRules.length} container compliance rules are enabled, but /stats/compliance recorded zero evaluations in rules[] and categories[], so no compliance rate can be derived; treated as warn.`
             : `${hostRules.length} host and ${containerRules.length} container compliance rules enabled across ${connectedDefenders} connected Defenders; ${compliance.failed} failed of ${compliance.total} compliance evaluations (${compliance.source}) gives a ${complianceRate}% compliance rate (threshold ${DEFAULT_MIN_HOST_COMPLIANCE_RATE}%).`,
     {
-      host_rules_enabled: hostRules.length,
-      container_rules_enabled: containerRules.length,
-      connected_defenders: connectedDefenders,
-      compliance_rate: complianceRate ?? null,
-      compliance_failed: compliance.failed,
-      compliance_total: compliance.total,
-      compliance_source: compliance.source,
-      worst_rules: compliance.worst,
+      host_rules_enabled: nullUnless(readable("compliance host policy"), hostRules.length),
+      container_rules_enabled: nullUnless(readable("compliance container policy"), containerRules.length),
+      connected_defenders: nullUnless(defendersReadable, connectedDefenders),
+      compliance_rate: complianceStatsReadable ? complianceRate ?? null : null,
+      compliance_failed: nullUnless(complianceStatsReadable, compliance.failed),
+      compliance_total: nullUnless(complianceStatsReadable, compliance.total),
+      compliance_source: nullUnless(complianceStatsReadable, compliance.source),
+      worst_rules: nullUnless(complianceStatsReadable, compliance.worst),
     },
   ), computeGate(compute, ["compliance host policy", "compliance container policy", "compliance stats", "defenders"]), CWPP_EVIDENCE[1].instruction));
 
@@ -1956,7 +2284,12 @@ export function assessPrismaCompute(snapshot: PrismaSnapshot | undefined): Paloa
         : runtimeDefenders === 0
           ? `${protectiveRules.length} preventive runtime rules exist but no Defender reports connected=true, so nothing enforces them.`
           : `${protectiveRules.length} of ${runtimeRules.length} enabled container runtime rules prevent or block at least one behavior class (${alertOnlyRules.length} alert-only), enforced by ${runtimeDefenders} connected Defenders.`,
-    { runtime_rules_enabled: runtimeRules.length, connected_defenders: runtimeDefenders, protective_rules: protectiveRules.map((rule) => asString(rule.name)).slice(0, 25), alert_only_rules: alertOnlyRules.map((rule) => asString(rule.name)).slice(0, 25) },
+    {
+      runtime_rules_enabled: nullUnless(readable("runtime container policy"), runtimeRules.length),
+      connected_defenders: nullUnless(defendersReadable, runtimeDefenders),
+      protective_rules: nullUnless(readable("runtime container policy"), protectiveRules.map((rule) => asString(rule.name)).slice(0, 25)),
+      alert_only_rules: nullUnless(readable("runtime container policy"), alertOnlyRules.map((rule) => asString(rule.name)).slice(0, 25)),
+    },
   ), computeGate(compute, ["runtime container policy", "defenders"]), CWPP_EVIDENCE[2].instruction));
 
   const connected = compute.defenders.filter((defender) => asBoolean(defender.connected) === true);
@@ -1975,11 +2308,11 @@ export function assessPrismaCompute(snapshot: PrismaSnapshot | undefined): Paloa
           ? `${connected.length} Defenders report connected=true, but ${withoutTimestamp.length} have no lastModified timestamp and cannot be counted as recently seen.`
           : `${connected.length} Defenders report connected=true across ${versions.size} version(s).`,
     {
-      defenders: compute.defenders.length,
-      connected: connected.length,
-      disconnected: disconnected.map((defender) => asString(defender.hostname)).slice(0, 25),
-      without_timestamp: withoutTimestamp.map((defender) => asString(defender.hostname)).slice(0, 25),
-      versions: [...versions],
+      defenders: nullUnless(defendersReadable, compute.defenders.length),
+      connected: nullUnless(defendersReadable, connected.length),
+      disconnected: nullUnless(defendersReadable, disconnected.map((defender) => asString(defender.hostname)).slice(0, 25)),
+      without_timestamp: nullUnless(defendersReadable, withoutTimestamp.map((defender) => asString(defender.hostname)).slice(0, 25)),
+      versions: nullUnless(defendersReadable, [...versions]),
     },
   ), computeGate(compute, ["defenders"]), CWPP_EVIDENCE[3].instruction));
 
@@ -1998,9 +2331,9 @@ export function assessPrismaCompute(snapshot: PrismaSnapshot | undefined): Paloa
           ? `${registryScansWithoutTime.length} of ${compute.registryScans.length} registry scan results have no scanTime and cannot be counted as fresh.`
           : `${registries.length} registries configured with ${compute.registryScans.length} scanned images.`,
     {
-      registries: registries.map((registry) => `${asString(registry.registry) ?? ""}/${asString(registry.repository) ?? "*"}`).slice(0, 25),
-      registry_scans: compute.registryScans.length,
-      scans_without_time: registryScansWithoutTime.length,
+      registries: nullUnless(readable("registry settings"), registries.map((registry) => `${asString(registry.registry) ?? ""}/${asString(registry.repository) ?? "*"}`).slice(0, 25)),
+      registry_scans: nullUnless(readable("registry scans"), compute.registryScans.length),
+      scans_without_time: nullUnless(readable("registry scans"), registryScansWithoutTime.length),
     },
   ), computeGate(compute, ["registry settings", "registry scans"]), CWPP_EVIDENCE[4].instruction));
 
@@ -2018,9 +2351,9 @@ export function assessPrismaCompute(snapshot: PrismaSnapshot | undefined): Paloa
           ? `${discoveryErrors.length} cloud discovery entries report errors, so coverage is uncertain.`
           : `${compute.cloudDiscovery.length} cloud discovery entries all report total resources equal to defended resources.`,
     {
-      discovery_entries: compute.cloudDiscovery.length,
-      unprotected: unprotected.map((entry) => `${asString(entry.provider)}/${asString(entry.serviceType)}: ${asNumber(entry.defended) ?? 0}/${asNumber(entry.total) ?? 0}`).slice(0, 25),
-      errors: discoveryErrors.map((entry) => asString(entry.err)).slice(0, 10),
+      discovery_entries: nullUnless(readable("cloud discovery"), compute.cloudDiscovery.length),
+      unprotected: nullUnless(readable("cloud discovery"), unprotected.map((entry) => `${asString(entry.provider)}/${asString(entry.serviceType)}: ${asNumber(entry.defended) ?? 0}/${asNumber(entry.total) ?? 0}`).slice(0, 25)),
+      errors: nullUnless(readable("cloud discovery"), discoveryErrors.map((entry) => redactErrorText(asString(entry.err) ?? "")).slice(0, 10)),
     },
   ), computeGate(compute, ["cloud discovery"]), CWPP_EVIDENCE[5].instruction));
 
@@ -2033,7 +2366,12 @@ export function assessPrismaCompute(snapshot: PrismaSnapshot | undefined): Paloa
     compute.ciScans.length === 0
       ? "Zero CI image scan results were returned; emptiness is treated as fail because no pipeline is submitting images to twistcli or the Jenkins plugin."
       : `${compute.ciScans.length} CI scan results (${failedScans.length} failed policy, ${scansWithoutTime.length} without a scan time). Admission control policy has no verified public read endpoint, so this control stays at warn until admission rules are reviewed manually.`,
-    { ci_scans: compute.ciScans.length, failed_scans: failedScans.length, scans_without_time: scansWithoutTime.length, manual_evidence: "export Compute > Defend > Access > Admission rules to confirm admission control gating." },
+    {
+      ci_scans: nullUnless(readable("ci scans"), compute.ciScans.length),
+      failed_scans: nullUnless(readable("ci scans"), failedScans.length),
+      scans_without_time: nullUnless(readable("ci scans"), scansWithoutTime.length),
+      manual_evidence: "export Compute > Defend > Access > Admission rules to confirm admission control gating.",
+    },
   ), computeGate(compute, ["ci scans"]), CWPP_EVIDENCE[6].instruction));
 
   return findings;
@@ -2153,6 +2491,9 @@ export function assessPanosFirewallPolicy(snapshots: PanosDeviceSnapshot[]): Pal
   const implicitLog = enabledRules.filter((rule) => rule.logEnd === undefined);
   const shadowed = enabledRules.filter((rule, index) => isShadowed(rule, enabledRules.slice(0, index).filter((item) => item.location === rule.location)));
   const findings: PaloaltoFinding[] = [];
+  const policyReadable = panosReadable(snapshots, POLICY_XPATHS);
+  const zonesReadable = panosReadable(snapshots, [...ZONE_XPATHS, ...POLICY_XPATHS]);
+  const decryptionReadable = panosReadable(snapshots, [...POLICY_XPATHS, ...DEVICE_XPATHS]);
 
   findings.push(gate(finding(
     12,
@@ -2162,12 +2503,12 @@ export function assessPanosFirewallPolicy(snapshots: PanosDeviceSnapshot[]): Pal
       ? "Zero security rules were returned by the configured devices; treated as manual because an empty rulebase usually means the wrong vsys or device group scope rather than a hardened policy. Manual evidence required: export the security rulebase for every vsys and device group."
       : `${enabledRules.length} enabled security rules: ${permissive.length} any/any allow, ${shadowed.length} likely shadowed, ${unlogged.length} with log-end=no, ${implicitLog.length} without an explicit log-end flag (implicit default not counted as logged).`,
     {
-      rules_total: rules.length,
-      rules_enabled: enabledRules.length,
-      rules_without_explicit_log_end: implicitLog.map((rule) => `${rule.location}/${rule.name}`).slice(0, 25),
-      permissive_rules: permissive.map((rule) => `${rule.location}/${rule.name}`).slice(0, 25),
-      shadowed_rules: shadowed.map((rule) => `${rule.location}/${rule.name}`).slice(0, 25),
-      unlogged_rules: unlogged.map((rule) => `${rule.location}/${rule.name}`).slice(0, 25),
+      rules_total: nullUnless(policyReadable, rules.length),
+      rules_enabled: nullUnless(policyReadable, enabledRules.length),
+      rules_without_explicit_log_end: nullUnless(policyReadable, implicitLog.map((rule) => `${rule.location}/${rule.name}`).slice(0, 25)),
+      permissive_rules: nullUnless(policyReadable, permissive.map((rule) => `${rule.location}/${rule.name}`).slice(0, 25)),
+      shadowed_rules: nullUnless(policyReadable, shadowed.map((rule) => `${rule.location}/${rule.name}`).slice(0, 25)),
+      unlogged_rules: nullUnless(policyReadable, unlogged.map((rule) => `${rule.location}/${rule.name}`).slice(0, 25)),
     },
   ), panosGate(snapshots, POLICY_XPATHS), "export the security rulebase with rule usage, logging, and disabled state."));
 
@@ -2207,11 +2548,11 @@ export function assessPanosFirewallPolicy(snapshots: PanosDeviceSnapshot[]): Pal
       ? "Zero zones were returned; treated as manual because a firewall always has zones, so the network subtree is probably hidden from this API role. Manual evidence required: export Network > Zones with zone protection assignments."
       : `${zones.length} zones; ${anyZone.length} allow rules use any zone, intrazone-default ${intrazoneDenied ? "denies" : "allows (default)"}, interzone-default logging ${interzoneLogged ? "enabled" : "not enabled"}, ${unprotectedZones.length} zones without a zone protection profile.`,
     {
-      zones: zones.map((zone) => `${zone.host}/${zone.name}`).slice(0, 50),
-      any_zone_allow_rules: anyZone.map((rule) => `${rule.location}/${rule.name}`).slice(0, 25),
-      intrazone_default_denied: intrazoneDenied,
-      interzone_default_logged: interzoneLogged,
-      zones_without_zone_protection: unprotectedZones.map((zone) => `${zone.host}/${zone.name}`).slice(0, 50),
+      zones: nullUnless(zonesReadable, zones.map((zone) => `${zone.host}/${zone.name}`).slice(0, 50)),
+      any_zone_allow_rules: nullUnless(policyReadable, anyZone.map((rule) => `${rule.location}/${rule.name}`).slice(0, 25)),
+      intrazone_default_denied: nullUnless(policyReadable, intrazoneDenied),
+      interzone_default_logged: nullUnless(policyReadable, interzoneLogged),
+      zones_without_zone_protection: nullUnless(zonesReadable, unprotectedZones.map((zone) => `${zone.host}/${zone.name}`).slice(0, 50)),
     },
   ), panosGate(snapshots, [...ZONE_XPATHS, ...POLICY_XPATHS]), "export zone protection profile assignments and the intrazone and interzone default rule settings."));
 
@@ -2248,9 +2589,9 @@ export function assessPanosFirewallPolicy(snapshots: PanosDeviceSnapshot[]): Pal
       ? "No enabled decryption rules with action decrypt were found; encrypted traffic is not inspected."
       : `${activeDecrypt.length} active decrypt rules (${decryptionRules.length - activeDecrypt.length} no-decrypt or disabled); ${weakTlsProfiles.length}/${tlsProfiles} SSL/TLS service profiles allow TLS below 1.2.`,
     {
-      decryption_rules: decryptionRules.map((rule) => `${rule.host}/${rule.name}: ${rule.action ?? "unknown"}${rule.disabled ? " (disabled)" : ""}`).slice(0, 25),
-      tls_service_profiles: tlsProfiles,
-      weak_tls_profiles: weakTlsProfiles.slice(0, 25),
+      decryption_rules: nullUnless(policyReadable, decryptionRules.map((rule) => `${rule.host}/${rule.name}: ${rule.action ?? "unknown"}${rule.disabled ? " (disabled)" : ""}`).slice(0, 25)),
+      tls_service_profiles: nullUnless(decryptionReadable, tlsProfiles),
+      weak_tls_profiles: nullUnless(decryptionReadable, weakTlsProfiles.slice(0, 25)),
     },
   ), panosGate(snapshots, [...POLICY_XPATHS, ...DEVICE_XPATHS]), "export the decryption rulebase and SSL/TLS service profiles."));
 
@@ -2263,6 +2604,7 @@ export function assessPanosThreatPrevention(snapshots: PanosDeviceSnapshot[]): P
   const findings: PaloaltoFinding[] = [];
   const groups = new Map<string, Record<string, string[]>>();
   for (const snapshot of snapshots) for (const [name, members] of profileGroups(snapshot)) groups.set(name, members);
+  const policyReadable = panosReadable(snapshots, POLICY_XPATHS);
 
   const virus = snapshots.flatMap((snapshot) => profileEntries(snapshot, "virus"));
   const spyware = snapshots.flatMap((snapshot) => profileEntries(snapshot, "spyware"));
@@ -2283,11 +2625,11 @@ export function assessPanosThreatPrevention(snapshots: PanosDeviceSnapshot[]): P
         ? `${missingThreat.length}/${allows.length} allow rules lack antivirus, anti-spyware, or vulnerability protection profiles.`
         : `All ${allows.length} allow rules carry threat prevention profiles; ${lenientVulnerability.length} vulnerability profiles alert or allow on critical/high signatures.`,
     {
-      antivirus_profiles: virus.map(xmlEntryName),
-      antispyware_profiles: spyware.map(xmlEntryName),
-      vulnerability_profiles: vulnerability.map(xmlEntryName),
-      allow_rules_missing_threat_profiles: missingThreat.map((rule) => `${rule.location}/${rule.name}`).slice(0, 25),
-      lenient_vulnerability_profiles: lenientVulnerability.map(xmlEntryName),
+      antivirus_profiles: nullUnless(policyReadable, virus.map(xmlEntryName)),
+      antispyware_profiles: nullUnless(policyReadable, spyware.map(xmlEntryName)),
+      vulnerability_profiles: nullUnless(policyReadable, vulnerability.map(xmlEntryName)),
+      allow_rules_missing_threat_profiles: nullUnless(policyReadable, missingThreat.map((rule) => `${rule.location}/${rule.name}`).slice(0, 25)),
+      lenient_vulnerability_profiles: nullUnless(policyReadable, lenientVulnerability.map(xmlEntryName)),
     },
   ), panosGate(snapshots, POLICY_XPATHS), "export antivirus, anti-spyware, and vulnerability profiles and their rule attachments."));
 
@@ -2304,9 +2646,9 @@ export function assessPanosThreatPrevention(snapshots: PanosDeviceSnapshot[]): P
       ? "No WildFire analysis profiles are configured."
       : `${wildfire.length} WildFire profiles (${fullCoverage.length} forward any application and any file type); ${missingWildfire.length}/${allows.length} allow rules lack WildFire coverage. Cloud connectivity must be confirmed with 'show wildfire status'.`,
     {
-      wildfire_profiles: wildfire.map(xmlEntryName),
-      full_coverage_profiles: fullCoverage.map(xmlEntryName),
-      allow_rules_missing_wildfire: missingWildfire.map((rule) => `${rule.location}/${rule.name}`).slice(0, 25),
+      wildfire_profiles: nullUnless(policyReadable, wildfire.map(xmlEntryName)),
+      full_coverage_profiles: nullUnless(policyReadable, fullCoverage.map(xmlEntryName)),
+      allow_rules_missing_wildfire: nullUnless(policyReadable, missingWildfire.map((rule) => `${rule.location}/${rule.name}`).slice(0, 25)),
     },
   ), panosGate(snapshots, POLICY_XPATHS), "export WildFire analysis profiles, rule attachments, and show wildfire status output."));
 
@@ -2329,10 +2671,10 @@ export function assessPanosThreatPrevention(snapshots: PanosDeviceSnapshot[]): P
       ? "No URL filtering profiles are configured."
       : `${urlProfiles.length} URL filtering profiles; ${weakUrlProfiles.length} do not block malware, phishing, and command-and-control; ${credentialDisabled.length} have credential phishing protection disabled; ${missingUrl.length}/${allows.length} allow rules lack URL filtering.`,
     {
-      url_profiles: urlProfiles.map(xmlEntryName),
-      weak_url_profiles: weakUrlProfiles.map(xmlEntryName),
-      credential_enforcement_disabled: credentialDisabled.map(xmlEntryName),
-      allow_rules_missing_url_filtering: missingUrl.map((rule) => `${rule.location}/${rule.name}`).slice(0, 25),
+      url_profiles: nullUnless(policyReadable, urlProfiles.map(xmlEntryName)),
+      weak_url_profiles: nullUnless(policyReadable, weakUrlProfiles.map(xmlEntryName)),
+      credential_enforcement_disabled: nullUnless(policyReadable, credentialDisabled.map(xmlEntryName)),
+      allow_rules_missing_url_filtering: nullUnless(policyReadable, missingUrl.map((rule) => `${rule.location}/${rule.name}`).slice(0, 25)),
     },
   ), panosGate(snapshots, POLICY_XPATHS), "export URL filtering profiles with blocked categories and credential enforcement settings."));
 
@@ -2351,9 +2693,9 @@ export function assessPanosThreatPrevention(snapshots: PanosDeviceSnapshot[]): P
       ? "No file blocking profile blocks PE executables or all file types."
       : `${blockingPe.length}/${fileBlocking.length} file blocking profiles block PE or all file types; ${missingFileBlocking.length}/${allows.length} allow rules lack file blocking.`,
     {
-      file_blocking_profiles: fileBlocking.map(xmlEntryName),
-      profiles_blocking_pe: blockingPe.map(xmlEntryName),
-      allow_rules_missing_file_blocking: missingFileBlocking.map((rule) => `${rule.location}/${rule.name}`).slice(0, 25),
+      file_blocking_profiles: nullUnless(policyReadable, fileBlocking.map(xmlEntryName)),
+      profiles_blocking_pe: nullUnless(policyReadable, blockingPe.map(xmlEntryName)),
+      allow_rules_missing_file_blocking: nullUnless(policyReadable, missingFileBlocking.map((rule) => `${rule.location}/${rule.name}`).slice(0, 25)),
     },
   ), panosGate(snapshots, POLICY_XPATHS), "export file blocking profiles and their rule attachments."));
 
@@ -2391,10 +2733,12 @@ export function assessDataLossPrevention(prisma: PrismaSnapshot | undefined, sna
       : "PAN-OS not configured.",
   ];
   const gateInfo = mergeGates(prisma ? prismaGate(prisma, ["policies"]) : undefined, snapshots.length > 0 ? panosGate(snapshots, POLICY_XPATHS) : undefined);
+  const prismaPoliciesReadable = prisma !== undefined && prismaReadable(prisma, "policies");
+  const panosPolicyReadable = snapshots.length > 0 && panosReadable(snapshots, POLICY_XPATHS);
   return gate(finding(21, "medium", status, parts.join(" "), {
-    prisma_dlp_policies: dlpPolicies.map((policy) => asString(policy.name)).slice(0, 25),
-    panos_data_filtering_profiles: panos.profiles,
-    panos_rules_with_data_filtering: panos.attachedRules,
+    prisma_dlp_policies: nullUnless(prismaPoliciesReadable, dlpPolicies.map((policy) => asString(policy.name)).slice(0, 25)),
+    panos_data_filtering_profiles: nullUnless(panosPolicyReadable, panos.profiles),
+    panos_rules_with_data_filtering: nullUnless(panosPolicyReadable, panos.attachedRules),
   }), gateInfo, instruction);
 }
 
@@ -2462,11 +2806,13 @@ export function assessAdminAccess(prisma: PrismaSnapshot | undefined, snapshots:
     prisma ? `Prisma Cloud: ${prisma.userRoles.length} roles, ${sysadminRoles.length} System Admin roles.${prisma.userRoles.length === 0 ? " Zero roles were returned, so role assignments could not be evaluated (warn)." : ""}` : "Prisma Cloud not configured.",
   ];
   const gateInfo = mergeGates(prisma ? prismaGate(prisma, ["user roles"]) : undefined, snapshots.length > 0 ? panosGate(snapshots, DEVICE_XPATHS) : undefined);
+  const deviceReadable = snapshots.length > 0 && panosReadable(snapshots, DEVICE_XPATHS);
+  const rolesReadable = prisma !== undefined && prismaReadable(prisma, "user roles");
   return gate(finding(19, "high", status, parts.join(" "), {
-    panos_admins: admins.map((admin) => `${admin.host}/${admin.name}${admin.superuser ? " (superuser)" : ""}`).slice(0, 50),
-    panos_local_password_only: localOnly.map((admin) => `${admin.host}/${admin.name}`).slice(0, 50),
-    password_complexity_by_device: snapshots.map((snapshot, index) => ({ host: snapshot.host, enabled: complexity[index] ?? null })),
-    prisma_roles: prisma?.userRoles.map((role) => `${asString(role.name)} (${asString(role.roleType) ?? "unknown"})`).slice(0, 50),
+    panos_admins: nullUnless(deviceReadable, admins.map((admin) => `${admin.host}/${admin.name}${admin.superuser ? " (superuser)" : ""}`).slice(0, 50)),
+    panos_local_password_only: nullUnless(deviceReadable, localOnly.map((admin) => `${admin.host}/${admin.name}`).slice(0, 50)),
+    password_complexity_by_device: nullUnless(deviceReadable, snapshots.map((snapshot, index) => ({ host: snapshot.host, enabled: complexity[index] ?? null }))),
+    prisma_roles: nullUnless(rolesReadable, prisma?.userRoles.map((role) => `${asString(role.name)} (${asString(role.roleType) ?? "unknown"})`).slice(0, 50) ?? null),
   }), gateInfo, instruction);
 }
 
@@ -2506,13 +2852,16 @@ export function assessLogging(prisma: PrismaSnapshot | undefined, snapshots: Pan
     prisma ? `Prisma Cloud: ${siemIntegrations.length}/${prisma.integrations.length} integrations forward alerts to a SIEM or notification channel.` : "Prisma Cloud not configured.",
   ];
   const gateInfo = mergeGates(prisma ? prismaGate(prisma, ["integrations"]) : undefined, snapshots.length > 0 ? panosGate(snapshots, [...POLICY_XPATHS, ...DEVICE_XPATHS]) : undefined);
+  const rulesReadable = snapshots.length > 0 && panosReadable(snapshots, POLICY_XPATHS);
+  const forwardingReadable = snapshots.length > 0 && panosReadable(snapshots, [...POLICY_XPATHS, ...DEVICE_XPATHS]);
+  const integrationsReadable = prisma !== undefined && prismaReadable(prisma, "integrations");
   return gate(finding(20, "high", status, parts.join(" "), {
-    unlogged_rules: unlogged.map((rule) => `${rule.location}/${rule.name}`).slice(0, 25),
-    rules_without_log_forwarding: noForwarding.map((rule) => `${rule.location}/${rule.name}`).slice(0, 25),
-    syslog_server_profiles: syslogServers,
-    log_forwarding_profiles: forwardingProfiles,
-    panorama_forwarding: panoramaForwarding,
-    prisma_integrations: prisma?.integrations.map((item) => `${asString(item.name)} (${asString(item.integrationType) ?? "unknown"})`).slice(0, 25),
+    unlogged_rules: nullUnless(rulesReadable, unlogged.map((rule) => `${rule.location}/${rule.name}`).slice(0, 25)),
+    rules_without_log_forwarding: nullUnless(rulesReadable, noForwarding.map((rule) => `${rule.location}/${rule.name}`).slice(0, 25)),
+    syslog_server_profiles: nullUnless(forwardingReadable, syslogServers),
+    log_forwarding_profiles: nullUnless(forwardingReadable, forwardingProfiles),
+    panorama_forwarding: nullUnless(forwardingReadable, panoramaForwarding),
+    prisma_integrations: nullUnless(integrationsReadable, prisma?.integrations.map((item) => `${asString(item.name)} (${asString(item.integrationType) ?? "unknown"})`).slice(0, 25) ?? null),
   }), gateInfo, instruction);
 }
 
@@ -2548,6 +2897,8 @@ export function assessPanosDeviceHardening(snapshots: PanosDeviceSnapshot[]): Pa
     }
   }
   const gpConfigured = portals.length + gateways.length > 0;
+  const gpReadable = panosReadable(snapshots, GLOBALPROTECT_XPATHS);
+  const authProfilesReadable = panosReadable(snapshots, AUTHENTICATION_PROFILE_XPATHS);
   findings.push(gate(finding(
     15,
     "high",
@@ -2556,14 +2907,14 @@ export function assessPanosDeviceHardening(snapshots: PanosDeviceSnapshot[]): Pa
       ? "GlobalProtect is not configured on the inspected devices, so the control is scoped out and reported as manual rather than pass. Manual evidence required: confirm no remote access VPN is expected for these devices or provide the device that hosts GlobalProtect."
       : `${portals.length} portals and ${gateways.length} gateways; ${portalsWithoutAuth.length + gatewaysWithoutAuth.length} without an authentication profile, ${mfaProfiles.length} authentication profiles enforce MFA, ${splitTunnelGateways.length} gateways use split tunneling. HIP profile requirements must be reviewed manually.`,
     {
-      portals,
-      gateways,
-      portals_without_authentication: portalsWithoutAuth,
-      gateways_without_authentication: gatewaysWithoutAuth,
-      mfa_authentication_profiles: mfaProfiles,
-      split_tunnel_gateways: splitTunnelGateways,
+      portals: nullUnless(gpReadable, portals),
+      gateways: nullUnless(gpReadable, gateways),
+      portals_without_authentication: nullUnless(gpReadable, portalsWithoutAuth),
+      gateways_without_authentication: nullUnless(gpReadable, gatewaysWithoutAuth),
+      mfa_authentication_profiles: nullUnless(authProfilesReadable, mfaProfiles),
+      split_tunnel_gateways: nullUnless(gpReadable, splitTunnelGateways),
     },
-  ), panosGate(snapshots, GLOBALPROTECT_XPATHS), "export GlobalProtect portal and gateway authentication settings with the referenced authentication profiles."));
+  ), panosGate(snapshots, AUTHENTICATION_PROFILE_XPATHS), "export GlobalProtect portal and gateway authentication settings with the referenced authentication profiles."));
 
   const hardening: JsonRecord[] = [];
   let failures = 0;
@@ -2604,7 +2955,7 @@ export function assessPanosDeviceHardening(snapshots: PanosDeviceSnapshot[]): Pa
     snapshots.length === 0 || hardening.length === 0
       ? "No deviceconfig system settings were readable from any device, so hardening cannot be evaluated. Manual evidence required: export Device > Setup > Management and Services settings."
       : `${snapshots.length} devices inspected: ${failures} fail hardening checks (NTP, default SNMP community, telnet or HTTP management), ${warnings} have warnings (banner, permitted IPs, idle timeout, DNS).`,
-    { devices: hardening },
+    { devices: nullUnless(panosReadable(snapshots, DEVICE_XPATHS), hardening) },
   ), panosGate(snapshots, DEVICE_XPATHS, { needsHaState: true }), "export management interface service settings, admin lockout settings, certificates, and HA state."));
 
   const haDetails = snapshots.map((snapshot) => {
@@ -2669,16 +3020,20 @@ async function readableSurface(
   endpoint: string,
   load: () => Promise<unknown>,
   countResolver?: (value: unknown) => number | undefined,
+  partialResolver?: (value: unknown) => boolean,
 ): Promise<PaloaltoAccessSurface> {
   try {
     const value = await load();
-    return { product, target, name, endpoint, status: "readable", count: countResolver?.(value) };
+    const partial = partialResolver?.(value) === true;
+    return { product, target, name, endpoint, status: "readable", count: countResolver?.(value), ...(partial ? { partial } : {}) };
   } catch (error) {
     return { product, target, name, endpoint, status: "not_readable", error: errorMessage(error) };
   }
 }
 
 const arrayCount = (value: unknown) => (Array.isArray(value) ? value.length : undefined);
+const pagedCount = (value: unknown) => (value as PagedResult).items.length;
+const pagedPartial = (value: unknown) => (value as PagedResult).truncated;
 
 export async function checkPaloaltoAccess(clients: PaloaltoClients): Promise<PaloaltoAccessCheckResult> {
   const surfaces: PaloaltoAccessSurface[] = [];
@@ -2692,7 +3047,7 @@ export async function checkPaloaltoAccess(clients: PaloaltoClients): Promise<Pal
     surfaces.push(
       await readableSurface("prisma-cloud", prisma.apiUrl, "compliance_posture", "GET /v2/compliance/posture", () => prisma.getCompliancePosture(), () => 1),
       await readableSurface("prisma-cloud", prisma.apiUrl, "alert_rules", "GET /v2/alert/rule", () => prisma.listAlertRules(), arrayCount),
-      await readableSurface("prisma-cloud", prisma.apiUrl, "open_alerts", "GET /v2/alert", () => prisma.listOpenAlerts(DEFAULT_ALERT_PAGE_SIZE), arrayCount),
+      await readableSurface("prisma-cloud", prisma.apiUrl, "open_alerts", "GET /v2/alert", () => prisma.collectOpenAlerts(DEFAULT_ALERT_PAGE_SIZE), pagedCount, pagedPartial),
       await readableSurface("prisma-cloud", prisma.apiUrl, "policies", "GET /v2/policy", () => prisma.listPolicies(), arrayCount),
       await readableSurface("prisma-cloud", prisma.apiUrl, "cloud_accounts", "GET /cloud", () => prisma.listCloudAccounts(), arrayCount),
       await readableSurface("prisma-cloud", prisma.apiUrl, "account_groups", "GET /cloud/group", () => prisma.listAccountGroups(), arrayCount),
@@ -2704,14 +3059,14 @@ export async function checkPaloaltoAccess(clients: PaloaltoClients): Promise<Pal
       products.push("prisma-compute");
       notes.push(`Prisma Cloud Compute console: ${compute.baseUrl}`);
       surfaces.push(
-        await readableSurface("prisma-compute", compute.baseUrl, "defenders", "GET /api/v1/defenders", () => compute.listDefenders(DEFAULT_COMPUTE_PAGE_SIZE), (value) => (value as { items: unknown[] }).items.length),
+        await readableSurface("prisma-compute", compute.baseUrl, "defenders", "GET /api/v1/defenders", () => compute.listDefenders(DEFAULT_COMPUTE_PAGE_SIZE), pagedCount, pagedPartial),
         await readableSurface("prisma-compute", compute.baseUrl, "runtime_container_policy", "GET /api/v1/policies/runtime/container", () => compute.getRuntimeContainerPolicy(), (value) => asRecords(asObject(value)?.rules).length),
         await readableSurface("prisma-compute", compute.baseUrl, "compliance_policies", "GET /api/v1/policies/compliance/{container,host}", async () => [await compute.getComplianceContainerPolicy(), await compute.getComplianceHostPolicy()], () => 2),
         await readableSurface("prisma-compute", compute.baseUrl, "vulnerability_image_policy", "GET /api/v1/policies/vulnerability/images", () => compute.getVulnerabilityImagePolicy(), (value) => asRecords(asObject(value)?.rules).length),
         await readableSurface("prisma-compute", compute.baseUrl, "registry_settings", "GET /api/v1/settings/registry", () => compute.getRegistrySettings(), (value) => asRecords(asObject(value)?.specifications).length),
         await readableSurface("prisma-compute", compute.baseUrl, "vulnerability_stats", "GET /api/v1/stats/vulnerabilities", () => compute.getVulnerabilityStats(), arrayCount),
-        await readableSurface("prisma-compute", compute.baseUrl, "cloud_discovery", "GET /api/v1/cloud/discovery", () => compute.listCloudDiscovery(DEFAULT_COMPUTE_PAGE_SIZE), (value) => (value as { items: unknown[] }).items.length),
-        await readableSurface("prisma-compute", compute.baseUrl, "ci_scans", "GET /api/v1/scans", () => compute.listCiScans(DEFAULT_COMPUTE_PAGE_SIZE), (value) => (value as { items: unknown[] }).items.length),
+        await readableSurface("prisma-compute", compute.baseUrl, "cloud_discovery", "GET /api/v1/cloud/discovery", () => compute.listCloudDiscovery(DEFAULT_COMPUTE_PAGE_SIZE), pagedCount, pagedPartial),
+        await readableSurface("prisma-compute", compute.baseUrl, "ci_scans", "GET /api/v1/scans", () => compute.listCiScans(DEFAULT_COMPUTE_PAGE_SIZE), pagedCount, pagedPartial),
       );
     } else {
       notes.push(`Prisma Cloud Compute not reachable: ${clients.computeUnavailableReason ?? "unknown"} Controls 7-11, 24, and 25 fall back to manual findings.`);
@@ -2738,8 +3093,9 @@ export async function checkPaloaltoAccess(clients: PaloaltoClients): Promise<Pal
   if (!clients.config.verifyTls) notes.push("TLS certificate verification is disabled for PAN-OS requests only (PANOS_VERIFY_TLS=false); Prisma Cloud requests and the rest of the process keep verification on.");
 
   const readable = surfaces.filter((surface) => surface.status === "readable").length;
+  const partialProbes = surfaces.filter((surface) => surface.partial).length;
   const status: PaloaltoAccessCheckResult["status"] = surfaces.length === 0 ? "unconfigured" : readable === surfaces.length ? "healthy" : "degraded";
-  notes.push(`${readable}/${surfaces.length} Palo Alto audit surfaces are readable.`);
+  notes.push(`${readable}/${surfaces.length} Palo Alto audit surfaces are readable.${partialProbes > 0 ? ` ${partialProbes} probe${partialProbes === 1 ? "" : "s"} stopped at the page cap, so counts marked + are lower bounds, not inventory totals.` : ""}`);
   return {
     status,
     products,
@@ -2753,6 +3109,36 @@ export async function checkPaloaltoAccess(clients: PaloaltoClients): Promise<Pal
 
 async function collectPanosSnapshots(clients: PaloaltoClients): Promise<PanosDeviceSnapshot[]> {
   return Promise.all(clients.panos.map((device) => collectPanosSnapshot(device)));
+}
+
+/** Per-device collection status for assessment summaries: which hosts and subtrees were not read. */
+function panosCollectionSummary(devices: PanosDeviceSnapshot[]): JsonRecord {
+  return {
+    devices: devices.length,
+    platforms: devices.map((item) => `${item.host}: ${item.platform}`),
+    unreachable_hosts: devices.filter((item) => !item.reachable).map((item) => item.host),
+    failed_xpaths: devices.flatMap((item) => item.failedXpaths.map((xpath) => `${item.host}: ${xpath}`)),
+    ha_state_unreadable: devices.filter((item) => item.haStateFailed).map((item) => item.host),
+  };
+}
+
+/** CSPM and Compute collection status for assessment summaries; counts from failed surfaces render null. */
+function prismaCollectionSummary(snapshot: PrismaSnapshot): JsonRecord {
+  return {
+    prisma_configured: true,
+    compute_configured: Boolean(snapshot.compute),
+    compute_console: snapshot.compute?.consoleUrl ?? null,
+    cloud_accounts: nullUnless(prismaReadable(snapshot, "cloud accounts"), snapshot.cloudAccounts.length),
+    open_alerts_sampled: nullUnless(prismaReadable(snapshot, "open alerts"), snapshot.alerts.length),
+    open_alerts_truncated: nullUnless(prismaReadable(snapshot, "open alerts"), snapshot.alertsTruncated),
+    open_alerts_truncation_reason: prismaReadable(snapshot, "open alerts") ? snapshot.alertsTruncationReason ?? null : null,
+    unreadable_surfaces: [
+      ...snapshot.failed.map((surface) => `prisma-cloud ${surface}`),
+      ...(snapshot.compute?.failed ?? []).map((surface) => `prisma-compute ${surface}`),
+    ],
+    truncated_surfaces: (snapshot.compute?.truncated ?? []).map((surface) => `prisma-compute ${surface}`),
+    compute_unavailable_reason: snapshot.compute ? null : snapshot.computeUnavailableReason ?? null,
+  };
 }
 
 function assessmentResult(title: string, findings: PaloaltoFinding[], errors: string[], extra: JsonRecord = {}): PaloaltoAssessmentResult {
@@ -2792,14 +3178,7 @@ export async function assessPaloaltoCloudPosture(
   const snapshot = prismaSnapshot ?? await loadPrismaSnapshot(clients, clampNumber(options.alertLimit, DEFAULT_ALERT_LIMIT, 1, 10000));
   if (!snapshot) throw new Error("Prisma Cloud snapshot could not be collected.");
   const findings = [...assessPrismaCloudPosture(snapshot, options), ...assessPrismaCompute(snapshot)];
-  return assessmentResult("Palo Alto cloud posture (Prisma Cloud)", findings, snapshot.errors, {
-    prisma_configured: true,
-    compute_configured: Boolean(snapshot.compute),
-    compute_console: snapshot.compute?.consoleUrl ?? null,
-    cloud_accounts: snapshot.cloudAccounts.length,
-    open_alerts_sampled: snapshot.alerts.length,
-    open_alerts_truncated: snapshot.alertsTruncated,
-  });
+  return assessmentResult("Palo Alto cloud posture (Prisma Cloud)", findings, snapshot.errors, prismaCollectionSummary(snapshot));
 }
 
 export async function assessPaloaltoFirewallPolicy(clients: PaloaltoClients, snapshots?: PanosDeviceSnapshot[]): Promise<PaloaltoAssessmentResult> {
@@ -2812,10 +3191,7 @@ export async function assessPaloaltoFirewallPolicy(clients: PaloaltoClients, sna
     return assessmentResult("Palo Alto firewall policy (PAN-OS)", findings, [], { devices: 0 });
   }
   const devices = snapshots ?? await collectPanosSnapshots(clients);
-  return assessmentResult("Palo Alto firewall policy (PAN-OS)", assessPanosFirewallPolicy(devices), devices.flatMap((item) => item.errors), {
-    devices: devices.length,
-    platforms: devices.map((item) => `${item.host}: ${item.platform}`),
-  });
+  return assessmentResult("Palo Alto firewall policy (PAN-OS)", assessPanosFirewallPolicy(devices), devices.flatMap((item) => item.errors), panosCollectionSummary(devices));
 }
 
 export async function assessPaloaltoThreatPrevention(clients: PaloaltoClients, snapshots?: PanosDeviceSnapshot[], prismaSnapshot?: PrismaSnapshot): Promise<PaloaltoAssessmentResult> {
@@ -2833,7 +3209,11 @@ export async function assessPaloaltoThreatPrevention(clients: PaloaltoClients, s
   const devices = snapshots ?? await collectPanosSnapshots(clients);
   const findings = [...assessPanosThreatPrevention(devices)];
   findings.splice(3, 0, assessDataLossPrevention(prisma, devices));
-  return assessmentResult("Palo Alto threat prevention (PAN-OS)", findings, [...devices.flatMap((item) => item.errors), ...(prisma?.errors ?? [])], { devices: devices.length });
+  return assessmentResult("Palo Alto threat prevention (PAN-OS)", findings, [...devices.flatMap((item) => item.errors), ...(prisma?.errors ?? [])], {
+    ...panosCollectionSummary(devices),
+    prisma_configured: Boolean(prisma),
+    prisma_unreadable_surfaces: prisma ? prisma.failed.map((surface) => `prisma-cloud ${surface}`) : null,
+  });
 }
 
 export async function assessPaloaltoDeviceHardening(
@@ -2858,8 +3238,9 @@ export async function assessPaloaltoDeviceHardening(
     findings.push(...hardening.slice(1));
   }
   return assessmentResult("Palo Alto device hardening and access", findings, [...devices.flatMap((item) => item.errors), ...(prisma?.errors ?? [])], {
-    devices: devices.length,
+    ...panosCollectionSummary(devices),
     prisma_configured: Boolean(prisma),
+    prisma_unreadable_surfaces: prisma ? prisma.failed.map((surface) => `prisma-cloud ${surface}`) : null,
   });
 }
 
@@ -2869,8 +3250,8 @@ function formatAccessCheckText(result: PaloaltoAccessCheckResult): string {
     surface.target.replace(/^https?:\/\//, "").slice(0, 32),
     surface.name,
     surface.status,
-    surface.count === undefined ? "-" : String(surface.count),
-    surface.error ? surface.error.replace(/\s+/g, " ").slice(0, 80) : "",
+    surface.count === undefined ? "-" : `${surface.count}${surface.partial ? "+" : ""}`,
+    surface.error ? redactErrorText(surface.error).replace(/\s+/g, " ").slice(0, 80) : "",
   ]);
   return [
     `Palo Alto access check: ${result.status}`,
@@ -3004,18 +3385,20 @@ function buildQuickReference(result: PaloaltoAccessCheckResult, assessments: Pal
     "",
     "## Layout",
     "",
-    `- \`core_data/\`: raw API snapshots (Prisma Cloud JSON, PAN-OS system info and configuration as JSON with credential-bearing nodes replaced by ${XML_REDACTION_MARKER})`,
-    "- `analysis/findings.json`: normalized findings with framework mappings",
-    "- `analysis/<area>.json`: per-assessment summaries",
+    `- \`core_data/\`: redacted API snapshots (Prisma Cloud and Compute JSON with credential-named properties replaced by ${REDACTION_MARKER}, PAN-OS system info and configuration as JSON with credential-bearing nodes replaced by ${REDACTION_MARKER})`,
+    "- `analysis/findings.json`: normalized findings with framework mappings; evidence derived from a surface that could not be read renders null, never 0 or an empty list",
+    "- `analysis/<area>.json`: per-assessment summaries with the collection status (unreadable surfaces, truncated collections, unreachable hosts, failed subtrees)",
     "- `compliance/executive_summary.md`, `compliance/unified_compliance_matrix.md`, one report per framework",
-    "- `_errors.log`: present only when collection partially failed",
+    "- `_errors.log`: present only when collection partially failed; error strings carry the HTTP status and the vendor's documented error fields only, and non-JSON or non-XML bodies are summarized as a status-and-length note that is never echoed",
     "",
     "## Assessments",
     "",
     ...assessments.map((item) => `- ${item.title}: ${item.summary.pass} pass, ${item.summary.warn} warn, ${item.summary.fail} fail, ${item.summary.manual} manual`),
     "",
     "Credentials, API keys, and JWTs are never written into the bundle.",
-    `PAN-OS configuration nodes that carry password hashes, shared secrets, keys, passphrases, tokens, or SNMP community strings are replaced with ${XML_REDACTION_MARKER} before core_data/ is written.`,
+    `Prisma Cloud integration configurations (auth tokens, API keys, passwords, secure header values, webhook URLs with tokens) and Compute registry credentials and image secrets are replaced with ${REDACTION_MARKER} as they are collected.`,
+    `PAN-OS configuration nodes that carry password hashes, shared secrets, keys, passphrases, tokens, or SNMP community strings are replaced with ${REDACTION_MARKER} before core_data/ is written.`,
+    "Verdicts: a finding whose evidence could not be read is manual, and a finding whose inventory was truncated (page cap, empty page with a cursor, repeated cursor, or a totalRows count larger than what was read) is capped at warn.",
   ].join("\n");
 }
 
@@ -3244,7 +3627,7 @@ export function registerPaloaltoTools(pi: any): void {
     name: "paloalto_export_audit_bundle",
     label: "Export Palo Alto audit bundle",
     description:
-      "Export a Palo Alto Networks audit bundle with raw Prisma Cloud and PAN-OS snapshots (core_data/), normalized findings (analysis/), executive summary, unified compliance matrix and per-framework reports (compliance/), QUICK_REFERENCE.md, an _errors.log when collection partially failed, and a zip archive.",
+      "Export a Palo Alto Networks audit bundle with redacted Prisma Cloud and PAN-OS snapshots (core_data/, credential-bearing values replaced with [REDACTED]), normalized findings (analysis/), executive summary, unified compliance matrix and per-framework reports (compliance/), QUICK_REFERENCE.md, an _errors.log when collection partially failed, and a zip archive.",
     parameters: Type.Object({
       ...authParams,
       output_dir: Type.Optional(Type.String({ description: `Output root. Defaults to ${DEFAULT_OUTPUT_DIR}.` })),

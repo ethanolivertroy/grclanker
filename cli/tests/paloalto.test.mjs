@@ -24,15 +24,23 @@ import {
   collectPrismaSnapshot,
   createInsecureFetch,
   PrismaComputeClient,
+  REDACTION_MARKER,
   checkPaloaltoAccess,
+  collectComputeSnapshot,
   collectPanosSnapshot,
   createPaloaltoClients,
+  describePrismaErrorBody,
   exportPaloaltoAuditBundle,
+  isCredentialPropertyName,
   isCredentialXmlName,
   isPrimaryFinding,
   parseXml,
+  redactCredentialProperties,
+  redactCredentialValueText,
+  redactErrorText,
   redactSecrets,
   redactXmlCredentials,
+  registerPaloaltoTools,
   resolvePaloaltoConfiguration,
   resolveSecureOutputPath,
   xmlFindAll,
@@ -385,7 +393,7 @@ test("resolvePaloaltoConfiguration allows a single product and rejects incomplet
   assert.throws(() => resolvePaloaltoConfiguration({}, {}), /Configure Prisma Cloud/);
   assert.throws(() => resolvePaloaltoConfiguration({}, { PRISMA_ACCESS_KEY_ID: "k" }), /both PRISMA_ACCESS_KEY_ID and PRISMA_SECRET_KEY/);
   assert.throws(() => resolvePaloaltoConfiguration({}, { PANOS_HOST: "fw.example.com" }), /PANOS_API_KEY or both/);
-  assert.throws(() => resolvePaloaltoConfiguration({ config_file: "/nonexistent/paloalto.json" }, {}), /config file not found/);
+  assert.throws(() => resolvePaloaltoConfiguration({ config_file: "/nonexistent/paloalto.json" }, {}), /Unable to read Palo Alto config file \/nonexistent\/paloalto\.json \(ENOENT\)/);
 });
 
 test("PrismaCloudClient logs in with the access key, paginates alerts, retries 429, and re-authenticates on 401", async () => {
@@ -484,7 +492,8 @@ test("parseXml handles attributes, nesting, CDATA, entities, and self-closing ta
   assert.equal(entries[0].attributes.name, "a & b");
   assert.equal(xmlText(xmlPath(entries[0], ["t"])), "<raw>");
   assert.equal(xmlText(entries[1]), "textA");
-  assert.equal(redactSecrets("https://fw/api/?type=op&key=LUFRPT123&cmd=x secret-value", ["secret-value"]), "https://fw/api/?type=op&key=[redacted]&cmd=x [redacted]");
+  assert.equal(redactSecrets("https://fw/api/?type=op&key=LUFRPT123&cmd=x secret-value", ["secret-value"]), "https://fw/api/?type=op&key=[REDACTED]&cmd=x [REDACTED]");
+  assert.equal(REDACTION_MARKER, "[REDACTED]");
 });
 
 test("collectPanosSnapshot detects Panorama and records per-xpath collection errors", async () => {
