@@ -1426,3 +1426,51 @@ test("Veracode tools are registered in the tool catalog under the Veracode group
   ]);
   assert.ok(tools.every((tool) => tool.group === "Veracode" && tool.kind === "domain"));
 });
+
+test("collection status: counters derived from a denied inventory render null in finding evidence (VERACODE-15, 10, 13, 09, 07), never 0 or []", async () => {
+  const denied = async (pattern) => {
+    const { fetchImpl } = recordingVeracodeFetch({ denied: [pattern] });
+    return runVeracodeAssessments(new VeracodeApiClient(sampleConfig({ retries: 0 }), { fetchImpl, sleep: async () => {} }));
+  };
+  const findingIn = (results, id) => results.flatMap((result) => result.findings).find((item) => item.id === id);
+
+  const noApplications = await denied(/^\/appsec\/v1\/applications$/);
+  const policies = findingIn(noApplications, "VERACODE-15");
+  assert.notEqual(policies.status, "pass");
+  assert.equal(policies.evidence.applications_on_custom_policies, null, "policy assignment per application is unknown without the application list");
+  assert.equal(policies.evidence.applications_on_default_policies, null);
+  assert.match(policies.summary, /the assignment per application is unknown\. The application inventory was unreadable/);
+  assert.doesNotMatch(policies.summary, /all 0 applications/);
+  const teams = findingIn(noApplications, "VERACODE-07");
+  assert.notEqual(teams.status, "pass");
+  assert.equal(teams.evidence.applications_without_team, null);
+  assert.equal(typeof teams.evidence.users_seen, "number", "the readable user list keeps its count");
+  assert.match(teams.summary, /The application inventory was unreadable, so application team assignment was not verified/);
+
+  const sandboxes = findingIn(await denied(/^\/appsec\/v1\/applications\/[^/]+\/sandboxes$/), "VERACODE-10");
+  assert.equal(sandboxes.status, "manual");
+  assert.equal(sandboxes.evidence.applications_with_sandboxes, null, "no sandbox list was readable, so the count is unknown");
+  assert.equal(sandboxes.evidence.applications_without_sandboxes, null);
+  assert.equal(sandboxes.evidence.applications_sampled, 2, "the application list itself was read");
+  assert.equal(sandboxes.evidence.unreadable_applications, 2);
+
+  const noConfigurations = findingIn(await denied(/^\/was\/configservice\/v1\/scans\/[^/]+\/configuration$/), "VERACODE-13");
+  assert.equal(noConfigurations.status, "manual");
+  for (const key of ["configured_scans", "unauthenticated_scans", "crawl_disabled_scans"]) {
+    assert.equal(noConfigurations.evidence[key], null, `${key} is unknown when no configuration was readable`);
+  }
+  assert.ok(Array.isArray(noConfigurations.evidence.scan_coverage), "the scan lists themselves were read");
+  const noScans = findingIn(await denied(/^\/was\/configservice\/v1\/analyses\/[^/]+\/scans$/), "VERACODE-13");
+  assert.equal(noScans.status, "manual");
+  for (const key of ["scan_coverage", "configured_scans", "unauthenticated_scans", "crawl_disabled_scans"]) {
+    assert.equal(noScans.evidence[key], null, `${key} is unknown when no scan list was readable`);
+  }
+
+  const credentials = findingIn(await denied(/^\/api\/authn\/v2\/api_credentials\/user_id\/[^/]+$/), "VERACODE-09");
+  assert.equal(credentials.status, "manual");
+  for (const key of ["credentials_current", "credentials_over_max_age", "credentials_over_max_age_count", "credentials_expired", "credentials_missing_dates"]) {
+    assert.equal(credentials.evidence[key], null, `${key} is unknown when no credential record was readable`);
+  }
+  assert.equal(credentials.evidence.credentials_readable, 0, "the number of successful reads is a real observation");
+  assert.equal(credentials.evidence.api_accounts_sampled, 1);
+});
