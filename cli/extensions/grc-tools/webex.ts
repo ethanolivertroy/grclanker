@@ -19,7 +19,7 @@ import { homedir } from "node:os";
 import { basename, dirname, join, relative, resolve } from "node:path";
 import { ZipArchive } from "archiver";
 import { Type } from "@sinclair/typebox";
-import { parse as parseYaml } from "yaml";
+import { YAMLError, parse as parseYaml } from "yaml";
 import { errorResult, formatTable, textResult } from "./shared.js";
 
 type FetchImpl = typeof fetch;
@@ -704,21 +704,69 @@ function describeErrorBody(payload: JsonRecord | undefined, rawText: string, con
   return webexErrorSummary(payload) ?? `JSON error body without a message field (${bytes} bytes)`;
 }
 
+/** The `code` of a Node system error (EACCES, EISDIR, ENOENT): a fixed identifier, never the message. */
+function systemErrorCode(error: unknown): string | undefined {
+  const code = asObject(error)?.code;
+  return typeof code === "string" && /^E[A-Z0-9_]{1,30}$/.test(code) ? code : undefined;
+}
+
+/**
+ * The first line the YAML parser points at, taken only from a structured
+ * YAMLError. An unresolved alias throws a plain ReferenceError whose message
+ * is the alias name itself, so nothing is read from any other thrown value.
+ */
+function yamlErrorLine(error: unknown): number | undefined {
+  return error instanceof YAMLError ? error.linePos?.[0]?.line : undefined;
+}
+
+/**
+ * Reads the config file without interpolating the filesystem message, which
+ * carries the path and OS wording (`EACCES: permission denied, open '...'`).
+ */
+function readConfigText(pathname: string): string {
+  try {
+    return readFileSync(pathname, "utf8");
+  } catch (error) {
+    const code = systemErrorCode(error);
+    throw new Error(scrubErrorText(`Unable to read Webex config file ${pathname}${code ? ` (${code})` : ""}`));
+  }
+}
+
+/**
+ * Parses the config file without interpolating the parser message: the YAML
+ * parser quotes the offending source line (for a malformed `token:` line that
+ * is the credential itself), an unresolved alias names its value, and
+ * JSON.parse quotes a ten-character window of the source. The thrown text is a
+ * fixed description with the path and, for YAML, the line number.
+ */
+function parseConfigText(pathname: string, text: string): unknown {
+  const format = pathname.endsWith(".json") ? "JSON" : "YAML";
+  try {
+    return format === "JSON" ? JSON.parse(text) : parseYaml(text);
+  } catch (error) {
+    const line = format === "YAML" ? yamlErrorLine(error) : undefined;
+    throw new Error(scrubErrorText(`Unable to parse Webex config file: invalid ${format} in ${pathname}${line === undefined ? "" : ` at line ${line}`}`));
+  }
+}
+
 function loadConfigFile(pathname: string): JsonRecord {
-  const raw = readFileSync(pathname, "utf8");
-  const parsed = pathname.endsWith(".json") ? JSON.parse(raw) : parseYaml(raw);
-  const object = asObject(parsed);
-  if (!object) throw new Error(`Webex config file ${pathname} must contain an object.`);
+  const object = asObject(parseConfigText(pathname, readConfigText(pathname)));
+  if (!object) throw new Error(scrubErrorText(`Webex config file ${pathname} must contain an object.`));
   return object;
 }
 
+/**
+ * An explicit path (config_file argument or WEBEX_CONFIG_FILE) that does not
+ * exist is reported rather than silently skipped; only the default locations
+ * are optional.
+ */
 function discoverConfigFile(env: NodeJS.ProcessEnv, homeDir: string, explicitPath?: string): string | undefined {
-  const candidates = explicitPath
-    ? [explicitPath]
-    : asString(env.WEBEX_CONFIG_FILE)
-      ? [asString(env.WEBEX_CONFIG_FILE) as string]
-      : CONFIG_FILE_NAMES.map((name) => join(homeDir, DEFAULT_CONFIG_DIR, name));
-  return candidates.find((candidate) => existsSync(candidate));
+  const requestedPath = explicitPath ?? asString(env.WEBEX_CONFIG_FILE);
+  if (requestedPath) {
+    if (!existsSync(requestedPath)) throw new Error(scrubErrorText(`Webex config file not found: ${requestedPath}`));
+    return requestedPath;
+  }
+  return CONFIG_FILE_NAMES.map((name) => join(homeDir, DEFAULT_CONFIG_DIR, name)).find((candidate) => existsSync(candidate));
 }
 
 /**
