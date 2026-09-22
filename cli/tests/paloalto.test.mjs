@@ -43,6 +43,7 @@ import {
   redactSecrets,
   redactXmlCredentials,
   registerPaloaltoTools,
+  resolveComputeClient,
   resolvePaloaltoConfiguration,
   resolveSecureOutputPath,
   xmlFindAll,
@@ -615,6 +616,7 @@ test("config loader errors carry fixed text, the path, a validated code, and a s
     assert.throws(() => resolvePaloaltoConfiguration({ config_file: entry.file }, {}), (error) => {
       assert.equal(error.message, entry.expected(entry.file), `${entry.label}: resolver message`);
       assertNoLoaderLeak(error.message, entry.canaries, `${entry.label} resolver`);
+      assert.equal(redactErrorText(error.message), error.message, `${entry.label}: the loader text survives the scrub`);
       return true;
     });
     assert.throws(() => resolvePaloaltoConfiguration({}, { PALOALTO_CONFIG_FILE: entry.file }), (error) => {
@@ -1727,6 +1729,82 @@ test("the two-device keygen sweep fixture is healthy before the canary sweep rel
     for (const field of ["summary", "detail", "remediation", "note", "title"]) {
       if (typeof item[field] === "string") assert.equal(redactErrorText(item[field]), item[field], `${item.id} ${field}`);
     }
+  }
+});
+
+// Round 7(a): fixed message text can itself match a credential-pair scrub ("credentials: <path>"
+// reads as a pair), so every fixed text this module emits on the unhealthy paths is driven out
+// of the module and run through the general scrub. The not-collected markers and their
+// collection status, the non-JSON and non-XML notes, the unavailable-Compute reason, the
+// PAN-OS and Prisma Cloud gate texts, the capped and manual summaries, and _errors.log must
+// all be the identity under redactErrorText; and because the writer scrubs before it writes,
+// a fixed text mangled on the way in would surface as a marker, so with nothing planted no
+// file or result may carry one (QUICK_REFERENCE.md describes the marker and is exempt).
+test("round 7(a): every fixed text emitted on refused, failed, and unconfigured paths survives the scrubs unchanged", async () => {
+  const fixtures = [
+    { label: "denied and failed reads", failures: true, clients: createPaloaltoClients({ ...bothProductsConfig(), retryAttempts: 0 }, mockedFetch({ integrationsDenied: true, mgtDenied: true, registryDenied: true, alertsDenied: true })) },
+    { label: "every read refused", failures: true, clients: createPaloaltoClients({ ...bothProductsConfig(), retryAttempts: 0 }, mockedFetch({ denyAll: true })) },
+    { label: "Compute console unreachable", failures: true, clients: createPaloaltoClients({ ...bothProductsConfig(), retryAttempts: 0 }, mockedFetch({ noCompute: true })) },
+    { label: "PAN-OS not configured", failures: false, clients: createPaloaltoClients(resolvePaloaltoConfiguration({}, { PRISMA_ACCESS_KEY_ID: "k", PRISMA_SECRET_KEY: "s", PRISMA_API_URL: "https://api2.prismacloud.io" }), mockedFetch()) },
+    { label: "Prisma Cloud not configured", failures: false, clients: createPaloaltoClients(resolvePaloaltoConfiguration({}, { PANOS_HOST: "fw1.example.com", PANOS_API_KEY: "LUFRPT-key" }), mockedFetch()) },
+  ];
+  const corpus = [];
+  for (const { label, failures, clients } of fixtures) {
+    const access = await checkPaloaltoAccess(clients);
+    const bundle = await exportPaloaltoAuditBundle(clients, createTempBase("grclanker-paloalto-fixed-text-"));
+    const rendered = [["check_access", JSON.stringify(access)], ...readBundleFiles(bundle.outputDir)];
+    for (const assess of [assessPaloaltoCloudPosture, assessPaloaltoFirewallPolicy, assessPaloaltoThreatPrevention, assessPaloaltoDeviceHardening]) {
+      rendered.push([assess.name, JSON.stringify(await assess(clients))]);
+    }
+    assert.equal(rendered.some(([name]) => name === "_errors.log"), failures, `${label}: _errors.log is written exactly when a read failed`);
+    for (const [name, text] of rendered) {
+      assert.equal(redactErrorText(text), text, `${label}: a fixed text in ${name} is changed by the general scrub`);
+      if (name !== "QUICK_REFERENCE.md") assert.equal(text.includes(REDACTION_MARKER), false, `${label}: ${name} carries a marker with nothing planted`);
+      corpus.push(text);
+    }
+  }
+  // The two Compute discovery reasons only resolveComputeClient itself produces: a documented
+  // CSPM /meta_info answer without twistlockUrl (an empty object is the silent-success class
+  // instead), and a PAN-OS-only configuration.
+  const healthy = mockedFetch();
+  const withoutTwistlockUrl = createPaloaltoClients({ ...bothProductsConfig(), retryAttempts: 0 }, async (input, init) => (new URL(input).pathname === "/meta_info" ? jsonResponse({ licenseType: "enterprise" }) : healthy(input, init)));
+  for (const clients of [withoutTwistlockUrl, fixtures[4].clients]) {
+    assert.equal(await resolveComputeClient(clients), undefined);
+    assert.equal(typeof clients.computeUnavailableReason, "string");
+    assert.equal(redactErrorText(clients.computeUnavailableReason), clients.computeUnavailableReason, clients.computeUnavailableReason);
+    corpus.push(clients.computeUnavailableReason);
+  }
+
+  // The loader texts, with the fs code and the structured line they carry, are fixed text too.
+  const base = createTempBase("grclanker-paloalto-fixed-loader-");
+  mkdirSync(join(base, "dir.json"));
+  writeFileSync(join(base, "broken.json"), '{\n  "PANOS_HOST": "fw1.example.com"\n  "PANOS_VERIFY_TLS": "true"\n}\n');
+  for (const file of [join(base, "dir.json"), join(base, "missing.json"), join(base, "broken.json")]) {
+    assert.throws(() => resolvePaloaltoConfiguration({ config_file: file }, {}), (error) => {
+      assert.equal(redactErrorText(error.message), error.message, `${basename(file)}: the loader text survives the scrub`);
+      assert.equal(redactCredentialValueText(error.message), error.message, `${basename(file)}: the loader text survives the data scrub`);
+      corpus.push(error.message);
+      return true;
+    });
+  }
+
+  // Positive controls: the fixtures reach every family of fixed text the rule names.
+  const emitted = corpus.join("\n");
+  for (const family of [
+    /"collected":\s*false/,
+    /"dataset_status":\s*"forbidden"/,
+    /"dataset_status":\s*"unavailable"/,
+    /non-JSON text\/html response body \(\d+ bytes, not echoed\)/,
+    /Compute console discovery via CSPM \/meta_info failed \(.*\); set PRISMA_COMPUTE_URL to the Compute console path\./,
+    /CSPM \/meta_info did not return twistlockUrl; set PRISMA_COMPUTE_URL to the Compute console path/,
+    /Prisma Cloud credentials were not configured, so the Compute console could not be reached\./,
+    /Manual evidence required:/,
+    /PAN-OS not configured/,
+    /Prisma Cloud not configured/,
+    /Unable to read Palo Alto config file .* \((EISDIR|ENOENT)\)/,
+    /Unable to parse Palo Alto config file: invalid JSON in .* at line \d+ \(INVALID_JSON\)/,
+  ]) {
+    assert.match(emitted, family, `the fixtures emit the ${family} family`);
   }
 });
 

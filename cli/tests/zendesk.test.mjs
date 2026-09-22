@@ -674,6 +674,7 @@ test("config loader errors carry fixed text, the path, a validated code, and a s
     assert.throws(() => resolveZendeskConfiguration({ config_file: entry.file }, {}, base), (error) => {
       assert.equal(error.message, entry.expected(entry.file), `${entry.label}: resolver message`);
       assertNoLoaderLeak(error.message, entry.canaries, `${entry.label} resolver`);
+      assert.equal(redactErrorText(error.message), error.message, `${entry.label}: the loader text survives the scrub`);
       return true;
     });
     assert.throws(() => resolveZendeskConfiguration({}, { ZENDESK_CONFIG_FILE: entry.file }, base), (error) => {
@@ -1171,7 +1172,7 @@ test("assessZendeskAuthentication renders manual for unreadable settings and use
   const unreadable = await assessZendeskAuthentication(forbiddenClient(), { now: () => NOW });
   assert.ok(unreadable.findings.every((item) => item.status === "manual"));
   assert.match(findingById(unreadable, "ZD-02").summary, /403 \(credential lacks permission\)/);
-  assert.ok(unreadable.errors.some((entry) => entry.startsWith("team_members:")));
+  assert.ok(unreadable.errors.some((entry) => entry.startsWith("team_members dataset:")));
 
   const empty = await assessZendeskAuthentication(emptyClient(), { now: () => NOW });
   assert.equal(findingById(empty, "ZD-02").status, "manual");
@@ -1638,7 +1639,7 @@ test("self-check (c) variant: an unknown credential role caps verdicts at warn",
   for (const [id, status] of statuses) {
     assert.notEqual(status, "pass", `${id} must not pass when the credential role is unknown`);
   }
-  assert.ok(results.every((result) => result.errors.some((entry) => entry.startsWith("current_user:"))));
+  assert.ok(results.every((result) => result.errors.some((entry) => entry.startsWith("current_user dataset:"))));
 });
 
 test("every finding carries the framework mappings from the spec table", async () => {
@@ -2013,8 +2014,8 @@ test("exportZendeskAuditBundle records partial collection failures in _errors.lo
   const result = await exportZendeskAuditBundle(client, config, base, { now: () => NOW });
   assert.ok(result.errorCount >= 2);
   const errorLog = readFileSync(join(result.outputDir, "_errors.log"), "utf8");
-  assert.match(errorLog, /oauth_clients: .*403/);
-  assert.match(errorLog, /audit_logs_recent: .*403/);
+  assert.match(errorLog, /oauth_clients dataset: .*403/);
+  assert.match(errorLog, /audit_logs_recent dataset: .*403/);
   const forbiddenFile = JSON.parse(readFileSync(join(result.outputDir, "core_data/oauth_clients.json"), "utf8"));
   assert.equal(forbiddenFile.collected, false, "a forbidden snapshot is written as a not-collected marker, never as data or an empty list");
   assert.equal(forbiddenFile.status, 403);
@@ -2329,6 +2330,88 @@ test("the healthy bundle is fixed text the scrubs leave untouched, so every mark
   for (const [label, text] of [["access check", JSON.stringify(access)], ["assessments", JSON.stringify(results)]]) {
     assert.equal(redactErrorText(text), text, `${label} is fixed text`);
     assert.ok(!text.includes("[REDACTED]"), `${label} carries no marker on a healthy tenant`);
+  }
+});
+
+// Round 7(a): fixed message text can itself match a credential-pair scrub ("credentials: <path>"
+// reads as a pair), so every fixed text this module emits on the unhealthy paths is driven out
+// of the module over HTTP and run through the general scrub: the not-collected markers and
+// their collection status, the refusal, plan, and could-not-be-read causes, the non-JSON and
+// silent-success notes, the manual and capped summaries, and _errors.log must all be the
+// identity under redactErrorText. Because the writer scrubs before it writes, a fixed text
+// mangled on the way in would surface as a marker, so with nothing planted no file or result
+// may carry one (QUICK_REFERENCE.md describes the marker and is exempt).
+test("round 7(a): every fixed text emitted on refused, unavailable, failed, and silent-success paths survives the scrubs unchanged", async () => {
+  const routes = await healthyHttpRoutes();
+  const everyRouteBut = (makeResponse) => new ZendeskApiClient(sampleConfig(), {
+    fetchImpl: async (url) => (zendeskRouteKey(url) === "/users/me" ? jsonResponse(routes["/users/me"]) : makeResponse()),
+    sleep: async () => {},
+  });
+  const fixtures = [
+    ["every list refused", everyRouteBut(forbiddenJsonResponse)],
+    ["every list unavailable on the plan", everyRouteBut(() => jsonResponse({ error: "RecordNotFound", description: "Not found" }, { status: 404, statusText: "Not Found" }))],
+    ["every list behind a proxy page", everyRouteBut(() => new Response("<html><body>502 Bad Gateway</body></html>", { status: 502, statusText: "Bad Gateway", headers: { "content-type": "text/html" } }))],
+    ["every list an empty success", everyRouteBut(() => new Response("", { status: 200, statusText: "OK", headers: { "content-type": "application/json" } }))],
+  ];
+  const corpus = [];
+  for (const [label, client] of fixtures) {
+    const access = await checkZendeskAccess(client);
+    const bundle = await exportZendeskAuditBundle(client, sampleConfig(), createTempBase("grclanker-zendesk-fixed-text-"), { now: () => NOW });
+    const rendered = [["check_access", JSON.stringify(access)], ["assessments", JSON.stringify(await runAllAssessments(client))], ...readBundleFiles(bundle.outputDir)];
+    assert.ok(rendered.some(([name]) => name === "_errors.log"), `${label}: the failures are logged`);
+    for (const [name, text] of rendered) {
+      assert.equal(redactErrorText(text), text, `${label}: a fixed text in ${name} is changed by the general scrub`);
+      if (name !== "QUICK_REFERENCE.md") assert.ok(!text.includes("[REDACTED]"), `${label}: ${name} carries a marker with nothing planted`);
+      corpus.push(text);
+    }
+  }
+
+  // One surface refused at a time: the capped-at-warn and secondary-inventory wordings.
+  for (const surface of Object.keys(routes)) {
+    if (surface === "/users/me") continue;
+    const client = httpClient(routes, surface, forbiddenJsonResponse);
+    for (const [name, text] of [["check_access", JSON.stringify(await checkZendeskAccess(client))], ["assessments", JSON.stringify(await runAllAssessments(client))]]) {
+      assert.equal(redactErrorText(text), text, `${surface} refused: a fixed text in ${name} is changed by the general scrub`);
+      assert.ok(!text.includes("[REDACTED]"), `${surface} refused: ${name} carries a marker with nothing planted`);
+      corpus.push(text);
+    }
+  }
+
+  // The loader texts, with the fs code and the structured line they carry, are fixed text too.
+  const base = createTempBase("grclanker-zendesk-fixed-loader-");
+  mkdirSync(join(base, "dir.json"));
+  writeFileSync(join(base, "broken.json"), '{\n  "subdomain": "acme"\n  "email": "auditor@example.com"\n}\n');
+  for (const file of [join(base, "dir.json"), join(base, "missing.json"), join(base, "broken.json")]) {
+    assert.throws(() => resolveZendeskConfiguration({ config_file: file }, {}, base), (error) => {
+      assert.equal(redactErrorText(error.message), error.message, `${file}: the loader text survives the scrub`);
+      assert.equal(redactCredentialValueText(error.message), error.message, `${file}: the loader text survives the data scrub`);
+      corpus.push(error.message);
+      return true;
+    });
+  }
+
+  // Positive controls: the fixtures reach every family of fixed text the rule names.
+  const emitted = corpus.join("\n");
+  for (const family of [
+    /"collected":\s*false/,
+    /"dataset_status":\s*"forbidden"/,
+    /"dataset_status":\s*"not_found"/,
+    /"dataset_status":\s*"error"/,
+    // The error line of a dataset named for what it holds keeps its whole message.
+    /"oauth_tokens dataset: Zendesk request failed for https:\/\/acme\.zendesk\.com\/api\/v2\/oauth\/tokens\?all=true\S* \(403 Forbidden; Forbidden; You do not have access to this page/,
+    /"oauth_tokens dataset: Zendesk request GET \/api\/v2\/oauth\/tokens returned 200 OK with an empty response body/,
+    /returned 403 \(credential lacks permission\)\./,
+    /returned 404 \(endpoint unavailable on this account or plan\)\./,
+    /Unavailable on this account or plan: /,
+    / could not be read: /,
+    / Manual evidence: /,
+    /Verdict capped at warn because a secondary inventory could not be read: /,
+    /502 Bad Gateway; non-JSON text\/html response body \(\d+ bytes, not echoed\)/,
+    /200 OK with an empty response body where the documented JSON document was expected/,
+    /Unable to read Zendesk config file .* \((EISDIR|ENOENT)\)/,
+    /Unable to parse Zendesk config file: invalid JSON in .* at line \d+ \(INVALID_JSON\)/,
+  ]) {
+    assert.match(emitted, family, `the fixtures emit the ${family} family`);
   }
 });
 
@@ -2694,7 +2777,7 @@ test("ZendeskApiError, transport errors, and the tool catch blocks scrub message
   });
   const transportResult = await assessZendeskAuthentication(transport, { now: () => NOW });
   assertNoCanary(JSON.stringify(transportResult), "transport error in assessment");
-  assert.ok(transportResult.errors.some((entry) => entry.startsWith("current_user: ") && entry.includes("[REDACTED]@proxy.example.com")));
+  assert.ok(transportResult.errors.some((entry) => entry.startsWith("current_user dataset: ") && entry.includes("[REDACTED]@proxy.example.com")));
 
   const tools = new Map();
   registerZendeskTools({ registerTool: (tool) => tools.set(tool.name, tool) });

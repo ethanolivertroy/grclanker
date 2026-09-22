@@ -467,6 +467,7 @@ test("config loader errors carry fixed text, the path, a validated code, and a s
     assert.throws(() => resolveTenableConfiguration({ config_file: entry.file, url: "https://cloud.tenable.com" }, EMPTY_ENV), (error) => {
       assert.equal(error.message, entry.expected(entry.file), `${entry.label}: resolver message`);
       assertNoLoaderLeak(error.message, entry.canaries, `${entry.label} resolver`);
+      assert.equal(redactErrorText(error.message), error.message, `${entry.label}: the loader text survives the scrub`);
       return true;
     });
     const toolText = await checkAccessText(entry.file);
@@ -665,7 +666,7 @@ test("checkTenableAccess reports limited access and names the missing role when 
   assert.equal(result.callerIsAdministrator, false);
   const auditLog = result.surfaces.find((surface) => surface.name === "audit_log");
   assert.equal(auditLog.status, "forbidden");
-  assert.ok(result.notes.some((note) => note.includes("audit_log needs the Administrator role")));
+  assert.ok(result.notes.some((note) => note.includes("audit_log requires role Administrator;")));
   assert.ok(result.recommendedNextStep.includes("Administrator"));
 });
 
@@ -1274,6 +1275,91 @@ test("the healthy bundle is fixed text the scrubs leave untouched, so every mark
   for (const [label, text] of [["access check", JSON.stringify(access)], ["assessments", JSON.stringify(results)]]) {
     assert.equal(redactErrorText(text), text, `${label} is fixed text`);
     assert.ok(!text.includes("[REDACTED]"), `${label} carries no marker on a healthy tenant`);
+  }
+});
+
+// Round 7(a): fixed message text can itself match a credential-pair scrub ("credentials: <path>"
+// reads as a pair), so every fixed text this module emits on the unhealthy paths is driven out
+// of the module over HTTP and run through the general scrub: the not-collected markers and
+// their collection status, the could-not-be-read causes, the non-JSON and silent-success
+// notes, the partial-view line, the Security Center not-configured texts, the manual and
+// capped summaries, and _errors.log must all be the identity under redactErrorText. Because
+// the writer scrubs before it writes, a fixed text mangled on the way in would surface as a
+// marker, so with nothing planted no file or result may carry one (QUICK_REFERENCE.md
+// describes the marker and is exempt).
+test("round 7(a): every fixed text emitted on refused, unavailable, failed, capped, and silent-success paths survives the scrubs unchanged", async () => {
+  const routes = healthyRoutes();
+  const everyRoute = (makeResponse) => createTenableClients(vmConfig(), { fetchImpl: async () => makeResponse(), sleepImpl: async () => {}, exportPollMs: 0, exportTimeoutMs: 5_000 });
+  const fallback = routerFetch(routes);
+  const cappedNetworks = fullPageFetch("networks", 50);
+  const fixtures = [
+    ["every read refused", clientsFor(routes, { status: 403 })],
+    ["every read unavailable", clientsFor(routes, { status: 404 })],
+    ["every read behind a proxy page", everyRoute(() => new Response("<html><body>502 Bad Gateway</body></html>", { status: 502, statusText: "Bad Gateway", headers: { "content-type": "text/html" } }))],
+    ["every read an empty success", everyRoute(() => new Response("", { status: 200, statusText: "OK", headers: { "content-type": "application/json" } }))],
+    ["a page-capped walk", createTenableClients(vmConfig(), {
+      fetchImpl: async (url, init) => (new URL(url).pathname === "/networks" ? cappedNetworks(url) : fallback(url, init)),
+      sleepImpl: async () => {},
+      exportPollMs: 0,
+      exportTimeoutMs: 5_000,
+    })],
+  ];
+  const corpus = [];
+  for (const [label, clients] of fixtures) {
+    const access = await checkTenableAccess(clients);
+    const bundle = await exportTenableAuditBundle(clients, mkdtempSync(join(tmpdir(), "tenable-fixed-text-unhealthy-")), { now: NOW });
+    const rendered = [["check_access", JSON.stringify(access)], ["assessments", JSON.stringify(await runAll(clients, { expectedAssetCount: 2 }))], ...readBundleFiles(bundle.outputDir)];
+    assert.ok(rendered.some(([name]) => name === "_errors.log"), `${label}: the failures are logged`);
+    for (const [name, text] of rendered) {
+      if (name.startsWith("core_data/") && name.endsWith(".json")) {
+        const payload = JSON.parse(text);
+        assert.deepEqual(redactCredentialProperties(payload), payload, `${label}: a fixed text in ${name} is changed by the data scrub`);
+      } else {
+        assert.equal(redactErrorText(text), text, `${label}: a fixed text in ${name} is changed by the general scrub`);
+      }
+      if (name !== "QUICK_REFERENCE.md") assert.ok(!text.includes("[REDACTED]"), `${label}: ${name} carries a marker with nothing planted`);
+      corpus.push(text);
+    }
+  }
+
+  // The loader texts, with the fs code and the structured line they carry, are fixed text too.
+  const base = mkdtempSync(join(tmpdir(), "tenable-fixed-loader-"));
+  mkdirSync(join(base, "dir.yaml"));
+  writeFileSync(join(base, "broken.yaml"), "url: https://cloud.tenable.com\nkey: value: nested\n");
+  for (const file of [join(base, "dir.yaml"), join(base, "missing.yaml"), join(base, "broken.yaml")]) {
+    assert.throws(() => resolveTenableConfiguration({ config_file: file, url: "https://cloud.tenable.com" }, EMPTY_ENV), (error) => {
+      assert.equal(redactErrorText(error.message), error.message, `${file}: the loader text survives the scrub`);
+      assert.equal(redactCredentialValueText(error.message), error.message, `${file}: the loader text survives the data scrub`);
+      corpus.push(error.message);
+      return true;
+    });
+  }
+
+  // Positive controls: the fixtures reach every family of fixed text the rule names.
+  const emitted = corpus.join("\n");
+  for (const family of [
+    /"collected":\s*false/,
+    /"dataset_status":\s*"forbidden"/,
+    /"dataset_status":\s*"error"/,
+    /"dataset_status":\s*"not_configured"/,
+    /Tenable request GET \/users failed \(HTTP 404; forbidden\)/,
+    // The error line of a dataset named for what it holds keeps its whole message.
+    /"credentials dataset: Tenable request GET \/credentials failed \(HTTP 403; forbidden\)"/,
+    /"credentials dataset: Tenable request GET \/credentials failed \(HTTP 502 Bad Gateway; non-JSON text\/html response body \(\d+ bytes, not echoed\)\)"/,
+    /"networks dataset: partial view \(10000 of unknown records retrieved; the walk stopped at the 200-page cap\)\."/,
+    // The role note names the Basic role, which is also a scheme word, and keeps its whole text.
+    /"server_properties requires role Basic; GET \/server\/properties refused the API key with HTTP 403: Tenable request GET \/server\/properties failed \(HTTP 403; forbidden\)"/,
+    /"roles requires role Administrator; GET \/access-control\/v1\/roles refused the API key with HTTP 403/,
+    /"credentials requires role Basic with Can Use on credentials; GET \/credentials refused the API key with HTTP 403/,
+    / could not be read because /,
+    /A human must collect/,
+    /TENABLE_SC_URL/,
+    /so the verdict is capped at warn/,
+    /200 OK with an empty response body where the documented JSON document was expected/,
+    /Unable to read Tenable config file .* \((EISDIR|ENOENT)\)/,
+    /Unable to parse Tenable config file: invalid YAML in .* at line \d+/,
+  ]) {
+    assert.match(emitted, family, `the fixtures emit the ${family} family`);
   }
 });
 

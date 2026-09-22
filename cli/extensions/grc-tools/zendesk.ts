@@ -1501,10 +1501,13 @@ function snapshotsForBundle(entries: Array<[string, ZendeskSnapshot<unknown>]>):
   return Object.fromEntries(entries.map(([name, snap]) => [name, collectedOrMarker(snap)]));
 }
 
+// The line reads "<name> dataset: <error>", never "<name>: <error>": a dataset named for
+// what it holds (oauth_tokens) followed by a colon is a credential pair to the scrub, and
+// the whole message after it would be replaced.
 function snapshotErrors(entries: Array<[string, ZendeskSnapshot<unknown>]>): string[] {
   return entries
     .filter(([, snap]) => snap.status !== "ok")
-    .map(([name, snap]) => `${name}: ${snap.error ?? snap.status}`);
+    .map(([name, snap]) => `${name} dataset: ${snap.error ?? snap.status}`);
 }
 
 function finding(

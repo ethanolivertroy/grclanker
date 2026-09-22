@@ -1860,13 +1860,16 @@ async function collectExport(endpoint: string, load: () => Promise<TenableExport
  * view of a truncated one, or the per-item failures of a readable one (for
  * example policy details that were refused for some policies).
  */
+// The line reads "<label> dataset: <error>", never "<label>: <error>": a dataset named for
+// what it holds (credentials) followed by a colon is a credential pair to the scrub, and
+// the whole message after it would be replaced.
 function datasetErrors(label: string, dataset: TenableDataset<unknown>): string[] {
   if (dataset.status === "not_configured") return [];
-  if (dataset.status !== "ok") return dataset.error ? [`${label}: ${dataset.error}`] : [];
+  if (dataset.status !== "ok") return dataset.error ? [`${label} dataset: ${dataset.error}`] : [];
   if (dataset.truncated) {
-    return [`${label}: partial view (${dataset.seen ?? "unknown"} of ${dataset.total ?? "unknown"} records retrieved${dataset.error ? `; ${dataset.error}` : ""}).`];
+    return [`${label} dataset: partial view (${dataset.seen ?? "unknown"} of ${dataset.total ?? "unknown"} records retrieved${dataset.error ? `; ${dataset.error}` : ""}).`];
   }
-  return dataset.error ? [`${label}: ${dataset.error}`] : [];
+  return dataset.error ? [`${label} dataset: ${dataset.error}`] : [];
 }
 
 /** Records in a readable list dataset; null when the list was not collected. */
@@ -3713,7 +3716,10 @@ export async function checkTenableAccess(clients: TenableClients): Promise<Tenab
       `Platform: ${platform}.`,
       `${readable.length}/${configured.length} configured audit surfaces are readable; ${forbidden.length} refused the API key${observedRefusals.length > 0 ? ` (HTTP ${observedRefusals.join(", ")})` : ""} and ${failed.length} failed for other reasons.`,
       roleNote,
-      ...forbidden.map((surface) => `${surface.name} needs the ${surface.requiredRole} role: ${describeSurfaceFailure(surface)}`),
+      // "requires role Basic ...;" never "needs the Basic role:" nor "role ...credentials:": Basic is
+      // a Tenable role name and an authentication scheme, so the scrub reads the plain word after
+      // it as its value, and a role phrase ending in a credential word before a colon is a pair.
+      ...forbidden.map((surface) => `${surface.name} requires role ${surface.requiredRole}; ${describeSurfaceFailure(surface)}`),
       ...failed.map((surface) => `${surface.name} could not be read: ${describeSurfaceFailure(surface)}`),
     ],
     recommendedNextStep: status === "healthy"
