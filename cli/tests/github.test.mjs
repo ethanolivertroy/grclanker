@@ -1,7 +1,8 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import {
+import fs, {
   existsSync,
+  mkdirSync,
   mkdtempSync,
   readdirSync,
   readFileSync,
@@ -10,7 +11,8 @@ import {
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { generateKeyPairSync } from "node:crypto";
+import { createPrivateKey, generateKeyPairSync, sign } from "node:crypto";
+import { syncBuiltinESMExports } from "node:module";
 import { dirname, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { inflateRawSync } from "node:zlib";
@@ -32,6 +34,7 @@ import {
   collectGitHubRepoProtectionData,
   exportGitHubAuditBundle,
   redactSensitiveKeys,
+  registerGitHubTools,
   resolveGitHubConfiguration,
   resolveSecureOutputPath,
   runGitHubAccessCheck,
@@ -489,6 +492,241 @@ test("resolveGitHubConfiguration loads GitHub App private key from a file path",
   assert.equal(resolved.appId, "123");
   assert.equal(resolved.installationId, "456");
   assert.match(resolved.appPrivateKey, /BEGIN PRIVATE KEY/);
+});
+
+const PRIVATE_KEY_READ_FAILURE = /^Unable to read GitHub App private key file .* \((EISDIR|ENOENT)\)$/;
+/** Wording the Node fs messages carry (`EISDIR: illegal operation on a directory, read`, `ENOENT: no such file or directory, open '<path>'`). */
+const FS_MESSAGE_WORDING = ["illegal operation", "no such file or directory", ", read", ", open", "open '"];
+const INVALID_PRIVATE_KEY_TEXT = "GitHub App private key is not a valid PEM private key";
+const UNSIGNABLE_PRIVATE_KEY_TEXT = "GitHub App private key could not produce an RS256 signature (an RSA private key is required)";
+
+/** Captures the registered GitHub tools so a test can call a handler the way the agent runtime does. */
+function captureGitHubTools() {
+  const tools = new Map();
+  registerGitHubTools({ registerTool(tool) { tools.set(tool.name, tool); } });
+  return tools;
+}
+
+function appArgs(privateKeyPath, overrides = {}) {
+  return { organization: "example-org", auth_mode: "app", app_id: "123", installation_id: "456", app_private_key_path: privateKeyPath, ...overrides };
+}
+
+function appEnv(privateKeyPath) {
+  return { GITHUB_ORG: "example-org", GITHUB_APP_ID: "123", GITHUB_APP_INSTALLATION_ID: "456", GITHUB_APP_PRIVATE_KEY_PATH: privateKeyPath };
+}
+
+async function rejection(promise) {
+  try {
+    await promise;
+  } catch (error) {
+    return error;
+  }
+  assert.fail("expected a rejection");
+}
+
+function assertCarriesNone(text, forbidden, context) {
+  for (const needle of forbidden) {
+    assert.ok(!text.includes(needle), `${context} must not carry ${JSON.stringify(needle)}: ${text}`);
+  }
+}
+
+test("resolveGitHubConfiguration reports a private key read failure by system error code, never the fs message", async () => {
+  const base = createTempBase("grclanker-github-key-read-");
+  const directoryPath = join(base, "key-as-directory.pem");
+  mkdirSync(directoryPath);
+  const missingPath = join(base, "missing-LEAKPATHCANARY.pem");
+
+  // Positive control: the raw fs messages carry library wording, and ENOENT quotes the path inline.
+  const directoryControl = (() => {
+    try {
+      readFileSync(directoryPath, "utf8");
+      return "";
+    } catch (error) {
+      return error.message;
+    }
+  })();
+  assert.match(directoryControl, /^EISDIR: illegal operation on a directory, read/);
+  const missingControl = (() => {
+    try {
+      readFileSync(missingPath, "utf8");
+      return "";
+    } catch (error) {
+      return error.message;
+    }
+  })();
+  assert.match(missingControl, /^ENOENT: no such file or directory, open '.*missing-LEAKPATHCANARY\.pem'$/);
+
+  for (const [pathname, code] of [[directoryPath, "EISDIR"], [missingPath, "ENOENT"]]) {
+    for (const [route, run] of [
+      ["environment", () => resolveGitHubConfiguration({}, appEnv(pathname))],
+      ["arguments", () => resolveGitHubConfiguration(appArgs(pathname), {})],
+    ]) {
+      const thrown = await rejection(run());
+      assert.ok(thrown instanceof Error, `${route} route throws an Error for ${code}`);
+      assert.match(thrown.message, PRIVATE_KEY_READ_FAILURE, `${route} route, ${code}`);
+      assert.ok(thrown.message.endsWith(` (${code})`), `${route} route names the ${code} code: ${thrown.message}`);
+      assert.ok(thrown.message.includes(resolve(pathname)), `${route} route names the configured path: ${thrown.message}`);
+      assertCarriesNone(thrown.message, FS_MESSAGE_WORDING, `${route} route, ${code}`);
+    }
+  }
+
+  // The same text reaches the tool result through summarizeError, with nothing else appended.
+  const checkAccess = captureGitHubTools().get("github_check_access");
+  const result = await checkAccess.execute("call-1", appArgs(directoryPath));
+  assert.equal(result.isError, true);
+  assert.match(result.content[0].text, /^GitHub access check failed: Unable to read GitHub App private key file .*key-as-directory\.pem \(EISDIR\)$/);
+  assertCarriesNone(JSON.stringify(result), FS_MESSAGE_WORDING, "github_check_access result");
+});
+
+test("a non-standard private key read error contributes nothing but a validated code to the github_check_access result", async () => {
+  const base = createTempBase("grclanker-github-key-stub-");
+  const keyPath = join(base, "github-app.pem");
+  writeFileSync(keyPath, "-----BEGIN PRIVATE KEY-----\nabc\n-----END PRIVATE KEY-----\n");
+  const nonStandardFields = ["NONSTD-MSG-CANARY", "NONSTD-FIELD-CANARY", "NONSTD-TOSTRING-CANARY", "not a code", "EIO: i/o error"];
+  const nonStandard = {
+    code: "not a code",
+    message: "NONSTD-MSG-CANARY",
+    field: "NONSTD-FIELD-CANARY",
+    toString() {
+      return "NONSTD-TOSTRING-CANARY";
+    },
+  };
+  class ReadFailure extends Error {
+    constructor() {
+      super("EIO: i/o error, read '/dev/LEAKPATHCANARY' NONSTD-MSG-CANARY");
+      this.code = "EIO";
+      this.field = "NONSTD-FIELD-CANARY";
+    }
+  }
+  const overlongCode = { code: `E${"X".repeat(40)}`, message: "NONSTD-MSG-CANARY" };
+
+  const checkAccess = captureGitHubTools().get("github_check_access");
+  const originalRead = fs.readFileSync;
+  const stubRead = (thrown) => {
+    fs.readFileSync = () => {
+      throw thrown;
+    };
+    syncBuiltinESMExports();
+  };
+  try {
+    stubRead(nonStandard);
+    // Positive control: `String(error)` on the thrown object, the branch summarizeError takes for a non-Error, is its toString().
+    const control = (() => {
+      try {
+        readFileSync(keyPath, "utf8");
+        return "";
+      } catch (error) {
+        return String(error);
+      }
+    })();
+    assert.equal(control, "NONSTD-TOSTRING-CANARY");
+
+    for (const [route, run] of [
+      ["environment", () => resolveGitHubConfiguration({}, appEnv(keyPath))],
+      ["arguments", () => resolveGitHubConfiguration(appArgs(keyPath), {})],
+    ]) {
+      const thrown = await rejection(run());
+      assert.equal(thrown.message, `Unable to read GitHub App private key file ${keyPath}`, `${route} route: an invalid code is dropped`);
+    }
+    const result = await checkAccess.execute("call-2", appArgs(keyPath));
+    assert.equal(result.isError, true);
+    assert.equal(result.content[0].text, `GitHub access check failed: Unable to read GitHub App private key file ${keyPath}`);
+    assertCarriesNone(JSON.stringify(result), nonStandardFields, "github_check_access result (non-standard object)");
+
+    stubRead(new ReadFailure());
+    const subclassResult = await checkAccess.execute("call-3", appArgs(keyPath));
+    assert.equal(subclassResult.content[0].text, `GitHub access check failed: Unable to read GitHub App private key file ${keyPath} (EIO)`);
+    assertCarriesNone(JSON.stringify(subclassResult), [...nonStandardFields, "LEAKPATHCANARY"], "github_check_access result (Error subclass)");
+
+    stubRead(overlongCode);
+    const overlongResult = await checkAccess.execute("call-4", appArgs(keyPath));
+    assert.equal(overlongResult.content[0].text, `GitHub access check failed: Unable to read GitHub App private key file ${keyPath}`);
+  } finally {
+    fs.readFileSync = originalRead;
+    syncBuiltinESMExports();
+  }
+  assert.equal(readFileSync, originalRead, "the fs binding is restored for the rest of the file");
+});
+
+test("a malformed GitHub App private key renders fixed text in every probe detail, never the OpenSSL message or the key body", async () => {
+  clearGitHubTokenCacheForTests();
+  const base = createTempBase("grclanker-github-key-malformed-");
+  const keyBodyCanary = "LEAKKEYBODYCANARY0123456789abcdef";
+  const bearerCanary = "LEAKBEARERCANARY9876543210fedcba";
+  const malformedPem = `-----BEGIN RSA PRIVATE KEY-----\n${keyBodyCanary}: Bearer ${bearerCanary}\n-----END RSA PRIVATE KEY-----\n`;
+  const keyPath = join(base, "github-app.pem");
+  writeFileSync(keyPath, malformedPem);
+  const forbidden = [keyBodyCanary, bearerCanary, "LEAKKEYBODY", "LEAKBEARER", "DECODER", "routines", "error:", "unsupported", "ERR_OSSL"];
+
+  // Positive control: the OpenSSL message is library wording (it does not quote the key body), and it is what every
+  // probe detail carried before the fix.
+  const control = (() => {
+    try {
+      createPrivateKey(malformedPem);
+      return "";
+    } catch (error) {
+      return `${error.message} [${error.code}]`;
+    }
+  })();
+  assert.match(control, /DECODER routines|PEM routines/);
+  assert.match(control, /ERR_OSSL/);
+
+  let fetchCalls = 0;
+  const neverFetch = async () => {
+    fetchCalls += 1;
+    throw new Error("network must not be reached with an unusable key");
+  };
+
+  const config = await resolveGitHubConfiguration(appArgs(keyPath), {});
+  assert.equal(config.appPrivateKey, malformedPem, "the loader stores the key verbatim; the parse runs at the first request");
+  const direct = await runGitHubAccessCheck(new GitHubAuditorClient(config, neverFetch), config);
+  assert.equal(direct.status, "limited");
+  assert.equal(direct.probes.length, 8);
+  for (const probe of direct.probes) {
+    assert.equal(probe.status, "error", probe.key);
+    assert.equal(probe.detail, INVALID_PRIVATE_KEY_TEXT, probe.key);
+  }
+
+  const checkAccess = captureGitHubTools().get("github_check_access");
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = neverFetch;
+  let result;
+  try {
+    result = await checkAccess.execute("call-5", appArgs(keyPath));
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+  assert.equal(fetchCalls, 0, "the JWT is built before any request, so nothing reaches the network");
+  assert.equal(result.isError, undefined);
+  assert.equal(result.details.status, "limited");
+  assert.equal(result.details.probes.length, 8);
+  for (const probe of result.details.probes) {
+    assert.equal(probe.detail, INVALID_PRIVATE_KEY_TEXT, probe.key);
+  }
+  const rendered = `${result.content[0].text}\n${JSON.stringify(result.details)}`;
+  assert.equal(rendered.split(INVALID_PRIVATE_KEY_TEXT).length - 1, 16, "each of the eight probes carries the fixed text once in the table and once in the details");
+  assertCarriesNone(rendered, forbidden, "github_check_access rendering");
+
+  // A key that parses but cannot sign RS256 (Ed25519 here) is the same leak shape on the signing step.
+  const ed25519Pem = generateKeyPairSync("ed25519").privateKey.export({ type: "pkcs8", format: "pem" }).toString();
+  const signingControl = (() => {
+    try {
+      sign("RSA-SHA256", Buffer.from("signing input"), createPrivateKey(ed25519Pem));
+      return "";
+    } catch (error) {
+      return error.message;
+    }
+  })();
+  assert.match(signingControl, /routines/);
+  const ed25519Config = await resolveGitHubConfiguration(appArgs(keyPath, { app_private_key: ed25519Pem, app_private_key_path: undefined }), {});
+  const unsignable = await runGitHubAccessCheck(new GitHubAuditorClient(ed25519Config, neverFetch), ed25519Config);
+  assert.equal(fetchCalls, 0);
+  for (const probe of unsignable.probes) {
+    assert.equal(probe.status, "error", probe.key);
+    assert.equal(probe.detail, UNSIGNABLE_PRIVATE_KEY_TEXT, probe.key);
+  }
+  assertCarriesNone(JSON.stringify(unsignable), ["routines", "error:", "invalid digest", "ERR_OSSL"], "unsignable key probes");
+  clearGitHubTokenCacheForTests();
 });
 
 test("GitHubAuditorClient handles installation token refresh, rate limits, and pagination", async () => {
