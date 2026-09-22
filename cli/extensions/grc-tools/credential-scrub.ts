@@ -203,6 +203,11 @@ const COOKIE_HEADER_PATTERN = new RegExp(String.raw`${NAME_START}(set-cookie|coo
 const COOKIE_PAIR_NAME_PATTERN = /[^\s;,"'<>=\\]+/y;
 const COOKIE_BARE_VALUE_PATTERN = /[^\s;,"'<>\\]*/y;
 const COOKIE_ATTRIBUTE_PATTERN = /;[ \t]*[A-Za-z0-9_-]+/y;
+// On one `;`- or `,`-separated line, the next header's `Name:` token ends the value before it: a cookie attribute is
+// `Name` or `Name=value`, never `Name:`, and a quoted value that has not closed by then was never terminated. The
+// header keeps its name and gets its own carrier treatment.
+const FOLLOWING_HEADER_PATTERN = /[;,][ \t]*[A-Za-z][A-Za-z0-9_-]*[ \t]*:/y;
+const HEADER_NAME_COLON_PATTERN = /[ \t]*:/y;
 
 // Session assignments in free text or query strings (`session=...`, `sid=...`, `JSESSIONID=...`), whatever the value.
 const SESSION_ASSIGNMENT_PATTERN = new RegExp(
@@ -488,7 +493,8 @@ function backslashRun(text: string, index: number): number {
  * Reads a quoted value opening at `index`: a double or single quote, with any backslashes that escape it in JSON or
  * JavaScript-escaped text (`\"value\"`, `\\\"value\\\"`). The value ends at the same quote token; a quote escaped one
  * level deeper is content, a quote escaped less deeply closes an enclosing string and leaves the value unterminated,
- * and an unterminated value runs to the end of the line or of the text so a truncated carrier still loses its value.
+ * and an unterminated value runs to the next header's `Name:` token on the line (`; X-Api-Key:`), or to the end of
+ * the line or of the text, so a truncated carrier still loses its value and the header after it keeps its name.
  */
 function readQuotedValue(text: string, index: number): QuotedValue | null {
   const depth = backslashRun(text, index);
@@ -500,6 +506,7 @@ function readQuotedValue(text: string, index: number): QuotedValue | null {
   while (cursor < text.length) {
     const char = text[cursor];
     if (char === "\n" || char === "\r") break;
+    if ((char === ";" || char === ",") && stickyExec(FOLLOWING_HEADER_PATTERN, text, cursor) !== null) break;
     if (char !== "\\" && char !== quote) {
       cursor += 1;
       continue;
@@ -604,7 +611,8 @@ function cookieValueEnd(text: string, index: number): number {
 
 /**
  * Reads a Cookie or Set-Cookie header value: quoted whole, or `name=value` followed by attributes (`; Path=/;
- * HttpOnly`), where each value may itself be quoted. The whole header value is replaced by one marker.
+ * HttpOnly`), where each value may itself be quoted. The whole header value is replaced by one marker. The value ends
+ * at `,`, at a `; Name:` token (the next header on the line, which is never a cookie attribute), or at the line end.
  */
 const readCookieHeaderValue: ValueReader = (text, valueStart) => {
   const quoted = readQuotedValue(text, valueStart);
@@ -617,6 +625,7 @@ const readCookieHeaderValue: ValueReader = (text, valueStart) => {
   let cursor = cookieValueEnd(text, valueStart + name.length + 1);
   let attribute: string | null;
   while ((attribute = stickyExec(COOKIE_ATTRIBUTE_PATTERN, text, cursor)) !== null) {
+    if (stickyExec(HEADER_NAME_COLON_PATTERN, text, cursor + attribute.length) !== null) break;
     cursor += attribute.length;
     if (text[cursor] === "=") cursor = cookieValueEnd(text, cursor + 1);
   }

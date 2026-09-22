@@ -688,7 +688,7 @@ test("BoxApiClient reports list truncation only when a marker, offset, or stream
     }
     return jsonResponse({}, { status: 404 });
   };
-  const client = new BoxApiClient(sampleConfig({ authMode: "oauth", accessToken: "token", clientId: undefined, clientSecret: undefined }), { fetchImpl, now: () => NOW });
+  const client = new BoxApiClient(sampleConfig({ authMode: "oauth", accessToken: "oauth-fixture-access-2026", clientId: undefined, clientSecret: undefined }), { fetchImpl, now: () => NOW });
 
   const complete = await client.listUsers(10);
   assert.deepEqual(complete.items.map((entry) => entry.id), ["user-1", "user-2", "user-3"]);
@@ -745,7 +745,7 @@ test("verdict rule 10: every Box pagination exit that leaves records behind repo
     if (url.pathname.startsWith("/2.0/enterprise_configurations/")) return jsonResponse(hardenedConfiguration());
     return jsonResponse({}, { status: 404 });
   };
-  const client = new BoxApiClient(sampleConfig({ authMode: "oauth", accessToken: "token", clientId: undefined, clientSecret: undefined }), { fetchImpl, now: () => NOW });
+  const client = new BoxApiClient(sampleConfig({ authMode: "oauth", accessToken: "oauth-fixture-access-2026", clientId: undefined, clientSecret: undefined }), { fetchImpl, now: () => NOW });
 
   const emptyPageWithMarker = await client.listUsers(10);
   assert.deepEqual(emptyPageWithMarker.items.map((entry) => entry.id), ["user-1"]);
@@ -776,7 +776,7 @@ test("verdict rule 9: non-JSON error bodies are described, never echoed, into Bo
     statusText: "Bad Gateway",
     headers: { "content-type": "text/html" },
   });
-  const client = new BoxApiClient(sampleConfig({ authMode: "oauth", accessToken: "token", clientId: undefined, clientSecret: undefined, maxRetries: 0 }), { fetchImpl, now: () => NOW });
+  const client = new BoxApiClient(sampleConfig({ authMode: "oauth", accessToken: "oauth-fixture-access-2026", clientId: undefined, clientSecret: undefined, maxRetries: 0 }), { fetchImpl, now: () => NOW });
   await assert.rejects(client.listUsers(5), (error) => {
     assert.ok(error instanceof BoxApiError);
     assert.equal(error.status, 502);
@@ -860,12 +860,21 @@ test("Box scrubber: a quoted header value in a recorded error is removed whole, 
     [`\\"Authorization\\":\\"Bearer ${canary}\\"`, '\\"Authorization\\":\\"Bearer [REDACTED]\\"'],
     [`\\"X-Api-Key\\": \\"${canary}\\"`, '\\"X-Api-Key\\": \\"[REDACTED]\\"'],
     [`Box request failed (502 Bad Gateway) for GET /2.0/users: upstream echoed {"headers":{"Authorization":"Bearer ${canary}","Cookie":"sid=${canary}","Content-Type":"application/json"}}`, 'Box request failed (502 Bad Gateway) for GET /2.0/users: upstream echoed {"headers":{"Authorization":"Bearer [REDACTED]","Cookie":"[REDACTED]","Content-Type":"application/json"}}'],
+    // Compound lines: the header after a cookie or header value keeps its name and gets its own carrier treatment.
+    [`Cookie: sid="${canary}"; X-Api-Key: "${canary}"; Content-Type: "application/json"`, 'Cookie: [REDACTED]; X-Api-Key: "[REDACTED]"; Content-Type: "application/json"'],
+    [`Cookie: sid=${canary}; X-Api-Key: "${canary}"; Content-Type: "application/json"`, 'Cookie: [REDACTED]; X-Api-Key: "[REDACTED]"; Content-Type: "application/json"'],
+    [`Cookie: sid=${canary}, X-Api-Key: ${canary}, Content-Type: application/json`, "Cookie: [REDACTED], X-Api-Key: [REDACTED], Content-Type: application/json"],
+    [`X-Api-Key: "${canary}"; Authorization: Bearer "${canary}"`, 'X-Api-Key: "[REDACTED]"; Authorization: Bearer "[REDACTED]"'],
+    [`X-Api-Key: "${canary}" {"token": "${canary}", "env": "production"}`, 'X-Api-Key: "[REDACTED]" {"token": "[REDACTED]", "env": "production"}'],
+    [`\\"Cookie\\": \\"sid=${canary}\\", \\"X-Api-Key\\": \\"${canary}\\", \\"Content-Type\\": \\"application/json\\"`, '\\"Cookie\\": \\"[REDACTED]\\", \\"X-Api-Key\\": \\"[REDACTED]\\", \\"Content-Type\\": \\"application/json\\"'],
+    [`Box request failed (502 Bad Gateway) for GET /2.0/users: upstream echoed Cookie: sid=${canary}; X-Api-Key: "${canary}"; Content-Type: "application/json"`, 'Box request failed (502 Bad Gateway) for GET /2.0/users: upstream echoed Cookie: [REDACTED]; X-Api-Key: "[REDACTED]"; Content-Type: "application/json"'],
   ];
   for (const [text, expected] of carriers) {
     const scrubbed = scrubErrorText(text);
     assert.equal(scrubbed, expected, text);
     assertCanaryWindowsAbsent(assert, scrubbed, [canary], text);
     assert.equal(scrubErrorText(scrubbed), scrubbed, `${text}: a second pass changed the text`);
+    if (text.includes("Content-Type")) assert.ok(/Content-Type\\?"?: ?\\?"?(application\/json|text\/html)/.test(scrubbed), `${text}: Content-Type lost its name or value`);
   }
   assert.equal(scrubErrorText('Authorization: Bearer "token"'), 'Authorization: Bearer "[REDACTED]"', "a plain word in quotes is the value and goes");
   assert.equal(scrubErrorText('Content-Type: "application/json"; Accept: "application/json"'), 'Content-Type: "application/json"; Accept: "application/json"', "quoted non-credential headers stay");

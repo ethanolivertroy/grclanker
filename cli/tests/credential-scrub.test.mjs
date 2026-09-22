@@ -118,6 +118,105 @@ const QUOTED_CARRIERS = [
     (value) => `{"headers":{"Authorization":"Bearer ${value}","X-Api-Key":"${value}","Cookie":"sid=${value}","Accept":"application/json"}}`,
     () => `{"headers":{"Authorization":"Bearer ${REDACTED}","X-Api-Key":"${REDACTED}","Cookie":"${REDACTED}","Accept":"application/json"}}`,
   ],
+  // Compound lines: a quoted value ends at its closing quote; an unquoted cookie or header value ends at `,`, at the
+  // next header's `Name:` token, or at the line end; the header after it keeps its name and gets its own carrier
+  // treatment. The fourth column lists the text that must survive as the following-header-name control.
+  [
+    "compound line, quoted cookie then quoted X-Api-Key then Content-Type",
+    (value) => `Cookie: sid="${value}"; X-Api-Key: "${value}"; Content-Type: "application/json"`,
+    () => `Cookie: ${REDACTED}; X-Api-Key: "${REDACTED}"; Content-Type: "application/json"`,
+    ['X-Api-Key: "', 'Content-Type: "application/json"'],
+  ],
+  [
+    "compound line, unquoted cookie then quoted X-Api-Key then Content-Type",
+    (value) => `Cookie: sid=${value}; X-Api-Key: "${value}"; Content-Type: "application/json"`,
+    () => `Cookie: ${REDACTED}; X-Api-Key: "${REDACTED}"; Content-Type: "application/json"`,
+    ['X-Api-Key: "', 'Content-Type: "application/json"'],
+  ],
+  [
+    "compound line, all unquoted",
+    (value) => `Cookie: sid=${value}; X-Api-Key: ${value}; Content-Type: application/json`,
+    () => `Cookie: ${REDACTED}; X-Api-Key: ${REDACTED}; Content-Type: application/json`,
+    ["X-Api-Key: ", "Content-Type: application/json"],
+  ],
+  [
+    "compound line, comma-separated",
+    (value) => `Cookie: sid=${value}, X-Api-Key: "${value}", Content-Type: "application/json"`,
+    () => `Cookie: ${REDACTED}, X-Api-Key: "${REDACTED}", Content-Type: "application/json"`,
+    ['X-Api-Key: "', 'Content-Type: "application/json"'],
+  ],
+  [
+    "compound line, no spaces",
+    (value) => `Cookie: sid=${value};X-Api-Key:"${value}";Content-Type:"application/json"`,
+    () => `Cookie: ${REDACTED};X-Api-Key:"${REDACTED}";Content-Type:"application/json"`,
+    ['X-Api-Key:"', 'Content-Type:"application/json"'],
+  ],
+  [
+    "compound line, cookie attributes before the next header",
+    (value) => `Cookie: sid=${value}; Path=/; HttpOnly; X-Api-Key: "${value}"; Content-Type: "application/json"`,
+    () => `Cookie: ${REDACTED}; X-Api-Key: "${REDACTED}"; Content-Type: "application/json"`,
+    ['X-Api-Key: "', 'Content-Type: "application/json"'],
+  ],
+  [
+    "compound line, Set-Cookie with attributes then a comma and Content-Type",
+    (value) => `Set-Cookie: sid="${value}"; Path=/; Secure, Content-Type: "application/json"`,
+    () => `Set-Cookie: ${REDACTED}, Content-Type: "application/json"`,
+    ['Content-Type: "application/json"'],
+  ],
+  [
+    "compound line, whole cookie value quoted then a quoted Content-Type holding a semicolon",
+    (value) => `Cookie: "sid=${value}; Path=/"; Content-Type: "text/html; charset=utf-8"`,
+    () => `Cookie: "${REDACTED}"; Content-Type: "text/html; charset=utf-8"`,
+    ['Content-Type: "text/html; charset=utf-8"'],
+  ],
+  [
+    "compound line, two quoted headers",
+    (value) => `X-Api-Key: "${value}"; Authorization: Bearer "${value}"`,
+    () => `X-Api-Key: "${REDACTED}"; Authorization: Bearer "${REDACTED}"`,
+    ['Authorization: Bearer "'],
+  ],
+  [
+    "compound line, two unquoted headers then Content-Type",
+    (value) => `X-Api-Key: ${value}; Authorization: Bearer ${value}; Content-Type: application/json`,
+    () => `X-Api-Key: ${REDACTED}; Authorization: Bearer ${REDACTED}; Content-Type: application/json`,
+    ["Authorization: Bearer ", "Content-Type: application/json"],
+  ],
+  [
+    "compound line, header then JSON fragment",
+    (value) => `X-Api-Key: "${value}" {"token": "${value}", "env": "production"}`,
+    () => `X-Api-Key: "${REDACTED}" {"token": "${REDACTED}", "env": "production"}`,
+    ['"env": "production"'],
+  ],
+  [
+    "compound line, JSON-escaped cookie then X-Api-Key then Content-Type",
+    (value) => `\\"Cookie\\": \\"sid=${value}\\", \\"X-Api-Key\\": \\"${value}\\", \\"Content-Type\\": \\"application/json\\"`,
+    () => `\\"Cookie\\": \\"${REDACTED}\\", \\"X-Api-Key\\": \\"${REDACTED}\\", \\"Content-Type\\": \\"application/json\\"`,
+    ['\\"X-Api-Key\\": \\"', '\\"Content-Type\\": \\"application/json\\"'],
+  ],
+  [
+    "compound line inside a 502 body note",
+    (value) => `502 Bad Gateway: upstream echoed Cookie: sid=${value}; X-Api-Key: "${value}"; Content-Type: "application/json"`,
+    () => `502 Bad Gateway: upstream echoed Cookie: ${REDACTED}; X-Api-Key: "${REDACTED}"; Content-Type: "application/json"`,
+    ["502 Bad Gateway: upstream echoed Cookie: ", 'X-Api-Key: "', 'Content-Type: "application/json"'],
+  ],
+  [
+    "compound line, unterminated quoted cookie value then a quoted X-Api-Key",
+    (value) => `Cookie: sid="${value}; X-Api-Key: "${value}"; Content-Type: "application/json"`,
+    () => `Cookie: ${REDACTED}; X-Api-Key: "${REDACTED}"; Content-Type: "application/json"`,
+    ['X-Api-Key: "', 'Content-Type: "application/json"'],
+  ],
+  [
+    "compound line, unterminated quoted header value then Content-Type",
+    (value) => `X-Api-Key: "${value}; Content-Type: "application/json"`,
+    () => `X-Api-Key: "${REDACTED}; Content-Type: "application/json"`,
+    ['Content-Type: "application/json"'],
+  ],
+  [
+    "compound line, a quoted Date holding commas and colons before a quoted X-Api-Key",
+    (value) => `Date: "Mon, 22 Sep 2026 12:30:00 GMT"; X-Api-Key: "${value}"`,
+    () => `Date: "Mon, 22 Sep 2026 12:30:00 GMT"; X-Api-Key: "${REDACTED}"`,
+    ['Date: "Mon, 22 Sep 2026 12:30:00 GMT"; X-Api-Key: "'],
+  ],
 ];
 
 /** Alphanumeric random-looking values planted in the quoted carriers; the first is name-shaped and stays bare. */
@@ -243,14 +342,18 @@ test("scrub boundary guard 1, quoted carriers: a quoted header or pair value is 
   const bare = `the resource ${nameShapedCanary} was not readable`;
   assert.equal(scrubber.scrub(bare), bare, "the name-shaped canary stays bare, so only the carrier can remove it");
   const values = [...QUOTED_CANARIES, ...NAME_SHAPED];
-  for (const [label, carrier, expected] of QUOTED_CARRIERS) {
+  for (const [label, carrier, expected, controls = []] of QUOTED_CARRIERS) {
     for (const value of values) {
       const scrubbed = scrubber.scrub(carrier(value));
       assert.equal(scrubbed, expected(), `${label} with ${value}`);
       assertCanaryWindowsAbsent(assert, scrubbed, [value], `${label} with ${value}`);
+      for (const control of controls) {
+        assert.ok(scrubbed.includes(control), `${label} with ${value}: the following header text ${JSON.stringify(control)} did not survive: ${scrubbed}`);
+      }
       assert.equal(scrubber.scrub(scrubbed), scrubbed, `${label} with ${value}: a second pass changed the text`);
     }
   }
+  assert.ok(QUOTED_CARRIERS.filter(([label]) => label.startsWith("compound line")).length >= 14, "the compound-line pins are present");
 });
 
 test("scrub boundary guard 1, quoted carriers: the reported forms, a plain word in quotes included, come out with the value gone and the quotes and scheme kept", () => {
