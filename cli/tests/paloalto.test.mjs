@@ -798,7 +798,14 @@ function mockedFetch(options = {}) {
       if (url.pathname === "/api/v1/authenticate") return jsonResponse({ token: "compute-token" });
       if (denyAll || partial || options.computeDenied) return jsonResponse({ err: "forbidden" }, { status: 403 });
       const path = url.pathname.replace("/api/v1", "");
-      if (emptyAll) return jsonResponse(path.startsWith("/policies") || path.startsWith("/settings") || path.startsWith("/stats") ? {} : []);
+      // The documented empty answers: a policy with no rules, no registry specifications,
+      // no compliance evaluations, and null for an empty collection (Compute serves null).
+      if (emptyAll) {
+        if (path.startsWith("/policies")) return jsonResponse({ rules: [] });
+        if (path === "/settings/registry") return jsonResponse({ specifications: [] });
+        if (path === "/stats/compliance") return jsonResponse({ rules: [], categories: [] });
+        return jsonResponse(path === "/stats/vulnerabilities" ? [] : null);
+      }
       if (path === "/defenders") return jsonResponse(compute.defenders);
       if (path === "/policies/runtime/container") return jsonResponse(compute.runtimeContainerPolicy);
       if (path === "/policies/compliance/container") return jsonResponse(compute.complianceContainerPolicy);
@@ -1500,7 +1507,7 @@ test("describePrismaErrorBody and PanosApiClient.parseResponse describe non-JSON
   });
   await assert.rejects(nonJson.listPolicies(), (error) => {
     assertNoCanary(error.message, "Prisma 200 HTML body");
-    assert.match(error.message, /^Prisma Cloud GET \/v2\/policy returned a non-JSON text\/html response body \(\d+ bytes, not echoed\) with status 200\.$/);
+    assert.match(error.message, /^Prisma Cloud GET \/v2\/policy returned status 200 with a non-JSON text\/html response body \(\d+ bytes, not echoed\) where the documented JSON document was expected\.$/);
     return true;
   });
 });
@@ -1976,7 +1983,10 @@ test("Compute listPaged reports a stuck offset and the record cap as truncated w
       const url = new URL(input);
       if (url.pathname === "/login") return jsonResponse({ token: "jwt" });
       if (url.pathname === "/api/v1/authenticate") return jsonResponse({ token: "compute-token" });
-      if (url.pathname.startsWith("/api/v1/policies") || url.pathname.startsWith("/api/v1/settings") || url.pathname.startsWith("/api/v1/stats")) return jsonResponse({});
+      if (url.pathname.startsWith("/api/v1/policies")) return jsonResponse({ rules: [] });
+      if (url.pathname === "/api/v1/settings/registry") return jsonResponse({ specifications: [] });
+      if (url.pathname === "/api/v1/stats/compliance") return jsonResponse({ rules: [], categories: [] });
+      if (url.pathname === "/api/v1/stats/vulnerabilities") return jsonResponse([]);
       return jsonResponse(fullPage(Number(url.searchParams.get("offset")), distinct));
     };
     return new PrismaComputeClient("https://compute.example.com", new PrismaCloudClient({ apiUrl: "https://api2.prismacloud.io", accessKeyId: "k", secretKey: "s" }, { fetchImpl, sleepImpl: noSleep }));
@@ -2382,7 +2392,7 @@ test("PrismaComputeClient authenticates with a Compute token, falls back to the 
       const offset = Number(url.searchParams.get("offset"));
       return jsonResponse(offset === 0 ? Array.from({ length: 50 }, (_, index) => ({ hostname: `n${index}` })) : [{ hostname: "last" }]);
     }
-    return jsonResponse({});
+    return jsonResponse({ rules: [] });
   };
   const cspm = new PrismaCloudClient({ apiUrl: "https://api2.prismacloud.io", accessKeyId: "key", secretKey: FIXTURE_SECRET_KEY }, { fetchImpl });
   const compute = new PrismaComputeClient("https://compute.example.com/", cspm);

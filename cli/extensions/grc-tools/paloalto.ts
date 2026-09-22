@@ -1641,13 +1641,110 @@ async function fetchWithRetry(url: string, init: RequestInit, options: HttpOptio
   }
 }
 
+// The media type of a response is server-controlled text: it is quoted only when it has
+// the shape of a media type, otherwise it is described as unknown.
+const MEDIA_TYPE_PATTERN = /^[a-z0-9][a-z0-9!#$&^_.+-]{0,31}\/[a-z0-9][a-z0-9!#$&^_.+-]{0,39}$/;
+
 function responseContentType(response: Response): string {
-  return response.headers.get("content-type")?.split(";")[0].trim().toLowerCase() || "unknown";
+  const value = response.headers.get("content-type")?.split(";")[0].trim().toLowerCase() ?? "";
+  return MEDIA_TYPE_PATTERN.test(value) ? value : "unknown";
 }
 
 /** Status-and-length note for a body that is not the JSON the API documents; the body is never echoed. */
 function nonJsonBodyNote(response: Response, rawText: string): string {
   return `non-JSON ${responseContentType(response)} response body (${rawText.length} bytes, not echoed)`;
+}
+
+function jsonValueKind(value: unknown): string {
+  if (value === null) return "null";
+  if (Array.isArray(value)) return "array";
+  return typeof value;
+}
+
+// What a 2xx answer was expected to carry: the documented JSON document of any kind, a
+// JSON object, a JSON array, one documented member of a JSON object, or any one of the
+// members that identify a documented object.
+type DocumentExpectation =
+  | { kind: "document" }
+  | { kind: "object" }
+  | { kind: "array" }
+  | { kind: "member"; key: string; type: "array" | "object" | "member" }
+  | { kind: "members"; keys: string[] };
+
+/**
+ * A 2xx answer whose body is not the documented JSON document (an empty body, the HTML
+ * page a proxy or SSO portal serves in place of the API, a foreign JSON value, a JSON
+ * object without the documented member) is described like an error body, by status,
+ * media type, and size only, and is recorded as an unreadable surface: its missing
+ * members are never read as an empty inventory or an empty policy.
+ */
+export function describeNonDocumentBody(response: Response, rawText: string, expected: DocumentExpectation = { kind: "document" }): string {
+  const base = `status ${response.status}`;
+  const size = `${rawText.length} bytes, not echoed`;
+  let what: string;
+  switch (expected.kind) {
+    case "member":
+      return `${base} with a JSON response body without the documented "${expected.key}" ${expected.type} (${size})`;
+    case "members":
+      return `${base} with a JSON response body without any of the documented members ${expected.keys.map((key) => `"${key}"`).join(", ")} (${size})`;
+    case "document":
+      what = "the documented JSON document";
+      break;
+    case "object":
+      what = "the documented JSON object";
+      break;
+    case "array":
+      what = "the documented JSON array";
+      break;
+    default: {
+      const exhaustive: never = expected;
+      throw new Error(`Unhandled document expectation: ${String(exhaustive)}`);
+    }
+  }
+  if (rawText.length === 0) return `${base} with an empty response body where ${what} was expected`;
+  const parsed = safeJsonParse(rawText);
+  if (parsed === undefined) return `${base} with a ${nonJsonBodyNote(response, rawText)} where ${what} was expected`;
+  return `${base} with a JSON ${jsonValueKind(parsed)} response body (${size}) where ${what} was expected`;
+}
+
+// One 2xx answer that passed the parse guard, kept with what the request observed so a
+// missing documented shape can be described by status, media type, and size. The label
+// names the product and request the way the client's other error strings do.
+interface PrismaDocument {
+  value: unknown;
+  response: Response;
+  rawText: string;
+  endpoint: string;
+  label: string;
+}
+
+function nonDocumentError(document: PrismaDocument, expected: DocumentExpectation, secrets: HttpOptions["secrets"]): PaloaltoApiError {
+  return new PaloaltoApiError(redactSecrets(`${document.label} returned ${describeNonDocumentBody(document.response, document.rawText, expected)}.`, secrets), document.response.status, document.endpoint);
+}
+
+// The documented answer is a JSON array of records; Compute serves null for an empty
+// collection, which is the documented empty answer. Any other value is a foreign document.
+function documentedArray(document: PrismaDocument, secrets: HttpOptions["secrets"]): JsonRecord[] {
+  if (document.value !== null && !Array.isArray(document.value)) throw nonDocumentError(document, { kind: "array" }, secrets);
+  return asRecords(document.value);
+}
+
+// A documented object is recognised by any one of the members that identify it; an
+// object carrying none of them (a health page, a portal's JSON) is a foreign document.
+function documentedObject(document: PrismaDocument, keys: string[], secrets: HttpOptions["secrets"]): JsonRecord {
+  const payload = asObject(document.value);
+  if (payload === undefined) throw nonDocumentError(document, { kind: "object" }, secrets);
+  if (!keys.some((key) => key in payload)) throw nonDocumentError(document, { kind: "members", keys }, secrets);
+  return payload;
+}
+
+// The documented collection member must be present on every page, as an array or null.
+function documentedRecords(document: PrismaDocument, key: string, secrets: HttpOptions["secrets"]): { payload: JsonRecord; records: JsonRecord[] } {
+  const payload = asObject(document.value);
+  if (payload === undefined) throw nonDocumentError(document, { kind: "object" }, secrets);
+  const value = payload[key];
+  if (!(key in payload) || (value !== null && !Array.isArray(value))) throw nonDocumentError(document, { kind: "member", key, type: "array" }, secrets);
+  return { payload, records: asRecords(value) };
 }
 
 // Prisma Cloud's documented error fields: the x-redlock-status header (a JSON array of
@@ -1766,6 +1863,17 @@ export class PrismaCloudClient {
   }
 
   async request(method: "GET" | "POST", path: string, query: JsonRecord = {}, body?: unknown, retryAuth = true): Promise<unknown> {
+    return (await this.requestDocument(method, path, query, body, retryAuth)).value;
+  }
+
+  /**
+   * One request, with the shape guard every 2xx answer passes: a body that is empty or
+   * not JSON is not the documented document and is thrown as an unreadable surface
+   * carrying the status the request observed, never returned as an empty object. The
+   * JSON value is returned with the response so a caller can describe a missing
+   * documented member the same way.
+   */
+  private async requestDocument(method: "GET" | "POST", path: string, query: JsonRecord = {}, body?: unknown, retryAuth = true): Promise<PrismaDocument> {
     const url = new URL(`${this.config.apiUrl}${path.startsWith("/") ? path : `/${path}`}`);
     for (const [key, value] of Object.entries(query)) {
       if (value === undefined || value === null || value === "") continue;
@@ -1784,29 +1892,35 @@ export class PrismaCloudClient {
     const rawText = await response.text();
     if (response.status === 401 && retryAuth) {
       this.token = undefined;
-      return this.request(method, path, query, body, false);
+      return this.requestDocument(method, path, query, body, false);
     }
     if (!response.ok) {
       throw new PaloaltoApiError(redactSecrets(`Prisma Cloud ${method} ${path} failed (${response.status}): ${describePrismaErrorBody(response, rawText, this.scrub)}`, this.http.secrets), response.status, endpoint);
     }
-    if (rawText.length === 0) return {};
-    const parsed = safeJsonParse(rawText);
-    if (parsed === undefined) {
-      throw new PaloaltoApiError(`Prisma Cloud ${method} ${path} returned a ${nonJsonBodyNote(response, rawText)} with status ${response.status}.`, response.status, endpoint);
-    }
-    return parsed;
+    const document: PrismaDocument = { value: rawText.length === 0 ? undefined : safeJsonParse(rawText), response, rawText, endpoint, label: `Prisma Cloud ${method} ${path}` };
+    if (document.value === undefined) throw nonDocumentError(document, { kind: "document" }, this.http.secrets);
+    return document;
   }
 
   async get(path: string, query: JsonRecord = {}): Promise<unknown> {
     return this.request("GET", path, query);
   }
 
+  private async getDocument(path: string, query: JsonRecord = {}): Promise<PrismaDocument> {
+    return this.requestDocument("GET", path, query);
+  }
+
+  // A read whose documented answer is a JSON array of records.
+  private async getList(path: string): Promise<JsonRecord[]> {
+    return documentedArray(await this.getDocument(path), this.http.secrets);
+  }
+
   async getCompliancePosture(): Promise<JsonRecord> {
-    return asObject(await this.get("/v2/compliance/posture")) ?? {};
+    return documentedObject(await this.getDocument("/v2/compliance/posture"), ["summary", "complianceDetails", "requestedTimestamp"], this.http.secrets);
   }
 
   async listAlertRules(): Promise<JsonRecord[]> {
-    return asRecords(await this.get("/v2/alert/rule"));
+    return this.getList("/v2/alert/rule");
   }
 
   /**
@@ -1823,7 +1937,9 @@ export class PrismaCloudClient {
     let totalRows: number | undefined;
     let truncationReason: string | undefined;
     for (;;) {
-      const payload = asObject(await this.get("/v2/alert", {
+      // Every page must carry the documented items array (or null); a 2xx object without
+      // it is a foreign document, not the end of the cursor.
+      const { payload, records: pageItems } = documentedRecords(await this.getDocument("/v2/alert", {
         "alert.status": "open",
         timeType: "relative",
         timeAmount: "30",
@@ -1831,8 +1947,7 @@ export class PrismaCloudClient {
         detailed: "true",
         limit: Math.min(DEFAULT_ALERT_PAGE_SIZE, Math.max(limit - items.length, 1)),
         pageToken,
-      })) ?? {};
-      const pageItems = asRecords(payload.items);
+      }), "items", this.http.secrets);
       totalRows = asNumber(payload.totalRows) ?? totalRows;
       const room = Math.max(limit - items.length, 0);
       items.push(...pageItems.slice(0, room));
@@ -1864,23 +1979,23 @@ export class PrismaCloudClient {
   }
 
   async getMetaInfo(): Promise<JsonRecord> {
-    return asObject(await this.get("/meta_info")) ?? {};
+    return documentedObject(await this.getDocument("/meta_info"), ["twistlockUrl", "licenseType", "marketplace", "startTs", "endTs"], this.http.secrets);
   }
 
   async listPolicies(): Promise<JsonRecord[]> {
-    return asRecords(await this.get("/v2/policy"));
+    return this.getList("/v2/policy");
   }
 
   async listCloudAccounts(): Promise<JsonRecord[]> {
-    return asRecords(await this.get("/cloud"));
+    return this.getList("/cloud");
   }
 
   async listAccountGroups(): Promise<JsonRecord[]> {
-    return asRecords(await this.get("/cloud/group"));
+    return this.getList("/cloud/group");
   }
 
   async listUserRoles(): Promise<JsonRecord[]> {
-    return asRecords(await this.get("/user/role"));
+    return this.getList("/user/role");
   }
 
   /**
@@ -1891,8 +2006,8 @@ export class PrismaCloudClient {
    */
   async listIntegrations(): Promise<JsonRecord[]> {
     await this.getToken();
-    if (this.prismaId) return asRecords(await this.get(`/api/v1/tenant/${encodeURIComponent(this.prismaId)}/integration`));
-    return asRecords(await this.get("/integration"));
+    if (this.prismaId) return this.getList(`/api/v1/tenant/${encodeURIComponent(this.prismaId)}/integration`);
+    return this.getList("/integration");
   }
 
   get tenantPrismaId(): string | undefined {
@@ -1945,6 +2060,12 @@ export class PrismaComputeClient {
   }
 
   async get(path: string, query: JsonRecord = {}): Promise<unknown> {
+    return (await this.getDocument(path, query)).value;
+  }
+
+  // One request with the same shape guard as the CSPM client: an empty or non-JSON 2xx
+  // body is thrown as an unreadable surface, never returned as an empty object.
+  private async getDocument(path: string, query: JsonRecord = {}): Promise<PrismaDocument> {
     const url = new URL(`${this.consoleUrl}/api/v1${path.startsWith("/") ? path : `/${path}`}`);
     for (const [key, value] of Object.entries(query)) {
       if (value === undefined || value === null || value === "") continue;
@@ -1959,12 +2080,19 @@ export class PrismaComputeClient {
     if (!response.ok) {
       throw new PaloaltoApiError(redactSecrets(`Prisma Cloud Compute GET ${path} failed (${response.status}): ${describePrismaErrorBody(response, rawText, this.scrub)}`, this.http.secrets), response.status, endpoint);
     }
-    if (rawText.length === 0) return {};
-    const parsed = safeJsonParse(rawText);
-    if (parsed === undefined) {
-      throw new PaloaltoApiError(`Prisma Cloud Compute GET ${path} returned a ${nonJsonBodyNote(response, rawText)} with status ${response.status}.`, response.status, endpoint);
-    }
-    return parsed;
+    const document: PrismaDocument = { value: rawText.length === 0 ? undefined : safeJsonParse(rawText), response, rawText, endpoint, label: `Prisma Cloud Compute GET ${path}` };
+    if (document.value === undefined) throw nonDocumentError(document, { kind: "document" }, this.http.secrets);
+    return document;
+  }
+
+  // A read whose documented answer is a JSON array of records (or null when empty).
+  private async getList(path: string): Promise<JsonRecord[]> {
+    return documentedArray(await this.getDocument(path), this.http.secrets);
+  }
+
+  // A read whose documented answer is the JSON object identified by any of the keys.
+  private async getObject(path: string, keys: string[]): Promise<JsonRecord> {
+    return documentedObject(await this.getDocument(path), keys, this.http.secrets);
   }
 
   /**
@@ -1977,7 +2105,7 @@ export class PrismaComputeClient {
     let offset = 0;
     let previousSignature: string | undefined;
     for (;;) {
-      const page = asRecords(await this.get(path, { limit: DEFAULT_COMPUTE_PAGE_SIZE, offset }));
+      const page = documentedArray(await this.getDocument(path, { limit: DEFAULT_COMPUTE_PAGE_SIZE, offset }), this.http.secrets);
       const signature = page.length > 0 ? JSON.stringify(page[0]) : undefined;
       if (signature !== undefined && signature === previousSignature) {
         return { items, truncated: true, truncationReason: `GET /api/v1${path} returned the same page for offset ${offset} as for the previous offset (stuck offset), so the remaining records were not read` };
@@ -1993,8 +2121,11 @@ export class PrismaComputeClient {
   }
 
   async getVersion(): Promise<string> {
-    const payload = await this.get("/version");
-    return asString(payload) ?? asString(asObject(payload)?.version) ?? "unknown";
+    // The documented answer is the version string itself, or an object carrying it.
+    const document = await this.getDocument("/version");
+    const version = asString(document.value) ?? asString(asObject(document.value)?.version);
+    if (version === undefined) throw nonDocumentError(document, { kind: "member", key: "version", type: "member" }, this.http.secrets);
+    return version;
   }
 
   async listDefenders(limit = DEFAULT_COMPUTE_LIMIT): Promise<PagedResult> {
@@ -2002,23 +2133,23 @@ export class PrismaComputeClient {
   }
 
   async getRuntimeContainerPolicy(): Promise<JsonRecord> {
-    return asObject(await this.get("/policies/runtime/container")) ?? {};
+    return this.getObject("/policies/runtime/container", ["rules", "_id", "learningDisabled"]);
   }
 
   async getComplianceContainerPolicy(): Promise<JsonRecord> {
-    return asObject(await this.get("/policies/compliance/container")) ?? {};
+    return this.getObject("/policies/compliance/container", ["rules", "_id", "policyType"]);
   }
 
   async getComplianceHostPolicy(): Promise<JsonRecord> {
-    return asObject(await this.get("/policies/compliance/host")) ?? {};
+    return this.getObject("/policies/compliance/host", ["rules", "_id", "policyType"]);
   }
 
   async getVulnerabilityImagePolicy(): Promise<JsonRecord> {
-    return asObject(await this.get("/policies/vulnerability/images")) ?? {};
+    return this.getObject("/policies/vulnerability/images", ["rules", "_id", "policyType"]);
   }
 
   async getRegistrySettings(): Promise<JsonRecord> {
-    return asObject(await this.get("/settings/registry")) ?? {};
+    return this.getObject("/settings/registry", ["specifications", "harborScannerUrlSuffix", "webhookUrlSuffix"]);
   }
 
   async listRegistryScans(limit = DEFAULT_COMPUTE_LIMIT): Promise<PagedResult> {
@@ -2030,11 +2161,11 @@ export class PrismaComputeClient {
   }
 
   async getVulnerabilityStats(): Promise<JsonRecord[]> {
-    return asRecords(await this.get("/stats/vulnerabilities"));
+    return this.getList("/stats/vulnerabilities");
   }
 
   async getComplianceStats(): Promise<JsonRecord> {
-    return asObject(await this.get("/stats/compliance")) ?? {};
+    return this.getObject("/stats/compliance", ["rules", "categories", "templates", "daily", "ids", "_id"]);
   }
 
   async listCloudDiscovery(limit = DEFAULT_COMPUTE_LIMIT): Promise<PagedResult> {
@@ -3825,6 +3956,10 @@ export async function checkPaloaltoAccess(clients: PaloaltoClients): Promise<Pal
   const readable = surfaces.filter((surface) => surface.status === "readable").length;
   const partialProbes = surfaces.filter((surface) => surface.partial).length;
   const status: PaloaltoAccessCheckResult["status"] = surfaces.length === 0 ? "unconfigured" : readable === surfaces.length ? "healthy" : "degraded";
+  // A refusal (401 or 403, or PAN-OS's own error status) is a role problem; a surface that
+  // failed any other way (a proxy or portal answering in place of the API, a transport
+  // fault) is not fixed by a role.
+  const refused = surfaces.some((surface) => surface.status !== "readable" && (surface.httpStatus === 401 || surface.httpStatus === 403));
   notes.push(`${readable}/${surfaces.length} Palo Alto audit surfaces are readable.${partialProbes > 0 ? ` ${partialProbes} probe${partialProbes === 1 ? "" : "s"} stopped at the page cap, so counts marked + are lower bounds, not inventory totals.` : ""}`);
   return {
     status,
@@ -3833,7 +3968,9 @@ export async function checkPaloaltoAccess(clients: PaloaltoClients): Promise<Pal
     notes,
     recommendedNextStep: status === "healthy"
       ? "Run paloalto_assess_cloud_posture, paloalto_assess_firewall_policy, paloalto_assess_threat_prevention, paloalto_assess_device_hardening, or paloalto_export_audit_bundle."
-      : "Grant the Prisma Cloud access key a read-only System Admin or Account Group Read Only role and the PAN-OS admin a read-only (auditadmin or custom XML API read) role, then re-run paloalto_check_access.",
+      : status === "degraded" && !refused
+        ? "Investigate the failed surfaces (the configured URL or host, a proxy or portal answering in place of the API, or a transport fault) before relying on the assessments; findings that read them are manual."
+        : "Grant the Prisma Cloud access key a read-only System Admin or Account Group Read Only role and the PAN-OS admin a read-only (auditadmin or custom XML API read) role, then re-run paloalto_check_access.",
   };
 }
 
