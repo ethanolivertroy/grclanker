@@ -979,6 +979,7 @@ test("credential-bearing tool arguments are redacted before serialization, at an
     "max_session_minutes", // duration threshold
     "max_session_timeout_minutes", // duration threshold
     "max_token_age_days", // duration threshold
+    "min_auth_scan_percent", // percentage threshold (Qualys authenticated-scan share)
     "min_compliance_pass_rate", // percentage threshold
     "min_password_length", // count threshold
     "min_posture_pass_rate", // ratio threshold
@@ -992,6 +993,7 @@ test("credential-bearing tool arguments are redacted before serialization, at an
     "stale_credential_days", // age threshold
     "stale_token_days", // age threshold
     "token_limit", // count threshold
+    "use_oauth", // boolean selecting the Qualys gateway JWT flow over basic auth, not a credential
     "webhook_limit", // count threshold
   ]);
   const unclassified = [...declaredKeys].filter(
