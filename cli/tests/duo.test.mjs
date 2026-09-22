@@ -55,8 +55,11 @@ import {
   shortBodyResponse,
 } from "./helpers/error-canaries.mjs";
 import {
+  ESCAPED_HEADER_LINES,
+  JSON_ESCAPES,
   QUOTED_NON_CREDENTIAL_GROUP,
   assertCredentialPairValuesRemoved,
+  assertEscapedHeaderCarriers,
   assertFixedTextsSurvive,
   assertIdentifierKeyRows,
   assertMustKeepRows,
@@ -2053,6 +2056,30 @@ test("rule 9 must-keep and must-redact table (addendum 7): every endpoint path, 
   ];
   assertMustKeepRows(assert, redactErrorText, groups);
   assertMustRedactRowsBesideMustKeep(assert, redactErrorText, groups);
+});
+
+test("rule 9 escapes (reviewer D round 5 escapes): a header carrier after a two-character or six-character JSON escape is removed exactly as at a line start, for the nineteen header lines the integrations send, the six escapes, and five forms, at 6-to-24 windows, direct and through the client's JSON error path", async () => {
+  const judged = assertEscapedHeaderCarriers(assert, redactErrorText);
+  assert.equal(judged, ESCAPED_HEADER_LINES.length * JSON_ESCAPES.length * 5);
+  assert.equal(ESCAPED_HEADER_LINES.length, 19);
+
+  // The two classes reviewer D found leaking, carried by an error message on a probed surface: a later cookie
+  // pair whose name has no credential word, and X-Auth-Key with an alphabetic value, each after a two-character
+  // and a six-character escape.
+  const tracker = "Rk7mVq2Zt9Xw4Ly6Pn8Hc3Jb";
+  const globalKey = "prodkeyQz8Nv3Tm5Rk2Wy7";
+  const message = `request failed\\nCookie: theme=dark; my.tracker=${tracker}\\u000aX-Auth-Key: ${globalKey}`;
+  assert.ok(message.includes("\\n") && message.includes("\\u000a"), "the message carries the escapes as backslash text");
+  const expectedTail = "\\nCookie: [REDACTED]\\u000aX-Auth-Key: [REDACTED]";
+  const config = createSampleConfig();
+  const surface = [...DUO_ACCESS_PROBE_PATHS][0];
+  const respond = () => new Response(JSON.stringify({ stat: "FAIL", code: 40301, message, message_detail: "" }), { status: 403, statusText: "Forbidden", headers: { "content-type": "application/json" } });
+  const client = new DuoAuditorClient(config, { fetchImpl: routedFetch({ ...healthyDuoRoutes(), [surface]: respond }) });
+  const access = await runDuoAccessCheck(client, config);
+  const probe = access.probes.find((entry) => entry.path === surface);
+  assert.ok(probe && probe.status !== "ok", `the probe for ${surface} is not ok`);
+  assert.ok(probe.detail.includes(expectedTail), `both carriers are removed whole after their escapes: ${probe.detail}`);
+  assertNoCanaryWindows(assert, access, [tracker, globalKey], "check_access after escaped headers");
 });
 
 test("rule 9 credential-named pairs (reviewer D round 5 baseline): a value under a credential-named key is removed whatever its shape and length, unquoted as well as quoted, in every form the pair takes, while identifier-named keys keep their values unless the value's own shape removes it", () => {

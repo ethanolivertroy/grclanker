@@ -813,14 +813,24 @@ function scrubCredentialPairs(text: string): string {
  * a quoted value (a plain or JSON-escaped quote) ends at its closing quote, so a closed value that holds `; Name:`
  * is one value and the quotes stay around the marker; an unquoted value, or a quoted one that is never closed,
  * ends at the `;` or `,` that introduces the next `Name:` header token on the line, at a `<` or `>` (the header
- * quoted inside markup), or at the end of the line, so the next header keeps its name and gets its own carrier
- * treatment. A value that is already the marker is left alone, so a second pass over a scrubbed message leaves
- * the text after the marker as it is.
+ * quoted inside markup), at a `"` that closes the JSON string and container that carried the line (`"}`, `"]`),
+ * at a JSON-escaped line break (`\n`, `\r`, `\u000a`, `\u000d` as backslash text, the end of the line inside a
+ * serialized message), or
+ * at the end of the line, so the next header keeps its name and gets its own carrier treatment. A value that is
+ * already the marker is left alone, so a second pass over a scrubbed message leaves the text after the marker as
+ * it is.
+ *
+ * The header name counts as a carrier at a line start, after any character that is not part of a name, and
+ * after a JSON escape (reviewer D round 5 escapes): inside a serialized message the character before `Cookie`
+ * is the escape's last letter (`\nCookie`, `\u000aCookie`), a word character to `\b`, and a boundary that
+ * relied on `\b` left the free-form removal to the pair rule, which stops at the first `;` and judges every
+ * later cookie pair on its own name and shape.
  */
-const HEADER_CARRIER_PATTERN = /\b(set-cookie|cookie|x-auth-key|x-auth-email)(\s*[:=]\s*)(?!\s*\[REDACTED\])/gi;
+const HEADER_CARRIER_PATTERN = /(?:(?<![A-Za-z0-9_])|(?<=\\[nrtbfv])|(?<=\\u[0-9A-Fa-f]{4}))(set-cookie|cookie|x-auth-key|x-auth-email)(\s*[:=]\s*)(?!\s*\[REDACTED\])/gi;
 const HEADER_CARRIER_QUOTE_PATTERN = /^(\\?)(["'])/;
 const NEXT_HEADER_TOKEN_PATTERN = /[;,]\s*[A-Za-z][A-Za-z0-9-]*\s*:/;
-const MARKUP_STOP_PATTERN = /[<>]/;
+const MARKUP_OR_JSON_CLOSE_PATTERN = /[<>]|"(?=\s*[}\]])/;
+const ESCAPED_LINE_BREAK_PATTERN = /\\(?:[nr]|u000[aAdD])/;
 
 /** The end of a free-form header value that starts at `start`, and the quote (plain or escaped) that encloses a closed quoted value. */
 function headerCarrierValueEnd(text: string, start: number): { end: number; quote?: string } {
@@ -831,8 +841,13 @@ function headerCarrierValueEnd(text: string, start: number): { end: number; quot
     const close = line.indexOf(opening[0], opening[0].length);
     if (close !== -1) return { end: start + close + opening[0].length, quote: opening[0] };
   }
-  const stops = [MARKUP_STOP_PATTERN.exec(line)?.index, NEXT_HEADER_TOKEN_PATTERN.exec(line)?.index].filter((index): index is number => index !== undefined);
-  return { end: start + (stops.length > 0 ? Math.min(...stops) : line.length) };
+  // An unterminated quote is part of the value; the stops are searched after it.
+  const skip = opening ? opening[0].length : 0;
+  const rest = line.slice(skip);
+  const stops = [MARKUP_OR_JSON_CLOSE_PATTERN.exec(rest)?.index, NEXT_HEADER_TOKEN_PATTERN.exec(rest)?.index, ESCAPED_LINE_BREAK_PATTERN.exec(rest)?.index].filter(
+    (index): index is number => index !== undefined,
+  );
+  return { end: start + skip + (stops.length > 0 ? Math.min(...stops) : rest.length) };
 }
 
 function scrubHeaderCarriers(text: string): string {

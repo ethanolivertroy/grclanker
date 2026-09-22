@@ -81,10 +81,13 @@ import {
   parserSnippetBody,
 } from "./helpers/error-canaries.mjs";
 import {
+  ESCAPED_HEADER_LINES,
+  JSON_ESCAPES,
   MASKED_HEX_ID_GROUP,
   QUOTED_NON_CREDENTIAL_GROUP,
   SERVER_ASSIGNED_HEX_IDS,
   assertCredentialPairValuesRemoved,
+  assertEscapedHeaderCarriers,
   assertFixedTextsSurvive,
   assertHexIdentifierPolicy,
   assertIdentifierKeyRows,
@@ -2667,6 +2670,38 @@ test("rule 9 must-keep and must-redact table (addendum 7): every command with it
   ];
   assertMustKeepRows(assert, redactErrorText, groups);
   assertMustRedactRowsBesideMustKeep(assert, redactErrorText, groups);
+});
+
+test("rule 9 escapes (reviewer D round 5 escapes): a header carrier after a two-character or six-character JSON escape is removed exactly as at a line start, for the nineteen header lines the integrations send, the six escapes, and five forms, at 6-to-24 windows, direct and through the client's JSON error path", async () => {
+  const judged = assertEscapedHeaderCarriers(assert, redactErrorText);
+  assert.equal(judged, ESCAPED_HEADER_LINES.length * JSON_ESCAPES.length * 5);
+  assert.equal(ESCAPED_HEADER_LINES.length, 19);
+
+  // The two classes reviewer D found leaking, carried by an error message on a probed surface: a later cookie
+  // pair whose name has no credential word, and X-Auth-Key with an alphabetic value, each after a two-character
+  // and a six-character escape.
+  const tracker = "Rk7mVq2Zt9Xw4Ly6Pn8Hc3Jb";
+  const globalKey = "prodkeyQz8Nv3Tm5Rk2Wy7";
+  const message = `request failed\\nCookie: theme=dark; my.tracker=${tracker}\\u000aX-Auth-Key: ${globalKey}`;
+  assert.ok(message.includes("\\n") && message.includes("\\u000a"), "the message carries the escapes as backslash text");
+  const expectedTail = "\\nCookie: [REDACTED]\\u000aX-Auth-Key: [REDACTED]";
+  const denied = ({ service }) => {
+    if (JSON_PROTOCOL_SERVICES.has(service)) {
+      return { status: 403, contentType: "application/x-amz-json-1.1", body: JSON.stringify({ __type: "AccessDeniedException", message }) };
+    }
+    return { status: 403, contentType: "text/xml", body: `<ErrorResponse xmlns="https://${service}.amazonaws.com/doc/2010-05-08/"><Error><Type>Sender</Type><Code>AccessDenied</Code><Message>${escapeXml(message)}</Message></Error><RequestId>req-1</RequestId></ErrorResponse>` };
+  };
+  await withLocalAwsEndpoint(denied, async () => {
+    const client = realAwsClient();
+    for (const [name, , call] of [LOCAL_AWS_METHODS[1], LOCAL_AWS_METHODS[6]]) {
+      await assert.rejects(() => call(client), (error) => {
+        assert.ok(error instanceof AwsApiError, name);
+        assert.ok(error.message.includes(expectedTail), `${name}: both carriers are removed whole after their escapes: ${error.message}`);
+        assertNoCanaryWindows(assert, thrownErrorRecord(error), [tracker, globalKey], `${name} thrown error after escaped headers`);
+        return true;
+      });
+    }
+  });
 });
 
 test("rule 9 credential-named pairs (reviewer D round 5 baseline): a value under a credential-named key is removed whatever its shape and length, unquoted as well as quoted, in every form the pair takes, while identifier-named keys keep their values unless the value's own shape removes it", () => {

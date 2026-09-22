@@ -193,6 +193,119 @@ export function assertIdentifierKeyRows(assert, redact, rows = IDENTIFIER_KEY_RO
 }
 
 /**
+ * reviewer D round 5 escapes. Inside a serialized message a header line follows a JSON escape rather than a
+ * real line break: `\n`, `\t`, `\r\n` (two characters each) or `\u000a`, `\u0009`, `\u000d\u000a` (six), as
+ * backslash text. The character before the header name is then the escape's last letter, a word character to
+ * `\b`, so a carrier rule that relied on `\b` never fired and left the line to the pair rule, which stops at the
+ * first `;`: `\nCookie: theme=dark; my.tracker=hunter2` came back `Cookie: [REDACTED]; my.tracker=hunter2`, the
+ * later pair judged on its own name and shape, and `\nX-Auth-Key: prodkey` lost the whatever-the-shape rule.
+ */
+export const JSON_ESCAPES = Object.freeze(["\\n", "\\t", "\\r\\n", "\\u000a", "\\u0009", "\\u000d\\u000a"]);
+
+/** The escaped line break, in the escape's own style, that separates a header line from the next one inside a serialized message. */
+export function escapedLineBreakFor(escape) {
+  return escape.includes("\\u") ? "\\u000d\\u000a" : "\\r\\n";
+}
+
+const CLOUDFLARE_GLOBAL_KEY = "c2547eb745079dac9320b638f5e225cf483cc";
+const SIGV4_KEY_ID = "AKIAQ7RZ3M5XK2VJ8N4W";
+const SIGV4_SIGNATURE = "3f2a9c8e7b6d5a4f3e2d1c0b9a8f7e6d5c4b3a2f1e0d9c8b7a6f5e4d3c2b1a0f";
+const SESSION_TOKEN = "FwoGZXIvYXdzEBYaDHt4Q2kzR2xNbVpqNXo5Y3VkbXM2Kq3Ht8Wz";
+const CSRF_TOKEN = "Xh4Kq9Lm2Tz7Bv5Rn8Wc3Yp6Fd1Gs0J";
+const SESSION_ID = "8m2kq4r7v9x1z3c5b6n0p2t4";
+const CSRF_COOKIE = "Wq3Er5Ty7Ui9Op1As2Df4Gh6";
+const BASIC_CREDENTIAL = Buffer.from("DIQ7RZ3M5XK2VJ8N4WPL:Zk8qLm3nRt7vWx2yPa5cB9dQf4Hs6Jt1", "utf8").toString("base64");
+
+/**
+ * The nineteen header lines the five integrations send, each with the values it carries (judged by 6-to-24
+ * windows; a whole pair when its value is under six characters) and the text that must stay. `X-Auth-Key`
+ * and `X-Auth-Email` (Cloudflare's global key pair), `Authorization: Bearer` (Azure, Cloudflare, Ansible),
+ * `Authorization: Basic` (Duo, Ansible), the SigV4 `Authorization` and `X-Amz-Security-Token` (AWS),
+ * `X-CSRFToken` and the session cookie (Ansible session mode), and the cookie shapes whose later pair carries
+ * no credential word (`my.tracker`, `ASP.NET_Tracker`) or a short value (`SessionId=abc`, `Session=v`).
+ */
+export const ESCAPED_HEADER_LINES = Object.freeze([
+  Object.freeze({ label: "X-Auth-Key hex global key", line: `X-Auth-Key: ${CLOUDFLARE_GLOBAL_KEY}`, values: [CLOUDFLARE_GLOBAL_KEY], name: "X-Auth-Key" }),
+  Object.freeze({ label: "X-Auth-Key name-shaped", line: "X-Auth-Key: prod-key", values: ["prod-key"], name: "X-Auth-Key" }),
+  Object.freeze({ label: "X-Auth-Key hunter2", line: "X-Auth-Key: hunter2", values: ["hunter2"], name: "X-Auth-Key" }),
+  Object.freeze({ label: "X-Auth-Key alphabetic seven", line: "X-Auth-Key: prodkey", values: ["prodkey"], name: "X-Auth-Key" }),
+  Object.freeze({ label: "X-Auth-Email", line: "X-Auth-Email: qz7auditor.rk3@corp.test", values: ["qz7auditor.rk3"], name: "X-Auth-Email" }),
+  Object.freeze({ label: "Bearer 23-character token", line: "Authorization: Bearer Zk8qLm3nRt7vWx2yPa5cB9d", values: ["Zk8qLm3nRt7vWx2yPa5cB9d"], name: "Authorization" }),
+  Object.freeze({ label: "Bearer name-shaped", line: "Authorization: Bearer prod-token", values: ["prod-token"], name: "Authorization" }),
+  Object.freeze({ label: "Bearer hunter2", line: "Authorization: Bearer hunter2", values: ["hunter2"], name: "Authorization" }),
+  Object.freeze({ label: "Basic ikey:signature", line: `Authorization: Basic ${BASIC_CREDENTIAL}`, values: [BASIC_CREDENTIAL], name: "Authorization" }),
+  Object.freeze({
+    label: "SigV4 Authorization",
+    line: `Authorization: AWS4-HMAC-SHA256 Credential=${SIGV4_KEY_ID}/20260922/us-east-1/sts/aws4_request, SignedHeaders=host;x-amz-date, Signature=${SIGV4_SIGNATURE}`,
+    values: [SIGV4_KEY_ID, SIGV4_SIGNATURE],
+    name: "Authorization",
+    keep: ["us-east-1", "aws4_request", "SignedHeaders=host;x-amz-date"],
+  }),
+  Object.freeze({ label: "X-Amz-Security-Token", line: `X-Amz-Security-Token: ${SESSION_TOKEN}`, values: [SESSION_TOKEN], name: "X-Amz-Security-Token" }),
+  Object.freeze({ label: "X-CSRFToken", line: `X-CSRFToken: ${CSRF_TOKEN}`, values: [CSRF_TOKEN], name: "X-CSRFToken" }),
+  Object.freeze({ label: "AAP session cookie", line: `Cookie: sessionid=${SESSION_ID}; csrftoken=${CSRF_COOKIE}`, values: [SESSION_ID, CSRF_COOKIE], name: "Cookie" }),
+  Object.freeze({ label: "cookie with a dotted credential pair", line: "Cookie: theme=dark; my.sid=hunter2", values: ["hunter2"], name: "Cookie" }),
+  Object.freeze({ label: "cookie with a later pair carrying no credential word", line: "Cookie: theme=dark; my.tracker=hunter2", values: ["hunter2"], name: "Cookie" }),
+  Object.freeze({ label: "cookie with a dotted later pair carrying no credential word", line: "Cookie: theme=dark; ASP.NET_Tracker=hunter2", values: ["hunter2"], name: "Cookie" }),
+  Object.freeze({ label: "cookie with a later short credential value", line: "Cookie: theme=dark; ASP.NET_SessionId=abc", values: ["ASP.NET_SessionId=abc"], name: "Cookie" }),
+  Object.freeze({ label: "Set-Cookie with a dotted short session value", line: "Set-Cookie: .AspNetCore.Session=v; HttpOnly", values: [".AspNetCore.Session=v"], name: "Set-Cookie" }),
+  Object.freeze({ label: "Set-Cookie with attributes", line: "Set-Cookie: session=Vb7Nq2Xz9Lk4Rm6Tp1Wc8; Path=/; HttpOnly; Secure", values: ["Vb7Nq2Xz9Lk4Rm6Tp1Wc8"], name: "Set-Cookie" }),
+]);
+
+const FOLLOWING_HEADER = "Content-Type: application/json";
+
+/**
+ * The forms one header line takes after one escape: at the start of the text, after prose, as the tail of a JSON
+ * string member, followed by the next header on the same line after `;`, and followed by the next header after an
+ * escaped line break. Each row is [label, text, expected output], the expectation built from the scrub of the
+ * plain line so the rule is "an escape changes nothing"; the JSON member form is judged by windows and by the
+ * string's close surviving instead.
+ */
+export function escapedHeaderForms(line, escape, plainOutput) {
+  const lineBreak = escapedLineBreakFor(escape);
+  return [
+    ["leading", `${escape}${line}`, `${escape}${plainOutput}`],
+    ["after prose", `request failed${escape}${line}`, `request failed${escape}${plainOutput}`],
+    ["JSON member", `{"error":"request failed${escape}${line}"}`, undefined],
+    ["followed by a header after ;", `${escape}${line}; ${FOLLOWING_HEADER}`, `${escape}${plainOutput}; ${FOLLOWING_HEADER}`],
+    ["followed by a header after an escaped line break", `${escape}${line}${lineBreak}${FOLLOWING_HEADER}`, `${escape}${plainOutput}${lineBreak}${FOLLOWING_HEADER}`],
+  ];
+}
+
+/**
+ * Asserts the escape rule for one redactErrorText over every header line, escape, and form: the plain line's
+ * values are removed (positive control) with its must-keep text kept, and after any escape the output is the
+ * escape plus the plain output (the header name kept, the following header kept whole), no 6-to-24 window of
+ * any planted value survives, and a second pass changes nothing. Returns the number of escaped texts judged.
+ */
+export function assertEscapedHeaderCarriers(assert, redact, { lines = ESCAPED_HEADER_LINES, escapes = JSON_ESCAPES } = {}) {
+  let judged = 0;
+  for (const { label, line, values, name, keep = [] } of lines) {
+    const plainOutput = redact(line);
+    assert.notEqual(plainOutput, line, `${label}: positive control, the plain line is scrubbed`);
+    assertNoCanaryWindows(assert, plainOutput, values, `${label}: plain line`);
+    assert.ok(plainOutput.startsWith(`${name}:`), `${label}: the plain line keeps its header name: ${plainOutput}`);
+    for (const text of keep) assert.ok(plainOutput.includes(text), `${label}: the plain line keeps ${text}: ${plainOutput}`);
+    for (const escape of escapes) {
+      for (const [form, text, expected] of escapedHeaderForms(line, escape, plainOutput)) {
+        const output = redact(text);
+        judged += 1;
+        assertNoCanaryWindows(assert, output, values, `${label} after ${JSON.stringify(escape)}, ${form}: ${text}`);
+        if (expected === undefined) {
+          assert.ok(output.includes(`${escape}${name}:`), `${label} after ${JSON.stringify(escape)}, ${form}: the header name survives: ${output}`);
+          assert.ok(output.endsWith('"}'), `${label} after ${JSON.stringify(escape)}, ${form}: the JSON string's close survives: ${output}`);
+          for (const kept of keep) assert.ok(output.includes(kept), `${label} after ${JSON.stringify(escape)}, ${form}: keeps ${kept}: ${output}`);
+        } else {
+          assert.equal(output, expected, `${label} after ${JSON.stringify(escape)}, ${form}: the escape changes nothing: ${text}`);
+        }
+        assert.equal(redact(output), output, `${label} after ${JSON.stringify(escape)}, ${form}: a second pass changes nothing`);
+      }
+    }
+  }
+  return judged;
+}
+
+/**
  * Round 4 open ruling on server-assigned 32-hex ids, resolved as: masked in sentences, kept whole in structured
  * fields. A GuardDuty detector id and a Cloudflare account, zone, or token id are 32 hex characters, a hex
  * digest to the scrub, so error text removes them bare and they travel whole in the structured fields
