@@ -716,6 +716,27 @@ test("DatadogApiClient follows meta.page.after cursors and page/page_size monito
   assert.equal(connectionCalls[0].searchParams.has("page[limit]"), false);
 });
 
+test("foreign-origin next link: a URL-shaped Datadog page cursor is an opaque value appended to the configured base, so no request leaves for the origin it names", async () => {
+  const FOREIGN = "https://collector.attacker.example/api/v2/audit/events?page[cursor]=stolen";
+  const seen = [];
+  const fetchImpl = async (input) => {
+    const url = new URL(typeof input === "string" ? input : input.toString());
+    seen.push(url);
+    if (url.pathname !== "/api/v2/audit/events") throw new Error(`unexpected ${url.pathname}`);
+    return url.searchParams.get("page[cursor]")
+      ? jsonResponse({ data: [{ id: "e2", attributes: {} }], meta: { page: {} } })
+      : jsonResponse({ data: [{ id: "e1", attributes: {} }], meta: { page: { after: FOREIGN } } });
+  };
+
+  const client = new DatadogApiClient(sampleConfig(), { fetchImpl });
+  const events = await client.listAuditEvents({ from: "now-1d", to: "now", query: "@action:login", limit: 10 });
+
+  assert.deepEqual(events.items.map((event) => event.id), ["e1", "e2"], "paging continued through the planted cursor");
+  assert.equal(seen.length, 2);
+  assert.ok(seen.every((url) => url.origin === "https://api.datadoghq.com"), "every request, including the one that carried the planted cursor, went to the configured origin");
+  assert.equal(seen[1].searchParams.get("page[cursor]"), FOREIGN, "the cursor travels only as a query parameter value on the configured base");
+});
+
 test("DatadogApiClient retries 429 honoring X-RateLimit-Reset and retries 5xx with backoff", async () => {
   const sleeps = [];
   let attempts = 0;

@@ -596,6 +596,27 @@ test("Knowbe4ApiClient sends bearer auth, paginates with page and per_page, and 
   assert.equal(client.getRequestCount(), 3);
 });
 
+test("foreign-origin next link: KnowBe4 paging is a client-side page counter on the configured base, so a payload carrying a URL-shaped field cannot redirect the next request", async () => {
+  const FOREIGN = "https://collector.attacker.example/v1/users?page=2";
+  const seen = [];
+  const fetchImpl = async (input) => {
+    const url = new URL(typeof input === "string" ? input : input.toString());
+    seen.push(url);
+    // The Reporting API returns bare arrays; a next link in any shape the server might add is not part of the contract.
+    return url.searchParams.get("page") === "1"
+      ? jsonResponse([{ id: 1, next: FOREIGN, links: { next: FOREIGN } }, { id: 2 }])
+      : jsonResponse([{ id: 3 }]);
+  };
+  const client = new Knowbe4ApiClient(sampleConfig({ apiToken: "reporting-token" }), { fetchImpl, minRequestIntervalMs: 0 });
+
+  const users = await client.list("/v1/users", { status: "active" }, { limit: 10, pageSize: 2 });
+
+  assert.deepEqual(users.items.map((item) => item.id), [1, 2, 3]);
+  assert.equal(seen.length, 2);
+  assert.ok(seen.every((url) => url.origin === "https://us.api.knowbe4.com" && url.pathname === "/v1/users"), "every page request went to the configured origin");
+  assert.deepEqual(seen.map((url) => url.searchParams.get("page")), ["1", "2"], "the next page is the client's own counter, not a server value");
+});
+
 test("Knowbe4ApiClient stops retrying after max retries and redacts tokens in errors", async () => {
   const always429 = async () => jsonResponse({ message: "slow down" }, { status: 429, statusText: "Too Many Requests" });
   const limited = new Knowbe4ApiClient(sampleConfig(), { fetchImpl: always429, sleepImpl: async () => {}, maxRetries: 1, minRequestIntervalMs: 0 });

@@ -136,6 +136,11 @@ export interface LaunchdarklyCollection {
   httpStatus?: number | null;
   /** The request the listing made (for a failed listing, the one that failed), as "GET /path[?query]". */
   endpoint?: string;
+  /**
+   * Why paging stopped before the server's last page when the cause was not the item cap: today only a server-supplied
+   * next link that the client refused to follow. Absent for a listing that drained or stopped at its cap.
+   */
+  truncationReason?: string;
 }
 
 /** A single record read (caller identity) together with how the read ended. */
@@ -165,6 +170,8 @@ export interface LaunchdarklyTruncationNote {
   seen: number;
   total: number | null;
   scope?: string;
+  /** Present when the listing stopped for a reason other than its cap (see LaunchdarklyCollection.truncationReason). */
+  reason?: string;
 }
 
 /** A secondary inventory that a finding reads but that could not be collected (403, 401, 5xx, transport). */
@@ -682,6 +689,21 @@ export class LaunchdarklyApiError extends Error {
     this.name = "LaunchdarklyApiError";
     this.status = status;
     this.endpoint = endpoint;
+  }
+}
+
+/**
+ * The whole message for a server-supplied link that would carry the token to another origin. Fixed text: the refused
+ * host, path, and query never enter the message, so a hostile link cannot smuggle content into an error string.
+ */
+export const LAUNCHDARKLY_FOREIGN_ORIGIN_MESSAGE =
+  "LaunchDarkly next link points to an origin other than the configured base URL, so it was not followed and no request was sent";
+
+/** Thrown before a request is built when a server-supplied link resolves outside the configured base origin. */
+export class LaunchdarklyForeignOriginError extends Error {
+  constructor() {
+    super(LAUNCHDARKLY_FOREIGN_ORIGIN_MESSAGE);
+    this.name = "LaunchdarklyForeignOriginError";
   }
 }
 
@@ -1381,10 +1403,20 @@ export class LaunchdarklyApiClient {
     return this.config;
   }
 
+  /**
+   * Builds every request URL the client sends. A server-supplied link (an absolute URL, a protocol-relative `//host`
+   * path, or a scheme change) is resolved against the configured base and refused with fixed text unless its origin
+   * equals the base origin, so the token never travels to a host the server chose.
+   */
   private buildUrl(pathOrUrl: string, query: JsonRecord = {}): string {
+    const base = new URL(`${this.config.baseUrl}/`);
     const url = pathOrUrl.startsWith("http://") || pathOrUrl.startsWith("https://")
       ? new URL(pathOrUrl)
-      : new URL(pathOrUrl.startsWith("/") ? pathOrUrl : `/${pathOrUrl}`, `${this.config.baseUrl}/`);
+      : new URL(pathOrUrl.startsWith("/") ? pathOrUrl : `/${pathOrUrl}`, base);
+    if (url.origin !== base.origin) throw new LaunchdarklyForeignOriginError();
+    // user:password@ in a link would otherwise ride along into the request and its label.
+    url.username = "";
+    url.password = "";
     for (const [key, value] of Object.entries(query)) {
       if (value === undefined || value === null || value === "") continue;
       url.searchParams.set(key, String(value));
@@ -1506,6 +1538,7 @@ export class LaunchdarklyApiClient {
     let offset = 0;
     let total: number | undefined;
     let remaining = false;
+    let truncationReason: string | undefined;
     let nextUrl: string | undefined = this.buildUrl(path, { ...query, limit: Math.min(pageSize, limit), offset });
     const endpoint = requestLabel(nextUrl);
     const visited = new Set<string>([nextUrl]);
@@ -1533,7 +1566,15 @@ export class LaunchdarklyApiClient {
       offset += pageItems.length;
 
       if (nextHref) {
-        nextUrl = this.buildUrl(nextHref);
+        try {
+          nextUrl = this.buildUrl(nextHref);
+        } catch (error) {
+          if (!(error instanceof LaunchdarklyForeignOriginError)) throw error;
+          // The link is refused before any request is built: the pages already read stay, the rest is reported unseen.
+          remaining = true;
+          truncationReason = error.message;
+          break;
+        }
       } else if (total !== undefined && offset < total && pageItems.length >= Math.min(pageSize, limit)) {
         nextUrl = this.buildUrl(path, { ...query, limit: Math.min(pageSize, limit - items.length), offset });
       } else {
@@ -1549,10 +1590,12 @@ export class LaunchdarklyApiClient {
 
     return {
       items,
-      truncated: total !== undefined ? total > items.length : remaining,
+      // A refused next link leaves the remainder unread even when the server total matches the items seen so far.
+      truncated: truncationReason !== undefined || (total !== undefined ? total > items.length : remaining),
       seen: items.length,
       total,
       endpoint,
+      ...(truncationReason !== undefined ? { truncationReason } : {}),
     };
   }
 
@@ -1758,14 +1801,16 @@ function toCollection(value: unknown): LaunchdarklyCollection {
   const error = asString(record?.error);
   const endpoint = asString(record?.endpoint);
   const httpStatus = record?.httpStatus === null ? null : asNumber(record?.httpStatus);
+  const truncationReason = asString(record?.truncationReason);
   return {
     items,
-    truncated: asBoolean(record?.truncated) === true || (total !== undefined && total > items.length),
+    truncated: asBoolean(record?.truncated) === true || truncationReason !== undefined || (total !== undefined && total > items.length),
     seen: items.length,
     total,
     ...(error ? { error } : {}),
     ...(endpoint ? { endpoint } : {}),
     ...(error && httpStatus !== undefined ? { httpStatus } : {}),
+    ...(truncationReason ? { truncationReason } : {}),
   };
 }
 
@@ -2035,13 +2080,15 @@ function truncationNote(
     seen: result.seen,
     total: result.total ?? null,
     ...(scope ? { scope } : {}),
+    ...(result.truncationReason ? { reason: result.truncationReason } : {}),
   }];
 }
 
 function truncationCaveat(notes: LaunchdarklyTruncationNote[]): string {
   const parts = notes.map((note) =>
-    `${note.collection}${note.scope ? ` for ${note.scope}` : ""} (${note.seen} of ${note.total ?? "an unknown total"} collected)`);
-  const options = uniqueStrings(notes.map((note) => note.option).filter((option): option is string => Boolean(option)));
+    `${note.collection}${note.scope ? ` for ${note.scope}` : ""} (${note.seen} of ${note.total ?? "an unknown total"} collected${note.reason ? `; ${note.reason}` : ""})`);
+  // A listing that stopped for a reason other than its cap is not fixed by raising the cap, so its option is not offered.
+  const options = uniqueStrings(notes.filter((note) => !note.reason).map((note) => note.option).filter((option): option is string => Boolean(option)));
   const remedy = options.length > 0
     ? `raise ${options.join(" and ")} and rerun for a complete evaluation`
     : "review the uncollected items manually";
@@ -2127,6 +2174,7 @@ function collectionSnapshot(result: LaunchdarklyCollection, items: unknown[] = r
     collected: true,
     endpoint: result.endpoint ?? request,
     truncated: result.truncated,
+    ...(result.truncationReason ? { truncation_reason: result.truncationReason } : {}),
     seen: result.seen,
     total: result.total ?? null,
     items,
@@ -4413,7 +4461,7 @@ function buildQuickReference(): string {
     "# LaunchDarkly Audit Bundle Quick Reference",
     "",
     "- `core_data/` contains LaunchDarkly REST API v2 snapshots: credential-shaped keys (SDK, mobile, relay, and API keys, webhook and integration secrets) are written as [REDACTED], destination URLs are reduced to scheme plus host, and flags are projected to the fields the verdicts read.",
-    "- A listing that was read carries `collected: true`, the request it made as `endpoint`, `truncated`, `seen`, `total`, and `items` (an empty inventory stays `items: []`). A listing that was denied, errored, or timed out is a marker object, never an empty array: `collected: false`, the HTTP `status` observed (or `error`), the `endpoint` that failed, the scrubbed `error`, and `null` for every flag and count. A listing that was never requested because its parent inventory was unreadable is a `status: \"not-collected\"` marker. Listings collected per team, environment, or integration are arrays with one entry per scope, collapsing to a single marker when no scope could be read.",
+    "- A listing that was read carries `collected: true`, the request it made as `endpoint`, `truncated`, `seen`, `total`, and `items` (an empty inventory stays `items: []`); `truncation_reason` is present only when paging stopped for a reason other than the cap, such as a server-supplied `_links.next.href` whose origin differed from the configured base URL (the client refuses such a link with fixed text and sends no request to it). A listing that was denied, errored, or timed out is a marker object, never an empty array: `collected: false`, the HTTP `status` observed (or `error`), the `endpoint` that failed, the scrubbed `error`, and `null` for every flag and count. A listing that was never requested because its parent inventory was unreadable is a `status: \"not-collected\"` marker. Listings collected per team, environment, or integration are arrays with one entry per scope, collapsing to a single marker when no scope could be read.",
     "- `core_data/collection_status.json` records, per listing (`inventories[]`), whether the read completed, the request and HTTP status of a failed read, how the read ended (complete or truncated at a cap), how many records were loaded, and the server total when the API exposes one; every flag and count is `null` for a read that did not complete, and `totals` counts those reads as unknown rather than as complete or untruncated.",
     "- Error strings in every file are scrubbed before they are recorded (LaunchDarkly key shapes, authorization and cookie values, credential-shaped key/value pairs, JWTs, and URL userinfo and query strings anywhere in the text); non-JSON error bodies are described by status, content type, and length, never echoed.",
     "- Finding evidence, assessment summaries, and analysis snapshots render `null` (never 0, [], or \"none\") for any count, list, or flag derived from an inventory that was not read; lists of named members, tokens, roles, environments, or flags are populated only from inventories that were actually read, and an empty list is asserted only from complete reads.",

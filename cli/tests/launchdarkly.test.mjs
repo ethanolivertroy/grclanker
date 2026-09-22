@@ -17,9 +17,11 @@ import { join } from "node:path";
 
 import {
   LAUNCHDARKLY_CONTROL_CATALOG,
+  LAUNCHDARKLY_FOREIGN_ORIGIN_MESSAGE,
   LaunchdarklyApiClient,
   LaunchdarklyApiError,
   LaunchdarklyConfigFileError,
+  LaunchdarklyForeignOriginError,
   assessLaunchdarklyAccessControl,
   assessLaunchdarklyEnvironmentGovernance,
   assessLaunchdarklyFlagHygiene,
@@ -648,6 +650,100 @@ test("verdict rule 10: LaunchdarklyApiClient.list reports truncation on an empty
   });
   const complete = await drained.list("/api/v2/members", {}, { limit: 10, pageSize: 2 });
   assert.equal(complete.truncated, false, "a bare empty page drains the listing");
+});
+
+// Every shape a server could use to point _links.next.href at another origin. The path and query are the ones the real
+// API would send, so only the authority differs from a legitimate link.
+const FOREIGN_NEXT_LINKS = [
+  ["absolute foreign host", "https://collector.attacker.example/api/v2/members?limit=2&offset=2"],
+  ["protocol-relative foreign host", "//collector.attacker.example/api/v2/members?limit=2&offset=2"],
+  ["scheme downgrade on the configured host", "http://app.launchdarkly.com/api/v2/members?limit=2&offset=2"],
+  ["configured host on another port", "https://app.launchdarkly.com:8443/api/v2/members?limit=2&offset=2"],
+  ["lookalike subdomain", "https://app.launchdarkly.com.attacker.example/api/v2/members?limit=2&offset=2"],
+  ["configured host as userinfo before a foreign host", "https://app.launchdarkly.com@collector.attacker.example/api/v2/members?limit=2&offset=2"],
+];
+
+test("foreign-origin next link: LaunchdarklyApiClient.list refuses a server-supplied _links.next.href outside the configured origin, sends no request to it, and reports the listing truncated with fixed text", async () => {
+  for (const [label, href] of FOREIGN_NEXT_LINKS) {
+    const requests = [];
+    const fetchImpl = async (input, init = {}) => {
+      const url = new URL(typeof input === "string" ? input : input.toString());
+      requests.push({ origin: url.origin, href: url.href, auth: headerValue(init.headers, "authorization") });
+      return jsonResponse({ items: [{ _id: "a" }, { _id: "b" }], totalCount: 2, _links: { next: { href } } });
+    };
+    const client = new LaunchdarklyApiClient(sampleConfig(), { fetchImpl });
+    const members = await client.list("/api/v2/members", {}, { limit: 10, pageSize: 2 });
+
+    assert.equal(requests.length, 1, `${label}: only the first page request leaves; the refused link is never fetched`);
+    assert.equal(requests[0].origin, "https://app.launchdarkly.com", `${label}: the one request went to the configured origin`);
+    assert.equal(requests[0].auth, TEST_TOKEN, `${label}: the token travelled only to the configured origin`);
+    assert.ok(!requests[0].href.includes("attacker") && !requests[0].href.includes(":8443"), `${label}: no request names the foreign authority`);
+    assert.deepEqual(members.items.map((item) => item._id), ["a", "b"], `${label}: the pages already read are kept`);
+    assert.equal(members.truncated, true, `${label}: the refused remainder is unread even though the server total matched the items seen, so the listing is truncated`);
+    assert.equal(members.truncationReason, LAUNCHDARKLY_FOREIGN_ORIGIN_MESSAGE, `${label}: the reason is the fixed client text`);
+    assert.doesNotMatch(members.truncationReason, /attacker|8443|http:\/\/|@/, `${label}: nothing from the refused link enters the reason`);
+    assert.equal(members.endpoint, "GET /api/v2/members", `${label}: the endpoint names the request that was made`);
+  }
+
+  // The direct get() path is gated by the same check, so no caller can route a server-supplied URL around it.
+  const direct = new LaunchdarklyApiClient(sampleConfig(), {
+    fetchImpl: async () => { throw new Error("no request may leave for a foreign origin"); },
+  });
+  await assert.rejects(direct.get("https://collector.attacker.example/api/v2/members"), (error) => {
+    assert.ok(error instanceof LaunchdarklyForeignOriginError, "the client throws its fixed-text error class");
+    assert.equal(error.message, LAUNCHDARKLY_FOREIGN_ORIGIN_MESSAGE);
+    return true;
+  });
+});
+
+test("foreign-origin next link: same-origin next links are still followed, and userinfo in a link is dropped before the request", async () => {
+  const SAME_ORIGIN_LINKS = [
+    ["relative path", "/api/v2/members?limit=1&offset=1"],
+    ["absolute same-origin URL", "https://app.launchdarkly.com/api/v2/members?limit=1&offset=1"],
+    ["absolute same-origin URL with userinfo", "https://audit:planted-basic-credential@app.launchdarkly.com/api/v2/members?limit=1&offset=1"],
+  ];
+  for (const [label, href] of SAME_ORIGIN_LINKS) {
+    const requests = [];
+    const fetchImpl = async (input) => {
+      const url = new URL(typeof input === "string" ? input : input.toString());
+      requests.push(url.href);
+      if (url.searchParams.get("offset") === "1") return jsonResponse({ items: [{ _id: "b" }], totalCount: 2 });
+      return jsonResponse({ items: [{ _id: "a" }], totalCount: 2, _links: { next: { href } } });
+    };
+    const client = new LaunchdarklyApiClient(sampleConfig(), { fetchImpl });
+    const members = await client.list("/api/v2/members", {}, { limit: 10, pageSize: 1 });
+
+    assert.deepEqual(members.items.map((item) => item._id), ["a", "b"], `${label}: the next page is read`);
+    assert.equal(members.truncated, false, `${label}: the listing drained`);
+    assert.equal(members.truncationReason, undefined, `${label}: no reason is recorded for a followed link`);
+    assert.equal(requests.length, 2, `${label}: both pages were requested`);
+    assert.ok(requests.every((request) => new URL(request).origin === "https://app.launchdarkly.com"), `${label}: every request stayed on the configured origin`);
+    assert.ok(requests.every((request) => !request.includes("planted-basic-credential") && !request.includes("@")), `${label}: userinfo never rides along into a request`);
+  }
+});
+
+test("foreign-origin next link: a refused link is recorded as a truncation with its reason in findings, summaries, and the core_data snapshot, and the cap remedy is not offered", async () => {
+  const base = healthyClient();
+  const result = await assessLaunchdarklyIdentity(healthyClient({
+    listMembers: async () => {
+      const items = await base.listMembers();
+      return { items, truncated: true, seen: items.length, total: items.length, endpoint: "GET /api/v2/members", truncationReason: LAUNCHDARKLY_FOREIGN_ORIGIN_MESSAGE };
+    },
+  }), { now: NOW });
+
+  for (const id of ["LD-02", "LD-03", "LD-06", "LD-24"]) {
+    assert.equal(findingStatus(result, id), "warn", `${id} must not pass on a listing whose remainder was refused`);
+    assert.match(finding(result, id).summary, /Truncated listing: members \(\d+ of \d+ collected; LaunchDarkly next link points to an origin other than the configured base URL/, `${id}: the caveat carries the reason`);
+    assert.doesNotMatch(finding(result, id).summary, /raise member_limit/, `${id}: raising the cap cannot fix a refused link, so it is not offered`);
+    assert.match(finding(result, id).summary, /review the uncollected items manually/);
+    const [note] = finding(result, id).evidence.truncated_collections;
+    assert.equal(note.collection, "members");
+    assert.equal(note.reason, LAUNCHDARKLY_FOREIGN_ORIGIN_MESSAGE, `${id}: the note names the reason`);
+  }
+  assert.equal(result.summary.truncated_collections, 1);
+  assert.equal(result.snapshots.members.truncated, true);
+  assert.equal(result.snapshots.members.truncation_reason, LAUNCHDARKLY_FOREIGN_ORIGIN_MESSAGE, "the core_data snapshot records why paging stopped");
+  assert.equal(result.snapshots.members.collected, true, "the pages that were read stay readable data, not a marker");
 });
 
 test("verdict rule 9: non-JSON error bodies are described, never echoed, into LaunchDarkly error text", async () => {

@@ -816,6 +816,27 @@ test("ElasticApiClient adds kbn-xsrf and space-aware paths for Kibana requests",
   assert.equal(withoutKibana.hasKibana(), false);
 });
 
+test("foreign-origin next link: a URL-shaped Elastic search_after value travels only inside the request body to the configured origin, so no request leaves for the origin it names", async () => {
+  const FOREIGN = "https://collector.attacker.example/_security/_query/api_key";
+  const seen = [];
+  const fetchImpl = createRouter({
+    "POST /_security/_query/api_key": (_url, init) => {
+      const body = JSON.parse(init.body);
+      return body.search_after
+        ? { total: 3, count: 1, api_keys: [{ id: "k3", _sort: [3, "k3"] }] }
+        : { total: 3, count: 2, api_keys: [{ id: "k1", _sort: [1, "k1"] }, { id: "k2", _sort: [FOREIGN, "k2"] }] };
+    },
+  }, seen);
+  const client = new ElasticApiClient(sampleConfig(), { fetchImpl });
+
+  const keys = await client.listApiKeys(10, 2);
+
+  assert.deepEqual(keys.items.map((key) => key.id), ["k1", "k2", "k3"], "paging continued through the planted cursor");
+  assert.equal(seen.length, 2);
+  assert.ok(seen.every((request) => request.host === "es.example.com:9200" && request.pathname === "/_security/_query/api_key"), "every request, including the one that carried the planted cursor, went to the configured Elasticsearch origin");
+  assert.deepEqual(seen[1].body.search_after, [FOREIGN, "k2"], "the cursor travels only as a value inside the POST body");
+});
+
 test("ElasticApiClient paginates API keys with search_after, Watcher with from/size, and Kibana with page parameters", async () => {
   const apiKeys = Array.from({ length: 150 }, (_, index) => ({ id: `k${index + 1}`, _sort: [index + 1, `k${index + 1}`] }));
   const watches = Array.from({ length: 150 }, (_, index) => ({ _id: `w${index + 1}` }));

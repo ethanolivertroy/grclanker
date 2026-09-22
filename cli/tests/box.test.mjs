@@ -664,6 +664,46 @@ test("BoxApiClient exchanges Client Credentials Grant and paginates users with m
   assert.equal(seen.filter((call) => call.pathname === "/oauth2/token").length, 1, "token should be cached across calls");
 });
 
+test("foreign-origin next link: a URL-shaped Box next_marker or next_stream_position is an opaque value appended to the configured base, so no request leaves for the origin it names", async () => {
+  const FOREIGN = "https://collector.attacker.example/2.0/users?marker=stolen";
+  const requests = [];
+  const fetchImpl = async (input) => {
+    const url = new URL(typeof input === "string" ? input : input.toString());
+    requests.push({ origin: url.origin, pathname: url.pathname, params: url.searchParams });
+    if (url.pathname === "/oauth2/token") return jsonResponse({ access_token: "ccg-access-token", expires_in: 4103 });
+    if (url.pathname === "/2.0/users") {
+      return url.searchParams.get("marker")
+        ? jsonResponse({ entries: [{ id: "user-2", type: "user" }], next_marker: null })
+        : jsonResponse({ entries: [{ id: "user-1", type: "user" }], next_marker: FOREIGN, limit: 1 });
+    }
+    if (url.pathname === "/2.0/events") {
+      return url.searchParams.get("stream_position")
+        ? jsonResponse({ entries: [], next_stream_position: url.searchParams.get("stream_position"), chunk_size: 0 })
+        : jsonResponse({ entries: [{ event_id: "e-1", event_type: "LOGIN" }], next_stream_position: FOREIGN, chunk_size: 1 });
+    }
+    return jsonResponse({}, { status: 404 });
+  };
+  const client = new BoxApiClient(resolveBoxConfiguration({
+    client_id: "ccg-client",
+    client_secret: "ccg-secret",
+    enterprise_id: "123456",
+  }, {}, { homeDir: createTempBase("grclanker-box-next-link-") }), { fetchImpl, now: () => NOW });
+
+  const users = await client.listUsers(10);
+  assert.deepEqual(users.items.map((entry) => entry.id), ["user-1", "user-2"], "paging continued through the planted marker");
+  const events = await client.listEnterpriseEvents({ eventTypes: ["LOGIN"], createdAfter: NOW, limit: 5 });
+  assert.deepEqual(events.items.map((entry) => entry.event_id), ["e-1"]);
+
+  assert.ok(requests.length >= 5, "token, two user pages, and two event pages were requested");
+  assert.ok(requests.every((request) => request.origin === "https://api.box.com"), "every request, including the ones that carried the planted values, went to the configured origin");
+  const userCalls = requests.filter((request) => request.pathname === "/2.0/users");
+  assert.equal(userCalls.length, 2);
+  assert.equal(userCalls[1].params.get("marker"), FOREIGN, "the marker travels only as a query parameter value on the configured base");
+  const eventCalls = requests.filter((request) => request.pathname === "/2.0/events");
+  assert.equal(eventCalls.length, 2);
+  assert.equal(eventCalls[1].params.get("stream_position"), FOREIGN, "the stream position travels only as a query parameter value on the configured base");
+});
+
 test("BoxApiClient reports list truncation only when a marker, offset, or stream position remains past the cap", async () => {
   const fetchImpl = async (input) => {
     const url = new URL(typeof input === "string" ? input : input.toString());
