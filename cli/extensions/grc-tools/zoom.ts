@@ -863,6 +863,7 @@ export class ZoomApiClient {
   private readonly config: ZoomResolvedConfig;
   private readonly fetchImpl: FetchImpl;
   private readonly sleep: (ms: number) => Promise<void>;
+  private readonly now: () => number;
   private accessToken?: string;
   private accessTokenExpiresAt = 0;
   private accessTokenPromise?: Promise<string>;
@@ -872,11 +873,14 @@ export class ZoomApiClient {
     options: {
       fetchImpl?: FetchImpl;
       sleep?: (ms: number) => Promise<void>;
+      /** Epoch milliseconds source for Retry-After dates and token expiry; defaults to Date.now. */
+      now?: () => number;
     } = {},
   ) {
     this.config = config;
     this.fetchImpl = options.fetchImpl ?? fetch;
     this.sleep = options.sleep ?? ((ms) => new Promise((resolvePromise) => setTimeout(resolvePromise, ms)));
+    this.now = options.now ?? (() => Date.now());
     if (config.token) {
       this.accessToken = config.token;
       this.accessTokenExpiresAt = Number.MAX_SAFE_INTEGER;
@@ -911,7 +915,7 @@ export class ZoomApiClient {
     const seconds = asNumber(header);
     if (seconds !== undefined) return Math.min(Math.max(seconds, 1) * 1000, MAX_RETRY_AFTER_MS);
     const at = header ? Date.parse(header) : Number.NaN;
-    if (Number.isFinite(at)) return Math.min(Math.max(at - Date.now(), 1000), MAX_RETRY_AFTER_MS);
+    if (Number.isFinite(at)) return Math.min(Math.max(at - this.now(), 1000), MAX_RETRY_AFTER_MS);
     return 1000;
   }
 
@@ -1011,12 +1015,12 @@ export class ZoomApiClient {
 
     const expiresIn = asNumber(payload.expires_in) ?? 3600;
     this.accessToken = accessToken;
-    this.accessTokenExpiresAt = Date.now() + Math.max((expiresIn - 60) * 1000, 60_000);
+    this.accessTokenExpiresAt = this.now() + Math.max((expiresIn - 60) * 1000, 60_000);
     return accessToken;
   }
 
   private async getAccessToken(): Promise<string> {
-    if (this.accessToken && Date.now() < this.accessTokenExpiresAt) {
+    if (this.accessToken && this.now() < this.accessTokenExpiresAt) {
       return this.accessToken;
     }
     if (!this.accessTokenPromise) {
@@ -2657,8 +2661,10 @@ export function assessZoomMeetingSecurityFromSnapshot(
   };
 }
 
-export async function checkZoomAccess(client: ZoomClientLike): Promise<ZoomAccessCheckResult> {
-  const snapshot = await collectZoomSnapshot(client, { groupLimit: 1 });
+export type ZoomAccessCheckOptions = Pick<ZoomCollectionOptions, "now">;
+
+export async function checkZoomAccess(client: ZoomClientLike, options: ZoomAccessCheckOptions = {}): Promise<ZoomAccessCheckResult> {
+  const snapshot = await collectZoomSnapshot(client, { groupLimit: 1, now: options.now });
   const config = client.getResolvedConfig();
   const currentUser = asObject(snapshot.currentUser.data) ?? {};
 
@@ -2954,7 +2960,7 @@ export async function exportZoomAuditBundle(
   await write("README.md", `${buildQuickReference({ outputDir, zipPath }, findings, errors)}\n`);
   await write("QUICK_REFERENCE.md", `${buildQuickReference({ outputDir, zipPath }, findings, errors)}\n`);
   await write("metadata.json", serializeJson({
-    generated_at: new Date().toISOString(),
+    generated_at: (options.now ?? new Date()).toISOString(),
     collected_at: snapshot.collectedAt,
     account_id: config.accountId,
     base_url: config.baseUrl,
@@ -3071,7 +3077,7 @@ async function checkZoomAccessFromSnapshot(snapshot: ZoomSnapshot, config: ZoomR
     listTrustedDomains: async () => unwrap(snapshot.trustedDomains),
     getPhoneAccountSettings: async () => unwrap(snapshot.phoneSettings),
   };
-  return checkZoomAccess(stub);
+  return checkZoomAccess(stub, { now: new Date(snapshot.collectedAt) });
 }
 
 function unwrap<T>(surface: ZoomSurface<T>): T {
