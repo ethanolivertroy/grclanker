@@ -487,9 +487,11 @@ function scrubConfiguredSecrets(text: string): string {
 }
 
 // The words that name a credential. A key ends in one of them; isCredentialNamedKey below decides how the word may
-// be attached to the rest of the key.
+// be attached to the rest of the key. `skey` and `ikey` are Duo's secret key and integration key (DUO_SKEY, DUO_IKEY),
+// both configured secrets of that integration; there is no bare `key`, so KmsKeyId, ssh_key_name, and the like stay
+// identifiers.
 const ERROR_CREDENTIAL_WORDS =
-  "token|secret|passw(?:or)?d|pwd|api[_-]?key|apikey|auth[_-]?key|auth[_-]?email|session(?:[_-]?id)?|sid|cookie|csrftoken|authorization|auth|signature|sig|nonce|credentials?|access[_-]?key|private[_-]?key|skey";
+  "token|secret|passw(?:or)?d|pwd|api[_-]?key|apikey|auth[_-]?key|auth[_-]?email|session(?:[_-]?id)?|sid|cookie|csrftoken|authorization|auth|signature|sig|nonce|credentials?|access[_-]?key|private[_-]?key|skey|ikey";
 const ERROR_CREDENTIAL_KEY_PATTERN = `[A-Za-z0-9_.-]*(?:${ERROR_CREDENTIAL_WORDS})`;
 /**
  * key=value and key: value pairs whose key ends in a credential word (a key after "/" is a path segment, not a

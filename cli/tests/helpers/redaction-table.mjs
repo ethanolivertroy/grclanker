@@ -75,7 +75,8 @@ export function assertMustRedactRowsBesideMustKeep(assert, redact, groups, canar
  * Reviewer D round 5 baseline: a value under a credential-named key is a carrier and is removed whatever its
  * shape and length, unquoted as well as quoted. The keys are the credential env names and config keys the five
  * integrations read (the AWS pair through the SDK chain) beside the generic keys reviewer D probed and one
- * lowerCamelCase, one header, and one dotted compound.
+ * lowerCamelCase, one header, and one dotted compound. DUO_IKEY and ikey are the keys the word list had no word
+ * for until reviewer D's round 5 baseline (the pattern named skey but not ikey).
  */
 export const CREDENTIAL_NAMED_KEYS = Object.freeze([
   "password",
@@ -92,7 +93,9 @@ export const CREDENTIAL_NAMED_KEYS = Object.freeze([
   "CLOUDFLARE_API_TOKEN",
   "CLOUDFLARE_API_KEY",
   "DUO_SKEY",
+  "DUO_IKEY",
   "skey",
+  "ikey",
   "AAP_TOKEN",
   "accessToken",
   "x-api-key",

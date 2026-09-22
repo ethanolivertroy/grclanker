@@ -871,6 +871,11 @@ test("rule 9 credential-named pairs (reviewer D round 5 baseline): a value under
     ["DB_PASSWORD=Sunshine", "DB_PASSWORD=[REDACTED]"],
     ["AZURE_CLIENT_SECRET: abc12", "AZURE_CLIENT_SECRET: [REDACTED]"],
     ["DUO_SKEY=p@ss", "DUO_SKEY=[REDACTED]"],
+    ["DUO_IKEY=DIXXXXXXXXXXXXXXXXXX", "DUO_IKEY=[REDACTED]"],
+    ["DUO_IKEY=letmein", "DUO_IKEY=[REDACTED]"],
+    ["ikey: monkey", "ikey: [REDACTED]"],
+    ['{"DUO_IKEY":"Sunshine"}', '{"DUO_IKEY":"[REDACTED]"}'],
+    ['"ikey": "abc12"', '"ikey": "[REDACTED]"'],
     ["Authorization: Basic letmein", "Authorization: Basic [REDACTED]"],
     ["token: value shape", "token: [REDACTED] shape"],
   ]) {
