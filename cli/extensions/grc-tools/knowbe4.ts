@@ -20,7 +20,7 @@ import { homedir } from "node:os";
 import { dirname, join, relative, resolve } from "node:path";
 import { ZipArchive } from "archiver";
 import { Type } from "@sinclair/typebox";
-import { parse as parseYaml } from "yaml";
+import { parse as parseYaml, YAMLError } from "yaml";
 import { errorResult, formatTable, textResult } from "./shared.js";
 
 type FetchImpl = typeof fetch;
@@ -224,7 +224,7 @@ export interface Knowbe4Collected<T> {
   error?: string;
   /** The HTTP status the failing request observed; null when the failure produced no response. */
   httpStatus?: number | null;
-  /** The request that failed, as "METHOD /path"; unset when the error did not identify one. */
+  /** The request the read made (for a failed read, the one that failed), as "METHOD /path"; unset when nothing identified one. */
   endpoint?: string;
   /** The read stopped at a cap while the API could still hold more records. */
   truncated?: boolean;
@@ -241,6 +241,8 @@ export interface Knowbe4Listing {
   limit: number;
   pages: number;
   total?: number;
+  /** The request the listing made, as "METHOD /path[?filters]" without the pagination parameters. */
+  endpoint?: string;
 }
 
 export interface Knowbe4SampledSecurityTest {
@@ -255,8 +257,8 @@ export interface Knowbe4SampledSecurityTest {
 /** One per-test recipient read that failed, with the request and status that read actually observed. */
 export interface Knowbe4RecipientReadFailure {
   pst_id: string;
-  /** The failed request as "METHOD /path"; null when the error did not identify one. */
-  endpoint: string | null;
+  /** The failed per-test request as "METHOD /path". */
+  endpoint: string;
   http_status: number | null;
   error: string;
 }
@@ -278,8 +280,8 @@ export type Knowbe4InventoryName =
 
 export interface Knowbe4InventoryGap {
   inventory: Knowbe4InventoryName;
-  /** The request that failed when the error identified one, otherwise the inventory's documented endpoint. */
-  endpoint: string;
+  /** The request that failed when one was identified, otherwise the inventory's documented endpoint; null when no request was made. */
+  endpoint: string | null;
   /** The HTTP status the failing request observed; null when no response was observed. */
   http_status: number | null;
   error: string;
@@ -785,9 +787,68 @@ type ConfigOverlay = {
   redactPii?: boolean;
 };
 
-function readConfigFileOverlay(location: string): ConfigOverlay | undefined {
-  if (!existsSync(location)) return undefined;
-  const parsed = asObject(parseYaml(readFileSync(location, "utf8"))) ?? {};
+const ERRNO_CODE_PATTERN = /^E[A-Z0-9_]{1,30}$/;
+
+/**
+ * Raised when the config file cannot be read or parsed. The file carries credentials, so the message is fixed text
+ * built only from the path, an errno code validated against ERRNO_CODE_PATTERN, and a line number taken from the
+ * parser's structured position: neither the filesystem's nor the parser's own message (which quotes the offending
+ * source, and for an unresolved alias quotes the value with no key name) is ever interpolated.
+ */
+export class Knowbe4ConfigFileError extends Error {
+  readonly path: string;
+  /** The errno code of a read failure, or INVALID_YAML for a parse failure. */
+  readonly code: string;
+  /** The parser's structured line for a parse failure; undefined for a read failure or a non-parser throw. */
+  readonly line: number | undefined;
+
+  constructor(step: "read" | "parse", path: string, code: string | undefined, line?: number) {
+    super(step === "read"
+      ? `Unable to read KnowBe4 config file ${path}${code ? ` (${code})` : ""}`
+      : `Unable to parse KnowBe4 config file: invalid YAML in ${path}${line !== undefined ? ` at line ${line}` : ""}`);
+    this.name = "Knowbe4ConfigFileError";
+    this.path = path;
+    this.code = code ?? "UNKNOWN";
+    this.line = line;
+  }
+}
+
+/** The errno code of a filesystem error, only when it has the strict E[A-Z0-9_] shape; anything else is dropped. */
+function errnoCode(error: unknown): string | undefined {
+  const code = asString(asObject(error)?.code);
+  return code && ERRNO_CODE_PATTERN.test(code) ? code : undefined;
+}
+
+/** The line a YAMLError points at; every other thrown value (for example the ReferenceError of an unresolved alias) has none. */
+function yamlErrorLine(error: unknown): number | undefined {
+  return error instanceof YAMLError ? error.linePos?.[0]?.line : undefined;
+}
+
+/** Read step of the config loader: any filesystem failure surfaces as fixed text with the validated errno code only. */
+function readConfigSource(location: string): string {
+  try {
+    return readFileSync(location, "utf8");
+  } catch (error) {
+    throw new Knowbe4ConfigFileError("read", location, errnoCode(error));
+  }
+}
+
+/** Parse step of the config loader: every thrown value, parser error class or not, becomes fixed text with at most a line number. */
+function parseConfigYaml(location: string, source: string): unknown {
+  try {
+    return parseYaml(source);
+  } catch (error) {
+    throw new Knowbe4ConfigFileError("parse", location, "INVALID_YAML", yamlErrorLine(error));
+  }
+}
+
+/**
+ * Loads the config file overlay. A missing default file is simply absent; a path named explicitly (argument or
+ * environment) that cannot be read is an error, so a typo in the path is not silently ignored.
+ */
+function readConfigFileOverlay(location: string, explicit: boolean): ConfigOverlay | undefined {
+  if (!explicit && !existsSync(location)) return undefined;
+  const parsed = asObject(parseConfigYaml(location, readConfigSource(location))) ?? {};
   return {
     apiToken: asString(parsed.api_token),
     region: normalizeRegion(asString(parsed.region)),
@@ -820,11 +881,9 @@ export function resolveKnowbe4Configuration(
   cwd: string = process.cwd(),
 ): Knowbe4ResolvedConfig {
   const sourceChain: string[] = [];
-  const configFile = resolve(
-    cwd,
-    asString(input.config_file) ?? asString(env.KNOWBE4_CONFIG_FILE) ?? join(homeDir, DEFAULT_CONFIG_FILE),
-  );
-  const file = readConfigFileOverlay(configFile) ?? {};
+  const explicitConfigFile = asString(input.config_file) ?? asString(env.KNOWBE4_CONFIG_FILE);
+  const configFile = resolve(cwd, explicitConfigFile ?? join(homeDir, DEFAULT_CONFIG_FILE));
+  const file = readConfigFileOverlay(configFile, explicitConfigFile !== undefined) ?? {};
   if (Object.values(file).some((value) => value !== undefined)) {
     sourceChain.push(`config:${configFile}`);
   }
@@ -889,6 +948,17 @@ export function resolveKnowbe4Configuration(
   };
 }
 
+/** The filter part of a listing request ("?status=active"), so the endpoint a listing names is the one it requested. */
+function describeQuery(query: JsonRecord): string {
+  const params = new URLSearchParams();
+  for (const [key, value] of Object.entries(query)) {
+    if (value === undefined || value === null || value === "") continue;
+    params.set(key, String(value));
+  }
+  const text = params.toString();
+  return text ? `?${text}` : "";
+}
+
 function retryDelayMs(retryAfter: string | null, attempt: number): number {
   const seconds = retryAfter ? Number(retryAfter) : Number.NaN;
   if (Number.isFinite(seconds) && seconds >= 0) {
@@ -932,9 +1002,27 @@ export function scrubErrorText(text: string): string {
     .replace(/\b((?:api[_-]?key|x-api-key|app[_-]?key|application[_-]?key|access[_-]?key|secret[_-]?key|client[_-]?secret|password|passwd|secret|token|access[_-]?token|refresh[_-]?token|private[_-]?key|credentials?)["']?\s*[:=]\s*["']?)([^"',;\s}]+)/gi, `$1${REDACTED}`);
 }
 
+const PARSE_ERROR_NOTE = "SyntaxError: response could not be parsed as JSON; the parser's message is not recorded because it quotes the body";
+
+/** JSON.parse quotes a window of the text it rejected, so a SyntaxError is recorded by name only, never by its message. */
+function isParseError(error: unknown): boolean {
+  return error instanceof SyntaxError || (error instanceof Error && error.name === "SyntaxError");
+}
+
+/** The message of any thrown value with the structural parse-error guard applied, before scrubbing. */
+function describeThrown(error: unknown): string {
+  if (isParseError(error)) return PARSE_ERROR_NOTE;
+  return error instanceof Error ? error.message : String(error);
+}
+
 /** The scrubbed message of any thrown value; the single point through which every recorded error string passes. */
 function errorMessage(error: unknown): string {
-  return scrubErrorText(error instanceof Error ? error.message : String(error));
+  return scrubErrorText(describeThrown(error));
+}
+
+/** Tool-level sink: every message a tool's catch block returns passes the same guard and scrub, whatever threw it. */
+function toolErrorText(error: unknown): string {
+  return errorMessage(error);
 }
 
 /** The HTTP status a failed request observed, or null when the failure produced no response or the error did not come from the client. */
@@ -954,7 +1042,8 @@ export class Knowbe4ApiError extends Error {
   readonly endpoint: string;
 
   constructor(message: string, status: number | null, endpoint: string) {
-    super(message);
+    // The constructor is the last stop before the message can escape, so the unanchored scrub runs here as well as at the sink.
+    super(scrubErrorText(message));
     this.name = "Knowbe4ApiError";
     this.status = status;
     this.endpoint = endpoint;
@@ -1138,8 +1227,7 @@ export class Knowbe4ApiClient {
         if (controller.signal.aborted) {
           throw new Knowbe4ApiError(this.redact(`KnowBe4 request timed out after ${this.config.timeoutMs}ms: ${target}`), null, endpoint);
         }
-        const message = error instanceof Error ? error.message : String(error);
-        throw new Knowbe4ApiError(this.redact(`KnowBe4 request failed: ${target}: ${message}`), null, endpoint);
+        throw new Knowbe4ApiError(this.redact(`KnowBe4 request failed: ${target}: ${describeThrown(error)}`), null, endpoint);
       } finally {
         clearTimeout(timeout);
       }
@@ -1190,6 +1278,7 @@ export class Knowbe4ApiClient {
     const items: JsonRecord[] = [];
     let truncated = false;
     let pages = 0;
+    const endpoint = `GET ${path}${describeQuery(query)}`;
 
     for (let page = 1; ; page += 1) {
       const payload = await this.get(path, { ...query, page, per_page: pageSize });
@@ -1208,7 +1297,7 @@ export class Knowbe4ApiClient {
       }
     }
 
-    return { items, truncated, limit, pages };
+    return { items, truncated, limit, pages, endpoint };
   }
 
   async probe(path: string, query: JsonRecord = {}): Promise<JsonRecord[]> {
@@ -1352,7 +1441,7 @@ export class Knowbe4ApiClient {
     }
 
     if (total !== undefined) truncated = truncated || total > items.length;
-    return { items, truncated, limit, pages, total };
+    return { items, truncated, limit, pages, total, endpoint: `POST ${new URL(this.config.phisherGraphqlUrl).pathname} ${field}` };
   }
 
   async listPhisherMessages(options: { query?: string; limit?: number } = {}): Promise<Knowbe4Listing> {
@@ -1539,6 +1628,7 @@ function toListing(value: unknown, limit: number): Knowbe4Listing {
       limit: asNumber(record.limit) ?? limit,
       pages: asNumber(record.pages) ?? 1,
       total: asNumber(record.total),
+      endpoint: asString(record.endpoint),
     };
   }
   return emptyListing(limit);
@@ -1553,7 +1643,14 @@ async function collectListing(
 ): Promise<Knowbe4Collected<JsonRecord[]>> {
   try {
     const listing = toListing(await load(), limit);
-    return { data: listing.items.map(project), collected: true, truncated: listing.truncated, total: listing.total, limit: listing.limit };
+    return {
+      data: listing.items.map(project),
+      collected: true,
+      truncated: listing.truncated,
+      total: listing.total,
+      limit: listing.limit,
+      ...(listing.endpoint ? { endpoint: listing.endpoint } : {}),
+    };
   } catch (error) {
     return { ...recordFailure<JsonRecord[]>(label, [], errors, error), limit };
   }
@@ -1683,9 +1780,20 @@ function inventoryCollection(snapshot: Knowbe4Snapshot, name: Knowbe4InventoryNa
 
 export const KNOWBE4_INVENTORIES: Knowbe4InventoryName[] = Object.keys(INVENTORY_ENDPOINTS) as Knowbe4InventoryName[];
 
-/** The endpoint to name for an inventory: the request that actually failed when the error identified one, otherwise the documented one. */
-function inventoryEndpoint(name: Knowbe4InventoryName, collection: Knowbe4Collected<unknown>): string {
-  return collection.endpoint ?? INVENTORY_ENDPOINTS[name];
+/**
+ * The endpoint to name for an inventory: the request the read actually made (or that failed) when one was identified,
+ * otherwise the documented one. Recipient results are read one test at a time, so when no per-test request was
+ * identified there is no endpoint to name; the templated documentation path is never written to output.
+ */
+function inventoryEndpoint(name: Knowbe4InventoryName, collection: Knowbe4Collected<unknown>): string | null {
+  if (collection.endpoint) return collection.endpoint;
+  if (name === "security_test_recipients") return null;
+  return INVENTORY_ENDPOINTS[name];
+}
+
+/** The per-test recipients request the collector issued for a security test; the client reports the same path when it fails. */
+function recipientsEndpoint(pstId: string): string {
+  return `GET /v1/phishing/security_tests/${encodeURIComponent(pstId)}/recipients`;
 }
 
 /**
@@ -1844,6 +1952,7 @@ export async function collectKnowbe4Snapshot(
     const samples: Knowbe4SampledSecurityTest[] = [];
     const recipientErrors: string[] = [];
     const failedEndpoints: string[] = [];
+    const requestedEndpoints: string[] = [];
     const failedStatuses = new Set<number | null>();
     let recipientsTruncated = false;
     for (const item of sampled) {
@@ -1851,6 +1960,7 @@ export async function collectKnowbe4Snapshot(
       if (!id) continue;
       try {
         const listing = toListing(await client.listSecurityTestRecipients(id), DEFAULT_LIST_LIMIT);
+        requestedEndpoints.push(listing.endpoint ?? recipientsEndpoint(id));
         recipientsTruncated = recipientsTruncated || listing.truncated;
         samples.push({
           pst_id: id,
@@ -1863,21 +1973,22 @@ export async function collectKnowbe4Snapshot(
       } catch (error) {
         const message = errorMessage(error);
         recipientErrors.push(`security_test_recipients[${id}]: ${message}`);
-        const endpoint = observedEndpoint(error);
-        if (endpoint) failedEndpoints.push(endpoint);
+        const endpoint = observedEndpoint(error) ?? recipientsEndpoint(id);
+        failedEndpoints.push(endpoint);
         failedStatuses.add(observedStatus(error));
-        securityTestRecipientFailures.push({ pst_id: id, endpoint: endpoint ?? null, http_status: observedStatus(error), error: message });
+        securityTestRecipientFailures.push({ pst_id: id, endpoint, http_status: observedStatus(error), error: message });
         unsampledSecurityTestIds.push(id);
       }
     }
     errors.push(...recipientErrors);
-    // The per-test reads that failed are named individually (never the templated path) and share one status only
-    // when every failure observed the same one.
+    // The per-test reads are named individually (never the templated path): the failed ones when any failed, otherwise
+    // every request made; the failures share one status only when every failure observed the same one.
     const singleStatus = failedStatuses.size === 1 ? [...failedStatuses][0] : null;
+    const namedEndpoints = recipientErrors.length > 0 ? failedEndpoints : requestedEndpoints;
     securityTestRecipients = {
       ...collected(samples, recipientErrors.length > 0 ? recipientErrors.join("; ") : undefined),
       ...(recipientErrors.length > 0 ? { httpStatus: singleStatus } : {}),
-      ...(failedEndpoints.length > 0 ? { endpoint: failedEndpoints.join(", ") } : {}),
+      ...(namedEndpoints.length > 0 ? { endpoint: namedEndpoints.join(", ") } : {}),
       truncated: recipientsTruncated,
       limit: DEFAULT_LIST_LIMIT,
     };
@@ -1980,7 +2091,7 @@ function inventoryGap(inventory: Knowbe4InventoryName, collection: Knowbe4Collec
 }
 
 function inventoryGapCaveat(gap: Knowbe4InventoryGap): string {
-  return `Unreadable inventory: ${gap.inventory} (${gap.endpoint}: ${gap.error}), so ${gap.not_checked}. Collect manually: ${gap.collect_manually}.`;
+  return `Unreadable inventory: ${gap.inventory} (${gap.endpoint ?? "no request made"}: ${gap.error}), so ${gap.not_checked}. Collect manually: ${gap.collect_manually}.`;
 }
 
 // An inventory the control cannot be judged without was not readable: the API cannot prove the control, so the
@@ -3024,21 +3135,23 @@ function assessRemedialTraining(snapshot: Knowbe4Snapshot, now: Date, lookbackDa
     summary = `${unremediated.length} of ${evaluable.length} users who failed a sampled phishing test have no training enrollment after the failure.`;
   }
 
+  // Every count derived from the recipient samples is unknown, not zero, when no per-test read completed.
+  const sampled = recipients.anyRead;
   return withInventoryCaveats(finding(10, "medium", status, summary, {
     security_tests_in_window: whenComplete(snapshot.securityTests, testsInWindow.length),
-    sampled_security_tests: samples.map((sample) => sample.pst_id),
+    sampled_security_tests: sampled ? samples.map((sample) => sample.pst_id) : null,
     unsampled_security_tests: unsampled,
-    recipient_reads_complete: recipients.anyRead ? recipients.complete : null,
+    recipient_reads_complete: sampled ? recipients.complete : null,
     failed_users_in_window: recipients.complete ? failures.size : null,
-    failed_users_in_sampled_tests: failures.size,
-    failed_users_evaluated: evaluable.length,
-    remediated_users: remediated.length,
-    unremediated_users: enrollmentsComplete ? unremediated.length : null,
-    remediated_pct: enrollmentsComplete ? remediatedPct ?? null : null,
+    failed_users_in_sampled_tests: sampled ? failures.size : null,
+    failed_users_evaluated: sampled ? evaluable.length : null,
+    remediated_users: sampled ? remediated.length : null,
+    unremediated_users: sampled && enrollmentsComplete ? unremediated.length : null,
+    remediated_pct: sampled && enrollmentsComplete ? remediatedPct ?? null : null,
     violation_observed: violationFlag([enrollmentsComplete, recipients.complete], enrollmentsComplete ? unremediated.length : 0),
     remedial_window_days: remedialWindowDays,
     auto_enroll_training_campaigns: whenRead(snapshot.trainingCampaigns, autoEnrollCampaigns),
-    unremediated_user_sample: enrollmentsComplete
+    unremediated_user_sample: sampled && enrollmentsComplete
       ? unremediated.slice(0, SAMPLE_SIZE).map(([, item]) => ({
         user: userLabel(item.user, redact),
         failed_at: item.failedAt.toISOString(),
@@ -4289,7 +4402,7 @@ function assessmentTool(
         return textResult(formatAssessmentText(result), { tool: name, ...result });
       } catch (error) {
         return errorResult(
-          `KnowBe4 ${area} assessment failed: ${error instanceof Error ? error.message : String(error)}`,
+          `KnowBe4 ${area} assessment failed: ${toolErrorText(error)}`,
           { tool: name },
         );
       }
@@ -4311,7 +4424,7 @@ export function registerKnowbe4Tools(pi: any): void {
         return textResult(formatAccessCheckText(result), { tool: "knowbe4_check_access", ...result });
       } catch (error) {
         return errorResult(
-          `KnowBe4 access check failed: ${error instanceof Error ? error.message : String(error)}`,
+          `KnowBe4 access check failed: ${toolErrorText(error)}`,
           { tool: "knowbe4_check_access" },
         );
       }
@@ -4390,7 +4503,7 @@ export function registerKnowbe4Tools(pi: any): void {
         );
       } catch (error) {
         return errorResult(
-          `KnowBe4 audit bundle export failed: ${error instanceof Error ? error.message : String(error)}`,
+          `KnowBe4 audit bundle export failed: ${toolErrorText(error)}`,
           { tool: "knowbe4_export_audit_bundle" },
         );
       }
