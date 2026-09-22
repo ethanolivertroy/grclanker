@@ -487,6 +487,38 @@ test("CodeRabbit (#78): a later cookie name with a dot or any RFC 6265 token cha
   assert.equal(scrubErrorText("Cookie: my.sid=v; Content-Type: text/html"), `Cookie: ${REDACTED}; Content-Type: text/html`);
 });
 
+/**
+ * `'` is the one RFC 6265 token character the cookie name and value classes leave out: a header line
+ * is often quoted whole in single quotes (a curl `-H` argument, a Python dict repr, a sentence that
+ * ends after the quote), and a name or value that ran through the `'` would take the closing quote
+ * with it. Each row plants the value in the cookie; the text after the closing quote must survive.
+ */
+const SINGLE_QUOTED_HEADER_ROWS = Object.freeze([
+  ["curl argument then a URL", (a) => `curl -H 'Cookie: sid=${a}; HttpOnly' https://api.example.com`, () => `curl -H 'Cookie: ${REDACTED}' https://api.example.com`, ["' https://api.example.com"]],
+  ["curl argument that ends a sentence", (a) => `header -H 'Cookie: sid=${a}; HttpOnly'. Retry later`, () => `header -H 'Cookie: ${REDACTED}'. Retry later`, ["'. Retry later"]],
+  ["Python dict repr with a quoted value", (a) => `headers={'Cookie': 'sid=${a}; Path=/'}`, () => `headers={'Cookie': '${REDACTED}'}`, ["'}"]],
+  ["Set-Cookie with attributes inside single quotes", (a) => `sent 'Set-Cookie: sid=${a}; Path=/; HttpOnly' and failed`, () => `sent 'Set-Cookie: ${REDACTED}' and failed`, ["' and failed"]],
+  ["later dot name inside single quotes", (a) => `sent 'Cookie: theme=dark; my.sid=${a}; Secure' and failed`, () => `sent 'Cookie: ${REDACTED}' and failed`, ["' and failed"]],
+]);
+
+test("a header line quoted whole in single quotes keeps its closing quote, since the cookie name and value classes leave `'` out", () => {
+  const legitimate = new Map(SINGLE_QUOTED_HEADER_ROWS.map(([label, line]) => [label, line("")]));
+  assertCanariesDisjointFromFixture(assert, plantedValues(), legitimate, "single-quoted header lines");
+  for (const [label, line, expected, keeps] of SINGLE_QUOTED_HEADER_ROWS) {
+    for (const a of plantedValues()) {
+      const input = line(a);
+      for (const [scrubName, scrub] of EXACT_SCRUBS) {
+        const output = scrub(input);
+        assert.equal(output, expected(), `${scrubName}: ${label} with ${a}`);
+        for (const text of keeps) assert.ok(output.includes(text), `${scrubName}: ${label}: ${JSON.stringify(text)} did not survive in ${output}`);
+        assertNoCanaryWindows(assert, output, [a], `${scrubName}: ${label}`);
+        assert.equal(scrub(output), output, `${scrubName}: ${label}: a second pass changed the text`);
+      }
+      assertNoCanaryWindows(assert, errorMessage(new Error(input)), [a], `errorMessage: ${label}`);
+    }
+  }
+});
+
 test("compound lines: a documented message field of a 502 body carrying one comes out of describeFailedResponse and describeErrorBody with the same rendering", () => {
   for (const [label, line, expected] of COMPOUND_LINES) {
     for (const [a, b] of plantedPairs().slice(0, 4)) {
