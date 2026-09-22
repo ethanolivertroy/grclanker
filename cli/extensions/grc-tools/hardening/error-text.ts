@@ -27,13 +27,23 @@ export const REDACTED = "[REDACTED]";
 export const MIN_CONFIGURED_SECRET_LENGTH = 4;
 
 /**
- * The long-token rule replaces any run of this many or more token characters that carries a digit or
- * mixed case and is not shaped like an identifier (uppercase code, camelCase or PascalCase word,
- * snake_case or Header-Case words, digits alone, canonical UUID). Error text is the only place a bare
- * token can arrive, which is why the rule is on by default there; the trade-off is that opaque
- * resource identifiers (instance ids, entity guids, hashes) are also removed from error text. Data
- * values and bundle content use `scrubDataText`, which leaves the rule off because such identifiers
- * are evidence.
+ * The long-token rule replaces any run of this many or more token characters that is not shaped like
+ * a name. It is path-safe by construction (coordinator addendum 7): "/", ".", ":", "@", and "=" end a
+ * run, so URL path segments, dotted hostnames, colon-separated ARNs, emails, and `key=value` pairs are
+ * judged piece by piece, and "-" or "_" split a run into segments that are names when each is letters
+ * in any casing (words, acronyms, camelCase, PascalCase: `AWSLambdaBasicExecutionRole`), digits alone,
+ * or letters with one digit group (`west2`, `sha256`, `AmazonS3ReadOnlyAccess`), so region, tenant,
+ * project, bucket, and hostname names with digits and hyphens stay (`prod-us-east-2026`,
+ * `my-project-123456`, `ec2-54-123-45-67`), as do uppercase codes, finding ids, and UUIDs. A run is a
+ * token when it carries base64 symbols, when digits are scattered through its letters
+ * (`0f9e8d7c6b5a4938`, `Kq7Zx2Vw9Lm4Tp8R`), or when its casing changes more often than once every
+ * three letters. Error text is the only place a bare token can arrive, which is why the rule is on by
+ * default there; the trade-off is that opaque identifiers whose shape is a token's (instance ids,
+ * Okta and ServiceNow record ids, entity guids, OCID unique parts, hashes) are also removed from error
+ * text and must travel in a validated structured field (`code`, `status`, `endpoint`) instead, and
+ * that a bare value shaped like a name (`sess-canary-COOKIE-31415926535897`, a passphrase) is caught
+ * only when a carrier names it (`Cookie:`, `api_key=`, `Bearer`). Data values and bundle content use
+ * `scrubDataText`, which leaves the rule off because such identifiers are evidence.
  */
 export const LONG_TOKEN_MIN_LENGTH = 16;
 
@@ -115,13 +125,18 @@ const VENDOR_TOKEN_PATTERNS: readonly RegExp[] = [
   /\bSG\.[A-Za-z0-9_-]{16,}\.[A-Za-z0-9_-]{16,}/g,
 ];
 
-// The long-token rule. "/", ".", ":", "@", and whitespace are not run characters, so URL paths, dotted
-// names, timestamps, and emails split into segments that are judged on their own.
-const LONG_TOKEN_RUN_PATTERN = new RegExp(`[A-Za-z0-9+=_-]{${LONG_TOKEN_MIN_LENGTH},}`, "g");
+// The long-token rule. "/", ".", ":", "@", "=", and whitespace are not run characters, so URL path
+// segments, dotted hostnames, colon-separated ARNs, emails, and the two sides of a `key=value` pair
+// are judged on their own; "=" joins a run only as trailing base64 padding. "-" and "_" stay in the
+// run and split it into name segments (see `isNameSegment`).
+const LONG_TOKEN_RUN_PATTERN = new RegExp(`[A-Za-z0-9+_-]{${LONG_TOKEN_MIN_LENGTH},}(?:={1,2}(?![A-Za-z0-9&]))?`, "g");
 const UPPERCASE_CODE_PATTERN = /^[A-Z][A-Z_]*$|^[A-Z][A-Z0-9]*(?:[_-][A-Z0-9]+)+$/;
 const DIGITS_ONLY_PATTERN = /^\d+$/;
+const DIGIT_GROUP_PATTERN = /\d+/g;
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-const WORD_SEGMENT_PATTERN = /^(?:[A-Z]?[a-z]+|[A-Z]+|[a-z]+(?:[A-Z][a-z]+)+|(?:[A-Z][a-z]+)+)$/;
+// Below this many letters a segment's casing is not judged: `eBay`, `iOS`, `McD` are names, and a
+// token this short is caught by its digit groups or its neighbours.
+const MIN_LETTERS_FOR_CASING = 6;
 
 // Keys that name a credential in query strings and name-value pairs beyond what the Flue heuristic
 // covers: bare `sid`, `sig`, `pwd`, `session`, `auth`, and the signed-URL parameters of S3 and GCS.
@@ -188,10 +203,15 @@ function looksLikeCredentialValue(value: string): boolean {
   return /[a-z][A-Z]/.test(value);
 }
 
-/** A value after an authorization scheme is a credential unless it is a plain word: it carries a digit, base64 characters, mixed case, or is 20 characters or longer. */
+/**
+ * A value after an authorization scheme is a credential unless it is a plain word: it carries a digit,
+ * base64 characters, a case change inside the word, or is 20 characters or longer. One capitalised
+ * word (`Splunk Enterprise`, `OAuth Provider`, `Token Manager`) is prose, so an integration's display
+ * name that opens with a scheme spelling survives in fixed text.
+ */
 function looksLikeSchemeValue(value: string): boolean {
   if (/\d/.test(value) || /[+/=]/.test(value) || value.length >= 20) return true;
-  return /[a-z]/.test(value) && /[A-Z]/.test(value);
+  return /[a-z][A-Z]/.test(value) || (/[a-z]/.test(value) && /[A-Z].*[A-Z]/.test(value));
 }
 
 /** A 40-character run is an AWS secret access key when it carries base64 symbols or a digit with both cases; lowercase hex digests are left to the long-token rule. */
@@ -200,12 +220,45 @@ function looksLikeAwsSecret(run: string): boolean {
   return /\d/.test(run) && /[a-z]/.test(run) && /[A-Z]/.test(run);
 }
 
-/** The long-token rule's identifier exclusions (see `LONG_TOKEN_MIN_LENGTH`). */
+/**
+ * Token-shaped casing: the case changes more often than once every three letters. Words, acronyms,
+ * camelCase, and PascalCase names change case at word boundaries (`AWSLambdaBasicExecutionRole`,
+ * `IAMReadOnlyAccess`, `getHTTPSUrl`: one change per four letters or fewer); a random run changes
+ * about every second letter (`bPxRfiCYcanaryKEY`).
+ */
+function hasTokenCasing(letters: string): boolean {
+  if (letters.length < MIN_LETTERS_FOR_CASING) return false;
+  let changes = 0;
+  for (let index = 1; index < letters.length; index += 1) {
+    const previousLower = letters[index - 1] >= "a" && letters[index - 1] <= "z";
+    const currentLower = letters[index] >= "a" && letters[index] <= "z";
+    if (previousLower !== currentLower) changes += 1;
+  }
+  return changes * 3 > letters.length;
+}
+
+/**
+ * A segment between "-" or "_" that is shaped like part of a name: empty, digits alone (account ids,
+ * ports, years, project numbers), or letters with at most one digit group anywhere (`west2`, `ec2`,
+ * `sha256`, `oauth2Client`, `AmazonS3ReadOnlyAccess`, `2fa`) whose casing is not token-shaped.
+ * Digits scattered through letters (`0f9e8d7c6b5a4938`, `Kq7Zx2Vw9Lm4Tp8R`) are the token signal.
+ */
+function isNameSegment(segment: string): boolean {
+  if (segment.length === 0 || DIGITS_ONLY_PATTERN.test(segment)) return true;
+  const digitGroups = segment.match(DIGIT_GROUP_PATTERN) ?? [];
+  if (digitGroups.length > 1) return false;
+  return !hasTokenCasing(segment.replace(DIGIT_GROUP_PATTERN, ""));
+}
+
+/**
+ * The long-token rule's decision (see `LONG_TOKEN_MIN_LENGTH`): a run is a token when it carries
+ * base64 symbols, or when any of its "-" or "_" separated segments is not shaped like part of a name.
+ * Uppercase codes, digit strings, and canonical UUIDs are names outright.
+ */
 function looksLikeToken(run: string): boolean {
   if (UPPERCASE_CODE_PATTERN.test(run) || DIGITS_ONLY_PATTERN.test(run) || UUID_PATTERN.test(run)) return false;
-  if (run.split(/[-_]/).every((segment) => segment.length === 0 || WORD_SEGMENT_PATTERN.test(segment))) return false;
-  if (/\d/.test(run)) return true;
-  return /[a-z]/.test(run) && /[A-Z]/.test(run);
+  if (/[+=]/.test(run)) return true;
+  return !run.split(/[-_]/).every(isNameSegment);
 }
 
 function scrubConfiguredSecrets(text: string, secrets: ScrubErrorTextOptions["secrets"]): string {
@@ -267,6 +320,17 @@ function replaceCredentialAssignments(text: string): string {
  * and (unless turned off) long token-shaped runs. Idempotent. Every integration error string passes
  * through here at the point it is created; a scrub at the tool boundary is a second layer, not a
  * substitute, because the exported resolvers and collectors throw before the boundary is reached.
+ *
+ * Fixed text rule: every fixed-text message this library renders is chosen so it comes back from
+ * this scrub unchanged (`hardening-fixed-text.test.mjs` renders each one and checks). Concretely, no
+ * fixed word that names a credential is followed by a colon or an equals sign, because the
+ * credential-pair rule would take the next word as the value (`Service account credentials: <path>`
+ * loses the path; `Token: non-JSON body` loses `non-JSON`); a path or other free value is rendered
+ * after a plain word and a space (`config file <path>`, `in <path>`), never as the value of such a
+ * pair; server text that could end in a credential word is validated before it is placed in front
+ * of a colon (`reasonPhrase`); and no fixed word is a 16-character run with a digit or mixed case.
+ * A message that must hand the scrub a free value labels it with a plain word (`file`, `in`, `for`),
+ * not with a credential word.
  */
 export function scrubErrorText(text: string, options: ScrubErrorTextOptions = {}): string {
   let scrubbed = scrubConfiguredSecrets(text, options.secrets);
@@ -422,15 +486,30 @@ export interface FailedResponse {
 }
 
 /**
+ * The reason phrase is server text and stands right before the colon that introduces the body note,
+ * so one whose last word names a credential (`Invalid Token`, `Expired Session`) would make the
+ * credential-pair rule read the fixed note as the pair's value (`Token: non-JSON` loses `non-JSON`).
+ * Such a phrase is dropped and the status number stands alone; every standard reason phrase passes.
+ */
+function reasonPhrase(statusText: string | null | undefined): string {
+  if (!statusText || !STATUS_TEXT_PATTERN.test(statusText)) return "";
+  const trimmed = statusText.trim();
+  const lastWord = /[A-Za-z0-9_.-]+$/.exec(trimmed.replace(/['\s]+$/, ""))?.[0];
+  if (lastWord !== undefined && isCredentialKey(lastWord)) return "";
+  return ` ${trimmed}`;
+}
+
+/**
  * The standard message for a failed HTTP request: `GET /v1/users failed with 502 Bad Gateway:
  * non-JSON body (text/html, 1234 bytes)`. The status text comes from the server and is kept only
- * when it is a short plain reason phrase; the body goes through `describeErrorBody`.
+ * when it is a short plain reason phrase that does not end in a credential word (see
+ * `reasonPhrase`); the body goes through `describeErrorBody`. The fixed words are chosen so the
+ * line comes back from `scrubErrorText` unchanged.
  */
 export function describeFailedResponse(response: FailedResponse, options: ScrubErrorTextOptions = {}): string {
   const method = HTTP_METHOD_PATTERN.test(response.method) ? response.method : "Request";
-  const statusText = response.statusText && STATUS_TEXT_PATTERN.test(response.statusText) ? ` ${response.statusText.trim()}` : "";
   const status = validHttpStatus(response.status) ?? "unknown status";
-  return scrubErrorText(`${method} ${response.endpoint} failed with ${status}${statusText}: ${describeErrorBody(response.contentType, response.body, options)}`, options);
+  return scrubErrorText(`${method} ${response.endpoint} failed with ${status}${reasonPhrase(response.statusText)}: ${describeErrorBody(response.contentType, response.body, options)}`, options);
 }
 
 // ---------------------------------------------------------------------------------------------

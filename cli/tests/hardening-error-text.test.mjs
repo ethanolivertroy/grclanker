@@ -29,17 +29,50 @@ import {
   htmlCanaryBody,
   jsonCanaryMessage,
 } from "./helpers/error-canaries.mjs";
+import {
+  ENCODED_FORM_SECRET,
+  ERROR_CANARY,
+  ERROR_CANARY_URL,
+  assertCanaryFixture,
+  assertNoFragment,
+  assertNoFragments,
+  htmlCanaryPage,
+  jsonCanarySentence,
+} from "./helpers/hardening-canaries.mjs";
 
 const HEX_DIGEST = "4f3a9c1b7e2d8f6a0b5c4d3e2f1a0b9c";
 const UUID = "123e4567-e89b-12d3-a456-426614174000";
 const CONFIGURED_SECRET = "s3cr3t-Value-With-Case-42";
-
+/**
+ * The shared group D contract (whole-value absence of every planted canary; those canaries are
+ * readable words, so only the whole value is checked) plus the fragment rule for the random-looking
+ * `ERROR_CANARY` set: no 6- to 24-character window may remain, so a partial echo (a truncated message,
+ * a base64 tail, a `JSON.parse` window) cannot pass.
+ */
 function assertNoCanaryValues(value, label) {
   assertNoCanaries(assert, value, label);
   const text = typeof value === "string" ? value : JSON.stringify(value);
   for (const canary of [CANARY.basic, CANARY.jwt, CANARY.awsAccessKeyId, CANARY.awsSecret]) {
     assert.ok(!text.includes(canary), `${label}: canary ${canary} leaked`);
   }
+  assertNoFragments(value, Object.values(ERROR_CANARY), { label });
+}
+
+/** Every carrier of the `ERROR_CANARY` set: header lines, a cookie, a key pair, a URL query, a JWT, and the AWS pair, in prose. */
+function errorCanaryCarriers() {
+  return [
+    `Authorization: Bearer ${ERROR_CANARY.bearer} was rejected`,
+    `proxy replayed Basic ${ERROR_CANARY.basic} and failed`,
+    `Set-Cookie: session=${ERROR_CANARY.sessionCookie}; Path=/; HttpOnly`,
+    `x-api-key: ${ERROR_CANARY.apiKey} for the caller`,
+    `api_key=${ERROR_CANARY.apiKey}&page=2`,
+    `retry the request at ${ERROR_CANARY_URL} once the incident clears`,
+    `token ${ERROR_CANARY.jwt} expired`,
+    `credentials ${ERROR_CANARY.awsAccessKeyId} ${ERROR_CANARY.awsSecret} were rejected`,
+    `key ${ERROR_CANARY.configured} rejected`,
+    htmlCanaryPage(),
+    jsonCanarySentence(),
+  ];
 }
 
 test("scrubErrorText handles every shared redaction case and is idempotent", () => {
@@ -50,6 +83,33 @@ test("scrubErrorText handles every shared redaction case and is idempotent", () 
     assertNoCanaryValues(once, "scrubbed text");
   }
   assert.equal(scrubErrorText(""), "");
+});
+
+test("the random-looking canary set leaves no 6- to 24-character fragment through any surface, with a fixture self-check", () => {
+  assertCanaryFixture();
+  const carriers = errorCanaryCarriers();
+  const secrets = [ERROR_CANARY.configured];
+  for (const carrier of carriers) {
+    for (const [surface, output] of [
+      ["scrubErrorText", scrubErrorText(carrier, { secrets })],
+      ["scrubDataText", scrubDataText(carrier, { secrets })],
+      ["errorMessage", errorMessage(new Error(carrier), { secrets })],
+      ["scrubError", scrubError(new Error("outer", { cause: new Error(carrier) }), { secrets })],
+      ["IntegrationError", new IntegrationError(carrier, { endpoint: ERROR_CANARY_URL }, { secrets })],
+      ["redactSecretValues", redactSecretValues({ message: carrier, token: carrier, list: [carrier] }, { secrets })],
+      ["describeErrorBody text/html", describeErrorBody("text/html", carrier, { secrets })],
+      ["describeErrorBody json message", describeErrorBody("application/json", JSON.stringify({ message: carrier }), { secrets })],
+      ["describeErrorBody json undocumented", describeErrorBody("application/json", JSON.stringify({ debug: carrier }), { secrets })],
+      ["describeErrorBody malformed", describeErrorBody("application/json", carrier, { secrets })],
+      ["describeFailedResponse", describeFailedResponse({ method: "GET", endpoint: ERROR_CANARY_URL, status: 502, statusText: carrier, contentType: "text/html", body: carrier }, { secrets })],
+    ]) {
+      const serialised = output instanceof Error ? { name: output.name, message: output.message, endpoint: output.endpoint, folded: errorMessage(output, { secrets }) } : output;
+      assertNoFragments(serialised, Object.values(ERROR_CANARY), { label: `${surface} of ${carrier.slice(0, 40)}` });
+    }
+  }
+  assert.equal(scrubErrorText(`Authorization: Bearer ${ERROR_CANARY.bearer} was rejected`), `Authorization: Bearer ${REDACTED} was rejected`);
+  assert.equal(scrubErrorText(jsonCanarySentence()), `Access denied while fetching https://api.example.com/v1/x?${REDACTED} for the caller; retry after re-authenticating.`);
+  assertNoFragment(scrubErrorText(`key ${ENCODED_FORM_SECRET} rejected`, { secrets: [ENCODED_FORM_SECRET] }), ENCODED_FORM_SECRET);
 });
 
 test("configured secrets are removed in every encoded form with one marker", () => {
