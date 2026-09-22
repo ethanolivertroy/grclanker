@@ -21,6 +21,7 @@ import {
   resolveTenableConfiguration,
 } from "../dist/extensions/grc-tools/tenable.js";
 import { getRegisteredToolSummaries } from "../dist/pi/tool-catalog.js";
+import { assertSecretsAbsent, readBundleFiles, readZipEntries } from "./helpers/bundle-contents.mjs";
 
 const NOW = Date.parse("2026-09-21T12:00:00Z");
 const RECENT_SECONDS = Math.floor((NOW - 2 * 86_400_000) / 1000);
@@ -266,6 +267,19 @@ test("TenableApiClient sends the X-ApiKeys header, walks pagination, and redacts
   });
   await assert.rejects(() => failing.vm.listScans(), (error) => {
     assert.equal(error.status, 403);
+    assert.ok(!error.message.includes("secret-key-654321"), error.message);
+    assert.ok(!error.message.includes("denied for"), `non-JSON bodies are never echoed: ${error.message}`);
+    assert.match(error.message, /403[^;]*; non-JSON text\/plain response body \(66 bytes, not echoed\)/);
+    return true;
+  });
+
+  const jsonFailure = createTenableClients(vmConfig(), {
+    fetchImpl: async () => jsonResponse({ error: "invalid credentials accessKey=access-key-123456;secretKey=secret-key-654321" }, 401),
+    sleepImpl: async () => {},
+  });
+  await assert.rejects(() => jsonFailure.vm.listScans(), (error) => {
+    assert.equal(error.status, 401);
+    assert.ok(error.message.includes("invalid credentials"), "documented JSON error fields are kept");
     assert.ok(!error.message.includes("secret-key-654321"), error.message);
     assert.ok(error.message.includes("[REDACTED]"), error.message);
     return true;
@@ -800,6 +814,381 @@ test("exportTenableAuditBundle records _errors.log when collection partially fai
   assert.ok(errors.includes("exclusions"), errors);
   const findings = JSON.parse(readFileSync(join(result.outputDir, "analysis/findings.json"), "utf8"));
   assert.equal(findings.find((item) => item.id === "TENABLE-13").status, "manual");
+});
+
+const CANARY_BEARER = "CANARY-BEARER-9f8e7d6c5b4a3210";
+const CANARY_SESSION = "CANARY-SESSION-0a1b2c3d4e5f6789";
+const CANARY_API_KEY = "CANARY-APIKEY-1122334455667788";
+const CANARY_URL_TOKEN = "CANARY-URLTOKEN-99aa88bb77cc66dd";
+const CANARIES = [CANARY_BEARER, CANARY_SESSION, CANARY_API_KEY, CANARY_URL_TOKEN];
+const CANARY_URL = `https://api.example.com/v1/x?token=${CANARY_URL_TOKEN}`;
+
+function htmlCanaryResponse() {
+  const body = `<html><head><title>502 Bad Gateway</title></head><body><p>Authorization: Bearer ${CANARY_BEARER}</p>`
+    + `<p>Set-Cookie: TNS_SESSIONID=${CANARY_SESSION}; Path=/</p><p>X-ApiKeys: accessKey=${CANARY_API_KEY};secretKey=${CANARY_API_KEY}</p>`
+    + `<p>The upstream at ${CANARY_URL} did not answer in time, retry later.</p></body></html>`;
+  return new Response(body, { status: 502, headers: { "content-type": "text/html; charset=utf-8" } });
+}
+
+function jsonCanaryResponse() {
+  return jsonResponse({
+    error: `Upstream refused Bearer ${CANARY_BEARER} when calling ${CANARY_URL} mid-sentence; session=${CANARY_SESSION} and api_key=${CANARY_API_KEY} were rejected`,
+  }, 400);
+}
+
+function assertNoCanary(text, label) {
+  for (const canary of CANARIES) assert.ok(!text.includes(canary), `${label}: ${canary} leaked`);
+}
+
+function canaryClients(routes, surfaceKey, makeResponse) {
+  const fallback = routerFetch(routes);
+  return createTenableClients(vmConfig(), {
+    fetchImpl: async (url, init) => {
+      const parsed = new URL(url);
+      const key = `${(init?.method ?? "GET").toUpperCase()} ${parsed.pathname}`;
+      if (key === surfaceKey) return makeResponse();
+      return fallback(url, init);
+    },
+    sleepImpl: async () => {},
+    exportPollMs: 0,
+    exportTimeoutMs: 5_000,
+    retryLimit: 1,
+  });
+}
+
+test("error-body canary sweep: every Tenable surface failing with an HTML 502 or a JSON error body leaks no credential into any tool result, finding, or bundle file", async () => {
+  const surfaces = Object.keys(healthyRoutes());
+  assert.ok(surfaces.length >= 25, `expected every collector surface to be enumerated, found ${surfaces.length}`);
+  const shapes = [
+    { name: "html-502", make: htmlCanaryResponse, marker: /non-JSON text\/html response body \(\d+ bytes, not echoed\)/ },
+    { name: "json-400", make: jsonCanaryResponse, marker: /\[REDACTED\]/ },
+  ];
+  for (const shape of shapes) {
+    for (const surface of surfaces) {
+      const label = `${shape.name} on ${surface}`;
+      const clients = canaryClients(healthyRoutes(), surface, shape.make);
+
+      const access = await checkTenableAccess(clients);
+      assertNoCanary(JSON.stringify(access), `${label} access check`);
+      const probed = access.surfaces.find((entry) => entry.endpoint === surface);
+      if (probed) {
+        assert.notEqual(probed.status, "readable", `${label}: surface should not be readable`);
+        assert.match(probed.error ?? "", shape.marker, `${label}: access error must carry the note`);
+      }
+
+      const results = await runAll(clients, { expectedAssetCount: 2 });
+      const serialized = JSON.stringify(results);
+      assertNoCanary(serialized, `${label} assessments`);
+      const errors = results.flatMap((result) => result.errors);
+      assert.ok(errors.length > 0, `${label}: the failing surface must be recorded as an error`);
+      assert.ok(errors.some((error) => shape.marker.test(error)), `${label}: errors must carry the note: ${JSON.stringify(errors)}`);
+      for (const error of errors) assert.ok(!/<html|Bad Gateway|Set-Cookie|TNS_SESSIONID/i.test(error), `${label}: body text echoed: ${error}`);
+
+      const bundle = await exportTenableAuditBundle(clients, mkdtempSync(join(tmpdir(), "tenable-canary-")), { now: NOW });
+      const files = readBundleFiles(bundle.outputDir);
+      const zipEntries = readZipEntries(bundle.zipPath);
+      assert.ok(files.size >= 20 && zipEntries.size >= 20, `${label}: bundle and zip were written`);
+      assertSecretsAbsent(assert, files, CANARIES, `${label} bundle`);
+      assertSecretsAbsent(assert, zipEntries, CANARIES, `${label} zip`);
+      const errorLog = files.get("_errors.log");
+      assert.ok(errorLog !== undefined, `${label}: _errors.log must exist`);
+      assert.match(errorLog, shape.marker, `${label}: _errors.log must carry the note`);
+    }
+  }
+});
+
+test("export polling, vendor reason strings, Security Center error_msg, and timeouts pass through the redacting sink", async () => {
+  const routes = healthyRoutes();
+  routes["GET /assets/export/asset-export-1/status"] = { status: "ERROR", chunks_available: [], chunks_failed: [], total_chunks: 0, reason: `worker rejected Bearer ${CANARY_BEARER} for ${CANARY_URL}` };
+  const errored = await collectTenableVulnerabilityData(clientsFor(routes), { now: NOW });
+  assert.equal(errored.assetExport.status, "error");
+  assertNoCanary(errored.assetExport.error, "export reason");
+  assert.match(errored.assetExport.error, /ended with status ERROR: worker rejected Bearer \[REDACTED\] for https:\/\/api\.example\.com\/v1\/x\?token=\[REDACTED\]/);
+  const vuln = assessTenableVulnerabilityManagement(errored, { now: NOW });
+  assertNoCanary(JSON.stringify(vuln), "vulnerability assessment with an errored export");
+  assert.equal(vuln.summary.exported_assets, null);
+
+  const stuck = healthyRoutes();
+  stuck["GET /assets/export/asset-export-1/status"] = { status: "PROCESSING", chunks_available: [] };
+  const slow = createTenableClients(vmConfig(), { fetchImpl: routerFetch(stuck), sleepImpl: async () => {}, exportPollMs: 0, exportTimeoutMs: 0 });
+  const timedOut = await slow.vm.exportAssets();
+  assert.equal(timedOut.truncated, true);
+  assert.match(timedOut.status, /^TIMEOUT\(PROCESSING\)$/);
+  const sensorData = await collectTenableSensorCoverageData(slow, { now: NOW });
+  assert.equal(sensorData.assetExport.status, "error");
+  assert.match(sensorData.assetExport.error, /did not finish within 0s/);
+  const sensor = assessTenableSensorCoverage(sensorData, { now: NOW, expectedAssetCount: 2 });
+  assert.equal(sensor.findings.find((item) => item.id === "TENABLE-03").status, "manual");
+  assert.equal(sensor.summary.exported_assets, null);
+
+  const scConfig = resolveTenableConfiguration({ url: "https://sc.example.internal", access_key: "sc-access-key", secret_key: "sc-secret-key", config_file: "/nonexistent" }, EMPTY_ENV);
+  const sc = createTenableClients(scConfig, {
+    fetchImpl: async () => jsonResponse({ error_code: 143, error_msg: `Cookie TNS_SESSIONID=${CANARY_SESSION} is not authorized for ${CANARY_URL}; Authorization: Bearer ${CANARY_BEARER}` }),
+    sleepImpl: async () => {},
+  });
+  const scResults = await runAll(sc);
+  assertNoCanary(JSON.stringify(scResults), "Security Center error_msg");
+  const scErrors = scResults.flatMap((result) => result.errors);
+  assert.ok(scErrors.some((error) => error.includes("error_code 143") && error.includes("[REDACTED]")), JSON.stringify(scErrors));
+
+  const transport = createTenableClients(vmConfig(), {
+    fetchImpl: async () => { throw new Error(`connect ECONNREFUSED via proxy https://svc:${CANARY_SESSION}@proxy.example.com with Authorization: Bearer ${CANARY_BEARER}`); },
+    sleepImpl: async () => {},
+    retryLimit: 0,
+  });
+  await assert.rejects(() => transport.vm.listScans(), (error) => {
+    assertNoCanary(error.message, "transport error");
+    assert.match(error.message, /https:\/\/\[REDACTED\]@proxy\.example\.com/);
+    return true;
+  });
+
+  const aborted = createTenableClients(vmConfig(), {
+    fetchImpl: async () => { const abort = new Error(`aborted while sending Bearer ${CANARY_BEARER}`); abort.name = "AbortError"; throw abort; },
+    sleepImpl: async () => {},
+  });
+  await assert.rejects(() => aborted.vm.listScans(), (error) => {
+    assertNoCanary(error.message, "abort error");
+    assert.match(error.message, /timed out after \d+ms/);
+    return true;
+  });
+});
+
+const FAKE_TENABLE_SECRETS = {
+  sshPassword: "FAKE-SSH-PASSWORD-a1b2c3d4e5f6",
+  sshPrivateKey: "FAKE-SSH-PRIVATE-KEY-001122334455",
+  windowsPassword: "FAKE-WINDOWS-PASSWORD-99887766",
+  smtpPassword: "FAKE-SMTP-PASSWORD-13579-24680",
+  scannerKey: "FAKE-SCANNER-LINKING-KEY-5566778899",
+  registrationCode: "FAKE-REGISTRATION-CODE-1122334455",
+  licenseKey: "FAKE-LICENSE-KEY-aabbccddeeff0011",
+  auditFieldToken: "FAKE-AUDIT-API-TOKEN-fedcba987654",
+  webhookQueryToken: "FAKE-WEBHOOK-QUERY-TOKEN-0f1e2d3c",
+  credentialSecret: "FAKE-CREDENTIAL-SETTINGS-SECRET-4242",
+  camelCaseSecret: "FAKE-CAMEL-CLIENT-SECRET-777888999",
+};
+
+function secretBearingRoutes() {
+  const routes = healthyRoutes();
+  const secrets = FAKE_TENABLE_SECRETS;
+  routes["GET /policies/1"] = {
+    ...healthyPolicyDetails({ settings: { smtp_password: secrets.smtpPassword } }),
+    credentials: {
+      current: {
+        Host: {
+          SSH: [{ auth_method: "password", username: "svc-scan", password: secrets.sshPassword, private_key: secrets.sshPrivateKey, elevate_privileges_with: "sudo" }],
+          Windows: [{ auth_method: "Password", username: "svc-win", password: secrets.windowsPassword, domain: "CORP" }],
+        },
+      },
+    },
+    audits: { current: { Unix: [{ file: "cis_ubuntu.audit" }] } },
+  };
+  routes["GET /scanners"] = {
+    scanners: [{ ...healthyRoutes()["GET /scanners"].scanners[0], key: secrets.scannerKey, registration_code: secrets.registrationCode, license: { type: "commercial", key: secrets.licenseKey, agents: 100 } }],
+  };
+  routes["GET /audit-log/v1/events"] = {
+    events: [{
+      ...healthyRoutes()["GET /audit-log/v1/events"].events[0],
+      fields: [
+        { name: "api_token", value: secrets.auditFieldToken },
+        { name: "target_url", value: `https://hooks.example.com/services/T000/B000?token=${secrets.webhookQueryToken}` },
+        { name: "X-Client-Id", value: "client-1" },
+      ],
+    }],
+    pagination: { total: 1 },
+  };
+  routes["GET /credentials"] = {
+    credentials: [{ ...healthyRoutes()["GET /credentials"].credentials[0], settings: { auth_method: "password", username: "svc", password: secrets.credentialSecret, clientSecret: secrets.camelCaseSecret } }],
+    pagination: { total: 1 },
+  };
+  return routes;
+}
+
+test("exportTenableAuditBundle never writes policy credentials, scanner linking keys, or credential-named properties into the bundle or the zip", async () => {
+  const root = mkdtempSync(join(tmpdir(), "tenable-bundle-secrets-"));
+  const secrets = Object.values(FAKE_TENABLE_SECRETS);
+  const clients = clientsFor(secretBearingRoutes());
+  const result = await exportTenableAuditBundle(clients, root, { now: NOW });
+  const files = readBundleFiles(result.outputDir);
+  const zipEntries = readZipEntries(result.zipPath);
+  assert.ok(files.has("core_data/policy_details.json") && files.has("core_data/scanners.json") && files.has("core_data/audit_log_events.json") && files.has("core_data/credentials.json"));
+  assertSecretsAbsent(assert, files, secrets, "bundle");
+  assertSecretsAbsent(assert, zipEntries, secrets, "zip");
+  assert.deepEqual([...files.keys()].sort(), [...zipEntries.keys()].sort(), "the zip mirrors the bundle directory");
+
+  const policyDetails = JSON.parse(files.get("core_data/policy_details.json"));
+  const projected = policyDetails.find((entry) => String(entry.policyId) === "1");
+  assert.deepEqual(Object.keys(projected.details).sort(), ["plugins", "settings", "uuid"], "policy details are projected to the verdict inputs only");
+  assert.equal(projected.details.settings.safe_checks, "yes");
+  assert.equal(projected.details.settings.smtp_password, "[REDACTED]");
+  assert.ok(!files.get("core_data/policy_details.json").includes("\"credentials\""));
+
+  const scanners = JSON.parse(files.get("core_data/scanners.json"));
+  assert.equal(scanners[0].key, "[REDACTED]");
+  assert.equal(scanners[0].registration_code, "[REDACTED]");
+  assert.equal(scanners[0].license, "[REDACTED]");
+  assert.equal(scanners[0].loaded_plugin_set, RECENT_PLUGIN_SET, "verdict inputs survive the scrub");
+
+  const events = JSON.parse(files.get("core_data/audit_log_events.json"));
+  const fields = events[0].fields;
+  assert.deepEqual(fields.find((field) => field.name === "api_token").value, "[REDACTED]");
+  assert.equal(fields.find((field) => field.name === "target_url").value, "https://hooks.example.com/services/T000/B000?token=[REDACTED]");
+  assert.equal(fields.find((field) => field.name === "X-Client-Id").value, "client-1");
+
+  const credentials = JSON.parse(files.get("core_data/credentials.json"));
+  assert.equal(credentials[0].settings.password, "[REDACTED]");
+  assert.equal(credentials[0].settings.clientSecret, "[REDACTED]");
+  assert.equal(credentials[0].settings.username, "svc");
+  assert.equal(credentials[0].name, "Linux SSH");
+
+  const findings = JSON.parse(files.get("analysis/findings.json"));
+  assert.equal(findings.find((item) => item.id === "TENABLE-01").status, "pass", "projection keeps the settings the verdict reads");
+  assert.equal(findings.find((item) => item.id === "TENABLE-08").status, "pass", "scanner plugin currency survives the credential scrub");
+  const healthyCredentials = byId(await runAll(clientsFor(healthyRoutes())), "TENABLE-12");
+  const scrubbedCredentials = findings.find((item) => item.id === "TENABLE-12");
+  assert.equal(scrubbedCredentials.status, healthyCredentials.status, "the credential inventory verdict is unaffected by the scrub");
+  assert.deepEqual(scrubbedCredentials.evidence.types, healthyCredentials.evidence.types);
+  assert.equal(result.errorCount, 0);
+  assert.ok(files.get("QUICK_REFERENCE.md").includes("redacted"), "the quick reference describes the redaction");
+
+  const results = await runAll(clients);
+  for (const secret of secrets) assert.ok(!JSON.stringify(results).includes(secret), `${secret} reached an assessment result`);
+});
+
+test("listPaginated stops as truncated when the endpoint ignores offset and replays the same page", async () => {
+  let calls = 0;
+  const stuck = createTenableClients(vmConfig(), {
+    fetchImpl: async () => {
+      calls += 1;
+      return jsonResponse({ networks: [{ uuid: "net-1", name: "Default", scanner_count: 1 }, { uuid: "net-2", name: "DMZ", scanner_count: 1 }], pagination: { total: 10 } });
+    },
+    sleepImpl: async () => {},
+  });
+  const page = await stuck.vm.listPaginated("/networks", "networks", {}, { pageLimit: 2, maxPages: 50 });
+  assert.equal(calls, 2, "the repeated page is detected on the second request");
+  assert.equal(page.items.length, 2, "duplicate records are not counted twice");
+  assert.equal(page.total, 10);
+  assert.equal(page.truncated, true, "a stuck offset is a partial inventory");
+
+  const routes = healthyRoutes();
+  const fallback = routerFetch(routes);
+  const clients = createTenableClients(vmConfig(), {
+    fetchImpl: async (url, init) => (new URL(url).pathname === "/networks"
+      ? jsonResponse({ networks: Array.from({ length: 50 }, (_, index) => ({ uuid: `net-${index}`, name: `Network ${index}`, scanner_count: 1 })) })
+      : fallback(url, init)),
+    sleepImpl: async () => {},
+    exportPollMs: 0,
+  });
+  const data = await collectTenableSensorCoverageData(clients, { now: NOW });
+  assert.equal(data.networks.status, "ok");
+  assert.equal(data.networks.truncated, true);
+  assert.equal(data.networks.seen, 50, "the walk stopped at the first repeated page");
+  const finding = assessTenableSensorCoverage(data, { now: NOW }).findings.find((item) => item.id === "TENABLE-09");
+  assert.equal(finding.status, "warn", finding.summary);
+  assert.match(finding.summary, /capped at warn/);
+});
+
+function forbidding(key) {
+  const routes = healthyRoutes();
+  // The healthy scanner last connected two days ago (TENABLE-07 fails on that); a recent
+  // connect makes scanner health depend only on the scanner list and the caller role.
+  routes["GET /scanners"] = { scanners: [{ ...routes["GET /scanners"].scanners[0], last_connect: Math.floor((NOW - 3_600_000) / 1000) }] };
+  routes[key] = { __status: 403 };
+  return routes;
+}
+
+test("rule 1 corollary: a pass never survives an unreadable secondary inventory and unread evidence renders null", async () => {
+  const templates = await runAll(clientsFor(forbidding("GET /editor/scan/templates")), { expectedAssetCount: 2 });
+  const scanPolicy = byId(templates, "TENABLE-01");
+  assert.equal(scanPolicy.status, "warn", scanPolicy.summary);
+  assert.match(scanPolicy.summary, /GET \/editor\/scan\/templates could not be read .*discovery-only scan detection was not possible/);
+  assert.equal(scanPolicy.evidence.scan_templates_in_use, null);
+  assert.equal(scanPolicy.evidence.policy_templates, null);
+  assert.equal(scanPolicy.evidence.discovery_only_scans, null);
+  assert.equal(scanPolicy.evidence.scan_templates_status, "forbidden");
+  assert.equal(byId(templates, "TENABLE-17").status, "manual");
+
+  const agents = await runAll(clientsFor(forbidding("GET /scanners/null/agents")), { expectedAssetCount: 2 });
+  const pluginCurrency = byId(agents, "TENABLE-08");
+  assert.equal(pluginCurrency.status, "warn", pluginCurrency.summary);
+  assert.match(pluginCurrency.summary, /GET \/scanners\/null\/agents could not be read .*agent plugin currency is unknown/);
+  assert.equal(pluginCurrency.evidence.stale_online_agents, null);
+  assert.equal(pluginCurrency.evidence.agents_status, "forbidden");
+  assert.equal(byId(agents, "TENABLE-07").status, "pass", "scanner health does not read the agent list");
+  assert.equal(byId(agents, "TENABLE-05").status, "manual");
+  assert.equal(byId(agents, "TENABLE-06").status, "manual");
+  assert.equal(agents[1].summary.agent_count, null);
+
+  const networks = await runAll(clientsFor(forbidding("GET /networks")), { expectedAssetCount: 2 });
+  const coverage = byId(networks, "TENABLE-03");
+  assert.equal(coverage.status, "warn", coverage.summary);
+  assert.match(coverage.summary, /GET \/networks could not be read/);
+  assert.equal(coverage.evidence.networks_without_assets, null);
+  assert.equal(coverage.evidence.networks_status, "forbidden");
+  assert.equal(byId(networks, "TENABLE-09").status, "manual");
+  assert.equal(networks[1].summary.network_count, null);
+
+  const tagValues = await runAll(clientsFor(forbidding("GET /tags/values")), { expectedAssetCount: 2 });
+  const tagging = byId(tagValues, "TENABLE-16");
+  assert.equal(tagging.status, "warn", tagging.summary);
+  assert.match(tagging.summary, /GET \/tags\/values could not be read/);
+  assert.equal(tagging.evidence.tag_value_count, null);
+
+  const serverProperties = await runAll(clientsFor(forbidding("GET /server/properties")));
+  const agentHealth = byId(serverProperties, "TENABLE-05");
+  assert.equal(agentHealth.status, "warn", agentHealth.summary);
+  assert.match(agentHealth.summary, /GET \/server\/properties \(license\.agents\) could not be read/);
+  assert.equal(agentHealth.evidence.licensed_agents, null);
+  assert.equal(byId(serverProperties, "TENABLE-08").status, "manual");
+
+  const agentGroups = await runAll(clientsFor(forbidding("GET /scanners/null/agent-groups")));
+  const grouping = byId(agentGroups, "TENABLE-06");
+  assert.equal(grouping.status, "manual");
+  assert.equal(grouping.evidence.groups, null);
+  assert.equal(grouping.evidence.agent_group_count, null);
+
+  const roles = await runAll(clientsFor(forbidding("GET /access-control/v1/roles")));
+  const userAccess = byId(roles, "TENABLE-10");
+  assert.equal(userAccess.status, "warn", userAccess.summary);
+  assert.match(userAccess.summary, /GET \/access-control\/v1\/roles could not be read/);
+  assert.equal(userAccess.evidence.custom_roles, null);
+
+  const groups = await runAll(clientsFor(forbidding("GET /groups")));
+  const permissions = byId(groups, "TENABLE-11");
+  assert.equal(permissions.status, "warn", permissions.summary);
+  assert.match(permissions.summary, /GET \/groups could not be read/);
+  assert.equal(permissions.evidence.user_groups, null);
+
+  const accessGroups = await runAll(clientsFor(forbidding("GET /v2/access-groups")));
+  const legacy = byId(accessGroups, "TENABLE-11");
+  assert.equal(legacy.status, "warn");
+  assert.equal(legacy.evidence.legacy_access_groups, null);
+  assert.equal(legacy.evidence.access_groups_status, "forbidden");
+
+  const jobs = await runAll(clientsFor(forbidding("GET /assets/export/status")));
+  const automation = byId(jobs, "TENABLE-19");
+  assert.equal(automation.status, "warn", automation.summary);
+  assert.match(automation.summary, /GET \/assets\/export\/status could not be read/);
+  assert.equal(automation.evidence.asset_export_jobs_listed, null);
+  assert.equal(automation.evidence.vuln_export_jobs_listed, 2);
+
+  const users = await runAll(clientsFor(forbidding("GET /users")), { expectedAssetCount: 2 });
+  assert.equal(byId(users, "TENABLE-07").status, "warn", "scanner health is capped when the caller role is unknown");
+  assert.equal(users[1].summary.caller_is_administrator, null);
+  assert.equal(users[2].summary.user_count, null);
+});
+
+test("assessment summaries render null, not zero, for every unreadable dataset", async () => {
+  const [scan, sensor, access, vuln] = await runAll(clientsFor(healthyRoutes(), { status: 403 }));
+  for (const [key, value] of Object.entries(scan.summary)) {
+    if (["scan_count", "policy_count", "exclusion_count", "target_group_count", "exported_assets", "caller_is_administrator"].includes(key)) assert.equal(value, null, `scan_program.summary.${key}`);
+  }
+  for (const key of ["exported_assets", "agent_count", "scanner_entries", "linked_scanners", "network_count", "tag_categories", "caller_is_administrator"]) assert.equal(sensor.summary[key], null, `sensor_coverage.summary.${key}`);
+  for (const key of ["user_count", "permission_count", "credential_count", "audit_events", "caller_is_administrator"]) assert.equal(access.summary[key], null, `access_control.summary.${key}`);
+  for (const key of ["exported_findings", "exported_assets"]) assert.equal(vuln.summary[key], null, `vulnerability_management.summary.${key}`);
+  for (const result of [scan, sensor, access, vuln]) {
+    assert.equal(result.summary.pass, 0, `${result.category}: nothing passes on forbidden data`);
+    assert.ok(result.summary.manual >= 1, `${result.category}: unreadable inventories are manual`);
+  }
 });
 
 test("resolveSecureOutputPath rejects traversal and symlinked parents", () => {
