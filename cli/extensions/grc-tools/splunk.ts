@@ -1446,19 +1446,33 @@ function parseSplunkDurationMinutes(value: string | undefined): number | undefin
   }
 }
 
-function downgradePassOnPartialInventory(
-  findings: SplunkFinding[],
-  sources: Array<[string, Collected<SplunkListResult> | undefined]>,
-): SplunkFinding[] {
-  const partialSources: Array<[string, SplunkListResult]> = [];
-  for (const [name, item] of sources) {
-    if (item?.ok && partialView(item.value)) partialSources.push([name, item.value]);
+/** A collected inventory and the control numbers whose verdict reads it. */
+type InventoryReaders = [name: string, collected: Collected<SplunkListResult> | undefined, readers: number[]];
+
+/**
+ * Rule 10 with the rule 1 corollary: a partially retrieved inventory demotes
+ * the passing findings that read it, and only those. A finding that never
+ * looked at the truncated list keeps its verdict, so a capped saved-search
+ * walk does not turn the password policy verdict into a warn.
+ */
+function downgradePassOnPartialInventory(findings: SplunkFinding[], sources: InventoryReaders[]): SplunkFinding[] {
+  const partialSources: Array<{ name: string; result: SplunkListResult; readers: number[] }> = [];
+  for (const [name, item, readers] of sources) {
+    if (item?.ok && partialView(item.value)) partialSources.push({ name, result: item.value, readers });
   }
   if (partialSources.length === 0) return findings;
-  const described = partialSources.map(([name, result]) => `${name} (${seenVersusTotal(result, "entries")})`);
-  return findings.map((item) => item.status === "pass"
-    ? { ...item, status: "warn", summary: `${item.summary} Downgraded: the ${described.join(", ")} inventory was only partially retrieved, so the verdict cannot be pass.`, evidence: { ...item.evidence, partial_sources: partialSources.map(([name]) => name) } }
-    : item);
+  return findings.map((item) => {
+    if (item.status !== "pass") return item;
+    const read = partialSources.filter((source) => source.readers.includes(item.control));
+    if (read.length === 0) return item;
+    const described = read.map((source) => `${source.name} (${seenVersusTotal(source.result, "entries")})`);
+    return {
+      ...item,
+      status: "warn",
+      summary: `${item.summary} Downgraded: the ${described.join(", ")} inventory was only partially retrieved, so the verdict cannot be pass.`,
+      evidence: { ...item.evidence, partial_sources: read.map((source) => source.name) },
+    };
+  });
 }
 
 function summarizeStatuses(findings: SplunkFinding[]): JsonRecord {
@@ -1496,6 +1510,8 @@ export async function assessSplunkAuthentication(
     collect(client, () => client.listRoles()),
   ]);
   const findings: SplunkFinding[] = [];
+  let providers: Collected<SplunkListResult> | undefined;
+  let mfa: Collected<SplunkListResult> | undefined;
 
   const authStanza = authConf.ok ? stanza(authConf.value, "authentication") : undefined;
   const authType = asString(authStanza?.authType);
@@ -1505,7 +1521,7 @@ export async function assessSplunkAuthentication(
   } else if (!authStanza || !authType) {
     findings.push(finding(1, "manual", "Unknown: authentication.conf was readable but the [authentication] stanza or its authType setting was absent; the documented default authType is Splunk (local), so confirm the effective authentication scheme manually.", inventoryNote(authConf.value)));
   } else if (authType === "SAML" || authType === "LDAP") {
-    const providers = authType === "SAML" ? await collect(client, () => client.listSamlProviders()) : await collect(client, () => client.listLdapProviders());
+    providers = authType === "SAML" ? await collect(client, () => client.listSamlProviders()) : await collect(client, () => client.listLdapProviders());
     const settingsNames = asStringList(authStanza.authSettings);
     const providerStanzas = settingsNames.map((name) => stanza(authConf.value, name)).filter((item): item is JsonRecord => Boolean(item));
     const disabledProviders = providerStanzas.filter((item) => asBoolean(item.disabled) === true);
@@ -1577,7 +1593,7 @@ export async function assessSplunkAuthentication(
     findings.push(manualUnreadable(3, "/services/configs/conf-authentication", authConf, "authentication.conf externalTwoFactorAuthVendor and the Duo or RSA stanza, or the SAML IdP MFA policy."));
   } else if (mfaVendor && /duo|rsa/i.test(mfaVendor)) {
     const vendorEndpoint = /duo/i.test(mfaVendor) ? "Duo-MFA" : "Rsa-MFA";
-    const mfa = await collect(client, () => client.listMfaProviders(vendorEndpoint));
+    mfa = await collect(client, () => client.listMfaProviders(vendorEndpoint));
     const evidence = { vendor: mfaVendor, endpoint: `/services/admin/${vendorEndpoint}`, entries: mfa.ok ? mfa.value.entries.map((entry) => entry.name) : null };
     if (mfa.ok && mfa.value.entries.length > 0) {
       findings.push(finding(3, "pass", `externalTwoFactorAuthVendor is ${mfaVendor} and the ${vendorEndpoint} configuration is present.`, evidence));
@@ -1677,7 +1693,16 @@ export async function assessSplunkAuthentication(
     }
   }
 
-  const finalFindings = downgradePassOnPartialInventory(findings, [["conf-authentication", authConf], ["conf-web", webConf], ["conf-server", serverConf], ["users", users], ["tokens", tokens]]);
+  const finalFindings = downgradePassOnPartialInventory(findings, [
+    ["conf-authentication", authConf, [1, 2, 3]],
+    [authType === "LDAP" ? "ldap-providers" : "saml-providers", providers, [1]],
+    ["mfa-providers", mfa, [3]],
+    ["conf-web", webConf, [4]],
+    ["conf-server", serverConf, [4]],
+    ["roles", roles, [5]],
+    ["users", users, [1, 6]],
+    ["tokens", tokens, [6]],
+  ]);
   return {
     title: "Splunk authentication and identity",
     summary: { url: client.getResolvedConfig().url, deployment: deployment.info.isCloud ? "splunk_cloud" : "enterprise", auth_type: authType ?? null, ...summarizeStatuses(finalFindings) },
@@ -1838,7 +1863,12 @@ export async function assessSplunkAccessControl(
     }
   }
 
-  const finalFindings = downgradePassOnPartialInventory(findings, [["roles", roles], ["users", users], ["saved-searches", savedSearches], ["lookup-table-files", lookups]]);
+  const finalFindings = downgradePassOnPartialInventory(findings, [
+    ["roles", roles, [7, 9, 10, 12]],
+    ["users", users, [8]],
+    ["saved-searches", savedSearches, [11]],
+    ["lookup-table-files", lookups, [11]],
+  ]);
   return {
     title: "Splunk authorization and access control",
     summary: { url: client.getResolvedConfig().url, roles: roles.ok ? roles.value.entries.length : null, users: users.ok ? users.value.entries.length : null, ...summarizeStatuses(finalFindings) },
@@ -2100,7 +2130,14 @@ export async function assessSplunkDataProtection(client: SplunkInspectorClient):
     findings.push(capWithCaveats(hecFinding, [acsCaveat, deploymentNote]));
   }
 
-  const finalFindings = downgradePassOnPartialInventory(findings, [["conf-server", serverConf], ["conf-web", webConf], ["conf-outputs", outputsConf], ["conf-inputs", inputsConf], ["hec-inputs", hecInputs], ["indexes", indexes]]);
+  const finalFindings = downgradePassOnPartialInventory(findings, [
+    ["conf-server", serverConf, [13]],
+    ["conf-web", webConf, [13]],
+    ["indexes", indexes, [14]],
+    ["conf-outputs", outputsConf, [15]],
+    ["conf-inputs", inputsConf, [15]],
+    ["hec-inputs", hecInputs, [16]],
+  ]);
   return {
     title: "Splunk data protection and encryption",
     summary: { url: client.getResolvedConfig().url, deployment: deployment.info.isCloud ? "splunk_cloud" : "enterprise", acs_configured: client.hasAcs(), ...summarizeStatuses(finalFindings) },
@@ -2213,7 +2250,12 @@ export async function assessSplunkAuditMonitoring(
     }
   }
 
-  const finalFindings = downgradePassOnPartialInventory(findings, [["indexes", indexes], ["roles", roles], ["users", users], ["conf-audit", auditConf]]);
+  const finalFindings = downgradePassOnPartialInventory(findings, [
+    ["indexes", indexes, [17, 18]],
+    ["conf-audit", auditConf, [17]],
+    ["roles", roles, [18]],
+    ["users", users, [18]],
+  ]);
   return {
     title: "Splunk audit and monitoring",
     summary: { url: client.getResolvedConfig().url, audit_index_visible: Boolean(auditIndex), ...summarizeStatuses(finalFindings) },
@@ -2515,7 +2557,15 @@ export async function assessSplunkPlatformHardening(client: SplunkInspectorClien
     findings.push(capWithCaveats(s2sFinding, [deploymentNote]));
   }
 
-  const finalFindings = downgradePassOnPartialInventory(findings, [["apps", apps], ["roles", roles], ["kv-collections", kvCollections], ["saved-searches", savedSearches], ["users", users], ["tcp-cooked-inputs", cookedInputs], ["conf-inputs", inputsConf]]);
+  const finalFindings = downgradePassOnPartialInventory(findings, [
+    ["apps", apps, [20]],
+    ["roles", roles, [20]],
+    ["kv-collections", kvCollections, [21]],
+    ["saved-searches", savedSearches, [22]],
+    ["users", users, [22]],
+    ["tcp-cooked-inputs", cookedInputs, [23]],
+    ["conf-inputs", inputsConf, [23]],
+  ]);
   return {
     title: "Splunk network and platform hardening",
     summary: { url: client.getResolvedConfig().url, deployment: deployment.info.isCloud ? "splunk_cloud" : "enterprise", version: deployment.info.version ?? null, acs_configured: client.hasAcs(), ...summarizeStatuses(finalFindings) },

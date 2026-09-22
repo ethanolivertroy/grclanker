@@ -178,7 +178,7 @@ function createFetch(fixture, options = {}) {
     const entries = fixture[url.pathname];
     if (entries === undefined) return jsonResponse({ messages: [{ type: "ERROR", text: "Not Found" }] }, 404);
     const offset = Number(url.searchParams.get("offset") ?? "0");
-    if (options.partial) {
+    if (options.partial || options.partialPaths?.includes(url.pathname)) {
       return jsonResponse(entryList(offset === 0 ? entries : [], entries.length + 5));
     }
     const count = Number(url.searchParams.get("count") ?? "100");
@@ -607,6 +607,68 @@ test("false-pass self-check (c): partial inventories never pass and record seen 
   assert.equal(rbac.evidence.total, 7);
   assert.equal(byId(results[1], "SPLUNK-AC-09").status, "manual");
   assert.match(byId(results[0], "SPLUNK-AUTH-06").summary, /1 of 6 tokens/);
+});
+
+/** Each paginated inventory and the finding ids whose verdict reads it; a truncated list demotes exactly these. */
+const INVENTORY_READERS = {
+  "/services/configs/conf-authentication": { name: "conf-authentication", readers: ["SPLUNK-AUTH-01", "SPLUNK-AUTH-02", "SPLUNK-AUTH-03"] },
+  "/services/authentication/providers/SAML": { name: "saml-providers", readers: ["SPLUNK-AUTH-01"] },
+  "/services/admin/Duo-MFA": { name: "mfa-providers", readers: ["SPLUNK-AUTH-03"] },
+  "/services/configs/conf-web": { name: "conf-web", readers: ["SPLUNK-AUTH-04", "SPLUNK-DP-13"] },
+  "/services/configs/conf-server": { name: "conf-server", readers: ["SPLUNK-AUTH-04", "SPLUNK-DP-13"] },
+  "/services/authentication/users": { name: "users", readers: ["SPLUNK-AUTH-01", "SPLUNK-AUTH-06", "SPLUNK-AC-08", "SPLUNK-AUD-18", "SPLUNK-PLAT-22"] },
+  "/services/authorization/tokens": { name: "tokens", readers: ["SPLUNK-AUTH-06"] },
+  "/services/authorization/roles": { name: "roles", readers: ["SPLUNK-AUTH-05", "SPLUNK-AC-07", "SPLUNK-AC-09", "SPLUNK-AC-10", "SPLUNK-AC-12", "SPLUNK-AUD-18", "SPLUNK-PLAT-20"] },
+  "/servicesNS/-/-/saved/searches": { name: "saved-searches", readers: ["SPLUNK-AC-11", "SPLUNK-PLAT-22"] },
+  "/servicesNS/-/-/data/lookup-table-files": { name: "lookup-table-files", readers: ["SPLUNK-AC-11"] },
+  "/services/configs/conf-outputs": { name: "conf-outputs", readers: ["SPLUNK-DP-15"] },
+  "/services/configs/conf-inputs": { name: "conf-inputs", readers: ["SPLUNK-DP-15", "SPLUNK-PLAT-23"] },
+  "/services/data/inputs/http": { name: "hec-inputs", readers: ["SPLUNK-DP-16"] },
+  "/services/data/indexes": { name: "indexes", readers: ["SPLUNK-DP-14", "SPLUNK-AUD-17", "SPLUNK-AUD-18"] },
+  "/services/configs/conf-audit": { name: "conf-audit", readers: ["SPLUNK-AUD-17"] },
+  "/services/apps/local": { name: "apps", readers: ["SPLUNK-PLAT-20"] },
+  "/servicesNS/-/-/storage/collections/config": { name: "kv-collections", readers: ["SPLUNK-PLAT-21"] },
+  "/services/data/inputs/tcp/cooked": { name: "tcp-cooked-inputs", readers: ["SPLUNK-PLAT-23"] },
+};
+
+test("rule 10 corollary: a truncated inventory demotes only the findings that read it, and every other pass keeps its verdict and summary", async () => {
+  const fixture = { ...HARDENED, "/services/configs/conf-audit": [entry("auditTrail", { queueing: "1", logging_format: "both" })] };
+  const baseline = new Map((await runAllAssessments(client(fixture).client)).flatMap((item) => item.findings).map((item) => [item.id, item]));
+  assert.equal(baseline.size, 23);
+  assert.equal([...baseline.values()].filter((item) => item.status === "pass").length, 20, "the fixture passes every finding that can pass");
+  assert.ok(Object.keys(INVENTORY_READERS).every((path) => path in fixture), "every paginated inventory the assessors read is in the fixture");
+
+  for (const [path, { name, readers }] of Object.entries(INVENTORY_READERS)) {
+    const { client: api, seen } = client(fixture, { partialPaths: [path] });
+    const findings = (await runAllAssessments(api)).flatMap((item) => item.findings);
+    assert.ok(seen.some((request) => request.pathname === path), `${name}: the truncated list was requested`);
+    for (const item of findings) {
+      const before = baseline.get(item.id);
+      if (readers.includes(item.id)) {
+        assert.notEqual(item.status, "pass", `${name} truncated: reader ${item.id} must not pass: ${item.summary}`);
+        if (before.status === "pass") {
+          assert.equal(item.status, "warn", `${name} truncated: reader ${item.id} demotes to warn`);
+          assert.match(item.summary, /(partially retrieved|before the walk stopped|were retrieved)/, `${name} truncated: ${item.id} states the partial view: ${item.summary}`);
+        }
+        if (item.evidence.partial_sources !== undefined) {
+          assert.deepEqual(item.evidence.partial_sources, [name], `${name} truncated: ${item.id} names only the inventory it read`);
+        }
+      } else {
+        assert.equal(item.status, before.status, `${name} truncated: non-reader ${item.id} keeps its ${before.status} verdict: ${item.summary}`);
+        assert.equal(item.summary, before.summary, `${name} truncated: non-reader ${item.id} keeps its summary`);
+        assert.equal(item.evidence.partial_sources, undefined, `${name} truncated: non-reader ${item.id} is not attributed to the truncated inventory`);
+      }
+    }
+  }
+
+  const { client: savedSearchesOnly } = client(fixture, { partialPaths: ["/servicesNS/-/-/saved/searches"] });
+  const authentication = await assessSplunkAuthentication(savedSearchesOnly);
+  assert.equal(byId(authentication, "SPLUNK-AUTH-02").status, "pass", "the password policy verdict never read the saved search list");
+  assert.equal(byId(authentication, "SPLUNK-AUTH-04").status, "pass", "the session timeout verdict never read the saved search list");
+  const access = await assessSplunkAccessControl(savedSearchesOnly);
+  assert.equal(byId(access, "SPLUNK-AC-11").status, "warn");
+  assert.match(byId(access, "SPLUNK-AC-11").summary, /Only 1 of 6 saved searches were retrieved/);
+  assert.equal(byId(access, "SPLUNK-AC-07").status, "pass", "the role verdicts never read the saved search list");
 });
 
 test("unreadable audit search downgrades an enabled _audit index to warn, and a disabled search skips to warn", async () => {
@@ -1074,9 +1136,11 @@ test("rule 10: list() reports a full last page without paging.total, the item ca
   assert.equal(capped.totalKnown, false);
   assert.equal(capped.entries.length, 9);
   const cappedAccess = await assessSplunkAccessControl(noTotal);
-  for (const id of ["SPLUNK-AC-07", "SPLUNK-AC-08", "SPLUNK-AC-09", "SPLUNK-AC-10", "SPLUNK-AC-12"]) {
+  for (const id of ["SPLUNK-AC-07", "SPLUNK-AC-09", "SPLUNK-AC-10", "SPLUNK-AC-12"]) {
     assert.notEqual(byId(cappedAccess, id).status, "pass", `${id}: ${byId(cappedAccess, id).summary}`);
   }
+  assert.equal(byId(cappedAccess, "SPLUNK-AC-08").status, "pass", "the admin count reads the user list, not the capped role list, so it keeps its verdict");
+  assert.equal(byId(cappedAccess, "SPLUNK-AC-11").status, "pass", "knowledge object permissions never read the capped role list");
   assert.match(byId(cappedAccess, "SPLUNK-AC-07").summary, /9 roles \(total unknown\)/);
   assert.equal(byId(cappedAccess, "SPLUNK-AC-07").evidence.total, null);
   assert.equal(byId(cappedAccess, "SPLUNK-AC-07").evidence.total_known, false);
