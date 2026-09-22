@@ -3,12 +3,14 @@ import assert from "node:assert/strict";
 import { createVerify, generateKeyPairSync } from "node:crypto";
 import {
   existsSync,
+  mkdirSync,
   mkdtempSync,
   readdirSync,
   realpathSync,
   readFileSync,
   rmSync,
   symlinkSync,
+  writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, join, relative } from "node:path";
@@ -2245,6 +2247,8 @@ test("scrubErrorText redacts every credential shape in free text and leaves beni
     "502 Bad Gateway: non-JSON error body (text/html; 236 bytes) (GET https://iam.googleapis.com/v1/projects/prod-audit/serviceAccounts)",
     "403 Forbidden: PERMISSION_DENIED: Compute Engine API has not been used in project 123456789012 before or it is disabled.; details ErrorInfo reason SERVICE_DISABLED, Help (GET https://compute.googleapis.com/compute/v1/projects/prod-audit/aggregated/instances)",
     "details ErrorInfo reason IAM_PERMISSION_DENIED, details ErrorInfo reason ACCESS_TOKEN_SCOPE_INSUFFICIENT",
+    "details PreconditionFailure, LocalizedMessage, ErrorInfo reason FAILED_PRECONDITION",
+    "details BadRequest, QuotaFailure, RetryInfo, DebugInfo, ResourceInfo, RequestInfo, Help; searchAllIamPolicies and allowedPolicyMemberDomains are camelCase",
     "service accounts unreadable for second-project via iam.googleapis.com/v1/projects/{project}/serviceAccounts (403 Forbidden)",
     `public IAM binding search not collected for the scope (cloudasset.googleapis.com/v1/{scope}:searchAllIamPolicies?query=${PUBLIC_MEMBER_IAM_QUERY} was not called): project inventory was unreadable`,
     "constraints/compute.requireOsLogin enforced; constraints/iam.allowedPolicyMemberDomains lists C0abc123",
@@ -2268,6 +2272,18 @@ test("scrubErrorText redacts every credential shape in free text and leaves beni
 
   // The heuristic cannot recognise arbitrary words, which is exactly why no response body is ever echoed.
   assert.equal(scrubErrorText(ERROR_CANARIES.bareHtml), ERROR_CANARIES.bareHtml);
+  // The PascalCase exemption admits words only: a digit, two adjacent capitals, or hex and base64 material still go.
+  const stillGo = {
+    "PascalCase with a digit": "PreconditionFailure7f3a9c1d",
+    "adjacent capitals without digits": "AbCDefghijklmnopqrstUvwxyz",
+    "ya29 without a shape prefix match": "a0AfH6SMBxCANARY7f3a9c1dZz",
+    "hex": "9f8e7d6c5b4a39281706f5e4d3c2b1a0",
+    "base64": "Q0FOQVJZQkVBUkVSN2YzYTlj",
+    "base64url": "dGhpcyBpcyBhIHRlc3QgdG9rZW4_-",
+  };
+  for (const [name, run] of Object.entries(stillGo)) {
+    assert.equal(scrubErrorText(`credential ${run} rejected`), "credential [REDACTED] rejected", `${name} must still be redacted in error text`);
+  }
   const keyName = "projects/prod-audit/serviceAccounts/svc@prod-audit.iam.gserviceaccount.com/keys/3f2a9c1d7b4e4c8a9d2e1f0a8b7c6d5e00000001";
   assert.equal(scrubErrorText(keyName, [], { longTokens: false }), keyName, "data mode keeps key names as evidence");
   assert.equal(scrubErrorText(keyName), "projects/prod-audit/serviceAccounts/svc@prod-audit.iam.gserviceaccount.com/keys/[REDACTED]", "error mode treats the same run as a token");
@@ -2466,7 +2482,11 @@ test("error-body walk: every GCP_INVENTORIES surface failing in four body shapes
   for (const row of INVENTORY_SURFACES) {
     for (const [shapeName, shape] of Object.entries(ERROR_BODY_SHAPES)) {
       const label = `${row.id} [${shapeName}]`;
-      const client = createClient(async (url, init) => (row.match(requestFacts(url, init)) ? shape.respond() : jsonResponse(routeForProject(url, init))));
+      const requested = new Set();
+      const client = createClient(async (url, init) => {
+        requested.add(url.split("?")[0]);
+        return row.match(requestFacts(url, init)) ? shape.respond() : jsonResponse(routeForProject(url, init));
+      });
 
       const thrown = await SURFACE_CLIENT_CALLS[row.id](client).then(() => null, (error) => error);
       assert.ok(thrown instanceof GcpApiError, `${label}: the direct client call throws a GcpApiError`);
@@ -2488,6 +2508,14 @@ test("error-body walk: every GCP_INVENTORIES surface failing in four body shapes
         assert.notEqual(byId[id].status, "pass", `${label}: ${id} must not pass`);
         const entries = byId[id].evidence.unreadable_inventories ?? [];
         assert.ok(entries.some((entry) => shape.disclosure.test(entry.error)), `${label}: ${id} lists the failure with its disclosure in unreadable_inventories (${JSON.stringify(entries)})`);
+      }
+      // A status-less note is abbreviated at a word boundary, so a summary never quotes a fragment of an endpoint.
+      for (const result of results) {
+        for (const finding of result.findings) {
+          for (const match of finding.summary.matchAll(/\((?:GET|POST) (https:\/\/[^\s()]+?)(?:\.\.\.)?(?: [^()]*)?\)/g)) {
+            assert.ok(requested.has(match[1]), `${label}: ${finding.id} summary quotes a URL fragment (${match[0]})`);
+          }
+        }
       }
       for (const result of results) {
         for (const marker of Object.values(result.snapshot).filter(isMarker)) {
@@ -2564,4 +2592,115 @@ test("project-only scope: without an organization ID the organization, SCC, and 
   }
   assert.deepEqual(markers.map((marker) => marker.dataset).sort(), ["Security Command Center sources", "VPC Service Controls perimeters", "organization metadata"], "exactly the three organization-scoped datasets carry markers");
   assert.ok(markers.every((marker) => marker.status === "not_collected"));
+});
+
+test("credential file loaders never echo the parser message, the file text, or the reader error", () => {
+  const keyBody = "MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQC7";
+  const pemHeader = "-----BEGIN PRIVATE KEY-----";
+  // The private_key line lost its opening quote, so the parser stops on the key body itself.
+  const unquoted = `{\n  "type": "service_account",\n  "client_email": "svc@prod-audit.iam.gserviceaccount.com",\n  "private_key": ${keyBody}\\n${pemHeader}\\n${ERROR_CANARIES.bearer}\\n-----END PRIVATE KEY-----\\n",\n  "token_uri": "https://oauth2.googleapis.com/token"\n}`;
+  // The same line lost its trailing comma, so the parser stops after the key material with a position.
+  const missingComma = `{\n  "type": "service_account",\n  "client_email": "svc@prod-audit.iam.gserviceaccount.com",\n  "private_key": "${pemHeader}\\n${keyBody} ${ERROR_CANARIES.bearer}\\n-----END PRIVATE KEY-----\\n"\n  "token_uri": "https://oauth2.googleapis.com/token"\n}`;
+  const parserWording = /Unexpected|token '|not valid JSON|position|line \d|column \d|Expected|property|minus sign/;
+  const fileText = new RegExp(`${keyBody.slice(0, 10)}|PRIVATE KEY|ate_key|service_account|gserviceaccount`);
+
+  assert.throws(() => JSON.parse(unquoted), (error) => error instanceof SyntaxError && /MIIEvQIBAD/.test(error.message), "positive control: V8 quotes the key body from the malformed line");
+  assert.throws(() => JSON.parse(missingComma), (error) => error instanceof SyntaxError && parserWording.test(error.message), "positive control: the parser message carries its own wording");
+
+  for (const [name, text] of Object.entries({ unquoted, missingComma })) {
+    assert.throws(() => parseGcpCredentialsJson(text, "/secure/sa.json"), (error) => {
+      assert.equal(error.message, "invalid JSON in /secure/sa.json", `${name}: a fixed description with the path only (V8 attaches no structured position)`);
+      return true;
+    });
+    assert.throws(() => resolveGcpConfiguration({}, { GCP_CREDENTIALS_FILE: "/secure/sa.json", GCP_PROJECT_ID: "p" }, () => undefined, (pathname) => (pathname === "/secure/sa.json" ? text : undefined)), (error) => {
+      assert.equal(error.message, "invalid JSON in /secure/sa.json", `${name}: the resolver names the file it read`);
+      assertNoCanary(error.message, `${name} resolver`);
+      assert.doesNotMatch(error.message, parserWording, `${name}: no parser wording`);
+      assert.doesNotMatch(error.message, fileText, `${name}: no file text`);
+      return true;
+    });
+  }
+  const throwsMessage = (fn, message, label) => assert.throws(fn, (error) => {
+    assert.equal(error.message, message, label);
+    return true;
+  });
+  throwsMessage(() => parseGcpCredentialsJson(unquoted), "invalid JSON in the credentials file", "without a path the description still names nothing from the file");
+  throwsMessage(() => parseGcpCredentialsJson(unquoted, "/keys/sa-3f2a9c1d7b4e4c8a9d2e1f0a8b7c6d5e.json"), "invalid JSON in /keys/sa-3f2a9c1d7b4e4c8a9d2e1f0a8b7c6d5e.json", "a path is a data value: a hash-named file keeps its name");
+  throwsMessage(() => parseGcpCredentialsJson(unquoted, `/tmp/${ERROR_CANARIES.bearer}/sa.json`), "invalid JSON in /tmp/[REDACTED]", "a path is a data value: a token shape inside it is still scrubbed (the ya29 rule admits / and . as token characters, so the suffix goes with it)");
+  throwsMessage(() => parseGcpCredentialsJson("[1, 2]", "/secure/sa.json"), "/secure/sa.json did not contain a JSON object.");
+  throwsMessage(() => parseGcpCredentialsJson(JSON.stringify({ type: "external_account" }), "/secure/sa.json"), 'Unsupported credentials type "external_account" in /secure/sa.json; expected service_account or authorized_user.', "a documented identifier shape is echoed");
+  throwsMessage(() => parseGcpCredentialsJson(JSON.stringify({ type: `external_account ${ERROR_CANARIES.bearer}` }), "/secure/sa.json"), 'Unsupported credentials type "unknown" in /secure/sa.json; expected service_account or authorized_user.', "a type without the identifier shape is dropped, not echoed");
+
+  const readFailures = {
+    EISDIR: Object.assign(new Error(`EISDIR: illegal operation on a directory, read '/secure/sa.json' ${ERROR_CANARIES.bearer}`), { code: "EISDIR", errno: -21, syscall: "read", path: "/secure/sa.json" }),
+    ENOENT: Object.assign(new Error(`ENOENT: no such file or directory, open '/secure/sa.json' ${ERROR_CANARIES.session}`), { code: "ENOENT", errno: -2, syscall: "open", path: "/secure/sa.json" }),
+  };
+  for (const [code, failure] of Object.entries(readFailures)) {
+    assert.throws(() => resolveGcpConfiguration({}, { GCP_CREDENTIALS_FILE: "/secure/sa.json", GCP_PROJECT_ID: "p" }, () => undefined, () => { throw failure; }), (error) => {
+      assert.equal(error.message, `unable to read /secure/sa.json (${code})`, `${code}: the path and the validated code only`);
+      return true;
+    });
+  }
+  const nonStandard = [
+    { name: "object with a numeric code and a secret message", value: { code: 12345, message: `reader exploded with ${ERROR_CANARIES.bearer}`, body: canaryHtmlPage() } },
+    { name: "string", value: `reader exploded with ${ERROR_CANARIES.apiKey}` },
+    { name: "error whose code is not an identifier", value: Object.assign(new Error(`bad code ${ERROR_CANARIES.session}`), { code: `EACCES ${ERROR_CANARIES.session}` }) },
+    { name: "error whose code is lowercase", value: Object.assign(new Error(`lower ${ERROR_CANARIES.session}`), { code: "eacces" }) },
+    { name: "null", value: null },
+  ];
+  for (const item of nonStandard) {
+    assert.throws(() => resolveGcpConfiguration({}, { GCP_CREDENTIALS_FILE: "/secure/sa.json", GCP_PROJECT_ID: "p" }, () => undefined, () => { throw item.value; }), (error) => {
+      assert.equal(error.message, "unable to read /secure/sa.json", `${item.name}: nothing from the thrown value is rendered`);
+      return true;
+    });
+  }
+  throwsMessage(() => resolveGcpConfiguration({}, { GOOGLE_APPLICATION_CREDENTIALS: "/secure/adc.json", GCP_PROJECT_ID: "p" }, () => undefined, () => { throw readFailures.EISDIR; }), "unable to read /secure/adc.json (EISDIR)", "the ADC path goes through the same reader");
+
+  // The default reader: a directory where the file should be, a malformed file on disk, and a missing file.
+  const base = createTempBase("grclanker-gcp-credentials-");
+  const directory = join(base, "sa.json");
+  mkdirSync(directory);
+  assert.throws(() => resolveGcpConfiguration({}, { GCP_CREDENTIALS_FILE: directory, GCP_PROJECT_ID: "p" }, () => undefined), (error) => {
+    assert.equal(error.message, `unable to read ${directory} (EISDIR)`);
+    return true;
+  });
+  const malformedPath = join(base, "malformed.json");
+  writeFileSync(malformedPath, unquoted, { mode: 0o600 });
+  assert.throws(() => resolveGcpConfiguration({}, { GCP_CREDENTIALS_FILE: malformedPath, GCP_PROJECT_ID: "p" }, () => undefined), (error) => {
+    assert.equal(error.message, `invalid JSON in ${malformedPath}`);
+    return true;
+  });
+  throwsMessage(() => resolveGcpConfiguration({}, { GCP_CREDENTIALS_FILE: join(base, "missing.json"), GCP_PROJECT_ID: "p" }, () => "opaque-gcloud-token"), `Credentials file not readable: ${join(base, "missing.json")}`, "a missing explicit file is reported without a code, since no read was attempted, and never falls through to gcloud");
+});
+
+test("exportGcpAuditBundle scrubs a shapeless configured token and an API key shape that arrive as data from every file and zip entry", async () => {
+  const configuredToken = "opaqueconfiguredtokenvalue";
+  const plantedKey = "AIzaSyCANARYDISPLAYNAME7f3a9c1d00000000";
+  const data = structuredClone(COMPLIANT);
+  data.organization.displayName = `Example Org ${plantedKey} ${configuredToken}`;
+  const config = sampleConfig({ accessToken: configuredToken });
+  const client = createClient(async (url, init) => jsonResponse(routeCompliant(url, init, data)), config);
+
+  const results = await runAllAssessments(client, { maxProjects: 5 });
+  const organization = findingsById(results)["GCP-ORG-01"];
+  assert.equal(organization.status, "pass");
+  assert.ok(organization.summary.includes(plantedKey) && organization.summary.includes(configuredToken), "in memory the display name is data and is kept verbatim; the bundle writer is the layer under test");
+
+  const exported = await exportGcpAuditBundle(client, config, createTempBase("grclanker-gcp-writer-layer-"), { max_projects: 5 });
+  assert.equal(exported.findingCount, 31);
+  assert.equal(exported.errorCount, 0);
+  const files = walkFiles(exported.outputDir).map((pathname) => ({ name: relative(exported.outputDir, pathname), content: readFileSync(pathname, "utf8") }));
+  const entries = readZipEntries(exported.zipPath).filter((entry) => !entry.name.endsWith("/"));
+  assert.ok(files.length >= 30 && entries.length === files.length, "every file is walked and every zip entry is compared");
+  for (const file of files) {
+    assert.ok(!file.content.includes(plantedKey) && !file.content.includes(plantedKey.slice(0, 16)), `${file.name}: the API key shape in a display name reached the bundle`);
+    assert.ok(!file.content.includes(configuredToken), `${file.name}: the configured token in a display name reached the bundle`);
+  }
+  for (const entry of entries) {
+    assert.ok(!entry.content.includes(plantedKey) && !entry.content.includes(configuredToken), `zip entry ${entry.name} carries a planted value`);
+  }
+  const rendered = files.filter((file) => file.content.includes("Example Org [REDACTED] [REDACTED]"));
+  assert.ok(rendered.some((file) => file.name === join("core_data", "org-guardrails.json")), "the snapshot keeps the display name's words and redacts only the planted values");
+  assert.ok(rendered.some((file) => file.name === join("analysis", "findings.json")), "the finding summary keeps the display name's words and redacts only the planted values");
+  assert.ok(rendered.length >= 3, `the display name reaches at least the snapshot, findings.json, and the category file (${rendered.map((file) => file.name).join(", ")})`);
 });

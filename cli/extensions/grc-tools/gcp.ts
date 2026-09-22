@@ -268,6 +268,7 @@ export interface GcpProjectInventory {
 }
 
 type GcpCommandRunner = (command: string, args: string[]) => string | undefined;
+/** Returns the file text, undefined when the file does not exist, or throws (a Node system error by preference) when it cannot be read. */
 type GcpFileReader = (pathname: string) => string | undefined;
 type FetchImpl = typeof fetch;
 
@@ -408,7 +409,12 @@ const NON_CREDENTIAL_KEY_SUFFIX_PATTERN = /(?:[_-]|[a-z](?=[A-Z]))(?:path|file|u
  */
 const LONG_TOKEN_RUN_PATTERN = /[A-Za-z0-9+_-]{16,}/g;
 const UPPERCASE_CODE_PATTERN = /^[A-Z][A-Z_-]*$/;
-const WORD_SEGMENT_PATTERN = /^(?:[A-Z]?[a-z]+|[A-Z]+|[a-z]+(?:[A-Z][a-z]+)+)$/;
+/**
+ * A segment made of words: an all-caps word, a lowercase or Capitalized word, or camelCase and PascalCase words
+ * without digits (searchAllIamPolicies, PreconditionFailure, LocalizedMessage). Every capital must start a
+ * lowercase run, so two adjacent capitals (AIza, base64 material) or any digit (ya29., hex) fail the test.
+ */
+const WORD_SEGMENT_PATTERN = /^(?:[A-Z]+|[A-Z]?[a-z]+(?:[A-Z][a-z]+)*)$/;
 
 function hasTokenShape(value: string): boolean {
   return /\d/.test(value) || (/[a-z]/.test(value) && /[A-Z]/.test(value));
@@ -416,8 +422,9 @@ function hasTokenShape(value: string): boolean {
 
 /**
  * A run of 16 or more token characters is a credential when it carries a digit or mixed case and is not made
- * of words: google.rpc codes and reasons (IAM_PERMISSION_DENIED), snake_case and camelCase identifiers
- * (searchAllIamPolicies, allowedPolicyMemberDomains), and Header-Style names are left alone.
+ * of words: google.rpc codes and reasons (IAM_PERMISSION_DENIED), snake_case, camelCase, and PascalCase
+ * identifiers (searchAllIamPolicies, allowedPolicyMemberDomains, PreconditionFailure), and Header-Style names
+ * are left alone.
  */
 function looksLikeToken(run: string): boolean {
   if (UPPERCASE_CODE_PATTERN.test(run)) return false;
@@ -726,23 +733,77 @@ function defaultCommandRunner(command: string, args: string[]): string | undefin
   }
 }
 
+/** A missing file is undefined; a file that exists but cannot be read (EACCES, EISDIR) throws the system error for readCredentialsFile to describe by code. */
 function defaultFileReader(pathname: string): string | undefined {
+  return existsSync(pathname) ? readFileSync(pathname, "utf8") : undefined;
+}
+
+/** The `code` of a Node system error (ENOENT, EACCES, EISDIR): a fixed identifier, never the message. */
+function systemErrorCode(error: unknown): string | undefined {
+  const code = asObject(error)?.code;
+  return typeof code === "string" && /^E[A-Z0-9_]{1,30}$/.test(code) ? code : undefined;
+}
+
+/**
+ * A structured parse position, when the runtime attaches one to the SyntaxError. V8 attaches none (its position
+ * lives in the message text, which is never read), so on Node the description carries the path alone.
+ */
+function jsonErrorPosition(error: unknown): string | undefined {
+  const record = asObject(error);
+  const line = record?.lineNumber;
+  const column = record?.columnNumber;
+  const position = record?.position;
+  if (typeof line === "number" && Number.isInteger(line) && line >= 0) {
+    return typeof column === "number" && Number.isInteger(column) && column >= 0 ? ` at line ${line} column ${column}` : ` at line ${line}`;
+  }
+  return typeof position === "number" && Number.isInteger(position) && position >= 0 ? ` at position ${position}` : undefined;
+}
+
+/**
+ * Loader errors carry fixed wording plus a path the operator configured, which is a data value: every shape rule
+ * and exact secret applies, the long-token heuristic does not, so a directory named after a hash or a random suffix
+ * survives as the pointer it is. Anything that surfaces through a tool still passes describeError's full scrub.
+ */
+function loaderError(message: string): Error {
+  return new Error(scrubDataText(message, []));
+}
+
+/**
+ * Reads a credentials file through the configured reader. The reader's error is never interpolated (a filesystem
+ * message can quote the path and, for a non-standard reader, anything): the thrown text is a fixed description with
+ * the path and the validated system error code, scrubbed like every other error this module raises.
+ */
+function readCredentialsFile(pathname: string, fileReader: GcpFileReader): string | undefined {
   try {
-    return existsSync(pathname) ? readFileSync(pathname, "utf8") : undefined;
-  } catch {
-    return undefined;
+    return fileReader(pathname);
+  } catch (error) {
+    const code = systemErrorCode(error);
+    throw loaderError(`unable to read ${pathname}${code ? ` (${code})` : ""}`);
   }
 }
+
+const CREDENTIALS_TYPE_PATTERN = /^[a-z][a-z0-9_]{0,63}$/;
 
 /**
  * Parses a Google credentials JSON file. Service account keys carry
  * type "service_account", client_email, private_key, and token_uri; ADC user
  * credentials carry type "authorized_user", client_id, client_secret, and
  * refresh_token (GCP_DOCS.serviceAccountJwt, GCP_DOCS.adc).
+ *
+ * The parser's error is never interpolated: V8 quotes the characters around the fault, which for a malformed
+ * private_key line is key material. A parse failure throws a fixed description with the path (and a position only
+ * when the runtime attaches a structured one), and the type field is echoed only when it has the shape of a
+ * documented credential type identifier.
  */
-export function parseGcpCredentialsJson(text: string): GcpFileCredentials {
-  const parsed = asObject(JSON.parse(text));
-  if (!parsed) throw new Error("Credentials file did not contain a JSON object.");
+export function parseGcpCredentialsJson(text: string, pathname = "the credentials file"): GcpFileCredentials {
+  let payload: unknown;
+  try {
+    payload = JSON.parse(text);
+  } catch (error) {
+    throw loaderError(`invalid JSON in ${pathname}${jsonErrorPosition(error) ?? ""}`);
+  }
+  const parsed = asObject(payload);
+  if (!parsed) throw loaderError(`${pathname} did not contain a JSON object.`);
   const type = asString(parsed.type);
   switch (type) {
     case "service_account": {
@@ -769,7 +830,7 @@ export function parseGcpCredentialsJson(text: string): GcpFileCredentials {
       return { type: "authorized_user", clientId, clientSecret, refreshToken, tokenUri: DEFAULT_TOKEN_URI };
     }
     default:
-      throw new Error(`Unsupported credentials type "${type ?? "unknown"}"; expected service_account or authorized_user.`);
+      throw loaderError(`Unsupported credentials type "${type && CREDENTIALS_TYPE_PATTERN.test(type) ? type : "unknown"}" in ${pathname}; expected service_account or authorized_user.`);
   }
 }
 
@@ -904,14 +965,14 @@ export function resolveGcpConfiguration(
     ];
     for (const [source, candidate] of candidates) {
       if (!candidate) continue;
-      const text = fileReader(candidate);
+      const text = readCredentialsFile(candidate, fileReader);
       if (!text) {
         if (source !== "application-default-credentials") {
-          throw new Error(`Credentials file not readable: ${candidate}`);
+          throw loaderError(`Credentials file not readable: ${candidate}`);
         }
         continue;
       }
-      credentials = parseGcpCredentialsJson(text);
+      credentials = parseGcpCredentialsJson(text, candidate);
       credentialsPath = candidate;
       sourceChain.push(source);
       break;
@@ -1547,7 +1608,18 @@ export interface UnreadableInventory {
  * nested text belongs to another call and is never harvested. Non-HTTP errors keep their start.
  */
 function shortError(error: string): string {
-  return error.match(/^(?:[^\s():]+: )?(\d{3} [A-Za-z][A-Za-z ]*)/)?.[1]?.trim() ?? error.slice(0, 80);
+  return error.match(/^(?:[^\s():]+: )?(\d{3} [A-Za-z][A-Za-z ]*)/)?.[1]?.trim() ?? truncateAtWord(error, 80);
+}
+
+/**
+ * About `max` characters cut at a space: back to the last space when that keeps at least half, otherwise forward
+ * to the next one, so a note that starts with an endpoint keeps the endpoint whole instead of a URL fragment.
+ */
+function truncateAtWord(text: string, max: number): string {
+  if (text.length <= max) return text;
+  const back = text.lastIndexOf(" ", max);
+  const cut = back > max / 2 ? back : text.indexOf(" ", max);
+  return cut === -1 ? text : `${text.slice(0, cut).trimEnd()}...`;
 }
 
 function describeUnreadable(entry: UnreadableInventory): string {
