@@ -30,6 +30,7 @@ Configuration precedence is explicit tool arguments, then environment variables,
 | `SERVICENOW_USERNAME` / `SERVICENOW_PASSWORD` | Basic auth, or the OAuth password grant when client credentials are also set |
 | `SERVICENOW_CLIENT_ID` / `SERVICENOW_CLIENT_SECRET` | OAuth application registry client (client credentials grant, or password grant with a user) |
 | `SERVICENOW_ACCESS_TOKEN` | Pre-issued bearer token |
+| `SERVICENOW_REFRESH_TOKEN` | Refresh token issued earlier to the OAuth client; with the client ID and secret, the first exchange uses the `refresh_token` grant |
 | `SERVICENOW_CONFIG_FILE` | YAML config file path |
 | `SERVICENOW_TIMEOUT`, `SERVICENOW_MAX_RETRIES`, `SERVICENOW_PAGE_SIZE` | HTTP timeout in seconds (default 30), retries for 429 and 5xx (default 3), Table API page size (default 500) |
 
@@ -43,6 +44,7 @@ Tokens are exchanged at `POST https://<instance>.service-now.com/oauth_token.do`
 
 - Client credentials grant: create an application registry entry ("Create an OAuth API endpoint for external clients"), set the OAuth Application User to the audit account, and set the system property `glide.oauth.inbound.client.credential.grant_type.enabled` to `true`. Provide `SERVICENOW_CLIENT_ID` and `SERVICENOW_CLIENT_SECRET`.
 - Password grant: provide the client ID and secret plus `SERVICENOW_USERNAME` and `SERVICENOW_PASSWORD`; the client sends `grant_type=password` and refreshes with `refresh_token` when one is issued.
+- Refresh token grant: provide the client ID and secret plus `SERVICENOW_REFRESH_TOKEN` (`refresh_token` in the config file, or the `refresh_token` argument; argument over environment over file, like every other credential); the first exchange sends `grant_type=refresh_token` and no password. The token is a configured secret: it is removed from every error string, row, and evidence text the tools keep.
 - Pre-issued token: provide `SERVICENOW_ACCESS_TOKEN`.
 
 ### Mutual TLS
@@ -60,7 +62,7 @@ Tokens are exchanged at `POST https://<instance>.service-now.com/oauth_token.do`
 | `servicenow_assess_operations_governance` | Controls 9, 10, 15, 19, 20. Option: `record_limit`. |
 | `servicenow_export_audit_bundle` | Runs the access check and all four assessments, then writes `core_data/` (Table API and Aggregate API snapshots projected to the requested `sysparm_fields`, with `truncated`, `total_unknown`, and `partial` flags per table; a table or aggregate that was forbidden, errored, or never requested is written as a `{ collected: false, table, query, status, endpoint, error }` marker instead of an empty list), `analysis/` (`findings.json`, per-area results with an `inventories` map that reports each table as read, `unread (...)`, or `not requested (...)`, `summary.json`), `compliance/` (`executive_summary.md`, `unified_compliance_matrix.md`, one report per framework), `QUICK_REFERENCE.md`, `metadata.json`, `_errors.log` when collection partially failed, and a zip archive named after the allocated output directory. Reruns allocate `-2`, `-3`, ... instead of overwriting. Default output root: `./export/servicenow`. |
 
-All tools accept the authentication arguments (`instance`, `instance_url`, `auth_method`, `username`, `password`, `client_id`, `client_secret`, `access_token`, `config_file`, `timeout_seconds`, `max_retries`, `page_size`).
+All tools accept the authentication arguments (`instance`, `instance_url`, `auth_method`, `username`, `password`, `client_id`, `client_secret`, `access_token`, `refresh_token`, `config_file`, `timeout_seconds`, `max_retries`, `page_size`).
 
 ## Verdict semantics
 

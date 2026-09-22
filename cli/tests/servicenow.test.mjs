@@ -2591,6 +2591,107 @@ test("round 7 note 2: credentials and the config file path set through the envir
   assert.deepEqual(shadowed.sourceChain, [`config-file:${configPath}`, "environment", "arguments"]);
 });
 
+/** Refresh tokens planted per source: random alphanumeric, distinct in every 6-character window (self-checked below). */
+const REFRESH_TOKEN_CANARY = Object.freeze({
+  file: "jnBCGxW6wDVSRhnt68ZHxF4R",
+  env: "LW6vTSyzJqJ74SEkWxJTkEfn",
+  argument: "v5GqAADTJezGBAKAy6A2CTnG",
+  clientSecret: "F3282AzaVAnDy8QxzdVgC9h8",
+});
+
+/**
+ * CodeRabbit (#62, second review) item 1: `refreshToken` is a real configuration input. Each source alone
+ * (config file `refresh_token`, `SERVICENOW_REFRESH_TOKEN`, the `refresh_token` argument) resolves it and the
+ * first token exchange uses the refresh_token grant carrying it; precedence is argument over environment
+ * over file; an unrelated argument does not erase an environment-provided token (round 7 note 2); and the
+ * value is a configured secret, so no 6-to-24-character window of it reaches the access check, an
+ * assessment, a bundle file, or a zip entry, even when a row's free text echoes it.
+ */
+test("CodeRabbit (#62, second review) item 1: a refresh token configured through the file, the environment, or an argument selects the refresh_token grant on the first exchange, resolves argument over environment over file, survives an unrelated argument, and never reaches any output", async () => {
+  assertPlantedValuesWellFormed(assert, REFRESH_TOKEN_CANARY, [["healthy fixture", JSON.stringify(healthyFixture())]]);
+  const base = createTempBase("servicenow-refresh-token-");
+  const configPath = join(base, "servicenow.yaml");
+  writeFileSync(configPath, ["servicenow:", "  instance: fileinstance", "  client_id: file-client", `  client_secret: ${REFRESH_TOKEN_CANARY.clientSecret}`, `  refresh_token: ${REFRESH_TOKEN_CANARY.file}`, ""].join("\n"));
+  const envOnly = { SERVICENOW_INSTANCE: "envinstance", SERVICENOW_CLIENT_ID: "env-client", SERVICENOW_CLIENT_SECRET: REFRESH_TOKEN_CANARY.clientSecret, SERVICENOW_REFRESH_TOKEN: REFRESH_TOKEN_CANARY.env };
+  const argumentsOnly = { instance: "arginstance", client_id: "arg-client", client_secret: REFRESH_TOKEN_CANARY.clientSecret, refresh_token: REFRESH_TOKEN_CANARY.argument };
+  const options = { cwd: base, homeDir: base };
+
+  const sources = [
+    ["config file", resolveServicenowConfiguration({ config_file: configPath }, {}, options), REFRESH_TOKEN_CANARY.file, `config-file:${configPath}`],
+    ["environment", resolveServicenowConfiguration({}, envOnly, options), REFRESH_TOKEN_CANARY.env, "environment"],
+    ["argument", resolveServicenowConfiguration(argumentsOnly, {}, options), REFRESH_TOKEN_CANARY.argument, "arguments"],
+  ];
+  for (const [label, resolved, expected, source] of sources) {
+    assert.equal(resolved.authMode, "oauth", `${label}: client credentials with a refresh token infer OAuth`);
+    assert.equal(resolved.refreshToken, expected, `${label}: the refresh token resolves from that source alone`);
+    assert.ok(resolved.sourceChain.includes(source), `${label}: the source chain names the source: ${JSON.stringify(resolved.sourceChain)}`);
+
+    // The first exchange is the refresh_token grant carrying that token; the bearer it returns is then used.
+    const inner = fixtureFetch(healthyFixture());
+    const tokenCalls = [];
+    const fetchImpl = async (input, init) => {
+      const url = new URL(String(input));
+      if (url.pathname === "/oauth_token.do") {
+        tokenCalls.push({ url, init });
+        return jsonResponse({ access_token: "oauth-access-token", expires_in: 1799, token_type: "Bearer" });
+      }
+      return inner.fetchImpl(input, init);
+    };
+    const client = new ServicenowApiClient(resolved, { fetchImpl, sleep: async () => {} });
+    const snapshot = await client.queryTable("sys_user_role");
+    assert.equal(snapshot.rows.length, 2, label);
+    assert.equal(tokenCalls.length, 1, `${label}: one exchange`);
+    const body = new URLSearchParams(tokenCalls[0].init.body);
+    assert.equal(body.get("grant_type"), "refresh_token", `${label}: the first exchange is the refresh_token grant`);
+    assert.equal(body.get("refresh_token"), expected, `${label}: the exchange carries the configured token`);
+    assert.equal(body.get("client_id"), resolved.clientId, label);
+    assert.equal(body.get("password"), null, `${label}: no password grant is attempted`);
+    assert.equal(inner.calls[0].init.headers.get("authorization"), "Bearer oauth-access-token", label);
+  }
+
+  // Precedence: the environment overrides the file, an argument overrides both.
+  const fileAndEnv = resolveServicenowConfiguration({ config_file: configPath }, envOnly, options);
+  assert.equal(fileAndEnv.refreshToken, REFRESH_TOKEN_CANARY.env, "environment over file");
+  const all = resolveServicenowConfiguration({ config_file: configPath, refresh_token: REFRESH_TOKEN_CANARY.argument }, envOnly, options);
+  assert.equal(all.refreshToken, REFRESH_TOKEN_CANARY.argument, "argument over environment over file");
+
+  // Round 7 note 2: an unrelated argument, or an undefined refresh_token key, leaves the environment token in place.
+  for (const [label, unrelated] of [["page_size", { page_size: 100 }], ["max_retries", { max_retries: 2 }], ["undefined refresh_token", { refresh_token: undefined, page_size: 50 }]]) {
+    const resolved = resolveServicenowConfiguration(unrelated, envOnly, options);
+    assert.equal(resolved.refreshToken, REFRESH_TOKEN_CANARY.env, `${label}: the environment refresh token survives`);
+    assert.deepEqual(resolved.sourceChain, ["environment", "arguments"], label);
+  }
+
+  // The configured token is a registered secret: echoed in a row's free text, it never reaches any output.
+  const config = resolveServicenowConfiguration({}, envOnly, options);
+  const { fetchImpl } = fixtureFetch(healthyFixture(), { oauthToken: "oauth-access-token" });
+  const echoing = injectingFetch(fetchImpl, `refresh token ${REFRESH_TOKEN_CANARY.env} on file`);
+  const client = new ServicenowApiClient(config, { fetchImpl: echoing, sleep: async () => {}, now: () => FIXED_NOW });
+  const access = await checkServicenowAccess(client);
+  const assessments = await Promise.all([
+    assessServicenowIdentityAccess(client),
+    assessServicenowPlatformHardening(client),
+    assessServicenowAccessControl(client),
+    assessServicenowOperationsGovernance(client),
+  ]);
+  const exportBase = createTempBase("servicenow-refresh-token-export-");
+  try {
+    const result = await exportServicenowAuditBundle(client, config, exportBase);
+    const texts = [
+      ["check_access", JSON.stringify(access)],
+      ["assessments", JSON.stringify(assessments)],
+      ...[...readBundleFiles(result.outputDir)].map(([name, content]) => [`bundle file ${name}`, content]),
+      ...[...readZipEntries(result.zipPath)].map(([name, content]) => [`zip entry ${name}`, content]),
+    ];
+    assert.ok(texts.some(([, text]) => text.includes("refresh token [REDACTED] on file")), "the echoing row text reached an output with the token replaced");
+    for (const [label, text] of texts) assertFragmentsAbsent(assert, text, Object.values(REFRESH_TOKEN_CANARY), label);
+    assert.equal(access.surfaces.filter((surface) => surface.status === "readable").length > 0, true, "the refresh grant produced a usable bearer");
+  } finally {
+    rmSync(exportBase, { recursive: true, force: true });
+    rmSync(base, { recursive: true, force: true });
+  }
+});
+
 test("review round item 13, extended: SNOW-08 and SNOW-17 do not assert the absence of a provider, plugin, or rule from a partial read", async () => {
   const inactiveProviders = healthyFixture();
   inactiveProviders.tables.sso_properties = inactiveProviders.tables.sso_properties.map((row) => ({ ...row, active: "false" }));

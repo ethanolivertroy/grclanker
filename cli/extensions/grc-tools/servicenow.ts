@@ -169,7 +169,7 @@ export interface ServicenowResolvedConfig {
   clientId?: string;
   clientSecret?: string;
   accessToken?: string;
-  /** A refresh token issued earlier to the OAuth client; when present the first token exchange uses the refresh_token grant. */
+  /** A refresh token issued earlier to the OAuth client (refresh_token in the config file, SERVICENOW_REFRESH_TOKEN, or the refresh_token argument); when present the first token exchange uses the refresh_token grant. */
   refreshToken?: string;
   timeoutMs: number;
   maxRetries: number;
@@ -338,6 +338,7 @@ type AuthArgs = {
   client_id?: string;
   client_secret?: string;
   access_token?: string;
+  refresh_token?: string;
   config_file?: string;
   timeout_seconds?: number;
   max_retries?: number;
@@ -841,6 +842,7 @@ interface ConfigOverlay {
   clientId?: string;
   clientSecret?: string;
   accessToken?: string;
+  refreshToken?: string;
   timeoutSeconds?: number;
   maxRetries?: number;
   pageSize?: number;
@@ -862,6 +864,7 @@ function overlayFromRecord(record: JsonRecord): ConfigOverlay {
     clientId: asString(pick("client_id", "clientId")),
     clientSecret: asString(pick("client_secret", "clientSecret")),
     accessToken: asString(pick("access_token", "accessToken", "token")),
+    refreshToken: asString(pick("refresh_token", "refreshToken")),
     timeoutSeconds: asNumber(pick("timeout_seconds", "timeout")),
     maxRetries: asNumber(pick("max_retries", "maxRetries")),
     pageSize: asNumber(pick("page_size", "pageSize")),
@@ -878,6 +881,7 @@ function overlayFromEnv(env: NodeJS.ProcessEnv): ConfigOverlay {
     clientId: asString(env.SERVICENOW_CLIENT_ID),
     clientSecret: asString(env.SERVICENOW_CLIENT_SECRET),
     accessToken: asString(env.SERVICENOW_ACCESS_TOKEN) ?? asString(env.SERVICENOW_TOKEN),
+    refreshToken: asString(env.SERVICENOW_REFRESH_TOKEN),
     timeoutSeconds: asNumber(env.SERVICENOW_TIMEOUT),
     maxRetries: asNumber(env.SERVICENOW_MAX_RETRIES),
     pageSize: asNumber(env.SERVICENOW_PAGE_SIZE),
@@ -951,6 +955,7 @@ export function resolveServicenowConfiguration(
     client_id: input.client_id,
     client_secret: input.client_secret,
     access_token: input.access_token,
+    refresh_token: input.refresh_token,
     timeout_seconds: input.timeout_seconds,
     max_retries: input.max_retries,
     page_size: input.page_size,
@@ -994,6 +999,7 @@ export function resolveServicenowConfiguration(
     clientId: overlay.clientId,
     clientSecret: overlay.clientSecret,
     accessToken: overlay.accessToken,
+    refreshToken: overlay.refreshToken,
     timeoutMs: parseTimeoutSeconds(overlay.timeoutSeconds),
     maxRetries: clampNumber(overlay.maxRetries, DEFAULT_MAX_RETRIES, 0, 10),
     pageSize: clampNumber(overlay.pageSize, DEFAULT_PAGE_SIZE, 1, 10_000),
@@ -3801,6 +3807,7 @@ function normalizeAuthArgs(args: unknown): AuthArgs {
     client_id: asString(value.client_id),
     client_secret: asString(value.client_secret),
     access_token: asString(value.access_token),
+    refresh_token: asString(value.refresh_token),
     config_file: asString(value.config_file),
     timeout_seconds: asNumber(value.timeout_seconds),
     max_retries: asNumber(value.max_retries),
@@ -3876,6 +3883,7 @@ const authParams = {
   client_id: Type.Optional(Type.String({ description: "OAuth application registry client ID. Defaults to SERVICENOW_CLIENT_ID." })),
   client_secret: Type.Optional(Type.String({ description: "OAuth application registry client secret. Defaults to SERVICENOW_CLIENT_SECRET." })),
   access_token: Type.Optional(Type.String({ description: "Pre-issued OAuth bearer token. Defaults to SERVICENOW_ACCESS_TOKEN." })),
+  refresh_token: Type.Optional(Type.String({ description: "OAuth refresh token issued earlier to the client; with client_id and client_secret the first token exchange uses the refresh_token grant. Defaults to SERVICENOW_REFRESH_TOKEN." })),
   config_file: Type.Optional(Type.String({ description: "YAML config file. Defaults to SERVICENOW_CONFIG_FILE, ./.servicenow.yaml, or ~/.servicenow-sec-inspector/config.yaml." })),
   timeout_seconds: Type.Optional(Type.Number({ description: "HTTP timeout in seconds. Defaults to 30.", default: 30 })),
   max_retries: Type.Optional(Type.Number({ description: "Retries for 429 and 5xx responses. Defaults to 3.", default: 3 })),
