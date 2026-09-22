@@ -888,10 +888,7 @@ export function redactSecrets(message: string, secrets: ReadonlyArray<string | u
  */
 export function configuredZendeskSecrets(config: ZendeskResolvedConfig): string[] {
   const secrets = [config.apiToken, config.oauthToken];
-  if (config.email && config.apiToken) {
-    const basic = `${config.email}/token:${config.apiToken}`;
-    secrets.push(basic, Buffer.from(basic).toString("base64"));
-  }
+  if (config.email && config.apiToken) secrets.push(Buffer.from(`${config.email}/token:${config.apiToken}`).toString("base64"));
   return secrets.filter((value): value is string => typeof value === "string" && value.length >= MIN_CONFIGURED_SECRET_LENGTH);
 }
 

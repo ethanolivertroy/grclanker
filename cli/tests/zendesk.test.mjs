@@ -2156,7 +2156,8 @@ test("scrub boundary: name-shaped values stay bare in prose, leave every carrier
   }
   // The composed Basic credential is its own configured secret: no encoding of the token alone matches it.
   const secrets = configuredZendeskSecrets(sampleConfig());
-  assert.deepEqual(secrets, [FIXTURE_API_TOKEN, `auditor@example.com/token:${FIXTURE_API_TOKEN}`, FIXTURE_BASIC_CREDENTIAL]);
+  assert.deepEqual(secrets, [FIXTURE_API_TOKEN, FIXTURE_BASIC_CREDENTIAL]);
+  assert.equal(redactConfiguredSecrets(`sent auditor@example.com/token:${FIXTURE_API_TOKEN} upstream`, secrets), "sent auditor@example.com/token:[REDACTED] upstream", "the plain Basic pair is covered by the token itself; the email is not a secret");
   assert.ok(!secretForms(FIXTURE_API_TOKEN).includes(FIXTURE_BASIC_CREDENTIAL), "the fixture proves the point: the Basic form is not a form of the token");
   assert.equal(redactConfiguredSecrets(`sent Authorization Basic ${FIXTURE_BASIC_CREDENTIAL} upstream`, secrets), "sent Authorization Basic [REDACTED] upstream");
   assert.equal(redactConfiguredSecrets(`sent ${FIXTURE_BASIC_CREDENTIAL} upstream`, [FIXTURE_API_TOKEN]), `sent ${FIXTURE_BASIC_CREDENTIAL} upstream`, "the token alone does not cover the Basic form, so the client registers it");
@@ -2309,12 +2310,19 @@ const CANARY_BEARER = "CANARY-BEARER-9f8e7d6c5b4a3210";
 const CANARY_SESSION = "CANARY-SESSION-0a1b2c3d4e5f6789";
 const CANARY_API_KEY = "CANARY-APIKEY-1122334455667788";
 const CANARY_URL_TOKEN = "CANARY-URLTOKEN-99aa88bb77cc66dd";
-const CANARIES = [CANARY_BEARER, CANARY_SESSION, CANARY_API_KEY, CANARY_URL_TOKEN];
+// A name-shaped value (the ruling's own example) that only its carrier, a cookie
+// assignment, gives away, and a plain lowercase word that only the Bearer scheme does.
+const CANARY_NAMED = "sess-canary-COOKIE-31415926535897";
+const CANARY_PLAIN = "canaryplainbearerword";
+const CANARIES = [CANARY_BEARER, CANARY_SESSION, CANARY_API_KEY, CANARY_URL_TOKEN, CANARY_NAMED, CANARY_PLAIN];
 const CANARY_URL = `https://api.example.com/v1/x?token=${CANARY_URL_TOKEN}`;
+// The scrubbed rendering of the JSON canary sentence, as every error string must carry it.
+const JSON_CANARY_MARKER = /400 Bad Request; InvalidUpstream; Upstream refused Bearer \[REDACTED\] at https:\/\/api\.example\.com\/v1\/x\?token=\[REDACTED\] mid-sentence; _zendesk_session=\[REDACTED\], api_key=\[REDACTED\], Bearer \[REDACTED\], sid=\[REDACTED\] rejected/;
 
 function htmlCanaryResponse() {
   const body = `<html><head><title>502 Bad Gateway</title></head><body><p>Authorization: Bearer ${CANARY_BEARER}</p>`
     + `<p>Set-Cookie: _zendesk_session=${CANARY_SESSION}; Path=/</p><p>X-Api-Key: ${CANARY_API_KEY}</p>`
+    + `<p>Proxy-Authorization: Bearer ${CANARY_PLAIN}</p><p>Cookie: sid=${CANARY_NAMED}</p>`
     + `<p>The upstream at ${CANARY_URL} did not answer in time, retry later.</p></body></html>`;
   return new Response(body, { status: 502, statusText: "Bad Gateway", headers: { "content-type": "text/html; charset=utf-8" } });
 }
@@ -2322,12 +2330,23 @@ function htmlCanaryResponse() {
 function jsonCanaryResponse() {
   return jsonResponse({
     error: "InvalidUpstream",
-    description: `Upstream refused Bearer ${CANARY_BEARER} when calling ${CANARY_URL} mid-sentence; _zendesk_session=${CANARY_SESSION} and api_key=${CANARY_API_KEY} were rejected`,
+    description: `Upstream refused Bearer ${CANARY_BEARER} at ${CANARY_URL} mid-sentence; _zendesk_session=${CANARY_SESSION}, api_key=${CANARY_API_KEY}, Bearer ${CANARY_PLAIN}, sid=${CANARY_NAMED} rejected`,
   }, { status: 400, statusText: "Bad Request" });
 }
 
-function assertNoCanary(text, label) {
-  for (const canary of CANARIES) assert.ok(!text.includes(canary), `${label}: ${canary} leaked`);
+// The configured secrets of the sweep fixture, echoed bare in prose in every encoded form:
+// nothing but the configured-secret pass (guard 2) removes a name-shaped token or the
+// composed Basic credential, so their absence proves that pass ran at every sink.
+const ECHOED_FORMS = [...secretForms(FIXTURE_API_TOKEN), ...secretForms(FIXTURE_BASIC_CREDENTIAL)];
+// The plain Basic pair is echoed too; its email half is not a secret and stays.
+const ECHOED_MARKER = /credentials(?: \[REDACTED\])+ auditor@example\.com\/token:\[REDACTED\] rejected/;
+
+function echoedSecretsResponse() {
+  return jsonResponse({ error: "InvalidUpstream", description: `credentials ${ECHOED_FORMS.join(" ")} auditor@example.com/token:${FIXTURE_API_TOKEN} rejected` }, { status: 400, statusText: "Bad Request" });
+}
+
+function assertNoCanary(text, label, canaries = CANARIES) {
+  for (const canary of canaries) assertNoWindow(text, canary, 8, label);
 }
 
 // Every HTTP surface ZendeskApiClient reads, keyed by path (the three /audit_logs reads are
@@ -2410,13 +2429,20 @@ test("error-body canary sweep: every Zendesk surface failing with an HTML 502 or
   const surfaces = Object.keys(routes);
   assert.equal(surfaces.length, 22, "every endpoint the client reads is enumerated");
   const shapes = [
-    { name: "html-502", make: htmlCanaryResponse, marker: /502 Bad Gateway; non-JSON text\/html response body \(\d+ bytes, not echoed\)/ },
-    { name: "json-400", make: jsonCanaryResponse, marker: /400 Bad Request; InvalidUpstream; Upstream refused Bearer \[REDACTED\] when calling https:\/\/api\.example\.com\/v1\/x\?token=\[REDACTED\] mid-sentence; _zendesk_session=\[REDACTED\] and api_key=\[REDACTED\] were rejected/ },
+    { name: "html-502", make: htmlCanaryResponse, marker: /502 Bad Gateway; non-JSON text\/html response body \(\d+ bytes, not echoed\)/, canaries: CANARIES },
+    { name: "json-400", make: jsonCanaryResponse, marker: JSON_CANARY_MARKER, canaries: CANARIES },
+    { name: "echoed-secrets", make: echoedSecretsResponse, marker: ECHOED_MARKER, canaries: ECHOED_FORMS },
   ];
+  // Fixture self-check: each body carries every canary or form verbatim before the scrubs see it.
+  for (const shape of shapes) {
+    const body = await shape.make().text();
+    for (const canary of shape.canaries) assert.ok(body.includes(canary), `fixture self-check: ${shape.name} carries ${canary}`);
+  }
   for (const shape of shapes) {
     for (const surface of surfaces) {
       const label = `${shape.name} on ${surface}`;
       const client = httpClient(routes, surface, shape.make);
+      const assertNoCanary = (text, where) => { for (const canary of shape.canaries) assertNoWindow(text, canary, 8, `${where}`); };
 
       const access = await checkZendeskAccess(client);
       assertNoCanary(JSON.stringify(access), `${label} access check`);
@@ -2449,8 +2475,9 @@ test("error-body canary sweep: every Zendesk surface failing with an HTML 502 or
       const files = readBundleFiles(bundle.outputDir);
       const zipEntries = readZipEntries(bundle.zipPath);
       assert.ok(files.size >= 15 && zipEntries.size === files.size, `${label}: bundle and zip were written`);
-      assertSecretsAbsent(assert, files, CANARIES, `${label} bundle`);
-      assertSecretsAbsent(assert, zipEntries, CANARIES, `${label} zip`);
+      assertSecretsAbsent(assert, files, shape.canaries, `${label} bundle`);
+      assertSecretsAbsent(assert, zipEntries, shape.canaries, `${label} zip`);
+      for (const [name, content] of files) assertNoCanary(content, `${label} ${name}`);
       const errorLog = files.get("_errors.log");
       assert.ok(errorLog !== undefined, `${label}: _errors.log must exist`);
       assert.match(errorLog, shape.marker, `${label}: _errors.log must carry the note`);
@@ -2459,10 +2486,115 @@ test("error-body canary sweep: every Zendesk surface failing with an HTML 502 or
   }
 });
 
+// Body text the notes must never echo, whatever the shape.
+const ECHOED_BODY_TEXT = /<html|Set-Cookie|X-Api-Key:|did not answer|Proxy-Authorization/i;
+
+test("the registered tools scrub error strings end to end over HTTP: access check, every assess tool, and the export", async () => {
+  const routes = await healthyHttpRoutes();
+  const failing = new Map();
+  // Bridges real HTTP requests from the tools onto the same route fixtures the sweep
+  // uses, so the tool boundary (runSealed, the text renderers, the export result) is
+  // exercised with the real fetch, the real retry sleeps, and the real config resolver.
+  const server = createServer((request, response) => {
+    const key = zendeskRouteKey(`http://127.0.0.1${request.url}`);
+    const upstream = failing.has(key)
+      ? failing.get(key)()
+      : routes[key] !== undefined
+        ? jsonResponse(routes[key])
+        : new Response(JSON.stringify({ error: "RecordNotFound", description: `unrouted ${key}` }), { status: 404, headers: { "content-type": "application/json" } });
+    upstream.text().then((text) => {
+      response.writeHead(upstream.status, Object.fromEntries(upstream.headers));
+      response.end(text);
+    });
+  });
+  await new Promise((resolveListen) => server.listen(0, "127.0.0.1", resolveListen));
+  const { port } = server.address();
+
+  const tools = new Map();
+  registerZendeskTools({ registerTool: (tool) => tools.set(tool.name, tool) });
+  const baseArgs = { subdomain: "acme", email: "auditor@example.com", api_token: FIXTURE_API_TOKEN, base_url: `http://127.0.0.1:${port}/api/v2` };
+  const run = async (name, extra = {}) => {
+    const tool = tools.get(name);
+    return tool.execute("call-tools", tool.prepareArguments({ ...baseArgs, ...extra }));
+  };
+  const assessTools = ["zendesk_assess_authentication", "zendesk_assess_access_control", "zendesk_assess_data_protection", "zendesk_assess_integrations"];
+  // The failing surfaces: team members (read by the access check, the authentication and
+  // access-control assessments, and the export) and webhooks (integrations and the export).
+  const failingSurfaces = { "/users": "team_members", "/webhooks": "webhooks" };
+
+  try {
+    // The 502 shape fails one surface only: the client retries a 5xx twice with real
+    // backoff, so every extra failing read costs the test 1.5 seconds.
+    for (const shape of [
+      { name: "html-502", make: htmlCanaryResponse, marker: /502 Bad Gateway; non-JSON text\/html response body \(\d+ bytes, not echoed\)/, canaries: CANARIES, surfaces: ["/webhooks"] },
+      { name: "json-400", make: jsonCanaryResponse, marker: JSON_CANARY_MARKER, canaries: CANARIES, surfaces: ["/users", "/webhooks"] },
+      { name: "echoed-secrets", make: echoedSecretsResponse, marker: ECHOED_MARKER, canaries: ECHOED_FORMS, surfaces: ["/users", "/webhooks"] },
+    ]) {
+      failing.clear();
+      for (const surface of shape.surfaces) failing.set(surface, shape.make);
+      const noCanary = (text, where) => { for (const canary of shape.canaries) assertNoWindow(text, canary, 8, where); };
+      const expectedProbes = shape.surfaces.map((surface) => failingSurfaces[surface]).sort();
+
+      const access = await run("zendesk_check_access");
+      noCanary(JSON.stringify(access), `${shape.name} zendesk_check_access`);
+      assert.notEqual(access.isError, true, access.content[0].text);
+      const failedProbes = access.details.surfaces.filter((probe) => probe.status !== "readable");
+      assert.deepEqual(failedProbes.map((probe) => probe.name).sort(), expectedProbes, `${shape.name}: exactly the failing surfaces probe as unreadable`);
+      for (const probe of failedProbes) {
+        assert.equal(probe.status, "error");
+        assert.equal(probe.count, null);
+        assert.equal(probe.truncated, null);
+        assert.match(probe.error, shape.marker, `${shape.name}: ${probe.name}: ${probe.error}`);
+      }
+      assert.doesNotMatch(access.content[0].text, ECHOED_BODY_TEXT);
+      // The Note column is capped at 90 characters and the request URL fills most of it, so
+      // the rendering guarantees the row's status and null count; the full note is in details.
+      for (const probe of failedProbes) {
+        assert.match(access.content[0].text, new RegExp(`^\\s*${probe.name}\\s+│[^│]*│\\s*error\\s*│\\s*null\\s*│`, "m"), `${shape.name}: the ${probe.name} row renders error and null`);
+      }
+
+      const recorded = [];
+      for (const name of assessTools) {
+        const result = await run(name);
+        noCanary(JSON.stringify(result), `${shape.name} ${name}`);
+        assert.notEqual(result.isError, true, result.content[0].text);
+        assert.equal(result.details.tool, name);
+        for (const error of result.details.errors) {
+          assert.match(error, shape.marker, `${shape.name} ${name}: ${error}`);
+          assert.doesNotMatch(error, ECHOED_BODY_TEXT, error);
+          recorded.push(error);
+        }
+        assert.doesNotMatch(result.content[0].text, ECHOED_BODY_TEXT);
+        if (result.details.errors.length > 0) assert.match(result.content[0].text, /Collection warnings:/, `${name}: the rendering names the partial collection`);
+        for (const item of result.details.findings) {
+          if (/could not be read|502 Bad Gateway|400 Bad Request/.test(item.summary)) {
+            assert.notEqual(item.status, "pass", `${shape.name}: ${item.id} passed while naming the failed read`);
+          }
+        }
+      }
+      assert.ok(recorded.length >= shape.surfaces.length, `${shape.name}: every failing surface is recorded by the assessment that reads it`);
+
+      const exported = await run("zendesk_export_audit_bundle", { output_dir: createTempBase("grclanker-zendesk-tool-export-") });
+      noCanary(JSON.stringify(exported), `${shape.name} zendesk_export_audit_bundle`);
+      assert.notEqual(exported.isError, true, exported.content[0].text);
+      assert.ok(exported.details.error_count >= shape.surfaces.length, `${shape.name}: the export counts the failed reads`);
+      assert.match(exported.content[0].text, new RegExp(`Collection errors: ${exported.details.error_count}$`, "m"));
+      const files = readBundleFiles(exported.details.output_dir);
+      const zipEntries = readZipEntries(exported.details.zip_path);
+      assert.ok(files.size >= 15 && zipEntries.size === files.size, `${shape.name}: bundle and zip were written`);
+      for (const [name, text] of files) noCanary(text, `${shape.name} tool bundle ${name}`);
+      for (const [name, text] of zipEntries) noCanary(text, `${shape.name} tool zip ${name}`);
+      for (const line of files.get("_errors.log").trim().split("\n")) assert.match(line, shape.marker, line);
+    }
+  } finally {
+    server.close();
+  }
+});
+
 test("ZendeskApiError, transport errors, and the tool catch blocks scrub messages built at the throw site", async () => {
-  const constructed = new ZendeskApiError(`Zendesk request failed for /x (500; Bearer ${CANARY_BEARER} at ${CANARY_URL}; Cookie: _zendesk_session=${CANARY_SESSION})`, 500);
+  const constructed = new ZendeskApiError(`Zendesk request failed for /x (500; Bearer ${CANARY_BEARER} at ${CANARY_URL}; Bearer ${CANARY_PLAIN}; sid=${CANARY_NAMED}; Cookie: _zendesk_session=${CANARY_SESSION})`, 500);
   assertNoCanary(constructed.message, "constructor");
-  assert.equal(constructed.message, "Zendesk request failed for /x (500; Bearer [REDACTED] at https://api.example.com/v1/x?token=[REDACTED]; Cookie: [REDACTED]", "the Cookie header line is withheld to the end of the line");
+  assert.equal(constructed.message, "Zendesk request failed for /x (500; Bearer [REDACTED] at https://api.example.com/v1/x?token=[REDACTED]; Bearer [REDACTED]; sid=[REDACTED]; Cookie: [REDACTED]", "the Cookie header line is withheld to the end of the line");
   assert.equal(constructed.status, 500);
 
   const transport = new ZendeskApiClient(sampleConfig(), {
