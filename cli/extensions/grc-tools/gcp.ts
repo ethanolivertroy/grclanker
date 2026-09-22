@@ -1191,7 +1191,14 @@ export class GcpAuditorClient {
       const body = describeGoogleErrorBody(text, contentType, response.status, secrets);
       throw new GcpApiError(`${httpStatusLine(response)}${body ? `: ${body}` : ""} (${method} ${endpoint})`, endpoint, response.status, secrets);
     }
-    if (text.trim().length === 0) return {};
+    // Every surface this client reads answers with a JSON object: the proto3 JSON mapping encodes a response message
+    // whose fields all hold defaults, and google.protobuf.Empty itself, as `{}` (protobuf.dev/programming-guides/json,
+    // "An empty JSON object"), and the Compute and Storage list responses always carry `kind`. A 2xx with nothing in
+    // it is a proxy, captive portal, or gateway answering in the service's place, so it is an unreadable surface,
+    // never an empty inventory.
+    if (text.trim().length === 0) {
+      throw new GcpApiError(`${httpStatusLine(response)}: ${describeOpaqueBody(text, contentType, "empty response body")} (${method} ${endpoint})`, endpoint, response.status, secrets);
+    }
     const payload = parseJsonObject(text);
     if (!payload) {
       throw new GcpApiError(`${httpStatusLine(response)}: ${describeOpaqueBody(text, contentType, "non-JSON response body")} (${method} ${endpoint})`, endpoint, response.status, secrets);
