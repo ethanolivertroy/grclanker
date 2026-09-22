@@ -129,7 +129,7 @@ const CREDENTIAL_DATA_KEY_QUALIFIERS = new Set([
 // `roleSecretId`). Every other `*_id` names a thing and stays an identifier: `client_id`, `enterprise_id`, `key_id`,
 // `api_key_id`, `tenant_id`, `token_id`, `access_key_id` (an AWS access key id is removed by its `AKIA` shape), and
 // `secret_name` likewise (CodeRabbit on #78, r4077259415).
-const BEARER_ID_LAST_SEGMENTS = new Set(["sid", "sessid", "sessionid", "jsessionid", "phpsessid", "aspnetsessionid"]);
+const BEARER_ID_LAST_SEGMENTS = new Set(["secretid", "sid", "sessid", "sessionid", "jsessionid", "phpsessid", "aspnetsessionid"]);
 const BEARER_ID_QUALIFIERS = new Set(["secret", "session"]);
 
 /** True for a key whose id value is itself a bearer credential: `secret_id` and the session-id keys, in any spelling. */

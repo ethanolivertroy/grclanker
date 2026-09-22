@@ -653,7 +653,7 @@ test("row (a), webhooks: a webhook or callback URL key stays a credential key wh
 // separator, names a Vault AppRole secret id, which is a UUID the identifier rule would otherwise keep; it and the
 // session-id keys are credential keys on both sides before the setting-suffix test. Every other `_id`, `_name`, and
 // `_key_id` key the five modules read names a thing and keeps its value.
-const BEARER_ID_KEYS = ["secret_id", "VAULT_SECRET_ID", "role_secret_id", "secretId", "roleSecretId", "vault.secret_id", "session_id", "sessionId", "sid", "sessid", "JSESSIONID", "PHPSESSID", "ASP.NET_SessionId"];
+const BEARER_ID_KEYS = ["secret_id", "VAULT_SECRET_ID", "role_secret_id", "secretId", "roleSecretId", "vault.secret_id", "SECRETID", "session_id", "sessionId", "sid", "sessid", "JSESSIONID", "PHPSESSID", "ASP.NET_SessionId"];
 
 /** The `_id`, `_name`, and `_key_id` keys the five modules read, config and vendor records included: all identifiers or settings. */
 const IDENTIFIER_KEYS = [
