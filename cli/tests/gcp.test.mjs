@@ -2704,3 +2704,138 @@ test("exportGcpAuditBundle scrubs a shapeless configured token and an API key sh
   assert.ok(rendered.some((file) => file.name === join("analysis", "findings.json")), "the finding summary keeps the display name's words and redacts only the planted values");
   assert.ok(rendered.length >= 3, `the display name reaches at least the snapshot, findings.json, and the category file (${rendered.map((file) => file.name).join(", ")})`);
 });
+
+/**
+ * Silent-success class (2xx non-protocol body): a 2xx whose body is not the JSON object the surface documents. The
+ * HTML row is the control the #68 review verified; the empty rows are the branch that used to resolve {} and be read
+ * as an empty inventory. Every surface this client reads documents a JSON object body (the proto3 JSON mapping
+ * encodes an all-default response message and google.protobuf.Empty as {}; Compute and Storage lists carry kind), so
+ * no endpoint is exempt.
+ */
+const SILENT_SUCCESS_SHAPES = {
+  "200 text/html sign-in page (control)": {
+    respond: () => new Response(canaryHtmlPage(), { status: 200, statusText: "OK", headers: { "content-type": "text/html; charset=utf-8" } }),
+    marker: /^(?:[^\s():]+: )*200 OK: non-JSON response body \(text\/html; \d+ bytes\) \((?:GET|POST) https:\/\/[a-z]+\.googleapis\.com\/[^\s?()]+\)$/,
+  },
+  "200 application/json with an empty body": {
+    respond: () => new Response("", { status: 200, statusText: "OK", headers: { "content-type": "application/json; charset=UTF-8" } }),
+    marker: /^(?:[^\s():]+: )*200 OK: empty response body \(application\/json; 0 bytes\) \((?:GET|POST) https:\/\/[a-z]+\.googleapis\.com\/[^\s?()]+\)$/,
+  },
+  "200 with an empty body and no content type": {
+    respond: () => new Response(null, { status: 200, statusText: "OK" }),
+    marker: /^(?:[^\s():]+: )*200 OK: empty response body \(unknown content type; 0 bytes\) \((?:GET|POST) https:\/\/[a-z]+\.googleapis\.com\/[^\s?()]+\)$/,
+  },
+  "200 application/json whose body is only whitespace": {
+    respond: () => new Response("\n \n", { status: 200, statusText: "OK", headers: { "content-type": "application/json" } }),
+    marker: /^(?:[^\s():]+: )*200 OK: empty response body \(application\/json; 3 bytes\) \((?:GET|POST) https:\/\/[a-z]+\.googleapis\.com\/[^\s?()]+\)$/,
+  },
+};
+
+/** The access probe that reads each surface, where one exists. */
+const SURFACE_ACCESS_PROBES = {
+  organization: "organization",
+  projects: "projects",
+  iamPolicies: "iam_policies",
+  loggingSettings: "logging_settings",
+  sinks: "log_sinks",
+  sccSources: "security_command_center",
+  [policySurfaceId("constraints/iam.disableServiceAccountKeyCreation")]: "org_policy",
+  firewalls: "compute_firewalls",
+  buckets: "storage_buckets",
+  cryptoKeys: "kms_crypto_keys",
+};
+
+/** The (surface, finding) pairs the #68 review saw rendered as pass or fail from an empty 200 body. */
+const REVIEWED_SILENT_SUCCESS_PAIRS = [
+  ["projects", "GCP-IAM-01"],
+  ["sinks", "GCP-LOG-03"],
+  [policySurfaceId("constraints/iam.disableServiceAccountKeyCreation"), "GCP-ORG-03"],
+  ["accessPolicies", "GCP-DATA-07"],
+  ["apiKeys", "GCP-DATA-06"],
+  ["serviceAccountKeys", "GCP-IAM-02"],
+  ["serviceAccountKeys", "GCP-IAM-03"],
+];
+
+test("silent-success class: a 200 with an HTML, empty, or whitespace body on every GCP_INVENTORIES surface is an unreadable surface, never an empty inventory: dependents are manual or warn, snapshots carry markers, the access probe is not readable, and no unobserved status is named", async () => {
+  const statusMention = /(?<![\w./:-])([1-5]\d{2}) [A-Z][A-Za-z]+/g;
+  const assertOnlyServedStatuses = (label, text) => {
+    for (const match of text.matchAll(statusMention)) {
+      assert.equal(match[1], "200", `${label}: names HTTP ${match[1]}, which the fixture never served: ${text}`);
+    }
+  };
+  for (const [surfaceId, findingId] of REVIEWED_SILENT_SUCCESS_PAIRS) {
+    const row = INVENTORY_SURFACES.find((candidate) => candidate.id === surfaceId);
+    assert.ok(row && row.dependents.includes(findingId), `${surfaceId} -> ${findingId} is a sweep dependency, so the walk below covers the reviewed pair`);
+  }
+  for (const surfaceId of Object.keys(SURFACE_ACCESS_PROBES)) assert.ok(SURFACE_CLIENT_CALLS[surfaceId], `${surfaceId} is a sweep surface`);
+
+  const verdicts = { manual: 0, warn: 0 };
+  let walked = 0;
+  let markers = 0;
+  for (const row of INVENTORY_SURFACES) {
+    for (const [shapeName, shape] of Object.entries(SILENT_SUCCESS_SHAPES)) {
+      const label = `${row.id} [${shapeName}]`;
+      const requests = [];
+      const client = createClient(async (url, init) => {
+        const facts = requestFacts(url, init);
+        const response = row.match(facts) ? shape.respond() : jsonResponse(routeForProject(url, init));
+        requests.push({ request: `${facts.host}${facts.path}`, surfaces: INVENTORY_SURFACES.filter((candidate) => candidate.match(facts)).map((candidate) => candidate.id), status: response.status });
+        return response;
+      });
+
+      const thrown = await SURFACE_CLIENT_CALLS[row.id](client).then(() => null, (error) => error);
+      assert.ok(thrown instanceof GcpApiError, `${label}: the direct client call throws a GcpApiError instead of resolving an empty inventory`);
+      assert.equal(thrown.status, 200, `${label}: the error carries the observed status`);
+      assert.match(thrown.message, shape.marker, `${label}: the marker names the status, the body state with its content type and length, the method, and the endpoint (${thrown.message})`);
+      assert.ok(thrown.message.endsWith(` ${thrown.endpoint})`), `${label}: the marker ends with the endpoint the client called`);
+      assertNoCanary(thrown.message, `${label} thrown message`);
+
+      const results = await runAllAssessments(client, { maxProjects: 5 });
+      const access = await checkGcpAccess(client);
+      assert.deepEqual([...new Set(requests.map((request) => request.status))], [200], `${label}: the fixture served only 200`);
+      assertNoCanary(JSON.stringify(results), `${label} results`);
+      assertNoCanary(JSON.stringify(access), `${label} access check`);
+
+      const byId = findingsById(results);
+      for (const finding of Object.values(byId)) {
+        assert.notEqual(finding.status, "fail", `${label}: ${finding.id} fails on a compliant fixture, a verdict fabricated from an unread surface (${finding.summary})`);
+        assertOnlyServedStatuses(`${label}: ${finding.id} summary`, finding.summary);
+        for (const entry of finding.evidence.unreadable_inventories ?? []) assertOnlyServedStatuses(`${label}: ${finding.id} unreadable_inventories`, entry.error);
+      }
+      for (const id of row.dependents) {
+        assert.ok(byId[id].status === "manual" || byId[id].status === "warn", `${label}: ${id} depends on the unread surface and must be manual or warn, got ${byId[id].status} (${byId[id].summary})`);
+        verdicts[byId[id].status] += 1;
+        const entries = byId[id].evidence.unreadable_inventories ?? [];
+        assert.ok(entries.length > 0, `${label}: ${id} carries unreadable_inventories`);
+        assert.ok(entries.some((entry) => (entry.status === "unreadable" && shape.marker.test(entry.error)) || entry.status === "not_collected"), `${label}: ${id} lists the surface with its marker, or the read it blocked as not collected (${JSON.stringify(entries)})`);
+      }
+      const errors = results.flatMap((result) => result.errors);
+      assert.ok(errors.some((entry) => shape.marker.test(entry)), `${label}: an assessment errors array carries the marker (${errors.join(" | ")})`);
+      for (const entry of errors) assertOnlyServedStatuses(`${label}: errors`, entry);
+      for (const result of results) {
+        assertOnlyServedStatuses(`${label}: ${result.category} summary`, JSON.stringify(result.summary));
+        for (const [path, value] of snapshotLeaves(result.snapshot, SNAPSHOT_SOURCES[result.category])) {
+          const sources = path.split(".").reduce((node, key) => node[key], SNAPSHOT_SOURCES[result.category]);
+          if (!derivedFromUnreadable(sources, row, blockedSurfaces(requests))) continue;
+          assertMarker(`${label}: core_data ${result.category}.${path}`, value);
+          assertOnlyServedStatuses(`${label}: core_data ${result.category}.${path}`, value.error);
+          assert.doesNotMatch(value.error, /<html|<title|Path=\/|__Secure/, `${label}: the marker echoes body text`);
+          markers += 1;
+        }
+      }
+
+      const probeName = SURFACE_ACCESS_PROBES[row.id];
+      if (probeName) {
+        const probe = access.surfaces.find((item) => item.name === probeName);
+        assert.ok(probe, `${label}: the access check probes ${probeName}`);
+        assert.equal(probe.status, "not_readable", `${label}: the access probe must not count the surface as readable (${JSON.stringify(probe)})`);
+        assert.match(probe.error, shape.marker, `${label}: the access probe carries the marker (${probe.error})`);
+      }
+      for (const probe of access.surfaces) if (probe.error) assertOnlyServedStatuses(`${label}: access probe ${probe.name}`, probe.error);
+      assert.ok(!access.surfaces.some((probe) => probe.status === "readable" && (probe.name === probeName)), `${label}: the failed surface is never readable`);
+      walked += 1;
+    }
+  }
+  assert.equal(walked, INVENTORY_SURFACES.length * Object.keys(SILENT_SUCCESS_SHAPES).length);
+  assert.ok(markers > 0 && verdicts.manual > 0, `the walk visited ${markers} markers and ${verdicts.manual} manual plus ${verdicts.warn} warn verdicts, so the assertions are not vacuous`);
+});

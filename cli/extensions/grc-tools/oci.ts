@@ -928,6 +928,16 @@ export function parseServiceError(stderr: string): OciServiceErrorFields | undef
   };
 }
 
+/**
+ * How exit-0 stdout failed the documented protocol shape, a JSON document
+ * with a `data` member (the `--output json` response shape shown in the CLI
+ * output examples at https://docs.oracle.com/en-us/iaas/Content/API/SDKDocs/cliusing.htm
+ * and in every command reference page's example output).
+ * Each is the silent-success class: the process succeeded but produced no
+ * readable inventory, so the surface is unreadable, never an empty list.
+ */
+export type OciStdoutShape = "non-json" | "empty" | "whitespace" | "no-data-member";
+
 export interface OciCommandFailure {
   args: string[];
   exitCode: number | null;
@@ -935,15 +945,33 @@ export interface OciCommandFailure {
   systemCode?: string;
   stderr: string;
   stdout: string;
-  /** Set when the CLI exited 0 but printed something other than JSON. */
-  unparseableStdout?: boolean;
+  /** Set when the CLI exited 0 but stdout was not the documented `{ "data": ... }` JSON document. */
+  stdoutShape?: OciStdoutShape;
+}
+
+/** Names the command and the observed stdout state only; stdout itself is never echoed and no status code is invented. */
+function describeStdoutShape(command: string, shape: OciStdoutShape, stdoutBytes: number): string {
+  switch (shape) {
+    case "non-json":
+      return `${command} exited 0 but printed ${stdoutBytes} bytes of non-JSON stdout (withheld)`;
+    case "empty":
+      return `${command} exited 0 with empty stdout (no JSON document)`;
+    case "whitespace":
+      return `${command} exited 0 with whitespace-only stdout (${stdoutBytes} bytes, no JSON document)`;
+    case "no-data-member":
+      return `${command} exited 0 with a JSON document that has no data member (${stdoutBytes} bytes)`;
+    default: {
+      const exhaustive: never = shape;
+      throw new Error(`Unhandled stdout shape: ${String(exhaustive)}`);
+    }
+  }
 }
 
 function describeCommandFailure(command: string, failure: OciCommandFailure, serviceError: OciServiceErrorFields | undefined): string {
   const stderrBytes = Buffer.byteLength(failure.stderr, "utf8");
   const stdoutBytes = Buffer.byteLength(failure.stdout, "utf8");
-  if (failure.unparseableStdout) {
-    return `${command} exited 0 but printed ${stdoutBytes} bytes of non-JSON stdout (withheld)`;
+  if (failure.stdoutShape) {
+    return describeStdoutShape(command, failure.stdoutShape, stdoutBytes);
   }
   const exit = failure.exitCode === null
     ? `did not exit normally${failure.signal ? ` (${failure.signal})` : ""}${failure.systemCode ? ` (${failure.systemCode})` : ""}`
@@ -972,17 +1000,19 @@ export class OciCommandError extends Error {
   readonly exitCode: number | null;
   readonly stderrBytes: number;
   readonly stdoutBytes: number;
+  readonly stdoutShape: OciStdoutShape | undefined;
   readonly serviceError: OciServiceErrorFields | undefined;
 
   constructor(failure: OciCommandFailure) {
     const command = `oci ${ociCommandWords(failure.args).join(" ")}`;
-    const serviceError = failure.unparseableStdout ? undefined : parseServiceError(failure.stderr);
+    const serviceError = failure.stdoutShape ? undefined : parseServiceError(failure.stderr);
     super(scrubErrorText(describeCommandFailure(command, failure, serviceError)));
     this.name = "OciCommandError";
     this.command = command;
     this.exitCode = failure.exitCode;
     this.stderrBytes = Buffer.byteLength(failure.stderr, "utf8");
     this.stdoutBytes = Buffer.byteLength(failure.stdout, "utf8");
+    this.stdoutShape = failure.stdoutShape;
     this.serviceError = serviceError
       ? { ...serviceError, message: serviceError.message === undefined ? undefined : scrubErrorText(serviceError.message) }
       : undefined;
@@ -1018,12 +1048,13 @@ type ExecFileSyncLike = (file: string, args: string[], options: ExecFileSyncOpti
 /**
  * Wraps execFileSync so that a failing `oci` invocation surfaces as an
  * OciCommandError. Exported with an injectable exec so tests drive the real
- * error construction with execFileSync-shaped failures.
+ * error construction with execFileSync-shaped failures. Stdout is returned
+ * untrimmed so runJson can name whitespace-only output as what it was.
  */
 export function createOciCommandRunner(exec: ExecFileSyncLike = execFileSync): OciCommandRunner {
   return (args) => {
     try {
-      return exec("oci", args, OCI_COMMAND_RUNNER_OPTIONS).trim();
+      return exec("oci", args, OCI_COMMAND_RUNNER_OPTIONS);
     } catch (error) {
       throw OciCommandError.fromExecFailure(args, error);
     }
@@ -1507,16 +1538,33 @@ export class OciAuditorClient {
     ];
   }
 
-  /** Non-JSON stdout (a gateway page passed through on exit 0) is never echoed; only its size is reported. */
+  /**
+   * Silent-success guard. Exit-0 stdout must be the documented `{ "data": ... }`
+   * JSON document; empty stdout, whitespace-only stdout, non-JSON stdout (a
+   * gateway page passed through), and a JSON document without a data member
+   * each raise an OciCommandError, which collect() records as an unreadable
+   * surface, so dependent verdicts render manual or null and never an empty
+   * inventory. The OCI CLI has printed nothing for an empty list on some
+   * versions (oracle/oci-cli issue 204, `oci audit event list` on 2.6.6), but
+   * no docs.oracle.com page documents that for any command, so no command's
+   * empty stdout is taken as a documented empty result. Stdout is never
+   * echoed; the marker names the command and the observed state.
+   */
   private runJson(args: string[]): JsonRecord {
     const fullArgs = [...this.buildBaseArgs(), ...args];
     const output = this.commandRunner(fullArgs);
-    if (output.trim().length === 0) return {};
+    const failure = (stdoutShape: OciStdoutShape): OciCommandError =>
+      new OciCommandError({ args: fullArgs, exitCode: 0, stderr: "", stdout: output, stdoutShape });
+    if (output.trim().length === 0) throw failure(output.length === 0 ? "empty" : "whitespace");
+    let parsed: unknown;
     try {
-      return JSON.parse(output) as JsonRecord;
+      parsed = JSON.parse(output);
     } catch {
-      throw new OciCommandError({ args: fullArgs, exitCode: 0, stderr: "", stdout: output, unparseableStdout: true });
+      throw failure("non-json");
     }
+    const document = asObject(parsed);
+    if (!document || !("data" in document)) throw failure("no-data-member");
+    return document;
   }
 
   /** OCI_SURFACE_DOCS.compartments; --all follows opc-next-page to completion. */
