@@ -1347,6 +1347,104 @@ test("assessment summaries render null, not zero, for every unreadable dataset",
   }
 });
 
+/** Wraps a fetch so every request and the status it received are on record for request matching. */
+function recordingTenableFetch(inner) {
+  const requests = [];
+  const fetchImpl = async (url, init = {}) => {
+    const parsed = new URL(url);
+    const entry = { method: (init.method ?? "GET").toUpperCase(), path: parsed.pathname, status: null };
+    requests.push(entry);
+    const response = await inner(url, init);
+    entry.status = response.status;
+    return response;
+  };
+  return { fetchImpl, requests };
+}
+
+/** Whether a "METHOD /path" label (with {placeholder} segments) and status name a request the run made and the status it received. */
+function tenableRequestObserved(requests, endpoint, status) {
+  const [method, path] = endpoint.split(" ");
+  const pattern = new RegExp(`^${path.split("/").map((segment) => (/^\{.+\}$/.test(segment) ? "[^/]+" : segment.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"))).join("/")}$`);
+  return requests.some((request) => request.method === method && pattern.test(request.path) && (status === null || request.status === status));
+}
+
+/** Every object carrying an endpoint, with the HTTP status it names (http_status on a status entry or evidence, status on a marker). */
+function tenableEndpointMentions(value, path = []) {
+  if (Array.isArray(value)) return value.flatMap((item, index) => tenableEndpointMentions(item, [...path, String(index)]));
+  if (!value || typeof value !== "object") return [];
+  const mentions = Object.entries(value).flatMap(([key, child]) => tenableEndpointMentions(child, [...path, key]));
+  if (typeof value.endpoint === "string") {
+    const status = typeof value.http_status === "number" ? value.http_status : typeof value.httpStatus === "number" ? value.httpStatus : typeof value.status === "number" ? value.status : null;
+    mentions.push({ at: path.join("."), endpoint: value.endpoint, status });
+  }
+  return mentions;
+}
+
+test("addendum 5: refused or failed Tenable reads write not-collected markers naming the failed request and its status, and every endpoint or status named anywhere matches an observed request", async () => {
+  const routes = healthyRoutes();
+  routes["GET /users"] = { __status: 403 };
+  routes["GET /scanners/null/agents"] = { __status: 403 };
+  const { fetchImpl, requests } = recordingTenableFetch(async (url, init) => {
+    if (new URL(url).pathname === "/server/properties") return new Response("<html><body>502 Bad Gateway</body></html>", { status: 502, headers: { "content-type": "text/html" } });
+    return routerFetch(routes)(url, init);
+  });
+  const clients = createTenableClients(vmConfig(), { fetchImpl, sleepImpl: async () => {}, exportPollMs: 0, exportTimeoutMs: 5_000 });
+  const root = mkdtempSync(join(tmpdir(), "tenable-markers-"));
+  const result = await exportTenableAuditBundle(clients, root, { now: NOW });
+  const files = readBundleFiles(result.outputDir);
+  const read = (name) => JSON.parse(files.get(join("core_data", name)));
+
+  const users = read("users.json");
+  assert.deepEqual(users, { collected: false, status: 403, dataset_status: "forbidden", endpoint: "GET /users", error: users.error });
+  assert.match(users.error, /403/);
+  const agents = read("agents.json");
+  assert.equal(agents.collected, false);
+  assert.equal(agents.status, 403);
+  assert.equal(agents.endpoint, "GET /scanners/null/agents");
+  const serverProperties = read("server_properties.json");
+  assert.deepEqual(serverProperties, { collected: false, status: 502, dataset_status: "error", endpoint: "GET /server/properties", error: serverProperties.error });
+  assert.match(serverProperties.error, /502.*text\/html.*bytes, not echoed/);
+  assert.ok(Array.isArray(read("scans.json")), "readable lists keep their content");
+  assert.ok(Array.isArray(read("groups.json")));
+
+  const findings = JSON.parse(files.get(join("analysis", "findings.json")));
+  const analysis = files.get(join("analysis", "findings.json"));
+  const mfa = findings.find((item) => item.id === "TENABLE-10");
+  assert.equal(mfa.status, "manual");
+  assert.deepEqual(mfa.evidence, { collected: false, endpoint: "GET /users", dataset_status: "forbidden", http_status: 403, error: mfa.evidence.error });
+  assert.match(mfa.summary, /GET \/users could not be read because GET \/users refused the API key with HTTP 403/);
+
+  const [scan, sensor, access, vuln] = await runAll(createTenableClients(vmConfig(), { fetchImpl, sleepImpl: async () => {}, exportPollMs: 0, exportTimeoutMs: 5_000 }));
+  assert.deepEqual(access.summary.collection.users, { status: "forbidden", endpoint: "GET /users", http_status: 403, seen: null, total: null, truncated: null, error: access.summary.collection.users.error });
+  assert.deepEqual(sensor.summary.collection.agents.truncated, null, "a refused walk is neither complete nor truncated");
+  assert.equal(sensor.summary.collection.server_properties.http_status, 502);
+  assert.equal(sensor.summary.collection.server_properties.status, "error");
+  assert.equal(sensor.summary.collection.scanners.status, "ok");
+  assert.equal(sensor.summary.collection.scanners.seen, 1);
+  assert.equal(sensor.summary.collection.scanners.truncated, false);
+  assert.equal(access.summary.user_count, null);
+  assert.equal(sensor.summary.agent_count, null);
+
+  const mentions = [
+    ...Object.keys(Object.fromEntries(files)).filter((name) => name.startsWith("core_data/")).flatMap((name) => tenableEndpointMentions(JSON.parse(files.get(name)), [name])),
+    ...tenableEndpointMentions(findings, ["findings"]),
+    ...[scan, sensor, access, vuln].flatMap((assessment) => tenableEndpointMentions(assessment.summary, [assessment.category, "summary"])),
+  ];
+  assert.ok(mentions.length >= 40, `every dataset is mentioned with its request (${mentions.length})`);
+  for (const mention of mentions) {
+    assert.ok(tenableRequestObserved(requests, mention.endpoint, mention.status), `${mention.at} names ${mention.endpoint} (status ${mention.status}) but no such request was made`);
+  }
+  assert.deepEqual([...new Set(mentions.filter((mention) => mention.status === 403).map((mention) => mention.endpoint))].sort(), ["GET /scanners/null/agents", "GET /users"]);
+  assert.deepEqual([...new Set(mentions.filter((mention) => mention.status === 502).map((mention) => mention.endpoint))], ["GET /server/properties"]);
+  // Finding summaries name requests only in "METHOD /path" form, and only ones the run made.
+  for (const match of analysis.matchAll(/\b(GET|POST) (\/[A-Za-z0-9_\-{}/]+(?:\.[A-Za-z0-9_\-{}/]+)*)/g)) {
+    assert.ok(tenableRequestObserved(requests, `${match[1]} ${match[2]}`, null), `findings name ${match[0]} but no such request was made`);
+  }
+  for (const match of analysis.matchAll(/HTTP (\d{3})/g)) {
+    assert.ok(requests.some((request) => request.status === Number(match[1])), `findings name HTTP ${match[1]} but no response carried it`);
+  }
+});
+
 test("resolveSecureOutputPath rejects traversal and symlinked parents", () => {
   const base = mkdtempSync(join(tmpdir(), "tenable-secure-"));
   assert.throws(() => resolveSecureOutputPath(base, "../escape"), /outside/);
