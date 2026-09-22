@@ -68,7 +68,7 @@ Empty inventories that pass by intent are stated in the finding text: no guests 
 ### Bundle redaction
 
 - Service principal and app registration records are reduced at collection time to `id`, `displayName`, `appId`, and the schedule fields of each credential (`keyId`, `displayName`, `type`, `usage`, `startDateTime`, `endDateTime`); `passwordCredential.hint`, `secretText`, `keyCredential.key`, and `customKeyIdentifier` never reach memory that a finding or the bundle could echo.
-- API error bodies are reduced to the documented envelope (`error.code: error.message` for Graph and ARM, `error: error_description` for the token endpoint); non-JSON bodies are dropped, so `_errors.log`, `core_data/access.json`, and `manual` evidence never carry raw payloads.
+- API error bodies are reduced to the documented envelope (`error.code: error.message` for Graph and ARM, `error: error_description` for the token endpoint); non-JSON bodies are dropped, so `_errors.log`, `core_data/access.json`, and `manual` evidence never carry raw payloads. A `SyntaxError` reaching the error sink from any path is recorded by name only (`SyntaxError: response could not be parsed as JSON; the parser's message is not recorded because it quotes the body`), because V8's parse message quotes a snippet of the rejected text. The tools read no configuration file: every setting comes from tool arguments and environment variables.
 - Tokens and the client secret are never written; the export test drives a real client through fake secrets, hints, key blobs, and an echoing error body and scans every bundle file and every inflated zip entry for them.
 
 ## Control coverage

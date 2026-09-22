@@ -101,7 +101,7 @@ Supporting findings without a spec control number: DUO-ADMIN-002 (administrator 
 
 - `core_data/integrations.json` carries `secret_key` as `[REDACTED]`, and `core_data/bypass_codes.json` carries any `code` or `bypass_code` value as `[REDACTED]`; both are stripped at collection time, so the values never reach assessment memory, evidence, or the zip.
 - `core_data/collection_status.json` is a projection: per dataset it records `readable`, `records`, `total`, `complete`, and `error`, without repeating the records that already live in their own `core_data` files.
-- The Duo secret key is used only to sign requests and is never written; `config.json` holds the API host, lookback window, and configuration source chain. Failure text is limited to the documented `message` and `message_detail` fields of the Admin API error envelope.
+- The Duo secret key is used only to sign requests and is never written; `config.json` holds the API host, lookback window, and configuration source chain. Failure text is limited to the documented `message` and `message_detail` fields of the Admin API error envelope; a non-JSON body is described by content type and byte length, and a `SyntaxError` reaching the error sink from any path is recorded by name only (`SyntaxError: response could not be parsed as JSON; the parser's message is not recorded because it quotes the body`), because V8's parse message quotes a snippet of the rejected text. The tools read no configuration file: every setting comes from tool arguments and environment variables.
 
 ## Framework mappings
 
