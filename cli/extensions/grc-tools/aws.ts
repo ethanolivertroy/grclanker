@@ -2379,6 +2379,14 @@ export async function assessAwsIdentity(
     }
   }
 
+  // A count judged over a partially readable set is rendered beside the number judged, and is null when nothing was
+  // judged, so "0 stale" never stands next to an unreadable remainder as if every key had been examined.
+  const keysJudged = sampledKeys - lastUsedUnreadableKeys.length;
+  const anyKeyNotJudged = lastUsedUnreadableKeys.length > 0 || keysUnreadableUsers.length > 0;
+  const judgedKeys = <T>(value: T): T | null => (keysJudged === 0 && anyKeyNotJudged ? null : value);
+  const usersMfaJudged = users.length - mfaUnreadableUsers.length;
+  const judgedMfa = <T>(value: T): T | null => (usersMfaJudged === 0 && mfaUnreadableUsers.length > 0 ? null : value);
+
   const privilegedRoles = roles.filter(hasAdministratorPolicy);
   const rolesWithoutBoundaries = privilegedRoles.filter((role) => !role.PermissionsBoundary);
   const mfaCaps = [...userCaps];
@@ -2513,7 +2521,8 @@ export async function assessAwsIdentity(
       {
         users_readable: !userListRead.error,
         user_count: ifRead(userListRead, users.length),
-        users_without_mfa: ifRead(userListRead, usersWithoutMfa.slice(0, 25)),
+        users_mfa_judged: ifRead(userListRead, judgedMfa(usersMfaJudged)),
+        users_without_mfa: ifRead(userListRead, judgedMfa(usersWithoutMfa.slice(0, 25))),
         users_mfa_unreadable: ifRead(userListRead, sample(mfaUnreadableUsers)),
         user_inventory_truncated: truncatedFlag(userListRead),
       },
@@ -2542,7 +2551,8 @@ export async function assessAwsIdentity(
         users_readable: !userListRead.error,
         // Zero keys were sampled because none could be listed, not because none exist, when every key list was unreadable.
         keys_sampled: users.length > 0 && keysUnreadableUsers.length === users.length ? null : ifRead(userListRead, sampledKeys),
-        stale_access_keys: ifRead(userListRead, staleAccessKeys.slice(0, 25).map((key) => ({ userName: key.userName, accessKeyId: maskAccessKeyId(key.accessKeyId), ageDays: key.ageDays }))),
+        keys_judged: ifRead(userListRead, judgedKeys(keysJudged)),
+        stale_access_keys: ifRead(userListRead, judgedKeys(staleAccessKeys.slice(0, 25).map((key) => ({ userName: key.userName, accessKeyId: maskAccessKeyId(key.accessKeyId), ageDays: key.ageDays })))),
         users_keys_unreadable: ifRead(userListRead, sample(keysUnreadableUsers)),
         keys_last_used_unreadable: ifRead(userListRead, sample(lastUsedUnreadableKeys)),
         user_inventory_truncated: truncatedFlag(userListRead),
@@ -2683,8 +2693,10 @@ export async function assessAwsIdentity(
     summary: {
       users: ifRead(userListRead, users.length),
       user_inventory_truncated: truncatedFlag(userListRead),
-      users_without_mfa: ifRead(userListRead, usersWithoutMfa.length),
-      stale_access_keys: ifRead(userListRead, staleAccessKeys.length),
+      users_mfa_judged: ifRead(userListRead, judgedMfa(usersMfaJudged)),
+      users_without_mfa: ifRead(userListRead, judgedMfa(usersWithoutMfa.length)),
+      keys_judged: ifRead(userListRead, judgedKeys(keysJudged)),
+      stale_access_keys: ifRead(userListRead, judgedKeys(staleAccessKeys.length)),
       keys_last_used_unreadable: ifRead(userListRead, lastUsedUnreadableKeys.length),
       roles: ifRead(roleListRead, roles.length),
       role_inventory_truncated: truncatedFlag(roleListRead),
@@ -3541,6 +3553,15 @@ export async function assessAwsDataProtection(
     return bucket.encryption.value === null || rules.length === 0 || rules.every((rule) => !asString(asObject(rule)?.SSEAlgorithm));
   });
   const bucketEncryptionUnreadable = bucketDetails.filter((bucket) => bucket.encryption.error);
+  // The RDS clause is worded from what was read: an inventory that could not be listed anywhere is not "all 0 instances".
+  const rdsReadableRegions = regionResults.length - rdsErrors.length;
+  const rdsClause = rdsAllFailed
+    ? `RDS instances could not be listed in any of ${regionResults.length} region(s) (${rdsErrors[0]?.rds.error ?? "rds:DescribeDBInstances failed"})`
+    : rdsUnencrypted.length > 0
+      ? `${rdsUnencrypted.length}/${rdsInstances.length} RDS instances have StorageEncrypted=false`
+      : rdsInstances.length === 0
+        ? `no RDS instances exist in the ${rdsReadableRegions} readable region(s)`
+        : `all ${rdsInstances.length} RDS instances in the ${rdsReadableRegions} readable region(s) report StorageEncrypted=true`;
 
   let encryptionStatus: AwsFinding["status"];
   let encryptionSummary: string;
@@ -3549,13 +3570,13 @@ export async function assessAwsDataProtection(
     encryptionSummary = `EBS default encryption could not be read in any of ${ebsRows.length} region(s) (${ebsRows[0].error ?? "flag missing"}); verify EBS, S3, and RDS encryption defaults in the console.`;
   } else if (bucketList.error) {
     encryptionStatus = "manual";
-    encryptionSummary = `EBS default encryption is disabled in ${ebsOff.length}/${ebsRows.length} region(s) and ${rdsUnencrypted.length}/${rdsInstances.length} RDS instances are unencrypted, but the S3 bucket inventory could not be read (${bucketList.error}).`;
+    encryptionSummary = `EBS default encryption is disabled in ${ebsOff.length}/${ebsRows.length} region(s) and ${rdsClause}, but the S3 bucket inventory could not be read (${bucketList.error}).`;
   } else if (ebsOff.length > 0 || rdsUnencrypted.length > 0 || bucketsWithoutSse.length > 0) {
     encryptionStatus = "fail";
-    encryptionSummary = `EBS default encryption disabled in ${ebsOff.length}/${ebsRows.length} region(s); ${bucketsWithoutSse.length}/${buckets.length} buckets lack default server-side encryption; ${rdsUnencrypted.length}/${rdsInstances.length} RDS instances have StorageEncrypted=false.`;
+    encryptionSummary = `EBS default encryption disabled in ${ebsOff.length}/${ebsRows.length} region(s); ${bucketsWithoutSse.length}/${buckets.length} buckets lack default server-side encryption; ${rdsClause}.`;
   } else {
     encryptionStatus = "pass";
-    encryptionSummary = `EBS encryption by default is enabled in all ${ebsRows.length - ebsUnknown.length} readable region(s), all ${buckets.length} buckets have default server-side encryption, and all ${rdsInstances.length} RDS instances report StorageEncrypted=true. EFS is not assessed by this check.`;
+    encryptionSummary = `EBS encryption by default is enabled in all ${ebsRows.length - ebsUnknown.length} readable region(s), all ${buckets.length} buckets have default server-side encryption, and ${rdsClause}. EFS is not assessed by this check.`;
   }
   const encryptionCaps: string[] = [];
   const scopeReason = scopeCap(scope);

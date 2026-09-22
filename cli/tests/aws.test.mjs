@@ -1109,6 +1109,8 @@ test("assessAwsDataProtection fixture (d): compliant account passes every data p
   assert.equal(encryption.evidence.ebs_by_region.length, 2);
   assert.equal(encryption.evidence.ebs_by_region[0].EbsEncryptionByDefault, true);
   assert.equal(encryption.evidence.efs, "not assessed");
+  // Every region's RDS inventory was read: the sentence counts the instances against the regions that were read.
+  assert.match(encryption.summary, /all \d+ RDS instances in the 2 readable region\(s\) report StorageEncrypted=true/);
   assert.equal(findingById(result, "AWS-DATA-22").evidence.eligible_keys, 2);
 });
 
@@ -1257,6 +1259,10 @@ test("assessAwsDataProtection caps partial reads and truncation at warn", async 
   assert.match(findingById(result, "AWS-DATA-11").summary, /Downgraded to warn: 1 bucket\(s\) could not be read \(s3:GetPublicAccessBlock or s3:GetBucketPolicyStatus\); bucket inventory truncated at 1000/);
   assert.match(findingById(result, "AWS-DATA-12").summary, /rds:DescribeDBInstances unreadable in 1 region\(s\) \(us-east-1\)/);
   assert.match(findingById(result, "AWS-DATA-12").summary, /only 1 of 2 regions assessed/);
+  // The RDS inventory was unreadable in every assessed region: the summary says so and never claims "all 0 RDS instances".
+  assert.match(findingById(result, "AWS-DATA-12").summary, /RDS instances could not be listed in any of 1 region\(s\) \(rds:DescribeDBInstances us-east-1: AccessDenied/);
+  assert.doesNotMatch(findingById(result, "AWS-DATA-12").summary, /all 0 RDS instances|0 RDS instances report/);
+  assert.deepEqual({ instances: result.summary.rds_instances, unencrypted: result.summary.rds_unencrypted, evidence: findingById(result, "AWS-DATA-12").evidence.rds_instances }, { instances: null, unencrypted: null, evidence: null }, "the RDS counts are unread, matching the summary sentence");
   assert.match(findingById(result, "AWS-DATA-13").summary, /bucket inventory truncated/);
   assert.match(findingById(result, "AWS-DATA-22").summary, /kms:GetKeyRotationStatus unreadable for 1 key\(s\)/);
   assert.match(findingById(result, "AWS-DATA-22").summary, /only 1 of 2 regions assessed/);
@@ -2078,7 +2084,13 @@ test("rule 1 corollary: assessAwsIdentity never passes a user control whose per-
   );
   assert.match(findingById(lastUsed, "AWS-IAM-04").summary, /no key was judged/);
   assert.deepEqual(findingById(lastUsed, "AWS-IAM-04").evidence.keys_last_used_unreadable, [MASKED_ACCESS_KEY_ID]);
-  assert.deepEqual(findingById(lastUsed, "AWS-IAM-04").evidence.stale_access_keys, [], "an unjudged key is never listed as stale");
+  // No key was judged, so the stale list and the judged count are unread (null), not an empty list beside an unreadable key.
+  assert.deepEqual(
+    { stale: findingById(lastUsed, "AWS-IAM-04").evidence.stale_access_keys, judged: findingById(lastUsed, "AWS-IAM-04").evidence.keys_judged, summaryStale: lastUsed.summary.stale_access_keys, summaryJudged: lastUsed.summary.keys_judged },
+    { stale: null, judged: null, summaryStale: null, summaryJudged: null },
+    "an unjudged key is never listed as stale, and 0 never stands beside the unreadable key",
+  );
+  assert.equal(lastUsed.summary.keys_last_used_unreadable, 1);
   assert.ok(lastUsed.errors.some((line) => line.startsWith(`iam:GetAccessKeyLastUsed ${MASKED_ACCESS_KEY_ID}: AccessDenied`)), "the error line carries the masked key id only");
   assertNoCanaryWindows(assert, lastUsed, [RAW_ACCESS_KEY_ID], "last-used evidence");
 
@@ -2108,6 +2120,12 @@ test("rule 1 corollary: assessAwsIdentity never passes a user control whose per-
   assert.ok(
     oldKeyFinding.summary.includes(`No sampled access key exceeded the 90-day staleness threshold. Downgraded to warn: GetAccessKeyLastUsed unreadable for 1 key(s) (${MASKED_ACCESS_KEY_ID}); those keys were not judged and need a manual last-used review`),
     oldKeyFinding.summary,
+  );
+  // One of two keys was judged: the stale count is 0 of the 1 judged key, stated beside the judged count and the unreadable key.
+  assert.deepEqual(
+    { stale: oldKeyFinding.evidence.stale_access_keys, judged: oldKeyFinding.evidence.keys_judged, sampled: oldKeyFinding.evidence.keys_sampled, summary: { stale: oldKeyDenied.summary.stale_access_keys, judged: oldKeyDenied.summary.keys_judged, unreadable: oldKeyDenied.summary.keys_last_used_unreadable } },
+    { stale: [], judged: 1, sampled: 2, summary: { stale: 0, judged: 1, unreadable: 1 } },
+    "a partially judged sample renders its stale count beside the number judged",
   );
   assertNoCanaryWindows(assert, oldKeyDenied, [RAW_ACCESS_KEY_ID], "denied last-used evidence");
 });
