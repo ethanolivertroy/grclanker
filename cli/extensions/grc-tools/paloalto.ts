@@ -1829,13 +1829,14 @@ export class PrismaCloudClient {
     if (!response.ok) {
       throw new PaloaltoApiError(redactSecrets(`Prisma Cloud login failed (${response.status}): ${describePrismaErrorBody(response, rawText, this.scrub)}`, this.http.secrets), response.status, endpoint);
     }
-    const parsed = safeJsonParse(rawText);
-    if (parsed === undefined) {
-      throw new PaloaltoApiError(`Prisma Cloud login returned a ${nonJsonBodyNote(response, rawText)} with status ${response.status}.`, response.status, endpoint);
-    }
-    const payload = asObject(parsed);
+    // The same shape guard as every other 2xx answer: an empty or non-JSON body, or a JSON
+    // document without the documented token member, is an unreadable surface described by
+    // status, media type, and size, never a login that silently yielded no session.
+    const document: PrismaDocument = { value: rawText.length === 0 ? undefined : safeJsonParse(rawText), response, rawText, endpoint, label: "Prisma Cloud POST /login" };
+    if (document.value === undefined) throw nonDocumentError(document, { kind: "document" }, this.http.secrets);
+    const payload = asObject(document.value);
     const token = asString(payload?.token);
-    if (!token) throw new PaloaltoApiError("Prisma Cloud login response did not include a token.", response.status, endpoint);
+    if (!token) throw nonDocumentError(document, { kind: "member", key: "token", type: "member" }, this.http.secrets);
     this.prismaId = asString(asRecords(payload?.customerNames)[0]?.prismaId) ?? this.prismaId;
     this.token = token;
     this.tokenExpiresAt = Date.now() + PRISMA_TOKEN_TTL_MS;

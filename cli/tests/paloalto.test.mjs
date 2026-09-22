@@ -1244,12 +1244,13 @@ const PLANTED_CREDENTIALS = [...Object.values(LOADER_CANARIES), ...CANARIES, ...
 const SHAPED_CREDENTIALS = new Set([CANARY_NAMED, FIXTURE_SECRET_KEY, FAKE_PRISMA_SECRETS.slackWebhookPath, FIXTURE_PANOS_PASSWORD]);
 
 // A proxy or load balancer error page: HTML with header lines and a URL carrying a token.
-// Retry-After is tiny so clients that do retry 5xx responses do so without waiting.
-function htmlCanaryResponse() {
+// Retry-After is tiny so clients that do retry 5xx responses do so without waiting. Served
+// with status 200 it is the page an SSO portal or captive proxy hands back as a success.
+function htmlCanaryResponse(status = 502) {
   const body = `<!DOCTYPE html><html><head><title>502 Bad Gateway</title></head><body><p>Authorization: Bearer ${CANARY_BEARER}</p>`
     + `<p>Set-Cookie: _upstream_session=${CANARY_SESSION}; Path=/</p><p>X-Api-Key: ${CANARY_API_KEY}</p>`
     + `<p>The upstream at ${CANARY_URL} did not answer in time, retry later.</p></body></html>`;
-  return new Response(body, { status: 502, statusText: "Bad Gateway", headers: { "content-type": "text/html; charset=utf-8", "retry-after": "0.001" } });
+  return new Response(body, { status, statusText: status === 200 ? "OK" : "Bad Gateway", headers: { "content-type": "text/html; charset=utf-8", "retry-after": "0.001" } });
 }
 
 function jsonCanaryResponse() {
@@ -1964,6 +1965,124 @@ test("error-body canary sweep: every Palo Alto surface on every device failing w
   }
 });
 
+// ---------------------------------------------------------------------------
+// Silent-success class: every surface, every device, three 2xx shapes
+// ---------------------------------------------------------------------------
+
+// Served with status 200 in place of the documented document: an empty body, the canary
+// page an SSO portal or captive proxy hands back as a success (so a 2xx that carries
+// credentials is covered too), and a foreign JSON document (an object without any
+// documented member). PAN-OS sees the same bodies; none of them has a <response> element.
+const SILENT_SUCCESS_SHAPES = [
+  { name: "empty-200", make: (product) => new Response("", { status: 200, statusText: "OK", headers: { "content-type": product === "pan-os" ? "application/xml" : "application/json" } }) },
+  { name: "html-200", make: () => htmlCanaryResponse(200) },
+  { name: "foreign-json-200", make: () => jsonResponse({ ok: true, page: "status" }) },
+];
+
+// The fixed note each product emits for a 2xx without the document, carrying the observed
+// status and the size, never the body.
+const SILENT_SUCCESS_NOTES = {
+  "prisma-cloud": /returned status 200 with (an empty response body where the documented JSON (document|object|array) was expected|a non-JSON text\/html response body \(\d+ bytes, not echoed\) where the documented JSON (document|object|array) was expected|a JSON object response body \(\d+ bytes, not echoed\) where the documented JSON array was expected|a JSON response body without (the documented "[A-Za-z_][A-Za-z0-9_]*" (array|object|member)|any of the documented members (?:"[A-Za-z_][A-Za-z0-9_]*"(?:, )?)+) \(\d+ bytes, not echoed\))\./,
+  "pan-os": /returned a non-XML (application\/xml|text\/html|application\/json) response \(status 200, \d+ bytes, not echoed\)\./,
+};
+SILENT_SUCCESS_NOTES["prisma-compute"] = SILENT_SUCCESS_NOTES["prisma-cloud"];
+
+/** Every not-collected marker in a core_data document, with where it sits. */
+function notCollectedMarkers(value, path = []) {
+  if (Array.isArray(value)) return value.flatMap((item, index) => notCollectedMarkers(item, [...path, String(index)]));
+  if (!value || typeof value !== "object") return [];
+  const own = value.collected === false ? [{ at: path.join("."), ...value }] : [];
+  return [...own, ...Object.entries(value).flatMap(([key, child]) => notCollectedMarkers(child, [...path, key]))];
+}
+
+test("silent-success class: a 2xx answer without the documented JSON or XML document on any Prisma Cloud, Compute, or PAN-OS surface is an unreadable surface with the observed status, never an empty inventory, a readable probe, a healthy check, or a hard verdict", async () => {
+  const productOf = (surface) => (surface.startsWith("prisma-cloud ") ? "prisma-cloud" : surface.startsWith("prisma-compute ") ? "prisma-compute" : "pan-os");
+  const refusal = (product) => (product === "pan-os" ? xmlResponse('<response status="error" code="403"><result><msg>Insufficient privileges</msg></result></response>', 403) : jsonResponse({ message: "forbidden" }, { status: 403 }));
+  const unprobed = new Set(["prisma-cloud /meta_info", "prisma-compute /registry", "prisma-compute /images", "prisma-compute /stats/compliance"]);
+  const statusesOf = (files) => new Map(JSON.parse(files.get(join("analysis", "findings.json"))).map((item) => [item.id, item.status]));
+  const exportFiles = async (fetchImpl, prefix) => readBundleFiles((await exportPaloaltoAuditBundle(createPaloaltoClients(sweepConfig(), fetchImpl), createTempBase(prefix))).outputDir);
+  const healthy = statusesOf(await exportFiles(sweepFetch("none", () => htmlCanaryResponse(200)), "grclanker-paloalto-silent-healthy-"));
+
+  // Positive controls: every shape is served as a success, and the parser's own message
+  // quotes the page, so only the fixed note keeps it out.
+  for (const shape of SILENT_SUCCESS_SHAPES) {
+    for (const product of ["prisma-cloud", "pan-os"]) assert.equal(shape.make(product).status, 200, `${shape.name} is served as a success`);
+  }
+  const htmlBody = await SILENT_SUCCESS_SHAPES[1].make("prisma-cloud").text();
+  assert.throws(() => JSON.parse(htmlBody), (error) => /Unexpected token|is not valid JSON/.test(error.message));
+  for (const canary of [CANARY_BEARER, CANARY_SESSION, CANARY_API_KEY, CANARY_URL_TOKEN]) assert.ok(htmlBody.includes(canary), "fixture self-check: the 200 page carries the carried canaries");
+
+  for (const surface of PALOALTO_SURFACES) {
+    const product = productOf(surface);
+    const note = SILENT_SUCCESS_NOTES[product];
+    // A 2xx without the document demotes exactly the verdicts a refusal of the same surface demotes.
+    const refused = statusesOf(await exportFiles(sweepFetch(surface, () => refusal(product)), "grclanker-paloalto-silent-refused-"));
+    const dependents = [...healthy.keys()].filter((id) => refused.get(id) !== healthy.get(id));
+
+    for (const shape of SILENT_SUCCESS_SHAPES) {
+      const label = `${shape.name} on ${surface}`;
+      const { fetchImpl, requests } = recordingPaloaltoFetch(sweepFetch(surface, () => shape.make(product)));
+      const clients = createPaloaltoClients(sweepConfig(), fetchImpl);
+      const bundle = await exportPaloaltoAuditBundle(clients, createTempBase("grclanker-paloalto-silent-"));
+      const files = readBundleFiles(bundle.outputDir);
+      for (const [name, text] of files) {
+        assertNoCanary(text, `${label} bundle ${name}`);
+        assert.doesNotMatch(text, ECHOED_BODY_TEXT, `${label}: the page or the parser message reached ${name}`);
+      }
+      assert.ok(requests.every((request) => request.status === 200), `${label}: every request in the run observed a 2xx`);
+
+      const access = JSON.parse(files.get(join("core_data", "access.json")));
+      if (surface === "prisma-compute /authenticate") {
+        // The Compute token exchange falls back to the CSPM JWT, so nothing fails and nothing is recorded.
+        assert.equal(bundle.errorCount, 0, label);
+        assert.equal(access.status, "healthy", label);
+        assert.deepEqual(statusesOf(files), healthy, label);
+        continue;
+      }
+
+      const failedProbes = access.surfaces.filter((entry) => entry.status !== "readable");
+      if (!unprobed.has(surface)) {
+        assert.ok(failedProbes.length >= 1, `${label}: the surface must probe as not readable`);
+        assert.notEqual(access.status, "healthy", `${label}: a surface that produced no document is not a healthy check`);
+      }
+      for (const probe of failedProbes) {
+        assert.equal(probe.status, "not_readable", `${label}: ${probe.name} is not counted as readable`);
+        assert.equal(probe.httpStatus, 200, `${label}: ${probe.name} carries the status the request observed`);
+        assert.equal(probe.count, null, `${label}: ${probe.name} read nothing, so it counts nothing`);
+        assert.match(probe.error, note, `${label}: probe ${probe.name} must carry the note: ${probe.error}`);
+      }
+
+      assert.ok(bundle.errorCount >= 1, `${label}: the surface is recorded as a collection error`);
+      const errorLog = files.get("_errors.log");
+      assert.ok(errorLog !== undefined, `${label}: _errors.log must exist`);
+      for (const line of errorLog.trim().split("\n")) assert.match(line, note, `${label}: every error must carry the note: ${line}`);
+
+      // Every dataset built from the surface is a marker carrying the observed 200, never an
+      // empty value, and every request or status named anywhere was made and observed.
+      const prisma = JSON.parse(files.get(join("core_data", "prisma_cloud.json")));
+      const devices = PANOS_SWEEP_HOSTS.map((host) => [`panos_${host}.json`, JSON.parse(files.get(join("core_data", `panos_${host}.json`)))]);
+      const markers = [...notCollectedMarkers(prisma, ["prisma_cloud.json"]), ...devices.flatMap(([name, device]) => notCollectedMarkers(device, [name]))];
+      assert.ok(markers.length >= 1, `${label}: the surface leaves a not-collected marker`);
+      for (const marker of markers) {
+        assert.equal(marker.status, 200, `${label}: marker ${marker.at} carries the observed status`);
+        assert.ok(["error", "unavailable"].includes(marker.dataset_status), `${label}: marker ${marker.at} is ${marker.dataset_status}`);
+        assert.match(marker.error, note, `${label}: marker ${marker.at} must carry the note: ${marker.error}`);
+      }
+      const mentions = [...endpointMentions(prisma, ["prisma_cloud.json"]), ...devices.flatMap(([name, device]) => endpointMentions(device, [name])), ...endpointMentions(access, ["access.json"])];
+      for (const mention of mentions) {
+        assert.ok(mention.status === null || mention.status === 200, `${label}: ${mention.at} names status ${mention.status} but the fixture served only 200`);
+        assert.ok(paloaltoRequestObserved(requests, mention.endpoint, mention.status), `${label}: ${mention.at} names ${mention.endpoint} (status ${mention.status}) but no such request was made`);
+      }
+
+      for (const [id, status] of statusesOf(files)) {
+        assert.equal(status, refused.get(id), `${label}: ${id} renders ${status} where a refused read of the same surface renders ${refused.get(id)}`);
+        if (dependents.includes(id)) assert.ok(["warn", "manual"].includes(status), `${label}: dependent ${id} rendered the hard verdict ${status}`);
+      }
+      assert.ok(dependents.length >= 1 || unprobed.has(surface), `${label}: the surface feeds at least one verdict`);
+    }
+  }
+});
+
 test("the registered tools scrub error strings end to end over HTTP: access check, every assess tool, and the export", async () => {
   const failing = new Map();
   const upstream = mockedFetch();
@@ -2321,12 +2440,22 @@ test("evidence and summaries derived from unreadable surfaces render null, never
   assert.ok(firewall.findings.every((item) => item.status === "manual"), "an unreachable device leaves every multi-device finding manual");
 });
 
-/** Wraps a fetch so every request and the status it received are on record for request matching. */
+/**
+ * Wraps a fetch so every request and the status it received are on record for request
+ * matching. The parameters of a form-encoded POST (the PAN-OS keygen call sends type=keygen
+ * in its body) count as the request's parameters too, so the "POST /api/?type=keygen" label
+ * a failed keygen carries can be matched to the request that was made.
+ */
 function recordingPaloaltoFetch(inner) {
   const requests = [];
   const fetchImpl = async (input, init = {}) => {
     const url = new URL(input);
-    const entry = { method: init.method ?? "GET", host: url.hostname, path: url.pathname, query: Object.fromEntries(url.searchParams), status: null };
+    const query = Object.fromEntries(url.searchParams);
+    const contentType = init.headers?.["content-type"] ?? init.headers?.["Content-Type"] ?? "";
+    if (typeof init.body === "string" && contentType.startsWith("application/x-www-form-urlencoded")) {
+      for (const [name, value] of new URLSearchParams(init.body)) query[name] ??= value;
+    }
+    const entry = { method: init.method ?? "GET", host: url.hostname, path: url.pathname, query, status: null };
     requests.push(entry);
     const response = await inner(input, init);
     entry.status = response.status;
