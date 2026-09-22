@@ -2562,6 +2562,58 @@ test("rule 9: scrub boundary: a name-shaped value stays bare in prose and is rem
     if (input.includes(name) && !expected.includes(name)) assertNoWindowOf(scrubbed, name, `carrier ${input}`);
   }
   assertNoWindowOf(scrubErrorText(bare, [name]), name, "configured secret in prose");
+
+  // Quoted header values (the Codex P1 carrier class): the value goes whatever its quote style (plain, single, JSON-escaped), separator, or frame; the quote and any scheme word stay; quoted non-credential headers come back unchanged.
+  const quotedExpectations = [
+    [`Cookie: sid="${name}"; Path=/`, "Cookie: [REDACTED]"],
+    [`Cookie: sid=\\"${name}\\"`, "Cookie: [REDACTED]"],
+    [`Set-Cookie: session='${name}'; HttpOnly`, "Set-Cookie: [REDACTED]"],
+    [`Authorization: Bearer "${name}" rejected`, 'Authorization: Bearer "[REDACTED]" rejected'],
+    [`Authorization: SSWS '${name}' rejected`, "Authorization: SSWS '[REDACTED]' rejected"],
+    [`Authorization: "Bearer ${name}" rejected`, 'Authorization: "Bearer [REDACTED]" rejected'],
+    [`\\"Authorization\\": \\"Bearer ${name}\\"`, '\\"Authorization\\": \\"Bearer [REDACTED]\\"'],
+    [`X-Api-Key: \\"Ab3dEf9hIj2k\\", next`, 'X-Api-Key: \\"[REDACTED]\\", next'],
+    [`X-Auth-Token: "Ab3dEf9hIj2k"`, 'X-Auth-Token: "[REDACTED]"'],
+    [`Bearer "${name}" rejected`, 'Bearer "[REDACTED]" rejected'],
+  ];
+  for (const [input, expected] of quotedExpectations) assert.equal(scrubErrorText(input), expected, input);
+  const quotedCarriers = [
+    (value, separator) => `Cookie${separator}sid=${value}; Path=/`,
+    (value, separator) => `Cookie${separator}sid = ${value}`,
+    (value, separator) => `Set-Cookie${separator}session=${value}; HttpOnly`,
+    (value, separator) => `X-Api-Key${separator}${value}`,
+    (value, separator) => `X-Auth-Token${separator}${value}`,
+    (value, separator) => `Authorization${separator}${value}`,
+    (value, separator) => `Authorization${separator}Bearer ${value}`,
+    (value, separator) => `Authorization${separator}Basic ${value}`,
+    (value, separator) => `Authorization${separator}SSWS ${value}`,
+    (value, separator) => `Proxy-Authorization${separator}Bearer ${value}`,
+    (value, separator, raw, quote) => `Authorization${separator}${quote}Bearer ${raw}${quote}`,
+  ];
+  const quotedFrames = [
+    (line) => line,
+    (line) => `Okta API request failed for /api/v1/users (401 Unauthorized): the request carried ${line} and was rejected`,
+    (line) => `{"errorCode":"E0000011","errorSummary":"Invalid header: ${line}","errorCauses":[]}`,
+  ];
+  for (const raw of [name, "Ab3dEf9hIj2k"]) {
+    for (const carrier of quotedCarriers) {
+      for (const separator of [": ", ":", " : ", " :"]) {
+        for (const frame of quotedFrames) {
+          for (const quote of ['"', "'", '\\"']) {
+            const input = frame(carrier(`${quote}${raw}${quote}`, separator, raw, quote));
+            assertNoWindowOf(scrubErrorText(input), raw, `quoted carrier ${input}`);
+          }
+          const control = frame(carrier(raw, separator, raw, ""));
+          assertNoWindowOf(scrubErrorText(control), raw, `unquoted carrier ${control}`);
+        }
+      }
+    }
+  }
+  for (const header of OKTA_QUOTED_HEADERS_KEPT) {
+    assert.equal(scrubErrorText(header), header, `must keep quoted header: ${header}`);
+    const sentence = `Okta API request failed for /api/v1/users (400 Bad Request): the response carried ${header}`;
+    assert.equal(scrubErrorText(sentence), sentence, `must keep quoted header in a sentence: ${sentence}`);
+  }
   const secret = 'top secret/value+1"x';
   const forms = {
     raw: secret,
@@ -2633,6 +2685,21 @@ const OKTA_REQUESTED_PATHS = [
   "/api/v1/zones?limit=200",
   "/oauth2/v1/token",
 ];
+/** Quoted non-credential headers (the Codex P1 must-keep rows): a quote alone never makes a header value a credential. */
+const OKTA_QUOTED_HEADERS_KEPT = [
+  'Content-Type: "application/json"',
+  'Content-Type:"application/json; charset=utf-8"',
+  "Accept: 'application/json'",
+  'Content-Length: "42"',
+  'X-Request-Id: "3f2b6a1e-9c4d-4e8f-b1a2-6d7c8e9f0a1b"',
+  'X-Rate-Limit-Remaining: "599"',
+  'User-Agent: "grclanker-cli/0.4.1"',
+  'Cache-Control: "no-store"',
+  'Location: "/api/v1/users"',
+  '{"Content-Type": "application/json", "Accept": "application/json"}',
+  '{\\"Content-Type\\": \\"application/json\\", \\"Accept\\": \\"application/json\\"}',
+];
+
 const OKTA_MUST_KEEP = [
   ...OKTA_REQUESTED_PATHS,
   ...OKTA_REQUESTED_PATHS.map((path) => `GET ${path}`),

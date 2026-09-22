@@ -218,26 +218,33 @@ const EMBEDDED_URL_PATTERN = /\b[a-z][a-z0-9+.-]*:\/\/[^\s"'<>()[\]{}]+/gi;
 const URL_PARTS_PATTERN = /^([a-z][a-z0-9+.-]*:\/\/)(?:[^\s/@"'<>]+@)?([^?#]*)(\?[^#]*)?(#.*)?$/i;
 const TRAILING_PUNCTUATION_PATTERN = /[.,;:!?]+$/;
 const QUERY_PAIR_PATTERN = /([?&])([A-Za-z0-9_.[\]-]+)=([^&#\s"'<>)\]}]+)/g;
-const COOKIE_HEADER_PATTERN = /\b(set-cookie|cookies?)(["']?\s*[:=]\s*)(?!\[REDACTED\])[^\s<>"'][^\r\n<>"']*/gi;
+// A cookie header's value runs to the end of the line and may hold quoted pair or attribute values in
+// plain, single, or JSON-escaped quotes; every quoted segment is part of the value, never its end.
+const COOKIE_HEADER_PATTERN = /\b(set-cookie|cookies?)(\\?["']?\s*[:=]\s*)(?!\[REDACTED\])(?=\S)(?:[^\r\n<>"'\\]|\\?["'][^"'\r\n\\]*\\?["'])+/gi;
 // A scheme word spelled as a header scheme followed by a run of 8 or more token characters is a
 // credential whatever the run's shape; only the mechanism words vendor prose puts there ("Basic
 // authentication", "Bearer credentials") are kept. Lowercase spellings in prose ("token provided")
 // are not schemes; inside an Authorization carrier the scheme word is matched case-insensitively.
+// The token after a scheme word may be quoted (plain, single, or JSON-escaped); the quote is kept and the token removed.
 const SCHEME_VALUE_PATTERN =
-  /\b(Bearer|BEARER|Basic|BASIC|Digest|DIGEST|Token|TOKEN|OAuth|OAUTH|Negotiate|NEGOTIATE|NTLM|SSWS|ApiKey|APIKEY|Api-Key|API-KEY)\s+([A-Za-z0-9._~+/=-]{8,})/g;
+  /\b(Bearer|BEARER|Basic|BASIC|Digest|DIGEST|Token|TOKEN|OAuth|OAUTH|Negotiate|NEGOTIATE|NTLM|SSWS|ApiKey|APIKEY|Api-Key|API-KEY|VERACODE-HMAC-SHA-256)\s+(\\?["']?)([A-Za-z0-9._~+/=-]{8,})/g;
 const SCHEME_PROSE_WORDS = new Set(["authentication", "authorization", "authenticated", "authorized", "credential", "credentials", "challenge"]);
-const SCHEME_WORD_PATTERN = /^(?:bearer|basic|digest|token|oauth|negotiate|ntlm|ssws|apikey|api-key|splunk|hmac)$/i;
-const SCHEME_TOKEN_PATTERN = /^(\s+)(?!\[REDACTED\])([^\s"'<>;,()[\]{}]+)/;
-const ASSIGNMENT_KEY_PATTERN = /(["']?)\b([A-Za-z][A-Za-z0-9_.-]{0,63})\b(["']?\s*([:=])\s*(["']?))/g;
-const ASSIGNMENT_VALUE_PATTERN = /(?!\[REDACTED\])[^\s"'<>;,&()[\]{}]+/y;
+const SCHEME_WORD_PATTERN = /^(?:bearer|basic|digest|token|oauth|negotiate|ntlm|ssws|apikey|api-key|splunk|hmac|veracode-hmac-sha-256)$/i;
+const SCHEME_TOKEN_PATTERN = /^(\s+)(?!\[REDACTED\])(\\?["']?)([^\s"'<>;,()[\]{}\\]+)/;
+// A pair key or value may sit in plain, single, or JSON-escaped quotes; the value ends at a quote or the escaping backslash.
+const ASSIGNMENT_KEY_PATTERN = /(\\?["']?)\b([A-Za-z][A-Za-z0-9_.-]{0,63})\b(\\?["']?\s*([:=])\s*(\\?["']?))/g;
+const ASSIGNMENT_VALUE_PATTERN = /(?!\[REDACTED\])[^\s"'<>;,&()[\]{}\\]+/y;
 const CLAUSE_END_PATTERN = /(?:[)\]}]|[.,;!?](?=\s|$)|[ \t]*(?:\r?\n|$))/y;
 const HEADER_NAME_PATTERN = /^(?:[A-Za-z0-9]+(?:-[A-Za-z0-9]+)+|authorization|cookies?)$/i;
 const JWT_IN_TEXT_PATTERN = /\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}(?:\.[A-Za-z0-9_-]+)*/g;
 const AWS_ACCESS_KEY_ID_PATTERN = /\b(?:AKIA|ASIA|AROA|AIDA|AGPA|ANPA|ANVA|APKA|ABIA|ACCA)[A-Z0-9]{16}\b/g;
 const AWS_SECRET_PATTERN = /(?<![A-Za-z0-9/+=])[A-Za-z0-9/+]{40}(?![A-Za-z0-9/+=])/g;
 const HEX_DIGEST_PATTERN = /\b[A-Fa-f0-9]{32,}\b/g;
+// The signed header value ("id=...,ts=...,nonce=...,sig=...") holds "," and so escapes the scheme
+// value rule; whatever run follows the scheme word goes, quoted or not, and the scheme word and the
+// opening quote stay so the header remains legible.
+const HMAC_HEADER_PATTERN = /\b(VERACODE-HMAC-SHA-256)\s+(?!\\?["']?\[REDACTED\])(\\?["']?)[^\s"'\\]+/g;
 const VENDOR_TOKEN_PATTERNS: readonly RegExp[] = [
-  /\bVERACODE-HMAC-SHA-256\s+(?!\[REDACTED\])\S+/g,
   /\b00[A-Za-z0-9_-]{40}\b/g,
   /\bxox[abopers]-[A-Za-z0-9-]{10,}/g,
   /\bgh[pousr]_[A-Za-z0-9]{20,}/g,
@@ -363,10 +370,10 @@ function scrubQueryPair(match: string, separator: string, key: string): string {
   return isCredentialCarrierKey(key) ? `${separator}${key}=${REDACTED}` : match;
 }
 
-function scrubSchemeValue(match: string, scheme: string, value: string): string {
+function scrubSchemeValue(match: string, scheme: string, quote: string, value: string): string {
   const trailing = TRAILING_PUNCTUATION_PATTERN.exec(value)?.[0] ?? "";
   const word = value.slice(0, value.length - trailing.length);
-  return SCHEME_PROSE_WORDS.has(word.toLowerCase()) ? match : `${scheme} ${REDACTED}${trailing}`;
+  return SCHEME_PROSE_WORDS.has(word.toLowerCase()) ? match : `${scheme} ${quote}${REDACTED}${trailing}`;
 }
 
 /**
@@ -403,7 +410,7 @@ function replaceCredentialAssignments(text: string): string {
     if (SCHEME_WORD_PATTERN.test(value)) {
       const token = SCHEME_TOKEN_PATTERN.exec(text.slice(valueStart + value.length));
       if (!token) continue;
-      kept = `${value}${token[1]}`;
+      kept = `${value}${token[1]}${token[2]}`;
       consumed += token[0].length;
     } else if (
       separatorChar === ":" &&
@@ -433,6 +440,7 @@ export function scrubErrorText(text: string, secrets: ReadonlyArray<string | und
     .replace(COOKIE_HEADER_PATTERN, `$1$2${REDACTED}`);
   scrubbed = replaceCredentialAssignments(scrubbed)
     .replace(SCHEME_VALUE_PATTERN, scrubSchemeValue)
+    .replace(HMAC_HEADER_PATTERN, `$1 $2${REDACTED}`)
     .replace(JWT_IN_TEXT_PATTERN, REDACTED)
     .replace(AWS_ACCESS_KEY_ID_PATTERN, REDACTED)
     .replace(AWS_SECRET_PATTERN, (run) => (looksLikeAwsSecret(run) ? REDACTED : run))

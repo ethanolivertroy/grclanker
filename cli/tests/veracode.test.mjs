@@ -1644,6 +1644,75 @@ test("rule 9: scrub boundary: a name-shaped value stays bare in prose and is rem
     if (input.includes(name) && !expected.includes(name)) assertNoWindowOf(scrubbed, name, `carrier ${input}`);
   }
   assertNoWindowOf(scrubErrorText(bare, [name]), name, "configured secret in prose");
+
+  // Quoted header values (the Codex P1 carrier class): the value goes whatever its quote style (plain, single, JSON-escaped), separator, or frame; the quote and any scheme word stay; quoted non-credential headers come back unchanged.
+  const quotedExpectations = [
+    [`Cookie: sid="${name}"; Path=/`, "Cookie: [REDACTED]"],
+    [`Cookie: sid=\\"${name}\\"`, "Cookie: [REDACTED]"],
+    [`Set-Cookie: session='${name}'; HttpOnly`, "Set-Cookie: [REDACTED]"],
+    [`Authorization: Bearer "${name}" rejected`, 'Authorization: Bearer "[REDACTED]" rejected'],
+    [`Authorization: VERACODE-HMAC-SHA-256 '${name}' rejected`, "Authorization: VERACODE-HMAC-SHA-256 '[REDACTED]' rejected"],
+    [`Authorization: "Bearer ${name}" rejected`, 'Authorization: "Bearer [REDACTED]" rejected'],
+    [`\\"Authorization\\": \\"Bearer ${name}\\"`, '\\"Authorization\\": \\"Bearer [REDACTED]\\"'],
+    [`X-Api-Key: \\"Ab3dEf9hIj2k\\", next`, 'X-Api-Key: \\"[REDACTED]\\", next'],
+    [`X-Auth-Token: "Ab3dEf9hIj2k"`, 'X-Auth-Token: "[REDACTED]"'],
+    [`Bearer "${name}" rejected`, 'Bearer "[REDACTED]" rejected'],
+  ];
+  for (const [input, expected] of quotedExpectations) assert.equal(scrubErrorText(input), expected, input);
+  // The signed header itself: the id, nonce, and signature go, the scheme word and the quote stay, and a second pass changes nothing.
+  const signedParts = { id: "dbb6f2a2ed0b6890bbd32e949f72c8c8", nonce: "0123456789abcdef0123456789abcdef", sig: "a1".repeat(32) };
+  const signedHeader = `VERACODE-HMAC-SHA-256 id=${signedParts.id},ts=1700000000000,nonce=${signedParts.nonce},sig=${signedParts.sig}`;
+  const signedScrubbed = "VERACODE-HMAC-SHA-256 [REDACTED],ts=1700000000000,nonce=[REDACTED],sig=[REDACTED]";
+  const signedExpectations = [
+    [signedHeader, signedScrubbed],
+    [`Authorization: ${signedHeader}`, `Authorization: ${signedScrubbed}`],
+    [`Authorization: "${signedHeader}"`, `Authorization: "${signedScrubbed}"`],
+    [`\\"Authorization\\": \\"${signedHeader}\\"`, `\\"Authorization\\": \\"${signedScrubbed}\\"`],
+    ["VERACODE-HMAC-SHA-256 id=ab,ts=1,nonce=cd,sig=ef", "VERACODE-HMAC-SHA-256 [REDACTED]"],
+  ];
+  for (const [input, expected] of signedExpectations) {
+    const scrubbed = scrubErrorText(input);
+    assert.equal(scrubbed, expected, input);
+    assert.equal(scrubErrorText(scrubbed), scrubbed, `second pass over ${input}`);
+    for (const part of Object.values(signedParts)) assertNoWindowOf(scrubbed, part, `signed header ${input}`);
+  }
+  const quotedCarriers = [
+    (value, separator) => `Cookie${separator}sid=${value}; Path=/`,
+    (value, separator) => `Cookie${separator}sid = ${value}`,
+    (value, separator) => `Set-Cookie${separator}session=${value}; HttpOnly`,
+    (value, separator) => `X-Api-Key${separator}${value}`,
+    (value, separator) => `X-Auth-Token${separator}${value}`,
+    (value, separator) => `Authorization${separator}${value}`,
+    (value, separator) => `Authorization${separator}Bearer ${value}`,
+    (value, separator) => `Authorization${separator}Basic ${value}`,
+    (value, separator) => `Authorization${separator}VERACODE-HMAC-SHA-256 ${value}`,
+    (value, separator) => `Proxy-Authorization${separator}Bearer ${value}`,
+    (value, separator, raw, quote) => `Authorization${separator}${quote}Bearer ${raw}${quote}`,
+  ];
+  const quotedFrames = [
+    (line) => line,
+    (line) => `Veracode request failed (401 Unauthorized) for /appsec/v1/applications: the request carried ${line} and was rejected`,
+    (line) => `{"http_code":401,"http_status":"Unauthorized","message":"Invalid header: ${line}"}`,
+  ];
+  for (const raw of [name, "Ab3dEf9hIj2k"]) {
+    for (const carrier of quotedCarriers) {
+      for (const separator of [": ", ":", " : ", " :"]) {
+        for (const frame of quotedFrames) {
+          for (const quote of ['"', "'", '\\"']) {
+            const input = frame(carrier(`${quote}${raw}${quote}`, separator, raw, quote));
+            assertNoWindowOf(scrubErrorText(input), raw, `quoted carrier ${input}`);
+          }
+          const control = frame(carrier(raw, separator, raw, ""));
+          assertNoWindowOf(scrubErrorText(control), raw, `unquoted carrier ${control}`);
+        }
+      }
+    }
+  }
+  for (const header of VERACODE_QUOTED_HEADERS_KEPT) {
+    assert.equal(scrubErrorText(header), header, `must keep quoted header: ${header}`);
+    const sentence = `Veracode request failed (400 Bad Request) for /appsec/v1/applications: the response carried ${header}`;
+    assert.equal(scrubErrorText(sentence), sentence, `must keep quoted header in a sentence: ${sentence}`);
+  }
   const secret = 'top secret/value+1"x';
   const forms = {
     raw: secret,
@@ -1716,6 +1785,21 @@ const VERACODE_REQUESTED_PATHS = [
   "/was/configservice/v1/analyses/an-1/scans",
   "/was/configservice/v1/scans/scan-1/configuration",
 ];
+/** Quoted non-credential headers (the Codex P1 must-keep rows): a quote alone never makes a header value a credential. */
+const VERACODE_QUOTED_HEADERS_KEPT = [
+  'Content-Type: "application/json"',
+  'Content-Type:"application/json; charset=utf-8"',
+  "Accept: 'application/json'",
+  'Content-Length: "42"',
+  'X-Request-Id: "3f2b6a1e-9c4d-4e8f-b1a2-6d7c8e9f0a1b"',
+  'X-Rate-Limit-Remaining: "599"',
+  'User-Agent: "grclanker-cli/0.4.1"',
+  'Cache-Control: "no-store"',
+  'Location: "/appsec/v1/applications"',
+  '{"Content-Type": "application/json", "Accept": "application/json"}',
+  '{\\"Content-Type\\": \\"application/json\\", \\"Accept\\": \\"application/json\\"}',
+];
+
 const VERACODE_MUST_KEEP = {
   path: [...VERACODE_REQUESTED_PATHS, ...VERACODE_REQUESTED_PATHS.map((path) => `GET ${path}`)],
   host: ["https://api.veracode.com", "https://api.veracode.eu", "https://api.veracode.us", "api.veracode.com", "acme-prod.example.gov"],
