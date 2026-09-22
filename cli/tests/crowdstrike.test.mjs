@@ -33,6 +33,7 @@ import {
 import { getRegisteredToolSummaries } from "../dist/pi/tool-catalog.js";
 import { assertSecretsAbsent, readBundleFiles, readZipEntries } from "./helpers/bundle-contents.mjs";
 import { assertConfigLoaderMatrix, configLoaderCases } from "./helpers/config-loader-matrix.mjs";
+import { assertScrubBoundary } from "./helpers/scrub-boundary-matrix.mjs";
 
 const ALL_CONTROL_IDS = Array.from({ length: 25 }, (_, index) => `CS-${String(index + 1).padStart(2, "0")}`);
 const EXPECTED_TOOLS = [
@@ -1855,14 +1856,15 @@ test("verdict safety rule 9: exportCrowdstrikeAuditBundle never writes alert com
   assert.match(ioa[0].description, /^Allow the uploader; it authenticates with Authorization: \[REDACTED\]/);
   assert.equal(ioa[0].name, "Backup agent");
   const ml = JSON.parse(files.get("core_data/access_governance/ml_exclusions.json"));
-  assert.equal(ml[0].value, "D:\\Builds\\artifacts\\password=[REDACTED]");
+  // The credential value ends at the path separator, so the path skeleton after it stays.
+  assert.equal(ml[0].value, "D:\\Builds\\artifacts\\password=[REDACTED]\\*.pdb");
   const sv = JSON.parse(files.get("core_data/access_governance/sensor_visibility_exclusions.json"));
   assert.equal(sv[0].value, "/opt/vendor/agent/collector --secret [REDACTED]");
   assert.equal(sv[0].comment, "Registered at https://vendor.example.com/register?[REDACTED] by ops");
   const governance = JSON.parse(files.get("analysis/access_governance.json"));
   assert.equal(findingById(governance, "CS-19").evidence.listing[0].cl_regex, ".*uploader\\.exe --token [REDACTED] --quiet.*");
   assert.equal(findingById(governance, "CS-19").evidence.listing[0].ifn_regex, "C:\\\\Tools\\\\uploader\\.exe api_key=[REDACTED]");
-  assert.equal(findingById(governance, "CS-20").evidence.listing[0].value, "D:\\Builds\\artifacts\\password=[REDACTED]");
+  assert.equal(findingById(governance, "CS-20").evidence.listing[0].value, "D:\\Builds\\artifacts\\password=[REDACTED]\\*.pdb");
   assert.equal(findingById(governance, "CS-21").evidence.listing[0].value, "/opt/vendor/agent/collector --secret [REDACTED]");
   assert.equal(findingById(governance, "CS-19").status, "pass", "redaction does not change the broad-regex verdict");
 });
@@ -2337,6 +2339,23 @@ test("addendum 4: on every Falcon surface a 502 HTML body or a JSON error embedd
     }
   }
   assert.equal(runs.length, CS_CANARY_SURFACES.length * 2);
+});
+
+test("scrub boundary: bare name-shaped values stay, carriers and registered secrets (in every encoded form) and real token shapes go, in CrowdstrikeHttpError", () => {
+  const fetchImpl = async () => jsonResponse({});
+  const mustKeep = [
+    "Falcon request failed (502) for /oauth2/token: non-JSON body (text/html, 5120 bytes)",
+    "Falcon request failed (403) for /policy/combined/prevention/v1: JSON body without documented error fields (application/json, 42 bytes)",
+    "Unable to read CrowdStrike config file /home/svc/.crowdstrike/config.json (ENOENT)",
+    "Unable to parse CrowdStrike config file: invalid JSON in /tmp/grclanker-crowdstrike-loader-Ab3dEf/short.json",
+    "host group Workstations-US-East-2026 and sensor update policy platform_default on cloud us-1",
+  ];
+  // The client constructor is the registration path (rememberSecrets on the configured client secret); the error constructor is the pass.
+  assertScrubBoundary({
+    scrub: (text) => new CrowdstrikeHttpError(text, 502, "/x").message,
+    registerSecret: (secret) => new CrowdstrikeApiClient(sampleConfig({ clientSecret: secret }), { fetchImpl }),
+    mustKeep,
+  });
 });
 
 test("resolveSecureOutputPath rejects traversal and symlink parents", () => {

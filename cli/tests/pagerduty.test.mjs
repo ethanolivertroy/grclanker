@@ -15,6 +15,7 @@ import {
   DEFAULT_AUDIT_LIMIT,
   PAGERDUTY_CONTROLS,
   PagerdutyApiClient,
+  PagerdutyRequestError,
   assessPagerdutyAccessControl,
   assessPagerdutyAuditLogging,
   assessPagerdutyIncidentResponse,
@@ -40,6 +41,7 @@ import {
 import { getRegisteredToolSummaries } from "../dist/pi/tool-catalog.js";
 import { assertSecretsAbsent, readBundleFiles, readZipEntries } from "./helpers/bundle-contents.mjs";
 import { assertConfigLoaderMatrix, configLoaderCases } from "./helpers/config-loader-matrix.mjs";
+import { assertScrubBoundary } from "./helpers/scrub-boundary-matrix.mjs";
 
 const NOW = new Date("2026-09-21T00:00:00.000Z");
 // An explicit config path must exist (a missing explicit file is a read error), so isolation from
@@ -3021,6 +3023,24 @@ test("addendum 4: a Scoped OAuth token endpoint that answers with a 502 HTML pag
   const redacted = client.redact(`header Bearer ${PD_CANARY.accessToken}, key Token token=${PD_CANARY.clientSecret}, at https://u:p@example.com/a?sid=1#frag`);
   assert.equal(redacted, "header Bearer [REDACTED], key Token token=[REDACTED], at https://[REDACTED]@example.com/a?[REDACTED]#[REDACTED]");
   assert.match(client.redact("Authorization: Bearer eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.c2lnbmF0dXJl"), /^Authorization: \[REDACTED\]/);
+});
+
+test("scrub boundary: bare name-shaped values stay, carriers and registered secrets (in every encoded form) and real token shapes go, in PagerdutyRequestError and on client.redact", () => {
+  const fetchImpl = async () => jsonResponse({});
+  const mustKeep = [
+    "PagerDuty request failed (502 Bad Gateway) for /users: non-JSON body (text/html, 5120 bytes)",
+    "PagerDuty request failed (403 Forbidden) for /audit/records: JSON body without documented error fields (application/json, 42 bytes)",
+    "Unable to read PagerDuty config file /home/svc/.pagerduty/config.json (ENOENT)",
+    "Unable to parse PagerDuty config file: invalid JSON in /tmp/grclanker-pagerduty-loader-Ab3dEf/short.json",
+    "escalation policy Platform-Primary-2026 and schedule SRE_Weekend_Rotation on team Acme_Platform_Team",
+  ];
+  // The client constructor is the registration path (rememberSecrets on the configured REST API key); the error constructor is the pass.
+  assertScrubBoundary({
+    scrub: (text) => new PagerdutyRequestError(502, text, "/x").message,
+    registerSecret: (secret) => new PagerdutyApiClient(sampleConfig({ apiToken: secret }), { fetchImpl }),
+    mustKeep,
+  });
+  assertScrubBoundary({ scrub: (text) => new PagerdutyApiClient(sampleConfig(), { fetchImpl }).redact(text), mustKeep });
 });
 
 test("collection status: a truncated user directory keeps seen counts, renders principal-derived counts and lists null, and names no user from the partial set", async () => {

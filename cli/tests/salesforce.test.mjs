@@ -7,6 +7,7 @@ import { join } from "node:path";
 
 import {
   SalesforceApiClient,
+  SalesforceApiError,
   assessSalesforceDataProtection,
   assessSalesforceDataProtectionData,
   assessSalesforceIdentityAccess,
@@ -31,6 +32,7 @@ import {
 import { getRegisteredToolSummaries } from "../dist/pi/tool-catalog.js";
 import { assertSecretsAbsent, readBundleFiles, readZipEntries } from "./helpers/bundle-contents.mjs";
 import { assertConfigLoaderMatrix, configLoaderCases } from "./helpers/config-loader-matrix.mjs";
+import { assertScrubBoundary } from "./helpers/scrub-boundary-matrix.mjs";
 
 const { privateKey: TEST_PRIVATE_KEY, publicKey: TEST_PUBLIC_KEY } = generateKeyPairSync("rsa", {
   modulusLength: 2048,
@@ -1856,4 +1858,22 @@ test("rule 9 error strings: on every Salesforce surface a 502 HTML body or a JSO
   }
   assert.equal(surfacesWithErrors, SF_CANARY_SURFACES.length * 2, "every surface and both flavors were exercised");
   assertSfCanariesAbsent(errorStrings.join("\n"), "collected error strings");
+});
+
+test("scrub boundary: bare name-shaped values stay, carriers and registered secrets (in every encoded form) and real token shapes go, in SalesforceApiError's message and errorCode", () => {
+  const fetchImpl = async () => jsonResponse({});
+  const mustKeep = [
+    "Salesforce request failed (502 Bad Gateway) for /services/data/v64.0/query: non-JSON body (text/html, 5120 bytes)",
+    "Salesforce SOAP login failed (403 Forbidden): non-SOAP body (application/json, 42 bytes)",
+    "Unable to read Salesforce credentials file /home/svc/.salesforce/credentials.json (ENOENT)",
+    "Unable to parse Salesforce credentials file: invalid JSON in /tmp/grclanker-salesforce-loader-Ab3dEf/short.json",
+    "Metadata read of SecurityHealthCheckRisks, TwoFactorMethodsInfo, and SetupAuditTrail failed for Acme_Production_Org",
+  ];
+  // The client constructor is the registration path (rememberSecrets on the configured password); the error constructor is the pass.
+  assertScrubBoundary({
+    scrub: (text) => new SalesforceApiError(text).message,
+    registerSecret: (secret) => new SalesforceApiClient(sampleConfig({ password: secret }), { fetchImpl }),
+    mustKeep,
+  });
+  assertScrubBoundary({ scrub: (text) => new SalesforceApiError("request failed", { status: 502, errorCode: text }).errorCode, mustKeep });
 });

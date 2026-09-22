@@ -35,6 +35,7 @@ import {
 import { getRegisteredToolSummaries } from "../dist/pi/tool-catalog.js";
 import { assertSecretsAbsent, readBundleFiles, readZipEntries } from "./helpers/bundle-contents.mjs";
 import { assertConfigLoaderMatrix, configLoaderCases } from "./helpers/config-loader-matrix.mjs";
+import { assertScrubBoundary } from "./helpers/scrub-boundary-matrix.mjs";
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 const ORG_ID = "org-1";
@@ -3325,4 +3326,23 @@ test("rule 9 error strings: on every Anypoint surface a 502 HTML body or a JSON 
   }
   assert.equal(exercised, MS_CANARY_SURFACES.length * 2, "every surface and both flavors were exercised");
   assertMsCanariesAbsent(errorStrings.join("\n"), "collected error strings");
+});
+
+test("scrub boundary: bare name-shaped values stay, carriers and registered secrets (in every encoded form) and real token shapes go, on redactSecretText, in MulesoftApiError, and on client.redact", () => {
+  const fetchImpl = async () => jsonResponse({});
+  const mustKeep = [
+    "Anypoint request failed (502 Bad Gateway) for /accounts/api/organizations/org-1/members: non-JSON body (text/html, 5120 bytes)",
+    "Anypoint request failed (403 Forbidden) for /cloudhub/api/v2/applications: JSON body without documented error fields (application/json, 42 bytes)",
+    "Unable to read MuleSoft config file /home/svc/.anypoint/config.toml (ENOENT)",
+    "Unable to parse MuleSoft config file: invalid TOML in /tmp/grclanker-mulesoft-loader-Ab3dEf/config.toml at line 3",
+    "environment Production-US-East-2026 and business group Acme_Platform_Team on control plane us",
+  ];
+  // The client constructor is the registration path (rememberSecrets on the configured token).
+  assertScrubBoundary({
+    scrub: (text) => redactSecretText(text),
+    registerSecret: (secret) => new MulesoftApiClient(sampleConfig({ token: secret }), { fetchImpl }),
+    mustKeep,
+  });
+  assertScrubBoundary({ scrub: (text) => new MulesoftApiError(502, text, "/x").message, mustKeep });
+  assertScrubBoundary({ scrub: (text) => new MulesoftApiClient(sampleConfig(), { fetchImpl }).redact(text), mustKeep });
 });

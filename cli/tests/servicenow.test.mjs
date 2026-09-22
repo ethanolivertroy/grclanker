@@ -12,6 +12,7 @@ import { basename, join } from "node:path";
 
 import {
   ServicenowApiClient,
+  ServicenowApiError,
   assessServicenowAccessControl,
   assessServicenowIdentityAccess,
   assessServicenowOperationsGovernance,
@@ -32,6 +33,7 @@ import {
 import { getRegisteredToolSummaries } from "../dist/pi/tool-catalog.js";
 import { assertSecretsAbsent, readBundleFiles, readZipEntries } from "./helpers/bundle-contents.mjs";
 import { assertConfigLoaderMatrix, configLoaderCases } from "./helpers/config-loader-matrix.mjs";
+import { assertScrubBoundary } from "./helpers/scrub-boundary-matrix.mjs";
 
 const FIXED_NOW = new Date("2026-09-21T00:00:00Z");
 const RECENT_LOGIN = "2026-09-20 08:15:00";
@@ -2202,6 +2204,25 @@ test("addendum 4: an OAuth token endpoint that answers with a 502 HTML page or a
   assert.equal(client.redact(`Authorization: Bearer ${SNOW_CANARY.accessToken}; client_secret=${SNOW_CANARY.clientSecret}; ${SNOW_CANARY_URL}`).includes("SNOWCANARY"), false);
   assert.equal(redactSecrets(`header Bearer ${SNOW_CANARY.bearer}, cookie JSESSIONID=${SNOW_CANARY.session}, at https://u:p@example.com/a?sid=1#frag`, []), "header Bearer [REDACTED], cookie JSESSIONID=[REDACTED], at https://[REDACTED]@example.com/a?[REDACTED]#[REDACTED]");
   assert.match(redactSecrets("Authorization: Bearer eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.c2lnbmF0dXJl", []), /^Authorization: \[REDACTED\]/);
+});
+
+test("scrub boundary: bare name-shaped values stay, carriers and registered secrets (in every encoded form) and real token shapes go, on redactSecrets and in ServicenowApiError", () => {
+  const fetchImpl = async () => jsonResponse({});
+  const mustKeep = [
+    "ServiceNow OAuth token request failed (502 Bad Gateway) for /oauth_token.do: non-JSON body (text/html, 5120 bytes)",
+    "ServiceNow request failed (403 Forbidden) for /api/now/table/sys_user_has_role: JSON body without documented error fields (application/json, 42 bytes)",
+    "Unable to read ServiceNow config file /home/svc/.servicenow.yaml (ENOENT)",
+    "Unable to parse ServiceNow config file: invalid YAML in /tmp/grclanker-servicenow-loader-Ab3dEf/alias.yaml",
+  ];
+  // The client constructor is the registration path (rememberSecrets on the configured password).
+  assertScrubBoundary({
+    scrub: (text) => redactSecrets(text, []),
+    registerSecret: (secret) => new ServicenowApiClient(sampleConfig({ password: secret }), { fetchImpl }),
+    mustKeep,
+  });
+  // The error constructor applies the same pass to the message and the detail field; the secrets are registered by now.
+  assertScrubBoundary({ scrub: (text) => new ServicenowApiError(text, 502).message, mustKeep });
+  assertScrubBoundary({ scrub: (text) => new ServicenowApiError("request failed", 502, text).detail, mustKeep });
 });
 
 test("review round item 13, extended: SNOW-08 and SNOW-17 do not assert the absence of a provider, plugin, or rule from a partial read", async () => {
