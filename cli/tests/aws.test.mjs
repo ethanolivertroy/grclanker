@@ -6,6 +6,7 @@ import {
   readdirSync,
   readFileSync,
   symlinkSync,
+  writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
@@ -14,6 +15,7 @@ import {
   AWS_CONTROL_CATALOG,
   AWS_FINDING_CONTROLS,
   AWS_FRAMEWORKS,
+  AwsCredentialProviderError,
   assessAwsDataProtection,
   assessAwsIdentity,
   assessAwsLoggingDetection,
@@ -42,6 +44,7 @@ import {
   healthySdkRoutes,
   proxyHtmlError,
   realAwsClient,
+  realAwsConfig,
   sdkAccessDenied,
   sdkServiceUnavailable,
   sdkThrottled,
@@ -2385,6 +2388,89 @@ test("rule 9: the aws_check_access tool scrubs the failure of the run's own iden
     assert.match(text, /AWS access check failed: /);
     if (makeError === proxyHtmlError) assert.match(text, /SyntaxError \(HTTP 502\): non-JSON body \(text\/html, \d+ bytes\)/);
     else assert.match(text, /AccessDeniedException \(HTTP 403\)/);
+  }
+});
+
+/** Runs `run` with the shared AWS config and credentials files pointed at fixtures, restoring the environment afterwards. */
+async function withSharedAwsFiles(files, run) {
+  const dir = createTempBase("grclanker-aws-creds-");
+  const credentialsFile = join(dir, "credentials");
+  const configFile = join(dir, "config");
+  writeFileSync(credentialsFile, files.credentials);
+  writeFileSync(configFile, files.config);
+  const previous = { AWS_SHARED_CREDENTIALS_FILE: process.env.AWS_SHARED_CREDENTIALS_FILE, AWS_CONFIG_FILE: process.env.AWS_CONFIG_FILE, AWS_PROFILE: process.env.AWS_PROFILE };
+  process.env.AWS_SHARED_CREDENTIALS_FILE = credentialsFile;
+  process.env.AWS_CONFIG_FILE = configFile;
+  delete process.env.AWS_PROFILE;
+  try {
+    return await run({ credentialsFile, configFile });
+  } finally {
+    for (const [key, value] of Object.entries(previous)) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+  }
+}
+
+test("config loader errors: a canary on a malformed line of the AWS_SHARED_CREDENTIALS_FILE never reaches the thrown message or the tool payload, which name only the provider, the SDK error name, and the files to check", async () => {
+  const { registerAwsTools } = await import("../dist/extensions/grc-tools/aws.js");
+  const canary = "CANARY-SHARED-CREDENTIALS-SECRET-31337";
+  // A profile whose secret line is malformed (no "=") and a malformed section header, each carrying the canary.
+  const credentials = ["[audit]", "aws_access_key_id = AKIAEXAMPLE000000001", `aws_secret_access_key ${canary}`, `[${canary}`, ""].join("\n");
+  const config = ["[profile audit]", "region = us-east-1", `output ${canary}`, ""].join("\n");
+
+  await withSharedAwsFiles({ credentials, config }, async ({ credentialsFile, configFile }) => {
+    const client = realAwsClient(realAwsConfig({ profile: "audit" }));
+    // The real send(): the provider chain fails while resolving credentials, before any request is signed or sent.
+    await assert.rejects(() => client.getCallerIdentity(), (error) => {
+      assert.ok(error instanceof AwsCredentialProviderError, `the provider failure is wrapped: ${error?.name}: ${error?.message}`);
+      assert.equal(error.name, "AwsCredentialProviderError");
+      assert.equal(error.provider, "fromIni (profile audit)");
+      assert.equal(error.code, "CredentialsProviderError", "the SDK error name is validated and kept as the code");
+      assert.ok(!error.message.includes(canary), `the thrown message carries the canary: ${error.message}`);
+      assert.match(error.message, /^credentials could not be resolved by fromIni \(profile audit\) \(CredentialsProviderError\)\. The provider's message is not recorded/);
+      assert.ok(error.message.includes(credentialsFile) && error.message.includes(configFile), `the message names the files to check: ${error.message}`);
+      return true;
+    });
+
+    const registered = [];
+    registerAwsTools({ registerTool: (tool) => registered.push(tool) });
+    for (const name of ["aws_check_access", "aws_assess_identity", "aws_export_audit_bundle"]) {
+      const tool = registered.find((candidate) => candidate.name === name);
+      const payload = await tool.execute("call-1", { region: "us-east-1", profile: "audit", account_id: FIXTURE_ACCOUNT, output_dir: createTempBase("grclanker-aws-creds-export-") });
+      const text = JSON.stringify(payload);
+      assert.ok(!text.includes(canary), `${name}: the tool payload carries the canary: ${text}`);
+      assert.ok(!/Could not resolve credentials|configuration\/credentials file/.test(text), `${name}: the provider's own message is not interpolated: ${text}`);
+      assert.match(text, /AwsCredentialProviderError: credentials could not be resolved by fromIni \(profile audit\) \(CredentialsProviderError\)/, `${name}: the payload names the provider and the SDK error name only: ${text}`);
+    }
+  });
+});
+
+test("config loader errors: a SyntaxError the SDK raises without attaching the body is recorded by name only, never by the parser's message that quotes the text", async () => {
+  const snippet = "<html>CANARY-PARSER-SNIPPET-4242</html>";
+  const bareParseError = () => new SyntaxError(`Unexpected token '<', "${snippet}"... is not valid JSON`);
+  const { registerAwsTools } = await import("../dist/extensions/grc-tools/aws.js");
+  const registered = [];
+  registerAwsTools({ registerTool: (tool) => registered.push(tool) });
+  const checkAccess = registered.find((tool) => tool.name === "aws_check_access");
+
+  const identityResult = await withSdkRoutes({ ...healthySdkRoutes(), "sts:GetCallerIdentity": () => { throw bareParseError(); } }, [], () => checkAccess.execute("call-1", { region: "us-east-1" }));
+  const identityText = JSON.stringify(identityResult);
+  assert.ok(!identityText.includes("CANARY-PARSER-SNIPPET") && !/Unexpected token/.test(identityText), `the parser's message reached the tool payload: ${identityText}`);
+  assert.match(identityText, /AWS access check failed: SyntaxError: response could not be parsed as the service protocol; the parser's message is not recorded/);
+
+  for (const action of ["iam:ListUsers", "cloudtrail:DescribeTrails", "s3:GetBucketPolicy"]) {
+    const routes = { ...healthySdkRoutes(), [action]: () => { throw bareParseError(); } };
+    const { outputs, exported } = await withSdkRoutes(routes, [], async () => {
+      const client = realAwsClient();
+      const results = await runAllAssessments(client);
+      return { outputs: results, exported: await exportAwsAuditBundle(client, client.getResolvedConfig(), createTempBase("grclanker-aws-parse-error-")) };
+    });
+    const text = [JSON.stringify(outputs), ...readBundleFiles(exported.outputDir).values(), ...readZipEntries(exported.zipPath).values()].join("\n");
+    assert.ok(!text.includes("CANARY-PARSER-SNIPPET") && !/Unexpected token/.test(text), `${action}: a slice of the parser's message survived`);
+    const lines = [...Object.values(outputs).flatMap((result) => result.errors ?? []), ...outputs.access.surfaces.map((surface) => surface.error ?? "")].filter((line) => line.includes(action.split(":")[1]));
+    assert.ok(lines.length > 0, `${action}: the failure is recorded against the command`);
+    for (const line of lines) assert.match(line, /SyntaxError: response could not be parsed as the service protocol; the parser's message is not recorded because it quotes the body/, `${action}: ${line}`);
   }
 });
 

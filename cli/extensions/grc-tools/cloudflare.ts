@@ -583,8 +583,21 @@ function errorEndpoint(error: unknown): string | undefined {
   return error instanceof CloudflareApiError ? error.path : undefined;
 }
 
+/**
+ * A parser's message quotes the text it could not parse (V8: `Unexpected token '<', "<html>..." is not valid
+ * JSON`), so a SyntaxError from any parse of a body or document is recorded by name only. Every JSON.parse in
+ * this file already substitutes the status-and-length note in its own catch; this keeps the property even
+ * for a parse failure that escapes one.
+ */
+function isParseError(error: unknown): boolean {
+  return error instanceof SyntaxError || (typeof error === "object" && error !== null && (error as { name?: unknown }).name === "SyntaxError");
+}
+
+const PARSE_ERROR_NOTE = "SyntaxError: response could not be parsed as JSON; the parser's message is not recorded because it quotes the body";
+
 /** The only way a thrown error becomes recorded text. */
 function errorMessage(error: unknown): string {
+  if (isParseError(error)) return PARSE_ERROR_NOTE;
   return redactErrorText(error instanceof Error ? error.message : String(error));
 }
 
@@ -648,7 +661,7 @@ export class CloudflareApiClient implements CloudflareReader {
         // Transport failures carry no HTTP status; the message names the path and the timeout budget, never a body.
         const reason = controller.signal.aborted
           ? `timed out after ${this.config.timeoutMs} ms`
-          : `network error: ${error instanceof Error ? error.message : String(error)}`;
+          : `network error: ${errorMessage(error)}`;
         throw new CloudflareApiError(`Cloudflare request failed for ${path} (${reason})`, undefined, path);
       }
 

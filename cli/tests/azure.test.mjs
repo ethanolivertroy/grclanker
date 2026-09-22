@@ -1520,3 +1520,26 @@ test("resolveSecureOutputPath rejects traversal and symlink parents", () => {
   symlinkSync(target, linked);
   assert.throws(() => resolveSecureOutputPath(base, "linked/out"), /Refusing to use symlinked parent directory/);
 });
+
+test("config loader errors: a SyntaxError raised by the transport is recorded by name only, never by the parser's message that quotes the body", async () => {
+  const snippet = "<html>CANARY-PARSER-SNIPPET-4242</html>";
+  const fetchImpl = async () => {
+    throw new SyntaxError(`Unexpected token '<', "${snippet}"... is not valid JSON`);
+  };
+  const note = "SyntaxError: response could not be parsed as JSON; the parser's message is not recorded because it quotes the body";
+  const client = new AzureAuditorClient(sampleConfig(), { fetchImpl, now: () => NOW });
+
+  const access = await checkAzureAccess(client);
+  const unreadable = access.surfaces.filter((surface) => surface.status === "not_readable");
+  assert.ok(unreadable.length > 0, "every probe failed on the transport");
+  for (const surface of unreadable) {
+    assert.equal(surface.error, note, `${surface.name}: the probe records the parse failure by name only`);
+    assert.equal(surface.http_status, null, `${surface.name}: no status was observed`);
+  }
+
+  const outputs = [JSON.stringify(access), JSON.stringify(await assessAzureIdentity(client))];
+  for (const text of outputs) {
+    assert.ok(!text.includes("CANARY-PARSER-SNIPPET") && !/Unexpected token/.test(text), `a slice of the parser's message reached an output: ${text.slice(0, 400)}`);
+    assert.ok(text.includes(note), `the output records the parse failure by name: ${text.slice(0, 400)}`);
+  }
+});

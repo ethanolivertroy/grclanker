@@ -24,7 +24,7 @@ import {
   DescribeConfigurationRecordersCommand,
   DescribeConfigurationRecorderStatusCommand,
 } from "@aws-sdk/client-config-service";
-import { fromIni } from "@aws-sdk/credential-providers";
+import { fromIni, fromNodeProviderChain } from "@aws-sdk/credential-providers";
 import {
   DescribeFlowLogsCommand,
   DescribeNetworkAclsCommand,
@@ -542,6 +542,18 @@ function nonJsonBodyNote(error: JsonRecord | undefined): string | undefined {
 }
 
 /**
+ * A parser's message quotes the text it could not parse (V8: `Unexpected token '<', "<html>..." is not valid
+ * JSON`), so a SyntaxError raised by the SDK deserializer, a credential cache, or any JSON.parse in the chain is
+ * never interpolated: the failure is described by the body note when the SDK attached the body, otherwise by
+ * the error name alone.
+ */
+function isParseError(error: unknown): boolean {
+  return error instanceof SyntaxError || asObject(error)?.name === "SyntaxError";
+}
+
+const PARSE_ERROR_NOTE = "response could not be parsed as the service protocol; the parser's message is not recorded because it quotes the body";
+
+/**
  * Describes a thrown SDK error as "<code> (HTTP <status>): <message>" with every part scrubbed; the code
  * and status are kept so a failure names what the service answered without repeating request context.
  */
@@ -549,7 +561,8 @@ function describeError(error: unknown): string {
   const object = asObject(error);
   const code = errorCode(error);
   const status = errorHttpStatus(error);
-  const rawMessage = nonJsonBodyNote(object) ?? (error instanceof Error ? error.message : String(error));
+  const rawMessage = nonJsonBodyNote(object)
+    ?? (isParseError(error) ? PARSE_ERROR_NOTE : error instanceof Error ? error.message : String(error));
   const message = code && rawMessage.startsWith(`${code}:`) ? rawMessage.slice(code.length + 1).trim() : rawMessage;
   const prefix = code
     ? (status !== undefined ? `${code} (HTTP ${status})` : code)
@@ -560,6 +573,68 @@ function describeError(error: unknown): string {
 /** Message of a tool-level failure, run through the same sink as every recorded read error. */
 function errorMessage(error: unknown): string {
   return describeError(error);
+}
+
+type AwsCredentialProvider = ReturnType<typeof fromIni>;
+
+const SDK_ERROR_NAME_PATTERN = /^[A-Za-z]+(?:Error|Exception)$/;
+const SYSTEM_ERROR_CODE_PATTERN = /^E[A-Z]+$/;
+
+/** The SDK error name (and a filesystem code such as ENOENT when present), each validated against a strict pattern so no free text rides along. */
+function sdkErrorIdentity(cause: unknown): string {
+  const record = asObject(cause);
+  const name = asString(record?.name) ?? (cause instanceof Error ? cause.name : undefined);
+  const code = asString(record?.code);
+  return [
+    name && SDK_ERROR_NAME_PATTERN.test(name) ? name : "UnknownError",
+    code && SYSTEM_ERROR_CODE_PATTERN.test(code) ? code : undefined,
+  ].filter(Boolean).join(" ");
+}
+
+/**
+ * Raised in place of any error the credential provider chain throws (rule 9, config loader class). The SDK
+ * parses the shared config and credentials files, SSO token caches, and credential_process output while it
+ * resolves credentials, and a provider's message can quote that text. This error carries only the provider
+ * name, the SDK error name (plus a filesystem code), and the paths of the files an operator should check,
+ * never the provider's message.
+ */
+export class AwsCredentialProviderError extends Error {
+  readonly provider: string;
+  readonly code: string;
+
+  constructor(provider: string, cause: unknown) {
+    const identity = sdkErrorIdentity(cause);
+    const credentialsFile = process.env.AWS_SHARED_CREDENTIALS_FILE || "~/.aws/credentials";
+    const configFile = process.env.AWS_CONFIG_FILE || "~/.aws/config";
+    super(
+      `credentials could not be resolved by ${provider} (${identity}). The provider's message is not recorded because it can quote the shared config or credentials file; check the profile in ${credentialsFile} and ${configFile}.`,
+    );
+    this.name = "AwsCredentialProviderError";
+    this.provider = provider;
+    this.code = identity;
+  }
+}
+
+/** Wraps a provider so every failure while resolving credentials surfaces as AwsCredentialProviderError. */
+function guardCredentialProvider(provider: string, resolve: AwsCredentialProvider): AwsCredentialProvider {
+  return async (options) => {
+    try {
+      return await resolve(options);
+    } catch (error) {
+      throw new AwsCredentialProviderError(provider, error);
+    }
+  };
+}
+
+/**
+ * The credential provider for the resolved configuration: the named profile through fromIni, otherwise the
+ * same default chain the SDK would use (environment, shared files, SSO, process, container, and instance
+ * metadata providers), both guarded so provider errors never reach an error string verbatim.
+ */
+function credentialProviderFor(config: AwsResolvedConfig): AwsCredentialProvider {
+  return config.profile
+    ? guardCredentialProvider(`fromIni (profile ${config.profile})`, fromIni({ profile: config.profile }))
+    : guardCredentialProvider("fromNodeProviderChain (default credential chain)", fromNodeProviderChain({ clientConfig: { region: config.region } }));
 }
 
 /** Run one read and classify the outcome instead of throwing. */
@@ -963,7 +1038,7 @@ export class AwsAuditorClient {
   private readonly s3Control: S3ControlClient;
   private readonly auditManager: AuditManagerClient;
   private readonly account: AccountClient;
-  private readonly credentials: ReturnType<typeof fromIni> | undefined;
+  private readonly credentials: AwsCredentialProvider;
   private readonly ec2Clients = new Map<string, EC2Client>();
   private readonly rdsClients = new Map<string, RDSClient>();
   private readonly kmsClients = new Map<string, KMSClient>();
@@ -974,7 +1049,7 @@ export class AwsAuditorClient {
     private readonly config: AwsResolvedConfig,
     options: { now?: () => Date } = {},
   ) {
-    const credentials = config.profile ? fromIni({ profile: config.profile }) : undefined;
+    const credentials = credentialProviderFor(config);
     const clientConfig = { region: config.region, credentials };
     this.credentials = credentials;
     this.sts = new STSClient(clientConfig);

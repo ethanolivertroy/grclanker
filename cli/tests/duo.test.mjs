@@ -2386,3 +2386,29 @@ test("rule 1 corollary: DUO-AUTH-006 keeps reading bypass codes when settings ar
   assert.ok(readable.evidence.includes("Admin auth methods allow WebAuthn."));
   assert.ok(readable.evidence.includes("admin_allowed_auth_methods.webauthn_enabled=true"));
 });
+
+test("config loader errors: a SyntaxError raised by the transport is recorded by name only, never by the parser's message that quotes the body", async () => {
+  const snippet = "<html>CANARY-PARSER-SNIPPET-4242</html>";
+  const fetchImpl = async () => {
+    throw new SyntaxError(`Unexpected token '<', "${snippet}"... is not valid JSON`);
+  };
+  const note = "SyntaxError: response could not be parsed as JSON; the parser's message is not recorded because it quotes the body";
+  const config = createSampleConfig();
+  const client = new DuoAuditorClient(config, { fetchImpl });
+
+  await assert.rejects(() => client.getSettings(), (error) => {
+    assert.equal(error.name, "DuoApiError");
+    assert.ok(!error.message.includes("CANARY-PARSER-SNIPPET") && !/Unexpected token/.test(error.message), `the parser's message was interpolated: ${error.message}`);
+    assert.equal(error.message, `Duo API request failed for /admin/v1/settings (network error: ${note})`);
+    return true;
+  });
+
+  const outputs = [
+    await runDuoAccessCheck(client, config).then((result) => JSON.stringify(result), (error) => error.message),
+    JSON.stringify(assessDuoAuthentication(await collectDuoAuthenticationData(client, config.lookbackDays), config)),
+  ];
+  for (const text of outputs) {
+    assert.ok(!text.includes("CANARY-PARSER-SNIPPET") && !/Unexpected token/.test(text), `a slice of the parser's message reached an output: ${text.slice(0, 400)}`);
+    assert.ok(text.includes(note), `the output records the parse failure by name: ${text.slice(0, 400)}`);
+  }
+});

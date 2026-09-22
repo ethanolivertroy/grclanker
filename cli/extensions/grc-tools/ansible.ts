@@ -1269,8 +1269,21 @@ export interface AnsibleClientSurface {
   listCollection?: (path: string, query?: Record<string, string | number | boolean | undefined>, options?: { limit?: number }) => Promise<AnsibleCollection>;
 }
 
+/**
+ * A parser's message quotes the text it could not parse (V8: `Unexpected token '<', "<html>..." is not valid
+ * JSON`), so a SyntaxError from any parse of a body or document is recorded by name only. Every JSON.parse in
+ * this file already substitutes the status-and-length note in its own catch; this keeps the property even
+ * for a parse failure that escapes one.
+ */
+function isParseError(error: unknown): boolean {
+  return error instanceof SyntaxError || (typeof error === "object" && error !== null && (error as { name?: unknown }).name === "SyntaxError");
+}
+
+const PARSE_ERROR_NOTE = "SyntaxError: response could not be parsed as JSON; the parser's message is not recorded because it quotes the body";
+
 /** The single conversion from a thrown error to recorded text; every message passes through redactErrorText here. */
 function errorMessage(error: unknown): string {
+  if (isParseError(error)) return PARSE_ERROR_NOTE;
   return redactErrorText(error instanceof Error ? error.message : String(error));
 }
 

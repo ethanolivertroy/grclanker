@@ -1594,3 +1594,28 @@ test("request matching: every endpoint path and HTTP status named in any output 
   assert.equal(managedWaf.evidence.legacy_firewall_rules_seen, 0);
   assert.match(managedWaf.evidence.legacy_fallback, /was consulted for evidence only because the rulesets API was unreadable/);
 });
+
+test("config loader errors: a SyntaxError raised by the transport is recorded by name only, never by the parser's message that quotes the body", async () => {
+  const snippet = "<html>CANARY-PARSER-SNIPPET-4242</html>";
+  const fetchImpl = async () => {
+    throw new SyntaxError(`Unexpected token '<', "${snippet}"... is not valid JSON`);
+  };
+  const note = "SyntaxError: response could not be parsed as JSON; the parser's message is not recorded because it quotes the body";
+  const client = new CloudflareApiClient(sampleConfig(), { fetchImpl });
+
+  await assert.rejects(() => client.listAccounts(), (error) => {
+    assert.equal(error.name, "CloudflareApiError");
+    assert.ok(!error.message.includes("CANARY-PARSER-SNIPPET") && !/Unexpected token/.test(error.message), `the parser's message was interpolated: ${error.message}`);
+    assert.equal(error.message, `Cloudflare request failed for /accounts (network error: ${note})`);
+    return true;
+  });
+
+  const outputs = [
+    await checkCloudflareAccess(client).then((result) => JSON.stringify(result), (error) => error.message),
+    JSON.stringify(await assessCloudflareIdentity(client)),
+  ];
+  for (const text of outputs) {
+    assert.ok(!text.includes("CANARY-PARSER-SNIPPET") && !/Unexpected token/.test(text), `a slice of the parser's message reached an output: ${text.slice(0, 400)}`);
+    assert.ok(text.includes(note), `the output records the parse failure by name: ${text.slice(0, 400)}`);
+  }
+});

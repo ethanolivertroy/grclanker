@@ -1942,3 +1942,28 @@ test("resolveSecureOutputPath rejects traversal and symlink parents", () => {
 
   assert.throws(() => resolveSecureOutputPath(base, "symlink-parent/file.txt"), /symlinked parent directory/);
 });
+
+test("config loader errors: a SyntaxError raised by the transport is recorded by name only, never by the parser's message that quotes the body", async () => {
+  const snippet = "<html>CANARY-PARSER-SNIPPET-4242</html>";
+  const fetchImpl = async () => {
+    throw new SyntaxError(`Unexpected token '<', "${snippet}"... is not valid JSON`);
+  };
+  const note = "SyntaxError: response could not be parsed as JSON; the parser's message is not recorded because it quotes the body";
+  const client = new AnsibleAapClient(AAP_CLIENT_CONFIG, { fetchImpl, now: () => NOW });
+
+  await assert.rejects(() => client.get("/api/v2/me/"), (error) => {
+    assert.equal(error.name, "AnsibleApiError");
+    assert.ok(!error.message.includes("CANARY-PARSER-SNIPPET") && !/Unexpected token/.test(error.message), `the parser's message was interpolated: ${error.message}`);
+    assert.equal(error.message, `AAP request failed: /api/v2/me/ (network error: ${note})`);
+    return true;
+  });
+
+  const outputs = [
+    await checkAnsibleAccess(client).then((result) => JSON.stringify(result), (error) => error.message),
+    JSON.stringify(await assessAnsibleJobHealth(client)),
+  ];
+  for (const text of outputs) {
+    assert.ok(!text.includes("CANARY-PARSER-SNIPPET") && !/Unexpected token/.test(text), `a slice of the parser's message reached an output: ${text.slice(0, 400)}`);
+    assert.ok(text.includes(note), `the output records the parse failure by name: ${text.slice(0, 400)}`);
+  }
+});
