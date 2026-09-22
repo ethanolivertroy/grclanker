@@ -17,7 +17,7 @@ import { homedir } from "node:os";
 import { basename, dirname, join, relative, resolve } from "node:path";
 import { ZipArchive } from "archiver";
 import { Type } from "@sinclair/typebox";
-import { parse as parseYaml } from "yaml";
+import { YAMLError, parse as parseYaml } from "yaml";
 import { errorResult, formatTable, textResult } from "./shared.js";
 
 type FetchImpl = typeof fetch;
@@ -756,7 +756,7 @@ function parseRegion(value: string | undefined): NewrelicRegion | undefined {
   const normalized = value?.trim().toUpperCase();
   if (!normalized) return undefined;
   if (normalized === "US" || normalized === "EU") return normalized;
-  throw new Error(`Unsupported New Relic region "${value}". Use US or EU.`);
+  throw new Error(scrubErrorText(`Unsupported New Relic region "${value}". Use US or EU.`));
 }
 
 interface ConfigFileValues {
@@ -767,13 +767,38 @@ interface ConfigFileValues {
   auditWindowDays?: number;
 }
 
+/** The `code` of a Node system error (ENOENT, EACCES, EISDIR): a fixed identifier, never the message. */
+function systemErrorCode(error: unknown): string | undefined {
+  const code = asObject(error)?.code;
+  return typeof code === "string" && /^E[A-Z0-9_]{1,30}$/.test(code) ? code : undefined;
+}
+
+/** The first line the YAML parser points at, when it reports one. */
+function yamlErrorLine(error: unknown): number | undefined {
+  return error instanceof YAMLError ? error.linePos?.[0]?.line : undefined;
+}
+
+/**
+ * Reads the optional config file. Neither the read error nor the parser error is interpolated: the YAML parser
+ * quotes the offending source line in its message, which for a malformed `api_key:` line is the key itself, so the
+ * thrown text is a fixed description with the path, the line number when the parser gives one, and the system error
+ * code when the read failed, scrubbed like every other error this module raises.
+ */
 function readConfigFile(pathname: string): ConfigFileValues | undefined {
   if (!existsSync(pathname)) return undefined;
+  let text: string;
+  try {
+    text = readFileSync(pathname, "utf8");
+  } catch (error) {
+    const code = systemErrorCode(error);
+    throw new Error(scrubErrorText(`Unable to read New Relic config file ${pathname}${code ? ` (${code})` : ""}`));
+  }
   let parsed: unknown;
   try {
-    parsed = parseYaml(readFileSync(pathname, "utf8"));
+    parsed = parseYaml(text);
   } catch (error) {
-    throw new Error(`Unable to parse New Relic config file ${pathname}: ${error instanceof Error ? error.message : String(error)}`);
+    const line = yamlErrorLine(error);
+    throw new Error(scrubErrorText(`Unable to parse New Relic config file: invalid YAML in ${pathname}${line === undefined ? "" : ` at line ${line}`}`));
   }
   const object = asObject(parsed) ?? {};
   return {
