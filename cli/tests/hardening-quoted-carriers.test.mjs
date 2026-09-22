@@ -176,16 +176,21 @@ test("quoted carriers: every must-keep row comes back unchanged from every scrub
     }
   }
   // A quoted or bare value under a header or key that `isCredentialKey` classifies is a carrier value
-  // whatever its shape (review of #78, gap 1; main at 02967cc redacted both of these too), even when
-  // the header rule alone would keep it as a descriptor.
-  for (const [text, expected] of [
-    ['X-Snowflake-Authorization-Token-Type: "KEYPAIR_JWT"', `X-Snowflake-Authorization-Token-Type: "${REDACTED}"`],
-    ["cookies: enabled", `cookies: ${REDACTED}`],
-  ]) {
+  // whatever its shape (review of #78, gap 1; main at 02967cc redacted this too).
+  for (const [text, expected] of [["cookies: enabled", `cookies: ${REDACTED}`]]) {
     for (const [scrubName, scrub] of EXACT_SCRUBS) {
       assert.equal(scrub(text), expected, `${scrubName} on ${JSON.stringify(text)}`);
     }
   }
+  // A header or key whose final segment is a setting suffix is a setting (coordinator ruling on the
+  // settings reviewer A saw over-redacted): the descriptor value stays, quoted or bare, in every
+  // scrub, and the same key with a token-shaped value loses only the token.
+  for (const text of ['X-Snowflake-Authorization-Token-Type: "KEYPAIR_JWT"', "X-Snowflake-Authorization-Token-Type: KEYPAIR_JWT", 'x-auth-mode: "legacy"', "x-auth-mode: legacy"]) {
+    for (const [scrubName, scrub] of EXACT_SCRUBS) {
+      assert.equal(scrub(text), text, `${scrubName} on ${JSON.stringify(text)}`);
+    }
+  }
+  assert.equal(scrubDataText('X-Snowflake-Authorization-Token-Type: "Kq7Zx2Vw9Lm4Tp8RwQ12"'), `X-Snowflake-Authorization-Token-Type: "${REDACTED}"`);
 });
 
 test("quoted carriers: reviewer A's 1872-case matrix has no hit under any scrub, the must-keep headers stay, and the unquoted control holds", () => {

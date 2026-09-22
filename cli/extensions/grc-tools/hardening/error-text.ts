@@ -219,7 +219,9 @@ const AUTH_PARAM_PATTERN = /^(?:realm|error|error_description|error_uri|scope|ch
 // words themselves, the session names, the signed-URL and OAuth 1 parameters, and Duo's key names;
 // compound keys the Flue heuristic classifies (`client_token`, `DB_PASSWORD`, `clientToken`,
 // `InvalidAuthenticationToken`) are handled by the generic pair rule below under the same ruling,
-// with the one prose exemption described there.
+// with the one prose exemption described there, and a compound key whose final segment is a setting
+// suffix (`token_url`, `auth_method`, `client_id`) is a setting, not a credential key (see
+// `SETTING_SUFFIXES`).
 const CREDENTIAL_PAIR_NAMES: readonly string[] = [
   "api[_-]?key",
   "app[_-]?key",
@@ -332,10 +334,29 @@ const MIN_LETTERS_FOR_CASING = 6;
 
 // Keys that name a credential in query strings and name-value pairs beyond what the Flue heuristic
 // covers: bare `sid`, `sig`, `pwd`, `session`, `auth`, and the signed-URL parameters of S3 and GCS.
-// The safe-shape exemption mirrors the Flue one: `session_count`, `auth_timeout_seconds`, and
-// `sig_path` are thresholds or file references, not credentials.
-const SAFE_KEY_SHAPE_PATTERN = /^(?:max|min)[_-]|[_-](?:limit|days|hours|minutes|seconds|count|path|file|dir)$/i;
 const EXTRA_CREDENTIAL_KEY_SEGMENTS = new Set(["sid", "sig", "pwd", "passwd", "pass", "session", "sessid", "auth", "nonce", "sas"]);
+
+// Settings beside a credential word (coordinator ruling after reviewer A found five settings
+// over-redacted in group A once its shape gate went): a key whose final segment is a setting suffix
+// names a setting, not a credential, even when an earlier segment is a credential word
+// (`BOX_AUTH_METHOD=ccg`, `BOX_TOKEN_URL=https://api.box.com/oauth2/token`, `BOX_JWT_ALGORITHM=RS256`,
+// `auth_method=client_secret`, `token_endpoint=<url>`, `oauth_signature_method=HMAC-SHA1`,
+// `secret_name`, `private_key_path`, `credentials_file`, `token_limit`), as does a threshold
+// (`max_keys`, `min_password_length`) and an identifier (`client_id`, `api_key_id`, `tenant_id`,
+// `key_name`). Its value stays unless it is token-shaped (the long-token decision, which the data
+// scrubs apply to the value under such a key even though their long-token rule is otherwise off, so
+// a 40-character `private_key_id` still goes) or a registered secret, and a URL value passes the URL
+// rule like any other (userinfo and query removed, path kept). Two families stay credential keys
+// whatever their suffix: the webhook and callback keys (`webhook*`, `*hook_url`, `callback_url`; rule
+// 9 names webhook URLs with embedded tokens, `webhook_url=https://hooks.example.com/services/<token>`
+// loses its whole value), and the session identifiers (`session_id`, `sid`, `PHPSESSID`,
+// `ASP.NET_SessionId`), which are bearer credentials, not identifiers, and are explicit credential
+// pair names. Both patterns and `SESSION_ID_KEY_PATTERN` read the key in its segment form
+// (`webhookUrl` and `WEBHOOK_URL` are `webhook_url`).
+const SETTING_SUFFIXES = new Set(["url", "uri", "endpoint", "method", "algorithm", "audience", "issuer", "shape", "type", "mode", "path", "file", "dir", "limit", "count", "id", "name", "days", "hours", "minutes", "seconds"]);
+const THRESHOLD_KEY_PATTERN = /^(?:max|min)[_-]/i;
+const WEBHOOK_KEY_PATTERN = /(?:^|_)webhooks?(?:_|$)|hook_url$|callback_url$/;
+const SESSION_ID_KEY_PATTERN = /(?:^|_)(?:sid|sessid|jsessionid|phpsessid|session_id)$/;
 const EXTRA_CREDENTIAL_KEYS = new Set([
   "x-amz-signature",
   "x-amz-credential",
@@ -368,18 +389,45 @@ function keySegments(key: string): string[] {
     .filter(Boolean);
 }
 
-/**
- * True when a name in a query string, header, or name-value pair carries a credential: the Flue
- * argument-key heuristic (`token`, `secret`, `password`, `api_key`, `authorization`, `cookie`, ...)
- * plus the bare and signed-URL names it does not cover, under the same safe-shape exemption for
- * thresholds, counts, and file references.
- */
-export function isCredentialKey(key: string): boolean {
+/** The Flue argument-key heuristic plus the bare and signed-URL names it does not cover, before the setting rule. */
+function namesCredential(key: string): boolean {
   if (isSensitiveArgumentKey(key)) return true;
-  if (SAFE_KEY_SHAPE_PATTERN.test(key)) return false;
   const normalized = key.toLowerCase();
   if (EXTRA_CREDENTIAL_KEYS.has(normalized)) return true;
   return keySegments(key).some((segment) => EXTRA_CREDENTIAL_KEY_SEGMENTS.has(segment));
+}
+
+/** A key whose final segment is a setting suffix, or a threshold (`max_`, `min_`); see `SETTING_SUFFIXES`. */
+function isSettingKey(key: string): boolean {
+  if (THRESHOLD_KEY_PATTERN.test(key)) return true;
+  const segments = keySegments(key);
+  return segments.length > 1 && SETTING_SUFFIXES.has(segments[segments.length - 1]);
+}
+
+/**
+ * True when a name in a query string, header, or name-value pair carries a credential: the Flue
+ * argument-key heuristic (`token`, `secret`, `password`, `api_key`, `authorization`, `cookie`, ...)
+ * plus the bare and signed-URL names it does not cover. A key whose final segment is a setting suffix
+ * (`token_url`, `auth_method`, `client_id`, `credentials_file`, see `SETTING_SUFFIXES`) is a setting
+ * and is not a credential key; the webhook, callback, and session-identifier keys are credential keys
+ * whatever their suffix.
+ */
+export function isCredentialKey(key: string): boolean {
+  const joined = keySegments(key).join("_");
+  if (WEBHOOK_KEY_PATTERN.test(joined) || SESSION_ID_KEY_PATTERN.test(joined)) return true;
+  if (isSettingKey(key)) return false;
+  return namesCredential(key);
+}
+
+/**
+ * A setting whose earlier segments name a credential (`token_url`, `BOX_AUTH_METHOD`, `private_key_id`,
+ * `api_key_name`): the value is a setting and stays, except that a token-shaped run inside it goes
+ * under every scrub, the data scrubs included (see `SETTING_SUFFIXES`).
+ */
+function isCredentialWordSetting(key: string): boolean {
+  if (!isSettingKey(key)) return false;
+  const segments = keySegments(key);
+  return segments.length > 1 && namesCredential(segments.slice(0, -1).join("_"));
 }
 
 /**
@@ -672,7 +720,40 @@ function readCarrierValue(text: string, valueStart: number, barePattern: RegExp,
   if (value === null) return null;
   const valueEnd = afterScheme + value.length;
   if (keepBare?.(value, valueEnd)) return null;
-  return { end: valueEnd, replacement: `${scheme}${REDACTED}` };
+  return { end: absorbMarkers(text, valueEnd), replacement: `${scheme}${REDACTED}` };
+}
+
+/**
+ * Extends a bare value's end over the markers an earlier rule left glued to it: the URL rule has
+ * already turned the query and fragment of a URL value into `?[REDACTED]#[REDACTED]`, so the pair
+ * renders one marker (`callback_url=[REDACTED]`) rather than `[REDACTED][REDACTED]#[REDACTED]`.
+ */
+function absorbMarkers(text: string, index: number): number {
+  let cursor = index;
+  for (;;) {
+    if (text.startsWith(REDACTED, cursor)) cursor += REDACTED.length;
+    else if ((text[cursor] === "?" || text[cursor] === "#") && text.startsWith(REDACTED, cursor + 1)) cursor += REDACTED.length + 1;
+    else return cursor;
+  }
+}
+
+/**
+ * The value under a credential-word setting (see `isCredentialWordSetting`): kept as it is unless the
+ * long-token rule finds a token-shaped run in it, in which case the run is replaced and the rest of
+ * the value (the scheme, host, and path of a URL, a name) stays.
+ */
+function readSettingValue(text: string, valueStart: number): ValueReplacement | null {
+  const quoted = readQuotedValue(text, valueStart);
+  if (quoted !== null) {
+    if (!opensValue(text, quoted)) return null;
+    const content = text.slice(quoted.start, quoted.end);
+    const scrubbed = content.replace(LONG_TOKEN_RUN_PATTERN, scrubLongTokenRun);
+    return scrubbed === content ? null : { end: quoted.after, replacement: `${quoted.open}${scrubbed}${quoted.close}` };
+  }
+  const value = readBareValue(text, valueStart, PAIR_BARE_VALUE_PATTERN);
+  if (value === null) return null;
+  const scrubbed = value.replace(LONG_TOKEN_RUN_PATTERN, scrubLongTokenRun);
+  return scrubbed === value ? null : { end: valueStart + value.length, replacement: scrubbed };
 }
 
 /** A credential header's value, unless the header name says the value is a descriptor (`...-token-type`). */
@@ -743,7 +824,9 @@ const readSchemeValue: ValueReader = (text, valueStart) => {
  * its second character and a credential pair nested inside it (`data=token=...`) or starting one
  * character later (`\napi_key=...`, where the pattern first takes `napi_key`) is still caught. The
  * value is read like a header's or an explicit credential pair's and goes whatever its shape, except
- * a bare word after `Key: ` that continues as prose (see `continuesAsProse`).
+ * a bare word after `Key: ` that continues as prose (see `continuesAsProse`). Under a setting key
+ * whose earlier segments name a credential (`token_url`, `auth_method`, `private_key_id`) only a
+ * token-shaped run in the value goes (see `readSettingValue`).
  */
 function replaceGenericCredentialPairs(text: string): string {
   GENERIC_PAIR_KEY_PATTERN.lastIndex = 0;
@@ -756,13 +839,17 @@ function replaceGenericCredentialPairs(text: string): string {
       GENERIC_PAIR_KEY_PATTERN.lastIndex += 1;
       continue;
     }
-    if (!isCredentialKey(key)) {
-      GENERIC_PAIR_KEY_PATTERN.lastIndex = match.index + 1;
+    const valueStart = match.index + whole.length;
+    const credential = isCredentialKey(key);
+    const read = credential
+      ? readCarrierValue(text, valueStart, PAIR_BARE_VALUE_PATTERN, (value, valueEnd) => continuesAsProse(text, separator, value, valueEnd))
+      : isCredentialWordSetting(key)
+        ? readSettingValue(text, valueStart)
+        : null;
+    if (read === null) {
+      if (!credential) GENERIC_PAIR_KEY_PATTERN.lastIndex = match.index + 1;
       continue;
     }
-    const valueStart = match.index + whole.length;
-    const read = readCarrierValue(text, valueStart, PAIR_BARE_VALUE_PATTERN, (value, valueEnd) => continuesAsProse(text, separator, value, valueEnd));
-    if (read === null) continue;
     out += `${text.slice(last, valueStart)}${read.replacement}`;
     last = read.end;
     GENERIC_PAIR_KEY_PATTERN.lastIndex = last;
@@ -779,7 +866,9 @@ function replaceGenericCredentialPairs(text: string): string {
  * SSWS, ApiKey, Splunk), credential-named pairs in prose, headers, query strings, and JSON fragments
  * (the value whatever its shape, under the credential words themselves and under every compound or
  * env-style key `isCredentialKey` classifies, `DB_PASSWORD`, `client_token`, `clientToken`; the one
- * exemption is a plain word after `Key: ` that continues as prose, see `continuesAsProse`), JWTs,
+ * exemption is a plain word after `Key: ` that continues as prose, see `continuesAsProse`; a key whose
+ * final segment is a setting suffix, `BOX_TOKEN_URL`, `auth_method`, `client_id`, is a setting whose
+ * value stays unless token-shaped, see `SETTING_SUFFIXES`), JWTs,
  * AWS key ids and secret keys, well-known vendor token prefixes, and (unless turned
  * off) long token-shaped runs. A quoted carrier value is removed whole, quotes kept, in double or
  * single quotes and JSON-escaped at any depth; on a compound line the next header's `Name:` token ends
@@ -860,7 +949,10 @@ export interface RedactSecretValuesOptions extends ScrubErrorTextOptions {
  * Rule 9 for exported records: walks a value and replaces every entry whose key names a credential
  * (nested objects and arrays included, booleans and null excepted because a `password_required: true`
  * flag holds no credential) with `[REDACTED]`, and passes every remaining string through
- * `scrubDataText`. Arrays and plain objects are copied; other objects are returned as they are.
+ * `scrubDataText`. A string under a setting key whose earlier segments name a credential
+ * (`token_url`, `private_key_id`, see `SETTING_SUFFIXES`) is a setting and stays, unless a run in it
+ * is token-shaped, which the long-token rule removes here even though the data scrub otherwise leaves
+ * long runs alone. Arrays and plain objects are copied; other objects are returned as they are.
  */
 export function redactSecretValues(value: unknown, options: RedactSecretValuesOptions = {}): unknown {
   if (typeof value === "string") return scrubDataText(value, options);
@@ -869,7 +961,9 @@ export function redactSecretValues(value: unknown, options: RedactSecretValuesOp
   const output: JsonRecord = {};
   for (const [key, entry] of Object.entries(value)) {
     const credential = isCredentialKey(key) && !(options.preserveKey?.(key) ?? false);
-    output[key] = credential && entry !== null && entry !== undefined && typeof entry !== "boolean" ? REDACTED : redactSecretValues(entry, options);
+    if (credential && entry !== null && entry !== undefined && typeof entry !== "boolean") output[key] = REDACTED;
+    else if (typeof entry === "string" && isCredentialWordSetting(key)) output[key] = scrubErrorText(entry, options);
+    else output[key] = redactSecretValues(entry, options);
   }
   return output;
 }

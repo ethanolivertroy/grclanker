@@ -282,7 +282,7 @@ test("credential-named pairs lose any nonempty value whatever its shape, compoun
     ["environment-token: present", `environment-token: ${REDACTED}`],
     ["settings.token: enabled", `settings.token: ${REDACTED}`],
     ["secrets: truncated", `secrets: ${REDACTED}`],
-    ["x-auth-mode: legacy", `x-auth-mode: ${REDACTED}`],
+    ["x-auth-header: legacy", `x-auth-header: ${REDACTED}`],
     ["client_token: Bearer abcdef", `client_token: Bearer ${REDACTED}`],
     ["client_token: Kq7Zx2Vw9Lm4Tp8R rejected", `client_token: ${REDACTED} rejected`],
     ["user_session: 0f9e8d7c6b5a4938 rejected", `user_session: ${REDACTED} rejected`],
@@ -322,6 +322,28 @@ test("credential-named pairs lose any nonempty value whatever its shape, compoun
   // A scheme word standing alone after such a key is the whole value and stays (`token_type: Bearer`).
   for (const text of ["token_type: Bearer", '{"access_token":"abc","token_type":"Bearer","expires_in":3600}', "X-Token-Type: Bearer"]) {
     assert.equal(scrubErrorText(text), text.replace('"abc"', `"${REDACTED}"`), text);
+  }
+  // A key whose final segment is a setting suffix is a setting, not a credential key (coordinator
+  // ruling): `x-auth-mode`, `token_type`, `BOX_TOKEN_URL` keep their values in every scrub, a URL value
+  // still loses its query, and a token-shaped value goes by shape, in the data scrubs too. The
+  // webhook and callback keys and the session identifiers stay credential keys whatever their suffix.
+  for (const text of ["x-auth-mode: legacy", "token_type: opaque", "auth_method=client_secret", "BOX_TOKEN_URL=https://api.box.com/oauth2/token", "client_id=my-app-2026", "api_key_id: signing-2026"]) {
+    assert.equal(scrubErrorText(text), text, text);
+    assert.equal(scrubDataText(text), text, text);
+    assert.equal(redactSecretValues(text), text, text);
+  }
+  for (const [text, expected] of [
+    ["BOX_TOKEN_URL=https://user:pw@api.box.com/oauth2/token?client_secret=abc", `BOX_TOKEN_URL=https://api.box.com/oauth2/token?${REDACTED}`],
+    ["auth_method=Kq7Zx2Vw9Lm4Tp8RwQ12", `auth_method=${REDACTED}`],
+    ['{"private_key_id":"0f9e8d7c6b5a49382716f5e4d3c2b1a09f8e7d6c"}', `{"private_key_id":"${REDACTED}"}`],
+    ["webhook_url=https://hooks.example.com/services/foo/bar/abcdefghijkl", `webhook_url=${REDACTED}`],
+    ["callback_url=https://app.example.com/callback?code=abc", `callback_url=${REDACTED}`],
+    ["session_id: abc123", `session_id: ${REDACTED}`],
+    ["PHPSESSID=abc123", `PHPSESSID=${REDACTED}`],
+  ]) {
+    assert.equal(scrubErrorText(text), expected, text);
+    assert.equal(scrubDataText(text), expected, text);
+    assert.equal(redactSecretValues(text), expected, text);
   }
   // A credential word inside a longer name, a path, or a dotted key is not one of the credential words
   // (`NAME_START`), so the explicit pair rule leaves it to the generic rule, whose value is a status
@@ -830,6 +852,44 @@ test("isCredentialKey covers the Flue heuristic plus bare and signed-URL names",
   }
   for (const key of ["username", "max_tokens", "token_limit", "keyword", "page", "region", "credentials_file", "session_count", "monkey", "signal"]) {
     assert.ok(!isCredentialKey(key), `${key} does not name a credential`);
+  }
+  // Coordinator ruling: a key whose final segment is a setting suffix is a setting even when an
+  // earlier segment is a credential word; the webhook, callback, and session-identifier keys are
+  // credential keys whatever their suffix.
+  for (const key of [
+    "BOX_AUTH_METHOD",
+    "BOX_TOKEN_URL",
+    "BOX_JWT_ALGORITHM",
+    "auth_method",
+    "token_endpoint",
+    "token_uri",
+    "tokenUrl",
+    "token_audience",
+    "jwt_issuer",
+    "token_shape",
+    "token_type",
+    "auth_mode",
+    "private_key_path",
+    "credentials_file",
+    "token_dir",
+    "token_limit",
+    "session_count",
+    "client_id",
+    "api_key_id",
+    "AWS_ACCESS_KEY_ID",
+    "tenant_id",
+    "secret_name",
+    "key_name",
+    "user_name",
+    "oauth_signature_method",
+    "X-Snowflake-Authorization-Token-Type",
+    "x-auth-mode",
+    "min_password_length",
+  ]) {
+    assert.ok(!isCredentialKey(key), `${key} names a setting`);
+  }
+  for (const key of ["webhook_url", "webhookUrl", "WEBHOOK_URL", "webhook", "webhooks", "slack_webhook", "webhook_count", "slack_hook_url", "incoming-hook-url", "callback_url", "oauth_callback_url", "session_id", "sessionId", "user_session_id", "PHPSESSID", "JSESSIONID", "ASP.NET_SessionId", "sid"]) {
+    assert.ok(isCredentialKey(key), `${key} stays a credential key whatever its suffix`);
   }
 });
 

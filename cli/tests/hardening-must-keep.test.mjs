@@ -147,6 +147,62 @@ const MUST_KEEP = Object.freeze([
   ["assignment", "policy=AmazonElasticContainerRegistryPublicRead"],
   ["assignment", "resource=arn:aws:iam::123456789012:role/OrganizationAccountAccessRole"],
   ["assignment", "max_results_per_page=1000"],
+  // settings beside a credential word (coordinator ruling): the final segment names a setting, so the value stays
+  ["setting", "BOX_AUTH_METHOD=ccg"],
+  ["setting", "BOX_TOKEN_URL=https://api.box.com/oauth2/token"],
+  ["setting", "BOX_JWT_ALGORITHM=RS256"],
+  ["setting", "auth_method=client_secret"],
+  ["setting", "token_endpoint=https://login.microsoftonline.com/contoso.onmicrosoft.com/oauth2/v2.0/token"],
+  ["setting", "token_uri: https://oauth2.googleapis.com/token"],
+  ["setting", "token_type=Bearer"],
+  ["setting", "grant_type=client_credentials"],
+  ["setting", "auth_mode: basic"],
+  ["setting", "oauth_signature_method=HMAC-SHA1"],
+  ["setting", "token_audience=https://api.example.com"],
+  ["setting", "jwt_issuer=https://issuer.example.com/oauth2/default"],
+  ["setting", "token_shape=jwt"],
+  ["setting", "private_key_path=/etc/grclanker/box-private.pem"],
+  ["setting", "credentials_file=./credentials.json"],
+  ["setting", "token_dir=/var/lib/grclanker/tokens"],
+  ["setting", "token_limit=5"],
+  ["setting", "session_count=3"],
+  ["setting", "secret_name=prod/grclanker/box"],
+  ["setting", "key_name=signing-2026"],
+  ["setting", "min_password_length=14"],
+  ["setting", '{"token_url":"https://api.box.com/oauth2/token","auth_method":"ccg","token_type":"Bearer"}'],
+  // identifiers: a client, key, or tenant id and a username stay; a token-shaped value under the same key goes by shape (see the must-redact rows)
+  ["identifier", "client_id=my-app-2026"],
+  ["identifier", "OKTA_CLIENT_ID=grclanker-audit-app"],
+  ["identifier", "key_id=signing-2026"],
+  ["identifier", "api_key_id: signing-2026"],
+  ["identifier", "tenant_id=2f3c1a9e-7b6d-4c5e-8f9a-0b1c2d3e4f5a"],
+  ["identifier", "username=alice.admin"],
+  ["identifier", "SPLUNK_USERNAME=admin"],
+  ["identifier", "user_name=svc-backup-2026"],
+]);
+
+/**
+ * Webhook and callback keys (coordinator ruling: credential keys whatever their suffix, because a
+ * webhook URL carries its token in its path, rule 9): the whole value goes, host and path included.
+ */
+const WEBHOOK_CARRIERS = Object.freeze([
+  (value) => `webhook_url=https://hooks.example.com/services/T000/B000/${value}`,
+  (value) => `WEBHOOK_URL=https://hooks.slack.com/services/T000/B000/${value}`,
+  (value) => `webhookUrl: https://hooks.example.com/services/${value}`,
+  (value) => `slack_hook_url=https://hooks.slack.com/services/${value}`,
+  (value) => `callback_url=https://app.example.com/callback?code=${value}`,
+  (value) => `webhook=https://hooks.example.com/services/foo/bar/${value}`,
+  (value) => `{"webhook_url":"https://hooks.example.com/services/T000/B000/${value}"}`,
+  (value) => `the notifier rejected webhook_url=https://hooks.example.com/services/${value} with 404 Not Found`,
+]);
+
+/** Setting keys beside a credential word, with a token-shaped value that must go by shape, in the data scrubs too. */
+const SETTING_CARRIERS = Object.freeze([
+  (value) => `auth_method=${value}`,
+  (value) => `BOX_TOKEN_URL=https://api.box.com/oauth2/${value}`,
+  (value) => `private_key_id: ${value}`,
+  (value) => `api_key_id="${value}"`,
+  (value) => `{"private_key_id":"${value}","token_url":"https://api.box.com/oauth2/token"}`,
 ]);
 
 /** The AWS secret access key canaries: the random-looking one, its slash and plus variants, and the group D value. */
@@ -357,4 +413,62 @@ test("boundary: opaque identifiers are removed from error text and kept in data 
     assert.equal(scrubDataText(`record ${identifier} not found`), `record ${identifier} not found`, `${label} in data text`);
     assert.equal(redactSecretValues({ id: identifier }).id, identifier, `${label} as a data value`);
   }
+});
+
+test("must-redact: a webhook, hook, or callback key loses its whole value whatever its suffix, a name-shaped path segment included, through every scrub", () => {
+  // The Codex example on #78 (r4076357762) is name-shaped in every segment; the token canary is the issued shape.
+  for (const value of ["abcdefghijkl", "T000B000XXXXXXXXXXXXXXXX", ERROR_CANARY.urlToken]) {
+    for (const carrier of WEBHOOK_CARRIERS) {
+      const text = carrier(value);
+      for (const [scrubName, scrub] of SCRUBS) {
+        const scrubbed = scrub(text);
+        assertNoFragment(scrubbed, value, { label: `${scrubName} on ${text}` });
+        assert.ok(!scrubbed.includes("hooks."), `${scrubName}: the webhook host goes with the value: ${scrubbed}`);
+        assert.ok(scrubbed.includes(REDACTED), `${scrubName}: the marker must stand in ${scrubbed}`);
+      }
+      // Codex's rendering, exactly.
+      assert.equal(scrubDataText(`webhook_url=https://hooks.example.com/services/foo/bar/${value}`), `webhook_url=${REDACTED}`);
+    }
+  }
+  assert.deepEqual(redactSecretValues({ webhook_url: "https://hooks.example.com/services/T000/B000/abcdefghijkl", webhook_count: 3, callback_url: "https://app.example.com/cb" }), {
+    webhook_url: REDACTED,
+    webhook_count: REDACTED,
+    callback_url: REDACTED,
+  });
+});
+
+test("must-redact: a token-shaped value under a setting key beside a credential word goes by shape through every scrub, the data scrubs included, while the setting's name-shaped value stays", () => {
+  for (const value of [ERROR_CANARY.apiKey, "Kq7Zx2Vw9Lm4Tp8RwQ12", "0f9e8d7c6b5a49382716f5e4d3c2b1a09f8e7d6c"]) {
+    for (const carrier of SETTING_CARRIERS) {
+      const text = carrier(value);
+      for (const [scrubName, scrub] of SCRUBS) {
+        const scrubbed = scrub(text);
+        assertNoFragment(scrubbed, value, { label: `${scrubName} on ${text}` });
+        assert.ok(scrubbed.includes(carrier(REDACTED)), `${scrubName}: only the token-shaped run goes, the key and the rest of the value stay: ${scrubbed}`);
+      }
+    }
+    assert.deepEqual(redactSecretValues({ private_key_id: value, token_url: "https://api.box.com/oauth2/token", auth_method: "ccg" }), {
+      private_key_id: REDACTED,
+      token_url: "https://api.box.com/oauth2/token",
+      auth_method: "ccg",
+    });
+  }
+  // The name-shaped identifier under the same keys stays, in data and in error text.
+  for (const text of ["private_key_id: signing-2026", 'api_key_id="signing-2026"', "auth_method=ccg"]) {
+    for (const [scrubName, scrub] of SCRUBS) assert.equal(scrub(text), text, `${scrubName} on ${text}`);
+  }
+  // A token-shaped identifier under a plain identifier key (no credential word) goes by shape in error text and, as documented for opaque identifiers, stays in data text.
+  assert.equal(scrubErrorText("OKTA_CLIENT_ID=0oa1b2c3d4e5f6g7h8i9"), `OKTA_CLIENT_ID=${REDACTED}`);
+  assert.equal(scrubDataText("OKTA_CLIENT_ID=0oa1b2c3d4e5f6g7h8i9"), "OKTA_CLIENT_ID=0oa1b2c3d4e5f6g7h8i9");
+});
+
+test("must-keep: a URL under a setting key passes the URL rule, userinfo and query removed and the path kept, and a webhook URL under a setting key goes only by its query", () => {
+  for (const [text, expected] of [
+    ["BOX_TOKEN_URL=https://user:pw@api.box.com/oauth2/token?client_secret=abc#frag", `BOX_TOKEN_URL=https://api.box.com/oauth2/token?${REDACTED}#${REDACTED}`],
+    ['{"token_endpoint":"https://login.microsoftonline.com/common/oauth2/v2.0/token?client_secret=abc"}', `{"token_endpoint":"https://login.microsoftonline.com/common/oauth2/v2.0/token?${REDACTED}"}`],
+    ["token_uri: https://oauth2.googleapis.com/token", "token_uri: https://oauth2.googleapis.com/token"],
+  ]) {
+    for (const [scrubName, scrub] of SCRUBS) assert.equal(scrub(text), expected, `${scrubName} on ${text}`);
+  }
+  assert.deepEqual(redactSecretValues({ token_url: "https://user:pw@api.box.com/oauth2/token?client_secret=abc" }), { token_url: `https://api.box.com/oauth2/token?${REDACTED}` });
 });

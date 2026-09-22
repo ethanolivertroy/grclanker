@@ -12,6 +12,7 @@ import {
   scrubDataText,
   scrubErrorText,
 } from "../dist/extensions/grc-tools/hardening/error-text.js";
+import { isSensitiveArgumentKey } from "../dist/flue/redact.js";
 import { leakedCanaryWindow } from "./helpers/error-canaries.mjs";
 
 /**
@@ -290,5 +291,142 @@ test("credential pairs: the prose exemption is the only way a value under a comp
   ]) {
     assert.equal(scrubErrorText(text), expected, text);
     assert.equal(scrubDataText(text), expected, text);
+  }
+});
+
+/**
+ * Coordinator ruling on the settings reviewer A saw over-redacted in group A: a key whose final
+ * segment is a setting suffix (`url`, `uri`, `endpoint`, `method`, `algorithm`, `audience`, `issuer`,
+ * `shape`, `type`, `mode`, `path`, `file`, `dir`, `limit`, `count`, `id`, `name`) is a setting, not a
+ * credential key, even when an earlier segment is a credential word. Its value stays unless it is
+ * token-shaped or a registered secret, and a URL value passes the URL rule. Main at 02967cc classified
+ * these keys by the Flue heuristic alone and redacted the value under `mainRedacted`, so the rows
+ * `MAIN_REDACTED_SETTINGS` lists are the ones main redacted and the head keeps by design: they are
+ * not leaks and are reported separately from the probe 1b regressions (which stay zero).
+ */
+const SETTING_ROWS = Object.freeze([
+  ["BOX_AUTH_METHOD", "ccg"],
+  ["BOX_TOKEN_URL", "https://api.box.com/oauth2/token"],
+  ["BOX_JWT_ALGORITHM", "RS256"],
+  ["auth_method", "client_secret"],
+  ["token_endpoint", "https://login.microsoftonline.com/common/oauth2/v2.0/token"],
+  ["token_uri", "https://oauth2.googleapis.com/token"],
+  ["tokenUrl", "https://api.box.com/oauth2/token"],
+  ["token_type", "Bearer"],
+  ["auth_mode", "basic"],
+  ["oauth_signature_method", "HMAC-SHA1"],
+  ["token_audience", "https://api.example.com"],
+  ["jwt_issuer", "https://issuer.example.com/oauth2/default"],
+  ["token_shape", "jwt"],
+  ["private_key_path", "/etc/grclanker/box-private.pem"],
+  ["credentials_file", "./credentials.json"],
+  ["token_dir", "/var/lib/grclanker/tokens"],
+  ["token_limit", "5"],
+  ["session_count", "3"],
+  ["secret_name", "prod/grclanker/box"],
+  ["key_name", "signing-2026"],
+  ["key_id", "signing-2026"],
+  ["api_key_id", "signing-2026"],
+  ["client_id", "my-app-2026"],
+  ["tenant_id", "2f3c1a9e-7b6d-4c5e-8f9a-0b1c2d3e4f5a"],
+  ["user_name", "svc-backup-2026"],
+]);
+
+/**
+ * Main's key rule at 02967cc (`isCredentialKey`): the Flue heuristic, then the safe-shape exemption
+ * (`max_`, `min_`, `_limit`, `_days`, `_hours`, `_minutes`, `_seconds`, `_count`, `_path`, `_file`,
+ * `_dir`), then the extra bare segments.
+ */
+function mainCredentialKey(key) {
+  if (isSensitiveArgumentKey(key)) return true;
+  if (/^(?:max|min)[_-]|[_-](?:limit|days|hours|minutes|seconds|count|path|file|dir)$/i.test(key)) return false;
+  const segments = key.replace(/([a-z0-9])([A-Z])/g, "$1_$2").toLowerCase().split(/[^a-z0-9]+/).filter(Boolean);
+  return segments.some((segment) => ["sid", "sig", "pwd", "passwd", "pass", "session", "sessid", "auth", "nonce", "sas"].includes(segment));
+}
+
+/** The setting rows main at 02967cc redacted in its text scrubs (main's key rule, main's value rule) and the head keeps. */
+const MAIN_REDACTED_SETTINGS = Object.freeze(["BOX_TOKEN_URL", "auth_method", "token_endpoint", "token_uri", "tokenUrl", "oauth_signature_method", "token_audience", "jwt_issuer", "secret_name", "key_name", "key_id", "api_key_id"]);
+
+/** The setting rows main redacted in `redactSecretValues` over an object (every key main classified, whatever the value). */
+const MAIN_REDACTED_SETTING_ENTRIES = Object.freeze([...MAIN_REDACTED_SETTINGS, "BOX_AUTH_METHOD", "BOX_JWT_ALGORITHM", "token_type", "auth_mode", "token_shape"]);
+
+test("settings: a key whose final segment is a setting suffix keeps its value in every form, frame, and sink, and the rows main redacted are exactly the documented list", () => {
+  let trials = 0;
+  for (const [key, value] of SETTING_ROWS) {
+    assert.ok(!isCredentialKey(key), `${key} is a setting`);
+    for (const [formName, form] of FORMS) {
+      for (const [frameName, frame] of FRAMES) {
+        const text = frame(form(key, value));
+        for (const [sinkName, sink] of SINKS) {
+          trials += 1;
+          const output = sink(text);
+          const rendered = typeof output === "string" ? output : JSON.stringify(output);
+          assert.ok(rendered.includes(value) || rendered.includes(JSON.stringify(value).slice(1, -1)), `${key}=${value} must survive ${formName} ${frameName} through ${sinkName}: ${rendered}`);
+        }
+      }
+    }
+    assert.deepEqual(redactSecretValues({ [key]: value }), { [key]: value }, `${key} as a record entry`);
+  }
+  assert.equal(trials, SETTING_ROWS.length * FORMS.length * FRAMES.length * SINKS.length);
+  assert.deepEqual(
+    SETTING_ROWS.filter(([key, value]) => mainCredentialKey(key) && mainRedacted(value)).map(([key]) => key),
+    [...MAIN_REDACTED_SETTINGS],
+  );
+  assert.deepEqual(
+    SETTING_ROWS.filter(([key]) => mainCredentialKey(key)).map(([key]) => key).sort(),
+    [...MAIN_REDACTED_SETTING_ENTRIES].sort(),
+  );
+});
+
+test("settings: the exceptions stay credential keys whatever their suffix and lose any value in every form, frame, and sink", () => {
+  const rows = [
+    ["webhook_url", "https://hooks.example.com/services/foo/bar/abcdefghijkl"],
+    ["WEBHOOK_URL", "https://hooks.slack.com/services/T000/B000/abcdefghijkl"],
+    ["webhookUrl", "https://hooks.example.com/services/abcdefghijkl"],
+    ["slack_hook_url", "https://hooks.slack.com/services/abcdefghijkl"],
+    ["callback_url", "https://app.example.com/oauth/return"],
+    ["webhook", "https://hooks.example.com/services/foo/bar/abcdefghijkl"],
+    ["webhook_count", "abcdefghijkl"],
+    ["session_id", "abcdefghijkl"],
+    ["user_session_id", "abcdefghijkl"],
+    ["PHPSESSID", "abcdefghijkl"],
+    ["ASP.NET_SessionId", "abcdefghijkl"],
+  ];
+  for (const [key, value] of rows) {
+    assert.ok(isCredentialKey(key), `${key} stays a credential key`);
+    for (const [formName, form] of FORMS) {
+      for (const [frameName, frame] of FRAMES) {
+        const text = frame(form(key, value));
+        for (const [sinkName, sink] of SINKS) {
+          assert.ok(!leaked(sink(text), value), `${key} ${formName} ${frameName} leaked through ${sinkName}`);
+        }
+      }
+    }
+    assert.deepEqual(redactSecretValues({ [key]: value }), { [key]: REDACTED }, `${key} as a record entry`);
+  }
+});
+
+test("settings: a token-shaped value under a setting key beside a credential word goes by shape through every sink, the data scrubs included, and only that run goes", () => {
+  for (const value of ["Kq7Zx2Vw9Lm4Tp8RwQ12", "0f9e8d7c6b5a49382716f5e4d3c2b1a09f8e7d6c", "tnAki87T1HyQxV2b"]) {
+    for (const [key, prefix] of [
+      ["auth_method", ""],
+      ["private_key_id", ""],
+      ["api_key_id", ""],
+      ["BOX_TOKEN_URL", "https://api.box.com/oauth2/"],
+      ["tokenUrl", "https://api.box.com/oauth2/"],
+    ]) {
+      for (const [formName, form] of FORMS) {
+        for (const [frameName, frame] of FRAMES) {
+          const text = frame(form(key, `${prefix}${value}`));
+          for (const [sinkName, sink] of SINKS) {
+            const output = sink(text);
+            assert.ok(!leaked(output, value), `${key} ${formName} ${frameName} leaked through ${sinkName}`);
+            const rendered = typeof output === "string" ? output : JSON.stringify(output);
+            if (prefix) assert.ok(rendered.includes(prefix), `${key}: the path in front of the token stays: ${rendered}`);
+          }
+        }
+      }
+      assert.deepEqual(redactSecretValues({ [key]: `${prefix}${value}` }), { [key]: `${prefix}${REDACTED}` }, `${key} as a record entry`);
+    }
   }
 });
