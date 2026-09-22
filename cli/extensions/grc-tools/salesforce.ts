@@ -546,6 +546,9 @@ const BARE_TOKEN_RUN_PATTERN = /(?<![A-Za-z0-9+/_=-])[A-Za-z0-9+/_-]{16,}={0,2}(
 // A segment that reads as a word: lowercase, UPPERCASE, Capitalized, or camelCase with up to six humps,
 // optionally followed by digits (oauth2, sha256, dev12345).
 const WORD_SEGMENT_PATTERN = /^(?:[A-Z]+|[A-Z]?[a-z]+(?:[A-Z][a-z]+){0,6}|[A-Z]{2,}[a-z]+(?:[A-Z][a-z]+){0,6})\d*$/;
+// A canonical UUID (8-4-4-4-12 hex) is a vendor identifier (a Falcon user uuid, an Anypoint organization or
+// environment id), not a credential, so it stays bare; inside a carrier or when remembered it still goes.
+const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 // Node fs error codes (ENOENT, EACCES, EISDIR); anything else on error.code is not echoed.
 const FS_ERROR_CODE_PATTERN = /^E[A-Z0-9_]{1,30}$/;
 // The only part of a JSON.parse message that is taken; the rest quotes the source.
@@ -613,8 +616,12 @@ function secretForms(secret: string): string[] {
   return forms;
 }
 
-/** A run reads as a token when any hyphen- or underscore-separated segment is neither a word, a number, nor a short abbreviation. */
+/**
+ * A run reads as a token when any hyphen- or underscore-separated segment is neither a word, a number, nor
+ * a short abbreviation; a canonical UUID is an identifier and never reads as one.
+ */
 function looksLikeToken(value: string): boolean {
+  if (UUID_PATTERN.test(value)) return false;
   return value.split(/[-_]+/).some((segment) =>
     segment.length > 0 && !/^\d+$/.test(segment) && !WORD_SEGMENT_PATTERN.test(segment) && !(segment.length < 8 && /^[A-Za-z0-9]+$/.test(segment)));
 }

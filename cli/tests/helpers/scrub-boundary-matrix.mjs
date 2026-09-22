@@ -133,11 +133,103 @@ export const BARE_TOKENS = [
   { name: "alternating case run", value: "AbCdEfGhIjKlMnOpQr" },
 ];
 
-/** Path skeletons keep their word-like pieces; only the identifier piece goes. */
+/**
+ * Path skeletons keep their word-like pieces. A canonical UUID (an Anypoint organization id, a Falcon
+ * user uuid) is a vendor identifier and stays; a 32-hex sys_id is indistinguishable from an MD5 digest
+ * and goes with the hex-digest rule.
+ */
 export const PATH_CASES = [
-  { text: "for /accounts/api/organizations/550e8400-e29b-41d4-a716-446655440000/members", expected: `for /accounts/api/organizations/${REDACTED}/members` },
+  { text: "for /accounts/api/organizations/550e8400-e29b-41d4-a716-446655440000/members", expected: "for /accounts/api/organizations/550e8400-e29b-41d4-a716-446655440000/members" },
   { text: "for /api/now/table/sys_user/6816f79cc0a8016401c5a33be04be441", expected: `for /api/now/table/sys_user/${REDACTED}` },
 ];
+
+/** HTTP status lines as describeStatus and `${status} ${statusText}` render them; every integration's error strings carry them. */
+export const HTTP_STATUS_TEXTS = [
+  "200 OK",
+  "400 Bad Request",
+  "401 Unauthorized",
+  "403 Forbidden",
+  "404 Not Found",
+  "429 Too Many Requests",
+  "500 Internal Server Error",
+  "502 Bad Gateway",
+  "503 Service Unavailable",
+  "504 Gateway Timeout",
+];
+
+/**
+ * Addendum 7 must-keep table for one integration. Every entry is rendered by `keepTableLines` in isolation
+ * and inside a realistic sentence of the kind the integration's error strings, inventories, and finding
+ * summaries carry, and `assertScrubBoundary` asserts each line comes back verbatim.
+ *
+ * @typedef {object} KeepTable
+ * @property {string[]} paths every endpoint path the integration requests
+ * @property {string[]} tables every table, object, or dataset name the integration requests, as the inventories name them
+ * @property {string[]} tenants tenant and org names with digits and hyphens
+ * @property {string[]} principals principal identifiers in the vendor's shapes
+ * @property {string[]} findingIds the integration's finding ids
+ * @property {string[]} fixedTexts the standing fixed texts (loader, opaque-body, not requested, withheld, skipped, corollary wordings)
+ * @property {string[]} [statusTexts] defaults to HTTP_STATUS_TEXTS
+ */
+
+/**
+ * Renders each table entry in isolation and inside a realistic summary sentence: an endpoint path in
+ * an error string, a table in an inventory state and a collection issue, a tenant in an access check
+ * summary, a principal in a finding summary, a status text in an opaque-body note, a finding id in a
+ * demotion summary, and a fixed text after a finding id and tenant.
+ */
+export function keepTableLines(table) {
+  for (const key of ["paths", "tables", "tenants", "principals", "findingIds", "fixedTexts"]) {
+    assert.ok(Array.isArray(table[key]) && table[key].length > 0, `keep table: ${key} lists at least one entry`);
+  }
+  const statusTexts = table.statusTexts ?? HTTP_STATUS_TEXTS;
+  const [path] = table.paths;
+  const [tenant] = table.tenants;
+  const [principal] = table.principals;
+  const [findingId] = table.findingIds;
+  const lines = [];
+  const add = (value, ...sentences) => {
+    assert.equal(typeof value, "string", `keep table entry is a string: ${JSON.stringify(value)}`);
+    assert.ok(value.length > 0, "keep table entry is not empty");
+    for (const sentence of sentences) assert.ok(sentence.includes(value), `sentence embeds ${JSON.stringify(value)}: ${sentence}`);
+    lines.push(value, ...sentences);
+  };
+  for (const item of table.paths) {
+    add(
+      item,
+      `request failed (403 Forbidden) for ${item}: JSON body without documented error fields (application/json, 42 bytes)`,
+      `${item} answered 200 OK on ${tenant}; 2 of 2 pages were read and the read was complete`,
+    );
+  }
+  for (const item of table.tables) {
+    add(
+      item,
+      `${item} read: complete (12 rows of 12)`,
+      `${item} read: unread (request failed (403 Forbidden) for ${path}: Insufficient rights to query records)`,
+      `the ${item} read was forbidden (403 Forbidden) on ${tenant}, so ${findingId} is manual and names ${item}`,
+    );
+  }
+  for (const item of table.tenants) {
+    add(item, `Connected to ${item} as ${principal}; every surface answered and ${path} was readable`);
+  }
+  for (const item of table.principals) {
+    add(
+      item,
+      `Among the visible rows, ${item} holds an administrative role on ${tenant} and has not signed in for 90+ days`,
+      `${findingId} names ${item} from a complete read of ${path}`,
+    );
+  }
+  for (const item of statusTexts) {
+    add(item, `request failed (${item}) for ${path}: non-JSON body (text/html, 5120 bytes)`);
+  }
+  for (const item of table.findingIds) {
+    add(item, `${item} is manual because the ${path} read was forbidden (403 Forbidden) on ${tenant}; the verdict is capped and the inventory is named`);
+  }
+  for (const item of table.fixedTexts) {
+    add(item, `${findingId} on ${tenant}: ${item}`);
+  }
+  return lines;
+}
 
 /** The raw, base64, base64url, URL-encoded (upper- and lowercase hex, `+` for space), and JSON-escaped forms, deduplicated. */
 export function encodedForms(secret) {
@@ -175,9 +267,11 @@ function assertRemoved(output, value, label) {
  *   path; when given, the name-shaped secret is first shown to survive bare (unregistered) before it is registered. Pass
  *   undefined for a second surface in the same file, where the secrets are already registered.
  * @param {string[]} [options.mustKeep] integration-specific prose that must come through verbatim
+ * @param {KeepTable} [options.keepTable] the integration's addendum 7 must-keep table; every entry is asserted verbatim in
+ *   isolation and inside a realistic summary sentence
  */
-export function assertScrubBoundary({ scrub, registerSecret, mustKeep = [] }) {
-  for (const keep of [...MUST_KEEP, ...mustKeep]) {
+export function assertScrubBoundary({ scrub, registerSecret, mustKeep = [], keepTable }) {
+  for (const keep of [...MUST_KEEP, ...mustKeep, ...(keepTable ? keepTableLines(keepTable) : [])]) {
     assert.equal(scrub(keep), keep, `bare name-shaped or ordinary prose must stay: ${JSON.stringify(keep)}`);
   }
 

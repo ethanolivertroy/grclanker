@@ -33,6 +33,7 @@ import {
 import { getRegisteredToolSummaries } from "../dist/pi/tool-catalog.js";
 import { assertSecretFragmentsAbsent, readBundleFiles, readZipEntries } from "./helpers/bundle-contents.mjs";
 import { CONFIG_CANARIES, assertConfigLoaderMatrix, configLoaderCases } from "./helpers/config-loader-matrix.mjs";
+import { assertFixedTextsSurvive, collectFixedTexts, logLines } from "./helpers/fixed-text-survival.mjs";
 import { assertFragmentsAbsent, assertPlantedValuesWellFormed } from "./helpers/planted-values.mjs";
 import { assertScrubBoundary } from "./helpers/scrub-boundary-matrix.mjs";
 
@@ -776,7 +777,7 @@ test("assessServicenowIdentityAccess fails weak identity controls and buckets us
   assert.equal(byId.get("SNOW-06").status, "fail");
   assert.match(byId.get("SNOW-06").summary, /min 6/);
   assert.equal(byId.get("SNOW-07").status, "fail");
-  assert.match(byId.get("SNOW-07").summary, /glide.authenticate.multifactor=false/);
+  assert.match(byId.get("SNOW-07").summary, /glide.authenticate.multifactor is false/);
   assert.equal(byId.get("SNOW-08").status, "fail");
   assert.equal(byId.get("SNOW-14").status, "fail");
   assert.match(byId.get("SNOW-14").summary, /svc.integration/);
@@ -899,7 +900,7 @@ test("assessServicenowPlatformHardening fails weak properties, eval usage, debug
   const byId = findingsById(await assessServicenowPlatformHardening(createClient(fetchImpl)));
 
   assert.equal(byId.get("SNOW-01").status, "fail");
-  assert.match(byId.get("SNOW-01").summary, /glide.security.use_csrf_token=false/);
+  assert.match(byId.get("SNOW-01").summary, /glide.security.use_csrf_token is false/);
   assert.equal(byId.get("SNOW-05").status, "fail");
   assert.match(byId.get("SNOW-05").summary, /120/);
   assert.equal(byId.get("SNOW-12").status, "fail");
@@ -1923,7 +1924,7 @@ test("collection status, request matching, and denied-list markers: each table a
       assert.match(roles.error, /^not requested: the sys_security_acl read failed/);
       assert.ok(!("pages" in roles));
       const accessControl = run.analysis.find((item) => item.area === "access_control");
-      assert.match(accessControl.summary.inventories.acl_roles, /^sys_security_acl_role: not requested \(/);
+      assert.match(accessControl.summary.inventories.acl_roles, /^sys_security_acl_role read: not requested \(/);
       const roleInput = findingsById(accessControl).get("SNOW-02").evidence.inputs.find((input) => input.table === "sys_security_acl_role");
       assert.equal(roleInput.state, "not_requested");
       assert.equal(roleInput.status_code, null);
@@ -1936,7 +1937,7 @@ test("collection status, request matching, and denied-list markers: each table a
     const states = run.analysis.flatMap((item) => Object.values(item.summary.inventories));
     const unread = states.filter((state) => /: unread \(/.test(state));
     if (tableDenied && SERVICENOW_TABLE_FILES[table]) {
-      assert.ok(unread.some((state) => state.startsWith(`${table}: unread (`)), `${label}: an assessment summary names the unread table`);
+      assert.ok(unread.some((state) => state.startsWith(`${table} read: unread (`)), `${label}: an assessment summary names the unread table`);
     }
     if (!tableDenied || SERVICENOW_COUNT_FILES[table]) {
       assert.ok(unread.some((state) => state.startsWith(`${table} aggregate: unread (`)), `${label}: an assessment summary names the unread aggregate`);
@@ -2035,7 +2036,7 @@ test("collection status: a partially visible user directory keeps seen and total
   assert.equal(identity.summary.active_users_visible, 4);
   assert.equal(identity.summary.active_users_total, 2004);
   assert.equal(identity.summary.admin_users, null);
-  assert.match(identity.summary.inventories.users, /^sys_user: partial \(sys_user returned 4 of 2004 rows/);
+  assert.match(identity.summary.inventories.users, /^sys_user read: partial \(sys_user returned 4 of 2004 rows/);
   const text = JSON.stringify([identity, run.payloads.slice(1)]);
   for (const name of fixtureUserNames(run.fixture)) assert.ok(!text.includes(name), `${name} must not be named from a partly read directory`);
   for (const id of ["SNOW-04", "SNOW-07", "SNOW-14"]) {
@@ -2233,7 +2234,90 @@ test("planted values self-check: every canary and planted secret is alphanumeric
   ]);
 });
 
-test("scrub boundary: bare name-shaped values stay, carriers and registered secrets (in every encoded form) and real token shapes go, on redactSecrets and in ServicenowApiError", () => {
+/**
+ * The standing fixed texts ServiceNow emits, rendered with sample paths and names: the config loader
+ * read and parse messages, the non-JSON and opaque-body notes, the timeout, the `not requested:` and
+ * skipped wordings, the inventory states, the withheld notes, and the corollary summary templates.
+ */
+const SERVICENOW_FIXED_TEXTS = [
+  "Unable to read ServiceNow config file /home/svc/.servicenow.yaml (ENOENT)",
+  "Unable to read ServiceNow config file /tmp/grclanker-servicenow-loader-Ab3dEf/directory.yaml (EISDIR)",
+  "Unable to read ServiceNow config file /tmp/grclanker-servicenow-loader-Ab3dEf/locked.yaml (EACCES)",
+  "Unable to parse ServiceNow config file: invalid YAML in /tmp/grclanker-servicenow-loader-Ab3dEf/alias.yaml",
+  "Unable to parse ServiceNow config file: invalid YAML in /tmp/grclanker-servicenow-loader-Ab3dEf/nested-mapping.yaml at line 2",
+  "Unable to parse ServiceNow config file: /home/svc/.servicenow-sec-inspector/config.yaml must contain a YAML mapping",
+  "ServiceNow request failed (502 Bad Gateway) for /api/now/table/sys_user: non-JSON body (text/html, 5120 bytes)",
+  "ServiceNow request failed (403 Forbidden) for /api/now/table/sys_user_has_role: JSON body without documented error fields (application/json, 42 bytes)",
+  "ServiceNow request failed (403 Forbidden) for /api/now/table/password_policy: Insufficient rights to query records",
+  "ServiceNow request failed (429 Too Many Requests) for /api/now/stats/sys_audit: non-JSON body (text/plain, 12 bytes)",
+  "ServiceNow OAuth token request failed (502 Bad Gateway) for /oauth_token.do: non-JSON body (text/html, 5120 bytes)",
+  "ServiceNow request timed out after 30000ms: /api/now/table/sys_user",
+  "not requested: the sys_security_acl read failed, so there were no ACL ids to look up",
+  "sys_security_acl_role was not requested (the sys_security_acl read returned no rows, so there were no ACL ids to look up)",
+  "sys_user read was forbidden (403)",
+  "password_policy read failed (ServiceNow request timed out after 30000ms: /api/now/table/password_policy)",
+  "sys_user was truncated at 500 of 2004 rows (record limit reached)",
+  "sys_user returned 4 of 2004 rows (ACL-filtered or hidden rows)",
+  "sys_public returned 0 rows without an X-Total-Count header (visibility unproven)",
+  "sys_user read: complete (12 rows of 12)",
+  "sys_user read: partial (sys_user returned 4 of 2004 rows (ACL-filtered or hidden rows))",
+  "sys_user read: unread (ServiceNow request failed (403 Forbidden) for /api/now/table/sys_user: Insufficient rights to query records)",
+  "password_policy read: complete (1 row)",
+  "password_policy read: unread (ServiceNow request failed (403 Forbidden) for /api/now/table/password_policy: Insufficient rights to query records)",
+  "sys_security_acl_role read: not requested (the sys_security_acl read failed, so there were no ACL ids to look up)",
+  "sys_encryption_context read: unavailable (sys_encryption_context (legacy Column Level Encryption contexts) does not exist on this instance (ServiceNow request failed (400 Bad Request) for /api/now/table/sys_encryption_context: Invalid table sys_encryption_context))",
+  "ip_access read: unavailable (ip_access does not exist on this instance; the com.glide.ip_authenticator plugin creates it when activated (ServiceNow request failed (400 Bad Request) for /api/now/table/ip_access: Invalid table ip_access))",
+  "sys_security_acl aggregate: unread (ServiceNow request failed (403 Forbidden) for /api/now/stats/sys_security_acl: Insufficient rights to query records)",
+  "sys_audit aggregate: unread (no count returned)",
+  "sys_audit aggregate: complete (120533)",
+  "users: sys_user read was forbidden (403)",
+  "acl roles: sys_security_acl_role was not requested (the sys_security_acl read failed, so there were no ACL ids to look up)",
+  "role inheritance: aggregate count failed (ServiceNow request failed (403 Forbidden) for /api/now/stats/sys_user_role_contains: Insufficient rights to query records)",
+  "exact counts and names are withheld because the user inventory was not fully read",
+  "counts and names are withheld because the user or role inventory was not fully read",
+  "Among the visible rows, an admin or security_admin holder has not logged in for 90+ days; exact counts and names are withheld because the user inventory was not fully read.",
+  "visible admin users without enable_multifactor_authn were observed (counts withheld because the user inventory was not fully read)",
+  "glide.authenticate.multifactor was not among the visible sys_properties rows and that read was partial, so the unread rows could hold it; platform MFA enablement is unknown.",
+  "Open System Security > Access Control (ACL) and confirm read, write, and delete record ACLs with roles exist for sys_user, sys_user_has_role, sys_user_role, sys_properties, sys_script, sys_security_acl, syslog, sys_audit.",
+  "Connection Security could not be read for 1/2 active SMTP accounts (Corporate SMTP): the connection_security column and the legacy enable_ssl and enable_tls booleans were all unreadable.",
+];
+
+/** Addendum 7 must-keep table for ServiceNow: paths and tables, tenants, principals, finding ids, and the standing fixed texts. */
+function servicenowKeepTable() {
+  const tables = Object.keys(SERVICENOW_TABLE_FILES);
+  const counts = Object.keys(SERVICENOW_COUNT_FILES);
+  return {
+    paths: [
+      "/oauth_token.do",
+      ...tables.map((table) => `/api/now/table/${table}`),
+      ...counts.map((table) => `/api/now/stats/${table}`),
+    ],
+    tables: [...new Set([...tables, ...counts, "sys_user_has_role", "sys_user_grmember", "sys_user_role", "sys_audit", "syslog", "syslog_transaction"])],
+    tenants: [
+      "dev12345.service-now.com",
+      "https://dev12345.service-now.com",
+      "acme-prod-2026.service-now.com",
+      "acme-prod-2026",
+      "prod-us-east-2026",
+      "Acme_Production_Org",
+    ],
+    principals: [
+      "bob.user",
+      "bob.user@acme.example",
+      "audit.reader",
+      "svc_integration_2026",
+      "abel.tuter",
+      "ITIL_User1",
+      "admin",
+      "security_admin",
+      "x_acme_app.integration_user",
+    ],
+    findingIds: listServicenowControls().map((control) => control.id),
+    fixedTexts: SERVICENOW_FIXED_TEXTS,
+  };
+}
+
+test("scrub boundary: bare name-shaped values stay, carriers and registered secrets (in every encoded form) and real token shapes go, on redactSecrets and in ServicenowApiError; the addendum 7 must-keep table survives in isolation and in sentences", () => {
   const fetchImpl = async () => jsonResponse({});
   const mustKeep = [
     "ServiceNow OAuth token request failed (502 Bad Gateway) for /oauth_token.do: non-JSON body (text/html, 5120 bytes)",
@@ -2241,15 +2325,112 @@ test("scrub boundary: bare name-shaped values stay, carriers and registered secr
     "Unable to read ServiceNow config file /home/svc/.servicenow.yaml (ENOENT)",
     "Unable to parse ServiceNow config file: invalid YAML in /tmp/grclanker-servicenow-loader-Ab3dEf/alias.yaml",
   ];
+  const keepTable = servicenowKeepTable();
+  assert.equal(keepTable.findingIds.length, 20, "every ServiceNow finding id is in the table");
+  assert.ok(keepTable.findingIds.includes("SNOW-11"));
   // The client constructor is the registration path (rememberSecrets on the configured password).
   assertScrubBoundary({
     scrub: (text) => redactSecrets(text, []),
     registerSecret: (secret) => new ServicenowApiClient(sampleConfig({ password: secret }), { fetchImpl }),
     mustKeep,
+    keepTable,
   });
   // The error constructor applies the same pass to the message and the detail field; the secrets are registered by now.
-  assertScrubBoundary({ scrub: (text) => new ServicenowApiError(text, 502).message, mustKeep });
-  assertScrubBoundary({ scrub: (text) => new ServicenowApiError("request failed", 502, text).detail, mustKeep });
+  assertScrubBoundary({ scrub: (text) => new ServicenowApiError(text, 502).message, mustKeep, keepTable });
+  assertScrubBoundary({ scrub: (text) => new ServicenowApiError("request failed", 502, text).detail, mustKeep, keepTable });
+});
+
+test("round 7 note 1: every fixed-text message ServiceNow emits (loader, opaque body, timeout, not requested, withheld, inventory states, corollary summaries) comes back from redactSecrets unchanged", async () => {
+  const texts = new Set(SERVICENOW_FIXED_TEXTS);
+
+  // The loader's own read and parse messages on real failing files.
+  const scratch = { cwd: createTempBase("servicenow-fixed-cwd-"), homeDir: createTempBase("servicenow-fixed-home-") };
+  for (const item of configLoaderCases({ format: "yaml", displayName: "ServiceNow", fileNoun: "config file", extension: ".yaml" })) {
+    if (item.skip) continue;
+    assert.throws(() => resolveServicenowConfiguration({ instance: "acme", config_file: item.path }, {}, scratch), (error) => {
+      texts.add(error.message);
+      return true;
+    });
+  }
+
+  // The error constructor's opaque-body notes and describeStatus text on real responses.
+  const opaque = createClient(async (input) => {
+    const pathname = new URL(String(input)).pathname;
+    if (pathname.endsWith("/sys_user")) return new Response("<html><body>Bad Gateway</body></html>", { status: 502, statusText: "Bad Gateway", headers: { "content-type": "text/html" } });
+    if (pathname.endsWith("/sys_properties")) return jsonResponse({ unexpected: { shape: true } }, { status: 403 });
+    return new Response("upstream request timeout", { status: 504, statusText: "Gateway Timeout", headers: { "content-type": "text/plain" } });
+  });
+  for (const table of ["sys_user", "sys_properties", "sys_audit"]) {
+    const snapshot = await opaque.queryTable(table);
+    assert.ok(snapshot.error, `${table} read is unread`);
+    texts.add(snapshot.error);
+    const count = await opaque.countRecords(table);
+    assert.ok(count.error, `${table} count is unread`);
+    texts.add(count.error);
+  }
+  await assert.rejects(opaque.requestJson(`${sampleConfig().instanceUrl}/api/now/table/sys_user`), (error) => {
+    assert.ok(error instanceof ServicenowApiError, `requestJson throws the client's error class: ${error}`);
+    texts.add(error.message);
+    if (error.detail) texts.add(error.detail);
+    return true;
+  });
+
+  // Every assessment, the access check, and the bundle on a healthy fixture, on every table denied, on a
+  // dependent read skipped behind its failed parent, and on a partial read: summaries, inventory states,
+  // principals_withheld, collection issues, dataset errors, and the error log.
+  const runs = [
+    await exportWithFixture(),
+    await exportWithFixture({ forbidAll: true }),
+    await exportWithFixture({ forbiddenTables: ["sys_security_acl", "sys_user", "password_policy"], forbiddenCounts: ["sys_user_role_contains", "sys_security_acl"] }),
+    await exportWithFixture({ inflateTotal: 2000 }),
+    await exportWithFixture({ omitTotalCount: true }),
+  ];
+  for (const run of runs) {
+    collectFixedTexts([run.analysis, run.accessCheck, run.payloads], texts);
+    for (const line of logLines(run.errors)) texts.add(line);
+    for (const [name, content] of run.files) {
+      if (name.startsWith("core_data/")) collectFixedTexts(JSON.parse(content), texts);
+    }
+  }
+
+  const checked = assertFixedTextsSurvive((text) => redactSecrets(text, []), texts, "ServiceNow fixed texts");
+  assert.ok(checked >= SERVICENOW_FIXED_TEXTS.length + 40, `the harvest rendered texts beyond the standing list (${checked})`);
+  assert.ok([...texts].some((text) => /read: not requested \(/.test(text)), "the harvest rendered a not requested inventory state");
+  assert.ok([...texts].some((text) => /^not requested: /.test(text)), "the harvest rendered a not requested dataset error");
+  assert.ok([...texts].some((text) => /withheld because the user inventory was not fully read/.test(text)), "the harvest rendered a principals_withheld note");
+  assert.ok([...texts].some((text) => /non-JSON body \(text\/html, \d+ bytes\)/.test(text)), "the harvest rendered a status-and-length note");
+});
+
+test("round 7 note 2: credentials and the config file path set through the environment survive an unrelated argument, and the source chain names the environment", () => {
+  const base = createTempBase("servicenow-env-survives-");
+  const configPath = join(base, "servicenow.yaml");
+  writeFileSync(configPath, ["servicenow:", "  instance: fileinstance", "  timeout_seconds: 12", ""].join("\n"));
+  const env = {
+    SERVICENOW_CONFIG_FILE: configPath,
+    SERVICENOW_INSTANCE: "envinstance",
+    SERVICENOW_USERNAME: "env.user",
+    SERVICENOW_PASSWORD: "env-password-value",
+  };
+  for (const [label, unrelated] of [
+    ["page_size", { page_size: 100 }],
+    ["max_retries", { max_retries: 2 }],
+    ["auth_method basic", { auth_method: "basic" }],
+  ]) {
+    const resolved = resolveServicenowConfiguration(unrelated, env, { cwd: base, homeDir: base });
+    assert.equal(resolved.username, "env.user", `${label}: the environment username resolves`);
+    assert.equal(resolved.password, "env-password-value", `${label}: the environment password resolves`);
+    assert.equal(resolved.instanceName, "envinstance", `${label}: the environment instance overrides the file`);
+    assert.equal(resolved.instanceUrl, "https://envinstance.service-now.com", label);
+    assert.equal(resolved.timeoutMs, 12000, `${label}: the file value not set elsewhere still applies`);
+    assert.ok(resolved.sourceChain.includes("environment"), `${label}: the source chain names the environment: ${JSON.stringify(resolved.sourceChain)}`);
+    assert.ok(resolved.sourceChain.includes(`config-file:${configPath}`), `${label}: the source chain names the config file from the environment`);
+    assert.deepEqual(resolved.sourceChain, [`config-file:${configPath}`, "environment", "arguments"], label);
+  }
+  // An argument object whose credential keys are present but undefined must not shadow the environment.
+  const shadowed = resolveServicenowConfiguration({ username: undefined, password: undefined, page_size: 50 }, env, { cwd: base, homeDir: base });
+  assert.equal(shadowed.username, "env.user");
+  assert.equal(shadowed.password, "env-password-value");
+  assert.deepEqual(shadowed.sourceChain, [`config-file:${configPath}`, "environment", "arguments"]);
 });
 
 test("review round item 13, extended: SNOW-08 and SNOW-17 do not assert the absence of a provider, plugin, or rule from a partial read", async () => {

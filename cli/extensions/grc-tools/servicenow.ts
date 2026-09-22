@@ -84,6 +84,9 @@ const BARE_TOKEN_RUN_PATTERN = /(?<![A-Za-z0-9+/_=-])[A-Za-z0-9+/_-]{16,}={0,2}(
 // A segment that reads as a word: lowercase, UPPERCASE, Capitalized, or camelCase with up to six humps,
 // optionally followed by digits (oauth2, sha256, dev12345).
 const WORD_SEGMENT_PATTERN = /^(?:[A-Z]+|[A-Z]?[a-z]+(?:[A-Z][a-z]+){0,6}|[A-Z]{2,}[a-z]+(?:[A-Z][a-z]+){0,6})\d*$/;
+// A canonical UUID (8-4-4-4-12 hex) is a vendor identifier (a Falcon user uuid, an Anypoint organization or
+// environment id), not a credential, so it stays bare; inside a carrier or when remembered it still goes.
+const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 // Node fs error codes (ENOENT, EACCES, EISDIR); anything else on error.code is not echoed.
 const FS_ERROR_CODE_PATTERN = /^E[A-Z0-9_]{1,30}$/;
 const DEFAULT_TIMEOUT_MS = 30_000;
@@ -571,8 +574,12 @@ function secretForms(secret: string): string[] {
   return forms;
 }
 
-/** A run reads as a token when any hyphen- or underscore-separated segment is neither a word, a number, nor a short abbreviation. */
+/**
+ * A run reads as a token when any hyphen- or underscore-separated segment is neither a word, a number, nor
+ * a short abbreviation; a canonical UUID is an identifier and never reads as one.
+ */
 function looksLikeToken(value: string): boolean {
+  if (UUID_PATTERN.test(value)) return false;
   return value.split(/[-_]+/).some((segment) =>
     segment.length > 0 && !/^\d+$/.test(segment) && !WORD_SEGMENT_PATTERN.test(segment) && !(segment.length < 8 && /^[A-Za-z0-9]+$/.test(segment)));
 }
@@ -1399,19 +1406,24 @@ function tableState(snapshot: TableSnapshot): TableState {
   return "complete";
 }
 
+/**
+ * Renders one inventory state as `<table> read: <state> (<detail>)`. The word `read` keeps a
+ * credential-named table (password_policy) from forming a `name: value` pair that the redaction
+ * pass would take as a credential, so the fixed text survives the pass unchanged.
+ */
 function describeTable(snapshot: TableSnapshot): string {
   const state = tableState(snapshot);
   switch (state) {
     case "unread":
-      return `${snapshot.table}: unread (${snapshot.error})`;
+      return `${snapshot.table} read: unread (${snapshot.error})`;
     case "not_requested":
-      return `${snapshot.table}: not requested (${snapshot.skipped})`;
+      return `${snapshot.table} read: not requested (${snapshot.skipped})`;
     case "unavailable":
-      return `${snapshot.table}: unavailable (${snapshot.unavailable})`;
+      return `${snapshot.table} read: unavailable (${snapshot.unavailable})`;
     case "partial":
-      return `${snapshot.table}: partial (${snapshotPartialNote(snapshot) ?? "visible rows are not the full population"})`;
+      return `${snapshot.table} read: partial (${snapshotPartialNote(snapshot) ?? "visible rows are not the full population"})`;
     case "complete":
-      return `${snapshot.table}: complete (${snapshot.rows.length} row${snapshot.rows.length === 1 ? "" : "s"}${snapshot.total !== undefined ? ` of ${snapshot.total}` : ""})`;
+      return `${snapshot.table} read: complete (${snapshot.rows.length} row${snapshot.rows.length === 1 ? "" : "s"}${snapshot.total !== undefined ? ` of ${snapshot.total}` : ""})`;
     default: {
       const exhaustive: never = state;
       throw new Error(`Unhandled table state ${String(exhaustive)}`);
@@ -1652,7 +1664,7 @@ function propertyVerdict(checks: PropertyCheck[], subject: string): Evaluation {
   if (nonCompliant.length > 0) {
     return {
       status: "fail",
-      summary: `${nonCompliant.length}/${checks.length} ${subject} properties are set to non-compliant values: ${nonCompliant.map((item) => `${item.name}=${item.value ?? ""}`).join(", ")}.`,
+      summary: `${nonCompliant.length}/${checks.length} ${subject} properties are set to non-compliant values: ${nonCompliant.map((item) => `${item.name} is ${item.value === undefined || item.value === "" ? "empty" : item.value}`).join(", ")}.`,
       evidence,
     };
   }
@@ -2093,7 +2105,7 @@ export function assessServicenowIdentityAccessData(data: ServicenowIdentityData)
     }
     return {
       status: "pass",
-      summary: `glide.enable.password_policy=true and all ${evaluated.length} password policies meet the threshold (minimum length ${data.minPasswordLength}, upper, lower, and digit required).`,
+      summary: `glide.enable.password_policy is true and all ${evaluated.length} password policies meet the threshold (minimum length ${data.minPasswordLength}, upper, lower, and digit required).`,
       evidence,
     };
   });
@@ -2148,7 +2160,7 @@ export function assessServicenowIdentityAccessData(data: ServicenowIdentityData)
       return {
         status: "fail",
         summary: enabled.exists
-          ? `glide.authenticate.multifactor=${enabled.value}; platform MFA is disabled.`
+          ? `glide.authenticate.multifactor is ${enabled.value}; platform MFA is disabled.`
           : "glide.authenticate.multifactor has no sys_properties row; the documented default is false, so platform MFA is not enabled.",
         evidence,
         principals,
@@ -2157,7 +2169,7 @@ export function assessServicenowIdentityAccessData(data: ServicenowIdentityData)
     if (criteria.length === 0) {
       return {
         status: "manual",
-        summary: `glide.authenticate.multifactor=true, but no ${MFA_CRITERIA_TABLE} rows were visible; the baseline Role-based multi-factor authentication record always exists, so the credential cannot read the enforcement criteria and enforcement is unknown.`,
+        summary: `glide.authenticate.multifactor is true, but no ${MFA_CRITERIA_TABLE} rows were visible; the baseline Role-based multi-factor authentication record always exists, so the credential cannot read the enforcement criteria and enforcement is unknown.`,
         evidence,
         principals,
       };
@@ -2165,7 +2177,7 @@ export function assessServicenowIdentityAccessData(data: ServicenowIdentityData)
     if (admins.length === 0) {
       return {
         status: "manual",
-        summary: `glide.authenticate.multifactor=true and the Role-based multi-factor authentication criteria record is ${activeRoleBased.length > 0 ? "active" : "inactive"}, but no admin users were visible to verify enforcement.`,
+        summary: `glide.authenticate.multifactor is true and the Role-based multi-factor authentication criteria record is ${activeRoleBased.length > 0 ? "active" : "inactive"}, but no admin users were visible to verify enforcement.`,
         evidence,
         principals,
       };
@@ -2173,7 +2185,7 @@ export function assessServicenowIdentityAccessData(data: ServicenowIdentityData)
     if (activeRoleBased.length === 0 && !userEnforced) {
       return {
         status: "fail",
-        summary: `glide.authenticate.multifactor=true, but the Role-based multi-factor authentication criteria record is ${roleBased.length > 0 ? "inactive" : "not present among the visible criteria"} and ${unflaggedAdmins}, so MFA is not enforced for administrators.`,
+        summary: `glide.authenticate.multifactor is true, but the Role-based multi-factor authentication criteria record is ${roleBased.length > 0 ? "inactive" : "not present among the visible criteria"} and ${unflaggedAdmins}, so MFA is not enforced for administrators.`,
         evidence,
         principals,
       };
@@ -2181,7 +2193,7 @@ export function assessServicenowIdentityAccessData(data: ServicenowIdentityData)
     if (activeRoleBased.length === 0) {
       return {
         status: "warn",
-        summary: `glide.authenticate.multifactor=true and ${allAdminsFlagged}, but the Role-based multi-factor authentication criteria record is inactive, so newly granted administrators are not enforced automatically.`,
+        summary: `glide.authenticate.multifactor is true and ${allAdminsFlagged}, but the Role-based multi-factor authentication criteria record is inactive, so newly granted administrators are not enforced automatically.`,
         evidence,
         principals,
       };
@@ -2192,7 +2204,7 @@ export function assessServicenowIdentityAccessData(data: ServicenowIdentityData)
         : "its Multi-factor Roles list was not returned by the Table API";
       return {
         status: "warn",
-        summary: `glide.authenticate.multifactor=true and the Role-based multi-factor authentication criteria record is active, but ${rolesDescription} and ${unflaggedAdmins}; confirm admin and security_admin are enforced.`,
+        summary: `glide.authenticate.multifactor is true and the Role-based multi-factor authentication criteria record is active, but ${rolesDescription} and ${unflaggedAdmins}; confirm admin and security_admin are enforced.`,
         evidence,
         principals,
       };
@@ -2215,7 +2227,7 @@ export function assessServicenowIdentityAccessData(data: ServicenowIdentityData)
     }
     return {
       status: "pass",
-      summary: `glide.authenticate.multifactor=true and MFA is enforced for administrators: ${enforcement}${perUser}.`,
+      summary: `glide.authenticate.multifactor is true and MFA is enforced for administrators: ${enforcement}${perUser}.`,
       evidence,
       principals,
     };
@@ -2481,7 +2493,7 @@ export function assessServicenowPlatformHardeningData(data: ServicenowHardeningD
     if (timeout.exists && (timeoutMinutes === undefined || timeoutMinutes <= 0 || timeoutMinutes > data.maxSessionTimeoutMinutes)) {
       return {
         status: "fail",
-        summary: `glide.ui.session_timeout=${timeout.value} exceeds the ${data.maxSessionTimeoutMinutes} minute threshold or is not a positive number.`,
+        summary: `glide.ui.session_timeout is ${timeout.value}, which exceeds the ${data.maxSessionTimeoutMinutes} minute threshold or is not a positive number.`,
         evidence,
       };
     }
@@ -2495,13 +2507,13 @@ export function assessServicenowPlatformHardeningData(data: ServicenowHardeningD
     if (rotate.exists && asBoolean(rotate.value) === false) {
       return {
         status: "warn",
-        summary: `glide.ui.session_timeout=${timeoutMinutes} minutes is within the threshold, but glide.ui.rotate_sessions is false.`,
+        summary: `glide.ui.session_timeout is ${timeoutMinutes} minutes, within the threshold, but glide.ui.rotate_sessions is false.`,
         evidence,
       };
     }
     return {
       status: "pass",
-      summary: `glide.ui.session_timeout=${timeoutMinutes} minutes is within the ${data.maxSessionTimeoutMinutes} minute threshold${rotate.exists ? ` and glide.ui.rotate_sessions=${rotate.value}` : ""}.`,
+      summary: `glide.ui.session_timeout is ${timeoutMinutes} minutes, within the ${data.maxSessionTimeoutMinutes} minute threshold${rotate.exists ? `, and glide.ui.rotate_sessions is ${rotate.value}` : ""}.`,
       evidence,
     };
   });
@@ -2612,7 +2624,7 @@ export function assessServicenowPlatformHardeningData(data: ServicenowHardeningD
     }
     return {
       status: "pass",
-      summary: `${IP_AUTHENTICATOR_PLUGIN} is active, ${activeRules.length} active ${IP_ACCESS_TABLE} rules restrict access by source network, and glide.ip.authenticate.strict=true.`,
+      summary: `${IP_AUTHENTICATOR_PLUGIN} is active, ${activeRules.length} active ${IP_ACCESS_TABLE} rules restrict access by source network, and glide.ip.authenticate.strict is true.`,
       evidence,
     };
   });
@@ -2641,7 +2653,7 @@ export function assessServicenowPlatformHardeningData(data: ServicenowHardeningD
     if (insecure.length > 0 || smtpAuthDisabled) {
       return {
         status: "fail",
-        summary: `${insecure.length}/${smtpAccounts.length} active SMTP accounts use Connection Security = None${insecure.length > 0 ? ` (${names(insecure).join(", ")})` : ""}${smtpAuthDisabled ? " and glide.smtp.auth=false" : ""}; ServiceNow warns that None may expose data and recommends SSL/TLS.`,
+        summary: `${insecure.length}/${smtpAccounts.length} active SMTP accounts use Connection Security = None${insecure.length > 0 ? ` (${names(insecure).join(", ")})` : ""}${smtpAuthDisabled ? " and glide.smtp.auth is false" : ""}; ServiceNow warns that None may expose data and recommends SSL/TLS.`,
         evidence,
       };
     }
@@ -2668,7 +2680,7 @@ export function assessServicenowPlatformHardeningData(data: ServicenowHardeningD
     }
     return {
       status: "manual",
-      summary: `All ${smtpAccounts.length} active SMTP accounts use Connection Security = SSL/TLS${smtpAuth.exists ? ` and glide.smtp.auth=${smtpAuth.value}` : ", but glide.smtp.auth has no row"}; DKIM signing and notification security headers are not exposed through the Table API and must be confirmed manually.`,
+      summary: `All ${smtpAccounts.length} active SMTP accounts use Connection Security = SSL/TLS${smtpAuth.exists ? ` and glide.smtp.auth is ${smtpAuth.value}` : ", but glide.smtp.auth has no row"}; DKIM signing and notification security headers are not exposed through the Table API and must be confirmed manually.`,
       evidence,
     };
   });
@@ -3164,7 +3176,7 @@ export function assessServicenowOperationsGovernanceData(data: ServicenowOperati
     if (override.exists && override.value) {
       return {
         status: "warn",
-        summary: `All ${servers.length} MID Servers are validated, but mid.version.override=${override.value} pins the version and disables automatic upgrade; ${notUp.length} are not Up.`,
+        summary: `All ${servers.length} MID Servers are validated, but mid.version.override is ${override.value}, which pins the version and disables automatic upgrade; ${notUp.length} are not Up.`,
         evidence,
       };
     }
