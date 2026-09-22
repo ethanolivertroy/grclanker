@@ -217,10 +217,14 @@ const PEM_OPEN_PATTERN = /-----BEGIN [A-Z0-9 ]+-----[\s\S]*$/;
 const EMBEDDED_URL_PATTERN = /\b[a-z][a-z0-9+.-]*:\/\/[^\s"'<>()[\]{}]+/gi;
 const URL_PARTS_PATTERN = /^([a-z][a-z0-9+.-]*:\/\/)(?:[^\s/@"'<>]+@)?([^?#]*)(\?[^#]*)?(#.*)?$/i;
 const TRAILING_PUNCTUATION_PATTERN = /[.,;:!?]+$/;
+const TRAILING_WHITESPACE_PATTERN = /[ \t]+$/;
 const QUERY_PAIR_PATTERN = /([?&])([A-Za-z0-9_.[\]-]+)=([^&#\s"'<>)\]}]+)/g;
-// A cookie header's value runs to the end of the line and may hold quoted pair or attribute values in
-// plain, single, or JSON-escaped quotes; every quoted segment is part of the value, never its end.
-const COOKIE_HEADER_PATTERN = /\b(set-cookie|cookies?)(\\?["']?\s*[:=]\s*)(?!\[REDACTED\])(?=\S)(?:[^\r\n<>"'\\]|\\?["'][^"'\r\n\\]*\\?["'])+/gi;
+// A cookie header value quoted as a whole ends at its closing quote (plain, single, or JSON-escaped).
+// An unquoted value may hold quoted pair values after "=" and runs to the end of the line, except that it
+// ends at a ";" or "," that precedes the next "Name:" header token or a JSON fragment, and at whitespace
+// before a JSON fragment, so a following header keeps its name and gets its own carrier treatment.
+const COOKIE_HEADER_PATTERN =
+  /\b(set-cookie|cookies?)(\\?["']?\s*[:=]\s*)(?!\\?["']?\[REDACTED\])(?:(\\?["'])[^"'\r\n\\]*\\?["']|([^\r\n\t <>"'\\;,=](?:[^\r\n\t <>"'\\;,=]|=[ \t]*(?:\\?["'](?:[^"'\r\n\\]*\\?["']|[^\r\n]*))?|[;,](?![ \t]*(?:[{[]|\\?["']?[A-Za-z][A-Za-z0-9_-]*\\?["']?[ \t]*:))|[ \t](?![ \t]*[{[]))*))/gi;
 // A scheme word spelled as a header scheme followed by a run of 8 or more token characters is a
 // credential whatever the run's shape; only the mechanism words vendor prose puts there ("Basic
 // authentication", "Bearer credentials") are kept. Lowercase spellings in prose ("token provided")
@@ -370,6 +374,12 @@ function scrubQueryPair(match: string, separator: string, key: string): string {
   return isCredentialCarrierKey(key) ? `${separator}${key}=${REDACTED}` : match;
 }
 
+function scrubCookieHeader(match: string, header: string, separator: string, quote: string | undefined, value: string | undefined): string {
+  if (quote !== undefined) return `${header}${separator}${quote}${REDACTED}${quote}`;
+  const trailing = TRAILING_WHITESPACE_PATTERN.exec(value ?? "")?.[0] ?? "";
+  return `${header}${separator}${REDACTED}${trailing}`;
+}
+
 function scrubSchemeValue(match: string, scheme: string, quote: string, value: string): string {
   const trailing = TRAILING_PUNCTUATION_PATTERN.exec(value)?.[0] ?? "";
   const word = value.slice(0, value.length - trailing.length);
@@ -437,7 +447,7 @@ export function scrubErrorText(text: string, secrets: ReadonlyArray<string | und
   scrubbed = scrubConfiguredSecrets(scrubbed, secrets)
     .replace(EMBEDDED_URL_PATTERN, scrubEmbeddedUrl)
     .replace(QUERY_PAIR_PATTERN, scrubQueryPair)
-    .replace(COOKIE_HEADER_PATTERN, `$1$2${REDACTED}`);
+    .replace(COOKIE_HEADER_PATTERN, scrubCookieHeader);
   scrubbed = replaceCredentialAssignments(scrubbed)
     .replace(SCHEME_VALUE_PATTERN, scrubSchemeValue)
     .replace(HMAC_HEADER_PATTERN, `$1 $2${REDACTED}`)
