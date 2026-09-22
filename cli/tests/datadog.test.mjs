@@ -1,7 +1,9 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import {
+  chmodSync,
   existsSync,
+  mkdirSync,
   mkdtempSync,
   readFileSync,
   readdirSync,
@@ -3482,11 +3484,103 @@ test("rule 9 / addendum 6: a malformed .dogrc whose bad line carries a credentia
     }
     assert.equal(fsError.name, "DatadogConfigFileError");
     assert.equal(fsError.code, "EISDIR");
-    assert.ok(fsError.message.includes(directoryAsFile));
-    assert.match(fsError.message, /could not be loaded \(EISDIR\)\./);
+    assert.equal(fsError.message, `Unable to read Datadog config file ${directoryAsFile} (EISDIR)`);
     const access = await checkTool.execute("call-dogrc-dir", checkTool.prepareArguments({ config_file: directoryAsFile }));
     assert.equal(access.isError, true);
-    assert.match(access.content[0].text, /Datadog access check failed: Datadog config file .* could not be loaded \(EISDIR\)/);
+    assert.equal(access.content[0].text, `Datadog access check failed: Unable to read Datadog config file ${directoryAsFile} (EISDIR)`);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+// ---------------------------------------------------------------------------------------------------------------
+// Addendum 6b: the .dogrc loader takes the read-failure rule (fixed text, validated errno code) and the
+// catch-everything rule; the dogshell INI parser has no structured position, so no line is ever reported.
+// ---------------------------------------------------------------------------------------------------------------
+
+const DOGRC_READ_CANARY = "CFGD5w6x7y8z9a0b1c2";
+const FS_WORDING = ["illegal operation", "permission denied", "no such file", "Nested mappings", "is not valid JSON", "Unresolved alias"];
+
+function eightCharacterWindows(text) {
+  const windows = [];
+  for (let index = 0; index + 8 <= text.length; index += 1) windows.push(text.slice(index, index + 8));
+  return windows;
+}
+
+/** Asserts a message carries neither the canary, nor any 8-character fragment of it, nor the filesystem's own wording. */
+function assertFixedTextOnly(message, label) {
+  assert.ok(!message.includes(DOGRC_READ_CANARY), `${label}: carries the canary: ${message}`);
+  for (const fragment of eightCharacterWindows(DOGRC_READ_CANARY)) assert.ok(!message.includes(fragment), `${label}: carries the fragment ${fragment}: ${message}`);
+  for (const wording of FS_WORDING) assert.ok(!message.includes(wording), `${label}: carries library wording "${wording}": ${message}`);
+}
+
+test("config loader errors: a .dogrc that cannot be read yields fixed text with only the path and a validated errno code, from the resolver and from check_access, and an explicit missing path is an error", async () => {
+  assert.equal(new Set(eightCharacterWindows(DOGRC_READ_CANARY)).size, eightCharacterWindows(DOGRC_READ_CANARY).length, "canary windows are distinct");
+  const registered = [];
+  registerDatadogTools({ registerTool: (tool) => registered.push(tool) });
+  const checkTool = registered.find((tool) => tool.name === "datadog_check_access");
+  const exportTool = registered.find((tool) => tool.name === "datadog_export_audit_bundle");
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = () => { throw new Error("no request may be made while the config file is unreadable"); };
+  try {
+    const base = createTempBase("grclanker-dogrc-read-errors-");
+    const cases = [];
+
+    // EISDIR: a directory at the path is a read failure with the filesystem's wording withheld.
+    const directory = join(base, "dogrc-dir");
+    mkdirSync(directory);
+    assert.throws(() => readFileSync(directory, "utf8"), (error) => error.code === "EISDIR" && /illegal operation/.test(error.message), "positive control: the filesystem message carries its own wording");
+    cases.push({ name: "EISDIR", path: directory, code: "EISDIR", message: `Unable to read Datadog config file ${directory} (EISDIR)` });
+
+    // EACCES: an unreadable file whose contents carry the canary (root reads everything, so skipped as root).
+    if (typeof process.getuid === "function" && process.getuid() !== 0) {
+      const unreadable = join(base, "unreadable.dogrc");
+      writeFileSync(unreadable, `[Connection]\napikey = ${DOGRC_READ_CANARY}\n`, "utf8");
+      chmodSync(unreadable, 0o000);
+      assert.throws(() => readFileSync(unreadable, "utf8"), (error) => error.code === "EACCES" && /permission denied/.test(error.message), "positive control");
+      cases.push({ name: "EACCES", path: unreadable, code: "EACCES", message: `Unable to read Datadog config file ${unreadable} (EACCES)` });
+    }
+
+    // ENOENT on an explicit path: a missing file named by argument or environment is an error, not a silent default.
+    const missing = join(base, "missing.dogrc");
+    cases.push({ name: "ENOENT", path: missing, code: "ENOENT", message: `Unable to read Datadog config file ${missing} (ENOENT)` });
+
+    for (const item of cases) {
+      let thrown;
+      try {
+        resolveDatadogConfiguration({ config_file: item.path }, {}, base);
+      } catch (error) {
+        thrown = error;
+      }
+      assert.ok(thrown, `${item.name}: the resolver must reject the file`);
+      assert.equal(thrown.name, "DatadogConfigFileError", item.name);
+      assert.equal(thrown.message, item.message, `${item.name}: fixed text only`);
+      assert.equal(thrown.code, item.code, item.name);
+      assert.equal(thrown.line, undefined, item.name);
+      assert.equal(thrown.path, item.path, item.name);
+      assertFixedTextOnly(thrown.message, `${item.name} resolver`);
+
+      const access = await checkTool.execute("call-dogrc-read", checkTool.prepareArguments({ config_file: item.path }));
+      assert.equal(access.isError, true, item.name);
+      assert.equal(access.content[0].text, `Datadog access check failed: ${item.message}`, item.name);
+      assertFixedTextOnly(JSON.stringify(access), `${item.name} check_access`);
+
+      const outputDir = join(base, `export-${item.code}`);
+      const exported = await exportTool.execute("call-dogrc-read-export", exportTool.prepareArguments({ config_file: item.path, output_dir: outputDir }));
+      assert.equal(exported.isError, true, item.name);
+      assert.equal(exported.content[0].text, `Datadog audit bundle export failed: ${item.message}`, item.name);
+      assert.equal(existsSync(outputDir), false, `${item.name}: nothing is written when the config file is unreadable`);
+    }
+
+    // The environment variables are explicit paths too, and a missing default ~/.dogrc is still simply absent.
+    for (const variable of ["DD_CONFIG_FILE", "DATADOG_CONFIG_FILE"]) {
+      assert.throws(
+        () => resolveDatadogConfiguration({ api_key: "k".repeat(32), app_key: "a".repeat(40) }, { [variable]: missing }, base),
+        { message: `Unable to read Datadog config file ${missing} (ENOENT)` },
+        variable,
+      );
+    }
+    assert.equal(resolveDatadogConfiguration({ api_key: "k".repeat(32), app_key: "a".repeat(40) }, {}, base).apiKey, "k".repeat(32));
   } finally {
     globalThis.fetch = originalFetch;
   }
