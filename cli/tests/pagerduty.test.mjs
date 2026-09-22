@@ -45,6 +45,7 @@ import { CONFIG_CANARIES, assertConfigLoaderMatrix, configLoaderCases } from "./
 import { assertFixedTextsSurvive, collectFixedTexts, collectThrownMessage, collectToolTexts, logLines } from "./helpers/fixed-text-survival.mjs";
 import { assertFragmentsAbsent, assertPlantedValuesWellFormed } from "./helpers/planted-values.mjs";
 import { CONFIGURED_SECRET_CANARIES, assertTextFieldCarriers, carrierSuffix, injectingFetch } from "./helpers/text-field-carriers.mjs";
+import { assertDeepCanariesWellFormed, assertDeepNesting, deepFields, plantingFetch } from "./helpers/deep-nesting.mjs";
 import { assertScrubBoundary } from "./helpers/scrub-boundary-matrix.mjs";
 
 const NOW = new Date("2026-09-21T00:00:00.000Z");
@@ -3045,6 +3046,42 @@ test("rule 9 data side: a credential carried in any free-text field of any Pager
   const healthyTexts = await harvest(false);
   const texts = await harvest(true);
   assertTextFieldCarriers(assert, texts, { configuredSecrets, healthyTexts });
+});
+
+/**
+ * CodeRabbit (#62, second review) items 2 and 3: a container nested past MAX_REDACTION_DEPTH in a PagerDuty
+ * response is replaced by the marker, never passed through unscrubbed. PagerDuty's walker is redactSnapshot
+ * behind capture; the schedule detail (kept whole in core_data/schedule_details.json) carries the three planted
+ * fields; the walker's root is the details array, so the schedule is depth 1 and the planted fields depth 2.
+ * redactSnapshot checks the depth before its string branch, so the control leaf at depth 32 keeps its keys
+ * and every value becomes the marker (stricter than scrubbing in place, and no leak).
+ */
+test("CodeRabbit (#62, second review) items 2 and 3: a PagerDuty record container nested past MAX_REDACTION_DEPTH is replaced whole, the leaf at the maximum depth is scrubbed in place, and no planted window reaches any output", async () => {
+  const harvest = async (planted) => {
+    const config = sampleConfig();
+    const fixture = pagerdutyApiFixture();
+    const planting = plantingFetch(fixture.fetchImpl, (url) => url.pathname === "/schedules/sched-1", (payload) => {
+      Object.assign(payload.schedule, deepFields(2));
+      return payload;
+    });
+    const client = new PagerdutyApiClient(config, { fetchImpl: planted ? planting : fixture.fetchImpl, now: () => NOW, sleep: async () => {} });
+    const access = await checkPagerdutyAccess(client);
+    const assessments = (await runAllAssessments(client)).results;
+    const base = createTempBase("grclanker-pagerduty-deep-nesting-");
+    try {
+      const result = await exportPagerdutyAuditBundle(client, config, base, { maxAdmins: 3, coverageDays: 30 });
+      return [
+        ["check_access", JSON.stringify(access)],
+        ["assessments", JSON.stringify(assessments)],
+        ...[...readBundleFiles(result.outputDir)].map(([name, content]) => [`bundle file ${name}`, content]),
+        ...[...readZipEntries(result.zipPath)].map(([name, content]) => [`zip entry ${name}`, content]),
+      ];
+    } finally {
+      rmSync(base, { recursive: true, force: true });
+    }
+  };
+  assertDeepCanariesWellFormed(assert, await harvest(false));
+  assertDeepNesting(assert, await harvest(true), { stringsPastDepth: "replaced" });
 });
 
 test("addendum 4: a Scoped OAuth token endpoint that answers with a 502 HTML page or a JSON error embedding a credential URL never echoes the body, and the obtained bearer token is redacted from every error string", async () => {

@@ -695,7 +695,8 @@ function redactedValue(entry: unknown): unknown {
  * {name, value} pair whose name does, and any secret-named query parameter inside a URL string
  * is replaced with the redaction marker. The allowlist projections below remove the fields the
  * vendor documents as credential carriers; this pass covers free-form objects such as change
- * event custom_details and workflow action inputs.
+ * event custom_details and workflow action inputs. A value nested deeper than MAX_REDACTION_DEPTH
+ * (container or leaf) is replaced by the marker rather than passed through.
  */
 export function redactSnapshot(value: unknown, depth = 0): unknown {
   if (depth > MAX_REDACTION_DEPTH) return REDACTED;
@@ -939,18 +940,6 @@ function scrubRememberedSecrets(text: string): string {
  */
 function scrubDataText(text: string): string {
   return scrubCarriers(scrubRememberedSecrets(text));
-}
-
-/** A collected value with every string leaf through the data-side pass; arrays and plain objects are rebuilt, other values are kept. */
-function scrubDataStrings<T>(value: T, depth = 0): T {
-  if (typeof value === "string") return scrubDataText(value) as T;
-  if (depth > MAX_REDACTION_DEPTH || value === null || typeof value !== "object") return value;
-  if (Array.isArray(value)) return value.map((item) => scrubDataStrings(item, depth + 1)) as T;
-  const prototype = Object.getPrototypeOf(value);
-  if (prototype !== Object.prototype && prototype !== null) return value;
-  const output: Record<string, unknown> = {};
-  for (const [key, entry] of Object.entries(value as Record<string, unknown>)) output[key] = scrubDataStrings(entry, depth + 1);
-  return output as T;
 }
 
 /** A scheme word standing in prose ("bearer of", "OAuth bearer token.", "Refresh Token Policy") rather than carrying a credential. */

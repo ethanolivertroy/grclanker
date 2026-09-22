@@ -39,6 +39,7 @@ import { assertFixedTextsSurvive, collectFixedTexts, collectThrownMessage, colle
 import { assertLeavesNullUnderDenial } from "./helpers/leaf-diff.mjs";
 import { assertFragmentsAbsent, assertPlantedValuesWellFormed } from "./helpers/planted-values.mjs";
 import { CONFIGURED_SECRET_CANARIES, assertTextFieldCarriers, carrierSuffix, injectingFetch } from "./helpers/text-field-carriers.mjs";
+import { assertDeepCanariesWellFormed, assertDeepNesting, deepFields, plantingFetch } from "./helpers/deep-nesting.mjs";
 import { assertScrubBoundary } from "./helpers/scrub-boundary-matrix.mjs";
 
 const { privateKey: TEST_PRIVATE_KEY, publicKey: TEST_PUBLIC_KEY } = generateKeyPairSync("rsa", {
@@ -2040,6 +2041,43 @@ test("rule 9 data side: a credential carried in any free-text field of any Sales
   const healthyTexts = await harvest(false);
   const texts = await harvest(true);
   assertTextFieldCarriers(assert, texts, { configuredSecrets, healthyTexts });
+});
+
+/**
+ * CodeRabbit (#62, second review) items 2 and 3: a container nested past MAX_REDACTION_DEPTH in a Salesforce
+ * record is replaced by the marker, never passed through unscrubbed. The Organization record (kept whole in
+ * core_data/organization.json) carries the three planted fields; the walker's root is the record itself, so
+ * the planted fields are depth 1.
+ */
+test("CodeRabbit (#62, second review) items 2 and 3: a Salesforce record container nested past MAX_REDACTION_DEPTH is replaced whole, the leaf at the maximum depth is scrubbed in place, and no planted window reaches any output", async () => {
+  const harvest = async (planted) => {
+    const config = sampleConfig({ authMode: "password", username: "auditor@acme.example", password: "sf-password-value", securityToken: "sf-security-token", consumerKey: "ck", consumerSecret: "sf-consumer-secret" });
+    const healthyFetch = sfCanaryFetch({ surface: null, flavor: null });
+    const planting = plantingFetch(healthyFetch, (url) => url.pathname.endsWith("/query") && /FROM\s+Organization\b/i.test(url.searchParams.get("q") ?? ""), (payload) => {
+      Object.assign(payload.records[0], deepFields(1));
+      return payload;
+    });
+    const client = new SalesforceApiClient(config, { fetchImpl: planted ? planting : healthyFetch, sleep: async () => {}, now: () => NOW });
+    const access = await checkSalesforceAccess(client);
+    const assessments = [];
+    for (const assess of [assessSalesforcePlatformSecurity, assessSalesforceIdentityAccess, assessSalesforceDataProtection, assessSalesforceMonitoringIntegrations]) {
+      assessments.push(await assess(client, { now: NOW }));
+    }
+    const base = createTempBase("grclanker-sf-deep-nesting-");
+    try {
+      const exported = await exportSalesforceAuditBundle(client, client.getResolvedConfig(), base, { now: NOW });
+      return [
+        ["check_access", JSON.stringify(access)],
+        ["assessments", JSON.stringify(assessments)],
+        ...[...readBundleFiles(exported.outputDir)].map(([path, content]) => [`bundle file ${path}`, content]),
+        ...[...readZipEntries(exported.zipPath)].map(([path, content]) => [`zip entry ${path}`, content]),
+      ];
+    } finally {
+      rmSync(base, { recursive: true, force: true });
+    }
+  };
+  assertDeepCanariesWellFormed(assert, await harvest(false));
+  assertDeepNesting(assert, await harvest(true));
 });
 
 test("planted values self-check: every canary and planted secret is alphanumeric, distinct in every 6-character window, and no window occurs in the healthy fixtures, the sample configuration, or a healthy bundle", async () => {

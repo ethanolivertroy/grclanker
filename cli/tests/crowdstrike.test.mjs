@@ -37,6 +37,7 @@ import { CONFIG_CANARIES, assertConfigLoaderMatrix, configLoaderCases } from "./
 import { assertFixedTextsSurvive, collectFixedTexts, collectThrownMessage, collectToolTexts, logLines } from "./helpers/fixed-text-survival.mjs";
 import { assertFragmentsAbsent, assertPlantedValuesWellFormed } from "./helpers/planted-values.mjs";
 import { CONFIGURED_SECRET_CANARIES, assertTextFieldCarriers, carrierSuffix, injectingFetch } from "./helpers/text-field-carriers.mjs";
+import { assertDeepCanariesWellFormed, assertDeepNesting, deepFields, plantingFetch } from "./helpers/deep-nesting.mjs";
 import { assertScrubBoundary } from "./helpers/scrub-boundary-matrix.mjs";
 
 const ALL_CONTROL_IDS = Array.from({ length: 25 }, (_, index) => `CS-${String(index + 1).padStart(2, "0")}`);
@@ -2610,6 +2611,40 @@ test("rule 9 data side: a credential carried in any free-text field of any Falco
   const healthyTexts = await harvest(false);
   const texts = await harvest(true);
   assertTextFieldCarriers(assert, texts, { configuredSecrets, healthyTexts });
+});
+
+/**
+ * CodeRabbit (#62, second review) items 2 and 3: a container nested past MAX_REDACTION_DEPTH in a Falcon
+ * response is replaced by the marker, never passed through unscrubbed. The first prevention policy (kept whole
+ * in core_data/prevention_policies/prevention_policies.json) carries the three planted fields; the walker's
+ * root is the CrowdstrikePage, so items is depth 1, the policy depth 2, and the planted fields depth 3.
+ */
+test("CodeRabbit (#62, second review) items 2 and 3: a CrowdStrike record container nested past MAX_REDACTION_DEPTH is replaced whole, the leaf at the maximum depth is scrubbed in place, and no planted window reaches any output", async () => {
+  const harvest = async (planted) => {
+    const config = sampleConfig();
+    const healthyFetch = csCanaryFetch({ path: null, flavor: null });
+    const planting = plantingFetch(healthyFetch, (url) => url.pathname === "/policy/combined/prevention/v1", (payload) => {
+      Object.assign(payload.resources[0], deepFields(3));
+      return payload;
+    });
+    const client = new CrowdstrikeApiClient(config, { fetchImpl: planted ? planting : healthyFetch, sleep: async () => {}, retryLimit: 0 });
+    const access = await checkCrowdstrikeAccess(client);
+    const assessments = await runAllCrowdstrikeAssessments(client);
+    const base = createTempBase("grclanker-cs-deep-nesting-");
+    try {
+      const result = await exportCrowdstrikeAuditBundle(client, config, base);
+      return [
+        ["check_access", JSON.stringify(access)],
+        ["assessments", JSON.stringify(assessments)],
+        ...[...readBundleFiles(result.outputDir)].map(([name, content]) => [`bundle file ${name}`, content]),
+        ...[...readZipEntries(result.zipPath)].map(([name, content]) => [`zip entry ${name}`, content]),
+      ];
+    } finally {
+      rmSync(base, { recursive: true, force: true });
+    }
+  };
+  assertDeepCanariesWellFormed(assert, await harvest(false));
+  assertDeepNesting(assert, await harvest(true));
 });
 
 test("planted values self-check: every canary and planted secret is alphanumeric, distinct in every 6-character window, and no window occurs in the healthy fixtures, the sample configuration, or a healthy bundle", async () => {

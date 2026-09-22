@@ -621,10 +621,15 @@ function scrubDataText(text: string): string {
   return scrubCarriers(scrubRememberedSecrets(text));
 }
 
-/** A collected value with every string leaf through the data-side pass; arrays and plain objects are rebuilt, other values are kept. */
+/**
+ * A collected value with every string leaf through the data-side pass; arrays and plain objects are
+ * rebuilt, primitives and null are kept, and a container nested deeper than MAX_REDACTION_DEPTH is
+ * replaced by the marker rather than passed through unscrubbed (the payload is server-controlled).
+ */
 function scrubDataStrings<T>(value: T, depth = 0): T {
   if (typeof value === "string") return scrubDataText(value) as T;
-  if (depth > MAX_REDACTION_DEPTH || value === null || typeof value !== "object") return value;
+  if (value === null || typeof value !== "object") return value;
+  if (depth > MAX_REDACTION_DEPTH) return REDACTED as T;
   if (Array.isArray(value)) return value.map((item) => scrubDataStrings(item, depth + 1)) as T;
   const prototype = Object.getPrototypeOf(value);
   if (prototype !== Object.prototype && prototype !== null) return value;

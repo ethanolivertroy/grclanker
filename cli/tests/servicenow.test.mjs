@@ -38,6 +38,7 @@ import { CONFIG_CANARIES, assertConfigLoaderMatrix, configLoaderCases } from "./
 import { assertFixedTextsSurvive, collectFixedTexts, collectThrownMessage, collectToolTexts, logLines } from "./helpers/fixed-text-survival.mjs";
 import { assertFragmentsAbsent, assertPlantedValuesWellFormed } from "./helpers/planted-values.mjs";
 import { CONFIGURED_SECRET_CANARIES, assertTextFieldCarriers, carrierSuffix, injectingFetch } from "./helpers/text-field-carriers.mjs";
+import { assertDeepCanariesWellFormed, assertDeepNesting, deepFields, plantingFetch } from "./helpers/deep-nesting.mjs";
 import { assertScrubBoundary } from "./helpers/scrub-boundary-matrix.mjs";
 
 const FIXED_NOW = new Date("2026-09-21T00:00:00Z");
@@ -2589,6 +2590,45 @@ test("round 7 note 2: credentials and the config file path set through the envir
   assert.equal(shadowed.username, "env.user");
   assert.equal(shadowed.password, "env-password-value");
   assert.deepEqual(shadowed.sourceChain, [`config-file:${configPath}`, "environment", "arguments"]);
+});
+
+/**
+ * CodeRabbit (#62, second review) items 2 and 3: a container nested past MAX_REDACTION_DEPTH in a Table API row
+ * is replaced by the marker, never passed through unscrubbed. The `version` field of the first sys_plugins row
+ * (a requested field, kept whole in core_data) carries the three planted fields; the walker's root is the rows
+ * array, so the row is depth 1, `version` depth 2, and the planted fields depth 3.
+ */
+test("CodeRabbit (#62, second review) items 2 and 3: a ServiceNow row container nested past MAX_REDACTION_DEPTH is replaced whole, the leaf at the maximum depth is scrubbed in place, and no planted window reaches any output", async () => {
+  const harvest = async (planted) => {
+    const config = sampleConfig();
+    const { fetchImpl } = fixtureFetch(healthyFixture());
+    const planting = plantingFetch(fetchImpl, (url) => url.pathname === "/api/now/table/sys_plugins", (payload) => {
+      payload.result[0].version = deepFields(3);
+      return payload;
+    });
+    const client = new ServicenowApiClient(config, { fetchImpl: planted ? planting : fetchImpl, sleep: async () => {}, now: () => FIXED_NOW });
+    const access = await checkServicenowAccess(client);
+    const assessments = await Promise.all([
+      assessServicenowIdentityAccess(client),
+      assessServicenowPlatformHardening(client),
+      assessServicenowAccessControl(client),
+      assessServicenowOperationsGovernance(client),
+    ]);
+    const base = createTempBase("grclanker-snow-deep-nesting-");
+    try {
+      const result = await exportServicenowAuditBundle(client, config, base);
+      return [
+        ["check_access", JSON.stringify(access)],
+        ["assessments", JSON.stringify(assessments)],
+        ...[...readBundleFiles(result.outputDir)].map(([name, content]) => [`bundle file ${name}`, content]),
+        ...[...readZipEntries(result.zipPath)].map(([name, content]) => [`zip entry ${name}`, content]),
+      ];
+    } finally {
+      rmSync(base, { recursive: true, force: true });
+    }
+  };
+  assertDeepCanariesWellFormed(assert, await harvest(false));
+  assertDeepNesting(assert, await harvest(true));
 });
 
 /** Refresh tokens planted per source: random alphanumeric, distinct in every 6-character window (self-checked below). */
