@@ -72,6 +72,55 @@ function secretForms(value) {
   return [...new Set([value, JSON.stringify(value).slice(1, -1), encodeURIComponent(value), Buffer.from(value).toString("base64"), Buffer.from(value).toString("base64url")])];
 }
 
+// The window rule (addendum 8): every leak assertion against a planted credential checks
+// the whole value and every window of it from LEAK_WINDOW_MIN to LEAK_WINDOW_MAX characters,
+// so a partial echo (the 10-character window JSON.parse quotes, a token cut by a length cap,
+// the head of a base64 form split by a marker) cannot pass. The planted values are alphanumeric
+// and random-looking, and the fixture self-check below proves that no 6-character window of
+// any of them occurs in the fixtures' legitimate text, so every failure is a real leak.
+const LEAK_WINDOW_MIN = 6;
+const LEAK_WINDOW_MAX = 24;
+const leakWindowCache = new Map();
+
+// The whole value plus every window of LEAK_WINDOW_MIN to LEAK_WINDOW_MAX characters, longest
+// first so a failure names the largest fragment that survived, and the shortest windows on
+// their own: a longer window contains its own first LEAK_WINDOW_MIN characters, so every
+// window is absent exactly when the whole value and every shortest window are.
+function leakWindows(canary) {
+  let entry = leakWindowCache.get(canary);
+  if (entry === undefined) {
+    const all = [canary];
+    for (let size = Math.min(LEAK_WINDOW_MAX, canary.length - 1); size >= LEAK_WINDOW_MIN; size -= 1) {
+      for (let index = 0; index + size <= canary.length; index += 1) all.push(canary.slice(index, index + size));
+    }
+    const shortest = Math.min(LEAK_WINDOW_MIN, canary.length);
+    entry = { all: [...new Set(all)], probes: [...new Set(all.filter((window) => window.length === shortest))] };
+    leakWindowCache.set(canary, entry);
+  }
+  return entry;
+}
+
+// Neither the canary nor any window of it from 6 to 24 characters may survive in the text.
+function assertNoWindow(text, canary, label) {
+  const { all, probes } = leakWindows(canary);
+  if (!probes.some((probe) => text.includes(probe))) return;
+  const leaked = all.find((window) => text.includes(window));
+  assert.fail(leaked === canary ? `${label}: ${canary} leaked` : `${label}: window ${leaked} of ${canary} leaked`);
+}
+
+// Every bundle file or zip entry against every planted secret: the shared whole-value scan, then every window.
+function assertNoSecretWindows(contents, secrets, label) {
+  assertSecretsAbsent(assert, contents, secrets, label);
+  for (const [name, text] of contents) {
+    for (const secret of secrets) assertNoWindow(text, secret, `${label} ${name}`);
+  }
+}
+
+// The 6-character windows of a planted value (the value itself when shorter), for the fixture self-check.
+function sixWindows(value) {
+  return leakWindows(value).probes;
+}
+
 function createTempBase(prefix) {
   return mkdtempSync(join(tmpdir(), prefix));
 }
@@ -198,17 +247,21 @@ function badMgtConfigXml() {
 }
 
 // Fake credential values a real PAN-OS config carries verbatim; none may reach the bundle.
+// Random-looking alphanumerics (see the window rule above); the PEM armor around the
+// private key material is composed where the fixture uses it, since the armor itself is
+// legitimate text a public certificate shares.
 const FAKE_PANOS_SECRETS = {
-  phash: "$1$fakesalt$fakehashvalue0123456789",
-  radiusSecret: "radius-shared-secret-fake",
-  ldapBindPassword: "ldap-bind-password-fake",
-  presharedKey: "ike-psk-fake-0123456789abcdef",
-  communityString: "snmp-c0mmun1ty-fake",
-  authpwd: "snmpv3-auth-password-fake",
-  privpwd: "snmpv3-priv-password-fake",
-  privateKey: "-----BEGIN PRIVATE KEY-----fakekeymaterial-----END PRIVATE KEY-----",
-  apiKey: "integration-api-key-fake",
+  phash: "1YMFRP6HbcXYT69d0D8aoK",
+  radiusSecret: "59EqaIulIB1Xinh8WcYxW4",
+  ldapBindPassword: "glnVK045hZAzIB6orPc68q",
+  presharedKey: "idlsZTIu1AXVyugMWj4c46",
+  communityString: "9ia06dm11jQlnx9JCddiy0",
+  authpwd: "5WO44igAdCyWi6gvSnwVcC",
+  privpwd: "yCgN3QGuB45U3RaT8ImP6R",
+  privateKeyMaterial: "sVmDR0RnpiQAC0GnEZ75XY",
+  apiKey: "c7asnENn31NX3tIlv2KOzq",
 };
+const FAKE_PANOS_PRIVATE_KEY_PEM = `-----BEGIN PRIVATE KEY-----${FAKE_PANOS_SECRETS.privateKeyMaterial}-----END PRIVATE KEY-----`;
 
 function secretsMgtConfigXml() {
   return `<mgt-config><users><entry name="admin"><phash>${FAKE_PANOS_SECRETS.phash}</phash><permissions><role-based><superuser>yes</superuser></role-based></permissions><authentication-profile>mfa-radius</authentication-profile></entry><entry name="auditor"><permissions><role-based><superreader>yes</superreader></role-based></permissions><public-key>c3NoLXJzYSBBQUFBQjNOemFDMXlj</public-key></entry></users><password-complexity><enabled>yes</enabled></password-complexity></mgt-config>`;
@@ -219,7 +272,7 @@ function secretsSharedXml() {
       <radius><entry name="corp-radius"><server><entry name="r1"><ip-address>10.9.9.9</ip-address><secret>${FAKE_PANOS_SECRETS.radiusSecret}</secret><port>1812</port></entry></server></entry></radius>
       <ldap><entry name="corp-ad"><bind-dn>cn=svc-panos,dc=example,dc=com</bind-dn><bind-password>${FAKE_PANOS_SECRETS.ldapBindPassword}</bind-password></entry></ldap>
     </server-profile>
-    <certificate><entry name="gp-portal"><private-key>${FAKE_PANOS_SECRETS.privateKey}</private-key><public-key>-----BEGIN CERTIFICATE-----fakecert-----END CERTIFICATE-----</public-key></entry></certificate>
+    <certificate><entry name="gp-portal"><private-key>${FAKE_PANOS_PRIVATE_KEY_PEM}</private-key><public-key>-----BEGIN CERTIFICATE-----fakecert-----END CERTIFICATE-----</public-key></entry></certificate>
     <integration api-key="${FAKE_PANOS_SECRETS.apiKey}" name="siem-connector"><url>https://siem.example.com</url></integration>
   </shared>`);
 }
@@ -444,7 +497,7 @@ test("round 7(b): environment credentials survive an argument overlay that carri
   assert.ok(fromFile.sourceChain.includes("config-file-prisma-secret-key"));
 });
 
-// Config loader canaries: no two share an 8-character window, so any fragment a parser
+// Config loader canaries: no two share a 6-character window, so any fragment a parser
 // quotes from the file is attributable to one fixture. The short canary keeps the JSON
 // short file at 20 characters, within the size at which JSON.parse quotes the whole source.
 const LOADER_CANARIES = {
@@ -458,13 +511,7 @@ const LOADER_CANARIES = {
 const LIBRARY_ERROR_WORDING = ["Nested mappings", "is not valid JSON", "Unresolved alias", "illegal operation", "permission denied", "Unexpected token", "Expected ',' or '}'"];
 
 function assertNoLoaderLeak(text, canaries, label) {
-  for (const canary of canaries) {
-    assert.ok(!text.includes(canary), `${label}: canary ${canary} leaked into: ${text}`);
-    for (let index = 0; index + 8 <= canary.length; index += 1) {
-      const fragment = canary.slice(index, index + 8);
-      assert.ok(!text.includes(fragment), `${label}: canary fragment ${fragment} leaked into: ${text}`);
-    }
-  }
+  for (const canary of canaries) assertNoWindow(text, canary, `${label} (${text})`);
   for (const wording of LIBRARY_ERROR_WORDING) {
     assert.ok(!text.includes(wording), `${label}: library wording "${wording}" leaked into: ${text}`);
   }
@@ -710,18 +757,20 @@ const PANOS_FORBIDDEN = '<response status="error" code="403"><result><msg>Insuff
 // Fake credential values Prisma Cloud CSPM and Compute payloads carry verbatim in real
 // tenants (integrationConfig, registry credentials, image secrets, Defender proxies);
 // none may reach an assessment payload, the bundle, or the zip.
+// Random-looking alphanumerics (see the window rule above); the Slack path keeps the
+// documented T.../B.../... shape because the whole path is the secret.
 const FAKE_PRISMA_SECRETS = {
-  splunkAuthToken: "splunk-hec-auth-token-fake-0123",
-  webhookQueryToken: "webhook-query-token-fake-4567",
-  webhookHeaderBearer: "webhook-header-bearer-fake-89ab",
-  slackWebhookPath: "T0FAKE/B0FAKE/slackwebhooksecretfake",
-  serviceNowPassword: "servicenow-password-fake-cdef",
-  tenableSecretKey: "tenable-secret-key-fake-0246",
-  registryPlainSecret: "registry-pull-secret-plain-fake",
-  registryBasicPassword: "registry-basic-password-fake",
-  imageSecret: "AKIAFAKEIMAGESECRET0123456789",
-  discoveryCredential: "cloud-discovery-credential-fake",
-  defenderProxyPassword: "defender-proxy-password-fake",
+  splunkAuthToken: "l7wws55g3rEVpnT12NJO78",
+  webhookQueryToken: "0JZOorpfk5rQhCKp6RA4o0",
+  webhookHeaderBearer: "6VCuAxxAkqMx3nlcay8S0e",
+  slackWebhookPath: "T0CSM24TT/B07GB5ULK/S0StoE0rnauAcnbRP2X6JA",
+  serviceNowPassword: "QSv2at8HxDN9YgiRo6Aw5w",
+  tenableSecretKey: "3RC06KxXSjuXX0BMtxebvJ",
+  registryPlainSecret: "C58sEmb4VTg1xXSxXRmK5N",
+  registryBasicPassword: "3i5DxV75zXGfqxZMp7o4GV",
+  imageSecret: "pjVQSukJKGD10deeMS0Fq2",
+  discoveryCredential: "2jHcFdODU4Qf1OmFfrXlh5",
+  defenderProxyPassword: "Pn9mPxU0Vc5CZN4kHE1ihV",
 };
 
 function secretsIntegrations() {
@@ -1080,7 +1129,7 @@ test("redactXmlCredentials collapses credential-bearing PAN-OS nodes and leaves 
   const redacted = xmlToJson(redactXmlCredentials(tree));
   const text = JSON.stringify(redacted);
   for (const secret of Object.values(FAKE_PANOS_SECRETS)) {
-    assert.ok(!text.includes(secret), `${secret} leaked into the redacted tree`);
+    assertNoWindow(text, secret, "redacted tree");
   }
 
   const config = redacted.config;
@@ -1125,11 +1174,11 @@ test("exportPaloaltoAuditBundle never writes PAN-OS credentials into the bundle 
 
   const files = readBundleFiles(result.outputDir);
   assert.ok(files.has(join("core_data", "panos_fw1.example.com.json")));
-  assertSecretsAbsent(assert, files, secrets, "bundle directory");
+  assertNoSecretWindows(files, secrets, "bundle directory");
   const zipEntries = readZipEntries(result.zipPath);
   assert.equal(zipEntries.size, files.size, "the zip carries exactly the written files");
   assert.ok(zipEntries.has("core_data/panos_fw1.example.com.json"));
-  assertSecretsAbsent(assert, zipEntries, secrets, "zip archive");
+  assertNoSecretWindows(zipEntries, secrets, "zip archive");
 
   const device = JSON.parse(files.get(join("core_data", "panos_fw1.example.com.json")));
   // config is keyed by the xpath each subtree was read from.
@@ -1162,13 +1211,14 @@ test("exportPaloaltoAuditBundle never writes PAN-OS credentials into the bundle 
 // ---------------------------------------------------------------------------
 
 // Canary values that must never survive into any probe, finding, summary, tool result, or
-// bundle file. No two share an 8-character window, so a leaked fragment is attributable.
-const CANARY_BEARER = "CANARY-BEARER-9f8e7d6c5b4a3210";
-const CANARY_SESSION = "CANARY-SESSION-0a1b2c3d4e5f6789";
-const CANARY_API_KEY = "CANARY-APIKEY-1122334455667788";
-const CANARY_URL_TOKEN = "CANARY-URLTOKEN-99aa88bb77cc66dd";
-// Name-shaped (one digit group per segment), so bare in prose it would stay: only the
-// carrier it travels in (a session assignment) removes it.
+// bundle file: random-looking alphanumerics, no two sharing a 6-character window, so a
+// leaked window is attributable (see the window rule above).
+const CANARY_BEARER = "Y3KOw754qXNCFl6eEmUidR";
+const CANARY_SESSION = "Lw9Ocoh3eXVTsqQ4gC2c1f";
+const CANARY_API_KEY = "2L6QMbn3y1GfaHnnWdnTaU";
+const CANARY_URL_TOKEN = "aFz86YMxEqbb0D6TxXN30I";
+// Name-shaped (one digit group per segment, the ruling's own example), so bare in prose it
+// would stay: only the carrier it travels in (a session assignment) removes it.
 const CANARY_NAMED = "sess-canary-COOKIE-31415926535897";
 const CANARIES = [CANARY_BEARER, CANARY_SESSION, CANARY_API_KEY, CANARY_URL_TOKEN, CANARY_NAMED];
 const CANARY_URL = `https://api.example.com/v1/x?token=${CANARY_URL_TOKEN}`;
@@ -1179,19 +1229,17 @@ function escapeRegExp(text) {
   return text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
-// Neither the canary nor any window of `windowSize` characters of it may survive, so a
-// partial echo (a slice, a split token) is attributable to the canary it came from.
-function assertNoWindow(text, canary, windowSize, label) {
-  assert.ok(!text.includes(canary), `${label}: ${canary} leaked`);
-  for (let index = 0; index + windowSize <= canary.length; index += 1) {
-    const fragment = canary.slice(index, index + windowSize);
-    assert.ok(!text.includes(fragment), `${label}: fragment ${fragment} of ${canary} leaked`);
-  }
+function assertNoCanary(text, label, canaries = CANARIES) {
+  for (const canary of canaries) assertNoWindow(text, canary, label);
 }
 
-function assertNoCanary(text, label, canaries = CANARIES) {
-  for (const canary of canaries) assertNoWindow(text, canary, 8, label);
-}
+// Every planted credential of this fixture. The deliberate exceptions to the alphanumeric
+// shape are the name-shaped values that prove the configured-secret pass and the carrier
+// rules run on their own (hyphenated words with one digit group), the Slack path (the
+// documented T/B/secret shape, the whole path being the secret), and the PAN-OS password
+// (every character class an encoding changes).
+const PLANTED_CREDENTIALS = [...Object.values(LOADER_CANARIES), ...CANARIES, ...Object.values(FAKE_PANOS_SECRETS), ...Object.values(FAKE_PRISMA_SECRETS), FIXTURE_SECRET_KEY, FIXTURE_PANOS_PASSWORD];
+const SHAPED_CREDENTIALS = new Set([CANARY_NAMED, FIXTURE_SECRET_KEY, FAKE_PRISMA_SECRETS.slackWebhookPath, FIXTURE_PANOS_PASSWORD]);
 
 // A proxy or load balancer error page: HTML with header lines and a URL carrying a token.
 // Retry-After is tiny so clients that do retry 5xx responses do so without waiting.
@@ -1272,8 +1320,8 @@ test("redaction helpers scrub credential-shaped text, JSON pairs, URL credential
     "empty credential values stay empty rather than claiming a redacted value",
   );
   for (const secret of Object.values(FAKE_PRISMA_SECRETS)) {
-    assert.ok(!JSON.stringify(redacted).includes(secret), `${secret} leaked from integrations`);
-    assert.ok(!JSON.stringify(compute).includes(secret), `${secret} leaked from the Compute snapshot`);
+    assertNoWindow(JSON.stringify(redacted), secret, "integrations");
+    assertNoWindow(JSON.stringify(compute), secret, "Compute snapshot");
   }
 });
 
@@ -1330,7 +1378,7 @@ test("scrub boundary: name-shaped values stay bare in prose, leave every carrier
       for (const scrub of [redactErrorText, redactCredentialValueText]) {
         const out = scrub(text);
         assert.match(out, expected, `${scrub.name}(${JSON.stringify(text)}) -> ${JSON.stringify(out)}`);
-        assertNoWindow(out, value, 6, `${scrub.name} ${text}`);
+        assertNoWindow(out, value, `${scrub.name} ${text}`);
         assert.equal(scrub(out), out, `${scrub.name} is idempotent on ${out}`);
       }
     }
@@ -1442,20 +1490,19 @@ test("no window of a carried or configured canary survives, for every canary len
     const characters = Array.from({ length }, () => alphabet[next() % alphabet.length]);
     characters[Math.floor(length / 2)] = String(next() % 10);
     const canary = characters.join("");
-    const window = Math.min(6, length);
     for (const input of [
       `Authorization: Bearer ${canary}`, `Cookie: sid=${canary}`, `X-Api-Key: ${canary}`, `?token=${canary}`, `&key=${canary}&cmd=x`,
       `password=${canary}`, `"api_key":"${canary}"`, `key="${canary}"`, `Basic ${canary}`, `https://u:${canary}@h.example.com/`,
     ]) {
       assert.ok(input.includes(canary), "fixture self-check");
       for (const scrub of [redactErrorText, redactCredentialValueText]) {
-        assertNoWindow(scrub(input), canary, window, `${scrub.name} length ${length}: ${input}`);
+        assertNoWindow(scrub(input), canary, `${scrub.name} length ${length}: ${input}`);
       }
     }
     const configured = `value ${canary} shown`;
     assert.ok(configured.includes(canary), "fixture self-check");
     assert.equal(redactSecrets(configured, [canary]), "value [REDACTED] shown", `configured length ${length}`);
-    for (const form of secretForms(canary)) assertNoWindow(redactConfiguredSecrets(`v ${form} w`, [canary]), form, window, `form ${form}`);
+    for (const form of secretForms(canary)) assertNoWindow(redactConfiguredSecrets(`v ${form} w`, [canary]), form, `form ${form}`);
   }
 });
 
@@ -1550,10 +1597,10 @@ test("exportPaloaltoAuditBundle and the assessment results never carry Prisma Cl
   assert.equal(result.errorCount, 0);
 
   const files = readBundleFiles(result.outputDir);
-  assertSecretsAbsent(assert, files, secrets, "bundle directory");
+  assertNoSecretWindows(files, secrets, "bundle directory");
   const zipEntries = readZipEntries(result.zipPath);
   assert.equal(zipEntries.size, files.size);
-  assertSecretsAbsent(assert, zipEntries, secrets, "zip archive");
+  assertNoSecretWindows(zipEntries, secrets, "zip archive");
 
   const prisma = JSON.parse(files.get(join("core_data", "prisma_cloud.json")));
   const integration = (name) => prisma.integrations.find((item) => item.name === name).integrationConfig;
@@ -1592,7 +1639,7 @@ test("exportPaloaltoAuditBundle and the assessment results never carry Prisma Cl
   // The same redacted snapshot feeds every assessment result the tools spread into their payloads.
   const access = await checkPaloaltoAccess(clients);
   const payloads = [access, await assessPaloaltoCloudPosture(clients), await assessPaloaltoThreatPrevention(clients), await assessPaloaltoDeviceHardening(clients)];
-  for (const payload of payloads) assertSecretsAbsent(assert, new Map([["payload", JSON.stringify(payload)]]), secrets, payload.title ?? "access check");
+  for (const payload of payloads) assertNoSecretWindows(new Map([["payload", JSON.stringify(payload)]]), secrets, payload.title ?? "access check");
 });
 
 // ---------------------------------------------------------------------------
@@ -1683,6 +1730,41 @@ test("the two-device keygen sweep fixture is healthy before the canary sweep rel
   }
 });
 
+test("fixture self-check: planted credentials are alphanumeric and random-looking, share no 6-character window with each other, and no 6-character window of any occurs in the fixtures' legitimate text", async () => {
+  const owners = new Map();
+  for (const value of PLANTED_CREDENTIALS) {
+    assert.ok(value.length >= LEAK_WINDOW_MIN, `${value} is too short to carry a window`);
+    if (!SHAPED_CREDENTIALS.has(value)) {
+      assert.match(value, /^[A-Za-z0-9]+$/, `${value} is not alphanumeric`);
+      assert.ok((value.match(/\d/g) ?? []).length >= 2 && (value.match(/[A-Za-z]/g) ?? []).length >= 4, `${value} does not look random`);
+    }
+    assert.doesNotMatch(value, /(.)\1\1/, `${value} repeats a character three times`);
+    for (const window of sixWindows(value)) {
+      const owner = owners.get(window);
+      assert.ok(owner === undefined || owner === value, `${value} shares the window ${window} with ${owner}`);
+      owners.set(window, value);
+    }
+  }
+
+  // Legitimate text: everything the healthy fixtures render (the access check and every
+  // bundle file, which carry no marker), plus everything the secret-bearing fixtures render
+  // with the planted values themselves removed, so what remains is the fixtures' ordinary
+  // vocabulary: names, hosts, xpaths, ids, dates, and this module's own wording.
+  const healthy = createPaloaltoClients(sweepConfig(), sweepFetch("none", () => htmlCanaryResponse()));
+  const corpus = [JSON.stringify(await checkPaloaltoAccess(healthy))];
+  for (const text of readBundleFiles((await exportPaloaltoAuditBundle(healthy, createTempBase("grclanker-paloalto-self-check-"))).outputDir).values()) corpus.push(text);
+  const planted = createPaloaltoClients(bothProductsConfig(), mockedFetch({ withSecrets: true }));
+  corpus.push(JSON.stringify(await checkPaloaltoAccess(planted)));
+  for (const text of readBundleFiles((await exportPaloaltoAuditBundle(planted, createTempBase("grclanker-paloalto-self-check-planted-"))).outputDir).values()) {
+    corpus.push(PLANTED_CREDENTIALS.reduce((rest, value) => rest.split(value).join(""), text));
+  }
+  const legitimate = corpus.join("\n");
+  assert.ok(legitimate.length > 10_000, "the legitimate corpus is not empty");
+  for (const value of PLANTED_CREDENTIALS) {
+    for (const window of sixWindows(value)) assert.ok(!legitimate.includes(window), `window ${window} of ${value} occurs in legitimate fixture text`);
+  }
+});
+
 // The failing surface echoes the configured secrets of its own product in every form a
 // server might reflect them: as is, JSON-escaped, URL-encoded, base64, and base64url. The
 // Prisma Cloud secret key is name-shaped, so nothing but the configured-secret pass can
@@ -1703,7 +1785,7 @@ test("a documented error field is scrubbed of the configured secrets before it i
     const fetchImpl = async () => jsonResponse({ message }, { status: 400, statusText: "Bad Request" });
     const client = new PrismaCloudClient({ apiUrl: "https://api2.prismacloud.io", accessKeyId: "k", secretKey: FIXTURE_SECRET_KEY }, { fetchImpl, sleepImpl: noSleep });
     await assert.rejects(client.get("/v2/policy"), (error) => {
-      assertNoWindow(error.message, form, 8, `straddling ${form}`);
+      assertNoWindow(error.message, form, `straddling ${form}`);
       assert.match(error.message, /x{20,} \[REDACTED\]/, error.message);
       return true;
     });

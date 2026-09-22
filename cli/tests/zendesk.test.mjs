@@ -53,7 +53,7 @@ function createTempBase(prefix) {
 // The configured API token of the fixtures, which only the configured-secret pass
 // (guard 2) removes: it is deliberately name-shaped, so bare in prose no carrier or
 // token-shape rule touches it and its absence proves that pass ran. Its words appear
-// nowhere in the module's own vocabulary, and no 8-character window of it does either
+// nowhere in the module's own vocabulary, and no 6-character window of it does either
 // (source_chain renders "api-token:environment", so "api-token" is out).
 const FIXTURE_API_TOKEN = "fixture-teal-harbor-2026";
 // The composed Basic credential the client sends for the fixture configuration.
@@ -62,6 +62,55 @@ const FIXTURE_BASIC_CREDENTIAL = Buffer.from(`auditor@example.com/token:${FIXTUR
 // The forms a configured secret can be echoed in: as is, JSON-escaped, URL-encoded, base64, base64url.
 function secretForms(value) {
   return [...new Set([value, JSON.stringify(value).slice(1, -1), encodeURIComponent(value), Buffer.from(value).toString("base64"), Buffer.from(value).toString("base64url")])];
+}
+
+// The window rule (addendum 8): every leak assertion against a planted credential checks
+// the whole value and every window of it from LEAK_WINDOW_MIN to LEAK_WINDOW_MAX characters,
+// so a partial echo (the 10-character window JSON.parse quotes, a token cut by a length cap,
+// the head of a base64 form split by a marker) cannot pass. The planted values are alphanumeric
+// and random-looking, and the fixture self-check below proves that no 6-character window of
+// any of them occurs in the fixtures' legitimate text, so every failure is a real leak.
+const LEAK_WINDOW_MIN = 6;
+const LEAK_WINDOW_MAX = 24;
+const leakWindowCache = new Map();
+
+// The whole value plus every window of LEAK_WINDOW_MIN to LEAK_WINDOW_MAX characters, longest
+// first so a failure names the largest fragment that survived, and the shortest windows on
+// their own: a longer window contains its own first LEAK_WINDOW_MIN characters, so every
+// window is absent exactly when the whole value and every shortest window are.
+function leakWindows(canary) {
+  let entry = leakWindowCache.get(canary);
+  if (entry === undefined) {
+    const all = [canary];
+    for (let size = Math.min(LEAK_WINDOW_MAX, canary.length - 1); size >= LEAK_WINDOW_MIN; size -= 1) {
+      for (let index = 0; index + size <= canary.length; index += 1) all.push(canary.slice(index, index + size));
+    }
+    const shortest = Math.min(LEAK_WINDOW_MIN, canary.length);
+    entry = { all: [...new Set(all)], probes: [...new Set(all.filter((window) => window.length === shortest))] };
+    leakWindowCache.set(canary, entry);
+  }
+  return entry;
+}
+
+// Neither the canary nor any window of it from 6 to 24 characters may survive in the text.
+function assertNoWindow(text, canary, label) {
+  const { all, probes } = leakWindows(canary);
+  if (!probes.some((probe) => text.includes(probe))) return;
+  const leaked = all.find((window) => text.includes(window));
+  assert.fail(leaked === canary ? `${label}: ${canary} leaked` : `${label}: window ${leaked} of ${canary} leaked`);
+}
+
+// Every bundle file or zip entry against every planted secret: the shared whole-value scan, then every window.
+function assertNoSecretWindows(contents, secrets, label) {
+  assertSecretsAbsent(assert, contents, secrets, label);
+  for (const [name, text] of contents) {
+    for (const secret of secrets) assertNoWindow(text, secret, `${label} ${name}`);
+  }
+}
+
+// The 6-character windows of a planted value (the value itself when shorter), for the fixture self-check.
+function sixWindows(value) {
+  return leakWindows(value).probes;
 }
 
 function sampleConfig(overrides = {}) {
@@ -507,7 +556,7 @@ test("resolveZendeskConfiguration selects auth mode and rejects incomplete crede
   assert.throws(() => resolveZendeskConfiguration({}, { ZENDESK_SUBDOMAIN: "bad domain!", ZENDESK_OAUTH_TOKEN: "x" }, base), /Invalid Zendesk subdomain/);
 });
 
-// Config loader canaries: no two share an 8-character window, so any fragment a parser
+// Config loader canaries: no two share a 6-character window, so any fragment a parser
 // quotes from the file is attributable to one fixture. The short canary keeps the JSON
 // short file at 20 characters, within the size at which JSON.parse quotes the whole source.
 const LOADER_CANARIES = {
@@ -521,13 +570,7 @@ const LOADER_CANARIES = {
 const LIBRARY_ERROR_WORDING = ["Nested mappings", "is not valid JSON", "Unresolved alias", "illegal operation", "permission denied", "Unexpected token", "Expected ',' or '}'"];
 
 function assertNoLoaderLeak(text, canaries, label) {
-  for (const canary of canaries) {
-    assert.ok(!text.includes(canary), `${label}: canary ${canary} leaked into: ${text}`);
-    for (let index = 0; index + 8 <= canary.length; index += 1) {
-      const fragment = canary.slice(index, index + 8);
-      assert.ok(!text.includes(fragment), `${label}: canary fragment ${fragment} leaked into: ${text}`);
-    }
-  }
+  for (const canary of canaries) assertNoWindow(text, canary, `${label} (${text})`);
   for (const wording of LIBRARY_ERROR_WORDING) {
     assert.ok(!text.includes(wording), `${label}: library wording "${wording}" leaked into: ${text}`);
   }
@@ -849,7 +892,7 @@ test("ZendeskApiClient surfaces API errors with status codes and redacts secrets
     assert.ok(error instanceof ZendeskApiError);
     assert.equal(error.status, 403);
     assert.match(error.message, /403/);
-    assert.ok(!error.message.includes(FIXTURE_API_TOKEN), error.message);
+    assertNoWindow(error.message, FIXTURE_API_TOKEN, "keygen-style denial");
     assert.match(error.message, /token \[REDACTED\] was rejected/, "a name-shaped configured secret bare in prose is removed by the configured-secret pass alone");
     return true;
   });
@@ -1671,7 +1714,7 @@ test("exportZendeskAuditBundle writes the bundle layout, archive, and never over
   assert.match(executive, /Subdomain: acme/);
   assert.match(executive, /## Manual Evidence Required/);
   const rawSettings = readFileSync(join(first.outputDir, "core_data/account_settings.json"), "utf8");
-  assert.ok(!rawSettings.includes(FIXTURE_API_TOKEN));
+  assertNoWindow(rawSettings, FIXTURE_API_TOKEN, "core_data/account_settings.json");
 
   const second = await exportZendeskAuditBundle(healthyClient(), config, base, { now: () => NOW });
   assert.notEqual(second.outputDir, first.outputDir);
@@ -1683,34 +1726,38 @@ test("exportZendeskAuditBundle writes the bundle layout, archive, and never over
 });
 
 // Fake credential values Zendesk list endpoints can return verbatim; none may reach a bundle.
+// Random-looking alphanumerics (see the window rule above). The Bearer and Basic schemes
+// of the header-valued settings are composed where the fixture uses them, since a scheme
+// name is legitimate text the scrubbed output keeps; the Slack path keeps the documented
+// T.../B.../... shape because the whole path is the secret.
 const FAKE_ZENDESK_SECRETS = {
-  fullToken: "zd-full-token-fake-0123456789abcdefghijklmnopqrstuvwxyz",
-  tokenPrefix: "zdtok-fake1",
-  refreshToken: "zd-refresh-token-fake-0123456789abcdef",
-  clientSecret: "zd-client-secret-fake-0123456789abcdef",
-  webhookBearer: "zd-webhook-bearer-fake-0123456789",
-  webhookApiKeyValue: "zd-webhook-api-key-value-fake",
-  signingSecret: "zd-signing-secret-fake-0123456789",
-  targetPassword: "zd-target-password-fake",
-  targetToken: "zd-target-token-fake-0123456789",
-  appApiKey: "zd-app-setting-api-key-fake",
-  appApiKeyCamel: "zd-app-setting-apiKey-camel-fake",
-  appClientSecretCamel: "zd-app-setting-clientSecret-camel-fake",
-  appRefreshTokenCamel: "zd-app-setting-refreshToken-camel-fake",
-  appAccessTokenCamel: "zd-app-setting-accessToken-camel-fake",
-  appAuthorizationHeader: "Bearer zd-app-setting-authorization-header-fake",
-  appXApiKeyHeader: "zd-app-setting-x-api-key-header-fake",
-  webhookCustomHeaderAuthorization: "Basic zd-webhook-custom-header-authorization-fake",
-  webhookCustomHeaderApiKey: "zd-webhook-custom-header-x-api-key-fake",
-  webhookCustomHeaderPlain: "zd-webhook-custom-header-plain-value-fake",
+  fullToken: "Mducb0QASQv3Ugw3wqZ21sZXWBc5ITociTOs5dcY",
+  tokenPrefix: "Q7l0gnUa1JE",
+  refreshToken: "jgf1W64hNNx9ke1OPzMZVU",
+  clientSecret: "MHFLILdUP1k7O2mIk7F4QL",
+  webhookBearer: "9MrdWdDal0Ldb8OR42Ralm",
+  webhookApiKeyValue: "fG8Y1Kg3zFnbHPqBRx6S1j",
+  signingSecret: "s1cZ1rG1ghdksri9b59ZD3",
+  targetPassword: "7f654gQ0nPLsqTXNMMyqtN",
+  targetToken: "jK83AxM1mN8VeQdSsFhvI6",
+  appApiKey: "ecLDZ7wK81IOa6WmUeZu25",
+  appApiKeyCamel: "DEV0MWVDG3ENLxn9MHYvM3",
+  appClientSecretCamel: "LGt33E2k18gewfyCqTGlRi",
+  appRefreshTokenCamel: "UdJ9SQ3o7EilvPZTNQt6f5",
+  appAccessTokenCamel: "Rs1O7EhdcCddVrl6dqlc4v",
+  appAuthorizationBearer: "lPvjw2zeivXec02ucgj0Ax",
+  appXApiKeyHeader: "fEOwyslS3SCop1Dnk99SME",
+  webhookCustomHeaderBasic: "eyEWii6APMwZCVD2GUSj51",
+  webhookCustomHeaderApiKey: "TMeDd3BKQgw6FrtK3HQ94H",
+  webhookCustomHeaderPlain: "iXdO3DeUVgMF7msDNb9G6Y",
   // Credentials carried inside URL and free-text string values rather than under a credential key.
-  targetUrlQueryToken: "zd-target-url-query-token-fake-0123456789",
-  webhookUserinfoPassword: "zd-webhook-userinfo-password-fake-0123",
-  redirectUriClientSecret: "zd-redirect-uri-client-secret-fake-0123",
-  slackWebhookPath: "T0FAKE0000/B0FAKE0000/zdSlackWebhookPathFake0123456789",
-  ownedAppParameterToken: "zd-owned-app-parameter-api-token-fake",
-  ownedAppSecureDefault: "zd-owned-app-secure-parameter-default-fake",
-  jsonEncodedSettingToken: "zd-json-encoded-setting-token-fake",
+  targetUrlQueryToken: "1Ea9sLRnJ4beGrDd6EAyOa",
+  webhookUserinfoPassword: "gKmD93ySVYQ0j8YqAVky65",
+  redirectUriClientSecret: "pAO1eEu7rf1wU7JgfwroI0",
+  slackWebhookPath: "T0K4CKLY1/B0WAF22EB/6swF2tmycU3qGVob6teeP7",
+  ownedAppParameterToken: "NtCeeftEa9id8Zaw3Y3yLk",
+  ownedAppSecureDefault: "s0nlpo2iHGUIZxhQQ9rW4P",
+  jsonEncodedSettingToken: "mjDAS07t0Z1n9lwnyFLaPh",
 };
 
 // Header names that must survive redaction as keys or name fields.
@@ -1730,7 +1777,7 @@ function secretBearingClient(overrides = {}) {
     },
     async listWebhooks() {
       return list([
-        { id: "wh1", name: "Pager", status: "active", endpoint: "https://hooks.example.com/zendesk", authentication: { type: "bearer_token", add_position: "header", data: { token: FAKE_ZENDESK_SECRETS.webhookBearer } }, custom_headers: { Authorization: FAKE_ZENDESK_SECRETS.webhookCustomHeaderAuthorization, "X-Tenant": FAKE_ZENDESK_SECRETS.webhookCustomHeaderPlain } },
+        { id: "wh1", name: "Pager", status: "active", endpoint: "https://hooks.example.com/zendesk", authentication: { type: "bearer_token", add_position: "header", data: { token: FAKE_ZENDESK_SECRETS.webhookBearer } }, custom_headers: { Authorization: `Basic ${FAKE_ZENDESK_SECRETS.webhookCustomHeaderBasic}`, "X-Tenant": FAKE_ZENDESK_SECRETS.webhookCustomHeaderPlain } },
         { id: "wh2", name: "SIEM", status: "active", endpoint: "https://siem.example.com/ingest", authentication: { type: "api_key", add_position: "header", data: { name: "X-Api-Key", value: FAKE_ZENDESK_SECRETS.webhookApiKeyValue } }, signing_secret: { algorithm: "SHA256", secret: FAKE_ZENDESK_SECRETS.signingSecret }, custom_headers: [{ name: "X-Api-Key", value: FAKE_ZENDESK_SECRETS.webhookCustomHeaderApiKey }] },
         { id: "wh3", name: "Relay", status: "active", endpoint: `https://relay:${FAKE_ZENDESK_SECRETS.webhookUserinfoPassword}@relay.example.com/ingest`, authentication: { type: "basic_auth", add_position: "header", data: { username: "relay", password: FAKE_ZENDESK_SECRETS.targetPassword } } },
       ]);
@@ -1774,7 +1821,7 @@ function secretBearingClient(overrides = {}) {
             refreshToken: FAKE_ZENDESK_SECRETS.appRefreshTokenCamel,
             accessToken: FAKE_ZENDESK_SECRETS.appAccessTokenCamel,
             tokenExpiresAt: "2027-01-01T00:00:00Z",
-            Authorization: FAKE_ZENDESK_SECRETS.appAuthorizationHeader,
+            Authorization: `Bearer ${FAKE_ZENDESK_SECRETS.appAuthorizationBearer}`,
             "X-Api-Key": FAKE_ZENDESK_SECRETS.appXApiKeyHeader,
             username: "crm-sync@example.com",
             scopes: "read write",
@@ -1851,7 +1898,7 @@ test("assessZendeskAccessControl never retains OAuth token values in its snapsho
   const result = await assessZendeskAccessControl(secretBearingClient(), { now: () => NOW });
   const text = JSON.stringify(result);
   for (const secret of [FAKE_ZENDESK_SECRETS.fullToken, FAKE_ZENDESK_SECRETS.tokenPrefix, FAKE_ZENDESK_SECRETS.refreshToken, FAKE_ZENDESK_SECRETS.clientSecret]) {
-    assert.ok(!text.includes(secret), `${secret} leaked into the assessment result`);
+    assertNoWindow(text, secret, "assessment result");
   }
   const [token] = result.snapshots.oauth_tokens.items;
   assert.equal(token.token, "[REDACTED]");
@@ -1880,11 +1927,11 @@ test("exportZendeskAuditBundle never writes OAuth tokens, client secrets, or web
   for (const relativePath of ["core_data/oauth_tokens.json", "core_data/oauth_clients.json", "core_data/webhooks.json", "core_data/targets.json", "core_data/app_installations.json", "analysis/access-control.json", "analysis/integrations.json"]) {
     assert.ok(files.has(join(...relativePath.split("/"))), `expected ${relativePath}`);
   }
-  assertSecretsAbsent(assert, files, secrets, "bundle directory");
+  assertNoSecretWindows(files, secrets, "bundle directory");
   const zipEntries = readZipEntries(result.zipPath);
   assert.equal(zipEntries.size, files.size, "the zip carries exactly the written files");
   assert.ok(zipEntries.has("core_data/oauth_tokens.json"));
-  assertSecretsAbsent(assert, zipEntries, secrets, "zip archive");
+  assertNoSecretWindows(zipEntries, secrets, "zip archive");
 
   const tokens = JSON.parse(files.get(join("core_data", "oauth_tokens.json")));
   assert.deepEqual(tokens.items[0], {
@@ -2090,16 +2137,6 @@ test("redactErrorText and describeErrorBody scrub credential-shaped text regardl
 // ---------------------------------------------------------------------------
 const NAME_SHAPED_VALUES = ["prod-us-east-2026", "fw-dc1-01", "sess-canary-COOKIE-31415926535897", "my-bucket-prod-2026-logs", "3f2b1c9e-8a7d-4e6f-9b0a-1c2d3e4f5a6b"];
 
-// Neither the canary nor any window of `windowSize` characters of it may survive, so a
-// partial echo (a slice, a split token) is attributable to the canary it came from.
-function assertNoWindow(text, canary, windowSize, label) {
-  assert.ok(!text.includes(canary), `${label}: ${canary} leaked`);
-  for (let index = 0; index + windowSize <= canary.length; index += 1) {
-    const fragment = canary.slice(index, index + windowSize);
-    assert.ok(!text.includes(fragment), `${label}: fragment ${fragment} of ${canary} leaked`);
-  }
-}
-
 // Every carrier of the ruling with the value in it, and the exact rendering after the scrub.
 function carriersOf(value) {
   return [
@@ -2144,7 +2181,7 @@ test("scrub boundary: name-shaped values stay bare in prose, leave every carrier
       for (const scrub of [redactErrorText, redactCredentialValueText]) {
         const out = scrub(text);
         assert.match(out, expected, `${scrub.name}(${JSON.stringify(text)}) -> ${JSON.stringify(out)}`);
-        assertNoWindow(out, value, 6, `${scrub.name} ${text}`);
+        assertNoWindow(out, value, `${scrub.name} ${text}`);
         assert.equal(scrub(out), out, `${scrub.name} is idempotent on ${out}`);
       }
     }
@@ -2265,11 +2302,11 @@ test("no window of a carried or configured canary survives, for every canary len
       const value = canary(length);
       for (const [text] of carriersOf(value)) {
         for (const scrub of [redactErrorText, redactCredentialValueText]) {
-          assertNoWindow(scrub(text), value, Math.min(6, length), `${scrub.name} ${text}`);
+          assertNoWindow(scrub(text), value, `${scrub.name} ${text}`);
         }
       }
       for (const form of secretForms(value)) {
-        assertNoWindow(redactSecrets(`upstream echoed ${form} in a ${length}-character reply`, [value]), value, Math.min(6, length), `configured ${value} as ${form}`);
+        assertNoWindow(redactSecrets(`upstream echoed ${form} in a ${length}-character reply`, [value]), value, `configured ${value} as ${form}`);
       }
     }
   }
@@ -2295,6 +2332,39 @@ test("the healthy bundle is fixed text the scrubs leave untouched, so every mark
   }
 });
 
+test("fixture self-check: planted credentials are alphanumeric and random-looking, share no 6-character window with each other, and no 6-character window of any occurs in the fixtures' legitimate text", async () => {
+  const owners = new Map();
+  for (const value of PLANTED_CREDENTIALS) {
+    assert.ok(value.length >= LEAK_WINDOW_MIN, `${value} is too short to carry a window`);
+    if (!SHAPED_CREDENTIALS.has(value)) {
+      assert.match(value, /^[A-Za-z0-9]+$/, `${value} is not alphanumeric`);
+      assert.ok((value.match(/\d/g) ?? []).length >= 2 && (value.match(/[A-Za-z]/g) ?? []).length >= 4, `${value} does not look random`);
+    }
+    assert.doesNotMatch(value, /(.)\1\1/, `${value} repeats a character three times`);
+    for (const window of sixWindows(value)) {
+      const owner = owners.get(window);
+      assert.ok(owner === undefined || owner === value, `${value} shares the window ${window} with ${owner}`);
+      owners.set(window, value);
+    }
+  }
+
+  // Legitimate text: everything the healthy fixture renders (the access check, every
+  // assessment, and every bundle file), plus everything the secret-bearing fixture renders
+  // with the planted values themselves removed, so what remains is the fixture's ordinary
+  // vocabulary: names, hosts, URLs, ids, dates, and this module's own wording.
+  const corpus = [];
+  for (const client of [healthyClient(), secretBearingClient()]) {
+    corpus.push(JSON.stringify(await checkZendeskAccess(client)), JSON.stringify(await runAllAssessments(client)));
+    const bundle = await exportZendeskAuditBundle(client, sampleConfig(), createTempBase("grclanker-zendesk-self-check-"), { now: () => NOW });
+    for (const text of readBundleFiles(bundle.outputDir).values()) corpus.push(text);
+  }
+  const legitimate = PLANTED_CREDENTIALS.reduce((rest, value) => rest.split(value).join(""), corpus.join("\n"));
+  assert.ok(legitimate.length > 10_000, "the legitimate corpus is not empty");
+  for (const value of PLANTED_CREDENTIALS) {
+    for (const window of sixWindows(value)) assert.ok(!legitimate.includes(window), `window ${window} of ${value} occurs in legitimate fixture text`);
+  }
+});
+
 test("a documented error field is scrubbed of the configured secrets before it is shortened, so the 200-character cut never leaves a fragment of a secret", async () => {
   const forms = [...secretForms(FIXTURE_API_TOKEN), ...secretForms(FIXTURE_BASIC_CREDENTIAL)];
   for (const form of forms) {
@@ -2304,22 +2374,24 @@ test("a documented error field is scrubbed of the configured secrets before it i
     const fetchImpl = async () => jsonResponse({ error: "Forbidden", description }, { status: 403, statusText: "Forbidden" });
     const client = new ZendeskApiClient(sampleConfig(), { fetchImpl, sleep: async () => {} });
     await assert.rejects(client.getAccountSettings(), (error) => {
-      assertNoWindow(error.message, form, 8, `straddling ${form}`);
+      assertNoWindow(error.message, form, `straddling ${form}`);
       assert.match(error.message, /403 Forbidden; Forbidden; x{20,} \[REDACTED\]/, error.message);
       return true;
     });
   }
 });
 
-// Canary values that must never survive into any tool result, finding, summary, or bundle file.
-const CANARY_BEARER = "CANARY-BEARER-9f8e7d6c5b4a3210";
-const CANARY_SESSION = "CANARY-SESSION-0a1b2c3d4e5f6789";
-const CANARY_API_KEY = "CANARY-APIKEY-1122334455667788";
-const CANARY_URL_TOKEN = "CANARY-URLTOKEN-99aa88bb77cc66dd";
+// Canary values that must never survive into any tool result, finding, summary, or bundle
+// file: random-looking alphanumerics, no two sharing a 6-character window, so a leaked
+// window is attributable (see the window rule above).
+const CANARY_BEARER = "2N6iyPTaI1DOHyaG2LG5Rw";
+const CANARY_SESSION = "oO3RNP3mUoKn8dhyFj1bw1";
+const CANARY_API_KEY = "18F0CMC68hClk3TW4foXVF";
+const CANARY_URL_TOKEN = "P3GfdBos2IChWd8L1EAbNz";
 // A name-shaped value (the ruling's own example) that only its carrier, a cookie
 // assignment, gives away, and a plain lowercase word that only the Bearer scheme does.
 const CANARY_NAMED = "sess-canary-COOKIE-31415926535897";
-const CANARY_PLAIN = "canaryplainbearerword";
+const CANARY_PLAIN = "jdvdnheoejphwk";
 const CANARIES = [CANARY_BEARER, CANARY_SESSION, CANARY_API_KEY, CANARY_URL_TOKEN, CANARY_NAMED, CANARY_PLAIN];
 const CANARY_URL = `https://api.example.com/v1/x?token=${CANARY_URL_TOKEN}`;
 // The scrubbed rendering of the JSON canary sentence, as every error string must carry it.
@@ -2352,8 +2424,16 @@ function echoedSecretsResponse() {
 }
 
 function assertNoCanary(text, label, canaries = CANARIES) {
-  for (const canary of canaries) assertNoWindow(text, canary, 8, label);
+  for (const canary of canaries) assertNoWindow(text, canary, label);
 }
+
+// Every planted credential of this fixture. The deliberate exceptions to the alphanumeric
+// shape are the name-shaped values that prove the configured-secret pass and the carrier
+// rules run on their own (hyphenated words with one digit group), the plain lowercase word
+// that only the Bearer scheme gives away, and the Slack path (the documented T/B/secret
+// shape, the whole path being the secret).
+const PLANTED_CREDENTIALS = [...Object.values(LOADER_CANARIES), ...CANARIES, ...Object.values(FAKE_ZENDESK_SECRETS), FIXTURE_API_TOKEN];
+const SHAPED_CREDENTIALS = new Set([CANARY_NAMED, CANARY_PLAIN, FIXTURE_API_TOKEN, FAKE_ZENDESK_SECRETS.slackWebhookPath]);
 
 // Every HTTP surface ZendeskApiClient reads, keyed by path (the three /audit_logs reads are
 // distinguished by their query), served from the same fixtures as healthyClient().
@@ -2448,7 +2528,7 @@ test("error-body canary sweep: every Zendesk surface failing with an HTML 502 or
     for (const surface of surfaces) {
       const label = `${shape.name} on ${surface}`;
       const client = httpClient(routes, surface, shape.make);
-      const assertNoCanary = (text, where) => { for (const canary of shape.canaries) assertNoWindow(text, canary, 8, `${where}`); };
+      const assertNoCanary = (text, where) => { for (const canary of shape.canaries) assertNoWindow(text, canary, `${where}`); };
 
       const access = await checkZendeskAccess(client);
       assertNoCanary(JSON.stringify(access), `${label} access check`);
@@ -2481,8 +2561,8 @@ test("error-body canary sweep: every Zendesk surface failing with an HTML 502 or
       const files = readBundleFiles(bundle.outputDir);
       const zipEntries = readZipEntries(bundle.zipPath);
       assert.ok(files.size >= 15 && zipEntries.size === files.size, `${label}: bundle and zip were written`);
-      assertSecretsAbsent(assert, files, shape.canaries, `${label} bundle`);
-      assertSecretsAbsent(assert, zipEntries, shape.canaries, `${label} zip`);
+      assertNoSecretWindows(files, shape.canaries, `${label} bundle`);
+      assertNoSecretWindows(zipEntries, shape.canaries, `${label} zip`);
       for (const [name, content] of files) assertNoCanary(content, `${label} ${name}`);
       const errorLog = files.get("_errors.log");
       assert.ok(errorLog !== undefined, `${label}: _errors.log must exist`);
@@ -2538,7 +2618,7 @@ test("the registered tools scrub error strings end to end over HTTP: access chec
     ]) {
       failing.clear();
       for (const surface of shape.surfaces) failing.set(surface, shape.make);
-      const noCanary = (text, where) => { for (const canary of shape.canaries) assertNoWindow(text, canary, 8, where); };
+      const noCanary = (text, where) => { for (const canary of shape.canaries) assertNoWindow(text, canary, where); };
       const expectedProbes = shape.surfaces.map((surface) => failingSurfaces[surface]).sort();
 
       const access = await run("zendesk_check_access");

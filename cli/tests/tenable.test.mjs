@@ -49,23 +49,63 @@ writeFileSync(EMPTY_CONFIG_FILE, "");
 // The configured API keys of the fixtures, which only the configured-secret pass (guard 2)
 // removes: they are deliberately name-shaped, so bare in prose no carrier or token-shape
 // rule touches them and their absence proves that pass ran. Their words appear nowhere in
-// the module's own vocabulary, and no 8-character window of them does either.
-const FIXTURE_ACCESS_KEY = "fixture-amber-quarry-2026";
-const FIXTURE_SECRET_KEY = "fixture-cobalt-meadow-2026";
+// the module's own vocabulary, no 6-character window of them does either, and the two
+// share no 6-character window with each other, so a leaked window names its key.
+const FIXTURE_ACCESS_KEY = "amber-quarry-summit-2026";
+const FIXTURE_SECRET_KEY = "cobalt-meadow-ridge-2026";
 
 // The forms a configured secret can be echoed in: as is, JSON-escaped, URL-encoded, base64, base64url.
 function secretForms(value) {
   return [...new Set([value, JSON.stringify(value).slice(1, -1), encodeURIComponent(value), Buffer.from(value).toString("base64"), Buffer.from(value).toString("base64url")])];
 }
 
-// Neither the canary nor any window of `windowSize` characters of it may survive, so a
-// partial echo (a slice, a split token) is attributable to the canary it came from.
-function assertNoWindow(text, canary, windowSize, label) {
-  assert.ok(!text.includes(canary), `${label}: ${canary} leaked`);
-  for (let index = 0; index + windowSize <= canary.length; index += 1) {
-    const fragment = canary.slice(index, index + windowSize);
-    assert.ok(!text.includes(fragment), `${label}: fragment ${fragment} of ${canary} leaked`);
+// The window rule (addendum 8): every leak assertion against a planted credential checks
+// the whole value and every window of it from LEAK_WINDOW_MIN to LEAK_WINDOW_MAX characters,
+// so a partial echo (the 10-character window JSON.parse quotes, a token cut by a length cap,
+// the head of a base64 form split by a marker) cannot pass. The planted values are alphanumeric
+// and random-looking, and the fixture self-check below proves that no 6-character window of
+// any of them occurs in the fixtures' legitimate text, so every failure is a real leak.
+const LEAK_WINDOW_MIN = 6;
+const LEAK_WINDOW_MAX = 24;
+const leakWindowCache = new Map();
+
+// The whole value plus every window of LEAK_WINDOW_MIN to LEAK_WINDOW_MAX characters, longest
+// first so a failure names the largest fragment that survived, and the shortest windows on
+// their own: a longer window contains its own first LEAK_WINDOW_MIN characters, so every
+// window is absent exactly when the whole value and every shortest window are.
+function leakWindows(canary) {
+  let entry = leakWindowCache.get(canary);
+  if (entry === undefined) {
+    const all = [canary];
+    for (let size = Math.min(LEAK_WINDOW_MAX, canary.length - 1); size >= LEAK_WINDOW_MIN; size -= 1) {
+      for (let index = 0; index + size <= canary.length; index += 1) all.push(canary.slice(index, index + size));
+    }
+    const shortest = Math.min(LEAK_WINDOW_MIN, canary.length);
+    entry = { all: [...new Set(all)], probes: [...new Set(all.filter((window) => window.length === shortest))] };
+    leakWindowCache.set(canary, entry);
   }
+  return entry;
+}
+
+// Neither the canary nor any window of it from 6 to 24 characters may survive in the text.
+function assertNoWindow(text, canary, label) {
+  const { all, probes } = leakWindows(canary);
+  if (!probes.some((probe) => text.includes(probe))) return;
+  const leaked = all.find((window) => text.includes(window));
+  assert.fail(leaked === canary ? `${label}: ${canary} leaked` : `${label}: window ${leaked} of ${canary} leaked`);
+}
+
+// Every bundle file or zip entry against every planted secret: the shared whole-value scan, then every window.
+function assertNoSecretWindows(contents, secrets, label) {
+  assertSecretsAbsent(assert, contents, secrets, label);
+  for (const [name, text] of contents) {
+    for (const secret of secrets) assertNoWindow(text, secret, `${label} ${name}`);
+  }
+}
+
+// The 6-character windows of a planted value (the value itself when shorter), for the fixture self-check.
+function sixWindows(value) {
+  return leakWindows(value).probes;
 }
 
 function jsonResponse(body, status = 200, headers = {}) {
@@ -306,7 +346,7 @@ test("round 7(b): environment credentials survive an argument overlay that carri
   assert.ok(!config.sourceChain.some((source) => /^config-file-(access_key|secret_key)$/.test(source)), config.sourceChain.join(", "));
 });
 
-// Config loader canaries: no two share an 8-character window, so any fragment a parser
+// Config loader canaries: no two share a 6-character window, so any fragment a parser
 // quotes from the file is attributable to one fixture. The short canary keeps the JSON
 // short file at 20 characters, within the size at which JSON.parse quotes the whole source.
 const LOADER_CANARIES = {
@@ -320,13 +360,7 @@ const LOADER_CANARIES = {
 const LIBRARY_ERROR_WORDING = ["Nested mappings", "is not valid JSON", "Unresolved alias", "illegal operation", "permission denied", "Unexpected token", "Expected ',' or '}'"];
 
 function assertNoLoaderLeak(text, canaries, label) {
-  for (const canary of canaries) {
-    assert.ok(!text.includes(canary), `${label}: canary ${canary} leaked into: ${text}`);
-    for (let index = 0; index + 8 <= canary.length; index += 1) {
-      const fragment = canary.slice(index, index + 8);
-      assert.ok(!text.includes(fragment), `${label}: canary fragment ${fragment} leaked into: ${text}`);
-    }
-  }
+  for (const canary of canaries) assertNoWindow(text, canary, `${label} (${text})`);
   for (const wording of LIBRARY_ERROR_WORDING) {
     assert.ok(!text.includes(wording), `${label}: library wording "${wording}" leaked into: ${text}`);
   }
@@ -471,7 +505,7 @@ test("TenableApiClient sends the X-ApiKeys header, walks pagination, and redacts
   });
   await assert.rejects(() => failing.vm.listScans(), (error) => {
     assert.equal(error.status, 403);
-    for (const secret of [FIXTURE_ACCESS_KEY, FIXTURE_SECRET_KEY]) assertNoWindow(error.message, secret, 8, "non-JSON denial");
+    for (const secret of [FIXTURE_ACCESS_KEY, FIXTURE_SECRET_KEY]) assertNoWindow(error.message, secret, "non-JSON denial");
     assert.ok(!error.message.includes("denied for"), `non-JSON bodies are never echoed: ${error.message}`);
     assert.match(error.message, new RegExp(`403[^;]*; non-JSON text/plain response body \\(${deniedBody.length} bytes, not echoed\\)`));
     return true;
@@ -484,7 +518,7 @@ test("TenableApiClient sends the X-ApiKeys header, walks pagination, and redacts
   await assert.rejects(() => jsonFailure.vm.listScans(), (error) => {
     assert.equal(error.status, 401);
     assert.ok(error.message.includes("invalid credentials"), "documented JSON error fields are kept");
-    for (const secret of [FIXTURE_ACCESS_KEY, FIXTURE_SECRET_KEY]) assertNoWindow(error.message, secret, 8, "JSON denial");
+    for (const secret of [FIXTURE_ACCESS_KEY, FIXTURE_SECRET_KEY]) assertNoWindow(error.message, secret, "JSON denial");
     assert.equal(error.message, "Tenable request GET /scans failed (HTTP 401; invalid credentials accessKey=[REDACTED];secretKey=[REDACTED])", "both halves of the echoed header go, the key names stay");
     return true;
   });
@@ -992,7 +1026,7 @@ test("exportTenableAuditBundle writes the documented layout, a paired zip, and n
   }
   assert.equal(existsSync(join(first.outputDir, "_errors.log")), false);
   const rawUsers = readFileSync(join(first.outputDir, "core_data/users.json"), "utf8");
-  assert.ok(!rawUsers.includes(FIXTURE_SECRET_KEY));
+  assertNoWindow(rawUsers, FIXTURE_SECRET_KEY, "core_data/users.json");
   assert.ok(first.findingCount >= 20);
 
   const second = await exportTenableAuditBundle(clients, root, { now: NOW });
@@ -1075,7 +1109,7 @@ test("scrub boundary: name-shaped values stay bare in prose, leave every carrier
       for (const scrub of [redactErrorText, redactCredentialValueText]) {
         const out = scrub(text);
         assert.match(out, expected, `${scrub.name}(${JSON.stringify(text)}) -> ${JSON.stringify(out)}`);
-        assertNoWindow(out, value, 6, `${scrub.name} ${text}`);
+        assertNoWindow(out, value, `${scrub.name} ${text}`);
         assert.equal(scrub(out), out, `${scrub.name} is idempotent on ${out}`);
       }
     }
@@ -1204,11 +1238,11 @@ test("no window of a carried or configured canary survives, for every canary len
       const value = canary(length);
       for (const [text] of carriersOf(value)) {
         for (const scrub of [redactErrorText, redactCredentialValueText]) {
-          assertNoWindow(scrub(text), value, Math.min(6, length), `${scrub.name} ${text}`);
+          assertNoWindow(scrub(text), value, `${scrub.name} ${text}`);
         }
       }
       for (const form of secretForms(value)) {
-        assertNoWindow(redactSecrets(`upstream echoed ${form} in a ${length}-character reply`, [value]), value, Math.min(6, length), `configured ${value} as ${form}`);
+        assertNoWindow(redactSecrets(`upstream echoed ${form} in a ${length}-character reply`, [value]), value, `configured ${value} as ${form}`);
       }
     }
   }
@@ -1255,7 +1289,7 @@ test("a documented error field is scrubbed of the configured secrets before it i
       sleepImpl: async () => {},
     });
     await assert.rejects(clients.vm.listScans(), (thrown) => {
-      assertNoWindow(thrown.message, form, 8, `straddling ${form}`);
+      assertNoWindow(thrown.message, form, `straddling ${form}`);
       assert.match(thrown.message, /HTTP 403 Forbidden; x{20,} \[REDACTED\]/, thrown.message);
       return true;
     });
@@ -1263,19 +1297,21 @@ test("a documented error field is scrubbed of the configured secrets before it i
     // shapes the general scrub knows (the form itself is name-shaped, so only the caller's
     // configured-secret scrub removes it).
     const response = new Response(body, { status: 403, statusText: "Forbidden", headers: { "content-type": "application/json" } });
-    assertNoWindow(describeErrorBody(response, body, (text) => redactSecrets(text, [FIXTURE_ACCESS_KEY, FIXTURE_SECRET_KEY])), form, 8, `describeErrorBody ${form}`);
+    assertNoWindow(describeErrorBody(response, body, (text) => redactSecrets(text, [FIXTURE_ACCESS_KEY, FIXTURE_SECRET_KEY])), form, `describeErrorBody ${form}`);
   }
 });
 
-// Canary values that must never survive into any tool result, finding, summary, or bundle file.
-const CANARY_BEARER = "CANARY-BEARER-9f8e7d6c5b4a3210";
-const CANARY_SESSION = "CANARY-SESSION-0a1b2c3d4e5f6789";
-const CANARY_API_KEY = "CANARY-APIKEY-1122334455667788";
-const CANARY_URL_TOKEN = "CANARY-URLTOKEN-99aa88bb77cc66dd";
+// Canary values that must never survive into any tool result, finding, summary, or bundle
+// file: random-looking alphanumerics, no two sharing a 6-character window, so a leaked
+// window is attributable (see the window rule above).
+const CANARY_BEARER = "rSdnWN7hjTh2aO3y1uHbpA";
+const CANARY_SESSION = "Fo9NJvYaHnUppTgu60tP8C";
+const CANARY_API_KEY = "l9zRN6mVdNtN6JZ7xz1MXL";
+const CANARY_URL_TOKEN = "ho4A04gykhqEgcruJ1Hu65";
 // A name-shaped value (the ruling's own example) that only its carrier, a cookie
 // assignment, gives away, and a plain lowercase word that only the Bearer scheme does.
 const CANARY_NAMED = "sess-canary-COOKIE-31415926535897";
-const CANARY_PLAIN = "canaryplainbearerword";
+const CANARY_PLAIN = "uhfsumxscmhlzj";
 const CANARIES = [CANARY_BEARER, CANARY_SESSION, CANARY_API_KEY, CANARY_URL_TOKEN, CANARY_NAMED, CANARY_PLAIN];
 const CANARY_URL = `https://api.example.com/v1/x?token=${CANARY_URL_TOKEN}`;
 
@@ -1309,7 +1345,7 @@ function echoedSecretsResponse() {
 }
 
 function assertNoCanary(text, label, canaries = CANARIES) {
-  for (const canary of canaries) assertNoWindow(text, canary, 8, label);
+  for (const canary of canaries) assertNoWindow(text, canary, label);
 }
 
 function canaryClients(routes, surfaceKey, makeResponse) {
@@ -1370,8 +1406,8 @@ test("error-body canary sweep: every Tenable surface failing with an HTML 502 or
       const files = readBundleFiles(bundle.outputDir);
       const zipEntries = readZipEntries(bundle.zipPath);
       assert.ok(files.size >= 20 && zipEntries.size >= 20, `${label}: bundle and zip were written`);
-      assertSecretsAbsent(assert, files, shape.canaries, `${label} bundle`);
-      assertSecretsAbsent(assert, zipEntries, shape.canaries, `${label} zip`);
+      assertNoSecretWindows(files, shape.canaries, `${label} bundle`);
+      assertNoSecretWindows(zipEntries, shape.canaries, `${label} zip`);
       for (const [name, content] of files) noCanary(content, `${label} ${name}`);
       const errorLog = files.get("_errors.log");
       assert.ok(errorLog !== undefined, `${label}: _errors.log must exist`);
@@ -1432,7 +1468,7 @@ test("the registered tools scrub error strings end to end over HTTP: access chec
     assert.ok(scProbes.length >= 4 && scProbes.every((probe) => probe.status === "readable"), JSON.stringify(healthy.details.surfaces));
     assert.ok(healthy.details.surfaces.every((probe) => probe.name.startsWith("sc_") || probe.status === "not_configured"), JSON.stringify(healthy.details.surfaces));
     assert.deepEqual(Object.values(failingSurfaces).filter((name) => !scProbes.some((probe) => probe.name === name)), [], "the failing surfaces are probed by name");
-    for (const secret of [FIXTURE_ACCESS_KEY, FIXTURE_SECRET_KEY]) assertNoWindow(JSON.stringify(healthy), secret, 8, "healthy access check");
+    for (const secret of [FIXTURE_ACCESS_KEY, FIXTURE_SECRET_KEY]) assertNoWindow(JSON.stringify(healthy), secret, "healthy access check");
 
     for (const shape of [
       { name: "html-502", make: htmlCanaryResponse, marker: HTML_CANARY_MARKER, canaries: [...CANARIES, ...ECHOED_FORMS] },
@@ -1441,7 +1477,7 @@ test("the registered tools scrub error strings end to end over HTTP: access chec
     ]) {
       failing.clear();
       for (const surface of Object.keys(failingSurfaces)) failing.set(surface, shape.make);
-      const noCanary = (text, where) => { for (const canary of shape.canaries) assertNoWindow(text, canary, 8, where); };
+      const noCanary = (text, where) => { for (const canary of shape.canaries) assertNoWindow(text, canary, where); };
 
       const access = await run("tenable_check_access");
       noCanary(JSON.stringify(access), `${shape.name} tenable_check_access`);
@@ -1549,18 +1585,20 @@ test("export polling, vendor reason strings, Security Center error_msg, and time
   });
 });
 
+// Fake credential values the fixtures plant where a real tenant carries them; none may reach
+// the bundle. Random-looking alphanumerics (see the window rule above).
 const FAKE_TENABLE_SECRETS = {
-  sshPassword: "FAKE-SSH-PASSWORD-a1b2c3d4e5f6",
-  sshPrivateKey: "FAKE-SSH-PRIVATE-KEY-001122334455",
-  windowsPassword: "FAKE-WINDOWS-PASSWORD-99887766",
-  smtpPassword: "FAKE-SMTP-PASSWORD-13579-24680",
-  scannerKey: "FAKE-SCANNER-LINKING-KEY-5566778899",
-  registrationCode: "FAKE-REGISTRATION-CODE-1122334455",
-  licenseKey: "FAKE-LICENSE-KEY-aabbccddeeff0011",
-  auditFieldToken: "FAKE-AUDIT-API-TOKEN-fedcba987654",
-  webhookQueryToken: "FAKE-WEBHOOK-QUERY-TOKEN-0f1e2d3c",
-  credentialSecret: "FAKE-CREDENTIAL-SETTINGS-SECRET-4242",
-  camelCaseSecret: "FAKE-CAMEL-CLIENT-SECRET-777888999",
+  sshPassword: "9U1CEev6U71JmHG2ldC100",
+  sshPrivateKey: "R1M0s5f4SrgBX0CgcNzyzJ",
+  windowsPassword: "KoZR57LLWDrl7waJR0GOBv",
+  smtpPassword: "hftgrr92BIbTnK98YFN4io",
+  scannerKey: "9U4Je6VR8IKId3TLiyyNFq",
+  registrationCode: "BnHNcwxb33SF3JaByM3XfK",
+  licenseKey: "PKJwsecPe18jp19Xw6vO2r",
+  auditFieldToken: "Yd7rmz2KDiBHYn4oc83WbN",
+  webhookQueryToken: "5OvJOMuFTt9kEn8tS14NAW",
+  credentialSecret: "0aLPuMBcC3LrhC03EFlIq8",
+  camelCaseSecret: "2dzaTJuwLGmPzB5L9ZZEK4",
 };
 
 function secretBearingRoutes() {
@@ -1607,8 +1645,8 @@ test("exportTenableAuditBundle never writes policy credentials, scanner linking 
   const files = readBundleFiles(result.outputDir);
   const zipEntries = readZipEntries(result.zipPath);
   assert.ok(files.has("core_data/policy_details.json") && files.has("core_data/scanners.json") && files.has("core_data/audit_log_events.json") && files.has("core_data/credentials.json"));
-  assertSecretsAbsent(assert, files, secrets, "bundle");
-  assertSecretsAbsent(assert, zipEntries, secrets, "zip");
+  assertNoSecretWindows(files, secrets, "bundle");
+  assertNoSecretWindows(zipEntries, secrets, "zip");
   assert.deepEqual([...files.keys()].sort(), [...zipEntries.keys()].sort(), "the zip mirrors the bundle directory");
 
   const policyDetails = JSON.parse(files.get("core_data/policy_details.json"));
@@ -1647,7 +1685,46 @@ test("exportTenableAuditBundle never writes policy credentials, scanner linking 
   assert.ok(files.get("QUICK_REFERENCE.md").includes("redacted"), "the quick reference describes the redaction");
 
   const results = await runAll(clients);
-  for (const secret of secrets) assert.ok(!JSON.stringify(results).includes(secret), `${secret} reached an assessment result`);
+  for (const secret of secrets) assertNoWindow(JSON.stringify(results), secret, "assessment result");
+});
+// Every planted credential of this fixture. The deliberate exceptions to the alphanumeric
+// shape are the name-shaped values that prove the configured-secret pass and the carrier
+// rules run on their own (hyphenated words with one digit group) and the plain lowercase
+// word that only the Bearer scheme gives away.
+const PLANTED_CREDENTIALS = [...Object.values(LOADER_CANARIES), ...CANARIES, ...Object.values(FAKE_TENABLE_SECRETS), FIXTURE_ACCESS_KEY, FIXTURE_SECRET_KEY];
+const SHAPED_CREDENTIALS = new Set([CANARY_NAMED, CANARY_PLAIN, FIXTURE_ACCESS_KEY, FIXTURE_SECRET_KEY]);
+
+test("fixture self-check: planted credentials are alphanumeric and random-looking, share no 6-character window with each other, and no 6-character window of any occurs in the fixtures' legitimate text", async () => {
+  const owners = new Map();
+  for (const value of PLANTED_CREDENTIALS) {
+    assert.ok(value.length >= LEAK_WINDOW_MIN, `${value} is too short to carry a window`);
+    if (!SHAPED_CREDENTIALS.has(value)) {
+      assert.match(value, /^[A-Za-z0-9]+$/, `${value} is not alphanumeric`);
+      assert.ok((value.match(/\d/g) ?? []).length >= 2 && (value.match(/[A-Za-z]/g) ?? []).length >= 4, `${value} does not look random`);
+    }
+    assert.doesNotMatch(value, /(.)\1\1/, `${value} repeats a character three times`);
+    for (const window of sixWindows(value)) {
+      const owner = owners.get(window);
+      assert.ok(owner === undefined || owner === value, `${value} shares the window ${window} with ${owner}`);
+      owners.set(window, value);
+    }
+  }
+
+  // Legitimate text: everything the healthy fixture renders (the access check, every
+  // assessment, and every bundle file), plus everything the secret-bearing fixture renders
+  // with the planted values themselves removed, so what remains is the fixture's ordinary
+  // vocabulary: names, hosts, URLs, ids, dates, and this module's own wording.
+  const corpus = [];
+  for (const routes of [healthyRoutes(), secretBearingRoutes()]) {
+    corpus.push(JSON.stringify(await checkTenableAccess(clientsFor(routes))), JSON.stringify(await runAll(clientsFor(routes))));
+    const bundle = await exportTenableAuditBundle(clientsFor(routes), mkdtempSync(join(tmpdir(), "tenable-self-check-")), { now: NOW });
+    for (const text of readBundleFiles(bundle.outputDir).values()) corpus.push(text);
+  }
+  const legitimate = PLANTED_CREDENTIALS.reduce((rest, value) => rest.split(value).join(""), corpus.join("\n"));
+  assert.ok(legitimate.length > 10_000, "the legitimate corpus is not empty");
+  for (const value of PLANTED_CREDENTIALS) {
+    for (const window of sixWindows(value)) assert.ok(!legitimate.includes(window), `window ${window} of ${value} occurs in legitimate fixture text`);
+  }
 });
 
 test("listPaginated stops as truncated when the endpoint ignores offset and replays the same page", async () => {
