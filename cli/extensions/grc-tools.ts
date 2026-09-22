@@ -15,9 +15,8 @@ import {
   buildComputeBackendSystemPromptNote,
   resolveComputeBackendExecution,
 } from "../pi/backend-exec.js";
-import { getComputeBackendConfigurationIssues, resolveComputeBackend } from "../pi/compute.js";
-import { cleanupParallelsSandboxes } from "../pi/parallels-sandbox.js";
-import { resetSandboxRuntime } from "../pi/sandbox.js";
+import { getComputeBackendConfigurationIssues } from "../pi/compute.js";
+import { shutdownComputeSessions } from "../pi/compute-shutdown.js";
 import { executeComputeAwareGrep } from "../pi/search-tools.js";
 import { readGrclankerSettings } from "../pi/settings.js";
 import { registerAnsibleTools } from "./grc-tools/ansible.js";
@@ -301,12 +300,6 @@ export default function grcTools(pi: ExtensionAPI): void {
   });
 
   pi.on("session_shutdown", async () => {
-    const settings = getSettings();
-    if (resolveComputeBackend(settings) === "sandbox-runtime") {
-      await resetSandboxRuntime();
-    }
-    if (resolveComputeBackend(settings) === "parallels-vm") {
-      await cleanupParallelsSandboxes();
-    }
+    await shutdownComputeSessions(getSettings());
   });
 }

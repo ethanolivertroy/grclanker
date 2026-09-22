@@ -1,9 +1,10 @@
 import { existsSync } from "node:fs";
 import { resolve } from "node:path";
 import { runComputeDoctor } from "./pi/doctor.js";
-import { runComputeExec, runComputeSmokeTest } from "./pi/env.js";
+import { extractComputeFlag, runComputeExec, runComputeList, runComputeSmokeTest } from "./pi/env.js";
 import { launchCli, runCliSetup } from "./pi/launch.js";
 import { GrclankerUserError } from "./pi/setup.js";
+import type { ComputeBackendKind } from "./pi/compute.js";
 import {
   findRegisteredTool,
   formatToolCatalogText,
@@ -28,12 +29,12 @@ function resolveAppRoot(currentDir: string): string {
 
 const appRoot = resolveAppRoot(import.meta.dirname);
 
-const commands: Record<string, () => Promise<void>> = {
-  setup: () => runCliSetup(appRoot),
-  investigate: () => launchCli(appRoot, "investigate"),
-  audit: () => launchCli(appRoot, "audit"),
-  assess: () => launchCli(appRoot, "assess"),
-  validate: () => launchCli(appRoot, "validate"),
+const commands: Record<string, (compute?: ComputeBackendKind) => Promise<void>> = {
+  setup: (compute) => runCliSetup(appRoot, compute),
+  investigate: (compute) => launchCli(appRoot, "investigate", compute),
+  audit: (compute) => launchCli(appRoot, "audit", compute),
+  assess: (compute) => launchCli(appRoot, "assess", compute),
+  validate: (compute) => launchCli(appRoot, "validate", compute),
 };
 
 function printHelp() {
@@ -43,13 +44,16 @@ grclanker
 Usage:
   grclanker                     Interactive GRC CLI
   grclanker setup               Configure local-first or hosted model access
-  grclanker env doctor          Check Phase 1 compute backend availability
+  grclanker setup --compute <k> Save <kind> as the preferred compute backend
+  grclanker env list            List every compute backend, bucket, and readiness
+  grclanker env doctor          Check compute backend availability
   grclanker env smoke-test      Validate the selected backend end-to-end
   grclanker env exec -- <cmd>   Run a shell command on the selected backend
   grclanker tools               List bundled GRC and compute tools
   grclanker flue run -m <text>  Run the same GRC agent under the Flue Framework runtime
   grclanker investigate         Trace crypto status, KEVs, and exploitability
   grclanker audit               Map evidence against a requested framework
+  ... --compute <kind>          Run investigate/audit on a specific backend
   grclanker assess              Produce a posture readout and remediation order
   grclanker validate            Answer a narrow FIPS validation question
 
@@ -76,6 +80,11 @@ async function main() {
 
   if (command === "env" && subcommand === "doctor") {
     await runComputeDoctor();
+    return;
+  }
+
+  if (command === "env" && subcommand === "list") {
+    await runComputeList(process.argv.slice(4));
     return;
   }
 
@@ -126,7 +135,8 @@ async function main() {
     process.exit(1);
   }
 
-  await (handler ?? (() => launchCli(appRoot)))();
+  const { compute } = extractComputeFlag(process.argv.slice(3));
+  await (handler ?? ((kind?: ComputeBackendKind) => launchCli(appRoot, undefined, kind)))(compute);
 }
 
 main().catch((error) => {
