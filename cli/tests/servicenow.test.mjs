@@ -2203,3 +2203,36 @@ test("addendum 4: an OAuth token endpoint that answers with a 502 HTML page or a
   assert.equal(redactSecrets(`header Bearer ${SNOW_CANARY.bearer}, cookie JSESSIONID=${SNOW_CANARY.session}, at https://u:p@example.com/a?sid=1#frag`, []), "header Bearer [REDACTED], cookie JSESSIONID=[REDACTED], at https://[REDACTED]@example.com/a?[REDACTED]#[REDACTED]");
   assert.match(redactSecrets("Authorization: Bearer eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.c2lnbmF0dXJl", []), /^Authorization: \[REDACTED\]/);
 });
+
+test("review round item 13, extended: SNOW-08 and SNOW-17 do not assert the absence of a provider, plugin, or rule from a partial read", async () => {
+  const inactiveProviders = healthyFixture();
+  inactiveProviders.tables.sso_properties = inactiveProviders.tables.sso_properties.map((row) => ({ ...row, active: "false" }));
+  const partialProviders = await assessServicenowIdentityAccess(createClient(fixtureFetch(inactiveProviders, { inflateTotals: { sso_properties: 40 } }).fetchImpl));
+  const sso = findingsById(partialProviders).get("SNOW-08");
+  assert.equal(sso.status, "manual");
+  assert.match(sso.summary, /was among the visible rows, and at least one of those reads was partial/);
+  const completeProviders = await assessServicenowIdentityAccess(createClient(fixtureFetch(inactiveProviders).fetchImpl));
+  assert.equal(findingsById(completeProviders).get("SNOW-08").status, "fail");
+
+  const inactiveRules = healthyFixture();
+  inactiveRules.tables.ip_access = inactiveRules.tables.ip_access.map((row) => ({ ...row, active: "false" }));
+  const partialRules = await assessServicenowPlatformHardening(createClient(fixtureFetch(inactiveRules, { inflateTotals: { ip_access: 40 } }).fetchImpl));
+  const rules = findingsById(partialRules).get("SNOW-17");
+  assert.equal(rules.status, "manual");
+  assert.match(rules.summary, /none of the visible ip_access rows is active, but that read was partial/);
+  const completeRules = await assessServicenowPlatformHardening(createClient(fixtureFetch(inactiveRules).fetchImpl));
+  assert.equal(findingsById(completeRules).get("SNOW-17").status, "fail");
+
+  // With active rules visible, a missing plugin row already stops at warn ("could not be confirmed"); the
+  // absence claim only fires when no active rule is visible either, so that is the path gated here.
+  const withoutPlugin = healthyFixture();
+  withoutPlugin.tables.sys_plugins = withoutPlugin.tables.sys_plugins.filter((row) => row.source !== "com.snc.ipauthenticator");
+  withoutPlugin.tables.ip_access = withoutPlugin.tables.ip_access.map((row) => ({ ...row, active: "false" }));
+  const partialPlugins = await assessServicenowPlatformHardening(createClient(fixtureFetch(withoutPlugin, { inflateTotals: { sys_plugins: 40 } }).fetchImpl));
+  const plugin = findingsById(partialPlugins).get("SNOW-17");
+  assert.equal(plugin.status, "manual");
+  assert.match(plugin.summary, /was not among the visible sys_plugins rows and that read was partial/);
+  const completePlugins = await assessServicenowPlatformHardening(createClient(fixtureFetch(withoutPlugin).fetchImpl));
+  assert.equal(findingsById(completePlugins).get("SNOW-17").status, "fail");
+  assert.match(findingsById(completePlugins).get("SNOW-17").summary, /has no row in sys_plugins/);
+});

@@ -2153,6 +2153,14 @@ export function assessServicenowIdentityAccessData(data: ServicenowIdentityData)
       certificates_without_expiration: truncateList(undated),
     };
     if (activeSso.length === 0 && activeLdap.length === 0) {
+      // Absence is only provable on complete reads: an active provider may sit in the unread remainder.
+      if (!tablesComplete([data.ssoProviders, data.ldapServers])) {
+        return {
+          status: "manual",
+          summary: "No active SSO identity provider (sso_properties) or LDAP server (ldap_server_config) was among the visible rows, and at least one of those reads was partial, so the absence of an external identity provider cannot be asserted.",
+          evidence,
+        };
+      }
       return {
         status: "fail",
         summary: "No active SSO identity provider (sso_properties) or LDAP server (ldap_server_config) is configured; users authenticate with local passwords only.",
@@ -2461,6 +2469,13 @@ export function assessServicenowPlatformHardeningData(data: ServicenowHardeningD
           evidence,
         };
       }
+      if (!pluginRow && !tablesComplete([data.ipAuthenticatorPlugin])) {
+        return {
+          status: "manual",
+          summary: `${IP_AUTHENTICATOR_PLUGIN} was not among the visible sys_plugins rows and that read was partial, so plugin activation cannot be asserted either way.`,
+          evidence,
+        };
+      }
       const pluginDescription = pluginRow ? `is ${rowString(pluginRow, "active") ?? "not active"} in sys_plugins` : "has no row in sys_plugins";
       return {
         status: "fail",
@@ -2476,6 +2491,13 @@ export function assessServicenowPlatformHardeningData(data: ServicenowHardeningD
       };
     }
     if (activeRules.length === 0) {
+      if (!tablesComplete([data.ipAccessRules])) {
+        return {
+          status: "manual",
+          summary: `${IP_AUTHENTICATOR_PLUGIN} is active and none of the visible ${IP_ACCESS_TABLE} rows is active, but that read was partial, so the absence of an active rule cannot be asserted.`,
+          evidence,
+        };
+      }
       return {
         status: "fail",
         summary: `${IP_AUTHENTICATOR_PLUGIN} is active but no active IP Address Access Control rule exists (${IP_ACCESS_TABLE} has ${rules.length} rows, none active), so administrative access is not restricted by source network.`,
