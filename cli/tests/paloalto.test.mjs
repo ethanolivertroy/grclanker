@@ -659,9 +659,65 @@ test("collectPanosSnapshot detects Panorama and records per-xpath collection err
 
 const PANOS_FORBIDDEN = '<response status="error" code="403"><result><msg>Insufficient privileges</msg></result></response>';
 
+// Fake credential values Prisma Cloud CSPM and Compute payloads carry verbatim in real
+// tenants (integrationConfig, registry credentials, image secrets, Defender proxies);
+// none may reach an assessment payload, the bundle, or the zip.
+const FAKE_PRISMA_SECRETS = {
+  splunkAuthToken: "splunk-hec-auth-token-fake-0123",
+  webhookQueryToken: "webhook-query-token-fake-4567",
+  webhookHeaderBearer: "webhook-header-bearer-fake-89ab",
+  slackWebhookPath: "T0FAKE/B0FAKE/slackwebhooksecretfake",
+  serviceNowPassword: "servicenow-password-fake-cdef",
+  tenableSecretKey: "tenable-secret-key-fake-0246",
+  registryPlainSecret: "registry-pull-secret-plain-fake",
+  registryBasicPassword: "registry-basic-password-fake",
+  imageSecret: "AKIAFAKEIMAGESECRET0123456789",
+  discoveryCredential: "cloud-discovery-credential-fake",
+  defenderProxyPassword: "defender-proxy-password-fake",
+};
+
+function secretsIntegrations() {
+  return [
+    { name: "splunk", integrationType: "splunk", enabled: true, integrationConfig: { url: "https://splunk.example.com:8088/services/collector", authToken: FAKE_PRISMA_SECRETS.splunkAuthToken, sourceType: "prisma" } },
+    {
+      name: "soar-webhook",
+      integrationType: "webhook",
+      enabled: true,
+      integrationConfig: {
+        url: `https://soar.example.com/prisma?token=${FAKE_PRISMA_SECRETS.webhookQueryToken}&env=prod`,
+        headers: [
+          { key: "Authorization", value: `Bearer ${FAKE_PRISMA_SECRETS.webhookHeaderBearer}`, secure: true },
+          { key: "Content-Type", value: "application/json", secure: false },
+        ],
+      },
+    },
+    { name: "slack", integrationType: "slack", enabled: true, integrationConfig: { webhookUrl: `https://hooks.slack.com/services/${FAKE_PRISMA_SECRETS.slackWebhookPath}` } },
+    { name: "servicenow", integrationType: "service_now", enabled: true, integrationConfig: { hostUrl: "acme.service-now.com", login: "prisma-svc", password: FAKE_PRISMA_SECRETS.serviceNowPassword, tables: { incident: true } } },
+    { name: "tenable", integrationType: "tenable", enabled: true, integrationConfig: { accessKey: "tenable-access-key-id", secretKey: FAKE_PRISMA_SECRETS.tenableSecretKey } },
+  ];
+}
+
+function secretsRegistrySettings() {
+  return {
+    specifications: [
+      { registry: "registry.example.com", repository: "*", cap: 5, scanners: 2, credentialID: "reg-cred-1", credential: { _id: "reg-cred-1", type: "basic", secret: { encrypted: "", plain: FAKE_PRISMA_SECRETS.registryPlainSecret } } },
+      { registry: "ghcr.io", repository: "acme/*", cap: 5, scanners: 1, credentialID: "reg-cred-2", credential: { _id: "reg-cred-2", type: "basic", accountID: "acme-bot", secret: { plain: FAKE_PRISMA_SECRETS.registryBasicPassword } } },
+    ],
+  };
+}
+
+function secretsComputeSnapshot() {
+  const snapshot = computeSnapshot();
+  snapshot.defenders = [{ ...snapshot.defenders[0], proxy: { httpProxy: "http://proxy.example.com:3128", user: "defender", password: { encrypted: "", plain: FAKE_PRISMA_SECRETS.defenderProxyPassword } } }];
+  snapshot.registrySettings = secretsRegistrySettings();
+  snapshot.images = [{ ...snapshot.images[0], secrets: [FAKE_PRISMA_SECRETS.imageSecret], labels: { maintainer: "platform" } }];
+  snapshot.cloudDiscovery = [{ ...snapshot.cloudDiscovery[0], credentialID: "aws-cred-1", credential: { _id: "aws-cred-1", type: "aws", secret: { plain: FAKE_PRISMA_SECRETS.discoveryCredential } } }];
+  return snapshot;
+}
+
 function mockedFetch(options = {}) {
   const { denyAll = false, emptyAll = false, partial = false } = options;
-  const compute = computeSnapshot();
+  const compute = options.withSecrets ? secretsComputeSnapshot() : computeSnapshot();
   return async (input, init = {}) => {
     const url = new URL(input);
     if (url.hostname.endsWith("prismacloud.io")) {
@@ -684,7 +740,8 @@ function mockedFetch(options = {}) {
       if (url.pathname === "/cloud/group") return jsonResponse(prismaSnapshot().accountGroups);
       if (url.pathname === "/user/role") return jsonResponse(prismaSnapshot().userRoles);
       if (url.pathname === "/integration" || url.pathname === "/api/v1/tenant/tenant-1/integration") {
-        return options.integrationsDenied ? jsonResponse([], { status: 403 }) : jsonResponse(prismaSnapshot().integrations);
+        if (options.integrationsDenied) return jsonResponse([], { status: 403 });
+        return jsonResponse(options.withSecrets ? secretsIntegrations() : prismaSnapshot().integrations);
       }
       return jsonResponse({}, { status: 404 });
     }
@@ -708,6 +765,7 @@ function mockedFetch(options = {}) {
       return jsonResponse({}, { status: 404 });
     }
     if (partial && url.hostname === "fw2.example.com") throw new Error("connect ECONNREFUSED");
+    if (init.method === "POST") return xmlResponse(panosSuccess("<key>LUFRPT-generated-fake</key>"));
     const type = url.searchParams.get("type");
     if (denyAll) return xmlResponse(PANOS_FORBIDDEN, 403);
     if (type === "op") {
@@ -1029,6 +1087,691 @@ test("exportPaloaltoAuditBundle never writes PAN-OS credentials into the bundle 
   assert.match(files.get("QUICK_REFERENCE.md"), /replaced with \[REDACTED\] before core_data\/ is written/);
 });
 
+// ---------------------------------------------------------------------------
+// Rule 9: redaction helpers, error-body descriptions, and Prisma Cloud secrets
+// ---------------------------------------------------------------------------
+
+// Canary values that must never survive into any probe, finding, summary, tool result, or
+// bundle file. No two share an 8-character window, so a leaked fragment is attributable.
+const CANARY_BEARER = "CANARY-BEARER-9f8e7d6c5b4a3210";
+const CANARY_SESSION = "CANARY-SESSION-0a1b2c3d4e5f6789";
+const CANARY_API_KEY = "CANARY-APIKEY-1122334455667788";
+const CANARY_URL_TOKEN = "CANARY-URLTOKEN-99aa88bb77cc66dd";
+const CANARIES = [CANARY_BEARER, CANARY_SESSION, CANARY_API_KEY, CANARY_URL_TOKEN];
+const CANARY_URL = `https://api.example.com/v1/x?token=${CANARY_URL_TOKEN}`;
+const CANARY_SENTENCE = `Upstream refused Bearer ${CANARY_BEARER} when calling ${CANARY_URL} mid-sentence; _upstream_session=${CANARY_SESSION} and api_key=${CANARY_API_KEY} were rejected`;
+const SCRUBBED_SENTENCE = "Upstream refused Bearer [REDACTED] when calling https://api.example.com/v1/x?token=[REDACTED] mid-sentence; _upstream_session=[REDACTED] and api_key=[REDACTED] were rejected";
+
+function escapeRegExp(text) {
+  return text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function assertNoCanary(text, label) {
+  for (const canary of CANARIES) {
+    assert.ok(!text.includes(canary), `${label}: ${canary} leaked`);
+    for (let index = 0; index + 8 <= canary.length; index += 1) {
+      const fragment = canary.slice(index, index + 8);
+      assert.ok(!text.includes(fragment), `${label}: fragment ${fragment} of ${canary} leaked`);
+    }
+  }
+}
+
+// A proxy or load balancer error page: HTML with header lines and a URL carrying a token.
+// Retry-After is tiny so clients that do retry 5xx responses do so without waiting.
+function htmlCanaryResponse() {
+  const body = `<!DOCTYPE html><html><head><title>502 Bad Gateway</title></head><body><p>Authorization: Bearer ${CANARY_BEARER}</p>`
+    + `<p>Set-Cookie: _upstream_session=${CANARY_SESSION}; Path=/</p><p>X-Api-Key: ${CANARY_API_KEY}</p>`
+    + `<p>The upstream at ${CANARY_URL} did not answer in time, retry later.</p></body></html>`;
+  return new Response(body, { status: 502, statusText: "Bad Gateway", headers: { "content-type": "text/html; charset=utf-8", "retry-after": "0.001" } });
+}
+
+function jsonCanaryResponse() {
+  return jsonResponse({ message: CANARY_SENTENCE }, { status: 400, statusText: "Bad Request" });
+}
+
+function xmlCanaryResponse() {
+  return xmlResponse(`<response status="error" code="403"><result><msg>${CANARY_SENTENCE}</msg></result></response>`, 403);
+}
+
+test("redaction helpers scrub credential-shaped text, JSON pairs, URL credentials, and credential-named properties", () => {
+  assert.equal(redactErrorText(`upstream sent Bearer ${CANARY_BEARER} then stopped`), "upstream sent Bearer [REDACTED] then stopped");
+  assert.equal(redactErrorText("Basic dXNlcjpwYXNzd29yZA== was refused"), "Basic [REDACTED] was refused");
+  assert.equal(redactErrorText(`X-Api-Key: ${CANARY_API_KEY} rejected`), "X-Api-Key: [REDACTED]", "header lines are withheld to the end of the line");
+  assert.equal(redactErrorText("Set-Cookie: PHPSESSID=abc123def; Path=/"), "Set-Cookie: [REDACTED]");
+  assert.equal(redactErrorText("GET /api/?type=op&key=LUFRPT0123456789abcdefghij&cmd=x"), "GET /api/?type=op&key=[REDACTED]&cmd=x");
+  assert.equal(redactErrorText("key LUFRPT0123456789abcdefghijklmnop expired"), "key [REDACTED] expired", "PAN-OS API keys are recognized by shape");
+  assert.equal(redactErrorText("jwt eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0In0.abcdefghijk expired"), "jwt [REDACTED] expired");
+  assert.equal(redactErrorText(`connect via https://svc:${CANARY_SESSION}@proxy.example.com failed`), "connect via https://[REDACTED]@proxy.example.com failed");
+  assert.equal(redactErrorText(`body {"password":"${CANARY_SESSION}","name":"svc"} rejected`), 'body {"password":"[REDACTED]","name":"svc"} rejected', "JSON pairs quoted inside a message are scrubbed");
+  assert.equal(redactErrorText(CANARY_SENTENCE), SCRUBBED_SENTENCE);
+  assert.equal(redactErrorText("PAN-OS keygen failed (code 403, status 403): Invalid credentials"), "PAN-OS keygen failed (code 403, status 403): Invalid credentials", "plain text without credential values is untouched");
+  assert.equal(redactErrorText(SCRUBBED_SENTENCE), SCRUBBED_SENTENCE, "idempotent");
+  assertNoCanary(redactErrorText(CANARY_SENTENCE), "redactErrorText");
+
+  assert.equal(redactCredentialValueText(`https://soar.example.com/prisma?token=${CANARY_URL_TOKEN}&env=prod`), "https://soar.example.com/prisma?token=[REDACTED]&env=prod");
+  assert.equal(redactCredentialValueText("https://svc:hunter2@registry.example.com/v2/"), "https://[REDACTED]@registry.example.com/v2/");
+  assert.equal(redactCredentialValueText("https://hooks.slack.com/services/T0FAKE/B0FAKE/secretpart"), "https://hooks.slack.com/services/[REDACTED]");
+  assert.equal(redactCredentialValueText('{"authToken":"abc123","url":"https://x.example.com"}'), '{"authToken":"[REDACTED]","url":"https://x.example.com"}');
+  assert.equal(redactCredentialValueText("registry.example.com"), "registry.example.com");
+
+  for (const name of ["authToken", "api_key", "apiKey", "APIKey", "X-Api-Key", "password", "clientSecret", "client_secret", "secretKey", "secret_key", "privateKey", "secrets", "credential", "credentials", "phash", "passphrase", "tokens", "authorization", "integrationKey", "sharedKey", "accessKey", "webhook_password"]) {
+    assert.equal(isCredentialPropertyName(name), true, `${name} should be redacted`);
+  }
+  for (const name of ["credentialID", "credentialId", "hostUrl", "login", "key", "publicKey", "public_key", "url", "name", "type", "enabled", "secure", "keyId", "tokenCount", "passwordPolicy", "secretsManager", "webhookUrl", "sourceType", "registry", "repository"]) {
+    assert.equal(isCredentialPropertyName(name), false, `${name} should be kept`);
+  }
+
+  const integrations = secretsIntegrations();
+  const redacted = redactCredentialProperties(integrations);
+  assert.equal(integrations[0].integrationConfig.authToken, FAKE_PRISMA_SECRETS.splunkAuthToken, "the source object is not mutated");
+  assert.equal(redacted[0].integrationConfig.authToken, "[REDACTED]");
+  assert.equal(redacted[0].integrationConfig.url, "https://splunk.example.com:8088/services/collector");
+  assert.equal(redacted[1].integrationConfig.url, "https://soar.example.com/prisma?token=[REDACTED]&env=prod", "URL query credentials are scrubbed inside kept strings");
+  assert.deepEqual(redacted[1].integrationConfig.headers, [
+    { key: "Authorization", value: "[REDACTED]", secure: true },
+    { key: "Content-Type", value: "application/json", secure: false },
+  ], "only the value of a secure or credential-labelled header pair is replaced");
+  assert.equal(redacted[2].integrationConfig.webhookUrl, "https://hooks.slack.com/services/[REDACTED]");
+  assert.equal(redacted[3].integrationConfig.password, "[REDACTED]");
+  assert.equal(redacted[3].integrationConfig.login, "prisma-svc");
+  assert.equal(redacted[3].integrationConfig.hostUrl, "acme.service-now.com");
+  assert.deepEqual(redacted[3].integrationConfig.tables, { incident: true });
+  assert.equal(redacted[4].integrationConfig.secretKey, "[REDACTED]");
+
+  const compute = redactCredentialProperties(secretsComputeSnapshot());
+  assert.equal(compute.registrySettings.specifications[0].credential, "[REDACTED]", "a credential container collapses whole");
+  assert.equal(compute.registrySettings.specifications[0].credentialID, "reg-cred-1");
+  assert.equal(compute.registrySettings.specifications[0].registry, "registry.example.com");
+  assert.equal(compute.images[0].secrets, "[REDACTED]");
+  assert.deepEqual(compute.images[0].labels, { maintainer: "platform" });
+  assert.equal(compute.defenders[0].proxy.password, "[REDACTED]");
+  assert.equal(compute.defenders[0].proxy.user, "defender");
+  assert.equal(compute.defenders[0].proxy.httpProxy, "http://proxy.example.com:3128");
+  assert.equal(compute.cloudDiscovery[0].credential, "[REDACTED]");
+  assert.deepEqual(redactCredentialProperties(compute), compute, "idempotent");
+  assert.deepEqual(
+    redactCredentialProperties({ password: "", token: null, secrets: [], credential: {} }),
+    { password: "", token: null, secrets: [], credential: {} },
+    "empty credential values stay empty rather than claiming a redacted value",
+  );
+  for (const secret of Object.values(FAKE_PRISMA_SECRETS)) {
+    assert.ok(!JSON.stringify(redacted).includes(secret), `${secret} leaked from integrations`);
+    assert.ok(!JSON.stringify(compute).includes(secret), `${secret} leaked from the Compute snapshot`);
+  }
+});
+
+test("describePrismaErrorBody and PanosApiClient.parseResponse describe non-JSON or non-XML bodies by status and length and redact before the length cap", async () => {
+  const html = htmlCanaryResponse();
+  const htmlText = await html.text();
+  assert.equal(describePrismaErrorBody(html, htmlText), `non-JSON text/html response body (${htmlText.length} bytes, not echoed)`);
+
+  const json = jsonCanaryResponse();
+  assert.equal(describePrismaErrorBody(json, await json.text()), SCRUBBED_SENTENCE);
+
+  const undocumented = jsonResponse({ foo: "bar", token: CANARY_SESSION }, { status: 500 });
+  const undocumentedText = await undocumented.text();
+  assert.equal(describePrismaErrorBody(undocumented, undocumentedText), `JSON response body without documented error fields (${undocumentedText.length} bytes, not echoed)`);
+  assert.equal(describePrismaErrorBody(new Response("", { status: 503 }), ""), "empty response body");
+
+  const header = new Response("", { status: 403, headers: { "x-redlock-status": JSON.stringify([{ i18nKey: "forbidden", severity: "error", subject: `Bearer ${CANARY_BEARER}` }]) } });
+  assert.equal(describePrismaErrorBody(header, ""), "x-redlock-status forbidden, Bearer [REDACTED]; empty response body");
+  const opaqueHeader = new Response("", { status: 403, headers: { "x-redlock-status": `Bearer ${CANARY_BEARER}` } });
+  assert.equal(describePrismaErrorBody(opaqueHeader, ""), "x-redlock-status header present (not echoed); empty response body");
+
+  // A userinfo password whose "@" falls past the 200-character cap would survive if the
+  // cap were applied before redaction; redaction runs first, so the cap only shortens text.
+  const longMessage = `${"x".repeat(155)} via https://svc:${CANARY_SESSION}@proxy.example.com refused`;
+  const long = jsonResponse({ message: longMessage }, { status: 400 });
+  const described = describePrismaErrorBody(long, await long.text());
+  assertNoCanary(described, "capped Prisma message");
+  assert.ok(described.includes("https://[REDACTED]@proxy.example.com"), described);
+  assert.ok(described.length <= 200);
+
+  const panos = new PanosApiClient(
+    { host: "fw.example.com", baseUrl: "https://fw.example.com", apiKey: "LUFRPT-key" },
+    { fetchImpl: async () => xmlResponse(`<response status="error" code="403"><result><msg>${"x".repeat(255)} via https://svc:${CANARY_SESSION}@proxy.example.com refused</msg></result></response>`, 403), retryAttempts: 0 },
+  );
+  await assert.rejects(panos.showSystemInfo(), (error) => {
+    assertNoCanary(error.message, "capped PAN-OS message");
+    assert.match(error.message, /failed \(code 403, status 403\): x+ via https:\/\/\[REDACTED\]@proxy\.example\.com/);
+    return true;
+  });
+  const nonXml = new PanosApiClient({ host: "fw.example.com", baseUrl: "https://fw.example.com", apiKey: "LUFRPT-key" }, { fetchImpl: async () => htmlCanaryResponse(), retryAttempts: 0 });
+  await assert.rejects(nonXml.showConfig("/config/shared"), (error) => {
+    assertNoCanary(error.message, "PAN-OS HTML body");
+    assert.equal(error.message, `PAN-OS config show /config/shared on fw.example.com returned a non-XML text/html response (status 502, ${htmlText.length} bytes, not echoed).`);
+    return true;
+  });
+  const nonJson = new PrismaCloudClient({ apiUrl: "https://api2.prismacloud.io", accessKeyId: "k", secretKey: "s" }, {
+    fetchImpl: async (input) => (new URL(input).pathname === "/login" ? jsonResponse({ token: "jwt" }) : new Response(`<html>Bearer ${CANARY_BEARER}</html>`, { status: 200, headers: { "content-type": "text/html" } })),
+    retryAttempts: 0,
+  });
+  await assert.rejects(nonJson.listPolicies(), (error) => {
+    assertNoCanary(error.message, "Prisma 200 HTML body");
+    assert.match(error.message, /^Prisma Cloud GET \/v2\/policy returned a non-JSON text\/html response body \(\d+ bytes, not echoed\) with status 200\.$/);
+    return true;
+  });
+});
+
+test("exportPaloaltoAuditBundle and the assessment results never carry Prisma Cloud or Compute credentials while verdicts still read the same evidence", async () => {
+  const base = createTempBase("grclanker-paloalto-prisma-secrets-");
+  const secrets = Object.values(FAKE_PRISMA_SECRETS);
+  const clients = createPaloaltoClients(bothProductsConfig(), mockedFetch({ withSecrets: true }));
+  const result = await exportPaloaltoAuditBundle(clients, base);
+  assert.equal(result.errorCount, 0);
+
+  const files = readBundleFiles(result.outputDir);
+  assertSecretsAbsent(assert, files, secrets, "bundle directory");
+  const zipEntries = readZipEntries(result.zipPath);
+  assert.equal(zipEntries.size, files.size);
+  assertSecretsAbsent(assert, zipEntries, secrets, "zip archive");
+
+  const prisma = JSON.parse(files.get(join("core_data", "prisma_cloud.json")));
+  const integration = (name) => prisma.integrations.find((item) => item.name === name).integrationConfig;
+  assert.equal(integration("splunk").authToken, "[REDACTED]");
+  assert.equal(integration("splunk").url, "https://splunk.example.com:8088/services/collector");
+  assert.equal(integration("soar-webhook").url, "https://soar.example.com/prisma?token=[REDACTED]&env=prod");
+  assert.deepEqual(integration("soar-webhook").headers, [{ key: "Authorization", value: "[REDACTED]", secure: true }, { key: "Content-Type", value: "application/json", secure: false }]);
+  assert.equal(integration("slack").webhookUrl, "https://hooks.slack.com/services/[REDACTED]");
+  assert.equal(integration("servicenow").password, "[REDACTED]");
+  assert.equal(integration("servicenow").login, "prisma-svc");
+  assert.equal(integration("tenable").secretKey, "[REDACTED]");
+  const registry = prisma.compute.registrySettings.specifications[0];
+  assert.equal(registry.credential, "[REDACTED]");
+  assert.equal(registry.credentialID, "reg-cred-1");
+  assert.equal(prisma.compute.images[0].secrets, "[REDACTED]");
+  assert.equal(prisma.compute.defenders[0].proxy.password, "[REDACTED]");
+  assert.equal(prisma.compute.defenders[0].proxy.user, "defender");
+  assert.equal(prisma.compute.cloudDiscovery[0].credential, "[REDACTED]");
+
+  const findings = JSON.parse(files.get(join("analysis", "findings.json")));
+  for (const id of ["PA-10", "PA-11", "PA-20", "PA-24"]) assert.equal(byId(findings, id).status, "pass", `${id}: ${byId(findings, id).summary}`);
+  assert.deepEqual(byId(findings, "PA-20").evidence.prisma_integrations, ["splunk (splunk)", "soar-webhook (webhook)", "slack (slack)", "servicenow (service_now)", "tenable (tenable)"]);
+  assert.match(files.get("QUICK_REFERENCE.md"), /credential-named properties replaced by \[REDACTED\]/);
+
+  // The same redacted snapshot feeds every assessment result the tools spread into their payloads.
+  const access = await checkPaloaltoAccess(clients);
+  const payloads = [access, await assessPaloaltoCloudPosture(clients), await assessPaloaltoThreatPrevention(clients), await assessPaloaltoDeviceHardening(clients)];
+  for (const payload of payloads) assertSecretsAbsent(assert, new Map([["payload", JSON.stringify(payload)]]), secrets, payload.title ?? "access check");
+});
+
+// ---------------------------------------------------------------------------
+// Error-string canary sweep: every surface, every device, two body shapes
+// ---------------------------------------------------------------------------
+
+const PANOS_SWEEP_HOSTS = ["fw1.example.com", "fw2.example.com"];
+const FIREWALL_XPATHS = ["/config/devices/entry/vsys", "/config/devices/entry/network", "/config/devices/entry/deviceconfig", "/config/shared", "/config/mgt-config"];
+const PRISMA_CLOUD_PATHS = ["/login", "/meta_info", "/v2/compliance/posture", "/v2/alert/rule", "/v2/alert", "/v2/policy", "/cloud", "/cloud/group", "/user/role", "/integration"];
+const PRISMA_COMPUTE_PATHS = ["/authenticate", "/defenders", "/policies/runtime/container", "/policies/compliance/container", "/policies/compliance/host", "/policies/vulnerability/images", "/settings/registry", "/registry", "/images", "/stats/vulnerabilities", "/stats/compliance", "/cloud/discovery", "/scans"];
+
+// Every HTTP surface the three clients read, keyed by product (or PAN-OS host) and path.
+function paloaltoRouteKey(input, init = {}) {
+  const url = new URL(input);
+  if (url.hostname.endsWith("prismacloud.io")) return `prisma-cloud ${url.pathname}`;
+  if (url.hostname === "compute.example.com") return `prisma-compute ${url.pathname.replace(/^\/api\/v1/, "")}`;
+  if ((init.method ?? "GET") === "POST") return `${url.hostname} keygen`;
+  if (url.searchParams.get("type") === "op") return `${url.hostname} ${url.searchParams.get("cmd").includes("high-availability") ? "ha_state" : "system_info"}`;
+  return `${url.hostname} ${url.searchParams.get("xpath")}`;
+}
+
+const PALOALTO_SURFACES = [
+  ...PRISMA_CLOUD_PATHS.map((path) => `prisma-cloud ${path}`),
+  ...PRISMA_COMPUTE_PATHS.map((path) => `prisma-compute ${path}`),
+  ...PANOS_SWEEP_HOSTS.flatMap((host) => ["keygen", "system_info", "ha_state", ...FIREWALL_XPATHS].map((surface) => `${host} ${surface}`)),
+];
+
+function sweepFetch(failingSurface, makeResponse) {
+  const healthy = mockedFetch();
+  return async (input, init = {}) => (paloaltoRouteKey(input, init) === failingSurface ? makeResponse() : healthy(input, init));
+}
+
+// Both products and two devices reached through keygen, so key generation is a surface
+// too; retries are off so a 502 fails immediately instead of sleeping through backoff.
+function sweepConfig() {
+  return {
+    ...resolvePaloaltoConfiguration({}, {
+      PRISMA_API_URL: "https://api2.prismacloud.io",
+      PRISMA_ACCESS_KEY_ID: "key",
+      PRISMA_SECRET_KEY: "secret",
+      PANOS_HOST: PANOS_SWEEP_HOSTS.join(","),
+      PANOS_USERNAME: "auditor",
+      PANOS_PASSWORD: "hunter2",
+    }),
+    retryAttempts: 0,
+  };
+}
+
+const HTML_MARKERS = {
+  "prisma-cloud": /\(502\): non-JSON text\/html response body \(\d+ bytes, not echoed\)/,
+  "prisma-compute": /\(502\): non-JSON text\/html response body \(\d+ bytes, not echoed\)/,
+  "pan-os": /returned a non-XML text\/html response \(status 502, \d+ bytes, not echoed\)/,
+};
+const STRUCTURED_MARKERS = {
+  "prisma-cloud": new RegExp(`\\(400\\): ${escapeRegExp(SCRUBBED_SENTENCE)}`),
+  "prisma-compute": new RegExp(`\\(400\\): ${escapeRegExp(SCRUBBED_SENTENCE)}`),
+  "pan-os": new RegExp(`failed \\(code 403, status 403\\): ${escapeRegExp(SCRUBBED_SENTENCE)}`),
+};
+const ECHOED_BODY_TEXT = /<html|<!DOCTYPE|Set-Cookie|X-Api-Key:|did not answer/i;
+
+test("the two-device keygen sweep fixture is healthy before the canary sweep relies on it", async () => {
+  const clients = createPaloaltoClients(sweepConfig(), sweepFetch("none", () => htmlCanaryResponse()));
+  const access = await checkPaloaltoAccess(clients);
+  assert.equal(access.status, "healthy");
+  assert.equal(access.surfaces.length, 8 + 8 + 2 * 7);
+  const result = await exportPaloaltoAuditBundle(clients, createTempBase("grclanker-paloalto-sweep-healthy-"));
+  assert.equal(result.errorCount, 0);
+  const findings = JSON.parse(readBundleFiles(result.outputDir).get(join("analysis", "findings.json")));
+  assert.deepEqual(findings.filter((item) => item.status !== "pass").map((item) => item.id), ["PA-25"]);
+});
+
+test("error-body canary sweep: every Palo Alto surface on every device failing with an HTML 502 or a JSON/XML error body leaks no credential into any probe, finding, summary, or bundle file", async () => {
+  assert.equal(PALOALTO_SURFACES.length, 10 + 13 + 16, "every endpoint the clients read is enumerated, per device");
+  const shapes = [
+    { name: "html-502", make: () => htmlCanaryResponse(), markers: HTML_MARKERS },
+    { name: "structured-error", make: (product) => (product === "pan-os" ? xmlCanaryResponse() : jsonCanaryResponse()), markers: STRUCTURED_MARKERS },
+  ];
+  const productOf = (surface) => (surface.startsWith("prisma-cloud ") ? "prisma-cloud" : surface.startsWith("prisma-compute ") ? "prisma-compute" : "pan-os");
+  // Surfaces the access check does not probe directly (Compute registry scans, images, and
+  // compliance stats are collector-only) still flow through the collectors and _errors.log.
+  const unprobed = new Set(["prisma-cloud /meta_info", "prisma-compute /registry", "prisma-compute /images", "prisma-compute /stats/compliance"]);
+  for (const shape of shapes) {
+    for (const surface of PALOALTO_SURFACES) {
+      const product = productOf(surface);
+      const label = `${shape.name} on ${surface}`;
+      const marker = shape.markers[product];
+      const clients = createPaloaltoClients(sweepConfig(), sweepFetch(surface, () => shape.make(product)));
+      const bundle = await exportPaloaltoAuditBundle(clients, createTempBase("grclanker-paloalto-canary-"));
+      const files = readBundleFiles(bundle.outputDir);
+      const zipEntries = readZipEntries(bundle.zipPath);
+      assert.equal(zipEntries.size, files.size, `${label}: the zip carries exactly the written files`);
+      for (const [name, text] of files) assertNoCanary(text, `${label} bundle ${name}`);
+      for (const [name, text] of zipEntries) assertNoCanary(text, `${label} zip ${name}`);
+
+      const access = JSON.parse(files.get(join("core_data", "access.json")));
+      const failedProbes = access.surfaces.filter((entry) => entry.status !== "readable");
+      if (surface === "prisma-compute /authenticate") {
+        // The Compute token exchange falls back to the CSPM JWT, so nothing fails and nothing is recorded.
+        assert.equal(failedProbes.length, 0, label);
+        assert.equal(bundle.errorCount, 0, label);
+        assert.equal(access.status, "healthy", label);
+        continue;
+      }
+      if (!unprobed.has(surface)) assert.ok(failedProbes.length >= 1, `${label}: the failing surface must probe as not readable`);
+      for (const probe of failedProbes) {
+        assert.equal(probe.status, "not_readable", `${label}: ${probe.name} status`);
+        assert.match(probe.error, marker, `${label}: probe ${probe.name} must carry the note: ${probe.error}`);
+        assert.doesNotMatch(probe.error, ECHOED_BODY_TEXT, `${label}: body text echoed into probe ${probe.name}: ${probe.error}`);
+      }
+      for (const note of access.notes) assert.doesNotMatch(note, ECHOED_BODY_TEXT, `${label}: body text echoed into a note: ${note}`);
+
+      assert.ok(bundle.errorCount >= 1, `${label}: the failing surface must be recorded as a collection error`);
+      const errorLog = files.get("_errors.log");
+      assert.ok(errorLog !== undefined, `${label}: _errors.log must exist`);
+      for (const line of errorLog.trim().split("\n")) {
+        assert.match(line, marker, `${label}: every error must carry the note: ${line}`);
+        assert.doesNotMatch(line, ECHOED_BODY_TEXT, `${label}: body text echoed: ${line}`);
+      }
+      const findings = JSON.parse(files.get(join("analysis", "findings.json")));
+      for (const item of findings) {
+        if (marker.test(item.summary) || marker.test(JSON.stringify(item.evidence ?? {}))) {
+          assert.notEqual(item.status, "pass", `${label}: ${item.id} passed while naming the failed read`);
+        }
+      }
+      assert.ok(findings.some((item) => item.status === "manual"), `${label}: the failed read must leave at least one finding manual`);
+      for (const analysis of ["cloud_posture", "firewall_policy", "threat_prevention", "device_hardening"]) {
+        const result = JSON.parse(files.get(join("analysis", `${analysis}.json`)));
+        for (const error of result.errors) assert.match(error, marker, `${label}: ${analysis} error must carry the note: ${error}`);
+      }
+    }
+  }
+});
+
+test("the registered tools scrub error strings end to end over HTTP: access check, every assess tool, and the export", async () => {
+  const failing = new Map();
+  const upstream = mockedFetch();
+  let port = 0;
+  // Bridges real HTTP requests from the tools onto the mocked fixtures: /prisma, /compute,
+  // and /panos prefixes stand in for the three hosts, and /meta_info points Compute
+  // discovery back at this server.
+  const server = createServer((request, response) => {
+    let body = "";
+    request.on("data", (chunk) => { body += chunk; });
+    request.on("end", async () => {
+      const match = /^\/(prisma|compute|panos)(\/.*)$/.exec(request.url);
+      const origin = match[1] === "prisma" ? "https://api2.prismacloud.io" : match[1] === "compute" ? "https://compute.example.com" : "https://fw1.example.com";
+      const target = `${origin}${match[2]}`;
+      const init = { method: request.method, body: request.method === "POST" ? body : undefined };
+      const key = paloaltoRouteKey(target, init);
+      const upstreamResponse = failing.has(key)
+        ? failing.get(key)()
+        : key === "prisma-cloud /meta_info"
+          ? jsonResponse({ twistlockUrl: `http://127.0.0.1:${port}/compute` })
+          : await upstream(target, init);
+      const text = await upstreamResponse.text();
+      response.writeHead(upstreamResponse.status, Object.fromEntries(upstreamResponse.headers));
+      response.end(text);
+    });
+  });
+  await new Promise((resolveListen) => server.listen(0, "127.0.0.1", resolveListen));
+  port = server.address().port;
+
+  const tools = new Map();
+  registerPaloaltoTools({ registerTool: (tool) => tools.set(tool.name, tool) });
+  const baseArgs = {
+    prisma_api_url: `http://127.0.0.1:${port}/prisma`,
+    prisma_access_key_id: "key",
+    prisma_secret_key: "secret",
+    panos_hosts: `http://127.0.0.1:${port}/panos`,
+    panos_api_key: "LUFRPT-key",
+  };
+  const run = async (name, extra = {}) => {
+    const tool = tools.get(name);
+    return tool.execute("call-sweep", tool.prepareArguments({ ...baseArgs, ...extra }));
+  };
+  const anyMarker = (markers) => new RegExp([markers["prisma-cloud"], markers["pan-os"]].map((pattern) => pattern.source).join("|"));
+
+  try {
+    for (const shape of [
+      { name: "structured-error", prisma: jsonCanaryResponse, panos: xmlCanaryResponse, markers: STRUCTURED_MARKERS },
+      { name: "html-502", prisma: htmlCanaryResponse, panos: htmlCanaryResponse, markers: HTML_MARKERS },
+    ]) {
+      failing.clear();
+      failing.set("prisma-cloud /v2/policy", shape.prisma);
+      failing.set("prisma-compute /defenders", shape.prisma);
+      failing.set("fw1.example.com /config/mgt-config", shape.panos);
+      const marker = anyMarker(shape.markers);
+
+      const access = await run("paloalto_check_access");
+      assertNoCanary(JSON.stringify(access), `${shape.name} paloalto_check_access`);
+      assert.notEqual(access.isError, true, access.content[0].text);
+      assert.equal(access.details.status, "degraded");
+      const failedProbes = access.details.surfaces.filter((probe) => probe.status !== "readable");
+      assert.deepEqual(failedProbes.map((probe) => probe.name).sort(), ["defenders", "mgt-config", "policies"]);
+      for (const probe of failedProbes) assert.match(probe.error, shape.markers[probe.product], `${shape.name}: ${probe.name}: ${probe.error}`);
+      assert.doesNotMatch(access.content[0].text, ECHOED_BODY_TEXT);
+      // The Note column is capped at 80 characters, so only the head of the note is guaranteed to render.
+      assert.match(access.content[0].text, /non-JSON text\/html response body|non-XML text\/html response|\[REDACTED\]/, "the rendered table carries the note or the marker");
+
+      for (const name of ["paloalto_assess_cloud_posture", "paloalto_assess_firewall_policy", "paloalto_assess_threat_prevention", "paloalto_assess_device_hardening"]) {
+        const result = await run(name);
+        assertNoCanary(JSON.stringify(result), `${shape.name} ${name}`);
+        assert.notEqual(result.isError, true, result.content[0].text);
+        assert.ok(result.details.errors.length >= 1, `${name}: the failing surfaces must be recorded`);
+        for (const error of result.details.errors) {
+          assert.match(error, marker, `${shape.name} ${name}: ${error}`);
+          assert.doesNotMatch(error, ECHOED_BODY_TEXT, error);
+        }
+        assert.doesNotMatch(result.content[0].text, ECHOED_BODY_TEXT);
+      }
+
+      const exported = await run("paloalto_export_audit_bundle", { output_dir: createTempBase("grclanker-paloalto-tool-export-") });
+      assertNoCanary(JSON.stringify(exported), `${shape.name} paloalto_export_audit_bundle`);
+      assert.notEqual(exported.isError, true, exported.content[0].text);
+      const files = readBundleFiles(exported.details.output_dir);
+      for (const [name, text] of files) assertNoCanary(text, `${shape.name} tool bundle ${name}`);
+      for (const [name, text] of readZipEntries(exported.details.zip_path)) assertNoCanary(text, `${shape.name} tool zip ${name}`);
+      for (const line of files.get("_errors.log").trim().split("\n")) assert.match(line, marker, line);
+    }
+  } finally {
+    server.close();
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Rule 10: pagination exits that must report truncation, with the reason
+// ---------------------------------------------------------------------------
+
+test("collectOpenAlerts reports every exit other than the cursor ending as truncated with the reason, and the dependent findings demote", async () => {
+  const alert = (id) => ({ id, policy: { name: `policy-${id}`, policyType: "config", severity: "low" } });
+  const scripted = (pages) => {
+    let index = 0;
+    return new PrismaCloudClient({ apiUrl: "https://api2.prismacloud.io", accessKeyId: "k", secretKey: "s" }, {
+      fetchImpl: async (input) => {
+        if (new URL(input).pathname === "/login") return jsonResponse({ token: "jwt" });
+        const page = pages[Math.min(index, pages.length - 1)];
+        index += 1;
+        return jsonResponse(page);
+      },
+      sleepImpl: noSleep,
+    });
+  };
+
+  const emptyPage = await scripted([{ items: [alert(1)], nextPageToken: "t1" }, { items: [], nextPageToken: "t2" }]).collectOpenAlerts(50);
+  assert.equal(emptyPage.truncated, true);
+  assert.equal(emptyPage.items.length, 1);
+  assert.match(emptyPage.truncationReason, /empty page while still returning a nextPageToken/);
+
+  const stuck = await scripted([{ items: [alert(1)], nextPageToken: "t1" }, { items: [alert(2)], nextPageToken: "t1" }]).collectOpenAlerts(50);
+  assert.equal(stuck.truncated, true);
+  assert.equal(stuck.items.length, 2);
+  assert.match(stuck.truncationReason, /repeated a nextPageToken \(stuck cursor\)/);
+
+  const capped = await scripted([{ items: [alert(1), alert(2)], nextPageToken: "t1" }, { items: [alert(3), alert(4)], nextPageToken: "t2" }]).collectOpenAlerts(3);
+  assert.equal(capped.truncated, true);
+  assert.equal(capped.items.length, 3, "the cap is never exceeded");
+  assert.match(capped.truncationReason, /alert_limit 3 reached/);
+
+  const surplus = await scripted([{ items: [alert(1), alert(2), alert(3)] }]).collectOpenAlerts(2);
+  assert.equal(surplus.truncated, true, "a server that ignores the limit parameter still reports truncation");
+  assert.equal(surplus.items.length, 2);
+
+  const undercount = await scripted([{ items: [alert(1)], totalRows: 7 }]).collectOpenAlerts(50);
+  assert.equal(undercount.truncated, true);
+  assert.match(undercount.truncationReason, /totalRows 7 but the cursor ended after 1 alerts/);
+
+  const complete = await scripted([{ items: [alert(1)], nextPageToken: "t1", totalRows: 2 }, { items: [alert(2)], totalRows: 2 }]).collectOpenAlerts(50);
+  assert.equal(complete.truncated, false);
+  assert.equal(complete.truncationReason, undefined);
+  assert.equal(complete.items.length, 2);
+
+  const source = {
+    getCompliancePosture: async () => prismaSnapshot().posture,
+    listAlertRules: async () => prismaSnapshot().alertRules,
+    collectOpenAlerts: async () => stuck,
+    listPolicies: async () => prismaSnapshot().policies,
+    listCloudAccounts: async () => prismaSnapshot().cloudAccounts,
+    listAccountGroups: async () => prismaSnapshot().accountGroups,
+    listUserRoles: async () => prismaSnapshot().userRoles,
+    listIntegrations: async () => prismaSnapshot().integrations,
+  };
+  const snapshot = await collectPrismaSnapshot(source, 50);
+  assert.equal(snapshot.alertsTruncated, true);
+  assert.match(snapshot.alertsTruncationReason, /stuck cursor/);
+  const findings = assessPrismaCloudPosture(snapshot);
+  for (const id of ["PA-02", "PA-03", "PA-05", "PA-06"]) {
+    assert.equal(byId(findings, id).status, "warn", `${id}: ${byId(findings, id).summary}`);
+    assert.match(byId(findings, id).summary, /Partial inventory: open alerts truncated at 2 \(GET \/v2\/alert repeated a nextPageToken \(stuck cursor\)/);
+    assert.deepEqual(byId(findings, id).evidence.partial_inventory.length, 1);
+  }
+  assert.equal(byId(findings, "PA-01").status, "pass", "a finding that does not read alerts is not demoted");
+  const result = await assessPaloaltoCloudPosture(createPaloaltoClients(bothProductsConfig(), mockedFetch()), {}, snapshot);
+  assert.equal(result.summary.open_alerts_truncated, true);
+  assert.match(result.summary.open_alerts_truncation_reason, /stuck cursor/);
+  assert.equal(result.summary.open_alerts_sampled, 2);
+});
+
+test("Compute listPaged reports a stuck offset and the record cap as truncated with the reason, and PA-10 demotes", async () => {
+  const fullPage = (offset, distinct) => Array.from({ length: 50 }, (_, index) => ({ hostname: distinct ? `node-${offset + index}` : `node-${index}`, connected: true, version: "34.00.100", lastModified: "2026-09-01T00:00:00Z" }));
+  const client = (distinct) => {
+    const fetchImpl = async (input) => {
+      const url = new URL(input);
+      if (url.pathname === "/login") return jsonResponse({ token: "jwt" });
+      if (url.pathname === "/api/v1/authenticate") return jsonResponse({ token: "compute-token" });
+      if (url.pathname.startsWith("/api/v1/policies") || url.pathname.startsWith("/api/v1/settings") || url.pathname.startsWith("/api/v1/stats")) return jsonResponse({});
+      return jsonResponse(fullPage(Number(url.searchParams.get("offset")), distinct));
+    };
+    return new PrismaComputeClient("https://compute.example.com", new PrismaCloudClient({ apiUrl: "https://api2.prismacloud.io", accessKeyId: "k", secretKey: "s" }, { fetchImpl, sleepImpl: noSleep }));
+  };
+
+  const stuck = await client(false).listDefenders(1000);
+  assert.equal(stuck.truncated, true);
+  assert.equal(stuck.items.length, 50, "the repeated page is not appended twice");
+  assert.match(stuck.truncationReason, /returned the same page for offset 50 as for the previous offset \(stuck offset\)/);
+
+  const capped = await client(true).listDefenders(120);
+  assert.equal(capped.truncated, true);
+  assert.equal(capped.items.length, 150);
+  assert.match(capped.truncationReason, /capped at 120 records while full pages were still being returned/);
+
+  const compute = await collectComputeSnapshot(client(false));
+  assert.deepEqual(compute.failed, []);
+  assert.deepEqual(compute.truncated, ["defenders", "registry scans", "images", "cloud discovery", "ci scans"]);
+  assert.match(compute.truncationReasons.defenders, /stuck offset/);
+  const findings = assessPrismaCompute(prismaSnapshot({ compute }));
+  assert.equal(byId(findings, "PA-10").status, "warn");
+  assert.match(byId(findings, "PA-10").summary, /Partial inventory: prisma-compute defenders truncated \(GET \/api\/v1\/defenders returned the same page for offset 50/);
+  assert.equal(byId(findings, "PA-10").evidence.defenders, 50);
+});
+
+test("checkPaloaltoAccess marks probes that stopped at the page cap as partial with lower-bound counts", async () => {
+  const healthy = mockedFetch();
+  const fetchImpl = async (input, init) => {
+    const url = new URL(input);
+    if (url.hostname.endsWith("prismacloud.io") && url.pathname === "/v2/alert") {
+      return jsonResponse({ items: Array.from({ length: 100 }, (_, index) => ({ id: index })), nextPageToken: "more", totalRows: 5000 });
+    }
+    if (url.hostname === "compute.example.com" && url.pathname === "/api/v1/defenders") {
+      return jsonResponse(Array.from({ length: 50 }, (_, index) => ({ hostname: `node-${index}` })));
+    }
+    return healthy(input, init);
+  };
+  const result = await checkPaloaltoAccess(createPaloaltoClients(bothProductsConfig(), fetchImpl));
+  assert.equal(result.status, "healthy", "a capped probe is readable, just not an inventory total");
+  const alerts = result.surfaces.find((surface) => surface.name === "open_alerts");
+  assert.equal(alerts.partial, true);
+  assert.equal(alerts.count, 100);
+  const defenders = result.surfaces.find((surface) => surface.name === "defenders");
+  assert.equal(defenders.partial, true);
+  assert.equal(defenders.count, 50);
+  assert.ok(result.surfaces.filter((surface) => surface.partial).length === 2);
+  assert.ok(result.notes.some((note) => /2 probes stopped at the page cap, so counts marked \+ are lower bounds, not inventory totals/.test(note)), result.notes.join("\n"));
+  const plain = await checkPaloaltoAccess(createPaloaltoClients(bothProductsConfig(), healthy));
+  assert.ok(plain.surfaces.every((surface) => surface.partial === undefined));
+  assert.ok(!plain.notes.some((note) => /page cap/.test(note)));
+});
+
+// ---------------------------------------------------------------------------
+// Rule 1 corollary and uniform null rendering
+// ---------------------------------------------------------------------------
+
+test("PA-15 gates on /config/shared and renders mfa_authentication_profiles null when the shared tree was not read", () => {
+  const sharedFailed = panosSnapshot({ failedXpaths: ["/config/shared"] });
+  sharedFailed.config = sharedFailed.config.filter((tree) => !tree.children.some((child) => child.name === "shared"));
+  const finding = byId(assessPanosDeviceHardening([sharedFailed]), "PA-15");
+  assert.equal(finding.status, "manual", finding.summary);
+  assert.match(finding.summary, /Evidence unavailable \(fw1\.example\.com config show failed for \/config\/shared\)/);
+  assert.equal(finding.evidence.mfa_authentication_profiles, null, "the MFA list comes from the shared tree, so it is unknown rather than empty");
+  assert.deepEqual(finding.evidence.portals, ["fw1.example.com/portal"], "GlobalProtect objects from the readable vsys tree are still reported");
+  assert.deepEqual(finding.evidence.unreadable_sources, ["fw1.example.com config show failed for /config/shared"]);
+
+  const networkFailed = panosSnapshot({ failedXpaths: ["/config/devices/entry/network"] });
+  const gp = byId(assessPanosDeviceHardening([networkFailed]), "PA-15");
+  assert.equal(gp.status, "manual");
+  assert.equal(gp.evidence.portals, null);
+  assert.equal(gp.evidence.gateways, null);
+
+  const readable = byId(assessPanosDeviceHardening([panosSnapshot()]), "PA-15");
+  assert.equal(readable.status, "pass");
+  assert.deepEqual(readable.evidence.mfa_authentication_profiles, ["fw1.example.com/mfa-radius"]);
+});
+
+test("evidence and summaries derived from unreadable surfaces render null, never 0 or an empty list", async () => {
+  const cspm = assessPrismaCloudPosture(prismaSnapshot({ failed: ["cloud accounts", "open alerts", "policies"] }));
+  const accounts = byId(cspm, "PA-04");
+  assert.equal(accounts.status, "manual");
+  assert.equal(accounts.evidence.accounts, null);
+  assert.equal(accounts.evidence.disabled_accounts, null);
+  assert.equal(accounts.evidence.ungrouped_accounts, null);
+  assert.equal(accounts.evidence.account_groups, 1, "the readable half keeps its value");
+  const rules = byId(cspm, "PA-02");
+  assert.equal(rules.status, "manual");
+  assert.deepEqual(rules.evidence.open_alerts, { count: null, critical: null, high: null, top_policies: null });
+  assert.deepEqual(rules.evidence.enabled_rules, ["all-critical"]);
+  const iam = byId(cspm, "PA-03");
+  assert.equal(iam.evidence.iam_policies, null);
+  assert.equal(iam.evidence.iam_policies_enabled, null);
+  assert.equal(iam.evidence.iam_alerts.count, null);
+  const network = byId(cspm, "PA-05");
+  assert.equal(network.evidence.network_policies_enabled, null);
+  assert.equal(network.evidence.count, null);
+  assert.equal(network.evidence.top_policies, null);
+  const encryption = byId(cspm, "PA-06");
+  assert.equal(encryption.evidence.encryption_policies, null);
+  assert.equal(encryption.evidence.encryption_alerts.critical, null);
+  const posture = byId(assessPrismaCloudPosture(prismaSnapshot({ failed: ["compliance posture"] })), "PA-01");
+  assert.equal(posture.status, "manual");
+  assert.equal(posture.evidence.passed_resources, null);
+  assert.equal(posture.evidence.failed_resources, null);
+  assert.equal(posture.evidence.standards, null);
+
+  const compute = assessPrismaCompute(prismaSnapshot({ compute: computeSnapshot({ failed: ["defenders", "images", "registry scans", "cloud discovery", "ci scans", "compliance stats"] }) }));
+  assert.equal(byId(compute, "PA-07").evidence.images_scanned, null);
+  assert.equal(byId(compute, "PA-07").evidence.critical_cves, null);
+  assert.equal(byId(compute, "PA-07").evidence.vulnerability_rules_enabled, 1, "the readable policy keeps its count");
+  assert.equal(byId(compute, "PA-08").evidence.connected_defenders, null);
+  assert.equal(byId(compute, "PA-08").evidence.compliance_rate, null);
+  assert.equal(byId(compute, "PA-08").evidence.compliance_total, null);
+  assert.equal(byId(compute, "PA-08").evidence.host_rules_enabled, 1);
+  assert.equal(byId(compute, "PA-09").evidence.connected_defenders, null);
+  assert.deepEqual(byId(compute, "PA-09").evidence.protective_rules, ["default"]);
+  assert.equal(byId(compute, "PA-10").evidence.defenders, null);
+  assert.equal(byId(compute, "PA-10").evidence.disconnected, null);
+  assert.equal(byId(compute, "PA-10").evidence.versions, null);
+  assert.equal(byId(compute, "PA-11").evidence.registry_scans, null);
+  assert.deepEqual(byId(compute, "PA-11").evidence.registries, ["registry.example.com/*"]);
+  assert.equal(byId(compute, "PA-24").evidence.discovery_entries, null);
+  assert.equal(byId(compute, "PA-24").evidence.unprotected, null);
+  assert.equal(byId(compute, "PA-25").evidence.ci_scans, null);
+  assert.equal(byId(compute, "PA-25").evidence.failed_scans, null);
+  for (const id of ["PA-07", "PA-08", "PA-09", "PA-10", "PA-11", "PA-24", "PA-25"]) assert.equal(byId(compute, id).status, "manual", id);
+
+  const admin = assessAdminAccess(prismaSnapshot({ failed: ["user roles"] }), [panosSnapshot({ failedXpaths: ["/config/mgt-config"] })]);
+  assert.equal(admin.status, "manual");
+  assert.equal(admin.evidence.panos_admins, null);
+  assert.equal(admin.evidence.panos_local_password_only, null);
+  assert.equal(admin.evidence.password_complexity_by_device, null);
+  assert.equal(admin.evidence.prisma_roles, null);
+  const adminRolesOnly = assessAdminAccess(prismaSnapshot({ failed: ["user roles"] }), [panosSnapshot()]);
+  assert.equal(adminRolesOnly.evidence.prisma_roles, null);
+  assert.deepEqual(adminRolesOnly.evidence.panos_admins, ["fw1.example.com/admin (superuser)", "fw1.example.com/auditor"]);
+
+  const logging = assessLogging(prismaSnapshot({ failed: ["integrations"] }), [panosSnapshot({ failedXpaths: ["/config/devices/entry/deviceconfig"] })]);
+  assert.equal(logging.status, "manual");
+  assert.equal(logging.evidence.prisma_integrations, null);
+  assert.equal(logging.evidence.syslog_server_profiles, null);
+  assert.equal(logging.evidence.log_forwarding_profiles, null);
+  assert.equal(logging.evidence.panorama_forwarding, null);
+  assert.deepEqual(logging.evidence.unlogged_rules, [], "rule logging came from the readable vsys tree, so its empty list is real");
+
+  const clients = createPaloaltoClients(bothProductsConfig(), mockedFetch());
+  const cloud = await assessPaloaltoCloudPosture(clients, {}, prismaSnapshot({ failed: ["cloud accounts", "open alerts"], compute: computeSnapshot({ failed: ["defenders"], truncated: ["images"] }) }));
+  assert.equal(cloud.summary.cloud_accounts, null);
+  assert.equal(cloud.summary.open_alerts_sampled, null);
+  assert.equal(cloud.summary.open_alerts_truncated, null);
+  assert.equal(cloud.summary.open_alerts_truncation_reason, null);
+  assert.deepEqual(cloud.summary.unreadable_surfaces, ["prisma-cloud cloud accounts", "prisma-cloud open alerts", "prisma-compute defenders"]);
+  assert.deepEqual(cloud.summary.truncated_surfaces, ["prisma-compute images"]);
+  const healthySummary = (await assessPaloaltoCloudPosture(clients)).summary;
+  assert.equal(healthySummary.cloud_accounts, 1);
+  assert.equal(healthySummary.open_alerts_sampled, 0);
+  assert.equal(healthySummary.open_alerts_truncated, false);
+  assert.deepEqual(healthySummary.unreadable_surfaces, []);
+
+  const devices = [panosSnapshot(), panosSnapshot({ host: "fw2.example.com", reachable: false, haStateFailed: true, failedXpaths: ["/config/shared"] })];
+  const threat = await assessPaloaltoThreatPrevention(clients, devices, prismaSnapshot({ failed: ["policies"] }));
+  assert.equal(threat.summary.devices, 2);
+  assert.deepEqual(threat.summary.unreachable_hosts, ["fw2.example.com"]);
+  assert.deepEqual(threat.summary.failed_xpaths, ["fw2.example.com: /config/shared"]);
+  assert.deepEqual(threat.summary.ha_state_unreadable, ["fw2.example.com"]);
+  assert.deepEqual(threat.summary.prisma_unreadable_surfaces, ["prisma-cloud policies"]);
+  const hardening = await assessPaloaltoDeviceHardening(clients, {}, devices, prismaSnapshot());
+  assert.deepEqual(hardening.summary.unreachable_hosts, ["fw2.example.com"]);
+  assert.deepEqual(hardening.summary.prisma_unreadable_surfaces, []);
+  const firewall = await assessPaloaltoFirewallPolicy(clients, devices);
+  assert.deepEqual(firewall.summary.platforms, ["fw1.example.com: firewall", "fw2.example.com: firewall"]);
+  assert.ok(firewall.findings.every((item) => item.status === "manual"), "an unreachable device leaves every multi-device finding manual");
+});
+
 test("resolveSecureOutputPath rejects traversal and symlink parents", () => {
   const base = createTempBase("grclanker-paloalto-path-");
   const outside = createTempBase("grclanker-paloalto-outside-");
@@ -1313,15 +2056,20 @@ async function runAllAssessments(clients) {
   return results.flatMap((result) => result.findings);
 }
 
+// Retries are disabled so the unreachable device fails immediately instead of sleeping
+// through the exponential backoff; retry behavior has its own coverage above.
 function twoDeviceConfig(extra = {}) {
-  return resolvePaloaltoConfiguration({}, {
-    PRISMA_API_URL: "https://api2.prismacloud.io",
-    PRISMA_ACCESS_KEY_ID: "key",
-    PRISMA_SECRET_KEY: "secret",
-    PANOS_HOST: "fw1.example.com,fw2.example.com",
-    PANOS_API_KEY: "LUFRPT-key",
-    ...extra,
-  });
+  return {
+    ...resolvePaloaltoConfiguration({}, {
+      PRISMA_API_URL: "https://api2.prismacloud.io",
+      PRISMA_ACCESS_KEY_ID: "key",
+      PRISMA_SECRET_KEY: "secret",
+      PANOS_HOST: "fw1.example.com,fw2.example.com",
+      PANOS_API_KEY: "LUFRPT-key",
+      ...extra,
+    }),
+    retryAttempts: 0,
+  };
 }
 
 test("false-pass self-check (a): every endpoint forbidden or erroring yields no pass", async () => {

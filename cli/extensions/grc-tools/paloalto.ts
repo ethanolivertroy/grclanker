@@ -384,15 +384,18 @@ export const REDACTION_MARKER = "[REDACTED]";
 
 // Unanchored patterns for credential-shaped text that an upstream body, proxy page, or
 // transport error may echo regardless of what this tool sent: bearer and basic tokens,
-// header lines, key=value or key: value pairs with a credential word in the key, PAN-OS
-// API keys (LUFRPT...), JWTs, and URL userinfo. Applied to every error string in
-// redactSecrets (the client throw sites) and again in errorMessage (the sink every
-// collector, access probe, and tool catch block reads through).
+// header lines, key=value or key: value pairs with a credential word in the key, JSON
+// pairs quoted inside a message ("password":"..."), PAN-OS API keys (LUFRPT...), JWTs,
+// and URL userinfo. Applied to every error string in redactSecrets (the client throw
+// sites) and again in errorMessage (the sink every collector, access probe, and tool
+// catch block reads through). Redaction always runs before any length cap so a value
+// cut by the cap can never survive as a prefix.
 const ERROR_TEXT_PATTERNS: Array<[RegExp, string]> = [
   [/\b(bearer|basic|digest|negotiate)\s+[a-z0-9._~+/=-]{8,}/gi, `$1 ${REDACTION_MARKER}`],
   [/\b(authorization|proxy-authorization|x-api-key|x-auth-token|x-pan-key|x-redlock-auth|set-cookie|cookie)\s*:\s*[^\r\n]+/gi, `$1: ${REDACTION_MARKER}`],
   [/\b([a-z0-9_-]*(?:session|token|secret|password|passwd|passphrase|phash|api[_-]?key|accesskey|secretkey|access_key|secret_key|private_key|shared_key|signature|authorization|credential)[a-z0-9_-]*)\s*[=:]\s*["']?(?!\[REDACTED\])[^\s"';,&<>]{4,}/gi, `$1=${REDACTION_MARKER}`],
   [/\b(key|auth|sig|sid|pwd|pin|otp)\s*[=:]\s*["']?(?!\[REDACTED\])[^\s"';,&<>]{4,}/gi, `$1=${REDACTION_MARKER}`],
+  [/("[a-z0-9_-]*(?:session|token|secret|password|passwd|passphrase|phash|api[_-]?key|accesskey|secretkey|access_key|secret_key|private_key|shared_key|signature|authorization|credential)[a-z0-9_-]*"\s*:\s*")(?!\[REDACTED\])[^"]+(")/gi, `$1${REDACTION_MARKER}$2`],
   [/\bLUFRPT[a-z0-9+/=_-]{16,}/gi, REDACTION_MARKER],
   [/\beyJ[a-z0-9_-]{8,}\.[a-z0-9_-]{8,}(?:\.[a-z0-9_-]{8,})?/gi, REDACTION_MARKER],
   [/(https?:\/\/)[^\s/@"'<>]+:[^\s/@"'<>]+@/gi, `$1${REDACTION_MARKER}@`],
@@ -1067,7 +1070,7 @@ export function describePrismaErrorBody(response: Response, rawText: string): st
       parts.push(fields.length > 0 ? fields.join("; ") : `JSON response body without documented error fields (${rawText.length} bytes, not echoed)`);
     }
   }
-  return redactErrorText(parts.map((part) => part.replace(/\s+/g, " ").slice(0, 200)).join("; "));
+  return parts.map((part) => redactErrorText(part.replace(/\s+/g, " ")).slice(0, 200)).join("; ");
 }
 
 export class PrismaCloudClient {
@@ -1471,7 +1474,8 @@ export class PanosApiClient {
         || xmlText(xmlChild(responseNode, "msg"))
         || "no message";
       const code = /^[a-z0-9_-]{1,16}$/i.test(responseNode.attributes.code ?? "") ? responseNode.attributes.code : "unknown";
-      throw new Error(redactSecrets(`PAN-OS ${context} failed (code ${code}, status ${response.status}): ${message.replace(/\s+/g, " ").slice(0, 300)}`, this.http.secrets));
+      const detail = redactSecrets(message.replace(/\s+/g, " "), this.http.secrets).slice(0, 300);
+      throw new Error(redactSecrets(`PAN-OS ${context} failed (code ${code}, status ${response.status}): ${detail}`, this.http.secrets));
     }
     return responseNode;
   }
