@@ -461,21 +461,42 @@ function describeNonJsonBody(response: Response, rawText: string): string {
   return `non-JSON body (${contentType}, ${Buffer.byteLength(rawText)} bytes)`;
 }
 
+/** A TOML line the simple reader cannot accept; it records the line number only, never the line. */
+export class SnowflakeTomlSyntaxError extends Error {
+  readonly line: number;
+
+  constructor(line: number) {
+    super(`Invalid TOML at line ${line}`);
+    this.name = "SnowflakeTomlSyntaxError";
+    this.line = line;
+  }
+}
+
+/**
+ * Reads the subset of TOML that Snowflake connection files use: comments,
+ * section headers, and single-line key = value pairs. A line that is none of
+ * those, or a quoted value that does not close on its own line, is a syntax
+ * error reported by line number, so a stray or continued credential line
+ * never reaches a value or an error message.
+ */
 export function parseSimpleToml(text: string): Record<string, JsonRecord> {
   const sections: Record<string, JsonRecord> = { "": {} };
   let current = "";
-  for (const rawLine of text.split(/\r?\n/)) {
-    const line = rawLine.trim();
+  const lines = text.split(/\r?\n/);
+  for (let index = 0; index < lines.length; index += 1) {
+    const lineNumber = index + 1;
+    const line = lines[index].trim();
     if (line.length === 0 || line.startsWith("#")) continue;
-    const sectionMatch = /^\[\s*([^\]]+?)\s*\]$/.exec(line);
+    const sectionMatch = /^\[\s*([^\]]+?)\s*\](?:\s+#.*)?$/.exec(line);
     if (sectionMatch) {
       current = sectionMatch[1].replace(/"/g, "").trim();
       sections[current] = sections[current] ?? {};
       continue;
     }
-    const keyMatch = /^([A-Za-z0-9_.-]+)\s*=\s*(.+)$/.exec(line);
-    if (!keyMatch) continue;
-    sections[current][keyMatch[1]] = parseTomlValue(keyMatch[2].trim());
+    const keyMatch = /^("[^"]+"|'[^']+'|[A-Za-z0-9_.-]+)\s*=\s*(.+)$/.exec(line);
+    if (!keyMatch) throw new SnowflakeTomlSyntaxError(lineNumber);
+    const key = keyMatch[1].replace(/^["']|["']$/g, "");
+    sections[current][key] = parseTomlValue(keyMatch[2].trim(), lineNumber);
   }
   return sections;
 }
@@ -491,25 +512,74 @@ function findClosingQuote(raw: string, quote: string, start: number): number {
   return -1;
 }
 
-function parseTomlValue(raw: string): unknown {
-  if (raw.startsWith("\"\"\"")) {
-    const end = raw.indexOf("\"\"\"", 3);
-    return end >= 0 ? raw.slice(3, end) : raw.slice(3);
+function parseTomlValue(raw: string, lineNumber: number): unknown {
+  if (raw.startsWith("\"\"\"") || raw.startsWith("'''")) {
+    const delimiter = raw.slice(0, 3);
+    const end = raw.indexOf(delimiter, 3);
+    if (end < 0) throw new SnowflakeTomlSyntaxError(lineNumber);
+    return raw.slice(3, end);
   }
   if (raw.startsWith("\"")) {
     const end = findClosingQuote(raw, "\"", 1);
-    const inner = end >= 0 ? raw.slice(1, end) : raw.slice(1);
-    return inner.replace(/\\n/g, "\n").replace(/\\"/g, "\"").replace(/\\\\/g, "\\");
+    if (end < 0) throw new SnowflakeTomlSyntaxError(lineNumber);
+    return raw.slice(1, end).replace(/\\n/g, "\n").replace(/\\"/g, "\"").replace(/\\\\/g, "\\");
   }
   if (raw.startsWith("'")) {
     const end = findClosingQuote(raw, "'", 1);
-    return end >= 0 ? raw.slice(1, end) : raw.slice(1);
+    if (end < 0) throw new SnowflakeTomlSyntaxError(lineNumber);
+    return raw.slice(1, end);
   }
   const withoutComment = raw.replace(/\s+#.*$/, "").trim();
   if (/^(true|false)$/i.test(withoutComment)) return withoutComment.toLowerCase() === "true";
   const numeric = Number(withoutComment);
   if (withoutComment.length > 0 && Number.isFinite(numeric)) return numeric;
   return withoutComment;
+}
+
+const FS_ERROR_CODE_PATTERN = /^E[A-Z0-9_]{1,30}$/;
+const CRYPTO_ERROR_CODE_PATTERN = /^ERR_[A-Z0-9_]{1,60}$/;
+
+function thrownCode(error: unknown, pattern: RegExp): string | undefined {
+  const code = typeof error === "object" && error !== null ? (error as { code?: unknown }).code : undefined;
+  return typeof code === "string" && pattern.test(code) ? code : undefined;
+}
+
+/**
+ * Read step of the config loader: a missing file is simply absent, every
+ * other failure is reported by path and errno code only, never by the
+ * filesystem's own wording.
+ */
+function readConfigFileText(pathname: string): string | undefined {
+  try {
+    return readFileSync(pathname, "utf8");
+  } catch (error) {
+    const code = thrownCode(error, FS_ERROR_CODE_PATTERN);
+    if (code === "ENOENT") return undefined;
+    throw new Error(`Unable to read Snowflake config file ${pathname} (${code ?? "UNREADABLE"})`);
+  }
+}
+
+/** Parse step: catches every thrown value and reports path, line, and a fixed code; nothing from the line itself. */
+function readSnowflakeTomlFile(pathname: string): Record<string, JsonRecord> | undefined {
+  const text = readConfigFileText(pathname);
+  if (text === undefined) return undefined;
+  try {
+    return parseSimpleToml(text);
+  } catch (error) {
+    const where = error instanceof SnowflakeTomlSyntaxError ? ` at line ${error.line}` : "";
+    throw new Error(`Unable to parse Snowflake config file: invalid TOML in ${pathname}${where} (INVALID_TOML)`);
+  }
+}
+
+/** The private key file is credential-bearing, so a read failure names the path and errno code only. */
+function readPrivateKeyFile(pathname: string): string {
+  try {
+    return readFileSync(pathname, "utf8");
+  } catch (error) {
+    const code = thrownCode(error, FS_ERROR_CODE_PATTERN);
+    if (code === "ENOENT") throw new Error(`Snowflake private key file was not found: ${pathname} (ENOENT)`);
+    throw new Error(`Unable to read Snowflake private key file ${pathname} (${code ?? "UNREADABLE"})`);
+  }
 }
 
 export interface SnowflakeTomlConnection {
@@ -526,15 +596,15 @@ export function loadSnowflakeTomlConnection(
   const configDir = asString(env.SNOWFLAKE_HOME) ?? join(homeDirectory, ".snowflake");
   const configPath = join(configDir, "config.toml");
   const connectionsPath = join(configDir, "connections.toml");
-  const configSections = existsSync(configPath) ? parseSimpleToml(readFileSync(configPath, "utf8")) : undefined;
+  const configSections = readSnowflakeTomlFile(configPath);
   const name = connectionName
     ?? asString(env.SNOWFLAKE_CONNECTION_NAME)
     ?? asString(env.SNOWFLAKE_DEFAULT_CONNECTION_NAME)
     ?? asString(configSections?.[""]?.default_connection_name)
     ?? "default";
 
-  if (existsSync(connectionsPath)) {
-    const sections = parseSimpleToml(readFileSync(connectionsPath, "utf8"));
+  const sections = readSnowflakeTomlFile(connectionsPath);
+  if (sections) {
     const values = sections[name] ?? sections[`connections.${name}`];
     if (values) return { name, values, source: connectionsPath };
   }
@@ -649,11 +719,7 @@ export function resolveSnowflakeConfiguration(
   if (inlinePrivateKey) {
     privateKeyPem = inlinePrivateKey.replace(/\\n/g, "\n");
   } else if (privateKeyPath) {
-    const resolvedPath = expandHome(privateKeyPath, homeDirectory);
-    if (!existsSync(resolvedPath)) {
-      throw new Error(`Snowflake private key file was not found: ${resolvedPath}`);
-    }
-    privateKeyPem = readFileSync(resolvedPath, "utf8");
+    privateKeyPem = readPrivateKeyFile(expandHome(privateKeyPath, homeDirectory));
   }
 
   const explicitTokenType = parseTokenType(authenticator);
@@ -733,7 +799,9 @@ export function buildSnowflakeKeyPairJwt(
       passphrase: config.privateKeyPassphrase,
     });
   } catch (error) {
-    throw new Error(`Unable to load the Snowflake private key: ${redactSecrets(error instanceof Error ? error.message : String(error))}`);
+    throw new Error(
+      `Unable to load the Snowflake private key (${thrownCode(error, CRYPTO_ERROR_CODE_PATTERN) ?? "INVALID_PRIVATE_KEY"}). Provide a PKCS#8 PEM key and, for an encrypted key, its passphrase.`,
+    );
   }
   const qualifiedUser = `${normalizeJwtAccountIdentifier(config.account)}.${config.user.trim().toUpperCase()}`;
   const issuer = `${qualifiedUser}.${computePublicKeyFingerprint(privateKey)}`;
@@ -858,6 +926,9 @@ export class SnowflakeSqlClient {
   ): Promise<SnowflakeApiResponse> {
     let attempt = 0;
     for (;;) {
+      // A credential that cannot be turned into a bearer token is a
+      // configuration error, not a transport failure, so it is never retried.
+      const authorization = `Bearer ${this.getBearerToken()}`;
       const controller = new AbortController();
       const timeout = setTimeout(() => controller.abort(), this.config.timeoutMs);
       try {
@@ -865,7 +936,7 @@ export class SnowflakeSqlClient {
           accept: "application/json",
           "content-type": "application/json",
           "user-agent": "grclanker-snowflake-inspector/1.0",
-          authorization: `Bearer ${this.getBearerToken()}`,
+          authorization,
           "x-snowflake-authorization-token-type": this.config.tokenType,
         });
         const response = await this.fetchImpl(`${this.config.baseUrl}${pathname}`, {

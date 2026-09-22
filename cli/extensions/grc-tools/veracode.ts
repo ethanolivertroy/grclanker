@@ -421,12 +421,36 @@ export function parseIniProfiles(contents: string): Record<string, Record<string
   return profiles;
 }
 
-function readCredentialsProfile(pathname: string, profile: string): Record<string, string> | undefined {
-  if (!existsSync(pathname)) return undefined;
+const FS_ERROR_CODE_PATTERN = /^E[A-Z0-9_]{1,30}$/;
+
+function thrownCode(error: unknown, pattern: RegExp): string | undefined {
+  const code = typeof error === "object" && error !== null ? (error as { code?: unknown }).code : undefined;
+  return typeof code === "string" && pattern.test(code) ? code : undefined;
+}
+
+/**
+ * Read step of the credentials loader: a missing file is simply absent,
+ * every other failure is reported by path and errno code only, never by the
+ * filesystem's own wording.
+ */
+function readCredentialsFileText(pathname: string): string | undefined {
   try {
-    return parseIniProfiles(readFileSync(pathname, "utf8"))[profile];
+    return readFileSync(pathname, "utf8");
+  } catch (error) {
+    const code = thrownCode(error, FS_ERROR_CODE_PATTERN);
+    if (code === "ENOENT") return undefined;
+    throw new Error(`Unable to read Veracode credentials file ${pathname} (${code ?? "UNREADABLE"})`);
+  }
+}
+
+/** Parse step: catches every thrown value and reports the path with a fixed code; the file holds API secrets, so nothing from it is repeated. */
+function readCredentialsProfile(pathname: string, profile: string): Record<string, string> | undefined {
+  const text = readCredentialsFileText(pathname);
+  if (text === undefined) return undefined;
+  try {
+    return parseIniProfiles(text)[profile];
   } catch {
-    return undefined;
+    throw new Error(`Unable to parse Veracode credentials file: invalid INI in ${pathname} (INVALID_INI)`);
   }
 }
 

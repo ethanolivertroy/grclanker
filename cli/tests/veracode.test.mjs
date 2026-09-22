@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { createHmac } from "node:crypto";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -18,6 +18,7 @@ import {
   computeVeracodeSignature,
   exportVeracodeAuditBundle,
   parseIniProfiles,
+  registerVeracodeTools,
   resolveSecureOutputPath,
   resolveVeracodeConfiguration,
 } from "../dist/extensions/grc-tools/veracode.js";
@@ -279,6 +280,113 @@ test("resolveVeracodeConfiguration prefers arguments, then environment, then the
   assert.throws(() => resolveVeracodeConfiguration({}, {}, { homeDir: createTempBase("grclanker-veracode-empty-") }), /credentials are required/);
   assert.throws(() => resolveVeracodeConfiguration({ api_key_id: "x", api_key_secret: "aabb", region: "mars" }, {}, { homeDir: home }), /Unknown Veracode region/);
   assert.deepEqual(Object.keys(parseIniProfiles("[a]\nk = v\n; comment\n[b]\nx=y")), ["a", "b"]);
+});
+
+/** Canaries planted on malformed credentials lines; every 8-character window of each is distinct so a partial quote is caught too. */
+const CONFIG_CANARIES = {
+  bareLine: "Bp6TzX3kW9nQ2sRc",
+  unterminatedSection: "Lf9BwD4sN7hVe3Ky",
+  readable: "Zx4HnV7qK2mYt9Pw",
+};
+const LIBRARY_ERROR_WORDING = [
+  "Nested mappings", "is not valid JSON", "Unresolved alias", "illegal operation", "permission denied", "no such file",
+  "not a directory", "Unexpected token",
+];
+
+function fragmentsOf(value, size = 8) {
+  const fragments = [];
+  for (let index = 0; index + size <= value.length; index += 1) fragments.push(value.slice(index, index + size));
+  return fragments;
+}
+
+function assertConfigErrorText(text, { path, code, canaries }, label) {
+  for (const canary of canaries) {
+    for (const fragment of fragmentsOf(canary)) assert.ok(!text.includes(fragment), `${label} carries a fragment (${fragment}) of ${canary}: ${text}`);
+  }
+  for (const wording of LIBRARY_ERROR_WORDING) assert.ok(!text.includes(wording), `${label} repeats library wording "${wording}": ${text}`);
+  assert.ok(text.includes(path), `${label} names the path ${path}: ${text}`);
+  if (code) assert.ok(text.includes(`(${code})`), `${label} carries the code ${code}: ${text}`);
+  assert.doesNotMatch(text, / at line \d+/, `${label} invents no line: ${text}`);
+}
+
+function thrownBy(fn) {
+  try {
+    fn();
+  } catch (error) {
+    return error;
+  }
+  assert.fail("expected the call to throw");
+}
+
+async function withoutVeracodeEnvironment(run) {
+  const names = ["VERACODE_API_KEY_ID", "VERACODE_API_KEY_SECRET", "VERACODE_API_CREDENTIALS_FILE", "VERACODE_API_PROFILE"];
+  const saved = Object.fromEntries(names.map((name) => [name, process.env[name]]));
+  for (const name of names) delete process.env[name];
+  try {
+    return await run();
+  } finally {
+    for (const name of names) {
+      if (saved[name] === undefined) delete process.env[name];
+      else process.env[name] = saved[name];
+    }
+  }
+}
+
+test("rule 9: Veracode credentials file errors carry only the path and code, never a credentials line or filesystem wording", async () => {
+  const dir = createTempBase("grclanker-veracode-config-errors-");
+  const registered = [];
+  registerVeracodeTools({ registerTool: (tool) => registered.push(tool) });
+  const checkAccess = registered.find((tool) => tool.name === "veracode_check_access");
+  const exportBundle = registered.find((tool) => tool.name === "veracode_export_audit_bundle");
+  const allCanaries = Object.values(CONFIG_CANARIES);
+
+  const malformed = join(dir, "malformed-credentials");
+  writeFileSync(malformed, [
+    "[default]",
+    `veracode_api_key_id ${CONFIG_CANARIES.bareLine}`,
+    `[unterminated ${CONFIG_CANARIES.unterminatedSection}`,
+    "veracode_api_key_secret = aabb",
+    "",
+  ].join("\n"));
+  const profiles = parseIniProfiles(readFileSync(malformed, "utf8"));
+  assert.equal(profiles.default.veracode_api_key_id, undefined, "a line without = is skipped, not stored under a guessed key");
+  const skipped = thrownBy(() => resolveVeracodeConfiguration({ credentials_file: malformed }, {}, { homeDir: dir }));
+  assert.match(skipped.message, /^Veracode API credentials are required/);
+  assertConfigErrorText(skipped.message, { path: malformed, canaries: allCanaries }, "resolver error for a malformed profile");
+  const skippedResult = await withoutVeracodeEnvironment(() => checkAccess.execute("call", checkAccess.prepareArguments({ credentials_file: malformed })));
+  assertConfigErrorText(JSON.stringify(skippedResult), { path: malformed, canaries: allCanaries }, "check_access payload for a malformed profile");
+
+  const readCases = [
+    { name: "EISDIR", path: join(dir, "directory-credentials"), setup: (path) => mkdirSync(path), control: /illegal operation/ },
+    { name: "ENOTDIR", path: join(dir, "plain-file", "credentials"), setup: () => writeFileSync(join(dir, "plain-file"), `[default]\nveracode_api_key_secret = ${CONFIG_CANARIES.readable}\n`), control: /not a directory/ },
+  ];
+  if (process.getuid?.() !== 0) {
+    readCases.push({ name: "EACCES", path: join(dir, "locked-credentials"), setup: (path) => { writeFileSync(path, `[default]\nveracode_api_key_secret = ${CONFIG_CANARIES.readable}\n`); chmodSync(path, 0o000); }, control: /permission denied/ });
+  }
+  for (const testCase of readCases) {
+    testCase.setup(testCase.path);
+    assert.match(thrownBy(() => readFileSync(testCase.path, "utf8")).message, testCase.control, `${testCase.name}: positive control uses the filesystem message`);
+    const expected = { path: testCase.path, code: testCase.name, canaries: allCanaries };
+    const thrown = thrownBy(() => resolveVeracodeConfiguration({ credentials_file: testCase.path }, {}, { homeDir: dir }));
+    assert.equal(thrown.message, `Unable to read Veracode credentials file ${testCase.path} (${testCase.name})`);
+    assertConfigErrorText(thrown.message, expected, `${testCase.name} resolver error`);
+    const fromEnv = thrownBy(() => resolveVeracodeConfiguration({}, { VERACODE_API_CREDENTIALS_FILE: testCase.path }, { homeDir: dir }));
+    assert.equal(fromEnv.message, thrown.message, `${testCase.name}: the environment path takes the same guard`);
+    const result = await withoutVeracodeEnvironment(() => checkAccess.execute("call", checkAccess.prepareArguments({ credentials_file: testCase.path })));
+    assertConfigErrorText(JSON.stringify(result), expected, `${testCase.name} check_access payload`);
+  }
+
+  const outputRoot = join(dir, "export");
+  const exported = await withoutVeracodeEnvironment(() => exportBundle.execute("call", exportBundle.prepareArguments({ credentials_file: join(dir, "directory-credentials"), output_dir: outputRoot })));
+  assertConfigErrorText(JSON.stringify(exported), { path: join(dir, "directory-credentials"), code: "EISDIR", canaries: allCanaries }, "export payload");
+  assert.equal(existsSync(outputRoot), false, "a credentials file error writes no bundle");
+
+  const missing = join(dir, "missing-credentials");
+  const absent = thrownBy(() => resolveVeracodeConfiguration({ credentials_file: missing }, {}, { homeDir: dir }));
+  assert.match(absent.message, /^Veracode API credentials are required/, "a missing credentials file is absent, not a read failure");
+  assertConfigErrorText(absent.message, { path: missing, canaries: allCanaries }, "resolver error for a missing file");
+  const absentResult = JSON.stringify(await withoutVeracodeEnvironment(() => checkAccess.execute("call", checkAccess.prepareArguments({ credentials_file: missing }))));
+  assertConfigErrorText(absentResult, { path: missing, canaries: allCanaries }, "check_access payload for a missing file");
 });
 
 test("computeVeracodeSignature matches the documented HMAC-SHA-256 chain and header format", () => {

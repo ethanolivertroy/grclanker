@@ -2,6 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { createVerify, generateKeyPairSync } from "node:crypto";
 import {
+  chmodSync,
   existsSync,
   mkdirSync,
   mkdtempSync,
@@ -34,6 +35,7 @@ import {
   normalizeJwtAccountIdentifier,
   parseSimpleToml,
   redactSecrets,
+  registerSnowflakeTools,
   resolveSecureOutputPath,
   resolveSnowflakeConfiguration,
 } from "../dist/extensions/grc-tools/snowflake.js";
@@ -611,6 +613,154 @@ test("parseSimpleToml handles sections, quoted keys, comments, numbers, and bool
   assert.equal(parsed["connections.audit"].port, 443);
   assert.equal(parsed["connections.audit"].insecure, false);
   assert.equal(parsed["connections.quoted name"].account, "triple");
+});
+
+/** Canaries planted on malformed config lines; every 8-character window of each is distinct so a partial quote is caught too. */
+const CONFIG_CANARIES = {
+  bareLine: "Bp6TzX3kW9nQ2sRc",
+  unterminated: "Lf9BwD4sN7hVe3Ky",
+  multiline: "Tn3XcM6zP8gQb5Rw",
+  missingValue: "Rk8VqL2tY7jCn4Fs",
+  readable: "Zx4HnV7qK2mYt9Pw",
+  privateKey: "Qv7ZkT3mR9pXw2Lc",
+};
+const LIBRARY_ERROR_WORDING = [
+  "Nested mappings", "is not valid JSON", "Unresolved alias", "illegal operation", "permission denied", "no such file",
+  "not a directory", "Unexpected token", "DECODER routines", "unsupported", "BEGIN PRIVATE KEY",
+];
+
+function fragmentsOf(value, size = 8) {
+  const fragments = [];
+  for (let index = 0; index + size <= value.length; index += 1) fragments.push(value.slice(index, index + size));
+  return fragments;
+}
+
+function assertConfigErrorText(text, { path, code, line, canaries }, label) {
+  for (const canary of canaries) {
+    for (const fragment of fragmentsOf(canary)) assert.ok(!text.includes(fragment), `${label} carries a fragment (${fragment}) of ${canary}: ${text}`);
+  }
+  for (const wording of LIBRARY_ERROR_WORDING) assert.ok(!text.includes(wording), `${label} repeats library wording "${wording}": ${text}`);
+  if (path) assert.ok(text.includes(path), `${label} names the path ${path}: ${text}`);
+  assert.ok(text.includes(`(${code})`), `${label} carries the code ${code}: ${text}`);
+  if (line) assert.ok(text.includes(` at line ${line}`), `${label} carries the position line ${line}: ${text}`);
+  else assert.doesNotMatch(text, / at line \d+/, `${label} invents no line: ${text}`);
+}
+
+function thrownBy(fn) {
+  try {
+    fn();
+  } catch (error) {
+    return error;
+  }
+  assert.fail("expected the call to throw");
+}
+
+async function withSnowflakeHome(snowflakeHome, run) {
+  const saved = process.env.SNOWFLAKE_HOME;
+  process.env.SNOWFLAKE_HOME = snowflakeHome;
+  try {
+    return await run();
+  } finally {
+    if (saved === undefined) delete process.env.SNOWFLAKE_HOME;
+    else process.env.SNOWFLAKE_HOME = saved;
+  }
+}
+
+test("rule 9: Snowflake TOML and private key file errors carry only the path, line, and code, never a config line, key material, or filesystem wording", async () => {
+  const base = createTempBase("grclanker-snowflake-config-errors-");
+  const registered = [];
+  registerSnowflakeTools({ registerTool: (tool) => registered.push(tool) });
+  const checkAccess = registered.find((tool) => tool.name === "snowflake_check_access");
+  const exportBundle = registered.find((tool) => tool.name === "snowflake_export_audit_bundle");
+  const allCanaries = Object.values(CONFIG_CANARIES);
+  const env = { SNOWFLAKE_ACCOUNT: "myorg-myaccount", SNOWFLAKE_USER: "svc", SNOWFLAKE_TOKEN: "env-token" };
+  let homes = 0;
+  const snowflakeHome = () => {
+    homes += 1;
+    const dir = join(base, `home-${homes}`);
+    mkdirSync(dir, { recursive: true });
+    return dir;
+  };
+
+  const parseCases = [
+    { name: "bare credential line", text: `[default]\naccount = "myorg-myaccount"\nuser = "svc"\n${CONFIG_CANARIES.bareLine}\n`, line: 4 },
+    { name: "unterminated quote", text: `[default]\naccount = "myorg-myaccount"\ntoken = "${CONFIG_CANARIES.unterminated}\nuser = "svc"\n`, line: 3 },
+    { name: "multi-line string", text: `[default]\nprivate_key_raw = """-----BEGIN PRIVATE KEY-----\n${CONFIG_CANARIES.multiline}\n-----END PRIVATE KEY-----"""\n`, line: 2 },
+    { name: "missing value", text: `[default]\ntoken =\n# ${CONFIG_CANARIES.missingValue}\n`, line: 2 },
+  ];
+  for (const testCase of parseCases) {
+    for (const fileName of ["connections.toml", "config.toml"]) {
+      const home = snowflakeHome();
+      const tomlPath = join(home, fileName);
+      writeFileSync(tomlPath, testCase.text);
+      const direct = thrownBy(() => parseSimpleToml(testCase.text));
+      assert.equal(direct.name, "SnowflakeTomlSyntaxError", `${testCase.name}: the parser reports a structured syntax error`);
+      assert.equal(direct.line, testCase.line, `${testCase.name}: the parser records the line`);
+      assert.equal(direct.message, `Invalid TOML at line ${testCase.line}`, `${testCase.name}: the parser message is the line number only`);
+
+      const expected = { path: tomlPath, code: "INVALID_TOML", line: testCase.line, canaries: allCanaries };
+      const thrown = thrownBy(() => resolveSnowflakeConfiguration({}, { ...env, SNOWFLAKE_HOME: home }, { homeDirectory: base }));
+      assert.equal(thrown.message, `Unable to parse Snowflake config file: invalid TOML in ${tomlPath} at line ${testCase.line} (INVALID_TOML)`, `${testCase.name} in ${fileName}`);
+      assertConfigErrorText(thrown.message, expected, `${testCase.name} resolver error (${fileName})`);
+      const result = await withSnowflakeHome(home, () => checkAccess.execute("call", checkAccess.prepareArguments({ account: "myorg-myaccount", user: "svc", token: "arg-token" })));
+      assertConfigErrorText(JSON.stringify(result), expected, `${testCase.name} check_access payload (${fileName})`);
+    }
+  }
+
+  const exportHome = snowflakeHome();
+  writeFileSync(join(exportHome, "connections.toml"), parseCases[0].text);
+  const outputRoot = join(base, "export");
+  const exported = await withSnowflakeHome(exportHome, () => exportBundle.execute("call", exportBundle.prepareArguments({ output_dir: outputRoot })));
+  assertConfigErrorText(JSON.stringify(exported), { path: join(exportHome, "connections.toml"), code: "INVALID_TOML", line: 4, canaries: allCanaries }, "export payload");
+  assert.equal(existsSync(outputRoot), false, "a config error writes no bundle");
+
+  const readCases = [
+    { name: "EISDIR", file: "connections.toml", setup: (path) => mkdirSync(path), control: /illegal operation/ },
+    { name: "EISDIR", file: "config.toml", setup: (path) => mkdirSync(path), control: /illegal operation/ },
+  ];
+  if (process.getuid?.() !== 0) {
+    readCases.push({ name: "EACCES", file: "connections.toml", setup: (path) => { writeFileSync(path, `[default]\ntoken = "${CONFIG_CANARIES.readable}"\n`); chmodSync(path, 0o000); }, control: /permission denied/ });
+  }
+  for (const testCase of readCases) {
+    const home = snowflakeHome();
+    const tomlPath = join(home, testCase.file);
+    testCase.setup(tomlPath);
+    assert.match(thrownBy(() => readFileSync(tomlPath, "utf8")).message, testCase.control, `${testCase.name}: positive control uses the filesystem message`);
+    const expected = { path: tomlPath, code: testCase.name, canaries: allCanaries };
+    const thrown = thrownBy(() => resolveSnowflakeConfiguration({}, { ...env, SNOWFLAKE_HOME: home }, { homeDirectory: base }));
+    assert.equal(thrown.message, `Unable to read Snowflake config file ${tomlPath} (${testCase.name})`);
+    const result = await withSnowflakeHome(home, () => checkAccess.execute("call", checkAccess.prepareArguments({ account: "myorg-myaccount", user: "svc", token: "arg-token" })));
+    assertConfigErrorText(JSON.stringify(result), expected, `${testCase.name} check_access payload (${testCase.file})`);
+  }
+
+  const emptyHome = snowflakeHome();
+  const absent = resolveSnowflakeConfiguration({}, { ...env, SNOWFLAKE_HOME: emptyHome }, { homeDirectory: base });
+  assert.equal(absent.token, "env-token", "missing TOML files are absent, not read failures");
+  const notDirectory = join(base, "plain-file");
+  writeFileSync(notDirectory, "x");
+  const enotdir = thrownBy(() => resolveSnowflakeConfiguration({}, { ...env, SNOWFLAKE_HOME: notDirectory }, { homeDirectory: base }));
+  assert.equal(enotdir.message, `Unable to read Snowflake config file ${join(notDirectory, "config.toml")} (ENOTDIR)`);
+
+  const keyDirectory = join(base, "key-directory.p8");
+  mkdirSync(keyDirectory);
+  const keyIsDir = thrownBy(() => resolveSnowflakeConfiguration({ private_key_path: keyDirectory }, { SNOWFLAKE_ACCOUNT: "myorg-myaccount", SNOWFLAKE_USER: "svc", SNOWFLAKE_HOME: emptyHome }, { homeDirectory: base }));
+  assert.equal(keyIsDir.message, `Unable to read Snowflake private key file ${keyDirectory} (EISDIR)`);
+  const keyMissing = thrownBy(() => resolveSnowflakeConfiguration({ private_key_path: join(base, "missing.p8") }, { SNOWFLAKE_ACCOUNT: "myorg-myaccount", SNOWFLAKE_USER: "svc", SNOWFLAKE_HOME: emptyHome }, { homeDirectory: base }));
+  assert.equal(keyMissing.message, `Snowflake private key file was not found: ${join(base, "missing.p8")} (ENOENT)`);
+  if (process.getuid?.() !== 0) {
+    const lockedKey = join(base, "locked.p8");
+    writeFileSync(lockedKey, `-----BEGIN PRIVATE KEY-----\n${CONFIG_CANARIES.privateKey}\n-----END PRIVATE KEY-----\n`);
+    chmodSync(lockedKey, 0o000);
+    const keyLocked = thrownBy(() => resolveSnowflakeConfiguration({ private_key_path: lockedKey }, { SNOWFLAKE_ACCOUNT: "myorg-myaccount", SNOWFLAKE_USER: "svc", SNOWFLAKE_HOME: emptyHome }, { homeDirectory: base }));
+    assert.equal(keyLocked.message, `Unable to read Snowflake private key file ${lockedKey} (EACCES)`);
+  }
+
+  const garbageKey = `-----BEGIN PRIVATE KEY-----\n${CONFIG_CANARIES.privateKey}\n-----END PRIVATE KEY-----\n`;
+  const unloadable = thrownBy(() => buildSnowflakeKeyPairJwt({ account: "myorg-myaccount", user: "svc", privateKeyPem: garbageKey }));
+  assert.match(unloadable.message, /^Unable to load the Snowflake private key \((ERR_[A-Z0-9_]+|INVALID_PRIVATE_KEY)\)\. Provide a PKCS#8 PEM key/);
+  assertConfigErrorText(unloadable.message, { code: unloadable.message.match(/\(([A-Z0-9_]+)\)/)[1], canaries: allCanaries }, "unloadable key error");
+  const keyResult = JSON.stringify(await withSnowflakeHome(emptyHome, () => checkAccess.execute("call", checkAccess.prepareArguments({ account: "myorg-myaccount", user: "svc", private_key: garbageKey }))));
+  assertConfigErrorText(keyResult, { code: unloadable.message.match(/\(([A-Z0-9_]+)\)/)[1], canaries: allCanaries }, "unloadable key check_access payload");
 });
 
 test("buildSnowflakeKeyPairJwt produces an RS256 token with the documented issuer and subject", () => {
