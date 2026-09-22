@@ -2148,6 +2148,24 @@ function carriersOf(value) {
     [`X-Api-Key: ${value}`, /^X-Api-Key: \[REDACTED\]$/],
     [`x-auth-token: ${value}`, /^x-auth-token: \[REDACTED\]$/],
     [`<p>X-Api-Key: ${value}</p><p>next</p>`, /^<p>X-Api-Key: \[REDACTED\]<\/p><p>next<\/p>$/],
+    // Quoted header values: the value goes with its quotes, whatever the name of the pair
+    // that carries it, through the closing quote or to the end of the line; a value that is
+    // one quoted string keeps the quotes around the marker; the quote that closes the text
+    // the header line was quoted in, and the JSON string it is escaped into, stay intact.
+    [`Cookie: sid="${value}"`, /^Cookie: \[REDACTED\]$/],
+    [`Cookie: sid='${value}'; theme=dark`, /^Cookie: \[REDACTED\]$/],
+    [`Cookie: theme=dark; sid="${value}"; lang=en`, /^Cookie: \[REDACTED\]$/],
+    [`Set-Cookie: _zendesk_session="${value}"; Path=/; HttpOnly`, /^Set-Cookie: \[REDACTED\]$/],
+    [`Authorization: Bearer "${value}"`, /^Authorization: \[REDACTED\]$/],
+    [`Authorization: "Bearer ${value}" was rejected`, /^Authorization: "\[REDACTED\]" was rejected$/],
+    [`X-Api-Key: "${value}"`, /^X-Api-Key: "\[REDACTED\]"$/],
+    [`x-auth-token: '${value}'`, /^x-auth-token: '\[REDACTED\]'$/],
+    [`{"detail":"upstream rejected Cookie: sid=\\"${value}\\"; path=/","code":401}`, /^\{"detail":"upstream rejected Cookie: \[REDACTED\]","code":401\}$/],
+    [`{"cookie": "sid=${value}", "other": "z"}`, /^\{"cookie": "\[REDACTED\]", "other": "z"\}$/],
+    [`rejected header "Cookie: sid=${value}" and "X-Other: 1"`, /^rejected header "Cookie: \[REDACTED\]" and "X-Other: 1"$/],
+    [`<p>Cookie: sid="${value}"</p><p>next</p>`, /^<p>Cookie: \[REDACTED\]<\/p><p>next<\/p>$/],
+    [`<p>Cookie: sid="${value}</p><p>next="1"</p>`, /^<p>Cookie: \[REDACTED\]<\/p><p>next="1"<\/p>$/],
+    [`Cookie: sid="${value}"\nX-Other: keep`, /^Cookie: \[REDACTED\]\nX-Other: keep$/],
     [`session=${value}; Path=/`, /^session=\[REDACTED\]; Path=\/$/],
     [`_zendesk_session=${value} expired`, /^_zendesk_session=\[REDACTED\] expired$/],
     [`JSESSIONID=${value}; Path=/`, /^JSESSIONID=\[REDACTED\]; Path=\/$/],
@@ -2475,15 +2493,19 @@ const CANARY_URL_TOKEN = "P3GfdBos2IChWd8L1EAbNz";
 // assignment, gives away, and a plain lowercase word that only the Bearer scheme does.
 const CANARY_NAMED = "sess-canary-COOKIE-31415926535897";
 const CANARY_PLAIN = "jdvdnheoejphwk";
-const CANARIES = [CANARY_BEARER, CANARY_SESSION, CANARY_API_KEY, CANARY_URL_TOKEN, CANARY_NAMED, CANARY_PLAIN];
+// A second name-shaped value that travels in quotes (Cookie: sid="value"): neither its shape
+// nor the pair rule removes it, only a header rule that carries a quoted value through its
+// closing quote, so its absence proves that rule ran.
+const CANARY_QUOTED = "sess-qtdv-QCARRY-16180339887498";
+const CANARIES = [CANARY_BEARER, CANARY_SESSION, CANARY_API_KEY, CANARY_URL_TOKEN, CANARY_NAMED, CANARY_PLAIN, CANARY_QUOTED];
 const CANARY_URL = `https://api.example.com/v1/x?token=${CANARY_URL_TOKEN}`;
-// The scrubbed rendering of the JSON canary sentence, as every error string must carry it.
-const JSON_CANARY_MARKER = /400 Bad Request; InvalidUpstream; Upstream refused Bearer \[REDACTED\] at https:\/\/api\.example\.com\/v1\/x\?token=\[REDACTED\] mid-sentence; _zendesk_session=\[REDACTED\], api_key=\[REDACTED\], Bearer \[REDACTED\], sid=\[REDACTED\] rejected/;
+// The scrubbed rendering of the JSON canary fields, as every error string must carry it.
+const JSON_CANARY_MARKER = /400 Bad Request; InvalidUpstream; Upstream refused Bearer \[REDACTED\] at https:\/\/api\.example\.com\/v1\/x\?token=\[REDACTED\] mid-sentence; _zendesk_session=\[REDACTED\], api_key=\[REDACTED\], Bearer \[REDACTED\], sid=\[REDACTED\] rejected; Cookie: \[REDACTED\]/;
 
 function htmlCanaryResponse() {
   const body = `<html><head><title>502 Bad Gateway</title></head><body><p>Authorization: Bearer ${CANARY_BEARER}</p>`
     + `<p>Set-Cookie: _zendesk_session=${CANARY_SESSION}; Path=/</p><p>X-Api-Key: ${CANARY_API_KEY}</p>`
-    + `<p>Proxy-Authorization: Bearer ${CANARY_PLAIN}</p><p>Cookie: sid=${CANARY_NAMED}</p>`
+    + `<p>Proxy-Authorization: Bearer ${CANARY_PLAIN}</p><p>Cookie: sid=${CANARY_NAMED}</p><p>Cookie: sid="${CANARY_QUOTED}"; theme=dark</p>`
     + `<p>The upstream at ${CANARY_URL} did not answer in time, retry later.</p></body></html>`;
   return new Response(body, { status: 502, statusText: "Bad Gateway", headers: { "content-type": "text/html; charset=utf-8" } });
 }
@@ -2492,6 +2514,7 @@ function jsonCanaryResponse() {
   return jsonResponse({
     error: "InvalidUpstream",
     description: `Upstream refused Bearer ${CANARY_BEARER} at ${CANARY_URL} mid-sentence; _zendesk_session=${CANARY_SESSION}, api_key=${CANARY_API_KEY}, Bearer ${CANARY_PLAIN}, sid=${CANARY_NAMED} rejected`,
+    message: `Cookie: sid="${CANARY_QUOTED}"; theme=dark`,
   }, { status: 400, statusText: "Bad Request" });
 }
 
@@ -2516,7 +2539,7 @@ function assertNoCanary(text, label, canaries = CANARIES) {
 // that only the Bearer scheme gives away, and the Slack path (the documented T/B/secret
 // shape, the whole path being the secret).
 const PLANTED_CREDENTIALS = [...Object.values(LOADER_CANARIES), ...CANARIES, ...Object.values(FAKE_ZENDESK_SECRETS), FIXTURE_API_TOKEN];
-const SHAPED_CREDENTIALS = new Set([CANARY_NAMED, CANARY_PLAIN, FIXTURE_API_TOKEN, FAKE_ZENDESK_SECRETS.slackWebhookPath]);
+const SHAPED_CREDENTIALS = new Set([CANARY_NAMED, CANARY_QUOTED, CANARY_PLAIN, FIXTURE_API_TOKEN, FAKE_ZENDESK_SECRETS.slackWebhookPath]);
 
 // Every HTTP surface ZendeskApiClient reads, keyed by path (the three /audit_logs reads are
 // distinguished by their query), served from the same fixtures as healthyClient().
@@ -2761,10 +2784,14 @@ test("the registered tools scrub error strings end to end over HTTP: access chec
 });
 
 test("ZendeskApiError, transport errors, and the tool catch blocks scrub messages built at the throw site", async () => {
-  const constructed = new ZendeskApiError(`Zendesk request failed for /x (500; Bearer ${CANARY_BEARER} at ${CANARY_URL}; Bearer ${CANARY_PLAIN}; sid=${CANARY_NAMED}; Cookie: _zendesk_session=${CANARY_SESSION})`, 500);
+  const constructed = new ZendeskApiError(`Zendesk request failed for /x (500; Bearer ${CANARY_BEARER} at ${CANARY_URL}; Bearer ${CANARY_PLAIN}; sid=${CANARY_NAMED}; Cookie: _zendesk_session=${CANARY_SESSION}; sid="${CANARY_QUOTED}")`, 500);
   assertNoCanary(constructed.message, "constructor");
-  assert.equal(constructed.message, "Zendesk request failed for /x (500; Bearer [REDACTED] at https://api.example.com/v1/x?token=[REDACTED]; Bearer [REDACTED]; sid=[REDACTED]; Cookie: [REDACTED]", "the Cookie header line is withheld to the end of the line");
+  assert.equal(constructed.message, "Zendesk request failed for /x (500; Bearer [REDACTED] at https://api.example.com/v1/x?token=[REDACTED]; Bearer [REDACTED]; sid=[REDACTED]; Cookie: [REDACTED]", "the Cookie header line is withheld to the end of the line, quoted values included");
   assert.equal(constructed.status, 500);
+  // A quoted header value in a JSON string, in the escaped form the raw body carries it.
+  const escaped = new ZendeskApiError(`upstream body {"detail":"rejected Cookie: sid=\\"${CANARY_QUOTED}\\"; path=/","code":401}`, 401);
+  assertNoCanary(escaped.message, "constructor, JSON-escaped quotes");
+  assert.equal(escaped.message, 'upstream body {"detail":"rejected Cookie: [REDACTED]","code":401}', "the escaped quotes go with the value and the JSON text around it stays intact");
 
   const transport = new ZendeskApiClient(sampleConfig(), {
     fetchImpl: async () => { throw new Error(`connect ECONNREFUSED via https://svc:${CANARY_SESSION}@proxy.example.com sending Authorization: Bearer ${CANARY_BEARER}`); },

@@ -1224,10 +1224,16 @@ const CANARY_URL_TOKEN = "aFz86YMxEqbb0D6TxXN30I";
 // Name-shaped (one digit group per segment, the ruling's own example), so bare in prose it
 // would stay: only the carrier it travels in (a session assignment) removes it.
 const CANARY_NAMED = "sess-canary-COOKIE-31415926535897";
-const CANARIES = [CANARY_BEARER, CANARY_SESSION, CANARY_API_KEY, CANARY_URL_TOKEN, CANARY_NAMED];
+// A second name-shaped value that travels in quotes (Cookie: sid="value"): neither its shape
+// nor the pair rule removes it, only a header rule that carries a quoted value through its
+// closing quote, so its absence proves that rule ran.
+const CANARY_QUOTED = "sess-qtdv-QCARRY-16180339887498";
+const CANARIES = [CANARY_BEARER, CANARY_SESSION, CANARY_API_KEY, CANARY_URL_TOKEN, CANARY_NAMED, CANARY_QUOTED];
 const CANARY_URL = `https://api.example.com/v1/x?token=${CANARY_URL_TOKEN}`;
-const CANARY_SENTENCE = `Upstream refused Bearer ${CANARY_BEARER} when calling ${CANARY_URL} mid-sentence; _upstream_session=${CANARY_SESSION}, api_key=${CANARY_API_KEY}, and session=${CANARY_NAMED} were rejected`;
-const SCRUBBED_SENTENCE = "Upstream refused Bearer [REDACTED] when calling https://api.example.com/v1/x?token=[REDACTED] mid-sentence; _upstream_session=[REDACTED], api_key=[REDACTED], and session=[REDACTED] were rejected";
+// The quoted cookie comes last because a header line is withheld to the end of the line; the
+// scrubbed sentence stays under the 200-character cut a documented error field gets.
+const CANARY_SENTENCE = `Upstream refused Bearer ${CANARY_BEARER} at ${CANARY_URL} mid-sentence; _upstream_session=${CANARY_SESSION}, api_key=${CANARY_API_KEY}, session=${CANARY_NAMED} rejected; Cookie: sid="${CANARY_QUOTED}"`;
+const SCRUBBED_SENTENCE = "Upstream refused Bearer [REDACTED] at https://api.example.com/v1/x?token=[REDACTED] mid-sentence; _upstream_session=[REDACTED], api_key=[REDACTED], session=[REDACTED] rejected; Cookie: [REDACTED]";
 
 function escapeRegExp(text) {
   return text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
@@ -1243,7 +1249,7 @@ function assertNoCanary(text, label, canaries = CANARIES) {
 // documented T/B/secret shape, the whole path being the secret), and the PAN-OS password
 // (every character class an encoding changes).
 const PLANTED_CREDENTIALS = [...Object.values(LOADER_CANARIES), ...CANARIES, ...Object.values(FAKE_PANOS_SECRETS), ...Object.values(FAKE_PRISMA_SECRETS), FIXTURE_SECRET_KEY, FIXTURE_PANOS_PASSWORD];
-const SHAPED_CREDENTIALS = new Set([CANARY_NAMED, FIXTURE_SECRET_KEY, FAKE_PRISMA_SECRETS.slackWebhookPath, FIXTURE_PANOS_PASSWORD]);
+const SHAPED_CREDENTIALS = new Set([CANARY_NAMED, CANARY_QUOTED, FIXTURE_SECRET_KEY, FAKE_PRISMA_SECRETS.slackWebhookPath, FIXTURE_PANOS_PASSWORD]);
 
 // A proxy or load balancer error page: HTML with header lines and a URL carrying a token.
 // Retry-After is tiny so clients that do retry 5xx responses do so without waiting. Served
@@ -1251,6 +1257,7 @@ const SHAPED_CREDENTIALS = new Set([CANARY_NAMED, FIXTURE_SECRET_KEY, FAKE_PRISM
 function htmlCanaryResponse(status = 502) {
   const body = `<!DOCTYPE html><html><head><title>502 Bad Gateway</title></head><body><p>Authorization: Bearer ${CANARY_BEARER}</p>`
     + `<p>Set-Cookie: _upstream_session=${CANARY_SESSION}; Path=/</p><p>X-Api-Key: ${CANARY_API_KEY}</p>`
+    + `<p>Cookie: session=${CANARY_NAMED}</p><p>Cookie: sid="${CANARY_QUOTED}"; theme=dark</p>`
     + `<p>The upstream at ${CANARY_URL} did not answer in time, retry later.</p></body></html>`;
   return new Response(body, { status, statusText: status === 200 ? "OK" : "Bad Gateway", headers: { "content-type": "text/html; charset=utf-8", "retry-after": "0.001" } });
 }
@@ -1348,6 +1355,26 @@ function carriersOf(value) {
     [`X-PAN-KEY: ${value}`, /^X-PAN-KEY: \[REDACTED\]$/],
     [`x-redlock-auth: ${value}`, /^x-redlock-auth: \[REDACTED\]$/],
     [`<p>X-Api-Key: ${value}</p><p>next</p>`, /^<p>X-Api-Key: \[REDACTED\]<\/p><p>next<\/p>$/],
+    // Quoted header values: the value goes with its quotes, whatever the name of the pair
+    // that carries it, through the closing quote or to the end of the line; a value that is
+    // one quoted string keeps the quotes around the marker; the quote that closes the text
+    // the header line was quoted in, and the JSON string it is escaped into, stay intact.
+    [`Cookie: sid="${value}"`, /^Cookie: \[REDACTED\]$/],
+    [`Cookie: sid='${value}'; theme=dark`, /^Cookie: \[REDACTED\]$/],
+    [`Cookie: theme=dark; sid="${value}"; lang=en`, /^Cookie: \[REDACTED\]$/],
+    [`Set-Cookie: PHPSESSID="${value}"; Path=/; HttpOnly`, /^Set-Cookie: \[REDACTED\]$/],
+    [`Authorization: Bearer "${value}"`, /^Authorization: \[REDACTED\]$/],
+    [`Authorization: "Bearer ${value}" was rejected`, /^Authorization: "\[REDACTED\]" was rejected$/],
+    [`X-Api-Key: "${value}"`, /^X-Api-Key: "\[REDACTED\]"$/],
+    [`X-PAN-KEY: '${value}'`, /^X-PAN-KEY: '\[REDACTED\]'$/],
+    [`x-redlock-auth: "${value}"`, /^x-redlock-auth: "\[REDACTED\]"$/],
+    [`{"detail":"upstream rejected Cookie: sid=\\"${value}\\"; path=/","code":401}`, /^\{"detail":"upstream rejected Cookie: \[REDACTED\]","code":401\}$/],
+    [`{"cookie": "sid=${value}", "other": "z"}`, /^\{"cookie": "\[REDACTED\]", "other": "z"\}$/],
+    [`rejected header "Cookie: sid=${value}" and "X-Other: 1"`, /^rejected header "Cookie: \[REDACTED\]" and "X-Other: 1"$/],
+    [`<p>Cookie: sid="${value}"</p><p>next</p>`, /^<p>Cookie: \[REDACTED\]<\/p><p>next<\/p>$/],
+    [`<p>Cookie: sid="${value}</p><p>next="1"</p>`, /^<p>Cookie: \[REDACTED\]<\/p><p>next="1"<\/p>$/],
+    [`<msg>Cookie: sid="${value}"</msg><msg>next</msg>`, /^<msg>Cookie: \[REDACTED\]<\/msg><msg>next<\/msg>$/],
+    [`Cookie: sid="${value}"\nX-Other: keep`, /^Cookie: \[REDACTED\]\nX-Other: keep$/],
     [`session=${value}; Path=/`, /^session=\[REDACTED\]; Path=\/$/],
     [`_upstream_session=${value} expired`, /^_upstream_session=\[REDACTED\] expired$/],
     [`PHPSESSID=${value}; Path=/`, /^PHPSESSID=\[REDACTED\]; Path=\/$/],

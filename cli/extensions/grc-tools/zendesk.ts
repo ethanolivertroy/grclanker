@@ -492,9 +492,17 @@ const URL_USERINFO_PATTERN = /^([a-z][a-z0-9+.-]*:\/\/)[^\s/@"'<>]+@/i;
 // token-shaped value loses the value. A value ends at "&", "#", whitespace, a quote, or the
 // ";" and "," that end a URL inside a sentence (no token carries either).
 const QUERY_PAIR_PATTERN = /([?&#])([A-Za-z0-9_.[\]-]+)=((?!\[REDACTED\])[^&#\s"'<>;,]+)/g;
-// A credential-bearing header line: the whole value goes, whatever its shape. A line that
-// already carries a marker is left alone so the rule is idempotent.
-const HEADER_LINE_PATTERN = /\b(authorization|proxy-authorization|cookie|set-cookie|x-api-key|api-key|apikey|x-pan-key|x-redlock-auth|x-auth-token|x-access-token|x-amz-security-token|x-vault-token|private-token|x-goog-api-key|x-csrf-token|x-xsrf-token)(["']?\s*:\s*)(?![^\r\n<>"']*\[REDACTED\])[^\r\n<>"']*[^\s\r\n<>"']/gi;
+// A credential-bearing header line: the whole value goes, whatever its shape. The name and
+// separator are matched here and the value is consumed by headerValueEnd, which carries a
+// quoted value (double, single, or JSON-escaped quotes) through its closing quote, so
+// Cookie: sid="value" loses value and quotes together instead of stopping at the first
+// quote. A value that already opens with a marker is left alone so the rule is idempotent.
+const HEADER_LINE_PATTERN = /\b(authorization|proxy-authorization|cookie|set-cookie|x-api-key|api-key|apikey|x-pan-key|x-redlock-auth|x-auth-token|x-access-token|x-amz-security-token|x-vault-token|private-token|x-goog-api-key|x-csrf-token|x-xsrf-token)(["']?\s*:\s*)/gi;
+// Inside a header value a quote opens a quoted segment only where a value can start: at the
+// start of the value or after "=", ":", ",", ";", "(", or whitespace. Anywhere else it is the
+// quote that closes the text the header line was quoted in.
+const HEADER_VALUE_OPENER_PATTERN = /[=:,;(\s]/;
+const HEADER_VALUE_TERMINATOR_PATTERN = /[\r\n<>]/;
 // A scheme and its credentials: the value is removed whatever its shape, except the
 // prose words that follow a scheme name in a sentence ("Basic authentication is
 // required", "Bearer token") and a Titlecase word, which makes the scheme name an
@@ -696,6 +704,66 @@ function scrubUrlUserinfo(url: string): string {
   return url.replace(URL_USERINFO_PATTERN, `$1${CREDENTIAL_REDACTION_MARKER}@`);
 }
 
+// Where the value of a header line that starts at start ends: at the end of the line, at an
+// HTML tag, or at the quote that closes the text the line sits in. A quoted segment
+// ("value", 'value') is carried through its closing quote on the same line; a JSON-escaped
+// quote (\") is content, and once one has been seen the next unescaped quote closes the JSON
+// string the header line is embedded in. Trailing whitespace is not part of the value.
+function headerValueEnd(text: string, start: number): number {
+  let index = start;
+  let escapedQuotes = false;
+  while (index < text.length) {
+    const char = text[index];
+    if (HEADER_VALUE_TERMINATOR_PATTERN.test(char)) break;
+    if (char === "\\" && (text[index + 1] === '"' || text[index + 1] === "'")) {
+      escapedQuotes = true;
+      index += 2;
+      continue;
+    }
+    if (char === '"' || char === "'") {
+      if (escapedQuotes || (index > start && !HEADER_VALUE_OPENER_PATTERN.test(text[index - 1]))) break;
+      const close = text.indexOf(char, index + 1);
+      const segment = text.slice(index + 1, close === -1 ? text.length : close);
+      if (close !== -1 && !HEADER_VALUE_TERMINATOR_PATTERN.test(segment)) {
+        index = close + 1;
+        // A value that is one quoted string ends with its closing quote.
+        if (index - segment.length - 2 === start) return index;
+        continue;
+      }
+    }
+    index += 1;
+  }
+  while (index > start && /\s/.test(text[index - 1])) index -= 1;
+  return index;
+}
+
+// The quote a header value is wrapped in as a whole, or "" when it is not one quoted string.
+// JSON-escaped quotes are content of the string the line sits in and go with the value.
+function enclosingQuote(value: string): string {
+  return value.length >= 2 && (value[0] === '"' || value[0] === "'") && value[value.length - 1] === value[0] ? value[0] : "";
+}
+
+// Every credential-bearing header line loses its value whatever the value's shape; a value
+// that is one quoted string keeps its quotes around the marker so quoted text stays quoted.
+function scrubHeaderLines(text: string): string {
+  HEADER_LINE_PATTERN.lastIndex = 0;
+  let out = "";
+  let last = 0;
+  let match: RegExpExecArray | null;
+  while ((match = HEADER_LINE_PATTERN.exec(text)) !== null) {
+    const start = match.index + match[0].length;
+    const end = headerValueEnd(text, start);
+    const value = text.slice(start, end);
+    if (value.length === 0 || value.startsWith(CREDENTIAL_REDACTION_MARKER)) continue;
+    const quote = enclosingQuote(value);
+    if (value.slice(quote.length).startsWith(CREDENTIAL_REDACTION_MARKER)) continue;
+    out += `${text.slice(last, start)}${quote}${CREDENTIAL_REDACTION_MARKER}${quote}`;
+    last = end;
+    HEADER_LINE_PATTERN.lastIndex = end;
+  }
+  return last === 0 ? text : `${out}${text.slice(last)}`;
+}
+
 // The key and separator are matched on their own and the value is consumed only when the
 // key names a credential, so the value of an ordinary pair is rescanned and a credential
 // pair nested inside it (data=token=...) is still caught.
@@ -720,11 +788,10 @@ function replaceCredentialAssignments(text: string): string {
 
 /** Every carrier rule (guard 1) plus the token shapes a prefix identifies on its own; the long-token rule is left to redactErrorText. */
 function scrubCarriers(text: string, pemScope: PemScope): string {
-  const scrubbed = scrubPem(text, pemScope)
+  const scrubbed = scrubHeaderLines(scrubPem(text, pemScope)
     .replace(TOKEN_IN_PATH_WEBHOOK_PATTERN, `$1${CREDENTIAL_REDACTION_MARKER}`)
     .replace(EMBEDDED_URL_PATTERN, scrubUrlUserinfo)
-    .replace(QUERY_PAIR_PATTERN, (match, separator: string, key: string, value: string) => (isCredentialAssignmentKey(key) || isTokenShapedValue(value) ? `${separator}${key}=${CREDENTIAL_REDACTION_MARKER}` : match))
-    .replace(HEADER_LINE_PATTERN, `$1$2${CREDENTIAL_REDACTION_MARKER}`)
+    .replace(QUERY_PAIR_PATTERN, (match, separator: string, key: string, value: string) => (isCredentialAssignmentKey(key) || isTokenShapedValue(value) ? `${separator}${key}=${CREDENTIAL_REDACTION_MARKER}` : match)))
     .replace(SCHEME_VALUE_PATTERN, (match, scheme: string, value: string) => (isSchemeProse(scheme, value) ? match : `${scheme} ${CREDENTIAL_REDACTION_MARKER}`))
     .replace(JSON_QUOTED_PAIR_PATTERN, (match, key: string, separator: string, value: string) => (isCredentialKey(key) && !isCountValue(key, value) ? `"${key}"${separator}"${CREDENTIAL_REDACTION_MARKER}"` : match))
     .replace(QUOTED_ATTRIBUTE_PATTERN, (match, key: string, quote: string) => (isCredentialKey(key) ? `${key}=${quote}${CREDENTIAL_REDACTION_MARKER}${quote}` : match));

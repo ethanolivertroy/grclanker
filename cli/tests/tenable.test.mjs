@@ -1076,6 +1076,27 @@ function carriersOf(value) {
     [`X-Cookie: token=${value}`, /^X-Cookie: \[REDACTED\]$/],
     [`X-Api-Key: ${value}`, /^X-Api-Key: \[REDACTED\]$/],
     [`<p>X-ApiKeys: accessKey=${value};secretKey=${value}</p><p>next</p>`, /^<p>X-ApiKeys: \[REDACTED\]<\/p><p>next<\/p>$/],
+    // Quoted header values: the value goes with its quotes, whatever the name of the pair
+    // that carries it, through the closing quote or to the end of the line; a value that is
+    // one quoted string keeps the quotes around the marker; the quote that closes the text
+    // the header line was quoted in, and the JSON string it is escaped into, stay intact.
+    [`Cookie: sid="${value}"`, /^Cookie: \[REDACTED\]$/],
+    [`Cookie: sid='${value}'; theme=dark`, /^Cookie: \[REDACTED\]$/],
+    [`Cookie: theme=dark; sid="${value}"; lang=en`, /^Cookie: \[REDACTED\]$/],
+    [`Set-Cookie: TNS_SESSIONID="${value}"; Path=/; HttpOnly`, /^Set-Cookie: \[REDACTED\]$/],
+    [`X-ApiKeys: accessKey="${value}";secretKey="${value}"`, /^X-ApiKeys: \[REDACTED\]$/],
+    [`x-apikey: accesskey='${value}'; secretkey='${value}';`, /^x-apikey: \[REDACTED\]$/],
+    [`Authorization: Bearer "${value}"`, /^Authorization: \[REDACTED\]$/],
+    [`Authorization: "Bearer ${value}" was rejected`, /^Authorization: "\[REDACTED\]" was rejected$/],
+    [`X-Api-Key: "${value}"`, /^X-Api-Key: "\[REDACTED\]"$/],
+    [`X-SecurityCenter: '${value}'`, /^X-SecurityCenter: '\[REDACTED\]'$/],
+    [`{"detail":"upstream rejected Cookie: sid=\\"${value}\\"; path=/","code":401}`, /^\{"detail":"upstream rejected Cookie: \[REDACTED\]","code":401\}$/],
+    [`{"error_msg":"X-ApiKeys: accessKey=\\"${value}\\";secretKey=\\"${value}\\"","code":403}`, /^\{"error_msg":"X-ApiKeys: \[REDACTED\]","code":403\}$/],
+    [`{"cookie": "sid=${value}", "other": "z"}`, /^\{"cookie": "\[REDACTED\]", "other": "z"\}$/],
+    [`rejected header "Cookie: sid=${value}" and "X-Other: 1"`, /^rejected header "Cookie: \[REDACTED\]" and "X-Other: 1"$/],
+    [`<p>Cookie: sid="${value}"</p><p>next</p>`, /^<p>Cookie: \[REDACTED\]<\/p><p>next<\/p>$/],
+    [`<p>Cookie: sid="${value}</p><p>next="1"</p>`, /^<p>Cookie: \[REDACTED\]<\/p><p>next="1"<\/p>$/],
+    [`Cookie: sid="${value}"\nX-Other: keep`, /^Cookie: \[REDACTED\]\nX-Other: keep$/],
     [`accessKey=${value};secretKey=${value}`, /^accessKey=\[REDACTED\];secretKey=\[REDACTED\]$/],
     [`TNS_SESSIONID=${value}; Path=/`, /^TNS_SESSIONID=\[REDACTED\]; Path=\/$/],
     [`session=${value} expired`, /^session=\[REDACTED\] expired$/],
@@ -1398,13 +1419,18 @@ const CANARY_URL_TOKEN = "ho4A04gykhqEgcruJ1Hu65";
 // assignment, gives away, and a plain lowercase word that only the Bearer scheme does.
 const CANARY_NAMED = "sess-canary-COOKIE-31415926535897";
 const CANARY_PLAIN = "uhfsumxscmhlzj";
-const CANARIES = [CANARY_BEARER, CANARY_SESSION, CANARY_API_KEY, CANARY_URL_TOKEN, CANARY_NAMED, CANARY_PLAIN];
+// A second name-shaped value that travels in quotes (Cookie: sid="value", X-ApiKeys:
+// accessKey="value"): neither its shape nor the pair rule removes it, only a header rule
+// that carries a quoted value through its closing quote, so its absence proves that rule ran.
+const CANARY_QUOTED = "sess-qtdv-QCARRY-16180339887498";
+const CANARIES = [CANARY_BEARER, CANARY_SESSION, CANARY_API_KEY, CANARY_URL_TOKEN, CANARY_NAMED, CANARY_PLAIN, CANARY_QUOTED];
 const CANARY_URL = `https://api.example.com/v1/x?token=${CANARY_URL_TOKEN}`;
 
 function htmlCanaryResponse() {
   const body = `<html><head><title>502 Bad Gateway</title></head><body><p>Authorization: Bearer ${CANARY_BEARER}</p>`
     + `<p>Set-Cookie: TNS_SESSIONID=${CANARY_SESSION}; Path=/</p><p>X-ApiKeys: accessKey=${CANARY_API_KEY};secretKey=${CANARY_API_KEY}</p>`
     + `<p>Proxy-Authorization: Bearer ${CANARY_PLAIN}</p><p>Cookie: sid=${CANARY_NAMED}</p>`
+    + `<p>Cookie: sid="${CANARY_QUOTED}"; theme=dark</p><p>X-ApiKeys: accessKey="${CANARY_QUOTED}";secretKey="${CANARY_QUOTED}"</p>`
     + `<p>The upstream at ${CANARY_URL} did not answer in time, retry later.</p></body></html>`;
   // retry-after: 0 keeps the client's 5xx retries instant when the response reaches a real sleep.
   return new Response(body, { status: 502, statusText: "Bad Gateway", headers: { "content-type": "text/html; charset=utf-8", "retry-after": "0" } });
@@ -1413,11 +1439,13 @@ function htmlCanaryResponse() {
 function jsonCanaryResponse() {
   return new Response(JSON.stringify({
     error: `Upstream refused Bearer ${CANARY_BEARER} at ${CANARY_URL} mid-sentence; session=${CANARY_SESSION}, api_key=${CANARY_API_KEY}, Bearer ${CANARY_PLAIN}, sid=${CANARY_NAMED} rejected`,
+    message: `Cookie: sid="${CANARY_QUOTED}"; theme=dark`,
+    error_msg: `X-Cookie: token="${CANARY_QUOTED}"`,
   }), { status: 400, statusText: "Bad Request", headers: { "content-type": "application/json" } });
 }
 
-// The scrubbed rendering of the JSON canary sentence, as every error string must carry it.
-const JSON_CANARY_MARKER = /HTTP 400 Bad Request; Upstream refused Bearer \[REDACTED\] at https:\/\/api\.example\.com\/v1\/x\?token=\[REDACTED\] mid-sentence; session=\[REDACTED\], api_key=\[REDACTED\], Bearer \[REDACTED\], sid=\[REDACTED\] rejected/;
+// The scrubbed rendering of the JSON canary fields, as every error string must carry it.
+const JSON_CANARY_MARKER = /HTTP 400 Bad Request; Upstream refused Bearer \[REDACTED\] at https:\/\/api\.example\.com\/v1\/x\?token=\[REDACTED\] mid-sentence; session=\[REDACTED\], api_key=\[REDACTED\], Bearer \[REDACTED\], sid=\[REDACTED\] rejected; Cookie: \[REDACTED\]; X-Cookie: \[REDACTED\]/;
 const HTML_CANARY_MARKER = /HTTP 502 Bad Gateway; non-JSON text\/html response body \(\d+ bytes, not echoed\)/;
 
 // The configured secrets of the sweep fixture, echoed bare in prose in every encoded form:
@@ -1778,7 +1806,7 @@ test("exportTenableAuditBundle never writes policy credentials, scanner linking 
 // rules run on their own (hyphenated words with one digit group) and the plain lowercase
 // word that only the Bearer scheme gives away.
 const PLANTED_CREDENTIALS = [...Object.values(LOADER_CANARIES), ...CANARIES, ...Object.values(FAKE_TENABLE_SECRETS), FIXTURE_ACCESS_KEY, FIXTURE_SECRET_KEY];
-const SHAPED_CREDENTIALS = new Set([CANARY_NAMED, CANARY_PLAIN, FIXTURE_ACCESS_KEY, FIXTURE_SECRET_KEY]);
+const SHAPED_CREDENTIALS = new Set([CANARY_NAMED, CANARY_QUOTED, CANARY_PLAIN, FIXTURE_ACCESS_KEY, FIXTURE_SECRET_KEY]);
 
 test("fixture self-check: planted credentials are alphanumeric and random-looking, share no 6-character window with each other, and no 6-character window of any occurs in the fixtures' legitimate text", async () => {
   const owners = new Map();
