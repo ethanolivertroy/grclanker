@@ -58,7 +58,11 @@ function assertNoCanaryValues(value, label) {
   assertNoFragments(value, Object.values(ERROR_CANARY), { label });
 }
 
-/** Every carrier of the `ERROR_CANARY` set: header lines, a cookie, a key pair, a URL query, a JWT, and the AWS pair, in prose. */
+/**
+ * Every carrier of the `ERROR_CANARY` set: header lines, a cookie, a key pair, a URL query, a JWT, the
+ * AWS pair in prose, and the AWS secret glued to `=` after a key that does not name a credential (a
+ * bare `x=` and an env-style `NAME=`), where only the secret's own shape can catch it.
+ */
 function errorCanaryCarriers() {
   return [
     `Authorization: Bearer ${ERROR_CANARY.bearer} was rejected`,
@@ -69,6 +73,8 @@ function errorCanaryCarriers() {
     `retry the request at ${ERROR_CANARY_URL} once the incident clears`,
     `token ${ERROR_CANARY.jwt} expired`,
     `credentials ${ERROR_CANARY.awsAccessKeyId} ${ERROR_CANARY.awsSecret} were rejected`,
+    `x=${ERROR_CANARY.awsSecret}`,
+    `ENV_VALUE=${ERROR_CANARY.awsSecret} was rejected`,
     `key ${ERROR_CANARY.configured} rejected`,
     htmlCanaryPage(),
     jsonCanarySentence(),
@@ -108,6 +114,11 @@ test("the random-looking canary set leaves no 6- to 24-character fragment throug
     }
   }
   assert.equal(scrubErrorText(`Authorization: Bearer ${ERROR_CANARY.bearer} was rejected`), `Authorization: Bearer ${REDACTED} was rejected`);
+  for (const scrub of [scrubErrorText, scrubDataText]) {
+    assert.equal(scrub(`x=${ERROR_CANARY.awsSecret}`), `x=${REDACTED}`, "an AWS secret after a non-credential key= is caught by its shape");
+    assert.equal(scrub(`ENV_VALUE=${ERROR_CANARY.awsSecret} was rejected`), `ENV_VALUE=${REDACTED} was rejected`);
+    assert.equal(scrub(`secret_access_key=${ERROR_CANARY.awsSecret}`), `secret_access_key=${REDACTED}`, "a long credential key keeps its name in front of one marker");
+  }
   assert.equal(scrubErrorText(jsonCanarySentence()), `Access denied while fetching https://api.example.com/v1/x?${REDACTED} for the caller; retry after re-authenticating.`);
   assertNoFragment(scrubErrorText(`key ${ENCODED_FORM_SECRET} rejected`, { secrets: [ENCODED_FORM_SECRET] }), ENCODED_FORM_SECRET);
 });

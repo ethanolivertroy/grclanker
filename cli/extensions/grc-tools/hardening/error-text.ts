@@ -105,9 +105,12 @@ const ASSIGNMENT_KEY_PATTERN = /(["']?)\b([A-Za-z][A-Za-z0-9_.-]{0,63})\b(["']?\
 const ASSIGNMENT_VALUE_PATTERN = /(?!\[REDACTED\])[^\s"'<>;,&]+/y;
 
 // JWT and JWE compact serialisations, AWS access key ids, and 40-character AWS secret access keys.
+// The secret shape is matched after any assignment operator too: `=` is not in the lookbehind, since
+// base64 padding ends a value and never precedes one, so `x=<secret>` and `ENV_VALUE=<secret>` under a
+// key that does not name a credential are caught by this rule (the pair rule handles credential keys).
 const JWT_PATTERN = /\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}(?:\.[A-Za-z0-9_-]+)*/g;
 const AWS_ACCESS_KEY_ID_PATTERN = /\b(?:AKIA|ASIA|AROA|AIDA|AGPA|ANPA|ANVA|APKA|ABIA|ACCA)[A-Z0-9]{16}\b/g;
-const AWS_SECRET_PATTERN = /(?<![A-Za-z0-9/+=])[A-Za-z0-9/+]{40}(?![A-Za-z0-9/+=])/g;
+const AWS_SECRET_PATTERN = /(?<![A-Za-z0-9/+])[A-Za-z0-9/+]{40}(?![A-Za-z0-9/+=])/g;
 
 // Vendor token prefixes that identify a credential on their own, so they are removed even when the
 // long-token rule is off.
@@ -347,7 +350,22 @@ export function scrubErrorText(text: string, options: ScrubErrorTextOptions = {}
     .replace(AWS_SECRET_PATTERN, (run) => (looksLikeAwsSecret(run) ? REDACTED : run));
   for (const pattern of VENDOR_TOKEN_PATTERNS) scrubbed = scrubbed.replace(pattern, REDACTED);
   if (options.longTokens === false) return scrubbed;
-  return scrubbed.replace(LONG_TOKEN_RUN_PATTERN, (run) => (looksLikeToken(run) ? REDACTED : run));
+  return scrubbed.replace(LONG_TOKEN_RUN_PATTERN, scrubLongTokenRun);
+}
+
+/**
+ * A run that ends in "=" is a padded base64 value only when the padding completes a multiple of four
+ * and the body uses the standard alphabet (no "-" or "_"); otherwise the "=" is an assignment operator
+ * after a long key (`secret_access_key=`, whose value the pair rule has already replaced), and the key
+ * alone is judged so the diagnostic keeps its key name in front of the marker.
+ */
+function scrubLongTokenRun(run: string): string {
+  const padding = /=+$/.exec(run)?.[0] ?? "";
+  if (padding.length > 0 && (run.length % 4 !== 0 || /[_-]/.test(run))) {
+    const key = run.slice(0, run.length - padding.length);
+    return looksLikeToken(key) ? `${REDACTED}${padding}` : run;
+  }
+  return looksLikeToken(run) ? REDACTED : run;
 }
 
 /**
