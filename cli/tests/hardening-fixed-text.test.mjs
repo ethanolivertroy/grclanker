@@ -109,6 +109,13 @@ const STATUSES = Object.freeze([
 ]);
 
 const DATASET_LABELS = Object.freeze(["roles", "users", "credentials", "secrets", "tokens", "api keys", "service account keys", "sessions", "OAuth clients", "password policies", "signing keys"]);
+/**
+ * Labels that are themselves a credential-named pair key (`credentials`, and any other word of the
+ * scrub's `CREDENTIAL_PAIR_NAMES`) cannot stand in front of a colon in a note: the pair rule takes
+ * whatever follows as the value whatever its shape (coordinator ruling on the Codex P2). A plural or
+ * compound label (`secrets`, `tokens`, `api keys`, `sessions`) is not such a key and survives.
+ */
+const PAIR_KEY_LABELS = Object.freeze(["credentials"]);
 
 function bodyNotes() {
   const notes = [];
@@ -242,6 +249,14 @@ test("marker error text survives the scrub for every inventory label, including 
       `${label}: truncated`,
     ];
     const gated = gatedPrincipals({ admins_without_mfa: ["alice"], admin_count: 1 }, false, notes);
+    if (PAIR_KEY_LABELS.includes(label)) {
+      // The caller's note, not the library's: a credential pair key before a colon loses the word after it, so such a label is written without the colon.
+      assert.equal(scrubErrorText(gated.principals_withheld), notes.map((note) => note.replace(/^credentials: \S+/, `credentials: ${REDACTED}`)).join("; "), `${label} principals_withheld with a colon`);
+      const withoutColon = notes.map((note) => note.replace(`${label}: `, `${label} `));
+      assertSurvivesScrub(gatedPrincipals({ admin_count: 1 }, false, withoutColon).principals_withheld, `${label} principals_withheld without a colon`);
+      assertSurvivesScrub(gatedPrincipals({ admin_count: 1 }, false, notes.map((note) => note.replace(`${label}: `, `${label} inventory: `))).principals_withheld, `${label} principals_withheld with a compound label`);
+      continue;
+    }
     assertSurvivesScrub(gated.principals_withheld, `${label} principals_withheld`);
   }
   assertSurvivesScrub(notCollected(line).error, "not collected without status");

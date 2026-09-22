@@ -26,6 +26,7 @@ import {
   REDACTION_CASES,
   assertNoCanaries,
   assertRedactionCases,
+  carrierCases,
   htmlCanaryBody,
   jsonCanaryMessage,
 } from "./helpers/error-canaries.mjs";
@@ -191,12 +192,129 @@ test("vendor token prefixes are removed even when the long-token rule is off", (
   }
 });
 
-test("authorization scheme values are removed unless the value is one plain lowercase word", () => {
+test("scheme-carried values are removed whatever their casing or entropy; the prose exemption is one plain word, a lowercase compound, a dotted version, or an auth-param", () => {
   assert.equal(scrubDataText(`Authorization: Bearer ${CANARY.bearer} rejected`), `Authorization: Bearer ${REDACTED} rejected`, "a lowercase word that continues into a token is a token");
   assert.equal(scrubDataText(`proxy replayed Basic ${CANARY.basic}`), `proxy replayed Basic ${REDACTED}`);
   assert.equal(scrubDataText("SSWS 00abcDEF123ghiJKL456 rejected"), `SSWS ${REDACTED} rejected`);
-  for (const prose of ["Basic authentication is disabled for this tenant.", "Bearer token-based auth is required", "the token authentication flow failed", "Digest access authentication"]) {
+  // Codex P2 (scheme-carried lowercase opaque): under a header carrier the value goes whatever its shape, a plain word included.
+  for (const opaque of ["abcdefghijkl", "qwertyuiopasdfghjklzxcvbnm", "token", "abc123", "AbCdEfGh", "x9y8z7"]) {
+    for (const scrub of [scrubErrorText, scrubDataText]) {
+      assert.equal(scrub(`Authorization: Bearer ${opaque} rejected`), `Authorization: Bearer ${REDACTED} rejected`, `header carrier with ${opaque}`);
+      assert.equal(scrub(`"Authorization": "Bearer ${opaque}"`), `"Authorization": "Bearer ${REDACTED}"`, `JSON header carrier with ${opaque}`);
+      assert.equal(scrub(`Proxy-Authorization: Basic ${opaque}`), `Proxy-Authorization: Basic ${REDACTED}`, `proxy header carrier with ${opaque}`);
+    }
+  }
+  // In free text the value goes unless it is one of the fixed-text shapes: a digit, a symbol, mixed casing inside a word, or 20 or more letters is never prose.
+  for (const opaque of ["abc123", "x9y8z7", "AbCdEfGh", "abcdefghijklmnopqrstu", "abcd_efgh", "abcd.efgh", "dXNlcjpwYXNz", "00abcDEF", "Kq7Zx2Vw9Lm4Tp8R", "12345", "sk-live-9x"]) {
+    for (const [scheme, tail] of [["Bearer", " was rejected"], ["Basic", " upstream"], ["Token", " expired"], ["SSWS", " rejected"], ["ApiKey", ""], ["Splunk", "."]]) {
+      const text = `replayed ${scheme} ${opaque}${tail}`;
+      assert.equal(scrubDataText(text), `replayed ${scheme} ${REDACTED}${tail}`, text);
+      assert.equal(scrubErrorText(text), `replayed ${scheme} ${REDACTED}${tail}`, text);
+    }
+  }
+  // The prose exemption, derived from the 121 distinct continuations the integrations' fixed texts put after a scheme word.
+  for (const prose of [
+    "Basic authentication is disabled for this tenant.",
+    "Bearer token-based auth is required",
+    "Bearer token authentication is required",
+    "the token authentication flow failed",
+    "Digest access authentication",
+    "third-party OAuth sign-in (codes 1, 11) and Zoom-held passwords",
+    "Optional Okta OAuth service-app client ID. Used with PrivateKey auth mode.",
+    "the OAuth 2.0 device flow and Splunk Enterprise 9.1.2",
+    "Splunk Cloud, Splunk Enterprise, SSWS API tokens, SSWS or OAuth",
+    'Bearer realm="api", error="invalid_token", error_description="The access token expired"',
+    "Token inventory: 3 of 5 keys have no expiry",
+    "Authorization: Bearer",
+    "Authorization: Bearer\nnext line starts here",
+    "Basic (deprecated) and Basic (full access) modes",
+  ]) {
     assert.equal(scrubErrorText(prose), prose);
+    assert.equal(scrubDataText(prose), prose);
+  }
+});
+
+test("credential-named pairs lose any nonempty value whatever its shape; compound credential keys keep prose and lose tokens", () => {
+  // Codex P2 (credential-labelled pair with a short lowercase word value): guard 1 as written, no shape gate.
+  for (const [text, expected] of [
+    ["password: hunter2xyz", `password: ${REDACTED}`],
+    ["password: hunter", `password: ${REDACTED}`],
+    ["token=abcdefgh", `token=${REDACTED}`],
+    ["api_key: short", `api_key: ${REDACTED}`],
+    ["secret: word.", `secret: ${REDACTED}.`],
+    ["the credentials: seen 40 of 120", `the credentials: ${REDACTED} 40 of 120`],
+    ['{"password": "correct horse battery staple"}', `{"password": "${REDACTED}"}`],
+    ["session_id=abc is stale", `session_id=${REDACTED} is stale`],
+    ["sid: x1", `sid: ${REDACTED}`],
+    ["passphrase: 'open sesame'", `passphrase: '${REDACTED}'`],
+    ["client_secret = s3", `client_secret = ${REDACTED}`],
+    ["Api-Key: prod-us-east-2026, env: production", `Api-Key: ${REDACTED}, env: production`],
+    ["x-amz-signature=abcdef&x-amz-date=20260922", `x-amz-signature=${REDACTED}&x-amz-date=20260922`],
+    [`token=${REDACTED} already scrubbed`, `token=${REDACTED} already scrubbed`],
+    ['"token": null, "otp": true', '"token": null, "otp": true'],
+    ["token: ", "token: "],
+  ]) {
+    assert.equal(scrubErrorText(text), expected, text);
+    assert.equal(scrubDataText(text), expected, text);
+    assert.equal(redactSecretValues(text), expected, text);
+  }
+  // A compound key the Flue heuristic classifies keeps a prose value and loses a token-shaped one.
+  for (const prose of ["InvalidAuthenticationToken: Access token has expired.", "access_tokens: seen 40 of 120", "user_session: 3 active sessions", "client_token: expired", "Authorization_RequestDenied: Insufficient privileges", "tokens: none are stale"]) {
+    assert.equal(scrubErrorText(prose), prose);
+    assert.equal(scrubDataText(prose), prose);
+  }
+  for (const [key, value] of [["client_token", "Kq7Zx2Vw9Lm4Tp8R"], ["user_session", "0f9e8d7c6b5a4938"], ["access_tokens", "dGhpcyBpcyBh=="], ["X-Vendor-Auth", "a1b2c3d4e5f6"]]) {
+    assert.equal(scrubDataText(`${key}: ${value} rejected`), `${key}: ${REDACTED} rejected`, `${key} with a token-shaped value`);
+  }
+  // A credential word inside a longer name, a path, or a dotted key is not a carrier.
+  for (const text of ["sdk-keys: 3 of 5 rotated", "environment-token: present", "settings.token: enabled", "GET /_security/api_key: 403 Forbidden", "the token: yes, but not this one"]) {
+    const expected = text === "the token: yes, but not this one" ? `the token: ${REDACTED}, but not this one` : text;
+    assert.equal(scrubErrorText(text), expected, text);
+  }
+});
+
+test("URL scrubbing is idempotent for query-only, fragment-only, and mixed URLs, and every entry point is idempotent over the carrier corpus", () => {
+  // Codex finding: a fragment-only URL came back as `#[REDACTED][REDACTED]` on a second pass.
+  for (const [text, expected] of [
+    ["see https://docs.example.com/guide#section-2 for details", `see https://docs.example.com/guide#${REDACTED} for details`],
+    ["see https://api.example.com/v1/x?page=2#top.", `see https://api.example.com/v1/x?${REDACTED}#${REDACTED}.`],
+    [`see https://api.example.com/v1/x?${REDACTED}#${REDACTED} for details`, `see https://api.example.com/v1/x?${REDACTED}#${REDACTED} for details`],
+    [`see https://api.example.com/v1/x#${REDACTED}`, `see https://api.example.com/v1/x#${REDACTED}`],
+    ['{"url":"https://api.example.com/v1/x?token=abc#frag"}', `{"url":"https://api.example.com/v1/x?${REDACTED}#${REDACTED}"}`],
+    ['"url":"https://api.example.com/v1/x?token=abc\\"}', `"url":"https://api.example.com/v1/x?${REDACTED}\\"}`],
+  ]) {
+    for (const scrub of [scrubErrorText, scrubDataText]) {
+      const once = scrub(text);
+      assert.equal(once, expected, text);
+      assert.equal(scrub(once), once, `second pass changed ${JSON.stringify(once)}`);
+    }
+  }
+  const corpus = [
+    ...REDACTION_CASES.map(({ input }) => input),
+    ...errorCanaryCarriers(),
+    ...["prod-us-east-2026", ERROR_CANARY.bearer].flatMap((value) => carrierCases(value).map(([, input]) => input)),
+    "see https://docs.example.com/guide#section-2 and https://h.example/p?x=1#y",
+    `Set-Cookie: sid="${ERROR_CANARY.sessionCookie}"; Path=/; HttpOnly`,
+    `{"headers":{"Authorization":"Bearer ${ERROR_CANARY.bearer}","X-Api-Key":"${ERROR_CANARY.apiKey}"}}`,
+    "-----BEGIN PRIVATE KEY-----\nMIIEowIBAAKCAQEA7canaryKEYbody\n-----END PRIVATE KEY-----",
+    "-----BEGIN PRIVATE KEY-----\nMIIEowIBAAKCAQEA7canaryKEYbody unterminated",
+  ];
+  const secrets = [ERROR_CANARY.configured];
+  const entryPoints = [
+    ["scrubErrorText", (text) => scrubErrorText(text, { secrets })],
+    ["scrubDataText", (text) => scrubDataText(text, { secrets })],
+    ["errorMessage", (text) => errorMessage(new Error(text), { secrets })],
+    ["scrubError", (text) => scrubError(new Error(text), { secrets }).message],
+    ["IntegrationError", (text) => new IntegrationError(text, {}, { secrets }).message],
+    ["redactSecretValues", (text) => redactSecretValues(text, { secrets })],
+    ["describeErrorBody", (text) => describeErrorBody("application/json", JSON.stringify({ message: text }), { secrets })],
+  ];
+  for (const text of corpus) {
+    for (const [name, scrub] of entryPoints) {
+      const once = scrub(text);
+      assert.equal(scrub(once), once, `${name} is not idempotent for ${JSON.stringify(text)}: ${JSON.stringify(once)}`);
+      assert.equal(scrub(scrub(once)), once, `${name} is not idempotent on the third pass for ${JSON.stringify(text)}`);
+    }
   }
 });
 
