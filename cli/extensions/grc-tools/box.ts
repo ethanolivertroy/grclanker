@@ -3314,19 +3314,27 @@ export function summarizeFindingStatuses(findings: BoxFinding[]): Record<BoxFind
 }
 
 function formatAccessCheckText(result: BoxAccessCheckResult): string {
-  const rows = result.surfaces.map((surface) => [
-    surface.name,
-    surface.status,
-    surface.count === undefined ? "-" : String(surface.count),
-    surface.error ? surface.error.replace(/\s+/g, " ").slice(0, 90) : "",
-  ]);
+  // A count, request, or status the probe did not observe renders as "-", never as a number or a constant path. The
+  // note drops the request label (the Request column carries it whole) before it is shortened, so a cut never leaves a
+  // partial endpoint in the output.
+  const rows = result.surfaces.map((surface) => {
+    const note = (surface.error ?? "").replace(surface.endpoint ? ` for ${surface.endpoint}` : "", "").replace(/\s+/g, " ");
+    return [
+      surface.name,
+      surface.status,
+      surface.count === undefined || surface.count === null ? "-" : String(surface.count),
+      surface.httpStatus === null ? "-" : String(surface.httpStatus),
+      surface.endpoint ?? "-",
+      note.length > 120 ? `${note.slice(0, 120)}...` : note,
+    ];
+  });
 
   return [
     `Box access check: ${result.status}`,
     "",
     ...result.notes,
     "",
-    formatTable(["Surface", "Status", "Count", "Note"], rows),
+    formatTable(["Surface", "Status", "Count", "HTTP", "Request", "Note"], rows),
     "",
     `Next: ${result.recommendedNextStep}`,
   ].join("\n");
