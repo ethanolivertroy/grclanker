@@ -11,7 +11,9 @@
  *    Token, ApiKey; credential-named key-value pairs; SOAP session elements) is removed whatever its
  *    shape, bare or quoted (`Cookie: sid="x"`, `X-Api-Key: 'x'`, `Authorization: Bearer "x"`, with any
  *    spacing and in JSON-escaped form), while a quoted non-credential header (`Content-Type:
- *    "application/json"`) stays;
+ *    "application/json"`) stays; on a compound line a quoted value ends at its closing quote and an
+ *    unquoted cookie or header value ends where the next `Name:` token begins, so the header that
+ *    follows (`; X-Api-Key: "x"`, `; Content-Type: "application/json"`) keeps its name;
  * 2. a registered secret (KNOWN_SECRETS, that is the client's own credentials) is removed whatever
  *    its shape and in its base64, base64url, URL-encoded, and JSON-escaped forms.
  *
@@ -117,6 +119,11 @@ export const MUST_KEEP = [
   'Location: "/api/now/table/sys_user"',
   'X-RateLimit-Remaining: "0"',
   'the proxy echoed Content-Type: "text/html" and Retry-After: "120" for prod-us-east-2026',
+  // Several non-credential headers on one line stay whole, names included.
+  'Content-Type: "application/json"; Accept: "application/json"',
+  'Host: api.example.com; Content-Type: "application/json"',
+  'Retry-After: "120", Content-Length: "5120"',
+  'Content-Type: "application/json" Accept: "application/json"',
 ];
 
 /**
@@ -224,6 +231,41 @@ export function quotedCarrierCases(canary) {
     { name: "JSON-escaped quoted assignment", text: `client_secret=\\"${canary}\\"`, keeps: ["client_secret="] },
     { name: "command-line token flag with a quoted value", text: `--token "${canary}" --org acme`, keeps: ["--token ", " --org acme"] },
     { name: "command-line password flag with a single-quoted value", text: `--password '${canary}'`, keeps: ["--password "] },
+    ...compoundHeaderLineCases(canary),
+  ];
+}
+
+/**
+ * Compound header lines (pinned carrier cases, round 4 early signal). Header dumps and proxy error pages
+ * put several headers on one `;`-, `,`-, or space-separated line. A quoted value ends at its closing
+ * quote and an unquoted cookie or header value ends where the next `Name:` token begins, so the header
+ * that follows a Cookie or another credential header keeps its name and gets its own carrier treatment:
+ * a quoted name-shaped `X-Api-Key` value after a Cookie goes, and a following `Content-Type:
+ * "application/json"` stays whole. The `ctl` cookie value is a position control, redacted with its
+ * carrier; `keeps` names the following header so a swallowed name fails the case.
+ */
+export function compoundHeaderLineCases(canary) {
+  const json = '"application/json"';
+  return [
+    { name: "Cookie followed by a quoted X-Api-Key", text: `Cookie: sid="ctl"; X-Api-Key: "${canary}"`, keeps: ["Cookie: ", '; X-Api-Key: "'], pinnedForShortToken: true },
+    { name: "Cookie followed by X-Api-Key with a space before the colon", text: `Cookie: sid="ctl"; X-Api-Key : "${canary}"`, keeps: ["Cookie: ", '; X-Api-Key : "'] },
+    { name: "unquoted Cookie followed by a quoted X-Api-Key", text: `Cookie: sid=ctl; X-Api-Key: "${canary}"`, keeps: ["Cookie: ", '; X-Api-Key: "'] },
+    { name: "single-quoted Cookie followed by X-Api-Key without a space", text: `Cookie: sid='ctl'; X-Api-Key:'${canary}'`, keeps: ["Cookie: ", "; X-Api-Key:'"] },
+    { name: "Cookie followed by X-Api-Key after a comma", text: `Cookie: sid=ctl, X-Api-Key: "${canary}"`, keeps: ["Cookie: ", ', X-Api-Key: "'] },
+    { name: "Cookie followed by X-Api-Key after a space", text: `Cookie: sid=ctl X-Api-Key: "${canary}"`, keeps: ["Cookie: ", ' X-Api-Key: "'] },
+    { name: "Cookie followed by a quoted Authorization Bearer", text: `Cookie: sid="ctl"; Authorization: Bearer "${canary}"`, keeps: ["Cookie: ", "; Authorization: "] },
+    { name: "Set-Cookie with attributes followed by Authorization", text: `Set-Cookie: session="ctl"; Path=/; Authorization: Bearer "${canary}"`, keeps: ["Set-Cookie: ", "; Authorization: "] },
+    { name: "lowercase cookie pairs followed by lowercase authorization", text: `cookie: a=b; c=d; authorization: bearer "${canary}"`, keeps: ["cookie: ", "; authorization: "] },
+    { name: "Cookie followed by Content-Type", text: `Cookie: sid=${canary}; Content-Type: ${json}`, keeps: ["Cookie: ", `; Content-Type: ${json}`], pinnedForShortToken: true },
+    { name: "quoted Cookie followed by Content-Type and Accept", text: `Cookie: sid="${canary}"; Content-Type: ${json}; Accept: ${json}`, keeps: ["Cookie: ", `; Content-Type: ${json}; Accept: ${json}`] },
+    { name: "Set-Cookie with an Expires date followed by X-Api-Key", text: `Set-Cookie: sid=${canary}; Expires=Wed, 21 Oct 2015 07:28:00 GMT; Path=/; X-Api-Key: "ctl"`, keeps: ["Set-Cookie: ", '; X-Api-Key: "'] },
+    { name: "two quoted headers, X-Api-Key then Authorization", text: `X-Api-Key: "ctl"; Authorization: Bearer "${canary}"`, keeps: ['X-Api-Key: "', "; Authorization: "] },
+    { name: "two quoted headers, Authorization then X-Api-Key", text: `Authorization: Bearer "ctl"; X-Api-Key: "${canary}"`, keeps: ["Authorization: ", '; X-Api-Key: "'], pinnedForShortToken: true },
+    { name: "two Set-Cookie headers on one line", text: `Set-Cookie: a=ctl; Secure; Set-Cookie: session="${canary}"; HttpOnly`, keeps: ["Set-Cookie: ", "; Set-Cookie: "] },
+    { name: "Proxy-Authorization without a scheme followed by X-Api-Key after a space", text: `Proxy-Authorization: ctl X-Api-Key: "${canary}"`, keeps: ["Proxy-Authorization: ", ' X-Api-Key: "'] },
+    { name: "Cookie followed by a JSON fragment", text: `Cookie: sid=ctl; {"X-Api-Key": "${canary}"}`, keeps: ["Cookie: ", '; {"X-Api-Key": "'] },
+    { name: "quoted Cookie followed by a JSON fragment after a space", text: `Cookie: sid="ctl" {"api_key": "${canary}"}`, keeps: ["Cookie: ", '{"api_key": "'] },
+    { name: "header dump with every credential header and Content-Type", text: `Headers presented: Authorization: Bearer "ctl"; Cookie: sid="ctl"; X-Api-Key: "${canary}"; Cookie: sid=prod-us-east-2026; Content-Type: ${json}`, keeps: ["Headers presented: Authorization: ", "; Cookie: ", '; X-Api-Key: "', `; Content-Type: ${json}`] },
   ];
 }
 

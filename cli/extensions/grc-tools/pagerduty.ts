@@ -71,6 +71,9 @@ const URL_IN_TEXT_PATTERN = /\b(https?:\/\/)(?:([^\s/?#@"'<>]+)@)?([^\s/?#"'<>]+
 const BARE_QUERY_PAIR_PATTERN = /([?&][\w.~%-]+=)([^\s"'&#<>\\]+)/g;
 // Header name to value: `: `, `="`, or the JSON-escaped `\":\"`.
 const HEADER_SEPARATOR = String.raw`\\?["']?\s*[:=]\s*\\?["']?`;
+// The next header on the same line (`; X-Api-Key: x`, `, Content-Type: x`, ` Accept: x`, a quoted or JSON-object
+// name too): a cookie or header value ends before it, so that header keeps its name and gets its own carrier treatment.
+const NEXT_HEADER_NAME = String.raw`\s*\{?\s*\\?["']?[A-Za-z][\w-]*\\?["']?\s*:`;
 // The schemes that stand as carriers in prose (the ruling's list, including PagerDuty's REST API key
 // scheme `Token token=<key>`) and the wider set recognized inside an Authorization header.
 const PROSE_AUTH_SCHEMES = "bearer|basic|digest|token|apikey|api-key";
@@ -85,14 +88,16 @@ const CREDENTIAL_PARAMETER_VALUE = String.raw`(?:\\?"[^"\\\r\n]*\\?"|'[^'\r\n]*'
 const CREDENTIAL_PARAMETERS = String.raw`[\w-]+=${CREDENTIAL_PARAMETER_VALUE}(?:\s*[,;]\s*[\w-]+=${CREDENTIAL_PARAMETER_VALUE})*`;
 // The whole value of an Authorization header: a scheme and its credential, or up to two tokens for an unknown scheme.
 const AUTHORIZATION_HEADER_PATTERN = new RegExp(
-  String.raw`\b((?:proxy-)?authorization)(${HEADER_SEPARATOR})(?:(?:${HEADER_AUTH_SCHEMES})\s+(?:${CREDENTIAL_PARAMETERS}|${CREDENTIAL_TOKEN})|${CREDENTIAL_PARAMETERS}|${CREDENTIAL_TOKEN}(?:\s+${CREDENTIAL_TOKEN})?)`,
+  String.raw`\b((?:proxy-)?authorization)(${HEADER_SEPARATOR})(?:(?:${HEADER_AUTH_SCHEMES})\s+(?:${CREDENTIAL_PARAMETERS}|${CREDENTIAL_TOKEN})|${CREDENTIAL_PARAMETERS}|${CREDENTIAL_TOKEN}(?:\s+(?!${NEXT_HEADER_NAME})${CREDENTIAL_TOKEN})?)`,
   "gi",
 );
-// Cookie and Set-Cookie headers: every pair to the end of the header value is a session credential. A pair's
-// value may be quoted (`sid="x"`, `sid = 'x'`, JSON-escaped `sid=\"x\"`); a quote anywhere else closes the
-// value, so the next header of a JSON headers object is not taken.
+// Cookie and Set-Cookie headers: every pair of the header value is a session credential. A pair's value may be
+// quoted (`sid="x"`, `sid = 'x'`, JSON-escaped `sid=\"x\"`) and ends at its closing quote; a quote anywhere else
+// closes the value, so the next header of a JSON headers object is not taken; an unquoted value runs to the
+// `;`, `,`, or space that begins the next header on the line, or to the end of the line.
 const COOKIE_PAIR_VALUE = String.raw`(?<==\s*)(?:\\?"[^"\\\r\n,;\s][^"\\\r\n]*\\?"|'[^'\r\n,;\s][^'\r\n]*')`;
-const COOKIE_HEADER_PATTERN = new RegExp(String.raw`\b(set-cookie|cookie)(${HEADER_SEPARATOR})((?:[^\r\n"'<>\\]|${COOKIE_PAIR_VALUE})+)`, "gi");
+const COOKIE_HEADER_VALUE = String.raw`(?:[^\s"'<>\\;,]|[ \t;,](?!${NEXT_HEADER_NAME})|${COOKIE_PAIR_VALUE})+`;
+const COOKIE_HEADER_PATTERN = new RegExp(String.raw`\b(set-cookie|cookie)(${HEADER_SEPARATOR})(${COOKIE_HEADER_VALUE})`, "gi");
 // A scheme standing in prose (`Bearer x`, `Bearer "x"`, `Token token=x`, `ApiKey x`); a scheme word that is itself a
 // header or field name (`X-Api-Key : x`) is left to the field rule.
 const AUTH_SCHEME_PATTERN = new RegExp(String.raw`\b(${PROSE_AUTH_SCHEMES})(?!\s*[:=])\s+(${CREDENTIAL_PARAMETERS}|${CREDENTIAL_TOKEN})`, "gi");
