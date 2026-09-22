@@ -1928,6 +1928,15 @@ export function assessServicenowIdentityAccessData(data: ServicenowIdentityData)
     const allAdminsFlagged = complete
       ? `all ${admins.length} admin users carry enable_multifactor_authn`
       : "every visible admin user carries enable_multifactor_authn (counts withheld because the user inventory was not fully read)";
+    // A property row that is absent from a partial sys_properties read may sit among the unread rows.
+    if (!enabled.exists && !tablesComplete([data.properties])) {
+      return {
+        status: "manual",
+        summary: "glide.authenticate.multifactor was not among the visible sys_properties rows and that read was partial, so the unread rows could hold it; platform MFA enablement is unknown.",
+        evidence,
+        principals,
+      };
+    }
     if (!enabled.exists || asBoolean(enabled.value) !== true) {
       return {
         status: "fail",
@@ -2642,6 +2651,14 @@ export function assessServicenowAccessControlData(data: ServicenowAccessControlD
     }
     const uncovered = coverage.filter((item) => item.acls === 0);
     const gaps = coverage.filter((item) => item.acls > 0 && item.missing_operations.length > 0);
+    // A table with no ACL among the visible rows is an absence claim; on a partial read the unread rows could hold it.
+    if ((uncovered.length > 0 || gaps.length > 0) && !complete) {
+      return {
+        status: "manual",
+        summary: "Some sensitive tables showed no active record ACL, or no explicit read, write, or delete rule, among the visible sys_security_acl rows, but that read was partial, so the unread rows could hold them; table names and counts are withheld and coverage cannot be judged.",
+        evidence,
+      };
+    }
     if (uncovered.length > 0) {
       return {
         status: "fail",
@@ -2931,9 +2948,11 @@ export function assessServicenowOperationsGovernanceData(data: ServicenowOperati
 
   const plugins = gatedFinding(20, [data.plugins], "Open System Definition > Plugins; confirm High Security Settings, Contextual Security: Role Management V2, and Security Jump Start are active, record Instance Security Center, Security Incident Response, GRC, and Vulnerability Response status, and review every other active plugin for necessity.", () => {
     const rows = data.plugins.rows;
+    // A plugin absent from a partial sys_plugins read may sit among the unread rows, so its presence is unknown rather than false.
+    const complete = tablesComplete([data.plugins]);
     const evaluate = (definition: { key: string; pattern: RegExp; label: string }) => {
       const match = rows.find((row) => definition.pattern.test(rowString(row, "name") ?? ""));
-      return { key: definition.key, label: definition.label, present: Boolean(match), active: match ? pluginActive(match) ?? null : null };
+      return { key: definition.key, label: definition.label, present: match ? true : complete ? false : null, active: match ? pluginActive(match) ?? null : null };
     };
     const required = REQUIRED_SECURITY_PLUGINS.map(evaluate);
     const optional = OPTIONAL_SECURITY_PLUGINS.map(evaluate);
@@ -2951,6 +2970,21 @@ export function assessServicenowOperationsGovernanceData(data: ServicenowOperati
       };
     }
     const inactiveRequired = required.filter((item) => item.active !== true);
+    const observedInactive = inactiveRequired.filter((item) => item.present === true);
+    if (observedInactive.length > 0) {
+      return {
+        status: "fail",
+        summary: `${observedInactive.length} baseline security plugins are present but not active: ${observedInactive.map((item) => item.label).join(", ")}.`,
+        evidence,
+      };
+    }
+    if (inactiveRequired.length > 0 && !complete) {
+      return {
+        status: "manual",
+        summary: `${inactiveRequired.length} baseline security plugins were not among the visible sys_plugins rows and that read was partial, so the unread rows could hold them; their status is unknown.`,
+        evidence,
+      };
+    }
     if (inactiveRequired.length > 0) {
       return {
         status: "fail",

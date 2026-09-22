@@ -1970,3 +1970,54 @@ test("collection status: a partially visible user directory keeps seen and total
   assert.equal(findingsById(identity).get("SNOW-14").evidence.integration_users, null);
   assertMentionsMatchRequests([run.analysis, run.accessCheck, run.payloads, run.errors, run.executive], run.requests, "partial users");
 });
+
+test("review round item 13: absence-driven fails on a partial ACL, plugin, or property read cap at manual and name nothing they did not see", async () => {
+  const withoutAcls = healthyFixture();
+  withoutAcls.tables.sys_security_acl = withoutAcls.tables.sys_security_acl.filter((row) => row.name !== "sys_audit" && row.name !== "syslog");
+  const partialAcls = await assessServicenowAccessControl(createClient(fixtureFetch(withoutAcls, { inflateTotals: { sys_security_acl: 60 } }).fetchImpl));
+  const tableLevel = findingsById(partialAcls).get("SNOW-11");
+  assert.equal(tableLevel.status, "manual");
+  assert.match(tableLevel.summary, /read was partial, so the unread rows could hold them; table names and counts are withheld/);
+  assert.doesNotMatch(tableLevel.summary, /sys_audit|syslog|\d+ sensitive tables have no/);
+  for (const row of tableLevel.evidence.sensitive_table_coverage) {
+    if (row.table === "sys_audit" || row.table === "syslog") {
+      assert.equal(row.acls, null, `${row.table} acls render null on a partial ACL read`);
+      assert.equal(row.missing_operations, null);
+    }
+  }
+  const completeAcls = await assessServicenowAccessControl(createClient(fixtureFetch(withoutAcls).fetchImpl));
+  assert.equal(findingsById(completeAcls).get("SNOW-11").status, "fail");
+  assert.match(findingsById(completeAcls).get("SNOW-11").summary, /2 sensitive tables have no visible active record ACL: syslog, sys_audit/);
+
+  const withoutPlugins = healthyFixture();
+  withoutPlugins.tables.sys_plugins = withoutPlugins.tables.sys_plugins.filter((row) => !/Role Management V2|Security Jump Start/.test(row.name));
+  const partialPlugins = await assessServicenowOperationsGovernance(createClient(fixtureFetch(withoutPlugins, { inflateTotals: { sys_plugins: 40 } }).fetchImpl));
+  const plugins = findingsById(partialPlugins).get("SNOW-20");
+  assert.equal(plugins.status, "manual");
+  assert.match(plugins.summary, /2 baseline security plugins were not among the visible sys_plugins rows and that read was partial/);
+  assert.doesNotMatch(plugins.summary, /Role Management V2|Security Jump Start/);
+  for (const item of plugins.evidence.required_security_plugins) {
+    if (/Role Management V2|Security Jump Start/.test(item.label)) assert.equal(item.present, null, `${item.label} presence is unknown on a partial read`);
+    else assert.equal(item.present, true);
+  }
+  const completePlugins = await assessServicenowOperationsGovernance(createClient(fixtureFetch(withoutPlugins).fetchImpl));
+  assert.equal(findingsById(completePlugins).get("SNOW-20").status, "fail");
+  assert.match(findingsById(completePlugins).get("SNOW-20").summary, /2 baseline security plugins are not active: Contextual Security: Role Management V2, Security Jump Start \(ACL Rules\)/);
+  const inactivePlugins = healthyFixture();
+  inactivePlugins.tables.sys_plugins = inactivePlugins.tables.sys_plugins.map((row) => (/Security Jump Start/.test(row.name) ? { ...row, active: "inactive" } : row));
+  const observedInactive = await assessServicenowOperationsGovernance(createClient(fixtureFetch(inactivePlugins, { inflateTotals: { sys_plugins: 40 } }).fetchImpl));
+  assert.equal(findingsById(observedInactive).get("SNOW-20").status, "fail", "a plugin observed inactive is a real observation even on a partial read");
+  assert.match(findingsById(observedInactive).get("SNOW-20").summary, /1 baseline security plugins are present but not active: Security Jump Start \(ACL Rules\)/);
+
+  const withoutMfaProperty = healthyFixture();
+  withoutMfaProperty.tables.sys_properties = withoutMfaProperty.tables.sys_properties.filter((row) => row.name !== "glide.authenticate.multifactor");
+  const partialProperties = await assessServicenowIdentityAccess(createClient(fixtureFetch(withoutMfaProperty, { inflateTotals: { sys_properties: 40 } }).fetchImpl));
+  const mfa = findingsById(partialProperties).get("SNOW-07");
+  assert.equal(mfa.status, "manual");
+  assert.match(mfa.summary, /glide\.authenticate\.multifactor was not among the visible sys_properties rows and that read was partial/);
+  assert.doesNotMatch(mfa.summary, /documented default is false/);
+  assert.equal(mfa.evidence.glide_authenticate_multifactor, null);
+  const completeProperties = await assessServicenowIdentityAccess(createClient(fixtureFetch(withoutMfaProperty).fetchImpl));
+  assert.equal(findingsById(completeProperties).get("SNOW-07").status, "fail");
+  assert.match(findingsById(completeProperties).get("SNOW-07").summary, /has no sys_properties row; the documented default is false/);
+});
