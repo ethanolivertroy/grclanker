@@ -67,6 +67,12 @@ export type ExecutionBackendCapabilities = {
   stageWorkspace: boolean;
   artifactSync: boolean;
   interactive: boolean;
+  /**
+   * Every exec runs in a fresh container or a stateless job, so a filesystem change made by one
+   * exec is invisible to the next. The runtime offers only bash on such a backend; read, write,
+   * edit, ls, grep, and find stay on the local workspace instead of pretending to persist remotely.
+   */
+  oneShot: boolean;
 };
 
 export interface ExecutionBackend {

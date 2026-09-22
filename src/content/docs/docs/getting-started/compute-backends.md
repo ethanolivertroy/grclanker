@@ -15,9 +15,9 @@ The compute backend is where tool execution happens.
 - `sandbox-runtime`: keep the runtime local, but wrap `bash`, `grep`, and `find` in a local sandbox and enforce matching filesystem policy for `read`, `write`, `edit`, and `ls`.
 - `docker`: run `bash`, `read`, `write`, `edit`, `ls`, `grep`, and `find` inside a local container with the repo bind-mounted into it.
 - `parallels-vm`: deploy a disposable Parallels sandbox from either a dedicated template or a stopped base VM, attach the repo share, and run the same tool surface inside that sandbox via `prlctl exec`.
-- `modal`: run each command one-shot inside a Modal container through the `modal shell` CLI, optionally with a GPU.
+- `modal`: run each `bash` command one-shot inside a fresh Modal container through the `modal shell` CLI, optionally with a GPU. File tools stay on the local workspace (see "One-shot backends" below).
 - `runpod-pod`: copy the tracked files of the repo into a persistent RunPod pod you already own and run the tool surface over SSH.
-- `runpod-serverless`: dispatch each command as a job to a RunPod serverless endpoint that runs the grclanker worker contract.
+- `runpod-serverless`: dispatch each `bash` command as a stateless job to a RunPod serverless endpoint that runs the grclanker worker contract. File tools stay on the local workspace.
 - `vercel-sandbox` and `cloudflare-sandbox`: reserved kinds that fail fast today (see the backend matrix below).
 
 Model/provider settings still decide which LLM answers questions. Compute backend settings decide where code execution and file operations happen.
@@ -30,9 +30,9 @@ Model/provider settings still decide which LLM answers questions. Compute backen
 | `sandbox-runtime` | sandboxed | shipped | contract adapter for bash, grep, and find; file tools stay local with the same FS policy | no | no | in place | in place |
 | `docker` | sandboxed | shipped | contract adapter (`docker run` args unchanged from phase 1) | no | no | bind mount | bind mount |
 | `parallels-vm` | sandboxed | shipped | contract adapter (disposable clone, `prlctl exec`) | yes (`prlctl snapshot`, `prlctl snapshot-switch`), exercised by `env smoke-test` | no | shared folder | shared folder |
-| `modal` | gpu-burst | shipped (CLI) | contract adapter over `modal shell` | no | yes | `--add-local` copy per command | not available |
+| `modal` | gpu-burst | shipped (CLI) | contract adapter over `modal shell`, one-shot: bash only, file tools stay local | no | yes | `--add-local` copy per command | not available |
 | `runpod-pod` | persistent-remote | shipped | contract adapter over the REST API plus `ssh`/`scp` | no | yes | `scp` of the git index (tracked files minus the deny list) into a per-session directory | `scp` (manual) |
-| `runpod-serverless` | gpu-burst | shipped | contract adapter over the serverless HTTP API | no | yes | worker image must contain the workspace | artifact paths reported by the worker |
+| `runpod-serverless` | gpu-burst | shipped | contract adapter over the serverless HTTP API, one-shot: bash only, file tools stay local | no | yes | worker image must contain the workspace | artifact paths reported by the worker |
 | `vercel-sandbox` | sandboxed | stub | fails fast | no | no | no | no |
 | `cloudflare-sandbox` | sandboxed | stub | fails fast | no | no | no | no |
 
@@ -49,7 +49,7 @@ Every adapter implements one TypeScript interface in `cli/pi/execution-backend.t
 ```ts
 interface ExecutionBackend {
   readonly kind: ExecutionBackendKind;
-  readonly capabilities: { snapshot: boolean; restore: boolean; gpu: boolean; stageWorkspace: boolean; artifactSync: boolean; interactive: boolean };
+  readonly capabilities: { snapshot: boolean; restore: boolean; gpu: boolean; stageWorkspace: boolean; artifactSync: boolean; interactive: boolean; oneShot: boolean };
   healthcheck(): Promise<void>;
   stageWorkspace(input: { localPath: string; sessionId: string; mountMode?: "ro" | "rw" }): Promise<{ remotePath: string }>;
   exec(request: ExecutionRequest): Promise<ExecutionResult>;
@@ -60,6 +60,10 @@ interface ExecutionBackend {
 ```
 
 Adapters that do not support an operation throw a clear "does not support" error instead of pretending. Every adapter takes an injected command runner or `fetch`, which is how the unit tests exercise Docker, Parallels, Modal, and RunPod without touching real binaries or the network.
+
+### One-shot backends
+
+`modal` and `runpod-serverless` set `capabilities.oneShot`. Every `exec` on them runs in a fresh container or a stateless job, so a file written by one execution does not exist for the next one. The runtime therefore offers only `bash` (and the user's `!` commands) on a one-shot backend: `read`, `write`, `edit`, `ls`, `grep`, and `find` are not routed through it and fall back to the host-local tools, which operate on the local workspace and keep their state there. Before this change a remote `write` reported success and the next `read` returned the original file, and agent edits disappeared silently. The consequence for agents is spelled out in the system prompt note: a file written by `bash` on a one-shot backend is gone afterwards, local edits are what the next `bash` command sees on Modal (the workspace is copied in per command with `--add-local`), and on RunPod serverless local edits are not uploaded at all because the worker image has to contain the workspace. `env smoke-test` on a one-shot backend prints `tool_adapter=skipped (one-shot backend, stateful file operations not offered)` plus `tool_find=skipped` and `tool_grep=skipped` with the same reason, never `tool_write=ok` or `tool_read=ok`, and verifies only that a single execution can write and read back its own file (`tool_one_shot_round_trip=ok`).
 
 ### Credential hygiene in output
 
@@ -122,7 +126,7 @@ grclanker env exec --backend docker -- pwd
 
 `env doctor` answers "is this backend configured and detectable?"
 
-`env smoke-test` answers "can this backend actually run `bash`, file tools, and backend-native search right now?"
+`env smoke-test` answers "can this backend actually run `bash`, file tools, and backend-native search right now?" On a one-shot backend (`modal`, `runpod-serverless`) the file tool and search probes are reported as skipped with the reason rather than as passed, because those tools are not offered there.
 
 That validation step is not optional once you move beyond `host`.
 
@@ -351,13 +355,13 @@ grclanker setup --compute modal
 grclanker env smoke-test --backend modal
 ```
 
-What runs where: each `bash`, `read`, `write`, `edit`, `ls`, `grep`, and `find` call becomes one `modal shell --no-pty --image <modalImage> --add-local <repo> [--gpu <modalGpu>] --cmd "<wrapper>"` invocation, following the flags documented at [modal.com/docs/reference/cli/shell](https://modal.com/docs/reference/cli/shell). The repo is copied into the container at `/mnt/<repo-name>` for every command.
+What runs where: each `bash` call (and each user `!` command) becomes one `modal shell --no-pty --image <modalImage> --add-local <repo> [--gpu <modalGpu>] --cmd "<wrapper>"` invocation, following the flags documented at [modal.com/docs/reference/cli/shell](https://modal.com/docs/reference/cli/shell). The repo is copied into the container at `/mnt/<repo-name>` for every command. `read`, `write`, `edit`, `ls`, `grep`, and `find` are not routed to Modal: the backend is one-shot, so they stay on the local workspace (see "One-shot backends").
 
 Command quoting: the modal client runs `shlex.split(f'/bin/bash -c "{cmd}"')` on the `--cmd` value, so a raw command containing double quotes would be re-split. grclanker therefore never passes the command itself; it passes a wrapper made only of characters shlex leaves alone (`f=$(mktemp) && printf %s <base64> | base64 -d > $f && bash $f; s=$?; rm -f $f; exit $s`). The real command travels as base64, is decoded into a temp file inside the container, runs with its own stdin, and its exit status is preserved.
 
 Limits:
 
-- Every command starts a fresh container, so state does not persist between commands and file writes are not synced back to the host. Treat Modal as a read-mostly burst lane (analyzers, inference, validation) rather than a place to edit the repo.
+- Every command starts a fresh container, so state does not persist between commands and file writes are not synced back to the host. A file that `bash` writes on Modal is gone when the command ends; edit the repo with the local file tools and let the next `bash` command pick the change up through `--add-local`. Treat Modal as a burst lane (analyzers, inference, validation) rather than a place where `bash` builds up state.
 - Snapshots are not exposed through the CLI, so `snapshot` and `restore` report "not supported".
 - Settings: `modalImage` (default `debian:bookworm-slim`), `modalGpu` (for example `a10g` or `a100:4`).
 
@@ -377,6 +381,8 @@ Requests, in order, with every field taken from [Send API requests](https://docs
 Polling deadline: the loop always has a ceiling. It uses the tool's timeout when one is given, otherwise 600000 ms, which is the default `executionTimeout` RunPod documents for serverless jobs, plus a 60 second grace window so the endpoint can report `TIMED_OUT` itself first. When the deadline passes, the adapter cancels the job and raises an `ExecutionBackendTimeoutError` (message `runpod-serverless timed out after 600s: ...`).
 
 Worker contract: RunPod documents that `input` is defined by your worker, so grclanker defines a small one. Your handler receives `input.command`, `input.cwd`, and `input.env`, runs the command with `bash -lc`, and returns `{ "exitCode": number, "stdout": string, "stderr": string, "artifacts": string[] }` as the job `output`. The worker image must already contain the workspace at `runpodWorkspacePath` (default `/workspace`); serverless jobs cannot receive files.
+
+What runs where: only `bash` (and user `!` commands) is dispatched as a job. The backend is one-shot, so `read`, `write`, `edit`, `ls`, `grep`, and `find` stay on the local workspace (see "One-shot backends"); local edits are not uploaded to the worker, and nothing a job writes persists to the next job.
 
 Limits: no workspace upload, no snapshots, and artifact sync-back is limited to the paths the worker reports. Results expire after 30 minutes per the RunPod docs.
 

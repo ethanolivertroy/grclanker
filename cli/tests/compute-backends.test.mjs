@@ -17,6 +17,7 @@ import {
   resolveComputeProfile,
 } from "../dist/pi/compute.js";
 import {
+  buildComputeBackendSystemPromptNote,
   buildDockerToolRunArgs,
   resolveComputeBackendExecution,
   withComputeBackendExecution,
@@ -51,6 +52,9 @@ import {
   buildComputeBackendList,
   extractComputeFlag,
   formatComputeBackendList,
+  ONE_SHOT_SMOKE_NOTE,
+  runBackendSearchSmokeTest,
+  runBackendToolSmokeTest,
 } from "../dist/pi/env.js";
 import { createHostBackend, createSandboxRuntimeBackend } from "../dist/pi/backends/local.js";
 import {
@@ -139,13 +143,16 @@ test("every adapter implements the ExecutionBackend contract with capability fla
     for (const method of ["healthcheck", "stageWorkspace", "exec", "snapshot", "restore", "teardown"]) {
       assert.equal(typeof backend[method], "function", `${kind}.${method}`);
     }
-    for (const flag of ["snapshot", "restore", "gpu", "stageWorkspace", "artifactSync", "interactive"]) {
+    for (const flag of ["snapshot", "restore", "gpu", "stageWorkspace", "artifactSync", "interactive", "oneShot"]) {
       assert.equal(typeof backend.capabilities[flag], "boolean", `${kind}.capabilities.${flag}`);
     }
   }
   assert.equal(createExecutionBackend("/tmp/repo", settings, {}, "parallels-vm").capabilities.snapshot, true);
   assert.equal(createExecutionBackend("/tmp/repo", settings, {}, "modal").capabilities.gpu, true);
   assert.equal(createExecutionBackend("/tmp/repo", settings, {}, "docker").capabilities.gpu, false);
+  assert.equal(createExecutionBackend("/tmp/repo", settings, {}, "modal").capabilities.oneShot, true);
+  assert.equal(createExecutionBackend("/tmp/repo", settings, {}, "runpod-serverless").capabilities.oneShot, true);
+  assert.equal(createExecutionBackend("/tmp/repo", settings, {}, "runpod-pod").capabilities.oneShot, false);
 });
 
 test("computeProfile and computeDefaults validate against the spec JSON shape", () => {
@@ -849,6 +856,113 @@ test("modal command wrapper survives the client's shlex bash -c wrapper", () => 
     const failing = spawnSync("/bin/bash", ["-c", buildModalCommandWrapper("exit 7")], { encoding: "utf8" });
     assert.equal(failing.status, 7);
   }
+});
+
+test("one-shot backends offer bash only and the smoke test never reports write-then-read as passed", async () => {
+  const contractSettings = { computeBackend: "host", parallelsTemplateName: "tpl" };
+  const oneShotKinds = COMPUTE_BACKEND_KINDS.filter((kind) =>
+    createExecutionBackend("/repo", contractSettings, { runner: async () => ({ exitCode: 0 }) }, kind).capabilities.oneShot,
+  );
+  assert.deepEqual(oneShotKinds, ["modal", "runpod-serverless"]);
+
+  await withEnv({
+    MODAL_TOKEN_ID: "ak-FAKEID0123456789ABCD",
+    MODAL_TOKEN_SECRET: "as-FAKESECRET0123456789",
+    RUNPOD_API_KEY: "rpa_FAKEKEY0123456789ABCDEF",
+    RUNPOD_ENDPOINT_ID: "ep123",
+  }, async () => {
+    // Both fakes behave like the real providers: every exec starts from the original workspace,
+    // so a remote write would "succeed" and the next read would still return the original bytes.
+    // Only a single execution can observe its own write.
+    const original = "original contents\n";
+    const answer = (command) => (command.includes("printf 'alpha") ? "alpha\n" : original);
+    const modal = createFakeRunner(async (_executable, args) => {
+      if (args[0] === "--version") return { exitCode: 0, stdout: "modal client version: 1.0" };
+      return { exitCode: 0, stdout: answer(decodeModalCommandWrapper(args.at(-1))) };
+    });
+    const serverlessRequests = [];
+    const serverlessFetch = async (url, init = {}) => {
+      serverlessRequests.push({ url, body: init.body });
+      if (url.endsWith("/health")) return new Response(JSON.stringify({ workers: { ready: 1 } }), { status: 200 });
+      if (url.endsWith("/run")) {
+        // Answer as an already completed job so the test does not wait for the default poll
+        // interval; the poll protocol itself is covered by the serverless adapter test.
+        const command = JSON.parse(init.body).input.command;
+        return new Response(JSON.stringify({
+          id: "job-1",
+          status: "COMPLETED",
+          output: { exitCode: 0, stdout: answer(command), stderr: "", artifacts: [] },
+        }), { status: 200 });
+      }
+      return new Response("{}", { status: 200 });
+    };
+
+    const cases = [
+      ["modal", { computeBackend: "modal" }, { runner: modal.runner }],
+      ["runpod-serverless", { computeBackend: "runpod-serverless" }, { fetch: serverlessFetch }],
+    ];
+    for (const [kind, settings, deps] of cases) {
+      await withComputeBackendExecution("/repo", settings, async (execution) => {
+        assert.equal(execution.kind, kind);
+        assert.equal(execution.backend.capabilities.oneShot, true);
+        assert.equal(typeof execution.bashOperations.exec, "function");
+        // The stateful tools are not offered at all, so the extension falls back to its
+        // host-local read, write, edit, ls, find, and grep, which keep their state locally.
+        for (const surface of ["readOperations", "writeOperations", "editOperations", "lsOperations", "findOperations", "grepOperations"]) {
+          assert.equal(execution[surface], undefined, `${kind} must not offer ${surface}`);
+        }
+        assert.match(execution.summary, /stay on the local workspace because/);
+
+        const lines = [];
+        const log = (line) => lines.push(line);
+        await runBackendToolSmokeTest({ cwd: "/repo", timeoutSeconds: 5 }, execution, log);
+        await runBackendSearchSmokeTest({ cwd: "/repo", timeoutSeconds: 5 }, execution, log);
+        assert.deepEqual(lines, [
+          `tool_adapter=skipped (${ONE_SHOT_SMOKE_NOTE})`,
+          "tool_one_shot_round_trip=ok",
+          `tool_find=skipped (${ONE_SHOT_SMOKE_NOTE})`,
+          `tool_grep=skipped (${ONE_SHOT_SMOKE_NOTE})`,
+        ], kind);
+        assert.ok(!lines.some((line) => /^tool_(write|read|edit|ls|find|grep)=ok$/.test(line)), `${kind} reported a stateful probe as passed`);
+      }, deps);
+    }
+    assert.equal(ONE_SHOT_SMOKE_NOTE, "one-shot backend, stateful file operations not offered");
+    const roundTrip = serverlessRequests.filter((request) => request.url.endsWith("/run"));
+    assert.equal(roundTrip.length, 1);
+    assert.match(JSON.parse(roundTrip[0].body).input.command, /printf 'alpha\\n' > "\$probe_file" && cat "\$probe_file"/);
+
+    // The in-execution round trip is a real check: a remote that loses the write fails it, and the
+    // failure is reported instead of a pass.
+    const lossy = createFakeRunner(async (_executable, args) => {
+      if (args[0] === "--version") return { exitCode: 0, stdout: "modal client version: 1.0" };
+      return { exitCode: 0, stdout: "" };
+    });
+    await withComputeBackendExecution("/repo", { computeBackend: "modal" }, async (execution) => {
+      const lines = [];
+      await assert.rejects(
+        () => runBackendToolSmokeTest({ cwd: "/repo", timeoutSeconds: 5 }, execution, (line) => lines.push(line)),
+        /One-shot write-then-read verification inside a single execution failed/,
+      );
+      assert.deepEqual(lines, [`tool_adapter=skipped (${ONE_SHOT_SMOKE_NOTE})`]);
+    }, { runner: lossy.runner });
+
+    // Stateful backends keep the full surface, so the change is scoped to one-shot kinds.
+    const pod = createFakeRunner(async () => ({ exitCode: 0, stdout: "ok\n" }));
+    await withEnv({ RUNPOD_POD_ID: "pod42" }, async () => {
+      const execution = resolveComputeBackendExecution("/repo", { computeBackend: "runpod-pod" }, { runner: pod.runner, fetch: async () => new Response(RUNPOD_POD_JSON, { status: 200 }) });
+      assert.equal(execution.backend.capabilities.oneShot, false);
+      for (const surface of ["readOperations", "writeOperations", "editOperations", "lsOperations", "findOperations", "grepOperations"]) {
+        assert.equal(typeof execution[surface], "object", `runpod-pod must keep ${surface}`);
+      }
+      await execution.teardown();
+    });
+
+    // The agent is told the same thing in its system prompt note.
+    const note = buildComputeBackendSystemPromptNote("/repo", { computeBackend: "modal" });
+    assert.match(note, /modal is a one-shot backend: only bash and user `!` commands are routed through it/);
+    assert.match(note, /Read, write, edit, ls, grep, and find operate on the local workspace/);
+    assert.ok(!note.includes("Bash, read, write, edit, ls, grep, and find are routed through the compute backend"));
+  });
 });
 
 test("parallels share args honor the configured workspace mount mode", async () => {

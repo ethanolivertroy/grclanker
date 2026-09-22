@@ -83,6 +83,7 @@ export function createModalBackend(options: ModalBackendOptions = {}): Execution
       stageWorkspace: true,
       artifactSync: false,
       interactive: false,
+      oneShot: true,
     },
     async healthcheck() {
       requireEnv("MODAL_TOKEN_ID");

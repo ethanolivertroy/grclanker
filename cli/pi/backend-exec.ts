@@ -644,14 +644,55 @@ function buildFullToolSurface(
   };
 }
 
+// One-shot backends get bash only. Their file tools used to run remotely too, but every exec is a
+// fresh container or job, so a remote write reported success and the next read saw the original
+// workspace. Leaving read, write, edit, ls, grep, and find undefined makes the extension fall
+// back to its host-local tools, which operate on the local workspace and keep their state.
+function buildOneShotToolSurface(
+  kind: ComputeBackendKind,
+  label: string,
+  summary: string,
+  adapter: BackendCommandAdapter,
+  backend: ExecutionBackend,
+): ResolvedComputeBackendExecution {
+  return {
+    kind,
+    label,
+    summary,
+    sessionId: adapter.sessionId,
+    backend,
+    teardown: adapter.teardown,
+    bashOperations: { exec: adapter.stream },
+  };
+}
+
+export function describeOneShotConsequence(kind: ComputeBackendKind): string {
+  switch (kind) {
+    case "modal":
+      return "each bash command starts a fresh Modal container that receives a copy of the local workspace (`modal shell --add-local`), so local edits are visible to the next command but nothing bash writes is synced back";
+    case "runpod-serverless":
+      return "each bash command is a stateless job against the workspace baked into the worker image, so local edits are not uploaded and nothing the job writes persists";
+    case "runpod-pod":
+    case "cloudflare-sandbox":
+    case "vercel-sandbox":
+    case "host":
+    case "sandbox-runtime":
+    case "docker":
+    case "parallels-vm":
+      return `${kind} keeps state between commands`;
+    default:
+      return assertExhaustive(kind);
+  }
+}
+
 function describeRemoteSummary(kind: ComputeBackendKind): string {
   switch (kind) {
     case "modal":
-      return "bash, read, write, edit, ls, grep, and find run one-shot inside a Modal container via `modal shell`; the repo is copied in per command and changes are not synced back";
+      return `bash runs one-shot inside a Modal container via \`modal shell\`; read, write, edit, ls, grep, and find stay on the local workspace because ${describeOneShotConsequence(kind)}`;
     case "runpod-pod":
-      return "bash, read, write, edit, ls, grep, and find run over SSH inside the configured RunPod pod after the repo is copied to a per-session directory";
+      return "bash, read, write, edit, ls, grep, and find run over SSH inside the configured RunPod pod after the tracked files of the repo are copied to a per-session directory";
     case "runpod-serverless":
-      return "bash, read, write, edit, ls, grep, and find are dispatched as jobs to the configured RunPod serverless endpoint running the grclanker worker contract";
+      return `bash is dispatched as a job to the configured RunPod serverless endpoint running the grclanker worker contract; read, write, edit, ls, grep, and find stay on the local workspace because ${describeOneShotConsequence(kind)}`;
     case "cloudflare-sandbox":
     case "vercel-sandbox":
       return `${kind} is selected, but the adapter is a stub that fails fast; pick another backend`;
@@ -770,6 +811,9 @@ export function resolveComputeBackendExecution(
     case "vercel-sandbox": {
       const backend = createExecutionBackend(localCwd, settings, deps, kind);
       const adapter = createContractCommandAdapter(localCwd, backend);
+      if (backend.capabilities.oneShot) {
+        return buildOneShotToolSurface(kind, label, describeRemoteSummary(kind), adapter, backend);
+      }
       return buildFullToolSurface(kind, label, describeRemoteSummary(kind), localCwd, adapter, backend);
     }
     default:
@@ -797,22 +841,27 @@ export function buildComputeBackendSystemPromptNote(
 ): string {
   const execution = resolveComputeBackendExecution(localCwd, settings);
   const issues = getComputeBackendConfigurationIssues(settings, execution.kind);
+  const oneShot = execution.backend?.capabilities.oneShot === true;
   const lines = [
     "Execution backend notes:",
     `- Preferred compute backend: ${execution.label} (${execution.kind}).`,
     `- ${execution.summary}.`,
-    execution.readOperations && execution.findOperations && execution.grepOperations
-      ? "- Bash, read, write, edit, ls, grep, and find are routed through the compute backend."
+    oneShot
+      ? `- ${execution.kind} is a one-shot backend: only bash and user \`!\` commands are routed through it, and ${describeOneShotConsequence(execution.kind)}.`
+      : execution.readOperations && execution.findOperations && execution.grepOperations
+        ? "- Bash, read, write, edit, ls, grep, and find are routed through the compute backend."
+        : execution.findOperations && execution.grepOperations
+          ? "- Bash, grep, and find are routed through the compute backend. Read, write, edit, and ls still use host-local tools."
+          : execution.readOperations
+            ? "- Bash, read, write, edit, and ls are routed through the compute backend."
+            : "- For this MVP, only bash and user `!` commands are routed through the compute backend.",
+    oneShot
+      ? "- Read, write, edit, ls, grep, and find operate on the local workspace and keep their state there; do not expect a file written by bash on this backend to exist afterwards."
       : execution.findOperations && execution.grepOperations
-        ? "- Bash, grep, and find are routed through the compute backend. Read, write, edit, and ls still use host-local tools."
+        ? "- Search tools stay inside the selected backend instead of falling back to the host workspace."
         : execution.readOperations
-          ? "- Bash, read, write, edit, and ls are routed through the compute backend."
-          : "- For this MVP, only bash and user `!` commands are routed through the compute backend.",
-    execution.findOperations && execution.grepOperations
-      ? "- Search tools stay inside the selected backend instead of falling back to the host workspace."
-      : execution.readOperations
-        ? "- Grep and find still operate on the host workspace for now."
-        : "- Read, write, edit, grep, find, and ls still operate on the host workspace.",
+          ? "- Grep and find still operate on the host workspace for now."
+          : "- Read, write, edit, grep, find, and ls still operate on the host workspace.",
   ];
 
   if (issues.length > 0) {

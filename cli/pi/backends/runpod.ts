@@ -140,6 +140,7 @@ export function createRunpodServerlessBackend(options: RunpodServerlessOptions =
       stageWorkspace: false,
       artifactSync: false,
       interactive: false,
+      oneShot: true,
     },
     async healthcheck() {
       const apiKey = requireEnv("RUNPOD_API_KEY");
@@ -434,6 +435,7 @@ export function createRunpodPodBackend(options: RunpodPodOptions = {}): Executio
       stageWorkspace: true,
       artifactSync: true,
       interactive: false,
+      oneShot: false,
     },
     async healthcheck() {
       const pod = await fetchPod();
