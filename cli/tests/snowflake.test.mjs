@@ -1349,6 +1349,69 @@ test("SnowflakeSqlClient submits async statements, polls, and fetches every part
   assert.equal(calls[3].url, "https://myorg-myaccount.snowflakecomputing.com/api/v2/statements/handle-1?partition=1");
 });
 
+test("foreign-origin next link: a statementStatusUrl that leaves the configured account origin is never polled, the outcome records the fixed reason, and no part of the URL reaches any text", async () => {
+  const foreignParts = { host: "collector.evil-example.net", path: "/harvest/snowflake-jwt", query: "sink=bearer&handle=handle-9" };
+  const foreignTarget = `${foreignParts.host}${foreignParts.path}?${foreignParts.query}`;
+  const statusText = "Snowflake SQL API returned a statement status URL that is not on the configured account origin; the statement was not polled and its result was not read.";
+  const refusedText = "Snowflake SQL API request refused: the request URL is not on the configured account origin, so no request was sent.";
+
+  for (const statusUrl of [`@${foreignTarget}`, `:443@${foreignTarget}`, `https://${foreignTarget}`]) {
+    const calls = [];
+    const fetchImpl = async (url, init) => {
+      calls.push({ url: new URL(String(url)), authorization: headerValue(init.headers, "authorization") });
+      if (init.method === "POST") {
+        return jsonResponse({ code: "333334", message: "Asynchronous execution in progress.", statementHandle: "handle-9", statementStatusUrl: statusUrl }, { status: 202 });
+      }
+      throw new Error(`a poll left for ${String(url)}`);
+    };
+    const client = new SnowflakeSqlClient(sampleConfig(), { fetchImpl });
+    await assert.rejects(() => client.execute("SHOW USERS"), (error) => {
+      assert.equal(error.name, "SnowflakeStatementError");
+      assert.equal(error.message, statusText, `status URL ${statusUrl}`);
+      assert.equal(error.kind, "error");
+      return true;
+    });
+    assert.equal(calls.length, 1, `status URL ${statusUrl}: only the submit left`);
+    assert.equal(calls[0].url.origin, "https://myorg-myaccount.snowflakecomputing.com");
+
+    const outcome = await collectStatement(client, "users", "SHOW USERS");
+    assert.equal(outcome.status, "error");
+    assert.equal(outcome.error, statusText);
+    assert.equal(outcome.numRows, null);
+    assert.equal(outcome.partitionCount, null);
+    assert.equal(outcome.truncated, null);
+    assert.equal(calls.length, 2, "the collector's submit is the only further request");
+    assert.ok(calls.every((call) => call.url.origin === "https://myorg-myaccount.snowflakecomputing.com"), "no request left the configured origin");
+    for (const part of Object.values(foreignParts)) assert.ok(!JSON.stringify(outcome).includes(part), `the outcome carries no ${part}`);
+  }
+
+  const sameOriginCalls = [];
+  const sameOrigin = new SnowflakeSqlClient(sampleConfig(), {
+    fetchImpl: async (url, init) => {
+      sameOriginCalls.push(new URL(String(url)));
+      if (init.method === "POST") {
+        return jsonResponse({ code: "333334", message: "Asynchronous execution in progress.", statementHandle: "handle-9", statementStatusUrl: "/api/v2/statements/handle-9" }, { status: 202 });
+      }
+      return jsonResponse({ code: "090001", statementHandle: "handle-9", resultSetMetaData: { numRows: 1, format: "jsonv2", rowType: [{ name: "NAME", type: "text" }], partitionInfo: [{ rowCount: 1 }] }, data: [["a"]] });
+    },
+  });
+  const followed = await sameOrigin.execute("SHOW USERS");
+  assert.equal(followed.rows.length, 1, "a status URL on the configured origin is still polled");
+  assert.equal(sameOriginCalls.length, 2);
+
+  // Defense in depth on the request layer itself (a private method, reached here as plain JavaScript): any path that would move the host is refused before a credential is built, with fixed text.
+  const guarded = new SnowflakeSqlClient(sampleConfig(), { fetchImpl: async (url) => { throw new Error(`a request left for ${String(url)}`); } });
+  for (const pathname of [`@${foreignTarget}`, `:8443@${foreignTarget}`, `https://${foreignTarget}`]) {
+    await assert.rejects(() => guarded.request("GET", pathname), (error) => {
+      assert.equal(error.name, "SnowflakeStatementError");
+      assert.equal(error.message, refusedText, `pathname ${pathname}`);
+      assert.equal(error.kind, "error");
+      for (const part of Object.values(foreignParts)) assert.ok(!error.message.includes(part), `the refusal carries no ${part}`);
+      return true;
+    });
+  }
+});
+
 test("SnowflakeSqlClient records truncation instead of treating the first partition as the whole result", async () => {
   const fetchImpl = async () => jsonResponse({
     statementHandle: "handle-2",

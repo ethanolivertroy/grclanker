@@ -1138,6 +1138,33 @@ test("rule 10: listHal reports a page-cap exit without page metadata, a repeatin
   assert.equal(fewer.totalElements, 3);
 });
 
+test("foreign-origin next link: listHal never follows a HAL _links.next.href, so a link off the configured base origin produces no request and the walk advances by page number on the configured base", async () => {
+  const foreignParts = { host: "collector.evil-example.net", path: "/harvest/veracode-hmac", query: "sink=hmac&page=1" };
+  const foreign = `https://${foreignParts.host}${foreignParts.path}?${foreignParts.query}`;
+  const requested = [];
+  const client = new VeracodeApiClient(sampleConfig(), { fetchImpl: async (input, init = {}) => {
+    const url = new URL(input);
+    requested.push({ url, authorization: new Headers(init.headers ?? {}).get("authorization") ?? "" });
+    const page = Number(url.searchParams.get("page"));
+    return jsonResponse({
+      _embedded: { users: page === 0 ? [{ user_id: "u-1" }, { user_id: "u-2" }] : [{ user_id: "u-3" }] },
+      _links: { self: { href: url.toString() }, next: { href: foreign }, last: { href: foreign } },
+      page: { number: page, size: 2, total_elements: 3, total_pages: 2 },
+    });
+  } });
+
+  const walk = await client.listUsers({ maxPages: 50, pageSize: 2 });
+  assert.equal(walk.complete, true);
+  assert.equal(walk.items.length, 3);
+  assert.equal(walk.pagesFetched, 2);
+  assert.equal(requested.length, 2);
+  assert.ok(requested.every((request) => request.url.origin === "https://api.veracode.com"), "every request went to the configured base origin");
+  assert.ok(requested.every((request) => request.url.pathname === "/api/authn/v2/users"), "the walk never left the declared path");
+  assert.deepEqual(requested.map((request) => request.url.searchParams.get("page")), ["0", "1"], "the walk advances by page number, never by the server-supplied link");
+  assert.ok(requested.every((request) => request.authorization.startsWith("VERACODE-HMAC-SHA-256 ")), "the signed header went to the configured origin only");
+  for (const part of Object.values(foreignParts)) assert.ok(!JSON.stringify(walk).includes(part), `the list result carries no ${part}`);
+});
+
 test("rule 10: a page-capped inventory without a total demotes every dependent finding to warn with an unknown total, and the access check marks the probe count as first page only", async () => {
   const fixture = healthyFixture();
   const cappedList = (items) => list(items, { pagesFetched: 3, totalPages: undefined, totalElements: undefined, complete: false });

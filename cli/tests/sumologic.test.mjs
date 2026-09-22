@@ -1556,6 +1556,31 @@ test("rule 10: token pagination stops on a repeated cursor or an empty page with
   assert.match(byId(governance, "SUMO-12").summary, /Pagination stopped before the last page, so only 2000 items were seen/);
 });
 
+test("foreign-origin next link: a URL-shaped next cursor is only ever a token query value on the configured base, so no request leaves for it and the Basic credential stays on the configured origin", async () => {
+  const foreignParts = { host: "collector.evil-example.net", path: "/harvest/sumo-basic", query: "sink=basic&page=2" };
+  const foreign = `https://${foreignParts.host}${foreignParts.path}?${foreignParts.query}`;
+  const requests = [];
+  const fetchImpl = async (input, init = {}) => {
+    const url = new URL(typeof input === "string" ? input : input.toString());
+    requests.push({ url, authorization: headerValue(init.headers, "authorization") });
+    if (url.pathname !== "/api/v1/roles") return jsonResponse({});
+    if (!url.searchParams.get("token")) return jsonResponse({ data: [{ id: "r1", name: "Role 1" }], next: foreign });
+    return jsonResponse({ data: [{ id: "r2", name: "Role 2" }], next: null });
+  };
+  const client = new SumologicApiClient(sampleConfig(), { fetchImpl, maxPages: 50, maxRetries: 0 });
+
+  const roles = await client.listRoles();
+  assert.equal(roles.ok, true);
+  assert.equal(roles.complete, true);
+  assert.equal(roles.data.length, 2);
+  assert.equal(requests.length, 2);
+  assert.ok(requests.every((request) => request.url.origin === "https://api.us2.sumologic.com"), "every request went to the configured base origin");
+  assert.ok(requests.every((request) => request.url.pathname === "/api/v1/roles"), "the walk never left the declared path");
+  assert.equal(requests[1].url.searchParams.get("token"), foreign, "the server's next value travels back only as the token query value");
+  assert.ok(requests.every((request) => request.authorization.startsWith("Basic ")), "the credential went to the configured origin only");
+  for (const part of Object.values(foreignParts)) assert.ok(!JSON.stringify(roles).includes(part), `the collection carries no ${part}`);
+});
+
 test("rule 10: control 10 names each capped forwarding inventory and never passes on a truncated partition or scheduled view list", async () => {
   const data = healthyData();
   const partial = (items) => collectionOf(items, { complete: false });

@@ -1146,6 +1146,24 @@ export class SnowflakeStatementError extends Error {
   }
 }
 
+/** Fixed text for a request the client refuses to send; it never names the URL, so no path, query, or host of a server-supplied link reaches an error string. */
+const FOREIGN_ORIGIN_REFUSED = "Snowflake SQL API request refused: the request URL is not on the configured account origin, so no request was sent.";
+const FOREIGN_STATUS_URL = "Snowflake SQL API returned a statement status URL that is not on the configured account origin; the statement was not polled and its result was not read.";
+
+/**
+ * A server-supplied path (the statementStatusUrl of an asynchronous
+ * statement) is followed only when it resolves onto the configured account
+ * origin, so the bearer token never leaves for another host: a value such as
+ * `@other.example/x` would otherwise move the host of the concatenated URL.
+ */
+function onConfiguredOrigin(candidateUrl: string, baseUrl: string): boolean {
+  try {
+    return new URL(candidateUrl).origin === new URL(baseUrl).origin;
+  } catch {
+    return false;
+  }
+}
+
 function classifyErrorMessage(message: string, statusCode?: number): "denied" | "error" | "timeout" {
   if (/insufficient privileges|not authorized|access control error|does not exist or not authorized|unauthorized|forbidden/i.test(message)) {
     return "denied";
@@ -1228,6 +1246,13 @@ export class SnowflakeSqlClient {
     pathname: string,
     body?: JsonRecord,
   ): Promise<SnowflakeApiResponse> {
+    // The URL is checked against the configured origin before any credential
+    // is built or attached, so a path that would move the host is refused
+    // with fixed text and nothing leaves.
+    const url = `${this.config.baseUrl}${pathname}`;
+    if (!onConfiguredOrigin(url, this.config.baseUrl)) {
+      throw new SnowflakeStatementError(FOREIGN_ORIGIN_REFUSED, { kind: "error" });
+    }
     let attempt = 0;
     for (;;) {
       // A credential that cannot be turned into a bearer token is a
@@ -1244,7 +1269,7 @@ export class SnowflakeSqlClient {
           authorization,
           "x-snowflake-authorization-token-type": this.config.tokenType,
         });
-        const response = await this.fetchImpl(`${this.config.baseUrl}${pathname}`, {
+        const response = await this.fetchImpl(url, {
           method,
           headers,
           body: body ? JSON.stringify(body) : undefined,
@@ -1314,6 +1339,9 @@ export class SnowflakeSqlClient {
 
     while (latest.nonJsonBody === undefined && (latest.status === 202 || (latest.status === 429 && handle))) {
       if (!statusUrl) break;
+      if (!onConfiguredOrigin(`${this.config.baseUrl}${statusUrl}`, this.config.baseUrl)) {
+        throw new SnowflakeStatementError(FOREIGN_STATUS_URL, { kind: "error" });
+      }
       if (this.now().getTime() > deadline) {
         throw new SnowflakeStatementError(`Snowflake statement ${handle ?? ""} did not complete before the ${this.config.statementTimeoutSeconds}s statement timeout.`, { kind: "timeout" });
       }

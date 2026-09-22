@@ -1209,6 +1209,33 @@ test("rule 10: the repeated-page check fingerprints entries by id or by name wit
   assert.match(byId(stuckAccess, "SPLUNK-AC-11").summary, /1 of 50 saved searches/);
 });
 
+test("foreign-origin next link: splunkd pages by count and offset, so a planted next link or entry id on another origin is never requested and never persisted", async () => {
+  const foreignParts = { host: "collector.evil-example.net", path: "/harvest/splunk-token", query: "sink=bearer&offset=100" };
+  const foreign = `https://${foreignParts.host}${foreignParts.path}?${foreignParts.query}`;
+  const requests = [];
+  const fetchImpl = async (input, init = {}) => {
+    const url = new URL(typeof input === "string" ? input : input.url);
+    requests.push({ url, authorization: new Headers(init.headers ?? {}).get("authorization") });
+    if (url.pathname !== "/services/authorization/roles") return jsonResponse({ messages: [{ type: "ERROR", text: "Not Found" }] }, 404);
+    const offset = Number(url.searchParams.get("offset") ?? "0");
+    const name = offset === 0 ? "admin" : "user";
+    const page = [{ name, id: `${foreign}#${name}`, links: { alternate: foreign, next: foreign }, content: { capabilities: ["search"] }, acl: { app: "system", owner: "nobody", sharing: "system" } }];
+    return jsonResponse({ links: { next: foreign, alternate: foreign }, entry: page, paging: { total: 2, perPage: 1, offset } });
+  };
+  const client = new SplunkApiClient(sampleConfig(), { fetchImpl, retryDelayMs: 0, pageSize: 1 });
+
+  const roles = await client.listRoles();
+  assert.equal(roles.truncated, false);
+  assert.equal(roles.entries.length, 2);
+  assert.deepEqual(roles.entries.map((item) => item.name), ["admin", "user"]);
+  assert.equal(requests.length, 2);
+  assert.ok(requests.every((request) => request.url.origin === "https://splunk.example.com:8089"), "every request went to the configured origin");
+  assert.ok(requests.every((request) => request.url.pathname === "/services/authorization/roles"), "the walk never left the declared path");
+  assert.deepEqual(requests.map((request) => request.url.searchParams.get("offset")), ["0", "1"], "the walk advances by offset, never by the server-supplied link");
+  assert.ok(requests.every((request) => request.authorization === `Bearer ${SAMPLE_TOKEN}`), "the token went to the configured origin only");
+  for (const part of Object.values(foreignParts)) assert.ok(!JSON.stringify(roles).includes(part), `the persisted entries carry no ${part}`);
+});
+
 test("rule 10: acsListAll reports a repeated ACS page as truncated and an unrecognized payload as unreadable, and control 16 never passes on either", async () => {
   const cloud = { ...HARDENED, "/services/server/info": [entry("server-info", { version: "9.3.2411", product_type: "splunk_cloud", instance_type: "cloud" })] };
   const config = { stack: "acme-stack", acsToken: "acs-jwt" };

@@ -1589,6 +1589,23 @@ function makeUrl(config: OktaResolvedConfig, pathOrUrl: string): string {
   return `${config.orgUrl}${pathOrUrl}`;
 }
 
+/** Fixed text for a request the client refuses to send; it never names the URL, so no path, query, or host of a server-supplied link reaches an error string. */
+const FOREIGN_ORIGIN_REFUSED = "Okta API request refused: the request URL is not on the configured org origin, so no request was sent.";
+const FOREIGN_ORIGIN_NEXT_LINK = 'the Link rel="next" URL is not on the configured org origin and was not followed';
+
+/**
+ * A server-supplied URL (a Link rel="next" page) is followed only when it
+ * resolves to the configured org origin, so the SSWS token or bearer
+ * credential never leaves for another host.
+ */
+function onConfiguredOrigin(config: OktaResolvedConfig, pathOrUrl: string): boolean {
+  try {
+    return new URL(makeUrl(config, pathOrUrl)).origin === new URL(config.orgUrl).origin;
+  } catch {
+    return false;
+  }
+}
+
 /** Keeps only the vendor's error summary fields; a body without them is described by size so a token echoed by a proxy never lands in an error string. */
 async function readErrorDetail(response: Response): Promise<string> {
   const text = await response.text();
@@ -1735,6 +1752,9 @@ export class OktaAuditorClient {
     init: RequestInit = {},
     attempt = 0,
   ): Promise<Response> {
+    if (!onConfiguredOrigin(this.config, pathOrUrl)) {
+      throw new OktaApiError(FOREIGN_ORIGIN_REFUSED, null, "(refused: not on the configured org origin)");
+    }
     const headers = new Headers(init.headers ?? {});
     headers.set("accept", "application/json");
     if (!headers.has("authorization")) {
@@ -1805,9 +1825,10 @@ export class OktaAuditorClient {
 
   /**
    * Walks Link rel="next" pages up to maxPages. Every early exit (page cap, a
-   * next URL already visited, or an empty page that still advertises a next
-   * link) returns truncated: true with a note stating pages and items seen and
-   * that the total is unknown, so the partial-inventory demotion applies.
+   * next URL already visited, an empty page that still advertises a next
+   * link, or a next URL on another origin, which is never requested) returns
+   * truncated: true with a note stating pages and items seen and that the
+   * total is unknown, so the partial-inventory demotion applies.
    */
   async listPaginatedWithMeta(pathOrUrl: string, maxPages: number = MAX_LIST_PAGES): Promise<PaginatedList> {
     const items: JsonRecord[] = [];
@@ -1837,6 +1858,9 @@ export class OktaAuditorClient {
       pagesFetched += 1;
       const next = parseLinkHeaderNext(response.headers.get("link"));
       if (!next) break;
+      if (!onConfiguredOrigin(this.config, next)) {
+        return truncatedList(FOREIGN_ORIGIN_NEXT_LINK);
+      }
       if (visited.has(makeUrl(this.config, next))) {
         return truncatedList('the Link rel="next" cursor repeated a page already read');
       }

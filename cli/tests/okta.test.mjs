@@ -1944,6 +1944,62 @@ test("rule 10: every list walk reports truncated on the page cap, a repeated cur
   assert.match(stalled.truncationNote, /an empty page still advertised a Link rel="next" cursor, total unknown/);
 });
 
+test('foreign-origin next link: a Link rel="next" URL off the configured org origin is never requested, the inventory is truncated with the reason, and no part of the link reaches any text', async () => {
+  const foreignParts = { host: "collector.evil-example.net", path: "/harvest/okta-tokens", query: "sink=okta-ssws&after=page-2", fragment: "frag-marker" };
+  const foreign = `https://${foreignParts.host}${foreignParts.path}?${foreignParts.query}#${foreignParts.fragment}`;
+  const requests = [];
+  const serveWithNext = (nextLink) => async (input, init = {}) => {
+    const url = new URL(input.toString());
+    requests.push({ url, authorization: new Headers(init.headers ?? {}).get("authorization") });
+    const headers = { "content-type": "application/json", link: `<${nextLink}>; rel="next"` };
+    return new Response(JSON.stringify([{ id: `${url.pathname}-item`, status: "ACTIVE", label: "App", signOnMode: "SAML_2_0" }]), { status: 200, headers });
+  };
+  const client = createRealClient(serveWithNext(foreign));
+
+  const apps = await client.listApps();
+  assert.equal(apps.truncated, true);
+  assert.equal(apps.pagesFetched, 1);
+  assert.equal(apps.items.length, 1);
+  assert.equal(apps.truncationNote, 'GET /api/v1/apps?limit=200 stopped after 1 pages (1 items): the Link rel="next" URL is not on the configured org origin and was not followed, total unknown.');
+  assert.equal(requests.length, 1, "the walk sent the first page only");
+  assert.ok(requests.every((request) => request.url.origin === "https://tenant.example.okta.com"), "no request left the configured origin");
+  assert.ok(requests.every((request) => request.authorization === "SSWS okta-test-token"), "the credential went to the configured origin only");
+  for (const part of Object.values(foreignParts)) assert.ok(!apps.truncationNote.includes(part), `the truncation note carries no ${part}`);
+
+  const integrations = await collectOktaIntegrationData(client);
+  assert.equal(integrations.apps.truncated, true);
+  const integResult = assessOktaIntegrations(integrations, createSampleConfig());
+  for (const id of ["OKTA-INTEG-003", "OKTA-INTEG-005", "OKTA-INTEG-006"]) {
+    assert.equal(statusOf(integResult, id), "Partial", id);
+    assert.match(findingById(integResult, id).summary, /not on the configured org origin and was not followed, total unknown/, id);
+  }
+  const rendered = JSON.stringify([integrations, integResult]);
+  for (const part of Object.values(foreignParts)) assert.ok(!rendered.includes(part), `no dataset or finding carries ${part}`);
+
+  const sameOriginRequests = requests.length;
+  for (const candidate of [
+    foreign,
+    "http://tenant.example.okta.com/api/v1/apps?after=page-2",
+    "https://tenant.example.okta.com:8443/api/v1/apps?after=page-2",
+    "https://tenant.example.okta.com.evil-example.net/api/v1/apps?after=page-2",
+    "https://okta-test-token@collector.evil-example.net/api/v1/apps",
+  ]) {
+    await assert.rejects(() => client.getJson(candidate), (error) => {
+      assert.equal(error.name, "OktaApiError");
+      assert.equal(error.message, "Okta API request refused: the request URL is not on the configured org origin, so no request was sent.");
+      assert.equal(error.status, null);
+      assert.equal(error.endpoint, "(refused: not on the configured org origin)");
+      return true;
+    });
+  }
+  assert.equal(requests.length, sameOriginRequests, "a refused URL produces no request at all");
+
+  const sameOrigin = createRealClient(serveWithNext("https://tenant.example.okta.com/api/v1/apps?limit=200&after=page-2"));
+  const followed = await sameOrigin.listApps();
+  assert.equal(followed.pagesFetched, 2, "a next link on the configured origin is still followed");
+  assert.match(followed.truncationNote, /cursor repeated a page already read/);
+});
+
 test("rule 10: listSystemLogs is bounded, capped at five pages, and demotes OKTA-MON-002 to a total-unknown statement", async () => {
   const requests = [];
   const client = createRealClient(pagedFetch({ pageSize: 4, onRequest: (url) => requests.push(url) }));
