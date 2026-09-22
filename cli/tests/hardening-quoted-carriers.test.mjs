@@ -76,6 +76,9 @@ const MUST_KEEP = Object.freeze([
   '\\"Content-Type\\": \\"application/json\\"',
   "Accept: 'application/json'",
   'Content-Type: "text/html; charset=utf-8"',
+  "Date: Mon, 22 Sep 2026 12:30:00 GMT",
+  'Date: "Mon, 22 Sep 2026 12:30:00 GMT"',
+  "Last-Modified: Mon, 22 Sep 2026 12:30:00 GMT; Content-Length: 512",
   'User-Agent: "grclanker/1.0"',
   '"Content-Length": "5120"',
   'X-Request-Id: "req-2026-09-22-zq"',
@@ -336,6 +339,37 @@ const COMPOUND_LINES = Object.freeze([
     () => `Content-Type: "text/html; charset=utf-8"; X-Api-Key: "${REDACTED}"`,
     ['Content-Type: "text/html; charset=utf-8"', "X-Api-Key:"],
   ],
+  [
+    "unquoted cookie, then a Date header whose value holds a comma and colons, then a quoted header (control)",
+    (a, b) => `Cookie: sid=${a}; Date: Mon, 22 Sep 2026 12:30:00 GMT; X-Api-Key: "${b}"`,
+    () => `Cookie: ${REDACTED}; Date: Mon, 22 Sep 2026 12:30:00 GMT; X-Api-Key: "${REDACTED}"`,
+    ["Date: Mon, 22 Sep 2026 12:30:00 GMT", "X-Api-Key:"],
+  ],
+  [
+    "unterminated cookie quote, then a Date header, then a quoted header (control)",
+    (a, b) => `Cookie: sid="${a}; Date: Mon, 22 Sep 2026 12:30:00 GMT; X-Api-Key: "${b}"`,
+    () => `Cookie: ${REDACTED}; Date: Mon, 22 Sep 2026 12:30:00 GMT; X-Api-Key: "${REDACTED}"`,
+    ["Date: Mon, 22 Sep 2026 12:30:00 GMT", "X-Api-Key:"],
+  ],
+  [
+    "quoted Date header before a quoted Authorization header (control)",
+    (a) => `Date: "Mon, 22 Sep 2026 12:30:00 GMT"; Authorization: Bearer "${a}"`,
+    () => `Date: "Mon, 22 Sep 2026 12:30:00 GMT"; Authorization: Bearer "${REDACTED}"`,
+    ['Date: "Mon, 22 Sep 2026 12:30:00 GMT"', "Authorization: Bearer"],
+  ],
+  [
+    "unquoted header, comma, then a Date header with its own comma (control)",
+    (a) => `X-Api-Key: ${a}, Date: Mon, 22 Sep 2026 12:30:00 GMT`,
+    () => `X-Api-Key: ${REDACTED}, Date: Mon, 22 Sep 2026 12:30:00 GMT`,
+    ["Date: Mon, 22 Sep 2026 12:30:00 GMT"],
+  ],
+  [
+    // The Expires attribute's date holds a comma, which ends the cookie's attribute run under the rule; the remainder is a date, and the next header keeps its name.
+    "Set-Cookie with an Expires date attribute before the next header",
+    (a, b) => `Set-Cookie: session=${a}; Expires=Mon, 22 Sep 2026 12:30:00 GMT; Path=/; X-Api-Key: "${b}"`,
+    () => `Set-Cookie: ${REDACTED}, 22 Sep 2026 12:30:00 GMT; Path=/; X-Api-Key: "${REDACTED}"`,
+    ["22 Sep 2026 12:30:00 GMT; Path=/", "X-Api-Key:"],
+  ],
 ]);
 
 /** Pairs of planted values: each value rides in the first carrier once and in the second carrier once. */
@@ -347,7 +381,7 @@ function plantedPairs() {
 test("compound lines fixture: the rows share no 6-character window with the planted values", () => {
   const legitimate = new Map(COMPOUND_LINES.map(([label, line]) => [label, line("", "")]));
   assertCanariesDisjointFromFixture(assert, plantedValues(), legitimate, "compound lines");
-  assert.equal(COMPOUND_LINES.length, 20);
+  assert.equal(COMPOUND_LINES.length, 25);
 });
 
 test("compound lines: each credential value goes, the following header names and the Content-Type value stay, through every scrub, and a second pass is a no-op", () => {
