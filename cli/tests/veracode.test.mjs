@@ -1790,7 +1790,88 @@ const VERACODE_FIXED_TEXTS = [
   "first page only, total unknown",
 ];
 
-test("rule 9: every fixed text the Veracode integration emits passes its scrubber unchanged", () => {
+const VERACODE_SOURCE_URL = new URL("../extensions/grc-tools/veracode.ts", import.meta.url);
+
+/**
+ * The static segments of every `new Error(...)` template inside the named top-level functions of
+ * the integration source, so a reworded or added resolver message fails the fixed-text test until a
+ * fixed text or a live rendering covers it.
+ */
+function errorTemplateSegments(sourceUrl, functionNames) {
+  const source = readFileSync(sourceUrl, "utf8");
+  const segments = [];
+  for (const name of functionNames) {
+    const start = source.search(new RegExp(`^(?:export )?(?:async )?function ${name}\\(`, "m"));
+    assert.notEqual(start, -1, `${name} is a top-level function of the integration source`);
+    const body = source.slice(start, source.indexOf("\n}\n", start) + 2);
+    for (const match of body.matchAll(/new Error\(/g)) {
+      let depth = 1;
+      let end = match.index + match[0].length;
+      while (depth > 0 && end < body.length) {
+        if (body[end] === "(") depth += 1;
+        else if (body[end] === ")") depth -= 1;
+        end += 1;
+      }
+      const argument = body.slice(match.index + match[0].length, end - 1);
+      for (const literal of argument.matchAll(/"((?:[^"\\]|\\.)*)"/g)) segments.push(literal[1].replace(/\\"/g, '"'));
+      for (const template of argument.matchAll(/`((?:[^`\\]|\\.)*)`/g)) segments.push(...template[1].split(/\$\{(?:[^{}]|\{[^{}]*\})*\}/));
+    }
+  }
+  return [...new Set(segments.map((segment) => segment.trim()).filter((segment) => segment.length >= 8))];
+}
+
+/**
+ * The resolver messages rendered live for the no credentials, partial credentials, bad credential
+ * shape, and credentials file failure cases, each against a real temp path; the malformed profile
+ * and the rejected secret carry config canaries so the messages prove they hold no credential value.
+ */
+function liveVeracodeResolverMessages() {
+  const home = createTempBase("grclanker-veracode-live-resolver-");
+  const defaultCredentials = join(home, ".veracode", "credentials");
+  const directoryCredentials = join(home, "directory-credentials");
+  mkdirSync(directoryCredentials);
+  const malformedCredentials = join(home, "malformed-credentials");
+  writeFileSync(malformedCredentials, `[default]\nveracode_api_key_id ${CONFIG_CANARIES.bareLine}\n[unterminated ${CONFIG_CANARIES.unterminatedSection}\nveracode_api_key_secret = aabb\n`);
+  const resolve = (input, env) => thrownBy(() => resolveVeracodeConfiguration(input, env, { homeDir: home })).message;
+  return {
+    paths: { defaultCredentials, directoryCredentials, malformedCredentials },
+    messages: {
+      "no credentials": resolve({}, {}),
+      "partial credentials: key ID without a secret": resolve({}, { VERACODE_API_KEY_ID: API_ID }),
+      "partial credentials: a named profile without a secret": resolve({ profile: "audit" }, { VERACODE_API_KEY_ID: API_ID }),
+      "bad credential shape: a secret that is not hex": resolve({}, { VERACODE_API_KEY_ID: API_ID, VERACODE_API_KEY_SECRET: CONFIG_CANARIES.readable }),
+      "credentials file failure: directory at the path": resolve({ credentials_file: directoryCredentials }, {}),
+      "credentials file failure: malformed profile": resolve({ credentials_file: malformedCredentials }, {}),
+    },
+  };
+}
+
+test("rule 9: every fixed text the Veracode integration emits, including the live resolver messages, passes its scrubber unchanged", () => {
+  const live = liveVeracodeResolverMessages();
+  const credentialsRequired = (profile, path) => `Veracode API credentials are required: pass api_key_id and api_key_secret, set VERACODE_API_KEY_ID and VERACODE_API_KEY_SECRET, or add veracode_api_key_id and veracode_api_key_secret to the [${profile}] profile in ${path}.`;
+  const expected = {
+    "no credentials": credentialsRequired("default", live.paths.defaultCredentials),
+    "partial credentials: key ID without a secret": credentialsRequired("default", live.paths.defaultCredentials),
+    "partial credentials: a named profile without a secret": credentialsRequired("audit", live.paths.defaultCredentials),
+    "bad credential shape: a secret that is not hex": "The Veracode API key secret must be a hex string; check the credential value.",
+    "credentials file failure: directory at the path": `Unable to read Veracode credentials file ${live.paths.directoryCredentials} (EISDIR)`,
+    "credentials file failure: malformed profile": credentialsRequired("default", live.paths.malformedCredentials),
+  };
+  assert.deepEqual(Object.keys(live.messages), Object.keys(expected));
+  for (const [label, message] of Object.entries(live.messages)) {
+    assert.equal(message, expected[label], label);
+    for (const canary of Object.values(CONFIG_CANARIES)) assertNoWindowOf(message, canary, `live resolver message (${label})`);
+    for (const wording of LIBRARY_ERROR_WORDING) assert.ok(!message.includes(wording), `${label} repeats library wording "${wording}": ${message}`);
+    assert.equal(scrubErrorText(message), message, `live resolver message survives the scrubber (${label})`);
+    assert.equal(scrubErrorText(message, [API_ID, API_SECRET]), message, `live resolver message survives with the configured credentials registered (${label})`);
+  }
+
+  // Every message template the resolver and its loaders can throw is pinned by a fixed text or a live rendering, so a reworded message fails here until the set is updated.
+  const corpus = [...VERACODE_FIXED_TEXTS, ...Object.values(live.messages)];
+  const segments = errorTemplateSegments(VERACODE_SOURCE_URL, ["resolveVeracodeConfiguration", "readCredentialsFileText", "readCredentialsProfile"]);
+  assert.ok(segments.length >= 6, `the template scan found the two resolver messages and the two loader messages (${segments.length})`);
+  for (const segment of segments) assert.ok(corpus.some((text) => text.includes(segment)), `resolver template segment is pinned by a fixed text or a live rendering: ${segment}`);
+
   for (const text of VERACODE_FIXED_TEXTS) assert.equal(scrubErrorText(text), text, text);
   for (const text of VERACODE_FIXED_TEXTS) assert.equal(scrubErrorText(text, [API_ID, API_SECRET]), text, `${text} (with the configured credentials registered)`);
 });

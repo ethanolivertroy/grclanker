@@ -1767,7 +1767,89 @@ const SPLUNK_FIXED_TEXTS = [
   "Grant the audit role the missing capabilities (list_users; edit_roles; list_tokens_all; rest_properties_get) or use an admin-scoped token; unreadable surfaces will render as manual findings.",
 ];
 
-test("rule 9: every fixed text the Splunk integration emits passes its scrubber unchanged", () => {
+const SPLUNK_SOURCE_URL = new URL("../extensions/grc-tools/splunk.ts", import.meta.url);
+
+/**
+ * The static segments of every `new Error(...)` template inside the named top-level functions of
+ * the integration source, so a reworded or added resolver message fails the fixed-text test until a
+ * fixed text or a live rendering covers it.
+ */
+function errorTemplateSegments(sourceUrl, functionNames) {
+  const source = readFileSync(sourceUrl, "utf8");
+  const segments = [];
+  for (const name of functionNames) {
+    const start = source.search(new RegExp(`^(?:export )?(?:async )?function ${name}\\(`, "m"));
+    assert.notEqual(start, -1, `${name} is a top-level function of the integration source`);
+    const body = source.slice(start, source.indexOf("\n}\n", start) + 2);
+    for (const match of body.matchAll(/new Error\(/g)) {
+      let depth = 1;
+      let end = match.index + match[0].length;
+      while (depth > 0 && end < body.length) {
+        if (body[end] === "(") depth += 1;
+        else if (body[end] === ")") depth -= 1;
+        end += 1;
+      }
+      const argument = body.slice(match.index + match[0].length, end - 1);
+      for (const literal of argument.matchAll(/"((?:[^"\\]|\\.)*)"/g)) segments.push(literal[1].replace(/\\"/g, '"'));
+      for (const template of argument.matchAll(/`((?:[^`\\]|\\.)*)`/g)) segments.push(...template[1].split(/\$\{(?:[^{}]|\{[^{}]*\})*\}/));
+    }
+  }
+  return [...new Set(segments.map((segment) => segment.trim()).filter((segment) => segment.length >= 8))];
+}
+
+/**
+ * The resolver messages rendered live for the no credentials, partial credentials, bad URL, and
+ * config file failure cases, each against a real temp path; the malformed file carries a config
+ * canary so the message proves it holds the path, position, and code only.
+ */
+function liveSplunkResolverMessages() {
+  const base = createTempBase("grclanker-splunk-live-resolver-");
+  const missingConfig = join(base, "missing.json");
+  const directoryConfig = join(base, "directory.json");
+  mkdirSync(directoryConfig);
+  const malformedConfig = join(base, "malformed.json");
+  writeFileSync(malformedConfig, `{\n  "url": "https://splunk.example.com:8089",\n  "token": "${CONFIG_CANARIES.unterminated}\n}\n`);
+  const url = { SPLUNK_URL: "https://splunk.example.com:8089" };
+  const resolve = (input, env) => thrownBy(() => resolveSplunkConfiguration({ config_file: missingConfig, ...input }, env)).message;
+  return {
+    paths: { directoryConfig, malformedConfig },
+    messages: {
+      "no credentials": resolve({}, {}),
+      "partial credentials: URL without a token or password": resolve({}, url),
+      "partial credentials: username without a password": resolve({}, { ...url, SPLUNK_USERNAME: "svc-audit" }),
+      "bad URL: a scheme the REST API does not serve": resolve({}, { SPLUNK_URL: "ftp://splunk.example.com:8089", SPLUNK_TOKEN: SAMPLE_TOKEN }),
+      "config file failure: directory at the path": resolve({ config_file: directoryConfig }, {}),
+      "config file failure: malformed JSON": resolve({ config_file: malformedConfig }, {}),
+    },
+  };
+}
+
+test("rule 9: every fixed text the Splunk integration emits, including the live resolver messages, passes its scrubber unchanged", () => {
+  const live = liveSplunkResolverMessages();
+  const credentialsRequired = "Provide SPLUNK_TOKEN or both SPLUNK_USERNAME and SPLUNK_PASSWORD (arguments or config file also work).";
+  const expected = {
+    "no credentials": "SPLUNK_URL, a url argument, or a config file url is required (for example https://splunk.example.com:8089).",
+    "partial credentials: URL without a token or password": credentialsRequired,
+    "partial credentials: username without a password": credentialsRequired,
+    "bad URL: a scheme the REST API does not serve": "SPLUNK_URL must be an http(s) URL such as https://splunk.example.com:8089.",
+    "config file failure: directory at the path": `Unable to read Splunk config file ${live.paths.directoryConfig} (EISDIR)`,
+    "config file failure: malformed JSON": `Unable to parse Splunk config file: invalid JSON in ${live.paths.malformedConfig} at line 3, column 29 (INVALID_JSON)`,
+  };
+  assert.deepEqual(Object.keys(live.messages), Object.keys(expected));
+  for (const [label, message] of Object.entries(live.messages)) {
+    assert.equal(message, expected[label], label);
+    for (const canary of Object.values(CONFIG_CANARIES)) assertNoWindowOf(message, canary, `live resolver message (${label})`);
+    for (const wording of LIBRARY_ERROR_WORDING) assert.ok(!message.includes(wording), `${label} repeats library wording "${wording}": ${message}`);
+    assert.equal(scrubErrorText(message), message, `live resolver message survives the scrubber (${label})`);
+    assert.equal(scrubErrorText(message, [SAMPLE_TOKEN, SAMPLE_ACS_TOKEN]), message, `live resolver message survives with the configured tokens registered (${label})`);
+  }
+
+  // Every message template the resolver and its loaders can throw is pinned by a fixed text or a live rendering, so a reworded message fails here until the set is updated.
+  const corpus = [...SPLUNK_FIXED_TEXTS, ...Object.values(live.messages)];
+  const segments = errorTemplateSegments(SPLUNK_SOURCE_URL, ["resolveSplunkConfiguration", "readConfigFileText", "configFileParseError", "normalizeBaseUrl"]);
+  assert.ok(segments.length >= 6, `the template scan found the two resolver messages, the URL message, and the loader messages (${segments.length})`);
+  for (const segment of segments) assert.ok(corpus.some((text) => text.includes(segment)), `resolver template segment is pinned by a fixed text or a live rendering: ${segment}`);
+
   for (const text of SPLUNK_FIXED_TEXTS) assert.equal(scrubErrorText(text), text, text);
   for (const text of SPLUNK_FIXED_TEXTS) assert.equal(scrubErrorText(text, [SAMPLE_TOKEN, SAMPLE_ACS_TOKEN]), text, `${text} (with the configured tokens registered)`);
 });

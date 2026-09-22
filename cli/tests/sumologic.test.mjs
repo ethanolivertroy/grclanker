@@ -1986,7 +1986,87 @@ const SUMOLOGIC_FIXED_TEXTS = [
   "- MANUAL: unreadable endpoint, not applicable, or outside API scope; the summary names the evidence to collect",
 ];
 
-test("rule 9: every fixed text the Sumo Logic integration emits passes its scrubber unchanged", () => {
+const SUMOLOGIC_SOURCE_URL = new URL("../extensions/grc-tools/sumologic.ts", import.meta.url);
+
+/**
+ * The static segments of every `new Error(...)` template inside the named top-level functions of
+ * the integration source, so a reworded or added resolver message fails the fixed-text test until a
+ * fixed text or a live rendering covers it.
+ */
+function errorTemplateSegments(sourceUrl, functionNames) {
+  const source = readFileSync(sourceUrl, "utf8");
+  const segments = [];
+  for (const name of functionNames) {
+    const start = source.search(new RegExp(`^(?:export )?(?:async )?function ${name}\\(`, "m"));
+    assert.notEqual(start, -1, `${name} is a top-level function of the integration source`);
+    const body = source.slice(start, source.indexOf("\n}\n", start) + 2);
+    for (const match of body.matchAll(/new Error\(/g)) {
+      let depth = 1;
+      let end = match.index + match[0].length;
+      while (depth > 0 && end < body.length) {
+        if (body[end] === "(") depth += 1;
+        else if (body[end] === ")") depth -= 1;
+        end += 1;
+      }
+      const argument = body.slice(match.index + match[0].length, end - 1);
+      for (const literal of argument.matchAll(/"((?:[^"\\]|\\.)*)"/g)) segments.push(literal[1].replace(/\\"/g, '"'));
+      for (const template of argument.matchAll(/`((?:[^`\\]|\\.)*)`/g)) segments.push(...template[1].split(/\$\{(?:[^{}]|\{[^{}]*\})*\}/));
+    }
+  }
+  return [...new Set(segments.map((segment) => segment.trim()).filter((segment) => segment.length >= 8))];
+}
+
+/**
+ * The resolver messages rendered live for the no credentials, partial credentials, and config file
+ * failure cases (Sumo Logic has a single auth mode, the access ID and key pair), each against a real
+ * temp path; the malformed file carries a config canary so the message proves it holds the path,
+ * position, and code only.
+ */
+function liveSumologicResolverMessages() {
+  const base = createTempBase("grclanker-sumo-live-resolver-");
+  const missingConfig = join(base, "missing.yaml");
+  const directoryConfig = join(base, "directory.yaml");
+  mkdirSync(directoryConfig);
+  const malformedConfig = join(base, "malformed.yaml");
+  writeFileSync(malformedConfig, `access_id: suABCDEF\naccess_key: "${CONFIG_CANARIES.unterminated}\n`);
+  const resolve = (input, env) => thrownBy(() => resolveSumologicConfiguration({ config_file: missingConfig, ...input }, env)).message;
+  return {
+    paths: { directoryConfig, malformedConfig },
+    messages: {
+      "no credentials": resolve({}, {}),
+      "partial credentials: access ID without a key": resolve({}, { SUMOLOGIC_ACCESS_ID: "suENVID1" }),
+      "partial credentials: access key without an ID": resolve({ access_key: SAMPLE_ACCESS_KEY }, {}),
+      "config file failure: directory at the path": resolve({ config_file: directoryConfig }, {}),
+      "config file failure: malformed YAML": resolve({ config_file: malformedConfig }, {}),
+    },
+  };
+}
+
+test("rule 9: every fixed text the Sumo Logic integration emits, including the live resolver messages, passes its scrubber unchanged", () => {
+  const live = liveSumologicResolverMessages();
+  const credentialsRequired = "SUMOLOGIC_ACCESS_ID and SUMOLOGIC_ACCESS_KEY (or access_id and access_key arguments, or a config file) are required.";
+  const expected = {
+    "no credentials": credentialsRequired,
+    "partial credentials: access ID without a key": credentialsRequired,
+    "partial credentials: access key without an ID": credentialsRequired,
+    "config file failure: directory at the path": `Unable to read Sumo Logic config file ${live.paths.directoryConfig} (EISDIR)`,
+    "config file failure: malformed YAML": `Unable to parse Sumo Logic config file: invalid YAML in ${live.paths.malformedConfig} at line 3, column 1 (MISSING_CHAR)`,
+  };
+  assert.deepEqual(Object.keys(live.messages), Object.keys(expected));
+  for (const [label, message] of Object.entries(live.messages)) {
+    assert.equal(message, expected[label], label);
+    for (const canary of Object.values(CONFIG_CANARIES)) assertNoWindowOf(message, canary, `live resolver message (${label})`);
+    for (const wording of LIBRARY_ERROR_WORDING) assert.ok(!message.includes(wording), `${label} repeats library wording "${wording}": ${message}`);
+    assert.equal(scrubErrorText(message), message, `live resolver message survives the scrubber (${label})`);
+    assert.equal(scrubErrorText(message, [SAMPLE_ACCESS_KEY, "suABCDEF"]), message, `live resolver message survives with the configured credentials registered (${label})`);
+  }
+
+  // Every message template the resolver and its loaders can throw is pinned by a fixed text or a live rendering, so a reworded message fails here until the set is updated.
+  const corpus = [...SUMOLOGIC_FIXED_TEXTS, ...Object.values(live.messages)];
+  const segments = errorTemplateSegments(SUMOLOGIC_SOURCE_URL, ["resolveSumologicConfiguration", "readConfigFileText", "configFileParseError"]);
+  assert.ok(segments.length >= 3, `the template scan found the resolver message and the two loader messages (${segments.length})`);
+  for (const segment of segments) assert.ok(corpus.some((text) => text.includes(segment)), `resolver template segment is pinned by a fixed text or a live rendering: ${segment}`);
+
   for (const text of SUMOLOGIC_FIXED_TEXTS) assert.equal(scrubErrorText(text), text, text);
   for (const text of SUMOLOGIC_FIXED_TEXTS) assert.equal(scrubErrorText(text, [SAMPLE_ACCESS_KEY, "suABCDEF"]), text, `${text} (with the configured credentials registered)`);
 });

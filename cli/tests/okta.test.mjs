@@ -2732,9 +2732,96 @@ const OKTA_FIXED_TEXTS = [
   "Unable to allocate output directory under /tmp/okta-export",
 ];
 
-test("rule 9: every fixed text the Okta integration emits passes its scrubber unchanged", () => {
+const OKTA_SOURCE_URL = new URL("../extensions/grc-tools/okta.ts", import.meta.url);
+
+/**
+ * The static segments of every `new Error(...)` template inside the named top-level functions of
+ * the integration source, so a reworded or added resolver message fails the fixed-text test until a
+ * fixed text or a live rendering covers it.
+ */
+function errorTemplateSegments(sourceUrl, functionNames) {
+  const source = readFileSync(sourceUrl, "utf8");
+  const segments = [];
+  for (const name of functionNames) {
+    const start = source.search(new RegExp(`^(?:export )?(?:async )?function ${name}\\(`, "m"));
+    assert.notEqual(start, -1, `${name} is a top-level function of the integration source`);
+    const body = source.slice(start, source.indexOf("\n}\n", start) + 2);
+    for (const match of body.matchAll(/new Error\(/g)) {
+      let depth = 1;
+      let end = match.index + match[0].length;
+      while (depth > 0 && end < body.length) {
+        if (body[end] === "(") depth += 1;
+        else if (body[end] === ")") depth -= 1;
+        end += 1;
+      }
+      const argument = body.slice(match.index + match[0].length, end - 1);
+      for (const literal of argument.matchAll(/"((?:[^"\\]|\\.)*)"/g)) segments.push(literal[1].replace(/\\"/g, '"'));
+      for (const template of argument.matchAll(/`((?:[^`\\]|\\.)*)`/g)) segments.push(...template[1].split(/\$\{(?:[^{}]|\{[^{}]*\})*\}/));
+    }
+  }
+  return [...new Set(segments.map((segment) => segment.trim()).filter((segment) => segment.length >= 8))];
+}
+
+/**
+ * The resolver messages rendered live for the no credentials, partial credentials, bad auth mode,
+ * and config file failure cases, each against a real temp path; the malformed file carries a config
+ * canary so the message proves it holds the path, position, and code only.
+ */
+async function liveOktaResolverMessages() {
+  const base = createTempBase("grclanker-okta-live-resolver-");
+  const cwd = join(base, "cwd");
+  const homeDir = join(base, "home");
+  mkdirSync(cwd);
+  mkdirSync(homeDir);
+  const directoryConfig = join(base, "directory.yaml");
+  mkdirSync(directoryConfig);
+  const malformedConfig = join(base, "malformed.yaml");
+  writeFileSync(malformedConfig, `okta:\n  client:\n    orgUrl: https://tenant.example.okta.com\n    token: "${CONFIG_CANARIES.unterminated}\n`);
+  const orgUrl = { OKTA_CLIENT_ORGURL: "https://tenant.example.okta.com" };
+  const privateKeyMode = { ...orgUrl, OKTA_CLIENT_AUTHORIZATIONMODE: "PrivateKey" };
+  const resolve = async (args, env) => (await rejectionOf(resolveOktaConfiguration(args, env, cwd, homeDir))).message;
+  return {
+    paths: { directoryConfig, malformedConfig },
+    messages: {
+      "no credentials": await resolve({}, {}),
+      "partial credentials: org URL without a token": await resolve({}, orgUrl),
+      "bad auth mode: PrivateKey without client_id": await resolve({}, privateKeyMode),
+      "bad auth mode: PrivateKey without a private key or client assertion": await resolve({}, { ...privateKeyMode, OKTA_CLIENT_CLIENTID: "0oa1clientid" }),
+      "config file failure: directory at the path": await resolve({ config_file: directoryConfig }, {}),
+      "config file failure: malformed YAML": await resolve({ config_file: malformedConfig }, {}),
+    },
+  };
+}
+
+test("rule 9: every fixed text the Okta integration emits, including the live resolver messages, passes its scrubber unchanged", async () => {
+  const live = await liveOktaResolverMessages();
+  const expected = {
+    "no credentials": "Okta org URL is required. Set OKTA_CLIENT_ORGURL, configure .okta.yaml, or pass org_url explicitly.",
+    "partial credentials: org URL without a token": "Okta SSWS auth requires an API token. Set OKTA_CLIENT_TOKEN, configure token in .okta.yaml, or pass api_token explicitly.",
+    "bad auth mode: PrivateKey without client_id": "Okta PrivateKey auth requires client_id. Set OKTA_CLIENT_CLIENTID, configure clientId in .okta.yaml, or pass client_id explicitly.",
+    "bad auth mode: PrivateKey without a private key or client assertion": "Okta PrivateKey auth requires private_key or client_assertion. Set OKTA_CLIENT_PRIVATEKEY, configure privateKey in .okta.yaml, or pass private_key explicitly.",
+    "config file failure: directory at the path": `Unable to read Okta config file ${live.paths.directoryConfig} (EISDIR)`,
+    "config file failure: malformed YAML": new RegExp(`^Unable to parse Okta config file: invalid YAML in ${live.paths.malformedConfig.replace(/[.*+?^$()|[\]\\]/g, "\\$&")} at line \\d+(?:, column \\d+)? \\([A-Z_]+\\)$`),
+  };
+  assert.deepEqual(Object.keys(live.messages), Object.keys(expected));
+  const configuredSecret = "00QbNhmq3FzXaXEDy3zZU5fS2EepAmFzLGFkGmhBeB";
+  for (const [label, message] of Object.entries(live.messages)) {
+    if (expected[label] instanceof RegExp) assert.match(message, expected[label], label);
+    else assert.equal(message, expected[label], label);
+    for (const canary of Object.values(CONFIG_CANARIES)) assertNoWindowOf(message, canary, `live resolver message (${label})`);
+    for (const wording of LIBRARY_ERROR_WORDING) assert.ok(!message.includes(wording), `${label} repeats library wording "${wording}": ${message}`);
+    assert.equal(scrubErrorText(message), message, `live resolver message survives the scrubber (${label})`);
+    assert.equal(scrubErrorText(message, [configuredSecret]), message, `live resolver message survives with a configured secret registered (${label})`);
+  }
+
+  // Every message template the resolver and its loaders can throw is pinned by a fixed text or a live rendering, so a reworded message fails here until the set is updated.
+  const corpus = [...OKTA_FIXED_TEXTS, ...Object.values(live.messages)];
+  const segments = errorTemplateSegments(OKTA_SOURCE_URL, ["resolveOktaConfiguration", "readConfigFileText", "configFileParseError"]);
+  assert.ok(segments.length >= 6, `the template scan found the four resolver messages and the two loader messages (${segments.length})`);
+  for (const segment of segments) assert.ok(corpus.some((text) => text.includes(segment)), `resolver template segment is pinned by a fixed text or a live rendering: ${segment}`);
+
   for (const text of OKTA_FIXED_TEXTS) assert.equal(scrubErrorText(text), text, text);
-  for (const text of OKTA_FIXED_TEXTS) assert.equal(scrubErrorText(text, ["00QbNhmq3FzXaXEDy3zZU5fS2EepAmFzLGFkGmhBeB"]), text, `${text} (with a configured secret registered)`);
+  for (const text of OKTA_FIXED_TEXTS) assert.equal(scrubErrorText(text, [configuredSecret]), text, `${text} (with a configured secret registered)`);
 });
 
 test("resolveOktaConfiguration keeps environment credentials when an unrelated argument is passed (GWS note 2)", async () => {
