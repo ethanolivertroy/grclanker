@@ -2370,7 +2370,14 @@ async function evaluateScaWorkspaceCoverage(client: ClientLike, snapshot: Applic
     sca_agent_api_available: !scaBlocker,
     sca_agent_api_status: workspaces.status === "error" ? workspaces.statusCode ?? null : null,
   };
-  const raw = { sca_projects_by_application: scaBlocker ? notAttempted("the SCA Agent API was not readable, so no linked project list was requested.") : rawProjects };
+  // The snapshot dataset is a marker, never {}, whenever no list was requested: the SCA Agent API was unreadable, or no sampled application needed one.
+  const raw = {
+    sca_projects_by_application: scaBlocker
+      ? notAttempted("the SCA Agent API was not readable, so no linked project list was requested.")
+      : listsRequested === 0
+        ? notAttempted("every sampled application has upload_and_scan_sca_enabled, so no linked project list was requested.")
+        : rawProjects,
+  };
   if (scaBlocker && covered.length === 0) {
     return { finding: { ...scaBlocker, evidence: { ...scaBlocker.evidence, ...evidence } }, raw, errors };
   }

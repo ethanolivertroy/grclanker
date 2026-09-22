@@ -1484,6 +1484,26 @@ test("collection status: a denied dataset is written to core_data and the assess
     assert.equal(surface.statusCode, undefined, "a readable surface carries no failure status");
   }
   assertOutputsNameOnlyObservedRequests(veracodeOutputs(access, results, exported), requests, "healthy with empty lists");
+  assert.deepEqual(Object.keys(sca.sca_projects_by_application), ["app-2"], "a requested and read list is keyed by application guid");
+
+  // No linked project list needed (every sampled application has upload_and_scan_sca_enabled): nothing was requested and nothing failed, so the dataset is the not-requested marker naming that cause in core_data and in the assess payload, never {}, while VERACODE-18 passes.
+  const allUploadAndScan = healthyFixture();
+  for (const app of allUploadAndScan.applications) app.profile.upload_and_scan_sca_enabled = true;
+  const noneNeeded = recordingVeracodeFetch({ fixture: allUploadAndScan });
+  const noneNeededClient = new VeracodeApiClient(sampleConfig({ retries: 0 }), { fetchImpl: noneNeeded.fetchImpl, sleep: async () => {} });
+  const noneNeededAccess = await checkVeracodeAccess(noneNeededClient);
+  const noneNeededPosture = await assessVeracodeScaPosture(noneNeededClient, {});
+  const noneNeededExport = await exportVeracodeAuditBundle(noneNeededClient, sampleConfig(), join(base, "none-needed"), { now: NOW });
+  const noneNeededSca = JSON.parse(readFileSync(join(noneNeededExport.outputDir, "core_data", "sca-posture.json"), "utf8"));
+  assert.equal(noneNeeded.requests.some((request) => /\/projects$/.test(request.path)), false, "no linked project list was requested");
+  for (const [label, value] of [["core_data/sca-posture.json", noneNeededSca.sca_projects_by_application], ["assess rawData", noneNeededPosture.rawData.sca_projects_by_application]]) {
+    assertNotCollectedMarker(value, `${label} sca_projects_by_application when no list was needed`, { status: null, endpoint: null, error: /^Not requested: every sampled application has upload_and_scan_sca_enabled, so no linked project list was requested\.$/ });
+  }
+  const noneNeededFinding = noneNeededPosture.findings.find((item) => item.id === "VERACODE-18");
+  assert.equal(noneNeededFinding.status, "pass");
+  assert.equal(noneNeededFinding.evidence.linked_project_lists_requested, 0);
+  assert.equal(noneNeededFinding.evidence.linked_projects_by_application, null);
+  assertOutputsNameOnlyObservedRequests(veracodeOutputs(noneNeededAccess, [noneNeededPosture], noneNeededExport), noneNeeded.requests, "no linked project list needed");
 });
 
 test("exportVeracodeAuditBundle writes the layout, logs errors, and never overwrites a prior bundle", async () => {
@@ -1768,6 +1788,7 @@ const VERACODE_FIXED_TEXTS = [
   "Not requested: the application inventory was not readable or empty, so no per-application list was requested.",
   "Not requested: the application inventory was not readable, so no linked project list was requested.",
   "Not requested: the SCA Agent API was not readable, so no linked project list was requested.",
+  "Not requested: every sampled application has upload_and_scan_sca_enabled, so no linked project list was requested.",
   "Not requested: the SCA workspace list was not readable, so no workspace issue or library list was requested.",
   "Not requested: the user list was not readable, so no credential record was requested.",
   "Not requested: the user list was empty, so no credential record was requested.",
