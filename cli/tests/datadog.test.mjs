@@ -2319,8 +2319,9 @@ test("isCredentialKey, reduceUrl, and redactCredentialValues cover nested, plura
     plain: "/relative/path?query=1",
   });
 
-  // Booleans, numbers, and nulls under credential keys pass through: they cannot carry a secret and often mean "is set".
-  assert.deepEqual(redactCredentialValues({ api_key: null, has_secret: true, token: 4 }), { api_key: null, has_secret: true, token: 4 });
+  // Booleans and nulls under credential keys pass through (they cannot carry a secret and often mean "is set"); a
+  // number under a credential key is a PIN or one-time code and goes, while a number under an ordinary key stays.
+  assert.deepEqual(redactCredentialValues({ api_key: null, has_secret: true, token: 4, count: 4 }), { api_key: null, has_secret: true, token: "[REDACTED]", count: 4 });
 
   let deep = { leaf: "value" };
   for (let depth = 0; depth < 80; depth += 1) deep = { level: deep };

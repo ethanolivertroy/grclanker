@@ -5,6 +5,7 @@ import {
   MIN_CONFIGURED_SECRET_LENGTH,
   REDACTED,
   createCredentialScrubber,
+  isCredentialDataKey,
   isCredentialKey,
   looksLikeToken,
 } from "../dist/extensions/grc-tools/credential-scrub.js";
@@ -480,4 +481,68 @@ test("isCredentialKey covers the Flue heuristic plus bare and signed-URL names, 
   for (const key of ["before", "after", "env", "expand", "limit", "offset", "page", "per_page", "fields", "include_defaults", "flat_settings", "with_limited_by", "stale_token_days", "max_keys", "token_limit", "credentials_file", "showAll", "status"]) {
     assert.ok(!isCredentialKey(key), `expected ordinary key: ${key}`);
   }
+});
+
+const DATA_CANARIES = {
+  tokensEntry: "BPt5mgDrRZ5YyLTHaQPepJUYQbGYRCjG",
+  credentialsValue: "zSVNdtuTMXK9T7qXe8CEDEYXmJ9K6vVL",
+  headerValue: "QJGjPixxDSCkGNoArXMeL2USsBcdGfdd",
+  noteToken: "PCWXTXXWpLrVFgXp2SPm7YQKZgcAgWUx",
+  deepNote: "U7ktAa5zEHKELrac4CfrjWJF3zBQuiEx",
+};
+
+test("scrubData: the module key rule sees the enclosing key, pair values go by name, identifier keys keep their value, and containers and strings past the depth cap become the marker", () => {
+  const scrubber = createCredentialScrubber();
+  const deep = { level: 0 };
+  let cursor = deep;
+  for (let level = 1; level <= 12; level += 1) {
+    cursor.child = { level, note: level === 9 ? DATA_CANARIES.deepNote : `depth-note-${level}` };
+    cursor = cursor.child;
+  }
+  const record = {
+    tokens: [DATA_CANARIES.tokensEntry],
+    credentials: { value: DATA_CANARIES.credentialsValue },
+    ssl: { key: "pem-body", certificate: "cert" },
+    keystore: { key: "ks", path: "/etc/ks.p12" },
+    headers: [{ name: "X-Api-Key", value: DATA_CANARIES.headerValue }, { name: "Accept", value: "application/json" }],
+    id: "AaB6wvMiGMD7ReAp6tKkmeQD9QWYFmuM",
+    note: `see token=${DATA_CANARIES.noteToken} and https://user:pw@h.example.com/a?token=x`,
+    count: 3,
+    password: 482913,
+    enabled: true,
+    none: null,
+    deep,
+  };
+  // The module rule: the conservative record rule plus a bare `key` under ssl, tls, or keystore (the Elastic rule).
+  const isModuleCredentialKey = (key, parentKey) => isCredentialDataKey(key) || (key === "key" && /^(ssl|tls|keystore)$/.test(parentKey ?? ""));
+  const out = scrubber.scrubData(record, { isCredentialKey: isModuleCredentialKey, maxDepth: 10 });
+
+  assert.equal(out.tokens, REDACTED, "an array under a credential key goes whole");
+  assert.equal(out.credentials, REDACTED, "an object under a credential key goes whole");
+  assert.equal(out.ssl.key, REDACTED, "the module rule receives the enclosing key");
+  assert.equal(out.ssl.certificate, "cert");
+  assert.equal(out.keystore.key, REDACTED);
+  assert.equal(out.keystore.path, "/etc/ks.p12");
+  assert.equal(out.headers[0].name, "X-Api-Key", "the pair keeps its name");
+  assert.equal(out.headers[0].value, REDACTED, "a pair whose name is credential-shaped loses its value");
+  assert.equal(out.headers[1].value, "application/json", "an ordinary pair keeps its value");
+  assert.equal(out.id, record.id, "a value under an identifier key is not judged by shape");
+  assert.match(out.note, /^see token=\[REDACTED\] and https:\/\/h\.example\.com\/a\?\[REDACTED\]$/, "free text gets the pattern pass");
+  assert.equal(out.count, 3, "a number under an ordinary key passes through");
+  assert.equal(out.password, REDACTED, "a number under a credential key is a PIN and goes");
+  assert.equal(out.enabled, true);
+  assert.equal(out.none, null);
+  assert.equal(scrubber.scrubData({ ssl: { key: "pem-body" } }).ssl.key, "pem-body", "without a module rule a bare key under ssl is an identifier");
+
+  // deep sits at depth 1, child level L at depth L + 1, and its note at depth L + 2: level 8's note (depth 10) is at the
+  // cap and stays, level 9's note (depth 11) and level 9's child (depth 11) are past it and become the marker.
+  let level = out.deep;
+  for (let index = 1; index <= 8; index += 1) level = level.child;
+  assert.equal(level.level, 8);
+  assert.equal(level.note, "depth-note-8", "a string at the cap is kept");
+  assert.equal(level.child.level, 9);
+  assert.equal(level.child.note, REDACTED, "a string one level past the cap becomes the marker instead of skipping the pattern pass");
+  assert.equal(level.child.child, REDACTED, "a container past the cap becomes the marker");
+  assertCanaryWindowsAbsent(assert, JSON.stringify(out), Object.values(DATA_CANARIES), "scrubData output");
+  assert.deepEqual(scrubber.scrubData(out, { isCredentialKey: isModuleCredentialKey, maxDepth: 10 }), out, "the data-side scrub is idempotent");
 });

@@ -68,15 +68,19 @@ export interface ScrubDataOptions {
    * module's own key rule when given, so vendor field names are honoured (a LaunchDarkly flag `key` or an Elastic
    * `api_keys` inventory container is not a credential); `isCredentialDataKey` otherwise. The header and query rule
    * `isCredentialKey` is deliberately not used here: it treats a bare `key` as sensitive, which is right for a query
-   * string and wrong for a record.
+   * string and wrong for a record. The enclosing record's key is passed as well (undefined at the root or inside an
+   * array), so a rule that reads a bare `key` under `ssl`, `tls`, or `keystore` as a private key can apply.
    */
-  isCredentialKey?: (key: string) => boolean;
+  isCredentialKey?: (key: string, parentKey?: string) => boolean;
   /**
    * Rewrites a string before the pattern pass, given the key it is stored under (undefined inside an array or at the
    * root): the module's URL-key reduction, request-label allowances, and similar field-aware rules.
    */
   transformString?: (value: string, key: string | undefined) => string;
-  /** Nesting deeper than this is replaced by the marker. */
+  /**
+   * Nesting deeper than this is replaced by the marker: containers and strings alike, so a string one level past the
+   * cap cannot skip the pattern pass. Numbers, booleans, and nulls pass through.
+   */
   maxDepth?: number;
 }
 
@@ -142,13 +146,14 @@ function isNameValuePair(record: Record<string, unknown>): string | undefined {
 
 /**
  * Walks a collected record. Under a credential-shaped key the whole entry goes, whether it is a string, an array
- * (`tokens: ["..."]`), or an object (`credentials: { value }`), so no nested container keeps a value its key names as
- * a credential; the key itself survives so a reader sees the field existed. Booleans, numbers, and nulls pass through
- * because they carry no secret (`serviceToken: true`).
+ * (`tokens: ["..."]`), an object (`credentials: { value }`), or a number (a PIN under `password`), so no nested
+ * container keeps a value its key names as a credential; the key itself survives so a reader sees the field existed.
+ * Booleans and nulls pass through everywhere because they carry no secret (`serviceToken: true`), and numbers pass
+ * through under every other key.
  */
 function scrubDataValue(value: unknown, scrubText: (text: string, options?: ScrubTextOptions) => string, options: ScrubDataOptions, key: string | undefined, depth: number): unknown {
   const maxDepth = options.maxDepth ?? DEFAULT_DATA_SCRUB_DEPTH;
-  if (depth > maxDepth) return value !== null && typeof value === "object" ? REDACTED : value;
+  if (depth > maxDepth) return typeof value === "string" || (value !== null && typeof value === "object") ? REDACTED : value;
   if (typeof value === "string") {
     const transformed = options.transformString ? options.transformString(value, key) : value;
     return scrubText(transformed, { shapes: key === undefined || !isIdentifierKey(key) });
@@ -160,10 +165,12 @@ function scrubDataValue(value: unknown, scrubText: (text: string, options?: Scru
   const credentialKey = options.isCredentialKey ?? isCredentialDataKey;
   const out: Record<string, unknown> = {};
   for (const [entryKey, entry] of Object.entries(record)) {
-    if (entry === null || entry === undefined || typeof entry === "boolean" || typeof entry === "number") {
+    if (entry === null || entry === undefined || typeof entry === "boolean") {
       out[entryKey] = entry;
-    } else if (credentialKey(entryKey) || (entryKey === "value" && pairName !== undefined && credentialKey(pairName))) {
+    } else if (credentialKey(entryKey, key) || (entryKey === "value" && pairName !== undefined && credentialKey(pairName))) {
       out[entryKey] = REDACTED;
+    } else if (typeof entry === "number") {
+      out[entryKey] = entry;
     } else {
       out[entryKey] = scrubDataValue(entry, scrubText, options, entryKey, depth + 1);
     }
