@@ -1432,6 +1432,12 @@ test("denied-list markers: a denied list writes a not-collected marker in core_d
   const emptyZones = JSON.parse(readBundleFiles(emptyRun.exported.outputDir).get("core_data/zones.json"));
   assert.deepEqual(emptyZones, { items: [], truncated: false, totalCount: 0 }, "a readable-but-empty zone list is written as an empty items array with observed flags");
   assert.equal(emptyRun.access.surfaces.find((entry) => entry.name === "zones").count, 0, "a readable-but-empty probe reports the real zero");
+  for (const name of ["zone_settings", "dnssec", "rulesets"]) {
+    const probe = emptyRun.access.surfaces.find((entry) => entry.name === name);
+    assert.equal(probe.status, "not_configured", `${name}: a readable-but-empty zone list leaves the zone-scoped probe not_configured`);
+    assert.equal(probe.error, "No visible zones were available.");
+  }
+  assert.equal(emptyRun.access.status, "healthy", "a readable-but-empty zone list is not a failure");
   for (const item of emptyRun.assessments[1].findings) {
     assert.equal(item.status, "manual", `${item.id} with zero zones`);
     assert.equal(item.evidence.zones_seen, 0, `${item.id}: a readable-but-empty zone list counts zero`);
@@ -1457,6 +1463,29 @@ test("denied-list markers: a denied list writes a not-collected marker in core_d
     }
     for (const probe of access.surfaces.filter((candidate) => candidate.status === "readable")) {
       assert.equal(typeof probe.count, "number", `${label}: a readable probe still reports its count`);
+    }
+    const probeFailed = access.surfaces.some((candidate) => candidate.status === "not_readable" || candidate.status === "not_attempted");
+    assert.equal(access.status, probeFailed ? "limited" : "healthy", `${label}: a failed or unattempted probe never leaves the access check healthy`);
+    const readableTally = access.notes.find((line) => /Cloudflare audit surfaces are readable/.test(line));
+    assert.equal(readableTally, `${access.surfaces.filter((candidate) => candidate.status === "readable").length}/${access.surfaces.length} Cloudflare audit surfaces are readable.`, `${label}: the tally counts only readable probes`);
+
+    if (entry.surface === "/zones") {
+      // The zone-scoped probes were never sent: each names the parent read and its status, never the
+      // not_configured rendering a readable-but-empty zone list earns, and none counts as readable.
+      const dependent = ["zone_settings", "dnssec", "rulesets"].map((name) => access.surfaces.find((candidate) => candidate.name === name));
+      assert.equal(dependent.filter(Boolean).length, 3, `${label}: zone_settings, dnssec, and rulesets rows are all present`);
+      for (const probe of dependent) {
+        assert.deepEqual(
+          { status: probe.status, count: probe.count, http_status: probe.http_status },
+          { status: "not_attempted", count: null, http_status: 403 },
+          `${label}: ${probe.name} is not attempted with the /zones status`,
+        );
+        assert.match(probe.error, /^Not attempted: \/zones could not be read \(.*\(403 Forbidden\)/, `${label}: ${probe.name} names the parent read and its status`);
+        assert.doesNotMatch(probe.error, /No visible zones/, `${label}: ${probe.name} is not mistaken for an empty zone list`);
+      }
+      assert.equal(access.surfaces.filter((candidate) => candidate.status === "not_configured").length, 0, `${label}: no probe renders not_configured for a denied zone list`);
+      assert.ok(access.notes.some((line) => /3 zone-scoped surfaces were not attempted because \/zones could not be read \(403\)/.test(line)), `${label}: the notes name the parent read`);
+      assert.equal(access.surfaces.length, 9, `${label}: the denied zone list drops no row`);
     }
 
     if (entry.coreData) {

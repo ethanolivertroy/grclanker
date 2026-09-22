@@ -116,7 +116,12 @@ export interface CloudflareAccessSurface {
   name: string;
   scope: "user" | "account" | "zone";
   endpoint: string;
-  status: "readable" | "not_readable" | "not_configured";
+  /**
+   * readable: the probe completed; not_readable: the probe itself failed; not_configured: the probe has no
+   * target because a readable parent inventory was empty or no account id is set; not_attempted: the probe
+   * was never sent because its parent inventory could not be read (the error names the parent).
+   */
+  status: "readable" | "not_readable" | "not_configured" | "not_attempted";
   /** Items the probe saw; null when the probe never completed, so a denial is never mistaken for an empty inventory. */
   count?: number | null;
   /** HTTP status the failing probe observed; null when the failure was not an HTTP response. */
@@ -1184,6 +1189,24 @@ function notConfiguredSurface(
   return { name, scope, endpoint, status: "not_configured", count: null, error };
 }
 
+/** A probe that was never sent because the inventory it depends on could not be read; carries the parent's status and error. */
+function notAttemptedSurface(
+  name: string,
+  scope: CloudflareAccessSurface["scope"],
+  endpoint: string,
+  parent: { endpoint: string; status?: number; error: string },
+): CloudflareAccessSurface {
+  return {
+    name,
+    scope,
+    endpoint,
+    status: "not_attempted",
+    count: null,
+    http_status: parent.status ?? null,
+    error: `Not attempted: ${parent.endpoint} could not be read (${parent.error})`,
+  };
+}
+
 function zoneName(zone: JsonRecord): string {
   return asString(zone.name) ?? asString(zone.id) ?? "unknown-zone";
 }
@@ -1563,11 +1586,21 @@ export async function checkCloudflareAccess(
       const listZoneRulesets = client.listZoneRulesets.bind(client);
       surfaces.push(await readableSurface("rulesets", "zone", `/zones/${firstZoneId}/rulesets`, () => listZoneRulesets(firstZoneId)));
     }
+  } else if (!zones.ok) {
+    // The zone list itself failed, so nothing zone-scoped was sent: the rows name the parent read and its
+    // status rather than the not_configured rendering a readable-but-empty zone list earns.
+    const parent = { endpoint: zones.endpoint ?? "/zones", status: zones.status, error: zones.error };
+    surfaces.push(
+      notAttemptedSurface("zone_settings", "zone", "/zones/{zone_id}/settings/{setting_id}", parent),
+      notAttemptedSurface("dnssec", "zone", "/zones/{zone_id}/dnssec", parent),
+    );
+    if (client.listZoneRulesets) surfaces.push(notAttemptedSurface("rulesets", "zone", "/zones/{zone_id}/rulesets", parent));
   } else {
     surfaces.push(
       notConfiguredSurface("zone_settings", "zone", "/zones/{zone_id}/settings/{setting_id}", "No visible zones were available."),
       notConfiguredSurface("dnssec", "zone", "/zones/{zone_id}/dnssec", "No visible zones were available."),
     );
+    if (client.listZoneRulesets) surfaces.push(notConfiguredSurface("rulesets", "zone", "/zones/{zone_id}/rulesets", "No visible zones were available."));
   }
 
   if (accountId) {
@@ -1585,7 +1618,11 @@ export async function checkCloudflareAccess(
   }
 
   const readableCount = surfaces.filter((surfaceItem) => surfaceItem.status === "readable").length;
-  const status = readableCount >= 5 ? "healthy" : "limited";
+  const notAttempted = surfaces.filter((surfaceItem) => surfaceItem.status === "not_attempted");
+  const failedCount = surfaces.filter((surfaceItem) => surfaceItem.status === "not_readable").length;
+  // A probe that failed or was never sent keeps the check at limited: not_configured rows (no account id,
+  // readable-but-empty zone list) are the only non-readable rows a healthy check may carry.
+  const status = readableCount >= 5 && failedCount === 0 && notAttempted.length === 0 ? "healthy" : "limited";
 
   return {
     status,
@@ -1596,6 +1633,9 @@ export async function checkCloudflareAccess(
       `Authenticated with ${config.authMethod === "token" ? "an API token" : "a Global API Key"}.`,
       note,
       `${readableCount}/${surfaces.length} Cloudflare audit surfaces are readable.`,
+      ...(!zones.ok && notAttempted.length > 0
+        ? [`${notAttempted.length} zone-scoped surfaces were not attempted because ${zones.endpoint ?? "/zones"} could not be read (${zones.status ?? "no HTTP status"}).`]
+        : []),
     ],
     recommendedNextStep:
       status === "healthy"
@@ -1756,7 +1796,17 @@ export async function assessCloudflareIdentity(
     tokenExpirySummary = `${tokensWithoutExpiry.length} of ${activeTokens.length} active API tokens have no expires_on date${expiredButActive.length > 0 ? ` and ${expiredButActive.length} report active past their expiry` : ""}.`;
   } else if (unknownStatusTokens.length > 0 || truncatedTokenLists.length > 0 || failedTokenLists.length > 0) {
     tokenExpiryStatus = "warn";
-    tokenExpirySummary = `${activeTokens.length} active tokens all carry expiry dates, but ${unknownStatusTokens.length} tokens have an undocumented status${truncatedTokenLists.length > 0 ? `, the token list was truncated (${truncatedTokenLists.map((source) => `${source.label}: ${readList(source.outcome)?.items.length ?? "unknown"} seen of ${readList(source.outcome)?.totalCount ?? "unknown"}`).join("; ")})` : ""}${failedTokenLists.length > 0 ? `, and ${failedTokenLists.map((source) => source.label).join(", ")} could not be read` : ""}.`;
+    // Counts are scoped to the sources this run could read; a denied or truncated source is named as the
+    // reason the verdict is capped rather than folded into the tally as zero.
+    const scope = failedTokenLists.length > 0 || truncatedTokenLists.length > 0
+      ? `the ${allTokens.length} readable ${allTokens.length === 1 ? "token" : "tokens"} (${readableTokenLists.map((source) => source.label).join(", ")})`
+      : `all ${allTokens.length} inventoried tokens`;
+    const caveats = [
+      unknownStatusTokens.length > 0 ? `${unknownStatusTokens.length} ${unknownStatusTokens.length === 1 ? "has" : "have"} an undocumented status` : "",
+      truncatedTokenLists.length > 0 ? `the token list was truncated (${truncatedTokenLists.map((source) => `${source.label}: ${readList(source.outcome)?.items.length ?? "unknown"} seen of ${readList(source.outcome)?.totalCount ?? "unknown"}`).join("; ")})` : "",
+      failedTokenLists.length > 0 ? `${failedTokenLists.map((source) => source.label).join(", ")} could not be read, so tokens listed there were not assessed` : "",
+    ].filter(Boolean);
+    tokenExpirySummary = `${activeTokens.length} of ${scope} ${activeTokens.length === 1 ? "is" : "are"} active and every active one carries an expiry date, but ${caveats.join(", and ")}.`;
   } else {
     tokenExpiryStatus = "pass";
     tokenExpirySummary = `All ${activeTokens.length} active API tokens carry an expires_on date (${allTokens.length} tokens inventoried).`;
