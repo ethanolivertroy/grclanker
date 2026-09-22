@@ -963,14 +963,16 @@ export function describeErrorBody(response: Response, rawText: string, scrub: (t
 
 // What a 2xx answer was expected to carry: the documented JSON document of any kind, a
 // JSON object, a JSON array, one documented member of a JSON object (an array, an
-// object, a Security Center list, or the member's mere presence), or any one of the
-// members that identify a documented object.
+// object, a Security Center list, or the member's mere presence), any one of the
+// members that identify a documented object, or an array at least one of whose records
+// carries a member that identifies a documented record.
 type DocumentExpectation =
   | { kind: "document" }
   | { kind: "object" }
   | { kind: "array" }
   | { kind: "member"; key: string; type: "array" | "object" | "list" | "member" }
-  | { kind: "members"; keys: string[] };
+  | { kind: "members"; keys: string[] }
+  | { kind: "records"; keys: string[]; count: number };
 
 /**
  * A 2xx answer whose body is not the documented JSON document (an empty body, the HTML
@@ -988,6 +990,8 @@ export function describeNonDocumentBody(response: Response, rawText: string, exp
       return `${base} with a JSON response body without the documented "${expected.key}" ${expected.type} (${size})`;
     case "members":
       return `${base} with a JSON response body without any of the documented members ${expected.keys.map((key) => `"${key}"`).join(", ")} (${size})`;
+    case "records":
+      return `${base} with a JSON array of ${expected.count} records none of which carries any of the documented members ${expected.keys.map((key) => `"${key}"`).join(", ")} (${size})`;
     case "document":
       what = "the documented JSON document";
       break;
@@ -1426,6 +1430,18 @@ abstract class TenableHttpClient {
     return asRecords(document.value);
   }
 
+  // A documented list is recognised by its records: an array none of whose records
+  // carries a member that identifies a documented record (a portal's JSON, another API's
+  // list) is a foreign document, never an inventory. An empty array is the documented
+  // empty answer.
+  protected documentedListOf(document: TenableDocument, members: string[]): JsonRecord[] {
+    const records = this.documentedList(document);
+    if (records.length > 0 && !records.some((record) => isDocumentedRecord(record, members))) {
+      throw this.nonDocument(document, { kind: "records", keys: members, count: records.length });
+    }
+    return records;
+  }
+
   // A documented object is recognised by any one of the members that identify it; an
   // object carrying none of them (a health page, a portal's JSON) is a foreign document.
   protected documentedObject(document: TenableObjectDocument, keys: string[]): JsonRecord {
@@ -1448,13 +1464,36 @@ interface TenableObjectDocument extends TenableDocument {
 }
 
 /**
+ * The members that identify a documented record of each array surface: the identity and
+ * status fields the verdicts read. A 2xx array none of whose records carries any of them
+ * is a foreign document (a portal's JSON, another API's list) and is a failed read (for
+ * an export chunk, a failed download), never an empty inventory; a record carrying none
+ * of them inside an otherwise documented export chunk is unevaluable and is kept out of
+ * the export's records with its count recorded, which caps every verdict that reads the
+ * export.
+ */
+const DOCUMENTED_RECORD_MEMBERS: Record<"roles" | "assets" | "vulns", string[]> = {
+  roles: ["uuid", "id", "name", "type", "privileges"],
+  assets: ["id", "uuid", "has_agent", "last_seen", "network_id", "tags"],
+  vulns: ["state", "severity", "plugin", "asset", "first_found", "last_found"],
+};
+
+/** Whether a record carries at least one of the members that identify a documented record of the surface. */
+function isDocumentedRecord(record: JsonRecord, members: string[]): boolean {
+  return members.some((member) => member in record);
+}
+
+/**
  * Outcome of one export workflow. Counters are null when the workflow never
  * observed them (the export was not started, or polling ended before a chunk
  * list was reported). fetchedChunks and downloadFailures count this client's
- * own chunk downloads; failedChunks is Tenable's chunks_failed. endpoint names
- * the request that reported the final state or the one that failed.
+ * own chunk downloads; failedChunks is Tenable's chunks_failed; unevaluableRecords
+ * counts the records of downloaded chunks that carried none of the documented
+ * members and were kept out of records. endpoint names the request that reported
+ * the final state or the one that failed.
  */
 export interface TenableExportResult {
+  kind: "assets" | "vulns" | null;
   exportUuid: string | null;
   status: string | null;
   records: JsonRecord[];
@@ -1463,6 +1502,7 @@ export interface TenableExportResult {
   fetchedChunks: number | null;
   failedChunks: number | null;
   downloadFailures: number | null;
+  unevaluableRecords: number | null;
   truncated: boolean | null;
   reason?: string;
   endpoint: string | null;
@@ -1508,9 +1548,10 @@ export class TenableApiClient extends TenableHttpClient {
     return this.requestJson(path, {}, query);
   }
 
-  // A read whose documented answer is a JSON array of records.
-  private async getList(path: string, query: Record<string, string | number | boolean | undefined | Array<string | number>> = {}): Promise<JsonRecord[]> {
-    return this.documentedList(await this.requestDocument(path, {}, query));
+  // A read whose documented answer is a JSON array of records recognised by the members
+  // that identify them.
+  private async getList(path: string, members: string[]): Promise<JsonRecord[]> {
+    return this.documentedListOf(await this.requestDocument(path), members);
   }
 
   // A read whose documented answer is a JSON object carrying the named array member.
@@ -1626,7 +1667,7 @@ export class TenableApiClient extends TenableHttpClient {
   }
 
   async listRoles(): Promise<JsonRecord[]> {
-    return this.getList("/access-control/v1/roles");
+    return this.getList("/access-control/v1/roles", DOCUMENTED_RECORD_MEMBERS.roles);
   }
 
   async listPermissions(): Promise<JsonRecord[]> {
@@ -1680,6 +1721,7 @@ export class TenableApiClient extends TenableHttpClient {
     const statusPath = `/${kind}/export/${encodeURIComponent(exportUuid)}/status`;
     const statusEndpoint = `GET ${statusPath}`;
     const notRun = (status: string, reason: string, endpoint: string, httpStatus: number | null): TenableExportResult => ({
+      kind,
       exportUuid,
       status,
       records: [],
@@ -1688,6 +1730,7 @@ export class TenableApiClient extends TenableHttpClient {
       fetchedChunks: null,
       failedChunks: null,
       downloadFailures: null,
+      unevaluableRecords: null,
       truncated: null,
       reason,
       endpoint,
@@ -1721,15 +1764,24 @@ export class TenableApiClient extends TenableHttpClient {
     const totalChunks = asNumber(status.total_chunks) ?? available.length;
     const records: JsonRecord[] = [];
     const downloadErrors: string[] = [];
+    const members = DOCUMENTED_RECORD_MEMBERS[kind];
     let fetchedChunks = 0;
+    let unevaluableRecords = 0;
     let failedEndpoint: string | undefined;
     let failedStatus: number | undefined;
     for (const chunkId of available.slice(0, maxChunks)) {
       const chunkPath = `/${kind}/export/${encodeURIComponent(exportUuid)}/chunks/${chunkId}`;
       try {
         // A chunk is the documented JSON array of records; a 2xx answer of any other
-        // shape is a failed download, never an empty chunk.
-        records.push(...await this.getList(chunkPath));
+        // shape, or an array none of whose records carries a documented member, is a
+        // failed download, never an empty chunk. Inside a documented chunk a record
+        // that carries none of the members is unevaluable: it is kept out of the
+        // records and counted, so the verdicts that read the export are capped
+        // rather than passed on it.
+        const chunkRecords = await this.getList(chunkPath, members);
+        const documented = chunkRecords.filter((record) => isDocumentedRecord(record, members));
+        records.push(...documented);
+        unevaluableRecords += chunkRecords.length - documented.length;
         fetchedChunks += 1;
       } catch (error) {
         downloadErrors.push(errorMessage(error));
@@ -1744,6 +1796,7 @@ export class TenableApiClient extends TenableHttpClient {
       downloadErrors.length > 0 ? `${downloadErrors.length} chunk downloads failed: ${downloadErrors.slice(0, 3).join("; ")}` : undefined,
     ].filter((item): item is string => Boolean(item));
     return {
+      kind,
       exportUuid,
       status: state,
       records,
@@ -1752,6 +1805,7 @@ export class TenableApiClient extends TenableHttpClient {
       fetchedChunks,
       failedChunks: failed,
       downloadFailures: downloadErrors.length,
+      unevaluableRecords,
       truncated: state !== "FINISHED" || fetchedChunks < available.length || failed > 0 || totalChunks > available.length,
       reason: reasons.length > 0 ? reasons.join("; ") : undefined,
       endpoint: failedEndpoint ?? statusEndpoint,
@@ -1918,6 +1972,7 @@ function notConfiguredDataset<T>(data: T, message: string): TenableDataset<T> {
 }
 
 const EMPTY_EXPORT: TenableExportResult = {
+  kind: null,
   exportUuid: null,
   status: null,
   records: [],
@@ -1926,6 +1981,7 @@ const EMPTY_EXPORT: TenableExportResult = {
   fetchedChunks: null,
   failedChunks: null,
   downloadFailures: null,
+  unevaluableRecords: null,
   truncated: null,
   endpoint: null,
   httpStatus: null,
@@ -1998,10 +2054,14 @@ async function collectExport(endpoint: string, load: () => Promise<TenableExport
 function datasetErrors(label: string, dataset: TenableDataset<unknown>): string[] {
   if (dataset.status === "not_configured") return [];
   if (dataset.status !== "ok") return dataset.error ? [`${label} dataset: ${dataset.error}`] : [];
+  const lines: string[] = [];
   if (dataset.truncated) {
-    return [`${label} dataset: partial view (${dataset.seen ?? "unknown"} of ${dataset.total ?? "unknown"} records retrieved${dataset.error ? `; ${dataset.error}` : ""}).`];
+    lines.push(`${label} dataset: partial view (${dataset.seen ?? "unknown"} of ${dataset.total ?? "unknown"} records retrieved${dataset.error ? `; ${dataset.error}` : ""}).`);
+  } else if (dataset.error) {
+    lines.push(`${label} dataset: ${dataset.error}`);
   }
-  return dataset.error ? [`${label} dataset: ${dataset.error}`] : [];
+  if (unevaluableRecordsOf(dataset) > 0) lines.push(`${label} dataset:${unevaluableRecordsNote(dataset)}`);
+  return lines;
 }
 
 /** Records in a readable list dataset; null when the list was not collected. */
@@ -2012,6 +2072,31 @@ function countOrNull(dataset: TenableDataset<unknown[]>): number | null {
 function recordCount(dataset: TenableDataset<TenableExportResult>): number | null {
   return dataset.status === "ok" ? dataset.data.records.length : null;
 }
+
+function isExportResult(value: unknown): value is TenableExportResult {
+  const record = asObject(value);
+  return record !== undefined && "exportUuid" in record && "unevaluableRecords" in record && Array.isArray(record.records);
+}
+
+/** Records of a readable export that carried none of the documented members and were kept out; 0 for any other dataset. */
+function unevaluableRecordsOf(dataset: TenableDataset<unknown>): number {
+  return dataset.status === "ok" && isExportResult(dataset.data) ? dataset.data.unevaluableRecords ?? 0 : 0;
+}
+
+/**
+ * The sentence a verdict appends for export records that carried none of the documented
+ * members: how many of the exported records were not evaluated, which members would have
+ * identified them, and (when given) what that does to the verdict. Empty when every
+ * record was documented.
+ */
+function unevaluableRecordsNote(dataset: TenableDataset<unknown>, consequence?: string): string {
+  const unevaluable = unevaluableRecordsOf(dataset);
+  if (unevaluable === 0 || !isExportResult(dataset.data)) return "";
+  const members = dataset.data.kind === null ? [] : DOCUMENTED_RECORD_MEMBERS[dataset.data.kind];
+  return ` ${unevaluable} of ${unevaluable + dataset.data.records.length} exported records carry none of the documented members (${members.join(", ")}) and were not evaluated${consequence ? `, ${consequence}` : ""}.`;
+}
+
+const CAPPED_AT_WARN = "so the verdict is capped at warn";
 
 /** "fetched/total" chunk ratio of an export that ran; null when it did not. */
 function chunkRatio(dataset: TenableDataset<TenableExportResult>): string | null {
@@ -2038,6 +2123,33 @@ function collectedOrMarker<T>(dataset: TenableDataset<T>, project: (data: T) => 
   return dataset.status === "ok" ? project(dataset.data) : notCollectedMarker(dataset);
 }
 
+/**
+ * What a readable export writes to core_data: its records when every available chunk
+ * was downloaded and every record was documented; otherwise a partial marker around the
+ * records it did evaluate (chunks lost to max_chunks, chunks_failed, or failed downloads,
+ * and records kept out as unevaluable), so the file is never read as the whole inventory.
+ */
+function partialExportOrRecords(result: TenableExportResult): unknown {
+  const unevaluable = result.unevaluableRecords ?? 0;
+  if (!result.truncated && unevaluable === 0) return result.records;
+  return {
+    collected: true,
+    complete: false,
+    truncated: result.truncated,
+    total_chunks: result.totalChunks,
+    available_chunks: result.availableChunks,
+    fetched_chunks: result.fetchedChunks,
+    failed_chunks: result.failedChunks,
+    download_failures: result.downloadFailures,
+    unevaluable_records: unevaluable,
+    reason: result.reason ?? null,
+    records: result.records,
+  };
+}
+
+// unevaluable_records counts the records of a readable export that carried none of the
+// documented members and were kept out of its records; null for a dataset that is not an
+// export or was not read.
 function collectionStatusOf(dataset: TenableDataset<unknown>): JsonRecord {
   return {
     status: dataset.status,
@@ -2046,6 +2158,7 @@ function collectionStatusOf(dataset: TenableDataset<unknown>): JsonRecord {
     seen: dataset.seen,
     total: dataset.total,
     truncated: dataset.truncated,
+    unevaluable_records: dataset.status === "ok" && isExportResult(dataset.data) ? dataset.data.unevaluableRecords : null,
     error: dataset.error ?? null,
   };
 }
@@ -2113,15 +2226,19 @@ function unreadableFinding(control: number, severity: TenableSeverity, dataset: 
   }, idSuffix);
 }
 
+// The partial-view sentence of a truncated inventory, followed by the unevaluable-record
+// sentence of an export some of whose records could not be evaluated.
 function partialNote(dataset: TenableDataset<unknown>): string {
-  return dataset.truncated && dataset.status === "ok"
-    ? ` Only ${dataset.seen ?? "an unknown number"} of ${dataset.total ?? "unknown"} records were retrieved${dataset.error ? ` (${dataset.error})` : ""}, so the verdict is capped at warn.`
+  const truncatedNote = dataset.truncated && dataset.status === "ok"
+    ? ` Only ${dataset.seen ?? "an unknown number"} of ${dataset.total ?? "unknown"} records were retrieved${dataset.error ? ` (${dataset.error})` : ""}, ${CAPPED_AT_WARN}.`
     : "";
+  return `${truncatedNote}${unevaluableRecordsNote(dataset, CAPPED_AT_WARN)}`;
 }
 
-// A pass never survives a capped, stuck, or unreadable inventory it depends on.
+// A pass never survives a capped, stuck, or unreadable inventory it depends on, nor an
+// export whose chunks carried records that could not be evaluated.
 function capForPartial(status: TenableFindingStatus, dataset: TenableDataset<unknown>): TenableFindingStatus {
-  if (status === "pass" && (dataset.status !== "ok" || dataset.truncated)) return "warn";
+  if (status === "pass" && (dataset.status !== "ok" || dataset.truncated || unevaluableRecordsOf(dataset) > 0)) return "warn";
   return status;
 }
 
@@ -2632,6 +2749,7 @@ export function assessTenableScanProgram(data: TenableScanProgramData, options: 
       threshold: credentialThreshold,
       export_status: data.assetExport.data.status,
       chunks_fetched: chunkRatio(data.assetExport),
+      unevaluable_records: unevaluableRecordsOf(data.assetExport),
     }));
   }
 
@@ -2873,6 +2991,7 @@ export function assessTenableSensorCoverage(data: TenableSensorCoverageData, opt
       networks_status: data.networks.status,
       expected_asset_count: expected ?? null,
       export_status: data.assetExport.data.status,
+      unevaluable_records: unevaluableRecordsOf(data.assetExport),
     }));
 
     const tagged = assets.filter((asset) => asRecords(asset.tags).length > 0);
@@ -2903,6 +3022,7 @@ export function assessTenableSensorCoverage(data: TenableSensorCoverageData, opt
       threshold: taggedThreshold,
       tag_categories: data.tagCategories.status === "ok" ? categories.slice(0, 50) : null,
       tag_value_count: countOrNull(data.tagValues),
+      unevaluable_records: unevaluableRecordsOf(data.assetExport),
     }));
   }
 
@@ -3554,8 +3674,10 @@ export function assessTenableVulnerabilityManagement(data: TenableVulnerabilityD
   const findings: TenableFinding[] = [];
   const callerIsAdministrator = detectAdministrator(data.users);
   const assetCount = data.assetExport.status === "ok" ? data.assetExport.data.records.length : undefined;
-  const capPopulation = (status: TenableFindingStatus): TenableFindingStatus => capForNonAdmin(capForPartial(status, data.assetExport), callerIsAdministrator);
-  const populationNote = `${partialNote(data.assetExport)}${nonAdminNote(callerIsAdministrator)}`;
+  // A pass over the two exports never survives a partial asset population, a vulnerability
+  // export some of whose records could not be evaluated, or a non-administrator caller.
+  const capPopulation = (status: TenableFindingStatus): TenableFindingStatus => capForNonAdmin(capForPartial(capForPartial(status, data.assetExport), data.vulnExport), callerIsAdministrator);
+  const populationNote = `${partialNote(data.assetExport)}${unevaluableRecordsNote(data.vulnExport, CAPPED_AT_WARN)}${nonAdminNote(callerIsAdministrator)}`;
 
   if (data.vulnExport.status !== "ok") {
     findings.push(unreadableFinding(14, "high", data.vulnExport, "the VPR distribution of open findings from Findings > Vulnerabilities"));
@@ -3582,7 +3704,7 @@ export function assessTenableVulnerabilityManagement(data: TenableVulnerabilityD
       vprSummary = "The asset export returned zero assets, so an empty vulnerability set does not demonstrate VPR-based prioritization.";
     } else if (open.length === 0) {
       vprStatus = "manual";
-      vprSummary = `No open findings were exported for the last ${lookbackDays} days across ${assetCount} assets, so VPR usage cannot be evaluated; confirm scans are producing findings.`;
+      vprSummary = `No open findings were exported for the last ${lookbackDays} days across ${assetCount} assets, so VPR usage cannot be evaluated; confirm scans are producing findings.${unevaluableRecordsNote(data.vulnExport)}`;
     } else if (data.vulnExport.truncated) {
       vprStatus = "warn";
       vprSummary = `Partial export: ${data.vulnExport.data.fetchedChunks ?? "unknown"} of ${data.vulnExport.data.totalChunks ?? "unknown"} chunks were downloaded (${data.vulnExport.error ?? "partial"}), covering ${open.length} open findings; ${percent(vprCoverage)} of rated findings carry a VPR score.`;
@@ -3604,6 +3726,8 @@ export function assessTenableVulnerabilityManagement(data: TenableVulnerabilityD
       asset_count: assetCount ?? null,
       export_status: data.vulnExport.data.status,
       chunks: chunkRatio(data.vulnExport),
+      unevaluable_records: unevaluableRecordsOf(data.vulnExport),
+      asset_unevaluable_records: unevaluableRecordsOf(data.assetExport),
     }));
 
     const overdue: Record<string, number> = { critical: 0, high: 0, medium: 0, low: 0 };
@@ -3641,7 +3765,7 @@ export function assessTenableVulnerabilityManagement(data: TenableVulnerabilityD
       slaSummary = `No critical or high findings exceed SLA, but ${overdue.medium} medium and ${overdue.low} low findings are overdue and ${undated} open findings have no first_found date (not counted as compliant).`;
     } else if (open.length === 0) {
       slaStatus = capPopulation("pass");
-      slaSummary = `Zero open findings were exported for the last ${lookbackDays} days; this passes only because the export FINISHED completely and the asset export returned ${assetCount} assets.${populationNote}`;
+      slaSummary = `Zero open findings were exported for the last ${lookbackDays} days from an export that FINISHED completely, against an asset export of ${assetCount} assets.${populationNote}`;
     } else {
       slaStatus = capPopulation("pass");
       slaSummary = `All ${open.length} open findings are within SLA (critical ${sla.critical}d, high ${sla.high}d, medium ${sla.medium}d, low ${sla.low}d) across ${assetCount} assets${mttrDays !== null ? `; mean time to remediate over ${fixTimes.length} fixed findings is ${mttrDays} days` : ""}.${populationNote}`;
@@ -3655,6 +3779,8 @@ export function assessTenableVulnerabilityManagement(data: TenableVulnerabilityD
       mttr_days: mttrDays,
       asset_count: assetCount ?? null,
       chunks: chunkRatio(data.vulnExport),
+      unevaluable_records: unevaluableRecordsOf(data.vulnExport),
+      asset_unevaluable_records: unevaluableRecordsOf(data.assetExport),
     }));
   }
 
@@ -4043,7 +4169,7 @@ export async function exportTenableAuditBundle(
   // as a not-collected marker instead of an empty inventory; a readable but empty
   // list stays []. Readable data was redacted at collection time and is scrubbed
   // once more here before it touches disk.
-  const exportRecords = (result: TenableExportResult) => result.records;
+  const exportRecords = (result: TenableExportResult) => partialExportOrRecords(result);
   const coreData: Array<[string, unknown]> = [
     ["core_data/access_check.json", access],
     ["core_data/scans.json", collectedOrMarker(scanProgramData.scans)],

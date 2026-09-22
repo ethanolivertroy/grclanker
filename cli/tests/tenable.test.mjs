@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, symlinkSync, writeFileSync } from "node:fs";
 import { createServer } from "node:http";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 import { parse as parseYaml } from "yaml";
 
 import {
@@ -1373,6 +1373,12 @@ test("round 7(a): every fixed text emitted on refused, unavailable, failed, capp
       exportPollMs: 0,
       exportTimeoutMs: 5_000,
     })],
+    // A chunk of only foreign records (a failed download) and a stray foreign record inside
+    // a documented chunk (unevaluable), with nothing planted in either.
+    ["an export with a foreign chunk and a stray record", clientsFor(threeChunkRoutes(
+      [healthyAssets(), [{ ok: true, region: "prod-us-east-2026" }], [THIRD_ASSET, { ok: true, region: "prod-us-east-2026" }]],
+      [healthyVulns(), [THIRD_VULN], [THIRD_VULN, { ok: true }]],
+    ))],
   ];
   const corpus = [];
   for (const [label, clients] of fixtures) {
@@ -1426,6 +1432,11 @@ test("round 7(a): every fixed text emitted on refused, unavailable, failed, capp
     /TENABLE_SC_URL/,
     /so the verdict is capped at warn/,
     /200 OK with an empty response body where the documented JSON document was expected/,
+    // The foreign-record texts: the failed download of a foreign chunk, the kept-out count, and the partial marker.
+    /returned HTTP 200 with a JSON array of 1 records none of which carries any of the documented members "id", "uuid", "has_agent", "last_seen", "network_id", "tags" \(\d+ bytes, not echoed\)/,
+    /"asset_export dataset: 1 of 4 exported records carry none of the documented members \(id, uuid, has_agent, last_seen, network_id, tags\) and were not evaluated\."/,
+    /"vuln_export dataset: 1 of 5 exported records carry none of the documented members \(state, severity, plugin, asset, first_found, last_found\) and were not evaluated\."/,
+    /"complete":\s*false/,
     /Unable to read Tenable config file .* \((EISDIR|ENOENT)\)/,
     /Unable to parse Tenable config file: invalid YAML in .* at line \d+/,
   ]) {
@@ -2108,7 +2119,7 @@ test("addendum 5: refused or failed Tenable reads write not-collected markers na
   assert.match(mfa.summary, /GET \/users could not be read because GET \/users refused the API key with HTTP 403/);
 
   const [scan, sensor, access, vuln] = await runAll(createTenableClients(vmConfig(), { fetchImpl, sleepImpl: async () => {}, exportPollMs: 0, exportTimeoutMs: 5_000 }));
-  assert.deepEqual(access.summary.collection.users, { status: "forbidden", endpoint: "GET /users", http_status: 403, seen: null, total: null, truncated: null, error: access.summary.collection.users.error });
+  assert.deepEqual(access.summary.collection.users, { status: "forbidden", endpoint: "GET /users", http_status: 403, seen: null, total: null, truncated: null, unevaluable_records: null, error: access.summary.collection.users.error });
   assert.deepEqual(sensor.summary.collection.agents.truncated, null, "a refused walk is neither complete nor truncated");
   assert.equal(sensor.summary.collection.server_properties.http_status, 502);
   assert.equal(sensor.summary.collection.server_properties.status, "error");
@@ -2244,6 +2255,22 @@ const SILENT_SUCCESS_SHAPES = [
     make: () => new Response("<html>Captive portal canary page</html>", { status: 200, statusText: "OK", headers: { "content-type": `Bearer ${CANARY_BEARER}` } }),
     note: /HTTP 200 OK with a non-JSON unknown response body \(\d+ bytes, not echoed\) where the documented JSON document was expected/,
   },
+  {
+    // A JSON array of records none of which carries a member that identifies a documented
+    // record: on the two export chunks and the roles list (whose documented answer is an
+    // array) it is a foreign list and a failed read, never assets, findings, or roles;
+    // everywhere else it is an array where the documented object was expected.
+    name: "200-foreign-records",
+    make: () => new Response(JSON.stringify(FOREIGN_RECORDS), { status: 200, statusText: "OK", headers: { "content-type": "application/json" } }),
+    note: /HTTP 200 OK with (?:a JSON array of 2 records none of which carries any of the documented members (?:"[a-z_]+"(?:, )?)+ \(\d+ bytes, not echoed\)|a JSON array response body \(\d+ bytes, not echoed\) where the documented JSON object was expected)/,
+  },
+];
+
+// Records shaped like a portal's or another API's list: no member that identifies a
+// Tenable asset, finding, or role, and two carried canaries so an echo would show.
+const FOREIGN_RECORDS = [
+  { ok: true, region: "prod-us-east-2026", title: "Captive portal canary page" },
+  { ok: true, note: `Authorization: Bearer ${CANARY_BEARER}`, cookie: `sid=${CANARY_NAMED}` },
 ];
 
 test("silent-success class: a 2xx answer without the documented JSON document on any Vulnerability Management or Security Center surface is an unreadable surface with the observed status, never an empty inventory, a readable probe, a healthy check, or a hard verdict", async () => {
@@ -2357,6 +2384,133 @@ test("silent-success class: a 2xx answer without the documented JSON document on
       }
       assert.ok(requests.every((request) => request.status === 200), `${label}: every request in the run observed a 2xx`);
     }
+  }
+});
+
+// Documented records for the third chunk of each export, alongside one foreign record.
+const THIRD_ASSET = { id: "a-3", has_agent: true, last_authentication_scan_status: "Success", last_seen: RECENT_ISO, network_id: "net-1", network_name: "Default", tags: [{ key: "Environment", value: "prod" }], sources: [{ name: "NESSUS_AGENT" }] };
+const THIRD_VULN = { severity: "high", state: "OPEN", first_found: RECENT_ISO, last_found: RECENT_ISO, plugin: { id: 3, vpr: { score: 7.4 }, cvss3_base_score: 8.0 } };
+const EXPORT_CAPPED = ["TENABLE-03", "TENABLE-04", "TENABLE-14", "TENABLE-15", "TENABLE-16"];
+const UNEVALUABLE_NOTE = /(\d+) of (\d+) exported records carry none of the documented members \((?:[a-z_]+(?:, )?)+\) and were not evaluated/;
+
+function threeChunkRoutes(assetChunks, vulnChunks) {
+  const routes = healthyRoutes();
+  routes["GET /assets/export/asset-export-1/status"] = { status: "FINISHED", chunks_available: [1, 2, 3], chunks_failed: [], total_chunks: 3 };
+  routes["GET /vulns/export/vuln-export-1/status"] = { status: "FINISHED", chunks_available: [1, 2, 3], chunks_failed: [], total_chunks: 3 };
+  assetChunks.forEach((chunk, index) => { routes[`GET /assets/export/asset-export-1/chunks/${index + 1}`] = chunk; });
+  vulnChunks.forEach((chunk, index) => { routes[`GET /vulns/export/vuln-export-1/chunks/${index + 1}`] = chunk; });
+  return routes;
+}
+
+async function exportedBundle(routes, label) {
+  const bundle = await exportTenableAuditBundle(clientsFor(routes), mkdtempSync(join(tmpdir(), "tenable-foreign-records-")), { now: NOW, expectedAssetCount: 3 });
+  const files = readBundleFiles(bundle.outputDir);
+  const zipEntries = readZipEntries(bundle.zipPath);
+  for (const [name, content] of [...files, ...zipEntries]) {
+    assertNoCanary(content, `${label} ${name}`);
+    assert.doesNotMatch(content, NON_DOCUMENT_ECHO, `${label}: a foreign record reached ${name}`);
+  }
+  const bundleName = basename(bundle.outputDir);
+  return { files, zipEntry: (name) => zipEntries.get(`${bundleName}/${name}`) ?? zipEntries.get(name) };
+}
+
+test("TENABLE-15 (round 1 blocking 2): export chunk records without a documented member are never assets or findings: a stray record is unevaluable and caps TENABLE-03, 04, 14, 15, and 16 at warn with its count, a chunk of only foreign records is a failed download, and assets_export.json and vulns_export.json carry a partial marker around the evaluated records instead of a bare array", async () => {
+  // Control: three documented chunks per export are one complete inventory of three records each.
+  const control = threeChunkRoutes([healthyAssets(), [THIRD_ASSET], [THIRD_ASSET]], [healthyVulns(), [THIRD_VULN], [THIRD_VULN]]);
+  const controlResults = await runAll(clientsFor(control), { expectedAssetCount: 3 });
+  const controlVerdicts = verdictMap(controlResults);
+  for (const id of EXPORT_CAPPED) assert.equal(controlVerdicts.get(id), "pass", `${id} passes on the documented control`);
+  assert.deepEqual(controlResults.flatMap((result) => result.errors), []);
+  const controlBundle = await exportedBundle(control, "control");
+  for (const name of ["assets_export.json", "vulns_export.json"]) {
+    const written = JSON.parse(controlBundle.files.get(join("core_data", name)));
+    assert.ok(Array.isArray(written) && written.length === 4, `${name} on the control is the bare list of every record: ${controlBundle.files.get(join("core_data", name)).slice(0, 80)}`);
+  }
+
+  // A stray foreign record inside an otherwise documented chunk of each export.
+  const stray = threeChunkRoutes([healthyAssets(), [THIRD_ASSET], [THIRD_ASSET, FOREIGN_RECORDS[0]]], [healthyVulns(), [THIRD_VULN], [FOREIGN_RECORDS[1], THIRD_VULN]]);
+  const assetExport = await clientsFor(stray).vm.exportAssets();
+  assert.deepEqual(
+    { kind: assetExport.kind, records: assetExport.records.length, unevaluableRecords: assetExport.unevaluableRecords, fetchedChunks: assetExport.fetchedChunks, downloadFailures: assetExport.downloadFailures, truncated: assetExport.truncated },
+    { kind: "assets", records: 4, unevaluableRecords: 1, fetchedChunks: 3, downloadFailures: 0, truncated: false },
+  );
+  assert.ok(assetExport.records.every((record) => "id" in record), "only documented assets are kept");
+  const vulnExport = await clientsFor(stray).vm.exportVulnerabilities(Math.floor((NOW - 30 * 86_400_000) / 1000));
+  assert.deepEqual({ kind: vulnExport.kind, records: vulnExport.records.length, unevaluableRecords: vulnExport.unevaluableRecords, truncated: vulnExport.truncated }, { kind: "vulns", records: 4, unevaluableRecords: 1, truncated: false });
+
+  const strayResults = await runAll(clientsFor(stray), { expectedAssetCount: 3 });
+  const strayText = JSON.stringify(strayResults);
+  assertNoCanary(strayText, "stray-record assessments");
+  assert.doesNotMatch(strayText, NON_DOCUMENT_ECHO);
+  for (const id of EXPORT_CAPPED) {
+    const item = byId(strayResults, id);
+    assert.equal(item.status, "warn", `${id} is capped at warn by the unevaluable record: ${item.summary}`);
+    assert.match(item.summary, /1 of (?:4|5) exported records carry none of the documented members \((?:[a-z_]+(?:, )?)+\) and were not evaluated, so the verdict is capped at warn\./, `${id}: ${item.summary}`);
+    assert.equal(item.evidence.unevaluable_records, 1, `${id} evidence counts the record that was kept out`);
+  }
+  for (const [id, status] of verdictMap(strayResults)) {
+    if (!EXPORT_CAPPED.includes(id)) assert.equal(status, controlVerdicts.get(id), `${id} does not read the exports and keeps its control verdict`);
+  }
+  const [, sensor, , vuln] = strayResults;
+  assert.deepEqual({ truncated: sensor.summary.collection.asset_export.truncated, unevaluable: sensor.summary.collection.asset_export.unevaluable_records, seen: sensor.summary.collection.asset_export.seen }, { truncated: false, unevaluable: 1, seen: 4 });
+  assert.equal(vuln.summary.collection.vuln_export.unevaluable_records, 1);
+  assert.equal(vuln.summary.collection.users.unevaluable_records, null, "a list that is not an export has no unevaluable count");
+  assert.ok(sensor.errors.some((error) => /^asset_export dataset: 1 of 5 exported records carry none of the documented members \(id, uuid, has_agent, last_seen, network_id, tags\) and were not evaluated\.$/.test(error)), JSON.stringify(sensor.errors));
+  assert.ok(vuln.errors.some((error) => /^vuln_export dataset: 1 of 5 exported records carry none of the documented members \(state, severity, plugin, asset, first_found, last_found\) and were not evaluated\.$/.test(error)), JSON.stringify(vuln.errors));
+
+  const strayBundle = await exportedBundle(stray, "stray record");
+  for (const name of ["assets_export.json", "vulns_export.json"]) {
+    for (const [where, content] of [["file", strayBundle.files.get(join("core_data", name))], ["zip entry", strayBundle.zipEntry(`core_data/${name}`)]]) {
+      assert.ok(content, `${name} ${where} is present`);
+      const written = JSON.parse(content);
+      assert.deepEqual(
+        { collected: written.collected, complete: written.complete, truncated: written.truncated, fetched_chunks: written.fetched_chunks, total_chunks: written.total_chunks, unevaluable_records: written.unevaluable_records, records: written.records.length },
+        { collected: true, complete: false, truncated: false, fetched_chunks: 3, total_chunks: 3, unevaluable_records: 1, records: 4 },
+        `${name} ${where} is a partial marker around the evaluated records: ${content.slice(0, 200)}`,
+      );
+    }
+  }
+  assert.match(strayBundle.files.get("_errors.log"), UNEVALUABLE_NOTE, "_errors.log names the records that were kept out");
+  for (const id of EXPORT_CAPPED) {
+    const item = JSON.parse(strayBundle.files.get(join("analysis", "findings.json"))).find((entry) => entry.id === id);
+    assert.equal(item.status, "warn", `${id} in the bundle`);
+  }
+
+  // A chunk of only foreign records is a failed download: with one chunk lost of three the
+  // export is partial; with the only chunk lost the export is unreadable, never empty.
+  const lostChunk = threeChunkRoutes([healthyAssets(), FOREIGN_RECORDS, [THIRD_ASSET, FOREIGN_RECORDS[0]]], [healthyVulns(), FOREIGN_RECORDS, [THIRD_VULN]]);
+  const lostExport = await clientsFor(lostChunk).vm.exportAssets();
+  assert.deepEqual(
+    { records: lostExport.records.length, unevaluableRecords: lostExport.unevaluableRecords, fetchedChunks: lostExport.fetchedChunks, downloadFailures: lostExport.downloadFailures, truncated: lostExport.truncated, endpoint: lostExport.endpoint, httpStatus: lostExport.httpStatus },
+    { records: 3, unevaluableRecords: 1, fetchedChunks: 2, downloadFailures: 1, truncated: true, endpoint: "GET /assets/export/asset-export-1/chunks/2", httpStatus: 200 },
+  );
+  assert.match(lostExport.reason, /1 chunk downloads failed: Tenable request GET \/assets\/export\/asset-export-1\/chunks\/2 returned HTTP 200 with a JSON array of 2 records none of which carries any of the documented members "id", "uuid", "has_agent", "last_seen", "network_id", "tags" \(\d+ bytes, not echoed\)/);
+  assertNoCanary(JSON.stringify(lostExport), "lost-chunk export result");
+  const lostResults = await runAll(clientsFor(lostChunk), { expectedAssetCount: 3 });
+  for (const id of EXPORT_CAPPED) assert.ok(["warn", "manual"].includes(byId(lostResults, id).status), `${id} never passes on a partial export: ${byId(lostResults, id).summary}`);
+  const lostBundle = await exportedBundle(lostChunk, "lost chunk");
+  const lostAssets = JSON.parse(lostBundle.files.get(join("core_data", "assets_export.json")));
+  assert.deepEqual(
+    { collected: lostAssets.collected, complete: lostAssets.complete, truncated: lostAssets.truncated, fetched_chunks: lostAssets.fetched_chunks, total_chunks: lostAssets.total_chunks, download_failures: lostAssets.download_failures, unevaluable_records: lostAssets.unevaluable_records, records: lostAssets.records.length },
+    { collected: true, complete: false, truncated: true, fetched_chunks: 2, total_chunks: 3, download_failures: 1, unevaluable_records: 1, records: 3 },
+  );
+  assert.match(lostAssets.reason, /1 chunk downloads failed: Tenable request GET \/assets\/export\/asset-export-1\/chunks\/2 returned HTTP 200 with a JSON array of 2 records/);
+  assert.match(lostBundle.files.get("_errors.log"), /asset_export dataset: partial view \(3 of unknown records retrieved; 1 chunk downloads failed/);
+
+  const onlyChunk = healthyRoutes();
+  onlyChunk["GET /assets/export/asset-export-1/chunks/1"] = FOREIGN_RECORDS;
+  onlyChunk["GET /vulns/export/vuln-export-1/chunks/1"] = FOREIGN_RECORDS;
+  const onlyResults = await runAll(clientsFor(onlyChunk), { expectedAssetCount: 2 });
+  for (const id of EXPORT_CAPPED) {
+    const item = byId(onlyResults, id);
+    assert.equal(item.status, "manual", `${id} is unreadable, not an empty inventory: ${item.summary}`);
+    assert.equal(item.evidence.collected, false, `${id} evidence is a not-collected marker`);
+  }
+  const onlyBundle = await exportedBundle(onlyChunk, "only chunk foreign");
+  for (const name of ["assets_export.json", "vulns_export.json"]) {
+    const marker = JSON.parse(onlyBundle.files.get(join("core_data", name)));
+    assert.deepEqual({ collected: marker.collected, status: marker.status, dataset_status: marker.dataset_status }, { collected: false, status: 200, dataset_status: "error" }, `${name}: ${JSON.stringify(marker)}`);
+    assert.match(marker.error, /FINISHED with 1 available chunks but none could be downloaded: 1 chunk downloads failed: Tenable request GET \/(?:assets|vulns)\/export\/[a-z]+-export-1\/chunks\/1 returned HTTP 200 with a JSON array of 2 records none of which carries any of the documented members/);
   }
 });
 
