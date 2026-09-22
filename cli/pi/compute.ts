@@ -2,6 +2,11 @@ import { spawnSync } from "node:child_process";
 import { createRequire } from "node:module";
 import { cpus, totalmem } from "node:os";
 import {
+  describeModalCredentialSource,
+  detectModalCredentials,
+  isModalCredentialSourceUsable,
+} from "./backends/modal-profile.js";
+import {
   assertExhaustive,
   hasEnv,
   type ExecutionBackendKind,
@@ -250,16 +255,25 @@ export function getComputeProfileIssues(settings: GrclankerSettings): string[] {
   return [];
 }
 
-function credentialsPresent(kind: ComputeBackendKind): boolean {
-  return COMPUTE_BACKEND_OPTIONS[kind].credentialEnv.every((name) => hasEnv(name));
-}
+export type ComputeBackendCredentialState = {
+  ok: boolean;
+  /** Names and sources only; never a credential value. */
+  detail: string;
+};
 
-function describeCredentialState(kind: ComputeBackendKind): string {
+// Modal is the one kind whose CLI reads credentials from a profile file as well as the
+// environment, so its state comes from the profile detector; every other remote kind is
+// configured through environment variables alone.
+export function getComputeBackendCredentialState(kind: ComputeBackendKind): ComputeBackendCredentialState {
+  if (kind === "modal") {
+    const source = detectModalCredentials();
+    return { ok: isModalCredentialSourceUsable(source), detail: describeModalCredentialSource(source) };
+  }
   const names = COMPUTE_BACKEND_OPTIONS[kind].credentialEnv;
   const missing = names.filter((name) => !hasEnv(name));
   return missing.length === 0
-    ? `Found ${names.join(", ")} in the environment.`
-    : `Set ${missing.join(", ")} to use this backend.`;
+    ? { ok: true, detail: `Found ${names.join(", ")} in the environment.` }
+    : { ok: false, detail: `Set ${missing.join(", ")} to use this backend.` };
 }
 
 function binaryExists(command: string): boolean {
@@ -658,11 +672,19 @@ export function getComputeBackendConfigurationIssues(
     ];
   }
 
-  const issues = getComputeBackendCredentialEnv(kind)
-    .filter((name) => !hasEnv(name))
-    .map((name) => `Set ${name} in the environment to use ${kind}.`);
-  if (kind === "modal" && !binaryExists("modal")) {
-    issues.push("Install the modal CLI (`pip install modal`) and run `modal setup`; grclanker drives Modal through `modal shell`.");
+  const issues: string[] = [];
+  if (kind === "modal") {
+    const credentials = getComputeBackendCredentialState(kind);
+    if (!credentials.ok) issues.push(credentials.detail);
+    if (!binaryExists("modal")) {
+      issues.push("Install the modal CLI (`pip install modal`) and run `modal setup`; grclanker drives Modal through `modal shell`.");
+    }
+  } else {
+    issues.push(
+      ...getComputeBackendCredentialEnv(kind)
+        .filter((name) => !hasEnv(name))
+        .map((name) => `Set ${name} in the environment to use ${kind}.`),
+    );
   }
   if (kind === "runpod-pod" && !binaryExists("ssh")) {
     issues.push("Install an `ssh` client; grclanker executes inside RunPod pods over SSH.");
@@ -682,17 +704,17 @@ function detectRemoteBackendStatus(kind: ComputeBackendKind, binary?: string): C
     };
   }
 
-  const credentialsOk = credentialsPresent(kind);
+  const credentials = getComputeBackendCredentialState(kind);
   const binaryOk = binary ? binaryExists(binary) : true;
   const detail = [
-    describeCredentialState(kind),
+    credentials.detail,
     binary ? (binaryOk ? `Found \`${binary}\` on PATH.` : `Install \`${binary}\` to use this backend.`) : undefined,
   ].filter(Boolean).join(" ");
   return {
     kind,
     label: metadata.label,
     summary: metadata.summary,
-    available: credentialsOk && binaryOk,
+    available: credentials.ok && binaryOk,
     detail,
   };
 }

@@ -852,41 +852,80 @@ function describeOpaqueBody(response: QualysHttpResponse, description: string): 
 }
 
 // A vendor error code copied out of a response body is server-controlled text like every other field, so it is
-// rendered only when it has the documented shape and as the fixed UnknownError otherwise. Qualys documents the VM/PC
-// API v2 <CODE> (simple_return.dtd, "Error Codes" in the API user guide: 1901, 1903, 1905, 1920, 1960, 2000, 2002,
-// 2010, ...), the generic_return.dtd <RETURN status="FAILED" number="..."> attribute, and the /msp/ <ERROR
-// number="999"> attribute (user_list_output.dtd) as small integers. The QPS ServiceResponse responseCode (Asset
-// Management and Tagging API v2 and WAS API user guides, "Error Handling") is an uppercase constant such as SUCCESS,
-// INVALID_REQUEST, INVALID_CREDENTIALS, UNAUTHORIZED, INVALID_API_VERSION, NOT_FOUND, or INTERNAL_ERROR.
-const XML_ERROR_CODE_PATTERN = /^\d{1,6}$/;
-const QPS_RESPONSE_CODE_PATTERN = /^[A-Z][A-Z_]{0,63}$/;
+// rendered only when the scrub with the configured secrets leaves it unchanged, it has the documented shape, and it
+// is one of the codes Qualys documents; anything else renders as the fixed UnknownError. Syntax alone is not enough:
+// a six-digit one-time passcode has the numeric shape and a letters-only base32 fragment has the constant shape, and
+// neither is a code.
+//
+// Numeric codes: the VM/PC API v2 <CODE> (simple_return.dtd), the generic_return.dtd <RETURN status="FAILED"
+// number="..."> attribute, and the /msp/ <ERROR number="..."> attribute (user_list_output.dtd) carry the codes of
+// Appendix D of the Qualys API (VM, PC) user guide (docs.qualys.com/en/vm/qweb-all-api/appendix/appendix_d.htm),
+// which states that the /msp/ Users API returns the same codes at HTTP 200, plus the three codes the guide shows
+// only in samples: 1980 (record limit warning), 1982 (duplicate hosts error output), and 2010 (basic authentication
+// required). Every documented code has three or four digits.
+const XML_ERROR_CODE_PATTERN = /^\d{3,4}$/;
+export const QUALYS_DOCUMENTED_ERROR_CODES: ReadonlySet<string> = new Set([
+  "999", "1901", "1903", "1904", "1905", "1907", "1908", "1920", "1922", "1960", "1965", "1980", "1981", "1982", "1999",
+  "2000", "2002", "2003", "2010", "2011", "2012",
+]);
+// QPS ServiceResponse responseCode: the ResponseCode enumeration of the published QPS XSDs that the WAS API method
+// pages reference (<qualys_base_url>/qps/xsd/3.0/was/webapp.xsd, wasscan.xsd, wasscanschedule.xsd,
+// webappauthrecord.xsd, and the rest), which the Asset Management and Tagging API samples (SUCCESS, INVALID_REQUEST)
+// are drawn from. The longest constant has 29 characters.
+const QPS_RESPONSE_CODE_PATTERN = /^[A-Z][A-Z_]{0,31}$/;
+export const QPS_DOCUMENTED_RESPONSE_CODES: ReadonlySet<string> = new Set([
+  "AUTH_CREDENTIALS_NEEDED", "CANNOT_BE_NULL", "EVALUATION_EXPIRED", "INVALID_API_VERSION", "INVALID_CREDENTIALS",
+  "INVALID_PARAM", "INVALID_REQUEST", "INVALID_URL", "INVALID_XML", "JMS_SERVER_DOWN", "NOT_FOUND",
+  "OPERATION_NOT_SUPPORTED", "OTHER_ERROR", "RMI_SERVER_DOWN", "STILL_PROCESSING", "SUCCESS", "UNAUTHORIZED",
+  "UNAUTHORIZED_DESTINATION_APPS", "UNIDENTIFIED_PRODUCER", "UNKNOWN_OBJECT",
+]);
 const UNKNOWN_ERROR_CODE = "UnknownError";
 
-function vendorErrorCode(value: string | undefined, pattern: RegExp): string | undefined {
+// Which documented vocabulary a copied code is checked against.
+type QualysVendorCodeKind = "xml" | "qps";
+
+function documentedVendorCode(value: string, kind: QualysVendorCodeKind): boolean {
+  switch (kind) {
+    case "xml":
+      return XML_ERROR_CODE_PATTERN.test(value) && QUALYS_DOCUMENTED_ERROR_CODES.has(value);
+    case "qps":
+      return QPS_RESPONSE_CODE_PATTERN.test(value) && QPS_DOCUMENTED_RESPONSE_CODES.has(value);
+    default: {
+      const exhaustive: never = kind;
+      throw new Error(`Unhandled Qualys vendor code kind ${String(exhaustive)}`);
+    }
+  }
+}
+
+// The scrub with the configured secrets runs first, so a configured credential returned as a code renders the
+// placeholder whatever its shape and even when it collides with a documented value; the vocabulary then keeps every
+// undocumented value out of the rendered string.
+export function vendorErrorCode(value: string | undefined, kind: QualysVendorCodeKind, secrets: string[] = []): string | undefined {
   const trimmed = value?.trim();
   if (!trimmed) return undefined;
-  return pattern.test(trimmed) ? trimmed : UNKNOWN_ERROR_CODE;
+  if (scrubErrorText(trimmed, secrets) !== trimmed) return UNKNOWN_ERROR_CODE;
+  return documentedVendorCode(trimmed, kind) ? trimmed : UNKNOWN_ERROR_CODE;
 }
 
 // The documented error envelopes, echoing only their documented fields: SIMPLE_RETURN or GENERIC_RETURN with
 // CODE and TEXT (VM/PC API v2), GENERIC_RETURN/RETURN status="FAILED" with a number attribute (generic_return.dtd),
 // and a root-level ERROR with a number attribute (user_list_output.dtd and the other /msp/ outputs). Every code
-// goes through vendorErrorCode; the TEXT is scrubbed by the QualysApiError constructor.
-function xmlErrorEnvelope(document: XmlNode): string | undefined {
+// goes through vendorErrorCode with the configured secrets; the TEXT is scrubbed by the QualysApiError constructor.
+function xmlErrorEnvelope(document: XmlNode, secrets: string[]): string | undefined {
   const simpleReturn = findXmlElement(document, "SIMPLE_RETURN") ?? findXmlElement(document, "GENERIC_RETURN");
   if (simpleReturn) {
-    const code = vendorErrorCode(xmlText(findXmlElement(simpleReturn, "CODE")), XML_ERROR_CODE_PATTERN);
+    const code = vendorErrorCode(xmlText(findXmlElement(simpleReturn, "CODE")), "xml", secrets);
     const text = xmlText(findXmlElement(simpleReturn, "TEXT"));
     if (code || text) return `${code ? `code ${code}` : "error"}${text ? `: ${text}` : ""}`;
     const failed = findXmlElements(simpleReturn, "RETURN").find((node) => /^failed$/i.test(node.attributes.status ?? ""));
     if (failed) {
-      const number = vendorErrorCode(failed.attributes.number, XML_ERROR_CODE_PATTERN);
+      const number = vendorErrorCode(failed.attributes.number, "xml", secrets);
       return `error${number ? ` ${number}` : ""}${xmlText(failed) ? `: ${xmlText(failed)}` : ""}`;
     }
   }
   const rootError = document.children.flatMap((root) => root.children).find((child) => child.name === "ERROR");
   if (rootError) {
-    const number = vendorErrorCode(rootError.attributes.number, XML_ERROR_CODE_PATTERN);
+    const number = vendorErrorCode(rootError.attributes.number, "xml", secrets);
     return `error${number ? ` ${number}` : ""}${xmlText(rootError) ? `: ${xmlText(rootError)}` : ""}`;
   }
   return undefined;
@@ -1088,7 +1127,7 @@ export class QualysApiClient {
   // XML and CSV surfaces share one failure path: a documented envelope contributes its CODE and TEXT (scrubbed
   // by the constructor), anything else contributes only its content type and byte length.
   private xmlFailure(response: QualysHttpResponse, endpoint: string, document: XmlNode | undefined): QualysApiError | undefined {
-    const envelope = document ? xmlErrorEnvelope(document) : undefined;
+    const envelope = document ? xmlErrorEnvelope(document, this.secrets()) : undefined;
     if (envelope) return this.failure("Qualys request", response, endpoint, envelope);
     if (response.status < 400) return undefined;
     return this.failure(
@@ -1138,11 +1177,12 @@ export class QualysApiClient {
       if (!payload) throw this.failure("Qualys QPS request", response, endpoint, describeOpaqueBody(response, "non-JSON error body"));
     }
     // ServiceResponse (qps/rest): only responseCode and responseErrorDetails.errorMessage are documented error fields,
-    // and only those two are echoed; the code only in its documented shape (vendorErrorCode), the message scrubbed.
+    // and only those two are echoed; the code only when it is in the documented vocabulary (vendorErrorCode), the
+    // message scrubbed.
     const serviceResponse = asObject(payload.ServiceResponse) ?? payload;
     const rawResponseCode = asString(serviceResponse.responseCode);
     if (response.status >= 400 || (rawResponseCode && rawResponseCode !== "SUCCESS")) {
-      const responseCode = vendorErrorCode(rawResponseCode, QPS_RESPONSE_CODE_PATTERN);
+      const responseCode = vendorErrorCode(rawResponseCode, "qps", this.secrets());
       const message = pathString(serviceResponse, "responseErrorDetails", "errorMessage");
       const detail = responseCode
         ? `responseCode ${responseCode}${message ? `: ${message}` : ""}`
