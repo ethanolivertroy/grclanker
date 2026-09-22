@@ -902,14 +902,214 @@ export function redactXmlCredentials(node: XmlNode): XmlNode {
   };
 }
 
-/** The core_data/ representation of a PAN-OS device snapshot, with credentials redacted. */
+/** The xpath behind each entry of config: recorded by the collector, inferred in platform order for a hand-built snapshot. */
+function panosConfigXpaths(snapshot: PanosDeviceSnapshot): string[] {
+  return snapshot.configXpaths ?? platformXpaths(snapshot.platform).filter((xpath) => !snapshot.failedXpaths.includes(xpath));
+}
+
+/** Per-read collection status of a PAN-OS device: the two operational reads plus every config xpath the platform requires. */
+function panosCollectionStatus(snapshot: PanosDeviceSnapshot): JsonRecord {
+  const xpaths = panosConfigXpaths(snapshot);
+  const status: JsonRecord = {
+    system_info: surfaceCollectionStatus(
+      PANOS_READ_ENDPOINTS[PANOS_SYSTEM_INFO_READ],
+      snapshot.reachable ? undefined : failureOf(snapshot.failures, PANOS_SYSTEM_INFO_READ),
+      Object.keys(snapshot.systemInfo).length,
+      false,
+    ),
+    ha_state: surfaceCollectionStatus(
+      PANOS_READ_ENDPOINTS[PANOS_HA_STATE_READ],
+      snapshot.haStateFailed ? failureOf(snapshot.failures, PANOS_HA_STATE_READ) : undefined,
+      snapshot.haState ? 1 : 0,
+      false,
+    ),
+  };
+  snapshot.config.forEach((tree, index) => {
+    const xpath = xpaths[index] ?? `#${index}`;
+    status[xpath] = surfaceCollectionStatus(panosConfigEndpoint(xpath), undefined, tree.children.length, false);
+  });
+  for (const xpath of snapshot.failedXpaths) {
+    status[xpath] = surfaceCollectionStatus(panosConfigEndpoint(xpath), failureOf(snapshot.failures, xpath), null, null);
+  }
+  return status;
+}
+
+/**
+ * The core_data/ representation of a PAN-OS device snapshot, with credentials
+ * redacted. config is keyed by xpath, and every read that failed (system info,
+ * HA state, or a config subtree) is written as a not-collected marker naming
+ * the request that failed and the status it observed, never as null, an empty
+ * object, or a missing entry.
+ */
 export function panosSnapshotToJson(snapshot: PanosDeviceSnapshot): JsonRecord {
+  const xpaths = panosConfigXpaths(snapshot);
+  const config: JsonRecord = {};
+  snapshot.config.forEach((tree, index) => {
+    config[xpaths[index] ?? `#${index}`] = xmlToJson(redactXmlCredentials(tree));
+  });
+  for (const xpath of snapshot.failedXpaths) {
+    config[xpath] = notCollectedMarker(failureOf(snapshot.failures, xpath));
+  }
   return {
     host: snapshot.host,
     platform: snapshot.platform,
-    system_info: redactCredentialProperties(snapshot.systemInfo),
-    ha_state: snapshot.haState ? xmlToJson(redactXmlCredentials(snapshot.haState)) : null,
-    config: snapshot.config.map((tree) => xmlToJson(redactXmlCredentials(tree))),
+    system_info: snapshot.reachable ? redactCredentialProperties(snapshot.systemInfo) : notCollectedMarker(failureOf(snapshot.failures, PANOS_SYSTEM_INFO_READ)),
+    ha_state: snapshot.haStateFailed
+      ? notCollectedMarker(failureOf(snapshot.failures, PANOS_HA_STATE_READ))
+      : snapshot.haState ? xmlToJson(redactXmlCredentials(snapshot.haState)) : null,
+    config,
+    collection: panosCollectionStatus(snapshot),
+  };
+}
+
+/** The documented request behind each CSPM read, keyed by the collector's surface label. */
+const PRISMA_READ_ENDPOINTS: Record<string, string> = {
+  "compliance posture": "GET /v2/compliance/posture",
+  "alert rules": "GET /v2/alert/rule",
+  "open alerts": "GET /v2/alert",
+  policies: "GET /v2/policy",
+  "cloud accounts": "GET /cloud",
+  "account groups": "GET /cloud/group",
+  "user roles": "GET /user/role",
+  integrations: "GET /api/v1/tenant/{prismaId}/integration",
+};
+
+/** The documented request behind each Compute read, keyed by the collector's surface label. */
+const COMPUTE_READ_ENDPOINTS: Record<string, string> = {
+  defenders: "GET /api/v1/defenders",
+  "runtime container policy": "GET /api/v1/policies/runtime/container",
+  "compliance container policy": "GET /api/v1/policies/compliance/container",
+  "compliance host policy": "GET /api/v1/policies/compliance/host",
+  "vulnerability image policy": "GET /api/v1/policies/vulnerability/images",
+  "registry settings": "GET /api/v1/settings/registry",
+  "registry scans": "GET /api/v1/registry",
+  images: "GET /api/v1/images",
+  "vulnerability stats": "GET /api/v1/stats/vulnerabilities",
+  "compliance stats": "GET /api/v1/stats/compliance",
+  "cloud discovery": "GET /api/v1/cloud/discovery",
+  "ci scans": "GET /api/v1/scans",
+};
+
+function seenCount(value: unknown): number {
+  if (Array.isArray(value)) return value.length;
+  if (value === undefined || value === null) return 0;
+  return 1;
+}
+
+function snakeCase(label: string): string {
+  return label.replace(/\s+/g, "_");
+}
+
+/** Per-surface collection status of a Compute snapshot, keyed by snake_case surface name. */
+function computeCollectionStatus(snapshot: ComputeSnapshot): JsonRecord {
+  const values: Record<string, unknown> = {
+    defenders: snapshot.defenders,
+    "runtime container policy": snapshot.runtimeContainerPolicy,
+    "compliance container policy": snapshot.complianceContainerPolicy,
+    "compliance host policy": snapshot.complianceHostPolicy,
+    "vulnerability image policy": snapshot.vulnerabilityImagePolicy,
+    "registry settings": snapshot.registrySettings,
+    "registry scans": snapshot.registryScans,
+    images: snapshot.images,
+    "vulnerability stats": snapshot.vulnerabilityStats,
+    "compliance stats": snapshot.complianceStats,
+    "cloud discovery": snapshot.cloudDiscovery,
+    "ci scans": snapshot.ciScans,
+  };
+  return Object.fromEntries(Object.entries(values).map(([label, value]) => [
+    snakeCase(label),
+    surfaceCollectionStatus(
+      COMPUTE_READ_ENDPOINTS[label] ?? null,
+      snapshot.failed.includes(label) ? failureOf(snapshot.failures, label) : undefined,
+      seenCount(value),
+      snapshot.truncated.includes(label),
+    ),
+  ]));
+}
+
+/** The marker written for the whole Compute half when the console could not be reached, naming the /meta_info request when one failed. */
+function computeUnavailableMarker(snapshot: PrismaSnapshot): JsonRecord {
+  const failure = snapshot.computeUnavailableFailure;
+  return notCollectedMarker({
+    endpoint: failure?.endpoint ?? null,
+    status: failure?.status ?? null,
+    error: snapshot.computeUnavailableReason ?? "Prisma Cloud Compute console was not reached.",
+  }, "unavailable");
+}
+
+/**
+ * The core_data/ representation of a Compute snapshot: every surface that was
+ * not read is written as a not-collected marker in place of its fallback value.
+ */
+export function computeSnapshotToJson(snapshot: ComputeSnapshot): JsonRecord {
+  const surface = (label: string, value: unknown): unknown => (snapshot.failed.includes(label) ? notCollectedMarker(failureOf(snapshot.failures, label)) : value);
+  return {
+    console_url: snapshot.consoleUrl,
+    defenders: surface("defenders", snapshot.defenders),
+    runtime_container_policy: surface("runtime container policy", snapshot.runtimeContainerPolicy),
+    compliance_container_policy: surface("compliance container policy", snapshot.complianceContainerPolicy),
+    compliance_host_policy: surface("compliance host policy", snapshot.complianceHostPolicy),
+    vulnerability_image_policy: surface("vulnerability image policy", snapshot.vulnerabilityImagePolicy),
+    registry_settings: surface("registry settings", snapshot.registrySettings),
+    registry_scans: surface("registry scans", snapshot.registryScans),
+    images: surface("images", snapshot.images),
+    vulnerability_stats: surface("vulnerability stats", snapshot.vulnerabilityStats),
+    compliance_stats: surface("compliance stats", snapshot.complianceStats),
+    cloud_discovery: surface("cloud discovery", snapshot.cloudDiscovery),
+    ci_scans: surface("ci scans", snapshot.ciScans),
+    truncated: snapshot.truncated.map(snakeCase),
+    truncation_reasons: Object.fromEntries(Object.entries(snapshot.truncationReasons ?? {}).map(([label, reason]) => [snakeCase(label), reason])),
+    collection: computeCollectionStatus(snapshot),
+  };
+}
+
+/** Per-surface collection status of the CSPM half of a Prisma snapshot, keyed by snake_case surface name. */
+function prismaCollectionStatus(snapshot: PrismaSnapshot): JsonRecord {
+  const values: Record<string, unknown> = {
+    "compliance posture": snapshot.posture,
+    "alert rules": snapshot.alertRules,
+    "open alerts": snapshot.alerts,
+    policies: snapshot.policies,
+    "cloud accounts": snapshot.cloudAccounts,
+    "account groups": snapshot.accountGroups,
+    "user roles": snapshot.userRoles,
+    integrations: snapshot.integrations,
+  };
+  return Object.fromEntries(Object.entries(values).map(([label, value]) => [
+    snakeCase(label),
+    surfaceCollectionStatus(
+      PRISMA_READ_ENDPOINTS[label] ?? null,
+      snapshot.failed.includes(label) ? failureOf(snapshot.failures, label) : undefined,
+      seenCount(value),
+      label === "open alerts" ? snapshot.alertsTruncated : false,
+    ),
+  ]));
+}
+
+/**
+ * The core_data/ representation of a Prisma Cloud snapshot. Every CSPM surface
+ * the collector could not read is written as a not-collected marker (never an
+ * empty array), the alert truncation flags render null when the alert walk never
+ * happened, and the Compute half is either its own projection or an unavailable
+ * marker naming the /meta_info request that failed.
+ */
+export function prismaSnapshotToJson(snapshot: PrismaSnapshot): JsonRecord {
+  const surface = (label: string, value: unknown): unknown => (snapshot.failed.includes(label) ? notCollectedMarker(failureOf(snapshot.failures, label)) : value);
+  const alertsRead = !snapshot.failed.includes("open alerts");
+  return {
+    compliance_posture: surface("compliance posture", snapshot.posture ?? null),
+    alert_rules: surface("alert rules", snapshot.alertRules),
+    open_alerts: surface("open alerts", snapshot.alerts),
+    open_alerts_truncated: alertsRead ? snapshot.alertsTruncated : null,
+    open_alerts_truncation_reason: alertsRead ? snapshot.alertsTruncationReason ?? null : null,
+    open_alerts_total: alertsRead ? snapshot.alertsTotal ?? null : null,
+    policies: surface("policies", snapshot.policies),
+    cloud_accounts: surface("cloud accounts", snapshot.cloudAccounts),
+    account_groups: surface("account groups", snapshot.accountGroups),
+    user_roles: surface("user roles", snapshot.userRoles),
+    integrations: surface("integrations", snapshot.integrations),
+    compute: snapshot.compute ? computeSnapshotToJson(snapshot.compute) : computeUnavailableMarker(snapshot),
+    collection: prismaCollectionStatus(snapshot),
   };
 }
 
@@ -1706,32 +1906,47 @@ const PANORAMA_XPATHS = [
   "/config/panorama",
 ];
 
+function platformXpaths(platform: PanosDeviceSnapshot["platform"]): string[] {
+  return platform === "panorama" ? PANORAMA_XPATHS : FIREWALL_XPATHS;
+}
+
+/**
+ * Every read records how it failed (the request that failed and the status it
+ * observed) under failures, keyed by the read name or the xpath, so the bundle
+ * can write a not-collected marker in place of the subtree that was not read.
+ */
 export async function collectPanosSnapshot(client: Pick<PanosApiClient, "host" | "showSystemInfo" | "showHighAvailabilityState" | "showConfig">): Promise<PanosDeviceSnapshot> {
   const errors: string[] = [];
   const failedXpaths: string[] = [];
+  const failures: Record<string, PaloaltoSurfaceFailure> = {};
   let reachable = true;
   const systemInfo = await client.showSystemInfo().catch((error: unknown) => {
-    errors.push(`${client.host}: show system info failed: ${errorMessage(error)}`);
+    errors.push(`${client.host}: ${PANOS_SYSTEM_INFO_READ} failed: ${errorMessage(error)}`);
+    failures[PANOS_SYSTEM_INFO_READ] = describeFailure(error);
     reachable = false;
     return {} as JsonRecord;
   });
   const platform = detectPlatform(systemInfo);
   let haStateFailed = false;
   const haState = await client.showHighAvailabilityState().catch((error: unknown) => {
-    errors.push(`${client.host}: show high-availability state failed: ${errorMessage(error)}`);
+    errors.push(`${client.host}: ${PANOS_HA_STATE_READ} failed: ${errorMessage(error)}`);
+    failures[PANOS_HA_STATE_READ] = describeFailure(error);
     haStateFailed = true;
     return undefined;
   });
   const config: XmlNode[] = [];
-  for (const xpath of platform === "panorama" ? PANORAMA_XPATHS : FIREWALL_XPATHS) {
+  const configXpaths: string[] = [];
+  for (const xpath of platformXpaths(platform)) {
     try {
       config.push(await client.showConfig(xpath));
+      configXpaths.push(xpath);
     } catch (error) {
       failedXpaths.push(xpath);
+      failures[xpath] = describeFailure(error);
       errors.push(`${client.host}: config show ${xpath} failed: ${errorMessage(error)}`);
     }
   }
-  return { host: client.host, platform, reachable, systemInfo, haState, haStateFailed, config, failedXpaths, errors };
+  return { host: client.host, platform, reachable, systemInfo, haState, haStateFailed, config, configXpaths, failedXpaths, failures, errors };
 }
 
 type ComputeSource = Pick<PrismaComputeClient, "baseUrl" | "listDefenders" | "getRuntimeContainerPolicy" | "getComplianceContainerPolicy" | "getComplianceHostPolicy" | "getVulnerabilityImagePolicy" | "getRegistrySettings" | "listRegistryScans" | "listImages" | "getVulnerabilityStats" | "getComplianceStats" | "listCloudDiscovery" | "listCiScans">;
@@ -1745,6 +1960,7 @@ type ComputeSource = Pick<PrismaComputeClient, "baseUrl" | "listDefenders" | "ge
 export async function collectComputeSnapshot(client: ComputeSource): Promise<ComputeSnapshot> {
   const errors: string[] = [];
   const failed: string[] = [];
+  const failures: Record<string, PaloaltoSurfaceFailure> = {};
   const truncated: string[] = [];
   const truncationReasons: Record<string, string> = {};
   const guard = async <T>(label: string, fallback: T, load: () => Promise<T>): Promise<T> => {
@@ -1752,6 +1968,7 @@ export async function collectComputeSnapshot(client: ComputeSource): Promise<Com
       return redactCredentialProperties(await load());
     } catch (error) {
       failed.push(label);
+      failures[label] = describeFailure(error);
       errors.push(`prisma-compute: ${label} failed: ${errorMessage(error)}`);
       return fallback;
     }
@@ -1791,6 +2008,7 @@ export async function collectComputeSnapshot(client: ComputeSource): Promise<Com
     cloudDiscovery,
     ciScans,
     failed,
+    failures,
     truncated,
     truncationReasons,
     errors,
@@ -1808,15 +2026,17 @@ type PrismaSource = Pick<PrismaCloudClient, "getCompliancePosture" | "listAlertR
 export async function collectPrismaSnapshot(
   client: PrismaSource,
   alertLimit = DEFAULT_ALERT_LIMIT,
-  compute?: { client?: ComputeSource; unavailableReason?: string },
+  compute?: { client?: ComputeSource; unavailableReason?: string; unavailableFailure?: PaloaltoSurfaceFailure },
 ): Promise<PrismaSnapshot> {
   const errors: string[] = [];
   const failed: string[] = [];
+  const failures: Record<string, PaloaltoSurfaceFailure> = {};
   const guard = async <T>(label: string, fallback: T, load: () => Promise<T>): Promise<T> => {
     try {
       return redactCredentialProperties(await load());
     } catch (error) {
       failed.push(label);
+      failures[label] = describeFailure(error);
       errors.push(`prisma-cloud: ${label} failed: ${errorMessage(error)}`);
       return fallback;
     }
@@ -1832,21 +2052,25 @@ export async function collectPrismaSnapshot(
   const computeSnapshot = compute?.client ? await collectComputeSnapshot(compute.client) : undefined;
   if (computeSnapshot) errors.push(...computeSnapshot.errors);
   else if (compute?.unavailableReason) errors.push(`prisma-compute: ${compute.unavailableReason}`);
+  const alertsRead = !failed.includes("open alerts");
   return {
     posture,
     alertRules,
     alerts: alertPage.items,
-    alertsTruncated: alertPage.truncated,
-    alertsTruncationReason: alertPage.truncationReason,
-    alertsTotal: alertPage.totalRows,
+    // No walk happened when the read failed, so it was neither complete nor truncated.
+    alertsTruncated: alertsRead ? alertPage.truncated : null,
+    alertsTruncationReason: alertsRead ? alertPage.truncationReason : undefined,
+    alertsTotal: alertsRead ? alertPage.totalRows : undefined,
     policies,
     cloudAccounts,
     accountGroups,
     userRoles,
     integrations,
     failed,
+    failures,
     compute: computeSnapshot,
     computeUnavailableReason: computeSnapshot ? undefined : compute?.unavailableReason,
+    computeUnavailableFailure: computeSnapshot ? undefined : compute?.unavailableFailure,
     errors,
   };
 }
@@ -1856,6 +2080,8 @@ export interface PaloaltoClients {
   prisma?: PrismaCloudClient;
   compute?: PrismaComputeClient;
   computeUnavailableReason?: string;
+  /** The CSPM /meta_info request that failed while locating the Compute console, when that is why it is unavailable. */
+  computeUnavailableFailure?: PaloaltoSurfaceFailure;
   panos: PanosApiClient[];
 }
 
@@ -1892,6 +2118,7 @@ export async function resolveComputeClient(clients: PaloaltoClients): Promise<Pr
     return clients.compute;
   } catch (error) {
     clients.computeUnavailableReason = `Compute console discovery via CSPM /meta_info failed (${errorMessage(error)}); set PRISMA_COMPUTE_URL to the Compute console path.`;
+    clients.computeUnavailableFailure = describeFailure(error);
     return undefined;
   }
 }
@@ -1899,7 +2126,11 @@ export async function resolveComputeClient(clients: PaloaltoClients): Promise<Pr
 export async function loadPrismaSnapshot(clients: PaloaltoClients, alertLimit = DEFAULT_ALERT_LIMIT): Promise<PrismaSnapshot | undefined> {
   if (!clients.prisma) return undefined;
   const compute = await resolveComputeClient(clients);
-  return collectPrismaSnapshot(clients.prisma, alertLimit, { client: compute, unavailableReason: clients.computeUnavailableReason });
+  return collectPrismaSnapshot(clients.prisma, alertLimit, {
+    client: compute,
+    unavailableReason: clients.computeUnavailableReason,
+    unavailableFailure: clients.computeUnavailableFailure,
+  });
 }
 
 interface EvidenceGate {
@@ -3163,9 +3394,13 @@ async function readableSurface(
   try {
     const value = await load();
     const partial = partialResolver?.(value) === true;
-    return { product, target, name, endpoint, status: "readable", count: countResolver?.(value), ...(partial ? { partial } : {}) };
+    return { product, target, name, endpoint, status: "readable", count: countResolver?.(value) ?? null, httpStatus: null, ...(partial ? { partial } : {}) };
   } catch (error) {
-    return { product, target, name, endpoint, status: "not_readable", error: errorMessage(error) };
+    // A failed probe names the request that actually failed (a login or keygen
+    // request when authentication is what broke) and reads nothing, so count and
+    // partial are null rather than 0 and false.
+    const failure = describeFailure(error);
+    return { product, target, name, endpoint: failure.endpoint ?? endpoint, status: "not_readable", count: null, partial: null, httpStatus: failure.status, error: failure.error };
   }
 }
 
@@ -3183,28 +3418,29 @@ export async function checkPaloaltoAccess(clients: PaloaltoClients): Promise<Pal
     products.push("prisma-cloud");
     notes.push(`Prisma Cloud API: ${prisma.apiUrl}`);
     surfaces.push(
-      await readableSurface("prisma-cloud", prisma.apiUrl, "compliance_posture", "GET /v2/compliance/posture", () => prisma.getCompliancePosture(), () => 1),
-      await readableSurface("prisma-cloud", prisma.apiUrl, "alert_rules", "GET /v2/alert/rule", () => prisma.listAlertRules(), arrayCount),
-      await readableSurface("prisma-cloud", prisma.apiUrl, "open_alerts", "GET /v2/alert", () => prisma.collectOpenAlerts(DEFAULT_ALERT_PAGE_SIZE), pagedCount, pagedPartial),
-      await readableSurface("prisma-cloud", prisma.apiUrl, "policies", "GET /v2/policy", () => prisma.listPolicies(), arrayCount),
-      await readableSurface("prisma-cloud", prisma.apiUrl, "cloud_accounts", "GET /cloud", () => prisma.listCloudAccounts(), arrayCount),
-      await readableSurface("prisma-cloud", prisma.apiUrl, "account_groups", "GET /cloud/group", () => prisma.listAccountGroups(), arrayCount),
-      await readableSurface("prisma-cloud", prisma.apiUrl, "user_roles", "GET /user/role", () => prisma.listUserRoles(), arrayCount),
-      await readableSurface("prisma-cloud", prisma.apiUrl, "integrations", "GET /api/v1/tenant/{prismaId}/integration", () => prisma.listIntegrations(), arrayCount),
+      await readableSurface("prisma-cloud", prisma.apiUrl, "compliance_posture", PRISMA_READ_ENDPOINTS["compliance posture"], () => prisma.getCompliancePosture(), () => 1),
+      await readableSurface("prisma-cloud", prisma.apiUrl, "alert_rules", PRISMA_READ_ENDPOINTS["alert rules"], () => prisma.listAlertRules(), arrayCount),
+      await readableSurface("prisma-cloud", prisma.apiUrl, "open_alerts", PRISMA_READ_ENDPOINTS["open alerts"], () => prisma.collectOpenAlerts(DEFAULT_ALERT_PAGE_SIZE), pagedCount, pagedPartial),
+      await readableSurface("prisma-cloud", prisma.apiUrl, "policies", PRISMA_READ_ENDPOINTS.policies, () => prisma.listPolicies(), arrayCount),
+      await readableSurface("prisma-cloud", prisma.apiUrl, "cloud_accounts", PRISMA_READ_ENDPOINTS["cloud accounts"], () => prisma.listCloudAccounts(), arrayCount),
+      await readableSurface("prisma-cloud", prisma.apiUrl, "account_groups", PRISMA_READ_ENDPOINTS["account groups"], () => prisma.listAccountGroups(), arrayCount),
+      await readableSurface("prisma-cloud", prisma.apiUrl, "user_roles", PRISMA_READ_ENDPOINTS["user roles"], () => prisma.listUserRoles(), arrayCount),
+      await readableSurface("prisma-cloud", prisma.apiUrl, "integrations", PRISMA_READ_ENDPOINTS.integrations, () => prisma.listIntegrations(), arrayCount),
     );
     const compute = await resolveComputeClient(clients);
     if (compute) {
       products.push("prisma-compute");
       notes.push(`Prisma Cloud Compute console: ${compute.baseUrl}`);
       surfaces.push(
-        await readableSurface("prisma-compute", compute.baseUrl, "defenders", "GET /api/v1/defenders", () => compute.listDefenders(DEFAULT_COMPUTE_PAGE_SIZE), pagedCount, pagedPartial),
-        await readableSurface("prisma-compute", compute.baseUrl, "runtime_container_policy", "GET /api/v1/policies/runtime/container", () => compute.getRuntimeContainerPolicy(), (value) => asRecords(asObject(value)?.rules).length),
-        await readableSurface("prisma-compute", compute.baseUrl, "compliance_policies", "GET /api/v1/policies/compliance/{container,host}", async () => [await compute.getComplianceContainerPolicy(), await compute.getComplianceHostPolicy()], () => 2),
-        await readableSurface("prisma-compute", compute.baseUrl, "vulnerability_image_policy", "GET /api/v1/policies/vulnerability/images", () => compute.getVulnerabilityImagePolicy(), (value) => asRecords(asObject(value)?.rules).length),
-        await readableSurface("prisma-compute", compute.baseUrl, "registry_settings", "GET /api/v1/settings/registry", () => compute.getRegistrySettings(), (value) => asRecords(asObject(value)?.specifications).length),
-        await readableSurface("prisma-compute", compute.baseUrl, "vulnerability_stats", "GET /api/v1/stats/vulnerabilities", () => compute.getVulnerabilityStats(), arrayCount),
-        await readableSurface("prisma-compute", compute.baseUrl, "cloud_discovery", "GET /api/v1/cloud/discovery", () => compute.listCloudDiscovery(DEFAULT_COMPUTE_PAGE_SIZE), pagedCount, pagedPartial),
-        await readableSurface("prisma-compute", compute.baseUrl, "ci_scans", "GET /api/v1/scans", () => compute.listCiScans(DEFAULT_COMPUTE_PAGE_SIZE), pagedCount, pagedPartial),
+        await readableSurface("prisma-compute", compute.baseUrl, "defenders", COMPUTE_READ_ENDPOINTS.defenders, () => compute.listDefenders(DEFAULT_COMPUTE_PAGE_SIZE), pagedCount, pagedPartial),
+        await readableSurface("prisma-compute", compute.baseUrl, "runtime_container_policy", COMPUTE_READ_ENDPOINTS["runtime container policy"], () => compute.getRuntimeContainerPolicy(), (value) => asRecords(asObject(value)?.rules).length),
+        await readableSurface("prisma-compute", compute.baseUrl, "compliance_container_policy", COMPUTE_READ_ENDPOINTS["compliance container policy"], () => compute.getComplianceContainerPolicy(), (value) => asRecords(asObject(value)?.rules).length),
+        await readableSurface("prisma-compute", compute.baseUrl, "compliance_host_policy", COMPUTE_READ_ENDPOINTS["compliance host policy"], () => compute.getComplianceHostPolicy(), (value) => asRecords(asObject(value)?.rules).length),
+        await readableSurface("prisma-compute", compute.baseUrl, "vulnerability_image_policy", COMPUTE_READ_ENDPOINTS["vulnerability image policy"], () => compute.getVulnerabilityImagePolicy(), (value) => asRecords(asObject(value)?.rules).length),
+        await readableSurface("prisma-compute", compute.baseUrl, "registry_settings", COMPUTE_READ_ENDPOINTS["registry settings"], () => compute.getRegistrySettings(), (value) => asRecords(asObject(value)?.specifications).length),
+        await readableSurface("prisma-compute", compute.baseUrl, "vulnerability_stats", COMPUTE_READ_ENDPOINTS["vulnerability stats"], () => compute.getVulnerabilityStats(), arrayCount),
+        await readableSurface("prisma-compute", compute.baseUrl, "cloud_discovery", COMPUTE_READ_ENDPOINTS["cloud discovery"], () => compute.listCloudDiscovery(DEFAULT_COMPUTE_PAGE_SIZE), pagedCount, pagedPartial),
+        await readableSurface("prisma-compute", compute.baseUrl, "ci_scans", COMPUTE_READ_ENDPOINTS["ci scans"], () => compute.listCiScans(DEFAULT_COMPUTE_PAGE_SIZE), pagedCount, pagedPartial),
       );
     } else {
       notes.push(`Prisma Cloud Compute not reachable: ${clients.computeUnavailableReason ?? "unknown"} Controls 7-11, 24, and 25 fall back to manual findings.`);
@@ -3215,14 +3451,14 @@ export async function checkPaloaltoAccess(clients: PaloaltoClients): Promise<Pal
 
   if (clients.panos.length > 0) products.push("pan-os");
   for (const device of clients.panos) {
-    const systemInfoSurface = await readableSurface("pan-os", device.host, "system_info", "type=op show system info", () => device.showSystemInfo(), () => 1);
+    const systemInfoSurface = await readableSurface("pan-os", device.host, "system_info", PANOS_READ_ENDPOINTS[PANOS_SYSTEM_INFO_READ], () => device.showSystemInfo(), () => 1);
     surfaces.push(systemInfoSurface);
     const systemInfo: JsonRecord = systemInfoSurface.status === "readable" ? await device.showSystemInfo().catch(() => ({})) : {};
     const platform = detectPlatform(systemInfo);
     notes.push(`${device.host}: ${platform}${asString(systemInfo.model) ? ` ${asString(systemInfo.model)}` : ""}${asString(systemInfo["sw-version"]) ? ` PAN-OS ${asString(systemInfo["sw-version"])}` : ""}`);
-    surfaces.push(await readableSurface("pan-os", device.host, "ha_state", "type=op show high-availability state", () => device.showHighAvailabilityState(), () => 1));
-    for (const xpath of platform === "panorama" ? PANORAMA_XPATHS : FIREWALL_XPATHS) {
-      surfaces.push(await readableSurface("pan-os", device.host, xpath.split("/").slice(-1)[0], `type=config action=show xpath=${xpath}`, () => device.showConfig(xpath), (value) => (value as XmlNode).children.length));
+    surfaces.push(await readableSurface("pan-os", device.host, "ha_state", PANOS_READ_ENDPOINTS[PANOS_HA_STATE_READ], () => device.showHighAvailabilityState(), () => 1));
+    for (const xpath of platformXpaths(platform)) {
+      surfaces.push(await readableSurface("pan-os", device.host, xpath.split("/").slice(-1)[0], panosConfigEndpoint(xpath), () => device.showConfig(xpath), (value) => (value as XmlNode).children.length));
     }
   }
   if (clients.panos.length === 0) {
@@ -3249,7 +3485,12 @@ async function collectPanosSnapshots(clients: PaloaltoClients): Promise<PanosDev
   return Promise.all(clients.panos.map((device) => collectPanosSnapshot(device)));
 }
 
-/** Per-device collection status for assessment summaries: which hosts and subtrees were not read. */
+/**
+ * Per-device collection status for assessment summaries: which hosts and
+ * subtrees were not read, plus a per-read collection block (status, the request
+ * behind the read, the HTTP status a failed read observed, and counts that are
+ * null rather than 0 when the read never happened).
+ */
 function panosCollectionSummary(devices: PanosDeviceSnapshot[]): JsonRecord {
   return {
     devices: devices.length,
@@ -3257,6 +3498,7 @@ function panosCollectionSummary(devices: PanosDeviceSnapshot[]): JsonRecord {
     unreachable_hosts: devices.filter((item) => !item.reachable).map((item) => item.host),
     failed_xpaths: devices.flatMap((item) => item.failedXpaths.map((xpath) => `${item.host}: ${xpath}`)),
     ha_state_unreadable: devices.filter((item) => item.haStateFailed).map((item) => item.host),
+    collection: Object.fromEntries(devices.map((item) => [item.host, panosCollectionStatus(item)])),
   };
 }
 
@@ -3276,6 +3518,10 @@ function prismaCollectionSummary(snapshot: PrismaSnapshot): JsonRecord {
     ],
     truncated_surfaces: (snapshot.compute?.truncated ?? []).map((surface) => `prisma-compute ${surface}`),
     compute_unavailable_reason: snapshot.compute ? null : snapshot.computeUnavailableReason ?? null,
+    collection: {
+      prisma_cloud: prismaCollectionStatus(snapshot),
+      prisma_compute: snapshot.compute ? computeCollectionStatus(snapshot.compute) : computeUnavailableMarker(snapshot),
+    },
   };
 }
 
@@ -3388,7 +3634,8 @@ function formatAccessCheckText(result: PaloaltoAccessCheckResult): string {
     surface.target.replace(/^https?:\/\//, "").slice(0, 32),
     surface.name,
     surface.status,
-    surface.count === undefined ? "-" : `${surface.count}${surface.partial ? "+" : ""}`,
+    surface.count === null ? "-" : `${surface.count}${surface.partial ? "+" : ""}`,
+    surface.httpStatus === null ? "-" : String(surface.httpStatus),
     surface.error ? redactErrorText(surface.error).replace(/\s+/g, " ").slice(0, 80) : "",
   ]);
   return [
@@ -3396,10 +3643,29 @@ function formatAccessCheckText(result: PaloaltoAccessCheckResult): string {
     "",
     ...result.notes,
     "",
-    formatTable(["Product", "Target", "Surface", "Status", "Count", "Note"], rows),
+    formatTable(["Product", "Target", "Surface", "Status", "Count", "HTTP", "Note"], rows),
     "",
     `Next: ${result.recommendedNextStep}`,
   ].join("\n");
+}
+
+/** One line per surface that was not read: "<group> <surface>: <dataset status> <HTTP status or no response> (<request>)"; "all surfaces read" otherwise. */
+function describeCollectionBlock(block: unknown): string {
+  const notRead: string[] = [];
+  const walk = (value: unknown, path: string[]) => {
+    const record = asObject(value);
+    if (!record) return;
+    if (record.collected === false || (typeof record.status === "string" && record.status !== "ok" && "http_status" in record)) {
+      const http = asNumber(record.http_status ?? record.status);
+      const endpoint = asString(record.endpoint);
+      const datasetStatus = asString(record.dataset_status) ?? asString(record.status) ?? "not read";
+      notRead.push(`${path.join(" ")}: ${datasetStatus} ${http === undefined ? "no response" : `HTTP ${http}`}${endpoint ? ` (${endpoint})` : ""}`);
+      return;
+    }
+    for (const [key, child] of Object.entries(record)) walk(child, [...path, key]);
+  };
+  walk(block, []);
+  return notRead.length === 0 ? "all surfaces read" : notRead.join("; ");
 }
 
 function formatAssessmentText(result: PaloaltoAssessmentResult): string {
@@ -3410,8 +3676,10 @@ function formatAssessmentText(result: PaloaltoAssessmentResult): string {
     item.title,
     item.summary.length > 160 ? `${item.summary.slice(0, 157)}...` : item.summary,
   ]);
+  // The per-surface collection block is structured data for the JSON result and
+  // the bundle; the text rendering names only the surfaces that were not read.
   const summary = Object.entries(result.summary)
-    .map(([key, value]) => `- ${key}: ${Array.isArray(value) ? value.join(", ") : String(value)}`)
+    .map(([key, value]) => `- ${key}: ${Array.isArray(value) ? value.join(", ") : key === "collection" ? describeCollectionBlock(value) : String(value)}`)
     .join("\n");
   return [
     result.title,
@@ -3574,8 +3842,7 @@ export async function exportPaloaltoAuditBundle(
   }));
   await writeSecureTextFile(outputDir, "core_data/access.json", serializeJson(access));
   if (prismaSnapshot) {
-    const { errors: _ignored, ...raw } = prismaSnapshot;
-    await writeSecureTextFile(outputDir, "core_data/prisma_cloud.json", serializeJson(raw));
+    await writeSecureTextFile(outputDir, "core_data/prisma_cloud.json", serializeJson(prismaSnapshotToJson(prismaSnapshot)));
   }
   for (const snapshot of deviceSnapshots) {
     await writeSecureTextFile(outputDir, `core_data/panos_${safeDirName(snapshot.host)}.json`, serializeJson(panosSnapshotToJson(snapshot)));
