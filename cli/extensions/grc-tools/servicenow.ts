@@ -34,11 +34,56 @@ const REDACTED = "[REDACTED]";
 const MIN_REMEMBERED_SECRET_LENGTH = 8;
 /** Every credential literal a client in this process was configured with or obtained from oauth_token.do. */
 const KNOWN_SECRETS = new Set<string>();
+/** The forms a remembered secret takes in an echoed body (raw, base64, base64url, URL-encoded, JSON-escaped), computed once per secret. */
+const SECRET_FORMS = new Map<string, string[]>();
+// Scrub boundary. A value inside a carrier (an Authorization, Cookie, Set-Cookie, or API key header, a
+// cookie or session assignment, URL userinfo or a query pair, a Bearer/Basic/Digest/Token/ApiKey scheme,
+// a credential-named key-value pair, a SOAP credential element) is removed whatever its shape; a
+// remembered secret is removed whatever its shape and in its encoded forms; a bare value is removed only
+// when it has a real token shape (JWT, PEM block, hex digest, vendor prefix, or a 16+ character run with
+// base64 symbols, scattered digits, or token casing). A bare name-shaped value (words joined by hyphens
+// or underscores, such as prod-us-east-2026) is indistinguishable from a resource name and stays.
 const URL_IN_TEXT_PATTERN = /\b(https?:\/\/)(?:([^\s/?#@"'<>]+)@)?([^\s/?#"'<>]+)([^\s?#"'<>]*)(\?[^\s#"'<>]*)?(#[^\s"'<>]*)?/gi;
+// A query pair standing without its URL (`?token=...`, `&sid=...`).
+const BARE_QUERY_PAIR_PATTERN = /([?&][\w.~%-]+=)([^\s"'&#<>\\]+)/g;
+// Header name to value: `: `, `="`, or the JSON-escaped `\":\"`.
+const HEADER_SEPARATOR = String.raw`\\?["']?\s*[:=]\s*\\?["']?`;
+// The schemes that stand as carriers in prose (the ruling's list) and the wider set recognized inside an Authorization header.
+const PROSE_AUTH_SCHEMES = "bearer|basic|digest|token|apikey|api-key";
+const HEADER_AUTH_SCHEMES = `${PROSE_AUTH_SCHEMES}|negotiate|ntlm|hmac|oauth|hoba|mutual|vapid|aws4-hmac-sha256|scram-sha-1|scram-sha-256`;
+// One credential token, or a parameter list such as Digest's `username="u", response="r"` (quotes possibly
+// JSON-escaped) or PagerDuty's `token=k`.
+const CREDENTIAL_TOKEN = String.raw`[^\s"'<>,;\\]+`;
+const CREDENTIAL_PARAMETER_VALUE = String.raw`(?:\\?"[^"\\\r\n]*\\?"|[^\s"',;<>\\]+)`;
+const CREDENTIAL_PARAMETERS = String.raw`[\w-]+=${CREDENTIAL_PARAMETER_VALUE}(?:\s*[,;]\s*[\w-]+=${CREDENTIAL_PARAMETER_VALUE})*`;
+// The whole value of an Authorization header: a scheme and its credential, or up to two tokens for an unknown scheme.
+const AUTHORIZATION_HEADER_PATTERN = new RegExp(
+  String.raw`\b((?:proxy-)?authorization)(${HEADER_SEPARATOR})(?:(?:${HEADER_AUTH_SCHEMES})\s+(?:${CREDENTIAL_PARAMETERS}|${CREDENTIAL_TOKEN})|${CREDENTIAL_PARAMETERS}|${CREDENTIAL_TOKEN}(?:\s+${CREDENTIAL_TOKEN})?)`,
+  "gi",
+);
+// Cookie and Set-Cookie headers: every pair to the end of the header value is a session credential.
+const COOKIE_HEADER_PATTERN = new RegExp(String.raw`\b(set-cookie|cookie)(${HEADER_SEPARATOR})([^\r\n"'<>\\]+)`, "gi");
+// A scheme standing in prose (`Bearer x`, `Token token=x`, `ApiKey x`).
+const AUTH_SCHEME_PATTERN = new RegExp(String.raw`\b(${PROSE_AUTH_SCHEMES})\s+(${CREDENTIAL_PARAMETERS}|${CREDENTIAL_TOKEN})`, "gi");
+const CREDENTIAL_PARAMETER_PATTERN = new RegExp(String.raw`([\w-]+=)${CREDENTIAL_PARAMETER_VALUE}`, "g");
+// Credential-named assignments (`client_secret=x`, `JSESSIONID=x`, `connect.sid=x`, `--token=x`).
+const SECRET_ASSIGNMENT_PATTERN = /(?<![\w.-])([\w.-]*(?:sess|sid|token|secret|passw|passphrase|pwd|passcode|api[_-]?key|apikey|access[_-]?key|private[_-]?key|credential|assertion|signature|auth|cookie|otp)[\w.-]*=)([^\s"'&;,<>\\]+)/gi;
+// Credential-named fields and single-value credential headers (`x-api-key: x`, `"password": "x"`, `\"access_token\":\"x\"`).
+const SECRET_FIELD_PATTERN = /(?<![\w/.-])((?:[\w-]*(?:api[_-]?key|apikey|token|secret|passw|passphrase|credential|assertion|signature|private[_-]?key|access[_-]?key|authorization)[\w-]*|pwd|passcode|otp|sid|jsessionid|session|sessionid|session[_-]?id|cookie|set-cookie|x-auth|x-token|x-secret|auth)\\?["']?\s*:\s*\\?["']?)([^\s"'&;,<>\\]+)/gi;
+// SOAP and XML credential elements (`<sessionId>x</sessionId>`, `<urn:password>x</urn:password>`).
+const CREDENTIAL_ELEMENT_PATTERN = /<((?:[\w.-]+:)?(?:session_?id|session|passw(?:or)?d|pwd|passcode|otp|token|access_?token|refresh_?token|id_?token|secret|client_?secret|api_?key|apikey|assertion|signature|credentials?|authorization|private_?key)[\w-]*)(\s[^>]*)?>([^<]*)<\/\1\s*>/gi;
+// Command-line credential flags (`--token x`, `-password x`).
+const CLI_SECRET_FLAG_PATTERN = /(--?(?:token|password|passwd|pwd|passcode|secret|api[_-]?key|apikey|access[_-]?key|client[_-]?secret|credential|auth|bearer|session|cookie|sid|otp)\s+)([^\s"'&;,<>-][^\s"'&;,<>]*)/gi;
+// Real token shapes, removed bare.
+const PEM_BLOCK_PATTERN = /-----BEGIN [A-Z0-9 ]+-----[\s\S]*?(?:-----END [A-Z0-9 ]+-----|$)/g;
 const JWT_PATTERN = /\beyJ[A-Za-z0-9_-]{4,}\.[A-Za-z0-9_-]{4,}\.[A-Za-z0-9_-]*/g;
-const AUTHORIZATION_VALUE_PATTERN = /\b(bearer|basic|digest|negotiate|ntlm)\s+([A-Za-z0-9\-._~+/!]{8,}=*)/gi;
-const SECRET_ASSIGNMENT_PATTERN = /\b([\w-]*(?:session|token|secret|password|passwd|pwd|api[_-]?key|apikey|credential|assertion|signature|sid|jsessionid)[\w-]*=)([^\s"'&;,<>]+)/gi;
-const SECRET_FIELD_PATTERN = /(?<![\w/.-])((?:api[\s_-]?key|x-api-key|access[_-]?token|refresh[_-]?token|id[_-]?token|auth[_-]?token|session[_-]?token|bearer[_-]?token|token|client[_-]?secret|secret|password|passwd|pwd|authorization|set-cookie|cookie|session[_-]?id|jsessionid|sid|assertion|signature|credential)["']?\s*:\s*["']?)([^\s"'&;,<>]+)/gi;
+const HEX_DIGEST_PATTERN = /(?<![A-Za-z0-9])[0-9a-f]{32,}(?![A-Za-z0-9])/gi;
+const VENDOR_TOKEN_PATTERN = /\b(?:(?:sk|rk|pk)_(?:live|test)_[A-Za-z0-9]{8,}|sk-(?:proj-)?[A-Za-z0-9_-]{20,}|gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|xox[abopsre]-[A-Za-z0-9-]{10,}|xapp-[A-Za-z0-9-]{10,}|(?:AKIA|ASIA|AGPA|AIDA|AROA|ANPA|ANVA)[0-9A-Z]{16}|AIza[0-9A-Za-z_-]{20,}|ya29\.[0-9A-Za-z_-]{20,}|glpat-[A-Za-z0-9_-]{16,}|npm_[A-Za-z0-9]{30,}|pypi-[A-Za-z0-9_-]{30,}|dop_v1_[a-f0-9]{40,}|SG\.[A-Za-z0-9_-]{16,}\.[A-Za-z0-9_-]{16,}|hvs\.[A-Za-z0-9_-]{20,}|shpat_[a-fA-F0-9]{32}|dckr_pat_[A-Za-z0-9_-]{20,}|lin_api_[A-Za-z0-9]{20,}|figd_[A-Za-z0-9_-]{20,}|u\+[A-Za-z0-9_-]{16,})(?![A-Za-z0-9_-])/g;
+// A run long enough to be a token; redactTokenRun decides by segment shape whether it is one.
+const BARE_TOKEN_RUN_PATTERN = /(?<![A-Za-z0-9+/_=-])[A-Za-z0-9+/_-]{16,}={0,2}(?![A-Za-z0-9+/_=-])/g;
+// A segment that reads as a word: lowercase, UPPERCASE, Capitalized, or camelCase with up to six humps,
+// optionally followed by digits (oauth2, sha256, dev12345).
+const WORD_SEGMENT_PATTERN = /^(?:[A-Z]+|[A-Z]?[a-z]+(?:[A-Z][a-z]+){0,6}|[A-Z]{2,}[a-z]+(?:[A-Z][a-z]+){0,6})\d*$/;
 // Node fs error codes (ENOENT, EACCES, EISDIR); anything else on error.code is not echoed.
 const FS_ERROR_CODE_PATTERN = /^E[A-Z0-9_]{1,30}$/;
 const DEFAULT_TIMEOUT_MS = 30_000;
@@ -467,22 +512,76 @@ function errorMessage(error: unknown): string {
 
 /**
  * The unanchored redaction pass applied to every error string (once in ServicenowApiError, again at
- * errorMessage): every secret any client in this process has seen, then credential shapes (URL
- * userinfo, query strings, and fragments anywhere in the text, JWT-shaped strings, Authorization
- * scheme values, and credential-named assignments and fields).
+ * errorMessage): every secret any client in this process has seen, in every form it can take in an
+ * echoed body, then the carriers (URL userinfo, query strings, and fragments anywhere in the text,
+ * Authorization and cookie headers, auth schemes in prose, credential-named assignments, fields, and
+ * elements, command-line flags), then the bare token shapes (PEM blocks, JWTs, hex digests, vendor
+ * prefixes, and long runs with base64 symbols, scattered digits, or token casing).
  */
 function scrubSecretText(text: string, secrets: Iterable<string | undefined> = []): string {
   let scrubbed = text;
   for (const secret of [...secrets, ...KNOWN_SECRETS]) {
-    if (secret && secret.length >= MIN_REMEMBERED_SECRET_LENGTH) scrubbed = scrubbed.split(secret).join(REDACTED);
+    if (!secret || secret.length < MIN_REMEMBERED_SECRET_LENGTH) continue;
+    for (const form of secretForms(secret)) scrubbed = scrubbed.split(form).join(REDACTED);
   }
   return scrubbed
+    .replace(PEM_BLOCK_PATTERN, REDACTED)
     .replace(URL_IN_TEXT_PATTERN, (_match, scheme: string, userinfo: string | undefined, host: string, path: string, query?: string, fragment?: string) =>
       `${scheme}${userinfo ? `${REDACTED}@` : ""}${host}${path}${query ? `?${REDACTED}` : ""}${fragment ? `#${REDACTED}` : ""}`)
+    .replace(BARE_QUERY_PAIR_PATTERN, (_match, pair: string) => `${pair}${REDACTED}`)
+    .replace(AUTHORIZATION_HEADER_PATTERN, (_match, header: string, separator: string) => `${header}${separator}${REDACTED}`)
+    .replace(COOKIE_HEADER_PATTERN, (_match, header: string, separator: string) => `${header}${separator}${REDACTED}`)
+    .replace(CREDENTIAL_ELEMENT_PATTERN, (_match, element: string, attributes: string | undefined) => `<${element}${attributes ?? ""}>${REDACTED}</${element}>`)
     .replace(JWT_PATTERN, REDACTED)
-    .replace(AUTHORIZATION_VALUE_PATTERN, (match: string, scheme: string, value: string) => (/^[a-z]+$/.test(value) ? match : `${scheme} ${REDACTED}`))
+    .replace(AUTH_SCHEME_PATTERN, (match: string, scheme: string, credential: string) =>
+      // A lowercase scheme word followed by a plain lowercase word is prose ("bearer of", "token request", "basic auth").
+      (/^[a-z]+$/.test(scheme) && /^[a-z]+$/.test(credential) ? match : `${scheme} ${redactCredentialParameters(credential)}`))
     .replace(SECRET_ASSIGNMENT_PATTERN, (_match, assignment: string) => `${assignment}${REDACTED}`)
-    .replace(SECRET_FIELD_PATTERN, (_match, field: string) => `${field}${REDACTED}`);
+    .replace(SECRET_FIELD_PATTERN, (_match, field: string) => `${field}${REDACTED}`)
+    .replace(CLI_SECRET_FLAG_PATTERN, (_match, flag: string) => `${flag}${REDACTED}`)
+    .replace(VENDOR_TOKEN_PATTERN, REDACTED)
+    .replace(HEX_DIGEST_PATTERN, REDACTED)
+    .replace(BARE_TOKEN_RUN_PATTERN, redactTokenRun);
+}
+
+/** A parameter list (`token=k`, `username="u", response="r"`) keeps its parameter names; a single credential is replaced whole. */
+function redactCredentialParameters(credential: string): string {
+  return /^[\w-]+=/.test(credential) ? credential.replace(CREDENTIAL_PARAMETER_PATTERN, (_match, name: string) => `${name}${REDACTED}`) : REDACTED;
+}
+
+/** The raw, base64, base64url, URL-encoded, and JSON-escaped forms of a secret, so an encoded echo is caught too. */
+function secretForms(secret: string): string[] {
+  let forms = SECRET_FORMS.get(secret);
+  if (!forms) {
+    const bytes = Buffer.from(secret, "utf8");
+    const base64 = bytes.toString("base64");
+    const urlEncoded = encodeURIComponent(secret);
+    forms = [...new Set([
+      secret,
+      base64,
+      base64.replace(/=+$/, ""),
+      bytes.toString("base64url"),
+      urlEncoded,
+      urlEncoded.replace(/%20/g, "+"),
+      urlEncoded.replace(/%[0-9A-F]{2}/g, (escape) => escape.toLowerCase()),
+      JSON.stringify(secret).slice(1, -1),
+    ])].filter((form) => form.length >= MIN_REMEMBERED_SECRET_LENGTH);
+    SECRET_FORMS.set(secret, forms);
+  }
+  return forms;
+}
+
+/** A run reads as a token when any hyphen- or underscore-separated segment is neither a word, a number, nor a short abbreviation. */
+function looksLikeToken(value: string): boolean {
+  return value.split(/[-_]+/).some((segment) =>
+    segment.length > 0 && !/^\d+$/.test(segment) && !WORD_SEGMENT_PATTERN.test(segment) && !(segment.length < 8 && /^[A-Za-z0-9]+$/.test(segment)));
+}
+
+/** Base64 symbols mark a token; otherwise a run without slashes is judged whole and a path piece by piece, keeping its word-like skeleton. */
+function redactTokenRun(run: string): string {
+  if (run.includes("+") || run.endsWith("=")) return REDACTED;
+  if (!run.includes("/")) return looksLikeToken(run) ? REDACTED : run;
+  return run.split("/").map((piece) => (looksLikeToken(piece) ? REDACTED : piece)).join("/");
 }
 
 function rememberSecrets(...values: Array<string | undefined>): void {
@@ -806,14 +905,14 @@ export function resolveServicenowConfiguration(
   };
 }
 
-/** The client's own credentials (including short ones) removed first, then the shared redaction pass. */
+/** The client's own credentials (including short ones) removed first, then the shared redaction pass with their encoded forms. */
 export function redactSecrets(message: string, secrets: Array<string | undefined>): string {
   let redacted = message;
   for (const secret of secrets) {
     if (!secret || secret.length < 4) continue;
     redacted = redacted.split(secret).join(REDACTED);
   }
-  return scrubSecretText(redacted);
+  return scrubSecretText(redacted, secrets);
 }
 
 /**
