@@ -6,7 +6,7 @@
  * read-only and organization-focused so GRC engineers can assess GitHub posture
  * with either a PAT or a GitHub App installation token.
  */
-import { createPrivateKey, sign as signData } from "node:crypto";
+import { createPrivateKey, sign as signData, type KeyObject } from "node:crypto";
 import {
   createWriteStream,
   existsSync,
@@ -1390,6 +1390,33 @@ export class GitHubHttpError extends Error {
   }
 }
 
+/** The shape of a Node system error `code` (ENOENT, EACCES, EISDIR): a fixed identifier, never a message. */
+const SYSTEM_ERROR_CODE_PATTERN = /^E[A-Z0-9_]{1,30}$/;
+
+function systemErrorCode(error: unknown): string | undefined {
+  const code = asRecord(error).code;
+  return typeof code === "string" && SYSTEM_ERROR_CODE_PATTERN.test(code) ? code : undefined;
+}
+
+/**
+ * Reads the GitHub App private key file named by GITHUB_APP_PRIVATE_KEY_PATH or app_private_key_path.
+ * The read error is never interpolated: a Node fs message carries library wording and whatever a
+ * non-standard thrown value's `String(error)` yields, and scrubErrorText has nothing to remove from
+ * either, so the thrown text is a fixed description with the path and the system error code only.
+ */
+function readPrivateKeyFile(pathname: string): string {
+  const resolvedPath = resolve(pathname);
+  try {
+    return readFileSync(resolvedPath, "utf8");
+  } catch (error) {
+    const code = systemErrorCode(error);
+    throw new Error(scrubErrorText(`Unable to read GitHub App private key file ${resolvedPath}${code ? ` (${code})` : ""}`));
+  }
+}
+
+const INVALID_PRIVATE_KEY_MESSAGE = "GitHub App private key is not a valid PEM private key";
+const UNSIGNABLE_PRIVATE_KEY_MESSAGE = "GitHub App private key could not produce an RS256 signature (an RSA private key is required)";
+
 export async function resolveGitHubConfiguration(
   args: RawConfigArgs = {},
   env: NodeJS.ProcessEnv = process.env,
@@ -1416,7 +1443,7 @@ export async function resolveGitHubConfiguration(
   if (privateKeyFromEnv) {
     envOverlay.appPrivateKey = privateKeyFromEnv;
   } else if (privateKeyPathFromEnv) {
-    envOverlay.appPrivateKey = readFileSync(resolve(privateKeyPathFromEnv), "utf8");
+    envOverlay.appPrivateKey = readPrivateKeyFile(privateKeyPathFromEnv);
   }
 
   const inferredEnvMode = envOverlay.apiToken
@@ -1446,7 +1473,7 @@ export async function resolveGitHubConfiguration(
   if (trimToUndefined(args.app_private_key)) {
     argOverlay.appPrivateKey = trimToUndefined(args.app_private_key);
   } else if (trimToUndefined(args.app_private_key_path)) {
-    argOverlay.appPrivateKey = readFileSync(resolve(trimToUndefined(args.app_private_key_path)!), "utf8");
+    argOverlay.appPrivateKey = readPrivateKeyFile(trimToUndefined(args.app_private_key_path)!);
   }
 
   if (Object.values(argOverlay).some((value) => value !== undefined)) {
@@ -1527,8 +1554,20 @@ function buildGitHubAppJwt(config: GitHubResolvedConfig): string {
     iss: config.appId,
   }));
   const signingInput = `${header}.${payload}`;
-  const key = createPrivateKey(config.appPrivateKey);
-  const signature = signData("RSA-SHA256", Buffer.from(signingInput), key);
+  // The OpenSSL messages (`DECODER routines::unsupported`, `Provider routines::invalid digest`) are
+  // library wording that would otherwise land in every probe detail, so both steps throw fixed text.
+  let key: KeyObject;
+  try {
+    key = createPrivateKey(config.appPrivateKey);
+  } catch {
+    throw new Error(INVALID_PRIVATE_KEY_MESSAGE);
+  }
+  let signature: Buffer;
+  try {
+    signature = signData("RSA-SHA256", Buffer.from(signingInput), key);
+  } catch {
+    throw new Error(UNSIGNABLE_PRIVATE_KEY_MESSAGE);
+  }
   return `${signingInput}.${encodeBase64Url(signature)}`;
 }
 
