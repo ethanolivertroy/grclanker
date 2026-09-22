@@ -997,35 +997,63 @@ function parseDogrc(content: string): DogrcOverlay {
   return overlay;
 }
 
-const ERRNO_CODE_PATTERN = /^E[A-Z]+$/;
+const ERRNO_CODE_PATTERN = /^E[A-Z0-9_]{1,30}$/;
 
 /**
- * Raised when the .dogrc file cannot be read. The file carries the API and application keys, so the
- * message names only the path and a validated errno code; the filesystem's own message is withheld.
- * parseDogrc itself never throws: a line it cannot read is skipped, never quoted.
+ * Raised when the .dogrc file cannot be read or parsed. The file carries the API and application keys, so the
+ * message is fixed text built only from the path and an errno code validated against ERRNO_CODE_PATTERN: neither
+ * the filesystem's message nor anything the parser might throw is ever interpolated. parseDogrc itself never
+ * throws (a line it cannot read is skipped, never quoted), so the parse arm is a guard against every thrown value.
  */
 export class DatadogConfigFileError extends Error {
   readonly path: string;
+  /** The errno code of a read failure, or INVALID_INI for a parse failure. */
   readonly code: string;
+  /** Always undefined: the dogshell INI parser has no structured position to report. */
+  readonly line: number | undefined;
 
-  constructor(path: string, code: string) {
-    super(`Datadog config file ${path} could not be loaded (${code}). The parser detail is withheld because config files carry credentials; fix or remove the file and retry.`);
+  constructor(step: "read" | "parse", path: string, code: string | undefined) {
+    super(step === "read"
+      ? `Unable to read Datadog config file ${path}${code ? ` (${code})` : ""}`
+      : `Unable to parse Datadog config file: invalid INI in ${path}`);
     this.name = "DatadogConfigFileError";
     this.path = path;
-    this.code = code;
+    this.code = code ?? "UNKNOWN";
+    this.line = undefined;
   }
 }
 
-function readDogrc(location: string): DogrcOverlay | undefined {
-  if (!existsSync(location)) return undefined;
-  let content: string;
+/** The errno code of a filesystem error, only when it has the strict E[A-Z0-9_] shape; anything else is dropped. */
+function errnoCode(error: unknown): string | undefined {
+  const code = asString(asObject(error)?.code);
+  return code && ERRNO_CODE_PATTERN.test(code) ? code : undefined;
+}
+
+/** Read step of the config loader: any filesystem failure surfaces as fixed text with the validated errno code only. */
+function readDogrcSource(location: string): string {
   try {
-    content = readFileSync(location, "utf8");
+    return readFileSync(location, "utf8");
   } catch (error) {
-    const errno = asString(asObject(error)?.code);
-    throw new DatadogConfigFileError(location, errno && ERRNO_CODE_PATTERN.test(errno) ? errno : "INVALID_CONFIG");
+    throw new DatadogConfigFileError("read", location, errnoCode(error));
   }
-  return parseDogrc(content);
+}
+
+/** Parse step of the config loader: every thrown value becomes fixed text naming only the path. */
+function parseDogrcSource(location: string, source: string): DogrcOverlay {
+  try {
+    return parseDogrc(source);
+  } catch {
+    throw new DatadogConfigFileError("parse", location, "INVALID_INI");
+  }
+}
+
+/**
+ * Loads the .dogrc overlay. A missing default file is simply absent; a path named explicitly (argument or
+ * environment) that cannot be read is an error, so a typo in the path is not silently ignored.
+ */
+function readDogrc(location: string, explicit: boolean): DogrcOverlay | undefined {
+  if (!explicit && !existsSync(location)) return undefined;
+  return parseDogrcSource(location, readDogrcSource(location));
 }
 
 export function resolveDatadogConfiguration(
@@ -1034,11 +1062,11 @@ export function resolveDatadogConfiguration(
   homeDir: string = homedir(),
 ): DatadogResolvedConfig {
   const sourceChain: string[] = [];
-  const configPath = asString(input.config_file)
+  const explicitConfigPath = asString(input.config_file)
     ?? asString(env.DD_CONFIG_FILE)
-    ?? asString(env.DATADOG_CONFIG_FILE)
-    ?? join(homeDir, ".dogrc");
-  const fileOverlay = readDogrc(configPath) ?? {};
+    ?? asString(env.DATADOG_CONFIG_FILE);
+  const configPath = explicitConfigPath ?? join(homeDir, ".dogrc");
+  const fileOverlay = readDogrc(configPath, explicitConfigPath !== undefined) ?? {};
 
   const argApiKey = asString(input.api_key);
   const envApiKey = asString(env.DD_API_KEY) ?? asString(env.DATADOG_API_KEY);
