@@ -9,6 +9,7 @@ import {
   describeFailedResponse,
   errorMessage,
   scrubDataText,
+  scrubError,
   scrubErrorText,
 } from "../dist/extensions/grc-tools/hardening/error-text.js";
 import {
@@ -332,6 +333,34 @@ test("marker error text survives the scrub for every inventory label, including 
     assertSurvivesScrub(gated.principals_withheld, `${label} principals_withheld`);
   }
   assertSurvivesScrub(notCollected(line).error, "not collected without status");
+});
+
+test("the scrubError fixed texts for a value that yields no message survive the scrub, including under a Proxy whose every trap throws", () => {
+  const hostile = new Proxy(
+    {},
+    {
+      get() {
+        throw new Error("get trap");
+      },
+      has() {
+        throw new Error("has trap");
+      },
+      getPrototypeOf() {
+        throw new Error("prototype trap");
+      },
+      ownKeys() {
+        throw new Error("keys trap");
+      },
+      getOwnPropertyDescriptor() {
+        throw new Error("descriptor trap");
+      },
+    },
+  );
+  const scrubbed = scrubError(hostile);
+  assert.equal(scrubbed.message, "Error without a message");
+  assertSurvivesScrub(scrubbed.message, "guarded reads yielding nothing");
+  assertSurvivesScrub(errorMessage(hostile), "guarded reads yielding nothing, folded");
+  assertSurvivesScrub("thrown value could not be read", "the last-resort fixed text");
 });
 
 test("a path rendered as the value of a credential-named pair is eaten, which is why no fixed text renders one that way", () => {
