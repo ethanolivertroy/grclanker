@@ -2096,15 +2096,25 @@ export async function assessSumologicDataGovernance(
       approved_destination_domains: approvedDestinations,
       unapproved_destinations: unapproved.map((item) => item.name),
     };
+    const forwardingCount = forwardingPartitions.length + forwardingViews.length;
     let forwardingFinding: SumologicFinding;
-    if (connectionList.length === 0 && forwardingPartitions.length === 0 && forwardingViews.length === 0 && partitions.ok && scheduledViews.ok && partitionList.length > 0) {
+    if (connectionList.length === 0 && forwardingCount === 0 && partitions.ok && scheduledViews.ok && partitionList.length > 0) {
       forwardingFinding = finding(10, "medium", "pass", "Zero outbound connections and zero data forwarding destinations are configured (endpoints readable), so no external destination review is pending; emptiness is compliant for this control.", evidence);
     } else if (approvedDestinations.length > 0 && unapproved.length > 0) {
       forwardingFinding = finding(10, "medium", "fail", `${unapproved.length}/${connectionList.length} connections point outside the approved destination domains (${unapproved.map((item) => item.name).join(", ")}).`, evidence);
+    } else if (approvedDestinations.length > 0 && connectionList.length === 0) {
+      // The approved-domain check only ever covers connections, so with none
+      // to check there is nothing to pass on: the forwarding destinations on
+      // partitions and scheduled views (or an empty partition inventory) still
+      // need a human.
+      const remaining = forwardingCount > 0
+        ? `${forwardingCount} data forwarding destination(s) on ${forwardingPartitions.length} partition(s) and ${forwardingViews.length} scheduled view(s) remain unchecked against the approved domains`
+        : "no data forwarding destination was seen but the partition inventory is empty, so that absence cannot be confirmed";
+      forwardingFinding = finding(10, "medium", "manual", `No outbound connections were found to check against the approved destination domains; ${remaining}, so a human must confirm each forwarding destination is approved.`, evidence);
     } else if (approvedDestinations.length > 0) {
-      forwardingFinding = finding(10, "medium", "pass", `All ${connectionList.length} connections resolve to approved destination domains; ${forwardingPartitions.length + forwardingViews.length} data forwarding destination(s) still require owner review.`, evidence);
+      forwardingFinding = finding(10, "medium", "pass", `All ${connectionList.length} connections resolve to approved destination domains; ${forwardingCount} data forwarding destination(s) still require owner review.`, evidence);
     } else {
-      forwardingFinding = finding(10, "medium", "manual", `${connectionList.length} outbound connection(s) and ${forwardingPartitions.length + forwardingViews.length} data forwarding destination(s) exist; no approved destination list was supplied, so a human must confirm each destination is approved (pass approved_destination_domains to automate).`, evidence);
+      forwardingFinding = finding(10, "medium", "manual", `${connectionList.length} outbound connection(s) and ${forwardingCount} data forwarding destination(s) exist; no approved destination list was supplied, so a human must confirm each destination is approved (pass approved_destination_domains to automate).`, evidence);
     }
     // The data forwarding destinations live on partitions and scheduled views,
     // so those inventories are essential: unreadable drops a pass to manual and

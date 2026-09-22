@@ -887,6 +887,43 @@ test("control 10 resolves connection hosts from url only and flags connections w
   assert.equal(byId(approved, "SUMO-10").status, "pass");
 });
 
+test("control 10 never passes the approved-domain check on an empty connection list while forwarding destinations remain", async () => {
+  const options = { now: NOW, approvedDestinationDomains: ["example.com"] };
+
+  const forwarding = healthyData();
+  forwarding.connections = [];
+  forwarding.partitions[0].dataForwardingId = "fwd-1";
+  forwarding.scheduledViews[0].dataForwardingId = "fwd-2";
+  const remaining = byId(await assessSumologicDataGovernance(readerFrom(forwarding), options), "SUMO-10");
+  assert.equal(remaining.status, "manual", remaining.summary);
+  assert.match(remaining.summary, /^No outbound connections were found to check against the approved destination domains; 2 data forwarding destination\(s\) on 1 partition\(s\) and 1 scheduled view\(s\) remain unchecked against the approved domains, so a human must confirm each forwarding destination is approved\.$/);
+  assert.doesNotMatch(remaining.summary, /All 0 connections/);
+  assert.equal(remaining.evidence.connections_seen, 0);
+  assert.deepEqual(remaining.evidence.partitions_forwarding, ["sumologic_default"]);
+  assert.deepEqual(remaining.evidence.scheduled_views_forwarding, ["errors"]);
+
+  const emptyPartitions = healthyData();
+  emptyPartitions.connections = [];
+  emptyPartitions.partitions = [];
+  emptyPartitions.scheduledViews = [];
+  const unconfirmed = byId(await assessSumologicDataGovernance(readerFrom(emptyPartitions), options), "SUMO-10");
+  assert.equal(unconfirmed.status, "manual", unconfirmed.summary);
+  assert.match(unconfirmed.summary, /no data forwarding destination was seen but the partition inventory is empty, so that absence cannot be confirmed/);
+
+  const nothingConfigured = healthyData();
+  nothingConfigured.connections = [];
+  const compliantEmptiness = byId(await assessSumologicDataGovernance(readerFrom(nothingConfigured), options), "SUMO-10");
+  assert.equal(compliantEmptiness.status, "pass", "zero connections and zero forwarding destinations on readable, non-empty inventories still pass");
+  assert.match(compliantEmptiness.summary, /^Zero outbound connections and zero data forwarding destinations/);
+
+  const approvedWithForwarding = healthyData();
+  approvedWithForwarding.connections = [{ id: "c1", name: "approved-hook", type: "WebhookConnection", url: "https://hooks.example.com/x" }];
+  approvedWithForwarding.partitions[0].dataForwardingId = "fwd-1";
+  const checked = byId(await assessSumologicDataGovernance(readerFrom(approvedWithForwarding), options), "SUMO-10");
+  assert.equal(checked.status, "pass");
+  assert.match(checked.summary, /^All 1 connections resolve to approved destination domains; 1 data forwarding destination\(s\) still require owner review\.$/);
+});
+
 test("approved_email_domains drives control 20 when org domains cannot be derived from the user list", async () => {
   const data = healthyData();
   data.monitors[0].notifications = [{ notification: { connectionType: "Email", recipients: ["soc@partner.example.org"] }, runForTriggerTypes: ["Critical"] }];
