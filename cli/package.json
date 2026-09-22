@@ -58,6 +58,7 @@
     "test:splunk:live": "npm run build && node scripts/splunk-live-smoke.mjs",
     "test:sumologic:live": "npm run build && node scripts/sumologic-live-smoke.mjs",
     "test:tenable:live": "npm run build && node scripts/tenable-live-smoke.mjs",
+    "test:slack:live": "npm run build && node scripts/slack-live-smoke.mjs",
     "test:vanta:live": "npm run build && node scripts/vanta-live-smoke.mjs",
     "test:veracode:live": "npm run build && node scripts/veracode-live-smoke.mjs",
     "test:zendesk:live": "npm run build && node scripts/zendesk-live-smoke.mjs",
