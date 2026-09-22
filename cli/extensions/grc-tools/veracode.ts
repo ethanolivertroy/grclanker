@@ -2921,17 +2921,23 @@ function isCredentialKey(key: string): boolean {
   return CREDENTIAL_KEY_PATTERN.test(key.toLowerCase().replace(/[\s._-]/g, ""));
 }
 
-/** Rewrites only URLs whose userinfo or query string could carry a token (git_repo_url with user:token@, target URLs with session parameters). */
+/**
+ * Reduces a URL that carries userinfo, a query string, or a fragment to
+ * scheme, host, and path (git_repo_url with user:token@, target URLs with
+ * session parameters, single-page targets whose fragment carries a token):
+ * userinfo and the query string are replaced by the marker and the fragment
+ * is dropped. A URL made of scheme, host, and path only is kept verbatim.
+ */
 function scrubUrlValue(value: string): string {
   const match = /^[a-z][a-z0-9+.-]*:\/\/(.*)$/i.exec(value);
-  if (!match || !/[@?]/.test(match[1])) return value;
+  if (!match || !/[@?#]/.test(match[1])) return value;
   try {
     const url = new URL(value);
     const userinfo = url.username || url.password ? `${REDACTED}@` : "";
     const query = url.search.length > 1 ? `?${REDACTED}` : "";
     return `${url.protocol}//${userinfo}${url.host}${url.pathname}${query}`;
   } catch {
-    return value.replace(/\/\/[^/@]*@/, `//${REDACTED}@`).replace(/\?.*$/, `?${REDACTED}`);
+    return value.replace(/#.*$/, "").replace(/\/\/[^/@]*@/, `//${REDACTED}@`).replace(/\?.*$/, `?${REDACTED}`);
   }
 }
 

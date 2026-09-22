@@ -982,6 +982,8 @@ const FAKE_SECRETS = {
   pairSecretKey: "cTEF3JvzumskuFUSrpnujEU2Xjf9jPqXnj9Px23p",
   settingsAccessKey: "A4urKDYCG35ubTm9v54aKCfTwDUYD4r5YFP7Lr99",
   settingsSecretKey: "6mckJxBg2BmjE9GKTpz5KeWXxHXcHtwkSm8Le9Gj",
+  runbookFragmentToken: "RBTsRfDATVHez2jXNJh7sBB5nDQkU9hs9Weyyjpb",
+  spaFragmentToken: "TRcHmKPJYAfFQftqKaPQWjhu2M5qT8YCvdCjTHT3",
 };
 
 /** Every collected object that can carry a credential per the vendor API carries a distinctive fake one. */
@@ -990,6 +992,8 @@ function secretFixture() {
   fixture.applications[0].profile.custom_fields = [
     { name: "Deploy API Token", value: FAKE_SECRETS.customFieldToken },
     { name: "ci_session", value: `eyJhbGciOiJIUzI1NiJ9.${FAKE_SECRETS.customFieldJwtPayload}.${FAKE_SECRETS.customFieldJwtSignature}` },
+    // A URL whose only sensitive part is the fragment (no userinfo, no query).
+    { name: "Runbook", value: `https://wiki.example.com/runbooks/payments#access_token=${FAKE_SECRETS.runbookFragmentToken}` },
   ];
   fixture.applications[0].profile.git_repo_url = `https://svc:${FAKE_SECRETS.repoUserinfoToken}@git.example.com/org/payments.git`;
   fixture.applications[1].profile.git_repo_url = `https://git.example.com/org/portal.git?access_token=${FAKE_SECRETS.repoQueryToken}`;
@@ -1005,6 +1009,11 @@ function secretFixture() {
     analysis_id: "an-1",
     target_url: `https://portal.example.com/?sid=${FAKE_SECRETS.scanListSession}`,
     scan_config_request: { auth_configuration: { authentications: { AUTO: { username: "svc", password: FAKE_SECRETS.scanRequestPassword } } } },
+  }, {
+    scan_id: "scan-2",
+    analysis_id: "an-1",
+    // A single-page application target whose fragment carries the token and which has no query string.
+    target_url: `https://spa.example.com/app#id_token=${FAKE_SECRETS.spaFragmentToken}`,
   }];
   fixture.scanConfiguration = {
     target_url: { url: `https://portal.example.com/login?session=${FAKE_SECRETS.configurationSession}` },
@@ -1055,7 +1064,12 @@ test("rule 9: the exported bundle, the zip, the assess payloads, and the access 
   assert.deepEqual(payments.profile.custom_fields, [
     { name: "Deploy API Token", value: "[REDACTED]" },
     { name: "ci_session", value: "[REDACTED]" },
-  ], "credential-named and JWT-shaped custom field values are redacted while the field names stay legible");
+    { name: "Runbook", value: "https://wiki.example.com/runbooks/payments" },
+  ], "credential-named and JWT-shaped custom field values are redacted while the field names stay legible, and a URL whose only sensitive part is the fragment keeps scheme, host, and path only");
+  assert.deepEqual(scanCoverage.dynamic_analysis.scans_by_analysis["an-1"].map((scan) => scan.target_url), [
+    "https://portal.example.com/?[REDACTED]",
+    "https://spa.example.com/app",
+  ], "the per-analysis scan list drops a fragment-only target's fragment as well as a query string");
   assert.equal(payments.profile.git_repo_url, "https://[REDACTED]@git.example.com/org/payments.git");
   assert.equal(portal.profile.git_repo_url, "https://git.example.com/org/portal.git?[REDACTED]");
   assert.deepEqual(portal.profile.custom_fields, [
@@ -1065,7 +1079,7 @@ test("rule 9: the exported bundle, the zip, the assess payloads, and the access 
   ], "pair names that normalize to accesskey or secretkey are credential-shaped, and a non-credential pair keeps its value");
   assert.deepEqual(portal.profile.settings, { sca_enabled: true, access_key: "[REDACTED]", "secret-key": "[REDACTED]" }, "access_key and secret-key are redacted as direct keys with the key names kept");
   assert.equal(payments.profile.name, "Payments", "non-credential profile fields stay verbatim");
-  const [configuration] = scanCoverage.dynamic_analysis.scan_configurations;
+  const [configuration, spaConfiguration] = scanCoverage.dynamic_analysis.scan_configurations;
   assert.deepEqual(configuration, {
     analysis_id: "an-1",
     scan_id: "scan-1",
@@ -1076,9 +1090,13 @@ test("rule 9: the exported bundle, the zip, the assess payloads, and the access 
     crawl_script_present: true,
     allowed_host_count: 1,
   }, "the DAST configuration is projected to verdict fields with the authentication tree redacted");
+  assert.equal(spaConfiguration.scan_id, "scan-2");
   const control13 = payloads[0].findings.find((item) => item.id === "VERACODE-13");
   assert.equal(control13.status, "fail");
-  assert.deepEqual(control13.evidence.crawl_disabled_scans, ["Portal DAST:https://portal.example.com/?[REDACTED]"], "the scan label scrubs the target URL query string");
+  assert.deepEqual(control13.evidence.crawl_disabled_scans, [
+    "Portal DAST:https://portal.example.com/?[REDACTED]",
+    "Portal DAST:https://spa.example.com/app",
+  ], "the scan label scrubs the target URL query string and drops a fragment");
 
   const accessControls = fileNamed("core_data/access-controls.json");
   const credentialRecord = accessControls.api_credentials_by_user["u-2"];
