@@ -627,12 +627,14 @@ function scrubRememberedSecrets(text: string): string {
 /**
  * The data-side pass (rule 9, data-side carrier class) for every string a snapshot, evidence list,
  * summary, core_data file, or tool payload keeps from an API response: the remembered secrets in every
- * form, then the carrier stage. It has no bare-token stage, so prose identifiers (a UUID, a sys_id, a
- * name such as prod-us-east-2026) stay while a header line, URL credential, assignment, or configured
- * secret embedded in a description, name, or note goes.
+ * form, then the carrier stage (which takes JWTs and PEM blocks), then the vendor-prefixed token shapes
+ * (`sk_live_`, `xoxb-`, `ghp_`, `AKIA`, and the rest of VENDOR_TOKEN_PATTERN), unambiguous credential
+ * shapes with no identifier collision. It has no generic bare-run stage, so prose identifiers (a UUID, a
+ * sys_id, a name such as prod-us-east-2026) stay while a header line, URL credential, assignment,
+ * configured secret, or vendor token embedded in a description, name, or note goes.
  */
 function scrubDataText(text: string): string {
-  return scrubCarriers(scrubRememberedSecrets(text));
+  return scrubCarriers(scrubRememberedSecrets(text)).replace(VENDOR_TOKEN_PATTERN, REDACTED);
 }
 
 /**

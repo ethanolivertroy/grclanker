@@ -44,7 +44,7 @@ import { assertSecretFragmentsAbsent, readBundleFiles, readZipEntries } from "./
 import { CONFIG_CANARIES, assertConfigLoaderMatrix, configLoaderCases } from "./helpers/config-loader-matrix.mjs";
 import { assertFixedTextsSurvive, collectFixedTexts, collectThrownMessage, collectToolTexts, logLines } from "./helpers/fixed-text-survival.mjs";
 import { assertFragmentsAbsent, assertPlantedValuesWellFormed } from "./helpers/planted-values.mjs";
-import { CONFIGURED_SECRET_CANARIES, assertTextFieldCarriers, carrierSuffix, injectingFetch } from "./helpers/text-field-carriers.mjs";
+import { BARE_TOKEN_CONTROL, CONFIGURED_SECRET_CANARIES, VENDOR_TOKEN_CANARIES, assertTextFieldCarriers, carrierSuffix, injectingFetch } from "./helpers/text-field-carriers.mjs";
 import { assertDeepCanariesWellFormed, assertDeepNesting, deepFields, plantingFetch } from "./helpers/deep-nesting.mjs";
 import { ESCAPE_CANARIES, ESCAPE_CANARY_PLANTED_VALUES, escapeBoundaryTrace } from "./helpers/escape-boundary.mjs";
 import { assertScrubBoundary } from "./helpers/scrub-boundary-matrix.mjs";
@@ -3048,6 +3048,11 @@ test("rule 9 data side: a credential carried in any free-text field of any Pager
   const healthyTexts = await harvest(false);
   const texts = await harvest(true);
   assertTextFieldCarriers(assert, texts, { configuredSecrets, healthyTexts });
+  // Ruling 6 on the snapshot walker itself: a vendor-prefixed token, a JWT, and a PEM block go bare; the generic run stays.
+  assert.deepEqual(
+    redactSnapshot({ note: `key ${VENDOR_TOKEN_CANARIES.stripeLiveKey} end`, jwt: `jwt ${VENDOR_TOKEN_CANARIES.jwt} end`, pem: `-----BEGIN PRIVATE KEY-----\n${VENDOR_TOKEN_CANARIES.pemBody}\n-----END PRIVATE KEY-----`, id: `id ${BARE_TOKEN_CONTROL} end` }),
+    { note: "key [REDACTED] end", jwt: "jwt [REDACTED] end", pem: "[REDACTED]", id: `id ${BARE_TOKEN_CONTROL} end` },
+  );
 });
 
 /**

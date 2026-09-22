@@ -7,9 +7,11 @@
  * `injectingFetch` wraps an integration's healthy fixture: every JSON response has the planted text
  * appended to every text-like string field, so every collector sees every form. The planted text is
  * the fifteen carrier forms reviewer B's `text-field-carriers` probe plants (each with its own random
- * alphanumeric token or a name-shaped value no shape rule removes), the integration's configured
- * secrets bare in prose (a remembered secret goes whatever its shape), the must-survive controls, and
- * a bare token that documents the ruling: no bare-token rule runs on the data side, so it stays.
+ * alphanumeric token or a name-shaped value no shape rule removes), the vendor-prefixed token shapes,
+ * a JWT, and a PEM block bare in prose (ruling 6: unambiguous credential shapes go on the data side too),
+ * the integration's configured secrets bare in prose (a remembered secret goes whatever its shape), the
+ * must-survive controls, and a bare token that documents the ruling: the generic bare-run rule does not
+ * run on the data side, so it stays.
  *
  * Leak assertions check every window of every planted value at lengths 6 through 24
  * (`assertFragmentsAbsent`); the fixture self-check proves no window occurs in the healthy outputs.
@@ -50,6 +52,33 @@ export const CARRIER_TOKENS = Object.freeze([
 
 /** The bare token the ruling keeps on the data side (informational control: it must survive). */
 export const BARE_TOKEN_CONTROL = "wwajkCRRybmRR5pnM9XsZv8c";
+
+/**
+ * Ruling 6 (reviewer B round 4 verdict): vendor-prefixed token shapes, JWTs, and PEM blocks are unambiguous
+ * credential shapes with no identifier collision, so the data side removes them bare too, while the generic
+ * bare-run rule stays off it (BARE_TOKEN_CONTROL survives). One random value per shape; the PEM block plants
+ * its body line, the whole block goes with it.
+ */
+export const VENDOR_TOKEN_CANARIES = Object.freeze({
+  stripeLiveKey: "sk_live_Vb3RqZ8mKp2WxT9nJc4LyH7d",
+  githubToken: "ghp_Xq7Lm2Nv9Rt4Wy6Zb8Kc3Fh5Jd1PgSaUe",
+  awsAccessKeyId: "AKIAQ7X2M9V4R6T8W3Y5",
+  slackBotToken: "xoxb-4827391056-Zk9Qm2Pv7Rt4Wy6B",
+  jwt: "eyJXq7Lm2Nv9Rt4Wy6Zb8.eyJKc3Fh5Jd1PgSaUeQm7Z.x3Kp9Wm2Rt5Yv8Nb4Lc6Hd",
+  pemBody: "Qm7Zx3Kp9Wm2Rt5Yv8Nb4Lc6HdJf1Gs0TwVy2Xz",
+});
+
+/** The vendor shapes bare in prose: [form, text, planted values]. */
+export function vendorTokenForms() {
+  return [
+    ["bare Stripe live key", `key ${VENDOR_TOKEN_CANARIES.stripeLiveKey} end`, [VENDOR_TOKEN_CANARIES.stripeLiveKey]],
+    ["bare GitHub token", `pat ${VENDOR_TOKEN_CANARIES.githubToken} end`, [VENDOR_TOKEN_CANARIES.githubToken]],
+    ["bare AWS access key id", `id ${VENDOR_TOKEN_CANARIES.awsAccessKeyId} end`, [VENDOR_TOKEN_CANARIES.awsAccessKeyId]],
+    ["bare Slack bot token", `bot ${VENDOR_TOKEN_CANARIES.slackBotToken} end`, [VENDOR_TOKEN_CANARIES.slackBotToken]],
+    ["bare JWT", `jwt ${VENDOR_TOKEN_CANARIES.jwt} end`, [VENDOR_TOKEN_CANARIES.jwt]],
+    ["PEM block", `-----BEGIN PRIVATE KEY-----\n${VENDOR_TOKEN_CANARIES.pemBody}\n-----END PRIVATE KEY-----`, [VENDOR_TOKEN_CANARIES.pemBody]],
+  ];
+}
 
 /** Configured-secret canaries for the clients under test; no 6-character window is shared with any token above. */
 export const CONFIGURED_SECRET_CANARIES = Object.freeze({
@@ -94,15 +123,16 @@ export function carrierForms() {
   ];
 }
 
-/** Every value that must vanish: the fifteen forms' values plus the integration's configured secrets. */
+/** Every value that must vanish: the fifteen forms' values, the vendor shapes, and the integration's configured secrets. */
 export function plantedCarrierValues(configuredSecrets = []) {
-  return [...carrierForms().flatMap(([, , values]) => values), ...configuredSecrets];
+  return [...carrierForms().flatMap(([, , values]) => values), ...vendorTokenForms().flatMap(([, , values]) => values), ...configuredSecrets];
 }
 
-/** The text appended to every text-like field: the forms, the configured secrets bare in prose, the controls, and the bare token. */
+/** The text appended to every text-like field: the forms, the vendor shapes, the configured secrets bare in prose, the controls, and the bare token. */
 export function carrierSuffix(configuredSecrets = []) {
   return [
     ...carrierForms().map(([, text]) => text),
+    ...vendorTokenForms().map(([, text]) => text),
     ...configuredSecrets.map((secret) => `configured ${secret} in prose`),
     ...MUST_SURVIVE,
     BARE_TOKEN_CONTROL,
