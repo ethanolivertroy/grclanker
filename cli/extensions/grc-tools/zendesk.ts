@@ -308,8 +308,14 @@ function normalizeSubdomain(value: string): string {
   return candidate;
 }
 
+// A configured base URL keeps its scheme, host, port, and path prefix for requests; its
+// user-and-secret prefix, query, and fragment are dropped here so no request, the
+// configured origin a refused next link is compared against, or any output ever
+// carries them.
 function normalizeBaseUrl(rawUrl: string): string {
   const parsed = new URL(rawUrl.trim());
+  parsed.username = "";
+  parsed.password = "";
   parsed.hash = "";
   parsed.search = "";
   parsed.pathname = parsed.pathname.replace(/\/+$/, "");

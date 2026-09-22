@@ -306,13 +306,23 @@ function clampInteger(value: number | undefined, fallback: number, min: number, 
   return Math.trunc(clampNumber(value, fallback, min, max));
 }
 
+// A configured URL keeps its scheme, host, port, and path prefix for requests; its
+// user-and-secret prefix, query, and fragment are dropped here so no request, label,
+// or bundle file ever carries them.
 function normalizeBaseUrl(rawUrl: string): string {
   const candidate = /^https?:\/\//i.test(rawUrl.trim()) ? rawUrl.trim() : `https://${rawUrl.trim()}`;
   const parsed = new URL(candidate);
+  parsed.username = "";
+  parsed.password = "";
   parsed.hash = "";
   parsed.search = "";
   parsed.pathname = parsed.pathname.replace(/\/+$/, "");
   return parsed.toString().replace(/\/+$/, "");
+}
+
+/** The scheme and host of a configured URL, which is all a platform label or summary line writes. */
+function displayOrigin(url: string): string {
+  return new URL(url).origin;
 }
 
 function isTenableCloudHost(baseUrl: string): boolean {
@@ -3954,7 +3964,7 @@ export async function checkTenableAccess(clients: TenableClients): Promise<Tenab
   const failed = configured.filter((surface) => surface.status === "not_readable");
   const observedRefusals = [...new Set(forbidden.map((surface) => surface.httpStatus).filter((code): code is number => code !== null))].sort();
   const status = configured.length > 0 && readable.length === configured.length && callerIsAdministrator !== false ? "healthy" : "limited";
-  const platform = [vm ? `Tenable Vulnerability Management ${vm.getConfig().baseUrl}${vm.getConfig().fedramp ? " (FedRAMP)" : ""}` : undefined, sc ? `Tenable Security Center ${sc.getConfig().baseUrl}` : undefined].filter(Boolean).join(" + ");
+  const platform = [vm ? `Tenable Vulnerability Management ${displayOrigin(vm.getConfig().baseUrl)}${vm.getConfig().fedramp ? " (FedRAMP)" : ""}` : undefined, sc ? `Tenable Security Center ${displayOrigin(sc.getConfig().baseUrl)}` : undefined].filter(Boolean).join(" + ");
   const roleNote = usersProbe.surface.status === "not_configured"
     ? "Caller role could not be determined because no Tenable Vulnerability Management tenant is configured."
     : usersProbe.surface.status !== "readable"
@@ -4073,7 +4083,7 @@ function buildExecutiveSummary(config: TenableResolvedConfig, assessments: Tenab
   const lines = [
     "# Tenable Audit Executive Summary",
     "",
-    `Platform: ${config.vm ? `${config.vm.baseUrl}${config.vm.fedramp ? " (FedRAMP)" : ""}` : "Tenable Vulnerability Management not configured"}${config.securityCenter ? `; Tenable Security Center ${config.securityCenter.baseUrl}` : ""}`,
+    `Platform: ${config.vm ? `${displayOrigin(config.vm.baseUrl)}${config.vm.fedramp ? " (FedRAMP)" : ""}` : "Tenable Vulnerability Management not configured"}${config.securityCenter ? `; Tenable Security Center ${displayOrigin(config.securityCenter.baseUrl)}` : ""}`,
     `Generated: ${new Date().toISOString()}`,
     "",
     "## Result Counts",

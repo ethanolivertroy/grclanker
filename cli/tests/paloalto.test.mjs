@@ -1253,6 +1253,9 @@ const CANARY_NAMED = "sess-canary-COOKIE-31415926535897";
 // closing quote, so its absence proves that rule ran.
 const CANARY_QUOTED = "sess-qtdv-QCARRY-16180339887498";
 const CANARIES = [CANARY_BEARER, CANARY_SESSION, CANARY_API_KEY, CANARY_URL_TOKEN, CANARY_NAMED, CANARY_QUOTED];
+// The secret of a user-and-secret prefix on a configured URL (rule 9: a configured URL is
+// written as scheme and host only).
+const CANARY_USERINFO = "Vd4kRt8Hq2ZpWn6Ys1CxJ7";
 const CANARY_URL = `https://api.example.com/v1/x?token=${CANARY_URL_TOKEN}`;
 // The sentence ends in one compound header line: an unquoted cookie carrying the session
 // canary, then a quoted name-shaped X-PAN-KEY value, then a Content-Type that must keep its
@@ -1281,7 +1284,7 @@ function assertNoCanary(text, label, canaries = CANARIES) {
 // rules run on their own (hyphenated words with one digit group), the Slack path (the
 // documented T/B/secret shape, the whole path being the secret), and the PAN-OS password
 // (every character class an encoding changes).
-const PLANTED_CREDENTIALS = [...Object.values(LOADER_CANARIES), ...CANARIES, ...Object.values(FAKE_PANOS_SECRETS), ...Object.values(FAKE_PRISMA_SECRETS), FIXTURE_SECRET_KEY, FIXTURE_PANOS_PASSWORD];
+const PLANTED_CREDENTIALS = [...Object.values(LOADER_CANARIES), ...CANARIES, CANARY_USERINFO, ...Object.values(FAKE_PANOS_SECRETS), ...Object.values(FAKE_PRISMA_SECRETS), FIXTURE_SECRET_KEY, FIXTURE_PANOS_PASSWORD];
 const SHAPED_CREDENTIALS = new Set([CANARY_NAMED, CANARY_QUOTED, FIXTURE_SECRET_KEY, FAKE_PRISMA_SECRETS.slackWebhookPath, FIXTURE_PANOS_PASSWORD]);
 
 // A proxy or load balancer error page: HTML with header lines and a URL carrying a token.
@@ -2405,7 +2408,8 @@ test("the registered tools scrub error strings end to end over HTTP: access chec
       const upstreamResponse = failing.has(key)
         ? failing.get(key)()
         : key === "prisma-cloud /meta_info"
-          ? jsonResponse({ twistlockUrl: `http://127.0.0.1:${port}/compute` })
+          // The server-supplied console URL carries a user-and-secret prefix too.
+          ? jsonResponse({ twistlockUrl: `http://compute-operator:${CANARY_USERINFO}@127.0.0.1:${port}/compute` })
           : await upstream(target, init);
       const text = await upstreamResponse.text();
       response.writeHead(upstreamResponse.status, Object.fromEntries(upstreamResponse.headers));
@@ -2417,13 +2421,17 @@ test("the registered tools scrub error strings end to end over HTTP: access chec
 
   const tools = new Map();
   registerPaloaltoTools({ registerTool: (tool) => tools.set(tool.name, tool) });
+  // Both configured URLs carry a user-and-secret prefix: fetch itself refuses a URL with
+  // credentials, so a request that leaves proves the prefix was dropped at configuration,
+  // and the labels prove every configured URL is written as scheme and host only.
   const baseArgs = {
-    prisma_api_url: `http://127.0.0.1:${port}/prisma`,
+    prisma_api_url: `http://prisma-operator:${CANARY_USERINFO}@127.0.0.1:${port}/prisma`,
     prisma_access_key_id: "key",
     prisma_secret_key: FIXTURE_SECRET_KEY,
-    panos_hosts: `http://127.0.0.1:${port}/panos`,
+    panos_hosts: `http://panos-operator:${CANARY_USERINFO}@127.0.0.1:${port}/panos`,
     panos_api_key: "LUFRPT-key",
   };
+  const URL_USERS = /prisma-operator|panos-operator|compute-operator/;
   const run = async (name, extra = {}) => {
     const tool = tools.get(name);
     return tool.execute("call-sweep", tool.prepareArguments({ ...baseArgs, ...extra }));
@@ -2438,10 +2446,36 @@ test("the registered tools scrub error strings end to end over HTTP: access chec
   const echoedMarkers = { "prisma-cloud": ECHOED_MARKER, "prisma-compute": ECHOED_MARKER, "pan-os": ECHOED_MARKER };
 
   try {
+    // Healthy first: the labels of both products and the console are scheme and host, and
+    // nothing carries the prefix or the URL user.
+    const healthy = await run("paloalto_check_access");
+    assert.notEqual(healthy.isError, true, healthy.content[0].text);
+    assert.equal(healthy.details.status, "healthy", JSON.stringify(healthy.details.notes));
+    assert.ok(healthy.details.notes.includes(`Prisma Cloud API: http://127.0.0.1:${port}`), JSON.stringify(healthy.details.notes));
+    assert.ok(healthy.details.notes.includes(`Prisma Cloud Compute console: http://127.0.0.1:${port}`), JSON.stringify(healthy.details.notes));
+    assert.deepEqual([...new Set(healthy.details.surfaces.map((probe) => probe.target))].sort(), [`127.0.0.1:${port}`, `http://127.0.0.1:${port}`], "surface targets are the host or the scheme and host");
+    assertNoWindow(JSON.stringify(healthy), CANARY_USERINFO, "healthy access check");
+    assert.doesNotMatch(JSON.stringify(healthy), URL_USERS, "the URL users are not written either");
+    const healthyBundle = await run("paloalto_export_audit_bundle", { output_dir: createTempBase("grclanker-paloalto-tool-export-") });
+    assert.notEqual(healthyBundle.isError, true, healthyBundle.content[0].text);
+    const healthyFiles = readBundleFiles(healthyBundle.details.output_dir);
+    for (const [name, text] of [...healthyFiles, ...readZipEntries(healthyBundle.details.zip_path)]) {
+      assertNoWindow(text, CANARY_USERINFO, `healthy bundle ${name}`);
+      assert.doesNotMatch(text, URL_USERS, `healthy bundle ${name} names a URL user`);
+    }
+    const healthyMetadata = JSON.parse(healthyFiles.get("metadata.json"));
+    assert.deepEqual(
+      { prisma_api_url: healthyMetadata.prisma_api_url, prisma_compute_url: healthyMetadata.prisma_compute_url, panos_hosts: healthyMetadata.panos_hosts },
+      { prisma_api_url: `http://127.0.0.1:${port}`, prisma_compute_url: `http://127.0.0.1:${port}`, panos_hosts: [`127.0.0.1:${port}`] },
+    );
+    assert.match(healthyFiles.get(join("compliance", "executive_summary.md")), new RegExp(`^Prisma Cloud: http://127\\.0\\.0\\.1:${port}$`, "m"));
+    assert.match(healthyFiles.get(join("compliance", "executive_summary.md")), new RegExp(`^PAN-OS devices: 127\\.0\\.0\\.1:${port}$`, "m"));
+    assert.equal(JSON.parse(healthyFiles.get(join("core_data", "prisma_cloud.json"))).compute.console_url, `http://127.0.0.1:${port}`);
+
     for (const shape of [
-      { name: "structured-error", prisma: jsonCanaryResponse, panos: xmlCanaryResponse, markers: STRUCTURED_MARKERS, canaries: CANARIES },
-      { name: "html-502", prisma: htmlCanaryResponse, panos: htmlCanaryResponse, markers: HTML_MARKERS, canaries: CANARIES },
-      { name: "echoed-secrets", prisma: echoedSecretsJson, panos: echoedSecretsXml, markers: echoedMarkers, canaries: [...CANARIES, ...crossProductForms] },
+      { name: "structured-error", prisma: jsonCanaryResponse, panos: xmlCanaryResponse, markers: STRUCTURED_MARKERS, canaries: [...CANARIES, CANARY_USERINFO] },
+      { name: "html-502", prisma: htmlCanaryResponse, panos: htmlCanaryResponse, markers: HTML_MARKERS, canaries: [...CANARIES, CANARY_USERINFO] },
+      { name: "echoed-secrets", prisma: echoedSecretsJson, panos: echoedSecretsXml, markers: echoedMarkers, canaries: [...CANARIES, ...crossProductForms, CANARY_USERINFO] },
     ]) {
       failing.clear();
       failing.set("prisma-cloud /v2/policy", shape.prisma);

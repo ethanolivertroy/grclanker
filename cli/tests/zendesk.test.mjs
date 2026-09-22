@@ -2555,6 +2555,9 @@ const CANARY_URL = `https://api.example.com/v1/x?token=${CANARY_URL_TOKEN}`;
 // A value only a refused foreign-origin next link carries, in its query and as its
 // password: it proves the link itself is never recorded and never requested.
 const CANARY_NEXT_LINK = "Vq7mR2tZk9XcP4nB6wLd3Y";
+// The secret of a user-and-secret prefix on a configured base URL (rule 9: a configured URL
+// is dropped to scheme, host, and path at configuration and never written).
+const CANARY_USERINFO = "Hn3xKw8Rq5TzM2pY7vB4Ld";
 // A JSON text stringified into a string value arrives with its quotes escaped (\"): the
 // header pairs and the credential pair inside it are carriers one level down, and each
 // keeps its escaped quotes around the marker so the text stays well formed.
@@ -2604,7 +2607,7 @@ function assertNoCanary(text, label, canaries = CANARIES) {
 // rules run on their own (hyphenated words with one digit group), the plain lowercase word
 // that only the Bearer scheme gives away, and the Slack path (the documented T/B/secret
 // shape, the whole path being the secret).
-const PLANTED_CREDENTIALS = [...Object.values(LOADER_CANARIES), ...CANARIES, CANARY_NEXT_LINK, ...Object.values(FAKE_ZENDESK_SECRETS), FIXTURE_API_TOKEN];
+const PLANTED_CREDENTIALS = [...Object.values(LOADER_CANARIES), ...CANARIES, CANARY_NEXT_LINK, CANARY_USERINFO, ...Object.values(FAKE_ZENDESK_SECRETS), FIXTURE_API_TOKEN];
 const SHAPED_CREDENTIALS = new Set([CANARY_NAMED, CANARY_QUOTED, CANARY_PLAIN, FIXTURE_API_TOKEN, FAKE_ZENDESK_SECRETS.slackWebhookPath]);
 
 // Every HTTP surface ZendeskApiClient reads, keyed by path (the three /audit_logs reads are
@@ -3812,4 +3815,49 @@ test("foreign-origin next link over HTTP: a refused link demotes the dependent f
     assert.equal(redactErrorText(text), text, `${name}: the reason is fixed text the general scrub leaves alone`);
     if (!name.includes("core_data") && !name.includes("QUICK_REFERENCE.md")) assert.ok(!text.includes("[REDACTED]"), `${name}: carries no marker with nothing planted`);
   }
+});
+
+test("rule 9: a user-and-secret prefix on a configured base URL is dropped at configuration, so no request, the configured origin a refused next link is compared against, no tool result, and no bundle file carries it", async () => {
+  const configured = `https://zd-operator:${CANARY_USERINFO}@acme.zendesk.com/api/v2/`;
+  // Positive control: the URL parser keeps the prefix, so only the loader can drop it.
+  assert.equal(new URL(configured).password, CANARY_USERINFO);
+  const config = resolveZendeskConfiguration({ subdomain: "acme", email: "auditor@example.com", api_token: FIXTURE_API_TOKEN, base_url: configured }, {}, createTempBase("grclanker-zendesk-userinfo-home-"));
+  assert.equal(config.baseUrl, "https://acme.zendesk.com/api/v2");
+  assertNoWindow(JSON.stringify(config), CANARY_USERINFO, "resolved configuration");
+
+  const routes = await healthyHttpRoutes();
+  const foreignUsersLink = `https://evil.example.com/api/v2/users?page%5Bafter%5D=${CANARY_NEXT_LINK}`;
+  const log = [];
+  const client = new ZendeskApiClient(config, {
+    fetchImpl: async (url, init) => {
+      log.push({ url, authorization: headerValue(init.headers, "authorization") });
+      const key = zendeskRouteKey(url);
+      if (key === "/users") return jsonResponse({ ...routes["/users"], meta: { has_more: true, after_cursor: "c2" }, links: { next: foreignUsersLink } });
+      const payload = routes[key];
+      if (payload === undefined) throw new Error(`unrouted Zendesk request: ${url}`);
+      return jsonResponse(payload);
+    },
+    sleep: async () => {},
+  });
+  const access = await checkZendeskAccess(client);
+  const results = await runAllAssessments(client);
+  const exported = await exportZendeskAuditBundle(client, config, createTempBase("grclanker-zendesk-userinfo-"), { now: () => NOW });
+  const files = readBundleFiles(exported.outputDir);
+  const zip = readZipEntries(exported.zipPath);
+
+  assert.ok(log.length >= 22, `the run made its reads (${log.length})`);
+  for (const entry of log) {
+    assert.ok(entry.url.startsWith(`${CONFIGURED_ORIGIN}/api/v2/`), `every request went to the configured origin without the prefix: ${entry.url}`);
+    assert.deepEqual({ username: new URL(entry.url).username, password: new URL(entry.url).password }, { username: "", password: "" }, `request URL carries no credentials: ${entry.url}`);
+    assert.equal(entry.authorization, `Basic ${FIXTURE_BASIC_CREDENTIAL}`, "the credential travels in the header, never in the URL");
+  }
+  // The refusal names the configured origin as scheme and host, never the prefix.
+  const team = access.surfaces.find((surface) => surface.name === "team_members");
+  assert.match(team.truncationReason, FOREIGN_HOST_REASON);
+  const outputs = [["check_access", JSON.stringify(access)], ...results.map((result) => [result.category, JSON.stringify(result)]), ...files, ...[...zip].map(([name, text]) => [`zip:${name}`, text])];
+  for (const [name, text] of outputs) {
+    assertNoWindow(text, CANARY_USERINFO, `${name}: the configured URL's secret`);
+    assert.ok(!text.includes("zd-operator"), `${name}: the configured URL's user is not written either`);
+  }
+  assert.match(files.get(join("compliance", "executive_summary.md")), /^Subdomain: acme$/m);
 });

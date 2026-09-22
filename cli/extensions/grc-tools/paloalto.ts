@@ -383,13 +383,28 @@ function clampNumber(value: number | undefined, fallback: number, min: number, m
   return Math.min(Math.max(parsed, min), max);
 }
 
+// A configured URL keeps its scheme, host, port, and path prefix for requests; its
+// user-and-secret prefix, query, and fragment are dropped here so no request, label,
+// or bundle file ever carries them.
 function normalizeBaseUrl(rawUrl: string): string {
   const withScheme = /^https?:\/\//i.test(rawUrl.trim()) ? rawUrl.trim() : `https://${rawUrl.trim()}`;
   const parsed = new URL(withScheme);
+  parsed.username = "";
+  parsed.password = "";
   parsed.hash = "";
   parsed.search = "";
   parsed.pathname = parsed.pathname.replace(/\/+$/, "");
   return parsed.toString().replace(/\/+$/, "");
+}
+
+/** The scheme and host of a configured URL, which is all a label, note, or metadata field writes. */
+function displayOrigin(url: string): string {
+  return new URL(url).origin;
+}
+
+/** The host (and port) of a configured PAN-OS device URL or hostname, which is how the device is named everywhere it is written. */
+function hostLabel(url: string): string {
+  return new URL(url).host;
 }
 
 function parseTimeoutSeconds(value: number | undefined): number {
@@ -1716,7 +1731,7 @@ export function resolvePaloaltoConfiguration(
     throw new Error("PAN-OS requires PANOS_API_KEY or both PANOS_USERNAME and PANOS_PASSWORD for keygen.");
   }
   const panos = panosHosts.map((host) => ({
-    host,
+    host: hostLabel(normalizeBaseUrl(host)),
     baseUrl: normalizeBaseUrl(host),
     apiKey: panosApiKey,
     username: panosApiKey ? undefined : panosUsername,
@@ -2681,7 +2696,7 @@ export async function collectComputeSnapshot(client: ComputeSource): Promise<Com
   const cloudDiscovery = await paged("cloud discovery", () => client.listCloudDiscovery());
   const ciScans = await paged("ci scans", () => client.listCiScans());
   return {
-    consoleUrl: client.baseUrl,
+    consoleUrl: displayOrigin(client.baseUrl),
     defenders,
     runtimeContainerPolicy,
     complianceContainerPolicy,
@@ -4201,32 +4216,34 @@ export async function checkPaloaltoAccess(clients: PaloaltoClients): Promise<Pal
   if (clients.prisma) {
     const prisma = clients.prisma;
     products.push("prisma-cloud");
-    notes.push(`Prisma Cloud API: ${prisma.apiUrl}`);
+    const prismaOrigin = displayOrigin(prisma.apiUrl);
+    notes.push(`Prisma Cloud API: ${prismaOrigin}`);
     surfaces.push(
-      await readableSurface("prisma-cloud", prisma.apiUrl, "compliance_posture", PRISMA_READ_ENDPOINTS["compliance posture"], () => prisma.getCompliancePosture(), () => 1),
-      await readableSurface("prisma-cloud", prisma.apiUrl, "alert_rules", PRISMA_READ_ENDPOINTS["alert rules"], () => prisma.listAlertRules(), arrayCount),
-      await readableSurface("prisma-cloud", prisma.apiUrl, "open_alerts", PRISMA_READ_ENDPOINTS["open alerts"], () => prisma.collectOpenAlerts(DEFAULT_ALERT_PAGE_SIZE), pagedCount, pagedPartial),
-      await readableSurface("prisma-cloud", prisma.apiUrl, "policies", PRISMA_READ_ENDPOINTS.policies, () => prisma.listPolicies(), arrayCount),
-      await readableSurface("prisma-cloud", prisma.apiUrl, "cloud_accounts", PRISMA_READ_ENDPOINTS["cloud accounts"], () => prisma.listCloudAccounts(), arrayCount),
-      await readableSurface("prisma-cloud", prisma.apiUrl, "account_groups", PRISMA_READ_ENDPOINTS["account groups"], () => prisma.listAccountGroups(), arrayCount),
-      await readableSurface("prisma-cloud", prisma.apiUrl, "user_roles", PRISMA_READ_ENDPOINTS["user roles"], () => prisma.listUserRoles(), arrayCount),
+      await readableSurface("prisma-cloud", prismaOrigin, "compliance_posture", PRISMA_READ_ENDPOINTS["compliance posture"], () => prisma.getCompliancePosture(), () => 1),
+      await readableSurface("prisma-cloud", prismaOrigin, "alert_rules", PRISMA_READ_ENDPOINTS["alert rules"], () => prisma.listAlertRules(), arrayCount),
+      await readableSurface("prisma-cloud", prismaOrigin, "open_alerts", PRISMA_READ_ENDPOINTS["open alerts"], () => prisma.collectOpenAlerts(DEFAULT_ALERT_PAGE_SIZE), pagedCount, pagedPartial),
+      await readableSurface("prisma-cloud", prismaOrigin, "policies", PRISMA_READ_ENDPOINTS.policies, () => prisma.listPolicies(), arrayCount),
+      await readableSurface("prisma-cloud", prismaOrigin, "cloud_accounts", PRISMA_READ_ENDPOINTS["cloud accounts"], () => prisma.listCloudAccounts(), arrayCount),
+      await readableSurface("prisma-cloud", prismaOrigin, "account_groups", PRISMA_READ_ENDPOINTS["account groups"], () => prisma.listAccountGroups(), arrayCount),
+      await readableSurface("prisma-cloud", prismaOrigin, "user_roles", PRISMA_READ_ENDPOINTS["user roles"], () => prisma.listUserRoles(), arrayCount),
       // Evaluated after the probes above logged in, so the tenant-scoped path is named when login returned a prismaId.
-      await readableSurface("prisma-cloud", prisma.apiUrl, "integrations", prismaIntegrationsEndpoint(prisma.tenantPrismaId), () => prisma.listIntegrations(), arrayCount),
+      await readableSurface("prisma-cloud", prismaOrigin, "integrations", prismaIntegrationsEndpoint(prisma.tenantPrismaId), () => prisma.listIntegrations(), arrayCount),
     );
     const compute = await resolveComputeClient(clients);
     if (compute) {
       products.push("prisma-compute");
-      notes.push(`Prisma Cloud Compute console: ${compute.baseUrl}`);
+      const computeOrigin = displayOrigin(compute.baseUrl);
+      notes.push(`Prisma Cloud Compute console: ${computeOrigin}`);
       surfaces.push(
-        await readableSurface("prisma-compute", compute.baseUrl, "defenders", COMPUTE_READ_ENDPOINTS.defenders, () => compute.listDefenders(DEFAULT_COMPUTE_PAGE_SIZE), pagedCount, pagedPartial),
-        await readableSurface("prisma-compute", compute.baseUrl, "runtime_container_policy", COMPUTE_READ_ENDPOINTS["runtime container policy"], () => compute.getRuntimeContainerPolicy(), (value) => asRecords(asObject(value)?.rules).length),
-        await readableSurface("prisma-compute", compute.baseUrl, "compliance_container_policy", COMPUTE_READ_ENDPOINTS["compliance container policy"], () => compute.getComplianceContainerPolicy(), (value) => asRecords(asObject(value)?.rules).length),
-        await readableSurface("prisma-compute", compute.baseUrl, "compliance_host_policy", COMPUTE_READ_ENDPOINTS["compliance host policy"], () => compute.getComplianceHostPolicy(), (value) => asRecords(asObject(value)?.rules).length),
-        await readableSurface("prisma-compute", compute.baseUrl, "vulnerability_image_policy", COMPUTE_READ_ENDPOINTS["vulnerability image policy"], () => compute.getVulnerabilityImagePolicy(), (value) => asRecords(asObject(value)?.rules).length),
-        await readableSurface("prisma-compute", compute.baseUrl, "registry_settings", COMPUTE_READ_ENDPOINTS["registry settings"], () => compute.getRegistrySettings(), (value) => asRecords(asObject(value)?.specifications).length),
-        await readableSurface("prisma-compute", compute.baseUrl, "vulnerability_stats", COMPUTE_READ_ENDPOINTS["vulnerability stats"], () => compute.getVulnerabilityStats(), arrayCount),
-        await readableSurface("prisma-compute", compute.baseUrl, "cloud_discovery", COMPUTE_READ_ENDPOINTS["cloud discovery"], () => compute.listCloudDiscovery(DEFAULT_COMPUTE_PAGE_SIZE), pagedCount, pagedPartial),
-        await readableSurface("prisma-compute", compute.baseUrl, "ci_scans", COMPUTE_READ_ENDPOINTS["ci scans"], () => compute.listCiScans(DEFAULT_COMPUTE_PAGE_SIZE), pagedCount, pagedPartial),
+        await readableSurface("prisma-compute", computeOrigin, "defenders", COMPUTE_READ_ENDPOINTS.defenders, () => compute.listDefenders(DEFAULT_COMPUTE_PAGE_SIZE), pagedCount, pagedPartial),
+        await readableSurface("prisma-compute", computeOrigin, "runtime_container_policy", COMPUTE_READ_ENDPOINTS["runtime container policy"], () => compute.getRuntimeContainerPolicy(), (value) => asRecords(asObject(value)?.rules).length),
+        await readableSurface("prisma-compute", computeOrigin, "compliance_container_policy", COMPUTE_READ_ENDPOINTS["compliance container policy"], () => compute.getComplianceContainerPolicy(), (value) => asRecords(asObject(value)?.rules).length),
+        await readableSurface("prisma-compute", computeOrigin, "compliance_host_policy", COMPUTE_READ_ENDPOINTS["compliance host policy"], () => compute.getComplianceHostPolicy(), (value) => asRecords(asObject(value)?.rules).length),
+        await readableSurface("prisma-compute", computeOrigin, "vulnerability_image_policy", COMPUTE_READ_ENDPOINTS["vulnerability image policy"], () => compute.getVulnerabilityImagePolicy(), (value) => asRecords(asObject(value)?.rules).length),
+        await readableSurface("prisma-compute", computeOrigin, "registry_settings", COMPUTE_READ_ENDPOINTS["registry settings"], () => compute.getRegistrySettings(), (value) => asRecords(asObject(value)?.specifications).length),
+        await readableSurface("prisma-compute", computeOrigin, "vulnerability_stats", COMPUTE_READ_ENDPOINTS["vulnerability stats"], () => compute.getVulnerabilityStats(), arrayCount),
+        await readableSurface("prisma-compute", computeOrigin, "cloud_discovery", COMPUTE_READ_ENDPOINTS["cloud discovery"], () => compute.listCloudDiscovery(DEFAULT_COMPUTE_PAGE_SIZE), pagedCount, pagedPartial),
+        await readableSurface("prisma-compute", computeOrigin, "ci_scans", COMPUTE_READ_ENDPOINTS["ci scans"], () => compute.listCiScans(DEFAULT_COMPUTE_PAGE_SIZE), pagedCount, pagedPartial),
       );
     } else {
       notes.push(`Prisma Cloud Compute not reachable: ${clients.computeUnavailableReason ?? "unknown"} Controls 7-11, 24, and 25 fall back to manual findings.`);
@@ -4491,7 +4508,7 @@ function buildExecutiveSummary(config: PaloaltoResolvedConfig, assessments: Palo
     "# Palo Alto Networks Audit Bundle: Executive Summary",
     "",
     `Generated: ${new Date().toISOString()}`,
-    `Prisma Cloud: ${config.prisma ? config.prisma.apiUrl : "not configured"}`,
+    `Prisma Cloud: ${config.prisma ? displayOrigin(config.prisma.apiUrl) : "not configured"}`,
     `PAN-OS devices: ${config.panos.length > 0 ? config.panos.map((item) => item.host).join(", ") : "not configured"}`,
     "",
     "## Result Counts",
@@ -4629,7 +4646,7 @@ export async function exportPaloaltoAuditBundle(
   await write("QUICK_REFERENCE.md", `${buildQuickReference(access, assessments)}\n`);
   await writeJson("metadata.json", {
     generated_at: new Date().toISOString(),
-    prisma_api_url: config.prisma?.apiUrl ?? null,
+    prisma_api_url: config.prisma ? displayOrigin(config.prisma.apiUrl) : null,
     prisma_compute_url: prismaSnapshot?.compute?.consoleUrl ?? null,
     panos_hosts: config.panos.map((item) => item.host),
     tls_verification: config.verifyTls,

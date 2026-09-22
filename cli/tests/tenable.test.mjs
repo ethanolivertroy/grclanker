@@ -1484,6 +1484,9 @@ const CANARY_PLAIN = "uhfsumxscmhlzj";
 // that carries a quoted value through its closing quote, so its absence proves that rule ran.
 const CANARY_QUOTED = "sess-qtdv-QCARRY-16180339887498";
 const CANARIES = [CANARY_BEARER, CANARY_SESSION, CANARY_API_KEY, CANARY_URL_TOKEN, CANARY_NAMED, CANARY_PLAIN, CANARY_QUOTED];
+// The secret of a user-and-secret prefix on a configured URL (rule 9: a configured URL is
+// written as scheme and host only).
+const CANARY_USERINFO = "Uq7pXw2ZmK9vT4bR3sN8Lc";
 const CANARY_URL = `https://api.example.com/v1/x?token=${CANARY_URL_TOKEN}`;
 // A JSON text stringified into a string value arrives with its quotes escaped (\"): the
 // header pairs and the credential pair inside it are carriers one level down, and each
@@ -1635,7 +1638,10 @@ test("the registered tools scrub error strings end to end over HTTP: access chec
   await new Promise((resolveListen) => server.listen(0, "127.0.0.1", resolveListen));
   const { port } = server.address();
   const configFile = join(mkdtempSync(join(tmpdir(), "tenable-tool-config-")), "config.yaml");
-  writeFileSync(configFile, `url: http://127.0.0.1:${port}\naccess_key: ${FIXTURE_ACCESS_KEY}\nsecret_key: ${FIXTURE_SECRET_KEY}\n`);
+  // The configured URL carries a user-and-secret prefix: fetch itself refuses a URL with
+  // credentials, so a request that leaves proves the prefix was dropped at configuration,
+  // and the platform label proves the URL is written as scheme and host only.
+  writeFileSync(configFile, `url: http://sc-operator:${CANARY_USERINFO}@127.0.0.1:${port}\naccess_key: ${FIXTURE_ACCESS_KEY}\nsecret_key: ${FIXTURE_SECRET_KEY}\n`);
 
   const tools = new Map();
   registerTenableTools({ registerTool: (tool) => tools.set(tool.name, tool) });
@@ -1655,12 +1661,13 @@ test("the registered tools scrub error strings end to end over HTTP: access chec
     assert.ok(scProbes.length >= 4 && scProbes.every((probe) => probe.status === "readable"), JSON.stringify(healthy.details.surfaces));
     assert.ok(healthy.details.surfaces.every((probe) => probe.name.startsWith("sc_") || probe.status === "not_configured"), JSON.stringify(healthy.details.surfaces));
     assert.deepEqual(Object.values(failingSurfaces).filter((name) => !scProbes.some((probe) => probe.name === name)), [], "the failing surfaces are probed by name");
-    for (const secret of [FIXTURE_ACCESS_KEY, FIXTURE_SECRET_KEY]) assertNoWindow(JSON.stringify(healthy), secret, "healthy access check");
+    for (const secret of [FIXTURE_ACCESS_KEY, FIXTURE_SECRET_KEY, CANARY_USERINFO]) assertNoWindow(JSON.stringify(healthy), secret, "healthy access check");
+    assert.ok(!JSON.stringify(healthy).includes("sc-operator"), "the URL user is not written either");
 
     for (const shape of [
-      { name: "html-502", make: htmlCanaryResponse, marker: HTML_CANARY_MARKER, canaries: [...CANARIES, ...ECHOED_FORMS] },
-      { name: "json-400", make: jsonCanaryResponse, marker: JSON_CANARY_MARKER, canaries: [...CANARIES, ...ECHOED_FORMS] },
-      { name: "echoed-secrets", make: echoedSecretsResponse, marker: ECHOED_MARKER, canaries: ECHOED_FORMS },
+      { name: "html-502", make: htmlCanaryResponse, marker: HTML_CANARY_MARKER, canaries: [...CANARIES, ...ECHOED_FORMS, CANARY_USERINFO] },
+      { name: "json-400", make: jsonCanaryResponse, marker: JSON_CANARY_MARKER, canaries: [...CANARIES, ...ECHOED_FORMS, CANARY_USERINFO] },
+      { name: "echoed-secrets", make: echoedSecretsResponse, marker: ECHOED_MARKER, canaries: [...ECHOED_FORMS, CANARY_USERINFO] },
     ]) {
       failing.clear();
       for (const surface of Object.keys(failingSurfaces)) failing.set(surface, shape.make);
@@ -1706,10 +1713,63 @@ test("the registered tools scrub error strings end to end over HTTP: access chec
       // The keys came from the config file alone: metadata names the file, never the values.
       const metadata = JSON.parse(files.get("metadata.json"));
       assert.ok(metadata.source_chain.some((entry) => entry === `config:${configFile}`), JSON.stringify(metadata.source_chain));
+      assert.equal(metadata.platform, `Tenable Security Center http://127.0.0.1:${port}`, "metadata writes the configured URL as scheme and host");
     }
   } finally {
     server.close();
   }
+});
+
+test("rule 9: a user-and-secret prefix on a configured Vulnerability Management or Security Center URL leaves with no request and reaches no platform label, metadata.json, executive summary, assessment, or bundle file; configured URLs are written as scheme and host only", async () => {
+  const configured = {
+    url: `https://vm-operator:${CANARY_USERINFO}@cloud.tenable.com/`,
+    sc_url: `https://sc-operator:${CANARY_USERINFO}@sc.example.internal:8443/`,
+    sc_access_key: SC_FIXTURE.sc_access_key,
+    sc_secret_key: SC_FIXTURE.sc_secret_key,
+  };
+  // Positive control: the URL parser keeps the prefix, so only the loader can drop it.
+  assert.equal(new URL(configured.url).password, CANARY_USERINFO);
+  assert.equal(new URL(configured.sc_url).username, "sc-operator");
+  const config = vmConfig(configured);
+  assert.equal(config.vm.baseUrl, "https://cloud.tenable.com");
+  assert.equal(config.securityCenter.baseUrl, "https://sc.example.internal:8443");
+  assertNoWindow(JSON.stringify(config), CANARY_USERINFO, "resolved configuration");
+
+  const routes = { ...healthyRoutes(), ...healthyScRoutes() };
+  const requests = [];
+  const fallback = routerFetch(routes);
+  const clients = createTenableClients(config, {
+    fetchImpl: async (url, init) => {
+      requests.push(String(url));
+      return fallback(url, init);
+    },
+    sleepImpl: async () => {},
+    exportPollMs: 0,
+    exportTimeoutMs: 5_000,
+  });
+  const access = await checkTenableAccess(clients);
+  assert.equal(access.status, "healthy", JSON.stringify(access.notes));
+  assert.equal(access.platform, "Tenable Vulnerability Management https://cloud.tenable.com + Tenable Security Center https://sc.example.internal:8443");
+  const results = await runAll(clients, { expectedAssetCount: 2 });
+  const bundle = await exportTenableAuditBundle(clients, mkdtempSync(join(tmpdir(), "tenable-userinfo-")), { now: NOW });
+  const files = readBundleFiles(bundle.outputDir);
+  const zipEntries = readZipEntries(bundle.zipPath);
+
+  assert.ok(requests.length >= 30, `both platforms were read (${requests.length} requests)`);
+  for (const url of requests) {
+    assertNoWindow(url, CANARY_USERINFO, `request ${url}`);
+    assert.deepEqual({ username: new URL(url).username, password: new URL(url).password }, { username: "", password: "" }, `request URL carries no credentials: ${url}`);
+  }
+  assert.ok(requests.some((url) => url.startsWith("https://cloud.tenable.com/")) && requests.some((url) => url.startsWith("https://sc.example.internal:8443/rest/")), "requests went to both configured hosts");
+  for (const [label, text] of [["access check", JSON.stringify(access)], ["assessments", JSON.stringify(results)], ...files, ...zipEntries]) {
+    assertNoWindow(text, CANARY_USERINFO, label);
+    assert.ok(!/vm-operator|sc-operator/.test(text), `${label} names the URL user`);
+    assert.ok(!text.includes("[REDACTED]") || label === "QUICK_REFERENCE.md", `${label} needed no marker: the prefix never reached a sink`);
+  }
+  const metadata = JSON.parse(files.get("metadata.json"));
+  assert.equal(metadata.platform, access.platform);
+  assert.match(files.get(join("compliance", "executive_summary.md")), /^Platform: https:\/\/cloud\.tenable\.com; Tenable Security Center https:\/\/sc\.example\.internal:8443$/m);
+  assert.ok(basename(bundle.outputDir).startsWith("cloud.tenable.com-audit-bundle"), `the bundle directory is named for the host: ${basename(bundle.outputDir)}`);
 });
 
 test("export polling, vendor reason strings, Security Center error_msg, and timeouts pass through the redacting sink", async () => {
@@ -1878,7 +1938,7 @@ test("exportTenableAuditBundle never writes policy credentials, scanner linking 
 // shape are the name-shaped values that prove the configured-secret pass and the carrier
 // rules run on their own (hyphenated words with one digit group) and the plain lowercase
 // word that only the Bearer scheme gives away.
-const PLANTED_CREDENTIALS = [...Object.values(LOADER_CANARIES), ...CANARIES, ...Object.values(FAKE_TENABLE_SECRETS), FIXTURE_ACCESS_KEY, FIXTURE_SECRET_KEY];
+const PLANTED_CREDENTIALS = [...Object.values(LOADER_CANARIES), ...CANARIES, CANARY_USERINFO, ...Object.values(FAKE_TENABLE_SECRETS), FIXTURE_ACCESS_KEY, FIXTURE_SECRET_KEY];
 const SHAPED_CREDENTIALS = new Set([CANARY_NAMED, CANARY_QUOTED, CANARY_PLAIN, FIXTURE_ACCESS_KEY, FIXTURE_SECRET_KEY]);
 
 test("fixture self-check: planted credentials are alphanumeric and random-looking, share no 6-character window with each other, and no 6-character window of any occurs in the fixtures' legitimate text", async () => {
