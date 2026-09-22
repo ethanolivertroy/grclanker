@@ -544,6 +544,21 @@ function isSecretKey(key: string): boolean {
   return SECRET_KEY_PATTERN.test(key) && !SECRET_KEY_ALLOWLIST.has(key);
 }
 
+/**
+ * The documented Slack token shape: bot `xoxb-` and user `xoxp-` strings (docs.slack.dev/authentication/tokens) and
+ * the rotating access form `xoxe.xoxp-` (docs.slack.dev/authentication/using-token-rotation). token_format evidence is
+ * derived only from a match, so a configured value outside the shape (a misconfigured value, a proxy or gateway token,
+ * a pasted OAuth code) renders the fixed prefix "unknown" and never any substring of itself.
+ */
+const SLACK_TOKEN_PREFIX_PATTERN = /^(xoxe\.)?(xox[a-z])-/;
+const UNKNOWN_TOKEN_PREFIX = "unknown";
+
+function describeTokenFormat(token: string): JsonRecord {
+  const match = SLACK_TOKEN_PREFIX_PATTERN.exec(token);
+  if (!match) return { prefix: UNKNOWN_TOKEN_PREFIX, rotating_format: false };
+  return { prefix: `${match[1] ?? ""}${match[2]}`, rotating_format: match[1] === "xoxe." };
+}
+
 /** Shorter configured values are not scrubbed by exact match, so a degenerate token cannot blank unrelated text. */
 export const MIN_KNOWN_SECRET_LENGTH = 8;
 
@@ -1161,11 +1176,7 @@ export class SlackApiClient {
   }
 
   describeToken(): JsonRecord {
-    const token = this.config.token ?? this.config.botToken ?? "";
-    return {
-      prefix: token.replace(/^(xoxe\.)?(xox[a-z])-.*$/, "$1$2") || "unknown",
-      rotating_format: token.startsWith("xoxe."),
-    };
+    return describeTokenFormat(this.config.token ?? this.config.botToken ?? "");
   }
 }
 

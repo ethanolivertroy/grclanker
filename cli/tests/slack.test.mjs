@@ -804,6 +804,80 @@ test("rule 9: the audit bundle and its zip never contain planted credentials", a
   assert.ok(entries.some((entry) => entry.name.endsWith("_errors.log") && /HTTP 403\) error=invalid_auth$/m.test(entry.content)));
 });
 
+/** Configured values outside the documented xox shape: 40 mixed-case alphanumerics with no prefix, and a bearer-style value. */
+const OPAQUE_TOKEN_CANARY = "Qm7Vt2Xr9Lk4Pz8Hd3Wn6Bj5Fy1Gc0Sa4Ue8Ni2T";
+const BEARER_TOKEN_CANARY = "Rk3Zp9Ws2Qx7Lm4Vb8Nc1Hd6Ty5Gf0Jq";
+const UNKNOWN_TOKEN_FORMAT = { prefix: "unknown", rotating_format: false };
+
+test("rule 9: token_format.prefix is unknown for a configured token outside the documented xox shape, and no 6-to-24 window of the token reaches evidence, the tool result, the bundle, _errors.log, or the zip", async () => {
+  assert.equal(OPAQUE_TOKEN_CANARY.length, 40);
+  assert.equal(redactErrorText(OPAQUE_TOKEN_CANARY), OPAQUE_TOKEN_CANARY, "positive control: no shape pattern catches an unprefixed value, so only the prefix rule keeps it out of evidence");
+  assert.equal(redactErrorText(`Bearer ${BEARER_TOKEN_CANARY}`), SLACK_REDACTION_MARKER, "positive control: the bearer shape is caught by the scrub, so the evidence field is the only unguarded path");
+
+  const tools = new Map();
+  registerSlackTools({ registerTool: (tool) => tools.set(tool.name, tool) });
+  for (const [label, token, canary] of [["opaque 40-character value", OPAQUE_TOKEN_CANARY, OPAQUE_TOKEN_CANARY], ["bearer-style value", `Bearer ${BEARER_TOKEN_CANARY}`, BEARER_TOKEN_CANARY]]) {
+    const args = { token, scim_token: "scim-test", org_id: "E1" };
+    const client = makeClient(compliantFixture, args);
+    assert.deepEqual(client.describeToken(), UNKNOWN_TOKEN_FORMAT, label);
+
+    const collected = [];
+    const integrations = await assessSlackIntegrations(client);
+    const rotation = byId(integrations, "SLACK-APP-07");
+    assert.deepEqual(rotation.evidence.token_format, UNKNOWN_TOKEN_FORMAT, `${label}: SLACK-APP-07 evidence`);
+    assert.match(rotation.summary, /Configured token uses the non-rotating format\. Manual evidence:/, `${label}: the summary names the format, not the value`);
+    collected.push(JSON.stringify(integrations), JSON.stringify(await checkSlackAccess(client)));
+    const all = await assessAll(client);
+    collected.push(JSON.stringify(all.findings), JSON.stringify(all.summaries), JSON.stringify(all.errors));
+
+    const config = resolveSlackConfiguration(args, EMPTY_ENV);
+    const base = createTempBase("grclanker-slack-token-prefix-");
+    try {
+      const bundle = await exportSlackAuditBundle(client, config, base);
+      const paths = listFilesRecursively(bundle.outputDir);
+      assert.ok(paths.length >= 20, `${label}: a full bundle was written`);
+      for (const file of paths) assertNoCanaryWindows(assert, readFileSync(file, "utf8"), [canary], `${label}: ${file.slice(bundle.outputDir.length + 1)}`);
+      const exported = JSON.parse(readFileSync(join(bundle.outputDir, "core_data/integrations.json"), "utf8"));
+      assert.deepEqual(exported.evidence.find((item) => item.id === "SLACK-APP-07").evidence.token_format, UNKNOWN_TOKEN_FORMAT, `${label}: the bundle carries the fixed marker, not a redaction of the value`);
+      const entries = readZipEntries(bundle.zipPath).filter((entry) => !entry.name.endsWith("/"));
+      assert.equal(entries.length, paths.length, `${label}: every bundle file is in the zip`);
+      for (const entry of entries) assertNoCanaryWindows(assert, entry.content, [canary], `${label}: zip ${entry.name}`);
+      if (existsSync(join(bundle.outputDir, "_errors.log"))) collected.push(readFileSync(join(bundle.outputDir, "_errors.log"), "utf8"));
+    } finally {
+      rmSync(base, { recursive: true, force: true });
+    }
+    assertNoCanaryWindows(assert, collected.join("\n"), [canary], `${label}: findings, summaries, errors, access surfaces, and _errors.log`);
+
+    const previous = process.env.SLACK_CONFIG_FILE;
+    process.env.SLACK_CONFIG_FILE = "";
+    try {
+      for (const name of ["slack_assess_integrations", "slack_check_access"]) {
+        const tool = tools.get(name);
+        const result = await withStubbedFetch(compliantFixture, () => tool.execute("call-1", tool.prepareArguments({ ...args })));
+        assert.equal(result.isError, undefined, `${label}: ${name} succeeds`);
+        assertNoCanaryWindows(assert, result, [canary], `${label}: ${name} result`);
+        if (name === "slack_assess_integrations") assert.deepEqual(result.details.findings.find((item) => item.id === "SLACK-APP-07").evidence.token_format, UNKNOWN_TOKEN_FORMAT, `${label}: tool evidence`);
+      }
+    } finally {
+      if (previous === undefined) delete process.env.SLACK_CONFIG_FILE;
+      else process.env.SLACK_CONFIG_FILE = previous;
+    }
+  }
+
+  for (const [token, prefix, rotating_format] of [["xoxb-111-222-abcdefghijklmnop", "xoxb", false], ["xoxp-111-222-abcdefghijklmnop", "xoxp", false], ["xoxe.xoxp-111-222-abcdefghijklmnop", "xoxe.xoxp", true], ["xoxe-1-abcdefghijklmnop", "xoxe", false]]) {
+    assert.deepEqual(makeClient(compliantFixture, { token, scim_token: "scim-test", org_id: "E1" }).describeToken(), { prefix, rotating_format }, token);
+  }
+  assert.deepEqual(makeClient(compliantFixture, { bot_token: "xoxb-111-222-abcdefghijklmnop", scim_token: "scim-test", org_id: "E1" }).describeToken(), { prefix: "xoxb", rotating_format: false }, "a bot-only configuration describes the bot token");
+  for (const outsideShape of ["xoxb", "xoxb_111-222", "XOXB-111-222-abcdefghijklmnop", "xoxe.111-222", "xapp-1-A1-abcdefghijklmnop", "xwfp-abcdefghijklmnop"]) {
+    assert.deepEqual(makeClient(compliantFixture, { token: outsideShape, scim_token: "scim-test", org_id: "E1" }).describeToken(), UNKNOWN_TOKEN_FORMAT, `${outsideShape}: app-level, workflow, and malformed values lie outside the xox?- shape`);
+  }
+  const rotating = await assessSlackIntegrations(makeClient(compliantFixture, { token: "xoxe.xoxp-111-222-abcdefghijklmnop", scim_token: "scim-test", org_id: "E1" }));
+  assert.deepEqual(byId(rotating, "SLACK-APP-07").evidence.token_format, { prefix: "xoxe.xoxp", rotating_format: true });
+  assert.match(byId(rotating, "SLACK-APP-07").summary, /Configured token uses the rotating \(xoxe\.\) format\. Manual evidence:/);
+  const bot = await assessSlackIntegrations(makeClient(compliantFixture, { token: "xoxb-111-222-abcdefghijklmnop", scim_token: "scim-test", org_id: "E1" }));
+  assert.deepEqual(byId(bot, "SLACK-APP-07").evidence.token_format, { prefix: "xoxb", rotating_format: false });
+});
+
 test("rule 10: every pagination loop reports truncation on its cap exit and dependent findings do not pass", async () => {
   const withOverride = (override) => makeClient((request) => override(request) ?? compliantFixture(request));
   const method = (request) => request.pathname.replace(/^\/api\//, "");
