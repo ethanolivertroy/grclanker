@@ -28,10 +28,14 @@ function createTempBase(prefix) {
   return mkdtempSync(join(tmpdir(), prefix));
 }
 
+/** The configured bearer and ACS tokens: random alphanumerics so every 6 to 24 character window of them is a leak signal. */
+const SAMPLE_TOKEN = "2xwtSsxGESNew4jyGcRvZHsM";
+const SAMPLE_ACS_TOKEN = "BZJaRfcKYwJx5gBWUypXAc4a";
+
 function sampleConfig(overrides = {}) {
   return {
     url: "https://splunk.example.com:8089",
-    token: "test-bearer-token",
+    token: SAMPLE_TOKEN,
     acsBaseUrl: "https://admin.splunk.com",
     verifyTls: true,
     timeoutMs: 30000,
@@ -242,7 +246,7 @@ test("resolveSplunkConfiguration prefers explicit args over env over config file
   assert.throws(() => resolveSplunkConfiguration({ config_file: join(base, "missing.json"), url: "https://x.example.com:8089" }, {}), /SPLUNK_TOKEN or both/);
 });
 
-/** Canaries planted on malformed config lines; every 8-character window of each is distinct so a partial quote is caught too. */
+/** Canaries planted on malformed config lines: random alphanumerics, so no 6-character window of one occurs in a legitimate fixture value or in another canary. */
 const CONFIG_CANARIES = {
   unquoted: "Yc6RtV3nJ8kMp4Sd",
   short: "Gz5Kq8Wn2Xt",
@@ -256,16 +260,41 @@ const LIBRARY_ERROR_WORDING = [
   "not a directory", "Unexpected token", "Expected double-quoted", "Bad control character", "at position",
 ];
 
-function fragmentsOf(value, size = 8) {
-  const fragments = [];
-  for (let index = 0; index + size <= value.length; index += 1) fragments.push(value.slice(index, index + size));
-  return fragments;
+/** Every substring of a planted credential at lengths 6 through 24 (sliding windows), so a partial echo such as a JSON.parse window or a truncated token cannot pass a leak assertion. */
+function windowsOf(value, { min = 6, max = 24 } = {}) {
+  const windows = new Set();
+  for (let size = Math.min(min, value.length); size <= Math.min(max, value.length); size += 1) {
+    for (let index = 0; index + size <= value.length; index += 1) windows.add(value.slice(index, index + size));
+  }
+  return [...windows];
+}
+
+/** The window set of every planted secret, for bundle, zip, and payload scans through assertSecretsAbsent. */
+function leakWindows(secrets) {
+  return [...new Set(secrets.flatMap((secret) => windowsOf(secret)))];
+}
+
+function assertNoWindowOf(text, secret, label) {
+  for (const window of windowsOf(secret)) assert.ok(!text.includes(window), `${label} carries a window (${window}) of the planted credential: ${text.slice(0, 300)}`);
+}
+
+/**
+ * Fixture self-check: the legitimate values of a fixture (everything it serves
+ * with the planted canaries themselves removed, longest first) contain no
+ * 6-character window of any canary, so a window hit in an output can only be a leak.
+ */
+function assertFixtureFreeOfCanaryWindows(legitimateText, canaries, label) {
+  let legitimate = legitimateText;
+  for (const canary of [...canaries].sort((a, b) => b.length - a.length)) legitimate = legitimate.split(canary).join("");
+  for (const canary of canaries) {
+    for (const window of windowsOf(canary, { min: 6, max: 6 })) {
+      assert.ok(!legitimate.includes(window), `${label}: legitimate fixture text contains the window ${window} of canary ${canary}`);
+    }
+  }
 }
 
 function assertConfigErrorText(text, { path, code, line, column, canaries }, label) {
-  for (const canary of canaries) {
-    for (const fragment of fragmentsOf(canary)) assert.ok(!text.includes(fragment), `${label} carries a fragment (${fragment}) of ${canary}: ${text}`);
-  }
+  for (const canary of canaries) assertNoWindowOf(text, canary, `${label} (${canary})`);
   for (const wording of LIBRARY_ERROR_WORDING) assert.ok(!text.includes(wording), `${label} repeats library wording "${wording}": ${text}`);
   assert.ok(text.includes(path), `${label} names the path ${path}: ${text}`);
   assert.ok(text.includes(`(${code})`), `${label} carries the code ${code}: ${text}`);
@@ -305,8 +334,9 @@ test("rule 9: Splunk config loader errors carry only the path, position, and cod
     const library = thrownBy(() => JSON.parse(testCase.text));
     assert.match(library.message, testCase.control, `${testCase.name}: positive control uses the JSON.parse message`);
     for (const canary of testCase.leaks) {
-      assert.ok(fragmentsOf(canary).some((fragment) => library.message.includes(fragment)), `${testCase.name}: positive control, JSON.parse quotes a window of the canary`);
+      assert.ok(windowsOf(canary).some((window) => library.message.includes(window)), `${testCase.name}: positive control, JSON.parse quotes a window of the canary`);
     }
+    assertFixtureFreeOfCanaryWindows(testCase.text, allCanaries, `${testCase.name} config fixture`);
 
     const expected = { path: configFile, code: "INVALID_JSON", line: testCase.line, column: testCase.column, canaries: allCanaries };
     const thrown = thrownBy(() => resolveSplunkConfiguration({ config_file: configFile }, {}));
@@ -360,7 +390,7 @@ test("SplunkApiClient sends bearer tokens, output_mode=json, and pages with coun
   assert.equal(roles.truncated, false);
   const roleCalls = seen.filter((item) => item.pathname === "/services/authorization/roles");
   assert.equal(roleCalls.length, 3);
-  assert.ok(roleCalls.every((item) => item.auth === "Bearer test-bearer-token"));
+  assert.ok(roleCalls.every((item) => item.auth === `Bearer ${SAMPLE_TOKEN}`));
   assert.ok(roleCalls.every((item) => item.search.includes("output_mode=json") && item.search.includes("count=3")));
   assert.ok(roleCalls.some((item) => item.search.includes("offset=6")));
 });
@@ -866,7 +896,7 @@ test("exportSplunkAuditBundle writes core_data, analysis, compliance reports, qu
   assert.equal(findings.find((item) => item.id === "SPLUNK-AUTH-06").status, "manual");
   const metadata = JSON.parse(readFileSync(join(result.outputDir, "metadata.json"), "utf8"));
   assert.equal(metadata.url, "https://splunk.example.com:8089");
-  assert.ok(!readFileSync(join(result.outputDir, "core_data/hec_inputs.json"), "utf8").includes("test-bearer-token"));
+  assertNoWindowOf(readFileSync(join(result.outputDir, "core_data/hec_inputs.json"), "utf8"), SAMPLE_TOKEN, "core_data/hec_inputs.json");
 
   const rerun = await exportSplunkAuditBundle(client(partialFailure).client, sampleConfig(), base);
   assert.notEqual(rerun.outputDir, result.outputDir);
@@ -874,32 +904,33 @@ test("exportSplunkAuditBundle writes core_data, analysis, compliance reports, qu
   assert.ok(existsSync(result.zipPath) && existsSync(rerun.zipPath));
 });
 
+/** Planted secrets: random alphanumerics (the Splunk ciphertexts keep their $7$ and $1$ prefixes), so no 6-character window of one occurs in a legitimate fixture value. */
 const FAKE_SECRETS = {
-  pass4SymmKey: "FAKE_PASS4SYMMKEY_1",
-  clusteringKey: "$7$FAKE_CIPHERTEXT_1",
-  sslKeysfilePassword: "FAKE_SSLKEYSFILE_PASSWORD_1",
-  proxyPassword: "FAKE_PROXY_PASSWORD_1",
-  httpEventCollectorToken: "FAKE_HEC_OUT_TOKEN_1",
-  discoveryKey: "FAKE_PASS4SYMMKEY_2",
-  outputsSslPassword: "FAKE_SSL_PASSWORD_1",
-  soapPassword: "FAKE_SOAP_PASSWORD_1",
-  rsaAccessKey: "FAKE_RSA_ACCESS_KEY_1",
-  bindPassword: "FAKE_BIND_PASSWORD_1",
-  duoSecret: "FAKE_DUO_SECRET_1",
-  hashedValue: "$1$FAKE_HASH_1",
-  hecToken: "FAKE_HEC_TOKEN_1",
-  inputsSslPassword: "FAKE_SSL_PASSWORD_2",
-  s2sPassword: "FAKE_S2S_PASSWORD_1",
-  webSslPassword: "FAKE_WEB_SSL_PASSWORD_1",
-  hecInputToken: "FAKE_HEC_TOKEN_2",
-  webhookToken: "FAKE_WEBHOOK_TOKEN_1",
-  slackToken: "FAKE_SLACK_TOKEN_1",
-  pagerdutyKey: "FAKE_PD_KEY_1",
-  customToken: "FAKE_CUSTOM_TOKEN_1",
-  splText: "FAKE_SPL_SECRET_1",
-  queryToken: "FAKE_QUERY_TOKEN_1",
-  acsHecToken: "FAKE_ACS_HEC_TOKEN_1",
-  errorBody: "FAKE_BODY_SECRET_1",
+  pass4SymmKey: "8Kw9ExUHb7Y3CbFJdr",
+  clusteringKey: "$7$gkWJcf98TvLBnPKkHJ",
+  sslKeysfilePassword: "4975Q3dY7v42SawGus",
+  proxyPassword: "9UuF9u63aYHpsFUmeu",
+  httpEventCollectorToken: "e3PWkuJSQgQbcjKyRz",
+  discoveryKey: "gR7Efd8kk72J87EFaW",
+  outputsSslPassword: "axJE3DCPasdNvvp9Tt",
+  soapPassword: "A4w2XUNjYgBBfCXhsp",
+  rsaAccessKey: "SZWRrhMsc6XjB5LURB",
+  bindPassword: "5ZAR84KxJV5mqCKQej",
+  duoSecret: "Bfk7B9GfWxkLEgkV7C",
+  hashedValue: "$1$RbDk5JPFPuQHvDnKvd",
+  hecToken: "9XWrk2ZvMFkvKRxUd9",
+  inputsSslPassword: "pMRkZj27UYBXajtvFySbdSbQ",
+  s2sPassword: "Heb5VKCAf2VT5MSKXbdBZ46c",
+  webSslPassword: "78MufNpWDNdJmpjX9tMhHjW3",
+  hecInputToken: "tsaMTrUYqUkYNN8aZKTjmmLR",
+  webhookToken: "ZFEs9XDcfwfCFxxfyVD9FqcU",
+  slackToken: "8bsWKgqWCQn7fRJgD6eKk4jr",
+  pagerdutyKey: "C9sKx6YMZee52aA9hKavCtjB",
+  customToken: "nXH5v29gTgy6CsrHAQahPfRn",
+  splText: "6tNNaNeeqP4vcQX6UjQh2zpM",
+  queryToken: "ShWLCDwUTEn9pFsdCc38ZLD7",
+  acsHecToken: "Vh27ecdg7ce6eqg3eZ3Y3FyN",
+  errorBody: "b4cmZJu28ZhHvQfDrMff734X",
 };
 
 const SECRET_FIXTURE = {
@@ -959,7 +990,9 @@ test("rule 9: the exported bundle, the zip, the assess payloads, and the access 
     return fetchImpl(input, init);
   };
   const api = new SplunkApiClient(sampleConfig(), { fetchImpl: withErrorBody, retryDelayMs: 0 });
-  const secrets = [...Object.values(FAKE_SECRETS), "test-bearer-token"];
+  const planted = [...Object.values(FAKE_SECRETS), SAMPLE_TOKEN, SAMPLE_ACS_TOKEN];
+  assertFixtureFreeOfCanaryWindows(JSON.stringify({ fixture: SECRET_FIXTURE, config: sampleConfig(), errorBody: `<html>${FAKE_SECRETS.errorBody}</html>` }), planted, "secret fixture");
+  const secrets = leakWindows(planted);
 
   const base = createTempBase("grclanker-splunk-rule9-");
   const result = await exportSplunkAuditBundle(api, sampleConfig(), base);
@@ -1012,15 +1045,14 @@ test("rule 9: the exported bundle, the zip, the assess payloads, and the access 
   assert.match(files.get("_errors.log"), /failed \(400\): non-JSON body \(text\/html, \d+ bytes\)/);
 
   const payloads = JSON.stringify([...(await runAllAssessments(api)), await checkSplunkAccess(api)]);
-  for (const secret of secrets) {
-    assert.ok(!payloads.includes(secret), `${secret} appears in an assess or access check payload`);
-  }
+  assertSecretsAbsent(assert, new Map([["assess results and access check", payloads]]), secrets, "tool payloads");
 
   const cloud = { ...SECRET_FIXTURE, "/services/server/info": [entry("server-info", { version: "9.3.2411", product_type: "splunk_cloud", instance_type: "cloud" })] };
   const acs = { "/inputs/http-event-collectors": { "http-event-collectors": [{ spec: { name: "firehose", allowedIndexes: ["main"], defaultSourcetype: "aws:firehose", disabled: false, useACK: true }, token: FAKE_SECRETS.acsHecToken }] } };
-  const cloudData = JSON.stringify(await assessSplunkDataProtection(client(cloud, { acs }, { stack: "acme-stack", acsToken: "acs-jwt" }).client));
-  assert.ok(!cloudData.includes(FAKE_SECRETS.acsHecToken));
-  assert.ok(!cloudData.includes("acs-jwt"));
+  assertFixtureFreeOfCanaryWindows(JSON.stringify({ cloud, acs }), planted, "cloud secret fixture");
+  const cloudData = JSON.stringify(await assessSplunkDataProtection(client(cloud, { acs }, { stack: "acme-stack", acsToken: SAMPLE_ACS_TOKEN }).client));
+  assertNoWindowOf(cloudData, FAKE_SECRETS.acsHecToken, "ACS data protection payload");
+  assertNoWindowOf(cloudData, SAMPLE_ACS_TOKEN, "ACS data protection payload");
 });
 
 function pagedFetch(fixture, path, page) {
@@ -1161,10 +1193,12 @@ test("rule 1 corollary: each multi-inventory finding drops below pass and names 
   assert.equal(byId(cloudData, "SPLUNK-DP-16").evidence.source, "acs:/inputs/http-event-collectors");
 });
 
-const SURFACE_CANARIES = ["CANARY_BEARER_S1", "CANARY_SESSION_S1", "CANARY_APIKEY_S1", "CANARY_URL_TOKEN_S1"];
-const SURFACE_HTML_BODY = "<html><body><h1>502 Bad Gateway</h1><p>Authorization: Bearer CANARY_BEARER_S1</p><p>Set-Cookie: JSESSIONID=CANARY_SESSION_S1; Path=/</p><p>api_key=CANARY_APIKEY_S1</p><p>Retry at https://api.example.com/v1/x?token=CANARY_URL_TOKEN_S1 later.</p></body></html>";
+/** Canaries planted in the failing surface's body, each inside a carrier: random alphanumerics. */
+const SURFACE = { bearer: "uWQ2n4KZw5xqJTLmL8aPbeVM", session: "8unXXkWgbbr7qQW5V2Hwk6TxNVmsW85e", apiKey: "kpQxJQTYthwEcws2ZMA2rZKS4MGBhLvK", urlToken: "8fyNDV2sTJnfNYZdjFVkhDGCDd4gg4ML" };
+const SURFACE_CANARIES = Object.values(SURFACE);
+const SURFACE_HTML_BODY = `<html><body><h1>502 Bad Gateway</h1><p>Authorization: Bearer ${SURFACE.bearer}</p><p>Set-Cookie: JSESSIONID=${SURFACE.session}; Path=/</p><p>api_key=${SURFACE.apiKey}</p><p>Retry at https://api.example.com/v1/x?token=${SURFACE.urlToken} later.</p></body></html>`;
 const SURFACE_JSON_BODY = {
-  messages: [{ type: "ERROR", text: "Denied while fetching https://api.example.com/v1/x?token=CANARY_URL_TOKEN_S1 for this key; Authorization: Bearer CANARY_BEARER_S1; api_key=CANARY_APIKEY_S1; session_id=CANARY_SESSION_S1" }],
+  messages: [{ type: "ERROR", text: `Denied while fetching https://api.example.com/v1/x?token=${SURFACE.urlToken} for this key; Authorization: Bearer ${SURFACE.bearer}; api_key=${SURFACE.apiKey}; session_id=${SURFACE.session}` }],
 };
 
 function endpointOf(url) {
@@ -1207,6 +1241,12 @@ test("rule 9: every Splunk surface that fails with a 502 HTML page or a JSON err
   await runAllAssessments(discovery.client);
   const endpoints = [...new Set(discovery.seen)].filter((endpoint) => endpoint !== "/services/auth/login");
   assert.ok(endpoints.length >= 18, `every access check probe, collector, ACS path, and the audit search are discovered (${endpoints.length})`);
+  assertFixtureFreeOfCanaryWindows(
+    JSON.stringify({ cloud, acs, config: sampleConfig(acsConfig), bodies: [SURFACE_HTML_BODY, SURFACE_JSON_BODY] }),
+    SURFACE_CANARIES,
+    "surface canary fixture",
+  );
+  const secrets = leakWindows(SURFACE_CANARIES);
 
   for (const endpoint of endpoints) {
     for (const variant of ["html", "json"]) {
@@ -1222,7 +1262,7 @@ test("rule 9: every Splunk surface that fails with a 502 HTML page or a JSON err
         ...[...files].map(([name, content]) => [`${label} bundle ${name}`, content]),
         ...[...readZipEntries(exported.zipPath)].map(([name, content]) => [`${label} zip ${name}`, content]),
       ]);
-      assertSecretsAbsent(assert, outputs, SURFACE_CANARIES, label);
+      assertSecretsAbsent(assert, outputs, secrets, label);
 
       // Wherever the error lands (access surface, errors array, a finding
       // summary quoting the cause, _errors.log), every string derived from
@@ -1350,7 +1390,7 @@ test("collection status: a denied snapshot is written to core_data as a not-coll
     assert.ok(!Array.isArray(file) && !Array.isArray(file.entries), `${name}: a denied snapshot is never written as an array`);
     assert.deepEqual(file, { collected: false, status: 403, endpoint, error: file.error }, `${name}: core_data carries the not-collected marker`);
     assert.match(file.error, /failed \(403\)/, `${name}: the marker error names the observed status`);
-    assert.match(readFileSync(join(exported.outputDir, "_errors.log"), "utf8"), new RegExp(`core_data/${name}: `));
+    assert.match(readFileSync(join(exported.outputDir, "_errors.log"), "utf8"), new RegExp(`^\\[core_data/${name}\\] Splunk request to `, "m"), `${name}: the _errors.log line is bracket-prefixed, so the dataset name never forms a carrier with the Splunk scheme word`);
 
     const surface = access.surfaces.find((item) => item.name === name);
     if (surface) {
@@ -1488,7 +1528,12 @@ test("rule 9: scrub boundary: a name-shaped value stays bare in prose and is rem
     ["Basic authentication is required", "Basic authentication is required"],
     ["InvalidAuthenticationToken: Access token has expired", "InvalidAuthenticationToken: Access token has expired"],
   ];
-  for (const [input, expected] of carriers) assert.equal(scrubErrorText(input), expected, input);
+  for (const [input, expected] of carriers) {
+    const scrubbed = scrubErrorText(input);
+    assert.equal(scrubbed, expected, input);
+    if (input.includes(name) && !expected.includes(name)) assertNoWindowOf(scrubbed, name, `carrier ${input}`);
+  }
+  assertNoWindowOf(scrubErrorText(bare, [name]), name, "configured secret in prose");
   const secret = 'top secret/value+1"x';
   const forms = {
     raw: secret,
@@ -1509,4 +1554,244 @@ test("rule 9: scrub boundary: a name-shaped value stays bare in prose and is rem
     "failed for /api/v1/users/aB3xZ9qL2mN8pR4tV7wY1/factors from /tmp/run-9b6rz9m4l55zg7/config.json and https://hooks.example.com/services/T0/[REDACTED]",
     "a token-shaped segment of a bare request target or file path is an identifier the run named; inside a URL it is a webhook token",
   );
+  assert.equal(
+    scrubErrorText("key wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY beside /servicesNS/nobody/search/saved/searches/Errors/acl"),
+    "key [REDACTED] beside /servicesNS/nobody/search/saved/searches/Errors/acl",
+    "a random 40-character base64 run is an AWS secret access key; a bare path of word segments is a request target",
+  );
+  assert.equal(
+    scrubErrorText("casing frozenTimePeriodInSecs maxTotalDataSizeMB externalTwoFactorAuthVendor QaZwSxEdCrFvTgByHn aBcDeFgHiJkLmNoPqRs ABcdEFghIJklMNopQR"),
+    "casing frozenTimePeriodInSecs maxTotalDataSizeMB externalTwoFactorAuthVendor [REDACTED] [REDACTED] [REDACTED]",
+    "camelCase identifiers whose words average three or more letters stay; alternating capitalized fragments and doubled-case runs are tokens",
+  );
+  assert.equal(
+    scrubErrorText("stanza [http://hec] httpEventCollectorToken=4f9c2b7e1d3a4c5b8e6f7a9b0c1d2e3f and sslPassword=hunter2x9 rejected"),
+    "stanza [http://hec] httpEventCollectorToken=[REDACTED] and sslPassword=[REDACTED] rejected",
+    "a credential-named key keeps its name once its value is replaced; the trailing = is not read as base64 padding",
+  );
+
+  // Must-keep table (addendum 7): every identifying string a summary may carry survives alone and inside a realistic sentence.
+  for (const value of SPLUNK_MUST_KEEP) {
+    assert.equal(scrubErrorText(value), value, `must keep bare: ${value}`);
+    for (const sentence of splunkSummarySentences(value)) assert.equal(scrubErrorText(sentence), sentence, `must keep in a sentence: ${sentence}`);
+  }
+});
+
+/** Every endpoint the Splunk client requests (splunkd REST, ACS, and the login and search job paths). */
+const SPLUNK_REQUESTED_PATHS = [
+  "/services/server/info",
+  "/services/authentication/current-context",
+  "/services/authentication/users",
+  "/services/authentication/providers/LDAP",
+  "/services/authentication/providers/SAML",
+  "/services/authorization/roles",
+  "/services/authorization/tokens",
+  "/services/auth/login",
+  "/services/admin/Duo-MFA",
+  "/services/admin/Rsa-MFA",
+  "/services/apps/local",
+  "/services/configs/conf-authentication",
+  "/services/configs/conf-audit",
+  "/services/configs/conf-inputs",
+  "/services/configs/conf-outputs",
+  "/services/configs/conf-server",
+  "/services/configs/conf-web",
+  "/services/data/indexes",
+  "/services/data/inputs/http",
+  "/services/data/inputs/tcp/cooked",
+  "/services/search/jobs",
+  "/servicesNS/-/-/data/lookup-table-files",
+  "/servicesNS/-/-/saved/searches",
+  "/servicesNS/-/-/storage/collections/config",
+  "/services/authorization/roles?output_mode=json&count=100&offset=200",
+  "acs:/inputs/http-event-collectors",
+  "acs:/access/search-api/ipallowlists",
+  "acs:/access/hec/ipallowlists",
+  "acs:/access/s2s/ipallowlists",
+  "acs:/access/search-ui/ipallowlists",
+  "/acme-stack/adminconfig/v2/inputs/http-event-collectors",
+];
+const SPLUNK_MUST_KEEP = [
+  ...SPLUNK_REQUESTED_PATHS,
+  ...SPLUNK_REQUESTED_PATHS.map((path) => `GET ${path}`),
+  "https://splunk.example.com:8089",
+  "https://acme.splunkcloud.com:8089",
+  "acme.splunkcloud.com",
+  "https://admin.splunk.com",
+  "acme-stack",
+  "prod-us-east-2026",
+  "splunk-prod-idx-01.example.gov:8089",
+  "tokens",
+  "core_data/tokens",
+  "[tokens]",
+  "[core_data/tokens]",
+  "hec-inputs",
+  "acs-hec",
+  "conf-authentication",
+  "saved-searches",
+  "lookup-table-files",
+  "kv-collections",
+  "tcp-cooked-inputs",
+  "server/info",
+  "authType",
+  "SAML",
+  "LDAP",
+  "Scripted",
+  "ProxySSO",
+  "externalTwoFactorAuthVendor",
+  "frozenTimePeriodInSecs",
+  "httpEventCollectorToken",
+  "maxTotalDataSizeMB",
+  "sslVerifyServerCert",
+  "enableSplunkdSSL",
+  "allowRemoteLogin",
+  "minPasswordLength",
+  "InvalidAuthenticationToken",
+  "Duo",
+  "RSA",
+  "admin",
+  "sc_admin",
+  "auditor",
+  "svc-audit-reader",
+  "jane.doe@acme-prod.example.gov",
+  "nobody",
+  "splunk-system-user",
+  "power",
+  "can_delete",
+  "delete_by_keyword",
+  "admin_all_objects",
+  "srchIndexesAllowed",
+  "index=main error",
+  "_audit",
+  "_internal",
+  "[splunktcp-ssl:9997]",
+  "[SSL]",
+  "[tcpout]",
+  "[auditTrail]",
+  "requireClientCert=1",
+  "sslVersions=tls1.2",
+  "useSSL=false",
+  "200 OK",
+  "400 Bad Request",
+  "401 Unauthorized",
+  "403 Forbidden",
+  "404 Not Found",
+  "429 Too Many Requests",
+  "500 Internal Server Error",
+  "502 Bad Gateway",
+  "503 Service Unavailable",
+  ...SPLUNK_CONTROLS.map((control) => control.id),
+  "environment-url",
+  "environment-token",
+  "config-file-url",
+  "arguments-url",
+  "/home/auditor/.splunk/grclanker.json",
+  "INVALID_JSON",
+  "EACCES",
+  "ENOTDIR",
+  "EISDIR",
+];
+
+/** Realistic Splunk summary and error sentences with an identifying value in the slot such a value occupies. */
+function splunkSummarySentences(value) {
+  return [
+    `Splunk request to ${value} failed (403 Forbidden): the credential lacks the required capability`,
+    `Unknown: ${value} could not be evaluated because the credential lacks the required capability (403). Collect manually: ${value} from each indexer.`,
+    `Not collected: ${value} was not requested because ${value} could not be read (Splunk request to ${value} failed (403 Forbidden)).`,
+    `Splunk Cloud Platform 9.3.2411 at ${value} (bearer token auth, TLS verification on).`,
+    `Authenticated as ${value} with 42 capabilities.`,
+    `[${value}] Splunk request to ${value} failed (502 Bad Gateway): non-JSON body (text/html, 5120 bytes)`,
+    `[core_data/${value}] Splunk request to ${value} failed (403 Forbidden): the credential lacks the required capability`,
+    `authType is ${value} with provider stanza ${value} present, but the provider endpoint could not be read (the credential lacks the required capability (403)); verify the provider is active.`,
+  ];
+}
+
+/** Every fixed text the Splunk integration emits, with sample paths and names, passes its scrubber unchanged (GWS note 1). */
+const SPLUNK_FIXED_TEXTS = [
+  "Unable to read Splunk config file /home/auditor/.splunk/grclanker.json (EACCES)",
+  "Unable to read Splunk config file /home/auditor/.splunk/grclanker.json (UNREADABLE)",
+  "Unable to parse Splunk config file: invalid JSON in /home/auditor/.splunk/grclanker.json at line 4, column 1 (INVALID_JSON)",
+  "Unable to parse Splunk config file: invalid JSON in /home/auditor/.splunk/grclanker.json (INVALID_JSON)",
+  "SPLUNK_URL, a url argument, or a config file url is required (for example https://splunk.example.com:8089).",
+  "Provide SPLUNK_TOKEN or both SPLUNK_USERNAME and SPLUNK_PASSWORD (arguments or config file also work).",
+  "Splunk session login requires SPLUNK_USERNAME and SPLUNK_PASSWORD.",
+  "Splunk login response did not include a sessionKey.",
+  "Splunk request to /services/authorization/roles failed (403 Forbidden): the credential lacks the required capability",
+  "Splunk request to /services/authorization/roles failed (401 Unauthorized): call not properly authenticated",
+  "[tokens] Splunk request to /services/authorization/tokens failed (403 Forbidden): the credential lacks the required capability",
+  "[core_data/tokens] Splunk request to /services/authorization/tokens failed (403 Forbidden): the credential lacks the required capability",
+  "[core_data/current_context] Splunk request to /services/authentication/current-context failed (401 Unauthorized): call not properly authenticated",
+  "[acs-hec] Splunk request to acs:/inputs/http-event-collectors failed (403 Forbidden): the credential lacks the required capability",
+  "authType is Splunk: local Splunk authentication is the primary method; SAML or LDAP is not enforced.",
+  "authType is Scripted: enforcement depends on the external proxy or script; collect the upstream identity provider configuration manually.",
+  "authType is SAML but no SAML provider stanza was readable in authentication.conf or the provider endpoint, so enforcement cannot be confirmed.",
+  "authType is LDAP but 1 referenced provider stanza(s) are disabled.",
+  "externalTwoFactorAuthVendor is Duo and the Duo-MFA configuration is present.",
+  "externalTwoFactorAuthVendor is RSA but no Rsa-MFA configuration stanza exists.",
+  "authType is SAML with active provider okta; 2 local Splunk-type accounts remain.",
+  "authType is SAML with no Splunk-native MFA vendor: MFA is enforced by the identity provider. Collect the IdP MFA policy for the Splunk application manually.",
+  "No externalTwoFactorAuthVendor (Duo or RSA) is configured and authType Splunk does not delegate MFA to an identity provider.",
+  "Splunk request to /servicesNS/-/-/storage/collections/config failed (400 Bad Request): non-JSON body (text/html, 5120 bytes)",
+  "Splunk request to /services/server/info returned an unreadable response (200 OK): non-JSON body (unknown content type, 0 bytes)",
+  "ACS response for /inputs/http-event-collectors did not include a http-event-collectors list (top-level fields: items, paging), so the inventory could not be read.",
+  "The deployment was classified as Splunk Cloud from the URL heuristic (the URL matches *.splunkcloud.com) because /services/server/info could not be read (the credential lacks the required capability (403)); confirm the product type before relying on this verdict.",
+  "the endpoint could not be read (Splunk request to /services/server/info failed (502 Bad Gateway): non-JSON body (text/html, 5120 bytes))",
+  "the endpoint was not found on this deployment (404)",
+  "the credential was rejected (401)",
+  "Unknown: /services/authentication/providers/SAML could not be evaluated because the credential lacks the required capability (403). Collect manually: the SAML provider stanza and its active state.",
+  "authType is SAML with provider stanza okta present, but the provider endpoint could not be read (the credential lacks the required capability (403)); verify the provider is active.",
+  "authType is SAML with an active provider, but the user list could not be read so local break-glass accounts could not be enumerated.",
+  "externalTwoFactorAuthVendor is Duo but /services/admin/Duo-MFA could not be read (the credential lacks the required capability (403)); verify the MFA stanza manually.",
+  "The subject-to-user check was skipped because the user list could not be read (the credential lacks the required capability (403)); confirm each token subject is a current user.",
+  "Unknown: no non-admin role exposed the srchIndexesAllowed field, so search restrictions could not be read.",
+  "Unknown: no non-admin role exposed the srchIndexesAllowed field, so _audit and _internal access could not be read.",
+  "None of the 3 non-admin roles hold high-risk capabilities. Only 3 of 50 roles were retrieved before the walk stopped, so the verdict is downgraded.",
+  "None of the 3 visible users hold admin or sc_admin; at least one administrator must exist, so the credential sees a partial view. Only 3 users (total unknown) were retrieved before the walk stopped, so the verdict is downgraded.",
+  "inputs.conf [SSL] could not be read (the credential lacks the required capability (403)), so the receiving-side serverCert and requireClientCert were not checked.",
+  "The ACS HEC token inventory (acs:/inputs/http-event-collectors) could not be read (the credential lacks the required capability (403)), so this verdict rests on the local /services/data/inputs/http view alone and the Splunk Cloud token settings were not checked.",
+  "audit.conf could not be read (the credential lacks the required capability (403))",
+  "No roles were visible, so audit deletion rights could not be evaluated; collect the roles holding delete_by_keyword manually.",
+  "role assignments could not be enumerated because the user list could not be read (the credential lacks the required capability (403)), so whether anyone holds a delete-capable role is unknown",
+  "_audit frozenTimePeriodInSecs was not readable because the index list could not be read (the credential lacks the required capability (403))",
+  "Splunk Cloud ACS is not configured (SPLUNK_STACK and SPLUNK_ACS_TOKEN), so IP allow lists could not be read. Collect GET /access/{feature}/ipallowlists for search-api, hec, s2s, and search-ui manually.",
+  "Unknown: 2 enabled apps lack Splunk or Splunkbase provenance and role capabilities could not be read to confirm installation is admin-only.",
+  "owner roles were not verified because the user list could not be read (the credential lacks the required capability (403))",
+  "Owner roles of the 4 scheduled searches could not be verified because the user list could not be read (the credential lacks the required capability (403)); none combine all indexes with an unbounded time range.",
+  "Unknown: 2 enabled splunktcp listeners exist (ports 9997, 9998) but /services/configs/conf-inputs could not be read because the credential lacks the required capability (403), and the data/inputs/tcp/cooked REST view does not report TLS. Collect inputs.conf [splunktcp-ssl:*] and [SSL] from each indexer manually.",
+  "Splunk Cloud Platform 9.3.2411 at https://acme.splunkcloud.com:8089 (bearer token auth, TLS verification on).",
+  "Splunk Enterprise 9.2.1 at https://splunk.example.com:8089 (session key auth, TLS verification OFF).",
+  "Authenticated as admin with 42 capabilities.",
+  "Authenticated as unknown (current-context unreadable) with an unread capability list.",
+  "17/21 audit surfaces are readable; ACS configured.",
+  "Run splunk_assess_authentication, splunk_assess_access_control, splunk_assess_data_protection, splunk_assess_audit_monitoring, splunk_assess_platform_hardening, or splunk_export_audit_bundle.",
+  "Grant the audit role the missing capabilities (list_users; edit_roles; list_tokens_all; rest_properties_get) or use an admin-scoped token; unreadable surfaces will render as manual findings.",
+];
+
+test("rule 9: every fixed text the Splunk integration emits passes its scrubber unchanged", () => {
+  for (const text of SPLUNK_FIXED_TEXTS) assert.equal(scrubErrorText(text), text, text);
+  for (const text of SPLUNK_FIXED_TEXTS) assert.equal(scrubErrorText(text, [SAMPLE_TOKEN, SAMPLE_ACS_TOKEN]), text, `${text} (with the configured tokens registered)`);
+});
+
+test("resolveSplunkConfiguration keeps environment credentials when an unrelated argument is passed (GWS note 2)", () => {
+  const dir = createTempBase("grclanker-splunk-env-args-");
+  const configFile = join(dir, "grclanker.json");
+  writeFileSync(configFile, JSON.stringify({ stack: "file-stack" }));
+  const env = { SPLUNK_CONFIG_FILE: configFile, SPLUNK_URL: "https://env.example.com:8089", SPLUNK_TOKEN: SAMPLE_TOKEN, SPLUNK_ACS_TOKEN: SAMPLE_ACS_TOKEN };
+
+  const resolved = resolveSplunkConfiguration({ timeout_seconds: 9 }, env);
+  assert.equal(resolved.token, SAMPLE_TOKEN, "the environment token survives an argument overlay that names no credential");
+  assert.equal(resolved.url, "https://env.example.com:8089");
+  assert.equal(resolved.stack, "file-stack", "the config file named through the environment still supplies the stack");
+  assert.equal(resolved.acsToken, SAMPLE_ACS_TOKEN);
+  assert.equal(resolved.timeoutMs, 9000);
+  assert.deepEqual(resolved.sourceChain, ["environment-url", "environment-token", "config-file-stack", "environment-acs-token"]);
+
+  const withUndefinedArguments = resolveSplunkConfiguration({ url: undefined, token: undefined, username: undefined, password: undefined }, env);
+  assert.equal(withUndefinedArguments.token, SAMPLE_TOKEN, "an argument overlay whose credential keys are undefined does not shadow the environment");
+  assert.deepEqual(withUndefinedArguments.sourceChain, ["environment-url", "environment-token", "config-file-stack", "environment-acs-token"]);
+
+  const session = resolveSplunkConfiguration({ verify_ssl: "true" }, { SPLUNK_URL: "https://env.example.com:8089", SPLUNK_USERNAME: "svc-audit-reader", SPLUNK_PASSWORD: SAMPLE_ACS_TOKEN });
+  assert.equal(session.username, "svc-audit-reader");
+  assert.equal(session.password, SAMPLE_ACS_TOKEN, "the environment password survives an unrelated verify_ssl argument");
+  assert.deepEqual(session.sourceChain, ["environment-url", "environment-username", "environment-password", "arguments-verify-ssl"]);
 });

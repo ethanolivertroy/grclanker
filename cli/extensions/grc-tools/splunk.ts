@@ -1191,7 +1191,7 @@ export class SplunkApiClient {
       const payload = await this.acsGet(path, { count: this.pageSize, offset });
       const list = keys.map((candidate) => payload[candidate]).find((value) => Array.isArray(value));
       if (list === undefined) {
-        throw new SplunkApiError(`ACS response for ${path} did not include a ${key} list (keys: ${Object.keys(payload).join(", ") || "none"}), so the inventory could not be read.`, `acs:${path}`);
+        throw new SplunkApiError(`ACS response for ${path} did not include a ${key} list (top-level fields: ${Object.keys(payload).join(", ") || "none"}), so the inventory could not be read.`, `acs:${path}`);
       }
       const page = asArray(list).map(asObject).filter((item): item is JsonRecord => Boolean(item));
       const pageKey = JSON.stringify(page.map((item) => asString(item.name) ?? asString(asObject(item.spec)?.name) ?? JSON.stringify(item)));
@@ -1290,8 +1290,15 @@ function deploymentCaveat(deployment: { info: SplunkDeploymentInfo; collected: C
   return `The deployment was classified as ${classification} from the URL heuristic (${basis}) because /services/server/info could not be read (${unreadableCause(deployment.collected)}); confirm the product type before relying on this verdict.`;
 }
 
+/**
+ * One `[<dataset>] <error>` line per failed read. The dataset name sits in
+ * brackets rather than before a colon because several names (tokens) are
+ * credential-shaped and the vendor word that opens every request error
+ * (`Splunk`) is also the session-key scheme, so `tokens: Splunk request`
+ * would read as a carrier to the error text rule.
+ */
 function collectedErrors(items: Array<[string, Collected<unknown>]>): string[] {
-  return items.filter(([, item]) => !item.ok).map(([name, item]) => `${name}: ${item.ok ? "" : item.error}`);
+  return items.filter(([, item]) => !item.ok).map(([name, item]) => `[${name}] ${item.ok ? "" : item.error}`);
 }
 
 function unreadableCause(item: { error: string; httpStatus?: number }): string {
@@ -1494,20 +1501,20 @@ export async function assessSplunkAuthentication(
       local_splunk_users: users.ok ? localUsers.map((user) => user.name).slice(0, 50) : null,
     };
     if (settingsNames.length === 0 || (providerStanzas.length === 0 && !(providers.ok && providers.value.entries.length > 0))) {
-      findings.push(finding(1, "fail", `authType=${authType} is set but no ${authType} provider stanza was readable in authentication.conf or the provider endpoint, so enforcement cannot be confirmed.`, evidence));
+      findings.push(finding(1, "fail", `authType is ${authType} but no ${authType} provider stanza was readable in authentication.conf or the provider endpoint, so enforcement cannot be confirmed.`, evidence));
     } else if (disabledProviders.length > 0) {
-      findings.push(finding(1, "fail", `authType=${authType} but ${disabledProviders.length} referenced provider stanza(s) are disabled.`, evidence));
+      findings.push(finding(1, "fail", `authType is ${authType} but ${disabledProviders.length} referenced provider stanza(s) are disabled.`, evidence));
     } else if (!providers.ok) {
-      findings.push(finding(1, "warn", `authType=${authType} with provider stanza ${settingsNames.join(", ")} present, but the provider endpoint could not be read (${unreadableCause(providers)}); verify the provider is active.`, evidence));
+      findings.push(finding(1, "warn", `authType is ${authType} with provider stanza ${settingsNames.join(", ")} present, but the provider endpoint could not be read (${unreadableCause(providers)}); verify the provider is active.`, evidence));
     } else if (!users.ok) {
-      findings.push(finding(1, "warn", `authType=${authType} with an active provider, but the user list could not be read so local break-glass accounts could not be enumerated.`, evidence));
+      findings.push(finding(1, "warn", `authType is ${authType} with an active provider, but the user list could not be read so local break-glass accounts could not be enumerated.`, evidence));
     } else {
-      findings.push(finding(1, localUsers.length > 3 ? "warn" : "pass", `authType=${authType} with active provider ${settingsNames.join(", ")}; ${localUsers.length} local Splunk-type accounts remain${localUsers.length > 3 ? " (more than 3, review break-glass scope)" : ""}.`, evidence));
+      findings.push(finding(1, localUsers.length > 3 ? "warn" : "pass", `authType is ${authType} with active provider ${settingsNames.join(", ")}; ${localUsers.length} local Splunk-type accounts remain${localUsers.length > 3 ? " (more than 3, review break-glass scope)" : ""}.`, evidence));
     }
   } else if (authType === "ProxySSO" || authType === "Scripted") {
-    findings.push(finding(1, "manual", `authType=${authType}: enforcement depends on the external proxy or script; collect the upstream identity provider configuration manually.`, { auth_type: authType }));
+    findings.push(finding(1, "manual", `authType is ${authType}: enforcement depends on the external proxy or script; collect the upstream identity provider configuration manually.`, { auth_type: authType }));
   } else {
-    findings.push(finding(1, "fail", `authType=${authType}: local Splunk authentication is the primary method; SAML or LDAP is not enforced.`, { auth_type: authType, local_users: users.ok ? users.value.entries.length : null }));
+    findings.push(finding(1, "fail", `authType is ${authType}: local Splunk authentication is the primary method; SAML or LDAP is not enforced.`, { auth_type: authType, local_users: users.ok ? users.value.entries.length : null }));
   }
 
   const passwordStanza = authConf.ok ? stanza(authConf.value, "splunk_auth") : undefined;
@@ -1554,16 +1561,16 @@ export async function assessSplunkAuthentication(
     const mfa = await collect(client, () => client.listMfaProviders(vendorEndpoint));
     const evidence = { vendor: mfaVendor, endpoint: `/services/admin/${vendorEndpoint}`, entries: mfa.ok ? mfa.value.entries.map((entry) => entry.name) : null };
     if (mfa.ok && mfa.value.entries.length > 0) {
-      findings.push(finding(3, "pass", `externalTwoFactorAuthVendor=${mfaVendor} and the ${vendorEndpoint} configuration is present.`, evidence));
+      findings.push(finding(3, "pass", `externalTwoFactorAuthVendor is ${mfaVendor} and the ${vendorEndpoint} configuration is present.`, evidence));
     } else if (mfa.ok) {
-      findings.push(finding(3, "fail", `externalTwoFactorAuthVendor=${mfaVendor} but no ${vendorEndpoint} configuration stanza exists.`, evidence));
+      findings.push(finding(3, "fail", `externalTwoFactorAuthVendor is ${mfaVendor} but no ${vendorEndpoint} configuration stanza exists.`, evidence));
     } else {
-      findings.push(finding(3, "warn", `externalTwoFactorAuthVendor=${mfaVendor} but /services/admin/${vendorEndpoint} could not be read (${unreadableCause(mfa)}); verify the MFA stanza manually.`, evidence));
+      findings.push(finding(3, "warn", `externalTwoFactorAuthVendor is ${mfaVendor} but /services/admin/${vendorEndpoint} could not be read (${unreadableCause(mfa)}); verify the MFA stanza manually.`, evidence));
     }
   } else if (authType === "SAML") {
-    findings.push(finding(3, "manual", "authType=SAML with no Splunk-native MFA vendor: MFA is enforced by the identity provider. Collect the IdP MFA policy for the Splunk application manually.", { auth_type: authType, external_two_factor_vendor: mfaVendor ?? null }));
+    findings.push(finding(3, "manual", "authType is SAML with no Splunk-native MFA vendor: MFA is enforced by the identity provider. Collect the IdP MFA policy for the Splunk application manually.", { auth_type: authType, external_two_factor_vendor: mfaVendor ?? null }));
   } else if (authType) {
-    findings.push(finding(3, "fail", `No externalTwoFactorAuthVendor (Duo or RSA) is configured and authType=${authType} does not delegate MFA to an identity provider.`, { auth_type: authType, external_two_factor_vendor: mfaVendor ?? null }));
+    findings.push(finding(3, "fail", `No externalTwoFactorAuthVendor (Duo or RSA) is configured and authType ${authType} does not delegate MFA to an identity provider.`, { auth_type: authType, external_two_factor_vendor: mfaVendor ?? null }));
   } else {
     findings.push(finding(3, "manual", "Unknown: neither authType nor externalTwoFactorAuthVendor could be read from authentication.conf; collect the MFA configuration manually.", {}));
   }
@@ -2591,7 +2598,7 @@ export async function checkSplunkAccess(client: SplunkInspectorClient): Promise<
     acsConfigured: client.hasAcs(),
     surfaces,
     notes: [
-      `Splunk ${deployment.info.isCloud ? "Cloud Platform" : "Enterprise"}${deployment.info.version ? ` ${deployment.info.version}` : ""} at ${config.url} (auth: ${config.token ? "bearer token" : "session key"}, TLS verification ${config.verifyTls ? "on" : "OFF"}).`,
+      `Splunk ${deployment.info.isCloud ? "Cloud Platform" : "Enterprise"}${deployment.info.version ? ` ${deployment.info.version}` : ""} at ${config.url} (${config.token ? "bearer token" : "session key"} auth, TLS verification ${config.verifyTls ? "on" : "OFF"}).`,
       `Authenticated as ${authenticatedAs ?? "unknown (current-context unreadable)"} with ${capabilities ? `${capabilities.length} capabilities` : "an unread capability list"}.`,
       `${readableCount}/${surfaces.length} audit surfaces are readable; ACS ${client.hasAcs() ? "configured" : "not configured"}.`,
     ],
@@ -2746,7 +2753,7 @@ export async function exportSplunkAuditBundle(
       await writeSecureTextFile(outputDir, `core_data/${name}.json`, serializeJson(redactSnapshot(snapshot.value)));
     } else {
       await writeSecureTextFile(outputDir, `core_data/${name}.json`, serializeJson(notCollectedMarker(snapshot, endpoint)));
-      errors.push(`core_data/${name}: ${snapshot.error}`);
+      errors.push(`[core_data/${name}] ${snapshot.error}`);
     }
   }
 
