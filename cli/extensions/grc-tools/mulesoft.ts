@@ -137,7 +137,7 @@ const URL_IN_TEXT_PATTERN = /\b(https?:\/\/)(?:([^\s/?#@"'<>]+)@)?([^\s/?#"'<>]+
 const JWT_PATTERN = /\beyJ[A-Za-z0-9_-]{4,}\.[A-Za-z0-9_-]{4,}\.[A-Za-z0-9_-]*/g;
 const AUTHORIZATION_VALUE_PATTERN = /\b(bearer|basic|digest|negotiate|ntlm)\s+([A-Za-z0-9\-._~+/!]{8,}=*)/gi;
 const SECRET_ASSIGNMENT_PATTERN = /\b([\w-]*(?:session|token|secret|password|passwd|pwd|api[_-]?key|apikey|credential|assertion|signature|sid|jsessionid)[\w-]*=)([^\s"'&;,<>]+)/gi;
-const SECRET_FIELD_PATTERN = /\b((?:api[\s_-]?key|x-api-key|access[_-]?token|refresh[_-]?token|id[_-]?token|auth[_-]?token|session[_-]?token|bearer[_-]?token|token|client[_-]?secret|secret|password|passwd|pwd|authorization|set-cookie|cookie|session[_-]?id|jsessionid|sid|assertion|signature|credential)["']?\s*:\s*["']?)([^\s"'&;,<>]+)/gi;
+const SECRET_FIELD_PATTERN = /(?<![\w/.-])((?:api[\s_-]?key|x-api-key|access[_-]?token|refresh[_-]?token|id[_-]?token|auth[_-]?token|session[_-]?token|bearer[_-]?token|token|client[_-]?secret|secret|password|passwd|pwd|authorization|set-cookie|cookie|session[_-]?id|jsessionid|sid|assertion|signature|credential)["']?\s*:\s*["']?)([^\s"'&;,<>]+)/gi;
 const MAX_REDACTION_DEPTH = 32;
 const PRODUCTION_NAME_PATTERN = /\bprod(uction)?\b/i;
 const NON_PRODUCTION_NAME_PATTERN = /\b(sandbox|dev(elopment)?|test|qa|uat|staging|stage)\b/i;
@@ -1644,10 +1644,12 @@ export function snapshotOf(source: Collected<unknown>, value: unknown, reads: Ar
   if (sourceCollected(source)) return redactSnapshot(value);
   const succeeded = reads.filter(sourceCollected);
   if (succeeded.length === 0) return notCollectedMarker(source);
+  // When every child read succeeded the failure sits on the merged source itself (an unread parent).
+  const failedReads = reads.some((read) => !sourceCollected(read)) ? reads.filter((read) => !sourceCollected(read)) : [source];
   return {
     collected: "partial",
     dataset: source.label,
-    failed_reads: reads.filter((read) => !sourceCollected(read)).map((read) => ({
+    failed_reads: failedReads.map((read) => ({
       read: read.label,
       status: read.httpStatus ?? null,
       endpoint: read.endpoint ?? null,
@@ -1727,7 +1729,18 @@ function failedSource(label: string, error: string): Collected<undefined> {
  * a successful empty read.
  */
 function mergeSources(label: string, sources: Array<Collected<unknown>>, parent?: Collected<unknown>): Collected<undefined> {
-  if (parent && !sourceCollected(parent)) return skippedSource(label, parent, undefined);
+  if (parent && !sourceCollected(parent)) {
+    if (sources.length === 0) return skippedSource(label, parent, undefined);
+    // Some parents were read and their children requested; the children of the unread parents were not.
+    return {
+      label,
+      value: undefined,
+      error: `${label} reads were requested only for the ${parent.label} that were read (${sourceFailure(parent)})`,
+      httpStatus: parent.httpStatus,
+      endpoint: parent.endpoint,
+      skippedParent: parent.label,
+    };
+  }
   const failed = sources.filter((source) => !sourceCollected(source));
   if (failed.length === 0) return readySource(label);
   const detail = failed.slice(0, 3).map((source) => `${source.label}: ${sourceFailure(source)}`).join("; ");
@@ -2394,7 +2407,7 @@ export async function assessMulesoftIdentityAccess(
       members_total: derived(members.value.total ?? null, members),
       members_truncated: derived(members.value.truncated, members),
       mfa_exempt_users: derived(exemptFlagged.length, mfaExemptUsers),
-      organization_admins: derived(adminUsers.size, roleGroups, adminUsersSource),
+      organization_admins: derived(adminUsers.size, roleGroups, roleGroupRolesSource, adminUsersSource),
       role_groups: derived(roleGroupItems.length, roleGroups),
       environments: derived(environmentItems.length, environments),
       connected_apps: derived(connectedAppItems.length, connectedApps),
@@ -2567,7 +2580,7 @@ export async function assessMulesoftApiGateway(
     const environmentId = asString(environment.id);
     const label = environmentLabel(environment);
     if (!environmentId) {
-      apiSources.push({ ...failedSource(`managed_apis:${label}`, "environment has no id"), value: toPage([]) });
+      apiSources.push({ ...failedSource(`api_manager_apis:${label}`, "environment has no id"), value: toPage([]) });
       continue;
     }
     const remaining = apiLimit - apiRecords.length;
@@ -2575,7 +2588,7 @@ export async function assessMulesoftApiGateway(
       apiPartialNotes.push(`the API limit of ${apiLimit} was reached before sampling ${label}`);
       continue;
     }
-    const apis = await collectPage(`managed_apis:${label}`, () => client.listManagedApis(environmentId, remaining), errors);
+    const apis = await collectPage(`api_manager_apis:${label}`, () => client.listManagedApis(environmentId, remaining), errors);
     apiSources.push(apis);
     const note = truncationNote(`${label} API instance`, apis.value);
     if (note) apiPartialNotes.push(note);
@@ -2587,7 +2600,7 @@ export async function assessMulesoftApiGateway(
       apiRecords.push({ environment, api, policies });
     }
   }
-  const apisSource = mergeSources("managed_apis", apiSources, environments.source);
+  const apisSource = mergeSources("api_manager_apis", apiSources, environments.source);
   const policiesSource = mergeSources("api_policies", apiRecords.map((record) => record.policies), apisSource);
 
   const exchangeAssets = await collectPage("exchange_assets", () => client.listExchangeAssets(), errors);

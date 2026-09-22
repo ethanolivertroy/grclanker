@@ -500,7 +500,7 @@ const URL_IN_TEXT_PATTERN = /\b(https?:\/\/)(?:([^\s/?#@"'<>]+)@)?([^\s/?#"'<>]+
 const JWT_PATTERN = /\beyJ[A-Za-z0-9_-]{4,}\.[A-Za-z0-9_-]{4,}\.[A-Za-z0-9_-]*/g;
 const AUTHORIZATION_VALUE_PATTERN = /\b(bearer|basic|digest|negotiate|ntlm)\s+([A-Za-z0-9\-._~+/!]{8,}=*)/gi;
 const SECRET_ASSIGNMENT_PATTERN = /\b([\w-]*(?:session|token|secret|password|passwd|pwd|api[_-]?key|apikey|credential|assertion|signature|sid|jsessionid)[\w-]*=)([^\s"'&;,<>]+)/gi;
-const SECRET_FIELD_PATTERN = /\b((?:api[\s_-]?key|x-api-key|access[_-]?token|refresh[_-]?token|id[_-]?token|auth[_-]?token|session[_-]?token|bearer[_-]?token|token|client[_-]?secret|secret|password|passwd|pwd|authorization|set-cookie|cookie|session[_-]?id|jsessionid|sid|assertion|signature|credential)["']?\s*:\s*["']?)([^\s"'&;,<>]+)/gi;
+const SECRET_FIELD_PATTERN = /(?<![\w/.-])((?:api[\s_-]?key|x-api-key|access[_-]?token|refresh[_-]?token|id[_-]?token|auth[_-]?token|session[_-]?token|bearer[_-]?token|token|client[_-]?secret|secret|password|passwd|pwd|authorization|set-cookie|cookie|session[_-]?id|jsessionid|sid|assertion|signature|credential)["']?\s*:\s*["']?)([^\s"'&;,<>]+)/gi;
 const SESSION_ID_ELEMENT_PATTERN = /<([\w:]*sessionId)>[^<]*<\/[\w:]*sessionId>/gi;
 
 /**
