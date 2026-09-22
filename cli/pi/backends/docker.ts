@@ -88,6 +88,7 @@ export function createDockerBackend(options: DockerBackendOptions): ExecutionBac
       stageWorkspace: true,
       artifactSync: true,
       interactive: true,
+      oneShot: false,
     },
     async healthcheck() {
       const result = await runner("docker", ["info"]);

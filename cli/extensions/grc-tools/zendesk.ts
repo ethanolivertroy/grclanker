@@ -19,6 +19,7 @@ import { homedir } from "node:os";
 import { dirname, join, relative, resolve } from "node:path";
 import { ZipArchive } from "archiver";
 import { Type } from "@sinclair/typebox";
+import { REDACTED_VALUE, scrubSensitiveValues } from "../../flue/redact.js";
 import { errorResult, formatTable, textResult } from "./shared.js";
 
 type FetchImpl = typeof fetch;
@@ -60,7 +61,12 @@ export interface ZendeskSnapshot<T> {
   status: ZendeskSnapshotStatus;
   data?: T;
   error?: string;
+  // The HTTP status the failed request observed; absent when no response arrived.
   httpStatus?: number;
+  // The request behind this snapshot: on failure the request that actually failed
+  // (method and path taken from the thrown ZendeskApiError), otherwise the read's
+  // documented endpoint.
+  endpoint?: string;
 }
 
 export interface ZendeskListResult {
@@ -69,16 +75,36 @@ export interface ZendeskListResult {
   pages: number;
 }
 
+// One 2xx answer that passed the shape guard: the JSON object it carried and the
+// response it came from, kept so a missing documented member can be described by the
+// status, media type, and size the request observed.
+interface ZendeskDocument {
+  payload: JsonRecord;
+  response: Response;
+  rawText: string;
+  url: string;
+}
+
 export interface ZendeskAccessSurface {
   name: string;
   endpoint: string;
   requiredRole: "agent" | "admin" | "admin-enterprise";
   status: "readable" | "forbidden" | "not_found" | "error";
-  count?: number;
+  // Items seen by a readable probe; null when the probe did not read anything, so a
+  // refused surface is never mistaken for an empty one.
+  count: number | null;
+  // True when a readable list probe stopped at its item cap or on a stuck cursor (count
+  // is a seen count rather than the population); null when the probe failed; absent for
+  // a readable single-object probe.
+  truncated?: boolean | null;
+  // The HTTP status observed by a failed probe; null when it was readable or no response arrived.
+  httpStatus: number | null;
   error?: string;
 }
 
 export interface ZendeskAccessCheckResult {
+  // healthy only when every surface was read: a refused, failed, or 2xx-without-document
+  // surface makes the check limited, since it produced no data to assess.
   status: "healthy" | "limited";
   subdomain: string;
   authMode: ZendeskAuthMode;
@@ -284,14 +310,49 @@ function normalizeBaseUrl(rawUrl: string): string {
   return parsed.toString().replace(/\/+$/, "");
 }
 
-function readConfigFile(pathname: string): JsonRecord | undefined {
-  if (!existsSync(pathname)) return undefined;
-  const raw = readFileSync(pathname, "utf8");
+const ERRNO_CODE_PATTERN = /^E[A-Z0-9_]{1,30}$/;
+const JSON_POSITION_PATTERN = /at position (\d+)/;
+
+/**
+ * Two-step config loader guard with fixed text per step. Neither the filesystem
+ * message (which echoes the path and the operation) nor the JSON.parse message
+ * (which quotes a window of the source around the failure, or the whole source
+ * of a short file) is ever interpolated: the read step carries the path and a
+ * validated errno code, the parse step carries the path and a line number taken
+ * only through a strict position regex.
+ */
+function readConfigText(pathname: string): string {
+  try {
+    return readFileSync(pathname, "utf8");
+  } catch (error) {
+    const code = asString(asObject(error)?.code);
+    const suffix = code !== undefined && ERRNO_CODE_PATTERN.test(code) ? ` (${code})` : "";
+    throw new Error(`Unable to read Zendesk config file ${pathname}${suffix}`);
+  }
+}
+
+function parseConfigJson(pathname: string, raw: string): unknown {
+  try {
+    return JSON.parse(raw) as unknown;
+  } catch (error) {
+    const position = error instanceof Error ? JSON_POSITION_PATTERN.exec(error.message) : null;
+    const line = position ? raw.slice(0, Number(position[1])).split("\n").length : undefined;
+    throw new Error(`Unable to parse Zendesk config file: invalid JSON in ${pathname}${line === undefined ? "" : ` at line ${line}`} (INVALID_JSON)`);
+  }
+}
+
+/**
+ * An explicitly named file (config_file argument or ZENDESK_CONFIG_FILE) must be
+ * readable, so a missing one surfaces as ENOENT; the default ~/.zendesk/config.json
+ * is optional and is skipped silently when absent.
+ */
+function readConfigFile(pathname: string, explicit: boolean): JsonRecord | undefined {
+  if (!explicit && !existsSync(pathname)) return undefined;
+  const raw = readConfigText(pathname);
   if (raw.trim().length === 0) return undefined;
-  const parsed = JSON.parse(raw) as unknown;
-  const object = asObject(parsed);
+  const object = asObject(parseConfigJson(pathname, raw));
   if (!object) {
-    throw new Error(`Zendesk config file ${pathname} must contain a JSON object.`);
+    throw new Error(`Unable to parse Zendesk config file: ${pathname} must contain a JSON object (INVALID_CONFIG_SHAPE)`);
   }
   return object;
 }
@@ -302,10 +363,9 @@ export function resolveZendeskConfiguration(
   homeDir: string = homedir(),
 ): ZendeskResolvedConfig {
   const sourceChain: string[] = [];
-  const configPath = asString(input.config_file)
-    ?? asString(env.ZENDESK_CONFIG_FILE)
-    ?? join(homeDir, ".zendesk", "config.json");
-  const fileConfig = readConfigFile(configPath) ?? {};
+  const explicitConfigPath = asString(input.config_file) ?? asString(env.ZENDESK_CONFIG_FILE);
+  const configPath = explicitConfigPath ?? join(homeDir, ".zendesk", "config.json");
+  const fileConfig = readConfigFile(configPath, explicitConfigPath !== undefined) ?? {};
   if (Object.keys(fileConfig).length > 0) sourceChain.push(`config:${configPath}`);
 
   const pick = (argKey: string, envKeys: string[], fileKeys: string[]): { value?: string; source?: string } => {
@@ -334,8 +394,14 @@ export function resolveZendeskConfiguration(
   }
   sourceChain.push(`subdomain:${subdomain.source}`);
 
+  // The credential set from the higher-ranked source wins (arguments over environment
+  // over config file), so a token left in a config file never displaces the credentials
+  // the environment or the caller supplied; on a tie OAuth is preferred.
+  const sourceRank = (source?: string): number => (source === "arguments" ? 3 : source === "environment" ? 2 : source === "config-file" ? 1 : 0);
+  const apiTokenRank = apiToken.value && email.value ? Math.min(sourceRank(apiToken.source), sourceRank(email.source)) : 0;
+  const oauthRank = oauthToken.value ? sourceRank(oauthToken.source) : 0;
   let authMode: ZendeskAuthMode;
-  if (oauthToken.value && !(asString(input.api_token) && asString(input.email))) {
+  if (oauthToken.value && oauthRank >= apiTokenRank) {
     authMode = "oauth";
     sourceChain.push(`oauth-token:${oauthToken.source}`);
   } else if (apiToken.value && email.value) {
@@ -360,17 +426,441 @@ export function resolveZendeskConfiguration(
   };
 }
 
+export const CREDENTIAL_REDACTION_MARKER = "[REDACTED]";
+
+/**
+ * Scrub boundary. A bare value shaped like a name (words joined by hyphens or
+ * underscores with at most one digit group per segment: prod-us-east-2026,
+ * fw-dc1-01, sess-canary-COOKIE-31415926535897) standing alone in prose is
+ * indistinguishable from a resource name and stays, because a summary that names
+ * the unread inventory is itself a verdict-safety requirement. Two guards make
+ * that safe and both hold by construction:
+ *
+ * 1. A value inside a carrier is removed whatever its shape: the Authorization,
+ *    Proxy-Authorization, Cookie, Set-Cookie, X-Api-Key, X-Auth-Token and similar
+ *    header lines to the end of the line; the userinfo of every embedded URL;
+ *    credential-named query and fragment pairs of every URL and bare query string
+ *    (the ?token= and &api_key= a target_url or trigger action may carry) and any
+ *    query value shaped like a token; the schemes Bearer, Basic, Digest, Token, Negotiate,
+ *    NTLM, SSWS, and ApiKey (only a listed prose word after the scheme, "Basic
+ *    authentication", stays; after the noun "Token" any short plain lowercase word does); credential-named key=value pairs (to the next
+ *    delimiter), key: value pairs (to the end of the line), "key":"value" pairs,
+ *    and key="value" XML or HTML attributes; and webhook services whose URL path is
+ *    the secret. Nothing this module renders puts a credential word in front of a
+ *    colon or an equals sign, so every fixed text survives the scrub.
+ * 2. A configured secret (the API token, the OAuth access token, and the composed
+ *    Basic credential the client sends, base64 of email/token:api_token) is removed whatever
+ *    its shape and in every encoded form (JSON-escaped, URL-encoded, form-encoded,
+ *    base64, base64url, re-flowed PEM lines), down to MIN_CONFIGURED_SECRET_LENGTH
+ *    (cli/flue/redact.ts owns the forms). redactSecrets applies it at every client
+ *    throw site; the tool boundary and the bundle writer apply it to the whole
+ *    payload and every written file.
+ *
+ * Real token shapes are still removed bare: PEM blocks, JWTs, LUFRPT-prefixed
+ * PAN-OS keys (a proxy page may echo any vendor's key), AWS access key ids, and (in
+ * error text) any run of
+ * LONG_TOKEN_MIN_LENGTH or more token characters that carries base64 symbols,
+ * digits scattered through its letters (0f9e8d7c6b5a4938), or token casing
+ * (Kq7Zx2Vw9Lm4Tp8R). The rule is path-safe: "/", ".", ":", "@", "=", and
+ * whitespace end a run, so URL path segments, dotted hostnames, colon-separated
+ * ARNs, and the two sides of a key=value pair are judged piece by piece, while
+ * "-" and "_" split a run into name segments; uppercase codes (ENOENT, PCI-DSS-4),
+ * digit strings, and canonical UUIDs are names outright. Data values and bundle
+ * content go through redactCredentialValueText, every carrier rule without the
+ * long-token one (an opaque identifier in evidence is not a secret) and with
+ * public PEM blocks (certificates, public keys, CSRs) kept as evidence. Every rule
+ * is unanchored and idempotent.
+ */
+export const MIN_CONFIGURED_SECRET_LENGTH = 4;
+export const LONG_TOKEN_MIN_LENGTH = 16;
+
+// Which PEM blocks a scrub removes: every block in error text, where a block is never
+// evidence; only non-public blocks in data values, where a certificate is.
+type PemScope = "all" | "private";
+
+const PEM_BLOCK_PATTERN = /-----BEGIN ([A-Z0-9 ]+)-----[\s\S]*?-----END [A-Z0-9 ]+-----/g;
+// A block whose END was cut off (a truncated message) runs to the end of the text.
+const PEM_OPEN_PATTERN = /-----BEGIN ([A-Z0-9 ]+)-----(?:(?!-----END )[\s\S])*$/;
+// Labels of PEM blocks that carry public material only; every other label (PRIVATE KEY,
+// ENCRYPTED PRIVATE KEY, RSA/EC/DSA/OPENSSH PRIVATE KEY, PGP PRIVATE KEY BLOCK) is a secret.
+const PUBLIC_PEM_LABELS = new Set(["CERTIFICATE", "TRUSTED CERTIFICATE", "X509 CRL", "CERTIFICATE REQUEST", "NEW CERTIFICATE REQUEST", "PUBLIC KEY", "RSA PUBLIC KEY", "PKCS7", "CMS"]);
+// Any scheme-prefixed URL: the userinfo is dropped; its query and fragment pairs are
+// judged by the pair rule below, so the scheme, host, path, and ordinary pairs stay.
+const EMBEDDED_URL_PATTERN = /\b[a-z][a-z0-9+.-]*:\/\/[^\s"'<>()[\]{}]+/gi;
+const URL_USERINFO_PATTERN = /^([a-z][a-z0-9+.-]*:\/\/)[^\s/@"'<>]+@/i;
+// A query or fragment pair, in a URL or a bare query string: a credential-named pair or a
+// token-shaped value loses the value. A value ends at "&", "#", whitespace, a quote, or the
+// ";" and "," that end a URL inside a sentence (no token carries either).
+const QUERY_PAIR_PATTERN = /([?&#])([A-Za-z0-9_.[\]-]+)=((?!\[REDACTED\])[^&#\s"'<>;,]+)/g;
+// A credential-bearing header line: the whole value goes, whatever its shape. The name and
+// separator are matched here and the value is consumed by headerValueEnd, which carries a
+// quoted value (double, single, or JSON-escaped quotes) through its closing quote, so
+// Cookie: sid="value" loses value and quotes together instead of stopping at the first
+// quote. A value that already opens with a marker is left alone so the rule is idempotent.
+const HEADER_LINE_PATTERN = /\b(authorization|proxy-authorization|cookie|set-cookie|x-api-key|api-key|apikey|x-pan-key|x-redlock-auth|x-auth-token|x-access-token|x-amz-security-token|x-vault-token|private-token|x-goog-api-key|x-csrf-token|x-xsrf-token)(["']?\s*:\s*)/gi;
+// Inside a header value a quote opens a quoted segment only where a value can start: at the
+// start of the value or after "=", ":", ",", ";", "(", or whitespace. Anywhere else it is the
+// quote that closes the text the header line was quoted in.
+const HEADER_VALUE_OPENER_PATTERN = /[=:,;(\s]/;
+const HEADER_VALUE_TERMINATOR_PATTERN = /[\r\n<>]/;
+// A scheme and its credentials: the value is removed whatever its shape, except the
+// prose words that follow a scheme name in a sentence ("Basic authentication is
+// required", "Bearer token") and a Titlecase word, which makes the scheme name an
+// adjective in a title ("Basic Network Scan", "Bearer Token", "Token Hygiene"): a Basic
+// credential is base64 and a bearer token or API key carries digits, symbols, or token
+// casing, so neither is ever one capitalized word of letters. "Token" is also this
+// module's own noun ("Token hygiene", "token inventory"), so after it any plain
+// lowercase word shorter than LONG_TOKEN_MIN_LENGTH is prose. OAuth 1.0 carries its
+// credentials as key="value" attributes, which the attribute rule removes, so OAuth is
+// not a scheme here and "OAuth clients" stays.
+const SCHEME_VALUE_PATTERN = /\b(Bearer|Basic|Digest|Token|Negotiate|NTLM|SSWS|ApiKey|Api-Key)\s+((?!\[REDACTED\])[A-Za-z0-9._~+/=-]{4,})/gi;
+const PLAIN_WORD_PATTERN = /^[a-z]+$/;
+const TITLE_WORD_PATTERN = /^[A-Z][a-z]{1,19}$/;
+const SCHEME_PROSE_WORDS = new Set([
+  "authentication", "authorization", "auth", "token", "tokens", "credential", "credentials", "scheme", "schemes", "header", "headers",
+  "realm", "challenge", "access", "mode", "method", "login", "flow", "grant", "type", "string", "value", "values", "user", "users",
+  "account", "client", "clients", "error", "request", "requests", "response", "with", "without", "and", "or", "is", "was", "are",
+  "not", "the", "this", "that", "these", "those", "to", "in", "for", "from", "on", "of", "by", "as", "at", "if", "then", "but", "so",
+  "than", "when", "where", "over", "via", "per", "only", "still", "also", "use", "used", "using", "required", "requires", "failed",
+  "rejected", "expired", "invalid", "missing", "unsupported", "supported", "unauthorized", "forbidden", "denied", "allowed", "enabled",
+  "disabled", "preferred", "deprecated", "retired", "retiring", "must", "should", "can", "cannot", "could", "will", "would", "may",
+  "has", "have", "does", "did", "do", "be", "been",
+]);
+// "key":"value" and key="value" carriers keep the whole quoted value together so a
+// value with spaces is removed as one; the unquoted pair rule below takes the rest.
+// Keys may start with "_" (_upstream_session, _token), so a key begins wherever no key
+// character precedes it rather than at a word boundary.
+const JSON_QUOTED_PAIR_PATTERN = /"([A-Za-z_][A-Za-z0-9_.-]{0,63})"(\s*:\s*)"((?!\[REDACTED\])[^"\r\n]+)"/g;
+const QUOTED_ATTRIBUTE_PATTERN = /(?<![A-Za-z0-9_.:-])([A-Za-z_][A-Za-z0-9_.:-]{0,63})\s*=\s*(["'])((?!\[REDACTED\])[^"'\r\n]+)\2/g;
+// An unquoted pair: key=value runs to the next delimiter, key: value (a header or
+// YAML-style line) to the end of the line, where a brace or bracket ends it so a JSON
+// structure after a credential-named key (compact "password":{...}, "auth":null}) is
+// never taken for a value.
+const ASSIGNMENT_KEY_PATTERN = /(?<![A-Za-z0-9_.-])(["']?)([A-Za-z_][A-Za-z0-9_.-]{0,63})(["']?\s*([:=])\s*["']?)/g;
+const DELIMITED_VALUE_PATTERN = /(?!\[REDACTED\])[^\s"'<>;,&]+/y;
+const LINE_VALUE_PATTERN = /(?!\[REDACTED\])[^\r\n<>"',;{}[\]]*[^\s\r\n<>"',;{}[\]]/y;
+const TOKEN_IN_PATH_WEBHOOK_PATTERN = /(https?:\/\/(?:hooks\.slack\.com\/services|discord(?:app)?\.com\/api\/webhooks|[a-z0-9.-]*webhook\.office\.com\/webhookb2)\/)(?!\[REDACTED\])[^\s"'<>]+/gi;
+const JWT_PATTERN = /\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}(?:\.[A-Za-z0-9_-]+)*/g;
+const PANOS_API_KEY_PATTERN = /\bLUFRPT[A-Za-z0-9+/=_-]{16,}/g;
+const AWS_ACCESS_KEY_ID_PATTERN = /\b(?:AKIA|ASIA|AROA|AIDA|AGPA|ANPA|ANVA|APKA|ABIA|ACCA)[A-Z0-9]{16}\b/g;
+const LONG_TOKEN_RUN_PATTERN = /[A-Za-z0-9+_-]{16,}(?:={1,2}(?![A-Za-z0-9&]))?/g;
+const TOKEN_VALUE_PATTERN = /^[A-Za-z0-9+_-]{16,}={0,2}$/;
+const UPPERCASE_CODE_PATTERN = /^[A-Z][A-Z_]*$|^[A-Z][A-Z0-9]*(?:[_-][A-Z0-9]+)+$/;
+const DIGITS_ONLY_PATTERN = /^\d+$/;
+const DIGIT_GROUP_PATTERN = /\d+/g;
+const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+// Below this many letters a segment's casing is not judged: eBay, iOS, McD are names.
+const MIN_LETTERS_FOR_CASING = 6;
+// A segment this long that is not name-shaped makes the whole run a token on its own.
+const MIN_TOKEN_SEGMENT_LENGTH = 8;
+// A carrier is named by its last word: api_key, access_token, client_secret, X-PAN-KEY,
+// _upstream_session, oauth_signature, Set-Cookie, password1. A key whose last word names
+// something else (credentialID, keyId, tokenCount, auth_mode, credentials_file,
+// passwordPolicy, password_complexity_by_device, credential-enforcement) is not one, nor is
+// a max/min bound; a session id (session_id, PHPSESSID, JSESSIONID) is, whatever its tail.
+const CREDENTIAL_KEY_WORDS = new Set([
+  "token", "tokens", "secret", "secrets", "password", "passwords", "passwd", "pwd", "passphrase", "passcode", "phash",
+  "apikey", "authorization", "credential", "credentials", "key", "keys", "cookie", "cookies", "sid", "sig", "signature",
+  "auth", "nonce", "sas", "community", "authpwd", "privpwd", "pin", "otp", "totp", "jwt", "assertion", "bearer", "hmac",
+  "session", "sessid", "kubeconfig", "dsn", "pem", "ikey", "skey",
+]);
+// Concatenated spellings the segment split cannot see (authtoken, sharedsecret, privatekey).
+const CREDENTIAL_KEY_SUFFIX_PATTERN = /(?:token|secret|passw(?:or)?d|passphrase|passcode|phash|authorization|credential|signature|nonce|community|assertion|session|sessid|authpwd|privpwd|(?:api|private|secret|access|signing|encryption|master|shared|account|client|service|session|license|ssh|hmac)keys?)$/;
+// A key whose last word names the form of a value (password_hash, token_value,
+// authorization_header, secret_plain) carries a credential when an earlier word names one.
+const CREDENTIAL_VALUE_FORM_WORDS = new Set(["value", "values", "plain", "plaintext", "data", "string", "text", "header", "raw", "encrypted", "hash", "digest", "blob", "content"]);
+const SESSION_ID_PATTERN = /sess(?:ion)?[_.-]?id$/i;
+const BOUND_KEY_SEGMENTS = new Set(["max", "min"]);
+const EXTRA_CREDENTIAL_KEYS = new Set(["x-pan-key", "x-redlock-auth", "proxy-authorization", "x-amz-signature", "x-amz-credential", "x-amz-security-token", "oauth_signature", "oauth_token", "oauth_verifier"]);
+// "pass" names a credential in a query string or an = assignment (user=a&pass=b), while a
+// "pass" count or verdict in a key: value pair is this module's own vocabulary.
+const ASSIGNMENT_ONLY_CREDENTIAL_WORDS = new Set(["pass"]);
+// JSON structure and literals after a key are never a credential value.
+const STRUCTURAL_VALUE_PATTERN = /^(?:[{[]|\{\}|\[\]|true|false|null)$/;
+// A bare integer under a plural credential word ("oauth_tokens": 1, keys=3, secrets: 0) is
+// a count, this module's own summary vocabulary, not a credential.
+const PLURAL_CREDENTIAL_WORDS = new Set(["tokens", "secrets", "keys", "cookies", "passwords", "credentials"]);
+const COUNT_VALUE_PATTERN = /^\d+(?:\s|$)/;
+// "code" names a credential only behind one of these words (registration_code,
+// activation_code, authorization_code, recovery_code); status_code, error_code, and
+// country_code stay evidence.
+const CREDENTIAL_CODE_QUALIFIERS = new Set(["registration", "activation", "linking", "auth", "authorization", "access", "verification", "recovery", "backup", "security", "mfa", "otp", "pairing", "enrollment", "license"]);
+
+function credentialKeyWord(segment: string): boolean {
+  return CREDENTIAL_KEY_WORDS.has(segment) || CREDENTIAL_KEY_SUFFIX_PATTERN.test(segment);
+}
+
+// The words of a key with trailing digits removed from each (password1, key2).
+function keyWords(key: string): string[] {
+  return propertyNameSegments(key).map((segment) => segment.replace(/\d+$/, "")).filter((segment) => segment.length > 0);
+}
+
+/** True when a name in a query string, header, attribute, or name-value pair carries a credential. */
+export function isCredentialKey(key: string): boolean {
+  if (SESSION_ID_PATTERN.test(key) || EXTRA_CREDENTIAL_KEYS.has(key.toLowerCase())) return true;
+  const words = keyWords(key);
+  const last = words[words.length - 1];
+  if (last === undefined || BOUND_KEY_SEGMENTS.has(words[0])) return false;
+  if ((last === "key" || last === "keys") && words.length > 1 && NON_CREDENTIAL_KEY_QUALIFIERS.has(words[words.length - 2])) return false;
+  if (last === "code" || last === "codes") return words.length > 1 && CREDENTIAL_CODE_QUALIFIERS.has(words[words.length - 2]);
+  if (credentialKeyWord(last)) return true;
+  return CREDENTIAL_VALUE_FORM_WORDS.has(last) && words.slice(0, -1).some(credentialKeyWord);
+}
+
+// True for a value that opens with a bare integer under a plural credential word: a count,
+// not a carrier (the rest of a key: value line is rescanned for pairs of its own).
+function isCountValue(key: string, value: string): boolean {
+  if (!COUNT_VALUE_PATTERN.test(value)) return false;
+  const words = keyWords(key);
+  return words.length > 0 && PLURAL_CREDENTIAL_WORDS.has(words[words.length - 1]);
+}
+
+/** isCredentialKey plus the words that name a credential only in a query string or = assignment. */
+function isCredentialAssignmentKey(key: string): boolean {
+  if (isCredentialKey(key)) return true;
+  const words = keyWords(key);
+  return words.length > 0 && ASSIGNMENT_ONLY_CREDENTIAL_WORDS.has(words[words.length - 1]);
+}
+
+// Token-shaped casing: the case changes more often than once every three letters
+// (bPxRfiCYcanaryKEY); words, acronyms, camelCase, and PascalCase change case at word
+// boundaries only (AWSLambdaBasicExecutionRole).
+function hasTokenCasing(letters: string): boolean {
+  if (letters.length < MIN_LETTERS_FOR_CASING) return false;
+  let changes = 0;
+  for (let index = 1; index < letters.length; index += 1) {
+    const previousLower = letters[index - 1] >= "a" && letters[index - 1] <= "z";
+    const currentLower = letters[index] >= "a" && letters[index] <= "z";
+    if (previousLower !== currentLower) changes += 1;
+  }
+  return changes * 3 > letters.length;
+}
+
+// A "-" or "_" separated segment shaped like part of a name: empty, digits alone, or letters
+// with at most one digit group (west2, sha256, vsys1, ethernet1) whose casing is not token-shaped.
+function isNameSegment(segment: string): boolean {
+  if (segment.length === 0 || DIGITS_ONLY_PATTERN.test(segment)) return true;
+  const digitGroups = segment.match(DIGIT_GROUP_PATTERN) ?? [];
+  if (digitGroups.length > 1) return false;
+  return !hasTokenCasing(segment.replace(DIGIT_GROUP_PATTERN, ""));
+}
+
+// A run is a token when it carries base64 symbols ("+" anywhere; "=" padding only where the
+// run is base64-shaped: a multiple of four characters with no "-" or "_", so "key=" left
+// in front of a marker is never padding and the rule stays idempotent), or when a
+// segment of MIN_TOKEN_SEGMENT_LENGTH or more is not name-shaped, or when at least half
+// of its segments are not. One short random-looking segment beside several names (the
+// six-character mkdtemp suffix of a temp path, a build id) does not make a token.
+function looksLikeToken(run: string): boolean {
+  const padding = /=+$/.exec(run)?.[0] ?? "";
+  const body = run.slice(0, run.length - padding.length);
+  if (UPPERCASE_CODE_PATTERN.test(body) || DIGITS_ONLY_PATTERN.test(body) || UUID_PATTERN.test(body)) return false;
+  if (body.includes("+")) return true;
+  if (padding.length > 0) return run.length % 4 === 0 && !/[-_]/.test(body);
+  const segments = body.split(/[-_]/).filter((segment) => segment.length > 0);
+  const tokenSegments = segments.filter((segment) => !isNameSegment(segment));
+  if (tokenSegments.length === 0) return false;
+  return tokenSegments.some((segment) => segment.length >= MIN_TOKEN_SEGMENT_LENGTH) || tokenSegments.length * 2 >= segments.length;
+}
+
+// A whole query value that is one token-shaped run (no path, dot, or percent escape inside).
+function isTokenShapedValue(value: string): boolean {
+  return TOKEN_VALUE_PATTERN.test(value) && looksLikeToken(value);
+}
+
+// The word after a scheme name is prose when it is a Titlecase word, a plain lowercase
+// word from the list above, or, after "Token", any plain lowercase word too short to be
+// a real token.
+function isSchemeProse(scheme: string, value: string): boolean {
+  if (TITLE_WORD_PATTERN.test(value)) return true;
+  if (!PLAIN_WORD_PATTERN.test(value)) return false;
+  if (SCHEME_PROSE_WORDS.has(value)) return true;
+  return scheme.toLowerCase() === "token" && value.length < LONG_TOKEN_MIN_LENGTH;
+}
+
+function isPublicPemLabel(label: string): boolean {
+  return PUBLIC_PEM_LABELS.has(label.trim());
+}
+
+function scrubPem(text: string, scope: PemScope): string {
+  const keeps = (label: string): boolean => {
+    switch (scope) {
+      case "all":
+        return false;
+      case "private":
+        return isPublicPemLabel(label);
+      default: {
+        const exhaustive: never = scope;
+        return exhaustive;
+      }
+    }
+  };
+  return text
+    .replace(PEM_BLOCK_PATTERN, (match, label: string) => (keeps(label) ? match : CREDENTIAL_REDACTION_MARKER))
+    .replace(PEM_OPEN_PATTERN, (match, label: string) => (keeps(label) ? match : CREDENTIAL_REDACTION_MARKER));
+}
+
+function scrubUrlUserinfo(url: string): string {
+  return url.replace(URL_USERINFO_PATTERN, `$1${CREDENTIAL_REDACTION_MARKER}@`);
+}
+
+// Where the value of a header line that starts at start ends: at the end of the line, at an
+// HTML tag, or at the quote that closes the text the line sits in. A quoted segment
+// ("value", 'value') is carried through its closing quote on the same line; a JSON-escaped
+// quote (\") is content, and once one has been seen the next unescaped quote closes the JSON
+// string the header line is embedded in. Trailing whitespace is not part of the value.
+function headerValueEnd(text: string, start: number): number {
+  let index = start;
+  let escapedQuotes = false;
+  while (index < text.length) {
+    const char = text[index];
+    if (HEADER_VALUE_TERMINATOR_PATTERN.test(char)) break;
+    if (char === "\\" && (text[index + 1] === '"' || text[index + 1] === "'")) {
+      escapedQuotes = true;
+      index += 2;
+      continue;
+    }
+    if (char === '"' || char === "'") {
+      if (escapedQuotes || (index > start && !HEADER_VALUE_OPENER_PATTERN.test(text[index - 1]))) break;
+      const close = text.indexOf(char, index + 1);
+      const segment = text.slice(index + 1, close === -1 ? text.length : close);
+      if (close !== -1 && !HEADER_VALUE_TERMINATOR_PATTERN.test(segment)) {
+        index = close + 1;
+        // A value that is one quoted string ends with its closing quote.
+        if (index - segment.length - 2 === start) return index;
+        continue;
+      }
+    }
+    index += 1;
+  }
+  while (index > start && /\s/.test(text[index - 1])) index -= 1;
+  return index;
+}
+
+// The quote a header value is wrapped in as a whole, or "" when it is not one quoted string.
+// JSON-escaped quotes are content of the string the line sits in and go with the value.
+function enclosingQuote(value: string): string {
+  return value.length >= 2 && (value[0] === '"' || value[0] === "'") && value[value.length - 1] === value[0] ? value[0] : "";
+}
+
+// Every credential-bearing header line loses its value whatever the value's shape; a value
+// that is one quoted string keeps its quotes around the marker so quoted text stays quoted.
+function scrubHeaderLines(text: string): string {
+  HEADER_LINE_PATTERN.lastIndex = 0;
+  let out = "";
+  let last = 0;
+  let match: RegExpExecArray | null;
+  while ((match = HEADER_LINE_PATTERN.exec(text)) !== null) {
+    const start = match.index + match[0].length;
+    const end = headerValueEnd(text, start);
+    const value = text.slice(start, end);
+    if (value.length === 0 || value.startsWith(CREDENTIAL_REDACTION_MARKER)) continue;
+    const quote = enclosingQuote(value);
+    if (value.slice(quote.length).startsWith(CREDENTIAL_REDACTION_MARKER)) continue;
+    out += `${text.slice(last, start)}${quote}${CREDENTIAL_REDACTION_MARKER}${quote}`;
+    last = end;
+    HEADER_LINE_PATTERN.lastIndex = end;
+  }
+  return last === 0 ? text : `${out}${text.slice(last)}`;
+}
+
+// The key and separator are matched on their own and the value is consumed only when the
+// key names a credential, so the value of an ordinary pair is rescanned and a credential
+// pair nested inside it (data=token=...) is still caught.
+function replaceCredentialAssignments(text: string): string {
+  ASSIGNMENT_KEY_PATTERN.lastIndex = 0;
+  let out = "";
+  let last = 0;
+  let match: RegExpExecArray | null;
+  while ((match = ASSIGNMENT_KEY_PATTERN.exec(text)) !== null) {
+    const [whole, openingQuote, key, separator, operator] = match;
+    if (!(operator === "=" ? isCredentialAssignmentKey(key) : isCredentialKey(key))) continue;
+    const valuePattern = operator === ":" ? LINE_VALUE_PATTERN : DELIMITED_VALUE_PATTERN;
+    valuePattern.lastIndex = match.index + whole.length;
+    const value = valuePattern.exec(text)?.[0];
+    if (value === undefined || STRUCTURAL_VALUE_PATTERN.test(value) || isCountValue(key, value)) continue;
+    out += `${text.slice(last, match.index)}${openingQuote}${key}${separator}${CREDENTIAL_REDACTION_MARKER}`;
+    last = match.index + whole.length + value.length;
+    ASSIGNMENT_KEY_PATTERN.lastIndex = last;
+  }
+  return last === 0 ? text : `${out}${text.slice(last)}`;
+}
+
+/** Every carrier rule (guard 1) plus the token shapes a prefix identifies on its own; the long-token rule is left to redactErrorText. */
+function scrubCarriers(text: string, pemScope: PemScope): string {
+  const scrubbed = scrubHeaderLines(scrubPem(text, pemScope)
+    .replace(TOKEN_IN_PATH_WEBHOOK_PATTERN, `$1${CREDENTIAL_REDACTION_MARKER}`)
+    .replace(EMBEDDED_URL_PATTERN, scrubUrlUserinfo)
+    .replace(QUERY_PAIR_PATTERN, (match, separator: string, key: string, value: string) => (isCredentialAssignmentKey(key) || isTokenShapedValue(value) ? `${separator}${key}=${CREDENTIAL_REDACTION_MARKER}` : match)))
+    .replace(SCHEME_VALUE_PATTERN, (match, scheme: string, value: string) => (isSchemeProse(scheme, value) ? match : `${scheme} ${CREDENTIAL_REDACTION_MARKER}`))
+    .replace(JSON_QUOTED_PAIR_PATTERN, (match, key: string, separator: string, value: string) => (isCredentialKey(key) && !isCountValue(key, value) ? `"${key}"${separator}"${CREDENTIAL_REDACTION_MARKER}"` : match))
+    .replace(QUOTED_ATTRIBUTE_PATTERN, (match, key: string, quote: string) => (isCredentialKey(key) ? `${key}=${quote}${CREDENTIAL_REDACTION_MARKER}${quote}` : match));
+  return replaceCredentialAssignments(scrubbed)
+    .replace(JWT_PATTERN, CREDENTIAL_REDACTION_MARKER)
+    .replace(PANOS_API_KEY_PATTERN, CREDENTIAL_REDACTION_MARKER)
+    .replace(AWS_ACCESS_KEY_ID_PATTERN, CREDENTIAL_REDACTION_MARKER);
+}
+
+/** The general scrub for error text: every carrier rule, every PEM block, and the long-token rule. Idempotent. */
+export function redactErrorText(text: string): string {
+  return scrubCarriers(text, "all").replace(LONG_TOKEN_RUN_PATTERN, (run) => (looksLikeToken(run) ? CREDENTIAL_REDACTION_MARKER : run));
+}
+
+/** Guard 2 on its own: every configured secret in every encoded form, for whole payloads and bundle files where the general scrub would remove evidence. */
+export function redactConfiguredSecrets(text: string, secrets: ReadonlyArray<string | undefined>): string {
+  const values = secrets.filter((value): value is string => typeof value === "string" && value.length >= MIN_CONFIGURED_SECRET_LENGTH);
+  if (values.length === 0) return text;
+  return scrubSensitiveValues(text, values).split(REDACTED_VALUE).join(CREDENTIAL_REDACTION_MARKER);
+}
+
+/**
+ * Every string inside a tool result or other plain value, with the configured secrets
+ * removed; a number whose decimal form is a configured secret becomes the marker too.
+ * Structure is never touched, so a short secret that matches a whole token (a PIN, a
+ * word) cannot break the JSON the value is serialized to.
+ */
+function sealValue<T>(value: T, secrets: ReadonlyArray<string | undefined>): T {
+  if (typeof value === "string") return redactConfiguredSecrets(value, secrets) as T;
+  if (typeof value === "number") return (secrets.includes(String(value)) ? CREDENTIAL_REDACTION_MARKER : value) as T;
+  if (Array.isArray(value)) return value.map((item) => sealValue(item, secrets)) as T;
+  if (value && typeof value === "object" && Object.getPrototypeOf(value) === Object.prototype) {
+    const output: JsonRecord = {};
+    for (const [key, entry] of Object.entries(value as JsonRecord)) output[key] = sealValue(entry, secrets);
+    return output as T;
+  }
+  return value;
+}
+
+/** The single sink every persisted or returned error string passes through. */
+function errorMessage(error: unknown): string {
+  return redactErrorText(error instanceof Error ? error.message : String(error));
+}
+
+/**
+ * status is the HTTP status the request observed (0 when no response arrived:
+ * timeout, DNS, TLS, or connection failure) and endpoint is "GET <path>" of the
+ * request that actually failed, so a marker or finding built from this error
+ * names only a request the run made.
+ */
 export class ZendeskApiError extends Error {
   readonly status: number;
+  readonly endpoint: string | null;
 
-  constructor(message: string, status: number) {
-    super(message);
+  constructor(message: string, status: number, endpoint: string | null = null) {
+    super(redactErrorText(message));
     this.name = "ZendeskApiError";
     this.status = status;
+    this.endpoint = endpoint;
   }
 }
 
-export const CREDENTIAL_REDACTION_MARKER = "[REDACTED]";
+function endpointLabel(url: string): string {
+  try {
+    return `GET ${new URL(url).pathname}`;
+  } catch {
+    return `GET ${url.split("?")[0]}`;
+  }
+}
 
 // A property name is split into lower-case segments on underscores, hyphens,
 // dots, spaces, and camelCase boundaries, so api_key, apiKey, APIKey, and the
@@ -380,8 +870,10 @@ export const CREDENTIAL_REDACTION_MARKER = "[REDACTED]";
 // X-Auth-Token) or a qualified key such as api_key, private_key, secret_key, or
 // signing_key. A bare key and public_key are kept, and ids, scopes, client ids,
 // dates, and usernames never match because their last segment is id, scopes,
-// at, or name. Only string values are replaced; objects and arrays are recursed,
-// so the authentication.agent.password policy object keeps its numeric fields.
+// at, or name. String and numeric values under a credential name are replaced;
+// objects and arrays are recursed, so the authentication.agent.password policy
+// object keeps its numeric fields (they sit under password_length and similar
+// names, not under password itself).
 const CREDENTIAL_LAST_SEGMENTS = new Set(["token", "secret", "password", "passwd", "pwd", "passphrase", "apikey", "authorization"]);
 const NON_CREDENTIAL_KEY_QUALIFIERS = new Set(["public"]);
 // Containers whose every string value is a credential apart from the name that
@@ -391,6 +883,24 @@ const NON_CREDENTIAL_KEY_QUALIFIERS = new Set(["public"]);
 // values are replaced).
 const HEADER_MAP_SEGMENTS = new Set(["headers", "custom_headers"]);
 const CREDENTIAL_CONTAINER_SAFE_KEYS = new Set(["username", "name"]);
+// A {name, value} pair whose name is a credential (an app parameter named api_token) or
+// any object flagged secure: true (owned app parameters) is a credential pair: its value
+// and default fields are replaced while the name, kind, and required flags are kept.
+const CREDENTIAL_PAIR_VALUE_KEYS = new Set(["value", "default", "default_value"]);
+
+/**
+ * The scrub for credentials carried inside string values rather than under a
+ * credential-named key: every carrier rule of redactErrorText (URL userinfo and
+ * credential query pairs; webhook services whose URL path is the secret; header,
+ * cookie, scheme, and credential-pair carriers; JSON encoded as a string; private
+ * PEM blocks) without the long-token rule, because an id, a scope, or a hash in
+ * evidence is not a secret, and with public PEM blocks kept because a certificate
+ * is evidence. Applied to every string kept in a snapshot, so target_url, endpoint,
+ * redirect_uri, url, and free-text settings are covered without naming them.
+ */
+export function redactCredentialValueText(text: string): string {
+  return scrubCarriers(text, "private");
+}
 
 function propertyNameSegments(name: string): string[] {
   return name
@@ -414,14 +924,26 @@ function isHeaderMapName(name: string): boolean {
   return HEADER_MAP_SEGMENTS.has(propertyNameSegments(name).join("_"));
 }
 
+function isCredentialPair(record: JsonRecord): boolean {
+  if (record.secure === true) return true;
+  const pairName = typeof record.name === "string" ? record.name : undefined;
+  return pairName !== undefined
+    && isCredentialPropertyName(pairName)
+    && [...CREDENTIAL_PAIR_VALUE_KEYS].some((key) => key in record);
+}
+
 function redactCredentialValue(value: unknown, insideContainer: boolean, parentKey: string | undefined): unknown {
+  if (typeof value === "string") return redactCredentialValueText(value);
   if (Array.isArray(value)) return value.map((item) => redactCredentialValue(item, insideContainer, parentKey));
   const record = asObject(value);
   if (!record) return value;
+  const credentialPair = isCredentialPair(record);
   const output: JsonRecord = {};
   for (const [key, entry] of Object.entries(record)) {
-    const credentialName = isCredentialPropertyName(key) || (insideContainer && !CREDENTIAL_CONTAINER_SAFE_KEYS.has(key.toLowerCase()));
-    if (credentialName && typeof entry === "string" && entry.length > 0) {
+    const credentialName = isCredentialPropertyName(key)
+      || (insideContainer && !CREDENTIAL_CONTAINER_SAFE_KEYS.has(key.toLowerCase()))
+      || (credentialPair && CREDENTIAL_PAIR_VALUE_KEYS.has(key));
+    if (credentialName && ((typeof entry === "string" && entry.length > 0) || typeof entry === "number")) {
       output[key] = CREDENTIAL_REDACTION_MARKER;
       continue;
     }
@@ -432,29 +954,39 @@ function redactCredentialValue(value: unknown, insideContainer: boolean, parentK
 }
 
 /**
- * Returns a deep copy of an API payload with every credential-bearing string
- * property replaced by CREDENTIAL_REDACTION_MARKER. Identifiers, scopes, client
- * ids, expiry and creation dates, usernames, header names, and every other
- * non-credential field are kept so the assessments read the redacted copy
- * unchanged.
+ * Returns a deep copy of an API payload with every credential-bearing string or
+ * numeric property replaced by CREDENTIAL_REDACTION_MARKER and every remaining
+ * string scrubbed of URL query credentials, URL userinfo, token-in-path webhook
+ * URLs, and JSON-encoded credential fields. Identifiers, scopes, client ids,
+ * expiry and creation dates, usernames, header names, URL schemes and hosts,
+ * and every other non-credential field are kept so the assessments read the
+ * redacted copy unchanged.
  */
 export function redactCredentialProperties(value: unknown): unknown {
   return redactCredentialValue(value, false, undefined);
 }
 
-function redactSecrets(text: string, secrets: Array<string | undefined>): string {
-  let output = text;
-  for (const secret of secrets) {
-    if (secret && secret.length >= 4) {
-      output = output.split(secret).join(CREDENTIAL_REDACTION_MARKER);
-    }
-  }
-  return output;
+/** The client-side scrub for a thrown message: the configured secrets in every form (guard 2), then the general scrub. */
+export function redactSecrets(message: string, secrets: ReadonlyArray<string | undefined>): string {
+  return redactErrorText(redactConfiguredSecrets(message, secrets));
 }
 
-function zendeskErrorSummary(payload: unknown): string | undefined {
+/**
+ * The secrets a resolved configuration puts on the wire: the API token and OAuth
+ * token as configured, and the Basic credential the client composes from them
+ * (base64 of email/token:api_token), which no encoding of the token alone matches.
+ */
+export function configuredZendeskSecrets(config: ZendeskResolvedConfig): string[] {
+  const secrets = [config.apiToken, config.oauthToken];
+  if (config.email && config.apiToken) secrets.push(Buffer.from(`${config.email}/token:${config.apiToken}`).toString("base64"));
+  return secrets.filter((value): value is string => typeof value === "string" && value.length >= MIN_CONFIGURED_SECRET_LENGTH);
+}
+
+// Zendesk's documented error fields: error, description, message, error.title,
+// error.message, and errors[].title or detail.
+function zendeskErrorFields(payload: unknown): string[] {
   const object = asObject(payload);
-  if (!object) return undefined;
+  if (!object) return [];
   const parts = [
     asString(object.error),
     asString(object.description),
@@ -463,7 +995,63 @@ function zendeskErrorSummary(payload: unknown): string | undefined {
     asString(asObject(object.error)?.message),
     ...asRecordArray(object.errors).map((item) => asString(item.title) ?? asString(item.detail)),
   ].filter((item): item is string => Boolean(item));
-  return parts.length > 0 ? [...new Set(parts)].join("; ") : undefined;
+  return [...new Set(parts)];
+}
+
+// The media type of a response is server-controlled text: it is quoted only when it has
+// the shape of a media type, otherwise it is described as unknown.
+const MEDIA_TYPE_PATTERN = /^[a-z0-9][a-z0-9!#$&^_.+-]{0,31}\/[a-z0-9][a-z0-9!#$&^_.+-]{0,39}$/;
+
+function mediaTypeOf(response: Response): string {
+  const value = response.headers.get("content-type")?.split(";")[0].trim().toLowerCase() ?? "";
+  return MEDIA_TYPE_PATTERN.test(value) ? value : "unknown";
+}
+
+// JSON.parse's own message quotes a window of the source, so it is never kept: a body
+// that is not JSON parses to undefined and is described by media type and size only.
+function parseJsonBody(rawText: string): { parsed: unknown } | undefined {
+  try {
+    return { parsed: JSON.parse(rawText) };
+  } catch {
+    return undefined;
+  }
+}
+
+function jsonValueKind(value: unknown): string {
+  if (value === null) return "null";
+  if (Array.isArray(value)) return "array";
+  return typeof value;
+}
+
+// Non-JSON bodies (HTML proxy pages, SSO interstitials, rate-limit pages) are described
+// by status, content type, and length only; JSON bodies contribute Zendesk's documented
+// error fields, each scrubbed before it is shortened, with the caller's scrub when it
+// knows the configured secrets, so the cut never leaves a fragment of a secret behind.
+export function describeErrorBody(response: Response, rawText: string, scrub: (text: string) => string = redactErrorText): string {
+  const base = `${response.status} ${response.statusText}`.trim();
+  if (rawText.length === 0) return base;
+  const body = parseJsonBody(rawText);
+  if (body === undefined) return `${base}; non-JSON ${mediaTypeOf(response)} response body (${rawText.length} bytes, not echoed)`;
+  const fields = zendeskErrorFields(body.parsed);
+  if (fields.length === 0) return `${base}; JSON response body without documented error fields (${rawText.length} bytes, not echoed)`;
+  return `${base}; ${fields.map((field) => scrub(field.replace(/\s+/g, " ")).slice(0, 200)).join("; ")}`;
+}
+
+/**
+ * A 2xx answer whose body is not the documented JSON document (an empty body, the HTML
+ * page a proxy or captive portal serves in place of the API, a foreign JSON value) is
+ * described like an error body, by status, media type, and size only, and is recorded
+ * as an unreadable surface: its missing members are never read as an empty inventory or
+ * a disabled setting. `member` names the documented member a JSON object lacked.
+ */
+export function describeNonDocumentBody(response: Response, rawText: string, member?: { key: string; kind: "array" | "object" }): string {
+  const base = `${response.status} ${response.statusText}`.trim();
+  const size = `${rawText.length} bytes, not echoed`;
+  if (member) return `${base} with a JSON response body without the documented "${member.key}" ${member.kind} (${size})`;
+  if (rawText.length === 0) return `${base} with an empty response body where the documented JSON document was expected`;
+  const body = parseJsonBody(rawText);
+  if (body === undefined) return `${base} with a non-JSON ${mediaTypeOf(response)} response body (${size}) where the documented JSON document was expected`;
+  return `${base} with a JSON ${jsonValueKind(body.parsed)} response body (${size}) where the documented JSON document was expected`;
 }
 
 function retryDelayMs(response: Response): number {
@@ -513,8 +1101,13 @@ export class ZendeskApiClient {
     }
   }
 
+  /** The configured secrets this client puts on the wire, for the tool boundary and bundle writer to remove from whole payloads (guard 2). */
+  get knownSecrets(): string[] {
+    return configuredZendeskSecrets(this.config);
+  }
+
   private redact(text: string): string {
-    return redactSecrets(text, [this.config.apiToken, this.config.oauthToken]);
+    return redactSecrets(text, this.knownSecrets);
   }
 
   buildUrl(pathOrUrl: string, query: JsonRecord = {}): string {
@@ -545,7 +1138,7 @@ export class ZendeskApiClient {
       });
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
-      throw new Error(this.redact(`Zendesk request failed for ${url}: ${message}`));
+      throw new ZendeskApiError(this.redact(`Zendesk request failed for ${url}: ${message}`), 0, endpointLabel(url));
     } finally {
       clearTimeout(timeout);
     }
@@ -562,25 +1155,51 @@ export class ZendeskApiClient {
   }
 
   async get(path: string, query: JsonRecord = {}): Promise<JsonRecord> {
-    const url = this.buildUrl(path, query);
+    return (await this.getDocument(this.buildUrl(path, query), path)).payload;
+  }
+
+  /**
+   * One read, with the shape guard every 2xx answer passes: a response whose body is
+   * not a JSON object (an empty body, the HTML page a proxy or captive portal serves,
+   * a foreign JSON value) is not the documented document. It is thrown as an
+   * unreadable surface carrying the status the request observed, so the collectors
+   * record it as an error with that status and never as an empty inventory.
+   */
+  private async getDocument(url: string, path: string): Promise<ZendeskDocument> {
     const response = await this.request(url);
     const rawText = await response.text();
-    let payload: JsonRecord = {};
-    if (rawText.length > 0) {
-      try {
-        payload = asObject(JSON.parse(rawText)) ?? {};
-      } catch {
-        payload = {};
-      }
-    }
     if (!response.ok) {
-      const detail = zendeskErrorSummary(payload) ?? rawText.slice(0, 200);
       throw new ZendeskApiError(
-        this.redact(`Zendesk request failed for ${path} (${response.status} ${response.statusText})${detail ? `: ${detail}` : ""}`),
+        this.redact(`Zendesk request failed for ${path} (${describeErrorBody(response, rawText, (text) => this.redact(text))})`),
         response.status,
+        endpointLabel(url),
       );
     }
-    return payload;
+    const payload = rawText.length === 0 ? undefined : asObject(parseJsonBody(rawText)?.parsed);
+    if (payload === undefined) {
+      throw new ZendeskApiError(this.redact(`Zendesk request ${endpointLabel(url)} returned ${describeNonDocumentBody(response, rawText)}`), response.status, endpointLabel(url));
+    }
+    return { payload, response, rawText, url };
+  }
+
+  // The documented collection member must be an array on every page; a 2xx page without
+  // it is a foreign document, not an empty page.
+  private documentedArray(document: ZendeskDocument, key: string): JsonRecord[] {
+    const { payload, response, rawText, url } = document;
+    if (!Array.isArray(payload[key])) {
+      throw new ZendeskApiError(this.redact(`Zendesk request ${endpointLabel(url)} returned ${describeNonDocumentBody(response, rawText, { key, kind: "array" })}`), response.status, endpointLabel(url));
+    }
+    return asRecordArray(payload[key]);
+  }
+
+  // The documented object member must be present; a 2xx document without it is foreign.
+  private async documentedObject(path: string, key: string, query: JsonRecord = {}): Promise<JsonRecord> {
+    const document = await this.getDocument(this.buildUrl(path, query), path);
+    const value = asObject(document.payload[key]);
+    if (value === undefined) {
+      throw new ZendeskApiError(this.redact(`Zendesk request ${endpointLabel(document.url)} returned ${describeNonDocumentBody(document.response, document.rawText, { key, kind: "object" })}`), document.response.status, endpointLabel(document.url));
+    }
+    return value;
   }
 
   async listCursor(
@@ -603,19 +1222,33 @@ export class ZendeskApiClient {
     let truncated = false;
 
     while (nextUrl) {
-      const payload: JsonRecord = await this.get(nextUrl);
+      const document = await this.getDocument(this.buildUrl(nextUrl), nextUrl);
+      const payload = document.payload;
       pages += 1;
-      const pageItems = asRecordArray(payload[collectionKey]);
+      const pageItems = this.documentedArray(document, collectionKey);
       const added = appendUnique(items, seen, pageItems);
       const meta = asObject(payload.meta);
       const hasMore = asBoolean(meta?.has_more);
       const afterCursor = asString(meta?.after_cursor);
-      const continuation = asString(asObject(payload.links)?.next)
-        ?? (afterCursor ? this.buildUrl(path, { ...baseQuery, "page[after]": afterCursor }) : undefined)
-        ?? asString(payload.next_page);
-      if (pageItems.length === 0 || added === 0 || hasMore === false) break;
+      // meta.has_more=false is Zendesk's documented end marker and wins over a
+      // links.next value that some endpoints still return on the last page.
+      const continuation = hasMore === false
+        ? undefined
+        : asString(asObject(payload.links)?.next)
+          ?? (afterCursor ? this.buildUrl(path, { ...baseQuery, "page[after]": afterCursor }) : undefined)
+          ?? asString(payload.next_page);
+      if (pageItems.length === 0 || added === 0) {
+        // An empty or fully repeated page while the server still promises more is a
+        // cursor that stopped advancing, so the inventory is partial rather than complete.
+        truncated = hasMore === true || Boolean(continuation);
+        break;
+      }
       if (!continuation) {
         truncated = hasMore === true;
+        break;
+      }
+      if (continuation === nextUrl) {
+        truncated = true;
         break;
       }
       if (items.length >= maxItems || pages >= DEFAULT_MAX_PAGES) {
@@ -643,14 +1276,26 @@ export class ZendeskApiClient {
     let truncated = false;
 
     while (nextUrl) {
-      const payload: JsonRecord = await this.get(nextUrl);
+      const document = await this.getDocument(this.buildUrl(nextUrl), nextUrl);
+      const payload = document.payload;
       pages += 1;
-      const pageItems = asRecordArray(payload[collectionKey]);
+      const pageItems = this.documentedArray(document, collectionKey);
       const added = appendUnique(items, seen, pageItems);
-      if (pageItems.length === 0 || added === 0 || payload.next_page === null) break;
+      // next_page=null is the documented end marker; an absent next_page after a full
+      // page means the endpoint did not paginate itself, so the next offset is requested.
       const continuation = asString(payload.next_page)
-        ?? (pageItems.length >= perPage ? this.buildUrl(path, { ...query, per_page: perPage, page: pages + 1 }) : undefined);
+        ?? (payload.next_page === null || pageItems.length < perPage ? undefined : this.buildUrl(path, { ...query, per_page: perPage, page: pages + 1 }));
+      if (pageItems.length === 0 || added === 0) {
+        // An empty or replayed page while a continuation still exists is an offset the
+        // server ignored, so the inventory is partial rather than complete.
+        truncated = Boolean(continuation);
+        break;
+      }
       if (!continuation) break;
+      if (continuation === nextUrl) {
+        truncated = true;
+        break;
+      }
       if (items.length >= maxItems || pages >= DEFAULT_MAX_PAGES) {
         truncated = true;
         break;
@@ -662,18 +1307,15 @@ export class ZendeskApiClient {
   }
 
   async getCurrentUser(): Promise<JsonRecord> {
-    const payload = await this.get("/users/me");
-    return asObject(payload.user) ?? {};
+    return this.documentedObject("/users/me", "user");
   }
 
   async getAccountSettings(): Promise<JsonRecord> {
-    const payload = await this.get("/account/settings");
-    return asObject(payload.settings) ?? {};
+    return this.documentedObject("/account/settings", "settings");
   }
 
   async getSecuritySettings(): Promise<JsonRecord> {
-    const payload = await this.get("/security_settings");
-    return asObject(payload.security_settings) ?? {};
+    return this.documentedObject("/security_settings", "security_settings");
   }
 
   async listTeamMembers(maxItems?: number): Promise<ZendeskListResult> {
@@ -698,8 +1340,9 @@ export class ZendeskApiClient {
   }
 
   async getOldestAuditLog(): Promise<JsonRecord | undefined> {
-    const payload = await this.get("/audit_logs", { sort: "created_at", "page[size]": 1 });
-    return asRecordArray(payload.audit_logs)[0];
+    const path = "/audit_logs";
+    const document = await this.getDocument(this.buildUrl(path, { sort: "created_at", "page[size]": 1 }), path);
+    return this.documentedArray(document, "audit_logs")[0];
   }
 
   async listApiTokenAuditLogs(maxItems?: number): Promise<ZendeskListResult> {
@@ -801,31 +1444,71 @@ export type ZendeskReadClient = Pick<
   | "listSuspendedTickets"
 >;
 
+type ZendeskReadMethod = Exclude<keyof ZendeskReadClient, "getResolvedConfig">;
+
+// The request each read method makes, recorded in collection status and in the
+// not-collected marker of a read that never produced data. A failed read names the
+// request that actually failed (from ZendeskApiError.endpoint) ahead of this label.
+const READ_ENDPOINTS: Record<ZendeskReadMethod, string> = {
+  getCurrentUser: "GET /api/v2/users/me",
+  getAccountSettings: "GET /api/v2/account/settings",
+  getSecuritySettings: "GET /api/v2/security_settings",
+  listTeamMembers: "GET /api/v2/users",
+  listCustomRoles: "GET /api/v2/custom_roles",
+  listGroups: "GET /api/v2/groups",
+  listGroupMemberships: "GET /api/v2/group_memberships",
+  listRecentAuditLogs: "GET /api/v2/audit_logs",
+  getOldestAuditLog: "GET /api/v2/audit_logs",
+  listApiTokenAuditLogs: "GET /api/v2/audit_logs",
+  listDeletionSchedules: "GET /api/v2/deletion_schedules",
+  listOAuthClients: "GET /api/v2/oauth/clients",
+  listOAuthTokens: "GET /api/v2/oauth/tokens",
+  listAppInstallations: "GET /api/v2/apps/installations",
+  listOwnedApps: "GET /api/v2/apps/owned",
+  listBrands: "GET /api/v2/brands",
+  listWebhooks: "GET /api/v2/webhooks",
+  listTargets: "GET /api/v2/targets",
+  listTriggers: "GET /api/v2/triggers",
+  listAutomations: "GET /api/v2/automations",
+  listSharingAgreements: "GET /api/v2/sharing_agreements",
+  listSuspendedTickets: "GET /api/v2/suspended_tickets",
+};
+
 // Every API read the assessments keep passes through here, so the in-memory
 // snapshot, the core_data/ files, the analysis/ objects, and the tool results
-// all see the redacted copy and never the raw credential values.
-async function snapshot<T>(load: () => Promise<T>): Promise<ZendeskSnapshot<T>> {
+// all see the redacted copy and never the raw credential values. Error strings
+// pass through the same unanchored scrub as the constructor, so a message built
+// at a throw site cannot reach a finding, summary, _errors.log, or bundle unscrubbed.
+// A failed read records the request that failed and the HTTP status it observed
+// (absent when no response arrived), never a defaulted status.
+async function snapshot<T>(method: ZendeskReadMethod, load: () => Promise<T>): Promise<ZendeskSnapshot<T>> {
+  const endpoint = READ_ENDPOINTS[method];
   try {
-    return { status: "ok", data: redactCredentialProperties(await load()) as T };
+    return { status: "ok", data: redactCredentialProperties(await load()) as T, endpoint };
   } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
+    const message = errorMessage(error);
     if (error instanceof ZendeskApiError) {
-      if (error.status === 401 || error.status === 403) return { status: "forbidden", error: message, httpStatus: error.status };
-      if (error.status === 404) return { status: "not_found", error: message, httpStatus: error.status };
-      return { status: "error", error: message, httpStatus: error.status };
+      const observed = error.endpoint ?? endpoint;
+      const httpStatus = error.status > 0 ? error.status : undefined;
+      if (error.status === 401 || error.status === 403) return { status: "forbidden", error: message, httpStatus, endpoint: observed };
+      if (error.status === 404) return { status: "not_found", error: message, httpStatus, endpoint: observed };
+      return { status: "error", error: message, httpStatus, endpoint: observed };
     }
-    return { status: "error", error: message };
+    return { status: "error", error: message, endpoint };
   }
 }
 
+// The status named here is the one the failed request observed; forbidden and
+// not_found are only ever assigned from an observed 401, 403, or 404.
 function snapshotCause(name: string, snap: ZendeskSnapshot<unknown>): string {
+  const observed = snap.httpStatus === undefined ? "an error without an HTTP status" : String(snap.httpStatus);
   switch (snap.status) {
     case "ok":
       return `${name} was readable.`;
     case "forbidden":
-      return `${name} returned ${snap.httpStatus ?? 403} (credential lacks permission).`;
+      return `${name} returned ${observed} (credential lacks permission).`;
     case "not_found":
-      return `${name} returned 404 (endpoint unavailable on this account or plan).`;
+      return `${name} returned ${observed} (endpoint unavailable on this account or plan).`;
     case "error":
       return `${name} could not be read: ${snap.error ?? "unknown error"}.`;
     default: {
@@ -835,10 +1518,63 @@ function snapshotCause(name: string, snap: ZendeskSnapshot<unknown>): string {
   }
 }
 
+/**
+ * Written to core_data/ and carried in the analysis snapshots in place of a list
+ * or object that was refused, failed, or never produced data, so a bundle
+ * consumer cannot mistake a denial for an empty inventory. status is the HTTP
+ * status the failed request observed (null when no response arrived).
+ */
+function notCollectedMarker(snap: ZendeskSnapshot<unknown>): JsonRecord {
+  return {
+    collected: false,
+    status: snap.httpStatus ?? null,
+    dataset_status: snap.status,
+    endpoint: snap.endpoint ?? null,
+    error: snap.error ?? null,
+  };
+}
+
+function collectedOrMarker(snap: ZendeskSnapshot<unknown>): unknown {
+  return snap.status === "ok" ? snap.data ?? null : notCollectedMarker(snap);
+}
+
+function isListResult(value: unknown): value is ZendeskListResult {
+  const record = asObject(value);
+  return record !== undefined && Array.isArray(record.items) && typeof record.truncated === "boolean";
+}
+
+// Per-read collection status for assessment summaries. seen, truncated, and pages
+// are counts of what the read actually did, so a read that never ran reports null
+// for all three rather than 0, false, or 1.
+function collectionStatusOf(snap: ZendeskSnapshot<unknown>): JsonRecord {
+  const list = snap.status === "ok" && isListResult(snap.data) ? snap.data : undefined;
+  const readObject = snap.status === "ok" && !list;
+  return {
+    status: snap.status,
+    endpoint: snap.endpoint ?? null,
+    http_status: snap.httpStatus ?? null,
+    seen: list ? list.items.length : readObject ? (snap.data === undefined || snap.data === null ? 0 : 1) : null,
+    truncated: list ? list.truncated : readObject ? false : null,
+    pages: list ? list.pages : null,
+    error: snap.error ?? null,
+  };
+}
+
+function collectionSummary(entries: Array<[string, ZendeskSnapshot<unknown>]>): JsonRecord {
+  return Object.fromEntries(entries.map(([name, snap]) => [name, collectionStatusOf(snap)]));
+}
+
+function snapshotsForBundle(entries: Array<[string, ZendeskSnapshot<unknown>]>): Record<string, unknown> {
+  return Object.fromEntries(entries.map(([name, snap]) => [name, collectedOrMarker(snap)]));
+}
+
+// The line reads "<name> dataset: <error>", never "<name>: <error>": a dataset named for
+// what it holds (oauth_tokens) followed by a colon is a credential pair to the scrub, and
+// the whole message after it would be replaced.
 function snapshotErrors(entries: Array<[string, ZendeskSnapshot<unknown>]>): string[] {
   return entries
     .filter(([, snap]) => snap.status !== "ok")
-    .map(([name, snap]) => `${name}: ${snap.error ?? snap.status}`);
+    .map(([name, snap]) => `${name} dataset: ${snap.error ?? snap.status}`);
 }
 
 function finding(
@@ -880,10 +1616,48 @@ function isTruncated(snap: ZendeskSnapshot<ZendeskListResult>): boolean {
   return snap.data?.truncated === true;
 }
 
+// Evidence truncation flag over one or more inventories: true when any readable one
+// stopped early, null when none did but one was never read (its paging outcome does
+// not exist, so false would be a defaulted flag), false only when every inventory was
+// read to completion.
+function truncationOrNull(...snaps: Array<ZendeskSnapshot<ZendeskListResult>>): boolean | null {
+  if (snaps.some(isTruncated)) return true;
+  return snaps.some((snap) => snap.status !== "ok") ? null : false;
+}
+
 function truncationNote(name: string, snap: ZendeskSnapshot<ZendeskListResult>): string {
   return isTruncated(snap)
-    ? ` The ${name} inventory was truncated after ${listSnapshotItems(snap).length} items (more pages exist), so the verdict is limited to the seen population.`
+    ? ` The ${name} inventory was truncated after ${listSnapshotItems(snap).length} items (more pages exist or the cursor stopped advancing), so the verdict is limited to the seen population.`
     : "";
+}
+
+// Evidence and summary counts derived from a dataset that could not be read render as
+// null rather than 0 or [], so an unread inventory is never mistaken for an empty one.
+function countOrNull(snap: ZendeskSnapshot<unknown>, count: number): number | null {
+  return snap.status === "ok" ? count : null;
+}
+
+function listCountOrNull(snap: ZendeskSnapshot<ZendeskListResult>): number | null {
+  return countOrNull(snap, listSnapshotItems(snap).length);
+}
+
+function listOrNull<T>(snap: ZendeskSnapshot<unknown>, values: T[]): T[] | null {
+  return snap.status === "ok" ? values : null;
+}
+
+// Rule 1 corollary: a finding that read several inventories may not pass when a
+// secondary one was unreadable, even when the pass branch did not consume it, because
+// the reviewer cannot tell a verified absence from an unread one. The cause is named and
+// the secondaries are recorded in evidence.
+function capForUnreadable(item: ZendeskFinding, secondaries: Array<[string, ZendeskSnapshot<unknown>]>): ZendeskFinding {
+  const unreadable = secondaries.filter(([, snap]) => snap.status !== "ok");
+  if (item.status !== "pass" || unreadable.length === 0) return item;
+  return {
+    ...item,
+    status: "warn",
+    summary: `${item.summary} Verdict capped at warn because a secondary inventory could not be read: ${unreadable.map(([name, snap]) => snapshotCause(name, snap)).join(" ")}`,
+    evidence: { ...(item.evidence ?? {}), verdict_capped_by_unreadable: unreadable.map(([name]) => name) },
+  };
 }
 
 function partitionByDate(
@@ -959,51 +1733,58 @@ function externalNotificationActions(rule: JsonRecord): Array<{ field: string; d
 
 export async function checkZendeskAccess(client: ZendeskReadClient): Promise<ZendeskAccessCheckResult> {
   const config = client.getResolvedConfig();
-  const currentUser = await snapshot(() => client.getCurrentUser());
+  const currentUser = await snapshot("getCurrentUser", () => client.getCurrentUser());
   const currentUserRole = asString(currentUser.data?.role);
 
   const probes: Array<{
     name: string;
     endpoint: string;
     requiredRole: ZendeskAccessSurface["requiredRole"];
+    method: ZendeskReadMethod;
     load: () => Promise<unknown>;
     count?: (value: unknown) => number | undefined;
   }> = [
-    { name: "current_user", endpoint: "/api/v2/users/me", requiredRole: "agent", load: () => client.getCurrentUser(), count: () => 1 },
-    { name: "account_settings", endpoint: "/api/v2/account/settings", requiredRole: "agent", load: () => client.getAccountSettings(), count: () => 1 },
-    { name: "security_settings", endpoint: "/api/v2/security_settings", requiredRole: "admin", load: () => client.getSecuritySettings(), count: () => 1 },
-    { name: "team_members", endpoint: "/api/v2/users?role[]=agent&role[]=admin", requiredRole: "agent", load: () => client.listTeamMembers(200) },
-    { name: "custom_roles", endpoint: "/api/v2/custom_roles", requiredRole: "admin-enterprise", load: () => client.listCustomRoles() },
-    { name: "deletion_schedules", endpoint: "/api/v2/deletion_schedules", requiredRole: "admin", load: () => client.listDeletionSchedules() },
-    { name: "groups", endpoint: "/api/v2/groups", requiredRole: "agent", load: () => client.listGroups(200) },
-    { name: "group_memberships", endpoint: "/api/v2/group_memberships", requiredRole: "agent", load: () => client.listGroupMemberships(200) },
-    { name: "audit_logs", endpoint: "/api/v2/audit_logs", requiredRole: "admin-enterprise", load: () => client.listRecentAuditLogs(1) },
-    { name: "oauth_clients", endpoint: "/api/v2/oauth/clients", requiredRole: "admin", load: () => client.listOAuthClients(100) },
-    { name: "oauth_tokens", endpoint: "/api/v2/oauth/tokens?all=true", requiredRole: "admin", load: () => client.listOAuthTokens(100) },
-    { name: "app_installations", endpoint: "/api/v2/apps/installations", requiredRole: "agent", load: () => client.listAppInstallations() },
-    { name: "owned_apps", endpoint: "/api/v2/apps/owned", requiredRole: "admin", load: () => client.listOwnedApps() },
-    { name: "brands", endpoint: "/api/v2/brands", requiredRole: "admin", load: () => client.listBrands(100) },
-    { name: "webhooks", endpoint: "/api/v2/webhooks", requiredRole: "agent", load: () => client.listWebhooks(100) },
-    { name: "targets", endpoint: "/api/v2/targets", requiredRole: "agent", load: () => client.listTargets() },
-    { name: "triggers", endpoint: "/api/v2/triggers", requiredRole: "agent", load: () => client.listTriggers(100) },
-    { name: "automations", endpoint: "/api/v2/automations", requiredRole: "agent", load: () => client.listAutomations(100) },
-    { name: "sharing_agreements", endpoint: "/api/v2/sharing_agreements", requiredRole: "agent", load: () => client.listSharingAgreements() },
-    { name: "suspended_tickets", endpoint: "/api/v2/suspended_tickets", requiredRole: "admin", load: () => client.listSuspendedTickets(100) },
+    { name: "current_user", endpoint: "/api/v2/users/me", requiredRole: "agent", method: "getCurrentUser", load: () => client.getCurrentUser(), count: () => 1 },
+    { name: "account_settings", endpoint: "/api/v2/account/settings", requiredRole: "agent", method: "getAccountSettings", load: () => client.getAccountSettings(), count: () => 1 },
+    { name: "security_settings", endpoint: "/api/v2/security_settings", requiredRole: "admin", method: "getSecuritySettings", load: () => client.getSecuritySettings(), count: () => 1 },
+    { name: "team_members", endpoint: "/api/v2/users?role[]=agent&role[]=admin", requiredRole: "agent", method: "listTeamMembers", load: () => client.listTeamMembers(200) },
+    { name: "custom_roles", endpoint: "/api/v2/custom_roles", requiredRole: "admin-enterprise", method: "listCustomRoles", load: () => client.listCustomRoles() },
+    { name: "deletion_schedules", endpoint: "/api/v2/deletion_schedules", requiredRole: "admin", method: "listDeletionSchedules", load: () => client.listDeletionSchedules() },
+    { name: "groups", endpoint: "/api/v2/groups", requiredRole: "agent", method: "listGroups", load: () => client.listGroups(200) },
+    { name: "group_memberships", endpoint: "/api/v2/group_memberships", requiredRole: "agent", method: "listGroupMemberships", load: () => client.listGroupMemberships(200) },
+    { name: "audit_logs", endpoint: "/api/v2/audit_logs", requiredRole: "admin-enterprise", method: "listRecentAuditLogs", load: () => client.listRecentAuditLogs(1) },
+    { name: "oauth_clients", endpoint: "/api/v2/oauth/clients", requiredRole: "admin", method: "listOAuthClients", load: () => client.listOAuthClients(100) },
+    { name: "oauth_tokens", endpoint: "/api/v2/oauth/tokens?all=true", requiredRole: "admin", method: "listOAuthTokens", load: () => client.listOAuthTokens(100) },
+    { name: "app_installations", endpoint: "/api/v2/apps/installations", requiredRole: "agent", method: "listAppInstallations", load: () => client.listAppInstallations() },
+    { name: "owned_apps", endpoint: "/api/v2/apps/owned", requiredRole: "admin", method: "listOwnedApps", load: () => client.listOwnedApps() },
+    { name: "brands", endpoint: "/api/v2/brands", requiredRole: "admin", method: "listBrands", load: () => client.listBrands(100) },
+    { name: "webhooks", endpoint: "/api/v2/webhooks", requiredRole: "agent", method: "listWebhooks", load: () => client.listWebhooks(100) },
+    { name: "targets", endpoint: "/api/v2/targets", requiredRole: "agent", method: "listTargets", load: () => client.listTargets() },
+    { name: "triggers", endpoint: "/api/v2/triggers", requiredRole: "agent", method: "listTriggers", load: () => client.listTriggers(100) },
+    { name: "automations", endpoint: "/api/v2/automations", requiredRole: "agent", method: "listAutomations", load: () => client.listAutomations(100) },
+    { name: "sharing_agreements", endpoint: "/api/v2/sharing_agreements", requiredRole: "agent", method: "listSharingAgreements", load: () => client.listSharingAgreements() },
+    { name: "suspended_tickets", endpoint: "/api/v2/suspended_tickets", requiredRole: "admin", method: "listSuspendedTickets", load: () => client.listSuspendedTickets(100) },
   ];
 
+  // A failed probe carries the status its request observed and null for count and
+  // truncated: nothing was read, so nothing is counted and no paging outcome exists.
   const surfaces: ZendeskAccessSurface[] = [];
   for (const probe of probes) {
-    const snap = probe.name === "current_user" ? currentUser : await snapshot(probe.load);
-    const items = asObject(snap.data)?.items;
+    const snap = probe.name === "current_user" ? currentUser : await snapshot(probe.method, probe.load);
+    const listResult = asObject(snap.data);
+    const items = listResult?.items;
     surfaces.push({
       name: probe.name,
       endpoint: probe.endpoint,
       requiredRole: probe.requiredRole,
       status: snap.status === "ok" ? "readable" : snap.status,
-      count: snap.status === "ok" ? (probe.count ? probe.count(snap.data) : Array.isArray(items) ? items.length : undefined) : undefined,
+      count: snap.status === "ok" ? (probe.count ? probe.count(snap.data) : Array.isArray(items) ? items.length : undefined) ?? null : null,
+      ...(snap.status === "ok" ? (Array.isArray(items) ? { truncated: listResult?.truncated === true } : {}) : { truncated: null }),
+      httpStatus: snap.httpStatus ?? null,
       error: snap.error,
     });
   }
+  const truncatedProbes = surfaces.filter((surface) => surface.truncated === true).map((surface) => surface.name);
 
   const coreReadable = ["current_user", "account_settings", "team_members"].every((name) =>
     surfaces.find((surface) => surface.name === name)?.status === "readable");
@@ -1011,8 +1792,12 @@ export async function checkZendeskAccess(client: ZendeskReadClient): Promise<Zen
     .filter((surface) => surface.status === "forbidden")
     .map((surface) => `${surface.name} requires ${surface.requiredRole === "agent" ? "an agent" : surface.requiredRole === "admin" ? "an admin" : "an Enterprise admin"} credential (${surface.endpoint}).`);
   const unavailable = surfaces.filter((surface) => surface.status === "not_found").map((surface) => surface.name);
+  // A surface that failed or answered a 2xx without the documented document produced no
+  // data, so the check is limited: a healthy verdict is never rendered over a surface
+  // the run could not read.
+  const unreadable = surfaces.filter((surface) => surface.status === "error").map((surface) => surface.name);
   const readableCount = surfaces.filter((surface) => surface.status === "readable").length;
-  const status = coreReadable && missingPermissions.length === 0 ? "healthy" : "limited";
+  const status = coreReadable && missingPermissions.length === 0 && unreadable.length === 0 ? "healthy" : "limited";
 
   return {
     status,
@@ -1026,11 +1811,15 @@ export async function checkZendeskAccess(client: ZendeskReadClient): Promise<Zen
       `Authenticated as ${currentUser.status === "ok" ? `${userLabel(currentUser.data ?? {})} (role: ${currentUserRole ?? "unknown"})` : "an unknown principal (current user lookup failed)"}.`,
       `${readableCount}/${surfaces.length} Zendesk audit surfaces are readable.`,
       ...(unavailable.length > 0 ? [`Unavailable on this account or plan: ${unavailable.join(", ")}.`] : []),
+      ...(unreadable.length > 0 ? [`Not read (the request failed or answered without the documented JSON document; see the surface errors): ${unreadable.join(", ")}. Their findings render manual or capped until they are readable.`] : []),
+      ...(truncatedProbes.length > 0 ? [`Probe counts for ${truncatedProbes.join(", ")} are capped samples (marked +), not the full population; the assessment tools page to max_items.`] : []),
       ...(currentUserRole && currentUserRole !== "admin" ? ["The credential is not an admin, so admin-only surfaces (security settings, deletion schedules, OAuth clients and tokens, audit logs, owned apps, brands, suspended tickets) will render as manual findings."] : []),
     ],
     recommendedNextStep: status === "healthy"
       ? "Run zendesk_assess_authentication, zendesk_assess_access_control, zendesk_assess_data_protection, zendesk_assess_integrations, or zendesk_export_audit_bundle."
-      : "Use an admin API token or OAuth token with read scope so the admin-only surfaces become readable, then rerun zendesk_check_access.",
+      : missingPermissions.length > 0
+        ? "Use an admin API token or OAuth token with read scope so the admin-only surfaces become readable, then rerun zendesk_check_access."
+        : "Check the network path to the Zendesk API (a proxy or sign-in page answering in place of it, or an outage) for the surfaces that were not read, then rerun zendesk_check_access.",
   };
 }
 
@@ -1170,8 +1959,11 @@ function assessAgentTwoFactor(
     seen_team_members: teamMembers.length,
     inventory_truncated: truncated,
     without_two_factor: withoutTwoFactor.slice(0, 50).map(userLabel),
+    without_two_factor_partial: truncated,
     two_factor_flag_missing: unknownTwoFactor.slice(0, 50).map(userLabel),
+    two_factor_flag_missing_partial: truncated,
   };
+  const atLeast = truncated ? "at least " : "";
   if (securitySnap.status !== "ok") {
     return withoutTwoFactor.length > 0
       ? finding(2, title, "critical", "fail", `${withoutTwoFactor.length}/${teamMembers.length} active team members report two_factor_auth_enabled=false. ${enforcementText}${truncationNote("team member", teamSnap)}`, evidence)
@@ -1187,7 +1979,7 @@ function assessAgentTwoFactor(
     return finding(2, title, "critical", "fail", `security_settings.authentication.agent.two_factor_enforce=false: the account does not require 2FA, so per-user enrollment is optional even though ${perUser}${withoutTwoFactor.length > 0 ? ` and ${withoutTwoFactor.length} report it disabled` : ""}.${truncationNote("team member", teamSnap)}`, evidence);
   }
   if (withoutTwoFactor.length > 0 || unknownTwoFactor.length > 0 || truncated) {
-    return finding(2, title, "critical", "warn", `two_factor_enforce=true, but ${withoutTwoFactor.length} team members report two_factor_auth_enabled=false (not yet enrolled) and ${unknownTwoFactor.length} did not expose the flag (${perUser}).${truncationNote("team member", teamSnap)}`, evidence);
+    return finding(2, title, "critical", "warn", `two_factor_enforce=true, but ${atLeast}${withoutTwoFactor.length} team members report two_factor_auth_enabled=false (not yet enrolled) and ${atLeast}${unknownTwoFactor.length} did not expose the flag (${perUser}).${truncationNote("team member", teamSnap)}`, evidence);
   }
   return finding(2, title, "critical", "pass", `security_settings.authentication.agent.two_factor_enforce=true and all ${teamMembers.length} active team members report two_factor_auth_enabled=true; the inventory was read to completion.`, evidence);
 }
@@ -1331,8 +2123,13 @@ function assessEndUserAuthentication(
   const title = "End-user authentication required (no anonymous tickets)";
   const anonymousInstruction = "capture Admin Center > People > Configuration > End users showing that 'Anybody can submit tickets' is disabled (or that sign-in is required), which the API does not expose.";
   const passwordApiAccess = settingsSnap.status === "ok" ? asBoolean(apiSettings.api_password_access_end_users) : undefined;
-  const apiNote = passwordApiAccess === true ? " Note: settings.api.api_password_access_end_users=true, so end users may call the API with email and password; review whether that is intended." : "";
-  const baseEvidence: JsonRecord = { api_password_access_end_users: passwordApiAccess ?? null, security_settings_status: securitySnap.status };
+  const apiNote = settingsSnap.status !== "ok"
+    ? ` settings.api.api_password_access_end_users could not be verified: ${snapshotCause("Account settings (/account/settings)", settingsSnap)}`
+    : passwordApiAccess === true
+      ? " Note: settings.api.api_password_access_end_users=true, so end users may call the API with email and password; review whether that is intended."
+      : "";
+  const baseEvidence: JsonRecord = { api_password_access_end_users: passwordApiAccess ?? null, account_settings_status: settingsSnap.status, security_settings_status: securitySnap.status };
+  const cap = (item: ZendeskFinding): ZendeskFinding => capForUnreadable(item, [["Account settings (/account/settings)", settingsSnap]]);
   if (securitySnap.status !== "ok") {
     return manualFinding(21, title, "high", `${snapshotCause(SECURITY_SETTINGS_SOURCE, securitySnap)}${apiNote}`, `capture Admin Center > Account > Security > End user authentication and ${anonymousInstruction}`, baseEvidence);
   }
@@ -1350,7 +2147,7 @@ function assessEndUserAuthentication(
   }
   const manualPortion = ` The anonymous submission setting is a separate manual check: ${anonymousInstruction}`;
   if (enforceSso && methods.length > 0) {
-    return finding(21, title, "high", "pass", `authentication.end_user.enforce_sso=true: end users must sign in through ${methods.join(", ")} and Zendesk password sign-in is disabled.${apiNote}${manualPortion}`, evidence);
+    return cap(finding(21, title, "high", "pass", `authentication.end_user.enforce_sso=true: end users must sign in through ${methods.join(", ")} and Zendesk password sign-in is disabled.${apiNote}${manualPortion}`, evidence));
   }
   if (enforceSso) {
     return finding(21, title, "high", "warn", `authentication.end_user.enforce_sso=true but no SSO method is enabled for end users; confirm how end users sign in.${apiNote}${manualPortion}`, evidence);
@@ -1358,11 +2155,11 @@ function assessEndUserAuthentication(
   if (zendeskLogin) {
     const social = methods.length > 0 ? ` Additional sign-in methods: ${methods.join(", ")}.` : "";
     return policyName === "recommended" || policyName === "high"
-      ? finding(21, title, "high", "pass", `authentication.end_user.zendesk_login=true under the ${policyName} password security level, so end users authenticate with Zendesk credentials.${social}${apiNote}${manualPortion}`, evidence)
+      ? cap(finding(21, title, "high", "pass", `authentication.end_user.zendesk_login=true under the ${policyName} password security level, so end users authenticate with Zendesk credentials.${social}${apiNote}${manualPortion}`, evidence))
       : finding(21, title, "high", "warn", `authentication.end_user.zendesk_login=true under the ${policyName ?? "unknown"} password security level; raise the end user password level to Recommended or High.${social}${apiNote}${manualPortion}`, evidence);
   }
   if (methods.length > 0) {
-    return finding(21, title, "high", "pass", `authentication.end_user.zendesk_login=false and end users authenticate only through ${methods.join(", ")}.${apiNote}${manualPortion}`, evidence);
+    return cap(finding(21, title, "high", "pass", `authentication.end_user.zendesk_login=false and end users authenticate only through ${methods.join(", ")}.${apiNote}${manualPortion}`, evidence));
   }
   return finding(21, title, "high", "fail", `authentication.end_user.zendesk_login=false, enforce_sso=false, and no SSO method is enabled, so end users have no way to sign in and every end user interaction is anonymous.${apiNote}${manualPortion}`, evidence);
 }
@@ -1373,10 +2170,10 @@ export async function assessZendeskAuthentication(
 ): Promise<ZendeskAssessmentResult> {
   const config = client.getResolvedConfig();
   const resolved = resolveOptions(options);
-  const currentUserSnap = await snapshot(() => client.getCurrentUser());
-  const settingsSnap = await snapshot(() => client.getAccountSettings());
-  const securitySnap = await snapshot(() => client.getSecuritySettings());
-  const teamSnap = await snapshot(() => client.listTeamMembers(resolved.maxItems));
+  const currentUserSnap = await snapshot("getCurrentUser", () => client.getCurrentUser());
+  const settingsSnap = await snapshot("getAccountSettings", () => client.getAccountSettings());
+  const securitySnap = await snapshot("getSecuritySettings", () => client.getSecuritySettings());
+  const teamSnap = await snapshot("listTeamMembers", () => client.listTeamMembers(resolved.maxItems));
   const apiSettings = asObject(settingsSnap.data?.api) ?? {};
   const security = securitySnap.data ?? {};
   const authentication = asObject(security.authentication) ?? {};
@@ -1409,12 +2206,13 @@ export async function assessZendeskAuthentication(
     summary: {
       subdomain: config.subdomain,
       current_user_role: asString(currentUserSnap.data?.role) ?? null,
-      seen_team_members: teamMembers.length,
+      seen_team_members: countOrNull(teamSnap, teamMembers.length),
       ...summarizeStatuses(finalFindings),
+      collection: collectionSummary(entries),
     },
     findings: finalFindings,
     errors: snapshotErrors(entries),
-    snapshots: Object.fromEntries(entries.map(([name, snap]) => [name, snap.data ?? null])),
+    snapshots: snapshotsForBundle(entries),
   };
 }
 
@@ -1475,28 +2273,32 @@ function assessApiTokens(
   const apiTokenAccess = asBoolean(asObject(settingsSnap.data?.api)?.api_token_access);
   const events = listSnapshotItems(tokenLogsSnap);
   const summary = summarizeApiTokenEvents(events, staleDays, now);
+  const tokenLogSource = "Audit log token events (/audit_logs?filter[source_type]=apitoken, Enterprise plan and admin role)";
   const evidence: JsonRecord = {
     api_token_access: apiTokenAccess ?? null,
     auth_mode: config.authMode,
     token_audit_log_status: tokenLogsSnap.status,
-    token_events_read: events.length,
-    token_events_truncated: isTruncated(tokenLogsSnap),
-    tokens_created: summary.created,
-    tokens_destroyed: summary.destroyed,
-    tokens_outstanding: summary.outstanding.length,
-    tokens_outstanding_over_stale_days: summary.outstandingOverStale,
-    tokens_outstanding_undated: summary.outstandingUndated,
-    outstanding_tokens: summary.outstanding.slice(0, 50),
+    token_events_read: countOrNull(tokenLogsSnap, events.length),
+    token_events_truncated: tokenLogsSnap.status === "ok" ? isTruncated(tokenLogsSnap) : null,
+    tokens_created: countOrNull(tokenLogsSnap, summary.created),
+    tokens_destroyed: countOrNull(tokenLogsSnap, summary.destroyed),
+    tokens_outstanding: countOrNull(tokenLogsSnap, summary.outstanding.length),
+    tokens_outstanding_over_stale_days: countOrNull(tokenLogsSnap, summary.outstandingOverStale),
+    tokens_outstanding_undated: countOrNull(tokenLogsSnap, summary.outstandingUndated),
+    outstanding_tokens: listOrNull(tokenLogsSnap, summary.outstanding.slice(0, 50)),
     newest_token_event: summary.newestEvent ?? null,
   };
   const auditText = tokenLogsSnap.status === "ok"
     ? `The audit log (filter[source_type]=apitoken) recorded ${summary.created} token creation and ${summary.destroyed} deletion events${isTruncated(tokenLogsSnap) ? " (history truncated)" : ""}, leaving ${summary.outstanding.length} outstanding token(s).`
-    : snapshotCause("Audit log token events (/audit_logs?filter[source_type]=apitoken, Enterprise plan and admin role)", tokenLogsSnap);
+    : snapshotCause(tokenLogSource, tokenLogsSnap);
   if (settingsSnap.status !== "ok") {
     return manualFinding(13, title, "high", `${snapshotCause("Account settings", settingsSnap)} ${auditText}`, instruction, evidence);
   }
   if (apiTokenAccess === false) {
-    return finding(13, title, "high", "pass", `settings.api.api_token_access=false, so API tokens cannot be used to authenticate to this account. ${auditText}`, evidence);
+    return capForUnreadable(
+      finding(13, title, "high", "pass", `settings.api.api_token_access=false, so API tokens cannot be used to authenticate to this account. ${auditText}`, evidence),
+      [[tokenLogSource, tokenLogsSnap]],
+    );
   }
   const accessText = `settings.api.api_token_access=${apiTokenAccess === true ? "true" : "absent"}, so API tokens can authenticate to this account.`;
   if (tokenLogsSnap.status !== "ok") {
@@ -1527,15 +2329,15 @@ export async function assessZendeskAccessControl(
   const config = client.getResolvedConfig();
   const resolved = resolveOptions(options);
   const now = resolved.now();
-  const currentUserSnap = await snapshot(() => client.getCurrentUser());
-  const settingsSnap = await snapshot(() => client.getAccountSettings());
-  const teamSnap = await snapshot(() => client.listTeamMembers(resolved.maxItems));
-  const rolesSnap = await snapshot(() => client.listCustomRoles());
-  const groupsSnap = await snapshot(() => client.listGroups(resolved.maxItems));
-  const membershipsSnap = await snapshot(() => client.listGroupMemberships(resolved.maxItems));
-  const clientsSnap = await snapshot(() => client.listOAuthClients(resolved.maxItems));
-  const tokensSnap = await snapshot(() => client.listOAuthTokens(resolved.maxItems));
-  const tokenLogsSnap = await snapshot(() => client.listApiTokenAuditLogs(resolved.maxItems));
+  const currentUserSnap = await snapshot("getCurrentUser", () => client.getCurrentUser());
+  const settingsSnap = await snapshot("getAccountSettings", () => client.getAccountSettings());
+  const teamSnap = await snapshot("listTeamMembers", () => client.listTeamMembers(resolved.maxItems));
+  const rolesSnap = await snapshot("listCustomRoles", () => client.listCustomRoles());
+  const groupsSnap = await snapshot("listGroups", () => client.listGroups(resolved.maxItems));
+  const membershipsSnap = await snapshot("listGroupMemberships", () => client.listGroupMemberships(resolved.maxItems));
+  const clientsSnap = await snapshot("listOAuthClients", () => client.listOAuthClients(resolved.maxItems));
+  const tokensSnap = await snapshot("listOAuthTokens", () => client.listOAuthTokens(resolved.maxItems));
+  const tokenLogsSnap = await snapshot("listApiTokenAuditLogs", () => client.listApiTokenAuditLogs(resolved.maxItems));
 
   const teamMembers = listSnapshotItems(teamSnap).filter(isActiveTeamMember);
   const admins = teamMembers.filter((user) => asString(user.role) === "admin");
@@ -1559,16 +2361,16 @@ export async function assessZendeskAccessControl(
       agents: agents.length,
       unrestricted_agents: unrestrictedAgents.length,
       custom_roles_status: rolesSnap.status,
-      custom_roles: customRoles.length,
-      admin_equivalent_custom_roles: adminEquivalent.slice(0, 25),
-      inventory_truncated: isTruncated(teamSnap),
+      custom_roles: listCountOrNull(rolesSnap),
+      admin_equivalent_custom_roles: listOrNull(rolesSnap, adminEquivalent.slice(0, 25)),
+      inventory_truncated: truncationOrNull(teamSnap, rolesSnap),
     };
     if (rolesSnap.status !== "ok") {
       findings.push(manualFinding(6, leastPrivilegeTitle, "critical", `${snapshotCause("Custom roles (/custom_roles, Enterprise plan)", rolesSnap)} Built-in roles seen: ${admins.length} admins, ${agents.length} agents (${unrestrictedAgents.length} unrestricted).`, "capture Admin Center > People > Team > Roles and confirm agents are assigned the least-privileged built-in or custom role.", evidence));
     } else if (adminEquivalent.some((role) => role.members > 0)) {
       findings.push(finding(6, leastPrivilegeTitle, "critical", "fail", `${adminEquivalent.filter((role) => role.members > 0).length} custom roles grant admin-equivalent permissions (${adminEquivalent.map((role) => `${role.name}: ${role.reasons.join(", ")}`).join("; ")}).${truncationNote("team member", teamSnap)}`, evidence));
-    } else if (isTruncated(teamSnap) || adminEquivalent.length > 0 || (agents.length > 0 && unrestrictedAgents.length === agents.length)) {
-      findings.push(finding(6, leastPrivilegeTitle, "critical", "warn", `${customRoles.length} custom roles reviewed; ${adminEquivalent.length} admin-equivalent roles have no members; ${unrestrictedAgents.length}/${agents.length} agents are unrestricted.${truncationNote("team member", teamSnap)} Review whether unrestricted agents need account-wide ticket access.`, evidence));
+    } else if (isTruncated(teamSnap) || isTruncated(rolesSnap) || adminEquivalent.length > 0 || (agents.length > 0 && unrestrictedAgents.length === agents.length)) {
+      findings.push(finding(6, leastPrivilegeTitle, "critical", "warn", `${customRoles.length} custom roles reviewed; ${adminEquivalent.length} admin-equivalent roles have no members; ${unrestrictedAgents.length}/${agents.length} agents are unrestricted.${truncationNote("team member", teamSnap)}${truncationNote("custom role", rolesSnap)} Review whether unrestricted agents need account-wide ticket access.`, evidence));
     } else {
       findings.push(finding(6, leastPrivilegeTitle, "critical", "pass", `${teamMembers.length} team members (${admins.length} admins, ${agents.length} agents, ${unrestrictedAgents.length} unrestricted) and ${customRoles.length} custom roles were read to completion with no admin-equivalent custom roles.`, evidence));
     }
@@ -1587,7 +2389,7 @@ export async function assessZendeskAccessControl(
       admins: admins.slice(0, 50).map(userLabel),
       dormant_admins: loginBuckets.stale.slice(0, 25).map(userLabel),
       admins_without_last_login: loginBuckets.undated.slice(0, 25).map(userLabel),
-      inventory_truncated: isTruncated(teamSnap),
+      inventory_truncated: truncationOrNull(teamSnap),
     };
     if (admins.length > resolved.adminThreshold) {
       findings.push(finding(7, adminTitle, "high", "fail", `${admins.length} active admins exceed the threshold of ${resolved.adminThreshold}.${truncationNote("team member", teamSnap)}`, evidence));
@@ -1612,7 +2414,7 @@ export async function assessZendeskAccessControl(
       private_groups: privateGroups.length,
       seen_memberships: memberships.length,
       groups: groups.slice(0, 50).map((group) => asString(group.name) ?? asString(group.id) ?? "group"),
-      inventory_truncated: isTruncated(groupsSnap) || isTruncated(membershipsSnap),
+      inventory_truncated: truncationOrNull(groupsSnap, membershipsSnap),
     };
     if (groups.length === 1 || memberships.length === 0) {
       findings.push(finding(8, groupsTitle, "medium", "warn", `${groups.length} group(s) and ${memberships.length} memberships were visible, so ticket access is not segmented by group.${truncationNote("group", groupsSnap)}`, evidence));
@@ -1637,25 +2439,34 @@ export async function assessZendeskAccessControl(
     const privilegedTokens = tokens.filter((token) => asArray(token.scopes).some((scope) => /write|impersonate/i.test(asString(scope) ?? "")));
     const nonExpiringTokens = tokens.filter((token) => !asString(token.expires_at));
     const usage = partitionByDate(tokens, "used_at", resolved.staleDays, now);
+    const tokenSource = "OAuth tokens (/oauth/tokens?all=true, admin only)";
     const evidence: JsonRecord = {
       oauth_clients: clients.length,
       clients_without_scope_restriction: unscoped.slice(0, 25).map((item) => asString(item.name) ?? asString(item.identifier) ?? "client"),
       public_clients: publicClients.slice(0, 25).map((item) => asString(item.name) ?? asString(item.identifier) ?? "client"),
       clients_with_http_redirects: insecureRedirects.slice(0, 25).map((item) => asString(item.name) ?? asString(item.identifier) ?? "client"),
       oauth_tokens_status: tokensSnap.status,
-      oauth_tokens: tokens.length,
-      tokens_with_write_or_impersonate: privilegedTokens.length,
-      tokens_without_expiry: nonExpiringTokens.length,
-      tokens_unused_over_stale_days: usage.stale.length,
-      tokens_without_used_at: usage.undated.length,
-      inventory_truncated: isTruncated(clientsSnap) || isTruncated(tokensSnap),
+      oauth_tokens: listCountOrNull(tokensSnap),
+      tokens_with_write_or_impersonate: countOrNull(tokensSnap, privilegedTokens.length),
+      tokens_without_expiry: countOrNull(tokensSnap, nonExpiringTokens.length),
+      tokens_unused_over_stale_days: countOrNull(tokensSnap, usage.stale.length),
+      tokens_without_used_at: countOrNull(tokensSnap, usage.undated.length),
+      inventory_truncated: truncationOrNull(clientsSnap, tokensSnap),
     };
     if (unscoped.length > 0 || insecureRedirects.length > 0) {
       findings.push(finding(14, oauthTitle, "high", "fail", `${unscoped.length}/${clients.length} OAuth clients have no scope restriction and ${insecureRedirects.length} use http:// redirect URIs.${truncationNote("OAuth client", clientsSnap)}`, evidence));
     } else if (clients.length === 0) {
-      findings.push(finding(14, oauthTitle, "high", tokens.length > 0 ? "warn" : "pass", tokens.length > 0 ? `Zero OAuth clients were returned but ${tokens.length} OAuth tokens exist (global clients or partial view); review token ownership.` : "The OAuth client endpoint was readable and returned zero clients, so no third-party OAuth applications are registered on this account.", evidence));
+      if (tokensSnap.status !== "ok") {
+        findings.push(finding(14, oauthTitle, "high", "warn", `The OAuth client endpoint was readable and returned zero clients, but the token inventory could not be read, so tokens issued to global or hidden clients cannot be ruled out: ${snapshotCause(tokenSource, tokensSnap)}`, evidence));
+      } else if (tokens.length > 0) {
+        findings.push(finding(14, oauthTitle, "high", "warn", `Zero OAuth clients were returned but ${tokens.length} OAuth tokens exist (global clients or partial view); review token ownership.${truncationNote("OAuth token", tokensSnap)}`, evidence));
+      } else if (isTruncated(clientsSnap) || isTruncated(tokensSnap)) {
+        findings.push(finding(14, oauthTitle, "high", "warn", `Zero OAuth clients and zero tokens were seen, but an inventory was truncated before completion.${truncationNote("OAuth client", clientsSnap)}${truncationNote("OAuth token", tokensSnap)}`, evidence));
+      } else {
+        findings.push(finding(14, oauthTitle, "high", "pass", "The OAuth client and token endpoints were readable and returned zero clients and zero tokens, so no third-party OAuth applications are registered on this account.", evidence));
+      }
     } else if (publicClients.length > 0 || privilegedTokens.length > 0 || nonExpiringTokens.length > 0 || usage.stale.length > 0 || usage.undated.length > 0 || isTruncated(clientsSnap) || isTruncated(tokensSnap) || tokensSnap.status !== "ok") {
-      findings.push(finding(14, oauthTitle, "high", "warn", `${clients.length} OAuth clients all declare allowed scopes; review ${publicClients.length} public clients, ${privilegedTokens.length} tokens with write or impersonate scope, ${nonExpiringTokens.length} non-expiring tokens, ${usage.stale.length} tokens unused for more than ${resolved.staleDays} days, and ${usage.undated.length} tokens with no used_at value.${tokensSnap.status !== "ok" ? ` ${snapshotCause("OAuth tokens", tokensSnap)}` : ""}${truncationNote("OAuth client", clientsSnap)}`, evidence));
+      findings.push(finding(14, oauthTitle, "high", "warn", `${clients.length} OAuth clients all declare allowed scopes; review ${publicClients.length} public clients${tokensSnap.status === "ok" ? `, ${privilegedTokens.length} tokens with write or impersonate scope, ${nonExpiringTokens.length} non-expiring tokens, ${usage.stale.length} tokens unused for more than ${resolved.staleDays} days, and ${usage.undated.length} tokens with no used_at value` : ""}.${tokensSnap.status !== "ok" ? ` Token hygiene could not be reviewed: ${snapshotCause(tokenSource, tokensSnap)}` : ""}${truncationNote("OAuth client", clientsSnap)}${truncationNote("OAuth token", tokensSnap)}`, evidence));
     } else {
       findings.push(finding(14, oauthTitle, "high", "pass", `${clients.length} OAuth clients all declare allowed scopes and https redirect URIs; ${tokens.length} tokens were read to completion with expiries and recent usage.`, evidence));
     }
@@ -1679,16 +2490,18 @@ export async function assessZendeskAccessControl(
     summary: {
       subdomain: config.subdomain,
       current_user_role: asString(currentUserSnap.data?.role) ?? null,
-      seen_team_members: teamMembers.length,
-      admins: admins.length,
-      custom_roles: listSnapshotItems(rolesSnap).length,
-      groups: groups.length,
-      oauth_clients: listSnapshotItems(clientsSnap).length,
+      seen_team_members: countOrNull(teamSnap, teamMembers.length),
+      admins: countOrNull(teamSnap, admins.length),
+      custom_roles: listCountOrNull(rolesSnap),
+      groups: countOrNull(groupsSnap, groups.length),
+      oauth_clients: listCountOrNull(clientsSnap),
+      oauth_tokens: listCountOrNull(tokensSnap),
       ...summarizeStatuses(finalFindings),
+      collection: collectionSummary(entries),
     },
     findings: finalFindings,
     errors: snapshotErrors(entries),
-    snapshots: Object.fromEntries(entries.map(([name, snap]) => [name, snap.data ?? null])),
+    snapshots: snapshotsForBundle(entries),
   };
 }
 
@@ -1731,14 +2544,22 @@ function assessDeletionPolicies(
   const redactionRoles = customRoles.filter((role) => asBoolean(asObject(role.configuration)?.ticket_redaction) === true).length;
   const deletionScheduleRoles = customRoles.filter((role) => asString(asObject(role.configuration)?.manage_deletion_schedules) === "all").length;
   const agentTicketDeletion = asBoolean(tickets.agent_ticket_deletion);
-  const context = `${settingsSnap.status === "ok" ? ` settings.tickets.agent_ticket_deletion=${agentTicketDeletion ?? "absent"}${agentTicketDeletion === true ? " (agents can delete tickets; review whether that is intended)" : ""}.` : ""}${rolesSnap.status === "ok" ? ` ${redactionRoles}/${customRoles.length} custom roles allow ticket redaction and ${deletionScheduleRoles} can manage deletion schedules.` : ""}`;
+  const settingsSource = "Account settings (settings.tickets.agent_ticket_deletion)";
+  const rolesSource = "Custom roles (/custom_roles, Enterprise plan; redaction and deletion schedule permissions)";
+  const context = `${settingsSnap.status === "ok"
+    ? ` settings.tickets.agent_ticket_deletion=${agentTicketDeletion ?? "absent"}${agentTicketDeletion === true ? " (agents can delete tickets; review whether that is intended)" : ""}.`
+    : ` ${snapshotCause(settingsSource, settingsSnap)}`}${rolesSnap.status === "ok"
+    ? ` ${redactionRoles}/${customRoles.length} custom roles allow ticket redaction and ${deletionScheduleRoles} can manage deletion schedules.${truncationNote("custom role", rolesSnap)}`
+    : ` ${snapshotCause(rolesSource, rolesSnap)}`}`;
   const baseEvidence: JsonRecord = {
     deletion_schedules_status: deletionSnap.status,
+    account_settings_status: settingsSnap.status,
     agent_ticket_deletion: agentTicketDeletion ?? null,
-    custom_roles_with_ticket_redaction: redactionRoles,
-    custom_roles_managing_deletion_schedules: deletionScheduleRoles,
+    custom_roles_with_ticket_redaction: countOrNull(rolesSnap, redactionRoles),
+    custom_roles_managing_deletion_schedules: countOrNull(rolesSnap, deletionScheduleRoles),
     custom_roles_status: rolesSnap.status,
   };
+  const cap = (item: ZendeskFinding): ZendeskFinding => capForUnreadable(item, [[settingsSource, settingsSnap], [rolesSource, rolesSnap]]);
   if (deletionSnap.status !== "ok") {
     return manualFinding(12, title, "high", `${snapshotCause("Deletion schedules (/deletion_schedules, admin only)", deletionSnap)}${context}`, instruction, baseEvidence);
   }
@@ -1755,7 +2576,7 @@ function assessDeletionPolicies(
     active_by_object: { ...activeByObject, other: otherActive },
     active_without_conditions: activeWithoutConditions,
     default_schedules: defaults,
-    inventory_truncated: isTruncated(deletionSnap),
+    inventory_truncated: truncationOrNull(deletionSnap),
     schedules: schedules.slice(0, 25).map(summarizeDeletionSchedule),
   };
   if (schedules.length === 0) {
@@ -1774,7 +2595,7 @@ function assessDeletionPolicies(
     ];
     return finding(12, title, "high", "warn", `${active.length} active deletion schedule(s) (${byObjectText}; ${defaults} default) but ${gaps.join(" and ")}.${truncationNote("deletion schedule", deletionSnap)}${context}`, evidence);
   }
-  return finding(12, title, "high", "pass", `${active.length} active deletion schedule(s) read to completion (${byObjectText}; ${defaults} default); ticket retention is enforced by ${ticketSchedules} conditioned schedule(s).${context}`, evidence);
+  return cap(finding(12, title, "high", "pass", `${active.length} active deletion schedule(s) read to completion (${byObjectText}; ${defaults} default); ticket retention is enforced by ${ticketSchedules} conditioned schedule(s).${context}`, evidence));
 }
 
 export async function assessZendeskDataProtection(
@@ -1784,15 +2605,17 @@ export async function assessZendeskDataProtection(
   const config = client.getResolvedConfig();
   const resolved = resolveOptions(options);
   const now = resolved.now();
-  const currentUserSnap = await snapshot(() => client.getCurrentUser());
-  const settingsSnap = await snapshot(() => client.getAccountSettings());
-  const auditSnap = await snapshot(() => client.listRecentAuditLogs(DEFAULT_AUDIT_LOG_SAMPLE));
+  const currentUserSnap = await snapshot("getCurrentUser", () => client.getCurrentUser());
+  const settingsSnap = await snapshot("getAccountSettings", () => client.getAccountSettings());
+  const auditSnap = await snapshot("listRecentAuditLogs", () => client.listRecentAuditLogs(DEFAULT_AUDIT_LOG_SAMPLE));
   const oldestSnap: ZendeskSnapshot<JsonRecord | undefined> = auditSnap.status === "ok"
-    ? await snapshot(() => client.getOldestAuditLog())
-    : { status: auditSnap.status, data: undefined, error: auditSnap.error, httpStatus: auditSnap.httpStatus };
-  const rolesSnap = await snapshot(() => client.listCustomRoles());
-  const deletionSnap = await snapshot(() => client.listDeletionSchedules(resolved.maxItems));
-  const suspendedSnap = await snapshot(() => client.listSuspendedTickets(resolved.maxItems));
+    ? await snapshot("getOldestAuditLog", () => client.getOldestAuditLog())
+    // Not requested: the oldest-record lookup inherits the failure of the recent-log
+    // read, naming that request rather than one that was never made.
+    : { status: auditSnap.status, data: undefined, error: auditSnap.error, httpStatus: auditSnap.httpStatus, endpoint: auditSnap.endpoint };
+  const rolesSnap = await snapshot("listCustomRoles", () => client.listCustomRoles());
+  const deletionSnap = await snapshot("listDeletionSchedules", () => client.listDeletionSchedules(resolved.maxItems));
+  const suspendedSnap = await snapshot("listSuspendedTickets", () => client.listSuspendedTickets(resolved.maxItems));
   const settings = settingsSnap.data ?? {};
   const tickets = asObject(settings.tickets) ?? {};
   const limits = asObject(settings.limits) ?? {};
@@ -1875,9 +2698,11 @@ export async function assessZendeskDataProtection(
       without_created_at: buckets.undated.length,
       age_threshold_days: resolved.suspendedTicketAgeDays,
       causes: [...new Set(suspended.map((ticket) => asString(ticket.cause)).filter(Boolean))].slice(0, 20),
-      inventory_truncated: isTruncated(suspendedSnap),
+      inventory_truncated: truncationOrNull(suspendedSnap),
     };
-    if (suspended.length === 0) {
+    if (suspended.length === 0 && isTruncated(suspendedSnap)) {
+      findings.push(finding(20, suspendedTitle, "low", "warn", `Zero suspended tickets were seen but the queue read was truncated before completion.${truncationNote("suspended ticket", suspendedSnap)}`, evidence));
+    } else if (suspended.length === 0) {
       findings.push(finding(20, suspendedTitle, "low", "pass", "The suspended ticket endpoint was readable and the queue is empty (0 suspended tickets).", evidence));
     } else if (buckets.stale.length > 0 || isTruncated(suspendedSnap)) {
       findings.push(finding(20, suspendedTitle, "low", "warn", `${suspended.length} suspended tickets are queued and ${buckets.stale.length} are older than ${resolved.suspendedTicketAgeDays} days (${buckets.undated.length} undated).${truncationNote("suspended ticket", suspendedSnap)}`, evidence));
@@ -1905,14 +2730,16 @@ export async function assessZendeskDataProtection(
       subdomain: config.subdomain,
       current_user_role: asString(currentUserSnap.data?.role) ?? null,
       audit_log_status: auditSnap.status,
-      audit_log_entries_sampled: auditEntries.length,
+      audit_log_entries_sampled: countOrNull(auditSnap, auditEntries.length),
       private_attachments: privateAttachments ?? null,
-      suspended_tickets: listSnapshotItems(suspendedSnap).length,
+      deletion_schedules: listCountOrNull(deletionSnap),
+      suspended_tickets: listCountOrNull(suspendedSnap),
       ...summarizeStatuses(finalFindings),
+      collection: collectionSummary(entries),
     },
     findings: finalFindings,
     errors: snapshotErrors(entries),
-    snapshots: Object.fromEntries(entries.map(([name, snap]) => [name, snap.data ?? null])),
+    snapshots: snapshotsForBundle(entries),
   };
 }
 
@@ -1922,16 +2749,16 @@ export async function assessZendeskIntegrations(
 ): Promise<ZendeskAssessmentResult> {
   const config = client.getResolvedConfig();
   const resolved = resolveOptions(options);
-  const settingsSnap = await snapshot(() => client.getAccountSettings());
-  const currentUserSnap = await snapshot(() => client.getCurrentUser());
-  const installationsSnap = await snapshot(() => client.listAppInstallations());
-  const ownedSnap = await snapshot(() => client.listOwnedApps());
-  const brandsSnap = await snapshot(() => client.listBrands(resolved.maxItems));
-  const sharingSnap = await snapshot(() => client.listSharingAgreements());
-  const targetsSnap = await snapshot(() => client.listTargets());
-  const webhooksSnap = await snapshot(() => client.listWebhooks(resolved.maxItems));
-  const triggersSnap = await snapshot(() => client.listTriggers(resolved.maxItems));
-  const automationsSnap = await snapshot(() => client.listAutomations(resolved.maxItems));
+  const settingsSnap = await snapshot("getAccountSettings", () => client.getAccountSettings());
+  const currentUserSnap = await snapshot("getCurrentUser", () => client.getCurrentUser());
+  const installationsSnap = await snapshot("listAppInstallations", () => client.listAppInstallations());
+  const ownedSnap = await snapshot("listOwnedApps", () => client.listOwnedApps());
+  const brandsSnap = await snapshot("listBrands", () => client.listBrands(resolved.maxItems));
+  const sharingSnap = await snapshot("listSharingAgreements", () => client.listSharingAgreements());
+  const targetsSnap = await snapshot("listTargets", () => client.listTargets());
+  const webhooksSnap = await snapshot("listWebhooks", () => client.listWebhooks(resolved.maxItems));
+  const triggersSnap = await snapshot("listTriggers", () => client.listTriggers(resolved.maxItems));
+  const automationsSnap = await snapshot("listAutomations", () => client.listAutomations(resolved.maxItems));
   const findings: ZendeskFinding[] = [];
 
   const installations = listSnapshotItems(installationsSnap);
@@ -1947,13 +2774,19 @@ export async function assessZendeskIntegrations(
     const enabled = marketplace.filter((item) => asBoolean(item.enabled) !== false);
     const evidence: JsonRecord = {
       app_installations: installations.length,
-      marketplace_installations: marketplace.length,
-      enabled_marketplace_installations: enabled.length,
+      marketplace_installations: countOrNull(ownedSnap, marketplace.length),
+      enabled_marketplace_installations: countOrNull(ownedSnap, enabled.length),
       owned_apps_status: ownedSnap.status,
+      inventory_truncated: truncationOrNull(installationsSnap, ownedSnap),
       apps: marketplace.slice(0, 50).map((item) => ({ name: installationName(item), enabled: asBoolean(item.enabled) ?? null, product: asString(item.product) ?? null, role_restrictions: asArray(item.role_restrictions).length, group_restrictions: asArray(item.group_restrictions).length })),
     };
-    if (installations.length === 0) {
-      findings.push(finding(15, marketplaceTitle, "medium", "pass", "The app installation endpoint was readable and returned zero installed apps, so there are no marketplace apps to review.", evidence));
+    if (installations.length === 0 && isTruncated(installationsSnap)) {
+      findings.push(finding(15, marketplaceTitle, "medium", "warn", `Zero installed apps were seen but the installation inventory was truncated before completion.${truncationNote("app installation", installationsSnap)}`, evidence));
+    } else if (installations.length === 0) {
+      findings.push(capForUnreadable(
+        finding(15, marketplaceTitle, "medium", "pass", "The app installation endpoint was readable and returned zero installed apps, so there are no marketplace apps to review.", evidence),
+        [["Owned apps (/apps/owned, used to separate private apps from marketplace apps)", ownedSnap]],
+      ));
     } else {
       findings.push(manualFinding(15, marketplaceTitle, "medium", `${marketplace.length} marketplace app installations (${enabled.length} enabled) were inventoried${ownedSnap.status !== "ok" ? ", but owned apps could not be separated because " + snapshotCause("/apps/owned", ownedSnap).toLowerCase() : ""}; app permission reviews cannot be verified through the API.`, "record the reviewer, date, and outcome of the permission review for each installed app in Admin Center > Apps and integrations > Zendesk Support apps.", evidence));
     }
@@ -1967,9 +2800,12 @@ export async function assessZendeskIntegrations(
     const evidence: JsonRecord = {
       owned_apps: ownedApps.length,
       deprecated_or_obsolete: retired.slice(0, 25).map((app) => asString(app.name) ?? asString(app.id) ?? "app"),
+      inventory_truncated: truncationOrNull(ownedSnap),
       apps: ownedApps.slice(0, 50).map((app) => ({ name: asString(app.name) ?? null, visibility: asString(app.visibility) ?? null, framework_version: asString(app.framework_version) ?? null, parameters: asArray(app.parameters).length })),
     };
-    if (ownedApps.length === 0) {
+    if (ownedApps.length === 0 && isTruncated(ownedSnap)) {
+      findings.push(finding(16, customAppTitle, "medium", "warn", `Zero owned apps were seen but the inventory was truncated before completion.${truncationNote("owned app", ownedSnap)}`, evidence));
+    } else if (ownedApps.length === 0) {
       findings.push(finding(16, customAppTitle, "medium", "pass", "The owned apps endpoint was readable and returned zero private or custom apps.", evidence));
     } else if (retired.length > 0) {
       findings.push(finding(16, customAppTitle, "medium", "warn", `${retired.length}/${ownedApps.length} owned apps are deprecated or obsolete and should be removed or updated; scope review of the remaining apps is manual.`, evidence));
@@ -2004,7 +2840,7 @@ export async function assessZendeskIntegrations(
       help_center_states: states,
       current_user_role: currentRole ?? null,
       brands_detail: brands.slice(0, 50).map((brand) => ({ name: asString(brand.name) ?? null, active: asBoolean(brand.active) ?? null, help_center_state: asString(brand.help_center_state) ?? null, has_help_center: asBoolean(brand.has_help_center) ?? null, host_mapping: asString(brand.host_mapping) ?? null })),
-      inventory_truncated: isTruncated(brandsSnap),
+      inventory_truncated: truncationOrNull(brandsSnap),
     };
     if (brands.length === 0) {
       findings.push(manualFinding(22, brandTitle, "medium", "Zero brands were visible although every account has a default brand, so the view is partial.", "use an admin credential and capture Admin Center > Account > Brand management.", evidence));
@@ -2030,8 +2866,11 @@ export async function assessZendeskIntegrations(
       sharing_agreements: agreements.length,
       active_agreements: active.slice(0, 25).map((item) => ({ name: asString(item.name) ?? null, remote_subdomain: asString(item.remote_subdomain) ?? null, partner_name: asString(item.partner_name) ?? null, status: asString(item.status) ?? null, type: asString(item.type) ?? null })),
       broken_agreements: broken.length,
+      inventory_truncated: truncationOrNull(sharingSnap),
     };
-    if (agreements.length === 0) {
+    if (agreements.length === 0 && isTruncated(sharingSnap)) {
+      findings.push(finding(23, sharingTitle, "medium", "warn", `Zero sharing agreements were seen but the inventory was truncated before completion.${truncationNote("sharing agreement", sharingSnap)}`, evidence));
+    } else if (agreements.length === 0) {
       findings.push(finding(23, sharingTitle, "medium", "pass", "The sharing agreement endpoint was readable and returned zero agreements, so tickets are not shared with external Zendesk accounts.", evidence));
     } else if (broken.length > 0) {
       findings.push(finding(23, sharingTitle, "medium", "warn", `${broken.length}/${agreements.length} sharing agreements are in a failed, ssl_error, or configuration_error state and ${active.length} are active; review each remote account.`, evidence));
@@ -2052,20 +2891,24 @@ export async function assessZendeskIntegrations(
     const activeWebhooks = webhooks.filter((hook) => asString(hook.status) === "active");
     const insecureWebhooks = activeWebhooks.filter((hook) => urlScheme(hook.endpoint) !== "https");
     const unauthenticatedWebhooks = activeWebhooks.filter((hook) => !asObject(hook.authentication) && !asObject(hook.signing_secret));
+    const destinationsTruncated = isTruncated(targetsSnap) || isTruncated(webhooksSnap);
+    const truncationNotes = `${truncationNote("target", targetsSnap)}${truncationNote("webhook", webhooksSnap)}`;
+    const targetText = targetsSnap.status === "ok" ? `${insecureTargets.length} active targets` : "an unread target inventory";
+    const webhookText = webhooksSnap.status === "ok" ? `${insecureWebhooks.length} active webhooks` : "an unread webhook inventory";
     const evidence: JsonRecord = {
       targets_status: targetsSnap.status,
-      active_targets: activeTargets.length,
-      insecure_targets: insecureTargets.slice(0, 25).map((target) => asString(target.title) ?? asString(target.id) ?? "target"),
+      active_targets: countOrNull(targetsSnap, activeTargets.length),
+      insecure_targets: listOrNull(targetsSnap, insecureTargets.slice(0, 25).map((target) => asString(target.title) ?? asString(target.id) ?? "target")),
       webhooks_status: webhooksSnap.status,
-      active_webhooks: activeWebhooks.length,
-      insecure_webhooks: insecureWebhooks.slice(0, 25).map((hook) => asString(hook.name) ?? asString(hook.id) ?? "webhook"),
-      webhooks_without_authentication: unauthenticatedWebhooks.slice(0, 25).map((hook) => asString(hook.name) ?? asString(hook.id) ?? "webhook"),
-      inventory_truncated: isTruncated(webhooksSnap),
+      active_webhooks: countOrNull(webhooksSnap, activeWebhooks.length),
+      insecure_webhooks: listOrNull(webhooksSnap, insecureWebhooks.slice(0, 25).map((hook) => asString(hook.name) ?? asString(hook.id) ?? "webhook")),
+      webhooks_without_authentication: listOrNull(webhooksSnap, unauthenticatedWebhooks.slice(0, 25).map((hook) => asString(hook.name) ?? asString(hook.id) ?? "webhook")),
+      inventory_truncated: truncationOrNull(targetsSnap, webhooksSnap),
     };
     if (insecureTargets.length > 0 || insecureWebhooks.length > 0) {
-      findings.push(finding(24, httpsTitle, "high", "fail", `${insecureTargets.length} active targets and ${insecureWebhooks.length} active webhooks deliver to non-https endpoints.${truncationNote("webhook", webhooksSnap)}`, evidence));
-    } else if (targetsSnap.status !== "ok" || webhooksSnap.status !== "ok" || isTruncated(webhooksSnap) || unauthenticatedWebhooks.length > 0) {
-      findings.push(finding(24, httpsTitle, "high", "warn", `All seen destinations use https, but ${unauthenticatedWebhooks.length} active webhooks have no authentication or signing secret visible${targetsSnap.status !== "ok" ? `, and ${snapshotCause("targets", targetsSnap).toLowerCase()}` : ""}${webhooksSnap.status !== "ok" ? `, and ${snapshotCause("webhooks", webhooksSnap).toLowerCase()}` : ""}.${truncationNote("webhook", webhooksSnap)}`, evidence));
+      findings.push(finding(24, httpsTitle, "high", "fail", `${targetText} and ${webhookText} deliver to non-https endpoints.${truncationNotes}`, evidence));
+    } else if (targetsSnap.status !== "ok" || webhooksSnap.status !== "ok" || destinationsTruncated || unauthenticatedWebhooks.length > 0) {
+      findings.push(finding(24, httpsTitle, "high", "warn", `All seen destinations use https, but ${webhooksSnap.status === "ok" ? `${unauthenticatedWebhooks.length} active webhooks have no authentication or signing secret visible` : "webhook authentication could not be reviewed"}${targetsSnap.status !== "ok" ? `, and ${snapshotCause("targets", targetsSnap).toLowerCase()}` : ""}${webhooksSnap.status !== "ok" ? `, and ${snapshotCause("webhooks", webhooksSnap).toLowerCase()}` : ""}${destinationsTruncated ? ", and an inventory was truncated" : ""}.${truncationNotes}`, evidence));
     } else if (activeTargets.length === 0 && activeWebhooks.length === 0) {
       findings.push(finding(24, httpsTitle, "high", "pass", "Both the targets and webhooks endpoints were readable and returned zero active destinations (0 targets, 0 webhooks), so there are no external notification endpoints to secure; emptiness is compliant for this control.", evidence));
     } else {
@@ -2085,31 +2928,50 @@ export async function assessZendeskIntegrations(
     const webhookIndex = new Map(webhooks.map((hook) => [asString(hook.id) ?? "", hook]));
     const external = rules.flatMap((entry) => externalNotificationActions(entry.rule).map((action) => {
       const destination = action.field === "notification_target"
-        ? asString(targetIndex.get(action.destination)?.target_url) ?? asString(targetIndex.get(action.destination)?.email) ?? `target ${action.destination}`
+        ? asString(targetIndex.get(action.destination)?.target_url) ?? asString(targetIndex.get(action.destination)?.email)
         : action.field === "notification_webhook"
-          ? asString(webhookIndex.get(action.destination)?.endpoint) ?? `webhook ${action.destination}`
+          ? asString(webhookIndex.get(action.destination)?.endpoint)
+          : undefined;
+      const fallback = action.field === "notification_target"
+        ? `target ${action.destination}`
+        : action.field === "notification_webhook"
+          ? `webhook ${action.destination}`
           : `sharing agreement ${action.destination}`;
-      return { kind: entry.kind, title: asString(entry.rule.title) ?? asString(entry.rule.id) ?? "rule", action: action.field, destination };
+      // A destination is unresolved when its inventory was unreadable (or truncated past it),
+      // so the http check below cannot run for that action.
+      const unresolved = destination === undefined && (action.field === "notification_target" ? targetsSnap.status !== "ok" || isTruncated(targetsSnap) : action.field === "notification_webhook" ? webhooksSnap.status !== "ok" || isTruncated(webhooksSnap) : false);
+      return { kind: entry.kind, title: asString(entry.rule.title) ?? asString(entry.rule.id) ?? "rule", action: action.field, destination: destination ?? fallback, unresolved };
     }));
     const insecure = external.filter((item) => urlScheme(item.destination) === "http");
+    const unresolved = external.filter((item) => item.unresolved);
     const truncated = isTruncated(triggersSnap) || isTruncated(automationsSnap);
+    const destinationSources: Array<[string, ZendeskSnapshot<unknown>]> = [["Targets (/targets, used to resolve notification_target destinations)", targetsSnap], ["Webhooks (/webhooks, used to resolve notification_webhook destinations)", webhooksSnap]];
+    const unresolvedNote = unresolved.length > 0
+      ? ` ${unresolved.length} destination(s) could not be resolved to a URL, so their scheme was not checked:${targetsSnap.status !== "ok" ? ` ${snapshotCause("targets", targetsSnap)}` : ""}${webhooksSnap.status !== "ok" ? ` ${snapshotCause("webhooks", webhooksSnap)}` : ""}${isTruncated(targetsSnap) || isTruncated(webhooksSnap) ? " The target or webhook inventory was truncated." : ""}`
+      : "";
     const evidence: JsonRecord = {
       active_triggers: listSnapshotItems(triggersSnap).filter((rule) => asBoolean(rule.active) !== false).length,
       active_automations: listSnapshotItems(automationsSnap).filter((rule) => asBoolean(rule.active) !== false).length,
       external_notification_actions: external.slice(0, 50),
       insecure_destinations: insecure.length,
+      unresolved_destinations: unresolved.length,
+      targets_status: targetsSnap.status,
+      webhooks_status: webhooksSnap.status,
       inventory_truncated: truncated,
     };
     if (insecure.length > 0) {
-      findings.push(finding(25, exfilTitle, "high", "fail", `${insecure.length}/${external.length} external notification actions deliver ticket data to http:// destinations.${truncationNote("trigger", triggersSnap)}${truncationNote("automation", automationsSnap)}`, evidence));
+      findings.push(finding(25, exfilTitle, "high", "fail", `${insecure.length}/${external.length} external notification actions deliver ticket data to http:// destinations.${unresolvedNote}${truncationNote("trigger", triggersSnap)}${truncationNote("automation", automationsSnap)}`, evidence));
     } else if (rules.length === 0) {
       findings.push(manualFinding(25, exfilTitle, "high", "Zero active triggers or automations were visible although Zendesk accounts ship with default triggers, so the view is partial.", "export the trigger and automation lists from Admin Center > Objects and rules and record every 'Notify webhook', 'Notify target', and 'Share ticket' action.", evidence));
     } else if (external.length > 0) {
-      findings.push(finding(25, exfilTitle, "high", "warn", `${external.length} active rule actions send ticket data to external destinations (${[...new Set(external.map((item) => urlHost(item.destination) ?? item.destination))].slice(0, 10).join(", ")}); confirm each destination is an approved processor.${truncated ? " The rule inventory was truncated." : ""}`, evidence));
+      findings.push(finding(25, exfilTitle, "high", "warn", `${external.length} active rule actions send ticket data to external destinations (${[...new Set(external.map((item) => urlHost(item.destination) ?? item.destination))].slice(0, 10).join(", ")}); confirm each destination is an approved processor.${unresolvedNote}${truncated ? " The rule inventory was truncated." : ""}`, evidence));
     } else if (truncated) {
       findings.push(finding(25, exfilTitle, "high", "warn", "No external notification actions were found in the seen rules, but the trigger or automation inventory was truncated, so the full population was not reviewed.", evidence));
     } else {
-      findings.push(finding(25, exfilTitle, "high", "pass", `${rules.length} active triggers and automations were read to completion and none notify external targets, webhooks, or sharing agreements.`, evidence));
+      findings.push(capForUnreadable(
+        finding(25, exfilTitle, "high", "pass", `${rules.length} active triggers and automations were read to completion and none notify external targets, webhooks, or sharing agreements.`, evidence),
+        destinationSources,
+      ));
     }
   }
 
@@ -2132,16 +2994,17 @@ export async function assessZendeskIntegrations(
     summary: {
       subdomain: config.subdomain,
       current_user_role: currentRole ?? null,
-      app_installations: installations.length,
-      owned_apps: ownedApps.length,
-      brands: listSnapshotItems(brandsSnap).length,
-      webhooks: webhooks.length,
-      targets: targets.length,
+      app_installations: listCountOrNull(installationsSnap),
+      owned_apps: listCountOrNull(ownedSnap),
+      brands: listCountOrNull(brandsSnap),
+      webhooks: listCountOrNull(webhooksSnap),
+      targets: listCountOrNull(targetsSnap),
       ...summarizeStatuses(finalFindings),
+      collection: collectionSummary(entries),
     },
     findings: finalFindings,
     errors: snapshotErrors(entries),
-    snapshots: Object.fromEntries(entries.map(([name, snap]) => [name, snap.data ?? null])),
+    snapshots: snapshotsForBundle(entries),
   };
 }
 
@@ -2194,10 +3057,17 @@ async function nextAvailableAuditDir(root: string, preferredName: string): Promi
   throw new Error(`Unable to allocate output directory under ${root}`);
 }
 
-async function writeSecureTextFile(rootDir: string, relativePathname: string, content: string): Promise<void> {
+/** Writes one bundle file; every configured secret is removed from the content first, in every encoded form (guard 2). */
+async function writeSecureTextFile(rootDir: string, relativePathname: string, content: string, secrets: ReadonlyArray<string | undefined> = []): Promise<void> {
   const destination = resolveSecureOutputPath(rootDir, relativePathname);
   ensurePrivateDir(dirname(destination));
-  await writeFile(destination, content, { encoding: "utf8", mode: 0o600 });
+  await writeFile(destination, redactConfiguredSecrets(content, secrets), { encoding: "utf8", mode: 0o600 });
+}
+
+/** Writes one JSON bundle file; the configured secrets are removed value by value before serialization so the file stays valid JSON. */
+async function writeSecureJsonFile(rootDir: string, relativePathname: string, value: unknown, secrets: ReadonlyArray<string | undefined>): Promise<void> {
+  const plain: unknown = JSON.parse(JSON.stringify(value ?? null));
+  await writeSecureTextFile(rootDir, relativePathname, serializeJson(sealValue(plain, secrets)));
 }
 
 async function createZipArchive(sourceDir: string, zipPath: string): Promise<void> {
@@ -2229,7 +3099,7 @@ function formatAccessCheckText(result: ZendeskAccessCheckResult): string {
     surface.name,
     surface.requiredRole,
     surface.status,
-    surface.count === undefined ? "-" : String(surface.count),
+    surface.count === undefined ? "-" : `${surface.count}${surface.truncated ? "+" : ""}`,
     surface.error ? surface.error.replace(/\s+/g, " ").slice(0, 90) : "",
   ]);
   return [
@@ -2309,10 +3179,10 @@ function buildQuickReference(): string {
   return [
     "# Zendesk Audit Bundle Quick Reference",
     "",
-    `- \`core_data/\` contains raw Zendesk API snapshots used during this assessment (credentials are never written: OAuth token values, client secrets, target passwords, and other credential-bearing properties are replaced with ${CREDENTIAL_REDACTION_MARKER}).`,
-    "- `analysis/` contains normalized findings (`findings.json`) and one JSON file per assessment category.",
+    `- \`core_data/\` contains redacted Zendesk API snapshots used during this assessment (credentials are never written: OAuth token values, client secrets, target passwords, app parameters flagged secure, {name, value} pairs with credential names, and other credential-bearing properties are replaced with ${CREDENTIAL_REDACTION_MARKER}; inside every string value, URL userinfo, credential-named or token-shaped query pairs such as ?token=, token-in-path webhook URLs, header, cookie, and scheme carriers, and private PEM blocks are replaced while the scheme, host, and path are kept; the configured API token, OAuth token, and composed Basic credential are removed from every file in every encoded form).`,
+    "- `analysis/` contains normalized findings (`findings.json`) and one JSON file per assessment category. Counts derived from an inventory that could not be read render as null, never 0.",
     "- `compliance/` contains the executive summary, the unified matrix, and one report per framework (FedRAMP, CMMC, SOC 2, CIS, PCI-DSS, DISA STIG, IRAP, ISMAP).",
-    "- `_errors.log` appears only when some reads failed but the bundle still completed.",
+    "- `_errors.log` appears only when some reads failed but the bundle still completed. Error strings carry the HTTP status and Zendesk's documented error fields only; non-JSON bodies are summarized as a status-and-length note and never echoed.",
     "- Manual findings name the Admin Center evidence a reviewer must collect; they never count as passing.",
     "",
     "Recommended reading order:",
@@ -2341,33 +3211,37 @@ export async function exportZendeskAuditBundle(
   const findings = assessments.flatMap((assessment) => assessment.findings);
   const errors = [...new Set(assessments.flatMap((assessment) => assessment.errors))];
 
+  // Every file passes through the configured-secret scrub (guard 2) on the way
+  // out: JSON files value by value, text files as a whole.
+  const secrets = configuredZendeskSecrets(config);
   const outputDir = await nextAvailableAuditDir(outputRoot, `${safeDirName(config.subdomain)}-zendesk-audit-bundle`);
-  await writeSecureTextFile(outputDir, "metadata.json", serializeJson({
+  await writeSecureJsonFile(outputDir, "metadata.json", {
     generated_at: generatedAt,
     subdomain: config.subdomain,
     auth_mode: config.authMode,
     source_chain: config.sourceChain,
     finding_count: findings.length,
     error_count: errors.length,
-  }));
-  await writeSecureTextFile(outputDir, "core_data/access_check.json", serializeJson(access));
+  }, secrets);
+  await writeSecureJsonFile(outputDir, "core_data/access_check.json", access, secrets);
+  // Every read gets a core_data/ file: the redacted payload when it was readable,
+  // otherwise the not-collected marker, so a refused list never appears as a
+  // missing file or an empty inventory.
   for (const assessment of assessments) {
     for (const [name, value] of Object.entries(assessment.snapshots)) {
-      if (value !== null && value !== undefined) {
-        await writeSecureTextFile(outputDir, `core_data/${name}.json`, serializeJson(value));
-      }
+      await writeSecureJsonFile(outputDir, `core_data/${name}.json`, value ?? null, secrets);
     }
-    await writeSecureTextFile(outputDir, `analysis/${assessment.category}.json`, serializeJson(assessment));
+    await writeSecureJsonFile(outputDir, `analysis/${assessment.category}.json`, assessment, secrets);
   }
-  await writeSecureTextFile(outputDir, "analysis/findings.json", serializeJson(findings));
-  await writeSecureTextFile(outputDir, "compliance/executive_summary.md", buildExecutiveSummary(config, assessments, errors, generatedAt));
-  await writeSecureTextFile(outputDir, "compliance/unified_compliance_matrix.md", buildUnifiedMatrix(findings));
+  await writeSecureJsonFile(outputDir, "analysis/findings.json", findings, secrets);
+  await writeSecureTextFile(outputDir, "compliance/executive_summary.md", buildExecutiveSummary(config, assessments, errors, generatedAt), secrets);
+  await writeSecureTextFile(outputDir, "compliance/unified_compliance_matrix.md", buildUnifiedMatrix(findings), secrets);
   for (const framework of FRAMEWORK_REPORTS) {
-    await writeSecureTextFile(outputDir, `compliance/${framework.slug}_compliance_report.md`, buildFrameworkReport(framework.title, framework.prefix, findings));
+    await writeSecureTextFile(outputDir, `compliance/${framework.slug}_compliance_report.md`, buildFrameworkReport(framework.title, framework.prefix, findings), secrets);
   }
-  await writeSecureTextFile(outputDir, "QUICK_REFERENCE.md", buildQuickReference());
+  await writeSecureTextFile(outputDir, "QUICK_REFERENCE.md", buildQuickReference(), secrets);
   if (errors.length > 0) {
-    await writeSecureTextFile(outputDir, "_errors.log", `${errors.join("\n")}\n`);
+    await writeSecureTextFile(outputDir, "_errors.log", `${errors.join("\n")}\n`, secrets);
   }
 
   const zipPath = `${outputDir}.zip`;
@@ -2430,6 +3304,33 @@ function createClient(args: AuthArgs): ZendeskApiClient {
   return new ZendeskApiClient(resolveZendeskConfiguration(args as JsonRecord));
 }
 
+type ToolResult = ReturnType<typeof textResult> & { isError?: boolean };
+
+/** Credentials passed as arguments or present in the environment, known before the client exists. */
+function argumentSecrets(args: AuthArgs): string[] {
+  return [args.api_token, args.oauth_token, process.env.ZENDESK_API_TOKEN, process.env.ZENDESK_OAUTH_TOKEN]
+    .filter((value): value is string => typeof value === "string");
+}
+
+/**
+ * Runs one tool and removes every configured secret from the whole result (guard 2):
+ * the text rendering and the structured details alike, whether the run succeeded or
+ * the catch block rendered the error. The client's secrets include the composed
+ * Basic credential, which the argument list alone cannot name.
+ */
+async function runSealed(label: string, tool: string, args: AuthArgs, run: (client: ZendeskApiClient) => Promise<ToolResult>): Promise<ToolResult> {
+  const secrets = new Set<string>(argumentSecrets(args));
+  let client: ZendeskApiClient | undefined;
+  try {
+    client = createClient(args);
+    for (const secret of client.knownSecrets) secrets.add(secret);
+    return sealValue(await run(client), [...secrets]);
+  } catch (error) {
+    for (const secret of client?.knownSecrets ?? []) secrets.add(secret);
+    return sealValue(errorResult(`${label} failed: ${errorMessage(error)}`, { tool }), [...secrets]);
+  }
+}
+
 const authParams = {
   subdomain: Type.Optional(Type.String({ description: "Zendesk subdomain (the {subdomain} in https://{subdomain}.zendesk.com). Defaults to ZENDESK_SUBDOMAIN or the config file." })),
   email: Type.Optional(Type.String({ description: "Email of the admin or agent that owns the API token. Defaults to ZENDESK_EMAIL." })),
@@ -2464,12 +3365,10 @@ function registerAssessmentTool(
     parameters: Type.Object(assessParams),
     prepareArguments: normalizeAssessArgs,
     async execute(_toolCallId: string, args: AssessArgs) {
-      try {
-        const result = await run(createClient(args), toOptions(args));
+      return runSealed(label, name, args, async (client) => {
+        const result = await run(client, toOptions(args));
         return textResult(formatAssessmentText(result), { tool: name, ...result });
-      } catch (error) {
-        return errorResult(`${label} failed: ${error instanceof Error ? error.message : String(error)}`, { tool: name });
-      }
+      });
     },
   });
 }
@@ -2483,12 +3382,10 @@ export function registerZendeskTools(pi: any): void {
     parameters: Type.Object(authParams),
     prepareArguments: normalizeAuthArgs,
     async execute(_toolCallId: string, args: AuthArgs) {
-      try {
-        const result = await checkZendeskAccess(createClient(args));
+      return runSealed("Zendesk access check", "zendesk_check_access", args, async (client) => {
+        const result = await checkZendeskAccess(client);
         return textResult(formatAccessCheckText(result), { tool: "zendesk_check_access", ...result });
-      } catch (error) {
-        return errorResult(`Zendesk access check failed: ${error instanceof Error ? error.message : String(error)}`, { tool: "zendesk_check_access" });
-      }
+      });
     },
   });
 
@@ -2535,10 +3432,9 @@ export function registerZendeskTools(pi: any): void {
     }),
     prepareArguments: normalizeExportArgs,
     async execute(_toolCallId: string, args: ExportArgs) {
-      try {
-        const config = resolveZendeskConfiguration(args as JsonRecord);
+      return runSealed("Zendesk audit bundle export", "zendesk_export_audit_bundle", args, async (client) => {
         const outputRoot = resolve(process.cwd(), args.output_dir?.trim() || DEFAULT_OUTPUT_DIR);
-        const result = await exportZendeskAuditBundle(new ZendeskApiClient(config), config, outputRoot, toOptions(args));
+        const result = await exportZendeskAuditBundle(client, client.getResolvedConfig(), outputRoot, toOptions(args));
         return textResult(
           [
             "Zendesk audit bundle exported.",
@@ -2557,9 +3453,7 @@ export function registerZendeskTools(pi: any): void {
             error_count: result.errorCount,
           },
         );
-      } catch (error) {
-        return errorResult(`Zendesk audit bundle export failed: ${error instanceof Error ? error.message : String(error)}`, { tool: "zendesk_export_audit_bundle" });
-      }
+      });
     },
   });
 }

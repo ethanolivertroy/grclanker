@@ -21,7 +21,7 @@ import {
   type ComputeBackendKind,
   type ComputeBackendStatus,
 } from "./compute.js";
-import { redactErrorMessage, redactSecrets } from "./execution-backend.js";
+import { ExecutionBackendCleanupError, redactErrorMessage, redactSecrets } from "./execution-backend.js";
 import { joinBashArgs, quoteForBash } from "./shell.js";
 import { GrclankerUserError } from "./setup.js";
 import {
@@ -29,7 +29,7 @@ import {
   type GrclankerSettings,
 } from "./settings.js";
 
-type EnvCommandOptions = {
+export type EnvCommandOptions = {
   backend?: ComputeBackendKind;
   cwd: string;
   timeoutSeconds?: number;
@@ -241,7 +241,14 @@ async function withEnvExecution<T>(
 ): Promise<T> {
   const settings = getEffectiveSettings(options);
   ensureBackendIsRunnable(settings);
-  return withComputeBackendExecution(options.cwd, settings, run);
+  try {
+    return await withComputeBackendExecution(options.cwd, settings, run);
+  } catch (error) {
+    // A remnant the backend could not remove is an operator message (pod id, path, and the
+    // delete command), not a stack trace.
+    if (error instanceof ExecutionBackendCleanupError) throw new GrclankerUserError(error.message);
+    throw error;
+  }
 }
 
 async function executeOnBackend(
@@ -311,17 +318,58 @@ async function removeProbeFile(
   }
 }
 
-async function runBackendToolSmokeTest(
+export const ONE_SHOT_SMOKE_NOTE = "one-shot backend, stateful file operations not offered";
+
+type SmokeLog = (line: string) => void;
+
+function isOneShotExecution(execution: ResolvedComputeBackendExecution): boolean {
+  return execution.backend?.capabilities.oneShot === true;
+}
+
+// A one-shot backend cannot pass a write-then-read check across two executions, so the stateful
+// probes are reported as skipped with the reason (never as a pass) and the only thing verified is
+// that a single execution can write and read back its own file.
+async function runOneShotRoundTripSmokeTest(
   options: EnvCommandOptions,
   execution: ResolvedComputeBackendExecution,
+  log: SmokeLog,
 ): Promise<void> {
+  log(`tool_adapter=skipped (${ONE_SHOT_SMOKE_NOTE})`);
+  const probeName = `.grclanker-one-shot-smoke-${Date.now()}-${Math.random().toString(36).slice(2, 8)}.txt`;
+  const command = [
+    `probe_file=${quoteForBash(probeName)}`,
+    "printf 'alpha\\n' > \"$probe_file\" && cat \"$probe_file\"",
+    "status=$?",
+    "rm -f -- \"$probe_file\"",
+    "exit $status",
+  ].join("; ");
+  const chunks: string[] = [];
+  const result = await execution.bashOperations.exec(command, options.cwd, {
+    onData: (chunk) => chunks.push(chunk.toString("utf8")),
+    timeout: options.timeoutSeconds ?? 15,
+  });
+  if (result.exitCode !== 0 || !chunks.join("").includes("alpha")) {
+    throw new GrclankerUserError("One-shot write-then-read verification inside a single execution failed.");
+  }
+  log("tool_one_shot_round_trip=ok");
+}
+
+export async function runBackendToolSmokeTest(
+  options: EnvCommandOptions,
+  execution: ResolvedComputeBackendExecution,
+  log: SmokeLog = console.log,
+): Promise<void> {
+  if (isOneShotExecution(execution)) {
+    await runOneShotRoundTripSmokeTest(options, execution, log);
+    return;
+  }
   if (
     !execution.readOperations ||
     !execution.writeOperations ||
     !execution.editOperations ||
     !execution.lsOperations
   ) {
-    console.log("tool_adapter=skipped");
+    log("tool_adapter=skipped");
     return;
   }
 
@@ -333,13 +381,13 @@ async function runBackendToolSmokeTest(
 
   try {
     await execution.writeOperations.writeFile(probePath, "alpha\n");
-    console.log("tool_write=ok");
+    log("tool_write=ok");
 
     const written = (await execution.readOperations.readFile(probePath)).toString("utf8");
     if (written !== "alpha\n") {
       throw new GrclankerUserError("Backend write/read verification failed.");
     }
-    console.log("tool_read=ok");
+    log("tool_read=ok");
 
     await execution.editOperations.access(probePath);
     await execution.editOperations.writeFile(probePath, "beta\n");
@@ -347,25 +395,27 @@ async function runBackendToolSmokeTest(
     if (edited !== "beta\n") {
       throw new GrclankerUserError("Backend edit verification failed.");
     }
-    console.log("tool_edit=ok");
+    log("tool_edit=ok");
 
     const entries = await execution.lsOperations.readdir(options.cwd);
     if (!entries.includes(probeName)) {
       throw new GrclankerUserError("Backend ls verification failed.");
     }
-    console.log("tool_ls=ok");
+    log("tool_ls=ok");
   } finally {
     await removeProbeFile(execution, probePath, options.timeoutSeconds ?? 15);
   }
 }
 
-async function runBackendSearchSmokeTest(
+export async function runBackendSearchSmokeTest(
   options: EnvCommandOptions,
   execution: ResolvedComputeBackendExecution,
+  log: SmokeLog = console.log,
 ): Promise<void> {
   if (!execution.findOperations || !execution.grepOperations) {
-    console.log("tool_find=skipped");
-    console.log("tool_grep=skipped");
+    const reason = isOneShotExecution(execution) ? ` (${ONE_SHOT_SMOKE_NOTE})` : "";
+    log(`tool_find=skipped${reason}`);
+    log(`tool_grep=skipped${reason}`);
     return;
   }
 
@@ -383,7 +433,7 @@ async function runBackendSearchSmokeTest(
     if (!found.includes(probePath)) {
       throw new GrclankerUserError("Backend find verification failed.");
     }
-    console.log("tool_find=ok");
+    log("tool_find=ok");
 
     const search = await execution.grepOperations.searchMatches({
       pattern: probeNeedle,
@@ -397,7 +447,7 @@ async function runBackendSearchSmokeTest(
     if (!matched) {
       throw new GrclankerUserError("Backend grep verification failed.");
     }
-    console.log("tool_grep=ok");
+    log("tool_grep=ok");
   } finally {
     await removeProbeFile(execution, probePath, options.timeoutSeconds ?? 15);
   }

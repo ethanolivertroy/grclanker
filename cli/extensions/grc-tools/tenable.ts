@@ -18,7 +18,8 @@ import { homedir } from "node:os";
 import { dirname, join, relative, resolve } from "node:path";
 import { ZipArchive } from "archiver";
 import { Type } from "@sinclair/typebox";
-import { parse as parseYaml } from "yaml";
+import { parse as parseYaml, YAMLError } from "yaml";
+import { REDACTED_VALUE, scrubSensitiveValues } from "../../flue/redact.js";
 import { errorResult, formatTable, textResult } from "./shared.js";
 
 type FetchImpl = typeof fetch;
@@ -78,28 +79,40 @@ export interface TenableResolvedConfig {
   sourceChain: string[];
 }
 
+/**
+ * One collected inventory. seen, total, and truncated describe a walk that ran;
+ * they are null whenever the read was refused, failed, or never attempted so a
+ * consumer cannot mistake "not collected" for "collected zero, complete".
+ * endpoint names the request that produced the data or the request that actually
+ * failed (which may differ from the nominal one, for example a chunk download
+ * inside an export), and is null when no request was made. httpStatus is the
+ * observed status of a failed request and null when none was observed.
+ */
 export interface TenableDataset<T> {
   data: T;
   status: "ok" | "forbidden" | "error" | "not_configured";
+  endpoint: string | null;
   error?: string;
-  seen: number;
-  total?: number;
-  truncated: boolean;
+  httpStatus: number | null;
+  seen: number | null;
+  total: number | null;
+  truncated: boolean | null;
 }
 
 export interface TenableAccessSurface {
   name: string;
-  endpoint: string;
+  endpoint: string | null;
   requiredRole: string;
   status: "readable" | "forbidden" | "not_readable" | "not_configured";
-  count?: number;
+  count: number | null;
+  httpStatus: number | null;
   error?: string;
 }
 
 export interface TenableAccessCheckResult {
   status: "healthy" | "limited";
   platform: string;
-  callerIsAdministrator: boolean | undefined;
+  callerIsAdministrator: boolean | null;
   surfaces: TenableAccessSurface[];
   notes: string[];
   recommendedNextStep: string;
@@ -324,12 +337,610 @@ function safeDirName(value: string): string {
   return normalized || "tenable";
 }
 
-function redactSecrets(message: string, secrets: string[]): string {
-  let redacted = message;
-  for (const secret of secrets) {
-    if (secret.length >= 6) redacted = redacted.split(secret).join("[REDACTED]");
+export const CREDENTIAL_REDACTION_MARKER = "[REDACTED]";
+const REDACTED = CREDENTIAL_REDACTION_MARKER;
+
+/**
+ * Scrub boundary. A bare value shaped like a name (words joined by hyphens or
+ * underscores with at most one digit group per segment: prod-us-east-2026,
+ * fw-dc1-01, sess-canary-COOKIE-31415926535897) standing alone in prose is
+ * indistinguishable from a resource name and stays, because a summary that names
+ * the unread inventory is itself a verdict-safety requirement. Two guards make
+ * that safe and both hold by construction:
+ *
+ * 1. A value inside a carrier is removed whatever its shape: the Authorization,
+ *    Proxy-Authorization, Cookie, Set-Cookie, X-Api-Key, X-ApiKeys, X-Cookie,
+ *    X-SecurityCenter, X-Auth-Token and similar header lines to the end of the
+ *    line; the userinfo of every embedded URL; credential-named query and fragment
+ *    pairs of every URL and bare query string (the ?token= an audit-log field or a
+ *    webhook target may carry) and any query value shaped like a token; the schemes
+ *    Bearer, Basic, Digest, Token, Negotiate, NTLM, SSWS, and ApiKey (only a listed
+ *    prose word after the scheme, "Basic authentication", stays; after the noun
+ *    "Token" any short plain lowercase word does); credential-named key=value pairs
+ *    (to the next delimiter: the accessKey= and secretKey= halves of an echoed
+ *    X-ApiKeys header), key: value pairs (to the end of the line), "key":"value"
+ *    pairs, and key="value" XML or HTML attributes; and webhook services whose URL
+ *    path is the secret. Nothing this module renders puts a credential word in front
+ *    of a colon or an equals sign, so every fixed text survives the scrub.
+ * 2. A configured secret (the Vulnerability Management access key and secret key,
+ *    and the Security Center access key and secret key) is removed whatever its
+ *    shape and in every encoded form (JSON-escaped, URL-encoded, form-encoded,
+ *    base64, base64url, re-flowed PEM lines), down to MIN_CONFIGURED_SECRET_LENGTH
+ *    (cli/flue/redact.ts owns the forms). redactSecrets applies it at every client
+ *    throw site; the tool boundary and the bundle writer apply it to the whole
+ *    payload and every written file.
+ *
+ * Real token shapes are still removed bare: PEM blocks, JWTs, LUFRPT-prefixed
+ * PAN-OS keys (a proxy page may echo any vendor's key), AWS access key ids, and (in
+ * error text) any run of
+ * LONG_TOKEN_MIN_LENGTH or more token characters that carries base64 symbols,
+ * digits scattered through its letters (0f9e8d7c6b5a4938), or token casing
+ * (Kq7Zx2Vw9Lm4Tp8R). The rule is path-safe: "/", ".", ":", "@", "=", and
+ * whitespace end a run, so URL path segments, dotted hostnames, colon-separated
+ * ARNs, and the two sides of a key=value pair are judged piece by piece, while
+ * "-" and "_" split a run into name segments; uppercase codes (ENOENT, PCI-DSS-4),
+ * digit strings, and canonical UUIDs are names outright. Data values and bundle
+ * content go through redactCredentialValueText, every carrier rule without the
+ * long-token one (an opaque identifier in evidence is not a secret) and with
+ * public PEM blocks (certificates, public keys, CSRs) kept as evidence. Every rule
+ * is unanchored and idempotent.
+ */
+export const MIN_CONFIGURED_SECRET_LENGTH = 4;
+export const LONG_TOKEN_MIN_LENGTH = 16;
+
+// Which PEM blocks a scrub removes: every block in error text, where a block is never
+// evidence; only non-public blocks in data values, where a certificate is.
+type PemScope = "all" | "private";
+
+const PEM_BLOCK_PATTERN = /-----BEGIN ([A-Z0-9 ]+)-----[\s\S]*?-----END [A-Z0-9 ]+-----/g;
+// A block whose END was cut off (a truncated message) runs to the end of the text.
+const PEM_OPEN_PATTERN = /-----BEGIN ([A-Z0-9 ]+)-----(?:(?!-----END )[\s\S])*$/;
+// Labels of PEM blocks that carry public material only; every other label (PRIVATE KEY,
+// ENCRYPTED PRIVATE KEY, RSA/EC/DSA/OPENSSH PRIVATE KEY, PGP PRIVATE KEY BLOCK) is a secret.
+const PUBLIC_PEM_LABELS = new Set(["CERTIFICATE", "TRUSTED CERTIFICATE", "X509 CRL", "CERTIFICATE REQUEST", "NEW CERTIFICATE REQUEST", "PUBLIC KEY", "RSA PUBLIC KEY", "PKCS7", "CMS"]);
+// Any scheme-prefixed URL: the userinfo is dropped; its query and fragment pairs are
+// judged by the pair rule below, so the scheme, host, path, and ordinary pairs stay.
+const EMBEDDED_URL_PATTERN = /\b[a-z][a-z0-9+.-]*:\/\/[^\s"'<>()[\]{}]+/gi;
+const URL_USERINFO_PATTERN = /^([a-z][a-z0-9+.-]*:\/\/)[^\s/@"'<>]+@/i;
+// A query or fragment pair, in a URL or a bare query string: a credential-named pair or a
+// token-shaped value loses the value. A value ends at "&", "#", whitespace, a quote, or the
+// ";" and "," that end a URL inside a sentence (no token carries either).
+const QUERY_PAIR_PATTERN = /([?&#])([A-Za-z0-9_.[\]-]+)=((?!\[REDACTED\])[^&#\s"'<>;,]+)/g;
+// A credential-bearing header line: the whole value goes, whatever its shape. The name and
+// separator are matched here and the value is consumed by headerValueEnd, which carries a
+// quoted value (double, single, or JSON-escaped quotes) through its closing quote, so
+// Cookie: sid="value" loses value and quotes together instead of stopping at the first
+// quote. A value that already opens with a marker is left alone so the rule is idempotent.
+const HEADER_LINE_PATTERN = /\b(authorization|proxy-authorization|cookie|set-cookie|x-cookie|x-api-key|x-apikeys?|api-key|apikey|x-securitycenter|x-pan-key|x-redlock-auth|x-auth-token|x-access-token|x-amz-security-token|x-vault-token|private-token|x-goog-api-key|x-csrf-token|x-xsrf-token)(["']?\s*:\s*)/gi;
+// Inside a header value a quote opens a quoted segment only where a value can start: at the
+// start of the value or after "=", ":", ",", ";", "(", or whitespace. Anywhere else it is the
+// quote that closes the text the header line was quoted in.
+const HEADER_VALUE_OPENER_PATTERN = /[=:,;(\s]/;
+const HEADER_VALUE_TERMINATOR_PATTERN = /[\r\n<>]/;
+// A scheme and its credentials: the value is removed whatever its shape, except the
+// prose words that follow a scheme name in a sentence ("Basic authentication is
+// required", "Bearer token") and a Titlecase word, which makes the scheme name an
+// adjective in a title ("Basic Network Scan", "Bearer Token", "Token Hygiene"): a Basic
+// credential is base64 and a bearer token or API key carries digits, symbols, or token
+// casing, so neither is ever one capitalized word of letters. "Token" is also this
+// module's own noun ("Token hygiene", "token inventory"), so after it any plain
+// lowercase word shorter than LONG_TOKEN_MIN_LENGTH is prose. OAuth 1.0 carries its
+// credentials as key="value" attributes, which the attribute rule removes, so OAuth is
+// not a scheme here and "OAuth clients" stays.
+const SCHEME_VALUE_PATTERN = /\b(Bearer|Basic|Digest|Token|Negotiate|NTLM|SSWS|ApiKey|Api-Key)\s+((?!\[REDACTED\])[A-Za-z0-9._~+/=-]{4,})/gi;
+const PLAIN_WORD_PATTERN = /^[a-z]+$/;
+const TITLE_WORD_PATTERN = /^[A-Z][a-z]{1,19}$/;
+const SCHEME_PROSE_WORDS = new Set([
+  "authentication", "authorization", "auth", "token", "tokens", "credential", "credentials", "scheme", "schemes", "header", "headers",
+  "realm", "challenge", "access", "mode", "method", "login", "flow", "grant", "type", "string", "value", "values", "user", "users",
+  "account", "client", "clients", "error", "request", "requests", "response", "with", "without", "and", "or", "is", "was", "are",
+  "not", "the", "this", "that", "these", "those", "to", "in", "for", "from", "on", "of", "by", "as", "at", "if", "then", "but", "so",
+  "than", "when", "where", "over", "via", "per", "only", "still", "also", "use", "used", "using", "required", "requires", "failed",
+  "rejected", "expired", "invalid", "missing", "unsupported", "supported", "unauthorized", "forbidden", "denied", "allowed", "enabled",
+  "disabled", "preferred", "deprecated", "retired", "retiring", "must", "should", "can", "cannot", "could", "will", "would", "may",
+  "has", "have", "does", "did", "do", "be", "been",
+]);
+// "key":"value" and key="value" carriers keep the whole quoted value together so a
+// value with spaces is removed as one; the unquoted pair rule below takes the rest.
+// Keys may start with "_" (_upstream_session, _token), so a key begins wherever no key
+// character precedes it rather than at a word boundary.
+const JSON_QUOTED_PAIR_PATTERN = /"([A-Za-z_][A-Za-z0-9_.-]{0,63})"(\s*:\s*)"((?!\[REDACTED\])[^"\r\n]+)"/g;
+const QUOTED_ATTRIBUTE_PATTERN = /(?<![A-Za-z0-9_.:-])([A-Za-z_][A-Za-z0-9_.:-]{0,63})\s*=\s*(["'])((?!\[REDACTED\])[^"'\r\n]+)\2/g;
+// An unquoted pair: key=value runs to the next delimiter, key: value (a header or
+// YAML-style line) to the end of the line, where a brace or bracket ends it so a JSON
+// structure after a credential-named key (compact "password":{...}, "auth":null}) is
+// never taken for a value.
+const ASSIGNMENT_KEY_PATTERN = /(?<![A-Za-z0-9_.-])(["']?)([A-Za-z_][A-Za-z0-9_.-]{0,63})(["']?\s*([:=])\s*["']?)/g;
+const DELIMITED_VALUE_PATTERN = /(?!\[REDACTED\])[^\s"'<>;,&]+/y;
+const LINE_VALUE_PATTERN = /(?!\[REDACTED\])[^\r\n<>"',;{}[\]]*[^\s\r\n<>"',;{}[\]]/y;
+const TOKEN_IN_PATH_WEBHOOK_PATTERN = /(https?:\/\/(?:hooks\.slack\.com\/services|discord(?:app)?\.com\/api\/webhooks|[a-z0-9.-]*webhook\.office\.com\/webhookb2)\/)(?!\[REDACTED\])[^\s"'<>]+/gi;
+const JWT_PATTERN = /\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}(?:\.[A-Za-z0-9_-]+)*/g;
+const PANOS_API_KEY_PATTERN = /\bLUFRPT[A-Za-z0-9+/=_-]{16,}/g;
+const AWS_ACCESS_KEY_ID_PATTERN = /\b(?:AKIA|ASIA|AROA|AIDA|AGPA|ANPA|ANVA|APKA|ABIA|ACCA)[A-Z0-9]{16}\b/g;
+const LONG_TOKEN_RUN_PATTERN = /[A-Za-z0-9+_-]{16,}(?:={1,2}(?![A-Za-z0-9&]))?/g;
+const TOKEN_VALUE_PATTERN = /^[A-Za-z0-9+_-]{16,}={0,2}$/;
+const UPPERCASE_CODE_PATTERN = /^[A-Z][A-Z_]*$|^[A-Z][A-Z0-9]*(?:[_-][A-Z0-9]+)+$/;
+const DIGITS_ONLY_PATTERN = /^\d+$/;
+const DIGIT_GROUP_PATTERN = /\d+/g;
+const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+// Below this many letters a segment's casing is not judged: eBay, iOS, McD are names.
+const MIN_LETTERS_FOR_CASING = 6;
+// A segment this long that is not name-shaped makes the whole run a token on its own.
+const MIN_TOKEN_SEGMENT_LENGTH = 8;
+// A carrier is named by its last word: api_key, access_token, client_secret, X-PAN-KEY,
+// _upstream_session, oauth_signature, Set-Cookie, password1. A key whose last word names
+// something else (credentialID, keyId, tokenCount, auth_mode, credentials_file,
+// passwordPolicy, password_complexity_by_device, credential-enforcement) is not one, nor is
+// a max/min bound; a session id (session_id, PHPSESSID, JSESSIONID) is, whatever its tail.
+const CREDENTIAL_KEY_WORDS = new Set([
+  "token", "tokens", "secret", "secrets", "password", "passwords", "passwd", "pwd", "passphrase", "passcode", "phash",
+  "apikey", "authorization", "credential", "credentials", "key", "keys", "cookie", "cookies", "sid", "sig", "signature",
+  "auth", "nonce", "sas", "community", "authpwd", "privpwd", "pin", "otp", "totp", "jwt", "assertion", "bearer", "hmac",
+  "session", "sessid", "kubeconfig", "dsn", "pem", "ikey", "skey",
+]);
+// Concatenated spellings the segment split cannot see (authtoken, sharedsecret, privatekey).
+const CREDENTIAL_KEY_SUFFIX_PATTERN = /(?:token|secret|passw(?:or)?d|passphrase|passcode|phash|authorization|credential|signature|nonce|community|assertion|session|sessid|authpwd|privpwd|(?:api|private|secret|access|signing|encryption|master|shared|account|client|service|session|license|ssh|hmac)keys?)$/;
+// A key whose last word names the form of a value (password_hash, token_value,
+// authorization_header, secret_plain) carries a credential when an earlier word names one.
+const CREDENTIAL_VALUE_FORM_WORDS = new Set(["value", "values", "plain", "plaintext", "data", "string", "text", "header", "raw", "encrypted", "hash", "digest", "blob", "content"]);
+const SESSION_ID_PATTERN = /sess(?:ion)?[_.-]?id$/i;
+const BOUND_KEY_SEGMENTS = new Set(["max", "min"]);
+const EXTRA_CREDENTIAL_KEYS = new Set(["x-pan-key", "x-redlock-auth", "proxy-authorization", "x-amz-signature", "x-amz-credential", "x-amz-security-token", "oauth_signature", "oauth_token", "oauth_verifier"]);
+// "pass" names a credential in a query string or an = assignment (user=a&pass=b), while a
+// "pass" count or verdict in a key: value pair is this module's own vocabulary.
+const ASSIGNMENT_ONLY_CREDENTIAL_WORDS = new Set(["pass"]);
+// JSON structure and literals after a key are never a credential value.
+const STRUCTURAL_VALUE_PATTERN = /^(?:[{[]|\{\}|\[\]|true|false|null)$/;
+// A bare integer under a plural credential word ("api_keys": 1, keys=3, secrets: 0) is
+// a count, this module's own summary vocabulary, not a credential.
+const PLURAL_CREDENTIAL_WORDS = new Set(["tokens", "secrets", "keys", "cookies", "passwords", "credentials"]);
+const COUNT_VALUE_PATTERN = /^\d+(?:\s|$)/;
+const NON_CREDENTIAL_KEY_QUALIFIERS = new Set(["public"]);
+// "code" names a credential only behind one of these words (registration_code,
+// activation_code, authorization_code, recovery_code); status_code, error_code, and
+// country_code stay evidence.
+const CREDENTIAL_CODE_QUALIFIERS = new Set(["registration", "activation", "linking", "auth", "authorization", "access", "verification", "recovery", "backup", "security", "mfa", "otp", "pairing", "enrollment", "license"]);
+
+function propertyNameSegments(name: string): string[] {
+  return name
+    .replace(/([a-z0-9])([A-Z])/g, "$1_$2")
+    .replace(/([A-Z]+)([A-Z][a-z])/g, "$1_$2")
+    .toLowerCase()
+    .split(/[^a-z0-9]+/)
+    .filter((segment) => segment.length > 0);
+}
+
+function credentialKeyWord(segment: string): boolean {
+  return CREDENTIAL_KEY_WORDS.has(segment) || CREDENTIAL_KEY_SUFFIX_PATTERN.test(segment);
+}
+
+// The words of a key with trailing digits removed from each (password1, key2).
+function keyWords(key: string): string[] {
+  return propertyNameSegments(key).map((segment) => segment.replace(/\d+$/, "")).filter((segment) => segment.length > 0);
+}
+
+/** True when a name in a query string, header, attribute, or name-value pair carries a credential. */
+export function isCredentialKey(key: string): boolean {
+  if (SESSION_ID_PATTERN.test(key) || EXTRA_CREDENTIAL_KEYS.has(key.toLowerCase())) return true;
+  const words = keyWords(key);
+  const last = words[words.length - 1];
+  if (last === undefined || BOUND_KEY_SEGMENTS.has(words[0])) return false;
+  if ((last === "key" || last === "keys") && words.length > 1 && NON_CREDENTIAL_KEY_QUALIFIERS.has(words[words.length - 2])) return false;
+  if (last === "code" || last === "codes") return words.length > 1 && CREDENTIAL_CODE_QUALIFIERS.has(words[words.length - 2]);
+  if (credentialKeyWord(last)) return true;
+  return CREDENTIAL_VALUE_FORM_WORDS.has(last) && words.slice(0, -1).some(credentialKeyWord);
+}
+
+// True for a value that opens with a bare integer under a plural credential word: a count,
+// not a carrier (the rest of a key: value line is rescanned for pairs of its own).
+function isCountValue(key: string, value: string): boolean {
+  if (!COUNT_VALUE_PATTERN.test(value)) return false;
+  const words = keyWords(key);
+  return words.length > 0 && PLURAL_CREDENTIAL_WORDS.has(words[words.length - 1]);
+}
+
+/** isCredentialKey plus the words that name a credential only in a query string or = assignment. */
+function isCredentialAssignmentKey(key: string): boolean {
+  if (isCredentialKey(key)) return true;
+  const words = keyWords(key);
+  return words.length > 0 && ASSIGNMENT_ONLY_CREDENTIAL_WORDS.has(words[words.length - 1]);
+}
+
+// Token-shaped casing: the case changes more often than once every three letters
+// (bPxRfiCYcanaryKEY); words, acronyms, camelCase, and PascalCase change case at word
+// boundaries only (AWSLambdaBasicExecutionRole).
+function hasTokenCasing(letters: string): boolean {
+  if (letters.length < MIN_LETTERS_FOR_CASING) return false;
+  let changes = 0;
+  for (let index = 1; index < letters.length; index += 1) {
+    const previousLower = letters[index - 1] >= "a" && letters[index - 1] <= "z";
+    const currentLower = letters[index] >= "a" && letters[index] <= "z";
+    if (previousLower !== currentLower) changes += 1;
   }
-  return redacted.replace(/(accessKey|secretKey|accesskey|secretkey)=[^;\s"]+/gi, "$1=[REDACTED]");
+  return changes * 3 > letters.length;
+}
+
+// A "-" or "_" separated segment shaped like part of a name: empty, digits alone, or letters
+// with at most one digit group (west2, sha256, vsys1, ethernet1) whose casing is not token-shaped.
+function isNameSegment(segment: string): boolean {
+  if (segment.length === 0 || DIGITS_ONLY_PATTERN.test(segment)) return true;
+  const digitGroups = segment.match(DIGIT_GROUP_PATTERN) ?? [];
+  if (digitGroups.length > 1) return false;
+  return !hasTokenCasing(segment.replace(DIGIT_GROUP_PATTERN, ""));
+}
+
+// A run is a token when it carries base64 symbols ("+" anywhere; "=" padding only where the
+// run is base64-shaped: a multiple of four characters with no "-" or "_", so "key=" left
+// in front of a marker is never padding and the rule stays idempotent), or when a
+// segment of MIN_TOKEN_SEGMENT_LENGTH or more is not name-shaped, or when at least half
+// of its segments are not. One short random-looking segment beside several names (the
+// six-character mkdtemp suffix of a temp path, a build id) does not make a token.
+function looksLikeToken(run: string): boolean {
+  const padding = /=+$/.exec(run)?.[0] ?? "";
+  const body = run.slice(0, run.length - padding.length);
+  if (UPPERCASE_CODE_PATTERN.test(body) || DIGITS_ONLY_PATTERN.test(body) || UUID_PATTERN.test(body)) return false;
+  if (body.includes("+")) return true;
+  if (padding.length > 0) return run.length % 4 === 0 && !/[-_]/.test(body);
+  const segments = body.split(/[-_]/).filter((segment) => segment.length > 0);
+  const tokenSegments = segments.filter((segment) => !isNameSegment(segment));
+  if (tokenSegments.length === 0) return false;
+  return tokenSegments.some((segment) => segment.length >= MIN_TOKEN_SEGMENT_LENGTH) || tokenSegments.length * 2 >= segments.length;
+}
+
+// A whole query value that is one token-shaped run (no path, dot, or percent escape inside).
+function isTokenShapedValue(value: string): boolean {
+  return TOKEN_VALUE_PATTERN.test(value) && looksLikeToken(value);
+}
+
+// The word after a scheme name is prose when it is a Titlecase word, a plain lowercase
+// word from the list above, or, after "Token", any plain lowercase word too short to be
+// a real token.
+function isSchemeProse(scheme: string, value: string): boolean {
+  if (TITLE_WORD_PATTERN.test(value)) return true;
+  if (!PLAIN_WORD_PATTERN.test(value)) return false;
+  if (SCHEME_PROSE_WORDS.has(value)) return true;
+  return scheme.toLowerCase() === "token" && value.length < LONG_TOKEN_MIN_LENGTH;
+}
+
+function isPublicPemLabel(label: string): boolean {
+  return PUBLIC_PEM_LABELS.has(label.trim());
+}
+
+function scrubPem(text: string, scope: PemScope): string {
+  const keeps = (label: string): boolean => {
+    switch (scope) {
+      case "all":
+        return false;
+      case "private":
+        return isPublicPemLabel(label);
+      default: {
+        const exhaustive: never = scope;
+        return exhaustive;
+      }
+    }
+  };
+  return text
+    .replace(PEM_BLOCK_PATTERN, (match, label: string) => (keeps(label) ? match : CREDENTIAL_REDACTION_MARKER))
+    .replace(PEM_OPEN_PATTERN, (match, label: string) => (keeps(label) ? match : CREDENTIAL_REDACTION_MARKER));
+}
+
+function scrubUrlUserinfo(url: string): string {
+  return url.replace(URL_USERINFO_PATTERN, `$1${CREDENTIAL_REDACTION_MARKER}@`);
+}
+
+// Where the value of a header line that starts at start ends: at the end of the line, at an
+// HTML tag, or at the quote that closes the text the line sits in. A quoted segment
+// ("value", 'value') is carried through its closing quote on the same line; a JSON-escaped
+// quote (\") is content, and once one has been seen the next unescaped quote closes the JSON
+// string the header line is embedded in. Trailing whitespace is not part of the value.
+function headerValueEnd(text: string, start: number): number {
+  let index = start;
+  let escapedQuotes = false;
+  while (index < text.length) {
+    const char = text[index];
+    if (HEADER_VALUE_TERMINATOR_PATTERN.test(char)) break;
+    if (char === "\\" && (text[index + 1] === '"' || text[index + 1] === "'")) {
+      escapedQuotes = true;
+      index += 2;
+      continue;
+    }
+    if (char === '"' || char === "'") {
+      if (escapedQuotes || (index > start && !HEADER_VALUE_OPENER_PATTERN.test(text[index - 1]))) break;
+      const close = text.indexOf(char, index + 1);
+      const segment = text.slice(index + 1, close === -1 ? text.length : close);
+      if (close !== -1 && !HEADER_VALUE_TERMINATOR_PATTERN.test(segment)) {
+        index = close + 1;
+        // A value that is one quoted string ends with its closing quote.
+        if (index - segment.length - 2 === start) return index;
+        continue;
+      }
+    }
+    index += 1;
+  }
+  while (index > start && /\s/.test(text[index - 1])) index -= 1;
+  return index;
+}
+
+// The quote a header value is wrapped in as a whole, or "" when it is not one quoted string.
+// JSON-escaped quotes are content of the string the line sits in and go with the value.
+function enclosingQuote(value: string): string {
+  return value.length >= 2 && (value[0] === '"' || value[0] === "'") && value[value.length - 1] === value[0] ? value[0] : "";
+}
+
+// Every credential-bearing header line loses its value whatever the value's shape; a value
+// that is one quoted string keeps its quotes around the marker so quoted text stays quoted.
+function scrubHeaderLines(text: string): string {
+  HEADER_LINE_PATTERN.lastIndex = 0;
+  let out = "";
+  let last = 0;
+  let match: RegExpExecArray | null;
+  while ((match = HEADER_LINE_PATTERN.exec(text)) !== null) {
+    const start = match.index + match[0].length;
+    const end = headerValueEnd(text, start);
+    const value = text.slice(start, end);
+    if (value.length === 0 || value.startsWith(CREDENTIAL_REDACTION_MARKER)) continue;
+    const quote = enclosingQuote(value);
+    if (value.slice(quote.length).startsWith(CREDENTIAL_REDACTION_MARKER)) continue;
+    out += `${text.slice(last, start)}${quote}${CREDENTIAL_REDACTION_MARKER}${quote}`;
+    last = end;
+    HEADER_LINE_PATTERN.lastIndex = end;
+  }
+  return last === 0 ? text : `${out}${text.slice(last)}`;
+}
+
+// The key and separator are matched on their own and the value is consumed only when the
+// key names a credential, so the value of an ordinary pair is rescanned and a credential
+// pair nested inside it (data=token=...) is still caught.
+function replaceCredentialAssignments(text: string): string {
+  ASSIGNMENT_KEY_PATTERN.lastIndex = 0;
+  let out = "";
+  let last = 0;
+  let match: RegExpExecArray | null;
+  while ((match = ASSIGNMENT_KEY_PATTERN.exec(text)) !== null) {
+    const [whole, openingQuote, key, separator, operator] = match;
+    if (!(operator === "=" ? isCredentialAssignmentKey(key) : isCredentialKey(key))) continue;
+    const valuePattern = operator === ":" ? LINE_VALUE_PATTERN : DELIMITED_VALUE_PATTERN;
+    valuePattern.lastIndex = match.index + whole.length;
+    const value = valuePattern.exec(text)?.[0];
+    if (value === undefined || STRUCTURAL_VALUE_PATTERN.test(value) || isCountValue(key, value)) continue;
+    out += `${text.slice(last, match.index)}${openingQuote}${key}${separator}${CREDENTIAL_REDACTION_MARKER}`;
+    last = match.index + whole.length + value.length;
+    ASSIGNMENT_KEY_PATTERN.lastIndex = last;
+  }
+  return last === 0 ? text : `${out}${text.slice(last)}`;
+}
+
+/** Every carrier rule (guard 1) plus the token shapes a prefix identifies on its own; the long-token rule is left to redactErrorText. */
+function scrubCarriers(text: string, pemScope: PemScope): string {
+  const scrubbed = scrubHeaderLines(scrubPem(text, pemScope)
+    .replace(TOKEN_IN_PATH_WEBHOOK_PATTERN, `$1${CREDENTIAL_REDACTION_MARKER}`)
+    .replace(EMBEDDED_URL_PATTERN, scrubUrlUserinfo)
+    .replace(QUERY_PAIR_PATTERN, (match, separator: string, key: string, value: string) => (isCredentialAssignmentKey(key) || isTokenShapedValue(value) ? `${separator}${key}=${CREDENTIAL_REDACTION_MARKER}` : match)))
+    .replace(SCHEME_VALUE_PATTERN, (match, scheme: string, value: string) => (isSchemeProse(scheme, value) ? match : `${scheme} ${CREDENTIAL_REDACTION_MARKER}`))
+    .replace(JSON_QUOTED_PAIR_PATTERN, (match, key: string, separator: string, value: string) => (isCredentialKey(key) && !isCountValue(key, value) ? `"${key}"${separator}"${CREDENTIAL_REDACTION_MARKER}"` : match))
+    .replace(QUOTED_ATTRIBUTE_PATTERN, (match, key: string, quote: string) => (isCredentialKey(key) ? `${key}=${quote}${CREDENTIAL_REDACTION_MARKER}${quote}` : match));
+  return replaceCredentialAssignments(scrubbed)
+    .replace(JWT_PATTERN, CREDENTIAL_REDACTION_MARKER)
+    .replace(PANOS_API_KEY_PATTERN, CREDENTIAL_REDACTION_MARKER)
+    .replace(AWS_ACCESS_KEY_ID_PATTERN, CREDENTIAL_REDACTION_MARKER);
+}
+
+/** The general scrub for error text: every carrier rule, every PEM block, and the long-token rule. Idempotent. */
+export function redactErrorText(text: string): string {
+  return scrubCarriers(text, "all").replace(LONG_TOKEN_RUN_PATTERN, (run) => (looksLikeToken(run) ? CREDENTIAL_REDACTION_MARKER : run));
+}
+
+/** Guard 2 on its own: every configured secret in every encoded form, for whole payloads and bundle files where the general scrub would remove evidence. */
+export function redactConfiguredSecrets(text: string, secrets: ReadonlyArray<string | undefined>): string {
+  const values = secrets.filter((value): value is string => typeof value === "string" && value.length >= MIN_CONFIGURED_SECRET_LENGTH);
+  if (values.length === 0) return text;
+  return scrubSensitiveValues(text, values).split(REDACTED_VALUE).join(CREDENTIAL_REDACTION_MARKER);
+}
+
+/**
+ * Every string inside a tool result or other plain value, with the configured secrets
+ * removed; a number whose decimal form is a configured secret becomes the marker too.
+ * Structure is never touched, so a short secret that matches a whole token (a PIN, a
+ * word) cannot break the JSON the value is serialized to.
+ */
+function sealValue<T>(value: T, secrets: ReadonlyArray<string | undefined>): T {
+  if (typeof value === "string") return redactConfiguredSecrets(value, secrets) as T;
+  if (typeof value === "number") return (secrets.includes(String(value)) ? CREDENTIAL_REDACTION_MARKER : value) as T;
+  if (Array.isArray(value)) return value.map((item) => sealValue(item, secrets)) as T;
+  if (value && typeof value === "object" && Object.getPrototypeOf(value) === Object.prototype) {
+    const output: JsonRecord = {};
+    for (const [key, entry] of Object.entries(value as JsonRecord)) output[key] = sealValue(entry, secrets);
+    return output as T;
+  }
+  return value;
+}
+
+/** The client-side scrub for a thrown message: the configured secrets in every form (guard 2), then the general scrub. */
+export function redactSecrets(message: string, secrets: ReadonlyArray<string | undefined>): string {
+  return redactErrorText(redactConfiguredSecrets(message, secrets));
+}
+
+/** The secrets a resolved configuration puts on the wire: both halves of the X-ApiKeys header and of the Security Center x-apikey header. */
+export function configuredTenableSecrets(config: TenableResolvedConfig): string[] {
+  return [config.vm?.accessKey, config.vm?.secretKey, config.securityCenter?.accessKey, config.securityCenter?.secretKey]
+    .filter((value): value is string => typeof value === "string" && value.length >= MIN_CONFIGURED_SECRET_LENGTH);
+}
+
+// Property names whose values are credentials wherever they appear in a vendor payload.
+// Matched on the flattened name (snake_case, kebab-case, camelCase, and header forms) or
+// on the final camelCase or snake_case segment. A bare "key" is not one: Tenable tags are
+// {key, value} pairs and the asset tag key is evidence.
+const CREDENTIAL_PROPERTY_NAMES = new Set([
+  "password", "passwd", "pwd", "passphrase", "secret", "secrets", "token", "tokens",
+  "apikey", "apikeys", "xapikey", "xapikeys", "accesskey", "secretkey", "privatekey", "clientsecret",
+  "apisecret", "sharedsecret", "registrationcode", "activationcode", "linkingkey", "authtoken",
+  "accesstoken", "refreshtoken", "idtoken", "sessionid", "sessiontoken", "authorization", "cookie", "xcookie",
+]);
+const CREDENTIAL_LAST_SEGMENTS = new Set(["password", "passwd", "pwd", "passphrase", "secret", "secrets", "token", "tokens", "authorization", "cookie"]);
+
+export function propertyNameIsCredential(name: string): boolean {
+  if (SESSION_ID_PATTERN.test(name) || CREDENTIAL_PROPERTY_NAMES.has(name.toLowerCase().replace(/[^a-z0-9]/g, ""))) return true;
+  const segments = propertyNameSegments(name);
+  const last = segments.at(-1);
+  return last !== undefined && CREDENTIAL_LAST_SEGMENTS.has(last);
+}
+
+/**
+ * The scrub for credentials carried inside string values rather than under a
+ * credential-named key: every carrier rule of redactErrorText (URL userinfo and
+ * credential query pairs; webhook services whose URL path is the secret; header,
+ * cookie, scheme, and credential-pair carriers; JSON encoded as a string; private
+ * PEM blocks) without the long-token rule, because an id, a plugin set, or a hash in
+ * evidence is not a secret, and with public PEM blocks kept because a certificate
+ * is evidence. Applied to every string kept in a dataset, so audit-log field values,
+ * webhook targets, and free-text settings are covered without naming them.
+ */
+export function redactCredentialValueText(text: string): string {
+  return scrubCarriers(text, "private");
+}
+
+function redactCredentialNode(value: unknown): unknown {
+  if (typeof value === "string") return redactCredentialValueText(value);
+  if (Array.isArray(value)) return value.map(redactCredentialNode);
+  const record = asObject(value);
+  if (!record) return value;
+  const pairName = typeof record.name === "string" ? record.name : undefined;
+  const pairIsCredential = (pairName !== undefined && propertyNameIsCredential(pairName)) || record.secure === true;
+  const result: JsonRecord = {};
+  for (const [key, entry] of Object.entries(record)) {
+    if (entry === null || entry === undefined) {
+      result[key] = entry;
+    } else if (propertyNameIsCredential(key) || (pairIsCredential && (key === "value" || key === "default"))) {
+      result[key] = REDACTED;
+    } else {
+      result[key] = redactCredentialNode(entry);
+    }
+  }
+  return result;
+}
+
+// Applied to every collected dataset before it can reach a finding, a tool result, or a
+// bundle file, so credential-bearing properties are redacted by construction.
+export function redactCredentialProperties<T>(value: T): T {
+  return redactCredentialNode(value) as T;
+}
+
+// Scanner records carry the linking key, registration code, and license block; none is
+// read by any finding, so they are replaced at collection time.
+const SCANNER_CREDENTIAL_FIELDS = ["key", "registration_code", "license"];
+
+function stripScannerCredentials(scanner: JsonRecord): JsonRecord {
+  const stripped: JsonRecord = { ...scanner };
+  for (const field of SCANNER_CREDENTIAL_FIELDS) {
+    if (stripped[field] !== undefined && stripped[field] !== null) stripped[field] = REDACTED;
+  }
+  return stripped;
+}
+
+// Only the fields the scan policy verdict reads are kept from GET /policies/{policy_id};
+// the credentials block, audits, and every other section are dropped before storage.
+function projectPolicyDetails(payload: JsonRecord): JsonRecord {
+  const projected: JsonRecord = {};
+  if (payload.uuid !== undefined) projected.uuid = payload.uuid;
+  if (payload.name !== undefined) projected.name = payload.name;
+  projected.settings = redactCredentialProperties(asObject(payload.settings) ?? {});
+  projected.plugins = asObject(payload.plugins) ?? {};
+  return projected;
+}
+
+// The media type of a response is server-controlled text: it is quoted only when it has
+// the shape of a media type, otherwise it is described as unknown.
+const MEDIA_TYPE_PATTERN = /^[a-z0-9][a-z0-9!#$&^_.+-]{0,31}\/[a-z0-9][a-z0-9!#$&^_.+-]{0,39}$/;
+
+function mediaTypeOf(response: Response): string {
+  const value = response.headers.get("content-type")?.split(";")[0].trim().toLowerCase() ?? "";
+  return MEDIA_TYPE_PATTERN.test(value) ? value : "unknown";
+}
+
+// JSON.parse's own message quotes a window of the source, so it is never kept: a body
+// that is not JSON parses to undefined and is described by media type and size only.
+function parseJsonBody(rawText: string): { parsed: unknown } | undefined {
+  try {
+    return { parsed: JSON.parse(rawText) };
+  } catch {
+    return undefined;
+  }
+}
+
+function jsonValueKind(value: unknown): string {
+  if (value === null) return "null";
+  if (Array.isArray(value)) return "array";
+  return typeof value;
+}
+
+function statusLine(response: Response): string {
+  return `HTTP ${response.status}${response.statusText ? ` ${response.statusText}` : ""}`;
+}
+
+// Non-JSON bodies (HTML error pages, SSO interstitials, WAF blocks) are described by
+// status and length only; JSON bodies contribute Tenable's documented error fields
+// (error, error.message, message, error_msg), each scrubbed before it is shortened, with
+// the caller's scrub when it knows the configured secrets, so the cut never leaves a
+// fragment of a secret behind.
+export function describeErrorBody(response: Response, rawText: string, scrub: (text: string) => string = redactErrorText): string {
+  const base = statusLine(response);
+  if (rawText.length === 0) return base;
+  const body = parseJsonBody(rawText);
+  if (body === undefined) return `${base}; non-JSON ${mediaTypeOf(response)} response body (${rawText.length} bytes, not echoed)`;
+  const record = asObject(body.parsed);
+  const fields = record
+    ? [asString(record.error), asString(asObject(record.error)?.message), asString(record.message), asString(record.error_msg)]
+      .filter((item): item is string => Boolean(item))
+    : [];
+  if (fields.length === 0) return `${base}; JSON response body without documented error fields (${rawText.length} bytes, not echoed)`;
+  return `${base}; ${fields.map((field) => scrub(field.replace(/\s+/g, " ")).slice(0, 200)).join("; ")}`;
+}
+
+// What a 2xx answer was expected to carry: the documented JSON document of any kind, a
+// JSON object, a JSON array, one documented member of a JSON object (an array, an
+// object, a Security Center list, or the member's mere presence), or any one of the
+// members that identify a documented object.
+type DocumentExpectation =
+  | { kind: "document" }
+  | { kind: "object" }
+  | { kind: "array" }
+  | { kind: "member"; key: string; type: "array" | "object" | "list" | "member" }
+  | { kind: "members"; keys: string[] };
+
+/**
+ * A 2xx answer whose body is not the documented JSON document (an empty body, the HTML
+ * page a proxy or captive portal serves in place of the API, a foreign JSON value, a
+ * JSON object without the documented member) is described like an error body, by
+ * status, media type, and size only, and is recorded as an unreadable surface: its
+ * missing members are never read as an empty inventory or a disabled setting.
+ */
+export function describeNonDocumentBody(response: Response, rawText: string, expected: DocumentExpectation = { kind: "document" }): string {
+  const base = statusLine(response);
+  const size = `${rawText.length} bytes, not echoed`;
+  let what: string;
+  switch (expected.kind) {
+    case "member":
+      return `${base} with a JSON response body without the documented "${expected.key}" ${expected.type} (${size})`;
+    case "members":
+      return `${base} with a JSON response body without any of the documented members ${expected.keys.map((key) => `"${key}"`).join(", ")} (${size})`;
+    case "document":
+      what = "the documented JSON document";
+      break;
+    case "object":
+      what = "the documented JSON object";
+      break;
+    case "array":
+      what = "the documented JSON array";
+      break;
+    default: {
+      const exhaustive: never = expected;
+      throw new Error(`Unhandled document expectation: ${String(exhaustive)}`);
+    }
+  }
+  if (rawText.length === 0) return `${base} with an empty response body where ${what} was expected`;
+  const body = parseJsonBody(rawText);
+  if (body === undefined) return `${base} with a non-JSON ${mediaTypeOf(response)} response body (${size}) where ${what} was expected`;
+  return `${base} with a JSON ${jsonValueKind(body.parsed)} response body (${size}) where ${what} was expected`;
 }
 
 function parseTimestampMs(value: unknown): number | undefined {
@@ -423,10 +1034,17 @@ async function nextAvailableAuditDir(root: string, preferredName: string): Promi
   throw new Error(`Unable to allocate output directory under ${root}`);
 }
 
-async function writeSecureTextFile(rootDir: string, relativePathname: string, content: string): Promise<void> {
+/** Writes one bundle file with the configured secrets removed from its text in every encoded form (guard 2). */
+async function writeSecureTextFile(rootDir: string, relativePathname: string, content: string, secrets: ReadonlyArray<string | undefined> = []): Promise<void> {
   const destination = resolveSecureOutputPath(rootDir, relativePathname);
   ensurePrivateDir(dirname(destination));
-  await writeFile(destination, content, { encoding: "utf8", mode: 0o600 });
+  await writeFile(destination, redactConfiguredSecrets(content, secrets), { encoding: "utf8", mode: 0o600 });
+}
+
+/** Writes one JSON bundle file; the configured secrets are removed value by value before serialization so the file stays valid JSON. */
+async function writeSecureJsonFile(rootDir: string, relativePathname: string, value: unknown, secrets: ReadonlyArray<string | undefined>): Promise<void> {
+  const plain: unknown = JSON.parse(JSON.stringify(value ?? null));
+  await writeSecureTextFile(rootDir, relativePathname, serializeJson(sealValue(plain, secrets)));
 }
 
 async function createZipArchive(sourceDir: string, zipPath: string): Promise<void> {
@@ -453,12 +1071,52 @@ async function countFilesRecursively(rootDir: string): Promise<number> {
   return total;
 }
 
-function readConfigFile(pathname: string | undefined): { values: JsonRecord; source?: string } {
-  if (!pathname) return { values: {} };
+const ERRNO_CODE_PATTERN = /^E[A-Z0-9_]{1,30}$/;
+
+/**
+ * Two-step config loader guard with fixed text per step. Neither the filesystem
+ * message (which echoes the path and the operation) nor the parser message is
+ * ever interpolated: the yaml parser quotes the offending source line, and an
+ * unresolved alias (`token: *VALUE`) throws a plain ReferenceError whose message
+ * starts with the value itself. The read step carries the path and a validated
+ * errno code; the parse step catches every thrown value and carries the path plus
+ * a line number taken only from a YAMLError's structured linePos.
+ */
+function readConfigText(resolvedPath: string): string {
+  try {
+    return readFileSync(resolvedPath, "utf8");
+  } catch (error) {
+    const code = asString(asObject(error)?.code);
+    const suffix = code !== undefined && ERRNO_CODE_PATTERN.test(code) ? ` (${code})` : "";
+    throw new Error(`Unable to read Tenable config file ${resolvedPath}${suffix}`);
+  }
+}
+
+function parseConfigYaml(resolvedPath: string, raw: string): unknown {
+  try {
+    return parseYaml(raw) as unknown;
+  } catch (error) {
+    const linePos = error instanceof YAMLError && Array.isArray(error.linePos) ? asObject(error.linePos[0]) : undefined;
+    const line = asNumber(linePos?.line);
+    throw new Error(`Unable to parse Tenable config file: invalid YAML in ${resolvedPath}${line === undefined ? "" : ` at line ${line}`} (INVALID_YAML)`);
+  }
+}
+
+/**
+ * An explicitly named file (config_file argument or TENABLE_CONFIG_FILE) must be
+ * readable, so a missing one surfaces as ENOENT; the default ~/.tenable/config.yaml
+ * is optional and is skipped silently when absent.
+ */
+function readConfigFile(pathname: string, explicit: boolean): { values: JsonRecord; source?: string } {
   const resolvedPath = pathname.startsWith("~") ? join(homedir(), pathname.slice(1)) : resolve(pathname);
-  if (!existsSync(resolvedPath)) return { values: {} };
-  const parsed = asObject(parseYaml(readFileSync(resolvedPath, "utf8"))) ?? {};
-  return { values: parsed, source: `config:${resolvedPath}` };
+  if (!explicit && !existsSync(resolvedPath)) return { values: {} };
+  const parsed = parseConfigYaml(resolvedPath, readConfigText(resolvedPath));
+  if (parsed === null || parsed === undefined) return { values: {}, source: `config:${resolvedPath}` };
+  const values = asObject(parsed);
+  if (!values) {
+    throw new Error(`Unable to parse Tenable config file: ${resolvedPath} must contain a YAML mapping of settings (INVALID_CONFIG_SHAPE)`);
+  }
+  return { values, source: `config:${resolvedPath}` };
 }
 
 function pick(input: JsonRecord, env: NodeJS.ProcessEnv, file: JsonRecord, argKeys: string[], envKeys: string[], fileKeys: string[]): { value?: string; source?: string } {
@@ -482,8 +1140,8 @@ export function resolveTenableConfiguration(
   env: NodeJS.ProcessEnv = process.env,
 ): TenableResolvedConfig {
   const sourceChain: string[] = [];
-  const configPath = asString(input.config_file) ?? asString(env.TENABLE_CONFIG_FILE) ?? join(homedir(), ".tenable", "config.yaml");
-  const file = readConfigFile(configPath);
+  const explicitConfigPath = asString(input.config_file) ?? asString(env.TENABLE_CONFIG_FILE);
+  const file = readConfigFile(explicitConfigPath ?? join(homedir(), ".tenable", "config.yaml"), explicitConfigPath !== undefined);
   if (file.source) sourceChain.push(file.source);
 
   const url = pick(input, env, file.values, ["url", "base_url"], ["TENABLE_URL", "TENABLE_BASE_URL"], ["url", "base_url"]);
@@ -534,14 +1192,25 @@ export function resolveTenableConfiguration(
   };
 }
 
+/**
+ * status is the observed HTTP status (0 when no response arrived) and endpoint
+ * is the "METHOD /path" of the request that actually failed, so every consumer
+ * can name the real request rather than the nominal one it set out to make.
+ */
 export class TenableApiError extends Error {
   readonly status: number;
+  readonly endpoint: string;
 
-  constructor(message: string, status: number) {
-    super(message);
+  constructor(message: string, status: number, endpoint: string) {
+    super(redactErrorText(message));
     this.name = "TenableApiError";
     this.status = status;
+    this.endpoint = endpoint;
   }
+}
+
+function endpointLabel(method: string | undefined, path: string): string {
+  return `${(method ?? "GET").toUpperCase()} ${path.startsWith("/") ? path : `/${path}`}`;
 }
 
 function retryDelayMs(response: Response, attempt: number): number {
@@ -584,6 +1253,22 @@ abstract class TenableHttpClient {
 
   protected abstract authHeaders(): Record<string, string>;
 
+  /** The configured keys this client puts on the wire, for the tool boundary and bundle writer to remove from whole payloads (guard 2). */
+  get knownSecrets(): string[] {
+    return this.secrets.filter((secret) => secret.length >= MIN_CONFIGURED_SECRET_LENGTH);
+  }
+
+  /** The client-side scrub: the configured keys in every form, then the general scrub. */
+  protected scrub(text: string): string {
+    return redactSecrets(text, this.secrets);
+  }
+
+  // Every error this client throws is built here so the configured keys and the
+  // credential text patterns are scrubbed before the message exists.
+  protected fail(message: string, status: number, endpoint: string): TenableApiError {
+    return new TenableApiError(this.scrub(message), status, endpoint);
+  }
+
   protected buildUrl(path: string, query: Record<string, string | number | boolean | undefined | Array<string | number>> = {}): string {
     const url = new URL(`${this.baseUrl}${path.startsWith("/") ? path : `/${path}`}`);
     for (const [key, value] of Object.entries(query)) {
@@ -598,7 +1283,19 @@ abstract class TenableHttpClient {
   }
 
   protected async requestJson(path: string, init: RequestInit = {}, query: Record<string, string | number | boolean | undefined | Array<string | number>> = {}): Promise<unknown> {
+    return (await this.requestDocument(path, init, query)).value;
+  }
+
+  /**
+   * One request, with the shape guard every 2xx answer passes: a body that is empty
+   * or not JSON is not the documented document and is thrown as an unreadable surface
+   * carrying the status the request observed, never returned as an empty object. The
+   * JSON value is returned with the response so a caller can describe a missing
+   * documented member the same way.
+   */
+  protected async requestDocument(path: string, init: RequestInit = {}, query: Record<string, string | number | boolean | undefined | Array<string | number>> = {}): Promise<TenableDocument> {
     const url = this.buildUrl(path, query);
+    const endpoint = endpointLabel(init.method, path);
     for (let attempt = 0; ; attempt += 1) {
       const controller = new AbortController();
       const timer = setTimeout(() => controller.abort(), this.timeoutMs);
@@ -611,12 +1308,14 @@ abstract class TenableHttpClient {
         });
       } catch (error) {
         clearTimeout(timer);
-        const message = redactSecrets(error instanceof Error ? error.message : String(error), this.secrets);
-        if (attempt < this.retryLimit && !/abort/i.test(message)) {
+        const message = this.scrub(error instanceof Error ? error.message : String(error));
+        const aborted = (error instanceof Error && error.name === "AbortError") || /abort/i.test(message);
+        if (aborted) throw this.fail(`Tenable request ${endpoint} timed out after ${this.timeoutMs}ms.`, 0, endpoint);
+        if (attempt < this.retryLimit) {
           await this.sleepImpl(Math.min(500 * 2 ** attempt, 15_000));
           continue;
         }
-        throw new TenableApiError(`Tenable request to ${path} failed: ${message}`, 0);
+        throw this.fail(`Tenable request ${endpoint} failed without an HTTP response: ${message}`, 0, endpoint);
       }
       clearTimeout(timer);
 
@@ -627,26 +1326,87 @@ abstract class TenableHttpClient {
 
       const rawText = await response.text();
       if (!response.ok) {
-        const detail = redactSecrets(rawText.replace(/\s+/g, " ").slice(0, 200), this.secrets);
-        throw new TenableApiError(`Tenable request to ${path} failed (${response.status} ${response.statusText})${detail ? `: ${detail}` : ""}`, response.status);
+        throw this.fail(`Tenable request ${endpoint} failed (${describeErrorBody(response, rawText, (text) => this.scrub(text))})`, response.status, endpoint);
       }
-      if (rawText.length === 0) return {};
-      try {
-        return JSON.parse(rawText) as unknown;
-      } catch {
-        throw new TenableApiError(`Tenable request to ${path} returned a non-JSON body.`, response.status);
-      }
+      const body = rawText.length === 0 ? undefined : parseJsonBody(rawText);
+      if (body === undefined) throw this.nonDocument({ value: undefined, response, rawText, endpoint }, { kind: "document" });
+      return { value: body.parsed, response, rawText, endpoint };
     }
+  }
+
+  protected nonDocument(document: TenableDocument, expected: DocumentExpectation): TenableApiError {
+    return this.fail(`Tenable request ${document.endpoint} returned ${describeNonDocumentBody(document.response, document.rawText, expected)}`, document.response.status, document.endpoint);
+  }
+
+  // The documented answer is a JSON object; any other JSON value is a foreign document.
+  protected async requestObject(path: string, init: RequestInit = {}, query: Record<string, string | number | boolean | undefined | Array<string | number>> = {}): Promise<TenableObjectDocument> {
+    const document = await this.requestDocument(path, init, query);
+    const payload = asObject(document.value);
+    if (payload === undefined) throw this.nonDocument(document, { kind: "object" });
+    return { ...document, payload };
+  }
+
+  // The documented collection member must be present on every page: an array of records,
+  // or null, which Tenable serves for an empty collection on some list endpoints. A 2xx
+  // object without the member is a foreign document, not an empty inventory.
+  protected documentedRecords(document: TenableObjectDocument, key: string): JsonRecord[] {
+    const value = document.payload[key];
+    if (!(key in document.payload) || (value !== null && !Array.isArray(value))) throw this.nonDocument(document, { kind: "member", key, type: "array" });
+    return asRecords(value);
+  }
+
+  // The documented answer is a JSON array of records (a role list, an export chunk).
+  protected documentedList(document: TenableDocument): JsonRecord[] {
+    if (!Array.isArray(document.value)) throw this.nonDocument(document, { kind: "array" });
+    return asRecords(document.value);
+  }
+
+  // A documented object is recognised by any one of the members that identify it; an
+  // object carrying none of them (a health page, a portal's JSON) is a foreign document.
+  protected documentedObject(document: TenableObjectDocument, keys: string[]): JsonRecord {
+    if (!keys.some((key) => key in document.payload)) throw this.nonDocument(document, { kind: "members", keys });
+    return document.payload;
   }
 }
 
+// One 2xx answer that passed the shape guard, kept with what the request observed so a
+// missing documented member can be described by status, media type, and size.
+interface TenableDocument {
+  value: unknown;
+  response: Response;
+  rawText: string;
+  endpoint: string;
+}
+
+interface TenableObjectDocument extends TenableDocument {
+  payload: JsonRecord;
+}
+
+/**
+ * Outcome of one export workflow. Counters are null when the workflow never
+ * observed them (the export was not started, or polling ended before a chunk
+ * list was reported). fetchedChunks and downloadFailures count this client's
+ * own chunk downloads; failedChunks is Tenable's chunks_failed. endpoint names
+ * the request that reported the final state or the one that failed.
+ */
 export interface TenableExportResult {
-  exportUuid: string;
-  status: string;
+  exportUuid: string | null;
+  status: string | null;
   records: JsonRecord[];
-  totalChunks: number;
-  fetchedChunks: number;
-  failedChunks: number;
+  totalChunks: number | null;
+  availableChunks: number | null;
+  fetchedChunks: number | null;
+  failedChunks: number | null;
+  downloadFailures: number | null;
+  truncated: boolean | null;
+  reason?: string;
+  endpoint: string | null;
+  httpStatus: number | null;
+}
+
+export interface TenablePage {
+  items: JsonRecord[];
+  total: number | null;
   truncated: boolean;
   reason?: string;
 }
@@ -676,19 +1436,29 @@ export class TenableApiClient extends TenableHttpClient {
   }
 
   async get(path: string, query: Record<string, string | number | boolean | undefined | Array<string | number>> = {}): Promise<JsonRecord> {
-    return asObject(await this.requestJson(path, {}, query)) ?? {};
+    return (await this.requestObject(path, {}, query)).payload;
   }
 
   async getRaw(path: string, query: Record<string, string | number | boolean | undefined | Array<string | number>> = {}): Promise<unknown> {
     return this.requestJson(path, {}, query);
   }
 
+  // A read whose documented answer is a JSON array of records.
+  private async getList(path: string, query: Record<string, string | number | boolean | undefined | Array<string | number>> = {}): Promise<JsonRecord[]> {
+    return this.documentedList(await this.requestDocument(path, {}, query));
+  }
+
+  // A read whose documented answer is a JSON object carrying the named array member.
+  private async getRecords(path: string, key: string, query: Record<string, string | number | boolean | undefined | Array<string | number>> = {}): Promise<JsonRecord[]> {
+    return this.documentedRecords(await this.requestObject(path, {}, query), key);
+  }
+
   async post(path: string, body: JsonRecord): Promise<JsonRecord> {
-    return asObject(await this.requestJson(path, {
+    return (await this.requestObject(path, {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify(body),
-    })) ?? {};
+    })).payload;
   }
 
   async listPaginated(
@@ -696,159 +1466,231 @@ export class TenableApiClient extends TenableHttpClient {
     collectionKey: string,
     query: Record<string, string | number | boolean | undefined | Array<string | number>> = {},
     options: { pageLimit?: number; maxPages?: number } = {},
-  ): Promise<{ items: JsonRecord[]; total?: number; truncated: boolean }> {
+  ): Promise<TenablePage> {
     const pageLimit = options.pageLimit ?? DEFAULT_PAGE_LIMIT;
     const maxPages = options.maxPages ?? DEFAULT_MAX_PAGES;
     const items: JsonRecord[] = [];
     let offset = 0;
-    let total: number | undefined;
+    let total: number | null = null;
     // Set only when the endpoint signalled the end of the collection (an empty or
     // short page, or the reported total reached). Leaving the loop at maxPages
     // without it means the inventory is partial even when no total was reported.
     let complete = false;
+    let reason: string | undefined;
+    let previousPageKey: string | undefined;
     for (let page = 0; page < maxPages; page += 1) {
-      const payload = await this.get(path, { ...query, limit: pageLimit, offset });
-      const pageItems = asRecords(payload[collectionKey]);
+      const document = await this.requestObject(path, {}, { ...query, limit: pageLimit, offset });
+      const payload = document.payload;
+      const pageItems = this.documentedRecords(document, collectionKey);
+      const first = pageItems[0];
+      const pageKey = first ? asString(first.uuid) ?? asString(first.id) ?? JSON.stringify(first) : undefined;
+      // A page that opens with the same record as the previous one means the endpoint
+      // ignored the offset; the walk cannot advance, so it stops as partial.
+      if (pageKey !== undefined && pageKey === previousPageKey) {
+        reason = `GET ${path} replayed the same page at offset ${offset}, so the walk could not advance`;
+        break;
+      }
+      previousPageKey = pageKey;
       items.push(...pageItems);
       total = asNumber(asObject(payload.pagination)?.total) ?? total;
       offset += pageItems.length;
-      if (pageItems.length === 0 || (total !== undefined && items.length >= total) || (total === undefined && pageItems.length < pageLimit)) {
+      if (pageItems.length === 0 || (total !== null && items.length >= total) || (total === null && pageItems.length < pageLimit)) {
         complete = true;
         break;
       }
     }
-    return { items, total, truncated: !complete || (total !== undefined && items.length < total) };
+    if (!complete && reason === undefined) reason = `the walk stopped at the ${maxPages}-page cap`;
+    const truncated = !complete || (total !== null && items.length < total);
+    return truncated ? { items, total, truncated, reason: reason ?? `only ${items.length} of the reported ${total} records were returned` } : { items, total, truncated };
   }
 
   async getServerProperties(): Promise<JsonRecord> {
-    return this.get("/server/properties");
+    return this.documentedObject(await this.requestObject("/server/properties"), ["plugin_set", "loaded_plugin_set", "server_version", "nessus_type", "nessus_ui_version", "license"]);
   }
 
   async listScans(): Promise<JsonRecord[]> {
-    return asRecords((await this.get("/scans")).scans);
+    return this.getRecords("/scans", "scans");
   }
 
   async getScanDetails(scanId: string | number): Promise<JsonRecord> {
-    return this.get(`/scans/${encodeURIComponent(String(scanId))}`);
+    return this.documentedObject(await this.requestObject(`/scans/${encodeURIComponent(String(scanId))}`), ["info", "hosts", "history"]);
   }
 
   async listPolicies(): Promise<JsonRecord[]> {
-    return asRecords((await this.get("/policies")).policies);
+    return this.getRecords("/policies", "policies");
   }
 
   async getPolicyDetails(policyId: string | number): Promise<JsonRecord> {
-    return this.get(`/policies/${encodeURIComponent(String(policyId))}`);
+    return this.documentedObject(await this.requestObject(`/policies/${encodeURIComponent(String(policyId))}`), ["uuid", "settings", "plugins", "credentials"]);
   }
 
   async listScanTemplates(): Promise<JsonRecord[]> {
-    return asRecords((await this.get("/editor/scan/templates")).templates);
+    return this.getRecords("/editor/scan/templates", "templates");
   }
 
   async listScanners(): Promise<JsonRecord[]> {
-    return asRecords((await this.get("/scanners")).scanners);
+    return (await this.getRecords("/scanners", "scanners")).map(stripScannerCredentials);
   }
 
-  async listAgents(): Promise<{ items: JsonRecord[]; total?: number; truncated: boolean }> {
+  async listAgents(): Promise<TenablePage> {
     return this.listPaginated("/scanners/null/agents", "agents");
   }
 
   async listAgentGroups(): Promise<JsonRecord[]> {
-    return asRecords((await this.get("/scanners/null/agent-groups")).groups);
+    return this.getRecords("/scanners/null/agent-groups", "groups");
   }
 
-  async listNetworks(): Promise<{ items: JsonRecord[]; total?: number; truncated: boolean }> {
+  async listNetworks(): Promise<TenablePage> {
     return this.listPaginated("/networks", "networks", {}, { pageLimit: 50 });
   }
 
-  async listExclusions(): Promise<{ items: JsonRecord[]; total?: number; truncated: boolean }> {
+  async listExclusions(): Promise<TenablePage> {
     return this.listPaginated("/exclusions", "exclusions", {}, { pageLimit: 200 });
   }
 
-  async listCredentials(): Promise<{ items: JsonRecord[]; total?: number; truncated: boolean }> {
+  async listCredentials(): Promise<TenablePage> {
     return this.listPaginated("/credentials", "credentials", {}, { pageLimit: 200 });
   }
 
   async listUsers(): Promise<JsonRecord[]> {
-    return asRecords((await this.get("/users", { withRoles: true })).users);
+    return this.getRecords("/users", "users", { withRoles: true });
   }
 
   async listGroups(): Promise<JsonRecord[]> {
-    return asRecords((await this.get("/groups")).groups);
+    return this.getRecords("/groups", "groups");
   }
 
   async listRoles(): Promise<JsonRecord[]> {
-    return asRecords(await this.getRaw("/access-control/v1/roles"));
+    return this.getList("/access-control/v1/roles");
   }
 
   async listPermissions(): Promise<JsonRecord[]> {
-    return asRecords((await this.get("/api/v3/access-control/permissions")).permissions);
+    return this.getRecords("/api/v3/access-control/permissions", "permissions");
   }
 
-  async listAccessGroups(): Promise<{ items: JsonRecord[]; total?: number; truncated: boolean }> {
+  async listAccessGroups(): Promise<TenablePage> {
     return this.listPaginated("/v2/access-groups", "access_groups", {}, { pageLimit: 200 });
   }
 
-  async listAuditLogEvents(sinceIso: string): Promise<{ items: JsonRecord[]; total?: number; truncated: boolean }> {
+  async listAuditLogEvents(sinceIso: string): Promise<TenablePage> {
     return this.listPaginated("/audit-log/v1/events", "events", { f: [`date.gte:${sinceIso}`] }, { pageLimit: 5000, maxPages: 20 });
   }
 
-  async listTagCategories(): Promise<{ items: JsonRecord[]; total?: number; truncated: boolean }> {
+  async listTagCategories(): Promise<TenablePage> {
     return this.listPaginated("/tags/categories", "categories", {}, { pageLimit: 5000 });
   }
 
-  async listTagValues(): Promise<{ items: JsonRecord[]; total?: number; truncated: boolean }> {
+  async listTagValues(): Promise<TenablePage> {
     return this.listPaginated("/tags/values", "values", {}, { pageLimit: 5000 });
   }
 
   async listTargetGroups(): Promise<JsonRecord[]> {
-    return asRecords((await this.get("/target-groups")).target_groups);
+    return this.getRecords("/target-groups", "target_groups");
   }
 
   async listVulnExportJobs(): Promise<JsonRecord[]> {
-    return asRecords((await this.get("/vulns/export/status")).exports);
+    return this.getRecords("/vulns/export/status", "exports");
   }
 
   async listAssetExportJobs(): Promise<JsonRecord[]> {
-    return asRecords((await this.get("/assets/export/status")).exports);
+    return this.getRecords("/assets/export/status", "exports");
   }
 
+  /**
+   * Request, poll, and download an export. Once the export id is known the
+   * workflow stops throwing: a status poll that fails, a poll deadline, or a
+   * chunk that cannot be downloaded is reported in the result with the request
+   * that failed and its observed status, so the caller keeps the export id and
+   * every record that did arrive.
+   */
   private async runExport(kind: "assets" | "vulns", body: JsonRecord, maxChunks: number): Promise<TenableExportResult> {
-    const started = await this.post(`/${kind}/export`, body);
-    const exportUuid = asString(started.export_uuid);
-    if (!exportUuid) throw new TenableApiError(`Tenable ${kind} export did not return export_uuid.`, 0);
+    const started = await this.requestObject(`/${kind}/export`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    const exportUuid = asString(started.payload.export_uuid);
+    if (!exportUuid) throw this.nonDocument(started, { kind: "member", key: "export_uuid", type: "member" });
 
+    const statusPath = `/${kind}/export/${encodeURIComponent(exportUuid)}/status`;
+    const statusEndpoint = `GET ${statusPath}`;
+    const notRun = (status: string, reason: string, endpoint: string, httpStatus: number | null): TenableExportResult => ({
+      exportUuid,
+      status,
+      records: [],
+      totalChunks: null,
+      availableChunks: null,
+      fetchedChunks: null,
+      failedChunks: null,
+      downloadFailures: null,
+      truncated: null,
+      reason,
+      endpoint,
+      httpStatus,
+    });
     const deadline = Date.now() + this.exportTimeoutMs;
     let status: JsonRecord = {};
     for (;;) {
-      status = await this.get(`/${kind}/export/${encodeURIComponent(exportUuid)}/status`);
+      try {
+        // The documented status document always carries the status string; a 2xx object
+        // without it is a foreign document and is reported as an unreadable poll rather
+        // than polled until the deadline.
+        const document = await this.requestObject(statusPath);
+        if (typeof document.payload.status !== "string") throw this.nonDocument(document, { kind: "member", key: "status", type: "member" });
+        status = document.payload;
+      } catch (error) {
+        return notRun("STATUS_UNREADABLE", errorMessage(error), errorEndpoint(error) ?? statusEndpoint, errorStatus(error) ?? null);
+      }
       const state = asString(status.status)?.toUpperCase();
       if (state === "FINISHED" || state === "ERROR" || state === "CANCELLED") break;
       if (Date.now() >= deadline) {
-        return { exportUuid, status: `TIMEOUT(${state ?? "unknown"})`, records: [], totalChunks: 0, fetchedChunks: 0, failedChunks: 0, truncated: true, reason: `Export did not finish within ${Math.round(this.exportTimeoutMs / 1000)}s.` };
+        return notRun(`TIMEOUT(${redactErrorText(state ?? "unknown")})`, `Export ${exportUuid} did not finish within ${Math.round(this.exportTimeoutMs / 1000)}s; the last ${statusEndpoint} poll reported ${state ?? "no status"}.`, statusEndpoint, null);
       }
       await this.sleepImpl(this.exportPollMs);
     }
 
-    const state = asString(status.status)?.toUpperCase() ?? "UNKNOWN";
+    const state = redactErrorText(asString(status.status)?.toUpperCase() ?? "UNKNOWN");
+    const reason = asString(status.reason);
     const available = asArray(status.chunks_available).map(asNumber).filter((item): item is number => item !== undefined);
     const failed = asArray(status.chunks_failed).length;
     const totalChunks = asNumber(status.total_chunks) ?? available.length;
     const records: JsonRecord[] = [];
+    const downloadErrors: string[] = [];
     let fetchedChunks = 0;
+    let failedEndpoint: string | undefined;
+    let failedStatus: number | undefined;
     for (const chunkId of available.slice(0, maxChunks)) {
-      const chunk = await this.getRaw(`/${kind}/export/${encodeURIComponent(exportUuid)}/chunks/${chunkId}`);
-      records.push(...asRecords(chunk));
-      fetchedChunks += 1;
+      const chunkPath = `/${kind}/export/${encodeURIComponent(exportUuid)}/chunks/${chunkId}`;
+      try {
+        // A chunk is the documented JSON array of records; a 2xx answer of any other
+        // shape is a failed download, never an empty chunk.
+        records.push(...await this.getList(chunkPath));
+        fetchedChunks += 1;
+      } catch (error) {
+        downloadErrors.push(errorMessage(error));
+        failedEndpoint = failedEndpoint ?? errorEndpoint(error) ?? `GET ${chunkPath}`;
+        failedStatus = failedStatus ?? errorStatus(error);
+      }
     }
+    const reasons = [
+      reason ? redactErrorText(reason) : undefined,
+      available.length > maxChunks ? `only the first ${maxChunks} of ${available.length} available chunks were requested (max_chunks)` : undefined,
+      failed > 0 ? `Tenable reported ${failed} failed chunks` : undefined,
+      downloadErrors.length > 0 ? `${downloadErrors.length} chunk downloads failed: ${downloadErrors.slice(0, 3).join("; ")}` : undefined,
+    ].filter((item): item is string => Boolean(item));
     return {
       exportUuid,
       status: state,
       records,
       totalChunks,
+      availableChunks: available.length,
       fetchedChunks,
       failedChunks: failed,
-      truncated: state !== "FINISHED" || fetchedChunks < available.length || failed > 0 || (totalChunks > available.length),
-      reason: asString(status.reason),
+      downloadFailures: downloadErrors.length,
+      truncated: state !== "FINISHED" || fetchedChunks < available.length || failed > 0 || totalChunks > available.length,
+      reason: reasons.length > 0 ? reasons.join("; ") : undefined,
+      endpoint: failedEndpoint ?? statusEndpoint,
+      httpStatus: failedStatus ?? null,
     };
   }
 
@@ -881,23 +1723,38 @@ export class TenableSecurityCenterClient extends TenableHttpClient {
     return { "x-apikey": `accesskey=${this.config.accessKey}; secretkey=${this.config.secretKey};` };
   }
 
-  private async rest(resource: string, query: Record<string, string | number | undefined> = {}): Promise<unknown> {
-    const payload = asObject(await this.requestJson(`/rest/${resource}`, {}, query)) ?? {};
+  // Security Center wraps every answer in { type, response, error_code, error_msg, ... }:
+  // a non-zero error_code is Security Center's own refusal, and a 2xx object without the
+  // response member is a foreign document, not an empty answer.
+  private async rest(resource: string, query: Record<string, string | number | undefined> = {}): Promise<{ response: unknown; document: TenableObjectDocument }> {
+    const document = await this.requestObject(`/rest/${resource}`, {}, query);
+    const payload = document.payload;
     const errorCode = asNumber(payload.error_code);
     if (errorCode !== undefined && errorCode !== 0) {
-      throw new TenableApiError(`Tenable Security Center /rest/${resource} returned error_code ${errorCode}: ${asString(payload.error_msg) ?? "unknown"}`, 0);
+      throw this.fail(`Tenable Security Center GET /rest/${resource} returned error_code ${errorCode}: ${asString(payload.error_msg) ?? "unknown"}`, 0, `GET /rest/${resource}`);
     }
-    return payload.response;
+    if (!("response" in payload)) throw this.nonDocument(document, { kind: "member", key: "response", type: "member" });
+    return { response: payload.response, document };
   }
 
-  private static usableList(response: unknown): JsonRecord[] {
+  private async restObject(resource: string, query: Record<string, string | number | undefined> = {}): Promise<JsonRecord> {
+    const { response, document } = await this.rest(resource, query);
+    const object = asObject(response);
+    if (object === undefined) throw this.nonDocument(document, { kind: "member", key: "response", type: "object" });
+    return object;
+  }
+
+  // A Security Center list arrives either as a bare array or as { usable, manageable }
+  // arrays deduplicated by id; a response of any other shape is a foreign document.
+  private async restList(resource: string, query: Record<string, string | number | undefined> = {}): Promise<JsonRecord[]> {
+    const { response, document } = await this.rest(resource, query);
     if (Array.isArray(response)) return asRecords(response);
     const object = asObject(response);
-    if (!object) return [];
-    const usable = asRecords(object.usable);
-    const manageable = asRecords(object.manageable);
+    if (!object || (!Array.isArray(object.usable) && !Array.isArray(object.manageable))) {
+      throw this.nonDocument(document, { kind: "member", key: "response", type: "list" });
+    }
     const seen = new Set<string>();
-    return [...usable, ...manageable].filter((item) => {
+    return [...asRecords(object.usable), ...asRecords(object.manageable)].filter((item) => {
       const id = asString(item.id) ?? JSON.stringify(item);
       if (seen.has(id)) return false;
       seen.add(id);
@@ -906,27 +1763,27 @@ export class TenableSecurityCenterClient extends TenableHttpClient {
   }
 
   async getCurrentUser(): Promise<JsonRecord> {
-    return asObject(await this.rest("currentUser", { fields: "id,username,role,lastLogin" })) ?? {};
+    return this.restObject("currentUser", { fields: "id,username,role,lastLogin" });
   }
 
   async listScans(): Promise<JsonRecord[]> {
-    return TenableSecurityCenterClient.usableList(await this.rest("scan", { fields: "id,name,status,schedule,policy,repository,credentials,modifiedTime" }));
+    return this.restList("scan", { fields: "id,name,status,schedule,policy,repository,credentials,modifiedTime" });
   }
 
   async listScanResults(startTimeUnix: number): Promise<JsonRecord[]> {
-    return TenableSecurityCenterClient.usableList(await this.rest("scanResult", { fields: "id,name,status,startTime,finishTime,scannedIPs,totalIPs", startTime: startTimeUnix }));
+    return this.restList("scanResult", { fields: "id,name,status,startTime,finishTime,scannedIPs,totalIPs", startTime: startTimeUnix });
   }
 
   async listScanners(): Promise<JsonRecord[]> {
-    return TenableSecurityCenterClient.usableList(await this.rest("scanner", { fields: "id,name,status,statusMessage,enabled,version,pluginSet,loadedPluginSet,lastCheckinTime,agentCapable" }));
+    return this.restList("scanner", { fields: "id,name,status,statusMessage,enabled,version,pluginSet,loadedPluginSet,lastCheckinTime,agentCapable" });
   }
 
   async listUsers(): Promise<JsonRecord[]> {
-    return TenableSecurityCenterClient.usableList(await this.rest("user", { fields: "id,username,status,role,lastLogin,locked,failedLogins,authType" }));
+    return this.restList("user", { fields: "id,username,status,role,lastLogin,locked,failedLogins,authType" });
   }
 
   async getFeed(): Promise<JsonRecord> {
-    return asObject(await this.rest("feed")) ?? {};
+    return this.restObject("feed");
   }
 }
 
@@ -944,81 +1801,192 @@ export function createTenableClients(config: TenableResolvedConfig, options: Htt
   };
 }
 
+// The single sink for error text: every dataset error, access surface error, policy
+// detail error, and tool error passes through here, so messages built outside the
+// Tenable clients (parser errors, transport errors) are scrubbed as well.
 function errorMessage(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
+  return redactErrorText(error instanceof Error ? error.message : String(error));
 }
 
 function errorStatus(error: unknown): number | undefined {
-  return error instanceof TenableApiError ? error.status : undefined;
+  return error instanceof TenableApiError && error.status > 0 ? error.status : undefined;
 }
 
-function isForbiddenError(error: unknown): boolean {
-  const status = errorStatus(error);
+function errorEndpoint(error: unknown): string | undefined {
+  return error instanceof TenableApiError ? error.endpoint : undefined;
+}
+
+function isForbiddenStatus(status: number | undefined | null): boolean {
   return status === 401 || status === 403;
 }
 
-function okDataset<T>(data: T, seen: number, total?: number, truncated = false): TenableDataset<T> {
-  return { data, status: "ok", seen, total, truncated };
+function isForbiddenError(error: unknown): boolean {
+  return isForbiddenStatus(errorStatus(error));
 }
 
-function failedDataset<T>(data: T, error: unknown): TenableDataset<T> {
-  return { data, status: isForbiddenError(error) ? "forbidden" : "error", error: errorMessage(error), seen: 0, truncated: true };
+function okDataset<T>(endpoint: string, data: T, seen: number, total: number | null, truncated = false, reason?: string): TenableDataset<T> {
+  const dataset: TenableDataset<T> = { data: redactCredentialProperties(data), status: "ok", endpoint, httpStatus: null, seen, total, truncated };
+  if (reason) dataset.error = reason;
+  return dataset;
+}
+
+/**
+ * A refused or failed read. The endpoint is the request that actually failed
+ * (which may differ from the nominal one, for example a chunk download inside
+ * an export) and every collection counter is null because no walk completed.
+ */
+function failedDataset<T>(endpoint: string, data: T, error: unknown): TenableDataset<T> {
+  return {
+    data,
+    status: isForbiddenError(error) ? "forbidden" : "error",
+    endpoint: errorEndpoint(error) ?? endpoint,
+    error: errorMessage(error),
+    httpStatus: errorStatus(error) ?? null,
+    seen: null,
+    total: null,
+    truncated: null,
+  };
 }
 
 function notConfiguredDataset<T>(data: T, message: string): TenableDataset<T> {
-  return { data, status: "not_configured", error: message, seen: 0, truncated: true };
+  return { data, status: "not_configured", endpoint: null, error: message, httpStatus: null, seen: null, total: null, truncated: null };
 }
 
-async function collectList(load: () => Promise<JsonRecord[]>): Promise<TenableDataset<JsonRecord[]>> {
+const EMPTY_EXPORT: TenableExportResult = {
+  exportUuid: null,
+  status: null,
+  records: [],
+  totalChunks: null,
+  availableChunks: null,
+  fetchedChunks: null,
+  failedChunks: null,
+  downloadFailures: null,
+  truncated: null,
+  endpoint: null,
+  httpStatus: null,
+};
+
+async function collectList(endpoint: string, load: () => Promise<JsonRecord[]>): Promise<TenableDataset<JsonRecord[]>> {
   try {
     const items = await load();
-    return okDataset(items, items.length, items.length);
+    return okDataset(endpoint, items, items.length, items.length);
   } catch (error) {
-    return failedDataset<JsonRecord[]>([], error);
+    return failedDataset<JsonRecord[]>(endpoint, [], error);
   }
 }
 
-async function collectPaginated(load: () => Promise<{ items: JsonRecord[]; total?: number; truncated: boolean }>): Promise<TenableDataset<JsonRecord[]>> {
+async function collectPaginated(endpoint: string, load: () => Promise<TenablePage>): Promise<TenableDataset<JsonRecord[]>> {
   try {
     const page = await load();
     // A walk that stopped at the page cap without a reported total has an unknown
     // size; only a complete walk may use its own length as the total.
-    const total = page.total ?? (page.truncated ? undefined : page.items.length);
-    return okDataset(page.items, page.items.length, total, page.truncated);
+    const total = page.total ?? (page.truncated ? null : page.items.length);
+    return okDataset(endpoint, page.items, page.items.length, total, page.truncated, page.reason);
   } catch (error) {
-    return failedDataset<JsonRecord[]>([], error);
+    return failedDataset<JsonRecord[]>(endpoint, [], error);
   }
 }
 
-async function collectObject(load: () => Promise<JsonRecord>): Promise<TenableDataset<JsonRecord>> {
+async function collectObject(endpoint: string, load: () => Promise<JsonRecord>): Promise<TenableDataset<JsonRecord>> {
   try {
     const value = await load();
-    return okDataset(value, 1, 1);
+    return okDataset(endpoint, value, 1, 1);
   } catch (error) {
-    return failedDataset<JsonRecord>({}, error);
+    return failedDataset<JsonRecord>(endpoint, {}, error);
   }
 }
 
-async function collectExport(load: () => Promise<TenableExportResult>): Promise<TenableDataset<TenableExportResult>> {
-  const empty: TenableExportResult = { exportUuid: "", status: "NOT_RUN", records: [], totalChunks: 0, fetchedChunks: 0, failedChunks: 0, truncated: true };
+/**
+ * An export that FINISHED with every available chunk downloaded is ok; one that
+ * FINISHED but lost chunks (max_chunks, chunks_failed, download errors) is ok
+ * and truncated; one that never FINISHED, or FINISHED with chunks none of which
+ * could be downloaded, is an error so its emptiness is never judged.
+ */
+async function collectExport(endpoint: string, load: () => Promise<TenableExportResult>): Promise<TenableDataset<TenableExportResult>> {
   try {
     const result = await load();
-    const dataset = okDataset(result, result.records.length, undefined, result.truncated);
-    if (result.status !== "FINISHED") {
-      dataset.status = "error";
-      dataset.error = `Export ${result.exportUuid || "(none)"} ended with status ${result.status}${result.reason ? `: ${result.reason}` : ""}.`;
+    const dataset = okDataset(result.endpoint ?? endpoint, result, result.records.length, null, result.truncated ?? true, result.reason);
+    const nothingDownloaded = (result.fetchedChunks ?? 0) === 0 && (result.availableChunks ?? 0) > 0;
+    if (result.status !== "FINISHED" || nothingDownloaded) {
+      dataset.status = isForbiddenStatus(result.httpStatus) ? "forbidden" : "error";
+      dataset.httpStatus = result.httpStatus;
+      dataset.error = redactErrorText(result.status !== "FINISHED"
+        ? `Export ${result.exportUuid} ended with status ${result.status}${result.reason ? `: ${result.reason}` : ""}.`
+        : `Export ${result.exportUuid} FINISHED with ${result.availableChunks} available chunks but none could be downloaded: ${result.reason ?? "unknown"}.`);
+      dataset.seen = null;
+      dataset.truncated = null;
     }
     return dataset;
   } catch (error) {
-    return failedDataset<TenableExportResult>(empty, error);
+    return failedDataset<TenableExportResult>(endpoint, EMPTY_EXPORT, error);
   }
 }
 
+/**
+ * Collection warnings for one dataset: the failure of an unread one, the partial
+ * view of a truncated one, or the per-item failures of a readable one (for
+ * example policy details that were refused for some policies).
+ */
+// The line reads "<label> dataset: <error>", never "<label>: <error>": a dataset named for
+// what it holds (credentials) followed by a colon is a credential pair to the scrub, and
+// the whole message after it would be replaced.
 function datasetErrors(label: string, dataset: TenableDataset<unknown>): string[] {
-  const errors: string[] = [];
-  if (dataset.error && dataset.status !== "not_configured") errors.push(`${label}: ${dataset.error}`);
-  if (dataset.status === "ok" && dataset.truncated) errors.push(`${label}: partial view (${dataset.seen} of ${dataset.total ?? "unknown"} records retrieved).`);
-  return errors;
+  if (dataset.status === "not_configured") return [];
+  if (dataset.status !== "ok") return dataset.error ? [`${label} dataset: ${dataset.error}`] : [];
+  if (dataset.truncated) {
+    return [`${label} dataset: partial view (${dataset.seen ?? "unknown"} of ${dataset.total ?? "unknown"} records retrieved${dataset.error ? `; ${dataset.error}` : ""}).`];
+  }
+  return dataset.error ? [`${label} dataset: ${dataset.error}`] : [];
+}
+
+/** Records in a readable list dataset; null when the list was not collected. */
+function countOrNull(dataset: TenableDataset<unknown[]>): number | null {
+  return dataset.status === "ok" ? dataset.data.length : null;
+}
+
+function recordCount(dataset: TenableDataset<TenableExportResult>): number | null {
+  return dataset.status === "ok" ? dataset.data.records.length : null;
+}
+
+/** "fetched/total" chunk ratio of an export that ran; null when it did not. */
+function chunkRatio(dataset: TenableDataset<TenableExportResult>): string | null {
+  const { fetchedChunks, totalChunks } = dataset.data;
+  return dataset.status === "ok" && fetchedChunks !== null && totalChunks !== null ? `${fetchedChunks}/${totalChunks}` : null;
+}
+
+/**
+ * Marker written in place of a list or object that was refused, failed, or
+ * never requested, so a bundle consumer cannot mistake a denial for an empty
+ * inventory. status is the observed HTTP status of the failed request.
+ */
+function notCollectedMarker(dataset: TenableDataset<unknown>): JsonRecord {
+  return {
+    collected: false,
+    status: dataset.httpStatus,
+    dataset_status: dataset.status,
+    endpoint: dataset.endpoint,
+    error: dataset.error ?? null,
+  };
+}
+
+function collectedOrMarker<T>(dataset: TenableDataset<T>, project: (data: T) => unknown = (data) => data): unknown {
+  return dataset.status === "ok" ? project(dataset.data) : notCollectedMarker(dataset);
+}
+
+function collectionStatusOf(dataset: TenableDataset<unknown>): JsonRecord {
+  return {
+    status: dataset.status,
+    endpoint: dataset.endpoint,
+    http_status: dataset.httpStatus,
+    seen: dataset.seen,
+    total: dataset.total,
+    truncated: dataset.truncated,
+    error: dataset.error ?? null,
+  };
+}
+
+function collectionSummary(datasets: Record<string, TenableDataset<unknown>>): JsonRecord {
+  return Object.fromEntries(Object.entries(datasets).map(([name, dataset]) => [name, collectionStatusOf(dataset)]));
 }
 
 function finding(
@@ -1040,44 +2008,89 @@ function finding(
   };
 }
 
-function unreadableFinding(control: number, severity: TenableSeverity, dataset: TenableDataset<unknown>, endpoint: string, manualEvidence: string, idSuffix = ""): TenableFinding {
-  const cause = dataset.status === "forbidden"
-    ? `the API key was refused (${dataset.error ?? "401/403"})`
-    : dataset.status === "not_configured"
-      ? dataset.error ?? "the platform is not configured"
-      : `the read failed (${dataset.error ?? "unknown error"})`;
-  return finding(
-    control,
-    "manual",
-    severity,
-    `Unknown: ${endpoint} could not be read because ${cause}. A human must collect ${manualEvidence}.`,
-    { endpoint, dataset_status: dataset.status, error: dataset.error ?? null },
-    idSuffix,
-  );
+/**
+ * Phrase describing why a dataset is unusable, naming only the request that
+ * actually failed and the status that was observed; empty for a readable one.
+ */
+function describeUnread(dataset: TenableDataset<unknown>): string {
+  const observed = dataset.httpStatus === null ? "" : ` with HTTP ${dataset.httpStatus}`;
+  switch (dataset.status) {
+    case "ok":
+      return "";
+    case "forbidden":
+      return `${dataset.endpoint} refused the API key${observed} (${dataset.error ?? "no error detail"})`;
+    case "error":
+      return `${dataset.endpoint} failed${observed} (${dataset.error ?? "no error detail"})`;
+    case "not_configured":
+      return dataset.error ?? "the platform is not configured";
+    default: {
+      const exhaustive: never = dataset.status;
+      throw new Error(`Unhandled dataset status: ${String(exhaustive)}`);
+    }
+  }
+}
+
+/**
+ * Manual verdict for a primary inventory that was not collected. A platform
+ * that is not configured is described without naming any endpoint, because no
+ * request was made; otherwise the summary names the request that failed.
+ */
+function unreadableFinding(control: number, severity: TenableSeverity, dataset: TenableDataset<unknown>, manualEvidence: string, idSuffix = ""): TenableFinding {
+  const summary = dataset.status === "not_configured"
+    ? `Not applicable: ${describeUnread(dataset)}, so this control was not assessed. A human must collect ${manualEvidence}.`
+    : `Unknown: ${dataset.endpoint} could not be read because ${describeUnread(dataset)}. A human must collect ${manualEvidence}.`;
+  return finding(control, "manual", severity, summary, {
+    collected: false,
+    endpoint: dataset.endpoint,
+    dataset_status: dataset.status,
+    http_status: dataset.httpStatus,
+    error: dataset.error ?? null,
+  }, idSuffix);
 }
 
 function partialNote(dataset: TenableDataset<unknown>): string {
   return dataset.truncated && dataset.status === "ok"
-    ? ` Only ${dataset.seen} of ${dataset.total ?? "unknown"} records were retrieved, so the verdict is capped at warn.`
+    ? ` Only ${dataset.seen ?? "an unknown number"} of ${dataset.total ?? "unknown"} records were retrieved${dataset.error ? ` (${dataset.error})` : ""}, so the verdict is capped at warn.`
     : "";
 }
 
+// A pass never survives a capped, stuck, or unreadable inventory it depends on.
 function capForPartial(status: TenableFindingStatus, dataset: TenableDataset<unknown>): TenableFindingStatus {
-  if (status === "pass" && dataset.status === "ok" && dataset.truncated) return "warn";
+  if (status === "pass" && (dataset.status !== "ok" || dataset.truncated)) return "warn";
   return status;
 }
 
-function capForNonAdmin(status: TenableFindingStatus, callerIsAdministrator: boolean | undefined): TenableFindingStatus {
+// Rule 1 corollary: a finding that reads several inventories cannot pass while any of
+// them is unreadable, even when the unreadable one only feeds evidence.
+function capForUnreadable(status: TenableFindingStatus, ...datasets: Array<TenableDataset<unknown>>): TenableFindingStatus {
+  if (status === "pass" && datasets.some((dataset) => dataset.status !== "ok")) return "warn";
+  return status;
+}
+
+interface SecondaryInventory {
+  dataset: TenableDataset<unknown>;
+  consequence: string;
+}
+
+/** Note for every unreadable secondary inventory, naming the request that failed and what stays unknown. */
+function unreadableNote(inventories: SecondaryInventory[]): string {
+  const unread = inventories.filter((inventory) => inventory.dataset.status !== "ok");
+  if (unread.length === 0) return "";
+  return ` ${unread.map((inventory) => `${describeUnread(inventory.dataset)}, so ${inventory.consequence}`).join("; ")}; the verdict is capped at warn.`;
+}
+
+function capForNonAdmin(status: TenableFindingStatus, callerIsAdministrator: boolean | null): TenableFindingStatus {
   if (status === "pass" && callerIsAdministrator !== true) return "warn";
   return status;
 }
 
-function nonAdminNote(callerIsAdministrator: boolean | undefined): string {
+function nonAdminNote(callerIsAdministrator: boolean | null): string {
   return callerIsAdministrator === true ? "" : " The API key is not confirmed as Administrator, so only objects shared with it are visible and the verdict is capped at warn.";
 }
 
-function detectAdministrator(users: TenableDataset<JsonRecord[]>): boolean | undefined {
-  if (users.status !== "ok" || users.data.length === 0) return undefined;
+/** true when GET /users exposed full attributes, false when it exposed the reduced shape, null when the list was unread or empty. */
+function detectAdministrator(users: TenableDataset<JsonRecord[]>): boolean | null {
+  if (users.status !== "ok" || users.data.length === 0) return null;
   return users.data.some((user) => asNumber(user.permissions) !== undefined);
 }
 
@@ -1133,7 +2146,7 @@ function evaluatePolicyDetail(detail: TenablePolicyDetail, policyNames: Map<stri
   };
   if (detail.status !== "ok") {
     evaluation.verdict = "unreadable";
-    evaluation.reasons.push(`GET /policies/${detail.policyId} ${detail.status === "forbidden" ? "was refused" : "failed"} (${detail.error ?? "unknown"})`);
+    evaluation.reasons.push(`${detail.endpoint} ${detail.status === "forbidden" ? "was refused" : "failed"}${detail.httpStatus === null ? "" : ` with HTTP ${detail.httpStatus}`} (${detail.error ?? "unknown"})`);
     return evaluation;
   }
   if (safeChecks === "no") {
@@ -1182,7 +2195,9 @@ function exclusionIsBroad(members: string | undefined): boolean {
 export interface TenablePolicyDetail {
   policyId: string;
   scanNames: string[];
+  endpoint: string;
   status: "ok" | "forbidden" | "error";
+  httpStatus: number | null;
   error?: string;
   details: JsonRecord;
 }
@@ -1214,33 +2229,40 @@ export interface TenableScanProgramData {
   scScanResults: TenableDataset<JsonRecord[]>;
 }
 
+const POLICY_DETAILS_ENDPOINT = "GET /policies/{policy_id}";
 const SC_NOT_CONFIGURED = "Tenable Security Center is not configured (set TENABLE_SC_URL with TENABLE_SC_ACCESS_KEY and TENABLE_SC_SECRET_KEY, or point TENABLE_URL at the Security Center host)";
 const VM_NOT_CONFIGURED = "Tenable Vulnerability Management is not configured (TENABLE_URL points at a Tenable Security Center host, so cloud-only controls do not apply)";
 
-async function scDataset(clients: TenableClients, load: (client: TenableSecurityCenterClient) => Promise<JsonRecord[]>): Promise<TenableDataset<JsonRecord[]>> {
+// Each collector is labelled with the request it issues, so a dataset can name
+// the request that produced it (or, on failure, the request that actually failed).
+async function scDataset(clients: TenableClients, endpoint: string, load: (client: TenableSecurityCenterClient) => Promise<JsonRecord[]>): Promise<TenableDataset<JsonRecord[]>> {
   if (!clients.securityCenter) return notConfiguredDataset<JsonRecord[]>([], SC_NOT_CONFIGURED);
-  return collectList(() => load(clients.securityCenter as TenableSecurityCenterClient));
+  return collectList(endpoint, () => load(clients.securityCenter as TenableSecurityCenterClient));
 }
 
-async function vmList(clients: TenableClients, load: (client: TenableApiClient) => Promise<JsonRecord[]>): Promise<TenableDataset<JsonRecord[]>> {
+async function scObject(clients: TenableClients, endpoint: string, load: (client: TenableSecurityCenterClient) => Promise<JsonRecord>): Promise<TenableDataset<JsonRecord>> {
+  if (!clients.securityCenter) return notConfiguredDataset<JsonRecord>({}, SC_NOT_CONFIGURED);
+  return collectObject(endpoint, () => load(clients.securityCenter as TenableSecurityCenterClient));
+}
+
+async function vmList(clients: TenableClients, endpoint: string, load: (client: TenableApiClient) => Promise<JsonRecord[]>): Promise<TenableDataset<JsonRecord[]>> {
   if (!clients.vm) return notConfiguredDataset<JsonRecord[]>([], VM_NOT_CONFIGURED);
-  return collectList(() => load(clients.vm as TenableApiClient));
+  return collectList(endpoint, () => load(clients.vm as TenableApiClient));
 }
 
-async function vmPaginated(clients: TenableClients, load: (client: TenableApiClient) => Promise<{ items: JsonRecord[]; total?: number; truncated: boolean }>): Promise<TenableDataset<JsonRecord[]>> {
+async function vmPaginated(clients: TenableClients, endpoint: string, load: (client: TenableApiClient) => Promise<TenablePage>): Promise<TenableDataset<JsonRecord[]>> {
   if (!clients.vm) return notConfiguredDataset<JsonRecord[]>([], VM_NOT_CONFIGURED);
-  return collectPaginated(() => load(clients.vm as TenableApiClient));
+  return collectPaginated(endpoint, () => load(clients.vm as TenableApiClient));
 }
 
-async function vmObject(clients: TenableClients, load: (client: TenableApiClient) => Promise<JsonRecord>): Promise<TenableDataset<JsonRecord>> {
+async function vmObject(clients: TenableClients, endpoint: string, load: (client: TenableApiClient) => Promise<JsonRecord>): Promise<TenableDataset<JsonRecord>> {
   if (!clients.vm) return notConfiguredDataset<JsonRecord>({}, VM_NOT_CONFIGURED);
-  return collectObject(() => load(clients.vm as TenableApiClient));
+  return collectObject(endpoint, () => load(clients.vm as TenableApiClient));
 }
 
-async function vmExport(clients: TenableClients, load: (client: TenableApiClient) => Promise<TenableExportResult>): Promise<TenableDataset<TenableExportResult>> {
-  const empty: TenableExportResult = { exportUuid: "", status: "NOT_RUN", records: [], totalChunks: 0, fetchedChunks: 0, failedChunks: 0, truncated: true };
-  if (!clients.vm) return notConfiguredDataset<TenableExportResult>(empty, VM_NOT_CONFIGURED);
-  return collectExport(() => load(clients.vm as TenableApiClient));
+async function vmExport(clients: TenableClients, endpoint: string, load: (client: TenableApiClient) => Promise<TenableExportResult>): Promise<TenableDataset<TenableExportResult>> {
+  if (!clients.vm) return notConfiguredDataset<TenableExportResult>(EMPTY_EXPORT, VM_NOT_CONFIGURED);
+  return collectExport(endpoint, () => load(clients.vm as TenableApiClient));
 }
 
 async function mapWithConcurrency<T, R>(items: T[], limit: number, worker: (item: T) => Promise<R>): Promise<R[]> {
@@ -1257,10 +2279,26 @@ async function mapWithConcurrency<T, R>(items: T[], limit: number, worker: (item
   return results;
 }
 
+/**
+ * One GET /policies/{policy_id} per policy referenced by a visible scan. The
+ * dataset is ok while at least one detail was read (per-policy failures stay on
+ * the detail records); when every read failed it takes the status of the first
+ * failed request, and when the scan list itself was unread no request is made
+ * and the dataset mirrors the scan list's failure.
+ */
 async function collectPolicyDetails(clients: TenableClients, scans: TenableDataset<JsonRecord[]>): Promise<TenableDataset<TenablePolicyDetail[]>> {
   if (!clients.vm) return notConfiguredDataset<TenablePolicyDetail[]>([], VM_NOT_CONFIGURED);
   if (scans.status !== "ok") {
-    return { data: [], status: scans.status === "forbidden" ? "forbidden" : "error", error: `policy details were not requested because GET /scans failed: ${scans.error ?? "unknown"}`, seen: 0, truncated: true };
+    return {
+      data: [],
+      status: scans.status === "forbidden" ? "forbidden" : "error",
+      endpoint: scans.endpoint,
+      error: `policy details were not requested because ${describeUnread(scans)}`,
+      httpStatus: scans.httpStatus,
+      seen: null,
+      total: null,
+      truncated: null,
+    };
   }
   const scanNamesByPolicy = new Map<string, string[]>();
   for (const scan of scans.data) {
@@ -1272,24 +2310,37 @@ async function collectPolicyDetails(clients: TenableClients, scans: TenableDatas
   const requested = policyIds.slice(0, MAX_POLICY_DETAILS);
   const client = clients.vm;
   const details = await mapWithConcurrency(requested, 4, async (policyId): Promise<TenablePolicyDetail> => {
+    const endpoint = `GET /policies/${encodeURIComponent(policyId)}`;
+    const scanNames = scanNamesByPolicy.get(policyId) ?? [];
     try {
       const payload = await client.getPolicyDetails(policyId);
-      return { policyId, scanNames: scanNamesByPolicy.get(policyId) ?? [], status: "ok", details: payload };
+      return { policyId, scanNames, endpoint, status: "ok", httpStatus: null, details: projectPolicyDetails(payload) };
     } catch (error) {
-      return { policyId, scanNames: scanNamesByPolicy.get(policyId) ?? [], status: isForbiddenError(error) ? "forbidden" : "error", error: errorMessage(error), details: {} };
+      return {
+        policyId,
+        scanNames,
+        endpoint: errorEndpoint(error) ?? endpoint,
+        status: isForbiddenError(error) ? "forbidden" : "error",
+        httpStatus: errorStatus(error) ?? null,
+        error: errorMessage(error),
+        details: {},
+      };
     }
   });
   const readable = details.filter((detail) => detail.status === "ok");
   const failed = details.filter((detail) => detail.status !== "ok");
+  const allFailed = details.length > 0 && readable.length === 0;
   const dataset: TenableDataset<TenablePolicyDetail[]> = {
     data: details,
-    status: readable.length > 0 || details.length === 0 ? "ok" : failed.every((detail) => detail.status === "forbidden") ? "forbidden" : "error",
-    seen: readable.length,
-    total: policyIds.length,
-    truncated: policyIds.length > requested.length,
+    status: allFailed ? (failed.every((detail) => detail.status === "forbidden") ? "forbidden" : "error") : "ok",
+    endpoint: allFailed ? failed[0].endpoint : details.length === 0 ? null : POLICY_DETAILS_ENDPOINT,
+    httpStatus: allFailed ? failed[0].httpStatus : null,
+    seen: allFailed ? null : readable.length,
+    total: allFailed ? null : policyIds.length,
+    truncated: allFailed ? null : policyIds.length > requested.length,
   };
   if (failed.length > 0) {
-    dataset.error = `${failed.length} of ${details.length} GET /policies/{policy_id} reads failed: ${failed.slice(0, 5).map((detail) => `${detail.policyId} (${detail.error ?? detail.status})`).join("; ")}`;
+    dataset.error = `${failed.length} of ${details.length} policy detail reads failed: ${failed.slice(0, 5).map((detail) => `${detail.endpoint}${detail.httpStatus === null ? "" : ` (HTTP ${detail.httpStatus})`}: ${detail.error ?? detail.status}`).join("; ")}`;
   }
   return dataset;
 }
@@ -1298,15 +2349,15 @@ export async function collectTenableScanProgramData(clients: TenableClients, opt
   const now = options.now ?? Date.now();
   const maxChunks = clampInteger(options.maxChunks, DEFAULT_MAX_CHUNKS, 1, 1000);
   const [scans, policies, templates, exclusions, targetGroups, users, assetExport, scScans, scScanResults] = await Promise.all([
-    vmList(clients, (client) => client.listScans()),
-    vmList(clients, (client) => client.listPolicies()),
-    vmList(clients, (client) => client.listScanTemplates()),
-    vmPaginated(clients, (client) => client.listExclusions()),
-    vmList(clients, (client) => client.listTargetGroups()),
-    vmList(clients, (client) => client.listUsers()),
-    vmExport(clients, (client) => client.exportAssets(maxChunks)),
-    scDataset(clients, (client) => client.listScans()),
-    scDataset(clients, (client) => client.listScanResults(Math.floor((now - DEFAULT_STALE_SCAN_DAYS * DAY_MS) / 1000))),
+    vmList(clients, "GET /scans", (client) => client.listScans()),
+    vmList(clients, "GET /policies", (client) => client.listPolicies()),
+    vmList(clients, "GET /editor/scan/templates", (client) => client.listScanTemplates()),
+    vmPaginated(clients, "GET /exclusions", (client) => client.listExclusions()),
+    vmList(clients, "GET /target-groups", (client) => client.listTargetGroups()),
+    vmList(clients, "GET /users", (client) => client.listUsers()),
+    vmExport(clients, "POST /assets/export", (client) => client.exportAssets(maxChunks)),
+    scDataset(clients, "GET /rest/scan", (client) => client.listScans()),
+    scDataset(clients, "GET /rest/scanResult", (client) => client.listScanResults(Math.floor((now - DEFAULT_STALE_SCAN_DAYS * DAY_MS) / 1000))),
   ]);
   const policyDetails = await collectPolicyDetails(clients, scans);
   return { scans, policies, policyDetails, templates, exclusions, targetGroups, users, assetExport, scScans, scScanResults };
@@ -1328,9 +2379,9 @@ export function assessTenableScanProgram(data: TenableScanProgramData, options: 
     templatesById.get(asString(item.wizard_uuid) ?? "") ?? templatesById.get(asString(item.template_uuid) ?? "");
 
   if (data.scans.status !== "ok") {
-    findings.push(unreadableFinding(1, "high", data.scans, "GET /scans", "the scan template list, port ranges, plugin families, and safe-check settings from the Tenable UI"));
-    findings.push(unreadableFinding(2, "high", data.scans, "GET /scans", "the scan schedule list and last run dates from the Tenable UI"));
-    findings.push(unreadableFinding(17, "medium", data.scans, "GET /scans", "the list of scheduled compliance audit scans (CIS, DISA STIG, PCI) from the Tenable UI"));
+    findings.push(unreadableFinding(1, "high", data.scans, "the scan template list, port ranges, plugin families, and safe-check settings from the Tenable UI"));
+    findings.push(unreadableFinding(2, "high", data.scans, "the scan schedule list and last run dates from the Tenable UI"));
+    findings.push(unreadableFinding(17, "medium", data.scans, "the list of scheduled compliance audit scans (CIS, DISA STIG, PCI) from the Tenable UI"));
   } else {
     const scans = data.scans.data;
     const templateNames = new Map<string, number>();
@@ -1363,40 +2414,48 @@ export function assessTenableScanProgram(data: TenableScanProgramData, options: 
       map.set(key, (map.get(key) ?? 0) + 1);
       return map;
     }, new Map<string, number>()));
+    // The template list decides discovery-only detection and the policy list supplies
+    // names; when either is unreadable a pass is capped and the cause is stated.
+    const policySecondaries: SecondaryInventory[] = [
+      { dataset: data.templates, consequence: "discovery-only scan detection was not possible" },
+      { dataset: data.policies, consequence: "policy names are unknown" },
+    ];
+    const templateNote = unreadableNote(policySecondaries);
     let policyStatus: TenableFindingStatus;
     let policySummary: string;
     if (scans.length === 0) {
       policyStatus = "fail";
-      policySummary = `No scans are visible to this API key (GET /scans returned zero scans), so no scan policy configuration exists to audit; emptiness fails this control.${nonAdminNote(callerIsAdministrator)}`;
+      policySummary = `No scans are visible to this API key (${data.scans.endpoint} returned zero scans), so no scan policy configuration exists to audit; emptiness fails this control.${nonAdminNote(callerIsAdministrator)}`;
     } else if (allDiscovery) {
       policyStatus = "fail";
       policySummary = `All ${scans.length} visible scans use host discovery templates; no vulnerability assessment policy is configured.`;
     } else if (failingPolicies.length > 0) {
       policyStatus = "fail";
-      policySummary = `${failingPolicies.length} of ${evaluations.length} scan policies referenced by scans have unsafe settings: ${describe(failingPolicies)}. Settings were read from GET /policies/{policy_id} (settings.safe_checks, settings.portscan_range, plugins family status).`;
+      policySummary = `${failingPolicies.length} of ${evaluations.length} scan policies referenced by scans have unsafe settings: ${describe(failingPolicies)}. Settings were read from ${POLICY_DETAILS_ENDPOINT} (settings.safe_checks, settings.portscan_range, plugins family status).`;
     } else if (data.policyDetails.status !== "ok" || (evaluations.length === 0 && scansWithoutPolicy.length === scans.length)) {
       policyStatus = "manual";
       policySummary = evaluations.length === 0 && data.policyDetails.status === "ok"
-        ? `Unknown: none of the ${scans.length} visible scans exposes a policy_id, so GET /policies/{policy_id} could not be called; a human must review port range, plugin families, and safe checks for each scan template in the Tenable UI (Scans > Scan Templates).`
-        : `Unknown: GET /policies/{policy_id} could not be read for the ${evaluations.length} policies referenced by scans because ${data.policyDetails.status === "forbidden" ? "the API key was refused (requires the Standard [32] role and Can View on each scan template)" : `the read failed (${data.policyDetails.error ?? "unknown"})`}. A human must collect safe_checks, portscan_range, and enabled plugin families for each template from the Tenable UI.`;
+        ? `Unknown: none of the ${scans.length} visible scans exposes a policy_id, so no policy details could be requested; a human must review port range, plugin families, and safe checks for each scan template in the Tenable UI (Scans > Scan Templates).`
+        : `Unknown: policy details could not be read for the ${evaluations.length} policies referenced by scans because ${describeUnread(data.policyDetails)}${data.policyDetails.status === "forbidden" ? "; the details read requires the Standard [32] role and Can View on each scan template" : ""}. A human must collect safe_checks, portscan_range, and enabled plugin families for each template from the Tenable UI.`;
     } else if (unreadablePolicies.length > 0 || unverifiedPolicies.length > 0 || data.policyDetails.truncated) {
       policyStatus = "manual";
-      policySummary = `Unknown: ${evaluations.length - unreadablePolicies.length - unverifiedPolicies.length} of ${evaluations.length} referenced scan policies were verified from GET /policies/{policy_id}, but ${unreadablePolicies.length} could not be read and ${unverifiedPolicies.length} do not expose safe_checks or a plugin family map${data.policyDetails.truncated ? `, and only ${data.policyDetails.seen} of ${data.policyDetails.total ?? "unknown"} referenced policies were requested` : ""}: ${describe([...unreadablePolicies, ...unverifiedPolicies])}. A human must review those templates in the Tenable UI before this control can pass.`;
+      policySummary = `Unknown: ${evaluations.length - unreadablePolicies.length - unverifiedPolicies.length} of ${evaluations.length} referenced scan policies were verified from ${POLICY_DETAILS_ENDPOINT}, but ${unreadablePolicies.length} could not be read and ${unverifiedPolicies.length} do not expose safe_checks or a plugin family map${data.policyDetails.truncated ? `, and only ${data.policyDetails.seen} of ${data.policyDetails.total ?? "unknown"} referenced policies were requested` : ""}: ${describe([...unreadablePolicies, ...unverifiedPolicies])}. A human must review those templates in the Tenable UI before this control can pass.`;
     } else if (warningPolicies.length > 0) {
       policyStatus = "warn";
-      policySummary = `All ${evaluations.length} scan policies referenced by scans enable safe checks and at least one plugin family, but ${warningPolicies.length} need review: ${describe(warningPolicies)}.`;
+      policySummary = `All ${evaluations.length} scan policies referenced by scans enable safe checks and at least one plugin family, but ${warningPolicies.length} need review: ${describe(warningPolicies)}.${templateNote}`;
     } else {
-      policyStatus = capForNonAdmin("pass", callerIsAdministrator);
-      policySummary = `All ${evaluations.length} scan policies referenced by the ${scans.length} visible scans enable safe checks (safe_checks=yes), scan the default or full port range, and keep more than half of their plugin families enabled, per GET /policies/{policy_id}.${scansWithoutPolicy.length > 0 ? ` ${scansWithoutPolicy.length} scans expose no policy_id and were not evaluated.` : ""}${nonAdminNote(callerIsAdministrator)}`;
+      policyStatus = capForNonAdmin(capForUnreadable("pass", data.templates, data.policies), callerIsAdministrator);
+      policySummary = `All ${evaluations.length} scan policies referenced by the ${scans.length} visible scans enable safe checks (safe_checks=yes), scan the default or full port range, and keep more than half of their plugin families enabled, per ${POLICY_DETAILS_ENDPOINT}.${scansWithoutPolicy.length > 0 ? ` ${scansWithoutPolicy.length} scans expose no policy_id and were not evaluated.` : ""}${templateNote}${nonAdminNote(callerIsAdministrator)}`;
       if (scansWithoutPolicy.length > 0 && policyStatus === "pass") policyStatus = "warn";
     }
     findings.push(finding(1, policyStatus, "high", policySummary, {
       scan_count: scans.length,
       scan_types: scanTypes,
-      policy_count: data.policies.status === "ok" ? data.policies.data.length : null,
-      policy_templates: policyTemplates.slice(0, 50),
-      scan_templates_in_use: Object.fromEntries(templateNames),
-      discovery_only_scans: discoveryOnly,
+      policy_count: countOrNull(data.policies),
+      policy_templates: data.policies.status === "ok" && data.templates.status === "ok" ? policyTemplates.slice(0, 50) : null,
+      scan_templates_in_use: data.templates.status === "ok" ? Object.fromEntries(templateNames) : null,
+      scan_templates_status: data.templates.status,
+      discovery_only_scans: data.templates.status === "ok" ? discoveryOnly : null,
       scans_without_policy_id: scansWithoutPolicy.map((scan) => asString(scan.name) ?? asString(scan.id)).slice(0, 50),
       policies_evaluated: evaluations.slice(0, 50).map((item) => ({
         policy_id: item.policyId,
@@ -1410,7 +2469,9 @@ export function assessTenableScanProgram(data: TenableScanProgramData, options: 
         performance: item.performance,
       })),
       policy_details_status: data.policyDetails.status,
-      caller_is_administrator: callerIsAdministrator ?? null,
+      policy_details_http_status: data.policyDetails.httpStatus,
+      policy_details_requested: data.policyDetails.data.length,
+      caller_is_administrator: callerIsAdministrator,
     }));
 
     const recurring = scans.filter((scan) => scanIsEnabled(scan) && scanIsRecurring(scan));
@@ -1445,11 +2506,11 @@ export function assessTenableScanProgram(data: TenableScanProgramData, options: 
       stale_recurring_scans: stale.map((scan) => asString(scan.name) ?? asString(scan.id)).slice(0, 50),
       never_run_or_undated_scans: neverRun.map((scan) => asString(scan.name) ?? asString(scan.id)).slice(0, 50),
       stale_scan_days: staleScanDays,
-      caller_is_administrator: callerIsAdministrator ?? null,
+      caller_is_administrator: callerIsAdministrator,
     }));
 
     if (data.templates.status !== "ok") {
-      findings.push(unreadableFinding(17, "medium", data.templates, "GET /editor/scan/templates", "the list of scheduled compliance audit scans (CIS, DISA STIG, PCI) from the Tenable UI"));
+      findings.push(unreadableFinding(17, "medium", data.templates, "the list of scheduled compliance audit scans (CIS, DISA STIG, PCI) from the Tenable UI"));
     } else {
       const complianceScans = scans.filter((scan) => {
         const template = templateFor(scan);
@@ -1475,7 +2536,7 @@ export function assessTenableScanProgram(data: TenableScanProgramData, options: 
   }
 
   if (data.assetExport.status !== "ok") {
-    findings.push(unreadableFinding(4, "high", data.assetExport, "POST /assets/export", "the credentialed scan ratio from the Tenable asset inventory (Last Authenticated Scan filter)"));
+    findings.push(unreadableFinding(4, "high", data.assetExport, "the credentialed scan ratio from the Tenable asset inventory (Last Authenticated Scan filter)"));
   } else {
     const assets = data.assetExport.data.records;
     const credentialed = assets.filter((asset) => asString(asset.last_authentication_scan_status) === "Success" || asBoolean(asset.has_agent) === true);
@@ -1505,12 +2566,12 @@ export function assessTenableScanProgram(data: TenableScanProgramData, options: 
       coverage_ratio: coverage,
       threshold: credentialThreshold,
       export_status: data.assetExport.data.status,
-      chunks_fetched: `${data.assetExport.data.fetchedChunks}/${data.assetExport.data.totalChunks}`,
+      chunks_fetched: chunkRatio(data.assetExport),
     }));
   }
 
   if (data.exclusions.status !== "ok") {
-    findings.push(unreadableFinding(13, "medium", data.exclusions, "GET /exclusions", "the scan exclusion list with schedules, targets, and justifications from Settings > Exclusions"));
+    findings.push(unreadableFinding(13, "medium", data.exclusions, "the scan exclusion list with schedules, targets, and justifications from Settings > Exclusions"));
   } else {
     const exclusions = data.exclusions.data;
     const permanent = exclusions.filter((item) => asBoolean(asObject(item.schedule)?.enabled) !== true);
@@ -1522,7 +2583,7 @@ export function assessTenableScanProgram(data: TenableScanProgramData, options: 
       exclusions.length === 0 ? capForPartial("pass", data.exclusions) : issues.size === 0 ? capForPartial("pass", data.exclusions) : permanent.length > 0 || broad.length > 0 ? "fail" : "warn",
       "medium",
       exclusions.length === 0
-        ? `GET /exclusions returned pagination.total 0, so nothing is excluded from scanning; emptiness is compliant for this control.${partialNote(data.exclusions)}`
+        ? `${data.exclusions.endpoint} returned pagination.total 0, so nothing is excluded from scanning; emptiness is compliant for this control.${partialNote(data.exclusions)}`
         : issues.size === 0
           ? `All ${exclusions.length} exclusions are scheduled, documented, and scoped to narrow targets.${partialNote(data.exclusions)}`
           : `${issues.size} of ${exclusions.length} exclusions need review: ${permanent.length} always-on (schedule.enabled=false), ${undocumented.length} without a description, ${broad.length} covering /16 or wider ranges.`,
@@ -1537,7 +2598,7 @@ export function assessTenableScanProgram(data: TenableScanProgramData, options: 
   }
 
   if (data.targetGroups.status !== "ok") {
-    findings.push(unreadableFinding(20, "low", data.targetGroups, "GET /target-groups", "the legacy target group list (deprecated feature) or confirmation that tags replaced target groups"));
+    findings.push(unreadableFinding(20, "low", data.targetGroups, "the legacy target group list (deprecated feature) or confirmation that tags replaced target groups"));
   } else {
     const groups = data.targetGroups.data;
     const stale = groups.filter((group) => {
@@ -1556,7 +2617,7 @@ export function assessTenableScanProgram(data: TenableScanProgramData, options: 
       groups.length === 0 ? capForNonAdmin("pass", callerIsAdministrator) : stale.length === 0 && overlapping.length === 0 ? capForNonAdmin("pass", callerIsAdministrator) : "warn",
       "low",
       groups.length === 0
-        ? `No legacy target groups are visible (GET /target-groups returned an empty list); target groups were deprecated in February 2022 in favor of tags, so emptiness is compliant.${nonAdminNote(callerIsAdministrator)}`
+        ? `No legacy target groups are visible (${data.targetGroups.endpoint} returned an empty list); target groups were deprecated in February 2022 in favor of tags, so emptiness is compliant.${nonAdminNote(callerIsAdministrator)}`
         : stale.length === 0 && overlapping.length === 0
           ? `${groups.length} legacy target groups exist, all modified within the last year with no overlapping members. Plan a migration to tags.${nonAdminNote(callerIsAdministrator)}`
           : `${groups.length} legacy target groups exist: ${stale.length} unmodified for over a year or undated, ${overlapping.length} member targets appear in more than one group.`,
@@ -1587,13 +2648,25 @@ export function assessTenableScanProgram(data: TenableScanProgramData, options: 
     title: "Tenable scan program",
     category: "scan_program",
     summary: {
-      scan_count: data.scans.data.length,
-      policy_count: data.policies.data.length,
-      exclusion_count: data.exclusions.data.length,
-      target_group_count: data.targetGroups.data.length,
-      exported_assets: data.assetExport.data.records.length,
-      caller_is_administrator: callerIsAdministrator ?? null,
+      scan_count: countOrNull(data.scans),
+      policy_count: countOrNull(data.policies),
+      exclusion_count: countOrNull(data.exclusions),
+      target_group_count: countOrNull(data.targetGroups),
+      exported_assets: recordCount(data.assetExport),
+      caller_is_administrator: callerIsAdministrator,
       ...statusCounts(findings),
+      collection: collectionSummary({
+        scans: data.scans,
+        policies: data.policies,
+        policy_details: data.policyDetails,
+        templates: data.templates,
+        exclusions: data.exclusions,
+        target_groups: data.targetGroups,
+        users: data.users,
+        asset_export: data.assetExport,
+        sc_scans: data.scScans,
+        sc_scan_results: data.scScanResults,
+      }),
     },
     findings,
     errors,
@@ -1602,7 +2675,7 @@ export function assessTenableScanProgram(data: TenableScanProgramData, options: 
 
 function assessSecurityCenterSchedule(scans: TenableDataset<JsonRecord[]>, results: TenableDataset<JsonRecord[]>, now: number, staleScanDays: number): TenableFinding {
   if (scans.status !== "ok") {
-    return unreadableFinding(2, "high", scans, "GET /rest/scan", "the Security Center scan schedule list and recent scan results", "-SC");
+    return unreadableFinding(2, "high", scans, "the Security Center scan schedule list and recent scan results", "-SC");
   }
   const scheduled = scans.data.filter((scan) => asString(asObject(scan.schedule)?.type) === "ical");
   const completed = results.status === "ok"
@@ -1618,7 +2691,7 @@ function assessSecurityCenterSchedule(scans: TenableDataset<JsonRecord[]>, resul
     summary = `${scans.data.length} Security Center scans are visible but none uses an ical (recurring) schedule.`;
   } else if (results.status !== "ok") {
     status = "manual";
-    summary = `${scheduled.length} recurring Security Center scans exist but GET /rest/scanResult could not be read (${results.error ?? "unknown"}), so recent completion cannot be confirmed.`;
+    summary = `${scheduled.length} recurring Security Center scans exist but ${describeUnread(results)}, so recent completion cannot be confirmed.`;
   } else if (completed.length === 0) {
     status = "fail";
     summary = `${scheduled.length} recurring Security Center scans exist but no scan result completed in the last ${staleScanDays} days.`;
@@ -1629,7 +2702,8 @@ function assessSecurityCenterSchedule(scans: TenableDataset<JsonRecord[]>, resul
   return finding(2, status, "high", summary, {
     sc_scan_count: scans.data.length,
     sc_recurring_scans: scheduled.length,
-    sc_completed_results_in_window: completed.length,
+    sc_completed_results_in_window: results.status === "ok" ? completed.length : null,
+    sc_scan_results_status: results.status,
   }, "-SC");
 }
 
@@ -1642,25 +2716,27 @@ export interface TenableSensorCoverageData {
   tagCategories: TenableDataset<JsonRecord[]>;
   tagValues: TenableDataset<JsonRecord[]>;
   assetExport: TenableDataset<TenableExportResult>;
+  users: TenableDataset<JsonRecord[]>;
   scScanners: TenableDataset<JsonRecord[]>;
   scFeed: TenableDataset<JsonRecord>;
 }
 
 export async function collectTenableSensorCoverageData(clients: TenableClients, options: TenableAssessmentOptions = {}): Promise<TenableSensorCoverageData> {
   const maxChunks = clampInteger(options.maxChunks, DEFAULT_MAX_CHUNKS, 1, 1000);
-  const [serverProperties, scanners, agents, agentGroups, networks, tagCategories, tagValues, assetExport, scScanners, scFeed] = await Promise.all([
-    vmObject(clients, (client) => client.getServerProperties()),
-    vmList(clients, (client) => client.listScanners()),
-    vmPaginated(clients, (client) => client.listAgents()),
-    vmList(clients, (client) => client.listAgentGroups()),
-    vmPaginated(clients, (client) => client.listNetworks()),
-    vmPaginated(clients, (client) => client.listTagCategories()),
-    vmPaginated(clients, (client) => client.listTagValues()),
-    vmExport(clients, (client) => client.exportAssets(maxChunks)),
-    scDataset(clients, (client) => client.listScanners()),
-    clients.securityCenter ? collectObject(() => (clients.securityCenter as TenableSecurityCenterClient).getFeed()) : Promise.resolve(notConfiguredDataset<JsonRecord>({}, SC_NOT_CONFIGURED)),
+  const [serverProperties, scanners, agents, agentGroups, networks, tagCategories, tagValues, assetExport, users, scScanners, scFeed] = await Promise.all([
+    vmObject(clients, "GET /server/properties", (client) => client.getServerProperties()),
+    vmList(clients, "GET /scanners", (client) => client.listScanners()),
+    vmPaginated(clients, "GET /scanners/null/agents", (client) => client.listAgents()),
+    vmList(clients, "GET /scanners/null/agent-groups", (client) => client.listAgentGroups()),
+    vmPaginated(clients, "GET /networks", (client) => client.listNetworks()),
+    vmPaginated(clients, "GET /tags/categories", (client) => client.listTagCategories()),
+    vmPaginated(clients, "GET /tags/values", (client) => client.listTagValues()),
+    vmExport(clients, "POST /assets/export", (client) => client.exportAssets(maxChunks)),
+    vmList(clients, "GET /users", (client) => client.listUsers()),
+    scDataset(clients, "GET /rest/scanner", (client) => client.listScanners()),
+    scObject(clients, "GET /rest/feed", (client) => client.getFeed()),
   ]);
-  return { serverProperties, scanners, agents, agentGroups, networks, tagCategories, tagValues, assetExport, scScanners, scFeed };
+  return { serverProperties, scanners, agents, agentGroups, networks, tagCategories, tagValues, assetExport, users, scScanners, scFeed };
 }
 
 function compareVersions(left: string, right: string): number {
@@ -1683,12 +2759,13 @@ export function assessTenableSensorCoverage(data: TenableSensorCoverageData, opt
   const agentOfflineDays = clampInteger(options.agentOfflineDays, DEFAULT_AGENT_OFFLINE_DAYS, 1, 365);
   const pluginStaleHours = clampInteger(options.pluginStaleHours, DEFAULT_PLUGIN_STALE_HOURS, 1, 24 * 30);
   const taggedThreshold = clampNumber(options.taggedThreshold, DEFAULT_TAGGED_THRESHOLD, 0, 1);
+  const callerIsAdministrator = detectAdministrator(data.users);
   const findings: TenableFinding[] = [];
   const assets = data.assetExport.status === "ok" ? data.assetExport.data.records : [];
 
   if (data.assetExport.status !== "ok") {
-    findings.push(unreadableFinding(3, "high", data.assetExport, "POST /assets/export", "the asset inventory per network and the expected network ranges"));
-    findings.push(unreadableFinding(16, "medium", data.assetExport, "POST /assets/export", "the asset tag coverage report from the Tenable UI"));
+    findings.push(unreadableFinding(3, "high", data.assetExport, "the asset inventory per network and the expected network ranges"));
+    findings.push(unreadableFinding(16, "medium", data.assetExport, "the asset tag coverage report from the Tenable UI"));
   } else {
     const fresh = assets.filter((asset) => {
       const lastSeen = parseTimestampMs(asset.last_seen);
@@ -1705,6 +2782,9 @@ export function assessTenableSensorCoverage(data: TenableSensorCoverageData, opt
       ? data.networks.data.filter((network) => !perNetwork.has(asString(network.name) ?? "") && !perNetwork.has(asString(network.uuid) ?? "")).map((network) => asString(network.name) ?? asString(network.uuid) ?? "network")
       : [];
     const expected = options.expectedAssetCount;
+    const networkNote = data.networks.status === "ok"
+      ? (emptyNetworks.length > 0 ? ` Networks without assets: ${emptyNetworks.slice(0, 10).join(", ")}.` : "")
+      : ` ${describeUnread(data.networks)}, so networks without assets are unknown.`;
     let status: TenableFindingStatus;
     let summary: string;
     if (assets.length === 0) {
@@ -1712,11 +2792,11 @@ export function assessTenableSensorCoverage(data: TenableSensorCoverageData, opt
       summary = "The asset export finished with zero assets, so no asset inventory exists to compare against expected ranges; emptiness fails this control.";
     } else if (expected !== undefined && expected > 0) {
       const coverage = ratio(fresh.length, expected);
-      status = coverage >= 0.95 ? capForPartial("pass", data.assetExport) : "fail";
-      summary = `${fresh.length} assets seen within ${staleAssetDays} days against an expected population of ${expected} (${percent(coverage)} coverage).${undated.length > 0 ? ` ${undated.length} assets have no last_seen date and were not counted.` : ""}${partialNote(data.assetExport)}`;
+      status = coverage >= 0.95 ? capForUnreadable(capForPartial("pass", data.assetExport), data.networks) : "fail";
+      summary = `${fresh.length} assets seen within ${staleAssetDays} days against an expected population of ${expected} (${percent(coverage)} coverage).${undated.length > 0 ? ` ${undated.length} assets have no last_seen date and were not counted.` : ""}${partialNote(data.assetExport)}${unreadableNote([{ dataset: data.networks, consequence: "networks without assets are unknown" }])}`;
     } else {
       status = "manual";
-      summary = `${assets.length} assets exported (${fresh.length} seen within ${staleAssetDays} days, ${stale} stale, ${undated.length} without last_seen). The API does not know the expected network ranges; pass expected_asset_count or compare the per-network counts in the evidence against the authoritative inventory.${emptyNetworks.length > 0 ? ` Networks without assets: ${emptyNetworks.slice(0, 10).join(", ")}.` : ""}`;
+      summary = `${assets.length} assets exported (${fresh.length} seen within ${staleAssetDays} days, ${stale} stale, ${undated.length} without last_seen). The API does not know the expected network ranges; pass expected_asset_count or compare the per-network counts in the evidence against the authoritative inventory.${networkNote}`;
     }
     findings.push(finding(3, status, "high", summary, {
       asset_count: assets.length,
@@ -1724,7 +2804,8 @@ export function assessTenableSensorCoverage(data: TenableSensorCoverageData, opt
       stale_assets: stale,
       undated_assets: undated.length,
       assets_per_network: Object.fromEntries(perNetwork),
-      networks_without_assets: emptyNetworks.slice(0, 50),
+      networks_without_assets: data.networks.status === "ok" ? emptyNetworks.slice(0, 50) : null,
+      networks_status: data.networks.status,
       expected_asset_count: expected ?? null,
       export_status: data.assetExport.data.status,
     }));
@@ -1736,7 +2817,7 @@ export function assessTenableSensorCoverage(data: TenableSensorCoverageData, opt
     let tagSummary: string;
     if (data.tagCategories.status !== "ok") {
       tagStatus = "manual";
-      tagSummary = `GET /tags/categories could not be read (${data.tagCategories.error ?? "unknown"}); a human must confirm the tag taxonomy for compliance scope, business unit, and environment.`;
+      tagSummary = `${describeUnread(data.tagCategories)}; a human must confirm the tag taxonomy for compliance scope, business unit, and environment.`;
     } else if (assets.length === 0) {
       tagStatus = "manual";
       tagSummary = "Zero assets were exported, so tag coverage cannot be measured.";
@@ -1747,23 +2828,23 @@ export function assessTenableSensorCoverage(data: TenableSensorCoverageData, opt
       tagStatus = "fail";
       tagSummary = `${percent(taggedRatio)} of ${assets.length} assets carry at least one tag, below the ${percent(taggedThreshold)} threshold (${categories.length} categories defined).`;
     } else {
-      tagStatus = capForPartial("pass", data.assetExport);
-      tagSummary = `${percent(taggedRatio)} of ${assets.length} assets carry at least one tag across ${categories.length} categories. Confirm the categories cover compliance scope, business unit, and environment.${partialNote(data.assetExport)}`;
+      tagStatus = capForUnreadable(capForPartial("pass", data.assetExport), data.tagValues);
+      tagSummary = `${percent(taggedRatio)} of ${assets.length} assets carry at least one tag across ${categories.length} categories. Confirm the categories cover compliance scope, business unit, and environment.${partialNote(data.assetExport)}${unreadableNote([{ dataset: data.tagValues, consequence: "the tag value population is unknown" }])}`;
     }
     findings.push(finding(16, tagStatus, "medium", tagSummary, {
       asset_count: assets.length,
       tagged_assets: tagged.length,
       tagged_ratio: taggedRatio,
       threshold: taggedThreshold,
-      tag_categories: categories.slice(0, 50),
-      tag_value_count: data.tagValues.status === "ok" ? data.tagValues.data.length : null,
+      tag_categories: data.tagCategories.status === "ok" ? categories.slice(0, 50) : null,
+      tag_value_count: countOrNull(data.tagValues),
     }));
   }
 
   const licensedAgents = asNumber(asObject(asObject(data.serverProperties.data)?.license)?.agents);
   if (data.agents.status !== "ok") {
-    findings.push(unreadableFinding(5, "high", data.agents, "GET /scanners/null/agents", "the agent inventory with status, last connect, and version from Sensors > Agents"));
-    findings.push(unreadableFinding(6, "medium", data.agents, "GET /scanners/null/agents", "the agent group membership report from Sensors > Agents"));
+    findings.push(unreadableFinding(5, "high", data.agents, "the agent inventory with status, last connect, and version from Sensors > Agents"));
+    findings.push(unreadableFinding(6, "medium", data.agents, "the agent group membership report from Sensors > Agents"));
   } else {
     const agents = data.agents.data;
     const offline = agents.filter((agent) => asString(agent.status) === "off");
@@ -1784,7 +2865,7 @@ export function assessTenableSensorCoverage(data: TenableSensorCoverageData, opt
       status = "manual";
       summary = licensedAgents === 0
         ? "Unlicensed: the license reports zero agents and no agents are linked, so agent deployment does not apply to this tenant."
-        : `No agents are linked (pagination.total ${data.agents.total ?? 0}). Confirm whether agent deployment is in scope; emptiness cannot pass this control.`;
+        : `No agents are linked (pagination.total ${data.agents.total ?? "unknown"}). Confirm whether agent deployment is in scope; emptiness cannot pass this control.`;
     } else if (ratio(unhealthy.size, agents.length) > 0.1) {
       status = "fail";
       summary = `${unhealthy.size} of ${agents.length} agents are offline or have not connected in ${agentOfflineDays} days (more than 10%).`;
@@ -1792,13 +2873,14 @@ export function assessTenableSensorCoverage(data: TenableSensorCoverageData, opt
       status = "warn";
       summary = `${agents.length} agents inventoried; ${unhealthy.size} offline or stale, ${undated.length} without last_connect (not counted as healthy), ${outdated.length} below the newest linked version ${newest ?? "unknown"}.${partialNote(data.agents)}`;
     } else {
-      status = "pass";
-      summary = `All ${agents.length} agents connected within ${agentOfflineDays} days and run version ${newest ?? "unknown"}; ${unhealthy.size} offline.`;
+      status = capForUnreadable("pass", data.serverProperties);
+      summary = `All ${agents.length} agents connected within ${agentOfflineDays} days and run version ${newest ?? "unknown"}; ${unhealthy.size} offline.${unreadableNote([{ dataset: data.serverProperties, consequence: "the licensed agent count (license.agents) is unknown" }])}`;
     }
     findings.push(finding(5, status, "high", summary, {
       agent_count: agents.length,
       pagination_total: data.agents.total ?? null,
       licensed_agents: licensedAgents ?? null,
+      server_properties_status: data.serverProperties.status,
       offline_agents: offline.length,
       stale_connect_agents: staleConnect.length,
       undated_agents: undated.length,
@@ -1816,7 +2898,7 @@ export function assessTenableSensorCoverage(data: TenableSensorCoverageData, opt
       groupSummary = "No agents are linked, so there is no agent group organization to evaluate.";
     } else if (data.agentGroups.status !== "ok") {
       groupStatus = "manual";
-      groupSummary = `GET /scanners/null/agent-groups could not be read (${data.agentGroups.error ?? "unknown"}); ${ungrouped.length} of ${agents.length} agents report no group membership.`;
+      groupSummary = `${describeUnread(data.agentGroups)}; ${ungrouped.length} of ${agents.length} agents report no group membership.`;
     } else if (groupCount === 0 || ratio(ungrouped.length, agents.length) > 0.1) {
       groupStatus = "fail";
       groupSummary = `${ungrouped.length} of ${agents.length} agents belong to no agent group (${groupCount} groups defined).`;
@@ -1831,15 +2913,16 @@ export function assessTenableSensorCoverage(data: TenableSensorCoverageData, opt
       agent_count: agents.length,
       agent_group_count: groupCount,
       ungrouped_agents: ungrouped.map((agent) => asString(agent.name) ?? asString(agent.id)).slice(0, 50),
-      groups: data.agentGroups.status === "ok" ? data.agentGroups.data.map((group) => ({ name: asString(group.name), agents_count: asNumber(group.agents_count) ?? null })).slice(0, 50) : [],
+      groups: data.agentGroups.status === "ok" ? data.agentGroups.data.map((group) => ({ name: asString(group.name), agents_count: asNumber(group.agents_count) ?? null })).slice(0, 50) : null,
+      agent_groups_status: data.agentGroups.status,
     }));
   }
 
   const linkedScanners = data.scanners.data.filter((scanner) => asString(scanner.type) !== "local" && asBoolean(scanner.pool) !== true && asBoolean(scanner.group) !== true);
   if (data.scanners.status !== "ok") {
-    findings.push(unreadableFinding(7, "high", data.scanners, "GET /scanners", "the linked scanner list with status, last connect, and Nessus version from Sensors > Nessus Scanners"));
+    findings.push(unreadableFinding(7, "high", data.scanners, "the linked scanner list with status, last connect, and Nessus version from Sensors > Nessus Scanners"));
   } else if (data.scanners.data.length === 0) {
-    findings.push(finding(7, "manual", "high", "GET /scanners returned zero scanners; even cloud scanners were not visible, so the key cannot see sensors. Collect the scanner inventory from Sensors > Nessus Scanners.", { scanner_count: 0 }));
+    findings.push(finding(7, "manual", "high", `${data.scanners.endpoint} returned zero scanners; even cloud scanners were not visible, so the key cannot see sensors. Collect the scanner inventory from Sensors > Nessus Scanners.`, { scanner_count: 0 }));
   } else if (linkedScanners.length === 0) {
     findings.push(finding(7, "manual", "high", `Not applicable to linked appliances: ${data.scanners.data.length} scanner entries are visible but all are Tenable-managed cloud scanners or groups. Confirm the tenant intentionally relies only on cloud scanners.`, {
       scanner_count: data.scanners.data.length,
@@ -1861,16 +2944,17 @@ export function assessTenableSensorCoverage(data: TenableSensorCoverageData, opt
     const unhealthy = new Set([...unlinked, ...off, ...staleConnect].map((scanner) => asString(scanner.name) ?? asString(scanner.id) ?? "scanner"));
     findings.push(finding(
       7,
-      unhealthy.size > 0 ? "fail" : undated.length > 0 || outdated.length > 0 ? "warn" : capForPartial("pass", data.agents),
+      unhealthy.size > 0 ? "fail" : undated.length > 0 || outdated.length > 0 ? "warn" : capForNonAdmin(capForPartial("pass", data.scanners), callerIsAdministrator),
       "high",
       unhealthy.size > 0
         ? `${unhealthy.size} of ${linkedScanners.length} linked scanners are unlinked, off, or have not connected in 24 hours: ${[...unhealthy].slice(0, 10).join(", ")}.`
         : undated.length > 0 || outdated.length > 0
           ? `${linkedScanners.length} linked scanners are on and linked, but ${undated.length} have no last_connect and ${outdated.length} run a version older than ${newest ?? "unknown"}.`
-          : `All ${linkedScanners.length} linked scanners are on, linked, connected within 24 hours, and run version ${newest ?? "unknown"}.${partialNote(data.agents)}`,
+          : `All ${linkedScanners.length} linked scanners are on, linked, connected within 24 hours, and run version ${newest ?? "unknown"}.${partialNote(data.scanners)}${nonAdminNote(callerIsAdministrator)}`,
       {
         linked_scanner_count: linkedScanners.length,
         total_scanner_entries: data.scanners.data.length,
+        caller_is_administrator: callerIsAdministrator,
         unlinked: unlinked.map((scanner) => asString(scanner.name)).slice(0, 50),
         off: off.map((scanner) => asString(scanner.name)).slice(0, 50),
         stale_connect: staleConnect.map((scanner) => asString(scanner.name)).slice(0, 50),
@@ -1882,7 +2966,7 @@ export function assessTenableSensorCoverage(data: TenableSensorCoverageData, opt
   }
 
   if (data.serverProperties.status !== "ok") {
-    findings.push(unreadableFinding(8, "high", data.serverProperties, "GET /server/properties", "the current plugin set date from Settings > About and each scanner's plugin set"));
+    findings.push(unreadableFinding(8, "high", data.serverProperties, "the current plugin set date from Settings > About and each scanner's plugin set"));
   } else {
     const serverPluginMs = parsePluginSetMs(data.serverProperties.data.plugin_set) ?? parsePluginSetMs(data.serverProperties.data.loaded_plugin_set);
     const datedScanners = data.scanners.data.filter((scanner) => parsePluginSetMs(scanner.loaded_plugin_set) !== undefined);
@@ -1900,19 +2984,23 @@ export function assessTenableSensorCoverage(data: TenableSensorCoverageData, opt
     let summary: string;
     if (serverPluginMs === undefined) {
       status = "manual";
-      summary = "GET /server/properties did not expose a parseable plugin_set, so plugin currency cannot be confirmed; collect the plugin set date from Settings > About.";
+      summary = `${data.serverProperties.endpoint} did not expose a parseable plugin_set, so plugin currency cannot be confirmed; collect the plugin set date from Settings > About.`;
     } else if (!serverFresh || staleScanners.length > 0) {
       status = "fail";
       summary = `The container plugin set ${asString(data.serverProperties.data.plugin_set) ?? "unknown"} is ${Math.round((now - serverPluginMs) / 3_600_000)} hours old and ${staleScanners.length} of ${datedScanners.length} scanner entries exposing loaded_plugin_set load a set older than ${pluginStaleHours} hours${staleScanners.length > 0 ? ` (${staleScanners.map((scanner) => asString(scanner.name) ?? asString(scanner.id)).slice(0, 10).join(", ")})` : ""}.`;
     } else if (data.scanners.status !== "ok") {
       status = "manual";
-      summary = `The container plugin set is ${Math.round((now - serverPluginMs) / 3_600_000)} hours old, but GET /scanners failed (${data.scanners.error ?? "unknown"}), so no scanner plugin set could be evaluated; collect each scanner's plugin set from Settings > Sensors.`;
+      summary = `The container plugin set is ${Math.round((now - serverPluginMs) / 3_600_000)} hours old, but ${describeUnread(data.scanners)}, so no scanner plugin set could be evaluated; collect each scanner's plugin set from Settings > Sensors.`;
     } else if (datedScanners.length === 0) {
       status = "manual";
-      summary = `The container plugin set is ${Math.round((now - serverPluginMs) / 3_600_000)} hours old, but ${data.scanners.data.length === 0 ? "GET /scanners returned zero scanners" : `none of the ${data.scanners.data.length} scanner entries exposes a parseable loaded_plugin_set (${undatedScanners.length} scanner instances without one, the rest are cloud scanner pools or groups)`}, so per-scanner plugin currency is not applicable or unverifiable and cannot pass; confirm scanner plugin sets in Settings > Sensors.`;
+      summary = `The container plugin set is ${Math.round((now - serverPluginMs) / 3_600_000)} hours old, but ${data.scanners.data.length === 0 ? `${data.scanners.endpoint} returned zero scanners` : `none of the ${data.scanners.data.length} scanner entries exposes a parseable loaded_plugin_set (${undatedScanners.length} scanner instances without one, the rest are cloud scanner pools or groups)`}, so per-scanner plugin currency is not applicable or unverifiable and cannot pass; confirm scanner plugin sets in Settings > Sensors.`;
     } else if (undatedScanners.length > 0 || staleAgents.length > 0) {
       status = "warn";
       summary = `The container plugin set is ${Math.round((now - serverPluginMs) / 3_600_000)} hours old and ${datedScanners.length} scanner entries load a fresh plugin set, but ${undatedScanners.length} scanner instances expose no parseable plugin set (not counted as current) and ${staleAgents.length} online agents load a plugin set older than ${pluginStaleHours} hours.`;
+    } else if (data.agents.status !== "ok") {
+      // Agent plugin currency is a verdict input; an unreadable agent list cannot pass.
+      status = "warn";
+      summary = `The container plugin set is ${Math.round((now - serverPluginMs) / 3_600_000)} hours old and all ${datedScanners.length} scanner entries exposing loaded_plugin_set load a set newer than ${pluginStaleHours} hours, but ${describeUnread(data.agents)}, so agent plugin currency is unknown and the verdict is capped at warn.`;
     } else {
       status = capForPartial("pass", data.agents);
       summary = `The container plugin set is ${Math.round((now - serverPluginMs) / 3_600_000)} hours old and all ${datedScanners.length} scanner entries exposing loaded_plugin_set (${linkedScanners.length} linked appliances) load a set newer than ${pluginStaleHours} hours.${partialNote(data.agents)}`;
@@ -1920,17 +3008,18 @@ export function assessTenableSensorCoverage(data: TenableSensorCoverageData, opt
     findings.push(finding(8, status, "high", summary, {
       plugin_set: asString(data.serverProperties.data.plugin_set) ?? null,
       plugin_set_age_hours: serverPluginMs === undefined ? null : Math.round((now - serverPluginMs) / 3_600_000),
-      scanner_entries: data.scanners.status === "ok" ? data.scanners.data.length : null,
+      scanner_entries: countOrNull(data.scanners),
       evaluated_scanners: datedScanners.map((scanner) => `${asString(scanner.name)} (${asString(scanner.loaded_plugin_set)})`).slice(0, 50),
       stale_scanners: staleScanners.map((scanner) => `${asString(scanner.name)} (${asString(scanner.loaded_plugin_set)})`).slice(0, 50),
       undated_scanners: undatedScanners.map((scanner) => asString(scanner.name)).slice(0, 50),
-      stale_online_agents: staleAgents.length,
+      stale_online_agents: data.agents.status === "ok" ? staleAgents.length : null,
+      agents_status: data.agents.status,
       threshold_hours: pluginStaleHours,
     }));
   }
 
   if (data.networks.status !== "ok") {
-    findings.push(unreadableFinding(9, "medium", data.networks, "GET /networks", "the network object list with assigned scanners from Settings > Sensors > Networks"));
+    findings.push(unreadableFinding(9, "medium", data.networks, "the network object list with assigned scanners from Settings > Sensors > Networks"));
   } else {
     const networks = data.networks.data;
     const withoutScanners = networks.filter((network) => asNumber(network.scanner_count) === 0);
@@ -1940,7 +3029,7 @@ export function assessTenableSensorCoverage(data: TenableSensorCoverageData, opt
       networks.length === 0 ? "manual" : withoutScanners.length > 0 ? "fail" : unknownCount.length > 0 ? "warn" : capForPartial("pass", data.networks),
       "medium",
       networks.length === 0
-        ? "GET /networks returned zero network objects; the default network should always exist, so the view is incomplete. Collect the network list from Settings > Sensors > Networks."
+        ? `${data.networks.endpoint} returned zero network objects; the default network should always exist, so the view is incomplete. Collect the network list from Settings > Sensors > Networks.`
         : withoutScanners.length > 0
           ? `${withoutScanners.length} of ${networks.length} network objects have no assigned scanners: ${withoutScanners.map((network) => asString(network.name)).slice(0, 10).join(", ")}.`
           : unknownCount.length > 0
@@ -1965,6 +3054,7 @@ export function assessTenableSensorCoverage(data: TenableSensorCoverageData, opt
     ...datasetErrors("tag_categories", data.tagCategories),
     ...datasetErrors("tag_values", data.tagValues),
     ...datasetErrors("asset_export", data.assetExport),
+    ...datasetErrors("users", data.users),
     ...datasetErrors("sc_scanners", data.scScanners),
     ...datasetErrors("sc_feed", data.scFeed),
   ];
@@ -1973,13 +3063,27 @@ export function assessTenableSensorCoverage(data: TenableSensorCoverageData, opt
     title: "Tenable sensor and asset coverage",
     category: "sensor_coverage",
     summary: {
-      exported_assets: assets.length,
-      agent_count: data.agents.data.length,
-      scanner_entries: data.scanners.data.length,
-      linked_scanners: linkedScanners.length,
-      network_count: data.networks.data.length,
-      tag_categories: data.tagCategories.data.length,
+      exported_assets: data.assetExport.status === "ok" ? assets.length : null,
+      agent_count: countOrNull(data.agents),
+      scanner_entries: countOrNull(data.scanners),
+      linked_scanners: data.scanners.status === "ok" ? linkedScanners.length : null,
+      network_count: countOrNull(data.networks),
+      tag_categories: countOrNull(data.tagCategories),
+      caller_is_administrator: callerIsAdministrator,
       ...statusCounts(findings),
+      collection: collectionSummary({
+        server_properties: data.serverProperties,
+        scanners: data.scanners,
+        agents: data.agents,
+        agent_groups: data.agentGroups,
+        networks: data.networks,
+        tag_categories: data.tagCategories,
+        tag_values: data.tagValues,
+        asset_export: data.assetExport,
+        users: data.users,
+        sc_scanners: data.scScanners,
+        sc_feed: data.scFeed,
+      }),
     },
     findings,
     errors,
@@ -1988,7 +3092,7 @@ export function assessTenableSensorCoverage(data: TenableSensorCoverageData, opt
 
 function assessSecurityCenterScanners(scanners: TenableDataset<JsonRecord[]>, feed: TenableDataset<JsonRecord>, now: number, pluginStaleHours: number): TenableFinding {
   if (scanners.status !== "ok") {
-    return unreadableFinding(7, "high", scanners, "GET /rest/scanner", "the Security Center scanner list with status, version, plugin set, and last check-in", "-SC");
+    return unreadableFinding(7, "high", scanners, "the Security Center scanner list with status, version, plugin set, and last check-in", "-SC");
   }
   const enabled = scanners.data.filter((scanner) => asBoolean(scanner.enabled) !== false);
   const unhealthy = enabled.filter((scanner) => asString(scanner.status) !== "1");
@@ -2013,7 +3117,7 @@ function assessSecurityCenterScanners(scanners: TenableDataset<JsonRecord[]>, fe
     summary = `${unhealthy.length} of ${enabled.length} enabled Security Center scanners report a non-working status, ${staleCheckin.length} have not checked in for 24 hours, ${stalePlugins.length} load a plugin set older than ${pluginStaleHours} hours${feedStale === true ? ", and the active plugin feed is marked stale" : ""}.`;
   } else if (undated.length > 0 || feed.status !== "ok") {
     status = "warn";
-    summary = `${enabled.length} enabled Security Center scanners report a working status; ${undated.length} expose no lastCheckinTime${feed.status !== "ok" ? ` and GET /rest/feed could not be read (${feed.error ?? "unknown"})` : ""}.`;
+    summary = `${enabled.length} enabled Security Center scanners report a working status; ${undated.length} expose no lastCheckinTime${feed.status !== "ok" ? ` and ${describeUnread(feed)}` : ""}.`;
   } else {
     status = "pass";
     summary = `All ${enabled.length} enabled Security Center scanners report status 1, checked in within 24 hours, load a plugin set newer than ${pluginStaleHours} hours, and the active plugin feed is not stale.`;
@@ -2046,14 +3150,14 @@ export async function collectTenableAccessControlData(clients: TenableClients, o
   const lookbackDays = clampInteger(options.auditLookbackDays, DEFAULT_AUDIT_LOOKBACK_DAYS, 1, 365);
   const sinceIso = new Date(now - lookbackDays * DAY_MS).toISOString();
   const [users, groups, roles, permissions, accessGroups, credentials, auditLog, scUsers] = await Promise.all([
-    vmList(clients, (client) => client.listUsers()),
-    vmList(clients, (client) => client.listGroups()),
-    vmList(clients, (client) => client.listRoles()),
-    vmList(clients, (client) => client.listPermissions()),
-    vmPaginated(clients, (client) => client.listAccessGroups()),
-    vmPaginated(clients, (client) => client.listCredentials()),
-    vmPaginated(clients, (client) => client.listAuditLogEvents(sinceIso)),
-    scDataset(clients, (client) => client.listUsers()),
+    vmList(clients, "GET /users", (client) => client.listUsers()),
+    vmList(clients, "GET /groups", (client) => client.listGroups()),
+    vmList(clients, "GET /access-control/v1/roles", (client) => client.listRoles()),
+    vmList(clients, "GET /api/v3/access-control/permissions", (client) => client.listPermissions()),
+    vmPaginated(clients, "GET /v2/access-groups", (client) => client.listAccessGroups()),
+    vmPaginated(clients, "GET /credentials", (client) => client.listCredentials()),
+    vmPaginated(clients, "GET /audit-log/v1/events", (client) => client.listAuditLogEvents(sinceIso)),
+    scDataset(clients, "GET /rest/user", (client) => client.listUsers()),
   ]);
   return { users, groups, roles, permissions, accessGroups, credentials, auditLog, scUsers };
 }
@@ -2096,11 +3200,11 @@ export function assessTenableAccessControl(data: TenableAccessControlData, optio
   const findings: TenableFinding[] = [];
 
   if (data.users.status !== "ok") {
-    findings.push(unreadableFinding(10, "high", data.users, "GET /users", "the user list with roles, last login, MFA, and enabled state from Settings > Access Control > Users"));
+    findings.push(unreadableFinding(10, "high", data.users, "the user list with roles, last login, MFA, and enabled state from Settings > Access Control > Users"));
   } else if (data.users.data.length === 0) {
-    findings.push(finding(10, "manual", "high", "GET /users returned zero users, which cannot be a complete view because the calling user must exist; collect the user list from Settings > Access Control > Users.", { user_count: 0 }));
+    findings.push(finding(10, "manual", "high", `${data.users.endpoint} returned zero users, which cannot be a complete view because the calling user must exist; collect the user list from Settings > Access Control > Users.`, { user_count: 0 }));
   } else if (callerIsAdministrator !== true) {
-    findings.push(finding(10, "manual", "high", `Partial view: GET /users returned ${data.users.data.length} users but only uuid, id, username, and email are exposed because the API key does not hold the Administrator [64] role. Role, last login, MFA, and enabled attributes require an Administrator key.`, {
+    findings.push(finding(10, "manual", "high", `Partial view: ${data.users.endpoint} returned ${data.users.data.length} users but only uuid, id, username, and email are exposed because the API key does not hold the Administrator [64] role. Role, last login, MFA, and enabled attributes require an Administrator key.`, {
       user_count: data.users.data.length,
       caller_is_administrator: false,
     }));
@@ -2128,13 +3232,13 @@ export function assessTenableAccessControl(data: TenableAccessControlData, optio
       summary = `${admins.length} enabled Administrator accounts (threshold ${maxAdmins}); ${adminsWithoutStrongAuth.length} UI-permitted administrators lack SAML-only or two-factor enforcement; ${inactive.length} enabled users have not logged in for ${inactiveDays} days.`;
     } else if (enabledUsers.length === 0) {
       status = "manual";
-      summary = `GET /users returned ${users.length} users but none has enabled=true (${missingEnabledFlag.length} expose no enabled flag), so no enabled population exists to verify and the calling user itself is unaccounted for; collect the user list with enabled state, role, and MFA from Settings > Access Control > Users.`;
+      summary = `${data.users.endpoint} returned ${users.length} users but none has enabled=true (${missingEnabledFlag.length} expose no enabled flag), so no enabled population exists to verify and the calling user itself is unaccounted for; collect the user list with enabled state, role, and MFA from Settings > Access Control > Users.`;
     } else if (neverLoggedIn.length > 0 || staleApiKeys.length > 0 || lockedOut.length > 0 || repeatedFailures.length > 0 || missingEnabledFlag.length > 0) {
       status = "warn";
       summary = `${admins.length} administrators all enforce SAML or two-factor and no enabled user is inactive past ${inactiveDays} days, but ${neverLoggedIn.length} enabled users have never logged in (not counted as active), ${staleApiKeys.length} have API keys unused for ${inactiveDays} days, ${lockedOut.length} are locked out, ${repeatedFailures.length} show 5 or more failed logins, and ${missingEnabledFlag.length} expose no enabled flag (not counted as enabled).`;
     } else {
-      status = "pass";
-      summary = `${enabledUsers.length} enabled users, ${admins.length} administrators (threshold ${maxAdmins}) all enforcing SAML-only or two-factor authentication, none inactive past ${inactiveDays} days.`;
+      status = capForUnreadable("pass", data.roles);
+      summary = `${enabledUsers.length} enabled users, ${admins.length} administrators (threshold ${maxAdmins}) all enforcing SAML-only or two-factor authentication, none inactive past ${inactiveDays} days.${unreadableNote([{ dataset: data.roles, consequence: "custom roles are unknown" }])}`;
     }
     findings.push(finding(10, status, "high", summary, {
       user_count: users.length,
@@ -2153,14 +3257,15 @@ export function assessTenableAccessControl(data: TenableAccessControlData, optio
         return map;
       }, new Map<string, number>())),
       custom_roles: data.roles.status === "ok" ? data.roles.data.filter((role) => asString(role.type) === "CUSTOM").map((role) => asString(role.name)).slice(0, 50) : null,
+      roles_status: data.roles.status,
       max_admins: maxAdmins,
     }));
   }
 
   if (data.permissions.status !== "ok") {
-    findings.push(unreadableFinding(11, "high", data.permissions, "GET /api/v3/access-control/permissions", "the access control permission list (Settings > Access Control > Permissions) and any legacy access groups"));
+    findings.push(unreadableFinding(11, "high", data.permissions, "the access control permission list (Settings > Access Control > Permissions) and any legacy access groups"));
   } else if (data.permissions.data.length === 0) {
-    findings.push(finding(11, "manual", "high", "GET /api/v3/access-control/permissions returned zero permissions, but Tenable always generates administrator permissions, so the view is incomplete; collect the permission list from Settings > Access Control > Permissions.", { permission_count: 0 }));
+    findings.push(finding(11, "manual", "high", `${data.permissions.endpoint} returned zero permissions, but Tenable always generates administrator permissions, so the view is incomplete; collect the permission list from Settings > Access Control > Permissions.`, { permission_count: 0 }));
   } else {
     const permissions = data.permissions.data;
     const broad = permissions.filter((permission) => {
@@ -2175,28 +3280,29 @@ export function assessTenableAccessControl(data: TenableAccessControlData, optio
     const legacyAccessGroups = data.accessGroups.status === "ok" ? data.accessGroups.data.filter((group) => asBoolean(group.all_assets) !== true) : [];
     findings.push(finding(
       11,
-      broad.length > 0 ? "fail" : legacyAccessGroups.length > 0 || data.accessGroups.status !== "ok" ? "warn" : capForNonAdmin(capForPartial("pass", data.accessGroups), callerIsAdministrator),
+      broad.length > 0 ? "fail" : legacyAccessGroups.length > 0 || data.accessGroups.status !== "ok" ? "warn" : capForNonAdmin(capForUnreadable(capForPartial("pass", data.accessGroups), data.groups), callerIsAdministrator),
       "high",
       broad.length > 0
         ? `${broad.length} of ${permissions.length} permissions grant every user (AllUsers or the tenant-wide All Users group ${ALL_USERS_GROUP_UUID}) write-style actions (CanEdit, CanScan, or CanUse) on all assets, objects, or tags: ${broad.map((permission) => asString(permission.name)).slice(0, 10).join(", ")}. Narrow these to specific groups and tags.`
         : legacyAccessGroups.length > 0
           ? `${permissions.length} permissions follow least privilege for AllUsers, but ${legacyAccessGroups.length} deprecated access groups still exist and should be migrated to permissions.`
           : data.accessGroups.status !== "ok"
-            ? `${permissions.length} permissions follow least privilege for AllUsers, but GET /v2/access-groups could not be read (${data.accessGroups.error ?? "unreadable"}), so legacy access groups are unverified and the verdict is capped at warn.`
-            : `${permissions.length} permissions are defined and none grants AllUsers write-style actions on all assets; no legacy access groups remain.${partialNote(data.accessGroups)}${nonAdminNote(callerIsAdministrator)}`,
+            ? `${permissions.length} permissions follow least privilege for AllUsers, but ${describeUnread(data.accessGroups)}, so legacy access groups are unverified and the verdict is capped at warn.`
+            : `${permissions.length} permissions are defined and none grants AllUsers write-style actions on all assets; no legacy access groups remain.${partialNote(data.accessGroups)}${unreadableNote([{ dataset: data.groups, consequence: "user group membership is unknown" }])}${nonAdminNote(callerIsAdministrator)}`,
       {
         permission_count: permissions.length,
         broad_permissions: broad.map((permission) => asString(permission.name)).slice(0, 50),
-        legacy_access_groups: legacyAccessGroups.map((group) => asString(group.name)).slice(0, 50),
-        user_groups: data.groups.status === "ok" ? data.groups.data.length : null,
+        legacy_access_groups: data.accessGroups.status === "ok" ? legacyAccessGroups.map((group) => asString(group.name)).slice(0, 50) : null,
+        access_groups_status: data.accessGroups.status,
+        user_groups: countOrNull(data.groups),
       },
     ));
   }
 
   if (data.credentials.status !== "ok") {
-    findings.push(unreadableFinding(12, "medium", data.credentials, "GET /credentials", "the managed credential inventory with types, owners, and last use from Settings > Credentials"));
+    findings.push(unreadableFinding(12, "medium", data.credentials, "the managed credential inventory with types, owners, and last use from Settings > Credentials"));
   } else if (data.credentials.data.length === 0) {
-    findings.push(finding(12, "manual", "medium", "GET /credentials returned zero managed credentials (pagination.total 0). Scan-embedded credentials are not listed by the API, so a human must confirm how scan credentials are managed and rotated.", { credential_count: 0 }));
+    findings.push(finding(12, "manual", "medium", `${data.credentials.endpoint} returned zero managed credentials (pagination.total 0). Scan-embedded credentials are not listed by the API, so a human must confirm how scan credentials are managed and rotated.`, { credential_count: 0 }));
   } else {
     const credentials = data.credentials.data;
     const unused = credentials.filter((credential) => asNumber(asObject(credential.last_used_by)?.id) === undefined);
@@ -2231,7 +3337,7 @@ export function assessTenableAccessControl(data: TenableAccessControlData, optio
   }
 
   if (data.auditLog.status !== "ok") {
-    findings.push(unreadableFinding(18, "medium", data.auditLog, "GET /audit-log/v1/events", `the activity log for the last ${lookbackDays} days from Settings > Activity Logs (Administrator role required)`));
+    findings.push(unreadableFinding(18, "medium", data.auditLog, `the activity log for the last ${lookbackDays} days from Settings > Activity Logs (Administrator role required)`));
   } else {
     const events = data.auditLog.data;
     const deletes = events.filter((event) => asString(event.crud) === "d");
@@ -2288,12 +3394,22 @@ export function assessTenableAccessControl(data: TenableAccessControlData, optio
     title: "Tenable access control",
     category: "access_control",
     summary: {
-      user_count: data.users.data.length,
-      permission_count: data.permissions.data.length,
-      credential_count: data.credentials.data.length,
-      audit_events: data.auditLog.data.length,
-      caller_is_administrator: callerIsAdministrator ?? null,
+      user_count: countOrNull(data.users),
+      permission_count: countOrNull(data.permissions),
+      credential_count: countOrNull(data.credentials),
+      audit_events: countOrNull(data.auditLog),
+      caller_is_administrator: callerIsAdministrator,
       ...statusCounts(findings),
+      collection: collectionSummary({
+        users: data.users,
+        groups: data.groups,
+        roles: data.roles,
+        permissions: data.permissions,
+        access_groups: data.accessGroups,
+        credentials: data.credentials,
+        audit_log: data.auditLog,
+        sc_users: data.scUsers,
+      }),
     },
     findings,
     errors,
@@ -2302,7 +3418,7 @@ export function assessTenableAccessControl(data: TenableAccessControlData, optio
 
 function assessSecurityCenterUsers(users: TenableDataset<JsonRecord[]>, now: number, inactiveDays: number): TenableFinding {
   if (users.status !== "ok") {
-    return unreadableFinding(10, "high", users, "GET /rest/user", "the Security Center user list with roles, last login, and lock state", "-SC");
+    return unreadableFinding(10, "high", users, "the Security Center user list with roles, last login, and lock state", "-SC");
   }
   const active = users.data.filter((user) => asString(user.status) === "0");
   const admins = active.filter((user) => asString(asObject(user.role)?.id) === "1" || /administrator/i.test(asString(asObject(user.role)?.name) ?? ""));
@@ -2350,13 +3466,13 @@ export async function collectTenableVulnerabilityData(clients: TenableClients, o
   const lookbackDays = clampInteger(options.vulnLookbackDays, DEFAULT_VULN_LOOKBACK_DAYS, 1, 730);
   const maxChunks = clampInteger(options.maxChunks, DEFAULT_MAX_CHUNKS, 1, 1000);
   const [vulnExportJobs, assetExportJobs, users] = await Promise.all([
-    vmList(clients, (client) => client.listVulnExportJobs()),
-    vmList(clients, (client) => client.listAssetExportJobs()),
-    vmList(clients, (client) => client.listUsers()),
+    vmList(clients, "GET /vulns/export/status", (client) => client.listVulnExportJobs()),
+    vmList(clients, "GET /assets/export/status", (client) => client.listAssetExportJobs()),
+    vmList(clients, "GET /users", (client) => client.listUsers()),
   ]);
   const [vulnExport, assetExport] = await Promise.all([
-    vmExport(clients, (client) => client.exportVulnerabilities(Math.floor((now - lookbackDays * DAY_MS) / 1000), maxChunks)),
-    vmExport(clients, (client) => client.exportAssets(maxChunks)),
+    vmExport(clients, "POST /vulns/export", (client) => client.exportVulnerabilities(Math.floor((now - lookbackDays * DAY_MS) / 1000), maxChunks)),
+    vmExport(clients, "POST /assets/export", (client) => client.exportAssets(maxChunks)),
   ]);
   return { vulnExport, assetExport, vulnExportJobs, assetExportJobs, users };
 }
@@ -2377,8 +3493,8 @@ export function assessTenableVulnerabilityManagement(data: TenableVulnerabilityD
   const populationNote = `${partialNote(data.assetExport)}${nonAdminNote(callerIsAdministrator)}`;
 
   if (data.vulnExport.status !== "ok") {
-    findings.push(unreadableFinding(14, "high", data.vulnExport, "POST /vulns/export", "the VPR distribution of open findings from Findings > Vulnerabilities"));
-    findings.push(unreadableFinding(15, "high", data.vulnExport, "POST /vulns/export", "the open finding age by severity and remediation times from Findings > Vulnerabilities"));
+    findings.push(unreadableFinding(14, "high", data.vulnExport, "the VPR distribution of open findings from Findings > Vulnerabilities"));
+    findings.push(unreadableFinding(15, "high", data.vulnExport, "the open finding age by severity and remediation times from Findings > Vulnerabilities"));
   } else {
     const records = data.vulnExport.data.records;
     const open = records.filter((record) => ["OPEN", "REOPENED"].includes(asString(record.state)?.toUpperCase() ?? ""));
@@ -2395,7 +3511,7 @@ export function assessTenableVulnerabilityManagement(data: TenableVulnerabilityD
     let vprSummary: string;
     if (assetCount === undefined) {
       vprStatus = "manual";
-      vprSummary = `The vulnerability export finished with ${open.length} open findings but the asset export failed (${data.assetExport.error ?? "unknown"}), so the population cannot be validated.`;
+      vprSummary = `The vulnerability export finished with ${open.length} open findings but ${describeUnread(data.assetExport)}, so the asset population cannot be validated.`;
     } else if (assetCount === 0) {
       vprStatus = "manual";
       vprSummary = "The asset export returned zero assets, so an empty vulnerability set does not demonstrate VPR-based prioritization.";
@@ -2404,7 +3520,7 @@ export function assessTenableVulnerabilityManagement(data: TenableVulnerabilityD
       vprSummary = `No open findings were exported for the last ${lookbackDays} days across ${assetCount} assets, so VPR usage cannot be evaluated; confirm scans are producing findings.`;
     } else if (data.vulnExport.truncated) {
       vprStatus = "warn";
-      vprSummary = `Partial export: ${data.vulnExport.data.fetchedChunks} of ${data.vulnExport.data.totalChunks} chunks were downloaded, covering ${open.length} open findings; ${percent(vprCoverage)} of rated findings carry a VPR score.`;
+      vprSummary = `Partial export: ${data.vulnExport.data.fetchedChunks ?? "unknown"} of ${data.vulnExport.data.totalChunks ?? "unknown"} chunks were downloaded (${data.vulnExport.error ?? "partial"}), covering ${open.length} open findings; ${percent(vprCoverage)} of rated findings carry a VPR score.`;
     } else if (vprCoverage < 0.5) {
       vprStatus = "warn";
       vprSummary = `Only ${percent(vprCoverage)} of ${rated.length} rated open findings carry a VPR score, so VPR-based prioritization has limited coverage.`;
@@ -2422,7 +3538,7 @@ export function assessTenableVulnerabilityManagement(data: TenableVulnerabilityD
       vpr_high_open: vprHigh.length,
       asset_count: assetCount ?? null,
       export_status: data.vulnExport.data.status,
-      chunks: `${data.vulnExport.data.fetchedChunks}/${data.vulnExport.data.totalChunks}`,
+      chunks: chunkRatio(data.vulnExport),
     }));
 
     const overdue: Record<string, number> = { critical: 0, high: 0, medium: 0, low: 0 };
@@ -2448,10 +3564,10 @@ export function assessTenableVulnerabilityManagement(data: TenableVulnerabilityD
       slaStatus = "manual";
       slaSummary = assetCount === 0
         ? "The asset export returned zero assets, so zero overdue findings does not demonstrate SLA compliance."
-        : `The asset export failed (${data.assetExport.error ?? "unknown"}), so the finding population cannot be validated.`;
+        : `${describeUnread(data.assetExport)}, so the finding population cannot be validated.`;
     } else if (data.vulnExport.truncated) {
       slaStatus = "warn";
-      slaSummary = `Partial export (${data.vulnExport.data.fetchedChunks} of ${data.vulnExport.data.totalChunks} chunks): ${overdueTotal} of ${open.length} retrieved open findings exceed their SLA, but unseen chunks may contain more.`;
+      slaSummary = `Partial export (${data.vulnExport.data.fetchedChunks ?? "unknown"} of ${data.vulnExport.data.totalChunks ?? "unknown"} chunks; ${data.vulnExport.error ?? "partial"}): ${overdueTotal} of ${open.length} retrieved open findings exceed their SLA, but unseen chunks may contain more.`;
     } else if (overdue.critical > 0 || overdue.high > 0) {
       slaStatus = "fail";
       slaSummary = `${overdue.critical} critical findings exceed ${sla.critical} days and ${overdue.high} high findings exceed ${sla.high} days (${overdue.medium} medium and ${overdue.low} low also overdue) out of ${open.length} open findings.`;
@@ -2473,14 +3589,21 @@ export function assessTenableVulnerabilityManagement(data: TenableVulnerabilityD
       fixed_findings_in_window: fixed.length,
       mttr_days: mttrDays,
       asset_count: assetCount ?? null,
-      chunks: `${data.vulnExport.data.fetchedChunks}/${data.vulnExport.data.totalChunks}`,
+      chunks: chunkRatio(data.vulnExport),
     }));
   }
 
   if (data.vulnExportJobs.status !== "ok" && data.assetExportJobs.status !== "ok") {
-    findings.push(unreadableFinding(19, "medium", data.vulnExportJobs, "GET /vulns/export/status", "evidence of scheduled exports or report schedules from the Tenable UI (Reports) and integration logs"));
+    const manualEvidence = "evidence of scheduled exports or report schedules from the Tenable UI (Reports) and integration logs";
+    findings.push(data.vulnExportJobs.status === "not_configured"
+      ? unreadableFinding(19, "medium", data.vulnExportJobs, manualEvidence)
+      : finding(19, "manual", "medium", `Unknown: the export job lists could not be read because ${describeUnread(data.vulnExportJobs)} and ${describeUnread(data.assetExportJobs)}. A human must collect ${manualEvidence}.`, {
+        collected: false,
+        vuln_export_jobs: collectionStatusOf(data.vulnExportJobs),
+        asset_export_jobs: collectionStatusOf(data.assetExportJobs),
+      }));
   } else {
-    const ownUuids = new Set([data.vulnExport.data.exportUuid, data.assetExport.data.exportUuid].filter(Boolean));
+    const ownUuids = new Set([data.vulnExport.data.exportUuid, data.assetExport.data.exportUuid].filter((uuid): uuid is string => typeof uuid === "string" && uuid.length > 0));
     const inWindow = (job: JsonRecord): boolean => {
       const created = parseTimestampMs(job.created);
       return created !== undefined && daysBetween(now, created) <= EXPORT_JOB_WINDOW_DAYS;
@@ -2495,24 +3618,25 @@ export function assessTenableVulnerabilityManagement(data: TenableVulnerabilityD
     ].filter((job) => !ownUuids.has(asString(job.uuid) ?? "") && inWindow(job));
     const externalDays = new Set(externalJobs.map((job) => new Date(parseTimestampMs(job.created) ?? 0).toISOString().slice(0, 10)));
     const limitation = `The export job lists include completed jobs only from the previous ${EXPORT_JOB_WINDOW_DAYS} days, so this is a point-in-time signal of export activity, and report schedules are not exposed by the API, so they need a manual check in Reports.`;
+    const unreadJobLists = unreadableNote([{ dataset: data.vulnExportJobs, consequence: "vulnerability export jobs are unobserved" }, { dataset: data.assetExportJobs, consequence: "asset export jobs are unobserved" }]);
     let status: TenableFindingStatus;
     let summary: string;
     if (externalDays.size >= 2) {
-      status = capForNonAdmin("pass", callerIsAdministrator);
-      summary = `${externalJobs.length} export jobs not created by this tool ran on ${externalDays.size} distinct days within the last ${EXPORT_JOB_WINDOW_DAYS} days, indicating recurring automated exports. ${limitation}${nonAdminNote(callerIsAdministrator)}`;
+      status = capForNonAdmin(capForUnreadable("pass", data.vulnExportJobs, data.assetExportJobs), callerIsAdministrator);
+      summary = `${externalJobs.length} export jobs not created by this tool ran on ${externalDays.size} distinct days within the last ${EXPORT_JOB_WINDOW_DAYS} days, indicating recurring automated exports. ${limitation}${unreadJobLists}${nonAdminNote(callerIsAdministrator)}`;
     } else if (externalJobs.length > 0) {
       status = "warn";
-      summary = `${externalJobs.length} export jobs not created by this tool ran within the last ${EXPORT_JOB_WINDOW_DAYS} days, all on one day, so recurring automation is not demonstrated. ${limitation}`;
+      summary = `${externalJobs.length} export jobs not created by this tool ran within the last ${EXPORT_JOB_WINDOW_DAYS} days, all on one day, so recurring automation is not demonstrated. ${limitation}${unreadJobLists}`;
     } else {
       status = "manual";
-      summary = `No export jobs other than this tool's own runs (${ownUuids.size} from this assessment and ${ownShaped.length} matching this tool's export shape) appear within the last ${EXPORT_JOB_WINDOW_DAYS} days, so automated exports are not evident in the observable window; a human must collect the integration or report schedule that distributes results. ${limitation}`;
+      summary = `No export jobs other than this tool's own runs (${ownUuids.size} from this assessment and ${ownShaped.length} matching this tool's export shape) appear within the last ${EXPORT_JOB_WINDOW_DAYS} days, so automated exports are not evident in the observable window; a human must collect the integration or report schedule that distributes results. ${limitation}${unreadJobLists}`;
     }
     findings.push(finding(19, status, "medium", summary, {
       external_export_jobs_in_window: externalJobs.length,
       external_export_days: [...externalDays].sort(),
       window_days: EXPORT_JOB_WINDOW_DAYS,
-      vuln_export_jobs_listed: data.vulnExportJobs.status === "ok" ? data.vulnExportJobs.data.length : null,
-      asset_export_jobs_listed: data.assetExportJobs.status === "ok" ? data.assetExportJobs.data.length : null,
+      vuln_export_jobs_listed: countOrNull(data.vulnExportJobs),
+      asset_export_jobs_listed: countOrNull(data.assetExportJobs),
       excluded_own_exports: [...ownUuids],
       excluded_own_shaped_jobs: ownShaped.map((job) => asString(job.uuid)).slice(0, 50),
     }));
@@ -2523,16 +3647,25 @@ export function assessTenableVulnerabilityManagement(data: TenableVulnerabilityD
     ...datasetErrors("asset_export", data.assetExport),
     ...datasetErrors("vuln_export_jobs", data.vulnExportJobs),
     ...datasetErrors("asset_export_jobs", data.assetExportJobs),
+    ...datasetErrors("users", data.users),
   ];
 
   return {
     title: "Tenable vulnerability management",
     category: "vulnerability_management",
     summary: {
-      exported_findings: data.vulnExport.data.records.length,
+      exported_findings: recordCount(data.vulnExport),
       exported_assets: assetCount ?? null,
       vuln_export_status: data.vulnExport.data.status,
+      caller_is_administrator: callerIsAdministrator,
       ...statusCounts(findings),
+      collection: collectionSummary({
+        vuln_export: data.vulnExport,
+        asset_export: data.assetExport,
+        vuln_export_jobs: data.vulnExportJobs,
+        asset_export_jobs: data.assetExportJobs,
+        users: data.users,
+      }),
     },
     findings,
     errors,
@@ -2548,24 +3681,36 @@ function statusCounts(findings: TenableFinding[]): JsonRecord {
   };
 }
 
+/**
+ * One access probe. A surface that was not configured carries no endpoint and
+ * no count because no request was made; a refused or failed surface names the
+ * request that actually failed and the status that was observed, with count
+ * null; a readable surface reports the count the response exposed, or null
+ * when the response carried no countable collection.
+ */
 async function probeSurface(
   name: string,
   endpoint: string,
   requiredRole: string,
   load: (() => Promise<unknown>) | undefined,
   count?: (value: unknown) => number | undefined,
-): Promise<TenableAccessSurface> {
-  if (!load) return { name, endpoint, requiredRole, status: "not_configured" };
+): Promise<{ surface: TenableAccessSurface; value: unknown }> {
+  if (!load) return { surface: { name, endpoint: null, requiredRole, status: "not_configured", count: null, httpStatus: null }, value: undefined };
   try {
     const value = await load();
-    return { name, endpoint, requiredRole, status: "readable", count: count?.(value) };
+    return { surface: { name, endpoint, requiredRole, status: "readable", count: count?.(value) ?? null, httpStatus: null }, value };
   } catch (error) {
     return {
-      name,
-      endpoint,
-      requiredRole,
-      status: isForbiddenError(error) ? "forbidden" : "not_readable",
-      error: errorMessage(error),
+      surface: {
+        name,
+        endpoint: errorEndpoint(error) ?? endpoint,
+        requiredRole,
+        status: isForbiddenError(error) ? "forbidden" : "not_readable",
+        count: null,
+        httpStatus: errorStatus(error) ?? null,
+        error: errorMessage(error),
+      },
+      value: undefined,
     };
   }
 }
@@ -2573,14 +3718,19 @@ async function probeSurface(
 const listCount = (value: unknown): number | undefined => (Array.isArray(value) ? value.length : undefined);
 const pageCount = (value: unknown): number | undefined => asNumber(asObject(value)?.total) ?? listCount(asObject(value)?.items);
 
+function describeSurfaceFailure(surface: TenableAccessSurface): string {
+  const observed = surface.httpStatus === null ? "" : ` with HTTP ${surface.httpStatus}`;
+  return `${surface.endpoint} ${surface.status === "forbidden" ? "refused the API key" : "failed"}${observed}: ${surface.error ?? "no error detail"}`;
+}
+
 export async function checkTenableAccess(clients: TenableClients): Promise<TenableAccessCheckResult> {
   const vm = clients.vm;
   const sc = clients.securityCenter;
   const usersProbe = await probeSurface("users", "GET /users", "Basic (full attributes need Administrator)", vm ? () => vm.listUsers() : undefined, listCount);
-  const users = vm && usersProbe.status === "readable" ? await vm.listUsers().catch(() => []) : [];
-  const callerIsAdministrator = users.length > 0 ? users.some((user) => asNumber(user.permissions) !== undefined) : undefined;
+  const users = usersProbe.surface.status === "readable" ? asRecords(usersProbe.value) : [];
+  const callerIsAdministrator = users.length > 0 ? users.some((user) => asNumber(user.permissions) !== undefined) : null;
 
-  const surfaces: TenableAccessSurface[] = [
+  const probes = [
     await probeSurface("server_properties", "GET /server/properties", "Basic", vm ? () => vm.getServerProperties() : undefined, () => 1),
     await probeSurface("scans", "GET /scans", "Basic with Can View on scans", vm ? () => vm.listScans() : undefined, listCount),
     await probeSurface("policies", "GET /policies", "Standard", vm ? () => vm.listPolicies() : undefined, listCount),
@@ -2605,12 +3755,24 @@ export async function checkTenableAccess(clients: TenableClients): Promise<Tenab
     await probeSurface("sc_scanners", "GET /rest/scanner", "Security Center administrator for full fields", sc ? () => sc.listScanners() : undefined, listCount),
     await probeSurface("sc_users", "GET /rest/user", "Security Center administrator or security manager", sc ? () => sc.listUsers() : undefined, listCount),
   ];
+  const surfaces = probes.map((probe) => probe.surface);
 
   const configured = surfaces.filter((surface) => surface.status !== "not_configured");
   const readable = configured.filter((surface) => surface.status === "readable");
   const forbidden = configured.filter((surface) => surface.status === "forbidden");
+  const failed = configured.filter((surface) => surface.status === "not_readable");
+  const observedRefusals = [...new Set(forbidden.map((surface) => surface.httpStatus).filter((code): code is number => code !== null))].sort();
   const status = configured.length > 0 && readable.length === configured.length && callerIsAdministrator !== false ? "healthy" : "limited";
   const platform = [vm ? `Tenable Vulnerability Management ${vm.getConfig().baseUrl}${vm.getConfig().fedramp ? " (FedRAMP)" : ""}` : undefined, sc ? `Tenable Security Center ${sc.getConfig().baseUrl}` : undefined].filter(Boolean).join(" + ");
+  const roleNote = usersProbe.surface.status === "not_configured"
+    ? "Caller role could not be determined because no Tenable Vulnerability Management tenant is configured."
+    : usersProbe.surface.status !== "readable"
+      ? `Caller role could not be determined because ${describeSurfaceFailure(usersProbe.surface)}.`
+      : callerIsAdministrator === null
+        ? `Caller role could not be determined because ${usersProbe.surface.endpoint} returned zero users.`
+        : callerIsAdministrator
+          ? `${usersProbe.surface.endpoint} exposed full user attributes, so the API key holds the Administrator [64] role.`
+          : `${usersProbe.surface.endpoint} exposed only uuid, id, username, and email, so the API key is below Administrator; scans, users, permissions, and audit log views will be partial.`;
 
   return {
     status,
@@ -2619,25 +3781,46 @@ export async function checkTenableAccess(clients: TenableClients): Promise<Tenab
     surfaces,
     notes: [
       `Platform: ${platform}.`,
-      `${readable.length}/${configured.length} configured audit surfaces are readable; ${forbidden.length} refused the API key (401/403).`,
-      callerIsAdministrator === undefined
-        ? "Caller role could not be determined because GET /users was not readable."
-        : callerIsAdministrator
-          ? "GET /users exposed full user attributes, so the API key holds the Administrator [64] role."
-          : "GET /users exposed only uuid, id, username, and email, so the API key is below Administrator; scans, users, permissions, and audit log views will be partial.",
-      ...forbidden.map((surface) => `${surface.name} needs the ${surface.requiredRole} role: ${surface.error ?? "forbidden"}`),
+      `${readable.length}/${configured.length} configured audit surfaces are readable; ${forbidden.length} refused the API key${observedRefusals.length > 0 ? ` (HTTP ${observedRefusals.join(", ")})` : ""} and ${failed.length} failed for other reasons.`,
+      roleNote,
+      // "requires role Basic ...;" never "needs the Basic role:" nor "role ...credentials:": Basic is
+      // a Tenable role name and an authentication scheme, so the scrub reads the plain word after
+      // it as its value, and a role phrase ending in a credential word before a colon is a pair.
+      ...forbidden.map((surface) => `${surface.name} requires role ${surface.requiredRole}; ${describeSurfaceFailure(surface)}`),
+      ...failed.map((surface) => `${surface.name} could not be read: ${describeSurfaceFailure(surface)}`),
     ],
     recommendedNextStep: status === "healthy"
       ? "Run tenable_assess_scan_program, tenable_assess_sensor_coverage, tenable_assess_access_control, tenable_assess_vulnerability_management, or tenable_export_audit_bundle."
-      : "Generate API keys for an Administrator [64] user (Settings > My Account > API Keys) so every surface is readable, or accept manual verdicts for refused surfaces.",
+      : forbidden.length > 0 || callerIsAdministrator === false
+        ? "Generate API keys for an Administrator [64] user (Settings > My Account > API Keys) so every surface is readable, or accept manual verdicts for refused surfaces."
+        : "Investigate the failed surfaces (the base URL, a proxy or portal answering in place of the API, or a transport fault) before relying on the assessments; findings that read them are demoted to warn or manual.",
   };
+}
+
+/** A count is only ever a number for a readable surface; anything else renders as what it is. */
+function renderSurfaceCount(surface: TenableAccessSurface): string {
+  if (surface.count !== null) return String(surface.count);
+  switch (surface.status) {
+    case "readable":
+      return "unknown";
+    case "not_configured":
+      return "n/a";
+    case "forbidden":
+    case "not_readable":
+      return "unread";
+    default: {
+      const exhaustive: never = surface.status;
+      throw new Error(`Unhandled surface status: ${String(exhaustive)}`);
+    }
+  }
 }
 
 function formatAccessCheckText(result: TenableAccessCheckResult): string {
   const rows = result.surfaces.map((surface) => [
     surface.name,
     surface.status,
-    surface.count === undefined ? "-" : String(surface.count),
+    renderSurfaceCount(surface),
+    surface.httpStatus === null ? "" : String(surface.httpStatus),
     surface.requiredRole,
     surface.error ? surface.error.replace(/\s+/g, " ").slice(0, 80) : "",
   ]);
@@ -2646,10 +3829,24 @@ function formatAccessCheckText(result: TenableAccessCheckResult): string {
     "",
     ...result.notes,
     "",
-    formatTable(["Surface", "Status", "Count", "Required role", "Note"], rows),
+    formatTable(["Surface", "Status", "Count", "HTTP", "Required role", "Note"], rows),
     "",
     `Next: ${result.recommendedNextStep}`,
   ].join("\n");
+}
+
+function renderSummaryValue(value: unknown): string {
+  if (value === null || value === undefined) return "unknown";
+  if (typeof value === "number") return String(Number(value.toFixed(2)));
+  return String(value);
+}
+
+function renderCollectionLine(name: string, status: unknown): string {
+  const record = asObject(status) ?? {};
+  const detail = record.status === "ok"
+    ? `${renderSummaryValue(record.seen)} seen of ${renderSummaryValue(record.total)}${record.truncated === true ? ", truncated" : ""}`
+    : `${String(record.status)}${record.http_status !== null && record.http_status !== undefined ? ` (HTTP ${String(record.http_status)})` : ""}`;
+  return `  - ${name}: ${detail}`;
 }
 
 function formatAssessmentText(result: TenableAssessmentResult): string {
@@ -2661,7 +3858,12 @@ function formatAssessmentText(result: TenableAssessmentResult): string {
     item.summary,
   ]);
   const summary = Object.entries(result.summary)
-    .map(([key, value]) => `- ${key}: ${typeof value === "number" ? Number(value.toFixed(2)) : String(value)}`)
+    .flatMap(([key, value]) => {
+      if (key === "collection") {
+        return ["- collection:", ...Object.entries(asObject(value) ?? {}).map(([name, status]) => renderCollectionLine(name, status))];
+      }
+      return [`- ${key}: ${renderSummaryValue(value)}`];
+    })
     .join("\n");
   return [
     result.title,
@@ -2732,7 +3934,7 @@ function buildQuickReference(): string {
   return [
     "# Tenable Audit Bundle Quick Reference",
     "",
-    "- `core_data/` contains raw Tenable API responses used during this assessment (credentials are never written).",
+    `- \`core_data/\` contains the Tenable API responses used during this assessment. API keys are never written: the configured access and secret keys are removed from every file in every encoded form; policy details are projected to uuid, name, settings, and plugins; scanner linking keys, registration codes, and license blocks are replaced with ${CREDENTIAL_REDACTION_MARKER}; every property whose name denotes a credential is redacted; inside every string value, URL userinfo, credential-named or token-shaped query pairs such as ?token=, token-in-path webhook URLs, header, cookie, and scheme carriers, and private PEM blocks are replaced while the scheme, host, and path are kept; error strings are scrubbed and non-JSON error bodies are described by status and length only.`,
     "- `analysis/` contains normalized findings and per-category summaries.",
     "- `compliance/` contains the executive summary, unified matrix, and per-framework reports.",
     "- `_errors.log` appears only when some reads failed or returned partial data; the affected controls carry manual or warn verdicts.",
@@ -2753,6 +3955,8 @@ export async function exportTenableAuditBundle(
   options: TenableAssessmentOptions = {},
 ): Promise<TenableAuditBundleResult> {
   const config = clients.config;
+  // Guard 2 for every written file: the configured keys in every encoded form.
+  const secrets = configuredTenableSecrets(config);
   const access = await checkTenableAccess(clients);
   const scanProgramData = await collectTenableScanProgramData(clients, options);
   const sensorData = await collectTenableSensorCoverageData(clients, options);
@@ -2770,60 +3974,68 @@ export async function exportTenableAuditBundle(
   const hostLabel = config.vm ? new URL(config.vm.baseUrl).hostname : new URL(config.securityCenter?.baseUrl ?? DEFAULT_CLOUD_URL).hostname;
   const outputDir = await nextAvailableAuditDir(outputRoot, `${safeDirName(hostLabel)}-audit-bundle`);
 
+  // Every list or object that was refused, failed, or never requested is written
+  // as a not-collected marker instead of an empty inventory; a readable but empty
+  // list stays []. Readable data was redacted at collection time and is scrubbed
+  // once more here before it touches disk.
+  const exportRecords = (result: TenableExportResult) => result.records;
   const coreData: Array<[string, unknown]> = [
     ["core_data/access_check.json", access],
-    ["core_data/scans.json", scanProgramData.scans.data],
-    ["core_data/policies.json", scanProgramData.policies.data],
-    ["core_data/policy_details.json", scanProgramData.policyDetails.data],
-    ["core_data/scan_templates.json", scanProgramData.templates.data],
-    ["core_data/exclusions.json", scanProgramData.exclusions.data],
-    ["core_data/target_groups.json", scanProgramData.targetGroups.data],
-    ["core_data/assets_export.json", sensorData.assetExport.data.records],
-    ["core_data/server_properties.json", sensorData.serverProperties.data],
-    ["core_data/scanners.json", sensorData.scanners.data],
-    ["core_data/agents.json", sensorData.agents.data],
-    ["core_data/agent_groups.json", sensorData.agentGroups.data],
-    ["core_data/networks.json", sensorData.networks.data],
-    ["core_data/tag_categories.json", sensorData.tagCategories.data],
-    ["core_data/tag_values.json", sensorData.tagValues.data],
-    ["core_data/users.json", accessData.users.data],
-    ["core_data/groups.json", accessData.groups.data],
-    ["core_data/roles.json", accessData.roles.data],
-    ["core_data/permissions.json", accessData.permissions.data],
-    ["core_data/access_groups.json", accessData.accessGroups.data],
-    ["core_data/credentials.json", accessData.credentials.data],
-    ["core_data/audit_log_events.json", accessData.auditLog.data],
-    ["core_data/vulns_export.json", vulnData.vulnExport.data.records],
-    ["core_data/export_jobs.json", { vulns: vulnData.vulnExportJobs.data, assets: vulnData.assetExportJobs.data }],
+    ["core_data/scans.json", collectedOrMarker(scanProgramData.scans)],
+    ["core_data/policies.json", collectedOrMarker(scanProgramData.policies)],
+    ["core_data/policy_details.json", collectedOrMarker(scanProgramData.policyDetails)],
+    ["core_data/scan_templates.json", collectedOrMarker(scanProgramData.templates)],
+    ["core_data/exclusions.json", collectedOrMarker(scanProgramData.exclusions)],
+    ["core_data/target_groups.json", collectedOrMarker(scanProgramData.targetGroups)],
+    ["core_data/assets_export.json", collectedOrMarker(sensorData.assetExport, exportRecords)],
+    ["core_data/server_properties.json", collectedOrMarker(sensorData.serverProperties)],
+    ["core_data/scanners.json", collectedOrMarker(sensorData.scanners)],
+    ["core_data/agents.json", collectedOrMarker(sensorData.agents)],
+    ["core_data/agent_groups.json", collectedOrMarker(sensorData.agentGroups)],
+    ["core_data/networks.json", collectedOrMarker(sensorData.networks)],
+    ["core_data/tag_categories.json", collectedOrMarker(sensorData.tagCategories)],
+    ["core_data/tag_values.json", collectedOrMarker(sensorData.tagValues)],
+    ["core_data/users.json", collectedOrMarker(accessData.users)],
+    ["core_data/groups.json", collectedOrMarker(accessData.groups)],
+    ["core_data/roles.json", collectedOrMarker(accessData.roles)],
+    ["core_data/permissions.json", collectedOrMarker(accessData.permissions)],
+    ["core_data/access_groups.json", collectedOrMarker(accessData.accessGroups)],
+    ["core_data/credentials.json", collectedOrMarker(accessData.credentials)],
+    ["core_data/audit_log_events.json", collectedOrMarker(accessData.auditLog)],
+    ["core_data/vulns_export.json", collectedOrMarker(vulnData.vulnExport, exportRecords)],
+    ["core_data/export_jobs.json", {
+      vulns: collectedOrMarker(vulnData.vulnExportJobs),
+      assets: collectedOrMarker(vulnData.assetExportJobs),
+    }],
     ["core_data/security_center.json", {
-      scans: scanProgramData.scScans.data,
-      scan_results: scanProgramData.scScanResults.data,
-      scanners: sensorData.scScanners.data,
-      feed: sensorData.scFeed.data,
-      users: accessData.scUsers.data,
+      scans: collectedOrMarker(scanProgramData.scScans),
+      scan_results: collectedOrMarker(scanProgramData.scScanResults),
+      scanners: collectedOrMarker(sensorData.scScanners),
+      feed: collectedOrMarker(sensorData.scFeed),
+      users: collectedOrMarker(accessData.scUsers),
     }],
   ];
   for (const [pathname, value] of coreData) {
-    await writeSecureTextFile(outputDir, pathname, serializeJson(value));
+    await writeSecureJsonFile(outputDir, pathname, redactCredentialProperties(value), secrets);
   }
   for (const assessment of assessments) {
-    await writeSecureTextFile(outputDir, `analysis/${assessment.category}.json`, serializeJson(assessment));
+    await writeSecureJsonFile(outputDir, `analysis/${assessment.category}.json`, redactCredentialProperties(assessment), secrets);
   }
-  await writeSecureTextFile(outputDir, "analysis/findings.json", serializeJson(findings));
-  await writeSecureTextFile(outputDir, "metadata.json", serializeJson({
+  await writeSecureJsonFile(outputDir, "analysis/findings.json", redactCredentialProperties(findings), secrets);
+  await writeSecureJsonFile(outputDir, "metadata.json", {
     generated_at: new Date().toISOString(),
     platform: access.platform,
     source_chain: config.sourceChain,
-    caller_is_administrator: access.callerIsAdministrator ?? null,
-  }));
-  await writeSecureTextFile(outputDir, "compliance/executive_summary.md", buildExecutiveSummary(config, assessments, errors));
-  await writeSecureTextFile(outputDir, "compliance/unified_compliance_matrix.md", buildUnifiedMatrix(findings));
+    caller_is_administrator: access.callerIsAdministrator,
+  }, secrets);
+  await writeSecureTextFile(outputDir, "compliance/executive_summary.md", buildExecutiveSummary(config, assessments, errors), secrets);
+  await writeSecureTextFile(outputDir, "compliance/unified_compliance_matrix.md", buildUnifiedMatrix(findings), secrets);
   for (const framework of FRAMEWORK_REPORTS) {
-    await writeSecureTextFile(outputDir, `compliance/${framework.slug}/${framework.slug}_compliance_report.md`, buildFrameworkReport(framework.title, framework.prefix, findings));
+    await writeSecureTextFile(outputDir, `compliance/${framework.slug}/${framework.slug}_compliance_report.md`, buildFrameworkReport(framework.title, framework.prefix, findings), secrets);
   }
-  await writeSecureTextFile(outputDir, "QUICK_REFERENCE.md", buildQuickReference());
+  await writeSecureTextFile(outputDir, "QUICK_REFERENCE.md", buildQuickReference(), secrets);
   if (errors.length > 0) {
-    await writeSecureTextFile(outputDir, "_errors.log", `${errors.join("\n")}\n`);
+    await writeSecureTextFile(outputDir, "_errors.log", `${errors.join("\n")}\n`, secrets);
   }
 
   const zipPath = `${outputDir}.zip`;
@@ -2905,6 +4117,35 @@ function createClients(args: CheckAccessArgs): TenableClients {
   return createTenableClients(resolveTenableConfiguration(args as JsonRecord));
 }
 
+type ToolResult = ReturnType<typeof textResult> & { isError?: boolean };
+
+/** Credentials passed as arguments or present in the environment, known before the clients exist. */
+function argumentSecrets(args: CheckAccessArgs): string[] {
+  return [
+    args.access_key, args.secret_key, args.sc_access_key, args.sc_secret_key,
+    process.env.TENABLE_ACCESS_KEY, process.env.TENABLE_SECRET_KEY, process.env.TENABLE_SC_ACCESS_KEY, process.env.TENABLE_SC_SECRET_KEY,
+  ].filter((value): value is string => typeof value === "string");
+}
+
+/**
+ * Runs one tool and removes every configured secret from the whole result (guard 2):
+ * the text rendering and the structured details alike, whether the run succeeded or
+ * the catch block rendered the error. The clients' secrets include the keys a config
+ * file supplied, which the argument list alone cannot name.
+ */
+async function runSealed(label: string, tool: string, args: CheckAccessArgs, run: (clients: TenableClients) => Promise<ToolResult>): Promise<ToolResult> {
+  const secrets = new Set<string>(argumentSecrets(args));
+  let clients: TenableClients | undefined;
+  try {
+    clients = createClients(args);
+    for (const secret of configuredTenableSecrets(clients.config)) secrets.add(secret);
+    return sealValue(await run(clients), [...secrets]);
+  } catch (error) {
+    for (const secret of clients ? configuredTenableSecrets(clients.config) : []) secrets.add(secret);
+    return sealValue(errorResult(`${label} failed: ${errorMessage(error)}`, { tool }), [...secrets]);
+  }
+}
+
 const authParams = {
   access_key: Type.Optional(Type.String({ description: "Tenable Vulnerability Management API access key. Defaults to TENABLE_ACCESS_KEY or the config file." })),
   secret_key: Type.Optional(Type.String({ description: "Tenable Vulnerability Management API secret key. Defaults to TENABLE_SECRET_KEY or the config file." })),
@@ -2962,12 +4203,10 @@ function registerAssessmentTool(pi: any, kind: AssessmentKind, name: string, lab
     parameters: Type.Object({ ...authParams, ...thresholdParams }),
     prepareArguments: normalizeAssessArgs,
     async execute(_toolCallId: string, args: AssessArgs) {
-      try {
-        const result = await runAssessment(kind, createClients(args), toAssessmentOptions(args));
+      return runSealed(label, name, args, async (clients) => {
+        const result = await runAssessment(kind, clients, toAssessmentOptions(args));
         return textResult(formatAssessmentText(result), { tool: name, ...result });
-      } catch (error) {
-        return errorResult(`${label} failed: ${errorMessage(error)}`, { tool: name });
-      }
+      });
     },
   });
 }
@@ -2981,12 +4220,10 @@ export function registerTenableTools(pi: any): void {
     parameters: Type.Object(authParams),
     prepareArguments: normalizeCheckAccessArgs,
     async execute(_toolCallId: string, args: CheckAccessArgs) {
-      try {
-        const result = await checkTenableAccess(createClients(args));
+      return runSealed("Tenable access check", "tenable_check_access", args, async (clients) => {
+        const result = await checkTenableAccess(clients);
         return textResult(formatAccessCheckText(result), { tool: "tenable_check_access", ...result });
-      } catch (error) {
-        return errorResult(`Tenable access check failed: ${errorMessage(error)}`, { tool: "tenable_check_access" });
-      }
+      });
     },
   });
 
@@ -3031,8 +4268,7 @@ export function registerTenableTools(pi: any): void {
     }),
     prepareArguments: normalizeExportArgs,
     async execute(_toolCallId: string, args: ExportAuditBundleArgs) {
-      try {
-        const clients = createClients(args);
+      return runSealed("Tenable audit bundle export", "tenable_export_audit_bundle", args, async (clients) => {
         const outputRoot = resolve(process.cwd(), args.output_dir?.trim() || DEFAULT_OUTPUT_DIR);
         const result = await exportTenableAuditBundle(clients, outputRoot, toAssessmentOptions(args));
         return textResult(
@@ -3053,9 +4289,7 @@ export function registerTenableTools(pi: any): void {
             error_count: result.errorCount,
           },
         );
-      } catch (error) {
-        return errorResult(`Tenable audit bundle export failed: ${errorMessage(error)}`, { tool: "tenable_export_audit_bundle" });
-      }
+      });
     },
   });
 }
