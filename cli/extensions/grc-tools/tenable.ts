@@ -2331,6 +2331,22 @@ function capForPartial(status: TenableFindingStatus, dataset: TenableDataset<unk
   return status;
 }
 
+// The partial-view statement of a truncated inventory appears on every branch, not only
+// the pass branch the author appended it to: a fail or warn read from a capped or stuck
+// walk says how many records it rests on, and the evidence carries the collection flags.
+function withPartialView(item: TenableFinding, dataset: TenableDataset<unknown>): TenableFinding {
+  const readable = dataset.status === "ok";
+  const evidence: JsonRecord = {
+    ...item.evidence,
+    inventory_truncated: readable ? dataset.truncated : null,
+    records_seen: readable ? dataset.seen ?? null : null,
+    records_total: readable ? dataset.total ?? null : null,
+  };
+  if (!readable || !dataset.truncated || item.summary.includes(" records were retrieved")) return { ...item, evidence };
+  const partial = ` Only ${dataset.seen ?? "an unknown number"} of ${dataset.total ?? "unknown"} records were retrieved${dataset.error ? ` (${dataset.error})` : ""}; the verdict rests on the records retrieved.`;
+  return { ...item, summary: `${item.summary}${partial}`, evidence };
+}
+
 // Rule 1 corollary: a finding that reads several inventories cannot pass while any of
 // them is unreadable, even when the unreadable one only feeds evidence.
 function capForUnreadable(status: TenableFindingStatus, ...datasets: Array<TenableDataset<unknown>>): TenableFindingStatus {
@@ -2850,7 +2866,7 @@ export function assessTenableScanProgram(data: TenableScanProgramData, options: 
     const undocumented = exclusions.filter((item) => !asString(item.description));
     const broad = exclusions.filter((item) => exclusionIsBroad(asString(item.members)));
     const issues = new Set([...permanent, ...undocumented, ...broad].map((item) => asString(item.name) ?? asString(item.id) ?? "exclusion"));
-    findings.push(finding(
+    findings.push(withPartialView(finding(
       13,
       exclusions.length === 0 ? capForPartial("pass", data.exclusions) : issues.size === 0 ? capForPartial("pass", data.exclusions) : permanent.length > 0 || broad.length > 0 ? "fail" : "warn",
       "medium",
@@ -2866,7 +2882,7 @@ export function assessTenableScanProgram(data: TenableScanProgramData, options: 
         undocumented_exclusions: undocumented.map((item) => asString(item.name)).slice(0, 50),
         broad_exclusions: broad.map((item) => asString(item.name)).slice(0, 50),
       },
-    ));
+    ), data.exclusions));
   }
 
   if (data.targetGroups.status !== "ok") {
@@ -3150,7 +3166,7 @@ export function assessTenableSensorCoverage(data: TenableSensorCoverageData, opt
       status = capForUnreadable("pass", data.serverProperties);
       summary = `All ${agents.length} agents connected within ${agentOfflineDays} days and run version ${newest ?? "unknown"}; ${unhealthy.size} offline.${unreadableNote([{ dataset: data.serverProperties, consequence: "the licensed agent count (license.agents) is unknown" }])}`;
     }
-    findings.push(finding(5, status, "high", summary, {
+    findings.push(withPartialView(finding(5, status, "high", summary, {
       agent_count: agents.length,
       pagination_total: data.agents.total ?? null,
       licensed_agents: licensedAgents ?? null,
@@ -3161,7 +3177,7 @@ export function assessTenableSensorCoverage(data: TenableSensorCoverageData, opt
       newest_version: newest ?? null,
       outdated_agents: outdated.map((agent) => `${asString(agent.name) ?? agent.id} (${asString(agent.core_version)})`).slice(0, 50),
       agent_offline_days: agentOfflineDays,
-    }));
+    }), data.agents));
 
     const ungrouped = agents.filter((agent) => asRecords(agent.groups).length === 0);
     const groupCount = data.agentGroups.status === "ok" ? data.agentGroups.data.length : null;
@@ -3183,13 +3199,13 @@ export function assessTenableSensorCoverage(data: TenableSensorCoverageData, opt
       groupStatus = "pass";
       groupSummary = `All ${agents.length} agents belong to at least one of ${groupCount} agent groups. Confirm the groups mirror network segments or business units.`;
     }
-    findings.push(finding(6, groupStatus, "medium", groupSummary, {
+    findings.push(withPartialView(finding(6, groupStatus, "medium", groupSummary, {
       agent_count: agents.length,
       agent_group_count: groupCount,
       ungrouped_agents: ungrouped.map((agent) => asString(agent.name) ?? asString(agent.id)).slice(0, 50),
       groups: data.agentGroups.status === "ok" ? data.agentGroups.data.map((group) => ({ name: asString(group.name), agents_count: asNumber(group.agents_count) ?? null })).slice(0, 50) : null,
       agent_groups_status: data.agentGroups.status,
-    }));
+    }), data.agents));
   }
 
   const linkedScanners = data.scanners.data.filter((scanner) => asString(scanner.type) !== "local" && asBoolean(scanner.pool) !== true && asBoolean(scanner.group) !== true);
@@ -3216,7 +3232,7 @@ export function assessTenableSensorCoverage(data: TenableSensorCoverageData, opt
       return version !== undefined && compareVersions(version, newest) < 0;
     }) : [];
     const unhealthy = new Set([...unlinked, ...off, ...staleConnect].map((scanner) => asString(scanner.name) ?? asString(scanner.id) ?? "scanner"));
-    findings.push(finding(
+    findings.push(withPartialView(finding(
       7,
       unhealthy.size > 0 ? "fail" : undated.length > 0 || outdated.length > 0 ? "warn" : capForNonAdmin(capForPartial("pass", data.scanners), callerIsAdministrator),
       "high",
@@ -3236,7 +3252,7 @@ export function assessTenableSensorCoverage(data: TenableSensorCoverageData, opt
         newest_version: newest ?? null,
         outdated: outdated.map((scanner) => `${asString(scanner.name)} (${asString(scanner.ui_version)})`).slice(0, 50),
       },
-    ));
+    ), data.scanners));
   }
 
   if (data.serverProperties.status !== "ok") {
@@ -3260,8 +3276,13 @@ export function assessTenableSensorCoverage(data: TenableSensorCoverageData, opt
       status = "manual";
       summary = `${data.serverProperties.endpoint} did not expose a parseable plugin_set, so plugin currency cannot be confirmed; collect the plugin set date from Settings > About.`;
     } else if (!serverFresh || staleScanners.length > 0) {
+      // A stale container plugin set fails on its own; when the scanner list was not read,
+      // the scanner clause names the unread read instead of counting zero of zero entries.
       status = "fail";
-      summary = `The container plugin set ${asString(data.serverProperties.data.plugin_set) ?? "unknown"} is ${Math.round((now - serverPluginMs) / 3_600_000)} hours old and ${staleScanners.length} of ${datedScanners.length} scanner entries exposing loaded_plugin_set load a set older than ${pluginStaleHours} hours${staleScanners.length > 0 ? ` (${staleScanners.map((scanner) => asString(scanner.name) ?? asString(scanner.id)).slice(0, 10).join(", ")})` : ""}.`;
+      const scannerClause = data.scanners.status !== "ok"
+        ? `${describeUnread(data.scanners)}, so scanner plugin sets are unverified`
+        : `${staleScanners.length} of ${datedScanners.length} scanner entries exposing loaded_plugin_set load a set older than ${pluginStaleHours} hours${staleScanners.length > 0 ? ` (${staleScanners.map((scanner) => asString(scanner.name) ?? asString(scanner.id)).slice(0, 10).join(", ")})` : ""}`;
+      summary = `The container plugin set ${asString(data.serverProperties.data.plugin_set) ?? "unknown"} is ${Math.round((now - serverPluginMs) / 3_600_000)} hours old${serverFresh ? "" : ` (older than ${pluginStaleHours} hours)`} and ${scannerClause}.`;
     } else if (data.scanners.status !== "ok") {
       status = "manual";
       summary = `The container plugin set is ${Math.round((now - serverPluginMs) / 3_600_000)} hours old, but ${describeUnread(data.scanners)}, so no scanner plugin set could be evaluated; collect each scanner's plugin set from Settings > Sensors.`;
@@ -3279,17 +3300,18 @@ export function assessTenableSensorCoverage(data: TenableSensorCoverageData, opt
       status = capForPartial("pass", data.agents);
       summary = `The container plugin set is ${Math.round((now - serverPluginMs) / 3_600_000)} hours old and all ${datedScanners.length} scanner entries exposing loaded_plugin_set (${linkedScanners.length} linked appliances) load a set newer than ${pluginStaleHours} hours.${partialNote(data.agents)}`;
     }
-    findings.push(finding(8, status, "high", summary, {
+    findings.push(withPartialView(finding(8, status, "high", summary, {
       plugin_set: asString(data.serverProperties.data.plugin_set) ?? null,
       plugin_set_age_hours: serverPluginMs === undefined ? null : Math.round((now - serverPluginMs) / 3_600_000),
       scanner_entries: countOrNull(data.scanners),
-      evaluated_scanners: datedScanners.map((scanner) => `${asString(scanner.name)} (${asString(scanner.loaded_plugin_set)})`).slice(0, 50),
-      stale_scanners: staleScanners.map((scanner) => `${asString(scanner.name)} (${asString(scanner.loaded_plugin_set)})`).slice(0, 50),
-      undated_scanners: undatedScanners.map((scanner) => asString(scanner.name)).slice(0, 50),
+      scanners_status: data.scanners.status,
+      evaluated_scanners: data.scanners.status === "ok" ? datedScanners.map((scanner) => `${asString(scanner.name)} (${asString(scanner.loaded_plugin_set)})`).slice(0, 50) : null,
+      stale_scanners: data.scanners.status === "ok" ? staleScanners.map((scanner) => `${asString(scanner.name)} (${asString(scanner.loaded_plugin_set)})`).slice(0, 50) : null,
+      undated_scanners: data.scanners.status === "ok" ? undatedScanners.map((scanner) => asString(scanner.name)).slice(0, 50) : null,
       stale_online_agents: data.agents.status === "ok" ? staleAgents.length : null,
       agents_status: data.agents.status,
       threshold_hours: pluginStaleHours,
-    }));
+    }), data.agents));
   }
 
   if (data.networks.status !== "ok") {
@@ -3298,7 +3320,7 @@ export function assessTenableSensorCoverage(data: TenableSensorCoverageData, opt
     const networks = data.networks.data;
     const withoutScanners = networks.filter((network) => asNumber(network.scanner_count) === 0);
     const unknownCount = networks.filter((network) => asNumber(network.scanner_count) === undefined);
-    findings.push(finding(
+    findings.push(withPartialView(finding(
       9,
       networks.length === 0 ? "manual" : withoutScanners.length > 0 ? "fail" : unknownCount.length > 0 ? "warn" : capForPartial("pass", data.networks),
       "medium",
@@ -3314,7 +3336,7 @@ export function assessTenableSensorCoverage(data: TenableSensorCoverageData, opt
         pagination_total: data.networks.total ?? null,
         networks: networks.map((network) => ({ name: asString(network.name), scanner_count: asNumber(network.scanner_count) ?? null, assets_ttl_days: asNumber(network.assets_ttl_days) ?? null, is_default: asBoolean(network.is_default) ?? null })).slice(0, 50),
       },
-    ));
+    ), data.networks));
   }
 
   findings.push(assessSecurityCenterScanners(data.scScanners, data.scFeed, now, pluginStaleHours));
@@ -3396,7 +3418,7 @@ function assessSecurityCenterScanners(scanners: TenableDataset<JsonRecord[]>, fe
     status = "pass";
     summary = `All ${enabled.length} enabled Security Center scanners report status 1, checked in within 24 hours, load a plugin set newer than ${pluginStaleHours} hours, and the active plugin feed is not stale.`;
   }
-  return finding(7, status, "high", summary, {
+  return withPartialView(finding(7, status, "high", summary, {
     sc_scanner_count: scanners.data.length,
     sc_enabled_scanners: enabled.length,
     sc_unhealthy: unhealthy.map((scanner) => `${asString(scanner.name)} (status ${asString(scanner.status)})`).slice(0, 50),
@@ -3405,7 +3427,7 @@ function assessSecurityCenterScanners(scanners: TenableDataset<JsonRecord[]>, fe
     sc_stale_plugins: stalePlugins.map((scanner) => `${asString(scanner.name)} (${asString(scanner.loadedPluginSet) ?? asString(scanner.pluginSet)})`).slice(0, 50),
     sc_feed_active_stale: feedStale ?? null,
     sc_feed_active_update_time: asString(feedActive?.updateTime) ?? null,
-  }, "-SC");
+  }, "-SC"), scanners);
 }
 
 export interface TenableAccessControlData {
@@ -3590,7 +3612,7 @@ export function assessTenableAccessControl(data: TenableAccessControlData, optio
       const type = asString(asObject(credential.type)?.name) ?? asString(asObject(credential.type)?.id) ?? "unknown";
       types.set(type, (types.get(type) ?? 0) + 1);
     }
-    findings.push(finding(
+    findings.push(withPartialView(finding(
       12,
       unused.length > 0 || old.length > 0 ? "warn" : undated.length > 0 ? "warn" : capForPartial("pass", data.credentials),
       "medium",
@@ -3607,7 +3629,7 @@ export function assessTenableAccessControl(data: TenableAccessControlData, optio
         older_than_one_year: old.map((credential) => asString(credential.name)).slice(0, 50),
         undated_credentials: undated.length,
       },
-    ));
+    ), data.credentials));
   }
 
   if (data.auditLog.status !== "ok") {

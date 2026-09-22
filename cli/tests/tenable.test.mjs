@@ -2331,6 +2331,200 @@ test("rule 1 corollary: a pass never survives an unreadable secondary inventory 
   assert.equal(users[2].summary.user_count, null);
 });
 
+// Reviewer E gap 4: a stale container plugin set fails on its own, and a scanner list the
+// key could not read is named in that fail rather than counted as zero of zero entries or
+// rendered as empty lists.
+test("reviewer E gap 4: a stale container fails with the denied scanner read named, not counted, and the scanner lists render null", async () => {
+  const STALE_PLUGIN_SET = "202609190000";
+  const stale = forbidding("GET /scanners");
+  stale["GET /server/properties"] = { loaded_plugin_set: STALE_PLUGIN_SET, nessus_ui_version: "10.8.0", plugin_set: STALE_PLUGIN_SET };
+  const results = await runAll(clientsFor(stale));
+  const pluginCurrency = byId(results, "TENABLE-08");
+  assert.equal(pluginCurrency.status, "fail", pluginCurrency.summary);
+  assert.equal(pluginCurrency.summary, "The container plugin set 202609190000 is 60 hours old (older than 24 hours) and GET /scanners refused the API key with HTTP 403 (Tenable request GET /scanners failed (HTTP 403; forbidden)), so scanner plugin sets are unverified.");
+  assert.doesNotMatch(pluginCurrency.summary, /\d+ of \d+ scanner entries/, "an unread scanner list is never counted");
+  assert.doesNotMatch(pluginCurrency.summary, /0 of 0/);
+  assert.equal(pluginCurrency.evidence.plugin_set_age_hours, 60);
+  assert.equal(pluginCurrency.evidence.scanner_entries, null);
+  assert.equal(pluginCurrency.evidence.scanners_status, "forbidden");
+  assert.equal(pluginCurrency.evidence.evaluated_scanners, null);
+  assert.equal(pluginCurrency.evidence.stale_scanners, null);
+  assert.equal(pluginCurrency.evidence.undated_scanners, null);
+  assert.equal(pluginCurrency.evidence.stale_online_agents, 0, "the readable agent list is still counted");
+  assert.equal(byId(results, "TENABLE-07").status, "manual", "scanner health on the denied read stays manual");
+  assert.equal(results[1].summary.scanner_entries, null);
+  assert.equal(results[1].summary.linked_scanners, null);
+  for (const [name, text] of Object.entries({ summary: pluginCurrency.summary, evidence: JSON.stringify(pluginCurrency.evidence) })) {
+    for (const secret of [FIXTURE_ACCESS_KEY, FIXTURE_SECRET_KEY]) assertNoWindow(text, secret, `TENABLE-08 ${name}`);
+  }
+
+  // The same denial under a fresh container is the manual the guide row describes.
+  const freshCurrency = byId(await runAll(clientsFor(forbidding("GET /scanners"))), "TENABLE-08");
+  assert.equal(freshCurrency.status, "manual", freshCurrency.summary);
+  assert.equal(freshCurrency.summary, "The container plugin set is 2 hours old, but GET /scanners refused the API key with HTTP 403 (Tenable request GET /scanners failed (HTTP 403; forbidden)), so no scanner plugin set could be evaluated; collect each scanner's plugin set from Settings > Sensors.");
+  assert.equal(freshCurrency.evidence.scanners_status, "forbidden");
+  assert.equal(freshCurrency.evidence.evaluated_scanners, null);
+  assert.equal(freshCurrency.evidence.stale_scanners, null);
+  assert.equal(freshCurrency.evidence.undated_scanners, null);
+
+  // A stale container beside a readable scanner list still counts the entries it read.
+  const counted = healthyRoutes();
+  counted["GET /server/properties"] = { ...counted["GET /server/properties"], loaded_plugin_set: STALE_PLUGIN_SET, plugin_set: STALE_PLUGIN_SET };
+  const countedCurrency = byId(await runAll(clientsFor(counted)), "TENABLE-08");
+  assert.equal(countedCurrency.status, "fail", countedCurrency.summary);
+  assert.equal(countedCurrency.summary, "The container plugin set 202609190000 is 60 hours old (older than 24 hours) and 0 of 1 scanner entries exposing loaded_plugin_set load a set older than 24 hours.");
+  assert.equal(countedCurrency.evidence.scanners_status, "ok");
+  assert.equal(countedCurrency.evidence.scanner_entries, 1);
+  assert.deepEqual(countedCurrency.evidence.evaluated_scanners, [`US Cloud Scanner (${RECENT_PLUGIN_SET})`]);
+  assert.deepEqual(countedCurrency.evidence.stale_scanners, []);
+  assert.deepEqual(countedCurrency.evidence.undated_scanners, []);
+
+  // A stale scanner under a fresh container names the scanner and keeps the count.
+  const staleScanner = healthyRoutes();
+  staleScanner["GET /scanners"] = { scanners: [{ ...staleScanner["GET /scanners"].scanners[0], loaded_plugin_set: STALE_PLUGIN_SET }] };
+  const staleScannerCurrency = byId(await runAll(clientsFor(staleScanner)), "TENABLE-08");
+  assert.equal(staleScannerCurrency.status, "fail", staleScannerCurrency.summary);
+  assert.equal(staleScannerCurrency.summary, `The container plugin set ${RECENT_PLUGIN_SET} is 2 hours old and 1 of 1 scanner entries exposing loaded_plugin_set load a set older than 24 hours (US Cloud Scanner).`);
+  assert.deepEqual(staleScannerCurrency.evidence.stale_scanners, ["US Cloud Scanner (202609190000)"]);
+});
+
+// Reviewer E gap 5 (rule 10): a truncated inventory states seen versus total, or that the
+// total is unknown, on the fail and warn branches as well as the pass branch, and the
+// finding evidence carries the collection flags beside the verdict.
+const PARTIAL_VIEW_FINDINGS = ["TENABLE-05", "TENABLE-06", "TENABLE-07", "TENABLE-08", "TENABLE-09", "TENABLE-12", "TENABLE-13"];
+
+function assertPartialView(item, seen, total, reason) {
+  const stated = total === null ? `Only ${seen} of unknown records were retrieved` : `Only ${seen} of ${total} records were retrieved`;
+  assert.equal(item.summary.split("records were retrieved").length, 2, `${item.id} states the partial view exactly once: ${item.summary}`);
+  assert.ok(item.summary.includes(`${stated} (${reason})`), `${item.id}: ${item.summary}`);
+  assert.equal(item.evidence.inventory_truncated, true, `${item.id} inventory_truncated`);
+  assert.equal(item.evidence.records_seen, seen, `${item.id} records_seen`);
+  assert.equal(item.evidence.records_total, total, `${item.id} records_total`);
+}
+
+test("reviewer E gap 5: a truncated inventory states seen versus total on the fail and warn branches and the evidence carries the collection flags", async () => {
+  // Probe A2b: one of a reported five credentials, never used in a scan (warn).
+  const credentials = healthyRoutes();
+  credentials["GET /credentials"] = { credentials: [{ uuid: "c-1", name: "Linux SSH", type: { id: "ssh", name: "SSH" }, created_date: RECENT_SECONDS }], pagination: { total: 5 } };
+  const unused = byId(await runAll(clientsFor(credentials)), "TENABLE-12");
+  assert.equal(unused.status, "warn", unused.summary);
+  assert.equal(unused.summary, "1 managed credentials: 1 have never been used in a scan, 0 were created over a year ago (the API exposes created_date but no rotation date, so confirm rotation manually). Only 1 of 5 records were retrieved (only 1 of the reported 5 records were returned); the verdict rests on the records retrieved.");
+  assertPartialView(unused, 1, 5, "only 1 of the reported 5 records were returned");
+  assert.equal(unused.evidence.credential_count, 1);
+  assert.equal(unused.evidence.pagination_total, 5);
+
+  // Networks: one of a reported three, without a scanner (fail), then without scanner_count (warn).
+  const networks = healthyRoutes();
+  networks["GET /networks"] = { networks: [{ uuid: "net-1", name: "Default", is_default: true, scanner_count: 0, assets_ttl_days: 90 }], pagination: { total: 3 } };
+  const unassigned = byId(await runAll(clientsFor(networks)), "TENABLE-09");
+  assert.equal(unassigned.status, "fail", unassigned.summary);
+  assert.equal(unassigned.summary, "1 of 1 network objects have no assigned scanners: Default. Only 1 of 3 records were retrieved (only 1 of the reported 3 records were returned); the verdict rests on the records retrieved.");
+  assertPartialView(unassigned, 1, 3, "only 1 of the reported 3 records were returned");
+  networks["GET /networks"] = { networks: [{ uuid: "net-1", name: "Default", is_default: true, assets_ttl_days: 90 }], pagination: { total: 3 } };
+  const uncounted = byId(await runAll(clientsFor(networks)), "TENABLE-09");
+  assert.equal(uncounted.status, "warn", uncounted.summary);
+  assert.equal(uncounted.summary, "1 network objects exist but 1 did not expose scanner_count, so scanner assignment cannot be confirmed for them. Only 1 of 3 records were retrieved (only 1 of the reported 3 records were returned); the verdict rests on the records retrieved.");
+  assertPartialView(uncounted, 1, 3, "only 1 of the reported 3 records were returned");
+
+  // Exclusions: one of a reported four, always-on (fail), then undocumented (warn).
+  const exclusions = healthyRoutes();
+  exclusions["GET /exclusions"] = { exclusions: [{ id: 1, name: "Maintenance window", description: "CHG-1234", members: "10.0.0.5", schedule: { enabled: false } }], pagination: { total: 4 } };
+  const permanent = byId(await runAll(clientsFor(exclusions)), "TENABLE-13");
+  assert.equal(permanent.status, "fail", permanent.summary);
+  assert.equal(permanent.summary, "1 of 1 exclusions need review: 1 always-on (schedule.enabled=false), 0 without a description, 0 covering /16 or wider ranges. Only 1 of 4 records were retrieved (only 1 of the reported 4 records were returned); the verdict rests on the records retrieved.");
+  assertPartialView(permanent, 1, 4, "only 1 of the reported 4 records were returned");
+  exclusions["GET /exclusions"] = { exclusions: [{ id: 1, name: "Maintenance window", members: "10.0.0.5", schedule: { enabled: true, rrules: "FREQ=WEEKLY" } }], pagination: { total: 4 } };
+  const undocumented = byId(await runAll(clientsFor(exclusions)), "TENABLE-13");
+  assert.equal(undocumented.status, "warn", undocumented.summary);
+  assert.equal(undocumented.summary, "1 of 1 exclusions need review: 0 always-on (schedule.enabled=false), 1 without a description, 0 covering /16 or wider ranges. Only 1 of 4 records were retrieved (only 1 of the reported 4 records were returned); the verdict rests on the records retrieved.");
+  assertPartialView(undocumented, 1, 4, "only 1 of the reported 4 records were returned");
+
+  // Agents: one of a reported seven, offline and ungrouped (TENABLE-05 and TENABLE-06 fail),
+  // while the plugin currency read of the same list is capped on its pass branch.
+  const agents = healthyRoutes();
+  agents["GET /scanners/null/agents"] = { agents: [{ id: 1, uuid: "ag-1", name: "host-1", status: "off", last_connect: RECENT_SECONDS, core_version: "10.8.0", plugin_feed_id: RECENT_PLUGIN_SET, groups: [] }], pagination: { total: 7 } };
+  const agentResults = await runAll(clientsFor(agents));
+  const offline = byId(agentResults, "TENABLE-05");
+  assert.equal(offline.status, "fail", offline.summary);
+  assert.equal(offline.summary, "1 of 1 agents are offline or have not connected in 7 days (more than 10%). Only 1 of 7 records were retrieved (only 1 of the reported 7 records were returned); the verdict rests on the records retrieved.");
+  assertPartialView(offline, 1, 7, "only 1 of the reported 7 records were returned");
+  assert.equal(offline.evidence.pagination_total, 7);
+  const ungrouped = byId(agentResults, "TENABLE-06");
+  assert.equal(ungrouped.status, "fail", ungrouped.summary);
+  assert.equal(ungrouped.summary, "1 of 1 agents belong to no agent group (1 groups defined). Only 1 of 7 records were retrieved (only 1 of the reported 7 records were returned); the verdict rests on the records retrieved.");
+  assertPartialView(ungrouped, 1, 7, "only 1 of the reported 7 records were returned");
+  const cappedCurrency = byId(agentResults, "TENABLE-08");
+  assert.equal(cappedCurrency.status, "warn", cappedCurrency.summary);
+  assert.match(cappedCurrency.summary, /load a set newer than 24 hours\. Only 1 of 7 records were retrieved \(only 1 of the reported 7 records were returned\), so the verdict is capped at warn\.$/);
+  assertPartialView(cappedCurrency, 1, 7, "only 1 of the reported 7 records were returned");
+
+  // The same partial agent list with a stale online agent reaches the warn branch of TENABLE-08.
+  agents["GET /scanners/null/agents"] = { agents: [{ id: 1, uuid: "ag-1", name: "host-1", status: "on", last_connect: RECENT_SECONDS, core_version: "10.8.0", plugin_feed_id: "202609190000", groups: [{ id: 1, name: "prod" }] }], pagination: { total: 7 } };
+  const staleAgentCurrency = byId(await runAll(clientsFor(agents)), "TENABLE-08");
+  assert.equal(staleAgentCurrency.status, "warn", staleAgentCurrency.summary);
+  assert.equal(staleAgentCurrency.summary, "The container plugin set is 2 hours old and 1 scanner entries load a fresh plugin set, but 0 scanner instances expose no parseable plugin set (not counted as current) and 1 online agents load a plugin set older than 24 hours. Only 1 of 7 records were retrieved (only 1 of the reported 7 records were returned); the verdict rests on the records retrieved.");
+  assertPartialView(staleAgentCurrency, 1, 7, "only 1 of the reported 7 records were returned");
+  assert.equal(staleAgentCurrency.evidence.stale_online_agents, 1);
+
+  // Probe A3 with a violation: the network walk stops at the 200-page cap with no reported
+  // total, a network without a scanner is among the pages, and the fail says the total is unknown.
+  const fallback = routerFetch(healthyRoutes());
+  const capped = createTenableClients(vmConfig(), {
+    fetchImpl: async (url, init) => {
+      const parsed = new URL(url);
+      if (parsed.pathname !== "/networks") return fallback(url, init);
+      const offset = Number(parsed.searchParams.get("offset") ?? "0");
+      return jsonResponse({ networks: Array.from({ length: 50 }, (_, index) => ({ uuid: `net-${offset + index}`, name: `Network ${offset + index}`, scanner_count: offset + index === 0 ? 0 : 1 })) });
+    },
+    sleepImpl: async () => {},
+    exportPollMs: 0,
+    exportTimeoutMs: 5_000,
+  });
+  const cappedData = await collectTenableSensorCoverageData(capped, { now: NOW });
+  assert.equal(cappedData.networks.total, null);
+  const cappedNetworks = assessTenableSensorCoverage(cappedData, { now: NOW }).findings.find((item) => item.id === "TENABLE-09");
+  assert.equal(cappedNetworks.status, "fail", cappedNetworks.summary);
+  assert.equal(cappedNetworks.summary, "1 of 10000 network objects have no assigned scanners: Network 0. Only 10000 of unknown records were retrieved (the walk stopped at the 200-page cap); the verdict rests on the records retrieved.");
+  assertPartialView(cappedNetworks, 10000, null, "the walk stopped at the 200-page cap");
+  assert.equal(cappedNetworks.evidence.pagination_total, null);
+
+  // A stuck offset with a violation: the replayed page is the reason and the total it reported is kept.
+  const stuck = createTenableClients(vmConfig(), {
+    fetchImpl: async (url, init) => (new URL(url).pathname === "/exclusions"
+      ? jsonResponse({ exclusions: [{ id: 1, name: "Lab range", description: "CHG-9", members: "10.0.0.0/8", schedule: { enabled: true, rrules: "FREQ=WEEKLY" } }], pagination: { total: 9 } })
+      : fallback(url, init)),
+    sleepImpl: async () => {},
+    exportPollMs: 0,
+    exportTimeoutMs: 5_000,
+  });
+  const stuckData = await collectTenableScanProgramData(stuck, { now: NOW });
+  const broad = assessTenableScanProgram(stuckData, { now: NOW }).findings.find((item) => item.id === "TENABLE-13");
+  assert.equal(broad.status, "fail", broad.summary);
+  assert.equal(broad.summary, "1 of 1 exclusions need review: 0 always-on (schedule.enabled=false), 0 without a description, 1 covering /16 or wider ranges. Only 1 of 9 records were retrieved (GET /exclusions replayed the same page at offset 1, so the walk could not advance); the verdict rests on the records retrieved.");
+  assertPartialView(broad, 1, 9, "GET /exclusions replayed the same page at offset 1, so the walk could not advance");
+
+  // A complete walk carries the flags without a statement, on a violation branch as well as a pass.
+  const healthy = await runAll(clientsFor(healthyRoutes()));
+  for (const id of PARTIAL_VIEW_FINDINGS) {
+    const item = byId(healthy, id);
+    assert.equal(item.evidence.inventory_truncated, false, `${id} inventory_truncated`);
+    assert.equal(typeof item.evidence.records_seen, "number", `${id} records_seen`);
+    assert.equal(typeof item.evidence.records_total, "number", `${id} records_total`);
+    assert.doesNotMatch(item.summary, /records were retrieved/, `${id}: ${item.summary}`);
+  }
+  assert.equal(byId(healthy, "TENABLE-07").status, "fail", "the healthy scanner last connected two days ago");
+  assert.equal(byId(healthy, "TENABLE-07").evidence.records_total, 1);
+  const securityCenter = byId(healthy, "TENABLE-07-SC");
+  assert.equal(securityCenter.evidence.inventory_truncated, undefined, "an unconfigured Security Center read renders the unreadable marker, not collection flags");
+  assert.equal(securityCenter.evidence.collected, false);
+
+  // An unreadable list renders the flags as null beside the marker of the finding that still reads it.
+  const denied = byId(await runAll(clientsFor(forbidding("GET /scanners/null/agents"))), "TENABLE-08");
+  assert.equal(denied.evidence.inventory_truncated, null);
+  assert.equal(denied.evidence.records_seen, null);
+  assert.equal(denied.evidence.records_total, null);
+});
+
 test("assessment summaries render null, not zero, for every unreadable dataset", async () => {
   const [scan, sensor, access, vuln] = await runAll(clientsFor(healthyRoutes(), { status: 403 }));
   for (const [key, value] of Object.entries(scan.summary)) {
