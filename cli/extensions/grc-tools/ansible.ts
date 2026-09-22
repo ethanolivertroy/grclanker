@@ -746,10 +746,11 @@ const ERROR_QUOTED_VALUE_PATTERN = String.raw`(\\?(["']))(?:(?!\\?\4)[^\n\\])+(\
  * separator, the scheme, and the quotes stay so the message remains diagnosable.
  */
 const ERROR_QUOTED_CREDENTIAL_PATTERN = new RegExp(
-  String.raw`\b(${ERROR_CREDENTIAL_KEY_PATTERN})((?:\\?["'])?\s*[=:]\s*(?:${ERROR_SCHEME_PATTERN}\s+)?)${ERROR_QUOTED_VALUE_PATTERN}`,
+  String.raw`\b(${ERROR_CREDENTIAL_KEY_PATTERN})((?:\\?["'])?\s*[=:]\s*(?:${ERROR_SCHEME_PATTERN}\s*)?)${ERROR_QUOTED_VALUE_PATTERN}`,
   "gi",
 );
-const ERROR_QUOTED_SCHEME_PATTERN = new RegExp(String.raw`\b(${ERROR_SCHEME_PATTERN})(\s+)${ERROR_QUOTED_VALUE_PATTERN}`, "gi");
+// A scheme word that is itself quoted (`"Token":"..."`, a JSON key) is a pair the rule above already handled.
+const ERROR_QUOTED_SCHEME_PATTERN = new RegExp(String.raw`(?<!["'\\])\b(${ERROR_SCHEME_PATTERN})(\s*)${ERROR_QUOTED_VALUE_PATTERN}`, "gi");
 const QUOTED_VALUE_REPLACEMENT = `$1$2$3${REDACTED_ERROR_VALUE}$5`;
 
 /**

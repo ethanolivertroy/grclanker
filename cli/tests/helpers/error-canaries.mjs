@@ -273,8 +273,15 @@ export const REDACTION_CASES = Object.freeze([
     absent: [],
     present: ["InvalidAuthenticationToken: Access token has expired.", "Basic authentication is disabled"],
   },
-  // Codex P1 (quoted header value): the quotes delimit the carrier, so the value is removed whole whatever its
-  // shape; the header name, the scheme, and the quotes stay.
+]);
+
+/**
+ * Codex P1 (quoted header value), token-shaped canaries: the quotes delimit the carrier, so the value is removed
+ * whole whatever its shape; the header name, the scheme, and the quotes stay. Kept beside REDACTION_CASES rather
+ * than inside it so a scrub that has not yet closed the class is judged by the sinks that claim it (the group D
+ * redactErrorText sinks through assertScrubBoundary), not by every consumer of the shared list.
+ */
+export const QUOTED_CARRIER_CASES = Object.freeze([
   {
     name: "quoted bearer token (Codex P1)",
     input: `upstream said Authorization: Bearer "${CANARY.bearer}" was rejected`,
@@ -288,10 +295,11 @@ export const REDACTION_CASES = Object.freeze([
     present: ["Authorization:Bearer '[REDACTED]' was rejected"],
   },
   {
+    // The header name survives; whether the quotes and the trailing prose do is the scrubber's choice.
     name: "quoted X-Auth-Key header (Codex P1, round 4 item F)",
     input: `X-Auth-Key: "${CANARY.apiKey}" was invalid`,
     absent: [CANARY.apiKey],
-    present: ["X-Auth-Key: [REDACTED]"],
+    present: ["X-Auth-Key: ", "[REDACTED]"],
   },
   {
     name: "bare X-Auth-Key and X-Auth-Email headers (round 4 item F)",
@@ -312,17 +320,17 @@ export const REDACTION_CASES = Object.freeze([
     present: ["Cookie: [REDACTED]"],
   },
   {
+    name: "spaceless quoted bearer token (Codex P1)",
+    input: `Authorization:Bearer"${CANARY.bearer}" was rejected`,
+    absent: [CANARY.bearer],
+    present: ['Authorization:Bearer"[REDACTED]" was rejected'],
+  },
+  {
+    // The keys and the escaped quotes survive; whether the scheme word stays beside the marker is the scrubber's choice.
     name: "JSON-escaped quoted headers (Codex P1)",
     input: `body was {\\"X-Auth-Key\\":\\"${CANARY.apiKey}\\",\\"Authorization\\":\\"Bearer ${CANARY.bearer}\\",\\"password\\":\\"${CANARY.basic}\\"}`,
     absent: [CANARY.apiKey, CANARY.bearer, CANARY.basic],
-    present: ['{\\"X-Auth-Key\\":\\"[REDACTED]\\",\\"Authorization\\":\\"[REDACTED]\\",\\"password\\":\\"[REDACTED]\\"}'],
-  },
-  {
-    // One carrier per line: the cookie and X-Auth-Key rules consume through the end of their line.
-    name: "name-shaped quoted values (the Codex P1 examples)",
-    input: 'Cookie: sid="prod-cookie"\nX-Api-Key: "prod-key"\nX-Auth-Key: "prod-key"\nAuthorization: Bearer "prod-token"\nAuthorization: Bearer \'prod-token\'',
-    absent: ["prod-cookie", "prod-key", "prod-token"],
-    present: ['Cookie: [REDACTED]\nX-Api-Key: "[REDACTED]"\nX-Auth-Key: [REDACTED]\nAuthorization: Bearer "[REDACTED]"\nAuthorization: Bearer \'[REDACTED]\''],
+    present: ['{\\"X-Auth-Key\\":\\"[REDACTED]\\",\\"Authorization\\":\\"', '[REDACTED]\\",\\"password\\":\\"[REDACTED]\\"}'],
   },
   {
     name: "quoted non-credential headers stay",
@@ -330,6 +338,34 @@ export const REDACTION_CASES = Object.freeze([
     absent: [],
     present: ['Content-Type: "application/json"', "Accept: 'application/json'", 'role "AWSLambdaBasicExecutionRole"'],
   },
+]);
+
+/**
+ * Codex P1 (quoted header value), the class as reported: a NAME-shaped value (the token scrub keeps such a value
+ * bare in prose) inside a quoted carrier, with the exact text expected after the scrub. Consumed by
+ * assertScrubBoundary, so a sink that has not yet closed the class fails on the value rather than on wording.
+ * The cookie and X-Auth-* rules consume through the end of their line; inside a JSON-escaped body the quoted
+ * pair rule keeps the escaped structure instead.
+ */
+export const NAME_SHAPED_QUOTED_CASES = Object.freeze([
+  ['Cookie: sid="prod-cookie" was rejected by the upstream proxy.', "Cookie: [REDACTED]", ["prod-cookie"]],
+  ['Set-Cookie: session="prod-cookie"; Path=/; HttpOnly rejected.', "Set-Cookie: [REDACTED]", ["prod-cookie"]],
+  ['Upstream error: X-Api-Key: "prod-key" is not authorized.', 'Upstream error: X-Api-Key: "[REDACTED]" is not authorized.', ["prod-key"]],
+  ["Upstream error: X-Api-Key: 'prod-key' is not authorized.", "Upstream error: X-Api-Key: '[REDACTED]' is not authorized.", ["prod-key"]],
+  ['Upstream error: x-api-key:"prod-key" is not authorized.', 'Upstream error: x-api-key:"[REDACTED]" is not authorized.', ["prod-key"]],
+  ['Cloudflare said X-Auth-Key: "prod-key" was invalid.', "Cloudflare said X-Auth-Key: [REDACTED]", ["prod-key"]],
+  ["Cloudflare said X-Auth-Key:'prod-key' was invalid.", "Cloudflare said X-Auth-Key:[REDACTED]", ["prod-key"]],
+  ['Gateway rejected Authorization: Bearer "prod-token" at the edge.', 'Gateway rejected Authorization: Bearer "[REDACTED]" at the edge.', ["prod-token"]],
+  ["Gateway rejected Authorization: Bearer 'prod-token' at the edge.", "Gateway rejected Authorization: Bearer '[REDACTED]' at the edge.", ["prod-token"]],
+  ['Gateway rejected Authorization:Bearer"prod-token" at the edge.', 'Gateway rejected Authorization:Bearer"[REDACTED]" at the edge.', ["prod-token"]],
+  ['Gateway rejected Basic "prod-token" at the edge.', 'Gateway rejected Basic "[REDACTED]" at the edge.', ["prod-token"]],
+  ['Config error: api_key="prod-key" was echoed back.', 'Config error: api_key="[REDACTED]" was echoed back.', ["prod-key"]],
+  ['Login failed: "password": "prod-key" in the response body.', 'Login failed: "password": "[REDACTED]" in the response body.', ["prod-key"]],
+  [
+    'body was {\\"X-Auth-Key\\":\\"prod-key\\",\\"Authorization\\":\\"Bearer prod-token\\",\\"Cookie\\":\\"sid=prod-cookie\\"}',
+    'body was {\\"X-Auth-Key\\":\\"[REDACTED]\\",\\"Authorization\\":\\"[REDACTED]\\",\\"Cookie\\":\\"[REDACTED]\\"}',
+    ["prod-key", "prod-token", "prod-cookie"],
+  ],
 ]);
 
 /**
@@ -347,10 +383,11 @@ export const QUOTED_NON_CREDENTIAL_TEXTS = Object.freeze([
 
 /**
  * The absent values are checked window by window; the present values must survive whole; and a second pass over
- * the scrubbed output changes nothing, since error sinks scrub at more than one layer.
+ * the scrubbed output changes nothing, since error sinks scrub at more than one layer. Defaults to the shared
+ * REDACTION_CASES; pass QUOTED_CARRIER_CASES (or both) for a sink that claims the Codex P1 class.
  */
-export function assertRedactionCases(assert, redact) {
-  for (const testCase of REDACTION_CASES) {
+export function assertRedactionCases(assert, redact, cases = REDACTION_CASES) {
+  for (const testCase of cases) {
     const output = redact(testCase.input);
     assertNoCanaryWindows(assert, output, testCase.absent, testCase.name);
     for (const value of testCase.present ?? []) {
@@ -470,6 +507,13 @@ export function assertScrubBoundary(assert, redact, { configuredSecret, mustKeep
       assert.equal(output, "upstream echoed [REDACTED] in its message", `configured secret form is removed: ${form}`);
       assertNoCanaryWindows(assert, output, forms, `configured secret form ${form}`);
     }
+  }
+  assertRedactionCases(assert, redact, QUOTED_CARRIER_CASES);
+  for (const [input, expected, values] of NAME_SHAPED_QUOTED_CASES) {
+    const output = redact(input);
+    assertNoCanaryWindows(assert, output, values, `Codex P1 quoted header value: ${input}`);
+    assert.equal(output, expected, `Codex P1 quoted header value is removed whole: ${input}`);
+    assert.equal(redact(output), output, `Codex P1 quoted header value: a second pass changes nothing: ${input}`);
   }
   for (const text of QUOTED_NON_CREDENTIAL_TEXTS) {
     assert.equal(redact(text), text, `quoted non-credential header survives the scrub: ${text}`);
