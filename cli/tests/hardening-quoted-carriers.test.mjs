@@ -410,6 +410,78 @@ test("compound lines: each credential value goes, the following header names and
   }
 });
 
+/**
+ * CodeRabbit (#78), discussion_r4076392614: the cookie attribute pattern allowed only `[A-Za-z0-9_-]`
+ * in a later pair or attribute name, so `Cookie: theme=dark; my.sid=<v>` ended the scan at the `.`
+ * and left `Cookie: [REDACTED].sid=<v>`, which no later rule removed. A cookie name may hold any RFC
+ * 6265 token character (`!#$%&'*+-.^_` + "`|~" and alphanumerics; real names: `ASP.NET_SessionId`,
+ * `.AspNetCore.Session`). The later-name class is now the first-pair-name class less `:`, so a
+ * `; Name:` token still ends the value for the next header on a compound line. Each row plants the
+ * first value in the cookie and, where a second header follows, the second value in that header.
+ */
+const RFC6265_COOKIE_NAME_ROWS = Object.freeze([
+  ["dot in a later pair name", (a) => `Cookie: theme=dark; my.sid=${a}`, () => `Cookie: ${REDACTED}`, []],
+  ["ASP.NET session name then an attribute", (a) => `Cookie: theme=dark; ASP.NET_SessionId=${a}; Path=/`, () => `Cookie: ${REDACTED}`, []],
+  ["leading-dot ASP.NET Core name with attributes", (a) => `Set-Cookie: .AspNetCore.Session=${a}; HttpOnly; SameSite=Lax`, () => `Set-Cookie: ${REDACTED}`, []],
+  ["leading-dot name as a later pair", (a) => `Cookie: theme=dark; .AspNetCore.Antiforgery.x9=${a}; lang=en`, () => `Cookie: ${REDACTED}`, []],
+  ["every RFC 6265 token character in a name before the credential pair", (a) => `Cookie: a=b; x!y#z$w%u&t*s+r^q\`p|o~n=1; sid=${a}`, () => `Cookie: ${REDACTED}`, []],
+  ["token-character name carrying the value", (a) => `Cookie: lang=en; ~sid!=${a}; Path=/`, () => `Cookie: ${REDACTED}`, []],
+  ["dot name with a quoted value", (a) => `Cookie: theme=dark; my.sid="${a}"; Secure`, () => `Cookie: ${REDACTED}`, []],
+  ["dot name in a Set-Cookie with spaced separators", (a) => `Set-Cookie: theme = dark; my.sid = ${a}; Path=/`, () => `Set-Cookie: ${REDACTED}`, []],
+  ["dot name in a JSON pair", (a) => `"Cookie": "theme=dark; my.sid=${a}"`, () => `"Cookie": "${REDACTED}"`, []],
+  ["dot name in a JSON-escaped pair", (a) => `\\"Cookie\\":\\"theme=dark; my.sid=${a}\\"`, () => `\\"Cookie\\":\\"${REDACTED}\\"`, []],
+  [
+    "compound control: dot name, then two headers keep their names",
+    (a, b) => `Cookie: a=b; my.sid=${a}; X-Api-Key: ${b}; Content-Type: text/html`,
+    () => `Cookie: ${REDACTED}; X-Api-Key: ${REDACTED}; Content-Type: text/html`,
+    ["X-Api-Key:", "Content-Type: text/html"],
+  ],
+  [
+    "compound control: token-character name, then a quoted header and a Date header",
+    (a, b) => `Cookie: lang=en; ~sid!=${a}; X-Auth-Token: "${b}"; Date: Mon, 22 Sep 2026 12:30:00 GMT`,
+    () => `Cookie: ${REDACTED}; X-Auth-Token: "${REDACTED}"; Date: Mon, 22 Sep 2026 12:30:00 GMT`,
+    ["X-Auth-Token:", "Date: Mon, 22 Sep 2026 12:30:00 GMT"],
+  ],
+  [
+    "compound control: ASP.NET name and attributes, then a Content-Type with a semicolon in quotes",
+    (a) => `Set-Cookie: ASP.NET_SessionId=${a}; Path=/; HttpOnly; Content-Type: "text/html; charset=utf-8"`,
+    () => `Set-Cookie: ${REDACTED}; Content-Type: "text/html; charset=utf-8"`,
+    ['Content-Type: "text/html; charset=utf-8"'],
+  ],
+]);
+
+test("CodeRabbit (#78): a later cookie name with a dot or any RFC 6265 token character keeps the scan going, so its value goes with the header, and the following header names still stay", () => {
+  const legitimate = new Map(RFC6265_COOKIE_NAME_ROWS.map(([label, line]) => [label, line("", "")]));
+  assertCanariesDisjointFromFixture(assert, plantedValues(), legitimate, "RFC 6265 cookie names");
+  for (const [label, line, expected, keeps] of RFC6265_COOKIE_NAME_ROWS) {
+    for (const [a, b] of plantedPairs()) {
+      const input = line(a, b);
+      const planted = [a, b].filter((value) => input.includes(value));
+      for (const [scrubName, scrub] of EXACT_SCRUBS) {
+        const output = scrub(input);
+        assert.equal(output, expected(), `${scrubName}: ${label} with ${a} and ${b}`);
+        for (const text of keeps) assert.ok(output.includes(text), `${scrubName}: ${label}: ${JSON.stringify(text)} did not survive in ${output}`);
+        assertNoCanaryWindows(assert, output, planted, `${scrubName}: ${label}`);
+        assert.equal(scrub(output), output, `${scrubName}: ${label}: a second pass changed the text`);
+      }
+      assertNoCanaryWindows(assert, errorMessage(new Error(input)), planted, `errorMessage: ${label}`);
+      const body = JSON.stringify({ message: `upstream sent ${input}` });
+      assert.equal(describeErrorBody("application/json", body), `upstream sent ${expected()}`, `describeErrorBody: ${label}`);
+      const described = describeFailedResponse({ method: "GET", endpoint: "/v1/users", status: 502, statusText: "Bad Gateway", contentType: "application/json", body });
+      assert.equal(described, `GET /v1/users failed with 502 Bad Gateway: upstream sent ${expected()}`, `describeFailedResponse: ${label}`);
+      assertNoCanaryWindows(assert, described, planted, `describeFailedResponse: ${label}`);
+    }
+  }
+  // The reported rendering, and the real names, with the literal value CodeRabbit used.
+  assert.equal(scrubErrorText("Cookie: theme=dark; my.sid=hunter2"), `Cookie: ${REDACTED}`);
+  assert.equal(scrubErrorText("Cookie: theme=dark; ASP.NET_SessionId=abc; Path=/"), `Cookie: ${REDACTED}`);
+  assert.equal(scrubErrorText("Set-Cookie: .AspNetCore.Session=v; HttpOnly; SameSite=Lax"), `Set-Cookie: ${REDACTED}`);
+  assert.equal(scrubErrorText("Cookie: a=b; my.sid=v; X-Api-Key: w; Content-Type: text/html"), `Cookie: ${REDACTED}; X-Api-Key: ${REDACTED}; Content-Type: text/html`);
+  // A `; Name:` token after a dot-named pair is still the next header, not an attribute.
+  assert.equal(scrubErrorText("Cookie: my.sid=v; X-Api-Key: w"), `Cookie: ${REDACTED}; X-Api-Key: ${REDACTED}`);
+  assert.equal(scrubErrorText("Cookie: my.sid=v; Content-Type: text/html"), `Cookie: ${REDACTED}; Content-Type: text/html`);
+});
+
 test("compound lines: a documented message field of a 502 body carrying one comes out of describeFailedResponse and describeErrorBody with the same rendering", () => {
   for (const [label, line, expected] of COMPOUND_LINES) {
     for (const [a, b] of plantedPairs().slice(0, 4)) {

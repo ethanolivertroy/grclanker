@@ -144,7 +144,10 @@ const NAME_CLOSE_AND_SEPARATOR = String.raw`(?:\\*["'])?\s*[:=]\s*`;
 const COOKIE_HEADER_PATTERN = new RegExp(String.raw`${NAME_START}(set-cookie|cookies?)${NAME_CLOSE_AND_SEPARATOR}`, "gi");
 const COOKIE_PAIR_NAME_PATTERN = /[^\s;,"'<>=()[\]{}\\]+/y;
 const COOKIE_BARE_VALUE_PATTERN = /[^\s;,"'<>()[\]{}\\]*/y;
-const COOKIE_ATTRIBUTE_PATTERN = /;[ \t]*[A-Za-z0-9_-]+/y;
+// A later pair or attribute name after `;`: the pair-name class less `:`, so any RFC 6265 token
+// character continues the scan (`my.sid`, `ASP.NET_SessionId`, `.AspNetCore.Session`, `~sid!`) and a
+// `; Name:` token still ends the value for the next header on a compound line (CodeRabbit on #78).
+const COOKIE_ATTRIBUTE_PATTERN = /;[ \t]*[^\s;,:"'<>=()[\]{}\\]+/y;
 // The compound-line rule, the same in every scrubber: a quoted value ends at its closing quote; an
 // unquoted cookie or header value, and a quoted one that is never closed, ends at the `;` or `,` that
 // introduces the next `Name:` token on the line (`Cookie: sid=<v>; X-Api-Key: "<v>"; Content-Type:
