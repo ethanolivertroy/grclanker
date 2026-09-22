@@ -2045,8 +2045,6 @@ test("reviewer C final verdict, item G: the value under a credential-named key i
       for (const form of PAIR_FORMS) {
         const pair = form(key, value);
         for (const [frameName, frame] of PAIR_FRAMES) {
-          // The JSON forms inside the double-escaped raw member sit at quote depth 2; the quote-aware reader (item F) covers them.
-          if (frameName === "502-json-raw" && pair.startsWith("{")) continue;
           const input = frame(pair);
           const scrubbed = scrubErrorText(input);
           const label = `${frameName}: ${input}`;
@@ -2119,6 +2117,95 @@ test("reviewer C final verdict, item G: the value under a credential-named key i
   assert.equal(scrubErrorText("callback_url: https://app.example.com/oauth/callback?code=abc123def456"), "callback_url: https://app.example.com/[REDACTED]");
   assert.equal(scrubErrorText("webhook_secret=monkey"), "webhook_secret=[REDACTED]");
   for (const line of ["webhook_url=https://hooks.example.com/[REDACTED]", "callback_url: https://app.example.com/[REDACTED]"]) assert.equal(scrubErrorText(line), line, `second pass over ${line}`);
+});
+
+/** Reviewer C's literal escapes (item H): the two- and six-character sequences as they sit inside error text, not the control characters. */
+const LITERAL_ESCAPES = ["\\n", "\\r\\n", "\\t", "\\b", "\\f", "\\/", "\\u000a", "\\u0009", "\\u000d\\u000a"];
+/** The header lines of rows (b) and (ii) glued to an escape; each gives the line and its expected rendering, or null where the scrubber's HMAC rendering differs by integration. */
+const ESCAPED_HEADER_LINES = [
+  (value) => [`api_key=${value}`, "api_key=[REDACTED]"],
+  (value) => [`password: ${value}`, "password: [REDACTED]"],
+  (value) => [`X-Api-Key: ${value}`, "X-Api-Key: [REDACTED]"],
+  (value) => [`Cookie: sid=${value}`, "Cookie: [REDACTED]"],
+  (value) => [`Authorization: Bearer ${value}`, "Authorization: Bearer [REDACTED]"],
+  (value) => [`Authorization: SSWS ${value}`, "Authorization: SSWS [REDACTED]"],
+  (value) => [`Authorization: Splunk ${value}`, "Authorization: Splunk [REDACTED]"],
+  (value) => [`Authorization: Basic ${value}`, "Authorization: Basic [REDACTED]"],
+  (value) => [`Authorization: VERACODE-HMAC-SHA-256 id=${value},ts=1758560000000,nonce=${value},sig=${value}`, null],
+  (value) => [`X-Snowflake-Authorization-Token-Type: KEYPAIR_JWT\\u000aAuthorization: Bearer ${value}`, "X-Snowflake-Authorization-Token-Type: KEYPAIR_JWT\\u000aAuthorization: Bearer [REDACTED]"],
+];
+/** The text before the escape: a colon-terminated word is the case that used to swallow the header line as its value. */
+const ESCAPE_PREFIXES = ["request failed", "request headers:"];
+/** The frames of item H: a bare line, a 502 banner ending in a colon, a JSON string member holding the literal escapes, and a double-escaped raw member (each with the encoding the frame applies to its inner text). */
+const ESCAPE_FRAMES = [
+  ["line", (text) => text, (text) => text],
+  ["502-text", (text) => `Vendor request failed (502 Bad Gateway) for /api/v1/items: Environment as echoed by the proxy:${text}`, (text) => text],
+  ["json-member", (text) => `{"message":"${text}"}`, (text) => text],
+  ["502-json-raw", (text) => `{"status":502,"raw":${JSON.stringify(JSON.stringify({ env: [text] }))}}`, (text) => JSON.stringify(JSON.stringify(text).slice(1, -1)).slice(1, -1)],
+];
+
+test("reviewer C final verdict, item H: a literal JSON escape is a boundary before every carrier opener, so a header line glued to an escape is scrubbed as a header line and never as the value of the word before it", () => {
+  for (const escape of LITERAL_ESCAPES) {
+    for (const prefix of ESCAPE_PREFIXES) {
+      for (const value of PAIR_VALUE_SHAPES) {
+        for (const headerLine of ESCAPED_HEADER_LINES) {
+          const [line, expectedLine] = headerLine(value);
+          for (const [frameName, frame, encode] of ESCAPE_FRAMES) {
+            const input = frame(`${prefix}${escape}${line}`);
+            const scrubbed = scrubErrorText(input);
+            const label = `${frameName}: ${input}`;
+            assertNoWindowOf(scrubbed, value, label);
+            assert.ok(scrubbed.includes("[REDACTED]"), `the value is replaced by the marker in ${label} -> ${scrubbed}`);
+            assert.ok(scrubbed.includes(encode(`${prefix}${escape}${line.split(/[ =]/)[0]}`)), `the prefix, the escape, and the header name stay in ${label} -> ${scrubbed}`);
+            if (expectedLine !== null) assert.equal(scrubbed, frame(`${prefix}${escape}${expectedLine}`), label);
+            else assert.ok(scrubbed.includes("Authorization: VERACODE-HMAC-SHA-256 "), `the HMAC scheme word stays in ${label} -> ${scrubbed}`);
+            assert.equal(scrubErrorText(scrubbed), scrubbed, `second pass over ${label}`);
+          }
+        }
+      }
+    }
+  }
+
+  // The reviewer's literal rows (b) and (ii).
+  assert.equal(scrubErrorText("request headers:\\u000aAuthorization: Splunk abcdefghijklmnop"), "request headers:\\u000aAuthorization: Splunk [REDACTED]");
+  assert.equal(scrubErrorText('{"message":"request headers:\\u000aAuthorization: Splunk abcdefghijklmnop"}'), '{"message":"request headers:\\u000aAuthorization: Splunk [REDACTED]"}');
+  assert.equal(scrubErrorText("request headers:\\u0009X-Api-Key: hunter2"), "request headers:\\u0009X-Api-Key: [REDACTED]");
+  assert.equal(scrubErrorText("request headers:\\u000aAuthorization: SSWS p@ss"), "request headers:\\u000aAuthorization: SSWS [REDACTED]");
+  assert.equal(scrubErrorText("request headers:\\u000d\\u000aAuthorization: Bearer abc12"), "request headers:\\u000d\\u000aAuthorization: Bearer [REDACTED]");
+  assert.equal(
+    scrubErrorText("Vendor request failed (502 Bad Gateway) for /api/v1/items: Environment as echoed by the proxy:\\tpassword: hunter2"),
+    "Vendor request failed (502 Bad Gateway) for /api/v1/items: Environment as echoed by the proxy:\\tpassword: [REDACTED]",
+  );
+  for (const banner of ["proxy:", "proxy.", "proxy"]) assert.equal(scrubErrorText(`${banner}\\n\\nX-Api-Key: hunter2`), `${banner}\\n\\nX-Api-Key: [REDACTED]`);
+  assert.equal(scrubErrorText("upstream said\\nAuthorization: Bearer hunter2"), "upstream said\\nAuthorization: Bearer [REDACTED]");
+  assert.equal(scrubErrorText('{\\n  \\"password\\": \\"monkey\\"\\n}'), '{\\n  \\"password\\": \\"[REDACTED]\\"\\n}');
+
+  // Every anchored token shape starts after the escape and never on its letter; a value, URL, or query pair ends at the backslash of the next escape.
+  const shapes = [
+    ["eyJhbGciOiJSUzI1NiJ9.eyJzdWIiOiJhIn0.c2lnbmF0dXJl", "a JWT"],
+    ["AKIAIOSFODNN7EXAMPLE", "an AWS access key id"],
+    ["wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY", "an AWS secret access key"],
+    ["9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08", "a hex digest"],
+    ["xKqZvBnMwLpRtYsHdG", "a run with token casing"],
+    ["sk_live_abcdefghij1234567890", "a vendor-prefixed token"],
+    ["ghp_abcdefghijklmnopqrstuvwxyz0123", "a GitHub token"],
+  ];
+  for (const escape of LITERAL_ESCAPES) {
+    for (const [shape, description] of shapes) {
+      assert.equal(scrubErrorText(`trace${escape}${shape} end`), `trace${escape}[REDACTED] end`, `${description} after ${escape}`);
+      assert.equal(scrubErrorText(`{"message":"trace${escape}${shape}${escape}end"}`), `{"message":"trace${escape}[REDACTED]${escape}end"}`, `${description} between two ${escape}`);
+    }
+    assert.equal(scrubErrorText(`trace${escape}name_with_words-2026 and${escape}ERR_MODULE_NOT_FOUND`), `trace${escape}name_with_words-2026 and${escape}ERR_MODULE_NOT_FOUND`, `a name after ${escape} stays whole`);
+    assert.equal(scrubErrorText(`note${escape}https://example.com/a?token=abc123def456${escape}next`), `note${escape}https://example.com/a?[REDACTED]${escape}next`, `a URL after ${escape}`);
+    assert.equal(scrubErrorText(`Bearer abcdefghijklmnop${escape}X-Api-Key: guest`), `Bearer [REDACTED]${escape}X-Api-Key: [REDACTED]`, `a scheme value ends at ${escape}`);
+    assert.equal(scrubErrorText(`Cookie: sid=hunter2${escape}X-Api-Key: guest`), `Cookie: [REDACTED]${escape}X-Api-Key: [REDACTED]`, `a cookie value ends at ${escape}`);
+  }
+  // A "\/" escape is a boundary rather than a path separator: a key or token after it is judged on its own, while a plain "/" still names a bare path segment.
+  assert.equal(scrubErrorText("path \\/api\\/v1\\/users\\/00u1abcd2EFGH3ijk4x5\\/factors"), "path \\/api\\/v1\\/users\\/[REDACTED]\\/factors");
+  assert.equal(scrubErrorText("path /api/v1/users/00u1abcd2EFGH3ijk4x5/factors"), "path /api/v1/users/00u1abcd2EFGH3ijk4x5/factors");
+  // A lone backslash is not an opening quote and does not hide the value after it.
+  assert.equal(scrubErrorText("password: \\hunter2"), "password: [REDACTED]");
+  assert.equal(scrubErrorText("Authorization: Bearer \\hunter2"), "Authorization: Bearer [REDACTED]");
 });
 
 const SUMOLOGIC_REQUESTED_PATHS = [

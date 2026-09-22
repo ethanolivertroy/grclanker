@@ -179,62 +179,93 @@ export interface OktaNotCollectedMarker {
 //   origin, because the token of a webhook URL sits in its path.
 // Identifier keys without a credential word (OKTA_CLIENT_ID, SUMO_ACCESS_ID, SNOWFLAKE_ACCOUNT,
 // X-Request-Id) are not pairs under this rule; their values are judged by shape only.
+//
+// The escape rule (reviewer C, item H): a literal JSON escape is a boundary before every carrier
+// opener, so a header line that begins after one ("request headers:\u000aAuthorization: Splunk
+// <key>", "proxy:\n\tpassword: hunter2") is scrubbed as a header line, never as the value of the
+// word before the escape; see the note above ESCAPE_LETTER.
 // ---------------------------------------------------------------------------------------------
 
 const MIN_CONFIGURED_SECRET_LENGTH = 4;
 const LONG_TOKEN_MIN_LENGTH = 16;
 const MIN_LETTERS_FOR_CASING = 6;
 
+// A literal JSON escape ("\n", "\r", "\t", "\b", "\f", "\/", "\uXXXX": the two- or six-character
+// sequence, not the control character) is a boundary before every carrier opener. A header name,
+// scheme word, pair key, URL, or token that begins right after one is read on its own, never as the
+// value of the word before the escape and never with the escape letter as its first character, and
+// a value, URL, or query pair ends at the backslash that opens the next escape. A backslash joins a
+// quote only as its escape, so a lone backslash is never read as an opening quote.
+const ESCAPE_LETTER = String.raw`(?:[nrtbf/]|u[0-9A-Fa-f]{4})`;
+/** The start of a carrier or token: outside a word (none of `wordCharacters` before it) or right after a literal escape, and not on an escape letter. */
+function carrierStart(wordCharacters: string): string {
+  return String.raw`(?:(?<![${wordCharacters}])|(?<=\\[nrtbf/]|\\u[0-9A-Fa-f]{4}))(?!(?<=\\)${ESCAPE_LETTER})`;
+}
+const CARRIER_START = carrierStart("A-Za-z0-9_");
+/** A quote unit at any JSON depth: the quote character and the backslashes that escape it (`"`, `\"`, `\\\"`). */
+const QUOTE_UNIT = String.raw`(?:\\*["'])`;
+
 const PEM_BLOCK_PATTERN = /-----BEGIN [A-Z0-9 ]+-----[\s\S]*?-----END [A-Z0-9 ]+-----/g;
 const PEM_OPEN_PATTERN = /-----BEGIN [A-Z0-9 ]+-----[\s\S]*$/;
-const EMBEDDED_URL_PATTERN = /\b[a-z][a-z0-9+.-]*:\/\/[^\s"'<>()[\]{}]+/gi;
+const EMBEDDED_URL_PATTERN = new RegExp(String.raw`${CARRIER_START}[a-z][a-z0-9+.-]*:\/\/[^\s"'<>()[\]{}\\]+`, "gi");
 const URL_PARTS_PATTERN = /^([a-z][a-z0-9+.-]*:\/\/)(?:[^\s/@"'<>]+@)?([^?#]*)(\?[^#]*)?(#.*)?$/i;
 const TRAILING_PUNCTUATION_PATTERN = /[.,;:!?]+$/;
 const TRAILING_WHITESPACE_PATTERN = /[ \t]+$/;
-const QUERY_PAIR_PATTERN = /([?&])([A-Za-z0-9_.[\]-]+)=([^&#\s"'<>)\]}]+)/g;
+const QUERY_PAIR_PATTERN = /([?&])([A-Za-z0-9_.[\]-]+)=([^&#\s"'<>)\]}\\]+)/g;
 // A cookie header value quoted as a whole ends at its closing quote (plain, single, or JSON-escaped).
 // An unquoted value may hold quoted pair values after "=" and runs to the end of the line, except that it
-// ends at a ";" or "," that precedes the next "Name:" header token or a JSON fragment, and at whitespace
-// before a JSON fragment, so a following header keeps its name and gets its own carrier treatment.
-const COOKIE_HEADER_PATTERN =
-  /\b(set-cookie|cookies?)(\\?["']?\s*[:=]\s*)(?!\\?["']?\[REDACTED\])(?:(\\?["'])[^"'\r\n\\]*\\?["']|([^\r\n\t <>"'\\;,=](?:[^\r\n\t <>"'\\;,=]|=[ \t]*(?:\\?["'](?:[^"'\r\n\\]*\\?["']|[^\r\n]*))?|[;,](?![ \t]*(?:[{[]|\\?["']?[A-Za-z][A-Za-z0-9_-]*\\?["']?[ \t]*:))|[ \t](?![ \t]*[{[]))*))/gi;
+// ends at a ";" or "," that precedes the next "Name:" header token or a JSON fragment, at whitespace
+// before a JSON fragment, and at a literal escape, so a following header keeps its name and gets its own carrier treatment.
+const COOKIE_HEADER_PATTERN = new RegExp(
+  String.raw`${CARRIER_START}(set-cookie|cookies?)(${QUOTE_UNIT}?\s*[:=]\s*)(?!${QUOTE_UNIT}?\[REDACTED\])(?:(${QUOTE_UNIT})[^"'\r\n\\]*${QUOTE_UNIT}|([^\r\n\t <>"'\\;,=](?:[^\r\n\t <>"'\\;,=]|=[ \t]*(?:${QUOTE_UNIT}(?:[^"'\r\n\\]*${QUOTE_UNIT}|[^\r\n]*))?|[;,](?![ \t]*(?:[{[]|${QUOTE_UNIT}?[A-Za-z][A-Za-z0-9_-]*${QUOTE_UNIT}?[ \t]*:))|[ \t](?![ \t]*[{[]))*))`,
+  "gi",
+);
 // A scheme word spelled as a header scheme followed by a run of 8 or more token characters is a
 // credential whatever the run's shape; only the mechanism words vendor prose puts there ("Basic
 // authentication", "Bearer credentials") are kept. Lowercase spellings in prose ("token provided")
 // are not schemes; inside an Authorization carrier the scheme word is matched case-insensitively.
 // The token after a scheme word may be quoted (plain, single, or JSON-escaped); the quote is kept and the token removed.
-const SCHEME_VALUE_PATTERN =
-  /\b(Bearer|BEARER|Basic|BASIC|Digest|DIGEST|Token|TOKEN|OAuth|OAUTH|Negotiate|NEGOTIATE|NTLM|SSWS|ApiKey|APIKEY|Api-Key|API-KEY|VERACODE-HMAC-SHA-256)\s+(\\?["']?)([A-Za-z0-9._~+/=-]{8,})/g;
+const SCHEME_VALUE_PATTERN = new RegExp(
+  String.raw`${CARRIER_START}(Bearer|BEARER|Basic|BASIC|Digest|DIGEST|Token|TOKEN|OAuth|OAUTH|Negotiate|NEGOTIATE|NTLM|SSWS|ApiKey|APIKEY|Api-Key|API-KEY|VERACODE-HMAC-SHA-256)\s+(${QUOTE_UNIT}?)([A-Za-z0-9._~+/=-]{8,})`,
+  "g",
+);
 const SCHEME_PROSE_WORDS = new Set(["authentication", "authorization", "authenticated", "authorized", "credential", "credentials", "challenge"]);
 const SCHEME_WORD_PATTERN = /^(?:bearer|basic|digest|token|oauth|negotiate|ntlm|ssws|apikey|api-key|splunk|hmac|veracode-hmac-sha-256)$/i;
-const SCHEME_TOKEN_PATTERN = /^(\s+)(?!\[REDACTED\])(\\?["']?)([^\s"'<>;,()[\]{}\\]+)/;
-// A pair key or value may sit in plain, single, or JSON-escaped quotes; the value ends at a quote or the escaping backslash.
-const ASSIGNMENT_KEY_PATTERN = /(\\?["']?)\b([A-Za-z][A-Za-z0-9_.-]{0,63})\b(\\?["']?\s*([:=])\s*(\\?["']?))/g;
-const ASSIGNMENT_VALUE_PATTERN = /(?!\[REDACTED\])[^\s"'<>;,&()[\]{}\\]+/y;
+// A value may begin with backslashes that open no escape and no quote (a Windows path, a stray
+// backslash); they go with the value rather than hiding it.
+const STRAY_BACKSLASHES = String.raw`(?:\\+(?![nrtbf/u"']))?`;
+const SCHEME_TOKEN_PATTERN = new RegExp(String.raw`^(\s+)(?!\[REDACTED\])(${QUOTE_UNIT}?)(${STRAY_BACKSLASHES}[^\s"'<>;,()[\]{}\\]+)`);
+// A pair key or value may sit in plain, single, or JSON-escaped quotes at any depth; the value ends at a quote or the escaping backslash.
+const ASSIGNMENT_KEY_PATTERN = new RegExp(String.raw`(${QUOTE_UNIT}?)${CARRIER_START}([A-Za-z][A-Za-z0-9_.-]{0,63})\b(${QUOTE_UNIT}?\s*([:=])\s*(${QUOTE_UNIT}?))`, "g");
+const ASSIGNMENT_VALUE_PATTERN = new RegExp(String.raw`(?!\[REDACTED\])${STRAY_BACKSLASHES}[^\s"'<>;,&()[\]{}\\]+`, "y");
 const URL_ORIGIN_PATTERN = /^[a-z][a-z0-9+.-]*:\/\/[^\s/?#@"'<>]+(?=[/?#]|$)/i;
 const SINGLE_RUN_PATTERN = /^[A-Za-z0-9+=_-]+$/;
 const BEARER_ID_KEY_PATTERN = /(?:secret|session)[_.-]?id$/i;
 const BEARER_ID_KEY_SEGMENTS = new Set(["sid", "jsessionid", "phpsessid", "sessid"]);
 const SETTING_KEY_SUFFIXES = new Set(["url", "uri", "endpoint", "method", "algorithm", "audience", "issuer", "shape", "type", "mode", "path", "file", "dir", "limit", "count", "id", "name", "policy", "policies"]);
-const JWT_IN_TEXT_PATTERN = /\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}(?:\.[A-Za-z0-9_-]+)*/g;
-const AWS_ACCESS_KEY_ID_PATTERN = /\b(?:AKIA|ASIA|AROA|AIDA|AGPA|ANPA|ANVA|APKA|ABIA|ACCA)[A-Z0-9]{16}\b/g;
-const AWS_SECRET_PATTERN = /(?<![A-Za-z0-9/+=])[A-Za-z0-9/+]{40}(?![A-Za-z0-9/+=])/g;
-const HEX_DIGEST_PATTERN = /\b[A-Fa-f0-9]{32,}\b/g;
-const VENDOR_TOKEN_PATTERNS: readonly RegExp[] = [
-  /\b00[A-Za-z0-9_-]{40}\b/g,
-  /\bxox[abopers]-[A-Za-z0-9-]{10,}/g,
-  /\bgh[pousr]_[A-Za-z0-9]{20,}/g,
-  /\bgithub_pat_[A-Za-z0-9_]{20,}/g,
-  /\bglpat-[A-Za-z0-9_-]{20,}/g,
-  /\bAIza[0-9A-Za-z_-]{35}\b/g,
-  /\bya29\.[0-9A-Za-z._-]{20,}/g,
-  /\bsk_(?:live|test)_[A-Za-z0-9]{10,}/g,
-  /\bSG\.[A-Za-z0-9_-]{16,}\.[A-Za-z0-9_-]{16,}/g,
+// Every token shape starts at a carrier start, so a token glued to a literal escape ("\neyJ...",
+// "\u000aAKIA...") is read after the escape and never with the escape letter as its first character.
+const JWT_IN_TEXT_PATTERN = new RegExp(String.raw`${CARRIER_START}eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}(?:\.[A-Za-z0-9_-]+)*`, "g");
+const AWS_ACCESS_KEY_ID_PATTERN = new RegExp(String.raw`${CARRIER_START}(?:AKIA|ASIA|AROA|AIDA|AGPA|ANPA|ANVA|APKA|ABIA|ACCA)[A-Z0-9]{16}\b`, "g");
+const AWS_SECRET_PATTERN = new RegExp(String.raw`${carrierStart("A-Za-z0-9/+=")}[A-Za-z0-9/+]{40}(?![A-Za-z0-9/+=])`, "g");
+const HEX_DIGEST_PATTERN = new RegExp(String.raw`${CARRIER_START}[A-Fa-f0-9]{32,}\b`, "g");
+const VENDOR_TOKEN_SHAPES: readonly string[] = [
+  String.raw`00[A-Za-z0-9_-]{40}\b`,
+  String.raw`xox[abopers]-[A-Za-z0-9-]{10,}`,
+  String.raw`gh[pousr]_[A-Za-z0-9]{20,}`,
+  String.raw`github_pat_[A-Za-z0-9_]{20,}`,
+  String.raw`glpat-[A-Za-z0-9_-]{20,}`,
+  String.raw`AIza[0-9A-Za-z_-]{35}\b`,
+  String.raw`ya29\.[0-9A-Za-z._-]{20,}`,
+  String.raw`sk_(?:live|test)_[A-Za-z0-9]{10,}`,
+  String.raw`SG\.[A-Za-z0-9_-]{16,}\.[A-Za-z0-9_-]{16,}`,
 ];
-// "/", ".", ":", "@", "=", and whitespace end a run, so URL path segments, dotted hostnames, and the
-// two sides of a pair are judged on their own; "=" joins a run only as trailing base64 padding, so a
-// key whose value was already replaced ("httpEventCollectorToken=[REDACTED]") keeps its name.
-const LONG_TOKEN_RUN_PATTERN = new RegExp(`[A-Za-z0-9+_-]{${LONG_TOKEN_MIN_LENGTH},}(?:={1,2}(?![A-Za-z0-9&\\[]))?`, "g");
+const VENDOR_TOKEN_PATTERNS: readonly RegExp[] = VENDOR_TOKEN_SHAPES.map((shape) => new RegExp(`${CARRIER_START}${shape}`, "g"));
+// "/", ".", ":", "@", "=", "\", and whitespace end a run, so URL path segments, dotted hostnames, the
+// two sides of a pair, and the text on either side of a literal escape are judged on their own; "="
+// joins a run only as trailing base64 padding, so a key whose value was already replaced
+// ("httpEventCollectorToken=[REDACTED]") keeps its name.
+const LONG_TOKEN_RUN_PATTERN = new RegExp(String.raw`${carrierStart("A-Za-z0-9+_-")}[A-Za-z0-9+_-]{${LONG_TOKEN_MIN_LENGTH},}(?:={1,2}(?![A-Za-z0-9&\[]))?`, "g");
 const DIGIT_GROUP_PATTERN = /\d+/g;
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const SAFE_KEY_SHAPE_PATTERN = /^(?:max|min)[_-]|[_-](?:limit|days|hours|minutes|seconds|count|path|file|dir)$/i;
@@ -346,9 +377,10 @@ function looksLikeToken(run: string): boolean {
   return run.split(/[-_]/).some((segment) => hasTokenCasing(segment.replace(DIGIT_GROUP_PATTERN, "")));
 }
 
-/** True when the run at `index` is a segment of a bare path: preceded by a path separator and not inside a URL that carries a scheme. */
+/** True when the run at `index` is a segment of a bare path: preceded by a path separator ("/" or a lone "\"; the escape "\/" is a boundary, not a separator) and not inside a URL that carries a scheme. */
 function isBarePathSegment(text: string, index: number, urlSpans: ReadonlyArray<readonly [number, number]>): boolean {
-  if (index === 0 || (text[index - 1] !== "/" && text[index - 1] !== "\\")) return false;
+  const before = text[index - 1];
+  if (before === "/" ? text[index - 2] === "\\" : before !== "\\") return false;
   return !urlSpans.some(([start, end]) => index >= start && index < end);
 }
 
