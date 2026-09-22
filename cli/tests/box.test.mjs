@@ -35,7 +35,7 @@ import {
 } from "../dist/extensions/grc-tools/box.js";
 import { getRegisteredToolSummaries } from "../dist/pi/tool-catalog.js";
 import { assertSecretsAbsent, readBundleFiles, readZipEntries } from "./helpers/bundle-contents.mjs";
-import { assertCanaryWindowsAbsent } from "./helpers/canary-windows.mjs";
+import { assertCanaryFixture, assertCanaryWindowsAbsent } from "./helpers/canary-windows.mjs";
 
 const NOW = new Date("2026-09-21T00:00:00Z");
 const FRAMEWORKS = ["FedRAMP", "CMMC", "SOC 2", "CIS", "PCI-DSS", "STIG", "IRAP", "ISMAP"];
@@ -1913,7 +1913,7 @@ test("verdict rule 9: the Box bundle and its zip never carry credential-shaped v
   assert.equal(shieldLists[1].content.integrations[0].client_secret, "[REDACTED]");
   assert.equal(shieldLists[1].content.integrations[0].id, "app-1");
   const retention = JSON.parse(files.get("core_data/retention_policies.json"));
-  assert.equal(retention[0].notification_webhook, "https://hooks.example.com/notify?token=[REDACTED]&policy=retention-1");
+  assert.equal(retention[0].notification_webhook, "https://hooks.example.com/notify?[REDACTED]", "a URL keeps scheme, host, and path; its whole query is replaced by one marker");
   const groups = JSON.parse(files.get("core_data/groups.json"));
   assert.equal(groups[0].provisioning_password, "[REDACTED]");
 
@@ -2042,4 +2042,349 @@ test("Box tools are registered in the tool catalog under the Box group", () => {
   assert.ok(exportTool.parameterSummaries.some((parameter) => parameter.name === "output_dir"));
   assert.ok(exportTool.parameterSummaries.some((parameter) => parameter.name === "jwt_config_path"));
   assert.match(exportTool.description, /FedRAMP, CMMC, SOC 2, CIS, PCI-DSS, STIG, IRAP, and ISMAP/);
+});
+
+// ---------------------------------------------------------------------------------------------------------------
+// The real BoxApiClient over a fetch router, so the client's own read rules (shape guard, boundary scrub, paging)
+// are what the assessments and the bundle see.
+// ---------------------------------------------------------------------------------------------------------------
+
+/** One marker-paged Box list response: entries from the numeric marker, and a next_marker while more remain. */
+function boxMarkerPage(items, url) {
+  const limit = Number(url.searchParams.get("limit") ?? "1000");
+  const start = Number(url.searchParams.get("marker") ?? "0");
+  const entries = items.slice(start, start + limit);
+  const next = start + limit < items.length ? String(start + limit) : undefined;
+  return jsonResponse({ entries, limit, ...(next === undefined ? {} : { next_marker: next }) });
+}
+
+/** One offset-paged Box list response. */
+function boxOffsetPage(items, url) {
+  const limit = Number(url.searchParams.get("limit") ?? "1000");
+  const offset = Number(url.searchParams.get("offset") ?? "0");
+  return jsonResponse({ entries: items.slice(offset, offset + limit), total_count: items.length, offset, limit });
+}
+
+const BOX_ROUTE_TEMPLATES = [
+  ["POST /oauth2/token", /^\/oauth2\/token$/],
+  ["GET /2.0/users/me", /^\/2\.0\/users\/me$/],
+  ["GET /2.0/users", /^\/2\.0\/users$/],
+  ["GET /2.0/groups", /^\/2\.0\/groups$/],
+  ["GET /2.0/events", /^\/2\.0\/events$/],
+  ["GET /2.0/enterprise_configurations/{enterprise}", /^\/2\.0\/enterprise_configurations\/([^/]+)$/],
+  ["GET /2.0/enterprises/{enterprise}/device_pinners", /^\/2\.0\/enterprises\/([^/]+)\/device_pinners$/],
+  ["GET /2.0/retention_policies", /^\/2\.0\/retention_policies$/],
+  ["GET /2.0/retention_policies/{policy}/assignments", /^\/2\.0\/retention_policies\/([^/]+)\/assignments$/],
+  ["GET /2.0/legal_hold_policies", /^\/2\.0\/legal_hold_policies$/],
+  ["GET /2.0/legal_hold_policy_assignments", /^\/2\.0\/legal_hold_policy_assignments$/],
+  ["GET /2.0/shield_information_barriers", /^\/2\.0\/shield_information_barriers$/],
+  ["GET /2.0/shield_information_barrier_segments", /^\/2\.0\/shield_information_barrier_segments$/],
+  ["GET /2.0/shield_lists", /^\/2\.0\/shield_lists$/],
+  ["GET /2.0/collaboration_whitelist_entries", /^\/2\.0\/collaboration_whitelist_entries$/],
+  ["GET /2.0/collaboration_whitelist_exempt_targets", /^\/2\.0\/collaboration_whitelist_exempt_targets$/],
+  ["GET /2.0/metadata_templates/enterprise", /^\/2\.0\/metadata_templates\/enterprise$/],
+  ["GET /2.0/metadata_templates/enterprise/{template}/schema", /^\/2\.0\/metadata_templates\/enterprise\/([^/]+)\/schema$/],
+  ["GET /2.0/terms_of_services", /^\/2\.0\/terms_of_services$/],
+];
+
+/** One handler per Box surface; handlers receive the URL and the decoded path parameters. */
+function boxRoutes(fixture) {
+  return {
+    "POST /oauth2/token": () => jsonResponse({ access_token: "router-issued-access-token-2026", expires_in: 3600, token_type: "bearer" }),
+    "GET /2.0/users/me": () => jsonResponse({ id: "service-1", type: "user", name: "Audit Service", login: "AutomationUser_123@boxdevedition.com", role: "admin", enterprise: { id: "123456", type: "enterprise" } }),
+    "GET /2.0/users": (url) => boxMarkerPage(fixture.users, url),
+    "GET /2.0/groups": (url) => boxOffsetPage(fixture.groups, url),
+    "GET /2.0/events": (url) => {
+      const types = url.searchParams.get("event_type")?.split(",").filter(Boolean);
+      const filtered = types && types.length > 0 ? fixture.events.filter((event) => types.includes(event.event_type)) : fixture.events;
+      const limit = Number(url.searchParams.get("limit") ?? "500");
+      const start = Number(url.searchParams.get("stream_position") ?? "0");
+      const entries = filtered.slice(start, start + limit);
+      return jsonResponse({ entries, chunk_size: entries.length, next_stream_position: String(start + entries.length) });
+    },
+    "GET /2.0/enterprise_configurations/{enterprise}": () => jsonResponse(fixture.configuration),
+    "GET /2.0/enterprises/{enterprise}/device_pinners": (url) => boxMarkerPage(fixture.devicePinners, url),
+    "GET /2.0/retention_policies": (url) => boxMarkerPage(fixture.retentionPolicies, url),
+    "GET /2.0/retention_policies/{policy}/assignments": (url) => boxMarkerPage(fixture.retentionAssignments, url),
+    "GET /2.0/legal_hold_policies": (url) => boxMarkerPage(fixture.legalHoldPolicies, url),
+    "GET /2.0/legal_hold_policy_assignments": (url) => boxMarkerPage(fixture.legalHoldAssignments, url),
+    "GET /2.0/shield_information_barriers": (url) => boxMarkerPage(fixture.barriers, url),
+    "GET /2.0/shield_information_barrier_segments": (url) => boxMarkerPage(fixture.barrierSegments, url),
+    "GET /2.0/shield_lists": () => jsonResponse({ entries: fixture.shieldLists }),
+    "GET /2.0/collaboration_whitelist_entries": (url) => boxMarkerPage(fixture.allowlistEntries, url),
+    "GET /2.0/collaboration_whitelist_exempt_targets": (url) => boxMarkerPage(fixture.exemptTargets, url),
+    "GET /2.0/metadata_templates/enterprise": (url) => boxMarkerPage(fixture.metadataTemplates, url),
+    "GET /2.0/metadata_templates/enterprise/{template}/schema": () => jsonResponse(fixture.classificationTemplate),
+    "GET /2.0/terms_of_services": () => jsonResponse({ entries: fixture.termsOfServices }),
+  };
+}
+
+/** The real BoxApiClient over a fetch router that records the method, path, URL, and status of every request served. */
+function httpBox(fixture, options = {}) {
+  const routes = { ...boxRoutes(fixture), ...(options.routes ?? {}) };
+  const log = [];
+  const fetchImpl = async (input, init = {}) => {
+    const url = new URL(typeof input === "string" ? input : input.url);
+    const method = (init.method ?? "GET").toUpperCase();
+    const template = BOX_ROUTE_TEMPLATES.find(([name, pattern]) => name.startsWith(`${method} `) && pattern.test(url.pathname));
+    let response;
+    if (template) {
+      const params = [...url.pathname.match(template[1])].slice(1).map(decodeURIComponent);
+      response = await routes[template[0]](url, params, init);
+    } else {
+      response = jsonResponse({ type: "error", status: 404, code: "not_found", message: "Not Found" }, { status: 404, statusText: "Not Found" });
+    }
+    log.push({ method, path: url.pathname, url: url.toString(), host: url.host, status: response.status, authorization: headerValue(init.headers, "authorization") });
+    return response;
+  };
+  const config = sampleConfig(options.config ?? {});
+  const client = new BoxApiClient(config, { fetchImpl, now: () => NOW, sleep: async () => {} });
+  return { client, config, log, routes, fetchImpl };
+}
+
+async function runAllBoxAssessments(client) {
+  return [
+    await assessBoxIdentityAccess(client),
+    await assessBoxSharingCollaboration(client),
+    await assessBoxDataGovernance(client),
+    await assessBoxShieldMonitoring(client),
+  ];
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// Silent success: a 200 whose body is not the documented shape is a failed read, never an empty inventory.
+// ---------------------------------------------------------------------------------------------------------------
+
+/** Flattens a value into [dotted.path, leaf] pairs; arrays index as .0, .1, ... and empty containers are leaves. */
+function boxLeafEntries(value, path = "", output = []) {
+  if (Array.isArray(value)) {
+    if (value.length === 0) output.push([path, "[]"]);
+    value.forEach((entry, index) => boxLeafEntries(entry, path ? `${path}.${index}` : String(index), output));
+  } else if (value !== null && typeof value === "object") {
+    const keys = Object.keys(value);
+    if (keys.length === 0) output.push([path, "{}"]);
+    for (const key of keys) boxLeafEntries(value[key], path ? `${path}.${key}` : key, output);
+  } else {
+    output.push([path, value]);
+  }
+  return output;
+}
+
+function boxPluck(value, path) {
+  return path.split(".").reduce((current, key) => (current === null || current === undefined ? undefined : current[key]), value);
+}
+
+const BOX_FALLBACK_VALUES = new Set([0, false, "none", "[]", "{}"]);
+
+/** Fields that describe the read itself (read-state flags, unreadable inventories, caveats) and legitimately flip under a failed read. */
+const BOX_READ_STATE_PATHS = [
+  /(^|\.)[a-z_]*(complete|readable|observed|loaded|read|sampled|available|requested|collected|checked|truncated)$/,
+  /^unreadable_inventories(\.|$)/,
+  /^(pass|warn|fail|manual)$/,
+  /(^|\.)(status_counts|counts)\.(pass|fail)$/,
+];
+
+/** True when a degraded-run value is a zero, false, or empty fallback where the all-readable baseline held real data. */
+function isBoxFallback(path, value, baselineValue) {
+  if (!BOX_FALLBACK_VALUES.has(value)) return false;
+  if (baselineValue === undefined || baselineValue === null || BOX_FALLBACK_VALUES.has(baselineValue)) return false;
+  if (Array.isArray(baselineValue) && baselineValue.length === 0) return false;
+  if (typeof baselineValue === "object" && !Array.isArray(baselineValue) && Object.keys(baselineValue).length === 0) return false;
+  return !BOX_READ_STATE_PATHS.some((pattern) => pattern.test(path));
+}
+
+/** A word planted in every silent body; any echo of the body into an output is caught by looking for it. */
+const BOX_SILENT_MARKER = "SilentPortalMarkerZq";
+
+/** The bodies a 200 can carry without being a Box answer, with the fixed note each must produce. */
+const BOX_SILENT_BODIES = [
+  { name: "empty body", response: () => new Response("", { status: 200, statusText: "OK" }), note: /returned 200( OK)? with an empty body \(0 bytes\); the endpoint is not serving the JSON API/ },
+  { name: "HTML page", response: () => new Response(`<html><body><h1>Sign in</h1><p>${BOX_SILENT_MARKER}</p></body></html>`, { status: 200, statusText: "OK", headers: { "content-type": "text/html; charset=utf-8" } }), note: /returned 200( OK)? with a non-JSON text\/html; charset=utf-8 response body \(\d+ bytes, not echoed\); the endpoint is not serving the JSON API/ },
+  { name: "foreign JSON object", response: () => jsonResponse({ status: "ok", service: BOX_SILENT_MARKER, version: "3.2.1" }), note: /returned 200( OK)? with a JSON body that is not the documented (list object with an entries array|resource object with any of [A-Za-z_, ]+) \(\d+ bytes, not echoed\); the endpoint is not serving the JSON API/ },
+  { name: "JSON array", response: () => jsonResponse([{ id: BOX_SILENT_MARKER, type: "user" }]), note: /returned 200( OK)? with a JSON body that is not the documented (list object with an entries array|resource object with any of [A-Za-z_, ]+) \(\d+ bytes, not echoed\)/ },
+];
+
+/** Every dataset the bundle writes, with the route that serves it; `verdicts` marks the datasets at least one finding reads. */
+const BOX_SILENT_DATASETS = [
+  { file: "core_data/users.json", route: "GET /2.0/users", inventory: "users", surface: "users", verdicts: true },
+  { file: "core_data/groups.json", route: "GET /2.0/groups", inventory: "groups", surface: "groups" },
+  { file: "core_data/enterprise_events_activity.json", route: "GET /2.0/events", inventory: "enterprise_events", surface: "enterprise_events", verdicts: true },
+  { file: "core_data/device_pinners.json", route: "GET /2.0/enterprises/{enterprise}/device_pinners", inventory: "device_pinners", surface: "device_pinners" },
+  { file: "core_data/classification_template.json", route: "GET /2.0/metadata_templates/enterprise/{template}/schema", inventory: "classification_template", surface: "classification_template", verdicts: true },
+  { file: "core_data/metadata_templates.json", route: "GET /2.0/metadata_templates/enterprise", inventory: "metadata_templates", surface: "metadata_templates" },
+  { file: "core_data/retention_policies.json", route: "GET /2.0/retention_policies", inventory: "retention_policies", surface: "retention_policies", verdicts: true },
+  { file: "core_data/legal_hold_policies.json", route: "GET /2.0/legal_hold_policies", inventory: "legal_hold_policies", surface: "legal_hold_policies", verdicts: true },
+  { file: "core_data/shield_information_barriers.json", route: "GET /2.0/shield_information_barriers", inventory: "shield_information_barriers", surface: "shield_information_barriers", verdicts: true },
+  { file: "core_data/shield_lists.json", route: "GET /2.0/shield_lists", inventory: "shield_lists", surface: "shield_lists" },
+  { file: "core_data/collaboration_allowlist_entries.json", route: "GET /2.0/collaboration_whitelist_entries", inventory: "collaboration_allowlist_entries", surface: "collaboration_allowlist_entries", verdicts: true },
+  { file: "core_data/collaboration_allowlist_exempt_targets.json", route: "GET /2.0/collaboration_whitelist_exempt_targets", inventory: "collaboration_allowlist_exempt_targets", surface: "collaboration_allowlist_exempt_targets", verdicts: true },
+  { file: "core_data/terms_of_services.json", route: "GET /2.0/terms_of_services", inventory: "terms_of_services", surface: "terms_of_services", verdicts: true },
+  { file: "core_data/enterprise_configuration.json", route: "GET /2.0/enterprise_configurations/{enterprise}", inventory: "enterprise_configuration", surface: "enterprise_configuration", verdicts: true },
+];
+
+test("verdict rule 1 (silent success): BoxApiClient treats a 200 with an empty, HTML, foreign-JSON, or array body as a failed read with http_status 200 and a fixed note, never as an empty inventory", async () => {
+  for (const variant of BOX_SILENT_BODIES) {
+    const { client } = httpBox(hardenedFixture(), { routes: { "GET /2.0/users": () => variant.response(), "GET /2.0/users/me": () => variant.response() } });
+    await assert.rejects(client.listUsers(10), (error) => {
+      assert.ok(error instanceof BoxApiError, `${variant.name}: the read fails as an API error`);
+      assert.equal(error.status, 200, `${variant.name}: the observed 200 travels with the error`);
+      assert.match(error.request, /^GET \/2\.0\/users\?/, `${variant.name}: the error names the request that was made`);
+      assert.match(error.message, variant.note, `${variant.name}: the message is the fixed note`);
+      assert.ok(!error.message.includes(BOX_SILENT_MARKER) && !error.message.includes("3.2.1") && !error.message.includes("Sign in"), `${variant.name}: nothing from the body is echoed`);
+      return true;
+    });
+    await assert.rejects(client.getCurrentUser(), (error) => {
+      assert.ok(error instanceof BoxApiError);
+      assert.equal(error.status, 200, `${variant.name}: a single-resource read is guarded the same way`);
+      assert.ok(!error.message.includes(BOX_SILENT_MARKER));
+      return true;
+    });
+  }
+
+  // A silent token endpoint is a failed authentication, not an access token of undefined.
+  const { client: noToken } = httpBox(hardenedFixture(), { routes: { "POST /oauth2/token": () => jsonResponse({ status: "ok", service: BOX_SILENT_MARKER }) } });
+  await assert.rejects(noToken.listUsers(10), (error) => {
+    assert.ok(error instanceof BoxApiError);
+    assert.equal(error.status, 200);
+    assert.match(error.message, /POST \/oauth2\/token returned 200( OK)? with a JSON body that is not the documented resource object with any of access_token/);
+    assert.ok(!error.message.includes(BOX_SILENT_MARKER));
+    return true;
+  });
+
+  // The documented shapes still read: an empty inventory is `entries: []`, and a resource carries its documented keys.
+  const { client: documented, log } = httpBox({ ...hardenedFixture(), users: [], allowlistEntries: [] });
+  const none = await documented.listUsers(10);
+  assert.deepEqual(none, { items: [], truncated: false }, "a documented empty listing stays a readable empty inventory");
+  assert.equal((await documented.getCurrentUser()).id, "service-1");
+  assert.ok(log.every((entry) => entry.status === 200));
+});
+
+test("verdict rule 1 (silent success): a silent 200 on any Box dataset is recorded not_readable with the observed 200 in core_data, collection_status, and the access check, no finding passes or fails on it, and nothing from the body is echoed", async () => {
+  const baseline = await runAllBoxAssessments(httpBox(hardenedFixture()).client);
+  const baselineStatuses = new Map(baseline.flatMap((result) => result.findings.map((item) => [item.id, item.status])));
+
+  for (const [index, dataset] of BOX_SILENT_DATASETS.entries()) {
+    const variant = BOX_SILENT_BODIES[index % BOX_SILENT_BODIES.length];
+    const { client, config, log } = httpBox(hardenedFixture(), { routes: { [dataset.route]: () => variant.response() } });
+    const label = `${dataset.inventory} answered with a silent 200 (${variant.name})`;
+    const access = await checkBoxAccess(client);
+    const results = await runAllBoxAssessments(client);
+    const exported = await exportBoxAuditBundle(client, config, createTempBase("grclanker-box-silent-"));
+    const files = readBundleFiles(exported.outputDir);
+
+    const outputs = new Map([...files, ["access check", JSON.stringify(access)], ["assess payloads", JSON.stringify(results)]]);
+    for (const [name, text] of outputs) {
+      assert.ok(!text.includes(BOX_SILENT_MARKER), `${label}: the body text was echoed into ${name}`);
+    }
+    assert.ok(log.some((entry) => entry.status === 200), `${label}: the 200 the outputs cite was observed on the wire`);
+
+    // The dataset's file is a marker object carrying the observed 200 and the fixed note, not an empty array or {}.
+    const record = JSON.parse(files.get(dataset.file));
+    assert.equal(record.collected, false, `${label}: ${dataset.file} is a not-collected marker`);
+    assert.equal(record.status, 200, `${label}: the marker carries the observed status`);
+    assert.match(record.error, variant.note, `${label}: the marker carries the fixed note`);
+    const status = JSON.parse(files.get("core_data/collection_status.json"));
+    const row = status.datasets.find((entry) => entry.file === dataset.file);
+    assert.deepEqual(
+      { collected: row.collected, status_code: row.status_code, count: row.count, complete: row.complete, truncated: row.truncated },
+      { collected: false, status_code: 200, count: null, complete: null, truncated: null },
+      `${label}: the collection_status row records a failed read with the observed 200 and null counts`,
+    );
+    assert.match(row.error, variant.note);
+    assert.match(row.endpoint, /^GET \/2\.0\//, `${label}: the row names the request that was made`);
+
+    // The access probe for the surface says not readable with the observed 200.
+    const probe = access.surfaces.find((surface) => surface.name === dataset.surface);
+    assert.ok(probe, `${label}: the access check probes this surface`);
+    assert.deepEqual({ status: probe.status, httpStatus: probe.httpStatus, count: probe.count }, { status: "not_readable", httpStatus: 200, count: null }, `${label}: the access probe records the failed read`);
+    assert.match(probe.error, variant.note);
+
+    const changed = results.flatMap((result) => result.findings).filter((item) => item.status !== baselineStatuses.get(item.id));
+    if (dataset.verdicts) assert.ok(changed.length > 0, `${label}: at least one verdict that reads this dataset leaves its baseline status`);
+    assert.ok(changed.every((item) => item.status === "manual" || item.status === "warn"), `${label}: a finding left pass or fail for something other than manual or warn: ${changed.map((item) => `${item.id}:${item.status}`).join(" ")}`);
+    // No verdict is reached on data that was never observed: every pass or fail in the degraded run was the same pass
+    // or fail on the all-readable baseline (a finding that read the silent dataset goes manual or warn), and no
+    // evidence or summary leaf falls back to zero, false, or empty where the baseline held data.
+    for (const [areaIndex, result] of results.entries()) {
+      for (const item of result.findings) {
+        if (item.status === "pass" || item.status === "fail") {
+          assert.equal(item.status, baselineStatuses.get(item.id), `${label}: ${item.id} reached ${item.status} while the baseline had ${baselineStatuses.get(item.id)}: ${item.summary}`);
+          assert.doesNotMatch(item.summary, variant.note, `${label}: ${item.id} ${item.status} cites the silent read`);
+        }
+        const baselineFinding = findingById(baseline[areaIndex], item.id);
+        for (const [path, value] of boxLeafEntries(item.evidence ?? {})) {
+          const baselineValue = boxPluck(baselineFinding.evidence ?? {}, path);
+          assert.ok(!isBoxFallback(path, value, baselineValue), `${label}: ${item.id} evidence.${path} = ${JSON.stringify(value)} fell back from ${JSON.stringify(baselineValue)}`);
+        }
+      }
+      for (const [path, value] of boxLeafEntries(result.summary ?? {})) {
+        const baselineValue = boxPluck(baseline[areaIndex].summary ?? {}, path);
+        assert.ok(!isBoxFallback(path, value, baselineValue), `${label}: ${result.area} summary.${path} = ${JSON.stringify(value)} fell back from ${JSON.stringify(baselineValue)}`);
+      }
+    }
+  }
+});
+
+// ---------------------------------------------------------------------------------------------------------------
+// Data-side carriers: credential subtrees and free text in collected records.
+// ---------------------------------------------------------------------------------------------------------------
+
+// Random alphanumeric values with no 6-character window in common with each other or the fixture (self-checked below).
+const BOX_DATA_CANARIES = {
+  tosSessionToken: "5oBc7cx5Ap5GyoRLYF2spiykxV2neZ4K",
+  tosHexSecret: "3f9a1c4e7b2d8f60a5c3e1b9d7f24a6c8e0b1d3f",
+  tokensEntry: "vpzNAAhcRicNV6dbDCxX6GZDZQSByBMN",
+  urlPathToken: "YuCrx3AeiPGNJUXAUKXsJecXdAKMuXxe",
+  urlQueryToken: "PHusoCSroBiMZPU6N9wJwMMNtgN5KrpB",
+  credentialsValue: "dYNfZ83NyGPawpD36FisN4mi7knLccqW",
+  keysEntry: "LwpKhwybpxvF598hRekWfQ4RvQHhs4jN",
+  bioBearer: "rzzeFBvjaahfmRUPxGGsEEbvHRPmKXN3",
+};
+
+test("verdict rule 9 (data-side carriers): Box blanks the whole subtree under tokens, keys, and credentials keys, scrubs mid-string URL queries, webhook-style paths, bearer carriers, and bare or hex tokens out of free text, and projects terms of service to the fields the verdicts read", async () => {
+  const canaries = Object.values(BOX_DATA_CANARIES);
+  const baselineExport = await exportBoxAuditBundle(httpBox(hardenedFixture()).client, sampleConfig(), createTempBase("grclanker-box-data-baseline-"));
+  assertCanaryFixture(assert, canaries.filter((canary) => canary !== BOX_DATA_CANARIES.tosHexSecret), readBundleFiles(baselineExport.outputDir), "data-side canaries");
+
+  const fixture = hardenedFixture();
+  fixture.termsOfServices[0] = {
+    ...fixture.termsOfServices[0],
+    text: `By continuing you accept the terms at https://terms.example.com/v3?session_token=${BOX_DATA_CANARIES.tosSessionToken} and the signing key ${BOX_DATA_CANARIES.tosHexSecret} applies.`,
+  };
+  fixture.users[1] = {
+    ...fixture.users[1],
+    tokens: [BOX_DATA_CANARIES.tokensEntry],
+    api_keys: [{ id: "k1", value: BOX_DATA_CANARIES.keysEntry }],
+    credentials: { value: BOX_DATA_CANARIES.credentialsValue, kind: "api" },
+    notification_url: `https://hooks.slack.com/services/T0000000/B0000000/${BOX_DATA_CANARIES.urlPathToken}`,
+    job_title: `Ops lead; profile at https://intranet.example.com/people/42?access_token=${BOX_DATA_CANARIES.urlQueryToken} mid sentence`,
+    address: `Bearer ${BOX_DATA_CANARIES.bioBearer} was pasted here`,
+  };
+
+  const { client, config } = httpBox(fixture);
+  const access = await checkBoxAccess(client);
+  const results = await runAllBoxAssessments(client);
+  const exported = await exportBoxAuditBundle(client, config, createTempBase("grclanker-box-data-"));
+  const files = readBundleFiles(exported.outputDir);
+  const entries = readZipEntries(exported.zipPath);
+
+  assertCanaryWindowsAbsent(assert, files, canaries, "bundle file");
+  assertCanaryWindowsAbsent(assert, entries, canaries, "zip entry");
+  assertCanaryWindowsAbsent(assert, new Map([["access check", JSON.stringify(access)], ["assess payloads", JSON.stringify(results)]]), canaries, "tool payload");
+
+  const terms = JSON.parse(files.get("core_data/terms_of_services.json"));
+  assert.ok(!("text" in terms[0]), "the agreement text is not written");
+  assert.deepEqual(
+    { id: terms[0].id, tos_type: terms[0].tos_type, status: terms[0].status, text_length: typeof terms[0].text_length, modified_at: terms[0].modified_at },
+    { id: "tos-1", tos_type: "managed", status: "enabled", text_length: "number", modified_at: "2026-01-01T00:00:00Z" },
+  );
+  const users = JSON.parse(files.get("core_data/users.json"));
+  const written = users.find((entry) => entry.id === fixture.users[1].id);
+  assert.equal(written.tokens, "[REDACTED]", "a credential-shaped list is blanked whole, not walked");
+  assert.equal(written.api_keys, "[REDACTED]", "a qualified plural key blanks its subtree");
+  assert.equal(written.credentials, "[REDACTED]", "a credential-shaped object is blanked whole");
+  assert.match(written.notification_url, /^https:\/\/hooks\.slack\.com\/services\/\[REDACTED\]$|^https:\/\/hooks\.slack\.com$|^https:\/\/hooks\.slack\.com\/services\/T0000000\/B0000000\/\[REDACTED\]$/, `a webhook-style path loses its token: ${written.notification_url}`);
+  assert.match(written.job_title, /^Ops lead; profile at https:\/\/intranet\.example\.com\/people\/42\?\[REDACTED\] mid sentence$/, `a URL query mid string is replaced: ${written.job_title}`);
+  assert.match(written.address, /^(Bearer )?\[REDACTED\] was pasted here$/, `a bearer carrier in free text loses its value: ${written.address}`);
+  assert.equal(written.login, fixture.users[1].login, "identifiers and logins are untouched");
 });

@@ -52,13 +52,16 @@ const MAX_ASSIGNMENT_POLICIES = 50;
 const REDACTED = "[REDACTED]";
 const CREDENTIAL_LAST_SEGMENTS = new Set([
   "token",
+  "tokens",
   "secret",
   "secrets",
   "password",
+  "passwords",
   "passwd",
   "pwd",
   "passphrase",
   "apikey",
+  "apikeys",
   "authorization",
   "credential",
   "credentials",
@@ -986,7 +989,7 @@ export function isCredentialKey(name: string): boolean {
   const last = segments[segments.length - 1];
   if (!last) return false;
   if (CREDENTIAL_LAST_SEGMENTS.has(last)) return true;
-  if (last === "key" && segments.length > 1 && CREDENTIAL_KEY_QUALIFIERS.has(segments[segments.length - 2])) return true;
+  if ((last === "key" || last === "keys") && segments.length > 1 && CREDENTIAL_KEY_QUALIFIERS.has(segments[segments.length - 2])) return true;
   return false;
 }
 
@@ -1012,26 +1015,33 @@ function redactUrlQuery(text: string): string {
 }
 
 /**
- * Deep-copies a collected payload while replacing every value stored under a
- * credential-shaped key (token, secret, password, api_key, ...) with a marker,
- * including {name, value} and {key, value} pair shapes and token-bearing URL
- * query parameters. Applied to every snapshot before it is written.
+ * Data-side pass over every collected record before a finding, a snapshot, or a bundle file reads it. The whole
+ * subtree under a credential-shaped key (`token`, `tokens`, `secret`, `credentials`, `api_key`, ...) becomes the marker
+ * whether it is a string, a list, or a nested object; `{name, value}` and `{key, value}` pairs with a credential-shaped
+ * name lose their value; and every other string, free text included, gets the shared scrubber's pattern pass: query
+ * tokens anywhere in the text (a URL mid-sentence, not only at the start), bearer, cookie, and assignment carriers,
+ * webhook-style paths, high-entropy and hex tokens, and the configured and issued secrets. Booleans, numbers, and
+ * nulls pass through; the shape is otherwise preserved.
  */
 export function redactCredentialValues(value: unknown): unknown {
-  if (Array.isArray(value)) return value.map((entry) => redactCredentialValues(entry));
-  if (typeof value === "string") return redactUrlQuery(value);
-  const record = asObject(value);
-  if (!record) return value;
-  const pairName = asString(record.name) ?? asString(record.key);
-  const redacted: JsonRecord = {};
-  for (const [key, entry] of Object.entries(record)) {
-    if (isCredentialKey(key) || (key === "value" && pairName !== undefined && isCredentialKey(pairName))) {
-      redacted[key] = entry === null || entry === undefined ? entry : REDACTED;
-    } else {
-      redacted[key] = redactCredentialValues(entry);
-    }
-  }
-  return redacted;
+  return credentialScrubber.scrubData(value, {
+    isCredentialKey,
+    transformString: (text) => redactUrlQuery(text),
+  });
+}
+
+/** Keeps the terms-of-service fields the verdicts read; the agreement text is free prose and is reduced to its length. */
+export function projectTermsOfService(terms: JsonRecord): JsonRecord {
+  const text = asString(terms.text);
+  return {
+    id: asString(terms.id) ?? null,
+    type: asString(terms.type) ?? null,
+    tos_type: asString(terms.tos_type) ?? null,
+    status: asString(terms.status) ?? null,
+    text_length: text === undefined ? null : text.length,
+    created_at: asString(terms.created_at) ?? null,
+    modified_at: asString(terms.modified_at) ?? null,
+  };
 }
 
 function projectActor(actor: unknown): JsonRecord | null {
@@ -1259,6 +1269,50 @@ function completePage(items: JsonRecord[]): BoxListPage {
   return { items, truncated: false };
 }
 
+/**
+ * The documented shape of a successful body. Every list the inspector reads answers with an object carrying an
+ * `entries` array (empty when the inventory is empty); a single resource answers with an object carrying at least one
+ * of its documented keys. A 2xx whose body is empty, is not JSON, or has another shape (a portal or proxy page, a
+ * status document, a different API behind the same host) is a failed read of that request, not an empty inventory.
+ */
+type BoxResponseShape =
+  | { kind: "list" }
+  | { kind: "object"; documentedKeys: readonly string[] };
+
+const LIST_SHAPE: BoxResponseShape = { kind: "list" };
+// The OAuth 2.0 token endpoint as documented; the caller still checks that access_token is a non-empty string.
+const TOKEN_RESPONSE_SHAPE: BoxResponseShape = { kind: "object", documentedKeys: ["access_token"] };
+// GET /users/me as documented.
+const USER_SHAPE: BoxResponseShape = { kind: "object", documentedKeys: ["id", "type", "login", "enterprise"] };
+// GET /metadata_templates/enterprise/{templateKey}/schema as documented.
+const METADATA_TEMPLATE_SHAPE: BoxResponseShape = { kind: "object", documentedKeys: ["id", "type", "templateKey", "fields"] };
+
+/** GET /enterprise_configurations/{id}: an object keyed by the requested categories (each may be null when not exposed). */
+function enterpriseConfigurationShape(categories: string[]): BoxResponseShape {
+  return { kind: "object", documentedKeys: ["id", "type", ...categories] };
+}
+
+function matchesResponseShape(payload: unknown, shape: BoxResponseShape): payload is JsonRecord {
+  const record = asObject(payload);
+  if (!record) return false;
+  if (shape.kind === "list") return Array.isArray(record.entries);
+  return shape.documentedKeys.some((key) => key in record);
+}
+
+/** Fixed text naming the documented shape; nothing from the body enters it. */
+function describeResponseShape(shape: BoxResponseShape): string {
+  return shape.kind === "list" ? "list object with an entries array" : `resource object with any of ${shape.documentedKeys.join(", ")}`;
+}
+
+/**
+ * The client's collection boundary: every record a listing or single-resource read returns passes through the
+ * data-side scrub once, so an assess payload's evidence, its snapshots, and the bundle all read the same scrubbed
+ * record; the export's second pass over core_data is defense in depth against a fake or future client.
+ */
+function scrubCollectedRecord(record: JsonRecord): JsonRecord {
+  return asObject(redactCredentialValues(record)) ?? record;
+}
+
 export class BoxApiClient implements BoxReadClient {
   private readonly config: BoxResolvedConfig;
   private readonly fetchImpl: FetchImpl;
@@ -1349,8 +1403,8 @@ export class BoxApiClient implements BoxReadClient {
 
   private async requestJson(
     url: string,
-    init: RequestInit = {},
-    options: { skipAuth?: boolean; allowRefresh?: boolean } = {},
+    init: RequestInit,
+    options: { skipAuth?: boolean; allowRefresh?: boolean; shape: BoxResponseShape },
   ): Promise<JsonRecord> {
     let attempt = 0;
     let refreshed = false;
@@ -1364,11 +1418,13 @@ export class BoxApiClient implements BoxReadClient {
 
       const response = await this.fetchWithTimeout(url, { ...init, headers }, request);
       const rawText = await response.text();
+      let parsed: unknown;
       let payload: JsonRecord | undefined;
       let bodyNote: string | undefined;
       if (rawText.length > 0) {
         try {
-          payload = asObject(JSON.parse(rawText));
+          parsed = JSON.parse(rawText) as unknown;
+          payload = asObject(parsed);
         } catch {
           // A body that is not JSON (an HTML proxy page, a WAF block) can reflect the request, including its
           // Authorization header, so it is described by content type and length and never echoed.
@@ -1376,7 +1432,28 @@ export class BoxApiClient implements BoxReadClient {
         }
       }
 
-      if (response.ok) return payload ?? {};
+      if (response.ok) {
+        // A success status is not a success by itself. An empty body, a portal or proxy page, or JSON of some other
+        // shape is not an empty inventory; each is recorded as a failed read of this request with the status the
+        // server sent, so the dependents go manual instead of passing or failing on data that was never observed.
+        const silentSuccess = rawText.length === 0
+          ? `with an empty body (0 bytes)`
+          : bodyNote !== undefined
+            ? `with a ${bodyNote}`
+            : matchesResponseShape(parsed, options.shape)
+              ? undefined
+              : `with a JSON body that is not the documented ${describeResponseShape(options.shape)} (${rawText.length} bytes, not echoed)`;
+        if (silentSuccess !== undefined) {
+          throw new BoxApiError(
+            this.redact(`Box request ${request} returned ${statusLine(response)} ${silentSuccess}; the endpoint is not serving the JSON API`),
+            response.status,
+            undefined,
+            undefined,
+            request,
+          );
+        }
+        return payload ?? {};
+      }
 
       if (response.status === 401 && !refreshed && options.allowRefresh !== false && !options.skipAuth && this.canRefresh()) {
         refreshed = true;
@@ -1473,7 +1550,7 @@ export class BoxApiClient implements BoxReadClient {
       method: "POST",
       headers: { "content-type": "application/x-www-form-urlencoded" },
       body: this.tokenRequestBody().toString(),
-    }, { skipAuth: true });
+    }, { skipAuth: true, shape: TOKEN_RESPONSE_SHAPE });
 
     const accessToken = asString(payload.access_token);
     if (!accessToken) {
@@ -1511,9 +1588,14 @@ export class BoxApiClient implements BoxReadClient {
     return pending;
   }
 
-  async get(path: string, query: JsonRecord = {}, headers: Record<string, string> = {}): Promise<JsonRecord> {
+  /**
+   * Reads one page or resource; the body must carry the documented shape, or the read fails with the observed status.
+   * The payload is returned as parsed (paging markers are opaque values the scrub must not touch); callers scrub the
+   * records they take from it.
+   */
+  async get(path: string, query: JsonRecord = {}, headers: Record<string, string> = {}, shape: BoxResponseShape = { kind: "object", documentedKeys: ["id", "type", "entries"] }): Promise<JsonRecord> {
     const url = this.buildUrl(path, query);
-    return this.memoized(`GET ${url} ${JSON.stringify(headers)}`, () => this.requestJson(url, { method: "GET", headers }));
+    return this.memoized(`GET ${url} ${JSON.stringify(headers)}`, () => this.requestJson(url, { method: "GET", headers }, { shape }));
   }
 
   async listMarker(
@@ -1534,7 +1616,7 @@ export class BoxApiClient implements BoxReadClient {
         limit: Math.min(pageSize, remaining),
         ...(options.useMarkerFlag ? { usemarker: "true" } : {}),
         marker,
-      }, options.headers);
+      }, options.headers, LIST_SHAPE);
       const entries = asRecordArray(payload.entries);
       items.push(...entries.slice(0, remaining));
       const nextMarker = asString(payload.next_marker);
@@ -1554,7 +1636,7 @@ export class BoxApiClient implements BoxReadClient {
       marker = nextMarker;
     }
 
-    return { items, truncated };
+    return { items: items.map(scrubCollectedRecord), truncated };
   }
 
   async listOffset(
@@ -1571,7 +1653,7 @@ export class BoxApiClient implements BoxReadClient {
     while (true) {
       const remaining = limit - items.length;
       const requested = Math.min(pageSize, remaining);
-      const payload = await this.get(path, { ...query, limit: requested, offset });
+      const payload = await this.get(path, { ...query, limit: requested, offset }, {}, LIST_SHAPE);
       const entries = asRecordArray(payload.entries);
       items.push(...entries.slice(0, remaining));
       offset += entries.length;
@@ -1588,11 +1670,11 @@ export class BoxApiClient implements BoxReadClient {
       }
     }
 
-    return { items, truncated };
+    return { items: items.map(scrubCollectedRecord), truncated };
   }
 
   async getCurrentUser(): Promise<JsonRecord> {
-    return this.get("/users/me", { fields: "id,type,name,login,role,status,enterprise,is_platform_access_only" });
+    return scrubCollectedRecord(await this.get("/users/me", { fields: "id,type,name,login,role,status,enterprise,is_platform_access_only" }, {}, USER_SHAPE));
   }
 
   async resolveEnterpriseId(): Promise<string> {
@@ -1614,11 +1696,12 @@ export class BoxApiClient implements BoxReadClient {
 
   async getEnterpriseConfiguration(categories: string[] = ["security", "content_and_sharing", "user_settings", "shield"]): Promise<JsonRecord> {
     const enterpriseId = await this.resolveEnterpriseId();
-    return this.get(
+    return scrubCollectedRecord(await this.get(
       `/enterprise_configurations/${encodeURIComponent(enterpriseId)}`,
       { categories: categories.join(",") },
       { "box-version": BOX_VERSION_HEADER },
-    );
+      enterpriseConfigurationShape(categories),
+    ));
   }
 
   async listUsers(limit = DEFAULT_USER_LIMIT): Promise<BoxListPage> {
@@ -1644,7 +1727,7 @@ export class BoxApiClient implements BoxReadClient {
           event_type: options.eventTypes && options.eventTypes.length > 0 ? options.eventTypes.join(",") : undefined,
           created_after: options.createdAfter?.toISOString(),
           stream_position: streamPosition,
-        }), { method: "GET" });
+        }), { method: "GET" }, { shape: LIST_SHAPE });
         const entries = asRecordArray(payload.entries);
         items.push(...entries.slice(0, remaining));
         const nextPosition = asString(payload.next_stream_position);
@@ -1655,7 +1738,7 @@ export class BoxApiClient implements BoxReadClient {
         }
         streamPosition = nextPosition;
       }
-      return { items, truncated };
+      return { items: items.map(scrubCollectedRecord), truncated };
     });
   }
 
@@ -1693,8 +1776,8 @@ export class BoxApiClient implements BoxReadClient {
   }
 
   async listShieldLists(): Promise<BoxListPage> {
-    const payload = await this.get("/shield_lists", {}, { "box-version": BOX_VERSION_HEADER });
-    return completePage(asRecordArray(payload.entries));
+    const payload = await this.get("/shield_lists", {}, { "box-version": BOX_VERSION_HEADER }, LIST_SHAPE);
+    return completePage(asRecordArray(payload.entries).map(scrubCollectedRecord));
   }
 
   async listCollaborationAllowlistEntries(limit = DEFAULT_LIST_LIMIT): Promise<BoxListPage> {
@@ -1710,12 +1793,12 @@ export class BoxApiClient implements BoxReadClient {
   }
 
   async getClassificationTemplate(): Promise<JsonRecord> {
-    return this.get(`/metadata_templates/enterprise/${CLASSIFICATION_TEMPLATE_KEY}/schema`);
+    return scrubCollectedRecord(await this.get(`/metadata_templates/enterprise/${CLASSIFICATION_TEMPLATE_KEY}/schema`, {}, {}, METADATA_TEMPLATE_SHAPE));
   }
 
   async listTermsOfServices(): Promise<BoxListPage> {
-    const payload = await this.get("/terms_of_services");
-    return completePage(asRecordArray(payload.entries));
+    const payload = await this.get("/terms_of_services", {}, {}, LIST_SHAPE);
+    return completePage(asRecordArray(payload.entries).map((terms) => scrubCollectedRecord(projectTermsOfService(terms))));
   }
 }
 
