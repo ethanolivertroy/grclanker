@@ -33,6 +33,9 @@ const DAY_MS = 24 * 60 * 60 * 1000;
 const STALE_GUEST_DAYS = 90;
 const MIN_RETENTION_DAYS = 90;
 const LONG_LIVED_CREDENTIAL_DAYS = 730;
+const SECURITY_DEFAULTS_ENDPOINT = "GET /v1.0/policies/identitySecurityDefaultsEnforcementPolicy";
+const MESSAGE_RULES_ENDPOINT = "GET /v1.0/users/{id}/mailFolders/inbox/messageRules";
+const MAILBOX_RULES_PERMISSION = "MailboxSettings.Read (application)";
 
 /**
  * Cloud endpoint sets. Public and US Government hosts:
@@ -228,7 +231,14 @@ export interface AzureAccessSurface {
   name: string;
   service: string;
   status: "readable" | "not_readable";
-  count?: number;
+  /** Items the probe saw; null when the probe never completed, so a denial is never mistaken for an empty inventory. */
+  count?: number | null;
+  /** True when the probe stopped at its page cap, so `count` is a floor rather than the inventory size; null when the probe never completed. */
+  truncated?: boolean | null;
+  /** HTTP status the failing probe observed; null when the failure was not an HTTP response. */
+  http_status?: number | null;
+  /** URL (without query) of the request that failed, taken from the observed request. */
+  request_url?: string | null;
   error?: string;
 }
 
@@ -428,25 +438,207 @@ export function toPage(value: unknown): AzurePage {
   return { items: [], truncated: false, seen: 0 };
 }
 
+const REDACTED_ERROR_VALUE = "[REDACTED]";
+const CONFIGURED_SECRETS = new Set<string>();
+const MIN_CONFIGURED_SECRET_LENGTH = 4;
+
+/**
+ * The forms a configured secret can take inside an error string: plain, JSON-escaped, URL-encoded, base64,
+ * and base64url (rule 9 scrub boundary: a configured secret is removed whatever its shape, in every form).
+ */
+function configuredSecretForms(value: string): string[] {
+  const forms = new Set<string>([
+    value,
+    JSON.stringify(value).slice(1, -1),
+    encodeURIComponent(value),
+    Buffer.from(value, "utf8").toString("base64"),
+    Buffer.from(value, "utf8").toString("base64url"),
+  ]);
+  return [...forms].filter((form) => form.length >= MIN_CONFIGURED_SECRET_LENGTH);
+}
+
+/** Secrets the running client was configured with or obtained; every recorded error string is scrubbed of them in every form. */
+function registerConfiguredSecrets(...values: Array<string | undefined>): void {
+  for (const value of values) {
+    if (!value || value.length < MIN_CONFIGURED_SECRET_LENGTH) continue;
+    for (const form of configuredSecretForms(value)) CONFIGURED_SECRETS.add(form);
+  }
+}
+
+function escapeErrorRegExp(text: string): string {
+  return text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+/** Replaces every configured secret form wherever it appears; a form under eight characters only where it stands as a whole token. */
+function scrubConfiguredSecrets(text: string): string {
+  let scrubbed = text;
+  for (const secret of [...CONFIGURED_SECRETS].sort((left, right) => right.length - left.length)) {
+    scrubbed = secret.length >= 8
+      ? scrubbed.split(secret).join(REDACTED_ERROR_VALUE)
+      : scrubbed.replace(new RegExp(`(?<![A-Za-z0-9])${escapeErrorRegExp(secret)}(?![A-Za-z0-9])`, "g"), REDACTED_ERROR_VALUE);
+  }
+  return scrubbed;
+}
+
+const ERROR_CREDENTIAL_KEY_PATTERN =
+  "[A-Za-z0-9_.-]*(?:token|secret|passw(?:or)?d|pwd|api[_-]?key|apikey|session(?:[_-]?id)?|sid|cookie|csrftoken|authorization|auth|signature|sig|nonce|credentials?|access[_-]?key|private[_-]?key|skey)";
+// key=value, key: value, and "key":"value" pairs whose key names a credential; the value's shape decides below.
+const ERROR_CREDENTIAL_PAIR_PATTERN = new RegExp(
+  `\\b(${ERROR_CREDENTIAL_KEY_PATTERN})(["']?\\s*[=:]\\s*["']?)((?:(?:Bearer|Basic|Digest|Token|ApiKey)\\s+)?[^\\s"'&;,<>]+)`,
+  "gi",
+);
+const TRAILING_PUNCTUATION_PATTERN = /[.!?:)]+$/;
+
+/**
+ * A value after a credential-named key is the credential (whatever its shape) when it is at least six
+ * characters and is twelve or longer, carries a digit or a character that is not a letter, or changes case
+ * inside the word. Short plain words after a colon ("InvalidAuthenticationToken: Access token has expired")
+ * are prose and stay.
+ */
+function looksLikeCredentialValue(value: string): boolean {
+  return value.length >= 6 && (value.length >= 12 || /\d/.test(value) || /[^A-Za-z]/.test(value) || /[a-z][A-Z]/.test(value));
+}
+
+function scrubCredentialPairs(text: string): string {
+  return text.replace(ERROR_CREDENTIAL_PAIR_PATTERN, (match: string, key: string, separator: string, value: string) => {
+    // A value the scheme rule already replaced ("Authorization: Bearer [REDACTED]") keeps its scheme name.
+    if (value.includes(REDACTED_ERROR_VALUE)) return match;
+    const core = value.replace(TRAILING_PUNCTUATION_PATTERN, "");
+    return looksLikeCredentialValue(core) ? `${key}${separator}${REDACTED_ERROR_VALUE}${value.slice(core.length)}` : match;
+  });
+}
+
+const ERROR_TEXT_PATTERNS: ReadonlyArray<readonly [RegExp, string]> = [
+  // Authorization scheme values wherever they appear (headers, cookies, HTML, JSON messages); the value must be
+  // long, carry a digit or base64 symbol, or change case inside the word, so prose such as "Basic authentication"
+  // and "Bearer Token" stays.
+  // Case-sensitive so the inner-case-change test means what it says (under /i, [a-z][A-Z] is any two letters).
+  [/\b(Bearer|bearer|BEARER|Basic|basic|BASIC|Digest|digest|Negotiate|negotiate|SSWS|Token|token|TOKEN|ApiKey|apikey|APIKEY|Api-Key|api-key)\s+(?=[A-Za-z0-9\-._~+/=:]{16,}|[A-Za-z0-9\-._~+/=:]*[\d+/=]|[A-Za-z0-9\-._~+/=:]*[a-z][A-Z])[A-Za-z0-9\-._~+/=:]{6,}/g, `$1 ${REDACTED_ERROR_VALUE}`],
+  // JWT-shaped strings.
+  [/\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}/g, REDACTED_ERROR_VALUE],
+  // PEM blocks, whole or cut off.
+  [/-----BEGIN [A-Z0-9 ]+-----[\s\S]*?(?:-----END [A-Z0-9 ]+-----|$)/g, REDACTED_ERROR_VALUE],
+  // AWS access key ids, 40-character secret access keys, long secret-shaped blobs, and hex digests.
+  [/\b(?:AKIA|ASIA|AROA|AIDA|AGPA|ANPA|ANVA|APKA|ABIA|ACCA)[A-Z0-9]{16}\b/g, REDACTED_ERROR_VALUE],
+  [/(?<![A-Za-z0-9/+=])[A-Za-z0-9/+]{40}(?![A-Za-z0-9/+=])/g, REDACTED_ERROR_VALUE],
+  // Long blobs must carry a digit so camelCase identifiers survive.
+  [/(?<![A-Za-z0-9+_=-])(?=[A-Za-z0-9+_-]*\d)[A-Za-z0-9+_-]{40,}={0,2}(?![A-Za-z0-9+_=-])/g, REDACTED_ERROR_VALUE],
+  [/\b[a-f0-9]{32,}\b/gi, REDACTED_ERROR_VALUE],
+  // Cookie headers carry session values in free form.
+  [/\b(set-cookie|cookie)(\s*[:=]\s*)[^\n<>]+/gi, `$1$2${REDACTED_ERROR_VALUE}`],
+];
+
+// URL userinfo and query strings anywhere in the string, not only when the string starts with a URL.
+const ERROR_URL_PATTERN = /\b(https?:\/\/)(?:[^\s/@"'<>]+@)?([^\s?#"'<>]+)(\?[^\s#"'<>]*)?/gi;
+
+/**
+ * Rule 9 scrub boundary for bare values. A run of 16 or more token characters is removed when it is shaped
+ * like a token (base64 symbols, digits scattered through its letters, or casing that breaks into one- and
+ * two-letter camelCase pieces) and kept when it is shaped like a name: "-" or "_" separated segments that are
+ * each letters in any casing, digits alone, or letters with one digit group (`prod-us-east-2026`,
+ * `AWSLambdaBasicExecutionRole`, `sha256`), an uppercase code, or a canonical UUID. "/", ".", ":", "@", and
+ * whitespace end a run, so path segments, hostnames, ARNs, and emails are judged piece by piece. Opaque
+ * identifiers whose shape is a token's are removed from error text as well; they travel in structured fields.
+ */
+const LONG_TOKEN_RUN_PATTERN = /[A-Za-z0-9+_-]{16,}(?:={1,2}(?![A-Za-z0-9&]))?/g;
+const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const UPPERCASE_CODE_PATTERN = /^[A-Z][A-Z_]*$|^[A-Z][A-Z0-9]*(?:[_-][A-Z0-9]+)+$/;
+const MIN_LETTERS_FOR_CASING = 6;
+
+const CAMEL_WORD_PATTERN = /[A-Z]+(?![a-z])|[A-Z]?[a-z]+/g;
+const MAX_SHORT_WORD_LENGTH = 2;
+
+/**
+ * Token-shaped casing. Split at camelCase boundaries, a name is words and acronyms of three letters or more
+ * (`GetAccessKeyLastUsed`, `AWSLambdaBasicExecutionRole`, `getHTTPSUrl`), while a random run breaks into
+ * one- and two-letter pieces (`bPxRfiCYcanaryKEYqm`: b, Px, C, KE). Two or more such pieces making up at
+ * least a third of the words is the token signal; one short word (`GetEbsEncryptionByDefault`) is a name.
+ */
+function hasTokenCasing(letters: string): boolean {
+  if (letters.length < MIN_LETTERS_FOR_CASING) return false;
+  const words = letters.match(CAMEL_WORD_PATTERN) ?? [];
+  const shortWords = words.filter((word) => word.length <= MAX_SHORT_WORD_LENGTH).length;
+  return shortWords >= 2 && shortWords * 3 >= words.length;
+}
+
+/** A "-" or "_" separated segment shaped like part of a name: empty, digits alone, or letters with at most one digit group and no token casing. */
+function isNameSegment(segment: string): boolean {
+  if (segment.length === 0 || /^\d+$/.test(segment)) return true;
+  if (!/^[A-Za-z0-9]+$/.test(segment)) return false;
+  if ((segment.match(/\d+/g) ?? []).length > 1) return false;
+  return !hasTokenCasing(segment.replace(/\d+/g, ""));
+}
+
+function looksLikeToken(run: string): boolean {
+  if (UUID_PATTERN.test(run) || UPPERCASE_CODE_PATTERN.test(run)) return false;
+  if (/[+=]/.test(run)) return true;
+  return run.split(/[-_]/).some((segment) => !isNameSegment(segment));
+}
+
+function scrubLongTokens(text: string): string {
+  return text.replace(LONG_TOKEN_RUN_PATTERN, (run: string) => (looksLikeToken(run) ? REDACTED_ERROR_VALUE : run));
+}
+
+/**
+ * Rule 9 sink for error text. AzureApiError scrubs its own message and every recorded error string
+ * (attempt results, access surfaces, tool results) passes through here again, so no path can carry a
+ * credential echoed by an upstream error body, a transport error, or a URL into the audit output.
+ */
+export function redactErrorText(text: string): string {
+  let scrubbed = scrubConfiguredSecrets(text);
+  scrubbed = scrubbed.replace(ERROR_URL_PATTERN, (_match, scheme: string, hostPath: string, query?: string) =>
+    `${scheme}${hostPath}${query ? `?${REDACTED_ERROR_VALUE}` : ""}`,
+  );
+  for (const [pattern, replacement] of ERROR_TEXT_PATTERNS) {
+    scrubbed = scrubbed.replace(pattern, replacement);
+  }
+  scrubbed = scrubCredentialPairs(scrubbed);
+  return scrubLongTokens(scrubbed);
+}
+
+/**
+ * A parser's message quotes the text it could not parse (V8: `Unexpected token '<', "<html>..." is not valid
+ * JSON`), so a SyntaxError from any parse of a body or document is recorded by name only. Every JSON.parse in
+ * this file already substitutes the status-and-length note in its own catch; this keeps the property even
+ * for a parse failure that escapes one.
+ */
+function isParseError(error: unknown): boolean {
+  return error instanceof SyntaxError || (typeof error === "object" && error !== null && (error as { name?: unknown }).name === "SyntaxError");
+}
+
+const PARSE_ERROR_NOTE = "SyntaxError: response could not be parsed as JSON; the parser's message is not recorded because it quotes the body";
+
+/** The only way a thrown error becomes recorded text. */
+function describeThrown(error: unknown): string {
+  if (isParseError(error)) return PARSE_ERROR_NOTE;
+  return redactErrorText(error instanceof Error ? error.message : String(error));
+}
+
 export class AzureApiError extends Error {
   constructor(
     message: string,
     readonly url: string,
     readonly status?: number,
   ) {
-    super(message);
+    super(redactErrorText(message));
     this.name = "AzureApiError";
   }
 }
 
-type Attempt<T> = { ok: true; value: T } | { ok: false; error: string; status?: number };
+type Attempt<T> = { ok: true; value: T } | { ok: false; error: string; status?: number; url?: string };
+
+/** The request URL without its query, so evidence names the observed request and never a token or filter value. */
+function observedRequestUrl(error: unknown): string | undefined {
+  if (!(error instanceof AzureApiError)) return undefined;
+  return redactErrorText(error.url.split("?")[0]);
+}
 
 async function attempt<T>(load: () => Promise<T>): Promise<Attempt<T>> {
   try {
     return { ok: true, value: await load() };
   } catch (error) {
     const status = error instanceof AzureApiError ? error.status : undefined;
-    return { ok: false, error: error instanceof Error ? error.message : String(error), status };
+    return { ok: false, error: describeThrown(error), status, url: observedRequestUrl(error) };
   }
 }
 
@@ -474,6 +666,55 @@ function describeFailure(result: { error: string; status?: number }): string {
   return result.error.replace(/\s+/g, " ").slice(0, 160);
 }
 
+const TOKEN_ENDPOINT_SUFFIX = "/oauth2/v2.0/token";
+
+/**
+ * True when the recorded failure is the token request itself. Every resource read starts with
+ * getToken, so a refused token means the finding's own endpoint was never requested and must
+ * not be named as the request that failed.
+ */
+function isTokenRequestFailure(result: { url?: string }): boolean {
+  return typeof result.url === "string" && result.url.endsWith(TOKEN_ENDPOINT_SUFFIX);
+}
+
+/** "POST /<tenant>/oauth2/v2.0/token", taken from the observed request URL rather than a constant. */
+function tokenRequestLabel(result: { url?: string }): string {
+  return `POST ${(result.url ?? "").replace(/^[a-z]+:\/\/[^/]+/i, "")}`;
+}
+
+/** Which API the finding's endpoint belongs to, from the documented endpoint label. */
+function resourceApiFor(endpoint: string): string {
+  return /\bMicrosoft\./.test(endpoint) ? "Azure Resource Manager" : "Microsoft Graph";
+}
+
+/** The failure detail without the "Token request failed:" prefix getToken adds, so it is not repeated after the request label. */
+function describeTokenFailure(result: { error: string; status?: number }): string {
+  return describeFailure(result).replace(/^Token request failed: /, "");
+}
+
+/** Sentence and marker for a finding whose resource request never happened because the token request failed. */
+function tokenFailureText(result: { error: string; status?: number; url?: string }, endpoint: string): { request: string; detail: string; api: string; marker: string } {
+  const api = resourceApiFor(endpoint);
+  return {
+    request: tokenRequestLabel(result),
+    detail: describeTokenFailure(result),
+    api,
+    marker: `not attempted: the token request failed, so no ${api} request was made`,
+  };
+}
+
+/**
+ * The error-log line for a failed read: "<request>: <detail>". When the token request was the one
+ * that failed it is named instead of the finding's endpoint, with the note that no resource request was made.
+ */
+function failedReadNote(result: { error: string; status?: number; url?: string }, endpoint: string): string {
+  if (isTokenRequestFailure(result)) {
+    const token = tokenFailureText(result, endpoint);
+    return `${token.request}: ${token.detail}; no ${token.api} request was made`;
+  }
+  return `${endpoint}: ${describeFailure(result)}`;
+}
+
 function manualForError(
   id: string,
   control: number,
@@ -482,12 +723,33 @@ function manualForError(
   endpoint: string,
   requirement: string,
   evidenceToCollect: string,
-  result: { error: string; status?: number },
+  result: { error: string; status?: number; url?: string },
   docUrl: string,
   errors: string[],
 ): AzureFinding {
+  errors.push(`${id} ${failedReadNote(result, endpoint)}`);
+  if (isTokenRequestFailure(result)) {
+    const token = tokenFailureText(result, endpoint);
+    return finding(
+      id,
+      control,
+      title,
+      severity,
+      "manual",
+      `${token.request} returned ${token.detail}, so no ${token.api} request was made for this finding. Fix the app registration's client credentials (tenant id, client id, client secret) so a token is issued; the read then needs ${requirement}. Or collect ${evidenceToCollect} manually.`,
+      {
+        endpoint: token.request,
+        http_status: result.status ?? null,
+        request_url: result.url ?? null,
+        error: result.error.slice(0, 300),
+        resource_request: token.marker,
+        required_access: requirement,
+        evidence_to_collect: evidenceToCollect,
+        documentation: [AZURE_ENDPOINT_DOCS.clientCredentials, docUrl],
+      },
+    );
+  }
   const detail = describeFailure(result);
-  errors.push(`${id} ${endpoint}: ${detail}`);
   return finding(
     id,
     control,
@@ -495,7 +757,7 @@ function manualForError(
     severity,
     "manual",
     `${endpoint} returned ${detail}. Grant ${requirement}, or collect ${evidenceToCollect} manually.`,
-    { endpoint, http_status: result.status ?? null, error: result.error.slice(0, 300), required_access: requirement, evidence_to_collect: evidenceToCollect, documentation: docUrl },
+    { endpoint, http_status: result.status ?? null, request_url: result.url ?? null, error: result.error.slice(0, 300), required_access: requirement, evidence_to_collect: evidenceToCollect, documentation: docUrl },
   );
 }
 
@@ -758,34 +1020,116 @@ function roleDefinitionIdTail(value: string | undefined): string | undefined {
   return value?.split("/").at(-1)?.toLowerCase();
 }
 
+type SurfaceSummary = { count?: number; truncated?: boolean };
+
 async function surface(
   name: string,
   service: string,
   load: () => Promise<unknown>,
-  countResolver?: (value: unknown) => number | undefined,
+  summarize?: (value: unknown) => SurfaceSummary,
 ): Promise<AzureAccessSurface> {
   try {
     const value = await load();
+    const summary = summarize?.(value) ?? {};
     return {
       name,
       service,
       status: "readable",
-      count: countResolver?.(value),
+      count: summary.count,
+      ...(summary.truncated ? { truncated: true } : {}),
     };
   } catch (error) {
+    // A probe that never completed has no count or paging outcome; both stay null and the
+    // status and URL are the ones the request observed.
     return {
       name,
       service,
       status: "not_readable",
-      error: error instanceof Error ? error.message : String(error),
+      count: null,
+      truncated: null,
+      http_status: error instanceof AzureApiError ? error.status ?? null : null,
+      request_url: observedRequestUrl(error) ?? null,
+      error: describeThrown(error),
     };
   }
 }
 
-function pageCount(value: unknown): number | undefined {
-  if (Array.isArray(value)) return value.length;
+/** Keeps the page's truncated flag next to its count so a capped probe is never reported as the full inventory. */
+function pageSummary(value: unknown): SurfaceSummary {
+  if (Array.isArray(value)) return { count: value.length };
   const page = asObject(value);
-  return page && Array.isArray(page.items) ? page.items.length : undefined;
+  if (!page || !Array.isArray(page.items)) return {};
+  return { count: page.items.length, truncated: page.truncated === true };
+}
+
+/**
+ * Reduces an error response body to its documented error envelope so bundle logs never
+ * echo raw payloads: Graph and ARM return `{ error: { code, message } }`, the token
+ * endpoint returns `{ error, error_description }`. Non-JSON bodies are dropped entirely.
+ * https://learn.microsoft.com/en-us/graph/errors and
+ * https://learn.microsoft.com/en-us/entra/identity-platform/reference-error-codes
+ */
+/**
+ * Reduces an error response body to the vendor's documented fields: Graph/ARM `error.code` and
+ * `error.message`, or the OAuth `error` and `error_description`. Any body that is not a JSON object,
+ * whatever its content type claims, is described by status shape and length and never quoted.
+ */
+export function describeErrorBody(text: string, contentType?: string | null): string {
+  if (!text.trim()) return "";
+  const nonJson = `non-JSON body (${contentType?.split(";")[0]?.trim() || "unknown content type"}, ${Buffer.byteLength(text, "utf8")} bytes)`;
+  let payload: unknown;
+  try {
+    payload = JSON.parse(text);
+  } catch {
+    return nonJson;
+  }
+  const record = asObject(payload);
+  if (!record) return nonJson;
+  const envelope = asObject(record.error);
+  if (envelope) {
+    const code = asString(envelope.code);
+    const message = asString(envelope.message)?.replace(/\s+/g, " ").slice(0, 160);
+    return [code, message].filter(Boolean).join(": ") || "error body without code or message";
+  }
+  const oauthError = asString(record.error);
+  if (oauthError) {
+    const description = asString(record.error_description)?.replace(/\s+/g, " ").slice(0, 160);
+    return description ? `${oauthError}: ${description}` : oauthError;
+  }
+  return "error body without code or message";
+}
+
+/**
+ * Drops every secret-bearing credential property before a service principal or
+ * application record is kept. Graph list responses carry passwordCredential.hint
+ * (the first characters of the secret) and keyCredential.key; the findings only
+ * read the schedule fields.
+ * https://learn.microsoft.com/en-us/graph/api/resources/passwordcredential and
+ * https://learn.microsoft.com/en-us/graph/api/resources/keycredential
+ */
+export function projectCredentialCarrier(record: JsonRecord): JsonRecord {
+  const { passwordCredentials, keyCredentials, ...rest } = record;
+  return {
+    ...rest,
+    passwordCredentials: asRecords(passwordCredentials).map((credential) => ({
+      keyId: credential.keyId ?? null,
+      displayName: credential.displayName ?? null,
+      startDateTime: credential.startDateTime ?? null,
+      endDateTime: credential.endDateTime ?? null,
+    })),
+    keyCredentials: asRecords(keyCredentials).map((credential) => ({
+      keyId: credential.keyId ?? null,
+      displayName: credential.displayName ?? null,
+      type: credential.type ?? null,
+      usage: credential.usage ?? null,
+      startDateTime: credential.startDateTime ?? null,
+      endDateTime: credential.endDateTime ?? null,
+    })),
+  };
+}
+
+function projectPage(page: AzurePage, project: (record: JsonRecord) => JsonRecord): AzurePage {
+  return { ...page, items: page.items.map(project) };
 }
 
 export class AzureAuditorClient {
@@ -801,6 +1145,7 @@ export class AzureAuditorClient {
     this.fetchImpl = options.fetchImpl ?? fetch;
     this.now = options.now ?? (() => new Date());
     this.cloud = config.cloud ?? AZURE_CLOUDS["login.microsoftonline.com"];
+    registerConfiguredSecrets(config.graphToken, config.managementToken, config.clientCredentials?.clientSecret);
   }
 
   getResolvedConfig(): AzureResolvedConfig {
@@ -842,14 +1187,26 @@ export class AzureAuditorClient {
     });
     const text = await response.text().catch(() => "");
     if (!response.ok) {
-      throw new AzureApiError(`Token request failed: ${response.status} ${response.statusText}${text ? `: ${text.slice(0, 160)}` : ""}`, url, response.status);
+      const detail = describeErrorBody(text, response.headers.get("content-type"));
+      throw new AzureApiError(`Token request failed: ${response.status} ${response.statusText}${detail ? `: ${detail}` : ""}`, url, response.status);
     }
-    const payload = asObject(JSON.parse(text)) ?? {};
+    const payload = this.parseJsonBody(text, response, url, "Token request");
     const token = asString(payload.access_token);
     if (!token) throw new AzureApiError("Token response did not include access_token.", url);
+    registerConfiguredSecrets(token);
     const expiresIn = asNumber(payload.expires_in) ?? 3600;
     this.tokenCache.set(resource, { token, expiresAt: this.now().getTime() + expiresIn * 1000 });
     return token;
+  }
+
+  /** A 2xx body that is not JSON (a proxy login page, an HTML error) is described by shape, never echoed. */
+  private parseJsonBody(text: string, response: Response, url: string, label: string): JsonRecord {
+    if (text.trim().length === 0) return {};
+    try {
+      return asObject(JSON.parse(text)) ?? {};
+    } catch {
+      throw new AzureApiError(`${label} returned ${response.status} ${response.statusText}: ${describeErrorBody(text, response.headers.get("content-type"))}`, url, response.status);
+    }
   }
 
   private async requestJson(url: string, resource: "graph" | "management", init: { method?: string; headers?: Record<string, string>; body?: string } = {}): Promise<JsonRecord> {
@@ -865,42 +1222,63 @@ export class AzureAuditorClient {
     });
     if (!response.ok) {
       const text = await response.text().catch(() => "");
-      throw new AzureApiError(`${response.status} ${response.statusText}${text ? `: ${text.slice(0, 160)}` : ""}`, url, response.status);
+      const detail = describeErrorBody(text, response.headers.get("content-type"));
+      throw new AzureApiError(`${response.status} ${response.statusText}${detail ? `: ${detail}` : ""}`, url, response.status);
     }
     const text = await response.text();
-    return text.trim().length > 0 ? (JSON.parse(text) as JsonRecord) : {};
+    return this.parseJsonBody(text, response, url, "Request");
   }
 
-  /** Graph paging via @odata.nextLink, https://learn.microsoft.com/en-us/graph/paging */
-  private async collectGraph(path: string, limit = 5000, headers: Record<string, string> = {}): Promise<AzurePage> {
+  /**
+   * Shared next-link walk for Graph and ARM. Every early exit reports `truncated: true`:
+   * the item cap, a next link that repeats the page just fetched, and an empty page that
+   * still advertises a next link (both would otherwise loop forever).
+   */
+  private async collectPages(
+    firstUrl: string,
+    limit: number,
+    fetchPage: (url: string) => Promise<JsonRecord>,
+    nextLinkOf: (response: JsonRecord) => string | undefined,
+    totalOf?: (response: JsonRecord) => number | undefined,
+  ): Promise<AzurePage> {
     const items: JsonRecord[] = [];
     let total: number | undefined;
-    let nextUrl: string | undefined = path.startsWith("http") ? path : `${this.cloud.graphBaseUrl}${path}`;
+    let nextUrl: string | undefined = firstUrl;
     while (nextUrl) {
-      const response = await this.requestJson(nextUrl, "graph", { headers });
-      total ??= asNumber(response["@odata.count"]);
-      items.push(...asRecords(response.value));
-      nextUrl = asString(response["@odata.nextLink"]);
-      if (nextUrl && items.length >= limit) {
+      const currentUrl: string = nextUrl;
+      const response = await fetchPage(currentUrl);
+      if (totalOf) total ??= totalOf(response);
+      const pageItems = asRecords(response.value);
+      items.push(...pageItems);
+      nextUrl = nextLinkOf(response);
+      if (!nextUrl) break;
+      const stalled = nextUrl === currentUrl || pageItems.length === 0;
+      if (stalled || items.length >= limit) {
         return { items: items.slice(0, limit), truncated: true, seen: Math.min(items.length, limit), total };
       }
     }
     return { items, truncated: false, seen: items.length, total: total ?? items.length };
   }
 
+  /** Graph paging via @odata.nextLink, https://learn.microsoft.com/en-us/graph/paging */
+  private async collectGraph(path: string, limit = 5000, headers: Record<string, string> = {}): Promise<AzurePage> {
+    return this.collectPages(
+      path.startsWith("http") ? path : `${this.cloud.graphBaseUrl}${path}`,
+      limit,
+      (url) => this.requestJson(url, "graph", { headers }),
+      (response) => asString(response["@odata.nextLink"]),
+      (response) => asNumber(response["@odata.count"]),
+    );
+  }
+
   /** ARM paging via nextLink, https://learn.microsoft.com/en-us/rest/api/azure/ */
   private async collectArm(path: string, limit = 5000): Promise<AzurePage> {
-    const items: JsonRecord[] = [];
-    let nextUrl: string | undefined = path.startsWith("http") ? path : `${this.cloud.managementBaseUrl}${path}`;
-    while (nextUrl) {
-      const response = await this.requestJson(nextUrl, "management");
-      items.push(...asRecords(response.value));
-      nextUrl = asString(response.nextLink);
-      if (nextUrl && items.length >= limit) {
-        return { items: items.slice(0, limit), truncated: true, seen: Math.min(items.length, limit), total: undefined };
-      }
-    }
-    return { items, truncated: false, seen: items.length, total: items.length };
+    return this.collectPages(
+      path.startsWith("http") ? path : `${this.cloud.managementBaseUrl}${path}`,
+      limit,
+      (url) => this.requestJson(url, "management"),
+      (response) => asString(response.nextLink),
+    );
   }
 
   private graph(path: string): string {
@@ -941,11 +1319,13 @@ export class AzureAuditorClient {
   }
 
   async listServicePrincipals(): Promise<AzurePage> {
-    return this.collectGraph("/v1.0/servicePrincipals?$top=100&$select=id,displayName,appId,passwordCredentials,keyCredentials");
+    const page = await this.collectGraph("/v1.0/servicePrincipals?$top=100&$select=id,displayName,appId,passwordCredentials,keyCredentials");
+    return projectPage(page, projectCredentialCarrier);
   }
 
   async listApplications(): Promise<AzurePage> {
-    return this.collectGraph("/v1.0/applications?$top=999&$select=id,appId,displayName,createdDateTime,signInAudience,passwordCredentials,keyCredentials&$expand=owners($select=id)");
+    const page = await this.collectGraph("/v1.0/applications?$top=999&$select=id,appId,displayName,createdDateTime,signInAudience,passwordCredentials,keyCredentials&$expand=owners($select=id)");
+    return projectPage(page, projectCredentialCarrier);
   }
 
   async listOAuth2PermissionGrants(): Promise<AzurePage> {
@@ -1119,7 +1499,7 @@ type NetworkPolicyClient = Pick<AzureAuditorClient, "listNetworkSecurityGroups" 
 
 function optionalCall<T>(method: (() => Promise<T>) | undefined, missing: string): () => Promise<T> {
   return method ?? (async () => {
-    throw new Error(`${missing} is not available on this client.`);
+    throw new Error(`not attempted: this client does not expose ${missing}, so no request was made.`);
   });
 }
 
@@ -1131,21 +1511,31 @@ export async function checkAzureAccess(
 ): Promise<AzureAccessCheckResult> {
   const config = client.getResolvedConfig();
   const surfaces = await Promise.all([
-    surface("organization", "graph", () => client.getOrganization(), () => 1),
-    surface("conditional_access", "graph", () => client.listConditionalAccessPolicies(), pageCount),
-    surface("directory_roles", "graph", () => client.listDirectoryRoles(), pageCount),
-    surface("secure_scores", "graph", () => client.listSecureScores(), pageCount),
-    surface("defender_pricings", "arm", () => client.listDefenderPricings(), pageCount),
-    surface("role_assignments", "arm", () => client.listRoleAssignments(25), pageCount),
-    surface("diagnostic_settings", "arm", () => client.listDiagnosticSettings(), pageCount),
-    surface("security_contacts", "arm", () => client.listSecurityContacts(), pageCount),
+    surface("organization", "graph", () => client.getOrganization(), () => ({ count: 1 })),
+    surface("conditional_access", "graph", () => client.listConditionalAccessPolicies(), pageSummary),
+    surface("directory_roles", "graph", () => client.listDirectoryRoles(), pageSummary),
+    surface("secure_scores", "graph", () => client.listSecureScores(), pageSummary),
+    surface("defender_pricings", "arm", () => client.listDefenderPricings(), pageSummary),
+    surface("role_assignments", "arm", () => client.listRoleAssignments(25), pageSummary),
+    surface("diagnostic_settings", "arm", () => client.listDiagnosticSettings(), pageSummary),
+    surface("security_contacts", "arm", () => client.listSecurityContacts(), pageSummary),
   ]);
 
   const readableCount = surfaces.filter((item) => item.status === "readable").length;
   const status = readableCount >= 6 ? "healthy" : "limited";
+  const truncatedSurfaces = surfaces.filter((item) => item.truncated).map((item) => item.name);
+  // A probe that failed at the token request never reached its resource; the note names the request that was made.
+  const tokenFailures = surfaces.filter((item) => item.status === "not_readable" && isTokenRequestFailure({ url: item.request_url ?? undefined }));
+  const tokenNote = tokenFailures[0]
+    ? `${tokenRequestLabel({ url: tokenFailures[0].request_url ?? undefined })} returned ${describeTokenFailure({ error: tokenFailures[0].error ?? "", status: tokenFailures[0].http_status ?? undefined })}; no resource request was made for ${tokenFailures.map((item) => item.name).join(", ")}.`
+    : undefined;
   const notes = [
     `Authenticated against ${describeSourceChain(config)}.`,
     `${readableCount}/${surfaces.length} Azure audit surfaces are readable.`,
+    ...(tokenNote ? [tokenNote] : []),
+    ...(truncatedSurfaces.length > 0
+      ? [`Probe counts for ${truncatedSurfaces.join(", ")} stopped at the probe page cap and are lower bounds, not inventory sizes.`]
+      : []),
   ];
 
   return {
@@ -1157,7 +1547,9 @@ export async function checkAzureAccess(
     recommendedNextStep:
       status === "healthy"
         ? "Run azure_assess_identity, azure_assess_monitoring, azure_assess_subscription_guardrails, azure_assess_data_protection, azure_assess_network_and_policy, or azure_export_audit_bundle."
-        : "Grant Microsoft Graph read permissions and Azure Reader/Security Reader roles for the audit principal.",
+        : tokenNote
+          ? "Fix the app registration's client credentials (tenant id, client id, client secret) so the token request succeeds, then re-run the access check."
+          : "Grant Microsoft Graph read permissions and Azure Reader/Security Reader roles for the audit principal.",
   };
 }
 
@@ -1242,22 +1634,50 @@ export async function assessAzureIdentity(client: IdentityClient): Promise<Azure
     findings.push(manualForError("AZURE-ID-01", 1, "Conditional Access MFA baseline", "high", "GET /v1.0/identity/conditionalAccess/policies", "Policy.Read.All", "the Conditional Access policy export from the Entra admin center", policies, AZURE_ENDPOINT_DOCS.conditionalAccess, errors));
     findings.push(manualForError("AZURE-ID-02", 4, "Legacy authentication blocking", "high", "GET /v1.0/identity/conditionalAccess/policies", "Policy.Read.All", "the Conditional Access policies that block legacy clients", policies, AZURE_ENDPOINT_DOCS.conditionalAccess, errors));
   } else {
+    // Security defaults are a secondary read: an enabled MFA or block policy satisfies the control on its own,
+    // but when no such policy exists the verdict rests entirely on the defaults, so an unreadable read is manual, not fail.
+    const defaultsFailure = securityDefaults.ok ? undefined : describeFailure(securityDefaults);
+    const defaultsNote = securityDefaults.ok
+      ? ""
+      : isTokenRequestFailure(securityDefaults)
+        ? ` Security defaults could not be read (${failedReadNote(securityDefaults, SECURITY_DEFAULTS_ENDPOINT)}).`
+        : ` Security defaults could not be read (${SECURITY_DEFAULTS_ENDPOINT} returned ${defaultsFailure}).`;
+    const defaultsEvidence = {
+      security_defaults_enabled: securityDefaults.ok ? securityDefaultsEnabled : null,
+      security_defaults_readable: securityDefaults.ok,
+      security_defaults_http_status: securityDefaults.ok ? null : securityDefaults.status ?? null,
+      security_defaults_request_url: securityDefaults.ok ? null : securityDefaults.url ?? null,
+      security_defaults_error: defaultsFailure ?? null,
+    };
+    if (!securityDefaults.ok) errors.push(`AZURE-ID-01 ${failedReadNote(securityDefaults, SECURITY_DEFAULTS_ENDPOINT)}`);
+    const policyEvidence = { total_policies: policies.value.items.length, enabled_policies: enabled.length, report_only_policies: reportOnly.length, mfa_policies: mfaPolicies.length, ...defaultsEvidence, ...pageEvidence(policies.value) };
     const baseline = mfaPolicies.length > 0 || securityDefaultsEnabled;
-    findings.push(finding("AZURE-ID-01", 1, "Conditional Access MFA baseline", "high",
-      baseline ? capForPartial("pass", policies.value) : "fail",
-      baseline
-        ? `Strong authentication baseline is present via ${mfaPolicies.length} enabled MFA Conditional Access policies${securityDefaultsEnabled ? " and security defaults" : ""}.${reportOnly.length > 0 ? ` ${reportOnly.length} policies are report-only and were not counted.` : ""}${partialNote(policies.value, "Conditional Access policies")}`
-        : policies.value.items.length === 0
-          ? "Zero Conditional Access policies were returned and security defaults are off; empty inventory fails this control by intent."
-          : `No enabled MFA Conditional Access policy or security defaults baseline was found (${reportOnly.length} report-only policies do not enforce).`,
-      { total_policies: policies.value.items.length, enabled_policies: enabled.length, report_only_policies: reportOnly.length, mfa_policies: mfaPolicies.length, security_defaults_enabled: securityDefaultsEnabled, security_defaults_readable: securityDefaults.ok, ...pageEvidence(policies.value) }));
+    if (!baseline && !securityDefaults.ok) {
+      const manual = manualForError("AZURE-ID-01", 1, "Conditional Access MFA baseline", "high", SECURITY_DEFAULTS_ENDPOINT, "Policy.Read.All", "the security defaults setting from the Entra admin center together with the Conditional Access policy export", securityDefaults, AZURE_ENDPOINT_DOCS.securityDefaults, errors);
+      findings.push({ ...manual, summary: `No enabled MFA Conditional Access policy was found and ${manual.summary}`, evidence: { ...manual.evidence, ...policyEvidence } });
+    } else {
+      findings.push(finding("AZURE-ID-01", 1, "Conditional Access MFA baseline", "high",
+        baseline ? capForPartial("pass", policies.value) : "fail",
+        baseline
+          ? `Strong authentication baseline is present via ${mfaPolicies.length} enabled MFA Conditional Access policies${securityDefaultsEnabled ? " and security defaults" : ""}.${reportOnly.length > 0 ? ` ${reportOnly.length} policies are report-only and were not counted.` : ""}${partialNote(policies.value, "Conditional Access policies")}${defaultsNote}`
+          : policies.value.items.length === 0
+            ? "Zero Conditional Access policies were returned and security defaults are off; empty inventory fails this control by intent."
+            : `No enabled MFA Conditional Access policy or security defaults baseline was found (${reportOnly.length} report-only policies do not enforce).`,
+        policyEvidence));
+    }
     const legacyBlocked = legacyAuthPolicies.length > 0 || securityDefaultsEnabled;
-    findings.push(finding("AZURE-ID-02", 4, "Legacy authentication blocking", "high",
-      legacyBlocked ? capForPartial("pass", policies.value) : "fail",
-      legacyBlocked
-        ? `Legacy authentication is blocked via ${legacyAuthPolicies.length} enabled Conditional Access block policies targeting exchangeActiveSync/other clients${securityDefaultsEnabled ? " and security defaults" : ""}.${partialNote(policies.value, "Conditional Access policies")}`
-        : "No enabled Conditional Access policy blocks exchangeActiveSync/other client app types and security defaults are off.",
-      { legacy_auth_block_policies: legacyAuthPolicies.length, security_defaults_enabled: securityDefaultsEnabled, ...pageEvidence(policies.value) }));
+    const legacyEvidence = { legacy_auth_block_policies: legacyAuthPolicies.length, ...defaultsEvidence, ...pageEvidence(policies.value) };
+    if (!legacyBlocked && !securityDefaults.ok) {
+      const manual = manualForError("AZURE-ID-02", 4, "Legacy authentication blocking", "high", SECURITY_DEFAULTS_ENDPOINT, "Policy.Read.All", "the security defaults setting from the Entra admin center together with the Conditional Access policies that block legacy clients", securityDefaults, AZURE_ENDPOINT_DOCS.securityDefaults, errors);
+      findings.push({ ...manual, summary: `No enabled Conditional Access policy blocks exchangeActiveSync/other client app types and ${manual.summary}`, evidence: { ...manual.evidence, ...legacyEvidence } });
+    } else {
+      findings.push(finding("AZURE-ID-02", 4, "Legacy authentication blocking", "high",
+        legacyBlocked ? capForPartial("pass", policies.value) : "fail",
+        legacyBlocked
+          ? `Legacy authentication is blocked via ${legacyAuthPolicies.length} enabled Conditional Access block policies targeting exchangeActiveSync/other clients${securityDefaultsEnabled ? " and security defaults" : ""}.${partialNote(policies.value, "Conditional Access policies")}${defaultsNote}`
+          : "No enabled Conditional Access policy blocks exchangeActiveSync/other client app types and security defaults are off.",
+        legacyEvidence));
+    }
   }
 
   if (!registrations.ok) {
@@ -1452,18 +1872,19 @@ export async function assessAzureIdentity(client: IdentityClient): Promise<Azure
 
   return {
     title: "Azure identity posture",
+    // Every count derived from an unreadable inventory renders null, never the zero of its empty fallback.
     summary: {
-      enabled_conditional_access_policies: enabled.length,
-      report_only_conditional_access_policies: reportOnly.length,
-      mfa_conditional_access_policies: mfaPolicies.length,
-      legacy_auth_block_policies: legacyAuthPolicies.length,
+      enabled_conditional_access_policies: policies.ok ? enabled.length : null,
+      report_only_conditional_access_policies: policies.ok ? reportOnly.length : null,
+      mfa_conditional_access_policies: policies.ok ? mfaPolicies.length : null,
+      legacy_auth_block_policies: policies.ok ? legacyAuthPolicies.length : null,
       users_in_registration_report: registrations.ok ? registrations.value.items.length : null,
-      global_administrators: globalAdmins,
-      privileged_role_assignments: privilegedAssignments,
+      global_administrators: roles.ok && !memberReadFailure ? globalAdmins : null,
+      privileged_role_assignments: roles.ok && !memberReadFailure ? privilegedAssignments : null,
       guests: guests.ok ? guests.value.items.length : null,
       risky_users: riskyUsers.ok ? riskyUsers.value.items.length : null,
       app_registrations: applications.ok ? applications.value.items.length : null,
-      security_defaults_enabled: securityDefaultsEnabled,
+      security_defaults_enabled: securityDefaults.ok ? securityDefaultsEnabled : null,
       entra_id_p2_license: p2 ?? null,
       manual_findings: findings.filter((item) => item.status === "manual").length,
     },
@@ -1528,28 +1949,30 @@ export async function assessAzureMonitoring(client: MonitoringClient): Promise<A
 
   const standardPlans = defenderPricings.ok ? defenderPricings.value.items.filter((item) => asLower(asObject(item.properties)?.pricingTier) === "standard") : [];
   const totalPlans = defenderPricings.ok ? defenderPricings.value.items.length : 0;
+  // The alerts read only annotates MON-04, but a failed read is still logged so the bundle names it.
+  if (!alerts.ok) errors.push(`AZURE-MON-04 ${failedReadNote(alerts, "GET /v1.0/security/alerts_v2")}`);
   if (!defenderPricings.ok) {
     findings.push(manualForError("AZURE-MON-04", 16, "Defender for Cloud plan coverage", "high", "GET Microsoft.Security/pricings", "Security Reader on the subscription", "the Defender for Cloud environment settings page", defenderPricings, AZURE_ENDPOINT_DOCS.defenderPricings, errors));
   } else {
     findings.push(finding("AZURE-MON-04", 16, "Defender for Cloud plan coverage", "high",
-      totalPlans === 0 ? "manual" : standardPlans.length === totalPlans ? "pass" : standardPlans.length > 0 ? "warn" : "fail",
+      totalPlans === 0 ? "manual" : standardPlans.length === totalPlans ? capForPartial("pass", defenderPricings.value) : standardPlans.length > 0 ? "warn" : "fail",
       totalPlans > 0
-        ? `${standardPlans.length}/${totalPlans} Defender for Cloud plans are on the Standard pricingTier.`
+        ? `${standardPlans.length}/${totalPlans} Defender for Cloud plans are on the Standard pricingTier.${partialNote(defenderPricings.value, "Defender plans")}`
         : "Zero Defender pricing records were returned; the API always lists every plan, so confirm access manually.",
-      { standard_plans: standardPlans.length, total_plans: totalPlans, alerts_visible: alerts.ok ? alerts.value.seen : null, alerts_error: alerts.ok ? null : describeFailure(alerts) }));
+      { standard_plans: standardPlans.length, total_plans: totalPlans, alerts_visible: alerts.ok ? alerts.value.seen : null, alerts_error: alerts.ok ? null : describeFailure(alerts), ...pageEvidence(defenderPricings.value) }));
   }
 
   const effectiveSettings = diagnosticSettings.ok ? diagnosticSettings.value.items.filter((setting) => diagnosticSettingHasEnabledLog(setting) && diagnosticSettingDestination(setting)) : [];
   if (!diagnosticSettings.ok) {
     findings.push(manualForError("AZURE-MON-05", 15, "Subscription diagnostic settings", "high", "GET Microsoft.Insights/diagnosticSettings", "Reader (Monitoring Reader) on the subscription", "the Activity log diagnostic settings page", diagnosticSettings, AZURE_ENDPOINT_DOCS.diagnosticSettings, errors));
   } else {
-    findings.push(finding("AZURE-MON-05", 15, "Subscription diagnostic settings", "high", effectiveSettings.length > 0 ? "pass" : "fail",
+    findings.push(finding("AZURE-MON-05", 15, "Subscription diagnostic settings", "high", effectiveSettings.length > 0 ? capForPartial("pass", diagnosticSettings.value) : "fail",
       effectiveSettings.length > 0
-        ? `${effectiveSettings.length}/${diagnosticSettings.value.items.length} subscription diagnostic settings have enabled log categories and a destination.`
+        ? `${effectiveSettings.length}/${diagnosticSettings.value.items.length} subscription diagnostic settings have enabled log categories and a destination.${partialNote(diagnosticSettings.value, "diagnostic settings")}`
         : diagnosticSettings.value.items.length === 0
           ? "Zero subscription diagnostic settings exist; Activity Log is not exported (empty inventory fails by intent)."
           : `${diagnosticSettings.value.items.length} diagnostic settings exist but none has an enabled log category with a destination.`,
-      { diagnostic_settings: diagnosticSettings.value.items.length, effective_settings: effectiveSettings.length }));
+      { diagnostic_settings: diagnosticSettings.value.items.length, effective_settings: effectiveSettings.length, ...pageEvidence(diagnosticSettings.value) }));
   }
 
   if (!diagnosticSettings.ok) {
@@ -1580,13 +2003,13 @@ export async function assessAzureMonitoring(client: MonitoringClient): Promise<A
   return {
     title: "Azure monitoring posture",
     summary: {
-      secure_score_ratio: round(secureScoreRatio, 2),
+      secure_score_ratio: secureScores.ok && maxScoreValue > 0 ? round(secureScoreRatio, 2) : null,
       directory_audits: audits.ok ? audits.value.seen : null,
       sign_ins: signIns.ok ? signIns.value.seen : null,
-      defender_standard_plans: standardPlans.length,
-      defender_total_plans: totalPlans,
+      defender_standard_plans: defenderPricings.ok ? standardPlans.length : null,
+      defender_total_plans: defenderPricings.ok ? totalPlans : null,
       security_alerts: alerts.ok ? alerts.value.seen : null,
-      effective_diagnostic_settings: effectiveSettings.length,
+      effective_diagnostic_settings: diagnosticSettings.ok ? effectiveSettings.length : null,
       manual_findings: findings.filter((item) => item.status === "manual").length,
     },
     findings,
@@ -1687,11 +2110,11 @@ export async function assessAzureSubscriptionGuardrails(
   return {
     title: "Azure subscription guardrails",
     summary: {
-      owner_assignments: ownerAssignments.length,
-      contributor_assignments: contributorAssignments.length,
+      owner_assignments: rbacManual ? null : ownerAssignments.length,
+      contributor_assignments: rbacManual ? null : contributorAssignments.length,
       inspected_assignments: roleAssignments.ok ? roleAssignments.value.seen : null,
       network_watchers: networkWatchers.ok ? networkWatchers.value.items.length : null,
-      privileged_service_principals: privilegedServicePrincipals.length,
+      privileged_service_principals: rbacManual ? null : privilegedServicePrincipals.length,
       manual_findings: findings.filter((item) => item.status === "manual").length,
     },
     findings,
@@ -1823,15 +2246,28 @@ export async function assessAzureDataProtection(
   } else {
     const forwardingRules: JsonRecord[] = [];
     let mailboxesRead = 0;
-    let mailboxesUnreadable = 0;
+    let mailboxesDenied = 0;
+    let mailboxesErrored = 0;
     let permissionFailure: { error: string; status?: number } | undefined;
+    let otherFailure: { error: string; status?: number } | undefined;
+    let tokenFailure: { error: string; status?: number; url?: string } | undefined;
     for (const user of members.value.items) {
       const userId = asString(user.id);
       if (!userId) continue;
       const rules = await attemptPage(() => client.listInboxMessageRules(userId));
       if (!rules.ok) {
-        mailboxesUnreadable += 1;
-        if (rules.status === 401 || rules.status === 403) permissionFailure = rules;
+        // A refused token (expired mid-run) is not a mailbox permission gap: no mailbox request was made and none can be.
+        if (isTokenRequestFailure(rules)) {
+          tokenFailure = rules;
+          break;
+        }
+        if (rules.status === 401 || rules.status === 403) {
+          mailboxesDenied += 1;
+          permissionFailure = rules;
+        } else {
+          mailboxesErrored += 1;
+          otherFailure = rules;
+        }
         continue;
       }
       mailboxesRead += 1;
@@ -1843,18 +2279,41 @@ export async function assessAzureDataProtection(
         }
       }
     }
-    if (permissionFailure && mailboxesRead === 0) {
-      findings.push(manualForError("AZURE-DP-06", 20, "Inbox forwarding rules", "high", "GET /v1.0/users/{id}/mailFolders/inbox/messageRules", "MailboxSettings.Read (application)", "the inbox rule export for every mailbox", permissionFailure, AZURE_ENDPOINT_DOCS.messageRules, errors));
+    const mailboxesUnreadable = mailboxesDenied + mailboxesErrored;
+    if (tokenFailure) {
+      findings.push(manualForError("AZURE-DP-06", 20, "Inbox forwarding rules", "high", MESSAGE_RULES_ENDPOINT, MAILBOX_RULES_PERMISSION, "the inbox rule export for every mailbox", tokenFailure, AZURE_ENDPOINT_DOCS.messageRules, errors));
+    } else if (permissionFailure && mailboxesRead === 0) {
+      findings.push(manualForError("AZURE-DP-06", 20, "Inbox forwarding rules", "high", MESSAGE_RULES_ENDPOINT, MAILBOX_RULES_PERMISSION, "the inbox rule export for every mailbox", permissionFailure, AZURE_ENDPOINT_DOCS.messageRules, errors));
     } else {
+      // A denied subset is a permission gap on those mailboxes, not a licensing quirk; only non-permission
+      // errors (typically 404 for users without an Exchange mailbox) are described that way.
+      if (permissionFailure) errors.push(`AZURE-DP-06 ${MESSAGE_RULES_ENDPOINT}: ${describeFailure(permissionFailure)} on ${mailboxesDenied} of ${mailboxesRead + mailboxesUnreadable} mailboxes`);
+      if (otherFailure) errors.push(`AZURE-DP-06 ${MESSAGE_RULES_ENDPOINT}: ${describeFailure(otherFailure)} on ${mailboxesErrored} of ${mailboxesRead + mailboxesUnreadable} mailboxes`);
+      const unreadableNotes = [
+        mailboxesDenied > 0 && permissionFailure ? `${mailboxesDenied} denied with ${describeFailure(permissionFailure)}, so ${MAILBOX_RULES_PERMISSION} is missing for those mailboxes and their rules were not inspected` : "",
+        mailboxesErrored > 0 && otherFailure ? `${mailboxesErrored} returned a non-permission error (${describeFailure(otherFailure)}; commonly users without an Exchange mailbox)` : "",
+      ].filter(Boolean);
       const partial = members.value.truncated || mailboxesUnreadable > 0;
       const status: AzureFindingStatus = members.value.items.length === 0
         ? "manual"
         : forwardingRules.length > 0 ? "fail" : partial ? "warn" : "pass";
+      const unreadableSummary = mailboxesUnreadable > 0
+        ? ` (${mailboxesUnreadable} unreadable: ${unreadableNotes.join("; ")}${status === "warn" ? "; verdict capped at warn" : ""})`
+        : "";
       findings.push(finding("AZURE-DP-06", 20, "Inbox forwarding rules", "high", status,
         members.value.items.length === 0
           ? "Zero enabled member users were returned; confirm User.Read.All before treating mailboxes as clean."
-          : `${forwardingRules.length} enabled inbox rules forward or redirect mail across ${mailboxesRead} readable mailboxes (${mailboxesUnreadable} unreadable, likely without an Exchange mailbox).${partialNote(members.value, "member users")}`,
-        { mailboxes_read: mailboxesRead, mailboxes_unreadable: mailboxesUnreadable, forwarding_rules: forwardingRules.slice(0, 25), ...pageEvidence(members.value) }));
+          : `${forwardingRules.length} enabled inbox rules forward or redirect mail across ${mailboxesRead} readable mailboxes${unreadableSummary}.${partialNote(members.value, "member users")}`,
+        {
+          mailboxes_read: mailboxesRead,
+          mailboxes_unreadable: mailboxesUnreadable,
+          mailboxes_permission_denied: mailboxesDenied,
+          mailboxes_other_errors: mailboxesErrored,
+          permission_failure: permissionFailure ? { endpoint: MESSAGE_RULES_ENDPOINT, http_status: permissionFailure.status ?? null, required_access: MAILBOX_RULES_PERMISSION, error: permissionFailure.error.slice(0, 300) } : null,
+          other_failure: otherFailure ? { endpoint: MESSAGE_RULES_ENDPOINT, http_status: otherFailure.status ?? null, error: otherFailure.error.slice(0, 300) } : null,
+          forwarding_rules: forwardingRules.slice(0, 25),
+          ...pageEvidence(members.value),
+        }));
     }
   }
 
@@ -2042,12 +2501,24 @@ export async function assessAzureNetworkAndPolicy(client: NetworkPolicyClient): 
   } else {
     const enforced = assignments.value.items.filter((item) => asLower(asObject(item.properties)?.enforcementMode) !== "donotenforce");
     const mandatoryPresent = MANDATORY_POLICY_DEFINITIONS.filter((definition) => assignments.value.items.some((item) => (asLower(asObject(item.properties)?.policyDefinitionId) ?? "").endsWith(definition.id)));
+    const mandatoryNotSeen = MANDATORY_POLICY_DEFINITIONS.filter((item) => !mandatoryPresent.includes(item)).map((item) => item.name);
+    // A truncated page cannot prove absence: the unseen built-ins are reported as not seen, and only a
+    // complete page states which mandatory definitions are missing.
+    const pageComplete = !assignments.value.truncated;
     findings.push(finding("AZURE-NP-02", 25, "Azure Policy assignments enforced", "medium",
       assignments.value.items.length === 0 ? "fail" : enforced.length === 0 ? "fail" : enforced.length < assignments.value.items.length ? "warn" : capForPartial("pass", assignments.value),
       assignments.value.items.length === 0
         ? "Zero Azure Policy assignments apply at subscription scope (empty inventory fails by intent)."
-        : `${enforced.length}/${assignments.value.items.length} policy assignments use enforcementMode Default; mandatory built-ins present: ${mandatoryPresent.map((item) => item.name).join(", ") || "none"}.${partialNote(assignments.value, "policy assignments")}`,
-      { assignments: assignments.value.items.length, enforced: enforced.length, do_not_enforce: assignments.value.items.length - enforced.length, mandatory_present: mandatoryPresent.map((item) => item.name), mandatory_missing: MANDATORY_POLICY_DEFINITIONS.filter((item) => !mandatoryPresent.includes(item)).map((item) => item.name), ...pageEvidence(assignments.value) }));
+        : `${enforced.length}/${assignments.value.items.length} policy assignments use enforcementMode Default; mandatory built-ins present: ${mandatoryPresent.map((item) => item.name).join(", ") || "none"}${pageComplete ? "" : `; ${mandatoryNotSeen.length} mandatory built-ins were not seen on the truncated page and may exist among the unseen assignments`}.${partialNote(assignments.value, "policy assignments")}`,
+      {
+        assignments: assignments.value.items.length,
+        enforced: enforced.length,
+        do_not_enforce: assignments.value.items.length - enforced.length,
+        mandatory_present: mandatoryPresent.map((item) => item.name),
+        mandatory_missing: pageComplete ? mandatoryNotSeen : null,
+        mandatory_not_seen: pageComplete ? null : mandatoryNotSeen,
+        ...pageEvidence(assignments.value),
+      }));
   }
 
   if (!summary.ok) {
@@ -2069,7 +2540,7 @@ export async function assessAzureNetworkAndPolicy(client: NetworkPolicyClient): 
     summary: {
       network_security_groups: nsgs.ok ? nsgs.value.items.length : null,
       network_watchers: watchers.ok ? watchers.value.items.length : null,
-      flow_logs: flowLogPage.seen,
+      flow_logs: watchers.ok && nsgs.ok && !flowLogFailure ? flowLogPage.seen : null,
       policy_assignments: assignments.ok ? assignments.value.items.length : null,
       manual_findings: findings.filter((item) => item.status === "manual").length,
     },
@@ -2083,7 +2554,7 @@ function formatAccessCheckText(result: AzureAccessCheckResult): string {
     surfaceItem.name,
     surfaceItem.service,
     surfaceItem.status,
-    surfaceItem.count === undefined ? "-" : String(surfaceItem.count),
+    surfaceItem.count === undefined ? "-" : `${surfaceItem.count}${surfaceItem.truncated ? "+ (capped)" : ""}`,
     surfaceItem.error ? surfaceItem.error.replace(/\s+/g, " ").slice(0, 80) : "",
   ]);
   return [
@@ -2216,7 +2687,7 @@ function buildQuickReference(result: { assessments: AzureAssessmentResult[]; err
     "- `compliance/executive_summary.md`: prioritized summary",
     "- `compliance/unified_compliance_matrix.md`: finding to framework matrix",
     "- `compliance/<framework>.md`: one report per framework in the spec mapping table",
-    "- `_errors.log`: present only when an API call failed and a finding was rendered manual",
+    "- `_errors.log`: present only when an API call failed; each entry names the finding that rendered manual or recorded the failure in its evidence",
     "",
     "## Status semantics",
     "",
@@ -2245,9 +2716,11 @@ function buildBundleReadme(): string {
     "- `compliance/`: executive summary, unified compliance matrix, per-framework reports",
     "- `analysis/`: normalized findings and assessment details as JSON",
     "- `core_data/`: accessible Azure audit surface inventory and non-secret run metadata",
-    "- `_errors.log`: API failures that produced manual findings (only on partial failure)",
+    "- `_errors.log`: API failures recorded during the run, each named in the affected finding (only on partial failure)",
     "",
-    "Resolved access tokens and client secrets are never written to this bundle.",
+    "Resolved access tokens and client secrets are never written to this bundle. Service principal and app registration",
+    "credentials are reduced to their schedule fields (keyId, start, end, type) before they are kept, and API error bodies are",
+    "reduced to their documented error code and message.",
   ].join("\n");
 }
 
@@ -2390,7 +2863,7 @@ export function registerAzureTools(pi: any): void {
         return textResult(formatAccessCheckText(result), { tool: "azure_check_access", ...result });
       } catch (error) {
         return errorResult(
-          `Azure access check failed: ${error instanceof Error ? error.message : String(error)}`,
+          `Azure access check failed: ${describeThrown(error)}`,
           { tool: "azure_check_access" },
         );
       }
@@ -2410,7 +2883,7 @@ export function registerAzureTools(pi: any): void {
         return textResult(formatAssessmentText(result), { tool: "azure_assess_identity", ...result });
       } catch (error) {
         return errorResult(
-          `Azure identity assessment failed: ${error instanceof Error ? error.message : String(error)}`,
+          `Azure identity assessment failed: ${describeThrown(error)}`,
           { tool: "azure_assess_identity" },
         );
       }
@@ -2430,7 +2903,7 @@ export function registerAzureTools(pi: any): void {
         return textResult(formatAssessmentText(result), { tool: "azure_assess_monitoring", ...result });
       } catch (error) {
         return errorResult(
-          `Azure monitoring assessment failed: ${error instanceof Error ? error.message : String(error)}`,
+          `Azure monitoring assessment failed: ${describeThrown(error)}`,
           { tool: "azure_assess_monitoring" },
         );
       }
@@ -2450,7 +2923,7 @@ export function registerAzureTools(pi: any): void {
         return textResult(formatAssessmentText(result), { tool: "azure_assess_subscription_guardrails", ...result });
       } catch (error) {
         return errorResult(
-          `Azure subscription guardrail assessment failed: ${error instanceof Error ? error.message : String(error)}`,
+          `Azure subscription guardrail assessment failed: ${describeThrown(error)}`,
           { tool: "azure_assess_subscription_guardrails" },
         );
       }
@@ -2470,7 +2943,7 @@ export function registerAzureTools(pi: any): void {
         return textResult(formatAssessmentText(result), { tool: "azure_assess_data_protection", ...result });
       } catch (error) {
         return errorResult(
-          `Azure data protection assessment failed: ${error instanceof Error ? error.message : String(error)}`,
+          `Azure data protection assessment failed: ${describeThrown(error)}`,
           { tool: "azure_assess_data_protection" },
         );
       }
@@ -2490,7 +2963,7 @@ export function registerAzureTools(pi: any): void {
         return textResult(formatAssessmentText(result), { tool: "azure_assess_network_and_policy", ...result });
       } catch (error) {
         return errorResult(
-          `Azure network and policy assessment failed: ${error instanceof Error ? error.message : String(error)}`,
+          `Azure network and policy assessment failed: ${describeThrown(error)}`,
           { tool: "azure_assess_network_and_policy" },
         );
       }
@@ -2534,10 +3007,80 @@ export function registerAzureTools(pi: any): void {
         );
       } catch (error) {
         return errorResult(
-          `Azure audit bundle export failed: ${error instanceof Error ? error.message : String(error)}`,
+          `Azure audit bundle export failed: ${describeThrown(error)}`,
           { tool: "azure_export_audit_bundle" },
         );
       }
     },
   });
+}
+
+/**
+ * Every fixed-text message this integration emits around a refused, failed, or unparseable read, rendered
+ * with representative observed values by the same constants and helpers the error sink uses (GWS note 1).
+ * Each must survive redactErrorText unchanged, since every recorded string passes through it; the fixed-text
+ * test holds this list to the scrub, and a message that does not survive is reworded rather than exempted.
+ */
+export function azureFixedTexts(): readonly string[] {
+  const tokenUrl = "https://login.microsoftonline.com/tenant-123/oauth2/v2.0/token";
+  const html = "<html><head><title>502 Bad Gateway</title></head><body>upstream unavailable</body></html>";
+  const graphDeniedBody = JSON.stringify({ error: { code: "Authorization_RequestDenied", message: "Insufficient privileges to complete the operation." } });
+  const mailboxDeniedBody = JSON.stringify({ error: { code: "ErrorAccessDenied", message: "Access is denied. Check credentials and try again." } });
+  const invalidClientBody = JSON.stringify({ error: "invalid_client", error_description: "AADSTS7000215: Invalid client secret provided." });
+  const graphDenied = { error: `403 Forbidden: ${describeErrorBody(graphDeniedBody, "application/json")}`, status: 403, url: "https://graph.microsoft.com/v1.0/identity/conditionalAccess/policies" };
+  const mailboxDenied = { error: `403 Forbidden: ${describeErrorBody(mailboxDeniedBody, "application/json")}`, status: 403, url: "https://graph.microsoft.com/v1.0/users/user-2026@contoso.example/mailFolders/inbox/messageRules" };
+  const mailboxMissing = { error: `404 Not Found: ${describeErrorBody(JSON.stringify({ error: { code: "ErrorItemNotFound", message: "The specified object was not found in the store." } }), "application/json")}`, status: 404 };
+  const tokenDenied = { error: "Token request failed: 403 Forbidden", status: 403, url: tokenUrl };
+  const tokenInvalid = { error: `Token request failed: 401 Unauthorized: ${describeErrorBody(invalidClientBody, "application/json")}`, status: 401, url: tokenUrl };
+  const conditionalAccess = "GET /v1.0/identity/conditionalAccess/policies";
+  const pricings = "GET /subscriptions/sub-123/providers/Microsoft.Security/pricings";
+  const errors: string[] = [];
+  const evidence = "the Conditional Access policy export from the Entra admin center";
+  const findings = [
+    manualForError("AZURE-ID-01", 1, "Conditional Access MFA baseline", "high", conditionalAccess, "Policy.Read.All", evidence, graphDenied, AZURE_ENDPOINT_DOCS.conditionalAccess, errors),
+    manualForError("AZURE-ID-01", 1, "Conditional Access MFA baseline", "high", conditionalAccess, "Policy.Read.All", evidence, tokenInvalid, AZURE_ENDPOINT_DOCS.conditionalAccess, errors),
+    manualForError("AZURE-MON-05", 10, "Defender for Cloud plans", "high", pricings, "Security Reader", "the Defender for Cloud plan list", tokenDenied, AZURE_ENDPOINT_DOCS.defenderPricings, errors),
+    manualForError("AZURE-DP-06", 20, "Inbox forwarding rules", "high", MESSAGE_RULES_ENDPOINT, MAILBOX_RULES_PERMISSION, "the inbox rule export for every mailbox", mailboxDenied, AZURE_ENDPOINT_DOCS.messageRules, errors),
+  ];
+  const surfaceNames = ["organization", "conditional_access", "directory_roles", "secure_scores", "defender_pricings", "role_assignments", "diagnostic_settings", "security_contacts"];
+  return Object.freeze([
+    PARSE_ERROR_NOTE,
+    describeErrorBody(html, "text/html; charset=utf-8"),
+    describeErrorBody("upstream unavailable", null),
+    describeErrorBody("{}", "application/json"),
+    graphDenied.error,
+    mailboxDenied.error,
+    mailboxMissing.error,
+    tokenDenied.error,
+    tokenInvalid.error,
+    `Token request failed: 502 Bad Gateway: ${describeErrorBody(html, "text/html")}`,
+    "Token response did not include access_token.",
+    `Request returned 200 OK: ${describeErrorBody(html, "text/html")}`,
+    `Token request returned 200 OK: ${describeErrorBody(html, "text/html")}`,
+    "No graph token or client credentials are available.",
+    describeFailure({ error: "", status: 401 }),
+    describeFailure({ error: "", status: 403 }),
+    describeFailure({ error: "", status: 402 }),
+    tokenFailureText(tokenDenied, conditionalAccess).marker,
+    tokenFailureText(tokenDenied, pricings).marker,
+    failedReadNote(graphDenied, SECURITY_DEFAULTS_ENDPOINT),
+    failedReadNote(tokenDenied, SECURITY_DEFAULTS_ENDPOINT),
+    failedReadNote(tokenInvalid, SECURITY_DEFAULTS_ENDPOINT),
+    ...findings.map((item) => item.summary),
+    ...errors,
+    `Security defaults could not be read (${SECURITY_DEFAULTS_ENDPOINT} returned ${describeFailure(graphDenied)}).`,
+    `Security defaults could not be read (${failedReadNote(tokenDenied, SECURITY_DEFAULTS_ENDPOINT)}).`,
+    `AZURE-DP-06 ${MESSAGE_RULES_ENDPOINT}: ${describeFailure(mailboxDenied)} on 3 of 12 mailboxes`,
+    `3 denied with ${describeFailure(mailboxDenied)}, so ${MAILBOX_RULES_PERMISSION} is missing for those mailboxes and their rules were not inspected`,
+    `2 returned a non-permission error (${describeFailure(mailboxMissing)}; commonly users without an Exchange mailbox)`,
+    "not attempted: this client does not expose listNetworkWatchers, so no request was made.",
+    partialNote({ items: [], seen: 100, total: undefined, truncated: true }, "Conditional Access policies").trim(),
+    partialNote({ items: [], seen: 25, total: 40, truncated: true }, "role assignments").trim(),
+    "Member inventory is partial; verdict capped at warn.",
+    "6/8 Azure audit surfaces are readable.",
+    `${tokenRequestLabel(tokenDenied)} returned ${describeTokenFailure(tokenDenied)}; no resource request was made for ${surfaceNames.join(", ")}.`,
+    "Probe counts for role_assignments stopped at the probe page cap and are lower bounds, not inventory sizes.",
+    "Fix the app registration's client credentials (tenant id, client id, client secret) so the token request succeeds, then re-run the access check.",
+    "Grant Microsoft Graph read permissions and Azure Reader/Security Reader roles for the audit principal.",
+  ]);
 }

@@ -9,7 +9,6 @@ import {
   existsSync,
   lstatSync,
   mkdirSync,
-  readFileSync,
   realpathSync,
 } from "node:fs";
 import { chmod, readdir, writeFile } from "node:fs/promises";
@@ -17,7 +16,7 @@ import { homedir } from "node:os";
 import { basename, dirname, join, relative, resolve } from "node:path";
 import { ZipArchive } from "archiver";
 import { Type } from "@sinclair/typebox";
-import { YAMLError, parse as parseYaml } from "yaml";
+import { describePagination, readYamlConfig, type PaginationStop } from "./hardening/index.js";
 import { errorResult, formatTable, textResult } from "./shared.js";
 
 type FetchImpl = typeof fetch;
@@ -220,37 +219,14 @@ export interface PagedList<T = JsonRecord> {
 }
 
 /**
- * Why a cursor walk stopped. Only `exhausted` (no next cursor and every reported item seen) may yield a complete
- * listing; every other exit is a cap or an anomaly and is reported as truncated so no verdict can pass on it.
+ * The outcome of a cursor walk in the `PagedList` shape. The shared `describePagination` decides completeness and
+ * phrases the note (only `exhausted` with every reported item seen is complete; every cap or anomaly is truncated so
+ * no verdict can pass on it); this adapter keeps the listing's `complete` and `note` fields only, so a `PagedList`
+ * carries no key beyond its interface.
  */
-type PaginationStop =
-  | { kind: "exhausted" }
-  | { kind: "cursor_stalled" }
-  | { kind: "empty_page" }
-  | { kind: "limit"; limit: number }
-  | { kind: "page_cap"; pages: number };
-
-function describePagination(seen: number, totalCount: number | undefined, stop: PaginationStop): Pick<PagedList, "complete" | "note"> {
-  const progress = `${seen}${totalCount !== undefined ? ` of ${totalCount}` : ""} items`;
-  switch (stop.kind) {
-    case "exhausted":
-      if (totalCount !== undefined && seen < totalCount) {
-        return { complete: false, note: `${progress} seen before the listing ended without a next cursor` };
-      }
-      return { complete: true };
-    case "cursor_stalled":
-      return { complete: false, note: `stopped after ${progress} because the next cursor did not advance` };
-    case "empty_page":
-      return { complete: false, note: `stopped after ${progress} because a page returned no items while a next cursor was reported` };
-    case "limit":
-      return { complete: false, note: `stopped after ${progress} with more pages available (${stop.limit} item limit)` };
-    case "page_cap":
-      return { complete: false, note: `stopped after ${progress} with more pages available (${stop.pages} page maximum)` };
-    default: {
-      const unhandled: never = stop;
-      throw new Error(`Unhandled pagination stop ${String(unhandled)}`);
-    }
-  }
+function describeCursorWalk(seen: number, totalCount: number | undefined, stop: PaginationStop): Pick<PagedList, "complete" | "note"> {
+  const outcome = describePagination(seen, totalCount, stop);
+  return outcome.note === undefined ? { complete: outcome.complete } : { complete: outcome.complete, note: outcome.note };
 }
 
 /** Classifies a page result; `undefined` means the walk continues with `nextCursor`. */
@@ -264,8 +240,8 @@ function paginationStopAfterPage(
 ): PaginationStop | undefined {
   if (keptCount < pageItemCount) return { kind: "limit", limit };
   if (!nextCursor) return { kind: "exhausted" };
-  if (nextCursor === cursor) return { kind: "cursor_stalled" };
-  if (pageItemCount === 0) return { kind: "empty_page" };
+  if (nextCursor === cursor) return { kind: "repeated_cursor" };
+  if (pageItemCount === 0) return { kind: "empty_page_with_cursor" };
   if (seen >= limit) return { kind: "limit", limit };
   return undefined;
 }
@@ -767,40 +743,18 @@ interface ConfigFileValues {
   auditWindowDays?: number;
 }
 
-/** The `code` of a Node system error (ENOENT, EACCES, EISDIR): a fixed identifier, never the message. */
-function systemErrorCode(error: unknown): string | undefined {
-  const code = asObject(error)?.code;
-  return typeof code === "string" && /^E[A-Z0-9_]{1,30}$/.test(code) ? code : undefined;
-}
-
-/** The first line the YAML parser points at, when it reports one. */
-function yamlErrorLine(error: unknown): number | undefined {
-  return error instanceof YAMLError ? error.linePos?.[0]?.line : undefined;
-}
-
 /**
- * Reads the optional config file. Neither the read error nor the parser error is interpolated: the YAML parser
- * quotes the offending source line in its message, which for a malformed `api_key:` line is the key itself, so the
- * thrown text is a fixed description with the path, the line number when the parser gives one, and the system error
- * code when the read failed, scrubbed like every other error this module raises.
+ * Reads the optional config file through the shared `readYamlConfig` guards. Neither the read error nor the parser
+ * error is interpolated: the YAML parser quotes the offending source line in its message, which for a malformed
+ * `api_key:` line is the key itself, so the thrown `ConfigFileError` is the fixed description with the path, the
+ * line, column, and parser code when the parse failed, or the system error code when the read failed, and nothing
+ * else. A missing file is no config, as before.
  */
 function readConfigFile(pathname: string): ConfigFileValues | undefined {
   if (!existsSync(pathname)) return undefined;
-  let text: string;
-  try {
-    text = readFileSync(pathname, "utf8");
-  } catch (error) {
-    const code = systemErrorCode(error);
-    throw new Error(scrubErrorText(`Unable to read New Relic config file ${pathname}${code ? ` (${code})` : ""}`));
-  }
-  let parsed: unknown;
-  try {
-    parsed = parseYaml(text);
-  } catch (error) {
-    const line = yamlErrorLine(error);
-    throw new Error(scrubErrorText(`Unable to parse New Relic config file: invalid YAML in ${pathname}${line === undefined ? "" : ` at line ${line}`}`));
-  }
-  const object = asObject(parsed) ?? {};
+  const read = readYamlConfig(pathname, { label: "New Relic" });
+  if (!read.ok) return undefined;
+  const object = asObject(read.value) ?? {};
   return {
     apiKey: asString(object.api_key) ?? asString(object.apiKey),
     accountIds: parseAccountIds(object.account_ids ?? object.accountIds ?? object.account_id ?? object.accountId),
@@ -1721,7 +1675,7 @@ export class NewrelicApiClient {
       stop = paginationStopAfterPage(pageItems.length, kept.length, items.length, limit, cursor, nextCursor);
       cursor = nextCursor;
     }
-    return { items, totalCount, ...describePagination(items.length, totalCount, stop ?? { kind: "page_cap", pages: MAX_PAGES }) };
+    return { items, totalCount, ...describeCursorWalk(items.length, totalCount, stop ?? { kind: "page_cap", pages: MAX_PAGES }) };
   }
 
   private buildRestUrl(pathOrUrl: string, query: JsonRecord = {}): string {
@@ -1864,7 +1818,7 @@ export class NewrelicApiClient {
       stop = paginationStopAfterPage(pageItems.length, kept.length, items.length, limit, cursor, nextCursor);
       cursor = nextCursor;
     }
-    return { items, totalCount, ...describePagination(items.length, totalCount, stop ?? { kind: "page_cap", pages: MAX_PAGES }) };
+    return { items, totalCount, ...describeCursorWalk(items.length, totalCount, stop ?? { kind: "page_cap", pages: MAX_PAGES }) };
   }
 
   async listOrganizationAuthenticationDomains(organizationId: string, limit = DEFAULT_PAGE_LIMIT): Promise<PagedList> {

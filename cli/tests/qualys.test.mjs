@@ -3095,6 +3095,153 @@ test("rule 9: the activity log's XML error envelope on the CSV path goes through
 });
 
 // ---------------------------------------------------------------------------------------------
+// Vendor error codes are pattern-validated fields, never free text
+// ---------------------------------------------------------------------------------------------
+
+// Base64 with "+", "/", and "==" (the shape the long-token rule splits at "/") and 68 mixed-case characters with a
+// digit in every 6-character window, so no fragment can coincide with a fixture id or a date.
+const VENDOR_CODE_CANARIES = {
+  base64: "CANQY+Qz8Wx7Vy6Ut5Sr4/Pq3On2Ml1Kj0Ih==",
+  mixedCase: `CANaRy${"Qz8Wx7Vy6Ut5Sr4Pq3On2Ml1Kj0Ih9Gf8Ed7Cb6Az5Yx4Wv3Ut2Sr1Qp0On9Ml8Kj7Ih6Gf5Ed4"}`.slice(0, 68),
+};
+
+function assertNoCanaryFragment(text, canary, label, minLength = 6) {
+  for (let start = 0; start + minLength <= canary.length; start += 1) {
+    const fragment = canary.slice(start, start + minLength);
+    assert.ok(!text.includes(fragment), `${label}: canary fragment ${JSON.stringify(fragment)} leaked`);
+  }
+}
+
+const VENDOR_CODE_ROWS = [
+  {
+    name: "/msp/ ERROR number carrying a base64 token",
+    endpoint: "/msp/user_list.php",
+    canary: VENDOR_CODE_CANARIES.base64,
+    body: () => `<?xml version="1.0" encoding="UTF-8"?><USER_LIST_OUTPUT><ERROR number="${VENDOR_CODE_CANARIES.base64}">Denied</ERROR></USER_LIST_OUTPUT>`,
+    respond: (body) => xmlResponse(body, { status: 403 }),
+    call: (client) => client.listUsers(),
+    expected: "Qualys request failed (403) for /msp/user_list.php: error UnknownError: Denied",
+    assessTool: "qualys_assess_administration",
+  },
+  {
+    name: "SIMPLE_RETURN CODE carrying a 68-character mixed-case token",
+    endpoint: "/api/2.0/fo/asset/host/",
+    canary: VENDOR_CODE_CANARIES.mixedCase,
+    body: () => `<?xml version="1.0" encoding="UTF-8"?><SIMPLE_RETURN><RESPONSE><DATETIME>${daysAgo(0)}</DATETIME><CODE>${VENDOR_CODE_CANARIES.mixedCase}</CODE><TEXT>Denied</TEXT></RESPONSE></SIMPLE_RETURN>`,
+    respond: (body) => xmlResponse(body, { status: 403 }),
+    call: (client) => client.listHosts(100),
+    expected: "Qualys request failed (403) for /api/2.0/fo/asset/host/: code UnknownError: Denied",
+    assessTool: "qualys_assess_scan_coverage",
+  },
+  {
+    name: "GENERIC_RETURN RETURN number carrying a base64 token",
+    endpoint: "/api/2.0/fo/asset/host/",
+    canary: VENDOR_CODE_CANARIES.base64,
+    body: () => `<?xml version="1.0" encoding="UTF-8"?><GENERIC_RETURN><RETURN status="FAILED" number="${VENDOR_CODE_CANARIES.base64}">Denied</RETURN></GENERIC_RETURN>`,
+    respond: (body) => xmlResponse(body, { status: 403 }),
+    call: (client) => client.listHosts(100),
+    expected: "Qualys request failed (403) for /api/2.0/fo/asset/host/: error UnknownError: Denied",
+    assessTool: "qualys_assess_scan_coverage",
+  },
+  {
+    name: "QPS responseCode carrying a 68-character mixed-case token",
+    endpoint: "/qps/rest/2.0/search/am/user/",
+    canary: VENDOR_CODE_CANARIES.mixedCase,
+    body: () => JSON.stringify({ ServiceResponse: { responseCode: VENDOR_CODE_CANARIES.mixedCase, responseErrorDetails: { errorMessage: "Denied" } } }),
+    respond: (body) => new Response(body, { status: 403, headers: { "content-type": "application/json" } }),
+    call: (client) => client.searchUsers(),
+    expected: "Qualys QPS request failed (403) for /qps/rest/2.0/search/am/user/: responseCode UnknownError: Denied",
+    assessTool: "qualys_assess_administration",
+  },
+  {
+    name: "QPS responseCode carrying a base64 token",
+    endpoint: "/qps/rest/2.0/search/am/tag",
+    canary: VENDOR_CODE_CANARIES.base64,
+    body: () => JSON.stringify({ ServiceResponse: { responseCode: VENDOR_CODE_CANARIES.base64, responseErrorDetails: { errorMessage: "Denied" } } }),
+    respond: (body) => new Response(body, { status: 403, headers: { "content-type": "application/json" } }),
+    call: (client) => client.searchTags(100),
+    expected: "Qualys QPS request failed (403) for /qps/rest/2.0/search/am/tag: responseCode UnknownError: Denied",
+    assessTool: "qualys_assess_asset_inventory",
+  },
+];
+
+test("vendor error codes: a token in CODE, ERROR number, RETURN number, or responseCode renders as UnknownError and no fragment reaches the client, the tools, or the bundle, while documented codes still render", async () => {
+  assert.equal(VENDOR_CODE_CANARIES.mixedCase.length, 68);
+  assert.match(VENDOR_CODE_CANARIES.base64, /[+/]/);
+  const outputRoot = createTempBase("qualys-vendor-code-");
+  const tools = registeredQualysTools();
+  const toolArgs = { config_file: join(outputRoot, "missing.qcrc"), username: "acme_api", password: "s3cret-value", platform: "US1" };
+
+  for (const row of VENDOR_CODE_ROWS) {
+    const body = row.body();
+    assert.ok(body.includes(row.canary), `${row.name}: positive control, the raw envelope carries the canary`);
+    const router = async (url, init) => (new URL(url).pathname === row.endpoint ? row.respond(body) : compliantRouter(url, init));
+    const client = routedClient(router);
+
+    const thrown = await row.call(client).then(() => null, (error) => error);
+    assert.ok(thrown instanceof QualysApiError, row.name);
+    assert.equal(thrown.status, 403, row.name);
+    assert.equal(thrown.endpoint, row.endpoint, row.name);
+    assert.equal(thrown.message, row.expected, row.name);
+    assertNoCanaryFragment(thrown.message, row.canary, `${row.name} thrown message`);
+
+    const results = await runAllAssessments(client);
+    const access = await checkQualysAccess(client);
+    const serialisedResults = JSON.stringify(results);
+    assertNoCanaryFragment(serialisedResults, row.canary, `${row.name} findings, summaries, evidence, sources, and errors arrays`);
+    assertNoCanaryFragment(JSON.stringify(access), row.canary, `${row.name} access check`);
+    assert.ok(results.flatMap((result) => result.errors).some((entry) => entry.endsWith(row.expected)), `${row.name}: an errors array carries the UnknownError disclosure`);
+    assert.ok(allFindings(results).some((item) => item.summary.includes("UnknownError")), `${row.name}: a finding summary names the UnknownError code`);
+    assert.ok(JSON.stringify(access).includes("UnknownError"), `${row.name}: the access check names the UnknownError code`);
+
+    const exported = await exportQualysAuditBundle(client, client.getResolvedConfig(), outputRoot);
+    for (const file of walkFiles(exported.outputDir)) assertNoCanaryFragment(file.content, row.canary, `${row.name} bundle file ${file.name}`);
+    for (const member of readZipMembers(exported.zipPath)) assertNoCanaryFragment(member.content, row.canary, `${row.name} zip member ${member.name}`);
+    assert.ok(readFileSync(join(exported.outputDir, "_errors.log"), "utf8").includes(row.expected), `${row.name}: _errors.log carries the disclosure`);
+    rmSync(exported.outputDir, { recursive: true, force: true });
+    rmSync(exported.zipPath, { force: true });
+
+    // The registered tools build their own client on the global fetch, so the same router is installed there.
+    const realFetch = globalThis.fetch;
+    globalThis.fetch = async (url, init) => router(String(url), init ?? {});
+    try {
+      const toolOutput = join(outputRoot, "tool-export");
+      for (const [name, args] of [
+        ["qualys_check_access", toolArgs],
+        [row.assessTool, toolArgs],
+        ["qualys_export_audit_bundle", { ...toolArgs, output_dir: toolOutput }],
+      ]) {
+        const result = await tools.get(name).execute("call", args);
+        assert.notEqual(result.isError, true, `${name}: ${row.name} is a disclosed collection failure, not a tool failure`);
+        const serialised = JSON.stringify(result);
+        assertNoCanaryFragment(serialised, row.canary, `${row.name} ${name} result`);
+        if (name !== "qualys_export_audit_bundle") assert.ok(serialised.includes("UnknownError"), `${row.name}: ${name} names the UnknownError code`);
+      }
+      const toolFiles = walkFiles(toolOutput);
+      for (const file of toolFiles) assertNoCanaryFragment(file.content, row.canary, `${row.name} tool bundle file ${file.name}`);
+      assert.ok(toolFiles.some((file) => file.name.endsWith("_errors.log") && file.content.includes(row.expected)), `${row.name}: the tool bundle's _errors.log carries the disclosure`);
+      rmSync(toolOutput, { recursive: true, force: true });
+    } finally {
+      globalThis.fetch = realFetch;
+    }
+  }
+
+  // Documented numeric codes and QPS constants still render verbatim.
+  const numeric = routedClient(async (url, init) => {
+    const pathname = new URL(url).pathname;
+    if (pathname === "/msp/user_list.php") return xmlResponse('<USER_LIST_OUTPUT><ERROR number="999">Denied</ERROR></USER_LIST_OUTPUT>', { status: 403 });
+    if (pathname === "/api/2.0/fo/asset/host/") return xmlResponse("<SIMPLE_RETURN><RESPONSE><CODE>1905</CODE><TEXT>Denied</TEXT></RESPONSE></SIMPLE_RETURN>", { status: 403 });
+    if (pathname === "/api/2.0/fo/scan/") return xmlResponse('<GENERIC_RETURN><RETURN status="FAILED" number="2010">Denied</RETURN></GENERIC_RETURN>', { status: 403 });
+    if (pathname === "/qps/rest/2.0/search/am/user/") return jsonResponse({ ServiceResponse: { responseCode: "UNAUTHORIZED", responseErrorDetails: { errorMessage: "Denied" } } }, { status: 403 });
+    return compliantRouter(url, init);
+  });
+  await assert.rejects(() => numeric.listUsers(), { message: "Qualys request failed (403) for /msp/user_list.php: error 999: Denied" });
+  await assert.rejects(() => numeric.listHosts(100), { message: "Qualys request failed (403) for /api/2.0/fo/asset/host/: code 1905: Denied" });
+  await assert.rejects(() => numeric.listScans(), { message: "Qualys request failed (403) for /api/2.0/fo/scan/: error 2010: Denied" });
+  await assert.rejects(() => numeric.searchUsers(), { message: "Qualys QPS request failed (403) for /qps/rest/2.0/search/am/user/: responseCode UNAUTHORIZED: Denied" });
+});
+
+// ---------------------------------------------------------------------------------------------
 // False-pass self-check fixtures (a) forbidden, (b) empty, (c) partial, (d) compliant
 // ---------------------------------------------------------------------------------------------
 
