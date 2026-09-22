@@ -122,8 +122,28 @@ const CREDENTIAL_DATA_KEY_QUALIFIERS = new Set([
   "auth", "sdk", "mobile", "relay", "service", "license", "ssh", "hmac", "enrollment",
 ]);
 
+// An id that is itself the credential (rule 9): possession of a Vault AppRole `secret_id` (a UUID, which the identifier
+// rule would otherwise keep) or of a session id (`session_id`, `sid`, `JSESSIONID`, `PHPSESSID`, `ASP.NET_SessionId`)
+// is what authenticates. These keys are credential keys on both sides whatever the value's shape, checked before the
+// setting-suffix and identifier rules; any prefix, casing, and separator (`VAULT_SECRET_ID`, `role_secret_id`,
+// `roleSecretId`). Every other `*_id` names a thing and stays an identifier: `client_id`, `enterprise_id`, `key_id`,
+// `api_key_id`, `tenant_id`, `token_id`, `access_key_id` (an AWS access key id is removed by its `AKIA` shape), and
+// `secret_name` likewise (CodeRabbit on #78, r4077259415).
+const BEARER_ID_LAST_SEGMENTS = new Set(["sid", "sessid", "sessionid", "jsessionid", "phpsessid", "aspnetsessionid"]);
+const BEARER_ID_QUALIFIERS = new Set(["secret", "session"]);
+
+/** True for a key whose id value is itself a bearer credential: `secret_id` and the session-id keys, in any spelling. */
+export function isBearerIdKey(key: string): boolean {
+  const segments = keySegments(key);
+  const last = segments[segments.length - 1];
+  if (last === undefined) return false;
+  if (BEARER_ID_LAST_SEGMENTS.has(last)) return true;
+  return last === "id" && segments.length >= 2 && BEARER_ID_QUALIFIERS.has(segments[segments.length - 2]);
+}
+
 /** True for a record key whose whole value is a credential under the conservative rule above. */
 export function isCredentialDataKey(key: string): boolean {
+  if (isBearerIdKey(key)) return true;
   const segments = keySegments(key);
   const last = segments[segments.length - 1];
   if (!last) return false;
@@ -465,13 +485,13 @@ export function isSettingKey(key: string): boolean {
 }
 
 /**
- * True when a name in a query string or name/value pair carries a credential: a webhook or callback URL key first
- * (whatever its suffix); then a setting key is never a credential key; then the Flue argument-key heuristic (`token`,
- * `secret`, `password`, `api_key`, `authorization`, `cookie`, ... anywhere in the name) plus the bare and signed-URL
- * names it does not cover.
+ * True when a name in a query string or name/value pair carries a credential: a webhook or callback URL key and a
+ * bearer id (`secret_id`, `session_id`) first, whatever their suffix; then a setting key is never a credential key;
+ * then the Flue argument-key heuristic (`token`, `secret`, `password`, `api_key`, `authorization`, `cookie`, ...
+ * anywhere in the name) plus the bare and signed-URL names it does not cover.
  */
 export function isCredentialKey(key: string): boolean {
-  if (isWebhookKey(key)) return true;
+  if (isWebhookKey(key) || isBearerIdKey(key)) return true;
   if (isSettingKey(key)) return false;
   if (isSensitiveArgumentKey(key)) return true;
   const normalized = key.toLowerCase();

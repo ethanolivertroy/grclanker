@@ -6,8 +6,10 @@ import {
   MIN_CONFIGURED_SECRET_LENGTH,
   REDACTED,
   createCredentialScrubber,
+  isBearerIdKey,
   isCredentialDataKey,
   isCredentialKey,
+  isIdentifierKey,
   isSettingKey,
   isWebhookKey,
   looksLikeToken,
@@ -644,6 +646,107 @@ test("row (a), webhooks: a webhook or callback URL key stays a credential key wh
   assert.equal(scrubber.scrub("see https://api.example.com/v1/x?webhook_url=https://hooks.example.com/services/a/b/c for details"), `see https://api.example.com/v1/x?${REDACTED} for details`);
   for (const text of ['"webhook": "canary-insecure-hook-zq"', "webhook_name: nightly-sync", "webhooks: 3 configured, 1 insecure"]) {
     assert.equal(scrubber.scrub(text), text, `a webhook name is not a URL and stays: ${text}`);
+  }
+});
+
+// The bearer-id override (CodeRabbit on #78, r4077259415): a key ending in `secret_id`, in any prefix, casing, and
+// separator, names a Vault AppRole secret id, which is a UUID the identifier rule would otherwise keep; it and the
+// session-id keys are credential keys on both sides before the setting-suffix test. Every other `_id`, `_name`, and
+// `_key_id` key the five modules read names a thing and keeps its value.
+const BEARER_ID_KEYS = ["secret_id", "VAULT_SECRET_ID", "role_secret_id", "secretId", "roleSecretId", "vault.secret_id", "session_id", "sessionId", "sid", "sessid", "JSESSIONID", "PHPSESSID", "ASP.NET_SessionId"];
+
+/** The `_id`, `_name`, and `_key_id` keys the five modules read, config and vendor records included: all identifiers or settings. */
+const IDENTIFIER_KEYS = [
+  "client_id", "BOX_CLIENT_ID", "clientId", "enterprise_id", "BOX_ENTERPRISE_ID", "enterpriseId", "subject_id", "BOX_SUBJECT_ID", "publicKeyId", "public_key_id", "BOX_PUBLIC_KEY_ID",
+  "key_id", "api_key_id", "access_key_id", "private_key_id", "secret_key_id", "tenant_id", "token_id", "tokenId", "account_id", "org_id", "member_id", "_id", "id",
+  "campaign_id", "group_id", "pst_id", "store_purchase_id", "user_id", "policy_id", "rule_id", "space_id", "event_id", "request_id",
+];
+const NAME_KEYS = ["secret_name", "tokenName", "token_name", "key_name", "role_name", "user_name", "policy_name", "space_name"];
+
+const BEARER_ID_UUID = "6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b";
+const BEARER_ID_CANARY = "Hq4vT9mXcR2pLw8ZbN6kJd3sVf7yGa5e";
+
+test("row (a), bearer ids: a key ending in secret_id or naming a session id is a credential key on both sides whatever its prefix, casing, and separator, before the setting-suffix test; every other _id, _name, and _key_id key stays an identifier or a setting", () => {
+  for (const key of BEARER_ID_KEYS) {
+    assert.ok(isBearerIdKey(key), `expected a bearer id: ${key}`);
+    assert.ok(isCredentialKey(key) && isCredentialDataKey(key) && !isIdentifierKey(key), `expected a credential key on both sides: ${key}`);
+  }
+  assert.ok(isSettingKey("secret_id") && isSettingKey("VAULT_SECRET_ID"), "the id suffix still names a setting; the bearer-id override is checked first");
+  for (const key of [...IDENTIFIER_KEYS, ...NAME_KEYS]) {
+    assert.ok(!isBearerIdKey(key) && !isCredentialKey(key) && !isCredentialDataKey(key), `expected an identifier or setting, not a credential key: ${key}`);
+  }
+  for (const key of IDENTIFIER_KEYS) assert.ok(isIdentifierKey(key), `expected an identifier key: ${key}`);
+  for (const key of NAME_KEYS) assert.ok(isSettingKey(key), `expected a setting key: ${key}`);
+});
+
+test("row (a), bearer ids: secret_id, VAULT_SECRET_ID, and role_secret_id lose a UUID, a random, and a human-chosen value in every pair form through every entry point, while client_id and the other identifiers keep a UUID", () => {
+  const values = [BEARER_ID_UUID, BEARER_ID_CANARY, "hunter2"];
+  const controls = ["client_id", "BOX_CLIENT_ID", "tenant_id", "enterprise_id", "key_id", "token_id", "account_id", "user_id"];
+  let cells = 0;
+  for (const [entryLabel, entry] of ENTRY_POINTS) {
+    for (const [formLabel, form] of PAIR_FORMS) {
+      for (const key of BEARER_ID_KEYS) {
+        for (const value of values) {
+          assertPairValueGone(entry(form(key, value)), key, value, `${entryLabel}, ${formLabel}, ${key}=${value}`);
+          cells += 1;
+        }
+      }
+      for (const key of controls) {
+        const text = form(key, BEARER_ID_UUID);
+        assert.ok(entry(text).includes(BEARER_ID_UUID), `${entryLabel}, ${formLabel}: the identifier ${key} lost its UUID: ${entry(text)}`);
+      }
+      for (const key of NAME_KEYS) {
+        const text = form(key, "deploy-key-2026");
+        assert.ok(entry(text).includes("deploy-key-2026"), `${entryLabel}, ${formLabel}: the setting ${key} lost its name: ${entry(text)}`);
+      }
+    }
+  }
+  assert.equal(cells, ENTRY_POINTS.length * PAIR_FORMS.length * BEARER_ID_KEYS.length * values.length);
+  // The control and the bearer id side by side: only the secret id goes.
+  const scrubber = createCredentialScrubber();
+  assert.equal(scrubber.scrub(`client_id=${BEARER_ID_UUID}&secret_id=${BEARER_ID_UUID}`), `client_id=${BEARER_ID_UUID}&secret_id=${REDACTED}`);
+  assert.equal(scrubber.scrub(`role_id: ${BEARER_ID_UUID}, VAULT_SECRET_ID: ${BEARER_ID_UUID}`), `role_id: ${BEARER_ID_UUID}, VAULT_SECRET_ID: ${REDACTED}`);
+  assert.equal(scrubber.scrub(`{"role_id": "${BEARER_ID_UUID}", "role_secret_id": "${BEARER_ID_UUID}"}`), `{"role_id": "${BEARER_ID_UUID}", "role_secret_id": "${REDACTED}"}`);
+});
+
+test("row (a), bearer ids: the shared record walker and every module walker replace a secret_id or session id value whatever its shape and keep the identifier keys beside it", () => {
+  const record = {
+    secret_id: BEARER_ID_UUID,
+    VAULT_SECRET_ID: BEARER_ID_CANARY,
+    role_secret_id: "hunter2",
+    session_id: BEARER_ID_UUID,
+    sid: 48213,
+    JSESSIONID: BEARER_ID_CANARY,
+    client_id: BEARER_ID_UUID,
+    tenant_id: BEARER_ID_UUID,
+    enterprise_id: "12345678",
+    key_id: "kid-2026",
+    secret_name: "deploy-key-2026",
+    nested: { auth: { secret_id: BEARER_ID_UUID, role_id: BEARER_ID_UUID } },
+    list: [{ secret_id: BEARER_ID_CANARY, user_id: BEARER_ID_UUID }],
+  };
+  const walkers = [
+    ["shared scrubData", (value) => createCredentialScrubber().scrubData(value)],
+    ["box redactCredentialValues", redactBoxValues],
+    ["launchdarkly redactCredentialValues", redactLaunchdarklyValues],
+    ["knowbe4 redactCredentialValues", redactKnowbe4Values],
+    ["datadog redactCredentialValues", redactDatadogValues],
+    ["elastic redactSensitiveValues", redactElasticValues],
+  ];
+  for (const [label, walker] of walkers) {
+    const out = walker(record);
+    for (const key of ["secret_id", "VAULT_SECRET_ID", "role_secret_id", "session_id", "sid", "JSESSIONID"]) assert.equal(out[key], REDACTED, `${label}: ${key}`);
+    assert.equal(out.nested.auth.secret_id, REDACTED, `${label}: nested secret_id`);
+    assert.equal(out.list[0].secret_id, REDACTED, `${label}: secret_id in a list`);
+    assert.equal(out.client_id, BEARER_ID_UUID, `${label}: client_id keeps its UUID`);
+    assert.equal(out.tenant_id, BEARER_ID_UUID, `${label}: tenant_id keeps its UUID`);
+    assert.equal(out.enterprise_id, "12345678", `${label}: enterprise_id`);
+    assert.equal(out.key_id, "kid-2026", `${label}: key_id`);
+    assert.equal(out.secret_name, "deploy-key-2026", `${label}: secret_name`);
+    assert.equal(out.nested.auth.role_id, BEARER_ID_UUID, `${label}: role_id beside the secret id`);
+    assert.equal(out.list[0].user_id, BEARER_ID_UUID, `${label}: user_id in a list`);
+    assertCanaryWindowsAbsent(assert, JSON.stringify(out), [BEARER_ID_CANARY], `${label} output`);
+    assert.deepEqual(walker(out), out, `${label}: the walker is idempotent`);
   }
 });
 

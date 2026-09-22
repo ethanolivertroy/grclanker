@@ -20,7 +20,7 @@ import { basename, dirname, join, relative, resolve } from "node:path";
 import { ZipArchive } from "archiver";
 import { Type } from "@sinclair/typebox";
 import { parse as parseYaml, YAMLError } from "yaml";
-import { createCredentialScrubber } from "./credential-scrub.js";
+import { createCredentialScrubber, isBearerIdKey } from "./credential-scrub.js";
 import { errorResult, formatTable, textResult } from "./shared.js";
 
 type FetchImpl = typeof fetch;
@@ -984,7 +984,13 @@ function keySegments(name: string): string[] {
     .filter((segment) => segment.length > 0);
 }
 
+/**
+ * True for token/secret/password style keys, for `key`/`keys` qualified by api, private, client, and so on, and for a
+ * bearer id (`secret_id`, `session_id`, `sid`) whose value authenticates by itself; every other `*_id` (`client_id`,
+ * `enterprise_id`, `key_id`, `user_id`) names a thing and keeps its value.
+ */
 export function isCredentialKey(name: string): boolean {
+  if (isBearerIdKey(name)) return true;
   const segments = keySegments(name);
   const last = segments[segments.length - 1];
   if (!last) return false;

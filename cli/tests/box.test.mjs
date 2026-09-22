@@ -28,6 +28,7 @@ import {
   listBoxControls,
   mappingsForControl,
   parseDurationHours,
+  projectEnterpriseEvent,
   redactCredentialValues,
   redactSecrets,
   resolveBoxConfiguration,
@@ -2416,6 +2417,33 @@ test("verdict rule 9 (data-side carriers): Box blanks the whole subtree under to
   assert.match(written.job_title, /^Ops lead; profile at https:\/\/intranet\.example\.com\/people\/42\?\[REDACTED\] mid sentence$/, `a URL query mid string is replaced: ${written.job_title}`);
   assert.match(written.address, /^(Bearer )?\[REDACTED\] was pasted here$/, `a bearer carrier in free text loses its value: ${written.address}`);
   assert.equal(written.login, fixture.users[1].login, "identifiers and logins are untouched");
+});
+
+test("bearer ids: an enterprise event's session_id survives the projection and the record walker writes the marker in its place before the file is written, while event_id, the actor id, and the address stay", () => {
+  const sessionId = "Hq4vT9mXcR2pLw8ZbN6kJd3sVf7yGa5e";
+  const event = {
+    event_id: "e-1",
+    event_type: "LOGIN",
+    created_at: "2026-09-10T00:00:00Z",
+    created_by: { id: "member-1", type: "user", name: "Ada", login: "ada@example.com" },
+    source: { id: "file-1", type: "file" },
+    session_id: sessionId,
+    ip_address: "203.0.113.7",
+    additional_details: { note: `Cookie: sid=${sessionId}` },
+  };
+  const projected = projectEnterpriseEvent(event);
+  assert.equal(projected.session_id, sessionId, "the projection keeps the field; the walker decides its value");
+  assert.equal(projected.additional_details, undefined, "the free-form bucket is dropped");
+  const written = redactCredentialValues([projected])[0];
+  assert.equal(written.session_id, "[REDACTED]", "a session id is a bearer id whatever its shape");
+  assert.equal(written.event_id, "e-1");
+  assert.equal(written.created_by.id, "member-1");
+  assert.equal(written.created_by.login, "ada@example.com");
+  assert.equal(written.ip_address, "203.0.113.7");
+  assertCanaryWindowsAbsent(assert, JSON.stringify(written), [sessionId], "projected and redacted event");
+  const uuid = "6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b";
+  const config = redactCredentialValues({ client_id: uuid, enterprise_id: "123456", subject_id: uuid, public_key_id: "kid-2026", secret_id: uuid, VAULT_SECRET_ID: uuid });
+  assert.deepEqual(config, { client_id: uuid, enterprise_id: "123456", subject_id: uuid, public_key_id: "kid-2026", secret_id: "[REDACTED]", VAULT_SECRET_ID: "[REDACTED]" }, "client_id, enterprise_id, subject_id, and public_key_id are identifiers; secret_id is a credential");
 });
 
 test("cookie attribute class: a later cookie whose name holds a dot or another token character goes with the header value through the Box error text, secret, and record scrubbers", () => {

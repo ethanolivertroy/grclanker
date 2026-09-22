@@ -18,7 +18,7 @@ import { homedir } from "node:os";
 import { basename, dirname, join, relative, resolve } from "node:path";
 import { ZipArchive } from "archiver";
 import { Type } from "@sinclair/typebox";
-import { createCredentialScrubber } from "./credential-scrub.js";
+import { createCredentialScrubber, isBearerIdKey } from "./credential-scrub.js";
 import { errorResult, formatTable, textResult } from "./shared.js";
 
 type FetchImpl = typeof fetch;
@@ -617,11 +617,13 @@ function keySegments(name: string): string[] {
 }
 
 /**
- * True for token/secret/password style keys, for `key`/`keys` qualified by api, private, client, and so on, and for
+ * True for token/secret/password style keys, for `key`/`keys` qualified by api, private, client, and so on, for
  * the `<qualifier>_key_id` identifiers (access_key_id, private_key_id) that name a credential even when they are not
- * the secret half of it.
+ * the secret half of it, and for a bearer id (`secret_id`, `session_id`, `sid`) whose value authenticates by itself;
+ * every other `_id` (`org_id`, `account_id`, `key_id` unqualified) names a thing and keeps its value.
  */
 export function isCredentialKey(name: string): boolean {
+  if (isBearerIdKey(name)) return true;
   const segments = keySegments(name);
   const last = segments[segments.length - 1];
   if (!last) return false;
