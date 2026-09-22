@@ -971,6 +971,7 @@ test("credential-bearing tool arguments are redacted before serialization, at an
     "max_concurrent_sessions", // count threshold
     "max_credential_age_days", // duration threshold
     "max_enrollment_keys_per_policy", // count threshold
+    "max_key_age_days", // duration threshold (New Relic user API key age)
     "max_keys", // count threshold
     "max_password_age_days", // duration threshold
     "max_session_hours", // duration threshold
