@@ -283,7 +283,7 @@ test("resolveVeracodeConfiguration prefers arguments, then environment, then the
   assert.deepEqual(Object.keys(parseIniProfiles("[a]\nk = v\n; comment\n[b]\nx=y")), ["a", "b"]);
 });
 
-/** Canaries planted on malformed credentials lines; every 8-character window of each is distinct so a partial quote is caught too. */
+/** Canaries planted on malformed credentials lines: random alphanumerics, so no 6-character window of one occurs in a legitimate fixture value or in another canary. */
 const CONFIG_CANARIES = {
   bareLine: "Bp6TzX3kW9nQ2sRc",
   unterminatedSection: "Lf9BwD4sN7hVe3Ky",
@@ -294,16 +294,41 @@ const LIBRARY_ERROR_WORDING = [
   "not a directory", "Unexpected token",
 ];
 
-function fragmentsOf(value, size = 8) {
-  const fragments = [];
-  for (let index = 0; index + size <= value.length; index += 1) fragments.push(value.slice(index, index + size));
-  return fragments;
+/** Every substring of a planted credential at lengths 6 through 24 (sliding windows), so a partial echo such as a truncated token or a quoted line fragment cannot pass a leak assertion. */
+function windowsOf(value, { min = 6, max = 24 } = {}) {
+  const windows = new Set();
+  for (let size = Math.min(min, value.length); size <= Math.min(max, value.length); size += 1) {
+    for (let index = 0; index + size <= value.length; index += 1) windows.add(value.slice(index, index + size));
+  }
+  return [...windows];
+}
+
+/** The window set of every planted secret, for bundle, zip, and payload scans through assertSecretsAbsent. */
+function leakWindows(secrets) {
+  return [...new Set(secrets.flatMap((secret) => windowsOf(secret)))];
+}
+
+function assertNoWindowOf(text, secret, label) {
+  for (const window of windowsOf(secret)) assert.ok(!text.includes(window), `${label} carries a window (${window}) of the planted credential: ${text.slice(0, 300)}`);
+}
+
+/**
+ * Fixture self-check: the legitimate values of a fixture (everything it serves
+ * with the planted canaries themselves removed, longest first) contain no
+ * 6-character window of any canary, so a window hit in an output can only be a leak.
+ */
+function assertFixtureFreeOfCanaryWindows(legitimateText, canaries, label) {
+  let legitimate = legitimateText;
+  for (const canary of [...canaries].sort((a, b) => b.length - a.length)) legitimate = legitimate.split(canary).join("");
+  for (const canary of canaries) {
+    for (const window of windowsOf(canary, { min: 6, max: 6 })) {
+      assert.ok(!legitimate.includes(window), `${label}: legitimate fixture text contains the window ${window} of canary ${canary}`);
+    }
+  }
 }
 
 function assertConfigErrorText(text, { path, code, canaries }, label) {
-  for (const canary of canaries) {
-    for (const fragment of fragmentsOf(canary)) assert.ok(!text.includes(fragment), `${label} carries a fragment (${fragment}) of ${canary}: ${text}`);
-  }
+  for (const canary of canaries) assertNoWindowOf(text, canary, `${label} (${canary})`);
   for (const wording of LIBRARY_ERROR_WORDING) assert.ok(!text.includes(wording), `${label} repeats library wording "${wording}": ${text}`);
   assert.ok(text.includes(path), `${label} names the path ${path}: ${text}`);
   if (code) assert.ok(text.includes(`(${code})`), `${label} carries the code ${code}: ${text}`);
@@ -349,6 +374,7 @@ test("rule 9: Veracode credentials file errors carry only the path and code, nev
     "veracode_api_key_secret = aabb",
     "",
   ].join("\n"));
+  assertFixtureFreeOfCanaryWindows(`${readFileSync(malformed, "utf8")} ${dir} ${API_ID} ${API_SECRET}`, allCanaries, "credentials file canaries");
   const profiles = parseIniProfiles(readFileSync(malformed, "utf8"));
   assert.equal(profiles.default.veracode_api_key_id, undefined, "a line without = is skipped, not stored under a guessed key");
   const skipped = thrownBy(() => resolveVeracodeConfiguration({ credentials_file: malformed }, {}, { homeDir: dir }));
@@ -435,7 +461,7 @@ test("VeracodeApiClient signs requests, paginates HAL pages to completion, retri
 
   await assert.rejects(() => client.getSelf(), (error) => {
     assert.equal(error.statusCode, 500);
-    assert.ok(!error.message.includes(API_SECRET));
+    assertNoWindowOf(error.message, API_SECRET, "error message with the configured secret echoed by the server");
     assert.match(error.message, /\[REDACTED\]/);
     return true;
   });
@@ -848,20 +874,22 @@ test("false-pass self-check (c): partial inventories downgrade every would-be pa
   assert.match(truncatedFindings.findings[0].summary, /truncated/);
 });
 
+/** Planted credentials: random alphanumerics, so no 6-character window of one occurs in a legitimate fixture value (checked by assertFixtureFreeOfCanaryWindows) or in another canary. */
 const FAKE_SECRETS = {
-  customFieldToken: "FAKE_CUSTOM_FIELD_TOKEN_1",
-  customFieldJwtPayload: "FAKE_JWT_PAYLOAD_1",
-  repoUserinfoToken: "FAKE_REPO_TOKEN_1",
-  repoQueryToken: "FAKE_REPO_QUERY_TOKEN_1",
-  dastPassword: "FAKE_DAST_PASSWORD_1",
-  loginScript: "FAKE_LOGIN_SCRIPT_BODY_1",
-  clientCertificate: "FAKE_CLIENT_CERTIFICATE_1",
-  certificatePassword: "FAKE_CERT_PASSWORD_1",
-  crawlScript: "FAKE_CRAWL_SCRIPT_BODY_1",
-  configurationSession: "FAKE_SESSION_TOKEN_1",
-  scanListSession: "FAKE_SESSION_TOKEN_2",
-  scanRequestPassword: "FAKE_SCAN_REQUEST_PASSWORD_1",
-  apiSecret: "FAKE_API_SECRET_1",
+  customFieldToken: "AX9Ajv33cV74xYBtFWjbQQvyLw4T2LkSH9BdWsRy",
+  customFieldJwtPayload: "jAMmVWnurbAAt6j2tA77Qxa6LTypgdBfpUU3Tjch",
+  customFieldJwtSignature: "jhKD4cugwG2VHZUthDqqALxdCjfzDjnvHVYYtgG6",
+  repoUserinfoToken: "pGWNtV2BmepjRQH4fBgLvxbPFHdxV6qWJmcdyZqY",
+  repoQueryToken: "7xrxUx6g5sUrQB26s5JySTb5pXQ2QSfcNDfZzhSM",
+  dastPassword: "NFjheYRmvsxWLttZk7",
+  loginScript: "v35pgSekRNVczKeNnCvr4wXavCYn8SumAeXCFcZq",
+  clientCertificate: "GUrj3eYAu6JKD7repGDgDmdRAUgjrFETN6LTBLdn",
+  certificatePassword: "njAV3RP8LRBFpXTaGr",
+  crawlScript: "BDdEwZnFman9uajLZDymGhyCfhqFC9AMjz3a5KSY",
+  configurationSession: "dY2uQe2vf3NaQ5QavNjeksHChdm7GNdrqFAhYJH7",
+  scanListSession: "U3SWh2gaRXQEmg2KpWxWEHb2gezPMAa3KPwNf2sf",
+  scanRequestPassword: "F9UDKhAWZvwMQdLNHh",
+  apiSecret: "Gy4Sr2nthWewBaLdX3CNSKuSQ2dajbJh5ht77mWw",
 };
 
 /** Every collected object that can carry a credential per the vendor API carries a distinctive fake one. */
@@ -869,7 +897,7 @@ function secretFixture() {
   const fixture = healthyFixture();
   fixture.applications[0].profile.custom_fields = [
     { name: "Deploy API Token", value: FAKE_SECRETS.customFieldToken },
-    { name: "ci_session", value: `eyJhbGciOiJIUzI1NiJ9.${FAKE_SECRETS.customFieldJwtPayload}.FAKE_JWT_SIGNATURE_1` },
+    { name: "ci_session", value: `eyJhbGciOiJIUzI1NiJ9.${FAKE_SECRETS.customFieldJwtPayload}.${FAKE_SECRETS.customFieldJwtSignature}` },
   ];
   fixture.applications[0].profile.git_repo_url = `https://svc:${FAKE_SECRETS.repoUserinfoToken}@git.example.com/org/payments.git`;
   fixture.applications[1].profile.git_repo_url = `https://git.example.com/org/portal.git?access_token=${FAKE_SECRETS.repoQueryToken}`;
@@ -897,16 +925,19 @@ function secretFixture() {
 
 test("rule 9: the exported bundle, the zip, the assess payloads, and the access check never carry custom field tokens, repository tokens, DAST credentials, login scripts, or API secrets", async () => {
   const base = createTempBase("grclanker-veracode-secrets-");
-  const client = mockClient(secretFixture(), { async listSandboxes() { throw forbidden("/appsec/v1/applications/app-1/sandboxes"); } });
-  const secrets = [...Object.values(FAKE_SECRETS), API_SECRET];
+  const fixture = secretFixture();
+  const client = mockClient(fixture, { async listSandboxes() { throw forbidden("/appsec/v1/applications/app-1/sandboxes"); } });
+  const secrets = [...Object.values(FAKE_SECRETS), API_SECRET, API_ID];
+  // Self-check: nothing the fixture legitimately serves (or the config, the output path, or the clock) shares a 6-character window with a planted credential.
+  assertFixtureFreeOfCanaryWindows(`${JSON.stringify(fixture)} ${JSON.stringify(sampleConfig())} ${base} ${NOW.toISOString()}`, secrets, "secret fixture");
 
   const result = await exportVeracodeAuditBundle(client, sampleConfig(), base, { now: NOW });
   const files = readBundleFiles(result.outputDir);
   for (const file of ["core_data/scan-coverage.json", "core_data/access-controls.json", "core_data/access.json", "analysis/findings.json", "analysis/summary.md", "_errors.log"]) {
     assert.ok(files.has(file), `${file} should exist`);
   }
-  assertSecretsAbsent(assert, files, secrets, "bundle files");
-  assertSecretsAbsent(assert, readZipEntries(result.zipPath), secrets, "zip entries");
+  assertSecretsAbsent(assert, files, leakWindows(secrets), "bundle files");
+  assertSecretsAbsent(assert, readZipEntries(result.zipPath), leakWindows(secrets), "zip entries");
 
   const access = await checkVeracodeAccess(client);
   const payloads = await Promise.all([
@@ -917,9 +948,7 @@ test("rule 9: the exported bundle, the zip, the assess payloads, and the access 
     assessVeracodeAccessControls(client, { now: NOW }),
   ]);
   const toolPayloads = JSON.stringify([access, ...payloads.map((item) => ({ title: item.title, summary: item.summary, findings: item.findings, errors: item.errors }))]);
-  for (const secret of secrets) {
-    assert.ok(!toolPayloads.includes(secret), `${secret} must not appear in the tool payloads`);
-  }
+  for (const secret of secrets) assertNoWindowOf(toolPayloads, secret, "tool payloads");
 
   const fileNamed = (name) => JSON.parse(files.get(name));
   const scanCoverage = fileNamed("core_data/scan-coverage.json");
@@ -953,20 +982,26 @@ test("rule 9: the exported bundle, the zip, the assess payloads, and the access 
   assert.equal(fileNamed("core_data/access.json").surfaces.find((item) => item.name === "api_credentials").count, 1);
 });
 
+/** Canaries planted in error bodies: random alphanumerics with no 6-character window in the vendor message or the HTML wrapper around them. */
+const ERROR_BODY_CANARIES = { bodyToken: "7zsXBTgCW2Xmxk8LwH", htmlToken: "PGUysLcBuHSWdW9AZY" };
+
 test("rule 9: VeracodeApiError keeps only the vendor message from a JSON error body and describes a non-JSON body by size", async () => {
+  const jsonBody = JSON.stringify({ message: "role Security Insights required", access_token: ERROR_BODY_CANARIES.bodyToken });
+  const htmlBody = `<html>${ERROR_BODY_CANARIES.htmlToken}</html>`;
+  assertFixtureFreeOfCanaryWindows(`${jsonBody} ${htmlBody} ${JSON.stringify(sampleConfig())}`, Object.values(ERROR_BODY_CANARIES), "error body canaries");
   const responses = {
-    "/appsec/v1/policies": new Response(JSON.stringify({ message: "role Security Insights required", access_token: "FAKE_BODY_TOKEN_1" }), { status: 403, statusText: "Forbidden", headers: { "content-type": "application/json" } }),
-    "/api/authn/v2/users/self": new Response("<html>FAKE_HTML_TOKEN_1</html>", { status: 400, statusText: "Bad Request", headers: { "content-type": "text/html" } }),
+    "/appsec/v1/policies": new Response(jsonBody, { status: 403, statusText: "Forbidden", headers: { "content-type": "application/json" } }),
+    "/api/authn/v2/users/self": new Response(htmlBody, { status: 400, statusText: "Bad Request", headers: { "content-type": "text/html" } }),
   };
   const client = new VeracodeApiClient(sampleConfig({ retries: 0 }), { fetchImpl: async (input) => responses[new URL(input).pathname] });
   await assert.rejects(() => client.listPolicies(), (error) => {
     assert.match(error.message, /403 Forbidden.*role Security Insights required/);
-    assert.ok(!error.message.includes("FAKE_BODY_TOKEN_1"), "only the message field of the error body is kept");
+    assertNoWindowOf(error.message, ERROR_BODY_CANARIES.bodyToken, "JSON error body (only the message field is kept)");
     return true;
   });
   await assert.rejects(() => client.getSelf(), (error) => {
-    assert.match(error.message, /non-JSON response body \(30 bytes, not recorded\)/);
-    assert.ok(!error.message.includes("FAKE_HTML_TOKEN_1"));
+    assert.match(error.message, new RegExp(`non-JSON response body \\(${Buffer.byteLength(htmlBody)} bytes, not recorded\\)`));
+    assertNoWindowOf(error.message, ERROR_BODY_CANARIES.htmlToken, "non-JSON error body");
     return true;
   });
 });
@@ -1394,7 +1429,7 @@ test("exportVeracodeAuditBundle writes the layout, logs errors, and never overwr
     assert.ok(existsSync(join(first.outputDir, file)), `${file} should exist`);
   }
   const bundleText = readFileSync(join(first.outputDir, "analysis", "findings.json"), "utf8") + readFileSync(join(first.outputDir, "metadata.json"), "utf8");
-  assert.ok(!bundleText.includes(API_SECRET));
+  assertNoWindowOf(bundleText, API_SECRET, "findings.json and metadata.json");
   assert.match(readFileSync(join(first.outputDir, "_errors.log"), "utf8"), /sca workspaces/);
   assert.equal(first.zipPath, `${first.outputDir}.zip`);
 
@@ -1495,7 +1530,12 @@ test("rule 9: scrub boundary: a name-shaped value stays bare in prose and is rem
     ["Basic authentication is required", "Basic authentication is required"],
     ["InvalidAuthenticationToken: Access token has expired", "InvalidAuthenticationToken: Access token has expired"],
   ];
-  for (const [input, expected] of carriers) assert.equal(scrubErrorText(input), expected, input);
+  for (const [input, expected] of carriers) {
+    const scrubbed = scrubErrorText(input);
+    assert.equal(scrubbed, expected, input);
+    if (input.includes(name) && !expected.includes(name)) assertNoWindowOf(scrubbed, name, `carrier ${input}`);
+  }
+  assertNoWindowOf(scrubErrorText(bare, [name]), name, "configured secret in prose");
   const secret = 'top secret/value+1"x';
   const forms = {
     raw: secret,
@@ -1516,4 +1556,199 @@ test("rule 9: scrub boundary: a name-shaped value stays bare in prose and is rem
     "failed for /api/v1/users/aB3xZ9qL2mN8pR4tV7wY1/factors from /tmp/run-9b6rz9m4l55zg7/credentials and https://hooks.example.com/services/T0/[REDACTED]",
     "a token-shaped segment of a bare request target or file path is an identifier the run named; inside a URL it is a webhook token",
   );
+  assert.equal(
+    scrubErrorText("casing policyComplianceStatus lastCompletedScanDate ignoreTeamRestrictions QaZwSxEdCrFvTgByHn aBcDeFgHiJkLmNoPqRs ABcdEFghIJklMNopQR"),
+    "casing policyComplianceStatus lastCompletedScanDate ignoreTeamRestrictions [REDACTED] [REDACTED] [REDACTED]",
+    "camelCase identifiers whose words average three or more letters stay; alternating capitalized fragments and doubled-case runs are tokens",
+  );
+  assert.equal(
+    scrubErrorText("veracode_api_key_secret=4f9c2b7e1d3a4c5b8e6f7a9b0c1d2e3f and client_certificate_password=hunter2x9 rejected"),
+    "veracode_api_key_secret=[REDACTED] and client_certificate_password=[REDACTED] rejected",
+    "a credential-named key keeps its name once its value is replaced; the trailing = is not read as base64 padding",
+  );
+
+  assert.equal(
+    scrubErrorText("Veracode request failed (403 Forbidden) for /api/authn/v2/api_credentials: Insufficient privileges for this operation"),
+    "Veracode request failed (403 Forbidden) for /api/authn/v2/api_credentials: Insufficient privileges for this operation",
+    "the last segment of a bare request path used as a label is not a pair key, so the vendor detail after it stays",
+  );
+
+  // Must-keep table (addendum 7): every identifying string a summary may carry survives alone and inside a realistic sentence.
+  for (const [kind, values] of Object.entries(VERACODE_MUST_KEEP)) {
+    for (const value of values) {
+      assert.equal(scrubErrorText(value), value, `must keep bare: ${value}`);
+      assert.equal(scrubErrorText(value, [API_ID, API_SECRET]), value, `must keep bare with the configured credentials registered: ${value}`);
+      for (const sentence of veracodeSummarySentences(kind, value)) assert.equal(scrubErrorText(sentence), sentence, `must keep in a sentence: ${sentence}`);
+    }
+  }
+});
+
+/** Every endpoint the Veracode client requests (applications, identity, SCA Agent, and Dynamic Analysis APIs), with the sample identifiers the fixtures use. */
+const VERACODE_REQUESTED_PATHS = [
+  "/api/authn/v2/users/self",
+  "/api/authn/v2/api_credentials",
+  "/api/authn/v2/api_credentials/user_id/u-2",
+  "/api/authn/v2/users",
+  "/api/authn/v2/users?detailed=true&include_roles=true&include_teams=true&page=0&size=100",
+  "/api/authn/v2/teams",
+  "/api/authn/v2/teams?all_for_org=true",
+  "/api/authn/v2/roles",
+  "/appsec/v1/applications",
+  "/appsec/v1/applications?page=1&size=100",
+  "/appsec/v1/applications/app-1/sandboxes",
+  "/appsec/v2/applications/app-1/findings",
+  "/appsec/v2/applications/app-1/findings?page=0&size=500",
+  "/appsec/v2/applications/app-1/summary_report",
+  "/appsec/v1/policies",
+  "/srcclr/v3/workspaces",
+  "/srcclr/v3/workspaces/ws-1/issues?type=vulnerability&status=open",
+  "/srcclr/v3/workspaces/ws-1/libraries",
+  "/srcclr/v3/applications/app-2/projects",
+  "/was/configservice/v1/analyses",
+  "/was/configservice/v1/analyses/an-1/scans",
+  "/was/configservice/v1/scans/scan-1/configuration",
+];
+const VERACODE_MUST_KEEP = {
+  path: [...VERACODE_REQUESTED_PATHS, ...VERACODE_REQUESTED_PATHS.map((path) => `GET ${path}`)],
+  host: ["https://api.veracode.com", "https://api.veracode.eu", "https://api.veracode.us", "api.veracode.com", "acme-prod.example.gov"],
+  name: [
+    "us-fed", "prod-us-east-2026", "svc-api", "alice", "alice@example.com", "jane.doe@acme-prod.example.gov", "Payments", "Portal DAST", "Workspace A", "Team A",
+    "Security Insights", "Reviewer", "Administrator", "Results API", "Workspace Administrator", "Workspace Editor", "sca_workspaces", "dynamic_analyses", "api_credentials",
+    "VERY_HIGH", "FINISHED_RESULTS_AVAILABLE", "PUBLISHED", "MAX_SEVERITY", "policy_compliance_status", "last_completed_scan_date", "ignore_team_restrictions",
+    "all_for_org=true", "include_roles=true",
+  ],
+  status: ["200 OK", "400 Bad Request", "401 Unauthorized", "403 Forbidden", "404 Not Found", "429 Too Many Requests", "500 Internal Server Error", "502 Bad Gateway", "503 Service Unavailable"],
+  id: VERACODE_CONTROLS.map((control) => `VERACODE-${String(control.number).padStart(2, "0")}`),
+  source: ["arguments-api-key-id", "environment-api-key-secret", "credentials-file-api-key-id (default)", "region-us", "explicit-base-url"],
+  code: ["INVALID_INI", "EACCES", "ENOTDIR", "EISDIR", "UNREADABLE"],
+  text: ["/home/auditor/.veracode/credentials", "first page only, total unknown"],
+};
+
+/** Realistic Veracode summary and error sentences with an identifying value in the slot such a value occupies. */
+function veracodeSummarySentences(kind, value) {
+  switch (kind) {
+    case "path":
+      return [
+        `Veracode request failed (403 Forbidden) for ${value}: role Security Insights required`,
+        `Veracode request failed (403 Forbidden) for ${value}: Insufficient privileges for this operation`,
+        `The ${value} endpoint was forbidden (403), so the control could not be verified: Veracode request failed (403 Forbidden) for ${value}`,
+        `sandboxes Payments: Veracode request failed (403 Forbidden) for ${value}`,
+        `2026-09-21T12:00:00.000Z api credentials svc-api: Veracode request failed (403 Forbidden) for ${value}`,
+      ];
+    case "host":
+      return [`Using Veracode API base ${value} (region us, credentials from environment-api-key-id -> environment-api-key-secret -> region-us).`, `Veracode request failed for ${value}/appsec/v1/applications: fetch failed`];
+    case "name":
+      return [
+        `Authenticated as ${value} with roles ${value}, Administrator.`,
+        `Only 2 of 6 ${value} were read (1/3 pages), so the verdict reflects a partial inventory.`,
+        `Not requested: the ${value} inventory was not readable, so no per-application list was requested.`,
+        `sandboxes ${value}: Veracode request failed (403 Forbidden) for /appsec/v1/applications/app-1/sandboxes`,
+        `Optional license-gated surfaces not readable: ${value} (their controls will render as manual).`,
+        `Grant the API service account the missing roles (${value}) and confirm the region matches the account.`,
+      ];
+    case "status":
+      return [`Veracode request failed (${value}) for /appsec/v1/policies: role Security Insights required`, `Veracode request to /appsec/v1/applications returned an unreadable response (${value}): non-JSON response body (5120 bytes, not recorded)`];
+    case "id":
+      return [`${value} is manual because the applications endpoint was forbidden (403).`, `| ${value} | HIGH | MANUAL | Policy assignment | The policies endpoint was forbidden (403), so the control could not be verified. |`];
+    case "source":
+      return [`Using Veracode API base https://api.veracode.com (region us, credentials from ${value} -> region-us).`, `- Credential source: ${value}`];
+    case "code":
+      return [`Unable to read Veracode credentials file /home/auditor/.veracode/credentials (${value})`, `Unable to parse Veracode credentials file: invalid INI in /home/auditor/.veracode/credentials (${value})`];
+    default:
+      return [`${value} was reported by veracode_check_access.`];
+  }
+}
+
+/** Every fixed text the Veracode integration emits, with sample paths and names, passes its scrubber unchanged (GWS note 1). */
+const VERACODE_FIXED_TEXTS = [
+  "Unable to read Veracode credentials file /home/auditor/.veracode/credentials (EACCES)",
+  "Unable to read Veracode credentials file /home/auditor/.veracode/credentials (UNREADABLE)",
+  "Unable to parse Veracode credentials file: invalid INI in /home/auditor/.veracode/credentials (INVALID_INI)",
+  "Veracode API credentials are required: pass api_key_id and api_key_secret, set VERACODE_API_KEY_ID and VERACODE_API_KEY_SECRET, or add veracode_api_key_id and veracode_api_key_secret to the [default] profile in /home/auditor/.veracode/credentials.",
+  "The Veracode API key secret must be a hex string; check the credential value.",
+  'Unknown Veracode region "mars". Use us, eu, or us-fed.',
+  "Veracode request failed (403 Forbidden) for /appsec/v1/policies: role Security Insights required",
+  "Veracode request failed (401 Unauthorized) for /api/authn/v2/users/self",
+  "Veracode request failed (500 Internal Server Error) for /api/authn/v2/users/self: JSON response body (24 bytes) carried no message field",
+  "Veracode request failed (400 Bad Request) for /api/authn/v2/users/self: non-JSON response body (30 bytes, not recorded)",
+  "Veracode request to /appsec/v1/applications returned an unreadable response (200 OK): non-JSON response body (5120 bytes, not recorded)",
+  "Veracode request failed for /appsec/v1/applications: The operation was aborted due to timeout",
+  "all_for_org=true was refused (403), so only teams the API user is a member of were listed and the team inventory is a partial view.",
+  "Not requested: the application inventory was not readable, so no sandbox list was requested.",
+  "Not requested: the Dynamic Analysis list was not readable, so no scan list or scan configuration was requested.",
+  "Not requested: no scan list was readable, so no scan configuration was requested.",
+  "Not requested: the application inventory was not readable or empty, so no per-application list was requested.",
+  "Not requested: the application inventory was not readable, so no linked project list was requested.",
+  "Not requested: the SCA Agent API was not readable, so no linked project list was requested.",
+  "Not requested: the SCA workspace list was not readable, so no workspace issue or library list was requested.",
+  "Not requested: the user list was not readable, so no credential record was requested.",
+  "Not requested: the user list was empty, so no credential record was requested.",
+  "Not requested: the user list carried no active API account, so no credential record was requested.",
+  "The applications (Security Insights or Reviewer role) endpoint was forbidden (403), so the control could not be verified: Veracode request failed (403 Forbidden) for /appsec/v1/applications",
+  "The users (Administrator role) endpoint returned an error (500), so the control could not be verified: Veracode request failed (500 Internal Server Error) for /api/authn/v2/users",
+  "The api_credentials (Administrator role) endpoint could not be read, so the control could not be verified: Veracode request failed for /api/authn/v2/api_credentials/user_id/u-2: The operation was aborted due to timeout",
+  "The policies surface was not read.",
+  "The Dynamic Analysis API was not available to this credential (403); Dynamic Analysis may be unlicensed or the API user lacks a Dynamic Analysis role, so the control is not applicable through the API.",
+  "The SCA Agent API was not available to this credential (404); agent-based SCA may be unlicensed or the API user lacks a Workspace role, so the control is not applicable through the API.",
+  "the SCA Agent API workspace list returned an error (403)",
+  "the SCA Agent API workspace list could not be read",
+  "The application inventory was unreadable, so policy assignment per application was not verified.",
+  "The application inventory was unreadable, so application team assignment was not verified.",
+  "Only 2 of 6 applications were read (1/3 pages), so the verdict reflects a partial inventory.",
+  "Only 2 of an unknown total of applications were read (1/? pages), so the verdict reflects a partial inventory.",
+  "Only 10 of 25 API accounts were sampled, so the verdict reflects a partial view.",
+  "2 scan configurations were unreadable.",
+  "2 application finding lists were unreadable.",
+  "3 finding lists were truncated before the last page.",
+  "1 workspace license lists were unreadable.",
+  "2 linked project lists were unreadable.",
+  "2 credential records were unreadable.",
+  "The policies endpoint returned zero policies, which cannot be a complete inventory because every Veracode account exposes the built-in policies; the empty list is treated as unverifiable rather than compliant.",
+  "The users endpoint returned zero users, which cannot be a complete inventory because the API credential belongs to a user; the empty list is treated as unverifiable rather than compliant.",
+  "The roles endpoint returned zero roles, which cannot be a complete inventory because Veracode ships built-in roles; the empty list is treated as unverifiable rather than compliant.",
+  "No active API service accounts were returned even though this request is authenticated with API credentials, so the credential inventory is unverifiable.",
+  "No Dynamic Analysis configurations exist, so there is no DAST configuration to evaluate; the empty inventory is treated as not applicable rather than compliant.",
+  "No Dynamic Analysis scan configuration could be read, so authentication and crawl settings are unknown.",
+  "No open vulnerability issues were returned, but no libraries were readable in the sampled workspaces, so it is unknown whether any scan has populated them.",
+  "sandboxes Payments: Veracode request failed (403 Forbidden) for /appsec/v1/applications/app-1/sandboxes",
+  "api credentials svc-api: Veracode request failed (403 Forbidden) for /api/authn/v2/api_credentials/user_id/u-2",
+  "dynamic scan configuration scan-1: Veracode request failed (403 Forbidden) for /was/configservice/v1/scans/scan-1/configuration",
+  "sca workspaces: Veracode request failed (403 Forbidden) for /srcclr/v3/workspaces",
+  "self: Veracode request failed (401 Unauthorized) for /api/authn/v2/users/self",
+  "Using Veracode API base https://api.veracode.com (region us, credentials from environment-api-key-id -> environment-api-key-secret -> region-us).",
+  "Authenticated as svc-api with roles Results API, Administrator.",
+  "The principal could not be read from /api/authn/v2/users/self.",
+  "5/7 core audit surfaces are readable.",
+  "Optional license-gated surfaces not readable: sca_workspaces, dynamic_analyses (their controls will render as manual).",
+  "Run veracode_assess_scan_coverage, veracode_assess_policy_compliance, veracode_assess_findings_hygiene, veracode_assess_sca_posture, veracode_assess_access_controls, or veracode_export_audit_bundle.",
+  "Grant the API service account the missing roles (Security Insights or Reviewer, Administrator) and confirm the region matches the account.",
+  "first page only, total unknown",
+];
+
+test("rule 9: every fixed text the Veracode integration emits passes its scrubber unchanged", () => {
+  for (const text of VERACODE_FIXED_TEXTS) assert.equal(scrubErrorText(text), text, text);
+  for (const text of VERACODE_FIXED_TEXTS) assert.equal(scrubErrorText(text, [API_ID, API_SECRET]), text, `${text} (with the configured credentials registered)`);
+});
+
+test("resolveVeracodeConfiguration keeps environment credentials when an unrelated argument is passed (GWS note 2)", () => {
+  const home = createTempBase("grclanker-veracode-env-args-");
+  const credentialsFile = join(home, "credentials");
+  writeFileSync(credentialsFile, "[default]\nveracode_api_key_id = file-id\nveracode_api_key_secret = abcdef\n");
+  const env = { VERACODE_API_KEY_ID: API_ID, VERACODE_API_KEY_SECRET: API_SECRET, VERACODE_API_CREDENTIALS_FILE: credentialsFile, VERACODE_REGION: "eu" };
+
+  const resolved = resolveVeracodeConfiguration({ timeout_seconds: 9 }, env, { homeDir: home });
+  assert.equal(resolved.apiKeyId, API_ID, "the environment key ID survives an argument overlay that names no credential");
+  assert.equal(resolved.apiKeySecret, API_SECRET);
+  assert.equal(resolved.baseUrl, "https://api.veracode.eu");
+  assert.equal(resolved.timeoutMs, 9000);
+  assert.deepEqual(resolved.sourceChain, ["environment-api-key-id", "environment-api-key-secret", "region-eu"]);
+
+  const withUndefinedArguments = resolveVeracodeConfiguration({ api_key_id: undefined, api_key_secret: undefined, region: undefined }, env, { homeDir: home });
+  assert.equal(withUndefinedArguments.apiKeyId, API_ID, "an argument overlay whose credential keys are undefined does not shadow the environment");
+  assert.equal(withUndefinedArguments.apiKeySecret, API_SECRET);
+  assert.deepEqual(withUndefinedArguments.sourceChain, ["environment-api-key-id", "environment-api-key-secret", "region-eu"]);
+
+  const fileOnly = resolveVeracodeConfiguration({ timeout_seconds: 9 }, { VERACODE_API_CREDENTIALS_FILE: credentialsFile }, { homeDir: home });
+  assert.equal(fileOnly.apiKeyId, "file-id", "the credentials file named through the environment still supplies the credential");
+  assert.deepEqual(fileOnly.sourceChain, ["credentials-file-api-key-id (default)", "credentials-file-api-key-secret (default)", "region-us"]);
 });
