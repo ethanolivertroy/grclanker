@@ -1,12 +1,14 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 
 import {
   COMPUTE_BACKEND_KINDS,
+  getComputeBackendConfigurationIssues,
+  getComputeBackendCredentialState,
   getComputeBackendSurfaceLabel,
   getComputeProfileIssues,
   getDefaultComputeProfile,
@@ -17,6 +19,7 @@ import {
   resolveComputeProfile,
 } from "../dist/pi/compute.js";
 import {
+  buildComputeBackendSystemPromptNote,
   buildDockerToolRunArgs,
   resolveComputeBackendExecution,
   withComputeBackendExecution,
@@ -30,6 +33,13 @@ import {
   decodeModalCommandWrapper,
 } from "../dist/pi/backends/modal.js";
 import {
+  describeModalCredentialSource,
+  detectModalCredentials,
+  MODAL_CONFIG_FILE_NAME,
+  parseModalProfileText,
+  resolveModalConfigPath,
+} from "../dist/pi/backends/modal-profile.js";
+import {
   buildParallelsShareArgs,
   createParallelsBackend,
   parseParallelsSnapshotId,
@@ -40,7 +50,11 @@ import {
   createRunpodPodBackend,
   createRunpodServerlessBackend,
   DEFAULT_RUNPOD_JOB_TIMEOUT_MS,
+  isSensitiveStagingPath,
   parseRunpodWorkerOutput,
+  planPodWorkspaceStaging,
+  RUNPOD_CLEANUP_ATTEMPTS,
+  RUNPOD_STAGING_DENYLIST,
 } from "../dist/pi/backends/runpod.js";
 import { activeComputeSessionCount } from "../dist/pi/compute-sessions.js";
 import { shutdownComputeSessions } from "../dist/pi/compute-shutdown.js";
@@ -48,6 +62,9 @@ import {
   buildComputeBackendList,
   extractComputeFlag,
   formatComputeBackendList,
+  ONE_SHOT_SMOKE_NOTE,
+  runBackendSearchSmokeTest,
+  runBackendToolSmokeTest,
 } from "../dist/pi/env.js";
 import { createHostBackend, createSandboxRuntimeBackend } from "../dist/pi/backends/local.js";
 import {
@@ -56,6 +73,7 @@ import {
   createProcessCommandRunner,
   createRedactingSink,
   describeEndpoint,
+  ExecutionBackendCleanupError,
   ExecutionBackendError,
   ExecutionBackendTimeoutError,
   REDACTING_SINK_MAX_HELD_CHARS,
@@ -74,6 +92,10 @@ const RUNPOD_POD_JSON = JSON.stringify({
   publicIp: "203.0.113.10",
   portMappings: { "22": 22022 },
 });
+
+// A profile path that never exists, so a real ~/.modal.toml on the test host cannot change
+// what the "no Modal credentials" cases observe.
+const MISSING_MODAL_CONFIG_PATH = join(tmpdir(), "grclanker-no-modal-profile-3f9c1a", ".modal.toml");
 
 function createFakeRunner(handler) {
   const calls = [];
@@ -136,13 +158,16 @@ test("every adapter implements the ExecutionBackend contract with capability fla
     for (const method of ["healthcheck", "stageWorkspace", "exec", "snapshot", "restore", "teardown"]) {
       assert.equal(typeof backend[method], "function", `${kind}.${method}`);
     }
-    for (const flag of ["snapshot", "restore", "gpu", "stageWorkspace", "artifactSync", "interactive"]) {
+    for (const flag of ["snapshot", "restore", "gpu", "stageWorkspace", "artifactSync", "interactive", "oneShot"]) {
       assert.equal(typeof backend.capabilities[flag], "boolean", `${kind}.capabilities.${flag}`);
     }
   }
   assert.equal(createExecutionBackend("/tmp/repo", settings, {}, "parallels-vm").capabilities.snapshot, true);
   assert.equal(createExecutionBackend("/tmp/repo", settings, {}, "modal").capabilities.gpu, true);
   assert.equal(createExecutionBackend("/tmp/repo", settings, {}, "docker").capabilities.gpu, false);
+  assert.equal(createExecutionBackend("/tmp/repo", settings, {}, "modal").capabilities.oneShot, true);
+  assert.equal(createExecutionBackend("/tmp/repo", settings, {}, "runpod-serverless").capabilities.oneShot, true);
+  assert.equal(createExecutionBackend("/tmp/repo", settings, {}, "runpod-pod").capabilities.oneShot, false);
 });
 
 test("computeProfile and computeDefaults validate against the spec JSON shape", () => {
@@ -373,7 +398,7 @@ test("modal adapter shells out through documented modal shell flags and redacts 
     await backend.teardown("m1");
   });
 
-  await withEnv({ MODAL_TOKEN_ID: undefined, MODAL_TOKEN_SECRET: undefined }, async () => {
+  await withEnv({ MODAL_TOKEN_ID: undefined, MODAL_TOKEN_SECRET: undefined, MODAL_CONFIG_PATH: MISSING_MODAL_CONFIG_PATH }, async () => {
     const backend = createModalBackend({ runner: async () => ({ exitCode: 0, stdout: "", stderr: "" }) });
     await assert.rejects(() => backend.healthcheck(), /Set MODAL_TOKEN_ID/);
   });
@@ -456,9 +481,10 @@ test("runpod pod adapter reads the documented pod fields and execs over ssh", as
 
     const staged = await backend.stageWorkspace({ localPath: "/repo", sessionId: "sess" });
     assert.equal(staged.remotePath, "/workspace/sess");
-    assert.equal(calls[0].executable, "ssh");
-    assert.equal(calls[1].executable, "scp");
-    assert.ok(calls[1].args.includes("root@203.0.113.10:/workspace/sess"));
+    assert.deepEqual(calls.map((call) => call.executable), ["git", "ssh", "scp"]);
+    assert.deepEqual(calls[0].args, ["-C", "/repo", "ls-files", "--cached", "-z"]);
+    assert.ok(calls[2].args.includes("root@203.0.113.10:/workspace/sess"));
+    assert.match(calls[2].args.at(-2), /grclanker-runpod-stage-[^/]+\/\.$/, "scp uploads the private staging copy, not the repo root");
 
     const result = await backend.exec({ sessionId: "sess", command: ["uname -a"], cwd: "/workspace/sess" });
     assert.equal(result.stdout, "ok\n");
@@ -493,6 +519,7 @@ test("env list reports every backend with kind, bucket, and readiness", () => {
   withEnv({
     MODAL_TOKEN_ID: undefined,
     MODAL_TOKEN_SECRET: undefined,
+    MODAL_CONFIG_PATH: MISSING_MODAL_CONFIG_PATH,
     RUNPOD_API_KEY: undefined,
     RUNPOD_ENDPOINT_ID: undefined,
     RUNPOD_POD_ID: undefined,
@@ -639,12 +666,287 @@ test("runpod pod adapter removes the directory it created when scp fails", async
       runner,
     });
     await assert.rejects(() => backend.stageWorkspace({ localPath: "/repo", sessionId: "sess" }), /Could not copy/);
-    assert.deepEqual(calls.map((call) => call.executable), ["ssh", "scp", "ssh"]);
-    assert.match(calls[0].args.at(-1), /^mkdir -p -- '\/workspace\/sess'$/);
-    assert.match(calls[2].args.at(-1), /^rm -rf -- '\/workspace\/sess'$/);
+    assert.deepEqual(calls.map((call) => call.executable), ["git", "ssh", "scp", "ssh"]);
+    assert.match(calls[1].args.at(-1), /^mkdir -p -- '\/workspace\/sess'$/);
+    assert.match(calls[3].args.at(-1), /^rm -rf -- '\/workspace\/sess'$/);
     await backend.teardown("sess");
-    assert.equal(calls.length, 3);
+    assert.equal(calls.length, 4);
   });
+});
+
+test("runpod pod cleanup keeps the session tracked until the removal is confirmed", async () => {
+  await withEnv({ RUNPOD_API_KEY: "rpa_podkey_ABCDEFG", RUNPOD_POD_ID: "pod42" }, async () => {
+    const fetchMock = async () => new Response(RUNPOD_POD_JSON, { status: 200 });
+    const isRemoval = (call) => call.executable === "ssh" && String(call.args.at(-1)).startsWith("rm -rf");
+    const removals = (calls) => calls.filter(isRemoval);
+    const stuck = { exitCode: 1, stderr: "rm: cannot remove '/workspace/sess': Device or resource busy rpa_podkey_ABCDEFG" };
+
+    // Adapter level: the runner resolves with exit code 1 (it never rejects), so the result has
+    // to be inspected. The removal is retried, the session stays staged, and the error names the
+    // pod, the path, and the delete command without the API key that the remote echoed.
+    let removalExit = 1;
+    const adapter = createFakeRunner(async (_executable, args) => (
+      String(args.at(-1)).startsWith("rm -rf") ? (removalExit === 0 ? { exitCode: 0 } : stuck) : { exitCode: 0, stdout: "ok\n" }
+    ));
+    const backend = createRunpodPodBackend({ fetch: fetchMock, runner: adapter.runner });
+    await backend.stageWorkspace({ localPath: "/repo", sessionId: "sess" });
+    await assert.rejects(
+      () => backend.teardown("sess"),
+      (error) => {
+        assert.ok(error instanceof ExecutionBackendCleanupError, "typed cleanup error");
+        assert.match(error.message, /runpod-pod could not remove \/workspace\/sess on RunPod pod pod42/);
+        assert.ok(
+          error.message.includes(`(delete it with: ssh -p 22022 root@203.0.113.10 ${quoteForBash("rm -rf -- '/workspace/sess'")})`),
+          `delete command named: ${error.message}`,
+        );
+        assert.match(error.message, /rm -rf exited 1 on 2 attempts: rm: cannot remove/);
+        assert.ok(!error.message.includes("rpa_podkey_ABCDEFG"), "the remote's stderr is scrubbed");
+        assert.match(error.resource, /\/workspace\/sess on RunPod pod pod42/);
+        return true;
+      },
+    );
+    assert.equal(removals(adapter.calls).length, RUNPOD_CLEANUP_ATTEMPTS, "the removal is retried before giving up");
+    // Still staged: a second teardown retries instead of returning early, and exit code 0 untracks.
+    removalExit = 0;
+    await backend.teardown("sess");
+    assert.equal(removals(adapter.calls).length, RUNPOD_CLEANUP_ATTEMPTS + 1);
+    await backend.teardown("sess");
+    assert.equal(removals(adapter.calls).length, RUNPOD_CLEANUP_ATTEMPTS + 1, "untracked after the confirmed removal");
+
+    // Runtime level: the registry keeps the session while the removal fails, the failure is the
+    // result of withComputeBackendExecution on the success path, and a later sweep retries it.
+    const settings = { computeBackend: "runpod-pod", computeProfile: "persistent-remote" };
+    let runtimeRemovalExit = 1;
+    const runtime = createFakeRunner(async (_executable, args) => (
+      String(args.at(-1)).startsWith("rm -rf") ? { exitCode: runtimeRemovalExit, stderr: runtimeRemovalExit ? "busy" : "" } : { exitCode: 0, stdout: "ok\n" }
+    ));
+    assert.equal(activeComputeSessionCount(), 0);
+    await assert.rejects(
+      () => withComputeBackendExecution("/repo", settings, async (execution) => {
+        await execution.bashOperations.exec("true", "/repo", { onData: () => {} });
+        return "done";
+      }, { fetch: fetchMock, runner: runtime.runner }),
+      (error) => error instanceof ExecutionBackendCleanupError && /on RunPod pod pod42/.test(error.message),
+    );
+    assert.equal(activeComputeSessionCount(), 1, "the session stays tracked after a failed removal");
+    assert.equal(removals(runtime.calls).length, RUNPOD_CLEANUP_ATTEMPTS);
+
+    // The shutdown sweep reports the failure and keeps the handle; once rm exits 0 it is gone.
+    await assert.rejects(
+      () => shutdownComputeSessions({ computeBackend: "host" }),
+      (error) => {
+        assert.equal(error.name, "ComputeSessionTeardownError");
+        assert.match(error.message, /1 compute session could not be torn down and stays tracked:\n- Compute backend error: runpod-pod could not remove/);
+        return true;
+      },
+    );
+    assert.equal(activeComputeSessionCount(), 1);
+    assert.equal(removals(runtime.calls).length, RUNPOD_CLEANUP_ATTEMPTS * 2);
+    runtimeRemovalExit = 0;
+    await shutdownComputeSessions({ computeBackend: "host" });
+    assert.equal(activeComputeSessionCount(), 0, "exit code 0 untracks the session");
+    assert.equal(removals(runtime.calls).length, RUNPOD_CLEANUP_ATTEMPTS * 2 + 1);
+
+    // Throw path: the run's own error stays primary and keeps its type; the cleanup failure is
+    // appended rather than lost, and the session stays tracked.
+    class ToolError extends Error {}
+    let throwPathRemovalExit = 1;
+    const throwPath = createFakeRunner(async (_executable, args) => (
+      String(args.at(-1)).startsWith("rm -rf") ? { exitCode: throwPathRemovalExit, stderr: "" } : { exitCode: 0, stdout: "" }
+    ));
+    await assert.rejects(
+      () => withComputeBackendExecution("/repo", settings, async (execution) => {
+        await execution.bashOperations.exec("true", "/repo", { onData: () => {} });
+        throw new ToolError("tool blew up");
+      }, { fetch: fetchMock, runner: throwPath.runner }),
+      (error) => {
+        assert.ok(error instanceof ToolError);
+        assert.match(error.message, /^tool blew up\nCleanup also failed: Compute backend error: runpod-pod could not remove \/workspace\/grclanker-[0-9a-z-]+ on RunPod pod pod42/);
+        return true;
+      },
+    );
+    assert.equal(activeComputeSessionCount(), 1);
+    throwPathRemovalExit = 0;
+    await shutdownComputeSessions({ computeBackend: "host" });
+    assert.equal(activeComputeSessionCount(), 0);
+
+    // Staging failure whose own cleanup fails: the partial upload is named, the session stays
+    // tracked (adapter and registry), and the sweep retries the removal.
+    let stagingRemovalExit = 1;
+    const staging = createFakeRunner(async (executable, args) => {
+      if (executable === "scp") return { exitCode: 1, stderr: "lost connection" };
+      if (String(args.at(-1)).startsWith("rm -rf")) return { exitCode: stagingRemovalExit, stderr: stagingRemovalExit ? "busy" : "" };
+      return { exitCode: 0, stdout: "" };
+    });
+    const execution = resolveComputeBackendExecution("/repo", settings, { fetch: fetchMock, runner: staging.runner });
+    await assert.rejects(
+      () => execution.bashOperations.exec("true", "/repo", { onData: () => {} }),
+      (error) => {
+        assert.ok(error instanceof ExecutionBackendCleanupError);
+        assert.match(error.message, /The workspace copy failed \(scp exited 1: lost connection\) and the partial upload could not be removed \(rm -rf exited 1 on 2 attempts: busy\)/);
+        return true;
+      },
+    );
+    assert.equal(activeComputeSessionCount(), 1, "a partial upload keeps the session tracked");
+    assert.deepEqual(staging.calls.map((call) => call.executable), ["git", "ssh", "scp", "ssh", "ssh"]);
+    stagingRemovalExit = 0;
+    await execution.teardown();
+    assert.equal(activeComputeSessionCount(), 0);
+    assert.equal(removals(staging.calls).length, RUNPOD_CLEANUP_ATTEMPTS + 1);
+    assert.equal(staging.calls.filter((call) => call.executable === "scp").length, 1, "teardown does not re-stage");
+
+    // The synchronous exit hook inspects the exit code too and tells the operator about the remnant.
+    const syncCalls = [];
+    const syncBackend = createRunpodPodBackend({
+      fetch: fetchMock,
+      runner: async (_executable, args) => (String(args.at(-1)).startsWith("rm -rf") ? { exitCode: 1, stderr: "" } : { exitCode: 0, stdout: "" }),
+      syncRunner: (executable, args) => {
+        syncCalls.push({ executable, args });
+        return { exitCode: 1, stdout: "", stderr: "busy" };
+      },
+    });
+    await syncBackend.stageWorkspace({ localPath: "/repo", sessionId: "sync" });
+    const written = [];
+    const originalWrite = process.stderr.write;
+    process.stderr.write = (chunk) => {
+      written.push(String(chunk));
+      return true;
+    };
+    try {
+      syncBackend.teardownSync("sync");
+      syncBackend.teardownSync("sync");
+    } finally {
+      process.stderr.write = originalWrite;
+    }
+    assert.equal(syncCalls.length, 2, "the session stays staged after a failed synchronous removal");
+    assert.match(written.join(""), /runpod-pod could not remove \/workspace\/sync on RunPod pod pod42/);
+  });
+});
+
+function git(cwd, ...args) {
+  const result = spawnSync("git", ["-C", cwd, ...args], { encoding: "utf8" });
+  assert.equal(result.status, 0, `git ${args.join(" ")} failed: ${result.stderr}`);
+  return result.stdout;
+}
+
+function plant(root, relativePath, contents) {
+  mkdirSync(join(root, dirname(relativePath)), { recursive: true });
+  writeFileSync(join(root, relativePath), contents);
+}
+
+function listFilesRecursively(root, prefix = "") {
+  const entries = [];
+  for (const entry of readdirSync(join(root, prefix), { withFileTypes: true })) {
+    const relativePath = prefix ? `${prefix}/${entry.name}` : entry.name;
+    if (entry.isDirectory()) entries.push(...listFilesRecursively(root, relativePath));
+    else entries.push(relativePath);
+  }
+  return entries.sort();
+}
+
+test("runpod pod staging uploads the git index only and never a planted secret", async () => {
+  const repo = mkdtempSync(join(tmpdir(), "grclanker-pod-stage-"));
+  const secrets = {
+    ".env": "PLANTED_SECRET_ENV=fake-env-secret-1a2b3c\n",
+    "credentials.json": "{\"secret\":\"fake-credentials-secret-4d5e6f\"}\n",
+    "client_secret.json": "{\"client_secret\":\"fake-client-secret-7g8h9i\"}\n",
+    "acme-service-account.json": "{\"private_key\":\"fake-service-account-secret-0j1k2l\"}\n",
+    "export/bundle.zip": "fake-export-bundle-secret-3m4n5o\n",
+    "oscal-workspace/x.json": "{\"token\":\"fake-oscal-workspace-secret-6p7q8r\"}\n",
+  };
+  try {
+    git(repo, "init", "-q");
+    plant(repo, "README.md", "# tracked\n");
+    plant(repo, "src/index.ts", "export const tracked = true;\n");
+    plant(repo, "scripts/run.sh", "#!/bin/sh\necho tracked\n");
+    chmodSync(join(repo, "scripts/run.sh"), 0o755);
+    git(repo, "add", "README.md", "src/index.ts", "scripts/run.sh");
+    git(repo, "-c", "user.email=test@example.invalid", "-c", "user.name=test", "commit", "-q", "-m", "init");
+    for (const [relativePath, contents] of Object.entries(secrets)) plant(repo, relativePath, contents);
+    // A sensitive file that was committed by mistake must still stay local.
+    plant(repo, "config/credentials.json", "{\"secret\":\"fake-committed-secret-9s0t1u\"}\n");
+    git(repo, "add", "-f", "config/credentials.json");
+    // A tracked file modified after the commit is uploaded with its working-tree content.
+    plant(repo, "README.md", "# tracked and modified\n");
+    plant(repo, "untracked-note.md", "not added yet\n");
+
+    const plan = await planPodWorkspaceStaging(repo, createProcessCommandRunner());
+    assert.deepEqual(plan.files, ["README.md", "scripts/run.sh", "src/index.ts"]);
+    assert.deepEqual(plan.excluded, ["config/credentials.json"]);
+    assert.deepEqual(plan.skipped, []);
+
+    const realRunner = createProcessCommandRunner();
+    let uploaded;
+    const { runner, calls } = createFakeRunner(async (executable, args) => {
+      if (executable === "git") return realRunner(executable, args);
+      if (executable === "scp") {
+        const source = args.at(-2);
+        assert.ok(source.endsWith("/."), source);
+        const stageRoot = source.slice(0, -2);
+        uploaded = {
+          files: listFilesRecursively(stageRoot),
+          contents: Object.fromEntries(listFilesRecursively(stageRoot).map((file) => [file, readFileSync(join(stageRoot, file), "utf8")])),
+          runMode: statSync(join(stageRoot, "scripts/run.sh")).mode & 0o777,
+        };
+      }
+      return { exitCode: 0 };
+    });
+    await withEnv({ RUNPOD_API_KEY: "rpa_podkey_ABCDEFG", RUNPOD_POD_ID: "pod42" }, async () => {
+      const backend = createRunpodPodBackend({ fetch: async () => new Response(RUNPOD_POD_JSON, { status: 200 }), runner });
+      const staged = await backend.stageWorkspace({ localPath: repo, sessionId: "sess" });
+      assert.match(staged.detail, /^copied 3 tracked files \(1 sensitive path excluded, 0 non-regular or missing entries skipped\) from /);
+    });
+
+    assert.deepEqual(uploaded.files, ["README.md", "scripts/run.sh", "src/index.ts"]);
+    assert.equal(uploaded.contents["README.md"], "# tracked and modified\n");
+    assert.equal(uploaded.runMode, 0o755, "file modes survive the staging copy");
+    const remoteArgs = calls.filter((call) => call.executable !== "git").flatMap((call) => call.args);
+    assert.deepEqual(calls.map((call) => call.executable), ["git", "ssh", "scp"]);
+    for (const relativePath of [...Object.keys(secrets), "config/credentials.json", "untracked-note.md"]) {
+      assert.ok(!uploaded.files.includes(relativePath), `${relativePath} reached the staged set`);
+      assert.ok(!remoteArgs.some((arg) => arg.includes(relativePath)), `${relativePath} appeared in an ssh or scp argument`);
+    }
+    const stagedText = Object.values(uploaded.contents).join("\n") + remoteArgs.join("\n");
+    const markers = [...Object.values(secrets), "fake-committed-secret-9s0t1u", "not added yet"]
+      .map((contents) => /fake-[a-z0-9-]+/.exec(contents)?.[0] ?? contents.trim());
+    assert.equal(markers.length, 8);
+    for (const marker of markers) {
+      assert.ok(!stagedText.includes(marker), `secret ${marker} reached the upload`);
+    }
+    assert.ok(!remoteArgs.some((arg) => arg.startsWith(`${repo}/`) || arg === `${repo}/.`), "scp never points at the repo root");
+
+    // The staging copy is private and removed after the upload.
+    const stageRoot = calls.find((call) => call.executable === "scp").args.at(-2).slice(0, -2);
+    assert.ok(!existsSync(stageRoot), "the temp staging copy is removed after scp");
+
+    // A workspace outside any git work tree is refused, never copied blindly.
+    const plain = mkdtempSync(join(tmpdir(), "grclanker-pod-plain-"));
+    try {
+      plant(plain, ".env", "PLANTED=fake-plain-secret\n");
+      const plainCalls = createFakeRunner(async (executable, args) => (executable === "git" ? realRunner(executable, args) : { exitCode: 0 }));
+      await withEnv({ RUNPOD_API_KEY: "rpa_podkey_ABCDEFG", RUNPOD_POD_ID: "pod42" }, async () => {
+        const backend = createRunpodPodBackend({ fetch: async () => new Response(RUNPOD_POD_JSON, { status: 200 }), runner: plainCalls.runner });
+        await assert.rejects(
+          () => backend.stageWorkspace({ localPath: plain, sessionId: "sess" }),
+          /git ls-files exited 128 for .*runpod-pod stages tracked files only/,
+        );
+      });
+      assert.deepEqual(plainCalls.calls.map((call) => call.executable), ["git"], "no ssh or scp call is made for a non-git workspace");
+    } finally {
+      rmSync(plain, { recursive: true, force: true });
+    }
+
+    for (const path of Object.keys(secrets)) assert.equal(isSensitiveStagingPath(path), true, path);
+    for (const path of ["nested/.env.local", "a/export/b.txt", "deep/oscal-workspace/y", "keys/server.pem", "id_ed25519", ".env/config"]) {
+      assert.equal(isSensitiveStagingPath(path), true, path);
+    }
+    for (const path of ["README.md", "src/exporter.ts", "environment.md", "id_ed25519.pub", "docs/env.md"]) {
+      assert.equal(isSensitiveStagingPath(path), false, path);
+    }
+    assert.ok(RUNPOD_STAGING_DENYLIST.includes("*service-account*.json"));
+  } finally {
+    rmSync(repo, { recursive: true, force: true });
+  }
 });
 
 test("runpod pod adapter rejects empty and traversal session ids at the boundary", async () => {
@@ -719,6 +1021,113 @@ test("modal command wrapper survives the client's shlex bash -c wrapper", () => 
     const failing = spawnSync("/bin/bash", ["-c", buildModalCommandWrapper("exit 7")], { encoding: "utf8" });
     assert.equal(failing.status, 7);
   }
+});
+
+test("one-shot backends offer bash only and the smoke test never reports write-then-read as passed", async () => {
+  const contractSettings = { computeBackend: "host", parallelsTemplateName: "tpl" };
+  const oneShotKinds = COMPUTE_BACKEND_KINDS.filter((kind) =>
+    createExecutionBackend("/repo", contractSettings, { runner: async () => ({ exitCode: 0 }) }, kind).capabilities.oneShot,
+  );
+  assert.deepEqual(oneShotKinds, ["modal", "runpod-serverless"]);
+
+  await withEnv({
+    MODAL_TOKEN_ID: "ak-FAKEID0123456789ABCD",
+    MODAL_TOKEN_SECRET: "as-FAKESECRET0123456789",
+    RUNPOD_API_KEY: "rpa_FAKEKEY0123456789ABCDEF",
+    RUNPOD_ENDPOINT_ID: "ep123",
+  }, async () => {
+    // Both fakes behave like the real providers: every exec starts from the original workspace,
+    // so a remote write would "succeed" and the next read would still return the original bytes.
+    // Only a single execution can observe its own write.
+    const original = "original contents\n";
+    const answer = (command) => (command.includes("printf 'alpha") ? "alpha\n" : original);
+    const modal = createFakeRunner(async (_executable, args) => {
+      if (args[0] === "--version") return { exitCode: 0, stdout: "modal client version: 1.0" };
+      return { exitCode: 0, stdout: answer(decodeModalCommandWrapper(args.at(-1))) };
+    });
+    const serverlessRequests = [];
+    const serverlessFetch = async (url, init = {}) => {
+      serverlessRequests.push({ url, body: init.body });
+      if (url.endsWith("/health")) return new Response(JSON.stringify({ workers: { ready: 1 } }), { status: 200 });
+      if (url.endsWith("/run")) {
+        // Answer as an already completed job so the test does not wait for the default poll
+        // interval; the poll protocol itself is covered by the serverless adapter test.
+        const command = JSON.parse(init.body).input.command;
+        return new Response(JSON.stringify({
+          id: "job-1",
+          status: "COMPLETED",
+          output: { exitCode: 0, stdout: answer(command), stderr: "", artifacts: [] },
+        }), { status: 200 });
+      }
+      return new Response("{}", { status: 200 });
+    };
+
+    const cases = [
+      ["modal", { computeBackend: "modal" }, { runner: modal.runner }],
+      ["runpod-serverless", { computeBackend: "runpod-serverless" }, { fetch: serverlessFetch }],
+    ];
+    for (const [kind, settings, deps] of cases) {
+      await withComputeBackendExecution("/repo", settings, async (execution) => {
+        assert.equal(execution.kind, kind);
+        assert.equal(execution.backend.capabilities.oneShot, true);
+        assert.equal(typeof execution.bashOperations.exec, "function");
+        // The stateful tools are not offered at all, so the extension falls back to its
+        // host-local read, write, edit, ls, find, and grep, which keep their state locally.
+        for (const surface of ["readOperations", "writeOperations", "editOperations", "lsOperations", "findOperations", "grepOperations"]) {
+          assert.equal(execution[surface], undefined, `${kind} must not offer ${surface}`);
+        }
+        assert.match(execution.summary, /stay on the local workspace because/);
+
+        const lines = [];
+        const log = (line) => lines.push(line);
+        await runBackendToolSmokeTest({ cwd: "/repo", timeoutSeconds: 5 }, execution, log);
+        await runBackendSearchSmokeTest({ cwd: "/repo", timeoutSeconds: 5 }, execution, log);
+        assert.deepEqual(lines, [
+          `tool_adapter=skipped (${ONE_SHOT_SMOKE_NOTE})`,
+          "tool_one_shot_round_trip=ok",
+          `tool_find=skipped (${ONE_SHOT_SMOKE_NOTE})`,
+          `tool_grep=skipped (${ONE_SHOT_SMOKE_NOTE})`,
+        ], kind);
+        assert.ok(!lines.some((line) => /^tool_(write|read|edit|ls|find|grep)=ok$/.test(line)), `${kind} reported a stateful probe as passed`);
+      }, deps);
+    }
+    assert.equal(ONE_SHOT_SMOKE_NOTE, "one-shot backend, stateful file operations not offered");
+    const roundTrip = serverlessRequests.filter((request) => request.url.endsWith("/run"));
+    assert.equal(roundTrip.length, 1);
+    assert.match(JSON.parse(roundTrip[0].body).input.command, /printf 'alpha\\n' > "\$probe_file" && cat "\$probe_file"/);
+
+    // The in-execution round trip is a real check: a remote that loses the write fails it, and the
+    // failure is reported instead of a pass.
+    const lossy = createFakeRunner(async (_executable, args) => {
+      if (args[0] === "--version") return { exitCode: 0, stdout: "modal client version: 1.0" };
+      return { exitCode: 0, stdout: "" };
+    });
+    await withComputeBackendExecution("/repo", { computeBackend: "modal" }, async (execution) => {
+      const lines = [];
+      await assert.rejects(
+        () => runBackendToolSmokeTest({ cwd: "/repo", timeoutSeconds: 5 }, execution, (line) => lines.push(line)),
+        /One-shot write-then-read verification inside a single execution failed/,
+      );
+      assert.deepEqual(lines, [`tool_adapter=skipped (${ONE_SHOT_SMOKE_NOTE})`]);
+    }, { runner: lossy.runner });
+
+    // Stateful backends keep the full surface, so the change is scoped to one-shot kinds.
+    const pod = createFakeRunner(async () => ({ exitCode: 0, stdout: "ok\n" }));
+    await withEnv({ RUNPOD_POD_ID: "pod42" }, async () => {
+      const execution = resolveComputeBackendExecution("/repo", { computeBackend: "runpod-pod" }, { runner: pod.runner, fetch: async () => new Response(RUNPOD_POD_JSON, { status: 200 }) });
+      assert.equal(execution.backend.capabilities.oneShot, false);
+      for (const surface of ["readOperations", "writeOperations", "editOperations", "lsOperations", "findOperations", "grepOperations"]) {
+        assert.equal(typeof execution[surface], "object", `runpod-pod must keep ${surface}`);
+      }
+      await execution.teardown();
+    });
+
+    // The agent is told the same thing in its system prompt note.
+    const note = buildComputeBackendSystemPromptNote("/repo", { computeBackend: "modal" });
+    assert.match(note, /modal is a one-shot backend: only bash and user `!` commands are routed through it/);
+    assert.match(note, /Read, write, edit, ls, grep, and find operate on the local workspace/);
+    assert.ok(!note.includes("Bash, read, write, edit, ls, grep, and find are routed through the compute backend"));
+  });
 });
 
 test("parallels share args honor the configured workspace mount mode", async () => {
@@ -1571,4 +1980,175 @@ test("parallels mount wait reports the deadline exit as a typed timeout and dest
   );
   assert.deepEqual(calls.slice(-2).map((call) => call.args[0]), ["stop", "delete"]);
   await assert.rejects(() => backend.exec({ sessionId: "s", command: ["true"], cwd: "/x" }), /Call stageWorkspace first/);
+});
+
+test("modal credentials resolve from the environment or the CLI profile file without exposing a token value", async () => {
+  const home = mkdtempSync(join(tmpdir(), "grclanker-modal-home-"));
+  const profilePath = join(home, MODAL_CONFIG_FILE_NAME);
+  const PROFILE_ID = "ak-FAKEPROFILEID0123456789";
+  const PROFILE_SECRET = "as-FAKEPROFILESECRET0123456789";
+  // Not shaped like a Modal token on purpose: only the loader's fixed-text contract, never the
+  // format scrub, can keep it out of an error.
+  const PLANTED = "plantedProfileSecret7Q9Z";
+  const tokenValues = [PROFILE_ID, PROFILE_SECRET, PLANTED];
+  const assertNoTokenValue = (text) => {
+    for (const value of tokenValues) assert.ok(!text.includes(value), `token value leaked into: ${text}`);
+  };
+  const noEnv = { MODAL_TOKEN_ID: undefined, MODAL_TOKEN_SECRET: undefined, MODAL_PROFILE: undefined, MODAL_CONFIG_PATH: undefined };
+  const settings = { computeBackend: "modal" };
+  const credentialIssues = (issues) => issues.filter((issue) => !issue.startsWith("Install the modal CLI"));
+  const versionRunner = () => createFakeRunner(async (_executable, args) => (
+    args[0] === "--version" ? { exitCode: 0, stdout: "modal client version: 1.0\n" } : { exitCode: 0, stdout: "ok\n" }
+  ));
+
+  try {
+    // Documented location: ~/.modal.toml, overridable through MODAL_CONFIG_PATH.
+    assert.equal(resolveModalConfigPath({}, home), profilePath);
+    assert.equal(resolveModalConfigPath({ MODAL_CONFIG_PATH: "/etc/modal/profile.toml" }, home), "/etc/modal/profile.toml");
+
+    // 1. The documented shape written by `modal token set`, env unset: not flagged, and the
+    //    healthcheck and exec paths proceed to the CLI call.
+    writeFileSync(profilePath, `# written by modal token set\n[default]\ntoken_id = "${PROFILE_ID}"\ntoken_secret = "${PROFILE_SECRET}"\n`);
+    await withEnv({ ...noEnv, MODAL_CONFIG_PATH: profilePath }, async () => {
+      assert.deepEqual(detectModalCredentials(), { kind: "profile", path: profilePath, profile: "default" });
+      assert.deepEqual(credentialIssues(getComputeBackendConfigurationIssues(settings, "modal")), []);
+      const state = getComputeBackendCredentialState("modal");
+      assert.equal(state.ok, true);
+      assert.match(state.detail, /^Found Modal CLI profile "default" in .*\.modal\.toml\.$/);
+      assertNoTokenValue(state.detail);
+
+      const { runner, calls } = versionRunner();
+      const backend = createModalBackend({ runner });
+      await backend.healthcheck();
+      assert.deepEqual(calls.map((call) => [call.executable, call.args[0]]), [["modal", "--version"]]);
+      const result = await backend.exec({ sessionId: "p", command: ["pwd"], cwd: "/mnt/repo" });
+      assert.equal(result.exitCode, 0);
+      assert.equal(calls.at(-1).args[0], "shell");
+      for (const call of calls) assertNoTokenValue(JSON.stringify(call.args));
+    });
+    // The same file is found through the home directory, not only through the override.
+    assert.deepEqual(detectModalCredentials({}, home), { kind: "profile", path: profilePath, profile: "default" });
+
+    // 2. Neither the environment nor the file: still flagged, and the CLI is never called.
+    await withEnv({ ...noEnv, MODAL_CONFIG_PATH: MISSING_MODAL_CONFIG_PATH }, async () => {
+      assert.equal(detectModalCredentials().kind, "missing");
+      const issues = credentialIssues(getComputeBackendConfigurationIssues(settings, "modal"));
+      assert.equal(issues.length, 1);
+      assert.match(
+        issues[0],
+        /^Set MODAL_TOKEN_ID and MODAL_TOKEN_SECRET in the environment, or run `modal setup` \/ `modal token set` to write .*\.modal\.toml \(the file does not exist\)\.$/,
+      );
+      assert.equal(getComputeBackendCredentialState("modal").ok, false);
+      const { runner, calls } = versionRunner();
+      const backend = createModalBackend({ runner });
+      await assert.rejects(() => backend.healthcheck(), /Set MODAL_TOKEN_ID and MODAL_TOKEN_SECRET/);
+      await assert.rejects(() => backend.exec({ sessionId: "p", command: ["pwd"], cwd: "/" }), /Set MODAL_TOKEN_ID and MODAL_TOKEN_SECRET/);
+      assert.equal(calls.length, 0);
+    });
+
+    // The environment alone is still enough, with or without a file.
+    await withEnv({ ...noEnv, MODAL_TOKEN_ID: "ak-FAKEENVID0123456789ABC", MODAL_TOKEN_SECRET: "as-FAKEENVSECRET0123456789", MODAL_CONFIG_PATH: MISSING_MODAL_CONFIG_PATH }, () => {
+      assert.deepEqual(detectModalCredentials(), { kind: "environment" });
+      assert.deepEqual(credentialIssues(getComputeBackendConfigurationIssues(settings, "modal")), []);
+      assert.equal(getComputeBackendCredentialState("modal").detail, "Found MODAL_TOKEN_ID, MODAL_TOKEN_SECRET in the environment.");
+    });
+
+    // Per-key resolution like the client: an environment override for one key completes a
+    // profile that holds only the other.
+    writeFileSync(profilePath, `[default]\ntoken_secret = "${PROFILE_SECRET}"\n`);
+    await withEnv({ ...noEnv, MODAL_TOKEN_ID: "ak-FAKEENVID0123456789ABC", MODAL_CONFIG_PATH: profilePath }, () => {
+      assert.equal(detectModalCredentials().kind, "profile");
+    });
+    await withEnv({ ...noEnv, MODAL_CONFIG_PATH: profilePath }, () => {
+      const source = detectModalCredentials();
+      assert.equal(source.kind, "missing");
+      assert.equal(source.detail, 'profile "default" has no token_id');
+    });
+
+    // 3. Profile selection: MODAL_PROFILE, else the table marked active, else default.
+    writeFileSync(profilePath, [
+      "[default]",
+      'loglevel = "DEBUG"',
+      "",
+      "[work] # activated with `modal profile activate work`",
+      `token_id = '${PROFILE_ID}'`,
+      `token_secret = "${PROFILE_SECRET}" # trailing comment`,
+      "active = true",
+      "logs_timeout = 10",
+      "",
+    ].join("\n"));
+    await withEnv({ ...noEnv, MODAL_CONFIG_PATH: profilePath }, () => {
+      assert.deepEqual(detectModalCredentials(), { kind: "profile", path: profilePath, profile: "work" });
+    });
+    await withEnv({ ...noEnv, MODAL_CONFIG_PATH: profilePath, MODAL_PROFILE: "default" }, () => {
+      const source = detectModalCredentials();
+      assert.equal(source.kind, "missing");
+      assert.equal(source.detail, 'profile "default" has no token_id and token_secret');
+      assertNoTokenValue(describeModalCredentialSource(source));
+    });
+    await withEnv({ ...noEnv, MODAL_CONFIG_PATH: profilePath, MODAL_PROFILE: "staging" }, () => {
+      const source = detectModalCredentials();
+      assert.equal(source.kind, "missing");
+      assert.equal(source.detail, 'the file has no "staging" profile');
+    });
+
+    // 4. A malformed profile with a planted credential on the bad line: the error carries the
+    //    path, the line number, and the code only, and the healthcheck never reaches the CLI.
+    writeFileSync(profilePath, `[default]\ntoken_id = "${PROFILE_ID}"\ntoken_secret = ${PLANTED}\n`);
+    await withEnv({ ...noEnv, MODAL_CONFIG_PATH: profilePath }, async () => {
+      const source = detectModalCredentials();
+      assert.equal(source.kind, "invalid");
+      assert.equal(source.message, `Unable to parse Modal config file: invalid TOML in ${profilePath} at line 3 (INVALID_TOML)`);
+      const issues = credentialIssues(getComputeBackendConfigurationIssues(settings, "modal"));
+      assert.equal(issues.length, 1);
+      assert.match(
+        issues[0],
+        /^Unable to parse Modal config file: invalid TOML in .*\.modal\.toml at line 3 \(INVALID_TOML\)\. Fix the file or set MODAL_TOKEN_ID and MODAL_TOKEN_SECRET in the environment\.$/,
+      );
+      assertNoTokenValue(issues[0]);
+      assertNoTokenValue(getComputeBackendCredentialState("modal").detail);
+      const { runner, calls } = versionRunner();
+      const backend = createModalBackend({ runner });
+      await assert.rejects(() => backend.healthcheck(), (error) => {
+        assert.ok(error instanceof ExecutionBackendError);
+        assert.match(error.message, /invalid TOML in .* at line 3 \(INVALID_TOML\)/);
+        assertNoTokenValue(error.message);
+        return true;
+      });
+      assert.equal(calls.length, 0);
+    });
+
+    // Other malformed shapes: a bare line carrying tokens, a duplicate table, a broken header, a duplicate key.
+    for (const [text, line, code] of [
+      [`[default]\n${PLANTED} ${PROFILE_SECRET}\n`, 2, "INVALID_TOML"],
+      [`[default]\ntoken_id = "${PROFILE_ID}"\n[default]\ntoken_secret = "${PROFILE_SECRET}"\n`, 3, "DUPLICATE_KEY"],
+      [`[default\ntoken_id = "${PROFILE_ID}"\n`, 1, "INVALID_TOML"],
+      [`[default]\ntoken_id = "${PROFILE_ID}"\ntoken_id = "${PLANTED}"\n`, 3, "DUPLICATE_KEY"],
+    ]) {
+      assert.throws(() => parseModalProfileText(text, profilePath), (error) => {
+        assert.equal(error.name, "ConfigFileError");
+        assert.equal(error.message, `Unable to parse Modal config file: invalid TOML in ${profilePath} at line ${line} (${code})`);
+        assertNoTokenValue(error.message);
+        return true;
+      });
+    }
+
+    // The parser keeps presence only; no token value is held on the parsed result.
+    const parsed = parseModalProfileText(`[default]\ntoken_id = "${PROFILE_ID}"\ntoken_secret = "${PROFILE_SECRET}"\n`, profilePath);
+    assert.deepEqual([...parsed.profiles.get("default").credentials].sort(), ["token_id", "token_secret"]);
+    assertNoTokenValue(JSON.stringify([...parsed.profiles.entries()].map(([name, table]) => [name, [...table.credentials], table.active])));
+
+    // 5. A read failure other than ENOENT follows the loader standard: path and errno code, no filesystem wording.
+    const directoryPath = join(home, "profile-dir");
+    mkdirSync(directoryPath);
+    await withEnv({ ...noEnv, MODAL_CONFIG_PATH: directoryPath }, () => {
+      const source = detectModalCredentials();
+      assert.equal(source.kind, "invalid");
+      assert.equal(source.message, `Unable to read Modal config file ${directoryPath} (EISDIR)`);
+      const issues = credentialIssues(getComputeBackendConfigurationIssues(settings, "modal"));
+      assert.match(issues[0], /^Unable to read Modal config file .* \(EISDIR\)\. Fix the file or set MODAL_TOKEN_ID/);
+    });
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
 });
