@@ -20,23 +20,7 @@ import {
   yamlErrorCode,
   yamlErrorPosition,
 } from "../dist/extensions/grc-tools/hardening/config-file.js";
-
-/**
- * Credential-shaped values planted on the malformed line of each fixture (coordinator addendum 6b).
- * Alphanumeric only, so no window of one can sit inside a temp path, and distinct in every
- * 8-character window, so the fragment assertion cannot pass by accident: a shared prefix would let
- * one canary's absence mask another's leak.
- */
-const CANARY = Object.freeze({
-  yamlNestedKey: "Kq7Zx2Vw9Lm4Tp8R",
-  yamlNestedBearer: "Hb3Ny6Qc1Fd5Js0W",
-  yamlAlias: "Rt4Ug8Ex2Vo6Zk1M",
-  yamlTag: "Zt8Kp3Wn6Rq1Yc4V",
-  jsonUnquoted: "Wp9Ha3Ze7Kc2Ru5Y",
-  jsonShort: "Lz3v8Qw2Xn",
-  jsonTrailingComma: "Qm6Bd2Ty9Vf4Xs1P",
-  lockedFile: "Gx5Jc9Wq3Ln7Ez2T",
-});
+import { CONFIG_CANARY as CANARY, assertCanaryFixture, assertNoFragment, carriesFragment } from "./helpers/hardening-canaries.mjs";
 
 /** The parser and filesystem wording the batch 2 canary report saw in agent-visible output. */
 const LIBRARY_WORDING = Object.freeze([
@@ -49,21 +33,10 @@ const LIBRARY_WORDING = Object.freeze([
   "no such file",
 ]);
 
-const FRAGMENT_LENGTH = 8;
 const RUNNING_AS_ROOT = typeof process.getuid === "function" && process.getuid() === 0;
 
 function tempBase() {
   return mkdtempSync(join(tmpdir(), "hardening-config-"));
-}
-
-function windows(value, size = FRAGMENT_LENGTH) {
-  const out = [];
-  for (let index = 0; index + size <= value.length; index += 1) out.push(value.slice(index, index + size));
-  return out;
-}
-
-function carriesFragment(text, canary) {
-  return windows(canary).some((fragment) => text.includes(fragment));
 }
 
 function capture(fn) {
@@ -75,15 +48,17 @@ function capture(fn) {
   return assert.fail("expected the call to throw");
 }
 
-/** Positive control: the library's own message quotes the planted value (or the window the library quotes of it). */
+/** Positive control: the library's own message quotes the planted value (or the 8-character window the library quotes of it). */
 function assertLibraryMessageCarries(message, canary, label) {
   assert.ok(carriesFragment(message, canary), `${label}: positive control failed, the library message does not quote the canary: ${message}`);
 }
 
 /**
  * The fixed-text contract: a `ConfigFileError` whose fields are the validated values and whose
- * message carries the path, the code, and the line where the parser gave one, and carries neither a
- * canary, nor any 8-character fragment of one, nor library wording.
+ * message carries the path, the code, and the line where the parser gave one, and carries neither
+ * any 6- to 24-character substring of a canary (so a partial echo such as the `JSON.parse` window
+ * cannot pass), nor library wording. The message and the whole error object are both checked, so a
+ * canary cannot hide in a field either.
  */
 function assertFixedTextError(error, expected, canaries, label) {
   assert.ok(error instanceof ConfigFileError, `${label}: expected ConfigFileError, got ${error?.constructor?.name}: ${error?.message}`);
@@ -97,10 +72,8 @@ function assertFixedTextError(error, expected, canaries, label) {
   assert.equal(error.column, expected.column);
   const { message } = error;
   for (const canary of canaries) {
-    assert.ok(!message.includes(canary), `${label}: canary ${canary} leaked into "${message}"`);
-    for (const fragment of windows(canary)) {
-      assert.ok(!message.includes(fragment), `${label}: fragment ${fragment} of ${canary} leaked into "${message}"`);
-    }
+    assertNoFragment(message, canary, { label: `${label} message` });
+    assertNoFragment({ ...error, message, name: error.name, stack: error.stack }, canary, { label: `${label} error object` });
   }
   for (const wording of LIBRARY_WORDING) {
     assert.ok(!message.includes(wording), `${label}: library wording "${wording}" leaked into "${message}"`);
@@ -114,10 +87,12 @@ function assertFixedTextError(error, expected, canaries, label) {
   return message;
 }
 
-test("config-file canaries are alphanumeric and distinct in every 8-character window", () => {
-  const fragments = Object.values(CANARY).flatMap((canary) => windows(canary));
-  assert.equal(new Set(fragments).size, fragments.length, "two canaries share an 8-character window");
-  for (const canary of Object.values(CANARY)) assert.match(canary, /^[A-Za-z0-9]{10,}$/);
+test("canary fixture: alphanumeric, distinct in every 8-character window, no 6-character window inside a legitimate value", () => {
+  assertCanaryFixture();
+  assert.equal(carriesFragment(`x ${CANARY.jsonShort.slice(0, 8)} y`, CANARY.jsonShort), true, "the positive-control helper sees an 8-character window");
+  assert.throws(() => assertNoFragment(`quoted "${CANARY.jsonUnquoted.slice(0, 10)}"`, CANARY.jsonUnquoted), /fragment .* leaked/, "a 10-character echo is a leak");
+  assert.throws(() => assertNoFragment(CANARY.jsonUnquoted.slice(5, 11), CANARY.jsonUnquoted), /fragment .* leaked/, "a 6-character echo is a leak");
+  assert.doesNotThrow(() => assertNoFragment(CANARY.jsonUnquoted.slice(0, 5), CANARY.jsonUnquoted), "5 characters are below the window floor");
 });
 
 test("YAML nested mapping: yaml quotes the line; ConfigFileError carries the path, line, column, and parser code only", () => {
