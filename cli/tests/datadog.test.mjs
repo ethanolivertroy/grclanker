@@ -1031,7 +1031,7 @@ test("DD-02 treats SAML strict mode without native MFA as manual with IdP eviden
   }), { now: NOW });
   const mfa = findingById(strict, "DD-02");
   assert.equal(mfa.status, "manual");
-  assert.match(mfa.summary, /1\/2 active users lack Datadog-native MFA/);
+  assert.match(mfa.summary, /1\/2 active human users lack Datadog-native MFA/);
   assert.match(mfa.summary, /does not expose whether the identity provider enforces a second factor/);
   assert.match(mfa.summary, /Okta authentication policy or Entra ID conditional access policy/);
   assert.equal(mfa.evidence.saml_strict_mode, true);
@@ -1160,10 +1160,19 @@ test("identity findings flag truncated user and role inventories instead of pass
     assert.equal(item.status, "warn", `${id} should warn on a truncated inventory`);
     assert.match(item.summary, /inventory is truncated at (50|10) items \((50|10) of an unknown total loaded; raise (user_limit|role_limit)\)/);
   }
-  assert.equal(findingById(result, "DD-02").evidence.users_inventory_truncated, true);
-  assert.equal(findingById(result, "DD-02").evidence.active_human_users, 50);
+  // Population counts derived from a truncated inventory render null; only the number of records read is stated.
+  const mfa = findingById(result, "DD-02");
+  assert.equal(mfa.evidence.users_inventory_truncated, true);
+  assert.equal(mfa.evidence.users_returned, 50);
+  assert.equal(mfa.evidence.active_human_users, null);
+  assert.equal(mfa.evidence.users_without_native_mfa, null);
+  assert.equal(mfa.evidence.users_without_native_mfa_sample, null);
+  assert.deepEqual([mfa.evidence.inventory.read, mfa.evidence.inventory.complete, mfa.evidence.inventory.seen, mfa.evidence.inventory.total], [true, false, 50, null]);
   assert.equal(findingById(result, "DD-03").evidence.roles_inventory_truncated, true);
-  assert.equal(result.summary.users, 50);
+  assert.equal(result.summary.users, null);
+  assert.equal(result.summary.users_seen, 50);
+  assert.equal(result.summary.users_complete, false);
+  assert.equal(result.summary.roles, null);
   assert.ok(result.errors.some((error) => /users: inventory truncated at 50 items/.test(error)));
   assert.ok(result.errors.some((error) => /roles: inventory truncated at 10 items/.test(error)));
 });
@@ -1348,13 +1357,28 @@ test("access control findings flag truncated key and shared dashboard inventorie
     assert.equal(item.status, "warn", `${id} should warn on a truncated inventory`);
     assert.match(item.summary, /inventory is truncated at 20 items \(20 of an unknown total loaded; raise key_limit\)/);
   }
-  assert.equal(findingById(result, "DD-05").evidence.api_keys_inventory_truncated, true);
-  assert.equal(findingById(result, "DD-06").evidence.application_keys_inventory_truncated, true);
+  const apiKeys = findingById(result, "DD-05");
+  assert.equal(apiKeys.evidence.api_keys_inventory_truncated, true);
+  assert.equal(apiKeys.evidence.keys_returned, 20);
+  assert.equal(apiKeys.evidence.api_keys, null);
+  assert.equal(apiKeys.evidence.keys_older_than_rotation_window, null);
+  const appKeys = findingById(result, "DD-06");
+  assert.equal(appKeys.evidence.application_keys_inventory_truncated, true);
+  assert.equal(appKeys.evidence.application_keys, null);
+  assert.equal(appKeys.evidence.orphaned_keys, null);
   const sharing = findingById(result, "DD-14");
   assert.equal(sharing.status, "warn");
+  assert.match(sharing.summary, /^an uncounted number of dashboards read are shared through public links/);
   assert.equal(sharing.evidence.shared_dashboards_inventory_truncated, true);
-  assert.equal(sharing.evidence.shared_dashboards, 2000);
-  assert.deepEqual(sharing.evidence.verdict_caveats, ["shared_dashboards inventory is truncated at 2000 items (2000 of an unknown total loaded; raise the dashboard limit), so the verdict covers a partial view."]);
+  // Counts and dashboard titles derived from the truncated list are unknown; only the records read are counted.
+  assert.equal(sharing.evidence.shared_dashboards, null);
+  assert.equal(sharing.evidence.shared_dashboards_seen, 2000);
+  assert.equal(sharing.evidence.shared_dashboard_titles, null);
+  assert.deepEqual(sharing.evidence.verdict_caveats, ["shared_dashboards inventory is truncated at 2000 items (2000 of an unknown total loaded; raise the dashboard limit), so the verdict covers a partial view and violators from it are neither counted nor named."]);
+  assert.equal(result.summary.api_keys, null);
+  assert.equal(result.summary.api_keys_seen, 20);
+  assert.equal(result.summary.shared_dashboards, null);
+  assert.equal(result.summary.shared_dashboards_seen, 2000);
   assert.ok(result.errors.some((error) => /shared_dashboards: inventory truncated at 2000 items/.test(error)));
 });
 
@@ -1553,14 +1577,36 @@ test("security monitoring findings flag truncated rule, signal, and monitor inve
     assert.equal(item.status, "warn", `${id} should warn on a truncated inventory`);
     assert.match(item.summary, new RegExp(`inventory is truncated at ${limit} items \\(${limit} of an unknown total loaded; raise ${argument}\\)`));
   }
-  assert.equal(findingById(result, "DD-08").evidence.rules_inventory_truncated, true);
+  // Population counts and the names of rules or monitors derived from a truncated list are unknown; the `_read`
+  // counts describe the records that were read.
+  const rules = findingById(result, "DD-08");
+  assert.equal(rules.evidence.rules_inventory_truncated, true);
+  assert.equal(rules.evidence.rules_returned, 40);
+  assert.equal(rules.evidence.total_rules, null);
+  assert.equal(rules.evidence.enabled_detection_rules, null);
+  assert.equal(rules.evidence.enabled_detection_rules_read, 20);
+  assert.equal(rules.evidence.disabled_default_rule_sample, null);
+  assert.equal(rules.evidence.critical_category_coverage, null);
   assert.equal(findingById(result, "DD-12").evidence.rules_inventory_truncated, true);
-  assert.equal(findingById(result, "DD-17").evidence.monitors_inventory_truncated, true);
+  assert.equal(findingById(result, "DD-12").evidence.cloud_configuration_rules, null);
+  assert.equal(findingById(result, "DD-13").evidence.coverage, null);
+  const monitors = findingById(result, "DD-17");
+  assert.equal(monitors.evidence.monitors_inventory_truncated, true);
+  assert.equal(monitors.evidence.monitors, null);
+  assert.equal(monitors.evidence.monitors_returned, 30);
+  assert.equal(monitors.evidence.security_monitors_without_notifications, null);
   const signals = findingById(result, "DD-09");
   assert.equal(signals.status, "warn");
   assert.equal(signals.evidence.signals_inventory_truncated, true);
-  assert.equal(signals.evidence.unresolved_high_or_critical_signals, 0);
+  assert.equal(signals.evidence.unresolved_high_or_critical_signals, null);
+  assert.equal(signals.evidence.unresolved_high_or_critical_signals_read, 0);
+  assert.equal(signals.evidence.overdue_signal_sample, null);
   assert.match(signals.summary, /truncated list of 10 items that were all archived/);
+  assert.equal(result.summary.rules, null);
+  assert.equal(result.summary.rules_seen, 40);
+  assert.equal(result.summary.monitors, null);
+  assert.equal(result.summary.monitors_seen, 30);
+  assert.equal(result.summary.unresolved_high_or_critical_signals, null);
 
   const openSignals = await assessDatadogSecurityMonitoring(healthyClient({
     async listSecuritySignals(options = {}) {
@@ -1573,7 +1619,9 @@ test("security monitoring findings flag truncated rule, signal, and monitor inve
   }), { now: NOW, signalLimit: 5 });
   const open = findingById(openSignals, "DD-09");
   assert.equal(open.status, "warn");
-  assert.equal(open.evidence.signals_without_timestamp, 1);
+  assert.equal(open.evidence.signals_without_timestamp, null);
+  assert.equal(open.evidence.signals_without_timestamp_sample, null);
+  assert.match(open.summary, /^an uncounted number of unresolved high or critical signals read are open within/);
   assert.match(open.summary, /1 signals have no timestamp and could not be aged/);
   assert.match(open.summary, /truncated at 5 items \(raise signal_limit\)/);
 });
@@ -1687,7 +1735,12 @@ test("DD-20 warns on indexes without a retention value and flags truncated org c
   const connections = findingById(truncated, "DD-20");
   assert.equal(connections.status, "warn");
   assert.equal(connections.evidence.org_connections_inventory_truncated, true);
-  assert.equal(connections.evidence.org_connections, 10000);
+  // The population count and the sink org ids come from a truncated list, so they are unknown; only the read count is stated.
+  assert.equal(connections.evidence.org_connections, null);
+  assert.equal(connections.evidence.org_connections_seen, 10000);
+  assert.equal(connections.evidence.org_connection_sample, null);
+  assert.match(connections.summary, /an uncounted number of cross-org connections read share data with other orgs/);
+  assert.equal(truncated.summary.org_connections, null);
   assert.match(connections.evidence.verdict_caveats[0], /org_connections inventory is truncated at 10000 items/);
   assert.ok(truncated.errors.some((error) => /org_connections: inventory truncated at 10000 items/.test(error)));
 });
@@ -1932,7 +1985,7 @@ const DATADOG_MULTI_INVENTORY_CASES = [
   // DD-02 reads users (primary) plus the organization's SAML strict-mode setting; native MFA still judges the users.
   { control: "DD-02", area: "identity", label: "organization settings", errorPrefix: "organization:", failure: { method: "getOrganization", path: "/api/v1/org" }, status: "warn", names: /All 2 active human users have Datadog MFA enabled.*Unreadable inventory: organization settings \(GET \/api\/v1\/org, org_management: .*403 Forbidden.*\), so whether SAML strict mode disables password login for the users below was not checked\. Collect manually: Organization Settings > Login Methods/ },
   // DD-03 reads roles (primary) plus each custom role's permission list.
-  { control: "DD-03", area: "identity", label: "role_permissions", errorPrefix: "role_permissions(Auditor):", failure: { method: "listRolePermissions", path: "/api/v2/roles/role-auditor/permissions" }, status: "manual", names: /1\/1 custom roles could not have their permissions read.*Unreadable inventory: role_permissions \(GET \/api\/v2\/roles\/\{id\}\/permissions, user_access_read: Auditor: .*403 Forbidden.*\), so admin-equivalent grants in 1 custom roles could not be ruled out\. Collect manually: the permission list of each custom role/ },
+  { control: "DD-03", area: "identity", label: "role_permissions", errorPrefix: "role_permissions(Auditor):", failure: { method: "listRolePermissions", path: "/api/v2/roles/role-auditor/permissions" }, status: "manual", names: /1\/1 custom roles could not have their permissions read.*Unreadable inventory: role_permissions \(GET \/api\/v2\/roles\/role-auditor\/permissions, user_access_read: Auditor: .*403 Forbidden.*\), so admin-equivalent grants in 1 custom roles could not be ruled out\. Collect manually: the permission list of each custom role/ },
   // DD-19 reads users (primary) plus application keys for rotation; naming and interactive logins still judge the users.
   { control: "DD-19", area: "identity", label: "application_keys", errorPrefix: "application_keys:", failure: { method: "listApplicationKeys", path: "/api/v2/application_keys" }, status: "warn", names: /1 service accounts follow the naming convention and have no interactive logins\. Unreadable inventory: application_keys \(GET \/api\/v2\/application_keys, org_app_keys_read: .*403 Forbidden.*\), so whether the application keys owned by these service accounts were rotated within 90 days was not checked\. Collect manually: Organization Settings > Application Keys/ },
   // DD-14 reads organization settings plus shared dashboards; both are essential.
@@ -2340,7 +2393,8 @@ test("DatadogApiClient withholds non-JSON error bodies, caps JSON error detail, 
   await assert.rejects(() => htmlDenied.listUsers(1), (error) => {
     assert.ok(error instanceof DatadogApiError);
     assert.doesNotMatch(error.message, /SECRET-IN-HTML-FAKE/);
-    assert.match(error.message, /non-JSON text\/html response body \(\d+ characters\) withheld/);
+    // The body is replaced with a status-and-length note rather than sliced into the message.
+    assert.match(error.message, /403 Forbidden: non-JSON body \(text\/html, \d+ bytes, not echoed\)/);
     return true;
   });
 
@@ -2357,7 +2411,7 @@ test("DatadogApiClient withholds non-JSON error bodies, caps JSON error detail, 
   const emptyJson = new DatadogApiClient(sampleConfig({ maxRetries: 0 }), {
     fetchImpl: async () => jsonResponse({ unexpected: "shape" }, { status: 400 }),
   });
-  await assert.rejects(() => emptyJson.listUsers(1), /JSON error body without a message \(\d+ characters\)/);
+  await assert.rejects(() => emptyJson.listUsers(1), /Datadog request failed \(400\) GET \/api\/v2\/users: 400: JSON body without a documented error field \(application\/json, \d+ bytes, not echoed\)/);
 
   const resolved = resolveDatadogConfiguration(
     { api_key: "arg-api-key-0123456789", app_key: "arg-app-key-0123456789", base_url: "https://svc:hunter2@api.datadoghq.eu/?token=abc#frag" },
@@ -2617,17 +2671,21 @@ test("exportDatadogAuditBundle writes collection_status.json with readable, comp
   }), sampleConfig(), base, { now: NOW, userLimit: 50 });
 
   const status = JSON.parse(readFileSync(join(result.outputDir, "core_data", "collection_status.json"), "utf8"));
-  const byInventory = new Map(status.map((row) => [row.inventory, row]));
+  const byInventory = new Map(status.inventories.map((row) => [row.inventory, row]));
   assert.equal(byInventory.size, 23);
-  assert.ok([...byInventory.values()].every((row) => typeof row.readable === "boolean" && typeof row.complete === "boolean" && row.endpoint && row.permission));
+  assert.ok([...byInventory.values()].every((row) => typeof row.readable === "boolean" && row.collected === row.readable && row.endpoint && row.permission));
+  // Flags are booleans only for inventories that were read; a denied inventory renders them null.
+  assert.ok([...byInventory.values()].every((row) => (row.readable ? typeof row.complete === "boolean" && typeof row.truncated === "boolean" : row.complete === null && row.truncated === null)));
 
   const users = byInventory.get("users");
+  assert.equal(users.status, "readable");
   assert.equal(users.readable, true);
   assert.equal(users.complete, false);
   assert.equal(users.truncated, true);
   assert.equal(users.seen, 50);
   assert.equal(users.total, null);
   assert.equal(users.limit, 50);
+  assert.equal(users.http_status, null);
   assert.match(users.truncation_reason, /more than 50 items exist/);
 
   const connections = byInventory.get("org_connections");
@@ -2636,9 +2694,21 @@ test("exportDatadogAuditBundle writes collection_status.json with readable, comp
   assert.equal(connections.total, 12000);
 
   const allowlist = byInventory.get("ip_allowlist");
+  assert.equal(allowlist.status, "forbidden");
+  assert.equal(allowlist.collected, false);
   assert.equal(allowlist.readable, false);
-  assert.equal(allowlist.complete, false);
+  assert.equal(allowlist.http_status, 403);
+  assert.deepEqual([allowlist.complete, allowlist.truncated, allowlist.seen, allowlist.total, allowlist.truncation_reason], [null, null, null, null, null]);
   assert.match(allowlist.error, /403 Forbidden/);
+
+  // Totals count only what was observed: the denied inventory is neither complete nor truncated.
+  assert.equal(status.totals.inventories, 23);
+  assert.equal(status.totals.readable, 22);
+  assert.equal(status.totals.forbidden, 1);
+  assert.equal(status.totals.not_readable, 0);
+  assert.equal(status.totals.truncated, 3);
+  assert.equal(status.totals.complete, 19);
+  assert.equal(status.totals.truncation_unknown, 1);
 
   const failing = byInventory.get("posture_findings_fail");
   assert.equal(failing.complete, false);

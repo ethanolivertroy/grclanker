@@ -1080,12 +1080,17 @@ function datadogErrorSummary(payload: unknown): string | undefined {
  * Describes a body that is not Datadog's documented JSON error shape by status, content type, and length instead of
  * echoing it, so HTML or proxy pages (which can carry bearer, session, and key values) never reach an error string.
  */
+/** "403 Forbidden" or just "403" when the response carried no status text. */
+function statusLine(response: Response): string {
+  return response.statusText ? `${response.status} ${response.statusText}` : String(response.status);
+}
+
 function describeOpaqueBody(response: Response, rawText: string, parsedJson: boolean): string {
   const contentType = (response.headers.get("content-type") ?? "").split(";")[0].trim() || "untyped";
   const size = `${contentType}, ${Buffer.byteLength(rawText, "utf8")} bytes, not echoed`;
   return parsedJson
-    ? `${response.status} ${response.statusText}: JSON body without a documented error field (${size})`
-    : `${response.status} ${response.statusText}: non-JSON body (${size})`;
+    ? `${statusLine(response)}: JSON body without a documented error field (${size})`
+    : `${statusLine(response)}: non-JSON body (${size})`;
 }
 
 function defaultSleep(ms: number): Promise<void> {
@@ -1202,7 +1207,7 @@ export class DatadogApiClient {
           ? ""
           : (parsedJson ? datadogErrorSummary(payload) : undefined) ?? describeOpaqueBody(response, rawText, parsedJson);
         throw new DatadogApiError(
-          this.redact(`Datadog request failed (${response.status} ${response.statusText}) ${method} ${path}${detail ? `: ${detail}` : ""}`),
+          this.redact(`Datadog request failed (${statusLine(response)}) ${method} ${path}${detail ? `: ${detail}` : ""}`),
           response.status,
           path,
         );
