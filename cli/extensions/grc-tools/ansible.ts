@@ -997,18 +997,81 @@ export function redactVariables(value: unknown): unknown {
 }
 
 /**
- * Projects the documented fields of a record. A body that parsed to a primitive or an array is not the
- * documented object: it projects to nothing rather than reaching the `in` operator, whose TypeError
- * message would quote the value.
+ * The documented type of a projected field, or a projector that returns the value to keep (undefined to drop
+ * it). `scalar` accepts a string, number, boolean, or null; every kind accepts null, the API's rendering of an
+ * unset field.
  */
-function pick(item: unknown, keys: readonly string[]): JsonRecord {
+type FieldKind = "scalar" | "string" | "number" | "boolean";
+type FieldRule = FieldKind | ((value: unknown) => unknown);
+type FieldSpec = Readonly<Record<string, FieldRule>>;
+
+function isScalar(value: unknown): value is string | number | boolean | null {
+  return value === null || typeof value === "string" || typeof value === "number" || typeof value === "boolean";
+}
+
+function hasFieldKind(value: unknown, kind: FieldKind): boolean {
+  switch (kind) {
+    case "scalar":
+      return isScalar(value);
+    case "string":
+      return typeof value === "string";
+    case "number":
+      return typeof value === "number" && Number.isFinite(value);
+    case "boolean":
+      return typeof value === "boolean";
+    default: {
+      const exhaustive: never = kind;
+      throw new Error(`unhandled field kind ${String(exhaustive)}`);
+    }
+  }
+}
+
+/** A list whose entries are strings; entries of any other type are dropped. */
+function stringList(value: unknown): string[] | undefined {
+  return Array.isArray(value) ? value.filter((entry): entry is string => typeof entry === "string") : undefined;
+}
+
+/** An object whose values are scalars (an environment map); nested values are dropped. */
+function scalarMap(value: unknown): JsonRecord | undefined {
+  const object = asObject(value);
+  return object ? Object.fromEntries(Object.entries(object).filter(([, entry]) => isScalar(entry))) : undefined;
+}
+
+/** A list of records projected one by one; entries that are not objects are dropped. */
+function listOf(spec: FieldSpec): (value: unknown) => JsonRecord[] | undefined {
+  return (value) => (Array.isArray(value) ? value.filter((entry) => asObject(entry) !== undefined).map((entry) => pickTyped(entry, spec)) : undefined);
+}
+
+/**
+ * Projects the documented fields of a record in their documented types. A body that parsed to a primitive or
+ * an array is not the documented object: it projects to nothing rather than reaching the `in` operator, whose
+ * TypeError message would quote the value. A documented key whose value is not of its documented type (a
+ * nested object or array where a scalar is documented, a string where a number is) is dropped rather than
+ * copied verbatim, so an undocumented shape under a documented key never travels into the access check, a
+ * finding, or the bundle (round 4 item E).
+ */
+function pickTyped(item: unknown, spec: FieldSpec): JsonRecord {
   const projected: JsonRecord = {};
   const object = asObject(item);
   if (!object) return projected;
-  for (const key of keys) {
-    if (key in object) projected[key] = object[key];
+  for (const [key, rule] of Object.entries(spec)) {
+    if (!(key in object)) continue;
+    const value = object[key];
+    if (value === null) {
+      projected[key] = null;
+    } else if (typeof rule === "function") {
+      const kept = rule(value);
+      if (kept !== undefined) projected[key] = kept;
+    } else if (hasFieldKind(value, rule)) {
+      projected[key] = value;
+    }
   }
   return projected;
+}
+
+/** Projects the documented fields of a record, each of which is a scalar (an id, a name, a flag, a timestamp, or null). */
+function pick(item: unknown, keys: readonly string[]): JsonRecord {
+  return pickTyped(item, Object.fromEntries(keys.map((key) => [key, "scalar" as const])));
 }
 
 function redactField(item: JsonRecord, key: string, redact: (value: unknown) => unknown = redactedOr): JsonRecord {
@@ -1029,8 +1092,10 @@ function pickSummaryList(item: JsonRecord, field: string, keys: readonly string[
     .map((entry) => pick(entry, keys));
 }
 
-const USER_FIELDS = ["id", "username", "is_superuser", "is_system_auditor", "external_account", "last_login", "created", "modified"];
-const PING_FIELDS = ["version", "active_node", "ha", "instances", "instance_groups"];
+const USER_FIELDS: FieldSpec = Object.freeze({ id: "number", username: "string", is_superuser: "boolean", is_system_auditor: "boolean", external_account: "string", last_login: "string", created: "string", modified: "string" });
+const PING_INSTANCE_FIELDS: FieldSpec = Object.freeze({ node: "string", node_type: "string", uuid: "string", heartbeat: "string", capacity: "number", version: "string" });
+const PING_INSTANCE_GROUP_FIELDS: FieldSpec = Object.freeze({ name: "string", capacity: "number", instances: stringList });
+const PING_FIELDS: FieldSpec = Object.freeze({ version: "string", active_node: "string", ha: "boolean", instances: listOf(PING_INSTANCE_FIELDS), instance_groups: listOf(PING_INSTANCE_GROUP_FIELDS) });
 const JOB_FIELDS = ["id", "type", "name", "status", "failed", "launch_type", "started", "finished", "elapsed", "job_template", "unified_job_template", "inventory", "project", "playbook", "created"];
 const TEMPLATE_FIELDS = ["id", "type", "name", "description", "playbook", "project", "inventory", "status", "last_job_run", "last_job_failed", "execution_environment", "survey_enabled", "ask_variables_on_launch", "ask_credential_on_launch", "ask_execution_environment_on_launch", "created", "modified"];
 const SCHEDULE_FIELDS = ["id", "name", "unified_job_template", "enabled", "rrule", "next_run", "dtstart", "dtend", "created", "modified"];
@@ -1051,11 +1116,12 @@ const INSTANCE_GROUP_FIELDS = ["id", "name", "max_concurrent_jobs", "max_forks",
 const JOB_HOST_SUMMARY_FIELDS = ["id", "job", "host", "host_name", "failed", "changed", "ok", "failures", "skipped", "unreachable", "created"];
 const EXECUTION_ENVIRONMENT_FIELDS = ["id", "name", "description", "image", "pull", "organization", "credential", "managed", "created", "modified"];
 const SURVEY_QUESTION_FIELDS = ["variable", "type", "required", "question_name", "min", "max"];
-const JOB_SETTING_KEYS = ["SCHEDULE_MAX_JOBS", "MAX_FORKS", "DEFAULT_JOB_TIMEOUT", "DEFAULT_INVENTORY_UPDATE_TIMEOUT", "DEFAULT_PROJECT_UPDATE_TIMEOUT", "AD_HOC_COMMANDS", "AWX_TASK_ENV", "GALAXY_TASK_ENV"];
+const JOB_SETTING_FIELDS: FieldSpec = Object.freeze({ SCHEDULE_MAX_JOBS: "number", MAX_FORKS: "number", DEFAULT_JOB_TIMEOUT: "number", DEFAULT_INVENTORY_UPDATE_TIMEOUT: "number", DEFAULT_PROJECT_UPDATE_TIMEOUT: "number", AD_HOC_COMMANDS: stringList, AWX_TASK_ENV: scalarMap, GALAXY_TASK_ENV: scalarMap });
 const SUMMARY_CREDENTIAL_FIELDS = ["id", "name", "kind", "credential_type_id"];
 
+/** The documented user fields in their documented types; anything else under those keys is dropped. */
 export function projectUser(user: JsonRecord): JsonRecord {
-  return pick(user, USER_FIELDS);
+  return pickTyped(user, USER_FIELDS);
 }
 
 function projectJob(job: JsonRecord): JsonRecord {
@@ -1184,17 +1250,22 @@ function projectSurveySpec(spec: JsonRecord | undefined): JsonRecord | undefined
 }
 
 function projectJobSettings(settings: JsonRecord | undefined): JsonRecord | undefined {
-  return settings ? redactCredentialTree(pick(settings, JOB_SETTING_KEYS)) as JsonRecord : settings;
+  return settings ? redactCredentialTree(pickTyped(settings, JOB_SETTING_FIELDS)) as JsonRecord : settings;
 }
 
 function projectSettings(settings: JsonRecord | undefined): JsonRecord | undefined {
   return settings ? redactCredentialTree(settings) as JsonRecord : settings;
 }
 
-/** The ping document's documented fields; a body that is not a JSON object (a string, number, or array) is not a ping and is dropped. */
-function projectPing(ping: unknown): JsonRecord | undefined {
+/**
+ * The ping document's documented fields in their documented types (`version`, `active_node` strings, `ha` a
+ * boolean, `instances` and `instance_groups` lists of records projected the same way); a body that is not a
+ * JSON object (a string, number, or array) is not a ping and is dropped, and so is a nested value under one
+ * of those keys.
+ */
+export function projectPing(ping: unknown): JsonRecord | undefined {
   const object = asObject(ping);
-  return object ? pick(object, PING_FIELDS) : undefined;
+  return object ? pickTyped(object, PING_FIELDS) : undefined;
 }
 
 export class AnsibleAapClient {
@@ -1541,11 +1612,18 @@ export interface AnsibleScope {
   note?: string;
 }
 
-function currentUserFromMe(value: unknown): JsonRecord | undefined {
+/**
+ * The current user from a `/api/v2/me/` body: the first entry of `results` (AAP) or the object itself, projected
+ * to its documented fields in their documented types. A body without a string `username` or a numeric `id`
+ * after projection is not a recognizable user and yields none.
+ */
+export function currentUserFromMe(value: unknown): JsonRecord | undefined {
   const object = asObject(value);
   if (!object) return undefined;
-  if (Array.isArray(object.results)) return asObject(object.results[0]);
-  return object;
+  const candidate = Array.isArray(object.results) ? asObject(object.results[0]) : object;
+  if (!candidate) return undefined;
+  const user = projectUser(candidate);
+  return typeof user.username === "string" || typeof user.id === "number" ? user : undefined;
 }
 
 async function probeScope(client: AnsibleClientSurface): Promise<Snapshot<AnsibleScope>> {

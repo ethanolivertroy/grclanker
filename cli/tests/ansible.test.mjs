@@ -25,9 +25,12 @@ import {
   assessAnsiblePlatformSecurity,
   checkAnsibleAccess,
   createTlsOptOutFetch,
+  currentUserFromMe,
   exportAnsibleAuditBundle,
   findPlaintextSecrets,
   parseRruleInterval,
+  projectPing,
+  projectUser,
   redactCredentialTree,
   redactErrorText,
   redactVariables,
@@ -2267,6 +2270,70 @@ test("rule 9: a 200 answer whose body is a JSON string or array on /api/v2/ping/
     for (const [name, text] of files) assert.doesNotMatch(text, PRIMITIVE_BODY_WORDING, `${label}: no TypeError wording reaches bundle ${name}`);
     const accessFile = JSON.parse(files.get("core_data/access.json"));
     if (surface === "/api/v2/ping/") assert.equal(accessFile.ping, undefined, `${label}: access.json carries no ping`);
+    assert.ok(log.some((entry) => entry.path === surface && entry.status === 200), `${label}: the 200 answer was observed`);
+  }
+});
+
+const ANSIBLE_NESTED_SHORT_CANARY = "Wq4nTz8kBv2xRj6mPc7Ld";
+const ANSIBLE_NESTED_LONG_CANARY = "Hx9pLm3vQt7wZk2nRb5cYd8fJg4sNa6uEe1rTi0oKy3qXz7wVb5nMc8dLp2gHf4jSk6tUa9yWo1zPl3eRv7iBn5xCm8oDq2uFa3tGw6yJb9k";
+
+test("rule 9 (round 4 item E): a nested object or array under a documented ping or me key is not the documented value and is dropped, never copied verbatim; no 6-to-24-character window of it reaches the access check, an assessment, or the bundle, and a nested user is not a recognizable user", async () => {
+  assert.equal(ANSIBLE_NESTED_SHORT_CANARY.length, 21);
+  assert.ok(ANSIBLE_NESTED_LONG_CANARY.length > 100);
+  const canaries = [ANSIBLE_NESTED_SHORT_CANARY, ANSIBLE_NESTED_LONG_CANARY];
+
+  // The typed projections alone: documented keys keep only their documented types.
+  assert.deepEqual(
+    projectPing({ version: { nested: ANSIBLE_NESTED_SHORT_CANARY }, active_node: [ANSIBLE_NESTED_SHORT_CANARY], ha: { flag: ANSIBLE_NESTED_SHORT_CANARY }, instances: { count: ANSIBLE_NESTED_SHORT_CANARY }, results: { username: ANSIBLE_NESTED_SHORT_CANARY }, detail: { text: ANSIBLE_NESTED_SHORT_CANARY } }),
+    {},
+    "nested21: every documented key holds another shape and is dropped",
+  );
+  assert.deepEqual(
+    projectPing({ version: "4.6.0", active_node: "controller-1", ha: false, instances: [{ node: "controller-1", node_type: "hybrid", capacity: 61, heartbeat: { nested: ANSIBLE_NESTED_LONG_CANARY }, extra: ANSIBLE_NESTED_LONG_CANARY }, ANSIBLE_NESTED_LONG_CANARY], instance_groups: [{ name: "default", capacity: 61, instances: ["controller-1", { node: ANSIBLE_NESTED_LONG_CANARY }] }] }),
+    { version: "4.6.0", active_node: "controller-1", ha: false, instances: [{ node: "controller-1", node_type: "hybrid", capacity: 61 }], instance_groups: [{ name: "default", capacity: 61, instances: ["controller-1"] }] },
+    "a documented ping keeps its documented fields, list entries included, and drops the nested values beside them",
+  );
+  assert.deepEqual(projectPing({ version: "4.6.0", active_node: null, ha: true }), { version: "4.6.0", active_node: null, ha: true }, "null is the API's unset and is kept");
+  assert.deepEqual(projectUser({ id: "1", username: { nested: ANSIBLE_NESTED_LONG_CANARY }, is_superuser: "true", is_system_auditor: { flag: true }, email: { addr: ANSIBLE_NESTED_LONG_CANARY }, last_login: null }), { last_login: null }, "a user whose documented keys hold other types projects to nothing but its nulls");
+  assert.deepEqual(projectUser(SUPERUSER), SUPERUSER, "a documented user is unchanged");
+  assert.equal(currentUserFromMe({ count: 1, results: [{ username: { nested: ANSIBLE_NESTED_LONG_CANARY }, id: ANSIBLE_NESTED_LONG_CANARY, email: { addr: ANSIBLE_NESTED_LONG_CANARY } }] }), undefined, "nestedLong: no string username or numeric id, so no user");
+  assert.equal(currentUserFromMe({ version: { nested: ANSIBLE_NESTED_SHORT_CANARY }, results: { username: ANSIBLE_NESTED_SHORT_CANARY } }), undefined, "nested21: results is not a list, so no user");
+  assert.deepEqual(currentUserFromMe({ count: 1, results: [{ ...SUPERUSER, password: ANSIBLE_NESTED_LONG_CANARY, email: { addr: ANSIBLE_NESTED_LONG_CANARY } }] }), SUPERUSER, "a documented user projects to its documented fields");
+
+  const nested21 = { version: { nested: ANSIBLE_NESTED_SHORT_CANARY }, active_node: [ANSIBLE_NESTED_SHORT_CANARY], ha: { flag: ANSIBLE_NESTED_SHORT_CANARY }, instances: { count: ANSIBLE_NESTED_SHORT_CANARY }, results: { username: ANSIBLE_NESTED_SHORT_CANARY }, detail: { text: ANSIBLE_NESTED_SHORT_CANARY } };
+  const nestedLong = { version: { nested: ANSIBLE_NESTED_LONG_CANARY }, active_node: { node: ANSIBLE_NESTED_LONG_CANARY }, results: [{ username: { nested: ANSIBLE_NESTED_LONG_CANARY }, id: ANSIBLE_NESTED_LONG_CANARY, email: { addr: ANSIBLE_NESTED_LONG_CANARY } }], detail: [ANSIBLE_NESTED_LONG_CANARY] };
+  for (const [surface, bodyName, body] of [
+    ["/api/v2/ping/", "nested21", nested21],
+    ["/api/v2/ping/", "nestedLong", nestedLong],
+    ["/api/v2/me/", "nested21", nested21],
+    ["/api/v2/me/", "nestedLong", nestedLong],
+  ]) {
+    const label = `${surface} ${bodyName}`;
+    const log = [];
+    const client = aapClient({ ...healthyAapRoutes(), [surface]: () => aapResponse(JSON.stringify(body), 200, "OK", "application/json") }, log);
+    const run = await runEveryAnsibleTool(client, createTempBase("grclanker-ansible-nested-body-"));
+
+    assert.equal(run.accessError, undefined, `${label}: the access check completes`);
+    if (surface === "/api/v2/ping/") {
+      assert.deepEqual(run.access.ping, {}, `${label}: the ping projects to no documented field`);
+      assert.equal(run.access.status, "healthy", `${label}: the ping body does not change the verdict of the readable surfaces`);
+    } else {
+      assert.equal(run.access.currentUser, undefined, `${label}: a nested user is not a recognizable user`);
+      assert.ok(run.access.notes.includes("Authentication succeeded but /api/v2/me/ did not return a recognizable user."), `${label}: the access check says the user was not recognizable`);
+      assert.equal(run.access.status, "limited", `${label}: no current user caps the access verdict`);
+    }
+    assertNoCanaryWindows(assert, run.access, canaries, `${label} check_access`);
+    assert.doesNotMatch(JSON.stringify(run.access), PRIMITIVE_BODY_WORDING, `${label}: no TypeError wording reaches check_access`);
+    for (const assessment of run.assessments) {
+      assertNoCanaryWindows(assert, assessment, canaries, `${label} ${assessment.title}`);
+      assert.doesNotMatch(JSON.stringify(assessment), PRIMITIVE_BODY_WORDING, `${label}: no TypeError wording reaches ${assessment.title}`);
+    }
+
+    assert.equal(run.exportError, undefined, `${label}: the export completes`);
+    const files = readBundleFiles(run.exported.outputDir);
+    assertNoCanaryWindowsInFiles(assert, files, canaries, `${label} bundle`);
+    assertNoCanaryWindowsInFiles(assert, readZipEntries(run.exported.zipPath), canaries, `${label} zip`);
+    for (const [name, text] of files) assert.doesNotMatch(text, PRIMITIVE_BODY_WORDING, `${label}: no TypeError wording reaches bundle ${name}`);
     assert.ok(log.some((entry) => entry.path === surface && entry.status === 200), `${label}: the 200 answer was observed`);
   }
 });
