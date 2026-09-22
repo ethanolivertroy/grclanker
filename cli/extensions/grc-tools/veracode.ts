@@ -2282,6 +2282,7 @@ async function evaluateScaWorkspaceCoverage(client: ClientLike, snapshot: Applic
   const unchecked: string[] = [];
   const rawProjects: JsonRecord = {};
   const linkedProjectsByApplication: JsonRecord = {};
+  let linkedProjectListsRead = 0;
   for (const app of sampled) {
     const guid = applicationGuid(app) ?? "";
     if (asBoolean(asObject(app.profile)?.upload_and_scan_sca_enabled) === true) {
@@ -2297,9 +2298,12 @@ async function evaluateScaWorkspaceCoverage(client: ClientLike, snapshot: Applic
     errors.push(...surfaceErrors(`sca projects ${applicationName(app)}`, projects));
     rawProjects[guid] = rawSurface(projects);
     if (projects.status === "error") {
+      // The evidence map keeps the same marker as the snapshot for a list that failed, so it never reads as "no linked projects".
       unreadable.push(applicationName(app));
+      linkedProjectsByApplication[applicationName(app)] = rawSurface(projects);
       continue;
     }
+    linkedProjectListsRead += 1;
     const linked = asRecords(projects.value.linked_projects);
     linkedProjectsByApplication[applicationName(app)] = linked.slice(0, 20).map((project) => ({
       name: asString(project.name) ?? asString(project.id) ?? null,
@@ -2311,13 +2315,14 @@ async function evaluateScaWorkspaceCoverage(client: ClientLike, snapshot: Applic
   }
   const caveats = [partialInventoryNote(list, "applications"), scopeNote(sampled.length, list.items.length, "applications"), unreadable.length > 0 ? `${unreadable.length} linked project lists were unreadable.` : undefined];
   // With the SCA Agent API unreadable no project list is requested: the uncovered set and the linked project map were never determined, so they render null and the snapshot carries a marker rather than an empty map.
+  // The map also renders null, never {}, when no linked project list was read (every requested list failed, or none was needed); with some lists read the failed ones sit beside them as markers.
   const evidence = {
     applications_sampled: sampled.length,
     covered_applications: covered.length,
     uncovered_applications: scaBlocker ? null : uncovered.slice(0, 50),
     unreadable_applications: unreadable.slice(0, 50),
     unchecked_applications: unchecked.slice(0, 50),
-    linked_projects_by_application: scaBlocker ? null : linkedProjectsByApplication,
+    linked_projects_by_application: linkedProjectListsRead > 0 ? linkedProjectsByApplication : null,
     sca_agent_api_available: !scaBlocker,
     sca_agent_api_status: workspaces.status === "error" ? workspaces.statusCode ?? null : null,
   };

@@ -739,6 +739,7 @@ test("assessVeracodeScaPosture fails on high CVSS and HIGH risk licenses and tre
   assert.deepEqual(denied.evidence.unreadable_applications, ["Portal"], "a failed per-application request is unreadable, not uncovered");
   assert.deepEqual(denied.evidence.uncovered_applications, [], "a readable Agent API with every list read leaves the uncovered set determined and empty");
   assert.deepEqual(denied.evidence.unchecked_applications, []);
+  assert.equal(denied.evidence.linked_projects_by_application, null, "a map derived from lookups that all failed renders null, never {}");
   assert.equal(denied.evidence.sca_agent_api_status, null);
 });
 
@@ -754,6 +755,70 @@ test("assessVeracodeScaPosture reads linked_projects from the documented LinkedP
   const undocumented = await assessVeracodeScaPosture(mockClient(fixture, { async getScaApplicationProjects() { return { _embedded: { projects: [{ id: "proj-1", name: "portal" }] } }; } }));
   assert.equal(statusOf(undocumented.findings, 18), "warn");
   assert.match(undocumented.findings.find((item) => item.id === "VERACODE-18").summary, /neither upload-and-scan SCA enabled nor a linked SCA agent project/);
+});
+
+test("VERACODE-18 renders linked_projects_by_application as null when no linked project list was read, keeps read lists beside a not-collected marker when some were denied, and keeps the populated map when every list was read", async () => {
+  const findingOf = (result) => result.findings.find((item) => item.id === "VERACODE-18");
+  const projectsPath = (guid) => `/srcclr/v3/applications/${guid}/projects`;
+  const portalProjects = [{ name: "portal", workspace: "Workspace A", last_scan_date: healthyFixture().scaProjects.linked_projects[0].last_scan_date }];
+
+  // Baseline: the SCA Agent API is available and every sampled application's list is read, so the map is populated.
+  const fixture = healthyFixture();
+  for (const app of fixture.applications) app.profile.upload_and_scan_sca_enabled = false;
+  const populated = findingOf(await assessVeracodeScaPosture(mockClient(fixture)));
+  assert.equal(populated.status, "pass");
+  assert.deepEqual(Object.keys(populated.evidence.linked_projects_by_application).sort(), ["Payments", "Portal"]);
+  assert.deepEqual(populated.evidence.linked_projects_by_application.Portal, portalProjects);
+  assert.deepEqual(populated.evidence.unreadable_applications, []);
+
+  // Every requested list denied (Payments covered by upload-and-scan, Portal's list forbidden): no list was read, so the map is null while unreadable_applications names the application and the verdict and summary are unchanged.
+  const requested = [];
+  const allDenied = findingOf(await assessVeracodeScaPosture(mockClient(healthyFixture(), {
+    async getScaApplicationProjects(guid) { requested.push(guid); throw forbidden(projectsPath(guid)); },
+  })));
+  assert.deepEqual(requested, ["app-2"], "the covered application needs no list; the other's list was requested and denied");
+  assert.equal(allDenied.status, "warn");
+  assert.equal(allDenied.summary, "All 1 sampled applications have upload-and-scan SCA enabled or a linked SCA agent project (linked_projects from the SCA Agent API). 1 linked project lists were unreadable.");
+  assert.deepEqual(allDenied.evidence.unreadable_applications, ["Portal"]);
+  assert.equal(allDenied.evidence.linked_projects_by_application, null, "a map derived from lookups that all failed renders null, never {}");
+  assert.equal(allDenied.evidence.sca_agent_api_available, true);
+
+  // Both sampled applications need a list and both are denied: no application could be evaluated, and the map is still null.
+  const noneRead = findingOf(await assessVeracodeScaPosture(mockClient(fixture, {
+    async getScaApplicationProjects(guid) { throw forbidden(projectsPath(guid)); },
+  })));
+  assert.equal(noneRead.status, "manual");
+  assert.equal(noneRead.evidence.covered_applications, 0);
+  assert.deepEqual(noneRead.evidence.unreadable_applications, ["Payments", "Portal"]);
+  assert.equal(noneRead.evidence.linked_projects_by_application, null);
+
+  // No list needed at all (every sampled application has upload-and-scan SCA): nothing was read, so the map is null rather than an empty {}.
+  const covered = healthyFixture();
+  for (const app of covered.applications) app.profile.upload_and_scan_sca_enabled = true;
+  const noneNeeded = findingOf(await assessVeracodeScaPosture(mockClient(covered, { async getScaApplicationProjects() { throw new Error("no list should be requested"); } })));
+  assert.equal(noneNeeded.status, "pass");
+  assert.equal(noneNeeded.evidence.linked_projects_by_application, null);
+
+  // Mixed: Payments' list denied, Portal's read. The read list is kept and the denied one is the not-collected marker, so neither reads as "no linked projects".
+  const mixed = findingOf(await assessVeracodeScaPosture(mockClient(fixture, {
+    async getScaApplicationProjects(guid) { if (guid === "app-1") throw forbidden(projectsPath(guid)); return fixture.scaProjects; },
+  })));
+  assert.equal(mixed.status, "warn");
+  assert.match(mixed.summary, /1 linked project lists were unreadable\.$/);
+  assert.deepEqual(mixed.evidence.unreadable_applications, ["Payments"]);
+  assert.deepEqual(Object.keys(mixed.evidence.linked_projects_by_application).sort(), ["Payments", "Portal"]);
+  assert.deepEqual(mixed.evidence.linked_projects_by_application.Portal, portalProjects);
+  assertNotCollectedMarker(mixed.evidence.linked_projects_by_application.Payments, "mixed linked_projects_by_application.Payments", { status: 403, endpoint: null, error: /^Veracode request failed \(403 Forbidden\) for \/srcclr\/v3\/applications\/app-1\/projects$/ });
+
+  // Through the real client the marker carries the observed status and endpoint of the request that failed, and the finding names no request the run did not make.
+  const { fetchImpl, requests } = recordingVeracodeFetch({ fixture, denied: [/^\/srcclr\/v3\/applications\/app-1\/projects$/] });
+  const client = new VeracodeApiClient(sampleConfig({ retries: 0 }), { fetchImpl, sleep: async () => {} });
+  const observed = findingOf(await assessVeracodeScaPosture(client, {}));
+  assert.equal(observed.status, "warn");
+  assert.deepEqual(observed.evidence.linked_projects_by_application.Portal, portalProjects);
+  assertNotCollectedMarker(observed.evidence.linked_projects_by_application.Payments, "observed linked_projects_by_application.Payments", { status: 403, endpoint: /^\/srcclr\/v3\/applications\/app-1\/projects$/, error: /403 Forbidden/ });
+  assert.ok(requests.some((request) => request.path === "/srcclr/v3/applications/app-1/projects" && request.status === 403), "the denied request was actually issued");
+  assertOutputsNameOnlyObservedRequests(new Map([["VERACODE-18", JSON.stringify(observed)]]), requests, "mixed linked project lists");
 });
 
 test("VeracodeApiClient requests users with include_roles and include_teams and teams with all_for_org, recording a refused flag", async () => {
