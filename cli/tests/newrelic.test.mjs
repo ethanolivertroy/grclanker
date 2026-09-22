@@ -477,7 +477,8 @@ test("resolveNewrelicConfiguration never echoes a malformed config line and keep
     }
   })();
   assert.ok(thrown instanceof Error, "a malformed config throws");
-  assert.match(thrown.message, /^Unable to parse New Relic config file: invalid YAML in .*inspector\.yaml at line 3$/);
+  // The shared loader's fixed text: path, the parser's line and column, and its code, and nothing else.
+  assert.match(thrown.message, /^Unable to parse New Relic config file: invalid YAML in .*inspector\.yaml at line 3, column 10 \(BLOCK_AS_IMPLICIT_KEY\)$/);
   for (const forbidden of [keyCanary, bearerCanary, "LEAKCANARY", "LEAKBEARER", "Bearer", "Nested mappings", malformedLine]) {
     assert.ok(!thrown.message.includes(forbidden), `thrown message must not carry ${JSON.stringify(forbidden)}: ${thrown.message}`);
   }
@@ -486,7 +487,7 @@ test("resolveNewrelicConfiguration never echoes a malformed config line and keep
   // Same file reached through the environment path variable.
   assert.throws(
     () => resolveNewrelicConfiguration({}, { NEW_RELIC_SEC_INSPECTOR_CONFIG: configPath }, home),
-    (error) => error instanceof Error && /invalid YAML in .*inspector\.yaml at line 3$/.test(error.message) && !error.message.includes("LEAK"),
+    (error) => error instanceof Error && /invalid YAML in .*inspector\.yaml at line 3, column 10 \(BLOCK_AS_IMPLICIT_KEY\)$/.test(error.message) && !error.message.includes("LEAK"),
   );
 
   // A read failure is a fixed description with the system error code, never the library message.

@@ -11,7 +11,6 @@ import {
   existsSync,
   lstatSync,
   mkdirSync,
-  readFileSync,
   realpathSync,
 } from "node:fs";
 import { chmod, readdir, writeFile } from "node:fs/promises";
@@ -19,6 +18,7 @@ import { homedir } from "node:os";
 import { dirname, join, relative, resolve } from "node:path";
 import { ZipArchive } from "archiver";
 import { Type } from "@sinclair/typebox";
+import { readConfigText } from "./hardening/index.js";
 import { errorResult, formatTable, textResult } from "./shared.js";
 
 type FetchImpl = typeof fetch;
@@ -646,29 +646,20 @@ export function resolveQualysPlatform(value: string | undefined, source = "the p
   return { platform: "custom", baseUrl, gatewayUrl: `https://${gatewayHost}` };
 }
 
-/** The `code` of a Node system error (ENOENT, EACCES, EISDIR): a fixed identifier, never the message. */
-function systemErrorCode(error: unknown): string | undefined {
-  const code = asObject(error)?.code;
-  return typeof code === "string" && /^E[A-Z0-9_]{1,30}$/.test(code) ? code : undefined;
-}
-
 /**
- * Reads the optional key=value config file. The read error is never interpolated: a Node fs error names the path
- * and operation, and a non-standard thrown value contributes whatever its `toString()` yields, so the thrown text is
- * a fixed description with the path and the validated system error code, scrubbed like every other error here. The
- * parser below is a hand-rolled loop that cannot throw, so it has no error path to guard.
+ * Reads the optional key=value config file. A missing file is an empty config (the existsSync check is kept in
+ * front of the read: it is the first unguarded call in every tool handler and the tests probe the handlers' catch
+ * blocks through it). The read itself goes through the shared `readConfigText` guard, so any failure is a
+ * `ConfigFileError` whose message is the fixed `Unable to read Qualys config file <path> (<CODE>)`, built from the
+ * path and the validated system error code only; neither a Node fs message nor a non-standard thrown value's
+ * `toString()` can reach it. The parser below is a hand-rolled loop that cannot throw, so it has no parse guard.
  */
 export function readQualysConfigFile(pathname: string | undefined): Record<string, string> {
   if (!pathname || !existsSync(pathname)) return {};
+  const read = readConfigText(pathname, { label: "Qualys" });
+  if (!read.ok) return {};
   const values: Record<string, string> = {};
-  let content: string;
-  try {
-    content = readFileSync(pathname, "utf8");
-  } catch (error) {
-    const code = systemErrorCode(error);
-    throw new Error(scrubErrorText(`Unable to read Qualys config file ${pathname}${code ? ` (${code})` : ""}`));
-  }
-  for (const rawLine of content.split(/\r?\n/)) {
+  for (const rawLine of read.value.split(/\r?\n/)) {
     const line = rawLine.trim();
     if (!line || line.startsWith("#") || line.startsWith(";") || line.startsWith("[")) continue;
     const separator = line.indexOf("=");
@@ -860,21 +851,43 @@ function describeOpaqueBody(response: QualysHttpResponse, description: string): 
   return `${description} (${mediaType(response.headers)}; ${bytes} bytes)`;
 }
 
+// A vendor error code copied out of a response body is server-controlled text like every other field, so it is
+// rendered only when it has the documented shape and as the fixed UnknownError otherwise. Qualys documents the VM/PC
+// API v2 <CODE> (simple_return.dtd, "Error Codes" in the API user guide: 1901, 1903, 1905, 1920, 1960, 2000, 2002,
+// 2010, ...), the generic_return.dtd <RETURN status="FAILED" number="..."> attribute, and the /msp/ <ERROR
+// number="999"> attribute (user_list_output.dtd) as small integers. The QPS ServiceResponse responseCode (Asset
+// Management and Tagging API v2 and WAS API user guides, "Error Handling") is an uppercase constant such as SUCCESS,
+// INVALID_REQUEST, INVALID_CREDENTIALS, UNAUTHORIZED, INVALID_API_VERSION, NOT_FOUND, or INTERNAL_ERROR.
+const XML_ERROR_CODE_PATTERN = /^\d{1,6}$/;
+const QPS_RESPONSE_CODE_PATTERN = /^[A-Z][A-Z_]{0,63}$/;
+const UNKNOWN_ERROR_CODE = "UnknownError";
+
+function vendorErrorCode(value: string | undefined, pattern: RegExp): string | undefined {
+  const trimmed = value?.trim();
+  if (!trimmed) return undefined;
+  return pattern.test(trimmed) ? trimmed : UNKNOWN_ERROR_CODE;
+}
+
 // The documented error envelopes, echoing only their documented fields: SIMPLE_RETURN or GENERIC_RETURN with
 // CODE and TEXT (VM/PC API v2), GENERIC_RETURN/RETURN status="FAILED" with a number attribute (generic_return.dtd),
-// and a root-level ERROR with a number attribute (user_list_output.dtd and the other /msp/ outputs).
+// and a root-level ERROR with a number attribute (user_list_output.dtd and the other /msp/ outputs). Every code
+// goes through vendorErrorCode; the TEXT is scrubbed by the QualysApiError constructor.
 function xmlErrorEnvelope(document: XmlNode): string | undefined {
   const simpleReturn = findXmlElement(document, "SIMPLE_RETURN") ?? findXmlElement(document, "GENERIC_RETURN");
   if (simpleReturn) {
-    const code = xmlText(findXmlElement(simpleReturn, "CODE"));
+    const code = vendorErrorCode(xmlText(findXmlElement(simpleReturn, "CODE")), XML_ERROR_CODE_PATTERN);
     const text = xmlText(findXmlElement(simpleReturn, "TEXT"));
     if (code || text) return `${code ? `code ${code}` : "error"}${text ? `: ${text}` : ""}`;
     const failed = findXmlElements(simpleReturn, "RETURN").find((node) => /^failed$/i.test(node.attributes.status ?? ""));
-    if (failed) return `error${failed.attributes.number ? ` ${failed.attributes.number}` : ""}${xmlText(failed) ? `: ${xmlText(failed)}` : ""}`;
+    if (failed) {
+      const number = vendorErrorCode(failed.attributes.number, XML_ERROR_CODE_PATTERN);
+      return `error${number ? ` ${number}` : ""}${xmlText(failed) ? `: ${xmlText(failed)}` : ""}`;
+    }
   }
   const rootError = document.children.flatMap((root) => root.children).find((child) => child.name === "ERROR");
   if (rootError) {
-    return `error${rootError.attributes.number ? ` ${rootError.attributes.number}` : ""}${xmlText(rootError) ? `: ${xmlText(rootError)}` : ""}`;
+    const number = vendorErrorCode(rootError.attributes.number, XML_ERROR_CODE_PATTERN);
+    return `error${number ? ` ${number}` : ""}${xmlText(rootError) ? `: ${xmlText(rootError)}` : ""}`;
   }
   return undefined;
 }
@@ -1125,10 +1138,11 @@ export class QualysApiClient {
       if (!payload) throw this.failure("Qualys QPS request", response, endpoint, describeOpaqueBody(response, "non-JSON error body"));
     }
     // ServiceResponse (qps/rest): only responseCode and responseErrorDetails.errorMessage are documented error fields,
-    // and only those two are echoed.
+    // and only those two are echoed; the code only in its documented shape (vendorErrorCode), the message scrubbed.
     const serviceResponse = asObject(payload.ServiceResponse) ?? payload;
-    const responseCode = asString(serviceResponse.responseCode);
-    if (response.status >= 400 || (responseCode && responseCode !== "SUCCESS")) {
+    const rawResponseCode = asString(serviceResponse.responseCode);
+    if (response.status >= 400 || (rawResponseCode && rawResponseCode !== "SUCCESS")) {
+      const responseCode = vendorErrorCode(rawResponseCode, QPS_RESPONSE_CODE_PATTERN);
       const message = pathString(serviceResponse, "responseErrorDetails", "errorMessage");
       const detail = responseCode
         ? `responseCode ${responseCode}${message ? `: ${message}` : ""}`

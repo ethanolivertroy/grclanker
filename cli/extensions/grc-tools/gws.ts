@@ -32,6 +32,7 @@ import { chmod, readdir, writeFile } from "node:fs/promises";
 import { basename, dirname, join, relative, resolve } from "node:path";
 import { ZipArchive } from "archiver";
 import { Type } from "@sinclair/typebox";
+import { REDACTED, systemErrorCode } from "./hardening/index.js";
 import { errorResult, formatTable, textResult } from "./shared.js";
 
 type JsonRecord = Record<string, unknown>;
@@ -147,16 +148,19 @@ const EMBEDDED_URL_PATTERN = /\b[a-z][a-z0-9+.-]*:\/\/[^\s"'<>()[\]{}]+/gi;
 /**
  * Well-known credential shapes redacted wherever they appear in free text: RFC 6750 bearer credentials, Google
  * OAuth access (ya29.) and refresh (1//) tokens, Google API keys (AIza), OAuth client secrets (GOCSPX-), JWTs,
- * and PEM private key blocks. This is defense in depth behind projection and key-based redaction.
+ * and PEM private key blocks. This is defense in depth behind projection and key-based redaction. The scrub stays
+ * local rather than delegating to the shared hardening scrubber: it removes a URL query outright where the shared
+ * scrubber leaves `?[REDACTED]`, and its key rules exclude bare `token` (nextPageToken, the token inventory wrapper)
+ * where the shared credential-key rule includes it.
  */
 const CREDENTIAL_SHAPE_PATTERNS: ReadonlyArray<{ pattern: RegExp; replacement: string }> = [
-  { pattern: /\bBearer\s+[A-Za-z0-9._~+/=-]{8,}/g, replacement: "Bearer [REDACTED]" },
-  { pattern: /\bya29\.[A-Za-z0-9._-]{8,}/g, replacement: "[REDACTED]" },
-  { pattern: /\b1\/\/[A-Za-z0-9._-]{8,}/g, replacement: "[REDACTED]" },
-  { pattern: /\bAIza[0-9A-Za-z_-]{35}\b/g, replacement: "[REDACTED]" },
-  { pattern: /\bGOCSPX-[A-Za-z0-9_-]{8,}/g, replacement: "[REDACTED]" },
-  { pattern: /\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}/g, replacement: "[REDACTED]" },
-  { pattern: /-----BEGIN [A-Z ]*PRIVATE KEY-----[^"]*?-----END [A-Z ]*PRIVATE KEY-----/g, replacement: "[REDACTED]" },
+  { pattern: /\bBearer\s+[A-Za-z0-9._~+/=-]{8,}/g, replacement: `Bearer ${REDACTED}` },
+  { pattern: /\bya29\.[A-Za-z0-9._-]{8,}/g, replacement: REDACTED },
+  { pattern: /\b1\/\/[A-Za-z0-9._-]{8,}/g, replacement: REDACTED },
+  { pattern: /\bAIza[0-9A-Za-z_-]{35}\b/g, replacement: REDACTED },
+  { pattern: /\bGOCSPX-[A-Za-z0-9_-]{8,}/g, replacement: REDACTED },
+  { pattern: /\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}/g, replacement: REDACTED },
+  { pattern: /-----BEGIN [A-Z ]*PRIVATE KEY-----[^"]*?-----END [A-Z ]*PRIVATE KEY-----/g, replacement: REDACTED },
 ];
 /** `key=value`, `key: value`, and `"key": "value"` pairs inside free text such as error messages, display names, and rendered JSON. */
 const TEXT_PAIR_PATTERN = /([A-Za-z_][A-Za-z0-9_.-]*)"?\s*[=:]\s*"?([A-Za-z0-9._~+/=-]{8,})/g;
@@ -168,8 +172,6 @@ const TEXT_SECRET_KEY_PATTERN = /(token|secret|password|passwd|credential|creden
  * None of them carry `.`, `-`, or `/`, so excluding those drops every dotted, hyphenated, or path-shaped credential form.
  */
 const ERROR_IDENTIFIER_PATTERN = /^[A-Za-z][A-Za-z0-9_]{0,62}$/;
-/** The `code` of a Node system error (ENOENT, EACCES, EISDIR): the only part of a read failure that is ever rendered. */
-const SYSTEM_ERROR_CODE_PATTERN = /^E[A-Z0-9_]{1,30}$/;
 /** RFC 9110 section 15 reason phrases for the statuses Google APIs return; the server-supplied phrase is never rendered. */
 const HTTP_REASON_PHRASES: Record<number, string> = {
   200: "OK",
@@ -1456,7 +1458,7 @@ export function scrubText(value: string): string {
     output = output.replace(pattern, replacement);
   }
   return output.replace(TEXT_PAIR_PATTERN, (match: string, key: string, secret: string) => (
-    isTextSecretKey(key) ? `${match.slice(0, match.length - secret.length)}[REDACTED]` : match
+    isTextSecretKey(key) ? `${match.slice(0, match.length - secret.length)}${REDACTED}` : match
   ));
 }
 
@@ -1474,7 +1476,7 @@ export function redactSecrets(value: unknown): unknown {
     const output: JsonRecord = {};
     for (const [key, entry] of Object.entries(record)) {
       const redactPairValue = secretPair && (PAIR_VALUE_KEYS as readonly string[]).includes(key);
-      output[key] = isSecretKey(key) || redactPairValue ? "[REDACTED]" : redactSecrets(entry);
+      output[key] = isSecretKey(key) || redactPairValue ? REDACTED : redactSecrets(entry);
     }
     return output;
   }
@@ -1494,7 +1496,7 @@ export function redactKnownValues(value: unknown, secrets: string[]): unknown {
       return output;
     }
     if (typeof input === "string") {
-      return known.reduce((current, secret) => current.split(secret).join("[REDACTED]"), input);
+      return known.reduce((current, secret) => current.split(secret).join(REDACTED), input);
     }
     return input;
   };
@@ -2020,12 +2022,6 @@ async function countFilesRecursively(pathname: string): Promise<number> {
   return count;
 }
 
-/** The system error code of a failed read when Node supplied one; a non-standard error object yields nothing. */
-function systemErrorCode(error: unknown): string | undefined {
-  const code = typeof error === "object" && error !== null && "code" in error ? (error as { code: unknown }).code : undefined;
-  return typeof code === "string" && SYSTEM_ERROR_CODE_PATTERN.test(code) ? code : undefined;
-}
-
 type FileReader = (pathname: string) => string;
 const readUtf8File: FileReader = (pathname) => readFileSync(pathname, "utf8");
 
@@ -2034,6 +2030,8 @@ const readUtf8File: FileReader = (pathname) => readFileSync(pathname, "utf8");
  * interpolated: Node's message would repeat the path with its own wording, and the JSON parser quotes the characters
  * around the failure, which in a key file is credential material. A read failure renders the path and the system
  * error code; a parse failure renders the path and the size read, and both pass through the module's error scrub.
+ * The loader keeps its own message shape and injectable reader rather than the shared hardening config loader,
+ * whose fixed "Unable to read/parse <Label> config file" wording, unscrubbed path, and direct file read differ.
  */
 export async function readServiceAccountFromFile(pathname: string, readFile: FileReader = readUtf8File): Promise<ServiceAccountCredentials> {
   let contents: string;
