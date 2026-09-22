@@ -586,7 +586,7 @@ test("MulesoftApiClient surfaces non-retryable errors with status and redacted s
   await assert.rejects(
     () => opaqueClient.listMembers(),
     (error) => {
-      assert.match(error.message, /403 Forbidden.*: response body omitted \(text\/html, 62 characters\)$/);
+      assert.match(error.message, /403 Forbidden.*: non-JSON body \(text\/html, 62 bytes\)$/);
       assert.doesNotMatch(error.message, /FAKE_PROXY_ECHOED_SECRET/, "a non-JSON error body is never copied into the error string");
       return true;
     },
@@ -2574,6 +2574,9 @@ const FAKE_MULESOFT_SECRETS = {
   loadBalancerPrivateKey: "FAKE-MULESOFT-DLB-PRIVATE-KEY-14",
   organizationAccessKey: "FAKE-MULESOFT-ORGANIZATION-ACCESS-KEY-15",
   serverCredential: "FAKE-MULESOFT-HYBRID-SERVER-CREDENTIAL-16",
+  vpnPresharedKey: "FAKE-MULESOFT-VPN-PRESHARED-KEY-17",
+  serverRegistrationKey: "FAKE-MULESOFT-SERVER-REGISTRATION-KEY-18",
+  alertWebhookPathToken: "FAKE-MULESOFT-ALERT-WEBHOOK-PATH-TOKEN-19",
 };
 
 function secretBearingBundleClient() {
@@ -2663,9 +2666,24 @@ function secretBearingBundleClient() {
         sslEndpoints: [{ publicKeyLabel: "api-cert", privateKeyLabel: "api-key", privateKey: secrets.loadBalancerPrivateKey }],
       }];
     },
+    async getVpc() {
+      return {
+        id: "vpc-1",
+        name: "prod-vpc",
+        firewallRules: [{ cidrBlock: "10.0.0.0/16", protocol: "tcp", fromPort: 8091, toPort: 8092 }],
+        vpnConnections: [{ name: "dc-vpn", remoteIpAddress: "203.0.113.10", presharedKey: secrets.vpnPresharedKey }],
+      };
+    },
     async listHybridServers(environmentId) {
       return environmentId === "env-prod"
-        ? [{ id: 1, name: "onprem-1", status: "RUNNING", muleVersion: "4.6.0", registration: { credentials: { token: secrets.serverCredential } } }]
+        ? [{
+          id: 1,
+          name: "onprem-1",
+          status: "RUNNING",
+          muleVersion: "4.6.0",
+          registrationKey: secrets.serverRegistrationKey,
+          registration: { credentials: { token: secrets.serverCredential } },
+        }]
         : [];
     },
     async listMqClients() {
@@ -2688,7 +2706,16 @@ function secretBearingBundleClient() {
     },
     async listCloudhubAlerts(environmentId) {
       return environmentId === "env-prod"
-        ? [{ id: "alert-1", name: "CPU", enabled: true, condition: { resources: ["*"] }, actions: [{ type: "webhook", url: `https://hooks.example.com/services/T1/B2?token=${secrets.alertWebhookToken}` }] }]
+        ? [{
+          id: "alert-1",
+          name: "CPU",
+          enabled: true,
+          condition: { resources: ["*"] },
+          actions: [
+            { type: "webhook", url: `https://hooks.example.com/services/T1/B2?token=${secrets.alertWebhookToken}` },
+            { type: "webhook", webhookUrl: `https://hooks.example.com/services/T1/B2/${secrets.alertWebhookPathToken}` },
+          ],
+        }]
         : [];
     },
   });
@@ -2804,7 +2831,15 @@ test("verdict safety rule 9: exportMulesoftAuditBundle never writes connected ap
   const auditLog = JSON.parse(files.get("core_data/audit_log_recent.json"));
   assert.deepEqual(Object.keys(auditLog[0]).sort(), ["action", "object_type", "platform", "timestamp"]);
   const alerts = JSON.parse(files.get("core_data/alerts.json"));
-  assert.equal(alerts[0].cloudhub_alerts[0].actions[0].url, "https://hooks.example.com/services/T1/B2?token=[REDACTED]");
+  assert.equal(alerts[0].cloudhub_alerts[0].actions[0].url, "https://hooks.example.com", "an alert action URL keeps scheme and host only");
+  assert.equal(alerts[0].cloudhub_alerts[0].actions[1].webhookUrl, "https://hooks.example.com", "a path-embedded webhook token goes with the path");
+  const vpcs = JSON.parse(files.get("core_data/vpcs.json"));
+  assert.equal(vpcs[0].vpnConnections[0].presharedKey, "[REDACTED]");
+  assert.equal(vpcs[0].vpnConnections[0].remoteIpAddress, "203.0.113.10");
+  const servers = JSON.parse(files.get("core_data/hybrid_servers.json"));
+  assert.equal(servers[0].server.registrationKey, "[REDACTED]");
+  assert.equal(servers[0].server.registration.credentials, "[REDACTED]");
+  assert.equal(servers[0].server.name, "onprem-1");
   const runtime = JSON.parse(files.get("analysis/runtime_infrastructure.json"));
   assert.equal(findingById(runtime, "MULESOFT-RT-22").status, "fail");
   assert.deepEqual(findingById(runtime, "MULESOFT-RT-22").evidence.insecure_property_keys, ["Production: orders-prod: downstream.apiKey, legacy.jdbc.password"]);

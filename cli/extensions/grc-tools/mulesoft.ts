@@ -126,8 +126,18 @@ const RATE_LIMIT_POLICY_PATTERN = /rate-limit|spike-control/i;
 const SENSITIVE_PROPERTY_PATTERN = /pass(word|wd)?|secret|token|api[-_]?key|private[-_]?key|credential/i;
 // Tested against key names normalized to lowercase with underscores, hyphens, and spaces removed, so camelCase and
 // snake_case variants (apiKey, api_key, signing-key) all match.
-const SECRET_KEY_PATTERN = /secret|password|passwd|token|privatekey|authorization|apikey|accesskey|credential|textkey|signingkey|community|hash/;
+const SECRET_KEY_PATTERN = /secret|password|passwd|token|privatekey|authorization|apikey|accesskey|credential|textkey|signingkey|community|hash|presharedkey|registrationkey/;
+// Keys whose string values are URLs (alert webhookUrl, callback and redirect targets); the exported value keeps scheme and host only
+// because tokens travel in the path and query of such targets.
+const URL_KEY_PATTERN = /(url|uri)s?$/;
 const REDACTED = "[REDACTED]";
+const MIN_REMEMBERED_SECRET_LENGTH = 4;
+const KNOWN_SECRETS = new Set<string>();
+const URL_IN_TEXT_PATTERN = /\b(https?:\/\/)(?:([^\s/?#@"'<>]+)@)?([^\s/?#"'<>]+)([^\s?#"'<>]*)(\?[^\s#"'<>]*)?(#[^\s"'<>]*)?/gi;
+const JWT_PATTERN = /\beyJ[A-Za-z0-9_-]{4,}\.[A-Za-z0-9_-]{4,}\.[A-Za-z0-9_-]*/g;
+const AUTHORIZATION_VALUE_PATTERN = /\b(bearer|basic|digest|negotiate|ntlm)\s+([A-Za-z0-9\-._~+/!]{8,}=*)/gi;
+const SECRET_ASSIGNMENT_PATTERN = /\b([\w-]*(?:session|token|secret|password|passwd|pwd|api[_-]?key|apikey|credential|assertion|signature|sid|jsessionid)[\w-]*=)([^\s"'&;,<>]+)/gi;
+const SECRET_FIELD_PATTERN = /\b((?:api[\s_-]?key|x-api-key|access[_-]?token|refresh[_-]?token|id[_-]?token|auth[_-]?token|session[_-]?token|bearer[_-]?token|token|client[_-]?secret|secret|password|passwd|pwd|authorization|set-cookie|cookie|session[_-]?id|jsessionid|sid|assertion|signature|credential)["']?\s*:\s*["']?)([^\s"'&;,<>]+)/gi;
 const MAX_REDACTION_DEPTH = 32;
 const PRODUCTION_NAME_PATTERN = /\bprod(uction)?\b/i;
 const NON_PRODUCTION_NAME_PATTERN = /\b(sandbox|dev(elopment)?|test|qa|uat|staging|stage)\b/i;
@@ -276,13 +286,21 @@ export interface MulesoftPage {
 
 export type MulesoftListResult = JsonRecord[] | MulesoftPage;
 
+/**
+ * The only field carrying response text is the message (status line, method and path, and either
+ * Anypoint's documented message, error_description, error, or errors[0].message, or the opaque-body
+ * note); it is scrubbed in the constructor so no throw site can hand an unredacted body to a catch
+ * block. `endpoint` is the request path, recorded so a not-collected marker can name the request.
+ */
 export class MulesoftApiError extends Error {
   readonly status: number;
+  readonly endpoint?: string;
 
-  constructor(status: number, message: string) {
-    super(message);
+  constructor(status: number, message: string, endpoint?: string) {
+    super(scrubErrorText(message));
     this.name = "MulesoftApiError";
     this.status = status;
+    this.endpoint = endpoint;
   }
 }
 
@@ -447,8 +465,49 @@ function serializeJson(value: unknown): string {
   return `${JSON.stringify(value, null, 2)}\n`;
 }
 
+/**
+ * The single sink every recorded error string passes through (collect() dataset errors and the errors
+ * arrays, access-check surfaces, _errors.log); it re-applies the redaction pass so a message built
+ * outside MulesoftApiError cannot bypass it.
+ */
 function errorMessage(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
+  return scrubErrorText(error instanceof Error ? error.message : String(error));
+}
+
+/**
+ * The unanchored redaction pass every error string receives, once in MulesoftApiError and again at
+ * the sink (errorMessage): every secret any client in this process has seen, then credential shapes
+ * (URL userinfo, query strings, and fragments anywhere in the text, JWT-shaped strings, Authorization
+ * scheme values, and cookie, query, or field assignments whose name suggests a credential).
+ */
+function scrubErrorText(text: string, secrets: Iterable<string | undefined> = KNOWN_SECRETS): string {
+  let scrubbed = text;
+  for (const secret of secrets) {
+    if (secret && secret.length >= MIN_REMEMBERED_SECRET_LENGTH) scrubbed = scrubbed.split(secret).join(REDACTED);
+  }
+  return scrubbed
+    .replace(URL_IN_TEXT_PATTERN, (_match, scheme: string, userinfo: string | undefined, host: string, path: string, query?: string, fragment?: string) =>
+      `${scheme}${userinfo ? `${REDACTED}@` : ""}${host}${path}${query ? `?${REDACTED}` : ""}${fragment ? `#${REDACTED}` : ""}`)
+    .replace(JWT_PATTERN, REDACTED)
+    .replace(AUTHORIZATION_VALUE_PATTERN, (match: string, scheme: string, value: string) => (/^[a-z]+$/.test(value) ? match : `${scheme} ${REDACTED}`))
+    .replace(SECRET_ASSIGNMENT_PATTERN, (_match, assignment: string) => `${assignment}${REDACTED}`)
+    .replace(SECRET_FIELD_PATTERN, (_match, field: string) => `${field}${REDACTED}`);
+}
+
+function rememberSecrets(...values: Array<string | undefined>): void {
+  for (const value of values) {
+    if (value && value.length >= MIN_REMEMBERED_SECRET_LENGTH) KNOWN_SECRETS.add(value);
+  }
+}
+
+/** A URL reduced to scheme and host: alert webhooks and callback targets carry tokens in their path and query. */
+export function reduceUrl(value: string): string {
+  try {
+    const url = new URL(value);
+    return `${url.protocol}//${url.host}`;
+  } catch {
+    return REDACTED;
+  }
 }
 
 function sample<T>(items: T[], limit = MAX_EVIDENCE_SAMPLES): T[] {
@@ -521,6 +580,10 @@ function isSecretKey(key: string): boolean {
   return SECRET_KEY_PATTERN.test(key.toLowerCase().replace(/[-_\s]/g, ""));
 }
 
+function isUrlKey(key: string): boolean {
+  return URL_KEY_PATTERN.test(key.toLowerCase().replace(/[-_\s]/g, ""));
+}
+
 function redactUrlQuery(text: string): string {
   if (!/^https?:\/\/[^?]+\?/i.test(text)) return text;
   return text.replace(/([?&])([^=&#]+)=([^&#]*)/g, (match, separator: string, key: string) => (
@@ -538,6 +601,15 @@ function redactedValue(entry: unknown): unknown {
   return entry === null || entry === undefined || typeof entry === "boolean" ? entry : REDACTED;
 }
 
+const ABSOLUTE_URL_PATTERN = /^[a-z][a-z0-9+.-]*:\/\//i;
+
+/** The value under a URL-named key: absolute URLs (alone or in a list) are reduced to scheme and host; anything else is redacted as usual. */
+function reducedUrlValue(entry: unknown, depth: number): unknown {
+  if (typeof entry === "string") return ABSOLUTE_URL_PATTERN.test(entry) ? reduceUrl(entry) : redactUrlQuery(entry);
+  if (Array.isArray(entry)) return entry.map((item) => reducedUrlValue(item, depth + 1));
+  return redactSnapshot(entry, depth + 1);
+}
+
 export function redactSnapshot(value: unknown, depth = 0): unknown {
   if (depth > MAX_REDACTION_DEPTH) return REDACTED;
   if (typeof value === "string") return redactUrlQuery(value);
@@ -547,21 +619,18 @@ export function redactSnapshot(value: unknown, depth = 0): unknown {
   const secretPair = isSecretNamedPair(object);
   const output: JsonRecord = {};
   for (const [key, entry] of Object.entries(object)) {
-    output[key] = isSecretKey(key) || (secretPair && key === "value") ? redactedValue(entry) : redactSnapshot(entry, depth + 1);
+    output[key] = isSecretKey(key) || (secretPair && key === "value")
+      ? redactedValue(entry)
+      : isUrlKey(key)
+        ? reducedUrlValue(entry, depth)
+        : redactSnapshot(entry, depth + 1);
   }
   return output;
 }
 
+/** Kept for callers that pass explicit secrets; it is the same pass as scrubErrorText over those secrets plus every remembered one. */
 export function redactSecretText(text: string, secrets: Array<string | undefined> = []): string {
-  let output = text.replace(/Bearer\s+[A-Za-z0-9._~+/=-]+/gi, "Bearer [REDACTED]");
-  output = output.replace(
-    /("?(?:client_secret|password|access_token|refresh_token|accessToken|token)"?\s*[:=]\s*"?)([^"&\s,}]+)/gi,
-    "$1[REDACTED]",
-  );
-  for (const secret of secrets) {
-    if (secret && secret.length >= 4) output = output.split(secret).join("[REDACTED]");
-  }
-  return output;
+  return scrubErrorText(text, [...secrets, ...KNOWN_SECRETS]);
 }
 
 function safeDirName(value: string): string {
@@ -972,17 +1041,26 @@ function parseJsonText(rawText: string): unknown {
  */
 function anypointErrorDetail(payload: unknown, response: Response, rawText: string): string {
   const object = asObject(payload);
-  const detail = object
+  const documented = object
     ? [
       asString(object.message),
       asString(object.error_description),
       asString(object.error),
       asString(getNestedValue(object, ["errors", "0", "message"])),
     ].filter((item): item is string => Boolean(item)).join("; ")
-    : rawText.length > 0
-      ? `response body omitted (${response.headers.get("content-type")?.split(";")[0]?.trim() || "unknown content type"}, ${rawText.length} characters)`
-      : "";
+    : "";
+  const detail = documented || describeOpaqueBody(response, rawText, payload === undefined ? "non-JSON body" : "JSON body without a recognized error field");
   return detail ? `: ${detail}` : "";
+}
+
+/**
+ * A response body without a recognizable Anypoint error field is described by content type and byte
+ * length only, whatever its content type; its text is never sliced into an error string.
+ */
+function describeOpaqueBody(response: Response, rawText: string, kind: string): string {
+  if (rawText.length === 0) return "";
+  const contentType = response.headers.get("content-type")?.split(";")[0]?.trim() || "unknown content type";
+  return `${kind} (${contentType}, ${Buffer.byteLength(rawText, "utf8")} bytes)`;
 }
 
 function isRetryableStatus(status: number): boolean {
@@ -1053,6 +1131,7 @@ export class MulesoftApiClient {
     this.maxRetries = clampNumber(options.maxRetries, DEFAULT_MAX_RETRIES, 0, 10);
     this.retryBaseDelayMs = clampNumber(options.retryBaseDelayMs, DEFAULT_RETRY_BASE_DELAY_MS, 0, MAX_RETRY_DELAY_MS);
     this.certificateProbe = options.certificateProbe ?? defaultCertificateProbe;
+    rememberSecrets(config.clientSecret, config.password, config.token);
     if (config.authMode === "token" && config.token) {
       this.accessToken = config.token;
       this.accessTokenExpiresAt = Number.MAX_SAFE_INTEGER;
@@ -1134,12 +1213,16 @@ export class MulesoftApiClient {
             `Anypoint request failed (${response.status} ${response.statusText}) for ${method} ${pathLabel}`
             + anypointErrorDetail(payload, response, rawText),
           ),
+          pathLabel,
         );
       } catch (error) {
         if (error instanceof MulesoftApiError) throw error;
         if (attempt < this.maxRetries) {
           await this.sleepImpl(this.retryDelayMs(undefined, attempt));
           continue;
+        }
+        if (error instanceof Error && error.name === "AbortError") {
+          throw new Error(`Anypoint request to ${method} ${pathLabel} timed out after ${this.config.timeoutMs} ms`);
         }
         throw new Error(this.redact(`Anypoint request failed for ${method} ${pathLabel}: ${errorMessage(error)}`));
       } finally {
@@ -1191,6 +1274,7 @@ export class MulesoftApiClient {
       throw new Error("Anypoint token response did not include access_token.");
     }
     const expiresIn = asNumber(record.expires_in) ?? 3600;
+    rememberSecrets(accessToken);
     this.accessToken = accessToken;
     this.accessTokenExpiresAt = Date.now() + Math.max((expiresIn - 60) * 1000, 60_000);
     return accessToken;
@@ -1504,6 +1588,88 @@ interface Collected<T> {
   value: T;
   error?: string;
   httpStatus?: number;
+  /** Path of the request that failed; absent when the read succeeded or no request was made. */
+  endpoint?: string;
+  /** Set when the read was never requested because its parent list failed; names the parent and its failure. */
+  skipped?: string;
+  /** Label of the parent source whose failure caused the skip. */
+  skippedParent?: string;
+}
+
+/**
+ * Written to core_data (and into each category's snapshots) in place of a dataset that was denied,
+ * errored, or never requested, so a bundle consumer cannot mistake a failed read for an empty
+ * inventory. A readable dataset with no items keeps its array shape.
+ */
+export interface NotCollectedMarker {
+  collected: false;
+  dataset: string;
+  status: number | null;
+  endpoint: string | null;
+  error: string;
+}
+
+/** A dataset assembled from several reads of which some failed: the collected items plus one entry per failed read. */
+export interface PartiallyCollectedSnapshot {
+  collected: "partial";
+  dataset: string;
+  failed_reads: Array<{ read: string; status: number | null; endpoint: string | null; error: string }>;
+  items: unknown;
+}
+
+function sourceCollected(source: Collected<unknown>): boolean {
+  return !source.error && !source.skipped;
+}
+
+function sourceFailure(source: Collected<unknown>): string {
+  return source.error ?? `not requested: ${source.skipped}`;
+}
+
+function notCollectedMarker(source: Collected<unknown>): NotCollectedMarker {
+  return {
+    collected: false,
+    dataset: source.label,
+    status: source.httpStatus ?? null,
+    endpoint: source.endpoint ?? null,
+    error: sourceFailure(source),
+  };
+}
+
+/**
+ * The exported view of a dataset: the redacted value when its source was read, a not-collected marker
+ * when it was denied, errored, or skipped, and a partial snapshot when it merges several reads of which
+ * only some failed (so the items that were read are kept beside the failures).
+ */
+export function snapshotOf(source: Collected<unknown>, value: unknown, reads: Array<Collected<unknown>> = []): unknown {
+  if (sourceCollected(source)) return redactSnapshot(value);
+  const succeeded = reads.filter(sourceCollected);
+  if (succeeded.length === 0) return notCollectedMarker(source);
+  return {
+    collected: "partial",
+    dataset: source.label,
+    failed_reads: reads.filter((read) => !sourceCollected(read)).map((read) => ({
+      read: read.label,
+      status: read.httpStatus ?? null,
+      endpoint: read.endpoint ?? null,
+      error: sourceFailure(read),
+    })),
+    items: redactSnapshot(value),
+  } satisfies PartiallyCollectedSnapshot;
+}
+
+/** A count, list, or flag derived from one or more reads renders null when any of them was not answered. */
+function derived<T>(value: T, ...sources: Array<Collected<unknown>>): T | null {
+  return sources.every(sourceCollected) ? value : null;
+}
+
+/**
+ * The partial-view notes of a summary: the notes when there are any, null when a source was not read at
+ * all (the view is absent rather than partial), and [] only when every source was read completely.
+ */
+function partialViewOf(notes: Array<string | undefined>, ...sources: Array<Collected<unknown>>): string[] | null {
+  const present = notes.filter((note): note is string => Boolean(note));
+  if (present.length > 0) return present;
+  return sources.every(sourceCollected) ? [] : null;
 }
 
 interface Verdict {
@@ -1529,8 +1695,17 @@ async function collect<T>(label: string, fallback: T, load: () => Promise<T>, er
       value: fallback,
       error: message,
       httpStatus: error instanceof MulesoftApiError ? error.status : undefined,
+      endpoint: error instanceof MulesoftApiError ? error.endpoint : undefined,
     };
   }
+}
+
+/** A read that was never requested because the list it depends on failed; the reason names that parent. */
+function skippedSource<T>(label: string, parent: Collected<unknown>, fallback: T): Collected<T> {
+  const reason = parent.error
+    ? `the ${parent.label} read failed (${parent.error}), so there were no ${parent.label} to scope the ${label} read`
+    : `the ${parent.label} read was not requested (${parent.skipped}), so there were no ${parent.label} to scope the ${label} read`;
+  return { label, value: fallback, skipped: reason, skippedParent: parent.label, httpStatus: parent.httpStatus };
 }
 
 async function collectPage(label: string, load: () => Promise<MulesoftListResult>, errors: string[]): Promise<Collected<MulesoftPage>> {
@@ -1546,19 +1721,27 @@ function failedSource(label: string, error: string): Collected<undefined> {
   return { label, value: undefined, error };
 }
 
-function mergeSources(label: string, sources: Array<Collected<unknown>>): Collected<undefined> {
-  const failed = sources.filter((source) => source.error);
+/**
+ * Combine per-item reads into one source. When the parent list the reads depend on was not collected,
+ * the merged source is skipped and names that parent, so an empty set of reads is never mistaken for
+ * a successful empty read.
+ */
+function mergeSources(label: string, sources: Array<Collected<unknown>>, parent?: Collected<unknown>): Collected<undefined> {
+  if (parent && !sourceCollected(parent)) return skippedSource(label, parent, undefined);
+  const failed = sources.filter((source) => !sourceCollected(source));
   if (failed.length === 0) return readySource(label);
-  const detail = failed.slice(0, 3).map((source) => `${source.label}: ${source.error}`).join("; ");
+  const detail = failed.slice(0, 3).map((source) => `${source.label}: ${sourceFailure(source)}`).join("; ");
   return {
     label,
     value: undefined,
     error: `${failed.length} of ${sources.length} reads failed (${detail}${failed.length > 3 ? "; ..." : ""})`,
     httpStatus: failed[0].httpStatus,
+    endpoint: failed[0].endpoint,
   };
 }
 
 function describeFailure(source: Collected<unknown>): string {
+  if (source.skipped) return `${source.label} was not requested because ${source.skipped}`;
   const status = source.httpStatus;
   const cause = status === 401 || status === 403
     ? `the credential lacks permission (HTTP ${status})`
@@ -1578,17 +1761,22 @@ function evaluate(
   evidenceToCollect: string,
   compute: () => Verdict,
 ): MulesoftFinding {
-  const primaryFailures = inputs.primary.filter((source) => source.error);
-  const secondaryFailures = (inputs.secondary ?? []).filter((source) => source.error);
+  const failures = [...inputs.primary, ...(inputs.secondary ?? [])].filter((source) => !sourceCollected(source));
+  // A read skipped because its parent failed is reported through the parent when both feed this finding.
+  const cascaded = (source: Collected<unknown>): boolean =>
+    source.skippedParent !== undefined && failures.some((failure) => failure.label === source.skippedParent);
+  const primaryFailures = inputs.primary.filter((source) => !sourceCollected(source) && !cascaded(source));
+  const secondaryFailures = (inputs.secondary ?? []).filter((source) => !sourceCollected(source) && !cascaded(source));
   const unreadableSources = [...primaryFailures, ...secondaryFailures].map(describeFailure);
   const partialView = (inputs.partial ?? []).filter((note): note is string => Boolean(note));
 
   if (primaryFailures.length > 0) {
+    // A list that was never read has no partial view to report; null says so where [] would claim a complete empty read.
     return finding(
       number,
       "manual",
       `Could not evaluate: ${primaryFailures.map(describeFailure).join("; ")}. ${evidenceToCollect}`,
-      { unreadable_sources: unreadableSources, partial_view: partialView },
+      { unreadable_sources: unreadableSources, partial_view: partialView.length > 0 ? partialView : null },
     );
   }
 
@@ -1834,8 +2022,8 @@ export async function assessMulesoftIdentityAccess(
       : undefined;
     roleGroupDetails.push({ roleGroup, roles, users });
   }
-  const roleGroupRolesSource = mergeSources("role_group_roles", roleGroupDetails.map((detail) => detail.roles));
-  const adminUsersSource = mergeSources("role_group_users", roleGroupDetails.flatMap((detail) => (detail.users ? [detail.users] : [])));
+  const roleGroupRolesSource = mergeSources("role_group_roles", roleGroupDetails.map((detail) => detail.roles), roleGroups);
+  const adminUsersSource = mergeSources("role_group_users", roleGroupDetails.flatMap((detail) => (detail.users ? [detail.users] : [])), roleGroups);
 
   const connectedAppScopes: Array<{ app: JsonRecord; scopes: Collected<MulesoftPage> }> = [];
   for (const app of connectedApps.value.items) {
@@ -1846,7 +2034,7 @@ export async function assessMulesoftIdentityAccess(
       : { ...failedSource(`connected_app_scopes:${name}`, "connected app has no client_id"), value: toPage([]) };
     connectedAppScopes.push({ app, scopes });
   }
-  const scopesSource = mergeSources("connected_app_scopes", connectedAppScopes.map((item) => item.scopes));
+  const scopesSource = mergeSources("connected_app_scopes", connectedAppScopes.map((item) => item.scopes), connectedApps);
 
   const providers = identityProviders.value.items;
   const providerSummaries = providers.map((provider) => ({
@@ -1932,7 +2120,7 @@ export async function assessMulesoftIdentityAccess(
   const findings: MulesoftFinding[] = [
     evaluate(
       1,
-      { primary: [identityProviders, organization], secondary: [identityProviderSettings], partial: [scopeNote] },
+      { primary: [identityProviders, organization], secondary: [identityProviderSettings], partial: [scopeNote, truncationNote("identity provider", identityProviders.value)] },
       "Export Access Management > Identity Providers (type and status) and the organization SSO settings as evidence.",
       () => {
         const evidence = {
@@ -2197,39 +2385,63 @@ export async function assessMulesoftIdentityAccess(
   return {
     category: "identity_access",
     title: "MuleSoft identity and access posture",
+    // Counts derived from a list that was not read render null rather than the empty fallback's zero.
     summary: {
       organization_id: config.organizationId,
-      identity_providers: providers.length,
-      members_sampled: members.value.items.length,
-      members_truncated: members.value.truncated,
-      mfa_exempt_users: exemptFlagged.length,
-      organization_admins: adminUsers.size,
-      role_groups: roleGroupItems.length,
-      environments: environmentItems.length,
-      connected_apps: connectedAppItems.length,
-      stale_connected_apps: staleApps.length,
-      business_groups: subOrganizations.length,
+      identity_providers: derived(providers.length, identityProviders),
+      identity_providers_truncated: derived(identityProviders.value.truncated, identityProviders),
+      members_sampled: derived(members.value.items.length, members),
+      members_total: derived(members.value.total ?? null, members),
+      members_truncated: derived(members.value.truncated, members),
+      mfa_exempt_users: derived(exemptFlagged.length, mfaExemptUsers),
+      organization_admins: derived(adminUsers.size, roleGroups, adminUsersSource),
+      role_groups: derived(roleGroupItems.length, roleGroups),
+      environments: derived(environmentItems.length, environments),
+      connected_apps: derived(connectedAppItems.length, connectedApps),
+      stale_connected_apps: derived(staleApps.length, connectedApps),
+      business_groups: derived(subOrganizations.length, hierarchy),
       unreadable_sources: errors.length,
+      inventories: describeSources(organization, hierarchy, identityProviders, identityProviderSettings, members, mfaExemptUsers, roleGroups, roleGroupRolesSource, adminUsersSource, environments, connectedApps, scopesSource),
     },
     findings,
     snapshots: {
-      organization: redactSnapshot(organization.value),
-      organization_hierarchy: redactSnapshot(hierarchy.value),
-      identity_providers: redactSnapshot(providers),
-      identity_provider_settings: redactSnapshot(identityProviderSettings.value),
-      members: redactSnapshot(members.value.items),
-      mfa_exempt_users: redactSnapshot(exemptReturned),
-      role_groups: redactSnapshot(roleGroupDetails.map((detail) => ({
+      organization: snapshotOf(organization, organization.value),
+      organization_hierarchy: snapshotOf(hierarchy, hierarchy.value),
+      identity_providers: snapshotOf(identityProviders, providers),
+      identity_provider_settings: snapshotOf(identityProviderSettings, identityProviderSettings.value),
+      members: snapshotOf(members, members.value.items),
+      mfa_exempt_users: snapshotOf(mfaExemptUsers, exemptReturned),
+      role_groups: snapshotOf(roleGroups, roleGroupDetails.map((detail) => ({
         role_group: detail.roleGroup,
-        roles: detail.roles.value.items,
-        roles_truncated: detail.roles.value.truncated,
-        users: detail.users?.value.items ?? [],
+        roles: sourceCollected(detail.roles) ? detail.roles.value.items : notCollectedMarker(detail.roles),
+        roles_truncated: derived(detail.roles.value.truncated, detail.roles),
+        users: detail.users === undefined ? null : sourceCollected(detail.users) ? detail.users.value.items : notCollectedMarker(detail.users),
       }))),
-      environments: redactSnapshot(environmentItems),
-      connected_applications: redactSnapshot(connectedAppScopes.map((item) => ({ ...item.app, scopes: item.scopes.value.items }))),
+      environments: snapshotOf(environments, environmentItems),
+      connected_applications: snapshotOf(connectedApps, connectedAppScopes.map((item) => ({
+        ...item.app,
+        scopes: sourceCollected(item.scopes) ? item.scopes.value.items : notCollectedMarker(item.scopes),
+      }))),
     },
     errors,
   };
+}
+
+/** One line per source stating whether it was read completely, partially, or not at all. */
+function describeSources(...sources: Array<Collected<unknown>>): Record<string, string> {
+  return Object.fromEntries(sources.map((source) => [source.label, describeSource(source)]));
+}
+
+function describeSource(source: Collected<unknown>): string {
+  if (source.skipped) return `not requested (${source.skipped})`;
+  if (source.error) return `unread (${source.error})`;
+  if (isPage(source.value)) {
+    return source.value.truncated
+      ? `partial (${source.value.items.length} of ${pageTotalLabel(source.value)})`
+      : `complete (${source.value.items.length} item${source.value.items.length === 1 ? "" : "s"})`;
+  }
+  if (Array.isArray(source.value)) return `complete (${source.value.length} item${source.value.length === 1 ? "" : "s"})`;
+  return "complete";
 }
 
 function policyAssetId(policy: JsonRecord): string {
@@ -2375,8 +2587,8 @@ export async function assessMulesoftApiGateway(
       apiRecords.push({ environment, api, policies });
     }
   }
-  const apisSource = mergeSources("managed_apis", apiSources);
-  const policiesSource = mergeSources("api_policies", apiRecords.map((record) => record.policies));
+  const apisSource = mergeSources("managed_apis", apiSources, environments.source);
+  const policiesSource = mergeSources("api_policies", apiRecords.map((record) => record.policies), apisSource);
 
   const exchangeAssets = await collectPage("exchange_assets", () => client.listExchangeAssets(), errors);
   const organizationAssets = exchangeAssets.value.items.filter((asset) => {
@@ -2406,7 +2618,7 @@ export async function assessMulesoftApiGateway(
     primary: [environments.source, apisSource, policiesSource],
     partial: gatewayPartialNotes,
   };
-  const apiInventoryFailure = [environments.source, apisSource].find((source) => source.error);
+  const apiInventoryFailure = [environments.source, apisSource].find((source) => !sourceCollected(source));
 
   const findings: MulesoftFinding[] = [
     evaluate(
@@ -2443,9 +2655,9 @@ export async function assessMulesoftApiGateway(
         : `Anypoint Platform does not expose client secret rotation timestamps. Export the ${activeContracts} active contract(s) from API Manager > API instance > Contracts and the client applications from Exchange > My Applications, then confirm each client secret was reset within the rotation period.`,
       {
         active_contracts: apiInventoryFailure ? null : activeContracts,
-        apis_sampled: apiRecords.length,
+        apis_sampled: apiInventoryFailure ? null : apiRecords.length,
         unreadable_sources: apiInventoryFailure ? [describeFailure(apiInventoryFailure)] : [],
-        partial_view: gatewayPartialNotes.filter((note): note is string => Boolean(note)),
+        partial_view: partialViewOf(gatewayPartialNotes, environments.source, apisSource),
       },
     ),
     evaluate(
@@ -2473,30 +2685,32 @@ export async function assessMulesoftApiGateway(
   return {
     category: "api_gateway",
     title: "MuleSoft API gateway and Exchange posture",
+    // Counts derived from a list that was not read render null rather than the empty fallback's zero.
     summary: {
       organization_id: config.organizationId,
-      environments_visible: environments.all.length,
-      environments_sampled: environments.sampled.length,
-      apis_sampled: apiRecords.length,
-      production_apis: productionApis.length,
-      production_without_authentication: productionWithoutAuth.length,
-      production_without_rate_limiting: productionWithoutRateLimit.length,
-      active_contracts: activeContracts,
-      exchange_assets: organizationAssets.length,
-      public_exchange_assets: publicAssets.length,
-      partial_view: gatewayPartialNotes.filter((note): note is string => Boolean(note)),
+      environments_visible: derived(environments.all.length, environments.source),
+      environments_sampled: derived(environments.sampled.length, environments.source),
+      apis_sampled: derived(apiRecords.length, environments.source, apisSource),
+      production_apis: derived(productionApis.length, environments.source, apisSource),
+      production_without_authentication: derived(productionWithoutAuth.length, environments.source, apisSource, policiesSource),
+      production_without_rate_limiting: derived(productionWithoutRateLimit.length, environments.source, apisSource, policiesSource),
+      active_contracts: derived(activeContracts, environments.source, apisSource),
+      exchange_assets: derived(organizationAssets.length, exchangeAssets),
+      public_exchange_assets: derived(publicAssets.length, exchangeAssets),
+      partial_view: partialViewOf(gatewayPartialNotes, environments.source, apisSource, policiesSource, exchangeAssets),
       unreadable_sources: errors.length,
+      inventories: describeSources(environments.source, apisSource, policiesSource, exchangeAssets),
     },
     findings,
     snapshots: {
-      api_manager_apis: redactSnapshot(apiRecords.map((record) => ({
+      api_manager_apis: snapshotOf(apisSource, apiRecords.map((record) => ({
         environment: environmentLabel(record.environment),
         environment_id: asString(record.environment.id),
         api: record.api,
-        policies: record.policies.value.map(projectApiPolicy),
+        policies: sourceCollected(record.policies) ? record.policies.value.map(projectApiPolicy) : notCollectedMarker(record.policies),
         policies_error: record.policies.error ?? null,
-      }))),
-      exchange_assets: redactSnapshot(organizationAssets),
+      })), apiSources),
+      exchange_assets: snapshotOf(exchangeAssets, organizationAssets),
     },
     errors,
   };
@@ -2780,12 +2994,12 @@ export async function assessMulesoftRuntimeInfrastructure(
     secretGroupSources.push(secretGroups);
     secretGroupsByEnvironment.push({ environment, secretGroups: secretGroups.value });
   }
-  const applicationsSource = mergeSources("cloudhub_applications", applicationSources);
-  const serversSource = mergeSources("hybrid_servers", serverSources);
-  const mqRegionsSource = mergeSources("mq_regions", mqRegionSources);
-  const mqQueuesSource = mergeSources("mq_queues", mqQueueSources);
-  const mqClientsSource = mergeSources("mq_clients", mqClientSources);
-  const secretGroupsSource = mergeSources("secret_groups", secretGroupSources);
+  const applicationsSource = mergeSources("cloudhub_applications", applicationSources, environments.source);
+  const serversSource = mergeSources("hybrid_servers", serverSources, environments.source);
+  const mqRegionsSource = mergeSources("mq_regions", mqRegionSources, environments.source);
+  const mqQueuesSource = mergeSources("mq_queues", mqQueueSources, mqRegionsSource);
+  const mqClientsSource = mergeSources("mq_clients", mqClientSources, mqRegionsSource);
+  const secretGroupsSource = mergeSources("secret_groups", secretGroupSources, environments.source);
 
   const vpcSummaries = await collectPage("vpcs", () => client.listVpcs(DEFAULT_VPC_LIMIT), errors);
   const vpcPage = capPage(vpcSummaries.value, DEFAULT_VPC_LIMIT);
@@ -2800,7 +3014,7 @@ export async function assessMulesoftRuntimeInfrastructure(
     vpcDetails.push(detail);
     vpcs.push({ ...vpc, ...detail.value });
   }
-  const vpcDetailsSource = mergeSources("vpc_details", vpcDetails);
+  const vpcDetailsSource = mergeSources("vpc_details", vpcDetails, vpcSummaries);
   const vpcPartialNote = truncationNote("VPC", vpcPage);
   const vpcsWithoutRules = vpcs.filter((vpc) => !Array.isArray(vpc.firewallRules));
 
@@ -2819,7 +3033,7 @@ export async function assessMulesoftRuntimeInfrastructure(
     loadBalancerDetails.push(detail);
     loadBalancers.push({ ...summary, ...detail.value });
   }
-  const loadBalancerDetailsSource = mergeSources("load_balancer_details", loadBalancerDetails);
+  const loadBalancerDetailsSource = mergeSources("load_balancer_details", loadBalancerDetails, loadBalancerSource);
   const loadBalancerPartialNote = truncationNote("load balancer", loadBalancerPage);
   // Certificate probes read sslEndpoints from the merged record, so a failed detail read leaves endpoints unprobed.
   const loadBalancerDetailNote = loadBalancerDetailsSource.error
@@ -3234,39 +3448,44 @@ export async function assessMulesoftRuntimeInfrastructure(
   return {
     category: "runtime_infrastructure",
     title: "MuleSoft runtime and infrastructure posture",
+    // Counts derived from a list that was not read render null rather than the empty fallback's zero.
     summary: {
       organization_id: config.organizationId,
-      environments_visible: environments.all.length,
-      environments_sampled: environments.sampled.length,
-      cloudhub_applications: applicationRecords.length,
-      applications_not_inspected: applicationsDropped,
-      unsupported_runtime_applications: unsupportedRuntime.length,
-      vpcs: vpcs.length,
-      firewall_rules: firewallRules.length,
-      load_balancers: loadBalancers.length,
-      hybrid_servers: servers.length,
-      mq_queues: allQueues.length,
-      secret_groups: totalSecretGroups,
-      partial_view: [...applicationPartialNotes, vpcPartialNote, loadBalancerPartialNote].filter((note): note is string => Boolean(note)),
+      environments_visible: derived(environments.all.length, environments.source),
+      environments_sampled: derived(environments.sampled.length, environments.source),
+      cloudhub_applications: derived(applicationRecords.length, environments.source, applicationsSource),
+      applications_not_inspected: derived(applicationsDropped, environments.source, applicationsSource),
+      unsupported_runtime_applications: derived(unsupportedRuntime.length, environments.source, applicationsSource),
+      vpcs: derived(vpcs.length, vpcSummaries),
+      firewall_rules: derived(firewallRules.length, vpcSummaries, vpcDetailsSource),
+      load_balancers: derived(loadBalancers.length, loadBalancerSource),
+      hybrid_servers: derived(servers.length, environments.source, serversSource),
+      mq_queues: derived(allQueues.length, environments.source, mqRegionsSource, mqQueuesSource),
+      secret_groups: derived(totalSecretGroups, environments.source, secretGroupsSource),
+      partial_view: partialViewOf(
+        [...applicationPartialNotes, vpcPartialNote, loadBalancerPartialNote],
+        environments.source, applicationsSource, serversSource, mqRegionsSource, mqQueuesSource, mqClientsSource, secretGroupsSource, vpcSummaries, vpcDetailsSource, loadBalancerSource, loadBalancerDetailsSource,
+      ),
       unreadable_sources: errors.length,
+      inventories: describeSources(environments.source, applicationsSource, serversSource, mqRegionsSource, mqQueuesSource, mqClientsSource, secretGroupsSource, vpcSummaries, vpcDetailsSource, loadBalancerSource, loadBalancerDetailsSource),
     },
     findings,
     snapshots: {
-      cloudhub_applications: redactSnapshot(applications.map((item) => ({
+      cloudhub_applications: snapshotOf(applicationsSource, applications.map((item) => ({
         environment: environmentLabel(item.environment),
         environment_id: asString(item.environment.id),
         application: projectCloudhubApplication(item.application),
-      }))),
-      vpcs: redactSnapshot(vpcs),
-      load_balancers: redactSnapshot(loadBalancers),
+      })), applicationSources),
+      vpcs: snapshotOf(vpcSummaries, vpcs),
+      load_balancers: snapshotOf(loadBalancerSource, loadBalancers),
       load_balancer_certificates: certificateResults,
-      hybrid_servers: redactSnapshot(servers.map((item) => ({ environment: environmentLabel(item.environment), server: item.server }))),
-      mq_queues: redactSnapshot(mqInventory),
-      mq_clients: redactSnapshot(mqClients),
-      secret_groups: redactSnapshot(secretGroupsByEnvironment.map((item) => ({
+      hybrid_servers: snapshotOf(serversSource, servers.map((item) => ({ environment: environmentLabel(item.environment), server: item.server })), serverSources),
+      mq_queues: snapshotOf(mqQueuesSource, mqInventory, mqQueueSources),
+      mq_clients: snapshotOf(mqClientsSource, mqClients, mqClientSources),
+      secret_groups: snapshotOf(secretGroupsSource, secretGroupsByEnvironment.map((item) => ({
         environment: environmentLabel(item.environment),
         secret_groups: item.secretGroups,
-      }))),
+      })), secretGroupSources),
     },
     errors,
   };
@@ -3383,7 +3602,8 @@ export async function assessMulesoftAuditMonitoring(
   const recentQuery = await collect<JsonRecord>("audit_query", {}, () => client.queryAuditLogs({ startDate, endDate, limit: AUDIT_QUERY_PAGE_LIMIT }), errors);
   const recentEntries = extractCollection(recentQuery.value);
   const recentTotal = asNumber(recentQuery.value.total);
-  const fallbackQuery: Collected<JsonRecord> = !recentQuery.error && recentEntries.length === 0
+  const fallbackRequested = !recentQuery.error && recentEntries.length === 0;
+  const fallbackQuery: Collected<JsonRecord> = fallbackRequested
     ? await collect<JsonRecord>("audit_query_fallback", {}, () => client.queryAuditLogs({
       startDate: new Date(now - AUDIT_FALLBACK_LOOKBACK_DAYS * DAY_MS).toISOString(),
       endDate,
@@ -3437,8 +3657,9 @@ export async function assessMulesoftAuditMonitoring(
       unknownCoverageApplications,
     });
   }
-  const alertsSource = mergeSources("alerts", alertCoverage.flatMap((item) => [item.cloudhubAlerts, item.hybridAlerts]));
-  const applicationsSource = mergeSources("cloudhub_applications", alertCoverage.map((item) => item.applications));
+  const alertReads = alertCoverage.flatMap((item) => [item.cloudhubAlerts, item.hybridAlerts]);
+  const alertsSource = mergeSources("alerts", alertReads, environments.source);
+  const applicationsSource = mergeSources("cloudhub_applications", alertCoverage.map((item) => item.applications), environments.source);
 
   const environmentsWithoutAlerts = alertCoverage.filter((item) => item.enabledAlerts.length === 0 && item.unknownStateAlerts.length === 0);
   const environmentsWithOnlyUnknownAlerts = alertCoverage.filter((item) => item.enabledAlerts.length === 0 && item.unknownStateAlerts.length > 0);
@@ -3459,13 +3680,13 @@ export async function assessMulesoftAuditMonitoring(
           lookback_hours: lookbackHours,
           entries_in_window: entriesInWindow,
           entries_fetched: recentEntries.length,
-          entries_in_fallback_window: fallbackEntries.length,
+          entries_in_fallback_window: fallbackRequested ? fallbackEntries.length : null,
           fallback_lookback_days: AUDIT_FALLBACK_LOOKBACK_DAYS,
-          platforms: platforms.value.map((platform) => asString(platform.name) ?? asString(platform.label) ?? "platform"),
+          platforms: derived(platforms.value.map((platform) => asString(platform.name) ?? asString(platform.label) ?? "platform"), platforms),
           platforms_error: platforms.error ?? null,
           retention_period_days: retention.currentPeriodDays,
-          retention_scheduled_change: retention.scheduledChange,
-          retention_entries: retention.entries,
+          retention_scheduled_change: derived(retention.scheduledChange, retentionSettings),
+          retention_entries: derived(retention.entries, retentionSettings),
           retention_settings_error: retentionSettings.error ?? null,
           retention_settings_source: "GET /audit/v2/organizations/{orgId}/retentionSettings; evidence only, the verdict does not depend on it",
           recent_entries: sample(recentEntries.map(auditEntrySummary), 10),
@@ -3492,13 +3713,13 @@ export async function assessMulesoftAuditMonitoring(
         const evidence = {
           production_environments: alertCoverage.map((item) => ({
             environment: item.environment,
-            cloudhub_alerts: item.cloudhubAlerts.value.length,
-            runtime_manager_alerts: item.hybridAlerts.value.length,
-            enabled_alerts: item.enabledAlerts.length,
-            unknown_state_alerts: item.unknownStateAlerts.length,
-            applications: item.applications.value.length,
-            uncovered_applications: sample(item.uncoveredApplications),
-            unknown_coverage_applications: sample(item.unknownCoverageApplications),
+            cloudhub_alerts: derived(item.cloudhubAlerts.value.length, item.cloudhubAlerts),
+            runtime_manager_alerts: derived(item.hybridAlerts.value.length, item.hybridAlerts),
+            enabled_alerts: derived(item.enabledAlerts.length, item.cloudhubAlerts, item.hybridAlerts),
+            unknown_state_alerts: derived(item.unknownStateAlerts.length, item.cloudhubAlerts, item.hybridAlerts),
+            applications: derived(item.applications.value.length, item.applications),
+            uncovered_applications: derived(sample(item.uncoveredApplications), item.applications, item.cloudhubAlerts, item.hybridAlerts),
+            unknown_coverage_applications: derived(sample(item.unknownCoverageApplications), item.applications, item.cloudhubAlerts, item.hybridAlerts),
           })),
           environments_without_alerts: environmentsWithoutAlerts.map((item) => item.environment),
           production_environments_sampled: productionSampleNote(environments),
@@ -3529,30 +3750,34 @@ export async function assessMulesoftAuditMonitoring(
   return {
     category: "audit_monitoring",
     title: "MuleSoft audit logging and monitoring posture",
+    // Counts derived from a list that was not read render null rather than the empty fallback's zero.
     summary: {
       organization_id: config.organizationId,
-      audit_platforms: platforms.value.length,
-      audit_entries_in_window: recentTotal ?? recentEntries.length,
+      audit_platforms: derived(platforms.value.length, platforms),
+      audit_entries_in_window: derived(recentTotal ?? recentEntries.length, recentQuery),
       audit_lookback_hours: lookbackHours,
-      audit_retention_period_days: retention.currentPeriodDays,
-      environments_visible: environments.all.length,
-      production_environments: productionEnvironments.length,
-      production_applications: totalProductionApplications,
-      enabled_alerts: totalEnabledAlerts,
-      uncovered_production_applications: uncoveredApplications.length,
-      partial_view: environmentPartialNotes.filter((note): note is string => Boolean(note)),
+      audit_retention_period_days: derived(retention.currentPeriodDays, retentionSettings),
+      environments_visible: derived(environments.all.length, environments.source),
+      environments_total: derived(environments.source.value.total ?? null, environments.source),
+      environments_truncated: derived(environments.source.value.truncated, environments.source),
+      production_environments: derived(productionEnvironments.length, environments.source),
+      production_applications: derived(totalProductionApplications, environments.source, applicationsSource),
+      enabled_alerts: derived(totalEnabledAlerts, environments.source, alertsSource),
+      uncovered_production_applications: derived(uncoveredApplications.length, environments.source, applicationsSource, alertsSource),
+      partial_view: partialViewOf(environmentPartialNotes, platforms, retentionSettings, recentQuery, environments.source, alertsSource, applicationsSource),
       unreadable_sources: errors.length,
+      inventories: describeSources(platforms, retentionSettings, recentQuery, environments.source, alertsSource, applicationsSource),
     },
     findings,
     snapshots: {
-      audit_platforms: redactSnapshot(platforms.value),
-      audit_retention_settings: redactSnapshot(retentionSettings.value),
-      audit_log_recent: redactSnapshot(recentEntries.map(auditEntrySummary)),
-      alerts: redactSnapshot(alertCoverage.map((item) => ({
+      audit_platforms: snapshotOf(platforms, platforms.value),
+      audit_retention_settings: snapshotOf(retentionSettings, retentionSettings.value),
+      audit_log_recent: snapshotOf(recentQuery, recentEntries.map(auditEntrySummary)),
+      alerts: snapshotOf(alertsSource, alertCoverage.map((item) => ({
         environment: item.environment,
-        cloudhub_alerts: item.cloudhubAlerts.value,
-        runtime_manager_alerts: item.hybridAlerts.value,
-      }))),
+        cloudhub_alerts: sourceCollected(item.cloudhubAlerts) ? item.cloudhubAlerts.value : notCollectedMarker(item.cloudhubAlerts),
+        runtime_manager_alerts: sourceCollected(item.hybridAlerts) ? item.hybridAlerts.value : notCollectedMarker(item.hybridAlerts),
+      })), alertReads),
     },
     errors,
   };
@@ -3896,8 +4121,9 @@ function buildQuickReference(): string {
   return [
     "# MuleSoft Audit Bundle Quick Reference",
     "",
-    "- `core_data/` contains the Anypoint Platform API responses used during this assessment, with secret-bearing fields redacted; CloudHub application properties, API policy configuration, and audit log entries are projected to the fields the verdicts read.",
-    "- `analysis/findings.json` contains every normalized finding; `analysis/<category>.json` contains each assessment with its summary.",
+    "- `core_data/` contains the Anypoint Platform API responses used during this assessment, with secret-bearing fields redacted and URL-valued fields reduced to scheme and host; CloudHub application properties, API policy configuration, and audit log entries are projected to the fields the verdicts read.",
+    "- A dataset that was denied, errored, or never requested (because the list it depends on failed) is written as `{ collected: false, dataset, status, endpoint, error }` instead of an empty list, so `[]` always means a readable list with no items; a dataset assembled from several reads of which some failed is written as `{ collected: \"partial\", failed_reads, items }`.",
+    "- `analysis/findings.json` contains every normalized finding; `analysis/<category>.json` contains each assessment with its summary and an `inventories` map stating each source as complete, partial, unread, or not requested; counts derived from an unread or unrequested source render null rather than zero.",
     "- `analysis/summary.json` contains per-category status counts.",
     "- `compliance/` contains the executive summary, the unified matrix, and one report per framework (FedRAMP, CMMC, SOC 2, CIS, PCI-DSS, DISA STIG, IRAP, ISMAP).",
     "- `_errors.log` appears only when some reads fail but the bundle still completes.",
@@ -4227,7 +4453,7 @@ export function registerMulesoftTools(pi: any): void {
     name: "mulesoft_export_audit_bundle",
     label: "Export MuleSoft audit bundle",
     description:
-      "Export a MuleSoft Anypoint Platform audit package covering all 25 spec controls: raw API snapshots in core_data/, findings and category summaries in analysis/, executive summary, unified matrix, and per-framework reports in compliance/, a QUICK_REFERENCE.md, an _errors.log when collection partially fails, and a zip archive.",
+      "Export a MuleSoft Anypoint Platform audit package covering all 25 spec controls: redacted and projected API snapshots in core_data/ (denied or unrequested datasets written as not-collected markers), findings and category summaries in analysis/, executive summary, unified matrix, and per-framework reports in compliance/, a QUICK_REFERENCE.md, an _errors.log when collection partially fails, and a zip archive.",
     parameters: Type.Object({
       ...authParams,
       output_dir: Type.Optional(Type.String({ description: `Output root. Defaults to ${DEFAULT_OUTPUT_DIR}.` })),
