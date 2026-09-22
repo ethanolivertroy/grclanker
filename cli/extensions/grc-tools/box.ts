@@ -242,9 +242,18 @@ export interface BoxAuditBundleResult {
   errorCount: number;
 }
 
+/** Why a collection stopped short, and whether a higher record cap would have read further. */
+export interface BoxTruncation {
+  reason: string;
+  /** True when the collection stopped at its record cap; false for a fixed cap or a server that could not be paged further. */
+  capReached: boolean;
+}
+
 export interface BoxListPage {
   items: JsonRecord[];
   truncated: boolean;
+  /** Present when `truncated` is true: the cap, a repeated marker, or a page the server left empty. */
+  truncation?: BoxTruncation;
 }
 
 export interface CollectedDataset<T> {
@@ -257,6 +266,8 @@ export interface CollectedDataset<T> {
   /** True when no request was made because a dataset it depends on could not be read. */
   notRequested?: boolean;
   truncated?: boolean;
+  /** The loader's account of why the collection stopped short, carried when `truncated` is true. */
+  truncation?: BoxTruncation;
 }
 
 /**
@@ -1275,6 +1286,20 @@ function completePage(items: JsonRecord[]): BoxListPage {
   return { items, truncated: false };
 }
 
+/** The scrubbed page a loader returns: complete when no truncation was recorded, truncated with its reason otherwise. */
+function listPage(items: JsonRecord[], truncation: BoxTruncation | undefined): BoxListPage {
+  const scrubbed = items.map(scrubCollectedRecord);
+  return truncation === undefined ? completePage(scrubbed) : { items: scrubbed, truncated: true, truncation };
+}
+
+function capTruncation(reason: string): BoxTruncation {
+  return { reason, capReached: true };
+}
+
+function pagingTruncation(reason: string): BoxTruncation {
+  return { reason, capReached: false };
+}
+
 /**
  * The documented shape of a successful body. Every list the inspector reads answers with an object carrying an
  * `entries` array (empty when the inventory is empty); a single resource answers with an object carrying at least one
@@ -1613,7 +1638,7 @@ export class BoxApiClient implements BoxReadClient {
     const pageSize = clampNumber(options.pageSize, DEFAULT_PAGE_SIZE, 1, 1000);
     const items: JsonRecord[] = [];
     let marker: string | undefined;
-    let truncated = false;
+    let truncation: BoxTruncation | undefined;
 
     while (true) {
       const remaining = limit - items.length;
@@ -1627,22 +1652,27 @@ export class BoxApiClient implements BoxReadClient {
       items.push(...entries.slice(0, remaining));
       const nextMarker = asString(payload.next_marker);
       if (entries.length === 0) {
-        truncated = Boolean(nextMarker);
+        if (nextMarker) truncation = pagingTruncation("the server returned an empty page while still offering a next marker");
         break;
       }
       if (entries.length > remaining) {
-        truncated = true;
+        truncation = capTruncation(`the ${limit}-record cap was reached while the server returned more records than requested`);
         break;
       }
-      if (!nextMarker) break;
+      if (!nextMarker) {
+        // A full last page at the cap with no next marker is the API's end signal, but it is indistinguishable from
+        // a server that dropped the marker, so the remainder is reported unknown rather than absent.
+        if (items.length >= limit) truncation = capTruncation(`the last page was full at the ${limit}-record cap and the server gave no next marker, so the remainder is unknown`);
+        break;
+      }
       if (items.length >= limit) {
-        truncated = true;
+        truncation = capTruncation(`the ${limit}-record cap was reached while the server offered a next marker`);
         break;
       }
       marker = nextMarker;
     }
 
-    return { items: items.map(scrubCollectedRecord), truncated };
+    return listPage(items, truncation);
   }
 
   async listOffset(
@@ -1654,7 +1684,7 @@ export class BoxApiClient implements BoxReadClient {
     const pageSize = clampNumber(options.pageSize, DEFAULT_PAGE_SIZE, 1, 1000);
     const items: JsonRecord[] = [];
     let offset = 0;
-    let truncated = false;
+    let truncation: BoxTruncation | undefined;
 
     while (true) {
       const remaining = limit - items.length;
@@ -1664,19 +1694,24 @@ export class BoxApiClient implements BoxReadClient {
       items.push(...entries.slice(0, remaining));
       offset += entries.length;
       const totalCount = asNumber(payload.total_count);
+      const reportedTotal = totalCount !== undefined ? ` while the server reported ${totalCount} records in total` : " while the last page was still full";
       const moreAvailable = totalCount !== undefined ? offset < totalCount : entries.length >= requested;
       if (entries.length === 0) {
-        truncated = moreAvailable && totalCount !== undefined;
+        if (moreAvailable && totalCount !== undefined) truncation = pagingTruncation(`the server returned an empty page${reportedTotal}`);
+        break;
+      }
+      if (entries.length > remaining) {
+        truncation = capTruncation(`the ${limit}-record cap was reached while the server returned more records than requested`);
         break;
       }
       if (!moreAvailable) break;
       if (items.length >= limit) {
-        truncated = true;
+        truncation = capTruncation(`the ${limit}-record cap was reached${reportedTotal}`);
         break;
       }
     }
 
-    return { items: items.map(scrubCollectedRecord), truncated };
+    return listPage(items, truncation);
   }
 
   async getCurrentUser(): Promise<JsonRecord> {
@@ -1723,8 +1758,9 @@ export class BoxApiClient implements BoxReadClient {
     const key = `EVENTS ${JSON.stringify([options.eventTypes ?? [], options.createdAfter?.toISOString() ?? null, limit])}`;
     return this.memoized(key, async () => {
       const items: JsonRecord[] = [];
+      const seenEventIds = new Set<string>();
       let streamPosition: string | undefined;
-      let truncated = false;
+      let truncation: BoxTruncation | undefined;
       while (true) {
         const remaining = limit - items.length;
         const payload = await this.requestJson(this.buildUrl("/events", {
@@ -1735,16 +1771,37 @@ export class BoxApiClient implements BoxReadClient {
           stream_position: streamPosition,
         }), { method: "GET" }, { shape: LIST_SHAPE });
         const entries = asRecordArray(payload.entries);
-        items.push(...entries.slice(0, remaining));
+        // A server that repeats its stream position re-serves the same page; an event already collected is not
+        // counted twice, so the truncated sample holds each event once.
+        const unseen = entries.filter((entry) => {
+          const eventId = asString(entry.event_id);
+          if (eventId === undefined) return true;
+          if (seenEventIds.has(eventId)) return false;
+          seenEventIds.add(eventId);
+          return true;
+        });
+        items.push(...unseen.slice(0, remaining));
         const nextPosition = asString(payload.next_stream_position);
         if (entries.length === 0) break;
-        if (!nextPosition || nextPosition === streamPosition || entries.length > remaining || items.length >= limit) {
-          truncated = true;
+        if (!nextPosition) {
+          truncation = pagingTruncation("the server returned a page without a next stream position, so the remainder is unknown");
+          break;
+        }
+        if (nextPosition === streamPosition) {
+          truncation = pagingTruncation("the server repeated its stream position, so the remaining events could not be paged");
+          break;
+        }
+        if (entries.length > remaining) {
+          truncation = capTruncation(`the ${limit}-event cap was reached while the server returned more events than requested`);
+          break;
+        }
+        if (items.length >= limit) {
+          truncation = capTruncation(`the ${limit}-event cap was reached while the server offered a next stream position`);
           break;
         }
         streamPosition = nextPosition;
       }
-      return { items: items.map(scrubCollectedRecord), truncated };
+      return listPage(items, truncation);
     });
   }
 
@@ -1829,6 +1886,7 @@ async function collectList(loader: () => Promise<BoxListPage>): Promise<Collecte
     statusCode: collected.statusCode,
     request: collected.request,
     truncated: collected.error ? undefined : collected.data.truncated,
+    truncation: collected.error ? undefined : collected.data.truncation,
   };
 }
 
@@ -1845,6 +1903,30 @@ function isComplete(dataset: CollectedDataset<unknown>): boolean {
 /** A value derived from a dataset renders only when the dataset was read at all. */
 function whenRead<T>(dataset: CollectedDataset<unknown>, value: T): T | null {
   return isRead(dataset) ? value : null;
+}
+
+/** A count or breakdown taken from a truncated sample, labelled as observed beside the sample size and the flag. */
+interface SampledValue<T> {
+  observed: T;
+  sampled_events: number;
+  events_truncated: true;
+}
+
+/**
+ * A count or breakdown derived from an event sample: the value itself when the read completed whole, and, when the
+ * collection stopped at the cap, the value labelled as observed beside the sample size and the truncation flag, so a
+ * `0` or an empty breakdown taken from a partial sample is never written as a bare leaf that reads as a complete count.
+ */
+function sampledValue<T>(dataset: CollectedDataset<JsonRecord[]>, value: T): T | SampledValue<T> | null {
+  if (!isRead(dataset)) return null;
+  if (dataset.truncated !== true) return value;
+  return { observed: value, sampled_events: dataset.data.length, events_truncated: true };
+}
+
+/** "3", "unread", or "0 among 5 sampled events (collection truncated)" for a count taken from an event sample. */
+function sampledCountText(dataset: CollectedDataset<JsonRecord[]>, count: number): string {
+  if (!isRead(dataset)) return "unread";
+  return dataset.truncated === true ? `${count} among ${dataset.data.length} sampled events (collection truncated)` : String(count);
 }
 
 /** A value joined across several datasets renders only when every one of them was read. */
@@ -1914,10 +1996,26 @@ function datasetRecordCount(data: unknown): number | null {
   return values.length > 0 ? 1 : 0;
 }
 
+/**
+ * "stopped after N records because <the loader's reason>" when the loader recorded why it stopped, and the generic
+ * cap wording for a page that carried the flag alone, so the note names the cap that applied and the exit taken.
+ */
+function truncationClause(dataset: CollectedDataset<unknown>, count: number, unit: string, generic: string): string {
+  return dataset.truncation
+    ? `stopped after ${count} ${unit} because ${dataset.truncation.reason}`
+    : `stopped at the ${count}-${unit.replace(/s$/, "")} cap while ${generic}`;
+}
+
+/** Raising the named limit is the remedy only for a cap exit; a fixed cap or a server that could not be paged further needs the Admin Console. */
+function truncationRemedy(dataset: CollectedDataset<unknown>, limitOption?: string): string {
+  const capReached = dataset.truncation?.capReached ?? true;
+  return capReached && limitOption ? `raise ${limitOption} and rerun` : "review the remainder in the Admin Console";
+}
+
 function datasetTruncations(label: string, dataset: CollectedDataset<unknown>, limitOption?: string): string[] {
   if (!dataset.truncated) return [];
-  const remedy = limitOption ? `raise ${limitOption} and rerun` : `the built-in ${DEFAULT_LIST_LIMIT}-record cap was reached, so review the remainder in the Admin Console`;
-  return [`${label}: collection stopped at the ${datasetRecordCount(dataset.data) ?? 0}-record cap while the server reported more records; ${remedy} before treating absence as compliance`];
+  const clause = truncationClause(dataset, datasetRecordCount(dataset.data) ?? 0, "records", "the server reported more records");
+  return [`${label}: collection ${clause}; ${truncationRemedy(dataset, limitOption)} before treating absence as compliance`];
 }
 
 function finding(
@@ -2064,12 +2162,13 @@ function isExemptFromLoginVerification(user: JsonRecord): boolean {
   return asBoolean(user.is_exempt_from_login_verification) === true;
 }
 
-function userInventoryGap(users: JsonRecord[], truncated: boolean): string | undefined {
+function userInventoryGap(dataset: CollectedDataset<JsonRecord[]>): string | undefined {
+  const users = dataset.data;
   if (users.length === 0) {
     return "the user list was readable but returned zero managed users; a Box enterprise always has at least the primary admin, so the inventory is empty and nothing was assessed";
   }
-  if (truncated) {
-    return `the user list stopped at the ${users.length}-record cap while Box reported more users (a next_marker remained), so the inventory is partial and the absence of a matching record proves nothing; raise user_limit and rerun`;
+  if (dataset.truncated === true) {
+    return `the user list ${truncationClause(dataset, users.length, "records", "Box reported more users (a next_marker remained)")}, so the inventory is partial and the absence of a matching record proves nothing; ${truncationRemedy(dataset, "user_limit")}`;
   }
   if (!users.some(isAdminUser)) {
     return `the ${users.length}-user inventory contains no admin account; a Box enterprise always has a primary admin, so the listing is incomplete or the audit principal cannot see admin accounts`;
@@ -2259,7 +2358,7 @@ export function assessBoxIdentityAccessData(data: BoxIdentityData, options: BoxI
   const exemptUsers = users.filter((user) => !isPrivilegedUser(user) && isExemptFromLoginVerification(user));
   const activeUsers = users.filter(isActiveHumanUser);
   const usersTruncated = data.users.truncated === true;
-  const inventoryGap = usersReadable ? userInventoryGap(users, usersTruncated) : undefined;
+  const inventoryGap = usersReadable ? userInventoryGap(data.users) : undefined;
   // Every count and name below is gated on the dataset that proves it: a denied user listing renders null, never 0 or
   // [], and a user is named as holding a property only from a record that was actually read.
   const inventoryEvidence = {
@@ -2529,7 +2628,7 @@ export function assessBoxIdentityAccessData(data: BoxIdentityData, options: BoxI
         : activeUsers.length === 0
           ? finding(24, "warn", `None of the ${users.length} sampled users are active managed users (only deactivated or platform-only app users were returned), so there was no activity to assess.`, inactivityEvidence, inactivityManualEvidence)
           : eventsTruncated
-            ? finding(24, "warn", `The event collection stopped at the ${events.length}-event cap while Box reported more events (a next_stream_position remained), so ${inactiveCandidates.length}/${activeUsers.length} active users without observed activity is an upper bound; raise event_limit or confirm in the Admin Console.`, inactivityEvidence, inactivityManualEvidence)
+            ? finding(24, "warn", `The event collection ${truncationClause(data.events, events.length, "events", "Box reported more events (a next_stream_position remained)")}, so ${inactiveCandidates.length}/${activeUsers.length} active users without observed activity is an upper bound; raise event_limit or confirm in the Admin Console.`, inactivityEvidence, inactivityManualEvidence)
             : inactiveCandidates.length === 0
               ? finding(24, "pass", `All ${activeUsers.length} active users showed successful login or content activity events within the last ${data.lookbackDays} days.`, inactivityEvidence)
               : inactiveRatio > 0.25
@@ -2894,14 +2993,18 @@ async function collectAssignments(
   const result: BoxAssignmentMap = {};
   const errors: string[] = [];
   let firstFailure: CollectedDataset<unknown> | undefined;
-  let truncated = parents.data.length > MAX_ASSIGNMENT_POLICIES;
+  const truncations: BoxTruncation[] = parents.data.length > MAX_ASSIGNMENT_POLICIES
+    ? [pagingTruncation(`only the first ${MAX_ASSIGNMENT_POLICIES} of ${parents.data.length} policies had their assignments read, a fixed cap`)]
+    : [];
   for (const parent of parents.data.slice(0, MAX_ASSIGNMENT_POLICIES)) {
     const parentId = asString(parent.id);
     if (!parentId) continue;
     try {
       const page = await loader(parentId);
       result[parentId] = page.items;
-      truncated = truncated || page.truncated;
+      if (page.truncated) {
+        truncations.push({ reason: `for policy ${parentId}, ${page.truncation?.reason ?? "the assignment listing stopped at its cap"}`, capReached: page.truncation?.capReached ?? true });
+      }
     } catch (error) {
       const failed: CollectedDataset<unknown> = {
         data: undefined,
@@ -2919,7 +3022,10 @@ async function collectAssignments(
     error: errors.length > 0 ? errors.join("; ") : undefined,
     statusCode: firstFailure?.statusCode,
     request: firstFailure?.request,
-    truncated: errors.length > 0 ? undefined : truncated,
+    truncated: errors.length > 0 ? undefined : truncations.length > 0,
+    truncation: errors.length > 0 || truncations.length === 0
+      ? undefined
+      : { reason: truncations.map((entry) => entry.reason).join("; "), capReached: truncations.some((entry) => entry.capReached) },
   };
 }
 
@@ -3159,7 +3265,9 @@ export function assessBoxShieldMonitoringData(data: BoxShieldData): BoxAssessmen
     shield_rules: shieldReadable ? truncateList(shieldRules.map((rule) => ({ name: asString(rule.name), category: asString(rule.rule_category), priority: asString(rule.priority) }))) : null,
     rule_categories: shieldReadable ? ruleCategories : null,
     shield_lists: whenRead(data.shieldLists, data.shieldLists.data.length),
-    shield_events: whenRead(data.events, Object.fromEntries(Object.entries(eventCounts).filter(([type]) => type.startsWith("SHIELD_")))),
+    shield_events: sampledValue(data.events, Object.fromEntries(Object.entries(eventCounts).filter(([type]) => type.startsWith("SHIELD_")))),
+    sampled_events: whenRead(data.events, events.length),
+    events_truncated: whenRead(data.events, data.events.truncated === true),
   };
   findings.push(
     !shieldReadable
@@ -3217,8 +3325,10 @@ export function assessBoxShieldMonitoringData(data: BoxShieldData): BoxAssessmen
   const accessEvents = events.filter((event) => /^(DOWNLOAD|PREVIEW|FILE_WATERMARKED_DOWNLOAD)$/.test(eventType(event)));
   const anomalyRules = shieldRules.filter((rule) => /anomal|threat|download|session|location|malicious/i.test(`${asString(rule.rule_category) ?? ""} ${asString(rule.name) ?? ""}`));
   const monitoringEvidence = {
-    anomaly_events: whenRead(data.events, anomalyEvents.length),
-    content_access_events: whenRead(data.events, accessEvents.length),
+    anomaly_events: sampledValue(data.events, anomalyEvents.length),
+    content_access_events: sampledValue(data.events, accessEvents.length),
+    sampled_events: whenRead(data.events, events.length),
+    events_truncated: whenRead(data.events, data.events.truncated === true),
     anomaly_detection_rules: shieldReadable ? anomalyRules.length : null,
     shield_rules_error: shieldReadable ? null : shieldUnreadableReason,
     events_error: data.events.error ?? null,
@@ -3231,7 +3341,7 @@ export function assessBoxShieldMonitoringData(data: BoxShieldData): BoxAssessmen
     !eventsReadable && !shieldReadable
       ? finding(25, "manual", "Neither enterprise events nor Shield rules could be read, so content access monitoring cannot be confirmed from the API.", monitoringEvidence, monitoringManualEvidence)
       : anomalyRules.length > 0 || anomalyEvents.length > 0
-        ? finding(25, "pass", `${shieldReadable ? String(anomalyRules.length) : "unread"} Shield anomaly detection rules and ${countOrUnread(data.events, anomalyEvents.length)} Shield alert or block events show content access monitoring is active.`, monitoringEvidence)
+        ? finding(25, "pass", `${shieldReadable ? String(anomalyRules.length) : "unread"} Shield anomaly detection rules and ${sampledCountText(data.events, anomalyEvents.length)} Shield alert or block events show content access monitoring is active.`, monitoringEvidence)
         : !shieldReadable
           ? finding(25, "warn", `Shield rule configuration could not be read because ${shieldUnreadableReason}, and no Shield alert or block events were observed among ${accessEvents.length} download and preview events; detection may depend on external analytics.`, monitoringEvidence, monitoringManualEvidence)
           : !eventsReadable
@@ -3239,7 +3349,7 @@ export function assessBoxShieldMonitoringData(data: BoxShieldData): BoxAssessmen
             : accessEvents.length > 0
               ? finding(25, "warn", `${accessEvents.length} download and preview events are recorded, but no Shield anomaly rules or alerts were observed, so detection depends on external analytics.`, monitoringEvidence, "Confirm the SIEM applies anomaly detection to Box download and preview events, or enable Shield threat detection rules.")
               : data.events.truncated
-                ? finding(25, "warn", `No Shield anomaly detection rules exist and no Shield alerts appeared in the ${events.length} sampled events, but the event collection stopped at the cap while Box reported more events, so alerts may exist beyond the sample; raise event_limit and rerun.`, monitoringEvidence, monitoringManualEvidence)
+                ? finding(25, "warn", `No Shield anomaly detection rules exist and no Shield alerts appeared in the ${events.length} sampled events, but the event collection ${truncationClause(data.events, events.length, "events", "Box reported more events")}, so alerts may exist beyond the sample; ${truncationRemedy(data.events, "event_limit")}.`, monitoringEvidence, monitoringManualEvidence)
                 : finding(25, "fail", "No Shield anomaly detection rules exist and no content access events were observed in the sampled window.", monitoringEvidence),
     [shieldConfigUnreadable, monitoringEventsUnreadable],
     monitoringManualEvidence,
@@ -3255,7 +3365,8 @@ export function assessBoxShieldMonitoringData(data: BoxShieldData): BoxAssessmen
       enabled_information_barriers: whenRead(data.barriers, enabledBarriers.length),
       shield_lists: whenRead(data.shieldLists, data.shieldLists.data.length),
       sampled_events: whenRead(data.events, events.length),
-      anomaly_events: whenRead(data.events, anomalyEvents.length),
+      events_truncated: whenRead(data.events, data.events.truncated === true),
+      anomaly_events: sampledValue(data.events, anomalyEvents.length),
       lookback_days: data.lookbackDays,
     },
     findings: sortFindings(findings),
@@ -3609,6 +3720,7 @@ function collectionStatusEntry(pathname: string, dataset: CollectedDataset<unkno
     count: read || partial ? datasetRecordCount(dataset.data) : null,
     complete: read ? dataset.truncated !== true : partial ? false : null,
     truncated: read ? dataset.truncated === true : null,
+    truncation_reason: read && dataset.truncated === true ? dataset.truncation?.reason ?? null : null,
     error: dataset.error ?? null,
     status_code: dataset.statusCode ?? null,
     endpoint: dataset.request ?? null,
@@ -3620,7 +3732,7 @@ function buildQuickReference(): string {
     "# Box Audit Bundle Quick Reference",
     "",
     "- `core_data/` contains the Box API responses used during this assessment; enterprise events are projected to the actor, source, and timing fields the verdicts read, and any credential-shaped field (token, secret, password, api key) is replaced with [REDACTED] before it is written.",
-    "- `core_data/collection_status.json` records, per snapshot file, whether the read happened, the record count, any read error, and whether the list was truncated at its cap; truncated lists never support a PASS that depends on the absence of a record.",
+    "- `core_data/collection_status.json` records, per snapshot file, whether the read happened, the record count, any read error, and whether the list was truncated at its cap together with the reason the collection stopped; truncated lists never support a PASS that depends on the absence of a record.",
     "- A snapshot whose read was denied, failed, or was never requested is written as a marker object (`collected: false` with the observed status, request, and error) rather than an empty list, so a denial is never mistaken for an empty inventory; a readable-but-empty inventory stays `[]`.",
     "- `analysis/` contains normalized findings and per-area assessment summaries.",
     "- `compliance/` contains the executive summary, unified matrix, and per-framework reports.",

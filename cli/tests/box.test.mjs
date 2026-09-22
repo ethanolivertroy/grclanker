@@ -736,22 +736,32 @@ test("BoxApiClient reports list truncation only when a marker, offset, or stream
   const complete = await client.listUsers(10);
   assert.deepEqual(complete.items.map((entry) => entry.id), ["user-1", "user-2", "user-3"]);
   assert.equal(complete.truncated, false, "the final page carried no next_marker");
+  assert.equal(complete.truncation, undefined);
 
   const partial = await client.listUsers(2);
   assert.deepEqual(partial.items.map((entry) => entry.id), ["user-1", "user-2"]);
   assert.equal(partial.truncated, true, "exactly the cap was returned and a next_marker remained");
+  assert.deepEqual(partial.truncation, { reason: "the 2-record cap was reached while the server offered a next marker", capReached: true });
 
-  const emptyMarker = await client.listCollaborationAllowlistEntries(1);
+  const fullPageWithoutMarker = await client.listCollaborationAllowlistEntries(1);
+  assert.equal(fullPageWithoutMarker.items.length, 1);
+  assert.equal(fullPageWithoutMarker.truncated, true, "a full last page at the cap with no next_marker cannot prove the remainder empty");
+  assert.deepEqual(fullPageWithoutMarker.truncation, { reason: "the last page was full at the 1-record cap and the server gave no next marker, so the remainder is unknown", capReached: true });
+
+  const emptyMarker = await client.listCollaborationAllowlistEntries(2);
   assert.equal(emptyMarker.items.length, 1);
-  assert.equal(emptyMarker.truncated, false, "an empty next_marker means the list is complete");
+  assert.equal(emptyMarker.truncated, false, "an empty next_marker on a page below the cap means the list is complete");
+  assert.equal(emptyMarker.truncation, undefined);
 
   const groups = await client.listGroups(2);
   assert.deepEqual(groups.items.map((entry) => entry.id), ["group-1", "group-2"]);
   assert.equal(groups.truncated, true, "offset paging stopped before total_count");
+  assert.deepEqual(groups.truncation, { reason: "the 2-record cap was reached while the server reported 3 records in total", capReached: true });
 
   const events = await client.listEnterpriseEvents({ limit: 3 });
   assert.equal(events.items.length, 3);
   assert.equal(events.truncated, true, "the cap filled while a fresh next_stream_position remained");
+  assert.deepEqual(events.truncation, { reason: "the 3-event cap was reached while the server offered a next stream position", capReached: true });
 });
 
 test("verdict rule 10: every Box pagination exit that leaves records behind reports truncated", async () => {
@@ -773,6 +783,9 @@ test("verdict rule 10: every Box pagination exit that leaves records behind repo
       if (kind === "LOGIN") {
         return jsonResponse({ entries: [{ event_id: `e-${position ?? "0"}`, event_type: "LOGIN" }], next_stream_position: "stuck" });
       }
+      if (kind === "SHIELD_ALERT") {
+        return jsonResponse({ entries: [{ event_id: "alert-1", event_type: "SHIELD_ALERT" }, { event_id: "alert-2", event_type: "SHIELD_ALERT" }], next_stream_position: "same" });
+      }
       return jsonResponse({ entries: [{ event_id: "e-1", event_type: "DOWNLOAD" }] });
     }
     if (url.pathname === "/2.0/retention_policies") {
@@ -793,24 +806,40 @@ test("verdict rule 10: every Box pagination exit that leaves records behind repo
   const emptyPageWithMarker = await client.listUsers(10);
   assert.deepEqual(emptyPageWithMarker.items.map((entry) => entry.id), ["user-1"]);
   assert.equal(emptyPageWithMarker.truncated, true, "an empty marker page that still carries next_marker is a partial inventory");
+  assert.deepEqual(emptyPageWithMarker.truncation, { reason: "the server returned an empty page while still offering a next marker", capReached: false });
 
   const emptyPageBelowTotal = await client.listGroups(10);
   assert.deepEqual(emptyPageBelowTotal.items.map((entry) => entry.id), ["group-1"]);
   assert.equal(emptyPageBelowTotal.truncated, true, "an empty offset page while offset < total_count is a partial inventory");
+  assert.deepEqual(emptyPageBelowTotal.truncation, { reason: "the server returned an empty page while the server reported 5 records in total", capReached: false });
 
   const stuckPosition = await client.listEnterpriseEvents({ eventTypes: ["LOGIN"], limit: 10 });
   assert.equal(stuckPosition.items.length, 2);
   assert.equal(stuckPosition.truncated, true, "a next_stream_position that stops advancing while entries keep arriving is a partial inventory");
+  assert.deepEqual(stuckPosition.truncation, { reason: "the server repeated its stream position, so the remaining events could not be paged", capReached: false });
+
+  const repeatedPage = await client.listEnterpriseEvents({ eventTypes: ["SHIELD_ALERT"], limit: 10 });
+  assert.deepEqual(repeatedPage.items.map((event) => event.event_id), ["alert-1", "alert-2"], "a page re-served under a repeated stream position is counted once");
+  assert.equal(repeatedPage.truncated, true);
+  assert.deepEqual(repeatedPage.truncation, { reason: "the server repeated its stream position, so the remaining events could not be paged", capReached: false });
 
   const missingPosition = await client.listEnterpriseEvents({ eventTypes: ["DOWNLOAD"], limit: 10 });
   assert.equal(missingPosition.items.length, 1);
   assert.equal(missingPosition.truncated, true, "a non-empty page without next_stream_position cannot be continued");
+  assert.deepEqual(missingPosition.truncation, { reason: "the server returned a page without a next stream position, so the remainder is unknown", capReached: false });
 
   const governance = await assessBoxDataGovernance(client, { listLimit: 100 });
   const cap = governance.truncated.find((note) => note.startsWith("retention_policy_assignments:"));
   assert.ok(cap, `the 50-policy assignment cap must be recorded, got ${JSON.stringify(governance.truncated)}`);
-  assert.match(cap, /stopped at the 50-record cap/);
+  assert.equal(cap, "retention_policy_assignments: collection stopped after 50 records because only the first 50 of 60 policies had their assignments read, a fixed cap; review the remainder in the Admin Console before treating absence as compliance");
+  assert.doesNotMatch(cap, /raise list_limit/, "list_limit does not raise the fixed policy cap, so the note must not advise it");
   assert.equal(findingById(governance, "BOX-12").status, "pass", "assignment presence is still proven for the 50 policies that were read");
+
+  const usersCaveat = await assessBoxIdentityAccess(client, { userLimit: 10 });
+  assert.match(findingById(usersCaveat, "BOX-02").summary, /the user list stopped after 1 records because the server returned an empty page while still offering a next marker, so the inventory is partial/);
+  assert.match(findingById(usersCaveat, "BOX-02").summary, /review the remainder in the Admin Console/);
+  assert.doesNotMatch(findingById(usersCaveat, "BOX-02").summary, /raise user_limit/, "a higher user_limit does not read past a server that serves empty pages");
+  assert.equal(usersCaveat.truncated.find((note) => note.startsWith("users:")), "users: collection stopped after 1 records because the server returned an empty page while still offering a next marker; review the remainder in the Admin Console before treating absence as compliance");
 });
 
 test("verdict rule 9: non-JSON error bodies are described, never echoed, into Box error text", async () => {
@@ -1284,12 +1313,52 @@ test("truncated allowlist and Shield event lists downgrade absence-based verdict
     },
   });
   assertStatuses(noRulesTruncated, { "BOX-16": "pass", "BOX-25": "warn" });
-  assert.match(findingById(noRulesTruncated, "BOX-25").summary, /no Shield alerts appeared in the 1 sampled events, but the event collection stopped at the cap while Box reported more events/);
+  assert.match(findingById(noRulesTruncated, "BOX-25").summary, /no Shield alerts appeared in the 1 sampled events, but the event collection stopped at the 1-event cap while Box reported more events/);
+  assert.match(findingById(noRulesTruncated, "BOX-25").summary, /raise event_limit and rerun/);
   assert.match(noRulesTruncated.truncated[0], /^enterprise_events: collection stopped at the 1-record cap .*raise event_limit/);
 
   const noRulesComplete = await assessBoxShieldMonitoring(shieldBase);
   assertStatuses(noRulesComplete, { "BOX-25": "fail" });
   assert.deepEqual(noRulesComplete.truncated, []);
+
+  const sampled = { sampled_events: 1, events_truncated: true };
+  const truncatedMonitoring = findingById(noRulesTruncated, "BOX-25").evidence;
+  assert.deepEqual(truncatedMonitoring.anomaly_events, { observed: 0, ...sampled }, "a zero counted in a truncated sample is labelled as observed");
+  assert.deepEqual(truncatedMonitoring.content_access_events, { observed: 0, ...sampled });
+  assert.equal(truncatedMonitoring.sampled_events, 1);
+  assert.equal(truncatedMonitoring.events_truncated, true);
+  assert.deepEqual(findingById(noRulesTruncated, "BOX-14").evidence.shield_events, { observed: {}, ...sampled }, "an empty Shield breakdown from a truncated sample is never a bare {}");
+  assert.deepEqual(noRulesTruncated.summary.anomaly_events, { observed: 0, ...sampled });
+  assert.equal(noRulesTruncated.summary.events_truncated, true);
+  const completeMonitoring = findingById(noRulesComplete, "BOX-25").evidence;
+  assert.equal(completeMonitoring.anomaly_events, 0, "a complete read keeps the plain count");
+  assert.equal(completeMonitoring.events_truncated, false);
+  assert.deepEqual(findingById(noRulesComplete, "BOX-14").evidence.shield_events, {});
+  assert.equal(noRulesComplete.summary.anomaly_events, 0);
+  for (const [leaf, value] of [
+    ["BOX-25.evidence.anomaly_events", truncatedMonitoring.anomaly_events],
+    ["BOX-25.evidence.content_access_events", truncatedMonitoring.content_access_events],
+    ["BOX-14.evidence.shield_events", findingById(noRulesTruncated, "BOX-14").evidence.shield_events],
+    ["summary.anomaly_events", noRulesTruncated.summary.anomaly_events],
+  ]) {
+    assert.notEqual(typeof value, "number", `${leaf} must not be a bare count under the cap`);
+    assert.ok(value !== null && typeof value === "object" && Object.keys(value).length > 0, `${leaf} must not be a bare {} under the cap`);
+    assert.equal(value.events_truncated, true, `${leaf} carries the truncation flag`);
+  }
+
+  const hardened = hardenedFixture();
+  const alertsBase = createStubClient(hardened);
+  const alertsTruncated = await assessBoxShieldMonitoring({
+    ...alertsBase,
+    async listEnterpriseEvents(options) {
+      const result = await alertsBase.listEnterpriseEvents(options);
+      return page(result.items, true);
+    },
+  });
+  assertStatuses(alertsTruncated, { "BOX-25": "pass" });
+  assert.match(findingById(alertsTruncated, "BOX-25").summary, /and 1 among 2 sampled events \(collection truncated\) Shield alert or block events show content access monitoring is active/);
+  assert.deepEqual(findingById(alertsTruncated, "BOX-25").evidence.anomaly_events, { observed: 1, sampled_events: 2, events_truncated: true });
+  assert.deepEqual(findingById(alertsTruncated, "BOX-14").evidence.shield_events, { observed: { SHIELD_ALERT: 1 }, sampled_events: 2, events_truncated: true });
 });
 
 test("assessBoxIdentityAccess treats null configuration categories as absent data instead of failing", async () => {
@@ -1805,8 +1874,9 @@ test("exportBoxAuditBundle records partial collection failures in _errors.log", 
 test("exportBoxAuditBundle records truncated snapshots without counting them as errors", async () => {
   const base = createTempBase("grclanker-box-export-truncated-");
   const fixture = hardenedFixture();
+  const usersTruncation = { reason: "the 4-record cap was reached while the server offered a next marker", capReached: true };
   const result = await exportBoxAuditBundle(createStubClient(fixture, {
-    listUsers: truncatedList(fixture.users),
+    listUsers: async () => ({ items: fixture.users, truncated: true, truncation: usersTruncation }),
     listGroups: truncatedList(fixture.groups),
   }), sampleConfig(), base);
 
@@ -1818,11 +1888,16 @@ test("exportBoxAuditBundle records truncated snapshots without counting them as 
   assert.equal(usersStatus.truncated, true);
   assert.equal(usersStatus.complete, false);
   assert.equal(usersStatus.error, null);
-  assert.equal(collectionStatus.datasets.find((entry) => entry.file === "core_data/groups.json").truncated, true);
-  assert.equal(collectionStatus.datasets.find((entry) => entry.file === "core_data/enterprise_events_activity.json").truncated, false);
+  assert.equal(usersStatus.truncation_reason, usersTruncation.reason, "the status row carries the loader's reason beside the flag");
+  const groupsStatus = collectionStatus.datasets.find((entry) => entry.file === "core_data/groups.json");
+  assert.equal(groupsStatus.truncated, true);
+  assert.equal(groupsStatus.truncation_reason, null, "a page that carried the flag alone has no reason to report");
+  const activityStatus = collectionStatus.datasets.find((entry) => entry.file === "core_data/enterprise_events_activity.json");
+  assert.equal(activityStatus.truncated, false);
+  assert.equal(activityStatus.truncation_reason, null);
   assert.equal(collectionStatus.truncated_datasets.length, 2);
-  assert.match(collectionStatus.truncated_datasets[0], /^users: collection stopped at the 4-record cap/);
-  assert.match(collectionStatus.truncated_datasets[1], /^groups: collection stopped at the 1-record cap/);
+  assert.equal(collectionStatus.truncated_datasets[0], "users: collection stopped after 4 records because the 4-record cap was reached while the server offered a next marker; raise user_limit and rerun before treating absence as compliance");
+  assert.match(collectionStatus.truncated_datasets[1], /^groups: collection stopped at the 1-record cap while the server reported more records; review the remainder in the Admin Console/);
 
   const summary = JSON.parse(readFileSync(join(result.outputDir, "analysis/summary.json"), "utf8"));
   assert.deepEqual(summary.truncated_datasets, collectionStatus.truncated_datasets);
