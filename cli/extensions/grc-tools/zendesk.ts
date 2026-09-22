@@ -75,6 +75,9 @@ export interface ZendeskAccessSurface {
   requiredRole: "agent" | "admin" | "admin-enterprise";
   status: "readable" | "forbidden" | "not_found" | "error";
   count?: number;
+  // True when the probe stopped at its item cap or on a stuck cursor, so count is a
+  // seen count rather than the population.
+  truncated?: boolean;
   error?: string;
 }
 
@@ -360,17 +363,46 @@ export function resolveZendeskConfiguration(
   };
 }
 
+export const CREDENTIAL_REDACTION_MARKER = "[REDACTED]";
+
+// Unanchored patterns for credential-shaped text that an upstream body, proxy page, or
+// transport error may echo regardless of what this tool sent. Applied to every error
+// string in the ZendeskApiError constructor, in the client's redact() helper, and again
+// at the sinks (snapshot() and the tool catch blocks via errorMessage()).
+const ERROR_TEXT_PATTERNS: Array<[RegExp, string]> = [
+  [/\b(bearer|basic|digest|negotiate)\s+[a-z0-9._~+/=-]{8,}/gi, `$1 ${CREDENTIAL_REDACTION_MARKER}`],
+  [/\b(authorization|proxy-authorization|x-api-key|x-auth-token|x-zendesk-[a-z-]+|set-cookie|cookie)\s*:\s*[^\r\n]+/gi, `$1: ${CREDENTIAL_REDACTION_MARKER}`],
+  // Keys that contain a credential word anywhere (_zendesk_session, x_auth_token, apiKey).
+  // Values that are already the marker are left alone so a header scrubbed above keeps
+  // its "name: [REDACTED]" shape.
+  [/\b([a-z0-9_-]*(?:session|token|secret|password|passwd|passphrase|api[_-]?key|accesskey|secretkey|access_key|secret_key|private_key|signature|authorization|credential)[a-z0-9_-]*)\s*[=:]\s*["']?(?!\[REDACTED\])[^\s"';,&<>]{4,}/gi, `$1=${CREDENTIAL_REDACTION_MARKER}`],
+  // Short keys that are only credentials as whole words.
+  [/\b(key|auth|sig|sid|pwd|pin|otp)\s*[=:]\s*["']?(?!\[REDACTED\])[^\s"';,&<>]{4,}/gi, `$1=${CREDENTIAL_REDACTION_MARKER}`],
+  [/\beyJ[a-z0-9_-]{8,}\.[a-z0-9_-]{8,}(?:\.[a-z0-9_-]{8,})?/gi, CREDENTIAL_REDACTION_MARKER],
+  [/(https?:\/\/)[^\s/@"'<>]+:[^\s/@"'<>]+@/gi, `$1${CREDENTIAL_REDACTION_MARKER}@`],
+];
+
+export function redactErrorText(text: string): string {
+  let redacted = text;
+  for (const [pattern, replacement] of ERROR_TEXT_PATTERNS) {
+    redacted = redacted.replace(pattern, replacement);
+  }
+  return redacted;
+}
+
+function errorMessage(error: unknown): string {
+  return redactErrorText(error instanceof Error ? error.message : String(error));
+}
+
 export class ZendeskApiError extends Error {
   readonly status: number;
 
   constructor(message: string, status: number) {
-    super(message);
+    super(redactErrorText(message));
     this.name = "ZendeskApiError";
     this.status = status;
   }
 }
-
-export const CREDENTIAL_REDACTION_MARKER = "[REDACTED]";
 
 // A property name is split into lower-case segments on underscores, hyphens,
 // dots, spaces, and camelCase boundaries, so api_key, apiKey, APIKey, and the
@@ -380,8 +412,10 @@ export const CREDENTIAL_REDACTION_MARKER = "[REDACTED]";
 // X-Auth-Token) or a qualified key such as api_key, private_key, secret_key, or
 // signing_key. A bare key and public_key are kept, and ids, scopes, client ids,
 // dates, and usernames never match because their last segment is id, scopes,
-// at, or name. Only string values are replaced; objects and arrays are recursed,
-// so the authentication.agent.password policy object keeps its numeric fields.
+// at, or name. String and numeric values under a credential name are replaced;
+// objects and arrays are recursed, so the authentication.agent.password policy
+// object keeps its numeric fields (they sit under password_length and similar
+// names, not under password itself).
 const CREDENTIAL_LAST_SEGMENTS = new Set(["token", "secret", "password", "passwd", "pwd", "passphrase", "apikey", "authorization"]);
 const NON_CREDENTIAL_KEY_QUALIFIERS = new Set(["public"]);
 // Containers whose every string value is a credential apart from the name that
@@ -391,6 +425,28 @@ const NON_CREDENTIAL_KEY_QUALIFIERS = new Set(["public"]);
 // values are replaced).
 const HEADER_MAP_SEGMENTS = new Set(["headers", "custom_headers"]);
 const CREDENTIAL_CONTAINER_SAFE_KEYS = new Set(["username", "name"]);
+// A {name, value} pair whose name is a credential (an app parameter named api_token) or
+// any object flagged secure: true (owned app parameters) is a credential pair: its value
+// and default fields are replaced while the name, kind, and required flags are kept.
+const CREDENTIAL_PAIR_VALUE_KEYS = new Set(["value", "default", "default_value"]);
+
+// Credentials carried inside string values rather than under a credential-named key:
+// URL query parameters (?token=, &api_key=), URL userinfo (https://user:pass@host),
+// webhook services whose URL path is the secret (Slack, Discord, Microsoft Teams), and
+// JSON encoded as a string. Applied to every string kept in a snapshot, so target_url,
+// endpoint, redirect_uri, url, and free-text settings are covered without naming them.
+const URL_QUERY_CREDENTIAL_PATTERN = /([?&](?:token|key|api_key|apikey|secret|password|passwd|access_token|refresh_token|auth|auth_token|signature|sig|client_secret|access_key|secret_key|private_token)=)[^&#\s"'<>]+/gi;
+const URL_USERINFO_PATTERN = /(https?:\/\/)[^\s/@"'<>]+:[^\s/@"'<>]+@/gi;
+const TOKEN_IN_PATH_WEBHOOK_PATTERN = /(https?:\/\/(?:hooks\.slack\.com\/services|discord(?:app)?\.com\/api\/webhooks|[a-z0-9.-]*webhook\.office\.com\/webhookb2)\/)[^\s"'<>]+/gi;
+const JSON_STRING_CREDENTIAL_PATTERN = /("(?:token|full_token|refresh_token|access_token|secret|client_secret|signing_secret|password|passwd|passphrase|api_key|apiKey|private_key|secret_key|access_key|authorization)"\s*:\s*")[^"]*(")/gi;
+
+export function redactCredentialValueText(text: string): string {
+  return text
+    .replace(URL_QUERY_CREDENTIAL_PATTERN, `$1${CREDENTIAL_REDACTION_MARKER}`)
+    .replace(URL_USERINFO_PATTERN, `$1${CREDENTIAL_REDACTION_MARKER}@`)
+    .replace(TOKEN_IN_PATH_WEBHOOK_PATTERN, `$1${CREDENTIAL_REDACTION_MARKER}`)
+    .replace(JSON_STRING_CREDENTIAL_PATTERN, `$1${CREDENTIAL_REDACTION_MARKER}$2`);
+}
 
 function propertyNameSegments(name: string): string[] {
   return name
@@ -414,14 +470,26 @@ function isHeaderMapName(name: string): boolean {
   return HEADER_MAP_SEGMENTS.has(propertyNameSegments(name).join("_"));
 }
 
+function isCredentialPair(record: JsonRecord): boolean {
+  if (record.secure === true) return true;
+  const pairName = typeof record.name === "string" ? record.name : undefined;
+  return pairName !== undefined
+    && isCredentialPropertyName(pairName)
+    && [...CREDENTIAL_PAIR_VALUE_KEYS].some((key) => key in record);
+}
+
 function redactCredentialValue(value: unknown, insideContainer: boolean, parentKey: string | undefined): unknown {
+  if (typeof value === "string") return redactCredentialValueText(value);
   if (Array.isArray(value)) return value.map((item) => redactCredentialValue(item, insideContainer, parentKey));
   const record = asObject(value);
   if (!record) return value;
+  const credentialPair = isCredentialPair(record);
   const output: JsonRecord = {};
   for (const [key, entry] of Object.entries(record)) {
-    const credentialName = isCredentialPropertyName(key) || (insideContainer && !CREDENTIAL_CONTAINER_SAFE_KEYS.has(key.toLowerCase()));
-    if (credentialName && typeof entry === "string" && entry.length > 0) {
+    const credentialName = isCredentialPropertyName(key)
+      || (insideContainer && !CREDENTIAL_CONTAINER_SAFE_KEYS.has(key.toLowerCase()))
+      || (credentialPair && CREDENTIAL_PAIR_VALUE_KEYS.has(key));
+    if (credentialName && ((typeof entry === "string" && entry.length > 0) || typeof entry === "number")) {
       output[key] = CREDENTIAL_REDACTION_MARKER;
       continue;
     }
@@ -432,11 +500,13 @@ function redactCredentialValue(value: unknown, insideContainer: boolean, parentK
 }
 
 /**
- * Returns a deep copy of an API payload with every credential-bearing string
- * property replaced by CREDENTIAL_REDACTION_MARKER. Identifiers, scopes, client
- * ids, expiry and creation dates, usernames, header names, and every other
- * non-credential field are kept so the assessments read the redacted copy
- * unchanged.
+ * Returns a deep copy of an API payload with every credential-bearing string or
+ * numeric property replaced by CREDENTIAL_REDACTION_MARKER and every remaining
+ * string scrubbed of URL query credentials, URL userinfo, token-in-path webhook
+ * URLs, and JSON-encoded credential fields. Identifiers, scopes, client ids,
+ * expiry and creation dates, usernames, header names, URL schemes and hosts,
+ * and every other non-credential field are kept so the assessments read the
+ * redacted copy unchanged.
  */
 export function redactCredentialProperties(value: unknown): unknown {
   return redactCredentialValue(value, false, undefined);
@@ -449,12 +519,14 @@ function redactSecrets(text: string, secrets: Array<string | undefined>): string
       output = output.split(secret).join(CREDENTIAL_REDACTION_MARKER);
     }
   }
-  return output;
+  return redactErrorText(output);
 }
 
-function zendeskErrorSummary(payload: unknown): string | undefined {
+// Zendesk's documented error fields: error, description, message, error.title,
+// error.message, and errors[].title or detail.
+function zendeskErrorFields(payload: unknown): string[] {
   const object = asObject(payload);
-  if (!object) return undefined;
+  if (!object) return [];
   const parts = [
     asString(object.error),
     asString(object.description),
@@ -463,7 +535,25 @@ function zendeskErrorSummary(payload: unknown): string | undefined {
     asString(asObject(object.error)?.message),
     ...asRecordArray(object.errors).map((item) => asString(item.title) ?? asString(item.detail)),
   ].filter((item): item is string => Boolean(item));
-  return parts.length > 0 ? [...new Set(parts)].join("; ") : undefined;
+  return [...new Set(parts)];
+}
+
+// Non-JSON bodies (HTML proxy pages, SSO interstitials, rate-limit pages) are described
+// by status, content type, and length only; JSON bodies contribute Zendesk's documented
+// error fields, each scrubbed before it is shortened.
+export function describeErrorBody(response: Response, rawText: string): string {
+  const base = `${response.status} ${response.statusText}`.trim();
+  if (rawText.length === 0) return base;
+  const contentType = response.headers.get("content-type")?.split(";")[0].trim().toLowerCase() || "unknown";
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(rawText);
+  } catch {
+    return `${base}; non-JSON ${contentType} response body (${rawText.length} bytes, not echoed)`;
+  }
+  const fields = zendeskErrorFields(parsed);
+  if (fields.length === 0) return `${base}; JSON response body without documented error fields (${rawText.length} bytes, not echoed)`;
+  return `${base}; ${fields.map((field) => redactErrorText(field.replace(/\s+/g, " ")).slice(0, 200)).join("; ")}`;
 }
 
 function retryDelayMs(response: Response): number {
@@ -565,22 +655,18 @@ export class ZendeskApiClient {
     const url = this.buildUrl(path, query);
     const response = await this.request(url);
     const rawText = await response.text();
-    let payload: JsonRecord = {};
-    if (rawText.length > 0) {
-      try {
-        payload = asObject(JSON.parse(rawText)) ?? {};
-      } catch {
-        payload = {};
-      }
-    }
     if (!response.ok) {
-      const detail = zendeskErrorSummary(payload) ?? rawText.slice(0, 200);
       throw new ZendeskApiError(
-        this.redact(`Zendesk request failed for ${path} (${response.status} ${response.statusText})${detail ? `: ${detail}` : ""}`),
+        this.redact(`Zendesk request failed for ${path} (${describeErrorBody(response, rawText)})`),
         response.status,
       );
     }
-    return payload;
+    if (rawText.length === 0) return {};
+    try {
+      return asObject(JSON.parse(rawText)) ?? {};
+    } catch {
+      return {};
+    }
   }
 
   async listCursor(
@@ -610,12 +696,25 @@ export class ZendeskApiClient {
       const meta = asObject(payload.meta);
       const hasMore = asBoolean(meta?.has_more);
       const afterCursor = asString(meta?.after_cursor);
-      const continuation = asString(asObject(payload.links)?.next)
-        ?? (afterCursor ? this.buildUrl(path, { ...baseQuery, "page[after]": afterCursor }) : undefined)
-        ?? asString(payload.next_page);
-      if (pageItems.length === 0 || added === 0 || hasMore === false) break;
+      // meta.has_more=false is Zendesk's documented end marker and wins over a
+      // links.next value that some endpoints still return on the last page.
+      const continuation = hasMore === false
+        ? undefined
+        : asString(asObject(payload.links)?.next)
+          ?? (afterCursor ? this.buildUrl(path, { ...baseQuery, "page[after]": afterCursor }) : undefined)
+          ?? asString(payload.next_page);
+      if (pageItems.length === 0 || added === 0) {
+        // An empty or fully repeated page while the server still promises more is a
+        // cursor that stopped advancing, so the inventory is partial rather than complete.
+        truncated = hasMore === true || Boolean(continuation);
+        break;
+      }
       if (!continuation) {
         truncated = hasMore === true;
+        break;
+      }
+      if (continuation === nextUrl) {
+        truncated = true;
         break;
       }
       if (items.length >= maxItems || pages >= DEFAULT_MAX_PAGES) {
@@ -647,10 +746,21 @@ export class ZendeskApiClient {
       pages += 1;
       const pageItems = asRecordArray(payload[collectionKey]);
       const added = appendUnique(items, seen, pageItems);
-      if (pageItems.length === 0 || added === 0 || payload.next_page === null) break;
+      // next_page=null is the documented end marker; an absent next_page after a full
+      // page means the endpoint did not paginate itself, so the next offset is requested.
       const continuation = asString(payload.next_page)
-        ?? (pageItems.length >= perPage ? this.buildUrl(path, { ...query, per_page: perPage, page: pages + 1 }) : undefined);
+        ?? (payload.next_page === null || pageItems.length < perPage ? undefined : this.buildUrl(path, { ...query, per_page: perPage, page: pages + 1 }));
+      if (pageItems.length === 0 || added === 0) {
+        // An empty or replayed page while a continuation still exists is an offset the
+        // server ignored, so the inventory is partial rather than complete.
+        truncated = Boolean(continuation);
+        break;
+      }
       if (!continuation) break;
+      if (continuation === nextUrl) {
+        truncated = true;
+        break;
+      }
       if (items.length >= maxItems || pages >= DEFAULT_MAX_PAGES) {
         truncated = true;
         break;
@@ -803,12 +913,14 @@ export type ZendeskReadClient = Pick<
 
 // Every API read the assessments keep passes through here, so the in-memory
 // snapshot, the core_data/ files, the analysis/ objects, and the tool results
-// all see the redacted copy and never the raw credential values.
+// all see the redacted copy and never the raw credential values. Error strings
+// pass through the same unanchored scrub as the constructor, so a message built
+// at a throw site cannot reach a finding, summary, _errors.log, or bundle unscrubbed.
 async function snapshot<T>(load: () => Promise<T>): Promise<ZendeskSnapshot<T>> {
   try {
     return { status: "ok", data: redactCredentialProperties(await load()) as T };
   } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
+    const message = errorMessage(error);
     if (error instanceof ZendeskApiError) {
       if (error.status === 401 || error.status === 403) return { status: "forbidden", error: message, httpStatus: error.status };
       if (error.status === 404) return { status: "not_found", error: message, httpStatus: error.status };
@@ -882,8 +994,37 @@ function isTruncated(snap: ZendeskSnapshot<ZendeskListResult>): boolean {
 
 function truncationNote(name: string, snap: ZendeskSnapshot<ZendeskListResult>): string {
   return isTruncated(snap)
-    ? ` The ${name} inventory was truncated after ${listSnapshotItems(snap).length} items (more pages exist), so the verdict is limited to the seen population.`
+    ? ` The ${name} inventory was truncated after ${listSnapshotItems(snap).length} items (more pages exist or the cursor stopped advancing), so the verdict is limited to the seen population.`
     : "";
+}
+
+// Evidence and summary counts derived from a dataset that could not be read render as
+// null rather than 0 or [], so an unread inventory is never mistaken for an empty one.
+function countOrNull(snap: ZendeskSnapshot<unknown>, count: number): number | null {
+  return snap.status === "ok" ? count : null;
+}
+
+function listCountOrNull(snap: ZendeskSnapshot<ZendeskListResult>): number | null {
+  return countOrNull(snap, listSnapshotItems(snap).length);
+}
+
+function listOrNull<T>(snap: ZendeskSnapshot<unknown>, values: T[]): T[] | null {
+  return snap.status === "ok" ? values : null;
+}
+
+// Rule 1 corollary: a finding that read several inventories may not pass when a
+// secondary one was unreadable, even when the pass branch did not consume it, because
+// the reviewer cannot tell a verified absence from an unread one. The cause is named and
+// the secondaries are recorded in evidence.
+function capForUnreadable(item: ZendeskFinding, secondaries: Array<[string, ZendeskSnapshot<unknown>]>): ZendeskFinding {
+  const unreadable = secondaries.filter(([, snap]) => snap.status !== "ok");
+  if (item.status !== "pass" || unreadable.length === 0) return item;
+  return {
+    ...item,
+    status: "warn",
+    summary: `${item.summary} Verdict capped at warn because a secondary inventory could not be read: ${unreadable.map(([name, snap]) => snapshotCause(name, snap)).join(" ")}`,
+    evidence: { ...(item.evidence ?? {}), verdict_capped_by_unreadable: unreadable.map(([name]) => name) },
+  };
 }
 
 function partitionByDate(
@@ -994,16 +1135,19 @@ export async function checkZendeskAccess(client: ZendeskReadClient): Promise<Zen
   const surfaces: ZendeskAccessSurface[] = [];
   for (const probe of probes) {
     const snap = probe.name === "current_user" ? currentUser : await snapshot(probe.load);
-    const items = asObject(snap.data)?.items;
+    const listResult = asObject(snap.data);
+    const items = listResult?.items;
     surfaces.push({
       name: probe.name,
       endpoint: probe.endpoint,
       requiredRole: probe.requiredRole,
       status: snap.status === "ok" ? "readable" : snap.status,
       count: snap.status === "ok" ? (probe.count ? probe.count(snap.data) : Array.isArray(items) ? items.length : undefined) : undefined,
+      ...(snap.status === "ok" && Array.isArray(items) ? { truncated: listResult?.truncated === true } : {}),
       error: snap.error,
     });
   }
+  const truncatedProbes = surfaces.filter((surface) => surface.truncated === true).map((surface) => surface.name);
 
   const coreReadable = ["current_user", "account_settings", "team_members"].every((name) =>
     surfaces.find((surface) => surface.name === name)?.status === "readable");
@@ -1026,6 +1170,7 @@ export async function checkZendeskAccess(client: ZendeskReadClient): Promise<Zen
       `Authenticated as ${currentUser.status === "ok" ? `${userLabel(currentUser.data ?? {})} (role: ${currentUserRole ?? "unknown"})` : "an unknown principal (current user lookup failed)"}.`,
       `${readableCount}/${surfaces.length} Zendesk audit surfaces are readable.`,
       ...(unavailable.length > 0 ? [`Unavailable on this account or plan: ${unavailable.join(", ")}.`] : []),
+      ...(truncatedProbes.length > 0 ? [`Probe counts for ${truncatedProbes.join(", ")} are capped samples (marked +), not the full population; the assessment tools page to max_items.`] : []),
       ...(currentUserRole && currentUserRole !== "admin" ? ["The credential is not an admin, so admin-only surfaces (security settings, deletion schedules, OAuth clients and tokens, audit logs, owned apps, brands, suspended tickets) will render as manual findings."] : []),
     ],
     recommendedNextStep: status === "healthy"
@@ -1170,8 +1315,11 @@ function assessAgentTwoFactor(
     seen_team_members: teamMembers.length,
     inventory_truncated: truncated,
     without_two_factor: withoutTwoFactor.slice(0, 50).map(userLabel),
+    without_two_factor_partial: truncated,
     two_factor_flag_missing: unknownTwoFactor.slice(0, 50).map(userLabel),
+    two_factor_flag_missing_partial: truncated,
   };
+  const atLeast = truncated ? "at least " : "";
   if (securitySnap.status !== "ok") {
     return withoutTwoFactor.length > 0
       ? finding(2, title, "critical", "fail", `${withoutTwoFactor.length}/${teamMembers.length} active team members report two_factor_auth_enabled=false. ${enforcementText}${truncationNote("team member", teamSnap)}`, evidence)
@@ -1187,7 +1335,7 @@ function assessAgentTwoFactor(
     return finding(2, title, "critical", "fail", `security_settings.authentication.agent.two_factor_enforce=false: the account does not require 2FA, so per-user enrollment is optional even though ${perUser}${withoutTwoFactor.length > 0 ? ` and ${withoutTwoFactor.length} report it disabled` : ""}.${truncationNote("team member", teamSnap)}`, evidence);
   }
   if (withoutTwoFactor.length > 0 || unknownTwoFactor.length > 0 || truncated) {
-    return finding(2, title, "critical", "warn", `two_factor_enforce=true, but ${withoutTwoFactor.length} team members report two_factor_auth_enabled=false (not yet enrolled) and ${unknownTwoFactor.length} did not expose the flag (${perUser}).${truncationNote("team member", teamSnap)}`, evidence);
+    return finding(2, title, "critical", "warn", `two_factor_enforce=true, but ${atLeast}${withoutTwoFactor.length} team members report two_factor_auth_enabled=false (not yet enrolled) and ${atLeast}${unknownTwoFactor.length} did not expose the flag (${perUser}).${truncationNote("team member", teamSnap)}`, evidence);
   }
   return finding(2, title, "critical", "pass", `security_settings.authentication.agent.two_factor_enforce=true and all ${teamMembers.length} active team members report two_factor_auth_enabled=true; the inventory was read to completion.`, evidence);
 }
@@ -1331,8 +1479,13 @@ function assessEndUserAuthentication(
   const title = "End-user authentication required (no anonymous tickets)";
   const anonymousInstruction = "capture Admin Center > People > Configuration > End users showing that 'Anybody can submit tickets' is disabled (or that sign-in is required), which the API does not expose.";
   const passwordApiAccess = settingsSnap.status === "ok" ? asBoolean(apiSettings.api_password_access_end_users) : undefined;
-  const apiNote = passwordApiAccess === true ? " Note: settings.api.api_password_access_end_users=true, so end users may call the API with email and password; review whether that is intended." : "";
-  const baseEvidence: JsonRecord = { api_password_access_end_users: passwordApiAccess ?? null, security_settings_status: securitySnap.status };
+  const apiNote = settingsSnap.status !== "ok"
+    ? ` settings.api.api_password_access_end_users could not be verified: ${snapshotCause("Account settings (/account/settings)", settingsSnap)}`
+    : passwordApiAccess === true
+      ? " Note: settings.api.api_password_access_end_users=true, so end users may call the API with email and password; review whether that is intended."
+      : "";
+  const baseEvidence: JsonRecord = { api_password_access_end_users: passwordApiAccess ?? null, account_settings_status: settingsSnap.status, security_settings_status: securitySnap.status };
+  const cap = (item: ZendeskFinding): ZendeskFinding => capForUnreadable(item, [["Account settings (/account/settings)", settingsSnap]]);
   if (securitySnap.status !== "ok") {
     return manualFinding(21, title, "high", `${snapshotCause(SECURITY_SETTINGS_SOURCE, securitySnap)}${apiNote}`, `capture Admin Center > Account > Security > End user authentication and ${anonymousInstruction}`, baseEvidence);
   }
@@ -1350,7 +1503,7 @@ function assessEndUserAuthentication(
   }
   const manualPortion = ` The anonymous submission setting is a separate manual check: ${anonymousInstruction}`;
   if (enforceSso && methods.length > 0) {
-    return finding(21, title, "high", "pass", `authentication.end_user.enforce_sso=true: end users must sign in through ${methods.join(", ")} and Zendesk password sign-in is disabled.${apiNote}${manualPortion}`, evidence);
+    return cap(finding(21, title, "high", "pass", `authentication.end_user.enforce_sso=true: end users must sign in through ${methods.join(", ")} and Zendesk password sign-in is disabled.${apiNote}${manualPortion}`, evidence));
   }
   if (enforceSso) {
     return finding(21, title, "high", "warn", `authentication.end_user.enforce_sso=true but no SSO method is enabled for end users; confirm how end users sign in.${apiNote}${manualPortion}`, evidence);
@@ -1358,11 +1511,11 @@ function assessEndUserAuthentication(
   if (zendeskLogin) {
     const social = methods.length > 0 ? ` Additional sign-in methods: ${methods.join(", ")}.` : "";
     return policyName === "recommended" || policyName === "high"
-      ? finding(21, title, "high", "pass", `authentication.end_user.zendesk_login=true under the ${policyName} password security level, so end users authenticate with Zendesk credentials.${social}${apiNote}${manualPortion}`, evidence)
+      ? cap(finding(21, title, "high", "pass", `authentication.end_user.zendesk_login=true under the ${policyName} password security level, so end users authenticate with Zendesk credentials.${social}${apiNote}${manualPortion}`, evidence))
       : finding(21, title, "high", "warn", `authentication.end_user.zendesk_login=true under the ${policyName ?? "unknown"} password security level; raise the end user password level to Recommended or High.${social}${apiNote}${manualPortion}`, evidence);
   }
   if (methods.length > 0) {
-    return finding(21, title, "high", "pass", `authentication.end_user.zendesk_login=false and end users authenticate only through ${methods.join(", ")}.${apiNote}${manualPortion}`, evidence);
+    return cap(finding(21, title, "high", "pass", `authentication.end_user.zendesk_login=false and end users authenticate only through ${methods.join(", ")}.${apiNote}${manualPortion}`, evidence));
   }
   return finding(21, title, "high", "fail", `authentication.end_user.zendesk_login=false, enforce_sso=false, and no SSO method is enabled, so end users have no way to sign in and every end user interaction is anonymous.${apiNote}${manualPortion}`, evidence);
 }
@@ -1409,7 +1562,7 @@ export async function assessZendeskAuthentication(
     summary: {
       subdomain: config.subdomain,
       current_user_role: asString(currentUserSnap.data?.role) ?? null,
-      seen_team_members: teamMembers.length,
+      seen_team_members: countOrNull(teamSnap, teamMembers.length),
       ...summarizeStatuses(finalFindings),
     },
     findings: finalFindings,
@@ -1475,28 +1628,32 @@ function assessApiTokens(
   const apiTokenAccess = asBoolean(asObject(settingsSnap.data?.api)?.api_token_access);
   const events = listSnapshotItems(tokenLogsSnap);
   const summary = summarizeApiTokenEvents(events, staleDays, now);
+  const tokenLogSource = "Audit log token events (/audit_logs?filter[source_type]=apitoken, Enterprise plan and admin role)";
   const evidence: JsonRecord = {
     api_token_access: apiTokenAccess ?? null,
     auth_mode: config.authMode,
     token_audit_log_status: tokenLogsSnap.status,
-    token_events_read: events.length,
-    token_events_truncated: isTruncated(tokenLogsSnap),
-    tokens_created: summary.created,
-    tokens_destroyed: summary.destroyed,
-    tokens_outstanding: summary.outstanding.length,
-    tokens_outstanding_over_stale_days: summary.outstandingOverStale,
-    tokens_outstanding_undated: summary.outstandingUndated,
-    outstanding_tokens: summary.outstanding.slice(0, 50),
+    token_events_read: countOrNull(tokenLogsSnap, events.length),
+    token_events_truncated: tokenLogsSnap.status === "ok" ? isTruncated(tokenLogsSnap) : null,
+    tokens_created: countOrNull(tokenLogsSnap, summary.created),
+    tokens_destroyed: countOrNull(tokenLogsSnap, summary.destroyed),
+    tokens_outstanding: countOrNull(tokenLogsSnap, summary.outstanding.length),
+    tokens_outstanding_over_stale_days: countOrNull(tokenLogsSnap, summary.outstandingOverStale),
+    tokens_outstanding_undated: countOrNull(tokenLogsSnap, summary.outstandingUndated),
+    outstanding_tokens: listOrNull(tokenLogsSnap, summary.outstanding.slice(0, 50)),
     newest_token_event: summary.newestEvent ?? null,
   };
   const auditText = tokenLogsSnap.status === "ok"
     ? `The audit log (filter[source_type]=apitoken) recorded ${summary.created} token creation and ${summary.destroyed} deletion events${isTruncated(tokenLogsSnap) ? " (history truncated)" : ""}, leaving ${summary.outstanding.length} outstanding token(s).`
-    : snapshotCause("Audit log token events (/audit_logs?filter[source_type]=apitoken, Enterprise plan and admin role)", tokenLogsSnap);
+    : snapshotCause(tokenLogSource, tokenLogsSnap);
   if (settingsSnap.status !== "ok") {
     return manualFinding(13, title, "high", `${snapshotCause("Account settings", settingsSnap)} ${auditText}`, instruction, evidence);
   }
   if (apiTokenAccess === false) {
-    return finding(13, title, "high", "pass", `settings.api.api_token_access=false, so API tokens cannot be used to authenticate to this account. ${auditText}`, evidence);
+    return capForUnreadable(
+      finding(13, title, "high", "pass", `settings.api.api_token_access=false, so API tokens cannot be used to authenticate to this account. ${auditText}`, evidence),
+      [[tokenLogSource, tokenLogsSnap]],
+    );
   }
   const accessText = `settings.api.api_token_access=${apiTokenAccess === true ? "true" : "absent"}, so API tokens can authenticate to this account.`;
   if (tokenLogsSnap.status !== "ok") {
@@ -1559,16 +1716,16 @@ export async function assessZendeskAccessControl(
       agents: agents.length,
       unrestricted_agents: unrestrictedAgents.length,
       custom_roles_status: rolesSnap.status,
-      custom_roles: customRoles.length,
-      admin_equivalent_custom_roles: adminEquivalent.slice(0, 25),
-      inventory_truncated: isTruncated(teamSnap),
+      custom_roles: listCountOrNull(rolesSnap),
+      admin_equivalent_custom_roles: listOrNull(rolesSnap, adminEquivalent.slice(0, 25)),
+      inventory_truncated: isTruncated(teamSnap) || isTruncated(rolesSnap),
     };
     if (rolesSnap.status !== "ok") {
       findings.push(manualFinding(6, leastPrivilegeTitle, "critical", `${snapshotCause("Custom roles (/custom_roles, Enterprise plan)", rolesSnap)} Built-in roles seen: ${admins.length} admins, ${agents.length} agents (${unrestrictedAgents.length} unrestricted).`, "capture Admin Center > People > Team > Roles and confirm agents are assigned the least-privileged built-in or custom role.", evidence));
     } else if (adminEquivalent.some((role) => role.members > 0)) {
       findings.push(finding(6, leastPrivilegeTitle, "critical", "fail", `${adminEquivalent.filter((role) => role.members > 0).length} custom roles grant admin-equivalent permissions (${adminEquivalent.map((role) => `${role.name}: ${role.reasons.join(", ")}`).join("; ")}).${truncationNote("team member", teamSnap)}`, evidence));
-    } else if (isTruncated(teamSnap) || adminEquivalent.length > 0 || (agents.length > 0 && unrestrictedAgents.length === agents.length)) {
-      findings.push(finding(6, leastPrivilegeTitle, "critical", "warn", `${customRoles.length} custom roles reviewed; ${adminEquivalent.length} admin-equivalent roles have no members; ${unrestrictedAgents.length}/${agents.length} agents are unrestricted.${truncationNote("team member", teamSnap)} Review whether unrestricted agents need account-wide ticket access.`, evidence));
+    } else if (isTruncated(teamSnap) || isTruncated(rolesSnap) || adminEquivalent.length > 0 || (agents.length > 0 && unrestrictedAgents.length === agents.length)) {
+      findings.push(finding(6, leastPrivilegeTitle, "critical", "warn", `${customRoles.length} custom roles reviewed; ${adminEquivalent.length} admin-equivalent roles have no members; ${unrestrictedAgents.length}/${agents.length} agents are unrestricted.${truncationNote("team member", teamSnap)}${truncationNote("custom role", rolesSnap)} Review whether unrestricted agents need account-wide ticket access.`, evidence));
     } else {
       findings.push(finding(6, leastPrivilegeTitle, "critical", "pass", `${teamMembers.length} team members (${admins.length} admins, ${agents.length} agents, ${unrestrictedAgents.length} unrestricted) and ${customRoles.length} custom roles were read to completion with no admin-equivalent custom roles.`, evidence));
     }
@@ -1637,25 +1794,34 @@ export async function assessZendeskAccessControl(
     const privilegedTokens = tokens.filter((token) => asArray(token.scopes).some((scope) => /write|impersonate/i.test(asString(scope) ?? "")));
     const nonExpiringTokens = tokens.filter((token) => !asString(token.expires_at));
     const usage = partitionByDate(tokens, "used_at", resolved.staleDays, now);
+    const tokenSource = "OAuth tokens (/oauth/tokens?all=true, admin only)";
     const evidence: JsonRecord = {
       oauth_clients: clients.length,
       clients_without_scope_restriction: unscoped.slice(0, 25).map((item) => asString(item.name) ?? asString(item.identifier) ?? "client"),
       public_clients: publicClients.slice(0, 25).map((item) => asString(item.name) ?? asString(item.identifier) ?? "client"),
       clients_with_http_redirects: insecureRedirects.slice(0, 25).map((item) => asString(item.name) ?? asString(item.identifier) ?? "client"),
       oauth_tokens_status: tokensSnap.status,
-      oauth_tokens: tokens.length,
-      tokens_with_write_or_impersonate: privilegedTokens.length,
-      tokens_without_expiry: nonExpiringTokens.length,
-      tokens_unused_over_stale_days: usage.stale.length,
-      tokens_without_used_at: usage.undated.length,
+      oauth_tokens: listCountOrNull(tokensSnap),
+      tokens_with_write_or_impersonate: countOrNull(tokensSnap, privilegedTokens.length),
+      tokens_without_expiry: countOrNull(tokensSnap, nonExpiringTokens.length),
+      tokens_unused_over_stale_days: countOrNull(tokensSnap, usage.stale.length),
+      tokens_without_used_at: countOrNull(tokensSnap, usage.undated.length),
       inventory_truncated: isTruncated(clientsSnap) || isTruncated(tokensSnap),
     };
     if (unscoped.length > 0 || insecureRedirects.length > 0) {
       findings.push(finding(14, oauthTitle, "high", "fail", `${unscoped.length}/${clients.length} OAuth clients have no scope restriction and ${insecureRedirects.length} use http:// redirect URIs.${truncationNote("OAuth client", clientsSnap)}`, evidence));
     } else if (clients.length === 0) {
-      findings.push(finding(14, oauthTitle, "high", tokens.length > 0 ? "warn" : "pass", tokens.length > 0 ? `Zero OAuth clients were returned but ${tokens.length} OAuth tokens exist (global clients or partial view); review token ownership.` : "The OAuth client endpoint was readable and returned zero clients, so no third-party OAuth applications are registered on this account.", evidence));
+      if (tokensSnap.status !== "ok") {
+        findings.push(finding(14, oauthTitle, "high", "warn", `The OAuth client endpoint was readable and returned zero clients, but the token inventory could not be read, so tokens issued to global or hidden clients cannot be ruled out: ${snapshotCause(tokenSource, tokensSnap)}`, evidence));
+      } else if (tokens.length > 0) {
+        findings.push(finding(14, oauthTitle, "high", "warn", `Zero OAuth clients were returned but ${tokens.length} OAuth tokens exist (global clients or partial view); review token ownership.${truncationNote("OAuth token", tokensSnap)}`, evidence));
+      } else if (isTruncated(clientsSnap) || isTruncated(tokensSnap)) {
+        findings.push(finding(14, oauthTitle, "high", "warn", `Zero OAuth clients and zero tokens were seen, but an inventory was truncated before completion.${truncationNote("OAuth client", clientsSnap)}${truncationNote("OAuth token", tokensSnap)}`, evidence));
+      } else {
+        findings.push(finding(14, oauthTitle, "high", "pass", "The OAuth client and token endpoints were readable and returned zero clients and zero tokens, so no third-party OAuth applications are registered on this account.", evidence));
+      }
     } else if (publicClients.length > 0 || privilegedTokens.length > 0 || nonExpiringTokens.length > 0 || usage.stale.length > 0 || usage.undated.length > 0 || isTruncated(clientsSnap) || isTruncated(tokensSnap) || tokensSnap.status !== "ok") {
-      findings.push(finding(14, oauthTitle, "high", "warn", `${clients.length} OAuth clients all declare allowed scopes; review ${publicClients.length} public clients, ${privilegedTokens.length} tokens with write or impersonate scope, ${nonExpiringTokens.length} non-expiring tokens, ${usage.stale.length} tokens unused for more than ${resolved.staleDays} days, and ${usage.undated.length} tokens with no used_at value.${tokensSnap.status !== "ok" ? ` ${snapshotCause("OAuth tokens", tokensSnap)}` : ""}${truncationNote("OAuth client", clientsSnap)}`, evidence));
+      findings.push(finding(14, oauthTitle, "high", "warn", `${clients.length} OAuth clients all declare allowed scopes; review ${publicClients.length} public clients${tokensSnap.status === "ok" ? `, ${privilegedTokens.length} tokens with write or impersonate scope, ${nonExpiringTokens.length} non-expiring tokens, ${usage.stale.length} tokens unused for more than ${resolved.staleDays} days, and ${usage.undated.length} tokens with no used_at value` : ""}.${tokensSnap.status !== "ok" ? ` Token hygiene could not be reviewed: ${snapshotCause(tokenSource, tokensSnap)}` : ""}${truncationNote("OAuth client", clientsSnap)}${truncationNote("OAuth token", tokensSnap)}`, evidence));
     } else {
       findings.push(finding(14, oauthTitle, "high", "pass", `${clients.length} OAuth clients all declare allowed scopes and https redirect URIs; ${tokens.length} tokens were read to completion with expiries and recent usage.`, evidence));
     }
@@ -1679,11 +1845,12 @@ export async function assessZendeskAccessControl(
     summary: {
       subdomain: config.subdomain,
       current_user_role: asString(currentUserSnap.data?.role) ?? null,
-      seen_team_members: teamMembers.length,
-      admins: admins.length,
-      custom_roles: listSnapshotItems(rolesSnap).length,
-      groups: groups.length,
-      oauth_clients: listSnapshotItems(clientsSnap).length,
+      seen_team_members: countOrNull(teamSnap, teamMembers.length),
+      admins: countOrNull(teamSnap, admins.length),
+      custom_roles: listCountOrNull(rolesSnap),
+      groups: countOrNull(groupsSnap, groups.length),
+      oauth_clients: listCountOrNull(clientsSnap),
+      oauth_tokens: listCountOrNull(tokensSnap),
       ...summarizeStatuses(finalFindings),
     },
     findings: finalFindings,
@@ -1731,14 +1898,22 @@ function assessDeletionPolicies(
   const redactionRoles = customRoles.filter((role) => asBoolean(asObject(role.configuration)?.ticket_redaction) === true).length;
   const deletionScheduleRoles = customRoles.filter((role) => asString(asObject(role.configuration)?.manage_deletion_schedules) === "all").length;
   const agentTicketDeletion = asBoolean(tickets.agent_ticket_deletion);
-  const context = `${settingsSnap.status === "ok" ? ` settings.tickets.agent_ticket_deletion=${agentTicketDeletion ?? "absent"}${agentTicketDeletion === true ? " (agents can delete tickets; review whether that is intended)" : ""}.` : ""}${rolesSnap.status === "ok" ? ` ${redactionRoles}/${customRoles.length} custom roles allow ticket redaction and ${deletionScheduleRoles} can manage deletion schedules.` : ""}`;
+  const settingsSource = "Account settings (settings.tickets.agent_ticket_deletion)";
+  const rolesSource = "Custom roles (/custom_roles, Enterprise plan; redaction and deletion schedule permissions)";
+  const context = `${settingsSnap.status === "ok"
+    ? ` settings.tickets.agent_ticket_deletion=${agentTicketDeletion ?? "absent"}${agentTicketDeletion === true ? " (agents can delete tickets; review whether that is intended)" : ""}.`
+    : ` ${snapshotCause(settingsSource, settingsSnap)}`}${rolesSnap.status === "ok"
+    ? ` ${redactionRoles}/${customRoles.length} custom roles allow ticket redaction and ${deletionScheduleRoles} can manage deletion schedules.${truncationNote("custom role", rolesSnap)}`
+    : ` ${snapshotCause(rolesSource, rolesSnap)}`}`;
   const baseEvidence: JsonRecord = {
     deletion_schedules_status: deletionSnap.status,
+    account_settings_status: settingsSnap.status,
     agent_ticket_deletion: agentTicketDeletion ?? null,
-    custom_roles_with_ticket_redaction: redactionRoles,
-    custom_roles_managing_deletion_schedules: deletionScheduleRoles,
+    custom_roles_with_ticket_redaction: countOrNull(rolesSnap, redactionRoles),
+    custom_roles_managing_deletion_schedules: countOrNull(rolesSnap, deletionScheduleRoles),
     custom_roles_status: rolesSnap.status,
   };
+  const cap = (item: ZendeskFinding): ZendeskFinding => capForUnreadable(item, [[settingsSource, settingsSnap], [rolesSource, rolesSnap]]);
   if (deletionSnap.status !== "ok") {
     return manualFinding(12, title, "high", `${snapshotCause("Deletion schedules (/deletion_schedules, admin only)", deletionSnap)}${context}`, instruction, baseEvidence);
   }
@@ -1774,7 +1949,7 @@ function assessDeletionPolicies(
     ];
     return finding(12, title, "high", "warn", `${active.length} active deletion schedule(s) (${byObjectText}; ${defaults} default) but ${gaps.join(" and ")}.${truncationNote("deletion schedule", deletionSnap)}${context}`, evidence);
   }
-  return finding(12, title, "high", "pass", `${active.length} active deletion schedule(s) read to completion (${byObjectText}; ${defaults} default); ticket retention is enforced by ${ticketSchedules} conditioned schedule(s).${context}`, evidence);
+  return cap(finding(12, title, "high", "pass", `${active.length} active deletion schedule(s) read to completion (${byObjectText}; ${defaults} default); ticket retention is enforced by ${ticketSchedules} conditioned schedule(s).${context}`, evidence));
 }
 
 export async function assessZendeskDataProtection(
@@ -1877,7 +2052,9 @@ export async function assessZendeskDataProtection(
       causes: [...new Set(suspended.map((ticket) => asString(ticket.cause)).filter(Boolean))].slice(0, 20),
       inventory_truncated: isTruncated(suspendedSnap),
     };
-    if (suspended.length === 0) {
+    if (suspended.length === 0 && isTruncated(suspendedSnap)) {
+      findings.push(finding(20, suspendedTitle, "low", "warn", `Zero suspended tickets were seen but the queue read was truncated before completion.${truncationNote("suspended ticket", suspendedSnap)}`, evidence));
+    } else if (suspended.length === 0) {
       findings.push(finding(20, suspendedTitle, "low", "pass", "The suspended ticket endpoint was readable and the queue is empty (0 suspended tickets).", evidence));
     } else if (buckets.stale.length > 0 || isTruncated(suspendedSnap)) {
       findings.push(finding(20, suspendedTitle, "low", "warn", `${suspended.length} suspended tickets are queued and ${buckets.stale.length} are older than ${resolved.suspendedTicketAgeDays} days (${buckets.undated.length} undated).${truncationNote("suspended ticket", suspendedSnap)}`, evidence));
@@ -1905,9 +2082,10 @@ export async function assessZendeskDataProtection(
       subdomain: config.subdomain,
       current_user_role: asString(currentUserSnap.data?.role) ?? null,
       audit_log_status: auditSnap.status,
-      audit_log_entries_sampled: auditEntries.length,
+      audit_log_entries_sampled: countOrNull(auditSnap, auditEntries.length),
       private_attachments: privateAttachments ?? null,
-      suspended_tickets: listSnapshotItems(suspendedSnap).length,
+      deletion_schedules: listCountOrNull(deletionSnap),
+      suspended_tickets: listCountOrNull(suspendedSnap),
       ...summarizeStatuses(finalFindings),
     },
     findings: finalFindings,
@@ -1947,13 +2125,19 @@ export async function assessZendeskIntegrations(
     const enabled = marketplace.filter((item) => asBoolean(item.enabled) !== false);
     const evidence: JsonRecord = {
       app_installations: installations.length,
-      marketplace_installations: marketplace.length,
-      enabled_marketplace_installations: enabled.length,
+      marketplace_installations: countOrNull(ownedSnap, marketplace.length),
+      enabled_marketplace_installations: countOrNull(ownedSnap, enabled.length),
       owned_apps_status: ownedSnap.status,
+      inventory_truncated: isTruncated(installationsSnap) || isTruncated(ownedSnap),
       apps: marketplace.slice(0, 50).map((item) => ({ name: installationName(item), enabled: asBoolean(item.enabled) ?? null, product: asString(item.product) ?? null, role_restrictions: asArray(item.role_restrictions).length, group_restrictions: asArray(item.group_restrictions).length })),
     };
-    if (installations.length === 0) {
-      findings.push(finding(15, marketplaceTitle, "medium", "pass", "The app installation endpoint was readable and returned zero installed apps, so there are no marketplace apps to review.", evidence));
+    if (installations.length === 0 && isTruncated(installationsSnap)) {
+      findings.push(finding(15, marketplaceTitle, "medium", "warn", `Zero installed apps were seen but the installation inventory was truncated before completion.${truncationNote("app installation", installationsSnap)}`, evidence));
+    } else if (installations.length === 0) {
+      findings.push(capForUnreadable(
+        finding(15, marketplaceTitle, "medium", "pass", "The app installation endpoint was readable and returned zero installed apps, so there are no marketplace apps to review.", evidence),
+        [["Owned apps (/apps/owned, used to separate private apps from marketplace apps)", ownedSnap]],
+      ));
     } else {
       findings.push(manualFinding(15, marketplaceTitle, "medium", `${marketplace.length} marketplace app installations (${enabled.length} enabled) were inventoried${ownedSnap.status !== "ok" ? ", but owned apps could not be separated because " + snapshotCause("/apps/owned", ownedSnap).toLowerCase() : ""}; app permission reviews cannot be verified through the API.`, "record the reviewer, date, and outcome of the permission review for each installed app in Admin Center > Apps and integrations > Zendesk Support apps.", evidence));
     }
@@ -1967,9 +2151,12 @@ export async function assessZendeskIntegrations(
     const evidence: JsonRecord = {
       owned_apps: ownedApps.length,
       deprecated_or_obsolete: retired.slice(0, 25).map((app) => asString(app.name) ?? asString(app.id) ?? "app"),
+      inventory_truncated: isTruncated(ownedSnap),
       apps: ownedApps.slice(0, 50).map((app) => ({ name: asString(app.name) ?? null, visibility: asString(app.visibility) ?? null, framework_version: asString(app.framework_version) ?? null, parameters: asArray(app.parameters).length })),
     };
-    if (ownedApps.length === 0) {
+    if (ownedApps.length === 0 && isTruncated(ownedSnap)) {
+      findings.push(finding(16, customAppTitle, "medium", "warn", `Zero owned apps were seen but the inventory was truncated before completion.${truncationNote("owned app", ownedSnap)}`, evidence));
+    } else if (ownedApps.length === 0) {
       findings.push(finding(16, customAppTitle, "medium", "pass", "The owned apps endpoint was readable and returned zero private or custom apps.", evidence));
     } else if (retired.length > 0) {
       findings.push(finding(16, customAppTitle, "medium", "warn", `${retired.length}/${ownedApps.length} owned apps are deprecated or obsolete and should be removed or updated; scope review of the remaining apps is manual.`, evidence));
@@ -2030,8 +2217,11 @@ export async function assessZendeskIntegrations(
       sharing_agreements: agreements.length,
       active_agreements: active.slice(0, 25).map((item) => ({ name: asString(item.name) ?? null, remote_subdomain: asString(item.remote_subdomain) ?? null, partner_name: asString(item.partner_name) ?? null, status: asString(item.status) ?? null, type: asString(item.type) ?? null })),
       broken_agreements: broken.length,
+      inventory_truncated: isTruncated(sharingSnap),
     };
-    if (agreements.length === 0) {
+    if (agreements.length === 0 && isTruncated(sharingSnap)) {
+      findings.push(finding(23, sharingTitle, "medium", "warn", `Zero sharing agreements were seen but the inventory was truncated before completion.${truncationNote("sharing agreement", sharingSnap)}`, evidence));
+    } else if (agreements.length === 0) {
       findings.push(finding(23, sharingTitle, "medium", "pass", "The sharing agreement endpoint was readable and returned zero agreements, so tickets are not shared with external Zendesk accounts.", evidence));
     } else if (broken.length > 0) {
       findings.push(finding(23, sharingTitle, "medium", "warn", `${broken.length}/${agreements.length} sharing agreements are in a failed, ssl_error, or configuration_error state and ${active.length} are active; review each remote account.`, evidence));
@@ -2052,20 +2242,24 @@ export async function assessZendeskIntegrations(
     const activeWebhooks = webhooks.filter((hook) => asString(hook.status) === "active");
     const insecureWebhooks = activeWebhooks.filter((hook) => urlScheme(hook.endpoint) !== "https");
     const unauthenticatedWebhooks = activeWebhooks.filter((hook) => !asObject(hook.authentication) && !asObject(hook.signing_secret));
+    const destinationsTruncated = isTruncated(targetsSnap) || isTruncated(webhooksSnap);
+    const truncationNotes = `${truncationNote("target", targetsSnap)}${truncationNote("webhook", webhooksSnap)}`;
+    const targetText = targetsSnap.status === "ok" ? `${insecureTargets.length} active targets` : "an unread target inventory";
+    const webhookText = webhooksSnap.status === "ok" ? `${insecureWebhooks.length} active webhooks` : "an unread webhook inventory";
     const evidence: JsonRecord = {
       targets_status: targetsSnap.status,
-      active_targets: activeTargets.length,
-      insecure_targets: insecureTargets.slice(0, 25).map((target) => asString(target.title) ?? asString(target.id) ?? "target"),
+      active_targets: countOrNull(targetsSnap, activeTargets.length),
+      insecure_targets: listOrNull(targetsSnap, insecureTargets.slice(0, 25).map((target) => asString(target.title) ?? asString(target.id) ?? "target")),
       webhooks_status: webhooksSnap.status,
-      active_webhooks: activeWebhooks.length,
-      insecure_webhooks: insecureWebhooks.slice(0, 25).map((hook) => asString(hook.name) ?? asString(hook.id) ?? "webhook"),
-      webhooks_without_authentication: unauthenticatedWebhooks.slice(0, 25).map((hook) => asString(hook.name) ?? asString(hook.id) ?? "webhook"),
-      inventory_truncated: isTruncated(webhooksSnap),
+      active_webhooks: countOrNull(webhooksSnap, activeWebhooks.length),
+      insecure_webhooks: listOrNull(webhooksSnap, insecureWebhooks.slice(0, 25).map((hook) => asString(hook.name) ?? asString(hook.id) ?? "webhook")),
+      webhooks_without_authentication: listOrNull(webhooksSnap, unauthenticatedWebhooks.slice(0, 25).map((hook) => asString(hook.name) ?? asString(hook.id) ?? "webhook")),
+      inventory_truncated: destinationsTruncated,
     };
     if (insecureTargets.length > 0 || insecureWebhooks.length > 0) {
-      findings.push(finding(24, httpsTitle, "high", "fail", `${insecureTargets.length} active targets and ${insecureWebhooks.length} active webhooks deliver to non-https endpoints.${truncationNote("webhook", webhooksSnap)}`, evidence));
-    } else if (targetsSnap.status !== "ok" || webhooksSnap.status !== "ok" || isTruncated(webhooksSnap) || unauthenticatedWebhooks.length > 0) {
-      findings.push(finding(24, httpsTitle, "high", "warn", `All seen destinations use https, but ${unauthenticatedWebhooks.length} active webhooks have no authentication or signing secret visible${targetsSnap.status !== "ok" ? `, and ${snapshotCause("targets", targetsSnap).toLowerCase()}` : ""}${webhooksSnap.status !== "ok" ? `, and ${snapshotCause("webhooks", webhooksSnap).toLowerCase()}` : ""}.${truncationNote("webhook", webhooksSnap)}`, evidence));
+      findings.push(finding(24, httpsTitle, "high", "fail", `${targetText} and ${webhookText} deliver to non-https endpoints.${truncationNotes}`, evidence));
+    } else if (targetsSnap.status !== "ok" || webhooksSnap.status !== "ok" || destinationsTruncated || unauthenticatedWebhooks.length > 0) {
+      findings.push(finding(24, httpsTitle, "high", "warn", `All seen destinations use https, but ${webhooksSnap.status === "ok" ? `${unauthenticatedWebhooks.length} active webhooks have no authentication or signing secret visible` : "webhook authentication could not be reviewed"}${targetsSnap.status !== "ok" ? `, and ${snapshotCause("targets", targetsSnap).toLowerCase()}` : ""}${webhooksSnap.status !== "ok" ? `, and ${snapshotCause("webhooks", webhooksSnap).toLowerCase()}` : ""}${destinationsTruncated ? ", and an inventory was truncated" : ""}.${truncationNotes}`, evidence));
     } else if (activeTargets.length === 0 && activeWebhooks.length === 0) {
       findings.push(finding(24, httpsTitle, "high", "pass", "Both the targets and webhooks endpoints were readable and returned zero active destinations (0 targets, 0 webhooks), so there are no external notification endpoints to secure; emptiness is compliant for this control.", evidence));
     } else {
@@ -2085,31 +2279,50 @@ export async function assessZendeskIntegrations(
     const webhookIndex = new Map(webhooks.map((hook) => [asString(hook.id) ?? "", hook]));
     const external = rules.flatMap((entry) => externalNotificationActions(entry.rule).map((action) => {
       const destination = action.field === "notification_target"
-        ? asString(targetIndex.get(action.destination)?.target_url) ?? asString(targetIndex.get(action.destination)?.email) ?? `target ${action.destination}`
+        ? asString(targetIndex.get(action.destination)?.target_url) ?? asString(targetIndex.get(action.destination)?.email)
         : action.field === "notification_webhook"
-          ? asString(webhookIndex.get(action.destination)?.endpoint) ?? `webhook ${action.destination}`
+          ? asString(webhookIndex.get(action.destination)?.endpoint)
+          : undefined;
+      const fallback = action.field === "notification_target"
+        ? `target ${action.destination}`
+        : action.field === "notification_webhook"
+          ? `webhook ${action.destination}`
           : `sharing agreement ${action.destination}`;
-      return { kind: entry.kind, title: asString(entry.rule.title) ?? asString(entry.rule.id) ?? "rule", action: action.field, destination };
+      // A destination is unresolved when its inventory was unreadable (or truncated past it),
+      // so the http check below cannot run for that action.
+      const unresolved = destination === undefined && (action.field === "notification_target" ? targetsSnap.status !== "ok" || isTruncated(targetsSnap) : action.field === "notification_webhook" ? webhooksSnap.status !== "ok" || isTruncated(webhooksSnap) : false);
+      return { kind: entry.kind, title: asString(entry.rule.title) ?? asString(entry.rule.id) ?? "rule", action: action.field, destination: destination ?? fallback, unresolved };
     }));
     const insecure = external.filter((item) => urlScheme(item.destination) === "http");
+    const unresolved = external.filter((item) => item.unresolved);
     const truncated = isTruncated(triggersSnap) || isTruncated(automationsSnap);
+    const destinationSources: Array<[string, ZendeskSnapshot<unknown>]> = [["Targets (/targets, used to resolve notification_target destinations)", targetsSnap], ["Webhooks (/webhooks, used to resolve notification_webhook destinations)", webhooksSnap]];
+    const unresolvedNote = unresolved.length > 0
+      ? ` ${unresolved.length} destination(s) could not be resolved to a URL, so their scheme was not checked:${targetsSnap.status !== "ok" ? ` ${snapshotCause("targets", targetsSnap)}` : ""}${webhooksSnap.status !== "ok" ? ` ${snapshotCause("webhooks", webhooksSnap)}` : ""}${isTruncated(targetsSnap) || isTruncated(webhooksSnap) ? " The target or webhook inventory was truncated." : ""}`
+      : "";
     const evidence: JsonRecord = {
       active_triggers: listSnapshotItems(triggersSnap).filter((rule) => asBoolean(rule.active) !== false).length,
       active_automations: listSnapshotItems(automationsSnap).filter((rule) => asBoolean(rule.active) !== false).length,
       external_notification_actions: external.slice(0, 50),
       insecure_destinations: insecure.length,
+      unresolved_destinations: unresolved.length,
+      targets_status: targetsSnap.status,
+      webhooks_status: webhooksSnap.status,
       inventory_truncated: truncated,
     };
     if (insecure.length > 0) {
-      findings.push(finding(25, exfilTitle, "high", "fail", `${insecure.length}/${external.length} external notification actions deliver ticket data to http:// destinations.${truncationNote("trigger", triggersSnap)}${truncationNote("automation", automationsSnap)}`, evidence));
+      findings.push(finding(25, exfilTitle, "high", "fail", `${insecure.length}/${external.length} external notification actions deliver ticket data to http:// destinations.${unresolvedNote}${truncationNote("trigger", triggersSnap)}${truncationNote("automation", automationsSnap)}`, evidence));
     } else if (rules.length === 0) {
       findings.push(manualFinding(25, exfilTitle, "high", "Zero active triggers or automations were visible although Zendesk accounts ship with default triggers, so the view is partial.", "export the trigger and automation lists from Admin Center > Objects and rules and record every 'Notify webhook', 'Notify target', and 'Share ticket' action.", evidence));
     } else if (external.length > 0) {
-      findings.push(finding(25, exfilTitle, "high", "warn", `${external.length} active rule actions send ticket data to external destinations (${[...new Set(external.map((item) => urlHost(item.destination) ?? item.destination))].slice(0, 10).join(", ")}); confirm each destination is an approved processor.${truncated ? " The rule inventory was truncated." : ""}`, evidence));
+      findings.push(finding(25, exfilTitle, "high", "warn", `${external.length} active rule actions send ticket data to external destinations (${[...new Set(external.map((item) => urlHost(item.destination) ?? item.destination))].slice(0, 10).join(", ")}); confirm each destination is an approved processor.${unresolvedNote}${truncated ? " The rule inventory was truncated." : ""}`, evidence));
     } else if (truncated) {
       findings.push(finding(25, exfilTitle, "high", "warn", "No external notification actions were found in the seen rules, but the trigger or automation inventory was truncated, so the full population was not reviewed.", evidence));
     } else {
-      findings.push(finding(25, exfilTitle, "high", "pass", `${rules.length} active triggers and automations were read to completion and none notify external targets, webhooks, or sharing agreements.`, evidence));
+      findings.push(capForUnreadable(
+        finding(25, exfilTitle, "high", "pass", `${rules.length} active triggers and automations were read to completion and none notify external targets, webhooks, or sharing agreements.`, evidence),
+        destinationSources,
+      ));
     }
   }
 
@@ -2132,11 +2345,11 @@ export async function assessZendeskIntegrations(
     summary: {
       subdomain: config.subdomain,
       current_user_role: currentRole ?? null,
-      app_installations: installations.length,
-      owned_apps: ownedApps.length,
-      brands: listSnapshotItems(brandsSnap).length,
-      webhooks: webhooks.length,
-      targets: targets.length,
+      app_installations: listCountOrNull(installationsSnap),
+      owned_apps: listCountOrNull(ownedSnap),
+      brands: listCountOrNull(brandsSnap),
+      webhooks: listCountOrNull(webhooksSnap),
+      targets: listCountOrNull(targetsSnap),
       ...summarizeStatuses(finalFindings),
     },
     findings: finalFindings,
@@ -2229,7 +2442,7 @@ function formatAccessCheckText(result: ZendeskAccessCheckResult): string {
     surface.name,
     surface.requiredRole,
     surface.status,
-    surface.count === undefined ? "-" : String(surface.count),
+    surface.count === undefined ? "-" : `${surface.count}${surface.truncated ? "+" : ""}`,
     surface.error ? surface.error.replace(/\s+/g, " ").slice(0, 90) : "",
   ]);
   return [
@@ -2309,10 +2522,10 @@ function buildQuickReference(): string {
   return [
     "# Zendesk Audit Bundle Quick Reference",
     "",
-    `- \`core_data/\` contains raw Zendesk API snapshots used during this assessment (credentials are never written: OAuth token values, client secrets, target passwords, and other credential-bearing properties are replaced with ${CREDENTIAL_REDACTION_MARKER}).`,
-    "- `analysis/` contains normalized findings (`findings.json`) and one JSON file per assessment category.",
+    `- \`core_data/\` contains redacted Zendesk API snapshots used during this assessment (credentials are never written: OAuth token values, client secrets, target passwords, app parameters flagged secure, {name, value} pairs with credential names, and other credential-bearing properties are replaced with ${CREDENTIAL_REDACTION_MARKER}; URL query credentials such as ?token=, URL userinfo, and token-in-path webhook URLs are replaced inside target_url, endpoint, and redirect_uri values while the scheme and host are kept).`,
+    "- `analysis/` contains normalized findings (`findings.json`) and one JSON file per assessment category. Counts derived from an inventory that could not be read render as null, never 0.",
     "- `compliance/` contains the executive summary, the unified matrix, and one report per framework (FedRAMP, CMMC, SOC 2, CIS, PCI-DSS, DISA STIG, IRAP, ISMAP).",
-    "- `_errors.log` appears only when some reads failed but the bundle still completed.",
+    "- `_errors.log` appears only when some reads failed but the bundle still completed. Error strings carry the HTTP status and Zendesk's documented error fields only; non-JSON bodies are summarized as a status-and-length note and never echoed.",
     "- Manual findings name the Admin Center evidence a reviewer must collect; they never count as passing.",
     "",
     "Recommended reading order:",
@@ -2468,7 +2681,7 @@ function registerAssessmentTool(
         const result = await run(createClient(args), toOptions(args));
         return textResult(formatAssessmentText(result), { tool: name, ...result });
       } catch (error) {
-        return errorResult(`${label} failed: ${error instanceof Error ? error.message : String(error)}`, { tool: name });
+        return errorResult(`${label} failed: ${errorMessage(error)}`, { tool: name });
       }
     },
   });
@@ -2487,7 +2700,7 @@ export function registerZendeskTools(pi: any): void {
         const result = await checkZendeskAccess(createClient(args));
         return textResult(formatAccessCheckText(result), { tool: "zendesk_check_access", ...result });
       } catch (error) {
-        return errorResult(`Zendesk access check failed: ${error instanceof Error ? error.message : String(error)}`, { tool: "zendesk_check_access" });
+        return errorResult(`Zendesk access check failed: ${errorMessage(error)}`, { tool: "zendesk_check_access" });
       }
     },
   });
@@ -2558,7 +2771,7 @@ export function registerZendeskTools(pi: any): void {
           },
         );
       } catch (error) {
-        return errorResult(`Zendesk audit bundle export failed: ${error instanceof Error ? error.message : String(error)}`, { tool: "zendesk_export_audit_bundle" });
+        return errorResult(`Zendesk audit bundle export failed: ${errorMessage(error)}`, { tool: "zendesk_export_audit_bundle" });
       }
     },
   });
