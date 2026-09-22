@@ -2042,7 +2042,7 @@ test("redactErrorText and describeErrorBody scrub credential-shaped text regardl
   assert.equal(redactErrorText("Bearer abcdefghijklmnop rejected"), "Bearer [REDACTED] rejected");
   assert.equal(redactErrorText("Basic dXNlcjpwYXNzd29yZA== rejected"), "Basic [REDACTED] rejected");
   assert.equal(redactErrorText("_zendesk_session=abc123def456 expired"), "_zendesk_session=[REDACTED] expired");
-  assert.equal(redactErrorText("see https://api.example.com/v1/x?token=abcd1234 and api_key=zzzz9999 or apiKey: 'qqqq1111'"), "see https://api.example.com/v1/x?token=[REDACTED] and api_key=[REDACTED] or apiKey=[REDACTED]'");
+  assert.equal(redactErrorText("see https://api.example.com/v1/x?token=abcd1234 and api_key=zzzz9999 or apiKey: 'qqqq1111'"), "see https://api.example.com/v1/x?token=[REDACTED] and api_key=[REDACTED] or apiKey: '[REDACTED]'");
   assert.equal(redactErrorText("proxy https://svc:pw12345@proxy.example.com refused"), "proxy https://[REDACTED]@proxy.example.com refused");
   assert.equal(redactErrorText("jwt eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.abcdefghijk"), "jwt [REDACTED]");
   assert.equal(redactErrorText("X-Api-Key: 0123456789abcdef"), "X-Api-Key: [REDACTED]");

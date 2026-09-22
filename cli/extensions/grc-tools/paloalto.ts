@@ -420,9 +420,9 @@ export const REDACTION_MARKER = "[REDACTED]";
  *    and similar header lines to the end of the line; the userinfo of every
  *    embedded URL; credential-named query and fragment pairs of every URL and bare
  *    query string (the PAN-OS key= parameter included) and any query value shaped
- *    like a token; the schemes Bearer, Basic, Digest, Token, OAuth, Negotiate,
- *    NTLM, SSWS, and ApiKey (one plain lowercase word after the scheme, "Basic
- *    authentication", is prose); credential-named key=value pairs (to the next
+ *    like a token; the schemes Bearer, Basic, Digest, Token, Negotiate, NTLM, SSWS,
+ *    and ApiKey (only a listed prose word after the scheme, "Basic authentication",
+ *    stays; after the noun "Token" any short plain lowercase word does); credential-named key=value pairs (to the next
  *    delimiter), key: value pairs (to the end of the line), "key":"value" pairs,
  *    and key="value" XML or HTML attributes; and webhook services whose URL path is
  *    the secret. Nothing this module renders puts a credential word in front of a
@@ -467,20 +467,36 @@ const PUBLIC_PEM_LABELS = new Set(["CERTIFICATE", "TRUSTED CERTIFICATE", "X509 C
 const EMBEDDED_URL_PATTERN = /\b[a-z][a-z0-9+.-]*:\/\/[^\s"'<>()[\]{}]+/gi;
 const URL_USERINFO_PATTERN = /^([a-z][a-z0-9+.-]*:\/\/)[^\s/@"'<>]+@/i;
 // A query or fragment pair, in a URL or a bare query string: a credential-named pair or a
-// token-shaped value loses the value.
-const QUERY_PAIR_PATTERN = /([?&#])([A-Za-z0-9_.[\]-]+)=((?!\[REDACTED\])[^&#\s"'<>]+)/g;
+// token-shaped value loses the value. A value ends at "&", "#", whitespace, a quote, or the
+// ";" and "," that end a URL inside a sentence (no token carries either).
+const QUERY_PAIR_PATTERN = /([?&#])([A-Za-z0-9_.[\]-]+)=((?!\[REDACTED\])[^&#\s"'<>;,]+)/g;
 // A credential-bearing header line: the whole value goes, whatever its shape. A line that
 // already carries a marker is left alone so the rule is idempotent.
 const HEADER_LINE_PATTERN = /\b(authorization|proxy-authorization|cookie|set-cookie|x-api-key|api-key|apikey|x-pan-key|x-redlock-auth|x-auth-token|x-access-token|x-amz-security-token|x-vault-token|private-token|x-goog-api-key|x-csrf-token|x-xsrf-token)(["']?\s*:\s*)(?![^\r\n<>"']*\[REDACTED\])[^\r\n<>"']*[^\s\r\n<>"']/gi;
-// A scheme and its credentials; one plain lowercase word after the scheme ("Basic
-// authentication", "Bearer token") is prose.
-const SCHEME_VALUE_PATTERN = /\b(Bearer|Basic|Digest|Token|OAuth|Negotiate|NTLM|SSWS|ApiKey|Api-Key)\s+((?!\[REDACTED\])[A-Za-z0-9._~+/=-]{4,})/gi;
-const PLAIN_WORD_PATTERN = /^[a-z]{1,20}$/;
+// A scheme and its credentials: the value is removed whatever its shape, except the
+// prose words that follow a scheme name in a sentence ("Basic authentication is
+// required", "Bearer token"). "Token" is also this module's own noun ("Token hygiene",
+// "token inventory"), so after it any plain lowercase word shorter than
+// LONG_TOKEN_MIN_LENGTH is prose. OAuth 1.0 carries its credentials as key="value"
+// attributes, which the attribute rule removes, so OAuth is not a scheme here and
+// "OAuth clients" stays.
+const SCHEME_VALUE_PATTERN = /\b(Bearer|Basic|Digest|Token|Negotiate|NTLM|SSWS|ApiKey|Api-Key)\s+((?!\[REDACTED\])[A-Za-z0-9._~+/=-]{4,})/gi;
+const PLAIN_WORD_PATTERN = /^[a-z]+$/;
+const SCHEME_PROSE_WORDS = new Set([
+  "authentication", "authorization", "auth", "token", "tokens", "credential", "credentials", "scheme", "schemes", "header", "headers",
+  "realm", "challenge", "access", "mode", "method", "login", "flow", "grant", "type", "string", "value", "values", "user", "users",
+  "account", "client", "clients", "error", "request", "requests", "response", "with", "without", "and", "or", "is", "was", "are",
+  "not", "the", "this", "that", "these", "those", "to", "in", "for", "from", "on", "of", "by", "as", "at", "if", "then", "but", "so",
+  "than", "when", "where", "over", "via", "per", "only", "still", "also", "use", "used", "using", "required", "requires", "failed",
+  "rejected", "expired", "invalid", "missing", "unsupported", "supported", "unauthorized", "forbidden", "denied", "allowed", "enabled",
+  "disabled", "preferred", "deprecated", "retired", "retiring", "must", "should", "can", "cannot", "could", "will", "would", "may",
+  "has", "have", "does", "did", "do", "be", "been",
+]);
 // "key":"value" and key="value" carriers keep the whole quoted value together so a
 // value with spaces is removed as one; the unquoted pair rule below takes the rest.
 // Keys may start with "_" (_upstream_session, _token), so a key begins wherever no key
 // character precedes it rather than at a word boundary.
-const JSON_QUOTED_PAIR_PATTERN = /"([A-Za-z_][A-Za-z0-9_.-]{0,63})"\s*:\s*"((?!\[REDACTED\])[^"\r\n]+)"/g;
+const JSON_QUOTED_PAIR_PATTERN = /"([A-Za-z_][A-Za-z0-9_.-]{0,63})"(\s*:\s*)"((?!\[REDACTED\])[^"\r\n]+)"/g;
 const QUOTED_ATTRIBUTE_PATTERN = /(?<![A-Za-z0-9_.:-])([A-Za-z_][A-Za-z0-9_.:-]{0,63})\s*=\s*(["'])((?!\[REDACTED\])[^"'\r\n]+)\2/g;
 // An unquoted pair: key=value runs to the next delimiter, key: value (a header or
 // YAML-style line) to the end of the line.
@@ -599,6 +615,14 @@ function isTokenShapedValue(value: string): boolean {
   return TOKEN_VALUE_PATTERN.test(value) && looksLikeToken(value);
 }
 
+// The word after a scheme name is prose when it is a plain lowercase word from the list
+// above, or, after "Token", any plain lowercase word too short to be a real token.
+function isSchemeProse(scheme: string, value: string): boolean {
+  if (!PLAIN_WORD_PATTERN.test(value)) return false;
+  if (SCHEME_PROSE_WORDS.has(value)) return true;
+  return scheme.toLowerCase() === "token" && value.length < LONG_TOKEN_MIN_LENGTH;
+}
+
 function isPublicPemLabel(label: string): boolean {
   return PUBLIC_PEM_LABELS.has(label.trim());
 }
@@ -654,8 +678,8 @@ function scrubCarriers(text: string, pemScope: PemScope): string {
     .replace(EMBEDDED_URL_PATTERN, scrubUrlUserinfo)
     .replace(QUERY_PAIR_PATTERN, (match, separator: string, key: string, value: string) => (isCredentialAssignmentKey(key) || isTokenShapedValue(value) ? `${separator}${key}=${REDACTION_MARKER}` : match))
     .replace(HEADER_LINE_PATTERN, `$1$2${REDACTION_MARKER}`)
-    .replace(SCHEME_VALUE_PATTERN, (match, scheme: string, value: string) => (PLAIN_WORD_PATTERN.test(value) ? match : `${scheme} ${REDACTION_MARKER}`))
-    .replace(JSON_QUOTED_PAIR_PATTERN, (match, key: string) => (isCredentialKey(key) ? `"${key}":"${REDACTION_MARKER}"` : match))
+    .replace(SCHEME_VALUE_PATTERN, (match, scheme: string, value: string) => (isSchemeProse(scheme, value) ? match : `${scheme} ${REDACTION_MARKER}`))
+    .replace(JSON_QUOTED_PAIR_PATTERN, (match, key: string, separator: string) => (isCredentialKey(key) ? `"${key}"${separator}"${REDACTION_MARKER}"` : match))
     .replace(QUOTED_ATTRIBUTE_PATTERN, (match, key: string, quote: string) => (isCredentialKey(key) ? `${key}=${quote}${REDACTION_MARKER}${quote}` : match));
   return replaceCredentialAssignments(scrubbed)
     .replace(JWT_PATTERN, REDACTION_MARKER)

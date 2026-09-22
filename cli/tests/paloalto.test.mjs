@@ -1306,7 +1306,7 @@ function carriersOf(value) {
     [`passphrase: ${value} and more words`, /^passphrase: \[REDACTED\]$/],
     [`client_secret=${value}&grant_type=x`, /^client_secret=\[REDACTED\]&grant_type=x$/],
     [`{"client_secret":"${value}","name":"svc"}`, /^\{"client_secret":"\[REDACTED\]","name":"svc"\}$/],
-    [`{"authToken": "${value}", "url": "https://x"}`, /^\{"authToken":"\[REDACTED\]", "url": "https:\/\/x"\}$/],
+    [`{"authToken": "${value}", "url": "https://x"}`, /^\{"authToken": "\[REDACTED\]", "url": "https:\/\/x"\}$/],
     [`<entry name="fw1" key="${value}"/>`, /^<entry name="fw1" key="\[REDACTED\]"\/>$/],
     [`<entry name='r1' secret='${value}'/>`, /^<entry name='r1' secret='\[REDACTED\]'\/>$/],
     [`<server name="r1" community-string="${value}"/>`, /^<server name="r1" community-string="\[REDACTED\]"\/>$/],
@@ -1357,6 +1357,22 @@ test("scrub boundary: name-shaped values stay bare in prose, leave every carrier
   ]) {
     assert.equal(redactErrorText(text), expected);
     assert.equal(redactErrorText(expected), expected, "idempotent");
+  }
+  // After a scheme the value goes whatever its shape, a plain lowercase word included,
+  // unless it is one of the listed prose words; after the noun "Token" any short plain
+  // lowercase word is prose.
+  for (const [text, expected] of [
+    ["Bearer abcdefghijklmnop rejected", "Bearer [REDACTED] rejected"],
+    ["Basic canarybasic rejected", "Basic [REDACTED] rejected"],
+    ["ApiKey canaryapikey rejected", "ApiKey [REDACTED] rejected"],
+    ["SSWS canarysswsvalue rejected", "SSWS [REDACTED] rejected"],
+    ["Token abcdefghijklmnopq expired", "Token [REDACTED] expired"],
+    ["Token hygiene could not be judged; token inventory read; Token count 3", "Token hygiene could not be judged; token inventory read; Token count 3"],
+    ["OAuth clients all declare scopes; an OAuth bearer token; OAuth abcdefghijklmnop", "OAuth clients all declare scopes; an OAuth bearer token; OAuth abcdefghijklmnop"],
+    ["Basic with Can View on scans; Bearer tokens expire; Basic credential; Basic authentication is required", "Basic with Can View on scans; Bearer tokens expire; Basic credential; Basic authentication is required"],
+  ]) {
+    assert.equal(redactErrorText(text), expected);
+    assert.equal(redactCredentialValueText(text), expected);
   }
   assert.equal(redactCredentialValueText("bare Kq7Zx2Vw9Lm4Tp8R id"), "bare Kq7Zx2Vw9Lm4Tp8R id", "an opaque identifier in evidence is not a secret");
   const certificate = "-----BEGIN CERTIFICATE-----\nMIIEfake\n-----END CERTIFICATE-----";
