@@ -147,6 +147,12 @@ export const MUST_KEEP = [
   'Retry-After: "120", Content-Length: "5120"',
   'Content-Type: "application/json" Accept: "application/json"',
   ...escapedNonCredentialHeaderLines(),
+  // A non-credential pair keeps a short or name-shaped value after `=`; only a real token shape goes there (N2).
+  "upstream said 502 theme=dark",
+  "upstream said 502 count=42",
+  "upstream said 502 Retry-After: 120",
+  "upstream said 502 mode=oauth2-client-credentials region=prod-us-east-2026 cipher=TLS_AES_256_GCM_SHA384",
+  "upstream said 502 org=550e8400-e29b-41d4-a716-446655440000 content=application/x-www-form-urlencoded",
 ];
 
 /**
@@ -227,7 +233,37 @@ export function carrierCases(canary = NAME_SHAPED_CANARY) {
     ...escapeBoundaryCases(TOKEN_SHAPED_CANARY),
     ...decodedControlCases(canary),
     ...escapedBareTokenCases(),
+    ...runAfterEqualsCases(),
   ];
+}
+
+/**
+ * Token runs right after `=` under a non-credential pair name (reviewer B round 4 verdict, N2): the pair rule owns
+ * the credential-named case, so the run rule must take a real token shape after `x=`, `theme=`, `id=`, and `key=`,
+ * with base64 padding on its right and after a double `=`, bare and inside a JSON string member. The pair name
+ * survives. Run with the token-shaped canary and every bare token shape; `id <run>` (the run rule alone) and
+ * `api_key=<run>` (the pair rule) are the positive controls, and `theme=dark`, `count=42` stay through MUST_KEEP.
+ */
+export function runAfterEqualsCases() {
+  const cases = [];
+  const runs = [{ name: "token-shaped canary", value: TOKEN_SHAPED_CANARY }, ...BARE_TOKENS.filter((item) => !item.value.includes("\n"))];
+  for (const run of runs) {
+    for (const [shape, text, keeps] of [
+      ["single-letter pair name", `x=${run.value} y`, ["x=", " y"]],
+      ["plain pair name", `theme=${run.value}`, ["theme="]],
+      ["identifier-named pair", `id=${run.value}`, ["id="]],
+      ["bare key pair", `key=${run.value}`, ["key="]],
+      ["base64 padding on the right", `x=${run.value}= y`, ["x=", " y"]],
+      ["double equals", `x==${run.value} y`, ["x==", " y"]],
+      ["positive control: run after a space", `id ${run.value}`, ["id "]],
+      ["positive control: credential-named pair", `api_key=${run.value}`, ["api_key="]],
+    ]) {
+      const bare = `upstream said 502 ${text}`;
+      cases.push({ name: `${run.name} after = (${shape})`, text: bare, value: run.value, keeps: ["upstream said 502 ", ...keeps] });
+      cases.push({ name: `${run.name} after = (${shape}) inside a JSON string member`, text: `{"message":"${bare}"}`, value: run.value, keeps: ['{"message":"upstream said 502 ', ...keeps] });
+    }
+  }
+  return cases;
 }
 
 /**
