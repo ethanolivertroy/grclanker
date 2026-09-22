@@ -3698,3 +3698,189 @@ test("scrub boundary: every fixed-text message the Datadog integration emits sur
   assert.ok(checked > 2000, `expected thousands of recorded strings, got ${checked}`);
   assert.deepEqual([...altered], [], `legitimate run text altered by the scrubber:\n${[...altered].join("\n")}`);
 });
+
+// ---------------------------------------------------------------------------------------------------------------
+// Review round 1: free-text carriers in collected data, scrub before the detail cut, silent success, short pages.
+// ---------------------------------------------------------------------------------------------------------------
+
+/** Credential carriers in free-text fields the key-based redaction cannot see: notes, descriptions, titles, filters, templates, messages. */
+const DD_FREE_TEXT_CARRIERS = {
+  allowlistNoteQuery: "Ycr7TXsmGCC99BFFh4zk3XuQ7CXTfVm3",
+  archiveConnectionKey: "7mVGCyZd6dPnr832nGuyMZzpBMErDbEg",
+  indexFilterPasswordPair: "kXam3Rmp2dS2GtCNqc8XAuTd2NmSLrYB",
+  pipelineTemplateBearer: "sPKqaX388JUWfmLCPnCsCpY2H2n5hNQn",
+  monitorWebhookPath: "7tDPWqe9jsWx3VbjwWTxzmvkyqLAnKmQ",
+  roleDescriptionUrlQuery: "mLfBcNTh6seQrRmhphf7pHHAbqSQMga9",
+  sdsDescriptionBareToken: "U4H8d4FFDZ4UZcbZET2UjkxC6kKRjFVB",
+  userTitleBareToken: "TLe2gSxXgrR48Ah8LkNn4ELH9nfhZXXK",
+};
+
+/** The healthy fixture with the reviewer's eight free-text carriers planted, one per position. */
+function freeTextCarrierClient() {
+  const carriers = DD_FREE_TEXT_CARRIERS;
+  const base = healthyClient();
+  return healthyClient({
+    async listUsers() {
+      const users = listingItems(await base.listUsers(100000)).map((record) => ({ ...record, attributes: { ...record.attributes } }));
+      users[0].attributes.title = `Platform lead ${carriers.userTitleBareToken}`;
+      return users;
+    },
+    async listRoles() {
+      const roles = listingItems(await base.listRoles(100000)).map((record) => ({ ...record, attributes: { ...record.attributes } }));
+      roles[0].attributes.description = `Break-glass role, runbook https://wiki.example.com/runbooks/role?token=${carriers.roleDescriptionUrlQuery}`;
+      return roles;
+    },
+    async getIpAllowlist() {
+      const allowlist = await base.getIpAllowlist();
+      allowlist.data.attributes.entries[0].data.attributes.note = `office egress; refresh at https://vpn.example.com/renew?token=${carriers.allowlistNoteQuery}`;
+      return allowlist;
+    },
+    async listLogArchives() {
+      return [{ id: "a1", type: "archives", attributes: { name: "s3-archive", state: "WORKING", destination: { type: "s3", integration: { account_id: "123456789012", role_name: "datadog-archive" }, connection: `s3://archive.example.com/logs key=${carriers.archiveConnectionKey}` } } }];
+    },
+    async listLogIndexes() {
+      return [{ name: "main", num_retention_days: 30, exclusion_filters: [{ name: "auth noise", is_enabled: true, filter: { query: `service:auth password=${carriers.indexFilterPasswordPair}`, sample_rate: 1 } }] }];
+    },
+    async listLogPipelines() {
+      return [{ id: "p1", name: "cloudtrail", is_enabled: true, filter: { query: "source:cloudtrail" }, processors: [{ type: "attribute-remapper", name: "auth header", template: `Authorization: Bearer ${carriers.pipelineTemplateBearer}` }] }];
+    },
+    async listMonitors() {
+      return [{ id: 1, name: "Security: root login", tags: ["team:security"], priority: 1, message: `@webhook-security https://hooks.slack.com/services/T0000000001/B0000000001/${carriers.monitorWebhookPath}`, query: 'logs("root login").index("*").rollup("count").last("5m") > 0' }];
+    },
+    async getSensitiveDataScannerConfig() {
+      const scanner = healthySensitiveDataScanner();
+      scanner.included[0].attributes.description = `Scans card numbers, see ${carriers.sdsDescriptionBareToken}`;
+      return scanner;
+    },
+  });
+}
+
+test("rule 9: credential carriers inside free-text fields (notes, descriptions, titles, filters, templates, monitor messages) reach no tool payload, bundle file, or zip entry, and the scrub runs at the collection boundary", async () => {
+  const planted = Object.values(DD_FREE_TEXT_CARRIERS);
+  const baselineLog = [];
+  const baseline = httpClient(routesFromClient(healthyClient()), baselineLog);
+  const baselineExport = await exportDatadogAuditBundle(baseline.client, baseline.config, createTempBase("grclanker-datadog-free-text-baseline-"), { now: NOW });
+  assertCanaryFixture(assert, planted, readBundleFiles(baselineExport.outputDir), "free-text carriers");
+
+  const log = [];
+  const { client, config } = httpClient(routesFromClient(freeTextCarrierClient()), log);
+  const access = await checkDatadogAccess(client);
+  const assessments = await runAllAssessments(client);
+  const exported = await exportDatadogAuditBundle(client, config, createTempBase("grclanker-datadog-free-text-"), { now: NOW });
+  const files = readBundleFiles(exported.outputDir);
+  assertCanaryWindowsAbsent(assert, JSON.stringify(access), planted, "check_access payload");
+  assertCanaryWindowsAbsent(assert, JSON.stringify(assessments), planted, "assess payloads");
+  assertCanaryWindowsAbsent(assert, files, planted, "bundle file");
+  assertCanaryWindowsAbsent(assert, readZipEntries(exported.zipPath), planted, "zip entry");
+
+  // The carrier context survives with the value gone, so a reader still sees the field and the shape of what was there.
+  const allowlist = JSON.parse(files.get("core_data/ip_allowlist.json"));
+  const note = JSON.stringify(allowlist);
+  assert.match(note, /https:\/\/vpn\.example\.com\/renew\?\[REDACTED\]/, "the query token goes, the URL stays");
+  const monitors = JSON.parse(files.get("core_data/monitors.json"));
+  assert.match(monitors[0].message, /https:\/\/hooks\.slack\.com\/services\/T0000000001\/B0000000001\/\[REDACTED\]/, "the webhook path token goes");
+  const pipelines = JSON.parse(files.get("core_data/log_pipelines.json"));
+  assert.match(JSON.stringify(pipelines), /Authorization: Bearer \[REDACTED\]/, "the bearer value goes, the scheme stays");
+  const indexes = JSON.parse(files.get("core_data/log_indexes.json"));
+  assert.match(JSON.stringify(indexes), /password=\[REDACTED\]/);
+  const users = JSON.parse(files.get("core_data/users.json"));
+  assert.equal(users[0].attributes.title, "Platform lead [REDACTED]", "a bare token in a title goes and the words stay");
+  assert.equal(users[0].attributes.email, "alice@acme.example", "legitimate values are untouched");
+  assertOutputMatchesRequestLog([...files], log, "free-text carriers");
+});
+
+test("rule 9: a configured API key straddling the 240-character error detail cut is scrubbed at full length before the cut, so no fragment survives", async () => {
+  for (const offset of [225, 235, 239, 240]) {
+    const message = `${"denied ".repeat(50).slice(0, offset)}${DD_TEST_API_KEY} was rejected`;
+    const routes = routesFromClient(healthyClient());
+    routes["GET /api/v2/users"] = () => jsonResponse({ errors: [message] }, { status: 403, statusText: "Forbidden" });
+    const { client } = httpClient(routes, []);
+    await assert.rejects(() => client.listUsers(), (error) => {
+      assertCanaryWindowsAbsent(assert, error.message, [DD_TEST_API_KEY], `detail cut at offset ${offset}`);
+      assert.match(error.message, /^Datadog request failed \(403 Forbidden\) GET \/api\/v2\/users: denied /, "the documented message is still quoted up to the cut");
+      assert.ok(error.message.length <= 340, `the detail is still cut (${error.message.length} characters)`);
+      return true;
+    });
+  }
+});
+
+const DD_SILENT_BODIES = [
+  ["empty", () => new Response("", { status: 200, statusText: "OK" }), /returned 200 OK with an empty body \(0 bytes\)/],
+  ["html", () => new Response("<html><body>Sign in to Datadog</body></html>", { status: 200, statusText: "OK", headers: { "content-type": "text/html" } }), /returned a 200 OK: non-JSON body \(text\/html, \d+ bytes, not echoed\)/],
+  ["foreign", () => jsonResponse({ status: "ok", service: "status-page" }, { statusText: "OK" }), /returned 200 OK with a JSON body that is not the documented JSON object \(one of data\) \(\d+ bytes, not echoed\)/],
+];
+
+test("silent success: a 2xx whose body is empty, an HTML page, or JSON of another shape is a failed read with http_status 200, a marker in core_data, and only manual or warn movement in the findings, never an empty inventory", async () => {
+  const baselineClient = httpClient(routesFromClient(healthyClient()), []);
+  const baselineExport = await exportDatadogAuditBundle(baselineClient.client, baselineClient.config, createTempBase("grclanker-datadog-silent-baseline-"), { now: NOW });
+  const baseline = JSON.parse(readBundleFiles(baselineExport.outputDir).get("analysis/findings.json"));
+  for (const [kind, body, expected] of DD_SILENT_BODIES) {
+    const label = `users served a ${kind} 200`;
+    const routes = routesFromClient(healthyClient());
+    routes["GET /api/v2/users"] = body;
+    const log = [];
+    const { client, config } = httpClient(routes, log);
+    const access = await checkDatadogAccess(client);
+    const surface = access.surfaces.find((entry) => entry.endpoint.startsWith("/api/v2/users"));
+    assert.equal(surface.status, "not_readable", `${label}: the surface is not readable`);
+    assert.equal(surface.collected, false, label);
+    assert.equal(surface.http_status, 200, `${label}: the observed status is the 200 the server sent`);
+    assert.match(surface.error, expected, label);
+
+    const exported = await exportDatadogAuditBundle(client, config, createTempBase("grclanker-datadog-silent-"), { now: NOW });
+    const files = readBundleFiles(exported.outputDir);
+    const row = JSON.parse(files.get("core_data/collection_status.json")).inventories.find((entry) => entry.inventory === "users");
+    assert.deepEqual({ status: row.status, collected: row.collected, http_status: row.http_status, complete: row.complete, truncated: row.truncated, seen: row.seen }, { status: "not_readable", collected: false, http_status: 200, complete: null, truncated: null, seen: null }, label);
+    const written = JSON.parse(files.get("core_data/users.json"));
+    assert.deepEqual({ collected: written.collected, status: written.status, reason: written.reason }, { collected: false, status: 200, reason: "not_readable" }, `${label}: core_data carries a marker, not []`);
+    assert.match(written.error, expected, label);
+
+    const findings = JSON.parse(files.get("analysis/findings.json"));
+    const moved = [];
+    for (const finding of findings) {
+      const before = baseline.find((item) => item.id === finding.id);
+      if (before.status === finding.status) continue;
+      moved.push(finding.id);
+      assert.ok(["manual", "warn"].includes(finding.status), `${label}: ${finding.id} moved ${before.status} -> ${finding.status}; only manual or warn may follow an unobserved read: ${finding.summary}`);
+    }
+    assert.ok(moved.includes("DD-02") && moved.includes("DD-04"), `${label}: the user-dependent findings demote (${moved.join(", ")})`);
+    assertOutputMatchesRequestLog([...files], log, label);
+
+    // Every endpoint silent: nothing was observed, so no finding may pass or fail; the reviewer's false fails
+    // (DD-07, DD-08, DD-11, DD-13) are manual.
+    const silentRoutes = Object.fromEntries(Object.keys(routesFromClient(healthyClient())).map((route) => [route, body]));
+    const allSilent = httpClient(silentRoutes, []);
+    const allExport = await exportDatadogAuditBundle(allSilent.client, allSilent.config, createTempBase("grclanker-datadog-silent-all-"), { now: NOW });
+    const allFindings = JSON.parse(readBundleFiles(allExport.outputDir).get("analysis/findings.json"));
+    for (const finding of allFindings) {
+      assert.equal(finding.status, "manual", `${label} on every endpoint: ${finding.id} is ${finding.status}: ${finding.summary}`);
+    }
+  }
+});
+
+test("verdict rule 10: a short page under a larger server-reported total is a truncated listing, and DD-02 says how many of the total were loaded", async () => {
+  const routes = routesFromClient(healthyClient());
+  routes["GET /api/v2/users"] = async () => {
+    const [first] = listingItems(await healthyClient().listUsers(100000));
+    return jsonResponse({ data: [first], meta: { page: { total_count: 7 } } });
+  };
+  const log = [];
+  const { client, config } = httpClient(routes, log);
+  const listing = await client.listUsers(50);
+  assert.equal(listing.truncated, true, "a short page under a larger total is not complete");
+  assert.equal(listing.total, 7);
+  assert.equal(listing.items.length, 1);
+  assert.match(listing.truncationReason, /short page of 1 while reporting 7 total, so 6 record\(s\) could not be read/);
+
+  const exported = await exportDatadogAuditBundle(client, config, createTempBase("grclanker-datadog-short-page-"), { now: NOW });
+  const files = readBundleFiles(exported.outputDir);
+  const row = JSON.parse(files.get("core_data/collection_status.json")).inventories.find((entry) => entry.inventory === "users");
+  assert.deepEqual({ status: row.status, complete: row.complete, truncated: row.truncated, seen: row.seen, total: row.total }, { status: "readable", complete: false, truncated: true, seen: 1, total: 7 });
+  assert.match(row.truncation_reason, /short page/);
+  const findings = JSON.parse(files.get("analysis/findings.json"));
+  for (const id of ["DD-02", "DD-04", "DD-19"]) {
+    const finding = findings.find((item) => item.id === id);
+    assert.notEqual(finding.status, "pass", `${id} must not pass on 1 of 7 users: ${finding.summary}`);
+  }
+  assert.match(findings.find((item) => item.id === "DD-02").summary, /1 of 7 loaded/);
+});

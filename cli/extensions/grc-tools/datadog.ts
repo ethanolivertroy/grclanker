@@ -650,29 +650,20 @@ export function reduceUrl(value: string): string {
 }
 
 /**
- * Defense-in-depth pass over everything written to the bundle: the value under any credential-shaped key becomes
- * [REDACTED] whether it is a string, a list, or a nested object (the key survives so an auditor can see the field
- * existed), URL-shaped keys keep only scheme and host, and {name, value} pairs whose name is credential-shaped lose
- * their value. Booleans, numbers, and nulls pass through, and other nested values recurse up to a depth cap.
+ * Data-side pass over every collected surface (applied at the collection boundary and again on every file written):
+ * the value under any credential-shaped key becomes [REDACTED] whether it is a string, a list, or a nested object
+ * (the key survives so an auditor can see the field existed), URL-shaped keys keep only scheme and host, {name, value}
+ * pairs whose name is credential-shaped lose their value, and every other string gets the shared scrubber's pattern
+ * pass, so a `?token=` query in an allowlist note, a `Bearer` template in a pipeline processor, a `password=` pair in
+ * an index filter, a webhook path in a monitor message, or a bare token in a role description or user title goes the
+ * way it would in an error message. Booleans, numbers, and nulls pass through; nesting recurses up to a depth cap.
  */
-export function redactCredentialValues(value: unknown, depth = 0): unknown {
-  if (depth > MAX_REDACTION_DEPTH) return REDACTED;
-  if (Array.isArray(value)) return value.map((item) => redactCredentialValues(item, depth + 1));
-  const record = asObject(value);
-  if (!record) return value;
-  const pairName = asString(record.name);
-  const redacted: JsonRecord = {};
-  for (const [key, entry] of Object.entries(record)) {
-    const credential = isCredentialKey(key) || (key === "value" && pairName !== undefined && isCredentialKey(pairName));
-    if (credential && (typeof entry === "string" || (typeof entry === "object" && entry !== null))) {
-      redacted[key] = REDACTED;
-    } else if (typeof entry === "string") {
-      redacted[key] = isUrlKey(key) ? reduceUrl(entry) : entry;
-    } else {
-      redacted[key] = redactCredentialValues(entry, depth + 1);
-    }
-  }
-  return redacted;
+export function redactCredentialValues(value: unknown): unknown {
+  return credentialScrubber.scrubData(value, {
+    isCredentialKey,
+    maxDepth: MAX_REDACTION_DEPTH,
+    transformString: (text, key) => (key !== undefined && isUrlKey(key) ? reduceUrl(text) : text),
+  });
 }
 
 /**
@@ -1125,9 +1116,11 @@ function datadogErrorSummary(payload: unknown): string | undefined {
   const errors = asArray(object.errors).map((item) =>
     asString(item) ?? asString(asObject(item)?.detail) ?? asString(asObject(item)?.title),
   );
-  const summary = [asString(object.message), asString(object.error), ...errors]
+  // Scrub first, cut second: a cut through a configured key would leave a fragment the whole-value rule no longer
+  // matches, so the documented detail loses its credentials at full length and is truncated afterwards.
+  const summary = scrubErrorText([asString(object.message), asString(object.error), ...errors]
     .filter((item): item is string => Boolean(item))
-    .join("; ");
+    .join("; "));
   if (!summary) return undefined;
   return summary.length > MAX_ERROR_DETAIL_CHARS ? `${summary.slice(0, MAX_ERROR_DETAIL_CHARS)}... (truncated)` : summary;
 }
@@ -1139,6 +1132,54 @@ function datadogErrorSummary(payload: unknown): string | undefined {
 /** "403 Forbidden" or just "403" when the response carried no status text. */
 function statusLine(response: Response): string {
   return response.statusText ? `${response.status} ${response.statusText}` : String(response.status);
+}
+
+/**
+ * The documented shape of a successful body per endpoint: the v2 API answers with a `data` container, the v1 API with
+ * bare arrays or named containers (`orgs`, `dashboards`, `indexes`, `accounts`, `pipeline_ids`), and the key checks
+ * with `valid`. A 2xx whose body is empty or of another shape (a status page, a different service behind the same
+ * host) is a failed read of that request, recorded with the 200 the server sent, never an empty inventory.
+ */
+type DatadogResponseShape = { kind: "array" } | { kind: "object"; documentedKeys: readonly string[] } | { kind: "any-object" };
+
+const ARRAY_SHAPE: DatadogResponseShape = { kind: "array" };
+const DATA_SHAPE: DatadogResponseShape = { kind: "object", documentedKeys: ["data"] };
+// The key-pair check is judged by its status alone and its body is not documented beyond being a JSON object.
+const ANY_OBJECT_SHAPE: DatadogResponseShape = { kind: "any-object" };
+function objectShape(...documentedKeys: string[]): DatadogResponseShape {
+  return { kind: "object", documentedKeys };
+}
+
+function matchesResponseShape(payload: unknown, shape: DatadogResponseShape): boolean {
+  switch (shape.kind) {
+    case "array":
+      return Array.isArray(payload);
+    case "object": {
+      const record = asObject(payload);
+      return record !== undefined && shape.documentedKeys.some((key) => key in record);
+    }
+    case "any-object":
+      return asObject(payload) !== undefined;
+    default: {
+      const exhaustive: never = shape;
+      return exhaustive;
+    }
+  }
+}
+
+function describeResponseShape(shape: DatadogResponseShape): string {
+  switch (shape.kind) {
+    case "array":
+      return "JSON array";
+    case "object":
+      return `JSON object (one of ${shape.documentedKeys.join(", ")})`;
+    case "any-object":
+      return "JSON object";
+    default: {
+      const exhaustive: never = shape;
+      return exhaustive;
+    }
+  }
 }
 
 function describeOpaqueBody(response: Response, rawText: string, parsedJson: boolean): string {
@@ -1234,7 +1275,7 @@ export class DatadogApiClient {
     }
   }
 
-  async request(method: string, path: string, query: JsonRecord = {}, body?: unknown): Promise<unknown> {
+  async request(method: string, path: string, query: JsonRecord = {}, body: unknown, shape: DatadogResponseShape): Promise<unknown> {
     const url = this.buildUrl(path, query);
     for (let attempt = 0; ; attempt += 1) {
       const response = await this.performRequest(method, url, body);
@@ -1269,10 +1310,25 @@ export class DatadogApiClient {
           path,
         );
       }
-      if (rawText.length > 0 && !parsedJson) {
-        // A login page or proxy page served with a success status is not an empty inventory; it is an error.
+      // A success status is not a success by itself: an empty body, a login or proxy page, or JSON of another shape is
+      // not an empty inventory. Each is a failed read of this request carrying the status the server sent.
+      if (rawText.length === 0) {
+        throw new DatadogApiError(
+          this.redact(`Datadog request ${method} ${path} returned ${statusLine(response)} with an empty body (0 bytes); the endpoint is not serving the JSON API`),
+          response.status,
+          path,
+        );
+      }
+      if (!parsedJson) {
         throw new DatadogApiError(
           this.redact(`Datadog request ${method} ${path} returned a ${describeOpaqueBody(response, rawText, false)}; the endpoint is not serving the JSON API`),
+          response.status,
+          path,
+        );
+      }
+      if (!matchesResponseShape(payload, shape)) {
+        throw new DatadogApiError(
+          this.redact(`Datadog request ${method} ${path} returned ${statusLine(response)} with a JSON body that is not the documented ${describeResponseShape(shape)} (${Buffer.byteLength(rawText, "utf8")} bytes, not echoed); the endpoint is not serving the JSON API`),
           response.status,
           path,
         );
@@ -1281,12 +1337,8 @@ export class DatadogApiClient {
     }
   }
 
-  async get(path: string, query: JsonRecord = {}): Promise<unknown> {
-    return this.request("GET", path, query);
-  }
-
-  async post(path: string, body: unknown, query: JsonRecord = {}): Promise<unknown> {
-    return this.request("POST", path, query, body);
+  async get(path: string, query: JsonRecord, shape: DatadogResponseShape): Promise<unknown> {
+    return this.request("GET", path, query, undefined, shape);
   }
 
   /**
@@ -1311,7 +1363,14 @@ export class DatadogApiClient {
       extra.push(...(result.extra ?? []));
       // Records left on the page after the cap was filled prove the inventory continues, even on a short last page.
       if (result.data.length > taken.length) return truncated(`the item cap of ${limit} was reached with more records on the same page`);
-      if (result.data.length < size) return { items, truncated: false, total: total ?? items.length, extra };
+      if (result.data.length < size) {
+        // A short page ends the listing only when the server's own total agrees; a short page under a larger total
+        // means records exist that no page delivered, and that is a truncated read, not a complete one.
+        if (total !== undefined && items.length < total) {
+          return truncated(`the server returned a short page of ${result.data.length} while reporting ${total} total, so ${total - items.length} record(s) could not be read`);
+        }
+        return { items, truncated: false, total: total ?? items.length, extra };
+      }
       if (total !== undefined && items.length >= total) return { items, truncated: false, total, extra };
       if (items.length >= limit) return truncated(`the item cap of ${limit} was reached while the last page was still full`);
     }
@@ -1324,7 +1383,7 @@ export class DatadogApiClient {
     pageSize: number = V2_PAGE_SIZE,
   ): Promise<DatadogListing> {
     return toListing(await this.listPaged(limit, pageSize, async (page, size) => {
-      const payload = asObject(await this.get(path, { ...query, "page[size]": size, "page[number]": page })) ?? {};
+      const payload = asObject(await this.get(path, { ...query, "page[size]": size, "page[number]": page }, DATA_SHAPE)) ?? {};
       return { data: asRecordArray(payload.data), total: pageTotal(payload) };
     }));
   }
@@ -1346,7 +1405,7 @@ export class DatadogApiClient {
     let cursor: string | undefined;
     let emptyPages = 0;
     for (;;) {
-      const payload = asObject(await this.get(path, { ...query, "page[limit]": size, "page[cursor]": cursor })) ?? {};
+      const payload = asObject(await this.get(path, { ...query, "page[limit]": size, "page[cursor]": cursor }, DATA_SHAPE)) ?? {};
       const data = asRecordArray(payload.data);
       items.push(...data.slice(0, limit - items.length));
       const nextCursor = asString(getNestedValue(payload, cursorPath));
@@ -1370,27 +1429,27 @@ export class DatadogApiClient {
   }
 
   async validateApiKey(): Promise<JsonRecord> {
-    return asObject(await this.get("/api/v1/validate")) ?? {};
+    return asObject(await this.get("/api/v1/validate", {}, objectShape("valid"))) ?? {};
   }
 
   async validateKeyPair(): Promise<JsonRecord> {
-    return asObject(await this.get("/api/v2/validate_keys")) ?? {};
+    return asObject(await this.get("/api/v2/validate_keys", {}, ANY_OBJECT_SHAPE)) ?? {};
   }
 
   async getOrganization(): Promise<JsonRecord> {
-    const payload = asObject(await this.get("/api/v1/org")) ?? {};
+    const payload = asObject(await this.get("/api/v1/org", {}, objectShape("orgs"))) ?? {};
     const orgs = asRecordArray(payload.orgs);
     return orgs[0] ?? payload;
   }
 
   async listOrgConfigs(): Promise<JsonRecord[]> {
-    const payload = asObject(await this.get("/api/v2/org_configs")) ?? {};
+    const payload = asObject(await this.get("/api/v2/org_configs", {}, DATA_SHAPE)) ?? {};
     return asRecordArray(payload.data);
   }
 
   async listOrgConnections(limit = DEFAULT_ORG_CONNECTION_LIMIT): Promise<DatadogListing> {
     return toListing(await this.listPaged(limit, ORG_CONNECTION_PAGE_SIZE, async (page, size) => {
-      const payload = asObject(await this.get("/api/v2/org_connections", { limit: size, offset: page * size })) ?? {};
+      const payload = asObject(await this.get("/api/v2/org_connections", { limit: size, offset: page * size }, DATA_SHAPE)) ?? {};
       return { data: asRecordArray(payload.data), total: pageTotal(payload) };
     }));
   }
@@ -1404,12 +1463,12 @@ export class DatadogApiClient {
   }
 
   async listRolePermissions(roleId: string): Promise<JsonRecord[]> {
-    const payload = asObject(await this.get(`/api/v2/roles/${encodeURIComponent(roleId)}/permissions`)) ?? {};
+    const payload = asObject(await this.get(`/api/v2/roles/${encodeURIComponent(roleId)}/permissions`, {}, DATA_SHAPE)) ?? {};
     return asRecordArray(payload.data);
   }
 
   async listPermissions(): Promise<JsonRecord[]> {
-    const payload = asObject(await this.get("/api/v2/permissions")) ?? {};
+    const payload = asObject(await this.get("/api/v2/permissions", {}, DATA_SHAPE)) ?? {};
     return asRecordArray(payload.data);
   }
 
@@ -1427,7 +1486,7 @@ export class DatadogApiClient {
         include: "owned_by",
         "page[size]": size,
         "page[number]": page,
-      })) ?? {};
+      }, DATA_SHAPE)) ?? {};
       return { data: asRecordArray(payload.data), total: pageTotal(payload), extra: asRecordArray(payload.included) };
     });
     return {
@@ -1498,7 +1557,7 @@ export class DatadogApiClient {
         "filter[status]": options.status,
         "page[limit]": pageSize,
         "page[cursor]": cursor,
-      })) ?? {};
+      }, DATA_SHAPE)) ?? {};
       const data = asRecordArray(payload.data);
       items.push(...data.slice(0, limit - items.length));
       totalFilteredCount ??= asNumber(getNestedValue(payload, ["meta", "page", "total_filtered_count"])) ?? null;
@@ -1538,28 +1597,28 @@ export class DatadogApiClient {
   }
 
   async getIpAllowlist(): Promise<JsonRecord> {
-    return asObject(await this.get("/api/v2/ip_allowlist")) ?? {};
+    return asObject(await this.get("/api/v2/ip_allowlist", {}, DATA_SHAPE)) ?? {};
   }
 
   async getSensitiveDataScannerConfig(): Promise<JsonRecord> {
-    return asObject(await this.get("/api/v2/sensitive-data-scanner/config")) ?? {};
+    return asObject(await this.get("/api/v2/sensitive-data-scanner/config", {}, DATA_SHAPE)) ?? {};
   }
 
   async listLogPipelines(): Promise<JsonRecord[]> {
-    return asRecordArray(await this.get("/api/v1/logs/config/pipelines"));
+    return asRecordArray(await this.get("/api/v1/logs/config/pipelines", {}, ARRAY_SHAPE));
   }
 
   async getLogPipelineOrder(): Promise<JsonRecord> {
-    return asObject(await this.get("/api/v1/logs/config/pipeline-order")) ?? {};
+    return asObject(await this.get("/api/v1/logs/config/pipeline-order", {}, objectShape("pipeline_ids"))) ?? {};
   }
 
   async listLogIndexes(): Promise<JsonRecord[]> {
-    const payload = asObject(await this.get("/api/v1/logs/config/indexes")) ?? {};
+    const payload = asObject(await this.get("/api/v1/logs/config/indexes", {}, objectShape("indexes"))) ?? {};
     return asRecordArray(payload.indexes);
   }
 
   async listLogArchives(): Promise<JsonRecord[]> {
-    const payload = asObject(await this.get("/api/v2/logs/config/archives")) ?? {};
+    const payload = asObject(await this.get("/api/v2/logs/config/archives", {}, DATA_SHAPE)) ?? {};
     return asRecordArray(payload.data);
   }
 
@@ -1570,28 +1629,28 @@ export class DatadogApiClient {
         "filter[shared]": options.shared === undefined ? undefined : String(options.shared),
         count: size,
         start: page * size,
-      })) ?? {};
+      }, objectShape("dashboards"))) ?? {};
       return { data: asRecordArray(payload.dashboards) };
     }));
   }
 
   async listMonitors(limit = DEFAULT_MONITOR_LIMIT): Promise<DatadogListing> {
     return toListing(await this.listPaged(limit, MONITOR_PAGE_SIZE, async (page, size) => ({
-      data: asRecordArray(await this.get("/api/v1/monitor", { page, page_size: size })),
+      data: asRecordArray(await this.get("/api/v1/monitor", { page, page_size: size }, ARRAY_SHAPE)),
     })));
   }
 
   async listAwsIntegrations(): Promise<JsonRecord[]> {
-    const payload = asObject(await this.get("/api/v1/integration/aws")) ?? {};
+    const payload = asObject(await this.get("/api/v1/integration/aws", {}, objectShape("accounts"))) ?? {};
     return asRecordArray(payload.accounts);
   }
 
   async listGcpIntegrations(): Promise<JsonRecord[]> {
-    return asRecordArray(await this.get("/api/v1/integration/gcp"));
+    return asRecordArray(await this.get("/api/v1/integration/gcp", {}, ARRAY_SHAPE));
   }
 
   async listAzureIntegrations(): Promise<JsonRecord[]> {
-    return asRecordArray(await this.get("/api/v1/integration/azure"));
+    return asRecordArray(await this.get("/api/v1/integration/azure", {}, ARRAY_SHAPE));
   }
 }
 
@@ -1679,9 +1738,13 @@ function observedStatus(error: unknown): number | undefined {
   return error instanceof DatadogApiError ? error.status : undefined;
 }
 
+/**
+ * Every surface is scrubbed at the collection boundary, so the records a finding reads, the counts and names a summary
+ * renders, and the files a bundle writes all come from the same credential-free copy (see `redactCredentialValues`).
+ */
 async function loadSurface<T>(label: string, load: () => Promise<T>, errors: string[]): Promise<SurfaceResult<T>> {
   try {
-    return { value: await load() };
+    return { value: redactCredentialValues(await load()) as T };
   } catch (error) {
     const message = errorMessage(error);
     errors.push(`${label}: ${message}`);
