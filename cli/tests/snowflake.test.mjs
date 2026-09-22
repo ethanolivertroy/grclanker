@@ -615,7 +615,7 @@ test("parseSimpleToml handles sections, quoted keys, comments, numbers, and bool
   assert.equal(parsed["connections.quoted name"].account, "triple");
 });
 
-/** Canaries planted on malformed config lines; every 8-character window of each is distinct so a partial quote is caught too. */
+/** Canaries planted on malformed config lines: random alphanumerics, so no 6-character window of one occurs in a legitimate fixture value or in another canary. */
 const CONFIG_CANARIES = {
   bareLine: "Bp6TzX3kW9nQ2sRc",
   unterminated: "Lf9BwD4sN7hVe3Ky",
@@ -629,16 +629,51 @@ const LIBRARY_ERROR_WORDING = [
   "not a directory", "Unexpected token", "DECODER routines", "unsupported", "BEGIN PRIVATE KEY",
 ];
 
-function fragmentsOf(value, size = 8) {
-  const fragments = [];
-  for (let index = 0; index + size <= value.length; index += 1) fragments.push(value.slice(index, index + size));
-  return fragments;
+/** Every substring of a planted credential at lengths 6 through 24 (sliding windows), so a partial echo such as a truncated token or a quoted line fragment cannot pass a leak assertion. */
+function windowsOf(value, { min = 6, max = 24 } = {}) {
+  const windows = new Set();
+  for (let size = Math.min(min, value.length); size <= Math.min(max, value.length); size += 1) {
+    for (let index = 0; index + size <= value.length; index += 1) windows.add(value.slice(index, index + size));
+  }
+  return [...windows];
+}
+
+/** The window set of every planted secret, for bundle, zip, and payload scans through assertSecretsAbsent. */
+function leakWindows(secrets) {
+  return [...new Set(secrets.flatMap((secret) => windowsOf(secret)))];
+}
+
+function assertNoWindowOf(text, secret, label) {
+  for (const window of windowsOf(secret)) assert.ok(!text.includes(window), `${label} carries a window (${window}) of the planted credential: ${text.slice(0, 300)}`);
+}
+
+/**
+ * Window scan over many outputs: the joined text is checked first (one pass per window), and only a
+ * hit falls back to the per-output scan so the failure names the file that carries the window.
+ */
+function assertNoLeakWindows(outputs, secrets, label) {
+  const joined = [...outputs.values()].join("\n");
+  const windows = leakWindows(secrets);
+  if (windows.some((window) => joined.includes(window))) assertSecretsAbsent(assert, outputs, windows, label);
+}
+
+/**
+ * Fixture self-check: the legitimate values of a fixture (everything it serves
+ * with the planted canaries themselves removed, longest first) contain no
+ * 6-character window of any canary, so a window hit in an output can only be a leak.
+ */
+function assertFixtureFreeOfCanaryWindows(legitimateText, canaries, label) {
+  let legitimate = legitimateText;
+  for (const canary of [...canaries].sort((a, b) => b.length - a.length)) legitimate = legitimate.split(canary).join("");
+  for (const canary of canaries) {
+    for (const window of windowsOf(canary, { min: 6, max: 6 })) {
+      assert.ok(!legitimate.includes(window), `${label}: legitimate fixture text contains the window ${window} of canary ${canary}`);
+    }
+  }
 }
 
 function assertConfigErrorText(text, { path, code, line, canaries }, label) {
-  for (const canary of canaries) {
-    for (const fragment of fragmentsOf(canary)) assert.ok(!text.includes(fragment), `${label} carries a fragment (${fragment}) of ${canary}: ${text}`);
-  }
+  for (const canary of canaries) assertNoWindowOf(text, canary, `${label} (${canary})`);
   for (const wording of LIBRARY_ERROR_WORDING) assert.ok(!text.includes(wording), `${label} repeats library wording "${wording}": ${text}`);
   if (path) assert.ok(text.includes(path), `${label} names the path ${path}: ${text}`);
   assert.ok(text.includes(`(${code})`), `${label} carries the code ${code}: ${text}`);
@@ -688,6 +723,8 @@ test("rule 9: Snowflake TOML and private key file errors carry only the path, li
     { name: "multi-line string", text: `[default]\nprivate_key_raw = """-----BEGIN PRIVATE KEY-----\n${CONFIG_CANARIES.multiline}\n-----END PRIVATE KEY-----"""\n`, line: 2 },
     { name: "missing value", text: `[default]\ntoken =\n# ${CONFIG_CANARIES.missingValue}\n`, line: 2 },
   ];
+  // Self-check: nothing the malformed files, the environment, or the temp paths legitimately carry shares a 6-character window with a planted canary.
+  assertFixtureFreeOfCanaryWindows(`${parseCases.map((testCase) => testCase.text).join("\n")} ${JSON.stringify(env)} ${base}`, allCanaries, "config file canaries");
   for (const testCase of parseCases) {
     for (const fileName of ["connections.toml", "config.toml"]) {
       const home = snowflakeHome();
@@ -810,9 +847,10 @@ test("redactSecrets removes private keys, JWTs, bearer tokens, and configured se
   const message = `failed with ${TEST_PRIVATE_KEY_PEM} token ${jwt} header Bearer abcdefghijkl passphrase topsecret`;
   const redacted = redactSecrets(message, ["topsecret"]);
   assert.ok(!redacted.includes("BEGIN PRIVATE KEY"));
-  assert.ok(!redacted.includes(jwt));
-  assert.ok(!redacted.includes("abcdefghijkl"), "a plain-word value after the Bearer scheme is removed whatever its shape");
-  assert.ok(!redacted.includes("topsecret"));
+  assertNoWindowOf(redacted, TEST_PRIVATE_KEY_PEM.split("\n")[1], "the PEM body");
+  assertNoWindowOf(redacted, jwt, "the JWT");
+  assertNoWindowOf(redacted, "abcdefghijkl", "a plain-word value after the Bearer scheme (removed whatever its shape)");
+  assertNoWindowOf(redacted, "topsecret", "the configured passphrase");
   assert.match(redacted, /^failed with \[REDACTED\]\s*token \[REDACTED\] header Bearer \[REDACTED\] passphrase \[REDACTED\]$/);
 });
 
@@ -834,7 +872,13 @@ test("rule 9: scrub boundary: a name-shaped value stays bare in prose and is rem
     ["Basic authentication is required", "Basic authentication is required"],
     ["InvalidAuthenticationToken: Access token has expired", "InvalidAuthenticationToken: Access token has expired"],
   ];
-  for (const [input, expected] of carriers) assert.equal(redactSecrets(input), expected, input);
+  const name = "prod-us-east-2026";
+  for (const [input, expected] of carriers) {
+    const scrubbed = redactSecrets(input);
+    assert.equal(scrubbed, expected, input);
+    if (input.includes(name) && !expected.includes(name)) assertNoWindowOf(scrubbed, name, `carrier ${input}`);
+  }
+  assertNoWindowOf(redactSecrets(bare, [name]), name, "configured secret in prose");
   const secret = 'top secret/value+1"x';
   const forms = {
     raw: secret,
@@ -855,6 +899,296 @@ test("rule 9: scrub boundary: a name-shaped value stays bare in prose and is rem
     "failed for /api/v1/users/aB3xZ9qL2mN8pR4tV7wY1/factors from /tmp/run-9b6rz9m4l55zg7/config.toml and https://hooks.example.com/services/T0/[REDACTED]",
     "a token-shaped segment of a bare request target or file path is an identifier the run named; inside a URL it is a webhook token",
   );
+  assert.equal(
+    redactSecrets("casing sessionIdleTimeoutMins minsToBypassMfa lastSuccessLogin QaZwSxEdCrFvTgByHn aBcDeFgHiJkLmNoPqRs ABcdEFghIJklMNopQR"),
+    "casing sessionIdleTimeoutMins minsToBypassMfa lastSuccessLogin [REDACTED] [REDACTED] [REDACTED]",
+    "camelCase identifiers whose words average three or more letters stay; alternating capitalized fragments and doubled-case runs are tokens",
+  );
+  assert.equal(
+    redactSecrets("private_key_passphrase=4f9c2b7e1d3a4c5b8e6f7a9b0c1d2e3f and oauth_token=hunter2x9 rejected"),
+    "private_key_passphrase=[REDACTED] and oauth_token=[REDACTED] rejected",
+    "a credential-named key keeps its name once its value is replaced; the trailing = is not read as base64 padding",
+  );
+  assert.equal(
+    redactSecrets("Snowflake OAuth token request failed for /oauth/token-request: invalid_client"),
+    "Snowflake OAuth token request failed for /oauth/token-request: invalid_client",
+    "the last segment of a bare request path used as a label is not a pair key, so the vendor detail after it stays",
+  );
+
+  // Must-keep table (addendum 7): every identifying string a summary may carry survives alone and inside a realistic sentence.
+  for (const [kind, values] of Object.entries(SNOWFLAKE_MUST_KEEP)) {
+    for (const value of values) {
+      assert.equal(redactSecrets(value), value, `must keep bare: ${value}`);
+      assert.equal(redactSecrets(value, [SAMPLE_CONFIGURED_TOKEN, TEST_PRIVATE_KEY_PEM]), value, `must keep bare with the configured credentials registered: ${value}`);
+      for (const sentence of snowflakeSummarySentences(kind, value)) assert.equal(redactSecrets(sentence), sentence, `must keep in a sentence: ${sentence}`);
+    }
+  }
+});
+
+/** A configured bearer token registered with the scrubber in the must-keep and fixed-text checks: random alphanumerics that occur in no fixed text. */
+const SAMPLE_CONFIGURED_TOKEN = "AJ64FNHxZz2NkPrJmyLz";
+/** Passphrases for the encrypted-key failure cases: planted credentials, so random alphanumerics with no 6-character window in the remediation text ("its passphrase") or another fixture value. */
+const LIVE_RESOLVER_PASSPHRASES = { right: "U5CqFH4YNnkzDWu7frMR", wrong: "aqqMKuvZ2ny3fJuXLhbJ" };
+
+/** Every statement key the Snowflake collectors record: core_data file names, statement outcomes, access check surfaces, and _errors.log line labels. */
+const SNOWFLAKE_STATEMENT_KEYS = [
+  "session_context", "show_network_policies", "account_network_policy_parameter", "network_policies", "network_policy_references", "users", "password_policies",
+  "session_policies", "show_integrations", "role_hierarchy_grants", "global_privilege_grants", "admin_role_grants_to_users", "role_usage_by_queries",
+  "direct_user_grants", "public_grants", "login_outcomes", "failed_logins", "access_history_probe", "data_retention_parameter", "show_warehouses",
+  "masking_policy_count", "masking_policy_references", "row_access_policy_count", "row_access_policy_references", "tag_references", "stage_parameters",
+  "unload_parameters", "show_databases", "show_shares", "show_replication_groups",
+];
+
+/** Every statement text the Snowflake client sends, with the limits and lookbacks the collectors use. */
+const SNOWFLAKE_REQUESTED_STATEMENTS = [
+  ...Object.values(SNOWFLAKE_STATEMENTS).filter((value) => typeof value === "string"),
+  SNOWFLAKE_STATEMENTS.networkPolicies(1000),
+  SNOWFLAKE_STATEMENTS.policyReferences("MASKING_POLICY", 1000),
+  SNOWFLAKE_STATEMENTS.policyReferencesByName({ database: "GOV", schema: "POLICIES", name: "STRONG_PW" }),
+  SNOWFLAKE_STATEMENTS.users(1000),
+  SNOWFLAKE_STATEMENTS.passwordPolicies(1000),
+  SNOWFLAKE_STATEMENTS.sessionPolicies(1000),
+  SNOWFLAKE_STATEMENTS.roleGrants(1000),
+  SNOWFLAKE_STATEMENTS.globalPrivilegeGrants(1000),
+  SNOWFLAKE_STATEMENTS.adminRoleGrantsToUsers(1000),
+  SNOWFLAKE_STATEMENTS.roleUsageByQueries(90),
+  SNOWFLAKE_STATEMENTS.directUserGrants(1000),
+  SNOWFLAKE_STATEMENTS.publicGrants(1000),
+  SNOWFLAKE_STATEMENTS.loginOutcomes(30),
+  SNOWFLAKE_STATEMENTS.failedLogins(30),
+];
+
+const SNOWFLAKE_MUST_KEEP = {
+  statement: SNOWFLAKE_REQUESTED_STATEMENTS,
+  key: SNOWFLAKE_STATEMENT_KEYS,
+  path: ["POST /api/v2/statements?async=true&requestId=6f1c2b3a-4d5e-4f60-8a9b-0c1d2e3f4a5b", "GET /api/v2/statements/01bd8f2e-0000-1234-0000-000000000001", "/api/v2/statements"],
+  host: [
+    "https://myorg-myaccount.snowflakecomputing.com", "https://myorg-myaccount.privatelink.snowflakecomputing.com", "https://env-acct.us-east-1.snowflakecomputing.com",
+    "myorg-myaccount.snowflakecomputing.com",
+  ],
+  name: [
+    "myorg-myaccount", "MYORG-MYACCOUNT", "xy12345.us-east-1", "env_acct.us-east-1", "auditor", "svc_etl", "SVC_ETL", "ALICE", "NO_MFA_USER", "ACCOUNTADMIN", "SECURITYADMIN", "AUDIT_ROLE",
+    "DATA_ENGINEER", "AUDIT_WH", "ALWAYS_ON_WH", "X-Small", "CORP_POLICY", "STRONG_PW", "SESSION_STRICT", "MASK_SSN", "REGION_RAP", "OKTA_SAML", "S3_INT", "PROVIDER_SHARE",
+    "PROVIDER.ACCT", "SNOWFLAKE.ACCOUNT_USAGE", "GOV.POLICIES.STRONG_PW", "NETWORK_POLICY", "DATA_RETENTION_TIME_IN_DAYS", "REQUIRE_STORAGE_INTEGRATION_FOR_STAGE_CREATION",
+    "PREVENT_UNLOAD_TO_INLINE_URL", "INCORRECT_USERNAME_PASSWORD", "LEGACY_SERVICE", "SERVICE_AGENT", "SNOWFLAKE_UI", "JDBC_DRIVER", "KEYPAIR_JWT", "PROGRAMMATIC_ACCESS_TOKEN", "OAUTH",
+    "IMPORTED PRIVILEGES", "MANAGE GRANTS", "ACCOUNT_USAGE", "INFORMATION_SCHEMA.POLICY_REFERENCES",
+  ],
+  status: ["200 OK", "202 Accepted", "401 Unauthorized", "403 Forbidden", "404 Not Found", "422 Unprocessable Entity", "429 Too Many Requests", "500 Internal Server Error", "502 Bad Gateway", "503 Service Unavailable"],
+  id: ALL_CONTROL_IDS,
+  source: [
+    "arguments-account", "arguments-private-key", "arguments-private-key-path", "arguments-token", "environment-account", "environment-user", "environment-token", "environment-private-key-path",
+    "environment-private-key-passphrase", "environment-role", "config-file-account", "config-file-private-key-path", "config-file-warehouse", "config-file:/home/auditor/.snowflake/connections.toml#audit",
+    "config-file:/home/auditor/.snowflake/config.toml#default",
+  ],
+  code: ["INVALID_TOML", "EACCES", "ENOTDIR", "EISDIR", "ENOENT", "UNREADABLE", "ERR_OSSL_UNSUPPORTED", "ERR_OSSL_BAD_DECRYPT", "INVALID_PRIVATE_KEY", "MISSING_PRIVATE_KEY", "003001", "42501", "390144", "08004", "333334", "090001"],
+  text: [
+    "/home/auditor/.snowflake/connections.toml", "/home/auditor/.snowflake/config.toml", "/home/auditor/.snowflake/rsa_key.p8", "PKCS#8 PEM key", "10000-row limit",
+    "total unknown", "SNOWFLAKE_ACCOUNT", "SNOWFLAKE_PRIVATE_KEY_PATH", "SNOWFLAKE_TOKEN", "snowflake_check_access", "snowflake_export_audit_bundle",
+  ],
+};
+
+/** Realistic Snowflake summary and error sentences with an identifying value in the slot such a value occupies. */
+function snowflakeSummarySentences(kind, value) {
+  switch (kind) {
+    case "statement":
+      return [`Refusing to execute a non read-only Snowflake statement: ${value.slice(0, 80)}`, `[denied] show_shares: Snowflake SQL API request failed (422 Unprocessable Entity): SQL access control error\n  ${value}`];
+    case "key":
+      return [
+        `Unknown: ${value} was denied (insufficient privileges): Snowflake SQL API request failed (422 Unprocessable Entity): SQL access control error: Insufficient privileges to operate on account 'MYORG' [code 003001, sqlState 42501]. Collect manually: SHOW SHARES output`,
+        `Unreadable inventory: ${value} timed out: Snowflake statement did not complete before the 30s statement timeout., so per-user policy assignments were not checked. The verdict cannot be pass while an inventory it reads is unreadable; collect manually: SHOW PARAMETERS output`,
+        `Partial inventory: ${value} hit the 10000-row limit (10000 rows seen); the verdict cannot be pass on a partial result.`,
+        `Partial inventory: ${value} returned 1/3 partitions (1000/2600 rows seen).`,
+        `[not_requested] ${value}: Not requested: the Snowflake private key could not be loaded (ERR_OSSL_UNSUPPORTED); no statement was sent.`,
+      ];
+    case "path":
+      return [`Snowflake SQL API request timed out after 5000ms (${value})`, `Snowflake SQL API request failed (${value}): fetch failed`];
+    case "host":
+      return [`Using Snowflake account myorg-myaccount via ${value} (KEYPAIR_JWT).`, `Snowflake SQL API request failed (POST /api/v2/statements?async=true&requestId=6f1c2b3a-4d5e-4f60-8a9b-0c1d2e3f4a5b): getaddrinfo ENOTFOUND ${value}`];
+    case "name":
+      return [
+        `Authenticated as ${value} with role ${value} and warehouse ${value}.`,
+        `Authentication not confirmed: the session context statement was denied, so the configured user ${value} and role ${value} are reported as configured, not as observed.`,
+        `The active role ${value} lacks MANAGE GRANTS, so SHOW commands may list only objects granted to that role.`,
+        `Using Snowflake account ${value} via https://myorg-myaccount.snowflakecomputing.com (${value}).`,
+        `Snowflake SQL API request failed (422 Unprocessable Entity): SQL access control error: Insufficient privileges to operate on account '${value}' [code 003001, sqlState 42501]`,
+        `3 of 4 users lack MFA: ${value}, ${value}. Unreadable inventory: ${value} (denied).`,
+      ];
+    case "status":
+      return [`Snowflake SQL API request failed (${value}): non-JSON body (text/html, 5120 bytes)`, `Snowflake SQL API request returned an unreadable response (${value}): non-JSON body (text/html, 5120 bytes)`];
+    case "id":
+      return [`${value} is manual because the users statement was denied.`, `| ${value} | HIGH | MANUAL | Network policy | Unknown: users was denied (insufficient privileges). |`];
+    case "source":
+      return [`Credential sources: ${value}, environment-role.`, `- Credential source: ${value}`];
+    case "code":
+      return [
+        `Unable to read Snowflake config file /home/auditor/.snowflake/connections.toml (${value})`,
+        `Unable to load the Snowflake private key (${value}). Provide a PKCS#8 PEM key and, for an encrypted key, its passphrase.`,
+        `Snowflake SQL API request failed (422 Unprocessable Entity): SQL compilation error [code ${value}, sqlState ${value}]`,
+      ];
+    default:
+      return [`${value} was reported by snowflake_check_access.`];
+  }
+}
+
+/** Every fixed text the Snowflake integration emits, with sample paths and names, passes its scrubber unchanged (GWS note 1). */
+const SNOWFLAKE_FIXED_TEXTS = [
+  "SNOWFLAKE_ACCOUNT, an account argument, or a connections.toml account entry is required.",
+  "SNOWFLAKE_USER, a user argument, or a connections.toml user entry is required.",
+  "Provide key-pair credentials (SNOWFLAKE_PRIVATE_KEY_PATH or SNOWFLAKE_PRIVATE_KEY) or a bearer token (SNOWFLAKE_TOKEN). Username/password authentication is not supported by the Snowflake SQL REST API.",
+  "Unable to read Snowflake config file /home/auditor/.snowflake/connections.toml (EACCES)",
+  "Unable to read Snowflake config file /home/auditor/.snowflake/config.toml (ENOTDIR)",
+  "Unable to parse Snowflake config file: invalid TOML in /home/auditor/.snowflake/connections.toml at line 4 (INVALID_TOML)",
+  "Snowflake private key file was not found: /home/auditor/.snowflake/rsa_key.p8 (ENOENT)",
+  "Unable to read Snowflake private key file /home/auditor/.snowflake/rsa_key.p8 (EISDIR)",
+  "Unable to load the Snowflake private key (ERR_OSSL_UNSUPPORTED). Provide a PKCS#8 PEM key and, for an encrypted key, its passphrase.",
+  "Unable to load the Snowflake private key (INVALID_PRIVATE_KEY). Provide a PKCS#8 PEM key and, for an encrypted key, its passphrase.",
+  "Unable to load the Snowflake private key (MISSING_PRIVATE_KEY). Snowflake key-pair authentication requires a private key.",
+  "Not requested: the Snowflake private key could not be loaded (ERR_OSSL_UNSUPPORTED); no statement was sent. Provide a PKCS#8 PEM key and, for an encrypted key, its passphrase.",
+  "Not authenticated: the Snowflake private key could not be loaded (ERR_OSSL_UNSUPPORTED); no request was sent.",
+  "Snowflake SQL API request timed out after 5000ms (POST /api/v2/statements?async=true&requestId=6f1c2b3a-4d5e-4f60-8a9b-0c1d2e3f4a5b)",
+  "Snowflake SQL API request failed (POST /api/v2/statements?async=true&requestId=6f1c2b3a-4d5e-4f60-8a9b-0c1d2e3f4a5b): fetch failed",
+  "Snowflake SQL API request failed (GET /api/v2/statements/01bd8f2e-0000-1234-0000-000000000001): The operation was aborted due to timeout",
+  "Snowflake statement 01bd8f2e-0000-1234-0000-000000000001 did not complete before the 30s statement timeout.",
+  "Snowflake SQL API request failed (422 Unprocessable Entity): SQL access control error:\nInsufficient privileges to operate on account 'MYORG' [code 003001, sqlState 42501]",
+  "Snowflake SQL API request failed (403 Forbidden): Denied while fetching https://api.example.com/v1/x?[REDACTED] for this key; Authorization: Bearer [REDACTED]; api_key=[REDACTED]; session_id=[REDACTED] [code 390144, sqlState 08004]",
+  "Snowflake SQL API request failed (502 Bad Gateway): non-JSON body (text/html, 5120 bytes)",
+  "Snowflake SQL API request returned an unreadable response (200 OK): non-JSON body (text/html, 5120 bytes)",
+  "Snowflake SQL API request failed (429 Too Many Requests): Rate limit exceeded [code 000630]",
+  "Refusing to execute a non read-only Snowflake statement: DROP TABLE SALES.PUBLIC.CUSTOMERS",
+  "Using Snowflake account myorg-myaccount via https://myorg-myaccount.snowflakecomputing.com (KEYPAIR_JWT).",
+  "Authenticated as auditor with role ACCOUNTADMIN and warehouse AUDIT_WH.",
+  "Authenticated as auditor with role (default role).",
+  "Authentication not confirmed: the session context statement was denied, so the configured user auditor and role AUDIT_ROLE are reported as configured, not as observed.",
+  "27/31 Snowflake audit surfaces are readable; 15 ACCOUNT_USAGE views responded.",
+  "The active role AUDIT_ROLE lacks MANAGE GRANTS, so SHOW commands may list only objects granted to that role.",
+  "The active role (unknown) lacks MANAGE GRANTS, so the share inventory may list only objects granted to that role.",
+  "Credential sources: arguments-account, arguments-user, arguments-private-key, environment-role, config-file:/home/auditor/.snowflake/connections.toml#default, config-file-warehouse.",
+  "Run snowflake_assess_network_and_authentication, snowflake_assess_access_control, snowflake_assess_monitoring_and_lifecycle, snowflake_assess_data_protection, or snowflake_export_audit_bundle.",
+  "Grant the audit role IMPORTED PRIVILEGES on the SNOWFLAKE database plus MANAGE GRANTS (or use SECURITYADMIN/ACCOUNTADMIN) and a small warehouse, then re-run snowflake_check_access.",
+  "Unknown: show_shares was denied (insufficient privileges): Snowflake SQL API request failed (422 Unprocessable Entity): SQL access control error: Insufficient privileges to operate on account 'MYORG' [code 003001, sqlState 42501]. Collect manually: SHOW SHARES output from ACCOUNTADMIN",
+  "Unknown: users timed out: Snowflake statement did not complete before the 30s statement timeout. Collect manually: SNOWFLAKE.ACCOUNT_USAGE.USERS export",
+  "Unknown: session_context: Not requested: the Snowflake private key could not be loaded (INVALID_PRIVATE_KEY); no statement was sent. Collect manually: SHOW NETWORK POLICIES output",
+  "Unreadable inventory: network_policy_references was denied (insufficient privileges): Snowflake SQL API request failed (403 Forbidden), so per-user network policy assignments were not checked. The verdict cannot be pass while an inventory it reads is unreadable; collect manually: POLICY_REFERENCES output",
+  "Unreadable inventory: password_policies (denied), session_policies (timeout).",
+  "Partial inventory: show_network_policies hit the 10000-row limit (10000 rows seen); the verdict cannot be pass on a partial result.",
+  "Partial inventory: users returned 1/3 partitions (1000/2600 rows seen).",
+  "the active role could not be verified and the share inventory may be scoped to a role with narrower visibility",
+  "[denied] show_shares: Snowflake SQL API request failed (422 Unprocessable Entity): SQL access control error: Insufficient privileges to operate on account 'MYORG' [code 003001, sqlState 42501]\n  SHOW SHARES",
+  "[not_requested] session_context: Not requested: the Snowflake private key could not be loaded (ERR_OSSL_UNSUPPORTED); no statement was sent. Provide a PKCS#8 PEM key and, for an encrypted key, its passphrase.",
+  "Authenticated as: auditor (role ACCOUNTADMIN, KEYPAIR_JWT)",
+  "Access check: limited (partial visibility: role lacks MANAGE GRANTS)",
+  "- `_errors.log`: statements that were denied, failed, timed out, or were never sent during collection",
+  "- `_errors.log`: not written because every statement completed",
+  "Snowflake access check failed: SNOWFLAKE_ACCOUNT, an account argument, or a connections.toml account entry is required.",
+  "Snowflake audit bundle export failed: Unable to parse Snowflake config file: invalid TOML in /home/auditor/.snowflake/config.toml at line 2 (INVALID_TOML)",
+  "Refusing to write outside /home/auditor/export: /home/auditor/export/../etc",
+  "Refusing to use symlinked parent directory: /home/auditor/export/link",
+];
+
+/**
+ * The resolver messages as rendered live for the no credentials, partial credentials, bad auth mode,
+ * and key or config file failure cases, each against a real temp path and the code the run observed;
+ * credential-bearing files carry a config canary so the messages prove they hold path and code only.
+ */
+function liveResolverMessages() {
+  const base = createTempBase("grclanker-snowflake-live-resolver-");
+  const emptyHome = join(base, "home");
+  mkdirSync(emptyHome);
+  const keyDirectory = join(base, "key-directory.p8");
+  mkdirSync(keyDirectory);
+  const malformedHome = join(base, "malformed");
+  mkdirSync(malformedHome);
+  writeFileSync(join(malformedHome, "connections.toml"), `[default]\naccount = "myorg-myaccount"\ntoken = "${CONFIG_CANARIES.unterminated}\n`);
+  const directoryHome = join(base, "directory");
+  mkdirSync(join(directoryHome, "connections.toml"), { recursive: true });
+  const garbageKey = `-----BEGIN PRIVATE KEY-----\n${CONFIG_CANARIES.privateKey}\n-----END PRIVATE KEY-----\n`;
+  const encryptedPem = testPrivateKey.export({ type: "pkcs8", format: "pem", cipher: "aes-256-cbc", passphrase: LIVE_RESOLVER_PASSPHRASES.right });
+  const account = { SNOWFLAKE_ACCOUNT: "myorg-myaccount" };
+  const identity = { ...account, SNOWFLAKE_USER: "svc" };
+  const resolve = (input, env, home = emptyHome) => thrownBy(() => resolveSnowflakeConfiguration(input, { ...env, SNOWFLAKE_HOME: home }, { homeDirectory: base })).message;
+  const build = (config) => thrownBy(() => buildSnowflakeKeyPairJwt({ account: "myorg-myaccount", user: "svc", ...config })).message;
+  return {
+    paths: { keyDirectory, missingKey: join(base, "missing.p8"), malformedToml: join(malformedHome, "connections.toml"), directoryToml: join(directoryHome, "connections.toml") },
+    messages: {
+      "no credentials": resolve({}, {}),
+      "partial credentials: account without user": resolve({}, account),
+      "partial credentials: identity without a key or token": resolve({}, identity),
+      "bad auth mode: username and password": resolve({}, { ...identity, SNOWFLAKE_PASSWORD: "hunter2" }),
+      "bad auth mode: an unsupported authenticator without a credential": resolve({ token_type: "externalbrowser" }, identity),
+      "key file failure: missing file": resolve({ private_key_path: join(base, "missing.p8") }, identity),
+      "key file failure: directory at the path": resolve({ private_key_path: keyDirectory }, identity),
+      "key file failure: unloadable key material": build({ privateKeyPem: garbageKey }),
+      "key file failure: encrypted key with the wrong passphrase": build({ privateKeyPem: encryptedPem, privateKeyPassphrase: LIVE_RESOLVER_PASSPHRASES.wrong }),
+      "key file failure: no key": build({}),
+      "config file failure: malformed TOML": resolve({}, identity, malformedHome),
+      "config file failure: directory at the TOML path": resolve({}, identity, directoryHome),
+    },
+  };
+}
+
+test("rule 9: every fixed text the Snowflake integration emits, including the live resolver messages, passes its scrubber unchanged", () => {
+  const live = liveResolverMessages();
+  const unsupportedAuth = "Provide key-pair credentials (SNOWFLAKE_PRIVATE_KEY_PATH or SNOWFLAKE_PRIVATE_KEY) or a bearer token (SNOWFLAKE_TOKEN). Username/password authentication is not supported by the Snowflake SQL REST API.";
+  const keyLoad = /^Unable to load the Snowflake private key \((ERR_[A-Z0-9_]+|INVALID_PRIVATE_KEY)\)\. Provide a PKCS#8 PEM key and, for an encrypted key, its passphrase\.$/;
+  const expected = {
+    "no credentials": "SNOWFLAKE_ACCOUNT, an account argument, or a connections.toml account entry is required.",
+    "partial credentials: account without user": "SNOWFLAKE_USER, a user argument, or a connections.toml user entry is required.",
+    "partial credentials: identity without a key or token": unsupportedAuth,
+    "bad auth mode: username and password": unsupportedAuth,
+    "bad auth mode: an unsupported authenticator without a credential": unsupportedAuth,
+    "key file failure: missing file": `Snowflake private key file was not found: ${live.paths.missingKey} (ENOENT)`,
+    "key file failure: directory at the path": `Unable to read Snowflake private key file ${live.paths.keyDirectory} (EISDIR)`,
+    "key file failure: unloadable key material": keyLoad,
+    "key file failure: encrypted key with the wrong passphrase": keyLoad,
+    "key file failure: no key": "Unable to load the Snowflake private key (MISSING_PRIVATE_KEY). Snowflake key-pair authentication requires a private key.",
+    "config file failure: malformed TOML": `Unable to parse Snowflake config file: invalid TOML in ${live.paths.malformedToml} at line 3 (INVALID_TOML)`,
+    "config file failure: directory at the TOML path": `Unable to read Snowflake config file ${live.paths.directoryToml} (EISDIR)`,
+  };
+  assert.deepEqual(Object.keys(live.messages), Object.keys(expected));
+  for (const [label, message] of Object.entries(live.messages)) {
+    if (expected[label] instanceof RegExp) assert.match(message, expected[label], label);
+    else assert.equal(message, expected[label], label);
+    for (const canary of Object.values(CONFIG_CANARIES)) assertNoWindowOf(message, canary, `live resolver message (${label})`);
+    for (const wording of LIBRARY_ERROR_WORDING) assert.ok(!message.includes(wording), `${label} repeats library wording "${wording}": ${message}`);
+    assert.equal(redactSecrets(message), message, `live resolver message survives the scrubber (${label})`);
+    assert.equal(redactSecrets(message, [SAMPLE_CONFIGURED_TOKEN, TEST_PRIVATE_KEY_PEM, LIVE_RESOLVER_PASSPHRASES.wrong]), message, `live resolver message survives with the configured credentials registered (${label})`);
+    for (const passphrase of Object.values(LIVE_RESOLVER_PASSPHRASES)) assertNoWindowOf(message, passphrase, `live resolver message (${label})`);
+  }
+
+  for (const text of SNOWFLAKE_FIXED_TEXTS) assert.equal(redactSecrets(text), text, text);
+  for (const text of SNOWFLAKE_FIXED_TEXTS) assert.equal(redactSecrets(text, [SAMPLE_CONFIGURED_TOKEN, TEST_PRIVATE_KEY_PEM]), text, `${text} (with the configured credentials registered)`);
+});
+
+/** An environment bearer token: random alphanumerics that occur in no fixture value. */
+const ENVIRONMENT_TOKEN = "wpcrJHTaWGpcmWkZjzVV";
+
+test("resolveSnowflakeConfiguration keeps environment credentials when an unrelated argument is passed (GWS note 2)", () => {
+  const home = createTempBase("grclanker-snowflake-env-args-");
+  const env = { SNOWFLAKE_ACCOUNT: "myorg-myaccount", SNOWFLAKE_USER: "svc", SNOWFLAKE_TOKEN: ENVIRONMENT_TOKEN, SNOWFLAKE_ROLE: "AUDIT_ROLE", SNOWFLAKE_HOME: home };
+
+  const resolved = resolveSnowflakeConfiguration({ timeout_seconds: 9 }, env, { homeDirectory: home });
+  assert.equal(resolved.token, ENVIRONMENT_TOKEN, "the environment token survives an argument overlay that names no credential");
+  assert.equal(resolved.tokenType, "OAUTH");
+  assert.equal(resolved.account, "myorg-myaccount");
+  assert.equal(resolved.user, "svc");
+  assert.equal(resolved.role, "AUDIT_ROLE");
+  assert.equal(resolved.timeoutMs, 9000);
+  assert.equal(resolved.connectionName, undefined, "no connections.toml is read from an empty SNOWFLAKE_HOME");
+  assert.deepEqual(resolved.sourceChain, ["environment-account", "environment-user", "environment-token", "environment-role"]);
+
+  const withUndefinedArguments = resolveSnowflakeConfiguration({ account: undefined, user: undefined, token: undefined, private_key: undefined, token_type: undefined }, env, { homeDirectory: home });
+  assert.equal(withUndefinedArguments.token, ENVIRONMENT_TOKEN, "an argument overlay whose credential keys are undefined does not shadow the environment");
+  assert.equal(withUndefinedArguments.tokenType, "OAUTH");
+  assert.deepEqual(withUndefinedArguments.sourceChain, ["environment-account", "environment-user", "environment-token", "environment-role"]);
+
+  const keyFile = join(home, "rsa_key.p8");
+  writeFileSync(keyFile, TEST_PRIVATE_KEY_PEM);
+  const keyPair = resolveSnowflakeConfiguration({ row_limit: 500 }, { SNOWFLAKE_ACCOUNT: "myorg-myaccount", SNOWFLAKE_USER: "svc", SNOWFLAKE_PRIVATE_KEY_PATH: keyFile, SNOWFLAKE_HOME: home }, { homeDirectory: home });
+  assert.equal(keyPair.tokenType, "KEYPAIR_JWT", "the key file named through the environment still supplies the credential");
+  assert.equal(keyPair.privateKeyPem, TEST_PRIVATE_KEY_PEM);
+  assert.equal(keyPair.token, undefined);
+  assert.equal(keyPair.rowLimit, 500);
+  assert.deepEqual(keyPair.sourceChain, ["environment-account", "environment-user", "environment-private-key-path"]);
 });
 
 test("SnowflakeSqlClient submits async statements, polls, and fetches every partition", async () => {
@@ -979,7 +1313,7 @@ test("SnowflakeSqlClient classifies insufficient privileges, timeouts, and redac
     return true;
   });
 
-  const secretToken = "super-secret-oauth-token-value";
+  const secretToken = "ayfzGHG9fDtZaSmG3cMg";
   const leaky = new SnowflakeSqlClient(sampleConfig({ tokenType: "OAUTH", token: secretToken, privateKeyPem: undefined, maxRetries: 0 }), {
     fetchImpl: async (_url, init) => {
       assert.equal(headerValue(init.headers, "x-snowflake-authorization-token-type"), "OAUTH");
@@ -988,7 +1322,7 @@ test("SnowflakeSqlClient classifies insufficient privileges, timeouts, and redac
     },
   });
   await assert.rejects(leaky.execute("SELECT 1"), (error) => {
-    assert.ok(!error.message.includes(secretToken));
+    assertNoWindowOf(error.message, secretToken, "error message with the configured token echoed by the transport");
     assert.match(error.message, /\[REDACTED/);
     return true;
   });
@@ -1818,11 +2152,17 @@ test("edition-gated and out-of-scope controls render as manual with explicit evi
 
 test("exportSnowflakeAuditBundle writes core data, analysis, compliance reports, quick reference, and a paired zip", async () => {
   const base = createTempBase("grclanker-snowflake-export-");
-  const secretToken = "bundle-secret-token-value-123456";
+  // The configured bearer token: random alphanumerics, so no 6-character window of it occurs in a legitimate fixture value (checked below once the served statements are known).
+  const secretToken = "qtz36MNVgApweGXmsgkGzM";
   const config = sampleConfig({ tokenType: "OAUTH", token: secretToken, privateKeyPem: undefined, role: "ACCOUNTADMIN" });
   const client = createMockClient((statement) => healthyFixture(statement), { tokenType: "OAUTH", token: secretToken, privateKeyPem: undefined, role: "ACCOUNTADMIN" });
 
   const result = await exportSnowflakeAuditBundle(client, config, base);
+  assertFixtureFreeOfCanaryWindows(
+    `${client.executed.map((statement) => JSON.stringify(healthyFixture(statement))).join(" ")} ${JSON.stringify({ ...config, token: undefined })} ${base}`,
+    [secretToken],
+    "export fixture",
+  );
   assert.ok(existsSync(result.outputDir));
   assert.ok(existsSync(result.zipPath));
   assert.equal(result.zipPath, join(base, `${basename(result.outputDir)}.zip`));
@@ -1892,15 +2232,19 @@ test("exportSnowflakeAuditBundle writes core data, analysis, compliance reports,
   for (const [relativePath, content] of bundleFiles) {
     assert.equal(zipEntries.get(relativePath.split("\\").join("/")), content, `${relativePath} differs between the directory and the zip`);
   }
-  assertSecretsAbsent(assert, bundleFiles, [secretToken, "BEGIN PRIVATE KEY"], "bundle directory");
-  assertSecretsAbsent(assert, zipEntries, [secretToken, "BEGIN PRIVATE KEY"], "bundle zip");
+  assertSecretsAbsent(assert, bundleFiles, [...leakWindows([secretToken]), "BEGIN PRIVATE KEY"], "bundle directory");
+  assertSecretsAbsent(assert, zipEntries, [...leakWindows([secretToken]), "BEGIN PRIVATE KEY"], "bundle zip");
 });
 
 test("exportSnowflakeAuditBundle records partial collection failures in _errors.log and never overwrites a prior bundle", async () => {
   const base = createTempBase("grclanker-snowflake-export-");
   const config = sampleConfig({ role: "ACCOUNTADMIN" });
-  const echoedBearer = "echoed-bearer-token-value-7890abcdef";
-  const echoedJwt = "eyJhbGciOiJSUzI1NiJ9.eyJpc3MiOiJlY2hvZWQtand0In0.c2lnbmF0dXJlLWVjaG9lZC1qd3Q";
+  // Credentials echoed by the server inside an error: random alphanumerics with no 6-character window in a legitimate fixture value.
+  const echoedBearer = "DhgYFGELAjr2EcbUuKPw";
+  const echoedJwtPayload = "KhzF7wJzSEE4dJCZfUrv";
+  const echoedJwtSignature = "wdmjdzXAQuJXUpUhBHLb";
+  const echoedJwt = `eyJhbGciOiJSUzI1NiJ9.${echoedJwtPayload}.${echoedJwtSignature}`;
+  const echoedKeyLine = TEST_PRIVATE_KEY_PEM.split("\n")[1];
   const resolver = (statement) => {
     if (statement === "SHOW SHARES") {
       throw new SnowflakeStatementError(`SQL access control error: Insufficient privileges to operate on account (request Authorization: Bearer ${echoedBearer}; session ${echoedJwt}; key ${TEST_PRIVATE_KEY_PEM})`, { statusCode: 422 });
@@ -1908,8 +2252,14 @@ test("exportSnowflakeAuditBundle records partial collection failures in _errors.
     return healthyFixture(statement);
   };
 
-  const first = await exportSnowflakeAuditBundle(createMockClient(resolver, { role: "ACCOUNTADMIN" }), config, base);
+  const firstClient = createMockClient(resolver, { role: "ACCOUNTADMIN" });
+  const first = await exportSnowflakeAuditBundle(firstClient, config, base);
   assert.ok(first.errorCount >= 1);
+  assertFixtureFreeOfCanaryWindows(
+    `${firstClient.executed.filter((statement) => statement !== "SHOW SHARES").map((statement) => JSON.stringify(healthyFixture(statement))).join(" ")} ${JSON.stringify({ ...config, privateKeyPem: undefined })} ${base}`,
+    [echoedBearer, echoedJwtPayload, echoedJwtSignature],
+    "partial export fixture",
+  );
   const errorLog = readFileSync(join(first.outputDir, "_errors.log"), "utf8");
   assert.match(errorLog, /\[denied\] show_shares: /);
   assert.match(errorLog, /SHOW SHARES/);
@@ -1921,7 +2271,7 @@ test("exportSnowflakeAuditBundle records partial collection failures in _errors.
   const metadata = JSON.parse(readFileSync(join(first.outputDir, "metadata.json"), "utf8"));
   assert.ok(metadata.failed_statement_count >= 1);
   assert.match(readFileSync(join(first.outputDir, "QUICK_REFERENCE.md"), "utf8"), /_errors\.log`: statements that were denied/);
-  const echoedSecrets = [echoedBearer, echoedJwt, "BEGIN PRIVATE KEY"];
+  const echoedSecrets = [...leakWindows([echoedBearer, echoedJwtPayload, echoedJwtSignature, echoedKeyLine]), "BEGIN PRIVATE KEY"];
   assertSecretsAbsent(assert, readBundleFiles(first.outputDir), echoedSecrets, "partial bundle directory");
   assertSecretsAbsent(assert, readZipEntries(first.zipPath), echoedSecrets, "partial bundle zip");
 
@@ -1938,11 +2288,12 @@ test("exportSnowflakeAuditBundle records partial collection failures in _errors.
   assert.equal(readFileSync(join(first.outputDir, "metadata.json"), "utf8"), firstMetadata);
 });
 
-const STATEMENT_CANARIES = ["CANARY_BEARER_S1", "CANARY_SESSION_S1", "CANARY_APIKEY_S1", "CANARY_URL_TOKEN_S1"];
-const STATEMENT_HTML_BODY = "<html><body><h1>502 Bad Gateway</h1><p>Authorization: Bearer CANARY_BEARER_S1</p><p>Set-Cookie: JSESSIONID=CANARY_SESSION_S1; Path=/</p><p>api_key=CANARY_APIKEY_S1</p><p>Retry at https://api.example.com/v1/x?token=CANARY_URL_TOKEN_S1 later.</p></body></html>";
+/** Canaries planted in the error bodies a failing statement returns: random alphanumerics with no 6-character window in the vendor message, the HTML wrapper, or a legitimate fixture value. */
+const STATEMENT_CANARIES = { bearer: "Y4W6x9CRzU39NUKa3B", session: "2bBAwKGbUByG8qYPCq", apiKey: "RHW9enMyb9c69WJ9nP", urlToken: "XyJZddzExJmchaeS8g" };
+const STATEMENT_HTML_BODY = `<html><body><h1>502 Bad Gateway</h1><p>Authorization: Bearer ${STATEMENT_CANARIES.bearer}</p><p>Set-Cookie: JSESSIONID=${STATEMENT_CANARIES.session}; Path=/</p><p>api_key=${STATEMENT_CANARIES.apiKey}</p><p>Retry at https://api.example.com/v1/x?token=${STATEMENT_CANARIES.urlToken} later.</p></body></html>`;
 const STATEMENT_JSON_BODY = {
   code: "390144",
-  message: "Denied while fetching https://api.example.com/v1/x?token=CANARY_URL_TOKEN_S1 for this key; Authorization: Bearer CANARY_BEARER_S1; api_key=CANARY_APIKEY_S1; session_id=CANARY_SESSION_S1",
+  message: `Denied while fetching https://api.example.com/v1/x?token=${STATEMENT_CANARIES.urlToken} for this key; Authorization: Bearer ${STATEMENT_CANARIES.bearer}; api_key=${STATEMENT_CANARIES.apiKey}; session_id=${STATEMENT_CANARIES.session}`,
   sqlState: "08004",
 };
 
@@ -1976,6 +2327,12 @@ test("rule 9: every Snowflake statement that fails with a 502 HTML page or a JSO
   await runAllAssessments(discovery);
   const statements = [...new Map(executed.map((statement) => [normalizeStatement(statement), statement])).values()];
   assert.ok(statements.length >= 30, `every access check probe and assessment statement is discovered (${statements.length})`);
+  // Self-check: the healthy result sets, the error bodies around the canaries, the config, and the output path share no 6-character window with a planted canary.
+  assertFixtureFreeOfCanaryWindows(
+    `${statements.map((statement) => JSON.stringify(healthyFixture(statement))).join(" ")} ${STATEMENT_HTML_BODY} ${JSON.stringify(STATEMENT_JSON_BODY)} ${JSON.stringify({ ...config, privateKeyPem: undefined })} ${base}`,
+    Object.values(STATEMENT_CANARIES),
+    "statement canaries",
+  );
 
   for (const [index, statement] of statements.entries()) {
     for (const variant of ["html", "json"]) {
@@ -1994,7 +2351,7 @@ test("rule 9: every Snowflake statement that fails with a 502 HTML page or a JSO
         ...[...files].map(([name, content]) => [`${label} bundle ${name}`, content]),
         ...[...readZipEntries(exported.zipPath)].map(([name, content]) => [`${label} zip ${name}`, content]),
       ]);
-      assertSecretsAbsent(assert, outputs, STATEMENT_CANARIES, label);
+      assertNoLeakWindows(outputs, Object.values(STATEMENT_CANARIES), label);
 
       const failedOutcomes = results.flatMap((result) => result.statements.filter((outcome) => outcome.status !== "ok"));
       const errorStrings = [
@@ -2170,11 +2527,14 @@ function assertNoRequestClaims(outputs, label) {
 
 test("addendum 5.2: a private key that does not load sends no request, so no output names POST /api/v2/statements or a statement text, and the run reports itself as not authenticated with the key failure code", async () => {
   const base = createTempBase("grclanker-snowflake-not-requested-");
-  const encryptedPem = testPrivateKey.export({ type: "pkcs8", format: "pem", cipher: "aes-256-cbc", passphrase: "the-right-passphrase-9f8e7d" });
+  // Passphrases and key bodies are planted credentials: random alphanumerics, so no 6-character window of one occurs in the remediation text or another fixture value.
+  const { right: rightPassphrase, wrong: wrongPassphrase } = LIVE_RESOLVER_PASSPHRASES;
+  const encryptedPem = testPrivateKey.export({ type: "pkcs8", format: "pem", cipher: "aes-256-cbc", passphrase: rightPassphrase });
   const variants = [
-    { name: "malformed PEM body", overrides: { privateKeyPem: "-----BEGIN PRIVATE KEY-----\nbm90LWEta2V5LWp1c3QtYnl0ZXM=\n-----END PRIVATE KEY-----\n" } },
-    { name: "encrypted key with the wrong passphrase", overrides: { privateKeyPem: encryptedPem, privateKeyPassphrase: "not-the-passphrase" } },
+    { name: "malformed PEM body", overrides: { privateKeyPem: "-----BEGIN PRIVATE KEY-----\nbm90LWEta2V5LWp1c3QtYnl0ZXM=\n-----END PRIVATE KEY-----\n" }, keyMaterial: ["bm90LWEta2V5LWp1c3QtYnl0ZXM="] },
+    { name: "encrypted key with the wrong passphrase", overrides: { privateKeyPem: encryptedPem, privateKeyPassphrase: wrongPassphrase }, keyMaterial: [encryptedPem.split("\n")[1], wrongPassphrase, rightPassphrase] },
   ];
+  assertFixtureFreeOfCanaryWindows(`${JSON.stringify(sampleConfig({ privateKeyPem: undefined }))} ${base}`, [wrongPassphrase, rightPassphrase], "key failure canaries");
   const registered = [];
   registerSnowflakeTools({ registerTool: (tool) => registered.push(tool) });
   const checkAccessTool = registered.find((tool) => tool.name === "snowflake_check_access");
@@ -2235,6 +2595,8 @@ test("addendum 5.2: a private key that does not load sends no request, so no out
       ...[...readZipEntries(exported.zipPath)].map(([name, content]) => [`zip ${name}`, content]),
     ]);
     assertNoRequestClaims(outputs, label);
+    assertNoLeakWindows(outputs, variant.keyMaterial, `${label}: key material`);
+    assertSecretsAbsent(assert, outputs, ["BEGIN PRIVATE KEY", "BEGIN ENCRYPTED PRIVATE KEY"], `${label}: PEM markers`);
 
     const metadata = JSON.parse(files.get("metadata.json"));
     assert.equal(metadata.user, null, label);
@@ -2275,6 +2637,7 @@ test("addendum 5.2: a private key that does not load sends no request, so no out
       })));
       assert.equal(fetchCalls, 0, `${label}: the tool sent no request`);
       assertNoRequestClaims(new Map([["snowflake_check_access payload", JSON.stringify(payload)]]), label);
+      for (const material of variant.keyMaterial) assertNoWindowOf(JSON.stringify(payload), material, `${label}: snowflake_check_access payload`);
       assert.ok(JSON.stringify(payload).includes(`Not authenticated: the Snowflake private key could not be loaded (${code}); no request was sent.`), `${label}: the tool payload states the failure`);
     } finally {
       globalThis.fetch = realFetch;
