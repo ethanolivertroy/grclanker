@@ -151,6 +151,7 @@ export function createParallelsBackend(options: ParallelsBackendOptions): Execut
       stageWorkspace: true,
       artifactSync: true,
       interactive: false,
+      oneShot: false,
     },
     async healthcheck() {
       const result = await prlctl(["list", "-a", "--json"]);

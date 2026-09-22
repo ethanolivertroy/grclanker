@@ -6,7 +6,6 @@ import {
   ExecutionBackendError,
   ExecutionBackendUnsupportedError,
   normalizeExitCode,
-  requireEnv,
   type CommandRunner,
   type ExecutionBackend,
   type ExecutionRequest,
@@ -15,12 +14,16 @@ import {
   type StageWorkspaceInput,
 } from "../execution-backend.js";
 import { quoteForBash } from "../shell.js";
+import { requireModalCredentials } from "./modal-profile.js";
 
 // Modal exposes Sandbox lifecycle through its SDKs; the documented non-SDK surface for
 // one-shot command execution is the `modal shell` CLI command:
 // https://modal.com/docs/reference/cli/shell
-// Credentials are documented at https://modal.com/docs/reference/modal.config
-// (MODAL_TOKEN_ID, MODAL_TOKEN_SECRET, optional MODAL_ENVIRONMENT and MODAL_PROFILE).
+// Credentials are documented at https://modal.com/docs/reference/modal.config: MODAL_TOKEN_ID
+// and MODAL_TOKEN_SECRET in the environment, or the active profile of `.modal.toml` written by
+// `modal setup` / `modal token set` (see modal-profile.ts); optional MODAL_ENVIRONMENT and
+// MODAL_PROFILE. The CLI resolves the credentials itself; the guard only confirms one source
+// exists so a missing token fails here with a clear message instead of inside `modal shell`.
 
 export const DEFAULT_MODAL_IMAGE = "debian:bookworm-slim";
 
@@ -83,10 +86,10 @@ export function createModalBackend(options: ModalBackendOptions = {}): Execution
       stageWorkspace: true,
       artifactSync: false,
       interactive: false,
+      oneShot: true,
     },
     async healthcheck() {
-      requireEnv("MODAL_TOKEN_ID");
-      requireEnv("MODAL_TOKEN_SECRET");
+      requireModalCredentials();
       const result = await runner("modal", ["--version"]);
       if (result.exitCode !== 0) {
         throw new ExecutionBackendError("The modal CLI is not installed or not on PATH. Install it with `pip install modal`.");
@@ -103,8 +106,7 @@ export function createModalBackend(options: ModalBackendOptions = {}): Execution
       };
     },
     async exec(request: ExecutionRequest): Promise<ExecutionResult> {
-      requireEnv("MODAL_TOKEN_ID");
-      requireEnv("MODAL_TOKEN_SECRET");
+      requireModalCredentials();
       const session = sessions.get(request.sessionId);
       const envPrefix = Object.entries(request.env ?? {})
         .map(([key, value]) => `export ${key}=${quoteForBash(value)};`)

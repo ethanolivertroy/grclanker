@@ -36,7 +36,7 @@ const candidates = detectComputeBackendStatuses()
 
 if (candidates.length === 0) {
   log(
-    "Skipping live compute backend smoke test: no non-host backend has its binaries or credentials present (docker daemon, prlctl, modal + MODAL_TOKEN_*, RUNPOD_API_KEY + RUNPOD_ENDPOINT_ID or RUNPOD_POD_ID). Set GRCLANKER_LIVE_BACKENDS=sandbox-runtime to include the local sandbox.",
+    "Skipping live compute backend smoke test: no non-host backend has its binaries or credentials present (docker daemon, prlctl, modal + MODAL_TOKEN_* or a ~/.modal.toml profile, RUNPOD_API_KEY + RUNPOD_ENDPOINT_ID or RUNPOD_POD_ID). Set GRCLANKER_LIVE_BACKENDS=sandbox-runtime to include the local sandbox.",
   );
   process.exit(0);
 }

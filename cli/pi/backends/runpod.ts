@@ -1,4 +1,7 @@
-import { resolve } from "node:path";
+import { copyFileSync, lstatSync, mkdirSync, mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { dirname, join, resolve } from "node:path";
+import { systemErrorCode } from "../../extensions/grc-tools/hardening/config-file.js";
 import {
   assertSafeSessionId,
   buildShellCommand,
@@ -6,6 +9,7 @@ import {
   createProcessCommandRunner,
   createProcessCommandRunnerSync,
   describeEndpoint,
+  ExecutionBackendCleanupError,
   ExecutionBackendError,
   ExecutionBackendTimeoutError,
   ExecutionBackendUnsupportedError,
@@ -14,6 +18,7 @@ import {
   requireEnv,
   summarizeJsonBody,
   type CommandRunner,
+  type CommandRunnerResult,
   type CommandRunnerSync,
   type ExecutionBackend,
   type ExecutionRequest,
@@ -136,6 +141,7 @@ export function createRunpodServerlessBackend(options: RunpodServerlessOptions =
       stageWorkspace: false,
       artifactSync: false,
       interactive: false,
+      oneShot: true,
     },
     async healthcheck() {
       const apiKey = requireEnv("RUNPOD_API_KEY");
@@ -266,6 +272,174 @@ export function buildPodSessionPath(workspacePath: string, sessionId: string): s
   return `${workspacePath.replace(/\/+$/, "")}/${assertSafeSessionId(sessionId)}`;
 }
 
+type PodSshTarget = { host: string; port: number; user: string };
+
+export const RUNPOD_CLEANUP_ATTEMPTS = 2;
+
+export type PodCleanupOutcome = { removed: true } | { removed: false; detail: string };
+
+export function buildPodRemovalCommand(remotePath: string): string {
+  return `rm -rf -- ${quoteForBash(remotePath)}`;
+}
+
+// Names the remnant and the exact command that deletes it, for the operator, when the adapter
+// could not remove the session directory itself.
+export function describePodRemnant(podId: string, target: PodSshTarget, remotePath: string): string {
+  return `${remotePath} on RunPod pod ${podId} (delete it with: ssh -p ${target.port} ${target.user}@${target.host} ${quoteForBash(buildPodRemovalCommand(remotePath))})`;
+}
+
+function describeRemovalFailure(result: CommandRunnerResult | undefined, attempts: number): string {
+  const stderr = result?.stderr.trim();
+  return `rm -rf exited ${result?.exitCode ?? "null"} on ${attempts} attempt${attempts === 1 ? "" : "s"}${stderr ? `: ${stderr}` : ""}`;
+}
+
+// The runner resolves with the exit code instead of rejecting, so a `.catch()` on the removal
+// never fires; the result has to be inspected. `rm -rf` exits 0 when the path is gone (or never
+// existed), so anything else means the directory, and possibly the upload, is still on the pod.
+export async function removePodSessionDirectory(
+  runner: CommandRunner,
+  target: PodSshTarget,
+  remotePath: string,
+  attempts: number = RUNPOD_CLEANUP_ATTEMPTS,
+): Promise<PodCleanupOutcome> {
+  let last: CommandRunnerResult | undefined;
+  for (let attempt = 0; attempt < attempts; attempt += 1) {
+    last = await runner("ssh", buildPodSshArgs(target, buildPodRemovalCommand(remotePath)));
+    if (last.exitCode === 0) return { removed: true };
+  }
+  return { removed: false, detail: describeRemovalFailure(last, attempts) };
+}
+
+export type PodStagingPlan = {
+  localRoot: string;
+  /** Tracked regular files that will be uploaded, as forward-slash paths relative to localRoot. */
+  files: string[];
+  /** Tracked paths that matched the sensitive-path deny list and are never uploaded. */
+  excluded: string[];
+  /** Index entries that are missing from disk, symlinks, directories (submodules), or escape localRoot. */
+  skipped: string[];
+};
+
+// The staged set is the git index (`git ls-files --cached`), never a directory walk, so ignored
+// files (.env, credentials.json, export/, oscal-workspace/, ...) cannot reach the pod. The deny
+// list below is applied on top of that for the paths this repository's .gitignore and AGENTS.md
+// name as secrets, so a copy that was committed by mistake stays local too. Documented as
+// RUNPOD_STAGING_DENYLIST in the compute backends guide.
+export const RUNPOD_STAGING_DENYLIST: readonly string[] = [
+  ".env",
+  ".env.*",
+  ".okta.yaml",
+  "credentials.json",
+  "client_secret.json",
+  "*service-account*.json",
+  "export/",
+  "oscal-workspace/",
+  "*.pem",
+  "*.key",
+  "*.p12",
+  "*.pfx",
+  "id_rsa",
+  "id_dsa",
+  "id_ecdsa",
+  "id_ed25519",
+];
+
+const SENSITIVE_DIRECTORY_SEGMENTS = new Set(["export", "oscal-workspace"]);
+const SENSITIVE_BASENAMES = new Set([
+  ".okta.yaml",
+  "credentials.json",
+  "client_secret.json",
+  "id_rsa",
+  "id_dsa",
+  "id_ecdsa",
+  "id_ed25519",
+]);
+const SENSITIVE_BASENAME_PATTERNS = [/^\.env(\.|$)/, /service-account.*\.json$/i, /\.(pem|key|p12|pfx)$/i];
+
+export function isSensitiveStagingPath(relativePath: string): boolean {
+  const segments = relativePath.split("/").filter((segment) => segment.length > 0);
+  if (segments.length === 0) return false;
+  const basename = segments[segments.length - 1]!;
+  const directories = segments.slice(0, -1);
+  if (directories.some((segment) => SENSITIVE_DIRECTORY_SEGMENTS.has(segment) || /^\.env(\.|$)/.test(segment))) {
+    return true;
+  }
+  if (SENSITIVE_BASENAMES.has(basename)) return true;
+  return SENSITIVE_BASENAME_PATTERNS.some((pattern) => pattern.test(basename));
+}
+
+function escapesRoot(relativePath: string): boolean {
+  return relativePath.startsWith("/") || relativePath.split("/").includes("..");
+}
+
+function isRegularFile(path: string): boolean {
+  try {
+    return lstatSync(path).isFile();
+  } catch {
+    return false;
+  }
+}
+
+// Lists the git index of localRoot through the injected runner. Git's stderr is never quoted:
+// only the exit code or the spawn errno reaches the message.
+export async function planPodWorkspaceStaging(localRoot: string, runner: CommandRunner): Promise<PodStagingPlan> {
+  let listing: CommandRunnerResult;
+  try {
+    listing = await runner("git", ["-C", localRoot, "ls-files", "--cached", "-z"]);
+  } catch (error) {
+    const code = systemErrorCode(error);
+    throw new ExecutionBackendError(
+      `Could not run git to list the tracked files of ${localRoot}${code ? ` (${code})` : ""}. runpod-pod stages tracked files only, so git must be installed and on PATH.`,
+    );
+  }
+  if (listing.exitCode !== 0) {
+    throw new ExecutionBackendError(
+      `git ls-files exited ${listing.exitCode ?? "null"} for ${localRoot}. runpod-pod stages tracked files only: the workspace must be inside a git work tree, and untracked or ignored files are never uploaded. Run git init and git add the files that should reach the pod, or pick another backend.`,
+    );
+  }
+
+  const plan: PodStagingPlan = { localRoot, files: [], excluded: [], skipped: [] };
+  const entries = new Set(listing.stdout.split("\0").filter((entry) => entry.length > 0));
+  for (const entry of entries) {
+    if (escapesRoot(entry)) {
+      plan.skipped.push(entry);
+      continue;
+    }
+    if (isSensitiveStagingPath(entry)) {
+      plan.excluded.push(entry);
+      continue;
+    }
+    if (!isRegularFile(join(localRoot, entry))) {
+      plan.skipped.push(entry);
+      continue;
+    }
+    plan.files.push(entry);
+  }
+  return plan;
+}
+
+// Copies the planned files into a private temp directory that scp then uploads with `-r`, so the
+// upload preserves the directory layout and file modes while containing nothing but the plan.
+export function materializePodStagingPlan(plan: PodStagingPlan): string {
+  const stageRoot = mkdtempSync(join(tmpdir(), "grclanker-runpod-stage-"));
+  try {
+    for (const relativePath of plan.files) {
+      const destination = join(stageRoot, relativePath);
+      mkdirSync(dirname(destination), { recursive: true });
+      copyFileSync(join(plan.localRoot, relativePath), destination);
+    }
+  } catch (error) {
+    rmSync(stageRoot, { recursive: true, force: true });
+    const code = systemErrorCode(error);
+    throw new ExecutionBackendError(`Could not build the local staging copy of ${plan.localRoot}${code ? ` (${code})` : ""}.`);
+  }
+  return stageRoot;
+}
+
+export function describePodStagingPlan(plan: PodStagingPlan): string {
+  return `${plan.files.length} tracked file${plan.files.length === 1 ? "" : "s"} (${plan.excluded.length} sensitive path${plan.excluded.length === 1 ? "" : "s"} excluded, ${plan.skipped.length} non-regular or missing entr${plan.skipped.length === 1 ? "y" : "ies"} skipped)`;
+}
+
 export function createRunpodPodBackend(options: RunpodPodOptions = {}): ExecutionBackend {
   const fetchImpl: FetchLike = options.fetch ?? ((input, init) => fetch(input, init));
   const runner = options.runner ?? createProcessCommandRunner();
@@ -287,8 +461,12 @@ export function createRunpodPodBackend(options: RunpodPodOptions = {}): Executio
     return cachedPod;
   }
 
-  async function sshTarget(): Promise<{ host: string; port: number; user: string }> {
+  async function sshTarget(): Promise<PodSshTarget> {
     return resolvePodSshTarget(cachedPod ?? await fetchPod(), sshUser);
+  }
+
+  function podId(): string {
+    return cachedPod?.id ?? process.env.RUNPOD_POD_ID ?? "(unknown)";
   }
 
   return {
@@ -300,6 +478,7 @@ export function createRunpodPodBackend(options: RunpodPodOptions = {}): Executio
       stageWorkspace: true,
       artifactSync: true,
       interactive: false,
+      oneShot: false,
     },
     async healthcheck() {
       const pod = await fetchPod();
@@ -310,30 +489,50 @@ export function createRunpodPodBackend(options: RunpodPodOptions = {}): Executio
     },
     async stageWorkspace(input: StageWorkspaceInput): Promise<StagedWorkspace> {
       const remotePath = buildPodSessionPath(workspacePath, input.sessionId);
-      const target = await sshTarget();
       const localRoot = resolve(input.localPath);
-      const prepare = await runner("ssh", buildPodSshArgs(target, `mkdir -p -- ${quoteForBash(remotePath)}`));
-      if (prepare.exitCode !== 0) {
-        throw new ExecutionBackendError(`Could not prepare ${remotePath} on the pod. ${prepare.stderr}`);
+      const plan = await planPodWorkspaceStaging(localRoot, runner);
+      const target = await sshTarget();
+      const stageRoot = materializePodStagingPlan(plan);
+      try {
+        const prepare = await runner("ssh", buildPodSshArgs(target, `mkdir -p -- ${quoteForBash(remotePath)}`));
+        if (prepare.exitCode !== 0) {
+          throw new ExecutionBackendError(`Could not prepare ${remotePath} on the pod. ${prepare.stderr}`);
+        }
+        stagedSessions.add(input.sessionId);
+        const copy = await runner("scp", [
+          "-o",
+          "BatchMode=yes",
+          "-o",
+          "StrictHostKeyChecking=accept-new",
+          "-P",
+          String(target.port),
+          "-r",
+          `${stageRoot}/.`,
+          `${target.user}@${target.host}:${remotePath}`,
+        ]);
+        if (copy.exitCode !== 0) {
+          // The upload may be partial, so the directory is removed before the copy failure is
+          // reported. If the removal fails too, the session stays in stagedSessions so teardown
+          // retries it, and the error names the remnant instead of untracking it.
+          const cleanup = await removePodSessionDirectory(runner, target, remotePath);
+          if (!cleanup.removed) {
+            throw new ExecutionBackendCleanupError(
+              "runpod-pod",
+              describePodRemnant(podId(), target, remotePath),
+              `The workspace copy failed (scp exited ${copy.exitCode ?? "null"}${copy.stderr.trim() ? `: ${copy.stderr.trim()}` : ""}) and the partial upload could not be removed (${cleanup.detail}).`,
+            );
+          }
+          stagedSessions.delete(input.sessionId);
+          throw new ExecutionBackendError(`Could not copy the workspace to the pod. ${copy.stderr}`);
+        }
+      } finally {
+        rmSync(stageRoot, { recursive: true, force: true });
       }
-      stagedSessions.add(input.sessionId);
-      const copy = await runner("scp", [
-        "-o",
-        "BatchMode=yes",
-        "-o",
-        "StrictHostKeyChecking=accept-new",
-        "-P",
-        String(target.port),
-        "-r",
-        `${localRoot}/.`,
-        `${target.user}@${target.host}:${remotePath}`,
-      ]);
-      if (copy.exitCode !== 0) {
-        await runner("ssh", buildPodSshArgs(target, `rm -rf -- ${quoteForBash(remotePath)}`)).catch(() => undefined);
-        stagedSessions.delete(input.sessionId);
-        throw new ExecutionBackendError(`Could not copy the workspace to the pod. ${copy.stderr}`);
-      }
-      return { sessionId: input.sessionId, remotePath, detail: `copied ${localRoot} to ${target.host}:${remotePath} over scp` };
+      return {
+        sessionId: input.sessionId,
+        remotePath,
+        detail: `copied ${describePodStagingPlan(plan)} from ${localRoot} to ${target.host}:${remotePath} over scp`,
+      };
     },
     async exec(request: ExecutionRequest): Promise<ExecutionResult> {
       const target = await sshTarget();
@@ -368,17 +567,25 @@ export function createRunpodPodBackend(options: RunpodPodOptions = {}): Executio
       const remotePath = buildPodSessionPath(workspacePath, sessionId);
       if (!stagedSessions.has(sessionId)) return;
       const target = await sshTarget();
-      try {
-        await runner("ssh", buildPodSshArgs(target, `rm -rf -- ${quoteForBash(remotePath)}`));
-      } finally {
-        stagedSessions.delete(sessionId);
+      const cleanup = await removePodSessionDirectory(runner, target, remotePath);
+      if (!cleanup.removed) {
+        // Still tracked: the next teardown call (or the shutdown sweep) retries the removal.
+        throw new ExecutionBackendCleanupError("runpod-pod", describePodRemnant(podId(), target, remotePath), cleanup.detail);
       }
+      stagedSessions.delete(sessionId);
     },
     teardownSync(sessionId: string) {
       const remotePath = buildPodSessionPath(workspacePath, sessionId);
       if (!stagedSessions.has(sessionId) || !cachedPod) return;
+      const target = resolvePodSshTarget(cachedPod, sshUser);
+      const result = syncRunner("ssh", buildPodSshArgs(target, buildPodRemovalCommand(remotePath)));
+      if (result.exitCode !== 0) {
+        // The process is exiting, so nothing can retry this; the operator gets the remnant's
+        // location and the delete command. The message is scrubbed by the error constructor.
+        process.stderr.write(`${new ExecutionBackendCleanupError("runpod-pod", describePodRemnant(podId(), target, remotePath), describeRemovalFailure(result, 1)).message}\n`);
+        return;
+      }
       stagedSessions.delete(sessionId);
-      syncRunner("ssh", buildPodSshArgs(resolvePodSshTarget(cachedPod, sshUser), `rm -rf -- ${quoteForBash(remotePath)}`));
     },
   };
 }

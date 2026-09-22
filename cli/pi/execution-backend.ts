@@ -67,6 +67,12 @@ export type ExecutionBackendCapabilities = {
   stageWorkspace: boolean;
   artifactSync: boolean;
   interactive: boolean;
+  /**
+   * Every exec runs in a fresh container or a stateless job, so a filesystem change made by one
+   * exec is invisible to the next. The runtime offers only bash on such a backend; read, write,
+   * edit, ls, grep, and find stay on the local workspace instead of pretending to persist remotely.
+   */
+  oneShot: boolean;
 };
 
 export interface ExecutionBackend {
@@ -136,6 +142,19 @@ export class ExecutionBackendNotAvailableError extends ExecutionBackendError {
   constructor(kind: ExecutionBackendKind, detail: string) {
     super(`${kind} is not available yet. ${detail}`);
     this.name = "ExecutionBackendNotAvailableError";
+  }
+}
+
+// A remote resource the adapter created survived its removal command. The session that owns it
+// stays tracked so the next teardown retries the removal, and the message names the resource so
+// an operator can delete it by hand if the retries keep failing.
+export class ExecutionBackendCleanupError extends ExecutionBackendError {
+  readonly resource: string;
+
+  constructor(kind: ExecutionBackendKind, resource: string, detail: string) {
+    super(`${kind} could not remove ${resource}. ${detail}`);
+    this.name = "ExecutionBackendCleanupError";
+    this.resource = redactErrorMessage(resource);
   }
 }
 
