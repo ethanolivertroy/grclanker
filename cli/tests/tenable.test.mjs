@@ -1107,9 +1107,22 @@ function carriersOf(value) {
     [`Set-Cookie: TNS_SESSIONID=${value}; Path=/; HttpOnly; X-ApiKeys: "accessKey=${value}"`, /^Set-Cookie: \[REDACTED\]; X-ApiKeys: "\[REDACTED\]"$/],
     [`Cookie: sid=${value}; Content-Type: "application/json"; X-ApiKeys: accessKey=${value};secretKey=${value}`, /^Cookie: \[REDACTED\]; Content-Type: "application\/json"; X-ApiKeys: \[REDACTED\]$/],
     [`X-ApiKeys: "accessKey=${value}"; Cookie: sid=${value}; Content-Type: text/plain`, /^X-ApiKeys: "\[REDACTED\]"; Cookie: \[REDACTED\]; Content-Type: text\/plain$/],
-    [`{"error_msg":"Cookie: sid=${value}; X-ApiKeys: \\"${value}\\"; Content-Type: \\"application/json\\"","code":401}`, /^\{"error_msg":"Cookie: \[REDACTED\]; X-ApiKeys: \[REDACTED\]; Content-Type: \\"application\/json\\"","code":401\}$/],
+    [`{"error_msg":"Cookie: sid=${value}; X-ApiKeys: \\"${value}\\"; Content-Type: \\"application/json\\"","code":401}`, /^\{"error_msg":"Cookie: \[REDACTED\]; X-ApiKeys: \\"\[REDACTED\]\\"; Content-Type: \\"application\/json\\"","code":401\}$/],
     [`<p>Cookie: sid="${value}"; X-ApiKeys: "${value}"; Content-Type: "text/html"</p><p>next</p>`, /^<p>Cookie: \[REDACTED\]; X-ApiKeys: "\[REDACTED\]"; Content-Type: "text\/html"<\/p><p>next<\/p>$/],
     [`Cookie: sid=${value}; X-Cookie: "token=${value}", Accept: text/html`, /^Cookie: \[REDACTED\]; X-Cookie: "\[REDACTED\]", Accept: text\/html$/],
+    // JSON-escaped carriers at any depth: a header pair, a credential pair, an attribute, and
+    // an assignment inside a JSON text stringified into a string value (one and two levels
+    // down) lose their values and keep their escaped quotes, so the JSON stays well formed.
+    [`{"detail":"{\\"Cookie\\": \\"sid=${value}\\", \\"X-ApiKeys\\": \\"accessKey=${value}\\", \\"Content-Type\\": \\"application/json\\"}"}`, /^\{"detail":"\{\\"Cookie\\": \\"\[REDACTED\]\\", \\"X-ApiKeys\\": \\"\[REDACTED\]\\", \\"Content-Type\\": \\"application\/json\\"\}"\}$/],
+    [`{"o":"{\\"detail\\":\\"{\\\\\\"Cookie\\\\\\": \\\\\\"sid=${value}\\\\\\", \\\\\\"X-SecurityCenter\\\\\\": \\\\\\"${value}\\\\\\"}\\"}"}`, /^\{"o":"\{\\"detail\\":\\"\{\\\\\\"Cookie\\\\\\": \\\\\\"\[REDACTED\]\\\\\\", \\\\\\"X-SecurityCenter\\\\\\": \\\\\\"\[REDACTED\]\\\\\\"\}\\"\}"\}$/],
+    [`{"detail":"{\\"Authorization\\": \\"Bearer ${value}\\"}"}`, /^\{"detail":"\{\\"Authorization\\": \\"\[REDACTED\]\\"\}"\}$/],
+    [`{"detail":"{'X-Cookie': 'token=${value}'}"}`, /^\{"detail":"\{'X-Cookie': '\[REDACTED\]'\}"\}$/],
+    [`{"o":"{\\"detail\\":\\"Cookie: sid=${value}; path=/\\",\\"code\\":401}"}`, /^\{"o":"\{\\"detail\\":\\"Cookie: \[REDACTED\]\\",\\"code\\":401\}"\}$/],
+    [`{"detail":"{\\"password\\": \\"${value}\\", \\"user\\": \\"a\\"}"}`, /^\{"detail":"\{\\"password\\": \\"\[REDACTED\]\\", \\"user\\": \\"a\\"\}"\}$/],
+    [`{"o":"{\\"detail\\":\\"{\\\\\\"secretKey\\\\\\": \\\\\\"${value}\\\\\\"}\\"}"}`, /^\{"o":"\{\\"detail\\":\\"\{\\\\\\"secretKey\\\\\\": \\\\\\"\[REDACTED\]\\\\\\"\}\\"\}"\}$/],
+    [`{"detail":"<scanner name=\\"s1\\" key=\\"${value}\\"/>"}`, /^\{"detail":"<scanner name=\\"s1\\" key=\\"\[REDACTED\]\\"\/>"\}$/],
+    [`{"detail":"password: \\"${value}\\" rejected"}`, /^\{"detail":"password: \\"\[REDACTED\]\\" rejected"\}$/],
+    [`{"detail":"registration_code=\\"${value}\\" rejected"}`, /^\{"detail":"registration_code=\\"\[REDACTED\]\\" rejected"\}$/],
     [`accessKey=${value};secretKey=${value}`, /^accessKey=\[REDACTED\];secretKey=\[REDACTED\]$/],
     [`TNS_SESSIONID=${value}; Path=/`, /^TNS_SESSIONID=\[REDACTED\]; Path=\/$/],
     [`session=${value} expired`, /^session=\[REDACTED\] expired$/],
@@ -1230,11 +1243,14 @@ test("scrub boundary: name-shaped values stay bare in prose, leave every carrier
   ]) {
     assert.equal(redactErrorText(text), text, text);
   }
-  // Compound header lines with no credential carrier keep every name and value in both scrubs.
+  // Compound header lines with no credential carrier keep every name and value in both
+  // scrubs, bare or JSON-escaped.
   for (const text of [
     'Content-Type: "application/json"; Accept: application/json, text/plain; X-Request-Id: 7f3a',
     "Content-Type: text/plain; charset=utf-8, Accept-Encoding: gzip, deflate",
     '<p>Content-Type: "text/html"; X-Request-Id: "7f3a"</p><p>next</p>',
+    '{"detail":"{\\"Content-Type\\": \\"application/json\\", \\"Date\\": \\"Tue, 22 Sep 2026 18:00:00 GMT\\"}"}',
+    '{"detail":"{\\"user\\": \\"auditor\\", \\"name\\": \\"s1\\", \\"tokens\\": 2}"}',
   ]) {
     assert.equal(redactErrorText(text), text, text);
     assert.equal(redactCredentialValueText(text), text, text);
@@ -1447,6 +1463,15 @@ const CANARY_PLAIN = "uhfsumxscmhlzj";
 const CANARY_QUOTED = "sess-qtdv-QCARRY-16180339887498";
 const CANARIES = [CANARY_BEARER, CANARY_SESSION, CANARY_API_KEY, CANARY_URL_TOKEN, CANARY_NAMED, CANARY_PLAIN, CANARY_QUOTED];
 const CANARY_URL = `https://api.example.com/v1/x?token=${CANARY_URL_TOKEN}`;
+// A JSON text stringified into a string value arrives with its quotes escaped (\"): the
+// header pairs and the credential pair inside it are carriers one level down, and each
+// keeps its escaped quotes around the marker so the text stays well formed.
+const CANARY_ESCAPED_NOTE = `upstream body ${JSON.stringify(JSON.stringify({ Cookie: `sid=${CANARY_QUOTED}`, "X-ApiKeys": `accessKey=${CANARY_QUOTED}`, password: CANARY_QUOTED }))}`;
+const SCRUBBED_ESCAPED_NOTE = 'upstream body "{\\"Cookie\\":\\"[REDACTED]\\",\\"X-ApiKeys\\":\\"[REDACTED]\\",\\"password\\":\\"[REDACTED]\\"}"';
+
+function escapeRegExp(text) {
+  return text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
 
 function htmlCanaryResponse() {
   const body = `<html><head><title>502 Bad Gateway</title></head><body><p>Authorization: Bearer ${CANARY_BEARER}</p>`
@@ -1465,12 +1490,13 @@ function jsonCanaryResponse() {
     // A compound line: the quoted cookie ends at its closing quote, the following quoted
     // X-Api-Key keeps its name and loses its value, and the Content-Type keeps both.
     message: `Cookie: sid="${CANARY_QUOTED}"; theme=dark; X-Api-Key: "${CANARY_QUOTED}"; Content-Type: "application/json"`,
-    error_msg: `X-Cookie: token="${CANARY_QUOTED}"`,
+    // The JSON-escaped carriers one level down, then a quoted X-Cookie line of their own.
+    error_msg: `${CANARY_ESCAPED_NOTE}; X-Cookie: token="${CANARY_QUOTED}"`,
   }), { status: 400, statusText: "Bad Request", headers: { "content-type": "application/json" } });
 }
 
 // The scrubbed rendering of the JSON canary fields, as every error string must carry it.
-const JSON_CANARY_MARKER = /HTTP 400 Bad Request; Upstream refused Bearer \[REDACTED\] at https:\/\/api\.example\.com\/v1\/x\?token=\[REDACTED\] mid-sentence; session=\[REDACTED\], api_key=\[REDACTED\], Bearer \[REDACTED\], sid=\[REDACTED\] rejected; Cookie: \[REDACTED\]; X-Api-Key: "\[REDACTED\]"; Content-Type: "application\/json"; X-Cookie: \[REDACTED\]/;
+const JSON_CANARY_MARKER = new RegExp(`HTTP 400 Bad Request; Upstream refused Bearer \\[REDACTED\\] at https://api\\.example\\.com/v1/x\\?token=\\[REDACTED\\] mid-sentence; session=\\[REDACTED\\], api_key=\\[REDACTED\\], Bearer \\[REDACTED\\], sid=\\[REDACTED\\] rejected; Cookie: \\[REDACTED\\]; X-Api-Key: "\\[REDACTED\\]"; Content-Type: "application/json"; ${escapeRegExp(SCRUBBED_ESCAPED_NOTE)}; X-Cookie: \\[REDACTED\\]`);
 const HTML_CANARY_MARKER = /HTTP 502 Bad Gateway; non-JSON text\/html response body \(\d+ bytes, not echoed\)/;
 
 // The configured secrets of the sweep fixture, echoed bare in prose in every encoded form:

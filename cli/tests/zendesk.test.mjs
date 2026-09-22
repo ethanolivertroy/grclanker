@@ -127,6 +127,10 @@ function sampleConfig(overrides = {}) {
   };
 }
 
+function escapeRegExp(text) {
+  return text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
 function jsonResponse(value, options = {}) {
   return new Response(JSON.stringify(value), {
     status: options.status ?? 200,
@@ -2176,9 +2180,22 @@ function carriersOf(value) {
     [`Set-Cookie: _zendesk_session=${value}; Path=/; HttpOnly; X-PAN-KEY: "${value}"`, /^Set-Cookie: \[REDACTED\]; X-PAN-KEY: "\[REDACTED\]"$/],
     [`Cookie: sid=${value}; Content-Type: "application/json"; X-Redlock-Auth: ${value}`, /^Cookie: \[REDACTED\]; Content-Type: "application\/json"; X-Redlock-Auth: \[REDACTED\]$/],
     [`X-Api-Key: "${value}"; Cookie: sid=${value}; Content-Type: text/plain`, /^X-Api-Key: "\[REDACTED\]"; Cookie: \[REDACTED\]; Content-Type: text\/plain$/],
-    [`{"description":"Cookie: sid=${value}; X-Api-Key: \\"${value}\\"; Content-Type: \\"application/json\\"","error":"InvalidUpstream"}`, /^\{"description":"Cookie: \[REDACTED\]; X-Api-Key: \[REDACTED\]; Content-Type: \\"application\/json\\"","error":"InvalidUpstream"\}$/],
+    [`{"description":"Cookie: sid=${value}; X-Api-Key: \\"${value}\\"; Content-Type: \\"application/json\\"","error":"InvalidUpstream"}`, /^\{"description":"Cookie: \[REDACTED\]; X-Api-Key: \\"\[REDACTED\]\\"; Content-Type: \\"application\/json\\"","error":"InvalidUpstream"\}$/],
     [`<p>Cookie: sid="${value}"; X-Api-Key: "${value}"; Content-Type: "text/html"</p><p>next</p>`, /^<p>Cookie: \[REDACTED\]; X-Api-Key: "\[REDACTED\]"; Content-Type: "text\/html"<\/p><p>next<\/p>$/],
     [`Cookie: sid=${value}; x-auth-token: "${value}", Accept: text/html`, /^Cookie: \[REDACTED\]; x-auth-token: "\[REDACTED\]", Accept: text\/html$/],
+    // JSON-escaped carriers at any depth: a header pair, a credential pair, an attribute, and
+    // an assignment inside a JSON text stringified into a string value (one and two levels
+    // down) lose their values and keep their escaped quotes, so the JSON stays well formed.
+    [`{"detail":"{\\"Cookie\\": \\"sid=${value}\\", \\"X-Api-Key\\": \\"${value}\\", \\"Content-Type\\": \\"application/json\\"}"}`, /^\{"detail":"\{\\"Cookie\\": \\"\[REDACTED\]\\", \\"X-Api-Key\\": \\"\[REDACTED\]\\", \\"Content-Type\\": \\"application\/json\\"\}"\}$/],
+    [`{"o":"{\\"detail\\":\\"{\\\\\\"Cookie\\\\\\": \\\\\\"sid=${value}\\\\\\", \\\\\\"X-Api-Key\\\\\\": \\\\\\"${value}\\\\\\"}\\"}"}`, /^\{"o":"\{\\"detail\\":\\"\{\\\\\\"Cookie\\\\\\": \\\\\\"\[REDACTED\]\\\\\\", \\\\\\"X-Api-Key\\\\\\": \\\\\\"\[REDACTED\]\\\\\\"\}\\"\}"\}$/],
+    [`{"detail":"{\\"Authorization\\": \\"Bearer ${value}\\"}"}`, /^\{"detail":"\{\\"Authorization\\": \\"\[REDACTED\]\\"\}"\}$/],
+    [`{"detail":"{'Cookie': 'sid=${value}'}"}`, /^\{"detail":"\{'Cookie': '\[REDACTED\]'\}"\}$/],
+    [`{"o":"{\\"detail\\":\\"Cookie: sid=${value}; path=/\\",\\"code\\":401}"}`, /^\{"o":"\{\\"detail\\":\\"Cookie: \[REDACTED\]\\",\\"code\\":401\}"\}$/],
+    [`{"detail":"{\\"password\\": \\"${value}\\", \\"user\\": \\"a\\"}"}`, /^\{"detail":"\{\\"password\\": \\"\[REDACTED\]\\", \\"user\\": \\"a\\"\}"\}$/],
+    [`{"o":"{\\"detail\\":\\"{\\\\\\"client_secret\\\\\\": \\\\\\"${value}\\\\\\"}\\"}"}`, /^\{"o":"\{\\"detail\\":\\"\{\\\\\\"client_secret\\\\\\": \\\\\\"\[REDACTED\]\\\\\\"\}\\"\}"\}$/],
+    [`{"detail":"<entry name=\\"fw1\\" key=\\"${value}\\"/>"}`, /^\{"detail":"<entry name=\\"fw1\\" key=\\"\[REDACTED\]\\"\/>"\}$/],
+    [`{"detail":"password: \\"${value}\\" rejected"}`, /^\{"detail":"password: \\"\[REDACTED\]\\" rejected"\}$/],
+    [`{"detail":"password=\\"${value}\\" rejected"}`, /^\{"detail":"password=\\"\[REDACTED\]\\" rejected"\}$/],
     [`session=${value}; Path=/`, /^session=\[REDACTED\]; Path=\/$/],
     [`_zendesk_session=${value} expired`, /^_zendesk_session=\[REDACTED\] expired$/],
     [`JSESSIONID=${value}; Path=/`, /^JSESSIONID=\[REDACTED\]; Path=\/$/],
@@ -2298,11 +2315,14 @@ test("scrub boundary: name-shaped values stay bare in prose, leave every carrier
   ]) {
     assert.equal(redactErrorText(text), text, text);
   }
-  // Compound header lines with no credential carrier keep every name and value in both scrubs.
+  // Compound header lines with no credential carrier keep every name and value in both
+  // scrubs, bare or JSON-escaped.
   for (const text of [
     'Content-Type: "application/json"; Accept: application/json, text/plain; X-Request-Id: 7f3a',
     "Content-Type: text/plain; charset=utf-8, Accept-Encoding: gzip, deflate",
     '<p>Content-Type: "text/html"; X-Request-Id: "7f3a"</p><p>next</p>',
+    '{"detail":"{\\"Content-Type\\": \\"application/json\\", \\"Date\\": \\"Tue, 22 Sep 2026 18:00:00 GMT\\"}"}',
+    '{"detail":"{\\"user\\": \\"auditor@example.com\\", \\"name\\": \\"svc\\", \\"tokens\\": 2}"}',
   ]) {
     assert.equal(redactErrorText(text), text, text);
     assert.equal(redactCredentialValueText(text), text, text);
@@ -2521,8 +2541,13 @@ const CANARY_PLAIN = "jdvdnheoejphwk";
 const CANARY_QUOTED = "sess-qtdv-QCARRY-16180339887498";
 const CANARIES = [CANARY_BEARER, CANARY_SESSION, CANARY_API_KEY, CANARY_URL_TOKEN, CANARY_NAMED, CANARY_PLAIN, CANARY_QUOTED];
 const CANARY_URL = `https://api.example.com/v1/x?token=${CANARY_URL_TOKEN}`;
+// A JSON text stringified into a string value arrives with its quotes escaped (\"): the
+// header pairs and the credential pair inside it are carriers one level down, and each
+// keeps its escaped quotes around the marker so the text stays well formed.
+const CANARY_ESCAPED_NOTE = `upstream body ${JSON.stringify(JSON.stringify({ Cookie: `sid=${CANARY_QUOTED}`, "X-Api-Key": CANARY_QUOTED, password: CANARY_QUOTED }))}`;
+const SCRUBBED_ESCAPED_NOTE = 'upstream body "{\\"Cookie\\":\\"[REDACTED]\\",\\"X-Api-Key\\":\\"[REDACTED]\\",\\"password\\":\\"[REDACTED]\\"}"';
 // The scrubbed rendering of the JSON canary fields, as every error string must carry it.
-const JSON_CANARY_MARKER = /400 Bad Request; InvalidUpstream; Upstream refused Bearer \[REDACTED\] at https:\/\/api\.example\.com\/v1\/x\?token=\[REDACTED\] mid-sentence; _zendesk_session=\[REDACTED\], api_key=\[REDACTED\], Bearer \[REDACTED\], sid=\[REDACTED\] rejected; Cookie: \[REDACTED\]; X-Api-Key: "\[REDACTED\]"; Content-Type: "application\/json"/;
+const JSON_CANARY_MARKER = new RegExp(`400 Bad Request; InvalidUpstream; Upstream refused Bearer \\[REDACTED\\] at https://api\\.example\\.com/v1/x\\?token=\\[REDACTED\\] mid-sentence; _zendesk_session=\\[REDACTED\\], api_key=\\[REDACTED\\], Bearer \\[REDACTED\\], sid=\\[REDACTED\\] rejected; Cookie: \\[REDACTED\\]; X-Api-Key: "\\[REDACTED\\]"; Content-Type: "application/json"; ${escapeRegExp(SCRUBBED_ESCAPED_NOTE)}`);
 
 function htmlCanaryResponse() {
   const body = `<html><head><title>502 Bad Gateway</title></head><body><p>Authorization: Bearer ${CANARY_BEARER}</p>`
@@ -2539,8 +2564,9 @@ function jsonCanaryResponse() {
     error: "InvalidUpstream",
     description: `Upstream refused Bearer ${CANARY_BEARER} at ${CANARY_URL} mid-sentence; _zendesk_session=${CANARY_SESSION}, api_key=${CANARY_API_KEY}, Bearer ${CANARY_PLAIN}, sid=${CANARY_NAMED} rejected`,
     // A compound line: the quoted cookie ends at its closing quote, the following quoted
-    // X-Api-Key keeps its name and loses its value, and the Content-Type keeps both.
-    message: `Cookie: sid="${CANARY_QUOTED}"; theme=dark; X-Api-Key: "${CANARY_QUOTED}"; Content-Type: "application/json"`,
+    // X-Api-Key keeps its name and loses its value, and the Content-Type keeps both; then
+    // the JSON-escaped carriers one level down.
+    message: `Cookie: sid="${CANARY_QUOTED}"; theme=dark; X-Api-Key: "${CANARY_QUOTED}"; Content-Type: "application/json"; ${CANARY_ESCAPED_NOTE}`,
   }, { status: 400, statusText: "Bad Request" });
 }
 

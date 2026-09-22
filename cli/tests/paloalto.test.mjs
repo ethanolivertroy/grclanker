@@ -1260,6 +1260,13 @@ const CANARY_URL = `https://api.example.com/v1/x?token=${CANARY_URL_TOKEN}`;
 // error field gets.
 const CANARY_SENTENCE = `Bearer ${CANARY_BEARER} at ${CANARY_URL} refused; api_key=${CANARY_API_KEY}, session=${CANARY_NAMED}; Cookie: sid=${CANARY_SESSION}; X-PAN-KEY: "${CANARY_QUOTED}"; Content-Type: "application/json"`;
 const SCRUBBED_SENTENCE = 'Bearer [REDACTED] at https://api.example.com/v1/x?token=[REDACTED] refused; api_key=[REDACTED], session=[REDACTED]; Cookie: [REDACTED]; X-PAN-KEY: "[REDACTED]"; Content-Type: "application/json"';
+// A JSON text stringified into a string value arrives with its quotes escaped (\"): the
+// header pairs and the credential pair inside it are carriers one level down, and each
+// keeps its escaped quotes around the marker so the text stays well formed. The Prisma
+// Cloud path carries it in the x-redlock-status header (its own 200-character part), the
+// PAN-OS path inside the <msg> text, where sentence and note stay under the 300-character cut.
+const CANARY_ESCAPED_NOTE = `upstream body ${JSON.stringify(JSON.stringify({ Cookie: `sid=${CANARY_QUOTED}`, "X-PAN-KEY": CANARY_QUOTED, password: CANARY_QUOTED }))}`;
+const SCRUBBED_ESCAPED_NOTE = 'upstream body "{\\"Cookie\\":\\"[REDACTED]\\",\\"X-PAN-KEY\\":\\"[REDACTED]\\",\\"password\\":\\"[REDACTED]\\"}"';
 
 function escapeRegExp(text) {
   return text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
@@ -1290,11 +1297,15 @@ function htmlCanaryResponse(status = 502) {
 }
 
 function jsonCanaryResponse() {
-  return jsonResponse({ message: CANARY_SENTENCE }, { status: 400, statusText: "Bad Request" });
+  return jsonResponse({ message: CANARY_SENTENCE }, {
+    status: 400,
+    statusText: "Bad Request",
+    headers: { "x-redlock-status": JSON.stringify([{ i18nKey: "upstream_body", message: CANARY_ESCAPED_NOTE }]) },
+  });
 }
 
 function xmlCanaryResponse() {
-  return xmlResponse(`<response status="error" code="403"><result><msg>${CANARY_SENTENCE}</msg></result></response>`, 403);
+  return xmlResponse(`<response status="error" code="403"><result><msg>${CANARY_SENTENCE}; ${CANARY_ESCAPED_NOTE}</msg></result></response>`, 403);
 }
 
 test("redaction helpers scrub credential-shaped text, JSON pairs, URL credentials, and credential-named properties", () => {
@@ -1412,9 +1423,22 @@ function carriersOf(value) {
     [`Set-Cookie: sid=${value}; Path=/; HttpOnly; X-ApiKeys: "${value}"`, /^Set-Cookie: \[REDACTED\]; X-ApiKeys: "\[REDACTED\]"$/],
     [`Cookie: sid=${value}; Content-Type: "application/json"; X-PAN-KEY: ${value}`, /^Cookie: \[REDACTED\]; Content-Type: "application\/json"; X-PAN-KEY: \[REDACTED\]$/],
     [`X-PAN-KEY: "${value}"; Cookie: sid=${value}; Content-Type: text/xml`, /^X-PAN-KEY: "\[REDACTED\]"; Cookie: \[REDACTED\]; Content-Type: text\/xml$/],
-    [`{"detail":"Cookie: sid=${value}; X-PAN-KEY: \\"${value}\\"; Content-Type: \\"application/json\\"","code":401}`, /^\{"detail":"Cookie: \[REDACTED\]; X-PAN-KEY: \[REDACTED\]; Content-Type: \\"application\/json\\"","code":401\}$/],
+    [`{"detail":"Cookie: sid=${value}; X-PAN-KEY: \\"${value}\\"; Content-Type: \\"application/json\\"","code":401}`, /^\{"detail":"Cookie: \[REDACTED\]; X-PAN-KEY: \\"\[REDACTED\]\\"; Content-Type: \\"application\/json\\"","code":401\}$/],
     [`<p>Cookie: sid="${value}"; X-PAN-KEY: "${value}"; Content-Type: "text/html"</p><p>next</p>`, /^<p>Cookie: \[REDACTED\]; X-PAN-KEY: "\[REDACTED\]"; Content-Type: "text\/html"<\/p><p>next<\/p>$/],
     [`Cookie: sid=${value}; X-Redlock-Auth: "${value}", Accept: text/html`, /^Cookie: \[REDACTED\]; X-Redlock-Auth: "\[REDACTED\]", Accept: text\/html$/],
+    // JSON-escaped carriers at any depth: a header pair, a credential pair, an attribute, and
+    // an assignment inside a JSON text stringified into a string value (one and two levels
+    // down) lose their values and keep their escaped quotes, so the JSON stays well formed.
+    [`{"detail":"{\\"Cookie\\": \\"sid=${value}\\", \\"X-PAN-KEY\\": \\"${value}\\", \\"Content-Type\\": \\"application/json\\"}"}`, /^\{"detail":"\{\\"Cookie\\": \\"\[REDACTED\]\\", \\"X-PAN-KEY\\": \\"\[REDACTED\]\\", \\"Content-Type\\": \\"application\/json\\"\}"\}$/],
+    [`{"o":"{\\"detail\\":\\"{\\\\\\"Cookie\\\\\\": \\\\\\"sid=${value}\\\\\\", \\\\\\"x-redlock-auth\\\\\\": \\\\\\"${value}\\\\\\"}\\"}"}`, /^\{"o":"\{\\"detail\\":\\"\{\\\\\\"Cookie\\\\\\": \\\\\\"\[REDACTED\]\\\\\\", \\\\\\"x-redlock-auth\\\\\\": \\\\\\"\[REDACTED\]\\\\\\"\}\\"\}"\}$/],
+    [`{"detail":"{\\"Authorization\\": \\"Bearer ${value}\\"}"}`, /^\{"detail":"\{\\"Authorization\\": \\"\[REDACTED\]\\"\}"\}$/],
+    [`{"detail":"{'Cookie': 'sid=${value}'}"}`, /^\{"detail":"\{'Cookie': '\[REDACTED\]'\}"\}$/],
+    [`{"o":"{\\"detail\\":\\"Cookie: sid=${value}; path=/\\",\\"code\\":401}"}`, /^\{"o":"\{\\"detail\\":\\"Cookie: \[REDACTED\]\\",\\"code\\":401\}"\}$/],
+    [`{"detail":"{\\"password\\": \\"${value}\\", \\"user\\": \\"a\\"}"}`, /^\{"detail":"\{\\"password\\": \\"\[REDACTED\]\\", \\"user\\": \\"a\\"\}"\}$/],
+    [`{"o":"{\\"detail\\":\\"{\\\\\\"authToken\\\\\\": \\\\\\"${value}\\\\\\"}\\"}"}`, /^\{"o":"\{\\"detail\\":\\"\{\\\\\\"authToken\\\\\\": \\\\\\"\[REDACTED\]\\\\\\"\}\\"\}"\}$/],
+    [`{"detail":"<entry name=\\"fw1\\" key=\\"${value}\\"/>"}`, /^\{"detail":"<entry name=\\"fw1\\" key=\\"\[REDACTED\]\\"\/>"\}$/],
+    [`{"detail":"password: \\"${value}\\" rejected"}`, /^\{"detail":"password: \\"\[REDACTED\]\\" rejected"\}$/],
+    [`{"detail":"password=\\"${value}\\" rejected"}`, /^\{"detail":"password=\\"\[REDACTED\]\\" rejected"\}$/],
     [`session=${value}; Path=/`, /^session=\[REDACTED\]; Path=\/$/],
     [`_upstream_session=${value} expired`, /^_upstream_session=\[REDACTED\] expired$/],
     [`PHPSESSID=${value}; Path=/`, /^PHPSESSID=\[REDACTED\]; Path=\/$/],
@@ -1532,11 +1556,14 @@ test("scrub boundary: name-shaped values stay bare in prose, leave every carrier
   ]) {
     assert.equal(redactErrorText(text), text, text);
   }
-  // Compound header lines with no credential carrier keep every name and value in both scrubs.
+  // Compound header lines with no credential carrier keep every name and value in both
+  // scrubs, bare or JSON-escaped.
   for (const text of [
     'Content-Type: "application/json"; Accept: application/json, text/xml; X-Request-Id: 7f3a',
     "Content-Type: text/xml; charset=utf-8, Accept-Encoding: gzip, deflate",
     '<p>Content-Type: "text/html"; X-Request-Id: "7f3a"</p><p>next</p>',
+    '{"detail":"{\\"Content-Type\\": \\"application/json\\", \\"Date\\": \\"Tue, 22 Sep 2026 18:00:00 GMT\\"}"}',
+    '{"detail":"{\\"user\\": \\"auditor\\", \\"name\\": \\"fw1\\", \\"tokens\\": 2}"}',
   ]) {
     assert.equal(redactErrorText(text), text, text);
     assert.equal(redactCredentialValueText(text), text, text);
@@ -1592,8 +1619,10 @@ test("describePrismaErrorBody and PanosApiClient.parseResponse describe non-JSON
   const htmlText = await html.text();
   assert.equal(describePrismaErrorBody(html, htmlText), `non-JSON text/html response body (${htmlText.length} bytes, not echoed)`);
 
+  // The x-redlock-status header part (the JSON-escaped carriers) and the body part are
+  // scrubbed and cut on their own.
   const json = jsonCanaryResponse();
-  assert.equal(describePrismaErrorBody(json, await json.text()), SCRUBBED_SENTENCE);
+  assert.equal(describePrismaErrorBody(json, await json.text()), `x-redlock-status upstream_body, ${SCRUBBED_ESCAPED_NOTE}; ${SCRUBBED_SENTENCE}`);
 
   const undocumented = jsonResponse({ foo: "bar", token: CANARY_SESSION }, { status: 500 });
   const undocumentedText = await undocumented.text();
@@ -1775,9 +1804,9 @@ const HTML_MARKERS = {
   "pan-os": /returned a non-XML text\/html response \(status 502, \d+ bytes, not echoed\)/,
 };
 const STRUCTURED_MARKERS = {
-  "prisma-cloud": new RegExp(`\\(400\\): ${escapeRegExp(SCRUBBED_SENTENCE)}`),
-  "prisma-compute": new RegExp(`\\(400\\): ${escapeRegExp(SCRUBBED_SENTENCE)}`),
-  "pan-os": new RegExp(`failed \\(code 403, status 403\\): ${escapeRegExp(SCRUBBED_SENTENCE)}`),
+  "prisma-cloud": new RegExp(`\\(400\\): x-redlock-status upstream_body, ${escapeRegExp(SCRUBBED_ESCAPED_NOTE)}; ${escapeRegExp(SCRUBBED_SENTENCE)}`),
+  "prisma-compute": new RegExp(`\\(400\\): x-redlock-status upstream_body, ${escapeRegExp(SCRUBBED_ESCAPED_NOTE)}; ${escapeRegExp(SCRUBBED_SENTENCE)}`),
+  "pan-os": new RegExp(`failed \\(code 403, status 403\\): ${escapeRegExp(SCRUBBED_SENTENCE)}; ${escapeRegExp(SCRUBBED_ESCAPED_NOTE)}`),
 };
 const ECHOED_BODY_TEXT = /<html|<!DOCTYPE|Set-Cookie|X-Api-Key:|did not answer/i;
 
@@ -2417,8 +2446,10 @@ test("the registered tools scrub error strings end to end over HTTP: access chec
       assert.deepEqual(failedProbes.map((probe) => probe.name).sort(), ["defenders", "mgt-config", "policies"]);
       for (const probe of failedProbes) assert.match(probe.error, shape.markers[probe.product], `${shape.name}: ${probe.name}: ${probe.error}`);
       assert.doesNotMatch(access.content[0].text, ECHOED_BODY_TEXT);
-      // The Note column is capped at 80 characters, so only the head of the note is guaranteed to render.
-      assert.match(access.content[0].text, /non-JSON text\/html response body|non-XML text\/html response|\[REDACTED\]/, "the rendered table carries the note or the marker");
+      // The Note column is capped at 80 characters: it renders the head of each scrubbed error string.
+      for (const probe of failedProbes) {
+        assert.ok(access.content[0].text.includes(probe.error.replace(/\s+/g, " ").slice(0, 80).trimEnd()), `the rendered table carries the head of the ${probe.name} error: ${probe.error}`);
+      }
 
       for (const name of ["paloalto_assess_cloud_posture", "paloalto_assess_firewall_policy", "paloalto_assess_threat_prevention", "paloalto_assess_device_hardening"]) {
         const result = await run(name);
