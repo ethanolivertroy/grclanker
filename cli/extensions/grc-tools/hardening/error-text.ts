@@ -180,6 +180,10 @@ const CLAUSE_PUNCTUATION_PATTERN = /[.:]+$/;
 // A character that continues a value glued to a marker (`[REDACTED]abc` is not scrubbed text; see
 // `isBlankOrScrubbed`).
 const VALUE_CHARACTER_PATTERN = /[A-Za-z0-9_~+/=%-]/;
+// What follows a quote that closes the enclosing JSON string rather than opening a value: the
+// structure after a string (`{"detail":"Authorization: Bearer"}`, `"note":"X-Api-Key:", "next"`). No
+// credential value begins with one of these, so such a quote is not a value opener (see `opensValue`).
+const ENCLOSING_STRING_CLOSE_PATTERN = /^[}\],]/;
 // The JSON literals hold no credential (`"password": null`, `"otp": true`), as in `redactSecretValues`.
 const JSON_LITERAL_PATTERN = /^(?:null|true|false)$/;
 
@@ -585,6 +589,15 @@ function isBlankOrScrubbed(value: string): boolean {
   return trimmed.startsWith(REDACTED) && !VALUE_CHARACTER_PATTERN.test(trimmed.charAt(REDACTED.length));
 }
 
+/**
+ * Whether a quote read at a value position opens a value: false when what it encloses begins with
+ * the structure that follows a JSON string (`}`, `]`, `,`), which means the quote closed the string
+ * the carrier stands in (`{"detail":"Authorization: Bearer"}`) and the carrier has no value here.
+ */
+function opensValue(text: string, quoted: QuotedValue): boolean {
+  return !ENCLOSING_STRING_CLOSE_PATTERN.test(text.slice(quoted.start, quoted.end));
+}
+
 function skipSpaces(text: string, index: number): number {
   let cursor = index;
   while (text[cursor] === " " || text[cursor] === "\t") cursor += 1;
@@ -639,6 +652,7 @@ function readBareValue(text: string, index: number, barePattern: RegExp): string
 function readCarrierValue(text: string, valueStart: number, barePattern: RegExp, keepBare?: (value: string, valueEnd: number) => boolean): ValueReplacement | null {
   const quoted = readQuotedValue(text, valueStart);
   if (quoted !== null) {
+    if (!opensValue(text, quoted)) return null;
     const content = text.slice(quoted.start, quoted.end);
     const scheme = stickyExec(VALUE_SCHEME_PATTERN, content, 0) ?? "";
     if (isBlankOrScrubbed(content.slice(scheme.length))) return null;
@@ -648,7 +662,7 @@ function readCarrierValue(text: string, valueStart: number, barePattern: RegExp,
   const afterScheme = valueStart + scheme.length;
   const quotedAfterScheme = scheme.length > 0 ? readQuotedValue(text, afterScheme) : null;
   if (quotedAfterScheme !== null) {
-    if (isBlankOrScrubbed(text.slice(quotedAfterScheme.start, quotedAfterScheme.end))) return null;
+    if (!opensValue(text, quotedAfterScheme) || isBlankOrScrubbed(text.slice(quotedAfterScheme.start, quotedAfterScheme.end))) return null;
     return { end: quotedAfterScheme.after, replacement: `${scheme}${quotedAfterScheme.open}${REDACTED}${quotedAfterScheme.close}` };
   }
   const value = readBareValue(text, afterScheme, barePattern);
@@ -679,7 +693,7 @@ function cookieValueEnd(text: string, index: number): number {
 const readCookieHeaderValue: ValueReader = (text, valueStart, carrier) => {
   const quoted = readQuotedValue(text, valueStart);
   if (quoted !== null) {
-    if (isBlankOrScrubbed(text.slice(quoted.start, quoted.end))) return null;
+    if (!opensValue(text, quoted) || isBlankOrScrubbed(text.slice(quoted.start, quoted.end))) return null;
     return { end: quoted.after, replacement: `${quoted.open}${REDACTED}${quoted.close}` };
   }
   const name = stickyExec(COOKIE_PAIR_NAME_PATTERN, text, valueStart);

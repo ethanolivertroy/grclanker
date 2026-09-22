@@ -407,6 +407,87 @@ test("the scrubError fixed texts for a value that yields no message survive the 
   assertSurvivesScrub("thrown value could not be read", "the last-resort fixed text");
 });
 
+test("the scheme phrases main rendered intact come back from every sink with only the sink's frame added, including a phrase that ends the enclosing JSON string", () => {
+  // Review of #78 (gap 4 and probe 2's pinned phrases): `{"detail":"Authorization: Bearer"}` came back
+  // as `{"detail":"Authorization: Bearer"[REDACTED]` because the quote that closes the enclosing JSON
+  // string was read as a value opener. A quote followed by the structure after a string is not one.
+  const phrases = [
+    "Bearer token is missing",
+    "Bearer token authentication is required",
+    "Bearer token-based auth is required",
+    "Basic authentication is disabled for this deployment",
+    "Basic (deprecated) and Basic (full access) modes",
+    "Token request failed",
+    "Token inventory: 3 of 5 keys have no expiry",
+    "OAuth bearer token",
+    "OAuth sign-in",
+    "OAuth service-app client ID",
+    "the OAuth 2.0 device flow",
+    "Splunk Enterprise 9.1.2",
+    "Splunk Cloud, Splunk Enterprise, SSWS API tokens, SSWS or OAuth",
+    "Digest access authentication",
+    "Negotiate authentication is not supported",
+    "NTLM authentication is not supported",
+    "ApiKey authentication requires an id and a key",
+    'Bearer realm="api", error="invalid_token", error_description="The access token expired"',
+    "Authorization: Bearer",
+    "Authorization: Bearer\nnext line starts here",
+    "the token authentication flow failed",
+    "Bearer tokens expire after one hour",
+    "Basic auth is deprecated",
+    "Token expiry is not enforced",
+    "X-Api-Key:",
+    "Cookie:",
+    "password:",
+  ];
+  class VendorApiError extends IntegrationError {}
+  const sinks = [
+    ["scrubErrorText", (text) => scrubErrorText(text), (text) => text],
+    ["scrubDataText", (text) => scrubDataText(text), (text) => text],
+    ["scrubError message", (text) => scrubError(new Error(text)).message, (text) => text],
+    ["scrubError error field", (text) => scrubError({ name: "VendorError", error: text }).message, (text) => text],
+    ["scrubError cause", (text) => scrubError(new Error("outer", { cause: new Error(text) })).message, (text) => `outer (cause: ${text})`],
+    ["scrubError aggregate", (text) => scrubError(new AggregateError([new Error(text), new Error("two")], "several")).message, (text) => `several (2 errors: ${text}; two)`],
+    ["errorMessage", (text) => errorMessage(new Error(text)), (text) => text.replace(/\s+/g, " ").trim()],
+    ["IntegrationError", (text) => new IntegrationError(text, {}).message, (text) => text],
+    ["IntegrationError subclass", (text) => new VendorApiError(text, { status: 401 }).message, (text) => text],
+    ["describeErrorBody message", (text) => describeErrorBody("application/json", JSON.stringify({ message: text })), (text) => text],
+    ["describeErrorBody nested", (text) => describeErrorBody("application/json", JSON.stringify({ error: { message: JSON.stringify({ detail: text }) } })), (text) => JSON.stringify({ detail: text })],
+    [
+      "describeFailedResponse body",
+      (text) => describeFailedResponse({ method: "GET", endpoint: "/v1/users", status: 502, statusText: "Bad Gateway", contentType: "application/json", body: JSON.stringify({ message: text }) }),
+      (text) => `GET /v1/users failed with 502 Bad Gateway: ${text}`,
+    ],
+    [
+      "describeFailedResponse errors",
+      (text) => describeFailedResponse({ method: "POST", endpoint: "/v1/items", status: 400, statusText: "Bad Request", contentType: "application/json", body: JSON.stringify({ errors: [{ detail: text }] }) }),
+      (text) => `POST /v1/items failed with 400 Bad Request: ${text}`,
+    ],
+  ];
+  for (const phrase of phrases) {
+    for (const [name, sink, frame] of sinks) {
+      assert.equal(sink(phrase), frame(phrase), `${name} changed ${JSON.stringify(phrase)}`);
+    }
+  }
+  // The same quote read at a value position inside JSON structure, in every carrier class.
+  for (const text of [
+    '{"detail":"Authorization: Bearer"}',
+    '{\\"detail\\":\\"Authorization: Bearer\\"}',
+    '{"detail":"Authorization: Bearer "}',
+    '{"detail":"X-Api-Key:"}',
+    '{"note":"X-Api-Key:", "next":"abc"}',
+    '{"detail":"Cookie:"}',
+    '{"detail":"password:"}',
+    '["Authorization: Bearer"]',
+    '{"detail":"Authorization: Bearer"}, {"detail":"X-Api-Key:"}',
+  ]) {
+    assertSurvivesScrub(text, `enclosing string closed after a carrier: ${text}`);
+  }
+  // A carrier value that follows such a phrase in the same document is still read.
+  assert.equal(scrubErrorText('{"detail":"Authorization: Bearer"}, {"detail":"X-Api-Key: hunter2xyz"}'), `{"detail":"Authorization: Bearer"}, {"detail":"X-Api-Key: ${REDACTED}"}`);
+  assert.equal(scrubErrorText('Authorization: Bearer"abc123def"'), `Authorization: Bearer"${REDACTED}"`);
+});
+
 test("a path rendered as the value of a credential-named pair is eaten, which is why no fixed text renders one that way", () => {
   const path = "/home/user/.config/tool/credentials.json";
   assert.equal(scrubErrorText(`Service account credentials: ${path}`), `Service account credentials: ${REDACTED}`);
