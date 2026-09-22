@@ -1182,15 +1182,31 @@ export function describeErrorBody(text: string, contentType?: string | null): st
   const envelope = asObject(record.error);
   if (envelope) {
     const code = asString(envelope.code);
-    const message = asString(envelope.message)?.replace(/\s+/g, " ").slice(0, 160);
+    const message = clipVendorMessage(asString(envelope.message));
     return [code, message].filter(Boolean).join(": ") || "error body without code or message";
   }
   const oauthError = asString(record.error);
   if (oauthError) {
-    const description = asString(record.error_description)?.replace(/\s+/g, " ").slice(0, 160);
+    const description = clipVendorMessage(asString(record.error_description));
     return description ? `${oauthError}: ${description}` : oauthError;
   }
   return "error body without code or message";
+}
+
+const VENDOR_MESSAGE_LIMIT = 160;
+
+/**
+ * Shortens a vendor's free-text error message for the recorded line. The scrub runs over the whole message
+ * first and the cut falls on a whitespace boundary of the scrubbed text, so a credential that straddles the
+ * cut is removed whole instead of leaving its first characters as a fragment too short for the bare-token
+ * rule to recognise (round 4 item D).
+ */
+export function clipVendorMessage(message: string | undefined): string | undefined {
+  if (message === undefined) return undefined;
+  const scrubbed = redactErrorText(message.replace(/\s+/g, " ").trim());
+  if (scrubbed.length <= VENDOR_MESSAGE_LIMIT) return scrubbed;
+  const cut = scrubbed.lastIndexOf(" ", VENDOR_MESSAGE_LIMIT);
+  return scrubbed.slice(0, cut > 0 ? cut : VENDOR_MESSAGE_LIMIT).trimEnd();
 }
 
 /**

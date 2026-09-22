@@ -35,6 +35,7 @@ import {
   toPage,
 } from "../dist/extensions/grc-tools/azure.js";
 import {
+  CANARY,
   CANARY_URL,
   CANARY_VALUES,
   ENCODED_FORM_SECRET,
@@ -480,6 +481,26 @@ test("rule 9: API error bodies are reduced to the documented error envelope befo
   assert.equal(describeErrorBody("[1,2,3]", "application/json"), "non-JSON body (application/json, 7 bytes)", "a JSON body that is not an object is described by shape too");
   assert.equal(describeErrorBody(JSON.stringify({ unexpected: "shape", token: "leaked-token" })), "error body without code or message");
   assertRedactionCases(assert, redactErrorText);
+
+  // Round 4 item D: the vendor message is scrubbed before it is shortened, so a credential whose start lies inside
+  // the 160-character cut is removed whole instead of leaving a 7 to 11 character tail the bare-token rule cannot see.
+  const sliceCanaries = { awsSecret: CANARY.awsSecret, cookie: CANARY.sessionCookie, bearerBare: CANARY.bearer, apiKey: CANARY.apiKey };
+  const envelopes = {
+    graph403: (message) => JSON.stringify({ error: { code: "Authorization_RequestDenied", message } }),
+    token400: (description) => JSON.stringify({ error: "invalid_client", error_description: description }),
+  };
+  for (const [envelopeName, envelope] of Object.entries(envelopes)) {
+    for (const [canaryName, canary] of Object.entries(sliceCanaries)) {
+      for (const keep of [7, 9, 11, 12, 15]) {
+        const lead = "the diagnostic context follows ".padStart(160 - keep, "x");
+        const described = describeErrorBody(envelope(`${lead}${canary} and more text after the cut`), "application/json");
+        assertNoCanaryWindows(assert, described, [canary], `${envelopeName} ${canaryName} keep ${keep}`);
+        assert.ok(described.length <= 160 + "Authorization_RequestDenied: ".length, `${envelopeName} ${canaryName} keep ${keep}: the line stays short (${described.length})`);
+      }
+    }
+  }
+  assert.equal(describeErrorBody(envelopes.graph403(`${"word ".repeat(40)}tail`), "application/json").endsWith("word"), true, "a long message is cut on a whitespace boundary");
+  assert.equal(describeErrorBody(envelopes.token400("AADSTS7000215: Invalid client secret provided. Trace ID: 0f7b2a6c-9c4e-4a63-8f2c-2f1d9a1c0b77"), "application/json"), "invalid_client: AADSTS7000215: Invalid client secret provided. Trace ID: 0f7b2a6c-9c4e-4a63-8f2c-2f1d9a1c0b77", "a short message keeps its UUID and is otherwise unchanged");
   assert.equal(
     new AzureApiError(`403 Forbidden: AuthorizationFailed: see ${CANARY_URL} for the denied scope`, "https://management.azure.com/x", 403).message,
     "403 Forbidden: AuthorizationFailed: see https://api.example.com/v1/x?[REDACTED] for the denied scope",
