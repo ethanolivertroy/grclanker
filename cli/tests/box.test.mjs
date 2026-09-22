@@ -31,8 +31,11 @@ import {
   redactSecrets,
   resolveBoxConfiguration,
   resolveSecureOutputPath,
+  scrubErrorText,
 } from "../dist/extensions/grc-tools/box.js";
 import { getRegisteredToolSummaries } from "../dist/pi/tool-catalog.js";
+import { assertSecretsAbsent, readBundleFiles, readZipEntries } from "./helpers/bundle-contents.mjs";
+import { assertCanaryWindowsAbsent } from "./helpers/canary-windows.mjs";
 
 const NOW = new Date("2026-09-21T00:00:00Z");
 const FRAMEWORKS = ["FedRAMP", "CMMC", "SOC 2", "CIS", "PCI-DSS", "STIG", "IRAP", "ISMAP"];
@@ -496,7 +499,10 @@ test("resolveBoxConfiguration supports JWT config files, CCG env vars, OAuth tok
   assert.throws(() => resolveBoxConfiguration({}, {}, { homeDir: base }), /Box credentials are required/);
   assert.throws(() => resolveBoxConfiguration({}, { BOX_CLIENT_ID: "only-client", BOX_CLIENT_SECRET: "only-secret", BOX_AUTH_METHOD: "ccg" }, { homeDir: base }), /BOX_ENTERPRISE_ID/);
   assert.throws(() => resolveBoxConfiguration({ auth_method: "saml" }, {}, { homeDir: base }), /Unsupported Box auth method/);
-  assert.throws(() => resolveBoxConfiguration({ config_path: join(base, "missing.yaml") }, {}, { homeDir: base, cwd: base }), /not found or was empty/);
+  assert.throws(
+    () => resolveBoxConfiguration({ config_path: join(base, "missing.yaml") }, {}, { homeDir: base, cwd: base }),
+    (error) => error.name === "BoxConfigFileError" && error.code === "ENOENT" && /^Unable to read Box config file .*missing\.yaml \(ENOENT\)$/.test(error.message),
+  );
 });
 
 test("BoxApiClient signs a JWT assertion, exchanges it for a token, and calls the API", async () => {
@@ -649,7 +655,7 @@ test("BoxApiClient exchanges Client Credentials Grant and paginates users with m
 
   const events = await client.listEnterpriseEvents({ eventTypes: ["LOGIN"], createdAfter: NOW, limit: 5 });
   assert.deepEqual(events.items.map((entry) => entry.event_id), ["e-1", "e-2"]);
-  assert.equal(events.truncated, false, "the stream position stopped advancing, so the stream was drained");
+  assert.equal(events.truncated, true, "a stream position that stops advancing while entries keep arriving cannot be drained, so the sample is partial");
   const eventCalls = seen.filter((call) => call.pathname === "/2.0/events");
   assert.equal(eventCalls[0].params.get("stream_type"), "admin_logs");
   assert.equal(eventCalls[0].params.get("event_type"), "LOGIN");
@@ -703,6 +709,81 @@ test("BoxApiClient reports list truncation only when a marker, offset, or stream
   const events = await client.listEnterpriseEvents({ limit: 3 });
   assert.equal(events.items.length, 3);
   assert.equal(events.truncated, true, "the cap filled while a fresh next_stream_position remained");
+});
+
+test("verdict rule 10: every Box pagination exit that leaves records behind reports truncated", async () => {
+  const fetchImpl = async (input) => {
+    const url = new URL(typeof input === "string" ? input : input.toString());
+    if (url.pathname === "/2.0/users") {
+      const marker = url.searchParams.get("marker");
+      if (!marker) return jsonResponse({ entries: [{ id: "user-1", type: "user" }], next_marker: "marker-2" });
+      return jsonResponse({ entries: [], next_marker: "marker-3" });
+    }
+    if (url.pathname === "/2.0/groups") {
+      const offset = Number(url.searchParams.get("offset") ?? "0");
+      if (offset === 0) return jsonResponse({ entries: [{ id: "group-1", type: "group" }], total_count: 5, offset, limit: 1 });
+      return jsonResponse({ entries: [], total_count: 5, offset, limit: 1 });
+    }
+    if (url.pathname === "/2.0/events") {
+      const kind = url.searchParams.get("event_type");
+      const position = url.searchParams.get("stream_position");
+      if (kind === "LOGIN") {
+        return jsonResponse({ entries: [{ event_id: `e-${position ?? "0"}`, event_type: "LOGIN" }], next_stream_position: "stuck" });
+      }
+      return jsonResponse({ entries: [{ event_id: "e-1", event_type: "DOWNLOAD" }] });
+    }
+    if (url.pathname === "/2.0/retention_policies") {
+      return jsonResponse({ entries: Array.from({ length: 60 }, (_, index) => ({ id: `policy-${index}`, type: "retention_policy", status: "active", assignment_counts: { folder: 1 } })), next_marker: null });
+    }
+    if (/^\/2\.0\/retention_policies\/[^/]+\/assignments$/.test(url.pathname)) {
+      return jsonResponse({ entries: [{ id: `assignment-${url.pathname.split("/")[3]}`, type: "retention_policy_assignment" }], next_marker: null });
+    }
+    if (url.pathname === "/2.0/legal_hold_policies") return jsonResponse({ entries: [], next_marker: null });
+    if (url.pathname === "/2.0/metadata_templates/enterprise") return jsonResponse({ entries: [], next_marker: null });
+    if (url.pathname.startsWith("/2.0/enterprises/")) return jsonResponse({ entries: [], next_marker: null });
+    if (url.pathname.startsWith("/2.0/metadata_templates/enterprise/")) return jsonResponse({ fields: [] });
+    if (url.pathname.startsWith("/2.0/enterprise_configurations/")) return jsonResponse(hardenedConfiguration());
+    return jsonResponse({}, { status: 404 });
+  };
+  const client = new BoxApiClient(sampleConfig({ authMode: "oauth", accessToken: "token", clientId: undefined, clientSecret: undefined }), { fetchImpl, now: () => NOW });
+
+  const emptyPageWithMarker = await client.listUsers(10);
+  assert.deepEqual(emptyPageWithMarker.items.map((entry) => entry.id), ["user-1"]);
+  assert.equal(emptyPageWithMarker.truncated, true, "an empty marker page that still carries next_marker is a partial inventory");
+
+  const emptyPageBelowTotal = await client.listGroups(10);
+  assert.deepEqual(emptyPageBelowTotal.items.map((entry) => entry.id), ["group-1"]);
+  assert.equal(emptyPageBelowTotal.truncated, true, "an empty offset page while offset < total_count is a partial inventory");
+
+  const stuckPosition = await client.listEnterpriseEvents({ eventTypes: ["LOGIN"], limit: 10 });
+  assert.equal(stuckPosition.items.length, 2);
+  assert.equal(stuckPosition.truncated, true, "a next_stream_position that stops advancing while entries keep arriving is a partial inventory");
+
+  const missingPosition = await client.listEnterpriseEvents({ eventTypes: ["DOWNLOAD"], limit: 10 });
+  assert.equal(missingPosition.items.length, 1);
+  assert.equal(missingPosition.truncated, true, "a non-empty page without next_stream_position cannot be continued");
+
+  const governance = await assessBoxDataGovernance(client, { listLimit: 100 });
+  const cap = governance.truncated.find((note) => note.startsWith("retention_policy_assignments:"));
+  assert.ok(cap, `the 50-policy assignment cap must be recorded, got ${JSON.stringify(governance.truncated)}`);
+  assert.match(cap, /stopped at the 50-record cap/);
+  assert.equal(findingById(governance, "BOX-12").status, "pass", "assignment presence is still proven for the 50 policies that were read");
+});
+
+test("verdict rule 9: non-JSON error bodies are described, never echoed, into Box error text", async () => {
+  const fetchImpl = async () => new Response(`<html><body>gateway error; upstream header Authorization: Bearer FAKE_SECRET_TOKEN_8</body></html>`, {
+    status: 502,
+    statusText: "Bad Gateway",
+    headers: { "content-type": "text/html" },
+  });
+  const client = new BoxApiClient(sampleConfig({ authMode: "oauth", accessToken: "token", clientId: undefined, clientSecret: undefined, maxRetries: 0 }), { fetchImpl, now: () => NOW });
+  await assert.rejects(client.listUsers(5), (error) => {
+    assert.ok(error instanceof BoxApiError);
+    assert.equal(error.status, 502);
+    assert.match(error.message, /non-JSON text\/html response body \(\d+ bytes, not echoed\)/);
+    assert.doesNotMatch(error.message, /FAKE_SECRET_TOKEN_8|gateway error/);
+    return true;
+  });
 });
 
 test("BoxApiClient retries 429 and 5xx responses with backoff and redacts secrets from errors", async () => {
@@ -763,6 +844,32 @@ test("BoxApiClient retries 429 and 5xx responses with backoff and redacts secret
   assert.deepEqual(delays, [500, 1000], "5xx retries use exponential backoff until maxRetries is exhausted");
 
   assert.equal(redactSecrets("Authorization: Bearer abc.def-ghi and secret shh-secret-value", ["shh-secret-value", "tiny"]), "Authorization: Bearer [REDACTED] and secret [REDACTED]");
+});
+
+test("Box scrubber: a quoted header value in a recorded error is removed whole, in double or single quotes, with or without spaces, and JSON-escaped", () => {
+  const canary = "RulingNameShapedProbeZq";
+  assert.equal(scrubErrorText(`the resource ${canary} was not readable`), `the resource ${canary} was not readable`, "the name-shaped canary stays bare, so only the carrier removes it");
+  const carriers = [
+    [`Cookie: sid="${canary}"`, "Cookie: [REDACTED]"],
+    [`Cookie: sid='${canary}'; Path=/; HttpOnly`, "Cookie: [REDACTED]"],
+    [`X-Api-Key: "${canary}"`, 'X-Api-Key: "[REDACTED]"'],
+    [`X-Api-Key:'${canary}'`, "X-Api-Key:'[REDACTED]'"],
+    [`Authorization: Bearer "${canary}"`, 'Authorization: Bearer "[REDACTED]"'],
+    [`Authorization: "Bearer ${canary}"`, 'Authorization: "Bearer [REDACTED]"'],
+    [`"Authorization": "Bearer ${canary}"`, '"Authorization": "Bearer [REDACTED]"'],
+    [`\\"Authorization\\":\\"Bearer ${canary}\\"`, '\\"Authorization\\":\\"Bearer [REDACTED]\\"'],
+    [`\\"X-Api-Key\\": \\"${canary}\\"`, '\\"X-Api-Key\\": \\"[REDACTED]\\"'],
+    [`Box request failed (502 Bad Gateway) for GET /2.0/users: upstream echoed {"headers":{"Authorization":"Bearer ${canary}","Cookie":"sid=${canary}","Content-Type":"application/json"}}`, 'Box request failed (502 Bad Gateway) for GET /2.0/users: upstream echoed {"headers":{"Authorization":"Bearer [REDACTED]","Cookie":"[REDACTED]","Content-Type":"application/json"}}'],
+  ];
+  for (const [text, expected] of carriers) {
+    const scrubbed = scrubErrorText(text);
+    assert.equal(scrubbed, expected, text);
+    assertCanaryWindowsAbsent(assert, scrubbed, [canary], text);
+    assert.equal(scrubErrorText(scrubbed), scrubbed, `${text}: a second pass changed the text`);
+  }
+  assert.equal(scrubErrorText('Authorization: Bearer "token"'), 'Authorization: Bearer "[REDACTED]"', "a plain word in quotes is the value and goes");
+  assert.equal(scrubErrorText('Content-Type: "application/json"; Accept: "application/json"'), 'Content-Type: "application/json"; Accept: "application/json"', "quoted non-credential headers stay");
+  assert.equal(redactSecrets(`Cookie: sid="${canary}"`, [canary]), "Cookie: [REDACTED]", "registering the value as a secret changes nothing about the carrier result");
 });
 
 test("BoxApiClient refreshes an expired OAuth token after a 401", async () => {
@@ -1479,7 +1586,9 @@ test("assessBoxShieldMonitoring fails when Shield rules and monitoring signals a
     "BOX-25": "manual",
   });
   assert.match(findingById(unreadable, "BOX-16").manualEvidence, /SIEM/);
-  assert.equal(unreadable.errors.length, 3);
+  // Three denied reads plus the segment reads that were never requested because the barrier listing was denied.
+  assert.equal(unreadable.errors.length, 4);
+  assert.ok(unreadable.errors.some((entry) => /^shield_information_barrier_segments: not requested because the parent listing could not be read$/.test(entry)));
 });
 
 test("exportBoxAuditBundle writes core data, analysis, compliance reports, and a zip archive", async () => {
@@ -1604,10 +1713,13 @@ test("exportBoxAuditBundle records partial collection failures in _errors.log", 
 
   assert.ok(existsSync(result.zipPath));
   assert.equal(result.findingCount, 25);
-  assert.equal(result.errorCount, 2);
+  // Two denied reads plus the two child reads that were never requested because their parent listing was denied.
+  assert.equal(result.errorCount, 4);
   const errorLog = readFileSync(join(result.outputDir, "_errors.log"), "utf8");
   assert.match(errorLog, /retention_policies: .*manage_data_retention/);
+  assert.match(errorLog, /retention_policy_assignments: not requested because the parent listing could not be read/);
   assert.match(errorLog, /shield_information_barriers: /);
+  assert.match(errorLog, /shield_information_barrier_segments: not requested because the parent listing could not be read/);
 
   const findings = JSON.parse(readFileSync(join(result.outputDir, "analysis/findings.json"), "utf8"));
   assert.equal(findings.find((entry) => entry.id === "BOX-12").status, "manual");
@@ -1618,9 +1730,24 @@ test("exportBoxAuditBundle records partial collection failures in _errors.log", 
 
   const collectionStatus = JSON.parse(readFileSync(join(result.outputDir, "core_data/collection_status.json"), "utf8"));
   const retentionStatus = collectionStatus.datasets.find((entry) => entry.file === "core_data/retention_policies.json");
-  assert.equal(retentionStatus.complete, false);
+  assert.equal(retentionStatus.collected, false);
+  assert.equal(retentionStatus.status, "denied");
+  assert.equal(retentionStatus.complete, null);
+  assert.equal(retentionStatus.truncated, null);
+  assert.equal(retentionStatus.count, null);
   assert.equal(retentionStatus.status_code, 403);
   assert.match(retentionStatus.error, /manage_data_retention/);
+  const assignmentStatus = collectionStatus.datasets.find((entry) => entry.file === "core_data/retention_policy_assignments.json");
+  assert.equal(assignmentStatus.collected, false);
+  assert.equal(assignmentStatus.status, "not-requested");
+  assert.equal(assignmentStatus.count, null);
+
+  const deniedSnapshot = JSON.parse(readFileSync(join(result.outputDir, "core_data/retention_policies.json"), "utf8"));
+  assert.equal(deniedSnapshot.collected, false);
+  assert.equal(deniedSnapshot.status, 403);
+  assert.equal(deniedSnapshot.reason, "not_readable");
+  const notRequestedSnapshot = JSON.parse(readFileSync(join(result.outputDir, "core_data/retention_policy_assignments.json"), "utf8"));
+  assert.deepEqual(notRequestedSnapshot, { collected: false, status: "not-collected", endpoint: null, error: null, reason: "not_requested" });
 });
 
 test("exportBoxAuditBundle records truncated snapshots without counting them as errors", async () => {
@@ -1654,6 +1781,96 @@ test("exportBoxAuditBundle records truncated snapshots without counting them as 
   assert.match(executive, /## Truncated Datasets/);
   assert.match(executive, /raise user_limit/);
   assert.doesNotMatch(executive, /Partial Collection Warnings/);
+});
+
+const MULTI_INVENTORY_CASES = [
+  { id: "BOX-02", assess: assessBoxIdentityAccess, secondary: "listUsers", names: /users/ },
+  { id: "BOX-02", assess: assessBoxIdentityAccess, secondary: "getEnterpriseConfiguration", names: /MFA settings/ },
+  { id: "BOX-03", assess: assessBoxIdentityAccess, secondary: "listUsers", names: /users/ },
+  { id: "BOX-03", assess: assessBoxIdentityAccess, secondary: "getEnterpriseConfiguration", names: /MFA settings/ },
+  { id: "BOX-24", assess: assessBoxIdentityAccess, secondary: "listEnterpriseEvents", names: /events were unreadable/ },
+  { id: "BOX-24", assess: assessBoxIdentityAccess, secondary: "listUsers", names: /users were unreadable/ },
+  // The stub client's errors carry no request label, so the summaries name the inventory alone; the endpoint text
+  // appears only when a real request failed (covered by the HTTP fixture tests below).
+  { id: "BOX-04", assess: assessBoxSharingCollaboration, secondary: "listCollaborationAllowlistEntries", names: /collaboration_allowlist_entries could not be read/ },
+  { id: "BOX-05", assess: assessBoxSharingCollaboration, secondary: "listCollaborationAllowlistExemptTargets", names: /collaboration_allowlist_exempt_targets could not be read/ },
+  { id: "BOX-05", assess: assessBoxSharingCollaboration, secondary: "getEnterpriseConfiguration", names: /enterprise_configuration \(content_and_sharing\) could not be read/ },
+  { id: "BOX-12", assess: assessBoxDataGovernance, secondary: "listRetentionPolicyAssignments", names: /retention_policy_assignments could not be read/ },
+  { id: "BOX-13", assess: assessBoxDataGovernance, secondary: "listLegalHoldPolicyAssignments", names: /legal_hold_policy_assignments could not be read/ },
+  { id: "BOX-15", assess: assessBoxShieldMonitoring, secondary: "listShieldInformationBarrierSegments", names: /shield_information_barrier_segments could not be read/ },
+  { id: "BOX-25", assess: assessBoxShieldMonitoring, secondary: "getEnterpriseConfiguration", names: /enterprise_configuration \(shield\) could not be read/ },
+  { id: "BOX-25", assess: assessBoxShieldMonitoring, secondary: "listEnterpriseEvents", names: /enterprise_events could not be read/ },
+];
+
+test("verdict rule 1 corollary: Box findings that read several inventories never pass while a secondary inventory is forbidden", async () => {
+  for (const testCase of MULTI_INVENTORY_CASES) {
+    const baseline = findingById(await testCase.assess(createStubClient(hardenedFixture())), testCase.id);
+    assert.equal(baseline.status, "pass", `${testCase.id} must pass on the hardened fixture so the demotion below is meaningful`);
+
+    const degraded = await testCase.assess(createStubClient(hardenedFixture(), { [testCase.secondary]: forbidden("scope missing") }));
+    const found = findingById(degraded, testCase.id);
+    assert.notEqual(found.status, "pass", `${testCase.id} passed while ${testCase.secondary} returned 403: ${found.summary}`);
+    assert.ok(["warn", "manual"].includes(found.status), `${testCase.id} should be warn or manual, got ${found.status}`);
+    assert.match(found.summary, testCase.names, `${testCase.id} summary must name the unreadable inventory when ${testCase.secondary} is forbidden`);
+    assert.ok(found.manualEvidence, `${testCase.id} must tell a human what evidence to collect`);
+    assert.ok(degraded.errors.some((entry) => /scope missing/.test(entry)), "the 403 is also disclosed in the errors array");
+  }
+});
+
+const BOX_FAKE_SECRETS = [
+  "FAKE_SECRET_TOKEN_1",
+  "FAKE_SECRET_TOKEN_2",
+  "FAKE_SECRET_TOKEN_3",
+  "FAKE_SECRET_TOKEN_4",
+  "FAKE_SECRET_TOKEN_5",
+  "FAKE_SECRET_TOKEN_6",
+  "FAKE_SECRET_TOKEN_7",
+];
+
+function secretBearingFixture() {
+  const fixture = hardenedFixture();
+  fixture.events[0].additional_details = { shared_link: "https://app.box.com/s/FAKE_SECRET_TOKEN_1", access_token: "FAKE_SECRET_TOKEN_2" };
+  fixture.users[1].tracking_codes = [{ type: "tracking_code", name: "api_token", value: "FAKE_SECRET_TOKEN_3" }];
+  fixture.configuration.security.sso_shared_secret = item("FAKE_SECRET_TOKEN_4");
+  fixture.shieldLists[1].content.integrations[0].client_secret = "FAKE_SECRET_TOKEN_5";
+  fixture.retentionPolicies[0].notification_webhook = "https://hooks.example.com/notify?token=FAKE_SECRET_TOKEN_6&policy=retention-1";
+  fixture.groups[0].provisioning_password = "FAKE_SECRET_TOKEN_7";
+  return fixture;
+}
+
+test("verdict rule 9: the Box bundle and its zip never carry credential-shaped values from any collected object", async () => {
+  const base = createTempBase("grclanker-box-export-secrets-");
+  const result = await exportBoxAuditBundle(createStubClient(secretBearingFixture()), sampleConfig(), base);
+
+  const files = readBundleFiles(result.outputDir);
+  assert.ok(files.size >= 40, `expected the full bundle layout, got ${files.size} files`);
+  assertSecretsAbsent(assert, files, BOX_FAKE_SECRETS, "bundle directory");
+  const zipEntries = readZipEntries(result.zipPath);
+  assert.equal(zipEntries.size, files.size, "every written file is archived");
+  assertSecretsAbsent(assert, zipEntries, BOX_FAKE_SECRETS, "zip archive");
+
+  const events = JSON.parse(files.get("core_data/enterprise_events_activity.json"));
+  assert.ok(events.length > 0);
+  assert.ok(events.every((event) => event.additional_details === undefined), "events are projected to the fields the verdicts read");
+  assert.equal(events[0].event_type, "ADMIN_LOGIN");
+  assert.equal(events[0].created_by.id, "admin-1");
+
+  const users = JSON.parse(files.get("core_data/users.json"));
+  assert.deepEqual(users[1].tracking_codes, [{ type: "tracking_code", name: "api_token", value: "[REDACTED]" }], "pair-shaped credentials keep their name and lose their value");
+  const configuration = JSON.parse(files.get("core_data/enterprise_configuration.json"));
+  assert.equal(configuration.security.sso_shared_secret, "[REDACTED]");
+  assert.equal(configuration.security.is_multi_factor_auth_required.value, true, "non-credential settings are untouched");
+  const shieldLists = JSON.parse(files.get("core_data/shield_lists.json"));
+  assert.equal(shieldLists[1].content.integrations[0].client_secret, "[REDACTED]");
+  assert.equal(shieldLists[1].content.integrations[0].id, "app-1");
+  const retention = JSON.parse(files.get("core_data/retention_policies.json"));
+  assert.equal(retention[0].notification_webhook, "https://hooks.example.com/notify?token=[REDACTED]&policy=retention-1");
+  const groups = JSON.parse(files.get("core_data/groups.json"));
+  assert.equal(groups[0].provisioning_password, "[REDACTED]");
+
+  const findings = JSON.parse(files.get("analysis/findings.json"));
+  assert.equal(findings.filter((entry) => entry.status === "pass").length, JSON.parse(readFileSync(join(result.outputDir, "analysis/summary.json"), "utf8")).status_counts.pass);
+  assert.equal(result.errorCount, 0, "redaction never counts as a collection error");
 });
 
 test("resolveSecureOutputPath rejects traversal and symlink parents", () => {

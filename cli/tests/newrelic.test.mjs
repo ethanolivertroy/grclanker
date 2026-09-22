@@ -1,5 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import fs from "node:fs";
 import {
   existsSync,
   mkdirSync,
@@ -9,11 +10,13 @@ import {
   symlinkSync,
   writeFileSync,
 } from "node:fs";
+import { syncBuiltinESMExports } from "node:module";
 import { tmpdir } from "node:os";
 import { join, relative } from "node:path";
 import { inflateRawSync } from "node:zlib";
 import { parse as parseYaml } from "yaml";
 
+import { ConfigFileError, readYamlConfig } from "../dist/extensions/grc-tools/hardening/index.js";
 import {
   API_KEY_DOCUMENTED_ONLY_NOTE,
   NEWRELIC_CLIENT_SURFACE_METHODS,
@@ -30,6 +33,7 @@ import {
   compactCause,
   exportNewrelicAuditBundle,
   projectRecord,
+  registerNewrelicTools,
   resolveNewrelicConfiguration,
   resolveSecureOutputPath,
   scrubErrorText,
@@ -503,6 +507,183 @@ test("resolveNewrelicConfiguration never echoes a malformed config line and keep
     () => resolveNewrelicConfiguration({ api_key: TEST_KEY, region: keyCanary }, {}, home),
     (error) => error instanceof Error && /^Unsupported New Relic region "NRAK-\[REDACTED\]"\. Use US or EU\.$/.test(error.message),
   );
+});
+
+// Replaces one node:fs function while `run` executes. syncBuiltinESMExports makes the dist module's named import see
+// the stub, and the original is restored (and synced back) whether or not `run` throws.
+async function withFsStub(name, stub, run) {
+  const original = fs[name];
+  fs[name] = (...args) => stub(original, ...args);
+  syncBuiltinESMExports();
+  try {
+    return await run();
+  } finally {
+    fs[name] = original;
+    syncBuiltinESMExports();
+  }
+}
+
+function thrownBy(fn) {
+  try {
+    fn();
+    return undefined;
+  } catch (error) {
+    return error;
+  }
+}
+
+function registeredNewrelicTools() {
+  const tools = new Map();
+  registerNewrelicTools({ registerTool: (tool) => tools.set(tool.name, tool) });
+  return tools;
+}
+
+test("resolveNewrelicConfiguration treats the config path as caller text: a config-file failure carries neither a path canary nor a bad-line canary in its message or its fields, a non-standard read failure leaks nothing, and the happy path loads", async () => {
+  // NRAK- followed by 40 base64 characters, planted as a directory name so it reaches the path of every config-file error.
+  const pathCanary = "NRAK-Q7mZ2pX9vB4nR8tK1wL6yH3sD5fG0jA2cE7uV9xNb1";
+  const lineCanary = "NRAK-LINECANARY9f3a1c7d2e4b6a8c0d";
+  const bearerCanary = "LINEBEARERCANARY7f3a9c1d2e4b";
+  const malformedLine = `api_key: ${lineCanary}: Bearer ${bearerCanary}`;
+  const configText = `region: US\n${malformedLine}\naccount_id: 777\n`;
+  const root = createTempBase("grclanker-newrelic-config-path-canary-");
+  const home = join(root, pathCanary);
+  mkdirSync(join(home, ".newrelic-sec-inspector"), { recursive: true });
+  const defaultPath = join(home, ".newrelic-sec-inspector", "config.yaml");
+  const explicitPath = join(home, "inspector.yaml");
+  writeFileSync(defaultPath, configText);
+  writeFileSync(explicitPath, configText);
+  const forbidden = [pathCanary, lineCanary, bearerCanary, "Q7mZ2pX9", "LINECANARY", "LINEBEARER", "Bearer", "Nested mappings", malformedLine];
+  /** Everything a caller can read off the error: the message, the string form, and every own property (the stack included). */
+  const exposed = (error) => [error.message, String(error), ...Object.getOwnPropertyNames(error).map((name) => `${name}=${String(error[name])}`)].join("\n");
+  const assertNoCanary = (text, label) => {
+    for (const value of forbidden) assert.ok(!text.includes(value), `${label}: carries ${JSON.stringify(value)}: ${text}`);
+  };
+
+  // Controls: the shared loader's own error carries the raw path in both its message and its path property, and the
+  // parser's message carries the bad line, so passing either through unchanged would leak the canaries.
+  const loaderError = thrownBy(() => readYamlConfig(explicitPath, { label: "New Relic" }));
+  assert.ok(loaderError instanceof ConfigFileError, "control: the loader throws ConfigFileError");
+  assert.ok(loaderError.message.includes(pathCanary) && loaderError.path === explicitPath, "control: the loader's error carries the raw path");
+  assert.ok(thrownBy(() => parseYaml(configText)).message.includes(lineCanary), "control: the parser message carries the bad line");
+
+  for (const [label, run] of [
+    ["config_file", () => resolveNewrelicConfiguration({ config_file: explicitPath }, {}, home)],
+    ["NEW_RELIC_SEC_INSPECTOR_CONFIG", () => resolveNewrelicConfiguration({}, { NEW_RELIC_SEC_INSPECTOR_CONFIG: explicitPath }, home)],
+    ["default location", () => resolveNewrelicConfiguration({}, {}, home)],
+  ]) {
+    const thrown = thrownBy(run);
+    assert.ok(thrown instanceof Error, `${label}: a malformed config throws`);
+    assert.equal(thrown.name, "NewrelicConfigFileError", label);
+    assert.ok(!(thrown instanceof ConfigFileError), `${label}: the loader's error does not escape`);
+    // The config-loader standard survives: fixed text, the scrubbed path, the parser's position, and its code.
+    assert.match(thrown.message, /^Unable to parse New Relic config file: invalid YAML in \/.*\/NRAK-\[REDACTED\]\/(?:inspector|\.newrelic-sec-inspector\/config)\.yaml at line 2, column 10 \(BLOCK_AS_IMPLICIT_KEY\)$/, label);
+    assert.equal(thrown.kind, "parse", label);
+    assert.equal(thrown.format, "YAML", label);
+    assert.equal(thrown.code, "BLOCK_AS_IMPLICIT_KEY", label);
+    assert.equal(thrown.line, 2, label);
+    assert.equal(thrown.column, 10, label);
+    assert.match(thrown.path, /^\/.*\/NRAK-\[REDACTED\]\/(?:inspector|\.newrelic-sec-inspector\/config)\.yaml$/, `${label}: the path property is scrubbed too`);
+    assert.ok(!thrown.message.includes(":\n"), `${label}: the parser's quoted source block is never appended`);
+    assertNoCanary(exposed(thrown), label);
+  }
+
+  // A read failure: the loader keeps a valid errno code and drops everything else; the path is scrubbed the same way.
+  const directoryPath = join(home, "config-as-directory.yaml");
+  mkdirSync(directoryPath);
+  const directoryError = thrownBy(() => resolveNewrelicConfiguration({ config_file: directoryPath }, {}, home));
+  assert.equal(directoryError.name, "NewrelicConfigFileError");
+  assert.match(directoryError.message, /^Unable to read New Relic config file \/.*\/NRAK-\[REDACTED\]\/config-as-directory\.yaml \(EISDIR\)$/);
+  assert.equal(directoryError.kind, "read");
+  assert.equal(directoryError.code, "EISDIR");
+  assert.equal(directoryError.line, undefined);
+  assertNoCanary(exposed(directoryError), "directory");
+  for (const wording of ["illegal operation", "EISDIR:", "on a directory", ", read"]) assert.ok(!directoryError.message.includes(wording), `no fs wording ${wording}`);
+
+  // A read failure with a non-standard thrown value, then an Error subclass with a valid code: nothing from either
+  // reaches the thrown error or the tool result beyond the fixed text, the scrubbed path, and the validated code.
+  const validPath = join(home, "valid.yaml");
+  writeFileSync(validPath, "api_key: NRAK-FILEKEY000000000000000000\naccount_id: 777\nregion: EU\n");
+  const nonStandardFields = ["NONSTD-CODE-CANARY", "NONSTD-MSG-CANARY", "NONSTD-FIELD-CANARY", "NONSTD-TOSTRING-CANARY"];
+  const nonStandard = {
+    code: "NONSTD-CODE-CANARY",
+    message: `NONSTD-MSG-CANARY ${validPath}`,
+    field: "NONSTD-FIELD-CANARY",
+    toString() {
+      return "NONSTD-TOSTRING-CANARY";
+    },
+  };
+  class ReadFailure extends Error {
+    constructor() {
+      super(`EACCES: permission denied, open '${validPath}' NONSTD-MSG-CANARY`);
+      this.code = "EACCES";
+      this.field = "NONSTD-FIELD-CANARY";
+    }
+  }
+  const tools = registeredNewrelicTools();
+  const checkAccess = tools.get("newrelic_check_access");
+  let failure = "non-standard object";
+  const [objectError, objectResult, subclassError, subclassResult] = await withFsStub(
+    "readFileSync",
+    (original, pathname, ...rest) => {
+      if (pathname !== validPath) return original(pathname, ...rest);
+      throw failure === "non-standard object" ? nonStandard : new ReadFailure();
+    },
+    async () => {
+      assert.equal(thrownBy(() => readFileSync(validPath, "utf8")), nonStandard, "control: the stub is in place");
+      const direct = thrownBy(() => resolveNewrelicConfiguration({ config_file: validPath }, {}, home));
+      const viaTool = await checkAccess.execute("call-1", checkAccess.prepareArguments({ config_file: validPath }));
+      failure = "Error subclass";
+      const subclass = thrownBy(() => resolveNewrelicConfiguration({ config_file: validPath }, {}, home));
+      const subclassTool = await checkAccess.execute("call-2", checkAccess.prepareArguments({ config_file: validPath }));
+      return [direct, viaTool, subclass, subclassTool];
+    },
+  );
+  assert.equal(objectError.name, "NewrelicConfigFileError");
+  assert.match(objectError.message, /^Unable to read New Relic config file \/.*\/NRAK-\[REDACTED\]\/valid\.yaml$/, "a code outside the errno grammar is dropped");
+  assert.equal(objectError.kind, "read");
+  assert.equal(objectError.code, undefined);
+  assertNoCanary(exposed(objectError), "non-standard object");
+  for (const field of nonStandardFields) assert.ok(!exposed(objectError).includes(field), `${field} reached the thrown error`);
+  assert.equal(objectResult.isError, true);
+  assert.match(objectResult.content[0].text, /^New Relic access check failed: Unable to read New Relic config file \/.*\/NRAK-\[REDACTED\]\/valid\.yaml$/);
+  assert.deepEqual(objectResult.details, { tool: "newrelic_check_access" });
+  for (const field of [...nonStandardFields, ...forbidden]) assert.ok(!JSON.stringify(objectResult).includes(field), `${field} reached the tool result`);
+  assert.match(subclassError.message, /^Unable to read New Relic config file \/.*\/NRAK-\[REDACTED\]\/valid\.yaml \(EACCES\)$/);
+  assert.equal(subclassError.code, "EACCES");
+  assert.equal(subclassResult.isError, true);
+  assert.match(subclassResult.content[0].text, /^New Relic access check failed: Unable to read New Relic config file \/.*\/NRAK-\[REDACTED\]\/valid\.yaml \(EACCES\)$/);
+  for (const value of [...nonStandardFields, ...forbidden, "permission denied", "open '"]) {
+    assert.ok(!exposed(subclassError).includes(value) && !JSON.stringify(subclassResult).includes(value), `${value} reached the error or the tool result`);
+  }
+
+  // The key configured by argument or environment is a known secret for the config-file error: a path that embeds it
+  // is scrubbed by exact match. The probe value has no digits and one case, so no shape rule catches it on its own.
+  const embeddedKey = "lowercasekeyvalue";
+  assert.equal(scrubErrorText(`/${embeddedKey}/config.yaml`), `/${embeddedKey}/config.yaml`, "control: the shape rules alone keep the probe");
+  const keyDir = join(home, embeddedKey);
+  mkdirSync(keyDir);
+  writeFileSync(join(keyDir, "config.yaml"), configText);
+  for (const [label, input, env] of [
+    ["argument", { config_file: join(keyDir, "config.yaml"), api_key: embeddedKey }, {}],
+    ["environment", { config_file: join(keyDir, "config.yaml") }, { NEW_RELIC_API_KEY: embeddedKey }],
+  ]) {
+    const thrown = thrownBy(() => resolveNewrelicConfiguration(input, env, home));
+    assert.match(thrown.message, /invalid YAML in \/.*\/NRAK-\[REDACTED\]\/\[REDACTED\]\/config\.yaml at line 2, column 10 \(BLOCK_AS_IMPLICIT_KEY\)$/, label);
+    assert.match(thrown.path, /\/NRAK-\[REDACTED\]\/\[REDACTED\]\/config\.yaml$/, label);
+    assert.ok(!exposed(thrown).includes(embeddedKey), `${label}: the configured key is scrubbed from the path`);
+  }
+
+  // The happy path under the same directory still loads, and the raw path stays available to the resolved config.
+  const loaded = resolveNewrelicConfiguration({ config_file: validPath }, {}, home);
+  assert.equal(loaded.apiKey, "NRAK-FILEKEY000000000000000000");
+  assert.deepEqual(loaded.accountIds, [777]);
+  assert.equal(loaded.region, "EU");
+  assert.ok(loaded.sourceChain.includes(`config:${validPath}`));
+  const fromDefault = (() => {
+    writeFileSync(defaultPath, "api_key: NRAK-DEFAULTKEY0000000000000000\n");
+    return resolveNewrelicConfiguration({}, {}, home);
+  })();
+  assert.equal(fromDefault.apiKey, "NRAK-DEFAULTKEY0000000000000000");
 });
 
 test("NewrelicApiClient posts NerdGraph queries with the Api-Key header and follows nextCursor pagination", async () => {
