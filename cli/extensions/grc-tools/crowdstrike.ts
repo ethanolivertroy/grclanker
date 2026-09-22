@@ -2251,16 +2251,21 @@ function evaluateContainment(hosts: CollectedDataset<CrowdstrikePage<JsonRecord>
   });
   const undated = contained.filter((host) => host.hours_since_status_change === undefined).length;
   const aged = contained.filter((host) => (host.hours_since_status_change ?? 0) > maxContainmentHours);
-  const status: CrowdstrikeFinding["status"] = contained.length === 0 ? "pass" : "warn";
+  const partial = partialInventory(hosts.data, "contained hosts");
+  // Emptiness is compliant only for a complete read; a truncated page with no visible match cannot rule
+  // containment out for the unread rows, so the absence sentence is not emitted and pass is withheld.
+  const status: CrowdstrikeFinding["status"] = contained.length === 0 && !partial ? "pass" : "warn";
   const base = finding(
     "CS-23",
     status,
     contained.length === 0
-      ? "The Hosts API was readable and the containment status filter returned no hosts, so there is no active containment to document; emptiness is compliant for this control."
+      ? partial
+        ? "The containment status filter read was truncated before any matching host was visible, so active containment cannot be confirmed or ruled out from the visible rows; document each containment and its incident reference."
+        : "The Hosts API was readable and the containment status filter returned no hosts, so there is no active containment to document; emptiness is compliant for this control."
       : `${contained.length} hosts are network contained or pending containment changes${aged.length > 0 ? `, ${aged.length} for more than ${maxContainmentHours} hours (based on last host record change)` : ""}; document each containment and its incident reference.`,
     { contained_hosts: contained.length, aged_over_hours: maxContainmentHours, hosts: contained.slice(0, 50) },
   );
-  return withPartialInventory(withUndatedItems(base, undated, "contained hosts", "modified_timestamp"), [partialInventory(hosts.data, "contained hosts")]);
+  return withPartialInventory(withUndatedItems(base, undated, "contained hosts", "modified_timestamp"), [partial]);
 }
 
 const ALERT_SNAPSHOT_FIELDS = [
@@ -3165,12 +3170,12 @@ function evaluateLeastPrivilege(views: UserView[], maxRoles: number, staleLoginD
   });
   const undatedPrivileged = admins.filter((view) => parseTimestamp(view.last_login_at) === undefined);
   const status: CrowdstrikeFinding["status"] = stalePrivileged.length > 0 ? "fail" : overprivileged.length > 0 ? "warn" : "pass";
+  // Scoped to the users that were read: under a truncated user list the partial-inventory clause names the
+  // unread rows, so the sentence never asserts an absence across users it did not see.
   const base = finding(
     "CS-17",
     status,
-    status === "pass"
-      ? `No user exceeds ${maxRoles} roles or stacks extra roles on an admin grant, and every dated admin login is within ${staleLoginDays} days.`
-      : `${overprivileged.length} users carry more than ${maxRoles} roles or redundant roles on top of admin, and ${stalePrivileged.length} admin accounts have a last login older than ${staleLoginDays} days.`,
+    `${views.length} users reviewed; ${overprivileged.length} carry more than ${maxRoles} roles or redundant roles on top of an admin grant, and ${stalePrivileged.length} of ${admins.length} admin accounts have a last login older than ${staleLoginDays} days.`,
     {
       users_reviewed: views.length,
       max_roles_per_user: maxRoles,

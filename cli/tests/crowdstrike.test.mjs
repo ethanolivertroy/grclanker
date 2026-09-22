@@ -2211,6 +2211,82 @@ test("review round item 5: a capped prevention policy list never asserts platfor
   assert.equal(findingById(cappedFirewall, "CS-11").evidence.absence_claim, true);
 });
 
+/** Wording that asserts an absence across rows the finding did not read; a capped list must never carry it. */
+const UNIVERSAL_ABSENCE = /\bNo user\b|\bevery dated admin login\b|\breturned no hosts\b|\bno active containment\b|\bemptiness is compliant\b|\bnothing to\b/;
+
+test("round 2 SEND BACK 5: under a capped list CS-17 and CS-23 scope their sentences to the rows that were read and never assert a universal absence; a complete read keeps its counts and the emptiness sentence", async () => {
+  // CS-17 under CAP listUserUuids: 1 of 43 user uuids visible, the visible user an admin with a fresh login.
+  const users = passingUsers();
+  const cappedUsers = await assessCrowdstrikeAccessGovernance(createFakeClient({
+    listUserUuids: async () => truncatedPage(["u-admin"], 43),
+    getUsers: async (uuids) => users.users.filter((user) => uuids.includes(user.uuid)),
+  }));
+  const leastPrivilege = findingById(cappedUsers, "CS-17");
+  assert.equal(leastPrivilege.status, "warn");
+  assert.equal(leastPrivilege.evidence.users_reviewed, 1);
+  assert.deepEqual(leastPrivilege.evidence.partial_inventory, [{ dataset: "users", seen: 1, total: 43 }]);
+  assert.equal(
+    leastPrivilege.summary,
+    "1 users reviewed; 0 carry more than 5 roles or redundant roles on top of an admin grant, and 0 of 1 admin accounts have a last login older than 90 days. Partial inventory: only 1 of 43 users were read (sampled or truncated), so this verdict cannot exceed warn.",
+  );
+  assert.doesNotMatch(leastPrivilege.summary, UNIVERSAL_ABSENCE);
+
+  // Control: a complete read keeps the count-scoped sentence over the whole inventory and passes without a partial clause.
+  const completeUsers = await assessCrowdstrikeAccessGovernance(createFakeClient());
+  const completeLeastPrivilege = findingById(completeUsers, "CS-17");
+  assert.equal(completeLeastPrivilege.status, "pass");
+  assert.equal(completeLeastPrivilege.summary, "2 users reviewed; 0 carry more than 5 roles or redundant roles on top of an admin grant, and 0 of 1 admin accounts have a last login older than 90 days.");
+  assert.equal(completeLeastPrivilege.evidence.partial_inventory, undefined);
+  assert.doesNotMatch(completeLeastPrivilege.summary, UNIVERSAL_ABSENCE);
+
+  // A stale admin observed on a visible row still fails under the cap, and the sentence stays count-scoped.
+  const staleCapped = await assessCrowdstrikeAccessGovernance(createFakeClient({
+    listUserUuids: async () => truncatedPage(["u-admin"], 43),
+    getUsers: async () => [{ uuid: "u-admin", uid: "alice@example.com", status: "active", last_login_at: isoDaysAgo(120) }],
+  }));
+  const staleLeastPrivilege = findingById(staleCapped, "CS-17");
+  assert.equal(staleLeastPrivilege.status, "fail", "a fail observed on a visible row stands under a cap");
+  assert.match(staleLeastPrivilege.summary, /^1 users reviewed; 0 carry more than 5 roles or redundant roles on top of an admin grant, and 1 of 1 admin accounts have a last login older than 90 days\. Partial inventory: only 1 of 43 users were read/);
+
+  // CS-23 under CAP listHosts: the containment status filter reports 40 hosts and none is visible.
+  const cappedHosts = await assessCrowdstrikeResponseReadiness(createFakeClient({
+    listHosts: async (_limit, filter) => (filter ? truncatedPage([], 40) : [host()]),
+  }));
+  const containment = findingById(cappedHosts, "CS-23");
+  assert.equal(containment.status, "warn");
+  assert.equal(containment.evidence.contained_hosts, 0);
+  assert.deepEqual(containment.evidence.partial_inventory, [{ dataset: "contained hosts", seen: 0, total: 40 }]);
+  assert.equal(
+    containment.summary,
+    "The containment status filter read was truncated before any matching host was visible, so active containment cannot be confirmed or ruled out from the visible rows; document each containment and its incident reference. Partial inventory: only 0 of 40 contained hosts were read (sampled or truncated), so this verdict cannot exceed warn.",
+  );
+  assert.doesNotMatch(containment.summary, UNIVERSAL_ABSENCE);
+
+  // A visible contained host under the cap keeps the count-scoped sentence and the partial clause.
+  const cappedContained = await assessCrowdstrikeResponseReadiness(createFakeClient({
+    listHosts: async (_limit, filter) => (filter ? truncatedPage([host({ hostname: "contained-01", status: "contained" })], 40) : [host()]),
+  }));
+  assert.equal(findingById(cappedContained, "CS-23").status, "warn");
+  assert.match(findingById(cappedContained, "CS-23").summary, /^1 hosts are network contained or pending containment changes; document each containment and its incident reference\. Partial inventory: only 1 of 40 contained hosts were read/);
+
+  // Control: a complete read with no contained hosts keeps the emptiness sentence and passes.
+  const completeHosts = await assessCrowdstrikeResponseReadiness(createFakeClient());
+  const completeContainment = findingById(completeHosts, "CS-23");
+  assert.equal(completeContainment.status, "pass");
+  assert.equal(completeContainment.summary, "The Hosts API was readable and the containment status filter returned no hosts, so there is no active containment to document; emptiness is compliant for this control.");
+  assert.equal(completeContainment.evidence.partial_inventory, undefined);
+
+  // The full capped run (every paged read truncated) carries no universal absence sentence on either finding.
+  const partialRun = await runAllCrowdstrikeAssessments(createPartialClient());
+  for (const id of ["CS-17", "CS-23"]) {
+    const item = partialRun.flatMap((assessment) => assessment.findings).find((entry) => entry.id === id);
+    assert.ok(item, `expected finding ${id}`);
+    assert.notEqual(item.status, "pass");
+    assert.doesNotMatch(item.summary, UNIVERSAL_ABSENCE, `${id} under the partial client: ${item.summary}`);
+    assert.match(item.summary, /Partial inventory: only \d+ of \d+ /);
+  }
+});
+
 // Addendum 4: on every Falcon surface, a 502 HTML body or a JSON error embedding a credential URL never reaches
 // tool results, findings, summaries, or the bundle; the recorded error carries a status-and-length note instead.
 
