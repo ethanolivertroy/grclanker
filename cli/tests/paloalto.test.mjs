@@ -1856,7 +1856,8 @@ function echoedSecretsMessage(forms) {
 }
 
 test("a documented error field is scrubbed of the configured secrets before it is shortened, so the 200-character cut never leaves a fragment of a secret", async () => {
-  const forms = [...secretForms(FIXTURE_SECRET_KEY), ...secretForms("k")].filter((form) => form.length >= 8);
+  // The one-character access key id has no form long enough to straddle the cut or to hold a leak window.
+  const forms = [...secretForms(FIXTURE_SECRET_KEY), ...secretForms("k")].filter((form) => form.length >= LEAK_WINDOW_MIN);
   for (const form of forms) {
     // The form straddles the 200-character boundary of the shortened field: scrubbing
     // after the cut would leave its head behind.
