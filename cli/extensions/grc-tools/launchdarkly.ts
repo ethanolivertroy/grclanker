@@ -699,6 +699,9 @@ export class LaunchdarklyApiError extends Error {
 export const LAUNCHDARKLY_FOREIGN_ORIGIN_MESSAGE =
   "LaunchDarkly next link points to an origin other than the configured base URL, so it was not followed and no request was sent";
 
+/** A link that names its own scheme (RFC 3986 scheme characters, any case) and so is not a path on the configured base. */
+const ABSOLUTE_LINK_PATTERN = /^[a-z][a-z0-9+.-]*:/i;
+
 /** Thrown before a request is built when a server-supplied link resolves outside the configured base origin. */
 export class LaunchdarklyForeignOriginError extends Error {
   constructor() {
@@ -1410,7 +1413,9 @@ export class LaunchdarklyApiClient {
    */
   private buildUrl(pathOrUrl: string, query: JsonRecord = {}): string {
     const base = new URL(`${this.config.baseUrl}/`);
-    const url = pathOrUrl.startsWith("http://") || pathOrUrl.startsWith("https://")
+    // Any scheme prefix (in any case, with / or \ after the colon) is an absolute link judged by its own origin; everything
+    // else is a path on the base, where the WHATWG parser also turns leading // /// /\ and \\ into an authority.
+    const url = ABSOLUTE_LINK_PATTERN.test(pathOrUrl)
       ? new URL(pathOrUrl)
       : new URL(pathOrUrl.startsWith("/") ? pathOrUrl : `/${pathOrUrl}`, base);
     if (url.origin !== base.origin) throw new LaunchdarklyForeignOriginError();
@@ -4462,7 +4467,7 @@ function buildQuickReference(): string {
     "",
     "- `core_data/` contains LaunchDarkly REST API v2 snapshots: credential-shaped keys (SDK, mobile, relay, and API keys, webhook and integration secrets) are written as [REDACTED], destination URLs are reduced to scheme plus host, and flags are projected to the fields the verdicts read.",
     "- A listing that was read carries `collected: true`, the request it made as `endpoint`, `truncated`, `seen`, `total`, and `items` (an empty inventory stays `items: []`); `truncation_reason` is present only when paging stopped for a reason other than the cap, such as a server-supplied `_links.next.href` whose origin differed from the configured base URL (the client refuses such a link with fixed text and sends no request to it). A listing that was denied, errored, or timed out is a marker object, never an empty array: `collected: false`, the HTTP `status` observed (or `error`), the `endpoint` that failed, the scrubbed `error`, and `null` for every flag and count. A listing that was never requested because its parent inventory was unreadable is a `status: \"not-collected\"` marker. Listings collected per team, environment, or integration are arrays with one entry per scope, collapsing to a single marker when no scope could be read.",
-    "- `core_data/collection_status.json` records, per listing (`inventories[]`), whether the read completed, the request and HTTP status of a failed read, how the read ended (complete or truncated at a cap), how many records were loaded, and the server total when the API exposes one; every flag and count is `null` for a read that did not complete, and `totals` counts those reads as unknown rather than as complete or untruncated.",
+    "- `core_data/collection_status.json` records, per listing (`inventories[]`), whether the read completed, the request and HTTP status of a failed read, how the read ended (complete or truncated at a cap), `truncation_reason` when a truncated read stopped for a reason other than its cap (otherwise `null`), how many records were loaded, and the server total when the API exposes one; every flag and count is `null` for a read that did not complete, and `totals` counts those reads as unknown rather than as complete or untruncated.",
     "- Error strings in every file are scrubbed before they are recorded (LaunchDarkly key shapes, authorization and cookie values, credential-shaped key/value pairs, JWTs, and URL userinfo and query strings anywhere in the text); non-JSON error bodies are described by status, content type, and length, never echoed.",
     "- Finding evidence, assessment summaries, and analysis snapshots render `null` (never 0, [], or \"none\") for any count, list, or flag derived from an inventory that was not read; lists of named members, tokens, roles, environments, or flags are populated only from inventories that were actually read, and an empty list is asserted only from complete reads.",
     "- Every HTTP status code and request label (method plus path and query) named in a finding, summary, access check surface, or error string is the request the run actually made and the response it observed.",
@@ -4494,6 +4499,8 @@ interface LaunchdarklyCollectionStatusRow {
   error: string | null;
   complete: boolean | null;
   truncated: boolean | null;
+  /** Why a truncated read stopped when the cause was not its cap (a refused next link); null for a complete, capped, or failed read. */
+  truncation_reason: string | null;
   seen: number | null;
   total: number | null;
 }
@@ -4512,6 +4519,7 @@ function collectionStatusRow(inventory: string, record: JsonRecord): Launchdarkl
     error: asString(record.error) ?? null,
     complete: collected ? asBoolean(record.truncated) !== true : null,
     truncated: collected ? asBoolean(record.truncated) === true : null,
+    truncation_reason: collected && asBoolean(record.truncated) === true ? asString(record.truncation_reason) ?? null : null,
     seen: collected ? asNumber(record.seen) ?? null : null,
     total: collected ? asNumber(record.total) ?? null : null,
   };
