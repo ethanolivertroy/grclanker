@@ -1,6 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import {
+  chmodSync,
   existsSync,
   mkdirSync,
   mkdtempSync,
@@ -9,6 +10,7 @@ import {
   symlinkSync,
   writeFileSync,
 } from "node:fs";
+import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -20,9 +22,17 @@ import {
   assessZendeskDataProtection,
   assessZendeskIntegrations,
   checkZendeskAccess,
+  configuredZendeskSecrets,
+  describeErrorBody,
   exportZendeskAuditBundle,
+  isCredentialKey,
   isCredentialPropertyName,
+  redactConfiguredSecrets,
   redactCredentialProperties,
+  redactCredentialValueText,
+  redactErrorText,
+  redactSecrets,
+  registerZendeskTools,
   resolveSecureOutputPath,
   resolveZendeskConfiguration,
 } from "../dist/extensions/grc-tools/zendesk.js";
@@ -40,13 +50,76 @@ function createTempBase(prefix) {
   return mkdtempSync(join(tmpdir(), prefix));
 }
 
+// The configured API token of the fixtures, which only the configured-secret pass
+// (guard 2) removes: it is deliberately name-shaped, so bare in prose no carrier or
+// token-shape rule touches it and its absence proves that pass ran. Its words appear
+// nowhere in the module's own vocabulary, and no 6-character window of it does either
+// (source_chain renders "api-token:environment", so "api-token" is out).
+const FIXTURE_API_TOKEN = "fixture-teal-harbor-2026";
+// The composed Basic credential the client sends for the fixture configuration.
+const FIXTURE_BASIC_CREDENTIAL = Buffer.from(`auditor@example.com/token:${FIXTURE_API_TOKEN}`).toString("base64");
+
+// The forms a configured secret can be echoed in: as is, JSON-escaped, URL-encoded, base64, base64url.
+function secretForms(value) {
+  return [...new Set([value, JSON.stringify(value).slice(1, -1), encodeURIComponent(value), Buffer.from(value).toString("base64"), Buffer.from(value).toString("base64url")])];
+}
+
+// The window rule (addendum 8): every leak assertion against a planted credential checks
+// the whole value and every window of it from LEAK_WINDOW_MIN to LEAK_WINDOW_MAX characters,
+// so a partial echo (the 10-character window JSON.parse quotes, a token cut by a length cap,
+// the head of a base64 form split by a marker) cannot pass. The planted values are alphanumeric
+// and random-looking, and the fixture self-check below proves that no 6-character window of
+// any of them occurs in the fixtures' legitimate text, so every failure is a real leak.
+const LEAK_WINDOW_MIN = 6;
+const LEAK_WINDOW_MAX = 24;
+const leakWindowCache = new Map();
+
+// The whole value plus every window of LEAK_WINDOW_MIN to LEAK_WINDOW_MAX characters, longest
+// first so a failure names the largest fragment that survived, and the shortest windows on
+// their own: a longer window contains its own first LEAK_WINDOW_MIN characters, so every
+// window is absent exactly when the whole value and every shortest window are.
+function leakWindows(canary) {
+  let entry = leakWindowCache.get(canary);
+  if (entry === undefined) {
+    const all = [canary];
+    for (let size = Math.min(LEAK_WINDOW_MAX, canary.length - 1); size >= LEAK_WINDOW_MIN; size -= 1) {
+      for (let index = 0; index + size <= canary.length; index += 1) all.push(canary.slice(index, index + size));
+    }
+    const shortest = Math.min(LEAK_WINDOW_MIN, canary.length);
+    entry = { all: [...new Set(all)], probes: [...new Set(all.filter((window) => window.length === shortest))] };
+    leakWindowCache.set(canary, entry);
+  }
+  return entry;
+}
+
+// Neither the canary nor any window of it from 6 to 24 characters may survive in the text.
+function assertNoWindow(text, canary, label) {
+  const { all, probes } = leakWindows(canary);
+  if (!probes.some((probe) => text.includes(probe))) return;
+  const leaked = all.find((window) => text.includes(window));
+  assert.fail(leaked === canary ? `${label}: ${canary} leaked` : `${label}: window ${leaked} of ${canary} leaked`);
+}
+
+// Every bundle file or zip entry against every planted secret: the shared whole-value scan, then every window.
+function assertNoSecretWindows(contents, secrets, label) {
+  assertSecretsAbsent(assert, contents, secrets, label);
+  for (const [name, text] of contents) {
+    for (const secret of secrets) assertNoWindow(text, secret, `${label} ${name}`);
+  }
+}
+
+// The 6-character windows of a planted value (the value itself when shorter), for the fixture self-check.
+function sixWindows(value) {
+  return leakWindows(value).probes;
+}
+
 function sampleConfig(overrides = {}) {
   return {
     subdomain: "acme",
     baseUrl: "https://acme.zendesk.com/api/v2",
     authMode: "api_token",
     email: "auditor@example.com",
-    apiToken: "secret-api-token-value",
+    apiToken: FIXTURE_API_TOKEN,
     oauthToken: undefined,
     timeoutMs: 30000,
     sourceChain: ["tests"],
@@ -442,6 +515,32 @@ test("resolveZendeskConfiguration prefers env over config file and falls back to
   assert.equal(fromHome.authMode, "api_token");
 });
 
+test("round 7(b): environment credentials survive an argument overlay that carries unrelated or undefined keys, and the source chain names the environment", () => {
+  const base = createTempBase("grclanker-zendesk-env-overlay-");
+  const configPath = join(base, "config.json");
+  writeFileSync(configPath, JSON.stringify({ subdomain: "file-sub", email: "file@example.com", api_token: "fileW3eR7tY1uI5oP9aS", oauth_token: "fileZ6xC2vB8nM4kL7jH" }));
+  const env = { ZENDESK_CONFIG_FILE: configPath, ZENDESK_SUBDOMAIN: "env-sub", ZENDESK_EMAIL: "env@example.com", ZENDESK_API_TOKEN: "envT8yU3iO6pA1sD4fG9" };
+  // The overlay a tool builds from optional arguments: one unrelated argument plus the
+  // credential keys present but undefined, as a spread of an unfilled schema produces.
+  const overlay = { timeout_seconds: 21, subdomain: undefined, email: undefined, api_token: undefined, oauth_token: undefined, config_file: undefined };
+  const config = resolveZendeskConfiguration(overlay, env, base);
+  assert.equal(config.authMode, "api_token", "the environment's API token wins over the file's OAuth token");
+  assert.equal(config.apiToken, env.ZENDESK_API_TOKEN, "the environment value beats the config file and is not erased by the undefined argument");
+  assert.equal(config.email, "env@example.com");
+  assert.equal(config.subdomain, "env-sub");
+  assert.equal(config.timeoutMs, 21_000, "the unrelated argument still applies");
+  for (const source of ["subdomain:environment", "api-token:environment", "email:environment"]) {
+    assert.ok(config.sourceChain.includes(source), `${source} in ${config.sourceChain.join(", ")}`);
+  }
+  assert.ok(!config.sourceChain.some((source) => source.endsWith(":arguments")), config.sourceChain.join(", "));
+
+  const oauthEnv = { ZENDESK_CONFIG_FILE: configPath, ZENDESK_SUBDOMAIN: "env-sub", ZENDESK_OAUTH_TOKEN: "envQ2wE5rT8yU1iO4pA7" };
+  const oauth = resolveZendeskConfiguration(overlay, oauthEnv, base);
+  assert.equal(oauth.authMode, "oauth");
+  assert.equal(oauth.oauthToken, oauthEnv.ZENDESK_OAUTH_TOKEN);
+  assert.ok(oauth.sourceChain.includes("oauth-token:environment"), oauth.sourceChain.join(", "));
+});
+
 test("resolveZendeskConfiguration selects auth mode and rejects incomplete credentials", () => {
   const base = createTempBase("grclanker-zendesk-config-");
   const both = resolveZendeskConfiguration({}, { ZENDESK_SUBDOMAIN: "acme", ZENDESK_EMAIL: "a@example.com", ZENDESK_API_TOKEN: "tok", ZENDESK_OAUTH_TOKEN: "oauth" }, base);
@@ -457,6 +556,142 @@ test("resolveZendeskConfiguration selects auth mode and rejects incomplete crede
   assert.throws(() => resolveZendeskConfiguration({}, { ZENDESK_SUBDOMAIN: "bad domain!", ZENDESK_OAUTH_TOKEN: "x" }, base), /Invalid Zendesk subdomain/);
 });
 
+// Config loader canaries: no two share a 6-character window, so any fragment a parser
+// quotes from the file is attributable to one fixture. The short canary keeps the JSON
+// short file at 20 characters, within the size at which JSON.parse quotes the whole source.
+const LOADER_CANARIES = {
+  yamlNestedKey: "cnrA1qz8Xw4LpT9vK2mD",
+  yamlNestedBearer: "cnrB5hj3Yn7GsW2rQ8kF",
+  yamlAlias: "cnrC9tb6Um1JdX3eN7wP",
+  jsonUnquoted: "cnrD2vf7Zk5HcR8sL4yG",
+  jsonShort: "cnrE6pm4Qa",
+  jsonMultiline: "cnrF3gk8Wd2ZnT6iM9oJ",
+};
+const LIBRARY_ERROR_WORDING = ["Nested mappings", "is not valid JSON", "Unresolved alias", "illegal operation", "permission denied", "Unexpected token", "Expected ',' or '}'"];
+
+function assertNoLoaderLeak(text, canaries, label) {
+  for (const canary of canaries) assertNoWindow(text, canary, `${label} (${text})`);
+  for (const wording of LIBRARY_ERROR_WORDING) {
+    assert.ok(!text.includes(wording), `${label}: library wording "${wording}" leaked into: ${text}`);
+  }
+}
+
+test("config loader errors carry fixed text, the path, a validated code, and a structured line, never the file contents or library wording", async () => {
+  const base = createTempBase("grclanker-zendesk-loader-errors-");
+  const write = (name, text) => {
+    const pathname = join(base, name);
+    writeFileSync(pathname, text);
+    return pathname;
+  };
+  const tools = new Map();
+  registerZendeskTools({ registerTool: (tool) => tools.set(tool.name, tool) });
+  const check = tools.get("zendesk_check_access");
+  const checkAccessText = async (configFile) => JSON.stringify(await check.execute("call-loader", check.prepareArguments({ config_file: configFile })));
+
+  const cases = [
+    {
+      // Not JSON at all: the parser quotes the first characters of the file.
+      label: "YAML nested mapping",
+      file: write("nested.yaml", `key: ${LOADER_CANARIES.yamlNestedKey}: Bearer ${LOADER_CANARIES.yamlNestedBearer}\n`),
+      canaries: [LOADER_CANARIES.yamlNestedKey, LOADER_CANARIES.yamlNestedBearer],
+      libraryThrows: true,
+      expected: (pathname) => `Unable to parse Zendesk config file: invalid JSON in ${pathname} (INVALID_JSON)`,
+    },
+    {
+      label: "YAML alias",
+      file: write("alias.yaml", `key: *${LOADER_CANARIES.yamlAlias}\n`),
+      canaries: [LOADER_CANARIES.yamlAlias],
+      libraryThrows: true,
+      expected: (pathname) => `Unable to parse Zendesk config file: invalid JSON in ${pathname} (INVALID_JSON)`,
+    },
+    {
+      // The "Unexpected token" family quotes a 10-character window around the failure.
+      label: "JSON unquoted value",
+      file: write("unquoted.json", `{"api_token": ${LOADER_CANARIES.jsonUnquoted}}\n`),
+      canaries: [LOADER_CANARIES.jsonUnquoted],
+      libraryThrows: true,
+      libraryCarriesFragment: true,
+      expected: (pathname) => `Unable to parse Zendesk config file: invalid JSON in ${pathname} (INVALID_JSON)`,
+    },
+    {
+      // At 21 characters or fewer the whole source is quoted, key on a scrub list or not.
+      label: "JSON short file",
+      file: write("short.json", `{"token":${LOADER_CANARIES.jsonShort}}`),
+      canaries: [LOADER_CANARIES.jsonShort],
+      libraryThrows: true,
+      libraryCarriesCanary: true,
+      expected: (pathname) => `Unable to parse Zendesk config file: invalid JSON in ${pathname} (INVALID_JSON)`,
+    },
+    {
+      // The structural family reports a position; only that position becomes a line.
+      label: "JSON missing comma",
+      file: write("multiline.json", `{\n  "subdomain": "acme",\n  "oauth_token": "${LOADER_CANARIES.jsonMultiline}"\n  "email": "a@example.com"\n}\n`),
+      canaries: [LOADER_CANARIES.jsonMultiline],
+      libraryThrows: true,
+      expected: (pathname) => `Unable to parse Zendesk config file: invalid JSON in ${pathname} at line 4 (INVALID_JSON)`,
+    },
+    {
+      label: "EISDIR",
+      file: (() => {
+        const pathname = join(base, "config-dir.json");
+        mkdirSync(pathname);
+        return pathname;
+      })(),
+      canaries: [],
+      libraryThrows: false,
+      expected: (pathname) => `Unable to read Zendesk config file ${pathname} (EISDIR)`,
+    },
+    {
+      label: "ENOENT",
+      file: join(base, "missing.json"),
+      canaries: [],
+      libraryThrows: false,
+      expected: (pathname) => `Unable to read Zendesk config file ${pathname} (ENOENT)`,
+    },
+    ...(process.getuid?.() === 0 ? [] : [{
+      label: "EACCES",
+      file: (() => {
+        const pathname = write("unreadable.json", JSON.stringify({ subdomain: "acme", oauth_token: LOADER_CANARIES.jsonMultiline }));
+        chmodSync(pathname, 0o000);
+        return pathname;
+      })(),
+      canaries: [LOADER_CANARIES.jsonMultiline],
+      libraryThrows: false,
+      expected: (pathname) => `Unable to read Zendesk config file ${pathname} (EACCES)`,
+    }]),
+  ];
+  assert.ok(readFileSync(cases[3].file, "utf8").length <= 20, "the short JSON fixture stays within the size JSON.parse quotes whole");
+
+  for (const entry of cases) {
+    if (entry.libraryThrows) {
+      // Positive control: JSON.parse's own message quotes the file contents.
+      assert.throws(() => JSON.parse(readFileSync(entry.file, "utf8")), (error) => {
+        if (entry.libraryCarriesCanary) assert.ok(error.message.includes(entry.canaries[0]), `${entry.label}: positive control expected the whole canary: ${error.message}`);
+        if (entry.libraryCarriesFragment) assert.ok(error.message.includes(entry.canaries[0].slice(0, 8)), `${entry.label}: positive control expected a canary fragment: ${error.message}`);
+        return true;
+      });
+    }
+    assert.throws(() => resolveZendeskConfiguration({ config_file: entry.file }, {}, base), (error) => {
+      assert.equal(error.message, entry.expected(entry.file), `${entry.label}: resolver message`);
+      assertNoLoaderLeak(error.message, entry.canaries, `${entry.label} resolver`);
+      assert.equal(redactErrorText(error.message), error.message, `${entry.label}: the loader text survives the scrub`);
+      return true;
+    });
+    assert.throws(() => resolveZendeskConfiguration({}, { ZENDESK_CONFIG_FILE: entry.file }, base), (error) => {
+      assert.equal(error.message, entry.expected(entry.file), `${entry.label}: ZENDESK_CONFIG_FILE is an explicit path too`);
+      return true;
+    });
+    const toolText = await checkAccessText(entry.file);
+    assertNoLoaderLeak(toolText, entry.canaries, `${entry.label} check_access`);
+    assert.ok(toolText.includes(entry.expected(entry.file)), `${entry.label}: check_access carries the fixed loader text: ${toolText}`);
+  }
+
+  // The default ~/.zendesk/config.json stays optional: absent means no file settings.
+  assert.throws(() => resolveZendeskConfiguration({}, {}, base), /Zendesk subdomain is required/);
+  const shape = write("list.json", "[1, 2]");
+  assert.throws(() => resolveZendeskConfiguration({ config_file: shape }, {}, base), new RegExp(`Unable to parse Zendesk config file: .* must contain a JSON object \\(INVALID_CONFIG_SHAPE\\)`));
+});
+
 test("ZendeskApiClient sends API token basic auth and OAuth bearer headers", async () => {
   const seen = [];
   const fetchImpl = async (url, init) => {
@@ -466,7 +701,7 @@ test("ZendeskApiClient sends API token basic auth and OAuth bearer headers", asy
 
   const tokenClient = new ZendeskApiClient(sampleConfig(), { fetchImpl });
   await tokenClient.getCurrentUser();
-  const expectedBasic = `Basic ${Buffer.from("auditor@example.com/token:secret-api-token-value").toString("base64")}`;
+  const expectedBasic = `Basic ${FIXTURE_BASIC_CREDENTIAL}`;
   assert.equal(seen[0].authorization, expectedBasic);
   assert.equal(seen[0].url, "https://acme.zendesk.com/api/v2/users/me");
 
@@ -598,6 +833,7 @@ test("ZendeskApiClient pages offset-only endpoints such as targets to completion
   }).listTargets();
   assert.equal(repeating.items.length, 100, "an endpoint that ignores page must not duplicate items");
   assert.equal(repeating.pages, 2);
+  assert.equal(repeating.truncated, true, "a full page replayed for the next offset means the population beyond it was never seen");
 
   for (const [method, key] of [["listSharingAgreements", "sharing_agreements"], ["listAppInstallations", "installations"], ["listOwnedApps", "apps"], ["listCustomRoles", "custom_roles"], ["listDeletionSchedules", "deletion_schedules"]]) {
     const seenPages = [];
@@ -651,20 +887,20 @@ test("ZendeskApiClient retries 429 with Retry-After and 5xx before succeeding", 
 });
 
 test("ZendeskApiClient surfaces API errors with status codes and redacts secrets", async () => {
-  const fetchImpl = async () => jsonResponse({ error: "Forbidden", description: "token secret-api-token-value was rejected" }, { status: 403, statusText: "Forbidden" });
+  const fetchImpl = async () => jsonResponse({ error: "Forbidden", description: `token ${FIXTURE_API_TOKEN} was rejected` }, { status: 403, statusText: "Forbidden" });
   const client = new ZendeskApiClient(sampleConfig(), { fetchImpl });
   await assert.rejects(client.getAccountSettings(), (error) => {
     assert.ok(error instanceof ZendeskApiError);
     assert.equal(error.status, 403);
     assert.match(error.message, /403/);
-    assert.doesNotMatch(error.message, /secret-api-token-value/);
-    assert.match(error.message, /\[REDACTED\]/);
+    assertNoWindow(error.message, FIXTURE_API_TOKEN, "keygen-style denial");
+    assert.match(error.message, /token \[REDACTED\] was rejected/, "a name-shaped configured secret bare in prose is removed by the configured-secret pass alone");
     return true;
   });
 
   const failing = new ZendeskApiClient(sampleConfig(), {
     fetchImpl: async () => {
-      throw new Error("connect ECONNREFUSED secret-api-token-value");
+      throw new Error(`connect ECONNREFUSED ${FIXTURE_API_TOKEN}`);
     },
   });
   await assert.rejects(failing.getCurrentUser(), /ECONNREFUSED \[REDACTED\]/);
@@ -936,7 +1172,7 @@ test("assessZendeskAuthentication renders manual for unreadable settings and use
   const unreadable = await assessZendeskAuthentication(forbiddenClient(), { now: () => NOW });
   assert.ok(unreadable.findings.every((item) => item.status === "manual"));
   assert.match(findingById(unreadable, "ZD-02").summary, /403 \(credential lacks permission\)/);
-  assert.ok(unreadable.errors.some((entry) => entry.startsWith("team_members:")));
+  assert.ok(unreadable.errors.some((entry) => entry.startsWith("team_members dataset:")));
 
   const empty = await assessZendeskAuthentication(emptyClient(), { now: () => NOW });
   assert.equal(findingById(empty, "ZD-02").status, "manual");
@@ -1403,7 +1639,7 @@ test("self-check (c) variant: an unknown credential role caps verdicts at warn",
   for (const [id, status] of statuses) {
     assert.notEqual(status, "pass", `${id} must not pass when the credential role is unknown`);
   }
-  assert.ok(results.every((result) => result.errors.some((entry) => entry.startsWith("current_user:"))));
+  assert.ok(results.every((result) => result.errors.some((entry) => entry.startsWith("current_user dataset:"))));
 });
 
 test("every finding carries the framework mappings from the spec table", async () => {
@@ -1479,7 +1715,7 @@ test("exportZendeskAuditBundle writes the bundle layout, archive, and never over
   assert.match(executive, /Subdomain: acme/);
   assert.match(executive, /## Manual Evidence Required/);
   const rawSettings = readFileSync(join(first.outputDir, "core_data/account_settings.json"), "utf8");
-  assert.doesNotMatch(rawSettings, /secret-api-token-value/);
+  assertNoWindow(rawSettings, FIXTURE_API_TOKEN, "core_data/account_settings.json");
 
   const second = await exportZendeskAuditBundle(healthyClient(), config, base, { now: () => NOW });
   assert.notEqual(second.outputDir, first.outputDir);
@@ -1491,26 +1727,38 @@ test("exportZendeskAuditBundle writes the bundle layout, archive, and never over
 });
 
 // Fake credential values Zendesk list endpoints can return verbatim; none may reach a bundle.
+// Random-looking alphanumerics (see the window rule above). The Bearer and Basic schemes
+// of the header-valued settings are composed where the fixture uses them, since a scheme
+// name is legitimate text the scrubbed output keeps; the Slack path keeps the documented
+// T.../B.../... shape because the whole path is the secret.
 const FAKE_ZENDESK_SECRETS = {
-  fullToken: "zd-full-token-fake-0123456789abcdefghijklmnopqrstuvwxyz",
-  tokenPrefix: "zdtok-fake1",
-  refreshToken: "zd-refresh-token-fake-0123456789abcdef",
-  clientSecret: "zd-client-secret-fake-0123456789abcdef",
-  webhookBearer: "zd-webhook-bearer-fake-0123456789",
-  webhookApiKeyValue: "zd-webhook-api-key-value-fake",
-  signingSecret: "zd-signing-secret-fake-0123456789",
-  targetPassword: "zd-target-password-fake",
-  targetToken: "zd-target-token-fake-0123456789",
-  appApiKey: "zd-app-setting-api-key-fake",
-  appApiKeyCamel: "zd-app-setting-apiKey-camel-fake",
-  appClientSecretCamel: "zd-app-setting-clientSecret-camel-fake",
-  appRefreshTokenCamel: "zd-app-setting-refreshToken-camel-fake",
-  appAccessTokenCamel: "zd-app-setting-accessToken-camel-fake",
-  appAuthorizationHeader: "Bearer zd-app-setting-authorization-header-fake",
-  appXApiKeyHeader: "zd-app-setting-x-api-key-header-fake",
-  webhookCustomHeaderAuthorization: "Basic zd-webhook-custom-header-authorization-fake",
-  webhookCustomHeaderApiKey: "zd-webhook-custom-header-x-api-key-fake",
-  webhookCustomHeaderPlain: "zd-webhook-custom-header-plain-value-fake",
+  fullToken: "Mducb0QASQv3Ugw3wqZ21sZXWBc5ITociTOs5dcY",
+  tokenPrefix: "Q7l0gnUa1JE",
+  refreshToken: "jgf1W64hNNx9ke1OPzMZVU",
+  clientSecret: "MHFLILdUP1k7O2mIk7F4QL",
+  webhookBearer: "9MrdWdDal0Ldb8OR42Ralm",
+  webhookApiKeyValue: "fG8Y1Kg3zFnbHPqBRx6S1j",
+  signingSecret: "s1cZ1rG1ghdksri9b59ZD3",
+  targetPassword: "7f654gQ0nPLsqTXNMMyqtN",
+  targetToken: "jK83AxM1mN8VeQdSsFhvI6",
+  appApiKey: "ecLDZ7wK81IOa6WmUeZu25",
+  appApiKeyCamel: "DEV0MWVDG3ENLxn9MHYvM3",
+  appClientSecretCamel: "LGt33E2k18gewfyCqTGlRi",
+  appRefreshTokenCamel: "UdJ9SQ3o7EilvPZTNQt6f5",
+  appAccessTokenCamel: "Rs1O7EhdcCddVrl6dqlc4v",
+  appAuthorizationBearer: "lPvjw2zeivXec02ucgj0Ax",
+  appXApiKeyHeader: "fEOwyslS3SCop1Dnk99SME",
+  webhookCustomHeaderBasic: "eyEWii6APMwZCVD2GUSj51",
+  webhookCustomHeaderApiKey: "TMeDd3BKQgw6FrtK3HQ94H",
+  webhookCustomHeaderPlain: "iXdO3DeUVgMF7msDNb9G6Y",
+  // Credentials carried inside URL and free-text string values rather than under a credential key.
+  targetUrlQueryToken: "1Ea9sLRnJ4beGrDd6EAyOa",
+  webhookUserinfoPassword: "gKmD93ySVYQ0j8YqAVky65",
+  redirectUriClientSecret: "pAO1eEu7rf1wU7JgfwroI0",
+  slackWebhookPath: "T0K4CKLY1/B0WAF22EB/6swF2tmycU3qGVob6teeP7",
+  ownedAppParameterToken: "NtCeeftEa9id8Zaw3Y3yLk",
+  ownedAppSecureDefault: "s0nlpo2iHGUIZxhQQ9rW4P",
+  jsonEncodedSettingToken: "mjDAS07t0Z1n9lwnyFLaPh",
 };
 
 // Header names that must survive redaction as keys or name fields.
@@ -1520,7 +1768,7 @@ function secretBearingClient(overrides = {}) {
   return healthyClient({
     async listOAuthClients() {
       return list([
-        { id: 1, name: "Reporting", identifier: "reporting", kind: "confidential", scope: "read", redirect_uri: ["https://reports.example.com/callback"], secret: FAKE_ZENDESK_SECRETS.clientSecret },
+        { id: 1, name: "Reporting", identifier: "reporting", kind: "confidential", scope: "read", redirect_uri: ["https://reports.example.com/callback", `https://reports.example.com/cb?client_secret=${FAKE_ZENDESK_SECRETS.redirectUriClientSecret}&state=abc`], secret: FAKE_ZENDESK_SECRETS.clientSecret },
       ]);
     },
     async listOAuthTokens() {
@@ -1530,19 +1778,36 @@ function secretBearingClient(overrides = {}) {
     },
     async listWebhooks() {
       return list([
-        { id: "wh1", name: "Pager", status: "active", endpoint: "https://hooks.example.com/zendesk", authentication: { type: "bearer_token", add_position: "header", data: { token: FAKE_ZENDESK_SECRETS.webhookBearer } }, custom_headers: { Authorization: FAKE_ZENDESK_SECRETS.webhookCustomHeaderAuthorization, "X-Tenant": FAKE_ZENDESK_SECRETS.webhookCustomHeaderPlain } },
+        { id: "wh1", name: "Pager", status: "active", endpoint: "https://hooks.example.com/zendesk", authentication: { type: "bearer_token", add_position: "header", data: { token: FAKE_ZENDESK_SECRETS.webhookBearer } }, custom_headers: { Authorization: `Basic ${FAKE_ZENDESK_SECRETS.webhookCustomHeaderBasic}`, "X-Tenant": FAKE_ZENDESK_SECRETS.webhookCustomHeaderPlain } },
         { id: "wh2", name: "SIEM", status: "active", endpoint: "https://siem.example.com/ingest", authentication: { type: "api_key", add_position: "header", data: { name: "X-Api-Key", value: FAKE_ZENDESK_SECRETS.webhookApiKeyValue } }, signing_secret: { algorithm: "SHA256", secret: FAKE_ZENDESK_SECRETS.signingSecret }, custom_headers: [{ name: "X-Api-Key", value: FAKE_ZENDESK_SECRETS.webhookCustomHeaderApiKey }] },
+        { id: "wh3", name: "Relay", status: "active", endpoint: `https://relay:${FAKE_ZENDESK_SECRETS.webhookUserinfoPassword}@relay.example.com/ingest`, authentication: { type: "basic_auth", add_position: "header", data: { username: "relay", password: FAKE_ZENDESK_SECRETS.targetPassword } } },
       ]);
     },
     async listTargets() {
       return list([
         { id: 5, title: "Legacy URL target", type: "url_target", active: true, target_url: "https://legacy.example.com/hook", method: "post", username: "svc-zendesk", password: FAKE_ZENDESK_SECRETS.targetPassword },
         { id: 6, title: "Chat room", type: "campfire_target", active: true, token: FAKE_ZENDESK_SECRETS.targetToken, room: "ops" },
+        { id: 7, title: "Query token target", type: "url_target_v2", active: true, target_url: `https://legacy.example.com/hook?token=${FAKE_ZENDESK_SECRETS.targetUrlQueryToken}&room=ops`, method: "post" },
+      ]);
+    },
+    async listOwnedApps() {
+      return list([
+        {
+          id: 88,
+          name: "Internal widget",
+          visibility: "private",
+          framework_version: "2.0",
+          parameters: [
+            { name: "api_token", kind: "text", required: true, secure: true, default_value: null, value: FAKE_ZENDESK_SECRETS.ownedAppParameterToken },
+            { name: "endpoint", kind: "text", required: false, secure: true, default: FAKE_ZENDESK_SECRETS.ownedAppSecureDefault },
+            { name: "region", kind: "text", required: false, secure: false, default: "us-east-1" },
+          ],
+        },
       ]);
     },
     async listAppInstallations() {
       return list([
-        { id: 900, app_id: 42, product: "support", enabled: true, settings: { name: "Ticket enricher", title: "Ticket enricher", api_key: FAKE_ZENDESK_SECRETS.appApiKey } },
+        { id: 900, app_id: 42, product: "support", enabled: true, settings: { name: "Ticket enricher", title: "Ticket enricher", api_key: FAKE_ZENDESK_SECRETS.appApiKey, notify_url: `https://hooks.slack.com/services/${FAKE_ZENDESK_SECRETS.slackWebhookPath}`, connector_config: JSON.stringify({ token: FAKE_ZENDESK_SECRETS.jsonEncodedSettingToken, host: "crm.example.com" }) } },
         {
           id: 901,
           app_id: 43,
@@ -1557,12 +1822,18 @@ function secretBearingClient(overrides = {}) {
             refreshToken: FAKE_ZENDESK_SECRETS.appRefreshTokenCamel,
             accessToken: FAKE_ZENDESK_SECRETS.appAccessTokenCamel,
             tokenExpiresAt: "2027-01-01T00:00:00Z",
-            Authorization: FAKE_ZENDESK_SECRETS.appAuthorizationHeader,
+            Authorization: `Bearer ${FAKE_ZENDESK_SECRETS.appAuthorizationBearer}`,
             "X-Api-Key": FAKE_ZENDESK_SECRETS.appXApiKeyHeader,
             username: "crm-sync@example.com",
             scopes: "read write",
           },
         },
+      ]);
+    },
+    async listTriggers() {
+      return list([
+        { id: 1, title: "Notify requester", active: true, actions: [{ field: "notification_user", value: ["requester_id", "Update", "Body"] }] },
+        { id: 2, title: "Post to legacy hook", active: true, actions: [{ field: "notification_target", value: ["7", "{{ticket.title}}"] }] },
       ]);
     },
     ...overrides,
@@ -1628,7 +1899,7 @@ test("assessZendeskAccessControl never retains OAuth token values in its snapsho
   const result = await assessZendeskAccessControl(secretBearingClient(), { now: () => NOW });
   const text = JSON.stringify(result);
   for (const secret of [FAKE_ZENDESK_SECRETS.fullToken, FAKE_ZENDESK_SECRETS.tokenPrefix, FAKE_ZENDESK_SECRETS.refreshToken, FAKE_ZENDESK_SECRETS.clientSecret]) {
-    assert.ok(!text.includes(secret), `${secret} leaked into the assessment result`);
+    assertNoWindow(text, secret, "assessment result");
   }
   const [token] = result.snapshots.oauth_tokens.items;
   assert.equal(token.token, "[REDACTED]");
@@ -1657,11 +1928,11 @@ test("exportZendeskAuditBundle never writes OAuth tokens, client secrets, or web
   for (const relativePath of ["core_data/oauth_tokens.json", "core_data/oauth_clients.json", "core_data/webhooks.json", "core_data/targets.json", "core_data/app_installations.json", "analysis/access-control.json", "analysis/integrations.json"]) {
     assert.ok(files.has(join(...relativePath.split("/"))), `expected ${relativePath}`);
   }
-  assertSecretsAbsent(assert, files, secrets, "bundle directory");
+  assertNoSecretWindows(files, secrets, "bundle directory");
   const zipEntries = readZipEntries(result.zipPath);
   assert.equal(zipEntries.size, files.size, "the zip carries exactly the written files");
   assert.ok(zipEntries.has("core_data/oauth_tokens.json"));
-  assertSecretsAbsent(assert, zipEntries, secrets, "zip archive");
+  assertNoSecretWindows(zipEntries, secrets, "zip archive");
 
   const tokens = JSON.parse(files.get(join("core_data", "oauth_tokens.json")));
   assert.deepEqual(tokens.items[0], {
@@ -1691,8 +1962,27 @@ test("exportZendeskAuditBundle never writes OAuth tokens, client secrets, or web
   assert.equal(targets.items[0].username, "svc-zendesk");
   assert.equal(targets.items[0].password, "[REDACTED]");
   assert.equal(targets.items[1].token, "[REDACTED]");
+  assert.equal(targets.items[2].target_url, "https://legacy.example.com/hook?token=[REDACTED]&room=ops", "URL query credentials are replaced while the scheme, host, path, and other parameters stay");
+  assert.equal(webhooks.items[2].endpoint, "https://[REDACTED]@relay.example.com/ingest", "URL userinfo is replaced while the scheme and host stay");
+  assert.equal(webhooks.items[2].authentication.data.username, "relay");
+  assert.equal(webhooks.items[2].authentication.data.password, "[REDACTED]");
+  const clients = JSON.parse(files.get(join("core_data", "oauth_clients.json")));
+  assert.deepEqual(clients.items[0].redirect_uri, ["https://reports.example.com/callback", "https://reports.example.com/cb?client_secret=[REDACTED]&state=abc"]);
+  const ownedApps = JSON.parse(files.get(join("core_data", "owned_apps.json")));
+  assert.deepEqual(ownedApps.items[0].parameters, [
+    { name: "api_token", kind: "text", required: true, secure: true, default_value: null, value: "[REDACTED]" },
+    { name: "endpoint", kind: "text", required: false, secure: true, default: "[REDACTED]" },
+    { name: "region", kind: "text", required: false, secure: false, default: "us-east-1" },
+  ], "{name, value} pairs with credential names and secure parameters lose their values while names, kinds, and non-secure defaults stay");
   const installations = JSON.parse(files.get(join("core_data", "app_installations.json")));
   assert.equal(installations.items[0].settings.api_key, "[REDACTED]");
+  assert.equal(installations.items[0].settings.notify_url, "https://hooks.slack.com/services/[REDACTED]", "token-in-path webhook URLs keep only the service prefix");
+  assert.equal(installations.items[0].settings.connector_config, '{"token":"[REDACTED]","host":"crm.example.com"}', "credential fields inside JSON encoded as a string are replaced");
+  const integrations = JSON.parse(files.get(join("analysis", "integrations.json")));
+  const exfil = integrations.findings.find((item) => item.id === "ZD-25");
+  assert.equal(exfil.status, "warn", exfil.summary);
+  assert.equal(exfil.evidence.external_notification_actions[0].destination, "https://legacy.example.com/hook?token=[REDACTED]&room=ops", "ZD-25 destination evidence carries the redacted target URL");
+  assert.match(exfil.summary, /legacy\.example\.com/);
   assert.deepEqual(installations.items[1].settings, {
     name: "CRM sync",
     title: "CRM sync",
@@ -1724,9 +2014,12 @@ test("exportZendeskAuditBundle records partial collection failures in _errors.lo
   const result = await exportZendeskAuditBundle(client, config, base, { now: () => NOW });
   assert.ok(result.errorCount >= 2);
   const errorLog = readFileSync(join(result.outputDir, "_errors.log"), "utf8");
-  assert.match(errorLog, /oauth_clients: .*403/);
-  assert.match(errorLog, /audit_logs_recent: .*403/);
-  assert.ok(!existsSync(join(result.outputDir, "core_data/oauth_clients.json")), "forbidden snapshots are not written as data");
+  assert.match(errorLog, /oauth_clients dataset: .*403/);
+  assert.match(errorLog, /audit_logs_recent dataset: .*403/);
+  const forbiddenFile = JSON.parse(readFileSync(join(result.outputDir, "core_data/oauth_clients.json"), "utf8"));
+  assert.equal(forbiddenFile.collected, false, "a forbidden snapshot is written as a not-collected marker, never as data or an empty list");
+  assert.equal(forbiddenFile.status, 403);
+  assert.equal(forbiddenFile.dataset_status, "forbidden");
   const executive = readFileSync(join(result.outputDir, "compliance/executive_summary.md"), "utf8");
   assert.match(executive, /## Partial Collection Warnings/);
 });
@@ -1750,4 +2043,1513 @@ test("Zendesk tools are registered in the tool catalog under the Zendesk group",
   const exportTool = zendeskTools.find((tool) => tool.name === "zendesk_export_audit_bundle");
   assert.ok(exportTool.parameterSummaries.some((parameter) => parameter.name === "output_dir"));
   assert.ok(exportTool.parameterSummaries.some((parameter) => parameter.name === "oauth_token"));
+});
+
+// ---------------------------------------------------------------------------
+// Rule 9: credentials carried inside string values, credential pairs, and error strings
+// ---------------------------------------------------------------------------
+
+test("redactCredentialProperties scrubs URL query credentials, userinfo, token-in-path webhooks, credential pairs, secure parameters, numeric secrets, and JSON encoded as a string", () => {
+  assert.equal(redactCredentialValueText("https://h.example.com/p?token=abc123&x=1#frag"), "https://h.example.com/p?token=[REDACTED]&x=1#frag");
+  assert.equal(redactCredentialValueText("https://h.example.com/p?x=1&api_key=abc&sig=zzz"), "https://h.example.com/p?x=1&api_key=[REDACTED]&sig=[REDACTED]");
+  assert.equal(redactCredentialValueText("https://svc:pw-123@h.example.com/x"), "https://[REDACTED]@h.example.com/x");
+  assert.equal(redactCredentialValueText("https://hooks.slack.com/services/T1/B1/xyz"), "https://hooks.slack.com/services/[REDACTED]");
+  assert.equal(redactCredentialValueText("https://discord.com/api/webhooks/123/abc"), "https://discord.com/api/webhooks/[REDACTED]");
+  assert.equal(redactCredentialValueText("https://contoso.webhook.office.com/webhookb2/aaa@bbb/IncomingWebhook/ccc/ddd"), "https://contoso.webhook.office.com/webhookb2/[REDACTED]");
+  assert.equal(redactCredentialValueText('{"password":"pw","user":"u","apiKey": "k"}'), '{"password":"[REDACTED]","user":"u","apiKey": "[REDACTED]"}');
+  assert.equal(redactCredentialValueText("https://h.example.com/p?state=abc&client_id=1"), "https://h.example.com/p?state=abc&client_id=1", "non-credential query parameters are kept");
+  assert.equal(redactCredentialValueText("plain text that mentions a token"), "plain text that mentions a token");
+
+  assert.deepEqual(
+    redactCredentialProperties({ id: 7, target_url: "https://legacy.example.com/hook?token=abc&room=ops", email: "ops@example.com", url: "https://acme.zendesk.com/api/v2/targets/7.json" }),
+    { id: 7, target_url: "https://legacy.example.com/hook?token=[REDACTED]&room=ops", email: "ops@example.com", url: "https://acme.zendesk.com/api/v2/targets/7.json" },
+  );
+  assert.deepEqual(
+    redactCredentialProperties({ redirect_uri: ["https://a.example.com/cb", "https://a.example.com/cb?client_secret=s&state=x"], endpoint: "https://u:p@b.example.com/x" }),
+    { redirect_uri: ["https://a.example.com/cb", "https://a.example.com/cb?client_secret=[REDACTED]&state=x"], endpoint: "https://[REDACTED]@b.example.com/x" },
+  );
+
+  assert.deepEqual(
+    redactCredentialProperties({
+      parameters: [
+        { name: "api_token", kind: "text", required: true, secure: true, value: "tok", default_value: "d" },
+        { name: "endpoint", kind: "text", secure: true, default: "https://x.example.com" },
+        { name: "region", kind: "text", secure: false, default: "us-east-1", value: "eu-west-1" },
+        { name: "password", value: "pw" },
+        { name: "Authorization", value: "Bearer abc" },
+      ],
+    }),
+    {
+      parameters: [
+        { name: "api_token", kind: "text", required: true, secure: true, value: "[REDACTED]", default_value: "[REDACTED]" },
+        { name: "endpoint", kind: "text", secure: true, default: "[REDACTED]" },
+        { name: "region", kind: "text", secure: false, default: "us-east-1", value: "eu-west-1" },
+        { name: "password", value: "[REDACTED]" },
+        { name: "Authorization", value: "[REDACTED]" },
+      ],
+    },
+    "{name, value} pairs with credential names and secure: true objects lose value and default fields while names and kinds stay",
+  );
+
+  assert.deepEqual(
+    redactCredentialProperties({ secret: 123456, api_key: 4242, id: 42, port: 443, password_length: 12, count: 0 }),
+    { secret: "[REDACTED]", api_key: "[REDACTED]", id: 42, port: 443, password_length: 12, count: 0 },
+    "numeric credentials are replaced while numeric identifiers and policy fields stay",
+  );
+  assert.deepEqual(
+    redactCredentialProperties({ settings: { connector_config: '{"token":"t","host":"h"}', notify_url: "https://hooks.slack.com/services/T/B/x", title: "CRM" } }),
+    { settings: { connector_config: '{"token":"[REDACTED]","host":"h"}', notify_url: "https://hooks.slack.com/services/[REDACTED]", title: "CRM" } },
+  );
+});
+
+test("redactErrorText and describeErrorBody scrub credential-shaped text regardless of content type and never echo non-JSON bodies", () => {
+  const bearer = redactErrorText("upstream said Authorization: Bearer abcdefghijklmnop and Basic dXNlcjpwYXNz then Cookie: _zendesk_session=abc123def456; Path=/");
+  assert.equal(bearer, "upstream said Authorization: [REDACTED]", "a header line is withheld to its end and the marker is not re-scrubbed into a different shape");
+  assert.equal(redactErrorText("Cookie: _zendesk_session=abc123def456; Path=/ was sent"), "Cookie: [REDACTED]");
+  assert.equal(redactErrorText("Bearer abcdefghijklmnop rejected"), "Bearer [REDACTED] rejected");
+  assert.equal(redactErrorText("Basic dXNlcjpwYXNzd29yZA== rejected"), "Basic [REDACTED] rejected");
+  assert.equal(redactErrorText("_zendesk_session=abc123def456 expired"), "_zendesk_session=[REDACTED] expired");
+  assert.equal(redactErrorText("see https://api.example.com/v1/x?token=abcd1234 and api_key=zzzz9999 or apiKey: 'qqqq1111'"), "see https://api.example.com/v1/x?token=[REDACTED] and api_key=[REDACTED] or apiKey: '[REDACTED]'");
+  assert.equal(redactErrorText("proxy https://svc:pw12345@proxy.example.com refused"), "proxy https://[REDACTED]@proxy.example.com refused");
+  assert.equal(redactErrorText("jwt eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.abcdefghijk"), "jwt [REDACTED]");
+  assert.equal(redactErrorText("X-Api-Key: 0123456789abcdef"), "X-Api-Key: [REDACTED]");
+  assert.equal(redactErrorText("Zendesk request failed for /users/me (403 Forbidden)"), "Zendesk request failed for /users/me (403 Forbidden)", "plain error strings are unchanged");
+
+  const html = new Response("<html><body>Bearer abcdefghijklmnop</body></html>", { status: 502, statusText: "Bad Gateway", headers: { "content-type": "text/html; charset=utf-8" } });
+  assert.equal(describeErrorBody(html, "<html><body>Bearer abcdefghijklmnop</body></html>"), "502 Bad Gateway; non-JSON text/html response body (49 bytes, not echoed)");
+  const untyped = new Response("Bearer abcdefghijklmnop", { status: 503, statusText: "Service Unavailable" });
+  assert.match(describeErrorBody(untyped, "Bearer abcdefghijklmnop"), /^503 Service Unavailable; non-JSON [a-z/;=\- ]+ response body \(23 bytes, not echoed\)$/);
+  const empty = new Response(null, { status: 401, statusText: "Unauthorized" });
+  assert.equal(describeErrorBody(empty, ""), "401 Unauthorized");
+  const jsonBody = JSON.stringify({ error: "Forbidden", description: "token=abcdefghijklmnop was rejected for Bearer abcdefghijklmnop", extra: "Bearer zzzzzzzzzzzzzzzz" });
+  assert.equal(describeErrorBody(jsonResponse({}, { status: 403, statusText: "Forbidden" }), jsonBody), "403 Forbidden; Forbidden; token=[REDACTED] was rejected for Bearer [REDACTED]", "only documented error fields are kept and each is scrubbed");
+  const undocumentedBody = JSON.stringify({ detail: "Bearer abcdefghijklmnop" });
+  assert.equal(describeErrorBody(jsonResponse({}, { status: 400, statusText: "Bad Request" }), undocumentedBody), `400 Bad Request; JSON response body without documented error fields (${undocumentedBody.length} bytes, not echoed)`);
+  const nestedBody = JSON.stringify({ error: { title: "Invalid", message: "Bearer abcdefghijklmnop" }, errors: [{ title: "Bad", detail: "x" }, { detail: "api_key=abcdefgh" }] });
+  assert.equal(describeErrorBody(jsonResponse({}, { status: 422, statusText: "Unprocessable Entity" }), nestedBody), "422 Unprocessable Entity; Invalid; Bearer [REDACTED]; Bad; api_key=[REDACTED]");
+  const longBody = JSON.stringify({ error: `x`.repeat(300) });
+  assert.equal(describeErrorBody(jsonResponse({}, { status: 400, statusText: "Bad Request" }), longBody), `400 Bad Request; ${"x".repeat(200)}`, "documented fields are shortened to 200 characters after scrubbing");
+});
+
+// ---------------------------------------------------------------------------
+// Scrub boundary ruling: a name-shaped value bare in prose stays, a carrier loses its value
+// whatever its shape, a configured secret is removed in every form whatever its shape, and
+// real token shapes are removed bare.
+// ---------------------------------------------------------------------------
+const NAME_SHAPED_VALUES = ["prod-us-east-2026", "fw-dc1-01", "sess-canary-COOKIE-31415926535897", "my-bucket-prod-2026-logs", "3f2b1c9e-8a7d-4e6f-9b0a-1c2d3e4f5a6b"];
+
+// Every carrier of the ruling with the value in it, and the exact rendering after the scrub.
+function carriersOf(value) {
+  return [
+    [`Authorization: Bearer ${value}`, /^Authorization: (?:Bearer )?\[REDACTED\]$/],
+    [`Proxy-Authorization: Basic ${value}`, /^Proxy-Authorization: (?:Basic )?\[REDACTED\]$/],
+    [`Cookie: _zendesk_session=${value}; theme=dark`, /^Cookie: \[REDACTED\]$/],
+    [`Set-Cookie: _zendesk_session=${value}; Path=/; HttpOnly`, /^Set-Cookie: \[REDACTED\]$/],
+    [`X-Api-Key: ${value}`, /^X-Api-Key: \[REDACTED\]$/],
+    [`x-auth-token: ${value}`, /^x-auth-token: \[REDACTED\]$/],
+    [`<p>X-Api-Key: ${value}</p><p>next</p>`, /^<p>X-Api-Key: \[REDACTED\]<\/p><p>next<\/p>$/],
+    // Quoted header values: the value goes with its quotes, whatever the name of the pair
+    // that carries it, through the closing quote or to the end of the line; a value that is
+    // one quoted string keeps the quotes around the marker; the quote that closes the text
+    // the header line was quoted in, and the JSON string it is escaped into, stay intact.
+    [`Cookie: sid="${value}"`, /^Cookie: \[REDACTED\]$/],
+    [`Cookie: sid='${value}'; theme=dark`, /^Cookie: \[REDACTED\]$/],
+    [`Cookie: theme=dark; sid="${value}"; lang=en`, /^Cookie: \[REDACTED\]$/],
+    [`Set-Cookie: _zendesk_session="${value}"; Path=/; HttpOnly`, /^Set-Cookie: \[REDACTED\]$/],
+    [`Authorization: Bearer "${value}"`, /^Authorization: \[REDACTED\]$/],
+    [`Authorization: "Bearer ${value}" was rejected`, /^Authorization: "\[REDACTED\]" was rejected$/],
+    [`X-Api-Key: "${value}"`, /^X-Api-Key: "\[REDACTED\]"$/],
+    [`x-auth-token: '${value}'`, /^x-auth-token: '\[REDACTED\]'$/],
+    [`{"detail":"upstream rejected Cookie: sid=\\"${value}\\"; path=/","code":401}`, /^\{"detail":"upstream rejected Cookie: \[REDACTED\]","code":401\}$/],
+    [`{"cookie": "sid=${value}", "other": "z"}`, /^\{"cookie": "\[REDACTED\]", "other": "z"\}$/],
+    [`rejected header "Cookie: sid=${value}" and "X-Other: 1"`, /^rejected header "Cookie: \[REDACTED\]" and "X-Other: 1"$/],
+    [`<p>Cookie: sid="${value}"</p><p>next</p>`, /^<p>Cookie: \[REDACTED\]<\/p><p>next<\/p>$/],
+    [`<p>Cookie: sid="${value}</p><p>next="1"</p>`, /^<p>Cookie: \[REDACTED\]<\/p><p>next="1"<\/p>$/],
+    [`Cookie: sid="${value}"\nX-Other: keep`, /^Cookie: \[REDACTED\]\nX-Other: keep$/],
+    [`session=${value}; Path=/`, /^session=\[REDACTED\]; Path=\/$/],
+    [`_zendesk_session=${value} expired`, /^_zendesk_session=\[REDACTED\] expired$/],
+    [`JSESSIONID=${value}; Path=/`, /^JSESSIONID=\[REDACTED\]; Path=\/$/],
+    [`https://svc:${value}@proxy.example.com/x`, /^https:\/\/\[REDACTED\]@proxy\.example\.com\/x$/],
+    [`https://hooks.example.com/zendesk?token=${value}&channel=ops`, /^https:\/\/hooks\.example\.com\/zendesk\?token=\[REDACTED\]&channel=ops$/],
+    [`https://x.example.com/cb?state=1&api_key=${value}`, /^https:\/\/x\.example\.com\/cb\?state=1&api_key=\[REDACTED\]$/],
+    [`GET /login?user=a&pass=${value}`, /^GET \/login\?user=a&pass=\[REDACTED\]$/],
+    [`https://x.example.com/cb#access_token=${value}&state=1`, /^https:\/\/x\.example\.com\/cb#access_token=\[REDACTED\]&state=1$/],
+    [`https://hooks.slack.com/services/${value}`, /^https:\/\/hooks\.slack\.com\/services\/\[REDACTED\]$/],
+    [`Bearer ${value}`, /^Bearer \[REDACTED\]$/],
+    [`Basic ${value}`, /^Basic \[REDACTED\]$/],
+    [`Token ${value}`, /^Token \[REDACTED\]$/],
+    [`ApiKey ${value}`, /^ApiKey \[REDACTED\]$/],
+    [`password=${value}`, /^password=\[REDACTED\]$/],
+    [`password: ${value}`, /^password: \[REDACTED\]$/],
+    [`passphrase: ${value} and more words`, /^passphrase: \[REDACTED\]$/],
+    [`client_secret=${value}&grant_type=x`, /^client_secret=\[REDACTED\]&grant_type=x$/],
+    [`{"client_secret":"${value}","name":"svc"}`, /^\{"client_secret":"\[REDACTED\]","name":"svc"\}$/],
+    [`{"full_token": "${value}", "id": 7}`, /^\{"full_token": "\[REDACTED\]", "id": 7\}$/],
+    [`<target name="t1" token="${value}"/>`, /^<target name="t1" token="\[REDACTED\]"\/>$/],
+    [`<field name='pw' password='${value}'/>`, /^<field name='pw' password='\[REDACTED\]'\/>$/],
+  ];
+}
+
+test("scrub boundary: name-shaped values stay bare in prose, leave every carrier whatever their shape, and go as configured secrets in every form", () => {
+  for (const value of NAME_SHAPED_VALUES) {
+    for (const prose of [`inventory ${value} was not read`, `${value}`, `webhook ${value} read 12 of 40 destinations`, `path /var/lib/${value}/state`]) {
+      assert.equal(redactErrorText(prose), prose, `${value} stays bare in error text`);
+      assert.equal(redactCredentialValueText(prose), prose, `${value} stays bare in a data value`);
+    }
+    for (const [text, expected] of carriersOf(value)) {
+      for (const scrub of [redactErrorText, redactCredentialValueText]) {
+        const out = scrub(text);
+        assert.match(out, expected, `${scrub.name}(${JSON.stringify(text)}) -> ${JSON.stringify(out)}`);
+        assertNoWindow(out, value, `${scrub.name} ${text}`);
+        assert.equal(scrub(out), out, `${scrub.name} is idempotent on ${out}`);
+      }
+    }
+    // A configured secret goes bare and in every encoded form, however name-shaped it is.
+    for (const form of secretForms(value)) {
+      assert.equal(redactSecrets(`login rejected for ${form} by upstream`, [value]), "login rejected for [REDACTED] by upstream", `configured ${value} as ${form}`);
+      assert.equal(redactConfiguredSecrets(`login rejected for ${form} by upstream`, [value]), "login rejected for [REDACTED] by upstream", `guard 2 alone on ${form}`);
+    }
+  }
+  // The composed Basic credential is its own configured secret: no encoding of the token alone matches it.
+  const secrets = configuredZendeskSecrets(sampleConfig());
+  assert.deepEqual(secrets, [FIXTURE_API_TOKEN, FIXTURE_BASIC_CREDENTIAL]);
+  assert.equal(redactConfiguredSecrets(`sent auditor@example.com/token:${FIXTURE_API_TOKEN} upstream`, secrets), "sent auditor@example.com/token:[REDACTED] upstream", "the plain Basic pair is covered by the token itself; the email is not a secret");
+  assert.ok(!secretForms(FIXTURE_API_TOKEN).includes(FIXTURE_BASIC_CREDENTIAL), "the fixture proves the point: the Basic form is not a form of the token");
+  assert.equal(redactConfiguredSecrets(`sent Authorization Basic ${FIXTURE_BASIC_CREDENTIAL} upstream`, secrets), "sent Authorization Basic [REDACTED] upstream");
+  assert.equal(redactConfiguredSecrets(`sent ${FIXTURE_BASIC_CREDENTIAL} upstream`, [FIXTURE_API_TOKEN]), `sent ${FIXTURE_BASIC_CREDENTIAL} upstream`, "the token alone does not cover the Basic form, so the client registers it");
+  assert.deepEqual(configuredZendeskSecrets(sampleConfig({ authMode: "oauth", email: undefined, apiToken: undefined, oauthToken: "oauth-fixture-value-2026" })), ["oauth-fixture-value-2026"]);
+  assert.equal(redactConfiguredSecrets("a pin 4711 and pin 47110", ["4711"]), "a pin [REDACTED] and pin 47110", "a short secret is removed as a whole token only");
+  assert.equal(redactConfiguredSecrets("too short abc", ["abc"]), "too short abc", "below the minimum length nothing is scrubbed");
+
+  // Real token shapes go bare from error text, and stay in data values where they are identifiers.
+  for (const [text, expected] of [
+    ["bare Kq7Zx2Vw9Lm4Tp8R token", "bare [REDACTED] token"],
+    ["digest 0f9e8d7c6b5a4938 shown", "digest [REDACTED] shown"],
+    ["hash 3a7bd3e2360a3d29eea436fcfb7e44c735d117c42d1c1835420b6b9942dd4f1b shown", "hash [REDACTED] shown"],
+    ["jwt eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0In0.abcdefghijk expired", "jwt [REDACTED] expired"],
+    ["bare dXNlcjpwYXNzd29yZA== padded", "bare [REDACTED] padded"],
+    ["akid AKIAIOSFODNN7EXAMPLE shown", "akid [REDACTED] shown"],
+    ["-----BEGIN RSA PRIVATE KEY-----\nMIIEfake\n-----END RSA PRIVATE KEY-----", "[REDACTED]"],
+    ["-----BEGIN CERTIFICATE-----\nMIIEfake\n-----END CERTIFICATE-----", "[REDACTED]"],
+    ["truncated -----BEGIN PRIVATE KEY-----\nMIIEfake", "truncated [REDACTED]"],
+  ]) {
+    assert.equal(redactErrorText(text), expected);
+    assert.equal(redactErrorText(expected), expected, "idempotent");
+  }
+  // After a scheme the value goes whatever its shape, a plain lowercase word included,
+  // unless it is one of the listed prose words; after the noun "Token" any short plain
+  // lowercase word is prose, and OAuth is this module's vocabulary, not a scheme.
+  for (const [text, expected] of [
+    ["Bearer abcdefghijklmnop rejected", "Bearer [REDACTED] rejected"],
+    ["Basic canarybasic rejected", "Basic [REDACTED] rejected"],
+    ["ApiKey canaryapikey rejected", "ApiKey [REDACTED] rejected"],
+    ["Token abcdefghijklmnopq expired", "Token [REDACTED] expired"],
+    ["Token hygiene could not be judged; token inventory read; Token count 3", "Token hygiene could not be judged; token inventory read; Token count 3"],
+    ["OAuth clients all declare scopes; an OAuth bearer token; OAuth abcdefghijklmnop", "OAuth clients all declare scopes; an OAuth bearer token; OAuth abcdefghijklmnop"],
+    ["API token basic auth; Bearer tokens expire; Basic credential; Basic authentication is required", "API token basic auth; Bearer tokens expire; Basic credential; Basic authentication is required"],
+    // A Titlecase word makes the scheme name an adjective in a title; a digit, a symbol,
+    // token casing, or a run longer than a word still marks a credential.
+    ["plans: Basic Support Plan, Bearer Token rotation, Token Hygiene, ApiKey Rotation", "plans: Basic Support Plan, Bearer Token rotation, Token Hygiene, ApiKey Rotation"],
+    ["Basic Canary2026 rejected; Basic dXNlcjpwYXNz rejected; Bearer Abcdefghijklmnopqrstu rejected; Basic Canary-Basic rejected", "Basic [REDACTED] rejected; Basic [REDACTED] rejected; Bearer [REDACTED] rejected; Basic [REDACTED] rejected"],
+  ]) {
+    assert.equal(redactErrorText(text), expected);
+    assert.equal(redactCredentialValueText(text), expected);
+  }
+  // A digit string under a singular credential word is still a credential (a PIN, a numeric token).
+  assert.equal(redactErrorText('"pin": 4711, "token": 12345678, otp=123456, "tokens": 2'), '"pin": [REDACTED], "token": [REDACTED], otp=[REDACTED], "tokens": 2');
+  assert.equal(redactCredentialValueText("bare Kq7Zx2Vw9Lm4Tp8R id"), "bare Kq7Zx2Vw9Lm4Tp8R id", "an opaque identifier in evidence is not a secret");
+  const certificate = "-----BEGIN CERTIFICATE-----\nMIIEfake\n-----END CERTIFICATE-----";
+  assert.equal(redactCredentialValueText(certificate), certificate, "a public certificate is evidence");
+  assert.equal(redactCredentialValueText("-----BEGIN PRIVATE KEY-----\nMIIEfake\n-----END PRIVATE KEY-----"), "[REDACTED]");
+  assert.equal(redactCredentialValueText(`${certificate}\n-----BEGIN EC PRIVATE KEY-----\nMHcC`), `${certificate}\n[REDACTED]`, "a truncated private block after a kept certificate");
+
+  // Names, prose, and this module's own vocabulary survive.
+  for (const text of [
+    "Zendesk request failed for /users/me (403 Forbidden)",
+    "Zendesk request failed for /oauth/tokens (502 Bad Gateway; non-JSON text/html response body (1234 bytes, not echoed))",
+    "GET /api/v2/audit_logs?filter[source_type]=apitoken&sort=-created_at&page[size]=100",
+    "The OAuth client and token endpoints were readable and returned zero clients and zero tokens, so no third-party OAuth applications are registered on this account.",
+    "3 OAuth clients all declare allowed scopes; review 1 public clients, 2 tokens with write or impersonate scope, 0 non-expiring tokens. Token hygiene could not be judged because GET /api/v2/oauth/tokens returned 403 (credential lacks permission).",
+    "API token access is disabled (api_token_access=false); manage_api_credentials=true; two_factor_auth=true; password_policy=high",
+    "review each outstanding token in Admin Center > Apps and integrations > APIs > API tokens, confirm its owner and purpose, delete unused tokens, and record the OAuth migration plan.",
+    "Using Zendesk subdomain acme with API token basic auth.",
+    "Unable to read Zendesk config file /etc/zendesk.json (EACCES)",
+    "Unable to parse Zendesk config file: invalid JSON in /etc/zendesk.json at line 3",
+    "/tmp/grclanker-zendesk-loader-errors-Ab3xY9/nested.yaml",
+    "policy 550e8400-e29b-41d4-a716-446655440000 unified_compliance_matrix ENOENT PCI-DSS-4",
+    "Basic authentication is required; the Bearer token is missing; token expired, retry later",
+    '"pass": 12, "pass_rate": 95, "api_token_access": false, "two_factor_auth": {"enforce": true}, "password": {"min_length": 12}',
+    '"api_keys": 3, "secrets": 0, "oauth_tokens": 1, "credentials": 12; keys=3 tokens: 7 cookies: 0',
+    "session_timeout_minutes=30 auth_mode=saml credentials_file=/etc/x access_key_id=AKIA client_id=abc",
+    "misconfiguration of the Authorization Code flow on misconfigured-support-cluster",
+  ]) {
+    assert.equal(redactErrorText(text), text, text);
+  }
+
+  for (const [key, expected] of [
+    ["key", true], ["token", true], ["full_token", true], ["api_key", true], ["X-Api-Key", true], ["Set-Cookie", true],
+    ["_zendesk_session", true], ["session_id", true], ["JSESSIONID", true], ["password1", true], ["authtoken", true],
+    ["sharedsecret", true], ["privatekey", true], ["password_hash", true], ["token_value", true], ["authorization_header", true],
+    ["client_secret", true], ["signing_secret", true], ["sid", true], ["sig", true],
+    ["api_token_access", false], ["public_key", false], ["tokenCount", false], ["scopes", false], ["client_id", false], ["user", false],
+    ["login", false], ["max_keys", false], ["auth_mode", false], ["password_policy", false], ["two_factor_auth", true],
+    ["pass_rate", false], ["pass", false], ["access_key_id", false], ["monkey", false], ["oauth", false], ["sessions", false],
+    ["session_timeout_minutes", false], ["credentials_file", false], ["passwordPolicy", false], ["webhookUrl", false], ["target_url", false],
+    ["registration_code", true], ["activation_code", true], ["authorization_code", true], ["recovery_codes", true],
+    ["status_code", false], ["error_code", false], ["country_code", false], ["code", false],
+  ]) {
+    assert.equal(isCredentialKey(key), expected, key);
+  }
+});
+
+test("no window of a carried or configured canary survives, for every canary length from 6 to 24", () => {
+  // A deterministic generator so a failure reproduces; one digit is forced so the value
+  // never falls under a prose exception after a scheme.
+  let seed = 0x2545f491;
+  const next = () => {
+    seed = (seed * 1103515245 + 12345) % 0x80000000;
+    return seed;
+  };
+  const alphabet = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+  const canary = (length) => {
+    let value = "";
+    for (let index = 0; index < length; index += 1) value += alphabet[next() % alphabet.length];
+    return `${value.slice(0, -1)}${next() % 10}`;
+  };
+  for (let length = 6; length <= 24; length += 1) {
+    for (let sample = 0; sample < 3; sample += 1) {
+      const value = canary(length);
+      for (const [text] of carriersOf(value)) {
+        for (const scrub of [redactErrorText, redactCredentialValueText]) {
+          assertNoWindow(scrub(text), value, `${scrub.name} ${text}`);
+        }
+      }
+      for (const form of secretForms(value)) {
+        assertNoWindow(redactSecrets(`upstream echoed ${form} in a ${length}-character reply`, [value]), value, `configured ${value} as ${form}`);
+      }
+    }
+  }
+});
+
+test("the healthy bundle is fixed text the scrubs leave untouched, so every marker in a bundle is attributable to a credential or an echo", async () => {
+  const bundle = await exportZendeskAuditBundle(healthyClient(), sampleConfig(), createTempBase("grclanker-zendesk-fixed-text-"), { now: () => NOW });
+  const files = readBundleFiles(bundle.outputDir);
+  assert.ok(files.size >= 20);
+  for (const [name, content] of files) {
+    assert.equal(redactErrorText(content), content, `${name} is fixed text redactErrorText leaves alone`);
+    assert.equal(redactCredentialValueText(content), content, `${name} is fixed text redactCredentialValueText leaves alone`);
+    assert.equal(redactConfiguredSecrets(content, configuredZendeskSecrets(sampleConfig())), content, `${name} carries no configured secret`);
+    // core_data/ carries the fixture's own webhook and target credentials as markers, and
+    // QUICK_REFERENCE.md describes the marker; every other file is marker-free on a healthy tenant.
+    if (!name.startsWith("core_data") && name !== "QUICK_REFERENCE.md") assert.ok(!content.includes("[REDACTED]"), `${name} carries no marker on a healthy tenant`);
+  }
+  const access = await checkZendeskAccess(healthyClient());
+  const results = await runAllAssessments(healthyClient());
+  for (const [label, text] of [["access check", JSON.stringify(access)], ["assessments", JSON.stringify(results)]]) {
+    assert.equal(redactErrorText(text), text, `${label} is fixed text`);
+    assert.ok(!text.includes("[REDACTED]"), `${label} carries no marker on a healthy tenant`);
+  }
+});
+
+// Round 7(a): fixed message text can itself match a credential-pair scrub ("credentials: <path>"
+// reads as a pair), so every fixed text this module emits on the unhealthy paths is driven out
+// of the module over HTTP and run through the general scrub: the not-collected markers and
+// their collection status, the refusal, plan, and could-not-be-read causes, the non-JSON and
+// silent-success notes, the manual and capped summaries, and _errors.log must all be the
+// identity under redactErrorText. Because the writer scrubs before it writes, a fixed text
+// mangled on the way in would surface as a marker, so with nothing planted no file or result
+// may carry one (QUICK_REFERENCE.md describes the marker and is exempt).
+test("round 7(a): every fixed text emitted on refused, unavailable, failed, and silent-success paths survives the scrubs unchanged", async () => {
+  const routes = await healthyHttpRoutes();
+  const everyRouteBut = (makeResponse) => new ZendeskApiClient(sampleConfig(), {
+    fetchImpl: async (url) => (zendeskRouteKey(url) === "/users/me" ? jsonResponse(routes["/users/me"]) : makeResponse()),
+    sleep: async () => {},
+  });
+  const fixtures = [
+    ["every list refused", everyRouteBut(forbiddenJsonResponse)],
+    ["every list unavailable on the plan", everyRouteBut(() => jsonResponse({ error: "RecordNotFound", description: "Not found" }, { status: 404, statusText: "Not Found" }))],
+    ["every list behind a proxy page", everyRouteBut(() => new Response("<html><body>502 Bad Gateway</body></html>", { status: 502, statusText: "Bad Gateway", headers: { "content-type": "text/html" } }))],
+    ["every list an empty success", everyRouteBut(() => new Response("", { status: 200, statusText: "OK", headers: { "content-type": "application/json" } }))],
+  ];
+  const corpus = [];
+  for (const [label, client] of fixtures) {
+    const access = await checkZendeskAccess(client);
+    const bundle = await exportZendeskAuditBundle(client, sampleConfig(), createTempBase("grclanker-zendesk-fixed-text-"), { now: () => NOW });
+    const rendered = [["check_access", JSON.stringify(access)], ["assessments", JSON.stringify(await runAllAssessments(client))], ...readBundleFiles(bundle.outputDir)];
+    assert.ok(rendered.some(([name]) => name === "_errors.log"), `${label}: the failures are logged`);
+    for (const [name, text] of rendered) {
+      assert.equal(redactErrorText(text), text, `${label}: a fixed text in ${name} is changed by the general scrub`);
+      if (name !== "QUICK_REFERENCE.md") assert.ok(!text.includes("[REDACTED]"), `${label}: ${name} carries a marker with nothing planted`);
+      corpus.push(text);
+    }
+  }
+
+  // One surface refused at a time: the capped-at-warn and secondary-inventory wordings.
+  for (const surface of Object.keys(routes)) {
+    if (surface === "/users/me") continue;
+    const client = httpClient(routes, surface, forbiddenJsonResponse);
+    for (const [name, text] of [["check_access", JSON.stringify(await checkZendeskAccess(client))], ["assessments", JSON.stringify(await runAllAssessments(client))]]) {
+      assert.equal(redactErrorText(text), text, `${surface} refused: a fixed text in ${name} is changed by the general scrub`);
+      assert.ok(!text.includes("[REDACTED]"), `${surface} refused: ${name} carries a marker with nothing planted`);
+      corpus.push(text);
+    }
+  }
+
+  // The loader texts, with the fs code and the structured line they carry, are fixed text too.
+  const base = createTempBase("grclanker-zendesk-fixed-loader-");
+  mkdirSync(join(base, "dir.json"));
+  writeFileSync(join(base, "broken.json"), '{\n  "subdomain": "acme"\n  "email": "auditor@example.com"\n}\n');
+  for (const file of [join(base, "dir.json"), join(base, "missing.json"), join(base, "broken.json")]) {
+    assert.throws(() => resolveZendeskConfiguration({ config_file: file }, {}, base), (error) => {
+      assert.equal(redactErrorText(error.message), error.message, `${file}: the loader text survives the scrub`);
+      assert.equal(redactCredentialValueText(error.message), error.message, `${file}: the loader text survives the data scrub`);
+      corpus.push(error.message);
+      return true;
+    });
+  }
+
+  // Positive controls: the fixtures reach every family of fixed text the rule names.
+  const emitted = corpus.join("\n");
+  for (const family of [
+    /"collected":\s*false/,
+    /"dataset_status":\s*"forbidden"/,
+    /"dataset_status":\s*"not_found"/,
+    /"dataset_status":\s*"error"/,
+    // The error line of a dataset named for what it holds keeps its whole message.
+    /"oauth_tokens dataset: Zendesk request failed for https:\/\/acme\.zendesk\.com\/api\/v2\/oauth\/tokens\?all=true\S* \(403 Forbidden; Forbidden; You do not have access to this page/,
+    /"oauth_tokens dataset: Zendesk request GET \/api\/v2\/oauth\/tokens returned 200 OK with an empty response body/,
+    /returned 403 \(credential lacks permission\)\./,
+    /returned 404 \(endpoint unavailable on this account or plan\)\./,
+    /Unavailable on this account or plan: /,
+    / could not be read: /,
+    / Manual evidence: /,
+    /Verdict capped at warn because a secondary inventory could not be read: /,
+    /502 Bad Gateway; non-JSON text\/html response body \(\d+ bytes, not echoed\)/,
+    /200 OK with an empty response body where the documented JSON document was expected/,
+    /Unable to read Zendesk config file .* \((EISDIR|ENOENT)\)/,
+    /Unable to parse Zendesk config file: invalid JSON in .* at line \d+ \(INVALID_JSON\)/,
+  ]) {
+    assert.match(emitted, family, `the fixtures emit the ${family} family`);
+  }
+});
+
+test("fixture self-check: planted credentials are alphanumeric and random-looking, share no 6-character window with each other, and no 6-character window of any occurs in the fixtures' legitimate text", async () => {
+  const owners = new Map();
+  for (const value of PLANTED_CREDENTIALS) {
+    assert.ok(value.length >= LEAK_WINDOW_MIN, `${value} is too short to carry a window`);
+    if (!SHAPED_CREDENTIALS.has(value)) {
+      assert.match(value, /^[A-Za-z0-9]+$/, `${value} is not alphanumeric`);
+      assert.ok((value.match(/\d/g) ?? []).length >= 2 && (value.match(/[A-Za-z]/g) ?? []).length >= 4, `${value} does not look random`);
+    }
+    assert.doesNotMatch(value, /(.)\1\1/, `${value} repeats a character three times`);
+    for (const window of sixWindows(value)) {
+      const owner = owners.get(window);
+      assert.ok(owner === undefined || owner === value, `${value} shares the window ${window} with ${owner}`);
+      owners.set(window, value);
+    }
+  }
+
+  // Legitimate text: everything the healthy fixture renders (the access check, every
+  // assessment, and every bundle file), plus everything the secret-bearing fixture renders
+  // with the planted values themselves removed, so what remains is the fixture's ordinary
+  // vocabulary: names, hosts, URLs, ids, dates, and this module's own wording.
+  const corpus = [];
+  for (const client of [healthyClient(), secretBearingClient()]) {
+    corpus.push(JSON.stringify(await checkZendeskAccess(client)), JSON.stringify(await runAllAssessments(client)));
+    const bundle = await exportZendeskAuditBundle(client, sampleConfig(), createTempBase("grclanker-zendesk-self-check-"), { now: () => NOW });
+    for (const text of readBundleFiles(bundle.outputDir).values()) corpus.push(text);
+  }
+  const legitimate = PLANTED_CREDENTIALS.reduce((rest, value) => rest.split(value).join(""), corpus.join("\n"));
+  assert.ok(legitimate.length > 10_000, "the legitimate corpus is not empty");
+  for (const value of PLANTED_CREDENTIALS) {
+    for (const window of sixWindows(value)) assert.ok(!legitimate.includes(window), `window ${window} of ${value} occurs in legitimate fixture text`);
+  }
+});
+
+test("a documented error field is scrubbed of the configured secrets before it is shortened, so the 200-character cut never leaves a fragment of a secret", async () => {
+  const forms = [...secretForms(FIXTURE_API_TOKEN), ...secretForms(FIXTURE_BASIC_CREDENTIAL)];
+  for (const form of forms) {
+    // The form straddles the 200-character boundary of the shortened field: scrubbing
+    // after the cut would leave its head behind.
+    const description = `${"x".repeat(200 - Math.floor(form.length / 2))} ${form} was rejected by the upstream identity provider`;
+    const fetchImpl = async () => jsonResponse({ error: "Forbidden", description }, { status: 403, statusText: "Forbidden" });
+    const client = new ZendeskApiClient(sampleConfig(), { fetchImpl, sleep: async () => {} });
+    await assert.rejects(client.getAccountSettings(), (error) => {
+      assertNoWindow(error.message, form, `straddling ${form}`);
+      assert.match(error.message, /403 Forbidden; Forbidden; x{20,} \[REDACTED\]/, error.message);
+      return true;
+    });
+  }
+});
+
+// Canary values that must never survive into any tool result, finding, summary, or bundle
+// file: random-looking alphanumerics, no two sharing a 6-character window, so a leaked
+// window is attributable (see the window rule above).
+const CANARY_BEARER = "2N6iyPTaI1DOHyaG2LG5Rw";
+const CANARY_SESSION = "oO3RNP3mUoKn8dhyFj1bw1";
+const CANARY_API_KEY = "18F0CMC68hClk3TW4foXVF";
+const CANARY_URL_TOKEN = "P3GfdBos2IChWd8L1EAbNz";
+// A name-shaped value (the ruling's own example) that only its carrier, a cookie
+// assignment, gives away, and a plain lowercase word that only the Bearer scheme does.
+const CANARY_NAMED = "sess-canary-COOKIE-31415926535897";
+const CANARY_PLAIN = "jdvdnheoejphwk";
+// A second name-shaped value that travels in quotes (Cookie: sid="value"): neither its shape
+// nor the pair rule removes it, only a header rule that carries a quoted value through its
+// closing quote, so its absence proves that rule ran.
+const CANARY_QUOTED = "sess-qtdv-QCARRY-16180339887498";
+const CANARIES = [CANARY_BEARER, CANARY_SESSION, CANARY_API_KEY, CANARY_URL_TOKEN, CANARY_NAMED, CANARY_PLAIN, CANARY_QUOTED];
+const CANARY_URL = `https://api.example.com/v1/x?token=${CANARY_URL_TOKEN}`;
+// The scrubbed rendering of the JSON canary fields, as every error string must carry it.
+const JSON_CANARY_MARKER = /400 Bad Request; InvalidUpstream; Upstream refused Bearer \[REDACTED\] at https:\/\/api\.example\.com\/v1\/x\?token=\[REDACTED\] mid-sentence; _zendesk_session=\[REDACTED\], api_key=\[REDACTED\], Bearer \[REDACTED\], sid=\[REDACTED\] rejected; Cookie: \[REDACTED\]/;
+
+function htmlCanaryResponse() {
+  const body = `<html><head><title>502 Bad Gateway</title></head><body><p>Authorization: Bearer ${CANARY_BEARER}</p>`
+    + `<p>Set-Cookie: _zendesk_session=${CANARY_SESSION}; Path=/</p><p>X-Api-Key: ${CANARY_API_KEY}</p>`
+    + `<p>Proxy-Authorization: Bearer ${CANARY_PLAIN}</p><p>Cookie: sid=${CANARY_NAMED}</p><p>Cookie: sid="${CANARY_QUOTED}"; theme=dark</p>`
+    + `<p>The upstream at ${CANARY_URL} did not answer in time, retry later.</p></body></html>`;
+  return new Response(body, { status: 502, statusText: "Bad Gateway", headers: { "content-type": "text/html; charset=utf-8" } });
+}
+
+function jsonCanaryResponse() {
+  return jsonResponse({
+    error: "InvalidUpstream",
+    description: `Upstream refused Bearer ${CANARY_BEARER} at ${CANARY_URL} mid-sentence; _zendesk_session=${CANARY_SESSION}, api_key=${CANARY_API_KEY}, Bearer ${CANARY_PLAIN}, sid=${CANARY_NAMED} rejected`,
+    message: `Cookie: sid="${CANARY_QUOTED}"; theme=dark`,
+  }, { status: 400, statusText: "Bad Request" });
+}
+
+// The configured secrets of the sweep fixture, echoed bare in prose in every encoded form:
+// nothing but the configured-secret pass (guard 2) removes a name-shaped token or the
+// composed Basic credential, so their absence proves that pass ran at every sink.
+const ECHOED_FORMS = [...secretForms(FIXTURE_API_TOKEN), ...secretForms(FIXTURE_BASIC_CREDENTIAL)];
+// The plain Basic pair is echoed too; its email half is not a secret and stays.
+const ECHOED_MARKER = /credentials(?: \[REDACTED\])+ auditor@example\.com\/token:\[REDACTED\] rejected/;
+
+function echoedSecretsResponse() {
+  return jsonResponse({ error: "InvalidUpstream", description: `credentials ${ECHOED_FORMS.join(" ")} auditor@example.com/token:${FIXTURE_API_TOKEN} rejected` }, { status: 400, statusText: "Bad Request" });
+}
+
+function assertNoCanary(text, label, canaries = CANARIES) {
+  for (const canary of canaries) assertNoWindow(text, canary, label);
+}
+
+// Every planted credential of this fixture. The deliberate exceptions to the alphanumeric
+// shape are the name-shaped values that prove the configured-secret pass and the carrier
+// rules run on their own (hyphenated words with one digit group), the plain lowercase word
+// that only the Bearer scheme gives away, and the Slack path (the documented T/B/secret
+// shape, the whole path being the secret).
+const PLANTED_CREDENTIALS = [...Object.values(LOADER_CANARIES), ...CANARIES, ...Object.values(FAKE_ZENDESK_SECRETS), FIXTURE_API_TOKEN];
+const SHAPED_CREDENTIALS = new Set([CANARY_NAMED, CANARY_QUOTED, CANARY_PLAIN, FIXTURE_API_TOKEN, FAKE_ZENDESK_SECRETS.slackWebhookPath]);
+
+// Every HTTP surface ZendeskApiClient reads, keyed by path (the three /audit_logs reads are
+// distinguished by their query), served from the same fixtures as healthyClient().
+function zendeskRouteKey(url) {
+  const parsed = new URL(url);
+  const path = parsed.pathname.replace(/^\/api\/v2/, "");
+  if (path === "/audit_logs") {
+    if (parsed.searchParams.get("filter[source_type]") === "apitoken") return "/audit_logs?filter[source_type]=apitoken";
+    if (parsed.searchParams.get("sort") === "created_at") return "/audit_logs?sort=created_at";
+    return "/audit_logs?sort=-created_at";
+  }
+  return path;
+}
+
+function cursorPage(key, items) {
+  return { [key]: items, meta: { has_more: false, after_cursor: null }, links: { next: null } };
+}
+
+function offsetPage(key, items) {
+  return { [key]: items, next_page: null, previous_page: null, count: items.length };
+}
+
+async function healthyHttpRoutes() {
+  const base = healthyClient();
+  const items = async (method) => (await base[method]()).items;
+  return {
+    "/users/me": { user: await base.getCurrentUser() },
+    "/account/settings": { settings: await base.getAccountSettings() },
+    "/security_settings": { security_settings: await base.getSecuritySettings() },
+    "/users": cursorPage("users", await items("listTeamMembers")),
+    "/custom_roles": offsetPage("custom_roles", await items("listCustomRoles")),
+    "/groups": cursorPage("groups", await items("listGroups")),
+    "/group_memberships": cursorPage("group_memberships", await items("listGroupMemberships")),
+    "/audit_logs?sort=-created_at": cursorPage("audit_logs", await items("listRecentAuditLogs")),
+    "/audit_logs?sort=created_at": { audit_logs: [await base.getOldestAuditLog()] },
+    "/audit_logs?filter[source_type]=apitoken": cursorPage("audit_logs", await items("listApiTokenAuditLogs")),
+    "/deletion_schedules": offsetPage("deletion_schedules", await items("listDeletionSchedules")),
+    "/oauth/clients": cursorPage("clients", await items("listOAuthClients")),
+    "/oauth/tokens": cursorPage("tokens", await items("listOAuthTokens")),
+    "/apps/installations": offsetPage("installations", await items("listAppInstallations")),
+    "/apps/owned": offsetPage("apps", await items("listOwnedApps")),
+    "/brands": cursorPage("brands", await items("listBrands")),
+    "/webhooks": cursorPage("webhooks", await items("listWebhooks")),
+    "/targets": offsetPage("targets", await items("listTargets")),
+    "/triggers": cursorPage("triggers", await items("listTriggers")),
+    "/automations": cursorPage("automations", await items("listAutomations")),
+    "/sharing_agreements": offsetPage("sharing_agreements", await items("listSharingAgreements")),
+    "/suspended_tickets": cursorPage("suspended_tickets", await items("listSuspendedTickets")),
+  };
+}
+
+function httpClient(routes, failingSurface, makeResponse) {
+  return new ZendeskApiClient(sampleConfig(), {
+    fetchImpl: async (url) => {
+      const key = zendeskRouteKey(url);
+      if (key === failingSurface) return makeResponse();
+      const payload = routes[key];
+      if (payload === undefined) throw new Error(`unrouted Zendesk request: ${url}`);
+      return jsonResponse(payload);
+    },
+    sleep: async () => {},
+  });
+}
+
+test("the HTTP-level healthy fixture reproduces the mocked-client verdicts before the canary sweep relies on it", async () => {
+  const client = httpClient(await healthyHttpRoutes());
+  const access = await checkZendeskAccess(client);
+  assert.equal(access.status, "healthy");
+  assert.equal(access.surfaces.filter((surface) => surface.status === "readable").length, 20);
+  const statuses = statusMap(await runAllAssessments(client));
+  assert.equal(statuses.size, 25);
+  for (const [id, status] of statuses) {
+    assert.equal(status, ["ZD-11", "ZD-19"].includes(id) ? "manual" : "pass", `${id} over HTTP matches the mocked-client verdict`);
+  }
+});
+
+test("error-body canary sweep: every Zendesk surface failing with an HTML 502 or a JSON error body leaks no credential into any tool result, finding, or bundle file", async () => {
+  const routes = await healthyHttpRoutes();
+  const surfaces = Object.keys(routes);
+  assert.equal(surfaces.length, 22, "every endpoint the client reads is enumerated");
+  const shapes = [
+    { name: "html-502", make: htmlCanaryResponse, marker: /502 Bad Gateway; non-JSON text\/html response body \(\d+ bytes, not echoed\)/, canaries: CANARIES },
+    { name: "json-400", make: jsonCanaryResponse, marker: JSON_CANARY_MARKER, canaries: CANARIES },
+    { name: "echoed-secrets", make: echoedSecretsResponse, marker: ECHOED_MARKER, canaries: ECHOED_FORMS },
+  ];
+  // Fixture self-check: each body carries every canary or form verbatim before the scrubs see it.
+  for (const shape of shapes) {
+    const body = await shape.make().text();
+    for (const canary of shape.canaries) assert.ok(body.includes(canary), `fixture self-check: ${shape.name} carries ${canary}`);
+  }
+  for (const shape of shapes) {
+    for (const surface of surfaces) {
+      const label = `${shape.name} on ${surface}`;
+      const client = httpClient(routes, surface, shape.make);
+      const assertNoCanary = (text, where) => { for (const canary of shape.canaries) assertNoWindow(text, canary, `${where}`); };
+
+      const access = await checkZendeskAccess(client);
+      assertNoCanary(JSON.stringify(access), `${label} access check`);
+      const failedProbes = access.surfaces.filter((entry) => entry.status !== "readable");
+      // The access check probes the recent audit log read only; the oldest-record and
+      // token-event reads are exercised by the assessments below.
+      if (!surface.startsWith("/audit_logs?") || surface === "/audit_logs?sort=-created_at") {
+        assert.equal(failedProbes.length, 1, `${label}: exactly the failing surface must probe as unreadable`);
+      }
+      for (const probe of failedProbes) {
+        assert.equal(probe.status, "error", `${label}: ${probe.name} status`);
+        assert.match(probe.error, shape.marker, `${label}: access error must carry the note: ${probe.error}`);
+      }
+
+      const results = await runAllAssessments(client);
+      assertNoCanary(JSON.stringify(results), `${label} assessments`);
+      const errors = results.flatMap((result) => result.errors);
+      assert.ok(errors.length > 0, `${label}: the failing surface must be recorded as an error`);
+      for (const error of errors) {
+        assert.match(error, shape.marker, `${label}: every error must carry the note: ${error}`);
+        assert.doesNotMatch(error, /<html|Set-Cookie|X-Api-Key:|did not answer/i, `${label}: body text echoed: ${error}`);
+      }
+      for (const item of results.flatMap((result) => result.findings)) {
+        if (/could not be read|502 Bad Gateway|400 Bad Request/.test(item.summary)) {
+          assert.notEqual(item.status, "pass", `${label}: ${item.id} passed while naming the failed read`);
+        }
+      }
+
+      const bundle = await exportZendeskAuditBundle(client, sampleConfig(), createTempBase("grclanker-zendesk-canary-"), { now: () => NOW });
+      const files = readBundleFiles(bundle.outputDir);
+      const zipEntries = readZipEntries(bundle.zipPath);
+      assert.ok(files.size >= 15 && zipEntries.size === files.size, `${label}: bundle and zip were written`);
+      assertNoSecretWindows(files, shape.canaries, `${label} bundle`);
+      assertNoSecretWindows(zipEntries, shape.canaries, `${label} zip`);
+      for (const [name, content] of files) assertNoCanary(content, `${label} ${name}`);
+      const errorLog = files.get("_errors.log");
+      assert.ok(errorLog !== undefined, `${label}: _errors.log must exist`);
+      assert.match(errorLog, shape.marker, `${label}: _errors.log must carry the note`);
+      assert.match(files.get(join("compliance", "executive_summary.md")), /## Partial Collection Warnings/, `${label}: the executive summary names the partial collection`);
+    }
+  }
+});
+
+// Body text the notes must never echo, whatever the shape.
+const ECHOED_BODY_TEXT = /<html|Set-Cookie|X-Api-Key:|did not answer|Proxy-Authorization/i;
+
+test("the registered tools scrub error strings end to end over HTTP: access check, every assess tool, and the export", async () => {
+  const routes = await healthyHttpRoutes();
+  const failing = new Map();
+  // Bridges real HTTP requests from the tools onto the same route fixtures the sweep
+  // uses, so the tool boundary (runSealed, the text renderers, the export result) is
+  // exercised with the real fetch, the real retry sleeps, and the real config resolver.
+  const server = createServer((request, response) => {
+    const key = zendeskRouteKey(`http://127.0.0.1${request.url}`);
+    const upstream = failing.has(key)
+      ? failing.get(key)()
+      : routes[key] !== undefined
+        ? jsonResponse(routes[key])
+        : new Response(JSON.stringify({ error: "RecordNotFound", description: `unrouted ${key}` }), { status: 404, headers: { "content-type": "application/json" } });
+    upstream.text().then((text) => {
+      response.writeHead(upstream.status, Object.fromEntries(upstream.headers));
+      response.end(text);
+    });
+  });
+  await new Promise((resolveListen) => server.listen(0, "127.0.0.1", resolveListen));
+  const { port } = server.address();
+
+  const tools = new Map();
+  registerZendeskTools({ registerTool: (tool) => tools.set(tool.name, tool) });
+  const baseArgs = { subdomain: "acme", email: "auditor@example.com", api_token: FIXTURE_API_TOKEN, base_url: `http://127.0.0.1:${port}/api/v2` };
+  const run = async (name, extra = {}) => {
+    const tool = tools.get(name);
+    return tool.execute("call-tools", tool.prepareArguments({ ...baseArgs, ...extra }));
+  };
+  const assessTools = ["zendesk_assess_authentication", "zendesk_assess_access_control", "zendesk_assess_data_protection", "zendesk_assess_integrations"];
+  // The failing surfaces: team members (read by the access check, the authentication and
+  // access-control assessments, and the export) and webhooks (integrations and the export).
+  const failingSurfaces = { "/users": "team_members", "/webhooks": "webhooks" };
+
+  try {
+    // The 502 shape fails one surface only: the client retries a 5xx twice with real
+    // backoff, so every extra failing read costs the test 1.5 seconds.
+    for (const shape of [
+      { name: "html-502", make: htmlCanaryResponse, marker: /502 Bad Gateway; non-JSON text\/html response body \(\d+ bytes, not echoed\)/, canaries: CANARIES, surfaces: ["/webhooks"] },
+      { name: "json-400", make: jsonCanaryResponse, marker: JSON_CANARY_MARKER, canaries: CANARIES, surfaces: ["/users", "/webhooks"] },
+      { name: "echoed-secrets", make: echoedSecretsResponse, marker: ECHOED_MARKER, canaries: ECHOED_FORMS, surfaces: ["/users", "/webhooks"] },
+    ]) {
+      failing.clear();
+      for (const surface of shape.surfaces) failing.set(surface, shape.make);
+      const noCanary = (text, where) => { for (const canary of shape.canaries) assertNoWindow(text, canary, where); };
+      const expectedProbes = shape.surfaces.map((surface) => failingSurfaces[surface]).sort();
+
+      const access = await run("zendesk_check_access");
+      noCanary(JSON.stringify(access), `${shape.name} zendesk_check_access`);
+      assert.notEqual(access.isError, true, access.content[0].text);
+      const failedProbes = access.details.surfaces.filter((probe) => probe.status !== "readable");
+      assert.deepEqual(failedProbes.map((probe) => probe.name).sort(), expectedProbes, `${shape.name}: exactly the failing surfaces probe as unreadable`);
+      for (const probe of failedProbes) {
+        assert.equal(probe.status, "error");
+        assert.equal(probe.count, null);
+        assert.equal(probe.truncated, null);
+        assert.match(probe.error, shape.marker, `${shape.name}: ${probe.name}: ${probe.error}`);
+      }
+      assert.doesNotMatch(access.content[0].text, ECHOED_BODY_TEXT);
+      // The Note column is capped at 90 characters and the request URL fills most of it, so
+      // the rendering guarantees the row's status and null count; the full note is in details.
+      for (const probe of failedProbes) {
+        assert.match(access.content[0].text, new RegExp(`^\\s*${probe.name}\\s+│[^│]*│\\s*error\\s*│\\s*null\\s*│`, "m"), `${shape.name}: the ${probe.name} row renders error and null`);
+      }
+
+      const recorded = [];
+      for (const name of assessTools) {
+        const result = await run(name);
+        noCanary(JSON.stringify(result), `${shape.name} ${name}`);
+        assert.notEqual(result.isError, true, result.content[0].text);
+        assert.equal(result.details.tool, name);
+        for (const error of result.details.errors) {
+          assert.match(error, shape.marker, `${shape.name} ${name}: ${error}`);
+          assert.doesNotMatch(error, ECHOED_BODY_TEXT, error);
+          recorded.push(error);
+        }
+        assert.doesNotMatch(result.content[0].text, ECHOED_BODY_TEXT);
+        if (result.details.errors.length > 0) assert.match(result.content[0].text, /Collection warnings:/, `${name}: the rendering names the partial collection`);
+        for (const item of result.details.findings) {
+          if (/could not be read|502 Bad Gateway|400 Bad Request/.test(item.summary)) {
+            assert.notEqual(item.status, "pass", `${shape.name}: ${item.id} passed while naming the failed read`);
+          }
+        }
+      }
+      assert.ok(recorded.length >= shape.surfaces.length, `${shape.name}: every failing surface is recorded by the assessment that reads it`);
+
+      const exported = await run("zendesk_export_audit_bundle", { output_dir: createTempBase("grclanker-zendesk-tool-export-") });
+      noCanary(JSON.stringify(exported), `${shape.name} zendesk_export_audit_bundle`);
+      assert.notEqual(exported.isError, true, exported.content[0].text);
+      assert.ok(exported.details.error_count >= shape.surfaces.length, `${shape.name}: the export counts the failed reads`);
+      assert.match(exported.content[0].text, new RegExp(`Collection errors: ${exported.details.error_count}$`, "m"));
+      const files = readBundleFiles(exported.details.output_dir);
+      const zipEntries = readZipEntries(exported.details.zip_path);
+      assert.ok(files.size >= 15 && zipEntries.size === files.size, `${shape.name}: bundle and zip were written`);
+      for (const [name, text] of files) noCanary(text, `${shape.name} tool bundle ${name}`);
+      for (const [name, text] of zipEntries) noCanary(text, `${shape.name} tool zip ${name}`);
+      for (const line of files.get("_errors.log").trim().split("\n")) assert.match(line, shape.marker, line);
+    }
+  } finally {
+    server.close();
+  }
+});
+
+test("ZendeskApiError, transport errors, and the tool catch blocks scrub messages built at the throw site", async () => {
+  const constructed = new ZendeskApiError(`Zendesk request failed for /x (500; Bearer ${CANARY_BEARER} at ${CANARY_URL}; Bearer ${CANARY_PLAIN}; sid=${CANARY_NAMED}; Cookie: _zendesk_session=${CANARY_SESSION}; sid="${CANARY_QUOTED}")`, 500);
+  assertNoCanary(constructed.message, "constructor");
+  assert.equal(constructed.message, "Zendesk request failed for /x (500; Bearer [REDACTED] at https://api.example.com/v1/x?token=[REDACTED]; Bearer [REDACTED]; sid=[REDACTED]; Cookie: [REDACTED]", "the Cookie header line is withheld to the end of the line, quoted values included");
+  assert.equal(constructed.status, 500);
+  // A quoted header value in a JSON string, in the escaped form the raw body carries it.
+  const escaped = new ZendeskApiError(`upstream body {"detail":"rejected Cookie: sid=\\"${CANARY_QUOTED}\\"; path=/","code":401}`, 401);
+  assertNoCanary(escaped.message, "constructor, JSON-escaped quotes");
+  assert.equal(escaped.message, 'upstream body {"detail":"rejected Cookie: [REDACTED]","code":401}', "the escaped quotes go with the value and the JSON text around it stays intact");
+
+  const transport = new ZendeskApiClient(sampleConfig(), {
+    fetchImpl: async () => { throw new Error(`connect ECONNREFUSED via https://svc:${CANARY_SESSION}@proxy.example.com sending Authorization: Bearer ${CANARY_BEARER}`); },
+    sleep: async () => {},
+  });
+  await assert.rejects(transport.getCurrentUser(), (error) => {
+    assertNoCanary(error.message, "transport error");
+    assert.match(error.message, /https:\/\/\[REDACTED\]@proxy\.example\.com sending Authorization: \[REDACTED\]/);
+    return true;
+  });
+  const transportResult = await assessZendeskAuthentication(transport, { now: () => NOW });
+  assertNoCanary(JSON.stringify(transportResult), "transport error in assessment");
+  assert.ok(transportResult.errors.some((entry) => entry.startsWith("current_user dataset: ") && entry.includes("[REDACTED]@proxy.example.com")));
+
+  const tools = new Map();
+  registerZendeskTools({ registerTool: (tool) => tools.set(tool.name, tool) });
+  assert.equal(tools.size, 6);
+  for (const name of ["zendesk_check_access", "zendesk_assess_access_control", "zendesk_export_audit_bundle"]) {
+    const tool = tools.get(name);
+    const args = tool.prepareArguments({ subdomain: `acme token=${CANARY_URL_TOKEN} Bearer ${CANARY_BEARER}`, oauth_token: "oauth-secret" });
+    const result = await tool.execute("call-1", args);
+    const text = JSON.stringify(result);
+    assertNoCanary(text, `${name} tool error`);
+    assert.match(text, /Invalid Zendesk subdomain: acme token=\[REDACTED\] Bearer \[REDACTED\]/, `${name} routes its catch block through the redacting sink`);
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Rule 10: pagination exits that must report truncation
+// ---------------------------------------------------------------------------
+
+test("listCursor reports truncation on an empty or repeated page while has_more is true, on a stuck links.next, and stays complete on has_more=false", async () => {
+  const usersUrl = (after) => `https://acme.zendesk.com/api/v2/users?page%5Bsize%5D=100&include_boundary_indicators=true${after ? `&page%5Bafter%5D=${after}` : ""}&role%5B%5D=agent&role%5B%5D=admin`;
+  const page = (users, hasMore, next) => jsonResponse({ users, meta: { has_more: hasMore, after_cursor: next ?? null }, links: { next: next ? usersUrl(next) : null } });
+  const scripted = (responses) => {
+    let index = 0;
+    return new ZendeskApiClient(sampleConfig(), { fetchImpl: async (url) => responses[Math.min(index++, responses.length - 1)](url), sleep: async () => {} });
+  };
+
+  const emptyWithMore = await scripted([() => page([{ id: 1 }], true, "c2"), () => page([], true, "c3")]).listTeamMembers();
+  assert.equal(emptyWithMore.items.length, 1);
+  assert.equal(emptyWithMore.truncated, true, "an empty page while has_more=true must be recorded as truncated");
+  assert.equal(emptyWithMore.pages, 2);
+
+  const repeated = await scripted([() => page([{ id: 1 }, { id: 2 }], true, "c2"), () => page([{ id: 1 }, { id: 2 }], true, "c3")]).listTeamMembers();
+  assert.equal(repeated.items.length, 2);
+  assert.equal(repeated.truncated, true, "a page that adds nothing while has_more=true is a stuck cursor");
+
+  const repeatedNoMeta = await scripted([
+    () => jsonResponse({ users: [{ id: 1 }], meta: { after_cursor: "c2" }, links: { next: usersUrl("c2") } }),
+    () => jsonResponse({ users: [{ id: 1 }], meta: { after_cursor: "c3" }, links: { next: usersUrl("c3") } }),
+  ]).listTeamMembers();
+  assert.equal(repeatedNoMeta.truncated, true, "a repeated page with a continuation and no has_more flag is still partial");
+
+  const stuck = await scripted([(url) => jsonResponse({ users: [{ id: 1 }], meta: { has_more: true, after_cursor: "same" }, links: { next: url } })]).listTeamMembers();
+  assert.equal(stuck.items.length, 1);
+  assert.equal(stuck.pages, 1);
+  assert.equal(stuck.truncated, true, "a links.next equal to the requested URL is a cursor that stopped advancing");
+
+  const complete = await scripted([() => page([{ id: 1 }], true, "c2"), () => page([], false)]).listTeamMembers();
+  assert.equal(complete.items.length, 1);
+  assert.equal(complete.truncated, false, "an empty last page with has_more=false is a completed read");
+
+  const completeRepeat = await scripted([() => page([{ id: 1 }], true, "c2"), () => page([{ id: 1 }], false)]).listTeamMembers();
+  assert.equal(completeRepeat.truncated, false, "a repeated page with has_more=false is a completed read");
+
+  const emptyNoMeta = await scripted([() => jsonResponse({ users: [], links: { next: null } })]).listTeamMembers();
+  assert.equal(emptyNoMeta.items.length, 0);
+  assert.equal(emptyNoMeta.truncated, false, "an empty inventory without a continuation is complete");
+});
+
+test("listOffset reports truncation on an empty or replayed page while next_page is a URL, on a stuck next_page, and stays complete on next_page=null", async () => {
+  const targetsUrl = (pageNumber) => `https://acme.zendesk.com/api/v2/targets?page=${pageNumber}&per_page=100`;
+  const page = (targets, nextPage) => jsonResponse({ targets, next_page: nextPage, previous_page: null, count: 999 });
+  const scripted = (responses) => {
+    let index = 0;
+    return new ZendeskApiClient(sampleConfig(), { fetchImpl: async (url) => responses[Math.min(index++, responses.length - 1)](url), sleep: async () => {} });
+  };
+
+  const emptyWithNext = await scripted([() => page([{ id: 1 }], targetsUrl(2)), () => page([], targetsUrl(3))]).listTargets();
+  assert.equal(emptyWithNext.items.length, 1);
+  assert.equal(emptyWithNext.truncated, true, "an empty page while next_page is a URL must be recorded as truncated");
+
+  const replayed = await scripted([() => page([{ id: 1 }, { id: 2 }], targetsUrl(2)), () => page([{ id: 1 }, { id: 2 }], targetsUrl(3))]).listTargets();
+  assert.equal(replayed.items.length, 2);
+  assert.equal(replayed.truncated, true, "a replayed page while next_page is a URL is an offset the server ignored");
+
+  const stuck = await scripted([(url) => page([{ id: 1 }], url)]).listTargets();
+  assert.equal(stuck.pages, 1);
+  assert.equal(stuck.truncated, true, "a next_page equal to the requested URL is a stuck offset");
+
+  const complete = await scripted([() => page([{ id: 1 }], targetsUrl(2)), () => page([], null)]).listTargets();
+  assert.equal(complete.items.length, 1);
+  assert.equal(complete.truncated, false, "an empty last page with next_page=null is a completed read");
+
+  const emptyNull = await scripted([() => page([], null)]).listTargets();
+  assert.equal(emptyNull.truncated, false, "an empty inventory with next_page=null is complete");
+
+  const partialNoNext = await scripted([() => jsonResponse({ targets: [{ id: 1 }, { id: 2 }] })]).listTargets();
+  assert.equal(partialNoNext.truncated, false, "a short page without next_page is the whole inventory");
+});
+
+test("checkZendeskAccess marks capped probe counts as partial samples", async () => {
+  const result = await checkZendeskAccess(healthyClient({
+    async listTeamMembers() {
+      return list([teamMember({ id: 1, role: "admin" })], true);
+    },
+  }));
+  const team = result.surfaces.find((surface) => surface.name === "team_members");
+  assert.equal(team.status, "readable");
+  assert.equal(team.count, 1);
+  assert.equal(team.truncated, true);
+  assert.equal(result.surfaces.find((surface) => surface.name === "groups").truncated, false);
+  assert.equal(result.surfaces.find((surface) => surface.name === "current_user").truncated, undefined, "single-object probes carry no truncation flag");
+  assert.ok(result.notes.some((note) => /Probe counts for team_members are capped samples \(marked \+\)/.test(note)), result.notes.join("\n"));
+  const healthy = await checkZendeskAccess(healthyClient());
+  assert.ok(!healthy.notes.some((note) => /capped samples/.test(note)));
+});
+
+// ---------------------------------------------------------------------------
+// Rule 1 corollary and null rendering: secondary inventories that could not be read
+// ---------------------------------------------------------------------------
+
+test("ZD-24 demotes when the targets inventory is truncated or unreadable and renders unread counts as null", async () => {
+  const truncatedTargets = await assessZendeskIntegrations(healthyClient({
+    async listTargets() {
+      return list([{ id: 5, title: "Ops hook", active: true, target_url: "https://hooks.example.com/ops", type: "url_target_v2" }], true);
+    },
+  }), { now: () => NOW });
+  const item = findingById(truncatedTargets, "ZD-24");
+  assert.equal(item.status, "warn", item.summary);
+  assert.equal(item.evidence.inventory_truncated, true);
+  assert.match(item.summary, /The target inventory was truncated after 1 items/);
+  assert.equal(item.evidence.active_targets, 1);
+
+  const forbiddenTargets = await assessZendeskIntegrations(healthyClient({ listTargets: forbidden("/targets") }), { now: () => NOW });
+  const unread = findingById(forbiddenTargets, "ZD-24");
+  assert.equal(unread.status, "warn", "readable webhooks alone cannot pass when targets were unreadable");
+  assert.match(unread.summary, /targets \(\/targets\) returned 403|targets returned 403/i);
+  assert.equal(unread.evidence.targets_status, "forbidden");
+  assert.equal(unread.evidence.active_targets, null);
+  assert.equal(unread.evidence.insecure_targets, null);
+  assert.equal(unread.evidence.active_webhooks, 1);
+  assert.equal(forbiddenTargets.summary.targets, null);
+  assert.equal(forbiddenTargets.summary.webhooks, 1);
+
+  const forbiddenWebhooks = await assessZendeskIntegrations(healthyClient({
+    listWebhooks: forbidden("/webhooks"),
+    async listTargets() {
+      return list([{ id: 5, title: "Legacy", active: true, target_url: "http://legacy.example.com/hook", type: "url_target_v2" }]);
+    },
+  }), { now: () => NOW });
+  const failed = findingById(forbiddenWebhooks, "ZD-24");
+  assert.equal(failed.status, "fail");
+  assert.match(failed.summary, /1 active targets and an unread webhook inventory deliver to non-https endpoints/);
+  assert.equal(failed.evidence.active_webhooks, null);
+  assert.equal(failed.evidence.webhooks_without_authentication, null);
+});
+
+test("ZD-14 requires a readable token inventory before zero clients can pass and renders unread token counts as null", async () => {
+  const tokensForbidden = await assessZendeskAccessControl(healthyClient({
+    async listOAuthClients() {
+      return list([]);
+    },
+    listOAuthTokens: forbidden("/oauth/tokens"),
+  }), { now: () => NOW });
+  const item = findingById(tokensForbidden, "ZD-14");
+  assert.equal(item.status, "warn", item.summary);
+  assert.match(item.summary, /returned zero clients, but the token inventory could not be read/);
+  assert.match(item.summary, /OAuth tokens \(\/oauth\/tokens\?all=true, admin only\) returned 403/);
+  assert.equal(item.evidence.oauth_clients, 0);
+  assert.equal(item.evidence.oauth_tokens_status, "forbidden");
+  assert.equal(item.evidence.oauth_tokens, null);
+  assert.equal(item.evidence.tokens_with_write_or_impersonate, null);
+  assert.equal(item.evidence.tokens_without_expiry, null);
+  assert.equal(item.evidence.tokens_unused_over_stale_days, null);
+  assert.equal(item.evidence.tokens_without_used_at, null);
+  assert.equal(tokensForbidden.summary.oauth_tokens, null);
+  assert.equal(tokensForbidden.summary.oauth_clients, 0);
+
+  const tokensTruncated = await assessZendeskAccessControl(healthyClient({
+    async listOAuthClients() {
+      return list([]);
+    },
+    async listOAuthTokens() {
+      return list([], true);
+    },
+  }), { now: () => NOW });
+  assert.equal(findingById(tokensTruncated, "ZD-14").status, "warn");
+  assert.match(findingById(tokensTruncated, "ZD-14").summary, /an inventory was truncated before completion/);
+
+  const clientsWithTokensForbidden = await assessZendeskAccessControl(healthyClient({ listOAuthTokens: forbidden("/oauth/tokens") }), { now: () => NOW });
+  const clients = findingById(clientsWithTokensForbidden, "ZD-14");
+  assert.equal(clients.status, "warn");
+  assert.match(clients.summary, /Token hygiene could not be reviewed/);
+  assert.equal(clients.evidence.oauth_tokens, null);
+});
+
+test("ZD-13 caps the api_token_access=false pass when the token audit log is unreadable and renders its counts as null", async () => {
+  const result = await assessZendeskAccessControl(healthyClient({ listApiTokenAuditLogs: forbidden("/audit_logs?filter[source_type]=apitoken") }), { now: () => NOW });
+  const item = findingById(result, "ZD-13");
+  assert.equal(item.status, "warn", item.summary);
+  assert.match(item.summary, /api_token_access=false/);
+  assert.match(item.summary, /Verdict capped at warn because a secondary inventory could not be read: Audit log token events/);
+  assert.deepEqual(item.evidence.verdict_capped_by_unreadable, ["Audit log token events (/audit_logs?filter[source_type]=apitoken, Enterprise plan and admin role)"]);
+  assert.equal(item.evidence.token_audit_log_status, "forbidden");
+  for (const key of ["token_events_read", "token_events_truncated", "tokens_created", "tokens_destroyed", "tokens_outstanding", "tokens_outstanding_over_stale_days", "tokens_outstanding_undated", "outstanding_tokens"]) {
+    assert.equal(item.evidence[key], null, `${key} must render as null when the token audit log was unreadable`);
+  }
+
+  const readable = await assessZendeskAccessControl(healthyClient(), { now: () => NOW });
+  const pass = findingById(readable, "ZD-13");
+  assert.equal(pass.status, "pass");
+  assert.equal(pass.evidence.token_events_read, 0);
+  assert.equal(pass.evidence.token_events_truncated, false);
+  assert.deepEqual(pass.evidence.outstanding_tokens, []);
+  assert.equal(pass.evidence.verdict_capped_by_unreadable, undefined);
+});
+
+test("ZD-12 caps its pass when account settings or custom roles are unreadable and renders unread role counts as null", async () => {
+  const rolesForbidden = await assessZendeskDataProtection(healthyClient({ listCustomRoles: forbidden("/custom_roles") }), { now: () => NOW });
+  const item = findingById(rolesForbidden, "ZD-12");
+  assert.equal(item.status, "warn", item.summary);
+  assert.match(item.summary, /2 active deletion schedule\(s\) read to completion/);
+  assert.match(item.summary, /Custom roles \(\/custom_roles, Enterprise plan; redaction and deletion schedule permissions\) returned 403/);
+  assert.match(item.summary, /Verdict capped at warn because a secondary inventory could not be read/);
+  assert.equal(item.evidence.custom_roles_status, "forbidden");
+  assert.equal(item.evidence.custom_roles_with_ticket_redaction, null);
+  assert.equal(item.evidence.custom_roles_managing_deletion_schedules, null);
+  assert.deepEqual(item.evidence.verdict_capped_by_unreadable, ["Custom roles (/custom_roles, Enterprise plan; redaction and deletion schedule permissions)"]);
+
+  const settingsForbidden = await assessZendeskDataProtection(healthyClient({ getAccountSettings: forbidden("/account/settings") }), { now: () => NOW });
+  const capped = findingById(settingsForbidden, "ZD-12");
+  assert.equal(capped.status, "warn");
+  assert.equal(capped.evidence.agent_ticket_deletion, null);
+  assert.equal(capped.evidence.account_settings_status, "forbidden");
+  assert.deepEqual(capped.evidence.verdict_capped_by_unreadable, ["Account settings (settings.tickets.agent_ticket_deletion)"]);
+  assert.equal(settingsForbidden.summary.private_attachments, null);
+
+  const inactive = await assessZendeskDataProtection(healthyClient({
+    listCustomRoles: forbidden("/custom_roles"),
+    async listDeletionSchedules() {
+      return list([deletionSchedule({ id: 1, active: false })]);
+    },
+  }), { now: () => NOW });
+  assert.equal(findingById(inactive, "ZD-12").status, "fail", "a verified gap is not softened by an unreadable secondary");
+});
+
+test("ZD-21 caps its pass when account settings are unreadable and names the unverifiable password API flag", async () => {
+  const result = await assessZendeskAuthentication(healthyClient({ getAccountSettings: forbidden("/account/settings") }), { now: () => NOW });
+  const item = findingById(result, "ZD-21");
+  assert.equal(item.status, "warn", item.summary);
+  assert.match(item.summary, /enforce_sso=true/);
+  assert.match(item.summary, /settings\.api\.api_password_access_end_users could not be verified: Account settings \(\/account\/settings\) returned 403/);
+  assert.match(item.summary, /Verdict capped at warn because a secondary inventory could not be read/);
+  assert.equal(item.evidence.api_password_access_end_users, null);
+  assert.equal(item.evidence.account_settings_status, "forbidden");
+  assert.equal(item.evidence.security_settings_status, "ok");
+
+  const zendeskLogin = await assessZendeskAuthentication(healthyClient({
+    getAccountSettings: forbidden("/account/settings"),
+    async getSecuritySettings() {
+      return healthySecuritySettings({ endUser: { enforce_sso: false, remote_login: false, zendesk_login: true, security_policy_name: "recommended" } });
+    },
+  }), { now: () => NOW });
+  assert.equal(findingById(zendeskLogin, "ZD-21").status, "warn");
+
+  const healthy = findingById(await assessZendeskAuthentication(healthyClient(), { now: () => NOW }), "ZD-21");
+  assert.equal(healthy.status, "pass");
+  assert.equal(healthy.evidence.api_password_access_end_users, false);
+  assert.equal(healthy.evidence.account_settings_status, "ok");
+});
+
+test("ZD-25 records unresolved destinations when the target or webhook inventory is unreadable and caps its pass", async () => {
+  const targetsForbidden = await assessZendeskIntegrations(healthyClient({
+    listTargets: forbidden("/targets"),
+    async listTriggers() {
+      return list([{ id: 9, title: "Post to legacy", active: true, actions: [{ field: "notification_target", value: ["77", "{{ticket.title}}"] }] }]);
+    },
+  }), { now: () => NOW });
+  const item = findingById(targetsForbidden, "ZD-25");
+  assert.equal(item.status, "warn", item.summary);
+  assert.equal(item.evidence.unresolved_destinations, 1);
+  assert.equal(item.evidence.targets_status, "forbidden");
+  assert.equal(item.evidence.external_notification_actions[0].destination, "target 77");
+  assert.equal(item.evidence.external_notification_actions[0].unresolved, true);
+  assert.match(item.summary, /1 destination\(s\) could not be resolved to a URL, so their scheme was not checked: targets returned 403/);
+
+  const noExternal = await assessZendeskIntegrations(healthyClient({ listWebhooks: forbidden("/webhooks") }), { now: () => NOW });
+  const capped = findingById(noExternal, "ZD-25");
+  assert.equal(capped.status, "warn", capped.summary);
+  assert.match(capped.summary, /none notify external targets, webhooks, or sharing agreements\. Verdict capped at warn because a secondary inventory could not be read: Webhooks \(\/webhooks, used to resolve notification_webhook destinations\) returned 403/);
+  assert.deepEqual(capped.evidence.verdict_capped_by_unreadable, ["Webhooks (/webhooks, used to resolve notification_webhook destinations)"]);
+  assert.equal(capped.evidence.unresolved_destinations, 0);
+
+  const truncatedTargets = await assessZendeskIntegrations(healthyClient({
+    async listTargets() {
+      return list([{ id: 5, title: "Seen", active: true, target_url: "https://seen.example.com/hook", type: "url_target_v2" }], true);
+    },
+    async listTriggers() {
+      return list([{ id: 9, title: "Post to unseen", active: true, actions: [{ field: "notification_target", value: ["77", "{{ticket.title}}"] }] }]);
+    },
+  }), { now: () => NOW });
+  const unseen = findingById(truncatedTargets, "ZD-25");
+  assert.equal(unseen.evidence.unresolved_destinations, 1);
+  assert.match(unseen.summary, /The target or webhook inventory was truncated/);
+});
+
+test("ZD-15 caps the zero-installation pass when owned apps are unreadable and renders unread marketplace counts as null", async () => {
+  const result = await assessZendeskIntegrations(healthyClient({ listOwnedApps: forbidden("/apps/owned") }), { now: () => NOW });
+  const item = findingById(result, "ZD-15");
+  assert.equal(item.status, "warn", item.summary);
+  assert.match(item.summary, /returned zero installed apps.*Verdict capped at warn because a secondary inventory could not be read: Owned apps \(\/apps\/owned/);
+  assert.equal(item.evidence.owned_apps_status, "forbidden");
+  assert.equal(item.evidence.marketplace_installations, null);
+  assert.equal(item.evidence.enabled_marketplace_installations, null);
+  assert.equal(result.summary.owned_apps, null);
+  assert.equal(result.summary.app_installations, 0);
+  assert.equal(findingById(result, "ZD-16").status, "manual");
+});
+
+test("ZD-02 marks named principal lists as partial when the team inventory is truncated", async () => {
+  const result = await assessZendeskAuthentication(healthyClient({
+    async listTeamMembers() {
+      const member = teamMember({ id: 2, role: "agent", two_factor_auth_enabled: false });
+      const unknown = teamMember({ id: 3, role: "agent" });
+      delete unknown.two_factor_auth_enabled;
+      return list([teamMember({ id: 1, role: "admin" }), member, unknown], true);
+    },
+  }), { now: () => NOW });
+  const item = findingById(result, "ZD-02");
+  assert.equal(item.status, "warn");
+  assert.match(item.summary, /at least 1 team members report two_factor_auth_enabled=false \(not yet enrolled\) and at least 1 did not expose the flag/);
+  assert.equal(item.evidence.inventory_truncated, true);
+  assert.equal(item.evidence.without_two_factor_partial, true);
+  assert.equal(item.evidence.two_factor_flag_missing_partial, true);
+  assert.deepEqual(item.evidence.without_two_factor, ["user-2@example.com"]);
+  assert.deepEqual(item.evidence.two_factor_flag_missing, ["user-3@example.com"]);
+
+  const complete = findingById(await assessZendeskAuthentication(healthyClient(), { now: () => NOW }), "ZD-02");
+  assert.equal(complete.evidence.without_two_factor_partial, false);
+  assert.equal(complete.evidence.two_factor_flag_missing_partial, false);
+});
+
+test("assessment summaries and evidence render unread inventories as null, never 0 or []", async () => {
+  const authentication = await assessZendeskAuthentication(healthyClient({ listTeamMembers: forbidden("/users") }), { now: () => NOW });
+  assert.equal(authentication.summary.seen_team_members, null);
+  assert.equal((await assessZendeskAuthentication(healthyClient(), { now: () => NOW })).summary.seen_team_members, 4);
+
+  const accessControl = await assessZendeskAccessControl(healthyClient({
+    listCustomRoles: forbidden("/custom_roles"),
+    listGroups: forbidden("/groups"),
+    listOAuthClients: forbidden("/oauth/clients"),
+    listOAuthTokens: forbidden("/oauth/tokens"),
+  }), { now: () => NOW });
+  assert.equal(accessControl.summary.seen_team_members, 4);
+  assert.equal(accessControl.summary.admins, 2);
+  assert.equal(accessControl.summary.custom_roles, null);
+  assert.equal(accessControl.summary.groups, null);
+  assert.equal(accessControl.summary.oauth_clients, null);
+  assert.equal(accessControl.summary.oauth_tokens, null);
+  const leastPrivilege = findingById(accessControl, "ZD-06");
+  assert.equal(leastPrivilege.status, "manual");
+  assert.equal(leastPrivilege.evidence.custom_roles, null);
+  assert.equal(leastPrivilege.evidence.admin_equivalent_custom_roles, null);
+  assert.equal(leastPrivilege.evidence.custom_roles_status, "forbidden");
+
+  const teamForbidden = await assessZendeskAccessControl(healthyClient({ listTeamMembers: forbidden("/users") }), { now: () => NOW });
+  assert.equal(teamForbidden.summary.seen_team_members, null);
+  assert.equal(teamForbidden.summary.admins, null);
+
+  const dataProtection = await assessZendeskDataProtection(healthyClient({
+    listRecentAuditLogs: forbidden("/audit_logs"),
+    listDeletionSchedules: forbidden("/deletion_schedules"),
+    listSuspendedTickets: forbidden("/suspended_tickets"),
+  }), { now: () => NOW });
+  assert.equal(dataProtection.summary.audit_log_status, "forbidden");
+  assert.equal(dataProtection.summary.audit_log_entries_sampled, null);
+  assert.equal(dataProtection.summary.deletion_schedules, null);
+  assert.equal(dataProtection.summary.suspended_tickets, null);
+  assert.equal(dataProtection.summary.private_attachments, true);
+
+  const integrations = await assessZendeskIntegrations(healthyClient({
+    listAppInstallations: forbidden("/apps/installations"),
+    listOwnedApps: forbidden("/apps/owned"),
+    listBrands: forbidden("/brands"),
+    listWebhooks: forbidden("/webhooks"),
+    listTargets: forbidden("/targets"),
+  }), { now: () => NOW });
+  for (const key of ["app_installations", "owned_apps", "brands", "webhooks", "targets"]) {
+    assert.equal(integrations.summary[key], null, `${key} must render as null when unread`);
+  }
+
+  const healthyIntegrations = await assessZendeskIntegrations(healthyClient(), { now: () => NOW });
+  assert.deepEqual(
+    [healthyIntegrations.summary.app_installations, healthyIntegrations.summary.owned_apps, healthyIntegrations.summary.brands, healthyIntegrations.summary.webhooks, healthyIntegrations.summary.targets],
+    [0, 0, 1, 1, 0],
+    "readable empty inventories still render their real counts",
+  );
+});
+
+// ---------------------------------------------------------------------------
+// Collection status, request matching, and denied-list markers (addendum 5)
+// ---------------------------------------------------------------------------
+
+// Every paged read the assessments keep, keyed by the route the HTTP fixture serves,
+// with the core_data/ file each one is written to.
+const LIST_CORE_DATA_FILES = {
+  "/users": "team_members",
+  "/custom_roles": "custom_roles",
+  "/groups": "groups",
+  "/group_memberships": "group_memberships",
+  "/oauth/clients": "oauth_clients",
+  "/oauth/tokens": "oauth_tokens",
+  "/audit_logs?filter[source_type]=apitoken": "api_token_audit_logs",
+  "/audit_logs?sort=-created_at": "audit_logs_recent",
+  "/deletion_schedules": "deletion_schedules",
+  "/suspended_tickets": "suspended_tickets",
+  "/apps/installations": "app_installations",
+  "/apps/owned": "owned_apps",
+  "/brands": "brands",
+  "/sharing_agreements": "sharing_agreements",
+  "/targets": "targets",
+  "/webhooks": "webhooks",
+  "/triggers": "triggers",
+  "/automations": "automations",
+};
+
+const PROBE_NAMES_BY_ROUTE = {
+  "/users": "team_members",
+  "/custom_roles": "custom_roles",
+  "/groups": "groups",
+  "/group_memberships": "group_memberships",
+  "/oauth/clients": "oauth_clients",
+  "/oauth/tokens": "oauth_tokens",
+  "/audit_logs?sort=-created_at": "audit_logs",
+  "/deletion_schedules": "deletion_schedules",
+  "/suspended_tickets": "suspended_tickets",
+  "/apps/installations": "app_installations",
+  "/apps/owned": "owned_apps",
+  "/brands": "brands",
+  "/sharing_agreements": "sharing_agreements",
+  "/targets": "targets",
+  "/webhooks": "webhooks",
+  "/triggers": "triggers",
+  "/automations": "automations",
+};
+
+function forbiddenJsonResponse() {
+  return jsonResponse(
+    { error: "Forbidden", description: "You do not have access to this page. Please contact the account owner of this help desk for further help." },
+    { status: 403, statusText: "Forbidden" },
+  );
+}
+
+function collectionEntry(files, name) {
+  for (const [path, text] of files) {
+    if (!path.startsWith("analysis") || !path.endsWith(".json") || path.endsWith("findings.json")) continue;
+    const entry = JSON.parse(text).summary?.collection?.[name];
+    if (entry) return entry;
+  }
+  return undefined;
+}
+
+test("denied-list markers: a denied list writes a not-collected marker in core_data with the observed status and request while a readable-but-empty list stays a list result", async () => {
+  const routes = await healthyHttpRoutes();
+  const outputRoot = createTempBase("grclanker-zendesk-markers-");
+
+  for (const [route, name] of Object.entries(LIST_CORE_DATA_FILES)) {
+    const client = httpClient(routes, route, forbiddenJsonResponse);
+    const endpoint = `GET /api/v2${route.split("?")[0]}`;
+
+    const access = await checkZendeskAccess(client);
+    const probeName = PROBE_NAMES_BY_ROUTE[route];
+    if (probeName) {
+      const probe = access.surfaces.find((surface) => surface.name === probeName);
+      assert.equal(probe.status, "forbidden", `${route}: the probe reports the refusal`);
+      assert.equal(probe.count, null, `${route}: a refused probe counts nothing`);
+      assert.equal(probe.truncated, null, `${route}: a refused probe has no paging outcome`);
+      assert.equal(probe.httpStatus, 403, `${route}: the probe carries the status the request observed`);
+    }
+
+    const exported = await exportZendeskAuditBundle(client, sampleConfig(), outputRoot, { now: () => NOW });
+    const files = readBundleFiles(exported.outputDir);
+    const marker = JSON.parse(files.get(join("core_data", `${name}.json`)));
+    assert.deepEqual(Object.keys(marker).sort(), ["collected", "dataset_status", "endpoint", "error", "status"], `${route}: the denied list is a marker object, not a list result`);
+    assert.equal(marker.collected, false);
+    assert.equal(marker.status, 403, `${route}: the marker carries the status the request observed`);
+    assert.equal(marker.dataset_status, "forbidden");
+    assert.equal(marker.endpoint, endpoint, `${route}: the marker names the request that actually failed`);
+    assert.match(marker.error, /\(403 Forbidden; Forbidden; You do not have access to this page/, `${route}: the marker carries the scrubbed error`);
+    assert.equal(readZipEntries(exported.zipPath).get(`core_data/${name}.json`), files.get(join("core_data", `${name}.json`)), `${route}: the zip carries the same marker`);
+
+    const status = collectionEntry(files, name);
+    assert.deepEqual(
+      { status: status.status, endpoint: status.endpoint, http_status: status.http_status, seen: status.seen, truncated: status.truncated, pages: status.pages },
+      { status: "forbidden", endpoint, http_status: 403, seen: null, truncated: null, pages: null },
+      `${route}: seen, truncated, and pages stay null for a read that never ran`,
+    );
+    assert.match(status.error, /403 Forbidden/);
+
+    // The healthy fixture serves app installations, owned apps, and targets as readable-but-empty lists.
+    const controlName = name === "targets" ? "app_installations" : "targets";
+    const control = JSON.parse(files.get(join("core_data", `${controlName}.json`)));
+    assert.deepEqual(control, { items: [], truncated: false, pages: 1 }, `${route} denied: a readable-but-empty list is still an empty list result`);
+    const controlStatus = collectionEntry(files, controlName);
+    assert.deepEqual(
+      { status: controlStatus.status, http_status: controlStatus.http_status, seen: controlStatus.seen, truncated: controlStatus.truncated, pages: controlStatus.pages, error: controlStatus.error },
+      { status: "ok", http_status: null, seen: 0, truncated: false, pages: 1, error: null },
+      `${route} denied: the readable-but-empty list reports its real counts`,
+    );
+  }
+
+  // A denied single-object read is written as a marker too, and a read that was never
+  // attempted because its prerequisite failed names the request that actually failed.
+  const client = httpClient(routes, "/security_settings", forbiddenJsonResponse);
+  const exported = await exportZendeskAuditBundle(client, sampleConfig(), outputRoot, { now: () => NOW });
+  const files = readBundleFiles(exported.outputDir);
+  const securityMarker = JSON.parse(files.get(join("core_data", "security_settings.json")));
+  assert.equal(securityMarker.collected, false);
+  assert.equal(securityMarker.status, 403);
+  assert.equal(securityMarker.endpoint, "GET /api/v2/security_settings");
+
+  const auditDenied = httpClient(routes, "/audit_logs?sort=-created_at", forbiddenJsonResponse);
+  const auditExport = await exportZendeskAuditBundle(auditDenied, sampleConfig(), outputRoot, { now: () => NOW });
+  const auditFiles = readBundleFiles(auditExport.outputDir);
+  const oldestMarker = JSON.parse(auditFiles.get(join("core_data", "audit_log_oldest.json")));
+  assert.equal(oldestMarker.collected, false, "the oldest-record lookup that was never attempted is a marker");
+  assert.equal(oldestMarker.endpoint, "GET /api/v2/audit_logs", "it names the recent-log request that actually failed");
+  assert.equal(oldestMarker.status, 403);
+});
+
+function recordingZendeskFetch(routes, failures, log) {
+  return async (url) => {
+    const parsed = new URL(url);
+    const key = zendeskRouteKey(url);
+    const failure = failures[key];
+    const response = failure ? failure() : routes[key] === undefined ? undefined : jsonResponse(routes[key]);
+    if (!response) throw new Error(`unrouted Zendesk request: ${url}`);
+    log.push({ method: "GET", path: parsed.pathname, status: response.status });
+    return response;
+  };
+}
+
+function namedZendeskEndpoints(text) {
+  const endpoints = new Set();
+  for (const match of text.matchAll(/\/api\/v2\/[A-Za-z0-9_/.-]+/g)) endpoints.add(match[0].replace(/[.,;:]+$/, ""));
+  // Finding summaries name the read's path in parentheses without the /api/v2 prefix.
+  for (const match of text.matchAll(/\((\/(?!api\/)[a-z_]+(?:\/[a-z_]+)*)/g)) endpoints.add(`/api/v2${match[1]}`);
+  return endpoints;
+}
+
+function namedZendeskStatusCodes(text) {
+  const codes = new Set();
+  for (const match of text.matchAll(/\((\d{3}) [A-Z][A-Za-z ]*[;)]/g)) codes.add(Number(match[1]));
+  for (const match of text.matchAll(/"(?:http_)?status": ?(\d{3})\b/g)) codes.add(Number(match[1]));
+  for (const match of text.matchAll(/returned (\d{3}) \(/g)) codes.add(Number(match[1]));
+  return codes;
+}
+
+test("request matching: every endpoint path and HTTP status named in any output corresponds to a request the run made and observed", async () => {
+  const routes = await healthyHttpRoutes();
+  const log = [];
+  const failures = {
+    "/oauth/clients": forbiddenJsonResponse,
+    "/webhooks": htmlCanaryResponse,
+    "/deletion_schedules": () => new Response("", { status: 404, statusText: "Not Found" }),
+  };
+  const client = new ZendeskApiClient(sampleConfig(), { fetchImpl: recordingZendeskFetch(routes, failures, log), sleep: async () => {} });
+
+  const outputs = [JSON.stringify(await checkZendeskAccess(client))];
+  for (const result of await runAllAssessments(client)) outputs.push(JSON.stringify(result));
+  const exported = await exportZendeskAuditBundle(client, sampleConfig(), createTempBase("grclanker-zendesk-request-log-"), { now: () => NOW });
+  outputs.push(...readBundleFiles(exported.outputDir).values());
+
+  const requestedPaths = new Set(log.map((entry) => entry.path));
+  const observedStatuses = new Set(log.map((entry) => entry.status));
+  assert.ok(observedStatuses.has(403) && observedStatuses.has(502) && observedStatuses.has(404), "the fixture served every failure status under test");
+
+  const text = outputs.join("\n");
+  const endpoints = namedZendeskEndpoints(text);
+  const statuses = namedZendeskStatusCodes(text);
+  assert.ok(endpoints.has("/api/v2/oauth/clients") && endpoints.has("/api/v2/webhooks") && endpoints.has("/api/v2/deletion_schedules"), `the outputs name the failing endpoints: ${[...endpoints].join(", ")}`);
+  assert.ok(statuses.has(403) && statuses.has(502) && statuses.has(404), `the outputs name the observed failure statuses: ${[...statuses].join(", ")}`);
+  for (const endpoint of endpoints) {
+    assert.ok(requestedPaths.has(endpoint), `endpoint ${endpoint} is named in output but the run never requested it`);
+  }
+  for (const status of statuses) {
+    assert.ok(observedStatuses.has(status), `status ${status} is named in output but no request observed it`);
+  }
+  for (const entry of log) {
+    assert.ok(entry.status === 200 || Object.keys(failures).some((key) => entry.path === `/api/v2${key.split("?")[0]}`), `only the three failing surfaces answered with an error: ${entry.path} ${entry.status}`);
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Silent-success class: a 2xx answer without the documented JSON document
+// ---------------------------------------------------------------------------
+
+// Wording that must never leave the client: the page itself and V8's parser message,
+// which quotes a window of the body.
+const NON_DOCUMENT_ECHO = /Captive portal canary page|Unexpected token|is not valid JSON|Unexpected end of JSON/;
+
+// Every body a proxy, captive portal, sign-in page, or misrouted request can serve with
+// a 2xx status in place of the documented document, driven through the real client
+// parser path (a fixture that throws for a non-protocol body could not see the class).
+// The page carries two carried canaries so an echo would show; the last shape carries
+// a content type that is not shaped like a media type, which is never quoted.
+const SILENT_SUCCESS_SHAPES = [
+  {
+    name: "200-html",
+    make: () => new Response(
+      `<html><head><title>Captive portal canary page</title></head><body><p>Authorization: Bearer ${CANARY_BEARER}</p><p>Cookie: sid=${CANARY_NAMED}</p></body></html>`,
+      { status: 200, statusText: "OK", headers: { "content-type": "text/html; charset=utf-8" } },
+    ),
+    note: /200 OK with a non-JSON text\/html response body \(\d+ bytes, not echoed\) where the documented JSON document was expected/,
+  },
+  {
+    name: "200-empty",
+    make: () => new Response("", { status: 200, statusText: "OK", headers: { "content-type": "application/json" } }),
+    note: /200 OK with an empty response body where the documented JSON document was expected/,
+  },
+  {
+    name: "200-json-array",
+    make: () => new Response("[]", { status: 200, statusText: "OK", headers: { "content-type": "application/json" } }),
+    note: /200 OK with a JSON array response body \(2 bytes, not echoed\) where the documented JSON document was expected/,
+  },
+  {
+    name: "200-foreign-object",
+    make: () => new Response(JSON.stringify({ status: "ok", region: "prod-us-east-2026" }), { status: 200, statusText: "OK", headers: { "content-type": "application/json" } }),
+    note: /200 OK with a JSON response body without the documented "[a-z_]+" (?:array|object) \(\d+ bytes, not echoed\)/,
+  },
+  {
+    name: "200-hostile-media-type",
+    make: () => new Response("<html>Captive portal canary page</html>", { status: 200, statusText: "OK", headers: { "content-type": `Bearer ${CANARY_BEARER}` } }),
+    note: /200 OK with a non-JSON unknown response body \(\d+ bytes, not echoed\) where the documented JSON document was expected/,
+  },
+];
+
+const OBJECT_PROBE_NAMES = { "/users/me": "current_user", "/account/settings": "account_settings", "/security_settings": "security_settings" };
+
+test("silent-success class: a 2xx answer without the documented JSON document on any surface is an unreadable surface with the observed status, never an empty inventory, a readable probe, a healthy check, or a hard verdict", async () => {
+  const routes = await healthyHttpRoutes();
+  const surfaces = Object.keys(routes);
+  const baseline = statusMap(await runAllAssessments(httpClient(routes)));
+
+  // Positive control: the parser's own message quotes the page, so only the fixed note keeps it out.
+  const htmlBody = await SILENT_SUCCESS_SHAPES[0].make().text();
+  assert.throws(() => JSON.parse(htmlBody), (error) => /Unexpected token|is not valid JSON/.test(error.message));
+  for (const shape of SILENT_SUCCESS_SHAPES) assert.equal(shape.make().status, 200, `${shape.name} is served as a success`);
+
+  for (const surface of surfaces) {
+    // A 2xx without the document demotes exactly the verdicts a refusal of the same surface demotes.
+    const refused = statusMap(await runAllAssessments(httpClient(routes, surface, forbiddenJsonResponse)));
+    const dependents = [...baseline.keys()].filter((id) => refused.get(id) !== baseline.get(id));
+    const coreDataName = LIST_CORE_DATA_FILES[surface];
+    const probeName = PROBE_NAMES_BY_ROUTE[surface] ?? OBJECT_PROBE_NAMES[surface];
+
+    for (const shape of SILENT_SUCCESS_SHAPES) {
+      const label = `${shape.name} on ${surface}`;
+      const log = [];
+      const client = new ZendeskApiClient(sampleConfig(), { fetchImpl: recordingZendeskFetch(routes, { [surface]: shape.make }, log), sleep: async () => {} });
+
+      const access = await checkZendeskAccess(client);
+      const accessText = JSON.stringify(access);
+      assertNoCanary(accessText, `${label} access check`);
+      assert.doesNotMatch(accessText, NON_DOCUMENT_ECHO, `${label}: the page or the parser message reached the access check`);
+      if (probeName) {
+        const probe = access.surfaces.find((entry) => entry.name === probeName);
+        assert.equal(probe.status, "error", `${label}: the probe does not count the surface as readable`);
+        assert.equal(probe.httpStatus, 200, `${label}: the probe carries the status the request observed`);
+        assert.equal(probe.count, null, `${label}: nothing was read, so nothing is counted`);
+        assert.equal(probe.truncated, null, `${label}: no paging outcome exists`);
+        assert.match(probe.error, shape.note, `${label}: ${probe.error}`);
+        assert.equal(access.status, "limited", `${label}: a surface that produced no data is not a healthy check`);
+        assert.ok(access.notes.some((note) => note.startsWith("Not read (") && note.includes(probeName)), `${label}: the notes name the surface: ${access.notes.join(" | ")}`);
+        assert.match(access.recommendedNextStep, /network path/, `${label}: the next step names the network, not the credential`);
+        assert.equal(access.surfaces.filter((entry) => entry.status !== "readable").length, 1, `${label}: only the failing surface is unreadable`);
+      } else {
+        assert.equal(access.status, "healthy", `${label}: the access check does not read this surface`);
+      }
+
+      const results = await runAllAssessments(client);
+      const resultsText = JSON.stringify(results);
+      assertNoCanary(resultsText, `${label} assessments`);
+      assert.doesNotMatch(resultsText, NON_DOCUMENT_ECHO, `${label}: the page or the parser message reached an assessment`);
+      const errors = results.flatMap((result) => result.errors);
+      assert.ok(errors.length > 0, `${label}: the surface is recorded as a collection error`);
+      for (const error of errors) assert.match(error, shape.note, `${label}: ${error}`);
+      for (const [id, status] of statusMap(results)) {
+        assert.equal(status, refused.get(id), `${label}: ${id} renders ${status} where a refused read of the same surface renders ${refused.get(id)}`);
+        if (dependents.includes(id)) assert.ok(["warn", "manual"].includes(status), `${label}: dependent ${id} rendered the hard verdict ${status}`);
+      }
+      for (const code of namedZendeskStatusCodes(`${accessText}\n${resultsText}`)) {
+        assert.equal(code, 200, `${label}: status ${code} is named in output but the fixture served only 200`);
+      }
+
+      const exported = await exportZendeskAuditBundle(client, sampleConfig(), createTempBase("grclanker-zendesk-silent-success-"), { now: () => NOW });
+      const files = readBundleFiles(exported.outputDir);
+      for (const [name, content] of files) {
+        assertNoCanary(content, `${label} ${name}`);
+        assert.doesNotMatch(content, NON_DOCUMENT_ECHO, `${label}: the page or the parser message reached ${name}`);
+      }
+      assert.match(files.get("_errors.log"), shape.note, `${label}: _errors.log carries the note`);
+      if (coreDataName) {
+        const marker = JSON.parse(files.get(join("core_data", `${coreDataName}.json`)));
+        assert.deepEqual(
+          { collected: marker.collected, status: marker.status, dataset_status: marker.dataset_status },
+          { collected: false, status: 200, dataset_status: "error" },
+          `${label}: the dataset is a marker carrying the observed status, not an empty list`,
+        );
+        assert.match(marker.error, shape.note, `${label}: the marker carries the note`);
+        const entry = collectionEntry(files, coreDataName);
+        assert.deepEqual(
+          { status: entry.status, http_status: entry.http_status, seen: entry.seen, truncated: entry.truncated },
+          { status: "error", http_status: 200, seen: null, truncated: null },
+          `${label}: the collection status carries the observed 200 and no counts`,
+        );
+      }
+      assert.ok(log.every((entry) => entry.status === 200), `${label}: every request in the run observed a 2xx`);
+    }
+  }
+});
+
+test("ZendeskApiClient fails a paged read whose later page or single-object read lacks the documented member instead of returning a shorter complete inventory", async () => {
+  const usersUrl = (after) => `https://acme.zendesk.com/api/v2/users?page%5Bsize%5D=100&include_boundary_indicators=true&page%5Bafter%5D=${after}&role%5B%5D=agent&role%5B%5D=admin`;
+  const scripted = (responses) => {
+    let index = 0;
+    return new ZendeskApiClient(sampleConfig(), { fetchImpl: async (url) => responses[Math.min(index++, responses.length - 1)](url), sleep: async () => {} });
+  };
+
+  await assert.rejects(
+    scripted([
+      () => jsonResponse({ users: [{ id: 1 }], meta: { has_more: true, after_cursor: "c2" }, links: { next: usersUrl("c2") } }, { statusText: "OK" }),
+      () => jsonResponse({ meta: { has_more: false } }, { statusText: "OK" }),
+    ]).listTeamMembers(),
+    (error) => {
+      assert.ok(error instanceof ZendeskApiError);
+      assert.equal(error.status, 200);
+      assert.equal(error.endpoint, "GET /api/v2/users");
+      assert.match(error.message, /^Zendesk request GET \/api\/v2\/users returned 200 OK with a JSON response body without the documented "users" array \(\d+ bytes, not echoed\)$/);
+      return true;
+    },
+  );
+  await assert.rejects(
+    scripted([() => jsonResponse({ user: [] }, { statusText: "OK" })]).getCurrentUser(),
+    /Zendesk request GET \/api\/v2\/users\/me returned 200 OK with a JSON response body without the documented "user" object \(\d+ bytes, not echoed\)$/,
+  );
+  await assert.rejects(
+    scripted([() => jsonResponse({ audit_logs: { id: 1 } }, { statusText: "OK" })]).getOldestAuditLog(),
+    /returned 200 OK with a JSON response body without the documented "audit_logs" array/,
+  );
+  // The documented empty document is still an empty, complete inventory.
+  const empty = await scripted([() => jsonResponse({ targets: [], next_page: null, previous_page: null, count: 0 })]).listTargets();
+  assert.deepEqual(empty, { items: [], truncated: false, pages: 1 });
+  // A 204 is not a documented answer to any read here and carries no document.
+  await assert.rejects(
+    scripted([() => new Response(null, { status: 204, statusText: "No Content" })]).getAccountSettings(),
+    /returned 204 No Content with an empty response body where the documented JSON document was expected/,
+  );
 });
