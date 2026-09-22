@@ -39,6 +39,7 @@ import { registerKevsTools } from "./grc-tools/kevs.js";
 import { registerKnowbe4Tools } from "./grc-tools/knowbe4.js";
 import { registerLaunchdarklyTools } from "./grc-tools/launchdarkly.js";
 import { registerMulesoftTools } from "./grc-tools/mulesoft.js";
+import { registerNewrelicTools } from "./grc-tools/newrelic.js";
 import { registerOktaTools } from "./grc-tools/okta.js";
 import { registerOciTools } from "./grc-tools/oci.js";
 import { registerOscalTools } from "./grc-tools/oscal.js";
@@ -85,6 +86,7 @@ const DOMAIN_TOOL_REGISTRARS: ReadonlyArray<(pi: ExtensionAPI) => void> = [
   registerKnowbe4Tools,
   registerLaunchdarklyTools,
   registerMulesoftTools,
+  registerNewrelicTools,
   registerOciTools,
   registerOktaTools,
   registerOscalTools,
