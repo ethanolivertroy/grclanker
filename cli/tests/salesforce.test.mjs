@@ -1063,7 +1063,7 @@ test("review fix 4: TwoFactorMethodsInfo names Manage MFA in API and treats the 
     twoFactorMethods: okDataset("TwoFactorMethodsInfo", goodTwoFactor, { truncated: true }),
   }), { now: NOW }), "SF-04");
   assert.equal(cappedFinding.status, "warn");
-  assert.match(cappedFinding.summary, /documented 2500-row cap with no done=false signal/);
+  assert.match(cappedFinding.summary, /TwoFactorMethodsInfo returned 2 rows, and the query reported more rows than were returned \(done=false or a stalled cursor\), so enrollment coverage is incomplete/);
   assert.equal(cappedFinding.evidence.two_factor_methods_possibly_capped, true);
 
   const denied = findingById(assessSalesforceIdentityData(goodIdentityData({
@@ -1290,6 +1290,8 @@ const FAKE_SALESFORCE_SECRETS = {
   domainSuffix: "FAKE_SECRET_TOKEN_3",
   ipRangeDescription: "FAKE_COMMUNITY_1",
   profileHash: "FAKE_HASH_1",
+  loginSid: "FAKE_SESSION_SID_1",
+  startUrlKey: "FAKE_START_URL_KEY_1",
 };
 
 test("rule 9: exportSalesforceAuditBundle projects Metadata API trees so fake secrets never reach the bundle directory or the zip", async () => {
@@ -1318,6 +1320,12 @@ test("rule 9: exportSalesforceAuditBundle projects Metadata API trees so fake se
         loginIpRanges: [{ startAddress: "10.0.0.1", endAddress: "10.0.0.254", description: FAKE_SALESFORCE_SECRETS.profileHash }],
         customPermissions: [{ enabled: "true", name: FAKE_SALESFORCE_SECRETS.samlCertificate }],
       }));
+    },
+    async listLoginHistory() {
+      return queryResult(goodMonitoringData().loginHistory.data.map((login, index) => ({ ...login, LoginUrl: index === 0 ? `acme.my.salesforce.com/?sid=${FAKE_SALESFORCE_SECRETS.loginSid}` : `https://acme.my.salesforce.com/secur/frontdoor.jsp?sid=${FAKE_SALESFORCE_SECRETS.loginSid}#frag` })));
+    },
+    async listConnectedApplications() {
+      return queryResult(goodMonitoringData().connectedApplications.data.map((app) => ({ ...app, StartUrl: `https://app.example.com/start?key=${FAKE_SALESFORCE_SECRETS.startUrlKey}`, MobileStartUrl: `https://m.example.com/start?key=${FAKE_SALESFORCE_SECRETS.startUrlKey}` })));
     },
   });
   const result = await exportSalesforceAuditBundle(client, config, base, { now: NOW });
@@ -1352,6 +1360,13 @@ test("rule 9: exportSalesforceAuditBundle projects Metadata API trees so fake se
   for (const id of ["SF-02", "SF-03", "SF-05", "SF-06", "SF-18", "SF-19", "SF-20"]) {
     assert.equal(findings.find((item) => item.id === id).status, "pass", `${id} must still pass on the projected trees`);
   }
+  // URL fields keep scheme, host, and path only (review round item 11): LoginUrl carries ?sid= and StartUrl can carry ?key=.
+  const loginHistory = JSON.parse(files.get(join("core_data", "login_history.json"))).data;
+  assert.equal(loginHistory[0].LoginUrl, "acme.my.salesforce.com/");
+  assert.equal(loginHistory[1].LoginUrl, "https://acme.my.salesforce.com/secur/frontdoor.jsp");
+  const connectedApps = JSON.parse(files.get(join("core_data", "connected_applications.json"))).data;
+  assert.equal(connectedApps[0].StartUrl, "https://app.example.com/start");
+  assert.equal(connectedApps[0].MobileStartUrl, "https://m.example.com/start");
 
   assert.equal(projectSecuritySettings(undefined), undefined);
   assert.equal(projectMyDomainSettings(undefined), undefined);
@@ -1366,7 +1381,7 @@ test("rule 9: SalesforceApiClient never echoes a non-JSON error body into error 
     assert.ok(!error.message.includes("FAKE_SECRET_TOKEN_1"), error.message);
     assert.ok(!error.message.includes("token-abc123"), error.message);
     assert.ok(!error.message.includes("gateway down"), error.message);
-    assert.match(error.message, /non-JSON response body \(text\/html, \d+ bytes\)/);
+    assert.match(error.message, /non-JSON body \(text\/html, \d+ bytes\)/);
     return true;
   });
 });
@@ -1540,4 +1555,265 @@ test("Salesforce tools are registered in the catalog under the Salesforce group"
     assert.equal(tool.kind, "domain");
     assert.ok(tool.parameterSummaries.some((parameter) => parameter.name === "instance_url"));
   }
+});
+
+test("review round item 1: SF-04 never names users as lacking MFA from a truncated TwoFactorMethodsInfo or User read and stops at warn", () => {
+  const partialMethods = okDataset("TwoFactorMethodsInfo", [goodTwoFactor[0]], { truncated: true, seen: 1, total: 43 });
+  const capped = findingById(assessSalesforceIdentityData(goodIdentityData({ twoFactorMethods: partialMethods }), { now: NOW }), "SF-04");
+  assert.equal(capped.status, "warn", `a partial enrollment read stops at warn: ${capped.summary}`);
+  assert.equal(capped.evidence.sample_users_without_mfa, null);
+  assert.equal(capped.evidence.users_without_registered_mfa_method, null);
+  assert.equal(capped.evidence.two_factor_methods_possibly_capped, true);
+  assert.match(capped.evidence.principals_withheld, /^TwoFactorMethodsInfo returned 1 of 43 rows; users without a registered method are not named from a partial read$/);
+  assert.match(capped.summary, /the read was partial \(TwoFactorMethodsInfo returned 1 of 43 rows\), so the unread rows could hold their enrollments and the count and names are withheld/);
+  assert.match(capped.summary, /TwoFactorMethodsInfo returned 1 rows, while the query reported 43 in total, so enrollment coverage is incomplete/);
+  assert.doesNotMatch(JSON.stringify(capped), /user@acme\.example|admin@acme\.example/, "no user is named from a partial read");
+
+  const partialUsers = okDataset("User", [goodUsers[0], goodUsers[1], { Id: "U9", Username: "nomfa@acme.example", IsActive: true, UserType: "Standard", ProfileId: "P-std", LastLoginDate: "2026-09-19T10:00:00Z", CreatedDate: "2021-01-01T00:00:00Z" }], { truncated: true, seen: 3, total: 90 });
+  const users = findingById(assessSalesforceIdentityData(goodIdentityData({ users: partialUsers }), { now: NOW }), "SF-04");
+  assert.equal(users.status, "warn");
+  assert.equal(users.evidence.sample_users_without_mfa, null);
+  assert.match(users.evidence.principals_withheld, /^User returned 3 of 90 rows;/);
+  assert.doesNotMatch(JSON.stringify(users), /nomfa@acme\.example/);
+
+  const documentedCap = okDataset("TwoFactorMethodsInfo", Array.from({ length: 2500 }, (_, index) => ({ UserId: `X${index}`, HasTotp: true })), { truncated: true });
+  const atCap = findingById(assessSalesforceIdentityData(goodIdentityData({ twoFactorMethods: documentedCap }), { now: NOW }), "SF-04");
+  assert.match(atCap.summary, /TwoFactorMethodsInfo returned 2500 rows, which is the documented 2500-row cap, so enrollment coverage is incomplete/);
+
+  const complete = findingById(assessSalesforceIdentityData(goodIdentityData({
+    users: okDataset("User", [...goodUsers, { Id: "U9", Username: "nomfa@acme.example", IsActive: true, UserType: "Standard", ProfileId: "P-std", LastLoginDate: "2026-09-19T10:00:00Z", CreatedDate: "2021-01-01T00:00:00Z" }]),
+  }), { now: NOW }), "SF-04");
+  assert.equal(complete.status, "fail", "a complete read still names and counts the unenrolled users");
+  assert.deepEqual(complete.evidence.sample_users_without_mfa, ["nomfa@acme.example"]);
+  assert.equal(complete.evidence.users_without_registered_mfa_method, 1);
+  assert.equal(complete.evidence.principals_withheld, null);
+});
+
+test("review round item 10: SF-14 and SF-07 stop at warn on a capped read and state no absence count over the unread rows", () => {
+  const oneLogin = okDataset("LoginHistory", [{ Id: "L1", UserId: "U1", LoginTime: "2026-09-20T10:00:00Z", Status: "Invalid Password", SourceIp: "10.0.0.5", CountryIso: "US", TlsProtocol: "TLS 1.3" }], { truncated: true, seen: 1, total: 80 });
+  const logins = findingById(assessSalesforceMonitoringData(goodMonitoringData({ loginHistory: oneLogin })), "SF-14");
+  assert.equal(logins.status, "warn", `a one-row capped read cannot fail: ${logins.summary}`);
+  assert.match(logins.summary, /^1 of 80 logins in 30 days were read: 1 failures among the visible rows \(ratio not stated from a partial read\), sources with 10\+ failures: unknown from the visible rows, 1 countries seen, legacy TLS logins: unknown from the visible rows\. The verdict is capped at warn/);
+  assert.equal(logins.evidence.failure_ratio, null);
+  assert.equal(logins.evidence.brute_force_sources, null);
+  assert.equal(logins.evidence.legacy_tls_logins, null);
+  assert.equal(logins.evidence.rows_without_login_time, null);
+  assert.equal(logins.evidence.failed_logins, 1, "an observed failure is real");
+  const legacy = findingById(assessSalesforceMonitoringData(goodMonitoringData({ loginHistory: okDataset("LoginHistory", [{ ...oneLogin.data[0], TlsProtocol: "TLS 1.0" }], { truncated: true, seen: 1, total: 80 }) })), "SF-14");
+  assert.equal(legacy.status, "warn");
+  assert.equal(legacy.evidence.legacy_tls_logins, 1, "a positive sighting is stated even on a partial read");
+  assert.match(legacy.summary, /1 legacy TLS logins/);
+
+  const oneProfile = okDataset("Profile", [goodProfiles[0]], { truncated: true, seen: 1, total: 48 });
+  const profiles = findingById(assessSalesforceIdentityData(goodIdentityData({ profiles: oneProfile }), { now: NOW }), "SF-07");
+  assert.equal(profiles.status, "warn", `a one-row capped profile read cannot fail: ${profiles.summary}`);
+  assert.equal(profiles.evidence.api_only_profiles, null);
+  assert.equal(profiles.evidence.profiles_total, 48);
+  assert.match(profiles.summary, /1\/1 visible profiles grant API Enabled covering 1 visible active users; no API Only User profile was among the visible rows, which a partial read cannot confirm/);
+  assert.match(profiles.summary, /The ratio is over the visible rows only, so the verdict is capped at warn/);
+  const completeProfiles = findingById(assessSalesforceIdentityData(goodIdentityData({ profiles: okDataset("Profile", goodProfiles.map((profile) => ({ ...profile, PermissionsApiEnabled: true }))) }), { now: NOW }), "SF-07");
+  assert.equal(completeProfiles.status, "fail", "a complete read keeps the ratio verdict");
+});
+
+test("review round item 9: denied Salesforce datasets are written as not-collected markers and every derived count renders null", async () => {
+  const base = createTempBase("grclanker-sf-markers-");
+  const deny = async () => {
+    const error = forbidden();
+    error.endpoint = "/services/data/v64.0/query";
+    throw error;
+  };
+  const client = createFullMockClient({ listUsers: deny, listProfileMetadata: deny, listLoginHistory: deny, listOauthTokens: deny, getCallerPermissions: deny });
+  const result = await exportSalesforceAuditBundle(client, sampleConfig(), base, { now: NOW });
+  const files = readBundleFiles(result.outputDir);
+  const read = (relativePath) => JSON.parse(files.get(join(...relativePath.split("/"))));
+
+  for (const [file, dataset] of [["core_data/users.json", "User"], ["core_data/profile_metadata.json", "Profile metadata"], ["core_data/login_history.json", "LoginHistory"], ["core_data/oauth_tokens.json", "OauthToken"], ["core_data/caller_permissions.json", "UserPermissionAccess"]]) {
+    const marker = read(file);
+    assert.equal(marker.collected, false, `${file} is a marker`);
+    assert.equal(marker.dataset, dataset);
+    assert.equal(marker.status, "forbidden");
+    assert.equal(marker.http_status, 403);
+    assert.equal(marker.endpoint, "/services/data/v64.0/query");
+    assert.match(marker.error, /INSUFFICIENT_ACCESS/);
+    assert.equal(marker.data, undefined, `${file} carries no data array`);
+    assert.equal(marker.seen, undefined, `${file} carries no seen count`);
+    assert.equal(marker.truncated, undefined, `${file} carries no truncated flag`);
+  }
+  const profilesFile = read("core_data/profiles.json");
+  assert.equal(profilesFile.status, "ok");
+  assert.equal(profilesFile.data.length, goodProfiles.length, "a readable dataset keeps its snapshot shape");
+
+  const access = read("core_data/access_check.json");
+  for (const surface of access.surfaces) {
+    if (surface.status === "not_readable") assert.equal(surface.count, undefined, `${surface.name} carries no count when denied`);
+  }
+  assert.equal(access.surfaces.find((surface) => surface.name === "caller_permissions").count, undefined);
+
+  const identity = read("analysis/identity_access.json");
+  for (const key of ["users", "users_total", "active_users", "users_truncated"]) assert.equal(identity.summary[key], null, `identity summary ${key} renders null under the User denial`);
+  assert.equal(identity.summary.profiles, goodProfiles.length, "a readable dataset keeps its count");
+  assert.equal(identity.summary.sensitive_profiles_read, null);
+  assert.match(identity.summary.inventories.User, /^User: unread \(forbidden: /);
+  assert.match(identity.summary.inventories.Profile, /^Profile: complete \(\d+ rows\)$/);
+  for (const id of ["SF-04", "SF-07", "SF-09", "SF-10", "SF-13"]) {
+    const item = identity.findings.find((finding) => finding.id === id);
+    assert.equal(item.status, "manual", `${id} is manual under the User denial`);
+    for (const key of ["users_seen", "active_users", "active_admins_seen"]) {
+      if (key in item.evidence) assert.equal(item.evidence[key], null, `${id} ${key} renders null under the User denial`);
+    }
+  }
+  const monitoring = read("analysis/monitoring_integrations.json");
+  for (const key of ["oauth_tokens", "oauth_tokens_partial_view", "oauth_tokens_possibly_capped", "login_rows", "login_rows_total"]) assert.equal(monitoring.summary[key], null, `monitoring summary ${key} renders null`);
+  assert.equal(monitoring.summary.audit_rows, 1, "a readable dataset keeps its count");
+  const platform = read("analysis/platform_security.json");
+  const ipRanges = platform.findings.find((finding) => finding.id === "SF-05");
+  assert.equal(ipRanges.status, "manual");
+  for (const key of ["sensitive_profiles_read", "profiles_with_login_ip_ranges", "profiles_without_login_ip_ranges", "profile_metadata_truncated"]) assert.equal(ipRanges.evidence[key], null, `SF-05 ${key} renders null when profile metadata is unread`);
+  assert.match(ipRanges.evidence.profile_metadata_error, /INSUFFICIENT_ACCESS/);
+  const zipEntries = readZipEntries(result.zipPath);
+  assert.equal(JSON.parse(zipEntries.get(join("core_data", "users.json"))).collected, false, "the zip carries the marker too");
+
+  // A Profile list denial cascades: the dependent profile metadata read is never requested and its marker names the parent.
+  const cascade = await exportSalesforceAuditBundle(createFullMockClient({ listProfiles: deny }), sampleConfig(), createTempBase("grclanker-sf-cascade-"), { now: NOW });
+  const cascadeFiles = readBundleFiles(cascade.outputDir);
+  const metadataMarker = JSON.parse(cascadeFiles.get(join("core_data", "profile_metadata.json")));
+  assert.equal(metadataMarker.collected, false);
+  assert.match(metadataMarker.error, /^not requested: the Profile list was not readable \(.*INSUFFICIENT_ACCESS.*\), so there were no sensitive profiles to read$/);
+  assert.equal(metadataMarker.http_status, 403, "the marker carries the parent's status");
+});
+
+const SF_CANARY = {
+  bearer: "SFCANARY_BEARER_a1b2c3d4e5f6g7h8",
+  cookie: "SFCANARY_SID_00Dxx0000001gPFsid9",
+  apiKey: "SFCANARY_APIKEY_9f8e7d6c5b4a",
+  urlToken: "SFCANARY_URLTOKEN_q1w2e3r4",
+};
+const SF_CANARY_VALUES = Object.values(SF_CANARY);
+const SF_CANARY_URL = `https://api.example.com/v1/x?token=${SF_CANARY.urlToken}`;
+
+function sfCanaryHtml() {
+  return [
+    "<html><head><title>502 Bad Gateway</title></head><body>",
+    `<p>Upstream rejected Authorization: Bearer ${SF_CANARY.bearer} while proxying.</p>`,
+    `<p>Set-Cookie: sid=${SF_CANARY.cookie}; Path=/; Secure</p>`,
+    `<p>x-api-key: ${SF_CANARY.apiKey}</p>`,
+    `<p>Retry the request at ${SF_CANARY_URL} after the gateway recovers.</p>`,
+    "</body></html>",
+  ].join("");
+}
+
+function sfCanaryFetch(failing) {
+  const org = goodOrganization;
+  const platform = goodPlatformData();
+  const identity = goodIdentityData();
+  const dataProtection = goodDataProtectionData();
+  const monitoring = goodMonitoringData();
+  const soqlObject = (query) => query.match(/\bFROM\s+(\w+)/i)?.[1];
+  const queryFixtures = {
+    Organization: [org],
+    SecurityHealthCheck: [{ Score: 95 }],
+    SecurityHealthCheckRisks: platform.healthCheckRisks.data,
+    User: identity.users.data,
+    Profile: identity.profiles.data,
+    PermissionSet: identity.permissionSets.data,
+    PermissionSetAssignment: identity.assignments.data,
+    TwoFactorMethodsInfo: identity.twoFactorMethods.data,
+    FieldPermissions: dataProtection.fieldPermissions.data,
+    TenantSecret: dataProtection.tenantSecrets.data,
+    Certificate: dataProtection.certificates.data,
+    ConnectedApplication: monitoring.connectedApplications.data,
+    OauthToken: monitoring.oauthTokens.data,
+    UserPermissionAccess: [goodCallerPermissions],
+    LoginHistory: monitoring.loginHistory.data,
+    SetupAuditTrail: monitoring.setupAuditTrail.data,
+    EventLogFile: monitoring.eventLogFiles.data,
+  };
+  const fail = (surface) => {
+    if (failing.surface !== surface) return undefined;
+    if (failing.flavor === "html") return new Response(sfCanaryHtml(), { status: 502, statusText: "Bad Gateway", headers: { "content-type": "text/html; charset=utf-8" } });
+    return jsonResponse([{ errorCode: "SERVER_ERROR", message: `Upstream failed; retry at ${SF_CANARY_URL} with Bearer ${SF_CANARY.bearer} (sid=${SF_CANARY.cookie})` }], { status: 403 });
+  };
+  const soapResult = (operation, records) => xmlResponse(`${SOAP_ENVELOPE_OPEN}<${operation}Response><result>${records}</result></${operation}Response>${SOAP_ENVELOPE_CLOSE}`);
+  return async (input, init = {}) => {
+    const url = new URL(String(input));
+    if (url.pathname === "/services/oauth2/token") {
+      return fail("oauth2/token") ?? jsonResponse({ access_token: "token-live-1234567890", instance_url: "https://acme.my.salesforce.com" });
+    }
+    if (url.pathname.endsWith("/limits")) return fail("limits") ?? jsonResponse({ DailyApiRequests: { Max: 100000, Remaining: 99000 } });
+    if (/\/sobjects\/\w+\/describe$/.test(url.pathname)) {
+      const object = url.pathname.split("/").at(-2);
+      const fields = Object.keys(Object.assign({}, ...(queryFixtures[object] ?? [{}]))).map((name) => ({ name }));
+      return fail(`describe:${object}`) ?? jsonResponse({ name: object, fields });
+    }
+    if (url.pathname.endsWith("/query") || url.pathname.endsWith("/tooling/query")) {
+      const soql = url.searchParams.get("q") ?? "";
+      const object = soqlObject(soql);
+      const records = queryFixtures[object] ?? [];
+      return fail(`query:${object}`) ?? jsonResponse({ totalSize: records.length, done: true, records });
+    }
+    if (url.pathname.startsWith("/services/Soap/m/")) {
+      const body = String(init.body ?? "");
+      if (body.includes("<met:listMetadata>")) {
+        return fail("soap:listMetadata") ?? soapResult("listMetadata", goodProfileListing.map((item) => `<id>${item.id}</id><fullName>${item.fullName}</fullName>`).join("</result><result>"));
+      }
+      const type = body.match(/<met:type>(\w+)<\/met:type>/)?.[1];
+      if (type === "SecuritySettings") return fail("soap:readMetadata:SecuritySettings") ?? soapResult("readMetadata", "<records xsi:type=\"SecuritySettings\"><sessionSettings><sessionTimeout>TwoHours</sessionTimeout><enableMFADirectUILoginOptIn>true</enableMFADirectUILoginOptIn></sessionSettings></records>");
+      if (type === "MyDomainSettings") return fail("soap:readMetadata:MyDomainSettings") ?? soapResult("readMetadata", "<records xsi:type=\"MyDomainSettings\"><myDomainName>acme</myDomainName></records>");
+      if (type === "Profile") return fail("soap:readMetadata:Profile") ?? soapResult("readMetadata", "<records xsi:type=\"Profile\"><fullName>Admin</fullName></records>");
+    }
+    return jsonResponse([{ errorCode: "NOT_FOUND", message: "not found" }], { status: 404 });
+  };
+}
+
+const SF_CANARY_SURFACES = [
+  "oauth2/token", "limits", "soap:listMetadata", "soap:readMetadata:SecuritySettings", "soap:readMetadata:MyDomainSettings", "soap:readMetadata:Profile",
+  ...["Organization", "SecurityHealthCheck", "SecurityHealthCheckRisks", "User", "Profile", "PermissionSet", "PermissionSetAssignment", "TwoFactorMethodsInfo", "FieldPermissions", "TenantSecret", "Certificate", "ConnectedApplication", "OauthToken", "UserPermissionAccess", "LoginHistory", "SetupAuditTrail", "EventLogFile"].map((object) => `query:${object}`),
+];
+
+function assertSfCanariesAbsent(text, label) {
+  for (const value of SF_CANARY_VALUES) assert.ok(!text.includes(value), `${label} leaked canary ${value}`);
+  assert.ok(!text.includes("token=SFCANARY"), `${label} leaked the URL query string`);
+}
+
+test("rule 9 error strings: on every Salesforce surface a 502 HTML body or a JSON error embedding a credential URL never reaches results or the bundle", async () => {
+  const errorStrings = [];
+  let surfacesWithErrors = 0;
+  for (const surface of SF_CANARY_SURFACES) {
+    for (const flavor of ["html", "json"]) {
+      const client = new SalesforceApiClient(sampleConfig({ authMode: "password", username: "auditor@acme.example", password: "pw-secret-1", securityToken: "tok-secret-2", consumerKey: "ck", consumerSecret: "cs-secret-3" }), { fetchImpl: sfCanaryFetch({ surface, flavor }), sleep: async () => {}, now: () => NOW });
+      const access = await checkSalesforceAccess(client);
+      const assessments = [];
+      for (const assess of [assessSalesforcePlatformSecurity, assessSalesforceIdentityAccess, assessSalesforceDataProtection, assessSalesforceMonitoringIntegrations]) {
+        assessments.push(await assess(client, { now: NOW }));
+      }
+      const base = createTempBase("grclanker-sf-canary-");
+      const exported = await exportSalesforceAuditBundle(client, client.getResolvedConfig(), base, { now: NOW });
+      const files = readBundleFiles(exported.outputDir);
+      const zipEntries = readZipEntries(exported.zipPath);
+      const label = `${surface}/${flavor}`;
+      assertSfCanariesAbsent(JSON.stringify(access), `${label} check_access`);
+      assertSfCanariesAbsent(JSON.stringify(assessments), `${label} assessments`);
+      for (const [path, content] of files) assertSfCanariesAbsent(content, `${label} bundle file ${path}`);
+      for (const [path, content] of zipEntries) assertSfCanariesAbsent(content, `${label} zip entry ${path}`);
+      const surfaceErrors = [
+        ...access.surfaces.filter((item) => item.error).map((item) => item.error),
+        ...assessments.flatMap((assessment) => assessment.errors),
+        ...(files.has("_errors.log") ? [files.get("_errors.log")] : []),
+      ];
+      assert.ok(surfaceErrors.length > 0, `${label} recorded at least one error`);
+      surfacesWithErrors += 1;
+      const joined = surfaceErrors.join("\n");
+      if (flavor === "html") {
+        assert.match(joined, /\(502\)[^\n]*non-(JSON|SOAP) body \(text\/html, \d+ bytes\)/, `${label} error strings carry the status-and-length note: ${joined.slice(0, 400)}`);
+      } else if (surface.startsWith("soap:")) {
+        // A JSON body on a SOAP endpoint carries no fault string, so it is described by shape rather than quoted.
+        assert.match(joined, /\(403\)[^\n]*non-SOAP body \(application\/json, \d+ bytes\)/, `${label} error strings carry the status-and-length note: ${joined.slice(0, 400)}`);
+      } else {
+        assert.match(joined, /https:\/\/api\.example\.com\/v1\/x\?\[REDACTED\]/, `${label} error strings keep the URL host with the query string redacted: ${joined.slice(0, 400)}`);
+      }
+      errorStrings.push(joined);
+    }
+  }
+  assert.equal(surfacesWithErrors, SF_CANARY_SURFACES.length * 2, "every surface and both flavors were exercised");
+  assertSfCanariesAbsent(errorStrings.join("\n"), "collected error strings");
 });

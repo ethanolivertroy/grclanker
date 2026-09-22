@@ -114,6 +114,36 @@ export interface SalesforceDataset<T> {
   seen: number;
   total?: number;
   omittedFields?: string[];
+  /** HTTP status of the failed request; absent when the read succeeded or failed without a response. */
+  httpStatus?: number;
+  /** Path of the request that failed; absent when the read succeeded. */
+  endpoint?: string;
+}
+
+/**
+ * Written to core_data in place of a dataset that was denied, unavailable, or errored, so a bundle
+ * consumer cannot mistake a failed read for an empty inventory. A readable dataset with no rows keeps
+ * its snapshot shape with `data: []`.
+ */
+export interface NotCollectedMarker {
+  collected: false;
+  dataset: string;
+  status: DatasetStatus;
+  http_status: number | null;
+  endpoint: string | null;
+  error: string;
+}
+
+export function datasetCoreData<T>(dataset: SalesforceDataset<T>): SalesforceDataset<T> | NotCollectedMarker {
+  if (dataset.status === "ok") return dataset;
+  return {
+    collected: false,
+    dataset: dataset.name,
+    status: dataset.status,
+    http_status: dataset.httpStatus ?? null,
+    endpoint: dataset.endpoint ?? null,
+    error: dataset.error ?? dataset.status,
+  };
 }
 
 export interface SalesforceAccessSurface {
@@ -463,31 +493,108 @@ async function countFilesRecursively(rootDir: string): Promise<number> {
   return total;
 }
 
+const REDACTED = "[REDACTED]";
+const MIN_REMEMBERED_SECRET_LENGTH = 6;
+const KNOWN_SECRETS = new Set<string>();
+const URL_IN_TEXT_PATTERN = /\b(https?:\/\/)(?:([^\s/?#@"'<>]+)@)?([^\s/?#"'<>]+)([^\s?#"'<>]*)(\?[^\s#"'<>]*)?(#[^\s"'<>]*)?/gi;
+const JWT_PATTERN = /\beyJ[A-Za-z0-9_-]{4,}\.[A-Za-z0-9_-]{4,}\.[A-Za-z0-9_-]*/g;
+const AUTHORIZATION_VALUE_PATTERN = /\b(bearer|basic|digest|negotiate|ntlm)\s+([A-Za-z0-9\-._~+/!]{8,}=*)/gi;
+const SECRET_ASSIGNMENT_PATTERN = /\b([\w-]*(?:session|token|secret|password|passwd|pwd|api[_-]?key|apikey|credential|assertion|signature|sid|jsessionid)[\w-]*=)([^\s"'&;,<>]+)/gi;
+const SECRET_FIELD_PATTERN = /\b((?:api[\s_-]?key|x-api-key|access[_-]?token|refresh[_-]?token|id[_-]?token|auth[_-]?token|session[_-]?token|bearer[_-]?token|token|client[_-]?secret|secret|password|passwd|pwd|authorization|set-cookie|cookie|session[_-]?id|jsessionid|sid|assertion|signature|credential)["']?\s*:\s*["']?)([^\s"'&;,<>]+)/gi;
+const SESSION_ID_ELEMENT_PATTERN = /<([\w:]*sessionId)>[^<]*<\/[\w:]*sessionId>/gi;
+
+/**
+ * The unanchored redaction pass every error string receives, once in SalesforceApiError and again
+ * at the sink (errorMessage): every secret any client in this process has seen, then credential
+ * shapes (URL userinfo, query strings, and fragments anywhere in the text, JWT-shaped assertions,
+ * Authorization scheme values, SOAP session headers, and cookie, query, or field assignments whose
+ * name suggests a credential).
+ */
+function scrubErrorText(text: string, secrets: Iterable<string | undefined> = KNOWN_SECRETS): string {
+  let scrubbed = text;
+  for (const secret of secrets) {
+    if (secret && secret.length >= MIN_REMEMBERED_SECRET_LENGTH) scrubbed = scrubbed.split(secret).join(REDACTED);
+  }
+  return scrubbed
+    .replace(URL_IN_TEXT_PATTERN, (_match, scheme: string, userinfo: string | undefined, host: string, path: string, query?: string, fragment?: string) =>
+      `${scheme}${userinfo ? `${REDACTED}@` : ""}${host}${path}${query ? `?${REDACTED}` : ""}${fragment ? `#${REDACTED}` : ""}`)
+    .replace(JWT_PATTERN, REDACTED)
+    .replace(SESSION_ID_ELEMENT_PATTERN, (_match, element: string) => `<${element}>${REDACTED}</${element}>`)
+    .replace(AUTHORIZATION_VALUE_PATTERN, (match: string, scheme: string, value: string) => (/^[a-z]+$/.test(value) ? match : `${scheme} ${REDACTED}`))
+    .replace(SECRET_ASSIGNMENT_PATTERN, (_match, assignment: string) => `${assignment}${REDACTED}`)
+    .replace(SECRET_FIELD_PATTERN, (_match, field: string) => `${field}${REDACTED}`);
+}
+
+function rememberSecrets(...values: Array<string | undefined>): void {
+  for (const value of values) {
+    if (value && value.length >= MIN_REMEMBERED_SECRET_LENGTH) KNOWN_SECRETS.add(value);
+  }
+}
+
+/**
+ * The fields carrying response text are the message (status line plus Salesforce's documented
+ * message, error_description, or faultstring, or the opaque-body note) and errorCode; both are
+ * scrubbed in the constructor so no throw site can hand an unredacted body to a catch block.
+ * `endpoint` is the request path, recorded so a not-collected marker can name the request that failed.
+ */
 export class SalesforceApiError extends Error {
   readonly status?: number;
   readonly errorCode?: string;
+  readonly endpoint?: string;
 
-  constructor(message: string, options: { status?: number; errorCode?: string } = {}) {
-    super(message);
+  constructor(message: string, options: { status?: number; errorCode?: string; endpoint?: string } = {}) {
+    super(scrubErrorText(message));
     this.name = "SalesforceApiError";
     this.status = options.status;
-    this.errorCode = options.errorCode;
+    this.errorCode = options.errorCode === undefined ? undefined : scrubErrorText(options.errorCode);
+    this.endpoint = options.endpoint;
   }
 }
 
 function redactSecrets(message: string, secrets: Array<string | undefined>): string {
-  let redacted = message
-    .replace(/assertion=[^&\s"]+/gi, "assertion=[REDACTED]")
-    .replace(/access_token"?\s*[:=]\s*"?[^"&\s,}]+/gi, "access_token=[REDACTED]")
-    .replace(/refresh_token"?\s*[:=]\s*"?[^"&\s,}]+/gi, "refresh_token=[REDACTED]")
-    .replace(/Bearer\s+[A-Za-z0-9._!~-]+/g, "Bearer [REDACTED]")
-    .replace(/<sessionId>[^<]*<\/sessionId>/gi, "<sessionId>[REDACTED]</sessionId>");
-  for (const secret of secrets) {
-    if (secret && secret.length >= 6) {
-      redacted = redacted.split(secret).join("[REDACTED]");
+  return scrubErrorText(message, [...secrets, ...KNOWN_SECRETS]);
+}
+
+/**
+ * A response body without a recognizable vendor error field is described by content type and
+ * length only, whatever its content type; its text is never sliced into an error string.
+ */
+function describeOpaqueBody(response: Response, rawText: string, kind: string): string | undefined {
+  if (rawText.length === 0) return undefined;
+  const contentType = response.headers.get("content-type")?.split(";")[0]?.trim() || "unknown content type";
+  return `${kind} (${contentType}, ${Buffer.byteLength(rawText, "utf8")} bytes)`;
+}
+
+function parseJsonBody(rawText: string): { payload: unknown; parsed: boolean } {
+  if (rawText.length === 0) return { payload: {}, parsed: false };
+  try {
+    return { payload: JSON.parse(rawText), parsed: true };
+  } catch {
+    return { payload: {}, parsed: false };
+  }
+}
+
+/**
+ * Exported URL fields keep scheme, host, and path only: LoginHistory.LoginUrl carries `?sid=` and
+ * ConnectedApplication.StartUrl can carry `?key=`, so the query string and fragment are dropped.
+ */
+export function reduceUrlFields(record: JsonRecord): JsonRecord {
+  const projected: JsonRecord = {};
+  for (const [key, value] of Object.entries(record)) {
+    if (/url$/i.test(key) && typeof value === "string" && /^[a-z][a-z0-9+.-]*:\/\//i.test(value)) {
+      try {
+        const url = new URL(value);
+        projected[key] = `${url.protocol}//${url.host}${url.pathname}`;
+      } catch {
+        projected[key] = value.split(/[?#]/)[0];
+      }
+    } else if (/url$/i.test(key) && typeof value === "string") {
+      projected[key] = value.split(/[?#]/)[0];
+    } else {
+      projected[key] = value;
     }
   }
-  return redacted;
+  return projected;
 }
 
 function salesforceErrorSummary(payload: unknown): { message?: string; errorCode?: string } {
@@ -803,6 +910,7 @@ export class SalesforceApiClient {
     this.fetchImpl = options.fetchImpl ?? fetch;
     this.sleep = options.sleep ?? ((ms) => new Promise((resolvePromise) => setTimeout(resolvePromise, ms)));
     this.now = options.now ?? (() => new Date());
+    rememberSecrets(config.password, config.securityToken, config.consumerSecret, config.refreshToken, config.accessToken, config.privateKey);
     if (config.authMode === "access-token" && config.accessToken && config.instanceUrl) {
       this.session = { accessToken: config.accessToken, instanceUrl: config.instanceUrl };
     }
@@ -834,11 +942,15 @@ export class SalesforceApiClient {
   private async rawFetch(url: string, init: RequestInit): Promise<Response> {
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), this.config.timeoutMs);
+    const endpoint = new URL(url).pathname;
     try {
       return await this.fetchImpl(url, { ...init, signal: controller.signal });
     } catch (error) {
+      if (error instanceof Error && error.name === "AbortError") {
+        throw new SalesforceApiError(`Salesforce request to ${endpoint} timed out after ${this.config.timeoutMs} ms`, { endpoint });
+      }
       const message = error instanceof Error ? error.message : String(error);
-      throw new SalesforceApiError(this.redact(`Salesforce request to ${new URL(url).pathname} failed: ${message}`));
+      throw new SalesforceApiError(this.redact(`Salesforce request to ${endpoint} failed: ${message}`), { endpoint });
     } finally {
       clearTimeout(timeout);
     }
@@ -874,22 +986,19 @@ export class SalesforceApiClient {
       body,
     });
     const rawText = await response.text();
-    let payload: unknown = {};
-    try {
-      payload = rawText.length > 0 ? JSON.parse(rawText) : {};
-    } catch {
-      payload = {};
-    }
+    const { payload, parsed } = parseJsonBody(rawText);
     if (!response.ok) {
       const summary = salesforceErrorSummary(payload);
+      const detail = summary.message ?? describeOpaqueBody(response, rawText, parsed ? "JSON body without a recognized error field" : "non-JSON body");
       throw new SalesforceApiError(
-        this.redact(`Salesforce token request failed (${response.status})${summary.message ? `: ${summary.message}` : ""}`),
-        { status: response.status, errorCode: summary.errorCode },
+        this.redact(`Salesforce token request failed (${response.status})${summary.errorCode ? ` ${summary.errorCode}` : ""}${detail ? `: ${detail}` : ""}`),
+        { status: response.status, errorCode: summary.errorCode, endpoint: "/services/oauth2/token" },
       );
     }
     const object = asObject(payload) ?? {};
     const accessToken = asString(object.access_token);
-    if (!accessToken) throw new SalesforceApiError("Salesforce token response did not include access_token.");
+    if (!accessToken) throw new SalesforceApiError("Salesforce token response did not include access_token.", { endpoint: "/services/oauth2/token" });
+    rememberSecrets(accessToken);
     const instanceUrl = asString(object.instance_url) ? normalizeBaseUrl(asString(object.instance_url) as string) : this.config.instanceUrl;
     if (!instanceUrl) throw new SalesforceApiError("Salesforce token response did not include instance_url and SF_INSTANCE_URL is not set.");
     return { accessToken, instanceUrl };
@@ -953,19 +1062,21 @@ export class SalesforceApiClient {
       headers: { authorization: `Bearer ${session.accessToken}`, accept: "application/json" },
     });
     const rawText = await response.text();
-    let payload: unknown = {};
-    try {
-      payload = rawText.length > 0 ? JSON.parse(rawText) : {};
-    } catch {
-      // Never echo a non-JSON body (proxy HTML, plain-text gateway errors) into error messages that
-      // land in _errors.log and analysis JSON; describe its shape instead.
-      payload = { message: `non-JSON response body (${response.headers.get("content-type") ?? "unknown content type"}, ${rawText.length} bytes)` };
-    }
+    const { payload, parsed } = parseJsonBody(rawText);
     if (!response.ok) {
+      // Only Salesforce's documented error fields are quoted; any other body (proxy HTML, plain-text
+      // gateway errors, unrecognized JSON) is described by content type and length.
       const summary = salesforceErrorSummary(payload);
+      const detail = summary.message ?? describeOpaqueBody(response, rawText, parsed ? "JSON body without a recognized error field" : "non-JSON body");
       throw new SalesforceApiError(
-        this.redact(`Salesforce request ${url.pathname} failed (${response.status})${summary.errorCode ? ` ${summary.errorCode}` : ""}${summary.message ? `: ${summary.message}` : ""}`),
-        { status: response.status, errorCode: summary.errorCode },
+        this.redact(`Salesforce request ${url.pathname} failed (${response.status})${summary.errorCode ? ` ${summary.errorCode}` : ""}${detail ? `: ${detail}` : ""}`),
+        { status: response.status, errorCode: summary.errorCode, endpoint: url.pathname },
+      );
+    }
+    if (!parsed && rawText.length > 0) {
+      throw new SalesforceApiError(
+        `Salesforce request ${url.pathname} returned ${describeOpaqueBody(response, rawText, "a non-JSON body")} with status ${response.status}`,
+        { status: response.status, endpoint: url.pathname },
       );
     }
     return payload;
@@ -1043,15 +1154,20 @@ export class SalesforceApiClient {
       headers: { "content-type": "text/xml; charset=UTF-8", soapaction: "\"\"" },
       body: envelope,
     });
+    const endpoint = `/services/Soap/m/${this.config.apiVersion}`;
     const rawText = await response.text();
     const parsed = parseSimpleXml(rawText);
+    const envelopeBody = findXmlNode(parsed, ["Envelope", "Body"]);
     const fault = firstRecord(findXmlNode(parsed, ["Envelope", "Body", "Fault"]));
     if (fault || !response.ok) {
+      // Only the SOAP fault's faultcode and faultstring are quoted; a body without a SOAP envelope
+      // (proxy HTML, plain text) is described by content type and length.
       const faultCode = asString(fault?.faultcode)?.replace(/^.*:/, "");
       const faultString = asString(fault?.faultstring);
+      const detail = faultString ?? describeOpaqueBody(response, rawText, envelopeBody === undefined ? "non-SOAP body" : "SOAP body without a fault string");
       throw new SalesforceApiError(
-        this.redact(`Salesforce Metadata API ${label} failed (${response.status})${faultCode ? ` ${faultCode}` : ""}${faultString ? `: ${faultString}` : ""}`),
-        { status: response.status, errorCode: faultCode },
+        this.redact(`Salesforce Metadata API ${label} failed (${response.status})${faultCode ? ` ${faultCode}` : ""}${detail ? `: ${detail}` : ""}`),
+        { status: response.status, errorCode: faultCode, endpoint },
       );
     }
     const result = findXmlNode(parsed, ["Envelope", "Body", ...resultPath]);
@@ -1271,24 +1387,40 @@ function classifyError(error: unknown): DatasetStatus {
   return "error";
 }
 
+/**
+ * The single sink every recorded error string passes through (dataset errors, access-check surfaces,
+ * assessment error arrays, _errors.log); it re-applies the redaction pass so a message built outside
+ * SalesforceApiError cannot bypass it.
+ */
 function errorMessage(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
+  return scrubErrorText(error instanceof Error ? error.message : String(error));
+}
+
+function failureFields(error: unknown): Pick<SalesforceDataset<unknown>, "httpStatus" | "endpoint"> {
+  if (!(error instanceof SalesforceApiError)) return {};
+  return {
+    ...(error.status !== undefined ? { httpStatus: error.status } : {}),
+    ...(error.endpoint !== undefined ? { endpoint: error.endpoint } : {}),
+  };
 }
 
 async function collectRecords(name: string, load: () => Promise<SalesforceQueryResult>): Promise<SalesforceDataset<JsonRecord[]>> {
   try {
     const result = await load();
+    const records = result.records.map(reduceUrlFields);
     return {
       name,
       status: "ok",
-      data: result.records,
+      data: records,
       truncated: result.truncated,
-      seen: result.records.length,
+      seen: records.length,
       total: result.totalSize,
       omittedFields: result.omittedFields,
     };
   } catch (error) {
-    return { name, status: classifyError(error), data: [], error: errorMessage(error), truncated: false, seen: 0 };
+    // The in-memory fallback keeps an empty array for the evaluators; every exported or summarized
+    // view of a failed dataset goes through datasetCoreData or whenOk and renders a marker or null.
+    return { name, status: classifyError(error), data: [], error: errorMessage(error), truncated: false, seen: 0, ...failureFields(error) };
   }
 }
 
@@ -1297,8 +1429,20 @@ async function collectRecord(name: string, load: () => Promise<JsonRecord | unde
     const data = await load();
     return { name, status: "ok", data, truncated: false, seen: data ? 1 : 0, total: data ? 1 : 0 };
   } catch (error) {
-    return { name, status: classifyError(error), data: undefined, error: errorMessage(error), truncated: false, seen: 0 };
+    return { name, status: classifyError(error), data: undefined, error: errorMessage(error), truncated: false, seen: 0, ...failureFields(error) };
   }
+}
+
+/** A count or list derived from a dataset renders null when that dataset was not read. */
+function whenOk<T>(value: T, ...datasets: Array<SalesforceDataset<unknown>>): T | null {
+  return datasets.every((dataset) => dataset.status === "ok") ? value : null;
+}
+
+/** One line per dataset stating whether it was read completely, partially, or not at all. */
+function describeDataset(dataset: SalesforceDataset<unknown>): string {
+  if (dataset.status !== "ok") return `${dataset.name}: unread (${dataset.status}${dataset.error ? `: ${dataset.error}` : ""})`;
+  if (dataset.truncated) return `${dataset.name}: partial (${dataset.seen} of ${dataset.total ?? "an unknown total of"} rows)`;
+  return `${dataset.name}: complete (${dataset.seen} row${dataset.seen === 1 ? "" : "s"})`;
 }
 
 function datasetErrors(...datasets: Array<SalesforceDataset<unknown>>): string[] {
@@ -1550,7 +1694,7 @@ function profileMetadataIssue(profiles: SalesforceDataset<JsonRecord[]>, profile
 export async function collectProfileMetadata(client: ReadClient, profiles: SalesforceDataset<JsonRecord[]>): Promise<SalesforceDataset<JsonRecord[]>> {
   const name = "Profile metadata";
   if (profiles.status !== "ok") {
-    return { name, status: profiles.status, data: [], error: `Profile list was not readable (${profiles.error ?? profiles.status})`, truncated: false, seen: 0 };
+    return { name, status: profiles.status, data: [], error: `not requested: the Profile list was not readable (${profiles.error ?? profiles.status}), so there were no sensitive profiles to read`, truncated: false, seen: 0, ...(profiles.httpStatus !== undefined ? { httpStatus: profiles.httpStatus } : {}), ...(profiles.endpoint !== undefined ? { endpoint: profiles.endpoint } : {}) };
   }
   const targets = sensitiveProfiles(profiles.data);
   const selected = targets.slice(0, MAX_PROFILE_METADATA_READS);
@@ -1585,7 +1729,7 @@ export async function collectProfileMetadata(client: ReadClient, profiles: Sales
       total: targets.length,
     };
   } catch (error) {
-    return { name, status: classifyError(error), data: [], error: errorMessage(error), truncated: false, seen: 0, total: targets.length };
+    return { name, status: classifyError(error), data: [], error: errorMessage(error), truncated: false, seen: 0, total: targets.length, ...failureFields(error) };
   }
 }
 
@@ -1745,13 +1889,14 @@ export function assessSalesforcePlatformData(data: SalesforcePlatformData): Sale
       trusted_ip_ranges: ranges.length,
       ranges: truncateList(ranges.map((range) => `${asString(range.start) ?? "?"}-${asString(range.end) ?? "?"}`)),
       enforce_ip_ranges_every_request: enforceEveryRequest ?? null,
-      sensitive_profiles: data.profileMetadata.total ?? null,
-      sensitive_profiles_read: view.resolved.length,
-      profiles_with_login_ip_ranges: truncateList(withRanges.map((record) => `${profileMetadataLabel(record)} (${loginIpRangeCount(record)})`)),
-      profiles_without_login_ip_ranges: truncateList(withoutRanges.map(profileMetadataLabel)),
-      profiles_unresolved: truncateList(view.unresolved.map(profileMetadataLabel)),
+      sensitive_profiles: whenOk(data.profileMetadata.total ?? null, data.profileMetadata),
+      sensitive_profiles_read: whenOk(view.resolved.length, data.profileMetadata),
+      profiles_with_login_ip_ranges: whenOk(truncateList(withRanges.map((record) => `${profileMetadataLabel(record)} (${loginIpRangeCount(record)})`)), data.profileMetadata),
+      profiles_without_login_ip_ranges: whenOk(truncateList(withoutRanges.map(profileMetadataLabel)), data.profileMetadata),
+      profiles_unresolved: whenOk(truncateList(view.unresolved.map(profileMetadataLabel)), data.profileMetadata),
       profile_metadata_status: data.profileMetadata.status,
-      profile_metadata_truncated: data.profileMetadata.truncated,
+      profile_metadata_error: data.profileMetadata.error ?? null,
+      profile_metadata_truncated: whenOk(data.profileMetadata.truncated, data.profileMetadata),
     };
     if (profileIssue) {
       findings.push(finding(5, "manual", `${orgWide}; per-profile login IP ranges could not be verified because ${profileIssue}.`, evidence, ipManual));
@@ -1837,7 +1982,7 @@ export function assessSalesforcePlatformData(data: SalesforcePlatformData): Sale
       is_sandbox: isSandbox ?? null,
       instance_url: data.instanceUrl ?? null,
       health_check_score: score ?? null,
-      health_check_risks: risks.length,
+      health_check_risks: whenOk(risks.length, data.healthCheckRisks),
       security_settings_readable: settingsReadable,
       my_domain_settings_readable: data.myDomainSettings.status === "ok",
       mfa_health_check_setting: mfaRisk ? `${asString(mfaRisk.Setting)} = ${asString(mfaRisk.OrgValue)}` : null,
@@ -1908,13 +2053,14 @@ export function assessSalesforceIdentityData(data: SalesforceIdentityData, optio
   const adminProfileIds = new Set(adminProfiles.map((profile) => asString(profile.Id) ?? ""));
   const admins = activeUsers.filter((user) => adminProfileIds.has(asString(user.ProfileId) ?? ""));
   const population = populationIssue(data, admins);
+  // Counts derived from a dataset that was not read render null rather than the empty fallback's zero.
   const populationEvidence = {
-    users_seen: data.users.seen,
-    users_total: data.users.total ?? null,
-    active_users: activeUsers.length,
-    profiles_seen: profiles.length,
-    admin_profiles: truncateList(adminProfiles.map((profile) => asString(profile.Name) ?? "")),
-    active_admins_seen: admins.length,
+    users_seen: whenOk(data.users.seen, data.users),
+    users_total: whenOk(data.users.total ?? null, data.users),
+    active_users: whenOk(activeUsers.length, data.users),
+    profiles_seen: whenOk(profiles.length, data.profiles),
+    admin_profiles: whenOk(truncateList(adminProfiles.map((profile) => asString(profile.Name) ?? "")), data.profiles),
+    active_admins_seen: whenOk(admins.length, data.users, data.profiles),
   };
   const populationManual = (control: number, manualEvidence: string): SalesforceFinding =>
     finding(control, "manual", `${controlDefinition(control).title} cannot be verified from this credential's view because ${population}.`, populationEvidence, manualEvidence);
@@ -1931,19 +2077,34 @@ export function assessSalesforceIdentityData(data: SalesforceIdentityData, optio
     return ["HasTotp", "HasU2F", "HasSecurityKey", "HasSalesforceAuthenticator", "HasBuiltInAuthenticator"].some((key) => asBoolean(row[key]) === true);
   };
   const unenrolled = standardActiveUsers.filter((user) => !enrolled(asString(user.Id) ?? ""));
+  // A user is named as lacking MFA only when both the user list and the enrollment table were read to
+  // completion; a truncated enrollment read cannot prove that a missing row means no method.
+  const enrollmentReadable = data.users.status === "ok" && data.twoFactorMethods.status === "ok";
+  const enrollmentComplete = enrollmentReadable && !data.twoFactorMethods.truncated && !data.users.truncated;
+  const enrollmentPartialNotes = [
+    ...(data.users.truncated ? [`User returned ${data.users.seen} of ${data.users.total ?? "an unknown total of"} rows`] : []),
+    ...(data.twoFactorMethods.truncated ? [`TwoFactorMethodsInfo returned ${data.twoFactorMethods.seen} of ${data.twoFactorMethods.total ?? "an unknown total of"} rows`] : []),
+  ];
   const mfaEvidence = {
     enable_mfa_direct_ui_login_opt_in: mfaRequired ?? null,
     health_check_mfa_setting: mfaRisk ? { setting: asString(mfaRisk.Setting), org_value: asString(mfaRisk.OrgValue), risk_type: asString(mfaRisk.RiskType) } : null,
-    active_standard_users: standardActiveUsers.length,
-    users_without_registered_mfa_method: unenrolled.length,
-    sample_users_without_mfa: truncateList(unenrolled.map(userLabel)),
+    active_standard_users: whenOk(standardActiveUsers.length, data.users),
+    users_without_registered_mfa_method: enrollmentComplete ? unenrolled.length : null,
+    sample_users_without_mfa: enrollmentComplete ? truncateList(unenrolled.map(userLabel)) : null,
+    principals_withheld: enrollmentComplete || !enrollmentReadable ? null : `${enrollmentPartialNotes.join("; ")}; users without a registered method are not named from a partial read`,
     two_factor_methods_readable: data.twoFactorMethods.status === "ok",
-    two_factor_methods_rows: data.twoFactorMethods.data.length,
-    two_factor_methods_possibly_capped: data.twoFactorMethods.truncated,
-    users_truncated: data.users.truncated,
+    two_factor_methods_rows: whenOk(data.twoFactorMethods.seen, data.twoFactorMethods),
+    two_factor_methods_total: whenOk(data.twoFactorMethods.total ?? null, data.twoFactorMethods),
+    two_factor_methods_possibly_capped: whenOk(data.twoFactorMethods.truncated, data.twoFactorMethods),
+    users_truncated: whenOk(data.users.truncated, data.users),
   };
+  const capSignal = data.twoFactorMethods.seen >= TWO_FACTOR_METHODS_ROW_CAP
+    ? `which is the documented ${TWO_FACTOR_METHODS_ROW_CAP}-row cap`
+    : data.twoFactorMethods.total !== undefined && data.twoFactorMethods.total > data.twoFactorMethods.seen
+      ? `while the query reported ${data.twoFactorMethods.total} in total`
+      : "and the query reported more rows than were returned (done=false or a stalled cursor)";
   const capNote = data.twoFactorMethods.truncated
-    ? ` TwoFactorMethodsInfo returned ${data.twoFactorMethods.data.length} rows, which is the documented ${TWO_FACTOR_METHODS_ROW_CAP}-row cap with no done=false signal, so enrollment coverage may be incomplete.`
+    ? ` TwoFactorMethodsInfo returned ${data.twoFactorMethods.seen} rows, ${capSignal}, so enrollment coverage is incomplete.`
     : "";
   if (data.securitySettings.status !== "ok" && !mfaRisk) {
     findings.push(finding(4, "manual", `MFA enforcement could not be verified because ${unreadableReason(data.securitySettings)} and Health Check exposed no MFA setting.`, mfaEvidence, mfaManual));
@@ -1964,8 +2125,11 @@ export function assessSalesforceIdentityData(data: SalesforceIdentityData, optio
       );
       const sourceNote = unreadableNote("the MFA requirement's second source", data.securitySettings, data.healthCheckRisks);
       findings.push(finding(4, status, `MFA is required for direct UI logins and all ${standardActiveUsers.length} active standard users have a registered verification method.${partialNote(data.users)}${capNote}${sourceNote}`, mfaEvidence, status === "pass" ? undefined : mfaManual));
+    } else if (!enrollmentComplete) {
+      // Visible users without an enrollment row are an absence claim over a partial read: the verdict stops at warn and names nobody.
+      findings.push(finding(4, "warn", `MFA is required for direct UI logins, but some of the ${standardActiveUsers.length} visible active standard users have no registered MFA method among the visible TwoFactorMethodsInfo rows; the read was partial (${enrollmentPartialNotes.join("; ")}), so the unread rows could hold their enrollments and the count and names are withheld.${partialNote(data.users)}${capNote}`, mfaEvidence, mfaManual));
     } else {
-      findings.push(finding(4, unenrolled.length > standardActiveUsers.length / 4 ? "fail" : "warn", `MFA is required for direct UI logins, but ${unenrolled.length}/${standardActiveUsers.length} active standard users have no registered MFA method (SSO-only users may be exempt by design).${capNote}`, mfaEvidence));
+      findings.push(finding(4, unenrolled.length > standardActiveUsers.length / 4 ? "fail" : "warn", `MFA is required for direct UI logins, but ${unenrolled.length}/${standardActiveUsers.length} active standard users have no registered MFA method (SSO-only users may be exempt by design).`, mfaEvidence));
     }
   } else {
     const unreadableSources = [data.securitySettings, data.healthCheckRisks].filter((dataset) => dataset.status !== "ok").map(unreadableReason);
@@ -2016,18 +2180,27 @@ export function assessSalesforceIdentityData(data: SalesforceIdentityData, optio
     const apiOnlyProfiles = profiles.filter((profile) => asBoolean(profile.PermissionsApiUserOnly) === true);
     const usersOnApiProfiles = activeUsers.filter((user) => asBoolean(profileById.get(asString(user.ProfileId) ?? "")?.PermissionsApiEnabled) === true);
     const ratio = profiles.length > 0 ? apiProfiles.length / profiles.length : 0;
+    // A ratio over a truncated profile list is a sample, and an absent API Only profile is an absence claim over the unread rows.
+    const inputsComplete = !data.profiles.truncated && !data.users.truncated;
     const evidence = {
       profiles: profiles.length,
+      profiles_total: data.profiles.total ?? null,
       api_enabled_profiles: truncateList(apiProfiles.map((profile) => asString(profile.Name) ?? "")),
-      api_only_profiles: truncateList(apiOnlyProfiles.map((profile) => asString(profile.Name) ?? "")),
+      api_only_profiles: inputsComplete || apiOnlyProfiles.length > 0 ? truncateList(apiOnlyProfiles.map((profile) => asString(profile.Name) ?? "")) : null,
       api_only_flag_available: apiOnlyFlagAvailable,
-      active_users_on_api_enabled_profiles: usersOnApiProfiles.length,
+      active_users_on_api_enabled_profiles: inputsComplete || usersOnApiProfiles.length > 0 ? usersOnApiProfiles.length : null,
       profiles_truncated: data.profiles.truncated,
       profile_fields_omitted: data.profiles.omittedFields ?? [],
     };
-    const status: SalesforceFindingStatus = ratio > 0.5 ? "fail" : ratio > 0.25 ? "warn" : withPartialDowngrade(withPartialDowngrade("pass", data.profiles), data.users);
-    const apiOnlyNote = apiOnlyFlagAvailable ? `${apiOnlyProfiles.length} are API Only User profiles.` : "PermissionsApiUserOnly is not available in this org, so API Only User profiles could not be identified.";
-    findings.push(finding(7, status, `${apiProfiles.length}/${profiles.length} profiles grant API Enabled covering ${usersOnApiProfiles.length} active users; ${apiOnlyNote}${partialNote(data.profiles)}${partialNote(data.users)}`, evidence, status === "pass" ? undefined : apiManual));
+    const observed: SalesforceFindingStatus = ratio > 0.5 ? "fail" : ratio > 0.25 ? "warn" : "pass";
+    const status: SalesforceFindingStatus = inputsComplete ? observed : "warn";
+    const apiOnlyNote = !apiOnlyFlagAvailable
+      ? "PermissionsApiUserOnly is not available in this org, so API Only User profiles could not be identified."
+      : inputsComplete || apiOnlyProfiles.length > 0
+        ? `${apiOnlyProfiles.length} are API Only User profiles.`
+        : "no API Only User profile was among the visible rows, which a partial read cannot confirm.";
+    const sampleNote = inputsComplete ? "" : " The ratio is over the visible rows only, so the verdict is capped at warn.";
+    findings.push(finding(7, status, `${apiProfiles.length}/${profiles.length} visible profiles grant API Enabled covering ${usersOnApiProfiles.length} visible active users; ${apiOnlyNote}${partialNote(data.profiles)}${partialNote(data.users)}${sampleNote}`, evidence, status === "pass" ? undefined : apiManual));
   }
 
   const permSetManual = "Setup > Permission Sets: filter by Modify All Data, View All Data, Manage Users, and Author Apex; export the assignment list and confirm each assignee is justified.";
@@ -2124,17 +2297,19 @@ export function assessSalesforceIdentityData(data: SalesforceIdentityData, optio
     area: "identity_access",
     title: "Salesforce identity and access",
     summary: {
-      users: users.length,
-      active_users: activeUsers.length,
-      users_truncated: data.users.truncated,
-      profiles: profiles.length,
-      permission_sets: permissionSets.length,
-      permission_set_assignments: data.assignments.data.length,
-      two_factor_method_rows: data.twoFactorMethods.data.length,
-      two_factor_methods_possibly_capped: data.twoFactorMethods.truncated,
+      users: whenOk(users.length, data.users),
+      users_total: whenOk(data.users.total ?? null, data.users),
+      active_users: whenOk(activeUsers.length, data.users),
+      users_truncated: whenOk(data.users.truncated, data.users),
+      profiles: whenOk(profiles.length, data.profiles),
+      permission_sets: whenOk(permissionSets.length, data.permissionSets),
+      permission_set_assignments: whenOk(data.assignments.data.length, data.assignments),
+      two_factor_method_rows: whenOk(data.twoFactorMethods.seen, data.twoFactorMethods),
+      two_factor_methods_possibly_capped: whenOk(data.twoFactorMethods.truncated, data.twoFactorMethods),
       mfa_required_for_direct_ui_login: mfaRequired ?? null,
-      sensitive_profiles_read: data.profileMetadata.seen,
+      sensitive_profiles_read: whenOk(data.profileMetadata.seen, data.profileMetadata),
       population_view_issue: population ?? null,
+      inventories: Object.fromEntries([data.users, data.profiles, data.profileMetadata, data.permissionSets, data.assignments, data.twoFactorMethods, data.securitySettings, data.healthCheckRisks].map((dataset) => [dataset.name, describeDataset(dataset)])),
     },
     findings: findings.sort((left, right) => left.control - right.control),
     errors: datasetErrors(data.users, data.profiles, data.profileMetadata, data.permissionSets, data.assignments, data.twoFactorMethods, data.securitySettings, data.healthCheckRisks),
@@ -2276,11 +2451,12 @@ export function assessSalesforceDataProtectionData(data: SalesforceDataProtectio
     area: "data_protection",
     title: "Salesforce data protection",
     summary: {
-      sensitive_field_grants: fieldPermissions.length,
-      tenant_secrets: secrets.length,
+      sensitive_field_grants: whenOk(fieldPermissions.length, data.fieldPermissions),
+      tenant_secrets: whenOk(secrets.length, data.tenantSecrets),
       tenant_secret_status: data.tenantSecrets.status,
-      certificates: certificates.length,
+      certificates: whenOk(certificates.length, data.certificates),
       organization_readable: data.organization.status === "ok",
+      inventories: Object.fromEntries([data.fieldPermissions, data.tenantSecrets, data.certificates, data.organization].map((dataset) => [dataset.name, describeDataset(dataset)])),
     },
     findings: findings.sort((left, right) => left.control - right.control),
     errors: datasetErrors(data.organization, data.fieldPermissions, data.tenantSecrets, data.certificates),
@@ -2390,21 +2566,29 @@ export function assessSalesforceMonitoringData(data: SalesforceMonitoringData): 
     const countries = [...new Set(logins.map((login) => asString(login.CountryIso)).filter((value): value is string => Boolean(value)))];
     const legacyTls = logins.filter((login) => /TLS 1\.[01]/i.test(asString(login.TlsProtocol) ?? ""));
     const failureRatio = failed.length / logins.length;
+    // Over a truncated read the ratio is a sample and every zero is an absence claim over the unread rows.
+    const complete = !data.loginHistory.truncated;
+    const absenceCount = (value: number): number | null => (complete || value > 0 ? value : null);
     const evidence = {
       login_rows: logins.length,
       window_days: data.loginHistoryDays,
       failed_logins: failed.length,
-      failure_ratio: Number(failureRatio.toFixed(3)),
-      brute_force_sources: truncateList(bruteForceIps),
+      failure_ratio: complete ? Number(failureRatio.toFixed(3)) : null,
+      brute_force_sources: complete || bruteForceIps.length > 0 ? truncateList(bruteForceIps) : null,
       countries,
-      legacy_tls_logins: legacyTls.length,
-      rows_without_login_time: undated.length,
+      legacy_tls_logins: absenceCount(legacyTls.length),
+      rows_without_login_time: absenceCount(undated.length),
       truncated: data.loginHistory.truncated,
       seen: data.loginHistory.seen,
       total: data.loginHistory.total ?? null,
     };
-    const status: SalesforceFindingStatus = bruteForceIps.length > 0 || failureRatio > 0.25 || legacyTls.length > 0 ? "fail" : failureRatio > 0.1 || countries.length > 5 || undated.length > 0 || data.loginHistory.truncated ? "warn" : "pass";
-    findings.push(finding(14, status, `${logins.length} logins in ${data.loginHistoryDays} days: ${failed.length} failures (${Math.round(failureRatio * 100)}%), ${bruteForceIps.length} sources with 10+ failures, ${countries.length} countries, ${legacyTls.length} legacy TLS logins.${partialNote(data.loginHistory)}`, evidence, status === "pass" ? undefined : loginManual));
+    const observed: SalesforceFindingStatus = bruteForceIps.length > 0 || failureRatio > 0.25 || legacyTls.length > 0 ? "fail" : failureRatio > 0.1 || countries.length > 5 || undated.length > 0 ? "warn" : "pass";
+    const status: SalesforceFindingStatus = complete ? observed : "warn";
+    const countClause = (value: number, label: string): string => (complete || value > 0 ? `${value} ${label}` : `${label}: unknown from the visible rows`);
+    const summary = complete
+      ? `${logins.length} logins in ${data.loginHistoryDays} days: ${failed.length} failures (${Math.round(failureRatio * 100)}%), ${bruteForceIps.length} sources with 10+ failures, ${countries.length} countries, ${legacyTls.length} legacy TLS logins.`
+      : `${logins.length} of ${data.loginHistory.total ?? "an unknown total of"} logins in ${data.loginHistoryDays} days were read: ${failed.length} failures among the visible rows (ratio not stated from a partial read), ${countClause(bruteForceIps.length, "sources with 10+ failures")}, ${countries.length} countries seen, ${countClause(legacyTls.length, "legacy TLS logins")}. The verdict is capped at warn because the unread rows could change it.${partialNote(data.loginHistory)}`;
+    findings.push(finding(14, status, summary, evidence, status === "pass" ? undefined : loginManual));
   }
 
   const auditManual = `Setup > Security > View Setup Audit Trail: download the last ${data.auditTrailDays} days and review permission, profile, admin, session, password, and network access changes.`;
@@ -2443,17 +2627,19 @@ export function assessSalesforceMonitoringData(data: SalesforceMonitoringData): 
     area: "monitoring_integrations",
     title: "Salesforce monitoring and integrations",
     summary: {
-      connected_applications: apps.length,
-      oauth_tokens: data.oauthTokens.data.length,
-      oauth_tokens_partial_view: tokenViewPartial,
-      oauth_tokens_possibly_capped: tokensPossiblyCapped,
+      connected_applications: whenOk(apps.length, data.connectedApplications),
+      oauth_tokens: whenOk(data.oauthTokens.data.length, data.oauthTokens),
+      oauth_tokens_partial_view: whenOk(tokenViewPartial, data.oauthTokens),
+      oauth_tokens_possibly_capped: whenOk(tokensPossiblyCapped, data.oauthTokens),
       caller_has_customize_application: canSeeAllTokens ?? null,
-      login_rows: logins.length,
+      login_rows: whenOk(logins.length, data.loginHistory),
+      login_rows_total: whenOk(data.loginHistory.total ?? null, data.loginHistory),
       login_history_days: data.loginHistoryDays,
-      audit_rows: trail.length,
+      audit_rows: whenOk(trail.length, data.setupAuditTrail),
       audit_trail_days: data.auditTrailDays,
-      event_log_files: data.eventLogFiles.data.length,
+      event_log_files: whenOk(data.eventLogFiles.data.length, data.eventLogFiles),
       event_log_status: data.eventLogFiles.status,
+      inventories: Object.fromEntries([data.connectedApplications, data.oauthTokens, data.callerPermissions, data.loginHistory, data.setupAuditTrail, data.eventLogFiles].map((dataset) => [dataset.name, describeDataset(dataset)])),
     },
     findings: findings.sort((left, right) => left.control - right.control),
     errors: datasetErrors(data.connectedApplications, data.oauthTokens, data.callerPermissions, data.loginHistory, data.setupAuditTrail, data.eventLogFiles),
@@ -2505,7 +2691,7 @@ export async function checkSalesforceAccess(client: ReadClient): Promise<Salesfo
       error: sessionError,
       permissionHint: "API Enabled plus a valid connected app grant",
     },
-    { name: "organization", endpoint: `/services/data/v${version}/query (Organization)`, status: organization.status === "ok" ? "readable" : "not_readable", count: organization.seen, error: organization.error, permissionHint: "API Enabled" },
+    { name: "organization", endpoint: `/services/data/v${version}/query (Organization)`, status: organization.status === "ok" ? "readable" : "not_readable", count: organization.status === "ok" ? organization.seen : undefined, error: organization.error, permissionHint: "API Enabled" },
     await probeSurface("limits", `/services/data/v${version}/limits`, "API Enabled", () => client.getLimits(), () => 1),
     await probeSurface("health_check", `/services/data/v${version}/tooling/query (SecurityHealthCheck)`, "View Setup and Configuration, View Health Check", () => client.getHealthCheck(), (value) => (value ? 1 : 0)),
     await probeSurface("health_check_risks", `/services/data/v${version}/tooling/query (SecurityHealthCheckRisks)`, "View Setup and Configuration", () => client.listHealthCheckRisks(50), queryCount),
@@ -2520,7 +2706,7 @@ export async function checkSalesforceAccess(client: ReadClient): Promise<Salesfo
     await probeSurface("connected_applications", `/services/data/v${version}/query (ConnectedApplication)`, "View Setup and Configuration", () => client.listConnectedApplications(50), queryCount),
     await probeSurface("oauth_tokens", `/services/data/v${version}/query (OauthToken)`, "Customize Application (without it only the caller's own tokens are returned)", () => client.listOauthTokens(50), queryCount),
     await probeSurface("event_log_files", `/services/data/v${version}/query (EventLogFile)`, "View Event Log Files (Event Monitoring license)", () => client.listEventLogFiles(1, 10), queryCount),
-    { name: "caller_permissions", endpoint: `/services/data/v${version}/query (UserPermissionAccess)`, status: callerPermissions.status === "ok" && callerPermissions.data ? "readable" : "not_readable", count: callerPermissions.seen, error: callerPermissions.error, permissionHint: "API Enabled" },
+    { name: "caller_permissions", endpoint: `/services/data/v${version}/query (UserPermissionAccess)`, status: callerPermissions.status === "ok" && callerPermissions.data ? "readable" : "not_readable", count: callerPermissions.status === "ok" ? callerPermissions.seen : undefined, error: callerPermissions.error, permissionHint: "API Enabled" },
   ];
 
   const deniedCallerPermissions = CALLER_PERMISSION_FIELDS
@@ -2672,9 +2858,9 @@ function buildQuickReference(): string {
     "",
     "## Layout",
     "",
-    "- `core_data/`: raw API snapshots (Organization, Health Check, SecuritySettings, users, profiles, profile metadata for sensitive profiles, permission sets, caller permissions, login history, audit trail, connected apps, certificates, tenant secrets, event log files)",
-    "- `analysis/findings.json`: all normalized findings with framework mappings",
-    "- `analysis/<area>.json`: per-area assessment results and collection errors",
+    "- `core_data/`: projected and redacted API snapshots (Organization, Health Check, SecuritySettings, users, profiles, profile metadata for sensitive profiles, permission sets, caller permissions, login history, audit trail, connected apps, certificates, tenant secrets, event log files); each dataset wrapper carries `status`, `seen`, `total`, and `truncated`, URL fields keep scheme, host, and path only, and a dataset that was denied, unavailable, or errored is written as a `{ collected: false, dataset, status, http_status, endpoint, error }` marker instead of an empty snapshot",
+    "- `analysis/findings.json`: all normalized findings with framework mappings; counts and names derived from a dataset that was not read render null, and lists of principals from a partial read render null with a `principals_withheld` note",
+    "- `analysis/<area>.json`: per-area assessment results, an `inventories` map stating each dataset as complete, partial, or unread, and collection errors; summary counts derived from an unread dataset render null",
     "- `compliance/executive_summary.md`: prioritized summary and manual verification queue",
     "- `compliance/unified_compliance_matrix.md`: control to framework matrix",
     "- `compliance/<framework>/`: one report per framework (FedRAMP, CMMC, SOC 2, CIS, PCI-DSS, DISA STIG, IRAP, ISMAP)",
@@ -2717,28 +2903,30 @@ export async function exportSalesforceAuditBundle(
   ensurePrivateDir(outputRoot);
   const outputDir = await nextAvailableAuditDir(outputRoot, `${safeDirName(orgLabel)}-audit-bundle`);
 
+  // Every dataset goes through datasetCoreData so a denied, unavailable, or errored read is written as a
+  // { collected: false, ... } marker instead of an empty snapshot.
   const coreDataFiles: Array<[string, unknown]> = [
     ["core_data/access_check.json", access],
-    ["core_data/organization.json", platformData.organization],
-    ["core_data/security_health_check.json", platformData.healthCheck],
-    ["core_data/security_health_check_risks.json", platformData.healthCheckRisks],
-    ["core_data/security_settings.json", platformData.securitySettings],
-    ["core_data/my_domain_settings.json", platformData.myDomainSettings],
-    ["core_data/users.json", identityData.users],
-    ["core_data/profiles.json", identityData.profiles],
-    ["core_data/profile_metadata.json", identityData.profileMetadata],
-    ["core_data/permission_sets.json", identityData.permissionSets],
-    ["core_data/permission_set_assignments.json", identityData.assignments],
-    ["core_data/two_factor_methods_info.json", identityData.twoFactorMethods],
-    ["core_data/field_permissions_sensitive.json", dataProtection.fieldPermissions],
-    ["core_data/tenant_secrets.json", dataProtection.tenantSecrets],
-    ["core_data/certificates.json", dataProtection.certificates],
-    ["core_data/connected_applications.json", monitoring.connectedApplications],
-    ["core_data/oauth_tokens.json", monitoring.oauthTokens],
-    ["core_data/caller_permissions.json", monitoring.callerPermissions],
-    ["core_data/login_history.json", monitoring.loginHistory],
-    ["core_data/setup_audit_trail.json", monitoring.setupAuditTrail],
-    ["core_data/event_log_files.json", monitoring.eventLogFiles],
+    ["core_data/organization.json", datasetCoreData(platformData.organization)],
+    ["core_data/security_health_check.json", datasetCoreData(platformData.healthCheck)],
+    ["core_data/security_health_check_risks.json", datasetCoreData(platformData.healthCheckRisks)],
+    ["core_data/security_settings.json", datasetCoreData(platformData.securitySettings)],
+    ["core_data/my_domain_settings.json", datasetCoreData(platformData.myDomainSettings)],
+    ["core_data/users.json", datasetCoreData(identityData.users)],
+    ["core_data/profiles.json", datasetCoreData(identityData.profiles)],
+    ["core_data/profile_metadata.json", datasetCoreData(identityData.profileMetadata)],
+    ["core_data/permission_sets.json", datasetCoreData(identityData.permissionSets)],
+    ["core_data/permission_set_assignments.json", datasetCoreData(identityData.assignments)],
+    ["core_data/two_factor_methods_info.json", datasetCoreData(identityData.twoFactorMethods)],
+    ["core_data/field_permissions_sensitive.json", datasetCoreData(dataProtection.fieldPermissions)],
+    ["core_data/tenant_secrets.json", datasetCoreData(dataProtection.tenantSecrets)],
+    ["core_data/certificates.json", datasetCoreData(dataProtection.certificates)],
+    ["core_data/connected_applications.json", datasetCoreData(monitoring.connectedApplications)],
+    ["core_data/oauth_tokens.json", datasetCoreData(monitoring.oauthTokens)],
+    ["core_data/caller_permissions.json", datasetCoreData(monitoring.callerPermissions)],
+    ["core_data/login_history.json", datasetCoreData(monitoring.loginHistory)],
+    ["core_data/setup_audit_trail.json", datasetCoreData(monitoring.setupAuditTrail)],
+    ["core_data/event_log_files.json", datasetCoreData(monitoring.eventLogFiles)],
   ];
   for (const [pathname, value] of coreDataFiles) {
     await writeSecureTextFile(outputDir, pathname, serializeJson(value));
@@ -2966,7 +3154,7 @@ export function registerSalesforceTools(pi: any): void {
     name: "salesforce_export_audit_bundle",
     label: "Export Salesforce audit bundle",
     description:
-      "Export a Salesforce audit package with raw API snapshots (core_data/), normalized findings (analysis/), executive summary, unified compliance matrix, per-framework reports (compliance/), QUICK_REFERENCE.md, an _errors.log when collection partially failed, and a zip archive.",
+      "Export a Salesforce audit package with projected and redacted API snapshots (core_data/, with not-collected markers for denied datasets), normalized findings (analysis/), executive summary, unified compliance matrix, per-framework reports (compliance/), QUICK_REFERENCE.md, an _errors.log when collection partially failed, and a zip archive.",
     parameters: Type.Object({
       ...assessParams,
       output_dir: Type.Optional(Type.String({ description: `Output root. Defaults to ${DEFAULT_OUTPUT_DIR}.` })),
