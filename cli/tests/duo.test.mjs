@@ -46,6 +46,7 @@ import {
   assertRedactionCases,
   assertScrubBoundary,
   assertShortBodyRecordedAsNote,
+  encodedFormsOf,
   htmlCanaryBody,
   jsonCanaryMessage,
   parserMessageFor,
@@ -1892,6 +1893,11 @@ test("rule 9 scrub boundary: name-shaped values stay bare, any value in a carrie
       "policy Global-Policy-2026 allows sms_passcodes",
     ],
   });
+  for (const form of encodedFormsOf(DUO_IKEY_CANARY)) {
+    const output = redactErrorText(`Duo rejected integration ${form} for this host`);
+    assert.equal(output, "Duo rejected integration [REDACTED] for this host", `the integration key is a configured secret removed whatever its shape: ${form}`);
+    assertNoCanaryWindows(assert, output, [DUO_IKEY_CANARY], `integration key form ${form}`);
+  }
 });
 
 const DUO_ACCESS_PROBE_PATHS = new Set([

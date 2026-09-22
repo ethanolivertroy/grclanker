@@ -1376,7 +1376,7 @@ export class DuoAuditorClient {
   constructor(config: DuoResolvedConfig, options?: { fetchImpl?: FetchImpl }) {
     this.config = config;
     this.fetchImpl = options?.fetchImpl ?? fetch;
-    registerConfiguredSecrets(config.skey);
+    registerConfiguredSecrets(config.ikey, config.skey);
   }
 
   /** Paging outcome of the most recent list call for a documented endpoint path. */
