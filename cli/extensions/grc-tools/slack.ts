@@ -734,27 +734,54 @@ function validScimType(value: unknown): string | undefined {
 }
 
 /**
- * Renders only the documented fields of a JSON error body: Web API and Audit Logs `error` (validated code),
- * `needed` and `provided` (validated scope lists), `warning` (validated code list); SCIM `status` (validated
- * integer), `scimType` (validated keyword, identifier, or urn, else dropped), and `detail` (scrubbed and cut).
- * Every other field, including response_metadata.messages, is dropped rather than echoed.
+ * Which Slack API answered a request. The error renderer reads only the fields that API documents, so a Web API
+ * or Audit Logs body cannot be read as a SCIM error because a gateway added a `detail` field, and a SCIM body
+ * cannot be read as a Web API error.
  */
-export function describeErrorFields(json: JsonRecord, scrub: (text: string) => string = redactErrorText): string {
+export type SlackApiFamily = "web" | "audit" | "scim";
+
+const WITHHELD_ERROR_FIELDS = "JSON body without documented error fields withheld";
+
+/** True when the body carries the SCIM 2.0 error discriminator (RFC 7644 section 3.12): the `schemas` array names the Error message schema. */
+function isScimErrorBody(json: JsonRecord): boolean {
+  return Array.isArray(json.schemas) && json.schemas.includes(SCIM_ERROR_SCHEMA);
+}
+
+/**
+ * Renders only the documented fields of a JSON error body, chosen by the API that was called rather than by the
+ * fields the body happens to carry. Web API and Audit Logs bodies (`ok: false` with an `error` code, optional
+ * `needed`, `provided`, `warning`): `error` (validated code), `needed` and `provided` (validated scope lists),
+ * `warning` (validated code list); a `detail`, `status`, or `scimType` field in such a body is gateway text and is
+ * dropped. SCIM bodies: only a body carrying the SCIM 2.0 error schema renders `status` (validated integer),
+ * `scimType` (validated keyword, identifier, or urn, else dropped), and `detail` (scrubbed with the configured
+ * secrets and cut); a SCIM body without the discriminator is withheld. Every other field, including
+ * response_metadata.messages, is dropped rather than echoed.
+ */
+export function describeErrorFields(json: JsonRecord, family: SlackApiFamily, secrets: readonly string[] = []): string {
   const parts: string[] = [];
-  const schemas = Array.isArray(json.schemas) ? json.schemas : [];
-  if (schemas.includes(SCIM_ERROR_SCHEMA) || "scimType" in json || "detail" in json) {
-    const status = validHttpStatus(json.status);
-    if (status !== undefined) parts.push(`status=${status}`);
-    const scimType = validScimType(json.scimType);
-    if (scimType !== undefined) parts.push(`scimType=${scimType}`);
-    if (typeof json.detail === "string") parts.push(`detail=${scrub(json.detail).slice(0, 200)}`);
-  } else {
-    if (json.error !== undefined) parts.push(`error=${vendorErrorCode(json.error)}`);
-    if (json.needed !== undefined) parts.push(`needed=${vendorCodeList(json.needed, SLACK_SCOPE_PATTERN)}`);
-    if (json.provided !== undefined) parts.push(`provided=${vendorCodeList(json.provided, SLACK_SCOPE_PATTERN)}`);
-    if (json.warning !== undefined) parts.push(`warning=${vendorCodeList(json.warning, SLACK_ERROR_CODE_PATTERN)}`);
+  switch (family) {
+    case "web":
+    case "audit":
+      if (json.error !== undefined) parts.push(`error=${vendorErrorCode(json.error)}`);
+      if (json.needed !== undefined) parts.push(`needed=${vendorCodeList(json.needed, SLACK_SCOPE_PATTERN)}`);
+      if (json.provided !== undefined) parts.push(`provided=${vendorCodeList(json.provided, SLACK_SCOPE_PATTERN)}`);
+      if (json.warning !== undefined) parts.push(`warning=${vendorCodeList(json.warning, SLACK_ERROR_CODE_PATTERN)}`);
+      break;
+    case "scim": {
+      if (!isScimErrorBody(json)) return WITHHELD_ERROR_FIELDS;
+      const status = validHttpStatus(json.status);
+      if (status !== undefined) parts.push(`status=${status}`);
+      const scimType = validScimType(json.scimType);
+      if (scimType !== undefined) parts.push(`scimType=${scimType}`);
+      if (typeof json.detail === "string") parts.push(`detail=${redactErrorText(json.detail, secrets).slice(0, 200)}`);
+      break;
+    }
+    default: {
+      const exhaustive: never = family;
+      throw new Error(`Unhandled Slack API family ${String(exhaustive)}`);
+    }
   }
-  return parts.length > 0 ? parts.join(" ") : "JSON body without documented error fields withheld";
+  return parts.length > 0 ? parts.join(" ") : WITHHELD_ERROR_FIELDS;
 }
 
 /** Describes a response body that is not a JSON object without quoting any of it. */
@@ -819,18 +846,19 @@ export class SlackApiClient {
   }
 
   /**
-   * A JSON error body is never echoed: only its documented fields are rendered, codes pattern-validated and SCIM
-   * detail scrubbed and cut (describeErrorFields); any other body (an HTML error page from a proxy or gateway,
-   * plain text) is only described by content type and length. The SlackApiError constructor scrubs the result again.
+   * A JSON error body is never echoed: only the fields documented for the API that was called are rendered, codes
+   * pattern-validated and SCIM detail scrubbed and cut (describeErrorFields); any other body (an HTML error page
+   * from a proxy or gateway, plain text) is only described by content type and length. The SlackApiError
+   * constructor scrubs the result again.
    */
-  private describeBody(response: Response, text: string): string {
+  private describeBody(family: SlackApiFamily, response: Response, text: string): string {
     const json = parseJsonRecord(text);
-    return json ? describeErrorFields(json, (value) => redactErrorText(value, this.knownSecrets())) : withheldBody(response, text);
+    return json ? describeErrorFields(json, family, this.knownSecrets()) : withheldBody(response, text);
   }
 
-  private httpError(label: string, response: Response, text: string): SlackApiError {
+  private httpError(label: string, family: SlackApiFamily, response: Response, text: string): SlackApiError {
     return new SlackApiError(
-      `${label} failed (HTTP ${response.status}) ${this.describeBody(response, text)}`,
+      `${label} failed (HTTP ${response.status}) ${this.describeBody(family, response, text)}`,
       label,
       response.status === 401 || response.status === 403 ? "http_forbidden" : `http_${response.status}`,
       response.status,
@@ -850,10 +878,10 @@ export class SlackApiClient {
     return redactSecrets(json, this.knownSecrets());
   }
 
-  private async fetchJson(url: URL, init: RequestInit, label: string): Promise<JsonRecord> {
+  private async fetchJson(url: URL, init: RequestInit, label: string, family: SlackApiFamily): Promise<JsonRecord> {
     const response = await this.fetchWithRateLimit(url, init);
     const text = await response.text();
-    if (!response.ok) throw this.httpError(label, response, text);
+    if (!response.ok) throw this.httpError(label, family, response, text);
     return this.parseOkJson(label, response, text);
   }
 
@@ -874,7 +902,7 @@ export class SlackApiClient {
     const contentType = (response.headers.get("content-type") ?? "").toLowerCase();
     if (!response.ok) {
       const text = await response.text();
-      throw this.httpError(label, response, text);
+      throw this.httpError(label, "web", response, text);
     }
     if (contentType.includes("gzip")) {
       await response.body?.cancel().catch(() => undefined);
@@ -912,14 +940,14 @@ export class SlackApiClient {
           authorization: `Bearer ${token}`,
         },
         body: params.toString(),
-      }, label);
+      }, label, "web");
     }
     const url = new URL(`${this.config.webApiBaseUrl}/${method}`);
     url.search = params.toString();
     return this.fetchJson(url, {
       method: "GET",
       headers: { accept: "application/json", authorization: `Bearer ${token}` },
-    }, label);
+    }, label, "web");
   }
 
   async scim(path: string, query: JsonRecord = {}): Promise<JsonRecord> {
@@ -935,7 +963,7 @@ export class SlackApiClient {
         accept: "application/scim+json,application/json",
         authorization: `Bearer ${this.config.scimToken}`,
       },
-    }, `Slack SCIM ${normalizedPath}`);
+    }, `Slack SCIM ${normalizedPath}`, "scim");
   }
 
   async audit(path: string, query: JsonRecord = {}): Promise<JsonRecord> {
@@ -948,7 +976,7 @@ export class SlackApiClient {
     return this.fetchJson(url, {
       method: "GET",
       headers: { accept: "application/json", authorization: `Bearer ${this.config.token}` },
-    }, `Slack Audit Logs ${normalizedPath}`);
+    }, `Slack Audit Logs ${normalizedPath}`, "audit");
   }
 
   async paginateWeb(

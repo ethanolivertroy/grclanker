@@ -1631,13 +1631,13 @@ test("vendor codes: a token-shaped Web API error code renders UnknownError every
   assert.equal(vendorErrorCode("not_allowed_token_type"), "not_allowed_token_type");
   assert.equal(vendorErrorCode("missing_scope"), "missing_scope");
   for (const rejected of ["Missing_Scope", "a".repeat(65), "", "1abc", "invalid auth", "xoxp-abc123456"]) assert.equal(vendorErrorCode(rejected), UNKNOWN_ERROR_CODE, rejected);
-  assert.equal(describeErrorFields({ ok: false, error: "missing_scope", needed: "admin.users:read", provided: "identify,users:read" }), "error=missing_scope needed=admin.users:read provided=identify,users:read");
-  assert.equal(describeErrorFields({ ok: false, error: "missing_scope", needed: TOKEN_CANARY, provided: `identify,${TOKEN_CANARY}`, warning: `missing_charset,${TOKEN_CANARY}`, response_metadata: { messages: [TOKEN_CANARY] } }), "error=missing_scope needed=UnknownError provided=identify,UnknownError warning=missing_charset,UnknownError");
-  assert.equal(describeErrorFields({ ok: false }), "JSON body without documented error fields withheld");
-  assert.equal(describeErrorFields({ schemas: ["urn:ietf:params:scim:api:messages:2.0:Error"], status: "403", scimType: SCIM_TYPE_CANARY, code: TOKEN_CANARY, detail: "denied" }), "status=403 detail=denied");
-  assert.equal(describeErrorFields({ schemas: ["urn:ietf:params:scim:api:messages:2.0:Error"], status: 403, scimType: "invalidFilter", detail: "Not authorized to view this resource" }), "status=403 scimType=invalidFilter detail=Not authorized to view this resource");
-  assert.equal(describeErrorFields({ schemas: ["urn:ietf:params:scim:api:messages:2.0:Error"], status: "401", scimType: "urn:ietf:params:scim:api:messages:2.0:invalidToken", detail: `see https://example.invalid/cb?access_token=${TOKEN_CANARY}` }), "status=401 scimType=urn:ietf:params:scim:api:messages:2.0:invalidToken detail=see https://example.invalid/cb?access_token=[REDACTED]");
-  assert.equal(describeErrorFields({ schemas: ["urn:ietf:params:scim:api:messages:2.0:Error"], status: TOKEN_CANARY, scimType: TOKEN_CANARY, detail: 7 }), "JSON body without documented error fields withheld");
+  assert.equal(describeErrorFields({ ok: false, error: "missing_scope", needed: "admin.users:read", provided: "identify,users:read" }, "web"), "error=missing_scope needed=admin.users:read provided=identify,users:read");
+  assert.equal(describeErrorFields({ ok: false, error: "missing_scope", needed: TOKEN_CANARY, provided: `identify,${TOKEN_CANARY}`, warning: `missing_charset,${TOKEN_CANARY}`, response_metadata: { messages: [TOKEN_CANARY] } }, "web"), "error=missing_scope needed=UnknownError provided=identify,UnknownError warning=missing_charset,UnknownError");
+  assert.equal(describeErrorFields({ ok: false }, "web"), "JSON body without documented error fields withheld");
+  assert.equal(describeErrorFields({ schemas: ["urn:ietf:params:scim:api:messages:2.0:Error"], status: "403", scimType: SCIM_TYPE_CANARY, code: TOKEN_CANARY, detail: "denied" }, "scim"), "status=403 detail=denied");
+  assert.equal(describeErrorFields({ schemas: ["urn:ietf:params:scim:api:messages:2.0:Error"], status: 403, scimType: "invalidFilter", detail: "Not authorized to view this resource" }, "scim"), "status=403 scimType=invalidFilter detail=Not authorized to view this resource");
+  assert.equal(describeErrorFields({ schemas: ["urn:ietf:params:scim:api:messages:2.0:Error"], status: "401", scimType: "urn:ietf:params:scim:api:messages:2.0:invalidToken", detail: `see https://example.invalid/cb?access_token=${TOKEN_CANARY}` }, "scim"), "status=401 scimType=urn:ietf:params:scim:api:messages:2.0:invalidToken detail=see https://example.invalid/cb?access_token=[REDACTED]");
+  assert.equal(describeErrorFields({ schemas: ["urn:ietf:params:scim:api:messages:2.0:Error"], status: TOKEN_CANARY, scimType: TOKEN_CANARY, detail: 7 }, "scim"), "JSON body without documented error fields withheld");
 
   const documented = makeClient(() => ({ ok: false, error: "missing_scope", needed: "admin.users:read" }));
   await assert.rejects(documented.web("users.list"), (error) => {
@@ -1734,6 +1734,136 @@ test("vendor codes: a token-shaped Web API error code renders UnknownError every
     const scimTool = await withStubbedFetch((request) => (request.pathname.startsWith("/scim/v2/") ? jsonResponse(scimCanary, 403) : compliantFixture(request)), () => identity.execute("call-3", identity.prepareArguments({ ...TOOL_ARGS })));
     assert.equal(leaks(JSON.stringify(scimTool)), false);
     assert.match(JSON.stringify(scimTool), /status=403 detail=denied/);
+  } finally {
+    if (previous === undefined) delete process.env.SLACK_CONFIG_FILE;
+    else process.env.SLACK_CONFIG_FILE = previous;
+  }
+});
+
+const SCIM_ERROR_SCHEMA = "urn:ietf:params:scim:api:messages:2.0:Error";
+/** Gateway text a proxy adds beside Slack's own fields; the canary has no prefix, so only the branch choice keeps it out. */
+const GATEWAY_DETAIL = `upstream gateway rejected the request; trace ${TOKEN_CANARY}`;
+
+/** Runs the access check, every assessment, and an export bundle against the fixture and returns every rendered string. */
+async function collectEverything(fixture, config) {
+  const client = makeClient(fixture);
+  const collected = [];
+  let accessThrew = false;
+  try {
+    collected.push(JSON.stringify(await checkSlackAccess(client)));
+  } catch (error) {
+    accessThrew = true;
+    collected.push(error.message);
+  }
+  const all = await assessAll(client);
+  collected.push(JSON.stringify(all.findings), JSON.stringify(all.summaries), JSON.stringify(all.errors));
+  const base = createTempBase("grclanker-slack-api-family-");
+  let exportThrew = false;
+  try {
+    const bundle = await exportSlackAuditBundle(client, config, base);
+    for (const file of listFilesRecursively(bundle.outputDir)) collected.push(readFileSync(file, "utf8"));
+    for (const entry of readZipEntries(bundle.zipPath)) collected.push(entry.content);
+  } catch (error) {
+    if (error instanceof assert.AssertionError) throw error;
+    exportThrew = true;
+    collected.push(error.message);
+  } finally {
+    rmSync(base, { recursive: true, force: true });
+  }
+  return { everything: collected.join("\n"), accessThrew, exportThrew };
+}
+
+test("API family: a Web API or Audit Logs error body carrying a gateway detail field renders its validated code, never the SCIM shape, and a SCIM body needs the RFC 7644 error schema", async () => {
+  const webBody = { ok: false, error: "invalid_auth", detail: GATEWAY_DETAIL };
+  const auditBody = { ok: false, error: "invalid_authentication", detail: GATEWAY_DETAIL, status: "401", scimType: "invalidFilter" };
+  const scimBody = { schemas: [SCIM_ERROR_SCHEMA], status: "403", scimType: "invalidFilter", detail: "denied" };
+  // Positive controls: the bodies carry the field the old discriminator keyed on, and the scrub alone does not catch the canary.
+  assert.ok("detail" in webBody && "detail" in auditBody, "control: the Web API and Audit Logs bodies carry detail");
+  assert.equal(redactErrorText(GATEWAY_DETAIL).includes(TOKEN_CANARY), true, "control: the scrub alone keeps the canary");
+  const leaks = (text) => text.includes(TOKEN_CANARY) || text.includes("CANARYSL") || text.includes("upstream gateway");
+
+  // The renderer reads the fields documented for the API that was called; detail, status, and scimType in a Web API or Audit Logs body are dropped.
+  assert.equal(describeErrorFields(webBody, "web"), "error=invalid_auth");
+  assert.equal(describeErrorFields(auditBody, "audit"), "error=invalid_authentication");
+  assert.equal(describeErrorFields({ ok: false, error: "invalid_auth", needed: "admin.users:read", schemas: [SCIM_ERROR_SCHEMA], detail: GATEWAY_DETAIL }, "web"), "error=invalid_auth needed=admin.users:read", "a SCIM-shaped body returned by the Web API still renders only the Web API fields");
+  assert.equal(describeErrorFields({ ok: false, detail: GATEWAY_DETAIL }, "web"), "JSON body without documented error fields withheld");
+  assert.equal(describeErrorFields({ ok: false, detail: GATEWAY_DETAIL }, "audit"), "JSON body without documented error fields withheld");
+  // A SCIM error is rendered only when the body carries the SCIM 2.0 error schema; the Web API fields of a SCIM body are never read.
+  assert.equal(describeErrorFields(scimBody, "scim"), "status=403 scimType=invalidFilter detail=denied");
+  assert.equal(describeErrorFields({ ...scimBody, error: TOKEN_CANARY, needed: TOKEN_CANARY }, "scim"), "status=403 scimType=invalidFilter detail=denied");
+  assert.equal(describeErrorFields({ status: "403", scimType: "invalidFilter", detail: GATEWAY_DETAIL }, "scim"), "JSON body without documented error fields withheld", "a SCIM body without the schema discriminator is withheld");
+  assert.equal(describeErrorFields({ schemas: ["urn:ietf:params:scim:schemas:core:2.0:User"], detail: GATEWAY_DETAIL }, "scim"), "JSON body without documented error fields withheld", "another schema is not the error discriminator");
+  assert.equal(describeErrorFields({ ok: false, error: "invalid_auth", detail: GATEWAY_DETAIL }, "scim"), "JSON body without documented error fields withheld", "a Web API body answered on the SCIM path renders nothing");
+  assert.throws(() => describeErrorFields(webBody, "rtm"), /Unhandled Slack API family rtm/);
+
+  // Through the client: the thrown message carries the validated code and the HTTP status, and never the gateway text.
+  await assert.rejects(makeClient(() => jsonResponse(webBody, 401)).web("users.list"), (error) => {
+    assert.equal(error.message, "Slack Web API users.list failed (HTTP 401) error=invalid_auth");
+    assert.equal(error.code, "http_forbidden");
+    return true;
+  });
+  await assert.rejects(makeClient(() => jsonResponse(webBody, 502)).probeAnalyticsExport(), (error) => {
+    assert.equal(error.message, "Slack Web API admin.analytics.getFile failed (HTTP 502) error=invalid_auth");
+    return true;
+  });
+  await assert.rejects(makeClient(() => jsonResponse(auditBody, 401)).audit("/logs"), (error) => {
+    assert.equal(error.message, "Slack Audit Logs /logs failed (HTTP 401) error=invalid_authentication");
+    return true;
+  });
+  await assert.rejects(makeClient(() => jsonResponse(scimBody, 403)).scim("/Users"), (error) => {
+    assert.equal(error.message, "Slack SCIM /Users failed (HTTP 403) status=403 scimType=invalidFilter detail=denied");
+    return true;
+  });
+  await assert.rejects(makeClient(() => jsonResponse({ error: "forbidden", detail: GATEWAY_DETAIL }, 403)).scim("/Users"), (error) => {
+    assert.equal(error.message, "Slack SCIM /Users failed (HTTP 403) JSON body without documented error fields withheld");
+    return true;
+  });
+
+  // Through the collectors, the bundle, and the zip: every Web API surface, then auth.test alone, then the Audit Logs surfaces.
+  const config = resolveSlackConfiguration(TOOL_ARGS, EMPTY_ENV);
+  const everyMethod = await collectEverything((request) => (request.pathname.startsWith("/api/") && methodOf(request) !== "auth.test" ? jsonResponse(webBody, 401) : compliantFixture(request)), config);
+  assert.equal(everyMethod.accessThrew, false);
+  assert.equal(everyMethod.exportThrew, false);
+  assert.equal(leaks(everyMethod.everything), false, "the gateway text reached a finding, a summary, an errors array, an access surface, a bundle file, or the zip");
+  assert.match(everyMethod.everything, /Slack Web API admin\.teams\.list failed \(HTTP 401\) error=invalid_auth/);
+  assert.match(everyMethod.everything, /Slack Web API users\.list failed \(HTTP 401\) error=invalid_auth/);
+  assert.doesNotMatch(everyMethod.everything, /detail=|scimType=|status=401/);
+  const authTest = await collectEverything((request) => (methodOf(request) === "auth.test" ? jsonResponse(webBody, 401) : compliantFixture(request)), config);
+  assert.equal(authTest.accessThrew, true);
+  assert.equal(authTest.exportThrew, true);
+  assert.equal(leaks(authTest.everything), false);
+  assert.match(authTest.everything, /Slack Web API auth\.test failed \(HTTP 401\) error=invalid_auth/);
+  const auditLogs = await collectEverything((request) => (request.pathname.startsWith("/audit/v1/") ? jsonResponse(auditBody, 401) : compliantFixture(request)), config);
+  assert.equal(auditLogs.accessThrew, false);
+  assert.equal(auditLogs.exportThrew, false);
+  assert.equal(leaks(auditLogs.everything), false);
+  assert.match(auditLogs.everything, /Slack Audit Logs \/logs failed \(HTTP 401\) error=invalid_authentication/);
+  assert.match(auditLogs.everything, /Slack Audit Logs \/schemas failed \(HTTP 401\) error=invalid_authentication/);
+  assert.doesNotMatch(auditLogs.everything, /detail=|scimType=/);
+  const scim = await collectEverything((request) => (request.pathname.startsWith("/scim/v2/") ? jsonResponse(scimBody, 403) : compliantFixture(request)), config);
+  assert.equal(leaks(scim.everything), false);
+  assert.match(scim.everything, /Slack SCIM \/ServiceProviderConfig failed \(HTTP 403\) status=403 scimType=invalidFilter detail=denied/);
+
+  // Through the registered tools with a stubbed global fetch.
+  const tools = new Map();
+  registerSlackTools({ registerTool: (tool) => tools.set(tool.name, tool) });
+  const checkAccess = tools.get("slack_check_access");
+  const monitoring = tools.get("slack_assess_monitoring");
+  const previous = process.env.SLACK_CONFIG_FILE;
+  process.env.SLACK_CONFIG_FILE = "";
+  try {
+    const denied = await withStubbedFetch(() => jsonResponse(webBody, 401), () => checkAccess.execute("call-1", checkAccess.prepareArguments({ ...TOOL_ARGS })));
+    assert.equal(denied.isError, true);
+    assert.equal(denied.content[0].text, "Check Slack audit access failed: Slack Web API auth.test failed (HTTP 401) error=invalid_auth");
+    const partial = await withStubbedFetch((request) => (request.pathname.startsWith("/api/") && methodOf(request) !== "auth.test" ? jsonResponse(webBody, 401) : compliantFixture(request)), () => checkAccess.execute("call-2", checkAccess.prepareArguments({ ...TOOL_ARGS })));
+    assert.equal(partial.isError, undefined);
+    const surfaces = partial.details.surfaces.filter((surface) => surface.error);
+    assert.ok(surfaces.length > 0);
+    for (const surface of surfaces) assert.match(surface.error, /failed \(HTTP 401\) error=invalid_auth$/, JSON.stringify(surface));
+    assert.equal(leaks(JSON.stringify(partial)), false);
+    const auditTool = await withStubbedFetch((request) => (request.pathname.startsWith("/audit/v1/") ? jsonResponse(auditBody, 401) : compliantFixture(request)), () => monitoring.execute("call-3", monitoring.prepareArguments({ ...TOOL_ARGS })));
+    assert.equal(leaks(JSON.stringify(auditTool)), false);
+    assert.match(JSON.stringify(auditTool), /Slack Audit Logs \/logs failed \(HTTP 401\) error=invalid_authentication/);
   } finally {
     if (previous === undefined) delete process.env.SLACK_CONFIG_FILE;
     else process.env.SLACK_CONFIG_FILE = previous;
