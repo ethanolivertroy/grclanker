@@ -46,6 +46,7 @@ import { assertFixedTextsSurvive, collectFixedTexts, collectThrownMessage, colle
 import { assertFragmentsAbsent, assertPlantedValuesWellFormed } from "./helpers/planted-values.mjs";
 import { CONFIGURED_SECRET_CANARIES, assertTextFieldCarriers, carrierSuffix, injectingFetch } from "./helpers/text-field-carriers.mjs";
 import { assertDeepCanariesWellFormed, assertDeepNesting, deepFields, plantingFetch } from "./helpers/deep-nesting.mjs";
+import { ESCAPE_CANARIES, ESCAPE_CANARY_PLANTED_VALUES, escapeBoundaryTrace } from "./helpers/escape-boundary.mjs";
 import { assertScrubBoundary } from "./helpers/scrub-boundary-matrix.mjs";
 
 const NOW = new Date("2026-09-21T00:00:00.000Z");
@@ -2609,7 +2610,8 @@ function pdCanaryHtml() {
 
 // `fail` serves one path with a body that must never be echoed: { path, flavor: "html" | "json" },
 // where html is a 502 proxy page carrying the canaries and json is a 403 PagerDuty error object whose
-// message embeds the canary URL mid-sentence.
+// message embeds the canary URL mid-sentence and ends with the doubly-encoded escape-boundary trace
+// (every literal JSON escape before a plain-name cookie pair, a URL userinfo password, and an X-Api-Key header).
 function pagerdutyApiFixture({ deny = [], empty = [], truncate = [], fail } = {}) {
   const fixtures = healthyFixtures();
   const requests = [];
@@ -2666,9 +2668,9 @@ function pagerdutyApiFixture({ deny = [], empty = [], truncate = [], fail } = {}
       if (fail.flavor === "opaqueJson") return respond({ unexpected: { shape: true } }, 403, "Forbidden");
       if (fail.flavor === "plainJson") return respond({ error: { message: "Access Denied", code: 2010, errors: ["Access Denied"] } }, 403, "Forbidden");
       if (url.pathname === "/oauth/token") {
-        return respond({ error: "invalid_client", error_description: `client rejected; see ${PD_CANARY_URL} for the registration` }, 403, "Forbidden");
+        return respond({ error: "invalid_client", error_description: `client rejected; see ${PD_CANARY_URL} for the registration; ${escapeBoundaryTrace()}` }, 403, "Forbidden");
       }
-      return respond({ error: { message: `Access Denied; see ${PD_CANARY_URL} for the missing scope`, code: 2010, errors: [`scope details at ${PD_CANARY_URL}`] } }, 403, "Forbidden");
+      return respond({ error: { message: `Access Denied; see ${PD_CANARY_URL} for the missing scope; ${escapeBoundaryTrace()}`, code: 2010, errors: [`scope details at ${PD_CANARY_URL}`] } }, 403, "Forbidden");
     }
     if (url.pathname === "/oauth/token") {
       return respond({ access_token: PD_CANARY.accessToken, token_type: "bearer", expires_in: 3600 });
@@ -2959,9 +2961,9 @@ const PAGERDUTY_CANARY_SURFACES = [
   ...PAGERDUTY_LIST_ENDPOINTS.map(([path]) => path),
 ];
 
-/** No canary survives in any substring at lengths 6 through 24. */
+/** No canary (the PagerDuty set and the escape-boundary pair) survives in any substring at lengths 6 through 24. */
 function assertPdCanariesAbsent(text, context) {
-  assertFragmentsAbsent(assert, text, Object.values(PD_CANARY), context);
+  assertFragmentsAbsent(assert, text, [...Object.values(PD_CANARY), ...Object.values(ESCAPE_CANARIES)], context);
 }
 
 async function pdCanaryRun(config, fail) {
@@ -3121,6 +3123,7 @@ test("planted values self-check: every canary and planted secret is alphanumeric
     ...Object.fromEntries(Object.entries(PD_CANARY).map(([name, value]) => [`PD_CANARY.${name}`, value])),
     ...Object.fromEntries(Object.entries(FAKE_PAGERDUTY_SECRETS).map(([name, value]) => [`FAKE_PAGERDUTY_SECRETS.${name}`, value])),
     ...Object.fromEntries(Object.entries(CONFIG_CANARIES).map(([name, value]) => [`CONFIG_CANARIES.${name}`, value])),
+    ...ESCAPE_CANARY_PLANTED_VALUES,
     SAMPLE_API_TOKEN,
   }, [
     ["healthy fixtures", JSON.stringify(healthyFixtures())],

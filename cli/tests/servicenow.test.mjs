@@ -39,6 +39,7 @@ import { assertFixedTextsSurvive, collectFixedTexts, collectThrownMessage, colle
 import { assertFragmentsAbsent, assertPlantedValuesWellFormed } from "./helpers/planted-values.mjs";
 import { CONFIGURED_SECRET_CANARIES, assertTextFieldCarriers, carrierSuffix, injectingFetch } from "./helpers/text-field-carriers.mjs";
 import { assertDeepCanariesWellFormed, assertDeepNesting, deepFields, plantingFetch } from "./helpers/deep-nesting.mjs";
+import { ESCAPE_CANARIES, ESCAPE_CANARY_PLANTED_VALUES, escapeBoundaryTrace } from "./helpers/escape-boundary.mjs";
 import { assertScrubBoundary } from "./helpers/scrub-boundary-matrix.mjs";
 
 const FIXED_NOW = new Date("2026-09-21T00:00:00Z");
@@ -108,7 +109,9 @@ const FAKE_SNOW_SECRETS = {
 /**
  * `fail` serves one table (Table API and Aggregate API) or one path with a body that must never be
  * echoed: html is a 502 proxy page carrying the canaries; json is a 403 ServiceNow error object whose
- * documented message and detail fields embed the canary URL mid-sentence and a bearer value.
+ * documented message and detail fields embed the canary URL mid-sentence and a bearer value, and whose
+ * message ends with the doubly-encoded escape-boundary trace (every literal JSON escape before a
+ * plain-name cookie pair, a URL userinfo password, and an X-Api-Key header).
  */
 function snowCanaryResponse(flavor) {
   if (flavor === "html") {
@@ -122,7 +125,7 @@ function snowCanaryResponse(flavor) {
   }
   return jsonResponse({
     error: {
-      message: `Insufficient rights; the request was logged at ${SNOW_CANARY_URL} for review`,
+      message: `Insufficient rights; the request was logged at ${SNOW_CANARY_URL} for review; ${escapeBoundaryTrace()}`,
       detail: `Presented Authorization: Bearer ${SNOW_CANARY.bearer}; see ${SNOW_CANARY_URL} for the ACL decision`,
     },
     error_description: `Token exchange refused; retry at ${SNOW_CANARY_URL}`,
@@ -2198,9 +2201,9 @@ test("review round item 13: absence-driven fails on a partial ACL, plugin, or pr
   assert.match(findingsById(completeProperties).get("SNOW-07").summary, /has no sys_properties row; the documented default is false/);
 });
 
-/** No canary survives in any substring at lengths 6 through 24, and no HTML body was echoed. */
+/** No canary (the ServiceNow set and the escape-boundary pair) survives in any substring at lengths 6 through 24, and no HTML body was echoed. */
 function assertSnowCanariesAbsent(text, context) {
-  assertFragmentsAbsent(assert, text, Object.values(SNOW_CANARY), context);
+  assertFragmentsAbsent(assert, text, [...Object.values(SNOW_CANARY), ...Object.values(ESCAPE_CANARIES)], context);
   assert.ok(!text.includes("<html>"), `${context}: an HTML body was echoed`);
 }
 
@@ -2355,6 +2358,7 @@ test("planted values self-check: every canary and planted secret is alphanumeric
     ...Object.fromEntries(Object.entries(SNOW_CANARY).map(([name, value]) => [`SNOW_CANARY.${name}`, value])),
     ...Object.fromEntries(Object.entries(FAKE_SNOW_SECRETS).map(([name, value]) => [`FAKE_SNOW_SECRETS.${name}`, value])),
     ...Object.fromEntries(Object.entries(CONFIG_CANARIES).map(([name, value]) => [`CONFIG_CANARIES.${name}`, value])),
+    ...ESCAPE_CANARY_PLANTED_VALUES,
     SAMPLE_PASSWORD,
   }, [
     ["healthy fixture", JSON.stringify(healthyFixture())],

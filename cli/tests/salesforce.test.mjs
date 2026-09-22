@@ -40,6 +40,7 @@ import { assertLeavesNullUnderDenial } from "./helpers/leaf-diff.mjs";
 import { assertFragmentsAbsent, assertPlantedValuesWellFormed } from "./helpers/planted-values.mjs";
 import { CONFIGURED_SECRET_CANARIES, assertTextFieldCarriers, carrierSuffix, injectingFetch } from "./helpers/text-field-carriers.mjs";
 import { assertDeepCanariesWellFormed, assertDeepNesting, deepFields, plantingFetch } from "./helpers/deep-nesting.mjs";
+import { ESCAPE_CANARIES, ESCAPE_CANARY_PLANTED_VALUES, escapeBoundaryTrace } from "./helpers/escape-boundary.mjs";
 import { assertScrubBoundary } from "./helpers/scrub-boundary-matrix.mjs";
 
 const { privateKey: TEST_PRIVATE_KEY, publicKey: TEST_PUBLIC_KEY } = generateKeyPairSync("rsa", {
@@ -1912,7 +1913,9 @@ function sfCanaryFetch(failing) {
     if (failing.flavor === "plainHtml") return new Response("<html><head><title>502 Bad Gateway</title></head><body>upstream unavailable</body></html>", { status: 502, statusText: "Bad Gateway", headers: { "content-type": "text/html; charset=utf-8" } });
     if (failing.flavor === "opaqueJson") return jsonResponse({ unexpected: { shape: true } }, { status: 403 });
     if (failing.flavor === "plainJson") return jsonResponse([{ errorCode: "INSUFFICIENT_ACCESS", message: "insufficient access rights on object id" }], { status: 403 });
-    return jsonResponse([{ errorCode: "SERVER_ERROR", message: `Upstream failed; retry at ${SF_CANARY_URL} with Bearer ${SF_CANARY.bearer} (sid=${SF_CANARY.cookie})` }], { status: 403 });
+    // The message ends with the doubly-encoded escape-boundary trace (every literal JSON escape before a plain-name
+    // cookie pair, a URL userinfo password, and an X-Api-Key header).
+    return jsonResponse([{ errorCode: "SERVER_ERROR", message: `Upstream failed; retry at ${SF_CANARY_URL} with Bearer ${SF_CANARY.bearer} (sid=${SF_CANARY.cookie}); ${escapeBoundaryTrace()}` }], { status: 403 });
   };
   const soapResult = (operation, records) => xmlResponse(`${SOAP_ENVELOPE_OPEN}<${operation}Response><result>${records}</result></${operation}Response>${SOAP_ENVELOPE_CLOSE}`);
   return async (input, init = {}) => {
@@ -1951,9 +1954,9 @@ const SF_CANARY_SURFACES = [
   ...["Organization", "SecurityHealthCheck", "SecurityHealthCheckRisks", "User", "Profile", "PermissionSet", "PermissionSetAssignment", "TwoFactorMethodsInfo", "FieldPermissions", "TenantSecret", "Certificate", "ConnectedApplication", "OauthToken", "UserPermissionAccess", "LoginHistory", "SetupAuditTrail", "EventLogFile"].map((object) => `query:${object}`),
 ];
 
-/** No canary survives in any substring at lengths 6 through 24. */
+/** No canary (the Salesforce set and the escape-boundary pair) survives in any substring at lengths 6 through 24. */
 function assertSfCanariesAbsent(text, label) {
-  assertFragmentsAbsent(assert, text, SF_CANARY_VALUES, label);
+  assertFragmentsAbsent(assert, text, [...SF_CANARY_VALUES, ...Object.values(ESCAPE_CANARIES)], label);
 }
 
 test("rule 9 error strings: on every Salesforce surface a 502 HTML body or a JSON error embedding a credential URL never reaches results or the bundle", async () => {
@@ -2088,6 +2091,7 @@ test("planted values self-check: every canary and planted secret is alphanumeric
     ...Object.fromEntries(Object.entries(SF_CANARY).map(([name, value]) => [`SF_CANARY.${name}`, value])),
     ...Object.fromEntries(Object.entries(FAKE_SALESFORCE_SECRETS).map(([name, value]) => [`FAKE_SALESFORCE_SECRETS.${name}`, value])),
     ...Object.fromEntries(Object.entries(CONFIG_CANARIES).map(([name, value]) => [`CONFIG_CANARIES.${name}`, value])),
+    ...ESCAPE_CANARY_PLANTED_VALUES,
     SAMPLE_ACCESS_TOKEN,
   }, [
     ["identity fixture", JSON.stringify(goodIdentityData())],

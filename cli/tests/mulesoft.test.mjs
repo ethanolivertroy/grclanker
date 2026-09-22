@@ -41,6 +41,7 @@ import { assertLeavesNullUnderDenial } from "./helpers/leaf-diff.mjs";
 import { assertFragmentsAbsent, assertPlantedValuesWellFormed } from "./helpers/planted-values.mjs";
 import { CONFIGURED_SECRET_CANARIES, assertTextFieldCarriers, carrierSuffix, injectingFetch } from "./helpers/text-field-carriers.mjs";
 import { assertDeepCanariesWellFormed, assertDeepNesting, deepFields, plantingFetch } from "./helpers/deep-nesting.mjs";
+import { ESCAPE_CANARIES, ESCAPE_CANARY_PLANTED_VALUES, escapeBoundaryTrace } from "./helpers/escape-boundary.mjs";
 import { assertScrubBoundary } from "./helpers/scrub-boundary-matrix.mjs";
 
 const DAY_MS = 24 * 60 * 60 * 1000;
@@ -3511,8 +3512,10 @@ function msCanaryFetch(failing) {
       if (failing.flavor === "plainHtml") return new Response("<html><head><title>502 Bad Gateway</title></head><body>upstream unavailable</body></html>", { status: 502, statusText: "Bad Gateway", headers: { "content-type": "text/html; charset=utf-8" } });
       if (failing.flavor === "opaqueJson") return jsonResponse({ unexpected: { shape: true } }, { status: 403, statusText: "Forbidden" });
       if (failing.flavor === "plainJson") return jsonResponse({ message: "Forbidden: insufficient permissions for this organization" }, { status: 403, statusText: "Forbidden" });
+      // The message ends with the doubly-encoded escape-boundary trace (every literal JSON escape before a plain-name
+      // cookie pair, a URL userinfo password, and an X-Api-Key header).
       return jsonResponse(
-        { message: `Upstream failed; retry at ${MS_CANARY_URL} with Bearer ${MS_CANARY.bearer} (JSESSIONID=${MS_CANARY.cookie}; x-api-key: ${MS_CANARY.apiKey})` },
+        { message: `Upstream failed; retry at ${MS_CANARY_URL} with Bearer ${MS_CANARY.bearer} (JSESSIONID=${MS_CANARY.cookie}; x-api-key: ${MS_CANARY.apiKey}); ${escapeBoundaryTrace()}` },
         { status: 403, statusText: "Forbidden" },
       );
     }
@@ -3520,9 +3523,9 @@ function msCanaryFetch(failing) {
   };
 }
 
-/** No canary survives in any substring at lengths 6 through 24. */
+/** No canary (the Anypoint set and the escape-boundary pair) survives in any substring at lengths 6 through 24. */
 function assertMsCanariesAbsent(text, label) {
-  assertFragmentsAbsent(assert, text, MS_CANARY_VALUES, label);
+  assertFragmentsAbsent(assert, text, [...MS_CANARY_VALUES, ...Object.values(ESCAPE_CANARIES)], label);
 }
 
 test("rule 9 error strings: on every Anypoint surface a 502 HTML body or a JSON error embedding a credential URL never reaches results or the bundle", async () => {
@@ -3684,6 +3687,7 @@ test("planted values self-check: every canary and planted secret is alphanumeric
     ...Object.fromEntries(Object.entries(PLANTED).map(([name, value]) => [`PLANTED.${name}`, value])),
     ...Object.fromEntries(Object.entries(CONFIG_CANARIES).map(([name, value]) => [`CONFIG_CANARIES.${name}`, value])),
     ...Object.fromEntries(Object.entries(TOML_CANARIES).map(([name, value]) => [`TOML_CANARIES.${name}`, value])),
+    ...ESCAPE_CANARY_PLANTED_VALUES,
     SAMPLE_TOKEN,
   }, [
     ["sample configuration", JSON.stringify({ ...sampleConfig(), token: null })],

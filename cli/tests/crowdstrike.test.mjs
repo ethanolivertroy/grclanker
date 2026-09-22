@@ -38,6 +38,7 @@ import { assertFixedTextsSurvive, collectFixedTexts, collectThrownMessage, colle
 import { assertFragmentsAbsent, assertPlantedValuesWellFormed } from "./helpers/planted-values.mjs";
 import { CONFIGURED_SECRET_CANARIES, assertTextFieldCarriers, carrierSuffix, injectingFetch } from "./helpers/text-field-carriers.mjs";
 import { assertDeepCanariesWellFormed, assertDeepNesting, deepFields, plantingFetch } from "./helpers/deep-nesting.mjs";
+import { ESCAPE_CANARIES, ESCAPE_CANARY_PLANTED_VALUES, escapeBoundaryTrace } from "./helpers/escape-boundary.mjs";
 import { assertScrubBoundary } from "./helpers/scrub-boundary-matrix.mjs";
 
 const ALL_CONTROL_IDS = Array.from({ length: 25 }, (_, index) => `CS-${String(index + 1).padStart(2, "0")}`);
@@ -2530,15 +2531,17 @@ function csCanaryFetch(failing) {
       if (failing.flavor === "plainHtml") return new Response("<html><head><title>502 Bad Gateway</title></head><body>upstream unavailable</body></html>", { status: 502, headers: { "content-type": "text/html; charset=utf-8" } });
       if (failing.flavor === "opaqueJson") return jsonResponse({ unexpected: { shape: true } }, { status: 403 });
       if (failing.flavor === "plainJson") return jsonResponse({ errors: [{ code: 403, message: "access denied, authorization failed" }] }, { status: 403 });
-      return jsonResponse({ errors: [{ code: 403, message: `access denied for this API client; see ${CS_CANARY_URL} for the scope that is missing` }] }, { status: 403 });
+      // The message ends with the doubly-encoded escape-boundary trace (every literal JSON escape before a plain-name
+      // cookie pair, a URL userinfo password, and an X-Api-Key header).
+      return jsonResponse({ errors: [{ code: 403, message: `access denied for this API client; see ${CS_CANARY_URL} for the scope that is missing; ${escapeBoundaryTrace()}` }] }, { status: 403 });
     }
     return csHealthyResponse(url.pathname);
   };
 }
 
-/** No canary survives in any substring at lengths 6 through 24. */
+/** No canary (the Falcon set and the escape-boundary pair) survives in any substring at lengths 6 through 24. */
 function assertCsCanariesAbsent(text, context) {
-  assertFragmentsAbsent(assert, text, Object.values(CS_CANARY), context);
+  assertFragmentsAbsent(assert, text, [...Object.values(CS_CANARY), ...Object.values(ESCAPE_CANARIES)], context);
 }
 
 test("addendum 4: on every Falcon surface a 502 HTML body or a JSON error embedding a credential URL never reaches results or the bundle, and the recorded error carries a status-and-length note", async () => {
@@ -2658,6 +2661,7 @@ test("planted values self-check: every canary and planted secret is alphanumeric
     ...Object.fromEntries(Object.entries(CS_CANARY).map(([name, value]) => [`CS_CANARY.${name}`, value])),
     ...Object.fromEntries(Object.entries(FAKE_CROWDSTRIKE_SECRETS).map(([name, value]) => [`FAKE_CROWDSTRIKE_SECRETS.${name}`, value])),
     ...Object.fromEntries(Object.entries(CONFIG_CANARIES).map(([name, value]) => [`CONFIG_CANARIES.${name}`, value])),
+    ...ESCAPE_CANARY_PLANTED_VALUES,
     SAMPLE_CLIENT_SECRET,
   }, [
     ["sample configuration", JSON.stringify({ ...sampleConfig(), clientSecret: null })],

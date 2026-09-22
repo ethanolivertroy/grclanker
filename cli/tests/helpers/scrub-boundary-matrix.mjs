@@ -56,6 +56,13 @@ export const UPPER_NAME_SHAPED_CANARY = "QXKV_JRWX_MBTH_58273940116";
 export const SHORT_TOKEN_CANARY = "Xk9QzPw2Rt";
 
 /**
+ * A real token shape (20 characters, token casing, digits scattered through it): the bare token-run rule
+ * removes it wherever it stands, so after a carrier label it is the shape whose removal proves least;
+ * the escape-boundary rows run it anyway, since the rows audit the run rule's own lookbehind too.
+ */
+export const TOKEN_SHAPED_CANARY = "Qw7xKp2ZvN9tRb4Ym6Lc";
+
+/**
  * Two secrets to register: one name-shaped, so its bare removal can only come from registration,
  * and one whose every encoded form differs from the raw form.
  */
@@ -64,9 +71,21 @@ export const REGISTERED_SECRETS = {
   symbolic: 'Vq7@kZ+2/wP="9rT4x"',
 };
 
+/**
+ * Literal JSON escapes as the two or six characters they are inside a doubly-encoded body (a gateway error
+ * whose field holds serialized JSON): the client's parse hands the scrubber a backslash and an `n`, not a
+ * newline. Every escape but `\/` and `\"` ends in a word character (`n`, `r`, `t`, `b`, `f`, a hex digit),
+ * which is what a `\b` anchor or a "not preceded by a word character" lookbehind in front of a carrier
+ * opener trips over (reviewer B round 4 verdict, N1). The reviewer's eleven plus `\b` and `\f`.
+ */
+export const JSON_ESCAPES = ["\\n", "\\r", "\\t", "\\b", "\\f", "\\r\\n", "\\u000a", "\\u0009", "\\u000d", "\\u000d\\u000a", "\\u0020", "\\/", '\\"'];
+
+/** The decoded control characters the escapes stand for; a carrier after one of them was always removed and still must be. */
+export const DECODED_CONTROLS = [["\n", "LF"], ["\t", "TAB"], ["\r\n", "CRLF"], [" ", "SPACE"]];
+
 (() => {
   const owners = new Map();
-  for (const [name, value] of [["NAME_SHAPED_CANARY", NAME_SHAPED_CANARY], ["UPPER_NAME_SHAPED_CANARY", UPPER_NAME_SHAPED_CANARY], ["SHORT_TOKEN_CANARY", SHORT_TOKEN_CANARY], ...Object.entries(REGISTERED_SECRETS)]) {
+  for (const [name, value] of [["NAME_SHAPED_CANARY", NAME_SHAPED_CANARY], ["UPPER_NAME_SHAPED_CANARY", UPPER_NAME_SHAPED_CANARY], ["SHORT_TOKEN_CANARY", SHORT_TOKEN_CANARY], ["TOKEN_SHAPED_CANARY", TOKEN_SHAPED_CANARY], ...Object.entries(REGISTERED_SECRETS)]) {
     for (const window of shortestWindows(value)) {
       const owner = owners.get(window);
       assert.equal(owner, undefined, `window ${window} appears in both ${owner} and ${name}`);
@@ -127,7 +146,27 @@ export const MUST_KEEP = [
   'Host: api.example.com; Content-Type: "application/json"',
   'Retry-After: "120", Content-Length: "5120"',
   'Content-Type: "application/json" Accept: "application/json"',
+  ...escapedNonCredentialHeaderLines(),
 ];
+
+/**
+ * Controls for the escape-boundary rows: a non-credential header right after each literal escape, bare and
+ * inside a JSON string member, stays whole, name and value (`\u0020Retry-After` is not a token run, and
+ * `\nContent-Type` is not a carrier).
+ */
+export function escapedNonCredentialHeaderLines() {
+  const lines = [];
+  for (const escape of JSON_ESCAPES) {
+    for (const [header, jsonMemberHeader] of [
+      ['Content-Type: "application/json"', 'Content-Type: \\"application/json\\"'],
+      ["Accept: text/html", "Accept: text/html"],
+      ["Retry-After: 120", "Retry-After: 120"],
+    ]) {
+      lines.push(`upstream said 502${escape}${header}`, `{"message":"upstream said 502${escape}${jsonMemberHeader}"}`);
+    }
+  }
+  return lines;
+}
 
 /**
  * The name-shaped canary inside every carrier the ruling names. `keeps` is the carrier's own label,
@@ -183,7 +222,74 @@ export function carrierCases(canary = NAME_SHAPED_CANARY) {
     { name: "SOAP password element", text: `<password>${canary}</password>`, keeps: ["<password>", "</password>"] },
     ...quotedCarrierCases(canary),
     ...quotedCarrierCases(SHORT_TOKEN_CANARY).filter((item) => item.pinnedForShortToken).map((item) => ({ ...item, name: `${item.name} (short token)`, value: SHORT_TOKEN_CANARY })),
+    ...escapeBoundaryCases(canary),
+    ...escapeBoundaryCases(SHORT_TOKEN_CANARY),
+    ...escapeBoundaryCases(TOKEN_SHAPED_CANARY),
+    ...decodedControlCases(canary),
+    ...escapedBareTokenCases(),
   ];
+}
+
+/**
+ * The carriers a literal escape stands in front of inside a doubly-encoded body, with the label that must
+ * survive after each: a cookie pair with a plain name (only the Cookie rule's opener can take it), a URL
+ * with a userinfo password (only the URL rule's opener), a single-value credential header (the field rule's
+ * lookbehind, which must also accept the `/` of `\/`), the Authorization header, and a scheme in prose.
+ */
+function escapeBoundaryCarriers(canary) {
+  return [
+    { carrier: "plain-name Cookie pair", text: `Cookie: theme=${canary}`, keeps: ["Cookie: "] },
+    { carrier: "plain-name Set-Cookie pair with an attribute", text: `Set-Cookie: theme=${canary}; Secure`, keeps: ["Set-Cookie: "] },
+    { carrier: "URL userinfo password", text: `https://alice:${canary}@host.example/path`, keeps: ["https://", "@host.example/path"] },
+    { carrier: "X-Api-Key header", text: `X-Api-Key: ${canary}`, keeps: ["X-Api-Key: "] },
+    { carrier: "Authorization Bearer header", text: `Authorization: Bearer ${canary}`, keeps: ["Authorization: "] },
+    { carrier: "Bearer scheme in prose", text: `Bearer ${canary}`, keeps: ["Bearer "] },
+  ];
+}
+
+/**
+ * Escape-boundary rows (reviewer B round 4 verdict, N1): every carrier of `escapeBoundaryCarriers` right after
+ * each literal JSON escape, bare (`upstream said 502\nCookie: theme=V`) and inside a JSON string member
+ * (`{"message":"upstream said 502\nCookie: theme=V"}`). The escape and the carrier label must survive; the
+ * value must not, in any 6-to-24-character window. Run with the name-shaped, the short token-cased, and the
+ * token-shaped canary.
+ */
+export function escapeBoundaryCases(canary = NAME_SHAPED_CANARY) {
+  const shape = canary === NAME_SHAPED_CANARY ? "name-shaped" : canary === SHORT_TOKEN_CANARY ? "short token" : "token-shaped";
+  const cases = [];
+  for (const escape of JSON_ESCAPES) {
+    for (const { carrier, text, keeps } of escapeBoundaryCarriers(canary)) {
+      const bare = `upstream said 502${escape}${text}`;
+      cases.push({ name: `${carrier} after ${escape} (${shape})`, text: bare, value: canary, keeps: [`upstream said 502${escape}`, ...keeps] });
+      cases.push({ name: `${carrier} after ${escape} inside a JSON string member (${shape})`, text: `{"message":"${bare}"}`, value: canary, keeps: [`{"message":"upstream said 502${escape}`, ...keeps, '"}'] });
+    }
+  }
+  return cases;
+}
+
+/** The same carriers after the decoded control character the escapes stand for (a real newline, tab, CRLF, or space). */
+export function decodedControlCases(canary = NAME_SHAPED_CANARY) {
+  const cases = [];
+  for (const [control, controlName] of DECODED_CONTROLS) {
+    for (const { carrier, text, keeps } of escapeBoundaryCarriers(canary)) {
+      cases.push({ name: `${carrier} after a decoded ${controlName}`, text: `upstream said 502${control}${text}`, value: canary, keeps: [`upstream said 502${control}`, ...keeps] });
+    }
+  }
+  return cases;
+}
+
+/**
+ * The bare token shapes right after each literal escape: the vendor-prefix, JWT, hex-digest, and token-run
+ * rules open on the escape boundary too, and no token run starts inside the escape's own body.
+ */
+export function escapedBareTokenCases() {
+  const cases = [];
+  for (const escape of JSON_ESCAPES) {
+    for (const token of BARE_TOKENS.filter((item) => !item.value.includes("\n"))) {
+      cases.push({ name: `bare token ${token.name} after ${escape}`, text: `upstream said 502${escape}${token.value} seen`, value: token.value, keeps: [`upstream said 502${escape}`, " seen"] });
+    }
+  }
+  return cases;
 }
 
 /**
