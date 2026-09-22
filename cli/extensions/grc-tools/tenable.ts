@@ -19,6 +19,7 @@ import { dirname, join, relative, resolve } from "node:path";
 import { ZipArchive } from "archiver";
 import { Type } from "@sinclair/typebox";
 import { parse as parseYaml, YAMLError } from "yaml";
+import { REDACTED_VALUE, scrubSensitiveValues } from "../../flue/redact.js";
 import { errorResult, formatTable, textResult } from "./shared.js";
 
 type FetchImpl = typeof fetch;
@@ -336,41 +337,361 @@ function safeDirName(value: string): string {
   return normalized || "tenable";
 }
 
-const REDACTED = "[REDACTED]";
+export const CREDENTIAL_REDACTION_MARKER = "[REDACTED]";
+const REDACTED = CREDENTIAL_REDACTION_MARKER;
 
-// Unanchored patterns for credential-shaped text that an upstream body, proxy page, or
-// transport error may echo regardless of what this tool sent. Applied to every error
-// string at the sink (errorMessage) and again in the TenableApiError constructor.
-const ERROR_TEXT_PATTERNS: Array<[RegExp, string]> = [
-  [/\b(bearer|basic|digest|negotiate)\s+[a-z0-9._~+/=-]{8,}/gi, `$1 ${REDACTED}`],
-  [/\b(authorization|x-api-key|x-apikeys?|x-cookie|set-cookie|cookie|x-redlock-auth)\s*:\s*[^\r\n]+/gi, `$1: ${REDACTED}`],
-  // Keys that contain a credential word anywhere (TNS_SESSIONID, x_auth_token, apiKey).
-  [/\b([a-z0-9_-]*(?:session|token|secret|password|passwd|passphrase|api[_-]?key|accesskey|secretkey|access_key|secret_key|private_key|signature|registration_code|activation_code|authorization|credential)[a-z0-9_-]*)\s*[=:]\s*["']?[^\s"';,&<>]{4,}/gi, `$1=${REDACTED}`],
-  // Short keys that are only credentials as whole words.
-  [/\b(key|auth|sig|sid|pwd|pin|otp)\s*[=:]\s*["']?[^\s"';,&<>]{4,}/gi, `$1=${REDACTED}`],
-  [/\beyJ[a-z0-9_-]{8,}\.[a-z0-9_-]{8,}(?:\.[a-z0-9_-]{8,})?/gi, REDACTED],
-  [/(https?:\/\/)[^\s/@"'<>]+:[^\s/@"'<>]+@/gi, `$1${REDACTED}@`],
-];
+/**
+ * Scrub boundary. A bare value shaped like a name (words joined by hyphens or
+ * underscores with at most one digit group per segment: prod-us-east-2026,
+ * fw-dc1-01, sess-canary-COOKIE-31415926535897) standing alone in prose is
+ * indistinguishable from a resource name and stays, because a summary that names
+ * the unread inventory is itself a verdict-safety requirement. Two guards make
+ * that safe and both hold by construction:
+ *
+ * 1. A value inside a carrier is removed whatever its shape: the Authorization,
+ *    Proxy-Authorization, Cookie, Set-Cookie, X-Api-Key, X-ApiKeys, X-Cookie,
+ *    X-SecurityCenter, X-Auth-Token and similar header lines to the end of the
+ *    line; the userinfo of every embedded URL; credential-named query and fragment
+ *    pairs of every URL and bare query string (the ?token= an audit-log field or a
+ *    webhook target may carry) and any query value shaped like a token; the schemes
+ *    Bearer, Basic, Digest, Token, Negotiate, NTLM, SSWS, and ApiKey (only a listed
+ *    prose word after the scheme, "Basic authentication", stays; after the noun
+ *    "Token" any short plain lowercase word does); credential-named key=value pairs
+ *    (to the next delimiter: the accessKey= and secretKey= halves of an echoed
+ *    X-ApiKeys header), key: value pairs (to the end of the line), "key":"value"
+ *    pairs, and key="value" XML or HTML attributes; and webhook services whose URL
+ *    path is the secret. Nothing this module renders puts a credential word in front
+ *    of a colon or an equals sign, so every fixed text survives the scrub.
+ * 2. A configured secret (the Vulnerability Management access key and secret key,
+ *    and the Security Center access key and secret key) is removed whatever its
+ *    shape and in every encoded form (JSON-escaped, URL-encoded, form-encoded,
+ *    base64, base64url, re-flowed PEM lines), down to MIN_CONFIGURED_SECRET_LENGTH
+ *    (cli/flue/redact.ts owns the forms). redactSecrets applies it at every client
+ *    throw site; the tool boundary and the bundle writer apply it to the whole
+ *    payload and every written file.
+ *
+ * Real token shapes are still removed bare: PEM blocks, JWTs, LUFRPT-prefixed
+ * PAN-OS keys (a proxy page may echo any vendor's key), AWS access key ids, and (in
+ * error text) any run of
+ * LONG_TOKEN_MIN_LENGTH or more token characters that carries base64 symbols,
+ * digits scattered through its letters (0f9e8d7c6b5a4938), or token casing
+ * (Kq7Zx2Vw9Lm4Tp8R). The rule is path-safe: "/", ".", ":", "@", "=", and
+ * whitespace end a run, so URL path segments, dotted hostnames, colon-separated
+ * ARNs, and the two sides of a key=value pair are judged piece by piece, while
+ * "-" and "_" split a run into name segments; uppercase codes (ENOENT, PCI-DSS-4),
+ * digit strings, and canonical UUIDs are names outright. Data values and bundle
+ * content go through redactCredentialValueText, every carrier rule without the
+ * long-token one (an opaque identifier in evidence is not a secret) and with
+ * public PEM blocks (certificates, public keys, CSRs) kept as evidence. Every rule
+ * is unanchored and idempotent.
+ */
+export const MIN_CONFIGURED_SECRET_LENGTH = 4;
+export const LONG_TOKEN_MIN_LENGTH = 16;
 
-function redactErrorText(text: string): string {
-  let redacted = text;
-  for (const [pattern, replacement] of ERROR_TEXT_PATTERNS) {
-    redacted = redacted.replace(pattern, replacement);
-  }
-  return redacted;
+// Which PEM blocks a scrub removes: every block in error text, where a block is never
+// evidence; only non-public blocks in data values, where a certificate is.
+type PemScope = "all" | "private";
+
+const PEM_BLOCK_PATTERN = /-----BEGIN ([A-Z0-9 ]+)-----[\s\S]*?-----END [A-Z0-9 ]+-----/g;
+// A block whose END was cut off (a truncated message) runs to the end of the text.
+const PEM_OPEN_PATTERN = /-----BEGIN ([A-Z0-9 ]+)-----(?:(?!-----END )[\s\S])*$/;
+// Labels of PEM blocks that carry public material only; every other label (PRIVATE KEY,
+// ENCRYPTED PRIVATE KEY, RSA/EC/DSA/OPENSSH PRIVATE KEY, PGP PRIVATE KEY BLOCK) is a secret.
+const PUBLIC_PEM_LABELS = new Set(["CERTIFICATE", "TRUSTED CERTIFICATE", "X509 CRL", "CERTIFICATE REQUEST", "NEW CERTIFICATE REQUEST", "PUBLIC KEY", "RSA PUBLIC KEY", "PKCS7", "CMS"]);
+// Any scheme-prefixed URL: the userinfo is dropped; its query and fragment pairs are
+// judged by the pair rule below, so the scheme, host, path, and ordinary pairs stay.
+const EMBEDDED_URL_PATTERN = /\b[a-z][a-z0-9+.-]*:\/\/[^\s"'<>()[\]{}]+/gi;
+const URL_USERINFO_PATTERN = /^([a-z][a-z0-9+.-]*:\/\/)[^\s/@"'<>]+@/i;
+// A query or fragment pair, in a URL or a bare query string: a credential-named pair or a
+// token-shaped value loses the value. A value ends at "&", "#", whitespace, a quote, or the
+// ";" and "," that end a URL inside a sentence (no token carries either).
+const QUERY_PAIR_PATTERN = /([?&#])([A-Za-z0-9_.[\]-]+)=((?!\[REDACTED\])[^&#\s"'<>;,]+)/g;
+// A credential-bearing header line: the whole value goes, whatever its shape. A line that
+// already carries a marker is left alone so the rule is idempotent.
+const HEADER_LINE_PATTERN = /\b(authorization|proxy-authorization|cookie|set-cookie|x-cookie|x-api-key|x-apikeys?|api-key|apikey|x-securitycenter|x-pan-key|x-redlock-auth|x-auth-token|x-access-token|x-amz-security-token|x-vault-token|private-token|x-goog-api-key|x-csrf-token|x-xsrf-token)(["']?\s*:\s*)(?![^\r\n<>"']*\[REDACTED\])[^\r\n<>"']*[^\s\r\n<>"']/gi;
+// A scheme and its credentials: the value is removed whatever its shape, except the
+// prose words that follow a scheme name in a sentence ("Basic authentication is
+// required", "Bearer token"). "Token" is also this module's own noun ("Token hygiene",
+// "token inventory"), so after it any plain lowercase word shorter than
+// LONG_TOKEN_MIN_LENGTH is prose. OAuth 1.0 carries its credentials as key="value"
+// attributes, which the attribute rule removes, so OAuth is not a scheme here and
+// "OAuth clients" stays.
+const SCHEME_VALUE_PATTERN = /\b(Bearer|Basic|Digest|Token|Negotiate|NTLM|SSWS|ApiKey|Api-Key)\s+((?!\[REDACTED\])[A-Za-z0-9._~+/=-]{4,})/gi;
+const PLAIN_WORD_PATTERN = /^[a-z]+$/;
+const SCHEME_PROSE_WORDS = new Set([
+  "authentication", "authorization", "auth", "token", "tokens", "credential", "credentials", "scheme", "schemes", "header", "headers",
+  "realm", "challenge", "access", "mode", "method", "login", "flow", "grant", "type", "string", "value", "values", "user", "users",
+  "account", "client", "clients", "error", "request", "requests", "response", "with", "without", "and", "or", "is", "was", "are",
+  "not", "the", "this", "that", "these", "those", "to", "in", "for", "from", "on", "of", "by", "as", "at", "if", "then", "but", "so",
+  "than", "when", "where", "over", "via", "per", "only", "still", "also", "use", "used", "using", "required", "requires", "failed",
+  "rejected", "expired", "invalid", "missing", "unsupported", "supported", "unauthorized", "forbidden", "denied", "allowed", "enabled",
+  "disabled", "preferred", "deprecated", "retired", "retiring", "must", "should", "can", "cannot", "could", "will", "would", "may",
+  "has", "have", "does", "did", "do", "be", "been",
+]);
+// "key":"value" and key="value" carriers keep the whole quoted value together so a
+// value with spaces is removed as one; the unquoted pair rule below takes the rest.
+// Keys may start with "_" (_upstream_session, _token), so a key begins wherever no key
+// character precedes it rather than at a word boundary.
+const JSON_QUOTED_PAIR_PATTERN = /"([A-Za-z_][A-Za-z0-9_.-]{0,63})"(\s*:\s*)"((?!\[REDACTED\])[^"\r\n]+)"/g;
+const QUOTED_ATTRIBUTE_PATTERN = /(?<![A-Za-z0-9_.:-])([A-Za-z_][A-Za-z0-9_.:-]{0,63})\s*=\s*(["'])((?!\[REDACTED\])[^"'\r\n]+)\2/g;
+// An unquoted pair: key=value runs to the next delimiter, key: value (a header or
+// YAML-style line) to the end of the line, where a brace or bracket ends it so a JSON
+// structure after a credential-named key (compact "password":{...}, "auth":null}) is
+// never taken for a value.
+const ASSIGNMENT_KEY_PATTERN = /(?<![A-Za-z0-9_.-])(["']?)([A-Za-z_][A-Za-z0-9_.-]{0,63})(["']?\s*([:=])\s*["']?)/g;
+const DELIMITED_VALUE_PATTERN = /(?!\[REDACTED\])[^\s"'<>;,&]+/y;
+const LINE_VALUE_PATTERN = /(?!\[REDACTED\])[^\r\n<>"',;{}[\]]*[^\s\r\n<>"',;{}[\]]/y;
+const TOKEN_IN_PATH_WEBHOOK_PATTERN = /(https?:\/\/(?:hooks\.slack\.com\/services|discord(?:app)?\.com\/api\/webhooks|[a-z0-9.-]*webhook\.office\.com\/webhookb2)\/)(?!\[REDACTED\])[^\s"'<>]+/gi;
+const JWT_PATTERN = /\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}(?:\.[A-Za-z0-9_-]+)*/g;
+const PANOS_API_KEY_PATTERN = /\bLUFRPT[A-Za-z0-9+/=_-]{16,}/g;
+const AWS_ACCESS_KEY_ID_PATTERN = /\b(?:AKIA|ASIA|AROA|AIDA|AGPA|ANPA|ANVA|APKA|ABIA|ACCA)[A-Z0-9]{16}\b/g;
+const LONG_TOKEN_RUN_PATTERN = /[A-Za-z0-9+_-]{16,}(?:={1,2}(?![A-Za-z0-9&]))?/g;
+const TOKEN_VALUE_PATTERN = /^[A-Za-z0-9+_-]{16,}={0,2}$/;
+const UPPERCASE_CODE_PATTERN = /^[A-Z][A-Z_]*$|^[A-Z][A-Z0-9]*(?:[_-][A-Z0-9]+)+$/;
+const DIGITS_ONLY_PATTERN = /^\d+$/;
+const DIGIT_GROUP_PATTERN = /\d+/g;
+const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+// Below this many letters a segment's casing is not judged: eBay, iOS, McD are names.
+const MIN_LETTERS_FOR_CASING = 6;
+// A segment this long that is not name-shaped makes the whole run a token on its own.
+const MIN_TOKEN_SEGMENT_LENGTH = 8;
+// A carrier is named by its last word: api_key, access_token, client_secret, X-PAN-KEY,
+// _upstream_session, oauth_signature, Set-Cookie, password1. A key whose last word names
+// something else (credentialID, keyId, tokenCount, auth_mode, credentials_file,
+// passwordPolicy, password_complexity_by_device, credential-enforcement) is not one, nor is
+// a max/min bound; a session id (session_id, PHPSESSID, JSESSIONID) is, whatever its tail.
+const CREDENTIAL_KEY_WORDS = new Set([
+  "token", "tokens", "secret", "secrets", "password", "passwords", "passwd", "pwd", "passphrase", "passcode", "phash",
+  "apikey", "authorization", "credential", "credentials", "key", "keys", "cookie", "cookies", "sid", "sig", "signature",
+  "auth", "nonce", "sas", "community", "authpwd", "privpwd", "pin", "otp", "totp", "jwt", "assertion", "bearer", "hmac",
+  "session", "sessid", "kubeconfig", "dsn", "pem", "ikey", "skey",
+]);
+// Concatenated spellings the segment split cannot see (authtoken, sharedsecret, privatekey).
+const CREDENTIAL_KEY_SUFFIX_PATTERN = /(?:token|secret|passw(?:or)?d|passphrase|passcode|phash|authorization|credential|signature|nonce|community|assertion|session|sessid|authpwd|privpwd|(?:api|private|secret|access|signing|encryption|master|shared|account|client|service|session|license|ssh|hmac)keys?)$/;
+// A key whose last word names the form of a value (password_hash, token_value,
+// authorization_header, secret_plain) carries a credential when an earlier word names one.
+const CREDENTIAL_VALUE_FORM_WORDS = new Set(["value", "values", "plain", "plaintext", "data", "string", "text", "header", "raw", "encrypted", "hash", "digest", "blob", "content"]);
+const SESSION_ID_PATTERN = /sess(?:ion)?[_.-]?id$/i;
+const BOUND_KEY_SEGMENTS = new Set(["max", "min"]);
+const EXTRA_CREDENTIAL_KEYS = new Set(["x-pan-key", "x-redlock-auth", "proxy-authorization", "x-amz-signature", "x-amz-credential", "x-amz-security-token", "oauth_signature", "oauth_token", "oauth_verifier"]);
+// "pass" names a credential in a query string or an = assignment (user=a&pass=b), while a
+// "pass" count or verdict in a key: value pair is this module's own vocabulary.
+const ASSIGNMENT_ONLY_CREDENTIAL_WORDS = new Set(["pass"]);
+// JSON structure and literals after a key are never a credential value.
+const STRUCTURAL_VALUE_PATTERN = /^(?:[{[]|\{\}|\[\]|true|false|null)$/;
+// A bare integer under a plural credential word ("api_keys": 1, keys=3, secrets: 0) is
+// a count, this module's own summary vocabulary, not a credential.
+const PLURAL_CREDENTIAL_WORDS = new Set(["tokens", "secrets", "keys", "cookies", "passwords", "credentials"]);
+const COUNT_VALUE_PATTERN = /^\d+(?:\s|$)/;
+const NON_CREDENTIAL_KEY_QUALIFIERS = new Set(["public"]);
+
+function propertyNameSegments(name: string): string[] {
+  return name
+    .replace(/([a-z0-9])([A-Z])/g, "$1_$2")
+    .replace(/([A-Z]+)([A-Z][a-z])/g, "$1_$2")
+    .toLowerCase()
+    .split(/[^a-z0-9]+/)
+    .filter((segment) => segment.length > 0);
 }
 
-function redactSecrets(message: string, secrets: string[]): string {
-  let redacted = message;
-  for (const secret of secrets) {
-    if (secret.length >= 4) redacted = redacted.split(secret).join(REDACTED);
+function credentialKeyWord(segment: string): boolean {
+  return CREDENTIAL_KEY_WORDS.has(segment) || CREDENTIAL_KEY_SUFFIX_PATTERN.test(segment);
+}
+
+// The words of a key with trailing digits removed from each (password1, key2).
+function keyWords(key: string): string[] {
+  return propertyNameSegments(key).map((segment) => segment.replace(/\d+$/, "")).filter((segment) => segment.length > 0);
+}
+
+/** True when a name in a query string, header, attribute, or name-value pair carries a credential. */
+export function isCredentialKey(key: string): boolean {
+  if (SESSION_ID_PATTERN.test(key) || EXTRA_CREDENTIAL_KEYS.has(key.toLowerCase())) return true;
+  const words = keyWords(key);
+  const last = words[words.length - 1];
+  if (last === undefined || BOUND_KEY_SEGMENTS.has(words[0])) return false;
+  if ((last === "key" || last === "keys") && words.length > 1 && NON_CREDENTIAL_KEY_QUALIFIERS.has(words[words.length - 2])) return false;
+  if (credentialKeyWord(last)) return true;
+  return CREDENTIAL_VALUE_FORM_WORDS.has(last) && words.slice(0, -1).some(credentialKeyWord);
+}
+
+// True for a value that opens with a bare integer under a plural credential word: a count,
+// not a carrier (the rest of a key: value line is rescanned for pairs of its own).
+function isCountValue(key: string, value: string): boolean {
+  if (!COUNT_VALUE_PATTERN.test(value)) return false;
+  const words = keyWords(key);
+  return words.length > 0 && PLURAL_CREDENTIAL_WORDS.has(words[words.length - 1]);
+}
+
+/** isCredentialKey plus the words that name a credential only in a query string or = assignment. */
+function isCredentialAssignmentKey(key: string): boolean {
+  if (isCredentialKey(key)) return true;
+  const words = keyWords(key);
+  return words.length > 0 && ASSIGNMENT_ONLY_CREDENTIAL_WORDS.has(words[words.length - 1]);
+}
+
+// Token-shaped casing: the case changes more often than once every three letters
+// (bPxRfiCYcanaryKEY); words, acronyms, camelCase, and PascalCase change case at word
+// boundaries only (AWSLambdaBasicExecutionRole).
+function hasTokenCasing(letters: string): boolean {
+  if (letters.length < MIN_LETTERS_FOR_CASING) return false;
+  let changes = 0;
+  for (let index = 1; index < letters.length; index += 1) {
+    const previousLower = letters[index - 1] >= "a" && letters[index - 1] <= "z";
+    const currentLower = letters[index] >= "a" && letters[index] <= "z";
+    if (previousLower !== currentLower) changes += 1;
   }
-  return redactErrorText(redacted);
+  return changes * 3 > letters.length;
+}
+
+// A "-" or "_" separated segment shaped like part of a name: empty, digits alone, or letters
+// with at most one digit group (west2, sha256, vsys1, ethernet1) whose casing is not token-shaped.
+function isNameSegment(segment: string): boolean {
+  if (segment.length === 0 || DIGITS_ONLY_PATTERN.test(segment)) return true;
+  const digitGroups = segment.match(DIGIT_GROUP_PATTERN) ?? [];
+  if (digitGroups.length > 1) return false;
+  return !hasTokenCasing(segment.replace(DIGIT_GROUP_PATTERN, ""));
+}
+
+// A run is a token when it carries base64 symbols ("+" anywhere; "=" padding only where the
+// run is base64-shaped: a multiple of four characters with no "-" or "_", so "key=" left
+// in front of a marker is never padding and the rule stays idempotent), or when a
+// segment of MIN_TOKEN_SEGMENT_LENGTH or more is not name-shaped, or when at least half
+// of its segments are not. One short random-looking segment beside several names (the
+// six-character mkdtemp suffix of a temp path, a build id) does not make a token.
+function looksLikeToken(run: string): boolean {
+  const padding = /=+$/.exec(run)?.[0] ?? "";
+  const body = run.slice(0, run.length - padding.length);
+  if (UPPERCASE_CODE_PATTERN.test(body) || DIGITS_ONLY_PATTERN.test(body) || UUID_PATTERN.test(body)) return false;
+  if (body.includes("+")) return true;
+  if (padding.length > 0) return run.length % 4 === 0 && !/[-_]/.test(body);
+  const segments = body.split(/[-_]/).filter((segment) => segment.length > 0);
+  const tokenSegments = segments.filter((segment) => !isNameSegment(segment));
+  if (tokenSegments.length === 0) return false;
+  return tokenSegments.some((segment) => segment.length >= MIN_TOKEN_SEGMENT_LENGTH) || tokenSegments.length * 2 >= segments.length;
+}
+
+// A whole query value that is one token-shaped run (no path, dot, or percent escape inside).
+function isTokenShapedValue(value: string): boolean {
+  return TOKEN_VALUE_PATTERN.test(value) && looksLikeToken(value);
+}
+
+// The word after a scheme name is prose when it is a plain lowercase word from the list
+// above, or, after "Token", any plain lowercase word too short to be a real token.
+function isSchemeProse(scheme: string, value: string): boolean {
+  if (!PLAIN_WORD_PATTERN.test(value)) return false;
+  if (SCHEME_PROSE_WORDS.has(value)) return true;
+  return scheme.toLowerCase() === "token" && value.length < LONG_TOKEN_MIN_LENGTH;
+}
+
+function isPublicPemLabel(label: string): boolean {
+  return PUBLIC_PEM_LABELS.has(label.trim());
+}
+
+function scrubPem(text: string, scope: PemScope): string {
+  const keeps = (label: string): boolean => {
+    switch (scope) {
+      case "all":
+        return false;
+      case "private":
+        return isPublicPemLabel(label);
+      default: {
+        const exhaustive: never = scope;
+        return exhaustive;
+      }
+    }
+  };
+  return text
+    .replace(PEM_BLOCK_PATTERN, (match, label: string) => (keeps(label) ? match : CREDENTIAL_REDACTION_MARKER))
+    .replace(PEM_OPEN_PATTERN, (match, label: string) => (keeps(label) ? match : CREDENTIAL_REDACTION_MARKER));
+}
+
+function scrubUrlUserinfo(url: string): string {
+  return url.replace(URL_USERINFO_PATTERN, `$1${CREDENTIAL_REDACTION_MARKER}@`);
+}
+
+// The key and separator are matched on their own and the value is consumed only when the
+// key names a credential, so the value of an ordinary pair is rescanned and a credential
+// pair nested inside it (data=token=...) is still caught.
+function replaceCredentialAssignments(text: string): string {
+  ASSIGNMENT_KEY_PATTERN.lastIndex = 0;
+  let out = "";
+  let last = 0;
+  let match: RegExpExecArray | null;
+  while ((match = ASSIGNMENT_KEY_PATTERN.exec(text)) !== null) {
+    const [whole, openingQuote, key, separator, operator] = match;
+    if (!(operator === "=" ? isCredentialAssignmentKey(key) : isCredentialKey(key))) continue;
+    const valuePattern = operator === ":" ? LINE_VALUE_PATTERN : DELIMITED_VALUE_PATTERN;
+    valuePattern.lastIndex = match.index + whole.length;
+    const value = valuePattern.exec(text)?.[0];
+    if (value === undefined || STRUCTURAL_VALUE_PATTERN.test(value) || isCountValue(key, value)) continue;
+    out += `${text.slice(last, match.index)}${openingQuote}${key}${separator}${CREDENTIAL_REDACTION_MARKER}`;
+    last = match.index + whole.length + value.length;
+    ASSIGNMENT_KEY_PATTERN.lastIndex = last;
+  }
+  return last === 0 ? text : `${out}${text.slice(last)}`;
+}
+
+/** Every carrier rule (guard 1) plus the token shapes a prefix identifies on its own; the long-token rule is left to redactErrorText. */
+function scrubCarriers(text: string, pemScope: PemScope): string {
+  const scrubbed = scrubPem(text, pemScope)
+    .replace(TOKEN_IN_PATH_WEBHOOK_PATTERN, `$1${CREDENTIAL_REDACTION_MARKER}`)
+    .replace(EMBEDDED_URL_PATTERN, scrubUrlUserinfo)
+    .replace(QUERY_PAIR_PATTERN, (match, separator: string, key: string, value: string) => (isCredentialAssignmentKey(key) || isTokenShapedValue(value) ? `${separator}${key}=${CREDENTIAL_REDACTION_MARKER}` : match))
+    .replace(HEADER_LINE_PATTERN, `$1$2${CREDENTIAL_REDACTION_MARKER}`)
+    .replace(SCHEME_VALUE_PATTERN, (match, scheme: string, value: string) => (isSchemeProse(scheme, value) ? match : `${scheme} ${CREDENTIAL_REDACTION_MARKER}`))
+    .replace(JSON_QUOTED_PAIR_PATTERN, (match, key: string, separator: string, value: string) => (isCredentialKey(key) && !isCountValue(key, value) ? `"${key}"${separator}"${CREDENTIAL_REDACTION_MARKER}"` : match))
+    .replace(QUOTED_ATTRIBUTE_PATTERN, (match, key: string, quote: string) => (isCredentialKey(key) ? `${key}=${quote}${CREDENTIAL_REDACTION_MARKER}${quote}` : match));
+  return replaceCredentialAssignments(scrubbed)
+    .replace(JWT_PATTERN, CREDENTIAL_REDACTION_MARKER)
+    .replace(PANOS_API_KEY_PATTERN, CREDENTIAL_REDACTION_MARKER)
+    .replace(AWS_ACCESS_KEY_ID_PATTERN, CREDENTIAL_REDACTION_MARKER);
+}
+
+/** The general scrub for error text: every carrier rule, every PEM block, and the long-token rule. Idempotent. */
+export function redactErrorText(text: string): string {
+  return scrubCarriers(text, "all").replace(LONG_TOKEN_RUN_PATTERN, (run) => (looksLikeToken(run) ? CREDENTIAL_REDACTION_MARKER : run));
+}
+
+/** Guard 2 on its own: every configured secret in every encoded form, for whole payloads and bundle files where the general scrub would remove evidence. */
+export function redactConfiguredSecrets(text: string, secrets: ReadonlyArray<string | undefined>): string {
+  const values = secrets.filter((value): value is string => typeof value === "string" && value.length >= MIN_CONFIGURED_SECRET_LENGTH);
+  if (values.length === 0) return text;
+  return scrubSensitiveValues(text, values).split(REDACTED_VALUE).join(CREDENTIAL_REDACTION_MARKER);
+}
+
+/**
+ * Every string inside a tool result or other plain value, with the configured secrets
+ * removed; a number whose decimal form is a configured secret becomes the marker too.
+ * Structure is never touched, so a short secret that matches a whole token (a PIN, a
+ * word) cannot break the JSON the value is serialized to.
+ */
+function sealValue<T>(value: T, secrets: ReadonlyArray<string | undefined>): T {
+  if (typeof value === "string") return redactConfiguredSecrets(value, secrets) as T;
+  if (typeof value === "number") return (secrets.includes(String(value)) ? CREDENTIAL_REDACTION_MARKER : value) as T;
+  if (Array.isArray(value)) return value.map((item) => sealValue(item, secrets)) as T;
+  if (value && typeof value === "object" && Object.getPrototypeOf(value) === Object.prototype) {
+    const output: JsonRecord = {};
+    for (const [key, entry] of Object.entries(value as JsonRecord)) output[key] = sealValue(entry, secrets);
+    return output as T;
+  }
+  return value;
+}
+
+/** The client-side scrub for a thrown message: the configured secrets in every form (guard 2), then the general scrub. */
+export function redactSecrets(message: string, secrets: ReadonlyArray<string | undefined>): string {
+  return redactErrorText(redactConfiguredSecrets(message, secrets));
+}
+
+/** The secrets a resolved configuration puts on the wire: both halves of the X-ApiKeys header and of the Security Center x-apikey header. */
+export function configuredTenableSecrets(config: TenableResolvedConfig): string[] {
+  return [config.vm?.accessKey, config.vm?.secretKey, config.securityCenter?.accessKey, config.securityCenter?.secretKey]
+    .filter((value): value is string => typeof value === "string" && value.length >= MIN_CONFIGURED_SECRET_LENGTH);
 }
 
 // Property names whose values are credentials wherever they appear in a vendor payload.
 // Matched on the flattened name (snake_case, kebab-case, camelCase, and header forms) or
-// on the final camelCase or snake_case segment.
+// on the final camelCase or snake_case segment. A bare "key" is not one: Tenable tags are
+// {key, value} pairs and the asset tag key is evidence.
 const CREDENTIAL_PROPERTY_NAMES = new Set([
   "password", "passwd", "pwd", "passphrase", "secret", "secrets", "token", "tokens",
   "apikey", "apikeys", "xapikey", "xapikeys", "accesskey", "secretkey", "privatekey", "clientsecret",
@@ -379,20 +700,25 @@ const CREDENTIAL_PROPERTY_NAMES = new Set([
 ]);
 const CREDENTIAL_LAST_SEGMENTS = new Set(["password", "passwd", "pwd", "passphrase", "secret", "secrets", "token", "tokens", "authorization", "cookie"]);
 
-function propertyNameIsCredential(name: string): boolean {
+export function propertyNameIsCredential(name: string): boolean {
   if (CREDENTIAL_PROPERTY_NAMES.has(name.toLowerCase().replace(/[^a-z0-9]/g, ""))) return true;
-  const segments = name.replace(/([a-z0-9])([A-Z])/g, "$1_$2").toLowerCase().split(/[^a-z0-9]+/).filter(Boolean);
+  const segments = propertyNameSegments(name);
   const last = segments.at(-1);
   return last !== undefined && CREDENTIAL_LAST_SEGMENTS.has(last);
 }
 
-// Credentials carried inside string values: URL query parameters, URL userinfo, and
-// JSON-encoded credential fields inside a string.
-function redactCredentialValueText(text: string): string {
-  return text
-    .replace(/([?&](?:token|key|api_key|apikey|secret|password|access_token|auth|signature|sig|client_secret|access_key|secret_key)=)[^&#\s"']+/gi, `$1${REDACTED}`)
-    .replace(/(https?:\/\/)[^\s/@"'<>]+:[^\s/@"'<>]+@/gi, `$1${REDACTED}@`)
-    .replace(/("(?:token|secret|password|passwd|api_key|apikey|access_token|refresh_token|client_secret|private_key|secret_key|access_key|registration_code)"\s*:\s*")[^"]*(")/gi, `$1${REDACTED}$2`);
+/**
+ * The scrub for credentials carried inside string values rather than under a
+ * credential-named key: every carrier rule of redactErrorText (URL userinfo and
+ * credential query pairs; webhook services whose URL path is the secret; header,
+ * cookie, scheme, and credential-pair carriers; JSON encoded as a string; private
+ * PEM blocks) without the long-token rule, because an id, a plugin set, or a hash in
+ * evidence is not a secret, and with public PEM blocks kept because a certificate
+ * is evidence. Applied to every string kept in a dataset, so audit-log field values,
+ * webhook targets, and free-text settings are covered without naming them.
+ */
+export function redactCredentialValueText(text: string): string {
+  return scrubCarriers(text, "private");
 }
 
 function redactCredentialNode(value: unknown): unknown {
@@ -417,7 +743,7 @@ function redactCredentialNode(value: unknown): unknown {
 
 // Applied to every collected dataset before it can reach a finding, a tool result, or a
 // bundle file, so credential-bearing properties are redacted by construction.
-function redactCredentialProperties<T>(value: T): T {
+export function redactCredentialProperties<T>(value: T): T {
   return redactCredentialNode(value) as T;
 }
 
@@ -445,8 +771,11 @@ function projectPolicyDetails(payload: JsonRecord): JsonRecord {
 }
 
 // Non-JSON bodies (HTML error pages, SSO interstitials, WAF blocks) are described by
-// status and length only; JSON bodies contribute their documented error fields.
-function describeErrorBody(response: Response, rawText: string): string {
+// status and length only; JSON bodies contribute Tenable's documented error fields
+// (error, error.message, message, error_msg), each scrubbed before it is shortened, with
+// the caller's scrub when it knows the configured secrets, so the cut never leaves a
+// fragment of a secret behind.
+export function describeErrorBody(response: Response, rawText: string, scrub: (text: string) => string = redactErrorText): string {
   const base = `HTTP ${response.status}${response.statusText ? ` ${response.statusText}` : ""}`;
   if (rawText.length === 0) return base;
   const contentType = response.headers.get("content-type")?.split(";")[0].trim().toLowerCase() || "unknown";
@@ -462,7 +791,7 @@ function describeErrorBody(response: Response, rawText: string): string {
       .filter((item): item is string => Boolean(item))
     : [];
   if (fields.length === 0) return `${base}; JSON response body without documented error fields (${rawText.length} bytes, not echoed)`;
-  return `${base}; ${fields.map((field) => redactErrorText(field.replace(/\s+/g, " ")).slice(0, 200)).join("; ")}`;
+  return `${base}; ${fields.map((field) => scrub(field.replace(/\s+/g, " ")).slice(0, 200)).join("; ")}`;
 }
 
 function parseTimestampMs(value: unknown): number | undefined {
@@ -556,10 +885,17 @@ async function nextAvailableAuditDir(root: string, preferredName: string): Promi
   throw new Error(`Unable to allocate output directory under ${root}`);
 }
 
-async function writeSecureTextFile(rootDir: string, relativePathname: string, content: string): Promise<void> {
+/** Writes one bundle file with the configured secrets removed from its text in every encoded form (guard 2). */
+async function writeSecureTextFile(rootDir: string, relativePathname: string, content: string, secrets: ReadonlyArray<string | undefined> = []): Promise<void> {
   const destination = resolveSecureOutputPath(rootDir, relativePathname);
   ensurePrivateDir(dirname(destination));
-  await writeFile(destination, content, { encoding: "utf8", mode: 0o600 });
+  await writeFile(destination, redactConfiguredSecrets(content, secrets), { encoding: "utf8", mode: 0o600 });
+}
+
+/** Writes one JSON bundle file; the configured secrets are removed value by value before serialization so the file stays valid JSON. */
+async function writeSecureJsonFile(rootDir: string, relativePathname: string, value: unknown, secrets: ReadonlyArray<string | undefined>): Promise<void> {
+  const plain: unknown = JSON.parse(JSON.stringify(value ?? null));
+  await writeSecureTextFile(rootDir, relativePathname, serializeJson(sealValue(plain, secrets)));
 }
 
 async function createZipArchive(sourceDir: string, zipPath: string): Promise<void> {
@@ -768,10 +1104,20 @@ abstract class TenableHttpClient {
 
   protected abstract authHeaders(): Record<string, string>;
 
+  /** The configured keys this client puts on the wire, for the tool boundary and bundle writer to remove from whole payloads (guard 2). */
+  get knownSecrets(): string[] {
+    return this.secrets.filter((secret) => secret.length >= MIN_CONFIGURED_SECRET_LENGTH);
+  }
+
+  /** The client-side scrub: the configured keys in every form, then the general scrub. */
+  protected scrub(text: string): string {
+    return redactSecrets(text, this.secrets);
+  }
+
   // Every error this client throws is built here so the configured keys and the
   // credential text patterns are scrubbed before the message exists.
   protected fail(message: string, status: number, endpoint: string): TenableApiError {
-    return new TenableApiError(redactSecrets(message, this.secrets), status, endpoint);
+    return new TenableApiError(this.scrub(message), status, endpoint);
   }
 
   protected buildUrl(path: string, query: Record<string, string | number | boolean | undefined | Array<string | number>> = {}): string {
@@ -802,7 +1148,7 @@ abstract class TenableHttpClient {
         });
       } catch (error) {
         clearTimeout(timer);
-        const message = redactSecrets(error instanceof Error ? error.message : String(error), this.secrets);
+        const message = this.scrub(error instanceof Error ? error.message : String(error));
         const aborted = (error instanceof Error && error.name === "AbortError") || /abort/i.test(message);
         if (aborted) throw this.fail(`Tenable request ${endpoint} timed out after ${this.timeoutMs}ms.`, 0, endpoint);
         if (attempt < this.retryLimit) {
@@ -820,7 +1166,7 @@ abstract class TenableHttpClient {
 
       const rawText = await response.text();
       if (!response.ok) {
-        throw this.fail(`Tenable request ${endpoint} failed (${describeErrorBody(response, rawText)})`, response.status, endpoint);
+        throw this.fail(`Tenable request ${endpoint} failed (${describeErrorBody(response, rawText, (text) => this.scrub(text))})`, response.status, endpoint);
       }
       if (rawText.length === 0) return {};
       try {
@@ -3342,7 +3688,7 @@ function buildQuickReference(): string {
   return [
     "# Tenable Audit Bundle Quick Reference",
     "",
-    "- `core_data/` contains the Tenable API responses used during this assessment. API keys are never written; policy details are projected to uuid, name, settings, and plugins; scanner linking keys, registration codes, and license blocks are replaced with [REDACTED]; every property whose name denotes a credential is redacted; error strings are scrubbed and non-JSON error bodies are described by status and length only.",
+    `- \`core_data/\` contains the Tenable API responses used during this assessment. API keys are never written: the configured access and secret keys are removed from every file in every encoded form; policy details are projected to uuid, name, settings, and plugins; scanner linking keys, registration codes, and license blocks are replaced with ${CREDENTIAL_REDACTION_MARKER}; every property whose name denotes a credential is redacted; inside every string value, URL userinfo, credential-named or token-shaped query pairs such as ?token=, token-in-path webhook URLs, header, cookie, and scheme carriers, and private PEM blocks are replaced while the scheme, host, and path are kept; error strings are scrubbed and non-JSON error bodies are described by status and length only.`,
     "- `analysis/` contains normalized findings and per-category summaries.",
     "- `compliance/` contains the executive summary, unified matrix, and per-framework reports.",
     "- `_errors.log` appears only when some reads failed or returned partial data; the affected controls carry manual or warn verdicts.",
@@ -3363,6 +3709,8 @@ export async function exportTenableAuditBundle(
   options: TenableAssessmentOptions = {},
 ): Promise<TenableAuditBundleResult> {
   const config = clients.config;
+  // Guard 2 for every written file: the configured keys in every encoded form.
+  const secrets = configuredTenableSecrets(config);
   const access = await checkTenableAccess(clients);
   const scanProgramData = await collectTenableScanProgramData(clients, options);
   const sensorData = await collectTenableSensorCoverageData(clients, options);
@@ -3422,26 +3770,26 @@ export async function exportTenableAuditBundle(
     }],
   ];
   for (const [pathname, value] of coreData) {
-    await writeSecureTextFile(outputDir, pathname, serializeJson(redactCredentialProperties(value)));
+    await writeSecureJsonFile(outputDir, pathname, redactCredentialProperties(value), secrets);
   }
   for (const assessment of assessments) {
-    await writeSecureTextFile(outputDir, `analysis/${assessment.category}.json`, serializeJson(redactCredentialProperties(assessment)));
+    await writeSecureJsonFile(outputDir, `analysis/${assessment.category}.json`, redactCredentialProperties(assessment), secrets);
   }
-  await writeSecureTextFile(outputDir, "analysis/findings.json", serializeJson(redactCredentialProperties(findings)));
-  await writeSecureTextFile(outputDir, "metadata.json", serializeJson({
+  await writeSecureJsonFile(outputDir, "analysis/findings.json", redactCredentialProperties(findings), secrets);
+  await writeSecureJsonFile(outputDir, "metadata.json", {
     generated_at: new Date().toISOString(),
     platform: access.platform,
     source_chain: config.sourceChain,
     caller_is_administrator: access.callerIsAdministrator,
-  }));
-  await writeSecureTextFile(outputDir, "compliance/executive_summary.md", buildExecutiveSummary(config, assessments, errors));
-  await writeSecureTextFile(outputDir, "compliance/unified_compliance_matrix.md", buildUnifiedMatrix(findings));
+  }, secrets);
+  await writeSecureTextFile(outputDir, "compliance/executive_summary.md", buildExecutiveSummary(config, assessments, errors), secrets);
+  await writeSecureTextFile(outputDir, "compliance/unified_compliance_matrix.md", buildUnifiedMatrix(findings), secrets);
   for (const framework of FRAMEWORK_REPORTS) {
-    await writeSecureTextFile(outputDir, `compliance/${framework.slug}/${framework.slug}_compliance_report.md`, buildFrameworkReport(framework.title, framework.prefix, findings));
+    await writeSecureTextFile(outputDir, `compliance/${framework.slug}/${framework.slug}_compliance_report.md`, buildFrameworkReport(framework.title, framework.prefix, findings), secrets);
   }
-  await writeSecureTextFile(outputDir, "QUICK_REFERENCE.md", buildQuickReference());
+  await writeSecureTextFile(outputDir, "QUICK_REFERENCE.md", buildQuickReference(), secrets);
   if (errors.length > 0) {
-    await writeSecureTextFile(outputDir, "_errors.log", `${errors.join("\n")}\n`);
+    await writeSecureTextFile(outputDir, "_errors.log", `${errors.join("\n")}\n`, secrets);
   }
 
   const zipPath = `${outputDir}.zip`;
@@ -3523,6 +3871,35 @@ function createClients(args: CheckAccessArgs): TenableClients {
   return createTenableClients(resolveTenableConfiguration(args as JsonRecord));
 }
 
+type ToolResult = ReturnType<typeof textResult> & { isError?: boolean };
+
+/** Credentials passed as arguments or present in the environment, known before the clients exist. */
+function argumentSecrets(args: CheckAccessArgs): string[] {
+  return [
+    args.access_key, args.secret_key, args.sc_access_key, args.sc_secret_key,
+    process.env.TENABLE_ACCESS_KEY, process.env.TENABLE_SECRET_KEY, process.env.TENABLE_SC_ACCESS_KEY, process.env.TENABLE_SC_SECRET_KEY,
+  ].filter((value): value is string => typeof value === "string");
+}
+
+/**
+ * Runs one tool and removes every configured secret from the whole result (guard 2):
+ * the text rendering and the structured details alike, whether the run succeeded or
+ * the catch block rendered the error. The clients' secrets include the keys a config
+ * file supplied, which the argument list alone cannot name.
+ */
+async function runSealed(label: string, tool: string, args: CheckAccessArgs, run: (clients: TenableClients) => Promise<ToolResult>): Promise<ToolResult> {
+  const secrets = new Set<string>(argumentSecrets(args));
+  let clients: TenableClients | undefined;
+  try {
+    clients = createClients(args);
+    for (const secret of configuredTenableSecrets(clients.config)) secrets.add(secret);
+    return sealValue(await run(clients), [...secrets]);
+  } catch (error) {
+    for (const secret of clients ? configuredTenableSecrets(clients.config) : []) secrets.add(secret);
+    return sealValue(errorResult(`${label} failed: ${errorMessage(error)}`, { tool }), [...secrets]);
+  }
+}
+
 const authParams = {
   access_key: Type.Optional(Type.String({ description: "Tenable Vulnerability Management API access key. Defaults to TENABLE_ACCESS_KEY or the config file." })),
   secret_key: Type.Optional(Type.String({ description: "Tenable Vulnerability Management API secret key. Defaults to TENABLE_SECRET_KEY or the config file." })),
@@ -3580,12 +3957,10 @@ function registerAssessmentTool(pi: any, kind: AssessmentKind, name: string, lab
     parameters: Type.Object({ ...authParams, ...thresholdParams }),
     prepareArguments: normalizeAssessArgs,
     async execute(_toolCallId: string, args: AssessArgs) {
-      try {
-        const result = await runAssessment(kind, createClients(args), toAssessmentOptions(args));
+      return runSealed(label, name, args, async (clients) => {
+        const result = await runAssessment(kind, clients, toAssessmentOptions(args));
         return textResult(formatAssessmentText(result), { tool: name, ...result });
-      } catch (error) {
-        return errorResult(`${label} failed: ${errorMessage(error)}`, { tool: name });
-      }
+      });
     },
   });
 }
@@ -3599,12 +3974,10 @@ export function registerTenableTools(pi: any): void {
     parameters: Type.Object(authParams),
     prepareArguments: normalizeCheckAccessArgs,
     async execute(_toolCallId: string, args: CheckAccessArgs) {
-      try {
-        const result = await checkTenableAccess(createClients(args));
+      return runSealed("Tenable access check", "tenable_check_access", args, async (clients) => {
+        const result = await checkTenableAccess(clients);
         return textResult(formatAccessCheckText(result), { tool: "tenable_check_access", ...result });
-      } catch (error) {
-        return errorResult(`Tenable access check failed: ${errorMessage(error)}`, { tool: "tenable_check_access" });
-      }
+      });
     },
   });
 
@@ -3649,8 +4022,7 @@ export function registerTenableTools(pi: any): void {
     }),
     prepareArguments: normalizeExportArgs,
     async execute(_toolCallId: string, args: ExportAuditBundleArgs) {
-      try {
-        const clients = createClients(args);
+      return runSealed("Tenable audit bundle export", "tenable_export_audit_bundle", args, async (clients) => {
         const outputRoot = resolve(process.cwd(), args.output_dir?.trim() || DEFAULT_OUTPUT_DIR);
         const result = await exportTenableAuditBundle(clients, outputRoot, toAssessmentOptions(args));
         return textResult(
@@ -3671,9 +4043,7 @@ export function registerTenableTools(pi: any): void {
             error_count: result.errorCount,
           },
         );
-      } catch (error) {
-        return errorResult(`Tenable audit bundle export failed: ${errorMessage(error)}`, { tool: "tenable_export_audit_bundle" });
-      }
+      });
     },
   });
 }
