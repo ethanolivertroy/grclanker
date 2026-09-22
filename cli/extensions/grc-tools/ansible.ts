@@ -2771,7 +2771,9 @@ export function assessAnsiblePlatformSecurityData(data: PlatformSecurityData, no
       const roleCoverageKnown = teams.readable && unreadableRoleLists === 0;
       const unconfirmed = organizations.items.filter((org) => !auditedOrgs.has(nameOf(org)));
       const uncovered = roleCoverageKnown ? unconfirmed : null;
-      const covered = systemAuditors.length > 0 || (roleCoverageKnown && unconfirmed.length === 0);
+      // A confirmed Auditor in a readable list is positive evidence whatever else was denied, so the
+      // control is covered when a system auditor exists or every organization has one confirmed.
+      const covered = systemAuditors.length > 0 || unconfirmed.length === 0;
       const auditorGapNote = !teams.readable
         ? `the teams list could not be read (${teams.error}), so team-held Auditor roles were not checked`
         : unreadableRoleLists > 0
@@ -2779,7 +2781,9 @@ export function assessAnsiblePlatformSecurityData(data: PlatformSecurityData, no
           : undefined;
       const coverageSentence = roleCoverageKnown
         ? `${auditedOrgs.size} organizations have an Auditor role holder among the probed users and teams`
-        : `an Auditor role holder was confirmed for ${auditedOrgs.size} of ${organizations.seen} organizations and coverage is unknown for ${unconfirmed.length} organizations because ${auditorGapNote}`;
+        : unconfirmed.length === 0
+          ? `an Auditor role holder was confirmed for every one of the ${organizations.seen} organizations, but ${auditorGapNote}`
+          : `an Auditor role holder was confirmed for ${auditedOrgs.size} of ${organizations.seen} organizations and coverage is unknown for ${unconfirmed.length} organizations because ${auditorGapNote}`;
       findings.push(finding(
         24,
         covered ? (auditorGapNote ? "warn" : "pass") : roleCoverageKnown ? "warn" : "manual",

@@ -28,12 +28,22 @@ import {
   findPlaintextSecrets,
   parseRruleInterval,
   redactCredentialTree,
+  redactErrorText,
   redactVariables,
   resolveAnsibleConfiguration,
   resolveSecureOutputPath,
   sanitizeScmUrl,
 } from "../dist/extensions/grc-tools/ansible.js";
 import { assertSecretsAbsent, readBundleFiles, readZipEntries } from "./helpers/bundle-contents.mjs";
+import {
+  HTML_BODY_NOTE,
+  REDACTED_CANARY_URL,
+  assertNoCanaries,
+  assertNoCanariesInFiles,
+  assertRedactionCases,
+  htmlCanaryBody,
+  jsonCanaryMessage,
+} from "./helpers/error-canaries.mjs";
 
 const NOW = new Date("2026-09-21T00:00:00.000Z");
 const SUPERUSER = { id: 1, username: "auditor", is_superuser: true, is_system_auditor: false };
@@ -1513,6 +1523,410 @@ test("rule 1 corollary: partialNotes caps any pass built on an unreadable view a
   assert.equal(teams.evidence.total_inventories, null, "an unreadable inventory total renders null, never a count");
   assert.ok(teams.evidence.partial_view.some((note) => /^inventories: unreadable \(/.test(note)), JSON.stringify(teams.evidence.partial_view));
   assert.doesNotMatch(teams.summary, /on every inventory\./);
+});
+
+// Fixtures over the real AnsibleAapClient: the error constructor, the request wrapper, the login
+// path, and every collector catch block are the code under test, not the mock client above.
+const AAP_CLIENT_CONFIG = { baseUrl: "https://aap.example.com", token: "FAKE_SECRET_AAP_RUN_TOKEN_90210", timeoutMs: 30_000, verifySsl: true, sourceChain: ["tests"] };
+
+function aapResponse(body, status, statusText, contentType) {
+  return new Response(body, { status, statusText, headers: { "content-type": contentType } });
+}
+
+function aapPage(items) {
+  return { count: items.length, next: null, previous: null, results: items };
+}
+
+function aapForbidden() {
+  return aapResponse(JSON.stringify({ detail: "You do not have permission to perform this action." }), 403, "Forbidden", "application/json");
+}
+
+function aapNotFound() {
+  return aapResponse(JSON.stringify({ detail: "Not found." }), 404, "Not Found", "application/json");
+}
+
+function aapCanaryHtml() {
+  return aapResponse(htmlCanaryBody(), 502, "Bad Gateway", "text/html");
+}
+
+function aapCanaryJson() {
+  return aapResponse(JSON.stringify({ detail: jsonCanaryMessage() }), 403, "Forbidden", "application/json");
+}
+
+function healthyAapRoutes() {
+  const routes = {
+    "/api/v2/me/": () => jsonResponse({ count: 1, results: [SUPERUSER] }),
+    "/api/v2/ping/": () => jsonResponse({ version: "4.6.0", active_node: "controller-1" }),
+  };
+  for (const [path, value] of Object.entries(HEALTHY_ROUTES)) {
+    routes[path] = Array.isArray(value) ? () => jsonResponse(aapPage(value)) : () => jsonResponse(value);
+  }
+  return routes;
+}
+
+function aapRoutedFetch(routes, log) {
+  return async (input, init) => {
+    const url = new URL(typeof input === "string" ? input : input.toString());
+    const route = routes[url.pathname];
+    if (!route) throw new Error(`Unexpected request: ${url.pathname}`);
+    const response = await route(url);
+    log?.push({ method: init?.method ?? "GET", path: url.pathname, status: response.status });
+    return response;
+  };
+}
+
+function aapClient(routes, log) {
+  return new AnsibleAapClient(AAP_CLIENT_CONFIG, { fetchImpl: aapRoutedFetch(routes, log), now: () => NOW });
+}
+
+/** Runs the access check, the three assessments, and the export, keeping the thrown text when a step fails outright. */
+async function runEveryAnsibleTool(client, outputRoot) {
+  const run = { access: undefined, accessError: undefined, assessments: [], exported: undefined, exportError: undefined };
+  try {
+    run.access = await checkAnsibleAccess(client);
+  } catch (error) {
+    run.accessError = error.message;
+  }
+  run.assessments = await runAllAssessments(client);
+  try {
+    run.exported = await exportAnsibleAuditBundle(client, AAP_CLIENT_CONFIG, outputRoot);
+  } catch (error) {
+    run.exportError = error.message;
+  }
+  return run;
+}
+
+/** Every string an assessment records about a failed read: the errors array plus evidence error fields and partial-view notes. */
+function recordedAnsibleErrors(assessments) {
+  const recorded = [];
+  for (const assessment of assessments) {
+    recorded.push(...assessment.errors);
+    for (const item of assessment.findings) {
+      if (typeof item.evidence?.error === "string") recorded.push(item.evidence.error);
+      for (const note of item.evidence?.partial_view ?? []) {
+        if (/unreadable \(/.test(note)) recorded.push(note);
+      }
+    }
+  }
+  return recorded;
+}
+
+test("rule 9: redactErrorText scrubs every credential shape in the shared cases and leaves prose diagnosable", () => {
+  assertRedactionCases(assert, redactErrorText);
+  assert.equal(redactErrorText(`login failed with token ${AAP_CLIENT_CONFIG.token}`), "login failed with token [REDACTED]", "the configured token is a registered secret once a client exists");
+});
+
+test("rule 9: a 502 HTML page or a JSON error message carrying credentials on any AAP surface never reaches a probe, finding, summary, or bundle file", async () => {
+  const outputRoot = createTempBase("grclanker-ansible-canary-");
+
+  // The healthy run proves the route table is the surface list: every route is requested and nothing else is.
+  const healthyLog = [];
+  const healthyRun = await runEveryAnsibleTool(aapClient(healthyAapRoutes(), healthyLog), outputRoot);
+  assert.equal(healthyRun.accessError, undefined);
+  assert.equal(healthyRun.exported.errorCount, 0, "the healthy fixture records no errors");
+  for (const assessment of healthyRun.assessments) {
+    for (const item of assessment.findings) assert.equal(item.status, "pass", `${item.id}: ${item.summary}`);
+  }
+  const surfaces = Object.keys(healthyAapRoutes());
+  assert.deepEqual([...new Set(healthyLog.map((entry) => entry.path))].sort(), [...surfaces].sort(), "every documented surface is exercised by the access check, the assessments, or the export");
+  const accessLog = [];
+  await checkAnsibleAccess(aapClient(healthyAapRoutes(), accessLog));
+  const probed = new Set(accessLog.map((entry) => entry.path));
+
+  for (const surface of surfaces) {
+    for (const [variant, response, expectedNote, expectedStatus] of [
+      ["html", aapCanaryHtml, HTML_BODY_NOTE, 502],
+      ["json", aapCanaryJson, REDACTED_CANARY_URL, 403],
+    ]) {
+      const label = `${surface} (${variant})`;
+      const run = await runEveryAnsibleTool(aapClient({ ...healthyAapRoutes(), [surface]: response }), createTempBase("grclanker-ansible-canary-"));
+
+      if (surface === "/api/v2/me/") {
+        assert.ok(run.accessError, `${label}: the access check fails outright when the current user cannot be read`);
+        assertNoCanaries(assert, run.accessError, `${label} check_access error`);
+        assert.match(run.accessError, expectedNote, `${label}: the thrown text carries the expected note`);
+      } else {
+        assertNoCanaries(assert, run.access, `${label} check_access`);
+        if (probed.has(surface) && surface !== "/api/v2/ping/") {
+          const failed = run.access.surfaces.filter((entry) => entry.status === "not_readable");
+          assert.deepEqual(failed.map((entry) => entry.endpoint), [surface], `${label}: the access check records exactly the failing surface`);
+          for (const entry of failed) {
+            assert.match(entry.error, expectedNote, `${label}: probe ${entry.name} carries the expected note`);
+            assert.equal(entry.count, null, `${label}: probe ${entry.name} renders no count`);
+            assert.equal(entry.http_status, expectedStatus, `${label}: probe ${entry.name} records the observed status`);
+          }
+        }
+      }
+
+      for (const assessment of run.assessments) assertNoCanaries(assert, assessment, `${label} ${assessment.title}`);
+      const recorded = recordedAnsibleErrors(run.assessments);
+      if (surface !== "/api/v2/ping/") {
+        assert.ok(recorded.length > 0, `${label}: the failing surface is recorded by an assessment`);
+        for (const error of recorded) assert.match(error, expectedNote, `${label}: "${error}" carries the expected note`);
+        if (variant === "html") {
+          assert.ok(recorded.some((error) => /\(502 Bad Gateway\): non-JSON body \(text\/html, \d+ bytes\)/.test(error)), `${label}: the note names the observed status`);
+        }
+      }
+
+      if (run.exportError !== undefined) {
+        assert.equal(surface, "/api/v2/me/", `${label}: only an unreadable current user fails the export outright (${run.exportError})`);
+        assertNoCanaries(assert, run.exportError, `${label} export error`);
+        continue;
+      }
+      const files = readBundleFiles(run.exported.outputDir);
+      assertNoCanariesInFiles(assert, files, `${label} bundle`);
+      assertNoCanariesInFiles(assert, readZipEntries(run.exported.zipPath), `${label} zip`);
+      for (const [name, text] of files) assert.ok(!text.includes(AAP_CLIENT_CONFIG.token), `${label}: the configured token leaked into ${name}`);
+      if (surface !== "/api/v2/ping/") {
+        assert.ok(run.exported.errorCount > 0, `${label}: the export logs the failed read`);
+        assert.match(files.get("_errors.log"), expectedNote, `${label}: _errors.log carries the expected note`);
+      }
+    }
+  }
+});
+
+/**
+ * Single-surface denials with the core_data file the denied list is written to and the summary or
+ * evidence fields a consumer reads for that inventory. Every listed field must render null, never
+ * the zero or empty list of an in-memory fallback.
+ */
+const ANSIBLE_DENIAL_TABLE = [
+  { surface: "/api/v2/jobs/", file: "core_data/jobs.json", summary: [0, ["total_jobs", "jobs_total_reported", "successful", "failed"]] },
+  { surface: "/api/v2/instance_groups/", file: "core_data/instance_groups.json", summary: [0, ["instance_groups"]] },
+  { surface: "/api/v2/hosts/", file: "core_data/hosts.json", summary: [1, ["total_hosts", "hosts_total_reported"]] },
+  { surface: "/api/v2/inventory_sources/", file: "core_data/inventory_sources.json", summary: [1, ["inventory_sources"]] },
+  { surface: "/api/v2/job_host_summaries/", file: "core_data/job_host_summaries.json", summary: [1, ["job_host_summaries"]] },
+  {
+    surface: "/api/v2/job_templates/",
+    file: "core_data/job_templates.json",
+    summary: [1, ["job_templates"]],
+    evidence: ["AAP-AUDIT-02", ["critical_templates", "critical_templates_eligible", "covered", "unreadable"]],
+    alsoSummary: [2, ["job_templates"]],
+  },
+  { surface: "/api/v2/schedules/", file: "core_data/schedules.json", summary: [1, ["schedules"]] },
+  { surface: "/api/v2/workflow_job_templates/", file: "core_data/workflow_job_templates.json", summary: [1, ["workflow_job_templates"]] },
+  { surface: "/api/v2/organizations/", file: "core_data/organizations.json", summary: [2, ["organizations"]] },
+  { surface: "/api/v2/users/", file: "core_data/users.json", summary: [2, ["users"]] },
+  { surface: "/api/v2/teams/", file: "core_data/teams.json", summary: [2, ["teams"]] },
+  { surface: "/api/v2/credentials/", file: "core_data/credentials.json", summary: [2, ["credentials"]], evidence: ["AAP-CRED-04", ["vault_credentials"]] },
+  { surface: "/api/v2/tokens/", file: "core_data/tokens.json", summary: [2, ["tokens"]] },
+  { surface: "/api/v2/projects/", file: "core_data/projects.json", summary: [2, ["projects"]] },
+  { surface: "/api/v2/inventories/", file: "core_data/inventories.json", evidence: ["AAP-CRED-04", ["inventories"]] },
+  { surface: "/api/v2/groups/", file: "core_data/groups.json", evidence: ["AAP-CRED-04", ["groups"]] },
+  { surface: "/api/v2/execution_environments/", file: "core_data/execution_environments.json", summary: [2, ["execution_environments"]] },
+  { surface: "/api/v2/notification_templates/", file: "core_data/notification_templates.json", summary: [2, ["notification_templates"]] },
+  { surface: "/api/v2/notifications/", file: "core_data/notifications.json", evidence: ["AAP-AUDIT-02", ["failed_notifications"]] },
+  { surface: "/api/v2/activity_stream/", file: "core_data/activity_stream.json", evidence: ["AAP-AUDIT-01", ["error"]], evidenceNotNull: true },
+];
+
+function assertNotCollectedMarker(marker, surface, label) {
+  assert.deepEqual(Object.keys(marker).sort(), ["collected", "endpoint", "error", "status"], `${label}: the denied dataset is a marker object, not an empty collection`);
+  assert.equal(marker.collected, false);
+  assert.equal(marker.status, 403, `${label}: the marker carries the status the request observed`);
+  assert.equal(marker.endpoint, surface, `${label}: the marker names the path the request actually used`);
+  assert.match(marker.error, /\(403 Forbidden\) You do not have permission to perform this action\./);
+}
+
+test("denied-list markers: a denied list writes a not-collected marker in core_data with the observed status and path, every dependent summary field renders null, and a readable-but-empty list keeps its empty collection", async () => {
+  // Each export gets its own base: the allocator caps re-runs of the same target name (rule 8).
+  const outputRoot = () => createTempBase("grclanker-ansible-markers-");
+
+  for (const testCase of ANSIBLE_DENIAL_TABLE) {
+    const { surface, file } = testCase;
+    // One other list is served readable-but-empty as the control: its file keeps the collection shape.
+    const control = surface === "/api/v2/workflow_job_templates/" ? "/api/v2/tokens/" : "/api/v2/workflow_job_templates/";
+    const controlFile = control === "/api/v2/tokens/" ? "core_data/tokens.json" : "core_data/workflow_job_templates.json";
+    const client = aapClient({ ...healthyAapRoutes(), [surface]: aapForbidden, [control]: () => jsonResponse(aapPage([])) });
+    const assessments = await runAllAssessments(client);
+    const exported = await exportAnsibleAuditBundle(client, AAP_CLIENT_CONFIG, outputRoot());
+    const files = readBundleFiles(exported.outputDir);
+
+    assertNotCollectedMarker(JSON.parse(files.get(file)), surface, surface);
+    assert.deepEqual(JSON.parse(files.get(controlFile)), { data: { items: [], complete: true, total: 0 } }, `${surface} denied: a readable-but-empty list is still an empty, complete collection`);
+
+    for (const [index, keys] of [testCase.summary, testCase.alsoSummary].filter(Boolean)) {
+      for (const key of keys) {
+        assert.equal(assessments[index].summary[key], null, `${surface} denied: summary.${key} renders null, not ${JSON.stringify(assessments[index].summary[key])}`);
+      }
+    }
+    if (testCase.evidence) {
+      const [id, keys] = testCase.evidence;
+      const item = assessments.flatMap((assessment) => assessment.findings).find((candidate) => candidate.id === id);
+      assert.notEqual(item.status, "pass", `${surface} denied: ${id} never passes (${item.summary})`);
+      for (const key of keys) {
+        if (testCase.evidenceNotNull) {
+          assert.match(String(item.evidence[key]), /403 Forbidden/, `${surface} denied: ${id} evidence.${key} names the denial`);
+          assert.equal(item.evidence.http_status, 403, `${surface} denied: ${id} evidence carries the observed status`);
+          assert.equal(item.evidence.endpoint, surface, `${surface} denied: ${id} evidence names the denied path`);
+        } else {
+          assert.equal(item.evidence[key], null, `${surface} denied: ${id} evidence.${key} renders null, not ${JSON.stringify(item.evidence[key])}`);
+        }
+      }
+    }
+    const denied = assessments.flatMap((assessment) => assessment.errors).filter((error) => error.includes(surface));
+    assert.ok(denied.length > 0, `${surface} denied: the errors array names the denied endpoint`);
+    assert.ok(files.get("_errors.log").includes(surface), `${surface} denied: _errors.log names the denied endpoint`);
+  }
+
+  // Per-item lists: the denied item is a marker beside its readable siblings, and the finding keeps the item with a null count.
+  const perItem = aapClient({
+    ...healthyAapRoutes(),
+    "/api/v2/users/3/roles/": aapForbidden,
+    "/api/v2/teams/1/roles/": aapForbidden,
+    "/api/v2/organizations/1/admins/": aapForbidden,
+    "/api/v2/job_templates/10/notification_templates_error/": aapForbidden,
+  });
+  const perItemAssessments = await runAllAssessments(perItem);
+  const perItemFiles = readBundleFiles((await exportAnsibleAuditBundle(perItem, AAP_CLIENT_CONFIG, outputRoot())).outputDir);
+  const userRoles = JSON.parse(perItemFiles.get("core_data/user_roles.json"));
+  assertNotCollectedMarker(userRoles["3"], "/api/v2/users/3/roles/", "user_roles.json[3]");
+  assert.equal(userRoles["1"].data.items.length, 1, "a readable sibling keeps its projected items");
+  assert.equal(userRoles["1"].collected, undefined, "a readable sibling carries no marker keys");
+  assertNotCollectedMarker(JSON.parse(perItemFiles.get("core_data/team_roles.json"))["1"], "/api/v2/teams/1/roles/", "team_roles.json[1]");
+  assertNotCollectedMarker(JSON.parse(perItemFiles.get("core_data/organization_admins.json"))["1"], "/api/v2/organizations/1/admins/", "organization_admins.json[1]");
+  const errorNotifications = JSON.parse(perItemFiles.get("core_data/template_error_notifications.json"));
+  assertNotCollectedMarker(errorNotifications["10"], "/api/v2/job_templates/10/notification_templates_error/", "template_error_notifications.json[10]");
+  assert.equal(errorNotifications["11"].data.items.length, 1);
+  const orgAdmins = byId(perItemAssessments[2], "AAP-RBAC-01");
+  assert.equal(orgAdmins.status, "manual");
+  assert.deepEqual(orgAdmins.evidence.organizations.map((org) => [org.name, org.admin_count, org.complete, org.http_status, org.endpoint]), [["Default", null, null, 403, "/api/v2/organizations/1/admins/"]], "the organization stays listed with a null admin count and the denial beside it");
+  const coverage = byId(perItemAssessments[2], "AAP-AUDIT-02");
+  assert.equal(coverage.evidence.unreadable, 1);
+  assert.equal(coverage.evidence.covered, 1);
+
+  // Per-item files whose parent list was denied were never probed: one not-attempted marker names the parent read.
+  const parentDenied = aapClient({ ...healthyAapRoutes(), "/api/v2/users/": aapForbidden, "/api/v2/job_templates/": aapForbidden });
+  const parentFiles = readBundleFiles((await exportAnsibleAuditBundle(parentDenied, AAP_CLIENT_CONFIG, outputRoot())).outputDir);
+  for (const [file, parent] of [
+    ["core_data/user_roles.json", "/api/v2/users/"],
+    ["core_data/template_error_notifications.json", "/api/v2/job_templates/"],
+    ["core_data/survey_specs.json", "/api/v2/job_templates/"],
+  ]) {
+    const marker = JSON.parse(parentFiles.get(file));
+    assert.deepEqual(Object.keys(marker).sort(), ["collected", "endpoint", "error", "status"], `${file}: a per-item file under a denied parent is a marker, not {}`);
+    assert.equal(marker.collected, false);
+    assert.equal(marker.status, 403);
+    assert.equal(marker.endpoint, parent, `${file}: the marker names the parent list that was denied`);
+    assert.match(marker.error, /^not attempted: the parent list could not be read \(/);
+  }
+  const teamRoles = JSON.parse(parentFiles.get("core_data/team_roles.json"));
+  assert.equal(teamRoles["1"].data.items.length, 1, "a per-item file whose parent was readable keeps its record shape");
+
+  // Object datasets: settings and job settings write the same marker, and the flags they feed stay null.
+  const objectDenied = aapClient({
+    ...healthyAapRoutes(),
+    "/api/v2/settings/system/": aapForbidden,
+    "/api/v2/settings/logging/": aapForbidden,
+    "/api/v2/settings/authentication/": aapForbidden,
+    "/api/v2/settings/jobs/": aapForbidden,
+  });
+  const objectAssessments = await runAllAssessments(objectDenied);
+  const objectFiles = readBundleFiles((await exportAnsibleAuditBundle(objectDenied, AAP_CLIENT_CONFIG, outputRoot())).outputDir);
+  for (const [file, surface] of [
+    ["core_data/settings_system.json", "/api/v2/settings/system/"],
+    ["core_data/settings_logging.json", "/api/v2/settings/logging/"],
+    ["core_data/settings_authentication.json", "/api/v2/settings/authentication/"],
+    ["core_data/job_settings.json", "/api/v2/settings/jobs/"],
+  ]) {
+    assertNotCollectedMarker(JSON.parse(objectFiles.get(file)), surface, file);
+  }
+  const audit = byId(objectAssessments[2], "AAP-AUDIT-01");
+  assert.equal(audit.status, "warn");
+  assert.deepEqual(
+    { enabled: audit.evidence.activity_stream_enabled, system: audit.evidence.system_settings_readable, aggregator: audit.evidence.log_aggregator_enabled, type: audit.evidence.log_aggregator_type, logging: audit.evidence.logging_settings_readable },
+    { enabled: null, system: false, aggregator: null, type: null, logging: false },
+    "settings-derived flags render null with their readable flags false",
+  );
+  assert.equal(objectAssessments[2].summary.external_auth, null);
+  assert.equal(objectAssessments[2].summary.auth_settings_readable, false);
+  const concurrency = byControl(objectAssessments[0], 28);
+  assert.equal(concurrency.status, "manual");
+  assert.deepEqual(concurrency.evidence, { error: concurrency.evidence.error, http_status: 403, endpoint: "/api/v2/settings/jobs/" });
+
+  // The scope probe renders visibility as unknown, never false, when the current user cannot be read.
+  const meDenied = aapClient({ ...healthyAapRoutes(), "/api/v2/me/": aapForbidden });
+  const meAssessments = await runAllAssessments(meDenied);
+  for (const assessment of meAssessments) {
+    assert.equal(assessment.summary.full_visibility, null, `${assessment.category}: full_visibility is null while the current user is unread`);
+  }
+});
+
+test("AAP-RBAC-05 never names an organization as uncovered while any probed role list was denied", async () => {
+  const noSystemAuditor = { "/api/v2/users/": [SUPERUSER, LIMITED_USER, { id: 3, username: "reviewer", is_superuser: false, is_system_auditor: false }] };
+
+  const readable = byId(await assessAnsiblePlatformSecurity(createMockClient({ routes: noSystemAuditor })), "AAP-RBAC-05");
+  assert.equal(readable.status, "pass");
+  assert.deepEqual(readable.evidence.audited_organizations, ["Default"]);
+  assert.deepEqual(readable.evidence.uncovered, []);
+  assert.equal(readable.evidence.coverage_unknown_organizations, 0);
+
+  const roleDenied = byId(await assessAnsiblePlatformSecurity(createMockClient({ routes: noSystemAuditor, forbiddenPaths: ["/api/v2/users/3/roles/"] })), "AAP-RBAC-05");
+  assert.equal(roleDenied.status, "manual", roleDenied.summary);
+  assert.deepEqual(roleDenied.evidence.audited_organizations, []);
+  assert.equal(roleDenied.evidence.uncovered, null, "no organization is called uncovered when the list that would show its auditor was denied");
+  assert.equal(roleDenied.evidence.coverage_unknown_organizations, 1);
+  assert.equal(roleDenied.evidence.unreadable_role_lists, 1);
+  assert.match(roleDenied.summary, /coverage is unknown for 1 organizations because 1 user or team role lists could not be read/);
+  assert.doesNotMatch(roleDenied.summary, /Default/);
+
+  const teamsDenied = byId(await assessAnsiblePlatformSecurity(createMockClient({ routes: noSystemAuditor, forbiddenPaths: ["/api/v2/teams/"] })), "AAP-RBAC-05");
+  assert.equal(teamsDenied.status, "warn", teamsDenied.summary);
+  assert.equal(teamsDenied.evidence.uncovered, null);
+  assert.match(teamsDenied.summary, /the teams list could not be read/);
+
+  const withSystemAuditor = byId(await assessAnsiblePlatformSecurity(createMockClient({ forbiddenPaths: ["/api/v2/users/3/roles/"] })), "AAP-RBAC-05");
+  assert.equal(withSystemAuditor.status, "warn", "a system auditor keeps the control at warn while the role list gap is named");
+  assert.equal(withSystemAuditor.evidence.uncovered, null);
+  assert.match(withSystemAuditor.summary, /1 system auditors exist and an Auditor role holder was confirmed for 0 of 1 organizations and coverage is unknown for 1 organizations/);
+
+  const trulyUncovered = byId(await assessAnsiblePlatformSecurity(createMockClient({ routes: { ...noSystemAuditor, "/api/v2/users/3/roles/": [] } })), "AAP-RBAC-05");
+  assert.equal(trulyUncovered.status, "warn");
+  assert.deepEqual(trulyUncovered.evidence.uncovered, ["Default"], "with every role list readable, an organization without an auditor is named");
+  assert.match(trulyUncovered.summary, /1\/1 organizations have no Auditor role holder/);
+});
+
+function namedAapEndpoints(text) {
+  return new Set(text.match(/\/api\/v2\/[A-Za-z0-9_/-]+/g) ?? []);
+}
+
+function namedAapStatusCodes(text) {
+  const codes = new Set();
+  for (const match of text.matchAll(/\((\d{3}) (?:[A-Z][A-Za-z]*(?: |\)))/g)) codes.add(Number(match[1]));
+  for (const match of text.matchAll(/"(?:http_)?status": ?(\d{3})\b/g)) codes.add(Number(match[1]));
+  return codes;
+}
+
+test("request matching: every endpoint path and HTTP status named in any output corresponds to a request the run made and observed", async () => {
+  const outputRoot = createTempBase("grclanker-ansible-request-log-");
+  const log = [];
+  const client = aapClient({
+    ...healthyAapRoutes(),
+    "/api/v2/jobs/": aapForbidden,
+    "/api/v2/credentials/": aapCanaryHtml,
+    "/api/v2/settings/logging/": aapNotFound,
+  }, log);
+
+  const outputs = [JSON.stringify(await checkAnsibleAccess(client))];
+  for (const assessment of await runAllAssessments(client)) outputs.push(JSON.stringify(assessment));
+  const exported = await exportAnsibleAuditBundle(client, AAP_CLIENT_CONFIG, outputRoot);
+  outputs.push(...readBundleFiles(exported.outputDir).values());
+
+  const requestedPaths = new Set(log.map((entry) => entry.path));
+  const observedStatuses = new Set(log.map((entry) => entry.status));
+  assert.ok(observedStatuses.has(403) && observedStatuses.has(502) && observedStatuses.has(404), "the fixture served every failure status under test");
+
+  const text = outputs.join("\n");
+  const endpoints = namedAapEndpoints(text);
+  const statuses = namedAapStatusCodes(text);
+  assert.ok(endpoints.has("/api/v2/jobs/") && endpoints.has("/api/v2/credentials/") && endpoints.has("/api/v2/settings/logging/"), "the outputs name the failing endpoints");
+  assert.ok(statuses.has(403) && statuses.has(502) && statuses.has(404), "the outputs name the observed failure statuses");
+  for (const endpoint of endpoints) {
+    assert.ok(requestedPaths.has(endpoint), `endpoint ${endpoint} is named in output but the run never requested it`);
+  }
+  for (const status of statuses) {
+    assert.ok(observedStatuses.has(status), `status ${status} is named in output but no request observed it`);
+  }
+  assertNoCanaries(assert, text, "request matching run");
 });
 
 test("resolveSecureOutputPath rejects traversal and symlink parents", () => {
