@@ -757,7 +757,7 @@ test("assessVeracodeScaPosture reads linked_projects from the documented LinkedP
   assert.match(undocumented.findings.find((item) => item.id === "VERACODE-18").summary, /neither upload-and-scan SCA enabled nor a linked SCA agent project/);
 });
 
-test("VERACODE-18 renders linked_projects_by_application as null when no linked project list was read, keeps read lists beside a not-collected marker when some were denied, and keeps the populated map when every list was read", async () => {
+test("VERACODE-18 renders linked_projects_by_application as null when no linked project list was read, keeps read lists beside a not-collected marker when some were denied, names the unread lists with count, endpoint, and observed status in every summary, and keeps the populated map when every list was read", async () => {
   const findingOf = (result) => result.findings.find((item) => item.id === "VERACODE-18");
   const projectsPath = (guid) => `/srcclr/v3/applications/${guid}/projects`;
   const portalProjects = [{ name: "portal", workspace: "Workspace A", last_scan_date: healthyFixture().scaProjects.linked_projects[0].last_scan_date }];
@@ -778,19 +778,40 @@ test("VERACODE-18 renders linked_projects_by_application as null when no linked 
   })));
   assert.deepEqual(requested, ["app-2"], "the covered application needs no list; the other's list was requested and denied");
   assert.equal(allDenied.status, "warn");
-  assert.equal(allDenied.summary, "All 1 sampled applications have upload-and-scan SCA enabled or a linked SCA agent project (linked_projects from the SCA Agent API). 1 linked project lists were unreadable.");
+  assert.equal(allDenied.summary, "1 of 2 sampled applications have upload-and-scan SCA enabled or a linked SCA agent project (linked_projects from the SCA Agent API). 1 of 1 requested linked project lists could not be read (the requests returned 403 Forbidden).", "the covered count is stated against the sample, and the caveat counts the unread lists against those requested with the observed status");
   assert.deepEqual(allDenied.evidence.unreadable_applications, ["Portal"]);
+  assert.deepEqual(allDenied.evidence.unreadable_linked_project_lists, [{ application: "Portal", status: 403, endpoint: null }], "the mock client reports no endpoint, so the evidence carries the observed status and a null endpoint");
+  assert.equal(allDenied.evidence.linked_project_lists_requested, 1);
   assert.equal(allDenied.evidence.linked_projects_by_application, null, "a map derived from lookups that all failed renders null, never {}");
   assert.equal(allDenied.evidence.sca_agent_api_available, true);
 
-  // Both sampled applications need a list and both are denied: no application could be evaluated, and the map is still null.
+  // Both sampled applications need a list and both are denied: no application could be evaluated, the manual summary names the unread lists with their count and observed status, and the map is still null.
   const noneRead = findingOf(await assessVeracodeScaPosture(mockClient(fixture, {
     async getScaApplicationProjects(guid) { throw forbidden(projectsPath(guid)); },
   })));
   assert.equal(noneRead.status, "manual");
+  assert.equal(noneRead.summary, "No application could be evaluated for SCA coverage: every linked project list requested was unreadable (2 of 2; the requests returned 403 Forbidden). Manual evidence required: Map each application to an SCA workspace.");
   assert.equal(noneRead.evidence.covered_applications, 0);
   assert.deepEqual(noneRead.evidence.unreadable_applications, ["Payments", "Portal"]);
+  assert.deepEqual(noneRead.evidence.unreadable_linked_project_lists, [{ application: "Payments", status: 403, endpoint: null }, { application: "Portal", status: 403, endpoint: null }]);
+  assert.equal(noneRead.evidence.linked_project_lists_requested, 2);
   assert.equal(noneRead.evidence.linked_projects_by_application, null);
+
+  // The same shape through the real client: the summary names the endpoint family and the 403 the run observed, the evidence keeps each list's real endpoint and status, and a sampled inventory keeps its scope caveat before the manual evidence line.
+  const noneReadFetch = recordingVeracodeFetch({ fixture, denied: [/^\/srcclr\/v3\/applications\/[^/]+\/projects$/] });
+  const noneReadObserved = findingOf(await assessVeracodeScaPosture(new VeracodeApiClient(sampleConfig({ retries: 0 }), { fetchImpl: noneReadFetch.fetchImpl, sleep: async () => {} }), {}));
+  assert.equal(noneReadObserved.status, "manual");
+  assert.equal(noneReadObserved.summary, "No application could be evaluated for SCA coverage: every linked project list requested was unreadable (2 of 2; GET /srcclr/v3/applications/{guid}/projects returned 403 Forbidden). Manual evidence required: Map each application to an SCA workspace.");
+  assert.deepEqual(noneReadObserved.evidence.unreadable_linked_project_lists, [
+    { application: "Payments", status: 403, endpoint: "/srcclr/v3/applications/app-1/projects" },
+    { application: "Portal", status: 403, endpoint: "/srcclr/v3/applications/app-2/projects" },
+  ]);
+  assert.equal(noneReadFetch.requests.filter((request) => /\/projects$/.test(request.path) && request.status === 403).length, 2, "both denied requests were actually issued");
+  assertOutputsNameOnlyObservedRequests(new Map([["VERACODE-18", JSON.stringify(noneReadObserved)]]), noneReadFetch.requests, "all linked project lists denied");
+  const sampledFetch = recordingVeracodeFetch({ fixture, denied: [/^\/srcclr\/v3\/applications\/[^/]+\/projects$/] });
+  const sampledObserved = findingOf(await assessVeracodeScaPosture(new VeracodeApiClient(sampleConfig({ retries: 0 }), { fetchImpl: sampledFetch.fetchImpl, sleep: async () => {} }), { maxApplications: 1 }));
+  assert.equal(sampledObserved.status, "manual");
+  assert.equal(sampledObserved.summary, "No application could be evaluated for SCA coverage: every linked project list requested was unreadable (1 of 1; GET /srcclr/v3/applications/app-1/projects returned 403 Forbidden). Only 1 of 2 applications were sampled, so the verdict reflects a partial view. Manual evidence required: Map each application to an SCA workspace.", "a single unread list names its own endpoint, and the scope caveat reaches the manual summary");
 
   // No list needed at all (every sampled application has upload-and-scan SCA): nothing was read, so the map is null rather than an empty {}.
   const covered = healthyFixture();
@@ -804,7 +825,7 @@ test("VERACODE-18 renders linked_projects_by_application as null when no linked 
     async getScaApplicationProjects(guid) { if (guid === "app-1") throw forbidden(projectsPath(guid)); return fixture.scaProjects; },
   })));
   assert.equal(mixed.status, "warn");
-  assert.match(mixed.summary, /1 linked project lists were unreadable\.$/);
+  assert.equal(mixed.summary, "1 of 2 sampled applications have upload-and-scan SCA enabled or a linked SCA agent project (linked_projects from the SCA Agent API). 1 of 2 requested linked project lists could not be read (the requests returned 403 Forbidden).");
   assert.deepEqual(mixed.evidence.unreadable_applications, ["Payments"]);
   assert.deepEqual(Object.keys(mixed.evidence.linked_projects_by_application).sort(), ["Payments", "Portal"]);
   assert.deepEqual(mixed.evidence.linked_projects_by_application.Portal, portalProjects);
@@ -815,6 +836,8 @@ test("VERACODE-18 renders linked_projects_by_application as null when no linked 
   const client = new VeracodeApiClient(sampleConfig({ retries: 0 }), { fetchImpl, sleep: async () => {} });
   const observed = findingOf(await assessVeracodeScaPosture(client, {}));
   assert.equal(observed.status, "warn");
+  assert.match(observed.summary, /1 of 2 requested linked project lists could not be read \(GET \/srcclr\/v3\/applications\/app-1\/projects returned 403 Forbidden\)\.$/, "the caveat names the real endpoint and status the run observed");
+  assert.deepEqual(observed.evidence.unreadable_linked_project_lists, [{ application: "Payments", status: 403, endpoint: "/srcclr/v3/applications/app-1/projects" }]);
   assert.deepEqual(observed.evidence.linked_projects_by_application.Portal, portalProjects);
   assertNotCollectedMarker(observed.evidence.linked_projects_by_application.Payments, "observed linked_projects_by_application.Payments", { status: 403, endpoint: /^\/srcclr\/v3\/applications\/app-1\/projects$/, error: /403 Forbidden/ });
   assert.ok(requests.some((request) => request.path === "/srcclr/v3/applications/app-1/projects" && request.status === 403), "the denied request was actually issued");
@@ -1766,7 +1789,11 @@ const VERACODE_FIXED_TEXTS = [
   "2 application finding lists were unreadable.",
   "3 finding lists were truncated before the last page.",
   "1 workspace license lists were unreadable.",
-  "2 linked project lists were unreadable.",
+  "1 of 2 requested linked project lists could not be read (GET /srcclr/v3/applications/app-1/projects returned 403 Forbidden).",
+  "2 of 2 requested linked project lists could not be read (GET /srcclr/v3/applications/{guid}/projects returned 403 Forbidden (1) and 500 Internal Server Error (1)).",
+  "1 of 1 requested linked project lists could not be read (the requests returned no status).",
+  "No application could be evaluated for SCA coverage: every linked project list requested was unreadable (2 of 2; GET /srcclr/v3/applications/{guid}/projects returned 403 Forbidden). Manual evidence required: Map each application to an SCA workspace.",
+  "1 of 2 sampled applications have upload-and-scan SCA enabled or a linked SCA agent project (linked_projects from the SCA Agent API).",
   "2 credential records were unreadable.",
   "The policies endpoint returned zero policies, which cannot be a complete inventory because every Veracode account exposes the built-in policies; the empty list is treated as unverifiable rather than compliant.",
   "The users endpoint returned zero users, which cannot be a complete inventory because the API credential belongs to a user; the empty list is treated as unverifiable rather than compliant.",

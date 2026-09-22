@@ -1211,11 +1211,48 @@ function manualFinding(
   reason: string,
   evidenceToCollect: string[],
   evidence: JsonRecord = {},
+  caveats: Array<string | undefined> = [],
 ): VeracodeFinding {
-  return finding(number, severity, "manual", `${reason} Manual evidence required: ${evidenceToCollect.join(" ")}`, {
+  return finding(number, severity, "manual", joinNotes(reason, ...caveats, `Manual evidence required: ${evidenceToCollect.join(" ")}`), {
     ...evidence,
     manual_evidence: evidenceToCollect,
   });
+}
+
+type UnreadableLinkedProjectList = { application: string; status: number | null; endpoint: string | null };
+
+const HTTP_REASON_PHRASES: Record<number, string> = {
+  400: "Bad Request", 401: "Unauthorized", 403: "Forbidden", 404: "Not Found", 429: "Too Many Requests",
+  500: "Internal Server Error", 502: "Bad Gateway", 503: "Service Unavailable", 504: "Gateway Timeout",
+};
+
+/** A status the run observed with its reason phrase, so a summary reads "403 Forbidden" rather than a bare number. */
+function statusPhrase(status: number): string {
+  const phrase = HTTP_REASON_PHRASES[status];
+  return phrase ? `${status} ${phrase}` : String(status);
+}
+
+/**
+ * Names the linked project lists that could not be read from the observed surfaces only: how many
+ * of the requested lists, the endpoint they were requested from when the client reported it (the
+ * per-application family is rendered with a {guid} placeholder once more than one list is named),
+ * and every status the run observed for them.
+ */
+function describeUnreadableLinkedProjectLists(lists: UnreadableLinkedProjectList[], requested: number): { count: string; observed: string } {
+  const endpoints = [...new Set(lists.map((item) => item.endpoint).filter((endpoint): endpoint is string => Boolean(endpoint)))];
+  const family = /\/applications\/[^/]+\/projects$/;
+  let subject = "the requests";
+  if (endpoints.length === 1) subject = `GET ${endpoints[0]}`;
+  else if (endpoints.length > 1 && endpoints.every((endpoint) => family.test(endpoint))) subject = `GET ${endpoints[0].replace(family, "/applications/{guid}/projects")}`;
+  else if (endpoints.length > 1) subject = `GET ${endpoints.slice(0, 2).join(" and ")}${endpoints.length > 2 ? ` and ${endpoints.length - 2} more` : ""}`;
+  const outcomes = new Map<string, number>();
+  for (const item of lists) {
+    const label = item.status === null ? "no status" : statusPhrase(item.status);
+    outcomes.set(label, (outcomes.get(label) ?? 0) + 1);
+  }
+  const rendered = [...outcomes.entries()].map(([label, count]) => (outcomes.size > 1 ? `${label} (${count})` : label));
+  const observed = outcomes.size === 1 && outcomes.has("no status") ? `${subject} returned no status` : `${subject} returned ${rendered.join(" and ")}`;
+  return { count: `${lists.length} of ${requested}`, observed };
 }
 
 function partialInventoryNote(list: HalListResult, noun: string): string | undefined {
@@ -2279,6 +2316,7 @@ async function evaluateScaWorkspaceCoverage(client: ClientLike, snapshot: Applic
   const covered: string[] = [];
   const uncovered: string[] = [];
   const unreadable: string[] = [];
+  const unreadableLists: UnreadableLinkedProjectList[] = [];
   const unchecked: string[] = [];
   const rawProjects: JsonRecord = {};
   const linkedProjectsByApplication: JsonRecord = {};
@@ -2300,6 +2338,7 @@ async function evaluateScaWorkspaceCoverage(client: ClientLike, snapshot: Applic
     if (projects.status === "error") {
       // The evidence map keeps the same marker as the snapshot for a list that failed, so it never reads as "no linked projects".
       unreadable.push(applicationName(app));
+      unreadableLists.push({ application: applicationName(app), status: projects.statusCode ?? null, endpoint: projects.endpoint ?? null });
       linkedProjectsByApplication[applicationName(app)] = rawSurface(projects);
       continue;
     }
@@ -2313,7 +2352,10 @@ async function evaluateScaWorkspaceCoverage(client: ClientLike, snapshot: Applic
     if (linked.length > 0) covered.push(applicationName(app));
     else uncovered.push(applicationName(app));
   }
-  const caveats = [partialInventoryNote(list, "applications"), scopeNote(sampled.length, list.items.length, "applications"), unreadable.length > 0 ? `${unreadable.length} linked project lists were unreadable.` : undefined];
+  const listsRequested = linkedProjectListsRead + unreadableLists.length;
+  const unreadableDetail = unreadableLists.length > 0 ? describeUnreadableLinkedProjectLists(unreadableLists, listsRequested) : undefined;
+  const inventoryCaveats = [partialInventoryNote(list, "applications"), scopeNote(sampled.length, list.items.length, "applications")];
+  const caveats = [...inventoryCaveats, unreadableDetail ? `${unreadableDetail.count} requested linked project lists could not be read (${unreadableDetail.observed}).` : undefined];
   // With the SCA Agent API unreadable no project list is requested: the uncovered set and the linked project map were never determined, so they render null and the snapshot carries a marker rather than an empty map.
   // The map also renders null, never {}, when no linked project list was read (every requested list failed, or none was needed); with some lists read the failed ones sit beside them as markers.
   const evidence = {
@@ -2321,6 +2363,8 @@ async function evaluateScaWorkspaceCoverage(client: ClientLike, snapshot: Applic
     covered_applications: covered.length,
     uncovered_applications: scaBlocker ? null : uncovered.slice(0, 50),
     unreadable_applications: unreadable.slice(0, 50),
+    unreadable_linked_project_lists: unreadableLists.slice(0, 50),
+    linked_project_lists_requested: listsRequested,
     unchecked_applications: unchecked.slice(0, 50),
     linked_projects_by_application: linkedProjectListsRead > 0 ? linkedProjectsByApplication : null,
     sca_agent_api_available: !scaBlocker,
@@ -2337,10 +2381,15 @@ async function evaluateScaWorkspaceCoverage(client: ClientLike, snapshot: Applic
     return { finding: finding(18, "medium", "warn", joinNotes(`${uncovered.length}/${sampled.length} sampled applications have neither upload-and-scan SCA enabled nor a linked SCA agent project.`, ...caveats), evidence), raw, errors };
   }
   if (covered.length === 0) {
-    return { finding: manualFinding(18, "medium", "No application could be evaluated for SCA coverage.", ["Map each application to an SCA workspace."], evidence), raw, errors };
+    // Every list requested was unreadable: the reason names the lists, their count, the endpoint, and the observed status, so the manual verdict says what could not be read.
+    const reason = unreadableDetail
+      ? `No application could be evaluated for SCA coverage: every linked project list requested was unreadable (${unreadableDetail.count}; ${unreadableDetail.observed}).`
+      : "No application could be evaluated for SCA coverage.";
+    return { finding: manualFinding(18, "medium", reason, ["Map each application to an SCA workspace."], evidence, inventoryCaveats), raw, errors };
   }
   const agentlessNote = scaAgentNote ? `Linked agent projects were not checked because ${scaAgentNote}; every sampled application is covered by upload-and-scan SCA alone.` : undefined;
-  return { finding: finding(18, "medium", limitedStatus("pass", caveats), joinNotes(`All ${covered.length} sampled applications have upload-and-scan SCA enabled or a linked SCA agent project (linked_projects from the SCA Agent API).`, agentlessNote, ...caveats), evidence), raw, errors };
+  const coveredCount = covered.length === sampled.length ? `All ${covered.length}` : `${covered.length} of ${sampled.length}`;
+  return { finding: finding(18, "medium", limitedStatus("pass", caveats), joinNotes(`${coveredCount} sampled applications have upload-and-scan SCA enabled or a linked SCA agent project (linked_projects from the SCA Agent API).`, agentlessNote, ...caveats), evidence), raw, errors };
 }
 
 /** Names the observed cause when the SCA Agent API workspace list could not be used: its own status code, or the empty inventory. */
