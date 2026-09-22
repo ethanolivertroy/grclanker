@@ -3,11 +3,11 @@ slug: "oci-sec-inspector"
 name: "OCI Security Inspector"
 vendor: "Oracle"
 category: "cloud-infrastructure"
-language: "go"
-status: "spec-only"
+language: "typescript"
+status: "implemented"
 version: "1.0"
-last_updated: "2026-03-29"
-source_repo: "https://github.com/hackIDLE/oci-sec-inspector"
+last_updated: "2026-09-21"
+source_repo: "https://github.com/hackIDLE/grclanker"
 ---
 
 # OCI Security Inspector - Architecture Specification
@@ -17,6 +17,10 @@ source_repo: "https://github.com/hackIDLE/oci-sec-inspector"
 OCI Security Inspector is a security compliance inspection tool for Oracle Cloud Infrastructure (OCI). It audits IAM policies, networking configurations, Cloud Guard posture, vault key management, audit logging, and bastion access controls across OCI tenancies and compartments. The tool produces structured findings mapped to major compliance frameworks, enabling continuous compliance monitoring for organizations running workloads on OCI.
 
 Written in Go with a hybrid CLI/TUI architecture, it performs read-only inspection of OCI resources using official REST APIs and produces machine-readable JSON and human-readable reports.
+
+### grclanker implementation
+
+The shipped implementation lives in `cli/extensions/grc-tools/oci.ts` as six native tools (`oci_check_access`, `oci_assess_identity`, `oci_assess_logging_detection`, `oci_assess_tenancy_guardrails`, `oci_assess_compute_and_storage`, `oci_export_audit_bundle`). It keeps the OCI CLI (API-key profile from `~/.oci/config`) as the authenticated transport and implements assessment, verdict-safety, and export natively. Every command, flag, and field is cited to the OCI CLI command reference and the REST API reference in `OCI_SURFACE_DOCS`. The integration guide is `src/content/docs/docs/integrations/oci.md`.
 
 ## 2. APIs & SDKs
 
@@ -335,4 +339,36 @@ GOOS=windows GOARCH=amd64 go build -o bin/oci-sec-inspector-windows-amd64.exe ./
 
 ## 10. Status
 
-Not yet implemented. Spec only.
+Implemented in grclanker (TypeScript) on 2026-09-21; the Go/TUI architecture in sections 7-9 remains the original design reference and was not built.
+
+### Shipped
+
+- 21 findings across four assess tools covering controls 1-23: OCI-IAM-01..06, OCI-LOG-01..06 (OCI-LOG-04 is supporting audit-event evidence), OCI-GRD-01..06, OCI-CMP-01..03.
+- Verdict safety: unreadable or denied surfaces (including the documented `NotAuthorizedOrNotFound` response) render `manual`; empty inventories never pass by default; compartment caps, denied compartments, item caps, and undated items withhold `pass`; every enabling flag is read explicitly; the CLI `--all` flag pages to completion; bundle reruns allocate `-2`, `-3` and never overwrite. A finding that reads more than one inventory demotes when any of them is incomplete (OCI-GRD-02 and OCI-GRD-03 consult the security list inventory for their vacuous-empty verdict and warn when it is partial), and every demoted summary names the failing CLI command and the compartments it could not read; a table-driven test makes each of the 33 client surfaces unreadable in turn (fully and per compartment) and asserts the dependent findings drop below pass and name the surface while unrelated findings keep passing.
+- Evidence bundle with `core_data/`, `analysis/`, `compliance/` (executive summary, unified matrix, one report per framework in section 5), `QUICK_REFERENCE.md`, and `_errors.log` on partial collection.
+- Bundle secret hygiene: credential-bearing fields (`accessUri`, `keyValue`, `token`, `key`, secrets, passwords, private keys, key material, wrapped keys, `userData`, `authorization`) are replaced with `[redacted]` at finding creation, PEM blocks, PAR URIs, the OCI request-signing `Signature` parameter list, standalone `keyId`/`signingKeyId`/`signature` values (assignment and JSON-colon forms), and `token`/`secret`/`password`/`pass_phrase`/`key_file`/`access_uri` assignments are scrubbed from all strings including CLI errors, raw compartment snapshots are projected to the four documented fields the verdicts read, and the config file path is redacted from `metadata.json` and `access.json`; a regression test writes a bundle from `FAKE_`-marked fixtures and asserts no marker survives in any file or zip entry.
+- Cap truncation: `max_compartments`, `max_keys`, `max_policies`, and `max_buckets` each record the cap hit, report seen versus total, and withhold `pass`; one regression test per cap drives it to the cap.
+- CLI error text: a failing `oci` process never has its stderr or stdout echoed. The runner raises `OciCommandError`, whose message keeps only the documented `ServiceError` fields (`status`, `code`, `message`, `opc-request-id`) after scrubbing, or otherwise a descriptor with the command words, exit code, and stderr and stdout byte counts. One exported scrub, `scrubErrorText`, runs once where every error string is created (the `OciCommandError` constructor and `errorMessage`), before the 500-character `ServiceError` message cap and the 1000-character `errorMessage` cap so no fragment of a secret can straddle a cap; it strips embedded URL queries and fragments, Bearer, Basic, cookie, api key, session, access, refresh, and id token, client secret, password, `Signature`, and `keyId` shapes (quoted or not), and any unlabeled run of 16 or more token characters that contains a digit or a `+` in free text, while `kmsKeyId`, `masterKeyId`, `--key-id`, and OCIDs stay readable. The bundle sink is a second layer in data mode: `scrubAssessmentForBundle` and the export path apply `redactSensitiveText` (the same patterns with the long-token rule off) to every finding summary, errors array entry, and access-check error, so identifiers such as a compartment named `prod-us-east-2026` survive in `_errors.log`, the per-area errors arrays, and the executive summary while `token=` shapes are still redacted there. An `opc-request-id` is disclosed only when it matches a documented layout, the CLI's `32hex(/32hex){0,2}` form or the UUID form shown in `usingapi.htm`; any other value behind the label is dropped from the disclosure. Residuals: a value that matches a documented layout and is deliberately placed directly behind an `opc-request-id=` label stays readable (no OCI secret has the bare 32-hex shape; the identity-domain OAuth client secret has the UUID shape), which is exfiltration rather than accidental echo; an unlabeled token of 16 or more characters with no digit or `+` is not redacted by the long-token rule; the in-memory errors arrays and assessment summary statuses wrap compartment names (and, in one informational line, vault display names) around each cause verbatim as tenant data, and the sink redacts assignment shapes inside them for the bundle. A table-driven walk drives all 33 client surfaces through three failure shapes and asserts no canary reaches a finding, summary, errors array, bundle file, zip entry, or thrown error, and that each failure is disclosed.
+- Live smoke script `cli/scripts/oci-live-smoke.mjs` (`npm --prefix cli run test:oci:live`).
+
+### Deviations from this spec (docs win over spec)
+
+- Control 1 expiration: the IAM `PasswordPolicy` datatype exposes no expiration setting, so expiration is a separate always-manual finding (OCI-IAM-06); length and complexity are judged from the documented fields.
+- Control 2 uses the documented `User.isMfaActivated` field instead of enumerating TOTP devices per user.
+- Control 9 uses `ProblemSummary.riskLevel` and `lifecycleDetail=OPEN` (the API has no `severity` field on problems).
+- Control 19 key length lives on `Key.keyShape` (GetKey), not on `KeySummary`, so every ENABLED key is fetched with `oci kms management key get --key-id --endpoint` (capped by `max_keys`). `KeyShape.length` is documented in bytes (AES 16/24/32, RSA 256/384/512, ECDSA 32/48/66): AES below 32 bytes and RSA below 512 bytes fail. The control text names only AES-256 and RSA-4096, so ECDSA keys pass on any documented `curveId` (NIST_P256, NIST_P384, NIST_P521) and fail when the curve is missing or undocumented. A denied key get renders the key inventory partial: warn when some keys were read, manual when none were.
+- Control 16: a bastion whose `clientCidrBlockAllowList` contains `0.0.0.0/0` or `::/0` and whose `maxSessionTtlInSeconds` exceeds 3 hours fails; either condition alone warns.
+- Control 14: `SecurityRule.isValid` is read into the NSG evidence (count of rules with `isValid=false`, flag on each permissive rule).
+- `OCI-LOG-04` (audit event visibility) is supporting evidence for control 11, not a numbered control, so it carries no framework mappings.
+- Controls 6, 12, 13, 14, 15, 16, 18, 20, 22, 23: the list APIs have no subtree parameter, so resources are listed per accessible compartment up to `max_compartments`.
+- Control 20: `BucketSummary` omits `publicAccessType`, so each bucket is fetched with `GetBucket` up to `max_buckets`.
+- Control 16: `BastionSummary` omits TTL and CIDR fields, so each bastion is fetched with `GetBastion`.
+- Control 21: `timeExpires` is present on every PAR by API contract; "no expiration" cannot occur and long-lived PARs (more than 30 days out) warn instead.
+- Output formats: SARIF and the JSON/CSV/HTML CLI outputs are out of scope; findings are JSON in `analysis/findings.json`.
+
+### Deferred
+
+- Control 24 budgets and alert rules (`oci budgets budget budget list`, `oci budgets budget alert-rule list`).
+- Control 25 OS Management patching: the current API reference index lists only OS Management Hub (`osmh`, `/20220901`); the legacy OS Management Service (`/20190801`) is no longer in the reference and should not be targeted.
+- Auth modes: session token (`security_token_file`), instance principal, resource principal, delegation token.
+- Unfolding controls 3-5 (OCI-IAM-03), 16-17 (OCI-GRD-04), 18-19 (OCI-GRD-05), and 20-21 (OCI-GRD-06) into one finding each; today each folded control is judged and reported as separate evidence buckets inside the shared finding.
