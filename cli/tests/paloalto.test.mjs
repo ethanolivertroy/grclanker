@@ -922,6 +922,30 @@ test("checkPaloaltoAccess reports healthy access across both products", async ()
   assert.ok(result.notes.some((note) => /PA-440/.test(note)));
 });
 
+test("the guide's paloalto_check_access row states exactly the Prisma Cloud and Compute surfaces checkPaloaltoAccess reports, by count and by name in order", async () => {
+  const result = await checkPaloaltoAccess(createPaloaltoClients(bothProductsConfig(), mockedFetch()));
+  const reported = (product) => result.surfaces.filter((surface) => surface.product === product).map((surface) => surface.name);
+  assert.ok(reported("prisma-cloud").length > 0 && reported("prisma-compute").length > 0, "the healthy fixture reports both Prisma Cloud and Compute surfaces");
+
+  const guide = readFileSync(new URL("../../src/content/docs/docs/integrations/paloalto.md", import.meta.url), "utf8");
+  assert.match(guide, /checkPaloaltoAccess/, "the guide names checkPaloaltoAccess as the source of the probe counts");
+  const row = guide.split("\n").find((line) => line.startsWith("| `paloalto_check_access` |"));
+  assert.ok(row, "the tools table has a paloalto_check_access row");
+  const documented = (pattern) => {
+    const match = row.match(pattern);
+    assert.ok(match, `the row states a count and a parenthesized list matching ${pattern}`);
+    const names = match[2].split(",").map((name) => name.trim().replace(/^`|`$/g, ""));
+    assert.equal(names.length, Number(match[1]), `the documented count ${match[1]} matches the ${names.length} names listed`);
+    return { count: Number(match[1]), names };
+  };
+  const cspm = documented(/(\d+) Prisma Cloud CSPM endpoints \(([^)]+)\)/);
+  const compute = documented(/(\d+) Compute console surfaces when the console is reachable \(([^)]+)\)/);
+  assert.equal(cspm.count, reported("prisma-cloud").length, "documented Prisma Cloud CSPM probe count equals the count checkPaloaltoAccess reports");
+  assert.deepEqual(cspm.names, reported("prisma-cloud"), "documented Prisma Cloud CSPM probe names equal the names checkPaloaltoAccess reports, in order");
+  assert.equal(compute.count, reported("prisma-compute").length, "documented Compute probe count equals the count checkPaloaltoAccess reports");
+  assert.deepEqual(compute.names, reported("prisma-compute"), "documented Compute probe names equal the names checkPaloaltoAccess reports, in order");
+});
+
 test("checkPaloaltoAccess reports degraded access and single-product configuration", async () => {
   const clients = createPaloaltoClients(bothProductsConfig(), mockedFetch({ integrationsDenied: true, mgtDenied: true }));
   const result = await checkPaloaltoAccess(clients);
