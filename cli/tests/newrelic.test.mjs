@@ -31,6 +31,7 @@ import {
   projectRecord,
   resolveNewrelicConfiguration,
   resolveSecureOutputPath,
+  scrubErrorText,
 } from "../dist/extensions/grc-tools/newrelic.js";
 import { getRegisteredToolSummaries } from "../dist/pi/tool-catalog.js";
 
@@ -548,6 +549,91 @@ test("NewrelicApiClient redacts the API key from NerdGraph and transport errors"
     assert.doesNotMatch(error.message, /SUPERSECRETVALUE/);
     return true;
   });
+});
+
+const ENTITY_GUID = Buffer.from("123456|APM|APPLICATION|1234567").toString("base64");
+
+// Every credential shape rule 9 names, as [label, input, canary, expected output]. The expected text pins the
+// rule that fires (a header keeps its name, a URL keeps its origin and path, a name-value pair keeps its name).
+const SCRUB_SHAPES = [
+  ["configured credential by exact match", "rejected key NRAK-SUPERSECRETVALUE0000001 for tenant 111", "SUPERSECRETVALUE", "rejected key [REDACTED] for tenant 111"],
+  ["NRAK user key", "api key NRAK-CANARYAPIKEY7F3A9C1D0000000 rejected", "CANARYAPIKEY7F3A9C1D", "api key NRAK-[REDACTED] rejected"],
+  ["NRII ingest license key", "ingest key NRII-CANARYINGEST7f3a9c1d rejected", "CANARYINGEST7f3a9c1d", "ingest key NRII-[REDACTED] rejected"],
+  ["NRJS browser key", "browser key NRJS-canary7f3a9c1d rejected", "canary7f3a9c1d", "browser key NRJS-[REDACTED] rejected"],
+  ["NRBR browser key", "browser key NRBR-canary7f3a9c1d rejected", "canary7f3a9c1d", "browser key NRBR-[REDACTED] rejected"],
+  ["40 character hex license key in a header", "X-License-Key: cafe7f3a9c1dcafe7f3a9c1dcafe7f3a9c1dcafe", "cafe7f3a9c1dcafe7f3a9c1dcafe7f3a9c1dcafe", "X-License-Key: [REDACTED]"],
+  ["40 character hex run in free text", "license cafe7f3a9c1dcafe7f3a9c1dcafe7f3a9c1dcafe rejected", "cafe7f3a9c1dcafe7f3a9c1dcafe7f3a9c1dcafe", "license [REDACTED] rejected"],
+  ["Authorization Bearer header", "Authorization: Bearer CANARYBEARER7f3a9c1dAAAAAAAAAAAAAAAAAAAA", "CANARYBEARER7f3a9c1d", "Authorization: Bearer [REDACTED]"],
+  ["bare Bearer value", "sent Bearer CANARYBEARER7f3a9c1dAAAA upstream", "CANARYBEARER7f3a9c1dAAAA", "sent Bearer [REDACTED] upstream"],
+  ["Authorization Basic header", "Authorization: Basic Y2xpZW50LWlkOmNsaWVudC1zZWNyZXQtN2YzYTljMWQ=", "Y2xpZW50LWlkOmNsaWVudC1zZWNyZXQtN2YzYTljMWQ=", "Authorization: Basic [REDACTED]"],
+  ["Cookie header", "Cookie: NRSESSION=CANARYSESSION7f3a9c1d; theme=dark", "CANARYSESSION7f3a9c1d", "Cookie: [REDACTED]"],
+  ["Set-Cookie header", "Set-Cookie: NRSESSION=CANARYSESSION7f3a9c1d; Path=/; HttpOnly", "CANARYSESSION7f3a9c1d", "Set-Cookie: [REDACTED]"],
+  ["quoted api key pair", 'api_key="CANARYAPIKEY7f3a9c1d"', "CANARYAPIKEY7f3a9c1d", 'api_key="[REDACTED]"'],
+  ["api key pair with a space", "api key: CANARYAPIKEY7f3a9c1d", "CANARYAPIKEY7f3a9c1d", "api key: [REDACTED]"],
+  ["license key pair", "license key: CANARYLICENSE7f3a9c1d", "CANARYLICENSE7f3a9c1d", "license key: [REDACTED]"],
+  ["session id pair", "session_id=CANARYSESSION7f3a9c1d", "CANARYSESSION7f3a9c1d", "session_id=[REDACTED]"],
+  ["session pair", "session: CANARYSESSION7f3a9c1d", "CANARYSESSION7f3a9c1d", "session: [REDACTED]"],
+  ["access token pair", "access_token=CANARYACCESS7f3a9c1d", "CANARYACCESS7f3a9c1d", "access_token=[REDACTED]"],
+  ["refresh token pair", "refresh_token: CANARYREFRESH7f3a9c1d", "CANARYREFRESH7f3a9c1d", "refresh_token: [REDACTED]"],
+  ["quoted id token pair", '"id_token": "CANARYIDTOKEN7f3a9c1d"', "CANARYIDTOKEN7f3a9c1d", '"id_token": "[REDACTED]"'],
+  ["quoted client secret pair", '{"client_secret": "CANARYSECRET7f3a9c1d"}', "CANARYSECRET7f3a9c1d", '{"client_secret": "[REDACTED]"}'],
+  ["password pair", "password: hunter22seven", "hunter22seven", "password: [REDACTED]"],
+  ["single-quoted password pair", "password='hunter22seven'", "hunter22seven", "password='[REDACTED]'"],
+  ["embedded URL userinfo", "https://user:CANARYPASS7f3a@api.newrelic.com/graphql", "CANARYPASS7f3a", "https://[REDACTED]@api.newrelic.com/graphql"],
+  ["embedded URL query", "retry at https://login.newrelic.com/callback?access_token=CANARYURLTOKEN7f3a9c1d&state=x", "CANARYURLTOKEN7f3a9c1d", "retry at https://login.newrelic.com/callback?[REDACTED]"],
+  ["embedded URL fragment", "see https://one.newrelic.com/#access_token=CANARYURLTOKEN7f3a9c1d&token_type=bearer", "CANARYURLTOKEN7f3a9c1d", "see https://one.newrelic.com/#[REDACTED]"],
+  ["long token with digits in free text", "Upstream rejected request CANARYLONGTOKEN7f3a9c1dZZZZ for tenant", "CANARYLONGTOKEN7f3a9c1dZZZZ", "Upstream rejected request [REDACTED] for tenant"],
+  ["long mixed-case token in free text", "Upstream rejected request CANARYmixedTOKENxyzABC for tenant", "CANARYmixedTOKENxyzABC", "Upstream rejected request [REDACTED] for tenant"],
+];
+
+// Text that carries no credential and must come back byte for byte: query paths and statuses, account, policy, and
+// entity ids, NRQL without secrets, schema names, finding ids, timestamps, enum codes, and `token: user`.
+const SCRUB_BENIGN = [
+  "alerts.policiesSearch: account 111, account 222: NerdGraph returned errors: Not authorized (at actor.account.alerts.policiesSearch)",
+  "authorizationManagement.groups: authentication domains were not readable (userManagement.authenticationDomains: NerdGraph returned errors: Not authorized (at actor.organization.userManagement.authenticationDomains))",
+  "nrqlDropRules.list: account 4343: NerdGraph returned errors: Not authorized [SERVER_ERROR] (at actor.account.nrqlDropRules.list)",
+  "logConfigurations.obfuscationExpressions: account 111: NerdGraph request failed (502 Bad Gateway) at POST /graphql: non-JSON error body (text/html; 412 bytes)",
+  "REST API v2 request failed for GET /v2/users.json (403 Forbidden): The API key provided is invalid",
+  'Cannot query field "nextCursor" on type "ApiAccessKeySearchResult"',
+  `entity ${ENTITY_GUID} in account 1234567 (policy 98765432101)`,
+  "SELECT actorAPIKey, actorId, actorEmail, actionIdentifier, targetType, targetId, timestamp FROM NrAuditEvent WHERE actorType = 'api_key' SINCE 30 days ago LIMIT MAX",
+  "SELECT count(*) AS matchCount FROM Log WHERE message RLIKE r'(?i).*(password\\s*[:=]|passwd\\s*[:=]|secret\\s*[:=]|api[_-]?key\\s*[:=]|authorization:\\s*bearer|NRAK-[A-Z0-9]{27}|AKIA[0-9A-Z]{16}|BEGIN [A-Z ]*PRIVATE KEY).*' SINCE 1 day ago",
+  "SELECT count(*) AS logCount FROM Log SINCE 1 day ago",
+  "token: user",
+  "New Relic request timed out after 30s: https://api.newrelic.com/graphql",
+  "NR-04-API-KEY-GOVERNANCE",
+  "2026-09-21T12:00:00.000Z",
+  "PIPELINE_CLOUD_RULE HASH_SHA256 MASK SCRIPT_BROWSER",
+  "Basic users: 3, Full platform users: 12, Core users: 4",
+  "token=[a-z0-9]+ and secret=(.*) and password=\\w+",
+  "keySearch rejected the cursor argument, so only the first page was read (12 of 40 keys)",
+  "arguments:api_key environment:NEW_RELIC_API_KEY config:/home/auditor/.newrelic-sec-inspector/config.yaml",
+];
+
+test("scrubErrorText removes every credential shape and leaves query paths, ids, guids, and NRQL untouched", () => {
+  const configured = ["NRAK-SUPERSECRETVALUE0000001"];
+  for (const [label, input, canary, expected] of SCRUB_SHAPES) {
+    assert.ok(input.includes(canary), `${label}: the fixture must carry its canary`);
+    const output = scrubErrorText(input, configured);
+    assert.equal(output, expected, label);
+    assert.equal(output.includes(canary), false, `${label}: the canary survived`);
+    assert.equal(scrubErrorText(output, configured), output, `${label}: a second scrub changed the text`);
+  }
+  for (const text of SCRUB_BENIGN) {
+    assert.equal(scrubErrorText(text, configured), text, `benign text changed: ${text}`);
+    assert.equal(scrubErrorText(text, configured, { longTokens: false }), text, `benign text changed in data mode: ${text}`);
+  }
+
+  // The long-token heuristic is the only rule the data mode turns off: opaque ids survive as evidence there, while
+  // every named shape is still removed.
+  const opaqueIds = `user-q2hCJZ7bT5C-lk1NXVApFA policy 98765432101 ${ENTITY_GUID}`;
+  assert.equal(scrubErrorText(opaqueIds, [], { longTokens: false }), opaqueIds);
+  assert.equal(scrubErrorText(opaqueIds), `[REDACTED] policy 98765432101 ${ENTITY_GUID}`);
+  for (const [label, input, canary] of SCRUB_SHAPES.filter(([name]) => !name.startsWith("long"))) {
+    assert.equal(scrubErrorText(input, configured, { longTokens: false }).includes(canary), false, `${label}: the canary survived the data mode`);
+  }
+  // A configured credential shorter than eight characters is never used as a scrub key (it would match everywhere).
+  assert.equal(scrubErrorText("the word key appears here", ["key"]), "the word key appears here");
 });
 
 test("NewrelicApiClient aborts requests that exceed the configured timeout", async () => {
@@ -3068,18 +3154,32 @@ function assertStatusesMatchRequests(value, requested, label, path = "") {
   }
 }
 
-/** Runs the four assessors on a recording client and checks every evidence, summary, and core_data value with both guards. */
+/**
+ * Runs the four assessors, each on its own recording client, and checks every evidence, summary, and core_data value
+ * with both guards. The request record is scoped per assessor, so a status may only name a query the assessor that
+ * rendered it issued itself, not one another assessor happened to run in the same test. `requested` is the union.
+ */
 async function assessGuarded(client, label) {
-  const recorder = recordingClient(client);
-  const { results, findings } = await assessAll({ identity: recorder.client, accessControl: recorder.client, alerting: recorder.client, dataGovernance: recorder.client });
+  const recorders = [recordingClient(client), recordingClient(client), recordingClient(client), recordingClient(client)];
+  const [identity, accessControl, alerting, dataGovernance] = recorders.map((recorder) => recorder.client);
+  const { results, findings } = await assessAll({ identity, accessControl, alerting, dataGovernance });
+  const requested = new Set();
+  results.forEach((result, index) => {
+    const scoped = {
+      summary: result.summary,
+      evidence: result.findings.map((item) => item.evidence ?? null),
+      coreData: result.coreData,
+    };
+    assertNoFabricatedValues(scoped, `${label} (${result.category})`);
+    assertStatusesMatchRequests(scoped, recorders[index].requested, `${label} (${result.category})`);
+    for (const source of recorders[index].requested) requested.add(source);
+  });
   const rendered = {
     summaries: results.map((result) => result.summary),
     evidence: findings.map((item) => item.evidence ?? null),
     coreData: results.map((result) => result.coreData),
   };
-  assertNoFabricatedValues(rendered, label);
-  assertStatusesMatchRequests(rendered, recorder.requested, label);
-  return { results, findings, requested: recorder.requested, rendered };
+  return { results, findings, requested, rendered };
 }
 
 test("rule 1 corollary: the corollary baseline passes every pass-capable finding with no collection errors", async () => {
@@ -3991,6 +4091,279 @@ test("bundle secret hygiene: planted credentials never reach any bundle file or 
 
   const alerting = JSON.parse(fileContents.get("analysis/alerting.json"));
   assert.equal(alerting.findings.find((item) => item.control === 10).status, "pass");
+});
+
+// Rule 9, error-body class. Canaries planted in upstream error responses: the three credential shapes of a proxy
+// error page, a plain-word marker that no pattern rule can recognise (only a body that is never echoed keeps it
+// out), a tokenised URL and a long free-text token inside documented GraphQL and REST error fields, and values in
+// undocumented REST body fields.
+const ERROR_BODY_CANARIES = {
+  bearer: "CANARYBEARER7f3a9c1dAAAAAAAAAAAAAAAAAAAA",
+  session: "CANARYSESSION7f3a9c1dbbbbbbbbbbbbbbbbbbbb",
+  licenseKey: "cafe7f3a9c1dcafe7f3a9c1dcafe7f3a9c1dcafe",
+  htmlMarker: "canary-html-body-marker",
+  urlToken: "CANARYURLTOKEN7f3a9c1d",
+  longToken: "CANARYLONGTOKEN7f3a9c1dZZZZ",
+  tenantId: "9f8e7d6c5b4a39281706f5e4d3c2b1a0",
+  restDetail: "CANARYRESTDETAIL7f3a9c1d",
+};
+
+const HTML_502_BODY = [
+  `<html><body><h1>502 Bad Gateway</h1><p>${ERROR_BODY_CANARIES.htmlMarker}</p>`,
+  `<p>Authorization: Bearer ${ERROR_BODY_CANARIES.bearer}</p>`,
+  `<p>Set-Cookie: NRSESSION=${ERROR_BODY_CANARIES.session}; Path=/; HttpOnly</p>`,
+  `<p>X-License-Key: ${ERROR_BODY_CANARIES.licenseKey}</p></body></html>`,
+].join("\n");
+const HTML_502_BYTES = Buffer.byteLength(HTML_502_BODY, "utf8");
+const TOKENISED_URL = `https://login.newrelic.com/callback?access_token=${ERROR_BODY_CANARIES.urlToken}&state=x`;
+
+function htmlResponse(body, status, statusText) {
+  return new Response(body, { status, statusText, headers: { "content-type": "text/html; charset=utf-8" } });
+}
+
+function restForbidden(body) {
+  return new Response(JSON.stringify(body), { status: 403, statusText: "Forbidden", headers: { "content-type": "application/json; charset=utf-8" } });
+}
+
+// The three upstream failure shapes of the walk. `respond` answers every request the client sends (NerdGraph POSTs
+// and REST GETs); `nerdgraph` and `rest` are the whole disclosed message each consumer must carry: status, path,
+// and either the body's content type and length or the documented fields, scrubbed.
+const ERROR_BODY_SHAPES = [
+  {
+    shape: "502 text/html with bearer, session, and license key canaries",
+    respond: async () => htmlResponse(HTML_502_BODY, 502, "Bad Gateway"),
+    nerdgraph: `NerdGraph request failed (502 Bad Gateway) at POST /graphql: non-JSON error body (text/html; ${HTML_502_BYTES} bytes)`,
+    rest: `REST API v2 request failed for GET /v2/users.json (502 Bad Gateway): non-JSON error body (text/html; ${HTML_502_BYTES} bytes)`,
+  },
+  {
+    shape: "GraphQL errors[] whose message embeds a tokenised URL",
+    respond: async (_input, init = {}) => ((init.method ?? "GET").toUpperCase() === "POST"
+      ? jsonResponse({
+        data: null,
+        errors: [{ message: `Upstream rejected the request; retry at ${TOKENISED_URL}`, path: ["actor", "account", "alerts"], extensions: { errorClass: "SERVER_ERROR" } }],
+      })
+      : restForbidden({ error: { title: `Forbidden; see ${TOKENISED_URL}` } })),
+    nerdgraph: "NerdGraph returned errors: Upstream rejected the request; retry at https://login.newrelic.com/callback?[REDACTED] [SERVER_ERROR] (at actor.account.alerts)",
+    rest: "REST API v2 request failed for GET /v2/users.json (403 Forbidden): Forbidden; see https://login.newrelic.com/callback?[REDACTED]",
+  },
+  {
+    shape: "free-text errors[].message with a long token",
+    respond: async (_input, init = {}) => ((init.method ?? "GET").toUpperCase() === "POST"
+      ? jsonResponse({
+        data: null,
+        errors: [{ message: `Request ${ERROR_BODY_CANARIES.longToken} was rejected for tenant ${ERROR_BODY_CANARIES.tenantId}`, path: ["actor"] }],
+      })
+      : restForbidden({ error: { title: `Request ${ERROR_BODY_CANARIES.longToken} was rejected for tenant ${ERROR_BODY_CANARIES.tenantId}` } })),
+    nerdgraph: "NerdGraph returned errors: Request [REDACTED] was rejected for tenant [REDACTED] (at actor)",
+    rest: "REST API v2 request failed for GET /v2/users.json (403 Forbidden): Request [REDACTED] was rejected for tenant [REDACTED]",
+  },
+];
+
+// getResolvedConfig is the only surface method that sends nothing; every other one is walked.
+const WALKED_SURFACE_METHODS = NEWRELIC_CLIENT_SURFACE_METHODS.filter((method) => method !== "getResolvedConfig");
+
+/**
+ * The corollary fixture with one method routed through a real NewrelicApiClient whose every request receives the
+ * shape's response, so the failure the collectors, check_access, and the bundle see is the one the client's own
+ * constructors built. Every error the real method throws is recorded for the thrown-error assertion.
+ */
+function errorBodyWalkClient(method, shape) {
+  // resolveAccountIds only queries actor.accounts when no account ids are configured.
+  const config = sampleConfig({ accountIds: method === "resolveAccountIds" ? [] : COROLLARY_ACCOUNT_IDS });
+  const real = new NewrelicApiClient(config, { fetchImpl: shape.respond, maxRetries: 0 });
+  const thrown = [];
+  const client = {
+    ...corollaryClient(),
+    getResolvedConfig: () => config,
+    async listRestUsers() {
+      return [{ id: 1 }];
+    },
+    async [method](...args) {
+      try {
+        return await real[method](...args);
+      } catch (error) {
+        thrown.push(error);
+        throw error;
+      }
+    },
+  };
+  return { client, thrown };
+}
+
+function assertNoCanary(text, label) {
+  for (const [name, canary] of Object.entries(ERROR_BODY_CANARIES)) {
+    assert.equal(text.includes(canary), false, `${name} canary reached ${label}`);
+  }
+}
+
+test("rule 9 error-body walk: no upstream error body reaches any finding, summary, coverage note, errors array, bundle file, zip entry, or thrown error", async () => {
+  const base = createTempBase("grclanker-newrelic-error-body-walk-");
+  for (const method of WALKED_SURFACE_METHODS) {
+    for (const shape of ERROR_BODY_SHAPES) {
+      const label = `${method} with ${shape.shape}`;
+      const { client, thrown } = errorBodyWalkClient(method, shape);
+      const { results } = await assessAll({ identity: client, accessControl: client, alerting: client, dataGovernance: client });
+      const access = await checkNewrelicAccess(client);
+      const outputRoot = join(base, `${method}-${ERROR_BODY_SHAPES.indexOf(shape)}`);
+      mkdirSync(outputRoot, { mode: 0o700 });
+      const exported = await exportNewrelicAuditBundle(client, client.getResolvedConfig(), outputRoot, { now: NOW });
+      const files = listFilesRecursively(exported.outputDir).map((file) => [file, readFileSync(join(exported.outputDir, file), "utf8")]);
+      const zipEntries = [...readZipEntries(readFileSync(exported.zipPath))];
+
+      // No canary anywhere: thrown errors, then in memory (findings, summaries, coverage notes, and errors arrays of
+      // all four assessors, and check_access), then every bundle file and zip entry.
+      assert.ok(thrown.length > 0, `${label}: the walk never exercised ${method}`);
+      for (const error of thrown) assertNoCanary(error.message, `${label}: thrown error`);
+      assertNoCanary(JSON.stringify(results), `${label}: assessment results`);
+      assertNoCanary(JSON.stringify(access), `${label}: check_access result`);
+      for (const [file, content] of files) assertNoCanary(content, `${label}: bundle file ${file}`);
+      for (const [entry, content] of zipEntries) assertNoCanary(content, `${label}: zip entry ${entry}`);
+
+      // Every error the client raised is the disclosed form and nothing else.
+      const expected = method === "listRestUsers" ? shape.rest : shape.nerdgraph;
+      for (const error of thrown) {
+        assert.equal(error.message, expected, `${label}: thrown error`);
+      }
+
+      // The failure is disclosed, whole, where the consumer records errors.
+      const disclosed = [
+        ...results.flatMap((result) => result.errors),
+        ...access.surfaces.map((surface) => surface.error).filter(Boolean),
+      ];
+      assert.ok(disclosed.some((text) => text.includes(expected)), `${label}: no errors entry or surface discloses "${expected}"; saw ${JSON.stringify(disclosed)}`);
+      if (method !== "listRestUsers") {
+        const errorsLog = files.find(([file]) => file === "_errors.log");
+        assert.ok(errorsLog && errorsLog[1].includes(expected), `${label}: _errors.log does not disclose the failure`);
+      }
+    }
+  }
+});
+
+test("rule 9 REST 403 body: checkNewrelicAccess echoes only the documented error.title and describes any other body", async () => {
+  const cases = [
+    {
+      label: "documented title beside undocumented fields",
+      respond: async () => restForbidden({
+        error: { title: "The API key provided is invalid", detail: `session ${ERROR_BODY_CANARIES.session}` },
+        debug: { authorization: `Bearer ${ERROR_BODY_CANARIES.bearer}`, license: ERROR_BODY_CANARIES.licenseKey, note: ERROR_BODY_CANARIES.restDetail },
+      }),
+      expected: "REST API v2 request failed for GET /v2/users.json (403 Forbidden): The API key provided is invalid",
+    },
+    {
+      label: "documented title carrying a tokenised URL",
+      respond: async () => restForbidden({ error: { title: `Forbidden; retry at ${TOKENISED_URL}` } }),
+      expected: "REST API v2 request failed for GET /v2/users.json (403 Forbidden): Forbidden; retry at https://login.newrelic.com/callback?[REDACTED]",
+    },
+    {
+      label: "JSON body without the documented title",
+      respond: async () => restForbidden({ message: `denied ${ERROR_BODY_CANARIES.restDetail}`, session: ERROR_BODY_CANARIES.session }),
+      expected: (bytes) => `REST API v2 request failed for GET /v2/users.json (403 Forbidden): JSON error body without a documented error.title (application/json; ${bytes} bytes)`,
+      body: JSON.stringify({ message: `denied ${ERROR_BODY_CANARIES.restDetail}`, session: ERROR_BODY_CANARIES.session }),
+    },
+    {
+      label: "text/html body",
+      respond: async () => htmlResponse(HTML_502_BODY, 403, "Forbidden"),
+      expected: `REST API v2 request failed for GET /v2/users.json (403 Forbidden): non-JSON error body (text/html; ${HTML_502_BYTES} bytes)`,
+    },
+  ];
+  for (const testCase of cases) {
+    const real = new NewrelicApiClient(sampleConfig({ accountIds: COROLLARY_ACCOUNT_IDS }), { fetchImpl: testCase.respond, maxRetries: 0 });
+    const client = { ...corollaryClient(), listRestUsers: (...args) => real.listRestUsers(...args) };
+    const result = await checkNewrelicAccess(client);
+    const surface = result.surfaces.find((entry) => entry.name === "rest_v2_users");
+    const expected = typeof testCase.expected === "function" ? testCase.expected(Buffer.byteLength(testCase.body, "utf8")) : testCase.expected;
+    assert.equal(surface.status, "not_readable", testCase.label);
+    assert.equal(surface.error, expected, testCase.label);
+    assertNoCanary(JSON.stringify(result), `${testCase.label}: check_access result`);
+    assert.equal(result.status, "healthy", `${testCase.label}: the optional REST surface does not limit access`);
+  }
+});
+
+test("null standard: NR-10 unapproved_email_destinations carries the approved-domain inventory and renders null without a basis", async () => {
+  const baseline = await assessGuarded(corollaryClient(), "unapproved destinations baseline");
+  const baselineChannels = findingById(baseline, controlId(10));
+  assert.deepEqual(baselineChannels.evidence.unapproved_email_destinations, []);
+  assert.equal(baselineChannels.evidence.unapproved_email_destinations_status, "complete (aiNotifications.destinations, actor.user)");
+
+  // actor.user denied: the comparison has no approved set, so the list is null beside a status naming actor.user.
+  const userDenied = await assessGuarded(denyInventories(corollaryClient(), [["actor.user", "full"]]), "actor.user denied");
+  const deniedChannels = findingById(userDenied, controlId(10));
+  assert.equal(deniedChannels.status, "warn", deniedChannels.summary);
+  assert.equal(deniedChannels.evidence.unapproved_email_destinations, null);
+  assert.match(deniedChannels.evidence.unapproved_email_destinations_status, /^unreadable \(actor\.user: NerdGraph returned errors: Not authorized \(at actor\.user\)\)$/);
+
+  // actor.user readable but without an email domain and no option passed: the comparison never ran.
+  const noEmail = await assessGuarded(corollaryClient({
+    async getCurrentUser() {
+      return { id: "u-1", email: null, name: "Auditor" };
+    },
+  }), "actor.user without an email");
+  const noEmailChannels = findingById(noEmail, controlId(10));
+  assert.equal(noEmailChannels.evidence.approved_email_domains, null);
+  assert.equal(noEmailChannels.evidence.unapproved_email_destinations, null);
+  const undetermined = "unknown (not compared against an approved domain list: actor.user returned no email domain and approved_email_domains was not passed; inputs complete (aiNotifications.destinations, actor.user))";
+  assert.equal(noEmailChannels.evidence.unapproved_email_destinations_status, undetermined);
+  assert.equal(noEmailChannels.evidence.approved_email_domains_status, "unknown (not compared against an approved domain list: actor.user returned no email domain and approved_email_domains was not passed; inputs complete (actor.user))");
+
+  // The option supplies the basis: the comparison runs on the destination listing alone, even with actor.user denied.
+  const withOption = await assessNewrelicAlerting(denyInventories(corollaryClient(), [["actor.user", "full"]]), { approvedEmailDomains: ["example.com"] });
+  const optionChannels = findingById(withOption, controlId(10));
+  assert.deepEqual(optionChannels.evidence.unapproved_email_destinations, []);
+  assert.equal(optionChannels.evidence.unapproved_email_destinations_status, "complete (aiNotifications.destinations)");
+
+  // A destination outside the derived domain is listed when the basis exists.
+  const unapproved = await assessGuarded(corollaryClient({
+    async listNotificationDestinations(accountId) {
+      return [{ id: `dest-${accountId}`, name: `Contractor pager ${accountId}`, type: "EMAIL", properties: [{ key: "email", value: "oncall@contractor.example.net" }] }];
+    },
+  }), "unapproved destination");
+  const unapprovedChannels = findingById(unapproved, controlId(10));
+  assert.deepEqual(unapprovedChannels.evidence.unapproved_email_destinations, ["Contractor pager 111", "Contractor pager 222"]);
+  assert.equal(unapprovedChannels.evidence.unapproved_email_destinations_status, "complete (aiNotifications.destinations, actor.user)");
+  assert.equal(unapprovedChannels.status, "warn", unapprovedChannels.summary);
+});
+
+test("null standard: NR-08 cross_environment_users renders null with an unknown status when accounts cannot be classified", async () => {
+  const baseline = await assessGuarded(corollaryClient(), "cross environment baseline");
+  const baselineAccounts = findingById(baseline, controlId(8));
+  assert.deepEqual(baselineAccounts.evidence.cross_environment_users, []);
+  assert.match(baselineAccounts.evidence.cross_environment_users_status, /^complete \(.*actor\.accounts\)$/);
+  assert.equal(baseline.results[1].summary.cross_environment_users, 0);
+
+  // Names on neither side of the production boundary: the comparison never ran, so no empty list or zero stands in.
+  const unclassifiable = await assessGuarded(corollaryClient({
+    async listAccounts() {
+      return [{ id: 111, name: "Payments Alpha" }, { id: 222, name: "Payments Beta" }];
+    },
+  }), "unclassifiable accounts");
+  const unclassifiableAccounts = findingById(unclassifiable, controlId(8));
+  assert.equal(unclassifiableAccounts.status, "manual", unclassifiableAccounts.summary);
+  assert.equal(unclassifiableAccounts.evidence.cross_environment_users, null);
+  const gap = "unknown (not compared: account names did not match both the production pattern /prod/ and the non-production pattern /dev|test|stag|sandbox|qa|nonprod|non-prod|uat|demo/ (0 production, 0 non-production, 2 unclassified of 2 accounts); inputs complete (userManagement.users, authorizationManagement.groups, actor.accounts))";
+  assert.equal(unclassifiableAccounts.evidence.cross_environment_users_status, gap);
+  assert.deepEqual(unclassifiableAccounts.evidence.unclassified_accounts, ["Payments Alpha", "Payments Beta"]);
+  assert.equal(unclassifiable.results[1].summary.cross_environment_users, null);
+  assert.equal(unclassifiable.results[1].summary.cross_environment_users_status, gap);
+
+  // Every account on one side: still no comparison.
+  const productionOnly = await assessGuarded(corollaryClient({
+    async listAccounts() {
+      return [{ id: 111, name: "Payments Production" }, { id: 222, name: "Payments Production EU" }];
+    },
+  }), "production-only accounts");
+  const productionAccounts = findingById(productionOnly, controlId(8));
+  assert.equal(productionAccounts.evidence.cross_environment_users, null);
+  assert.match(productionAccounts.evidence.cross_environment_users_status, /^unknown \(not compared: .*\(2 production, 0 non-production, 0 unclassified of 2 accounts\); inputs complete \(/);
+
+  // An unreadable input outranks the classification gap: the status stays partial and names the scope and path.
+  const partialAndUnclassifiable = await assessGuarded(denyInventories(corollaryClient({
+    async listAccounts() {
+      return [{ id: 111, name: "Payments Alpha" }, { id: 222, name: "Payments Beta" }];
+    },
+  }), [["authorizationManagement.groups", "partial"]]), "unclassifiable accounts with groups denied for one domain");
+  const partialAccounts = findingById(partialAndUnclassifiable, controlId(8));
+  assert.equal(partialAccounts.evidence.cross_environment_users, null);
+  assert.match(partialAccounts.evidence.cross_environment_users_status, /^partial: 1 scope unreadable \(authorizationManagement\.groups: authentication domain Contractors: .*\(at actor\.organization\.authorizationManagement\.authenticationDomains\.groups\)\)/);
 });
 
 test("exportNewrelicAuditBundle allocates a fresh directory and zip on repeated runs", async () => {

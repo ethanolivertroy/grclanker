@@ -642,12 +642,114 @@ async function countFilesRecursively(rootDir: string): Promise<number> {
   return total;
 }
 
-function redactSecrets(message: string, apiKey?: string): string {
-  let redacted = message.replace(/NRAK-[A-Za-z0-9]{8,}/g, "NRAK-[REDACTED]");
-  if (apiKey && apiKey.length >= 8) {
-    redacted = redacted.split(apiKey).join("[REDACTED]");
+const REDACTED = "[REDACTED]";
+
+/*
+ * Error-text hygiene (rule 9, error-body class). Every error string passes through scrubErrorText at the point it is
+ * created: the NerdGraph and REST failure constructors in NewrelicApiClient, and errorMessage, the helper every
+ * collector, check_access surface, and tool handler uses to turn a thrown error into text (causeOf and compactCause
+ * only ever see text that came through it). A non-JSON response body is never echoed at all (the constructors record
+ * status, endpoint, content type, and byte length instead), so these rules guard the documented JSON error fields that
+ * are echoed (NerdGraph errors[].message, errors[].path, errors[].extensions.errorClass; REST v2 error.title) and any
+ * text assembled from them. The bundle writer applies the same rules once more to every file, without the long-token
+ * heuristic, because account ids, entity guids, and policy ids are evidence. The patterns are unanchored so a header,
+ * URL, or name-value pair embedded anywhere in free text is caught.
+ */
+// New Relic key prefixes: NRAK (user), NRII (ingest license), NRJS and NRBR (browser).
+const NEWRELIC_KEY_PATTERN = /\bNR(AK|II|JS|BR)-[A-Za-z0-9_-]{6,}/g;
+// Classic 40 character hex license and insert keys.
+const HEX40_PATTERN = /(?<![A-Za-z0-9])[A-Fa-f0-9]{40}(?![A-Za-z0-9])/g;
+const EMBEDDED_URL_USERINFO_PATTERN = /(\b[a-z][a-z0-9+.-]*:\/\/)[^\s/@"'<>]+@/gi;
+const EMBEDDED_URL_QUERY_PATTERN = /(\b[a-z][a-z0-9+.-]*:\/\/[^\s"'<>()?#]+)\?[^\s"'<>()#]*/gi;
+const EMBEDDED_URL_FRAGMENT_PATTERN = /(\b[a-z][a-z0-9+.-]*:\/\/[^\s"'<>()#]+#)[^\s"'<>()]+/gi;
+// Relative paths and bare query strings: the named parameter keeps its name, the value goes.
+const SECRET_QUERY_PARAM_PATTERN = /([?&](?:token|access_token|refresh_token|id_token|api[_-]?key|apikey|license[_-]?key|insert[_-]?key|query[_-]?key|key|secret|client_secret|password|passwd|pwd|session|session_id|sessionid|sig|signature|auth|authorization|credential)=)[^&#\s"'<>]+/gi;
+const AUTHORIZATION_HEADER_PATTERN = /\b(authorization)(["']?\s*[:=]\s*)(["']?)(Bearer|Basic|Digest|Token|OAuth|Negotiate)\s+[^\s"'<>;,]+/gi;
+const BEARER_PATTERN = /\bBearer\s+[A-Za-z0-9._~+/=-]{8,}/g;
+const BASIC_AUTH_PATTERN = /\bBasic\s+(?=[A-Za-z0-9+/=]*[0-9+/=])[A-Za-z0-9+/=]{16,}/g;
+const COOKIE_HEADER_PATTERN = /\b(set-cookie|cookie)(["']?\s*[:=]\s*)(?!\s*\[REDACTED\])[^\s<>"'][^\r\n<>"']*/gi;
+// Credential names, quoted or not, separated by ":" or "=": api key, license key, session, access, refresh, and id
+// tokens, client secret, password. The value excludes regex metacharacters so an obfuscation expression such as
+// token=[a-z0-9]+ stored as evidence is not mistaken for a credential; real tokens never contain them.
+const CREDENTIAL_ASSIGNMENT_PATTERN = /\b((?:[a-z0-9_-]*(?:token|secret|password|passwd))|(?:x-)?(?:api|license|licence|insert|query|browser|ingest|user|private)[ _-]?key|apikey|authorization|(?:nr)?session(?:[_-]?id)?|jsessionid|pwd)(["']?\s*[:=]\s*)(["']?)(?!Bearer\b|Basic\b)[^\s"'<>;,&[\](){}|\\]{6,}/gi;
+// "/" and "." are not run characters, so URL paths and dotted query paths split into their segments.
+const LONG_TOKEN_RUN_PATTERN = /[A-Za-z0-9+=_-]{16,}/g;
+// Uppercase codes (SERVER_ERROR, PIPELINE_CLOUD_RULE) and hyphenated identifiers such as finding ids
+// (NR-04-API-KEY-GOVERNANCE); an unbroken uppercase run that carries digits is still a token.
+const UPPERCASE_CODE_PATTERN = /^[A-Z][A-Z_]*$|^[A-Z][A-Z0-9]*(?:[_-][A-Z0-9]+)+$/;
+const DIGITS_ONLY_PATTERN = /^\d+$/;
+// camelCase and PascalCase schema identifiers (authenticationDomains, nrqlConditionsSearch, ApiAccessKeySearchResult).
+const CASED_IDENTIFIER_PATTERN = /^[a-z]+(?:[A-Z][a-z]+)+$|^(?:[A-Z][a-z]+){2,}$/;
+const BASE64_PATTERN = /^[A-Za-z0-9+/]+={0,2}$/;
+// An entity guid decodes to "<account id>|<domain>|<type>|<identifier>".
+const ENTITY_GUID_PLAINTEXT_PATTERN = /^\d+\|[A-Z][A-Z0-9_]*\|[A-Z][A-Z0-9_]*\|[\x20-\x7e]+$/;
+
+/** True when a base64 run decodes to the documented entity guid layout, so guids survive even in error text. */
+function isEntityGuid(run: string): boolean {
+  if (!BASE64_PATTERN.test(run)) return false;
+  return ENTITY_GUID_PLAINTEXT_PATTERN.test(Buffer.from(run, "base64").toString("utf8"));
+}
+
+/**
+ * A run of 16 or more token characters is treated as a credential when it carries a digit or mixed case, except for
+ * the shapes that are identifiers rather than secrets: uppercase codes and finding ids (SERVER_ERROR,
+ * NR-04-API-KEY-GOVERNANCE), runs of digits alone (ids and timestamps), camelCase and PascalCase schema names (the
+ * query paths every cause names), and entity guids.
+ * Arbitrary words in a response body are therefore not something this heuristic can recognise, which is why the
+ * failure constructors never echo a non-JSON body in the first place.
+ */
+function looksLikeToken(run: string): boolean {
+  if (UPPERCASE_CODE_PATTERN.test(run) || DIGITS_ONLY_PATTERN.test(run)) return false;
+  if (isEntityGuid(run)) return false;
+  if (/\d/.test(run)) return true;
+  const mixedCase = /[a-z]/.test(run) && /[A-Z]/.test(run);
+  return mixedCase && !CASED_IDENTIFIER_PATTERN.test(run);
+}
+
+export interface ScrubErrorTextOptions {
+  /**
+   * Apply the long-token heuristic. On by default because error text is the only place a bare token can arrive; the
+   * bundle writer and data values turn it off because account ids, entity guids, policy ids, and rule ids are
+   * evidence, not secrets.
+   */
+  longTokens?: boolean;
+}
+
+/**
+ * Removes credential material from free text: the configured credentials by exact match, New Relic key shapes and 40
+ * character hex keys, Authorization, Bearer, Basic, Cookie, and Set-Cookie values, credential name-value pairs, the
+ * userinfo, query, and fragment of any embedded URL, and (unless turned off) long token-like runs. Idempotent: text
+ * that has been scrubbed once comes back unchanged.
+ */
+export function scrubErrorText(text: string, secrets: string[] = [], options: ScrubErrorTextOptions = {}): string {
+  let scrubbed = text;
+  for (const secret of secrets) {
+    if (secret.length >= 8) scrubbed = scrubbed.split(secret).join(REDACTED);
   }
-  return redacted.replace(/(api-key\s*[:=]\s*)\S+/gi, "$1[REDACTED]");
+  scrubbed = scrubbed
+    .replace(EMBEDDED_URL_USERINFO_PATTERN, `$1${REDACTED}@`)
+    .replace(EMBEDDED_URL_QUERY_PATTERN, `$1?${REDACTED}`)
+    .replace(EMBEDDED_URL_FRAGMENT_PATTERN, `$1${REDACTED}`)
+    .replace(SECRET_QUERY_PARAM_PATTERN, `$1${REDACTED}`)
+    .replace(AUTHORIZATION_HEADER_PATTERN, `$1$2$3$4 ${REDACTED}`)
+    .replace(BEARER_PATTERN, `Bearer ${REDACTED}`)
+    .replace(BASIC_AUTH_PATTERN, `Basic ${REDACTED}`)
+    .replace(COOKIE_HEADER_PATTERN, `$1$2${REDACTED}`)
+    .replace(CREDENTIAL_ASSIGNMENT_PATTERN, `$1$2$3${REDACTED}`)
+    .replace(NEWRELIC_KEY_PATTERN, `NR$1-${REDACTED}`)
+    .replace(HEX40_PATTERN, REDACTED);
+  if (options.longTokens === false) return scrubbed;
+  return scrubbed.replace(LONG_TOKEN_RUN_PATTERN, (run) => (looksLikeToken(run) ? REDACTED : run));
+}
+
+/** Data values and bundle content: every rule except the long-token heuristic (see ScrubErrorTextOptions). */
+function scrubDataText(text: string, secrets: string[] = []): string {
+  return scrubErrorText(text, secrets, { longTokens: false });
+}
+
+/** The configured credential values a scrub removes by exact match. */
+function credentialValues(config: Pick<NewrelicResolvedConfig, "apiKey">): string[] {
+  return [config.apiKey].filter((value): value is string => typeof value === "string" && value.length >= 8);
 }
 
 function parseRegion(value: string | undefined): NewrelicRegion | undefined {
@@ -804,14 +906,51 @@ function isSchemaMismatchError(error: unknown): boolean {
   return /cannot query field|unknown argument|unknown field|has invalid value|is not defined|does not accept|undefined argument|undefined field|does not exist on type|field .* doesn't exist/i.test(message);
 }
 
+const SCHEMA_IDENTIFIER_PATTERN = /^[A-Za-z_][A-Za-z0-9_]*$/;
+const ERROR_CLASS_PATTERN = /^[A-Z][A-Z0-9_]{1,63}$/;
+
+/**
+ * The documented parts of a GraphQL error and nothing else: `message` (free text, scrubbed by the caller), the
+ * `extensions.errorClass` code (TIMEOUT, SERVER_ERROR, ...), and `path` reduced to schema identifiers and list
+ * indexes, so no other part of the response body is echoed.
+ */
 function nerdgraphErrorSummary(errors: unknown): string {
   return asRecords(errors)
     .map((error) => {
       const message = asString(error.message) ?? "unknown NerdGraph error";
-      const path = asArray(error.path).map((segment) => String(segment)).join(".");
-      return path ? `${message} (at ${path})` : message;
+      const errorClass = asString(asObject(error.extensions)?.errorClass);
+      const path = asArray(error.path)
+        .map((segment) => (typeof segment === "number" ? String(segment) : SCHEMA_IDENTIFIER_PATTERN.test(String(segment)) ? String(segment) : "?"))
+        .join(".");
+      const classNote = errorClass && ERROR_CLASS_PATTERN.test(errorClass) ? ` [${errorClass}]` : "";
+      return `${message}${classNote}${path ? ` (at ${path})` : ""}`;
     })
     .join("; ");
+}
+
+/** A response body parsed as a JSON object; undefined when it is empty, not JSON, or not an object. */
+function parseJsonObject(rawText: string): JsonRecord | undefined {
+  if (rawText.trim().length === 0) return undefined;
+  try {
+    return asObject(JSON.parse(rawText));
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Describes an error body that is not echoed: `non-JSON error body (text/html; 412 bytes)`, or the JSON shape that
+ * lacked the documented error fields, or `empty body`. The media type comes from the response header, not the body.
+ */
+function describeOpaqueBody(response: Response, rawText: string, description: string): string {
+  const bytes = Buffer.byteLength(rawText, "utf8");
+  if (bytes === 0) return "empty body";
+  const mediaType = (response.headers.get("content-type") ?? "").split(";")[0].trim().toLowerCase() || "unknown content type";
+  return `${description} (${mediaType}; ${bytes} bytes)`;
+}
+
+function httpStatusLabel(response: Response): string {
+  return [String(response.status), response.statusText].filter((part) => part.length > 0).join(" ");
 }
 
 /*
@@ -1459,8 +1598,17 @@ export class NewrelicApiClient {
     return this.config;
   }
 
-  private redact(message: string): string {
-    return redactSecrets(message, this.config.apiKey);
+  private scrub(message: string): string {
+    return scrubErrorText(message, credentialValues(this.config));
+  }
+
+  /**
+   * The single point where a failed exchange becomes an error: status and endpoint (or the transport failure), then
+   * either the documented error fields or a description of the body that was not echoed. Every message passes
+   * through scrub, so nothing the network or the API returned reaches a caller unscrubbed.
+   */
+  private failure(summary: string, detail: string | undefined): Error {
+    return new Error(this.scrub(detail ? `${summary}: ${detail}` : summary));
   }
 
   private async requestWithRetry(url: string, init: RequestInit): Promise<Response> {
@@ -1473,10 +1621,9 @@ export class NewrelicApiClient {
       } catch (error) {
         const aborted = controller.signal.aborted;
         const message = error instanceof Error ? error.message : String(error);
-        throw new Error(
-          aborted
-            ? `New Relic request timed out after ${Math.round(this.config.timeoutMs / 1000)}s: ${url}`
-            : `New Relic request failed: ${this.redact(message)}`,
+        throw this.failure(
+          aborted ? `New Relic request timed out after ${Math.round(this.config.timeoutMs / 1000)}s` : "New Relic request failed",
+          aborted ? url : message,
         );
       } finally {
         clearTimeout(timeout);
@@ -1502,22 +1649,19 @@ export class NewrelicApiClient {
     });
 
     const rawText = await response.text();
-    let payload: JsonRecord = {};
-    if (rawText.length > 0) {
-      try {
-        payload = asObject(JSON.parse(rawText)) ?? {};
-      } catch {
-        payload = {};
-      }
-    }
-    if (!response.ok) {
-      const detail = nerdgraphErrorSummary(payload.errors) || rawText.slice(0, 240);
-      throw new Error(this.redact(`NerdGraph request failed (${response.status} ${response.statusText})${detail ? `: ${detail}` : ""}`));
-    }
+    const parsed = parseJsonObject(rawText);
+    const payload: JsonRecord = parsed ?? {};
     const errors = asArray(payload.errors);
+    if (!response.ok) {
+      // Never the body itself: the documented errors[] fields when present, otherwise the body's type and length.
+      const detail = errors.length > 0
+        ? nerdgraphErrorSummary(errors)
+        : describeOpaqueBody(response, rawText, parsed ? "JSON error body without an errors array" : "non-JSON error body");
+      throw this.failure(`NerdGraph request failed (${httpStatusLabel(response)}) at POST ${new URL(this.config.nerdgraphUrl).pathname}`, detail);
+    }
     const data = asObject(payload.data);
     if (errors.length > 0) {
-      throw new Error(this.redact(`NerdGraph returned errors: ${nerdgraphErrorSummary(errors)}`));
+      throw this.failure("NerdGraph returned errors", nerdgraphErrorSummary(errors));
     }
     if (!data) {
       throw new Error("NerdGraph response did not include data.");
@@ -1543,7 +1687,7 @@ export class NewrelicApiClient {
       const pageObject = asObject(getNestedValue(data, pagePath));
       if (!pageObject) throw new Error(`NerdGraph response did not include ${pageLabel}.`);
       const pageError = notificationPageError(pageObject);
-      if (pageError) throw new Error(`${pageLabel} returned an error: ${pageError}`);
+      if (pageError) throw this.failure(`${pageLabel} returned an error`, pageError);
       const pageItems = asRecords(pageObject[itemsKey]);
       totalCount = asNumber(totalPath ? getNestedValue(data, totalPath) : pageObject.totalCount ?? pageObject.count) ?? totalCount;
       const kept = pageItems.slice(0, Math.max(0, limit - items.length));
@@ -1578,19 +1722,14 @@ export class NewrelicApiClient {
       },
     });
     const rawText = await response.text();
-    let payload: JsonRecord = {};
-    if (rawText.length > 0) {
-      try {
-        payload = asObject(JSON.parse(rawText)) ?? {};
-      } catch {
-        payload = {};
-      }
-    }
+    const parsed = parseJsonObject(rawText);
     if (!response.ok) {
-      const detail = asString(asObject(payload.error)?.title) ?? asString(payload.error) ?? rawText.slice(0, 240);
-      throw new Error(this.redact(`REST API v2 request failed for ${new URL(url).pathname} (${response.status} ${response.statusText})${detail ? `: ${detail}` : ""}`));
+      // Only the documented error.title is echoed (scrubbed); any other body is described by type and length.
+      const title = parsed ? asString(asObject(parsed.error)?.title) : undefined;
+      const detail = title ?? describeOpaqueBody(response, rawText, parsed ? "JSON error body without a documented error.title" : "non-JSON error body");
+      throw this.failure(`REST API v2 request failed for GET ${new URL(url).pathname} (${httpStatusLabel(response)})`, detail);
     }
-    return { payload, nextUrl: parseLinkNext(response.headers.get("link")) };
+    return { payload: parsed ?? {}, nextUrl: parseLinkNext(response.headers.get("link")) };
   }
 
   async restList(path: string, collectionKey: string, limit = DEFAULT_PAGE_LIMIT): Promise<PagedList> {
@@ -1908,7 +2047,8 @@ export class NewrelicApiClient {
     const list = asObject(getNestedValue(data, ["actor", "account", "nrqlDropRules", "list"]));
     const error = asObject(list?.error);
     if (error) {
-      throw new Error(`NRQL drop rule listing failed: ${asString(error.reason) ?? "unknown"} ${asString(error.description) ?? ""}`.trim());
+      // Documented error { reason description } fields only, through the scrubbed constructor.
+      throw this.failure("NRQL drop rule listing failed", `${asString(error.reason) ?? "unknown"} ${asString(error.description) ?? ""}`.trim());
     }
     return completeList(asRecords(list?.rules));
   }
@@ -1924,7 +2064,8 @@ export class NewrelicApiClient {
     if (!result) throw new Error("NerdGraph response did not include actor.dashboard.liveUrls.");
     const errors = asRecords(result.errors);
     if (errors.length > 0) {
-      throw new Error(`Dashboard live URL listing failed: ${errors.map((error) => asString(error.description) ?? "unknown error").join("; ")}`);
+      // Documented errors { description } only, through the scrubbed constructor.
+      throw this.failure("Dashboard live URL listing failed", errors.map((error) => asString(error.description) ?? "unknown error").join("; "));
     }
     if (!Array.isArray(result.liveUrls)) throw new Error("NerdGraph response did not include actor.dashboard.liveUrls.liveUrls.");
     return completeList(asRecords(result.liveUrls));
@@ -2236,6 +2377,17 @@ function measured(field: string, items: Inventories, value: unknown): JsonRecord
 }
 
 /**
+ * A value derived by comparing one inventory against a basis that turned out empty (no approved email domain to hold
+ * destinations against, no account classified as production or none as non-production) is not an empty result: the
+ * comparison never ran, so the field renders null beside an `unknown` status that names the missing basis and the
+ * status of the inputs. When an input was unreadable, not collected, or partly readable, that status takes precedence.
+ */
+function measuredUnlessUndetermined(field: string, items: Inventories, value: unknown, undetermined: string | undefined): JsonRecord {
+  if (undetermined === undefined || !inventoriesOf(items).every(isFullyReadable)) return measured(field, items, value);
+  return { [field]: null, [`${field}_status`]: `unknown (${undetermined}; inputs ${collectionStatus(items)})` };
+}
+
+/**
  * Records for `core_data/`: the projected rows when every scope answered, otherwise an object whose `status` names the
  * gap and whose `records` are the readable rows, or null when the query failed or was never issued, never a bare [].
  */
@@ -2430,7 +2582,7 @@ async function readableSurface(
       endpoint,
       required,
       status: "not_readable",
-      error: error instanceof Error ? error.message : String(error),
+      error: errorMessage(error),
     };
   }
 }
@@ -3259,6 +3411,11 @@ export function assessNewrelicAccessControlData(
   const productionIds = new Set(productionAccounts.map((account) => asNumber(account.id)).filter((id): id is number => id !== undefined));
   const nonproductionIds = new Set(nonproductionAccounts.map((account) => asNumber(account.id)).filter((id): id is number => id !== undefined));
   const classifiable = productionIds.size > 0 && nonproductionIds.size > 0;
+  // Without an account on each side of the production boundary the cross-environment comparison never runs, so its
+  // results render null beside a status naming the classification gap rather than as an empty list.
+  const classificationGap = classifiable
+    ? undefined
+    : `not compared: account names did not match both the production pattern /${productionPattern.source}/ and the non-production pattern /${nonproductionPattern.source}/ (${productionAccounts.length} production, ${nonproductionAccounts.length} non-production, ${unclassifiedAccounts.length} unclassified of ${accounts.length} accounts)`;
   const crossEnvironmentUsers = classifiable
     ? access.filter((entry) => {
       if (entry.admin) return false;
@@ -3509,7 +3666,7 @@ export function assessNewrelicAccessControlData(
     ...measured("production_accounts", data.accounts, sample(productionAccounts.map(accountLabel))),
     ...measured("nonproduction_accounts", data.accounts, sample(nonproductionAccounts.map(accountLabel))),
     ...measured("unclassified_accounts", data.accounts, sample(unclassifiedAccounts.map(accountLabel))),
-    ...measured("cross_environment_users", accessMap, sample(crossEnvironmentUsers.map((entry) => userLabel(entry.user)))),
+    ...measuredUnlessUndetermined("cross_environment_users", accessMap, sample(crossEnvironmentUsers.map((entry) => userLabel(entry.user))), classificationGap),
     ...measured("admin_users_excluded", adminRoster, adminUserIds.size),
     manual_evidence: "Account inventory with environment classification from Administration > Access Management > Accounts.",
   }));
@@ -3558,7 +3715,7 @@ export function assessNewrelicAccessControlData(
       ...measured("aged_user_keys", data.apiKeys, agedUserKeys.length),
       ...measured("admin_users", adminRoster, adminUserIds.size),
       ...measured("broad_access_users", adminRoster, broadAccessUsers.length),
-      ...measured("cross_environment_users", accessMap, crossEnvironmentUsers.length),
+      ...measuredUnlessUndetermined("cross_environment_users", accessMap, crossEnvironmentUsers.length, classificationGap),
       ...measured("custom_roles", data.roles, customRoles.length),
       ...measured("api_key_audit_events", data.apiKeyAuditEvents, data.apiKeyAuditEvents.data.length),
       collection_errors: accountScopeErrors(data.accountScope, allCollected).length,
@@ -3689,8 +3846,15 @@ export function assessNewrelicAlertingData(
   const approvedDomains = new Set(
     (options.approvedEmailDomains ?? []).map((domain) => domain.trim().toLowerCase().replace(/^@/, "")).filter(Boolean),
   );
+  const approvedDomainsFromOption = approvedDomains.size > 0;
   const derivedDomain = emailDomain(asString(data.currentUser.data.email));
   if (approvedDomains.size === 0 && derivedDomain) approvedDomains.add(derivedDomain);
+  // The unapproved-destination comparison rests on the destination listing and on whatever produced the approved
+  // set: the option, or actor.user. With no approved domain at all the comparison never runs.
+  const approvedDomainInputs: Array<Collected<unknown>> = approvedDomainsFromOption ? [] : [data.currentUser];
+  const approvedDomainsUndetermined = approvedDomains.size > 0
+    ? undefined
+    : "not compared against an approved domain list: actor.user returned no email domain and approved_email_domains was not passed";
 
   const emailDestinations = destinations.filter((destination) => (asString(destination.type) ?? "").toUpperCase() === "EMAIL");
   const personalEmailDestinations = emailDestinations.filter((destination) =>
@@ -3868,11 +4032,12 @@ export function assessNewrelicAlertingData(
 
   // NR-10 reads alert policies on its zero-destination and zero-workflow branches, so the policy listing is part of
   // its coverage and is disclosed with its status even on the pass path. The approved domain list is derived from
-  // actor.user unless it was passed in, so it carries that query's status.
+  // actor.user unless it was passed in, so it and the unapproved-destination comparison carry that query's status,
+  // and both render null when no approved domain exists to compare against.
   const routing = [data.destinations, data.channels, data.workflows];
-  const approvedDomainsEvidence = (options.approvedEmailDomains ?? []).length > 0
+  const approvedDomainsEvidence = approvedDomainsFromOption
     ? { approved_email_domains: [...approvedDomains], approved_email_domains_status: "complete (approved_email_domains option)" }
-    : measured("approved_email_domains", data.currentUser, [...approvedDomains]);
+    : measuredUnlessUndetermined("approved_email_domains", data.currentUser, [...approvedDomains], approvedDomainsUndetermined);
   findings.push(finding(10, limitCoverage(control10(), [...destinationCoverage, ...channelCoverage, ...workflowCoverage, ...policyCoverage]), {
     ...measured("destinations", data.destinations, destinations.length),
     ...measured("destination_types", data.destinations, destinationTypeCounts),
@@ -3884,7 +4049,12 @@ export function assessNewrelicAlertingData(
     ...approvedDomainsEvidence,
     current_user_status: collectionStatus(data.currentUser),
     ...measured("personal_email_destinations", data.destinations, sample(personalEmailDestinations.map((destination) => asString(destination.name) ?? "destination"))),
-    ...measured("unapproved_email_destinations", data.destinations, sample(unapprovedEmailDestinations.map((destination) => asString(destination.name) ?? "destination"))),
+    ...measuredUnlessUndetermined(
+      "unapproved_email_destinations",
+      [data.destinations, ...approvedDomainInputs],
+      sample(unapprovedEmailDestinations.map((destination) => asString(destination.name) ?? "destination")),
+      approvedDomainsUndetermined,
+    ),
     ...measured("destinations_routed_by_enabled_workflows", routing, routedDestinationIds.size),
     ...measured("enabled_workflows_without_resolved_destination", routing, sample(unroutedEnabledWorkflows.map((workflow) => asString(workflow.name) ?? asString(workflow.id) ?? "workflow"))),
     destination_active_state: "not read: not among the documented aiNotifications.destinations fields",
@@ -4748,8 +4918,13 @@ export async function exportNewrelicAuditBundle(
   ensurePrivateDir(outputRoot);
   const label = accountIds.length > 0 ? accountIds.join("-") : config.region.toLowerCase();
   const outputDir = await nextAvailableAuditDir(outputRoot, safeDirName(`newrelic-${label}-audit-bundle`));
+  // Second layer for every bundle file: the same scrub the failure constructors and errorMessage apply, minus the
+  // long-token heuristic (account ids, entity guids, policy and rule ids are evidence). The first layer is the
+  // constructors plus the per-record projection shapes.
+  const secrets = credentialValues(config);
+  const write = (relativePathname: string, content: string) => writeSecureTextFile(outputDir, relativePathname, scrubDataText(content, secrets));
 
-  await writeSecureTextFile(outputDir, "metadata.json", serializeJson({
+  await write("metadata.json", serializeJson({
     generated_at: new Date().toISOString(),
     region: config.region,
     nerdgraph_url: config.nerdgraphUrl,
@@ -4763,9 +4938,9 @@ export async function exportNewrelicAuditBundle(
     for (const [pathname, value] of Object.entries(assessment.coreData)) {
       if (writtenCoreData.has(pathname)) continue;
       writtenCoreData.add(pathname);
-      await writeSecureTextFile(outputDir, pathname, serializeJson(value));
+      await write(pathname, serializeJson(value));
     }
-    await writeSecureTextFile(outputDir, `analysis/${assessment.category}.json`, serializeJson({
+    await write(`analysis/${assessment.category}.json`, serializeJson({
       category: assessment.category,
       title: assessment.title,
       summary: assessment.summary,
@@ -4774,19 +4949,15 @@ export async function exportNewrelicAuditBundle(
       coverage: assessment.coverage,
     }));
   }
-  await writeSecureTextFile(outputDir, "analysis/findings.json", serializeJson(findings));
-  await writeSecureTextFile(outputDir, "compliance/executive_summary.md", buildExecutiveSummary(config, accountIds, assessments, errors));
-  await writeSecureTextFile(outputDir, "compliance/unified_compliance_matrix.md", buildUnifiedMatrix(findings));
+  await write("analysis/findings.json", serializeJson(findings));
+  await write("compliance/executive_summary.md", buildExecutiveSummary(config, accountIds, assessments, errors));
+  await write("compliance/unified_compliance_matrix.md", buildUnifiedMatrix(findings));
   for (const framework of FRAMEWORKS) {
-    await writeSecureTextFile(
-      outputDir,
-      `compliance/${framework.slug}/${framework.file}`,
-      buildFrameworkReport(framework.title, framework.label, findings),
-    );
+    await write(`compliance/${framework.slug}/${framework.file}`, buildFrameworkReport(framework.title, framework.label, findings));
   }
-  await writeSecureTextFile(outputDir, "QUICK_REFERENCE.md", buildQuickReference());
+  await write("QUICK_REFERENCE.md", buildQuickReference());
   if (errors.length > 0) {
-    await writeSecureTextFile(outputDir, "_errors.log", `${errors.join("\n")}\n`);
+    await write("_errors.log", `${errors.join("\n")}\n`);
   }
 
   const zipPath = resolveSecureOutputPath(outputRoot, `${basename(outputDir)}.zip`);
@@ -4910,8 +5081,13 @@ function createClient(args: AuthArgs): NewrelicApiClient {
   return new NewrelicApiClient(resolveNewrelicConfiguration(args));
 }
 
+/**
+ * The one error-to-string helper: collectors (so every cause that reaches an errors array, a status, or a summary
+ * through causeOf and compactCause), check_access surfaces, and tool handlers all pass thrown errors through it, so
+ * text raised outside the client's failure constructors is scrubbed too.
+ */
 function errorMessage(error: unknown): string {
-  return redactSecrets(error instanceof Error ? error.message : String(error));
+  return scrubErrorText(error instanceof Error ? error.message : String(error));
 }
 
 const authParams = {
