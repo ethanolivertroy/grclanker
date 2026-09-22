@@ -6,6 +6,7 @@ import { basename, join } from "node:path";
 import { createServer } from "node:http";
 
 import {
+  PaloaltoApiError,
   PanosApiClient,
   PrismaCloudClient,
   assessAdminAccess,
@@ -36,6 +37,7 @@ import {
   isCredentialXmlName,
   isPrimaryFinding,
   parseXml,
+  prismaSnapshotToJson,
   redactConfiguredSecrets,
   redactCredentialProperties,
   redactCredentialValueText,
@@ -1972,18 +1974,23 @@ test("error-body canary sweep: every Palo Alto surface on every device failing w
 
 // Served with status 200 in place of the documented document: an empty body, the canary
 // page an SSO portal or captive proxy hands back as a success (so a 2xx that carries
-// credentials is covered too), and a foreign JSON document (an object without any
-// documented member). PAN-OS sees the same bodies; none of them has a <response> element.
+// credentials is covered too), a foreign JSON document (an object without any documented
+// member), and a foreign JSON array (records that carry none of the documented members of
+// any surface, the shape that a list of something else takes when served as a success).
+// PAN-OS sees the same bodies; none of them has a <response> element.
+const FOREIGN_RECORDS = [{ unexpected: true }, { alsoUnexpected: "status" }];
 const SILENT_SUCCESS_SHAPES = [
   { name: "empty-200", make: (product) => new Response("", { status: 200, statusText: "OK", headers: { "content-type": product === "pan-os" ? "application/xml" : "application/json" } }) },
   { name: "html-200", make: () => htmlCanaryResponse(200) },
   { name: "foreign-json-200", make: () => jsonResponse({ ok: true, page: "status" }) },
+  { name: "foreign-array-200", make: () => jsonResponse(FOREIGN_RECORDS) },
 ];
 
 // The fixed note each product emits for a 2xx without the document, carrying the observed
 // status and the size, never the body.
+const DOCUMENTED_MEMBER_LIST = /(?:"[A-Za-z_][A-Za-z0-9_]*"(?:, )?)+/.source;
 const SILENT_SUCCESS_NOTES = {
-  "prisma-cloud": /returned status 200 with (an empty response body where the documented JSON (document|object|array) was expected|a non-JSON text\/html response body \(\d+ bytes, not echoed\) where the documented JSON (document|object|array) was expected|a JSON object response body \(\d+ bytes, not echoed\) where the documented JSON array was expected|a JSON response body without (the documented "[A-Za-z_][A-Za-z0-9_]*" (array|object|member)|any of the documented members (?:"[A-Za-z_][A-Za-z0-9_]*"(?:, )?)+) \(\d+ bytes, not echoed\))\./,
+  "prisma-cloud": new RegExp(`returned status 200 with (an empty response body where the documented JSON (document|object|array) was expected|a non-JSON text/html response body \\(\\d+ bytes, not echoed\\) where the documented JSON (document|object|array) was expected|a JSON (object|array) response body \\(\\d+ bytes, not echoed\\) where the documented JSON (document|object|array) was expected|a JSON response body without (the documented "[A-Za-z_][A-Za-z0-9_]*" (array|object|member)|any of the documented members ${DOCUMENTED_MEMBER_LIST}) \\(\\d+ bytes, not echoed\\)|a JSON array of \\d+ records none of which carries any of the documented members ${DOCUMENTED_MEMBER_LIST} \\(\\d+ bytes, not echoed\\))\\.`),
   "pan-os": /returned a non-XML (application\/xml|text\/html|application\/json) response \(status 200, \d+ bytes, not echoed\)\./,
 };
 SILENT_SUCCESS_NOTES["prisma-compute"] = SILENT_SUCCESS_NOTES["prisma-cloud"];
@@ -2082,6 +2089,185 @@ test("silent-success class: a 2xx answer without the documented JSON or XML docu
       assert.ok(dependents.length >= 1 || unprobed.has(surface), `${label}: the surface feeds at least one verdict`);
     }
   }
+});
+
+// ---------------------------------------------------------------------------
+// Silent-success class at record level: every array surface, one foreign record
+// ---------------------------------------------------------------------------
+
+// Every surface whose documented answer is a JSON array of records, with the collection
+// key its status is written under and the product half that carries it.
+const PALOALTO_ARRAY_SURFACES = [
+  ["prisma-cloud /v2/alert/rule", "alert_rules", "prisma-cloud"],
+  ["prisma-cloud /v2/alert", "open_alerts", "prisma-cloud"],
+  ["prisma-cloud /v2/policy", "policies", "prisma-cloud"],
+  ["prisma-cloud /cloud", "cloud_accounts", "prisma-cloud"],
+  ["prisma-cloud /cloud/group", "account_groups", "prisma-cloud"],
+  ["prisma-cloud /user/role", "user_roles", "prisma-cloud"],
+  ["prisma-cloud /integration", "integrations", "prisma-cloud"],
+  ["prisma-compute /defenders", "defenders", "prisma-compute"],
+  ["prisma-compute /registry", "registry_scans", "prisma-compute"],
+  ["prisma-compute /images", "images", "prisma-compute"],
+  ["prisma-compute /stats/vulnerabilities", "vulnerability_stats", "prisma-compute"],
+  ["prisma-compute /cloud/discovery", "cloud_discovery", "prisma-compute"],
+  ["prisma-compute /scans", "ci_scans", "prisma-compute"],
+];
+
+// The healthy answer of one array surface with one foreign record appended: a documented
+// list that also carries a record without any documented member.
+function mixedRecordsFetch(surface) {
+  const healthy = mockedFetch();
+  return async (input, init = {}) => {
+    const response = await healthy(input, init);
+    if (paloaltoRouteKey(input, init) !== surface) return response;
+    const body = await response.json();
+    if (surface === "prisma-cloud /v2/alert") {
+      return jsonResponse({ ...body, items: [{ id: "alert-1", status: "open", policy: { name: "AWS S3 bucket public", policyType: "network", severity: "low" } }, FOREIGN_RECORDS[0]] });
+    }
+    return jsonResponse([...body, FOREIGN_RECORDS[0]]);
+  };
+}
+
+/** The finding whose evidence names the surface's unevaluable records, by collection key. */
+function findingsNamingUnevaluable(findings, key) {
+  return findings.filter((item) => item.evidence?.unevaluable_records?.[key] !== undefined);
+}
+
+test("silent-success class at record level: a record without any documented member inside an otherwise documented array is kept out of the inventory, counted, and caps every dependent verdict at warn with the count named", async () => {
+  const statusesOf = (files) => new Map(JSON.parse(files.get(join("analysis", "findings.json"))).map((item) => [item.id, item.status]));
+  const exportFiles = async (fetchImpl, prefix) => readBundleFiles((await exportPaloaltoAuditBundle(createPaloaltoClients(sweepConfig(), fetchImpl), createTempBase(prefix))).outputDir);
+  const healthyFiles = await exportFiles(mockedFetch(), "grclanker-paloalto-records-healthy-");
+  const healthy = statusesOf(healthyFiles);
+  const refusal = () => jsonResponse({ message: "forbidden" }, { status: 403 });
+  assert.equal(PALOALTO_ARRAY_SURFACES.length, PALOALTO_SURFACES.filter((surface) => /^prisma-(cloud|compute) /.test(surface)).length - 10, "every array surface of both products is enumerated");
+
+  for (const [surface, key, product] of PALOALTO_ARRAY_SURFACES) {
+    const label = `mixed records on ${surface}`;
+    const path = surface.split(" ")[1];
+    const refused = statusesOf(await exportFiles(sweepFetch(surface, refusal), "grclanker-paloalto-records-refused-"));
+    const dependents = [...healthy.keys()].filter((id) => refused.get(id) !== healthy.get(id));
+    assert.ok(dependents.length >= 1, `${label}: the surface feeds at least one verdict`);
+
+    const { fetchImpl, requests } = recordingPaloaltoFetch(mixedRecordsFetch(surface));
+    const bundle = await exportPaloaltoAuditBundle(createPaloaltoClients(sweepConfig(), fetchImpl), createTempBase("grclanker-paloalto-records-mixed-"));
+    const files = readBundleFiles(bundle.outputDir);
+    assert.ok(requests.some((request) => request.path.endsWith(path) && request.status === 200), `${label}: the mixed answer was served`);
+    for (const [name, text] of files) assert.ok(!text.includes("unexpected"), `${label}: the foreign record reached ${name}`);
+
+    // The surface was read: it probes readable, nothing is an error, and the foreign record is counted, not inventoried.
+    const access = JSON.parse(files.get(join("core_data", "access.json")));
+    assert.equal(access.status, "healthy", `${label}: a documented list with one foreign record is still a readable surface`);
+    assert.equal(bundle.errorCount, 0, `${label}: a foreign record is a partial inventory, not a collection error`);
+    const prisma = JSON.parse(files.get(join("core_data", "prisma_cloud.json")));
+    const half = product === "prisma-cloud" ? prisma : prisma.compute;
+    const status = half.collection[key];
+    assert.equal(status.status, "ok", `${label}: collection status`);
+    assert.equal(status.unevaluable_records, 1, `${label}: the foreign record is counted in the collection status`);
+    assert.ok(Array.isArray(half[key]), `${label}: the inventory stays a list`);
+    assert.equal(status.seen, half[key].length, `${label}: seen counts the evaluated records`);
+    for (const [otherKey, other] of Object.entries(half.collection)) {
+      if (otherKey !== key && other.status === "ok") assert.equal(other.unevaluable_records, 0, `${label}: ${otherKey} counts no unevaluable record`);
+    }
+
+    // Every verdict the surface feeds is capped: pass becomes warn with the count named, harder verdicts keep their status and gain the note.
+    const findings = JSON.parse(files.get(join("analysis", "findings.json")));
+    const named = findingsNamingUnevaluable(findings, key);
+    assert.ok(named.length >= 1, `${label}: at least one finding names the unevaluable records`);
+    const note = new RegExp(`Partial inventory: .*${product} ${key.replace(/_/g, " ")}: 1 of \\d+ records carry none of the documented members \\([A-Za-z_, ]+\\) and were not evaluated`);
+    for (const item of named) {
+      assert.notEqual(item.status, "pass", `${label}: ${item.id} passed on a list with an unevaluable record`);
+      assert.equal(item.evidence.unevaluable_records[key], 1, `${label}: ${item.id} evidence count`);
+      assert.match(item.summary, note, `${label}: ${item.id} summary must name the count: ${item.summary}`);
+      assert.ok(item.evidence.partial_inventory.some((entry) => note.test(`Partial inventory: ${entry}`)), `${label}: ${item.id} partial_inventory names the surface`);
+    }
+    for (const id of dependents) {
+      const expected = healthy.get(id) === "pass" ? "warn" : healthy.get(id);
+      const item = findings.find((entry) => entry.id === id);
+      assert.equal(item.status, expected, `${label}: dependent ${id} renders ${item.status} where the healthy read renders ${healthy.get(id)}`);
+      if (item.status !== "manual") assert.ok(named.includes(item), `${label}: dependent ${id} must name the unevaluable records`);
+    }
+    for (const [id, status] of statusesOf(files)) {
+      if (!dependents.includes(id)) assert.equal(status, healthy.get(id), `${label}: ${id} is not fed by the surface and must not change`);
+    }
+  }
+});
+
+test("PA-24 cannot pass on discovery entries that report neither total nor defended resources, and an array of records without any documented member is an unreadable surface", () => {
+  const evaluable = { provider: "aws", serviceType: "eks", total: 3, defended: 3 };
+  const bare = { provider: "aws", serviceType: "lambda", region: "us-east-1" };
+  const healthy = byId(assessPrismaCompute(prismaSnapshot({ compute: computeSnapshot() })), "PA-24");
+  assert.equal(healthy.status, "pass");
+
+  const mixed = byId(assessPrismaCompute(prismaSnapshot({ compute: { ...computeSnapshot(), cloudDiscovery: [evaluable, bare] } })), "PA-24");
+  assert.equal(mixed.status, "warn");
+  assert.match(mixed.summary, /1 of 2 cloud discovery entries report neither total nor defended resources, so their coverage cannot be evaluated\./);
+  assert.equal(mixed.evidence.discovery_entries, 2);
+  assert.equal(mixed.evidence.unevaluable_entries, 1);
+  assert.deepEqual(mixed.evidence.unprotected, []);
+
+  const bareOnly = byId(assessPrismaCompute(prismaSnapshot({ compute: { ...computeSnapshot(), cloudDiscovery: [bare] } })), "PA-24");
+  assert.equal(bareOnly.status, "warn");
+  assert.match(bareOnly.summary, /1 of 1 cloud discovery entries report neither total nor defended/);
+
+  // An unprotected service still fails, and an errored bare entry names both conditions.
+  const failing = byId(assessPrismaCompute(prismaSnapshot({ compute: { ...computeSnapshot(), cloudDiscovery: [{ ...evaluable, defended: 1 }, bare] } })), "PA-24");
+  assert.equal(failing.status, "fail");
+  assert.equal(failing.evidence.unevaluable_entries, 1);
+  const errored = byId(assessPrismaCompute(prismaSnapshot({ compute: { ...computeSnapshot(), cloudDiscovery: [evaluable, { ...bare, err: "AccessDenied for token abc" }] } })), "PA-24");
+  assert.equal(errored.status, "warn");
+  assert.match(errored.summary, /neither total nor defended resources, so their coverage cannot be evaluated; 1 entries report errors\./);
+
+  // Through the collector, a record without any documented member is kept out of the
+  // inventory and capped by the gate, while an array of only such records is not a document.
+  const collectorSnapshot = { ...computeSnapshot(), unevaluable: { "cloud discovery": 1 } };
+  const gated = byId(assessPrismaCompute(prismaSnapshot({ compute: collectorSnapshot })), "PA-24");
+  assert.equal(gated.status, "warn");
+  assert.match(gated.summary, /Partial inventory: prisma-compute cloud discovery: 1 of 2 records carry none of the documented members \(provider, serviceType, total, defended, err\) and were not evaluated\./);
+  assert.deepEqual(gated.evidence.unevaluable_records, { cloud_discovery: 1 });
+  const unreadable = byId(assessPrismaCompute(prismaSnapshot({ compute: computeSnapshot({ failed: ["cloud discovery"] }) })), "PA-24");
+  assert.equal(unreadable.status, "manual");
+});
+
+test("the Prisma Cloud and Compute clients refuse a 2xx array whose records carry none of the documented members and keep the documented records of a mixed array", async () => {
+  const fetchImpl = async (input) => {
+    const url = new URL(input);
+    if (url.pathname === "/login") return jsonResponse({ token: "jwt" });
+    if (url.pathname === "/v2/policy") return jsonResponse(FOREIGN_RECORDS);
+    if (url.pathname === "/cloud") return jsonResponse([{ accountId: "111", name: "prod", enabled: true }, FOREIGN_RECORDS[0]]);
+    if (url.pathname === "/user/role") return jsonResponse(["admin", "auditor"]);
+    if (url.pathname === "/v2/alert") return jsonResponse({ items: FOREIGN_RECORDS });
+    if (url.pathname === "/api/v1/authenticate") return jsonResponse({ token: "compute-token" });
+    if (url.pathname === "/api/v1/cloud/discovery") return jsonResponse(FOREIGN_RECORDS);
+    return jsonResponse({}, { status: 404 });
+  };
+  const clients = createPaloaltoClients(bothProductsConfig(), fetchImpl);
+  const compute = new PrismaComputeClient("https://compute.example.com", clients.prisma);
+  const foreignArray = (members) => (error) => {
+    assert.ok(error instanceof PaloaltoApiError, String(error));
+    assert.equal(error.status, 200);
+    assert.match(error.message, new RegExp(`returned status 200 with a JSON array of 2 records none of which carries any of the documented members ${members} \\(\\d+ bytes, not echoed\\)\\.`));
+    assert.ok(!error.message.includes("unexpected"), error.message);
+    return true;
+  };
+  await assert.rejects(clients.prisma.listPolicies(), foreignArray('"policyId", "name", "policyType", "severity", "enabled"'));
+  await assert.rejects(clients.prisma.collectOpenAlerts(10), foreignArray('"id", "status", "policy", "alertTime", "resource"'));
+  await assert.rejects(compute.listCloudDiscovery(), foreignArray('"provider", "serviceType", "total", "defended", "err"'));
+  await assert.rejects(clients.prisma.listUserRoles(), (error) => {
+    assert.equal(error.status, 200);
+    assert.match(error.message, /a JSON array of 2 records none of which carries any of the documented members "id", "name", "roleType", "associatedUsers"/);
+    return true;
+  });
+  // The client returns a mixed array whole; the collector decides what is evaluable.
+  assert.deepEqual((await clients.prisma.listCloudAccounts()).map((account) => account.accountId ?? "foreign"), ["111", "foreign"]);
+  const snapshot = await collectPrismaSnapshot(clients.prisma, 10);
+  assert.deepEqual(snapshot.cloudAccounts.map((account) => account.accountId), ["111"]);
+  assert.deepEqual(snapshot.unevaluable, { "cloud accounts": 1 });
+  assert.ok(snapshot.failed.includes("policies") && snapshot.failed.includes("open alerts") && snapshot.failed.includes("user roles"), snapshot.failed.join(", "));
+  const json = prismaSnapshotToJson(snapshot);
+  assert.equal(json.collection.cloud_accounts.unevaluable_records, 1);
+  assert.equal(json.collection.cloud_accounts.seen, 1);
+  assert.equal(json.collection.account_groups.unevaluable_records, null);
+  assert.equal(json.collection.policies.unevaluable_records, null);
 });
 
 test("the registered tools scrub error strings end to end over HTTP: access check, every assess tool, and the export", async () => {
@@ -2257,7 +2443,24 @@ test("collectOpenAlerts reports every exit other than the cursor ending as trunc
 });
 
 test("Compute listPaged reports a stuck offset and the record cap as truncated with the reason, and PA-10 demotes", async () => {
-  const fullPage = (offset, distinct) => Array.from({ length: 50 }, (_, index) => ({ hostname: distinct ? `node-${offset + index}` : `node-${index}`, connected: true, version: "34.00.100", lastModified: "2026-09-01T00:00:00Z" }));
+  // Each paged surface is served full pages of records in its own documented shape.
+  const pagedRecord = (path, name) => {
+    switch (path) {
+      case "/api/v1/defenders":
+        return { hostname: name, connected: true, version: "34.00.100", lastModified: "2026-09-01T00:00:00Z" };
+      case "/api/v1/registry":
+        return { _id: name, repoTag: { registry: "registry.example.com", repo: name, tag: "latest" }, scanTime: "2026-09-01T00:00:00Z" };
+      case "/api/v1/images":
+        return { _id: name, scanTime: "2026-09-01T00:00:00Z", vulnerabilityDistribution: { critical: 0, high: 0 } };
+      case "/api/v1/cloud/discovery":
+        return { provider: "aws", serviceType: name, total: 1, defended: 1 };
+      case "/api/v1/scans":
+        return { _id: name, time: "2026-09-01T00:00:00Z", pass: true };
+      default:
+        throw new Error(`unexpected paged path ${path}`);
+    }
+  };
+  const fullPage = (path, offset, distinct) => Array.from({ length: 50 }, (_, index) => pagedRecord(path, distinct ? `node-${offset + index}` : `node-${index}`));
   const client = (distinct) => {
     const fetchImpl = async (input) => {
       const url = new URL(input);
@@ -2267,7 +2470,7 @@ test("Compute listPaged reports a stuck offset and the record cap as truncated w
       if (url.pathname === "/api/v1/settings/registry") return jsonResponse({ specifications: [] });
       if (url.pathname === "/api/v1/stats/compliance") return jsonResponse({ rules: [], categories: [] });
       if (url.pathname === "/api/v1/stats/vulnerabilities") return jsonResponse([]);
-      return jsonResponse(fullPage(Number(url.searchParams.get("offset")), distinct));
+      return jsonResponse(fullPage(url.pathname, Number(url.searchParams.get("offset")), distinct));
     };
     return new PrismaComputeClient("https://compute.example.com", new PrismaCloudClient({ apiUrl: "https://api2.prismacloud.io", accessKeyId: "k", secretKey: "s" }, { fetchImpl, sleepImpl: noSleep }));
   };

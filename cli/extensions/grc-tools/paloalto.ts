@@ -178,6 +178,8 @@ export interface ComputeSnapshot {
   truncated: string[];
   /** Why each entry of truncated stopped early (page cap, stuck offset). */
   truncationReasons?: Record<string, string>;
+  /** Per surface, how many collected records carried none of the documented members and were kept out of the inventory; absent only in hand-built snapshots. */
+  unevaluable?: Record<string, number>;
   errors: string[];
 }
 
@@ -210,6 +212,8 @@ export interface PrismaSnapshot {
   failures?: Record<string, PaloaltoSurfaceFailure>;
   /** The request the client issued for each surface, where it differs from the documented default (integrations is tenant-scoped once login returns a prismaId). */
   readEndpoints?: Record<string, string>;
+  /** Per surface, how many collected records carried none of the documented members and were kept out of the inventory; absent only in hand-built snapshots. */
+  unevaluable?: Record<string, number>;
   compute?: ComputeSnapshot;
   computeUnavailableReason?: string;
   /** The request that made the Compute console unreachable (CSPM /meta_info), when one was made. */
@@ -806,14 +810,19 @@ function notCollectedMarker(failure: PaloaltoSurfaceFailure, datasetStatus: Palo
   };
 }
 
-/** Collection status of one surface for assessment summaries; a surface that was not read reports null counts, never 0 or false. */
-function surfaceCollectionStatus(endpoint: string | null, failure: PaloaltoSurfaceFailure | undefined, seen: number | null, truncated: boolean | null): JsonRecord {
+/**
+ * Collection status of one surface for assessment summaries; a surface that was not read
+ * reports null counts, never 0 or false. unevaluable_records counts the collected records
+ * that carried none of the documented members and were kept out of the inventory.
+ */
+function surfaceCollectionStatus(endpoint: string | null, failure: PaloaltoSurfaceFailure | undefined, seen: number | null, truncated: boolean | null, unevaluable = 0): JsonRecord {
   return {
     status: failure ? datasetStatusOf(failure.status) : "ok",
     endpoint: failure ? failure.endpoint : endpoint,
     http_status: failure ? failure.status : null,
     seen: failure ? null : seen,
     truncated: failure ? null : truncated,
+    unevaluable_records: failure ? null : unevaluable,
     error: failure ? failure.error : null,
   };
 }
@@ -1305,6 +1314,56 @@ const COMPUTE_READ_ENDPOINTS: Record<string, string> = {
   "ci scans": "GET /api/v1/scans",
 };
 
+/**
+ * The members that identify a documented record of each list surface: the identity
+ * and status fields the verdicts read, keyed by the collector's surface label. A 2xx
+ * array whose records carry none of them is a foreign document (a portal's JSON, another
+ * API's list) and is recorded as an unreadable surface, never as an inventory; a record
+ * carrying none of them inside an otherwise documented array is unevaluable and is kept
+ * out of the inventory with its count recorded, which caps every dependent verdict.
+ */
+const DOCUMENTED_RECORD_MEMBERS: Record<string, string[]> = {
+  "alert rules": ["policyScanConfigId", "name", "enabled", "alertRuleNotificationConfig", "policies"],
+  "open alerts": ["id", "status", "policy", "alertTime", "resource"],
+  policies: ["policyId", "name", "policyType", "severity", "enabled"],
+  "cloud accounts": ["accountId", "name", "cloudType", "enabled", "status"],
+  "account groups": ["id", "name", "accountIds", "accounts"],
+  "user roles": ["id", "name", "roleType", "associatedUsers"],
+  integrations: ["id", "name", "integrationType", "enabled", "integrationConfig"],
+  defenders: ["hostname", "version", "connected", "type", "lastModified"],
+  "registry scans": ["_id", "repoTag", "scanTime", "type"],
+  images: ["_id", "repoTag", "scanTime", "vulnerabilityDistribution", "tags"],
+  "vulnerability stats": ["_id", "images", "registryImages", "containers", "hosts", "functions"],
+  "cloud discovery": ["provider", "serviceType", "total", "defended", "err"],
+  "ci scans": ["_id", "time", "pass", "type", "entityInfo"],
+};
+
+function documentedMembersOf(label: string): string[] {
+  const members = DOCUMENTED_RECORD_MEMBERS[label];
+  if (!members) throw new Error(`No documented record members are registered for the ${label} surface`);
+  return members;
+}
+
+/** Whether a record carries at least one of the members that identify a documented record of the surface. */
+function isDocumentedRecord(record: JsonRecord, members: string[]): boolean {
+  return members.some((member) => member in record);
+}
+
+/**
+ * Splits a collected list into the documented records the verdicts evaluate and the
+ * count of records that carry none of the surface's documented members.
+ */
+function partitionDocumentedRecords(label: string, records: JsonRecord[]): { records: JsonRecord[]; unevaluable: number } {
+  const members = documentedMembersOf(label);
+  const documented = records.filter((record) => isDocumentedRecord(record, members));
+  return { records: documented, unevaluable: records.length - documented.length };
+}
+
+/** The note a gate appends for records of a list surface that carry none of the documented members. */
+function unevaluableRecordsNote(product: string, label: string, unevaluable: number, evaluated: number): string {
+  return `${product} ${label}: ${unevaluable} of ${unevaluable + evaluated} records carry none of the documented members (${documentedMembersOf(label).join(", ")}) and were not evaluated`;
+}
+
 function seenCount(value: unknown): number {
   if (Array.isArray(value)) return value.length;
   if (value === undefined || value === null) return 0;
@@ -1338,6 +1397,7 @@ function computeCollectionStatus(snapshot: ComputeSnapshot): JsonRecord {
       snapshot.failed.includes(label) ? failureOf(snapshot.failures, label) : undefined,
       seenCount(value),
       snapshot.truncated.includes(label),
+      snapshot.unevaluable?.[label] ?? 0,
     ),
   ]));
 }
@@ -1397,6 +1457,7 @@ function prismaCollectionStatus(snapshot: PrismaSnapshot): JsonRecord {
       snapshot.failed.includes(label) ? failureOf(snapshot.failures, label) : undefined,
       seenCount(value),
       label === "open alerts" ? snapshot.alertsTruncated : false,
+      snapshot.unevaluable?.[label] ?? 0,
     ),
   ]));
 }
@@ -1669,7 +1730,8 @@ type DocumentExpectation =
   | { kind: "object" }
   | { kind: "array" }
   | { kind: "member"; key: string; type: "array" | "object" | "member" }
-  | { kind: "members"; keys: string[] };
+  | { kind: "members"; keys: string[] }
+  | { kind: "records"; count: number; keys: string[] };
 
 /**
  * A 2xx answer whose body is not the documented JSON document (an empty body, the HTML
@@ -1687,6 +1749,8 @@ export function describeNonDocumentBody(response: Response, rawText: string, exp
       return `${base} with a JSON response body without the documented "${expected.key}" ${expected.type} (${size})`;
     case "members":
       return `${base} with a JSON response body without any of the documented members ${expected.keys.map((key) => `"${key}"`).join(", ")} (${size})`;
+    case "records":
+      return `${base} with a JSON array of ${expected.count} records none of which carries any of the documented members ${expected.keys.map((key) => `"${key}"`).join(", ")} (${size})`;
     case "document":
       what = "the documented JSON document";
       break;
@@ -1722,11 +1786,24 @@ function nonDocumentError(document: PrismaDocument, expected: DocumentExpectatio
   return new PaloaltoApiError(redactSecrets(`${document.label} returned ${describeNonDocumentBody(document.response, document.rawText, expected)}.`, secrets), document.response.status, document.endpoint);
 }
 
+// A non-empty array (or one page of a walk) in which no record carries any of the
+// surface's documented members is a foreign document: a list of something else served
+// with a 2xx, or a list of primitives. It is thrown, never read as an inventory. Records
+// without the members inside an otherwise documented array are the collector's to count.
+function documentedRecordArray(document: PrismaDocument, value: unknown, label: string, secrets: HttpOptions["secrets"]): JsonRecord[] {
+  const entries = asArray(value);
+  const members = documentedMembersOf(label);
+  if (entries.length > 0 && !asRecords(entries).some((record) => isDocumentedRecord(record, members))) {
+    throw nonDocumentError(document, { kind: "records", count: entries.length, keys: members }, secrets);
+  }
+  return asRecords(entries);
+}
+
 // The documented answer is a JSON array of records; Compute serves null for an empty
 // collection, which is the documented empty answer. Any other value is a foreign document.
-function documentedArray(document: PrismaDocument, secrets: HttpOptions["secrets"]): JsonRecord[] {
+function documentedArray(document: PrismaDocument, label: string, secrets: HttpOptions["secrets"]): JsonRecord[] {
   if (document.value !== null && !Array.isArray(document.value)) throw nonDocumentError(document, { kind: "array" }, secrets);
-  return asRecords(document.value);
+  return documentedRecordArray(document, document.value, label, secrets);
 }
 
 // A documented object is recognised by any one of the members that identify it; an
@@ -1738,13 +1815,14 @@ function documentedObject(document: PrismaDocument, keys: string[], secrets: Htt
   return payload;
 }
 
-// The documented collection member must be present on every page, as an array or null.
-function documentedRecords(document: PrismaDocument, key: string, secrets: HttpOptions["secrets"]): { payload: JsonRecord; records: JsonRecord[] } {
+// The documented collection member must be present on every page, as an array or null,
+// and a non-empty page must carry at least one documented record of the surface.
+function documentedRecords(document: PrismaDocument, key: string, label: string, secrets: HttpOptions["secrets"]): { payload: JsonRecord; records: JsonRecord[] } {
   const payload = asObject(document.value);
   if (payload === undefined) throw nonDocumentError(document, { kind: "object" }, secrets);
   const value = payload[key];
   if (!(key in payload) || (value !== null && !Array.isArray(value))) throw nonDocumentError(document, { kind: "member", key, type: "array" }, secrets);
-  return { payload, records: asRecords(value) };
+  return { payload, records: documentedRecordArray(document, value, label, secrets) };
 }
 
 // Prisma Cloud's documented error fields: the x-redlock-status header (a JSON array of
@@ -1911,9 +1989,9 @@ export class PrismaCloudClient {
     return this.requestDocument("GET", path, query);
   }
 
-  // A read whose documented answer is a JSON array of records.
-  private async getList(path: string): Promise<JsonRecord[]> {
-    return documentedArray(await this.getDocument(path), this.http.secrets);
+  // A read whose documented answer is a JSON array of records of the named surface.
+  private async getList(path: string, label: string): Promise<JsonRecord[]> {
+    return documentedArray(await this.getDocument(path), label, this.http.secrets);
   }
 
   async getCompliancePosture(): Promise<JsonRecord> {
@@ -1921,7 +1999,7 @@ export class PrismaCloudClient {
   }
 
   async listAlertRules(): Promise<JsonRecord[]> {
-    return this.getList("/v2/alert/rule");
+    return this.getList("/v2/alert/rule", "alert rules");
   }
 
   /**
@@ -1948,7 +2026,7 @@ export class PrismaCloudClient {
         detailed: "true",
         limit: Math.min(DEFAULT_ALERT_PAGE_SIZE, Math.max(limit - items.length, 1)),
         pageToken,
-      }), "items", this.http.secrets);
+      }), "items", "open alerts", this.http.secrets);
       totalRows = asNumber(payload.totalRows) ?? totalRows;
       const room = Math.max(limit - items.length, 0);
       items.push(...pageItems.slice(0, room));
@@ -1984,19 +2062,19 @@ export class PrismaCloudClient {
   }
 
   async listPolicies(): Promise<JsonRecord[]> {
-    return this.getList("/v2/policy");
+    return this.getList("/v2/policy", "policies");
   }
 
   async listCloudAccounts(): Promise<JsonRecord[]> {
-    return this.getList("/cloud");
+    return this.getList("/cloud", "cloud accounts");
   }
 
   async listAccountGroups(): Promise<JsonRecord[]> {
-    return this.getList("/cloud/group");
+    return this.getList("/cloud/group", "account groups");
   }
 
   async listUserRoles(): Promise<JsonRecord[]> {
-    return this.getList("/user/role");
+    return this.getList("/user/role", "user roles");
   }
 
   /**
@@ -2007,8 +2085,8 @@ export class PrismaCloudClient {
    */
   async listIntegrations(): Promise<JsonRecord[]> {
     await this.getToken();
-    if (this.prismaId) return this.getList(`/api/v1/tenant/${encodeURIComponent(this.prismaId)}/integration`);
-    return this.getList("/integration");
+    if (this.prismaId) return this.getList(`/api/v1/tenant/${encodeURIComponent(this.prismaId)}/integration`, "integrations");
+    return this.getList("/integration", "integrations");
   }
 
   get tenantPrismaId(): string | undefined {
@@ -2086,9 +2164,9 @@ export class PrismaComputeClient {
     return document;
   }
 
-  // A read whose documented answer is a JSON array of records (or null when empty).
-  private async getList(path: string): Promise<JsonRecord[]> {
-    return documentedArray(await this.getDocument(path), this.http.secrets);
+  // A read whose documented answer is a JSON array of records of the named surface (or null when empty).
+  private async getList(path: string, label: string): Promise<JsonRecord[]> {
+    return documentedArray(await this.getDocument(path), label, this.http.secrets);
   }
 
   // A read whose documented answer is the JSON object identified by any of the keys.
@@ -2101,12 +2179,12 @@ export class PrismaComputeClient {
    * again means the console ignored the offset (stuck offset); that and the
    * record cap both end the walk as truncated with the reason recorded.
    */
-  async listPaged(path: string, limit: number): Promise<PagedResult> {
+  async listPaged(path: string, label: string, limit: number): Promise<PagedResult> {
     const items: JsonRecord[] = [];
     let offset = 0;
     let previousSignature: string | undefined;
     for (;;) {
-      const page = documentedArray(await this.getDocument(path, { limit: DEFAULT_COMPUTE_PAGE_SIZE, offset }), this.http.secrets);
+      const page = documentedArray(await this.getDocument(path, { limit: DEFAULT_COMPUTE_PAGE_SIZE, offset }), label, this.http.secrets);
       const signature = page.length > 0 ? JSON.stringify(page[0]) : undefined;
       if (signature !== undefined && signature === previousSignature) {
         return { items, truncated: true, truncationReason: `GET /api/v1${path} returned the same page for offset ${offset} as for the previous offset (stuck offset), so the remaining records were not read` };
@@ -2130,7 +2208,7 @@ export class PrismaComputeClient {
   }
 
   async listDefenders(limit = DEFAULT_COMPUTE_LIMIT): Promise<PagedResult> {
-    return this.listPaged("/defenders", limit);
+    return this.listPaged("/defenders", "defenders", limit);
   }
 
   async getRuntimeContainerPolicy(): Promise<JsonRecord> {
@@ -2154,15 +2232,15 @@ export class PrismaComputeClient {
   }
 
   async listRegistryScans(limit = DEFAULT_COMPUTE_LIMIT): Promise<PagedResult> {
-    return this.listPaged("/registry", limit);
+    return this.listPaged("/registry", "registry scans", limit);
   }
 
   async listImages(limit = DEFAULT_COMPUTE_LIMIT): Promise<PagedResult> {
-    return this.listPaged("/images", limit);
+    return this.listPaged("/images", "images", limit);
   }
 
   async getVulnerabilityStats(): Promise<JsonRecord[]> {
-    return this.getList("/stats/vulnerabilities");
+    return this.getList("/stats/vulnerabilities", "vulnerability stats");
   }
 
   async getComplianceStats(): Promise<JsonRecord> {
@@ -2170,11 +2248,11 @@ export class PrismaComputeClient {
   }
 
   async listCloudDiscovery(limit = DEFAULT_COMPUTE_LIMIT): Promise<PagedResult> {
-    return this.listPaged("/cloud/discovery", limit);
+    return this.listPaged("/cloud/discovery", "cloud discovery", limit);
   }
 
   async listCiScans(limit = DEFAULT_COMPUTE_LIMIT): Promise<PagedResult> {
-    return this.listPaged("/scans", limit);
+    return this.listPaged("/scans", "ci scans", limit);
   }
 }
 
@@ -2431,6 +2509,7 @@ export async function collectComputeSnapshot(client: ComputeSource): Promise<Com
   const failures: Record<string, PaloaltoSurfaceFailure> = {};
   const truncated: string[] = [];
   const truncationReasons: Record<string, string> = {};
+  const unevaluable: Record<string, number> = {};
   const guard = async <T>(label: string, fallback: T, load: () => Promise<T>): Promise<T> => {
     try {
       return redactCredentialProperties(await load());
@@ -2441,13 +2520,21 @@ export async function collectComputeSnapshot(client: ComputeSource): Promise<Com
       return fallback;
     }
   };
+  // Records without any documented member never enter the inventory; their count is kept
+  // per surface so every dependent verdict is capped with the count named.
+  const documented = (label: string, records: JsonRecord[]): JsonRecord[] => {
+    const partition = partitionDocumentedRecords(label, records);
+    if (partition.unevaluable > 0) unevaluable[label] = partition.unevaluable;
+    return partition.records;
+  };
+  const list = async (label: string, load: () => Promise<JsonRecord[]>): Promise<JsonRecord[]> => documented(label, await guard(label, [] as JsonRecord[], load));
   const paged = async (label: string, load: () => Promise<PagedResult>): Promise<JsonRecord[]> => {
     const result = await guard(label, { items: [] as JsonRecord[], truncated: false } as PagedResult, load);
     if (result.truncated) {
       truncated.push(label);
       truncationReasons[label] = result.truncationReason ?? `capped at ${DEFAULT_COMPUTE_LIMIT} records`;
     }
-    return result.items;
+    return documented(label, result.items);
   };
   const defenders = await paged("defenders", () => client.listDefenders());
   const runtimeContainerPolicy = await guard("runtime container policy", {} as JsonRecord, () => client.getRuntimeContainerPolicy());
@@ -2457,7 +2544,7 @@ export async function collectComputeSnapshot(client: ComputeSource): Promise<Com
   const registrySettings = await guard("registry settings", {} as JsonRecord, () => client.getRegistrySettings());
   const registryScans = await paged("registry scans", () => client.listRegistryScans());
   const images = await paged("images", () => client.listImages());
-  const vulnerabilityStats = await guard("vulnerability stats", [] as JsonRecord[], () => client.getVulnerabilityStats());
+  const vulnerabilityStats = await list("vulnerability stats", () => client.getVulnerabilityStats());
   const complianceStats = await guard("compliance stats", {} as JsonRecord, () => client.getComplianceStats());
   const cloudDiscovery = await paged("cloud discovery", () => client.listCloudDiscovery());
   const ciScans = await paged("ci scans", () => client.listCiScans());
@@ -2479,6 +2566,7 @@ export async function collectComputeSnapshot(client: ComputeSource): Promise<Com
     failures,
     truncated,
     truncationReasons,
+    unevaluable,
     errors,
   };
 }
@@ -2499,6 +2587,7 @@ export async function collectPrismaSnapshot(
   const errors: string[] = [];
   const failed: string[] = [];
   const failures: Record<string, PaloaltoSurfaceFailure> = {};
+  const unevaluable: Record<string, number> = {};
   const guard = async <T>(label: string, fallback: T, load: () => Promise<T>): Promise<T> => {
     try {
       return redactCredentialProperties(await load());
@@ -2509,14 +2598,23 @@ export async function collectPrismaSnapshot(
       return fallback;
     }
   };
+  // Records without any documented member never enter the inventory; their count is kept
+  // per surface so every dependent verdict is capped with the count named.
+  const documented = (label: string, records: JsonRecord[]): JsonRecord[] => {
+    const partition = partitionDocumentedRecords(label, records);
+    if (partition.unevaluable > 0) unevaluable[label] = partition.unevaluable;
+    return partition.records;
+  };
+  const list = async (label: string, load: () => Promise<JsonRecord[]>): Promise<JsonRecord[]> => documented(label, await guard(label, [] as JsonRecord[], load));
   const posture = await guard("compliance posture", undefined as JsonRecord | undefined, () => client.getCompliancePosture());
-  const alertRules = await guard("alert rules", [] as JsonRecord[], () => client.listAlertRules());
+  const alertRules = await list("alert rules", () => client.listAlertRules());
   const alertPage = await guard("open alerts", { items: [] as JsonRecord[], truncated: false } as AlertPage, () => client.collectOpenAlerts(alertLimit));
-  const policies = await guard("policies", [] as JsonRecord[], () => client.listPolicies());
-  const cloudAccounts = await guard("cloud accounts", [] as JsonRecord[], () => client.listCloudAccounts());
-  const accountGroups = await guard("account groups", [] as JsonRecord[], () => client.listAccountGroups());
-  const userRoles = await guard("user roles", [] as JsonRecord[], () => client.listUserRoles());
-  const integrations = await guard("integrations", [] as JsonRecord[], () => client.listIntegrations());
+  const alerts = documented("open alerts", alertPage.items);
+  const policies = await list("policies", () => client.listPolicies());
+  const cloudAccounts = await list("cloud accounts", () => client.listCloudAccounts());
+  const accountGroups = await list("account groups", () => client.listAccountGroups());
+  const userRoles = await list("user roles", () => client.listUserRoles());
+  const integrations = await list("integrations", () => client.listIntegrations());
   const computeSnapshot = compute?.client ? await collectComputeSnapshot(compute.client) : undefined;
   if (computeSnapshot) errors.push(...computeSnapshot.errors);
   else if (compute?.unavailableReason) errors.push(`prisma-compute: ${compute.unavailableReason}`);
@@ -2524,7 +2622,7 @@ export async function collectPrismaSnapshot(
   return {
     posture,
     alertRules,
-    alerts: alertPage.items,
+    alerts,
     // No walk happened when the read failed, so it was neither complete nor truncated.
     alertsTruncated: alertsRead ? alertPage.truncated : null,
     alertsTruncationReason: alertsRead ? alertPage.truncationReason : undefined,
@@ -2538,6 +2636,7 @@ export async function collectPrismaSnapshot(
     failures,
     // Read after the integrations call so the tenant id learned at login is reflected.
     readEndpoints: { integrations: prismaIntegrationsEndpoint(client.tenantPrismaId) },
+    unevaluable,
     compute: computeSnapshot,
     computeUnavailableReason: computeSnapshot ? undefined : compute?.unavailableReason,
     computeUnavailableFailure: computeSnapshot ? undefined : compute?.unavailableFailure,
@@ -2623,11 +2722,14 @@ export async function loadPrismaSnapshot(clients: PaloaltoClients, alertLimit = 
 interface EvidenceGate {
   unreadable: string[];
   partial: string[];
+  /** Per surface the finding reads, the collected records that carried none of the documented members. */
+  unevaluable?: Record<string, number>;
 }
 
 /**
  * Applies the verdict-safety rules: unreadable evidence forces manual,
- * partial inventories cap the verdict at warn.
+ * partial inventories (a truncated walk, or records that carried none of the
+ * documented members and could not be evaluated) cap the verdict at warn.
  */
 function gate(result: PaloaltoFinding, gateInfo: EvidenceGate, evidenceInstruction: string): PaloaltoFinding {
   if (gateInfo.unreadable.length > 0) {
@@ -2639,14 +2741,64 @@ function gate(result: PaloaltoFinding, gateInfo: EvidenceGate, evidenceInstructi
     };
   }
   if (gateInfo.partial.length > 0) {
+    const unevaluable = gateInfo.unevaluable && Object.keys(gateInfo.unevaluable).length > 0 ? { unevaluable_records: gateInfo.unevaluable } : {};
     return {
       ...result,
       status: result.status === "pass" ? "warn" : result.status,
       summary: `${result.summary} Partial inventory: ${gateInfo.partial.join("; ")}.`,
-      evidence: { ...(result.evidence ?? {}), partial_inventory: gateInfo.partial },
+      evidence: { ...(result.evidence ?? {}), partial_inventory: gateInfo.partial, ...unevaluable },
     };
   }
   return result;
+}
+
+/** The unevaluable-record entries of a snapshot for the named surfaces, as gate notes and as counts keyed by surface. */
+function unevaluableGate(product: string, snapshot: { unevaluable?: Record<string, number>; failed: string[] }, surfaces: string[], evaluated: (surface: string) => number): Pick<EvidenceGate, "partial" | "unevaluable"> {
+  const affected = surfaces.filter((surface) => (snapshot.unevaluable?.[surface] ?? 0) > 0 && !snapshot.failed.includes(surface));
+  return {
+    partial: affected.map((surface) => unevaluableRecordsNote(product, surface, snapshot.unevaluable?.[surface] ?? 0, evaluated(surface))),
+    unevaluable: Object.fromEntries(affected.map((surface) => [snakeCase(surface), snapshot.unevaluable?.[surface] ?? 0])),
+  };
+}
+
+function prismaSurfaceRecords(snapshot: PrismaSnapshot, surface: string): JsonRecord[] {
+  switch (surface) {
+    case "alert rules":
+      return snapshot.alertRules;
+    case "open alerts":
+      return snapshot.alerts;
+    case "policies":
+      return snapshot.policies;
+    case "cloud accounts":
+      return snapshot.cloudAccounts;
+    case "account groups":
+      return snapshot.accountGroups;
+    case "user roles":
+      return snapshot.userRoles;
+    case "integrations":
+      return snapshot.integrations;
+    default:
+      return [];
+  }
+}
+
+function computeSurfaceRecords(snapshot: ComputeSnapshot, surface: string): JsonRecord[] {
+  switch (surface) {
+    case "defenders":
+      return snapshot.defenders;
+    case "registry scans":
+      return snapshot.registryScans;
+    case "images":
+      return snapshot.images;
+    case "vulnerability stats":
+      return snapshot.vulnerabilityStats;
+    case "cloud discovery":
+      return snapshot.cloudDiscovery;
+    case "ci scans":
+      return snapshot.ciScans;
+    default:
+      return [];
+  }
 }
 
 function prismaGate(snapshot: PrismaSnapshot, surfaces: string[]): EvidenceGate {
@@ -2656,18 +2808,24 @@ function prismaGate(snapshot: PrismaSnapshot, surfaces: string[]): EvidenceGate 
     const reach = `${snapshot.alerts.length}${snapshot.alertsTotal !== undefined ? ` of ${snapshot.alertsTotal}` : ""}`;
     partial.push(`open alerts truncated at ${reach} (${snapshot.alertsTruncationReason ?? "raise alert_limit"})`);
   }
-  return { unreadable, partial };
+  const unevaluable = unevaluableGate("prisma-cloud", snapshot, surfaces, (surface) => prismaSurfaceRecords(snapshot, surface).length);
+  return { unreadable, partial: [...partial, ...unevaluable.partial], unevaluable: unevaluable.unevaluable };
 }
 
 function computeGate(snapshot: ComputeSnapshot, surfaces: string[]): EvidenceGate {
+  const unevaluable = unevaluableGate("prisma-compute", snapshot, surfaces, (surface) => computeSurfaceRecords(snapshot, surface).length);
   return {
     unreadable: surfaces.filter((surface) => snapshot.failed.includes(surface)).map((surface) => `prisma-compute ${surface} unreadable`),
-    partial: surfaces
-      .filter((surface) => snapshot.truncated.includes(surface) && !snapshot.failed.includes(surface))
-      .map((surface) => {
-        const reason = snapshot.truncationReasons?.[surface];
-        return reason ? `prisma-compute ${surface} truncated (${reason})` : `prisma-compute ${surface} truncated at ${DEFAULT_COMPUTE_LIMIT} records`;
-      }),
+    partial: [
+      ...surfaces
+        .filter((surface) => snapshot.truncated.includes(surface) && !snapshot.failed.includes(surface))
+        .map((surface) => {
+          const reason = snapshot.truncationReasons?.[surface];
+          return reason ? `prisma-compute ${surface} truncated (${reason})` : `prisma-compute ${surface} truncated at ${DEFAULT_COMPUTE_LIMIT} records`;
+        }),
+      ...unevaluable.partial,
+    ],
+    unevaluable: unevaluable.unevaluable,
   };
 }
 
@@ -2702,6 +2860,7 @@ function mergeGates(...gates: Array<EvidenceGate | undefined>): EvidenceGate {
   return {
     unreadable: gates.flatMap((item) => item?.unreadable ?? []),
     partial: gates.flatMap((item) => item?.partial ?? []),
+    unevaluable: Object.assign({}, ...gates.map((item) => item?.unevaluable ?? {})) as Record<string, number>,
   };
 }
 
@@ -3193,21 +3352,28 @@ export function assessPrismaCompute(snapshot: PrismaSnapshot | undefined): Paloa
     },
   ), computeGate(compute, ["registry settings", "registry scans"]), CWPP_EVIDENCE[4].instruction));
 
-  const unprotected = compute.cloudDiscovery.filter((entry) => (asNumber(entry.total) ?? 0) > (asNumber(entry.defended) ?? 0));
+  // An entry that reports neither total nor defended carries nothing the coverage
+  // comparison can read, so it is unevaluable: it can never count as covered.
+  const evaluableDiscovery = compute.cloudDiscovery.filter((entry) => asNumber(entry.total) !== undefined || asNumber(entry.defended) !== undefined);
+  const unevaluableDiscovery = compute.cloudDiscovery.length - evaluableDiscovery.length;
+  const unprotected = evaluableDiscovery.filter((entry) => (asNumber(entry.total) ?? 0) > (asNumber(entry.defended) ?? 0));
   const discoveryErrors = compute.cloudDiscovery.filter((entry) => asString(entry.err));
   findings.push(gate(finding(
     24,
     "medium",
-    compute.cloudDiscovery.length === 0 ? "manual" : unprotected.length > 0 ? "fail" : discoveryErrors.length > 0 ? "warn" : "pass",
+    compute.cloudDiscovery.length === 0 ? "manual" : unprotected.length > 0 ? "fail" : unevaluableDiscovery > 0 || discoveryErrors.length > 0 ? "warn" : "pass",
     compute.cloudDiscovery.length === 0
       ? "Zero cloud discovery results were returned; treated as manual because discovery requires cloud account credentials in Compute. Manual evidence required: configure cloud discovery and export Radars > Cloud."
       : unprotected.length > 0
         ? `${unprotected.length} discovered cloud services report more total resources than defended ones.`
-        : discoveryErrors.length > 0
-          ? `${discoveryErrors.length} cloud discovery entries report errors, so coverage is uncertain.`
-          : `${compute.cloudDiscovery.length} cloud discovery entries all report total resources equal to defended resources.`,
+        : unevaluableDiscovery > 0
+          ? `${unevaluableDiscovery} of ${compute.cloudDiscovery.length} cloud discovery entries report neither total nor defended resources, so their coverage cannot be evaluated${discoveryErrors.length > 0 ? `; ${discoveryErrors.length} entries report errors` : ""}.`
+          : discoveryErrors.length > 0
+            ? `${discoveryErrors.length} cloud discovery entries report errors, so coverage is uncertain.`
+            : `${compute.cloudDiscovery.length} cloud discovery entries all report total resources equal to defended resources.`,
     {
       discovery_entries: nullUnless(readable("cloud discovery"), compute.cloudDiscovery.length),
+      unevaluable_entries: nullUnless(readable("cloud discovery"), unevaluableDiscovery),
       unprotected: nullUnless(readable("cloud discovery"), unprotected.map((entry) => `${asString(entry.provider)}/${asString(entry.serviceType)}: ${asNumber(entry.defended) ?? 0}/${asNumber(entry.total) ?? 0}`).slice(0, 25)),
       errors: nullUnless(readable("cloud discovery"), discoveryErrors.map((entry) => redactErrorText(asString(entry.err) ?? "")).slice(0, 10)),
     },
