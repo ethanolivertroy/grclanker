@@ -207,6 +207,8 @@ export interface PrismaSnapshot {
   failed: string[];
   /** Failure detail per entry of failed; absent only in hand-built snapshots. */
   failures?: Record<string, PaloaltoSurfaceFailure>;
+  /** The request the client issued for each surface, where it differs from the documented default (integrations is tenant-scoped once login returns a prismaId). */
+  readEndpoints?: Record<string, string>;
   compute?: ComputeSnapshot;
   computeUnavailableReason?: string;
   /** The request that made the Compute console unreachable (CSPM /meta_info), when one was made. */
@@ -962,7 +964,12 @@ export function panosSnapshotToJson(snapshot: PanosDeviceSnapshot): JsonRecord {
   };
 }
 
-/** The documented request behind each CSPM read, keyed by the collector's surface label. */
+/** The integrations request the client issues: tenant-scoped once login has returned a prismaId, the legacy path otherwise. */
+function prismaIntegrationsEndpoint(prismaId: string | undefined): string {
+  return prismaId ? `GET /api/v1/tenant/${encodeURIComponent(prismaId)}/integration` : "GET /integration";
+}
+
+/** The request behind each CSPM read, keyed by the collector's surface label, as issued when login returned no prismaId. */
 const PRISMA_READ_ENDPOINTS: Record<string, string> = {
   "compliance posture": "GET /v2/compliance/posture",
   "alert rules": "GET /v2/alert/rule",
@@ -971,7 +978,7 @@ const PRISMA_READ_ENDPOINTS: Record<string, string> = {
   "cloud accounts": "GET /cloud",
   "account groups": "GET /cloud/group",
   "user roles": "GET /user/role",
-  integrations: "GET /api/v1/tenant/{prismaId}/integration",
+  integrations: prismaIntegrationsEndpoint(undefined),
 };
 
 /** The documented request behind each Compute read, keyed by the collector's surface label. */
@@ -1078,7 +1085,7 @@ function prismaCollectionStatus(snapshot: PrismaSnapshot): JsonRecord {
   return Object.fromEntries(Object.entries(values).map(([label, value]) => [
     snakeCase(label),
     surfaceCollectionStatus(
-      PRISMA_READ_ENDPOINTS[label] ?? null,
+      snapshot.readEndpoints?.[label] ?? PRISMA_READ_ENDPOINTS[label] ?? null,
       snapshot.failed.includes(label) ? failureOf(snapshot.failures, label) : undefined,
       seenCount(value),
       label === "open alerts" ? snapshot.alertsTruncated : false,
@@ -2015,7 +2022,7 @@ export async function collectComputeSnapshot(client: ComputeSource): Promise<Com
   };
 }
 
-type PrismaSource = Pick<PrismaCloudClient, "getCompliancePosture" | "listAlertRules" | "collectOpenAlerts" | "listPolicies" | "listCloudAccounts" | "listAccountGroups" | "listUserRoles" | "listIntegrations">;
+type PrismaSource = Pick<PrismaCloudClient, "getCompliancePosture" | "listAlertRules" | "collectOpenAlerts" | "listPolicies" | "listCloudAccounts" | "listAccountGroups" | "listUserRoles" | "listIntegrations"> & Partial<Pick<PrismaCloudClient, "tenantPrismaId">>;
 
 /**
  * Every CSPM payload is redacted as it is collected: integrations[]
@@ -2068,6 +2075,8 @@ export async function collectPrismaSnapshot(
     integrations,
     failed,
     failures,
+    // Read after the integrations call so the tenant id learned at login is reflected.
+    readEndpoints: { integrations: prismaIntegrationsEndpoint(client.tenantPrismaId) },
     compute: computeSnapshot,
     computeUnavailableReason: computeSnapshot ? undefined : compute?.unavailableReason,
     computeUnavailableFailure: computeSnapshot ? undefined : compute?.unavailableFailure,
@@ -3425,7 +3434,8 @@ export async function checkPaloaltoAccess(clients: PaloaltoClients): Promise<Pal
       await readableSurface("prisma-cloud", prisma.apiUrl, "cloud_accounts", PRISMA_READ_ENDPOINTS["cloud accounts"], () => prisma.listCloudAccounts(), arrayCount),
       await readableSurface("prisma-cloud", prisma.apiUrl, "account_groups", PRISMA_READ_ENDPOINTS["account groups"], () => prisma.listAccountGroups(), arrayCount),
       await readableSurface("prisma-cloud", prisma.apiUrl, "user_roles", PRISMA_READ_ENDPOINTS["user roles"], () => prisma.listUserRoles(), arrayCount),
-      await readableSurface("prisma-cloud", prisma.apiUrl, "integrations", PRISMA_READ_ENDPOINTS.integrations, () => prisma.listIntegrations(), arrayCount),
+      // Evaluated after the probes above logged in, so the tenant-scoped path is named when login returned a prismaId.
+      await readableSurface("prisma-cloud", prisma.apiUrl, "integrations", prismaIntegrationsEndpoint(prisma.tenantPrismaId), () => prisma.listIntegrations(), arrayCount),
     );
     const compute = await resolveComputeClient(clients);
     if (compute) {

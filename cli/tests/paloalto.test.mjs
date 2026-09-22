@@ -732,6 +732,7 @@ function mockedFetch(options = {}) {
       if (url.pathname === "/v2/compliance/posture") return partial ? jsonResponse({}, { status: 403 }) : jsonResponse(prismaSnapshot().posture);
       if (url.pathname === "/v2/alert/rule") return jsonResponse(prismaSnapshot().alertRules);
       if (url.pathname === "/v2/alert") {
+        if (options.alertsDenied) return new Response("<html><body>502 Bad Gateway</body></html>", { status: 502, headers: { "content-type": "text/html" } });
         if (partial) return jsonResponse({ items: [{ policy: { name: "AWS S3 bucket public", policyType: "network", severity: "low" } }], nextPageToken: `next-${url.searchParams.get("pageToken") ?? "0"}`, totalRows: 5000 });
         return jsonResponse({ items: [] });
       }
@@ -755,7 +756,7 @@ function mockedFetch(options = {}) {
       if (path === "/policies/compliance/container") return jsonResponse(compute.complianceContainerPolicy);
       if (path === "/policies/compliance/host") return jsonResponse(compute.complianceHostPolicy);
       if (path === "/policies/vulnerability/images") return jsonResponse(compute.vulnerabilityImagePolicy);
-      if (path === "/settings/registry") return jsonResponse(compute.registrySettings);
+      if (path === "/settings/registry") return options.registryDenied ? jsonResponse({ err: "registry settings require the Administrator role" }, { status: 403 }) : jsonResponse(compute.registrySettings);
       if (path === "/registry") return jsonResponse(compute.registryScans);
       if (path === "/images") return jsonResponse(compute.images);
       if (path === "/stats/vulnerabilities") return jsonResponse(compute.vulnerabilityStats);
@@ -1795,6 +1796,164 @@ test("evidence and summaries derived from unreadable surfaces render null, never
   const firewall = await assessPaloaltoFirewallPolicy(clients, devices);
   assert.deepEqual(firewall.summary.platforms, ["fw1.example.com: firewall", "fw2.example.com: firewall"]);
   assert.ok(firewall.findings.every((item) => item.status === "manual"), "an unreachable device leaves every multi-device finding manual");
+});
+
+/** Wraps a fetch so every request and the status it received are on record for request matching. */
+function recordingPaloaltoFetch(inner) {
+  const requests = [];
+  const fetchImpl = async (input, init = {}) => {
+    const url = new URL(input);
+    const entry = { method: init.method ?? "GET", host: url.hostname, path: url.pathname, query: Object.fromEntries(url.searchParams), status: null };
+    requests.push(entry);
+    const response = await inner(input, init);
+    entry.status = response.status;
+    return response;
+  };
+  return { fetchImpl, requests };
+}
+
+/** Whether a "METHOD /path[?a=b&c=d]" label with the given status names a request the run actually made and the status it received. */
+function paloaltoRequestObserved(requests, endpoint, status) {
+  const [method, rest] = endpoint.split(" ");
+  const [path, query = ""] = rest.split("?");
+  const pairs = query ? query.split("&").map((pair) => pair.split(/=(.*)/s).slice(0, 2)) : [];
+  return requests.some((request) =>
+    request.method === method
+    && request.path === path
+    && pairs.every(([name, value]) => request.query[name] === value)
+    && (status === null || request.status === status),
+  );
+}
+
+/** Every object carrying an endpoint, with the HTTP status it names (http_status on a status entry, status on a marker). */
+function endpointMentions(value, path = []) {
+  if (Array.isArray(value)) return value.flatMap((item, index) => endpointMentions(item, [...path, String(index)]));
+  if (!value || typeof value !== "object") return [];
+  const mentions = Object.entries(value).flatMap(([key, child]) => endpointMentions(child, [...path, key]));
+  if (typeof value.endpoint === "string") {
+    const status = typeof value.http_status === "number" ? value.http_status : typeof value.httpStatus === "number" ? value.httpStatus : typeof value.status === "number" ? value.status : null;
+    mentions.push({ at: path.join("."), endpoint: value.endpoint, status });
+  }
+  return mentions;
+}
+
+test("addendum 5: denied CSPM, Compute, and PAN-OS reads write not-collected markers naming the failed request and its status, never an empty value", async () => {
+  const { fetchImpl, requests } = recordingPaloaltoFetch(mockedFetch({ integrationsDenied: true, mgtDenied: true, registryDenied: true, alertsDenied: true }));
+  const clients = createPaloaltoClients({ ...bothProductsConfig(), retryAttempts: 0 }, fetchImpl);
+  const access = await checkPaloaltoAccess(clients);
+  const result = await exportPaloaltoAuditBundle(clients, createTempBase("grclanker-paloalto-markers-"));
+  const files = readBundleFiles(result.outputDir);
+
+  const prisma = JSON.parse(files.get(join("core_data", "prisma_cloud.json")));
+  assert.deepEqual(prisma.integrations, { collected: false, status: 403, dataset_status: "forbidden", endpoint: "GET /integration", error: prisma.integrations.error });
+  assert.match(prisma.integrations.error, /403/);
+  assert.equal(prisma.collection.integrations.status, "forbidden");
+  assert.equal(prisma.collection.integrations.http_status, 403);
+  assert.equal(prisma.collection.integrations.seen, null, "a refused read never counts 0");
+  assert.equal(prisma.collection.integrations.truncated, null);
+  assert.equal(prisma.open_alerts.collected, false);
+  assert.equal(prisma.open_alerts.status, 502);
+  assert.equal(prisma.open_alerts.dataset_status, "error");
+  assert.equal(prisma.open_alerts.endpoint, "GET /v2/alert");
+  assert.match(prisma.open_alerts.error, /502.*text\/html.*bytes, not echoed/);
+  assert.equal(prisma.open_alerts_truncated, null, "no alert walk happened, so it was neither complete nor truncated");
+  assert.equal(prisma.open_alerts_total, null);
+  assert.equal(prisma.collection.open_alerts.truncated, null);
+  assert.equal(prisma.collection.policies.status, "ok");
+  assert.equal(prisma.collection.policies.seen, prisma.policies.length);
+  assert.deepEqual(prisma.compute.registry_settings, { collected: false, status: 403, dataset_status: "forbidden", endpoint: "GET /api/v1/settings/registry", error: prisma.compute.registry_settings.error });
+  assert.equal(prisma.compute.collection.registry_settings.http_status, 403);
+  assert.equal(prisma.compute.collection.registry_settings.seen, null);
+  assert.equal(prisma.compute.collection.defenders.status, "ok");
+
+  const device = JSON.parse(files.get(join("core_data", "panos_fw1.example.com.json")));
+  assert.deepEqual(device.config["/config/mgt-config"], { collected: false, status: 403, dataset_status: "forbidden", endpoint: "GET /api/?type=config&action=show&xpath=/config/mgt-config", error: device.config["/config/mgt-config"].error });
+  assert.match(device.config["/config/mgt-config"].error, /Insufficient privileges/);
+  assert.ok(device.config["/config/shared"].shared, "the readable subtrees keep their content");
+  assert.equal(device.collection["/config/mgt-config"].status, "forbidden");
+  assert.equal(device.collection["/config/mgt-config"].http_status, 403);
+  assert.equal(device.collection["/config/mgt-config"].seen, null);
+  assert.equal(device.collection.system_info.status, "ok");
+  assert.equal(device.collection.system_info.endpoint, "GET /api/?type=op&cmd=<show><system><info></info></system></show>");
+  assert.equal(device.collection.ha_state.status, "ok");
+
+  const mentions = [
+    ...endpointMentions(prisma, ["prisma_cloud.json"]),
+    ...endpointMentions(device, ["panos_fw1.example.com.json"]),
+    ...endpointMentions(JSON.parse(files.get(join("core_data", "access.json"))), ["access.json"]),
+    ...endpointMentions(access, ["check_access"]),
+  ];
+  assert.ok(mentions.length >= 8 + 12 + 7 + 24, `every surface is mentioned with its request (${mentions.length})`);
+  for (const mention of mentions) {
+    assert.ok(paloaltoRequestObserved(requests, mention.endpoint, mention.status), `${mention.at} names ${mention.endpoint} (status ${mention.status}) but no such request was made`);
+  }
+  const forbiddenMentions = mentions.filter((mention) => mention.status === 403);
+  assert.deepEqual([...new Set(forbiddenMentions.map((mention) => mention.endpoint))].sort(), ["GET /api/?type=config&action=show&xpath=/config/mgt-config", "GET /api/v1/settings/registry", "GET /integration"]);
+  assert.deepEqual([...new Set(mentions.filter((mention) => mention.status === 502).map((mention) => mention.endpoint))], ["GET /v2/alert"]);
+
+  const assessment = await assessPaloaltoCloudPosture(clients);
+  assert.equal(assessment.summary.collection.prisma_cloud.integrations.http_status, 403);
+  assert.equal(assessment.summary.collection.prisma_cloud.open_alerts.seen, null);
+  assert.equal(assessment.summary.collection.prisma_compute.registry_settings.status, "forbidden");
+  for (const mention of endpointMentions(assessment.summary, ["summary"])) {
+    assert.ok(paloaltoRequestObserved(requests, mention.endpoint, mention.status), `${mention.at} names ${mention.endpoint}`);
+  }
+});
+
+test("addendum 5: an unreachable Compute console writes an unavailable marker naming the /meta_info request, and a transport failure records a null status", async () => {
+  const { fetchImpl, requests } = recordingPaloaltoFetch(async (input, init) => {
+    const url = new URL(input);
+    if (url.pathname === "/meta_info") return jsonResponse({ message: "meta_info is disabled for this role" }, { status: 403 });
+    return mockedFetch()(input, init);
+  });
+  const clients = createPaloaltoClients({ ...bothProductsConfig(), retryAttempts: 0 }, fetchImpl);
+  const result = await exportPaloaltoAuditBundle(clients, createTempBase("grclanker-paloalto-compute-marker-"));
+  const prisma = JSON.parse(readBundleFiles(result.outputDir).get(join("core_data", "prisma_cloud.json")));
+  assert.equal(prisma.compute.collected, false);
+  assert.equal(prisma.compute.dataset_status, "unavailable");
+  assert.equal(prisma.compute.status, 403);
+  assert.equal(prisma.compute.endpoint, "GET /meta_info");
+  assert.match(prisma.compute.error, /Compute console discovery via CSPM \/meta_info failed/);
+  assert.ok(paloaltoRequestObserved(requests, "GET /meta_info", 403));
+
+  const offline = createPaloaltoClients(twoDeviceConfig(), async (input, init) => {
+    const url = new URL(input);
+    if (url.hostname === "fw2.example.com") throw new Error("connect ECONNREFUSED 10.0.0.2:443");
+    return mockedFetch()(input, init);
+  });
+  const access = await checkPaloaltoAccess(offline);
+  const fw2 = access.surfaces.filter((surface) => surface.target === "fw2.example.com");
+  assert.ok(fw2.length >= 2);
+  for (const surface of fw2) {
+    assert.equal(surface.status, "not_readable");
+    assert.equal(surface.httpStatus, null, "no response arrived, so no status is claimed");
+    assert.equal(surface.count, null);
+    assert.match(surface.error, /ECONNREFUSED/);
+  }
+  const systemInfoRead = "GET /api/?type=op&cmd=<show><system><info></info></system></show>";
+  assert.equal(fw2.find((surface) => surface.name === "system_info").endpoint, systemInfoRead, "with an API key configured the read itself is the request that failed");
+  const bundle = await exportPaloaltoAuditBundle(offline, createTempBase("grclanker-paloalto-offline-"));
+  const device = JSON.parse(readBundleFiles(bundle.outputDir).get(join("core_data", "panos_fw2.example.com.json")));
+  assert.equal(device.system_info.collected, false);
+  assert.equal(device.system_info.status, null);
+  assert.equal(device.system_info.dataset_status, "error");
+  assert.equal(device.system_info.endpoint, systemInfoRead);
+  assert.equal(device.collection.system_info.http_status, null);
+  assert.equal(device.collection.system_info.seen, null);
+  for (const xpath of FIREWALL_XPATHS) {
+    assert.equal(device.config[xpath].collected, false, xpath);
+    assert.equal(device.config[xpath].endpoint, `GET /api/?type=config&action=show&xpath=${xpath}`, xpath);
+  }
+
+  // A device that must generate its key names the keygen request when that is what failed.
+  const keygenConfig = { ...resolvePaloaltoConfiguration({}, { PANOS_HOST: "fw3.example.com", PANOS_USERNAME: "auditor", PANOS_PASSWORD: "pw" }), retryAttempts: 0 };
+  const keygenClients = createPaloaltoClients(keygenConfig, async () => { throw new Error("connect ETIMEDOUT 10.0.0.3:443"); });
+  const keygenAccess = await checkPaloaltoAccess(keygenClients);
+  assert.ok(keygenAccess.surfaces.length >= 2);
+  for (const surface of keygenAccess.surfaces) {
+    assert.equal(surface.endpoint, "POST /api/?type=keygen", surface.name);
+    assert.equal(surface.httpStatus, null);
+  }
 });
 
 test("resolveSecureOutputPath rejects traversal and symlink parents", () => {
