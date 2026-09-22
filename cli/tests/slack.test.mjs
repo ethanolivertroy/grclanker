@@ -13,12 +13,14 @@ import {
   SLACK_SECURITY_AUDIT_ACTIONS,
   SLACK_SPEC_CONTROLS,
   SlackApiClient,
+  UNKNOWN_ERROR_CODE,
   assessSlackAdminAccess,
   assessSlackChannelGovernance,
   assessSlackIdentity,
   assessSlackIntegrations,
   assessSlackMonitoring,
   checkSlackAccess,
+  describeErrorFields,
   exportSlackAuditBundle,
   isSlackPostingRestricted,
   redactErrorText,
@@ -27,6 +29,7 @@ import {
   registerSlackTools,
   resolveSecureOutputPath,
   resolveSlackConfiguration,
+  vendorErrorCode,
 } from "../dist/extensions/grc-tools/slack.js";
 
 const NOW = new Date("2026-09-21T00:00:00.000Z");
@@ -784,8 +787,8 @@ test("rule 9: the audit bundle and its zip never contain planted credentials", a
     }
   }
   const errorsLog = readFileSync(join(bundle.outputDir, "_errors.log"), "utf8");
-  assert.match(errorsLog, /admin\.barriers\.list.*HTTP 403/);
-  assert.ok(errorsLog.includes(SLACK_REDACTION_MARKER), "redacted error bodies keep a marker");
+  assert.match(errorsLog, /admin\.barriers\.list: Slack Web API admin\.barriers\.list failed \(HTTP 403\) error=invalid_auth$/m);
+  assert.doesNotMatch(errorsLog, /token|hint/, "undocumented error body fields are dropped, not echoed");
   const access = JSON.parse(readFileSync(join(bundle.outputDir, "core_data/access.json"), "utf8"));
   assert.equal(JSON.stringify(access).includes("FAKE_"), false);
 
@@ -796,7 +799,7 @@ test("rule 9: the audit bundle and its zip never contain planted credentials", a
       assert.equal(entry.content.includes(marker), false, `zip entry ${entry.name} leaks ${marker}`);
     }
   }
-  assert.ok(entries.some((entry) => entry.name.endsWith("_errors.log") && entry.content.includes(SLACK_REDACTION_MARKER)));
+  assert.ok(entries.some((entry) => entry.name.endsWith("_errors.log") && /HTTP 403\) error=invalid_auth$/m.test(entry.content)));
 });
 
 test("rule 10: every pagination loop reports truncation on its cap exit and dependent findings do not pass", async () => {
@@ -1437,21 +1440,20 @@ test("non-JSON response bodies are described, never quoted, and every error stri
   const tokenised = "https://example.invalid/cb?access_token=CANARY-URLTOKEN-2&state=x";
   const jsonForbidden = makeClient(() => jsonResponse({ ok: false, error: `invalid_auth: see ${tokenised}`, response_metadata: { messages: [`redirect ${tokenised}`] } }, 403));
   await assert.rejects(jsonForbidden.web("users.list"), (error) => {
-    assert.doesNotMatch(error.message, /CANARY-/);
-    assert.match(error.message, /failed \(HTTP 403\) \{"ok":false,"error":"invalid_auth: see https:\/\/example\.invalid\/cb\?access_token=\[REDACTED\]&state=x"/);
+    assert.doesNotMatch(error.message, /CANARY-|redirect/);
+    assert.equal(error.message, "Slack Web API users.list failed (HTTP 403) error=UnknownError", "a free-text error value is not a documented code and response_metadata.messages is never rendered");
     return true;
   });
   const okFalse = makeClient(() => ({ ok: false, error: `invalid_auth: see ${tokenised}` }));
   await assert.rejects(okFalse.web("users.list"), (error) => {
-    assert.doesNotMatch(error.message, /CANARY-/);
-    assert.doesNotMatch(error.code, /CANARY-/);
-    assert.match(error.code, /access_token=\[REDACTED\]/);
+    assert.equal(error.message, "Slack Web API users.list failed: UnknownError");
+    assert.equal(error.code, "UnknownError");
     return true;
   });
   const scimDetail = makeClient(() => jsonResponse({ schemas: ["urn:ietf:params:scim:api:messages:2.0:Error"], detail: `forbidden, see ${tokenised}`, status: "403" }, 403));
   await assert.rejects(scimDetail.scim("/Users"), (error) => {
     assert.doesNotMatch(error.message, /CANARY-/);
-    assert.match(error.message, /"detail":"forbidden, see https:\/\/example\.invalid\/cb\?access_token=\[REDACTED\]&state=x"/);
+    assert.equal(error.message, "Slack SCIM /Users failed (HTTP 403) status=403 detail=forbidden, see https://example.invalid/cb?access_token=[REDACTED]&state=x");
     return true;
   });
 
@@ -1536,10 +1538,11 @@ function assertNoCanary(value, label) {
 test("rule 9 error bodies: a failing surface's HTML page or tokenised JSON error never reaches a finding, summary, errors array, bundle file, zip entry, or the thrown export error", async () => {
   assert.equal(ERROR_SURFACES.length, 21, "the surface list matches the reviewer's sweep");
   const config = resolveSlackConfiguration({ token: "xoxp-test", scim_token: "scim-test", org_id: "E1" }, EMPTY_ENV);
+  const tokenisedDisclosure = (family) => (family === "scim" ? /detail=(?:forbidden|unauthorized), see https:\/\/example\.invalid\/callback\?access_token=\[REDACTED\]&state=x/ : /failed(?: \(HTTP \d{3}\) error=|: )UnknownError/);
   const shapes = [
-    ["A:502-html", (slug) => htmlGatewayError(slug), /non-JSON text\/html body \(\d+ characters\) withheld/],
-    ["B:403-json-url", (slug, family) => tokenisedJsonError(slug, family), /access_token=\[REDACTED\]&state=x/],
-    ["C:ok-false-url", (slug, family) => tokenisedOkFalse(slug, family), /access_token=\[REDACTED\]&state=x/],
+    ["A:502-html", (slug) => htmlGatewayError(slug), () => /non-JSON text\/html body \(\d+ characters\) withheld/],
+    ["B:403-json-url", (slug, family) => tokenisedJsonError(slug, family), tokenisedDisclosure],
+    ["C:ok-false-url", (slug, family) => tokenisedOkFalse(slug, family), tokenisedDisclosure],
   ];
   const table = [];
   for (const surface of ERROR_SURFACES) {
@@ -1567,7 +1570,7 @@ test("rule 9 error bodies: a failing surface's HTML page or tokenised JSON error
       try {
         const bundle = await exportSlackAuditBundle(client, config, base);
         if (surface.label === "scim:/Groups") {
-          assert.match(readFileSync(join(bundle.outputDir, "core_data/access.json"), "utf8"), disclosure, `${run}: only the access check reads /Groups, so its surface entry carries the failure`);
+          assert.match(readFileSync(join(bundle.outputDir, "core_data/access.json"), "utf8"), disclosure(surface.family), `${run}: only the access check reads /Groups, so its surface entry carries the failure`);
         } else {
           assert.ok(bundle.errorCount > 0, `${run}: the failure is recorded as a collection error`);
         }
@@ -1591,11 +1594,148 @@ test("rule 9 error bodies: a failing surface's HTML page or tokenised JSON error
 
       const everything = collected.join("\n");
       assertNoCanary(everything, `${run}: in-memory findings, summaries, errors, access surfaces, thrown errors, and _errors.log`);
-      assert.match(everything, disclosure, `${run}: the failure is disclosed with the scrubbed shape`);
+      assert.match(everything, disclosure(surface.family), `${run}: the failure is disclosed with the validated shape`);
       if (shape === "A:502-html") assert.match(everything, /HTTP 502/, `${run}: the HTTP status is disclosed`);
       table.push({ surface: surface.label, shape, files, entries, exportThrew });
     }
   }
   assert.equal(table.length, 63);
   assert.equal(table.filter((row) => !row.exportThrew && row.files >= 20).length, 60, "every export other than the auth.test runs wrote a full bundle");
+});
+
+/** 68 mixed-case alphanumerics with no token prefix, so no shape pattern in redactErrorText can catch it: only code validation can. */
+const TOKEN_CANARY = "CANARYSL7f3a9C1d2E4b6A8c0D1e2F3a4B5c6D7e8F9a0B1c2D3e4F5a6B7c8D9e0Fqz";
+const SCIM_TYPE_CANARY = "CANSL+Qz8Wx7Vy6Ut5Sr4/Pq3On2Ml1Kj0Ih==";
+const TOOL_ARGS = { token: "xoxp-test", scim_token: "scim-test", org_id: "E1" };
+
+async function withStubbedFetch(handler, run) {
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (input, init) => {
+    const request = await requestParams(input, init);
+    const result = handler(request);
+    return result instanceof Response ? result : jsonResponse(result);
+  };
+  try {
+    return await run();
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+}
+
+test("vendor codes: a token-shaped Web API error code renders UnknownError everywhere and SCIM errors render only documented fields", async () => {
+  assert.equal(TOKEN_CANARY.length, 68);
+  assert.equal(redactErrorText(TOKEN_CANARY), TOKEN_CANARY, "positive control: the scrub alone does not catch an unprefixed token");
+  const canaryBody = { ok: false, error: TOKEN_CANARY };
+  assert.ok(JSON.stringify(canaryBody).includes(TOKEN_CANARY), "positive control: the raw body carries the canary");
+  assert.equal(vendorErrorCode(TOKEN_CANARY), UNKNOWN_ERROR_CODE);
+  assert.equal(vendorErrorCode("not_allowed_token_type"), "not_allowed_token_type");
+  assert.equal(vendorErrorCode("missing_scope"), "missing_scope");
+  for (const rejected of ["Missing_Scope", "a".repeat(65), "", "1abc", "invalid auth", "xoxp-abc123456"]) assert.equal(vendorErrorCode(rejected), UNKNOWN_ERROR_CODE, rejected);
+  assert.equal(describeErrorFields({ ok: false, error: "missing_scope", needed: "admin.users:read", provided: "identify,users:read" }), "error=missing_scope needed=admin.users:read provided=identify,users:read");
+  assert.equal(describeErrorFields({ ok: false, error: "missing_scope", needed: TOKEN_CANARY, provided: `identify,${TOKEN_CANARY}`, warning: `missing_charset,${TOKEN_CANARY}`, response_metadata: { messages: [TOKEN_CANARY] } }), "error=missing_scope needed=UnknownError provided=identify,UnknownError warning=missing_charset,UnknownError");
+  assert.equal(describeErrorFields({ ok: false }), "JSON body without documented error fields withheld");
+  assert.equal(describeErrorFields({ schemas: ["urn:ietf:params:scim:api:messages:2.0:Error"], status: "403", scimType: SCIM_TYPE_CANARY, code: TOKEN_CANARY, detail: "denied" }), "status=403 detail=denied");
+  assert.equal(describeErrorFields({ schemas: ["urn:ietf:params:scim:api:messages:2.0:Error"], status: 403, scimType: "invalidFilter", detail: "Not authorized to view this resource" }), "status=403 scimType=invalidFilter detail=Not authorized to view this resource");
+  assert.equal(describeErrorFields({ schemas: ["urn:ietf:params:scim:api:messages:2.0:Error"], status: "401", scimType: "urn:ietf:params:scim:api:messages:2.0:invalidToken", detail: `see https://example.invalid/cb?access_token=${TOKEN_CANARY}` }), "status=401 scimType=urn:ietf:params:scim:api:messages:2.0:invalidToken detail=see https://example.invalid/cb?access_token=[REDACTED]");
+  assert.equal(describeErrorFields({ schemas: ["urn:ietf:params:scim:api:messages:2.0:Error"], status: TOKEN_CANARY, scimType: TOKEN_CANARY, detail: 7 }), "JSON body without documented error fields withheld");
+
+  const documented = makeClient(() => ({ ok: false, error: "missing_scope", needed: "admin.users:read" }));
+  await assert.rejects(documented.web("users.list"), (error) => {
+    assert.equal(error.message, "Slack Web API users.list failed: missing_scope");
+    assert.equal(error.code, "missing_scope");
+    return true;
+  });
+  await assert.rejects(makeClient(() => jsonResponse({ ok: false, error: "not_allowed_token_type" }, 403)).web("users.list"), (error) => {
+    assert.equal(error.message, "Slack Web API users.list failed (HTTP 403) error=not_allowed_token_type");
+    assert.equal(error.code, "http_forbidden");
+    return true;
+  });
+  await assert.rejects(makeClient(() => canaryBody).web("users.list"), (error) => {
+    assert.equal(error.message, "Slack Web API users.list failed: UnknownError");
+    assert.equal(error.code, "UnknownError");
+    return true;
+  });
+  await assert.rejects(makeClient(() => jsonResponse(canaryBody, 403)).web("users.list"), (error) => {
+    assert.equal(error.message, "Slack Web API users.list failed (HTTP 403) error=UnknownError");
+    return true;
+  });
+
+  const scimCanary = { schemas: ["urn:ietf:params:scim:api:messages:2.0:Error"], status: "403", scimType: SCIM_TYPE_CANARY, code: TOKEN_CANARY, detail: "denied" };
+  await assert.rejects(makeClient(() => jsonResponse(scimCanary, 403)).scim("/Users"), (error) => {
+    assert.equal(error.message, "Slack SCIM /Users failed (HTTP 403) status=403 detail=denied");
+    return true;
+  });
+  await assert.rejects(makeClient(() => jsonResponse({ ...scimCanary, scimType: "invalidFilter" }, 403)).scim("/Users"), (error) => {
+    assert.equal(error.message, "Slack SCIM /Users failed (HTTP 403) status=403 scimType=invalidFilter detail=denied");
+    return true;
+  });
+
+  const config = resolveSlackConfiguration(TOOL_ARGS, EMPTY_ENV);
+  const leaks = (text) => text.includes(TOKEN_CANARY) || text.includes(SCIM_TYPE_CANARY) || text.includes("CANSL+") || text.includes("CANARYSL");
+  const walk = async (label, fixture, expectThrow) => {
+    const client = makeClient(fixture);
+    const collected = [];
+    let threw = false;
+    try {
+      collected.push(JSON.stringify(await checkSlackAccess(client)));
+    } catch (error) {
+      threw = true;
+      collected.push(error.message);
+    }
+    assert.equal(threw, expectThrow, `${label}: access check throw`);
+    const all = await assessAll(client);
+    collected.push(JSON.stringify(all.findings), JSON.stringify(all.summaries), JSON.stringify(all.errors));
+    const base = createTempBase("grclanker-slack-vendor-code-");
+    try {
+      const bundle = await exportSlackAuditBundle(client, config, base);
+      for (const file of listFilesRecursively(bundle.outputDir)) {
+        const content = readFileSync(file, "utf8");
+        assert.equal(leaks(content), false, `${label}: ${file.slice(bundle.outputDir.length + 1)} leaks a canary`);
+        collected.push(content);
+      }
+      for (const entry of readZipEntries(bundle.zipPath)) assert.equal(leaks(entry.content), false, `${label}: zip ${entry.name} leaks a canary`);
+    } catch (error) {
+      if (error instanceof assert.AssertionError) throw error;
+      collected.push(error.message);
+    } finally {
+      rmSync(base, { recursive: true, force: true });
+    }
+    const everything = collected.join("\n");
+    assert.equal(leaks(everything), false, `${label}: in-memory findings, summaries, errors, access surfaces, thrown errors, or bundle files leak a canary`);
+    return everything;
+  };
+
+  for (const method of Object.keys(SLACK_METHODS)) {
+    const everything = await walk(`web:${method}`, (request) => (methodOf(request) === method ? canaryBody : compliantFixture(request)), method === "auth.test");
+    assert.match(everything, new RegExp(`Slack Web API ${method.replace(/\./g, "\\.")} failed: UnknownError`), `web:${method}: the placeholder code is disclosed`);
+  }
+  const everyMethod = await walk("every web method except auth.test", (request) => (request.pathname.startsWith("/api/") && methodOf(request) !== "auth.test" ? canaryBody : compliantFixture(request)), false);
+  assert.match(everyMethod, /"error":"Slack Web API admin\.teams\.list failed: UnknownError"/);
+  const scimWalk = await walk("scim 403 with scimType and code canaries", (request) => (request.pathname.startsWith("/scim/v2/") ? jsonResponse(scimCanary, 403) : compliantFixture(request)), false);
+  assert.match(scimWalk, /Slack SCIM \/ServiceProviderConfig failed \(HTTP 403\) status=403 detail=denied/);
+  assert.doesNotMatch(scimWalk, /scimType=/);
+
+  const tools = new Map();
+  registerSlackTools({ registerTool: (tool) => tools.set(tool.name, tool) });
+  const checkAccess = tools.get("slack_check_access");
+  const identity = tools.get("slack_assess_identity");
+  const previous = process.env.SLACK_CONFIG_FILE;
+  process.env.SLACK_CONFIG_FILE = "";
+  try {
+    const denied = await withStubbedFetch(() => canaryBody, () => checkAccess.execute("call-1", checkAccess.prepareArguments({ ...TOOL_ARGS })));
+    assert.equal(denied.isError, true);
+    assert.equal(denied.content[0].text, "Check Slack audit access failed: Slack Web API auth.test failed: UnknownError");
+    const partial = await withStubbedFetch((request) => (request.pathname.startsWith("/api/") && methodOf(request) !== "auth.test" ? canaryBody : compliantFixture(request)), () => checkAccess.execute("call-2", checkAccess.prepareArguments({ ...TOOL_ARGS })));
+    assert.equal(partial.isError, undefined);
+    const surfaces = partial.details.surfaces.filter((surface) => surface.error);
+    assert.ok(surfaces.length > 0);
+    for (const surface of surfaces) assert.match(surface.error, /failed: UnknownError$/, JSON.stringify(surface));
+    assert.equal(leaks(JSON.stringify(partial)), false);
+    const scimTool = await withStubbedFetch((request) => (request.pathname.startsWith("/scim/v2/") ? jsonResponse(scimCanary, 403) : compliantFixture(request)), () => identity.execute("call-3", identity.prepareArguments({ ...TOOL_ARGS })));
+    assert.equal(leaks(JSON.stringify(scimTool)), false);
+    assert.match(JSON.stringify(scimTool), /status=403 detail=denied/);
+  } finally {
+    if (previous === undefined) delete process.env.SLACK_CONFIG_FILE;
+    else process.env.SLACK_CONFIG_FILE = previous;
+  }
 });

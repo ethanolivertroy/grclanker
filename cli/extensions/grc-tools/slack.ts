@@ -703,6 +703,60 @@ export class SlackApiError extends Error {
   }
 }
 
+/** Slack documents snake_case error codes; a value of any other shape (for example a token) renders as this placeholder. */
+const SLACK_ERROR_CODE_PATTERN = /^[a-z][a-z0-9_]{0,63}$/;
+/** Comma-separated scope lists in the documented needed and provided fields (for example admin.users:read). */
+const SLACK_SCOPE_PATTERN = /^[a-z][a-z0-9_.:-]{0,63}$/;
+export const UNKNOWN_ERROR_CODE = "UnknownError";
+const SCIM_ERROR_SCHEMA = "urn:ietf:params:scim:api:messages:2.0:Error";
+/** RFC 7644 section 3.12 scimType keywords, a short identifier, or a urn; anything else is dropped. */
+const SCIM_TYPES = new Set(["invalidFilter", "tooMany", "uniqueness", "mutability", "invalidSyntax", "invalidPath", "noTarget", "invalidValue", "invalidVers", "sensitive"]);
+const SCIM_TYPE_PATTERN = /^(?:[a-z][a-zA-Z0-9]{0,31}|urn:[a-z0-9][a-z0-9-]{0,31}:[a-zA-Z0-9._:-]{1,96})$/;
+
+/** A vendor error code copied from a response body is pattern-validated like every other code before it is rendered. */
+export function vendorErrorCode(value: unknown): string {
+  return typeof value === "string" && SLACK_ERROR_CODE_PATTERN.test(value) ? value : UNKNOWN_ERROR_CODE;
+}
+
+function vendorCodeList(value: unknown, pattern: RegExp): string {
+  const items = typeof value === "string" ? value.split(",").map((item) => item.trim()).filter((item) => item.length > 0) : [];
+  if (items.length === 0) return UNKNOWN_ERROR_CODE;
+  return items.map((item) => (pattern.test(item) ? item : UNKNOWN_ERROR_CODE)).join(",");
+}
+
+function validHttpStatus(value: unknown): number | undefined {
+  const status = typeof value === "number" ? value : typeof value === "string" && /^\d{3}$/.test(value) ? Number(value) : undefined;
+  return status !== undefined && Number.isInteger(status) && status >= 100 && status <= 599 ? status : undefined;
+}
+
+function validScimType(value: unknown): string | undefined {
+  return typeof value === "string" && (SCIM_TYPES.has(value) || SCIM_TYPE_PATTERN.test(value)) ? value : undefined;
+}
+
+/**
+ * Renders only the documented fields of a JSON error body: Web API and Audit Logs `error` (validated code),
+ * `needed` and `provided` (validated scope lists), `warning` (validated code list); SCIM `status` (validated
+ * integer), `scimType` (validated keyword, identifier, or urn, else dropped), and `detail` (scrubbed and cut).
+ * Every other field, including response_metadata.messages, is dropped rather than echoed.
+ */
+export function describeErrorFields(json: JsonRecord, scrub: (text: string) => string = redactErrorText): string {
+  const parts: string[] = [];
+  const schemas = Array.isArray(json.schemas) ? json.schemas : [];
+  if (schemas.includes(SCIM_ERROR_SCHEMA) || "scimType" in json || "detail" in json) {
+    const status = validHttpStatus(json.status);
+    if (status !== undefined) parts.push(`status=${status}`);
+    const scimType = validScimType(json.scimType);
+    if (scimType !== undefined) parts.push(`scimType=${scimType}`);
+    if (typeof json.detail === "string") parts.push(`detail=${scrub(json.detail).slice(0, 200)}`);
+  } else {
+    if (json.error !== undefined) parts.push(`error=${vendorErrorCode(json.error)}`);
+    if (json.needed !== undefined) parts.push(`needed=${vendorCodeList(json.needed, SLACK_SCOPE_PATTERN)}`);
+    if (json.provided !== undefined) parts.push(`provided=${vendorCodeList(json.provided, SLACK_SCOPE_PATTERN)}`);
+    if (json.warning !== undefined) parts.push(`warning=${vendorCodeList(json.warning, SLACK_ERROR_CODE_PATTERN)}`);
+  }
+  return parts.length > 0 ? parts.join(" ") : "JSON body without documented error fields withheld";
+}
+
 /** Describes a response body that is not a JSON object without quoting any of it. */
 function withheldBody(response: Response, text: string): string {
   const contentType = (response.headers.get("content-type") ?? "").split(";")[0].trim() || "unknown content type";
@@ -765,13 +819,13 @@ export class SlackApiClient {
   }
 
   /**
-   * A JSON error body (error, response_metadata.messages, SCIM detail) is echoed after field-level and text
-   * redaction; any other body (an HTML error page from a proxy or gateway, plain text) is never placed in an error
-   * string, only described by content type and length. The SlackApiError constructor scrubs the result again.
+   * A JSON error body is never echoed: only its documented fields are rendered, codes pattern-validated and SCIM
+   * detail scrubbed and cut (describeErrorFields); any other body (an HTML error page from a proxy or gateway,
+   * plain text) is only described by content type and length. The SlackApiError constructor scrubs the result again.
    */
   private describeBody(response: Response, text: string): string {
     const json = parseJsonRecord(text);
-    return json ? this.redactText(JSON.stringify(redactSecrets(json, this.knownSecrets()))).slice(0, 200) : withheldBody(response, text);
+    return json ? describeErrorFields(json, (value) => redactErrorText(value, this.knownSecrets())) : withheldBody(response, text);
   }
 
   private httpError(label: string, response: Response, text: string): SlackApiError {
@@ -790,8 +844,8 @@ export class SlackApiClient {
       throw new SlackApiError(`${label} failed (HTTP ${response.status}) ${withheldBody(response, text)}`, label, "non_json_body", response.status);
     }
     if (json.ok === false) {
-      const code = asString(json.error) ?? "ok_false";
-      throw new SlackApiError(`${label} failed: ${this.redactText(code)}`, label, code, response.status);
+      const code = json.error === undefined ? "ok_false" : vendorErrorCode(json.error);
+      throw new SlackApiError(`${label} failed: ${code}`, label, code, response.status);
     }
     return redactSecrets(json, this.knownSecrets());
   }
