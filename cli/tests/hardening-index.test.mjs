@@ -5,9 +5,10 @@ import * as index from "../dist/extensions/grc-tools/hardening/index.js";
 import * as collectionStatus from "../dist/extensions/grc-tools/hardening/collection-status.js";
 import * as configFile from "../dist/extensions/grc-tools/hardening/config-file.js";
 import * as errorText from "../dist/extensions/grc-tools/hardening/error-text.js";
+import * as nextLink from "../dist/extensions/grc-tools/hardening/next-link.js";
 import * as pagination from "../dist/extensions/grc-tools/hardening/pagination.js";
 
-const MODULES = { "collection-status": collectionStatus, "config-file": configFile, "error-text": errorText, pagination };
+const MODULES = { "collection-status": collectionStatus, "config-file": configFile, "error-text": errorText, "next-link": nextLink, pagination };
 
 test("the hardening index re-exports every runtime export of every module, each exactly once", () => {
   const seen = new Map();
@@ -37,4 +38,5 @@ test("the four constructor points the audit named are present under one import",
   assert.equal(typeof index.countIfReadable, "function");
   assert.equal(typeof index.gatedPrincipals, "function");
   assert.equal(typeof index.describePagination, "function");
+  assert.equal(typeof index.resolveSameOriginUrl, "function");
 });

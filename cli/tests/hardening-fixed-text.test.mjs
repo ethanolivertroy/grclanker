@@ -21,6 +21,7 @@ import {
   unreadableDataset,
 } from "../dist/extensions/grc-tools/hardening/collection-status.js";
 import { describePagination } from "../dist/extensions/grc-tools/hardening/pagination.js";
+import { NextLinkError, nextLinkStop, originOf, resolveSameOriginUrl } from "../dist/extensions/grc-tools/hardening/next-link.js";
 
 /**
  * Every fixed-text message the library renders must come back from the library's own scrub
@@ -218,6 +219,10 @@ test("every pagination note survives the scrub", () => {
     { kind: "empty_page_with_cursor" },
     { kind: "time_budget", budgetMs: 30000 },
     { kind: "missing_total" },
+    { kind: "rejected_next_link", reason: "foreign_origin", origin: "https://evil.example" },
+    { kind: "rejected_next_link", reason: "foreign_origin" },
+    { kind: "rejected_next_link", reason: "userinfo" },
+    { kind: "rejected_next_link", reason: "unparseable" },
   ];
   for (const stop of stops) {
     for (const [seen, total] of [[0, null], [40, 120], [500, 1200], [1000, undefined], [40, 0]]) {
@@ -227,6 +232,73 @@ test("every pagination note survives the scrub", () => {
   }
   assertSurvivesScrub(seenVersusTotal(40, 120), "seen of total");
   assertSurvivesScrub(seenVersusTotal(40, null), "seen, total unknown");
+});
+
+/** Configured origins in the shapes the integrations use: vendor hosts, tenant subdomains, ports, and IP literals. */
+const CONFIGURED_ORIGINS = Object.freeze([
+  "https://api.example.com",
+  "https://acme.okta.com",
+  "https://acme-admin.zscaler.net",
+  "https://graph.microsoft.com",
+  "https://api.us.onelogin.com",
+  "https://dev123456.service-now.com",
+  "https://api.eu1.qualys.com:443",
+  "https://vault.internal.example:8200",
+  "http://10.0.0.1:8080",
+  "https://[2001:db8::1]:8443",
+]);
+/** Rejected origins: other hosts, other schemes, other ports, IP literals, and non-hierarchical schemes. */
+const REJECTED_ORIGINS = Object.freeze([
+  "https://evil.example",
+  "https://collector.attacker.example",
+  "http://api.example.com",
+  "https://api.example.com:8443",
+  "http://169.254.169.254",
+  "http://127.0.0.1:9000",
+  "https://[::1]",
+  "https://xn--80ak6aa92e.com",
+  "javascript:",
+  "data:",
+]);
+
+test("every NextLinkError message and next-link pagination note survives the scrub for every configured and rejected origin", () => {
+  let rendered = 0;
+  for (const configuredAsWritten of CONFIGURED_ORIGINS) {
+    const base = `${configuredAsWritten}/api/v2/users?per_page=100`;
+    // A default port written in the configuration (`:443`) is not part of the origin the URL parser reports.
+    const configured = originOf(new URL(base));
+    for (const rejected of REJECTED_ORIGINS) {
+      const link = rejected.endsWith(":") ? `${rejected}payload` : `${rejected}/collect?token=abc`;
+      let error;
+      try {
+        resolveSameOriginUrl(link, base);
+      } catch (thrown) {
+        error = thrown;
+      }
+      if (error === undefined) continue; // the rejected origin equals this configured origin
+      assert.ok(error instanceof NextLinkError, `${configured} <- ${rejected}`);
+      assert.equal(error.message, `next link to ${rejected} was not followed because it does not share the configured origin ${configured}`);
+      assertSurvivesScrub(error.message, `foreign ${configured} <- ${rejected}`);
+      assertSurvivesScrub(errorMessage(error), `foreign ${configured} <- ${rejected} folded`);
+      const note = describePagination(40, 120, nextLinkStop(error)).note;
+      assertSurvivesScrub(note, `foreign note ${configured} <- ${rejected}`);
+      rendered += 1;
+    }
+    for (const [reason, link] of [["userinfo", `${configured.replace("://", "://user:pw@")}/api/v2/users?page=2`], ["unparseable", "http://[bad"]]) {
+      let error;
+      try {
+        resolveSameOriginUrl(link, base);
+      } catch (thrown) {
+        error = thrown;
+      }
+      assert.ok(error instanceof NextLinkError && error.reason === reason, `${configured} ${reason}`);
+      assertSurvivesScrub(error.message, `${reason} ${configured}`);
+      assertSurvivesScrub(errorMessage(error), `${reason} ${configured} folded`);
+      assertSurvivesScrub(describePagination(40, 120, nextLinkStop(error)).note, `${reason} note ${configured}`);
+      rendered += 1;
+    }
+  }
+  assert.ok(rendered >= 100, `expected the full matrix, rendered ${rendered}`);
 });
 
 test("marker error text survives the scrub for every inventory label, including credential-named inventories", () => {
