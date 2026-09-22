@@ -17,11 +17,64 @@ import { homedir } from "node:os";
 import { basename, dirname, join, relative, resolve } from "node:path";
 import { ZipArchive } from "archiver";
 import { Type } from "@sinclair/typebox";
-import { parse as parseYaml } from "yaml";
+import { parseDocument as parseYamlDocument, YAMLError } from "yaml";
 import { errorResult, formatTable, textResult } from "./shared.js";
 
 type FetchImpl = typeof fetch;
 type JsonRecord = Record<string, unknown>;
+
+const FS_ERROR_CODE_PATTERN = /^E[A-Z0-9_]{1,30}$/;
+const YAML_ERROR_CODE_PATTERN = /^[A-Z_]+$/;
+
+interface ConfigFilePosition {
+  line: number;
+  column?: number;
+}
+
+function thrownCode(error: unknown, pattern: RegExp): string | undefined {
+  const code = typeof error === "object" && error !== null ? (error as { code?: unknown }).code : undefined;
+  return typeof code === "string" && pattern.test(code) ? code : undefined;
+}
+
+/**
+ * Read step of the config loader: a missing file is simply absent, every
+ * other failure is reported by path and errno code only, never by the
+ * filesystem's own wording.
+ */
+function readConfigFileText(pathname: string): string | undefined {
+  try {
+    return readFileSync(pathname, "utf8");
+  } catch (error) {
+    const code = thrownCode(error, FS_ERROR_CODE_PATTERN);
+    if (code === "ENOENT") return undefined;
+    throw new Error(`Unable to read Sumo Logic config file ${pathname} (${code ?? "UNREADABLE"})`);
+  }
+}
+
+/** Parse step: fixed text plus path, position, and validated code; nothing the parser said, quoted, or named. */
+function configFileParseError(pathname: string, code: string, position: ConfigFilePosition | undefined): Error {
+  const where = position ? ` at line ${position.line}${position.column ? `, column ${position.column}` : ""}` : "";
+  return new Error(`Unable to parse Sumo Logic config file: invalid YAML in ${pathname}${where} (${code})`);
+}
+
+/** The yaml package's own error code when the thrown value is a YAMLError (an unresolved alias throws a plain ReferenceError), otherwise a fixed code. */
+function yamlErrorCode(error: unknown): string {
+  return error instanceof YAMLError && YAML_ERROR_CODE_PATTERN.test(error.code) ? error.code : "INVALID_YAML";
+}
+
+function yamlErrorPosition(error: unknown): ConfigFilePosition | undefined {
+  if (!(error instanceof YAMLError)) return undefined;
+  const start = error.linePos?.[0];
+  if (!start || !Number.isInteger(start.line) || start.line < 1) return undefined;
+  return { line: start.line, column: Number.isInteger(start.col) && start.col > 0 ? start.col : undefined };
+}
+
+/** Parses config YAML without logging warnings (their pretty text quotes the source line) and throws the document's first error. */
+function parseConfigYaml(text: string): unknown {
+  const document = parseYamlDocument(text);
+  if (document.errors.length > 0) throw document.errors[0];
+  return document.toJS();
+}
 
 const DEFAULT_OUTPUT_DIR = "./export/sumologic";
 const DEFAULT_TIMEOUT_MS = 30_000;
@@ -516,13 +569,15 @@ export function resolveSumologicBaseUrl(endpointOrDeployment: string): { baseUrl
 
 function readConfigFile(pathname: string | undefined): JsonRecord {
   const target = pathname ?? DEFAULT_CONFIG_FILE;
-  if (!existsSync(target)) return {};
+  const text = readConfigFileText(target);
+  if (text === undefined) return {};
+  let parsed: unknown;
   try {
-    const parsed = parseYaml(readFileSync(target, "utf8")) as unknown;
-    return asObject(parsed) ?? {};
+    parsed = parseConfigYaml(text);
   } catch (error) {
-    throw new Error(`Unable to parse Sumo Logic config file ${target}: ${error instanceof Error ? error.message : String(error)}`);
+    throw configFileParseError(target, yamlErrorCode(error), yamlErrorPosition(error));
   }
+  return asObject(parsed) ?? {};
 }
 
 function configFileValue(file: JsonRecord, keys: string[]): string | undefined {

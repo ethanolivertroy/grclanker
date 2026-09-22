@@ -1,7 +1,9 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import {
+  chmodSync,
   existsSync,
+  mkdirSync,
   mkdtempSync,
   readFileSync,
   symlinkSync,
@@ -9,6 +11,7 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { parse as parseYaml } from "yaml";
 
 import {
   SUMOLOGIC_CONTROLS,
@@ -22,6 +25,7 @@ import {
   collectionOf,
   exportSumologicAuditBundle,
   failedCollection,
+  registerSumologicTools,
   resolveSecureOutputPath,
   resolveSumologicBaseUrl,
   resolveSumologicConfiguration,
@@ -270,6 +274,112 @@ test("resolveSumologicConfiguration prefers args over env over config file and m
   assert.equal(defaulted.deployment, "us1");
 
   assert.throws(() => resolveSumologicConfiguration({}, { SUMOLOGIC_CONFIG_FILE: join(dir, "missing.yaml") }), /SUMOLOGIC_ACCESS_ID/);
+});
+
+/** Canaries planted on malformed config lines; every 8-character window of each is distinct so a partial quote is caught too. */
+const CONFIG_CANARIES = {
+  nestedKey: "Qv7ZkT3mR9pXw2Lc",
+  nestedValue: "Hj4NsB8yF6dGa1Ue",
+  alias: "Wm2PxK9rT5vLq7Zb",
+  unterminated: "Lf9BwD4sN7hVe3Ky",
+  indent: "Tn3XcM6zP8gQb5Rw",
+  duplicate: "Rk8VqL2tY7jCn4Fs",
+  readable: "Zx4HnV7qK2mYt9Pw",
+};
+const LIBRARY_ERROR_WORDING = [
+  "Nested mappings", "is not valid JSON", "Unresolved alias", "illegal operation", "permission denied", "no such file",
+  "not a directory", "Unexpected token", "Missing closing", "Map keys must be unique", "must start at the same column",
+];
+
+function fragmentsOf(value, size = 8) {
+  const fragments = [];
+  for (let index = 0; index + size <= value.length; index += 1) fragments.push(value.slice(index, index + size));
+  return fragments;
+}
+
+function assertConfigErrorText(text, { path, code, line, column, canaries }, label) {
+  for (const canary of canaries) {
+    for (const fragment of fragmentsOf(canary)) assert.ok(!text.includes(fragment), `${label} carries a fragment (${fragment}) of ${canary}: ${text}`);
+  }
+  for (const wording of LIBRARY_ERROR_WORDING) assert.ok(!text.includes(wording), `${label} repeats library wording "${wording}": ${text}`);
+  assert.ok(text.includes(path), `${label} names the path ${path}: ${text}`);
+  assert.ok(text.includes(`(${code})`), `${label} carries the code ${code}: ${text}`);
+  if (line) assert.ok(text.includes(` at line ${line}${column ? `, column ${column}` : ""}`), `${label} carries the position line ${line}: ${text}`);
+  else assert.doesNotMatch(text, / at line \d+/, `${label} invents no line: ${text}`);
+}
+
+function thrownBy(fn) {
+  try {
+    fn();
+  } catch (error) {
+    return error;
+  }
+  assert.fail("expected the call to throw");
+}
+
+test("rule 9: Sumo Logic config loader errors carry only the path, position, and code, never a config line or library wording", async () => {
+  const dir = createTempBase("grclanker-sumo-config-errors-");
+  const registered = [];
+  registerSumologicTools({ registerTool: (tool) => registered.push(tool) });
+  const checkAccess = registered.find((tool) => tool.name === "sumologic_check_access");
+  const exportBundle = registered.find((tool) => tool.name === "sumologic_export_audit_bundle");
+  const allCanaries = Object.values(CONFIG_CANARIES);
+
+  const parseCases = [
+    { name: "nested mapping", file: "nested.yaml", text: `access_id: suABCDEF\naccess_key: ${CONFIG_CANARIES.nestedKey}: Bearer ${CONFIG_CANARIES.nestedValue}\n`, leaks: [CONFIG_CANARIES.nestedKey, CONFIG_CANARIES.nestedValue], control: /Nested mappings/, code: "BLOCK_AS_IMPLICIT_KEY", line: 2, column: 13 },
+    { name: "alias", file: "alias.yaml", text: `access_id: suABCDEF\naccess_key: *${CONFIG_CANARIES.alias}\n`, leaks: [CONFIG_CANARIES.alias], control: /Unresolved alias/, code: "INVALID_YAML" },
+    { name: "unterminated quote", file: "quote.yaml", text: `access_id: suABCDEF\naccess_key: "${CONFIG_CANARIES.unterminated}\n`, leaks: [CONFIG_CANARIES.unterminated], control: /Missing closing/, code: "MISSING_CHAR", line: 3, column: 1 },
+    { name: "bad indent", file: "indent.yaml", text: `sumo:\n  access_id: suABCDEF\n access_key: ${CONFIG_CANARIES.indent}\n`, leaks: [CONFIG_CANARIES.indent], control: /same column/, code: "BAD_INDENT", line: 3, column: 1 },
+    { name: "duplicate key", file: "duplicate.yaml", text: `access_key: one\naccess_key: ${CONFIG_CANARIES.duplicate}\n`, leaks: [CONFIG_CANARIES.duplicate], control: /Map keys must be unique/, code: "DUPLICATE_KEY", line: 2, column: 1 },
+  ];
+  for (const testCase of parseCases) {
+    const configFile = join(dir, testCase.file);
+    writeFileSync(configFile, testCase.text);
+    const library = thrownBy(() => parseYaml(testCase.text));
+    assert.match(library.message, testCase.control, `${testCase.name}: positive control uses the library message`);
+    assert.ok(testCase.leaks.some((canary) => fragmentsOf(canary).some((fragment) => library.message.includes(fragment))), `${testCase.name}: positive control, the library message quotes the canary`);
+
+    const expected = { path: configFile, code: testCase.code, line: testCase.line, column: testCase.column, canaries: allCanaries };
+    const thrown = thrownBy(() => resolveSumologicConfiguration({}, { SUMOLOGIC_CONFIG_FILE: configFile }));
+    assert.match(thrown.message, /^Unable to parse Sumo Logic config file: invalid YAML in /, testCase.name);
+    assertConfigErrorText(thrown.message, expected, `${testCase.name} resolver error`);
+    const fromArgs = thrownBy(() => resolveSumologicConfiguration({ config_file: configFile, access_id: "a", access_key: "b" }, {}));
+    assertConfigErrorText(fromArgs.message, expected, `${testCase.name} resolver error with credentials in arguments`);
+
+    const result = await checkAccess.execute("call", checkAccess.prepareArguments({ config_file: configFile }));
+    assertConfigErrorText(JSON.stringify(result), expected, `${testCase.name} check_access payload`);
+  }
+
+  const outputRoot = join(dir, "export");
+  const exported = await exportBundle.execute("call", exportBundle.prepareArguments({ config_file: join(dir, "nested.yaml"), output_dir: outputRoot }));
+  assertConfigErrorText(JSON.stringify(exported), { path: join(dir, "nested.yaml"), code: "BLOCK_AS_IMPLICIT_KEY", line: 2, column: 13, canaries: allCanaries }, "export payload");
+  assert.equal(existsSync(outputRoot), false, "a config error writes no bundle");
+
+  const readCases = [
+    { name: "EISDIR", path: join(dir, "directory.yaml"), setup: (path) => mkdirSync(path), control: /illegal operation/ },
+    { name: "ENOTDIR", path: join(dir, "plain-file", "config.yaml"), setup: (path) => writeFileSync(join(dir, "plain-file"), `access_key: ${CONFIG_CANARIES.readable}\n`), control: /not a directory/ },
+  ];
+  if (process.getuid?.() !== 0) {
+    readCases.push({ name: "EACCES", path: join(dir, "locked.yaml"), setup: (path) => { writeFileSync(path, `access_key: ${CONFIG_CANARIES.readable}\n`); chmodSync(path, 0o000); }, control: /permission denied/ });
+  }
+  for (const testCase of readCases) {
+    testCase.setup(testCase.path);
+    assert.match(thrownBy(() => readFileSync(testCase.path, "utf8")).message, testCase.control, `${testCase.name}: positive control uses the filesystem message`);
+    const expected = { path: testCase.path, code: testCase.name, canaries: allCanaries };
+    const thrown = thrownBy(() => resolveSumologicConfiguration({}, { SUMOLOGIC_CONFIG_FILE: testCase.path }));
+    assert.equal(thrown.message, `Unable to read Sumo Logic config file ${testCase.path} (${testCase.name})`);
+    assertConfigErrorText(thrown.message, expected, `${testCase.name} resolver error`);
+    const result = await checkAccess.execute("call", checkAccess.prepareArguments({ config_file: testCase.path }));
+    assertConfigErrorText(JSON.stringify(result), expected, `${testCase.name} check_access payload`);
+  }
+
+  const missing = join(dir, "missing.yaml");
+  const absent = thrownBy(() => resolveSumologicConfiguration({}, { SUMOLOGIC_CONFIG_FILE: missing }));
+  assert.match(absent.message, /SUMOLOGIC_ACCESS_ID/, "a missing config file is absent, not a read failure");
+  for (const wording of LIBRARY_ERROR_WORDING) assert.ok(!absent.message.includes(wording));
+  const absentResult = JSON.stringify(await checkAccess.execute("call", checkAccess.prepareArguments({ config_file: missing })));
+  assert.ok(absentResult.includes("SUMOLOGIC_ACCESS_ID"));
+  for (const wording of LIBRARY_ERROR_WORDING) assert.ok(!absentResult.includes(wording));
 });
 
 test("resolveSumologicBaseUrl maps every documented deployment and normalizes URLs", () => {
