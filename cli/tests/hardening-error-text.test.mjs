@@ -419,7 +419,9 @@ test("a carrier after a two-character JSON escape is recognised through every en
   ];
   // The escapes as the scrub sees them (two characters, or `\u` and four hex digits), then the
   // controls every escape must equal: a space, a raw line break, an escaped quote, an escaped backslash.
-  const escapes = ["\\n", "\\r", "\\t", "\\b", "\\f", "\\v", "\\r\\n", "\\u000a", "\\u001b"];
+  // `\/` is the JSON escape of the solidus (review of #78 row A): a carrier after it is caught as after
+  // any other escape, so `see \/tmp\/password=<value>` and `request failed\/X-Api-Key: <value>` go.
+  const escapes = ["\\n", "\\r", "\\t", "\\b", "\\f", "\\v", "\\/", "\\r\\n", "\\u000a", "\\u001b"];
   const controls = [" ", 'said \\"', "path C:\\\\"];
   const textScrubs = [
     ["scrubErrorText", (text) => scrubErrorText(text)],
@@ -505,6 +507,27 @@ test("a carrier after a two-character JSON escape is recognised through every en
     assert.equal(scrubErrorText(`request failed${escape}InvalidAuthenticationToken: Access token has expired.`), `request failed${escape}InvalidAuthenticationToken: Access token has expired.`, escape);
     assert.equal(scrubErrorText(`request failed${escape}UnauthorizedAccessException see the log`), `request failed${escape}UnauthorizedAccessException see the log`, escape);
     assert.equal(scrubErrorText(`request failed${escape}kq7zx2vw9lm4tp8 see the log`), `request failed${escape}kq7zx2vw9lm4tp8 see the log`, `${escape}: fifteen characters after the letter are not a long run`);
+  }
+});
+
+test("#78 row A: the escaped solidus is a carrier boundary in the forms the CLI-bridge and JSON bodies carry", () => {
+  // Regression from main at 02967cc: `\/` (the JSON escape of `/`) was not one of the escape boundaries,
+  // so a carrier after a JSON-escaped path segment leaked where main redacted it. `\/` is a boundary
+  // like every other escape, in the error scrub and the data scrubs alike.
+  const value = ERROR_CANARY.bearer;
+  const rows = [
+    [`request failed\\/X-Api-Key: ${value} see the log`, `request failed\\/X-Api-Key: ${REDACTED} see the log`],
+    [`request failed\\/Authorization: Bearer ${value}`, `request failed\\/Authorization: Bearer ${REDACTED}`],
+    [`path\\/client_token: ${value}`, `path\\/client_token: ${REDACTED}`],
+    [`{"detail":"see \\/tmp\\/password=${value}"}`, `{"detail":"see \\/tmp\\/password=${REDACTED}"}`],
+    [`config\\/api_key=${value} see log`, `config\\/api_key=${REDACTED} see log`],
+    // A prose word after the escape stays a boundary, not a value (as after a raw line break).
+    [`request headers\\/no token was sent`, `request headers\\/no token was sent`],
+  ];
+  for (const [text, expected] of rows) {
+    for (const scrub of [scrubErrorText, scrubDataText, (t) => redactSecretValues(t)]) {
+      assert.equal(scrub(text), expected, JSON.stringify(text));
+    }
   }
 });
 

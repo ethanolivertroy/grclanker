@@ -129,10 +129,11 @@ const QUERY_PAIR_PATTERN = /([?&])([A-Za-z0-9_.[\]-]+)=(?!\[REDACTED\])([^&#\s"'
 // `environment-token`, `settings.token`, and `/_security/api_key:` are names and paths, not carriers.
 // A JSON escape sequence ends the run before a name: over JSON-encoded text, and inside the nested
 // strings `describeErrorBody` reads, a line break or tab is the two characters `\n`, `\r`, `\t`
-// (also `\b`, `\f`, `\v`, and `\uXXXX`), so the letter of the escape is a boundary and
-// `request failed\napi_key=<value>`, `\tpassword: <value>`, `\nX-Api-Key: <value>`, and
-// `\r\nBearer <value>` are carriers as they are after a raw line break.
-const NAME_START = String.raw`(?:(?<![A-Za-z0-9_/.-])|(?<=\\[nrtbfv]|\\u[0-9A-Fa-f]{4}))`;
+// (also `\b`, `\f`, `\v`, `\/`, and `\uXXXX`), so the letter of the escape is a boundary and
+// `request failed\napi_key=<value>`, `\tpassword: <value>`, `\nX-Api-Key: <value>`,
+// `\r\nBearer <value>`, and the escaped solidus `see \/tmp\/password=<value>` (`\/` is the JSON escape
+// of `/`, review of #78 row A) are carriers as they are after a raw line break.
+const NAME_START = String.raw`(?:(?<![A-Za-z0-9_/.-])|(?<=\\[nrtbfv/]|\\u[0-9A-Fa-f]{4}))`;
 // The quote that may close a quoted carrier name in JSON or JSON-escaped text (`"X-Api-Key":`,
 // `\"X-Api-Key\":`), then the separator with any spacing around it.
 const NAME_CLOSE_AND_SEPARATOR = String.raw`(?:\\*["'])?\s*[:=]\s*`;
