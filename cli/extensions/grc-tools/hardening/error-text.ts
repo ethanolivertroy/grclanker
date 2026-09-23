@@ -124,9 +124,11 @@ const QUERY_PAIR_PATTERN = /([?&])([A-Za-z0-9_.[\]-]+)=(?!\[REDACTED\])([^&#\s"'
 
 // Carriers. Each carrier pattern matches a name and its separator only; the value that follows is read
 // by a quote-aware reader (see "Carrier values"), never by the pattern, so a quoted value is removed
-// whole and a JSON-escaped quote is a quote rather than a value character. A carrier name stands on
-// its own: it is preceded by neither a word character nor "-", ".", or "/", so `sdk-keys:`,
-// `environment-token`, `settings.token`, and `/_security/api_key:` are names and paths, not carriers.
+// whole and a JSON-escaped quote is a quote rather than a value character. An explicit carrier name
+// (a header, a cookie header, a scheme word, one of `CREDENTIAL_PAIR_NAMES`) stands on its own: it is
+// preceded by neither a word character nor "-", ".", or "/", so `sdk-keys:`, `environment-token`,
+// `settings.token`, and `/_security/api_key:` are names and paths for these rules and are left to the
+// generic pair rule, which reads them whole and after "-" or "/" too (see `PAIR_KEY_START`).
 // A JSON escape sequence ends the run before a name: over JSON-encoded text, and inside the nested
 // strings `describeErrorBody` reads, a line break or tab is the two characters `\n`, `\r`, `\t`
 // (also `\b`, `\f`, `\v`, `\/`, and `\uXXXX`), so the letter of the escape is a boundary and
@@ -300,7 +302,20 @@ const CREDENTIAL_PAIR_PATTERN = new RegExp(String.raw`${NAME_START}(?:${CREDENTI
 // `admin_password:` is a credential as much as an issued token). The separator is captured because
 // the one exemption, a value that continues as prose, is read only after `Key: ` (see
 // `continuesAsProse`); `=` is an assignment and its value is always the credential.
-const GENERIC_PAIR_KEY_PATTERN = new RegExp(String.raw`${NAME_START}([A-Za-z][A-Za-z0-9_.-]{0,63})\b(?:\\*["'])?(\s*[:=]\s*)`, "g");
+// The key of this rule may also start after "-" or "/", and after the `-D` of a Java system property
+// (reviewer #78 row D: a spawned CLI echoes its flags, `mysql --password=<value> -h db`,
+// `java -Dpassword=<value>`, `java -Dspring.datasource.password=<value>`, and a path segment carries a
+// pair, `path/password=<value>`, `/password=<value>`). `=` after a credential-named segment is a pair
+// whatever precedes the name; `:` after a path segment removes a single-token value (`kv/password:
+// <value>`) and keeps a prose continuation under the exemption (`/api/v1/api-tokens: request failed
+// with 403` stays whole). A "." still joins a dotted key, which is read whole (`settings.token`,
+// `Dspring.datasource.password`), and a JSON escape is a boundary as under `NAME_START`.
+const PAIR_KEY_START = String.raw`(?:(?<![A-Za-z0-9_.])|(?<=\\[nrtbfv/]|\\u[0-9A-Fa-f]{4})|(?<=(?<![A-Za-z0-9_])-D))`;
+const GENERIC_PAIR_KEY_PATTERN = new RegExp(String.raw`${PAIR_KEY_START}([A-Za-z][A-Za-z0-9_.-]{0,63})\b(?:\\*["'])?(\s*[:=]\s*)`, "g");
+// A long flag whose argument follows after a space (`psql --password <value> -h db`, row D): the flag
+// keeps its name and the argument goes when the name is a credential key and the argument is not the
+// next flag. The `--name=value` spelling is the generic pair above.
+const FLAG_ARGUMENT_PATTERN = /(?<![A-Za-z0-9_-])--([A-Za-z][A-Za-z0-9_.-]{0,63})[ \t]+(?!-)/g;
 // The prose exemption of the generic pair rule: a value continues as prose when it is one plain word
 // of letters (lowercase or capitalised, at most `PROSE_WORD_MAX_LENGTH` letters) or a count of at
 // most five digits, followed on the same line by a space and another word, number, or parenthesis,
@@ -791,6 +806,8 @@ function readSettingValue(text: string, valueStart: number): ValueReplacement | 
 /** A credential header's value, unless the header name says the value is a descriptor (`...-token-type`). */
 const readHeaderValue: ValueReader = (text, valueStart, carrier) => (HEADER_DESCRIPTOR_SUFFIX_PATTERN.test(carrier[1]) ? null : readCarrierValue(text, valueStart, HEADER_BARE_VALUE_PATTERN));
 const readPairValue: ValueReader = (text, valueStart) => readCarrierValue(text, valueStart, PAIR_BARE_VALUE_PATTERN);
+/** The argument of a long flag (`--password <value>`), when the flag names a credential (see `FLAG_ARGUMENT_PATTERN`). */
+const readFlagArgument: ValueReader = (text, valueStart, carrier) => (isCredentialKey(carrier[1]) ? readCarrierValue(text, valueStart, PAIR_BARE_VALUE_PATTERN) : null);
 
 /** Index just past a cookie pair's or attribute's value, which may be quoted. */
 function cookieValueEnd(text: string, index: number): number {
@@ -945,7 +962,8 @@ export function scrubErrorText(text: string, options: ScrubErrorTextOptions = {}
   scrubbed = replaceCarrierValues(scrubbed, CREDENTIAL_HEADER_PATTERN, readHeaderValue);
   scrubbed = replaceCarrierValues(scrubbed, SCHEME_WORD_PATTERN, readSchemeValue);
   scrubbed = replaceCarrierValues(scrubbed, CREDENTIAL_PAIR_PATTERN, readPairValue);
-  scrubbed = replaceGenericCredentialPairs(scrubbed)
+  scrubbed = replaceGenericCredentialPairs(scrubbed);
+  scrubbed = replaceCarrierValues(scrubbed, FLAG_ARGUMENT_PATTERN, readFlagArgument)
     .replace(JWT_PATTERN, REDACTED)
     .replace(AWS_ACCESS_KEY_ID_PATTERN, REDACTED)
     .replace(AWS_SECRET_PATTERN, (run) => (looksLikeAwsSecret(run) ? REDACTED : run));

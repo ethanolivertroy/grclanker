@@ -506,3 +506,62 @@ test("settings: a token-shaped value under a setting key beside a credential wor
     }
   }
 });
+
+test("#78 row D: a credential name after --, -D, -Dprefix., or a path segment is a carrier in every sink, and the path label control keeps its prose", () => {
+  // Regression from main at 02967cc: `NAME_START` forbade "-" and "/" before a name, so the flags a
+  // spawned CLI echoes (`mysql --password=<v>`, `java -Dpassword=<v>`) and a pair after a path segment
+  // (`kv/password: <v>`) passed every scrub. The generic pair rule now starts a key after "-" or "/"
+  // (`PAIR_KEY_START`), and `--name <value>` with a space is its own carrier (`FLAG_ARGUMENT_PATTERN`).
+  const word = "skvclmtirehs";
+  const token = "yln2bVNl4tE9Cyp1B18V2mX7CVud5LhW";
+  const keys = ["password", "api_key", "api-key", "client_secret", "client-secret", "token", "access_token", "secret_id", "DB_PASSWORD", "X-Api-Key", "private-key", "SERVICENOW_PASSWORD", "DUO_SKEY", "refresh_token"];
+  const forms = [
+    [(key, value) => `mysql --${key}=${value} -h db`, (key) => [`mysql --${key}=`, " -h db"]],
+    [(key, value) => `psql --${key} ${value} -h db`, (key) => [`psql --${key} `, " -h db"]],
+    [(key, value) => `--${key}=${value}`, (key) => [`--${key}=`]],
+    [(key, value) => `curl --${key}=${value} https://api.example.com/v1`, (key) => [`curl --${key}=`, " https://api.example.com/v1"]],
+    [(key, value) => `java -D${key}=${value} -jar app.jar`, (key) => [`java -D${key}=`, " -jar app.jar"]],
+    [(key, value) => `java -Dspring.datasource.${key}=${value} -jar app.jar`, (key) => [`java -Dspring.datasource.${key}=`, " -jar app.jar"]],
+    [(key, value) => `path/${key}=${value} see log`, (key) => [`path/${key}=`, " see log"]],
+    [(key, value) => `/${key}=${value}`, (key) => [`/${key}=`]],
+    [(key, value) => `kv/${key}: ${value}`, (key) => [`kv/${key}: `]],
+  ];
+  let trials = 0;
+  for (const key of keys) {
+    for (const value of [word, token]) {
+      for (const [form, keep] of forms) {
+        const text = form(key, value);
+        for (const [sinkName, sink] of SINKS) {
+          trials += 1;
+          const output = sink(text);
+          assert.ok(!leaked(output, value), `${JSON.stringify(text)} leaked through ${sinkName}: ${JSON.stringify(output)}`);
+          const rendered = typeof output === "string" ? output : JSON.stringify(output);
+          for (const fragment of keep(key)) assert.ok(rendered.includes(fragment), `${JSON.stringify(text)} lost ${JSON.stringify(fragment)} through ${sinkName}: ${rendered}`);
+        }
+      }
+    }
+  }
+  assert.equal(trials, keys.length * 2 * forms.length * SINKS.length);
+  for (const [text, expected] of [
+    [`mysql --password=${word} -h db`, `mysql --password=${REDACTED} -h db`],
+    [`psql --password ${word} -h db`, `psql --password ${REDACTED} -h db`],
+    [`psql --password '${word}' -h db`, `psql --password '${REDACTED}' -h db`],
+    [`java -Dspring.datasource.password=${word} -jar app.jar`, `java -Dspring.datasource.password=${REDACTED} -jar app.jar`],
+    [`kv/password: ${word}`, `kv/password: ${REDACTED}`],
+    [`/password=${word}`, `/password=${REDACTED}`],
+    // The controls the ruling keeps: a path label whose `:` continues as prose, the flag forms main
+    // already handled, a setting flag, a flag with no argument, and the prose the sources emit.
+    ["/api/v1/api-tokens: request failed with 403", "/api/v1/api-tokens: request failed with 403"],
+    ["GET /_security/api_key: 403 Forbidden", "GET /_security/api_key: 403 Forbidden"],
+    [`helm --set db.password=${word} upgrade`, `helm --set db.password=${REDACTED} upgrade`],
+    ["--token-url https://api.example.com/oauth2/token", "--token-url https://api.example.com/oauth2/token"],
+    ["--password --verbose", "--password --verbose"],
+    ["sdk-keys: 3 of 5 rotated", "sdk-keys: 3 of 5 rotated"],
+    ["Content-Type: application/json", "Content-Type: application/json"],
+  ]) {
+    assert.equal(scrubErrorText(text), expected, text);
+    assert.equal(scrubDataText(text), expected, text);
+    assert.equal(redactSecretValues(text), expected, text);
+    assert.equal(scrubErrorText(expected), expected, `idempotent: ${text}`);
+  }
+});
