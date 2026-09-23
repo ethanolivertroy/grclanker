@@ -1816,6 +1816,68 @@ test("reviewer E finding A: an unquoted pair value, a single-token header value,
   assert.equal(cases, 2 * FINDING_A_FIRST_CARRIERS.length * FINDING_A_ESCAPES.length * FINDING_A_SECOND_CARRIERS.length * FINDING_A_CONTEXTS.length);
 });
 
+// Reviewer E finding D (ruling R5): a colon-terminated credential key that ends a path
+// segment is a label whose value is at most one token. A singular label (password, token,
+// api_key, secret) takes that token whatever its shape, a random token or a plain word,
+// and whatever follows it, so "/etc/app/password: <value> was rejected" renders
+// "/etc/app/password: [REDACTED] was rejected"; a plural label (api-tokens, tokens, apikeys,
+// passwords, credentials) names a collection, so prose after the token means there was no
+// value ("/api/v1/api-tokens: request failed with 403" stays) while a lone token after it is
+// one; a count under a plural label stays; an escaped slash before the key is not a path.
+const FINDING_D_VALUES = ["hunter2first", "hunter2", "3f9c2b1e-7a4d-4c58-9b0e-2d6f8a1c5e73", "Kq7Zx2Vw9Lm4Tp8RfS1uY3cB6dN0hJ5g", "mfa.Xk9pQ2.rT7vN4wL8s"];
+const FINDING_D_SINGULAR_LABELS = ["/etc/app/password: ", "secrets/db/password: ", "vault read secret/app/token: ", "/run/secrets/api_key: ", "GET /api/v2/oauth/token: ", "kv/data/app/secret: ", "# /etc/app/password: ", "https://vault.example.com:8200/v1/secret/app/key: "];
+const FINDING_D_PLURAL_LABELS = ["/api/v1/api-tokens: ", "GET /api/v2/oauth/tokens: ", "/api/v1/apikeys: ", "/etc/app/passwords: ", "/v1/credentials: ", "/api/v1/keys: "];
+const FINDING_D_TAILS = [" was rejected", " is expired", " has no policy", ""];
+const FINDING_D_PROSE = ["request failed with 403", "listing returned 200 items", "read refused for this role"];
+const FINDING_D_CONTEXTS = [
+  ["bare", (line) => line],
+  ["JSON member", (line) => `{"detail":"${line}","code":403}`],
+  ["escaped line", (line) => `request failed\\n${line}\\nContent-Type: application/json`],
+];
+const FINDING_D_CONTROLS = [
+  "/api/v1/api-tokens: request failed with 403",
+  "GET /api/v2/oauth/tokens: request failed",
+  "/api/v2/oauth/tokens: 3",
+  "/api/v1/keys: listing returned 200 items",
+  "/rest/token failed (403): upstream rejected the request",
+  "GET /api/v2/users/me.json: request failed with 403",
+  "/etc/app/password:",
+  "/etc/app/password: [REDACTED] was rejected",
+];
+
+test("reviewer E finding D: a singular credential label at the end of a path segment takes the next token whatever its shape and whatever follows, a plural label followed by prose stays and followed by a lone token loses it, in both scrubs, bare, as a JSON member, and on an escaped line", () => {
+  let cases = 0;
+  for (const scrub of [redactErrorText, redactCredentialValueText]) {
+    for (const value of FINDING_D_VALUES) for (const [context, wrap] of FINDING_D_CONTEXTS) {
+      for (const label of FINDING_D_SINGULAR_LABELS) for (const tail of FINDING_D_TAILS) {
+        const input = wrap(`${label}${value}${tail}`);
+        const out = scrub(input);
+        const name = `reviewer E finding D: ${scrub.name} ${context} ${JSON.stringify(input)} -> ${JSON.stringify(out)}`;
+        assert.equal(out, wrap(`${label}[REDACTED]${tail}`), name);
+        assertNoWindow(out, value, name);
+        assert.equal(scrub(out), out, `${name}: not idempotent`);
+        cases += 1;
+      }
+      for (const label of FINDING_D_PLURAL_LABELS) {
+        const lone = wrap(`${label}${value}`);
+        const out = scrub(lone);
+        const name = `reviewer E finding D: ${scrub.name} ${context} ${JSON.stringify(lone)} -> ${JSON.stringify(out)}`;
+        assert.equal(out, wrap(`${label}[REDACTED]`), `${name}: a lone token after a plural label is its value`);
+        assertNoWindow(out, value, name);
+        cases += 1;
+      }
+    }
+    for (const [context, wrap] of FINDING_D_CONTEXTS) for (const label of FINDING_D_PLURAL_LABELS) for (const prose of FINDING_D_PROSE) {
+      const input = wrap(`${label}${prose}`);
+      assert.equal(scrub(input), input, `reviewer E finding D: ${scrub.name} ${context} changed a plural label followed by prose: ${JSON.stringify(input)}`);
+      cases += 1;
+    }
+    assert.equal(scrub("line\\/password: hunter2first was rejected"), "line\\/password: [REDACTED]", `reviewer E finding D: ${scrub.name} an escaped slash before the key is a line break, not a path, so the key: value line goes to its end`);
+    for (const text of FINDING_D_CONTROLS) assert.equal(scrub(text), text, `reviewer E finding D: ${scrub.name} changed a control: ${text}`);
+  }
+  assert.equal(cases, 2 * (FINDING_D_VALUES.length * FINDING_D_CONTEXTS.length * (FINDING_D_SINGULAR_LABELS.length * FINDING_D_TAILS.length + FINDING_D_PLURAL_LABELS.length) + FINDING_D_CONTEXTS.length * FINDING_D_PLURAL_LABELS.length * FINDING_D_PROSE.length));
+});
+
 test("scrub boundary: name-shaped values stay bare in prose, leave every carrier whatever their shape, and go as configured secrets in every form", () => {
   for (const value of NAME_SHAPED_VALUES) {
     for (const prose of [`device ${value} was not read`, `${value}`, `inventory ${value} read 12 of 40 resources`, `path /var/lib/${value}/state`]) {

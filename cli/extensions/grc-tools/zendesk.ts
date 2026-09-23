@@ -642,10 +642,15 @@ const ESCAPED_CONTROL_SOURCE = String.raw`\\(?:[nrtbfv0]|u(?:00[01][0-9a-fA-F]|0
 // command line too), and the value is the one token after it, never another flag, ending
 // where an unquoted pair value does.
 const FLAG_VALUE_PATTERN = new RegExp(String.raw`(?<![A-Za-z0-9_-])--([A-Za-z][A-Za-z0-9_.-]{0,63})([ \t]+)((?!\[REDACTED\])(?!-)(?:(?!${ESCAPED_CONTROL_SOURCE})[^\s\x00-\x1f\x7f"'<>;,&])+)`, "g");
-// After a credential-named path segment and ":" (kv/password: value) the value is one token;
-// prose after that token (/api/v1/api-tokens: request failed with 403) makes the segment a
-// label, not a pair.
+// After a credential-named path segment and ":" (kv/password: value) the value is at most
+// one token. A singular label (password, token, key) takes that token whatever its shape
+// and whatever follows it (/etc/app/password: <value> was rejected); a plural label names a
+// collection (/api/v1/api-tokens: request failed with 403), so prose after the token means
+// there was no value, while a lone token after a plural label is one.
 const PROSE_CONTINUATION_PATTERN = /^[ \t]+[A-Za-z]/;
+// A key whose last word is a plural credential word, in the segment split (api-tokens, keys,
+// oauth_tokens) or concatenated (apikeys, sshkeys).
+const PLURAL_CREDENTIAL_LABEL_PATTERN = /(?:token|secret|key|cookie|password|credential|passphrase|signature|session)s$/;
 // The "-D" of a Java system property (java -Dkey=value) is not part of the key.
 const JAVA_PROPERTY_PREFIX_PATTERN = /(?:^|\s)-$/;
 // A delimited (key=value) value ends at whitespace or a control character, raw or left
@@ -775,6 +780,14 @@ function isCountValue(key: string, value: string): boolean {
   if (!COUNT_VALUE_PATTERN.test(value)) return false;
   const words = keyWords(key);
   return words.length > 0 && PLURAL_CREDENTIAL_WORDS.has(words[words.length - 1]);
+}
+
+// True for a key whose last word is a plural credential word (api-tokens, keys, apikeys): a
+// collection, so as a path label it is a pair only when a lone token follows.
+function isPluralCredentialKey(key: string): boolean {
+  const words = keyWords(key);
+  const last = words[words.length - 1];
+  return last !== undefined && (PLURAL_CREDENTIAL_WORDS.has(last) || PLURAL_CREDENTIAL_LABEL_PATTERN.test(last));
 }
 
 /** isCredentialKey plus the words that name a credential only in a query string or = assignment. */
@@ -1167,9 +1180,11 @@ function scrubHeaderLines(text: string): string {
 // pair nested inside it (data=token=...) is still caught. A value the scheme rule already
 // reduced to "<scheme> [REDACTED]" keeps its scheme word under an Authorization key and loses
 // it under any other credential key, where the scheme word was the start of the value. A
-// colon-terminated key that ends a path segment (/api/v1/api-tokens: request failed) is a
-// label, not a pair: its value is one token, and a prose continuation after the token means
-// there was no value at all; an escaped slash (\/) before the key is a line break, not a path.
+// colon-terminated key that ends a path segment is a label whose value is at most one token:
+// a singular label (/etc/app/password: <value> was rejected) takes that token whatever its
+// shape and whatever follows, and a plural label (/api/v1/api-tokens: request failed) takes
+// it only when no prose continues after it, since prose means there was no value at all; an
+// escaped slash (\/) before the key is a line break, not a path.
 function replaceCredentialAssignments(text: string): string {
   ASSIGNMENT_KEY_PATTERN.lastIndex = 0;
   let out = "";
@@ -1203,7 +1218,7 @@ function replaceCredentialAssignments(text: string): string {
     valuePattern.lastIndex = valueStart;
     const value = valuePattern.exec(text)?.[0];
     if (value === undefined || STRUCTURAL_VALUE_PATTERN.test(value) || isCountValue(name, value)) continue;
-    if (pathLabel && PROSE_CONTINUATION_PATTERN.test(text.slice(valueStart + value.length))) continue;
+    if (pathLabel && isPluralCredentialKey(name) && PROSE_CONTINUATION_PATTERN.test(text.slice(valueStart + value.length))) continue;
     out += `${text.slice(last, match.index)}${openingQuote}${key}${separator}${CREDENTIAL_REDACTION_MARKER}`;
     last = valueStart + value.length;
     ASSIGNMENT_KEY_PATTERN.lastIndex = last;
