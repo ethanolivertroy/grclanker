@@ -1066,6 +1066,54 @@ test("assessKnowbe4TrainingProgram degrades remedial training to warn when tests
   assert.equal(full.evidence.sampled_security_tests.length, 3);
 });
 
+test("assessKnowbe4TrainingProgram renders remediated_users as null when the enrollments read stopped before any remediation was seen", async () => {
+  const fixture = healthyFixture();
+
+  // Capped: the first four enrollments belong to users who never failed a test, and the remediation sits beyond the cap.
+  // Zero remediations among the records read is not an observation that none happened.
+  const cappedSnapshot = await collectKnowbe4Snapshot(mockClient(fixture), { scopes: ["training"], now: NOW, enrollmentLimit: 4 });
+  assert.equal(cappedSnapshot.enrollmentLimitReached, true);
+  const capped = findingFor(assessKnowbe4TrainingProgram(cappedSnapshot, { now: NOW }), 10);
+  assert.equal(capped.status, "warn");
+  assert.match(capped.summary, /truncated at enrollment_limit \(4\)/);
+  assert.equal(capped.evidence.failed_users_evaluated, 1);
+  assert.equal(capped.evidence.remediated_users, null);
+  assert.equal(capped.evidence.unremediated_users, null);
+  assert.equal(capped.evidence.remediated_pct, null);
+  assert.ok(capped.evidence.truncated_inventories.some((row) => row.inventory === "training_enrollments" && row.seen === 4));
+
+  // Zero rows read while the server reported more: the same null, beside the marker that says why.
+  const zeroRowsClient = mockClient(fixture);
+  zeroRowsClient.listTrainingEnrollments = async () => ({ items: [], truncated: true, truncationReason: "the server repeated the same page", total: 500 });
+  const zeroRowsSnapshot = await collectKnowbe4Snapshot(zeroRowsClient, { scopes: ["training"], now: NOW });
+  const zeroRows = findingFor(assessKnowbe4TrainingProgram(zeroRowsSnapshot, { now: NOW }), 10);
+  assert.equal(zeroRows.status, "warn");
+  assert.equal(zeroRows.evidence.remediated_users, null);
+  assert.equal(zeroRows.evidence.unremediated_users, null);
+  assert.ok(zeroRows.evidence.truncated_inventories.some((row) => row.inventory === "training_enrollments" && row.seen === 0 && row.total === 500));
+
+  // A remediation seen within a read that still stopped at its cap is a real observation and renders as a lower bound.
+  const partialSnapshot = await collectKnowbe4Snapshot(mockClient(fixture), { scopes: ["training"], now: NOW, enrollmentLimit: fixture.enrollments.length });
+  assert.equal(partialSnapshot.enrollmentLimitReached, true);
+  const partial = findingFor(assessKnowbe4TrainingProgram(partialSnapshot, { now: NOW }), 10);
+  assert.equal(partial.status, "warn");
+  assert.equal(partial.evidence.remediated_users, 1);
+  assert.equal(partial.evidence.unremediated_users, null);
+
+  // An unreadable enrollments listing has no count to report either: the manual finding carries the gap, not a zero.
+  const unreadableClient = mockClient(fixture, { failures: { listTrainingEnrollments: "KnowBe4 request failed (403 Forbidden) for /v1/training/enrollments" } });
+  const unreadableSnapshot = await collectKnowbe4Snapshot(unreadableClient, { scopes: ["training"], now: NOW });
+  const unreadable = findingFor(assessKnowbe4TrainingProgram(unreadableSnapshot, { now: NOW }), 10);
+  assert.equal(unreadable.status, "manual");
+  assert.equal(unreadable.evidence.remediated_users ?? null, null);
+
+  // A complete read asserts the count, zero included.
+  const complete = findingFor(assessKnowbe4TrainingProgram(await collectKnowbe4Snapshot(mockClient(fixture), { scopes: ["training"], now: NOW }), { now: NOW }), 10);
+  assert.equal(complete.evidence.remediated_users, 1);
+  const none = findingFor(assessKnowbe4TrainingProgram(await collectKnowbe4Snapshot(mockClient(failingFixture()), { scopes: ["training"], now: NOW }), { now: NOW }), 10);
+  assert.equal(none.evidence.remediated_users, 0);
+});
+
 test("assessKnowbe4TrainingProgram treats a -1 completion sentinel with truncated enrollments as unmeasurable", async () => {
   const fixture = healthyFixture();
   // The documented "too large to calculate" sentinel forces the enrollment fallback; the first three enrollments passed and the next three never started.

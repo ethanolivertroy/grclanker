@@ -1832,6 +1832,16 @@ function whenAllComplete<T>(collections: Knowbe4Collected<unknown>[], value: T):
   return collections.every(isComplete) ? value : null;
 }
 
+/**
+ * The count of records observed to hold a property: a positive count is a real observation and renders (a lower bound
+ * while a source inventory stopped short, which the truncation marker beside it records); zero is asserted only from
+ * inventories read to completion and renders null from a read that stopped or failed, so an absence is never derived
+ * from a partial inventory.
+ */
+function observedCount(collections: Knowbe4Collected<unknown>[], count: number): number | null {
+  return count > 0 || collections.every(isComplete) ? count : null;
+}
+
 /** The truncation flag of an inventory; null when the inventory was never read, so a flag cannot default on a scan that did not run. */
 function truncatedFlag(collection: Knowbe4Collected<unknown>): boolean | null {
   return isRead(collection) ? collection.truncated === true : null;
@@ -3311,7 +3321,8 @@ function assessRemedialTraining(snapshot: Knowbe4Snapshot, now: Date, lookbackDa
     failed_users_in_window: recipients.complete ? failures.size : null,
     failed_users_in_sampled_tests: sampled ? failures.size : null,
     failed_users_evaluated: sampled ? evaluable.length : null,
-    remediated_users: sampled ? remediated.length : null,
+    // A remediation is observed in the enrollments read; none observed in a truncated read is unknown, not zero.
+    remediated_users: sampled ? observedCount([snapshot.trainingEnrollments], remediated.length) : null,
     unremediated_users: sampled && enrollmentsComplete ? unremediated.length : null,
     remediated_pct: sampled && enrollmentsComplete ? remediatedPct ?? null : null,
     violation_observed: violationFlag([enrollmentsComplete, recipients.complete], enrollmentsComplete ? unremediated.length : 0),
