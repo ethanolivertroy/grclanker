@@ -785,10 +785,12 @@ const BARE_SHAPE_PATTERNS: ReadonlyArray<TextRule> = [
  * URL userinfo and query strings anywhere in the string, not only when the string starts with a URL: any scheme
  * (`https://`, `proxy://`), plain or with its slashes JSON-escaped (`https:\/\/`, reviewer #78 row C), after a
  * JSON escape as after any other boundary. The scheme, host, and path stay; the userinfo goes and the query
- * becomes the marker.
+ * becomes the marker. The userinfo ends at the first `/`, `?`, or `#` as at whitespace (CodeRabbit on #76), so an
+ * `@` inside a query or a fragment is not a userinfo boundary: `https://h?e=a@x.com&token=v` is host `h` with a
+ * query, which becomes the marker whole, and `https://h#f@x.com` is host `h` with a fragment, kept.
  */
 const ERROR_URL_PATTERN = new RegExp(
-  String.raw`(?:(?<![A-Za-z0-9+.\\-])|(?<=\\[nrtbfv])|(?<=\\u[0-9A-Fa-f]{4}))([A-Za-z][A-Za-z0-9+.-]*:(?:\/\/|\\\/\\\/))(?:[^\s\/@"'<>\\]+@)?((?:[^\s?#"'<>\\]|\\\/)+)(\?(?:[^\s#"'<>\\]|\\\/)*)?`,
+  String.raw`(?:(?<![A-Za-z0-9+.\\-])|(?<=\\[nrtbfv])|(?<=\\u[0-9A-Fa-f]{4}))([A-Za-z][A-Za-z0-9+.-]*:(?:\/\/|\\\/\\\/))(?:[^\s\/?#@"'<>\\]+@)?((?:[^\s?#"'<>\\]|\\\/)+)(\?(?:[^\s#"'<>\\]|\\\/)*)?`,
   "g",
 );
 

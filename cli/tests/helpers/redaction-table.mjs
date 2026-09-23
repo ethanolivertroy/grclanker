@@ -230,6 +230,38 @@ export function assertFlagAndPathPairRows(assert, redact, rows = FLAG_AND_PATH_P
 }
 
 /**
+ * URL userinfo boundary (CodeRabbit on #76 at b0ef16f): the userinfo of the URL rule ends at the first `/`, `?`,
+ * or `#` as at whitespace, so an `@` inside a query or a fragment is not a userinfo boundary. Before the fix
+ * `https://h?e=a@x.com&token=s3cr3t` read as userinfo `h?e=a@` and host `x.com&token=s3cr3t`, so the query rule
+ * never saw the token: the pair rule removed `token=s3cr3t` on its own, while the same query under a benign key
+ * (`&v=s3cr3t`, the third row) reached the output whole, and `https://h#f@x.com` read as userinfo `h#f@` and host
+ * `x.com`. Each row is `[text, expected]`: the host `h` stays, a query becomes the marker whole, and a fragment
+ * is kept. The rows hold for the error sink, the data-string sink, and a snapshot string alike.
+ */
+export const URL_USERINFO_BOUNDARY_ROWS = Object.freeze([
+  ["https://h?e=a@x.com&token=s3cr3t", "https://h?[REDACTED]"],
+  ["https://h#f@x.com", "https://h#f@x.com"],
+  ["https://h?e=a@x.com&v=s3cr3t", "https://h?[REDACTED]"],
+]);
+
+/**
+ * Asserts each URL userinfo boundary row scrubs to exactly its expected text, bare and inside a sentence, that a
+ * second pass changes nothing, and that no window of the query value survives in any output.
+ */
+export function assertUrlUserinfoBoundaryRows(assert, redact, { label = "redact", rows = URL_USERINFO_BOUNDARY_ROWS } = {}) {
+  const outputs = [];
+  for (const [text, expected] of rows) {
+    const output = redact(text);
+    assert.equal(output, expected, `${label} URL userinfo boundary: ${text}`);
+    assert.equal(redact(output), output, `${label}: a second pass over ${JSON.stringify(output)} changes nothing`);
+    const sentence = redact(`upstream ${text} rejected the request`);
+    assert.equal(sentence, `upstream ${expected} rejected the request`, `${label} URL userinfo boundary inside a sentence: ${text}`);
+    outputs.push(output, sentence);
+  }
+  assertNoCanaryWindows(assert, outputs.join("\n"), ["s3cr3t"], `${label} URL userinfo boundary rows`);
+}
+
+/**
  * The bearer-id override to the identifier ruling above (CodeRabbit r4077259415 on #78): a key ending in `secret_id`,
  * any prefix, casing, and separator, holds a Vault AppRole secret id, and a session-id key holds a session token;
  * each authenticates rather than identifies, so it is a credential key despite its `id` suffix and its value is

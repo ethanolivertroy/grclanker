@@ -77,6 +77,7 @@ import {
   assertFixedTextsSurvive,
   assertIdentifierKeyRows,
   assertFlagAndPathPairRows,
+  assertUrlUserinfoBoundaryRows,
   assertMustKeepRows,
   assertMustRedactRowsBesideMustKeep,
   withPlantedRoutes,
@@ -996,6 +997,11 @@ test("rule 9 credential-named pairs (reviewer D round 5 baseline): a value under
   }
 });
 
+test("rule 9 URL userinfo boundary (CodeRabbit on #76 at b0ef16f): an `@` inside a query or a fragment is not a userinfo boundary, so the real host stays, a query becomes the marker whole, and a fragment is kept, on the error sink, the data-string sink, and a snapshot string", () => {
+  assertUrlUserinfoBoundaryRows(assert, redactErrorText, { label: "azure.redactErrorText" });
+  assertUrlUserinfoBoundaryRows(assert, redactCarrierText, { label: "azure.redactCarrierText" });
+  assertUrlUserinfoBoundaryRows(assert, (text) => scrubSnapshotValue(text), { label: "azure.scrubSnapshotValue" });
+});
 test("rule 9 bearer-id override (CodeRabbit r4077259415 on #78): a key ending in secret_id or naming a session id is a credential key despite its id suffix, so a Vault AppRole secret id goes whatever its shape, a UUID included, through the error sink, the data-string sink, the snapshot walker, and the thrown error, while AZURE_TENANT_ID=<uuid> and the other identifier keys keep their values", async () => {
   assertBearerIdKeyRows(assert, redactErrorText);
   assertBearerIdKeyRows(assert, redactCarrierText, { controls: BEARER_ID_CARRIER_CONTROL_ROWS });
