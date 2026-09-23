@@ -262,11 +262,13 @@ export function assertUrlUserinfoBoundaryRows(assert, redact, { label = "redact"
 }
 
 /**
- * The bearer-id override to the identifier ruling above (CodeRabbit r4077259415 on #78): a key ending in `secret_id`,
- * any prefix, casing, and separator, holds a Vault AppRole secret id, and a session-id key holds a session token;
- * each authenticates rather than identifies, so it is a credential key despite its `id` suffix and its value is
- * removed whatever its shape, a UUID included. Every key rides every form of credentialPairForms with a UUID, a
- * random, and a name-shaped value; none of the values' 6-to-24 windows occurs in any key, form, or sentence.
+ * The bearer-id override to the identifier ruling above (CodeRabbit r4077259415 on #78): a key ending in `secret_id`
+ * or `token_id`, any prefix, casing, and separator, holds a Vault AppRole secret id or a token id that is itself the
+ * bearer, and a session-id key holds a session token; each authenticates rather than identifies, so it is a
+ * credential key despite its `id` suffix and its value is removed whatever its shape, a UUID included. Every key
+ * rides every form of credentialPairForms with a UUID, a random, and a name-shaped value; none of the values'
+ * 6-to-24 windows occurs in any key, form, or sentence. The `token_id` keys pin the row the modules already
+ * implemented (SNAPSHOT_BEARER_ID_KEY_PATTERN and ERROR_CREDENTIAL_WORDS name both suffixes; CodeRabbit on #76).
  */
 export const BEARER_ID_KEYS = Object.freeze([
   "secret_id",
@@ -276,6 +278,9 @@ export const BEARER_ID_KEYS = Object.freeze([
   "role_secret_id",
   "roleSecretId",
   "vault.secret_id",
+  "token_id",
+  "TOKEN_ID",
+  "tokenId",
   "session_id",
   "sid",
   "sessid",
@@ -318,13 +323,14 @@ export function assertBearerIdKeyRows(assert, redact, { keys = BEARER_ID_KEYS, v
 }
 
 /**
- * Asserts the bearer-id override on a snapshot walker: a value under a key ending in `secret_id` is the marker at
- * the top level and nested, while the identifier keys beside it keep their values, whatever the shape of either.
+ * Asserts the bearer-id override on a snapshot walker: a value under a key ending in `secret_id` or `token_id` is
+ * the marker at the top level and nested, while the identifier keys beside it keep their values, whatever the
+ * shape of either.
  */
 export function assertBearerIdSnapshotKeys(assert, scrubSnapshot, values = BEARER_ID_VALUES) {
   for (const value of values) {
     const identifiers = { AZURE_TENANT_ID: value, client_id: value, tenant_id: value, role_id: value, access_key_id: value, key_id: value, secret_name: value, user_id: value };
-    const bearers = { secret_id: value, SECRET_ID: value, VAULT_SECRET_ID: value, role_secret_id: value, roleSecretId: value };
+    const bearers = { secret_id: value, SECRET_ID: value, VAULT_SECRET_ID: value, role_secret_id: value, roleSecretId: value, token_id: value, TOKEN_ID: value, tokenId: value };
     const output = scrubSnapshot({ ...identifiers, ...bearers, nested: { approle: { ...identifiers, ...bearers } }, list: [{ ...bearers }] });
     for (const record of [output, output.nested.approle, output.list[0]]) {
       for (const key of Object.keys(bearers)) assert.equal(record[key], "[REDACTED]", `snapshot key ${key} holds the marker for ${value}`);
