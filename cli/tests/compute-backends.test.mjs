@@ -1205,7 +1205,11 @@ test("runpod pod staging uploads the git index only and never a planted secret",
 test("runpod pod staging denies the whole .env family and every gitignore secret name even when force-added", async () => {
   const repo = mkdtempSync(join(tmpdir(), "grclanker-pod-deny-"));
   // Every path below is ignored by this repository's own .gitignore and then force-added, the way
-  // a credential file lands in the index by mistake. Each carries a distinct canary.
+  // a credential file lands in the index by mistake. Each carries a distinct canary. The two
+  // `.dev.vars.example` directories are the exception: .gitignore's `!.dev.vars.example` negation
+  // lets them through without -f, so the deny layer is the only thing keeping them local. They sit
+  // under separate parents because the root already holds the template file of that name and the
+  // two casings would collide on a case-insensitive filesystem.
   const forceAdded = {
     ".envrc": "export PLANTED=fake-envrc-canary-a1\n",
     ".env.local": "PLANTED=fake-env-local-canary-b2\n",
@@ -1226,6 +1230,8 @@ test("runpod pod staging denies the whole .env family and every gitignore secret
     "legacy/Credentials.JSON": "{\"secret\":\"fake-case-canary-q7\"}\n",
     ".dev.vars": "PLANTED=fake-dev-vars-canary-r8\n",
     ".dev.vars.production": "PLANTED=fake-dev-vars-production-canary-s9\n",
+    "cf/.dev.vars.example/token": "fake-dev-vars-example-dir-canary-b8\n",
+    "cf-upper/.DEV.VARS.EXAMPLE/token": "fake-dev-vars-example-upper-dir-canary-c9\n",
     ".secrets/token.txt": "fake-secrets-dir-canary-t0\n",
     "keys/id_rsa": "fake-id-rsa-canary-u1\n",
     "keys/server.key": "fake-server-key-canary-v2\n",
@@ -1236,7 +1242,8 @@ test("runpod pod staging denies the whole .env family and every gitignore secret
     "keys/bundle.p12": "fake-p12-canary-a7\n",
   };
   // Ordinary tracked files, including names that merely contain "env", the negated
-  // `.dev.vars.example` template, and a public key half, must still stage.
+  // `.dev.vars.example` template as a file (at the root, nested, and upper-cased), and a public
+  // key half, must still stage.
   const ordinary = {
     "README.md": "# tracked\n",
     "environment.md": "# environment notes\n",
@@ -1244,6 +1251,8 @@ test("runpod pod staging denies the whole .env family and every gitignore secret
     "guides/env.md": "# env guide\n",
     "src/exporter.ts": "export const exporter = true;\n",
     ".dev.vars.example": "PLANTED=replace-me\n",
+    "nested/dir/.dev.vars.example": "PLANTED=replace-me-nested\n",
+    "nested/upper/.DEV.VARS.EXAMPLE": "PLANTED=replace-me-upper\n",
     "keys/id_ed25519.pub": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIPublicHalfOnly comment\n",
   };
   try {
@@ -1301,6 +1310,9 @@ test("runpod pod staging denies the whole .env family and every gitignore secret
       "deploy/my.service-account.v2.json", "acme-service-account.json", "service-account.json", "Service-Account.JSON",
       "ops/.okta.yaml", "data/export/x.zip", "deep/oscal-workspace/y", ".secrets/x", ".secrets",
       ".dev.vars", ".dev.vars.local", "worker/.dev.vars",
+      // The template exemption is for the file only: a directory of that name, in any casing, is
+      // still a `.dev.vars*` directory.
+      ".dev.vars.example/token", ".DEV.VARS.EXAMPLE/token", "cf/.dev.vars.example/token", "a/.Dev.Vars.Example/b/c",
       "x/prod.credentials.json", "x/robot.sa.json", "x/app-client-secret.json", "x/app-client_secret.v2.json", "legacy/Credentials.JSON",
       "k/apns.p8", "k/putty.ppk", "k/store.jks", "k/store.keystore", "k/bundle.p12", "k/bundle.pfx", "k/server.PEM", "k/id_ecdsa",
     ]) {
@@ -1308,7 +1320,8 @@ test("runpod pod staging denies the whole .env family and every gitignore secret
     }
     for (const path of [
       "README.md", "src/exporter.ts", "environment.md", "id_ed25519.pub", "docs/env.md", "config/envelope.ts",
-      ".dev.vars.example", "env/config.ts", "envrc", "export.ts", "my-export/x.txt", "exports/x.txt", "secrets/x.txt", "keys/notes.txt",
+      ".dev.vars.example", ".DEV.VARS.EXAMPLE", "nested/dir/.dev.vars.example", "nested/upper/.DEV.VARS.EXAMPLE",
+      "env/config.ts", "envrc", "export.ts", "my-export/x.txt", "exports/x.txt", "secrets/x.txt", "keys/notes.txt",
     ]) {
       assert.equal(isSensitiveStagingPath(path), false, path);
     }

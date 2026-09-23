@@ -381,7 +381,9 @@ const SENSITIVE_BASENAMES = new Set([
 // config/envelope.ts, docs/env.md) do not start with `.env` and stay eligible.
 const ENV_FAMILY_PATTERN = /^\.env/;
 // Cloudflare `.dev.vars*` secrets; .gitignore negates the committed template with
-// `!.dev.vars.example`, so that one name is allowed through.
+// `!.dev.vars.example`. That exemption is for the single template file, so it is applied to the
+// final basename only: a directory named `.dev.vars.example` (in any casing) is as sensitive as
+// any other `.dev.vars*` directory, and `.dev.vars.example/token` stays local.
 const DEV_VARS_PATTERN = /^\.dev\.vars/;
 const DEV_VARS_TEMPLATE = ".dev.vars.example";
 const SENSITIVE_BASENAME_PATTERNS = [
@@ -394,9 +396,17 @@ const SENSITIVE_BASENAME_PATTERNS = [
   /\.(pem|key|p12|pfx|p8|ppk|jks|keystore)$/,
 ];
 
-function isSensitiveFamilyName(name: string): boolean {
-  if (ENV_FAMILY_PATTERN.test(name)) return true;
-  return DEV_VARS_PATTERN.test(name) && name !== DEV_VARS_TEMPLATE;
+// A directory segment from either family marks everything below it as sensitive. The template
+// exemption never applies here: `.dev.vars.example/token` is not the template file.
+function isSensitiveFamilyDirectory(segment: string): boolean {
+  return ENV_FAMILY_PATTERN.test(segment) || DEV_VARS_PATTERN.test(segment);
+}
+
+// The final basename: the same two families minus the one `.dev.vars.example` template file.
+// Segments arrive lowercased, so the exemption is case-insensitive like the rest of the list.
+function isSensitiveFamilyBasename(basename: string): boolean {
+  if (ENV_FAMILY_PATTERN.test(basename)) return true;
+  return DEV_VARS_PATTERN.test(basename) && basename !== DEV_VARS_TEMPLATE;
 }
 
 export function isSensitiveStagingPath(relativePath: string): boolean {
@@ -407,10 +417,10 @@ export function isSensitiveStagingPath(relativePath: string): boolean {
   if (segments.length === 0) return false;
   const basename = segments[segments.length - 1]!;
   const directories = segments.slice(0, -1);
-  if (directories.some((segment) => SENSITIVE_DIRECTORY_SEGMENTS.has(segment) || isSensitiveFamilyName(segment))) {
+  if (directories.some((segment) => SENSITIVE_DIRECTORY_SEGMENTS.has(segment) || isSensitiveFamilyDirectory(segment))) {
     return true;
   }
-  if (SENSITIVE_BASENAMES.has(basename) || isSensitiveFamilyName(basename)) return true;
+  if (SENSITIVE_BASENAMES.has(basename) || isSensitiveFamilyBasename(basename)) return true;
   return SENSITIVE_BASENAME_PATTERNS.some((pattern) => pattern.test(basename));
 }
 
