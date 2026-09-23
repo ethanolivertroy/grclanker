@@ -2469,6 +2469,93 @@ test("reviewer E finding C: an Authorization value with an unlisted first word g
   assert.equal(cases, 2 * FINDING_C_ROWS.length * FINDING_C_VALUES.length * FINDING_C_CONTEXTS.length);
 });
 
+// Reviewer E finding A: inside a JSON string that was stringified once, a tab, form feed,
+// backspace, vertical tab, NUL, or their \u0009-style codes arrive as two or six characters,
+// and an unquoted pair value in the = spelling, a single-token header value, the token after
+// a scheme word, and a --flag value ran through them, so a second credential pair chained
+// after the escape lost its key into the first value and kept its own value. Every such
+// value now ends at an escaped control as it does at the raw character (a line break, \t,
+// \b, \f, \v, \0, \u0000 to \u001f, \u007f, \x09 and the other \xHH controls), so the
+// second pair is read on its own and loses its value; a key: value line still ends at a line
+// break only, so the second pair after a tab goes with the first value there (nothing
+// survives). The escape of a printable character (\u00e9) is content; a raw control ends a
+// value the same way; text with no carrier is untouched; the result is a fixed point.
+const FINDING_A_FIRST = "hunter2first";
+const FINDING_A_SECOND = "correcthorsesecond";
+const FINDING_A_FIRST_CARRIERS = [
+  ["api_key=", (v) => `api_key=${v}`],
+  ["token=", (v) => `token=${v}`],
+  ["password: ", (v) => `password: ${v}`],
+  ["Authorization: Bearer ", (v) => `Authorization: Bearer ${v}`],
+  ["X-Auth-Token: Bearer ", (v) => `X-Auth-Token: Bearer ${v}`],
+  ["Cookie: sid=", (v) => `Cookie: sid=${v}`],
+  ["X-Api-Key: ", (v) => `X-Api-Key: ${v}`],
+  ['"api_key":"', (v) => `"api_key":"${v}"`],
+  ["--password ", (v) => `--password ${v}`],
+  ["-Dpassword=", (v) => `-Dpassword=${v}`],
+];
+const FINDING_A_ESCAPES = ["\\t", "\\n", "\\r\\n", "\\u0009", "\\u000a", "\\f", "\\b", "\\v", "\\0", "\\x09", "\\u001f", "\\u007f"];
+const FINDING_A_SECOND_CARRIERS = [
+  ["password: ", (v) => `password: ${v}`],
+  ["password:", (v) => `password:${v}`],
+  ["secret=", (v) => `secret=${v}`],
+  ["X-Api-Key: ", (v) => `X-Api-Key: ${v}`],
+  ["Authorization: Bearer ", (v) => `Authorization: Bearer ${v}`],
+  ["Cookie: sid=", (v) => `Cookie: sid=${v}`],
+];
+const FINDING_A_CONTEXTS = [
+  ["bare", (line) => line],
+  ["JSON member", (line) => `{"message":"${line}","code":502}`],
+  ["prose before", (line) => `login failed: ${line}`],
+];
+// Exact renderings: the = spelling, the header token, the scheme credentials, and the flag
+// value end at the escape, and the chained pair keeps its key and loses its value.
+const FINDING_A_EXACT = [
+  [(e) => `api_key=${FINDING_A_FIRST}${e}password: ${FINDING_A_SECOND}`, (e) => `api_key=[REDACTED]${e}password: [REDACTED]`],
+  [(e) => `token=${FINDING_A_FIRST}${e}secret=${FINDING_A_SECOND}`, (e) => `token=[REDACTED]${e}secret=[REDACTED]`],
+  [(e) => `api_key=${FINDING_A_FIRST}${e}X-Api-Key: ${FINDING_A_SECOND}`, (e) => `api_key=[REDACTED]${e}X-Api-Key: [REDACTED]`],
+  [(e) => `Authorization: Bearer ${FINDING_A_FIRST}${e}password: ${FINDING_A_SECOND}`, (e) => `Authorization: Bearer [REDACTED]${e}password: [REDACTED]`],
+  [(e) => `X-Api-Key: ${FINDING_A_FIRST}${e}X-Api-Key: ${FINDING_A_SECOND}`, (e) => `X-Api-Key: [REDACTED]${e}X-Api-Key: [REDACTED]`],
+  [(e) => `X-Auth-Token: Bearer ${FINDING_A_FIRST}${e}Cookie: sid=${FINDING_A_SECOND}`, (e) => `X-Auth-Token: [REDACTED]${e}Cookie: [REDACTED]`],
+  [(e) => `--password ${FINDING_A_FIRST}${e}secret=${FINDING_A_SECOND}`, (e) => `--password [REDACTED]${e}secret=[REDACTED]`],
+  [(e) => `{"message":"--password ${FINDING_A_FIRST}${e}password: ${FINDING_A_SECOND}","code":502}`, (e) => `{"message":"--password [REDACTED]${e}password: [REDACTED]","code":502}`],
+];
+const FINDING_A_CONTROLS = [
+  "Content-Type: application/json\\tX-Request-Id: 7d2f4e6a\\u0009Date: Tue, 22 Sep 2026 18:00:00 GMT",
+  '{"message":"request failed\\tstatus 502\\fretry later\\bdone","code":502}',
+  "api_keys: 3\\tkeys=2\\u0009cookies: 0",
+  "path C:\\\\temp\\\\file.txt and C:\\\\Users\\\\bob\\\\.kube\\\\config",
+  "api_key=[REDACTED]\\tpassword: [REDACTED]",
+];
+
+test("reviewer E finding A: an unquoted pair value, a single-token header value, the token after a scheme word, and a flag value end at every escaped control, so a credential pair chained after the escape loses its own value in both scrubs", () => {
+  let cases = 0;
+  for (const scrub of [redactErrorText, redactCredentialValueText]) {
+    for (const [firstName, first] of FINDING_A_FIRST_CARRIERS) for (const escape of FINDING_A_ESCAPES) for (const [secondName, second] of FINDING_A_SECOND_CARRIERS) for (const [context, wrap] of FINDING_A_CONTEXTS) {
+      const input = wrap(`${first(FINDING_A_FIRST)}${escape}${second(FINDING_A_SECOND)}`);
+      const out = scrub(input);
+      const label = `reviewer E finding A: ${scrub.name} [${firstName}] ${JSON.stringify(escape)} [${secondName}] ${context}: ${JSON.stringify(input)} -> ${JSON.stringify(out)}`;
+      assertNoWindow(out, FINDING_A_FIRST, label);
+      assertNoWindow(out, FINDING_A_SECOND, label);
+      if (context === "JSON member") assert.ok(out.endsWith('","code":502}'), `${label}: the JSON member lost its closing text`);
+      if (context === "prose before") assert.ok(out.startsWith("login failed: "), `${label}: the prose before the pair was lost`);
+      assert.equal(scrub(out), out, `${label}: not idempotent`);
+      cases += 1;
+    }
+    for (const [make, expect] of FINDING_A_EXACT) for (const escape of FINDING_A_ESCAPES) {
+      const input = make(escape);
+      assert.equal(scrub(input), expect(escape), `reviewer E finding A: ${scrub.name} ${JSON.stringify(input)}`);
+    }
+    for (const escape of ["\t", "\n", "\f", "\v", "\u001f"]) {
+      assert.equal(scrub(`api_key=${FINDING_A_FIRST}${escape}password: ${FINDING_A_SECOND}`), `api_key=[REDACTED]${escape}password: [REDACTED]`, `reviewer E finding A: ${scrub.name} raw control ${JSON.stringify(escape)}`);
+    }
+    assert.equal(scrub(`api_key=${FINDING_A_FIRST}\\u00e9tail rejected`), "api_key=[REDACTED] rejected", `reviewer E finding A: ${scrub.name} keeps the escape of a printable character inside the value`);
+    assert.equal(scrub(`password: ${FINDING_A_FIRST}\\tpassword: ${FINDING_A_SECOND}`), "password: [REDACTED]", `reviewer E finding A: ${scrub.name} a key: value line ends at a line break only`);
+    for (const text of FINDING_A_CONTROLS) assert.equal(scrub(text), text, `reviewer E finding A: ${scrub.name} changed a control: ${text}`);
+  }
+  assert.equal(cases, 2 * FINDING_A_FIRST_CARRIERS.length * FINDING_A_ESCAPES.length * FINDING_A_SECOND_CARRIERS.length * FINDING_A_CONTEXTS.length);
+});
+
 test("scrub boundary: name-shaped values stay bare in prose, leave every carrier whatever their shape, and go as configured secrets in every form", () => {
   for (const value of NAME_SHAPED_VALUES) {
     for (const prose of [`inventory ${value} was not read`, `${value}`, `webhook ${value} read 12 of 40 destinations`, `path /var/lib/${value}/state`]) {

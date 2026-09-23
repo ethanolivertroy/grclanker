@@ -541,24 +541,35 @@ const QUOTED_ATTRIBUTE_PATTERN = /(?<![A-Za-z0-9_.:-])([A-Za-z_][A-Za-z0-9_.:-]{
 // no word character precedes it: after the "--" of a command-line flag (--password=v), the
 // "-D" of a Java system property (-Dpassword=v, where the D is read as part of the key and
 // the credential word is still its tail), a "/" path separator, or a "." (the tail of a
-// dotted name is scanned only when no key match started earlier on the name).
-const ASSIGNMENT_KEY_PATTERN = /(?<![A-Za-z0-9_])((?:\\*["'])?)([A-Za-z_][A-Za-z0-9_.-]{0,63})((?:\\*["'])?\s*([:=])\s*(?:\\*["'])?)/g;
+// dotted name is scanned only when no key match started earlier on the name); or right
+// after a \0 escape, whose digit cannot start a key (the letter escapes, \n and the rest,
+// are read as part of the key and removed by keyAfterEscape).
+const ASSIGNMENT_KEY_PATTERN = /(?:(?<![A-Za-z0-9_])|(?<=\\0))((?:\\*["'])?)([A-Za-z_][A-Za-z0-9_.-]{0,63})((?:\\*["'])?\s*([:=])\s*(?:\\*["'])?)/g;
+// The escape one stringify leaves for a control character: \n, \r, \t, \b, \f, \v, \0, or a
+// \uXXXX or \xHH code of a control (U+0000 to U+001F, U+007F, and the line and paragraph
+// separators U+2028 and U+2029). An escape of a printable character (\u00e9) is content.
+const ESCAPED_CONTROL_SOURCE = String.raw`\\(?:[nrtbfv0]|u(?:00[01][0-9a-fA-F]|007[fF]|202[89])|x(?:[01][0-9a-fA-F]|7[fF]))`;
 // A credential name after "--" with its value as the next argument (psql --password value):
-// the value is the one token after the flag, never another flag.
-const FLAG_VALUE_PATTERN = /(?<![^\s])--([A-Za-z][A-Za-z0-9_.-]{0,63})([ \t]+)((?!\[REDACTED\])(?!-)[^\s"'<>;,&]+)/g;
+// the flag starts where no word character or "-" precedes it (at the start of a quoted
+// command line too), and the value is the one token after it, never another flag, ending
+// where an unquoted pair value does.
+const FLAG_VALUE_PATTERN = new RegExp(String.raw`(?<![A-Za-z0-9_-])--([A-Za-z][A-Za-z0-9_.-]{0,63})([ \t]+)((?!\[REDACTED\])(?!-)(?:(?!${ESCAPED_CONTROL_SOURCE})[^\s\x00-\x1f\x7f"'<>;,&])+)`, "g");
 // After a credential-named path segment and ":" (kv/password: value) the value is one token;
 // prose after that token (/api/v1/api-tokens: request failed with 403) makes the segment a
 // label, not a pair.
 const PROSE_CONTINUATION_PATTERN = /^[ \t]+[A-Za-z]/;
 // The "-D" of a Java system property (java -Dkey=value) is not part of the key.
 const JAVA_PROPERTY_PREFIX_PATTERN = /(?:^|\s)-$/;
-// A value also ends at a line break left escaped by one stringify (\n, \r, \u000a, \u000d),
-// as it does at the raw character, so the header or pair on the next escaped line is read
-// on its own.
+// A delimited (key=value) value ends at whitespace or a control character, raw or left
+// escaped by one stringify (\n, \r, \t, \b, \f, \v, \0, \u0009 and the other \u00XX control
+// codes, \x09), as an unquoted header token does, so a pair or header chained after the
+// escape (api_key=<v>\tpassword: <v>) is read on its own and loses its own value. A key:
+// value line ends at a line break only, raw or escaped (\n, \r, \u000a, \u000d), as the raw
+// line does, so the header or pair on the next escaped line is read on its own.
 // A quote with a value character on both sides (O'hunter2, my'pref) is content of the value;
 // a quote at the end of a token, or an escaped quote, ends it, as does a value's first quote.
-const DELIMITED_VALUE_PATTERN = /(?!\[REDACTED\])(?!["'])(?:(?!\\+["'])(?!\\(?:[nr]|u000[adAD]))[^\s"'<>;,&]|["'](?=[^\s"'<>;,&:)}\]\\]))+/y;
-const LINE_VALUE_PATTERN = /(?!\[REDACTED\])(?!["'])(?:(?!\\+["'])(?!\\(?:[nr]|u000[adAD]))[^\r\n<>"',;{}[\]]|["'](?=[^\s\r\n<>"',;{}[\]:)\\]))*(?!\\+["'])(?!\\(?:[nr]|u000[adAD]))[^\s\r\n<>"',;{}[\]]/y;
+const DELIMITED_VALUE_PATTERN = new RegExp(String.raw`(?!\[REDACTED\])(?!["'])(?:(?!\\+["'])(?!${ESCAPED_CONTROL_SOURCE})[^\s\x00-\x1f\x7f"'<>;,&]|["'](?=[^\s"'<>;,&:)}\]\\]))+`, "y");
+const LINE_VALUE_PATTERN = /(?!\[REDACTED\])(?!["'])(?:(?!\\+["'])(?!\\(?:[nr]|u000[adAD]|x0[adAD]))[^\r\n<>"',;{}[\]]|["'](?=[^\s\r\n<>"',;{}[\]:)\\]))*(?!\\+["'])(?!\\(?:[nr]|u000[adAD]|x0[adAD]))[^\s\r\n<>"',;{}[\]]/y;
 const TOKEN_IN_PATH_WEBHOOK_PATTERN = /(https?:\/\/(?:hooks\.slack\.com\/services|discord(?:app)?\.com\/api\/webhooks|[a-z0-9.-]*webhook\.office\.com\/webhookb2)\/)(?!\[REDACTED\])(?:[^\s"'<>\\]|["'](?=[^\s"'<>\\,;:)}\]]))+/gi;
 // A URL whose slashes arrive escaped by a stringify (https:\/\/user:secret@host\/path): the
 // userinfo goes as it does from a bare URL; the query pairs are read by the pair rule.
@@ -616,9 +627,10 @@ const ASSIGNMENT_ONLY_CREDENTIAL_WORDS = new Set(["pass"]);
 // JSON structure and literals after a key are never a credential value.
 const STRUCTURAL_VALUE_PATTERN = /^(?:[{[]|\{\}|\[\]|true|false|null)$/;
 // A bare integer under a plural credential word ("api_keys": 1, keys=3, secrets: 0) is
-// a count, this module's own summary vocabulary, not a credential.
+// a count, this module's own summary vocabulary, not a credential; the digits end at
+// whitespace, raw or left escaped by a stringify (keys: 3\tcookies: 0), or at the end.
 const PLURAL_CREDENTIAL_WORDS = new Set(["tokens", "secrets", "keys", "cookies", "passwords", "credentials"]);
-const COUNT_VALUE_PATTERN = /^\d+(?:\s|$)/;
+const COUNT_VALUE_PATTERN = new RegExp(String.raw`^\d+(?:\s|${ESCAPED_CONTROL_SOURCE}|$)`);
 const NON_CREDENTIAL_KEY_QUALIFIERS = new Set(["public"]);
 // "code" names a credential only behind one of these words (registration_code,
 // activation_code, authorization_code, recovery_code); status_code, error_code, and
@@ -822,14 +834,58 @@ function lineEndFrom(text: string, start: number): number {
   return terminator ? start + terminator.index : text.length;
 }
 
-// True at a line break left escaped by one stringify (\n, \r, \u000a, \u000d behind an
-// odd run of backslashes): a line end for an unquoted header value, as the raw character is.
-function escapedLineBreakAt(text: string, index: number): boolean {
+// The control characters the one-letter escapes stand for.
+const CONTROL_ESCAPE_LETTERS = new Map<string, number>([["n", 0x0a], ["r", 0x0d], ["t", 0x09], ["b", 0x08], ["f", 0x0c], ["v", 0x0b], ["0", 0x00]]);
+
+// True for the code of a control character: U+0000 to U+001F, U+007F, or the line and
+// paragraph separators U+2028 and U+2029.
+function isControlCode(code: number): boolean {
+  return code <= 0x1f || code === 0x7f || code === 0x2028 || code === 0x2029;
+}
+
+// The code of the control character an escape at index stands for (\n, \r, \t, \b, \f, \v,
+// \0, \uXXXX, or \xHH behind an odd run of backslashes, as one stringify leaves it), or -1
+// when the text at index is no such escape: an even run escapes backslashes, and the escape
+// of a printable character (\u00e9) is content.
+function escapedControlCodeAt(text: string, index: number): number {
   const run = backslashRun(text, index);
-  if (run === 0 || run % 2 === 0) return false;
+  if (run === 0 || run % 2 === 0) return -1;
   const letter = text[index + run];
-  if (letter === "n" || letter === "r") return true;
-  return letter === "u" && /^000[ad]$/i.test(text.slice(index + run + 1, index + run + 5));
+  if (letter === undefined) return -1;
+  const simple = CONTROL_ESCAPE_LETTERS.get(letter);
+  if (simple !== undefined) return simple;
+  const digits = letter === "u" ? 4 : letter === "x" ? 2 : 0;
+  if (digits === 0) return -1;
+  const hex = text.slice(index + run + 1, index + run + 1 + digits);
+  if (hex.length !== digits || !/^[0-9a-f]+$/i.test(hex)) return -1;
+  const code = parseInt(hex, 16);
+  return isControlCode(code) ? code : -1;
+}
+
+// True at a line break left escaped by one stringify (\n, \r, \u000a, \u000d, \x0a, \x0d): a
+// line end for an unquoted header value, as the raw character is.
+function escapedLineBreakAt(text: string, index: number): boolean {
+  const code = escapedControlCodeAt(text, index);
+  return code === 0x0a || code === 0x0d;
+}
+
+// Where the unquoted token that starts at start ends: at the first whitespace or raw control
+// character, at a control the stringify left escaped (\t, \u0009, \f, \b, and a line break
+// among them), or at limit. A token never carries a control, so the pair or header chained
+// after the escape is read on its own.
+function unquotedTokenEnd(text: string, start: number, limit: number): number {
+  let index = start;
+  while (index < limit) {
+    const char = text[index];
+    if (/\s/.test(char) || isControlCode(char.charCodeAt(0))) break;
+    if (char === "\\") {
+      if (escapedControlCodeAt(text, index) !== -1) break;
+      index += backslashRun(text, index);
+      continue;
+    }
+    index += 1;
+  }
+  return index;
 }
 
 // The key without the escape letter in front of it: after an escaping backslash the letter
@@ -937,7 +993,7 @@ function leadingSchemeWord(value: string): RegExpExecArray | undefined {
 // Where the credentials after a scheme word end, credentialsStart being the index after the
 // word and the whitespace behind it: a parameter list (username=..., realm=...) runs to end,
 // a quoted string to the quote that closes it (or to end when nothing does), and a bare
-// token to its first whitespace.
+// token to its first whitespace or escaped control.
 function schemeCredentialsEnd(text: string, credentialsStart: number, end: number): number {
   const credentials = text.slice(credentialsStart, end);
   if (AUTH_PARAM_LIST_PATTERN.test(credentials)) return end;
@@ -946,19 +1002,20 @@ function schemeCredentialsEnd(text: string, credentialsStart: number, end: numbe
     const close = closingQuoteIndex(text, credentialsStart + quote.length, quote, end);
     return close === -1 ? end : close + quote.length;
   }
-  return credentialsStart + (/^\S*/.exec(credentials)?.[0].length ?? 0);
+  return unquotedTokenEnd(text, credentialsStart, end);
 }
 
-// Where the value of a single-token header ends: an unquoted value at its first whitespace,
-// a quoted one where headerValueEnd put it. A value that opens with a listed scheme word
-// and a token (X-Auth-Token: Bearer <token>) is the word and the credentials after it, as
-// it would be under Authorization, so the token is never left standing after the marker.
+// Where the value of a single-token header ends: an unquoted value at its first whitespace
+// or escaped control, a quoted one where headerValueEnd put it. A value that opens with a
+// listed scheme word and a token (X-Auth-Token: Bearer <token>) is the word and the
+// credentials after it, as it would be under Authorization, so the token is never left
+// standing after the marker.
 function singleTokenEnd(text: string, start: number, end: number): number {
   const value = text.slice(start, end);
   if (enclosingQuote(value) !== "") return end;
   const scheme = leadingSchemeWord(value);
   if (scheme !== undefined) return schemeCredentialsEnd(text, start + scheme[0].length, end);
-  return start + (/^\S*/.exec(value)?.[0].length ?? 0);
+  return unquotedTokenEnd(text, start, end);
 }
 
 // Where an Authorization value ends: after the listed scheme word and the one token (or one
