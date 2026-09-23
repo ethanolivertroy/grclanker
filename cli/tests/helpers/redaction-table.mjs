@@ -455,6 +455,101 @@ export function assertEscapedHeaderCarriers(assert, redact, { lines = ESCAPED_HE
   return judged;
 }
 
+/** The proofs planted in AUTHORIZATION_PARAMETER_ROWS: lowercase letters only, so only a carrier rule can remove them, and one hex digest. */
+const AUTHORIZATION_PROOFS = Object.freeze({
+  codeRabbit: "skvclmtirehs",
+  snowflake: "pvbxrqzmwltn",
+  value: "zrqmxvwbtpln",
+  key: "wtqzvxrmblpn",
+  response: "wrqzvbnxmlpt",
+  nonce: "qxzmvrwbplnt",
+  cnonce: "mzvqwrtxbpln",
+  opaque: "bnzxqvmrwtlp",
+  hexResponse: "4f1c9e2a7b3d8f6e5a0c1b2d3e4f5a6b",
+  oauthToken: "vqzxrwmbntlp",
+  oauthSignature: "xzqvrmwbltpn",
+  oauthNonce: "rwmbqzxvtlpn",
+});
+const DIGEST_HEAD = 'Authorization: Digest username="Mufasa", realm="testrealm@host.com"';
+const OAUTH_HEAD = 'Authorization: OAuth oauth_consumer_key="audit-client"';
+const DIGEST_TAIL = 'uri="/dir/index.html", qop=auth, nc=00000001';
+const OAUTH_TAIL = 'oauth_signature_method="HMAC-SHA1", oauth_version="1.0"';
+
+/**
+ * Authorization parameter lists (CodeRabbit on #81, discussion_r4081238237, probed on #76): under an Authorization
+ * or Proxy-Authorization header a scheme word may be followed by `name=value` parameters, and the value of every
+ * parameter that is a proof is removed whatever its name, quoted or bare: `Snowflake Token="..."`, any `<Scheme>
+ * <name>="..."` shape, Digest's `response`, `nonce`, `cnonce`, and `opaque`, OAuth 1.0's `oauth_token`,
+ * `oauth_signature`, and `oauth_nonce`. The parameters that describe the exchange stay: `realm`, `username`, `uri`,
+ * `qop`, `nc`, `algorithm`, `oauth_consumer_key` (a client identifier, judged by its own shape like `client_id`),
+ * `oauth_signature_method`, `oauth_version`, and SigV4's scope and signed headers. A WWW-Authenticate challenge is
+ * not an Authorization header, so its `realm="api"` stays with the rest of it, as does `Bearer realm="api"` in prose;
+ * a header value quoted whole (a JSON header object) is removed whole by the quoted-value rule as before. Before the
+ * fix a quoted value under a parameter name that is no credential word (`response`, `value`) survived on every sink,
+ * and a `name=` of four or eight characters (`key=`, `uri=`) read as base64 padding, so the marker replaced the name
+ * and the quoted value survived. Each row is `[text, expected]`; the rows hold for the error sink, the data-string
+ * sink, and a snapshot string alike, bare, inside a sentence, after a JSON escape, and inside a JSON string.
+ */
+export const AUTHORIZATION_PARAMETER_ROWS = Object.freeze([
+  [`Authorization: Snowflake Token="${AUTHORIZATION_PROOFS.codeRabbit}"`, 'Authorization: Snowflake Token="[REDACTED]"'],
+  [`proxy-authorization: snowflake token='${AUTHORIZATION_PROOFS.snowflake}'`, "proxy-authorization: snowflake token='[REDACTED]'"],
+  [`Authorization: Bearer value="${AUTHORIZATION_PROOFS.value}"`, 'Authorization: Bearer value="[REDACTED]"'],
+  [`Authorization: Bearer key="${AUTHORIZATION_PROOFS.key}"`, 'Authorization: Bearer key="[REDACTED]"'],
+  [`Authorization: Digest response=${AUTHORIZATION_PROOFS.response}`, "Authorization: Digest response=[REDACTED]"],
+  [`Authorization: Digest response="${AUTHORIZATION_PROOFS.response}"`, 'Authorization: Digest response="[REDACTED]"'],
+  [`Authorization: Digest nonce="${AUTHORIZATION_PROOFS.nonce}"`, 'Authorization: Digest nonce="[REDACTED]"'],
+  [
+    `${DIGEST_HEAD}, nonce="${AUTHORIZATION_PROOFS.nonce}", ${DIGEST_TAIL}, cnonce="${AUTHORIZATION_PROOFS.cnonce}", response="${AUTHORIZATION_PROOFS.response}", opaque="${AUTHORIZATION_PROOFS.opaque}"`,
+    `${DIGEST_HEAD}, nonce="[REDACTED]", ${DIGEST_TAIL}, cnonce="[REDACTED]", response="[REDACTED]", opaque="[REDACTED]"`,
+  ],
+  [`${DIGEST_HEAD}, uri="/dir/index.html", response="${AUTHORIZATION_PROOFS.hexResponse}"`, `${DIGEST_HEAD}, uri="/dir/index.html", response="[REDACTED]"`],
+  [
+    `${OAUTH_HEAD}, oauth_token="${AUTHORIZATION_PROOFS.oauthToken}", ${OAUTH_TAIL}, oauth_signature="${AUTHORIZATION_PROOFS.oauthSignature}", oauth_nonce="${AUTHORIZATION_PROOFS.oauthNonce}"`,
+    `${OAUTH_HEAD}, oauth_token="[REDACTED]", ${OAUTH_TAIL}, oauth_signature="[REDACTED]", oauth_nonce="[REDACTED]"`,
+  ],
+  [
+    `Authorization: AWS4-HMAC-SHA256 Credential=${SIGV4_KEY_ID}/20260922/us-east-1/sts/aws4_request, SignedHeaders=host;x-amz-date, Signature=${SIGV4_SIGNATURE}`,
+    "Authorization: AWS4-HMAC-SHA256 Credential=[REDACTED]/20260922/us-east-1/sts/aws4_request, SignedHeaders=host;x-amz-date, Signature=[REDACTED]",
+  ],
+  [JSON.stringify({ headers: { Authorization: `Digest response="${AUTHORIZATION_PROOFS.response}"` } }), '{"headers":{"Authorization":"Digest [REDACTED]"}}'],
+  ['WWW-Authenticate: Bearer realm="api", error="invalid_token", error_description="The access token expired"', 'WWW-Authenticate: Bearer realm="api", error="invalid_token", error_description="The access token expired"'],
+  ['WWW-Authenticate: Digest realm="api", qop="auth", algorithm=SHA-256', 'WWW-Authenticate: Digest realm="api", qop="auth", algorithm=SHA-256'],
+  ['The server answered 401 with Bearer realm="api" and no token.', 'The server answered 401 with Bearer realm="api" and no token.'],
+]);
+
+/** The values that must not survive any AUTHORIZATION_PARAMETER_ROWS output, by 6-to-24 windows. */
+export const AUTHORIZATION_PROOF_VALUES = Object.freeze([...Object.values(AUTHORIZATION_PROOFS), SIGV4_KEY_ID, SIGV4_SIGNATURE]);
+
+/** One JSON escape of `text` without the enclosing quotes, so a header line reads as the tail of a serialized message. */
+function jsonEscaped(text) {
+  return JSON.stringify(text).slice(1, -1);
+}
+
+/**
+ * Asserts each Authorization parameter row scrubs to exactly its expected text bare, inside a sentence with a
+ * parenthesis after it, after a JSON escape, and inside a JSON string (the expectation is the escape or the
+ * serialization of the plain expectation, so the form changes nothing), that a second pass over every output
+ * changes nothing, and that no window of any planted proof survives in any output.
+ */
+export function assertAuthorizationParameterRows(assert, redact, { label = "redact", rows = AUTHORIZATION_PARAMETER_ROWS } = {}) {
+  const outputs = [];
+  for (const [text, expected] of rows) {
+    const forms = [
+      ["bare", text, expected],
+      ["inside a sentence", `upstream rejected the request (${text}) and returned 401 Unauthorized`, `upstream rejected the request (${expected}) and returned 401 Unauthorized`],
+      ["after a JSON escape", `Request failed\\n${jsonEscaped(text)}\\nRetry later`, `Request failed\\n${jsonEscaped(expected)}\\nRetry later`],
+      ["inside a JSON string", JSON.stringify({ code: "Unauthorized", message: `rejected ${text}` }), JSON.stringify({ code: "Unauthorized", message: `rejected ${expected}` })],
+    ];
+    for (const [form, input, expectedOutput] of forms) {
+      const output = redact(input);
+      assert.equal(output, expectedOutput, `${label} Authorization parameters, ${form}: ${text}`);
+      assert.equal(redact(output), output, `${label}, ${form}: a second pass over ${JSON.stringify(output)} changes nothing`);
+      outputs.push(output);
+    }
+  }
+  assertNoCanaryWindows(assert, outputs.join("\n"), AUTHORIZATION_PROOF_VALUES, `${label} Authorization parameter rows`);
+}
+
 /**
  * reviewer D round 5 depth control. The data walkers removed a credential-keyed value at every depth but left a
  * carrier inside a benign-keyed string untouched at every depth, and the AAP settings API returns arbitrary

@@ -583,13 +583,27 @@ const SCHEME_PARAMETER_PATTERN = /^([A-Za-z][A-Za-z0-9_-]*)=(?!=)/;
 
 /**
  * Whether the value after a scheme word is a `name=value` parameter list (SigV4 `Credential=...`, `realm="api"`,
- * `OAuth oauth_signature=...`) rather than one bearer credential: the name is shaped like a name, and the `=` is
- * followed by more text or the whole is not base64-length (`realm=` is a parameter; `cGFzc3dvcmQ=` is padding).
+ * `OAuth oauth_consumer_key=...`) rather than one bearer credential: the name is shaped like a name segment by
+ * segment (`oauth_consumer_key`, `x-amz-date`), and the `=` is followed by more text, or by the quote that opens
+ * the parameter's value where the caller's value stopped (`uri="/dir"`, `Session="v"`: `quoteFollows`), or the
+ * whole is not base64-length (`realm=` is a parameter; `cGFzc3dvcmQ=` is padding).
  */
-function isSchemeParameterList(value: string): boolean {
+function isSchemeParameterList(value: string, quoteFollows = false): boolean {
   const parameter = SCHEME_PARAMETER_PATTERN.exec(value);
-  if (parameter === null || !isNameSegment(parameter[1])) return false;
-  return parameter[0].length < value.length || value.length % 4 !== 0;
+  if (parameter === null || !isParameterName(parameter[1])) return false;
+  return parameter[0].length < value.length || quoteFollows || value.length % 4 !== 0;
+}
+
+/** A parameter name: `-` or `_` separated segments that are each shaped like part of a name (see isNameSegment). */
+function isParameterName(name: string): boolean {
+  return name.split(/[-_]/).every((segment) => isNameSegment(segment));
+}
+
+/** Whether a quote, plain or behind the backslashes of its JSON escape, stands at `index` in `text`. */
+function quoteOpensAt(text: string, index: number): boolean {
+  let cursor = index;
+  while (text[cursor] === "\\") cursor += 1;
+  return text[cursor] === '"' || text[cursor] === "'";
 }
 
 /**
@@ -619,12 +633,13 @@ function isCredentialNamedKey(key: string): boolean {
  * punctuation after the value stay. Under an Authorization header a scheme word in front of the value stays
  * too, a scheme word standing alone ("sent as Authorization: Bearer") names the scheme and carries nothing, and
  * a parameter list after the scheme (SigV4 `Credential=..., SignedHeaders=..., Signature=...`) is judged pair by
- * pair so the region and the request scope stay. Under any other credential key the scheme word is the value
- * (CodeRabbit r4078025849 on #63: `sslPassword=splunk rejected`, `db_password: token`), and the prose after it
- * stays. A `--name value` flag is a pair whose separator is the space.
+ * pair so the region and the request scope stay (scrubAuthorizationParameters has already removed every
+ * parameter value that is a proof, so this pass sees markers and the kept parameters). Under any other
+ * credential key the scheme word is the value (CodeRabbit r4078025849 on #63: `sslPassword=splunk rejected`,
+ * `db_password: token`), and the prose after it stays. A `--name value` flag is a pair whose separator is the space.
  */
 function scrubCredentialPairs(text: string): string {
-  const scrubbed = text.replace(ERROR_CREDENTIAL_PAIR_PATTERN, (match: string, key: string, separator: string, value: string) => {
+  const scrubbed = text.replace(ERROR_CREDENTIAL_PAIR_PATTERN, (match: string, key: string, separator: string, value: string, offset: number) => {
     if (!isCredentialNamedKey(key)) return match;
     const scheme = PAIR_VALUE_SCHEME_PATTERN.exec(value)?.[0] ?? "";
     const authorization = AUTHORIZATION_KEY_PATTERN.test(key);
@@ -637,7 +652,9 @@ function scrubCredentialPairs(text: string): string {
     const tail = value.slice(scheme.length + core.length);
     if (authorization) {
       if (BARE_SCHEME_WORD_PATTERN.test(core)) return match;
-      if (isSchemeParameterList(core)) return `${key}${separator}${scheme}${scrubCredentialPairs(core)}${tail}`;
+      if (isSchemeParameterList(core, quoteOpensAt(text, offset + match.length - tail.length))) {
+        return `${key}${separator}${scheme}${scrubCredentialPairs(core)}${tail}`;
+      }
     }
     return `${key}${separator}${scheme}${REDACTED_ERROR_VALUE}${tail}`;
   });
@@ -716,17 +733,122 @@ function scrubHeaderCarriers(text: string): string {
 }
 
 /**
+ * An Authorization or Proxy-Authorization header (any prefix the key rule accepts, any casing, plain or after a
+ * JSON escape) whose value is a scheme word and a parameter list (CodeRabbit on #81, discussion_r4081238237):
+ * `Authorization: Snowflake Token="..."`, `Authorization: Digest username="...", realm="...", nonce="...",
+ * uri="...", response="..."`, `Authorization: OAuth oauth_token="..."`, any `<Scheme> <name>="..."` shape. The
+ * match ends after the space that follows the scheme word, where the first parameter's name starts, and
+ * scrubSchemeParameterList walks the list. A header value quoted whole (`Authorization: "Digest ..."`, a JSON
+ * header object) is not this shape: the quoted-value rule below removes it whole.
+ */
+const AUTHORIZATION_PARAMETERS_PATTERN = new RegExp(
+  String.raw`${KEY_BOUNDARY_PATTERN}([A-Za-z0-9_.-]*authorization)((?:\\*["'])?\s*[=:]\s*)(${ERROR_SCHEME_PATTERN})(\s+)(?=[A-Za-z])`,
+  "gi",
+);
+/**
+ * The parameters whose value describes the exchange rather than proves it, so they stay: Digest's `realm`,
+ * `username`, `uri`, `qop`, `nc`, `algorithm`, `charset`, and `userhash` (RFC 7616), OAuth 1.0's consumer key (a
+ * client identifier), signature method, timestamp, version, and callback (RFC 5849), and SigV4's `Credential`
+ * (the access key id in front of the request scope, judged by the vendor prefix rule and the pair rule as before)
+ * and `SignedHeaders`. Every other parameter is the proof or an opaque blob (`response`, `nonce`, `cnonce`,
+ * `opaque`, `oauth_token`, `oauth_signature`, `oauth_nonce`, `Token`, `Session`, `value`) and its value becomes
+ * the marker, quoted at any serialization depth or bare.
+ */
+const KEPT_SCHEME_PARAMETER_PATTERN =
+  /^(?:realm|username|uri|qop|nc|algorithm|charset|userhash|oauth_consumer_key|oauth_signature_method|oauth_timestamp|oauth_version|oauth_callback|credential|signedheaders)$/i;
+const SCHEME_PARAMETER_NAME_PATTERN = /([A-Za-z][A-Za-z0-9_-]*)=(?!=)/y;
+const SCHEME_PARAMETER_BARE_VALUE_PATTERN = /(?:\[REDACTED\]|[^\s"'&;,<>)\]}\\])+/y;
+const SCHEME_PARAMETER_SEPARATOR_PATTERN = /\s*,\s*/y;
+
+/**
+ * Where the parameter value that starts at `start` ends, and the quote (plain or JSON-escaped) that encloses a
+ * quoted value: a quoted value runs to its closing quote at the same depth on the same line (an escaped quote
+ * inside it is part of it), a bare value ends where the pair rule's value ends. An unterminated quote or an
+ * empty bare value is not a parameter value, so the list ends before it.
+ */
+function schemeParameterValueEnd(text: string, start: number): { end: number; quote?: string } | undefined {
+  const newline = text.indexOf("\n", start);
+  const line = text.slice(start, newline === -1 ? text.length : newline);
+  const opening = HEADER_CARRIER_QUOTE_PATTERN.exec(line);
+  if (opening) {
+    const close = closingQuoteIndex(line, opening[0], opening[0].length);
+    return close === -1 ? undefined : { end: start + close + opening[0].length, quote: opening[0] };
+  }
+  SCHEME_PARAMETER_BARE_VALUE_PATTERN.lastIndex = start;
+  const bare = SCHEME_PARAMETER_BARE_VALUE_PATTERN.exec(text);
+  return bare === null ? undefined : { end: start + bare[0].length };
+}
+
+/**
+ * Walks the `name=value` parameter list that starts at `start`, the parameters separated by commas (RFC 7235),
+ * each name shaped like a name (a base64 value with its padding, `cGFzc3dvcmQ=`, is no parameter). A kept
+ * parameter passes whole; every other value becomes the marker inside its own quotes, an empty value stays
+ * empty, and a value that is already the marker is left as it is, so a second pass changes nothing. The list ends
+ * before the first text that is not a parameter (prose, a `)`, the close of the JSON string that carried the
+ * line, the `;` inside SigV4's `SignedHeaders=host;x-amz-date`), which the caller keeps; a separator with no
+ * parameter after it is not consumed. Returns the end of the list and its scrubbed text.
+ */
+function scrubSchemeParameterList(text: string, start: number): { end: number; replacement: string } {
+  let end = start;
+  let replacement = "";
+  let pending = "";
+  let cursor = start;
+  for (;;) {
+    SCHEME_PARAMETER_NAME_PATTERN.lastIndex = cursor;
+    const name = SCHEME_PARAMETER_NAME_PATTERN.exec(text);
+    if (name === null || !isParameterName(name[1])) break;
+    const valueStart = cursor + name[0].length;
+    const value = schemeParameterValueEnd(text, valueStart);
+    if (value === undefined) break;
+    const quote = value.quote ?? "";
+    const content = text.slice(valueStart + quote.length, value.end - quote.length);
+    const kept = content.length === 0 || KEPT_SCHEME_PARAMETER_PATTERN.test(name[1]);
+    replacement += `${pending}${name[0]}${quote}${kept ? content : REDACTED_ERROR_VALUE}${quote}`;
+    end = cursor = value.end;
+    SCHEME_PARAMETER_SEPARATOR_PATTERN.lastIndex = cursor;
+    const separator = SCHEME_PARAMETER_SEPARATOR_PATTERN.exec(text);
+    if (separator === null) break;
+    pending = separator[0];
+    cursor += separator[0].length;
+  }
+  return { end, replacement };
+}
+
+/**
+ * Removes the proofs from every Authorization parameter list in the text (see AUTHORIZATION_PARAMETERS_PATTERN),
+ * the header name, the scheme word, the parameter names, the kept parameters, their quotes, and the text after
+ * the list staying. Runs before the quoted-value and scheme rules, which then see the marker where a proof
+ * stood; a header name inside a list already walked (`Authorization: Digest opaque="Authorization: ..."`) is part
+ * of that value.
+ */
+function scrubAuthorizationParameters(text: string): string {
+  let scrubbed = "";
+  let cursor = 0;
+  for (const match of text.matchAll(AUTHORIZATION_PARAMETERS_PATTERN)) {
+    if (match.index < cursor || !isCredentialNamedKey(match[1])) continue;
+    const listStart = match.index + match[0].length;
+    const { end, replacement } = scrubSchemeParameterList(text, listStart);
+    if (end === listStart) continue;
+    scrubbed += text.slice(cursor, listStart) + replacement;
+    cursor = end;
+  }
+  return scrubbed + text.slice(cursor);
+}
+
+/**
  * Whether the token after a bare scheme word in prose is a credential: long, or carrying a digit or a base64
  * symbol (padding included), or changing case inside the word, so prose such as "Basic authentication" and
  * "Bearer token is missing" stays. A `name=value` parameter list after the scheme (`Bearer realm="api"`, SigV4
- * `Credential=...`, `OAuth oauth_signature=...`) is judged pair by pair by the pair rule, not as one bearer value.
+ * `Credential=...`, `OAuth oauth_consumer_key=...`), its first value quoted (`quoteFollows`) or bare, is judged
+ * parameter by parameter by scrubAuthorizationParameters and the pair rule, not as one bearer value.
  */
-function looksLikeSchemeCredential(value: string): boolean {
-  if (isSchemeParameterList(value)) return false;
+function looksLikeSchemeCredential(value: string, quoteFollows = false): boolean {
+  if (isSchemeParameterList(value, quoteFollows)) return false;
   return value.length >= 16 || /[\d+/=]/.test(value) || /[a-z][A-Z]/.test(value);
 }
 
-type TextRule = readonly [RegExp, string | ((...groups: string[]) => string)];
+/** A pattern and its replacement: a string, or a callback typed as String.prototype.replace types it (the match, its groups, the offset, the text). */
+type TextRule = readonly [RegExp, string | ((substring: string, ...args: any[]) => string)];
 
 function applyTextRule(text: string, [pattern, replacement]: TextRule): string {
   return typeof replacement === "string" ? text.replace(pattern, replacement) : text.replace(pattern, replacement);
@@ -735,7 +857,8 @@ function applyTextRule(text: string, [pattern, replacement]: TextRule): string {
 /**
  * Carrier rules: a value is removed because of what carries it (a quoted header or pair value, an authorization
  * scheme, a vendor token prefix, a JWT or PEM shape), not because of its own shape. The free-form header carriers
- * (Cookie, Set-Cookie, X-Auth-Key, X-Auth-Email) run first in scrubHeaderCarriers, so these only ever see the marker.
+ * (Cookie, Set-Cookie, X-Auth-Key, X-Auth-Email) run first in scrubHeaderCarriers and the Authorization parameter
+ * lists in scrubAuthorizationParameters, so these only ever see the marker.
  */
 const CARRIER_TEXT_PATTERNS: ReadonlyArray<TextRule> = [
   // Quoted header and pair values first, whatever their shape, so the scheme and pair rules see the marker. Under
@@ -750,10 +873,12 @@ const CARRIER_TEXT_PATTERNS: ReadonlyArray<TextRule> = [
   [ERROR_QUOTED_SCHEME_PATTERN, QUOTED_VALUE_REPLACEMENT],
   [ERROR_QUOTED_SCHEME_PHRASE_PATTERN, QUOTED_SCHEME_PHRASE_REPLACEMENT],
   // Authorization scheme values wherever they appear (headers, cookies, HTML, JSON messages), in any casing of
-  // the scheme word; looksLikeSchemeCredential keeps prose and parameter lists.
+  // the scheme word; looksLikeSchemeCredential keeps prose and parameter lists (a first parameter whose quoted
+  // value follows the match included).
   [
     new RegExp(String.raw`${NAME_BOUNDARY_PATTERN}(${ERROR_SCHEME_PATTERN})\s+([A-Za-z0-9\-._~+/=:]{6,})`, "gi"),
-    (match: string, scheme: string, value: string) => (looksLikeSchemeCredential(value) ? `${scheme} ${REDACTED_ERROR_VALUE}` : match),
+    (match: string, scheme: string, value: string, offset: number, text: string) =>
+      looksLikeSchemeCredential(value, quoteOpensAt(text, offset + match.length)) ? `${scheme} ${REDACTED_ERROR_VALUE}` : match,
   ],
   // Vendor token prefixes name the token type: AWS access key ids (long-term `AKIA`, temporary `ASIA`) and STS
   // bearer and context-specific credentials (`ABIA`, `ACCA`), Stripe secret and restricted keys, GitHub tokens,
@@ -857,13 +982,14 @@ export function redactErrorText(text: string): string {
   return scrubLongTokens(scrubbed);
 }
 
-/** The carrier passes shared by error text and snapshot strings: configured secrets, URL userinfo and query, header carriers, quoted values, schemes, vendor token prefixes, JWT and PEM shapes. */
+/** The carrier passes shared by error text and snapshot strings: configured secrets, URL userinfo and query, header carriers, Authorization parameter lists, quoted values, schemes, vendor token prefixes, JWT and PEM shapes. */
 function scrubCarriers(text: string): string {
   let scrubbed = scrubConfiguredSecrets(text);
   scrubbed = scrubbed.replace(ERROR_URL_PATTERN, (_match: string, scheme: string, hostPath: string, query?: string) =>
     `${scheme}${hostPath}${query ? `?${REDACTED_ERROR_VALUE}` : ""}`,
   );
   scrubbed = scrubHeaderCarriers(scrubbed);
+  scrubbed = scrubAuthorizationParameters(scrubbed);
   for (const rule of CARRIER_TEXT_PATTERNS) scrubbed = applyTextRule(scrubbed, rule);
   return scrubbed;
 }
@@ -871,9 +997,9 @@ function scrubCarriers(text: string): string {
 /**
  * Rule 9 data-side scrub for a string kept in a snapshot (reviewer D round 5 depth control): the carrier rules of
  * redactErrorText (the configured secrets in every encoded form, URL userinfo and query strings, the free-form
- * header carriers, quoted header and pair values, authorization schemes, vendor token prefixes, JWT and PEM
- * shapes, and credential-named pairs) without its bare-shape rules, so a value is removed for what carries it and
- * an identifier, a digest, or a key id that is data stays data.
+ * header carriers, the proofs in Authorization parameter lists, quoted header and pair values, authorization
+ * schemes, vendor token prefixes, JWT and PEM shapes, and credential-named pairs) without its bare-shape rules,
+ * so a value is removed for what carries it and an identifier, a digest, or a key id that is data stays data.
  */
 export function redactCarrierText(text: string): string {
   return scrubCredentialPairs(scrubCarriers(text));

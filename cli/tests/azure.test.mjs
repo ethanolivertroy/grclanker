@@ -67,6 +67,7 @@ import {
   ESCAPED_HEADER_LINES,
   JSON_ESCAPES,
   QUOTED_NON_CREDENTIAL_GROUP,
+  assertAuthorizationParameterRows,
   assertBearerIdKeyRows,
   assertBearerIdSnapshotKeys,
   assertCarrierTextScrub,
@@ -1001,6 +1002,11 @@ test("rule 9 URL userinfo boundary (CodeRabbit on #76 at b0ef16f): an `@` inside
   assertUrlUserinfoBoundaryRows(assert, redactErrorText, { label: "azure.redactErrorText" });
   assertUrlUserinfoBoundaryRows(assert, redactCarrierText, { label: "azure.redactCarrierText" });
   assertUrlUserinfoBoundaryRows(assert, (text) => scrubSnapshotValue(text), { label: "azure.scrubSnapshotValue" });
+});
+test("rule 9 Authorization parameter lists (CodeRabbit on #81, discussion_r4081238237): under an Authorization or Proxy-Authorization scheme every parameter value that is a proof is removed whatever its name, quoted or bare (Snowflake Token=\"...\", Bearer value=\"...\", Digest response, nonce, cnonce, and opaque, OAuth 1.0 oauth_token, oauth_signature, and oauth_nonce), while realm, username, uri, qop, nc, the SigV4 scope and signed headers, a WWW-Authenticate challenge, and Bearer realm=\"api\" in prose stay, on the error sink, the data-string sink, and a snapshot string, bare, inside a sentence, after a JSON escape, and inside a JSON string", () => {
+  assertAuthorizationParameterRows(assert, redactErrorText, { label: "azure.redactErrorText" });
+  assertAuthorizationParameterRows(assert, redactCarrierText, { label: "azure.redactCarrierText" });
+  assertAuthorizationParameterRows(assert, (text) => scrubSnapshotValue(text), { label: "azure.scrubSnapshotValue" });
 });
 test("rule 9 bearer-id override (CodeRabbit r4077259415 on #78): a key ending in secret_id or naming a session id is a credential key despite its id suffix, so a Vault AppRole secret id goes whatever its shape, a UUID included, through the error sink, the data-string sink, the snapshot walker, and the thrown error, while AZURE_TENANT_ID=<uuid> and the other identifier keys keep their values", async () => {
   assertBearerIdKeyRows(assert, redactErrorText);
