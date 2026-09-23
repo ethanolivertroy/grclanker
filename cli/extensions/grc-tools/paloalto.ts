@@ -1369,8 +1369,10 @@ const CREDENTIAL_LAST_SEGMENTS = new Set([
 ]);
 const NON_CREDENTIAL_KEY_QUALIFIERS = new Set(["public"]);
 // Header pairs ({key, value, secure} in Prisma Cloud webhook integrations) are credential
-// pairs when flagged secure: true or when the label names a credential (Authorization,
-// X-Api-Key); only the value is replaced so the label and flags stay readable.
+// pairs when flagged secure: true or when the label names a credential in either
+// vocabulary, the walker's (Authorization, X-Api-Key) or the text rules' (x-redlock-auth,
+// X-Auth, Cookie, X-PAN-KEY), whatever the secure flag says; only the value is replaced so
+// the label and flags stay readable.
 const CREDENTIAL_PAIR_LABEL_KEYS = ["key", "name", "header"];
 const CREDENTIAL_PAIR_VALUE_KEYS = new Set(["value", "default", "default_value"]);
 
@@ -1409,7 +1411,7 @@ function isCredentialJsonPair(record: JsonRecord): boolean {
   if (record.secure === true) return true;
   const label = CREDENTIAL_PAIR_LABEL_KEYS.map((key) => record[key]).find((value): value is string => typeof value === "string");
   return label !== undefined
-    && isCredentialPropertyName(label)
+    && (isCredentialPropertyName(label) || isCredentialKey(label))
     && [...CREDENTIAL_PAIR_VALUE_KEYS].some((key) => key in record);
 }
 

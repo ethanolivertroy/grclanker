@@ -767,6 +767,8 @@ const FAKE_PRISMA_SECRETS = {
   splunkAuthToken: "l7wws55g3rEVpnT12NJO78",
   webhookQueryToken: "0JZOorpfk5rQhCKp6RA4o0",
   webhookHeaderBearer: "6VCuAxxAkqMx3nlcay8S0e",
+  webhookHeaderRedlockAuth: "nECb9FEL0gTOkt9K8rzvpn",
+  webhookHeaderXAuth: "gAj2r82tYmFMjBnmlovWn4",
   slackWebhookPath: "T0CSM24TT/B07GB5ULK/S0StoE0rnauAcnbRP2X6JA",
   serviceNowPassword: "QSv2at8HxDN9YgiRo6Aw5w",
   tenableSecretKey: "3RC06KxXSjuXX0BMtxebvJ",
@@ -786,8 +788,13 @@ function secretsIntegrations() {
       enabled: true,
       integrationConfig: {
         url: `https://soar.example.com/prisma?token=${FAKE_PRISMA_SECRETS.webhookQueryToken}&env=prod`,
+        // Two credential-labelled pairs the tenant left unflagged (reviewer E finding B): the
+        // label alone makes them credential pairs. X-Trace is a benign unflagged pair.
         headers: [
           { key: "Authorization", value: `Bearer ${FAKE_PRISMA_SECRETS.webhookHeaderBearer}`, secure: true },
+          { key: "x-redlock-auth", value: FAKE_PRISMA_SECRETS.webhookHeaderRedlockAuth, secure: false },
+          { key: "X-Auth", value: FAKE_PRISMA_SECRETS.webhookHeaderXAuth, secure: false },
+          { key: "X-Trace", value: "trace-rvw-1", secure: false },
           { key: "Content-Type", value: "application/json", secure: false },
         ],
       },
@@ -1366,8 +1373,11 @@ test("redaction helpers scrub credential-shaped text, JSON pairs, URL credential
   assert.equal(redacted[1].integrationConfig.url, "https://soar.example.com/prisma?token=[REDACTED]&env=prod", "URL query credentials are scrubbed inside kept strings");
   assert.deepEqual(redacted[1].integrationConfig.headers, [
     { key: "Authorization", value: "[REDACTED]", secure: true },
+    { key: "x-redlock-auth", value: "[REDACTED]", secure: false },
+    { key: "X-Auth", value: "[REDACTED]", secure: false },
+    { key: "X-Trace", value: "trace-rvw-1", secure: false },
     { key: "Content-Type", value: "application/json", secure: false },
-  ], "only the value of a secure or credential-labelled header pair is replaced");
+  ], "only the value of a secure or credential-labelled header pair is replaced, whatever the secure flag says");
   assert.equal(redacted[2].integrationConfig.webhookUrl, "https://hooks.slack.com/[REDACTED]", "a URL under a webhook key keeps its origin only");
   assert.equal(redacted[3].integrationConfig.password, "[REDACTED]");
   assert.equal(redacted[3].integrationConfig.login, "prisma-svc");
@@ -2064,7 +2074,13 @@ test("exportPaloaltoAuditBundle and the assessment results never carry Prisma Cl
   assert.equal(integration("splunk").authToken, "[REDACTED]");
   assert.equal(integration("splunk").url, "https://splunk.example.com:8088/services/collector");
   assert.equal(integration("soar-webhook").url, "https://soar.example.com/prisma?token=[REDACTED]&env=prod");
-  assert.deepEqual(integration("soar-webhook").headers, [{ key: "Authorization", value: "[REDACTED]", secure: true }, { key: "Content-Type", value: "application/json", secure: false }]);
+  assert.deepEqual(integration("soar-webhook").headers, [
+    { key: "Authorization", value: "[REDACTED]", secure: true },
+    { key: "x-redlock-auth", value: "[REDACTED]", secure: false },
+    { key: "X-Auth", value: "[REDACTED]", secure: false },
+    { key: "X-Trace", value: "trace-rvw-1", secure: false },
+    { key: "Content-Type", value: "application/json", secure: false },
+  ], "an unflagged header pair whose label names a credential loses its value in the bundle file; a benign unflagged pair keeps it");
   assert.equal(integration("slack").webhookUrl, "https://hooks.slack.com/[REDACTED]");
   assert.equal(integration("servicenow").password, "[REDACTED]");
   assert.equal(integration("servicenow").login, "prisma-svc");

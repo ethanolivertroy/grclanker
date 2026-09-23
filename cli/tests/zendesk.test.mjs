@@ -2109,6 +2109,33 @@ test("redactCredentialProperties scrubs URL query credentials, userinfo, token-i
     "{name, value} pairs with credential names and secure: true objects lose value and default fields while names and kinds stay",
   );
 
+  // Reviewer E finding B: a pair whose name is a credential in the text rules' vocabulary
+  // (a header name ending in auth) loses its value whatever the secure flag says. The pairs
+  // sit under a neutral container: a headers map is replaced whole by its own rule.
+  assert.deepEqual(
+    redactCredentialProperties({
+      fields: [
+        { name: "x-redlock-auth", value: "rvw1RedlockPairValue", secure: false },
+        { name: "X-Auth", value: "rvw1XAuthPairValue", secure: false },
+        { name: "auth", value: "rvw1AuthPairValue" },
+        { name: "Cookie", value: "session=rvw1CookiePairValue", secure: false },
+        { name: "X-Trace", value: "trace-rvw-1", secure: false },
+        { name: "Content-Type", value: "application/json", secure: false },
+      ],
+    }),
+    {
+      fields: [
+        { name: "x-redlock-auth", value: "[REDACTED]", secure: false },
+        { name: "X-Auth", value: "[REDACTED]", secure: false },
+        { name: "auth", value: "[REDACTED]" },
+        { name: "Cookie", value: "[REDACTED]", secure: false },
+        { name: "X-Trace", value: "trace-rvw-1", secure: false },
+        { name: "Content-Type", value: "application/json", secure: false },
+      ],
+    },
+    "an unflagged pair whose name names a credential loses its value; a benign unflagged pair keeps it",
+  );
+
   assert.deepEqual(
     redactCredentialProperties({ secret: 123456, api_key: 4242, id: 42, port: 443, password_length: 12, count: 0 }),
     { secret: "[REDACTED]", api_key: "[REDACTED]", id: 42, port: 443, password_length: 12, count: 0 },

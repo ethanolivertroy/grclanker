@@ -1243,8 +1243,11 @@ function redactCredentialNode(value: unknown): unknown {
   if (Array.isArray(value)) return value.map(redactCredentialNode);
   const record = asObject(value);
   if (!record) return value;
+  // A {name, value} pair is a credential pair when flagged secure: true or when its name is
+  // a credential in either vocabulary, the walker's or the text rules' (auth, X-Auth, a
+  // header name such as Cookie), whatever the secure flag says.
   const pairName = typeof record.name === "string" ? record.name : undefined;
-  const pairIsCredential = (pairName !== undefined && propertyNameIsCredential(pairName)) || record.secure === true;
+  const pairIsCredential = (pairName !== undefined && (propertyNameIsCredential(pairName) || isCredentialKey(pairName))) || record.secure === true;
   const result: JsonRecord = {};
   for (const [key, entry] of Object.entries(record)) {
     if (entry === null || entry === undefined) {

@@ -2242,6 +2242,8 @@ const FAKE_TENABLE_SECRETS = {
   registrationCode: "BnHNcwxb33SF3JaByM3XfK",
   licenseKey: "PKJwsecPe18jp19Xw6vO2r",
   auditFieldToken: "Yd7rmz2KDiBHYn4oc83WbN",
+  auditFieldRedlockAuth: "UHE7I4ihja1YxODlSyT2S0",
+  auditFieldXAuth: "j8lEIFXwMaM2TE4aDCERVZ",
   webhookQueryToken: "5OvJOMuFTt9kEn8tS14NAW",
   credentialSecret: "0aLPuMBcC3LrhC03EFlIq8",
   camelCaseSecret: "2dzaTJuwLGmPzB5L9ZZEK4",
@@ -2268,9 +2270,14 @@ function secretBearingRoutes() {
   routes["GET /audit-log/v1/events"] = {
     events: [{
       ...healthyRoutes()["GET /audit-log/v1/events"].events[0],
+      // Two credential-labelled pairs flagged secure: false (reviewer E finding B): the
+      // label alone makes them credential pairs. X-Trace is a benign unflagged pair.
       fields: [
         { name: "api_token", value: secrets.auditFieldToken },
         { name: "target_url", value: `https://hooks.example.com/services/T000/B000?token=${secrets.webhookQueryToken}` },
+        { name: "x-redlock-auth", value: secrets.auditFieldRedlockAuth, secure: false },
+        { name: "X-Auth", value: secrets.auditFieldXAuth, secure: false },
+        { name: "X-Trace", value: "trace-rvw-1", secure: false },
         { name: "X-Client-Id", value: "client-1" },
       ],
     }],
@@ -2312,7 +2319,15 @@ test("exportTenableAuditBundle never writes policy credentials, scanner linking 
   const fields = events[0].fields;
   assert.deepEqual(fields.find((field) => field.name === "api_token").value, "[REDACTED]");
   assert.equal(fields.find((field) => field.name === "target_url").value, "https://hooks.example.com/services/T000/B000?token=[REDACTED]");
+  assert.deepEqual(fields.find((field) => field.name === "x-redlock-auth"), { name: "x-redlock-auth", value: "[REDACTED]", secure: false }, "an unflagged pair whose name ends in auth loses its value");
+  assert.deepEqual(fields.find((field) => field.name === "X-Auth"), { name: "X-Auth", value: "[REDACTED]", secure: false });
+  assert.deepEqual(fields.find((field) => field.name === "X-Trace"), { name: "X-Trace", value: "trace-rvw-1", secure: false }, "a benign unflagged pair keeps its value");
   assert.equal(fields.find((field) => field.name === "X-Client-Id").value, "client-1");
+  assert.deepEqual(
+    redactCredentialProperties({ fields: [{ name: "auth", value: "rvw1AuthPairValue" }, { name: "Cookie", value: "session=rvw1CookiePairValue", secure: false }, { name: "Content-Type", value: "application/json", secure: false }] }),
+    { fields: [{ name: "auth", value: "[REDACTED]" }, { name: "Cookie", value: "[REDACTED]", secure: false }, { name: "Content-Type", value: "application/json", secure: false }] },
+    "a pair named in the text rules' vocabulary loses its value whatever the secure flag says",
+  );
 
   const credentials = JSON.parse(files.get("core_data/credentials.json"));
   assert.equal(credentials[0].settings.password, "[REDACTED]");

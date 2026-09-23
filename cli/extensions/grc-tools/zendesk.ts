@@ -1358,9 +1358,11 @@ const NON_CREDENTIAL_KEY_QUALIFIERS = new Set(["public"]);
 // values are replaced).
 const HEADER_MAP_SEGMENTS = new Set(["headers", "custom_headers"]);
 const CREDENTIAL_CONTAINER_SAFE_KEYS = new Set(["username", "name"]);
-// A {name, value} pair whose name is a credential (an app parameter named api_token) or
-// any object flagged secure: true (owned app parameters) is a credential pair: its value
-// and default fields are replaced while the name, kind, and required flags are kept.
+// A {name, value} pair whose name is a credential in either vocabulary, the walker's (an
+// app parameter named api_token) or the text rules' (auth, X-Auth, a header name such as
+// Cookie), or any object flagged secure: true (owned app parameters) is a credential pair:
+// its value and default fields are replaced while the name, kind, and required flags are
+// kept, whatever the secure flag says.
 const CREDENTIAL_PAIR_VALUE_KEYS = new Set(["value", "default", "default_value"]);
 
 /**
@@ -1403,7 +1405,7 @@ function isCredentialPair(record: JsonRecord): boolean {
   if (record.secure === true) return true;
   const pairName = typeof record.name === "string" ? record.name : undefined;
   return pairName !== undefined
-    && isCredentialPropertyName(pairName)
+    && (isCredentialPropertyName(pairName) || isCredentialKey(pairName))
     && [...CREDENTIAL_PAIR_VALUE_KEYS].some((key) => key in record);
 }
 
