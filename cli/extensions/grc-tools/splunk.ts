@@ -708,12 +708,24 @@ const PAIR_KEY_ONLY_PATTERN = /^[A-Za-z][A-Za-z0-9_.-]*=$/;
 // The pairs of a request credential's list: a key up to its "=", a bare value, and the separator before
 // the next pair ("," with optional spaces, or spaces alone).
 const LIST_PAIR_KEY_PATTERN = /[A-Za-z][A-Za-z0-9_.-]*=/y;
-const LIST_BARE_VALUE_PATTERN = /[^\s"'<>;,()[\]{}\\]*/y;
+// A bare value that is already the marker reads as one value, so the list goes on past a pair an earlier pass removed.
+const LIST_BARE_VALUE_PATTERN = /\[REDACTED\]|[^\s"'<>;,()[\]{}\\]*/y;
 const LIST_PAIR_SEPARATOR_PATTERN = /[ \t]*,[ \t]*|[ \t]+/y;
 // The descriptive parameters of a credential's pair list, whose quoted value stays (`realm="api"`,
 // `qop="auth"`, `algorithm="SHA-256"`, a challenge's `error="invalid_token"`); every other quoted value
 // in the list is the credential.
 const LIST_KEPT_PARAM_PATTERN = /^(?:realm|qop|algorithm|charset|error|error_description|error_uri|scope)$/i;
+// The proof parameters of an authentication exchange: Digest's `response`, an HTTP Signatures or
+// OAuth 1.0 `signature` and `oauth_signature`, the MAC and Hawk schemes' `mac`, and an HMAC header's
+// `sig`. A proof's value is the credential wherever its pair sits in a list with a challenge parameter
+// (realm, nonce, cnonce, opaque, qop, or an oauth_* name), with or without a scheme word or a header in
+// front of the list, so `realm="api", nonce="n", response="<proof>"` is never read as a bare challenge;
+// a proof-free challenge (`realm="api", qop="auth"`) and a pair list of another kind (`status=500
+// response=slow`) keep their values. Inside a scheme word's list a bare proof goes whatever its neighbours.
+const PROOF_PARAM_PATTERN = /^(?:response|signature|oauth_signature|mac|sig)$/i;
+const CHALLENGE_PARAM_PATTERN = /^(?:realm|nonce|cnonce|opaque|qop|oauth_[a-z0-9_]+)$/i;
+// The first key of a pair list, at a carrier start; the keys after it are read past the list separator.
+const PAIR_LIST_KEY_PATTERN = new RegExp(String.raw`${CARRIER_START}[A-Za-z][A-Za-z0-9_.-]*=`, "g");
 // The marker, in quotes or bare, where a pair's value stood before an earlier pass removed it.
 const REDACTED_PAIR_VALUE_PATTERN = new RegExp(String.raw`${QUOTE_UNIT}?\[REDACTED\]`, "y");
 // In prose, an authorization scheme word followed by a quoted pair opens a credential's pair list
@@ -903,9 +915,10 @@ interface ListRead {
   end: number;
 }
 
-/** The bare value of a pair in a request credential's list follows its key's own rule: a credential key loses it, a setting key loses a token-shaped one, a webhook key keeps its origin, and any other key keeps it. */
+/** The bare value of a pair in a request credential's list follows its key's own rule: a credential or proof key loses it, a setting key loses a token-shaped one, a webhook key keeps its origin, and any other key keeps it. */
 function scrubBareListValue(key: string, value: string): string {
   if (value.length === 0 || value === REDACTED) return value;
+  if (PROOF_PARAM_PATTERN.test(key)) return REDACTED;
   const rule = pairRuleFor(key);
   switch (rule) {
     case "credential":
@@ -928,7 +941,8 @@ function scrubBareListValue(key: string, value: string): string {
  * credential, so a quoted value is removed whatever its key (`Snowflake Token="<v>"`, `Digest
  * response="<v>"`, `Bearer blob="<v>"`) unless the key is a descriptive parameter (`realm="api"`),
  * while a bare value follows its key's own rule so `qop=auth`, `nc=00000001`, and an HMAC header's
- * timestamp stay legible. `terminated` is false when a quoted value never closed, which ends the list there.
+ * timestamp stay legible and a bare proof (`response=<v>`, `sig=<v>`) goes. `terminated` is false when a
+ * quoted value never closed, which ends the list there.
  */
 function readListPairValue(text: string, valueStart: number, key: string, limit: number): ListRead & { terminated: boolean } {
   const opener = openingQuoteUnit(text, valueStart);
@@ -998,6 +1012,74 @@ function scrubSchemePairLists(text: string): string {
     out += `${text.slice(last, match.index + match[0].length)}${list.replacement}`;
     last = list.end;
     SCHEME_PAIR_LIST_PATTERN.lastIndex = last;
+  }
+  return last === 0 ? text : `${out}${text.slice(last)}`;
+}
+
+interface ListPair {
+  /** The pair's key, without its "=". */
+  key: string;
+  /** The value's content: between the quote units when quoted, the bare run otherwise. */
+  content: string;
+  /** The index of the content's first character. */
+  contentStart: number;
+}
+
+/**
+ * Reads the pair list whose first key starts at `start`: pairs separated by "," or spaces, with values
+ * quoted at any depth or bare. The list ends at the first text that is not another pair, and an
+ * unterminated quoted value ends it there.
+ */
+function readPairList(text: string, start: number): { pairs: ListPair[]; end: number } {
+  const pairs: ListPair[] = [];
+  let position = start;
+  let end = start;
+  while (position < text.length) {
+    LIST_PAIR_KEY_PATTERN.lastIndex = position;
+    const key = LIST_PAIR_KEY_PATTERN.exec(text)?.[0];
+    if (key === undefined) break;
+    const valueStart = position + key.length;
+    const opener = openingQuoteUnit(text, valueStart);
+    if (opener) {
+      const read = readQuotedContent(text, opener.contentStart, opener.backslashes, opener.quoteChar);
+      pairs.push({ key: key.slice(0, -1), content: read.content, contentStart: opener.contentStart });
+      end = read.end;
+      if (!read.terminated) break;
+    } else {
+      LIST_BARE_VALUE_PATTERN.lastIndex = valueStart;
+      const content = LIST_BARE_VALUE_PATTERN.exec(text)?.[0] ?? "";
+      pairs.push({ key: key.slice(0, -1), content, contentStart: valueStart });
+      end = valueStart + content.length;
+    }
+    LIST_PAIR_SEPARATOR_PATTERN.lastIndex = end;
+    const separator = LIST_PAIR_SEPARATOR_PATTERN.exec(text)?.[0];
+    if (separator === undefined) break;
+    position = end + separator.length;
+  }
+  return { pairs, end };
+}
+
+/**
+ * Removes the value of every proof parameter (see PROOF_PARAM_PATTERN) in a pair list that also carries
+ * a challenge parameter, whatever the value's shape and whether or not a scheme word or a header
+ * precedes the list: `realm="api", nonce="n", response="<proof>"` as a data value, after a literal
+ * escape, or inside a JSON string. The other pairs keep their own rule, so `realm="api"` stays.
+ */
+function scrubProofPairLists(text: string): string {
+  PAIR_LIST_KEY_PATTERN.lastIndex = 0;
+  let out = "";
+  let last = 0;
+  let match: RegExpExecArray | null;
+  while ((match = PAIR_LIST_KEY_PATTERN.exec(text)) !== null) {
+    const list = readPairList(text, match.index);
+    if (list.pairs.some((pair) => CHALLENGE_PARAM_PATTERN.test(pair.key))) {
+      for (const pair of list.pairs) {
+        if (!PROOF_PARAM_PATTERN.test(pair.key) || pair.content.length === 0 || pair.content === REDACTED) continue;
+        out += `${text.slice(last, pair.contentStart)}${REDACTED}`;
+        last = pair.contentStart + pair.content.length;
+      }
+    }
+    PAIR_LIST_KEY_PATTERN.lastIndex = list.end;
   }
   return last === 0 ? text : `${out}${text.slice(last)}`;
 }
@@ -1108,16 +1190,17 @@ function replaceFlagValues(text: string): string {
 
 /**
  * The carrier and shape rules shared by the error and data passes: PEM blocks, configured secrets,
- * cookie headers, URLs, query pairs, credential pairs and flags, pair lists and scheme words in prose,
- * JWTs, AWS keys, and vendor-prefixed tokens. `longTokens` adds the generic long-token and hex-digest rules,
- * which the error pass runs and the data pass leaves off so identifiers survive in evidence.
+ * cookie headers, URLs, query pairs, the proof parameters of a pair list, credential pairs and flags,
+ * pair lists and scheme words in prose, JWTs, AWS keys, and vendor-prefixed tokens. `longTokens` adds the
+ * generic long-token and hex-digest rules, which the error pass runs and the data pass leaves off so
+ * identifiers survive in evidence.
  */
 function scrubText(text: string, secrets: ReadonlyArray<string | undefined>, longTokens: boolean): string {
   let scrubbed = text.replace(PEM_BLOCK_PATTERN, REDACTED).replace(PEM_OPEN_PATTERN, REDACTED);
   scrubbed = scrubCookieHeaders(scrubConfiguredSecrets(scrubbed, secrets))
     .replace(EMBEDDED_URL_PATTERN, scrubEmbeddedUrl)
     .replace(QUERY_PAIR_PATTERN, scrubQueryPair);
-  scrubbed = scrubSchemePairLists(replaceFlagValues(replaceCredentialAssignments(scrubbed)))
+  scrubbed = scrubSchemePairLists(replaceFlagValues(replaceCredentialAssignments(scrubProofPairLists(scrubbed))))
     .replace(SCHEME_VALUE_PATTERN, scrubSchemeValue)
     .replace(JWT_IN_TEXT_PATTERN, REDACTED)
     .replace(AWS_ACCESS_KEY_ID_PATTERN, REDACTED)
