@@ -41,6 +41,7 @@ import { readBundleFiles, readZipEntries } from "./helpers/bundle-contents.mjs";
 import { assertCanaryFixture, assertCanaryWindowsAbsent, assertDepthCapPins } from "./helpers/canary-windows.mjs";
 import { assertCookieAttributeCarriersScrubbed } from "./helpers/cookie-attribute-carriers.mjs";
 import { scrubAlterations } from "./helpers/scrub-survival.mjs";
+import { assertGroupALeakProbe, reportTable, runGroupALeakProbeInFreshProcess } from "./helpers/group-a-leak-probe.mjs";
 
 const NOW = new Date("2026-09-21T12:00:00Z");
 const DAY_MS = 86_400_000;
@@ -2841,4 +2842,10 @@ test("cookie attribute class: a later cookie whose name holds a dot or another t
   assertCookieAttributeCarriersScrubbed(assert, scrubErrorText, "knowbe4 scrubErrorText");
   assertCookieAttributeCarriersScrubbed(assert, (text) => redactCredentialValues({ note: text }).note, "knowbe4 redactCredentialValues");
   assertCookieAttributeCarriersScrubbed(assert, (text) => redactCredentialValues([{ message: text }])[0].message, "knowbe4 redactCredentialValues, error list");
+});
+
+test("leak-probe harness: knowbe4", () => {
+  const run = runGroupALeakProbeInFreshProcess("knowbe4");
+  console.log(reportTable(run.result));
+  assertGroupALeakProbe(assert, run, { integration: "knowbe4" });
 });
