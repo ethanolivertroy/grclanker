@@ -800,6 +800,16 @@ const AUTHORIZATION_PARAMETERS_PATTERN = new RegExp(
  */
 const KEPT_SCHEME_PARAMETER_PATTERN =
   /^(?:realm|username|uri|qop|nc|algorithm|charset|userhash|oauth_consumer_key|oauth_signature_method|oauth_timestamp|oauth_version|oauth_callback|credential|signedheaders)$/i;
+/**
+ * The parameters whose name says the value is a proof wherever the list stands (CodeRabbit on #81,
+ * discussion_r4081776771): Digest's `response`, a `signature` or `sig`, OAuth 1.0's `oauth_signature`, and the MAC
+ * scheme's `mac`. In a challenge (see CHALLENGE_PARAMETERS_PATTERN) only these go; under an Authorization header
+ * every parameter that is not kept goes, so this list never widens what that header gives up.
+ */
+const PROOF_SCHEME_PARAMETER_PATTERN = /^(?:response|signature|oauth_signature|mac|sig)$/i;
+const REALM_PARAMETER_PATTERN = /^realm$/i;
+/** Which values a parameter list gives up: every proof under an Authorization header, only the proof-named parameters in a challenge. */
+type SchemeParameterListKind = "authorization" | "challenge";
 const SCHEME_PARAMETER_NAME_PATTERN = /([A-Za-z][A-Za-z0-9_-]*)=(?!=)/y;
 const SCHEME_PARAMETER_BARE_VALUE_PATTERN = /(?:\[REDACTED\]|[^\s"'&;,<>)\]}\\])+/y;
 const SCHEME_PARAMETER_SEPARATOR_PATTERN = /\s*,\s*/y;
@@ -825,18 +835,21 @@ function schemeParameterValueEnd(text: string, start: number): { end: number; qu
 
 /**
  * Walks the `name=value` parameter list that starts at `start`, the parameters separated by commas (RFC 7235),
- * each name shaped like a name (a base64 value with its padding, `cGFzc3dvcmQ=`, is no parameter). A kept
- * parameter passes whole; every other value becomes the marker inside its own quotes, an empty value stays
- * empty, and a value that is already the marker is left as it is, so a second pass changes nothing. The list ends
+ * each name shaped like a name (a base64 value with its padding, `cGFzc3dvcmQ=`, is no parameter). Under an
+ * Authorization header a kept parameter passes whole and every other value becomes the marker; in a challenge
+ * only a proof-named value does. The marker stands inside the value's own quotes, an empty value stays empty,
+ * and a value that is already the marker is left as it is, so a second pass changes nothing. The list ends
  * before the first text that is not a parameter (prose, a `)`, the close of the JSON string that carried the
  * line, the `;` inside SigV4's `SignedHeaders=host;x-amz-date`), which the caller keeps; a separator with no
- * parameter after it is not consumed. Returns the end of the list and its scrubbed text.
+ * parameter after it is not consumed. Returns the end of the list, its scrubbed text, and whether a `realm`
+ * parameter was among the parameters walked.
  */
-function scrubSchemeParameterList(text: string, start: number): { end: number; replacement: string } {
+function scrubSchemeParameterList(text: string, start: number, kind: SchemeParameterListKind): { end: number; replacement: string; realm: boolean } {
   let end = start;
   let replacement = "";
   let pending = "";
   let cursor = start;
+  let realm = false;
   for (;;) {
     SCHEME_PARAMETER_NAME_PATTERN.lastIndex = cursor;
     const name = SCHEME_PARAMETER_NAME_PATTERN.exec(text);
@@ -846,7 +859,9 @@ function scrubSchemeParameterList(text: string, start: number): { end: number; r
     if (value === undefined) break;
     const quote = value.quote ?? "";
     const content = text.slice(valueStart + quote.length, value.end - quote.length);
-    const kept = content.length === 0 || KEPT_SCHEME_PARAMETER_PATTERN.test(name[1]);
+    const kept =
+      content.length === 0 || (kind === "authorization" ? KEPT_SCHEME_PARAMETER_PATTERN.test(name[1]) : !PROOF_SCHEME_PARAMETER_PATTERN.test(name[1]));
+    if (REALM_PARAMETER_PATTERN.test(name[1])) realm = true;
     replacement += `${pending}${name[0]}${quote}${kept ? content : REDACTED_ERROR_VALUE}${quote}`;
     end = cursor = value.end;
     SCHEME_PARAMETER_SEPARATOR_PATTERN.lastIndex = cursor;
@@ -855,7 +870,7 @@ function scrubSchemeParameterList(text: string, start: number): { end: number; r
     pending = separator[0];
     cursor += separator[0].length;
   }
-  return { end, replacement };
+  return { end, replacement, realm };
 }
 
 /**
@@ -871,8 +886,48 @@ function scrubAuthorizationParameters(text: string): string {
   for (const match of text.matchAll(AUTHORIZATION_PARAMETERS_PATTERN)) {
     if (match.index < cursor || !isCredentialNamedKey(match[1])) continue;
     const listStart = match.index + match[0].length;
-    const { end, replacement } = scrubSchemeParameterList(text, listStart);
+    const { end, replacement } = scrubSchemeParameterList(text, listStart, "authorization");
     if (end === listStart) continue;
+    scrubbed += text.slice(cursor, listStart) + replacement;
+    cursor = end;
+  }
+  return scrubbed + text.slice(cursor);
+}
+
+/**
+ * Where a parameter list that is not under an Authorization key may start (CodeRabbit on #81,
+ * discussion_r4081776771): after a scheme word and its whitespace when a parameter follows (a WWW-Authenticate or
+ * Proxy-Authenticate challenge, `Digest realm="api", nonce="n", response="..."` in prose or in a JSON string, any
+ * casing), or at a `realm` parameter or a proof-named parameter standing on its own (`realm="api", nonce="n",
+ * response="..."` as a data value, `response="...", realm="api"`). A list shaped like a challenge is not exempt
+ * from the proof rule because the challenge names it: scrubChallengeParameters removes the proof-named values and
+ * keeps the rest, where a list under an Authorization key has already given up every proof.
+ */
+const CHALLENGE_PARAMETERS_PATTERN = new RegExp(
+  String.raw`(${NAME_BOUNDARY_PATTERN}(?:${ERROR_SCHEME_PATTERN})\s+)(?=[A-Za-z][A-Za-z0-9_-]*=(?!=))|${KEY_BOUNDARY_PATTERN}(?=(?:realm|response|signature|oauth_signature|mac|sig)=(?!=))`,
+  "gi",
+);
+
+/**
+ * Removes the proof-named values (see PROOF_SCHEME_PARAMETER_PATTERN) from every challenge-shaped parameter list in
+ * the text: the list after a scheme word, whatever its parameters, and a bare list that holds a `realm` parameter,
+ * before or after the proof. The scheme word, the parameter names, the other parameters (`realm`, `qop`,
+ * `algorithm`, `opaque`, `error`, `error_description`), their quotes, and the text after the list stay, so
+ * `WWW-Authenticate: Bearer realm="api"` and `Digest realm="api", qop="auth"` pass unchanged. A bare list with no
+ * `realm` and no scheme word is data (`response="ok", status="done"`, `mac=aa:bb:cc:dd:ee:ff response=200`), as is
+ * a `response` or `mac` field outside a parameter list (`"response": 403`). A list under an Authorization key has
+ * already been walked by scrubAuthorizationParameters and holds markers where its proofs stood, which this pass
+ * leaves as they are; a parameter name inside a value already walked is part of that value.
+ */
+function scrubChallengeParameters(text: string): string {
+  let scrubbed = "";
+  let cursor = 0;
+  for (const match of text.matchAll(CHALLENGE_PARAMETERS_PATTERN)) {
+    if (match.index < cursor) continue;
+    const scheme: string | undefined = match[1];
+    const listStart = match.index + match[0].length;
+    const { end, replacement, realm } = scrubSchemeParameterList(text, listStart, "challenge");
+    if (end === listStart || (scheme === undefined && !realm)) continue;
     scrubbed += text.slice(cursor, listStart) + replacement;
     cursor = end;
   }
@@ -884,7 +939,8 @@ function scrubAuthorizationParameters(text: string): string {
  * symbol (padding included), or changing case inside the word, so prose such as "Basic authentication" and
  * "Bearer token is missing" stays. A `name=value` parameter list after the scheme (`Bearer realm="api"`, SigV4
  * `Credential=...`, `OAuth oauth_consumer_key=...`), its first value quoted (`quoteFollows`) or bare, is judged
- * parameter by parameter by scrubAuthorizationParameters and the pair rule, not as one bearer value.
+ * parameter by parameter by scrubAuthorizationParameters, scrubChallengeParameters, and the pair rule, not as one
+ * bearer value.
  */
 function looksLikeSchemeCredential(value: string, quoteFollows = false): boolean {
   if (isSchemeParameterList(value, quoteFollows)) return false;
@@ -901,8 +957,9 @@ function applyTextRule(text: string, [pattern, replacement]: TextRule): string {
 /**
  * Carrier rules: a value is removed because of what carries it (a quoted header or pair value, an authorization
  * scheme, a vendor token prefix, a JWT or PEM shape), not because of its own shape. The free-form header carriers
- * (Cookie, Set-Cookie, X-Auth-Key, X-Auth-Email) run first in scrubHeaderCarriers and the Authorization parameter
- * lists in scrubAuthorizationParameters, so these only ever see the marker.
+ * (Cookie, Set-Cookie, X-Auth-Key, X-Auth-Email) run first in scrubHeaderCarriers, the Authorization parameter
+ * lists in scrubAuthorizationParameters, and the challenge proofs in scrubChallengeParameters, so these only ever
+ * see the marker.
  */
 const CARRIER_TEXT_PATTERNS: ReadonlyArray<TextRule> = [
   // Quoted header and pair values first, whatever their shape, so the scheme and pair rules see the marker. Under
@@ -1027,7 +1084,7 @@ export function redactErrorText(text: string): string {
   return scrubLongTokens(scrubbed);
 }
 
-/** The carrier passes shared by error text and snapshot strings: configured secrets, URL userinfo and query, header carriers, Authorization parameter lists, quoted values, schemes, vendor token prefixes, JWT and PEM shapes. */
+/** The carrier passes shared by error text and snapshot strings: configured secrets, URL userinfo and query, header carriers, Authorization parameter lists, challenge proofs, quoted values, schemes, vendor token prefixes, JWT and PEM shapes. */
 function scrubCarriers(text: string): string {
   let scrubbed = scrubConfiguredSecrets(text);
   scrubbed = scrubbed.replace(ERROR_URL_PATTERN, (_match: string, scheme: string, hostPath: string, query?: string) =>
@@ -1035,6 +1092,7 @@ function scrubCarriers(text: string): string {
   );
   scrubbed = scrubHeaderCarriers(scrubbed);
   scrubbed = scrubAuthorizationParameters(scrubbed);
+  scrubbed = scrubChallengeParameters(scrubbed);
   for (const rule of CARRIER_TEXT_PATTERNS) scrubbed = applyTextRule(scrubbed, rule);
   return scrubbed;
 }
@@ -1042,9 +1100,10 @@ function scrubCarriers(text: string): string {
 /**
  * Rule 9 data-side scrub for a string kept in a snapshot (reviewer D round 5 depth control): the carrier rules of
  * redactErrorText (the configured secrets in every encoded form, URL userinfo and query strings, the free-form
- * header carriers, the proofs in Authorization parameter lists, quoted header and pair values, authorization
- * schemes, vendor token prefixes, JWT and PEM shapes, and credential-named pairs) without its bare-shape rules,
- * so a value is removed for what carries it and an identifier, a digest, or a key id that is data stays data.
+ * header carriers, the proofs in Authorization parameter lists and in challenges, quoted header and pair values,
+ * authorization schemes, vendor token prefixes, JWT and PEM shapes, and credential-named pairs) without its
+ * bare-shape rules, so a value is removed for what carries it and an identifier, a digest, or a key id that is
+ * data stays data.
  */
 export function redactCarrierText(text: string): string {
   return scrubCredentialPairs(scrubCarriers(text));

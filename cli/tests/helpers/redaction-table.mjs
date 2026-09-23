@@ -520,18 +520,90 @@ export const AUTHORIZATION_PARAMETER_ROWS = Object.freeze([
 /** The values that must not survive any AUTHORIZATION_PARAMETER_ROWS output, by 6-to-24 windows. */
 export const AUTHORIZATION_PROOF_VALUES = Object.freeze([...Object.values(AUTHORIZATION_PROOFS), SIGV4_KEY_ID, SIGV4_SIGNATURE]);
 
+/** The proofs planted in CHALLENGE_PROOF_ROWS: non-hex and name-shaped (lowercase letters, one hyphenated), so only a carrier rule can remove them. */
+const CHALLENGE_PROOFS = Object.freeze({
+  challenge: "hwzqtnvxrblm",
+  data: "ltrqzvwmbxnp",
+  prose: "vbnqxzrwtlmp",
+  sig: "ptzrqwvxnbml",
+  signature: "nxqvzrltwbmp",
+  oauthSignature: "rzqvtwxnblmp",
+  mac: "wxzqrtvnblpm",
+  macScheme: "zqvnrtwxlbmp",
+  unquoted: "bqzrvtwxnlmp",
+  singleQuoted: "mxzqrvtwnblp",
+  first: "qwzrvtxnblmp",
+  hyphenated: "rzqwt-vxnbl-mpqz",
+  token: "xzqrvwtnblmp",
+  header: "tzqrvwxnblmp",
+});
+
+/**
+ * Challenge proofs (CodeRabbit on #81, discussion_r4081776771, probed on #76): a parameter list that is not under an
+ * Authorization key, a WWW-Authenticate or Proxy-Authenticate challenge, a scheme word and its parameters in prose,
+ * or a bare realm-led data value such as `realm="api", nonce="n", response="..."`, is not exempt from the proof
+ * rule because it is shaped like a challenge: the value of a parameter named as a proof (`response`, `signature`,
+ * `oauth_signature`, `mac`, `sig`) goes, quoted at any depth or bare, before or after the `realm`, while the
+ * parameters that describe the challenge (`realm`, `qop`, `algorithm`, `error`, `error_description`, `id`, `ts`)
+ * keep their values, so a proof-free challenge passes unchanged. A `nonce` is a credential word since #64, so
+ * `nonce="n"` reads `nonce="[REDACTED]"` in a challenge as in an Authorization header; the rows pin that rendering
+ * as it stands. A list with neither a `realm` nor a scheme word before it is data (`response="ok", status="done"`),
+ * as is a `response` or `mac` field outside a parameter list (`"response": 403`, `mac=aa:bb:cc:dd:ee:ff`). Before
+ * the fix the `response` and `mac` values survived on every sink in every form (`sig`, `signature`, and
+ * `oauth_signature` are credential words and went already). Each row is `[text, expected]`; the rows hold for the
+ * error sink, the data-string sink, and a snapshot string alike, bare, inside a sentence, after a JSON escape, and
+ * inside a JSON string.
+ */
+export const CHALLENGE_PROOF_ROWS = Object.freeze([
+  [`WWW-Authenticate: Digest realm="api", nonce="n", response="${CHALLENGE_PROOFS.challenge}"`, 'WWW-Authenticate: Digest realm="api", nonce="[REDACTED]", response="[REDACTED]"'],
+  [`realm="api", nonce="n", response="${CHALLENGE_PROOFS.data}"`, 'realm="api", nonce="[REDACTED]", response="[REDACTED]"'],
+  [`Digest realm="api", nonce="n", response="${CHALLENGE_PROOFS.prose}"`, 'Digest realm="api", nonce="[REDACTED]", response="[REDACTED]"'],
+  [`realm="api", sig="${CHALLENGE_PROOFS.sig}"`, 'realm="api", sig="[REDACTED]"'],
+  [`realm="api", signature="${CHALLENGE_PROOFS.signature}"`, 'realm="api", signature="[REDACTED]"'],
+  [`realm="api", oauth_signature="${CHALLENGE_PROOFS.oauthSignature}"`, 'realm="api", oauth_signature="[REDACTED]"'],
+  [`realm="api", mac="${CHALLENGE_PROOFS.mac}"`, 'realm="api", mac="[REDACTED]"'],
+  [
+    `WWW-Authenticate: MAC realm="api", id="h480djs93hd8", ts="1336363200", mac="${CHALLENGE_PROOFS.macScheme}"`,
+    'WWW-Authenticate: MAC realm="api", id="h480djs93hd8", ts="1336363200", mac="[REDACTED]"',
+  ],
+  [`WWW-Authenticate: Digest realm=api, nonce=n, response=${CHALLENGE_PROOFS.unquoted}`, "WWW-Authenticate: Digest realm=api, nonce=[REDACTED], response=[REDACTED]"],
+  [`WWW-Authenticate: Digest realm='api', response='${CHALLENGE_PROOFS.singleQuoted}'`, "WWW-Authenticate: Digest realm='api', response='[REDACTED]'"],
+  [`WWW-Authenticate: Digest realm="api", response="${CHALLENGE_PROOFS.hyphenated}"`, 'WWW-Authenticate: Digest realm="api", response="[REDACTED]"'],
+  [JSON.stringify({ "WWW-Authenticate": `Digest realm="api", response="${CHALLENGE_PROOFS.header}"` }), '{"WWW-Authenticate":"Digest realm=\\"api\\", response=\\"[REDACTED]\\""}'],
+  [`response="${CHALLENGE_PROOFS.first}", realm="api"`, 'response="[REDACTED]", realm="api"'],
+  [`Token realm="api", response="${CHALLENGE_PROOFS.token}"`, 'Token realm="api", response="[REDACTED]"'],
+  [
+    `WWW-Authenticate: Bearer realm="api", error="invalid_token", signature="${CHALLENGE_PROOFS.signature}"`,
+    'WWW-Authenticate: Bearer realm="api", error="invalid_token", signature="[REDACTED]"',
+  ],
+  ['WWW-Authenticate: Bearer realm="api"', 'WWW-Authenticate: Bearer realm="api"'],
+  ['Digest realm="api", qop="auth", nonce="n"', 'Digest realm="api", qop="auth", nonce="[REDACTED]"'],
+  [
+    'WWW-Authenticate: Bearer realm="api", error_description="the response signature did not verify"',
+    'WWW-Authenticate: Bearer realm="api", error_description="the response signature did not verify"',
+  ],
+  ['WWW-Authenticate: OAuth realm="api", oauth_problem="signature_invalid"', 'WWW-Authenticate: OAuth realm="api", oauth_problem="signature_invalid"'],
+  ['{"response": 403, "mac": "aa:bb:cc:dd:ee:ff"}', '{"response": 403, "mac": "aa:bb:cc:dd:ee:ff"}'],
+  ["interface eth0 mac=aa:bb:cc:dd:ee:ff response=200 in 12ms", "interface eth0 mac=aa:bb:cc:dd:ee:ff response=200 in 12ms"],
+  ['response="ok", status="done"', 'response="ok", status="done"'],
+  ['realm="api" was offered; the response body follows', 'realm="api" was offered; the response body follows'],
+]);
+
+/** The values that must not survive any CHALLENGE_PROOF_ROWS output, by 6-to-24 windows. */
+export const CHALLENGE_PROOF_VALUES = Object.freeze(Object.values(CHALLENGE_PROOFS));
+
 /** One JSON escape of `text` without the enclosing quotes, so a header line reads as the tail of a serialized message. */
 function jsonEscaped(text) {
   return JSON.stringify(text).slice(1, -1);
 }
 
 /**
- * Asserts each Authorization parameter row scrubs to exactly its expected text bare, inside a sentence with a
+ * Asserts each `[text, expected]` row scrubs to exactly its expected text bare, inside a sentence with a
  * parenthesis after it, after a JSON escape, and inside a JSON string (the expectation is the escape or the
  * serialization of the plain expectation, so the form changes nothing), that a second pass over every output
  * changes nothing, and that no window of any planted proof survives in any output.
  */
-export function assertAuthorizationParameterRows(assert, redact, { label = "redact", rows = AUTHORIZATION_PARAMETER_ROWS } = {}) {
+function assertParameterRows(assert, redact, { label, rows, subject, rowsLabel, proofValues }) {
   const outputs = [];
   for (const [text, expected] of rows) {
     const forms = [
@@ -542,12 +614,22 @@ export function assertAuthorizationParameterRows(assert, redact, { label = "reda
     ];
     for (const [form, input, expectedOutput] of forms) {
       const output = redact(input);
-      assert.equal(output, expectedOutput, `${label} Authorization parameters, ${form}: ${text}`);
+      assert.equal(output, expectedOutput, `${label} ${subject}, ${form}: ${text}`);
       assert.equal(redact(output), output, `${label}, ${form}: a second pass over ${JSON.stringify(output)} changes nothing`);
       outputs.push(output);
     }
   }
-  assertNoCanaryWindows(assert, outputs.join("\n"), AUTHORIZATION_PROOF_VALUES, `${label} Authorization parameter rows`);
+  assertNoCanaryWindows(assert, outputs.join("\n"), proofValues, `${label} ${rowsLabel}`);
+}
+
+/** The Authorization parameter rows (AUTHORIZATION_PARAMETER_ROWS) through assertParameterRows. */
+export function assertAuthorizationParameterRows(assert, redact, { label = "redact", rows = AUTHORIZATION_PARAMETER_ROWS } = {}) {
+  assertParameterRows(assert, redact, { label, rows, subject: "Authorization parameters", rowsLabel: "Authorization parameter rows", proofValues: AUTHORIZATION_PROOF_VALUES });
+}
+
+/** The challenge proof rows (CHALLENGE_PROOF_ROWS) through assertParameterRows. */
+export function assertChallengeProofRows(assert, redact, { label = "redact", rows = CHALLENGE_PROOF_ROWS } = {}) {
+  assertParameterRows(assert, redact, { label, rows, subject: "challenge parameters", rowsLabel: "challenge proof rows", proofValues: CHALLENGE_PROOF_VALUES });
 }
 
 /**

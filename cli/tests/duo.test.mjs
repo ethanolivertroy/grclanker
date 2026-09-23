@@ -68,6 +68,7 @@ import {
   assertBearerIdKeyRows,
   assertBearerIdSnapshotKeys,
   assertCarrierTextScrub,
+  assertChallengeProofRows,
   assertCredentialPairValuesRemoved,
   assertDepthControl,
   assertDepthControlOutputs,
@@ -2196,6 +2197,11 @@ test("rule 9 Authorization parameter lists (CodeRabbit on #81, discussion_r40812
   assertAuthorizationParameterRows(assert, redactErrorText, { label: "duo.redactErrorText" });
   assertAuthorizationParameterRows(assert, redactCarrierText, { label: "duo.redactCarrierText" });
   assertAuthorizationParameterRows(assert, (text) => scrubSnapshotValue(text), { label: "duo.scrubSnapshotValue" });
+});
+test("rule 9 challenge proofs (CodeRabbit on #81, discussion_r4081776771): a parameter list that is not under an Authorization key (a WWW-Authenticate challenge, Digest realm=\"api\", ... in prose, a bare realm=\"api\", nonce=\"n\", response=\"...\" data value) is not exempt because it is shaped like a challenge: the value of a parameter named response, signature, oauth_signature, mac, or sig goes, quoted at any depth or bare, before or after the realm, while realm, qop, algorithm, error, and error_description keep theirs, a proof-free challenge passes unchanged, and a response or mac field outside such a list is data, on the error sink, the data-string sink, and a snapshot string, bare, inside a sentence, after a JSON escape, and inside a JSON string", () => {
+  assertChallengeProofRows(assert, redactErrorText, { label: "duo.redactErrorText" });
+  assertChallengeProofRows(assert, redactCarrierText, { label: "duo.redactCarrierText" });
+  assertChallengeProofRows(assert, (text) => scrubSnapshotValue(text), { label: "duo.scrubSnapshotValue" });
 });
 test("rule 9 bearer-id override (CodeRabbit r4077259415 on #78): a key ending in secret_id or naming a session id is a credential key despite its id suffix, so a Vault AppRole secret id goes whatever its shape, a UUID included, through the error sink, the data-string sink, the snapshot walker, and the thrown error, while AZURE_TENANT_ID=<uuid> and the other identifier keys keep their values", async () => {
   assertBearerIdKeyRows(assert, redactErrorText);
