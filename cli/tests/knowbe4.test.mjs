@@ -1867,6 +1867,10 @@ const KNOWBE4_FAKE_SECRETS = [
   "X7dGVP2XHLR6Na7nD3e8vgwAJUvL34bA",
   "tUYsX4ybRbBMD9qRG6Jsc8nLQRGTEKaB",
   "QVzH3EeJNJyVKuza4iSEnrasY5UxSheU",
+  "Wm6RkT2xPz8HqYvB4NdLc7GsJf3AeUyK",
+  "Pv9NcXr4TbQz2MkHsL7dWyE6GfAj8RuC",
+  "Zk3HtVq7RmYb5NcXw2PdLg9SfJe4AuTn",
+  "Bq8LmWx3TzKv6HnRc2YdPf7GsJa5EuXk",
 ];
 
 function secretBearingKnowbe4Fixture() {
@@ -1875,6 +1879,10 @@ function secretBearingKnowbe4Fixture() {
   fixture.users[0].custom_field_1 = KNOWBE4_FAKE_SECRETS[1];
   fixture.users[0].comment = `shared vpn password ${KNOWBE4_FAKE_SECRETS[2]}`;
   fixture.account.integrations = [{ name: "SIEM webhook", webhook_url: `https://hooks.example.com/services/${KNOWBE4_FAKE_SECRETS[4]}`, shared_secret: KNOWBE4_FAKE_SECRETS[3] }];
+  fixture.account.sso_certificate = `-----BEGIN CERTIFICATE-----\n${KNOWBE4_FAKE_SECRETS[9]}\n-----END CERTIFICATE-----`;
+  fixture.account.sso_certificate_fingerprint = KNOWBE4_FAKE_SECRETS[10];
+  fixture.account.sso = { idp_entity_id: "https://idp.example.com", certificate: KNOWBE4_FAKE_SECRETS[11] };
+  fixture.account.admins[0].api_token = KNOWBE4_FAKE_SECRETS[12];
   const rows = fixture.recipientsByTest.get(String(fixture.securityTests[0].pst_id));
   rows[0] = { ...rows[0], user: { ...rows[0].user, custom_field_2: KNOWBE4_FAKE_SECRETS[5] } };
   fixture.trainingPolicies[0].settings = [{ name: "download_token", value: KNOWBE4_FAKE_SECRETS[6] }, { name: "minimum_time", value: "60" }];
@@ -1908,9 +1916,25 @@ test("verdict rule 9: the KnowBe4 bundle and its zip never carry credential-shap
   assert.ok(!("custom_field_1" in users[0]) && !("comment" in users[0]), "free-form user fields are dropped at collection time");
   assert.equal(users[0].email, "user1@acme.example", "assessment fields survive without PII redaction enabled");
   const account = JSON.parse(files.get(join("core_data", "account.json")));
-  assert.equal(account.integrations[0].shared_secret, "[REDACTED]");
-  assert.equal(account.integrations[0].webhook_url, "https://hooks.example.com");
-  assert.equal(account.integrations[0].name, "SIEM webhook");
+  assert.deepEqual(
+    account,
+    {
+      name: "Acme Corp",
+      type: "paid",
+      domains: ["acme.example"],
+      subscription_level: "Diamond",
+      subscription_end_date: "2027-01-01",
+      number_of_seats: 100,
+      current_risk_score: 28.4,
+      admins: [{ id: 1, first_name: "First1", last_name: "Last1", email: "user1@acme.example" }],
+      certificates: {
+        sso_certificate: { present: true, length: 86 },
+        sso_certificate_fingerprint: { present: true, fingerprint_length: 32 },
+      },
+    },
+    "the account snapshot carries only the fields the findings read, with certificates summarized as present and their length",
+  );
+  assert.ok(!("integrations" in account) && !("sso" in account), "fields no finding reads are dropped rather than scrubbed field by field");
   const recipients = JSON.parse(files.get(join("core_data", "security_test_recipients.json")));
   assert.ok(recipients.every((sample) => sample.recipients.every((row) => !("custom_field_2" in row.user))), "embedded recipient users are projected too");
   const policies = JSON.parse(files.get(join("core_data", "training_policies.json")));

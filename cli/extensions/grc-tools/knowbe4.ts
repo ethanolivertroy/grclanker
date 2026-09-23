@@ -690,6 +690,48 @@ export function projectKnowbe4User(user: JsonRecord): JsonRecord {
   return Object.fromEntries(Object.entries(user).filter(([key]) => !USER_FREE_FORM_KEYS.has(key)));
 }
 
+/** The account fields the findings read; every other field of the account record is dropped at collection time. */
+const ACCOUNT_FIELDS = ["name", "type", "domains", "subscription_level", "subscription_end_date", "number_of_seats", "current_risk_score"];
+const ACCOUNT_ADMIN_FIELDS = ["id", "first_name", "last_name", "email"];
+const CERTIFICATE_KEY_PATTERN = /cert|fingerprint|thumbprint/i;
+
+function pickFields(record: JsonRecord, fields: string[]): JsonRecord {
+  return Object.fromEntries(fields.filter((field) => record[field] !== undefined).map((field) => [field, record[field]]));
+}
+
+/**
+ * Summarizes each certificate, fingerprint, or thumbprint field of the account record as present with its length, so
+ * an SSO certificate PEM or its fingerprint is described in the bundle without being written into it.
+ */
+function certificateSummaries(account: JsonRecord): JsonRecord {
+  const summaries: JsonRecord = {};
+  for (const [key, value] of Object.entries(account)) {
+    if (!CERTIFICATE_KEY_PATTERN.test(key)) continue;
+    if (value === null || value === undefined || value === "") {
+      summaries[key] = { present: false };
+      continue;
+    }
+    const text = typeof value === "string" ? value : JSON.stringify(value) ?? "";
+    summaries[key] = /fingerprint|thumbprint/i.test(key) ? { present: true, fingerprint_length: text.length } : { present: true, length: text.length };
+  }
+  return summaries;
+}
+
+/**
+ * Projects the account record to the fields the findings read (name, type, domains, subscription, seats, risk score,
+ * and each console admin's id, name, and email). Certificate-shaped fields are summarized as present with their
+ * length; any other field (SSO settings, integrations) is dropped, so the account snapshot never dumps the record.
+ */
+export function projectKnowbe4Account(account: JsonRecord): JsonRecord {
+  const projected = pickFields(account, ACCOUNT_FIELDS);
+  if (account.admins !== undefined) {
+    projected.admins = asRecordArray(account.admins).map((admin) => pickFields(admin, ACCOUNT_ADMIN_FIELDS));
+  }
+  const certificates = certificateSummaries(account);
+  if (Object.keys(certificates).length > 0) projected.certificates = certificates;
+  return projected;
+}
+
 function projectRecipient(recipient: JsonRecord): JsonRecord {
   const embedded = asObject(recipient.user);
   return embedded ? { ...recipient, user: projectKnowbe4User(embedded) } : recipient;
@@ -2000,7 +2042,7 @@ export async function collectKnowbe4Snapshot(
   const phisherMessageLimit = clampInteger(options.phisherMessageLimit, DEFAULT_PHISHER_MESSAGE_LIMIT, 1, 100_000);
   const errors: string[] = [];
 
-  const account = await collectSurface("account", {}, errors, () => client.getAccount());
+  const account = await collectSurface("account", {}, errors, async () => projectKnowbe4Account(await client.getAccount()));
   const accountRiskHistory = needs("phishing", "risk")
     ? await collectListing("account_risk_score_history", errors, DEFAULT_LIST_LIMIT, () => client.getAccountRiskScoreHistory(true))
     : skipped<JsonRecord[]>([]);
