@@ -592,6 +592,11 @@ const VENDOR_TOKEN_PATTERNS: readonly RegExp[] = VENDOR_TOKEN_SHAPES.map((shape)
 const LONG_TOKEN_RUN_PATTERN = new RegExp(String.raw`${carrierStart("A-Za-z0-9+_-")}[A-Za-z0-9+_-]{${LONG_TOKEN_MIN_LENGTH},}(?:={1,2}(?![A-Za-z0-9&\["'\\]))?`, "g");
 const DIGIT_GROUP_PATTERN = /\d+/g;
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+// Trailing base64 padding is judged apart from the run it follows: `private_key_file=` is a setting
+// key whose value starts with a symbol, not a padded token.
+const BASE64_PADDING_PATTERN = /={1,2}$/;
+// A setting suffix concatenated onto another word (OKTA_CLIENT_AUTHORIZATIONMODE, OKTA_CLIENT_PRIVATEKEYID) still names the setting.
+const SETTING_KEY_SUFFIX_PATTERN = new RegExp(`(?:${[...SETTING_KEY_SUFFIXES].join("|")})$`);
 const SAFE_KEY_SHAPE_PATTERN = /^(?:max|min)[_-]|[_-](?:limit|days|hours|minutes|seconds|count|path|file|dir)$/i;
 const EXTRA_CREDENTIAL_KEY_SEGMENTS = new Set(["sid", "sig", "pwd", "passwd", "pass", "sessid", "phpsessid", "auth", "nonce", "sas"]);
 // "session" carries a credential only as the final segment (session=, user_session=); session_context and session_policy name settings.
@@ -641,9 +646,9 @@ function isAuthorizationStyleKey(segments: readonly string[]): boolean {
   return segments[segments.length - 1] === "authorization" || segments.slice(-2).join("_") === "www_authenticate";
 }
 
-/** The final segment names a setting; a concatenated key id or key name (OKTA_CLIENT_PRIVATEKEYID) counts as one. */
+/** The final segment names a setting, as its own word or concatenated onto another (OKTA_CLIENT_AUTHORIZATIONMODE, OKTA_CLIENT_PRIVATEKEYID); a bearer id is read before this test. */
 function isSettingSegment(segment: string): boolean {
-  return SETTING_KEY_SUFFIXES.has(segment) || /key(?:id|name)$/.test(segment);
+  return SETTING_KEY_SUFFIXES.has(segment) || SETTING_KEY_SUFFIX_PATTERN.test(segment);
 }
 
 /** How the value of a `key=value` or `key: value` pair is treated; see the pair rule above. */
@@ -655,9 +660,9 @@ function pairRuleFor(key: string): PairRule {
   return isSettingSegment(segments[segments.length - 1] ?? "") ? "setting" : "credential";
 }
 
-/** A setting value is removed only when it is a single run with a real token shape (base64 symbols, scattered digits, or token casing); a UUID, a scheme word, a mode name, or a URL stays for the later shape rules to judge. */
+/** A setting value is removed only when it is a single run of 16 or more characters with a real token shape (base64 symbols, scattered digits, or token casing); an identifier (0oa1audit, key-2024-01), a UUID, a scheme word, a mode name, or a URL stays for the later shape rules to judge. */
 function isTokenShapedValue(value: string): boolean {
-  return SINGLE_RUN_PATTERN.test(value) && looksLikeToken(value);
+  return value.length >= LONG_TOKEN_MIN_LENGTH && SINGLE_RUN_PATTERN.test(value) && looksLikeToken(value);
 }
 
 /** A webhook value keeps its origin and loses its path and query; a value that is not a URL goes whole. */
@@ -721,7 +726,7 @@ function isBarePathSegment(text: string, index: number, urlSpans: ReadonlyArray<
 function scrubBareTokens(text: string): string {
   const urlSpans = [...text.matchAll(EMBEDDED_URL_PATTERN)].map((match) => [match.index ?? 0, (match.index ?? 0) + match[0].length] as const);
   return text.replace(LONG_TOKEN_RUN_PATTERN, (run: string, offset: number) =>
-    looksLikeToken(run) && !SCHEME_WORD_PATTERN.test(run) && !isBarePathSegment(text, offset, urlSpans) ? REDACTED : run,
+    looksLikeToken(run.replace(BASE64_PADDING_PATTERN, "")) && !SCHEME_WORD_PATTERN.test(run) && !isBarePathSegment(text, offset, urlSpans) ? REDACTED : run,
   );
 }
 

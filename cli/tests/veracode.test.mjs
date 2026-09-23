@@ -2542,6 +2542,18 @@ const KEY_AUDIT_ROWS = [
   [`client_id=svc-audit-2026 tenant_id=${BEARER_ID_UUID}`, `client_id=svc-audit-2026 tenant_id=${BEARER_ID_UUID}`],
   ["access_key_id=svc-audit-2026 key_id=kid-primary private_key_id=kid-primary secret_name=db-credentials-prod", "access_key_id=svc-audit-2026 key_id=kid-primary private_key_id=kid-primary secret_name=db-credentials-prod"],
   [`token_type=${PLANTED_TOKEN}`, "token_type=[REDACTED]"],
+  ["client_id=0oa1audit key_id=key-2024-01 api_key_id=a1b2c3d4 private_key_id=kid-2026-01", "client_id=0oa1audit key_id=key-2024-01 api_key_id=a1b2c3d4 private_key_id=kid-2026-01"],
+  [`api_key_id=${PLANTED_TOKEN}`, "api_key_id=[REDACTED]"],
+  ["OKTA_CLIENT_AUTHORIZATIONMODE=ccg", "OKTA_CLIENT_AUTHORIZATIONMODE=ccg"],
+  ["OKTA_CLIENT_AUTHORIZATIONMODE: RS256", "OKTA_CLIENT_AUTHORIZATIONMODE: RS256"],
+  ['{"OKTA_CLIENT_AUTHORIZATIONMODE":"https://api.example.com/oauth2/token"}', '{"OKTA_CLIENT_AUTHORIZATIONMODE":"https://api.example.com/oauth2/token"}'],
+  ["export OKTA_CLIENT_AUTHORIZATIONMODE=privatekey", "export OKTA_CLIENT_AUTHORIZATIONMODE=privatekey"],
+  [`OKTA_CLIENT_AUTHORIZATIONMODE=${PLANTED_TOKEN}`, "OKTA_CLIENT_AUTHORIZATIONMODE=[REDACTED]"],
+  ["private_key_file=/x/y.pem credentials_file=/x/c.json --private-key-file=/x", "private_key_file=/x/y.pem credentials_file=/x/c.json --private-key-file=/x"],
+  ["OKTA_CLIENT_ORGURL= https://tenant.okta.gov", "OKTA_CLIENT_ORGURL= https://tenant.okta.gov"],
+  ["SPLUNK_BASE_URL_OVERRIDE=/opt/splunk", "SPLUNK_BASE_URL_OVERRIDE=/opt/splunk"],
+  ["export_output_dir=./export snowflake_account_name=", "export_output_dir=./export snowflake_account_name="],
+  ["QmFzZTY0K1N5bWJvbHM= stays a token", "[REDACTED] stays a token"],
 ];
 
 /** Flag, path-label, slash-escaped URL, and cookie carriers: the value goes and the prose around it stays. */
