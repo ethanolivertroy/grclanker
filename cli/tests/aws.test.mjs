@@ -2515,6 +2515,47 @@ test("rule 9 scrub boundary: name-shaped values stay bare, any value in a carrie
   });
 });
 
+test("rule 9 configured secrets from construction: static AWS_SECRET_ACCESS_KEY and AWS_SESSION_TOKEN in the environment are registered when the client is constructed, before any request is signed, and leave every sink in prose, under a setting key, and in a JSON member", () => {
+  // Name-shaped values short enough that no bare rule on any sink touches them: only the registration can.
+  const secret = "ctor-registered-first-2026";
+  const session = "ctor-registered-second-2026";
+  const control = "ctor-unregistered-control-2026";
+  const sinks = [
+    ["redactErrorText", redactErrorText],
+    ["redactCarrierText", redactCarrierText],
+    ["scrubSnapshotValue", (text) => scrubSnapshotValue(text)],
+  ];
+  const carriers = (value) => [`the value ${value} was echoed by the proxy`, `auth_method=${value}`, `{"detail":"${value}"}`];
+  // Positive control: before construction every sink keeps them, a setting value and a JSON member included.
+  for (const [name, sink] of sinks) {
+    for (const value of [secret, session, control]) {
+      for (const text of carriers(value)) assert.ok(sink(text).includes(value), `${name} keeps the unregistered ${text}`);
+    }
+  }
+  const previous = { AWS_SECRET_ACCESS_KEY: process.env.AWS_SECRET_ACCESS_KEY, AWS_SESSION_TOKEN: process.env.AWS_SESSION_TOKEN };
+  process.env.AWS_SECRET_ACCESS_KEY = secret;
+  process.env.AWS_SESSION_TOKEN = session;
+  try {
+    realAwsClient(realAwsConfig());
+  } finally {
+    for (const [key, value] of Object.entries(previous)) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+  }
+  for (const [name, sink] of sinks) {
+    for (const value of [secret, session]) {
+      for (const text of carriers(value)) {
+        const output = sink(text);
+        assert.ok(!output.includes(value), `${name} removes the configured ${text}: ${output}`);
+        assert.ok(output.includes("[REDACTED]"), `${name} leaves the marker in ${text}: ${output}`);
+      }
+      assert.equal(sink(`auth_method=${value}`), "auth_method=[REDACTED]", `${name} keeps the setting key`);
+    }
+    for (const text of carriers(control)) assert.ok(sink(text).includes(control), `${name} still keeps the unregistered control ${text}`);
+  }
+});
+
 test("rule 9 fixed texts (GWS note 1): every fixed-text message the integration emits survives redactErrorText unchanged, from the SyntaxError and non-JSON notes through every AwsApiError, IncompleteResponse, and AwsCredentialProviderError rendering to the region-scope, not_readable, and downgrade wordings", () => {
   const texts = awsFixedTexts();
   assertFixedTextsSurvive(assert, redactErrorText, texts, { minimum: 45 });

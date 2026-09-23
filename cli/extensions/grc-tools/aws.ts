@@ -1954,6 +1954,9 @@ export class AwsAuditorClient {
     private readonly config: AwsResolvedConfig,
     options: { now?: () => Date } = {},
   ) {
+    // Static credentials in the environment are configured secrets from construction on, before any request
+    // is signed; the guarded chain registers whatever it resolves at the first signed request as well.
+    registerConfiguredSecrets(process.env.AWS_SECRET_ACCESS_KEY, process.env.AWS_SESSION_TOKEN);
     const credentials = credentialProviderFor(config);
     const clientConfig = { region: config.region, credentials };
     this.credentials = credentials;
