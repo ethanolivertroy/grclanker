@@ -64,7 +64,7 @@ export function readZipEntries(zipPath) {
   return entries;
 }
 
-/** Asserts through the supplied assert module that no secret appears in any file or zip entry. */
+/** Asserts through the supplied assert module that no secret appears whole in any file or zip entry. */
 export function assertSecretsAbsent(assert, contents, secrets, label) {
   for (const [name, text] of contents) {
     for (const secret of secrets) {
@@ -72,3 +72,10 @@ export function assertSecretsAbsent(assert, contents, secrets, label) {
     }
   }
 }
+
+/**
+ * The fragment-window form of the scan: no substring of any planted secret at lengths 6 through 24
+ * appears in any file or zip entry. Planted secrets must be alphanumeric and random-looking (see
+ * planted-values.mjs) so no window can coincide with a legitimate value.
+ */
+export { assertSecretFragmentsAbsent } from "./planted-values.mjs";

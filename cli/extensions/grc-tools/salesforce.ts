@@ -97,11 +97,14 @@ export interface SalesforceResolvedConfig {
 
 export interface SalesforceQueryResult {
   records: JsonRecord[];
-  totalSize: number;
+  /** Undefined when Salesforce omitted totalSize; the result is then reported as truncated with an unknown total. */
+  totalSize?: number;
   done: boolean;
   truncated: boolean;
   pages: number;
   omittedFields?: string[];
+  /** Why the read stopped short, when it did (a stalled or foreign cursor, an empty page, the record limit). */
+  truncationReason?: string;
 }
 
 export interface SalesforceDataset<T> {
@@ -110,9 +113,41 @@ export interface SalesforceDataset<T> {
   data: T;
   error?: string;
   truncated: boolean;
+  /** Why a truncated read stopped short; absent when the read was complete or failed. */
+  truncationReason?: string;
   seen: number;
   total?: number;
   omittedFields?: string[];
+  /** HTTP status of the failed request; absent when the read succeeded or failed without a response. */
+  httpStatus?: number;
+  /** Path of the request that failed; absent when the read succeeded. */
+  endpoint?: string;
+}
+
+/**
+ * Written to core_data in place of a dataset that was denied, unavailable, or errored, so a bundle
+ * consumer cannot mistake a failed read for an empty inventory. A readable dataset with no rows keeps
+ * its snapshot shape with `data: []`.
+ */
+export interface NotCollectedMarker {
+  collected: false;
+  dataset: string;
+  status: DatasetStatus;
+  http_status: number | null;
+  endpoint: string | null;
+  error: string;
+}
+
+export function datasetCoreData<T>(dataset: SalesforceDataset<T>): SalesforceDataset<T> | NotCollectedMarker {
+  if (dataset.status === "ok") return dataset;
+  return {
+    collected: false,
+    dataset: dataset.name,
+    status: dataset.status,
+    http_status: dataset.httpStatus ?? null,
+    endpoint: dataset.endpoint ?? null,
+    error: dataset.error ?? dataset.status,
+  };
 }
 
 export interface SalesforceAccessSurface {
@@ -352,6 +387,42 @@ function normalizeBaseUrl(rawUrl: string): string {
   return parsed.toString().replace(/\/+$/, "");
 }
 
+/**
+ * Judges a server-supplied URL before it is requested. getJson puts the Bearer token on whatever it
+ * fetches, so a URL is requested only when it resolves to the session's instance origin and carries
+ * no userinfo: a credentialed URL is refused here, not handed to fetch. The clause names the
+ * configured origin and the rejected origin (scheme, host, port) and never the URL's path, query, or
+ * userinfo; undefined means the URL may be requested.
+ */
+export function refusedUrlClause(link: string, instanceUrl: string): string | undefined {
+  const configuredOrigin = new URL(instanceUrl).origin;
+  let resolved: URL;
+  try {
+    resolved = new URL(link, instanceUrl);
+  } catch {
+    return `was not a valid URL (instance origin ${configuredOrigin})`;
+  }
+  const carriesUserinfo = resolved.username !== "" || resolved.password !== "";
+  const foreignOrigin = resolved.origin !== configuredOrigin;
+  if (!carriesUserinfo && !foreignOrigin) return undefined;
+  const rejectedOrigin = resolved.origin === "null" ? `an opaque ${resolved.protocol} origin` : resolved.origin;
+  const target = foreignOrigin
+    ? `pointed at another origin, ${rejectedOrigin}, than the instance origin ${configuredOrigin}`
+    : `pointed at the instance origin ${configuredOrigin}`;
+  return carriesUserinfo ? `carried embedded credentials (userinfo) and ${target}` : target;
+}
+
+/** Fixed text for a request URL that was refused; the request is never sent. */
+export function foreignUrlMessage(clause: string): string {
+  return `Salesforce request URL ${clause}; the request was not sent.`;
+}
+
+/** Truncation reason recorded when a query's nextRecordsUrl is refused; the cursor is never requested. */
+export function nextRecordsRefusal(link: string, instanceUrl: string): string | undefined {
+  const clause = refusedUrlClause(link, instanceUrl);
+  return clause === undefined ? undefined : `nextRecordsUrl ${clause}; not followed`;
+}
+
 function serializeJson(value: unknown): string {
   return `${JSON.stringify(value, null, 2)}\n`;
 }
@@ -462,31 +533,345 @@ async function countFilesRecursively(rootDir: string): Promise<number> {
   return total;
 }
 
+const REDACTED = "[REDACTED]";
+const MIN_REMEMBERED_SECRET_LENGTH = 6;
+/** Nesting beyond this depth is left as served; parsed API payloads never reach it. */
+const MAX_REDACTION_DEPTH = 32;
+const KNOWN_SECRETS = new Set<string>();
+/** The forms a remembered secret takes in an echoed body (raw, base64, base64url, URL-encoded, JSON-escaped), computed once per secret. */
+const SECRET_FORMS = new Map<string, string[]>();
+// Scrub boundary. A value inside a carrier (an Authorization, Cookie, Set-Cookie, or API key header, a
+// cookie or session assignment, URL userinfo or a query pair, a Bearer/Basic/Digest/Token/ApiKey scheme,
+// a credential-named key-value pair, a SOAP credential element) is removed whatever its shape, quoted or bare; a
+// remembered secret is removed whatever its shape and in its encoded forms; a bare value is removed only
+// when it has a real token shape (JWT, PEM block, hex digest, vendor prefix, or a 16+ character run with
+// base64 symbols, scattered digits, or token casing). A bare name-shaped value (words joined by hyphens
+// or underscores, such as prod-us-east-2026) is indistinguishable from a resource name and stays.
+// A literal JSON escape (`\n`, `\r`, `\t`, `\b`, `\f`, `\/`, `\"`, `\uXXXX`) stands right before a header, a scheme,
+// a URL, or a token in a doubly-encoded body (a gateway error whose field holds serialized JSON). Its last character is
+// a word character for most of them, so `\b` and a "not preceded by a word character" lookbehind see no boundary there;
+// every carrier and token opener of the pass therefore also starts right after one, and no token shape starts inside one.
+const JSON_ESCAPE = String.raw`\\(?:u[0-9a-fA-F]{4}|[nrtbf/"])`;
+const AFTER_JSON_ESCAPE = `(?<=${JSON_ESCAPE})`;
+const OPENER_BOUNDARY = String.raw`(?:\b|${AFTER_JSON_ESCAPE})`;
+const NOT_INSIDE_JSON_ESCAPE = String.raw`(?!(?<=\\)(?:u[0-9a-fA-F]{4}|[nrtbf/]))`;
+const URL_IN_TEXT_PATTERN = new RegExp(String.raw`${OPENER_BOUNDARY}(https?:\/\/)(?:([^\s/?#@"'<>]+)@)?([^\s/?#"'<>]+)([^\s?#"'<>]*)(\?[^\s#"'<>]*)?(#[^\s"'<>]*)?`, "gi");
+// A query pair standing without its URL (`?token=...`, `&sid=...`).
+const BARE_QUERY_PAIR_PATTERN = /([?&][\w.~%-]+=)([^\s"'&#<>\\]+)/g;
+// Header name to value: `: `, `="`, or the JSON-escaped `\":\"`.
+const HEADER_SEPARATOR = String.raw`\\?["']?\s*[:=]\s*\\?["']?`;
+// The next header on the same line (`; X-Api-Key: x`, `, Content-Type: x`, ` Accept: x`, a quoted or JSON-object
+// name too): a cookie or header value ends before it, so that header keeps its name and gets its own carrier treatment.
+const NEXT_HEADER_NAME = String.raw`\s*\{?\s*\\?["']?[A-Za-z][\w-]*\\?["']?\s*:`;
+// The schemes that stand as carriers in prose (the ruling's list) and the wider set recognized inside an Authorization header.
+const PROSE_AUTH_SCHEMES = "bearer|basic|digest|token|apikey|api-key";
+const HEADER_AUTH_SCHEMES = `${PROSE_AUTH_SCHEMES}|negotiate|ntlm|hmac|oauth|hoba|mutual|vapid|aws4-hmac-sha256|scram-sha-1|scram-sha-256`;
+// A quote closes a value only when a delimiter or the end of the text follows it; a quote followed by a value
+// character opens the next header's value instead, so the value it seemed to close was never terminated.
+const CLOSING_QUOTE_BOUNDARY = String.raw`(?![\w/+=-])`;
+// A quoted value, in double quotes (possibly JSON-escaped) or single quotes, on one line, ending at its closing
+// quote even with `; Name:` inside. Quotes around a credential belong to its carrier: `Bearer "x"`, `sid='x'`,
+// `--token "x"` carry x whatever its shape.
+const QUOTED_VALUE = String.raw`(?:\\?"[^"\\\r\n]+\\?"|'[^'\r\n]+')${CLOSING_QUOTE_BOUNDARY}`;
+// A value whose opening quote never closes: it runs to the next `;`, `,`, or space (where the header patterns
+// apply the `Name:` cut) or to the end of the line, stray quotes included.
+const UNTERMINATED_QUOTED_VALUE = String.raw`\\?["'][^\s<>,;\\]+`;
+// One credential token (bare or quoted), or a parameter list such as Digest's `username="u", response="r"`
+// (quotes possibly JSON-escaped or single) or PagerDuty's `token=k`.
+const CREDENTIAL_TOKEN = String.raw`(?:${QUOTED_VALUE}|${UNTERMINATED_QUOTED_VALUE}|[^\s"'<>,;\\]+)`;
+const CREDENTIAL_PARAMETER_VALUE = String.raw`(?:(?:\\?"[^"\\\r\n]*\\?"|'[^'\r\n]*')${CLOSING_QUOTE_BOUNDARY}|\\?["']?[^\s"',;<>\\]+)`;
+const CREDENTIAL_PARAMETERS = String.raw`[\w-]+=${CREDENTIAL_PARAMETER_VALUE}(?:\s*[,;]\s*[\w-]+=${CREDENTIAL_PARAMETER_VALUE})*`;
+// The whole value of an Authorization header: a scheme and its credential, or up to two tokens for an unknown scheme.
+const AUTHORIZATION_HEADER_PATTERN = new RegExp(
+  String.raw`${OPENER_BOUNDARY}((?:proxy-)?authorization)(${HEADER_SEPARATOR})(?:(?:${HEADER_AUTH_SCHEMES})\s+(?:${CREDENTIAL_PARAMETERS}|${CREDENTIAL_TOKEN})|${CREDENTIAL_PARAMETERS}|${CREDENTIAL_TOKEN}(?:\s+(?!${NEXT_HEADER_NAME})${CREDENTIAL_TOKEN})?)`,
+  "gi",
+);
+// Cookie and Set-Cookie headers: every pair of the header value is a session credential. A pair's value may be
+// quoted (`sid="x"`, `sid = 'x'`, JSON-escaped `sid=\"x\"`) and ends at its closing quote even with `; Name:`
+// inside; a quote anywhere else closes the value, so the next header of a JSON headers object is not taken; an
+// unquoted value, or one whose opening quote never closes, runs to the `;`, `,`, or space that begins the next
+// header on the line, or to the end of the line.
+const COOKIE_PAIR_VALUE = String.raw`(?<==\s*)(?:(?:\\?"[^"\\\r\n,;\s][^"\\\r\n]*\\?"|'[^'\r\n,;\s][^'\r\n]*')${CLOSING_QUOTE_BOUNDARY}|${UNTERMINATED_QUOTED_VALUE})`;
+const COOKIE_HEADER_VALUE = String.raw`(?:[^\s"'<>\\;,]|[ \t;,](?!${NEXT_HEADER_NAME})|${COOKIE_PAIR_VALUE})+`;
+const COOKIE_HEADER_PATTERN = new RegExp(String.raw`${OPENER_BOUNDARY}(set-cookie|cookie)(${HEADER_SEPARATOR})(${COOKIE_HEADER_VALUE})`, "gi");
+// A scheme standing in prose (`Bearer x`, `Bearer "x"`, `Token token=x`, `ApiKey x`); a scheme word that is itself a
+// header or field name (`X-Api-Key : x`) is left to the field rule.
+const AUTH_SCHEME_PATTERN = new RegExp(String.raw`${OPENER_BOUNDARY}(${PROSE_AUTH_SCHEMES})(?!\s*[:=])\s+(${CREDENTIAL_PARAMETERS}|${CREDENTIAL_TOKEN})`, "gi");
+// What follows a scheme word in prose rather than as its credential: after a lowercase scheme, a word without
+// digits (lowercase, Capitalized, camelCase with up to three humps, a short acronym, or an acronym-led word such
+// as OAuth) or an environment variable name ("bearer of", "OAuth bearer token.", "access token (OAuth bearer
+// token)", "JWT bearer (SF_CONSUMER_KEY,"); after a capitalized scheme, only the capitalized next word of a title
+// ("Refresh Token Policy"). Wrapping punctuation belongs to the prose, so it is allowed around the word.
+const PROSE_AFTER_LOWERCASE_SCHEME_PATTERN = /^\(?(?:[A-Z]?[a-z]+(?:[A-Z][a-z]+){0,3}|[A-Z]{2,5}(?:[a-z]+)?|[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)+)[).:!?]*$/;
+const PROSE_AFTER_CAPITALIZED_SCHEME_PATTERN = /^\(?[A-Z][a-z]+[).:!?]*$/;
+const CREDENTIAL_PARAMETER_PATTERN = new RegExp(String.raw`([\w-]+=)${CREDENTIAL_PARAMETER_VALUE}`, "g");
+// Credential-named assignments (`client_secret=x`, `client_secret = "x"`, `JSESSIONID=x`, `connect.sid='x'`, `--token=x`).
+const SECRET_ASSIGNMENT_PATTERN = new RegExp(
+  String.raw`(?:(?<![\w.-])|${AFTER_JSON_ESCAPE})([\w.-]*(?:sess|sid|token|secret|passw|passphrase|pwd|passcode|api[_-]?key|apikey|access[_-]?key|private[_-]?key|credential|assertion|signature|auth|cookie|otp)[\w.-]*\s*=\s*)(${QUOTED_VALUE}|${UNTERMINATED_QUOTED_VALUE}|[^\s"'&;,<>\\]+)`,
+  "gi",
+);
+// Credential-named fields and single-value credential headers (`x-api-key: x`, `"password": "x"`, `\"access_token\":\"x\"`).
+const SECRET_FIELD_PATTERN = new RegExp(
+  String.raw`(?:(?<![\w/.-])|${AFTER_JSON_ESCAPE})((?:[\w-]*(?:api[_-]?key|apikey|token|secret|passw|passphrase|credential|assertion|signature|private[_-]?key|access[_-]?key|authorization)[\w-]*|pwd|passcode|otp|sid|jsessionid|session|sessionid|session[_-]?id|cookie|set-cookie|x-auth|x-token|x-secret|auth)\\?["']?\s*:\s*\\?["']?)([^\s"'&;,<>\\]+(?:["'](?=[\w/+=-])[^\s"'&;,<>\\]*)*)`,
+  "gi",
+);
+// SOAP and XML credential elements (`<sessionId>x</sessionId>`, `<urn:password>x</urn:password>`).
+const CREDENTIAL_ELEMENT_PATTERN = /<((?:[\w.-]+:)?(?:session_?id|session|passw(?:or)?d|pwd|passcode|otp|token|access_?token|refresh_?token|id_?token|secret|client_?secret|api_?key|apikey|assertion|signature|credentials?|authorization|private_?key)[\w-]*)(\s[^>]*)?>([^<]*)<\/\1\s*>/gi;
+// Command-line credential flags (`--token x`, `-password x`); the flag starts a word, so `access-token against` is prose.
+const CLI_SECRET_FLAG_PATTERN = new RegExp(
+  String.raw`(?:(?<![\w-])|${AFTER_JSON_ESCAPE})(--?(?:token|password|passwd|pwd|passcode|secret|api[_-]?key|apikey|access[_-]?key|client[_-]?secret|credential|auth|bearer|session|cookie|sid|otp)\s+)(${QUOTED_VALUE}|${UNTERMINATED_QUOTED_VALUE}|[^\s"'&;,<>-][^\s"'&;,<>]*)`,
+  "gi",
+);
+// Real token shapes, removed bare.
+const PEM_BLOCK_PATTERN = /-----BEGIN [A-Z0-9 ]+-----[\s\S]*?(?:-----END [A-Z0-9 ]+-----|$)/g;
+const JWT_PATTERN = new RegExp(String.raw`${OPENER_BOUNDARY}eyJ[A-Za-z0-9_-]{4,}\.[A-Za-z0-9_-]{4,}\.[A-Za-z0-9_-]*`, "g");
+const HEX_DIGEST_PATTERN = new RegExp(String.raw`(?:(?<![A-Za-z0-9])|${AFTER_JSON_ESCAPE})${NOT_INSIDE_JSON_ESCAPE}[0-9a-f]{32,}(?![A-Za-z0-9])`, "gi");
+const VENDOR_TOKEN_PATTERN = new RegExp(String.raw`${OPENER_BOUNDARY}${NOT_INSIDE_JSON_ESCAPE}(?:(?:sk|rk|pk)_(?:live|test)_[A-Za-z0-9]{8,}|sk-(?:proj-)?[A-Za-z0-9_-]{20,}|gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|xox[abopsre]-[A-Za-z0-9-]{10,}|xapp-[A-Za-z0-9-]{10,}|(?:AKIA|ASIA|AGPA|AIDA|AROA|ANPA|ANVA)[0-9A-Z]{16}|AIza[0-9A-Za-z_-]{20,}|ya29\.[0-9A-Za-z_-]{20,}|glpat-[A-Za-z0-9_-]{16,}|npm_[A-Za-z0-9]{30,}|pypi-[A-Za-z0-9_-]{30,}|dop_v1_[a-f0-9]{40,}|SG\.[A-Za-z0-9_-]{16,}\.[A-Za-z0-9_-]{16,}|hvs\.[A-Za-z0-9_-]{20,}|shpat_[a-fA-F0-9]{32}|dckr_pat_[A-Za-z0-9_-]{20,}|lin_api_[A-Za-z0-9]{20,}|figd_[A-Za-z0-9_-]{20,}|u\+[A-Za-z0-9_-]{16,})(?![A-Za-z0-9_-])`, "g");
+// A run long enough to be a token; redactTokenRun decides by segment shape whether it is one. It may start right
+// after `=` (`theme=<run>`, `x==<run>`): the pair rule has already replaced every credential-named pair by the time
+// this rule runs, so a run still standing after `=` is under a non-credential name and is judged by its shape alone;
+// the padding of a base64 run is taken on its right side.
+const BARE_TOKEN_RUN_PATTERN = new RegExp(String.raw`(?:(?<![A-Za-z0-9+/_-])|${AFTER_JSON_ESCAPE})${NOT_INSIDE_JSON_ESCAPE}[A-Za-z0-9+/_-]{16,}={0,2}(?![A-Za-z0-9+/_=-])`, "g");
+// A segment that reads as a word: lowercase, UPPERCASE, Capitalized, or camelCase with up to six humps, each
+// hump optionally led by a short acronym (enableCSRFOnPost, connectedAppOAuth) or closed by one
+// (sessionTimeoutSAML), optionally followed by digits (oauth2, sha256, dev12345) or a version suffix
+// (EngineProtectionV2, getDeviceControlPoliciesV2).
+const WORD_SEGMENT_PATTERN = /^(?:[A-Z]+|[A-Z]?[a-z]+(?:[A-Z]{1,5}[a-z]+){0,6}(?:[A-Z]{2,5})?|[A-Z]{2,}[a-z]+(?:[A-Z]{1,5}[a-z]+){0,6}(?:[A-Z]{2,5})?)(?:V\d+|\d*)$/;
+// A canonical UUID (8-4-4-4-12 hex) is a vendor identifier (a Falcon user uuid, an Anypoint organization or
+// environment id), not a credential, so it stays bare; inside a carrier or when remembered it still goes.
+const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+// An 18-character Salesforce record Id (00D org, 005 user, 0PS permission set) is the vendor's identifier shape; its
+// last three characters are a case checksum over the first fifteen, which a random token passes with probability 1/32768.
+const SALESFORCE_ID_PATTERN = /^[0-9A-Za-z]{15}[A-Z0-5]{3}$/;
+const SALESFORCE_ID_CHECKSUM_ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZ012345";
+// Node fs error codes (ENOENT, EACCES, EISDIR); anything else on error.code is not echoed.
+const FS_ERROR_CODE_PATTERN = /^E[A-Z0-9_]{1,30}$/;
+// The only part of a JSON.parse message that is taken; the rest quotes the source.
+const JSON_POSITION_PATTERN = /at position (\d+)/;
+
+/**
+ * The unanchored redaction pass every error string receives, once in SalesforceApiError and again
+ * at the sink (errorMessage): every secret any client in this process has seen, in every form it can
+ * take in an echoed body, then the carriers (URL userinfo, query strings, and fragments anywhere in
+ * the text, Authorization and cookie headers, auth schemes in prose, SOAP credential elements,
+ * credential-named assignments and fields, command-line flags), then the bare token shapes (PEM
+ * blocks, JWT-shaped assertions, hex digests, vendor prefixes, and long runs with base64 symbols,
+ * scattered digits, or token casing).
+ */
+function scrubErrorText(text: string, secrets: Iterable<string | undefined> = KNOWN_SECRETS): string {
+  let scrubbed = text;
+  for (const secret of secrets) {
+    if (!secret || secret.length < MIN_REMEMBERED_SECRET_LENGTH) continue;
+    for (const form of secretForms(secret)) scrubbed = scrubbed.split(form).join(REDACTED);
+  }
+  return scrubBareTokens(scrubCarriers(scrubbed));
+}
+
+/**
+ * The carrier stage of the pass: URL userinfo, query strings, and fragments anywhere in the text,
+ * Authorization and cookie headers, credential elements, JWTs and PEM blocks, auth schemes in prose,
+ * credential-named assignments, fields, and command-line flags. It removes a value by the company it
+ * keeps, never by its shape alone.
+ */
+function scrubCarriers(text: string): string {
+  return text
+    .replace(PEM_BLOCK_PATTERN, REDACTED)
+    .replace(URL_IN_TEXT_PATTERN, (_match, scheme: string, userinfo: string | undefined, host: string, path: string, query?: string, fragment?: string) =>
+      `${scheme}${userinfo ? `${REDACTED}@` : ""}${host}${path}${query ? `?${REDACTED}` : ""}${fragment ? `#${REDACTED}` : ""}`)
+    .replace(BARE_QUERY_PAIR_PATTERN, (_match, pair: string) => `${pair}${REDACTED}`)
+    .replace(AUTHORIZATION_HEADER_PATTERN, (_match, header: string, separator: string) => `${header}${separator}${REDACTED}`)
+    .replace(COOKIE_HEADER_PATTERN, (_match, header: string, separator: string) => `${header}${separator}${REDACTED}`)
+    .replace(CREDENTIAL_ELEMENT_PATTERN, (_match, element: string, attributes: string | undefined) => `<${element}${attributes ?? ""}>${REDACTED}</${element}>`)
+    .replace(JWT_PATTERN, REDACTED)
+    .replace(AUTH_SCHEME_PATTERN, (match: string, scheme: string, credential: string) =>
+      (isProseAfterScheme(scheme, credential) ? match : `${scheme} ${redactCredentialParameters(credential)}`))
+    .replace(SECRET_ASSIGNMENT_PATTERN, (_match, assignment: string) => `${assignment}${REDACTED}`)
+    .replace(SECRET_FIELD_PATTERN, (_match, field: string) => `${field}${REDACTED}`)
+    .replace(CLI_SECRET_FLAG_PATTERN, (_match, flag: string) => `${flag}${REDACTED}`);
+}
+
+/** The bare-token stage: real token shapes removed whatever their company (vendor prefixes, hex digests, long runs with base64 symbols, scattered digits, or token casing). */
+function scrubBareTokens(text: string): string {
+  return text
+    .replace(VENDOR_TOKEN_PATTERN, REDACTED)
+    .replace(HEX_DIGEST_PATTERN, REDACTED)
+    .replace(BARE_TOKEN_RUN_PATTERN, redactTokenRun);
+}
+
+/** Every secret any client in this process has seen, in every form it can take in a text. */
+function scrubRememberedSecrets(text: string): string {
+  let scrubbed = text;
+  for (const secret of KNOWN_SECRETS) {
+    for (const form of secretForms(secret)) scrubbed = scrubbed.split(form).join(REDACTED);
+  }
+  return scrubbed;
+}
+
+/**
+ * The data-side pass (rule 9, data-side carrier class) for every string a snapshot, evidence list,
+ * summary, core_data file, or tool payload keeps from an API response: the remembered secrets in every
+ * form, then the carrier stage (which takes JWTs and PEM blocks), then the vendor-prefixed token shapes
+ * (`sk_live_`, `xoxb-`, `ghp_`, `AKIA`, and the rest of VENDOR_TOKEN_PATTERN), unambiguous credential
+ * shapes with no identifier collision. It has no generic bare-run stage, so prose identifiers (a UUID, a
+ * sys_id, a name such as prod-us-east-2026) stay while a header line, URL credential, assignment,
+ * configured secret, or vendor token embedded in a description, name, or note goes.
+ */
+function scrubDataText(text: string): string {
+  return scrubCarriers(scrubRememberedSecrets(text)).replace(VENDOR_TOKEN_PATTERN, REDACTED);
+}
+
+/**
+ * A collected value with every string leaf through the data-side pass; arrays and plain objects are
+ * rebuilt, primitives and null are kept, and a container nested deeper than MAX_REDACTION_DEPTH is
+ * replaced by the marker rather than passed through unscrubbed (the payload is server-controlled).
+ */
+function scrubDataStrings<T>(value: T, depth = 0): T {
+  if (typeof value === "string") return scrubDataText(value) as T;
+  if (value === null || typeof value !== "object") return value;
+  if (depth > MAX_REDACTION_DEPTH) return REDACTED as T;
+  if (Array.isArray(value)) return value.map((item) => scrubDataStrings(item, depth + 1)) as T;
+  const prototype = Object.getPrototypeOf(value);
+  if (prototype !== Object.prototype && prototype !== null) return value;
+  const output: Record<string, unknown> = {};
+  for (const [key, entry] of Object.entries(value as Record<string, unknown>)) output[key] = scrubDataStrings(entry, depth + 1);
+  return output as T;
+}
+
+/** A scheme word standing in prose ("bearer of", "OAuth bearer token.", "Refresh Token Policy") rather than carrying a credential. */
+function isProseAfterScheme(scheme: string, credential: string): boolean {
+  return /^[a-z]+$/.test(scheme)
+    ? PROSE_AFTER_LOWERCASE_SCHEME_PATTERN.test(credential)
+    : PROSE_AFTER_CAPITALIZED_SCHEME_PATTERN.test(credential);
+}
+
+/** A parameter list (`token=k`, `username="u", response="r"`) keeps its parameter names; a single credential is replaced whole. */
+function redactCredentialParameters(credential: string): string {
+  return /^[\w-]+=/.test(credential) ? credential.replace(CREDENTIAL_PARAMETER_PATTERN, (_match, name: string) => `${name}${REDACTED}`) : REDACTED;
+}
+
+/** The raw, base64, base64url, URL-encoded, and JSON-escaped forms of a secret, so an encoded echo is caught too. */
+function secretForms(secret: string): string[] {
+  let forms = SECRET_FORMS.get(secret);
+  if (!forms) {
+    const bytes = Buffer.from(secret, "utf8");
+    const base64 = bytes.toString("base64");
+    const urlEncoded = encodeURIComponent(secret);
+    forms = [...new Set([
+      secret,
+      base64,
+      base64.replace(/=+$/, ""),
+      bytes.toString("base64url"),
+      urlEncoded,
+      urlEncoded.replace(/%20/g, "+"),
+      urlEncoded.replace(/%[0-9A-F]{2}/g, (escape) => escape.toLowerCase()),
+      JSON.stringify(secret).slice(1, -1),
+    ])].filter((form) => form.length >= MIN_REMEMBERED_SECRET_LENGTH);
+    SECRET_FORMS.set(secret, forms);
+  }
+  return forms;
+}
+
+/** True for an 18-character Salesforce Id whose checksum suffix matches the case of its first fifteen characters. */
+export function isSalesforceRecordId(value: string): boolean {
+  if (!SALESFORCE_ID_PATTERN.test(value)) return false;
+  for (let group = 0; group < 3; group += 1) {
+    let bits = 0;
+    for (let offset = 0; offset < 5; offset += 1) {
+      const character = value[group * 5 + offset];
+      if (character >= "A" && character <= "Z") bits |= 1 << offset;
+    }
+    if (value[15 + group] !== SALESFORCE_ID_CHECKSUM_ALPHABET[bits]) return false;
+  }
+  return true;
+}
+
+/**
+ * A run reads as a token when any hyphen- or underscore-separated segment is neither a word, a number, nor
+ * a short abbreviation; a canonical UUID or a checksum-valid Salesforce Id is an identifier and never reads as one.
+ */
+function looksLikeToken(value: string): boolean {
+  if (UUID_PATTERN.test(value) || isSalesforceRecordId(value)) return false;
+  return value.split(/[-_]+/).some((segment) =>
+    segment.length > 0 && !/^\d+$/.test(segment) && !WORD_SEGMENT_PATTERN.test(segment) && !(segment.length < 8 && /^[A-Za-z0-9]+$/.test(segment)));
+}
+
+/** Base64 symbols mark a token; otherwise a run without slashes is judged whole and a path piece by piece, keeping its word-like skeleton. */
+function redactTokenRun(run: string): string {
+  if (run.includes("+") || run.endsWith("=")) return REDACTED;
+  if (!run.includes("/")) return looksLikeToken(run) ? REDACTED : run;
+  return run.split("/").map((piece) => (looksLikeToken(piece) ? REDACTED : piece)).join("/");
+}
+
+function rememberSecrets(...values: Array<string | undefined>): void {
+  for (const value of values) {
+    if (value && value.length >= MIN_REMEMBERED_SECRET_LENGTH) KNOWN_SECRETS.add(value);
+  }
+}
+
+/**
+ * The fields carrying response text are the message (status line plus Salesforce's documented
+ * message, error_description, or faultstring, or the opaque-body note) and errorCode; both are
+ * scrubbed in the constructor so no throw site can hand an unredacted body to a catch block.
+ * `endpoint` is the request path, recorded so a not-collected marker can name the request that failed.
+ */
 export class SalesforceApiError extends Error {
   readonly status?: number;
   readonly errorCode?: string;
+  readonly endpoint?: string;
 
-  constructor(message: string, options: { status?: number; errorCode?: string } = {}) {
-    super(message);
+  constructor(message: string, options: { status?: number; errorCode?: string; endpoint?: string } = {}) {
+    super(scrubErrorText(message));
     this.name = "SalesforceApiError";
     this.status = options.status;
-    this.errorCode = options.errorCode;
+    this.errorCode = options.errorCode === undefined ? undefined : scrubErrorText(options.errorCode);
+    this.endpoint = options.endpoint;
   }
 }
 
 function redactSecrets(message: string, secrets: Array<string | undefined>): string {
-  let redacted = message
-    .replace(/assertion=[^&\s"]+/gi, "assertion=[REDACTED]")
-    .replace(/access_token"?\s*[:=]\s*"?[^"&\s,}]+/gi, "access_token=[REDACTED]")
-    .replace(/refresh_token"?\s*[:=]\s*"?[^"&\s,}]+/gi, "refresh_token=[REDACTED]")
-    .replace(/Bearer\s+[A-Za-z0-9._!~-]+/g, "Bearer [REDACTED]")
-    .replace(/<sessionId>[^<]*<\/sessionId>/gi, "<sessionId>[REDACTED]</sessionId>");
-  for (const secret of secrets) {
-    if (secret && secret.length >= 6) {
-      redacted = redacted.split(secret).join("[REDACTED]");
+  return scrubErrorText(message, [...secrets, ...KNOWN_SECRETS]);
+}
+
+/**
+ * A response body without a recognizable vendor error field is described by content type and
+ * length only, whatever its content type; its text is never sliced into an error string.
+ */
+function describeOpaqueBody(response: Response, rawText: string, kind: string): string | undefined {
+  if (rawText.length === 0) return undefined;
+  const contentType = response.headers.get("content-type")?.split(";")[0]?.trim() || "unknown content type";
+  return `${kind} (${contentType}, ${Buffer.byteLength(rawText, "utf8")} bytes)`;
+}
+
+function parseJsonBody(rawText: string): { payload: unknown; parsed: boolean } {
+  if (rawText.length === 0) return { payload: {}, parsed: false };
+  try {
+    return { payload: JSON.parse(rawText), parsed: true };
+  } catch {
+    return { payload: {}, parsed: false };
+  }
+}
+
+/**
+ * Exported URL fields keep scheme, host, and path only: LoginHistory.LoginUrl carries `?sid=` and
+ * ConnectedApplication.StartUrl can carry `?key=`, so the query string and fragment are dropped.
+ */
+export function reduceUrlFields(record: JsonRecord): JsonRecord {
+  const projected: JsonRecord = {};
+  for (const [key, value] of Object.entries(record)) {
+    if (/url$/i.test(key) && typeof value === "string" && /^[a-z][a-z0-9+.-]*:\/\//i.test(value)) {
+      try {
+        const url = new URL(value);
+        projected[key] = `${url.protocol}//${url.host}${url.pathname}`;
+      } catch {
+        projected[key] = value.split(/[?#]/)[0];
+      }
+    } else if (/url$/i.test(key) && typeof value === "string") {
+      projected[key] = value.split(/[?#]/)[0];
+    } else {
+      projected[key] = value;
     }
   }
-  return redacted;
+  return projected;
 }
 
 function salesforceErrorSummary(payload: unknown): { message?: string; errorCode?: string } {
@@ -512,15 +897,52 @@ function isUnavailableError(error: unknown): boolean {
   return /INVALID_TYPE|INVALID_FIELD|NOT_FOUND|INVALID_TYPE_FOR_OPERATION|sObject type .* is not supported|No such column|UNKNOWN_EXCEPTION/i.test(`${error.errorCode ?? ""} ${error.message}`);
 }
 
+/**
+ * Thrown by the credentials file loader. The message is fixed text carrying only the path, the fs
+ * error code, and the line: neither Node's fs message (which quotes its own wording and path) nor
+ * V8's JSON.parse message (which quotes a window of the source, or the whole source when it is
+ * short) is ever interpolated, because the file holds the client secret, password, or private key.
+ */
+export class SalesforceConfigFileError extends Error {
+  readonly code: string;
+
+  constructor(message: string, code: string) {
+    super(message);
+    this.name = "SalesforceConfigFileError";
+    this.code = code;
+  }
+}
+
+/** Read step of the loader: any failure (ENOENT included) becomes fixed text with the validated fs code. */
+function readCredentialsFileText(pathname: string): string {
+  try {
+    return readFileSync(pathname, "utf8");
+  } catch (error) {
+    const rawCode = (error as { code?: unknown } | null)?.code;
+    const code = typeof rawCode === "string" && FS_ERROR_CODE_PATTERN.test(rawCode) ? rawCode : undefined;
+    throw new SalesforceConfigFileError(`Unable to read Salesforce credentials file ${pathname}${code ? ` (${code})` : ""}`, code ?? "EUNKNOWN");
+  }
+}
+
+/**
+ * Parse step of the loader: every thrown value is caught and only a position taken through the
+ * strict `at position N` pattern is kept, converted to the line it falls on.
+ */
+function parseCredentialsFileJson(pathname: string, text: string): unknown {
+  try {
+    return JSON.parse(text) as unknown;
+  } catch (error) {
+    const position = error instanceof Error ? JSON_POSITION_PATTERN.exec(error.message) : null;
+    const line = position ? text.slice(0, Number(position[1])).split("\n").length : undefined;
+    throw new SalesforceConfigFileError(`Unable to parse Salesforce credentials file: invalid JSON in ${pathname}${line ? ` at line ${line}` : ""}`, "INVALID_JSON");
+  }
+}
+
 function readCredentialsFile(pathname: string): JsonRecord {
   const resolved = resolve(pathname);
-  if (!existsSync(resolved)) {
-    throw new Error(`Salesforce credentials file not found: ${resolved}`);
-  }
-  const parsed = JSON.parse(readFileSync(resolved, "utf8")) as unknown;
-  const object = asObject(parsed);
+  const object = asObject(parseCredentialsFileJson(resolved, readCredentialsFileText(resolved)));
   if (!object) {
-    throw new Error(`Salesforce credentials file must contain a JSON object: ${resolved}`);
+    throw new SalesforceConfigFileError(`Unable to parse Salesforce credentials file: ${resolved} must contain a JSON object`, "INVALID_JSON");
   }
   return object;
 }
@@ -529,10 +951,13 @@ function loadPrivateKey(inline: string | undefined, pathname: string | undefined
   if (inline) return inline.replace(/\\n/g, "\n");
   if (!pathname) return undefined;
   const resolved = resolve(pathname);
-  if (!existsSync(resolved)) {
-    throw new Error(`Salesforce private key file not found: ${resolved}`);
+  try {
+    return readFileSync(resolved, "utf8");
+  } catch (error) {
+    const rawCode = (error as { code?: unknown } | null)?.code;
+    const code = typeof rawCode === "string" && FS_ERROR_CODE_PATTERN.test(rawCode) ? rawCode : undefined;
+    throw new SalesforceConfigFileError(`Unable to read Salesforce private key file ${resolved}${code ? ` (${code})` : ""}`, code ?? "EUNKNOWN");
   }
-  return readFileSync(resolved, "utf8");
 }
 
 function looksLikeSandbox(instanceUrl: string | undefined, loginUrl: string | undefined): boolean {
@@ -802,6 +1227,7 @@ export class SalesforceApiClient {
     this.fetchImpl = options.fetchImpl ?? fetch;
     this.sleep = options.sleep ?? ((ms) => new Promise((resolvePromise) => setTimeout(resolvePromise, ms)));
     this.now = options.now ?? (() => new Date());
+    rememberSecrets(config.password, config.securityToken, config.consumerSecret, config.refreshToken, config.accessToken, config.privateKey);
     if (config.authMode === "access-token" && config.accessToken && config.instanceUrl) {
       this.session = { accessToken: config.accessToken, instanceUrl: config.instanceUrl };
     }
@@ -833,11 +1259,15 @@ export class SalesforceApiClient {
   private async rawFetch(url: string, init: RequestInit): Promise<Response> {
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), this.config.timeoutMs);
+    const endpoint = new URL(url).pathname;
     try {
       return await this.fetchImpl(url, { ...init, signal: controller.signal });
     } catch (error) {
+      if (error instanceof Error && error.name === "AbortError") {
+        throw new SalesforceApiError(`Salesforce request to ${endpoint} timed out after ${this.config.timeoutMs} ms`, { endpoint });
+      }
       const message = error instanceof Error ? error.message : String(error);
-      throw new SalesforceApiError(this.redact(`Salesforce request to ${new URL(url).pathname} failed: ${message}`));
+      throw new SalesforceApiError(this.redact(`Salesforce request to ${endpoint} failed: ${message}`), { endpoint });
     } finally {
       clearTimeout(timeout);
     }
@@ -873,22 +1303,19 @@ export class SalesforceApiClient {
       body,
     });
     const rawText = await response.text();
-    let payload: unknown = {};
-    try {
-      payload = rawText.length > 0 ? JSON.parse(rawText) : {};
-    } catch {
-      payload = {};
-    }
+    const { payload, parsed } = parseJsonBody(rawText);
     if (!response.ok) {
       const summary = salesforceErrorSummary(payload);
+      const detail = summary.message ?? describeOpaqueBody(response, rawText, parsed ? "JSON body without a recognized error field" : "non-JSON body");
       throw new SalesforceApiError(
-        this.redact(`Salesforce token request failed (${response.status})${summary.message ? `: ${summary.message}` : ""}`),
-        { status: response.status, errorCode: summary.errorCode },
+        this.redact(`Salesforce token request failed (${response.status})${summary.errorCode ? ` ${summary.errorCode}` : ""}${detail ? `: ${detail}` : ""}`),
+        { status: response.status, errorCode: summary.errorCode, endpoint: "/services/oauth2/token" },
       );
     }
     const object = asObject(payload) ?? {};
     const accessToken = asString(object.access_token);
-    if (!accessToken) throw new SalesforceApiError("Salesforce token response did not include access_token.");
+    if (!accessToken) throw new SalesforceApiError("Salesforce token response did not include access_token.", { endpoint: "/services/oauth2/token" });
+    rememberSecrets(accessToken);
     const instanceUrl = asString(object.instance_url) ? normalizeBaseUrl(asString(object.instance_url) as string) : this.config.instanceUrl;
     if (!instanceUrl) throw new SalesforceApiError("Salesforce token response did not include instance_url and SF_INSTANCE_URL is not set.");
     return { accessToken, instanceUrl };
@@ -945,24 +1372,34 @@ export class SalesforceApiClient {
 
   async getJson(pathOrUrl: string, query: Record<string, string> = {}): Promise<unknown> {
     const session = await this.getSession();
-    const url = new URL(pathOrUrl.startsWith("http") ? pathOrUrl : `${session.instanceUrl}${pathOrUrl}`);
+    // Every request resolves against the session's instance URL and must stay on its origin without
+    // userinfo: the Bearer token goes on the request, so a server-supplied absolute URL elsewhere, or a
+    // credentialed one, is refused here and never fetched. The error carries no endpoint, so the
+    // refused URL's path never reaches a dataset marker.
+    const refusal = refusedUrlClause(pathOrUrl, session.instanceUrl);
+    if (refusal !== undefined) throw new SalesforceApiError(foreignUrlMessage(refusal));
+    const url = new URL(pathOrUrl, session.instanceUrl);
     for (const [key, value] of Object.entries(query)) url.searchParams.set(key, value);
     const response = await this.fetchWithRetry(url.toString(), {
       method: "GET",
       headers: { authorization: `Bearer ${session.accessToken}`, accept: "application/json" },
     });
     const rawText = await response.text();
-    let payload: unknown = {};
-    try {
-      payload = rawText.length > 0 ? JSON.parse(rawText) : {};
-    } catch {
-      payload = { message: rawText.slice(0, 200) };
-    }
+    const { payload, parsed } = parseJsonBody(rawText);
     if (!response.ok) {
+      // Only Salesforce's documented error fields are quoted; any other body (proxy HTML, plain-text
+      // gateway errors, unrecognized JSON) is described by content type and length.
       const summary = salesforceErrorSummary(payload);
+      const detail = summary.message ?? describeOpaqueBody(response, rawText, parsed ? "JSON body without a recognized error field" : "non-JSON body");
       throw new SalesforceApiError(
-        this.redact(`Salesforce request ${url.pathname} failed (${response.status})${summary.errorCode ? ` ${summary.errorCode}` : ""}${summary.message ? `: ${summary.message}` : ""}`),
-        { status: response.status, errorCode: summary.errorCode },
+        this.redact(`Salesforce request ${url.pathname} failed (${response.status})${summary.errorCode ? ` ${summary.errorCode}` : ""}${detail ? `: ${detail}` : ""}`),
+        { status: response.status, errorCode: summary.errorCode, endpoint: url.pathname },
+      );
+    }
+    if (!parsed && rawText.length > 0) {
+      throw new SalesforceApiError(
+        `Salesforce request ${url.pathname} returned ${describeOpaqueBody(response, rawText, "a non-JSON body")} with status ${response.status}`,
+        { status: response.status, endpoint: url.pathname },
       );
     }
     return payload;
@@ -971,23 +1408,61 @@ export class SalesforceApiClient {
   private async runQuery(resource: string, soql: string, limit: number): Promise<SalesforceQueryResult> {
     const recordLimit = clampNumber(limit, DEFAULT_RECORD_LIMIT, 1, 200_000);
     const records: JsonRecord[] = [];
+    const visitedCursors = new Set<string>();
     let payload = asObject(await this.getJson(this.dataPath(resource), { q: soql })) ?? {};
     let pages = 1;
-    let done = asBoolean(payload.done) ?? true;
-    const totalSize = asNumber(payload.totalSize) ?? asRecords(payload.records).length;
+    const totalSize = asNumber(payload.totalSize);
+    let doneFlag = asBoolean(payload.done);
+    let nextUrl = asString(payload.nextRecordsUrl);
+    // A missing done flag is only trusted as "complete" when no further page is promised.
+    let done = doneFlag ?? nextUrl === undefined;
+    let stalled = false;
+    let truncationReason: string | undefined;
     records.push(...asRecords(payload.records));
 
     while (!done && records.length < recordLimit) {
-      const nextUrl = asString(payload.nextRecordsUrl);
-      if (!nextUrl) break;
+      // More records promised but no cursor, or a cursor that stopped advancing: exit and report truncated.
+      if (!nextUrl || visitedCursors.has(nextUrl)) {
+        stalled = true;
+        truncationReason = nextUrl ? "nextRecordsUrl did not advance" : "more records promised without a nextRecordsUrl";
+        break;
+      }
+      // The cursor is followed on the instance's own origin only, and never with userinfo: an absolute
+      // URL elsewhere would carry the Bearer token to a foreign host, and a credentialed URL must not
+      // reach fetch at all, so the read stops and is reported truncated with a reason that names the
+      // two origins only.
+      const { instanceUrl } = await this.getSession();
+      const refusal = nextRecordsRefusal(nextUrl, instanceUrl);
+      if (refusal !== undefined) {
+        stalled = true;
+        truncationReason = refusal;
+        break;
+      }
+      visitedCursors.add(nextUrl);
       payload = asObject(await this.getJson(nextUrl)) ?? {};
       pages += 1;
-      records.push(...asRecords(payload.records));
-      done = asBoolean(payload.done) ?? true;
+      const pageRecords = asRecords(payload.records);
+      records.push(...pageRecords);
+      doneFlag = asBoolean(payload.done);
+      nextUrl = asString(payload.nextRecordsUrl);
+      done = doneFlag ?? nextUrl === undefined;
+      if (pageRecords.length === 0 && !done) {
+        stalled = true;
+        truncationReason = "empty page returned with more records promised";
+        break;
+      }
     }
 
-    const truncated = !done || records.length > recordLimit || totalSize > records.length;
-    return { records: records.slice(0, recordLimit), totalSize, done, truncated, pages };
+    const complete = done && !stalled && records.length <= recordLimit
+      && (totalSize === undefined ? doneFlag === true : totalSize <= records.length);
+    return {
+      records: records.slice(0, recordLimit),
+      totalSize,
+      done: done && !stalled,
+      truncated: !complete,
+      pages,
+      ...(truncationReason ? { truncationReason } : {}),
+    };
   }
 
   async query(soql: string, limit = DEFAULT_RECORD_LIMIT): Promise<SalesforceQueryResult> {
@@ -1023,15 +1498,20 @@ export class SalesforceApiClient {
       headers: { "content-type": "text/xml; charset=UTF-8", soapaction: "\"\"" },
       body: envelope,
     });
+    const endpoint = `/services/Soap/m/${this.config.apiVersion}`;
     const rawText = await response.text();
     const parsed = parseSimpleXml(rawText);
+    const envelopeBody = findXmlNode(parsed, ["Envelope", "Body"]);
     const fault = firstRecord(findXmlNode(parsed, ["Envelope", "Body", "Fault"]));
     if (fault || !response.ok) {
+      // Only the SOAP fault's faultcode and faultstring are quoted; a body without a SOAP envelope
+      // (proxy HTML, plain text) is described by content type and length.
       const faultCode = asString(fault?.faultcode)?.replace(/^.*:/, "");
       const faultString = asString(fault?.faultstring);
+      const detail = faultString ?? describeOpaqueBody(response, rawText, envelopeBody === undefined ? "non-SOAP body" : "SOAP body without a fault string");
       throw new SalesforceApiError(
-        this.redact(`Salesforce Metadata API ${label} failed (${response.status})${faultCode ? ` ${faultCode}` : ""}${faultString ? `: ${faultString}` : ""}`),
-        { status: response.status, errorCode: faultCode },
+        this.redact(`Salesforce Metadata API ${label} failed (${response.status})${faultCode ? ` ${faultCode}` : ""}${detail ? `: ${detail}` : ""}`),
+        { status: response.status, errorCode: faultCode, endpoint },
       );
     }
     const result = findXmlNode(parsed, ["Envelope", "Body", ...resultPath]);
@@ -1251,40 +1731,94 @@ function classifyError(error: unknown): DatasetStatus {
   return "error";
 }
 
+/**
+ * The single sink every recorded error string passes through (dataset errors, access-check surfaces,
+ * assessment error arrays, _errors.log); it re-applies the redaction pass so a message built outside
+ * SalesforceApiError cannot bypass it.
+ */
 function errorMessage(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
+  return scrubErrorText(error instanceof Error ? error.message : String(error));
+}
+
+function failureFields(error: unknown): Pick<SalesforceDataset<unknown>, "httpStatus" | "endpoint"> {
+  if (!(error instanceof SalesforceApiError)) return {};
+  return {
+    ...(error.status !== undefined ? { httpStatus: error.status } : {}),
+    ...(error.endpoint !== undefined ? { endpoint: error.endpoint } : {}),
+  };
 }
 
 async function collectRecords(name: string, load: () => Promise<SalesforceQueryResult>): Promise<SalesforceDataset<JsonRecord[]>> {
   try {
     const result = await load();
+    const records = result.records.map((record) => scrubDataStrings(reduceUrlFields(record)));
     return {
       name,
       status: "ok",
-      data: result.records,
+      data: records,
       truncated: result.truncated,
-      seen: result.records.length,
+      ...(result.truncationReason ? { truncationReason: result.truncationReason } : {}),
+      seen: records.length,
       total: result.totalSize,
       omittedFields: result.omittedFields,
     };
   } catch (error) {
-    return { name, status: classifyError(error), data: [], error: errorMessage(error), truncated: false, seen: 0 };
+    // The in-memory fallback keeps an empty array for the evaluators; every exported or summarized
+    // view of a failed dataset goes through datasetCoreData or whenOk and renders a marker or null.
+    return { name, status: classifyError(error), data: [], error: errorMessage(error), truncated: false, seen: 0, ...failureFields(error) };
   }
 }
 
 async function collectRecord(name: string, load: () => Promise<JsonRecord | undefined>): Promise<SalesforceDataset<JsonRecord | undefined>> {
   try {
-    const data = await load();
+    const data = scrubDataStrings(await load());
     return { name, status: "ok", data, truncated: false, seen: data ? 1 : 0, total: data ? 1 : 0 };
   } catch (error) {
-    return { name, status: classifyError(error), data: undefined, error: errorMessage(error), truncated: false, seen: 0 };
+    return { name, status: classifyError(error), data: undefined, error: errorMessage(error), truncated: false, seen: 0, ...failureFields(error) };
   }
+}
+
+/** A count or list derived from a dataset renders null when that dataset was not read. */
+function whenOk<T>(value: T, ...datasets: Array<SalesforceDataset<unknown>>): T | null {
+  return datasets.every((dataset) => dataset.status === "ok") ? value : null;
+}
+
+/** A bare count of a dataset's records (not a `seen` count): unknown, so null, unless the dataset was read to completion. */
+function completeCount(value: number, dataset: SalesforceDataset<unknown>): number | null {
+  return dataset.status === "ok" && !dataset.truncated ? value : null;
+}
+
+/** The dataset's read state for a summary: `partial` for a truncated read, never `ok` beside a partial inventory line. */
+function datasetState(dataset: SalesforceDataset<unknown>): DatasetStatus | "partial" {
+  return dataset.status === "ok" && dataset.truncated ? "partial" : dataset.status;
+}
+
+/** A partial read that showed no record: the absence the verdict would rest on is a claim about the unread records. */
+function truncatedBeforeVisible(dataset: SalesforceDataset<JsonRecord[]>): boolean {
+  return dataset.status === "ok" && dataset.truncated && dataset.data.length === 0;
+}
+
+/** The partial-view clause for a read truncated before any record was visible. */
+function truncatedBeforeVisibleNote(dataset: SalesforceDataset<JsonRecord[]>, record: string, property: string): string {
+  return `The ${dataset.name} read was truncated before any ${record} was visible (0 of ${dataset.total ?? "an unknown total of"} rows${dataset.truncationReason ? `; ${dataset.truncationReason}` : ""}), so ${property} cannot be confirmed or ruled out from the visible rows.`;
+}
+
+/** One line per dataset stating whether it was read completely, partially, or not at all. */
+/**
+ * Renders one dataset state as `<name> read: <state> (<detail>)`. The word `read` keeps a
+ * credential-named dataset (TenantSecret, OauthToken) from forming a `name: value` pair that the
+ * redaction pass would take as a credential, so the fixed text survives the pass unchanged.
+ */
+function describeDataset(dataset: SalesforceDataset<unknown>): string {
+  if (dataset.status !== "ok") return `${dataset.name} read: unread (${dataset.status}${dataset.error ? `: ${dataset.error}` : ""})`;
+  if (dataset.truncated) return `${dataset.name} read: partial (${dataset.seen} of ${dataset.total ?? "an unknown total of"} rows${dataset.truncationReason ? `; ${dataset.truncationReason}` : ""})`;
+  return `${dataset.name} read: complete (${dataset.seen} row${dataset.seen === 1 ? "" : "s"})`;
 }
 
 function datasetErrors(...datasets: Array<SalesforceDataset<unknown>>): string[] {
   return datasets
     .filter((dataset) => dataset.status !== "ok")
-    .map((dataset) => `${dataset.name}: ${dataset.status}${dataset.error ? ` (${dataset.error})` : ""}`);
+    .map((dataset) => `${dataset.name} read: ${dataset.status}${dataset.error ? ` (${dataset.error})` : ""}`);
 }
 
 function unreadableReason(dataset: SalesforceDataset<unknown>): string {
@@ -1362,6 +1896,89 @@ function partialNote(dataset: SalesforceDataset<JsonRecord[]>): string {
 function withPartialDowngrade(status: SalesforceFindingStatus, dataset: SalesforceDataset<JsonRecord[]>): SalesforceFindingStatus {
   if (!dataset.truncated) return status;
   return status === "pass" ? "warn" : status;
+}
+
+/** Rule 1 corollary: a verdict that also reads a secondary inventory cannot pass while that inventory is unreadable. */
+function withUnreadableDowngrade(status: SalesforceFindingStatus, ...datasets: Array<SalesforceDataset<unknown>>): SalesforceFindingStatus {
+  if (datasets.every((dataset) => dataset.status === "ok")) return status;
+  return status === "pass" ? "warn" : status;
+}
+
+function unreadableNote(notChecked: string, ...datasets: Array<SalesforceDataset<unknown>>): string {
+  const unreadable = datasets.filter((dataset) => dataset.status !== "ok");
+  if (unreadable.length === 0) return "";
+  return ` ${unreadable.map(unreadableReason).join(" and ")}, so ${notChecked} was not checked and the verdict is capped at warn.`;
+}
+
+const SECURITY_SETTINGS_PROJECTION: Record<string, string[]> = {
+  sessionSettings: [
+    "sessionTimeout",
+    "forceLogoutOnSessionTimeout",
+    "lockSessionsToIp",
+    "enforceIpRangesEveryRequest",
+    "enableClickjackSetup",
+    "enableClickjackNonsetupSFDC",
+    "enableClickjackNonsetupUser",
+    "enableClickjackNonsetupUserHeaderless",
+    "enableCSRFOnGet",
+    "enableCSRFOnPost",
+    "enableMFADirectUILoginOptIn",
+  ],
+  passwordPolicies: ["minimumPasswordLength", "complexity", "expiration", "historyRestriction", "maxLoginAttempts", "lockoutInterval"],
+};
+const MY_DOMAIN_SETTINGS_FIELDS = ["myDomainName", "canOnlyLoginWithMyDomainUrl", "doesApiLoginRequireOrgDomain"];
+const PROFILE_METADATA_FIELDS = ["fullName", "custom"];
+const LOGIN_HOURS_FIELDS = WEEKDAYS.flatMap((day) => [`${day}Start`, `${day}End`]);
+const LOGIN_IP_RANGE_FIELDS = ["startAddress", "endAddress"];
+const OMITTED_SECTIONS_KEY = "_omittedSections";
+
+function pickFields(record: JsonRecord, fields: string[]): JsonRecord {
+  const picked: JsonRecord = {};
+  for (const field of fields) {
+    if (record[field] !== undefined) picked[field] = record[field];
+  }
+  return picked;
+}
+
+function omittedKeys(record: JsonRecord, kept: string[]): string[] {
+  return Object.keys(record).filter((key) => !kept.includes(key)).sort();
+}
+
+function asRecordList(value: unknown): JsonRecord[] {
+  return asRecords(Array.isArray(value) ? value : value ? [value] : []);
+}
+
+/**
+ * Metadata API settings and Profile trees are whole-tenant configuration dumps. Only the leaves the verdicts
+ * read are persisted (rule 9); the names of dropped sections are kept under _omittedSections so the evidence
+ * stays legible without carrying any of their values.
+ */
+export function projectSecuritySettings(record: JsonRecord | undefined): JsonRecord | undefined {
+  if (!record) return undefined;
+  const projected: JsonRecord = pickFields(record, ["fullName"]);
+  for (const [section, fields] of Object.entries(SECURITY_SETTINGS_PROJECTION)) {
+    const tree = asObject(record[section]);
+    if (tree) projected[section] = pickFields(tree, fields);
+  }
+  const network = asObject(record.networkAccess);
+  if (network) projected.networkAccess = { ipRanges: asRecordList(network.ipRanges).map((range) => pickFields(range, ["start", "end"])) };
+  projected[OMITTED_SECTIONS_KEY] = omittedKeys(record, ["fullName", ...Object.keys(SECURITY_SETTINGS_PROJECTION), "networkAccess"]);
+  return projected;
+}
+
+export function projectMyDomainSettings(record: JsonRecord | undefined): JsonRecord | undefined {
+  if (!record) return undefined;
+  const kept = ["fullName", ...MY_DOMAIN_SETTINGS_FIELDS];
+  return { ...pickFields(record, kept), [OMITTED_SECTIONS_KEY]: omittedKeys(record, kept) };
+}
+
+export function projectProfileMetadata(record: JsonRecord): JsonRecord {
+  const projected: JsonRecord = pickFields(record, PROFILE_METADATA_FIELDS);
+  const hours = asObject(record.loginHours);
+  if (hours) projected.loginHours = pickFields(hours, LOGIN_HOURS_FIELDS);
+  if (record.loginIpRanges !== undefined) projected.loginIpRanges = asRecordList(record.loginIpRanges).map((range) => pickFields(range, LOGIN_IP_RANGE_FIELDS));
+  projected[OMITTED_SECTIONS_KEY] = omittedKeys(record, [...PROFILE_METADATA_FIELDS, "loginHours", "loginIpRanges"]);
+  return projected;
 }
 
 function metadataBoolean(value: unknown): boolean | undefined {
@@ -1447,7 +2064,7 @@ function profileMetadataIssue(profiles: SalesforceDataset<JsonRecord[]>, profile
 export async function collectProfileMetadata(client: ReadClient, profiles: SalesforceDataset<JsonRecord[]>): Promise<SalesforceDataset<JsonRecord[]>> {
   const name = "Profile metadata";
   if (profiles.status !== "ok") {
-    return { name, status: profiles.status, data: [], error: `Profile list was not readable (${profiles.error ?? profiles.status})`, truncated: false, seen: 0 };
+    return { name, status: profiles.status, data: [], error: `not requested: the Profile list was not readable (${profiles.error ?? profiles.status}), so there were no sensitive profiles to read`, truncated: false, seen: 0, ...(profiles.httpStatus !== undefined ? { httpStatus: profiles.httpStatus } : {}), ...(profiles.endpoint !== undefined ? { endpoint: profiles.endpoint } : {}) };
   }
   const targets = sensitiveProfiles(profiles.data);
   const selected = targets.slice(0, MAX_PROFILE_METADATA_READS);
@@ -1466,7 +2083,7 @@ export async function collectProfileMetadata(client: ReadClient, profiles: Sales
     const data = resolvedNames.map(({ profile, fullName }) => {
       const record = fullName ? byFullName.get(fullName) : undefined;
       return {
-        ...(record ?? {}),
+        ...(record ? projectProfileMetadata(record) : {}),
         [PROFILE_ID_KEY]: asString(profile.Id) ?? null,
         [PROFILE_NAME_KEY]: asString(profile.Name) ?? null,
         [PROFILE_FULL_NAME_KEY]: fullName ?? null,
@@ -1476,13 +2093,13 @@ export async function collectProfileMetadata(client: ReadClient, profiles: Sales
     return {
       name,
       status: "ok",
-      data,
+      data: scrubDataStrings(data),
       truncated: profiles.truncated || targets.length > selected.length,
       seen: data.filter((record) => record[PROFILE_RESOLVED_KEY] === true).length,
       total: targets.length,
     };
   } catch (error) {
-    return { name, status: classifyError(error), data: [], error: errorMessage(error), truncated: false, seen: 0, total: targets.length };
+    return { name, status: classifyError(error), data: [], error: errorMessage(error), truncated: false, seen: 0, total: targets.length, ...failureFields(error) };
   }
 }
 
@@ -1532,8 +2149,8 @@ export async function collectSalesforcePlatformData(client: ReadClient, options:
     collectRecord("Organization", () => client.getOrganization()),
     collectRecord("SecurityHealthCheck", () => client.getHealthCheck()),
     collectRecords("SecurityHealthCheckRisks", () => client.listHealthCheckRisks(limit)),
-    collectRecord("SecuritySettings", () => client.readSecuritySettings()),
-    collectRecord("MyDomainSettings", () => client.readMyDomainSettings()),
+    collectRecord("SecuritySettings", async () => projectSecuritySettings(await client.readSecuritySettings())),
+    collectRecord("MyDomainSettings", async () => projectMyDomainSettings(await client.readMyDomainSettings())),
     collectRecords("Profile", () => client.listProfiles(limit)),
   ]);
   const profileMetadata = await collectProfileMetadata(client, profiles);
@@ -1574,10 +2191,10 @@ export function assessSalesforcePlatformData(data: SalesforcePlatformData): Sale
         : `Health Check score is ${score} with ${highRisks.length} high-risk and ${mediumRisks.length} medium-risk settings out of ${risks.length} evaluated.${partialNote(data.healthCheckRisks)}`,
       {
         score,
-        high_risk_settings: truncateList(highRisks.map((risk) => `${asString(risk.SettingGroup) ?? ""}: ${asString(risk.Setting) ?? ""} = ${asString(risk.OrgValue) ?? ""} (standard ${asString(risk.StandardValue) ?? ""})`)),
-        medium_risk_settings: mediumRisks.length,
-        settings_evaluated: risks.length,
-        risks_truncated: data.healthCheckRisks.truncated,
+        high_risk_settings: whenOk(truncateList(highRisks.map((risk) => `${asString(risk.SettingGroup) ?? ""}: ${asString(risk.Setting) ?? ""} = ${asString(risk.OrgValue) ?? ""} (standard ${asString(risk.StandardValue) ?? ""})`)), data.healthCheckRisks),
+        medium_risk_settings: whenOk(mediumRisks.length, data.healthCheckRisks),
+        settings_evaluated: whenOk(risks.length, data.healthCheckRisks),
+        risks_truncated: whenOk(data.healthCheckRisks.truncated, data.healthCheckRisks),
       },
       !risksReadable ? "Setup > Security > Health Check: export the High-Risk and Medium-Risk setting tables." : undefined,
     ));
@@ -1642,13 +2259,14 @@ export function assessSalesforcePlatformData(data: SalesforcePlatformData): Sale
       trusted_ip_ranges: ranges.length,
       ranges: truncateList(ranges.map((range) => `${asString(range.start) ?? "?"}-${asString(range.end) ?? "?"}`)),
       enforce_ip_ranges_every_request: enforceEveryRequest ?? null,
-      sensitive_profiles: data.profileMetadata.total ?? null,
-      sensitive_profiles_read: view.resolved.length,
-      profiles_with_login_ip_ranges: truncateList(withRanges.map((record) => `${profileMetadataLabel(record)} (${loginIpRangeCount(record)})`)),
-      profiles_without_login_ip_ranges: truncateList(withoutRanges.map(profileMetadataLabel)),
-      profiles_unresolved: truncateList(view.unresolved.map(profileMetadataLabel)),
+      sensitive_profiles: whenOk(data.profileMetadata.total ?? null, data.profileMetadata),
+      sensitive_profiles_read: whenOk(view.resolved.length, data.profileMetadata),
+      profiles_with_login_ip_ranges: whenOk(truncateList(withRanges.map((record) => `${profileMetadataLabel(record)} (${loginIpRangeCount(record)})`)), data.profileMetadata),
+      profiles_without_login_ip_ranges: whenOk(truncateList(withoutRanges.map(profileMetadataLabel)), data.profileMetadata),
+      profiles_unresolved: whenOk(truncateList(view.unresolved.map(profileMetadataLabel)), data.profileMetadata),
       profile_metadata_status: data.profileMetadata.status,
-      profile_metadata_truncated: data.profileMetadata.truncated,
+      profile_metadata_error: data.profileMetadata.error ?? null,
+      profile_metadata_truncated: whenOk(data.profileMetadata.truncated, data.profileMetadata),
     };
     if (profileIssue) {
       findings.push(finding(5, "manual", `${orgWide}; per-profile login IP ranges could not be verified because ${profileIssue}.`, evidence, ipManual));
@@ -1734,7 +2352,7 @@ export function assessSalesforcePlatformData(data: SalesforcePlatformData): Sale
       is_sandbox: isSandbox ?? null,
       instance_url: data.instanceUrl ?? null,
       health_check_score: score ?? null,
-      health_check_risks: risks.length,
+      health_check_risks: whenOk(risks.length, data.healthCheckRisks),
       security_settings_readable: settingsReadable,
       my_domain_settings_readable: data.myDomainSettings.status === "ok",
       mfa_health_check_setting: mfaRisk ? `${asString(mfaRisk.Setting)} = ${asString(mfaRisk.OrgValue)}` : null,
@@ -1773,7 +2391,7 @@ export async function collectSalesforceIdentityData(client: ReadClient, options:
     collectRecords("PermissionSet", () => client.listPermissionSets(limit)),
     collectRecords("PermissionSetAssignment", () => client.listPermissionSetAssignments(limit)),
     collectRecords("TwoFactorMethodsInfo", () => client.listTwoFactorMethods(limit)),
-    collectRecord("SecuritySettings", () => client.readSecuritySettings()),
+    collectRecord("SecuritySettings", async () => projectSecuritySettings(await client.readSecuritySettings())),
     collectRecords("SecurityHealthCheckRisks", () => client.listHealthCheckRisks(limit)),
   ]);
   const profileMetadata = await collectProfileMetadata(client, profiles);
@@ -1805,13 +2423,14 @@ export function assessSalesforceIdentityData(data: SalesforceIdentityData, optio
   const adminProfileIds = new Set(adminProfiles.map((profile) => asString(profile.Id) ?? ""));
   const admins = activeUsers.filter((user) => adminProfileIds.has(asString(user.ProfileId) ?? ""));
   const population = populationIssue(data, admins);
+  // Counts derived from a dataset that was not read render null rather than the empty fallback's zero.
   const populationEvidence = {
-    users_seen: data.users.seen,
-    users_total: data.users.total ?? null,
-    active_users: activeUsers.length,
-    profiles_seen: profiles.length,
-    admin_profiles: truncateList(adminProfiles.map((profile) => asString(profile.Name) ?? "")),
-    active_admins_seen: admins.length,
+    users_seen: whenOk(data.users.seen, data.users),
+    users_total: whenOk(data.users.total ?? null, data.users),
+    active_users: whenOk(activeUsers.length, data.users),
+    profiles_seen: whenOk(profiles.length, data.profiles),
+    admin_profiles: whenOk(truncateList(adminProfiles.map((profile) => asString(profile.Name) ?? "")), data.profiles),
+    active_admins_seen: whenOk(admins.length, data.users, data.profiles),
   };
   const populationManual = (control: number, manualEvidence: string): SalesforceFinding =>
     finding(control, "manual", `${controlDefinition(control).title} cannot be verified from this credential's view because ${population}.`, populationEvidence, manualEvidence);
@@ -1828,19 +2447,34 @@ export function assessSalesforceIdentityData(data: SalesforceIdentityData, optio
     return ["HasTotp", "HasU2F", "HasSecurityKey", "HasSalesforceAuthenticator", "HasBuiltInAuthenticator"].some((key) => asBoolean(row[key]) === true);
   };
   const unenrolled = standardActiveUsers.filter((user) => !enrolled(asString(user.Id) ?? ""));
+  // A user is named as lacking MFA only when both the user list and the enrollment table were read to
+  // completion; a truncated enrollment read cannot prove that a missing row means no method.
+  const enrollmentReadable = data.users.status === "ok" && data.twoFactorMethods.status === "ok";
+  const enrollmentComplete = enrollmentReadable && !data.twoFactorMethods.truncated && !data.users.truncated;
+  const enrollmentPartialNotes = [
+    ...(data.users.truncated ? [`User returned ${data.users.seen} of ${data.users.total ?? "an unknown total of"} rows`] : []),
+    ...(data.twoFactorMethods.truncated ? [`TwoFactorMethodsInfo returned ${data.twoFactorMethods.seen} of ${data.twoFactorMethods.total ?? "an unknown total of"} rows`] : []),
+  ];
   const mfaEvidence = {
     enable_mfa_direct_ui_login_opt_in: mfaRequired ?? null,
     health_check_mfa_setting: mfaRisk ? { setting: asString(mfaRisk.Setting), org_value: asString(mfaRisk.OrgValue), risk_type: asString(mfaRisk.RiskType) } : null,
-    active_standard_users: standardActiveUsers.length,
-    users_without_registered_mfa_method: unenrolled.length,
-    sample_users_without_mfa: truncateList(unenrolled.map(userLabel)),
+    active_standard_users: whenOk(standardActiveUsers.length, data.users),
+    users_without_registered_mfa_method: enrollmentComplete ? unenrolled.length : null,
+    sample_users_without_mfa: enrollmentComplete ? truncateList(unenrolled.map(userLabel)) : null,
+    principals_withheld: enrollmentComplete || !enrollmentReadable ? null : `${enrollmentPartialNotes.join("; ")}; users without a registered method are not named from a partial read`,
     two_factor_methods_readable: data.twoFactorMethods.status === "ok",
-    two_factor_methods_rows: data.twoFactorMethods.data.length,
-    two_factor_methods_possibly_capped: data.twoFactorMethods.truncated,
-    users_truncated: data.users.truncated,
+    two_factor_methods_rows: whenOk(data.twoFactorMethods.seen, data.twoFactorMethods),
+    two_factor_methods_total: whenOk(data.twoFactorMethods.total ?? null, data.twoFactorMethods),
+    two_factor_methods_possibly_capped: whenOk(data.twoFactorMethods.truncated, data.twoFactorMethods),
+    users_truncated: whenOk(data.users.truncated, data.users),
   };
+  const capSignal = data.twoFactorMethods.seen >= TWO_FACTOR_METHODS_ROW_CAP
+    ? `which is the documented ${TWO_FACTOR_METHODS_ROW_CAP}-row cap`
+    : data.twoFactorMethods.total !== undefined && data.twoFactorMethods.total > data.twoFactorMethods.seen
+      ? `while the query reported ${data.twoFactorMethods.total} in total`
+      : "and the query reported more rows than were returned (done=false or a stalled cursor)";
   const capNote = data.twoFactorMethods.truncated
-    ? ` TwoFactorMethodsInfo returned ${data.twoFactorMethods.data.length} rows, which is the documented ${TWO_FACTOR_METHODS_ROW_CAP}-row cap with no done=false signal, so enrollment coverage may be incomplete.`
+    ? ` TwoFactorMethodsInfo returned ${data.twoFactorMethods.seen} rows, ${capSignal}, so enrollment coverage is incomplete.`
     : "";
   if (data.securitySettings.status !== "ok" && !mfaRisk) {
     findings.push(finding(4, "manual", `MFA enforcement could not be verified because ${unreadableReason(data.securitySettings)} and Health Check exposed no MFA setting.`, mfaEvidence, mfaManual));
@@ -1854,13 +2488,22 @@ export function assessSalesforceIdentityData(data: SalesforceIdentityData, optio
     } else if (standardActiveUsers.length === 0) {
       findings.push(finding(4, "manual", "MFA is required for direct UI logins, but zero active standard users were returned, which indicates a partial user view rather than a compliant org.", mfaEvidence, mfaManual));
     } else if (unenrolled.length === 0) {
-      const status = withPartialDowngrade(withPartialDowngrade("pass", data.users), data.twoFactorMethods);
-      findings.push(finding(4, status, `MFA is required for direct UI logins and all ${standardActiveUsers.length} active standard users have a registered verification method.${partialNote(data.users)}${capNote}`, mfaEvidence, status === "pass" ? undefined : mfaManual));
+      const status = withUnreadableDowngrade(
+        withPartialDowngrade(withPartialDowngrade("pass", data.users), data.twoFactorMethods),
+        data.securitySettings,
+        data.healthCheckRisks,
+      );
+      const sourceNote = unreadableNote("the MFA requirement's second source", data.securitySettings, data.healthCheckRisks);
+      findings.push(finding(4, status, `MFA is required for direct UI logins and all ${standardActiveUsers.length} active standard users have a registered verification method.${partialNote(data.users)}${capNote}${sourceNote}`, mfaEvidence, status === "pass" ? undefined : mfaManual));
+    } else if (!enrollmentComplete) {
+      // Visible users without an enrollment row are an absence claim over a partial read: the verdict stops at warn and names nobody.
+      findings.push(finding(4, "warn", `MFA is required for direct UI logins, but some of the ${standardActiveUsers.length} visible active standard users have no registered MFA method among the visible TwoFactorMethodsInfo rows; the read was partial (${enrollmentPartialNotes.join("; ")}), so the unread rows could hold their enrollments and the count and names are withheld.${partialNote(data.users)}${capNote}`, mfaEvidence, mfaManual));
     } else {
-      findings.push(finding(4, unenrolled.length > standardActiveUsers.length / 4 ? "fail" : "warn", `MFA is required for direct UI logins, but ${unenrolled.length}/${standardActiveUsers.length} active standard users have no registered MFA method (SSO-only users may be exempt by design).${capNote}`, mfaEvidence));
+      findings.push(finding(4, unenrolled.length > standardActiveUsers.length / 4 ? "fail" : "warn", `MFA is required for direct UI logins, but ${unenrolled.length}/${standardActiveUsers.length} active standard users have no registered MFA method (SSO-only users may be exempt by design).`, mfaEvidence));
     }
   } else {
-    findings.push(finding(4, "manual", "Neither SecuritySettings.sessionSettings.enableMFADirectUILoginOptIn nor a Health Check MFA setting exposed a value, so MFA enforcement cannot be confirmed.", mfaEvidence, mfaManual));
+    const unreadableSources = [data.securitySettings, data.healthCheckRisks].filter((dataset) => dataset.status !== "ok").map(unreadableReason);
+    findings.push(finding(4, "manual", `Neither SecuritySettings.sessionSettings.enableMFADirectUILoginOptIn nor a Health Check MFA setting exposed a value, so MFA enforcement cannot be confirmed${unreadableSources.length > 0 ? ` (${unreadableSources.join("; ")})` : ""}.`, mfaEvidence, mfaManual));
   }
 
   const hoursManual = "Setup > Profiles > (System Administrator and other elevated profiles) > Login Hours: record configured hours or the decision not to restrict them.";
@@ -1907,18 +2550,27 @@ export function assessSalesforceIdentityData(data: SalesforceIdentityData, optio
     const apiOnlyProfiles = profiles.filter((profile) => asBoolean(profile.PermissionsApiUserOnly) === true);
     const usersOnApiProfiles = activeUsers.filter((user) => asBoolean(profileById.get(asString(user.ProfileId) ?? "")?.PermissionsApiEnabled) === true);
     const ratio = profiles.length > 0 ? apiProfiles.length / profiles.length : 0;
+    // A ratio over a truncated profile list is a sample, and an absent API Only profile is an absence claim over the unread rows.
+    const inputsComplete = !data.profiles.truncated && !data.users.truncated;
     const evidence = {
       profiles: profiles.length,
+      profiles_total: data.profiles.total ?? null,
       api_enabled_profiles: truncateList(apiProfiles.map((profile) => asString(profile.Name) ?? "")),
-      api_only_profiles: truncateList(apiOnlyProfiles.map((profile) => asString(profile.Name) ?? "")),
+      api_only_profiles: inputsComplete || apiOnlyProfiles.length > 0 ? truncateList(apiOnlyProfiles.map((profile) => asString(profile.Name) ?? "")) : null,
       api_only_flag_available: apiOnlyFlagAvailable,
-      active_users_on_api_enabled_profiles: usersOnApiProfiles.length,
+      active_users_on_api_enabled_profiles: inputsComplete || usersOnApiProfiles.length > 0 ? usersOnApiProfiles.length : null,
       profiles_truncated: data.profiles.truncated,
       profile_fields_omitted: data.profiles.omittedFields ?? [],
     };
-    const status: SalesforceFindingStatus = ratio > 0.5 ? "fail" : ratio > 0.25 ? "warn" : withPartialDowngrade("pass", data.profiles);
-    const apiOnlyNote = apiOnlyFlagAvailable ? `${apiOnlyProfiles.length} are API Only User profiles.` : "PermissionsApiUserOnly is not available in this org, so API Only User profiles could not be identified.";
-    findings.push(finding(7, status, `${apiProfiles.length}/${profiles.length} profiles grant API Enabled covering ${usersOnApiProfiles.length} active users; ${apiOnlyNote}${partialNote(data.profiles)}`, evidence, status === "pass" ? undefined : apiManual));
+    const observed: SalesforceFindingStatus = ratio > 0.5 ? "fail" : ratio > 0.25 ? "warn" : "pass";
+    const status: SalesforceFindingStatus = inputsComplete ? observed : "warn";
+    const apiOnlyNote = !apiOnlyFlagAvailable
+      ? "PermissionsApiUserOnly is not available in this org, so API Only User profiles could not be identified."
+      : inputsComplete || apiOnlyProfiles.length > 0
+        ? `${apiOnlyProfiles.length} are API Only User profiles.`
+        : "no API Only User profile was among the visible rows, which a partial read cannot confirm.";
+    const sampleNote = inputsComplete ? "" : " The ratio is over the visible rows only, so the verdict is capped at warn.";
+    findings.push(finding(7, status, `${apiProfiles.length}/${profiles.length} visible profiles grant API Enabled covering ${usersOnApiProfiles.length} visible active users; ${apiOnlyNote}${partialNote(data.profiles)}${partialNote(data.users)}${sampleNote}`, evidence, status === "pass" ? undefined : apiManual));
   }
 
   const permSetManual = "Setup > Permission Sets: filter by Modify All Data, View All Data, Manage Users, and Author Apex; export the assignment list and confirm each assignee is justified.";
@@ -1941,16 +2593,18 @@ export function assessSalesforceIdentityData(data: SalesforceIdentityData, optio
       elevated_permission_sets: truncateList(elevated.map((item) => `${asString(item.set.Name) ?? ""} [${item.perms.join(", ")}]`)),
       elevated_assignments: assignmentsReadable ? activeElevatedAssignments.length : null,
       distinct_assignees: assignmentsReadable ? assignees.size : null,
-      assignments_truncated: data.assignments.truncated,
+      assignments_truncated: whenOk(data.assignments.truncated, data.assignments),
       permission_sets_truncated: data.permissionSets.truncated,
     };
     if (elevated.length === 0) {
-      findings.push(finding(9, withPartialDowngrade("pass", data.permissionSets), `None of the ${permissionSets.length} permission sets grant Modify All Data, View All Data, Manage Users, Author Apex, or other elevated permissions.${partialNote(data.permissionSets)}`, evidence));
+      const status = withUnreadableDowngrade(withPartialDowngrade("pass", data.permissionSets), data.assignments);
+      const assignmentNote = unreadableNote("assignment coverage of the permission sets that were read", data.assignments);
+      findings.push(finding(9, status, `None of the ${permissionSets.length} permission sets grant Modify All Data, View All Data, Manage Users, Author Apex, or other elevated permissions.${partialNote(data.permissionSets)}${assignmentNote}`, evidence, status === "pass" ? undefined : permSetManual));
     } else if (!assignmentsReadable) {
       findings.push(finding(9, "manual", `${elevated.length} permission sets grant elevated permissions, but assignments could not be read because ${unreadableReason(data.assignments)}.`, evidence, permSetManual));
     } else {
-      const status: SalesforceFindingStatus = assignees.size > maxAdmins ? "fail" : assignees.size > 0 ? "warn" : withPartialDowngrade("pass", data.assignments);
-      findings.push(finding(9, status, `${elevated.length} permission sets grant elevated permissions and are assigned to ${assignees.size} distinct active users (threshold ${maxAdmins}).${partialNote(data.assignments)}`, evidence, status === "pass" ? undefined : permSetManual));
+      const status: SalesforceFindingStatus = assignees.size > maxAdmins ? "fail" : assignees.size > 0 ? "warn" : withPartialDowngrade(withPartialDowngrade("pass", data.assignments), data.permissionSets);
+      findings.push(finding(9, status, `${elevated.length} permission sets grant elevated permissions and are assigned to ${assignees.size} distinct active users (threshold ${maxAdmins}).${partialNote(data.permissionSets)}${partialNote(data.assignments)}`, evidence, status === "pass" ? undefined : permSetManual));
     }
   }
 
@@ -1975,9 +2629,10 @@ export function assessSalesforceIdentityData(data: SalesforceIdentityData, optio
       users_truncated: data.users.truncated,
       users_seen: data.users.seen,
       users_total: data.users.total ?? null,
+      profiles_truncated: data.profiles.truncated,
     };
-    const status: SalesforceFindingStatus = admins.length > maxAdmins || staleAdmins.length > 0 ? "fail" : adminsWithoutLogin.length > 0 ? "warn" : withPartialDowngrade("pass", data.users);
-    findings.push(finding(10, status, `${admins.length} active users hold administrator-class profiles (threshold ${maxAdmins}); ${staleAdmins.length} have not logged in for ${staleDays}+ days and ${adminsWithoutLogin.length} have no LastLoginDate and are not counted as active administrators.${partialNote(data.users)}`, evidence, status === "pass" ? undefined : adminManual));
+    const status: SalesforceFindingStatus = admins.length > maxAdmins || staleAdmins.length > 0 ? "fail" : adminsWithoutLogin.length > 0 ? "warn" : withPartialDowngrade(withPartialDowngrade("pass", data.users), data.profiles);
+    findings.push(finding(10, status, `${admins.length} active users hold administrator-class profiles (threshold ${maxAdmins}); ${staleAdmins.length} have not logged in for ${staleDays}+ days and ${adminsWithoutLogin.length} have no LastLoginDate and are not counted as active administrators.${partialNote(data.users)}${partialNote(data.profiles)}`, evidence, status === "pass" ? undefined : adminManual));
   }
 
   const guestManual = "Setup > Sites and Digital Experiences > (each site) > Public Access Settings: confirm guest profiles have no API access, no View All or Modify All permissions, and object access limited to what the site needs.";
@@ -2012,17 +2667,19 @@ export function assessSalesforceIdentityData(data: SalesforceIdentityData, optio
     area: "identity_access",
     title: "Salesforce identity and access",
     summary: {
-      users: users.length,
-      active_users: activeUsers.length,
-      users_truncated: data.users.truncated,
-      profiles: profiles.length,
-      permission_sets: permissionSets.length,
-      permission_set_assignments: data.assignments.data.length,
-      two_factor_method_rows: data.twoFactorMethods.data.length,
-      two_factor_methods_possibly_capped: data.twoFactorMethods.truncated,
+      users: whenOk(users.length, data.users),
+      users_total: whenOk(data.users.total ?? null, data.users),
+      active_users: whenOk(activeUsers.length, data.users),
+      users_truncated: whenOk(data.users.truncated, data.users),
+      profiles: whenOk(profiles.length, data.profiles),
+      permission_sets: whenOk(permissionSets.length, data.permissionSets),
+      permission_set_assignments: whenOk(data.assignments.data.length, data.assignments),
+      two_factor_method_rows: whenOk(data.twoFactorMethods.seen, data.twoFactorMethods),
+      two_factor_methods_possibly_capped: whenOk(data.twoFactorMethods.truncated, data.twoFactorMethods),
       mfa_required_for_direct_ui_login: mfaRequired ?? null,
-      sensitive_profiles_read: data.profileMetadata.seen,
+      sensitive_profiles_read: whenOk(data.profileMetadata.seen, data.profileMetadata),
       population_view_issue: population ?? null,
+      inventories: Object.fromEntries([data.users, data.profiles, data.profileMetadata, data.permissionSets, data.assignments, data.twoFactorMethods, data.securitySettings, data.healthCheckRisks].map((dataset) => [dataset.name, describeDataset(dataset)])),
     },
     findings: findings.sort((left, right) => left.control - right.control),
     errors: datasetErrors(data.users, data.profiles, data.profileMetadata, data.permissionSets, data.assignments, data.twoFactorMethods, data.securitySettings, data.healthCheckRisks),
@@ -2102,6 +2759,9 @@ export function assessSalesforceDataProtectionData(data: SalesforceDataProtectio
     findings.push(finding(16, "manual", `Shield Platform Encryption is not applicable or not visible: ${unreadableReason(data.tenantSecrets)}. This is a not-applicable or scoped-out result, not a pass.`, { dataset_status: data.tenantSecrets.status, error: data.tenantSecrets.error ?? null }, encryptionManual));
   } else if (data.tenantSecrets.status !== "ok") {
     findings.push(manualForUnreadable(16, data.tenantSecrets, encryptionManual));
+  } else if (truncatedBeforeVisible(data.tenantSecrets)) {
+    // Zero visible secrets of a truncated read is an absence claim over the unread rows: manual, with the count unknown.
+    findings.push(finding(16, "manual", `${truncatedBeforeVisibleNote(data.tenantSecrets, "tenant secret", "whether Shield Platform Encryption has active keys")} The verdict is manual (unknown).`, { tenant_secrets: null, tenant_secrets_total: data.tenantSecrets.total ?? null, tenant_secrets_truncated: true, truncation_reason: data.tenantSecrets.truncationReason ?? null }, encryptionManual));
   } else if (secrets.length === 0) {
     findings.push(finding(16, "fail", "TenantSecret is readable but no tenant secrets exist, so Shield Platform Encryption has no active keys and no fields are encrypted.", { tenant_secrets: 0 }, encryptionManual));
   } else {
@@ -2164,11 +2824,15 @@ export function assessSalesforceDataProtectionData(data: SalesforceDataProtectio
     area: "data_protection",
     title: "Salesforce data protection",
     summary: {
-      sensitive_field_grants: fieldPermissions.length,
-      tenant_secrets: secrets.length,
-      tenant_secret_status: data.tenantSecrets.status,
-      certificates: certificates.length,
+      sensitive_field_grants: whenOk(fieldPermissions.length, data.fieldPermissions),
+      // A bare count of the org's tenant secrets is unknown from a partial read; the read state says `partial` there.
+      tenant_secrets: completeCount(secrets.length, data.tenantSecrets),
+      tenant_secrets_seen: whenOk(data.tenantSecrets.seen, data.tenantSecrets),
+      tenant_secrets_total: whenOk(data.tenantSecrets.total ?? null, data.tenantSecrets),
+      tenant_secret_status: datasetState(data.tenantSecrets),
+      certificates: whenOk(certificates.length, data.certificates),
       organization_readable: data.organization.status === "ok",
+      inventories: Object.fromEntries([data.fieldPermissions, data.tenantSecrets, data.certificates, data.organization].map((dataset) => [dataset.name, describeDataset(dataset)])),
     },
     findings: findings.sort((left, right) => left.control - right.control),
     errors: datasetErrors(data.organization, data.fieldPermissions, data.tenantSecrets, data.certificates),
@@ -2214,14 +2878,20 @@ export function assessSalesforceMonitoringData(data: SalesforceMonitoringData): 
     : tokensTruncated
       ? ` Only ${data.oauthTokens.data.length} of ${data.oauthTokens.total ?? "?"} OauthToken rows were read, so the token count is incomplete.`
       : "";
+  const callerPermissionLabel = canSeeAllTokens === false
+    ? "false"
+    : data.callerPermissions.status !== "ok"
+      ? `unknown because ${unreadableReason(data.callerPermissions)}`
+      : "unknown";
   const tokenViewNote = `${tokenViewPartial
-    ? ` OauthToken shows only the caller's own tokens without Customize Application (caller permission: ${canSeeAllTokens === false ? "false" : "unknown"}), so the ${data.oauthTokens.data.length} tokens seen are a partial view.`
-    : ""}${tokenCountNote}`;
+    ? ` OauthToken shows only the caller's own tokens without Customize Application (caller permission: ${callerPermissionLabel}), so the ${data.oauthTokens.data.length} tokens seen are a partial view.`
+    : ""}${tokensReadable ? "" : ` OAuth token usage was not checked because ${unreadableReason(data.oauthTokens)}; review Setup > Connected Apps OAuth Usage manually.`}${tokenCountNote}`;
+  // Every token-derived leaf renders null, not false or 0, when OauthToken was not read.
   const tokenEvidence = {
-    oauth_tokens: tokensReadable ? data.oauthTokens.data.length : null,
-    oauth_tokens_partial_view: tokenViewPartial,
-    oauth_tokens_possibly_capped: tokensPossiblyCapped,
-    oauth_tokens_truncated: tokensTruncated,
+    oauth_tokens: whenOk(data.oauthTokens.data.length, data.oauthTokens),
+    oauth_tokens_partial_view: whenOk(tokenViewPartial, data.oauthTokens),
+    oauth_tokens_possibly_capped: whenOk(tokensPossiblyCapped, data.oauthTokens),
+    oauth_tokens_truncated: whenOk(tokensTruncated, data.oauthTokens),
   };
   if (data.connectedApplications.status !== "ok") {
     findings.push(manualForUnreadable(11, data.connectedApplications, appManual));
@@ -2243,8 +2913,8 @@ export function assessSalesforceMonitoringData(data: SalesforceMonitoringData): 
       apps_without_refresh_token_limit: truncateList(unboundedRefresh.map((app) => asString(app.Name) ?? "")),
       ...tokenEvidence,
       caller_has_customize_application: canSeeAllTokens ?? null,
-      tokens_by_app: tokensReadable ? Object.fromEntries([...tokensByApp.entries()].slice(0, 25)) : null,
-      truncated: data.connectedApplications.truncated,
+      tokens_by_app: whenOk(Object.fromEntries([...tokensByApp.entries()].slice(0, 25)), data.oauthTokens),
+      connected_applications_truncated: whenOk(data.connectedApplications.truncated, data.connectedApplications),
     };
     if (unknownPolicy.length === apps.length) {
       findings.push(finding(11, "manual", `${apps.length} connected apps were returned but none exposed OptionsAllowAdminApprovedUsersOnly, so the pre-authorization policy cannot be confirmed.${tokenViewNote}`, evidence, appManual));
@@ -2273,21 +2943,29 @@ export function assessSalesforceMonitoringData(data: SalesforceMonitoringData): 
     const countries = [...new Set(logins.map((login) => asString(login.CountryIso)).filter((value): value is string => Boolean(value)))];
     const legacyTls = logins.filter((login) => /TLS 1\.[01]/i.test(asString(login.TlsProtocol) ?? ""));
     const failureRatio = failed.length / logins.length;
+    // Over a truncated read the ratio is a sample and every zero is an absence claim over the unread rows.
+    const complete = !data.loginHistory.truncated;
+    const absenceCount = (value: number): number | null => (complete || value > 0 ? value : null);
     const evidence = {
       login_rows: logins.length,
       window_days: data.loginHistoryDays,
       failed_logins: failed.length,
-      failure_ratio: Number(failureRatio.toFixed(3)),
-      brute_force_sources: truncateList(bruteForceIps),
+      failure_ratio: complete ? Number(failureRatio.toFixed(3)) : null,
+      brute_force_sources: complete || bruteForceIps.length > 0 ? truncateList(bruteForceIps) : null,
       countries,
-      legacy_tls_logins: legacyTls.length,
-      rows_without_login_time: undated.length,
+      legacy_tls_logins: absenceCount(legacyTls.length),
+      rows_without_login_time: absenceCount(undated.length),
       truncated: data.loginHistory.truncated,
       seen: data.loginHistory.seen,
       total: data.loginHistory.total ?? null,
     };
-    const status: SalesforceFindingStatus = bruteForceIps.length > 0 || failureRatio > 0.25 || legacyTls.length > 0 ? "fail" : failureRatio > 0.1 || countries.length > 5 || undated.length > 0 || data.loginHistory.truncated ? "warn" : "pass";
-    findings.push(finding(14, status, `${logins.length} logins in ${data.loginHistoryDays} days: ${failed.length} failures (${Math.round(failureRatio * 100)}%), ${bruteForceIps.length} sources with 10+ failures, ${countries.length} countries, ${legacyTls.length} legacy TLS logins.${partialNote(data.loginHistory)}`, evidence, status === "pass" ? undefined : loginManual));
+    const observed: SalesforceFindingStatus = bruteForceIps.length > 0 || failureRatio > 0.25 || legacyTls.length > 0 ? "fail" : failureRatio > 0.1 || countries.length > 5 || undated.length > 0 ? "warn" : "pass";
+    const status: SalesforceFindingStatus = complete ? observed : "warn";
+    const countClause = (value: number, label: string): string => (complete || value > 0 ? `${value} ${label}` : `${label}: unknown from the visible rows`);
+    const summary = complete
+      ? `${logins.length} logins in ${data.loginHistoryDays} days: ${failed.length} failures (${Math.round(failureRatio * 100)}%), ${bruteForceIps.length} sources with 10+ failures, ${countries.length} countries, ${legacyTls.length} legacy TLS logins.`
+      : `${logins.length} of ${data.loginHistory.total ?? "an unknown total of"} logins in ${data.loginHistoryDays} days were read: ${failed.length} failures among the visible rows (ratio not stated from a partial read), ${countClause(bruteForceIps.length, "sources with 10+ failures")}, ${countries.length} countries seen, ${countClause(legacyTls.length, "legacy TLS logins")}. The verdict is capped at warn because the unread rows could change it.${partialNote(data.loginHistory)}`;
+    findings.push(finding(14, status, summary, evidence, status === "pass" ? undefined : loginManual));
   }
 
   const auditManual = `Setup > Security > View Setup Audit Trail: download the last ${data.auditTrailDays} days and review permission, profile, admin, session, password, and network access changes.`;
@@ -2301,6 +2979,7 @@ export function assessSalesforceMonitoringData(data: SalesforceMonitoringData): 
     const undated = trail.filter((row) => asDate(row.CreatedDate) === undefined);
     const actors = [...new Set(highRisk.map((row) => asString(asObject(row.CreatedBy)?.Username) ?? asString(row.CreatedById) ?? "unknown"))];
     const eventLogReadable = data.eventLogFiles.status === "ok";
+    const eventLogComplete = eventLogReadable && !data.eventLogFiles.truncated;
     const eventTypes = [...new Set(data.eventLogFiles.data.map((row) => asString(row.EventType) ?? ""))].filter(Boolean);
     const evidence = {
       audit_rows: trail.length,
@@ -2309,28 +2988,50 @@ export function assessSalesforceMonitoringData(data: SalesforceMonitoringData): 
       high_risk_actors: truncateList(actors),
       sample_high_risk_changes: truncateList(highRisk.map((row) => `${asString(row.CreatedDate) ?? "?"} ${asString(row.Section) ?? ""}/${asString(row.Action) ?? ""}: ${asString(row.Display) ?? ""}`), 15),
       rows_without_created_date: undated.length,
-      event_monitoring: eventLogReadable ? { event_log_files_last_7_days: data.eventLogFiles.data.length, event_types: eventTypes } : { status: data.eventLogFiles.status, error: data.eventLogFiles.error ?? null },
+      // A zero from a truncated EventLogFile read is an absence claim over the unread rows and renders null.
+      event_monitoring: eventLogReadable
+        ? {
+          event_log_files_last_7_days: eventLogComplete || data.eventLogFiles.data.length > 0 ? data.eventLogFiles.data.length : null,
+          event_log_files_total: data.eventLogFiles.total ?? null,
+          event_types: eventLogComplete || eventTypes.length > 0 ? eventTypes : null,
+          truncated: data.eventLogFiles.truncated,
+        }
+        : { status: data.eventLogFiles.status, error: data.eventLogFiles.error ?? null },
       truncated: data.setupAuditTrail.truncated,
     };
-    const status: SalesforceFindingStatus = data.setupAuditTrail.truncated || undated.length > 0 ? "warn" : highRisk.length > 0 ? "warn" : "pass";
-    findings.push(finding(15, status, `${trail.length} setup changes in ${data.auditTrailDays} days with ${highRisk.length} high-risk security changes by ${actors.length} actors; Event Monitoring ${eventLogReadable ? `exposed ${data.eventLogFiles.data.length} EventLogFile rows in 7 days` : `is not readable (${data.eventLogFiles.status})`}.${partialNote(data.setupAuditTrail)}`, evidence, status === "pass" ? undefined : auditManual));
+    const status: SalesforceFindingStatus = data.setupAuditTrail.truncated || undated.length > 0 || highRisk.length > 0 ? "warn" : withUnreadableDowngrade("pass", data.eventLogFiles);
+    // The emptiness sentence is stated only from a complete read; a truncated read carries the partial-view clause.
+    const eventNote = !eventLogReadable
+      ? `was not checked because ${unreadableReason(data.eventLogFiles)}, so the verdict is capped at warn`
+      : eventLogComplete
+        ? `exposed ${data.eventLogFiles.data.length} EventLogFile rows in 7 days`
+        : data.eventLogFiles.data.length === 0
+          ? `exposed no EventLogFile row among the visible rows, which the partial read cannot confirm for the unread rows: the EventLogFile read was truncated before any row was visible (0 of ${data.eventLogFiles.total ?? "an unknown total of"} rows${data.eventLogFiles.truncationReason ? `; ${data.eventLogFiles.truncationReason}` : ""})`
+          : `exposed ${data.eventLogFiles.data.length} of ${data.eventLogFiles.total ?? "an unknown total of"} EventLogFile rows in 7 days (the read was truncated${data.eventLogFiles.truncationReason ? `: ${data.eventLogFiles.truncationReason}` : ""}, so the visible rows are not the full set)`;
+    const eventManual = eventLogReadable ? "" : " Setup > Event Manager and the EventLogFile browser: confirm Event Monitoring log files are being generated and retained.";
+    findings.push(finding(15, status, `${trail.length} setup changes in ${data.auditTrailDays} days with ${highRisk.length} high-risk security changes by ${actors.length} actors; Event Monitoring ${eventNote}.${partialNote(data.setupAuditTrail)}`, evidence, status === "pass" ? undefined : `${auditManual}${eventManual}`));
   }
 
   return {
     area: "monitoring_integrations",
     title: "Salesforce monitoring and integrations",
     summary: {
-      connected_applications: apps.length,
-      oauth_tokens: data.oauthTokens.data.length,
-      oauth_tokens_partial_view: tokenViewPartial,
-      oauth_tokens_possibly_capped: tokensPossiblyCapped,
+      connected_applications: whenOk(apps.length, data.connectedApplications),
+      oauth_tokens: whenOk(data.oauthTokens.data.length, data.oauthTokens),
+      oauth_tokens_partial_view: whenOk(tokenViewPartial, data.oauthTokens),
+      oauth_tokens_possibly_capped: whenOk(tokensPossiblyCapped, data.oauthTokens),
       caller_has_customize_application: canSeeAllTokens ?? null,
-      login_rows: logins.length,
+      login_rows: whenOk(logins.length, data.loginHistory),
+      login_rows_total: whenOk(data.loginHistory.total ?? null, data.loginHistory),
       login_history_days: data.loginHistoryDays,
-      audit_rows: trail.length,
+      audit_rows: whenOk(trail.length, data.setupAuditTrail),
       audit_trail_days: data.auditTrailDays,
-      event_log_files: data.eventLogFiles.data.length,
-      event_log_status: data.eventLogFiles.status,
+      // A bare count of the org's EventLogFile rows is unknown from a partial read; the read state says `partial` there.
+      event_log_files: completeCount(data.eventLogFiles.data.length, data.eventLogFiles),
+      event_log_files_seen: whenOk(data.eventLogFiles.seen, data.eventLogFiles),
+      event_log_files_total: whenOk(data.eventLogFiles.total ?? null, data.eventLogFiles),
+      event_log_status: datasetState(data.eventLogFiles),
+      inventories: Object.fromEntries([data.connectedApplications, data.oauthTokens, data.callerPermissions, data.loginHistory, data.setupAuditTrail, data.eventLogFiles].map((dataset) => [dataset.name, describeDataset(dataset)])),
     },
     findings: findings.sort((left, right) => left.control - right.control),
     errors: datasetErrors(data.connectedApplications, data.oauthTokens, data.callerPermissions, data.loginHistory, data.setupAuditTrail, data.eventLogFiles),
@@ -2382,7 +3083,7 @@ export async function checkSalesforceAccess(client: ReadClient): Promise<Salesfo
       error: sessionError,
       permissionHint: "API Enabled plus a valid connected app grant",
     },
-    { name: "organization", endpoint: `/services/data/v${version}/query (Organization)`, status: organization.status === "ok" ? "readable" : "not_readable", count: organization.seen, error: organization.error, permissionHint: "API Enabled" },
+    { name: "organization", endpoint: `/services/data/v${version}/query (Organization)`, status: organization.status === "ok" ? "readable" : "not_readable", count: organization.status === "ok" ? organization.seen : undefined, error: organization.error, permissionHint: "API Enabled" },
     await probeSurface("limits", `/services/data/v${version}/limits`, "API Enabled", () => client.getLimits(), () => 1),
     await probeSurface("health_check", `/services/data/v${version}/tooling/query (SecurityHealthCheck)`, "View Setup and Configuration, View Health Check", () => client.getHealthCheck(), (value) => (value ? 1 : 0)),
     await probeSurface("health_check_risks", `/services/data/v${version}/tooling/query (SecurityHealthCheckRisks)`, "View Setup and Configuration", () => client.listHealthCheckRisks(50), queryCount),
@@ -2397,7 +3098,7 @@ export async function checkSalesforceAccess(client: ReadClient): Promise<Salesfo
     await probeSurface("connected_applications", `/services/data/v${version}/query (ConnectedApplication)`, "View Setup and Configuration", () => client.listConnectedApplications(50), queryCount),
     await probeSurface("oauth_tokens", `/services/data/v${version}/query (OauthToken)`, "Customize Application (without it only the caller's own tokens are returned)", () => client.listOauthTokens(50), queryCount),
     await probeSurface("event_log_files", `/services/data/v${version}/query (EventLogFile)`, "View Event Log Files (Event Monitoring license)", () => client.listEventLogFiles(1, 10), queryCount),
-    { name: "caller_permissions", endpoint: `/services/data/v${version}/query (UserPermissionAccess)`, status: callerPermissions.status === "ok" && callerPermissions.data ? "readable" : "not_readable", count: callerPermissions.seen, error: callerPermissions.error, permissionHint: "API Enabled" },
+    { name: "caller_permissions", endpoint: `/services/data/v${version}/query (UserPermissionAccess)`, status: callerPermissions.status === "ok" && callerPermissions.data ? "readable" : "not_readable", count: callerPermissions.status === "ok" && callerPermissions.data ? callerPermissions.seen : undefined, error: callerPermissions.error, permissionHint: "API Enabled" },
   ];
 
   const deniedCallerPermissions = CALLER_PERMISSION_FIELDS
@@ -2549,9 +3250,9 @@ function buildQuickReference(): string {
     "",
     "## Layout",
     "",
-    "- `core_data/`: raw API snapshots (Organization, Health Check, SecuritySettings, users, profiles, profile metadata for sensitive profiles, permission sets, caller permissions, login history, audit trail, connected apps, certificates, tenant secrets, event log files)",
-    "- `analysis/findings.json`: all normalized findings with framework mappings",
-    "- `analysis/<area>.json`: per-area assessment results and collection errors",
+    "- `core_data/`: projected and redacted API snapshots (Organization, Health Check, SecuritySettings, users, profiles, profile metadata for sensitive profiles, permission sets, caller permissions, login history, audit trail, connected apps, certificates, tenant secrets, event log files); each dataset wrapper carries `status`, `seen`, `total`, and `truncated`, URL fields keep scheme, host, and path only, and a dataset that was denied, unavailable, or errored is written as a `{ collected: false, dataset, status, http_status, endpoint, error }` marker instead of an empty snapshot",
+    "- `analysis/findings.json`: all normalized findings with framework mappings; counts and names derived from a dataset that was not read render null, and lists of principals from a partial read render null with a `principals_withheld` note",
+    "- `analysis/<area>.json`: per-area assessment results, an `inventories` map stating each dataset as complete, partial, or unread, and collection errors; summary counts derived from an unread dataset render null",
     "- `compliance/executive_summary.md`: prioritized summary and manual verification queue",
     "- `compliance/unified_compliance_matrix.md`: control to framework matrix",
     "- `compliance/<framework>/`: one report per framework (FedRAMP, CMMC, SOC 2, CIS, PCI-DSS, DISA STIG, IRAP, ISMAP)",
@@ -2594,28 +3295,30 @@ export async function exportSalesforceAuditBundle(
   ensurePrivateDir(outputRoot);
   const outputDir = await nextAvailableAuditDir(outputRoot, `${safeDirName(orgLabel)}-audit-bundle`);
 
+  // Every dataset goes through datasetCoreData so a denied, unavailable, or errored read is written as a
+  // { collected: false, ... } marker instead of an empty snapshot.
   const coreDataFiles: Array<[string, unknown]> = [
     ["core_data/access_check.json", access],
-    ["core_data/organization.json", platformData.organization],
-    ["core_data/security_health_check.json", platformData.healthCheck],
-    ["core_data/security_health_check_risks.json", platformData.healthCheckRisks],
-    ["core_data/security_settings.json", platformData.securitySettings],
-    ["core_data/my_domain_settings.json", platformData.myDomainSettings],
-    ["core_data/users.json", identityData.users],
-    ["core_data/profiles.json", identityData.profiles],
-    ["core_data/profile_metadata.json", identityData.profileMetadata],
-    ["core_data/permission_sets.json", identityData.permissionSets],
-    ["core_data/permission_set_assignments.json", identityData.assignments],
-    ["core_data/two_factor_methods_info.json", identityData.twoFactorMethods],
-    ["core_data/field_permissions_sensitive.json", dataProtection.fieldPermissions],
-    ["core_data/tenant_secrets.json", dataProtection.tenantSecrets],
-    ["core_data/certificates.json", dataProtection.certificates],
-    ["core_data/connected_applications.json", monitoring.connectedApplications],
-    ["core_data/oauth_tokens.json", monitoring.oauthTokens],
-    ["core_data/caller_permissions.json", monitoring.callerPermissions],
-    ["core_data/login_history.json", monitoring.loginHistory],
-    ["core_data/setup_audit_trail.json", monitoring.setupAuditTrail],
-    ["core_data/event_log_files.json", monitoring.eventLogFiles],
+    ["core_data/organization.json", datasetCoreData(platformData.organization)],
+    ["core_data/security_health_check.json", datasetCoreData(platformData.healthCheck)],
+    ["core_data/security_health_check_risks.json", datasetCoreData(platformData.healthCheckRisks)],
+    ["core_data/security_settings.json", datasetCoreData(platformData.securitySettings)],
+    ["core_data/my_domain_settings.json", datasetCoreData(platformData.myDomainSettings)],
+    ["core_data/users.json", datasetCoreData(identityData.users)],
+    ["core_data/profiles.json", datasetCoreData(identityData.profiles)],
+    ["core_data/profile_metadata.json", datasetCoreData(identityData.profileMetadata)],
+    ["core_data/permission_sets.json", datasetCoreData(identityData.permissionSets)],
+    ["core_data/permission_set_assignments.json", datasetCoreData(identityData.assignments)],
+    ["core_data/two_factor_methods_info.json", datasetCoreData(identityData.twoFactorMethods)],
+    ["core_data/field_permissions_sensitive.json", datasetCoreData(dataProtection.fieldPermissions)],
+    ["core_data/tenant_secrets.json", datasetCoreData(dataProtection.tenantSecrets)],
+    ["core_data/certificates.json", datasetCoreData(dataProtection.certificates)],
+    ["core_data/connected_applications.json", datasetCoreData(monitoring.connectedApplications)],
+    ["core_data/oauth_tokens.json", datasetCoreData(monitoring.oauthTokens)],
+    ["core_data/caller_permissions.json", datasetCoreData(monitoring.callerPermissions)],
+    ["core_data/login_history.json", datasetCoreData(monitoring.loginHistory)],
+    ["core_data/setup_audit_trail.json", datasetCoreData(monitoring.setupAuditTrail)],
+    ["core_data/event_log_files.json", datasetCoreData(monitoring.eventLogFiles)],
   ];
   for (const [pathname, value] of coreDataFiles) {
     await writeSecureTextFile(outputDir, pathname, serializeJson(value));
@@ -2843,7 +3546,7 @@ export function registerSalesforceTools(pi: any): void {
     name: "salesforce_export_audit_bundle",
     label: "Export Salesforce audit bundle",
     description:
-      "Export a Salesforce audit package with raw API snapshots (core_data/), normalized findings (analysis/), executive summary, unified compliance matrix, per-framework reports (compliance/), QUICK_REFERENCE.md, an _errors.log when collection partially failed, and a zip archive.",
+      "Export a Salesforce audit package with projected and redacted API snapshots (core_data/, with not-collected markers for denied datasets), normalized findings (analysis/), executive summary, unified compliance matrix, per-framework reports (compliance/), QUICK_REFERENCE.md, an _errors.log when collection partially failed, and a zip archive.",
     parameters: Type.Object({
       ...assessParams,
       output_dir: Type.Optional(Type.String({ description: `Output root. Defaults to ${DEFAULT_OUTPUT_DIR}.` })),

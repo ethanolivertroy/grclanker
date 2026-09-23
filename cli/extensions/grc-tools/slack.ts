@@ -544,6 +544,25 @@ function isSecretKey(key: string): boolean {
   return SECRET_KEY_PATTERN.test(key) && !SECRET_KEY_ALLOWLIST.has(key);
 }
 
+/**
+ * The documented xox-family token prefixes, the text before the first `-`: bot `xoxb` and user `xoxp`
+ * (docs.slack.dev/authentication/tokens), the rotating access forms `xoxe.xoxb` and `xoxe.xoxp`, and the refresh form
+ * `xoxe` (docs.slack.dev/authentication/using-token-rotation). token_format evidence is derived only from an exact
+ * member of this set, so a configured value with any other prefix (an undocumented letter such as xoxz or xoxa, `xoxe.`
+ * followed by anything but xoxb or xoxp, an xapp or xwfp token, a misconfigured value, a proxy or gateway token, a
+ * pasted OAuth code) renders the fixed prefix "unknown" and never any substring of itself.
+ */
+export const SLACK_TOKEN_PREFIXES: ReadonlySet<string> = new Set(["xoxb", "xoxp", "xoxe", "xoxe.xoxb", "xoxe.xoxp"]);
+const ROTATING_TOKEN_PREFIX = "xoxe.";
+const UNKNOWN_TOKEN_PREFIX = "unknown";
+
+function describeTokenFormat(token: string): JsonRecord {
+  const separator = token.indexOf("-");
+  const prefix = separator > 0 ? token.slice(0, separator) : "";
+  if (!SLACK_TOKEN_PREFIXES.has(prefix)) return { prefix: UNKNOWN_TOKEN_PREFIX, rotating_format: false };
+  return { prefix, rotating_format: prefix.startsWith(ROTATING_TOKEN_PREFIX) };
+}
+
 /** Shorter configured values are not scrubbed by exact match, so a degenerate token cannot blank unrelated text. */
 export const MIN_KNOWN_SECRET_LENGTH = 8;
 
@@ -1161,11 +1180,7 @@ export class SlackApiClient {
   }
 
   describeToken(): JsonRecord {
-    const token = this.config.token ?? this.config.botToken ?? "";
-    return {
-      prefix: token.replace(/^(xoxe\.)?(xox[a-z])-.*$/, "$1$2") || "unknown",
-      rotating_format: token.startsWith("xoxe."),
-    };
+    return describeTokenFormat(this.config.token ?? this.config.botToken ?? "");
   }
 }
 

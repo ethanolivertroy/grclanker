@@ -19,7 +19,7 @@ import { homedir } from "node:os";
 import { basename, dirname, join, relative, resolve } from "node:path";
 import { ZipArchive } from "archiver";
 import { Type } from "@sinclair/typebox";
-import { parse as parseYaml } from "yaml";
+import { YAMLError, parse as parseYaml } from "yaml";
 import { errorResult, formatTable, textResult } from "./shared.js";
 
 type FetchImpl = typeof fetch;
@@ -28,6 +28,118 @@ type JsonRecord = Record<string, unknown>;
 const DEFAULT_OUTPUT_DIR = "./export/servicenow";
 const DEFAULT_CONFIG_DIR = ".servicenow-sec-inspector";
 const DEFAULT_CONFIG_FILE = "config.yaml";
+const REDACTED = "[REDACTED]";
+// ServiceNow passwords, OAuth client secrets, and bearer tokens are long; a shorter minimum would
+// remember common words and redact them out of ordinary error text.
+const MIN_REMEMBERED_SECRET_LENGTH = 8;
+/** Nesting beyond this depth is left as served; parsed API payloads never reach it. */
+const MAX_REDACTION_DEPTH = 32;
+/** Every credential literal a client in this process was configured with or obtained from oauth_token.do. */
+const KNOWN_SECRETS = new Set<string>();
+/** The forms a remembered secret takes in an echoed body (raw, base64, base64url, URL-encoded, JSON-escaped), computed once per secret. */
+const SECRET_FORMS = new Map<string, string[]>();
+// Scrub boundary. A value inside a carrier (an Authorization, Cookie, Set-Cookie, or API key header, a
+// cookie or session assignment, URL userinfo or a query pair, a Bearer/Basic/Digest/Token/ApiKey scheme,
+// a credential-named key-value pair, a SOAP credential element) is removed whatever its shape, quoted or bare; a
+// remembered secret is removed whatever its shape and in its encoded forms; a bare value is removed only
+// when it has a real token shape (JWT, PEM block, hex digest, vendor prefix, or a 16+ character run with
+// base64 symbols, scattered digits, or token casing). A bare name-shaped value (words joined by hyphens
+// or underscores, such as prod-us-east-2026) is indistinguishable from a resource name and stays.
+// A literal JSON escape (`\n`, `\r`, `\t`, `\b`, `\f`, `\/`, `\"`, `\uXXXX`) stands right before a header, a scheme,
+// a URL, or a token in a doubly-encoded body (a gateway error whose field holds serialized JSON). Its last character is
+// a word character for most of them, so `\b` and a "not preceded by a word character" lookbehind see no boundary there;
+// every carrier and token opener of the pass therefore also starts right after one, and no token shape starts inside one.
+const JSON_ESCAPE = String.raw`\\(?:u[0-9a-fA-F]{4}|[nrtbf/"])`;
+const AFTER_JSON_ESCAPE = `(?<=${JSON_ESCAPE})`;
+const OPENER_BOUNDARY = String.raw`(?:\b|${AFTER_JSON_ESCAPE})`;
+const NOT_INSIDE_JSON_ESCAPE = String.raw`(?!(?<=\\)(?:u[0-9a-fA-F]{4}|[nrtbf/]))`;
+const URL_IN_TEXT_PATTERN = new RegExp(String.raw`${OPENER_BOUNDARY}(https?:\/\/)(?:([^\s/?#@"'<>]+)@)?([^\s/?#"'<>]+)([^\s?#"'<>]*)(\?[^\s#"'<>]*)?(#[^\s"'<>]*)?`, "gi");
+// A query pair standing without its URL (`?token=...`, `&sid=...`).
+const BARE_QUERY_PAIR_PATTERN = /([?&][\w.~%-]+=)([^\s"'&#<>\\]+)/g;
+// Header name to value: `: `, `="`, or the JSON-escaped `\":\"`.
+const HEADER_SEPARATOR = String.raw`\\?["']?\s*[:=]\s*\\?["']?`;
+// The next header on the same line (`; X-Api-Key: x`, `, Content-Type: x`, ` Accept: x`, a quoted or JSON-object
+// name too): a cookie or header value ends before it, so that header keeps its name and gets its own carrier treatment.
+const NEXT_HEADER_NAME = String.raw`\s*\{?\s*\\?["']?[A-Za-z][\w-]*\\?["']?\s*:`;
+// The schemes that stand as carriers in prose (the ruling's list) and the wider set recognized inside an Authorization header.
+const PROSE_AUTH_SCHEMES = "bearer|basic|digest|token|apikey|api-key";
+const HEADER_AUTH_SCHEMES = `${PROSE_AUTH_SCHEMES}|negotiate|ntlm|hmac|oauth|hoba|mutual|vapid|aws4-hmac-sha256|scram-sha-1|scram-sha-256`;
+// A quote closes a value only when a delimiter or the end of the text follows it; a quote followed by a value
+// character opens the next header's value instead, so the value it seemed to close was never terminated.
+const CLOSING_QUOTE_BOUNDARY = String.raw`(?![\w/+=-])`;
+// A quoted value, in double quotes (possibly JSON-escaped) or single quotes, on one line, ending at its closing
+// quote even with `; Name:` inside. Quotes around a credential belong to its carrier: `Bearer "x"`, `sid='x'`,
+// `--token "x"` carry x whatever its shape.
+const QUOTED_VALUE = String.raw`(?:\\?"[^"\\\r\n]+\\?"|'[^'\r\n]+')${CLOSING_QUOTE_BOUNDARY}`;
+// A value whose opening quote never closes: it runs to the next `;`, `,`, or space (where the header patterns
+// apply the `Name:` cut) or to the end of the line, stray quotes included.
+const UNTERMINATED_QUOTED_VALUE = String.raw`\\?["'][^\s<>,;\\]+`;
+// One credential token (bare or quoted), or a parameter list such as Digest's `username="u", response="r"`
+// (quotes possibly JSON-escaped or single) or PagerDuty's `token=k`.
+const CREDENTIAL_TOKEN = String.raw`(?:${QUOTED_VALUE}|${UNTERMINATED_QUOTED_VALUE}|[^\s"'<>,;\\]+)`;
+const CREDENTIAL_PARAMETER_VALUE = String.raw`(?:(?:\\?"[^"\\\r\n]*\\?"|'[^'\r\n]*')${CLOSING_QUOTE_BOUNDARY}|\\?["']?[^\s"',;<>\\]+)`;
+const CREDENTIAL_PARAMETERS = String.raw`[\w-]+=${CREDENTIAL_PARAMETER_VALUE}(?:\s*[,;]\s*[\w-]+=${CREDENTIAL_PARAMETER_VALUE})*`;
+// The whole value of an Authorization header: a scheme and its credential, or up to two tokens for an unknown scheme.
+const AUTHORIZATION_HEADER_PATTERN = new RegExp(
+  String.raw`${OPENER_BOUNDARY}((?:proxy-)?authorization)(${HEADER_SEPARATOR})(?:(?:${HEADER_AUTH_SCHEMES})\s+(?:${CREDENTIAL_PARAMETERS}|${CREDENTIAL_TOKEN})|${CREDENTIAL_PARAMETERS}|${CREDENTIAL_TOKEN}(?:\s+(?!${NEXT_HEADER_NAME})${CREDENTIAL_TOKEN})?)`,
+  "gi",
+);
+// Cookie and Set-Cookie headers: every pair of the header value is a session credential. A pair's value may be
+// quoted (`sid="x"`, `sid = 'x'`, JSON-escaped `sid=\"x\"`) and ends at its closing quote even with `; Name:`
+// inside; a quote anywhere else closes the value, so the next header of a JSON headers object is not taken; an
+// unquoted value, or one whose opening quote never closes, runs to the `;`, `,`, or space that begins the next
+// header on the line, or to the end of the line.
+const COOKIE_PAIR_VALUE = String.raw`(?<==\s*)(?:(?:\\?"[^"\\\r\n,;\s][^"\\\r\n]*\\?"|'[^'\r\n,;\s][^'\r\n]*')${CLOSING_QUOTE_BOUNDARY}|${UNTERMINATED_QUOTED_VALUE})`;
+const COOKIE_HEADER_VALUE = String.raw`(?:[^\s"'<>\\;,]|[ \t;,](?!${NEXT_HEADER_NAME})|${COOKIE_PAIR_VALUE})+`;
+const COOKIE_HEADER_PATTERN = new RegExp(String.raw`${OPENER_BOUNDARY}(set-cookie|cookie)(${HEADER_SEPARATOR})(${COOKIE_HEADER_VALUE})`, "gi");
+// A scheme standing in prose (`Bearer x`, `Bearer "x"`, `Token token=x`, `ApiKey x`); a scheme word that is itself a
+// header or field name (`X-Api-Key : x`) is left to the field rule.
+const AUTH_SCHEME_PATTERN = new RegExp(String.raw`${OPENER_BOUNDARY}(${PROSE_AUTH_SCHEMES})(?!\s*[:=])\s+(${CREDENTIAL_PARAMETERS}|${CREDENTIAL_TOKEN})`, "gi");
+// What follows a scheme word in prose rather than as its credential: after a lowercase scheme, a word without
+// digits (lowercase, Capitalized, camelCase with up to three humps, a short acronym, or an acronym-led word such
+// as OAuth) or an environment variable name ("bearer of", "OAuth bearer token.", "access token (OAuth bearer
+// token)", "JWT bearer (SF_CONSUMER_KEY,"); after a capitalized scheme, only the capitalized next word of a title
+// ("Refresh Token Policy"). Wrapping punctuation belongs to the prose, so it is allowed around the word.
+const PROSE_AFTER_LOWERCASE_SCHEME_PATTERN = /^\(?(?:[A-Z]?[a-z]+(?:[A-Z][a-z]+){0,3}|[A-Z]{2,5}(?:[a-z]+)?|[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)+)[).:!?]*$/;
+const PROSE_AFTER_CAPITALIZED_SCHEME_PATTERN = /^\(?[A-Z][a-z]+[).:!?]*$/;
+const CREDENTIAL_PARAMETER_PATTERN = new RegExp(String.raw`([\w-]+=)${CREDENTIAL_PARAMETER_VALUE}`, "g");
+// Credential-named assignments (`client_secret=x`, `client_secret = "x"`, `JSESSIONID=x`, `connect.sid='x'`, `--token=x`).
+const SECRET_ASSIGNMENT_PATTERN = new RegExp(
+  String.raw`(?:(?<![\w.-])|${AFTER_JSON_ESCAPE})([\w.-]*(?:sess|sid|token|secret|passw|passphrase|pwd|passcode|api[_-]?key|apikey|access[_-]?key|private[_-]?key|credential|assertion|signature|auth|cookie|otp)[\w.-]*\s*=\s*)(${QUOTED_VALUE}|${UNTERMINATED_QUOTED_VALUE}|[^\s"'&;,<>\\]+)`,
+  "gi",
+);
+// Credential-named fields and single-value credential headers (`x-api-key: x`, `"password": "x"`, `\"access_token\":\"x\"`).
+const SECRET_FIELD_PATTERN = new RegExp(
+  String.raw`(?:(?<![\w/.-])|${AFTER_JSON_ESCAPE})((?:[\w-]*(?:api[_-]?key|apikey|token|secret|passw|passphrase|credential|assertion|signature|private[_-]?key|access[_-]?key|authorization)[\w-]*|pwd|passcode|otp|sid|jsessionid|session|sessionid|session[_-]?id|cookie|set-cookie|x-auth|x-token|x-secret|auth)\\?["']?\s*:\s*\\?["']?)([^\s"'&;,<>\\]+(?:["'](?=[\w/+=-])[^\s"'&;,<>\\]*)*)`,
+  "gi",
+);
+// SOAP and XML credential elements (`<sessionId>x</sessionId>`, `<urn:password>x</urn:password>`).
+const CREDENTIAL_ELEMENT_PATTERN = /<((?:[\w.-]+:)?(?:session_?id|session|passw(?:or)?d|pwd|passcode|otp|token|access_?token|refresh_?token|id_?token|secret|client_?secret|api_?key|apikey|assertion|signature|credentials?|authorization|private_?key)[\w-]*)(\s[^>]*)?>([^<]*)<\/\1\s*>/gi;
+// Command-line credential flags (`--token x`, `-password x`); the flag starts a word, so `access-token against` is prose.
+const CLI_SECRET_FLAG_PATTERN = new RegExp(
+  String.raw`(?:(?<![\w-])|${AFTER_JSON_ESCAPE})(--?(?:token|password|passwd|pwd|passcode|secret|api[_-]?key|apikey|access[_-]?key|client[_-]?secret|credential|auth|bearer|session|cookie|sid|otp)\s+)(${QUOTED_VALUE}|${UNTERMINATED_QUOTED_VALUE}|[^\s"'&;,<>-][^\s"'&;,<>]*)`,
+  "gi",
+);
+// Real token shapes, removed bare.
+const PEM_BLOCK_PATTERN = /-----BEGIN [A-Z0-9 ]+-----[\s\S]*?(?:-----END [A-Z0-9 ]+-----|$)/g;
+const JWT_PATTERN = new RegExp(String.raw`${OPENER_BOUNDARY}eyJ[A-Za-z0-9_-]{4,}\.[A-Za-z0-9_-]{4,}\.[A-Za-z0-9_-]*`, "g");
+const HEX_DIGEST_PATTERN = new RegExp(String.raw`(?:(?<![A-Za-z0-9])|${AFTER_JSON_ESCAPE})${NOT_INSIDE_JSON_ESCAPE}[0-9a-f]{32,}(?![A-Za-z0-9])`, "gi");
+const VENDOR_TOKEN_PATTERN = new RegExp(String.raw`${OPENER_BOUNDARY}${NOT_INSIDE_JSON_ESCAPE}(?:(?:sk|rk|pk)_(?:live|test)_[A-Za-z0-9]{8,}|sk-(?:proj-)?[A-Za-z0-9_-]{20,}|gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|xox[abopsre]-[A-Za-z0-9-]{10,}|xapp-[A-Za-z0-9-]{10,}|(?:AKIA|ASIA|AGPA|AIDA|AROA|ANPA|ANVA)[0-9A-Z]{16}|AIza[0-9A-Za-z_-]{20,}|ya29\.[0-9A-Za-z_-]{20,}|glpat-[A-Za-z0-9_-]{16,}|npm_[A-Za-z0-9]{30,}|pypi-[A-Za-z0-9_-]{30,}|dop_v1_[a-f0-9]{40,}|SG\.[A-Za-z0-9_-]{16,}\.[A-Za-z0-9_-]{16,}|hvs\.[A-Za-z0-9_-]{20,}|shpat_[a-fA-F0-9]{32}|dckr_pat_[A-Za-z0-9_-]{20,}|lin_api_[A-Za-z0-9]{20,}|figd_[A-Za-z0-9_-]{20,}|u\+[A-Za-z0-9_-]{16,})(?![A-Za-z0-9_-])`, "g");
+// A run long enough to be a token; redactTokenRun decides by segment shape whether it is one. It may start right
+// after `=` (`theme=<run>`, `x==<run>`): the pair rule has already replaced every credential-named pair by the time
+// this rule runs, so a run still standing after `=` is under a non-credential name and is judged by its shape alone;
+// the padding of a base64 run is taken on its right side.
+const BARE_TOKEN_RUN_PATTERN = new RegExp(String.raw`(?:(?<![A-Za-z0-9+/_-])|${AFTER_JSON_ESCAPE})${NOT_INSIDE_JSON_ESCAPE}[A-Za-z0-9+/_-]{16,}={0,2}(?![A-Za-z0-9+/_=-])`, "g");
+// A segment that reads as a word: lowercase, UPPERCASE, Capitalized, or camelCase with up to six humps, each
+// hump optionally led by a short acronym (enableCSRFOnPost, connectedAppOAuth) or closed by one
+// (sessionTimeoutSAML), optionally followed by digits (oauth2, sha256, dev12345) or a version suffix
+// (EngineProtectionV2, getDeviceControlPoliciesV2).
+const WORD_SEGMENT_PATTERN = /^(?:[A-Z]+|[A-Z]?[a-z]+(?:[A-Z]{1,5}[a-z]+){0,6}(?:[A-Z]{2,5})?|[A-Z]{2,}[a-z]+(?:[A-Z]{1,5}[a-z]+){0,6}(?:[A-Z]{2,5})?)(?:V\d+|\d*)$/;
+// A canonical UUID (8-4-4-4-12 hex) is a vendor identifier (a Falcon user uuid, an Anypoint organization or
+// environment id), not a credential, so it stays bare; inside a carrier or when remembered it still goes.
+const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+// Node fs error codes (ENOENT, EACCES, EISDIR); anything else on error.code is not echoed.
+const FS_ERROR_CODE_PATTERN = /^E[A-Z0-9_]{1,30}$/;
 const DEFAULT_TIMEOUT_MS = 30_000;
 const DEFAULT_MAX_RETRIES = 3;
 const DEFAULT_PAGE_SIZE = 500;
@@ -71,6 +183,8 @@ export interface ServicenowResolvedConfig {
   clientId?: string;
   clientSecret?: string;
   accessToken?: string;
+  /** A refresh token issued earlier to the OAuth client (refresh_token in the config file, SERVICENOW_REFRESH_TOKEN, or the refresh_token argument); when present the first token exchange uses the refresh_token grant. */
+  refreshToken?: string;
   timeoutMs: number;
   maxRetries: number;
   pageSize: number;
@@ -84,10 +198,18 @@ export interface TableSnapshot {
   total?: number;
   pages: number;
   truncated: boolean;
+  /** Why pagination stopped before the inventory was exhausted; set whenever truncated is true. */
+  truncationReason?: string;
+  /** True when rows came back without an X-Total-Count header, so the population size is unproven. */
+  totalUnknown?: boolean;
   partial: boolean;
   error?: string;
   statusCode?: number;
   unavailable?: string;
+  /** Path of the Table API request that was issued for this snapshot; absent when no request was made. */
+  endpoint?: string;
+  /** Set when no request was issued at all, with the reason; the flags and counts on such a snapshot are placeholders. */
+  skipped?: string;
 }
 
 export interface CountResult {
@@ -96,14 +218,67 @@ export interface CountResult {
   count?: number;
   error?: string;
   statusCode?: number;
+  /** Path of the Aggregate API request that was issued; absent when no request was made. */
+  endpoint?: string;
+}
+
+/**
+ * Written to core_data in place of a table or aggregate dataset that was denied, errored, unavailable,
+ * or never requested, so a bundle consumer cannot mistake a denial for an empty inventory. A readable
+ * table with no matching rows keeps its snapshot shape with `rows: []`.
+ */
+export interface NotCollectedMarker {
+  collected: false;
+  table: string;
+  query: string | null;
+  status: number | null;
+  endpoint: string | null;
+  error: string;
+  pages?: number;
+}
+
+/** True when a Table API request was issued and answered with rows (possibly none); false for denied, errored, unavailable, or skipped reads. */
+function tableCollected(snapshot: TableSnapshot): boolean {
+  return !snapshot.error && !snapshot.unavailable && !snapshot.skipped;
+}
+
+export function tableCoreData(snapshot: TableSnapshot): TableSnapshot | NotCollectedMarker {
+  if (tableCollected(snapshot)) return snapshot;
+  const reason = snapshot.error
+    ?? (snapshot.skipped ? `not requested: ${snapshot.skipped}` : `table unavailable: ${snapshot.unavailable}`);
+  return {
+    collected: false,
+    table: snapshot.table,
+    query: snapshot.query ?? null,
+    status: snapshot.statusCode ?? null,
+    endpoint: snapshot.endpoint ?? null,
+    error: reason,
+    ...(snapshot.pages > 0 ? { pages: snapshot.pages } : {}),
+  };
+}
+
+export function countCoreData(count: CountResult): CountResult | NotCollectedMarker {
+  if (!count.error) return count;
+  return {
+    collected: false,
+    table: count.table,
+    query: count.query ?? null,
+    status: count.statusCode ?? null,
+    endpoint: count.endpoint ?? null,
+    error: count.error,
+  };
 }
 
 export interface ServicenowAccessSurface {
   name: string;
   table: string;
   status: "readable" | "forbidden" | "acl_filtered" | "not_readable";
+  /** Rows the probe returned; absent when the Table API read was not answered with rows. */
   visible?: number;
+  /** Aggregate count, or the X-Total-Count header when the aggregate failed; absent when neither request answered. */
   total?: number;
+  /** HTTP status the failed Table API probe observed; absent for readable surfaces and non-HTTP failures. */
+  http_status?: number;
   error?: string;
 }
 
@@ -177,6 +352,7 @@ type AuthArgs = {
   client_id?: string;
   client_secret?: string;
   access_token?: string;
+  refresh_token?: string;
   config_file?: string;
   timeout_seconds?: number;
   max_retries?: number;
@@ -376,8 +552,203 @@ function daysBetween(later: Date, earlier: Date): number {
   return Math.floor((later.getTime() - earlier.getTime()) / 86_400_000);
 }
 
+/** "403 Forbidden", or just "403" when the server (or an HTTP/2 hop) sent no reason phrase. */
+function describeStatus(response: Response): string {
+  return response.statusText ? `${response.status} ${response.statusText}` : String(response.status);
+}
+
+/**
+ * The single point where a thrown error becomes a recorded string (table and count snapshot errors,
+ * access-check surfaces, errors arrays, _errors.log, tool error results). It re-applies the redaction
+ * pass so a message built outside ServicenowApiError (a transport error, a timeout, a token response
+ * without access_token) cannot bypass it.
+ */
 function errorMessage(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
+  return scrubSecretText(error instanceof Error ? error.message : String(error));
+}
+
+/**
+ * The unanchored redaction pass applied to every error string (once in ServicenowApiError, again at
+ * errorMessage): every secret any client in this process has seen, in every form it can take in an
+ * echoed body, then the carriers (URL userinfo, query strings, and fragments anywhere in the text,
+ * Authorization and cookie headers, auth schemes in prose, credential-named assignments, fields, and
+ * elements, command-line flags), then the bare token shapes (PEM blocks, JWTs, hex digests, vendor
+ * prefixes, and long runs with base64 symbols, scattered digits, or token casing).
+ */
+function scrubSecretText(text: string, secrets: Iterable<string | undefined> = []): string {
+  let scrubbed = text;
+  for (const secret of [...secrets, ...KNOWN_SECRETS]) {
+    if (!secret || secret.length < MIN_REMEMBERED_SECRET_LENGTH) continue;
+    for (const form of secretForms(secret)) scrubbed = scrubbed.split(form).join(REDACTED);
+  }
+  return scrubBareTokens(scrubCarriers(scrubbed));
+}
+
+/**
+ * The carrier stage of the pass: URL userinfo, query strings, and fragments anywhere in the text,
+ * Authorization and cookie headers, credential elements, JWTs and PEM blocks, auth schemes in prose,
+ * credential-named assignments, fields, and command-line flags. It removes a value by the company it
+ * keeps, never by its shape alone.
+ */
+function scrubCarriers(text: string): string {
+  return text
+    .replace(PEM_BLOCK_PATTERN, REDACTED)
+    .replace(URL_IN_TEXT_PATTERN, (_match, scheme: string, userinfo: string | undefined, host: string, path: string, query?: string, fragment?: string) =>
+      `${scheme}${userinfo ? `${REDACTED}@` : ""}${host}${path}${query ? `?${REDACTED}` : ""}${fragment ? `#${REDACTED}` : ""}`)
+    .replace(BARE_QUERY_PAIR_PATTERN, (_match, pair: string) => `${pair}${REDACTED}`)
+    .replace(AUTHORIZATION_HEADER_PATTERN, (_match, header: string, separator: string) => `${header}${separator}${REDACTED}`)
+    .replace(COOKIE_HEADER_PATTERN, (_match, header: string, separator: string) => `${header}${separator}${REDACTED}`)
+    .replace(CREDENTIAL_ELEMENT_PATTERN, (_match, element: string, attributes: string | undefined) => `<${element}${attributes ?? ""}>${REDACTED}</${element}>`)
+    .replace(JWT_PATTERN, REDACTED)
+    .replace(AUTH_SCHEME_PATTERN, (match: string, scheme: string, credential: string) =>
+      (isProseAfterScheme(scheme, credential) ? match : `${scheme} ${redactCredentialParameters(credential)}`))
+    .replace(SECRET_ASSIGNMENT_PATTERN, (_match, assignment: string) => `${assignment}${REDACTED}`)
+    .replace(SECRET_FIELD_PATTERN, (_match, field: string) => `${field}${REDACTED}`)
+    .replace(CLI_SECRET_FLAG_PATTERN, (_match, flag: string) => `${flag}${REDACTED}`);
+}
+
+/** The bare-token stage: real token shapes removed whatever their company (vendor prefixes, hex digests, long runs with base64 symbols, scattered digits, or token casing). */
+function scrubBareTokens(text: string): string {
+  return text
+    .replace(VENDOR_TOKEN_PATTERN, REDACTED)
+    .replace(HEX_DIGEST_PATTERN, REDACTED)
+    .replace(BARE_TOKEN_RUN_PATTERN, redactTokenRun);
+}
+
+/** Every secret any client in this process has seen, in every form it can take in a text. */
+function scrubRememberedSecrets(text: string): string {
+  let scrubbed = text;
+  for (const secret of KNOWN_SECRETS) {
+    for (const form of secretForms(secret)) scrubbed = scrubbed.split(form).join(REDACTED);
+  }
+  return scrubbed;
+}
+
+/**
+ * The data-side pass (rule 9, data-side carrier class) for every string a snapshot, evidence list,
+ * summary, core_data file, or tool payload keeps from an API response: the remembered secrets in every
+ * form, then the carrier stage (which takes JWTs and PEM blocks), then the vendor-prefixed token shapes
+ * (`sk_live_`, `xoxb-`, `ghp_`, `AKIA`, and the rest of VENDOR_TOKEN_PATTERN), unambiguous credential
+ * shapes with no identifier collision. It has no generic bare-run stage, so prose identifiers (a UUID, a
+ * sys_id, a name such as prod-us-east-2026) stay while a header line, URL credential, assignment,
+ * configured secret, or vendor token embedded in a description, name, or note goes.
+ */
+function scrubDataText(text: string): string {
+  return scrubCarriers(scrubRememberedSecrets(text)).replace(VENDOR_TOKEN_PATTERN, REDACTED);
+}
+
+/**
+ * A collected value with every string leaf through the data-side pass; arrays and plain objects are
+ * rebuilt, primitives and null are kept, and a container nested deeper than MAX_REDACTION_DEPTH is
+ * replaced by the marker rather than passed through unscrubbed (the payload is server-controlled).
+ */
+function scrubDataStrings<T>(value: T, depth = 0): T {
+  if (typeof value === "string") return scrubDataText(value) as T;
+  if (value === null || typeof value !== "object") return value;
+  if (depth > MAX_REDACTION_DEPTH) return REDACTED as T;
+  if (Array.isArray(value)) return value.map((item) => scrubDataStrings(item, depth + 1)) as T;
+  const prototype = Object.getPrototypeOf(value);
+  if (prototype !== Object.prototype && prototype !== null) return value;
+  const output: Record<string, unknown> = {};
+  for (const [key, entry] of Object.entries(value as Record<string, unknown>)) output[key] = scrubDataStrings(entry, depth + 1);
+  return output as T;
+}
+
+/** A scheme word standing in prose ("bearer of", "OAuth bearer token.", "Refresh Token Policy") rather than carrying a credential. */
+function isProseAfterScheme(scheme: string, credential: string): boolean {
+  return /^[a-z]+$/.test(scheme)
+    ? PROSE_AFTER_LOWERCASE_SCHEME_PATTERN.test(credential)
+    : PROSE_AFTER_CAPITALIZED_SCHEME_PATTERN.test(credential);
+}
+
+/** A parameter list (`token=k`, `username="u", response="r"`) keeps its parameter names; a single credential is replaced whole. */
+function redactCredentialParameters(credential: string): string {
+  return /^[\w-]+=/.test(credential) ? credential.replace(CREDENTIAL_PARAMETER_PATTERN, (_match, name: string) => `${name}${REDACTED}`) : REDACTED;
+}
+
+/** The raw, base64, base64url, URL-encoded, and JSON-escaped forms of a secret, so an encoded echo is caught too. */
+function secretForms(secret: string): string[] {
+  let forms = SECRET_FORMS.get(secret);
+  if (!forms) {
+    const bytes = Buffer.from(secret, "utf8");
+    const base64 = bytes.toString("base64");
+    const urlEncoded = encodeURIComponent(secret);
+    forms = [...new Set([
+      secret,
+      base64,
+      base64.replace(/=+$/, ""),
+      bytes.toString("base64url"),
+      urlEncoded,
+      urlEncoded.replace(/%20/g, "+"),
+      urlEncoded.replace(/%[0-9A-F]{2}/g, (escape) => escape.toLowerCase()),
+      JSON.stringify(secret).slice(1, -1),
+    ])].filter((form) => form.length >= MIN_REMEMBERED_SECRET_LENGTH);
+    SECRET_FORMS.set(secret, forms);
+  }
+  return forms;
+}
+
+/**
+ * A run reads as a token when any hyphen- or underscore-separated segment is neither a word, a number, nor
+ * a short abbreviation; a canonical UUID is an identifier and never reads as one.
+ */
+function looksLikeToken(value: string): boolean {
+  if (UUID_PATTERN.test(value)) return false;
+  return value.split(/[-_]+/).some((segment) =>
+    segment.length > 0 && !/^\d+$/.test(segment) && !WORD_SEGMENT_PATTERN.test(segment) && !(segment.length < 8 && /^[A-Za-z0-9]+$/.test(segment)));
+}
+
+/** Base64 symbols mark a token; otherwise a run without slashes is judged whole and a path piece by piece, keeping its word-like skeleton. */
+function redactTokenRun(run: string): string {
+  if (run.includes("+") || run.endsWith("=")) return REDACTED;
+  if (!run.includes("/")) return looksLikeToken(run) ? REDACTED : run;
+  return run.split("/").map((piece) => (looksLikeToken(piece) ? REDACTED : piece)).join("/");
+}
+
+function rememberSecrets(...values: Array<string | undefined>): void {
+  for (const value of values) {
+    if (value && value.length >= MIN_REMEMBERED_SECRET_LENGTH) KNOWN_SECRETS.add(value);
+  }
+}
+
+/**
+ * Thrown by the config loader. The message is fixed text carrying only the path, the fs error code,
+ * and the line: neither Node's fs message (which quotes its own wording and path) nor the yaml
+ * parser's message (which quotes the offending source line, or for an unresolved alias starts with
+ * the alias value) is ever interpolated.
+ */
+export class ServicenowConfigFileError extends Error {
+  readonly code: string;
+
+  constructor(message: string, code: string) {
+    super(message);
+    this.name = "ServicenowConfigFileError";
+    this.code = code;
+  }
+}
+
+/** Read step of the config loader: any failure becomes fixed text with the validated fs code. */
+function readConfigFileText(pathname: string): string {
+  try {
+    return readFileSync(pathname, "utf8");
+  } catch (error) {
+    const rawCode = (error as { code?: unknown } | null)?.code;
+    const code = typeof rawCode === "string" && FS_ERROR_CODE_PATTERN.test(rawCode) ? rawCode : undefined;
+    throw new ServicenowConfigFileError(`Unable to read ServiceNow config file ${pathname}${code ? ` (${code})` : ""}`, code ?? "EUNKNOWN");
+  }
+}
+
+/**
+ * Parse step of the config loader: every thrown value is caught (the yaml package throws a plain
+ * ReferenceError, not a YAMLError, for an unresolved alias) and only a YAMLError's line is kept.
+ */
+function parseConfigFileYaml(pathname: string, text: string): unknown {
+  try {
+    return parseYaml(text);
+  } catch (error) {
+    const line = error instanceof YAMLError ? error.linePos?.[0]?.line : undefined;
+    throw new ServicenowConfigFileError(`Unable to parse ServiceNow config file: invalid YAML in ${pathname}${line ? ` at line ${line}` : ""}`, "INVALID_YAML");
+  }
 }
 
 function truncateList<T>(items: T[], max = 25): T[] {
@@ -492,6 +863,7 @@ interface ConfigOverlay {
   clientId?: string;
   clientSecret?: string;
   accessToken?: string;
+  refreshToken?: string;
   timeoutSeconds?: number;
   maxRetries?: number;
   pageSize?: number;
@@ -513,6 +885,7 @@ function overlayFromRecord(record: JsonRecord): ConfigOverlay {
     clientId: asString(pick("client_id", "clientId")),
     clientSecret: asString(pick("client_secret", "clientSecret")),
     accessToken: asString(pick("access_token", "accessToken", "token")),
+    refreshToken: asString(pick("refresh_token", "refreshToken")),
     timeoutSeconds: asNumber(pick("timeout_seconds", "timeout")),
     maxRetries: asNumber(pick("max_retries", "maxRetries")),
     pageSize: asNumber(pick("page_size", "pageSize")),
@@ -529,6 +902,7 @@ function overlayFromEnv(env: NodeJS.ProcessEnv): ConfigOverlay {
     clientId: asString(env.SERVICENOW_CLIENT_ID),
     clientSecret: asString(env.SERVICENOW_CLIENT_SECRET),
     accessToken: asString(env.SERVICENOW_ACCESS_TOKEN) ?? asString(env.SERVICENOW_TOKEN),
+    refreshToken: asString(env.SERVICENOW_REFRESH_TOKEN),
     timeoutSeconds: asNumber(env.SERVICENOW_TIMEOUT),
     maxRetries: asNumber(env.SERVICENOW_MAX_RETRIES),
     pageSize: asNumber(env.SERVICENOW_PAGE_SIZE),
@@ -547,11 +921,17 @@ function applyOverlay(base: ConfigOverlay, overlay: ConfigOverlay, source: strin
   return merged;
 }
 
-function readYamlConfigFile(pathname: string): ConfigOverlay | undefined {
-  if (!existsSync(pathname)) return undefined;
-  const parsed = parseYaml(readFileSync(pathname, "utf8"));
+/**
+ * Loads one candidate config file. A default candidate that does not exist is skipped; an explicit
+ * path that cannot be read fails with the fixed-text read error (ENOENT included). A file that exists
+ * but holds no YAML mapping (a scalar, a sequence, an empty document) is a config error at any
+ * candidate, never a silent fall-through to the next candidate or the environment.
+ */
+function readYamlConfigFile(pathname: string, explicit = false): ConfigOverlay {
+  if (!explicit && !existsSync(pathname)) return {};
+  const parsed = parseConfigFileYaml(pathname, readConfigFileText(pathname));
   const record = asObject(parsed);
-  if (!record) return undefined;
+  if (!record) throw new ServicenowConfigFileError(`Unable to parse ServiceNow config file: ${pathname} must contain a YAML mapping`, "INVALID_YAML");
   const section = asObject(record.servicenow);
   return overlayFromRecord(section ? { ...record, ...section } : record);
 }
@@ -582,14 +962,9 @@ export function resolveServicenowConfiguration(
 
   let overlay: ConfigOverlay = {};
   for (const candidate of configCandidates) {
-    const fileOverlay = readYamlConfigFile(candidate);
-    if (fileOverlay) {
-      overlay = applyOverlay(overlay, fileOverlay, `config-file:${candidate}`, sourceChain);
-      break;
-    }
-    if (explicitConfigPath) {
-      throw new Error(`ServiceNow config file was not found: ${candidate}`);
-    }
+    if (!explicitConfigPath && !existsSync(candidate)) continue;
+    overlay = applyOverlay(overlay, readYamlConfigFile(candidate, Boolean(explicitConfigPath)), `config-file:${candidate}`, sourceChain);
+    break;
   }
   overlay = applyOverlay(overlay, overlayFromEnv(env), "environment", sourceChain);
   overlay = applyOverlay(overlay, overlayFromRecord({
@@ -601,6 +976,7 @@ export function resolveServicenowConfiguration(
     client_id: input.client_id,
     client_secret: input.client_secret,
     access_token: input.access_token,
+    refresh_token: input.refresh_token,
     timeout_seconds: input.timeout_seconds,
     max_retries: input.max_retries,
     page_size: input.page_size,
@@ -627,7 +1003,7 @@ export function resolveServicenowConfiguration(
       break;
     case "mtls":
       throw new Error(
-        "ServiceNow mutual TLS is recognized but not supported by this runtime's fetch client; use SERVICENOW_AUTH_METHOD=basic or oauth.",
+        "ServiceNow mutual TLS is recognized but not supported by this runtime's fetch client; set SERVICENOW_AUTH_METHOD to basic or oauth.",
       );
     default: {
       const exhaustive: never = authMode;
@@ -644,6 +1020,7 @@ export function resolveServicenowConfiguration(
     clientId: overlay.clientId,
     clientSecret: overlay.clientSecret,
     accessToken: overlay.accessToken,
+    refreshToken: overlay.refreshToken,
     timeoutMs: parseTimeoutSeconds(overlay.timeoutSeconds),
     maxRetries: clampNumber(overlay.maxRetries, DEFAULT_MAX_RETRIES, 0, 10),
     pageSize: clampNumber(overlay.pageSize, DEFAULT_PAGE_SIZE, 1, 10_000),
@@ -651,27 +1028,39 @@ export function resolveServicenowConfiguration(
   };
 }
 
+/** The client's own credentials (including short ones) removed first, then the shared redaction pass with their encoded forms. */
 export function redactSecrets(message: string, secrets: Array<string | undefined>): string {
   let redacted = message;
   for (const secret of secrets) {
     if (!secret || secret.length < 4) continue;
-    redacted = redacted.split(secret).join("[REDACTED]");
+    redacted = redacted.split(secret).join(REDACTED);
   }
-  return redacted;
+  return scrubSecretText(redacted, secrets);
 }
 
+/**
+ * The one error class the client throws for HTTP failures. The message is built from the status,
+ * the request path, and either ServiceNow's documented error fields or a status-and-length note for
+ * any other body; the constructor runs the redaction pass over the message and the detail
+ * regardless of how they were built.
+ */
 export class ServicenowApiError extends Error {
   readonly status: number;
   readonly detail?: string;
 
   constructor(message: string, status: number, detail?: string) {
-    super(message);
+    super(scrubSecretText(message));
     this.name = "ServicenowApiError";
     this.status = status;
-    this.detail = detail;
+    this.detail = detail === undefined ? undefined : scrubSecretText(detail);
   }
 }
 
+/**
+ * ServiceNow's documented error fields (`error.message`, `error.detail`, `status` on Table and
+ * Aggregate API errors; `error` and `error_description` on oauth_token.do); nothing else in a body
+ * is echoed.
+ */
 function servicenowErrorDetail(payload: JsonRecord): string | undefined {
   const error = asObject(payload.error);
   return [asString(error?.message), asString(error?.detail), asString(payload.error_description), asString(payload.status)]
@@ -683,6 +1072,37 @@ function isRetryableStatus(status: number): boolean {
   return status === 429 || status >= 500;
 }
 
+/**
+ * Judges a server-supplied URL before it is requested. requestJson attaches the Authorization header
+ * to whatever it fetches, so a URL is requested only when it resolves to the configured instance
+ * origin and carries no userinfo: a credentialed URL is refused here, not handed to fetch. The clause
+ * names the configured origin and the rejected origin (scheme, host, port) and never the URL's path,
+ * query, or userinfo; undefined means the URL may be requested.
+ */
+export function refusedUrlClause(link: string, instanceUrl: string): string | undefined {
+  const configuredOrigin = new URL(instanceUrl).origin;
+  let resolved: URL;
+  try {
+    resolved = new URL(link, instanceUrl);
+  } catch {
+    return `was not a valid URL (configured instance ${configuredOrigin})`;
+  }
+  const carriesUserinfo = resolved.username !== "" || resolved.password !== "";
+  const foreignOrigin = resolved.origin !== configuredOrigin;
+  if (!carriesUserinfo && !foreignOrigin) return undefined;
+  const rejectedOrigin = resolved.origin === "null" ? `an opaque ${resolved.protocol} origin` : resolved.origin;
+  const target = foreignOrigin
+    ? `pointed at another origin, ${rejectedOrigin}, than the configured instance ${configuredOrigin}`
+    : `pointed at the configured instance ${configuredOrigin}`;
+  return carriesUserinfo ? `carried embedded credentials (userinfo) and ${target}` : target;
+}
+
+/** Truncation reason recorded when a `Link rel=next` is refused; the link is never requested. */
+export function nextLinkRefusal(link: string, instanceUrl: string): string | undefined {
+  const clause = refusedUrlClause(link, instanceUrl);
+  return clause === undefined ? undefined : `Link rel=next ${clause}; not followed`;
+}
+
 export function parseLinkNext(header: string | null | undefined): string | undefined {
   if (!header) return undefined;
   for (const part of header.split(",")) {
@@ -692,12 +1112,65 @@ export function parseLinkNext(header: string | null | undefined): string | undef
   return undefined;
 }
 
+/**
+ * Error strings land in access_check.json, analysis errors, and _errors.log, so an error body that
+ * is not JSON (a proxy or gateway page that may echo request headers, whatever its content type
+ * claims), or JSON without ServiceNow's documented error fields, is described by status, content
+ * type, and byte length only and never quoted.
+ */
+function describeOpaqueBody(response: Response, rawText: string, parsedJson: boolean): string {
+  const contentType = response.headers.get("content-type")?.split(";")[0]?.trim() || "unknown content type";
+  const bytes = Buffer.byteLength(rawText, "utf8");
+  return parsedJson
+    ? `JSON body without documented error fields (${contentType}, ${bytes} bytes)`
+    : `non-JSON body (${contentType}, ${bytes} bytes)`;
+}
+
+/** Parses a response body as a JSON object; undefined when it is not JSON, so the body is never echoed. */
+function parseJsonBody(rawText: string): JsonRecord | undefined {
+  if (rawText.length === 0) return undefined;
+  try {
+    return asObject(JSON.parse(rawText));
+  } catch {
+    return undefined;
+  }
+}
+
+function requestPathname(url: string): string {
+  try {
+    return new URL(url).pathname;
+  } catch {
+    return "(unparseable url)";
+  }
+}
+
+/**
+ * Client-side counterpart of sysparm_fields: keep only the requested columns
+ * so a server that ignores the parameter (or a widened schema) cannot land
+ * password, key, or payload columns in the snapshot.
+ */
+export function projectRows(rows: JsonRecord[], fields: string[] | undefined): JsonRecord[] {
+  if (!fields || fields.length === 0) return rows;
+  const keep = new Set(fields);
+  return rows.map((row) => Object.fromEntries(Object.entries(row).filter(([key]) => keep.has(key))));
+}
+
 export interface ServicenowTableQuery {
   query?: string;
   fields?: string[];
   limit?: number;
   pageSize?: number;
   displayValue?: boolean | "all";
+}
+
+/**
+ * Every table read the collectors and the access check make goes through here, so each kept row passes
+ * the data-side pass (remembered secrets and carriers, no bare-token stage) before it reaches a snapshot,
+ * evidence, a summary, core_data, or a tool payload.
+ */
+async function readTable(client: Pick<ServicenowReadClient, "queryTable">, table: string, options: ServicenowTableQuery = {}): Promise<TableSnapshot> {
+  const snapshot = await client.queryTable(table, options);
+  return { ...snapshot, rows: scrubDataStrings(snapshot.rows) };
 }
 
 export interface ServicenowReadClient {
@@ -733,6 +1206,8 @@ export class ServicenowApiClient implements ServicenowReadClient {
       this.accessToken = config.accessToken;
       this.accessTokenExpiresAt = Number.MAX_SAFE_INTEGER;
     }
+    this.refreshToken = config.refreshToken;
+    rememberSecrets(config.password, config.clientSecret, config.accessToken, config.refreshToken);
   }
 
   getResolvedConfig(): ServicenowResolvedConfig {
@@ -767,7 +1242,7 @@ export class ServicenowApiClient implements ServicenowReadClient {
       return await this.fetchImpl(url, { ...init, signal: controller.signal });
     } catch (error) {
       if (controller.signal.aborted) {
-        throw new Error(`ServiceNow request timed out after ${this.config.timeoutMs}ms: ${this.redact(url)}`);
+        throw new Error(`ServiceNow request timed out after ${this.config.timeoutMs}ms: ${requestPathname(url)}`);
       }
       throw new Error(`ServiceNow request failed: ${this.redact(errorMessage(error))}`);
     } finally {
@@ -833,28 +1308,27 @@ export class ServicenowApiClient implements ServicenowReadClient {
       body: body.toString(),
     });
     const rawText = await response.text();
-    let payload: JsonRecord = {};
-    try {
-      payload = asObject(JSON.parse(rawText)) ?? {};
-    } catch {
-      payload = { raw: rawText.slice(0, 240) };
-    }
+    const parsed = parseJsonBody(rawText);
+    const payload: JsonRecord = parsed ?? {};
     if (!response.ok) {
-      const detail = servicenowErrorDetail(payload) ?? asString(payload.error) ?? asString(payload.raw);
+      const detail = servicenowErrorDetail(payload) ?? asString(payload.error) ?? (rawText.length > 0 ? describeOpaqueBody(response, rawText, parsed !== undefined) : undefined);
+      // detail passes through the client's redact too: it knows the configured credentials, including
+      // ones shorter than the remembered-secret minimum that the constructor's pass cannot see.
       throw new ServicenowApiError(
-        this.redact(`ServiceNow OAuth token request failed (${response.status} ${response.statusText})${detail ? `: ${detail}` : ""}`),
+        this.redact(`ServiceNow OAuth token request failed (${describeStatus(response)}) for /oauth_token.do${detail ? `: ${detail}` : ""}`),
         response.status,
-        detail,
+        detail === undefined ? undefined : this.redact(detail),
       );
     }
     const accessToken = asString(payload.access_token);
     if (!accessToken) {
-      throw new Error("ServiceNow OAuth token response did not include access_token.");
+      throw new Error(`ServiceNow OAuth token response did not include access_token (${rawText.length > 0 ? describeOpaqueBody(response, rawText, parsed !== undefined) : "empty response body"}).`);
     }
     const expiresIn = asNumber(payload.expires_in) ?? 1800;
     this.accessToken = accessToken;
     this.accessTokenExpiresAt = Date.now() + Math.max((expiresIn - 60) * 1000, 60_000);
     this.refreshToken = asString(payload.refresh_token) ?? this.refreshToken;
+    rememberSecrets(accessToken, this.refreshToken);
     return accessToken;
   }
 
@@ -876,6 +1350,10 @@ export class ServicenowApiClient implements ServicenowReadClient {
   }
 
   async requestJson(url: string, init: RequestInit = {}): Promise<{ payload: JsonRecord; headers: Headers; status: number }> {
+    // The one fetch site for table reads: a URL off the configured origin or carrying userinfo is
+    // refused before the Authorization header is attached, whatever path led here.
+    const refusal = refusedUrlClause(url, this.config.instanceUrl);
+    if (refusal !== undefined) throw new Error(`ServiceNow request URL ${refusal}; the request was not sent.`);
     let attempt = 0;
     let reauthenticated = false;
     for (;;) {
@@ -885,14 +1363,8 @@ export class ServicenowApiClient implements ServicenowReadClient {
 
       const response = await this.fetchWithTimeout(url, { ...init, headers });
       const rawText = await response.text();
-      let payload: JsonRecord = {};
-      if (rawText.length > 0) {
-        try {
-          payload = asObject(JSON.parse(rawText)) ?? {};
-        } catch {
-          payload = { raw: rawText.slice(0, 240) };
-        }
-      }
+      const parsed = parseJsonBody(rawText);
+      const payload: JsonRecord = parsed ?? {};
 
       if (response.ok) return { payload, headers: response.headers, status: response.status };
 
@@ -909,11 +1381,11 @@ export class ServicenowApiClient implements ServicenowReadClient {
         continue;
       }
 
-      const detail = servicenowErrorDetail(payload) ?? asString(payload.raw);
+      const detail = servicenowErrorDetail(payload) ?? (rawText.length > 0 ? describeOpaqueBody(response, rawText, parsed !== undefined) : undefined);
       throw new ServicenowApiError(
-        this.redact(`ServiceNow request failed (${response.status} ${response.statusText}) for ${new URL(url).pathname}${detail ? `: ${detail}` : ""}`),
+        this.redact(`ServiceNow request failed (${describeStatus(response)}) for ${new URL(url).pathname}${detail ? `: ${detail}` : ""}`),
         response.status,
-        detail,
+        detail === undefined ? undefined : this.redact(detail),
       );
     }
   }
@@ -924,8 +1396,11 @@ export class ServicenowApiClient implements ServicenowReadClient {
     const rows: JsonRecord[] = [];
     let total: number | undefined;
     let pages = 0;
-    let truncated = false;
-    let url: string | undefined = this.buildUrl(`/api/now/table/${encodeURIComponent(table)}`, {
+    let truncationReason: string | undefined;
+    let currentOffset = 0;
+    const visitedUrls = new Set<string>();
+    const endpoint = `/api/now/table/${encodeURIComponent(table)}`;
+    let url: string | undefined = this.buildUrl(endpoint, {
       sysparm_query: options.query,
       sysparm_fields: options.fields?.join(","),
       sysparm_limit: pageSize,
@@ -936,24 +1411,49 @@ export class ServicenowApiClient implements ServicenowReadClient {
 
     try {
       while (url) {
+        visitedUrls.add(url);
         const { payload, headers } = await this.requestJson(url);
         pages += 1;
-        const pageRows = asRecordArray(payload.result);
+        const pageRows = projectRows(asRecordArray(payload.result), options.fields);
         rows.push(...pageRows);
         const count = asNumber(headers.get("x-total-count"));
         if (count !== undefined) total = count;
         const next = parseLinkNext(headers.get("link"));
-        if (!next || pageRows.length === 0) break;
+        if (!next) break;
+        // More rows are promised by Link rel=next but this page carried none: a
+        // stuck cursor, so the read is reported truncated instead of complete.
+        if (pageRows.length === 0) {
+          truncationReason = "empty page returned with a Link rel=next";
+          break;
+        }
         if (rows.length >= limit) {
-          truncated = true;
+          truncationReason = "record limit reached";
+          break;
+        }
+        // A next link is followed on the instance's own origin only, and never with userinfo:
+        // requestJson attaches the Authorization header to whatever it fetches, so an absolute link
+        // elsewhere would carry the credential to a foreign host, and a credentialed link must not
+        // reach fetch at all. The read stops here and is reported truncated with a reason that names
+        // the two origins only.
+        const refusal = nextLinkRefusal(next, this.config.instanceUrl);
+        if (refusal !== undefined) {
+          truncationReason = refusal;
           break;
         }
         const nextUrl = new URL(next, this.config.instanceUrl);
         const nextOffset = asNumber(nextUrl.searchParams.get("sysparm_offset"));
         if (total !== undefined && nextOffset !== undefined && nextOffset >= total) break;
-        url = nextUrl.toString();
+        const nextUrlText = nextUrl.toString();
+        if (visitedUrls.has(nextUrlText) || nextOffset === undefined || nextOffset <= currentOffset) {
+          truncationReason = "Link rel=next offset did not advance";
+          break;
+        }
+        currentOffset = nextOffset;
+        url = nextUrlText;
       }
     } catch (error) {
+      // The in-memory flags on a failed read are placeholders; every rendered surface (core_data,
+      // evidence, summaries) reads them through tableCoreData or snapshotEvidence, which render null.
       return {
         table,
         query: options.query,
@@ -964,9 +1464,12 @@ export class ServicenowApiClient implements ServicenowReadClient {
         partial: false,
         error: this.redact(errorMessage(error)),
         statusCode: error instanceof ServicenowApiError ? error.status : undefined,
+        endpoint,
       };
     }
 
+    const truncated = truncationReason !== undefined;
+    const totalUnknown = total === undefined && rows.length > 0;
     return {
       table,
       query: options.query,
@@ -974,25 +1477,30 @@ export class ServicenowApiClient implements ServicenowReadClient {
       total,
       pages,
       truncated,
-      partial: truncated || (total !== undefined && total > rows.length),
+      ...(truncationReason ? { truncationReason } : {}),
+      ...(totalUnknown ? { totalUnknown } : {}),
+      partial: truncated || totalUnknown || (total !== undefined && total > rows.length),
+      endpoint,
     };
   }
 
   async countRecords(table: string, query?: string): Promise<CountResult> {
+    const endpoint = `/api/now/stats/${encodeURIComponent(table)}`;
     try {
-      const { payload } = await this.requestJson(this.buildUrl(`/api/now/stats/${encodeURIComponent(table)}`, {
+      const { payload } = await this.requestJson(this.buildUrl(endpoint, {
         sysparm_count: "true",
         sysparm_query: query,
       }));
       const result = asObject(payload.result);
       const stats = asObject(result?.stats);
-      return { table, query, count: asNumber(stats?.count) };
+      return { table, query, count: asNumber(stats?.count), endpoint };
     } catch (error) {
       return {
         table,
         query,
         error: this.redact(errorMessage(error)),
         statusCode: error instanceof ServicenowApiError ? error.status : undefined,
+        endpoint,
       };
     }
   }
@@ -1000,6 +1508,9 @@ export class ServicenowApiClient implements ServicenowReadClient {
 
 function snapshotIssue(snapshot: TableSnapshot): string | undefined {
   if (snapshot.error) {
+    if (snapshot.skipped) {
+      return `${snapshot.table} was not requested (${snapshot.skipped})`;
+    }
     if (snapshot.statusCode === 401 || snapshot.statusCode === 403) {
       return `${snapshot.table} read was forbidden (${snapshot.statusCode})`;
     }
@@ -1015,7 +1526,8 @@ function snapshotIssue(snapshot: TableSnapshot): string | undefined {
  */
 function normalizeMissingTable(snapshot: TableSnapshot, reason: string): TableSnapshot {
   if (snapshot.statusCode === 400 && /invalid table/i.test(snapshot.error ?? "")) {
-    return { ...snapshot, rows: [], error: undefined, statusCode: undefined, truncated: false, partial: false, unavailable: reason };
+    // The observed status code and message are kept so the core_data marker names what the API answered.
+    return { ...snapshot, rows: [], error: undefined, truncated: false, partial: false, unavailable: `${reason} (${snapshot.error})` };
   }
   return snapshot;
 }
@@ -1023,13 +1535,16 @@ function normalizeMissingTable(snapshot: TableSnapshot, reason: string): TableSn
 function snapshotPartialNote(snapshot: TableSnapshot): string | undefined {
   if (snapshot.error) return undefined;
   if (snapshot.truncated) {
-    return `${snapshot.table} was truncated at ${snapshot.rows.length} of ${snapshot.total ?? "unknown"} rows (record limit reached)`;
+    return `${snapshot.table} was truncated at ${snapshot.rows.length} of ${snapshot.total ?? "unknown"} rows (${snapshot.truncationReason ?? "record limit reached"})`;
   }
   if (snapshot.total !== undefined && snapshot.total > snapshot.rows.length) {
     return `${snapshot.table} returned ${snapshot.rows.length} of ${snapshot.total} rows (ACL-filtered or hidden rows)`;
   }
   if (visibilityUnproven(snapshot)) {
     return `${snapshot.table} returned 0 rows without an X-Total-Count header (visibility unproven)`;
+  }
+  if (snapshot.totalUnknown) {
+    return `${snapshot.table} returned ${snapshot.rows.length} rows without an X-Total-Count header (total unknown)`;
   }
   return undefined;
 }
@@ -1055,18 +1570,124 @@ function countErrors(label: string, count: CountResult): string[] {
   return count.error ? [`${label}: aggregate count failed (${count.error})`] : [];
 }
 
+type TableState = "complete" | "partial" | "unread" | "unavailable" | "not_requested";
+
+function tableState(snapshot: TableSnapshot): TableState {
+  if (snapshot.skipped) return "not_requested";
+  if (snapshot.error) return "unread";
+  if (snapshot.unavailable) return "unavailable";
+  if (snapshot.partial || visibilityUnproven(snapshot)) return "partial";
+  return "complete";
+}
+
+/**
+ * Renders one inventory state as `<table> read: <state> (<detail>)`. The word `read` keeps a
+ * credential-named table (password_policy) from forming a `name: value` pair that the redaction
+ * pass would take as a credential, so the fixed text survives the pass unchanged.
+ */
+function describeTable(snapshot: TableSnapshot): string {
+  const state = tableState(snapshot);
+  switch (state) {
+    case "unread":
+      return `${snapshot.table} read: unread (${snapshot.error})`;
+    case "not_requested":
+      return `${snapshot.table} read: not requested (${snapshot.skipped})`;
+    case "unavailable":
+      return `${snapshot.table} read: unavailable (${snapshot.unavailable})`;
+    case "partial":
+      return `${snapshot.table} read: partial (${snapshotPartialNote(snapshot) ?? "visible rows are not the full population"})`;
+    case "complete":
+      return `${snapshot.table} read: complete (${snapshot.rows.length} row${snapshot.rows.length === 1 ? "" : "s"}${snapshot.total !== undefined ? ` of ${snapshot.total}` : ""})`;
+    default: {
+      const exhaustive: never = state;
+      throw new Error(`Unhandled table state ${String(exhaustive)}`);
+    }
+  }
+}
+
+function describeCount(count: CountResult): string {
+  if (count.error) return `${count.table} aggregate: unread (${count.error})`;
+  if (count.count === undefined) return `${count.table} aggregate: unread (no count returned)`;
+  return `${count.table} aggregate: complete (${count.count})`;
+}
+
+/** True when every listed snapshot was read without error and its visible rows are the whole population. */
+function tablesComplete(snapshots: TableSnapshot[]): boolean {
+  return snapshots.every((snapshot) => tableState(snapshot) === "complete");
+}
+
+function tablesReadable(snapshots: TableSnapshot[]): boolean {
+  return snapshots.every((snapshot) => !snapshot.error);
+}
+
+function isAbsenceValue(value: unknown): boolean {
+  if (value === 0) return true;
+  if (Array.isArray(value)) return value.length === 0;
+  if (value !== null && typeof value === "object") return Object.keys(value as object).length === 0;
+  return false;
+}
+
+/**
+ * A count, list, or map derived from one or more table reads. It renders null when any source was not
+ * read, and null when a source is partial or unavailable and the value would assert absence (0, [], {}),
+ * because a partly read inventory cannot prove that nothing exists.
+ */
+function derived<T>(value: T, ...snapshots: TableSnapshot[]): T | null {
+  if (!tablesReadable(snapshots)) return null;
+  if (!tablesComplete(snapshots) && isAbsenceValue(value)) return null;
+  return value;
+}
+
+/** A boolean observation: true is a positive sighting from any read; false is an absence claim that needs a complete read. */
+function derivedFlag(value: boolean, ...snapshots: TableSnapshot[]): boolean | null {
+  if (!tablesReadable(snapshots)) return null;
+  if (!value && !tablesComplete(snapshots)) return null;
+  return value;
+}
+
+/** The number of rows read is meaningful whenever the table was read at all; it is null when it was not. */
+function visibleRows(snapshot: TableSnapshot): number | null {
+  return tableCollected(snapshot) ? snapshot.rows.length : null;
+}
+
+/** An X-Total-Count or aggregate total is reported only when the request that carries it was answered. */
+function totalRows(snapshot: TableSnapshot): number | null {
+  return tableCollected(snapshot) ? snapshot.total ?? null : null;
+}
+
+function countValue(count: CountResult): number | null {
+  return count.error ? null : count.count ?? null;
+}
+
+/** A count of principals holding or lacking a property, unknown unless every proving table was fully read. */
+function principalCount(value: number, ...snapshots: TableSnapshot[]): number | null {
+  return tablesComplete(snapshots) ? value : null;
+}
+
+/**
+ * Collection metadata for one input table. Counts and flags are real only when the read was answered
+ * with rows; a denied, errored, unavailable, or skipped read renders every one of them null so a
+ * consumer cannot mistake a placeholder `truncated: false` or `visible_rows: 0` for an observation.
+ */
 function snapshotEvidence(snapshot: TableSnapshot): JsonRecord {
+  const listed = tableCollected(snapshot);
   return {
     table: snapshot.table,
     query: snapshot.query ?? null,
-    visible_rows: snapshot.rows.length,
-    total_rows: snapshot.total ?? null,
-    pages: snapshot.pages,
-    truncated: snapshot.truncated,
-    partial: snapshot.partial,
+    state: tableState(snapshot),
+    visible_rows: listed ? snapshot.rows.length : null,
+    total_rows: listed ? snapshot.total ?? null : null,
+    // Pages read before a failure are an observation; zero pages on a read that was not answered is not.
+    pages: listed || snapshot.pages > 0 ? snapshot.pages : null,
+    truncated: listed ? snapshot.truncated : null,
+    truncation_reason: snapshot.truncationReason ?? null,
+    total_unknown: listed ? snapshot.totalUnknown ?? false : null,
+    partial: listed ? snapshot.partial : null,
     error: snapshot.error ?? null,
     status_code: snapshot.statusCode ?? null,
+    endpoint: snapshot.endpoint ?? null,
     unavailable: snapshot.unavailable ?? null,
+    skipped: snapshot.skipped ?? null,
   };
 }
 
@@ -1075,6 +1696,35 @@ interface Evaluation {
   summary: string;
   evidence?: JsonRecord;
   manualEvidence?: string;
+  /**
+   * Lists that name principals (users, accounts, integrations) as holding or lacking a property, and
+   * counts of such principals. They are emitted only when every input was read to completion; a partial
+   * input renders each of them null and `principals_withheld` names the inventory that was not fully read.
+   */
+  principals?: Record<string, unknown[] | number>;
+  /** Thresholds and options echoed into evidence verbatim; they describe the run, not the tenant, so they are never gated. */
+  parameters?: JsonRecord;
+  /**
+   * A fail that rests on the absence of a row among the visible rows (no policy row, no provider row).
+   * Under a partial read the absence is provable only against the rows that were not read, so the
+   * verdict renders manual instead of fail; a complete empty read still fails.
+   */
+  absenceClaim?: boolean;
+}
+
+/** Under a partial read, evidence values that assert absence (0, [], {}) render null because the missing rows could hold the item. */
+function withoutAbsenceClaims(evidence: JsonRecord | undefined, complete: boolean): JsonRecord {
+  if (!evidence) return {};
+  if (complete) return evidence;
+  return Object.fromEntries(Object.entries(evidence).map(([key, value]) => [key, isAbsenceValue(value) ? null : value]));
+}
+
+function gatedPrincipals(principals: Record<string, unknown[] | number> | undefined, complete: boolean, partialNotes: string[]): JsonRecord {
+  if (!principals) return {};
+  const gated: JsonRecord = {};
+  for (const [key, value] of Object.entries(principals)) gated[key] = complete ? value : null;
+  gated.principals_withheld = complete ? null : partialNotes.join("; ");
+  return gated;
 }
 
 function finding(controlNumber: number, evaluation: Evaluation): ServicenowFinding {
@@ -1116,8 +1766,14 @@ function gatedFinding(
 
   const evaluation = evaluate();
   const partialNotes = inputs.map(snapshotPartialNote).filter((item): item is string => Boolean(item));
-  const evidence = { ...inputEvidence, ...(evaluation.evidence ?? {}) };
-  if (partialNotes.length === 0) {
+  const complete = partialNotes.length === 0;
+  const evidence = {
+    ...inputEvidence,
+    ...(evaluation.parameters ?? {}),
+    ...withoutAbsenceClaims(evaluation.evidence, complete),
+    ...gatedPrincipals(evaluation.principals, complete, partialNotes),
+  };
+  if (complete) {
     return finding(controlNumber, { ...evaluation, evidence, manualEvidence: evaluation.manualEvidence ?? (evaluation.status === "manual" ? manualEvidence : undefined) });
   }
 
@@ -1130,8 +1786,17 @@ function gatedFinding(
         evidence,
         manualEvidence,
       });
-    case "warn":
     case "fail":
+      if (evaluation.absenceClaim) {
+        return finding(controlNumber, {
+          status: "manual",
+          summary: `${evaluation.summary} ${partialSummary} The absence this verdict rests on cannot be asserted for the rows that were not read, so the verdict is manual (unknown).`,
+          evidence,
+          manualEvidence,
+        });
+      }
+      return finding(controlNumber, { ...evaluation, summary: `${evaluation.summary} ${partialSummary}`, evidence });
+    case "warn":
       return finding(controlNumber, { ...evaluation, summary: `${evaluation.summary} ${partialSummary}`, evidence });
     case "manual":
       return finding(controlNumber, { ...evaluation, summary: `${evaluation.summary} ${partialSummary}`, evidence, manualEvidence: evaluation.manualEvidence ?? manualEvidence });
@@ -1188,7 +1853,7 @@ function propertyVerdict(checks: PropertyCheck[], subject: string): Evaluation {
   if (nonCompliant.length > 0) {
     return {
       status: "fail",
-      summary: `${nonCompliant.length}/${checks.length} ${subject} properties are set to non-compliant values: ${nonCompliant.map((item) => `${item.name}=${item.value ?? ""}`).join(", ")}.`,
+      summary: `${nonCompliant.length}/${checks.length} ${subject} properties are set to non-compliant values: ${nonCompliant.map((item) => `${item.name} is ${item.value === undefined || item.value === "" ? "empty" : item.value}`).join(", ")}.`,
       evidence,
     };
   }
@@ -1297,6 +1962,33 @@ const CERTIFICATE_FIELDS = ["sys_id", "name", "type", "expires", "active", "sys_
 const ACL_FIELDS = ["sys_id", "name", "operation", "type", "active", "admin_overrides", "condition", "script", "advanced", "description"];
 const ACL_ROLE_FIELDS = ["sys_id", "sys_security_acl", "sys_security_acl.name", "sys_user_role", "sys_user_role.name"];
 const PLUGIN_FIELDS = ["sys_id", "name", "source", "active", "version"];
+/**
+ * SNOW-06 reads the policy name, the minimum and maximum length, the
+ * character-class requirements, and the strength preset. Both the
+ * "require_*" flag and the "minimum_*_characters" count spellings are
+ * requested because the Table API ignores unknown names in sysparm_fields;
+ * anything else on the record (description, lockout, history, expiration) is
+ * dropped before the snapshot is stored.
+ */
+const PASSWORD_POLICY_FIELDS = [
+  "sys_id",
+  "name",
+  "active",
+  "sys_updated_on",
+  "minimum_password_length",
+  "maximum_password_length",
+  "password_strength_preset",
+  "require_uppercase",
+  "require_lowercase",
+  "require_digit",
+  "require_special",
+  "minimum_uppercase_characters",
+  "minimum_lowercase_characters",
+  "minimum_numeric_characters",
+  "minimum_special_characters",
+];
+/** SNOW-07 reads the criteria name, active flag, and the Multi-factor Roles list (display value). */
+const MFA_CRITERIA_FIELDS = ["sys_id", "name", "active", "order", "roles", "multi_factor_roles", "sys_updated_on"];
 const MFA_CRITERIA_TABLE = "multi_factor_criteria";
 const CRYPTO_MODULE_TABLE = "sys_kmf_crypto_module";
 const LEGACY_ENCRYPTION_CONTEXT_TABLE = "sys_encryption_context";
@@ -1331,17 +2023,17 @@ export async function collectServicenowIdentityData(
   const recordLimit = clampNumber(options.recordLimit, DEFAULT_RECORD_LIMIT, 1, 500_000);
   const roleList = PRIVILEGED_ROLE_NAMES.join(",");
   const [users, privilegedAssignments, roleInheritance, roleInheritanceTotal, properties, passwordPolicies, ssoProviders, ldapServers, certificates, oauthEntities, mfaCriteria] = await Promise.all([
-    client.queryTable("sys_user", { query: "active=true", fields: USER_FIELDS, limit: recordLimit }),
-    client.queryTable("sys_user_has_role", { query: `role.nameIN${roleList}`, fields: USER_ROLE_FIELDS, limit: recordLimit }),
-    client.queryTable("sys_user_role_contains", { query: `contains.nameIN${ELEVATED_ROLE_NAMES.join(",")}`, fields: ROLE_CONTAINS_FIELDS, limit: recordLimit }),
+    readTable(client, "sys_user", { query: "active=true", fields: USER_FIELDS, limit: recordLimit }),
+    readTable(client, "sys_user_has_role", { query: `role.nameIN${roleList}`, fields: USER_ROLE_FIELDS, limit: recordLimit }),
+    readTable(client, "sys_user_role_contains", { query: `contains.nameIN${ELEVATED_ROLE_NAMES.join(",")}`, fields: ROLE_CONTAINS_FIELDS, limit: recordLimit }),
     client.countRecords("sys_user_role_contains"),
-    client.queryTable("sys_properties", { query: `nameIN${IDENTITY_PROPERTY_QUERY_NAMES.join(",")}`, fields: PROPERTY_FIELDS, limit: recordLimit }),
-    client.queryTable("password_policy", { limit: recordLimit }),
-    client.queryTable("sso_properties", { fields: ["sys_id", "name", "active", "default", "auto_redirect_idp", "sys_updated_on"], limit: recordLimit }),
-    client.queryTable("ldap_server_config", { fields: ["sys_id", "name", "active", "sys_updated_on"], limit: recordLimit }),
-    client.queryTable("sys_certificate", { fields: CERTIFICATE_FIELDS, limit: recordLimit }),
-    client.queryTable("oauth_entity", { fields: ["sys_id", "name", "type", "active", "client_id", "sys_updated_on"], limit: recordLimit }),
-    client.queryTable(MFA_CRITERIA_TABLE, { displayValue: true, limit: recordLimit }),
+    readTable(client, "sys_properties", { query: `nameIN${IDENTITY_PROPERTY_QUERY_NAMES.join(",")}`, fields: PROPERTY_FIELDS, limit: recordLimit }),
+    readTable(client, "password_policy", { fields: PASSWORD_POLICY_FIELDS, limit: recordLimit }),
+    readTable(client, "sso_properties", { fields: ["sys_id", "name", "active", "default", "auto_redirect_idp", "sys_updated_on"], limit: recordLimit }),
+    readTable(client, "ldap_server_config", { fields: ["sys_id", "name", "active", "sys_updated_on"], limit: recordLimit }),
+    readTable(client, "sys_certificate", { fields: CERTIFICATE_FIELDS, limit: recordLimit }),
+    readTable(client, "oauth_entity", { fields: ["sys_id", "name", "type", "active", "client_id", "sys_updated_on"], limit: recordLimit }),
+    readTable(client, MFA_CRITERIA_TABLE, { fields: MFA_CRITERIA_FIELDS, displayValue: true, limit: recordLimit }),
   ]);
   return {
     users,
@@ -1491,12 +2183,11 @@ export function assessServicenowIdentityAccessData(data: ServicenowIdentityData)
     const adminsWithoutLoginDate = users.filter((user) => elevatedUserIds.has(rowString(user, "sys_id") ?? "") && !parseServicenowDate(user.last_login_time)).map(userLabel);
     const lockedOut = users.filter((user) => rowBoolean(user, "locked_out") === true);
     const lockedOutAdmins = lockedOut.filter((user) => elevatedUserIds.has(rowString(user, "sys_id") ?? "")).map(userLabel);
-    const evidence: JsonRecord = {
-      active_users: users.length,
+    const evidence: JsonRecord = { active_users: users.length };
+    const parameters: JsonRecord = { max_admins: data.maxAdmins, inactive_days: data.inactiveDays };
+    const principals: Evaluation["principals"] = {
       admin_users: elevatedUserIds.size,
       admin_user_names: truncateList(elevatedUserNames),
-      max_admins: data.maxAdmins,
-      inactive_days: data.inactiveDays,
       inactive_users: truncateList(stale),
       inactive_user_count: stale.length,
       users_without_last_login: truncateList(neverLoggedIn),
@@ -1508,24 +2199,40 @@ export function assessServicenowIdentityAccessData(data: ServicenowIdentityData)
       locked_out_admins: lockedOutAdmins,
       multi_privileged_users: truncateList(multiPrivilegedUsers.map(([user, roles]) => ({ user, roles: [...roles] }))),
     };
+    // Counts of principals are stated only when both inventories were read to completion; a partial
+    // read reports what was observed without a number or a name, since the missing rows could change both.
+    const complete = tablesComplete([data.users, data.privilegedAssignments]);
+    const withheld = "exact counts and names are withheld because the user inventory was not fully read";
     if (staleAdmins.length > 0 || elevatedUserIds.size > data.maxAdmins) {
       return {
         status: "fail",
-        summary: `${elevatedUserIds.size} active users hold admin or security_admin (threshold ${data.maxAdmins}); ${staleAdmins.length} admins have not logged in for ${data.inactiveDays}+ days; ${stale.length} active users are inactive; ${neverLoggedIn.length} have no last login date and are not counted as active; ${lockedOut.length} active accounts are locked out (${lockedOutAdmins.length} admins).`,
+        summary: complete
+          ? `${elevatedUserIds.size} active users hold admin or security_admin (threshold ${data.maxAdmins}); ${staleAdmins.length} admins have not logged in for ${data.inactiveDays}+ days; ${stale.length} active users are inactive; ${neverLoggedIn.length} have no last login date and are not counted as active; ${lockedOut.length} active accounts are locked out (${lockedOutAdmins.length} admins).`
+          : `Among the visible rows, ${staleAdmins.length > 0 ? `an admin or security_admin holder has not logged in for ${data.inactiveDays}+ days` : `more than ${data.maxAdmins} active users hold admin or security_admin`}; ${withheld}.`,
         evidence,
+        parameters,
+        principals,
       };
     }
     if (stale.length > 0 || neverLoggedIn.length > 0 || adminsWithoutLoginDate.length > 0 || multiPrivilegedUsers.length > 0 || lockedOut.length > 0) {
       return {
         status: "warn",
-        summary: `${elevatedUserIds.size} admin users are within the threshold of ${data.maxAdmins}, but ${stale.length} active users are inactive for ${data.inactiveDays}+ days, ${neverLoggedIn.length} have no last login date (reported separately, never counted as active), ${lockedOut.length} active accounts are locked out (${lockedOutAdmins.length} admins; review or deactivate them), and ${multiPrivilegedUsers.length} users hold multiple privileged roles.`,
+        summary: complete
+          ? `${elevatedUserIds.size} admin users are within the threshold of ${data.maxAdmins}, but ${stale.length} active users are inactive for ${data.inactiveDays}+ days, ${neverLoggedIn.length} have no last login date (reported separately, never counted as active), ${lockedOut.length} active accounts are locked out (${lockedOutAdmins.length} admins; review or deactivate them), and ${multiPrivilegedUsers.length} users hold multiple privileged roles.`
+          : `Among the visible rows, accounts that are inactive for ${data.inactiveDays}+ days, have no last login date, are locked out, or hold multiple privileged roles were observed; ${withheld}.`,
         evidence,
+        parameters,
+        principals,
       };
     }
     return {
       status: "pass",
-      summary: `${users.length} active users reviewed: ${elevatedUserIds.size} admins within the threshold of ${data.maxAdmins}, no user inactive for ${data.inactiveDays}+ days, every active user has a last login date, no active account is locked out, and no user stacks multiple privileged roles.`,
+      summary: complete
+        ? `${users.length} active users reviewed: ${elevatedUserIds.size} admins within the threshold of ${data.maxAdmins}, no user inactive for ${data.inactiveDays}+ days, every active user has a last login date, no active account is locked out, and no user stacks multiple privileged roles.`
+        : `No inactive, never-logged-in, locked-out, or multi-privileged account was observed among the visible rows and the visible admin holders are within the threshold of ${data.maxAdmins}, but the user inventory was not fully read, so the population is unknown.`,
       evidence,
+      parameters,
+      principals,
     };
   });
 
@@ -1545,10 +2252,13 @@ export function assessServicenowIdentityAccessData(data: ServicenowIdentityData)
       return { status: "fail", summary: "glide.enable.password_policy is set to false, so the password_policy table is not enforced.", evidence };
     }
     if (policies.length === 0) {
+      // A complete empty read fails; a truncated, ACL-filtered, or visibility-unproven zero-row read is an
+      // absence claim over the unread rows and renders manual (gatedFinding).
       return {
         status: "fail",
         summary: "No password_policy rows are visible; the baseline Default policy should exist, so either the policy was removed or the credential cannot read it.",
         evidence,
+        absenceClaim: true,
       };
     }
     const evaluated = policies.map((policy) => ({
@@ -1587,7 +2297,7 @@ export function assessServicenowIdentityAccessData(data: ServicenowIdentityData)
     }
     return {
       status: "pass",
-      summary: `glide.enable.password_policy=true and all ${evaluated.length} password policies meet the threshold (minimum length ${data.minPasswordLength}, upper, lower, and digit required).`,
+      summary: `glide.enable.password_policy is true and all ${evaluated.length} password policies meet the threshold (minimum length ${data.minPasswordLength}, upper, lower, and digit required).`,
       evidence,
     };
   });
@@ -1612,48 +2322,72 @@ export function assessServicenowIdentityAccessData(data: ServicenowIdentityData)
     const evidence: JsonRecord = {
       glide_authenticate_multifactor: enabled.exists ? enabled.value : null,
       email_otp_enabled: emailOtp.exists ? emailOtp.value : null,
-      admin_users: admins.length,
-      admins_without_user_mfa_flag: truncateList(adminsWithoutFlag),
       multi_factor_criteria: truncateList(criteria),
       role_based_criteria_active: activeRoleBased.length > 0,
       role_based_criteria_roles: enforcedRoles,
       elevated_roles_covered_by_criteria: elevatedCovered,
     };
+    const principals: Evaluation["principals"] = {
+      admin_users: admins.length,
+      admins_without_user_mfa_flag: truncateList(adminsWithoutFlag),
+    };
+    // Admin ratios are stated only from a complete read; a partial user or role read reports the observation without numbers.
+    const complete = tablesComplete([data.users, data.privilegedAssignments]);
+    const unflaggedAdmins = complete
+      ? `${adminsWithoutFlag.length}/${admins.length} admin users do not carry enable_multifactor_authn`
+      : "visible admin users without enable_multifactor_authn were observed (counts withheld because the user inventory was not fully read)";
+    const allAdminsFlagged = complete
+      ? `all ${admins.length} admin users carry enable_multifactor_authn`
+      : "every visible admin user carries enable_multifactor_authn (counts withheld because the user inventory was not fully read)";
+    // A property row that is absent from a partial sys_properties read may sit among the unread rows.
+    if (!enabled.exists && !tablesComplete([data.properties])) {
+      return {
+        status: "manual",
+        summary: "glide.authenticate.multifactor was not among the visible sys_properties rows and that read was partial, so the unread rows could hold it; platform MFA enablement is unknown.",
+        evidence,
+        principals,
+      };
+    }
     if (!enabled.exists || asBoolean(enabled.value) !== true) {
       return {
         status: "fail",
         summary: enabled.exists
-          ? `glide.authenticate.multifactor=${enabled.value}; platform MFA is disabled.`
+          ? `glide.authenticate.multifactor is ${enabled.value}; platform MFA is disabled.`
           : "glide.authenticate.multifactor has no sys_properties row; the documented default is false, so platform MFA is not enabled.",
         evidence,
+        principals,
       };
     }
     if (criteria.length === 0) {
       return {
         status: "manual",
-        summary: `glide.authenticate.multifactor=true, but no ${MFA_CRITERIA_TABLE} rows were visible; the baseline Role-based multi-factor authentication record always exists, so the credential cannot read the enforcement criteria and enforcement is unknown.`,
+        summary: `glide.authenticate.multifactor is true, but no ${MFA_CRITERIA_TABLE} rows were visible; the baseline Role-based multi-factor authentication record always exists, so the credential cannot read the enforcement criteria and enforcement is unknown.`,
         evidence,
+        principals,
       };
     }
     if (admins.length === 0) {
       return {
         status: "manual",
-        summary: `glide.authenticate.multifactor=true and the Role-based multi-factor authentication criteria record is ${activeRoleBased.length > 0 ? "active" : "inactive"}, but no admin users were visible to verify enforcement.`,
+        summary: `glide.authenticate.multifactor is true and the Role-based multi-factor authentication criteria record is ${activeRoleBased.length > 0 ? "active" : "inactive"}, but no admin users were visible to verify enforcement.`,
         evidence,
+        principals,
       };
     }
     if (activeRoleBased.length === 0 && !userEnforced) {
       return {
         status: "fail",
-        summary: `glide.authenticate.multifactor=true, but the Role-based multi-factor authentication criteria record is ${roleBased.length > 0 ? "inactive" : "not present among the visible criteria"} and ${adminsWithoutFlag.length}/${admins.length} admin users do not carry enable_multifactor_authn, so MFA is not enforced for administrators.`,
+        summary: `glide.authenticate.multifactor is true, but the Role-based multi-factor authentication criteria record is ${roleBased.length > 0 ? "inactive" : "not present among the visible criteria"} and ${unflaggedAdmins}, so MFA is not enforced for administrators.`,
         evidence,
+        principals,
       };
     }
     if (activeRoleBased.length === 0) {
       return {
         status: "warn",
-        summary: `glide.authenticate.multifactor=true and all ${admins.length} admin users carry enable_multifactor_authn, but the Role-based multi-factor authentication criteria record is inactive, so newly granted administrators are not enforced automatically.`,
+        summary: `glide.authenticate.multifactor is true and ${allAdminsFlagged}, but the Role-based multi-factor authentication criteria record is inactive, so newly granted administrators are not enforced automatically.`,
         evidence,
+        principals,
       };
     }
     if (!roleEnforced && !userEnforced) {
@@ -1662,25 +2396,32 @@ export function assessServicenowIdentityAccessData(data: ServicenowIdentityData)
         : "its Multi-factor Roles list was not returned by the Table API";
       return {
         status: "warn",
-        summary: `glide.authenticate.multifactor=true and the Role-based multi-factor authentication criteria record is active, but ${rolesDescription} and ${adminsWithoutFlag.length}/${admins.length} admin users do not carry enable_multifactor_authn; confirm admin and security_admin are enforced.`,
+        summary: `glide.authenticate.multifactor is true and the Role-based multi-factor authentication criteria record is active, but ${rolesDescription} and ${unflaggedAdmins}; confirm admin and security_admin are enforced.`,
         evidence,
+        principals,
       };
     }
     const enforcement = roleEnforced
       ? `the Role-based multi-factor authentication criteria record is active and covers ${elevatedCovered.join(" and ")}`
       : "the Role-based multi-factor authentication criteria record is active";
-    const perUser = userEnforced ? `; all ${admins.length} admin users also carry enable_multifactor_authn` : "";
+    const perUser = userEnforced
+      ? complete
+        ? `; all ${admins.length} admin users also carry enable_multifactor_authn`
+        : "; every visible admin user also carries enable_multifactor_authn (counts withheld because the user inventory was not fully read)"
+      : "";
     if (emailOtp.exists && asBoolean(emailOtp.value) === true) {
       return {
         status: "warn",
         summary: `MFA is enforced for administrators (${enforcement}${perUser}), but email OTP is enabled as a factor; ServiceNow hardening guidance treats email as a weak factor.`,
         evidence,
+        principals,
       };
     }
     return {
       status: "pass",
-      summary: `glide.authenticate.multifactor=true and MFA is enforced for administrators: ${enforcement}${perUser}.`,
+      summary: `glide.authenticate.multifactor is true and MFA is enforced for administrators: ${enforcement}${perUser}.`,
       evidence,
+      principals,
     };
   });
 
@@ -1715,6 +2456,14 @@ export function assessServicenowIdentityAccessData(data: ServicenowIdentityData)
       certificates_without_expiration: truncateList(undated),
     };
     if (activeSso.length === 0 && activeLdap.length === 0) {
+      // Absence is only provable on complete reads: an active provider may sit in the unread remainder.
+      if (!tablesComplete([data.ssoProviders, data.ldapServers])) {
+        return {
+          status: "manual",
+          summary: "No active SSO identity provider (sso_properties) or LDAP server (ldap_server_config) was among the visible rows, and at least one of those reads was partial, so the absence of an external identity provider cannot be asserted.",
+          evidence,
+        };
+      }
       return {
         status: "fail",
         summary: "No active SSO identity provider (sso_properties) or LDAP server (ldap_server_config) is configured; users authenticate with local passwords only.",
@@ -1748,17 +2497,25 @@ export function assessServicenowIdentityAccessData(data: ServicenowIdentityData)
     const integrationWithAdmin = assignments.filter((row) => assignmentIsIntegration(row) && ELEVATED_ROLE_NAMES.includes(rowString(row, "role.name") ?? "")).map(userLabel);
     const integrationWithPrivilege = assignments.filter(assignmentIsIntegration).map((row) => `${userLabel(row)}:${rowString(row, "role.name") ?? "role"}`);
     const evidence: JsonRecord = {
+      oauth_entities: data.oauthEntities.rows.length,
+    };
+    const principals: Evaluation["principals"] = {
       integration_users: integration.length,
       integration_user_names: truncateList(integration.map(userLabel)),
       integration_users_with_admin: [...new Set(integrationWithAdmin)],
       integration_privileged_assignments: truncateList([...new Set(integrationWithPrivilege)]),
-      oauth_entities: data.oauthEntities.rows.length,
     };
+    const complete = tablesComplete([data.users, data.privilegedAssignments, data.oauthEntities]);
+    const withheld = "counts and names are withheld because the user or role inventory was not fully read";
     if (integrationWithAdmin.length > 0) {
+      const names = [...new Set(integrationWithAdmin)];
       return {
         status: "fail",
-        summary: `${new Set(integrationWithAdmin).size} integration accounts hold admin or security_admin: ${[...new Set(integrationWithAdmin)].join(", ")}.`,
+        summary: complete
+          ? `${names.length} integration accounts hold admin or security_admin: ${names.join(", ")}.`
+          : `Among the visible rows, integration accounts hold admin or security_admin; ${withheld}.`,
         evidence,
+        principals,
       };
     }
     if (integration.length === 0) {
@@ -1766,19 +2523,26 @@ export function assessServicenowIdentityAccessData(data: ServicenowIdentityData)
         status: "manual",
         summary: `No active user is flagged web_service_access_only or internal_integration_user although ${data.oauthEntities.rows.length} OAuth application registry entries exist; integrations may be running under interactive accounts, which cannot be told apart through the API.`,
         evidence,
+        principals,
       };
     }
     if (integrationWithPrivilege.length > 0) {
       return {
         status: "warn",
-        summary: `${integration.length} integration accounts exist and none hold admin, but ${new Set(integrationWithPrivilege).size} privileged assignments (${PRIVILEGED_ROLE_NAMES.join(", ")}) belong to integration accounts.`,
+        summary: complete
+          ? `${integration.length} integration accounts exist and none hold admin, but ${new Set(integrationWithPrivilege).size} privileged assignments (${PRIVILEGED_ROLE_NAMES.join(", ")}) belong to integration accounts.`
+          : `Among the visible rows, no integration account holds admin, but privileged assignments (${PRIVILEGED_ROLE_NAMES.join(", ")}) belong to integration accounts; ${withheld}.`,
         evidence,
+        principals,
       };
     }
     return {
       status: "pass",
-      summary: `${integration.length} integration accounts are flagged web service or internal integration users and none hold a privileged role.`,
+      summary: complete
+        ? `${integration.length} integration accounts are flagged web service or internal integration users and none hold a privileged role.`
+        : `No visible integration account holds a privileged role, but the user or role inventory was not fully read, so the population is unknown.`,
       evidence,
+      principals,
     };
   });
 
@@ -1787,13 +2551,26 @@ export function assessServicenowIdentityAccessData(data: ServicenowIdentityData)
     area: "identity_access",
     title: "ServiceNow identity and access",
     summary: {
-      active_users_visible: users.length,
-      active_users_total: data.users.total ?? null,
-      admin_users: elevatedUserIds.size,
-      privileged_assignments_visible: assignments.length,
-      roles_inheriting_admin: data.roleInheritance.rows.length,
-      active_sso_providers: data.ssoProviders.rows.filter((row) => rowBoolean(row, "active") === true).length,
-      active_ldap_servers: data.ldapServers.rows.filter((row) => rowBoolean(row, "active") === true).length,
+      active_users_visible: visibleRows(data.users),
+      active_users_total: totalRows(data.users),
+      admin_users: principalCount(elevatedUserIds.size, data.users, data.privilegedAssignments),
+      privileged_assignments_visible: visibleRows(data.privilegedAssignments),
+      roles_inheriting_admin: derived(data.roleInheritance.rows.length, data.roleInheritance),
+      active_sso_providers: derived(data.ssoProviders.rows.filter((row) => rowBoolean(row, "active") === true).length, data.ssoProviders),
+      active_ldap_servers: derived(data.ldapServers.rows.filter((row) => rowBoolean(row, "active") === true).length, data.ldapServers),
+      inventories: {
+        users: describeTable(data.users),
+        privileged_assignments: describeTable(data.privilegedAssignments),
+        role_inheritance: describeTable(data.roleInheritance),
+        role_inheritance_total: describeCount(data.roleInheritanceTotal),
+        properties: describeTable(data.properties),
+        password_policies: describeTable(data.passwordPolicies),
+        sso_providers: describeTable(data.ssoProviders),
+        ldap_servers: describeTable(data.ldapServers),
+        certificates: describeTable(data.certificates),
+        oauth_entities: describeTable(data.oauthEntities),
+        mfa_criteria: describeTable(data.mfaCriteria),
+      },
       status_counts: summarizeFindingStatuses(findings),
     },
     findings,
@@ -1824,12 +2601,12 @@ export async function collectServicenowHardeningData(
 ): Promise<ServicenowHardeningData> {
   const recordLimit = clampNumber(options.recordLimit, DEFAULT_RECORD_LIMIT, 1, 500_000);
   const [properties, debugProperties, evalScripts, ipAccessRules, ipAuthenticatorPlugin, emailAccounts] = await Promise.all([
-    client.queryTable("sys_properties", { query: `nameIN${HARDENING_PROPERTY_QUERY_NAMES.join(",")}`, fields: PROPERTY_FIELDS, limit: recordLimit }),
-    client.queryTable("sys_properties", { query: "nameLIKEdebug^value=true", fields: PROPERTY_FIELDS, limit: recordLimit }),
-    client.queryTable("sys_script", { query: "active=true^scriptLIKEeval(", fields: ["sys_id", "name", "collection", "sys_updated_on"], limit: recordLimit }),
-    client.queryTable(IP_ACCESS_TABLE, { fields: IP_ACCESS_FIELDS, limit: recordLimit }),
-    client.queryTable("sys_plugins", { query: `source=${IP_AUTHENTICATOR_PLUGIN}`, fields: PLUGIN_FIELDS, limit: recordLimit }),
-    client.queryTable("sys_email_account", { fields: EMAIL_ACCOUNT_FIELDS, displayValue: true, limit: recordLimit }),
+    readTable(client, "sys_properties", { query: `nameIN${HARDENING_PROPERTY_QUERY_NAMES.join(",")}`, fields: PROPERTY_FIELDS, limit: recordLimit }),
+    readTable(client, "sys_properties", { query: "nameLIKEdebug^value=true", fields: PROPERTY_FIELDS, limit: recordLimit }),
+    readTable(client, "sys_script", { query: "active=true^scriptLIKEeval(", fields: ["sys_id", "name", "collection", "sys_updated_on"], limit: recordLimit }),
+    readTable(client, IP_ACCESS_TABLE, { fields: IP_ACCESS_FIELDS, limit: recordLimit }),
+    readTable(client, "sys_plugins", { query: `source=${IP_AUTHENTICATOR_PLUGIN}`, fields: PLUGIN_FIELDS, limit: recordLimit }),
+    readTable(client, "sys_email_account", { fields: EMAIL_ACCOUNT_FIELDS, displayValue: true, limit: recordLimit }),
   ]);
   return {
     properties,
@@ -1908,7 +2685,7 @@ export function assessServicenowPlatformHardeningData(data: ServicenowHardeningD
     if (timeout.exists && (timeoutMinutes === undefined || timeoutMinutes <= 0 || timeoutMinutes > data.maxSessionTimeoutMinutes)) {
       return {
         status: "fail",
-        summary: `glide.ui.session_timeout=${timeout.value} exceeds the ${data.maxSessionTimeoutMinutes} minute threshold or is not a positive number.`,
+        summary: `glide.ui.session_timeout is ${timeout.value}, which exceeds the ${data.maxSessionTimeoutMinutes} minute threshold or is not a positive number.`,
         evidence,
       };
     }
@@ -1922,13 +2699,13 @@ export function assessServicenowPlatformHardeningData(data: ServicenowHardeningD
     if (rotate.exists && asBoolean(rotate.value) === false) {
       return {
         status: "warn",
-        summary: `glide.ui.session_timeout=${timeoutMinutes} minutes is within the threshold, but glide.ui.rotate_sessions is false.`,
+        summary: `glide.ui.session_timeout is ${timeoutMinutes} minutes, within the threshold, but glide.ui.rotate_sessions is false.`,
         evidence,
       };
     }
     return {
       status: "pass",
-      summary: `glide.ui.session_timeout=${timeoutMinutes} minutes is within the ${data.maxSessionTimeoutMinutes} minute threshold${rotate.exists ? ` and glide.ui.rotate_sessions=${rotate.value}` : ""}.`,
+      summary: `glide.ui.session_timeout is ${timeoutMinutes} minutes, within the ${data.maxSessionTimeoutMinutes} minute threshold${rotate.exists ? `, and glide.ui.rotate_sessions is ${rotate.value}` : ""}.`,
       evidence,
     };
   });
@@ -1995,6 +2772,13 @@ export function assessServicenowPlatformHardeningData(data: ServicenowHardeningD
           evidence,
         };
       }
+      if (!pluginRow && !tablesComplete([data.ipAuthenticatorPlugin])) {
+        return {
+          status: "manual",
+          summary: `${IP_AUTHENTICATOR_PLUGIN} was not among the visible sys_plugins rows and that read was partial, so plugin activation cannot be asserted either way.`,
+          evidence,
+        };
+      }
       const pluginDescription = pluginRow ? `is ${rowString(pluginRow, "active") ?? "not active"} in sys_plugins` : "has no row in sys_plugins";
       return {
         status: "fail",
@@ -2010,6 +2794,13 @@ export function assessServicenowPlatformHardeningData(data: ServicenowHardeningD
       };
     }
     if (activeRules.length === 0) {
+      if (!tablesComplete([data.ipAccessRules])) {
+        return {
+          status: "manual",
+          summary: `${IP_AUTHENTICATOR_PLUGIN} is active and none of the visible ${IP_ACCESS_TABLE} rows is active, but that read was partial, so the absence of an active rule cannot be asserted.`,
+          evidence,
+        };
+      }
       return {
         status: "fail",
         summary: `${IP_AUTHENTICATOR_PLUGIN} is active but no active IP Address Access Control rule exists (${IP_ACCESS_TABLE} has ${rules.length} rows, none active), so administrative access is not restricted by source network.`,
@@ -2025,7 +2816,7 @@ export function assessServicenowPlatformHardeningData(data: ServicenowHardeningD
     }
     return {
       status: "pass",
-      summary: `${IP_AUTHENTICATOR_PLUGIN} is active, ${activeRules.length} active ${IP_ACCESS_TABLE} rules restrict access by source network, and glide.ip.authenticate.strict=true.`,
+      summary: `${IP_AUTHENTICATOR_PLUGIN} is active, ${activeRules.length} active ${IP_ACCESS_TABLE} rules restrict access by source network, and glide.ip.authenticate.strict is true.`,
       evidence,
     };
   });
@@ -2054,7 +2845,7 @@ export function assessServicenowPlatformHardeningData(data: ServicenowHardeningD
     if (insecure.length > 0 || smtpAuthDisabled) {
       return {
         status: "fail",
-        summary: `${insecure.length}/${smtpAccounts.length} active SMTP accounts use Connection Security = None${insecure.length > 0 ? ` (${names(insecure).join(", ")})` : ""}${smtpAuthDisabled ? " and glide.smtp.auth=false" : ""}; ServiceNow warns that None may expose data and recommends SSL/TLS.`,
+        summary: `${insecure.length}/${smtpAccounts.length} active SMTP accounts use Connection Security = None${insecure.length > 0 ? ` (${names(insecure).join(", ")})` : ""}${smtpAuthDisabled ? " and glide.smtp.auth is false" : ""}; ServiceNow warns that None may expose data and recommends SSL/TLS.`,
         evidence,
       };
     }
@@ -2081,7 +2872,7 @@ export function assessServicenowPlatformHardeningData(data: ServicenowHardeningD
     }
     return {
       status: "manual",
-      summary: `All ${smtpAccounts.length} active SMTP accounts use Connection Security = SSL/TLS${smtpAuth.exists ? ` and glide.smtp.auth=${smtpAuth.value}` : ", but glide.smtp.auth has no row"}; DKIM signing and notification security headers are not exposed through the Table API and must be confirmed manually.`,
+      summary: `All ${smtpAccounts.length} active SMTP accounts use Connection Security = SSL/TLS${smtpAuth.exists ? ` and glide.smtp.auth is ${smtpAuth.value}` : ", but glide.smtp.auth has no row"}; DKIM signing and notification security headers are not exposed through the Table API and must be confirmed manually.`,
       evidence,
     };
   });
@@ -2091,12 +2882,20 @@ export function assessServicenowPlatformHardeningData(data: ServicenowHardeningD
     area: "platform_hardening",
     title: "ServiceNow platform hardening",
     summary: {
-      hardening_properties_visible: data.properties.rows.length,
+      hardening_properties_visible: visibleRows(data.properties),
       hardening_properties_expected: HARDENING_PROPERTY_QUERY_NAMES.length,
-      enabled_debug_properties: data.debugProperties.rows.length,
-      business_rules_using_eval: data.evalScripts.rows.length,
-      active_ip_access_rules: data.ipAccessRules.rows.filter((row) => rowBoolean(row, "active") !== false).length,
-      ip_authenticator_plugin_active: data.ipAuthenticatorPlugin.rows.some((row) => pluginActive(row) === true),
+      enabled_debug_properties: derived(data.debugProperties.rows.length, data.debugProperties),
+      business_rules_using_eval: derived(data.evalScripts.rows.length, data.evalScripts),
+      active_ip_access_rules: derived(data.ipAccessRules.rows.filter((row) => rowBoolean(row, "active") !== false).length, data.ipAccessRules),
+      ip_authenticator_plugin_active: derivedFlag(data.ipAuthenticatorPlugin.rows.some((row) => pluginActive(row) === true), data.ipAuthenticatorPlugin),
+      inventories: {
+        properties: describeTable(data.properties),
+        debug_properties: describeTable(data.debugProperties),
+        eval_scripts: describeTable(data.evalScripts),
+        ip_access_rules: describeTable(data.ipAccessRules),
+        ip_authenticator_plugin: describeTable(data.ipAuthenticatorPlugin),
+        email_accounts: describeTable(data.emailAccounts),
+      },
       status_counts: summarizeFindingStatuses(findings),
     },
     findings,
@@ -2133,19 +2932,44 @@ export function buildSensitiveAclQuery(): string {
   ].join("^NQ");
 }
 
+/**
+ * SNOW-02 and SNOW-11 only ask whether an ACL carries a condition or a
+ * script, so the tenant code bodies are reduced to booleans before the
+ * snapshot is stored or exported.
+ */
+export function projectAclRow(row: JsonRecord): JsonRecord {
+  const { condition, script, ...rest } = row;
+  return { ...rest, has_condition: Boolean(asString(condition)), has_script: Boolean(asString(script)) };
+}
+
 export async function collectServicenowAccessControlData(
   client: Pick<ServicenowReadClient, "queryTable" | "countRecords">,
   options: ServicenowAccessControlOptions = {},
 ): Promise<ServicenowAccessControlData> {
   const recordLimit = clampNumber(options.recordLimit, DEFAULT_RECORD_LIMIT, 1, 500_000);
-  const acls = await client.queryTable("sys_security_acl", { query: buildSensitiveAclQuery(), fields: ACL_FIELDS, limit: recordLimit });
+  const rawAcls = await readTable(client, "sys_security_acl", { query: buildSensitiveAclQuery(), fields: ACL_FIELDS, limit: recordLimit });
+  const acls: TableSnapshot = { ...rawAcls, rows: rawAcls.rows.map(projectAclRow) };
   const aclIds = acls.rows.map((row) => rowString(row, "sys_id")).filter((item): item is string => Boolean(item));
+  // The role lookup is keyed on the ACL ids that were read. Without ids no request is issued, and the
+  // placeholder snapshot says so instead of borrowing the status code of the sys_security_acl read.
+  const skippedRoles = (reason: string, failed: boolean): TableSnapshot => ({
+    table: "sys_security_acl_role",
+    query: "sys_security_aclIN",
+    rows: [],
+    pages: 0,
+    truncated: false,
+    partial: false,
+    skipped: reason,
+    ...(failed ? { error: `not requested: ${reason}` } : {}),
+  });
   const [aclRoles, aclTotal, publicPages] = await Promise.all([
     aclIds.length > 0
-      ? client.queryTable("sys_security_acl_role", { query: `sys_security_aclIN${aclIds.join(",")}`, fields: ACL_ROLE_FIELDS, limit: recordLimit })
-      : Promise.resolve<TableSnapshot>({ table: "sys_security_acl_role", query: "sys_security_aclIN", rows: [], pages: 0, truncated: false, partial: false, ...(acls.error ? { error: `skipped because ${acls.table} failed`, statusCode: acls.statusCode } : {}) }),
+      ? readTable(client, "sys_security_acl_role", { query: `sys_security_aclIN${aclIds.join(",")}`, fields: ACL_ROLE_FIELDS, limit: recordLimit })
+      : Promise.resolve(acls.error
+        ? skippedRoles(`the ${acls.table} read failed, so there were no ACL ids to look up`, true)
+        : skippedRoles(`the ${acls.table} read returned no rows, so there were no ACL ids to look up`, false)),
     client.countRecords("sys_security_acl", "active=true^type=record"),
-    client.queryTable("sys_public", { query: "active=true", fields: ["sys_id", "page", "active", "sys_updated_on"], limit: recordLimit }),
+    readTable(client, "sys_public", { query: "active=true", fields: ["sys_id", "page", "active", "sys_updated_on"], limit: recordLimit }),
   ]);
   return { acls, aclRoles, aclTotal, publicPages };
 }
@@ -2172,8 +2996,8 @@ export function assessServicenowAccessControlData(data: ServicenowAccessControlD
   const describeAcl = (row: JsonRecord) => {
     const id = rowString(row, "sys_id") ?? "";
     const roles = rolesByAcl.get(id) ?? [];
-    const hasCondition = Boolean(rowString(row, "condition"));
-    const hasScript = Boolean(rowString(row, "script"));
+    const hasCondition = rowBoolean(row, "has_condition") ?? Boolean(rowString(row, "condition"));
+    const hasScript = rowBoolean(row, "has_script") ?? Boolean(rowString(row, "script"));
     return { label: aclLabel(row), name: rowString(row, "name") ?? "", operation: rowString(row, "operation") ?? "", roles, unrestricted: roles.length === 0 && !hasCondition && !hasScript, admin_overrides: rowBoolean(row, "admin_overrides") };
   };
   const described = data.acls.rows.map(describeAcl);
@@ -2199,6 +3023,26 @@ export function assessServicenowAccessControlData(data: ServicenowAccessControlD
         evidence,
       };
     }
+    if (described.length === 0) {
+      // A positive Aggregate count with no visible ACL row is the ACL filtering described under
+      // Limitations: the set the wildcard and unrestricted claims would be made about was not seen, so
+      // this check runs before those claims and they render null rather than 0 or []. The public pages
+      // that were seen are a presence claim and stay; a zero would be an absence claim from this
+      // untrusted view and renders null.
+      const visiblePages = publicPages.length > 0;
+      return {
+        status: "manual",
+        summary: `${proven} active record ACLs exist but none of the sensitive-table or wildcard ACLs were visible to this credential, so completeness cannot be judged${visiblePages ? `; ${publicPages.length} active public pages (${truncateList(publicPages, 8).join(", ")}) were visible and need justification` : ""}.`,
+        evidence: {
+          ...evidence,
+          wildcard_acls: null,
+          unrestricted_acls: null,
+          unrestricted_acl_count: null,
+          public_pages: visiblePages ? evidence.public_pages : null,
+          public_page_count: visiblePages ? publicPages.length : null,
+        },
+      };
+    }
     if (unrestricted.length > 0) {
       return {
         status: "fail",
@@ -2213,13 +3057,6 @@ export function assessServicenowAccessControlData(data: ServicenowAccessControlD
         evidence,
       };
     }
-    if (described.length === 0) {
-      return {
-        status: "manual",
-        summary: `${proven} active record ACLs exist but none of the sensitive-table or wildcard ACLs were visible to this credential, so completeness cannot be judged.`,
-        evidence,
-      };
-    }
     return {
       status: "pass",
       summary: `${proven} active record ACLs exist; ${described.length} ACLs on sensitive tables were reviewed, none is unrestricted, no wildcard ACL is active, and no public page is active.`,
@@ -2229,6 +3066,8 @@ export function assessServicenowAccessControlData(data: ServicenowAccessControlD
 
   const tableLevel = gatedFinding(11, [data.acls, data.aclRoles], `Open System Security > Access Control (ACL) and confirm read, write, and delete record ACLs with roles exist for ${SENSITIVE_ACL_TABLES.join(", ")}.`, () => {
     const proven = data.aclTotal.count;
+    // Per-table "no ACL" and "missing operation" claims are absence claims; on a partial ACL read they render null.
+    const complete = tablesComplete([data.acls, data.aclRoles]);
     const coverage = SENSITIVE_ACL_TABLES.map((table) => {
       const rows = described.filter((item) => item.name === table || item.name.startsWith(`${table}.`));
       const operations = new Set(rows.map((item) => item.operation));
@@ -2241,7 +3080,14 @@ export function assessServicenowAccessControlData(data: ServicenowAccessControlD
         role_protected_acls: roleProtected,
       };
     });
-    const evidence: JsonRecord = { record_acl_total: proven ?? null, sensitive_table_coverage: coverage };
+    const coverageEvidence = coverage.map((item) => ({
+      table: item.table,
+      acls: complete || item.acls > 0 ? item.acls : null,
+      operations: complete || item.operations.length > 0 ? item.operations : null,
+      missing_operations: complete ? item.missing_operations : null,
+      role_protected_acls: complete || item.role_protected_acls > 0 ? item.role_protected_acls : null,
+    }));
+    const evidence: JsonRecord = { record_acl_total: proven ?? null, sensitive_table_coverage: coverageEvidence };
     if (data.aclTotal.error || proven === undefined || proven === 0) {
       return {
         status: "manual",
@@ -2251,6 +3097,14 @@ export function assessServicenowAccessControlData(data: ServicenowAccessControlD
     }
     const uncovered = coverage.filter((item) => item.acls === 0);
     const gaps = coverage.filter((item) => item.acls > 0 && item.missing_operations.length > 0);
+    // A table with no ACL among the visible rows is an absence claim; on a partial read the unread rows could hold it.
+    if ((uncovered.length > 0 || gaps.length > 0) && !complete) {
+      return {
+        status: "manual",
+        summary: "Some sensitive tables showed no active record ACL, or no explicit read, write, or delete rule, among the visible sys_security_acl rows, but that read was partial, so the unread rows could hold them; table names and counts are withheld and coverage cannot be judged.",
+        evidence,
+      };
+    }
     if (uncovered.length > 0) {
       return {
         status: "fail",
@@ -2277,11 +3131,17 @@ export function assessServicenowAccessControlData(data: ServicenowAccessControlD
     area: "access_control",
     title: "ServiceNow access control",
     summary: {
-      record_acl_total: data.aclTotal.count ?? null,
-      sensitive_acls_visible: described.length,
-      wildcard_acls: wildcard.length,
-      unrestricted_acls: unrestricted.length,
-      public_pages: data.publicPages.rows.length,
+      record_acl_total: countValue(data.aclTotal),
+      sensitive_acls_visible: visibleRows(data.acls),
+      wildcard_acls: derived(wildcard.length, data.acls),
+      unrestricted_acls: derived(unrestricted.length, data.acls, data.aclRoles),
+      public_pages: derived(data.publicPages.rows.length, data.publicPages),
+      inventories: {
+        acls: describeTable(data.acls),
+        acl_roles: describeTable(data.aclRoles),
+        acl_total: describeCount(data.aclTotal),
+        public_pages: describeTable(data.publicPages),
+      },
       status_counts: summarizeFindingStatuses(findings),
     },
     findings,
@@ -2321,18 +3181,18 @@ export async function collectServicenowOperationsData(
     ["sys_security_acl_", "sys_user_role_", "sys_user_role_contains_", "sys_script_", "sys_script_include_", "sys_properties_"].map((prefix) => `nameSTARTSWITH${prefix}`).join("^OR"),
   ].join("^");
   const [encryptionContexts, cryptoModules, encryptedFields, auditDictionary, recentAuditCount, recentTransactionCount, updateSetsInProgress, updateSetTotal, sensitiveUpdateXml, midServers, properties, plugins] = await Promise.all([
-    client.queryTable(LEGACY_ENCRYPTION_CONTEXT_TABLE, { fields: ["sys_id", "name", "type", "sys_updated_on"], limit: recordLimit }),
-    client.queryTable(CRYPTO_MODULE_TABLE, { fields: ["sys_id", "name", "module_name", "state", "sys_scope", "sys_updated_on"], limit: recordLimit }),
-    client.queryTable("sys_dictionary", { query: "internal_type=glide_encrypted^ORinternal_type=password2", fields: ["sys_id", "name", "element", "internal_type"], limit: recordLimit }),
-    client.queryTable("sys_dictionary", { query: `internal_type=collection^nameIN${AUDITED_CRITICAL_TABLES.join(",")}`, fields: ["sys_id", "name", "audit", "attributes"], limit: recordLimit }),
+    readTable(client, LEGACY_ENCRYPTION_CONTEXT_TABLE, { fields: ["sys_id", "name", "type", "sys_updated_on"], limit: recordLimit }),
+    readTable(client, CRYPTO_MODULE_TABLE, { fields: ["sys_id", "name", "module_name", "state", "sys_scope", "sys_updated_on"], limit: recordLimit }),
+    readTable(client, "sys_dictionary", { query: "internal_type=glide_encrypted^ORinternal_type=password2", fields: ["sys_id", "name", "element", "internal_type"], limit: recordLimit }),
+    readTable(client, "sys_dictionary", { query: `internal_type=collection^nameIN${AUDITED_CRITICAL_TABLES.join(",")}`, fields: ["sys_id", "name", "audit", "attributes"], limit: recordLimit }),
     client.countRecords("sys_audit", `sys_created_on>=javascript:gs.daysAgoStart(${AUDIT_LOOKBACK_DAYS})`),
     client.countRecords("syslog_transaction", "sys_created_on>=javascript:gs.daysAgoStart(1)"),
-    client.queryTable("sys_update_set", { query: "state=in progress", fields: ["sys_id", "name", "state", "application", "sys_created_by", "sys_updated_on"], limit: recordLimit }),
+    readTable(client, "sys_update_set", { query: "state=in progress", fields: ["sys_id", "name", "state", "application", "sys_created_by", "sys_updated_on"], limit: recordLimit }),
     client.countRecords("sys_update_set"),
-    client.queryTable("sys_update_xml", { query: sensitiveXmlQuery, fields: ["sys_id", "name", "type", "target_name", "action", "update_set", "update_set.name", "sys_updated_on"], limit: recordLimit }),
-    client.queryTable("ecc_agent", { fields: ["sys_id", "name", "status", "validated", "version", "host_name", "sys_updated_on"], limit: recordLimit }),
-    client.queryTable("sys_properties", { query: `nameIN${MID_PROPERTY_NAMES.join(",")}`, fields: PROPERTY_FIELDS, limit: recordLimit }),
-    client.queryTable("sys_plugins", { fields: PLUGIN_FIELDS, limit: recordLimit }),
+    readTable(client, "sys_update_xml", { query: sensitiveXmlQuery, fields: ["sys_id", "name", "type", "target_name", "action", "update_set", "update_set.name", "sys_updated_on"], limit: recordLimit }),
+    readTable(client, "ecc_agent", { fields: ["sys_id", "name", "status", "validated", "version", "host_name", "sys_updated_on"], limit: recordLimit }),
+    readTable(client, "sys_properties", { query: `nameIN${MID_PROPERTY_NAMES.join(",")}`, fields: PROPERTY_FIELDS, limit: recordLimit }),
+    readTable(client, "sys_plugins", { fields: PLUGIN_FIELDS, limit: recordLimit }),
   ]);
   return {
     encryptionContexts: normalizeMissingTable(encryptionContexts, `${LEGACY_ENCRYPTION_CONTEXT_TABLE} (legacy Column Level Encryption contexts) does not exist on this instance`),
@@ -2521,7 +3381,7 @@ export function assessServicenowOperationsGovernanceData(data: ServicenowOperati
     if (override.exists && override.value) {
       return {
         status: "warn",
-        summary: `All ${servers.length} MID Servers are validated, but mid.version.override=${override.value} pins the version and disables automatic upgrade; ${notUp.length} are not Up.`,
+        summary: `All ${servers.length} MID Servers are validated, but mid.version.override is ${override.value}, which pins the version and disables automatic upgrade; ${notUp.length} are not Up.`,
         evidence,
       };
     }
@@ -2534,9 +3394,11 @@ export function assessServicenowOperationsGovernanceData(data: ServicenowOperati
 
   const plugins = gatedFinding(20, [data.plugins], "Open System Definition > Plugins; confirm High Security Settings, Contextual Security: Role Management V2, and Security Jump Start are active, record Instance Security Center, Security Incident Response, GRC, and Vulnerability Response status, and review every other active plugin for necessity.", () => {
     const rows = data.plugins.rows;
+    // A plugin absent from a partial sys_plugins read may sit among the unread rows, so its presence is unknown rather than false.
+    const complete = tablesComplete([data.plugins]);
     const evaluate = (definition: { key: string; pattern: RegExp; label: string }) => {
       const match = rows.find((row) => definition.pattern.test(rowString(row, "name") ?? ""));
-      return { key: definition.key, label: definition.label, present: Boolean(match), active: match ? pluginActive(match) ?? null : null };
+      return { key: definition.key, label: definition.label, present: match ? true : complete ? false : null, active: match ? pluginActive(match) ?? null : null };
     };
     const required = REQUIRED_SECURITY_PLUGINS.map(evaluate);
     const optional = OPTIONAL_SECURITY_PLUGINS.map(evaluate);
@@ -2554,6 +3416,21 @@ export function assessServicenowOperationsGovernanceData(data: ServicenowOperati
       };
     }
     const inactiveRequired = required.filter((item) => item.active !== true);
+    const observedInactive = inactiveRequired.filter((item) => item.present === true);
+    if (observedInactive.length > 0) {
+      return {
+        status: "fail",
+        summary: `${observedInactive.length} baseline security plugins are present but not active: ${observedInactive.map((item) => item.label).join(", ")}.`,
+        evidence,
+      };
+    }
+    if (inactiveRequired.length > 0 && !complete) {
+      return {
+        status: "manual",
+        summary: `${inactiveRequired.length} baseline security plugins were not among the visible sys_plugins rows and that read was partial, so the unread rows could hold them; their status is unknown.`,
+        evidence,
+      };
+    }
     if (inactiveRequired.length > 0) {
       return {
         status: "fail",
@@ -2573,13 +3450,27 @@ export function assessServicenowOperationsGovernanceData(data: ServicenowOperati
     area: "operations_governance",
     title: "ServiceNow operations governance",
     summary: {
-      encryption_contexts: data.encryptionContexts.rows.length,
-      crypto_modules: data.cryptoModules.rows.length,
-      encrypted_fields: data.encryptedFields.rows.length,
-      audit_rows_last_7_days: data.recentAuditCount.count ?? null,
-      update_sets_in_progress: data.updateSetsInProgress.rows.length,
-      mid_servers: data.midServers.rows.length,
-      plugins_visible: data.plugins.rows.length,
+      encryption_contexts: derived(data.encryptionContexts.rows.length, data.encryptionContexts),
+      crypto_modules: derived(data.cryptoModules.rows.length, data.cryptoModules),
+      encrypted_fields: derived(data.encryptedFields.rows.length, data.encryptedFields),
+      audit_rows_last_7_days: countValue(data.recentAuditCount),
+      update_sets_in_progress: derived(data.updateSetsInProgress.rows.length, data.updateSetsInProgress),
+      mid_servers: derived(data.midServers.rows.length, data.midServers),
+      plugins_visible: visibleRows(data.plugins),
+      inventories: {
+        encryption_contexts: describeTable(data.encryptionContexts),
+        crypto_modules: describeTable(data.cryptoModules),
+        encrypted_fields: describeTable(data.encryptedFields),
+        audit_dictionary: describeTable(data.auditDictionary),
+        recent_audit_count: describeCount(data.recentAuditCount),
+        recent_transaction_count: describeCount(data.recentTransactionCount),
+        update_sets_in_progress: describeTable(data.updateSetsInProgress),
+        update_set_total: describeCount(data.updateSetTotal),
+        sensitive_update_xml: describeTable(data.sensitiveUpdateXml),
+        mid_servers: describeTable(data.midServers),
+        mid_properties: describeTable(data.properties),
+        plugins: describeTable(data.plugins),
+      },
       status_counts: summarizeFindingStatuses(findings),
     },
     findings,
@@ -2631,7 +3522,7 @@ async function probeSurface(
   surface: { name: string; table: string },
 ): Promise<ServicenowAccessSurface> {
   const [snapshot, count] = await Promise.all([
-    client.queryTable(surface.table, { fields: ["sys_id"], limit: 1, pageSize: 1 }),
+    readTable(client, surface.table, { fields: ["sys_id"], limit: 1, pageSize: 1 }),
     client.countRecords(surface.table),
   ]);
   const total = count.count ?? snapshot.total;
@@ -2640,8 +3531,9 @@ async function probeSurface(
       name: surface.name,
       table: surface.table,
       status: snapshot.statusCode === 401 || snapshot.statusCode === 403 ? "forbidden" : "not_readable",
-      total,
-      error: snapshot.error,
+      ...(total !== undefined ? { total } : {}),
+      ...(snapshot.statusCode !== undefined ? { http_status: snapshot.statusCode } : {}),
+      error: count.error ? `${snapshot.error}; aggregate count also failed (${count.error})` : snapshot.error,
     };
   }
   if (snapshot.rows.length === 0 && total !== undefined && total > 0) {
@@ -2661,7 +3553,7 @@ export async function checkServicenowAccess(
   client: Pick<ServicenowReadClient, "getResolvedConfig" | "queryTable" | "countRecords">,
 ): Promise<ServicenowAccessCheckResult> {
   const config = client.getResolvedConfig();
-  const whoami = await client.queryTable("sys_user", { query: "sys_id=javascript:gs.getUserID()", fields: ["user_name", "name"], limit: 1, pageSize: 1 });
+  const whoami = await readTable(client, "sys_user", { query: "sys_id=javascript:gs.getUserID()", fields: ["user_name", "name"], limit: 1, pageSize: 1 });
   const identity = whoami.rows[0] ? rowString(whoami.rows[0], "user_name") ?? rowString(whoami.rows[0], "name") : undefined;
   const surfaces = await Promise.all(ACCESS_SURFACES.map((surface) => probeSurface(client, surface)));
   const readable = surfaces.filter((surface) => surface.status === "readable");
@@ -2865,9 +3757,9 @@ function buildQuickReference(): string {
     "",
     "## Layout",
     "",
-    "- `core_data/`: raw Table API and Aggregate API snapshots (rows, X-Total-Count, pagination, and errors)",
+    "- `core_data/`: projected Table API and Aggregate API snapshots (rows, X-Total-Count, pagination); a dataset that was denied, errored, unavailable, or never requested is written as `{ collected: false, status, endpoint, error }` instead of an empty row list, so `rows: []` always means a readable table with no matching rows",
     "- `analysis/findings.json`: normalized findings with framework mappings",
-    "- `analysis/<area>.json`: per-area assessment results and collection issues",
+    "- `analysis/<area>.json`: per-area assessment results, an `inventories` map stating each table read as complete, partial, unread, unavailable, or not requested, and collection issues; counts derived from an unread or partial table render null",
     "- `analysis/summary.json`: status counts and run metadata",
     "- `compliance/executive_summary.md`: prioritized findings and manual evidence list",
     "- `compliance/unified_compliance_matrix.md`: all controls against all frameworks",
@@ -2907,41 +3799,43 @@ export async function exportServicenowAuditBundle(
   ensurePrivateDir(outputRoot);
   const outputDir = await nextAvailableAuditDir(outputRoot, `${safeDirName(config.instanceName)}-audit-bundle`);
 
+  // Every table or aggregate dataset passes through tableCoreData or countCoreData, so a denied, errored,
+  // unavailable, or skipped read is written as a not-collected marker rather than as an empty snapshot.
   const coreDataFiles: Array<[string, unknown]> = [
     ["core_data/access_check.json", access],
-    ["core_data/sys_user.json", identityData.users],
-    ["core_data/sys_user_has_role_privileged.json", identityData.privilegedAssignments],
-    ["core_data/sys_user_role_contains.json", identityData.roleInheritance],
-    ["core_data/sys_user_role_contains_count.json", identityData.roleInheritanceTotal],
-    ["core_data/sys_properties_identity.json", identityData.properties],
-    ["core_data/password_policy.json", identityData.passwordPolicies],
-    ["core_data/sso_properties.json", identityData.ssoProviders],
-    ["core_data/ldap_server_config.json", identityData.ldapServers],
-    ["core_data/sys_certificate.json", identityData.certificates],
-    ["core_data/oauth_entity.json", identityData.oauthEntities],
-    ["core_data/multi_factor_criteria.json", identityData.mfaCriteria],
-    ["core_data/sys_properties_hardening.json", hardeningData.properties],
-    ["core_data/sys_properties_debug.json", hardeningData.debugProperties],
-    ["core_data/sys_script_eval.json", hardeningData.evalScripts],
-    ["core_data/ip_access.json", hardeningData.ipAccessRules],
-    ["core_data/sys_plugins_ip_authenticator.json", hardeningData.ipAuthenticatorPlugin],
-    ["core_data/sys_email_account.json", hardeningData.emailAccounts],
-    ["core_data/sys_security_acl.json", accessControlData.acls],
-    ["core_data/sys_security_acl_role.json", accessControlData.aclRoles],
-    ["core_data/sys_security_acl_count.json", accessControlData.aclTotal],
-    ["core_data/sys_public.json", accessControlData.publicPages],
-    ["core_data/sys_encryption_context.json", operationsData.encryptionContexts],
-    ["core_data/sys_kmf_crypto_module.json", operationsData.cryptoModules],
-    ["core_data/sys_dictionary_encrypted.json", operationsData.encryptedFields],
-    ["core_data/sys_dictionary_audit.json", operationsData.auditDictionary],
-    ["core_data/sys_audit_count.json", operationsData.recentAuditCount],
-    ["core_data/syslog_transaction_count.json", operationsData.recentTransactionCount],
-    ["core_data/sys_update_set_in_progress.json", operationsData.updateSetsInProgress],
-    ["core_data/sys_update_set_count.json", operationsData.updateSetTotal],
-    ["core_data/sys_update_xml_sensitive.json", operationsData.sensitiveUpdateXml],
-    ["core_data/ecc_agent.json", operationsData.midServers],
-    ["core_data/sys_properties_mid.json", operationsData.properties],
-    ["core_data/sys_plugins.json", operationsData.plugins],
+    ["core_data/sys_user.json", tableCoreData(identityData.users)],
+    ["core_data/sys_user_has_role_privileged.json", tableCoreData(identityData.privilegedAssignments)],
+    ["core_data/sys_user_role_contains.json", tableCoreData(identityData.roleInheritance)],
+    ["core_data/sys_user_role_contains_count.json", countCoreData(identityData.roleInheritanceTotal)],
+    ["core_data/sys_properties_identity.json", tableCoreData(identityData.properties)],
+    ["core_data/password_policy.json", tableCoreData(identityData.passwordPolicies)],
+    ["core_data/sso_properties.json", tableCoreData(identityData.ssoProviders)],
+    ["core_data/ldap_server_config.json", tableCoreData(identityData.ldapServers)],
+    ["core_data/sys_certificate.json", tableCoreData(identityData.certificates)],
+    ["core_data/oauth_entity.json", tableCoreData(identityData.oauthEntities)],
+    ["core_data/multi_factor_criteria.json", tableCoreData(identityData.mfaCriteria)],
+    ["core_data/sys_properties_hardening.json", tableCoreData(hardeningData.properties)],
+    ["core_data/sys_properties_debug.json", tableCoreData(hardeningData.debugProperties)],
+    ["core_data/sys_script_eval.json", tableCoreData(hardeningData.evalScripts)],
+    ["core_data/ip_access.json", tableCoreData(hardeningData.ipAccessRules)],
+    ["core_data/sys_plugins_ip_authenticator.json", tableCoreData(hardeningData.ipAuthenticatorPlugin)],
+    ["core_data/sys_email_account.json", tableCoreData(hardeningData.emailAccounts)],
+    ["core_data/sys_security_acl.json", tableCoreData(accessControlData.acls)],
+    ["core_data/sys_security_acl_role.json", tableCoreData(accessControlData.aclRoles)],
+    ["core_data/sys_security_acl_count.json", countCoreData(accessControlData.aclTotal)],
+    ["core_data/sys_public.json", tableCoreData(accessControlData.publicPages)],
+    ["core_data/sys_encryption_context.json", tableCoreData(operationsData.encryptionContexts)],
+    ["core_data/sys_kmf_crypto_module.json", tableCoreData(operationsData.cryptoModules)],
+    ["core_data/sys_dictionary_encrypted.json", tableCoreData(operationsData.encryptedFields)],
+    ["core_data/sys_dictionary_audit.json", tableCoreData(operationsData.auditDictionary)],
+    ["core_data/sys_audit_count.json", countCoreData(operationsData.recentAuditCount)],
+    ["core_data/syslog_transaction_count.json", countCoreData(operationsData.recentTransactionCount)],
+    ["core_data/sys_update_set_in_progress.json", tableCoreData(operationsData.updateSetsInProgress)],
+    ["core_data/sys_update_set_count.json", countCoreData(operationsData.updateSetTotal)],
+    ["core_data/sys_update_xml_sensitive.json", tableCoreData(operationsData.sensitiveUpdateXml)],
+    ["core_data/ecc_agent.json", tableCoreData(operationsData.midServers)],
+    ["core_data/sys_properties_mid.json", tableCoreData(operationsData.properties)],
+    ["core_data/sys_plugins.json", tableCoreData(operationsData.plugins)],
   ];
   for (const [pathname, value] of coreDataFiles) {
     await writeSecureTextFile(outputDir, pathname, serializeJson(value));
@@ -3000,6 +3894,7 @@ function normalizeAuthArgs(args: unknown): AuthArgs {
     client_id: asString(value.client_id),
     client_secret: asString(value.client_secret),
     access_token: asString(value.access_token),
+    refresh_token: asString(value.refresh_token),
     config_file: asString(value.config_file),
     timeout_seconds: asNumber(value.timeout_seconds),
     max_retries: asNumber(value.max_retries),
@@ -3075,6 +3970,7 @@ const authParams = {
   client_id: Type.Optional(Type.String({ description: "OAuth application registry client ID. Defaults to SERVICENOW_CLIENT_ID." })),
   client_secret: Type.Optional(Type.String({ description: "OAuth application registry client secret. Defaults to SERVICENOW_CLIENT_SECRET." })),
   access_token: Type.Optional(Type.String({ description: "Pre-issued OAuth bearer token. Defaults to SERVICENOW_ACCESS_TOKEN." })),
+  refresh_token: Type.Optional(Type.String({ description: "OAuth refresh token issued earlier to the client; with client_id and client_secret the first token exchange uses the refresh_token grant. Defaults to SERVICENOW_REFRESH_TOKEN." })),
   config_file: Type.Optional(Type.String({ description: "YAML config file. Defaults to SERVICENOW_CONFIG_FILE, ./.servicenow.yaml, or ~/.servicenow-sec-inspector/config.yaml." })),
   timeout_seconds: Type.Optional(Type.Number({ description: "HTTP timeout in seconds. Defaults to 30.", default: 30 })),
   max_retries: Type.Optional(Type.Number({ description: "Retries for 429 and 5xx responses. Defaults to 3.", default: 3 })),
