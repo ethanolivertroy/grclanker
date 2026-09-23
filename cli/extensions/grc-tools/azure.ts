@@ -875,7 +875,7 @@ function observedRequestUrl(error: unknown): string | undefined {
   return redactErrorText(error.url.split("?")[0]);
 }
 
-/** Why a server-supplied link is not followed. Each class renders as fixed text that never carries the link. */
+/** Why a server-supplied link is not followed. Each class renders as text that names the origins involved and never the link. */
 type NextLinkRefusal = "foreign_origin" | "userinfo" | "unparseable";
 
 /**
@@ -898,11 +898,46 @@ function nextLinkRefusal(target: string, base: string): NextLinkRefusal | undefi
   return undefined;
 }
 
-const NEXT_LINK_REFUSAL_NOTES: Readonly<Record<NextLinkRefusal, string>> = Object.freeze({
-  foreign_origin: "the API advertised a next page on another origin (scheme, host, or port), so the link was not followed and no request was made for it",
-  userinfo: "the API advertised a next page link carrying userinfo, so the link was not followed and no request was made for it",
-  unparseable: "the API advertised a next page link that could not be parsed, so the link was not followed and no request was made for it",
-});
+/**
+ * The origin `target` names once resolved against `base`, as scheme, host, and port (`https://graph.microsoft.com:8443`)
+ * or as the bare scheme of a URL without a host (`javascript:`, `data:`); undefined when it does not parse.
+ */
+function originLabel(target: string, base?: string): string | undefined {
+  try {
+    const url = new URL(target, base);
+    return url.host.length > 0 ? `${url.protocol}//${url.host}` : url.protocol;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * The truncation reason recorded for a refused next link (harness revision 3, class 8): it names the configured
+ * origin and, when the link resolved onto another one, that origin too (scheme, host, and port, or the bare
+ * scheme of a `javascript:` or `data:` link), so the operator can see where the API tried to send the client.
+ * Never the link itself: no path, query, fragment, or userinfo is recorded. A link on another origin and a
+ * link with userinfo both parsed against the configured base (that is how they were classified), so their
+ * origins are known; the unparseable class has no origin of its own to name.
+ */
+function nextLinkRefusalNote(refusal: NextLinkRefusal, target: string, base: string): string {
+  const configuredOrigin = originLabel(base);
+  const configured = configuredOrigin === undefined ? "the configured origin" : `the configured origin ${configuredOrigin}`;
+  switch (refusal) {
+    case "foreign_origin":
+      return `the API advertised a next page on ${originLabel(target, base) ?? "another origin"} rather than ${configured}, so the link was not followed and no request was made for it`;
+    case "userinfo": {
+      const linkOrigin = originLabel(target, base);
+      const where = linkOrigin === undefined || linkOrigin === configuredOrigin ? configured : `${linkOrigin} rather than ${configured}`;
+      return `the API advertised a next page link carrying userinfo for ${where}, so the link was not followed and no request was made for it`;
+    }
+    case "unparseable":
+      return `the API advertised a next page link that could not be parsed against ${configured}, so the link was not followed and no request was made for it`;
+    default: {
+      const exhaustive: never = refusal;
+      return exhaustive;
+    }
+  }
+}
 
 /** Rendering of a request refused by the same-origin rule before it was made; the target itself is never recorded. */
 const REQUEST_REFUSED_NOTE = "Request refused: the target is not on the configured origin, so no request was made.";
@@ -1633,7 +1668,7 @@ export class AzureAuditorClient {
       if (!nextLink) break;
       const refusal = nextLinkRefusal(nextLink, base);
       if (refusal) {
-        return { items: items.slice(0, limit), truncated: true, seen: Math.min(items.length, limit), total, truncation: NEXT_LINK_REFUSAL_NOTES[refusal] };
+        return { items: items.slice(0, limit), truncated: true, seen: Math.min(items.length, limit), total, truncation: nextLinkRefusalNote(refusal, nextLink, base) };
       }
       // Passed the rule, so it resolves onto the configured base (a relative link becomes absolute there).
       nextUrl = new URL(nextLink, base).toString();
@@ -3442,6 +3477,21 @@ export function azureFixedTexts(): readonly string[] {
     manualForError("AZURE-DP-06", 20, "Inbox forwarding rules", "high", MESSAGE_RULES_ENDPOINT, MAILBOX_RULES_PERMISSION, "the inbox rule export for every mailbox", mailboxDenied, AZURE_ENDPOINT_DOCS.messageRules, errors),
   ];
   const surfaceNames = ["organization", "conditional_access", "directory_roles", "secure_scores", "defender_pricings", "role_assignments", "diagnostic_settings", "security_contacts"];
+  // Refused next links rendered for every origin shape the rule can meet: another host, port, or scheme, a
+  // scheme without a host, an IP literal, userinfo on the configured host and on another, and a link that
+  // does not parse. The link's path, query, fragment, and userinfo never reach the note. The first entry is
+  // the foreign-host note and the sixth the userinfo note, reused by the partial and probe renderings below.
+  const graphBase = "https://graph.microsoft.com";
+  const refusalNotes = [
+    nextLinkRefusalNote("foreign_origin", "https://evil.example/v1.0/identity/conditionalAccess/policies?$skiptoken=next-page", graphBase),
+    nextLinkRefusalNote("foreign_origin", "https://graph.microsoft.com:8443/v1.0/identity/conditionalAccess/policies", graphBase),
+    nextLinkRefusalNote("foreign_origin", "http://graph.microsoft.com/v1.0/identity/conditionalAccess/policies", graphBase),
+    nextLinkRefusalNote("foreign_origin", "javascript:alert(1)", graphBase),
+    nextLinkRefusalNote("foreign_origin", "https://[::1]:8443/v1.0/identity/conditionalAccess/policies", graphBase),
+    nextLinkRefusalNote("userinfo", "https://svc:placeholder@graph.microsoft.com/v1.0/identity/conditionalAccess/policies", graphBase),
+    nextLinkRefusalNote("userinfo", "https://svc:placeholder@evil.example/v1.0/identity/conditionalAccess/policies", graphBase),
+    nextLinkRefusalNote("unparseable", "https://[bad/v1.0/identity/conditionalAccess/policies", graphBase),
+  ];
   return Object.freeze([
     PARSE_ERROR_NOTE,
     describeErrorBody(html, "text/html; charset=utf-8"),
@@ -3475,12 +3525,12 @@ export function azureFixedTexts(): readonly string[] {
     "not attempted: this client does not expose listNetworkWatchers, so no request was made.",
     partialNote({ items: [], seen: 100, total: undefined, truncated: true }, "Conditional Access policies").trim(),
     partialNote({ items: [], seen: 25, total: 40, truncated: true }, "role assignments").trim(),
-    ...Object.values(NEXT_LINK_REFUSAL_NOTES),
+    ...refusalNotes,
     REQUEST_REFUSED_NOTE,
-    partialNote({ items: [], seen: 5, total: undefined, truncated: true, truncation: NEXT_LINK_REFUSAL_NOTES.foreign_origin }, "Conditional Access policies").trim(),
+    partialNote({ items: [], seen: 5, total: undefined, truncated: true, truncation: refusalNotes[0] }, "Conditional Access policies").trim(),
     ...truncatedProbeNotes([
-      { name: "conditional_access", service: "graph", status: "readable", count: 5, truncated: true, truncation: NEXT_LINK_REFUSAL_NOTES.foreign_origin },
-      { name: "role_assignments", service: "arm", status: "readable", count: 1, truncated: true, truncation: NEXT_LINK_REFUSAL_NOTES.userinfo },
+      { name: "conditional_access", service: "graph", status: "readable", count: 5, truncated: true, truncation: refusalNotes[0] },
+      { name: "role_assignments", service: "arm", status: "readable", count: 1, truncated: true, truncation: refusalNotes[5] },
     ]),
     "Member inventory is partial; verdict capped at warn.",
     "6/8 Azure audit surfaces are readable.",

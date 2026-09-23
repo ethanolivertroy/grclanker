@@ -499,16 +499,38 @@ const NEXT_LINK_PATH_CANARY = "Hq7vTm3KpXw9ZbLn2Rf";
 const NEXT_LINK_QUERY_CANARY = "Wn4kJd8VqRz2TxPy6Mc";
 const NEXT_LINK_USERINFO_CANARY = "Fy9bNs2LtKp7WqXm4Vd";
 const FOREIGN_PAGE_ITEM_CANARY = "Zc3tRv8HnQm5KwYp7Lb";
-const NEXT_LINK_PATH_NAME = "offsite-hop-segment";
-const NEXT_LINK_QUERY_NAME = "offsite-query-marker";
+// Name-shaped and sharing no window with the origins the refusal reason names (the reason names the link's origin,
+// never its path or query).
+const NEXT_LINK_PATH_NAME = "planted-hop-segment";
+const NEXT_LINK_QUERY_NAME = "planted-query-marker";
 const NEXT_LINK_CANARIES = Object.freeze([NEXT_LINK_PATH_CANARY, NEXT_LINK_QUERY_CANARY, NEXT_LINK_USERINFO_CANARY, FOREIGN_PAGE_ITEM_CANARY, NEXT_LINK_PATH_NAME, NEXT_LINK_QUERY_NAME]);
 const FOREIGN_NEXT_HOST = "offsite.example.net";
 const AZURE_CONFIGURED_ORIGINS = new Set(["https://login.microsoftonline.com", "https://graph.microsoft.com", "https://management.azure.com"]);
+const NEXT_LINK_REFUSED_TAIL = "so the link was not followed and no request was made for it";
+
+function escapeRegExp(text) {
+  return text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
 
 /**
- * Every shape a server-supplied next link can take off the configured origin, each with the refusal class its
- * truncation reason must name, plus the two same-origin controls (absolute, and relative to the base) that must
- * still be followed. `legitUrl` is the first page's URL; `extraQuery` carries ARM's api-version.
+ * The truncation reason for a link that resolved onto `origin` off the `configured` one: it names both origins
+ * (harness revision 3, class 8), so the operator sees where the API tried to send the client, and nothing else of
+ * the link.
+ */
+function foreignOriginReason(origin, configured) {
+  return new RegExp(`^the API advertised a next page on ${escapeRegExp(origin)} rather than the configured origin ${escapeRegExp(configured)}, ${escapeRegExp(NEXT_LINK_REFUSED_TAIL)}$`);
+}
+function userinfoReason(configured) {
+  return new RegExp(`^the API advertised a next page link carrying userinfo for the configured origin ${escapeRegExp(configured)}, ${escapeRegExp(NEXT_LINK_REFUSED_TAIL)}$`);
+}
+function unparseableReason(configured) {
+  return new RegExp(`^the API advertised a next page link that could not be parsed against the configured origin ${escapeRegExp(configured)}, ${escapeRegExp(NEXT_LINK_REFUSED_TAIL)}$`);
+}
+
+/**
+ * Every shape a server-supplied next link can take off the configured origin, each with the refusal reason its
+ * truncation must carry, plus the two same-origin controls (absolute, and relative to the base) that must still
+ * be followed. `legitUrl` is the first page's URL; `extraQuery` carries ARM's api-version.
  */
 function nextLinkVariants(legitUrl, queryKey, extraQuery = "") {
   const legit = new URL(legitUrl);
@@ -516,16 +538,19 @@ function nextLinkVariants(legitUrl, queryKey, extraQuery = "") {
   const query = `${queryKey}=${NEXT_LINK_QUERY_CANARY}&hop=${NEXT_LINK_QUERY_NAME}${extraQuery}`;
   return {
     refused: {
-      host: [`https://${FOREIGN_NEXT_HOST}${path}?${query}`, /another origin \(scheme, host, or port\)/],
-      port: [`${legit.protocol}//${legit.hostname}:8443${path}?${query}`, /another origin \(scheme, host, or port\)/],
-      scheme: [`http://${legit.hostname}${path}?${query}`, /another origin \(scheme, host, or port\)/],
-      userinfo: [`https://intruder:${NEXT_LINK_USERINFO_CANARY}@${legit.hostname}${path}?${query}`, /carrying userinfo/],
-      protocol_relative: [`//${FOREIGN_NEXT_HOST}${path}?${query}`, /another origin \(scheme, host, or port\)/],
-      unparseable: [`https://[${NEXT_LINK_PATH_CANARY}${path}?${query}`, /could not be parsed/],
+      host: [`https://${FOREIGN_NEXT_HOST}${path}?${query}`, foreignOriginReason(`https://${FOREIGN_NEXT_HOST}`, legit.origin)],
+      port: [`${legit.protocol}//${legit.hostname}:8443${path}?${query}`, foreignOriginReason(`${legit.protocol}//${legit.hostname}:8443`, legit.origin)],
+      scheme: [`http://${legit.hostname}${path}?${query}`, foreignOriginReason(`http://${legit.hostname}`, legit.origin)],
+      userinfo: [`https://intruder:${NEXT_LINK_USERINFO_CANARY}@${legit.hostname}${path}?${query}`, userinfoReason(legit.origin)],
+      protocol_relative: [`//${FOREIGN_NEXT_HOST}${path}?${query}`, foreignOriginReason(`https://${FOREIGN_NEXT_HOST}`, legit.origin)],
+      unparseable: [`https://[${NEXT_LINK_PATH_CANARY}${path}?${query}`, unparseableReason(legit.origin)],
     },
     followed: {
       absolute_same_origin: `${legit.origin}${legit.pathname}?${queryKey}=ctrl-page-2${extraQuery}`,
       relative_same_origin: `${legit.pathname}?${queryKey}=ctrl-page-2${extraQuery}`,
+      // The URL parser reads the scheme and the host case-insensitively, so these name the configured origin too.
+      uppercase_scheme_same_origin: `${legit.origin.toUpperCase()}${legit.pathname}?${queryKey}=ctrl-page-2${extraQuery}`,
+      case_differing_host_same_origin: `${legit.protocol}//${legit.hostname.toUpperCase()}${legit.pathname}?${queryKey}=ctrl-page-2${extraQuery}`,
     },
   };
 }
@@ -579,10 +604,9 @@ test("rule 9: a next link that leaves the configured origin is refused before an
       assert.deepEqual(page.items.map((item) => item.id), ["page-1-item"], `${label}: the inventory is the first page only, nothing merged from the link`);
       assert.equal(page.truncated, true, `${label}: the walk is reported truncated`);
       assert.equal(page.seen, 1, `${label}: seen counts the first page`);
-      assert.match(page.truncation ?? "", reason, `${label}: the truncation reason names the refusal class`);
-      assert.match(page.truncation, /not followed and no request was made for it/, `${label}: the reason states that no request left`);
+      assert.match(page.truncation ?? "", reason, `${label}: the truncation reason names the origins involved and states that no request left`);
       assertNoCanaryWindows(assert, page, NEXT_LINK_CANARIES, `${label} page`);
-      assert.ok(!JSON.stringify(page).includes(FOREIGN_NEXT_HOST), `${label}: the reason is fixed text without the link's host`);
+      assert.ok(!JSON.stringify({ ...page, truncation: undefined }).includes(FOREIGN_NEXT_HOST), `${label}: outside the reason, nothing names the link's host`);
     }
     for (const [variant, link] of Object.entries(variants.followed)) {
       const label = `${walk} (${variant})`;
@@ -591,6 +615,7 @@ test("rule 9: a next link that leaves the configured origin is refused before an
       const page = await list(client);
       assert.equal(calls.length, 2, `${label}: the same-origin control page is followed`);
       assert.equal(new URL(calls[1].url).origin, new URL(firstPage).origin, `${label}: the control request stays on the configured origin`);
+      assert.equal(new URL(calls[1].url).pathname, new URL(firstPage).pathname, `${label}: the control link is requested as the URL it is`);
       assert.equal(new URL(calls[1].url).searchParams.get("$skiptoken"), "ctrl-page-2", `${label}: the control link is requested as served (a relative link resolves onto the base)`);
       assert.deepEqual(page.items.map((item) => item.id), ["page-1-item", "ctrl-page-2-item"], `${label}: both pages are merged`);
       assert.equal(page.truncated, false, `${label}: a complete same-origin walk is not truncated`);
@@ -643,33 +668,37 @@ test("rule 9: a refused next link on a probed surface leaves the access check, t
   assert.equal(conditionalAccess.status, "readable");
   assert.equal(conditionalAccess.count, 5, "the probe count is the first page, a floor");
   assert.equal(conditionalAccess.truncated, true);
-  assert.match(conditionalAccess.truncation, /another origin \(scheme, host, or port\)/);
+  const graphReason = `the API advertised a next page on https://${FOREIGN_NEXT_HOST} rather than the configured origin https://graph.microsoft.com, ${NEXT_LINK_REFUSED_TAIL}`;
+  const armReason = `the API advertised a next page link carrying userinfo for the configured origin https://management.azure.com, ${NEXT_LINK_REFUSED_TAIL}`;
+  assert.equal(conditionalAccess.truncation, graphReason);
   const roleAssignments = access.surfaces.find((entry) => entry.name === "role_assignments");
   assert.deepEqual({ status: roleAssignments.status, count: roleAssignments.count, truncated: roleAssignments.truncated }, { status: "readable", count: 1, truncated: true });
-  assert.match(roleAssignments.truncation, /carrying userinfo/);
-  assert.ok(access.notes.some((note) => /Probe counts for conditional_access are lower bounds, not inventory sizes: the API advertised a next page on another origin/.test(note)), `the access note carries the reason: ${JSON.stringify(access.notes)}`);
-  assert.ok(access.notes.some((note) => /Probe counts for role_assignments are lower bounds, not inventory sizes: the API advertised a next page link carrying userinfo/.test(note)));
+  assert.equal(roleAssignments.truncation, armReason);
+  assert.ok(access.notes.some((note) => note.includes(`Probe counts for conditional_access are lower bounds, not inventory sizes: ${graphReason}`)), `the access note carries the reason: ${JSON.stringify(access.notes)}`);
+  assert.ok(access.notes.some((note) => note.includes(`Probe counts for role_assignments are lower bounds, not inventory sizes: ${armReason}`)), `the access note carries the userinfo reason: ${JSON.stringify(access.notes)}`);
   assert.ok(!access.notes.some((note) => /probe page cap/.test(note)), "a refused link is not described as a page cap");
   assertNoCanaryWindows(assert, access, NEXT_LINK_CANARIES, "check_access");
 
   const identity = assessments.find((assessment) => assessment.findings.some((item) => item.id === "AZURE-ID-01"));
   const mfaBaseline = identity.findings.find((item) => item.id === "AZURE-ID-01");
   assert.equal(mfaBaseline.status, "warn", "a verdict over the truncated page is capped at warn");
-  assert.match(mfaBaseline.summary, /Inventory of Conditional Access policies is partial \(5 seen of unknown total; the API advertised a next page on another origin/);
+  assert.ok(mfaBaseline.summary.includes(`Inventory of Conditional Access policies is partial (5 seen of unknown total; ${graphReason}`), `the summary carries the reason: ${mfaBaseline.summary}`);
   assert.deepEqual({ seen: mfaBaseline.evidence.seen, truncated: mfaBaseline.evidence.truncated }, { seen: 5, truncated: true });
-  assert.match(mfaBaseline.evidence.truncation, /another origin/);
+  assert.equal(mfaBaseline.evidence.truncation, graphReason);
   const guardrails = assessments.find((assessment) => assessment.findings.some((item) => item.id === "AZURE-SUB-01"));
   const owners = guardrails.findings.find((item) => item.id === "AZURE-SUB-01");
   assert.equal(owners.status, "warn");
-  assert.match(owners.summary, /partial \(1 seen of unknown total; the API advertised a next page link carrying userinfo/);
+  assert.ok(owners.summary.includes(`partial (1 seen of unknown total; ${armReason}`), `the summary carries the userinfo reason: ${owners.summary}`);
   for (const assessment of assessments) assertNoCanaryWindows(assert, assessment, NEXT_LINK_CANARIES, assessment.title);
 
   const files = readBundleFiles(exported.outputDir);
   assertNoCanaryWindowsInFiles(assert, files, NEXT_LINK_CANARIES, "bundle");
   assertNoCanaryWindowsInFiles(assert, readZipEntries(exported.zipPath), NEXT_LINK_CANARIES, "zip");
   const allText = [...files.values()].join("\n");
-  assert.ok(!allText.includes(FOREIGN_NEXT_HOST), "the bundle never names the link's host");
-  assert.match(allText, /the API advertised a next page on another origin/, "the bundle records the refusal as the truncation reason");
+  const hostMentions = allText.split(FOREIGN_NEXT_HOST).length - 1;
+  const reasonMentions = allText.split(`on https://${FOREIGN_NEXT_HOST} rather than the configured origin https://graph.microsoft.com`).length - 1;
+  assert.ok(hostMentions > 0 && hostMentions === reasonMentions, `the bundle names the link's host only as the origin inside the refusal reason, never as a link (${hostMentions} mentions, ${reasonMentions} in reasons)`);
+  assert.ok(allText.includes(graphReason), "the bundle records the refusal as the truncation reason");
 });
 
 test("rule 9: API error bodies are reduced to the documented error envelope before they reach messages, evidence, or logs", async () => {
