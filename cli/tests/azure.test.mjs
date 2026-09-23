@@ -803,7 +803,9 @@ test("rule 9 fixed texts (GWS note 1): every fixed-text message the integration 
   }
   assert.ok(texts.some((text) => HTML_BODY_NOTE.test(text)), "the fixed-text list carries the non-JSON body note");
   assert.ok(texts.some((text) => /^POST \/tenant-123\/oauth2\/v2\.0\/token returned 403 Forbidden, so no Azure Resource Manager request was made for this finding\./.test(text)), "the token-failure finding summary is in the list");
-  assert.ok(texts.some((text) => /^AZURE-ID-01 POST \/tenant-123\/oauth2\/v2\.0\/token: 401 Unauthorized; no Microsoft Graph request was made$/.test(text)), "the token-failure error-log line is in the list");
+  // The token endpoint path ends in `token`, so the status is joined by "returned" rather than a colon: a
+  // `path: value` pair with a credential-named last segment loses its value to the error sink (harness revision 3).
+  assert.ok(texts.some((text) => /^AZURE-ID-01 POST \/tenant-123\/oauth2\/v2\.0\/token returned 401 Unauthorized; no Microsoft Graph request was made$/.test(text)), "the token-failure error-log line is in the list");
 
   // The renderings the client throws, built the way getToken, requestJson, and parseJsonBody build them.
   const tokenUrl = "https://login.microsoftonline.com/tenant-123/oauth2/v2.0/token";
@@ -2127,7 +2129,7 @@ test("request matching: a token-endpoint denial is attributed to POST /<tenant>/
     assert.ok(recorded.some((item) => item.evidence.resource_request.endsWith("no Microsoft Graph request was made")), `${label}: Graph findings name their API`);
     for (const assessment of assessments) {
       for (const error of assessment.errors) {
-        assert.match(error, new RegExp(`^AZURE-[A-Z]+-\\d+ POST ${AZURE_TOKEN_PATH.replace(/[.]/g, "\\.")}: ${status} ${statusText}; no (Microsoft Graph|Azure Resource Manager) request was made$`), `${label}: the errors array names the token request: ${error}`);
+        assert.match(error, new RegExp(`^AZURE-[A-Z]+-\\d+ POST ${AZURE_TOKEN_PATH.replace(/[.]/g, "\\.")} returned ${status} ${statusText}; no (Microsoft Graph|Azure Resource Manager) request was made$`), `${label}: the errors array names the token request: ${error}`);
       }
     }
     assert.ok(exported.errorCount >= 30, `${label}: the export logs every failed read`);
@@ -2200,7 +2202,7 @@ test("request matching (Codex P2): a token request rejected before any response 
     }
     for (const assessment of assessments) {
       for (const error of assessment.errors) {
-        assert.match(error, new RegExp(`^AZURE-[A-Z]+-\\d+ POST ${AZURE_TOKEN_PATH.replace(/[.]/g, "\\.")}: no response \\(${detail.source.slice(1, -1)}\\); no (Microsoft Graph|Azure Resource Manager) request was made$`), `${label}: the errors array names the token request: ${error}`);
+        assert.match(error, new RegExp(`^AZURE-[A-Z]+-\\d+ POST ${AZURE_TOKEN_PATH.replace(/[.]/g, "\\.")} received no response \\(${detail.source.slice(1, -1)}\\); no (Microsoft Graph|Azure Resource Manager) request was made$`), `${label}: the errors array names the token request: ${error}`);
       }
     }
     assert.ok(exported.errorCount >= 30, `${label}: the export logs every failed read`);

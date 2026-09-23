@@ -1043,13 +1043,16 @@ function tokenFailureText(result: { error: string; status?: number; url?: string
 }
 
 /**
- * The error-log line for a failed read: "<request>: <detail>". When the token request was the one
- * that failed it is named instead of the finding's endpoint, with the note that no resource request was made.
+ * The error-log line for a failed read: "<request>: <detail>". When the token request was the one that failed
+ * it is named instead of the finding's endpoint, as the outcome clause ("<request> returned <detail>") with the
+ * note that no resource request was made: the token endpoint path ends in `token`, and a `path: value` pair
+ * with a credential-named last segment loses its value to the error sink (harness revision 3, row D), so the
+ * status is joined by "returned" rather than a colon.
  */
 function failedReadNote(result: { error: string; status?: number; url?: string }, endpoint: string): string {
   if (isTokenRequestFailure(result)) {
     const token = tokenFailureText(result, endpoint);
-    return `${token.request}: ${token.detail}; no ${token.api} request was made`;
+    return `${token.outcome}; no ${token.api} request was made`;
   }
   return `${endpoint}: ${describeFailure(result)}`;
 }
