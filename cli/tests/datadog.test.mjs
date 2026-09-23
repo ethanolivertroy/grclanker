@@ -1207,6 +1207,49 @@ test("identity findings flag truncated user and role inventories instead of pass
   assert.ok(result.errors.some((error) => /roles: inventory truncated at 10 items/.test(error)));
 });
 
+test("DD-03 renders the user population as null beside its own truncation marker when the users read stopped early", async () => {
+  // A complete read keeps the count, and the marker beside it reads false.
+  const complete = findingById(await assessDatadogIdentity(healthyClient(), { now: NOW }), "DD-03");
+  assert.equal(complete.evidence.total_users, 3);
+  assert.equal(complete.evidence.users_inventory_truncated, false);
+
+  // Zero rows read while the server reported more: the population is unknown, never 0, and the finding's own evidence
+  // says why, because its `inventory` object covers the roles read alone.
+  const zeroRows = await assessDatadogIdentity(healthyClient({
+    async listUsers() {
+      return { items: [], truncated: true, truncationReason: "the server repeated the same page cursor", total: 500 };
+    },
+  }), { now: NOW });
+  const zeroRowsRbac = findingById(zeroRows, "DD-03");
+  assert.equal(zeroRowsRbac.status, "pass", "the roles verdict does not depend on the users read");
+  assert.equal(zeroRowsRbac.evidence.total_users, null);
+  assert.equal(zeroRowsRbac.evidence.users_inventory_truncated, true);
+  assert.deepEqual([zeroRowsRbac.evidence.inventory.inventory, zeroRowsRbac.evidence.inventory.complete], ["roles", true]);
+  assert.equal(zeroRows.summary.users, null);
+  assert.equal(zeroRows.summary.users_seen, 0);
+
+  // A capped read: the records read are real, the population is not.
+  const capped = await assessDatadogIdentity(healthyClient({
+    async listUsers(limit) {
+      return fill(limit, (index) => user(`u${index}`));
+    },
+  }), { now: NOW, userLimit: 2 });
+  const cappedRbac = findingById(capped, "DD-03");
+  assert.equal(cappedRbac.evidence.total_users, null);
+  assert.equal(cappedRbac.evidence.users_inventory_truncated, true);
+  assert.equal(capped.summary.users_seen, 2);
+
+  // An unread inventory has no count and no truncation flag to report.
+  const denied = await assessDatadogIdentity(healthyClient({
+    async listUsers() {
+      throw forbidden("/api/v2/users");
+    },
+  }), { now: NOW });
+  const deniedRbac = findingById(denied, "DD-03");
+  assert.equal(deniedRbac.evidence.total_users, null);
+  assert.equal(deniedRbac.evidence.users_inventory_truncated, null);
+});
+
 test("assessDatadogIdentity honors key_limit for the application key inventory behind DD-19", async () => {
   const requestedLimits = [];
   const client = healthyClient({

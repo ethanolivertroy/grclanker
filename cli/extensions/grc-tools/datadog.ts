@@ -2354,7 +2354,7 @@ function evaluateMfaControl(snapshot: DatadogIdentitySnapshot, strictSaml: boole
   );
 }
 
-function evaluateRbacControl(snapshot: DatadogIdentitySnapshot, maxAdmins: number, totalUsers: number | undefined): DatadogFinding {
+function evaluateRbacControl(snapshot: DatadogIdentitySnapshot, maxAdmins: number): DatadogFinding {
   if (!snapshot.roles.value) {
     return manualFinding(3, "high", unreadableReason("roles (user_access_read)", snapshot.roles), [
       "Export Organization Settings > Roles with each custom role's permission list and the Datadog Admin Role membership count.",
@@ -2407,7 +2407,10 @@ function evaluateRbacControl(snapshot: DatadogIdentitySnapshot, maxAdmins: numbe
     ),
     violation_observed: violationFlag([snapshot.roles, permissionsComplete], overPrivileged.length),
     admin_role_user_count: adminCount ?? null,
-    total_users: totalUsers ?? null,
+    // The user population is a second inventory of this finding: its count renders only from a complete read, and its
+    // own truncation marker sits beside the count because the `inventory` object below covers the roles read alone.
+    total_users: whenComplete(snapshot.users, snapshot.users.value?.length ?? 0),
+    users_inventory_truncated: truncatedFlag(snapshot.users),
     max_admins: maxAdmins,
     custom_roles_without_permission_detail: unresolved.length,
     custom_roles_without_permission_detail_sample: sample(unresolvedDetail),
@@ -2683,7 +2686,7 @@ export function evaluateDatadogIdentity(
   const findings = [
     saml.finding,
     evaluateMfaControl(snapshot, saml.strictSaml),
-    evaluateRbacControl(snapshot, maxAdmins, totalUsers),
+    evaluateRbacControl(snapshot, maxAdmins),
     evaluateUserAccessControl(snapshot, now, inactiveDays, pendingInviteDays),
     evaluateSessionTimeoutControl(snapshot),
     evaluateServiceAccountControl(snapshot, now, keyRotationDays, serviceAccountPattern),
