@@ -3285,10 +3285,19 @@ function evaluateDetectionRulesControl(snapshot: DatadogSecurityMonitoringSnapsh
     rules_inventory_truncated: truncatedFlag(surface),
     inventory: inventoryState("security_rules", surface),
   };
+  const caveats = [truncationCaveat("security_rules", surface, "rule_limit")];
+  // An empty inventory proves that no detection is active only when the listing was read completely. A listing that
+  // returned no rows before it stopped (an empty first page under a next-page cursor, a repeated cursor) leaves whether
+  // any rule exists unknown, so it is reported with the collection's own stop reason rather than as a fail (gap 40).
+  if (rules.length === 0 && !complete) {
+    return withVerdictCaveats(
+      finding(8, "high", "warn", `The security monitoring rules listing returned no rules before it stopped (${surface.truncationReason ?? "the listing stopped early"}), so whether any detection rule is enabled is unknown.`, evidence),
+      caveats,
+    );
+  }
   if (rules.length === 0) {
     return finding(8, "high", "fail", "The security monitoring rules endpoint returned no rules at all. An empty rule inventory is treated as fail because no detection is active; if Cloud SIEM is not licensed for this organization, record the control as not applicable with the plan evidence.", evidence);
   }
-  const caveats = [truncationCaveat("security_rules", surface, "rule_limit")];
   // An absence (no enabled rule, no rule for a category) is proven only by a complete list; from a truncated list it
   // is reported as warn because rules beyond the cap may hold what was not seen.
   if (enabledDetection.length === 0) {

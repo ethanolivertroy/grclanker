@@ -1540,6 +1540,43 @@ test("DD-12 is manual when either the rules or the posture findings source is un
   assert.match(findingById(integrationsForbidden, "DD-12").summary, /Unreadable inventory: gcp_integrations \(GET \/api\/v1\/integration\/gcp, gcp_configuration_read: .*403 Forbidden/);
 });
 
+test("gap 40: DD-08 does not fail on an empty rules listing that stopped early; the collection's own stop reason is rendered and fail is reserved for a complete read that returned nothing", async () => {
+  const cursorReason = "the server repeated the same page cursor, so the remaining pages could not be read";
+  const emptyTruncated = await assessDatadogSecurityMonitoring(healthyClient({
+    async listSecurityRules() {
+      return { items: [], truncated: true, truncationReason: cursorReason, total: 500 };
+    },
+  }), { now: NOW });
+  const rules = findingById(emptyTruncated, "DD-08");
+  assert.equal(rules.status, "warn", `an empty first page under a next-page cursor is not a fail: ${rules.summary}`);
+  assert.match(rules.summary, /^The security monitoring rules listing returned no rules before it stopped \(the server repeated the same page cursor, so the remaining pages could not be read\), so whether any detection rule is enabled is unknown\./);
+  assert.doesNotMatch(rules.summary, /returned no rules at all|no detection is active/);
+  assert.deepEqual(
+    { returned: rules.evidence.rules_returned, total: rules.evidence.total_rules, enabled: rules.evidence.enabled_detection_rules, truncated: rules.evidence.rules_inventory_truncated, complete: rules.evidence.inventory.complete, seen: rules.evidence.inventory.seen, inventoryTotal: rules.evidence.inventory.total },
+    { returned: 0, total: null, enabled: null, truncated: true, complete: false, seen: 0, inventoryTotal: 500 },
+  );
+  assert.ok(rules.evidence.verdict_caveats.some((caveat) => caveat.startsWith("security_rules inventory is truncated")), "the truncation caveat is recorded");
+
+  // An empty page that stopped at the cap reads the same way, with that reason.
+  const capReason = "the item cap of 500 was reached while a next-page cursor was still present";
+  const emptyCapped = await assessDatadogSecurityMonitoring(healthyClient({
+    async listSecurityRules() {
+      return { items: [], truncated: true, truncationReason: capReason };
+    },
+  }), { now: NOW });
+  assert.equal(findingStatus(emptyCapped, "DD-08"), "warn");
+  assert.match(findingById(emptyCapped, "DD-08").summary, /before it stopped \(the item cap of 500 was reached while a next-page cursor was still present\)/);
+
+  // A complete read that returned nothing is the only empty inventory that fails.
+  const emptyComplete = await assessDatadogSecurityMonitoring(healthyClient({
+    async listSecurityRules() {
+      return { items: [], truncated: false, total: 0 };
+    },
+  }), { now: NOW });
+  assert.equal(findingStatus(emptyComplete, "DD-08"), "fail");
+  assert.match(findingById(emptyComplete, "DD-08").summary, /^The security monitoring rules endpoint returned no rules at all\./);
+});
+
 test("DD-12 downgrades to warn when posture counts are truncated instead of reporting a fixed rate", async () => {
   const truncated = await assessDatadogSecurityMonitoring(healthyClient({
     async listPostureFindings(options = {}) {
