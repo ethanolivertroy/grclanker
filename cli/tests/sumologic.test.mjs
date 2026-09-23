@@ -2208,7 +2208,7 @@ test("reviewer C final verdict, item H: a literal JSON escape is a boundary befo
   assert.equal(scrubErrorText("Authorization: Bearer \\hunter2"), "Authorization: Bearer [REDACTED]");
 });
 
-/** Reviewer C's compound header lines (item F): several carriers on one line. Each builder takes distinct planted values and gives the line, its credential slots, the header names that must survive as often as they appeared, and the fragments that must survive verbatim. */
+/** Reviewer C's compound header lines (items F and L): several carriers on one line. Each builder takes distinct planted values and gives the line, its credential slots, the header names that must survive as often as they appeared, and the fragments that must survive verbatim. */
 const COMPOUND_HEADER_LINES = [
   (a, b) => [`Cookie: sid="${a}"; X-Api-Key: "${b}"; Content-Type: "application/json"`, [a, b], ["Cookie", "X-Api-Key", "Content-Type"], ["application/json"]],
   (a, b) => [`Cookie: sid=${a}; X-Api-Key: "${b}"; Content-Type: "application/json"`, [a, b], ["Cookie", "X-Api-Key", "Content-Type"], ["application/json"]],
@@ -2236,6 +2236,9 @@ const COMPOUND_HEADER_LINES = [
   (a, b) => [`{"Cookie": "sid=\\"${a}\\"", "X-Api-Key": "${b}", "Content-Type": "application/json"}`, [a, b], ["Cookie", "X-Api-Key", "Content-Type"], ["application/json"]],
   (a, b) => [`{"X-Api-Key": "\\"${a}\\"", "Cookie": "sid=${b}", "Content-Type": "application/json"}`, [a, b], ["X-Api-Key", "Cookie", "Content-Type"], ["application/json"]],
   (a, b) => [`{"Authorization": "Bearer \\"${a}\\"", "X-Api-Key": "${b}", "Content-Type": "application/json"}`, [a, b], ["Authorization", "X-Api-Key", "Content-Type"], ["Bearer", "application/json"]],
+  // A following header whose name carries RFC 7230 token punctuation is recognised as the next header (item L).
+  (a, b) => [`Cookie: theme=dark; my.sid=${a}; X.Api.Key: "${b}"`, [a, b], ["Cookie", "X.Api.Key"], []],
+  (a, b) => [`Cookie: sid=${a}; X_Api_Key: "${b}"; Content-Type: "application/json"`, [a, b], ["Cookie", "X_Api_Key", "Content-Type"], ["application/json"]],
 ];
 /** The two value shapes of the compound matrix: pairwise distinct canaries sharing no 6-character window with any line or frame text. */
 const COMPOUND_VALUE_SHAPES = [
@@ -2257,7 +2260,7 @@ function occurrencesOf(text, fragment) {
   return text.split(fragment).length - 1;
 }
 
-test("reviewer C final verdict, item F: on a compound header line every carrier value goes at every JSON depth, an escaped inner quote is inner content, an unterminated quote ends before the next header token, and every following header keeps its name", () => {
+test("reviewer C final verdict, items F and L: on a compound header line every carrier value goes at every JSON depth, an escaped inner quote is inner content, an unterminated quote ends before the next header token, and every following header keeps its name", () => {
   for (const [shapeName, values] of COMPOUND_VALUE_SHAPES) {
     for (const build of COMPOUND_HEADER_LINES) {
       const [line, credentials, names, keeps] = build(...values);
@@ -2279,6 +2282,7 @@ test("reviewer C final verdict, item F: on a compound header line every carrier 
   assert.equal(scrubErrorText('{"Cookie": "sid=\\"prod-iidsre-itdpqey\\"", "X-Api-Key": "prod-yzrupn-efussqe", "Content-Type": "application/json"}'), '{"Cookie": "[REDACTED]", "X-Api-Key": "[REDACTED]", "Content-Type": "application/json"}');
   assert.equal(scrubErrorText('{"X-Api-Key": "\\"prod-iidsre-itdpqey\\"", "Cookie": "sid=prod-yzrupn-efussqe", "Content-Type": "application/json"}'), '{"X-Api-Key": "[REDACTED]", "Cookie": "[REDACTED]", "Content-Type": "application/json"}');
   assert.equal(scrubErrorText('{"Authorization": "Bearer \\"prod-iidsre-itdpqey\\"", "X-Api-Key": "prod-yzrupn-efussqe", "Content-Type": "application/json"}'), '{"Authorization": "Bearer [REDACTED]", "X-Api-Key": "[REDACTED]", "Content-Type": "application/json"}');
+  assert.equal(scrubErrorText('Cookie: theme=dark; my.sid=prod-iidsre-itdpqey; X.Api.Key: "prod-yzrupn-efussqe"'), 'Cookie: [REDACTED]; X.Api.Key: "[REDACTED]"');
   // Inside a double-escaped raw JSON string every quoted carrier goes and the quote units at that depth stay.
   const rawMember = (headers) => `{"status":502,"raw":${JSON.stringify(JSON.stringify({ headers }))}}`;
   assert.equal(

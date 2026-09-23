@@ -185,11 +185,12 @@ export interface OktaNotCollectedMarker {
 // <key>", "proxy:\n\tpassword: hunter2") is scrubbed as a header line, never as the value of the
 // word before the escape; see the note above ESCAPE_LETTER.
 //
-// The quote rule (reviewer C, item F): a quoted carrier value is read to the closing quote that
+// The quote rule (reviewer C, items F and L): a quoted carrier value is read to the closing quote that
 // matches its opener (the same quote character behind the same backslash run), so an escaped inner
 // quote at any JSON depth is inner content and goes with the value; an unterminated quote and an
-// unquoted value end at a ";" or "," before the next header token, so the following header keeps its
-// name and its own treatment; see readQuotedContent and scrubCookieHeaders.
+// unquoted value end at a ";" or "," before the next header token, whose name may carry any RFC 7230
+// token character, so the following header keeps its name and its own treatment; see
+// readQuotedContent and scrubCookieHeaders.
 // ---------------------------------------------------------------------------------------------
 
 const MIN_CONFIGURED_SECRET_LENGTH = 4;
@@ -413,8 +414,9 @@ function scrubSchemeValue(match: string, scheme: string, quote: string, value: s
   return SCHEME_PROSE_WORDS.has(word.toLowerCase()) ? match : `${scheme} ${quote}${REDACTED}${trailing}`;
 }
 
-// The name of a following header, as the cookie and pair readers recognise it.
-const NEXT_HEADER_NAME = String.raw`[A-Za-z][A-Za-z0-9_-]*`;
+// The RFC 7230 token characters, so a following header whose name carries a "." or other token
+// punctuation (X.Api.Key) is recognised as the next header rather than swallowed (item L).
+const NEXT_HEADER_NAME = "[!#$%&'*+.^_`|~0-9A-Za-z-]+";
 // A ";" or "," ends a carrier value when the text after it (past optional spaces) opens the next
 // header "Name:" token or a JSON fragment.
 const NEXT_HEADER_AFTER_SEPARATOR = new RegExp(String.raw`^[ \t]*(?:[{[]|${QUOTE_UNIT}?${NEXT_HEADER_NAME}${QUOTE_UNIT}?[ \t]*:)`);
