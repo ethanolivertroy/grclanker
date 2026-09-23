@@ -3146,7 +3146,7 @@ const CLOUD_DEPLOYMENT_CARRIERS = {
 };
 const CLOUD_DEPLOYMENT_PLACEHOLDERS = { cloudId: "cloudid", endpointHost: "es-host", userSettings: "principal", planHash: "hash", nonArrayKind: "att" };
 
-/** One deployment the way GET /api/v1/deployments returns it: resources listed per kind as arrays, each element carrying its info, plan, and settings. */
+/** One deployment the way GET /api/v1/deployments/{id} (DeploymentGetResponse) returns it: resources listed per kind as arrays, each element carrying its info, plan, and settings. */
 function cloudDeploymentBody(planted = CLOUD_DEPLOYMENT_CARRIERS) {
   const endpoint = `${planted.endpointHost}.us-central1.gcp.cloud.es.io`;
   return {
@@ -3225,6 +3225,80 @@ test("Codex r4082447905: a deployment's per-kind resource arrays are projected e
     assert.ok(!files.get("core_data/cloud_deployments.json").includes(dropped), `undocumented field ${dropped} is not written`);
   }
   assertCanaryFixture(assert, planted, new Map([["deployment body", JSON.stringify(cloudDeploymentBody(CLOUD_DEPLOYMENT_PLACEHOLDERS))], ...outputs]), "cloud deployment carriers");
+});
+
+/**
+ * Values planted in the undocumented fields of a DeploymentsListResponse element (the Cloud ID, the credentials the
+ * resource schema allows, a secret token, and the id of an element that names no kind), random-looking so every
+ * 6-to-24-character window can be asserted absent from what the projection keeps.
+ */
+const CLOUD_LISTING_CARRIERS = {
+  cloudId: "Vn7QxL2kRz9TbW4mYp8HdC3sJf6gAe1U",
+  password: "Hq3ZwN8vKt5XcL2rPy7BdM9sGf4jTa6E",
+  secretToken: "Rk8PmT4xVz2LqW7nYb3HdJ9cGs5fAe1N",
+  kindless: "Zt5KpX9wQr2LvN7mYc4HbD8sJf3gTe6A",
+};
+const CLOUD_LISTING_PLACEHOLDERS = { cloudId: "cloudid", password: "pw", secretToken: "secret", kindless: "kindless" };
+
+/** One deployment the way GET /api/v1/deployments (DeploymentsListResponse), the request the client makes, returns it: one resources array whose elements each name their kind. */
+function cloudDeploymentListingBody(planted = CLOUD_LISTING_CARRIERS) {
+  return {
+    id: "3f2a9c8e7b6d5a4c3b2a1f0e9d8c7b6a",
+    name: "prod-observability",
+    resources: [
+      { kind: "elasticsearch", ref_id: "main-elasticsearch", id: "5c4b3a2f1e0d9c8b7a6f5e4d3c2b1a09", region: "gcp-us-central1", cloud_id: `prod-observability:${planted.cloudId}`, credentials: { username: "elastic", password: planted.password }, warnings: [] },
+      { kind: "kibana", ref_id: "main-kibana", id: "9a8b7c6d5e4f3a2b1c0d9e8f7a6b5c4d", region: "gcp-us-central1", secret_token: planted.secretToken },
+      { kind: "kibana", ref_id: "secondary-kibana", id: "0b1c2d3e4f5a69788796a5b4c3d2e1f0", region: "gcp-europe-west1" },
+      { ref_id: "orphan", id: planted.kindless, region: "gcp-us-central1" },
+      { kind: 7, ref_id: "numeric-kind", id: "c0ffee00c0ffee00c0ffee00c0ffee00", region: "gcp-us-central1" },
+    ],
+  };
+}
+
+test("CodeRabbit on #77: the deployment listing's resources array (DeploymentsListResponse) is grouped by each element's kind, so the ids and regions main carried reach core_data/cloud_deployments.json, its zip entry, and the snapshot on the path the client uses", async () => {
+  const projected = projectDataset("cloud_deployments", [cloudDeploymentListingBody()]);
+  assert.deepEqual(projected, [{
+    id: "3f2a9c8e7b6d5a4c3b2a1f0e9d8c7b6a",
+    name: "prod-observability",
+    resources: {
+      elasticsearch: [{ ref_id: "main-elasticsearch", id: "5c4b3a2f1e0d9c8b7a6f5e4d3c2b1a09", region: "gcp-us-central1" }],
+      kibana: [
+        { ref_id: "main-kibana", id: "9a8b7c6d5e4f3a2b1c0d9e8f7a6b5c4d", region: "gcp-us-central1" },
+        { ref_id: "secondary-kibana", id: "0b1c2d3e4f5a69788796a5b4c3d2e1f0", region: "gcp-europe-west1" },
+      ],
+    },
+  }], "each element keeps ref_id, id, and region under its kind; an element without a string kind, the Cloud ID, credentials, secret token, and warnings are dropped");
+
+  // Through the real client: GET /api/v1/deployments is served over the router, collected, written, and zipped.
+  const config = sampleConfig({ maxRetries: 0, cloudApiKey: "cloud-key" });
+  const fixtures = healthyFixtures();
+  fixtures.cloudDeployments = [cloudDeploymentListingBody()];
+  const client = new ElasticApiClient(config, { fetchImpl: createRouter(healthyRoutes(fixtures)) });
+  const access = await checkElasticAccess(client);
+  const snapshot = await collectElasticSnapshot(client, ["cloud_deployments"], {});
+  const result = await exportElasticAuditBundle(client, config, createTempBase("elastic-cloud-listing-"), {});
+  const files = readBundleFiles(result.outputDir);
+  const entries = readZipEntries(result.zipPath);
+  const written = JSON.parse(files.get("core_data/cloud_deployments.json")).data;
+  assert.deepEqual(written, projected, "the bundle carries the projected deployment, ids and regions included");
+  assert.deepEqual(JSON.parse(entries.get("core_data/cloud_deployments.json")).data, projected);
+  assert.deepEqual(snapshot.cloud_deployments.data, projected);
+  assert.deepEqual(
+    written[0].resources.elasticsearch.map((resource) => [resource.id, resource.region]),
+    [["5c4b3a2f1e0d9c8b7a6f5e4d3c2b1a09", "gcp-us-central1"]],
+  );
+  assert.deepEqual(
+    written[0].resources.kibana.map((resource) => [resource.id, resource.region]),
+    [["9a8b7c6d5e4f3a2b1c0d9e8f7a6b5c4d", "gcp-us-central1"], ["0b1c2d3e4f5a69788796a5b4c3d2e1f0", "gcp-europe-west1"]],
+  );
+
+  const planted = Object.values(CLOUD_LISTING_CARRIERS);
+  const outputs = new Map([...files, ...[...entries].map(([name, text]) => [`zip:${name}`, text]), ["access", JSON.stringify(access)], ["snapshot", JSON.stringify(snapshot)]]);
+  assertCanaryWindowsAbsent(assert, outputs, planted, "cloud deployment listing output");
+  for (const dropped of ["cloud_id", "credentials", "password", "secret_token", "warnings", "orphan", "numeric-kind", "c0ffee00"]) {
+    assert.ok(!files.get("core_data/cloud_deployments.json").includes(dropped), `undocumented field or kindless element ${dropped} is not written`);
+  }
+  assertCanaryFixture(assert, planted, new Map([["deployment listing body", JSON.stringify(cloudDeploymentListingBody(CLOUD_LISTING_PLACEHOLDERS))], ...outputs]), "cloud deployment listing carriers");
 });
 
 test("verdict rule 9: reduceUrlValueToOrigin reduces a value that is one URL to scheme and host and leaves a URL inside free text to the shared pass, which redactSensitiveValues applies to every collected string", () => {

@@ -988,25 +988,39 @@ function projectAlertingRule(rule: JsonRecord): JsonRecord {
 }
 
 /**
- * Elastic Cloud lists a deployment's resources per kind as arrays (`elasticsearch: [{ ref_id, id, region, info, ... }]`,
- * likewise kibana, apm, integrations_server, enterprise_search, appsearch); each element keeps its documented identity
- * fields and a kind whose value is not an array is dropped.
+ * Elastic Cloud gives a deployment's resources in two shapes. The listing the client reads, GET /api/v1/deployments
+ * (DeploymentsListResponse), carries one array of `{ kind, ref_id, id, region, ... }`; the per-deployment read,
+ * GET /api/v1/deployments/{id}, groups them per kind as arrays (`elasticsearch: [{ ref_id, id, region, info, ... }]`,
+ * likewise kibana, apm, integrations_server, enterprise_search, appsearch). Both project to the per-kind map, each
+ * element keeping its documented identity fields; an array element without a string kind and a per-kind value that is
+ * not an array are dropped, and any other value is not a resource collection at all.
  */
-function projectCloudResources(resources: JsonRecord): JsonRecord {
+function projectCloudResources(resources: unknown): JsonRecord | undefined {
+  const projectResource = (resource: JsonRecord): JsonRecord => pick(resource, ["ref_id", "id", "region"]);
+  if (Array.isArray(resources)) {
+    const grouped: Record<string, JsonRecord[]> = {};
+    for (const resource of asObjectArray(resources)) {
+      const kind = typeof resource.kind === "string" ? resource.kind.trim() : "";
+      if (kind) (grouped[kind] ??= []).push(projectResource(resource));
+    }
+    return grouped;
+  }
+  const perKind = asObject(resources);
+  if (!perKind) return undefined;
   const output: JsonRecord = {};
-  for (const [kind, value] of Object.entries(resources)) {
-    if (Array.isArray(value)) output[kind] = asObjectArray(value).map((resource) => pick(resource, ["ref_id", "id", "region"]));
+  for (const [kind, value] of Object.entries(perKind)) {
+    if (Array.isArray(value)) output[kind] = asObjectArray(value).map(projectResource);
   }
   return output;
 }
 
 function projectCloudDeployment(deployment: JsonRecord): JsonRecord {
   const metadata = asObject(deployment.metadata);
-  const resources = asObject(deployment.resources);
+  const resources = projectCloudResources(deployment.resources);
   return {
     ...pick(deployment, ["id", "name", "alias", "healthy"]),
     ...(metadata ? { metadata: pick(metadata, ["last_modified", "system_owned", "hidden"]) } : {}),
-    ...(resources ? { resources: projectCloudResources(resources) } : {}),
+    ...(resources ? { resources } : {}),
   };
 }
 
