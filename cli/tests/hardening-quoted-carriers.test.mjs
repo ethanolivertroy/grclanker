@@ -758,6 +758,99 @@ test("CodeRabbit r4081238237 on #81: a quoted auth-param after a scheme word goe
 });
 
 /**
+ * CodeRabbit r4081776771 on #81 (at `ed1bb8b`): the free-text reader exempted every auth-param list
+ * that began with a challenge param (`realm=`) as a WWW-Authenticate challenge, even when a later
+ * param was a proof, so `Digest realm="api", nonce="n", response="<proof>"` kept its `response`; no
+ * pair rule names `response` (nor `mac`), and the data scrubs have no long-token fallback. The list
+ * reader now records a proof param during the walk (`response`, `signature`, `oauth_signature`,
+ * `mac`, `sig`, `hmac`, `token`, `password`, `secret`, `key`, `assertion`, read as the final segment
+ * of the name), and a list that holds one is a credential whatever it begins with: it goes whole, as
+ * the same list does under a header and as a list led by `username=` did already, so the rendering
+ * does not depend on the order of the params. The proof values are name-shaped words, so neither the
+ * hex-digest nor the long-token rule can mask the result. Each row stands bare, after a JSON escape,
+ * and inside a JSON string.
+ */
+const PROOF_PARAM_ROWS = Object.freeze([
+  ["Digest response", (value) => `Digest realm="api", nonce="n", response="${value}"`, `Digest ${REDACTED}`],
+  ["Digest response with bare values", (value) => `Digest realm=api, nonce=n, response=${value}`, `Digest ${REDACTED}`],
+  ["Digest response led by realm, full RFC 7616 shape", (value) => `Digest realm="api", username="Mufasa", nonce="dcd98b7102dd2f0e8b11d0f600bfb0c093", uri="/dir/index.html", qop=auth, nc=00000001, cnonce="0a4f113b", response="${value}"`, `Digest ${REDACTED}`],
+  ["OAuth 1 signature", (value) => `OAuth realm="api", oauth_consumer_key="dpf43f3p2l4k3l03", oauth_signature_method="HMAC-SHA1", oauth_signature="${value}"`, `OAuth ${REDACTED}`],
+  ["OAuth 1 signature alone after the realm", (value) => `OAuth realm="api", oauth_signature="${value}"`, `OAuth ${REDACTED}`],
+  ["MAC token", (value) => `Token realm="api", id="h480djs93hd8", ts="1336363200", nonce="dj83hs9s", mac="${value}"`, `Token ${REDACTED}`],
+  ["mac after a Bearer challenge's params", (value) => `Bearer realm="api", error="invalid_token", mac="${value}"`, `Bearer ${REDACTED}`],
+  ["lowercase scheme word, Digest response", (value) => `digest realm="api", nonce="n", response="${value}"`, `digest ${REDACTED}`],
+  ["lowercase scheme word, response alone", (value) => `digest response="${value}"`, `digest response="${REDACTED}"`],
+  ["header line led by realm", (value) => `Authorization: Digest realm="api", nonce="n", response="${value}"`, `Authorization: Digest ${REDACTED}`],
+]);
+
+const PROOF_PARAM_FORMS = Object.freeze([
+  ["bare", (line) => line, (rendering) => rendering],
+  ["after a JSON escape", (line) => `request failed\\n${line.replaceAll('"', '\\"')}`, (rendering) => `request failed\\n${rendering.replaceAll('"', '\\"')}`],
+  ["inside a JSON string", (line) => `{"detail":"${line.replaceAll('"', '\\"')}"}`, (rendering) => `{"detail":"${rendering.replaceAll('"', '\\"')}"}`],
+]);
+
+test("CodeRabbit r4081776771 on #81: an auth-param list led by realm= goes whole when a later param is a proof, bare, after a JSON escape, and inside a JSON string, through every sink, while a challenge without a proof keeps its params", () => {
+  const legitimate = new Map(PROOF_PARAM_ROWS.map(([label, line]) => [label, line("")]));
+  assertCanariesDisjointFromFixture(assert, ["skvclmtirehs", "yqzvbnxrlt", ...plantedValues()], legitimate, "proof-param rows");
+  let trials = 0;
+  for (const [label, line, rendering] of PROOF_PARAM_ROWS) {
+    for (const [formName, form, expectedForm] of PROOF_PARAM_FORMS) {
+      // Two lowercase words and the planted values: a name-shaped word is what the review planted.
+      for (const value of ["skvclmtirehs", "yqzvbnxrlt", ...plantedValues()]) {
+        const input = form(line(value));
+        const expected = expectedForm(rendering);
+        for (const [scrubName, scrub] of EXACT_SCRUBS) {
+          const output = scrub(input);
+          assert.equal(output, expected, `${scrubName}: ${label}, ${formName}, with ${value}`);
+          assertNoCanaryWindows(assert, output, [value], `${scrubName}: ${label}, ${formName}`);
+          assert.equal(scrub(output), output, `${scrubName}: ${label}, ${formName}: a second pass changed the text`);
+          trials += 1;
+        }
+        assertNoCanaryWindows(assert, errorMessage(new Error(input)), [value], `errorMessage: ${label}, ${formName}`);
+        assert.deepEqual(redactSecretValues({ detail: input, list: [{ note: input }] }), { detail: expected, list: [{ note: expected }] }, `redactSecretValues record: ${label}, ${formName}, with ${value}`);
+      }
+    }
+  }
+  assert.equal(trials, PROOF_PARAM_ROWS.length * PROOF_PARAM_FORMS.length * (2 + plantedValues().length) * EXACT_SCRUBS.length);
+  // The rows as reported, through the three sinks the review named.
+  const reported = 'Digest realm="api", nonce="n", response="skvclmtirehs"';
+  assert.equal(scrubErrorText(reported), `Digest ${REDACTED}`);
+  assert.equal(scrubDataText(reported), `Digest ${REDACTED}`);
+  assert.equal(redactSecretValues(reported), `Digest ${REDACTED}`);
+  assert.deepEqual(redactSecretValues({ detail: reported }), { detail: `Digest ${REDACTED}` });
+  // The must-keep side: a challenge without a proof keeps its params, in a WWW-Authenticate header, in
+  // prose, and in each form. `nonce` is a credential pair name, so its value has gone under the pair
+  // rule since the #78 shape ruling and renders `nonce="[REDACTED]"` as on main; `realm`, `qop`, and
+  // the scheme word keep their values, and the list is not replaced by one marker.
+  for (const [text, expected] of [
+    ['WWW-Authenticate: Bearer realm="api"', 'WWW-Authenticate: Bearer realm="api"'],
+    ['Bearer realm="api"', 'Bearer realm="api"'],
+    ['WWW-Authenticate: Digest realm="api", qop="auth", nonce="n"', `WWW-Authenticate: Digest realm="api", qop="auth", nonce="${REDACTED}"`],
+    ['Digest realm="api", qop="auth", nonce="n"', `Digest realm="api", qop="auth", nonce="${REDACTED}"`],
+    ['challenge was Digest realm="api", qop="auth", nonce="n" and the client gave up', `challenge was Digest realm="api", qop="auth", nonce="${REDACTED}" and the client gave up`],
+    ['Bearer realm="api", error="invalid_token", error_description="The access token expired"', 'Bearer realm="api", error="invalid_token", error_description="The access token expired"'],
+    ['Digest realm="api", algorithm=SHA-256, signature_method="HMAC-SHA1"', 'Digest realm="api", algorithm=SHA-256, signature_method="HMAC-SHA1"'],
+    ['digest realm="api"', 'digest realm="api"'],
+    ['token realm="api", scope="read"', 'token realm="api", scope="read"'],
+  ]) {
+    for (const [formName, form, expectedForm] of PROOF_PARAM_FORMS) {
+      for (const [scrubName, scrub] of EXACT_SCRUBS) assert.equal(scrub(form(text)), expectedForm(expected), `${scrubName}: ${text}, ${formName}`);
+    }
+  }
+  // A list whose proof the pair rule has already replaced is still a credential and goes whole, and
+  // the renderings are fixed points.
+  for (const [text, expected] of [
+    ['Bearer realm="api", token="skvclmtirehs"', `Bearer ${REDACTED}`],
+    [`Bearer realm="api", token="${REDACTED}"`, `Bearer ${REDACTED}`],
+    [`Digest realm="[REDACTED]", response="${REDACTED}"`, `Digest realm="[REDACTED]", response="${REDACTED}"`],
+    [`Digest ${REDACTED}`, `Digest ${REDACTED}`],
+    [`digest response="${REDACTED}"`, `digest response="${REDACTED}"`],
+  ]) {
+    for (const [scrubName, scrub] of EXACT_SCRUBS) assert.equal(scrub(text), expected, `${scrubName}: ${text}`);
+  }
+});
+
+/**
  * A header line quoted whole in single quotes (a curl `-H` argument, a Python dict repr, a sentence
  * that ends after the quote) keeps its closing quote: the apostrophe that closes it is followed by a
  * space, a bracket, sentence punctuation, or the end, which is where a cookie name or value ends.

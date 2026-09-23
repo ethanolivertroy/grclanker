@@ -268,6 +268,16 @@ const PLAIN_WORD_PATTERN = /^(?:[A-Z]?[a-z]+(?:-[a-z]+)*|[A-Z]+)$/;
 const PLAIN_WORD_MAX_LENGTH = 20;
 const VERSION_PATTERN = /^\d+(?:\.\d+)+$/;
 const AUTH_PARAM_PATTERN = /^(?:realm|error|error_description|error_uri|scope|charset|algorithm|qop|stale|domain|opaque|title|resource|client_id|authorization_uri|as_uri|ticket)=/i;
+// The auth-params that carry a proof or a credential, read as the final segment of the param name
+// (`response`, `oauth_signature`, `X-Amz-Signature`, `client_secret`, `access_token`, `Token`): a
+// Digest `response`, an OAuth 1 `oauth_signature`, a `mac`, an HMAC `sig` or `hmac`, and the
+// credential words. A list that holds one is a credential whatever param it begins with, so the
+// challenge exemption (`AUTH_PARAM_PATTERN`) does not reach it (CodeRabbit r4081776771 on #81:
+// `Digest realm="api", nonce="n", response="<proof>"` kept its proof because the list began with
+// `realm=`, and no pair rule names `response`). A name that only begins with one of these words is a
+// setting or an identifier and names no proof (`oauth_signature_method`, `token_type`, `key_id`,
+// `keyId`), as are a challenge's `nonce`, `opaque`, and `cnonce`.
+const PROOF_PARAM_WORDS = new Set(["response", "signature", "sig", "mac", "hmac", "token", "password", "secret", "key", "apikey", "assertion"]);
 
 // Credential-named pairs in prose, headers, query strings, and JSON fragments: the key and separator
 // stay, the value goes whatever its shape (coordinator ruling on the Codex P2: any nonempty value
@@ -890,11 +900,19 @@ interface AuthParamList {
   scrubbed: boolean;
   /** For a list of one quoted param: the text inside its quotes and its rendering with the name and the quotes kept (`Token="[REDACTED]"`); null for a longer list. */
   single: { content: string; rendering: string } | null;
+  /** True when a param of the list names a proof or a credential (see `PROOF_PARAM_WORDS`): the list is a credential whatever it begins with. */
+  proof: boolean;
 }
 
 /** A param name that is a word rather than a token-cased run (see `AUTH_PARAM_NAME`). */
 function isAuthParamName(name: string): boolean {
   return !hasTokenCasing(name.replace(/[^A-Za-z]/g, ""));
+}
+
+/** A param name whose final segment is a proof or credential word (see `PROOF_PARAM_WORDS`). */
+function isProofParamName(name: string): boolean {
+  const segments = keySegments(name);
+  return segments.length > 0 && PROOF_PARAM_WORDS.has(segments[segments.length - 1]);
 }
 
 /** A value that is the marker an earlier pass left, with at most a non-value character after it (see `isBlankOrScrubbed`); blank is not scrubbed. */
@@ -927,14 +945,20 @@ function authParamBareValueEnd(text: string, valueStart: number, bare: string): 
  * token=<key>` still render `Snowflake [REDACTED]` and `Token [REDACTED]`), in which case the caller
  * replaces the run; `scrubbed` when every value is already the marker (`Token="[REDACTED]"`, or
  * `Token=[REDACTED]` where a configured secret was replaced first), so a rendering read again is left
- * as it is.
+ * as it is. `proof` records whether any param of the list, the first included, names a proof or a
+ * credential (`response`, `oauth_signature`, `mac`, `token`; see `PROOF_PARAM_WORDS`), which the
+ * free-text reader uses to tell a Digest response led by `realm=` from a challenge (CodeRabbit
+ * r4081776771 on #81).
  */
 function readAuthParamList(text: string, start: number, run: string, walk: boolean): AuthParamList | null {
   let cursor = start + run.length;
   let live = false;
+  let proof = false;
   let single: AuthParamList["single"] = null;
   if (AUTH_PARAM_KEY_PATTERN.test(run)) {
-    if (!isAuthParamName(run.slice(0, -1))) return null;
+    const name = run.slice(0, -1);
+    if (!isAuthParamName(name)) return null;
+    proof = isProofParamName(name);
     if (text.startsWith(REDACTED, cursor)) {
       cursor = absorbMarkers(text, cursor);
     } else {
@@ -951,16 +975,22 @@ function readAuthParamList(text: string, start: number, run: string, walk: boole
     const keyed = AUTH_PARAM_KEYED_RUN_PATTERN.exec(run);
     if (!walk || keyed === null || !isAuthParamName(keyed[1]) || stickyMatch(AUTH_PARAM_NEXT_PATTERN, text, cursor) === null) return null;
     live = true;
+    proof = isProofParamName(keyed[1]);
   }
   let next: RegExpExecArray | null;
   while (walk && (next = stickyMatch(AUTH_PARAM_NEXT_PATTERN, text, cursor)) !== null) {
     if (!isAuthParamName(next[1])) break;
+    if (isProofParamName(next[1])) proof = true;
     const valueStart = cursor + next[0].length;
     const quoted = readQuotedValue(text, valueStart);
     if (quoted !== null) {
       if (!opensValue(text, quoted)) break;
       if (!isScrubbedMarker(text.slice(quoted.start, quoted.end))) live = true;
       cursor = quoted.after;
+    } else if (text.startsWith(REDACTED, valueStart)) {
+      // A bare value a pair rule has already replaced (`nonce=[REDACTED]`) is a param like any other,
+      // and the walk goes on past it to the params after it.
+      cursor = absorbMarkers(text, valueStart);
     } else {
       const bare = stickyExec(AUTH_PARAM_BARE_VALUE_PATTERN, text, valueStart);
       cursor = bare === null ? valueStart : authParamBareValueEnd(text, valueStart, bare);
@@ -968,7 +998,7 @@ function readAuthParamList(text: string, start: number, run: string, walk: boole
     }
     single = null;
   }
-  return { end: absorbMarkers(text, cursor), scrubbed: !live, single };
+  return { end: absorbMarkers(text, cursor), scrubbed: !live, single, proof };
 }
 
 /**
@@ -1066,7 +1096,13 @@ const readCookieHeaderValue: ValueReader = (text, valueStart, carrier) => {
  * Token="<v>"` renders `replayed Snowflake Token="[REDACTED]"` and `OAuth oauth_consumer_key="<v>",
  * oauth_token="<v>"` goes whole, while `Bearer realm="api", error="invalid_token"` is the prose of a
  * challenge and stays (`AUTH_PARAM_PATTERN`); after a lowercase English word only a single quoted
- * param goes, and only when its value cannot be a word or a name.
+ * param goes, and only when its value cannot be a word or a name. A list that holds a proof param
+ * (`response`, `oauth_signature`, `mac`, `token`; see `PROOF_PARAM_WORDS`) is a credential whatever
+ * param it begins with and whatever the casing of the scheme word (CodeRabbit r4081776771 on #81):
+ * `Digest realm="api", nonce="n", response="<proof>"` goes whole (`Digest [REDACTED]`), as the same
+ * list does under a header and as a list led by `username=` does here, so the rendering does not
+ * depend on the order of the params, and `digest response="<proof>"` renders `digest
+ * response="[REDACTED]"`.
  */
 const readSchemeValue: ValueReader = (text, valueStart, carrier) => {
   const lowercaseScheme = LOWERCASE_SCHEME_WORDS.has(carrier[0].trim());
@@ -1081,11 +1117,17 @@ const readSchemeValue: ValueReader = (text, valueStart, carrier) => {
   if (bare === null) return null;
   const value = bare.replace(CLAUSE_PUNCTUATION_PATTERN, "");
   // A run the marker follows is the pair the pair rules have scrubbed and goes with its marker as one.
-  const params = text.startsWith(REDACTED, valueStart + value.length) ? null : readAuthParamList(text, valueStart, value, !lowercaseScheme);
-  if (params !== null) {
-    if (params.scrubbed || AUTH_PARAM_PATTERN.test(value)) return null;
-    if (lowercaseScheme && (params.single === null || !looksLikeSchemeValue(params.single.content, true))) return null;
-    return { end: params.end, replacement: params.single?.rendering ?? REDACTED };
+  const list = text.startsWith(REDACTED, valueStart + value.length) ? null : readAuthParamList(text, valueStart, value, true);
+  if (list !== null) {
+    if (list.scrubbed || (!list.proof && AUTH_PARAM_PATTERN.test(value))) return null;
+    if (list.proof || !lowercaseScheme) return { end: list.end, replacement: list.single?.rendering ?? REDACTED };
+    // After a lowercase English word the list is not walked: its first quoted param alone goes, and only
+    // when its value cannot be a word or a name.
+    const params = readAuthParamList(text, valueStart, value, false);
+    if (params !== null) {
+      if (params.scrubbed || params.single === null || !looksLikeSchemeValue(params.single.content, true)) return null;
+      return { end: params.end, replacement: params.single.rendering };
+    }
   }
   if (value.length < SCHEME_VALUE_MIN_LENGTH || !looksLikeSchemeValue(value, lowercaseScheme)) return null;
   return { end: absorbMarkers(text, valueStart + value.length), replacement: REDACTED };
