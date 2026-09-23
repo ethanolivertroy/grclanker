@@ -124,8 +124,10 @@ const URL_PARTS_PATTERN = /^([a-z][a-z0-9+.-]*:(?:\/\/|\\\/\\\/))(?:[^\s/@"'<>\\
 const TRAILING_PUNCTUATION_PATTERN = /[.,;:!?]+$/;
 
 // A relative path or bare query string: the named parameter keeps its name, the value goes. A
-// backslash ends the value so a JSON-escaped closing quote is kept.
-const QUERY_PAIR_PATTERN = /([?&])([A-Za-z0-9_.[\]-]+)=(?!\[REDACTED\])([^&#\s"'<>\\]+)/g;
+// backslash ends the value so a JSON-escaped closing quote is kept, and so does ";": a cookie pair
+// whose name begins with "&" (`Cookie: &sid=<v>; pref=<v>`) is matched here first, and the ";" must
+// stay for the cookie reader to read the later pair (CodeRabbit r4077655607, review of #78 row E).
+const QUERY_PAIR_PATTERN = /([?&])([A-Za-z0-9_.[\]-]+)=(?!\[REDACTED\])([^&#;\s"'<>\\]+)/g;
 
 // Carriers. Each carrier pattern matches a name and its separator only; the value that follows is read
 // by a quote-aware reader (see "Carrier values"), never by the pattern, so a quoted value is removed
@@ -165,6 +167,7 @@ const cookieToken = (character: string): string => String.raw`${character}+(?:'(
 const NAME_FINAL_APOSTROPHE = String.raw`(?:'(?=[ \t]*=))?`;
 const COOKIE_PAIR_NAME_PATTERN = new RegExp(String.raw`${cookieToken(COOKIE_NAME_CHARACTER)}${NAME_FINAL_APOSTROPHE}`, "y");
 const COOKIE_BARE_VALUE_PATTERN = new RegExp(String.raw`(?:${cookieToken(COOKIE_VALUE_CHARACTER)})?`, "y");
+const COOKIE_VALUE_START_PATTERN = new RegExp(COOKIE_VALUE_CHARACTER, "y");
 const COOKIE_ATTRIBUTE_PATTERN = new RegExp(String.raw`;[ \t]*${cookieToken(COOKIE_ATTRIBUTE_CHARACTER)}${NAME_FINAL_APOSTROPHE}`, "y");
 // The compound-line rule, the same in every scrubber: a quoted value ends at its closing quote; an
 // unquoted cookie or header value, and a quoted one that is never closed, ends at the `;` or `,` that
@@ -822,20 +825,35 @@ const readPairValue: ValueReader = (text, valueStart) => readCarrierValue(text, 
 /** The argument of a long flag (`--password <value>`), when the flag names a credential (see `FLAG_ARGUMENT_PATTERN`). */
 const readFlagArgument: ValueReader = (text, valueStart, carrier) => (isCredentialKey(carrier[1]) ? readCarrierValue(text, valueStart, PAIR_BARE_VALUE_PATTERN) : null);
 
-/** Index just past a cookie pair's or attribute's value, which may be quoted. */
+/**
+ * Index just past a cookie pair's or attribute's value, which may be quoted. A bare run may hold "="
+ * and "#" (`theme=dark#sid=`); when it ends in "=" and a closed quoted value that begins with a value
+ * character stands right after it, the run names one more pair and that quoted value belongs to it
+ * (`theme=dark#sid=\"<v>\"`, review of #78 row E). A quote there that runs unterminated or encloses
+ * prose is the quote of a header line quoted whole (`'Cookie: sid=<base64>==' then ...`) and ends the
+ * value. A marker an earlier rule left at the end of the value (`&sid=[REDACTED]` after the query
+ * rule) is part of it, so the attributes or the later pairs after the marker are still read.
+ */
 function cookieValueEnd(text: string, index: number): number {
   const quoted = readQuotedValue(text, index);
-  if (quoted !== null) return quoted.after;
-  return index + (stickyExec(COOKIE_BARE_VALUE_PATTERN, text, index)?.length ?? 0);
+  if (quoted !== null) return absorbMarkers(text, quoted.after);
+  const bare = stickyExec(COOKIE_BARE_VALUE_PATTERN, text, index) ?? "";
+  let end = index + bare.length;
+  if (bare.endsWith("=")) {
+    const inner = readQuotedValue(text, end);
+    if (inner !== null && inner.close !== "" && stickyExec(COOKIE_VALUE_START_PATTERN, text, inner.start) !== null) end = inner.after;
+  }
+  return absorbMarkers(text, end);
 }
 
 /**
  * Reads a Cookie or Set-Cookie header value: quoted whole; `name=value` (spaces around "=" allowed)
  * followed by attributes (`; Path=/; HttpOnly`) whose values may themselves be quoted; or a bare run
  * after the singular header name. The whole header value is replaced by one marker, a marker an
- * earlier rule left at its end (`Cookie: &sid=[REDACTED]` after the query rule) folded in. The value
- * ends at ",", at a `; Name:` token (the next header on a compound line, which is never a cookie
- * attribute, so the ";" and the name stay for that header's own rule), or at the line end.
+ * earlier rule left in it (`Cookie: &sid=[REDACTED]; pref=<v>` after the query rule) folded in with
+ * the pairs after it. The value ends at ",", at a `; Name:` token (the next header on a compound
+ * line, which is never a cookie attribute, so the ";" and the name stay for that header's own rule),
+ * or at the line end.
  */
 const readCookieHeaderValue: ValueReader = (text, valueStart, carrier) => {
   const quoted = readQuotedValue(text, valueStart);

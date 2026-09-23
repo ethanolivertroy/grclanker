@@ -557,6 +557,67 @@ test("leak-probe class 3: an apostrophe inside a cookie name or value is part of
   assert.equal(scrubErrorText("Cookie: theme=dark; my'pref=hunter2"), `Cookie: ${REDACTED}`);
 });
 
+const REQUEST_ID_HEADER = "X-Request-Id: 5add72d1-b870-423d-a911-7f51772d8e6a";
+
+/**
+ * Review of #78 row E (CodeRabbit r4077655607 on `dd7426e`; leak-probe class 3): a cookie pair whose
+ * name begins with "&" is matched by the query rule before the cookie reader runs, and a query value
+ * that took the ";" with it ended the cookie there, so the later pair survived (`Cookie: [REDACTED]
+ * pref=<v>`). A query value now ends at ";", and the cookie reader folds the marker in and reads the
+ * pairs and attributes after it. A bare cookie run that ends in "=" (`theme=dark#sid=`,
+ * `theme=dark&sid=`) names one more pair whose JSON-escaped quoted value belongs to it, so that value
+ * goes with the header rather than standing after the marker. The header after the cookie keeps its
+ * name and value in every row.
+ */
+const AMPERSAND_COOKIE_ROWS = Object.freeze([
+  ["ampersand name, then a later pair", (a, b) => `Cookie: &sid=${a}; pref=${b}`, () => `Cookie: ${REDACTED}`, []],
+  ["ampersand name, then a later pair, then a header", (a, b) => `Cookie: &sid=${a}; pref=${b}; ${REQUEST_ID_HEADER}`, () => `Cookie: ${REDACTED}; ${REQUEST_ID_HEADER}`, [REQUEST_ID_HEADER]],
+  ["hash name, then a later pair, then a header", (a, b) => `Cookie: #sid=${a}; pref=${b}; ${REQUEST_ID_HEADER}`, () => `Cookie: ${REDACTED}; ${REQUEST_ID_HEADER}`, [REQUEST_ID_HEADER]],
+  ["ampersand name in Set-Cookie before attributes", (a) => `Set-Cookie: &sid=${a}; Path=/; HttpOnly`, () => `Set-Cookie: ${REDACTED}`, []],
+  ["ampersand name in Set-Cookie before attributes and a header", (a) => `Set-Cookie: &sid=${a}; Path=/; HttpOnly; ${REQUEST_ID_HEADER}`, () => `Set-Cookie: ${REDACTED}; ${REQUEST_ID_HEADER}`, [REQUEST_ID_HEADER]],
+  ["bare run ending in = after a hash, then a JSON-escaped quoted value", (a) => `Cookie: theme=dark#sid=\\"${a}\\"; ${REQUEST_ID_HEADER}`, () => `Cookie: ${REDACTED}; ${REQUEST_ID_HEADER}`, [REQUEST_ID_HEADER]],
+  ["bare run ending in = after an ampersand, then a JSON-escaped quoted value", (a) => `Cookie: theme=dark&sid=\\"${a}\\"; ${REQUEST_ID_HEADER}`, () => `Cookie: ${REDACTED}; ${REQUEST_ID_HEADER}`, [REQUEST_ID_HEADER]],
+  ["later ampersand name with a JSON-escaped quoted value", (a) => `Cookie: theme=dark; my&sid=\\"${a}\\"; ${REQUEST_ID_HEADER}`, () => `Cookie: ${REDACTED}; ${REQUEST_ID_HEADER}`, [REQUEST_ID_HEADER]],
+  ["bare run ending in =, then a quoted value, then attributes", (a) => `Set-Cookie: theme=dark&sid="${a}"; Path=/; HttpOnly`, () => `Set-Cookie: ${REDACTED}`, []],
+  ["ampersand name in a JSON-escaped header line", (a, b) => `{"detail":"Cookie: &sid=${a}; pref=${b}; ${REQUEST_ID_HEADER}"}`, () => `{"detail":"Cookie: ${REDACTED}; ${REQUEST_ID_HEADER}"}`, [REQUEST_ID_HEADER]],
+  ["query value ends at the cookie separator, the pair after it keeps its name", (a) => `GET /v1/users?api_key=${a};x=1 failed`, () => `GET /v1/users?api_key=${REDACTED};x=1 failed`, [";x=1 failed"]],
+]);
+
+test("#78 row E: an ampersand or hash cookie name takes the whole header value with the pairs after it, a bare run ending in = owns the quoted value after it, and the following header stays", () => {
+  const legitimate = new Map(AMPERSAND_COOKIE_ROWS.map(([label, line]) => [label, line("", "")]));
+  assertCanariesDisjointFromFixture(assert, plantedValues(), legitimate, "ampersand cookie rows");
+  for (const [label, line, expected, keeps] of AMPERSAND_COOKIE_ROWS) {
+    for (const [a, b] of plantedPairs()) {
+      const input = line(a, b);
+      const planted = [a, b].filter((value) => input.includes(value));
+      for (const [scrubName, scrub] of EXACT_SCRUBS) {
+        const output = scrub(input);
+        assert.equal(output, expected(), `${scrubName}: ${label} with ${a} and ${b}`);
+        for (const text of keeps) assert.ok(output.includes(text), `${scrubName}: ${label}: ${JSON.stringify(text)} did not survive in ${output}`);
+        assertNoCanaryWindows(assert, output, planted, `${scrubName}: ${label}`);
+        assert.equal(scrub(output), output, `${scrubName}: ${label}: a second pass changed the text`);
+      }
+      assertNoCanaryWindows(assert, errorMessage(new Error(input)), planted, `errorMessage: ${label}`);
+      const body = JSON.stringify({ message: `upstream sent ${input}` });
+      assert.equal(describeErrorBody("application/json", body), `upstream sent ${expected()}`, `describeErrorBody: ${label}`);
+      const described = describeFailedResponse({ method: "GET", endpoint: "/v1/users", status: 502, statusText: "Bad Gateway", contentType: "application/json", body });
+      assert.equal(described, `GET /v1/users failed with 502 Bad Gateway: upstream sent ${expected()}`, `describeFailedResponse: ${label}`);
+      assertNoCanaryWindows(assert, described, planted, `describeFailedResponse: ${label}`);
+    }
+  }
+  // The renderings the review reported, with the literal values it used: the later pair survived.
+  assert.equal(scrubErrorText("Cookie: &sid=hunter2; pref=dark"), `Cookie: ${REDACTED}`);
+  assert.equal(scrubDataText("Cookie: theme=dark#sid=\\\"hunter2\\\"; X-Request-Id: 1"), `Cookie: ${REDACTED}; X-Request-Id: 1`);
+  // A ";" still ends a bare query value, so a later query pair on a path keeps its name.
+  assert.equal(scrubErrorText("GET /v1/users?api_key=abcdef123456;page=2 failed"), `GET /v1/users?api_key=${REDACTED};page=2 failed`);
+  // Base64 padding before the closing quote of a header line quoted whole: the quote after "==" runs
+  // unterminated or encloses prose, so it ends the value rather than opening one.
+  assert.equal(scrubErrorText("sent 'Cookie: sid=dGhpcyBpcyBhIHNlY3JldA==' then 'Accept: text/html'"), `sent 'Cookie: ${REDACTED}' then 'Accept: text/html'`);
+  assert.equal(scrubErrorText("header -H 'Cookie: sid=dGhpcyBpcyBhIHNlY3JldA=='. Retry later"), `header -H 'Cookie: ${REDACTED}'. Retry later`);
+  assert.equal(scrubErrorText('{"detail":"sent \\"Cookie: sid=dGhpcyBpcyBhIHNlY3JldA==\\", then \\"Accept: text/html\\""}'), `{"detail":"sent \\"Cookie: ${REDACTED}\\", then \\"Accept: text/html\\""}`);
+  assert.equal(scrubErrorText('{"detail":"sent \\"Cookie: sid=dGhpcyBpcyBhIHNlY3JldA==\\" then \\"Accept: text/html\\""}'), `{"detail":"sent \\"Cookie: ${REDACTED}\\" then \\"Accept: text/html\\""}`);
+});
+
 /**
  * A header line quoted whole in single quotes (a curl `-H` argument, a Python dict repr, a sentence
  * that ends after the quote) keeps its closing quote: the apostrophe that closes it is followed by a
