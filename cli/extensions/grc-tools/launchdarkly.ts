@@ -2885,7 +2885,8 @@ function withTruncatedTokens(inventory: TokenInventory, tokens: LaunchdarklyColl
     ...inventory,
     scope: "partial",
     reason: `The token listing was truncated at ${tokens.seen} of ${tokens.total ?? "an unknown total"} tokens, so the uncollected tokens were not evaluated.`,
-    remedy: "Raise token_limit and rerun for a complete inventory.",
+    // A listing that stopped for a reason other than its cap (a refused next link, for one) is not completed by raising the cap.
+    remedy: tokens.truncationReason ? `${tokens.truncationReason}; review the uncollected tokens in Authorization > Access tokens.` : "Raise token_limit and rerun for a complete inventory.",
   };
 }
 

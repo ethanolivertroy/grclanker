@@ -1530,6 +1530,32 @@ test("assessLaunchdarklyAccessControl never passes role or token controls on tru
   ]);
 });
 
+test("CodeRabbit on #77: a token listing stopped by a refused next link renders the refusal in the token inventory caveat with no token_limit remedy, while a cap stop still offers token_limit", async () => {
+  const base = healthyClient();
+  const refused = await assessLaunchdarklyAccessControl(healthyClient({
+    listTokens: async () => ({ ...(await truncatedListing(base, "listTokens", 2, undefined)), endpoint: "GET /api/v2/tokens?showAll=true", truncationReason: FOREIGN_ORIGIN_MESSAGE }),
+  }), { now: NOW });
+  assert.equal(refused.summary.token_inventory_scope, "partial");
+  for (const id of ["LD-08", "LD-09", "LD-10", "LD-11"]) {
+    const summary = finding(refused, id).summary;
+    assert.equal(findingStatus(refused, id), "warn", `${id} must not pass on a listing whose next link was refused`);
+    assert.match(summary, /Partial token inventory: The token listing was truncated at 2 of an unknown total tokens, so the uncollected tokens were not evaluated\. /);
+    assert.ok(summary.includes(`${FOREIGN_ORIGIN_MESSAGE}; review the uncollected tokens in Authorization > Access tokens.`), `${id} carries the refusal reason`);
+    assert.doesNotMatch(summary, /token_limit/, `${id} must not offer token_limit for a stop the cap did not cause`);
+    assert.deepEqual(finding(refused, id).evidence.truncated_collections, [
+      { collection: "access_tokens", option: "token_limit", seen: 2, total: null, reason: FOREIGN_ORIGIN_MESSAGE },
+    ]);
+  }
+
+  const capped = await assessLaunchdarklyAccessControl(healthyClient({
+    listTokens: () => truncatedListing(base, "listTokens", 2, 40),
+  }), { now: NOW });
+  for (const id of ["LD-08", "LD-09", "LD-10", "LD-11"]) {
+    assert.match(finding(capped, id).summary, /Partial token inventory: The token listing was truncated at 2 of 40 tokens, so the uncollected tokens were not evaluated\. Raise token_limit and rerun for a complete inventory\./, `${id} still offers token_limit for a cap stop`);
+    assert.doesNotMatch(finding(capped, id).summary, /next link/);
+  }
+});
+
 test("assessLaunchdarklyAccessControl marks token controls manual instead of passing when tokens cannot be read", async () => {
   const result = await assessLaunchdarklyAccessControl(healthyClient({
     async listTokens() {
