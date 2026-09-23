@@ -2402,7 +2402,8 @@ function assertPartialView(item, seen, total, reason) {
   assert.equal(item.summary.split("records were retrieved").length, 2, `${item.id} states the partial view exactly once: ${item.summary}`);
   assert.ok(item.summary.includes(`${stated} (${reason})`), `${item.id}: ${item.summary}`);
   assert.equal(item.evidence.inventory_truncated, true, `${item.id} inventory_truncated`);
-  assert.equal(item.evidence.records_seen, seen, `${item.id} records_seen`);
+  // A truncated walk that delivered no record renders records_seen null: 0 would read as an empty inventory.
+  assert.equal(item.evidence.records_seen, seen === 0 ? null : seen, `${item.id} records_seen`);
   assert.equal(item.evidence.records_total, total, `${item.id} records_total`);
 }
 
@@ -2422,8 +2423,18 @@ test("reviewer E gap 5: a truncated inventory states seen versus total on the fa
   networks["GET /networks"] = { networks: [{ uuid: "net-1", name: "Default", is_default: true, scanner_count: 0, assets_ttl_days: 90 }], pagination: { total: 3 } };
   const unassigned = byId(await runAll(clientsFor(networks)), "TENABLE-09");
   assert.equal(unassigned.status, "fail", unassigned.summary);
-  assert.equal(unassigned.summary, "1 of 1 network objects have no assigned scanners: Default. Only 1 of 3 records were retrieved (only 1 of the reported 3 records were returned); the verdict rests on the records retrieved.");
+  // Over a truncated network inventory the networks are counted, not named, and the per-network detail is withheld.
+  assert.equal(unassigned.summary, "1 of 1 network objects have no assigned scanners. Only 1 of 3 records were retrieved (only 1 of the reported 3 records were returned); the verdict rests on the records retrieved.");
   assertPartialView(unassigned, 1, 3, "only 1 of the reported 3 records were returned");
+  assert.equal(unassigned.evidence.network_count, 1);
+  assert.equal(unassigned.evidence.networks_without_scanners, 1);
+  assert.equal(unassigned.evidence.networks, null, "per-network detail is withheld while the inventory is truncated");
+  assert.doesNotMatch(JSON.stringify(unassigned), /Default/);
+  const completeNetworks = healthyRoutes();
+  completeNetworks["GET /networks"] = { networks: [{ uuid: "net-1", name: "Default", is_default: true, scanner_count: 0, assets_ttl_days: 90 }], pagination: { total: 1 } };
+  const namedUnassigned = byId(await runAll(clientsFor(completeNetworks)), "TENABLE-09");
+  assert.equal(namedUnassigned.summary, "1 of 1 network objects have no assigned scanners: Default.");
+  assert.deepEqual(namedUnassigned.evidence.networks, [{ name: "Default", scanner_count: 0, assets_ttl_days: 90, is_default: true }]);
   networks["GET /networks"] = { networks: [{ uuid: "net-1", name: "Default", is_default: true, assets_ttl_days: 90 }], pagination: { total: 3 } };
   const uncounted = byId(await runAll(clientsFor(networks)), "TENABLE-09");
   assert.equal(uncounted.status, "warn", uncounted.summary);
@@ -2488,7 +2499,8 @@ test("reviewer E gap 5: a truncated inventory states seen versus total on the fa
   assert.equal(cappedData.networks.total, null);
   const cappedNetworks = assessTenableSensorCoverage(cappedData, { now: NOW }).findings.find((item) => item.id === "TENABLE-09");
   assert.equal(cappedNetworks.status, "fail", cappedNetworks.summary);
-  assert.equal(cappedNetworks.summary, "1 of 10000 network objects have no assigned scanners: Network 0. Only 10000 of unknown records were retrieved (the walk stopped at the 200-page cap); the verdict rests on the records retrieved.");
+  assert.equal(cappedNetworks.summary, "1 of 10000 network objects have no assigned scanners. Only 10000 of unknown records were retrieved (the walk stopped at the 200-page cap); the verdict rests on the records retrieved.");
+  assert.equal(cappedNetworks.evidence.networks, null, "the network detail is withheld while the walk is capped");
   assertPartialView(cappedNetworks, 10000, null, "the walk stopped at the 200-page cap");
   assert.equal(cappedNetworks.evidence.pagination_total, null);
 
@@ -2520,7 +2532,8 @@ test("reviewer E gap 5: a truncated inventory states seen versus total on the fa
   assert.equal(byId(healthy, "TENABLE-07").evidence.records_total, 1);
   const securityCenter = byId(healthy, "TENABLE-07-SC");
   assert.equal(securityCenter.evidence.inventory_truncated, undefined, "an unconfigured Security Center read renders the unreadable marker, not collection flags");
-  assert.equal(securityCenter.evidence.collected, false);
+  assert.equal(securityCenter.evidence.not_collected, true);
+  assert.ok(!("collected" in securityCenter.evidence), "the finding marker states the absence in the positive form, so no false leaf appears under a denied read");
 
   // An unreadable list renders the flags as null beside the marker of the finding that still reads it.
   const denied = byId(await runAll(clientsFor(forbidding("GET /scanners/null/agents"))), "TENABLE-08");
@@ -2566,8 +2579,10 @@ test("assessment summaries render null, not zero, for every unreadable dataset",
   for (const key of ["user_count", "permission_count", "credential_count", "audit_events", "caller_is_administrator"]) assert.equal(access.summary[key], null, `access_control.summary.${key}`);
   for (const key of ["exported_findings", "exported_assets"]) assert.equal(vuln.summary[key], null, `vulnerability_management.summary.${key}`);
   for (const result of [scan, sensor, access, vuln]) {
-    assert.equal(result.summary.pass, 0, `${result.category}: nothing passes on forbidden data`);
+    // A status count of zero over incomplete inventories renders null, never 0, so it is not read as "none".
+    assert.equal(result.summary.pass, null, `${result.category}: nothing passes on forbidden data, and the zero is not asserted`);
     assert.ok(result.summary.manual >= 1, `${result.category}: unreadable inventories are manual`);
+    assert.ok(!result.findings.some((item) => item.status === "pass"), `${result.category}: no finding passes`);
   }
 });
 
@@ -2635,7 +2650,7 @@ test("addendum 5: refused or failed Tenable reads write not-collected markers na
   const analysis = files.get(join("analysis", "findings.json"));
   const mfa = findings.find((item) => item.id === "TENABLE-10");
   assert.equal(mfa.status, "manual");
-  assert.deepEqual(mfa.evidence, { collected: false, endpoint: "GET /users", dataset_status: "forbidden", http_status: 403, error: mfa.evidence.error });
+  assert.deepEqual(mfa.evidence, { not_collected: true, endpoint: "GET /users", dataset_status: "forbidden", http_status: 403, error: mfa.evidence.error });
   assert.match(mfa.summary, /GET \/users could not be read because GET \/users refused the API key with HTTP 403/);
 
   const [scan, sensor, access, vuln] = await runAll(createTenableClients(vmConfig(), { fetchImpl, sleepImpl: async () => {}, exportPollMs: 0, exportTimeoutMs: 5_000 }));
@@ -3024,7 +3039,7 @@ test("TENABLE-15 (round 1 blocking 2): export chunk records without a documented
   for (const id of EXPORT_CAPPED) {
     const item = byId(onlyResults, id);
     assert.equal(item.status, "manual", `${id} is unreadable, not an empty inventory: ${item.summary}`);
-    assert.equal(item.evidence.collected, false, `${id} evidence is a not-collected marker`);
+    assert.equal(item.evidence.not_collected, true, `${id} evidence is a not-collected marker`);
   }
   const onlyBundle = await exportedBundle(onlyChunk, "only chunk foreign");
   for (const name of ["assets_export.json", "vulns_export.json"]) {

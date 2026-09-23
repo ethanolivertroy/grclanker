@@ -2356,13 +2356,50 @@ function datasetErrors(label: string, dataset: TenableDataset<unknown>): string[
   return lines;
 }
 
-/** Records in a readable list dataset; null when the list was not collected. */
+/*
+ * Incomplete inventories. An inventory is incomplete when it was not read (refused or
+ * failed) or when its page walk was truncated (a page cap, a stalled or replayed page,
+ * or fewer records delivered than pagination.total reports). A count over an incomplete
+ * inventory is a lower bound: a positive count is rendered as observed, and a count of
+ * zero renders null, because the unread remainder may hold what the seen population did
+ * not. Item-level detail (names, labels, per-record entries) is withheld as null while an
+ * inventory is incomplete, so no consumer reads a partial list as the population. No
+ * finding passes over an inventory it did not read to completion, and a fail that rests
+ * on the absence of records becomes warn when the walk was truncated. A platform that is
+ * not configured is not an incomplete inventory: no read was attempted and its findings
+ * say so.
+ */
+function isIncomplete(dataset: TenableDataset<unknown>): boolean {
+  return dataset.status === "forbidden" || dataset.status === "error" || (dataset.status === "ok" && dataset.truncated === true);
+}
+
+function anyIncomplete(datasets: Record<string, TenableDataset<unknown>>): boolean {
+  return Object.values(datasets).some(isIncomplete);
+}
+
+/** A count over inventories: null when any was not read, null in place of 0 when any is incomplete, otherwise the observed count. */
+function boundedCount(count: number, ...datasets: Array<TenableDataset<unknown>>): number | null {
+  if (datasets.some((dataset) => dataset.status !== "ok")) return null;
+  return count === 0 && datasets.some(isIncomplete) ? null : count;
+}
+
+/** Item-level detail over inventories: withheld as null while any is incomplete. */
+function detailOrNull<T>(values: T, ...datasets: Array<TenableDataset<unknown>>): T | null {
+  return datasets.some(isIncomplete) ? null : values;
+}
+
+/** Records in a readable list dataset; null when the list was not collected or was truncated before delivering any. */
 function countOrNull(dataset: TenableDataset<unknown[]>): number | null {
-  return dataset.status === "ok" ? dataset.data.length : null;
+  return boundedCount(dataset.status === "ok" ? dataset.data.length : 0, dataset);
 }
 
 function recordCount(dataset: TenableDataset<TenableExportResult>): number | null {
-  return dataset.status === "ok" ? dataset.data.records.length : null;
+  return boundedCount(dataset.status === "ok" ? dataset.data.records.length : 0, dataset);
+}
+
+/** The records-seen figure of a collection status: null when a truncated walk delivered none. */
+function seenOrNull(dataset: TenableDataset<unknown>): number | null {
+  return dataset.status === "ok" && dataset.truncated === true && dataset.seen === 0 ? null : dataset.seen;
 }
 
 function isExportResult(value: unknown): value is TenableExportResult {
@@ -2447,7 +2484,7 @@ function collectionStatusOf(dataset: TenableDataset<unknown>): JsonRecord {
     status: dataset.status,
     endpoint: dataset.endpoint,
     http_status: dataset.httpStatus,
-    seen: dataset.seen,
+    seen: seenOrNull(dataset),
     total: dataset.total,
     truncated: dataset.truncated,
     unevaluable_records: dataset.status === "ok" && isExportResult(dataset.data) ? dataset.data.unevaluableRecords : null,
@@ -2509,8 +2546,10 @@ function unreadableFinding(control: number, severity: TenableSeverity, dataset: 
   const summary = dataset.status === "not_configured"
     ? `Not applicable: ${describeUnread(dataset)}, so this control was not assessed. A human must collect ${manualEvidence}.`
     : `Unknown: ${dataset.endpoint} could not be read because ${describeUnread(dataset)}. A human must collect ${manualEvidence}.`;
+  // The evidence states the absence in the positive form (not_collected: true): a false
+  // leaf appearing under a denied read is the shape an empty or disabled setting takes.
   return finding(control, "manual", severity, summary, {
-    collected: false,
+    not_collected: true,
     endpoint: dataset.endpoint,
     dataset_status: dataset.status,
     http_status: dataset.httpStatus,
@@ -2542,7 +2581,7 @@ function withPartialView(item: TenableFinding, dataset: TenableDataset<unknown>)
   const evidence: JsonRecord = {
     ...item.evidence,
     inventory_truncated: readable ? dataset.truncated : null,
-    records_seen: readable ? dataset.seen ?? null : null,
+    records_seen: readable ? seenOrNull(dataset) ?? null : null,
     records_total: readable ? dataset.total ?? null : null,
   };
   if (!readable || !dataset.truncated || item.summary.includes(" records were retrieved")) return { ...item, evidence };
@@ -2554,6 +2593,14 @@ function withPartialView(item: TenableFinding, dataset: TenableDataset<unknown>)
 // them is unreadable, even when the unreadable one only feeds evidence.
 function capForUnreadable(status: TenableFindingStatus, ...datasets: Array<TenableDataset<unknown>>): TenableFindingStatus {
   if (status === "pass" && datasets.some((dataset) => dataset.status !== "ok")) return "warn";
+  return status;
+}
+
+// The corollary extended to truncation: a pass does not survive a secondary inventory
+// that was unreadable or truncated, since its unread remainder may hold what the pass
+// ruled out.
+function capForIncomplete(status: TenableFindingStatus, ...datasets: Array<TenableDataset<unknown>>): TenableFindingStatus {
+  if (status === "pass" && datasets.some((dataset) => dataset.status !== "ok" || dataset.truncated === true)) return "warn";
   return status;
 }
 
@@ -3082,11 +3129,14 @@ export function assessTenableScanProgram(data: TenableScanProgramData, options: 
           ? `All ${exclusions.length} exclusions are scheduled, documented, and scoped to narrow targets.${partialNote(data.exclusions)}`
           : `${issues.size} of ${exclusions.length} exclusions need review: ${permanent.length} always-on (schedule.enabled=false), ${undocumented.length} without a description, ${broad.length} covering /16 or wider ranges.`,
       {
-        exclusion_count: exclusions.length,
+        exclusion_count: boundedCount(exclusions.length, data.exclusions),
         pagination_total: data.exclusions.total ?? null,
-        permanent_exclusions: permanent.map((item) => asString(item.name)).slice(0, 50),
-        undocumented_exclusions: undocumented.map((item) => asString(item.name)).slice(0, 50),
-        broad_exclusions: broad.map((item) => asString(item.name)).slice(0, 50),
+        permanent_exclusions_count: boundedCount(permanent.length, data.exclusions),
+        undocumented_exclusions_count: boundedCount(undocumented.length, data.exclusions),
+        broad_exclusions_count: boundedCount(broad.length, data.exclusions),
+        permanent_exclusions: detailOrNull(permanent.map((item) => asString(item.name)).slice(0, 50), data.exclusions),
+        undocumented_exclusions: detailOrNull(undocumented.map((item) => asString(item.name)).slice(0, 50), data.exclusions),
+        broad_exclusions: detailOrNull(broad.map((item) => asString(item.name)).slice(0, 50), data.exclusions),
       },
     ), data.exclusions));
   }
@@ -3138,6 +3188,18 @@ export function assessTenableScanProgram(data: TenableScanProgramData, options: 
     ...datasetErrors("sc_scan_results", data.scScanResults),
   ];
 
+  const datasets = {
+    scans: data.scans,
+    policies: data.policies,
+    policy_details: data.policyDetails,
+    templates: data.templates,
+    exclusions: data.exclusions,
+    target_groups: data.targetGroups,
+    users: data.users,
+    asset_export: data.assetExport,
+    sc_scans: data.scScans,
+    sc_scan_results: data.scScanResults,
+  };
   return {
     title: "Tenable scan program",
     category: "scan_program",
@@ -3148,19 +3210,8 @@ export function assessTenableScanProgram(data: TenableScanProgramData, options: 
       target_group_count: countOrNull(data.targetGroups),
       exported_assets: recordCount(data.assetExport),
       caller_is_administrator: callerIsAdministrator,
-      ...statusCounts(findings),
-      collection: collectionSummary({
-        scans: data.scans,
-        policies: data.policies,
-        policy_details: data.policyDetails,
-        templates: data.templates,
-        exclusions: data.exclusions,
-        target_groups: data.targetGroups,
-        users: data.users,
-        asset_export: data.assetExport,
-        sc_scans: data.scScans,
-        sc_scan_results: data.scScanResults,
-      }),
+      ...statusCounts(findings, anyIncomplete(datasets)),
+      collection: collectionSummary(datasets),
     },
     findings,
     errors,
@@ -3276,8 +3327,14 @@ export function assessTenableSensorCoverage(data: TenableSensorCoverageData, opt
       ? data.networks.data.filter((network) => !perNetwork.has(asString(network.name) ?? "") && !perNetwork.has(asString(network.uuid) ?? "")).map((network) => asString(network.name) ?? asString(network.uuid) ?? "network")
       : [];
     const expected = options.expectedAssetCount;
+    // Networks are named only when the network inventory was read to completion; over a
+    // truncated walk the note counts them and says why they are not named.
     const networkNote = data.networks.status === "ok"
-      ? (emptyNetworks.length > 0 ? ` Networks without assets: ${emptyNetworks.slice(0, 10).join(", ")}.` : "")
+      ? emptyNetworks.length === 0
+        ? ""
+        : data.networks.truncated
+          ? ` ${emptyNetworks.length} of the ${data.networks.data.length} network objects retrieved have no assets; the network inventory was truncated (${data.networks.seen ?? "an unknown number"} of ${data.networks.total ?? "unknown"} records), so they are not named until it is read to completion.`
+          : ` Networks without assets: ${emptyNetworks.slice(0, 10).join(", ")}.`
       : ` ${describeUnread(data.networks)}, so networks without assets are unknown.`;
     let status: TenableFindingStatus;
     let summary: string;
@@ -3286,8 +3343,8 @@ export function assessTenableSensorCoverage(data: TenableSensorCoverageData, opt
       summary = "The asset export finished with zero assets, so no asset inventory exists to compare against expected ranges; emptiness fails this control.";
     } else if (expected !== undefined && expected > 0) {
       const coverage = ratio(fresh.length, expected);
-      status = coverage >= 0.95 ? capForUnreadable(capForPartial("pass", data.assetExport), data.networks) : "fail";
-      summary = `${fresh.length} assets seen within ${staleAssetDays} days against an expected population of ${expected} (${percent(coverage)} coverage).${undated.length > 0 ? ` ${undated.length} assets have no last_seen date and were not counted.` : ""}${partialNote(data.assetExport)}${unreadableNote([{ dataset: data.networks, consequence: "networks without assets are unknown" }])}`;
+      status = coverage >= 0.95 ? capForIncomplete(capForPartial("pass", data.assetExport), data.networks) : "fail";
+      summary = `${fresh.length} assets seen within ${staleAssetDays} days against an expected population of ${expected} (${percent(coverage)} coverage).${undated.length > 0 ? ` ${undated.length} assets have no last_seen date and were not counted.` : ""}${partialNote(data.assetExport)}${partialNote(data.networks)}${unreadableNote([{ dataset: data.networks, consequence: "networks without assets are unknown" }])}`;
     } else {
       status = "manual";
       summary = `${assets.length} assets exported (${fresh.length} seen within ${staleAssetDays} days, ${stale} stale, ${undated.length} without last_seen). The API does not know the expected network ranges; pass expected_asset_count or compare the per-network counts in the evidence against the authoritative inventory.${networkNote}`;
@@ -3298,7 +3355,8 @@ export function assessTenableSensorCoverage(data: TenableSensorCoverageData, opt
       stale_assets: stale,
       undated_assets: undated.length,
       assets_per_network: Object.fromEntries(perNetwork),
-      networks_without_assets: data.networks.status === "ok" ? emptyNetworks.slice(0, 50) : null,
+      networks_without_assets_count: boundedCount(emptyNetworks.length, data.networks),
+      networks_without_assets: detailOrNull(emptyNetworks.slice(0, 50), data.networks),
       networks_status: data.networks.status,
       expected_asset_count: expected ?? null,
       export_status: data.assetExport.data.status,
@@ -3316,6 +3374,10 @@ export function assessTenableSensorCoverage(data: TenableSensorCoverageData, opt
     } else if (assets.length === 0) {
       tagStatus = "manual";
       tagSummary = "Zero assets were exported, so tag coverage cannot be measured.";
+    } else if (categories.length === 0 && data.tagCategories.truncated) {
+      // Zero delivered records under a truncated walk is an unread taxonomy, not an absent one.
+      tagStatus = "warn";
+      tagSummary = `${data.tagCategories.endpoint} delivered zero tag categories although pagination.total reports ${data.tagCategories.total ?? "an unknown count"}, so the tag taxonomy was not reviewed.${partialNote(data.tagCategories)}`;
     } else if (categories.length === 0) {
       tagStatus = "fail";
       tagSummary = "No tag categories are defined, so assets are not classified for compliance scope, business unit, or environment.";
@@ -3323,16 +3385,19 @@ export function assessTenableSensorCoverage(data: TenableSensorCoverageData, opt
       tagStatus = "fail";
       tagSummary = `${percent(taggedRatio)} of ${assets.length} assets carry at least one tag, below the ${percent(taggedThreshold)} threshold (${categories.length} categories defined).`;
     } else {
-      tagStatus = capForUnreadable(capForPartial("pass", data.assetExport), data.tagValues);
-      tagSummary = `${percent(taggedRatio)} of ${assets.length} assets carry at least one tag across ${categories.length} categories. Confirm the categories cover compliance scope, business unit, and environment.${partialNote(data.assetExport)}${unreadableNote([{ dataset: data.tagValues, consequence: "the tag value population is unknown" }])}`;
+      tagStatus = capForIncomplete(capForPartial("pass", data.assetExport), data.tagCategories, data.tagValues);
+      tagSummary = `${percent(taggedRatio)} of ${assets.length} assets carry at least one tag across ${categories.length} categories. Confirm the categories cover compliance scope, business unit, and environment.${partialNote(data.assetExport)}${partialNote(data.tagCategories)}${partialNote(data.tagValues)}${unreadableNote([{ dataset: data.tagValues, consequence: "the tag value population is unknown" }])}`;
     }
     findings.push(finding(16, tagStatus, "medium", tagSummary, {
       asset_count: assets.length,
       tagged_assets: tagged.length,
       tagged_ratio: taggedRatio,
       threshold: taggedThreshold,
-      tag_categories: data.tagCategories.status === "ok" ? categories.slice(0, 50) : null,
+      tag_category_count: countOrNull(data.tagCategories),
+      tag_categories: detailOrNull(categories.slice(0, 50), data.tagCategories),
+      tag_categories_truncated: data.tagCategories.status === "ok" ? data.tagCategories.truncated : null,
       tag_value_count: countOrNull(data.tagValues),
+      tag_values_truncated: data.tagValues.status === "ok" ? data.tagValues.truncated : null,
       unevaluable_records: unevaluableRecordsOf(data.assetExport),
     }));
   }
@@ -3373,15 +3438,16 @@ export function assessTenableSensorCoverage(data: TenableSensorCoverageData, opt
       summary = `All ${agents.length} agents connected within ${agentOfflineDays} days and run version ${newest ?? "unknown"}; ${unhealthy.size} offline.${unreadableNote([{ dataset: data.serverProperties, consequence: "the licensed agent count (license.agents) is unknown" }])}`;
     }
     findings.push(withPartialView(finding(5, status, "high", summary, {
-      agent_count: agents.length,
+      agent_count: boundedCount(agents.length, data.agents),
       pagination_total: data.agents.total ?? null,
       licensed_agents: licensedAgents ?? null,
       server_properties_status: data.serverProperties.status,
-      offline_agents: offline.length,
-      stale_connect_agents: staleConnect.length,
-      undated_agents: undated.length,
+      offline_agents: boundedCount(offline.length, data.agents),
+      stale_connect_agents: boundedCount(staleConnect.length, data.agents),
+      undated_agents: boundedCount(undated.length, data.agents),
       newest_version: newest ?? null,
-      outdated_agents: outdated.map((agent) => `${asString(agent.name) ?? agent.id} (${asString(agent.core_version)})`).slice(0, 50),
+      outdated_agents_count: boundedCount(outdated.length, data.agents),
+      outdated_agents: detailOrNull(outdated.map((agent) => `${asString(agent.name) ?? agent.id} (${asString(agent.core_version)})`).slice(0, 50), data.agents),
       agent_offline_days: agentOfflineDays,
     }), data.agents));
 
@@ -3406,10 +3472,11 @@ export function assessTenableSensorCoverage(data: TenableSensorCoverageData, opt
       groupSummary = `All ${agents.length} agents belong to at least one of ${groupCount} agent groups. Confirm the groups mirror network segments or business units.`;
     }
     findings.push(withPartialView(finding(6, groupStatus, "medium", groupSummary, {
-      agent_count: agents.length,
+      agent_count: boundedCount(agents.length, data.agents),
       agent_group_count: groupCount,
-      ungrouped_agents: ungrouped.map((agent) => asString(agent.name) ?? asString(agent.id)).slice(0, 50),
-      groups: data.agentGroups.status === "ok" ? data.agentGroups.data.map((group) => ({ name: asString(group.name), agents_count: asNumber(group.agents_count) ?? null })).slice(0, 50) : null,
+      ungrouped_agents_count: boundedCount(ungrouped.length, data.agents),
+      ungrouped_agents: detailOrNull(ungrouped.map((agent) => asString(agent.name) ?? asString(agent.id)).slice(0, 50), data.agents),
+      groups: detailOrNull(data.agentGroups.status === "ok" ? data.agentGroups.data.map((group) => ({ name: asString(group.name), agents_count: asNumber(group.agents_count) ?? null })).slice(0, 50) : null, data.agentGroups),
       agent_groups_status: data.agentGroups.status,
     }), data.agents));
   }
@@ -3514,7 +3581,7 @@ export function assessTenableSensorCoverage(data: TenableSensorCoverageData, opt
       evaluated_scanners: data.scanners.status === "ok" ? datedScanners.map((scanner) => `${asString(scanner.name)} (${asString(scanner.loaded_plugin_set)})`).slice(0, 50) : null,
       stale_scanners: data.scanners.status === "ok" ? staleScanners.map((scanner) => `${asString(scanner.name)} (${asString(scanner.loaded_plugin_set)})`).slice(0, 50) : null,
       undated_scanners: data.scanners.status === "ok" ? undatedScanners.map((scanner) => asString(scanner.name)).slice(0, 50) : null,
-      stale_online_agents: data.agents.status === "ok" ? staleAgents.length : null,
+      stale_online_agents: boundedCount(staleAgents.length, data.agents),
       agents_status: data.agents.status,
       threshold_hours: pluginStaleHours,
     }), data.agents));
@@ -3533,14 +3600,17 @@ export function assessTenableSensorCoverage(data: TenableSensorCoverageData, opt
       networks.length === 0
         ? `${data.networks.endpoint} returned zero network objects; the default network should always exist, so the view is incomplete. Collect the network list from Settings > Sensors > Networks.`
         : withoutScanners.length > 0
-          ? `${withoutScanners.length} of ${networks.length} network objects have no assigned scanners: ${withoutScanners.map((network) => asString(network.name)).slice(0, 10).join(", ")}.`
+          // Names are given only over a network inventory read to completion.
+          ? `${withoutScanners.length} of ${networks.length} network objects have no assigned scanners${data.networks.truncated ? "" : `: ${withoutScanners.map((network) => asString(network.name)).slice(0, 10).join(", ")}`}.`
           : unknownCount.length > 0
             ? `${networks.length} network objects exist but ${unknownCount.length} did not expose scanner_count, so scanner assignment cannot be confirmed for them.`
             : `All ${networks.length} network objects have at least one assigned scanner.${partialNote(data.networks)}`,
       {
-        network_count: networks.length,
+        network_count: boundedCount(networks.length, data.networks),
         pagination_total: data.networks.total ?? null,
-        networks: networks.map((network) => ({ name: asString(network.name), scanner_count: asNumber(network.scanner_count) ?? null, assets_ttl_days: asNumber(network.assets_ttl_days) ?? null, is_default: asBoolean(network.is_default) ?? null })).slice(0, 50),
+        networks_without_scanners: boundedCount(withoutScanners.length, data.networks),
+        networks_without_scanner_count: boundedCount(unknownCount.length, data.networks),
+        networks: detailOrNull(networks.map((network) => ({ name: asString(network.name), scanner_count: asNumber(network.scanner_count) ?? null, assets_ttl_days: asNumber(network.assets_ttl_days) ?? null, is_default: asBoolean(network.is_default) ?? null })).slice(0, 50), data.networks),
       },
     ), data.networks));
   }
@@ -3561,31 +3631,32 @@ export function assessTenableSensorCoverage(data: TenableSensorCoverageData, opt
     ...datasetErrors("sc_feed", data.scFeed),
   ];
 
+  const datasets = {
+    server_properties: data.serverProperties,
+    scanners: data.scanners,
+    agents: data.agents,
+    agent_groups: data.agentGroups,
+    networks: data.networks,
+    tag_categories: data.tagCategories,
+    tag_values: data.tagValues,
+    asset_export: data.assetExport,
+    users: data.users,
+    sc_scanners: data.scScanners,
+    sc_feed: data.scFeed,
+  };
   return {
     title: "Tenable sensor and asset coverage",
     category: "sensor_coverage",
     summary: {
-      exported_assets: data.assetExport.status === "ok" ? assets.length : null,
+      exported_assets: recordCount(data.assetExport),
       agent_count: countOrNull(data.agents),
       scanner_entries: countOrNull(data.scanners),
-      linked_scanners: data.scanners.status === "ok" ? linkedScanners.length : null,
+      linked_scanners: boundedCount(linkedScanners.length, data.scanners),
       network_count: countOrNull(data.networks),
       tag_categories: countOrNull(data.tagCategories),
       caller_is_administrator: callerIsAdministrator,
-      ...statusCounts(findings),
-      collection: collectionSummary({
-        server_properties: data.serverProperties,
-        scanners: data.scanners,
-        agents: data.agents,
-        agent_groups: data.agentGroups,
-        networks: data.networks,
-        tag_categories: data.tagCategories,
-        tag_values: data.tagValues,
-        asset_export: data.assetExport,
-        users: data.users,
-        sc_scanners: data.scScanners,
-        sc_feed: data.scFeed,
-      }),
+      ...statusCounts(findings, anyIncomplete(datasets)),
+      collection: collectionSummary(datasets),
     },
     findings,
     errors,
@@ -3767,7 +3838,7 @@ export function assessTenableAccessControl(data: TenableAccessControlData, optio
   if (data.permissions.status !== "ok") {
     findings.push(unreadableFinding(11, "high", data.permissions, "the access control permission list (Settings > Access Control > Permissions) and any legacy access groups"));
   } else if (data.permissions.data.length === 0) {
-    findings.push(finding(11, "manual", "high", `${data.permissions.endpoint} returned zero permissions, but Tenable always generates administrator permissions, so the view is incomplete; collect the permission list from Settings > Access Control > Permissions.`, { permission_count: 0 }));
+    findings.push(finding(11, "manual", "high", `${data.permissions.endpoint} returned zero permissions, but Tenable always generates administrator permissions, so the view is incomplete; collect the permission list from Settings > Access Control > Permissions.`, { permission_count: boundedCount(0, data.permissions) }));
   } else {
     const permissions = data.permissions.data;
     const broad = permissions.filter((permission) => {
@@ -3792,10 +3863,12 @@ export function assessTenableAccessControl(data: TenableAccessControlData, optio
             ? `${permissions.length} permissions follow least privilege for AllUsers, but ${describeUnread(data.accessGroups)}, so legacy access groups are unverified and the verdict is capped at warn.`
             : `${permissions.length} permissions are defined and none grants AllUsers write-style actions on all assets; no legacy access groups remain.${partialNote(data.accessGroups)}${unreadableNote([{ dataset: data.groups, consequence: "user group membership is unknown" }])}${nonAdminNote(callerIsAdministrator)}`,
       {
-        permission_count: permissions.length,
-        broad_permissions: broad.map((permission) => asString(permission.name)).slice(0, 50),
-        legacy_access_groups: data.accessGroups.status === "ok" ? legacyAccessGroups.map((group) => asString(group.name)).slice(0, 50) : null,
+        permission_count: boundedCount(permissions.length, data.permissions),
+        broad_permissions: detailOrNull(broad.map((permission) => asString(permission.name)).slice(0, 50), data.permissions),
+        legacy_access_group_count: boundedCount(legacyAccessGroups.length, data.accessGroups),
+        legacy_access_groups: detailOrNull(legacyAccessGroups.map((group) => asString(group.name)).slice(0, 50), data.accessGroups),
         access_groups_status: data.accessGroups.status,
+        access_groups_truncated: data.accessGroups.status === "ok" ? data.accessGroups.truncated : null,
         user_groups: countOrNull(data.groups),
       },
     ));
@@ -3804,7 +3877,7 @@ export function assessTenableAccessControl(data: TenableAccessControlData, optio
   if (data.credentials.status !== "ok") {
     findings.push(unreadableFinding(12, "medium", data.credentials, "the managed credential inventory with types, owners, and last use from Settings > Credentials"));
   } else if (data.credentials.data.length === 0) {
-    findings.push(finding(12, "manual", "medium", `${data.credentials.endpoint} returned zero managed credentials (pagination.total ${data.credentials.total ?? "not reported"}). Scan-embedded credentials are not listed by the API, so a human must confirm how scan credentials are managed and rotated.`, { credential_count: 0, pagination_total: data.credentials.total ?? null }));
+    findings.push(finding(12, "manual", "medium", `${data.credentials.endpoint} returned zero managed credentials (pagination.total ${data.credentials.total ?? "not reported"}).${data.credentials.truncated ? " The walk was truncated before any record arrived, so the credential list was not reviewed." : ""} Scan-embedded credentials are not listed by the API, so a human must confirm how scan credentials are managed and rotated.`, { credential_count: boundedCount(0, data.credentials), pagination_total: data.credentials.total ?? null, inventory_truncated: data.credentials.truncated }));
   } else {
     const credentials = data.credentials.data;
     const unused = credentials.filter((credential) => asNumber(asObject(credential.last_used_by)?.id) === undefined);
@@ -3828,12 +3901,14 @@ export function assessTenableAccessControl(data: TenableAccessControlData, optio
           ? `${credentials.length} managed credentials are all in use, but ${undated.length} expose no created_date.`
           : `All ${credentials.length} managed credentials are in use and were created within the last year across ${types.size} credential types.${partialNote(data.credentials)}`,
       {
-        credential_count: credentials.length,
+        credential_count: boundedCount(credentials.length, data.credentials),
         pagination_total: data.credentials.total ?? null,
         types: Object.fromEntries(types),
-        unused_credentials: unused.map((credential) => asString(credential.name)).slice(0, 50),
-        older_than_one_year: old.map((credential) => asString(credential.name)).slice(0, 50),
-        undated_credentials: undated.length,
+        unused_credentials_count: boundedCount(unused.length, data.credentials),
+        older_than_one_year_count: boundedCount(old.length, data.credentials),
+        unused_credentials: detailOrNull(unused.map((credential) => asString(credential.name)).slice(0, 50), data.credentials),
+        older_than_one_year: detailOrNull(old.map((credential) => asString(credential.name)).slice(0, 50), data.credentials),
+        undated_credentials: boundedCount(undated.length, data.credentials),
       },
     ), data.credentials));
   }
@@ -3863,19 +3938,21 @@ export function assessTenableAccessControl(data: TenableAccessControlData, optio
       summary = `${events.length} activity log events were retrieved completely for the last ${lookbackDays} days with no deletions, privilege changes, or exclusion changes; ${failures.length} failed actions recorded.`;
     }
     findings.push(finding(18, status, "medium", summary, {
-      event_count: events.length,
+      event_count: boundedCount(events.length, data.auditLog),
       pagination_total: data.auditLog.total ?? null,
+      inventory_truncated: data.auditLog.truncated,
       lookback_days: lookbackDays,
-      deletions: deletes.length,
-      privilege_changes: privilege.length,
-      exclusion_or_template_changes: exclusionOrPolicy.length,
-      failed_actions: failures.length,
-      sensitive_samples: [...deletes, ...privilege, ...exclusionOrPolicy].slice(0, 25).map((event) => ({
+      deletions: boundedCount(deletes.length, data.auditLog),
+      privilege_changes: boundedCount(privilege.length, data.auditLog),
+      exclusion_or_template_changes: boundedCount(exclusionOrPolicy.length, data.auditLog),
+      failed_actions: boundedCount(failures.length, data.auditLog),
+      sensitive_events: boundedCount(sensitive.size, data.auditLog),
+      sensitive_samples: detailOrNull([...deletes, ...privilege, ...exclusionOrPolicy].slice(0, 25).map((event) => ({
         received: asString(event.received),
         action: asString(event.action),
         actor: asString(asObject(event.actor)?.name),
         target: asString(asObject(event.target)?.name),
-      })),
+      })), data.auditLog),
     }));
   }
 
@@ -3892,6 +3969,16 @@ export function assessTenableAccessControl(data: TenableAccessControlData, optio
     ...datasetErrors("sc_users", data.scUsers),
   ];
 
+  const datasets = {
+    users: data.users,
+    groups: data.groups,
+    roles: data.roles,
+    permissions: data.permissions,
+    access_groups: data.accessGroups,
+    credentials: data.credentials,
+    audit_log: data.auditLog,
+    sc_users: data.scUsers,
+  };
   return {
     title: "Tenable access control",
     category: "access_control",
@@ -3901,17 +3988,8 @@ export function assessTenableAccessControl(data: TenableAccessControlData, optio
       credential_count: countOrNull(data.credentials),
       audit_events: countOrNull(data.auditLog),
       caller_is_administrator: callerIsAdministrator,
-      ...statusCounts(findings),
-      collection: collectionSummary({
-        users: data.users,
-        groups: data.groups,
-        roles: data.roles,
-        permissions: data.permissions,
-        access_groups: data.accessGroups,
-        credentials: data.credentials,
-        audit_log: data.auditLog,
-        sc_users: data.scUsers,
-      }),
+      ...statusCounts(findings, anyIncomplete(datasets)),
+      collection: collectionSummary(datasets),
     },
     findings,
     errors,
@@ -4106,7 +4184,7 @@ export function assessTenableVulnerabilityManagement(data: TenableVulnerabilityD
     findings.push(data.vulnExportJobs.status === "not_configured"
       ? unreadableFinding(19, "medium", data.vulnExportJobs, manualEvidence)
       : finding(19, "manual", "medium", `Unknown: the export job lists could not be read because ${describeUnread(data.vulnExportJobs)} and ${describeUnread(data.assetExportJobs)}. A human must collect ${manualEvidence}.`, {
-        collected: false,
+        not_collected: true,
         vuln_export_jobs: collectionStatusOf(data.vulnExportJobs),
         asset_export_jobs: collectionStatusOf(data.assetExportJobs),
       }));
@@ -4158,6 +4236,13 @@ export function assessTenableVulnerabilityManagement(data: TenableVulnerabilityD
     ...datasetErrors("users", data.users),
   ];
 
+  const datasets = {
+    vuln_export: data.vulnExport,
+    asset_export: data.assetExport,
+    vuln_export_jobs: data.vulnExportJobs,
+    asset_export_jobs: data.assetExportJobs,
+    users: data.users,
+  };
   return {
     title: "Tenable vulnerability management",
     category: "vulnerability_management",
@@ -4166,27 +4251,24 @@ export function assessTenableVulnerabilityManagement(data: TenableVulnerabilityD
       exported_assets: assetCount ?? null,
       vuln_export_status: data.vulnExport.data.status,
       caller_is_administrator: callerIsAdministrator,
-      ...statusCounts(findings),
-      collection: collectionSummary({
-        vuln_export: data.vulnExport,
-        asset_export: data.assetExport,
-        vuln_export_jobs: data.vulnExportJobs,
-        asset_export_jobs: data.assetExportJobs,
-        users: data.users,
-      }),
+      ...statusCounts(findings, anyIncomplete(datasets)),
+      collection: collectionSummary(datasets),
     },
     findings,
     errors,
   };
 }
 
-function statusCounts(findings: TenableFinding[]): JsonRecord {
-  return {
-    pass: findings.filter((item) => item.status === "pass").length,
-    warn: findings.filter((item) => item.status === "warn").length,
-    fail: findings.filter((item) => item.status === "fail").length,
-    manual: findings.filter((item) => item.status === "manual").length,
+// Status counts over a set of findings. With incomplete=true (an inventory the findings
+// read was unreadable or truncated) a count of zero renders null: a finding over that
+// inventory may be undetermined, so 0 would claim that no finding has the status when
+// one may (see "Incomplete inventories"). A positive count is rendered as observed.
+function statusCounts(findings: TenableFinding[], incomplete: boolean): JsonRecord {
+  const count = (status: TenableFindingStatus): number | null => {
+    const total = findings.filter((item) => item.status === status).length;
+    return total === 0 && incomplete ? null : total;
   };
+  return { pass: count("pass"), warn: count("warn"), fail: count("fail"), manual: count("manual") };
 }
 
 /**
@@ -4386,7 +4468,11 @@ function formatAssessmentText(result: TenableAssessmentResult): string {
 
 function buildExecutiveSummary(config: TenableResolvedConfig, assessments: TenableAssessmentResult[], errors: string[]): string {
   const findings = assessments.flatMap((assessment) => assessment.findings);
-  const counts = statusCounts(findings);
+  // A category renders a null status count only when an inventory its findings read was
+  // incomplete, so the roll-up inherits that state from the category summaries.
+  const incomplete = assessments.some((assessment) => ["pass", "warn", "fail", "manual"].some((key) => assessment.summary[key] === null));
+  const counts = statusCounts(findings, incomplete);
+  const renderCount = (value: unknown): string => value === null ? "none seen (not asserted: an inventory the findings read was incomplete)" : String(value);
   const lines = [
     "# Tenable Audit Executive Summary",
     "",
@@ -4395,10 +4481,10 @@ function buildExecutiveSummary(config: TenableResolvedConfig, assessments: Tenab
     "",
     "## Result Counts",
     "",
-    `- Passing: ${counts.pass}`,
-    `- Warning: ${counts.warn}`,
-    `- Failing: ${counts.fail}`,
-    `- Manual (unknown or not applicable): ${counts.manual}`,
+    `- Passing: ${renderCount(counts.pass)}`,
+    `- Warning: ${renderCount(counts.warn)}`,
+    `- Failing: ${renderCount(counts.fail)}`,
+    `- Manual (unknown or not applicable): ${renderCount(counts.manual)}`,
     "",
     "## Highest Priority Findings",
     "",
