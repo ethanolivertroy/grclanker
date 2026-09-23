@@ -3587,17 +3587,24 @@ function nullUnless<T>(readable: boolean, value: T): T | null {
 }
 
 /*
- * Incomplete inventories. A surface is incomplete when it was not read or when its walk
- * stopped early (a page cap, a stuck offset, or a refused next link). A count over an
- * incomplete surface is a lower bound: a positive count is rendered as observed, and a
- * count of zero renders null, because the unread remainder may hold what the seen records
- * did not. Item-level detail (names, hosts, per-record entries) is withheld as null while a
- * surface is incomplete, so no consumer reads a partial list as the population. The gate
- * caps a pass over a truncated surface at warn, and a fail that rests on the absence of
+ * Incomplete inventories. A surface is incomplete when it was not read, when its walk
+ * stopped early (a page cap, a stuck offset, or a refused next link), or when some of the
+ * records it delivered were kept out as unevaluable (records that carry none of the
+ * surface's documented members): the evaluated records are then not the whole population
+ * the surface delivered. A count over an incomplete surface is a lower bound: a positive
+ * count is rendered as observed, and a count of zero renders null, because the unread or
+ * unevaluated remainder may hold what the seen records did not. Item-level detail (names,
+ * hosts, per-record entries) is withheld as null while a surface is incomplete, so no
+ * consumer reads a partial list as the population. The gate caps a pass over a truncated
+ * surface or one with unevaluable records at warn, and a fail that rests on the absence of
  * records becomes warn when the walk was truncated.
  */
+function hasUnevaluableRecords(snapshot: { unevaluable?: Record<string, number> }, surface: string): boolean {
+  return (snapshot.unevaluable?.[surface] ?? 0) > 0;
+}
+
 function computeIncomplete(snapshot: ComputeSnapshot, ...surfaces: string[]): boolean {
-  return surfaces.some((surface) => snapshot.failed.includes(surface) || snapshot.truncated.includes(surface));
+  return surfaces.some((surface) => snapshot.failed.includes(surface) || snapshot.truncated.includes(surface) || hasUnevaluableRecords(snapshot, surface));
 }
 
 function computeCount(snapshot: ComputeSnapshot, surfaces: string[], count: number): number | null {
@@ -3610,7 +3617,7 @@ function computeDetail<T>(snapshot: ComputeSnapshot, surfaces: string[], value: 
 }
 
 function prismaIncomplete(snapshot: PrismaSnapshot, ...surfaces: string[]): boolean {
-  return surfaces.some((surface) => snapshot.failed.includes(surface) || (surface === "open alerts" && snapshot.alertsTruncated === true));
+  return surfaces.some((surface) => snapshot.failed.includes(surface) || (surface === "open alerts" && snapshot.alertsTruncated === true) || hasUnevaluableRecords(snapshot, surface));
 }
 
 function prismaCount(snapshot: PrismaSnapshot, surfaces: string[], count: number): number | null {
@@ -5028,12 +5035,14 @@ function renderStatusCount(value: unknown): string {
   return value === null ? "none seen" : String(value);
 }
 
-/** True when a Prisma Cloud or Compute surface the findings read was unreadable or truncated. */
+/** True when a Prisma Cloud or Compute surface the findings read was unreadable, truncated, or delivered unevaluable records. */
 function prismaSnapshotIncomplete(snapshot: PrismaSnapshot): boolean {
+  const anyUnevaluable = (unevaluable: Record<string, number> | undefined): boolean => Object.values(unevaluable ?? {}).some((count) => count > 0);
   return snapshot.errors.length > 0
     || snapshot.failed.length > 0
     || snapshot.alertsTruncated === true
-    || (snapshot.compute !== undefined && (snapshot.compute.failed.length > 0 || snapshot.compute.truncated.length > 0));
+    || anyUnevaluable(snapshot.unevaluable)
+    || (snapshot.compute !== undefined && (snapshot.compute.failed.length > 0 || snapshot.compute.truncated.length > 0 || anyUnevaluable(snapshot.compute.unevaluable)));
 }
 
 export async function assessPaloaltoCloudPosture(

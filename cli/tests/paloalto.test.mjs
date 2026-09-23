@@ -3123,6 +3123,70 @@ test("silent-success class at record level: a record without any documented memb
   }
 });
 
+test("Codex P2 (#75): a surface with an unevaluable record is an incomplete inventory: a Defender page with one connected Defender and one foreign record withholds the zero counts and the item lists of PA-10, a mixed alert page withholds the zero severity counts and the per-policy breakdown, positive counts stay as observed, and the assessment status counts follow", async () => {
+  const STATUS_KEYS = ["pass", "warn", "fail", "manual"];
+  const observedCounts = (result) => Object.fromEntries(STATUS_KEYS.map((key) => [key, result.findings.filter((item) => item.status === key).length]));
+  const assessStatusCounts = (result, label) => {
+    const observed = observedCounts(result);
+    for (const key of STATUS_KEYS) assert.strictEqual(result.summary[key], observed[key] === 0 ? null : observed[key], `${label}: summary.${key} renders null in place of 0 and a positive count as observed (${JSON.stringify(observed)})`);
+    assert.ok(STATUS_KEYS.some((key) => observed[key] === 0), `${label}: a status count is zero, so the null rendering is exercised: ${JSON.stringify(observed)}`);
+  };
+
+  // Control: the same pages read to completion with every record documented assert their zeros.
+  const complete = await assessPaloaltoCloudPosture(createPaloaltoClients(bothProductsConfig(), mockedFetch()));
+  const completeDefenders = byId(complete.findings, "PA-10");
+  assert.equal(completeDefenders.status, "pass");
+  assert.deepEqual(
+    { defenders: completeDefenders.evidence.defenders, connected: completeDefenders.evidence.connected, disconnected_count: completeDefenders.evidence.disconnected_count, without_timestamp_count: completeDefenders.evidence.without_timestamp_count, disconnected: completeDefenders.evidence.disconnected, without_timestamp: completeDefenders.evidence.without_timestamp, versions: completeDefenders.evidence.versions.length },
+    { defenders: 1, connected: 1, disconnected_count: 0, without_timestamp_count: 0, disconnected: [], without_timestamp: [], versions: 1 },
+  );
+  assert.deepEqual(byId(complete.findings, "PA-02").evidence.open_alerts, { count: 0, critical: 0, high: 0, top_policies: [] });
+  for (const key of STATUS_KEYS) assert.equal(typeof complete.summary[key], "number", `${key} is asserted when every surface was read to completion with every record documented`);
+
+  // A Defender page of one connected Defender and one record without any documented member,
+  // through the assess tool path: the connected count is observed, every zero and every list is withheld.
+  const defenderPage = await assessPaloaltoCloudPosture(createPaloaltoClients(bothProductsConfig(), mixedRecordsFetch("prisma-compute /defenders")));
+  const defenders = byId(defenderPage.findings, "PA-10");
+  assert.equal(defenders.status, "warn", `a pass over a Defender page with an unevaluable record is capped: ${defenders.summary}`);
+  assert.match(defenders.summary, /Partial inventory: prisma-compute defenders: 1 of 2 records carry none of the documented members \(hostname, version, connected, type, lastModified\) and were not evaluated\./);
+  assert.deepEqual(
+    { defenders: defenders.evidence.defenders, connected: defenders.evidence.connected, disconnected_count: defenders.evidence.disconnected_count, without_timestamp_count: defenders.evidence.without_timestamp_count, disconnected: defenders.evidence.disconnected, without_timestamp: defenders.evidence.without_timestamp, versions: defenders.evidence.versions, unevaluable_records: defenders.evidence.unevaluable_records },
+    { defenders: 1, connected: 1, disconnected_count: null, without_timestamp_count: null, disconnected: null, without_timestamp: null, versions: null, unevaluable_records: { defenders: 1 } },
+    "zero over a page with an unevaluable record is a lower bound and renders null, and the item lists wait for a page every record of which was evaluated",
+  );
+  assert.equal(byId(defenderPage.findings, "PA-08").evidence.connected_defenders, 1, "a positive count stays as observed");
+  assert.equal(byId(defenderPage.findings, "PA-09").evidence.connected_defenders, 1);
+  assert.deepEqual(byId(defenderPage.findings, "PA-02").evidence.open_alerts, { count: 0, critical: 0, high: 0, top_policies: [] }, "the alert page carried no unevaluable record and keeps its asserted zeros");
+  assessStatusCounts(defenderPage, "Defender page with an unevaluable record");
+
+  // The same page through the export tool path: the bundle's findings carry the same evidence beside the collection status that counts the record.
+  const bundle = await exportPaloaltoAuditBundle(createPaloaltoClients(bothProductsConfig(), mixedRecordsFetch("prisma-compute /defenders")), createTempBase("grclanker-paloalto-unevaluable-defender-"));
+  const files = readBundleFiles(bundle.outputDir);
+  const exported = JSON.parse(files.get(join("analysis", "findings.json"))).find((item) => item.id === "PA-10");
+  assert.equal(exported.status, "warn");
+  assert.deepEqual(
+    { disconnected_count: exported.evidence.disconnected_count, disconnected: exported.evidence.disconnected, versions: exported.evidence.versions, defenders: exported.evidence.defenders },
+    { disconnected_count: null, disconnected: null, versions: null, defenders: 1 },
+  );
+  const collection = JSON.parse(files.get(join("core_data", "prisma_cloud.json"))).compute.collection.defenders;
+  assert.deepEqual({ status: collection.status, seen: collection.seen, truncated: collection.truncated, unevaluable_records: collection.unevaluable_records }, { status: "ok", seen: 1, truncated: false, unevaluable_records: 1 });
+
+  // An alert page of one documented low-severity network alert and one record without any documented
+  // member: the alert count is observed, the zero severity counts and the per-policy breakdown are withheld.
+  const alertPage = await assessPaloaltoCloudPosture(createPaloaltoClients(bothProductsConfig(), mixedRecordsFetch("prisma-cloud /v2/alert")));
+  const rules = byId(alertPage.findings, "PA-02");
+  assert.deepEqual(rules.evidence.open_alerts, { count: 1, critical: null, high: null, top_policies: null }, "zero critical or high alerts on a page with an unevaluable record is not asserted");
+  assert.match(rules.summary, /Partial inventory: prisma-cloud open alerts: 1 of 2 records carry none of the documented members \(id, status, policy, alertTime, resource\) and were not evaluated\./);
+  const network = byId(alertPage.findings, "PA-05");
+  assert.equal(network.status, "warn", network.summary);
+  assert.deepEqual({ count: network.evidence.count, critical: network.evidence.critical, high: network.evidence.high, top_policies: network.evidence.top_policies }, { count: 1, critical: null, high: null, top_policies: null });
+  assert.deepEqual(byId(alertPage.findings, "PA-03").evidence.iam_alerts, { count: null, critical: null, high: null, top_policies: null }, "zero IAM alerts among the evaluated records is a lower bound");
+  assert.deepEqual(byId(alertPage.findings, "PA-06").evidence.encryption_alerts, { count: null, critical: null, high: null, top_policies: null });
+  for (const id of ["PA-02", "PA-03", "PA-05", "PA-06"]) assert.deepEqual(byId(alertPage.findings, id).evidence.unevaluable_records, { open_alerts: 1 }, `${id} names the record that was kept out`);
+  assert.deepEqual(byId(alertPage.findings, "PA-10").evidence.disconnected, [], "the Defender page carried no unevaluable record and keeps its asserted lists");
+  assessStatusCounts(alertPage, "alert page with an unevaluable record");
+});
+
 test("PA-24 cannot pass on discovery entries that report neither total nor defended resources, and an array of records without any documented member is an unreadable surface", () => {
   const evaluable = { provider: "aws", serviceType: "eks", total: 3, defended: 3 };
   const bare = { provider: "aws", serviceType: "lambda", region: "us-east-1" };
