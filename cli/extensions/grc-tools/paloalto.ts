@@ -1245,7 +1245,8 @@ function surfaceCollectionStatus(endpoint: string | null, failure: PaloaltoSurfa
     status: failure ? datasetStatusOf(failure.status) : "ok",
     endpoint: failure ? failure.endpoint : endpoint,
     http_status: failure ? failure.status : null,
-    seen: failure ? null : seen,
+    // A truncated walk that delivered no record reports seen null: 0 would read as an empty inventory.
+    seen: failure ? null : truncated === true && seen === 0 ? null : seen,
     truncated: failure ? null : truncated,
     unevaluable_records: failure ? null : unevaluable,
     error: failure ? failure.error : null,
@@ -3276,6 +3277,47 @@ function nullUnless<T>(readable: boolean, value: T): T | null {
   return readable ? value : null;
 }
 
+/*
+ * Incomplete inventories. A surface is incomplete when it was not read or when its walk
+ * stopped early (a page cap, a stuck offset, or a refused next link). A count over an
+ * incomplete surface is a lower bound: a positive count is rendered as observed, and a
+ * count of zero renders null, because the unread remainder may hold what the seen records
+ * did not. Item-level detail (names, hosts, per-record entries) is withheld as null while a
+ * surface is incomplete, so no consumer reads a partial list as the population. The gate
+ * caps a pass over a truncated surface at warn, and a fail that rests on the absence of
+ * records becomes warn when the walk was truncated.
+ */
+function computeIncomplete(snapshot: ComputeSnapshot, ...surfaces: string[]): boolean {
+  return surfaces.some((surface) => snapshot.failed.includes(surface) || snapshot.truncated.includes(surface));
+}
+
+function computeCount(snapshot: ComputeSnapshot, surfaces: string[], count: number): number | null {
+  if (!computeReadable(snapshot, ...surfaces)) return null;
+  return count === 0 && computeIncomplete(snapshot, ...surfaces) ? null : count;
+}
+
+function computeDetail<T>(snapshot: ComputeSnapshot, surfaces: string[], value: T): T | null {
+  return computeIncomplete(snapshot, ...surfaces) ? null : value;
+}
+
+function prismaIncomplete(snapshot: PrismaSnapshot, ...surfaces: string[]): boolean {
+  return surfaces.some((surface) => snapshot.failed.includes(surface) || (surface === "open alerts" && snapshot.alertsTruncated === true));
+}
+
+function prismaCount(snapshot: PrismaSnapshot, surfaces: string[], count: number): number | null {
+  if (!prismaReadable(snapshot, ...surfaces)) return null;
+  return count === 0 && prismaIncomplete(snapshot, ...surfaces) ? null : count;
+}
+
+function prismaDetail<T>(snapshot: PrismaSnapshot, surfaces: string[], value: T): T | null {
+  return prismaIncomplete(snapshot, ...surfaces) ? null : value;
+}
+
+/** An absence-based verdict over a truncated walk is warn: the unread remainder may hold the records whose absence the fail rests on. */
+function absenceStatus(truncated: boolean): PaloaltoStatus {
+  return truncated ? "warn" : "fail";
+}
+
 function panosGate(snapshots: PanosDeviceSnapshot[], xpathFragments: string[], options: { needsHaState?: boolean } = {}): EvidenceGate {
   const unreadable: string[] = [];
   for (const snapshot of snapshots) {
@@ -3378,16 +3420,21 @@ const NETWORK_EXPOSURE_PATTERN = /public|internet|0\.0\.0\.0|::\/0|exposed|open 
 const ENCRYPTION_PATTERN = /encrypt|kms|cmk|customer.managed key/i;
 const DLP_PATTERN = /\bdlp\b|data loss|sensitive data|pii|data classification|data security/i;
 
-/** Alert counts, or the same shape with every value null when the alert list was not read. */
-function summarizeAlerts(alerts: JsonRecord[], readable = true): JsonRecord {
-  if (!readable) return { count: null, critical: null, high: null, top_policies: null };
+/**
+ * Alert counts, or the same shape with every value null when the alert list was not
+ * read. Over a truncated alert walk the counts are lower bounds (a zero renders null)
+ * and the per-policy breakdown is withheld until the walk completes.
+ */
+function summarizeAlerts(alerts: JsonRecord[], snapshot: PrismaSnapshot): JsonRecord {
+  if (!prismaReadable(snapshot, "open alerts")) return { count: null, critical: null, high: null, top_policies: null };
   const byPolicy = new Map<string, number>();
   for (const alert of alerts) byPolicy.set(policyName(alert), (byPolicy.get(policyName(alert)) ?? 0) + 1);
+  const count = (value: number): number | null => prismaCount(snapshot, ["open alerts"], value);
   return {
-    count: alerts.length,
-    critical: alerts.filter((item) => policySeverity(item) === "critical").length,
-    high: alerts.filter((item) => policySeverity(item) === "high").length,
-    top_policies: [...byPolicy.entries()].sort((a, b) => b[1] - a[1]).slice(0, 10).map(([name, count]) => ({ policy: name, open_alerts: count })),
+    count: count(alerts.length),
+    critical: count(alerts.filter((item) => policySeverity(item) === "critical").length),
+    high: count(alerts.filter((item) => policySeverity(item) === "high").length),
+    top_policies: prismaDetail(snapshot, ["open alerts"], [...byPolicy.entries()].sort((a, b) => b[1] - a[1]).slice(0, 10).map(([name, total]) => ({ policy: name, open_alerts: total }))),
   };
 }
 
@@ -3399,7 +3446,7 @@ export function assessPrismaCloudPosture(
   const findings: PaloaltoFinding[] = [];
   const postureReadable = prismaReadable(snapshot, "compliance posture");
   const rulesReadable = prismaReadable(snapshot, "alert rules");
-  const alertsReadable = prismaReadable(snapshot, "open alerts");
+  const alertsTruncated = prismaReadable(snapshot, "open alerts") && snapshot.alertsTruncated === true;
   const policiesReadable = prismaReadable(snapshot, "policies");
   const accountsReadable = prismaReadable(snapshot, "cloud accounts");
   const groupsReadable = prismaReadable(snapshot, "account groups");
@@ -3442,7 +3489,7 @@ export function assessPrismaCloudPosture(
       enabled_rules: nullUnless(rulesReadable, enabledRules.map((rule) => asString(rule.name)).slice(0, 25)),
       disabled_rules: nullUnless(rulesReadable, disabledRules.map((rule) => asString(rule.name)).slice(0, 25)),
       rules_with_notifications: nullUnless(rulesReadable, snapshot.alertRules.filter((rule) => asArray(rule.alertRuleNotificationConfig).length > 0).length),
-      open_alerts: summarizeAlerts(snapshot.alerts, alertsReadable),
+      open_alerts: summarizeAlerts(snapshot.alerts, snapshot),
     },
   ), prismaGate(snapshot, ["alert rules", "open alerts"]), "export Alerts > Alert Rules showing enabled rules and their notification channels."));
 
@@ -3463,7 +3510,7 @@ export function assessPrismaCloudPosture(
     {
       iam_policies: nullUnless(policiesReadable, iamPolicies.length),
       iam_policies_enabled: nullUnless(policiesReadable, iamEnabled.length),
-      iam_alerts: summarizeAlerts(iamAlerts, alertsReadable),
+      iam_alerts: summarizeAlerts(iamAlerts, snapshot),
     },
   ), prismaGate(snapshot, ["policies", "open alerts"]), "export the IAM Security policy list and open identity alerts."));
 
@@ -3493,13 +3540,16 @@ export function assessPrismaCloudPosture(
   findings.push(gate(finding(
     5,
     "high",
-    networkPolicies.length === 0 ? "manual" : networkHighOrCritical.length > 0 ? "fail" : networkAlerts.length > 0 ? "warn" : "pass",
+    networkPolicies.length === 0 ? "manual" : networkHighOrCritical.length > 0 ? "fail" : networkAlerts.length > 0 || alertsTruncated ? "warn" : "pass",
     networkPolicies.length === 0
       ? "No enabled network policies were visible, so exposure cannot be detected from alerts; treated as manual. Manual evidence required: enable network exposure policies and export their open alerts."
       : networkAlerts.length === 0
-        ? `No open network exposure alerts across ${networkPolicies.length} enabled network policies in the sampled window; emptiness is compliant here because detection policies are active and alerts were readable.`
+        // Emptiness is compliant only over an alert walk read to completion.
+        ? alertsTruncated
+          ? `No open network exposure alerts among the ${snapshot.alerts.length} alerts delivered before the alert walk stopped, across ${networkPolicies.length} enabled network policies; the unread remainder may hold some, so emptiness is not asserted.`
+          : `No open network exposure alerts across ${networkPolicies.length} enabled network policies in the sampled window; emptiness is compliant here because detection policies are active and alerts were readable.`
         : `${networkAlerts.length} open network exposure alerts (${networkHighOrCritical.length} critical or high).`,
-    { network_policies_enabled: nullUnless(policiesReadable, networkPolicies.length), ...summarizeAlerts(networkAlerts, alertsReadable) },
+    { network_policies_enabled: nullUnless(policiesReadable, networkPolicies.length), ...summarizeAlerts(networkAlerts, snapshot) },
   ), prismaGate(snapshot, ["policies", "open alerts"]), "export open network exposure alerts and the enabled network policy list."));
 
   const encryptionPolicies = snapshot.policies.filter((policy) => ENCRYPTION_PATTERN.test(policyLabels(policy)));
@@ -3515,7 +3565,7 @@ export function assessPrismaCloudPosture(
     {
       encryption_policies: nullUnless(policiesReadable, encryptionPolicies.length),
       encryption_policies_enabled: nullUnless(policiesReadable, encryptionEnabled.length),
-      encryption_alerts: summarizeAlerts(encryptionAlerts, alertsReadable),
+      encryption_alerts: summarizeAlerts(encryptionAlerts, snapshot),
     },
   ), prismaGate(snapshot, ["policies", "open alerts"]), "export enabled encryption policies and their open alerts."));
 
@@ -3664,10 +3714,12 @@ export function assessPrismaCompute(snapshot: PrismaSnapshot | undefined): Paloa
     {
       vulnerability_rules_enabled: nullUnless(vulnPolicyReadable, vulnPolicyRules.length),
       blocking_rules: nullUnless(vulnPolicyReadable, blockingRules.map((rule) => asString(rule.name)).slice(0, 25)),
-      images_scanned: nullUnless(imagesReadable, compute.images.length),
-      images_without_scan_time: nullUnless(imagesReadable, imagesWithoutScanTime.map((image) => asString(image.id) ?? asString(asObject(image.repoTag)?.repo)).slice(0, 25)),
-      critical_cves: cveStatsReadable ? criticalCves ?? null : null,
-      high_cves: cveStatsReadable ? highCves ?? null : null,
+      images_scanned: computeCount(compute, ["images"], compute.images.length),
+      images_without_scan_time_count: computeCount(compute, ["images"], imagesWithoutScanTime.length),
+      images_without_scan_time: computeDetail(compute, ["images"], nullUnless(imagesReadable, imagesWithoutScanTime.map((image) => asString(image.id) ?? asString(asObject(image.repoTag)?.repo)).slice(0, 25))),
+      // The CVE totals take the stricter of the stats and the image scan results, so a truncated image walk makes them lower bounds.
+      critical_cves: cveStatsReadable && criticalCves !== undefined ? computeCount(compute, ["vulnerability stats", "images"], criticalCves) : null,
+      high_cves: cveStatsReadable && highCves !== undefined ? computeCount(compute, ["vulnerability stats", "images"], highCves) : null,
       cve_stats_by_resource: nullUnless(cveStatsReadable, cveStats.byResource),
       cve_stats_source: nullUnless(cveStatsReadable, cveStats.source),
     },
@@ -3679,6 +3731,12 @@ export function assessPrismaCompute(snapshot: PrismaSnapshot | undefined): Paloa
   const complianceRate = compliance.rate;
   const connectedDefenders = compute.defenders.filter((defender) => asBoolean(defender.connected) === true).length;
   const defendersReadable = readable("defenders");
+  const defendersTruncated = defendersReadable && compute.truncated.includes("defenders");
+  // Zero connected Defenders is an absence verdict: over a truncated Defender walk the
+  // unread remainder may hold connected ones, so it is warn and says so.
+  const noConnectedDefenders = defendersTruncated
+    ? `no Defender delivered before the Defender walk stopped (${compute.defenders.length} seen) reports connected=true, so whether any host is being evaluated could not be determined`
+    : "no Defender reports connected=true, so no host is actually being evaluated";
   const complianceStatsReadable = readable("compliance stats");
   findings.push(gate(finding(
     8,
@@ -3688,7 +3746,7 @@ export function assessPrismaCompute(snapshot: PrismaSnapshot | undefined): Paloa
       : hostRules.length === 0
         ? "fail"
         : connectedDefenders === 0
-          ? "fail"
+          ? absenceStatus(defendersTruncated)
           : complianceRate === undefined
             ? "warn"
             : complianceRate < DEFAULT_MIN_HOST_COMPLIANCE_RATE
@@ -3699,14 +3757,14 @@ export function assessPrismaCompute(snapshot: PrismaSnapshot | undefined): Paloa
       : hostRules.length === 0
         ? `${containerRules.length} container compliance rules are enabled but no host compliance rule is, so host CIS benchmarks are not evaluated.`
         : connectedDefenders === 0
-          ? `${hostRules.length} host compliance rules are enabled but no Defender reports connected=true, so no host is actually being evaluated.`
+          ? `${hostRules.length} host compliance rules are enabled but ${noConnectedDefenders}.`
           : complianceRate === undefined
             ? `${hostRules.length} host and ${containerRules.length} container compliance rules are enabled, but /stats/compliance recorded zero evaluations in rules[] and categories[], so no compliance rate can be derived; treated as warn.`
             : `${hostRules.length} host and ${containerRules.length} container compliance rules enabled across ${connectedDefenders} connected Defenders; ${compliance.failed} failed of ${compliance.total} compliance evaluations (${compliance.source}) gives a ${complianceRate}% compliance rate (threshold ${DEFAULT_MIN_HOST_COMPLIANCE_RATE}%).`,
     {
       host_rules_enabled: nullUnless(readable("compliance host policy"), hostRules.length),
       container_rules_enabled: nullUnless(readable("compliance container policy"), containerRules.length),
-      connected_defenders: nullUnless(defendersReadable, connectedDefenders),
+      connected_defenders: computeCount(compute, ["defenders"], connectedDefenders),
       compliance_rate: complianceStatsReadable ? complianceRate ?? null : null,
       compliance_failed: nullUnless(complianceStatsReadable, compliance.failed),
       compliance_total: nullUnless(complianceStatsReadable, compliance.total),
@@ -3725,17 +3783,17 @@ export function assessPrismaCompute(snapshot: PrismaSnapshot | undefined): Paloa
   findings.push(gate(finding(
     9,
     "high",
-    runtimeRules.length === 0 ? "fail" : protectiveRules.length === 0 ? "warn" : runtimeDefenders === 0 ? "fail" : "pass",
+    runtimeRules.length === 0 ? "fail" : protectiveRules.length === 0 ? "warn" : runtimeDefenders === 0 ? absenceStatus(defendersTruncated) : "pass",
     runtimeRules.length === 0
       ? "Zero enabled container runtime rules were returned; emptiness is treated as fail because Defenders have no runtime policy to enforce."
       : protectiveRules.length === 0
         ? `${runtimeRules.length} container runtime rules are enabled but every process, network, file system, and DNS effect is alert or disable, so nothing is prevented.`
         : runtimeDefenders === 0
-          ? `${protectiveRules.length} preventive runtime rules exist but no Defender reports connected=true, so nothing enforces them.`
+          ? `${protectiveRules.length} preventive runtime rules exist but ${defendersTruncated ? `no Defender delivered before the Defender walk stopped (${compute.defenders.length} seen) reports connected=true, so whether anything enforces them could not be determined` : "no Defender reports connected=true, so nothing enforces them"}.`
           : `${protectiveRules.length} of ${runtimeRules.length} enabled container runtime rules prevent or block at least one behavior class (${alertOnlyRules.length} alert-only), enforced by ${runtimeDefenders} connected Defenders.`,
     {
       runtime_rules_enabled: nullUnless(readable("runtime container policy"), runtimeRules.length),
-      connected_defenders: nullUnless(defendersReadable, runtimeDefenders),
+      connected_defenders: computeCount(compute, ["defenders"], runtimeDefenders),
       protective_rules: nullUnless(readable("runtime container policy"), protectiveRules.map((rule) => asString(rule.name)).slice(0, 25)),
       alert_only_rules: nullUnless(readable("runtime container policy"), alertOnlyRules.map((rule) => asString(rule.name)).slice(0, 25)),
     },
@@ -3748,41 +3806,48 @@ export function assessPrismaCompute(snapshot: PrismaSnapshot | undefined): Paloa
   findings.push(gate(finding(
     10,
     "high",
-    compute.defenders.length === 0 ? "fail" : disconnected.length > 0 ? "fail" : withoutTimestamp.length > 0 || versions.size > 2 ? "warn" : "pass",
+    compute.defenders.length === 0 ? absenceStatus(defendersTruncated) : disconnected.length > 0 ? "fail" : withoutTimestamp.length > 0 || versions.size > 2 ? "warn" : "pass",
     compute.defenders.length === 0
-      ? "Zero Defenders are deployed; emptiness is treated as fail because no host or cluster is protected."
+      ? defendersTruncated
+        ? "Zero Defenders were delivered before the Defender walk stopped, so whether any host or cluster is protected could not be determined."
+        : "Zero Defenders are deployed; emptiness is treated as fail because no host or cluster is protected."
       : disconnected.length > 0
         ? `${disconnected.length} of ${compute.defenders.length} Defenders do not report connected=true.`
         : withoutTimestamp.length > 0
           ? `${connected.length} Defenders report connected=true, but ${withoutTimestamp.length} have no lastModified timestamp and cannot be counted as recently seen.`
           : `${connected.length} Defenders report connected=true across ${versions.size} version(s).`,
     {
-      defenders: nullUnless(defendersReadable, compute.defenders.length),
-      connected: nullUnless(defendersReadable, connected.length),
-      disconnected: nullUnless(defendersReadable, disconnected.map((defender) => asString(defender.hostname)).slice(0, 25)),
-      without_timestamp: nullUnless(defendersReadable, withoutTimestamp.map((defender) => asString(defender.hostname)).slice(0, 25)),
-      versions: nullUnless(defendersReadable, [...versions]),
+      defenders: computeCount(compute, ["defenders"], compute.defenders.length),
+      connected: computeCount(compute, ["defenders"], connected.length),
+      disconnected_count: computeCount(compute, ["defenders"], disconnected.length),
+      without_timestamp_count: computeCount(compute, ["defenders"], withoutTimestamp.length),
+      disconnected: computeDetail(compute, ["defenders"], disconnected.map((defender) => asString(defender.hostname)).slice(0, 25)),
+      without_timestamp: computeDetail(compute, ["defenders"], withoutTimestamp.map((defender) => asString(defender.hostname)).slice(0, 25)),
+      versions: computeDetail(compute, ["defenders"], [...versions]),
     },
   ), computeGate(compute, ["defenders"]), CWPP_EVIDENCE[3].instruction));
 
   const registries = asRecords(compute.registrySettings.specifications);
   const registriesWithoutCadence = registries.filter((registry) => !asString(registry.cap) && asNumber(registry.cap) === undefined && !asString(registry.scanners) && asNumber(registry.scanners) === undefined);
   const registryScansWithoutTime = compute.registryScans.filter((scan) => !asString(scan.scanTime));
+  const registryScansTruncated = readable("registry scans") && compute.truncated.includes("registry scans");
   findings.push(gate(finding(
     11,
     "medium",
-    registries.length === 0 ? "manual" : compute.registryScans.length === 0 ? "fail" : registryScansWithoutTime.length > 0 || registriesWithoutCadence.length > 0 ? "warn" : "pass",
+    registries.length === 0 ? "manual" : compute.registryScans.length === 0 ? absenceStatus(registryScansTruncated) : registryScansWithoutTime.length > 0 || registriesWithoutCadence.length > 0 ? "warn" : "pass",
     registries.length === 0
       ? "Zero registries are configured for scanning; treated as manual because an organization without container registries has nothing to scan. Manual evidence required: confirm no container registry is in use or configure registry scanning."
       : compute.registryScans.length === 0
-        ? `${registries.length} registries are configured but zero registry scan results exist, so scanning has not completed.`
+        ? registryScansTruncated
+          ? `${registries.length} registries are configured but zero registry scan results were delivered before the scan walk stopped, so whether scanning has completed could not be determined.`
+          : `${registries.length} registries are configured but zero registry scan results exist, so scanning has not completed.`
         : registryScansWithoutTime.length > 0
           ? `${registryScansWithoutTime.length} of ${compute.registryScans.length} registry scan results have no scanTime and cannot be counted as fresh.`
           : `${registries.length} registries configured with ${compute.registryScans.length} scanned images.`,
     {
       registries: nullUnless(readable("registry settings"), registries.map((registry) => `${asString(registry.registry) ?? ""}/${asString(registry.repository) ?? "*"}`).slice(0, 25)),
-      registry_scans: nullUnless(readable("registry scans"), compute.registryScans.length),
-      scans_without_time: nullUnless(readable("registry scans"), registryScansWithoutTime.length),
+      registry_scans: computeCount(compute, ["registry scans"], compute.registryScans.length),
+      scans_without_time: computeCount(compute, ["registry scans"], registryScansWithoutTime.length),
     },
   ), computeGate(compute, ["registry settings", "registry scans"]), CWPP_EVIDENCE[4].instruction));
 
@@ -3806,26 +3871,30 @@ export function assessPrismaCompute(snapshot: PrismaSnapshot | undefined): Paloa
             ? `${discoveryErrors.length} cloud discovery entries report errors, so coverage is uncertain.`
             : `${compute.cloudDiscovery.length} cloud discovery entries all report total resources equal to defended resources.`,
     {
-      discovery_entries: nullUnless(readable("cloud discovery"), compute.cloudDiscovery.length),
-      unevaluable_entries: nullUnless(readable("cloud discovery"), unevaluableDiscovery),
-      unprotected: nullUnless(readable("cloud discovery"), unprotected.map((entry) => `${asString(entry.provider)}/${asString(entry.serviceType)}: ${asNumber(entry.defended) ?? 0}/${asNumber(entry.total) ?? 0}`).slice(0, 25)),
-      errors: nullUnless(readable("cloud discovery"), discoveryErrors.map((entry) => redactErrorText(asString(entry.err) ?? "")).slice(0, 10)),
+      discovery_entries: computeCount(compute, ["cloud discovery"], compute.cloudDiscovery.length),
+      unevaluable_entries: computeCount(compute, ["cloud discovery"], unevaluableDiscovery),
+      unprotected_count: computeCount(compute, ["cloud discovery"], unprotected.length),
+      unprotected: computeDetail(compute, ["cloud discovery"], unprotected.map((entry) => `${asString(entry.provider)}/${asString(entry.serviceType)}: ${asNumber(entry.defended) ?? 0}/${asNumber(entry.total) ?? 0}`).slice(0, 25)),
+      errors: computeDetail(compute, ["cloud discovery"], discoveryErrors.map((entry) => redactErrorText(asString(entry.err) ?? "")).slice(0, 10)),
     },
   ), computeGate(compute, ["cloud discovery"]), CWPP_EVIDENCE[5].instruction));
 
   const scansWithoutTime = compute.ciScans.filter((scan) => !asString(scan.time));
   const failedScans = compute.ciScans.filter((scan) => asBoolean(scan.pass) === false);
+  const ciScansTruncated = readable("ci scans") && compute.truncated.includes("ci scans");
   findings.push(gate(finding(
     25,
     "medium",
-    compute.ciScans.length === 0 ? "fail" : "warn",
+    compute.ciScans.length === 0 ? absenceStatus(ciScansTruncated) : "warn",
     compute.ciScans.length === 0
-      ? "Zero CI image scan results were returned; emptiness is treated as fail because no pipeline is submitting images to twistcli or the Jenkins plugin."
+      ? ciScansTruncated
+        ? "Zero CI image scan results were delivered before the scan walk stopped, so whether any pipeline submits images to twistcli or the Jenkins plugin could not be determined."
+        : "Zero CI image scan results were returned; emptiness is treated as fail because no pipeline is submitting images to twistcli or the Jenkins plugin."
       : `${compute.ciScans.length} CI scan results (${failedScans.length} failed policy, ${scansWithoutTime.length} without a scan time). Admission control policy has no verified public read endpoint, so this control stays at warn until admission rules are reviewed manually.`,
     {
-      ci_scans: nullUnless(readable("ci scans"), compute.ciScans.length),
-      failed_scans: nullUnless(readable("ci scans"), failedScans.length),
-      scans_without_time: nullUnless(readable("ci scans"), scansWithoutTime.length),
+      ci_scans: computeCount(compute, ["ci scans"], compute.ciScans.length),
+      failed_scans: computeCount(compute, ["ci scans"], failedScans.length),
+      scans_without_time: computeCount(compute, ["ci scans"], scansWithoutTime.length),
       manual_evidence: "export Compute > Defend > Access > Admission rules to confirm admission control gating.",
     },
   ), computeGate(compute, ["ci scans"]), CWPP_EVIDENCE[6].instruction));
@@ -4621,21 +4690,41 @@ function prismaCollectionSummary(snapshot: PrismaSnapshot): JsonRecord {
   };
 }
 
-function assessmentResult(title: string, findings: PaloaltoFinding[], errors: string[], extra: JsonRecord = {}): PaloaltoAssessmentResult {
+// Status counts over the findings. With incomplete=true (a surface the findings read was
+// unreadable or truncated) a count of zero renders null: a finding over that surface may
+// be undetermined, so 0 would claim that no finding has the status when one may (see
+// "Incomplete inventories"). A positive count is rendered as observed.
+function assessmentResult(title: string, findings: PaloaltoFinding[], errors: string[], extra: JsonRecord = {}, incomplete = errors.length > 0): PaloaltoAssessmentResult {
+  const count = (status: PaloaltoStatus): number | null => {
+    const total = findings.filter((item) => item.status === status).length;
+    return total === 0 && incomplete ? null : total;
+  };
   return {
     title,
     summary: {
       controls: findings.length,
-      pass: findings.filter((item) => item.status === "pass").length,
-      warn: findings.filter((item) => item.status === "warn").length,
-      fail: findings.filter((item) => item.status === "fail").length,
-      manual: findings.filter((item) => item.status === "manual").length,
+      pass: count("pass"),
+      warn: count("warn"),
+      fail: count("fail"),
+      manual: count("manual"),
       collection_errors: errors.length,
       ...extra,
     },
     findings,
     errors,
   };
+}
+
+function renderStatusCount(value: unknown): string {
+  return value === null ? "none seen" : String(value);
+}
+
+/** True when a Prisma Cloud or Compute surface the findings read was unreadable or truncated. */
+function prismaSnapshotIncomplete(snapshot: PrismaSnapshot): boolean {
+  return snapshot.errors.length > 0
+    || snapshot.failed.length > 0
+    || snapshot.alertsTruncated === true
+    || (snapshot.compute !== undefined && (snapshot.compute.failed.length > 0 || snapshot.compute.truncated.length > 0));
 }
 
 export async function assessPaloaltoCloudPosture(
@@ -4658,7 +4747,7 @@ export async function assessPaloaltoCloudPosture(
   const snapshot = prismaSnapshot ?? await loadPrismaSnapshot(clients, clampNumber(options.alertLimit, DEFAULT_ALERT_LIMIT, 1, 10000));
   if (!snapshot) throw new Error("Prisma Cloud snapshot could not be collected.");
   const findings = [...assessPrismaCloudPosture(snapshot, options), ...assessPrismaCompute(snapshot)];
-  return assessmentResult("Palo Alto cloud posture (Prisma Cloud)", findings, snapshot.errors, prismaCollectionSummary(snapshot));
+  return assessmentResult("Palo Alto cloud posture (Prisma Cloud)", findings, snapshot.errors, prismaCollectionSummary(snapshot), prismaSnapshotIncomplete(snapshot));
 }
 
 export async function assessPaloaltoFirewallPolicy(clients: PaloaltoClients, snapshots?: PanosDeviceSnapshot[]): Promise<PaloaltoAssessmentResult> {
@@ -4895,7 +4984,7 @@ function buildQuickReference(result: PaloaltoAccessCheckResult, assessments: Pal
     "",
     "## Assessments",
     "",
-    ...assessments.map((item) => `- ${item.title}: ${item.summary.pass} pass, ${item.summary.warn} warn, ${item.summary.fail} fail, ${item.summary.manual} manual`),
+    ...assessments.map((item) => `- ${item.title}: ${renderStatusCount(item.summary.pass)} pass, ${renderStatusCount(item.summary.warn)} warn, ${renderStatusCount(item.summary.fail)} fail, ${renderStatusCount(item.summary.manual)} manual${["pass", "warn", "fail", "manual"].some((key) => item.summary[key] === null) ? " (a count rendered as \"none seen\" is not asserted: a surface the findings read was unreadable or truncated)" : ""}`),
     "",
     "Credentials, API keys, and JWTs are never written into the bundle.",
     `Prisma Cloud integration configurations (auth tokens, API keys, passwords, secure header values, webhook URLs with tokens) and Compute registry credentials and image secrets are replaced with ${REDACTION_MARKER} as they are collected.`,

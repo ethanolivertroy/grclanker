@@ -3343,6 +3343,124 @@ test("rule 5: partial inventories flag seen and total counts instead of passing"
   assert.match(byId(computeTruncated, "PA-10").summary, /truncated at 500 records/);
 });
 
+test("rule 5: zero records over a truncated walk are not asserted as absence, counts are lower bounds, and item-level detail waits for the walk to complete", async () => {
+  // The Defender walk stopped before any record arrived: PA-08, PA-09, and PA-10 rest on the absence of connected Defenders.
+  const emptyDefenders = computeSnapshot({ truncated: ["defenders"] });
+  emptyDefenders.defenders = [];
+  const compute = assessPrismaCompute(prismaSnapshot({ compute: emptyDefenders }));
+  assert.equal(byId(compute, "PA-10").status, "warn");
+  assert.match(byId(compute, "PA-10").summary, /Zero Defenders were delivered before the Defender walk stopped, so whether any host or cluster is protected could not be determined/);
+  assert.equal(byId(compute, "PA-10").evidence.defenders, null, "zero over a truncated walk is a lower bound and renders null, never 0");
+  assert.equal(byId(compute, "PA-10").evidence.connected, null);
+  assert.equal(byId(compute, "PA-10").evidence.disconnected_count, null);
+  assert.equal(byId(compute, "PA-10").evidence.versions, null);
+  assert.equal(byId(compute, "PA-10").evidence.disconnected, null);
+  assert.equal(byId(compute, "PA-10").evidence.without_timestamp, null);
+  assert.equal(byId(compute, "PA-08").status, "warn");
+  assert.match(byId(compute, "PA-08").summary, /no Defender delivered before the Defender walk stopped \(0 seen\) reports connected=true, so whether any host is being evaluated could not be determined/);
+  assert.equal(byId(compute, "PA-08").evidence.connected_defenders, null);
+  assert.equal(byId(compute, "PA-09").status, "warn");
+  assert.match(byId(compute, "PA-09").summary, /no Defender delivered before the Defender walk stopped \(0 seen\) reports connected=true, so whether anything enforces them could not be determined/);
+  assert.equal(byId(compute, "PA-09").evidence.connected_defenders, null);
+  const emptyCollection = prismaSnapshotToJson(prismaSnapshot({ compute: emptyDefenders })).compute.collection.defenders;
+  assert.equal(emptyCollection.seen, null, "a truncated walk that delivered nothing does not report seen 0");
+  assert.equal(emptyCollection.truncated, true);
+
+  // The same inventory read to completion: the absence verdicts are fail and the zero counts are asserted.
+  const noDefenders = computeSnapshot();
+  noDefenders.defenders = [];
+  const complete = assessPrismaCompute(prismaSnapshot({ compute: noDefenders }));
+  assert.equal(byId(complete, "PA-10").status, "fail");
+  assert.match(byId(complete, "PA-10").summary, /Zero Defenders are deployed; emptiness is treated as fail/);
+  assert.equal(byId(complete, "PA-10").evidence.defenders, 0);
+  assert.deepEqual(byId(complete, "PA-10").evidence.versions, []);
+  assert.deepEqual(byId(complete, "PA-10").evidence.disconnected, []);
+  assert.equal(byId(complete, "PA-08").status, "fail");
+  assert.equal(byId(complete, "PA-08").evidence.connected_defenders, 0);
+  assert.equal(byId(complete, "PA-09").status, "fail");
+  assert.equal(prismaSnapshotToJson(prismaSnapshot({ compute: noDefenders })).compute.collection.defenders.seen, 0);
+
+  // A truncated walk that delivered records keeps the positive counts as observed and withholds the per-record detail.
+  const partialDefenders = assessPrismaCompute(prismaSnapshot({ compute: computeSnapshot({ truncated: ["defenders"] }) }));
+  assert.equal(byId(partialDefenders, "PA-10").evidence.defenders, 1);
+  assert.equal(byId(partialDefenders, "PA-10").evidence.connected, 1);
+  assert.equal(byId(partialDefenders, "PA-10").evidence.disconnected_count, null);
+  assert.equal(byId(partialDefenders, "PA-10").evidence.without_timestamp_count, null);
+  assert.equal(byId(partialDefenders, "PA-10").evidence.versions, null);
+  assert.equal(byId(partialDefenders, "PA-10").evidence.disconnected, null);
+  assert.equal(byId(partialDefenders, "PA-08").evidence.connected_defenders, 1);
+  assert.equal(prismaSnapshotToJson(prismaSnapshot({ compute: computeSnapshot({ truncated: ["defenders"] }) })).compute.collection.defenders.seen, 1);
+
+  // Registry scans and CI scans: zero over a truncated walk is warn, zero over a complete walk stays fail.
+  const emptyScans = computeSnapshot({ truncated: ["registry scans", "ci scans"] });
+  emptyScans.registryScans = [];
+  emptyScans.ciScans = [];
+  const scans = assessPrismaCompute(prismaSnapshot({ compute: emptyScans }));
+  assert.equal(byId(scans, "PA-11").status, "warn");
+  assert.match(byId(scans, "PA-11").summary, /zero registry scan results were delivered before the scan walk stopped, so whether scanning has completed could not be determined/);
+  assert.equal(byId(scans, "PA-11").evidence.registry_scans, null);
+  assert.equal(byId(scans, "PA-11").evidence.scans_without_time, null);
+  assert.equal(byId(scans, "PA-25").status, "warn");
+  assert.match(byId(scans, "PA-25").summary, /Zero CI image scan results were delivered before the scan walk stopped, so whether any pipeline submits images/);
+  assert.equal(byId(scans, "PA-25").evidence.ci_scans, null);
+  assert.equal(byId(scans, "PA-25").evidence.failed_scans, null);
+  const completeScans = computeSnapshot();
+  completeScans.registryScans = [];
+  completeScans.ciScans = [];
+  const scansComplete = assessPrismaCompute(prismaSnapshot({ compute: completeScans }));
+  assert.equal(byId(scansComplete, "PA-11").status, "fail");
+  assert.equal(byId(scansComplete, "PA-11").evidence.registry_scans, 0);
+  assert.equal(byId(scansComplete, "PA-25").status, "fail");
+  assert.equal(byId(scansComplete, "PA-25").evidence.ci_scans, 0);
+
+  // A truncated image walk turns the image and CVE totals into lower bounds and withholds the image list.
+  const truncatedImages = assessPrismaCompute(prismaSnapshot({ compute: computeSnapshot({ truncated: ["images"] }) }));
+  assert.equal(byId(truncatedImages, "PA-07").evidence.images_scanned, 1);
+  assert.equal(byId(truncatedImages, "PA-07").evidence.images_without_scan_time_count, null);
+  assert.equal(byId(truncatedImages, "PA-07").evidence.images_without_scan_time, null);
+  assert.equal(byId(truncatedImages, "PA-07").evidence.critical_cves, null, "zero critical CVEs over a truncated image walk is a lower bound");
+  assert.equal(byId(truncatedImages, "PA-07").evidence.high_cves, 3);
+  const completeImages = assessPrismaCompute(prismaSnapshot());
+  assert.equal(byId(completeImages, "PA-07").evidence.critical_cves, 0);
+  assert.deepEqual(byId(completeImages, "PA-07").evidence.images_without_scan_time, []);
+
+  // The alert walk stopped before any alert arrived: the alert counts are lower bounds and the per-policy breakdown waits.
+  const alerts = assessPrismaCloudPosture(prismaSnapshot({ alertsTruncated: true, alertsTotal: 5000 }));
+  assert.equal(byId(alerts, "PA-02").evidence.open_alerts.count, null);
+  assert.equal(byId(alerts, "PA-02").evidence.open_alerts.critical, null);
+  assert.equal(byId(alerts, "PA-02").evidence.open_alerts.high, null);
+  assert.equal(byId(alerts, "PA-02").evidence.open_alerts.top_policies, null);
+  assert.equal(byId(alerts, "PA-05").status, "warn");
+  assert.match(byId(alerts, "PA-05").summary, /No open network exposure alerts among the 0 alerts delivered before the alert walk stopped, across \d+ enabled network policies; the unread remainder may hold some, so emptiness is not asserted/);
+  assert.equal(byId(alerts, "PA-05").evidence.count, null);
+  assert.equal(byId(alerts, "PA-05").evidence.top_policies, null);
+  const completeAlerts = assessPrismaCloudPosture(prismaSnapshot());
+  assert.equal(byId(completeAlerts, "PA-02").evidence.open_alerts.count, 0);
+  assert.deepEqual(byId(completeAlerts, "PA-02").evidence.open_alerts.top_policies, []);
+  assert.equal(byId(completeAlerts, "PA-05").status, "pass");
+  assert.match(byId(completeAlerts, "PA-05").summary, /emptiness is compliant here because detection policies are active and alerts were readable/);
+  assert.equal(byId(completeAlerts, "PA-05").evidence.count, 0);
+
+  // A truncated alert walk that delivered alerts keeps the positive counts, withholds the breakdown, and still fails on what it saw.
+  const partialAlerts = assessPrismaCloudPosture(prismaSnapshot({ good: false, alertsTruncated: true, alertsTotal: 5000 }));
+  assert.equal(byId(partialAlerts, "PA-02").evidence.open_alerts.count, 3);
+  assert.equal(byId(partialAlerts, "PA-02").evidence.open_alerts.critical, 1);
+  assert.equal(byId(partialAlerts, "PA-02").evidence.open_alerts.top_policies, null);
+  assert.equal(byId(partialAlerts, "PA-05").status, "fail", "a critical network exposure alert that was seen is asserted regardless of the unread remainder");
+  assert.equal(byId(partialAlerts, "PA-05").evidence.count, 1);
+
+  // Status counts over an assessment that read an incomplete surface render zero as null and say so in the quick reference.
+  const clients = createPaloaltoClients(bothProductsConfig(), mockedFetch());
+  const incomplete = await assessPaloaltoCloudPosture(clients, {}, prismaSnapshot({ compute: emptyDefenders }));
+  assert.ok(incomplete.summary.pass > 0);
+  assert.ok(incomplete.summary.warn > 0);
+  for (const key of ["pass", "warn", "fail", "manual"]) assert.notEqual(incomplete.summary[key], 0, `${key} renders null rather than 0 over an incomplete surface`);
+  assert.equal(incomplete.summary.fail, null);
+  const healthy = await assessPaloaltoCloudPosture(clients, {}, prismaSnapshot());
+  for (const key of ["pass", "warn", "fail", "manual"]) assert.equal(typeof healthy.summary[key], "number", `${key} is a number when every surface was read to completion`);
+  assert.equal(healthy.summary.fail, 0);
+});
+
 test("rule 6: absent or false enabling flags never support pass", () => {
   const implicit = prismaSnapshot();
   implicit.alertRules = [{ name: "no-flag", alertRuleNotificationConfig: [] }];
