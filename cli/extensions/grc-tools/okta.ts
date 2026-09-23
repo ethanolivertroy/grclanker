@@ -2052,7 +2052,13 @@ function resolveOnConfiguredOrigin(config: OktaResolvedConfig, pathOrUrl: string
   return { url: resolved.href };
 }
 
-/** Keeps only the vendor's error summary fields; a body without them is described by size so a token echoed by a proxy never lands in an error string. */
+/** Describes a response body that is not JSON by content type and size without copying any of it. */
+function describeNonJsonBody(response: Response, rawText: string): string {
+  const contentType = response.headers.get("content-type")?.split(";")[0]?.trim() || "unknown content type";
+  return `non-JSON body (${contentType}, ${Buffer.byteLength(rawText)} bytes)`;
+}
+
+/** Keeps only the vendor's error summary fields; a body without them is described by content type and size so a token echoed by a proxy never lands in an error string. */
 async function readErrorDetail(response: Response): Promise<string> {
   const text = await response.text();
   if (!text) return "";
@@ -2064,20 +2070,20 @@ async function readErrorDetail(response: Response): Promise<string> {
       asString(parsed.error_description) ??
       asString(parsed.errorSummary) ??
       (summaries.length > 0 ? summaries.join("; ") : undefined);
-    return detail ?? `JSON error body without errorSummary (${text.length} chars)`;
+    return detail ?? `JSON error body without errorSummary (${Buffer.byteLength(text)} bytes)`;
   } catch {
-    return `non-JSON error body (${text.length} chars)`;
+    return describeNonJsonBody(response, text);
   }
 }
 
-/** Parses a successful body as JSON; a body that is not JSON is described by size only, so no fragment of it (which V8 would quote) reaches an error string. */
+/** Parses a successful body as JSON; a body that is not JSON is described by content type and size only, so no fragment of it (which V8 would quote) reaches an error string. */
 async function readJsonBody(response: Response, target: string): Promise<unknown> {
   const text = await response.text();
   try {
     return JSON.parse(text) as unknown;
   } catch {
     throw new OktaApiError(
-      `Okta API response from ${target} (${response.status}) was not JSON (${text.length} chars)`,
+      `Okta API response from ${target} (${response.status}) was unreadable: ${describeNonJsonBody(response, text)}`,
       response.status,
       target,
     );

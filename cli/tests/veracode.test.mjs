@@ -1192,7 +1192,7 @@ test("rule 9: VeracodeApiError keeps only the vendor message from a JSON error b
     return true;
   });
   await assert.rejects(() => client.getSelf(), (error) => {
-    assert.match(error.message, new RegExp(`non-JSON response body \\(${Buffer.byteLength(htmlBody)} bytes, not recorded\\)`));
+    assert.match(error.message, new RegExp(`non-JSON body \\(text/html, ${Buffer.byteLength(htmlBody)} bytes\\)`));
     assertNoWindowOf(error.message, ERROR_BODY_CANARIES.htmlToken, "non-JSON error body");
     return true;
   });
@@ -2287,7 +2287,7 @@ function veracodeSummarySentences(kind, value) {
         `Grant the API service account the missing roles (${value}) and confirm the region matches the account.`,
       ];
     case "status":
-      return [`Veracode request failed (${value}) for /appsec/v1/policies: role Security Insights required`, `Veracode request to /appsec/v1/applications returned an unreadable response (${value}): non-JSON response body (5120 bytes, not recorded)`];
+      return [`Veracode request failed (${value}) for /appsec/v1/policies: role Security Insights required`, `Veracode request to /appsec/v1/applications returned an unreadable response (${value}): non-JSON body (text/html, 5120 bytes)`];
     case "id":
       return [`${value} is manual because the applications endpoint was forbidden (403).`, `| ${value} | HIGH | MANUAL | Policy assignment | The policies endpoint was forbidden (403), so the control could not be verified. |`];
     case "source":
@@ -2310,8 +2310,8 @@ const VERACODE_FIXED_TEXTS = [
   "Veracode request failed (403 Forbidden) for /appsec/v1/policies: role Security Insights required",
   "Veracode request failed (401 Unauthorized) for /api/authn/v2/users/self",
   "Veracode request failed (500 Internal Server Error) for /api/authn/v2/users/self: JSON response body (24 bytes) carried no message field",
-  "Veracode request failed (400 Bad Request) for /api/authn/v2/users/self: non-JSON response body (30 bytes, not recorded)",
-  "Veracode request to /appsec/v1/applications returned an unreadable response (200 OK): non-JSON response body (5120 bytes, not recorded)",
+  "Veracode request failed (400 Bad Request) for /api/authn/v2/users/self: non-JSON body (text/html, 30 bytes)",
+  "Veracode request to /appsec/v1/applications returned an unreadable response (200 OK): non-JSON body (text/html, 5120 bytes)",
   "Veracode request failed for /appsec/v1/applications: The operation was aborted due to timeout",
   "all_for_org=true was refused (403), so only teams the API user is a member of were listed and the team inventory is a partial view.",
   "Not requested: the application inventory was not readable, so no sandbox list was requested.",

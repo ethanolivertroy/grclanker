@@ -1251,21 +1251,22 @@ function configuredSecretsOf(config: Pick<VeracodeResolvedConfig, "apiKeyId" | "
   return [config.apiKeyId, config.apiKeySecret];
 }
 
-/** Describes a body that is not JSON by size only; the text itself is never kept. */
-function describeNonJsonBody(rawText: string): string {
-  return `non-JSON response body (${Buffer.byteLength(rawText)} bytes, not recorded)`;
+/** Describes a body that is not JSON by content type and size only; the text itself is never kept. */
+function describeNonJsonBody(response: Response, rawText: string): string {
+  const contentType = response.headers.get("content-type")?.split(";")[0]?.trim() || "unknown content type";
+  return `non-JSON body (${contentType}, ${Buffer.byteLength(rawText)} bytes)`;
 }
 
-/** Keeps only the vendor's message fields from an error body; a non-JSON body is described by size, never quoted. */
-function errorDetailFrom(rawText: string): string {
+/** Keeps only the vendor's message fields from an error body; a non-JSON body is described by content type and size, never quoted. */
+function errorDetailFrom(response: Response, rawText: string): string {
   if (rawText.length === 0) return "";
   try {
     const payload = asObject(JSON.parse(rawText)) ?? {};
     const embeddedErrors = asRecords(asObject(payload._embedded)?.errors).map((item) => asString(item.detail) ?? asString(item.message)).filter((item): item is string => Boolean(item));
     const message = [asString(payload.message), asString(payload.error_description), asString(payload.error), ...embeddedErrors].filter((item): item is string => Boolean(item)).join("; ");
-    return message.length > 0 ? message.replace(/\s+/g, " ").slice(0, 240) : `JSON response body (${rawText.length} bytes) carried no message field`;
+    return message.length > 0 ? message.replace(/\s+/g, " ").slice(0, 240) : `JSON response body (${Buffer.byteLength(rawText)} bytes) carried no message field`;
   } catch {
-    return describeNonJsonBody(rawText);
+    return describeNonJsonBody(response, rawText);
   }
 }
 
@@ -1282,7 +1283,7 @@ function parseSuccessBody(response: Response, rawText: string, endpoint: string)
     parsed = JSON.parse(rawText);
   } catch {
     throw new VeracodeApiError(
-      `Veracode request to ${endpoint} returned an unreadable response (${response.status} ${response.statusText}): ${describeNonJsonBody(rawText)}`,
+      `Veracode request to ${endpoint} returned an unreadable response (${response.status} ${response.statusText}): ${describeNonJsonBody(response, rawText)}`,
       response.status,
       endpoint,
     );
@@ -1367,7 +1368,7 @@ export class VeracodeApiClient {
           await this.sleep(Math.min(250 * 2 ** attempt, 8_000));
           continue;
         }
-        const detail = scrubErrorText(errorDetailFrom(rawText), configuredSecretsOf(this.config));
+        const detail = scrubErrorText(errorDetailFrom(response, rawText), configuredSecretsOf(this.config));
         throw new VeracodeApiError(
           `Veracode request failed (${response.status} ${response.statusText}) for ${url.pathname}${detail ? `: ${detail}` : ""}`,
           response.status,

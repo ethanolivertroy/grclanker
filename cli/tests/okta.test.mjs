@@ -1848,7 +1848,7 @@ test("rule 9: OktaAuditorClient error strings drop the request cursor, raw bodie
   await assert.rejects(
     () => client.listPaginatedWithMeta("https://tenant.example.okta.com/api/v1/apps?limit=200&after=cursor-2"),
     (error) => {
-      assert.match(error.message, /^Okta API request failed for \/api\/v1\/apps\?limit=200 \(502 Bad Gateway\): non-JSON error body \(\d+ chars\)$/);
+      assert.match(error.message, /^Okta API request failed for \/api\/v1\/apps\?limit=200 \(502 Bad Gateway\): non-JSON body \(text\/html, \d+ bytes\)$/);
       assert.ok(!error.message.includes("after="));
       assertNoWindowOf(error.message, token, "502 HTML error string");
       assert.ok(!error.message.includes("<html>"));
@@ -1866,7 +1866,7 @@ test("rule 9: OktaAuditorClient error strings drop the request cursor, raw bodie
   await assert.rejects(
     () => client.listNetworkZones(),
     (error) => {
-      assert.match(error.message, /\(500 Internal Server Error\): JSON error body without errorSummary \(\d+ chars\)$/);
+      assert.match(error.message, /\(500 Internal Server Error\): JSON error body without errorSummary \(\d+ bytes\)$/);
       assertNoWindowOf(error.message, token, "500 JSON error string");
       return true;
     },
@@ -3233,11 +3233,11 @@ const OKTA_FIXED_TEXTS = [
   "API token inventory: empty with no error",
   "Okta PrivateKey auth could not load the configured private key (ERR_OSSL_UNSUPPORTED). Provide an unencrypted RSA private key in PEM form.",
   "Okta PrivateKey auth could not load the configured private key (INVALID_PRIVATE_KEY). Provide an unencrypted RSA private key in PEM form.",
-  "Okta API request failed for /api/v1/apps?limit=200 (502 Bad Gateway): non-JSON error body (5120 chars)",
-  "Okta API request failed for /api/v1/zones?limit=200 (500 Internal Server Error): JSON error body without errorSummary (37 chars)",
+  "Okta API request failed for /api/v1/apps?limit=200 (502 Bad Gateway): non-JSON body (text/html, 5120 bytes)",
+  "Okta API request failed for /api/v1/zones?limit=200 (500 Internal Server Error): JSON error body without errorSummary (37 bytes)",
   "Okta API request failed for /api/v1/idps?limit=200 (403 Forbidden): You do not have permission to perform the requested action",
   "Okta API request failed for /api/v1/logs?limit=1 (429 Too Many Requests)",
-  "Okta API response from /api/v1/users?limit=200 (200) was not JSON (5120 chars)",
+  "Okta API response from /api/v1/users?limit=200 (200) was unreadable: non-JSON body (text/html, 5120 bytes)",
   "Okta OAuth token request failed (401 Unauthorized): invalid_client",
   "Okta API request refused: the request URL is on origin https://collector.evil-example.net, not the configured org origin https://tenant.example.okta.com, so no request was sent.",
   "Okta API request refused: the request URL carries userinfo for origin https://tenant.example.okta.com (configured org origin https://tenant.example.okta.com), so no request was sent.",
