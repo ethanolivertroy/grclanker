@@ -2668,19 +2668,24 @@ function datasetErrors(label: string, dataset: TenableDataset<unknown>): string[
 
 /*
  * Incomplete inventories. An inventory is incomplete when it was not read (refused or
- * failed) or when its page walk was truncated (a page cap, a stalled or replayed page,
- * or fewer records delivered than pagination.total reports). A count over an incomplete
- * inventory is a lower bound: a positive count is rendered as observed, and a count of
- * zero renders null, because the unread remainder may hold what the seen population did
- * not. Item-level detail (names, labels, per-record entries) is withheld as null while an
- * inventory is incomplete, so no consumer reads a partial list as the population. No
- * finding passes over an inventory it did not read to completion, and a fail that rests
- * on the absence of records becomes warn when the walk was truncated. A platform that is
- * not configured is not an incomplete inventory: no read was attempted and its findings
- * say so.
+ * failed), when its page walk was truncated (a page cap, a stalled or replayed page,
+ * or fewer records delivered than pagination.total reports), or when it is an export
+ * some of whose records were kept out as unevaluable (records that carried none of the
+ * documented members): the evaluated records are then not the whole population the
+ * export delivered, which is the same state the partial marker written to the bundle
+ * records. A count over an incomplete inventory is a lower bound: a positive count is
+ * rendered as observed, and a count of zero renders null, because the unread or
+ * unevaluated remainder may hold what the seen population did not. Item-level detail
+ * (names, labels, per-record entries) is withheld as null while an inventory is
+ * incomplete, so no consumer reads a partial list as the population. No finding passes
+ * over an inventory it did not read to completion, and a fail that rests on the absence
+ * of records becomes warn when the walk was truncated. A platform that is not configured
+ * is not an incomplete inventory: no read was attempted and its findings say so.
  */
 function isIncomplete(dataset: TenableDataset<unknown>): boolean {
-  return dataset.status === "forbidden" || dataset.status === "error" || (dataset.status === "ok" && dataset.truncated === true);
+  return dataset.status === "forbidden"
+    || dataset.status === "error"
+    || (dataset.status === "ok" && (dataset.truncated === true || unevaluableRecordsOf(dataset) > 0));
 }
 
 function anyIncomplete(datasets: Record<string, TenableDataset<unknown>>): boolean {

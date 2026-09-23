@@ -3663,6 +3663,79 @@ test("TENABLE-15 (round 1 blocking 2): export chunk records without a documented
   }
 });
 
+test("Codex P2 (#75): an export with unevaluable records is an incomplete inventory: the categories that read it render their zero status counts as null beside the partial marker the bundle writes, positive counts stay as observed, the roll-up follows the category summaries, and the categories that read no export keep their counts", async () => {
+  const STATUS_KEYS = ["pass", "warn", "fail", "manual"];
+  const CATEGORY_FILES = ["scan_program", "sensor_coverage", "access_control", "vulnerability_management"];
+  const EXPORT_READERS = ["scan_program", "sensor_coverage", "vulnerability_management"];
+  const observedCounts = (assessment) => Object.fromEntries(STATUS_KEYS.map((key) => [key, assessment.findings.filter((item) => item.status === key).length]));
+  const NOT_ASSERTED = /none seen \(not asserted: an inventory the findings read was incomplete\)/;
+
+  // Control: three documented chunks per export are a complete inventory, so every status count is asserted, zeros included.
+  const control = threeChunkRoutes([healthyAssets(), [THIRD_ASSET], [THIRD_ASSET]], [healthyVulns(), [THIRD_VULN], [THIRD_VULN]]);
+  const controlBundle = await exportedBundle(control, "complete export control");
+  const controlAssessments = Object.fromEntries(CATEGORY_FILES.map((name) => [name, JSON.parse(controlBundle.files.get(join("analysis", `${name}.json`)))]));
+  for (const [name, assessment] of Object.entries(controlAssessments)) {
+    const observed = observedCounts(assessment);
+    for (const key of STATUS_KEYS) assert.equal(assessment.summary[key], observed[key], `${name}.summary.${key} on the complete control is the observed count`);
+    assert.ok(STATUS_KEYS.some((key) => observed[key] === 0), `${name}: the control has a zero status count, so the asserted 0 is exercised: ${JSON.stringify(observed)}`);
+  }
+  assert.equal(controlAssessments.scan_program.summary.exported_assets, 4);
+  assert.equal(controlAssessments.sensor_coverage.summary.exported_assets, 4);
+  assert.equal(controlAssessments.vulnerability_management.summary.exported_findings, 4);
+  assert.doesNotMatch(controlBundle.files.get(join("compliance", "executive_summary.md")), NOT_ASSERTED, "a complete inventory asserts every roll-up count");
+
+  // A stray foreign record inside an otherwise documented chunk of each export: the same
+  // readable export the bundle writes under a partial marker.
+  const stray = threeChunkRoutes([healthyAssets(), [THIRD_ASSET], [THIRD_ASSET, FOREIGN_RECORDS[0]]], [healthyVulns(), [THIRD_VULN], [FOREIGN_RECORDS[1], THIRD_VULN]]);
+  const strayBundle = await exportedBundle(stray, "unevaluable export records");
+  for (const name of ["assets_export.json", "vulns_export.json"]) {
+    const written = JSON.parse(strayBundle.files.get(join("core_data", name)));
+    assert.deepEqual(
+      { collected: written.collected, complete: written.complete, truncated: written.truncated, unevaluable_records: written.unevaluable_records, records: written.records.length },
+      { collected: true, complete: false, truncated: false, unevaluable_records: 1, records: 4 },
+      `${name} is a partial marker around the evaluated records`,
+    );
+  }
+  const strayAssessments = Object.fromEntries(CATEGORY_FILES.map((name) => [name, JSON.parse(strayBundle.files.get(join("analysis", `${name}.json`)))]));
+  const withheld = [];
+  for (const name of EXPORT_READERS) {
+    const assessment = strayAssessments[name];
+    const observed = observedCounts(assessment);
+    for (const key of STATUS_KEYS) {
+      const expected = observed[key] === 0 ? null : observed[key];
+      if (expected === null) withheld.push(`${name}.${key}`);
+      assert.strictEqual(assessment.summary[key], expected, `${name}.summary.${key}: zero over an export with unevaluable records renders null, never 0, and a positive count is the observed count (${JSON.stringify(observed)})`);
+    }
+    assert.equal(assessment.summary.collection[name === "vulnerability_management" ? "vuln_export" : "asset_export"].unevaluable_records, 1, `${name}: the collection status counts the record that was kept out`);
+  }
+  assert.ok(withheld.length >= 1, "at least one export-reading category has a zero status count on the mixed export, so the null rendering is exercised");
+  // The demotion the same export carries: every verdict that reads it is capped at warn with the count named.
+  for (const id of EXPORT_CAPPED) {
+    const item = JSON.parse(strayBundle.files.get(join("analysis", "findings.json"))).find((entry) => entry.id === id);
+    assert.equal(item.status, "warn", `${id} is capped at warn by the unevaluable record: ${item.summary}`);
+    assert.equal(item.evidence.unevaluable_records, 1, `${id} evidence counts the record that was kept out`);
+  }
+  // Positive counts are lower bounds and render as observed: the evaluated records are counted, the kept-out one is not.
+  assert.equal(strayAssessments.scan_program.summary.exported_assets, 4);
+  assert.equal(strayAssessments.sensor_coverage.summary.exported_assets, 4);
+  assert.equal(strayAssessments.vulnerability_management.summary.exported_findings, 4);
+  // A category that reads no export is not incomplete and keeps its asserted counts, zeros included.
+  const accessObserved = observedCounts(strayAssessments.access_control);
+  for (const key of STATUS_KEYS) assert.strictEqual(strayAssessments.access_control.summary[key], accessObserved[key], `access_control.summary.${key} reads no export and stays asserted`);
+  assert.deepEqual(accessObserved, observedCounts(controlAssessments.access_control), "the stray record changes nothing the access-control findings read");
+  // The roll-up inherits the incomplete state from the category summaries: a zero roll-up
+  // count is not asserted, a positive one renders as observed (every status occurs at
+  // least once across the four categories of this fixture, so the four lines are counts).
+  const rollup = JSON.parse(strayBundle.files.get(join("analysis", "findings.json")));
+  const executive = strayBundle.files.get(join("compliance", "executive_summary.md"));
+  for (const [key, label] of [["pass", "Passing"], ["warn", "Warning"], ["fail", "Failing"], ["manual", "Manual (unknown or not applicable)"]]) {
+    const total = rollup.filter((item) => item.status === key).length;
+    const line = executive.split("\n").find((text) => text.startsWith(`- ${label}: `));
+    assert.ok(line, `${label} line in the executive summary`);
+    assert.equal(line, `- ${label}: ${total === 0 ? "none seen (not asserted: an inventory the findings read was incomplete)" : total}`, `roll-up ${key}`);
+  }
+});
+
 test("TenableApiClient fails a later page, a status poll, a chunk, or a Security Center envelope that lacks the documented member instead of returning a shorter complete inventory", async () => {
   const scripted = (responses, config = vmConfig()) => {
     let index = 0;
