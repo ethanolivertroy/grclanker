@@ -636,7 +636,9 @@ function isSecretKey(key: string, parentKey: string | undefined): boolean {
 }
 
 const SCHEME_URL_PATTERN = /^[a-z][a-z0-9+.-]*:\/\//i;
-const EMBEDDED_URL_PATTERN = /\b[a-z][a-z0-9+.-]*:\/\/[^\s"'<>()[\]{}\\]+/gi;
+// The marker is part of a URL an earlier pass wrote (`https://hooks.example.com/[REDACTED]`), so a second pass reads
+// the whole URL and reduces it again instead of cutting it before the bracket and gluing the marker onto the host.
+const EMBEDDED_URL_PATTERN = /\b[a-z][a-z0-9+.-]*:\/\/(?:\[REDACTED\]|[^\s"'<>()[\]{}\\])+/gi;
 const TRAILING_PUNCTUATION_PATTERN = /[.,;:!?]+$/;
 
 function urlOrigin(url: string): string {

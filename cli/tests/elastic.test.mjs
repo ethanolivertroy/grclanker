@@ -3024,6 +3024,13 @@ test("verdict rule 9: reduceUrlsToOrigin reduces a URL value and every URL embed
     nested: { url: "https://h.example.com" },
     id: "https://id.example.com",
   });
+  // A URL that carries the marker from an earlier pass is read whole: the marker is not cut off and glued to the host,
+  // so a second pass over a webhook pair is a fixed point instead of collapsing the whole value.
+  assert.equal(reduceUrlsToOrigin("sent to https://hooks.example.com/[REDACTED] twice"), "sent to https://hooks.example.com twice");
+  const webhookPair = "webhook_url=https://hooks.example.com/services/T0/B0/Kq7Zx2Vw9Lm4Tp8RfiCYcanaryKEY";
+  const once = redactSensitiveValues({ note: webhookPair }).note;
+  assert.equal(once, "webhook_url=https://hooks.example.com/[REDACTED]");
+  assert.equal(redactSensitiveValues({ note: once }).note, once, "the data-side scrub of a webhook pair is idempotent");
 });
 
 test("verdict rule 9: a configured secret straddling the 240-character error detail cut is scrubbed at full length before the cut in every encoding, so no fragment survives in the error, a tool payload, or the bundle", async () => {
