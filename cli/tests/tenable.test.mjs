@@ -1614,6 +1614,50 @@ test("CodeRabbit #76 userinfo: the user-and-secret prefix of a URL ends at the f
   }
 });
 
+// Harness self-check (frozen revision 3, flag carrier cells): a credential name after "--"
+// whose spelling opens with an underscore (the `TNS_SESSIONID` cookie name with a leading underscore) was not read as a
+// flag, so "psql --_TNS_SESSIONID <value> -h db" kept the value when no token rule caught its
+// shape. The flag name may now open with a letter or an underscore; the value is still the
+// one token after it, never another flag, and a flag glued to a word (x--_password v) or a
+// non-credential underscore flag (--_theme dark) stays.
+const UNDERSCORE_FLAG_NAME_VALUE = "skvclmtirehs";
+const UNDERSCORE_FLAG_LONG_VALUE = "Wn4Kd8Tq2Zr7Vb1Xs9Pm3Lc6Yh0Jf5Gt";
+const UNDERSCORE_FLAG_ROWS = [
+  [(v) => `psql --_TNS_SESSIONID ${v} -h db`, `psql --_TNS_SESSIONID [REDACTED] -h db`],
+  [(v) => `--_TNS_SESSIONID ${v}`, `--_TNS_SESSIONID [REDACTED]`],
+  [(v) => `psql --_password ${v} -h db`, "psql --_password [REDACTED] -h db"],
+  [(v) => `run --__token ${v} --verbose`, "run --__token [REDACTED] --verbose"],
+  [(v) => `"cmd --_api_key ${v}"`, '"cmd --_api_key [REDACTED]"'],
+  [(v) => `{"message":"psql --_TNS_SESSIONID ${v} -h db failed","code":502}`, `{"message":"psql --_TNS_SESSIONID [REDACTED] -h db failed","code":502}`],
+];
+const UNDERSCORE_FLAG_CONTROLS = [
+  "--_theme dark",
+  "psql --_timeout 30 -h db",
+  "--_password --other",
+  "--_TNS_SESSIONID [REDACTED] -h db",
+  "count --_items 3",
+];
+
+test("harness self-check: a credential-named flag whose name opens with an underscore (--_TNS_SESSIONID <value>) loses its one value argument in both scrubs, while a non-credential underscore flag and a flag glued to a word stay", () => {
+  let cases = 0;
+  for (const scrub of [redactErrorText, redactCredentialValueText]) {
+    for (const [make, expected] of UNDERSCORE_FLAG_ROWS) for (const value of [UNDERSCORE_FLAG_NAME_VALUE, UNDERSCORE_FLAG_LONG_VALUE]) {
+      const input = make(value);
+      const out = scrub(input);
+      const label = `underscore flag: ${scrub.name} ${JSON.stringify(input)} -> ${JSON.stringify(out)}`;
+      assert.equal(out, expected, label);
+      assertNoWindow(out, value, label);
+      assert.equal(scrub(out), out, `${label}: not idempotent`);
+      cases += 1;
+    }
+    for (const text of UNDERSCORE_FLAG_CONTROLS) assert.equal(scrub(text), text, `underscore flag: ${scrub.name} changed a control: ${text}`);
+    assert.equal(scrub(`x--_password ${UNDERSCORE_FLAG_NAME_VALUE}`), `x--_password ${UNDERSCORE_FLAG_NAME_VALUE}`, `underscore flag: ${scrub.name} a flag glued to a word is not a flag`);
+  }
+  assert.equal(cases, 2 * UNDERSCORE_FLAG_ROWS.length * 2);
+  assert.equal(isCredentialKey("_TNS_SESSIONID"), true);
+  assert.equal(isCredentialKey("_theme"), false);
+});
+
 test("scrub boundary: name-shaped values stay bare in prose, leave every carrier whatever their shape, and go as configured secrets in every form", () => {
   for (const value of NAME_SHAPED_VALUES) {
     for (const prose of [`inventory ${value} was not read`, `${value}`, `scanner ${value} reported 12 of 40 agents`, `path /var/lib/${value}/state`]) {

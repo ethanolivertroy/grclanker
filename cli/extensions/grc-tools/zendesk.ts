@@ -643,9 +643,10 @@ const ASSIGNMENT_KEY_PATTERN = /(?:(?<![A-Za-z0-9_])|(?<=\\0))((?:\\*["'])?)([A-
 const ESCAPED_CONTROL_SOURCE = String.raw`\\(?:[nrtbfv0]|u(?:00[01][0-9a-fA-F]|007[fF]|202[89])|x(?:[01][0-9a-fA-F]|7[fF]))`;
 // A credential name after "--" with its value as the next argument (psql --password value):
 // the flag starts where no word character or "-" precedes it (at the start of a quoted
-// command line too), and the value is the one token after it, never another flag, ending
-// where an unquoted pair value does.
-const FLAG_VALUE_PATTERN = new RegExp(String.raw`(?<![A-Za-z0-9_-])--([A-Za-z][A-Za-z0-9_.-]{0,63})([ \t]+)((?!\[REDACTED\])(?!-)(?:(?!${ESCAPED_CONTROL_SOURCE})[^\s\x00-\x1f\x7f"'<>;,&])+)`, "g");
+// command line too), its name may open with a letter or an underscore (a cookie name such as
+// _zendesk_session is a credential name too), and the value is the one token after it, never
+// another flag, ending where an unquoted pair value does.
+const FLAG_VALUE_PATTERN = new RegExp(String.raw`(?<![A-Za-z0-9_-])--([A-Za-z_][A-Za-z0-9_.-]{0,63})([ \t]+)((?!\[REDACTED\])(?!-)(?:(?!${ESCAPED_CONTROL_SOURCE})[^\s\x00-\x1f\x7f"'<>;,&])+)`, "g");
 // After a credential-named path segment and ":" (kv/password: value) the value is at most
 // one token. A singular label (password, token, key) takes that token whatever its shape
 // and whatever follows it (/etc/app/password: <value> was rejected); a plural label names a
