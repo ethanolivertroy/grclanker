@@ -2297,6 +2297,16 @@ function countWhenRead(readable: boolean, count: number): number | null {
 }
 
 /**
+ * The count of records observed in an inventory: a positive count is a real observation and renders (a lower bound
+ * while the listing stopped short, which the inventory state beside it records); zero is asserted only from a listing
+ * read to completion and renders null from a read that stopped or failed, so an absence is never derived from a
+ * partial inventory.
+ */
+function observedCount(complete: boolean, count: number): number | null {
+  return count > 0 || complete ? count : null;
+}
+
+/**
  * Renders a list of named principals (users, keys, roles, policies) only when
  * the inventory proving the property was read completely; denied or partial
  * sets render null so no principal is asserted as violating or compliant
@@ -3740,6 +3750,8 @@ export function evaluateElasticClusterHardening(
 
   const watchesComplete = datasetComplete(snapshot, "watches");
   const connectorsComplete = datasetComplete(snapshot, "connectors");
+  const alertingRulesComplete = datasetComplete(snapshot, "alerting_rules");
+  const detectionRulesComplete = datasetComplete(snapshot, "detection_rules");
   const rulesReadable = datasetReadable(snapshot, "alerting_rules") && datasetReadable(snapshot, "detection_rules");
   const watchIssues = (watches ?? []).map((watch) => ({ id: asString(watch._id) ?? "watch", ...watchActionIssues(watch) }));
   const insecureWatchActions = watchIssues.filter((watch) => watch.insecureWebhooks.length > 0);
@@ -3768,18 +3780,19 @@ export function evaluateElasticClusterHardening(
       inventoryState(snapshot, "alerting_rules", alertingRules?.length),
       inventoryState(snapshot, "detection_rules", detectionRules?.length),
     ],
-    watches: watches?.length ?? null,
+    // Inventory counts: zero from a listing that stopped early is unknown, not an absence (the inventories above say why).
+    watches: observedCount(watchesComplete, watches?.length ?? 0),
     watcher_unreadable: watcherProblem ?? null,
     watcher_licensed: watcherLicensed ?? null,
     watcher_not_applicable: whenRead(licenseReadable, watcherNotApplicable),
     kibana_scoped_out: kibanaScopedOut ?? null,
     kibana_space_queried: kibanaSpaceId ?? "default",
     kibana_spaces_total: kibanaSpaces?.length ?? null,
-    connectors: connectors?.length ?? null,
+    connectors: observedCount(connectorsComplete, connectors?.length ?? 0),
     connectors_unreadable: connectorProblem ?? null,
-    alerting_rules: alertingRules?.length ?? null,
-    detection_rules: detectionRules?.length ?? null,
-    rules_with_actions: countWhenRead(rulesReadable, rulesWithActions),
+    alerting_rules: observedCount(alertingRulesComplete, alertingRules?.length ?? 0),
+    detection_rules: observedCount(detectionRulesComplete, detectionRules?.length ?? 0),
+    rules_with_actions: rulesReadable ? observedCount(alertingRulesComplete && detectionRulesComplete, rulesWithActions) : null,
     insecure_watch_webhooks: principalsWhenComplete(watchesComplete, insecureWatchActions.map((watch) => ({ id: watch.id, actions: watch.insecureWebhooks }))),
     watch_actions_with_embedded_credentials: principalsWhenComplete(watchesComplete, credentialWatchActions.map((watch) => ({ id: watch.id, actions: watch.embeddedCredentials }))),
     insecure_connectors: principalsWhenComplete(connectorsComplete, insecureConnectors.map((connector) => ({ id: asString(connector.id), name: asString(connector.name), type: asString(connector.connector_type_id), url: connectorUrl(connector) }))),
@@ -3791,6 +3804,9 @@ export function evaluateElasticClusterHardening(
   const alertingFailed = insecureWatchActions.length > 0 || insecureConnectors.length > 0;
   const alertingWarned = credentialWatchActions.length > 0 || connectorsMissingSecrets.length > 0;
   const alertingEmpty = (watches?.length ?? 0) === 0 && (connectors?.length ?? 0) === 0;
+  // An empty read is an observed absence only when every listing behind it ran to completion; a page that stopped before
+  // any watch or connector was read says nothing about whether alerting destinations exist.
+  const alertingEmptyObserved = alertingEmpty && (watches === undefined || watchesComplete) && (connectors === undefined || connectorsComplete);
   const alertingManualEvidence: JsonRecord = { ...alertingEvidence, unreadable_sources: alertingProblems, partial_sources: alertingPartial, unchecked_sources: alertingUnchecked };
   if (!alertingFailed && alertingProblems.length === 0 && watcherNotApplicable && kibanaScopedOut) {
     findings.push(manualFinding(
@@ -3818,16 +3834,18 @@ export function evaluateElasticClusterHardening(
     ));
   } else {
     findings.push(guardedFinding(20, "medium", {
-      status: alertingFailed ? "fail" : alertingWarned ? "warn" : "pass",
+      status: alertingFailed ? "fail" : alertingWarned || (alertingEmpty && !alertingEmptyObserved) ? "warn" : "pass",
       summary: alertingFailed
         ? `${insecureWatchActions.length} watch(es) and ${insecureConnectors.length} Kibana connector(s) send to plain http webhook destinations.`
         : alertingWarned
           ? `${credentialWatchActions.length} watch action(s) embed basic-auth credentials and ${connectorsMissingSecrets.length} connector(s) are missing secrets.`
           : alertingProblems.length > 0
             ? "the readable alerting inventories show no insecure destination, but the alerting picture is incomplete."
-            : alertingEmpty
+            : alertingEmptyObserved
               ? `Zero watches and zero connectors exist in the only Kibana space${watcherNotApplicable ? ` (Watcher is not available on the ${license.type} license)` : ""}; this passes because the control governs the security of existing alerting destinations and none exist.`
-              : `${watches?.length ?? 0} watches and ${connectors?.length ?? 0} connectors reviewed (${rulesWithActions} rules carry actions); all webhook destinations use https and no inline credentials were found${watcherNotApplicable ? `; Watcher is not available on the ${license.type} license, so only Kibana connectors were assessed` : ""}.`,
+              : alertingEmpty
+                ? "Zero watches and zero connectors were read before the listing stopped, so no alerting destination was assessed and their absence is not established."
+                : `${watches?.length ?? 0} watches and ${connectors?.length ?? 0} connectors reviewed (${rulesWithActions} rules carry actions); all webhook destinations use https and no inline credentials were found${watcherNotApplicable ? `; Watcher is not available on the ${license.type} license, so only Kibana connectors were assessed` : ""}.`,
       evidence: alertingEvidence,
     }, { problems: alertingProblems, partial: alertingPartial, unchecked: alertingUnchecked, collect: alertingCollect }));
   }
@@ -3943,10 +3961,10 @@ export function evaluateElasticClusterHardening(
       snapshot_repositories: countWhenRead(reposReadable, Object.keys(repositories ?? {}).length),
       slm_policies: countWhenRead(slmReadable, Object.keys(slmPolicies ?? {}).length),
       slm_operation_mode: slmMode ?? null,
-      watches: watches?.length ?? null,
-      connectors: connectors?.length ?? null,
-      alerting_rules: alertingRules?.length ?? null,
-      detection_rules: detectionRules?.length ?? null,
+      watches: observedCount(watchesComplete, watches?.length ?? 0),
+      connectors: observedCount(connectorsComplete, connectors?.length ?? 0),
+      alerting_rules: observedCount(alertingRulesComplete, alertingRules?.length ?? 0),
+      detection_rules: observedCount(detectionRulesComplete, detectionRules?.length ?? 0),
       ingest_pipelines: countWhenRead(pipelinesReadable, Object.keys(pipelines ?? {}).length),
       license_type: whenRead(licenseReadable, license.type ?? null),
       license_status: whenRead(licenseReadable, license.status ?? null),

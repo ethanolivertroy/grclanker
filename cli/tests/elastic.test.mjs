@@ -1976,6 +1976,77 @@ test("gap 43: ELASTIC-23 counts a truncated watches read as Watcher in use, name
   assert.deepEqual(none.evidence.partial_sources, []);
 });
 
+test("ELASTIC-20 renders an alerting inventory count as null when its listing stopped before any record was read, and as the rows read otherwise", async () => {
+  const fixtures = healthyFixtures();
+  fixtures.spaces = [fixtures.spaces[0]];
+  const inventoryRow = (item, dataset) => item.evidence.inventories.find((row) => row.dataset === dataset);
+
+  const complete = await assessElasticClusterHardening(stubClient(fixtures));
+  const completeAlerting = findingById(complete, "ELASTIC-20");
+  assert.equal(completeAlerting.status, "pass");
+  assert.deepEqual(
+    [completeAlerting.evidence.watches, completeAlerting.evidence.connectors, completeAlerting.evidence.alerting_rules, completeAlerting.evidence.detection_rules, completeAlerting.evidence.rules_with_actions],
+    [fixtures.watches.length, fixtures.connectors.length, 1, 1, 1],
+  );
+  assert.deepEqual([complete.summary.watches, complete.summary.detection_rules], [fixtures.watches.length, 1]);
+
+  // Zero watches read under a server count of 500: the count is unknown, and the inventory state beside it says why.
+  const zeroWatches = await assessElasticClusterHardening(stubClient(fixtures, { listWatches: async () => pagedList([], 500, true) }));
+  const zeroWatchesAlerting = findingById(zeroWatches, "ELASTIC-20");
+  assert.equal(zeroWatchesAlerting.status, "warn");
+  assert.equal(zeroWatchesAlerting.evidence.watches, null);
+  assert.equal(zeroWatches.summary.watches, null);
+  assert.deepEqual([inventoryRow(zeroWatchesAlerting, "watches").complete, inventoryRow(zeroWatchesAlerting, "watches").seen, inventoryRow(zeroWatchesAlerting, "watches").total], [false, 0, 500]);
+  assert.equal(zeroWatchesAlerting.evidence.connectors, fixtures.connectors.length, "the complete connectors read keeps its count");
+  assert.match(zeroWatchesAlerting.summary, /^0 watches and \d+ connectors reviewed .* Verdict is capped at warn because the inventory is partial: watches is truncated \(0 of 500 seen/);
+
+  // Zero detection rules read: the same rule in the finding and the tool summary; the rules that carry actions were
+  // seen among the alerting rules, so that count stays as a lower bound.
+  const zeroRules = await assessElasticClusterHardening(stubClient(fixtures, { listDetectionRules: async () => pagedList([], 40, true) }));
+  const zeroRulesAlerting = findingById(zeroRules, "ELASTIC-20");
+  assert.equal(zeroRulesAlerting.status, "warn");
+  assert.equal(zeroRulesAlerting.evidence.detection_rules, null);
+  assert.equal(zeroRules.summary.detection_rules, null);
+  assert.equal(zeroRulesAlerting.evidence.rules_with_actions, 1);
+  assert.deepEqual([inventoryRow(zeroRulesAlerting, "detection_rules").complete, inventoryRow(zeroRulesAlerting, "detection_rules").seen], [false, 0]);
+
+  // No rule carries an action among rules read from a listing that stopped: unknown, never "none".
+  const quietRules = { ...fixtures, alertingRules: [{ ...fixtures.alertingRules[0], actions: [] }] };
+  const zeroActions = findingById(await assessElasticClusterHardening(stubClient(quietRules, { listDetectionRules: async () => pagedList([], 40, true) })), "ELASTIC-20");
+  assert.equal(zeroActions.evidence.rules_with_actions, null);
+  assert.equal(findingById(await assessElasticClusterHardening(stubClient(quietRules)), "ELASTIC-20").evidence.rules_with_actions, 0, "a complete read asserts the zero");
+
+  // A capped read with rows renders the rows read as a lower bound beside the partial marker.
+  const capped = await assessElasticClusterHardening(stubClient(fixtures, {
+    listWatches: async () => pagedList(Array.from({ length: 100 }, (_, index) => ({ ...fixtures.watches[0], _id: `w${index}` })), 500, true),
+  }));
+  const cappedAlerting = findingById(capped, "ELASTIC-20");
+  assert.equal(cappedAlerting.status, "warn");
+  assert.equal(cappedAlerting.evidence.watches, 100);
+  assert.equal(capped.summary.watches, 100);
+  assert.equal(inventoryRow(cappedAlerting, "watches").complete, false);
+
+  // Both listings stopped before any record was read: the text does not assert that no destination exists.
+  const emptyStopped = findingById(await assessElasticClusterHardening(stubClient(fixtures, {
+    listWatches: async () => pagedList([], 500, true),
+    listConnectors: async () => pagedList([], 5, true),
+  })), "ELASTIC-20");
+  assert.equal(emptyStopped.status, "warn");
+  assert.equal(emptyStopped.evidence.observed_status, "warn");
+  assert.match(emptyStopped.summary, /^Zero watches and zero connectors were read before the listing stopped, so no alerting destination was assessed and their absence is not established\. Verdict is capped at warn because the inventory is partial: watches is truncated \(0 of 500 seen.*connectors is truncated \(0 of 5 seen/);
+  assert.ok(!/exist in the only Kibana space/.test(emptyStopped.summary));
+  assert.deepEqual([emptyStopped.evidence.watches, emptyStopped.evidence.connectors], [null, null]);
+
+  // Complete empty reads are an observed absence and keep the pass.
+  const emptyComplete = findingById(await assessElasticClusterHardening(stubClient(fixtures, {
+    listWatches: async () => pagedList([], 0, false),
+    listConnectors: async () => pagedList([], 0, false),
+  })), "ELASTIC-20");
+  assert.equal(emptyComplete.status, "pass");
+  assert.match(emptyComplete.summary, /^Zero watches and zero connectors exist in the only Kibana space; this passes because/);
+  assert.deepEqual([emptyComplete.evidence.watches, emptyComplete.evidence.connectors], [0, 0]);
+});
+
 test("verdict rule 6: every enabling flag is read, absent or false flags never support pass, and settings precedence is honored", async () => {
   const now = Date.now();
 
