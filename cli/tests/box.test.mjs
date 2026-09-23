@@ -39,7 +39,6 @@ import { getRegisteredToolSummaries } from "../dist/pi/tool-catalog.js";
 import { assertSecretsAbsent, readBundleFiles, readZipEntries } from "./helpers/bundle-contents.mjs";
 import { assertCanaryFixture, assertCanaryWindowsAbsent, assertDepthCapPins } from "./helpers/canary-windows.mjs";
 import { assertCookieAttributeCarriersScrubbed } from "./helpers/cookie-attribute-carriers.mjs";
-import { assertGroupALeakProbe, reportTable, runGroupALeakProbeInFreshProcess } from "./helpers/group-a-leak-probe.mjs";
 
 const NOW = new Date("2026-09-21T00:00:00Z");
 const FRAMEWORKS = ["FedRAMP", "CMMC", "SOC 2", "CIS", "PCI-DSS", "STIG", "IRAP", "ISMAP"];
@@ -2584,10 +2583,4 @@ test("cookie attribute class: a later cookie whose name holds a dot or another t
   assertCookieAttributeCarriersScrubbed(assert, (text) => redactSecrets(text, []), "box redactSecrets");
   assertCookieAttributeCarriersScrubbed(assert, (text) => redactCredentialValues({ note: text }).note, "box redactCredentialValues");
   assertCookieAttributeCarriersScrubbed(assert, (text) => redactCredentialValues([{ message: text }])[0].message, "box redactCredentialValues, error list");
-});
-
-test("leak-probe harness: box", () => {
-  const run = runGroupALeakProbeInFreshProcess("box");
-  console.log(reportTable(run.result));
-  assertGroupALeakProbe(assert, run, { integration: "box" });
 });

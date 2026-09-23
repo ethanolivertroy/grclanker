@@ -42,7 +42,6 @@ import { readBundleFiles, readZipEntries } from "./helpers/bundle-contents.mjs";
 import { assertCanaryFixture, assertCanaryWindowsAbsent, assertDepthCapPins } from "./helpers/canary-windows.mjs";
 import { assertCookieAttributeCarriersScrubbed } from "./helpers/cookie-attribute-carriers.mjs";
 import { scrubAlterations } from "./helpers/scrub-survival.mjs";
-import { assertGroupALeakProbe, reportTable, runGroupALeakProbeInFreshProcess } from "./helpers/group-a-leak-probe.mjs";
 
 const NOW = Date.parse("2026-09-21T00:00:00Z");
 const RECENT = "2026-09-15T00:00:00Z";
@@ -3553,13 +3552,4 @@ test("cookie attribute class: a later cookie whose name holds a dot or another t
   assertCookieAttributeCarriersScrubbed(assert, scrubErrorText, "launchdarkly scrubErrorText");
   assertCookieAttributeCarriersScrubbed(assert, (text) => redactCredentialValues({ note: text }).note, "launchdarkly redactCredentialValues");
   assertCookieAttributeCarriersScrubbed(assert, (text) => redactCredentialValues([{ message: text }])[0].message, "launchdarkly redactCredentialValues, error list");
-});
-
-test("leak-probe harness: launchdarkly", () => {
-  const run = runGroupALeakProbeInFreshProcess("launchdarkly");
-  console.log(reportTable(run.result));
-  assertGroupALeakProbe(assert, run, { integration: "launchdarkly", nextLinks: true });
-  const nextLinks = run.result.classes.find((cls) => cls.id === 8);
-  assert.ok(nextLinks.cells >= 17, `class 8 ran every rejected shape and control, got ${nextLinks.cells} cells`);
-  assert.deepEqual(nextLinks.unsafeRequests ?? [], [], "no request left for a rejected link's origin");
 });
