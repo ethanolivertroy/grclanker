@@ -696,14 +696,25 @@ export class LaunchdarklyApiError extends Error {
 export type LaunchdarklyRefusedLinkKind = "foreign-origin" | "userinfo";
 
 /**
- * The whole message for a server-supplied link the client refuses. Fixed text plus the configured origin (the
- * operator's own, userinfo-free setting), so the reader knows which origin was expected; the refused host, path,
- * query, and userinfo never enter the message, so a hostile link cannot smuggle content into an error string.
+ * The origin a refused link resolves to, in the form a reader compares with the configured origin: the scheme, host,
+ * and port (`https://evil.example:8443`), or the bare scheme when the link has no authority (`javascript:`, `data:`,
+ * `file:`). Only the parsed scheme and host enter the text; the link's userinfo, path, query, and fragment never do.
  */
-export function launchdarklyRefusedLinkMessage(kind: LaunchdarklyRefusedLinkKind, configuredOrigin: string): string {
+export function refusedLinkOrigin(url: URL): string {
+  return url.host.length > 0 ? `${url.protocol}//${url.host}` : url.protocol;
+}
+
+/**
+ * The whole message for a server-supplied link the client refuses. Fixed text plus the configured origin (the
+ * operator's own, userinfo-free setting), so the reader knows which origin was expected, and for a foreign link the
+ * origin it resolved to (scheme, host, and port, or the bare scheme), so the reader knows where the server pointed; the
+ * link's path, query, fragment, and userinfo never enter the message, so a hostile link cannot smuggle content into an
+ * error string.
+ */
+export function launchdarklyRefusedLinkMessage(kind: LaunchdarklyRefusedLinkKind, configuredOrigin: string, refusedOrigin: string): string {
   switch (kind) {
     case "foreign-origin":
-      return `LaunchDarkly next link points outside the configured origin ${configuredOrigin}, so it was not followed and no request was sent`;
+      return `LaunchDarkly next link points to ${refusedOrigin}, outside the configured origin ${configuredOrigin}, so it was not followed and no request was sent`;
     case "userinfo":
       return `LaunchDarkly next link carries credentials in its authority, so it was not followed and no request was sent; only the configured origin ${configuredOrigin} is requested`;
     default: {
@@ -720,12 +731,15 @@ const ABSOLUTE_LINK_PATTERN = /^[a-z][a-z0-9+.-]*:/i;
 export class LaunchdarklyForeignOriginError extends Error {
   readonly kind: LaunchdarklyRefusedLinkKind;
   readonly configuredOrigin: string;
+  /** The scheme, host, and port the link resolved to (or its bare scheme); the configured origin for a userinfo refusal. */
+  readonly refusedOrigin: string;
 
-  constructor(kind: LaunchdarklyRefusedLinkKind, configuredOrigin: string) {
-    super(launchdarklyRefusedLinkMessage(kind, configuredOrigin));
+  constructor(kind: LaunchdarklyRefusedLinkKind, configuredOrigin: string, refusedOrigin: string) {
+    super(launchdarklyRefusedLinkMessage(kind, configuredOrigin, refusedOrigin));
     this.name = "LaunchdarklyForeignOriginError";
     this.kind = kind;
     this.configuredOrigin = configuredOrigin;
+    this.refusedOrigin = refusedOrigin;
   }
 }
 
@@ -1476,10 +1490,10 @@ export class LaunchdarklyApiClient {
 
   /**
    * Builds every request URL the client sends. A server-supplied link (an absolute URL, a protocol-relative `//host`
-   * path, or a scheme change) is resolved against the configured base and refused with fixed text unless its origin
-   * equals the base origin, so the token never travels to a host the server chose; a link whose authority carries
-   * user:password@ is refused too, since the configured base never has one and such credentials would otherwise ride
-   * along into the request and its label.
+   * path, or a scheme change) is resolved against the configured base and refused with fixed text naming the origin it
+   * resolved to and the configured one unless the two are equal, so the token never travels to a host the server chose;
+   * a link whose authority carries user:password@ is refused too, since the configured base never has one and such
+   * credentials would otherwise ride along into the request and its label.
    */
   private buildUrl(pathOrUrl: string, query: JsonRecord = {}): string {
     const base = new URL(`${this.config.baseUrl}/`);
@@ -1488,8 +1502,10 @@ export class LaunchdarklyApiClient {
     const url = ABSOLUTE_LINK_PATTERN.test(pathOrUrl)
       ? new URL(pathOrUrl)
       : new URL(pathOrUrl.startsWith("/") ? pathOrUrl : `/${pathOrUrl}`, base);
-    if (url.origin !== base.origin) throw new LaunchdarklyForeignOriginError("foreign-origin", base.origin);
-    if (url.username !== "" || url.password !== "") throw new LaunchdarklyForeignOriginError("userinfo", base.origin);
+    // The scheme and host are compared directly rather than through `origin`: a `blob:` link that wraps the configured
+    // origin reports that origin as its own, yet it is not a request to the configured base.
+    if (url.protocol !== base.protocol || url.host !== base.host) throw new LaunchdarklyForeignOriginError("foreign-origin", base.origin, refusedLinkOrigin(url));
+    if (url.username !== "" || url.password !== "") throw new LaunchdarklyForeignOriginError("userinfo", base.origin, base.origin);
     for (const [key, value] of Object.entries(query)) {
       if (value === undefined || value === null || value === "") continue;
       url.searchParams.set(key, String(value));
@@ -4578,7 +4594,7 @@ function buildQuickReference(): string {
     "# LaunchDarkly Audit Bundle Quick Reference",
     "",
     "- `core_data/` contains LaunchDarkly REST API v2 snapshots: credential-shaped keys (SDK, mobile, relay, and API keys, webhook and integration secrets) are written as [REDACTED], destination URLs are reduced to scheme plus host, and flags are projected to the fields the verdicts read.",
-    "- A listing that was read carries `collected: true`, the request it made as `endpoint`, `truncated`, `seen`, `total`, and `items` (an empty inventory stays `items: []`); `truncation_reason` is present only when paging stopped for a reason other than the cap, such as a server-supplied `_links.next.href` whose origin differed from the configured base URL or whose authority carried credentials (the client refuses such a link with fixed text naming only the configured origin and sends no request to it). A listing that was denied, errored, or timed out is a marker object, never an empty array: `collected: false`, the HTTP `status` observed (or `error`), the `endpoint` that failed, the scrubbed `error`, and `null` for every flag and count. A listing that was never requested because its parent inventory was unreadable is a `status: \"not-collected\"` marker. Listings collected per team, environment, or integration are arrays with one entry per scope, collapsing to a single marker when no scope could be read.",
+    "- A listing that was read carries `collected: true`, the request it made as `endpoint`, `truncated`, `seen`, `total`, and `items` (an empty inventory stays `items: []`); `truncation_reason` is present only when paging stopped for a reason other than the cap, such as a server-supplied `_links.next.href` whose origin differed from the configured base URL or whose authority carried credentials (the client refuses such a link before any request is built, with fixed text naming the configured origin and, for a foreign link, the scheme, host, and port it resolved to; nothing else from the link enters the text). A listing that was denied, errored, or timed out is a marker object, never an empty array: `collected: false`, the HTTP `status` observed (or `error`), the `endpoint` that failed, the scrubbed `error`, and `null` for every flag and count. A listing that was never requested because its parent inventory was unreadable is a `status: \"not-collected\"` marker. Listings collected per team, environment, or integration are arrays with one entry per scope, collapsing to a single marker when no scope could be read.",
     "- `core_data/collection_status.json` records, per listing (`inventories[]`), whether the read completed, the request and HTTP status of a failed read, how the read ended (complete or truncated at a cap), `truncation_reason` when a truncated read stopped for a reason other than its cap (otherwise `null`), how many records were loaded, and the server total when the API exposes one; every flag and count is `null` for a read that did not complete, and `totals` counts those reads as unknown rather than as complete or untruncated.",
     "- Error strings in every file are scrubbed before they are recorded (LaunchDarkly key shapes, authorization and cookie values, credential-shaped key/value pairs, JWTs, and URL userinfo and query strings anywhere in the text); non-JSON error bodies are described by status, content type, and length, never echoed.",
     "- Finding evidence, assessment summaries, and analysis snapshots render `null` (never 0, [], or \"none\") for any count, list, or flag derived from an inventory that was not read; lists of named members, tokens, roles, environments, or flags are populated only from inventories that were actually read, and an empty list is asserted only from complete reads.",

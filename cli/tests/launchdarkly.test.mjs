@@ -29,6 +29,7 @@ import {
   checkLaunchdarklyAccess,
   exportLaunchdarklyAuditBundle,
   launchdarklyRefusedLinkMessage,
+  refusedLinkOrigin,
   parseSimpleToml,
   redactCredentialValues,
   registerLaunchdarklyTools,
@@ -691,38 +692,54 @@ test("verdict rule 10: LaunchdarklyApiClient.list reports truncation on an empty
 
 // Every shape a server could use to point _links.next.href at another origin. The path and query are the ones the real
 // API would send, so only the authority differs from a legitimate link.
+// Each row: the link, and the origin the refusal names for it (scheme, host, and port after the URL parser has
+// lowercased and normalized them, or the bare scheme for a link without an authority).
 const FOREIGN_NEXT_LINKS = [
-  ["absolute foreign host", "https://collector.attacker.example/api/v2/members?limit=2&offset=2"],
-  ["protocol-relative foreign host", "//collector.attacker.example/api/v2/members?limit=2&offset=2"],
-  ["scheme downgrade on the configured host", "http://app.launchdarkly.com/api/v2/members?limit=2&offset=2"],
-  ["configured host on another port", "https://app.launchdarkly.com:8443/api/v2/members?limit=2&offset=2"],
-  ["lookalike subdomain", "https://app.launchdarkly.com.attacker.example/api/v2/members?limit=2&offset=2"],
-  ["configured host as userinfo before a foreign host", "https://app.launchdarkly.com@collector.attacker.example/api/v2/members?limit=2&offset=2"],
+  ["absolute foreign host", "https://collector.attacker.example/api/v2/members?limit=2&offset=2", "https://collector.attacker.example"],
+  ["protocol-relative foreign host", "//collector.attacker.example/api/v2/members?limit=2&offset=2", "https://collector.attacker.example"],
+  ["scheme downgrade on the configured host", "http://app.launchdarkly.com/api/v2/members?limit=2&offset=2", "http://app.launchdarkly.com"],
+  ["configured host on another port", "https://app.launchdarkly.com:8443/api/v2/members?limit=2&offset=2", "https://app.launchdarkly.com:8443"],
+  ["lookalike subdomain", "https://app.launchdarkly.com.attacker.example/api/v2/members?limit=2&offset=2", "https://app.launchdarkly.com.attacker.example"],
+  ["configured host as userinfo before a foreign host", "https://app.launchdarkly.com@collector.attacker.example/api/v2/members?limit=2&offset=2", "https://collector.attacker.example"],
   // The WHATWG parser reads each of these leading spellings as an authority, not a path, when resolved against the base.
-  ["triple-slash authority", "///collector.attacker.example/api/v2/members?limit=2&offset=2"],
-  ["slash-backslash authority", "/\\collector.attacker.example/api/v2/members?limit=2&offset=2"],
-  ["double-backslash authority", "\\\\collector.attacker.example/api/v2/members?limit=2&offset=2"],
-  ["backslash-slash authority", "\\/collector.attacker.example/api/v2/members?limit=2&offset=2"],
+  ["triple-slash authority", "///collector.attacker.example/api/v2/members?limit=2&offset=2", "https://collector.attacker.example"],
+  ["slash-backslash authority", "/\\collector.attacker.example/api/v2/members?limit=2&offset=2", "https://collector.attacker.example"],
+  ["double-backslash authority", "\\\\collector.attacker.example/api/v2/members?limit=2&offset=2", "https://collector.attacker.example"],
+  ["backslash-slash authority", "\\/collector.attacker.example/api/v2/members?limit=2&offset=2", "https://collector.attacker.example"],
   // Absolute links in spellings that a prefix check for "https://" would have missed.
-  ["upper-case scheme", "HTTPS://collector.attacker.example/api/v2/members?limit=2&offset=2"],
-  ["backslashes after the scheme", "https:\\\\collector.attacker.example/api/v2/members?limit=2&offset=2"],
-  ["scheme without slashes", "https:collector.attacker.example/api/v2/members?limit=2&offset=2"],
-  ["non-http scheme", "javascript:alert(1)"],
+  ["upper-case scheme", "HTTPS://collector.attacker.example/api/v2/members?limit=2&offset=2", "https://collector.attacker.example"],
+  ["backslashes after the scheme", "https:\\\\collector.attacker.example/api/v2/members?limit=2&offset=2", "https://collector.attacker.example"],
+  ["scheme without slashes", "https:collector.attacker.example/api/v2/members?limit=2&offset=2", "https://collector.attacker.example"],
+  ["IPv4 literal", "http://10.0.0.1/api/v2/members?limit=2&offset=2", "http://10.0.0.1"],
+  ["IPv6 literal on another port", "https://[::1]:8443/api/v2/members?limit=2&offset=2", "https://[::1]:8443"],
+  ["non-http scheme", "javascript:alert(1)", "javascript:"],
+  ["data scheme", "data:text/plain,members", "data:"],
+  ["file scheme", "file:///etc/members", "file:"],
+  // A blob link wrapping the configured origin reports that origin as its own `origin`; the scheme and host comparison
+  // still refuses it, and the refusal names the bare scheme.
+  ["blob wrapping the configured origin", "blob:https://app.launchdarkly.com/6f1c0a2e", "blob:"],
+  ["blob wrapping a foreign origin", "blob:https://collector.attacker.example/6f1c0a2e", "blob:"],
 ];
 
-// The fixed refusal texts name only the configured origin; nothing from the link enters them.
+// The refusal texts are fixed apart from two origins: the configured one, and for a foreign link the scheme, host, and
+// port it resolved to; the link's path, query, fragment, and userinfo never enter them.
 const CONFIGURED_ORIGIN = "https://app.launchdarkly.com";
-const FOREIGN_ORIGIN_MESSAGE = launchdarklyRefusedLinkMessage("foreign-origin", CONFIGURED_ORIGIN);
-const USERINFO_MESSAGE = launchdarklyRefusedLinkMessage("userinfo", CONFIGURED_ORIGIN);
+const FOREIGN_ORIGIN_MESSAGE = launchdarklyRefusedLinkMessage("foreign-origin", CONFIGURED_ORIGIN, "https://collector.attacker.example");
+const USERINFO_MESSAGE = launchdarklyRefusedLinkMessage("userinfo", CONFIGURED_ORIGIN, CONFIGURED_ORIGIN);
 
-test("foreign-origin next link: the refusal texts are fixed, name the configured origin, and differ only by cause", () => {
-  assert.equal(FOREIGN_ORIGIN_MESSAGE, "LaunchDarkly next link points outside the configured origin https://app.launchdarkly.com, so it was not followed and no request was sent");
+test("foreign-origin next link: the refusal texts are fixed apart from the origins they name, name the configured origin and the refused one, and differ only by cause", () => {
+  assert.equal(FOREIGN_ORIGIN_MESSAGE, "LaunchDarkly next link points to https://collector.attacker.example, outside the configured origin https://app.launchdarkly.com, so it was not followed and no request was sent");
   assert.equal(USERINFO_MESSAGE, "LaunchDarkly next link carries credentials in its authority, so it was not followed and no request was sent; only the configured origin https://app.launchdarkly.com is requested");
-  assert.equal(launchdarklyRefusedLinkMessage("foreign-origin", "https://ld.internal.example:8443"), "LaunchDarkly next link points outside the configured origin https://ld.internal.example:8443, so it was not followed and no request was sent");
+  assert.equal(launchdarklyRefusedLinkMessage("foreign-origin", "https://ld.internal.example:8443", "javascript:"), "LaunchDarkly next link points to javascript:, outside the configured origin https://ld.internal.example:8443, so it was not followed and no request was sent");
+  // The refused origin is read from the parsed link: scheme, host, and port only, or the bare scheme without an authority.
+  assert.equal(refusedLinkOrigin(new URL("HTTPS://svc:pw@Collector.Attacker.Example:8443/api/v2/members?limit=2#frag")), "https://collector.attacker.example:8443");
+  assert.equal(refusedLinkOrigin(new URL("https://collector.attacker.example:443/api/v2/members")), "https://collector.attacker.example");
+  assert.equal(refusedLinkOrigin(new URL("blob:https://app.launchdarkly.com/6f1c0a2e")), "blob:");
+  assert.equal(refusedLinkOrigin(new URL("data:text/plain,members")), "data:");
 });
 
-test("foreign-origin next link: LaunchdarklyApiClient.list refuses a server-supplied _links.next.href outside the configured origin, sends no request to it, and reports the listing truncated with fixed text", async () => {
-  for (const [label, href] of FOREIGN_NEXT_LINKS) {
+test("foreign-origin next link: LaunchdarklyApiClient.list refuses a server-supplied _links.next.href outside the configured origin, sends no request to it, and reports the listing truncated with fixed text naming both origins", async () => {
+  for (const [label, href, refusedOrigin] of FOREIGN_NEXT_LINKS) {
     const requests = [];
     const fetchImpl = async (input, init = {}) => {
       const url = new URL(typeof input === "string" ? input : input.toString());
@@ -735,11 +752,12 @@ test("foreign-origin next link: LaunchdarklyApiClient.list refuses a server-supp
     assert.equal(requests.length, 1, `${label}: only the first page request leaves; the refused link is never fetched`);
     assert.equal(requests[0].origin, "https://app.launchdarkly.com", `${label}: the one request went to the configured origin`);
     assert.equal(requests[0].auth, TEST_TOKEN, `${label}: the token travelled only to the configured origin`);
-    assert.ok(!requests[0].href.includes("attacker") && !requests[0].href.includes(":8443") && !requests[0].href.includes("javascript"), `${label}: no request names the foreign authority`);
+    assert.ok(!requests[0].href.includes("attacker") && !requests[0].href.includes(":8443") && !requests[0].href.includes("javascript") && !requests[0].href.includes("blob") && !requests[0].href.includes("10.0.0.1"), `${label}: no request names the foreign authority`);
     assert.deepEqual(members.items.map((item) => item._id), ["a", "b"], `${label}: the pages already read are kept`);
     assert.equal(members.truncated, true, `${label}: the refused remainder is unread even though the server total matched the items seen, so the listing is truncated`);
-    assert.equal(members.truncationReason, FOREIGN_ORIGIN_MESSAGE, `${label}: the reason is the fixed client text`);
-    assert.doesNotMatch(members.truncationReason, /attacker|collector|8443|http:|HTTPS|javascript|\\|@/, `${label}: nothing from the refused link enters the reason`);
+    assert.equal(members.truncationReason, launchdarklyRefusedLinkMessage("foreign-origin", CONFIGURED_ORIGIN, refusedOrigin), `${label}: the reason is the fixed client text naming the refused origin and the configured one`);
+    assert.ok(members.truncationReason.includes(CONFIGURED_ORIGIN) && members.truncationReason.includes(refusedOrigin), `${label}: the reason names both origins`);
+    assert.doesNotMatch(members.truncationReason, /api\/v2|members|limit=|offset=|alert|etc|6f1c|text\/plain|HTTPS|\\|@/, `${label}: nothing from the refused link beyond its scheme, host, and port enters the reason`);
     assert.equal(members.endpoint, "GET /api/v2/members", `${label}: the endpoint names the request that was made`);
   }
 
@@ -751,6 +769,7 @@ test("foreign-origin next link: LaunchdarklyApiClient.list refuses a server-supp
     assert.ok(error instanceof LaunchdarklyForeignOriginError, "the client throws its fixed-text error class");
     assert.equal(error.kind, "foreign-origin");
     assert.equal(error.configuredOrigin, CONFIGURED_ORIGIN);
+    assert.equal(error.refusedOrigin, "https://collector.attacker.example");
     assert.equal(error.message, FOREIGN_ORIGIN_MESSAGE);
     return true;
   });
@@ -784,6 +803,7 @@ test("foreign-origin next link: a same-origin link whose authority carries crede
   await assert.rejects(direct.get(`https://audit:${planted}@app.launchdarkly.com/api/v2/members`), (error) => {
     assert.ok(error instanceof LaunchdarklyForeignOriginError);
     assert.equal(error.kind, "userinfo");
+    assert.equal(error.refusedOrigin, CONFIGURED_ORIGIN, "a userinfo refusal is on the configured origin itself");
     assert.equal(error.message, USERINFO_MESSAGE);
     return true;
   });
@@ -826,7 +846,7 @@ test("foreign-origin next link: a refused link is recorded as a truncation with 
 
   for (const id of ["LD-02", "LD-03", "LD-06", "LD-24"]) {
     assert.equal(findingStatus(result, id), "warn", `${id} must not pass on a listing whose remainder was refused`);
-    assert.match(finding(result, id).summary, /Truncated listing: members \(\d+ of \d+ collected; LaunchDarkly next link points outside the configured origin https:\/\/app\.launchdarkly\.com/, `${id}: the caveat carries the reason`);
+    assert.match(finding(result, id).summary, /Truncated listing: members \(\d+ of \d+ collected; LaunchDarkly next link points to https:\/\/collector\.attacker\.example, outside the configured origin https:\/\/app\.launchdarkly\.com/, `${id}: the caveat carries the reason`);
     assert.doesNotMatch(finding(result, id).summary, /raise member_limit/, `${id}: raising the cap cannot fix a refused link, so it is not offered`);
     assert.match(finding(result, id).summary, /review the uncollected items manually/);
     const [note] = finding(result, id).evidence.truncated_collections;
