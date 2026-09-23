@@ -523,8 +523,24 @@ const AUTH_PARAM_NAMES = new Set([
 // charset, the Digest challenge fields: Bearer realm="api", error="invalid_token", a
 // WWW-Authenticate value) is a challenge and stays for the per-parameter rules; a list with
 // any other parameter (Token, token, key, username, uri, response, oauth_token, ...) is the
-// credential side of its scheme. The list is read by authParameterListEnd.
+// credential side of its scheme. The list is read by readAuthParameterList.
 const CHALLENGE_PARAM_NAMES = new Set(["realm", "error", "error_description", "error_uri", "scope", "charset", "domain", "nonce", "opaque", "stale", "algorithm", "qop", "userhash"]);
+// The parameters that carry the proof of a credential: the Digest response, a signature
+// (oauth_signature, signature, sig), or a MAC. A proof's value goes whatever its shape, in
+// a list after a scheme word or in one without a scheme word.
+const PROOF_PARAM_NAMES = new Set(["response", "signature", "oauth_signature", "mac", "sig"]);
+// A parameter list without a scheme word (realm="api", nonce="n", response="<proof>": the
+// value of a www_authenticate field, or a credential echoed without its scheme word) is an
+// auth parameter list when it holds two or more parameters and one of them, other than a
+// proof, is a known auth parameter (a challenge parameter, or username, uri, nc, cnonce, an
+// oauth_* parameter). In such a list, or in the list after a scheme word, a proof goes and a
+// challenge parameter keeps its value: the nonce of a challenge is public, so a proof-free
+// challenge (Digest realm="api", qop="auth", nonce="n") keeps every value, while a list
+// that carries a proof is not a challenge, whatever parameters open it. Any other parameter
+// (username, oauth_token) is judged under its own name, and a lone name=value pair is no
+// list. A list opens at a name that no word character precedes.
+const AUTH_PARAMETER_LIST_OPENER_PATTERN = /(?<![A-Za-z0-9_.:-])[A-Za-z][A-Za-z0-9_-]*=/g;
+const SCHEME_LED_LIST_PATTERN = new RegExp(String.raw`\b(?:${SCHEME_WORD_SOURCE})\s+$`, "i");
 const SCHEME_PARAMETER_LIST_PATTERN = new RegExp(String.raw`\b(${SCHEME_WORD_SOURCE})\s+(?=[A-Za-z][A-Za-z0-9_-]*=)`, "gi");
 const AUTH_PARAM_ITEM_PATTERN = /([A-Za-z][A-Za-z0-9_-]*)=/y;
 const AUTH_PARAM_BARE_VALUE_PATTERN = /[^\s,"'\\<>]+/y;
@@ -1132,12 +1148,14 @@ function scrubHeaderLines(text: string): string {
 // it only when no prose continues after it, since prose means there was no value at all; an
 // escaped slash (\/) before the key is a line break, not a path.
 function replaceCredentialAssignments(text: string): string {
+  const fates = authParameterFates(text);
   ASSIGNMENT_KEY_PATTERN.lastIndex = 0;
   let out = "";
   let last = 0;
   let match: RegExpExecArray | null;
   while ((match = ASSIGNMENT_KEY_PATTERN.exec(text)) !== null) {
     const [whole, openingQuote, key, separator, operator] = match;
+    if (operator === "=" && fates.get(match.index + openingQuote.length) === "challenge") continue;
     const spelledName = keyAfterEscape(text, match.index + openingQuote.length, key);
     const name = openingQuote === "" && spelledName.startsWith("D") && JAVA_PROPERTY_PREFIX_PATTERN.test(text.slice(Math.max(0, match.index - 2), match.index)) ? spelledName.slice(1) : spelledName;
     const valueStart = match.index + whole.length;
@@ -1200,18 +1218,31 @@ function quotedParameterValueEnd(text: string, valueStart: number, quote: string
   return limit;
 }
 
-// Where the parameter list that opens at start (name=value, name2=value2, ...) ends, and
-// whether it carries credentials: a list made only of challenge parameters is a challenge.
-// A quoted value (bare or escaped to any depth) runs to the quote that closes it, or to the
-// end of the text it sits in when nothing does (a cut-off value keeps no part of itself),
-// an unquoted value is one token, and the list ends before a "," that no further parameter
-// follows, so prose after the list stays. Undefined when no parameter opens at start
-// (nothing after the "=").
-function authParameterListEnd(text: string, start: number): { end: number; credentials: boolean } | undefined {
+// One parameter of a list: its name as spelled (without an escape letter glued to its
+// front), where the name starts, and where its value starts and ends; the quote token that
+// opens a quoted value, or undefined for a bare one.
+interface AuthParameter {
+  name: string;
+  nameStart: number;
+  valueStart: number;
+  valueEnd: number;
+  quote: string | undefined;
+}
+
+// What a parameter of an auth parameter list is: a proof (its value goes), a challenge
+// parameter (its value stays), or another parameter (judged under its own name).
+type AuthParameterFate = "proof" | "challenge" | "other";
+
+// The parameter list that opens at start (name=value, name2=value2, ...): its parameters
+// and where it ends. A quoted value (bare or escaped to any depth) runs to the quote that
+// closes it, or to the end of the text it sits in when nothing does (a cut-off value keeps
+// no part of itself), an unquoted value is one token, and the list ends before a "," that
+// no further parameter follows, so prose after the list stays. Undefined when no parameter
+// opens at start (nothing after the "=").
+function readAuthParameterList(text: string, start: number): { end: number; items: AuthParameter[] } | undefined {
   const limit = lineEndFrom(text, start);
+  const items: AuthParameter[] = [];
   let index = start;
-  let end: number | undefined;
-  let credentials = false;
   while (index < limit) {
     AUTH_PARAM_ITEM_PATTERN.lastIndex = index;
     const item = AUTH_PARAM_ITEM_PATTERN.exec(text);
@@ -1227,14 +1258,47 @@ function authParameterListEnd(text: string, start: number): { end: number; crede
       if (bare === null) break;
       valueEnd = valueStart + bare[0].length;
     }
-    if (!CHALLENGE_PARAM_NAMES.has(item[1].toLowerCase())) credentials = true;
-    end = valueEnd;
+    items.push({ name: keyAfterEscape(text, index, item[1]), nameStart: index, valueStart, valueEnd, quote });
     AUTH_PARAM_SEPARATOR_PATTERN.lastIndex = valueEnd;
     const separator = AUTH_PARAM_SEPARATOR_PATTERN.exec(text);
     if (separator === null || separator[0].length === 0) break;
     index = valueEnd + separator[0].length;
   }
-  return end === undefined ? undefined : { end, credentials };
+  const lastItem = items[items.length - 1];
+  return lastItem === undefined ? undefined : { end: lastItem.valueEnd, items };
+}
+
+function authParameterFate(name: string): AuthParameterFate {
+  const lower = name.toLowerCase();
+  if (PROOF_PARAM_NAMES.has(lower)) return "proof";
+  return CHALLENGE_PARAM_NAMES.has(lower) ? "challenge" : "other";
+}
+
+// A known auth parameter other than a proof: one of them makes a list without a scheme
+// word an auth parameter list.
+function isAuthParameterAnchor(name: string): boolean {
+  const lower = name.toLowerCase();
+  return (AUTH_PARAM_NAMES.has(lower) || CHALLENGE_PARAM_NAMES.has(lower)) && !PROOF_PARAM_NAMES.has(lower);
+}
+
+// The fate of every parameter of every auth parameter list in text, by where its name
+// starts: the list after a scheme word, whatever it holds (a credential list after a scheme
+// word has already gone whole when this runs), and a list without one that holds two or
+// more parameters, one of them an anchor. A parameter outside such a list has no entry.
+function authParameterFates(text: string): Map<number, AuthParameterFate> {
+  const fates = new Map<number, AuthParameterFate>();
+  AUTH_PARAMETER_LIST_OPENER_PATTERN.lastIndex = 0;
+  let opener: RegExpExecArray | null;
+  while ((opener = AUTH_PARAMETER_LIST_OPENER_PATTERN.exec(text)) !== null) {
+    const list = readAuthParameterList(text, opener.index);
+    if (list === undefined) continue;
+    const schemeLed = SCHEME_LED_LIST_PATTERN.test(text.slice(Math.max(0, opener.index - 32), opener.index));
+    if (schemeLed || (list.items.length > 1 && list.items.some((item) => isAuthParameterAnchor(item.name)))) {
+      for (const item of list.items) fates.set(item.nameStart, authParameterFate(item.name));
+    }
+    AUTH_PARAMETER_LIST_OPENER_PATTERN.lastIndex = list.end;
+  }
+  return fates;
 }
 
 // A scheme word and the credential parameter list after it lose the list and keep the
@@ -1245,8 +1309,8 @@ function replaceSchemeParameterLists(text: string): string {
   let last = 0;
   let match: RegExpExecArray | null;
   while ((match = SCHEME_PARAMETER_LIST_PATTERN.exec(text)) !== null) {
-    const list = authParameterListEnd(text, match.index + match[0].length);
-    if (list === undefined || !list.credentials) continue;
+    const list = readAuthParameterList(text, match.index + match[0].length);
+    if (list === undefined || !list.items.some((item) => !CHALLENGE_PARAM_NAMES.has(item.name.toLowerCase()))) continue;
     out += `${text.slice(last, match.index)}${match[1]} ${CREDENTIAL_REDACTION_MARKER}`;
     last = list.end;
     SCHEME_PARAMETER_LIST_PATTERN.lastIndex = last;
@@ -1254,11 +1318,48 @@ function replaceSchemeParameterLists(text: string): string {
   return last === 0 ? text : `${out}${text.slice(last)}`;
 }
 
+// Every proof parameter of an auth parameter list loses its value, quoted (the quote token
+// of its own depth stays, and a cut-off value gets no closing quote it never had) or bare;
+// the parameters beside it are left as they are.
+function replaceAuthParameterProofs(text: string): string {
+  const proofs = [...authParameterFates(text).entries()].filter(([, fate]) => fate === "proof").map(([nameStart]) => nameStart);
+  if (proofs.length === 0) return text;
+  let out = "";
+  let last = 0;
+  for (const nameStart of proofs) {
+    const list = readAuthParameterList(text, nameStart);
+    const item = list?.items[0];
+    if (item === undefined || item.nameStart !== nameStart) continue;
+    const quote = item.quote ?? "";
+    const closed = quote !== "" && item.valueEnd - quote.length > item.valueStart && text.startsWith(quote, item.valueEnd - quote.length);
+    const value = text.slice(item.valueStart + quote.length, closed ? item.valueEnd - quote.length : item.valueEnd);
+    if (value.length === 0 || value === CREDENTIAL_REDACTION_MARKER) continue;
+    out += `${text.slice(last, item.valueStart)}${quote}${CREDENTIAL_REDACTION_MARKER}${closed ? quote : ""}`;
+    last = item.valueEnd;
+  }
+  return last === 0 ? text : `${out}${text.slice(last)}`;
+}
+
+// The rule for a quoted attribute or pair value under a key: redacted under a credential
+// key (or reduced to its origin under a webhook key), the match otherwise.
+type QuotedValueRule = (key: string, value: string, redacted: () => string, webhook: (url: string) => string, match: string) => string;
+
+// Every key="value" attribute, at any escape depth, under the quoted-value rule; a challenge
+// parameter inside an auth parameter list (the nonce of Digest realm="api", nonce="n")
+// keeps its value whatever its name says.
+function replaceQuotedAttributes(text: string, quotedValue: QuotedValueRule): string {
+  const fates = authParameterFates(text);
+  return text.replace(QUOTED_ATTRIBUTE_PATTERN, (match, key: string, quote: string, value: string, offset: number) =>
+    (fates.get(offset) === "challenge" ? match : quotedValue(keyAfterEscape(text, offset, key), value, () => `${key}=${quote}${CREDENTIAL_REDACTION_MARKER}${quote}`, (url) => `${key}=${quote}${url}${quote}`, match)));
+}
+
 /** Every carrier rule (guard 1) plus the token shapes a prefix identifies on its own; the long-token rule is left to redactErrorText. */
 // Header lines go first: a recognised header line takes its whole value, so the URL and
 // query rules never split a cookie pair whose name holds "&" or "#" off its cookie. The
 // parameter-list rule runs before the scheme rule, so a credential list after a scheme
-// word goes whole instead of losing its first "name=" and keeping the quoted value.
+// word goes whole instead of losing its first "name=" and keeping the quoted value, and the
+// proof rule right after it, so a proof in a list without a scheme word goes before the
+// per-parameter rules read the list.
 function scrubCarriers(text: string, pemScope: PemScope): string {
   const quotedValue = (key: string, value: string, redacted: () => string, webhook: (url: string) => string, match: string): string => {
     if (isWebhookUrlKey(key) && URL_VALUE_PATTERN.test(value)) return webhook(redactedWebhookUrl(value));
@@ -1269,11 +1370,11 @@ function scrubCarriers(text: string, pemScope: PemScope): string {
     .replace(EMBEDDED_URL_PATTERN, scrubUrlUserinfo)
     .replace(SLASH_ESCAPED_URL_USERINFO_PATTERN, `$1${CREDENTIAL_REDACTION_MARKER}@`)
     .replace(QUERY_PAIR_PATTERN, (match, separator: string, key: string, value: string) => (isCredentialAssignmentKey(key) || isTokenShapedValue(value) ? `${separator}${key}=${CREDENTIAL_REDACTION_MARKER}` : match));
-  const scrubbed = replaceSchemeParameterLists(carriers)
+  const pairs = replaceAuthParameterProofs(replaceSchemeParameterLists(carriers))
     .replace(SCHEME_VALUE_PATTERN, (match, scheme: string, value: string) => (isSchemeProse(scheme, value) ? match : `${scheme} ${CREDENTIAL_REDACTION_MARKER}`))
     .replace(JSON_QUOTED_PAIR_PATTERN, (match, key: string, separator: string, value: string) => quotedValue(key, value, () => `"${key}"${separator}"${CREDENTIAL_REDACTION_MARKER}"`, (url) => `"${key}"${separator}"${url}"`, match))
-    .replace(JSON_ESCAPED_PAIR_PATTERN, (match, run: string, key: string, separator: string, value: string) => quotedValue(key, value, () => `${run}"${key}${run}"${separator}${run}"${CREDENTIAL_REDACTION_MARKER}${run}"`, (url) => `${run}"${key}${run}"${separator}${run}"${url}${run}"`, match))
-    .replace(QUOTED_ATTRIBUTE_PATTERN, (match, key: string, quote: string, value: string, offset: number, whole: string) => quotedValue(keyAfterEscape(whole, offset, key), value, () => `${key}=${quote}${CREDENTIAL_REDACTION_MARKER}${quote}`, (url) => `${key}=${quote}${url}${quote}`, match));
+    .replace(JSON_ESCAPED_PAIR_PATTERN, (match, run: string, key: string, separator: string, value: string) => quotedValue(key, value, () => `${run}"${key}${run}"${separator}${run}"${CREDENTIAL_REDACTION_MARKER}${run}"`, (url) => `${run}"${key}${run}"${separator}${run}"${url}${run}"`, match));
+  const scrubbed = replaceQuotedAttributes(pairs, quotedValue);
   return replaceCredentialAssignments(replaceFlagValues(scrubbed))
     .replace(JWT_PATTERN, CREDENTIAL_REDACTION_MARKER)
     .replace(PANOS_API_KEY_PATTERN, CREDENTIAL_REDACTION_MARKER)

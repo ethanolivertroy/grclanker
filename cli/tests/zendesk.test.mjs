@@ -2928,6 +2928,102 @@ test("harness self-check: a 401 body that echoes an Authorization header with a 
   }
 });
 
+// Harness self-check (CodeRabbit on #81, discussion_r4081776771, auth-param cells): a parameter
+// list without a scheme word (realm="api", nonce="n", response="<proof>": the value of a
+// www_authenticate field, or a credential echoed without its scheme word) is not a
+// WWW-Authenticate challenge when a later parameter is a proof (response, signature,
+// oauth_signature, mac, sig). Before, such a list fell to the per-parameter rules, where
+// response and mac are not credential names, so a name-shaped proof survived in every sink
+// (and a long one on the data side), while the nonce of a proof-free challenge went as a
+// credential name. Now the proof values go whatever their shape, quoted at any depth or bare,
+// wherever the proof sits in the list, and a proof-free challenge (WWW-Authenticate: Bearer
+// realm="api", Digest realm="api", qop="auth", nonce="n") keeps every value, the nonce
+// included; a lone nonce="..." is no list and still goes, and a list with no known auth
+// parameter (code="401", response="Unauthorized", a MAC address beside an IP) stays.
+const PROOF_SHORT_VALUE = "skvclmtirehs";
+const PROOF_LONG_VALUE = "Qm7Vx2Lk9Rt4Pw8Zs3Yh6Nd1Bc5Fg0Jt";
+const PROOF_PARAM_NAMES = ["response", "signature", "oauth_signature", "mac", "sig"];
+const escapeJsonText = (text) => JSON.stringify(text).slice(1, -1);
+// Each form: the text with the proof under a parameter name, and the same text with the
+// proof gone.
+const PROOF_LIST_FORMS = [
+  (name, v) => [`realm="api", nonce="n", ${name}="${v}"`, `realm="api", nonce="n", ${name}="[REDACTED]"`],
+  (name, v) => [`the client answered realm="api", nonce="n", ${name}="${v}" and was refused`, `the client answered realm="api", nonce="n", ${name}="[REDACTED]" and was refused`],
+  (name, v) => [`status 401\\n${escapeJsonText(`realm="api", nonce="n", ${name}="${v}"`)}`, `status 401\\n${escapeJsonText(`realm="api", nonce="n", ${name}="[REDACTED]"`)}`],
+  (name, v) => [`{"detail":"${escapeJsonText(`realm="api", nonce="n", ${name}="${v}"`)}","code":401}`, `{"detail":"${escapeJsonText(`realm="api", nonce="n", ${name}="[REDACTED]"`)}","code":401}`],
+  (name, v) => [`{"detail":"challenge answered:\\n${escapeJsonText(`realm="api", nonce="n", ${name}="${v}"`)} refused","code":401}`, `{"detail":"challenge answered:\\n${escapeJsonText(`realm="api", nonce="n", ${name}="[REDACTED]"`)} refused","code":401}`],
+  (name, v) => [`{"detail":"{\\"h\\":\\"${escapeJsonText(escapeJsonText(`realm="api", nonce="n", ${name}="${v}"`))}\\"}"}`, `{"detail":"{\\"h\\":\\"${escapeJsonText(escapeJsonText(`realm="api", nonce="n", ${name}="[REDACTED]"`))}\\"}"}`],
+  (name, v) => [`{"detail":"${escapeJsonText(`realm="api", nonce="n", ${name}="${v}`)}","code":401}`, `{"detail":"${escapeJsonText(`realm="api", nonce="n", ${name}="`)}[REDACTED]","code":401}`],
+  (name, v) => [`realm='api', nonce='n', ${name}='${v}'`, `realm='api', nonce='n', ${name}='[REDACTED]'`],
+  (name, v) => [`realm=api, nonce=n, ${name}=${v}`, `realm=api, nonce=n, ${name}=[REDACTED]`],
+  (name, v) => [`${name}="${v}", realm="api"`, `${name}="[REDACTED]", realm="api"`],
+  (name, v) => [`nonce="n", ${name}="${v}"`, `nonce="n", ${name}="[REDACTED]"`],
+  (name, v) => [`username="auditor", realm="api", nonce="n", uri="/api/v2/users", ${name}="${v}"`, `username="auditor", realm="api", nonce="n", uri="/api/v2/users", ${name}="[REDACTED]"`],
+  (name, v) => [`id="h480djs93hd8", ts="1336363200", nonce="dj83hs9s", ${name}="${v}"`, `id="h480djs93hd8", ts="1336363200", nonce="dj83hs9s", ${name}="[REDACTED]"`],
+];
+// A lone credential-named pair is no list and goes as before.
+const PROOF_NO_LIST_ROWS = [
+  ['nonce="n"', 'nonce="[REDACTED]"'],
+  ['set realm="api" and retry, nonce="n" was stale', 'set realm="api" and retry, nonce="[REDACTED]" was stale'],
+];
+const PROOF_LIST_CONTROLS = [
+  'WWW-Authenticate: Bearer realm="api"',
+  'WWW-Authenticate: Digest realm="api", qop="auth", nonce="n"',
+  'Digest realm="api", qop="auth", nonce="n"',
+  'Digest nonce="n"',
+  'realm="api", qop="auth", nonce="n"',
+  'realm="api", nonce="n"',
+  'realm=api, qop=auth, nonce=n',
+  'Bearer realm="api", error="invalid_token", error_description="The access token expired"',
+  '{"www_authenticate":"Digest realm=\\"api\\", qop=\\"auth\\", nonce=\\"n\\""}',
+  'error="invalid_token", error_description="The token expired, please renew", realm="api"',
+  'code="401", response="Unauthorized"',
+  'mac="00:11:22:33:44:55", ip="10.0.0.1"',
+  'response="ok"',
+  'the response was slow; mac address 00:11:22:33:44:55; sig figs 3',
+  '{"response":"ok","mac":"00:11:22:33:44:55"}',
+  'realm="api", nonce="n", response="[REDACTED]"',
+];
+
+test("harness self-check: a proof parameter (response, signature, oauth_signature, mac, sig) in a parameter list without a scheme word loses its value in both scrubs, the error constructor, and the walker, bare, after a JSON escape, inside a JSON string, and double-escaped, while a proof-free challenge keeps its values, the nonce included", () => {
+  let cases = 0;
+  for (const [sinkName, sink] of SCHEME_LIST_SINKS) {
+    for (const form of PROOF_LIST_FORMS) for (const name of PROOF_PARAM_NAMES) for (const value of [PROOF_SHORT_VALUE, PROOF_LONG_VALUE]) {
+      const [input, expected] = form(name, value);
+      const out = sink(input);
+      const label = `proof parameter: ${sinkName} ${JSON.stringify(input)} -> ${JSON.stringify(out)}`;
+      assert.equal(out, expected, label);
+      assertNoWindow(out, value, label);
+      assert.equal(sink(out), out, `${label}: not idempotent`);
+      cases += 1;
+    }
+    for (const [input, expected] of PROOF_NO_LIST_ROWS) assert.equal(sink(input), expected, `proof parameter: ${sinkName} ${JSON.stringify(input)}`);
+    for (const text of PROOF_LIST_CONTROLS) assert.equal(sink(text), text, `proof parameter: ${sinkName} changed a control: ${text}`);
+  }
+  assert.equal(cases, SCHEME_LIST_SINKS.length * PROOF_LIST_FORMS.length * PROOF_PARAM_NAMES.length * 2);
+  // The walker: a www_authenticate value loses its proof and keeps its realm and nonce, a
+  // challenge keeps every value, and response and mac properties are not credentials.
+  assert.deepEqual(
+    redactCredentialProperties({ www_authenticate: `realm="api", nonce="n", response="${PROOF_SHORT_VALUE}"`, nested: [{ challenge: 'Digest realm="api", qop="auth", nonce="n"' }], response: "ok", mac: "00:11:22:33:44:55" }),
+    { www_authenticate: 'realm="api", nonce="n", response="[REDACTED]"', nested: [{ challenge: 'Digest realm="api", qop="auth", nonce="n"' }], response: "ok", mac: "00:11:22:33:44:55" },
+  );
+});
+
+test("harness self-check: a 401 body that echoes a parameter list without a scheme word (realm=\"api\", nonce=\"n\", response=\"<proof>\") reaches the thrown error with the proof gone and the realm and nonce kept, end to end through the client", async () => {
+  for (const name of PROOF_PARAM_NAMES) for (const value of [PROOF_SHORT_VALUE, PROOF_LONG_VALUE]) {
+    const echoed = `the client answered realm="api", nonce="n", ${name}="${value}" and was refused`;
+    const fetchImpl = async () => jsonResponse({ error: "Couldn't authenticate you", description: echoed }, { status: 401, statusText: "Unauthorized", headers: { "www-authenticate": 'Digest realm="api", qop="auth", nonce="n"' } });
+    const client = new ZendeskApiClient(sampleConfig(), { fetchImpl, sleep: async () => {} });
+    await assert.rejects(() => client.get("/users/me"), (error) => {
+      assert.ok(error instanceof ZendeskApiError, `proof echo: ${echoed} threw ${String(error)}`);
+      assert.equal(error.status, 401);
+      assert.equal(error.message, `Zendesk request failed for /users/me (401 Unauthorized; Couldn't authenticate you; the client answered realm="api", nonce="n", ${name}="[REDACTED]" and was refused)`, `proof echo: ${echoed}`);
+      assertNoWindow(error.message, value, `proof echo: ${echoed}`);
+      return true;
+    });
+  }
+});
+
 test("scrub boundary: name-shaped values stay bare in prose, leave every carrier whatever their shape, and go as configured secrets in every form", () => {
   for (const value of NAME_SHAPED_VALUES) {
     for (const prose of [`inventory ${value} was not read`, `${value}`, `webhook ${value} read 12 of 40 destinations`, `path /var/lib/${value}/state`]) {
