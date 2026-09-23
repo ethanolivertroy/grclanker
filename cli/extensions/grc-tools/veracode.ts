@@ -391,7 +391,9 @@ function isWebhookKey(segments: readonly string[]): boolean {
 /** Whether a key's last word is a credential noun or the key is a bearer id: the test a bare path label must pass to be read as a pair. */
 function namesCredential(key: string): boolean {
   const segments = keySegments(key);
-  return CREDENTIAL_NOUN_PATTERN.test(segments[segments.length - 1] ?? "") || isBearerIdKey(key, segments);
+  const last = segments[segments.length - 1] ?? "";
+  const noun = CREDENTIAL_ENCODING_WORDS.has(last) ? segments[segments.length - 2] ?? "" : last;
+  return CREDENTIAL_NOUN_PATTERN.test(noun) || isBearerIdKey(key, segments);
 }
 
 /** Authorization, Proxy-Authorization, and WWW-Authenticate carry a scheme word in front of the credential; every other key's value goes whatever word it starts with. */
@@ -597,11 +599,14 @@ const REDACTED_PAIR_VALUE_PATTERN = new RegExp(String.raw`${QUOTE_UNIT}?\[REDACT
 const SCHEME_PAIR_LIST_PATTERN = new RegExp(String.raw`${CARRIER_START}(?:bearer|basic|digest|token|oauth|negotiate|ntlm|ssws|apikey|api-key|aws4-hmac-sha256|veracode-hmac-sha-256)\s+(?=[A-Za-z][A-Za-z0-9_.-]*=${QUOTE_UNIT})`, "gi");
 // After a bare path label the text is prose ("/api/v1/api-tokens: request failed with 403",
 // "/oauth/token-request: invalid_client") and stays, unless the segment itself names a credential
-// in the singular (its last word is password, key, secret, token, passphrase, or assertion, or it is
-// a bearer id): then the next token is the value whatever its shape and whatever follows it
-// ("kv/password: <value> [code 003001]"), while a plural label ("api-tokens", "secrets") names a
-// collection and its colon continues as prose.
+// in the singular (its last word is password, key, secret, token, passphrase, or assertion, alone
+// or followed by an encoding word such as pem or base64, or it is a bearer id): then the next token
+// is the value whatever its shape and whatever follows it ("kv/password: <value> [code 003001]",
+// "kv/privateKeyPem: <value>"), while a plural label ("api-tokens", "secrets") names a collection
+// and its colon continues as prose, and so does a label whose last word names a file or path
+// ("kv/private_key_file: /x/y.pem").
 const CREDENTIAL_NOUN_PATTERN = /(?:password|passwd|passphrase|pwd|secret|token|key|assertion)$/;
+const CREDENTIAL_ENCODING_WORDS = new Set(["pem", "der", "b64", "base64", "jwk"]);
 // A credential-named flag whose value is the next argument (`psql --password <value> -h db`), as a
 // spawned CLI echoes its command line; `--name=value` is a pair and is read by the pair rule.
 const FLAG_VALUE_PATTERN = new RegExp(String.raw`(?<![A-Za-z0-9_-])--([A-Za-z][A-Za-z0-9_.-]{0,63})([ \t]+)(?!\[REDACTED\])(?!-)([^\s"'<>;,&()[\]{}\\]+)`, "g");
