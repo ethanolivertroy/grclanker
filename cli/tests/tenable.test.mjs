@@ -1711,6 +1711,119 @@ test("harness self-check: a \";\" inside a query value is part of the value, so 
   assert.equal(cases, SEMICOLON_QUERY_SINKS.length * SEMICOLON_QUERY_ROWS.length * 2);
 });
 
+// Harness self-check (CodeRabbit on #81, discussion_r4081238237, scheme carrier cells): a scheme
+// word followed by a parameter list (Snowflake Token="<value>", Token token="<value>",
+// nonce="...", Digest username="...", nonce="...", response="...") is the value of an
+// Authorization header wherever it appears. With the header name in front the whole list
+// already went ("Authorization: Snowflake [REDACTED]"); without it the scheme rule consumed the
+// first "Token=" alone and left the quoted token standing ("Snowflake [REDACTED]\"<value>\""),
+// and a headerless Digest list kept its response="..." on the data side. The word now stays
+// and the whole list goes in both cases, bare, after a JSON escape, inside a JSON string, and
+// end to end through a 401 body that echoes the header; a list made only of challenge
+// parameters (a WWW-Authenticate value: Bearer realm="api", error="invalid_token") stays.
+const SCHEME_LIST_SHORT_VALUE = "skvclmtirehs";
+const SCHEME_LIST_LONG_VALUE = "Zq8Lm3Vn7Rt2Kp6Xw9Hs4Bd1";
+const DIGEST_NONCE = "dcd98b7102dd2f0e8b11d0f600bfb0c093";
+const DIGEST_RESPONSE = "6629fae49393a05397450978507c4ef1";
+const SCHEME_LIST_ROWS = [
+  [(v) => `Authorization: Snowflake Token="${v}"`, "Authorization: Snowflake [REDACTED]"],
+  [(v) => `request failed with Authorization: Snowflake Token="${v}" see the log`, "request failed with Authorization: Snowflake [REDACTED]"],
+  [(v) => `authorization: snowflake token="${v}"`, "authorization: snowflake [REDACTED]"],
+  [(v) => `Proxy-Authorization: Snowflake Token='${v}'`, "Proxy-Authorization: Snowflake [REDACTED]"],
+  [(v) => `request failed\\nAuthorization: Snowflake Token=\\"${v}\\"`, "request failed\\nAuthorization: Snowflake [REDACTED]"],
+  [(v) => `{"message":"Authorization: Snowflake Token=\\"${v}\\" was rejected","code":401}`, '{"message":"Authorization: Snowflake [REDACTED]","code":401}'],
+  [(v) => `{"detail":"{\\"header\\":\\"Authorization: Snowflake Token=\\\\\\"${v}\\\\\\"\\"}"}`, '{"detail":"{\\"header\\":\\"Authorization: Snowflake [REDACTED]\\"}"}'],
+  [(v) => `auth header Snowflake Token="${v}" rejected`, "auth header Snowflake [REDACTED] rejected"],
+  [(v) => `Snowflake Token="${v}"`, "Snowflake [REDACTED]"],
+  [(v) => `{"error":"Snowflake Token=\\"${v}\\" rejected","code":401}`, '{"error":"Snowflake [REDACTED] rejected","code":401}'],
+  [(v) => `{"detail":"{\\"h\\":\\"Snowflake Token=\\\\\\"${v}\\\\\\"\\"}"}`, '{"detail":"{\\"h\\":\\"Snowflake [REDACTED]\\"}"}'],
+  [(v) => `Snowflake Token="${v}`, "Snowflake [REDACTED]"],
+  [(v) => `{"error":"Snowflake Token=\\"${v}","code":401}`, '{"error":"Snowflake [REDACTED]","code":401}'],
+  [(v) => `sent Token token="${v}", nonce="${DIGEST_NONCE}" to the API`, "sent Token [REDACTED] to the API"],
+  [(v) => `Authorization: Token token="${v}", nonce="${DIGEST_NONCE}"`, "Authorization: Token [REDACTED]"],
+  [(v) => `Authorization: Bearer token="${v}"`, "Authorization: Bearer [REDACTED]"],
+  [(v) => `ApiKey key="${v}" was refused`, "ApiKey [REDACTED] was refused"],
+  [(v) => `X-SecurityCenter: Snowflake Token="${v}"`, "X-SecurityCenter: [REDACTED]"],
+  [(v) => `OAuth oauth_consumer_key="dpf43f3p2l4k3l03", oauth_token="${v}", oauth_signature="${DIGEST_RESPONSE}" rejected`, "OAuth [REDACTED] rejected"],
+];
+const DIGEST_LIST_ROWS = [
+  [`Authorization: Digest username="auditor", realm="api", nonce="${DIGEST_NONCE}", uri="/users", response="${DIGEST_RESPONSE}", opaque="5ccc069c403ebaf9f0171e9517f40e41"`, "Authorization: Digest [REDACTED]"],
+  [`{"message":"Authorization: Digest username=\\"auditor\\", realm=\\"api\\", nonce=\\"${DIGEST_NONCE}\\", response=\\"${DIGEST_RESPONSE}\\" rejected"}`, '{"message":"Authorization: Digest [REDACTED]"}'],
+  [`request failed\\nAuthorization: Digest username=\\"auditor\\", nonce=\\"${DIGEST_NONCE}\\", response=\\"${DIGEST_RESPONSE}\\"`, "request failed\\nAuthorization: Digest [REDACTED]"],
+  [`Digest username="auditor", realm="api", nonce="${DIGEST_NONCE}", uri="/users", response="${DIGEST_RESPONSE}"`, "Digest [REDACTED]"],
+  [`the client sent Digest username="auditor", realm="api", nonce="${DIGEST_NONCE}", uri="/users", response="${DIGEST_RESPONSE}" and was refused`, "the client sent Digest [REDACTED] and was refused"],
+  [`{"error":"Digest username=\\"auditor\\", realm=\\"api\\", nonce=\\"${DIGEST_NONCE}\\", response=\\"${DIGEST_RESPONSE}\\" rejected"}`, '{"error":"Digest [REDACTED] rejected"}'],
+  [`Digest username=auditor, realm=api, nc=00000001, response=${DIGEST_RESPONSE} refused`, "Digest [REDACTED] refused"],
+];
+const SCHEME_LIST_CONTROLS = [
+  'WWW-Authenticate: Bearer realm="api"',
+  'WWW-Authenticate: Bearer realm="api", error="invalid_token", error_description="The access token expired"',
+  'WWW-Authenticate: Basic realm="Tenable API", charset="UTF-8"',
+  '{"message":"401 Unauthorized","www_authenticate":"Bearer realm=\\"api\\", error=\\"invalid_token\\""}',
+  'the challenge was Bearer realm="api" and the request was retried',
+  'the challenge was Digest realm="api", qop="auth" and the request was retried',
+  "Snowflake [REDACTED] rejected",
+  "Authorization: Snowflake [REDACTED]",
+  "Token Hygiene",
+  "Basic authentication is required",
+  "Snowflake account acme-eu",
+  "OAuth clients: 3",
+];
+const SCHEME_LIST_SINKS = [
+  ["redactErrorText", redactErrorText],
+  ["redactCredentialValueText", redactCredentialValueText],
+  ["redactSecrets", (text) => redactSecrets(text, [])],
+  ["TenableApiError", (text) => new TenableApiError(text, 401, "GET /users").message],
+  ["redactCredentialProperties", (text) => redactCredentialProperties({ note: text, items: [{ description: text }] }).note],
+];
+
+test("harness self-check: a scheme word and the parameter list after it (Snowflake Token=\"<value>\", Digest ... nonce=\"...\", response=\"...\") lose the whole list with the header name or without it, bare, after a JSON escape, and inside a JSON string, while a WWW-Authenticate challenge's realm=\"api\" stays", () => {
+  let cases = 0;
+  for (const [sinkName, sink] of SCHEME_LIST_SINKS) {
+    for (const [make, expected] of SCHEME_LIST_ROWS) for (const value of [SCHEME_LIST_SHORT_VALUE, SCHEME_LIST_LONG_VALUE]) {
+      const input = make(value);
+      const out = sink(input);
+      const label = `scheme parameter list: ${sinkName} ${JSON.stringify(input)} -> ${JSON.stringify(out)}`;
+      assert.equal(out, expected, label);
+      assertNoWindow(out, value, label);
+      assert.equal(sink(out), out, `${label}: not idempotent`);
+      cases += 1;
+    }
+    for (const [input, expected] of DIGEST_LIST_ROWS) {
+      const out = sink(input);
+      const label = `digest parameter list: ${sinkName} ${JSON.stringify(input)} -> ${JSON.stringify(out)}`;
+      assert.equal(out, expected, label);
+      for (const value of [DIGEST_NONCE, DIGEST_RESPONSE]) assertNoWindow(out, value, label);
+      assert.equal(sink(out), out, `${label}: not idempotent`);
+      cases += 1;
+    }
+    for (const text of SCHEME_LIST_CONTROLS) assert.equal(sink(text), text, `scheme parameter list: ${sinkName} changed a control: ${text}`);
+  }
+  assert.equal(cases, SCHEME_LIST_SINKS.length * (SCHEME_LIST_ROWS.length * 2 + DIGEST_LIST_ROWS.length));
+});
+
+test("harness self-check: a 401 body that echoes an Authorization header with a Snowflake Token=\"...\" or Digest parameter list reaches the thrown error with the scheme word kept and the list gone, end to end through the client", async () => {
+  const echoes = [
+    [(v) => `Authorization: Snowflake Token="${v}" was rejected`, "Authorization: Snowflake [REDACTED]"],
+    [(v) => `Snowflake Token="${v}" was rejected`, "Snowflake [REDACTED] was rejected"],
+    [() => `Authorization: Digest username="auditor", realm="api", nonce="${DIGEST_NONCE}", response="${DIGEST_RESPONSE}" was rejected`, "Authorization: Digest [REDACTED]"],
+    [() => `Digest username="auditor", realm="api", nonce="${DIGEST_NONCE}", response="${DIGEST_RESPONSE}" was rejected`, "Digest [REDACTED] was rejected"],
+    [() => 'challenge Bearer realm="api" answered with an expired token', 'challenge Bearer realm="api" answered with an expired token'],
+  ];
+  for (const [make, expected] of echoes) for (const value of [SCHEME_LIST_SHORT_VALUE, SCHEME_LIST_LONG_VALUE]) {
+    const echoed = make(value);
+    const fetchImpl = async () => new Response(JSON.stringify({ error: echoed }), { status: 401, statusText: "Unauthorized", headers: { "content-type": "application/json", "www-authenticate": 'Bearer realm="api"' } });
+    const clients = createTenableClients(vmConfig(), { fetchImpl, sleepImpl: async () => {} });
+    await assert.rejects(() => clients.vm.listUsers(), (error) => {
+      assert.ok(error instanceof TenableApiError, `401 echo: ${echoed} threw ${String(error)}`);
+      assert.equal(error.status, 401);
+      assert.equal(error.message, `Tenable request GET /users failed (HTTP 401 Unauthorized; ${expected})`, `401 echo: ${echoed}`);
+      for (const secret of [value, DIGEST_NONCE, DIGEST_RESPONSE]) assertNoWindow(error.message, secret, `401 echo: ${echoed}`);
+      return true;
+    });
+  }
+});
+
 test("scrub boundary: name-shaped values stay bare in prose, leave every carrier whatever their shape, and go as configured secrets in every form", () => {
   for (const value of NAME_SHAPED_VALUES) {
     for (const prose of [`inventory ${value} was not read`, `${value}`, `scanner ${value} reported 12 of 40 agents`, `path /var/lib/${value}/state`]) {
