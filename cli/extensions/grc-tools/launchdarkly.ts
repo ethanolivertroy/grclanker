@@ -2491,10 +2491,11 @@ export async function assessLaunchdarklyIdentity(
             : "No recent account audit entries touched SAML, SCIM, or MFA settings.",
       ].filter((part): part is string => Boolean(part)).join(" "),
       {
-        active_members: whenRead(memberCollection, activeMembers.length),
-        scim_provisioned_members: whenRead(memberCollection, scimProvisioned.length),
-        members_with_password: whenRead(memberCollection, passwordMembers.length),
-        members_with_oauth_providers: whenRead(memberCollection, oauthMembers.length),
+        // Population counts: zero from a listing that stopped early is unknown, not an absence (truncated_collections says why).
+        active_members: observedCount([memberCollection], activeMembers.length),
+        scim_provisioned_members: observedCount([memberCollection], scimProvisioned.length),
+        members_with_password: observedCount([memberCollection], passwordMembers.length),
+        members_with_oauth_providers: observedCount([memberCollection], oauthMembers.length),
         recent_sso_audit_events: whenRead(accountAuditCollection, sample(ssoAuditEvents.map((entry) => ({
           date: isoDate(asTimestamp(entry.date)),
           actions: auditActions(entry),
@@ -2517,11 +2518,11 @@ export async function assessLaunchdarklyIdentity(
             ? `All ${activeMembers.length} active members report MFA enabled (${mfaEnforcedMembers.length} under account enforcement). Confirm the account level Require MFA for new members setting in Organization settings > Security.`
             : `${membersWithoutMfa.length}/${activeMembers.length} active members do not have MFA enabled.`,
       {
-        active_members: whenRead(memberCollection, activeMembers.length),
-        pending_invites: whenRead(memberCollection, pendingMembers.length),
+        active_members: observedCount([memberCollection], activeMembers.length),
+        pending_invites: observedCount([memberCollection], pendingMembers.length),
         // Members observed without MFA are real observations; an empty list is asserted only from a complete listing.
         members_without_mfa: observedList([memberCollection], sample(membersWithoutMfa.map(memberEmail))),
-        mfa_enforced_members: whenRead(memberCollection, mfaEnforcedMembers.length),
+        mfa_enforced_members: observedCount([memberCollection], mfaEnforcedMembers.length),
       },
     ),
     memberFinding(
@@ -2541,7 +2542,7 @@ export async function assessLaunchdarklyIdentity(
         admins: observedList([memberCollection], sample(admins.map(memberEmail))),
         max_owners: maxOwners,
         max_admins: maxAdmins,
-        total_members: whenRead(memberCollection, members.length),
+        total_members: observedCount([memberCollection], members.length),
       },
     ),
     membershipFinding(
@@ -2559,7 +2560,7 @@ export async function assessLaunchdarklyIdentity(
             ? `All ${activeMembers.length} active members belong to at least one of ${teams.length} teams.`
             : `${orphanedMembers.length}/${activeMembers.length} active members are not assigned to any team.`,
       {
-        teams: whenRead(teamCollection, teams.length),
+        teams: observedCount([teamCollection], teams.length),
         // A member is named as unassigned only when both the member and team inventories were read; the list is complete only from complete reads.
         orphaned_members: whenAllRead([memberCollection, teamCollection], observedList([memberCollection, teamCollection], sample(orphanedMembers.map(memberEmail)))),
       },
@@ -2589,7 +2590,8 @@ export async function assessLaunchdarklyIdentity(
         teams_without_custom_roles: whenRead(teamCollection, observedList([teamCollection, ...teamRoleCollections], sample(teamsWithoutCustomRoles.map((team) => team.key)))),
         // A count of built-in role holders is a total only from a complete members listing; a partial or denied read renders null.
         built_in_admin_or_owner_members: whenAllComplete([memberCollection], admins.length + owners.length),
-        team_roles: whenRead(teamCollection, sample(teamRoles.map((team) => ({
+        // The sampled teams and their roles are observations; an empty sample from a team listing that stopped early is unknown.
+        team_roles: observedList([teamCollection], sample(teamRoles.map((team) => ({
           team: team.key,
           roles: whenRead(team.collection, team.roles.map((role) => asString(role.key) ?? asString(role.name))),
         })))),
@@ -2609,7 +2611,7 @@ export async function assessLaunchdarklyIdentity(
             : `${offDomainMembers.length}/${activeMembers.length} active members use email domains outside the approved list (${allowedDomains.join(", ")}).`,
       {
         allowed_domains: allowedDomains,
-        domain_distribution: whenRead(memberCollection, sample(domainDistribution)),
+        domain_distribution: observedList([memberCollection], sample(domainDistribution)),
         off_domain_members: whenRead(memberCollection, allowedDomains.length === 0 ? [] : observedList([memberCollection], sample(offDomainMembers.map(memberEmail)))),
       },
     ),
@@ -2620,13 +2622,13 @@ export async function assessLaunchdarklyIdentity(
     category: "identity",
     summary: {
       base_url: config.baseUrl,
-      members: whenRead(memberCollection, members.length),
-      active_members: whenRead(memberCollection, activeMembers.length),
-      pending_invites: whenRead(memberCollection, pendingMembers.length),
+      members: observedCount([memberCollection], members.length),
+      active_members: observedCount([memberCollection], activeMembers.length),
+      pending_invites: observedCount([memberCollection], pendingMembers.length),
       members_without_mfa: observedCount([memberCollection], membersWithoutMfa.length),
       owners: observedCount([memberCollection], owners.length),
       admins: observedCount([memberCollection], admins.length),
-      teams: whenRead(teamCollection, teams.length),
+      teams: observedCount([teamCollection], teams.length),
       orphaned_members: whenAllRead([memberCollection, teamCollection], observedCount([memberCollection, teamCollection], orphanedMembers.length)),
       teams_without_custom_roles: whenRead(teamCollection, observedCount([teamCollection, ...teamRoleCollections], teamsWithoutCustomRoles.length)),
       allowed_domains: allowedDomains.length,
@@ -3020,7 +3022,7 @@ export async function assessLaunchdarklyAccessControl(
             ? `All ${roles.length} custom roles enumerate explicit actions without wildcard or notActions grants.`
             : `${wildcardRoles.length}/${roles.length} custom roles contain allow statements with wildcard actions or open ended notActions grants.`,
       {
-        custom_roles: whenRead(roleCollection, roles.length),
+        custom_roles: observedCount([roleCollection], roles.length),
         wildcard_roles: observedList([roleCollection], sample(wildcardRoles.map((role) => ({
           role: role.key,
           statements: role.wildcardStatements.map((statement) => ({ actions: statement.actions, notActions: statement.notActions, resources: statement.resources })),
@@ -3044,7 +3046,7 @@ export async function assessLaunchdarklyAccessControl(
               ? `No custom role grants sensitive administration actions, but ${readerBaseRoles.length}/${roles.length} roles use reader base permissions instead of no_access.`
               : `All ${roles.length} custom roles start from no_access base permissions and do not allow sensitive administration actions.`,
       {
-        custom_roles: whenRead(roleCollection, roles.length),
+        custom_roles: observedCount([roleCollection], roles.length),
         sensitive_roles: observedList([roleCollection], sample(sensitiveRoles.map((role) => ({ role: role.key, granted: sample(role.sensitiveGrants) })))),
         reader_base_permission_roles: observedList([roleCollection], sample(readerBaseRoles.map((role) => role.key))),
       },
@@ -3058,8 +3060,12 @@ export async function assessLaunchdarklyAccessControl(
           ? `All ${tokens.length} visible access tokens have an expiry configured.`
           : `${tokensWithoutExpiry.length}/${tokens.length} visible access tokens have no expiry configured.`,
       {
-        tokens: whenRead(tokenCollection, tokens.length),
-        tokens_without_expiry: observedList([tokenCollection], sample(tokensWithoutExpiry.map(tokenLabel))),
+        tokens: observedCount([tokenCollection], tokens.length),
+        // Token names are item-level detail: rendered in full from a complete listing, withheld while the listing stopped
+        // early so a truncated page never names its part of the inventory as the whole; the count beside them is the
+        // lower bound observed (zero only from a complete listing).
+        tokens_without_expiry: whenAllComplete([tokenCollection], sample(tokensWithoutExpiry.map(tokenLabel))),
+        tokens_without_expiry_count: observedCount([tokenCollection], tokensWithoutExpiry.length),
       },
     ),
     tokenFinding(
@@ -3093,7 +3099,7 @@ export async function assessLaunchdarklyAccessControl(
           ? `Of ${serviceTokens.length} visible service tokens, ${serviceTokenIssues.join("; ")}.`
           : `All ${serviceTokens.length} visible service tokens use Reader, custom role, or scoped inline policy permissions.`,
       {
-        service_tokens: whenRead(tokenCollection, serviceTokens.length),
+        service_tokens: observedCount([tokenCollection], serviceTokens.length),
         owner_or_admin_service_tokens: observedList([tokenCollection], sample(overScopedOtherServiceTokens.map(tokenLabel))),
         assessment_service_token: whenRead(tokenCollection, assessmentServiceToken
           ? { token: tokenLabel(assessmentServiceToken), role: tokenRole(assessmentServiceToken), over_scoped: assessmentTokenOverScoped }
@@ -3121,7 +3127,7 @@ export async function assessLaunchdarklyAccessControl(
                 ? "No personal tokens are visible."
                 : `All ${personalTokens.length} visible personal tokens are tied to current members and stay within each member's base role scope.`,
       {
-        personal_tokens: whenRead(tokenCollection, personalTokens.length),
+        personal_tokens: observedCount([tokenCollection], personalTokens.length),
         orphaned_personal_tokens: membersReconciled ? observedList([tokenCollection], sample(orphanedPersonalTokens.map(tokenLabel))) : null,
         unverified_personal_tokens: tokensRead && membersRead ? sample(unverifiedPersonalTokens.map(tokenLabel)) : null,
         over_scoped_personal_tokens: whenRead(memberCollection, observedList([tokenCollection, memberCollection], sample(overScopedPersonalTokens))),
@@ -3137,13 +3143,13 @@ export async function assessLaunchdarklyAccessControl(
     category: "access_control",
     summary: {
       base_url: config.baseUrl,
-      custom_roles: whenRead(roleCollection, roles.length),
+      custom_roles: observedCount([roleCollection], roles.length),
       wildcard_roles: observedCount([roleCollection], wildcardRoles.length),
       sensitive_roles: observedCount([roleCollection], sensitiveRoles.length),
-      tokens: whenRead(tokenCollection, tokens.length),
+      tokens: observedCount([tokenCollection], tokens.length),
       token_inventory_scope: inventory.scope,
-      service_tokens: whenRead(tokenCollection, serviceTokens.length),
-      personal_tokens: whenRead(tokenCollection, personalTokens.length),
+      service_tokens: observedCount([tokenCollection], serviceTokens.length),
+      personal_tokens: observedCount([tokenCollection], personalTokens.length),
       tokens_without_expiry: observedCount([tokenCollection], tokensWithoutExpiry.length),
       stale_tokens: observedCount([tokenCollection], staleTokens.length),
       orphaned_personal_tokens: membersReconciled ? observedCount([tokenCollection], orphanedPersonalTokens.length) : null,
@@ -3643,8 +3649,9 @@ export async function assessLaunchdarklyEnvironmentGovernance(
               ? `${criticalOnlyProduction.length}/${productionEnvironments.length} production environments are marked critical, which only enables safeguards and UI prompts; no custom role denies, excludes, or scopes actions away from them (for example a deny on proj/*:env/*;{critical:true}:flag/*).`
               : `All ${productionEnvironments.length} production environments are restricted by custom role statements that deny, exclude, or scope actions away from them (${roles.length} custom roles evaluated).`,
       {
-        // The production set is known only when the project listing and every project's environment listing were read.
-        production_environments: whenAllRead(environmentCollections, sample(productionEnvironments.map(environmentLabel))),
+        // The production set is known only when the project listing and every project's environment listing were read,
+        // and an empty set is asserted only when every one of them ran to completion.
+        production_environments: whenAllRead(environmentCollections, observedList(environmentCollections, sample(productionEnvironments.map(environmentLabel)))),
         // A restriction is a role statement observed to cover the environment; "none is restricted" needs every listing complete.
         restricted_production_environments: whenRead(roleCollection, observedList([roleCollection, ...environmentCollections], sample(restrictedProduction.map((entry) => ({
           environment: environmentLabel(entry.context),
@@ -3675,7 +3682,7 @@ export async function assessLaunchdarklyEnvironmentGovernance(
           weaknesses: entry.approvals.weaknesses,
           settings: entry.approvals.settings,
         })))),
-        production_environment_settings: whenAllRead(environmentCollections, sample(productionSummary)),
+        production_environment_settings: whenAllRead(environmentCollections, observedList(environmentCollections, sample(productionSummary))),
       },
     ),
     sdkKeyFinding(
@@ -3717,7 +3724,7 @@ export async function assessLaunchdarklyEnvironmentGovernance(
             ? `None of the ${projects.length} projects look like test or temporary projects.`
             : `${testProjects.length}/${projects.length} projects look like test or temporary projects; confirm they are intentional and not exposed to production SDK traffic.`,
       {
-        projects: whenRead(inventory.projects, projects.length),
+        projects: observedCount([inventory.projects], projects.length),
         test_like_projects: observedList([inventory.projects], sample(testProjects.map((project) => asString(project.key) ?? asString(project.name) ?? "project"))),
       },
     ),
@@ -3734,7 +3741,7 @@ export async function assessLaunchdarklyEnvironmentGovernance(
             ? `Secure mode is enabled everywhere, but ${ttlZero.length} production environments use a zero default TTL and ${changeSafeguardsMissing.length} lack confirm changes or require comments.`
             : `All ${productionEnvironments.length} production environments enable secure mode, a non-zero default TTL, confirm changes, and required comments.`,
       {
-        production_environment_settings: whenAllRead(environmentCollections, sample(productionSummary)),
+        production_environment_settings: whenAllRead(environmentCollections, observedList(environmentCollections, sample(productionSummary))),
         secure_mode_missing: observedList(environmentCollections, sample(secureModeMissing.map(environmentLabel))),
         zero_ttl: observedList(environmentCollections, sample(ttlZero.map(environmentLabel))),
         change_safeguards_missing: observedList(environmentCollections, sample(changeSafeguardsMissing.map(environmentLabel))),
@@ -3748,9 +3755,9 @@ export async function assessLaunchdarklyEnvironmentGovernance(
     category: "environment_governance",
     summary: {
       base_url: config.baseUrl,
-      projects: whenRead(inventory.projects, projects.length),
-      environments: whenAllRead(environmentCollections, environments.length),
-      production_environments: whenAllRead(environmentCollections, productionEnvironments.length),
+      projects: observedCount([inventory.projects], projects.length),
+      environments: whenAllRead(environmentCollections, observedCount(environmentCollections, environments.length)),
+      production_environments: whenAllRead(environmentCollections, observedCount(environmentCollections, productionEnvironments.length)),
       restricted_production_environments: whenRead(roleCollection, observedCount([roleCollection, ...environmentCollections], restrictedProduction.length)),
       critical_only_production_environments: rolesComplete ? observedCount(environmentCollections, criticalOnlyProduction.length) : null,
       unrestricted_production_environments: rolesComplete ? observedCount(environmentCollections, unrestrictedProduction.length) : null,
@@ -3966,7 +3973,7 @@ export async function assessLaunchdarklyFlagHygiene(
             ? `None of the ${evaluatedFlags} evaluated flags use individual context targets in production environments.`
             : `${individuallyTargetedFlags.length} flags expose individual user or context keys through production targeting.`,
       {
-        production_environments: whenAllRead(environmentCollections, sample(productionTargets.map(environmentLabel))),
+        production_environments: whenAllRead(environmentCollections, observedList(environmentCollections, sample(productionTargets.map(environmentLabel)))),
         // A targeted flag is a real observation; "no flag is targeted" needs every environment and flag listing complete.
         individually_targeted_flags: observedList([...environmentCollections, ...flagCollections], sample(individuallyTargetedFlags)),
       },
@@ -4014,7 +4021,7 @@ export async function assessLaunchdarklyFlagHygiene(
     category: "flag_hygiene",
     summary: {
       base_url: config.baseUrl,
-      projects: whenRead(inventory.projects, projects.length),
+      projects: observedCount([inventory.projects], projects.length),
       evaluated_environments: whenAllRead(environmentCollections, targetEnvironments.length),
       evaluated_flags: whenAllRead([...environmentCollections, ...flagCollections], evaluatedFlags),
       individually_targeted_flags: observedCount([...environmentCollections, ...flagCollections], individuallyTargetedFlags.length),

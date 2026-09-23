@@ -1303,6 +1303,88 @@ test("assessLaunchdarklyIdentity never passes member or team controls on truncat
   assert.match(finding(failingAndTruncated, "LD-02").summary, /1\/1 active members do not have MFA enabled\. Truncated listing/);
 });
 
+test("class 9: population counts and inventory lists render null from a listing that stopped before any record was read, and token names are withheld with a count while the token listing is truncated", async () => {
+  const base = healthyClient();
+  const emptyTruncated = (total) => async () => ({ items: [], truncated: true, seen: 0, total, truncationReason: `the server returned an empty page while reporting ${total} records` });
+
+  // Complete reads assert their counts and lists.
+  const identity = await assessLaunchdarklyIdentity(base, { now: NOW });
+  assert.ok(finding(identity, "LD-01").evidence.active_members > 0);
+  assert.ok(Array.isArray(finding(identity, "LD-24").evidence.domain_distribution) && finding(identity, "LD-24").evidence.domain_distribution.length > 0);
+  assert.ok(identity.summary.members > 0);
+
+  // Members: zero rows under a server count of 500.
+  const noMembers = await assessLaunchdarklyIdentity(healthyClient({ listMembers: emptyTruncated(500) }), { now: NOW });
+  assert.equal(finding(noMembers, "LD-01").evidence.active_members, null);
+  assert.equal(finding(noMembers, "LD-02").evidence.active_members, null);
+  assert.equal(finding(noMembers, "LD-02").evidence.mfa_enforced_members, null);
+  assert.equal(finding(noMembers, "LD-03").evidence.total_members, null);
+  assert.equal(finding(noMembers, "LD-24").evidence.domain_distribution, null);
+  assert.deepEqual([noMembers.summary.members, noMembers.summary.active_members], [null, null]);
+  assert.deepEqual(finding(noMembers, "LD-03").evidence.truncated_collections, [{ collection: "members", option: "member_limit", seen: 0, total: 500, reason: "the server returned an empty page while reporting 500 records" }]);
+
+  // Members: a capped read with rows keeps the rows read as a lower bound.
+  const someMembers = await assessLaunchdarklyIdentity(healthyClient({ listMembers: () => truncatedListing(base, "listMembers", 2, 400) }), { now: NOW });
+  assert.equal(finding(someMembers, "LD-03").evidence.total_members, 2);
+  assert.equal(someMembers.summary.members, 2);
+
+  // Teams: zero rows.
+  const noTeams = await assessLaunchdarklyIdentity(healthyClient({ listTeams: emptyTruncated(30) }), { now: NOW });
+  assert.equal(finding(noTeams, "LD-06").evidence.teams, null);
+  assert.equal(finding(noTeams, "LD-07").evidence.team_roles, null);
+  assert.equal(noTeams.summary.teams, null);
+  assert.equal(finding(noTeams, "LD-07").evidence.teams_sampled, 0, "a count named for the read's own size still renders");
+
+  // Roles and tokens.
+  const noRoles = await assessLaunchdarklyAccessControl(healthyClient({ listCustomRoles: emptyTruncated(12) }), { now: NOW });
+  assert.equal(finding(noRoles, "LD-04").evidence.custom_roles, null);
+  assert.equal(finding(noRoles, "LD-05").evidence.custom_roles, null);
+  assert.equal(noRoles.summary.custom_roles, null);
+  const noTokens = await assessLaunchdarklyAccessControl(healthyClient({ listTokens: emptyTruncated(40) }), { now: NOW });
+  assert.equal(finding(noTokens, "LD-08").evidence.tokens, null);
+  assert.equal(finding(noTokens, "LD-08").evidence.tokens_without_expiry, null);
+  assert.equal(finding(noTokens, "LD-08").evidence.tokens_without_expiry_count, null);
+  assert.equal(finding(noTokens, "LD-10").evidence.service_tokens, null);
+  assert.equal(finding(noTokens, "LD-11").evidence.personal_tokens, null);
+  assert.deepEqual([noTokens.summary.tokens, noTokens.summary.service_tokens, noTokens.summary.personal_tokens], [null, null, null]);
+
+  // Tokens: a capped read that observed tokens without expiry withholds their names and keeps the count as a lower bound.
+  const cappedTokens = await assessLaunchdarklyAccessControl(healthyClient({
+    async listTokens() {
+      const tokens = await base.listTokens();
+      return { items: tokens.slice(0, 2).map((token) => ({ ...token, expiry: undefined })), truncated: true, seen: 2, total: 40 };
+    },
+  }), { now: NOW });
+  const cappedExpiry = finding(cappedTokens, "LD-08");
+  assert.equal(cappedExpiry.status, "fail");
+  assert.equal(cappedExpiry.evidence.tokens, 2);
+  assert.equal(cappedExpiry.evidence.tokens_without_expiry, null, "names from a truncated listing are withheld");
+  assert.equal(cappedExpiry.evidence.tokens_without_expiry_count, 2);
+  assert.match(cappedExpiry.summary, /^2\/2 visible access tokens have no expiry configured\. Partial token inventory: The token listing was truncated at 2 of 40 tokens/);
+  assert.ok(!JSON.stringify(cappedExpiry.evidence).includes("grc-audit"), "no token name from the truncated page appears in the evidence");
+  const completeTokens = finding(await assessLaunchdarklyAccessControl(healthyClient({
+    async listTokens() {
+      return (await base.listTokens()).map((token) => ({ ...token, expiry: undefined }));
+    },
+  }), { now: NOW }), "LD-08");
+  assert.equal(completeTokens.evidence.tokens_without_expiry.length, 3, "a complete listing renders the names");
+  assert.equal(completeTokens.evidence.tokens_without_expiry_count, 3);
+  assert.deepEqual(finding(await assessLaunchdarklyAccessControl(base, { now: NOW }), "LD-08").evidence.tokens_without_expiry, [], "a complete listing asserts the empty list");
+
+  // Projects: zero rows empties every environment-derived leaf, which renders null rather than 0 or [].
+  const noProjects = await assessLaunchdarklyEnvironmentGovernance(healthyClient({ listProjects: emptyTruncated(9) }), { now: NOW });
+  assert.equal(finding(noProjects, "LD-16").evidence.production_environments, null);
+  assert.equal(finding(noProjects, "LD-17").evidence.production_environment_settings, null);
+  assert.equal(finding(noProjects, "LD-22").evidence.projects, null);
+  assert.equal(finding(noProjects, "LD-23").evidence.production_environment_settings, null);
+  assert.deepEqual([noProjects.summary.projects, noProjects.summary.environments, noProjects.summary.production_environments], [null, null, null]);
+  const noProjectFlags = await assessLaunchdarklyFlagHygiene(healthyClient({ listProjects: emptyTruncated(9) }), { now: NOW });
+  assert.equal(finding(noProjectFlags, "LD-14").evidence.production_environments, null);
+  assert.equal(noProjectFlags.summary.projects, null);
+  const governance = await assessLaunchdarklyEnvironmentGovernance(base, { now: NOW });
+  assert.ok(governance.summary.projects > 0 && governance.summary.production_environments > 0, "complete reads keep their counts");
+});
+
 test("gap 42: LD-07 states why built-in Admin or Owner holders are unknown under a truncated or denied members listing, renders the count null, and never passes", async () => {
   const healthy = await assessLaunchdarklyIdentity(healthyClient(), { now: NOW });
   assert.equal(findingStatus(healthy, "LD-07"), "pass");
