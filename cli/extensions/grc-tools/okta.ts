@@ -223,8 +223,11 @@ const EMBEDDED_URL_PATTERN = new RegExp(String.raw`${CARRIER_START}[a-z][a-z0-9+
 // The userinfo ends at the first "/", "?", or "#": an "@" inside a query or fragment ("https://h?e=a@x.com&q=v") never turns the query into the host.
 const URL_PARTS_PATTERN = /^([a-z][a-z0-9+.-]*:\/\/)(?:[^\s\/?#@"'<>\\]+@)?([^?#]*)(\?[^#]*)?(#.*)?$/i;
 const TRAILING_PUNCTUATION_PATTERN = /[.,;:!?]+$/;
-// A query pair's value ends at ";" too, so a pair inside a cookie header ("my&sid=<v>; Content-Type: ...") never consumes the cookie separator before the cookie reader runs.
-const QUERY_PAIR_PATTERN = /([?&])([A-Za-z0-9_.[\]-]+)=([^&#;\s"'<>)\]}\\]+)/g;
+// A ";" inside a query value is part of the value (URLSearchParams semantics), so "?token=<v>;<rest>"
+// loses the whole value with no tail. The ";" separator belongs to Cookie and Set-Cookie parsing alone,
+// and the cookie reader runs before this pass, so a pair inside a cookie header is already gone. A pair
+// whose value is already the marker is left alone, so a second pass never grows it to "[REDACTED]]".
+const QUERY_PAIR_PATTERN = /([?&])([A-Za-z0-9_.[\]-]+)=(?!\[REDACTED\])([^&#\s"'<>)\]}\\]+)/g;
 // The authorization scheme words, matched in any casing on both sides: a peer's error text may spell
 // "bearer" or "BASIC", and an Authorization carrier may carry "sNoWfLaKe". In prose, a scheme word
 // followed by a run of 8 or more token characters is a credential unless the run is prose: a mechanism
@@ -783,16 +786,15 @@ function replaceFlagValues(text: string): string {
 
 /**
  * The carrier and shape rules shared by the error and data passes: PEM blocks, configured secrets,
- * URLs, query pairs, cookie headers, credential pairs and flags, scheme words in prose, JWTs, AWS
+ * cookie headers, URLs, query pairs, credential pairs and flags, scheme words in prose, JWTs, AWS
  * keys, and vendor-prefixed tokens. `longTokens` adds the generic long-token and hex-digest rules,
  * which the error pass runs and the data pass leaves off so identifiers survive in evidence.
  */
 function scrubText(text: string, secrets: ReadonlyArray<string | undefined>, longTokens: boolean): string {
   let scrubbed = text.replace(PEM_BLOCK_PATTERN, REDACTED).replace(PEM_OPEN_PATTERN, REDACTED);
-  scrubbed = scrubConfiguredSecrets(scrubbed, secrets)
+  scrubbed = scrubCookieHeaders(scrubConfiguredSecrets(scrubbed, secrets))
     .replace(EMBEDDED_URL_PATTERN, scrubEmbeddedUrl)
     .replace(QUERY_PAIR_PATTERN, scrubQueryPair);
-  scrubbed = scrubCookieHeaders(scrubbed);
   scrubbed = replaceFlagValues(replaceCredentialAssignments(scrubbed))
     .replace(SCHEME_VALUE_PATTERN, scrubSchemeValue)
     .replace(JWT_IN_TEXT_PATTERN, REDACTED)
