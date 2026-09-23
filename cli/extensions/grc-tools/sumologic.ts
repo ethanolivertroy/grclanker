@@ -709,12 +709,7 @@ function namesCredential(key: string): boolean {
 
 /** Authorization, Proxy-Authorization, and WWW-Authenticate carry a scheme word in front of the credential; every other key's value goes whatever word it starts with. */
 function isAuthorizationStyleKey(segments: readonly string[]): boolean {
-  return segments[segments.length - 1] === "authorization" || isChallengeKey(segments);
-}
-
-/** WWW-Authenticate describes a challenge whose pairs follow their own key's rule; Authorization and Proxy-Authorization carry the credential itself. */
-function isChallengeKey(segments: readonly string[]): boolean {
-  return segments.slice(-2).join("_") === "www_authenticate";
+  return segments[segments.length - 1] === "authorization" || segments.slice(-2).join("_") === "www_authenticate";
 }
 
 /** The final segment names a setting, as its own word or concatenated onto another (OKTA_CLIENT_AUTHORIZATIONMODE, OKTA_CLIENT_PRIVATEKEYID); a bearer id is read before this test. */
@@ -891,9 +886,9 @@ const NEXT_HEADER_AFTER_SEPARATOR = new RegExp(String.raw`^[ \t]*(?:[{[]|${QUOTE
 // A quoted value that opens with a scheme word keeps the scheme and its gap and loses the rest, except
 // that a scheme followed by a pair list is read pair by pair. The pairs are the credential: a quoted
 // value goes whatever its key (`Snowflake Token="<v>"`, `Digest response="<v>"`, `Bearer blob="<v>"`)
-// unless the key is a challenge parameter (realm, error, scope, qop, ...), and a bare value follows its
-// key's own rule, so an HMAC header's "id=...,ts=...,nonce=...,sig=..." keeps its timestamp. Under a
-// challenge header (WWW-Authenticate) each pair follows its key's own rule, so `realm="api"` stays.
+// unless the key is a descriptive parameter (realm, qop, algorithm, ...), and a bare value follows its
+// key's own rule, so an HMAC header's "id=...,ts=...,nonce=...,sig=..." keeps its timestamp. A
+// challenge header (WWW-Authenticate) is read the same way, so its `realm="api"` stays and its nonce goes.
 const LEADING_SCHEME_IN_VALUE = /^([A-Za-z][A-Za-z0-9-]*)(\s+)(\S[\s\S]*)$/;
 const PAIR_LIST_START = /^[A-Za-z][A-Za-z0-9_.-]*=/;
 // The run after the scheme is a bare key ("Token=", "username=") whose value follows it.
@@ -903,6 +898,10 @@ const PAIR_KEY_ONLY_PATTERN = /^[A-Za-z][A-Za-z0-9_.-]*=$/;
 const LIST_PAIR_KEY_PATTERN = /[A-Za-z][A-Za-z0-9_.-]*=/y;
 const LIST_BARE_VALUE_PATTERN = /[^\s"'<>;,()[\]{}\\]*/y;
 const LIST_PAIR_SEPARATOR_PATTERN = /[ \t]*,[ \t]*|[ \t]+/y;
+// The descriptive parameters of a credential's pair list, whose quoted value stays (`realm="api"`,
+// `qop="auth"`, `algorithm="SHA-256"`, a challenge's `error="invalid_token"`); every other quoted value
+// in the list is the credential.
+const LIST_KEPT_PARAM_PATTERN = /^(?:realm|qop|algorithm|charset|error|error_description|error_uri|scope)$/i;
 // The marker, in quotes or bare, where a pair's value stood before an earlier pass removed it.
 const REDACTED_PAIR_VALUE_PATTERN = new RegExp(String.raw`${QUOTE_UNIT}?\[REDACTED\]`, "y");
 // In prose, an authorization scheme word followed by a quoted pair opens a credential's pair list
@@ -1112,7 +1111,7 @@ function scrubBareListValue(key: string, value: string): string {
 /**
  * Reads one pair's value at `valueStart`, up to `limit`. The pairs of a credential's list are the
  * credential, so a quoted value is removed whatever its key (`Snowflake Token="<v>"`, `Digest
- * response="<v>"`, `Bearer blob="<v>"`) unless the key is a challenge parameter (`realm="api"`),
+ * response="<v>"`, `Bearer blob="<v>"`) unless the key is a descriptive parameter (`realm="api"`),
  * while a bare value follows its key's own rule so `qop=auth`, `nc=00000001`, and an HMAC header's
  * timestamp stay legible. `terminated` is false when a quoted value never closed, which ends the list there.
  */
@@ -1129,7 +1128,7 @@ function readListPairValue(text: string, valueStart: number, key: string, limit:
   const end = Math.min(read.end, limit);
   const content = terminated ? read.content : text.slice(opener.contentStart, end);
   const closer = terminated ? text.slice(read.end - opener.backslashes - 1, read.end) : "";
-  const value = content.length === 0 || content === REDACTED || AUTH_PARAM_PATTERN.test(`${key}=`) ? content : REDACTED;
+  const value = content.length === 0 || content === REDACTED || LIST_KEPT_PARAM_PATTERN.test(key) ? content : REDACTED;
   return { replacement: `${text.slice(valueStart, opener.contentStart)}${value}${closer}`, end, terminated };
 }
 
@@ -1157,20 +1156,19 @@ function scrubRequestPairList(text: string, start: number, limit: number): ListR
 /**
  * The run after a scheme word under an Authorization-style key, when it is a bare key whose value
  * follows ("Token=", "username="). A quoted value opens the credential's pair list, read with the list
- * rule under a request header; under a challenge header the pair rule reads each pair by its own key,
- * so `realm="api"` stays, and the caller resumes after the scheme. A key whose value is already the
+ * rule under a request header and a challenge header alike. A key whose value is already the
  * marker stays as it is, so a second pass adds nothing. Undefined when the run is the credential
  * itself, which goes whole.
  */
-function readSchemePairList(text: string, start: number, run: string, limit: number, challenge: boolean): ListRead | "pairs" | undefined {
+function readSchemePairList(text: string, start: number, run: string, limit: number): ListRead | undefined {
   if (!PAIR_KEY_ONLY_PATTERN.test(run)) return undefined;
   const valueStart = start + run.length;
-  if (valueStart < limit && openingQuoteUnit(text, valueStart)) return challenge ? "pairs" : scrubRequestPairList(text, start, limit);
+  if (valueStart < limit && openingQuoteUnit(text, valueStart)) return scrubRequestPairList(text, start, limit);
   if (text.startsWith(REDACTED, valueStart)) return { replacement: `${run}${REDACTED}`, end: valueStart + REDACTED.length };
   return undefined;
 }
 
-/** Reads the quoted pair list after every authorization scheme word in prose (see SCHEME_PAIR_LIST_PATTERN) with the list rule; a list under a header was read by the pair rule and stays as it is. */
+/** Reads the quoted pair list after every authorization scheme word in prose (see SCHEME_PAIR_LIST_PATTERN) with the list rule; a list under a header was read by the assignment pass and reads the same a second time. */
 function scrubSchemePairLists(text: string): string {
   SCHEME_PAIR_LIST_PATTERN.lastIndex = 0;
   let out = "";
@@ -1220,9 +1218,7 @@ function replaceCredentialAssignments(text: string): string {
     const valueStart = match.index + whole.length;
     const barePathLabel = openingQuote === "" && separatorChar === ":" && isBarePathSegment(text, match.index, urlSpans);
     if (barePathLabel && !namesCredential(key)) continue;
-    const segments = keySegments(key);
-    const schemeCarrier = isAuthorizationStyleKey(segments);
-    const challenge = isChallengeKey(segments);
+    const schemeCarrier = isAuthorizationStyleKey(keySegments(key));
     let kept = "";
     let consumed: number;
     let replacement = REDACTED;
@@ -1243,11 +1239,7 @@ function replaceCredentialAssignments(text: string): string {
         kept = `${lead[1]}${lead[2]}`;
         const firstPair = PAIR_LIST_START.test(lead[3]) ? SCHEME_TOKEN_PATTERN.exec(text.slice(valueStart + lead[1].length)) : null;
         if (firstPair) {
-          const list = readSchemePairList(text, valueStart + lead[1].length + firstPair[1].length, firstPair[3], valueStart + content.length, challenge);
-          if (list === "pairs") {
-            ASSIGNMENT_KEY_PATTERN.lastIndex = valueStart + lead[1].length;
-            continue;
-          }
+          const list = readSchemePairList(text, valueStart + lead[1].length + firstPair[1].length, firstPair[3], valueStart + content.length);
           kept = `${lead[1]}${firstPair[1]}${firstPair[2]}`;
           if (list) {
             replacement = list.replacement;
@@ -1272,11 +1264,7 @@ function replaceCredentialAssignments(text: string): string {
       if (schemeCarrier && SCHEME_WORD_PATTERN.test(value)) {
         const token = SCHEME_TOKEN_PATTERN.exec(text.slice(valueStart + value.length));
         if (!token) continue;
-        const list = token[2] === "" ? readSchemePairList(text, valueStart + value.length + token[1].length, token[3], text.length, challenge) : undefined;
-        if (list === "pairs") {
-          ASSIGNMENT_KEY_PATTERN.lastIndex = valueStart + value.length;
-          continue;
-        }
+        const list = token[2] === "" ? readSchemePairList(text, valueStart + value.length + token[1].length, token[3], text.length) : undefined;
         kept = `${value}${token[1]}${token[2]}`;
         if (list) {
           replacement = list.replacement;
