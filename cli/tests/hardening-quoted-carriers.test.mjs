@@ -557,6 +557,299 @@ test("leak-probe class 3: an apostrophe inside a cookie name or value is part of
   assert.equal(scrubErrorText("Cookie: theme=dark; my'pref=hunter2"), `Cookie: ${REDACTED}`);
 });
 
+const REQUEST_ID_HEADER = "X-Request-Id: 5add72d1-b870-423d-a911-7f51772d8e6a";
+
+/**
+ * Review of #78 row E (CodeRabbit r4077655607 on `dd7426e`; leak-probe class 3): a cookie pair whose
+ * name begins with "&" was matched by the query rule before the cookie reader ran, and the query
+ * value took the ";" with it and ended the cookie there, so the later pair survived (`Cookie:
+ * [REDACTED] pref=<v>`). The cookie reader now runs before the query rule and reads the pairs and
+ * attributes whole, the ";" its boundary alone; a query value keeps running through ";" as on main
+ * (Codex r4080768613 on #81, see the test after this one). A bare cookie run that ends in "="
+ * (`theme=dark#sid=`, `theme=dark&sid=`) names one more pair whose JSON-escaped quoted value belongs
+ * to it, so that value goes with the header rather than standing after the marker. The header after
+ * the cookie keeps its name and value in every row.
+ */
+const AMPERSAND_COOKIE_ROWS = Object.freeze([
+  ["ampersand name, then a later pair", (a, b) => `Cookie: &sid=${a}; pref=${b}`, () => `Cookie: ${REDACTED}`, []],
+  ["ampersand name, then a later pair, then a header", (a, b) => `Cookie: &sid=${a}; pref=${b}; ${REQUEST_ID_HEADER}`, () => `Cookie: ${REDACTED}; ${REQUEST_ID_HEADER}`, [REQUEST_ID_HEADER]],
+  ["hash name, then a later pair, then a header", (a, b) => `Cookie: #sid=${a}; pref=${b}; ${REQUEST_ID_HEADER}`, () => `Cookie: ${REDACTED}; ${REQUEST_ID_HEADER}`, [REQUEST_ID_HEADER]],
+  ["ampersand name in Set-Cookie before attributes", (a) => `Set-Cookie: &sid=${a}; Path=/; HttpOnly`, () => `Set-Cookie: ${REDACTED}`, []],
+  ["ampersand name in Set-Cookie before attributes and a header", (a) => `Set-Cookie: &sid=${a}; Path=/; HttpOnly; ${REQUEST_ID_HEADER}`, () => `Set-Cookie: ${REDACTED}; ${REQUEST_ID_HEADER}`, [REQUEST_ID_HEADER]],
+  ["bare run ending in = after a hash, then a JSON-escaped quoted value", (a) => `Cookie: theme=dark#sid=\\"${a}\\"; ${REQUEST_ID_HEADER}`, () => `Cookie: ${REDACTED}; ${REQUEST_ID_HEADER}`, [REQUEST_ID_HEADER]],
+  ["bare run ending in = after an ampersand, then a JSON-escaped quoted value", (a) => `Cookie: theme=dark&sid=\\"${a}\\"; ${REQUEST_ID_HEADER}`, () => `Cookie: ${REDACTED}; ${REQUEST_ID_HEADER}`, [REQUEST_ID_HEADER]],
+  ["later ampersand name with a JSON-escaped quoted value", (a) => `Cookie: theme=dark; my&sid=\\"${a}\\"; ${REQUEST_ID_HEADER}`, () => `Cookie: ${REDACTED}; ${REQUEST_ID_HEADER}`, [REQUEST_ID_HEADER]],
+  ["bare run ending in =, then a quoted value, then attributes", (a) => `Set-Cookie: theme=dark&sid="${a}"; Path=/; HttpOnly`, () => `Set-Cookie: ${REDACTED}`, []],
+  ["ampersand name in a JSON-escaped header line", (a, b) => `{"detail":"Cookie: &sid=${a}; pref=${b}; ${REQUEST_ID_HEADER}"}`, () => `{"detail":"Cookie: ${REDACTED}; ${REQUEST_ID_HEADER}"}`, [REQUEST_ID_HEADER]],
+  ["a query value runs through a semicolon, which is not a cookie separator there", (a) => `GET /v1/users?api_key=${a};x=1 failed`, () => `GET /v1/users?api_key=${REDACTED} failed`, [" failed"]],
+]);
+
+test("#78 row E: an ampersand or hash cookie name takes the whole header value with the pairs after it, a bare run ending in = owns the quoted value after it, and the following header stays", () => {
+  const legitimate = new Map(AMPERSAND_COOKIE_ROWS.map(([label, line]) => [label, line("", "")]));
+  assertCanariesDisjointFromFixture(assert, plantedValues(), legitimate, "ampersand cookie rows");
+  for (const [label, line, expected, keeps] of AMPERSAND_COOKIE_ROWS) {
+    for (const [a, b] of plantedPairs()) {
+      const input = line(a, b);
+      const planted = [a, b].filter((value) => input.includes(value));
+      for (const [scrubName, scrub] of EXACT_SCRUBS) {
+        const output = scrub(input);
+        assert.equal(output, expected(), `${scrubName}: ${label} with ${a} and ${b}`);
+        for (const text of keeps) assert.ok(output.includes(text), `${scrubName}: ${label}: ${JSON.stringify(text)} did not survive in ${output}`);
+        assertNoCanaryWindows(assert, output, planted, `${scrubName}: ${label}`);
+        assert.equal(scrub(output), output, `${scrubName}: ${label}: a second pass changed the text`);
+      }
+      assertNoCanaryWindows(assert, errorMessage(new Error(input)), planted, `errorMessage: ${label}`);
+      const body = JSON.stringify({ message: `upstream sent ${input}` });
+      assert.equal(describeErrorBody("application/json", body), `upstream sent ${expected()}`, `describeErrorBody: ${label}`);
+      const described = describeFailedResponse({ method: "GET", endpoint: "/v1/users", status: 502, statusText: "Bad Gateway", contentType: "application/json", body });
+      assert.equal(described, `GET /v1/users failed with 502 Bad Gateway: upstream sent ${expected()}`, `describeFailedResponse: ${label}`);
+      assertNoCanaryWindows(assert, described, planted, `describeFailedResponse: ${label}`);
+    }
+  }
+  // The renderings the review reported, with the literal values it used: the later pair survived.
+  assert.equal(scrubErrorText("Cookie: &sid=hunter2; pref=dark"), `Cookie: ${REDACTED}`);
+  assert.equal(scrubDataText("Cookie: theme=dark#sid=\\\"hunter2\\\"; X-Request-Id: 1"), `Cookie: ${REDACTED}; X-Request-Id: 1`);
+  // A ";" does not end a bare query value: `URLSearchParams` reads it as part of the value.
+  assert.equal(scrubErrorText("GET /v1/users?api_key=abcdef123456;page=2 failed"), `GET /v1/users?api_key=${REDACTED} failed`);
+  // Base64 padding before the closing quote of a header line quoted whole: the quote after "==" runs
+  // unterminated or encloses prose, so it ends the value rather than opening one.
+  assert.equal(scrubErrorText("sent 'Cookie: sid=dGhpcyBpcyBhIHNlY3JldA==' then 'Accept: text/html'"), `sent 'Cookie: ${REDACTED}' then 'Accept: text/html'`);
+  assert.equal(scrubErrorText("header -H 'Cookie: sid=dGhpcyBpcyBhIHNlY3JldA=='. Retry later"), `header -H 'Cookie: ${REDACTED}'. Retry later`);
+  assert.equal(scrubErrorText('{"detail":"sent \\"Cookie: sid=dGhpcyBpcyBhIHNlY3JldA==\\", then \\"Accept: text/html\\""}'), `{"detail":"sent \\"Cookie: ${REDACTED}\\", then \\"Accept: text/html\\""}`);
+  assert.equal(scrubErrorText('{"detail":"sent \\"Cookie: sid=dGhpcyBpcyBhIHNlY3JldA==\\" then \\"Accept: text/html\\""}'), `{"detail":"sent \\"Cookie: ${REDACTED}\\" then \\"Accept: text/html\\""}`);
+});
+
+/**
+ * Codex r4080768613 on #81 (P1 at `5f75c90`): the ";" boundary row E gave the query value class
+ * applied to every query pair, so `?token=<v>;<rest>` rendered `?token=[REDACTED];<rest>` and the tail
+ * of the value survived, where `02967cc` and `b47f90d` redacted through the semicolon
+ * (`URLSearchParams` reads ";" as part of the value). The value now goes whole again in the bare,
+ * relative, absolute, slash-escaped, JSON, and JSON-escaped forms, and the cookie rows above keep
+ * their rendering because the cookie reader owns the ";" and runs first. Mutation check (recorded in
+ * the round 3 body): with ";" put back in the query value class every query row here renders
+ * `[REDACTED];<rest>` and fails while the cookie rows still pass.
+ */
+const SEMICOLON_QUERY_ROWS = Object.freeze([
+  ["bare query string", (value) => `?token=${value}`, () => `?token=${REDACTED}`],
+  ["relative path", (value) => `GET /v1/x?token=${value} HTTP/1.1`, () => `GET /v1/x?token=${REDACTED} HTTP/1.1`],
+  ["later pair on a relative path", (value) => `/v1/x?a=1&token=${value}&b=2`, () => `/v1/x?a=1&token=${REDACTED}&b=2`],
+  ["bare later pair", (value) => `&api_key=${value}`, () => `&api_key=${REDACTED}`],
+  ["absolute URL", (value) => `https://host/v1/x?token=${value}`, () => `https://host/v1/x?${REDACTED}`],
+  ["absolute URL in a sentence", (value) => `GET https://host/v1/x?token=${value} failed with 401`, () => `GET https://host/v1/x?${REDACTED} failed with 401`],
+  ["slash-escaped URL", (value) => `https:\\/\\/host\\/v1\\/x?token=${value}`, () => `https:\\/\\/host\\/v1\\/x?${REDACTED}`],
+  ["relative path in a JSON string", (value) => `{"url":"/v1/x?token=${value}"}`, () => `{"url":"/v1/x?token=${REDACTED}"}`],
+  ["absolute URL in a JSON string", (value) => `{"url":"https://host/v1/x?token=${value}"}`, () => `{"url":"https://host/v1/x?${REDACTED}"}`],
+  ["relative path in a JSON-escaped string", (value) => `{\\"url\\":\\"/v1/x?token=${value}\\"}`, () => `{\\"url\\":\\"/v1/x?token=${REDACTED}\\"}`],
+  ["slash-escaped URL in a JSON-escaped string", (value) => `{\\"url\\":\\"https:\\/\\/host\\/v1\\/x?token=${value}\\"}`, () => `{\\"url\\":\\"https:\\/\\/host\\/v1\\/x?${REDACTED}\\"}`],
+]);
+
+test("Codex r4080768613 on #81: a query value runs through a semicolon, so `?token=<v>;<rest>` loses the whole value in every URL form and sink, and the cookie rows keep their rendering", () => {
+  const legitimate = new Map(SEMICOLON_QUERY_ROWS.map(([label, line]) => [label, line("")]));
+  assertCanariesDisjointFromFixture(assert, plantedValues(), legitimate, "semicolon query rows");
+  const valuePairs = [["hunter2", "restofsecret"], ...plantedPairs()];
+  for (const [label, line, expected] of SEMICOLON_QUERY_ROWS) {
+    for (const [head, tail] of valuePairs) {
+      const input = line(`${head};${tail}`);
+      for (const [scrubName, scrub] of EXACT_SCRUBS) {
+        const output = scrub(input);
+        assert.equal(output, expected(), `${scrubName}: ${label} with ${head};${tail}`);
+        assertNoCanaryWindows(assert, output, [head, tail], `${scrubName}: ${label}`);
+        assert.equal(scrub(output), output, `${scrubName}: ${label}: a second pass changed the text`);
+      }
+      assertNoCanaryWindows(assert, errorMessage(new Error(input)), [head, tail], `errorMessage: ${label}`);
+    }
+  }
+  // The row as reported, through both scrubbers and a record under `redactSecretValues`.
+  assert.equal(scrubErrorText("?token=hunter2;restofsecret"), `?token=${REDACTED}`);
+  assert.equal(scrubDataText("?token=hunter2;restofsecret"), `?token=${REDACTED}`);
+  assert.deepEqual(redactSecretValues({ request: "GET /v1/x?token=hunter2;restofsecret HTTP/1.1" }), { request: `GET /v1/x?token=${REDACTED} HTTP/1.1` });
+  // The cookie rows the ";" boundary was added for keep their rendering: the boundary is the cookie reader's.
+  for (const [text, expected] of [
+    ["Cookie: &sid=a; pref=b", `Cookie: ${REDACTED}`],
+    ["Cookie: &sid=hunter2; pref=dark", `Cookie: ${REDACTED}`],
+    ["Cookie: #sid=hunter2; pref=dark; X-Request-Id: 1", `Cookie: ${REDACTED}; X-Request-Id: 1`],
+    ["Cookie: sid=hunter2; Path=/; HttpOnly", `Cookie: ${REDACTED}`],
+    ["Set-Cookie: &sid=hunter2; Path=/; HttpOnly", `Set-Cookie: ${REDACTED}`],
+    ["Cookie: sid=hunter2; X-Request-Id: 1", `Cookie: ${REDACTED}; X-Request-Id: 1`],
+    ["Cookie: return_to=https://x/y?token=hunter2;restofsecret; pref=dark", `Cookie: ${REDACTED}`],
+  ]) {
+    for (const [scrubName, scrub] of EXACT_SCRUBS) assert.equal(scrub(text), expected, `${scrubName}: ${text}`);
+  }
+});
+
+/**
+ * CodeRabbit r4081238237 on #81 (at `a377984`): `Authorization: Snowflake Token="<jwt>"` carries its
+ * credential as a quoted auth-param (RFC 7235), the header reader's bare run stopped at the quote, and
+ * the pair rule could not match `Token` after the marker, so the quoted value survived
+ * (`Snowflake [REDACTED]"<jwt>"`); the same for the quoted params after `Digest` (`response`, `nonce`,
+ * `cnonce`) and for any `<Scheme> <Key>="..."` shape. The reader now reads the auth-param list: one
+ * quoted param keeps its label and quotes (`Snowflake Token="[REDACTED]"`), a list (Digest, OAuth 1,
+ * SigV4) goes whole, a challenge's params (`realm="api"`) stay, and a scheme spelling that "=" follows
+ * is a param name (`Authorization: Token="[REDACTED]"`). The fixed values in the Digest, SigV4, and
+ * OAuth 1 rows are the RFC 7616, AWS, and RFC 5849 examples. Mutation check (recorded in the round 3
+ * body): with the list reader returning null, 13 of the 15 rows fail and 10 leak the value through
+ * every sink; the two rows inside a JSON string hold because the quoted header path takes the whole
+ * string there.
+ */
+const AUTH_PARAM_ROWS = Object.freeze([
+  ["bare header line", (value) => `Authorization: Snowflake Token="${value}"`, () => `Authorization: Snowflake Token="${REDACTED}"`],
+  ["single-quoted header line", (value) => `Authorization: Snowflake Token='${value}'`, () => `Authorization: Snowflake Token='${REDACTED}'`],
+  ["after a JSON escape", (value) => `request failed\\nAuthorization: Snowflake Token=\\"${value}\\"`, () => `request failed\\nAuthorization: Snowflake Token=\\"${REDACTED}\\"`],
+  ["inside a JSON string", (value) => `{"headers":{"Authorization":"Snowflake Token=\\"${value}\\""}}`, () => `{"headers":{"Authorization":"Snowflake ${REDACTED}"}}`],
+  ["header line inside a JSON string", (value) => `{"detail":"Authorization: Snowflake Token=\\"${value}\\""}`, () => `{"detail":"Authorization: Snowflake Token=\\"${REDACTED}\\""}`],
+  ["compound line", (value) => `Authorization: Snowflake Token="${value}"; X-Request-Id: 1`, () => `Authorization: Snowflake Token="${REDACTED}"; X-Request-Id: 1`],
+  ["Bearer with a quoted param", (value) => `Authorization: Bearer Token="${value}"`, () => `Authorization: Bearer Token="${REDACTED}"`],
+  ["scheme spelling as the param name", (value) => `Authorization: Token="${value}"`, () => `Authorization: Token="${REDACTED}"`],
+  ["generic credential header", (value) => `X-Api-Key: Token="${value}"`, () => `X-Api-Key: Token="${REDACTED}"`],
+  ["scheme word in free text", (value) => `replayed Snowflake Token="${value}" upstream`, () => `replayed Snowflake Token="${REDACTED}" upstream`],
+  ["credential-named pair", (value) => `password=Token="${value}"`, () => `password=${REDACTED}`],
+  ["Digest auth-param list", (value) => `Authorization: Digest username="Mufasa", realm="testrealm@host.com", nonce="dcd98b7102dd2f0e8b11d0f600bfb0c093", uri="/dir/index.html", qop=auth, nc=00000001, cnonce="0a4f113b", response="${value}", opaque="5ccc069c403ebaf9f0171e9517f40e41"`, () => `Authorization: Digest ${REDACTED}`],
+  ["Digest auth-param list inside a JSON string", (value) => `{"Authorization":"Digest username=\\"Mufasa\\", realm=\\"testrealm@host.com\\", nonce=\\"dcd98b7102dd2f0e8b11d0f600bfb0c093\\", response=\\"${value}\\", opaque=\\"5ccc069c403ebaf9f0171e9517f40e41\\""}`, () => `{"Authorization":"Digest ${REDACTED}"}`],
+  ["SigV4 auth-param list", (value) => `Authorization: AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/20260922/eu-north-1/s3/aws4_request, SignedHeaders=host;x-amz-date, Signature=${value}`, () => `Authorization: AWS4-HMAC-SHA256 ${REDACTED}`],
+  ["OAuth 1 auth-param list", (value) => `Authorization: OAuth oauth_consumer_key="dpf43f3p2l4k3l03", oauth_token="${value}", oauth_signature_method="HMAC-SHA1", oauth_version="1.0"`, () => `Authorization: OAuth ${REDACTED}`],
+]);
+
+test("CodeRabbit r4081238237 on #81: a quoted auth-param after a scheme word goes with its label kept, a Digest, OAuth 1, or SigV4 list goes whole, and a challenge's params stay, through every sink", () => {
+  const legitimate = new Map(AUTH_PARAM_ROWS.map(([label, line]) => [label, line("")]));
+  assertCanariesDisjointFromFixture(assert, plantedValues(), legitimate, "auth-param rows");
+  // "skvclmtirehs" is the value the review used.
+  for (const [label, line, expected] of AUTH_PARAM_ROWS) {
+    for (const value of ["skvclmtirehs", ...plantedValues()]) {
+      const input = line(value);
+      for (const [scrubName, scrub] of EXACT_SCRUBS) {
+        const output = scrub(input);
+        assert.equal(output, expected(), `${scrubName}: ${label} with ${value}`);
+        assertNoCanaryWindows(assert, output, [value], `${scrubName}: ${label}`);
+        assert.equal(scrub(output), output, `${scrubName}: ${label}: a second pass changed the text`);
+      }
+      assertNoCanaryWindows(assert, errorMessage(new Error(input)), [value], `errorMessage: ${label}`);
+    }
+  }
+  // The row as reported, through both scrubbers and records under `redactSecretValues`.
+  const reported = 'Authorization: Snowflake Token="skvclmtirehs"';
+  assert.equal(scrubErrorText(reported), `Authorization: Snowflake Token="${REDACTED}"`);
+  assert.equal(scrubDataText(reported), `Authorization: Snowflake Token="${REDACTED}"`);
+  assert.equal(redactSecretValues(reported), `Authorization: Snowflake Token="${REDACTED}"`);
+  assert.deepEqual(redactSecretValues({ detail: reported }), { detail: `Authorization: Snowflake Token="${REDACTED}"` });
+  assert.deepEqual(redactSecretValues({ headers: { Authorization: 'Snowflake Token="skvclmtirehs"' } }), { headers: { Authorization: REDACTED } });
+  // A challenge's params describe the server and stay, in a WWW-Authenticate header and in prose.
+  for (const text of [
+    'WWW-Authenticate: Bearer realm="api", error="invalid_token", error_description="The access token expired"',
+    'WWW-Authenticate: Basic realm="WallyWorld"',
+    'Bearer realm="api", error="invalid_token", error_description="The access token expired"',
+    'Basic realm="WallyWorld"',
+  ]) {
+    for (const [scrubName, scrub] of EXACT_SCRUBS) assert.equal(scrub(text), text, `${scrubName}: ${text}`);
+  }
+  const digestChallenge = 'WWW-Authenticate: Digest realm="testrealm@host.com", qop="auth,auth-int", nonce="dcd98b7102dd2f0e8b11d0f600bfb0c093", opaque="5ccc069c403ebaf9f0171e9517f40e41"';
+  for (const [scrubName, scrub] of EXACT_SCRUBS) {
+    assert.ok(scrub(digestChallenge).startsWith('WWW-Authenticate: Digest realm="testrealm@host.com", qop="auth,auth-int", '), `${scrubName}: ${scrub(digestChallenge)}`);
+  }
+  // A bare run after the scheme word goes whole as before, and the renderings are fixed points.
+  for (const [text, expected] of [
+    ["Authorization: Snowflake Token=skvclmtirehs", `Authorization: Snowflake ${REDACTED}`],
+    ['"Authorization": "Token=skvclmtirehs"', `"Authorization": "${REDACTED}"`],
+    [`Authorization: Snowflake Token="${REDACTED}"`, `Authorization: Snowflake Token="${REDACTED}"`],
+    [`Authorization: Token=${REDACTED}`, `Authorization: Token=${REDACTED}`],
+    [`Authorization: Digest ${REDACTED}`, `Authorization: Digest ${REDACTED}`],
+  ]) {
+    for (const [scrubName, scrub] of EXACT_SCRUBS) assert.equal(scrub(text), expected, `${scrubName}: ${text}`);
+  }
+});
+
+/**
+ * CodeRabbit r4081776771 on #81 (at `ed1bb8b`): the free-text reader exempted every auth-param list
+ * that began with a challenge param (`realm=`) as a WWW-Authenticate challenge, even when a later
+ * param was a proof, so `Digest realm="api", nonce="n", response="<proof>"` kept its `response`; no
+ * pair rule names `response` (nor `mac`), and the data scrubs have no long-token fallback. The list
+ * reader now records a proof param during the walk (`response`, `signature`, `oauth_signature`,
+ * `mac`, `sig`, `hmac`, `token`, `password`, `secret`, `key`, `assertion`, read as the final segment
+ * of the name), and a list that holds one is a credential whatever it begins with: it goes whole, as
+ * the same list does under a header and as a list led by `username=` did already, so the rendering
+ * does not depend on the order of the params. The proof values are name-shaped words, so neither the
+ * hex-digest nor the long-token rule can mask the result. Each row stands bare, after a JSON escape,
+ * and inside a JSON string.
+ */
+const PROOF_PARAM_ROWS = Object.freeze([
+  ["Digest response", (value) => `Digest realm="api", nonce="n", response="${value}"`, `Digest ${REDACTED}`],
+  ["Digest response with bare values", (value) => `Digest realm=api, nonce=n, response=${value}`, `Digest ${REDACTED}`],
+  ["Digest response led by realm, full RFC 7616 shape", (value) => `Digest realm="api", username="Mufasa", nonce="dcd98b7102dd2f0e8b11d0f600bfb0c093", uri="/dir/index.html", qop=auth, nc=00000001, cnonce="0a4f113b", response="${value}"`, `Digest ${REDACTED}`],
+  ["OAuth 1 signature", (value) => `OAuth realm="api", oauth_consumer_key="dpf43f3p2l4k3l03", oauth_signature_method="HMAC-SHA1", oauth_signature="${value}"`, `OAuth ${REDACTED}`],
+  ["OAuth 1 signature alone after the realm", (value) => `OAuth realm="api", oauth_signature="${value}"`, `OAuth ${REDACTED}`],
+  ["MAC token", (value) => `Token realm="api", id="h480djs93hd8", ts="1336363200", nonce="dj83hs9s", mac="${value}"`, `Token ${REDACTED}`],
+  ["mac after a Bearer challenge's params", (value) => `Bearer realm="api", error="invalid_token", mac="${value}"`, `Bearer ${REDACTED}`],
+  ["lowercase scheme word, Digest response", (value) => `digest realm="api", nonce="n", response="${value}"`, `digest ${REDACTED}`],
+  ["lowercase scheme word, response alone", (value) => `digest response="${value}"`, `digest response="${REDACTED}"`],
+  ["header line led by realm", (value) => `Authorization: Digest realm="api", nonce="n", response="${value}"`, `Authorization: Digest ${REDACTED}`],
+]);
+
+const PROOF_PARAM_FORMS = Object.freeze([
+  ["bare", (line) => line, (rendering) => rendering],
+  ["after a JSON escape", (line) => `request failed\\n${line.replaceAll('"', '\\"')}`, (rendering) => `request failed\\n${rendering.replaceAll('"', '\\"')}`],
+  ["inside a JSON string", (line) => `{"detail":"${line.replaceAll('"', '\\"')}"}`, (rendering) => `{"detail":"${rendering.replaceAll('"', '\\"')}"}`],
+]);
+
+test("CodeRabbit r4081776771 on #81: an auth-param list led by realm= goes whole when a later param is a proof, bare, after a JSON escape, and inside a JSON string, through every sink, while a challenge without a proof keeps its params", () => {
+  const legitimate = new Map(PROOF_PARAM_ROWS.map(([label, line]) => [label, line("")]));
+  assertCanariesDisjointFromFixture(assert, ["skvclmtirehs", "yqzvbnxrlt", ...plantedValues()], legitimate, "proof-param rows");
+  let trials = 0;
+  for (const [label, line, rendering] of PROOF_PARAM_ROWS) {
+    for (const [formName, form, expectedForm] of PROOF_PARAM_FORMS) {
+      // Two lowercase words and the planted values: a name-shaped word is what the review planted.
+      for (const value of ["skvclmtirehs", "yqzvbnxrlt", ...plantedValues()]) {
+        const input = form(line(value));
+        const expected = expectedForm(rendering);
+        for (const [scrubName, scrub] of EXACT_SCRUBS) {
+          const output = scrub(input);
+          assert.equal(output, expected, `${scrubName}: ${label}, ${formName}, with ${value}`);
+          assertNoCanaryWindows(assert, output, [value], `${scrubName}: ${label}, ${formName}`);
+          assert.equal(scrub(output), output, `${scrubName}: ${label}, ${formName}: a second pass changed the text`);
+          trials += 1;
+        }
+        assertNoCanaryWindows(assert, errorMessage(new Error(input)), [value], `errorMessage: ${label}, ${formName}`);
+        assert.deepEqual(redactSecretValues({ detail: input, list: [{ note: input }] }), { detail: expected, list: [{ note: expected }] }, `redactSecretValues record: ${label}, ${formName}, with ${value}`);
+      }
+    }
+  }
+  assert.equal(trials, PROOF_PARAM_ROWS.length * PROOF_PARAM_FORMS.length * (2 + plantedValues().length) * EXACT_SCRUBS.length);
+  // The rows as reported, through the three sinks the review named.
+  const reported = 'Digest realm="api", nonce="n", response="skvclmtirehs"';
+  assert.equal(scrubErrorText(reported), `Digest ${REDACTED}`);
+  assert.equal(scrubDataText(reported), `Digest ${REDACTED}`);
+  assert.equal(redactSecretValues(reported), `Digest ${REDACTED}`);
+  assert.deepEqual(redactSecretValues({ detail: reported }), { detail: `Digest ${REDACTED}` });
+  // The must-keep side: a challenge without a proof keeps its params, in a WWW-Authenticate header, in
+  // prose, and in each form. `nonce` is a credential pair name, so its value has gone under the pair
+  // rule since the #78 shape ruling and renders `nonce="[REDACTED]"` as on main; `realm`, `qop`, and
+  // the scheme word keep their values, and the list is not replaced by one marker.
+  for (const [text, expected] of [
+    ['WWW-Authenticate: Bearer realm="api"', 'WWW-Authenticate: Bearer realm="api"'],
+    ['Bearer realm="api"', 'Bearer realm="api"'],
+    ['WWW-Authenticate: Digest realm="api", qop="auth", nonce="n"', `WWW-Authenticate: Digest realm="api", qop="auth", nonce="${REDACTED}"`],
+    ['Digest realm="api", qop="auth", nonce="n"', `Digest realm="api", qop="auth", nonce="${REDACTED}"`],
+    ['challenge was Digest realm="api", qop="auth", nonce="n" and the client gave up', `challenge was Digest realm="api", qop="auth", nonce="${REDACTED}" and the client gave up`],
+    ['Bearer realm="api", error="invalid_token", error_description="The access token expired"', 'Bearer realm="api", error="invalid_token", error_description="The access token expired"'],
+    ['Digest realm="api", algorithm=SHA-256, signature_method="HMAC-SHA1"', 'Digest realm="api", algorithm=SHA-256, signature_method="HMAC-SHA1"'],
+    ['digest realm="api"', 'digest realm="api"'],
+    ['token realm="api", scope="read"', 'token realm="api", scope="read"'],
+  ]) {
+    for (const [formName, form, expectedForm] of PROOF_PARAM_FORMS) {
+      for (const [scrubName, scrub] of EXACT_SCRUBS) assert.equal(scrub(form(text)), expectedForm(expected), `${scrubName}: ${text}, ${formName}`);
+    }
+  }
+  // A list whose proof the pair rule has already replaced is still a credential and goes whole, and
+  // the renderings are fixed points.
+  for (const [text, expected] of [
+    ['Bearer realm="api", token="skvclmtirehs"', `Bearer ${REDACTED}`],
+    [`Bearer realm="api", token="${REDACTED}"`, `Bearer ${REDACTED}`],
+    [`Digest realm="[REDACTED]", response="${REDACTED}"`, `Digest realm="[REDACTED]", response="${REDACTED}"`],
+    [`Digest ${REDACTED}`, `Digest ${REDACTED}`],
+    [`digest response="${REDACTED}"`, `digest response="${REDACTED}"`],
+  ]) {
+    for (const [scrubName, scrub] of EXACT_SCRUBS) assert.equal(scrub(text), expected, `${scrubName}: ${text}`);
+  }
+});
+
 /**
  * A header line quoted whole in single quotes (a curl `-H` argument, a Python dict repr, a sentence
  * that ends after the quote) keeps its closing quote: the apostrophe that closes it is followed by a

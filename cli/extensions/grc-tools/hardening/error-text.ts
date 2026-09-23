@@ -12,8 +12,10 @@
  * or underscores, digits standing in whole segments) is indistinguishable from a resource name and
  * stays. Two guards make that safe, and both are construction requirements. (1) A value inside a
  * carrier is removed whatever its shape: the Cookie, Set-Cookie, Authorization, Proxy-Authorization,
- * x-api-key and similar headers; the schemes Bearer, Basic, Token, ApiKey, Digest, OAuth, SSWS, and
- * Splunk; credential-named pairs (`token=`, `"password":`, `api_key:`, `session_id=`); URL userinfo
+ * x-api-key and similar headers; the schemes Bearer, Basic, Token, ApiKey, Digest, OAuth, Negotiate,
+ * NTLM, SSWS, Splunk, Snowflake, and AWS4-HMAC-SHA256 in any casing; credential-named pairs (`token=`,
+ * `"password":`, `api_key:`, `session_id=`, and the flags and path segments a spawned CLI echoes,
+ * `--password=`, `--password <value>`, `-Dpassword=`, `kv/password:`); URL userinfo
  * and query pairs. A quoted value (`X-Api-Key: "value"`, `Cookie: sid='value'`, `Authorization:
  * Bearer "value"`, the JSON pair `"Authorization": "Bearer value"`, and their JSON-escaped forms
  * `\"X-Api-Key\": \"value\"` at any depth) is removed whole up to its closing quote, spaces and all,
@@ -78,7 +80,7 @@ const MAX_CUT_ATTEMPTS = 4;
 // The tail of a cut head that a second pass would read as a value: a separator followed only by a
 // quote, a scheme word, or both (`X-Api-Key: "`, `"Authorization": "Bearer`), a trailing partial query
 // or fragment of a URL (`?token=`, `#`), trailing spaces, and a dangling escape backslash.
-const CUT_VALUE_OPENER_PATTERN = /([:=])[ \t]*(?:\\*["'])?[ \t]*(?:(?:Bearer|Basic|Token|Digest|OAuth|Negotiate|NTLM|SSWS|ApiKey|Api-Key|Splunk)[ \t]*)?$/i;
+const CUT_VALUE_OPENER_PATTERN = /([:=])[ \t]*(?:\\*["'])?[ \t]*(?:(?:Bearer|Basic|Token|Digest|OAuth|Negotiate|NTLM|SSWS|ApiKey|Api-Key|Splunk|Snowflake|AWS4-HMAC-SHA256)[ \t]*)?$/i;
 const CUT_URL_TAIL_PATTERN = /([a-z][a-z0-9+.-]*:\/\/(?:\[REDACTED\]|[^\s"'<>()[\]{}\\])*?)[?#&](?!\[REDACTED\]$)[^\s?#&"'<>()[\]{}\\]*$/i;
 const CUT_TAIL_PATTERN = /(?:[ \t]|\\+|[?#&]+)+$/;
 const CUT_WORD_CHARACTER_PATTERN = /[A-Za-z0-9_-]/;
@@ -111,28 +113,40 @@ const PEM_BLOCK_PATTERN = /-----BEGIN [A-Z0-9 ]+-----[\s\S]*?-----END [A-Z0-9 ]+
 const PEM_OPEN_PATTERN = /-----BEGIN [A-Z0-9 ]+-----[\s\S]*$/;
 
 // Any scheme-prefixed URL wherever it sits in the text: the userinfo is dropped, the query and the
-// fragment are replaced, the scheme, host, and path stay because they name the surface. A marker
-// already standing in the query or fragment is consumed with the URL so a second pass is a no-op,
-// and a backslash ends the URL so a JSON-escaped closing quote is kept.
-const EMBEDDED_URL_PATTERN = /\b[a-z][a-z0-9+.-]*:\/\/(?:\[REDACTED\]|[^\s"'<>()[\]{}\\])+/gi;
-const URL_PARTS_PATTERN = /^([a-z][a-z0-9+.-]*:\/\/)(?:[^\s/@"'<>]+@)?([^?#]*)(\?[^#]*)?(#.*)?$/i;
+// fragment are replaced, the scheme, host, and path stay because they name the surface. The userinfo
+// ends where the authority does, at the first "/", "?", or "#", so `https://h?e=a@x.com&token=<v>` is
+// the host `h` and a query (`https://h?[REDACTED]`), not the userinfo `h?e=a@` before a host of
+// `x.com&token=<v>` (CodeRabbit on #76), and `https://h#f@x.com` is the host `h` and a fragment. A
+// marker already standing in the query or fragment is consumed with the URL so a second pass is a
+// no-op, and a backslash ends the URL so a JSON-escaped closing quote is kept, except the escaped
+// solidus `\/`: a JSON encoder may write every "/" of a URL as `\/` (review of #78 row C), so
+// `https:\/\/svc:<value>@api.example.com\/v1\/items` is the same URL and loses its userinfo, query, and
+// fragment the same way, its escaped separators kept as written.
+const EMBEDDED_URL_PATTERN = /\b[a-z][a-z0-9+.-]*:(?:\/\/|\\\/\\\/)(?:\[REDACTED\]|\\\/|[^\s"'<>()[\]{}\\])+/gi;
+const URL_PARTS_PATTERN = /^([a-z][a-z0-9+.-]*:(?:\/\/|\\\/\\\/))(?:[^\s\/?#@"'<>\\]+@)?([^?#]*)(\?[^#]*)?(#.*)?$/i;
 const TRAILING_PUNCTUATION_PATTERN = /[.,;:!?]+$/;
 
 // A relative path or bare query string: the named parameter keeps its name, the value goes. A
-// backslash ends the value so a JSON-escaped closing quote is kept.
+// backslash ends the value so a JSON-escaped closing quote is kept. A ";" does not end it:
+// `URLSearchParams` reads `?token=<v>;<rest>` as one value, so the run to the next "&", "#", or space
+// goes whole (Codex r4080768613 on #81; the ";" boundary belongs to the cookie reader, which runs
+// before this rule so a cookie pair whose name begins with "&" or "#" never reaches it).
 const QUERY_PAIR_PATTERN = /([?&])([A-Za-z0-9_.[\]-]+)=(?!\[REDACTED\])([^&#\s"'<>\\]+)/g;
 
 // Carriers. Each carrier pattern matches a name and its separator only; the value that follows is read
 // by a quote-aware reader (see "Carrier values"), never by the pattern, so a quoted value is removed
-// whole and a JSON-escaped quote is a quote rather than a value character. A carrier name stands on
-// its own: it is preceded by neither a word character nor "-", ".", or "/", so `sdk-keys:`,
-// `environment-token`, `settings.token`, and `/_security/api_key:` are names and paths, not carriers.
+// whole and a JSON-escaped quote is a quote rather than a value character. An explicit carrier name
+// (a header, a cookie header, a scheme word, one of `CREDENTIAL_PAIR_NAMES`) stands on its own: it is
+// preceded by neither a word character nor "-", ".", or "/", so `sdk-keys:`, `environment-token`,
+// `settings.token`, and `/_security/api_key:` are names and paths for these rules and are left to the
+// generic pair rule, which reads them whole and after "-" or "/" too (see `PAIR_KEY_START`).
 // A JSON escape sequence ends the run before a name: over JSON-encoded text, and inside the nested
 // strings `describeErrorBody` reads, a line break or tab is the two characters `\n`, `\r`, `\t`
-// (also `\b`, `\f`, `\v`, and `\uXXXX`), so the letter of the escape is a boundary and
-// `request failed\napi_key=<value>`, `\tpassword: <value>`, `\nX-Api-Key: <value>`, and
-// `\r\nBearer <value>` are carriers as they are after a raw line break.
-const NAME_START = String.raw`(?:(?<![A-Za-z0-9_/.-])|(?<=\\[nrtbfv]|\\u[0-9A-Fa-f]{4}))`;
+// (also `\b`, `\f`, `\v`, `\/`, and `\uXXXX`), so the letter of the escape is a boundary and
+// `request failed\napi_key=<value>`, `\tpassword: <value>`, `\nX-Api-Key: <value>`,
+// `\r\nBearer <value>`, and the escaped solidus `see \/tmp\/password=<value>` (`\/` is the JSON escape
+// of `/`, review of #78 row A) are carriers as they are after a raw line break.
+const NAME_START = String.raw`(?:(?<![A-Za-z0-9_/.-])|(?<=\\[nrtbfv/]|\\u[0-9A-Fa-f]{4}))`;
 // The quote that may close a quoted carrier name in JSON or JSON-escaped text (`"X-Api-Key":`,
 // `\"X-Api-Key\":`), then the separator with any spacing around it.
 const NAME_CLOSE_AND_SEPARATOR = String.raw`(?:\\*["'])?\s*[:=]\s*`;
@@ -157,6 +171,7 @@ const cookieToken = (character: string): string => String.raw`${character}+(?:'(
 const NAME_FINAL_APOSTROPHE = String.raw`(?:'(?=[ \t]*=))?`;
 const COOKIE_PAIR_NAME_PATTERN = new RegExp(String.raw`${cookieToken(COOKIE_NAME_CHARACTER)}${NAME_FINAL_APOSTROPHE}`, "y");
 const COOKIE_BARE_VALUE_PATTERN = new RegExp(String.raw`(?:${cookieToken(COOKIE_VALUE_CHARACTER)})?`, "y");
+const COOKIE_VALUE_START_PATTERN = new RegExp(COOKIE_VALUE_CHARACTER, "y");
 const COOKIE_ATTRIBUTE_PATTERN = new RegExp(String.raw`;[ \t]*${cookieToken(COOKIE_ATTRIBUTE_CHARACTER)}${NAME_FINAL_APOSTROPHE}`, "y");
 // The compound-line rule, the same in every scrubber: a quoted value ends at its closing quote; an
 // unquoted cookie or header value, and a quoted one that is never closed, ends at the `;` or `,` that
@@ -177,11 +192,30 @@ const GENERIC_CREDENTIAL_HEADER = String.raw`x-[a-z0-9-]*(?:key|token|secret|aut
 const CREDENTIAL_HEADER_PATTERN = new RegExp(String.raw`${NAME_START}(${CREDENTIAL_HEADER_NAMES.join("|")}|${GENERIC_CREDENTIAL_HEADER})\b${NAME_CLOSE_AND_SEPARATOR}`, "gi");
 const HEADER_DESCRIPTOR_SUFFIX_PATTERN = /-(?:type|mode|scheme|method|status|version|timeout|ttl|expires|expiry|expiration|count|limit|name|url|uri|endpoint|header)$/i;
 
-// A scheme word in front of a header or pair value (`Authorization: Bearer <value>`, `"Bearer <value>"`)
-// is kept and the value after it goes; a scheme word with nothing after it (`Authorization: Bearer` at
-// the end of a line) is the whole value and stays. The spacing does not cross a line, so a scheme word
-// ending a line is not joined to the next line's first word.
-const VALUE_SCHEME_PATTERN = /(?:Bearer|Basic|Token|Digest|OAuth|Negotiate|NTLM|SSWS|ApiKey|Api-Key|Splunk)(?![A-Za-z0-9_-])[ \t]*/iy;
+// A scheme word in front of a header value (`Authorization: Bearer <value>`, `"Bearer <value>"`), in
+// any casing, is kept and the value after it goes whatever its shape (the header names the
+// credential, so a name-shaped value after `Negotiate` or `Snowflake` goes too); a scheme word with
+// nothing after it (`Authorization: Bearer` at the end of a line) is the whole value and stays. The
+// spacing does not cross a line, so a scheme word ending a line is not joined to the next line's
+// first word. A scheme spelling that "=" follows is the name of a param, not a scheme (`X-Api-Key:
+// Token="<v>"`, `client_token: Token="<v>"`; see `readAuthParamList`). Under a credential-named pair
+// the scheme word is part of the value (see `readCarrierValue`).
+const VALUE_SCHEME_PATTERN = /(?:Bearer|Basic|Token|Digest|OAuth|Negotiate|NTLM|SSWS|ApiKey|Api-Key|Splunk|Snowflake|AWS4-HMAC-SHA256)(?![A-Za-z0-9_-])(?![ \t]*=)[ \t]*/iy;
+// The auth-params of a credential (RFC 7235: after the scheme word stand either one token68 or a
+// comma-separated list of `name=value` and `name="value"` params; see `readAuthParamList`). A param
+// name is a word of letters, digits, "_", "-", and "." that is not token-cased (`isAuthParamName`),
+// and a quoted param value begins like a credential, so a base64 value whose one padding "=" a quote
+// happens to follow (`'Authorization: Basic <base64>=' then ...`) is neither a name nor a param. A
+// bare param value runs to the next ",", space, or quote; ";" is content there (SigV4's
+// `SignedHeaders=host;x-amz-date`) unless it introduces the next header of a compound line (see
+// `FOLLOWING_HEADER_PATTERN`).
+const AUTH_PARAM_NAME = String.raw`[A-Za-z][A-Za-z0-9_.-]{0,63}`;
+const AUTH_PARAM_KEY_PATTERN = new RegExp(String.raw`^${AUTH_PARAM_NAME}=$`);
+// A name and a bare value in one run; the value does not begin with "=", so a base64 value's padding
+// (`dXNlcjpwYXNz==`) names no param.
+const AUTH_PARAM_KEYED_RUN_PATTERN = new RegExp(String.raw`^(${AUTH_PARAM_NAME})=[^=]`);
+const AUTH_PARAM_NEXT_PATTERN = new RegExp(String.raw`[ \t]*,[ \t]*(${AUTH_PARAM_NAME})=`, "y");
+const AUTH_PARAM_BARE_VALUE_PATTERN = /[^\s,"'<>()[\]{}\\]+/y;
 // A bare header value runs to the first character that ends a header value in free text; a bare pair
 // value also stops at "&" and the closing brackets of a JSON or query fragment. A backslash ends both
 // so a JSON-escaped closing quote is kept, and neither can begin at "[" so the marker is never a value.
@@ -201,26 +235,31 @@ const ENCLOSING_STRING_CLOSE_PATTERN = /^[}\],]/;
 const JSON_LITERAL_PATTERN = /^(?:null|true|false)$/;
 
 // Authorization schemes in free text (`Bearer <value>`, `Basic <base64>`, Okta `SSWS`, GitHub `Token`,
-// Splunk `Splunk`): the value goes whatever its casing or entropy unless it is one plain word, which
-// is prose ("Basic authentication is disabled", "Token request failed", "OAuth bearer token", "Splunk
-// Enterprise"). The exemption is derived from the fixed texts the integrations emit after these
-// words (121 distinct continuations across every integration source): every one is a single word of
-// letters in one casing (the longest, "authentication", has 14) or a hyphenated compound of lowercase
-// words ("OAuth sign-in", "OAuth service-app"), a dotted version ("OAuth 2.0"), or an auth-param of a
-// challenge (`Bearer realm="api"`, `error="invalid_token"`). A value with a digit, a symbol, or mixed
-// casing inside a word is never prose. "token", "basic", "digest", "oauth", and "splunk" in lowercase
-// are English words as often as schemes ("token canary-noexpiry-token-zq has no expiry" names a
-// LaunchDarkly token; "basic authentication is disabled"), yet a peer's error text may spell a scheme
-// in lowercase (Codex P1 on #78: "replayed basic dXNlcjpwYXNz upstream"), so the lowercase spellings
-// are weaker carriers: the value goes only when it cannot be a word or a name, that is when it carries
-// a digit, a symbol, or mixed casing inside the word, and is at least `LOWERCASE_SCHEME_VALUE_MIN_LENGTH`
-// characters (main's floor at 02967cc); a word in either casing or a hyphenated lowercase compound of
-// any length after them is prose. Every one of the 103 distinct continuations after these spellings in
-// the sources is prose under this rule. A quoted value is delimited by its quotes and goes whole when
-// it begins like a credential; in `"Basic ", "token"` inside a JSON document the quote after the
-// scheme word closes one string rather than opening a value.
-const SCHEME_WORD_PATTERN = new RegExp(String.raw`${NAME_START}(?:Bearer|BEARER|bearer|Basic|BASIC|basic|Token|TOKEN|token|Digest|digest|OAuth|oauth|Negotiate|NTLM|SSWS|ApiKey|Apikey|apikey|APIKEY|Api-Key|api-key|Splunk|splunk)[ \t]+`, "g");
-const LOWERCASE_SCHEME_WORDS = new Set(["basic", "token", "digest", "oauth", "splunk"]);
+// Splunk `Splunk`, Snowflake `Snowflake`, SigV4 `AWS4-HMAC-SHA256`), in any casing (a peer's error text
+// or a log may spell one `BEARER`, `bEaReR`, `negotiate`, or `API-KEY`; 01:40 ruling, row B): the value
+// goes whatever its casing or entropy unless it is one plain word, which is prose ("Basic
+// authentication is disabled", "Token request failed", "OAuth bearer token", "Splunk Enterprise"). The
+// exemption is derived from the fixed texts the integrations emit after these words (121 distinct
+// continuations across every integration source): every one is a single word of letters in one
+// casing (the longest, "authentication", has 14) or a hyphenated compound of lowercase words ("OAuth
+// sign-in", "OAuth service-app"), a dotted version ("OAuth 2.0"), or an auth-param of a challenge
+// (`Bearer realm="api"`, `error="invalid_token"`). A value with a digit, a symbol, or mixed casing
+// inside a word is never prose. "token", "basic", "digest", "oauth", "splunk", "negotiate", and
+// "snowflake" in lowercase are English words as often as schemes ("token canary-noexpiry-token-zq has
+// no expiry" names a LaunchDarkly token; "basic authentication is disabled"; "failed to negotiate
+// tls"), yet a peer's error text may spell a scheme in lowercase (Codex P1 on #78: "replayed basic
+// dXNlcjpwYXNz upstream"), so the lowercase spellings of the English words are weaker carriers: the
+// value goes only when it cannot be a word or a name, that is when it carries a digit, a symbol, or
+// mixed casing inside the word, and is at least `LOWERCASE_SCHEME_VALUE_MIN_LENGTH` characters (main's
+// floor at 02967cc); a word in either casing or a hyphenated lowercase compound of any length after
+// them is prose. Every one of the 103 distinct continuations after these spellings in the sources is
+// prose under this rule. Every other spelling (`Bearer`, `bearer`, `TOKEN`, `tOkEn`, `ntlm`, `ssws`,
+// `apikey`, `api-key`, `aws4-hmac-sha256`) is a scheme, not a word, and carries under the plain-word
+// exemption alone. A quoted value is delimited by its quotes and goes whole when it begins like a
+// credential; in `"Basic ", "token"` inside a JSON document the quote after the scheme word closes
+// one string rather than opening a value.
+const SCHEME_WORD_PATTERN = new RegExp(String.raw`${NAME_START}(?:Bearer|Basic|Token|Digest|OAuth|Negotiate|NTLM|SSWS|ApiKey|Api-Key|Splunk|Snowflake|AWS4-HMAC-SHA256)(?![A-Za-z0-9_-])[ \t]+`, "gi");
+const LOWERCASE_SCHEME_WORDS = new Set(["basic", "token", "digest", "oauth", "splunk", "negotiate", "snowflake"]);
 const SCHEME_BARE_VALUE_PATTERN = /[A-Za-z0-9][A-Za-z0-9._~+/=-]{3,}/y;
 const SCHEME_VALUE_MIN_LENGTH = 4;
 const LOWERCASE_SCHEME_VALUE_MIN_LENGTH = 8;
@@ -229,6 +268,16 @@ const PLAIN_WORD_PATTERN = /^(?:[A-Z]?[a-z]+(?:-[a-z]+)*|[A-Z]+)$/;
 const PLAIN_WORD_MAX_LENGTH = 20;
 const VERSION_PATTERN = /^\d+(?:\.\d+)+$/;
 const AUTH_PARAM_PATTERN = /^(?:realm|error|error_description|error_uri|scope|charset|algorithm|qop|stale|domain|opaque|title|resource|client_id|authorization_uri|as_uri|ticket)=/i;
+// The auth-params that carry a proof or a credential, read as the final segment of the param name
+// (`response`, `oauth_signature`, `X-Amz-Signature`, `client_secret`, `access_token`, `Token`): a
+// Digest `response`, an OAuth 1 `oauth_signature`, a `mac`, an HMAC `sig` or `hmac`, and the
+// credential words. A list that holds one is a credential whatever param it begins with, so the
+// challenge exemption (`AUTH_PARAM_PATTERN`) does not reach it (CodeRabbit r4081776771 on #81:
+// `Digest realm="api", nonce="n", response="<proof>"` kept its proof because the list began with
+// `realm=`, and no pair rule names `response`). A name that only begins with one of these words is a
+// setting or an identifier and names no proof (`oauth_signature_method`, `token_type`, `key_id`,
+// `keyId`), as are a challenge's `nonce`, `opaque`, and `cnonce`.
+const PROOF_PARAM_WORDS = new Set(["response", "signature", "sig", "mac", "hmac", "token", "password", "secret", "key", "apikey", "assertion"]);
 
 // Credential-named pairs in prose, headers, query strings, and JSON fragments: the key and separator
 // stay, the value goes whatever its shape (coordinator ruling on the Codex P2: any nonempty value
@@ -238,8 +287,9 @@ const AUTH_PARAM_PATTERN = /^(?:realm|error|error_description|error_uri|scope|ch
 // `InvalidAuthenticationToken`) are handled by the generic pair rule below under the same ruling,
 // with the one prose exemption described there, and a compound key whose final segment is a setting
 // suffix (`token_url`, `auth_method`, `client_id`) is a setting, not a credential key (see
-// `SETTING_SUFFIXES`). The secret id (`secret_id`, `VAULT_SECRET_ID`, `role_secret_id`) is a bearer
-// name like the session names, so it is explicit here with any prefix and takes any value.
+// `SETTING_SUFFIXES`). The bearer ids (`secret_id`, `VAULT_SECRET_ID`, `role_secret_id`, `token_id`)
+// are bearer names like the session names, so they are explicit here with any prefix and take any
+// value, the prose exemption never applying to them.
 const CREDENTIAL_PAIR_NAMES: readonly string[] = [
   "api[_-]?key",
   "app[_-]?key",
@@ -255,6 +305,7 @@ const CREDENTIAL_PAIR_NAMES: readonly string[] = [
   "passcode",
   "secret",
   "[a-z0-9_-]*secret[_-]?id",
+  "[a-z0-9_-]*token[_-]?id",
   "token",
   "access[_-]?token",
   "refresh[_-]?token",
@@ -299,7 +350,20 @@ const CREDENTIAL_PAIR_PATTERN = new RegExp(String.raw`${NAME_START}(?:${CREDENTI
 // `admin_password:` is a credential as much as an issued token). The separator is captured because
 // the one exemption, a value that continues as prose, is read only after `Key: ` (see
 // `continuesAsProse`); `=` is an assignment and its value is always the credential.
-const GENERIC_PAIR_KEY_PATTERN = new RegExp(String.raw`${NAME_START}([A-Za-z][A-Za-z0-9_.-]{0,63})\b(?:\\*["'])?(\s*[:=]\s*)`, "g");
+// The key of this rule may also start after "-" or "/", and after the `-D` of a Java system property
+// (reviewer #78 row D: a spawned CLI echoes its flags, `mysql --password=<value> -h db`,
+// `java -Dpassword=<value>`, `java -Dspring.datasource.password=<value>`, and a path segment carries a
+// pair, `path/password=<value>`, `/password=<value>`). `=` after a credential-named segment is a pair
+// whatever precedes the name; `:` after a path segment removes a single-token value (`kv/password:
+// <value>`) and keeps a prose continuation under the exemption (`/api/v1/api-tokens: request failed
+// with 403` stays whole). A "." still joins a dotted key, which is read whole (`settings.token`,
+// `Dspring.datasource.password`), and a JSON escape is a boundary as under `NAME_START`.
+const PAIR_KEY_START = String.raw`(?:(?<![A-Za-z0-9_.])|(?<=\\[nrtbfv/]|\\u[0-9A-Fa-f]{4})|(?<=(?<![A-Za-z0-9_])-D))`;
+const GENERIC_PAIR_KEY_PATTERN = new RegExp(String.raw`${PAIR_KEY_START}([A-Za-z][A-Za-z0-9_.-]{0,63})\b(?:\\*["'])?(\s*[:=]\s*)`, "g");
+// A long flag whose argument follows after a space (`psql --password <value> -h db`, row D): the flag
+// keeps its name and the argument goes when the name is a credential key and the argument is not the
+// next flag. The `--name=value` spelling is the generic pair above.
+const FLAG_ARGUMENT_PATTERN = /(?<![A-Za-z0-9_-])--([A-Za-z][A-Za-z0-9_.-]{0,63})[ \t]+(?!-)/g;
 // The prose exemption of the generic pair rule: a value continues as prose when it is one plain word
 // of letters (lowercase or capitalised, at most `PROSE_WORD_MAX_LENGTH` letters) or a count of at
 // most five digits, followed on the same line by a space and another word, number, or parenthesis,
@@ -366,25 +430,34 @@ const EXTRA_CREDENTIAL_KEY_SEGMENTS = new Set(["sid", "sig", "pwd", "passwd", "p
 // `auth_method=client_secret`, `token_endpoint=<url>`, `oauth_signature_method=HMAC-SHA1`,
 // `secret_name`, `private_key_path`, `credentials_file`, `token_limit`), as does a threshold
 // (`max_keys`, `min_password_length`) and an identifier (`client_id`, `api_key_id`, `tenant_id`,
-// `key_name`). Its value stays unless it is token-shaped (the long-token decision, which the data
-// scrubs apply to the value under such a key even though their long-token rule is otherwise off, so
-// a 40-character `private_key_id` still goes) or a registered secret, and a URL value passes the URL
-// rule like any other (userinfo and query removed, path kept). Three families stay credential keys
-// whatever their suffix: the webhook and callback keys (`webhook*`, `*hook_url`, `callback_url`; rule
-// 9 names webhook URLs with embedded tokens, `webhook_url=https://hooks.example.com/services/<token>`
-// loses its whole value); the session identifiers (`session_id`, `sid`, `PHPSESSID`,
-// `ASP.NET_SessionId`), which are bearer credentials, not identifiers, and are explicit credential
-// pair names; and the secret id (`secret_id`, `VAULT_SECRET_ID`, `role_secret_id`, `secretId`), the
-// Vault AppRole bearer half whose UUID shape keeps it off the long-token rule, so the key alone must
-// carry it (CodeRabbit on #78; main redacted it through the `secret` word). The two identifier
-// families the suffix rule keeps are the ones whose value names something (`client_id`, `key_id`,
-// `access_key_id`, `tenant_id`, `private_key_id`, `secret_name`, `user_name`). The three patterns read
-// the key in its segment form (`webhookUrl` and `WEBHOOK_URL` are `webhook_url`).
-const SETTING_SUFFIXES = new Set(["url", "uri", "endpoint", "method", "algorithm", "audience", "issuer", "shape", "type", "mode", "path", "file", "dir", "limit", "count", "id", "name", "days", "hours", "minutes", "seconds"]);
+// `key_name`). The lifetime, use-count, network, and accessor settings a Vault AppRole assessment
+// reports beside the bearer keys are settings too (`secret_id_ttl`, `token_max_ttl`,
+// `secret_id_num_uses`, `token_num_uses`, `secret_id_bound_cidrs`, `token_bound_cidrs`,
+// `secret_id_accessor`, `token_accessor`; a Vault accessor is a UUID that looks a token up and never
+// authenticates; review of #78, 01:40 rulings). Its value stays unless it is token-shaped (the
+// long-token decision, which the data scrubs apply to the value under such a key even though their
+// long-token rule is otherwise off, so a 40-character `private_key_id` still goes) or a registered
+// secret, and a URL value passes the URL rule like any other (userinfo and query removed, path kept).
+// Three families stay credential keys whatever their suffix: the URL-valued webhook and callback keys
+// (`webhook`, `webhooks`, `slack_webhook`, `webhook_url`, `webhook_uri`, `webhook_endpoint`,
+// `webhook_path`, `*hook_url`, `callback_url`; rule 9 names webhook URLs with embedded tokens,
+// `webhook_url=https://hooks.example.com/services/<token>` loses its whole value; a webhook setting
+// whose value is not the URL, `webhook_count`, `webhook_id`, `webhook_name`, is a setting like any
+// other); the session identifiers (`session_id`, `sid`, `PHPSESSID`, `ASP.NET_SessionId`), which are
+// bearer credentials, not identifiers, and are explicit credential pair names; and the bearer ids
+// (`secret_id`, `VAULT_SECRET_ID`, `role_secret_id`, `secretId`, the Vault AppRole bearer half whose
+// UUID shape keeps it off the long-token rule, and `token_id`, `tokenId`, a token id that is the
+// token), so the key alone must carry the value (CodeRabbit on #78; main redacted the secret id
+// through the `secret` word). The two identifier families the suffix rule keeps are the ones whose
+// value names something (`client_id`, `key_id`, `access_key_id`, `tenant_id`, `private_key_id`,
+// `secret_name`, `user_name`). The three patterns read the key in its segment form (`webhookUrl` and
+// `WEBHOOK_URL` are `webhook_url`).
+const SETTING_SUFFIXES = new Set(["url", "uri", "endpoint", "method", "algorithm", "audience", "issuer", "shape", "type", "mode", "path", "file", "dir", "limit", "count", "id", "name", "days", "hours", "minutes", "seconds", "ttl", "uses", "cidrs", "accessor"]);
 const THRESHOLD_KEY_PATTERN = /^(?:max|min)[_-]/i;
-const WEBHOOK_KEY_PATTERN = /(?:^|_)webhooks?(?:_|$)|hook_url$|callback_url$/;
+const WEBHOOK_KEY_PATTERN = /(?:^|_)webhooks?(?:_(?:url|uri|endpoint|address|link|path))?$|hook_url$|callback_url$/;
 const SESSION_ID_KEY_PATTERN = /(?:^|_)(?:sid|sessid|jsessionid|phpsessid|session_id)$/;
-const SECRET_ID_KEY_PATTERN = /secret_id$/;
+const BEARER_ID_KEY_PATTERN = /(?:secret|token)_id$/;
+const AUTHORIZATION_KEY_PATTERN = /(?:^|_)authorization$/;
 const EXTRA_CREDENTIAL_KEYS = new Set([
   "x-amz-signature",
   "x-amz-credential",
@@ -436,27 +509,43 @@ function isSettingKey(key: string): boolean {
  * True when a name in a query string, header, or name-value pair carries a credential: the Flue
  * argument-key heuristic (`token`, `secret`, `password`, `api_key`, `authorization`, `cookie`, ...)
  * plus the bare and signed-URL names it does not cover. A key whose final segment is a setting suffix
- * (`token_url`, `auth_method`, `client_id`, `credentials_file`, see `SETTING_SUFFIXES`) is a setting
- * and is not a credential key; the webhook and callback keys, the session identifiers, and a key
- * ending in `secret_id` (any prefix, casing, or separator) are credential keys whatever their suffix.
+ * (`token_url`, `auth_method`, `client_id`, `credentials_file`, `secret_id_ttl`, see
+ * `SETTING_SUFFIXES`) is a setting and is not a credential key; the URL-valued webhook and callback
+ * keys, the session identifiers, and a key ending in `secret_id` or `token_id` (any prefix, casing,
+ * or separator) are credential keys whatever their suffix.
  */
 export function isCredentialKey(key: string): boolean {
   const joined = keySegments(key).join("_");
-  if (WEBHOOK_KEY_PATTERN.test(joined) || SESSION_ID_KEY_PATTERN.test(joined) || SECRET_ID_KEY_PATTERN.test(joined)) return true;
+  if (WEBHOOK_KEY_PATTERN.test(joined) || SESSION_ID_KEY_PATTERN.test(joined) || BEARER_ID_KEY_PATTERN.test(joined)) return true;
   if (isSettingKey(key)) return false;
   return namesCredential(key);
 }
 
 /**
+ * An Authorization-style key the generic pair rule reads (`Authorization`, `Proxy-Authorization`, or one
+ * glued to a non-JSON escape, `x0aAuthorization`): the scheme word in front of its value names the
+ * scheme and stays, as under the header rule (CodeRabbit r4078025849 on #63: the scheme-word branches
+ * apply to Authorization-style keys, a credential-named pair loses the scheme word with its value).
+ */
+function isAuthorizationKey(key: string): boolean {
+  return AUTHORIZATION_KEY_PATTERN.test(keySegments(key).join("_"));
+}
+
+/**
  * A setting whose earlier segments name a credential (`token_url`, `BOX_AUTH_METHOD`, `private_key_id`,
- * `api_key_name`): the value is a setting and stays, except that a token-shaped run inside it goes
- * under every scrub, the data scrubs included (see `SETTING_SUFFIXES`). A key the bearer overrides
- * keep as a credential key (`session_id`, `secret_id`) is never a setting.
+ * `api_key_name`) or a webhook (`webhook_count`, `webhook_id`, `webhook_name`, `slack_webhook_id`; see
+ * `WEBHOOK_KEY_PATTERN`): the value is a setting and stays, except that a token-shaped run inside it
+ * goes under every scrub, the data scrubs included (see `SETTING_SUFFIXES`). The webhook settings
+ * were credential keys on `main` before the 01:40 ruling made them settings, so a token-shaped value
+ * under one goes as it did there while `webhook_count=3` and `webhook_name=deploy-hook` stay. A key
+ * the bearer overrides keep as a credential key (`session_id`, `secret_id`) is never a setting.
  */
 function isCredentialWordSetting(key: string): boolean {
   if (!isSettingKey(key) || isCredentialKey(key)) return false;
   const segments = keySegments(key);
-  return segments.length > 1 && namesCredential(segments.slice(0, -1).join("_"));
+  if (segments.length < 2) return false;
+  const stem = segments.slice(0, -1).join("_");
+  return namesCredential(stem) || WEBHOOK_KEY_PATTERN.test(stem);
 }
 
 /**
@@ -653,8 +742,12 @@ interface ValueReplacement {
 type ValueReader = (text: string, valueStart: number, carrier: RegExpExecArray) => ValueReplacement | null;
 
 function stickyExec(pattern: RegExp, text: string, index: number): string | null {
+  return stickyMatch(pattern, text, index)?.[0] ?? null;
+}
+
+function stickyMatch(pattern: RegExp, text: string, index: number): RegExpExecArray | null {
   pattern.lastIndex = index;
-  return pattern.exec(text)?.[0] ?? null;
+  return pattern.exec(text);
 }
 
 /**
@@ -725,33 +818,70 @@ function readBareValue(text: string, index: number, barePattern: RegExp): string
 
 /**
  * Reads the value of a header or credential-named pair: a quoted value goes whole up to its closing
- * quote with the quotes and a leading scheme word kept (`"Bearer value"` becomes `"Bearer
- * [REDACTED]"`); a bare value may carry a scheme word in front of it and then either a quoted value
- * (`Bearer "value"`) or a bare run. A bare run is kept when `keepBare` says so (the generic pair
- * rule's prose exemption, which reads the word after a scheme word too so `token_type: Bearer token
- * expected` stays); a quoted value is never prose.
+ * quote with the quotes kept; a bare value may carry a scheme word in front of it and then either a
+ * quoted value (`Bearer "value"`) or a bare run.
+ *
+ * The scheme word is treated by the carrier (CodeRabbit r4078025849 on #63, the scheme-word order).
+ * Under a header (`keepScheme`) it names the scheme and stays: `Authorization: Bearer <value>` becomes
+ * `Authorization: Bearer [REDACTED]`, `"Bearer value"` becomes `"Bearer [REDACTED]"`, and a scheme
+ * word alone, or one that only a marker follows, is left as it is. Under a credential-named pair or
+ * flag it is the start of the value, whatever the casing: `password=Bearer rejected`,
+ * `sslPassword=splunk rejected`, `db_password: token`, `password="Bearer rejected"`, and `"password":
+ * "Basic"` lose the scheme word and the run after it as one value (`password=[REDACTED]`), and the
+ * prose exemption never applies to a value that starts with one (`client_token: Bearer abcdef` is a
+ * header-like rendering whose token is `abcdef`). A scheme word that only a marker follows is text
+ * an earlier rule scrubbed (`Authorization: Bearer [REDACTED]` seen again by the generic rule) and is
+ * left as it is. A bare run without a scheme word is kept when `keepBare` says so (the generic pair
+ * rule's prose exemption); a quoted value is never prose.
+ *
+ * A bare run that begins an auth-param list is read with the list (see `readAuthParamList`,
+ * CodeRabbit r4081238237 on #81). Under a header the list is the credential after the scheme word:
+ * one quoted param keeps its name and quotes (`Authorization: Snowflake Token="[REDACTED]"`,
+ * `X-Api-Key: Token="[REDACTED]"`), a longer list goes whole (`Authorization: Digest [REDACTED]`,
+ * `Authorization: AWS4-HMAC-SHA256 [REDACTED]`, `Authorization: OAuth [REDACTED]`), and a bare run
+ * goes whole as before (`Authorization: Snowflake Token=<v>` renders `Authorization: Snowflake
+ * [REDACTED]`). Under a credential-named pair or flag a quoted param goes with the rest of the value
+ * (`password=Token="<v>"` and `--password Token="<v>"` render `password=[REDACTED]` and `--password
+ * [REDACTED]`) and the list is not walked, a pair's value being one value; a compound key's value
+ * that begins that way (`client_token: Snowflake Token="<v>"`) has been read by the explicit pair
+ * rule at `Token=` first and renders `client_token: Snowflake Token="[REDACTED]"`.
  */
-function readCarrierValue(text: string, valueStart: number, barePattern: RegExp, keepBare?: (value: string, valueEnd: number) => boolean): ValueReplacement | null {
+function readCarrierValue(text: string, valueStart: number, barePattern: RegExp, keepBare?: (value: string, valueEnd: number) => boolean, keepScheme = true): ValueReplacement | null {
   const quoted = readQuotedValue(text, valueStart);
   if (quoted !== null) {
     if (!opensValue(text, quoted)) return null;
     const content = text.slice(quoted.start, quoted.end);
     const scheme = stickyExec(VALUE_SCHEME_PATTERN, content, 0) ?? "";
-    if (isBlankOrScrubbed(content.slice(scheme.length))) return null;
-    return { end: quoted.after, replacement: `${quoted.open}${scheme}${REDACTED}${quoted.close}` };
+    const rest = content.slice(scheme.length);
+    if (keepScheme) {
+      if (isBlankOrScrubbed(rest)) return null;
+      return { end: quoted.after, replacement: `${quoted.open}${scheme}${REDACTED}${quoted.close}` };
+    }
+    if (isBlankOrScrubbed(content) || (scheme.length > 0 && rest.trim().length > 0 && isBlankOrScrubbed(rest))) return null;
+    return { end: quoted.after, replacement: `${quoted.open}${REDACTED}${quoted.close}` };
   }
   const scheme = stickyExec(VALUE_SCHEME_PATTERN, text, valueStart) ?? "";
   const afterScheme = valueStart + scheme.length;
   const quotedAfterScheme = scheme.length > 0 ? readQuotedValue(text, afterScheme) : null;
-  if (quotedAfterScheme !== null) {
+  if (quotedAfterScheme !== null && (keepScheme || opensValue(text, quotedAfterScheme))) {
     if (!opensValue(text, quotedAfterScheme) || isBlankOrScrubbed(text.slice(quotedAfterScheme.start, quotedAfterScheme.end))) return null;
-    return { end: quotedAfterScheme.after, replacement: `${scheme}${quotedAfterScheme.open}${REDACTED}${quotedAfterScheme.close}` };
+    return keepScheme
+      ? { end: quotedAfterScheme.after, replacement: `${scheme}${quotedAfterScheme.open}${REDACTED}${quotedAfterScheme.close}` }
+      : { end: quotedAfterScheme.after, replacement: REDACTED };
   }
   const value = readBareValue(text, afterScheme, barePattern);
-  if (value === null) return null;
+  if (value === null) {
+    if (keepScheme || scheme.length === 0 || text.startsWith(REDACTED, afterScheme)) return null;
+    return { end: valueStart + scheme.trimEnd().length, replacement: REDACTED };
+  }
   const valueEnd = afterScheme + value.length;
-  if (keepBare?.(value, valueEnd)) return null;
-  return { end: absorbMarkers(text, valueEnd), replacement: `${scheme}${REDACTED}` };
+  if (scheme.length === 0 && keepBare?.(value, valueEnd)) return null;
+  const params = readAuthParamList(text, afterScheme, value, keepScheme);
+  if (params !== null) {
+    if (params.scrubbed) return null;
+    return { end: params.end, replacement: keepScheme ? `${scheme}${params.single?.rendering ?? REDACTED}` : REDACTED };
+  }
+  return { end: absorbMarkers(text, valueEnd), replacement: keepScheme ? `${scheme}${REDACTED}` : REDACTED };
 }
 
 /**
@@ -766,6 +896,114 @@ function absorbMarkers(text: string, index: number): number {
     else if ((text[cursor] === "?" || text[cursor] === "#") && text.startsWith(REDACTED, cursor + 1)) cursor += REDACTED.length + 1;
     else return cursor;
   }
+}
+
+interface AuthParamList {
+  /** Index just past the list and any marker glued to it. */
+  end: number;
+  /** True when no value in the list is live (each is the marker an earlier pass left), so there is nothing to replace. */
+  scrubbed: boolean;
+  /** For a list of one quoted param: the text inside its quotes and its rendering with the name and the quotes kept (`Token="[REDACTED]"`); null for a longer list. */
+  single: { content: string; rendering: string } | null;
+  /** True when a param of the list names a proof or a credential (see `PROOF_PARAM_WORDS`): the list is a credential whatever it begins with. */
+  proof: boolean;
+}
+
+/** A param name that is a word rather than a token-cased run (see `AUTH_PARAM_NAME`). */
+function isAuthParamName(name: string): boolean {
+  return !hasTokenCasing(name.replace(/[^A-Za-z]/g, ""));
+}
+
+/** A param name whose final segment is a proof or credential word (see `PROOF_PARAM_WORDS`). */
+function isProofParamName(name: string): boolean {
+  const segments = keySegments(name);
+  return segments.length > 0 && PROOF_PARAM_WORDS.has(segments[segments.length - 1]);
+}
+
+/** A value that is the marker an earlier pass left, with at most a non-value character after it (see `isBlankOrScrubbed`); blank is not scrubbed. */
+function isScrubbedMarker(value: string): boolean {
+  return value.trim().startsWith(REDACTED) && isBlankOrScrubbed(value);
+}
+
+/** Index just past a bare param value, cut before a ";" that introduces the next header of a compound line. */
+function authParamBareValueEnd(text: string, valueStart: number, bare: string): number {
+  for (let semicolon = bare.indexOf(";"); semicolon >= 0; semicolon = bare.indexOf(";", semicolon + 1)) {
+    if (stickyExec(FOLLOWING_HEADER_PATTERN, text, valueStart + semicolon) !== null) return valueStart + semicolon;
+  }
+  return valueStart + bare.length;
+}
+
+/**
+ * Reads the auth-param list that the bare run `run`, read at `start`, begins (CodeRabbit r4081238237
+ * on #81): `Authorization: Snowflake Token="<jwt>"` carries its credential as a quoted param, and the
+ * bare run stops at the quote, so a reader that replaced the run alone left the quoted value standing
+ * after the marker (`Snowflake [REDACTED]"<jwt>"`). The run is the first param when it is a param name
+ * and its "=" with the quoted value right after (`Token=` then `"<v>"`, `\"<v>\"`, `'<v>'`, closed or
+ * running to the line end), the quoted text beginning like a credential (a letter or digit, so the
+ * quote after a padded base64 value, `'Authorization: Basic <base64>=' then`, opens no param), or,
+ * with `walk`, when it is a name and a bare value in one (`Credential=<key id>/<scope>`) and another
+ * param follows. With `walk` the list continues over every `, name=value` or `, name="value"` after
+ * it: a Digest, OAuth 1, or SigV4 credential is the whole list, whose proof is computed over the
+ * other params, and goes as one marker; a list of one quoted param is a labelled credential and keeps
+ * its label (`Snowflake Token="[REDACTED]"`, `Bearer Token="[REDACTED]"`). Null when the run is not a
+ * param (a bare `name=value` alone is the run as before, so `Snowflake Token=<v>` and `Token
+ * token=<key>` still render `Snowflake [REDACTED]` and `Token [REDACTED]`), in which case the caller
+ * replaces the run; `scrubbed` when every value is already the marker (`Token="[REDACTED]"`, or
+ * `Token=[REDACTED]` where a configured secret was replaced first), so a rendering read again is left
+ * as it is. `proof` records whether any param of the list, the first included, names a proof or a
+ * credential (`response`, `oauth_signature`, `mac`, `token`; see `PROOF_PARAM_WORDS`), which the
+ * free-text reader uses to tell a Digest response led by `realm=` from a challenge (CodeRabbit
+ * r4081776771 on #81).
+ */
+function readAuthParamList(text: string, start: number, run: string, walk: boolean): AuthParamList | null {
+  let cursor = start + run.length;
+  let live = false;
+  let proof = false;
+  let single: AuthParamList["single"] = null;
+  if (AUTH_PARAM_KEY_PATTERN.test(run)) {
+    const name = run.slice(0, -1);
+    if (!isAuthParamName(name)) return null;
+    proof = isProofParamName(name);
+    if (text.startsWith(REDACTED, cursor)) {
+      cursor = absorbMarkers(text, cursor);
+    } else {
+      const quoted = readQuotedValue(text, cursor);
+      if (quoted === null || !opensValue(text, quoted)) return null;
+      const content = text.slice(quoted.start, quoted.end);
+      const scrubbed = isScrubbedMarker(content);
+      if (!scrubbed && !QUOTED_SCHEME_VALUE_START_PATTERN.test(content)) return null;
+      live = !scrubbed;
+      cursor = quoted.after;
+      single = { content, rendering: `${run}${quoted.open}${REDACTED}${quoted.close}` };
+    }
+  } else {
+    const keyed = AUTH_PARAM_KEYED_RUN_PATTERN.exec(run);
+    if (!walk || keyed === null || !isAuthParamName(keyed[1]) || stickyMatch(AUTH_PARAM_NEXT_PATTERN, text, cursor) === null) return null;
+    live = true;
+    proof = isProofParamName(keyed[1]);
+  }
+  let next: RegExpExecArray | null;
+  while (walk && (next = stickyMatch(AUTH_PARAM_NEXT_PATTERN, text, cursor)) !== null) {
+    if (!isAuthParamName(next[1])) break;
+    if (isProofParamName(next[1])) proof = true;
+    const valueStart = cursor + next[0].length;
+    const quoted = readQuotedValue(text, valueStart);
+    if (quoted !== null) {
+      if (!opensValue(text, quoted)) break;
+      if (!isScrubbedMarker(text.slice(quoted.start, quoted.end))) live = true;
+      cursor = quoted.after;
+    } else if (text.startsWith(REDACTED, valueStart)) {
+      // A bare value a pair rule has already replaced (`nonce=[REDACTED]`) is a param like any other,
+      // and the walk goes on past it to the params after it.
+      cursor = absorbMarkers(text, valueStart);
+    } else {
+      const bare = stickyExec(AUTH_PARAM_BARE_VALUE_PATTERN, text, valueStart);
+      cursor = bare === null ? valueStart : authParamBareValueEnd(text, valueStart, bare);
+      if (bare !== null && !isBlankOrScrubbed(bare)) live = true;
+    }
+    single = null;
+  }
+  return { end: absorbMarkers(text, cursor), scrubbed: !live, single, proof };
 }
 
 /**
@@ -789,22 +1027,42 @@ function readSettingValue(text: string, valueStart: number): ValueReplacement | 
 
 /** A credential header's value, unless the header name says the value is a descriptor (`...-token-type`). */
 const readHeaderValue: ValueReader = (text, valueStart, carrier) => (HEADER_DESCRIPTOR_SUFFIX_PATTERN.test(carrier[1]) ? null : readCarrierValue(text, valueStart, HEADER_BARE_VALUE_PATTERN));
-const readPairValue: ValueReader = (text, valueStart) => readCarrierValue(text, valueStart, PAIR_BARE_VALUE_PATTERN);
+/** An explicit credential pair's value: a scheme word in front of it is part of the value (see `readCarrierValue`). */
+const readPairValue: ValueReader = (text, valueStart) => readCarrierValue(text, valueStart, PAIR_BARE_VALUE_PATTERN, undefined, false);
+/** The argument of a long flag (`--password <value>`), when the flag names a credential (see `FLAG_ARGUMENT_PATTERN`). */
+const readFlagArgument: ValueReader = (text, valueStart, carrier) => (isCredentialKey(carrier[1]) ? readCarrierValue(text, valueStart, PAIR_BARE_VALUE_PATTERN, undefined, false) : null);
 
-/** Index just past a cookie pair's or attribute's value, which may be quoted. */
+/**
+ * Index just past a cookie pair's or attribute's value, which may be quoted. A bare run may hold "="
+ * and "#" (`theme=dark#sid=`); when it ends in "=" and a closed quoted value that begins with a value
+ * character stands right after it, the run names one more pair and that quoted value belongs to it
+ * (`theme=dark#sid=\"<v>\"`, review of #78 row E). A quote there that runs unterminated or encloses
+ * prose is the quote of a header line quoted whole (`'Cookie: sid=<base64>==' then ...`) and ends the
+ * value. A marker the URL rule left at the end of the value (`return_to=https://x/y?[REDACTED]`) is
+ * part of it, so the attributes or the later pairs after the marker are still read.
+ */
 function cookieValueEnd(text: string, index: number): number {
   const quoted = readQuotedValue(text, index);
-  if (quoted !== null) return quoted.after;
-  return index + (stickyExec(COOKIE_BARE_VALUE_PATTERN, text, index)?.length ?? 0);
+  if (quoted !== null) return absorbMarkers(text, quoted.after);
+  const bare = stickyExec(COOKIE_BARE_VALUE_PATTERN, text, index) ?? "";
+  let end = index + bare.length;
+  if (bare.endsWith("=")) {
+    const inner = readQuotedValue(text, end);
+    if (inner !== null && inner.close !== "" && stickyExec(COOKIE_VALUE_START_PATTERN, text, inner.start) !== null) end = inner.after;
+  }
+  return absorbMarkers(text, end);
 }
 
 /**
  * Reads a Cookie or Set-Cookie header value: quoted whole; `name=value` (spaces around "=" allowed)
  * followed by attributes (`; Path=/; HttpOnly`) whose values may themselves be quoted; or a bare run
- * after the singular header name. The whole header value is replaced by one marker, a marker an
- * earlier rule left at its end (`Cookie: &sid=[REDACTED]` after the query rule) folded in. The value
- * ends at ",", at a `; Name:` token (the next header on a compound line, which is never a cookie
- * attribute, so the ";" and the name stay for that header's own rule), or at the line end.
+ * after the singular header name. The whole header value is replaced by one marker, a marker the URL
+ * rule left in it (`Cookie: return_to=https://x/y?[REDACTED]; pref=<v>`) folded in with the pairs
+ * after it. The reader runs before the query-pair rule, so the ";" between pairs and attributes is
+ * read here alone and a pair whose name begins with "&" or "#" (`Cookie: &sid=<v>; pref=<v>`, review
+ * of #78 row E) is a cookie pair, not a query pair. The value ends at ",", at a `; Name:` token (the
+ * next header on a compound line, which is never a cookie attribute, so the ";" and the name stay for
+ * that header's own rule), or at the line end.
  */
 const readCookieHeaderValue: ValueReader = (text, valueStart, carrier) => {
   const quoted = readQuotedValue(text, valueStart);
@@ -835,7 +1093,21 @@ const readCookieHeaderValue: ValueReader = (text, valueStart, carrier) => {
  * Reads the value after a bare scheme word in free text: a quoted value goes whole when it begins like
  * a credential; a bare value goes unless it is one of the prose shapes (see `looksLikeSchemeValue`).
  * After a lowercase English-word spelling (`basic`, `token`, `digest`, `oauth`, `splunk`) a bare or
- * quoted value goes only when it cannot be a word or a name.
+ * quoted value goes only when it cannot be a word or a name. A marker an earlier rule left glued to
+ * the bare run is part of it: the pair rules run first and have turned `Token token=<key>` into
+ * `Token token=[REDACTED]`, so the run `token=` and its marker go as one (`Token [REDACTED]`) rather
+ * than as `[REDACTED][REDACTED]`. An auth-param list after the scheme word (see `readAuthParamList`)
+ * is read as under a header when its first param is not one of a challenge: `replayed Snowflake
+ * Token="<v>"` renders `replayed Snowflake Token="[REDACTED]"` and `OAuth oauth_consumer_key="<v>",
+ * oauth_token="<v>"` goes whole, while `Bearer realm="api", error="invalid_token"` is the prose of a
+ * challenge and stays (`AUTH_PARAM_PATTERN`); after a lowercase English word only a single quoted
+ * param goes, and only when its value cannot be a word or a name. A list that holds a proof param
+ * (`response`, `oauth_signature`, `mac`, `token`; see `PROOF_PARAM_WORDS`) is a credential whatever
+ * param it begins with and whatever the casing of the scheme word (CodeRabbit r4081776771 on #81):
+ * `Digest realm="api", nonce="n", response="<proof>"` goes whole (`Digest [REDACTED]`), as the same
+ * list does under a header and as a list led by `username=` does here, so the rendering does not
+ * depend on the order of the params, and `digest response="<proof>"` renders `digest
+ * response="[REDACTED]"`.
  */
 const readSchemeValue: ValueReader = (text, valueStart, carrier) => {
   const lowercaseScheme = LOWERCASE_SCHEME_WORDS.has(carrier[0].trim());
@@ -849,8 +1121,21 @@ const readSchemeValue: ValueReader = (text, valueStart, carrier) => {
   const bare = stickyExec(SCHEME_BARE_VALUE_PATTERN, text, valueStart);
   if (bare === null) return null;
   const value = bare.replace(CLAUSE_PUNCTUATION_PATTERN, "");
+  // A run the marker follows is the pair the pair rules have scrubbed and goes with its marker as one.
+  const list = text.startsWith(REDACTED, valueStart + value.length) ? null : readAuthParamList(text, valueStart, value, true);
+  if (list !== null) {
+    if (list.scrubbed || (!list.proof && AUTH_PARAM_PATTERN.test(value))) return null;
+    if (list.proof || !lowercaseScheme) return { end: list.end, replacement: list.single?.rendering ?? REDACTED };
+    // After a lowercase English word the list is not walked: its first quoted param alone goes, and only
+    // when its value cannot be a word or a name.
+    const params = readAuthParamList(text, valueStart, value, false);
+    if (params !== null) {
+      if (params.scrubbed || params.single === null || !looksLikeSchemeValue(params.single.content, true)) return null;
+      return { end: params.end, replacement: params.single.rendering };
+    }
+  }
   if (value.length < SCHEME_VALUE_MIN_LENGTH || !looksLikeSchemeValue(value, lowercaseScheme)) return null;
-  return { end: valueStart + value.length, replacement: REDACTED };
+  return { end: absorbMarkers(text, valueStart + value.length), replacement: REDACTED };
 };
 
 /**
@@ -878,7 +1163,7 @@ function replaceGenericCredentialPairs(text: string): string {
     const valueStart = match.index + whole.length;
     const credential = isCredentialKey(key);
     const read = credential
-      ? readCarrierValue(text, valueStart, PAIR_BARE_VALUE_PATTERN, (value, valueEnd) => continuesAsProse(text, separator, value, valueEnd))
+      ? readCarrierValue(text, valueStart, PAIR_BARE_VALUE_PATTERN, (value, valueEnd) => continuesAsProse(text, separator, value, valueEnd), isAuthorizationKey(key))
       : isCredentialWordSetting(key)
         ? readSettingValue(text, valueStart)
         : null;
@@ -899,7 +1184,8 @@ function replaceGenericCredentialPairs(text: string): string {
  * query strings, Cookie and Set-Cookie values, credential header values (Authorization,
  * Proxy-Authorization, x-api-key and the like, a scheme word in front of the value kept),
  * authorization scheme values in free text (Bearer, Basic, Digest, Token, OAuth, Negotiate, NTLM,
- * SSWS, ApiKey, Splunk), credential-named pairs in prose, headers, query strings, and JSON fragments
+ * SSWS, ApiKey, Splunk, Snowflake, AWS4-HMAC-SHA256, in any casing, the lowercase English words
+ * among them as weaker carriers), credential-named pairs in prose, headers, query strings, and JSON fragments
  * (the value whatever its shape, under the credential words themselves and under every compound or
  * env-style key `isCredentialKey` classifies, `DB_PASSWORD`, `client_token`, `clientToken`; the one
  * exemption is a plain word after `Key: ` that continues as prose, see `continuesAsProse`; a key whose
@@ -938,13 +1224,21 @@ export function scrubErrorText(text: string, options: ScrubErrorTextOptions = {}
   scrubbed = scrubbed
     .replace(PEM_BLOCK_PATTERN, REDACTED)
     .replace(PEM_OPEN_PATTERN, REDACTED)
-    .replace(EMBEDDED_URL_PATTERN, scrubEmbeddedUrl)
-    .replace(QUERY_PAIR_PATTERN, scrubQueryPair);
+    .replace(EMBEDDED_URL_PATTERN, scrubEmbeddedUrl);
+  // The cookie reader runs before the query-pair rule: the ";" between a cookie's pairs and attributes
+  // is its boundary alone, so a cookie pair whose name begins with "&" or "#" (`Cookie: &sid=<v>;
+  // pref=<v>`) is read whole here rather than as a query pair, and a query value keeps running through
+  // ";" (Codex r4080768613 on #81).
   scrubbed = replaceCarrierValues(scrubbed, COOKIE_HEADER_PATTERN, readCookieHeaderValue);
+  scrubbed = scrubbed.replace(QUERY_PAIR_PATTERN, scrubQueryPair);
   scrubbed = replaceCarrierValues(scrubbed, CREDENTIAL_HEADER_PATTERN, readHeaderValue);
-  scrubbed = replaceCarrierValues(scrubbed, SCHEME_WORD_PATTERN, readSchemeValue);
+  // The pair rules read a scheme word at the start of their value as the value (see `readCarrierValue`),
+  // so they run before the bare scheme-word rule, which would otherwise keep the word and leave
+  // `password=Bearer [REDACTED]` for them.
   scrubbed = replaceCarrierValues(scrubbed, CREDENTIAL_PAIR_PATTERN, readPairValue);
-  scrubbed = replaceGenericCredentialPairs(scrubbed)
+  scrubbed = replaceGenericCredentialPairs(scrubbed);
+  scrubbed = replaceCarrierValues(scrubbed, FLAG_ARGUMENT_PATTERN, readFlagArgument);
+  scrubbed = replaceCarrierValues(scrubbed, SCHEME_WORD_PATTERN, readSchemeValue)
     .replace(JWT_PATTERN, REDACTED)
     .replace(AWS_ACCESS_KEY_ID_PATTERN, REDACTED)
     .replace(AWS_SECRET_PATTERN, (run) => (looksLikeAwsSecret(run) ? REDACTED : run));

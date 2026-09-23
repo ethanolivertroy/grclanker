@@ -265,6 +265,55 @@ test("scheme-carried values are removed whatever their casing or entropy; the pr
   }
 });
 
+test("#78 row B: every scheme word carries in any casing on both sides, Snowflake and AWS4-HMAC-SHA256 included; a name-shaped value after a scheme word in a header goes, the scheme word as spelled stays", () => {
+  // Regression from main at 02967cc on the data side: `SCHEME_WORD_PATTERN` enumerated conventional
+  // spellings, so `replayed DIGEST <token>`, `bEaReR`, `negotiate`, `API-KEY` carried nothing. The
+  // pattern is case-insensitive now (01:40 ruling); the lowercase spellings of the English words
+  // (`basic`, `token`, `digest`, `oauth`, `splunk`, `negotiate`, `snowflake`) stay the weaker carriers.
+  const alternate = (word) => [...word].map((char, index) => (index % 2 === 0 ? char.toLowerCase() : char.toUpperCase())).join("");
+  const token = "YUVEiVuCTge5Xk7iTaMU2YHLgrPkg5bm";
+  const opaque = "c3ZjOndsa3RheXVkZAAA";
+  const nameShaped = "aaohkypvimed";
+  const schemes = ["Bearer", "Basic", "Token", "Digest", "OAuth", "Negotiate", "NTLM", "SSWS", "ApiKey", "Api-Key", "Splunk", "Snowflake", "AWS4-HMAC-SHA256"];
+  for (const scheme of schemes) {
+    for (const spelled of new Set([scheme, scheme.toLowerCase(), scheme.toUpperCase(), alternate(scheme)])) {
+      for (const value of [token, opaque, nameShaped]) {
+        for (const text of [`Authorization: ${spelled} ${value}`, `request failed\\/Authorization: ${spelled} ${value} see the log`, `request failed\nAuthorization: ${spelled} ${value}`]) {
+          const expected = text.replace(value, REDACTED);
+          for (const scrub of [scrubErrorText, scrubDataText, (t) => redactSecretValues(t)]) {
+            assert.equal(scrub(text), expected, JSON.stringify(text));
+          }
+        }
+      }
+      for (const value of [token, opaque]) {
+        const text = `replayed ${spelled} ${value} upstream`;
+        for (const scrub of [scrubErrorText, scrubDataText, (t) => redactSecretValues(t)]) {
+          assert.equal(scrub(text), `replayed ${spelled} ${REDACTED} upstream`, text);
+        }
+      }
+    }
+  }
+  // The prose exemption holds in every casing, and the lowercase English words take no word-shaped value.
+  for (const prose of [
+    "Bearer token is missing",
+    'BEARER realm="api"',
+    "failed to negotiate TLS with the upstream",
+    "the snowflake account was suspended",
+    "Snowflake account locked",
+    "NEGOTIATE authentication is disabled",
+    "token canary-noexpiry-token-zq has no expiry",
+    "Authorization: SNOWFLAKE",
+    "Authorization: aws4-hmac-sha256",
+  ]) {
+    assert.equal(scrubErrorText(prose), prose, prose);
+    assert.equal(scrubDataText(prose), prose, prose);
+  }
+  // A SigV4 header loses its whole auth-param list (credential scope, signed headers, and signature) and keeps the scheme word.
+  const sigv4 = "Authorization: AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/20260922/us-east-1/s3/aws4_request, SignedHeaders=host;x-amz-date, Signature=fe5f80f77d5fa3beca038a248ff027d0445342fe2855ddc963176630326f1024";
+  assert.equal(scrubErrorText(sigv4), `Authorization: AWS4-HMAC-SHA256 ${REDACTED}`);
+  assert.equal(scrubDataText(sigv4), `Authorization: AWS4-HMAC-SHA256 ${REDACTED}`);
+});
+
 test("credential-named pairs lose any nonempty value whatever its shape, compound and env-style keys included; the one exemption is a word that continues as prose", () => {
   // Codex P2 (credential-labelled pair with a short lowercase word value): guard 1 as written, no shape gate.
   for (const [text, expected] of [
@@ -313,7 +362,9 @@ test("credential-named pairs lose any nonempty value whatever its shape, compoun
     ["settings.token: enabled", `settings.token: ${REDACTED}`],
     ["secrets: truncated", `secrets: ${REDACTED}`],
     ["x-auth-header: legacy", `x-auth-header: ${REDACTED}`],
-    ["client_token: Bearer abcdef", `client_token: Bearer ${REDACTED}`],
+    // A scheme word in front of a credential-named pair's value is the start of the value and goes
+    // with it (CodeRabbit r4078025849 on #63); under a header it stays (see the header rows above).
+    ["client_token: Bearer abcdef", `client_token: ${REDACTED}`],
     ["client_token: Kq7Zx2Vw9Lm4Tp8R rejected", `client_token: ${REDACTED} rejected`],
     ["user_session: 0f9e8d7c6b5a4938 rejected", `user_session: ${REDACTED} rejected`],
     ["access_tokens: dGhpcyBpcyBh== rejected", `access_tokens: ${REDACTED} rejected`],
@@ -419,7 +470,9 @@ test("a carrier after a two-character JSON escape is recognised through every en
   ];
   // The escapes as the scrub sees them (two characters, or `\u` and four hex digits), then the
   // controls every escape must equal: a space, a raw line break, an escaped quote, an escaped backslash.
-  const escapes = ["\\n", "\\r", "\\t", "\\b", "\\f", "\\v", "\\r\\n", "\\u000a", "\\u001b"];
+  // `\/` is the JSON escape of the solidus (review of #78 row A): a carrier after it is caught as after
+  // any other escape, so `see \/tmp\/password=<value>` and `request failed\/X-Api-Key: <value>` go.
+  const escapes = ["\\n", "\\r", "\\t", "\\b", "\\f", "\\v", "\\/", "\\r\\n", "\\u000a", "\\u001b"];
   const controls = [" ", 'said \\"', "path C:\\\\"];
   const textScrubs = [
     ["scrubErrorText", (text) => scrubErrorText(text)],
@@ -505,6 +558,27 @@ test("a carrier after a two-character JSON escape is recognised through every en
     assert.equal(scrubErrorText(`request failed${escape}InvalidAuthenticationToken: Access token has expired.`), `request failed${escape}InvalidAuthenticationToken: Access token has expired.`, escape);
     assert.equal(scrubErrorText(`request failed${escape}UnauthorizedAccessException see the log`), `request failed${escape}UnauthorizedAccessException see the log`, escape);
     assert.equal(scrubErrorText(`request failed${escape}kq7zx2vw9lm4tp8 see the log`), `request failed${escape}kq7zx2vw9lm4tp8 see the log`, `${escape}: fifteen characters after the letter are not a long run`);
+  }
+});
+
+test("#78 row A: the escaped solidus is a carrier boundary in the forms the CLI-bridge and JSON bodies carry", () => {
+  // Regression from main at 02967cc: `\/` (the JSON escape of `/`) was not one of the escape boundaries,
+  // so a carrier after a JSON-escaped path segment leaked where main redacted it. `\/` is a boundary
+  // like every other escape, in the error scrub and the data scrubs alike.
+  const value = ERROR_CANARY.bearer;
+  const rows = [
+    [`request failed\\/X-Api-Key: ${value} see the log`, `request failed\\/X-Api-Key: ${REDACTED} see the log`],
+    [`request failed\\/Authorization: Bearer ${value}`, `request failed\\/Authorization: Bearer ${REDACTED}`],
+    [`path\\/client_token: ${value}`, `path\\/client_token: ${REDACTED}`],
+    [`{"detail":"see \\/tmp\\/password=${value}"}`, `{"detail":"see \\/tmp\\/password=${REDACTED}"}`],
+    [`config\\/api_key=${value} see log`, `config\\/api_key=${REDACTED} see log`],
+    // A prose word after the escape stays a boundary, not a value (as after a raw line break).
+    [`request headers\\/no token was sent`, `request headers\\/no token was sent`],
+  ];
+  for (const [text, expected] of rows) {
+    for (const scrub of [scrubErrorText, scrubDataText, (t) => redactSecretValues(t)]) {
+      assert.equal(scrub(text), expected, JSON.stringify(text));
+    }
   }
 });
 
@@ -730,6 +804,24 @@ test("URLs keep scheme, host, and path and lose userinfo, query, and fragment; b
   );
   assert.equal(scrubErrorText("GET /v1/users?api_key=abcdef123456&page=2&sig=zzzz9999 failed"), `GET /v1/users?api_key=${REDACTED}&page=2&sig=${REDACTED} failed`);
   assert.equal(scrubErrorText("open https://docs.example.com/guide/setup for details"), "open https://docs.example.com/guide/setup for details");
+  // #78 row C: a JSON encoder may write every "/" of a URL as `\/`; the slash-escaped URL is the same
+  // URL and loses its userinfo, query, and fragment with its escaped separators kept as written.
+  // Regression from main at 02967cc, where a backslash ended the URL before the userinfo was read.
+  const escapedHost = "api.example.com\\/v1\\/items";
+  for (const [text, expected] of [
+    [`upstream https:\\/\\/svc:${CANARY.basic}@${escapedHost} refused`, `upstream https:\\/\\/${escapedHost} refused`],
+    [`upstream https:\\/\\/svc:aaohkypvimed@${escapedHost} refused`, `upstream https:\\/\\/${escapedHost} refused`],
+    [`{"detail":"upstream https:\\/\\/svc:${CANARY.basic}@${escapedHost}?token=${CANARY.urlToken}&x=1 refused"}`, `{"detail":"upstream https:\\/\\/${escapedHost}?${REDACTED} refused"}`],
+    [`request url: proxy:\\/\\/svc:${CANARY.basic}@proxy.example.com:8080`, "request url: proxy:\\/\\/proxy.example.com:8080"],
+    [`{"url":"https:\\/\\/${escapedHost}?token=${CANARY.urlToken}#frag"}`, `{"url":"https:\\/\\/${escapedHost}?${REDACTED}#${REDACTED}"}`],
+    // A backslash that is not an escaped solidus still ends the URL, so the JSON-escaped closing quote stays.
+    [`{"detail":"see https:\\/\\/${escapedHost}\\" next"}`, `{"detail":"see https:\\/\\/${escapedHost}\\" next"}`],
+  ]) {
+    for (const scrub of [scrubErrorText, scrubDataText, (t) => redactSecretValues(t)]) {
+      assert.equal(scrub(text), expected, JSON.stringify(text));
+      assert.equal(scrub(expected), expected, `idempotent: ${JSON.stringify(text)}`);
+    }
+  }
 });
 
 test("describeErrorBody never echoes a body and keeps only documented message fields", () => {
@@ -938,19 +1030,37 @@ test("isCredentialKey covers the Flue heuristic plus bare and signed-URL names",
     "X-Snowflake-Authorization-Token-Type",
     "x-auth-mode",
     "min_password_length",
+    // Review of #78 (01:40 rulings): the Vault AppRole lifetime, use-count, network, and accessor
+    // settings, and a webhook setting whose value is not the URL.
+    "secret_id_ttl",
+    "secretIdTtl",
+    "token_max_ttl",
+    "TOKEN_TTL",
+    "secret_id_num_uses",
+    "token_num_uses",
+    "secret_id_bound_cidrs",
+    "token_bound_cidrs",
+    "secret_id_accessor",
+    "token_accessor",
+    "tokenAccessor",
+    "webhook_count",
+    "webhooks_limit",
+    "webhook_id",
+    "webhook_name",
   ]) {
     assert.ok(!isCredentialKey(key), `${key} names a setting`);
   }
-  for (const key of ["webhook_url", "webhookUrl", "WEBHOOK_URL", "webhook", "webhooks", "slack_webhook", "webhook_count", "slack_hook_url", "incoming-hook-url", "callback_url", "oauth_callback_url", "session_id", "sessionId", "user_session_id", "PHPSESSID", "JSESSIONID", "ASP.NET_SessionId", "sid"]) {
+  for (const key of ["webhook_url", "webhookUrl", "WEBHOOK_URL", "webhook_uri", "webhook_endpoint", "webhook_path", "webhook", "webhooks", "slack_webhook", "slack_hook_url", "incoming-hook-url", "callback_url", "oauth_callback_url", "session_id", "sessionId", "user_session_id", "PHPSESSID", "JSESSIONID", "ASP.NET_SessionId", "sid"]) {
     assert.ok(isCredentialKey(key), `${key} stays a credential key whatever its suffix`);
   }
   // CodeRabbit (#78) secret_id: the Vault AppRole secret id is the bearer half of the pair, so a key
-  // ending in `secret_id` is a credential key in any prefix, casing, or separator; the identifier half
-  // (`role_id`) and the other identifier keys stay settings.
-  for (const key of ["secret_id", "SECRET_ID", "VAULT_SECRET_ID", "role_secret_id", "secretId", "roleSecretId", "secret-id", "vault.approle.secret_id", "X-Vault-Secret-Id", "secretid"]) {
-    assert.ok(isCredentialKey(key), `${key} is the bearer secret id`);
+  // ending in `secret_id` is a credential key in any prefix, casing, or separator, as is a token id
+  // (`token_id`, the token itself; 01:40 rulings); the identifier half (`role_id`) and the other
+  // identifier keys stay settings.
+  for (const key of ["secret_id", "SECRET_ID", "VAULT_SECRET_ID", "role_secret_id", "secretId", "roleSecretId", "secret-id", "vault.approle.secret_id", "X-Vault-Secret-Id", "secretid", "token_id", "tokenId", "TOKEN_ID", "access_token_id", "X-Token-Id"]) {
+    assert.ok(isCredentialKey(key), `${key} is a bearer id`);
   }
-  for (const key of ["role_id", "VAULT_ROLE_ID", "roleId", "key_id", "access_key_id", "private_key_id", "secret_name", "client_id", "tenant_id", "user_name", "secret_id_count"]) {
+  for (const key of ["role_id", "VAULT_ROLE_ID", "roleId", "key_id", "access_key_id", "private_key_id", "secret_name", "client_id", "tenant_id", "user_name", "secret_id_count", "token_id_count", "id_token_url"]) {
     assert.ok(!isCredentialKey(key), `${key} is an identifier or a setting`);
   }
 });
