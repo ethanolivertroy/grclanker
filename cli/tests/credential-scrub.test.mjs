@@ -672,18 +672,35 @@ test("row (a), webhooks: a webhook or callback URL key stays a credential key wh
   for (const text of ['"webhook": "canary-insecure-hook-zq"', "webhook_name: nightly-sync", "webhooks: 3 configured, 1 insecure"]) {
     assert.equal(scrubber.scrub(text), text, `a webhook name is not a URL and stays: ${text}`);
   }
+  // On the data side the value is the origin alone, whatever the walker's own URL rule left of it: a rule that drops
+  // only the query would keep the path, and a walker with no URL rule would keep both.
+  const webhook = "https://svc:pw@hooks.example.com/services/T000/B000/abcdefghijkl?ts=1695000000&sig=mnopqrstuvwx";
+  const queryOnly = (text) => text.replace(/\?.*$/, `?${REDACTED}`);
+  const originOnly = (text) => (/^\s*https?:\/\//.test(text) ? `${new URL(text.trim()).protocol}//${new URL(text.trim()).host}` : text);
+  for (const options of [{}, { transformString: queryOnly }, { transformString: originOnly }]) {
+    const out = scrubber.scrubData({ id: "rec-4", webhook_url: webhook, name: "benign-sibling", hooks: [{ callbackUrl: ` ${webhook} ` }] }, options);
+    assert.deepEqual(out, { id: "rec-4", webhook_url: "https://hooks.example.com", name: "benign-sibling", hooks: [{ callbackUrl: "https://hooks.example.com" }] });
+  }
+  assert.deepEqual(scrubber.scrubData({ webhook_url: "https://hooks.example.com" }), { webhook_url: "https://hooks.example.com" }, "an origin is already reduced");
+  assert.deepEqual(scrubber.scrubData({ webhook_url: "https://[not a host/x" }), { webhook_url: REDACTED }, "a value that starts like a URL but does not parse becomes the marker");
+  assert.deepEqual(
+    scrubber.scrubData({ webhook_url: "hooks.example.com/services/T000/B000/abcdefghijkl", callbackUri: "/oauth/cb?code=abcdefghijkl", hook_url: "", webhook: "nightly-sync", webhooks: ["nightly-sync"] }),
+    { webhook_url: REDACTED, callbackUri: REDACTED, hook_url: "", webhook: "nightly-sync", webhooks: ["nightly-sync"] },
+    "a schemeless path under a URL-named webhook key becomes the marker, a blank stays blank, and a webhook name stays a name",
+  );
 });
 
-// The bearer-id override (CodeRabbit on #78, r4077259415): a key ending in `secret_id`, in any prefix, casing, and
-// separator, names a Vault AppRole secret id, which is a UUID the identifier rule would otherwise keep; it and the
-// session-id keys are credential keys on both sides before the setting-suffix test. Every other `_id`, `_name`, and
-// `_key_id` key the five modules read names a thing and keeps its value.
-const BEARER_ID_KEYS = ["secret_id", "VAULT_SECRET_ID", "role_secret_id", "secretId", "roleSecretId", "vault.secret_id", "SECRETID", "session_id", "sessionId", "sid", "sessid", "JSESSIONID", "PHPSESSID", "ASP.NET_SessionId"];
+// The bearer-id override (CodeRabbit on #78, r4077259415; `token_id` joined it in the 01:40 rulings, fail closed): a key
+// ending in `secret_id` or `token_id`, in any prefix, casing, and separator, names a Vault AppRole secret id or a token
+// id, which is a UUID the identifier rule would otherwise keep; they and the session-id keys are credential keys on
+// both sides before the setting-suffix test. Every other `_id`, `_name`, and `_key_id` key the five modules read names
+// a thing and keeps its value.
+const BEARER_ID_KEYS = ["secret_id", "VAULT_SECRET_ID", "role_secret_id", "secretId", "roleSecretId", "vault.secret_id", "SECRETID", "token_id", "tokenId", "access_token_id", "session_id", "sessionId", "sid", "sessid", "JSESSIONID", "PHPSESSID", "ASP.NET_SessionId"];
 
 /** The `_id`, `_name`, and `_key_id` keys the five modules read, config and vendor records included: all identifiers or settings. */
 const IDENTIFIER_KEYS = [
   "client_id", "BOX_CLIENT_ID", "clientId", "enterprise_id", "BOX_ENTERPRISE_ID", "enterpriseId", "subject_id", "BOX_SUBJECT_ID", "publicKeyId", "public_key_id", "BOX_PUBLIC_KEY_ID",
-  "key_id", "api_key_id", "access_key_id", "private_key_id", "secret_key_id", "tenant_id", "token_id", "tokenId", "account_id", "org_id", "member_id", "_id", "id",
+  "key_id", "api_key_id", "access_key_id", "private_key_id", "secret_key_id", "tenant_id", "account_id", "org_id", "member_id", "_id", "id",
   "campaign_id", "group_id", "pst_id", "store_purchase_id", "user_id", "policy_id", "rule_id", "space_id", "event_id", "request_id",
 ];
 const NAME_KEYS = ["secret_name", "tokenName", "token_name", "key_name", "role_name", "user_name", "policy_name", "space_name"];
@@ -691,12 +708,12 @@ const NAME_KEYS = ["secret_name", "tokenName", "token_name", "key_name", "role_n
 const BEARER_ID_UUID = "6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b";
 const BEARER_ID_CANARY = "Hq4vT9mXcR2pLw8ZbN6kJd3sVf7yGa5e";
 
-test("row (a), bearer ids: a key ending in secret_id or naming a session id is a credential key on both sides whatever its prefix, casing, and separator, before the setting-suffix test; every other _id, _name, and _key_id key stays an identifier or a setting", () => {
+test("row (a), bearer ids: a key ending in secret_id or token_id or naming a session id is a credential key on both sides whatever its prefix, casing, and separator, before the setting-suffix test; every other _id, _name, and _key_id key stays an identifier or a setting", () => {
   for (const key of BEARER_ID_KEYS) {
     assert.ok(isBearerIdKey(key), `expected a bearer id: ${key}`);
     assert.ok(isCredentialKey(key) && isCredentialDataKey(key) && !isIdentifierKey(key), `expected a credential key on both sides: ${key}`);
   }
-  assert.ok(isSettingKey("secret_id") && isSettingKey("VAULT_SECRET_ID"), "the id suffix still names a setting; the bearer-id override is checked first");
+  assert.ok(isSettingKey("secret_id") && isSettingKey("VAULT_SECRET_ID") && isSettingKey("token_id"), "the id suffix still names a setting; the bearer-id override is checked first");
   for (const key of [...IDENTIFIER_KEYS, ...NAME_KEYS]) {
     assert.ok(!isBearerIdKey(key) && !isCredentialKey(key) && !isCredentialDataKey(key), `expected an identifier or setting, not a credential key: ${key}`);
   }
@@ -704,9 +721,9 @@ test("row (a), bearer ids: a key ending in secret_id or naming a session id is a
   for (const key of NAME_KEYS) assert.ok(isSettingKey(key), `expected a setting key: ${key}`);
 });
 
-test("row (a), bearer ids: secret_id, VAULT_SECRET_ID, and role_secret_id lose a UUID, a random, and a human-chosen value in every pair form through every entry point, while client_id and the other identifiers keep a UUID", () => {
+test("row (a), bearer ids: secret_id, VAULT_SECRET_ID, role_secret_id, and token_id lose a UUID, a random, and a human-chosen value in every pair form through every entry point, while client_id and the other identifiers keep a UUID", () => {
   const values = [BEARER_ID_UUID, BEARER_ID_CANARY, "hunter2"];
-  const controls = ["client_id", "BOX_CLIENT_ID", "tenant_id", "enterprise_id", "key_id", "token_id", "account_id", "user_id"];
+  const controls = ["client_id", "BOX_CLIENT_ID", "tenant_id", "enterprise_id", "key_id", "api_key_id", "account_id", "user_id"];
   let cells = 0;
   for (const [entryLabel, entry] of ENTRY_POINTS) {
     for (const [formLabel, form] of PAIR_FORMS) {
@@ -900,6 +917,10 @@ const BOUNDARY_CARRIERS = [
   ["raw slash before a pair", (value) => `mount /password=${value} see the log`, ["mount /password=", " see the log"]],
   ["long flag", (value) => `mysql --password=${value} -h db.example.com`, ["mysql --password=", " -h db.example.com"]],
   ["short flag with a property key", (value) => `java -Dspring.datasource.password=${value} -jar app.jar`, ["java -Dspring.datasource.password=", " -jar app.jar"]],
+  ["short flag with a bearer-id key", (value) => `java -Dsecret_id=${value} -jar app.jar`, ["java -Dsecret_id=", " -jar app.jar"]],
+  ["short flag with a qualified key", (value) => `java -Dapi_key=${value} -jar app.jar`, ["java -Dapi_key=", " -jar app.jar"]],
+  ["short flag with a hyphenated key", (value) => `java -Dprivate-key=${value} -jar app.jar`, ["java -Dprivate-key=", " -jar app.jar"]],
+  ["short flag at line start", (value) => `-Dapi_key=${value}`, ["-Dapi_key="]],
   ["long flag with a hyphenated key", (value) => `vault login --vault-secret-id=${value} now`, ["vault login --vault-secret-id=", " now"]],
   ["backslash before a plain pair name", (value) => `note \\token=${value} end`, ["note \\token=", " end"]],
 ];
@@ -910,6 +931,7 @@ const BOUNDARY_KEPT = [
   "POST /oauth2/token: invalid_grant",
   "GET /_security/api_key?with_limited_by=true",
   "user-session: 3 active sessions",
+  "java -Duser.name=alice -Dtoken.file=/etc/app/token -jar app.jar",
   "Config precedence resolved from: environment-token -> config-base-url -> config-file-present.",
   'WWW-Authenticate: Bearer realm="api", error="invalid_token"',
   'WWW-Authenticate: Basic realm="Restricted"',
@@ -925,6 +947,7 @@ const BOUNDARY_KEPT_URLS = [
   "https://api.box.com/oauth2/token: 400 Bad Request",
   "GET https://es.example.com:9200/_security/api_key: 403 Forbidden",
   "https:\\/\\/es.example.com:9200\\/_security\\/api_key: 403 Forbidden",
+  "java -Dtoken_url=https://auth.example.com/token -jar app.jar",
 ];
 
 test("name boundary: the planted values look random and share no 6-character window with the boundary rows or the must-keep strings", () => {
@@ -956,6 +979,10 @@ test("name boundary rows A and D: a carrier fires after a JSON escape, after a f
   assert.equal(scrubber.scrub(`request failed\\/password=${canary} see the log`), `request failed\\/password=${REDACTED} see the log`);
   assert.equal(scrubber.scrub(`mysql --password=${canary} -h db.example.com`), `mysql --password=${REDACTED} -h db.example.com`);
   assert.equal(scrubber.scrub(`java -Dspring.datasource.password=${canary} -jar app.jar`), `java -Dspring.datasource.password=${REDACTED} -jar app.jar`);
+  for (const key of ["secret_id", "api_key", "private-key"]) {
+    assert.equal(scrubber.scrub(`java -D${key}=${NAME_SHAPED[0]} -jar app.jar`), `java -D${key}=${REDACTED} -jar app.jar`, `the flag is -D and the key is ${key}, so a name-shaped value goes too`);
+  }
+  assert.equal(scrubber.scrub(`java --Dapi_key=${NAME_SHAPED[0]} -jar app.jar`), `java --Dapi_key=${NAME_SHAPED[0]} -jar app.jar`, "after two dashes the D belongs to the name, an unqualified key that keeps a name-shaped value");
   assert.equal(scrubber.scrub(`vault read kv/password: ${canary} see the log`), `vault read kv/password: ${REDACTED} see the log`);
   assert.equal(scrubber.scrub(`mysql --password=hunter2abcd -h db`), `mysql --password=${REDACTED} -h db`, "a short plain value after a flag goes too: the flag is an assignment");
 });
