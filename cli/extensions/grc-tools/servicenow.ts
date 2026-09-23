@@ -3023,6 +3023,26 @@ export function assessServicenowAccessControlData(data: ServicenowAccessControlD
         evidence,
       };
     }
+    if (described.length === 0) {
+      // A positive Aggregate count with no visible ACL row is the ACL filtering described under
+      // Limitations: the set the wildcard and unrestricted claims would be made about was not seen, so
+      // this check runs before those claims and they render null rather than 0 or []. The public pages
+      // that were seen are a presence claim and stay; a zero would be an absence claim from this
+      // untrusted view and renders null.
+      const visiblePages = publicPages.length > 0;
+      return {
+        status: "manual",
+        summary: `${proven} active record ACLs exist but none of the sensitive-table or wildcard ACLs were visible to this credential, so completeness cannot be judged${visiblePages ? `; ${publicPages.length} active public pages (${truncateList(publicPages, 8).join(", ")}) were visible and need justification` : ""}.`,
+        evidence: {
+          ...evidence,
+          wildcard_acls: null,
+          unrestricted_acls: null,
+          unrestricted_acl_count: null,
+          public_pages: visiblePages ? evidence.public_pages : null,
+          public_page_count: visiblePages ? publicPages.length : null,
+        },
+      };
+    }
     if (unrestricted.length > 0) {
       return {
         status: "fail",
@@ -3034,13 +3054,6 @@ export function assessServicenowAccessControlData(data: ServicenowAccessControlD
       return {
         status: "warn",
         summary: `${proven} active record ACLs exist; ${wildcard.length} wildcard ACLs and ${publicPages.length} active public pages (${truncateList(publicPages, 8).join(", ")}) need justification.`,
-        evidence,
-      };
-    }
-    if (described.length === 0) {
-      return {
-        status: "manual",
-        summary: `${proven} active record ACLs exist but none of the sensitive-table or wildcard ACLs were visible to this credential, so completeness cannot be judged.`,
         evidence,
       };
     }

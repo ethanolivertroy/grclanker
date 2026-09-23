@@ -2905,3 +2905,52 @@ test("reviewer B round 4 verdict N3: SNOW-06 is manual, not fail, on a password_
   assert.match(weakPartial.summary, /fall below the threshold/);
   assert.match(weakPartial.summary, /Partial view: password_policy returned 1 of 4 rows/);
 });
+
+test("reviewer B round 4 verdict SNOW-02 (ruled code, not sentence): a positive Aggregate count with zero visible ACL rows renders manual before the wildcard and public-page evaluation, and the absence claims about the unseen ACL set render null", async () => {
+  // Aggregate count 24, Table API read returned zero ACL rows (complete: X-Total-Count 0), two active public pages.
+  const hidden = healthyFixture();
+  hidden.tables.sys_security_acl = [];
+  hidden.tables.sys_security_acl_role = [];
+  hidden.tables.sys_public = [
+    { sys_id: "pub-1", page: "welcome", active: "true", sys_updated_on: "2026-09-01 10:00:00" },
+    { sys_id: "pub-2", page: "status", active: "true", sys_updated_on: "2026-09-01 10:00:00" },
+  ];
+  hidden.counts = { ...hidden.counts, sys_security_acl: 24 };
+  const finding = findingsById(await assessServicenowAccessControl(createClient(fixtureFetch(hidden).fetchImpl))).get("SNOW-02");
+  assert.equal(finding.status, "manual", finding.summary);
+  assert.match(finding.summary, /^24 active record ACLs exist but none of the sensitive-table or wildcard ACLs were visible to this credential, so completeness cannot be judged; 2 active public pages \(welcome, status\) were visible and need justification\.$/);
+  assert.doesNotMatch(finding.summary, /\b0 wildcard|no wildcard|0 unrestricted|0 active public pages/i);
+  assert.equal(finding.evidence.record_acl_total, 24, "the seen-versus-total form stays");
+  assert.equal(finding.evidence.sensitive_acls_visible, 0, "the seen count stays");
+  for (const key of ["wildcard_acls", "unrestricted_acls", "unrestricted_acl_count"]) {
+    assert.equal(finding.evidence[key], null, `${key} is an absence claim about the unseen ACL set and renders null`);
+  }
+  assert.deepEqual(finding.evidence.public_pages, ["welcome", "status"], "the pages that were seen are a presence claim and stay");
+  assert.equal(finding.evidence.public_page_count, 2);
+  assert.ok(finding.manualEvidence, "the manual verdict names the evidence to collect");
+
+  // The same hidden set with no active public page: no public-page absence is rendered from this untrusted view.
+  const noPages = healthyFixture();
+  noPages.tables.sys_security_acl = [];
+  noPages.tables.sys_security_acl_role = [];
+  noPages.counts = { ...noPages.counts, sys_security_acl: 24 };
+  const bare = findingsById(await assessServicenowAccessControl(createClient(fixtureFetch(noPages).fetchImpl))).get("SNOW-02");
+  assert.equal(bare.status, "manual");
+  assert.match(bare.summary, /^24 active record ACLs exist but none of the sensitive-table or wildcard ACLs were visible to this credential, so completeness cannot be judged\.$/);
+  assert.equal(bare.evidence.public_pages, null);
+  assert.equal(bare.evidence.public_page_count, null);
+  assert.equal(bare.evidence.wildcard_acls, null);
+
+  // Controls: visible ACL rows keep their verdicts. Two public pages beside visible, well-formed ACLs warn with the
+  // observed counts; a visible unrestricted ACL still fails; the healthy fixture still passes.
+  const visible = healthyFixture();
+  visible.tables.sys_public = hidden.tables.sys_public;
+  const warned = findingsById(await assessServicenowAccessControl(createClient(fixtureFetch(visible).fetchImpl))).get("SNOW-02");
+  assert.equal(warned.status, "warn");
+  assert.match(warned.summary, /0 wildcard ACLs and 2 active public pages \(welcome, status\) need justification/);
+  assert.deepEqual(warned.evidence.wildcard_acls, []);
+  assert.equal(warned.evidence.unrestricted_acl_count, 0);
+  const healthy = findingsById(await assessServicenowAccessControl(createClient(fixtureFetch(healthyFixture()).fetchImpl))).get("SNOW-02");
+  assert.equal(healthy.status, "pass", healthy.summary);
+  assert.equal(healthy.evidence.public_page_count, 0, "a complete sys_public read beside visible ACLs states its zero");
+});
