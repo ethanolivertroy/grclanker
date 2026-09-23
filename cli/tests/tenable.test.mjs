@@ -1658,6 +1658,59 @@ test("harness self-check: a credential-named flag whose name opens with an under
   assert.equal(isCredentialKey("_theme"), false);
 });
 
+// Harness self-check (Codex P1 on #81, query carrier cells): a ";" inside a query value is part
+// of the value, as URLSearchParams reads it, so "?token=hunter2;restofsecret" is one value and
+// loses the whole of it. The query rule used to end a value at ";" and left ";restofsecret"
+// standing in relative, absolute, JSON-escaped, and slash-escaped URLs alike, through both
+// scrubs, the error constructor, and the walker. The ";" boundary belongs to the Cookie,
+// Set-Cookie, X-Cookie, and X-ApiKeys header lines, which go whole and are read before the query rule.
+const SEMICOLON_QUERY_VALUE = "hunter2;restofsecret";
+const SEMICOLON_QUERY_LONG_VALUE = "Rk7Vm2Qx9Tz4;Lw8Hn3Bd6Yp1Cf5";
+const SEMICOLON_QUERY_ROWS = [
+  [(v) => `GET /users?token=${v} failed`, "GET /users?token=[REDACTED] failed"],
+  [(v) => `GET /scans?folder_id=2&api_key=${v}&limit=50`, "GET /scans?folder_id=2&api_key=[REDACTED]&limit=50"],
+  [(v) => `GET /users?token=${v}; retrying`, "GET /users?token=[REDACTED] retrying"],
+  [(v) => `request to https://cloud.tenable.com/users?token=${v} failed`, "request to https://cloud.tenable.com/users?token=[REDACTED] failed"],
+  [(v) => `request to https://cloud.tenable.com/users?token=${v}`, "request to https://cloud.tenable.com/users?token=[REDACTED]"],
+  [(v) => `{"url":"https://cloud.tenable.com/users?token=${v}","status":401}`, '{"url":"https://cloud.tenable.com/users?token=[REDACTED]","status":401}'],
+  [(v) => `{"error":"request to \\"https://cloud.tenable.com/users?token=${v}\\" failed"}`, '{"error":"request to \\"https://cloud.tenable.com/users?token=[REDACTED]\\" failed"}'],
+  [(v) => `{"error":"GET \\"/users?token=${v}\\" failed"}`, '{"error":"GET \\"/users?token=[REDACTED]\\" failed"}'],
+  [(v) => `{"url":"https:\\/\\/cloud.tenable.com\\/users?token=${v}"}`, '{"url":"https:\\/\\/cloud.tenable.com\\/users?token=[REDACTED]"}'],
+  [(v) => `request to https:\\/\\/cloud.tenable.com\\/users?token=${v} failed`, "request to https:\\/\\/cloud.tenable.com\\/users?token=[REDACTED] failed"],
+  [(v) => `see https://sc.example.com/rest/token#access_token=${v}&type=bearer`, "see https://sc.example.com/rest/token#access_token=[REDACTED]&type=bearer"],
+];
+const SEMICOLON_QUERY_CONTROLS = [
+  ["Cookie: &sid=a; pref=b", "Cookie: [REDACTED]"],
+  ["Set-Cookie: TNS_SESSIONID=abc123; Path=/; HttpOnly", "Set-Cookie: [REDACTED]"],
+  ["GET /users?sort=asc;include=roles ok", "GET /users?sort=asc;include=roles ok"],
+  ["GET /scans?folder_id=2&limit=50 ok", "GET /scans?folder_id=2&limit=50 ok"],
+  ["GET /users?token=[REDACTED] failed", "GET /users?token=[REDACTED] failed"],
+];
+const SEMICOLON_QUERY_SINKS = [
+  ["redactErrorText", redactErrorText],
+  ["redactCredentialValueText", redactCredentialValueText],
+  ["redactSecrets", (text) => redactSecrets(text, [])],
+  ["TenableApiError", (text) => new TenableApiError(text, 401, "GET /users").message],
+  ["redactCredentialProperties", (text) => redactCredentialProperties({ note: text, items: [{ description: text }] }).note],
+];
+
+test("harness self-check: a \";\" inside a query value is part of the value, so ?token=hunter2;restofsecret loses the whole value in relative, absolute, JSON-escaped, and slash-escaped URLs through both scrubs, the error constructor, and the walker, while Cookie: &sid=a; pref=b still goes whole", () => {
+  let cases = 0;
+  for (const [sinkName, sink] of SEMICOLON_QUERY_SINKS) {
+    for (const [make, expected] of SEMICOLON_QUERY_ROWS) for (const value of [SEMICOLON_QUERY_VALUE, SEMICOLON_QUERY_LONG_VALUE]) {
+      const input = make(value);
+      const out = sink(input);
+      const label = `semicolon query value: ${sinkName} ${JSON.stringify(input)} -> ${JSON.stringify(out)}`;
+      assert.equal(out, expected, label);
+      assertNoWindow(out, value, label);
+      assert.equal(sink(out), out, `${label}: not idempotent`);
+      cases += 1;
+    }
+    for (const [text, expected] of SEMICOLON_QUERY_CONTROLS) assert.equal(sink(text), expected, `semicolon query value: ${sinkName} control ${JSON.stringify(text)}`);
+  }
+  assert.equal(cases, SEMICOLON_QUERY_SINKS.length * SEMICOLON_QUERY_ROWS.length * 2);
+});
+
 test("scrub boundary: name-shaped values stay bare in prose, leave every carrier whatever their shape, and go as configured secrets in every form", () => {
   for (const value of NAME_SHAPED_VALUES) {
     for (const prose of [`inventory ${value} was not read`, `${value}`, `scanner ${value} reported 12 of 40 agents`, `path /var/lib/${value}/state`]) {

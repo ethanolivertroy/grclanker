@@ -2002,6 +2002,59 @@ test("harness self-check: a credential-named flag whose name opens with an under
   assert.equal(isCredentialKey("_theme"), false);
 });
 
+// Harness self-check (Codex P1 on #81, query carrier cells): a ";" inside a query value is part
+// of the value, as URLSearchParams reads it, so "?token=hunter2;restofsecret" is one value and
+// loses the whole of it. The query rule used to end a value at ";" and left ";restofsecret"
+// standing in relative, absolute, JSON-escaped, and slash-escaped URLs alike, through both
+// scrubs, the error constructor, and the walker. The ";" boundary belongs to the Cookie and
+// Set-Cookie header lines, which go whole and are read before the query rule.
+const SEMICOLON_QUERY_VALUE = "hunter2;restofsecret";
+const SEMICOLON_QUERY_LONG_VALUE = "Rk7Vm2Qx9Tz4;Lw8Hn3Bd6Yp1Cf5";
+const SEMICOLON_QUERY_ROWS = [
+  [(v) => `GET /v2/policy?token=${v} failed`, "GET /v2/policy?token=[REDACTED] failed"],
+  [(v) => `GET /api/?type=keygen&user=auditor&password=${v}&target=vsys1`, "GET /api/?type=keygen&user=auditor&password=[REDACTED]&target=vsys1"],
+  [(v) => `GET /v2/policy?token=${v}; retrying`, "GET /v2/policy?token=[REDACTED] retrying"],
+  [(v) => `request to https://api2.prismacloud.io/v2/policy?token=${v} failed`, "request to https://api2.prismacloud.io/v2/policy?token=[REDACTED] failed"],
+  [(v) => `request to https://api2.prismacloud.io/v2/policy?token=${v}`, "request to https://api2.prismacloud.io/v2/policy?token=[REDACTED]"],
+  [(v) => `{"url":"https://api2.prismacloud.io/v2/policy?token=${v}","status":401}`, '{"url":"https://api2.prismacloud.io/v2/policy?token=[REDACTED]","status":401}'],
+  [(v) => `{"error":"request to \\"https://api2.prismacloud.io/v2/policy?token=${v}\\" failed"}`, '{"error":"request to \\"https://api2.prismacloud.io/v2/policy?token=[REDACTED]\\" failed"}'],
+  [(v) => `{"error":"GET \\"/v2/policy?token=${v}\\" failed"}`, '{"error":"GET \\"/v2/policy?token=[REDACTED]\\" failed"}'],
+  [(v) => `{"url":"https:\\/\\/api2.prismacloud.io\\/v2\\/policy?token=${v}"}`, '{"url":"https:\\/\\/api2.prismacloud.io\\/v2\\/policy?token=[REDACTED]"}'],
+  [(v) => `request to https:\\/\\/api2.prismacloud.io\\/v2\\/policy?token=${v} failed`, "request to https:\\/\\/api2.prismacloud.io\\/v2\\/policy?token=[REDACTED] failed"],
+  [(v) => `see https://fw.example.com/php/login.php#access_token=${v}&type=bearer`, "see https://fw.example.com/php/login.php#access_token=[REDACTED]&type=bearer"],
+];
+const SEMICOLON_QUERY_CONTROLS = [
+  ["Cookie: &sid=a; pref=b", "Cookie: [REDACTED]"],
+  ["Set-Cookie: PHPSESSID=abc123; Path=/; HttpOnly", "Set-Cookie: [REDACTED]"],
+  ["GET /v2/policy?sort=asc;include=roles ok", "GET /v2/policy?sort=asc;include=roles ok"],
+  ["GET /api/?type=op&target=vsys1 ok", "GET /api/?type=op&target=vsys1 ok"],
+  ["GET /v2/policy?token=[REDACTED] failed", "GET /v2/policy?token=[REDACTED] failed"],
+];
+const SEMICOLON_QUERY_SINKS = [
+  ["redactErrorText", redactErrorText],
+  ["redactCredentialValueText", redactCredentialValueText],
+  ["redactSecrets", (text) => redactSecrets(text, [])],
+  ["PaloaltoApiError", (text) => new PaloaltoApiError(text, 401, "GET /v2/policy").message],
+  ["redactCredentialProperties", (text) => redactCredentialProperties({ note: text, items: [{ description: text }] }).note],
+];
+
+test("harness self-check: a \";\" inside a query value is part of the value, so ?token=hunter2;restofsecret loses the whole value in relative, absolute, JSON-escaped, and slash-escaped URLs through both scrubs, the error constructor, and the walker, while Cookie: &sid=a; pref=b still goes whole", () => {
+  let cases = 0;
+  for (const [sinkName, sink] of SEMICOLON_QUERY_SINKS) {
+    for (const [make, expected] of SEMICOLON_QUERY_ROWS) for (const value of [SEMICOLON_QUERY_VALUE, SEMICOLON_QUERY_LONG_VALUE]) {
+      const input = make(value);
+      const out = sink(input);
+      const label = `semicolon query value: ${sinkName} ${JSON.stringify(input)} -> ${JSON.stringify(out)}`;
+      assert.equal(out, expected, label);
+      assertNoWindow(out, value, label);
+      assert.equal(sink(out), out, `${label}: not idempotent`);
+      cases += 1;
+    }
+    for (const [text, expected] of SEMICOLON_QUERY_CONTROLS) assert.equal(sink(text), expected, `semicolon query value: ${sinkName} control ${JSON.stringify(text)}`);
+  }
+  assert.equal(cases, SEMICOLON_QUERY_SINKS.length * SEMICOLON_QUERY_ROWS.length * 2);
+});
+
 test("scrub boundary: name-shaped values stay bare in prose, leave every carrier whatever their shape, and go as configured secrets in every form", () => {
   for (const value of NAME_SHAPED_VALUES) {
     for (const prose of [`device ${value} was not read`, `${value}`, `inventory ${value} read 12 of 40 resources`, `path /var/lib/${value}/state`]) {

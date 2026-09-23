@@ -515,11 +515,13 @@ const URL_USERINFO_PATTERN = /^([a-z][a-z0-9+.-]*:\/\/)[^\s\/?#@"'<>\\]+@/i;
 // A query or fragment pair, in a URL or a bare query string: a credential-named pair or a
 // token-shaped value loses the value. A value ends at "&", "#", whitespace, a quote, a
 // backslash (no token carries one; the escape after it, \" or \n inside a JSON string, is
-// kept so the string still parses and the text after it is still read), or the ";" and ","
-// that end a URL inside a sentence. A recognised header line is read before this rule, so a
-// cookie pair whose name holds "&" or "#" goes with its cookie.
+// kept so the string still parses and the text after it is still read), or the "," that
+// ends a URL inside a sentence. A ";" is part of the value, as URLSearchParams reads it
+// (?token=hunter2;restofsecret is one value and loses the whole of it); the ";" that ends a
+// pair belongs to the cookie and key-list header lines, which are read before this rule, so
+// a cookie pair whose name holds "&" or "#" goes with its cookie.
 // A quote with a value character on both sides (O'hunter2) is content of the value.
-const QUERY_PAIR_PATTERN = /([?&#])([A-Za-z0-9_.[\]-]+)=((?!\[REDACTED\])[^&#\s"'<>;,\\]+(?:["'](?![:)}\]])[^&#\s"'<>;,\\]+)*)/g;
+const QUERY_PAIR_PATTERN = /([?&#])([A-Za-z0-9_.[\]-]+)=((?!\[REDACTED\])[^&#\s"'<>,\\]+(?:["'](?![:)}\]])[^&#\s"'<>,\\]+)*)/g;
 // A credential-bearing header line: the whole value goes, whatever its shape. The name and
 // separator are matched here (the name may be quoted as a JSON member name, with its quotes
 // escaped to any depth: "Cookie": ..., \"Cookie\": ..., \\\"Cookie\\\": ...) and the value
