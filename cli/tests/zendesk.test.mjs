@@ -2118,7 +2118,9 @@ test("redactCredentialProperties scrubs URL query credentials, userinfo, token-i
 
 test("redactErrorText and describeErrorBody scrub credential-shaped text regardless of content type and never echo non-JSON bodies", () => {
   const bearer = redactErrorText("upstream said Authorization: Bearer abcdefghijklmnop and Basic dXNlcjpwYXNz then Cookie: _zendesk_session=abc123def456; Path=/");
-  assert.equal(bearer, "upstream said Authorization: [REDACTED]", "a header line is withheld to its end and the marker is not re-scrubbed into a different shape");
+  assert.equal(bearer, "upstream said Authorization: Bearer [REDACTED] and Basic [REDACTED] then Cookie: [REDACTED]", "an Authorization value is its scheme word and the one token after it, the rest of the line gets its own carrier treatment, and the marker is not re-scrubbed into a different shape");
+  assert.equal(redactErrorText("Authorization: Digest username=\"Mufasa\", realm=\"testrealm@host.com\", nonce=\"dcd98b7102dd2f0e8b11d0f600bfb0c093\", response=\"6629fae49393a05397450978507c4ef1\""), "Authorization: Digest [REDACTED]", "a parameter list after the scheme goes whole");
+  assert.equal(redactCredentialValueText("note: key Authorization: Bearer v8cVjqg71d1bQBCQrqEhOQ2Un3jIPVKl end"), "note: key Authorization: Bearer [REDACTED] end", "prose after the one token of an Authorization value stays");
   assert.equal(redactErrorText("Cookie: _zendesk_session=abc123def456; Path=/ was sent"), "Cookie: [REDACTED]");
   assert.equal(redactErrorText("Bearer abcdefghijklmnop rejected"), "Bearer [REDACTED] rejected");
   assert.equal(redactErrorText("Basic dXNlcjpwYXNzd29yZA== rejected"), "Basic [REDACTED] rejected");
@@ -2170,8 +2172,8 @@ function carriersOf(value) {
     [`Cookie: sid='${value}'; theme=dark`, /^Cookie: \[REDACTED\]$/],
     [`Cookie: theme=dark; sid="${value}"; lang=en`, /^Cookie: \[REDACTED\]$/],
     [`Set-Cookie: _zendesk_session="${value}"; Path=/; HttpOnly`, /^Set-Cookie: \[REDACTED\]$/],
-    [`Authorization: Bearer "${value}"`, /^Authorization: \[REDACTED\]$/],
-    [`Authorization: "Bearer ${value}" was rejected`, /^Authorization: "\[REDACTED\]" was rejected$/],
+    [`Authorization: Bearer "${value}"`, /^Authorization: Bearer "\[REDACTED\]"$/],
+    [`Authorization: "Bearer ${value}" was rejected`, /^Authorization: "Bearer \[REDACTED\]" was rejected$/],
     [`X-Api-Key: "${value}"`, /^X-Api-Key: "\[REDACTED\]"$/],
     [`x-auth-token: '${value}'`, /^x-auth-token: '\[REDACTED\]'$/],
     [`{"detail":"upstream rejected Cookie: sid=\\"${value}\\"; path=/","code":401}`, /^\{"detail":"upstream rejected Cookie: \[REDACTED\]","code":401\}$/],
@@ -2207,7 +2209,7 @@ function carriersOf(value) {
     // down) lose their values and keep their escaped quotes, so the JSON stays well formed.
     [`{"detail":"{\\"Cookie\\": \\"sid=${value}\\", \\"X-Api-Key\\": \\"${value}\\", \\"Content-Type\\": \\"application/json\\"}"}`, /^\{"detail":"\{\\"Cookie\\": \\"\[REDACTED\]\\", \\"X-Api-Key\\": \\"\[REDACTED\]\\", \\"Content-Type\\": \\"application\/json\\"\}"\}$/],
     [`{"o":"{\\"detail\\":\\"{\\\\\\"Cookie\\\\\\": \\\\\\"sid=${value}\\\\\\", \\\\\\"X-Api-Key\\\\\\": \\\\\\"${value}\\\\\\"}\\"}"}`, /^\{"o":"\{\\"detail\\":\\"\{\\\\\\"Cookie\\\\\\": \\\\\\"\[REDACTED\]\\\\\\", \\\\\\"X-Api-Key\\\\\\": \\\\\\"\[REDACTED\]\\\\\\"\}\\"\}"\}$/],
-    [`{"detail":"{\\"Authorization\\": \\"Bearer ${value}\\"}"}`, /^\{"detail":"\{\\"Authorization\\": \\"\[REDACTED\]\\"\}"\}$/],
+    [`{"detail":"{\\"Authorization\\": \\"Bearer ${value}\\"}"}`, /^\{"detail":"\{\\"Authorization\\": \\"Bearer \[REDACTED\]\\"\}"\}$/],
     [`{"detail":"{'Cookie': 'sid=${value}'}"}`, /^\{"detail":"\{'Cookie': '\[REDACTED\]'\}"\}$/],
     [`{"o":"{\\"detail\\":\\"Cookie: sid=${value}; path=/\\",\\"code\\":401}"}`, /^\{"o":"\{\\"detail\\":\\"Cookie: \[REDACTED\]\\",\\"code\\":401\}"\}$/],
     [`{"detail":"{\\"password\\": \\"${value}\\", \\"user\\": \\"a\\"}"}`, /^\{"detail":"\{\\"password\\": \\"\[REDACTED\]\\", \\"user\\": \\"a\\"\}"\}$/],
@@ -2348,7 +2350,7 @@ const GAP10_ROWS = [
   [(v) => `{"headers":"Set-Cookie: my#sid=\\"${v}\\"; HttpOnly; Content-Type: \\"text/html\\""}`, () => `{"headers":"Set-Cookie: [REDACTED]; Content-Type: \\"text/html\\""}`],
   [(v) => `{"headers":"Cookie: theme=dark; my&sid=\\"${v}\\"; Content-Type: \\"text/html; charset=utf-8\\"; Date: \\"Mon, 22 Sep 2026 12:30:00 GMT\\""}`, () => `{"headers":"Cookie: [REDACTED]; Content-Type: \\"text/html; charset=utf-8\\"; Date: \\"Mon, 22 Sep 2026 12:30:00 GMT\\""}`],
   // boundaries that held before and must keep holding
-  [(v) => `Authorization: Bearer ${v}&token=${v}`, () => `Authorization: [REDACTED]`],
+  [(v) => `Authorization: Bearer ${v}&token=${v}`, () => `Authorization: Bearer [REDACTED]`],
   [(v) => `Cookie: my&sid=${v}`, () => `Cookie: [REDACTED]`],
   [(v) => `Cookie: theme=dark; my#sid=${v}`, () => `Cookie: [REDACTED]`],
   [(v) => `rejected header "Cookie: sid=${v}" and "X-Other: 1"`, () => `rejected header "Cookie: [REDACTED]" and "X-Other: 1"`],
@@ -2358,7 +2360,7 @@ const GAP10_ROWS = [
   [(v) => `X-ApiKeys: accessKey="${v}";secretKey="${v}"; Content-Type: application/json`, () => `X-ApiKeys: [REDACTED]; Content-Type: application/json`],
   [(v) => `{"error":"X-ApiKeys: accessKey=\\"${v}\\";secretKey=\\"${v}\\"","code":403}`, () => `{"error":"X-ApiKeys: [REDACTED]","code":403}`],
   [(v) => `Cookie: sid=${v}"; theme=dark`, () => `Cookie: [REDACTED]"; theme=dark`],
-  [(v) => `{"detail":"Authorization: Basic ${v}=","code":401}`, () => `{"detail":"Authorization: [REDACTED]","code":401}`],
+  [(v) => `{"detail":"Authorization: Basic ${v}=","code":401}`, () => `{"detail":"Authorization: Basic [REDACTED]","code":401}`],
   [(v) => `Cookie: sid=${v}=" and "X-Other: 1"`, () => `Cookie: [REDACTED]" and "X-Other: 1"`],
   [(v) => `sid=${v}'; path=/`, () => `sid=[REDACTED]'; path=/`],
   [(v) => `api_key=${v}"}`, () => `api_key=[REDACTED]"}`],
@@ -2436,15 +2438,18 @@ test("scrub boundary: name-shaped values stay bare in prose, leave every carrier
     assert.equal(redactErrorText(expected), expected, "idempotent");
   }
   // After a scheme the value goes whatever its shape, a plain lowercase word included,
-  // unless it is one of the listed prose words; after the noun "Token" any short plain
-  // lowercase word is prose, and OAuth is this module's vocabulary, not a scheme.
+  // unless it is one of the listed prose words; after the nouns "Token", "OAuth", "Splunk",
+  // and "Snowflake" a plain lowercase word shorter than a long token run is prose, and
+  // "realm=" or another auth parameter name after any scheme is prose.
   for (const [text, expected] of [
     ["Bearer abcdefghijklmnop rejected", "Bearer [REDACTED] rejected"],
     ["Basic canarybasic rejected", "Basic [REDACTED] rejected"],
     ["ApiKey canaryapikey rejected", "ApiKey [REDACTED] rejected"],
     ["Token abcdefghijklmnopq expired", "Token [REDACTED] expired"],
     ["Token hygiene could not be judged; token inventory read; Token count 3", "Token hygiene could not be judged; token inventory read; Token count 3"],
-    ["OAuth clients all declare scopes; an OAuth bearer token; OAuth abcdefghijklmnop", "OAuth clients all declare scopes; an OAuth bearer token; OAuth abcdefghijklmnop"],
+    ["OAuth clients all declare scopes; an OAuth bearer token; OAuth authentication failed; OAuth abcdefghijklmnop rejected", "OAuth clients all declare scopes; an OAuth bearer token; OAuth authentication failed; OAuth [REDACTED] rejected"],
+    ["replayed OAuth Kq7Zx2Vw9Lm4Tp8R upstream; replayed Splunk Kq7Zx2Vw9Lm4Tp8R upstream; replayed Snowflake Kq7Zx2Vw9Lm4Tp8R upstream; replayed AWS4-HMAC-SHA256 Kq7Zx2Vw9Lm4Tp8R upstream", "replayed OAuth [REDACTED] upstream; replayed Splunk [REDACTED] upstream; replayed Snowflake [REDACTED] upstream; replayed AWS4-HMAC-SHA256 [REDACTED] upstream"],
+    ["Bearer realm=\"api\"; Bearer token is missing; Digest realm=\"api\", qop=\"auth\"; Splunk search head", "Bearer realm=\"api\"; Bearer token is missing; Digest realm=\"api\", qop=\"auth\"; Splunk search head"],
     ["API token basic auth; Bearer tokens expire; Basic credential; Basic authentication is required", "API token basic auth; Bearer tokens expire; Basic credential; Basic authentication is required"],
     // A Titlecase word makes the scheme name an adjective in a title; a digit, a symbol,
     // token casing, or a run longer than a word still marks a credential.
@@ -3047,7 +3052,7 @@ test("ZendeskApiError, transport errors, and the tool catch blocks scrub message
   });
   await assert.rejects(transport.getCurrentUser(), (error) => {
     assertNoCanary(error.message, "transport error");
-    assert.match(error.message, /https:\/\/\[REDACTED\]@proxy\.example\.com sending Authorization: \[REDACTED\]/);
+    assert.match(error.message, /https:\/\/\[REDACTED\]@proxy\.example\.com sending Authorization: Bearer \[REDACTED\]/);
     return true;
   });
   const transportResult = await assessZendeskAuthentication(transport, { now: () => NOW });
@@ -3836,8 +3841,8 @@ const FOREIGN_HOST_REASON = /^the next link pointed to https:\/\/evil\.example\.
 const FOREIGN_PORT_REASON = /^the next link pointed to https:\/\/acme\.zendesk\.com:8443, outside the configured origin https:\/\/acme\.zendesk\.com, and was not followed$/;
 
 // Every shape a foreign next link takes on a paged read of path, with the fixed text the
-// refusal records: the rejected origin (or, for a link carrying user credentials, only its
-// host) and the configured origin, never the link's path, query, or credentials.
+// refusal records: the rejected origin (for a link carrying user credentials, its origin
+// without them) and the configured origin, never the link's path, query, or credentials.
 function foreignNextLinks(path) {
   const rest = `${path}?page%5Bafter%5D=${CANARY_NEXT_LINK}&page=2&per_page=100`;
   return [
@@ -3845,9 +3850,14 @@ function foreignNextLinks(path) {
     ["a host that merely starts with the configured one", `https://acme.zendesk.com.evil.example.com${rest}`, /^the next link pointed to https:\/\/acme\.zendesk\.com\.evil\.example\.com, outside the configured origin https:\/\/acme\.zendesk\.com, and was not followed$/],
     ["another port", `https://acme.zendesk.com:8443${rest}`, FOREIGN_PORT_REASON],
     ["another scheme", `http://acme.zendesk.com${rest}`, /^the next link pointed to http:\/\/acme\.zendesk\.com, outside the configured origin https:\/\/acme\.zendesk\.com, and was not followed$/],
-    ["the configured host as userinfo before a foreign host", `https://acme.zendesk.com:${CANARY_NEXT_LINK}@evil.example.com${rest}`, /^the next link to evil\.example\.com carried user credentials in the URL and was not followed$/],
-    ["user credentials on the configured host", `https://auditor%40example.com:${CANARY_NEXT_LINK}@acme.zendesk.com${rest}`, /^the next link to acme\.zendesk\.com carried user credentials in the URL and was not followed$/],
+    ["the configured host as userinfo before a foreign host", `https://acme.zendesk.com:${CANARY_NEXT_LINK}@evil.example.com${rest}`, /^the next link to https:\/\/evil\.example\.com carried user credentials in the URL and was not followed; only links on the configured origin https:\/\/acme\.zendesk\.com without user credentials are followed$/],
+    ["user credentials on the configured host", `https://auditor%40example.com:${CANARY_NEXT_LINK}@acme.zendesk.com${rest}`, /^the next link to https:\/\/acme\.zendesk\.com carried user credentials in the URL and was not followed; only links on the configured origin https:\/\/acme\.zendesk\.com without user credentials are followed$/],
     ["protocol-relative", `//evil.example.com${rest}`, FOREIGN_HOST_REASON],
+    ["backslash protocol-relative", `\\\\evil.example.com${rest}`, FOREIGN_HOST_REASON],
+    ["a javascript scheme", `javascript:alert('${CANARY_NEXT_LINK}')`, /^the next link used the javascript: scheme, outside the configured origin https:\/\/acme\.zendesk\.com, and was not followed$/],
+    ["a data scheme", `data:text/plain,${CANARY_NEXT_LINK}`, /^the next link used the data: scheme, outside the configured origin https:\/\/acme\.zendesk\.com, and was not followed$/],
+    ["a blob scheme", `blob:https://evil.example.com/${CANARY_NEXT_LINK}`, /^the next link used the blob: scheme, outside the configured origin https:\/\/acme\.zendesk\.com, and was not followed$/],
+    ["a file scheme", `file:///etc/${CANARY_NEXT_LINK}`, /^the next link used the file: scheme, outside the configured origin https:\/\/acme\.zendesk\.com, and was not followed$/],
   ];
 }
 
