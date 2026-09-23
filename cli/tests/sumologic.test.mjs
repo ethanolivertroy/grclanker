@@ -3001,6 +3001,28 @@ test("data-side ruling: vendor-prefixed tokens, JWTs, PEM blocks, and credential
 
 const REGISTERED_SECRET = "registry-passphrase-2026-echo";
 
+const HANDED_SHORT_SECRET = "hunter2";
+/** A handed-in value glued into a longer run: the whole-token needle rule passes over it, the literal pass does not. */
+const HANDED_SHORT_ROWS = [
+  [`x${HANDED_SHORT_SECRET}y`, "x[REDACTED]y"],
+  [`{"detail":"id${HANDED_SHORT_SECRET}99"}`, '{"detail":"id[REDACTED]99"}'],
+  [`${HANDED_SHORT_SECRET}${HANDED_SHORT_SECRET}`, "[REDACTED][REDACTED]"],
+  [`the value ${HANDED_SHORT_SECRET} was echoed by the proxy`, "the value [REDACTED] was echoed by the proxy"],
+];
+
+test("merge bar: a secret handed to the call goes wherever it stands, glued into a longer run included, on both sides; the marker is never a needle, a value under the minimum is ignored, and a second pass changes nothing", () => {
+  for (const [input, expected] of HANDED_SHORT_ROWS) {
+    for (const [name, scrub] of [["scrubErrorText", scrubErrorText], ["scrubDataText", scrubDataText]]) {
+      const output = scrub(input, [HANDED_SHORT_SECRET]);
+      assert.equal(output, expected, `${name}: ${input}`);
+      assert.equal(scrub(output, [HANDED_SHORT_SECRET]), output, `${name} second pass: ${input}`);
+    }
+  }
+  assert.equal(scrubErrorText("[REDACTED] stays", ["DACT"]), "[REDACTED] stays");
+  assert.equal(scrubErrorText("[REDACTED] stays", ["[REDACTED]"]), "[REDACTED] stays");
+  assert.equal(scrubErrorText("abc stays", ["abc"]), "abc stays");
+});
+
 test("item 7: once a client is constructed its configured access key and the Basic credential built from it are removed by redactSnapshot on a string leaf and by scrubDataText and scrubErrorText called without them, in every encoded form", () => {
   const leaf = `the value ${REGISTERED_SECRET} was echoed by the proxy`;
   const basic = Buffer.from(`suREGISTRY:${REGISTERED_SECRET}`).toString("base64");
