@@ -76,6 +76,7 @@ import {
   assertEscapedHeaderCarriers,
   assertFixedTextsSurvive,
   assertIdentifierKeyRows,
+  assertFlagAndPathPairRows,
   assertMustKeepRows,
   assertMustRedactRowsBesideMustKeep,
   withPlantedRoutes,
@@ -966,6 +967,7 @@ test("rule 9 depth control (reviewer D round 5 depth control): every string a sn
 test("rule 9 credential-named pairs (reviewer D round 5 baseline): a value under a credential-named key is removed whatever its shape and length, unquoted as well as quoted, in every form the pair takes, while identifier-named keys keep their values unless the value's own shape removes it", () => {
   assertCredentialPairValuesRemoved(assert, redactErrorText);
   assertIdentifierKeyRows(assert, redactErrorText);
+  assertFlagAndPathPairRows(assert, redactErrorText);
   // The retired value-shape test would have kept every one of these; the pair rule no longer asks.
   for (const [text, expected] of [
     ["password=letmein", "password=[REDACTED]"],
@@ -982,13 +984,12 @@ test("rule 9 credential-named pairs (reviewer D round 5 baseline): a value under
   ]) {
     assert.equal(redactErrorText(text), expected, `credential-named pair: ${text}`);
   }
-  // A PascalCase error code that ends in a credential word is prose, and a bare scheme word or a path segment is not a pair.
+  // A PascalCase error code that ends in a credential word is prose, and a bare scheme word is not a pair; a path segment
+  // ending in a credential word is one (assertFlagAndPathPairRows).
   for (const text of [
     "InvalidAuthenticationToken: Access token has expired. Basic authentication is disabled for this tenant.",
     "ExpiredToken: The security token included in the request is expired",
     "sent as Authorization: Bearer) or as X-Auth-Key",
-    "GET /_security/api_key: 403 Forbidden",
-    "POST /tenant/oauth2/v2.0/token: 401 Unauthorized",
     "oauth: invalid_grant was returned",
   ]) {
     assert.equal(redactErrorText(text), text, `prose beside a credential word survives: ${text}`);

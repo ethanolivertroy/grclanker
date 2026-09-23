@@ -193,6 +193,43 @@ export function assertIdentifierKeyRows(assert, redact, rows = IDENTIFIER_KEY_RO
 }
 
 /**
+ * Flag and path position (harness revision 3, reviewer #78 row D): a credential-named segment followed by `=` is a
+ * pair whatever precedes it (a `--flag`, a `-D` property, a `kv/` path segment, a parenthesis, a comma), `--name
+ * value` is a pair whose separator is the space, and `:` after a path segment removes the single-token value,
+ * so an endpoint path that ends in a credential word loses the token after its colon (a status code included:
+ * the modules join a status to such a path with "returned" or parentheses instead). The text after the value
+ * stays in every form. A path segment that is not a credential word (`api-tokens`) and a `--` or `-D` flag whose
+ * name is not one (`--timeout`) keep their values. Each row is `[text, expected]`.
+ */
+export const FLAG_AND_PATH_PAIR_ROWS = Object.freeze([
+  ["mysql --password=Sunshine -h db", "mysql --password=[REDACTED] -h db"],
+  ["psql --password Sunshine -h db", "psql --password [REDACTED] -h db"],
+  ["curl --api-key=prod-key-2026 https://api.example.com/v1", "curl --api-key=[REDACTED] https://api.example.com/v1"],
+  ["java -Dspring.datasource.password=Sunshine -jar app.jar", "java -Dspring.datasource.password=[REDACTED] -jar app.jar"],
+  ["java -DDB_PASSWORD=Sunshine -jar app.jar", "java -DDB_PASSWORD=[REDACTED] -jar app.jar"],
+  ["kv/password: Sunshine", "kv/password: [REDACTED]"],
+  ["path/x-auth-key=prod-key-2026 see log", "path/x-auth-key=[REDACTED] see log"],
+  ["/client_secret=prod-key-2026", "/client_secret=[REDACTED]"],
+  ["GET /_security/api_key: 403 Forbidden", "GET /_security/api_key: [REDACTED] Forbidden"],
+  ["POST /tenant/oauth2/v2.0/token: 401 Unauthorized", "POST /tenant/oauth2/v2.0/token: [REDACTED] Unauthorized"],
+  ["helm --set db.password=Sunshine upgrade", "helm --set db.password=[REDACTED] upgrade"],
+  ["(password=Sunshine)", "(password=[REDACTED])"],
+  ["a,password=Sunshine", "a,password=[REDACTED]"],
+  ["/api/v1/api-tokens: request failed with 403", "/api/v1/api-tokens: request failed with 403"],
+  ["psql --timeout 30 -h db", "psql --timeout 30 -h db"],
+  ["java -Dspring.datasource.url=jdbc:postgresql://db/app -jar app.jar", "java -Dspring.datasource.url=jdbc:postgresql://db/app -jar app.jar"],
+]);
+
+/** Asserts each flag and path row scrubs to exactly its expected text and that a second pass changes nothing. */
+export function assertFlagAndPathPairRows(assert, redact, rows = FLAG_AND_PATH_PAIR_ROWS) {
+  for (const [text, expected] of rows) {
+    const output = redact(text);
+    assert.equal(output, expected, `flag or path pair: ${text}`);
+    assert.equal(redact(output), output, `a second pass over ${JSON.stringify(output)} changes nothing`);
+  }
+}
+
+/**
  * The bearer-id override to the identifier ruling above (CodeRabbit r4077259415 on #78): a key ending in `secret_id`,
  * any prefix, casing, and separator, holds a Vault AppRole secret id, and a session-id key holds a session token;
  * each authenticates rather than identifies, so it is a credential key despite its `id` suffix and its value is
@@ -465,15 +502,32 @@ export function findPlantedTrees(value, key = "x_deep_probe", depth = 1, path = 
   return found;
 }
 
-/** Identifier shapes a snapshot names its resources by; the data-side scrub keeps every one bare and beside a label. */
+/**
+ * Identifier shapes a snapshot names its resources by; the data-side scrub keeps every one bare and beside a label.
+ * An AWS role unique id (`AROA...`) is a resource identifier and stays; an access key id (`AKIA...`) is a
+ * credential's own id and goes (SNAPSHOT_VENDOR_TOKEN_ROWS).
+ */
 export const SNAPSHOT_IDENTIFIER_ROWS = Object.freeze([
   "4f1c2f7a9b3d4e5f8a7b6c5d4e3f2a1b",
-  "AKIAEXAMPLE000000001",
   "62e90394-69f5-4237-9190-012177145e10",
   "arn:aws:iam::123456789012:role/Deploy",
   "sha256:9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08",
   "AROAEXAMPLE000000001:session-name",
+  "AIDAEXAMPLE000000001",
   "https://aap.example.com/api/v2/hosts/",
+]);
+
+/**
+ * Vendor-prefixed token shapes (harness revision 3, class 6): the prefix names the token type, so the value goes
+ * from a snapshot string as from error text, whatever key carries it. Each is `[text, expected]`; the AWS
+ * access key id is the fixture id AWS evidence masks.
+ */
+export const SNAPSHOT_VENDOR_TOKEN_ROWS = Object.freeze([
+  ["AKIAEXAMPLE000000001", "[REDACTED]"],
+  ["ASIAEXAMPLE000000001", "[REDACTED]"],
+  ["sk_live_EXAMPLE0000000000000001", "[REDACTED]"],
+  ["ghp_EXAMPLE00000000000000000000000001", "[REDACTED]"],
+  ["xoxb-1234567890-1234567890123-EXAMPLE0000000001", "[REDACTED]"],
 ]);
 
 /**
@@ -502,6 +556,10 @@ export function assertCarrierTextScrub(assert, redact, { label = "redactCarrierT
   for (const row of SNAPSHOT_IDENTIFIER_ROWS) {
     assert.equal(redact(row), row, `${label} keeps the identifier bare: ${row}`);
     assert.equal(redact(`resource ${row} read`), `resource ${row} read`, `${label} keeps the identifier in a sentence: ${row}`);
+  }
+  for (const [text, expected] of SNAPSHOT_VENDOR_TOKEN_ROWS) {
+    assert.equal(redact(text), expected, `${label} removes the vendor-prefixed token bare: ${text}`);
+    assert.equal(redact(`note: key ${text} end`), `note: key ${expected} end`, `${label} removes the vendor-prefixed token in a sentence: ${text}`);
   }
   assertNoCanaryWindows(assert, cases.map(([text]) => redact(text)).join("\n"), [canary], `${label} cases`);
 }

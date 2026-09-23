@@ -346,7 +346,8 @@ export const QUOTED_CARRIER_CASES = Object.freeze([
  * assertScrubBoundary, so a sink that has not yet closed the class fails on the value rather than on wording.
  * A cookie value (its quoted attributes included) runs to the end of its line; a header value that is itself
  * quoted ends at its closing quote (compound-line rule: closing quote first), so the prose after it survives;
- * inside a JSON-escaped body the quoted pair rule keeps the escaped structure instead.
+ * inside a JSON-escaped body the quoted pair rule keeps the escaped structure instead, and a scheme word inside
+ * the quotes stays beside the marker (harness revision 3, class 4: `"Bearer [REDACTED]"`).
  */
 export const NAME_SHAPED_QUOTED_CASES = Object.freeze([
   ['Cookie: sid="prod-cookie" was rejected by the upstream proxy.', "Cookie: [REDACTED]", ["prod-cookie"]],
@@ -364,7 +365,7 @@ export const NAME_SHAPED_QUOTED_CASES = Object.freeze([
   ['Login failed: "password": "prod-key" in the response body.', 'Login failed: "password": "[REDACTED]" in the response body.', ["prod-key"]],
   [
     'body was {\\"X-Auth-Key\\":\\"prod-key\\",\\"Authorization\\":\\"Bearer prod-token\\",\\"Cookie\\":\\"sid=prod-cookie\\"}',
-    'body was {\\"X-Auth-Key\\":\\"[REDACTED]\\",\\"Authorization\\":\\"[REDACTED]\\",\\"Cookie\\":\\"[REDACTED]\\"}',
+    'body was {\\"X-Auth-Key\\":\\"[REDACTED]\\",\\"Authorization\\":\\"Bearer [REDACTED]\\",\\"Cookie\\":\\"[REDACTED]\\"}',
     ["prod-key", "prod-token", "prod-cookie"],
   ],
 ]);
@@ -474,7 +475,11 @@ export function carrierCases(value) {
     ["single-quoted credential pair", `api_key='${value}' too`, "api_key='[REDACTED]' too"],
     ["quoted cookie attribute", `Cookie: sid="${value}"; theme=dark`, "Cookie: [REDACTED]"],
     ["JSON-escaped quoted header", `{\\"X-Auth-Key\\":\\"${value}\\"}`, '{\\"X-Auth-Key\\":\\"[REDACTED]\\"}'],
-    ["JSON-escaped quoted Authorization", `{\\"Authorization\\":\\"Bearer ${value}\\"}`, '{\\"Authorization\\":\\"[REDACTED]\\"}'],
+    // Harness revision 3, class 4: under an Authorization key the scheme word that opens the quoted value stays
+    // inside the quotes (`Authorization: "Bearer [REDACTED]"`), plain or JSON-escaped, the way it stays unquoted.
+    ["JSON-escaped quoted Authorization", `{\\"Authorization\\":\\"Bearer ${value}\\"}`, '{\\"Authorization\\":\\"Bearer [REDACTED]\\"}'],
+    ["quoted scheme and value", `Authorization: "Bearer ${value}" was rejected`, 'Authorization: "Bearer [REDACTED]" was rejected'],
+    ["depth-two JSON-escaped quoted value", `{\\\\\\"api_key\\\\\\":\\\\\\"${value}\\\\\\"}`, '{\\\\\\"api_key\\\\\\":\\\\\\"[REDACTED]\\\\\\"}'],
   ];
 }
 

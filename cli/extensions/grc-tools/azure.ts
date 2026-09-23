@@ -489,35 +489,62 @@ function scrubConfiguredSecrets(text: string): string {
 // The words that name a credential. A key ends in one of them; isCredentialNamedKey below decides how the word may
 // be attached to the rest of the key. `skey` and `ikey` are Duo's secret key and integration key (DUO_SKEY, DUO_IKEY),
 // both configured secrets of that integration; there is no bare `key`, so KmsKeyId, ssh_key_name, and the like stay
-// identifiers. The bearer ids are the one override to that identifier suffix (CodeRabbit r4077259415 on #78): a key
-// ending in `secret_id` (a Vault AppRole secret id: `secret_id`, `VAULT_SECRET_ID`, `role_secret_id`, `roleSecretId`)
-// or in a session id (`session_id`, `sid`, `sessid`, `jsessionid`, `PHPSESSID`) authenticates rather than identifies,
-// so it is a credential key despite ending in `id` and its value goes whatever its shape, UUID included, while
-// `client_id`, `tenant_id`, `access_key_id`, `key_id`, and `secret_name` keep theirs unless the value's own shape goes.
+// identifiers. The compound words (`session_token`, `client_secret`, `secret_access_key`, `secret_key`,
+// `connection_string`, `ssh_key_data`) are the members an SDK response or a credential store carries, so they count
+// in their PascalCase form too (`SessionToken`, `ClientSecret`, `SecretAccessKey`, `SecretKey`), where a PascalCase
+// error code that merely ends in `Token` (`ExpiredToken`) does not; see isCredentialNamedKey. The bearer ids are the
+// one override to the identifier suffix (CodeRabbit r4077259415 on #78, harness revision 3): a key ending in
+// `secret_id` (a Vault AppRole secret id) or `token_id` (a token id is the token), or in a session id (`session_id`,
+// `sid`, `sessid`, `jsessionid`, `PHPSESSID`), authenticates rather than identifies, so it is a credential key
+// despite ending in `id` and its value goes whatever its shape, UUID included, while `client_id`, `tenant_id`,
+// `access_key_id`, `key_id`, and `secret_name` keep theirs unless the value's own shape goes. A URL-valued webhook
+// key (`webhook`, `webhook_url`) carries its token in the path, so the whole value goes; `webhook_count` is a count.
 const ERROR_CREDENTIAL_WORDS =
-  "token|secret[_-]?id|secret|passw(?:or)?d|pwd|api[_-]?key|apikey|auth[_-]?key|auth[_-]?email|session(?:[_-]?id)?|sessid|sid|cookie|csrftoken|authorization|auth|signature|sig|nonce|credentials?|access[_-]?key|private[_-]?key|skey|ikey";
+  "token|secret[_.-]?id|token[_.-]?id|session[_.-]?token|access[_.-]?token|refresh[_.-]?token|id[_.-]?token|client[_.-]?secret|api[_.-]?secret|secret[_.-]?access[_.-]?key|secret[_.-]?key|secret|passw(?:or)?d|pwd|passphrase|api[_.-]?key|apikey|auth[_.-]?key|auth[_.-]?email|session(?:[_.-]?id)?|sessid|sid|cookie|csrftoken|authorization|auth|signature|sig|nonce|credentials?|access[_.-]?key|private[_.-]?key|ssh[_.-]?key[_.-]?data|skey|ikey|assertion|connection[_.-]?string|webhook(?:[_.-]?url)?";
 const ERROR_CREDENTIAL_KEY_PATTERN = `[A-Za-z0-9_.-]*(?:${ERROR_CREDENTIAL_WORDS})`;
+
 /**
- * key=value and key: value pairs whose key ends in a credential word (a key after "/" is a path segment, not a
- * key). The value runs to whitespace, a quote, `&`, `;`, `,`, a closing bracket, an angle bracket, or a
- * backslash (the compound-line rule), so a pair inside a query string, a header list, a JSON fragment, or a
- * parenthesis keeps the text after it. A value that is already the marker is not a value, so a second pass over a
- * scrubbed message changes nothing; scrubCredentialPairs decides whether the key names a credential.
+ * Where a key may start: after a character that cannot be part of a key, or after a JSON escape (`\n`, `\t`,
+ * `\u000a`) inside a serialized message, where the character before the key is the escape's last letter and
+ * `\b` sees no boundary (reviewer D round 5 escapes). Never right after a backslash, so the escape letter is not
+ * read as the first letter of the key (`\nExpiredToken:` is the error code, not a key `nExpiredToken`).
+ */
+const KEY_BOUNDARY_PATTERN = String.raw`(?:(?<![A-Za-z0-9_.\\-])|(?<=\\[nrtbfv])|(?<=\\u[0-9A-Fa-f]{4}))`;
+/** Where a header name or a scheme word may start: the same boundaries, allowing a `.` or `-` before the name. */
+const NAME_BOUNDARY_PATTERN = String.raw`(?:(?<![A-Za-z0-9_])|(?<=\\[nrtbfv])|(?<=\\u[0-9A-Fa-f]{4}))`;
+
+/**
+ * The authorization scheme words, matched in any casing (harness revision 3, row B): the HTTP schemes, Okta's
+ * SSWS, the Splunk and Snowflake header schemes, and SigV4. Under a credential-named key only an Authorization
+ * header treats the word as a scheme in front of the value; under any other key the word is the value.
+ */
+const ERROR_SCHEME_WORDS = "Bearer|Basic|Digest|Negotiate|NTLM|OAuth|SSWS|Token|ApiKey|Api-Key|Splunk|Snowflake|AWS4-HMAC-SHA256";
+const ERROR_SCHEME_PATTERN = `(?:${ERROR_SCHEME_WORDS})`;
+/**
+ * key=value and key: value pairs whose key ends in a credential word, wherever the key stands (after a flag
+ * prefix `--`, `-D`, a path segment `kv/`, a parenthesis, or a comma: reviewer #78 row D). The value runs to
+ * whitespace, a quote, `&`, `;`, `,`, a closing bracket, an angle bracket, or a backslash (the compound-line
+ * rule), so a pair inside a query string, a header list, a JSON fragment, or a parenthesis keeps the text after
+ * it; a marker inside the value (a URL whose query was already removed) is part of it. A value that is already
+ * the marker is not a value, so a second pass over a scrubbed message changes nothing; scrubCredentialPairs
+ * decides whether the key names a credential.
  */
 const ERROR_CREDENTIAL_PAIR_PATTERN = new RegExp(
-  `(?<!/)\\b(${ERROR_CREDENTIAL_KEY_PATTERN})(["']?\\s*[=:]\\s*["']?)((?:(?:Bearer|Basic|Digest|Token|ApiKey)\\s+)?(?!\\[REDACTED\\])[^\\s"'&;,<>)\\]}\\\\]+)`,
+  `${KEY_BOUNDARY_PATTERN}(${ERROR_CREDENTIAL_KEY_PATTERN})((?:\\\\*["'])?\\s*[=:]\\s*["']?)((?:${ERROR_SCHEME_PATTERN}\\s+)?(?!\\[REDACTED\\])(?:\\[REDACTED\\]|[^\\s"'&;,<>)\\]}\\\\])+)`,
   "gi",
 );
+/** `--name value` (a CLI flag echoed in a spawned CLI's stderr, reviewer #78 row D): the next token is the value. */
+const FLAG_CARRIER_PATTERN = new RegExp(`(?<![A-Za-z0-9_.-])--(${ERROR_CREDENTIAL_KEY_PATTERN})(\\s+)(?![-\\[])([^\\s"'&;,<>)\\]}\\\\]+)`, "gi");
 const TRAILING_PUNCTUATION_PATTERN = /[.!?:)]+$/;
 
-const ERROR_SCHEME_PATTERN = "(?:Bearer|Basic|Digest|Negotiate|SSWS|Token|ApiKey|Api-Key)";
 /**
- * A quoted value: the opening quote (plain, or JSON-escaped when the message was itself serialized) with its
- * quote character captured, the value up to the matching close quote (so it may hold spaces and the other quote
- * character), and the close quote. Both patterns below place it after two capturing groups, so the quote
- * character is group 4 and the close quote group 5.
+ * A quoted value: the opening quote with the backslashes that escape it at its serialization depth (none when the
+ * message is plain, one when it was serialized once, three when twice), the value up to the close quote at the
+ * same depth (an escaped quote inside the value, `\"` inside `"..."`, is part of the value, as is a deeper
+ * quote), and that close quote. Both patterns below place it after two capturing groups, so the backslashes are
+ * group 4, the quote character group 5, the value group 6, and the close quote group 7.
  */
-const ERROR_QUOTED_VALUE_PATTERN = String.raw`(\\?(["']))(?:(?!\\?\4)[^\n\\])+(\\?\4)`;
+const ERROR_QUOTED_VALUE_PATTERN = String.raw`(?<!\\)((\\*)(["']))((?:(?!(?<!\\)\4\5)[^\n])+)((?<!\\)\4\5)`;
 /**
  * Codex P1 (quoted header value). `X-Api-Key: "value"`, `Cookie: sid='value'`, `Authorization: Bearer "value"`,
  * `\"X-Auth-Key\":\"value\"`: with or without spaces, single or double quotes, plain or JSON-escaped. The quotes
@@ -526,37 +553,55 @@ const ERROR_QUOTED_VALUE_PATTERN = String.raw`(\\?(["']))(?:(?!\\?\4)[^\n\\])+(\
  * separator, the scheme, and the quotes stay so the message remains diagnosable.
  */
 const ERROR_QUOTED_CREDENTIAL_PATTERN = new RegExp(
-  String.raw`\b(${ERROR_CREDENTIAL_KEY_PATTERN})((?:\\?["'])?\s*[=:]\s*(?:${ERROR_SCHEME_PATTERN}\s*)?)${ERROR_QUOTED_VALUE_PATTERN}`,
+  String.raw`${KEY_BOUNDARY_PATTERN}(${ERROR_CREDENTIAL_KEY_PATTERN})((?:\\*["'])?\s*[=:]\s*(?:${ERROR_SCHEME_PATTERN}\s*)?)${ERROR_QUOTED_VALUE_PATTERN}`,
   "gi",
 );
 // A scheme word that is itself quoted (`"Token":"..."`, a JSON key) or ends a compound key (`"x-api-key":`,
 // `"settings.token":`) is a pair the rule above already handled.
 const ERROR_QUOTED_SCHEME_PATTERN = new RegExp(String.raw`(?<!["'\\./-])\b(${ERROR_SCHEME_PATTERN})(\s*)${ERROR_QUOTED_VALUE_PATTERN}`, "gi");
-const QUOTED_VALUE_REPLACEMENT = `$1$2$3${REDACTED_ERROR_VALUE}$5`;
+const QUOTED_VALUE_REPLACEMENT = `$1$2$3${REDACTED_ERROR_VALUE}$7`;
 /**
  * A quoted phrase that is a scheme word and one value (`"Bearer prod-token"`, `\"Token prod-key\"`, `'Basic abc'`):
  * the quotes delimit a header value being quoted, so the value goes whatever its shape (reviewer D round 5 depth
  * control, the quoted name-shaped bearer), where the same phrase bare in prose (`sent as Bearer prod-token`) is
  * judged by the scheme rule's shape test. A quoted phrase of several words after the scheme is prose and stays.
  */
-const ERROR_QUOTED_SCHEME_PHRASE_PATTERN = new RegExp(String.raw`(\\?(["']))(${ERROR_SCHEME_PATTERN})(\s+)((?:(?!\\?\2)[^\s"'\\])+)(\\?\2)`, "gi");
-const QUOTED_SCHEME_PHRASE_REPLACEMENT = `$1$3$4${REDACTED_ERROR_VALUE}$6`;
+const ERROR_QUOTED_SCHEME_PHRASE_PATTERN = new RegExp(
+  String.raw`(?<!\\)((\\*)(["']))(${ERROR_SCHEME_PATTERN})(\s+)((?:(?!(?<!\\)\2\3)[^\s"'\\])+)((?<!\\)\2\3)`,
+  "gi",
+);
+const QUOTED_SCHEME_PHRASE_REPLACEMENT = `$1$4$5${REDACTED_ERROR_VALUE}$7`;
 
 const CREDENTIAL_KEY_WORD_PATTERN = new RegExp(`(?:${ERROR_CREDENTIAL_WORDS})$`, "i");
 // Credential words that end too many ordinary words to count when glued to a lowercase prefix (`oauth`, `ssid`).
 const WEAK_CREDENTIAL_WORD_PATTERN = /^(?:auth|sid|sig)$/i;
-const PAIR_VALUE_SCHEME_PATTERN = /^(?:Bearer|Basic|Digest|Token|ApiKey)\s+/i;
-const BARE_SCHEME_WORD_PATTERN = /^(?:Bearer|Basic|Digest|Token|ApiKey)$/i;
+const PAIR_VALUE_SCHEME_PATTERN = new RegExp(`^${ERROR_SCHEME_PATTERN}\\s+`, "i");
+const BARE_SCHEME_WORD_PATTERN = new RegExp(`^${ERROR_SCHEME_PATTERN}$`, "i");
+/** The keys whose value is `<scheme> <credential>`: Authorization and Proxy-Authorization. */
+const AUTHORIZATION_KEY_PATTERN = /authorization$/i;
+const SCHEME_PARAMETER_PATTERN = /^([A-Za-z][A-Za-z0-9_-]*)=(?!=)/;
+
+/**
+ * Whether the value after a scheme word is a `name=value` parameter list (SigV4 `Credential=...`, `realm="api"`,
+ * `OAuth oauth_signature=...`) rather than one bearer credential: the name is shaped like a name, and the `=` is
+ * followed by more text or the whole is not base64-length (`realm=` is a parameter; `cGFzc3dvcmQ=` is padding).
+ */
+function isSchemeParameterList(value: string): boolean {
+  const parameter = SCHEME_PARAMETER_PATTERN.exec(value);
+  if (parameter === null || !isNameSegment(parameter[1])) return false;
+  return parameter[0].length < value.length || value.length % 4 !== 0;
+}
 
 /**
  * Whether a key names a credential (reviewer D round 5 baseline). It does when it is a credential word
- * (`password`, `Token`, `skey`), sets one off with `_`, `-`, or `.` (`DB_PASSWORD`, `AZURE_CLIENT_SECRET`,
- * `x-api-key`, `Proxy-Authorization`), or is a lowerCamelCase, lowercase, or uppercase compound ending in one
- * (`accessToken`, `clientSecret`, `dbpassword`, `ACCESSTOKEN`). A PascalCase identifier that merely ends in the
- * word (`InvalidAuthenticationToken`, `ExpiredToken`) is an error code or a type name, and the text after its
- * colon is prose. A key that names an identifier (`AWS_ACCESS_KEY_ID`, `AZURE_TENANT_ID`, `CLOUDFLARE_EMAIL`)
- * never ends in a credential word, so its value is judged by its own shape alone; the bearer ids (`secret_id` and
- * the session ids, see ERROR_CREDENTIAL_WORDS) are credential words, so that suffix test never reaches them.
+ * (`password`, `Token`, `skey`, `SessionToken`), sets one off with `_`, `-`, or `.` (`DB_PASSWORD`,
+ * `AZURE_CLIENT_SECRET`, `x-api-key`, `Proxy-Authorization`), or is a lowerCamelCase, lowercase, or uppercase
+ * compound ending in one (`accessToken`, `clientSecret`, `dbpassword`, `ACCESSTOKEN`). A PascalCase identifier
+ * that merely ends in the word (`InvalidAuthenticationToken`, `ExpiredToken`) is an error code or a type name,
+ * and the text after its colon is prose. A key that names an identifier (`AWS_ACCESS_KEY_ID`, `AZURE_TENANT_ID`,
+ * `CLOUDFLARE_EMAIL`) never ends in a credential word, so its value is judged by its own shape alone; the bearer
+ * ids (`secret_id`, `token_id`, and the session ids, see ERROR_CREDENTIAL_WORDS) are credential words, so that
+ * suffix test never reaches them.
  */
 function isCredentialNamedKey(key: string): boolean {
   const word = CREDENTIAL_KEY_WORD_PATTERN.exec(key)?.[0];
@@ -570,18 +615,35 @@ function isCredentialNamedKey(key: string): boolean {
 /**
  * The value of a pair whose key names a credential is the credential and is removed whatever its shape and
  * length (reviewer D round 5 baseline): `password=letmein`, `DB_PASSWORD=Sunshine`, `AZURE_CLIENT_SECRET: abc12`,
- * and `DUO_SKEY=p@ss` go the way `{"password":"letmein"}` already did. The key, the separator, a scheme word in
- * front of the value, and the sentence punctuation after it stay; a scheme word standing alone ("sent as
- * Authorization: Bearer") names the scheme and carries nothing.
+ * and `DUO_SKEY=p@ss` go the way `{"password":"letmein"}` already did. The key, the separator, and the sentence
+ * punctuation after the value stay. Under an Authorization header a scheme word in front of the value stays
+ * too, a scheme word standing alone ("sent as Authorization: Bearer") names the scheme and carries nothing, and
+ * a parameter list after the scheme (SigV4 `Credential=..., SignedHeaders=..., Signature=...`) is judged pair by
+ * pair so the region and the request scope stay. Under any other credential key the scheme word is the value
+ * (CodeRabbit r4078025849 on #63: `sslPassword=splunk rejected`, `db_password: token`), and the prose after it
+ * stays. A `--name value` flag is a pair whose separator is the space.
  */
 function scrubCredentialPairs(text: string): string {
-  return text.replace(ERROR_CREDENTIAL_PAIR_PATTERN, (match: string, key: string, separator: string, value: string) => {
+  const scrubbed = text.replace(ERROR_CREDENTIAL_PAIR_PATTERN, (match: string, key: string, separator: string, value: string) => {
     if (!isCredentialNamedKey(key)) return match;
     const scheme = PAIR_VALUE_SCHEME_PATTERN.exec(value)?.[0] ?? "";
+    const authorization = AUTHORIZATION_KEY_PATTERN.test(key);
+    if (scheme.length > 0 && !authorization) {
+      const word = scheme.trimEnd();
+      return `${key}${separator}${REDACTED_ERROR_VALUE}${value.slice(word.length)}`;
+    }
     const core = value.slice(scheme.length).replace(TRAILING_PUNCTUATION_PATTERN, "");
-    if (core.length === 0 || BARE_SCHEME_WORD_PATTERN.test(core)) return match;
-    return `${key}${separator}${scheme}${REDACTED_ERROR_VALUE}${value.slice(scheme.length + core.length)}`;
+    if (core.length === 0) return match;
+    const tail = value.slice(scheme.length + core.length);
+    if (authorization) {
+      if (BARE_SCHEME_WORD_PATTERN.test(core)) return match;
+      if (isSchemeParameterList(core)) return `${key}${separator}${scheme}${scrubCredentialPairs(core)}${tail}`;
+    }
+    return `${key}${separator}${scheme}${REDACTED_ERROR_VALUE}${tail}`;
   });
+  return scrubbed.replace(FLAG_CARRIER_PATTERN, (match: string, key: string, space: string) =>
+    isCredentialNamedKey(key) ? `--${key}${space}${REDACTED_ERROR_VALUE}` : match,
+  );
 }
 
 /**
@@ -590,25 +652,35 @@ function scrubCredentialPairs(text: string): string {
  * value is removed whatever its shape. Where it ends follows the compound-line rule shared by every scrubber:
  * a quoted value (a plain or JSON-escaped quote) ends at its closing quote, so a closed value that holds `; Name:`
  * is one value and the quotes stay around the marker; an unquoted value, or a quoted one that is never closed,
- * ends at the `;` or `,` that introduces the next `Name:` header token on the line, at a `<` or `>` (the header
- * quoted inside markup), at a `"` that closes the JSON string and container that carried the line (`"}`, `"]`),
- * at a JSON-escaped line break (`\n`, `\r`, `\u000a`, `\u000d` as backslash text, the end of the line inside a
- * serialized message), or
- * at the end of the line, so the next header keeps its name and gets its own carrier treatment. A value that is
- * already the marker is left alone, so a second pass over a scrubbed message leaves the text after the marker as
- * it is.
+ * ends at the `;` or `,` that introduces the next `Name:` header token on the line (a name may hold dots,
+ * `X.Api.Key:`), at a `<` or `>` (the header quoted inside markup), at a `"` that closes the JSON string and
+ * container that carried the line (`"}`, `"]`), at a JSON-escaped line break (`\n`, `\r`, `\u000a`, `\u000d` as
+ * backslash text, the end of the line inside a serialized message), or at the end of the line, so the next
+ * header keeps its name and gets its own carrier treatment. A value that is already the marker is left alone,
+ * so a second pass over a scrubbed message leaves the text after the marker as it is.
  *
  * The header name counts as a carrier at a line start, after any character that is not part of a name, and
  * after a JSON escape (reviewer D round 5 escapes): inside a serialized message the character before `Cookie`
  * is the escape's last letter (`\nCookie`, `\u000aCookie`), a word character to `\b`, and a boundary that
  * relied on `\b` left the free-form removal to the pair rule, which stops at the first `;` and judges every
- * later cookie pair on its own name and shape.
+ * later cookie pair on its own name and shape. After `--`, `.`, or `/` (plain or JSON-escaped) the name is a
+ * flag, a property, or a path segment (`--x-auth-key=value -h db`, `-Dspring.datasource.x-auth-key=value`,
+ * `kv/x-auth-key=value see log`), a pair whose value ends at the next space, so the pair rule takes it and the
+ * text after the value stays.
  */
-const HEADER_CARRIER_PATTERN = /(?:(?<![A-Za-z0-9_])|(?<=\\[nrtbfv])|(?<=\\u[0-9A-Fa-f]{4}))(set-cookie|cookie|x-auth-key|x-auth-email)(\s*[:=]\s*)(?!\s*\[REDACTED\])/gi;
-const HEADER_CARRIER_QUOTE_PATTERN = /^(\\?)(["'])/;
-const NEXT_HEADER_TOKEN_PATTERN = /[;,]\s*[A-Za-z][A-Za-z0-9-]*\s*:/;
+const HEADER_CARRIER_PATTERN = new RegExp(`(?:(?<![A-Za-z0-9_./-])|(?<=\\\\[nrtbfv])|(?<=\\\\u[0-9A-Fa-f]{4}))(set-cookie|cookie|x-auth-key|x-auth-email)(\\s*[:=]\\s*)(?!\\s*\\[REDACTED\\])`, "gi");
+const HEADER_CARRIER_QUOTE_PATTERN = /^(\\*)(["'])/;
+const NEXT_HEADER_TOKEN_PATTERN = /[;,]\s*[A-Za-z][A-Za-z0-9.-]*\s*:/;
 const MARKUP_OR_JSON_CLOSE_PATTERN = /[<>]|"(?=\s*[}\]])/;
 const ESCAPED_LINE_BREAK_PATTERN = /\\(?:[nr]|u000[aAdD])/;
+
+/** The first occurrence of `quote` in `line` at or after `from` that is not escaped by a backslash before it, or -1. */
+function closingQuoteIndex(line: string, quote: string, from: number): number {
+  for (let index = line.indexOf(quote, from); index !== -1; index = line.indexOf(quote, index + 1)) {
+    if (index === 0 || line[index - 1] !== "\\") return index;
+  }
+  return -1;
+}
 
 /** The end of a free-form header value that starts at `start`, and the quote (plain or escaped) that encloses a closed quoted value. */
 function headerCarrierValueEnd(text: string, start: number): { end: number; quote?: string } {
@@ -616,7 +688,7 @@ function headerCarrierValueEnd(text: string, start: number): { end: number; quot
   const line = text.slice(start, newline === -1 ? text.length : newline);
   const opening = HEADER_CARRIER_QUOTE_PATTERN.exec(line);
   if (opening) {
-    const close = line.indexOf(opening[0], opening[0].length);
+    const close = closingQuoteIndex(line, opening[0], opening[0].length);
     if (close !== -1) return { end: start + close + opening[0].length, quote: opening[0] };
   }
   // An unterminated quote is part of the value; the stops are searched after it.
@@ -644,20 +716,53 @@ function scrubHeaderCarriers(text: string): string {
 }
 
 /**
- * Carrier rules: a value is removed because of what carries it (a quoted header or pair value, an authorization
- * scheme, a JWT or PEM shape), not because of its own shape. The free-form header carriers (Cookie, Set-Cookie,
- * X-Auth-Key, X-Auth-Email) run first in scrubHeaderCarriers, so these only ever see the marker.
+ * Whether the token after a bare scheme word in prose is a credential: long, or carrying a digit or a base64
+ * symbol (padding included), or changing case inside the word, so prose such as "Basic authentication" and
+ * "Bearer token is missing" stays. A `name=value` parameter list after the scheme (`Bearer realm="api"`, SigV4
+ * `Credential=...`, `OAuth oauth_signature=...`) is judged pair by pair by the pair rule, not as one bearer value.
  */
-const CARRIER_TEXT_PATTERNS: ReadonlyArray<readonly [RegExp, string]> = [
-  // Quoted header and pair values first, whatever their shape, so the scheme and pair rules see the marker.
-  [ERROR_QUOTED_CREDENTIAL_PATTERN, QUOTED_VALUE_REPLACEMENT],
+function looksLikeSchemeCredential(value: string): boolean {
+  if (isSchemeParameterList(value)) return false;
+  return value.length >= 16 || /[\d+/=]/.test(value) || /[a-z][A-Z]/.test(value);
+}
+
+type TextRule = readonly [RegExp, string | ((...groups: string[]) => string)];
+
+function applyTextRule(text: string, [pattern, replacement]: TextRule): string {
+  return typeof replacement === "string" ? text.replace(pattern, replacement) : text.replace(pattern, replacement);
+}
+
+/**
+ * Carrier rules: a value is removed because of what carries it (a quoted header or pair value, an authorization
+ * scheme, a vendor token prefix, a JWT or PEM shape), not because of its own shape. The free-form header carriers
+ * (Cookie, Set-Cookie, X-Auth-Key, X-Auth-Email) run first in scrubHeaderCarriers, so these only ever see the marker.
+ */
+const CARRIER_TEXT_PATTERNS: ReadonlyArray<TextRule> = [
+  // Quoted header and pair values first, whatever their shape, so the scheme and pair rules see the marker. Under
+  // an Authorization header a scheme word that opens the quoted value stays (`Authorization: "Bearer [REDACTED]"`).
+  [
+    ERROR_QUOTED_CREDENTIAL_PATTERN,
+    (_match: string, key: string, separator: string, opening: string, _backslashes: string, _quote: string, content: string, closing: string) => {
+      const scheme = AUTHORIZATION_KEY_PATTERN.test(key) ? PAIR_VALUE_SCHEME_PATTERN.exec(content)?.[0] ?? "" : "";
+      return `${key}${separator}${opening}${scheme}${REDACTED_ERROR_VALUE}${closing}`;
+    },
+  ],
   [ERROR_QUOTED_SCHEME_PATTERN, QUOTED_VALUE_REPLACEMENT],
   [ERROR_QUOTED_SCHEME_PHRASE_PATTERN, QUOTED_SCHEME_PHRASE_REPLACEMENT],
-  // Authorization scheme values wherever they appear (headers, cookies, HTML, JSON messages); the value must be
-  // long, carry a digit or base64 symbol, or change case inside the word, so prose such as "Basic authentication"
-  // and "Bearer Token" stays.
-  // Case-sensitive so the inner-case-change test means what it says (under /i, [a-z][A-Z] is any two letters).
-  [/\b(Bearer|bearer|BEARER|Basic|basic|BASIC|Digest|digest|Negotiate|negotiate|SSWS|Token|token|TOKEN|ApiKey|apikey|APIKEY|Api-Key|api-key)\s+(?=[A-Za-z0-9\-._~+/=:]{16,}|[A-Za-z0-9\-._~+/=:]*[\d+/=]|[A-Za-z0-9\-._~+/=:]*[a-z][A-Z])[A-Za-z0-9\-._~+/=:]{6,}/g, `$1 ${REDACTED_ERROR_VALUE}`],
+  // Authorization scheme values wherever they appear (headers, cookies, HTML, JSON messages), in any casing of
+  // the scheme word; looksLikeSchemeCredential keeps prose and parameter lists.
+  [
+    new RegExp(String.raw`${NAME_BOUNDARY_PATTERN}(${ERROR_SCHEME_PATTERN})\s+([A-Za-z0-9\-._~+/=:]{6,})`, "gi"),
+    (match: string, scheme: string, value: string) => (looksLikeSchemeCredential(value) ? `${scheme} ${REDACTED_ERROR_VALUE}` : match),
+  ],
+  // Vendor token prefixes name the token type: AWS access key ids (long-term `AKIA`, temporary `ASIA`) and STS
+  // bearer and context-specific credentials (`ABIA`, `ACCA`), Stripe secret and restricted keys, GitHub tokens,
+  // Slack tokens. The prefix is the carrier, so these go from snapshots too (AWS evidence carries its access key
+  // ids masked); the AWS unique ids of resources (roles, users, groups, policies) are bare shapes below.
+  [/\b(?:AKIA|ASIA|ABIA|ACCA)[A-Z0-9]{16}\b/g, REDACTED_ERROR_VALUE],
+  [/\b[sr]k_(?:live|test)_[A-Za-z0-9]{16,}/g, REDACTED_ERROR_VALUE],
+  [/\b(?:gh[oprsu]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,})/g, REDACTED_ERROR_VALUE],
+  [/\bxox[abeoprs]-[A-Za-z0-9-]{10,}/g, REDACTED_ERROR_VALUE],
   // JWT-shaped strings.
   [/\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}/g, REDACTED_ERROR_VALUE],
   // PEM blocks, whole or cut off.
@@ -665,19 +770,27 @@ const CARRIER_TEXT_PATTERNS: ReadonlyArray<readonly [RegExp, string]> = [
 ];
 
 /** Bare-shape rules: a value is removed for its own shape, wherever it stands. Error text only; a snapshot keeps its identifiers. */
-const BARE_SHAPE_PATTERNS: ReadonlyArray<readonly [RegExp, string]> = [
-  // AWS access key ids, 40-character secret access keys, long secret-shaped blobs, and hex digests.
-  [/\b(?:AKIA|ASIA|AROA|AIDA|AGPA|ANPA|ANVA|APKA|ABIA|ACCA)[A-Z0-9]{16}\b/g, REDACTED_ERROR_VALUE],
+const BARE_SHAPE_PATTERNS: ReadonlyArray<TextRule> = [
+  // AWS unique ids of roles, users, groups, managed policies, policy versions, and public keys: opaque
+  // identifiers in error text, resource names in a snapshot (an assumed-role principal is `AROA...:session`).
+  [/\b(?:AROA|AIDA|AGPA|ANPA|ANVA|APKA)[A-Z0-9]{16}\b/g, REDACTED_ERROR_VALUE],
+  // 40-character secret access keys, long secret-shaped blobs, and hex digests.
   [/(?<![A-Za-z0-9/+=])[A-Za-z0-9/+]{40}(?![A-Za-z0-9/+=])/g, REDACTED_ERROR_VALUE],
   // Long blobs must carry a digit so camelCase identifiers survive.
   [/(?<![A-Za-z0-9+_=-])(?=[A-Za-z0-9+_-]*\d)[A-Za-z0-9+_-]{40,}={0,2}(?![A-Za-z0-9+_=-])/g, REDACTED_ERROR_VALUE],
   [/\b[a-f0-9]{32,}\b/gi, REDACTED_ERROR_VALUE],
 ];
 
-const ERROR_TEXT_PATTERNS: ReadonlyArray<readonly [RegExp, string]> = [...CARRIER_TEXT_PATTERNS, ...BARE_SHAPE_PATTERNS];
-
-// URL userinfo and query strings anywhere in the string, not only when the string starts with a URL.
-const ERROR_URL_PATTERN = /\b(https?:\/\/)(?:[^\s/@"'<>]+@)?([^\s?#"'<>]+)(\?[^\s#"'<>]*)?/gi;
+/**
+ * URL userinfo and query strings anywhere in the string, not only when the string starts with a URL: any scheme
+ * (`https://`, `proxy://`), plain or with its slashes JSON-escaped (`https:\/\/`, reviewer #78 row C), after a
+ * JSON escape as after any other boundary. The scheme, host, and path stay; the userinfo goes and the query
+ * becomes the marker.
+ */
+const ERROR_URL_PATTERN = new RegExp(
+  String.raw`(?:(?<![A-Za-z0-9+.\\-])|(?<=\\[nrtbfv])|(?<=\\u[0-9A-Fa-f]{4}))([A-Za-z][A-Za-z0-9+.-]*:(?:\/\/|\\\/\\\/))(?:[^\s\/@"'<>\\]+@)?((?:[^\s?#"'<>\\]|\\\/)+)(\?(?:[^\s#"'<>\\]|\\\/)*)?`,
+  "g",
+);
 
 /**
  * Rule 9 scrub boundary for bare values. A run of 16 or more token characters is removed when it is shaped
@@ -688,9 +801,10 @@ const ERROR_URL_PATTERN = /\b(https?:\/\/)(?:[^\s/@"'<>]+@)?([^\s?#"'<>]+)(\?[^\
  * whitespace end a run, so path segments, hostnames, ARNs, and emails are judged piece by piece. Opaque
  * identifiers whose shape is a token's are removed from error text as well; they travel in structured fields.
  */
-// Trailing "=" is base64 padding only when a delimiter follows it; before a marker (`API_KEY=[REDACTED]`) or a path
+// Trailing "=" is base64 padding only when a delimiter follows it; before a marker (`API_KEY=[REDACTED]`), a quote
+// (`AWS_SECRET_ACCESS_KEY='[REDACTED]'`, `signature_method='ccg'`), an escape, or a path
 // (`AWS_SHARED_CREDENTIALS_FILE=/home/audit/.aws/credentials`) it is the pair's separator, so the key keeps its name.
-const LONG_TOKEN_RUN_PATTERN = /[A-Za-z0-9+_-]{16,}(?:={1,2}(?![A-Za-z0-9&[/]))?/g;
+const LONG_TOKEN_RUN_PATTERN = /[A-Za-z0-9+_-]{16,}(?:={1,2}(?![A-Za-z0-9&[/"'\\<]))?/g;
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const UPPERCASE_CODE_PATTERN = /^[A-Z][A-Z_]*$|^[A-Z][A-Z0-9]*(?:[_-][A-Z0-9]+)+$/;
 const MIN_LETTERS_FOR_CASING = 6;
@@ -736,32 +850,28 @@ function scrubLongTokens(text: string): string {
  */
 export function redactErrorText(text: string): string {
   let scrubbed = scrubCarriers(text);
-  for (const [pattern, replacement] of BARE_SHAPE_PATTERNS) {
-    scrubbed = scrubbed.replace(pattern, replacement);
-  }
+  for (const rule of BARE_SHAPE_PATTERNS) scrubbed = applyTextRule(scrubbed, rule);
   scrubbed = scrubCredentialPairs(scrubbed);
   return scrubLongTokens(scrubbed);
 }
 
-/** The carrier passes shared by error text and snapshot strings: configured secrets, URL userinfo and query, header carriers, quoted values, schemes, JWT and PEM shapes. */
+/** The carrier passes shared by error text and snapshot strings: configured secrets, URL userinfo and query, header carriers, quoted values, schemes, vendor token prefixes, JWT and PEM shapes. */
 function scrubCarriers(text: string): string {
   let scrubbed = scrubConfiguredSecrets(text);
-  scrubbed = scrubbed.replace(ERROR_URL_PATTERN, (_match, scheme: string, hostPath: string, query?: string) =>
+  scrubbed = scrubbed.replace(ERROR_URL_PATTERN, (_match: string, scheme: string, hostPath: string, query?: string) =>
     `${scheme}${hostPath}${query ? `?${REDACTED_ERROR_VALUE}` : ""}`,
   );
   scrubbed = scrubHeaderCarriers(scrubbed);
-  for (const [pattern, replacement] of CARRIER_TEXT_PATTERNS) {
-    scrubbed = scrubbed.replace(pattern, replacement);
-  }
+  for (const rule of CARRIER_TEXT_PATTERNS) scrubbed = applyTextRule(scrubbed, rule);
   return scrubbed;
 }
 
 /**
  * Rule 9 data-side scrub for a string kept in a snapshot (reviewer D round 5 depth control): the carrier rules of
  * redactErrorText (the configured secrets in every encoded form, URL userinfo and query strings, the free-form
- * header carriers, quoted header and pair values, authorization schemes, JWT and PEM shapes, and credential-named
- * pairs) without its bare-shape rules, so a value is removed for what carries it and an identifier, a digest, or a
- * key id that is data stays data.
+ * header carriers, quoted header and pair values, authorization schemes, vendor token prefixes, JWT and PEM
+ * shapes, and credential-named pairs) without its bare-shape rules, so a value is removed for what carries it and
+ * an identifier, a digest, or a key id that is data stays data.
  */
 export function redactCarrierText(text: string): string {
   return scrubCredentialPairs(scrubCarriers(text));
@@ -772,17 +882,19 @@ const SNAPSHOT_DEPTH_CAP = 32;
 /**
  * Field names whose value in API data is a secret whatever its shape. Exact names, not the suffix rule of the error
  * text pair rule: a snapshot's own keys name collections about credentials (`tokens`, `credentials`,
- * `passwordCredentials`, `webauthncredentials`, `hardtoken`) that carry metadata, and those stay.
+ * `passwordCredentials`, `webauthncredentials`, `hardtoken`) that carry metadata, and those stay. The URL-valued
+ * webhook keys are here because the token travels in the URL's path.
  */
 const SNAPSHOT_SECRET_KEY_PATTERN =
-  /^(?:secret[_-]?key|skey|secret|client[_-]?secret|api[_-]?secret|password|passwd|passphrase|private[_-]?key|access[_-]?token|refresh[_-]?token|id[_-]?token|authorization|cookie|set-cookie|x-auth-key|api[_-]?key|x-api-key)$/i;
+  /^(?:secret[_-]?key|skey|secret|client[_-]?secret|api[_-]?secret|password|passwd|passphrase|private[_-]?key|access[_-]?token|refresh[_-]?token|id[_-]?token|session[_-]?token|secret[_-]?access[_-]?key|assertion|connection[_-]?string|authorization|cookie|set-cookie|x-auth-key|api[_-]?key|x-api-key|webhook(?:[_-]?url)?)$/i;
 /**
- * The bearer-id override for snapshot keys (CodeRabbit r4077259415 on #78): a key ending in `secret_id`, any prefix,
- * casing, and separator (`secret_id`, `VAULT_SECRET_ID`, `role_secret_id`, `roleSecretId`), holds a Vault AppRole
- * secret id, which authenticates rather than identifies, so its value is the marker whatever its shape; an `_id` key
- * that identifies (`client_id`, `tenant_id`, `key_id`, `user_id`) is data and stays.
+ * The bearer-id override for snapshot keys (CodeRabbit r4077259415 on #78, harness revision 3): a key ending in
+ * `secret_id` or `token_id`, any prefix, casing, and separator (`secret_id`, `VAULT_SECRET_ID`, `role_secret_id`,
+ * `roleSecretId`, `token_id`, `tokenId`), holds a Vault AppRole secret id or a token id, which authenticates rather
+ * than identifies, so its value is the marker whatever its shape; an `_id` key that identifies (`client_id`,
+ * `tenant_id`, `key_id`, `user_id`) is data and stays.
  */
-const SNAPSHOT_BEARER_ID_KEY_PATTERN = /secret[_-]?id$/i;
+const SNAPSHOT_BEARER_ID_KEY_PATTERN = /(?:secret|token)[_-]?id$/i;
 
 /** The snapshot walk behind scrubSnapshotValue and the integration's own data walkers: one key rule, one string rule, one cap. */
 function scrubSnapshotTree(value: unknown, isSecretKey: (key: string) => boolean, depth: number): unknown {
