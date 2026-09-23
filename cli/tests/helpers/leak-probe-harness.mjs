@@ -19,7 +19,11 @@
  * `num_uses`, `bound_cidrs`, `accessor` and the URL-only webhook exception, flag and path carriers,
  * the scheme-word-order row, slash-escaped URLs, the query-separator cookie row, and any-casing
  * scheme words. Percent-encoded and JavaScript hex line breaks run as informational rows: counted
- * in the report, never a leak in the gating totals, never a throw from `assertNoLeaks`.
+ * in the report, never a leak in the gating totals, never a throw from `assertNoLeaks`. Class 8
+ * classifies every request the runner made (CodeRabbit 5286122785 on #78 `8b92f20`): a request is
+ * unsafe when it does not parse as a URL, when its username or password is non-empty, or when its
+ * origin differs from the configured origin; each unsafe request is a leak and is listed on the
+ * class 8 result with its userinfo masked.
  *
  * Depends only on `node:` modules and `./bundle-contents.mjs`; runs on Node 22.19 or newer.
  */
@@ -896,13 +900,41 @@ function stringify(value) {
   }
 }
 
-function originOfUrl(url) {
+function originOfParsedUrl(parsed) {
+  return parsed.host.length > 0 ? `${parsed.protocol}//${parsed.host}` : parsed.protocol;
+}
+
+/** The URL with its username and password replaced by `[REDACTED]`; an unparseable string is masked by pattern. */
+function maskUserinfo(url) {
+  let parsed;
   try {
-    const parsed = new URL(url);
-    return parsed.host.length > 0 ? `${parsed.protocol}//${parsed.host}` : parsed.protocol;
+    parsed = new URL(url);
   } catch {
-    return undefined;
+    return String(url).replace(/^([A-Za-z][A-Za-z0-9+.-]*:)?(\/\/|\\\\)[^/\\?#@\s]*@/, "$1$2[REDACTED]@");
   }
+  if (parsed.username.length === 0 && parsed.password.length === 0) return parsed.href;
+  const userinfo = `${parsed.username.length > 0 ? "[REDACTED]" : ""}${parsed.password.length > 0 ? ":[REDACTED]" : ""}`;
+  return `${parsed.protocol}//${userinfo}@${parsed.host}${parsed.pathname}${parsed.search}${parsed.hash}`;
+}
+
+/**
+ * Classifies a request the runner made (CodeRabbit 5286122785 on #78 `8b92f20`: the origin test alone
+ * let a userinfo-bearing request on the configured origin pass). Unsafe when the URL does not parse,
+ * when its username or password is non-empty, or when its origin differs from the configured origin;
+ * returns `{ reason, url }` with the userinfo masked, or `undefined` for a safe request.
+ */
+export function classifyRequest(url, configuredOrigin) {
+  let parsed;
+  try {
+    parsed = new URL(url);
+  } catch {
+    return { reason: "does not parse as a URL", url: maskUserinfo(url) };
+  }
+  const masked = maskUserinfo(url);
+  if (parsed.username.length > 0 || parsed.password.length > 0) return { reason: "carries userinfo", url: masked };
+  const origin = originOfParsedUrl(parsed);
+  if (origin !== configuredOrigin) return { reason: `origin ${origin} differs from the configured origin ${configuredOrigin}`, url: masked };
+  return undefined;
 }
 
 /** Leaves of a JSON value, each with its path; an empty array or object is a leaf at its own path. */
@@ -985,6 +1017,8 @@ class ClassResult {
     this.informational = 0;
     this.informationalEntryPoints = new Set();
     this.informationalExamples = [];
+    // Class 8: every request the runner made that was unsafe, `{ label, link, url, reason }` with the userinfo masked.
+    this.unsafeRequests = [];
     this.skipped = null;
     this.notes = [];
   }
@@ -1031,6 +1065,8 @@ function fixtureTextOf(options) {
  *   `{ outputDir, zipPath, toolPayloads }` (classes 7 and 10, end to end, bundle and zip scanned).
  * - `nextLinkRunner({ nextLink, fetchImpl, requests, origin, canaries })` returning
  *   `{ requests, errorTexts, findings, truncated, note }` (class 8); `origin` sets the configured origin.
+ *   Every request the runner made is classified (`classifyRequest`); each unsafe one is a leak and is
+ *   listed on the class result as `unsafeRequests: [{ label, link, url, reason }]`, userinfo masked.
  * - `truncationRunner({ inventory, mode })` for `mode` in `baseline`, `zero-rows-truncated`,
  *   `capped`, `denied`, returning `{ findings, summaries, principals, readers }`, with `inventories`
  *   naming the sets (class 9).
@@ -1257,6 +1293,7 @@ export async function runLeakProbe(options) {
       const [pathCanary, queryCanary, fragmentCanary, userinfoCanary] = [canaries.tokens[4], canaries.tokens[5], canaries.tokens[6], canaries.tokens[7]];
       const tail = `/${pathCanary}/users?cursor=${queryCanary}#${fragmentCanary}`;
       const linkCanaries = [pathCanary, queryCanary, fragmentCanary, userinfoCanary];
+      const linkParts = [["path", pathCanary], ["query", queryCanary], ["fragment", fragmentCanary], ["userinfo", userinfoCanary]];
       const otherScheme = originUrl.protocol === "https:" ? "http:" : "https:";
       const rejected = [
         ["foreign host", `https://evil.example${tail}`],
@@ -1292,16 +1329,29 @@ export async function runLeakProbe(options) {
           return;
         }
         const requests = [...recorder.requests, ...(outcome?.requests ?? []).map((request) => (typeof request === "string" ? { url: request, headers: {} } : request))];
-        const foreign = requests.filter((request) => originOfUrl(request.url) !== configuredOrigin);
+        // Every request is classified: unparseable, userinfo-bearing, or off the configured origin is
+        // unsafe (CodeRabbit 5286122785 on #78 `8b92f20`). A rejected link must produce no request at
+        // all, so on a rejected row a safe-looking request that carries any part of the link followed it.
+        const recordUnsafe = (verdict) => {
+          cls.unsafeRequests.push({ label, link: nextLink, url: verdict.url, reason: verdict.reason });
+          recordLeak(cls, { label, entryPoint: "nextLinkRunner request", input: nextLink, output: verdict.url, planted: verdict.url, window: `unsafe request: ${verdict.reason}` });
+        };
+        for (const request of requests) {
+          const url = String(request.url);
+          const verdict = classifyRequest(url, configuredOrigin);
+          if (verdict !== undefined) recordUnsafe(verdict);
+          else if (!expectFollowed) {
+            const carried = linkParts.find(([, value]) => url.includes(value));
+            if (carried) recordUnsafe({ reason: `a rejected link must produce no request, yet this one carries the link's ${carried[0]}`, url });
+          }
+        }
         if (!expectFollowed) {
-          for (const request of foreign) recordLeak(cls, { label, entryPoint: "nextLinkRunner request", input: nextLink, output: request.url, planted: request.url, window: `request to ${originOfUrl(request.url) ?? "an unparseable origin"}` });
           if (outcome && "truncated" in outcome && outcome.truncated !== true) recordLeak(cls, { label, entryPoint: "nextLinkRunner truncated", input: nextLink, output: stringify(outcome.truncated), planted: "truncated", window: "inventory not reported truncated" });
           // The reason the operator reads is the note plus whatever error text the runner surfaced
           // (a library may name the configured origin in the error and the rejected origin in the note).
           const reasonTexts = [outcome?.note ?? outcome?.reason, ...(outcome?.errorTexts ?? [])].filter((text) => typeof text === "string");
           if (reasonTexts.length > 0 && !reasonTexts.some((text) => text.includes(configuredOrigin))) recordLoss(cls, { label, entryPoint: "nextLinkRunner note", input: nextLink, output: reasonTexts.join(" | "), missing: configuredOrigin });
         } else {
-          for (const request of foreign) recordLeak(cls, { label, entryPoint: "nextLinkRunner request", input: nextLink, output: request.url, planted: request.url, window: `request to ${originOfUrl(request.url) ?? "an unparseable origin"}` });
           const followed = requests.some((request) => {
             try {
               const url = new URL(request.url);
@@ -1462,6 +1512,7 @@ export async function runLeakProbe(options) {
       informational: cls.informational,
       informationalEntryPoints: [...cls.informationalEntryPoints].sort(),
       informationalExamples: cls.informationalExamples,
+      unsafeRequests: cls.unsafeRequests,
       skipped: cls.skipped,
       notes: cls.notes,
     })),
@@ -1509,6 +1560,12 @@ function renderReport(summary) {
     if (cls.examples.length === 0) continue;
     lines.push("", `#### Class ${cls.id} examples (${cls.examples.length} of ${cls.leaks + cls.mustKeepLosses + cls.idempotenceFailures})`);
     for (const example of cls.examples) lines.push(...exampleLines(example));
+  }
+  for (const cls of summary.classes) {
+    if (cls.unsafeRequests.length === 0) continue;
+    lines.push("", `#### Class ${cls.id} unsafe requests (${cls.unsafeRequests.length}; userinfo masked)`);
+    for (const request of cls.unsafeRequests.slice(0, MAX_EXAMPLES_PER_CLASS)) lines.push(`- ${clip(request.label, 100)}: ${request.reason}`, `  - link: ${JSON.stringify(clip(request.link))}`, `  - request: ${JSON.stringify(clip(request.url))}`);
+    if (cls.unsafeRequests.length > MAX_EXAMPLES_PER_CLASS) lines.push(`- ... ${cls.unsafeRequests.length - MAX_EXAMPLES_PER_CLASS} more`);
   }
   for (const cls of summary.classes) {
     if (cls.informationalExamples.length === 0) continue;

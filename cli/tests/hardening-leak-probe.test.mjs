@@ -43,7 +43,9 @@ import {
  * flipping collector, and a raw-writing export, and that the class 1 bearer-id row detects the
  * setting-suffix exemption without its override (CodeRabbit r4077259415 on #78 `e848385`), and that
  * the informational rows (percent-encoded and JavaScript hex line breaks, non-gating by the
- * principal's ruling) are counted in the report without ever failing `assertNoLeaks`. The library
+ * principal's ruling) are counted in the report without ever failing `assertNoLeaks`, and that
+ * class 8 flags a userinfo-bearing request on the configured origin, an unparseable request, and a
+ * userinfo-stripped follow of a rejected link (CodeRabbit 5286122785 on #78 `8b92f20`). The library
  * run wires every entry point the library exposes and must report zero leaks.
  */
 
@@ -175,6 +177,38 @@ async function followerNextLinkRunner({ nextLink, fetchImpl, origin }) {
   const next = new URL(nextLink, base);
   await fetchImpl(next.href, { headers });
   return { errorTexts: [`followed next link ${nextLink}`], findings: [{ id: "USERS-01", status: "pass", summary: "read every page" }], truncated: false };
+}
+
+/** A clean outcome for a walk that stops: nothing in the texts, the inventory truncated, the configured origin in the note. */
+function cleanStopOutcome(origin) {
+  return { errorTexts: [], findings: [{ id: "USERS-01", status: "not_evaluated", summary: "users inventory truncated" }], truncated: true, note: `walk stopped at ${origin}` };
+}
+
+/**
+ * A walk that fetches the next link exactly as the server named it, resolved against the base, and
+ * says nothing about it: the only trace is the request (CodeRabbit 5286122785 on #78 `8b92f20`).
+ */
+async function identityNextLinkRunner({ nextLink, fetchImpl, origin }) {
+  const base = `${origin}/api/v2/users?per_page=100`;
+  await fetchImpl(base, { headers: { Authorization: `Bearer ${CONFIGURED_SECRET}` } });
+  await fetchImpl(new URL(nextLink, base).href, { headers: { Authorization: `Bearer ${CONFIGURED_SECRET}` } });
+  return cleanStopOutcome(origin);
+}
+
+/** A walk that hands the next link to fetch verbatim, so a relative or protocol-relative link is not a URL at all. */
+async function verbatimNextLinkRunner({ nextLink, fetchImpl, origin }) {
+  await fetchImpl(nextLink, { headers: { Authorization: `Bearer ${CONFIGURED_SECRET}` } });
+  return cleanStopOutcome(origin);
+}
+
+/** A walk that strips the userinfo off the next link and follows the rest on the configured origin. */
+async function strippingNextLinkRunner({ nextLink, fetchImpl, origin }) {
+  const base = `${origin}/api/v2/users?per_page=100`;
+  const next = new URL(nextLink, base);
+  next.username = "";
+  next.password = "";
+  if (`${next.protocol}//${next.host}` === origin) await fetchImpl(next.href, { headers: { Authorization: `Bearer ${CONFIGURED_SECRET}` } });
+  return cleanStopOutcome(origin);
 }
 
 /** An export that writes whatever the server answered into its bundle directory. */
@@ -400,8 +434,56 @@ test("leak-probe harness: class 8 catches a walk that follows a foreign next lin
     assert.ok(foreignRequests.some((leak) => leak.label === label), `${label}: a request left for the foreign origin`);
   }
   assert.ok(result.leaks.some((leak) => leak.class === 8 && leak.label === "userinfo on the configured host" && leak.entryPoint === "nextLinkRunner output"), "the userinfo link's password reached the error text");
+  assert.ok(foreignRequests.some((leak) => leak.label === "userinfo on the configured host" && /carries userinfo/.test(leak.window)), "the userinfo request on the configured origin is unsafe");
   assert.ok(result.leaks.some((leak) => leak.class === 8 && leak.label === "relative same origin" && leak.entryPoint === "nextLinkRunner output"), "the followed cursor reached the error text unscrubbed");
   assert.ok(result.leaks.some((leak) => leak.class === 8 && leak.label === "foreign host" && leak.window === "inventory not reported truncated"));
+});
+
+test("leak-probe harness: class 8 flags a userinfo request on the configured origin, an unparseable request, and a stripped follow", async () => {
+  const identity = await runLeakProbe({ integration: "identity-walk", nextLinkRunner: identityNextLinkRunner });
+  const userinfoCanary = identity.canaries.tokens[7];
+  const identityUnsafe = byClass(identity, 8).unsafeRequests;
+  const userinfoRequest = identityUnsafe.find((request) => request.label === "userinfo on the configured host");
+  assert.ok(userinfoRequest, "the userinfo request on the configured origin is recorded as unsafe");
+  assert.equal(userinfoRequest.reason, "carries userinfo");
+  assert.ok(userinfoRequest.link.includes(userinfoCanary), "the input link is recorded");
+  assert.ok(!userinfoRequest.url.includes(userinfoCanary), "the recorded URL masks the password");
+  assert.match(userinfoRequest.url, /^https:\/\/\[REDACTED\]:\[REDACTED\]@api\.example\.com\//);
+  const userinfoLeak = identity.leaks.find((leak) => leak.class === 8 && leak.label === "userinfo on the configured host" && leak.entryPoint === "nextLinkRunner request");
+  assert.ok(userinfoLeak, "the unsafe request is a leak");
+  assert.equal(userinfoLeak.window, "unsafe request: carries userinfo");
+  assert.ok(!userinfoLeak.output.includes(userinfoCanary), "the leak record masks the password");
+  assert.equal(identity.leaks.filter((leak) => leak.class === 8 && leak.label === "userinfo on the configured host").length, 1, "the request is the only trace the identity walk leaves");
+  for (const label of ["foreign host", "foreign port", "foreign scheme", "IPv4 literal", "IPv6 literal", "javascript: scheme", "data: scheme", "blob: scheme", "file: scheme"]) {
+    assert.ok(identityUnsafe.some((request) => request.label === label && /differs from the configured origin https:\/\/api\.example\.com$/.test(request.reason)), `${label}: off the configured origin`);
+  }
+  for (const label of ["relative same origin", "absolute same origin", "case-differing host", "default port"]) {
+    assert.ok(!identityUnsafe.some((request) => request.label === label), `${label}: the followed control is safe`);
+  }
+  assert.equal(identity.mustKeepLosses.filter((loss) => loss.class === 8).length, 0, "the controls are followed and the notes name the origin");
+  assert.match(identity.report, /#### Class 8 unsafe requests \(\d+; userinfo masked\)/);
+  assert.match(identity.report, /- userinfo on the configured host: carries userinfo\n  - link: "https:\/\/svc:[A-Za-z0-9]+@api\.example\.com\//);
+  assert.match(identity.report, /  - request: "https:\/\/\[REDACTED\]:\[REDACTED\]@api\.example\.com\//);
+  const occurrences = (text, needle) => text.split(needle).length - 1;
+  assert.equal(occurrences(identity.report, userinfoCanary), occurrences(identity.report, `svc:${userinfoCanary}@`), "the report shows the password only inside the input link");
+
+  const verbatim = await runLeakProbe({ integration: "verbatim-walk", nextLinkRunner: verbatimNextLinkRunner });
+  const verbatimUnsafe = byClass(verbatim, 8).unsafeRequests;
+  for (const label of ["relative same origin", "protocol-relative foreign host", "backslash foreign host"]) {
+    const request = verbatimUnsafe.find((entry) => entry.label === label);
+    assert.ok(request, `${label}: the verbatim request is recorded as unsafe`);
+    assert.equal(request.reason, "does not parse as a URL");
+    assert.ok(verbatim.leaks.some((leak) => leak.class === 8 && leak.label === label && leak.window === "unsafe request: does not parse as a URL"), `${label}: the unparseable request is a leak`);
+  }
+  assert.ok(verbatim.mustKeepLosses.some((loss) => loss.class === 8 && loss.label === "relative same origin" && loss.entryPoint === "nextLinkRunner request"), "the relative control was not followed");
+
+  const stripping = await runLeakProbe({ integration: "stripping-walk", nextLinkRunner: strippingNextLinkRunner });
+  const stripped = byClass(stripping, 8).unsafeRequests.find((request) => request.label === "userinfo on the configured host");
+  assert.ok(stripped, "the stripped follow on the configured origin is recorded as unsafe");
+  assert.equal(stripped.reason, "a rejected link must produce no request, yet this one carries the link's path");
+  assert.ok(!stripped.url.includes(stripping.canaries.tokens[7]), "the stripped request carries no userinfo");
+  assert.equal(byClass(stripping, 8).unsafeRequests.filter((request) => request.label !== "userinfo on the configured host").length, 0, "the foreign links produced no request");
+  assert.equal(stripping.mustKeepLosses.filter((loss) => loss.class === 8).length, 0);
 });
 
 test("leak-probe harness: class 9 catches a collector that flips, passes on a truncated read, names principals, and writes absence values", async () => {
