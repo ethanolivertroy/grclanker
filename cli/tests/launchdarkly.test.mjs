@@ -2493,6 +2493,30 @@ test("exportLaunchdarklyAuditBundle records truncated listings in core data snap
   assert.doesNotMatch(executive, /Partial Collection Warnings/);
 });
 
+test("exportLaunchdarklyAuditBundle writes a refused next link's reason to the executive summary's Truncated Listings instead of the cap remedy, while a cap stop still advises its option", async () => {
+  const base = createTempBase("grclanker-ld-export-refused-");
+  const reference = healthyClient();
+  const result = await exportLaunchdarklyAuditBundle(healthyClient({
+    listMembers: async () => {
+      const items = await reference.listMembers();
+      return { items, truncated: true, seen: items.length, total: items.length, endpoint: "GET /api/v2/members", truncationReason: FOREIGN_ORIGIN_MESSAGE };
+    },
+    listCustomRoles: () => truncatedListing(reference, "listCustomRoles", 1, 40),
+  }), sampleConfig(), base, { now: NOW });
+
+  const findings = JSON.parse(readFileSync(join(result.outputDir, "analysis", "findings.json"), "utf8"));
+  const [memberNote] = findings.find((item) => item.id === "LD-02").evidence.truncated_collections;
+  assert.equal(memberNote.reason, FOREIGN_ORIGIN_MESSAGE, "the finding note carries the refusal");
+
+  const executive = readFileSync(join(result.outputDir, "compliance", "executive_summary.md"), "utf8");
+  const truncatedLines = executive.slice(executive.indexOf("## Truncated Listings")).split("\n").filter((line) => line.startsWith("- "));
+  const membersLine = truncatedLines.find((line) => line.startsWith("- members:"));
+  assert.equal(membersLine, `- members: 3 of 3 collected; ${FOREIGN_ORIGIN_MESSAGE}`, "the summary line names the refusal, as the finding caveat and QUICK_REFERENCE.md do");
+  assert.doesNotMatch(membersLine, /raise member_limit/, "raising the cap cannot fix a refused link, so the summary does not offer it");
+  const rolesLine = truncatedLines.find((line) => line.startsWith("- custom_roles:"));
+  assert.equal(rolesLine, "- custom_roles: 1 of 40 collected; raise role_limit", "a cap stop keeps the option remedy");
+});
+
 test("exportLaunchdarklyAuditBundle keeps directory and zip paired across repeated exports", async () => {
   const base = createTempBase("grclanker-ld-export-dupe-");
   const first = await exportLaunchdarklyAuditBundle(healthyClient(), sampleConfig(), base, { now: NOW });

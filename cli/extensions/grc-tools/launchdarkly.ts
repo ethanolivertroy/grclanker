@@ -4569,7 +4569,10 @@ function buildExecutiveSummary(
   if (truncated.length > 0) {
     lines.push("", "## Truncated Listings", "");
     for (const note of truncated) {
-      lines.push(`- ${note.collection}${note.scope ? ` (${note.scope})` : ""}: ${note.seen} of ${note.total ?? "an unknown total"} collected${note.option ? `; raise ${note.option}` : ""}`);
+      // The same rule as the finding caveat: a listing that stopped for a reason other than its cap (a refused next
+      // link, for one) is written with that reason, and raising the cap is offered only for a stop the cap caused.
+      const remedy = note.reason ? `; ${note.reason}` : note.option ? `; raise ${note.option}` : "";
+      lines.push(`- ${note.collection}${note.scope ? ` (${note.scope})` : ""}: ${note.seen} of ${note.total ?? "an unknown total"} collected${remedy}`);
     }
   }
 
@@ -4594,12 +4597,14 @@ function collectTruncationNotes(findings: LaunchdarklyFinding[]): LaunchdarklyTr
       const key = `${collection}|${scope ?? ""}`;
       if (seen.has(key)) continue;
       seen.add(key);
+      const reason = asString(entry.reason);
       notes.push({
         collection,
         ...(asString(entry.option) ? { option: asString(entry.option) } : {}),
         seen: asNumber(entry.seen) ?? 0,
         total: asNumber(entry.total) ?? null,
         ...(scope ? { scope } : {}),
+        ...(reason ? { reason } : {}),
       });
     }
   }
