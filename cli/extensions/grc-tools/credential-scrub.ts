@@ -21,7 +21,9 @@
  *    (see `NAME_START`, `javaPropertyPrefixOf`, and `FLAG_VALUE_PATTERN`). On the data side a webhook or callback URL
  *    keeps its origin alone (see `scrubDataValue`).
  * 2. A configured secret is removed whatever its shape and in its base64, base64url, URL-encoded, form-encoded, and
- *    JSON-escaped forms; the Flue redaction primitives own the encoded forms.
+ *    JSON-escaped forms; the Flue redaction primitives own the encoded forms. A configured secret that is itself a
+ *    carrier word (`password`, `Authorization`, `Bearer`) is removed after the carriers rather than before them, so
+ *    the pair or header it names still loses its value (see `isCarrierVocabulary`).
  *
  * Real token shapes are removed bare: runs of 16 or more characters with base64 symbols, digits scattered through
  * letters, or token casing; hex digests; JWTs; AWS access key ids and secret keys; PEM blocks; and well-known vendor
@@ -103,7 +105,9 @@ export interface CredentialScrubber {
   /**
    * Registers configured secret values (API keys, tokens, passwords, private keys); each is removed from every string
    * scrubbed from then on, in every encoded form. Entries shorter than `MIN_CONFIGURED_SECRET_LENGTH`, undefined, and
-   * null are ignored.
+   * null are ignored. A value that is itself a carrier vocabulary word (`password`, `Authorization`, `Bearer`; see
+   * `isCarrierVocabulary`) is removed after the carriers have run rather than before, so the pair it names still loses
+   * its value.
    */
   registerSecrets(values: ReadonlyArray<string | undefined | null>): void;
   /** The configured secrets registered so far, in their plain form. */
@@ -326,7 +330,8 @@ const GENERIC_CREDENTIAL_HEADER = "x-[a-z0-9-]*(?:key|token|secret|auth|session|
 // line, so a scheme word ending a line is not joined to the next line's first word. Under a credential-named pair key
 // that is not an Authorization-style header (`sslPassword=bearer rejected`) the word is the value's first word and
 // goes with it; see `keepsSchemeWord`.
-const HEADER_SCHEME_PATTERN = /(?:bearer|basic|token|apikey|api-key|digest|ssws|oauth|negotiate|ntlm|splunk|snowflake|aws4-hmac-sha256)[ \t]+/iy;
+const HEADER_SCHEME_WORDS: readonly string[] = ["bearer", "basic", "token", "apikey", "api-key", "digest", "ssws", "oauth", "negotiate", "ntlm", "splunk", "snowflake", "aws4-hmac-sha256"];
+const HEADER_SCHEME_PATTERN = new RegExp(String.raw`(?:${HEADER_SCHEME_WORDS.join("|")})[ \t]+`, "iy");
 // A bare header value runs to the first character that ends a header value in free text; a backslash ends it so a
 // JSON-escaped closing quote is kept.
 const HEADER_BARE_VALUE_PATTERN = /[^\s,;"'<>\\]+/y;
@@ -1131,6 +1136,28 @@ function replaceCompoundCredentialPairs(text: string): string {
   return last === 0 ? text : `${out}${text.slice(last)}`;
 }
 
+// Header names the cookie carrier reads; with the credential header names and the scheme words they make up the
+// carrier vocabulary a configured secret can collide with (see `isCarrierVocabulary`).
+const COOKIE_HEADER_NAMES: readonly string[] = ["cookie", "set-cookie"];
+const GENERIC_CREDENTIAL_HEADER_NAME_PATTERN = new RegExp(`^${GENERIC_CREDENTIAL_HEADER}$`, "i");
+// A key, header, or scheme word: letters, digits, and the separators a key carries; no spaces, quotes, or symbols.
+const KEY_SHAPED_WORD_PATTERN = /^[a-z][a-z0-9_.-]*$/;
+
+/**
+ * True when a configured secret is one of the words the carriers key on: a credential-named key (`password`, `secret`,
+ * `token`, `api_key`, `client-secret`, `webhook`), a credential or cookie header name (`Authorization`, `X-Api-Key`,
+ * `Cookie`), or a scheme word (`Bearer`, `Basic`). Such a secret cannot be told from the vocabulary, so removing it
+ * first would erase the key or header name the carrier needs (`client_[REDACTED]=<value>`) and leave the value beside
+ * it standing; it is removed after the carriers have read the pair instead.
+ */
+function isCarrierVocabulary(secret: string, headerNames: ReadonlySet<string>): boolean {
+  const word = secret.toLowerCase();
+  if (!KEY_SHAPED_WORD_PATTERN.test(word)) return false;
+  if (HEADER_SCHEME_WORDS.includes(word) || COOKIE_HEADER_NAMES.includes(word)) return true;
+  if (headerNames.has(word) || GENERIC_CREDENTIAL_HEADER_NAME_PATTERN.test(word)) return true;
+  return isCredentialKey(word);
+}
+
 /**
  * Builds the scrubber an integration module owns. The scrubber carries the configured secrets of every client the
  * module constructed, so the sink that turns a thrown value into recorded text removes them without knowing which
@@ -1138,7 +1165,12 @@ function replaceCompoundCredentialPairs(text: string): string {
  */
 export function createCredentialScrubber(options: CredentialScrubberOptions = {}): CredentialScrubber {
   const secrets = new Set<string>();
-  const headerNames = [...new Set([...COMMON_CREDENTIAL_HEADERS, ...(options.headers ?? []).map((name) => name.toLowerCase())])]
+  // Configured secrets in the order they run: plain values before every carrier, so a secret is removed whole before
+  // a pattern can split it; values equal to a carrier vocabulary word after the carriers (see `isCarrierVocabulary`).
+  const plainSecrets = new Set<string>();
+  const vocabularySecrets = new Set<string>();
+  const headerNameSet = new Set([...COMMON_CREDENTIAL_HEADERS, ...(options.headers ?? []).map((name) => name.toLowerCase())]);
+  const headerNames = [...headerNameSet]
     .sort((left, right) => right.length - left.length)
     .map((name) => name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"));
   // The header carrier: a credential header name, its optional closing quote, and the separator; the value is read
@@ -1148,15 +1180,15 @@ export function createCredentialScrubber(options: CredentialScrubberOptions = {}
 
   // The Flue marker is folded into this module's marker only where Flue wrote it: a `[redacted]` already in the text
   // (KnowBe4's PII mask uses the same spelling) is parked behind a sentinel first and restored afterwards.
-  function scrubConfiguredSecrets(text: string): string {
-    if (secrets.size === 0) return text;
+  function scrubConfiguredSecrets(text: string, values: ReadonlySet<string>): string {
+    if (values.size === 0) return text;
     const parked = text.split(REDACTED_VALUE).join(PRESERVED_MARKER_SENTINEL);
-    return scrubSensitiveValues(parked, [...secrets]).split(REDACTED_VALUE).join(REDACTED).split(PRESERVED_MARKER_SENTINEL).join(REDACTED_VALUE);
+    return scrubSensitiveValues(parked, [...values]).split(REDACTED_VALUE).join(REDACTED).split(PRESERVED_MARKER_SENTINEL).join(REDACTED_VALUE);
   }
 
   function scrub(text: string, textOptions: ScrubTextOptions = {}): string {
     const shapes = textOptions.shapes ?? true;
-    let scrubbed = scrubConfiguredSecrets(text)
+    let scrubbed = scrubConfiguredSecrets(text, plainSecrets)
       .replace(PEM_BLOCK_PATTERN, REDACTED)
       .replace(PEM_OPEN_PATTERN, REDACTED)
       .replace(EMBEDDED_URL_PATTERN, scrubEmbeddedUrl)
@@ -1167,7 +1199,10 @@ export function createCredentialScrubber(options: CredentialScrubberOptions = {}
     scrubbed = replaceCarrierValues(scrubbed, SESSION_ASSIGNMENT_PATTERN, readPairValue);
     scrubbed = replaceCarrierValues(scrubbed, CREDENTIAL_PAIR_PATTERN, readPairValue);
     scrubbed = replaceCarrierValues(scrubbed, FLAG_VALUE_PATTERN, readFlagValue);
-    scrubbed = replaceCompoundCredentialPairs(scrubbed)
+    scrubbed = replaceCompoundCredentialPairs(scrubbed);
+    // A configured secret spelled like a key, header, or scheme word goes once the carriers have read the pairs it
+    // names, so the value beside it is gone before the word is.
+    scrubbed = scrubConfiguredSecrets(scrubbed, vocabularySecrets)
       .replace(JWT_PATTERN, REDACTED)
       .replace(AWS_ACCESS_KEY_ID_PATTERN, REDACTED);
     if (shapes) scrubbed = scrubbed.replace(AWS_SECRET_PATTERN, scrubAwsSecret).replace(HEX_DIGEST_PATTERN, REDACTED);
@@ -1181,7 +1216,9 @@ export function createCredentialScrubber(options: CredentialScrubberOptions = {}
 
   function registerSecrets(values: ReadonlyArray<string | undefined | null>): void {
     for (const value of values) {
-      if (typeof value === "string" && value.length >= MIN_CONFIGURED_SECRET_LENGTH) secrets.add(value);
+      if (typeof value !== "string" || value.length < MIN_CONFIGURED_SECRET_LENGTH) continue;
+      secrets.add(value);
+      (isCarrierVocabulary(value, headerNameSet) ? vocabularySecrets : plainSecrets).add(value);
     }
   }
 

@@ -432,6 +432,54 @@ test("scrub boundary guard 2: a configured secret is removed whatever its shape 
   assert.ok(MIN_CONFIGURED_SECRET_LENGTH >= 4, "a configured secret shorter than four characters would match ordinary prose");
 });
 
+test("scrub boundary guard 2, gap 45: a configured secret equal to a carrier vocabulary word is removed after the carriers, so the value beside the word goes and the word itself still goes", () => {
+  // Reviewer A's twelve forms: a name-shaped value (never removed by shape) under a key, header, or scheme whose word
+  // is the registered secret. Before the fix the word was replaced first (`client_[REDACTED]=abcdefghijkl`) and the
+  // value survived; now the carrier reads the pair first and the word goes afterwards.
+  const value = "abcdefghijkl";
+  const forms = [
+    ["secret", `client_secret=${value}`],
+    ["password", `password: ${value}`],
+    ["token", `token:${value}`],
+    ["api_key", `api_key="${value}"`],
+    ["client-secret", `client-secret='${value}'`],
+    ["password", `"password": "${value}"`],
+    ["token", `{"token":"${value}"}`],
+    ["secret", `\\"client_secret\\": \\"${value}\\"`],
+    ["Bearer", `Authorization: Bearer ${value}`],
+    ["Authorization", `Authorization: Bearer ${value}`],
+    ["webhook", `webhook_secret=${value}`],
+    ["x-api-key", `x-api-key: ${value}`],
+    ["Cookie", `Cookie: sid=${value}; Path=/`],
+    ["secret", `the pair client_secret=${value} was rejected upstream`],
+    ["client-secret", `--client-secret ${value} rejected`],
+    ["DD-API-KEY", `DD-API-KEY: ${value}`],
+  ];
+  for (const [word, text] of forms) {
+    const scrubber = createCredentialScrubber({ headers: ["dd-api-key"] });
+    scrubber.registerSecrets([word]);
+    assert.ok(scrubber.secrets.has(word), `${word} is registered`);
+    const scrubbed = scrubber.scrub(text);
+    assertRemoved(scrubbed, value, `${JSON.stringify(text)} with ${word} registered`);
+    assert.ok(!scrubbed.toLowerCase().includes(word.toLowerCase()), `${JSON.stringify(text)}: the configured word ${word} survived: ${scrubbed}`);
+    assert.equal(scrubber.scrub(scrubbed), scrubbed, `${JSON.stringify(text)} with ${word} registered: a second pass changed the text`);
+    const control = createCredentialScrubber({ headers: ["dd-api-key"] });
+    control.registerSecrets([word]);
+    assertRemoved(control.scrubData({ note: text }).note, value, `data side: ${JSON.stringify(text)} with ${word} registered`);
+  }
+  // A vocabulary word registered as a secret still leaves every other string alone.
+  const scrubber = createCredentialScrubber();
+  scrubber.registerSecrets(["password", "Authorization", "Bearer"]);
+  assert.deepEqual(scrubAlterations(MUST_KEEP.filter((text) => !/password|authorization|bearer/i.test(text)), scrubber.scrub), []);
+  assert.equal(scrubber.scrub("the resource prod-us-east-2026 was not readable"), "the resource prod-us-east-2026 was not readable");
+  // A secret that merely contains a vocabulary word is a plain secret and is removed whole before the carriers.
+  const plain = createCredentialScrubber();
+  plain.registerSecrets(["sk_live_token_9f8e7d6c", "Bearer abcdefghijkl", "secret value"]);
+  assert.equal(plain.scrub("key sk_live_token_9f8e7d6c rejected"), `key ${REDACTED} rejected`);
+  assert.equal(plain.scrub("Authorization: Bearer abcdefghijkl"), `Authorization: ${REDACTED}`);
+  assert.equal(plain.scrub("the secret value leaked"), `the ${REDACTED} leaked`);
+});
+
 test("scrub boundary guard 2: scrubbers built separately do not share configured secrets", () => {
   const first = createCredentialScrubber();
   const second = createCredentialScrubber();
