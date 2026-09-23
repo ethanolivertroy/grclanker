@@ -2,14 +2,20 @@
  * Uniform pagination stop reporting (rule 10).
  *
  * Every pagination or collection loop that can exit on an item limit, a page cap, a time budget, a
- * cursor that does not advance, an empty page that still reports a cursor, or a listing that reports
- * no total must report the dataset truncated so the rule 5 partial-inventory demotion applies. Only
- * `exhausted` (no next cursor, and every reported item seen) yields a complete listing. Distilled from
- * the New Relic `describePagination` (#30). This module describes the stop; it does not walk pages,
- * because every client has its own page shape.
+ * cursor that does not advance, an empty page that still reports a cursor, a listing that reports
+ * no total, or a server-supplied next link that may not be followed (`resolveSameOriginUrl` in
+ * `next-link.ts`) must report the dataset truncated so the rule 5 partial-inventory demotion
+ * applies. Only `exhausted` (no next cursor, and every reported item seen) yields a complete
+ * listing. Distilled from the New Relic `describePagination` (#30). This module describes the stop;
+ * it does not walk pages, because every client has its own page shape.
  */
 
-/** Why a walk stopped. Every kind other than `exhausted` is a cap or an anomaly. */
+/**
+ * Why a walk stopped. Every kind other than `exhausted` is a cap or an anomaly. `rejected_next_link`
+ * carries the rejection reason and, for a foreign origin, the rejected link's origin (scheme, host,
+ * and port; never its path, query, fragment, or userinfo), which the note names beside the fixed
+ * text. Build it with `nextLinkStop` from the thrown `NextLinkError`.
+ */
 export type PaginationStop =
   | { kind: "exhausted" }
   | { kind: "limit"; limit: number }
@@ -17,7 +23,8 @@ export type PaginationStop =
   | { kind: "repeated_cursor" }
   | { kind: "empty_page_with_cursor" }
   | { kind: "time_budget"; budgetMs: number }
-  | { kind: "missing_total" };
+  | { kind: "missing_total" }
+  | { kind: "rejected_next_link"; reason: "foreign_origin" | "userinfo" | "unparseable"; origin?: string };
 
 export type PaginationStopKind = PaginationStop["kind"];
 
@@ -30,6 +37,21 @@ export interface PaginationOutcome {
 
 function progress(seen: number, total: number | null | undefined): string {
   return `${seen}${total === null || total === undefined ? "" : ` of ${total}`} items`;
+}
+
+function nextLinkRejectionText(stop: Extract<PaginationStop, { kind: "rejected_next_link" }>): string {
+  switch (stop.reason) {
+    case "foreign_origin":
+      return `named ${stop.origin ?? "another origin"} rather than the configured origin`;
+    case "userinfo":
+      return "carried userinfo";
+    case "unparseable":
+      return "could not be parsed";
+    default: {
+      const unhandled: never = stop.reason;
+      throw new Error(`Unhandled next link rejection ${String(unhandled)}`);
+    }
+  }
 }
 
 /**
@@ -56,6 +78,8 @@ export function describePagination(seen: number, total: number | null | undefine
       return { complete: false, truncated: true, note: `stopped after ${seenText} when the ${stop.budgetMs} ms time budget ran out` };
     case "missing_total":
       return { complete: false, truncated: true, note: `stopped after ${seenText} because the listing reported no total, so the population size is unproven` };
+    case "rejected_next_link":
+      return { complete: false, truncated: true, note: `stopped after ${seenText} because the next link ${nextLinkRejectionText(stop)} and was not followed` };
     default: {
       const unhandled: never = stop;
       throw new Error(`Unhandled pagination stop ${String(unhandled)}`);

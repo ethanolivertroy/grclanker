@@ -9,6 +9,7 @@ import {
   describeFailedResponse,
   errorMessage,
   scrubDataText,
+  scrubError,
   scrubErrorText,
 } from "../dist/extensions/grc-tools/hardening/error-text.js";
 import {
@@ -21,6 +22,7 @@ import {
   unreadableDataset,
 } from "../dist/extensions/grc-tools/hardening/collection-status.js";
 import { describePagination } from "../dist/extensions/grc-tools/hardening/pagination.js";
+import { NextLinkError, nextLinkStop, originOf, resolveSameOriginUrl } from "../dist/extensions/grc-tools/hardening/next-link.js";
 
 /**
  * Every fixed-text message the library renders must come back from the library's own scrub
@@ -109,6 +111,34 @@ const STATUSES = Object.freeze([
 ]);
 
 const DATASET_LABELS = Object.freeze(["roles", "users", "credentials", "secrets", "tokens", "api keys", "service account keys", "sessions", "OAuth clients", "password policies", "signing keys"]);
+/**
+ * Labels whose last word is a credential word of the scrub's `CREDENTIAL_PAIR_NAMES` (`credentials`)
+ * cannot stand in front of a colon in a note at all: the explicit pair rule takes whatever follows as
+ * the value whatever its shape (coordinator ruling on the Codex P2). Labels whose last word
+ * `isCredentialKey` classifies by the Flue heuristic (`secrets`, `tokens`, `api keys`, `signing
+ * keys`) are carriers of the generic pair rule under the same ruling (review of #78, gap 1): the word
+ * after the colon goes unless it continues as prose, so `secrets: seen 40 of 120`, `secrets: not
+ * collected`, and `secrets: unreadable (...)` survive and `secrets: truncated` loses its word. A
+ * label whose last word is plain (`sessions`, `OAuth clients`, `password policies`) survives whole.
+ */
+const PAIR_KEY_LABELS = Object.freeze(["credentials"]);
+const GENERIC_KEY_LABELS = Object.freeze(["secrets", "tokens", "api keys", "service account keys", "signing keys"]);
+/** Phrases the generic pair rule's prose exemption keeps; each is pinned here so a narrowing of the exemption is seen. */
+const PROSE_CONTINUATION_PHRASES = Object.freeze([
+  "InvalidAuthenticationToken: Access token has expired.",
+  "InvalidAuthenticationToken: Access token has expired. Basic authentication is disabled for this tenant.",
+  "TokenExpired: The token has expired",
+  "access_tokens: seen 40 of 120",
+  "tokens: 3 of 5 rotated",
+  "tokens: none are stale",
+  "api keys: 40 seen, total unknown",
+  "secrets: not collected",
+  "secrets: unreadable (GET /v1/secrets failed with 403 Forbidden: non-JSON body (text/html, 19 bytes))",
+  "token_type: Bearer token expected",
+  "token_type: Bearer",
+  '{"token_type":"Bearer","expires_in":3600}',
+  "user_session: 3 active sessions",
+]);
 
 function bodyNotes() {
   const notes = [];
@@ -211,6 +241,10 @@ test("every pagination note survives the scrub", () => {
     { kind: "empty_page_with_cursor" },
     { kind: "time_budget", budgetMs: 30000 },
     { kind: "missing_total" },
+    { kind: "rejected_next_link", reason: "foreign_origin", origin: "https://evil.example" },
+    { kind: "rejected_next_link", reason: "foreign_origin" },
+    { kind: "rejected_next_link", reason: "userinfo" },
+    { kind: "rejected_next_link", reason: "unparseable" },
   ];
   for (const stop of stops) {
     for (const [seen, total] of [[0, null], [40, 120], [500, 1200], [1000, undefined], [40, 0]]) {
@@ -220,6 +254,96 @@ test("every pagination note survives the scrub", () => {
   }
   assertSurvivesScrub(seenVersusTotal(40, 120), "seen of total");
   assertSurvivesScrub(seenVersusTotal(40, null), "seen, total unknown");
+});
+
+/** Configured origins in the shapes the integrations use: vendor hosts, tenant subdomains, ports, and IP literals. */
+const CONFIGURED_ORIGINS = Object.freeze([
+  "https://api.example.com",
+  "https://acme.okta.com",
+  "https://acme-admin.zscaler.net",
+  "https://graph.microsoft.com",
+  "https://api.us.onelogin.com",
+  "https://dev123456.service-now.com",
+  "https://api.eu1.qualys.com:443",
+  "https://vault.internal.example:8200",
+  "http://10.0.0.1:8080",
+  "https://[2001:db8::1]:8443",
+]);
+/** Rejected origins: other hosts, other schemes, other ports, IP literals, and non-hierarchical schemes. */
+const REJECTED_ORIGINS = Object.freeze([
+  "https://evil.example",
+  "https://collector.attacker.example",
+  "http://api.example.com",
+  "https://api.example.com:8443",
+  "http://169.254.169.254",
+  "http://127.0.0.1:9000",
+  "https://[::1]",
+  "https://xn--80ak6aa92e.com",
+  "javascript:",
+  "data:",
+]);
+
+test("every NextLinkError message and next-link pagination note survives the scrub for every configured and rejected origin", () => {
+  let rendered = 0;
+  for (const configuredAsWritten of CONFIGURED_ORIGINS) {
+    const base = `${configuredAsWritten}/api/v2/users?per_page=100`;
+    // A default port written in the configuration (`:443`) is not part of the origin the URL parser reports.
+    const configured = originOf(new URL(base));
+    for (const rejected of REJECTED_ORIGINS) {
+      const link = rejected.endsWith(":") ? `${rejected}payload` : `${rejected}/collect?token=abc`;
+      let error;
+      try {
+        resolveSameOriginUrl(link, base);
+      } catch (thrown) {
+        error = thrown;
+      }
+      if (error === undefined) continue; // the rejected origin equals this configured origin
+      assert.ok(error instanceof NextLinkError, `${configured} <- ${rejected}`);
+      assert.equal(error.message, `next link to ${rejected} was not followed because it does not share the configured origin ${configured}`);
+      assertSurvivesScrub(error.message, `foreign ${configured} <- ${rejected}`);
+      assertSurvivesScrub(errorMessage(error), `foreign ${configured} <- ${rejected} folded`);
+      const note = describePagination(40, 120, nextLinkStop(error)).note;
+      assertSurvivesScrub(note, `foreign note ${configured} <- ${rejected}`);
+      rendered += 1;
+    }
+    for (const [reason, link] of [["userinfo", `${configured.replace("://", "://user:pw@")}/api/v2/users?page=2`], ["unparseable", "http://[bad"]]) {
+      let error;
+      try {
+        resolveSameOriginUrl(link, base);
+      } catch (thrown) {
+        error = thrown;
+      }
+      assert.ok(error instanceof NextLinkError && error.reason === reason, `${configured} ${reason}`);
+      assertSurvivesScrub(error.message, `${reason} ${configured}`);
+      assertSurvivesScrub(errorMessage(error), `${reason} ${configured} folded`);
+      assertSurvivesScrub(describePagination(40, 120, nextLinkStop(error)).note, `${reason} note ${configured}`);
+      rendered += 1;
+    }
+  }
+  assert.ok(rendered >= 100, `expected the full matrix, rendered ${rendered}`);
+});
+
+test("both invalid-configured-origin texts survive the scrub and echo nothing of the base", () => {
+  const cases = [
+    ["not a url ZmFrZS1jb25maWctdG9rZW4", "configured origin could not be parsed as an absolute URL"],
+    ["blob:https://api.example.com/ZmFrZS1jb25maWctdG9rZW4", "configured origin must be an http or https URL"],
+    ["javascript:alert(1)", "configured origin must be an http or https URL"],
+    [new URL("data:text/plain,ZmFrZS1jb25maWctdG9rZW4"), "configured origin must be an http or https URL"],
+  ];
+  for (const [base, expected] of cases) {
+    let error;
+    try {
+      resolveSameOriginUrl("/api/v2/users?page=2", base);
+    } catch (thrown) {
+      error = thrown;
+    }
+    assert.ok(error instanceof IntegrationError && !(error instanceof NextLinkError), String(base));
+    assert.equal(error.code, "INVALID_CONFIGURED_ORIGIN");
+    assert.equal(error.message, expected);
+    assert.ok(!error.message.includes("ZmFrZS1"), String(base));
+    assertSurvivesScrub(error.message, `invalid base ${String(base)}`);
+    assertSurvivesScrub(errorMessage(error), `invalid base ${String(base)} folded`);
+  }
 });
 
 test("marker error text survives the scrub for every inventory label, including credential-named inventories", () => {
@@ -242,9 +366,149 @@ test("marker error text survives the scrub for every inventory label, including 
       `${label}: truncated`,
     ];
     const gated = gatedPrincipals({ admins_without_mfa: ["alice"], admin_count: 1 }, false, notes);
+    // The caller's notes, not the library's. A safe label is written without the colon or with a plain word before it.
+    const withoutColon = notes.map((note) => note.replace(`${label}: `, `${label} `));
+    assertSurvivesScrub(gatedPrincipals({ admin_count: 1 }, false, withoutColon).principals_withheld, `${label} principals_withheld without a colon`);
+    assertSurvivesScrub(gatedPrincipals({ admin_count: 1 }, false, notes.map((note) => note.replace(`${label}: `, `${label} inventory: `))).principals_withheld, `${label} principals_withheld with a compound label`);
+    if (PAIR_KEY_LABELS.includes(label)) {
+      // A credential pair word before a colon loses whatever follows it.
+      assert.equal(scrubErrorText(gated.principals_withheld), notes.map((note) => note.replace(/^credentials: \S+/, `credentials: ${REDACTED}`)).join("; "), `${label} principals_withheld with a colon`);
+      continue;
+    }
+    if (GENERIC_KEY_LABELS.includes(label)) {
+      // A label the Flue heuristic classifies loses a bare word after the colon and keeps a value that continues as prose.
+      assert.equal(scrubErrorText(gated.principals_withheld), notes.map((note) => (note.endsWith(": truncated") ? `${label}: ${REDACTED}` : note)).join("; "), `${label} principals_withheld with a colon`);
+      assert.equal(scrubDataText(gated.principals_withheld), scrubErrorText(gated.principals_withheld), `${label} principals_withheld: both scrubs agree`);
+      continue;
+    }
     assertSurvivesScrub(gated.principals_withheld, `${label} principals_withheld`);
   }
   assertSurvivesScrub(notCollected(line).error, "not collected without status");
+});
+
+test("the prose-continuation phrases the generic pair rule exempts survive the scrub, and a bare word after such a key does not", () => {
+  for (const phrase of PROSE_CONTINUATION_PHRASES) {
+    assertSurvivesScrub(phrase, phrase);
+    assertSurvivesScrub(scrubError(new Error(phrase)).message, `${phrase} through scrubError`);
+    assertSurvivesScrub(describeErrorBody("application/json", JSON.stringify({ message: phrase })), `${phrase} through describeErrorBody`);
+  }
+  for (const [text, expected] of [
+    ["secrets: truncated", `secrets: ${REDACTED}`],
+    ["client_token: expired", `client_token: ${REDACTED}`],
+    ["Authorization_RequestDenied: Insufficient privileges to complete the operation.", `Authorization_RequestDenied: ${REDACTED} privileges to complete the operation.`],
+    ["signing keys: rotated", `signing keys: ${REDACTED}`],
+  ]) {
+    assert.equal(scrubErrorText(text), expected, text);
+  }
+});
+
+test("the scrubError fixed texts for a value that yields no message survive the scrub, including under a Proxy whose every trap throws", () => {
+  const hostile = new Proxy(
+    {},
+    {
+      get() {
+        throw new Error("get trap");
+      },
+      has() {
+        throw new Error("has trap");
+      },
+      getPrototypeOf() {
+        throw new Error("prototype trap");
+      },
+      ownKeys() {
+        throw new Error("keys trap");
+      },
+      getOwnPropertyDescriptor() {
+        throw new Error("descriptor trap");
+      },
+    },
+  );
+  const scrubbed = scrubError(hostile);
+  assert.equal(scrubbed.message, "Error without a message");
+  assertSurvivesScrub(scrubbed.message, "guarded reads yielding nothing");
+  assertSurvivesScrub(errorMessage(hostile), "guarded reads yielding nothing, folded");
+  assertSurvivesScrub("thrown value could not be read", "the last-resort fixed text");
+});
+
+test("the scheme phrases main rendered intact come back from every sink with only the sink's frame added, including a phrase that ends the enclosing JSON string", () => {
+  // Review of #78 (gap 4 and probe 2's pinned phrases): `{"detail":"Authorization: Bearer"}` came back
+  // as `{"detail":"Authorization: Bearer"[REDACTED]` because the quote that closes the enclosing JSON
+  // string was read as a value opener. A quote followed by the structure after a string is not one.
+  const phrases = [
+    "Bearer token is missing",
+    "Bearer token authentication is required",
+    "Bearer token-based auth is required",
+    "Basic authentication is disabled for this deployment",
+    "Basic (deprecated) and Basic (full access) modes",
+    "Token request failed",
+    "Token inventory: 3 of 5 keys have no expiry",
+    "OAuth bearer token",
+    "OAuth sign-in",
+    "OAuth service-app client ID",
+    "the OAuth 2.0 device flow",
+    "Splunk Enterprise 9.1.2",
+    "Splunk Cloud, Splunk Enterprise, SSWS API tokens, SSWS or OAuth",
+    "Digest access authentication",
+    "Negotiate authentication is not supported",
+    "NTLM authentication is not supported",
+    "ApiKey authentication requires an id and a key",
+    'Bearer realm="api", error="invalid_token", error_description="The access token expired"',
+    "Authorization: Bearer",
+    "Authorization: Bearer\nnext line starts here",
+    "the token authentication flow failed",
+    "Bearer tokens expire after one hour",
+    "Basic auth is deprecated",
+    "Token expiry is not enforced",
+    "X-Api-Key:",
+    "Cookie:",
+    "password:",
+  ];
+  class VendorApiError extends IntegrationError {}
+  const sinks = [
+    ["scrubErrorText", (text) => scrubErrorText(text), (text) => text],
+    ["scrubDataText", (text) => scrubDataText(text), (text) => text],
+    ["scrubError message", (text) => scrubError(new Error(text)).message, (text) => text],
+    ["scrubError error field", (text) => scrubError({ name: "VendorError", error: text }).message, (text) => text],
+    ["scrubError cause", (text) => scrubError(new Error("outer", { cause: new Error(text) })).message, (text) => `outer (cause: ${text})`],
+    ["scrubError aggregate", (text) => scrubError(new AggregateError([new Error(text), new Error("two")], "several")).message, (text) => `several (2 errors: ${text}; two)`],
+    ["errorMessage", (text) => errorMessage(new Error(text)), (text) => text.replace(/\s+/g, " ").trim()],
+    ["IntegrationError", (text) => new IntegrationError(text, {}).message, (text) => text],
+    ["IntegrationError subclass", (text) => new VendorApiError(text, { status: 401 }).message, (text) => text],
+    ["describeErrorBody message", (text) => describeErrorBody("application/json", JSON.stringify({ message: text })), (text) => text],
+    ["describeErrorBody nested", (text) => describeErrorBody("application/json", JSON.stringify({ error: { message: JSON.stringify({ detail: text }) } })), (text) => JSON.stringify({ detail: text })],
+    [
+      "describeFailedResponse body",
+      (text) => describeFailedResponse({ method: "GET", endpoint: "/v1/users", status: 502, statusText: "Bad Gateway", contentType: "application/json", body: JSON.stringify({ message: text }) }),
+      (text) => `GET /v1/users failed with 502 Bad Gateway: ${text}`,
+    ],
+    [
+      "describeFailedResponse errors",
+      (text) => describeFailedResponse({ method: "POST", endpoint: "/v1/items", status: 400, statusText: "Bad Request", contentType: "application/json", body: JSON.stringify({ errors: [{ detail: text }] }) }),
+      (text) => `POST /v1/items failed with 400 Bad Request: ${text}`,
+    ],
+  ];
+  for (const phrase of phrases) {
+    for (const [name, sink, frame] of sinks) {
+      assert.equal(sink(phrase), frame(phrase), `${name} changed ${JSON.stringify(phrase)}`);
+    }
+  }
+  // The same quote read at a value position inside JSON structure, in every carrier class.
+  for (const text of [
+    '{"detail":"Authorization: Bearer"}',
+    '{\\"detail\\":\\"Authorization: Bearer\\"}',
+    '{"detail":"Authorization: Bearer "}',
+    '{"detail":"X-Api-Key:"}',
+    '{"note":"X-Api-Key:", "next":"abc"}',
+    '{"detail":"Cookie:"}',
+    '{"detail":"password:"}',
+    '["Authorization: Bearer"]',
+    '{"detail":"Authorization: Bearer"}, {"detail":"X-Api-Key:"}',
+  ]) {
+    assertSurvivesScrub(text, `enclosing string closed after a carrier: ${text}`);
+  }
+  // A carrier value that follows such a phrase in the same document is still read.
+  assert.equal(scrubErrorText('{"detail":"Authorization: Bearer"}, {"detail":"X-Api-Key: hunter2xyz"}'), `{"detail":"Authorization: Bearer"}, {"detail":"X-Api-Key: ${REDACTED}"}`);
+  assert.equal(scrubErrorText('Authorization: Bearer"abc123def"'), `Authorization: Bearer"${REDACTED}"`);
 });
 
 test("a path rendered as the value of a credential-named pair is eaten, which is why no fixed text renders one that way", () => {

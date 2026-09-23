@@ -1,8 +1,9 @@
 /**
  * Shared hardening helpers for integration tools: the error-text sink and `IntegrationError` base class,
- * the safe config-file loaders, the collection-status markers and null-rendering helpers, and the
- * pagination stop descriptions. Nothing under `cli/extensions/grc-tools/` imports this directory yet;
- * the consolidation PR rewires each integration's ad hoc helper onto it.
+ * the safe config-file loaders, the collection-status markers and null-rendering helpers, the
+ * pagination stop descriptions, and the same-origin guard for server-supplied next links. The
+ * integrations under `cli/extensions/grc-tools/` import this index; the export surface is frozen at
+ * 2b4c4c4 (#67) and only grows.
  */
 export {
   IntegrationError,
@@ -66,3 +67,6 @@ export type { Dataset, DatasetState, DatasetStatus, NotCollectedMarker, ReadData
 
 export { describePagination } from "./pagination.js";
 export type { PaginationOutcome, PaginationStop, PaginationStopKind } from "./pagination.js";
+
+export { INVALID_CONFIGURED_ORIGIN_CODE, NEXT_LINK_REJECTED_CODE, NextLinkError, nextLinkStop, originOf, resolveSameOriginUrl } from "./next-link.js";
+export type { NextLinkRejection } from "./next-link.js";
