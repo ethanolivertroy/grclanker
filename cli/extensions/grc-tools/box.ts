@@ -1651,6 +1651,9 @@ export class BoxApiClient implements BoxReadClient {
     const limit = clampNumber(options.limit, DEFAULT_LIST_LIMIT, 1, 100_000);
     const pageSize = clampNumber(options.pageSize, DEFAULT_PAGE_SIZE, 1, 1000);
     const items: JsonRecord[] = [];
+    // A record is collected once by id, so a server that re-serves a page under a fresh marker cannot inflate a count
+    // or hold the walk open; a record without an id cannot be recognised again and is kept as served.
+    const seenIds = new Set<string>();
     let marker: string | undefined;
     let truncation: BoxTruncation | undefined;
 
@@ -1663,13 +1666,20 @@ export class BoxApiClient implements BoxReadClient {
         marker,
       }, options.headers, LIST_SHAPE);
       const entries = asRecordArray(payload.entries);
-      items.push(...entries.slice(0, remaining));
+      const unseen = entries.filter((entry) => {
+        const id = asString(entry.id);
+        if (id === undefined) return true;
+        if (seenIds.has(id)) return false;
+        seenIds.add(id);
+        return true;
+      });
+      items.push(...unseen.slice(0, remaining));
       const nextMarker = asString(payload.next_marker);
       if (entries.length === 0) {
         if (nextMarker) truncation = pagingTruncation("the server returned an empty page while still offering a next marker");
         break;
       }
-      if (entries.length > remaining) {
+      if (unseen.length > remaining) {
         truncation = capTruncation(`the ${limit}-record cap was reached while the server returned more records than requested`);
         break;
       }
@@ -1677,6 +1687,14 @@ export class BoxApiClient implements BoxReadClient {
         // A full last page at the cap with no next marker is the API's end signal, but it is indistinguishable from
         // a server that dropped the marker, so the remainder is reported unknown rather than absent.
         if (items.length >= limit) truncation = capTruncation(`the last page was full at the ${limit}-record cap and the server gave no next marker, so the remainder is unknown`);
+        break;
+      }
+      if (unseen.length === 0) {
+        truncation = pagingTruncation("the server re-served already-collected records under a new marker, so the remaining records could not be paged");
+        break;
+      }
+      if (nextMarker === marker) {
+        truncation = pagingTruncation("the server repeated its marker, so the remaining records could not be paged");
         break;
       }
       if (items.length >= limit) {
@@ -2037,6 +2055,11 @@ function truncationClause(dataset: CollectedDataset<unknown>, count: number, uni
 function truncationRemedy(dataset: CollectedDataset<unknown>, limitOption?: string): string {
   const capReached = dataset.truncation?.capReached ?? true;
   return capReached && limitOption ? `raise ${limitOption} and rerun` : "review the remainder in the Admin Console";
+}
+
+/** "the retention policy listing stopped after N records because <the loader's reason>": a listing's own exit, for a finding that counts its records. */
+function listingTruncationNote(label: string, dataset: CollectedDataset<JsonRecord[]>): string {
+  return `the ${label} listing ${truncationClause(dataset, dataset.data.length, "records", "Box reported more records (a next_marker remained)")}`;
 }
 
 function datasetTruncations(label: string, dataset: CollectedDataset<unknown>, limitOption?: string): string[] {
@@ -3152,6 +3175,7 @@ export function assessBoxDataGovernanceData(data: BoxGovernanceData): BoxAssessm
   );
 
   const retentionPolicies = data.retentionPolicies.data;
+  const retentionTruncated = data.retentionPolicies.truncated === true;
   const activeRetention = retentionPolicies.filter((policy) => (asString(policy.status) ?? "active") === "active");
   const assignedRetention = activeRetention.filter((policy) => hasKnownAssignments(policy, data.retentionAssignments.data));
   const retentionEvidence = {
@@ -3165,21 +3189,31 @@ export function assessBoxDataGovernanceData(data: BoxGovernanceData): BoxAssessm
     })))),
     active_policies: whenRead(data.retentionPolicies, activeRetention.length),
     assigned_policies: observedCount([data.retentionPolicies, data.retentionAssignments], assignedRetention.length),
+    retention_policies_truncated: whenRead(data.retentionPolicies, retentionTruncated),
   };
   const retentionManualEvidence = "Admin Console > Governance > Retention: record each policy, its retention length, disposition action, and the folders or metadata it is assigned to.";
+  // A listing that stopped short is tested before the empty branch: an empty or inactive truncated read proves no
+  // absence, and the counts a truncated pass or warn states are lower bounds carried with the listing's own exit.
+  const retentionTruncationNote = listingTruncationNote("retention policy", data.retentionPolicies);
+  const retentionRemedy = truncationRemedy(data.retentionPolicies, "list_limit");
   findings.push(capForUnreadableInventories(
     data.retentionPolicies.error
       ? finding(12, "manual", `Retention policies could not be read because ${unreadableReason(data.retentionPolicies)}; this endpoint requires Box Governance and the manage_data_retention scope.`, retentionEvidence, retentionManualEvidence)
-      : assignedRetention.length > 0
-        ? finding(12, "pass", `${assignedRetention.length}/${activeRetention.length} active retention policies have assignments.`, retentionEvidence)
-        : activeRetention.length > 0
-          ? finding(12, "warn", `${activeRetention.length} active retention policies exist but none have visible assignments.`, retentionEvidence)
-          : finding(12, "fail", "No active retention policies exist.", retentionEvidence),
+      : retentionTruncated && retentionPolicies.length === 0
+        ? finding(12, "warn", `The retention policy listing returned no policies before it stopped (${data.retentionPolicies.truncation?.reason ?? "the listing stopped at its cap"}), so whether active retention policies exist is unknown; ${retentionRemedy}.`, retentionEvidence, retentionManualEvidence)
+        : assignedRetention.length > 0
+          ? finding(12, "pass", `${assignedRetention.length}/${activeRetention.length} active retention policies have assignments${retentionTruncated ? ` among the policies read; ${retentionTruncationNote}, so both counts are lower bounds; ${retentionRemedy}` : ""}.`, retentionEvidence)
+          : activeRetention.length > 0
+            ? finding(12, "warn", `${activeRetention.length} active retention policies exist but none have visible assignments${retentionTruncated ? `; ${retentionTruncationNote}, so assigned policies may remain unread; ${retentionRemedy}` : ""}.`, retentionEvidence)
+            : retentionTruncated
+              ? finding(12, "warn", `None of the ${retentionPolicies.length} retention policies read is active, but ${retentionTruncationNote}, so active policies may remain unread; ${retentionRemedy}.`, retentionEvidence, retentionManualEvidence)
+              : finding(12, "fail", "No active retention policies exist.", retentionEvidence),
     [unreadableInventory("retention_policy_assignments", data.retentionAssignments, "the folders and metadata each policy is assigned to were not checked (only the policy's own assignment_counts were read)")],
     retentionManualEvidence,
   ));
 
   const legalHolds = data.legalHoldPolicies.data;
+  const holdsTruncated = data.legalHoldPolicies.truncated === true;
   const activeHolds = legalHolds.filter((policy) => ["active", "applying"].includes(asString(policy.status) ?? ""));
   const assignedHolds = activeHolds.filter((policy) => hasKnownAssignments(policy, data.legalHoldAssignments.data));
   const holdEvidence = {
@@ -3190,16 +3224,23 @@ export function assessBoxDataGovernanceData(data: BoxGovernanceData): BoxAssessm
     })))),
     active_policies: whenRead(data.legalHoldPolicies, activeHolds.length),
     assigned_policies: observedCount([data.legalHoldPolicies, data.legalHoldAssignments], assignedHolds.length),
+    legal_hold_policies_truncated: whenRead(data.legalHoldPolicies, holdsTruncated),
   };
   const holdManualEvidence = "Admin Console > Governance > Legal Holds: record each policy, its custodians or folders, and confirm the legal team's hold process is documented.";
+  const holdTruncationNote = listingTruncationNote("legal hold policy", data.legalHoldPolicies);
+  const holdRemedy = truncationRemedy(data.legalHoldPolicies, "list_limit");
   findings.push(capForUnreadableInventories(
     data.legalHoldPolicies.error
       ? finding(13, "manual", `Legal hold policies could not be read because ${unreadableReason(data.legalHoldPolicies)}; this endpoint requires Box Governance and the manage_legal_holds scope.`, holdEvidence, holdManualEvidence)
-      : assignedHolds.length > 0
-        ? finding(13, "pass", `${assignedHolds.length}/${activeHolds.length} active legal hold policies have custodian or content assignments.`, holdEvidence)
-        : activeHolds.length > 0
-          ? finding(13, "warn", `${activeHolds.length} active legal hold policies exist without visible assignments.`, holdEvidence)
-          : finding(13, "warn", "No legal hold policies exist; confirm a documented process exists to create holds when litigation is anticipated.", holdEvidence, "Obtain the legal team's hold procedure and confirm Box Governance is licensed so holds can be applied when required."),
+      : holdsTruncated && legalHolds.length === 0
+        ? finding(13, "warn", `The legal hold policy listing returned no policies before it stopped (${data.legalHoldPolicies.truncation?.reason ?? "the listing stopped at its cap"}), so whether legal hold policies exist is unknown; ${holdRemedy}.`, holdEvidence, holdManualEvidence)
+        : assignedHolds.length > 0
+          ? finding(13, "pass", `${assignedHolds.length}/${activeHolds.length} active legal hold policies have custodian or content assignments${holdsTruncated ? ` among the policies read; ${holdTruncationNote}, so both counts are lower bounds; ${holdRemedy}` : ""}.`, holdEvidence)
+          : activeHolds.length > 0
+            ? finding(13, "warn", `${activeHolds.length} active legal hold policies exist without visible assignments${holdsTruncated ? `; ${holdTruncationNote}, so assigned holds may remain unread; ${holdRemedy}` : ""}.`, holdEvidence)
+            : holdsTruncated
+              ? finding(13, "warn", `None of the ${legalHolds.length} legal hold policies read is active, but ${holdTruncationNote}, so active holds may remain unread; ${holdRemedy}.`, holdEvidence, holdManualEvidence)
+              : finding(13, "warn", "No legal hold policies exist; confirm a documented process exists to create holds when litigation is anticipated.", holdEvidence, "Obtain the legal team's hold procedure and confirm Box Governance is licensed so holds can be applied when required."),
     [unreadableInventory("legal_hold_policy_assignments", data.legalHoldAssignments, "the custodians and content each hold covers were not checked (only the policy's own assignment_counts were read)")],
     holdManualEvidence,
   ));

@@ -905,6 +905,150 @@ test("verdict rule 10 (gap 37): the events walk ends after the first page that a
   assert.ok(!status.truncated_datasets.some((note) => note.includes(RESERVED_EVENTS_REASON) && note.includes("raise event_limit")));
 });
 
+const RESERVED_RECORDS_REASON = "the server re-served already-collected records under a new marker, so the remaining records could not be paged";
+const EMPTY_MARKER_PAGE_REASON = "the server returned an empty page while still offering a next marker";
+
+/** Every page answers with the same records under a fresh marker (m-1, m-2, ...): a marker list that never ends. */
+function fullForeverRoute(entries) {
+  return (url) => {
+    const marker = url.searchParams.get("marker");
+    const next = marker === null ? "m-1" : `m-${Number(marker.slice(2)) + 1}`;
+    return jsonResponse({ entries, limit: entries.length, next_marker: next });
+  };
+}
+
+const ASSIGNED_RETENTION_POLICY = { id: "retention-1", type: "retention_policy", policy_name: "Seven year records", policy_type: "finite", retention_length: "2555", disposition_action: "remove_retention", status: "active", assignment_counts: { enterprise: 0, folder: 2, metadata_template: 0 } };
+const ASSIGNED_LEGAL_HOLD = { id: "hold-1", type: "legal_hold_policy", policy_name: "Litigation 2026", status: "active", assignment_counts: { user: 2, folder: 0, file: 0, file_version: 0 } };
+
+test("gap 41: a marker list counts a record once by id, ends after a page that adds no unseen record or repeats its marker, and still completes over overlapping pages", async () => {
+  const markers = [];
+  const routed = httpBox(hardenedFixture(), {
+    routes: {
+      "GET /2.0/retention_policies": (url) => {
+        markers.push(url.searchParams.get("marker"));
+        return fullForeverRoute([ASSIGNED_RETENTION_POLICY])(url);
+      },
+      // New records on every page, but the same marker every time.
+      "GET /2.0/legal_hold_policies": (url) => {
+        const marker = url.searchParams.get("marker");
+        const index = marker === null ? 0 : 1;
+        return jsonResponse({ entries: [{ ...ASSIGNED_LEGAL_HOLD, id: `hold-${index + 1}` }], limit: 1, next_marker: "same" });
+      },
+      // Overlapping pages: the last record of one page opens the next; the server ends the list itself.
+      "GET /2.0/enterprises/{enterprise}/device_pinners": (url) => {
+        const marker = url.searchParams.get("marker");
+        if (marker === null) return jsonResponse({ entries: [{ id: "pin-1", type: "device_pinner" }, { id: "pin-2", type: "device_pinner" }], limit: 2, next_marker: "p-2" });
+        return jsonResponse({ entries: [{ id: "pin-2", type: "device_pinner" }, { id: "pin-3", type: "device_pinner" }], limit: 2 });
+      },
+    },
+  });
+
+  const reserved = await routed.client.listRetentionPolicies(100);
+  assert.deepEqual(markers, [null, "m-1"], "the second page re-serves the collected policy, so no third request is made");
+  assert.deepEqual(reserved.items.map((policy) => policy.id), ["retention-1"], "a re-served record is counted once");
+  assert.equal(reserved.truncated, true);
+  assert.deepEqual(reserved.truncation, { reason: RESERVED_RECORDS_REASON, capReached: false });
+
+  const repeatedMarker = await routed.client.listLegalHoldPolicies(100);
+  assert.deepEqual(repeatedMarker.items.map((policy) => policy.id), ["hold-1", "hold-2"], "the page served under the repeated marker is kept, then the walk ends");
+  assert.equal(repeatedMarker.truncated, true);
+  assert.deepEqual(repeatedMarker.truncation, { reason: "the server repeated its marker, so the remaining records could not be paged", capReached: false });
+
+  const overlapping = await routed.client.listDevicePinners(100);
+  assert.deepEqual(overlapping.items.map((pin) => pin.id), ["pin-1", "pin-2", "pin-3"], "a record served on two pages is counted once and the walk continues");
+  assert.equal(overlapping.truncated, false, "the server ended the list itself, so an overlap is not a truncation");
+  assert.equal(overlapping.truncation, undefined);
+
+  // The governance findings over the same server: a re-served policy list is a truncated read whose pass carries
+  // the listing's own exit and whose counts do not exceed the distinct ids.
+  const governance = await assessBoxDataGovernance(routed.client, { listLimit: 100 });
+  const retention = findingById(governance, "BOX-12");
+  assert.equal(retention.status, "pass", "an assigned active policy was observed, so the positive evidence stands");
+  assert.equal(retention.summary, `1/1 active retention policies have assignments among the policies read; the retention policy listing stopped after 1 records because ${RESERVED_RECORDS_REASON}, so both counts are lower bounds; review the remainder in the Admin Console.`);
+  assert.doesNotMatch(retention.summary, /raise list_limit/, "a higher list_limit does not read past a server that re-serves records");
+  assert.equal(retention.evidence.retention_policies_truncated, true);
+  assert.equal(retention.evidence.active_policies, 1);
+  assert.equal(retention.evidence.assigned_policies, 1);
+  assert.equal(retention.evidence.retention_policies.length, 1, "the evidence lists the distinct policy once");
+  assert.equal(governance.summary.retention_policies, 1, "the summary count does not exceed the distinct ids");
+  const hold = findingById(governance, "BOX-13");
+  assert.equal(hold.status, "pass");
+  assert.equal(hold.summary, "2/2 active legal hold policies have custodian or content assignments among the policies read; the legal hold policy listing stopped after 2 records because the server repeated its marker, so the remaining records could not be paged, so both counts are lower bounds; review the remainder in the Admin Console.");
+  assert.equal(hold.evidence.legal_hold_policies_truncated, true);
+  assert.equal(governance.summary.legal_hold_policies, 2);
+  assert.ok(governance.truncated.some((note) => note.startsWith("retention_policies: ") && note.includes(RESERVED_RECORDS_REASON)), JSON.stringify(governance.truncated));
+  assert.ok(governance.truncated.some((note) => note.startsWith("legal_hold_policies: ") && note.includes("repeated its marker")), JSON.stringify(governance.truncated));
+});
+
+test("gap 41: BOX-12 and BOX-13 test the listing's truncation before the empty branch, so an empty or inactive page under a next_marker never reads as absence", async () => {
+  // Empty first pages that still offer a next marker: nothing was read, and nothing is asserted absent.
+  const emptyPages = httpBox(hardenedFixture(), {
+    routes: {
+      "GET /2.0/retention_policies": () => jsonResponse({ entries: [], limit: 100, next_marker: "later" }),
+      "GET /2.0/legal_hold_policies": () => jsonResponse({ entries: [], limit: 100, next_marker: "later" }),
+    },
+  });
+  const empty = await assessBoxDataGovernance(emptyPages.client, { listLimit: 100 });
+  const emptyRetention = findingById(empty, "BOX-12");
+  assert.notEqual(emptyRetention.status, "fail", "an empty page under a next_marker is not evidence that no policy exists");
+  assert.equal(emptyRetention.status, "warn");
+  assert.equal(emptyRetention.summary, `The retention policy listing returned no policies before it stopped (${EMPTY_MARKER_PAGE_REASON}), so whether active retention policies exist is unknown; review the remainder in the Admin Console.`);
+  assert.equal(emptyRetention.evidence.retention_policies_truncated, true);
+  assert.deepEqual(emptyRetention.evidence.retention_policies, []);
+  assert.equal(emptyRetention.evidence.active_policies, 0);
+  assert.equal(emptyRetention.evidence.assigned_policies, null, "zero assigned policies is not asserted from a truncated read");
+  assert.match(emptyRetention.manualEvidence, /Admin Console > Governance > Retention/);
+  const emptyHold = findingById(empty, "BOX-13");
+  assert.equal(emptyHold.status, "warn");
+  assert.equal(emptyHold.summary, `The legal hold policy listing returned no policies before it stopped (${EMPTY_MARKER_PAGE_REASON}), so whether legal hold policies exist is unknown; review the remainder in the Admin Console.`);
+  assert.doesNotMatch(emptyHold.summary, /No legal hold policies exist/);
+  assert.equal(emptyHold.evidence.legal_hold_policies_truncated, true);
+  assert.equal(empty.summary.assigned_retention_policies, null);
+  assert.equal(empty.summary.assigned_legal_hold_policies, null);
+  assert.equal(empty.truncated.filter((note) => note.startsWith("retention_policies: ") || note.startsWith("legal_hold_policies: ")).length, 2, JSON.stringify(empty.truncated));
+
+  // A capped read whose collected policies are all retired: the fail branch is not reached, and the remedy names the cap option.
+  const retired = { ...ASSIGNED_RETENTION_POLICY, status: "retired" };
+  const cappedInactive = httpBox(hardenedFixture(), {
+    routes: {
+      "GET /2.0/retention_policies": (url) => boxMarkerPage([{ ...retired, id: "retention-1" }, { ...retired, id: "retention-2" }, ASSIGNED_RETENTION_POLICY], url),
+      "GET /2.0/legal_hold_policies": (url) => boxMarkerPage([{ ...ASSIGNED_LEGAL_HOLD, id: "hold-1", status: "released" }, { ...ASSIGNED_LEGAL_HOLD, id: "hold-2", status: "released" }, ASSIGNED_LEGAL_HOLD], url),
+    },
+  });
+  const capped = await assessBoxDataGovernance(cappedInactive.client, { listLimit: 2 });
+  const cappedRetention = findingById(capped, "BOX-12");
+  assert.equal(cappedRetention.status, "warn", "an inactive sample from a capped read does not prove that no active policy exists");
+  assert.equal(cappedRetention.summary, "None of the 2 retention policies read is active, but the retention policy listing stopped after 2 records because the 2-record cap was reached while the server offered a next marker, so active policies may remain unread; raise list_limit and rerun.");
+  assert.equal(cappedRetention.evidence.retention_policies_truncated, true);
+  assert.equal(cappedRetention.evidence.active_policies, 0);
+  const cappedHold = findingById(capped, "BOX-13");
+  assert.equal(cappedHold.status, "warn");
+  assert.equal(cappedHold.summary, "None of the 2 legal hold policies read is active, but the legal hold policy listing stopped after 2 records because the 2-record cap was reached while the server offered a next marker, so active holds may remain unread; raise list_limit and rerun.");
+
+  // A capped read that did observe an assigned active policy: the pass stands and carries the clause, the cap option, and the flag.
+  const cappedAssigned = httpBox(hardenedFixture(), {
+    routes: {
+      "GET /2.0/retention_policies": (url) => boxMarkerPage([ASSIGNED_RETENTION_POLICY, { ...ASSIGNED_RETENTION_POLICY, id: "retention-2" }, { ...ASSIGNED_RETENTION_POLICY, id: "retention-3" }], url),
+    },
+  });
+  const passed = findingById(await assessBoxDataGovernance(cappedAssigned.client, { listLimit: 2 }), "BOX-12");
+  assert.equal(passed.status, "pass");
+  assert.equal(passed.summary, "2/2 active retention policies have assignments among the policies read; the retention policy listing stopped after 2 records because the 2-record cap was reached while the server offered a next marker, so both counts are lower bounds; raise list_limit and rerun.");
+  assert.equal(passed.evidence.retention_policies_truncated, true);
+
+  // Complete reads keep their wording and carry the flag as false.
+  const complete = await assessBoxDataGovernance(httpBox(hardenedFixture()).client, { listLimit: 100 });
+  assert.equal(findingById(complete, "BOX-12").summary, "1/1 active retention policies have assignments.");
+  assert.equal(findingById(complete, "BOX-12").evidence.retention_policies_truncated, false);
+  assert.equal(findingById(complete, "BOX-13").summary, "1/1 active legal hold policies have custodian or content assignments.");
+  assert.equal(findingById(complete, "BOX-13").evidence.legal_hold_policies_truncated, false);
+  const denied = await assessBoxDataGovernance(httpBox(hardenedFixture(), {
+    routes: { "GET /2.0/retention_policies": () => jsonResponse({ type: "error", status: 403, code: "access_denied_insufficient_permissions", message: "Access denied" }, { status: 403 }) },
+  }).client, { listLimit: 100 });
+  assert.equal(findingById(denied, "BOX-12").status, "manual");
+  assert.equal(findingById(denied, "BOX-12").evidence.retention_policies_truncated, null, "a denied read carries no truncation flag");
+});
+
 test("verdict rule 9: non-JSON error bodies are described, never echoed, into Box error text", async () => {
   const fetchImpl = async () => new Response(`<html><body>gateway error; upstream header Authorization: Bearer FAKE_SECRET_TOKEN_8</body></html>`, {
     status: 502,
