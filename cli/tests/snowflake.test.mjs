@@ -3372,6 +3372,12 @@ const CARRIER_ROWS = [
   [`kv/password: ${PLANTED_TOKEN}`, "kv/password: [REDACTED]"],
   ["/oauth/token-request: invalid_client", "/oauth/token-request: invalid_client"],
   ["/api/v1/api-tokens: request failed with 403", "/api/v1/api-tokens: request failed with 403"],
+  [`kv/password: ${PLANTED_TOKEN} [code 003001, sqlState 42501]`, "kv/password: [REDACTED] [code 003001, sqlState 42501]"],
+  [`kv/password: ${PLANTED_TOKEN} (requestId abc-123)`, "kv/password: [REDACTED] (requestId abc-123)"],
+  ["config/prod/password: hunter2 was echoed by the proxy", "config/prod/password: [REDACTED] was echoed by the proxy"],
+  [`secrets/data/api_key: ${PLANTED_TOKEN}, then retried`, "secrets/data/api_key: [REDACTED], then retried"],
+  ["/api/v1/secrets: request failed with 403", "/api/v1/secrets: request failed with 403"],
+  ["/v1/auth/approle/passwords: listing denied", "/v1/auth/approle/passwords: listing denied"],
   [`/api_key=${PLANTED_TOKEN}`, "/api_key=[REDACTED]"],
   [`SPLUNK_ACS_TOKEN='${PLANTED_TOKEN}'`, "SPLUNK_ACS_TOKEN='[REDACTED]'"],
   [`httpEventCollectorToken="${PLANTED_TOKEN}"`, 'httpEventCollectorToken="[REDACTED]"'],
@@ -3411,6 +3417,16 @@ test("reviewer C final verdict, scheme-word order (r4078025849) and the key audi
   assertRows(redactSecrets, KEY_AUDIT_ROWS, "key audit");
   assertRows(redactSecrets, CARRIER_ROWS, "carrier");
   assert.equal(redactSecrets(`run ${PLANTED_TOKEN} end`), "run [REDACTED] end", "the error side keeps the generic long-run rule");
+});
+
+test("path-label pair, end to end: a 403 whose vendor message reads `kv/password: <value>` reaches the statement error with the value removed and the code detail that follows it kept", async () => {
+  const client = new SnowflakeSqlClient(sampleConfig({ maxRetries: 0 }), {
+    fetchImpl: async () => jsonResponse({ code: "003001", message: `kv/password: ${PLANTED_TOKEN}`, sqlState: "42501" }, { status: 403, statusText: "Forbidden" }),
+  });
+  const error = await client.execute("SHOW USERS").then(() => undefined, (thrown) => thrown);
+  assert.ok(error instanceof SnowflakeStatementError);
+  assert.equal(error.message, "Snowflake SQL API request failed (403 Forbidden): kv/password: [REDACTED] [code 003001, sqlState 42501]");
+  assertNoWindowOf(error.message, PLANTED_TOKEN, "403 path-label message");
 });
 
 test("data-side ruling: vendor-prefixed tokens, JWTs, PEM blocks, and credential carriers are removed on the data side while identifiers and bare runs survive, in scrubDataText, in redactSnapshot, and in the exported Snowflake bundle", async () => {

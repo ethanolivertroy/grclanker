@@ -471,9 +471,10 @@ const LEADING_SCHEME_IN_VALUE = /^([A-Za-z][A-Za-z0-9-]*)(\s+)(\S[\s\S]*)$/;
 const PAIR_LIST_START = /^[A-Za-z][A-Za-z0-9_.-]*=/;
 // After a bare path label the text is prose ("/api/v1/api-tokens: request failed with 403",
 // "/oauth/token-request: invalid_client") and stays, unless the segment itself names a credential
-// (its last word is password, key, secret, token, or passphrase, or it is a bearer id) and a single
-// token ends the line there ("kv/password: <value>"), which is the value.
-const SOLE_VALUE_PATTERN = new RegExp(String.raw`^(?!\[REDACTED\])[^\s"'<>;,&()[\]{}\\]+[ \t]*(?:$|[\r\n]|\\[nr]|\\u000[adAD])`);
+// in the singular (its last word is password, key, secret, token, or passphrase, or it is a bearer
+// id): then the next token is the value whatever its shape and whatever follows it
+// ("kv/password: <value> [code 003001]"), while a plural label ("api-tokens", "secrets") names a
+// collection and its colon continues as prose.
 const CREDENTIAL_NOUN_PATTERN = /(?:password|passwd|passphrase|pwd|secret|token|key)$/;
 // A credential-named flag whose value is the next argument (`psql --password <value> -h db`), as a
 // spawned CLI echoes its command line; `--name=value` is a pair and is read by the pair rule.
@@ -651,8 +652,8 @@ function scrubCookieHeaders(text: string): string {
  * setting key keeps a value that is not token-shaped, a bearer-id key loses a UUID, and a webhook
  * key keeps only the origin. The last segment of a bare path used as a label
  * ("/api/authn/v2/api_credentials: <detail>") is a request target, not a pair key, so the prose
- * after it is kept, unless a single token ends the line there ("kv/password: <value>"); inside a URL
- * with a scheme the pair rule still applies.
+ * after it is kept, unless the segment names a credential in the singular ("kv/password: <value>"),
+ * whose next token is the value; inside a URL with a scheme the pair rule still applies.
  */
 function replaceCredentialAssignments(text: string): string {
   const urlSpans = [...text.matchAll(EMBEDDED_URL_PATTERN)].map((match) => [match.index ?? 0, (match.index ?? 0) + match[0].length] as const);
@@ -670,7 +671,7 @@ function replaceCredentialAssignments(text: string): string {
     if (rule === "none") continue;
     const valueStart = match.index + whole.length;
     const barePathLabel = openingQuote === "" && separatorChar === ":" && isBarePathSegment(text, match.index, urlSpans);
-    if (barePathLabel && (!namesCredential(key) || (valueOpenQuote === "" && !SOLE_VALUE_PATTERN.test(text.slice(valueStart))))) continue;
+    if (barePathLabel && !namesCredential(key)) continue;
     const schemeCarrier = isAuthorizationStyleKey(keySegments(key));
     let kept = "";
     let consumed: number;
