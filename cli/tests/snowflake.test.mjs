@@ -3432,6 +3432,36 @@ function assertRows(scrub, rows, label) {
   }
 }
 
+/**
+ * CodeRabbit finding on #76: the userinfo of a URL ends at the first "/", "?", or "#", so an "@" inside a
+ * query or fragment never turns the query into the host. Before the fix "https://h?e=a@x.com&token=s3cr3t"
+ * read "h?e=a@" as userinfo and kept "x.com&token=..." as the host, which the query scrub never saw.
+ */
+const URL_USERINFO_ROWS = [
+  ["https://h?e=a@x.com&token=s3cr3t", "https://h?[REDACTED]"],
+  ["https://h#f@x.com", "https://h#[REDACTED]"],
+  ["https://h?e=a@x.com&q=s3cr3t", "https://h?[REDACTED]"],
+  ["https://h?e=a@x.com&code=s3cr3t#f@y.com", "https://h?[REDACTED]#[REDACTED]"],
+  ["https:\\/\\/h?e=a@x.com&token=s3cr3t", "https:\\/\\/h?[REDACTED]"],
+  ["https:\\/\\/h#f@x.com", "https:\\/\\/h#[REDACTED]"],
+  ["request to https://h?e=a@x.com&token=s3cr3t failed", "request to https://h?[REDACTED] failed"],
+  ["request to https://h#f@x.com failed", "request to https://h#[REDACTED] failed"],
+  ["https://user:s3cr3t@h/p?q=1#frag", "https://h/p?[REDACTED]#[REDACTED]"],
+  ["https://h/p@q?x=s3cr3t", "https://h/p@q?[REDACTED]"],
+  ["https://h:8443/p?u=a@x.com&sig=s3cr3t", "https://h:8443/p?[REDACTED]"],
+];
+
+test("CodeRabbit #76 userinfo: the userinfo of a URL ends at the first slash, question mark, or hash, so an @ inside a query or fragment never turns the query into the host, in the error scrubber, the data scrubber, and redactSnapshot, spelled plain and slash-escaped", () => {
+  assertRows(redactSecrets, URL_USERINFO_ROWS, "userinfo, error side");
+  assertRows(scrubDataText, URL_USERINFO_ROWS, "userinfo, data side");
+  assertRows((text) => redactSnapshot({ note: text }).note, URL_USERINFO_ROWS.filter(([input]) => input.startsWith("request to ")), "userinfo, redactSnapshot leaf");
+  for (const [input, expected] of URL_USERINFO_ROWS) {
+    for (const piece of ["s3cr3t", "x.com", "y.com"]) {
+      if (input.includes(piece)) assert.ok(!redactSecrets(input).includes(piece) && !scrubDataText(input).includes(piece), `${piece} left in the output of ${input}: ${expected}`);
+    }
+  }
+});
+
 test("reviewer C final verdict, scheme-word order (r4078025849) and the key audit: a credential-named key loses its value before any scheme word is read in both spellings, scheme words act only under Authorization-style keys and bare in prose, bearer ids go, setting suffixes and URL-valued webhook keys keep their values, and the flag, path, escaped-URL, and cookie carriers are read", () => {
   assertRows(redactSecrets, SCHEME_ORDER_ROWS, "scheme-word order");
   assertRows(redactSecrets, KEY_AUDIT_ROWS, "key audit");

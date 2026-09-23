@@ -220,7 +220,8 @@ const PEM_OPEN_PATTERN = /-----BEGIN [A-Z0-9 ]+-----[\s\S]*$/;
 // The escaped form is unescaped for reading and written back escaped.
 const ESCAPED_SLASH = "\\/";
 const EMBEDDED_URL_PATTERN = new RegExp(String.raw`${CARRIER_START}[a-z][a-z0-9+.-]*:(?:\/\/[^\s"'<>()[\]{}\\]+|\\\/\\\/(?:\\\/|[^\s"'<>()[\]{}\\])+)`, "gi");
-const URL_PARTS_PATTERN = /^([a-z][a-z0-9+.-]*:\/\/)(?:[^\s/@"'<>]+@)?([^?#]*)(\?[^#]*)?(#.*)?$/i;
+// The userinfo ends at the first "/", "?", or "#": an "@" inside a query or fragment ("https://h?e=a@x.com&q=v") never turns the query into the host.
+const URL_PARTS_PATTERN = /^([a-z][a-z0-9+.-]*:\/\/)(?:[^\s\/?#@"'<>\\]+@)?([^?#]*)(\?[^#]*)?(#.*)?$/i;
 const TRAILING_PUNCTUATION_PATTERN = /[.,;:!?]+$/;
 // A query pair's value ends at ";" too, so a pair inside a cookie header ("my&sid=<v>; Content-Type: ...") never consumes the cookie separator before the cookie reader runs.
 const QUERY_PAIR_PATTERN = /([?&])([A-Za-z0-9_.[\]-]+)=([^&#;\s"'<>)\]}\\]+)/g;
@@ -474,7 +475,13 @@ function scrubEmbeddedUrl(match: string): string {
   if (!parts) return match;
   const [, scheme, hostAndPath, query, fragment] = parts;
   const kept = `${scheme}${hostAndPath}`;
-  return `${escaped ? kept.split("/").join(ESCAPED_SLASH) : kept}${query ? `?${REDACTED}` : ""}${fragment ? `#${REDACTED}` : ""}${trailing}`;
+  return `${escaped ? kept.split("/").join(ESCAPED_SLASH) : kept}${redactedUrlPart(query)}${redactedUrlPart(fragment)}${trailing}`;
+}
+
+/** A query or fragment with content becomes its delimiter and the marker; a bare delimiter (what an earlier pass left before its marker) carries nothing and stays, so a second pass adds no second marker. */
+function redactedUrlPart(part: string | undefined): string {
+  if (!part) return "";
+  return part.length > 1 ? `${part[0]}${REDACTED}` : part;
 }
 
 function scrubQueryPair(match: string, separator: string, key: string): string {
