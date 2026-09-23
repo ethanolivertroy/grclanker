@@ -1921,6 +1921,61 @@ test("verdict rule 5: partial inventories are flagged with seen and total counts
   assert.match(findingById(truncatedWatches, "ELASTIC-20").summary, /watches is truncated \(100 of 500 seen/);
 });
 
+test("gap 43: ELASTIC-23 counts a truncated watches read as Watcher in use, names watches as a partial source, and never reports the requirement set complete", async () => {
+  const fixtures = healthyFixtures();
+  fixtures.spaces = [fixtures.spaces[0]];
+  const complete = findingById(await assessElasticClusterHardening(stubClient(fixtures)), "ELASTIC-23");
+  assert.equal(complete.status, "pass");
+  assert.equal(complete.evidence.requirements_complete, true);
+  assert.deepEqual(complete.evidence.partial_sources, []);
+  assert.ok(complete.evidence.required_features.some((item) => item.feature === "Watcher"), "the healthy fixture carries a watch, so Watcher is a requirement");
+  const requirementCount = complete.evidence.required_features.length;
+  assert.match(complete.summary, new RegExp(`\\(${requirementCount} requirement\\(s\\) checked\\)\\.$`));
+
+  // Zero rows under a server count of 500: Watcher is in use, the requirement set is incomplete, and the read is partial.
+  const zero = findingById(await assessElasticClusterHardening(stubClient(fixtures, { listWatches: async () => pagedList([], 500, true) })), "ELASTIC-23");
+  assert.notEqual(zero.status, "pass", "a truncated watches read never supports a pass");
+  assert.equal(zero.status, "warn");
+  assert.equal(zero.evidence.requirements_complete, false);
+  assert.deepEqual(zero.evidence.required_features, complete.evidence.required_features, "the Watcher requirement is kept from the server count");
+  assert.deepEqual(zero.evidence.partial_sources, ["watches is truncated (0 of 500 seen across 1 page(s); raise the collection limit)"]);
+  assert.match(zero.summary, new RegExp(`covers every configured security feature \\(${requirementCount} requirement\\(s\\) checked\\)\\. Verdict is capped at warn because the inventory is partial: watches is truncated \\(0 of 500 seen`));
+  assert.equal(zero.evidence.unsupported_features, null, "coverage is not asserted from an incomplete requirement set");
+  assert.equal(zero.evidence.observed_status, "pass");
+
+  // A capped read with rows: the same requirement set and the same partial note.
+  const capped = findingById(await assessElasticClusterHardening(stubClient(fixtures, {
+    listWatches: async () => pagedList(Array.from({ length: 100 }, (_, index) => ({ ...fixtures.watches[0], _id: `w${index}` })), 500, true),
+  })), "ELASTIC-23");
+  assert.equal(capped.status, "warn");
+  assert.equal(capped.evidence.requirements_complete, false);
+  assert.equal(capped.evidence.required_features.length, requirementCount);
+  assert.deepEqual(capped.evidence.partial_sources, ["watches is truncated (100 of 500 seen across 1 page(s); raise the collection limit)"]);
+
+  // Zero rows with no server count: Watcher in use cannot be proven, so the requirement is not added, and the set stays incomplete.
+  const unknownTotal = findingById(await assessElasticClusterHardening(stubClient(fixtures, { listWatches: async () => pagedList([], undefined, true) })), "ELASTIC-23");
+  assert.equal(unknownTotal.status, "warn");
+  assert.equal(unknownTotal.evidence.requirements_complete, false);
+  assert.equal(unknownTotal.evidence.required_features.length, requirementCount - 1);
+  assert.ok(!unknownTotal.evidence.required_features.some((item) => item.feature === "Watcher"));
+  assert.deepEqual(unknownTotal.evidence.partial_sources, ["watches is truncated (0 of an unknown total seen across 1 page(s); raise the collection limit)"]);
+
+  // Below gold, the Watcher requirement a truncated read establishes is a coverage failure, and the partial note travels with it.
+  const basic = { ...fixtures, license: { license: { ...fixtures.license.license, type: "basic" } } };
+  const uncovered = findingById(await assessElasticClusterHardening(stubClient(basic, { listWatches: async () => pagedList([], 500, true) })), "ELASTIC-23");
+  assert.equal(uncovered.status, "fail");
+  assert.match(uncovered.summary, /does not cover configured features: .*Watcher \(needs gold\)/);
+  assert.match(uncovered.summary, /Additional sources were unreadable or partial: watches is truncated \(0 of 500 seen/);
+  assert.equal(uncovered.evidence.requirements_complete, false);
+
+  // A complete empty read proves the feature absent: no Watcher requirement, no partial note.
+  const none = findingById(await assessElasticClusterHardening(stubClient(fixtures, { listWatches: async () => pagedList([], 0, false) })), "ELASTIC-23");
+  assert.equal(none.status, "pass");
+  assert.equal(none.evidence.requirements_complete, true);
+  assert.equal(none.evidence.required_features.length, requirementCount - 1);
+  assert.deepEqual(none.evidence.partial_sources, []);
+});
+
 test("verdict rule 6: every enabling flag is read, absent or false flags never support pass, and settings precedence is honored", async () => {
   const now = Date.now();
 

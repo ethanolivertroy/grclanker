@@ -3878,13 +3878,17 @@ export function evaluateElasticClusterHardening(
   const realmTypes = new Set([...parseRealms(view).filter((realm) => realm.enabled).map((realm) => realm.type), ...usageRealmTypes(usage)]);
   const rolesReadable = roles !== undefined;
   const usesFlsOrDls = roles ? roleIndexEntries(roles).some((entry) => (entry.fieldSecurity && Object.keys(entry.fieldSecurity).length > 0) || (entry.query !== undefined && entry.query !== null)) : false;
-  const requirements = requiredLicenseRankFor(realmTypes, usesFlsOrDls, auditEnabled, watches?.length ?? 0);
+  // A partial watches read proves Watcher is in use from any collected row or a server count above zero; it never
+  // proves the feature absent, so the requirement set stays incomplete and the read is named as partial.
+  const watchesInUse = watches !== undefined ? Math.max(watches.length, datasetPage(snapshot, "watches")?.total ?? 0) : 0;
+  const requirements = requiredLicenseRankFor(realmTypes, usesFlsOrDls, auditEnabled, watchesInUse);
   const unsupported = license.rank === undefined ? [] : requirements.filter((requirement) => requirement.rank > (license.rank as number));
   const expiryDays = licenseExpiry ? daysBetween(now, Date.parse(licenseExpiry)) : undefined;
   const expiryMissing = licenseReadable && licenseExpiry === undefined && license.type !== "basic";
   const featureSourceProblems = [...settingsProblems, ...dependencyProblems(snapshot, ["roles"])];
   const featureSourcesUnchecked = uncheckedSources(snapshot, ["xpack_usage", "xpack_info"]).concat(watches || watcherNotApplicable ? [] : uncheckedSources(snapshot, ["watches"]));
-  const requirementsComplete = settingsReadable && rolesReadable && usageReadable && (watches !== undefined || watcherNotApplicable);
+  const featureSourcesPartial = truncationNotes(snapshot, ["watches"]);
+  const requirementsComplete = settingsReadable && rolesReadable && usageReadable && (watchesComplete || watcherNotApplicable);
   // Below platinum the configured features decide coverage, so their sources are essential; at platinum or above every feature is covered and they only cross-check.
   const coverageEssential = license.rank === undefined || license.rank < LICENSE_RANK.platinum;
   const licenseEvidence: JsonRecord = {
@@ -3923,7 +3927,7 @@ export function evaluateElasticClusterHardening(
     evidence: licenseEvidence,
   }, {
     problems: [...licenseProblems, ...(coverageEssential ? featureSourceProblems : [])],
-    partial: nodeNotes,
+    partial: [...nodeNotes, ...featureSourcesPartial],
     unchecked: [...(coverageEssential ? [] : featureSourceProblems), ...featureSourcesUnchecked],
     collect: "the output of GET /_license and the subscription tier that covers the configured realms, FLS/DLS, audit logging, and Watcher.",
   }));
