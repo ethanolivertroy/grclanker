@@ -25,6 +25,14 @@
  * origin differs from the configured origin; each unsafe request is a leak and is listed on the
  * class 8 result with its userinfo masked.
  *
+ * Revision 3 (group D self-check, 02:20) adds `Snowflake` and `AWS4-HMAC-SHA256` to the scheme
+ * words, a name-shaped value after every scheme casing in a header, bare and after every escape and
+ * control character; a dozen vendor environment names as pair carriers after every escape; the
+ * snapshot-string and `webhook_url` rows on the data side and through the walker; `secret_key`, the
+ * quoted cloud secret names, and the PascalCase members with `AccessKeyId` kept; the quoted scheme
+ * word inside a quoted Authorization value; and in class 8 the rejected origin in the refusal note
+ * and an uppercase-scheme link followed as an absolute URL.
+ *
  * Depends only on `node:` modules and `./bundle-contents.mjs`; runs on Node 22.19 or newer.
  */
 import { readBundleFiles, readZipEntries } from "./bundle-contents.mjs";
@@ -66,6 +74,35 @@ export const GENERIC_CREDENTIAL_KEYS = Object.freeze([
   "DB_PASSWORD",
   "admin_password",
   "client_token",
+  // Group D self-check (02:20): `secret_key`, the cloud secret names in their quoted forms, and the
+  // PascalCase members an SDK response carries.
+  "secret_key",
+  "secret_access_key",
+  "AWS_SECRET_ACCESS_KEY",
+  "AZURE_CLIENT_SECRET",
+  "SecretAccessKey",
+  "SessionToken",
+  "ClientSecret",
+  "SecretKey",
+]);
+
+/**
+ * Vendor environment names probed as credential pairs after every escape form (group D self-check:
+ * `\/` immediately before a credential pair for a dozen keys including vendor env names).
+ */
+export const VENDOR_ENV_KEYS = Object.freeze([
+  "AWS_SECRET_ACCESS_KEY",
+  "AZURE_CLIENT_SECRET",
+  "GITHUB_TOKEN",
+  "SLACK_BOT_TOKEN",
+  "DD_API_KEY",
+  "SNOWFLAKE_PASSWORD",
+  "OKTA_API_TOKEN",
+  "SERVICENOW_PASSWORD",
+  "GOOGLE_API_KEY",
+  "ZOOM_CLIENT_SECRET",
+  "QUALYS_PASSWORD",
+  "NEW_RELIC_API_KEY",
 ]);
 
 /**
@@ -100,10 +137,10 @@ export const SETTING_SUFFIX_CONTROLS = Object.freeze([
 export const SETTING_SUFFIX_UUID_CONTROL_KEYS = Object.freeze(["secret_id_accessor", "token_accessor"]);
 
 /**
- * Scheme words every scrubber recognises in any casing on both sides (01:40 ruling, row B); an
- * integration's own `schemeWords` are added to these.
+ * Scheme words every scrubber recognises in any casing on both sides (01:40 ruling, row B; group D
+ * self-check adds `Snowflake` and `AWS4-HMAC-SHA256`); an integration's own `schemeWords` are added.
  */
-export const FIXED_SCHEME_WORDS = Object.freeze(["Bearer", "Basic", "Token", "Digest", "OAuth", "Negotiate", "NTLM", "SSWS", "ApiKey", "Api-Key", "Splunk"]);
+export const FIXED_SCHEME_WORDS = Object.freeze(["Bearer", "Basic", "Token", "Digest", "OAuth", "Negotiate", "NTLM", "SSWS", "ApiKey", "Api-Key", "Splunk", "Snowflake", "AWS4-HMAC-SHA256"]);
 
 /**
  * Credential names probed in flag and path position (reviewer #78 row D): `=` after a
@@ -160,6 +197,10 @@ const VOCABULARY = Object.freeze([
   ...IDENTIFIER_PLAIN_VALUES,
   ...SETTING_SUFFIX_CONTROLS.flat(),
   ...SETTING_SUFFIX_UUID_CONTROL_KEYS,
+  ...VENDOR_ENV_KEYS,
+  "AccessKeyId",
+  "snapshot",
+  "ts=1695000000",
   ...FIXED_SCHEME_WORDS,
   ...FLAG_PATH_KEYS,
   ...INFORMATIONAL_ESCAPE_FORMS,
@@ -491,6 +532,7 @@ function credentialPairCells(options, canaries) {
     ["client_id", canaries.uuid[1]],
     ["tenant_id", canaries.uuid[1]],
     ["access_key_id", "key-2026-primary"],
+    ["AccessKeyId", "key-2026-primary"],
     ["key_id", "primary-signing-key"],
     ["secret_name", "my-secret"],
   ];
@@ -637,7 +679,7 @@ function escapeBoundaryCells(options, canaries) {
     ["token", canaries.tokens[4]],
     ["name-shaped", canaries.nameShaped[2]],
   ];
-  const pairKeys = unique([...(options.credentialKeys ?? []), "api_key", "password", "client_token"]);
+  const pairKeys = unique([...(options.credentialKeys ?? []), "api_key", "password", "client_token", ...VENDOR_ENV_KEYS]);
   const contexts = [
     ["bare", (escape, carrier) => `request failed${escape}${carrier} see the log`, ["failed"]],
     ["inside a JSON string member", (escape, carrier) => `{"detail":"request failed${escape}${carrier} see the log"}`, ["failed", "detail"]],
@@ -664,6 +706,17 @@ function escapeBoundaryCells(options, canaries) {
     for (const [contextName, context, contextKeep] of contexts) {
       cells.push(cell(`${prefixName} / control Content-Type / ${contextName}`, context(escape, "Content-Type: application/json"), { mustKeep: ["Content-Type: application/json", ...contextKeep] }));
       cells.push(cell(`${prefixName} / control X-Request-Id / ${contextName}`, context(escape, `X-Request-Id: ${canaries.uuid[1]}`), { mustKeep: [`X-Request-Id: ${canaries.uuid[1]}`, ...contextKeep] }));
+    }
+  }
+  // Group D self-check: `Authorization: <Scheme> <name-shaped value>` for every scheme word in lower,
+  // upper, given, and alternating casing after every escape form and control character; the value
+  // goes, the scheme word as spelled stays.
+  const casedSchemeValue = nameShapedAt(canaries, 2);
+  for (const scheme of unique([...FIXED_SCHEME_WORDS, ...(options.schemeWords ?? [])])) {
+    for (const spelled of unique([scheme.toLowerCase(), scheme.toUpperCase(), scheme, alternateCase(scheme)])) {
+      for (const [prefixName, escape] of prefixes) {
+        cells.push(cell(`scheme casing after ${prefixName} / ${spelled} / name-shaped`, `request failed${escape}Authorization: ${spelled} ${casedSchemeValue} see the log`, { planted: [casedSchemeValue], mustKeep: ["Authorization", spelled, "failed"] }));
+      }
     }
   }
   // Percent-encoded and JavaScript hex line breaks: the same rows, informational by the principal's ruling.
@@ -745,6 +798,8 @@ function quotedCompoundHeaderCells(canaries) {
   rows.push(["JSON-escaped quoted X-Api-Key (depth 2)", `X-Api-Key: \\\\\\"${first}\\\\\\"`, [first], ["X-Api-Key"]]);
   rows.push(["quoted cookie pair", `Cookie: sid="${first}"`, [first], ["Cookie"]]);
   rows.push(["quoted bearer value", `Authorization: Bearer "${first}"`, [first], ["Authorization", "Bearer"]]);
+  // Group D self-check: the scheme word inside the quotes stays (`Authorization: "Bearer [REDACTED]"`).
+  rows.push(["quoted scheme and value", `Authorization: "Bearer ${first}"`, [first], ["Authorization", '"Bearer']]);
   rows.push(["compound unquoted", `Cookie: sid=${first}; X-Api-Key: ${second}; Content-Type: application/json`, [first, second], ["Cookie", "X-Api-Key", "Content-Type: application/json"]]);
   rows.push(["compound quoted", `Cookie: sid="${first}"; X-Api-Key: "${second}"; Content-Type: "application/json"`, [first, second], ["Cookie", "X-Api-Key", 'Content-Type: "application/json"']]);
   rows.push(["compound all bare", `Cookie: ${first}; X-Api-Key: ${second}; Content-Type: application/json`, [first, second], ["Cookie", "X-Api-Key", "Content-Type: application/json"]]);
@@ -769,12 +824,17 @@ function schemeCasingCells(options, canaries) {
     ["token", canaries.tokens[7]],
     ["opaque", canaries.opaque[0]],
   ];
+  // Group D self-check: a name-shaped value after the scheme word in a header goes too (the header
+  // names the credential); prose keeps to the token shapes.
+  const headerValues = [...values, ["name-shaped", nameShapedAt(canaries, 2)]];
   for (const scheme of schemes) {
     // Lower, upper, the given spelling, and an alternating one: any casing matches (01:40 ruling).
     const casings = unique([scheme.toLowerCase(), scheme.toUpperCase(), scheme, alternateCase(scheme)]);
     for (const spelled of casings) {
-      for (const [valueName, value] of values) {
+      for (const [valueName, value] of headerValues) {
         cells.push(cell(`scheme ${spelled} in a header / ${valueName}`, `Authorization: ${spelled} ${value}`, { planted: [value], mustKeep: ["Authorization", spelled] }));
+      }
+      for (const [valueName, value] of values) {
         cells.push(cell(`scheme ${spelled} in prose / ${valueName}`, `replayed ${spelled} ${value} upstream`, { planted: [value], mustKeep: ["replayed", spelled, "upstream"] }));
       }
     }
@@ -799,21 +859,39 @@ function dataShapeValues(canaries) {
   ];
 }
 
+/** A serialized snapshot held as a string under a benign key, as an audit record or a diff stores it. */
+function snapshotString(text) {
+  return JSON.stringify({ description: `note: key ${text} end` });
+}
+
+/** The URL-valued webhook member (group D self-check): its path and query go, the key stays. */
+function webhookUrlRow(canaries) {
+  const token = canaries.tokens[2];
+  const signature = tokenAt(canaries, 9);
+  return { url: `https://hooks.example.com/services/T/B/${token}?ts=1695000000&sig=${signature}`, planted: [token, signature], mustRemove: ["services/T/B", "ts=1695000000"] };
+}
+
 function dataShapeTextCells(canaries) {
   const cells = [];
   for (const [label, text, planted] of dataShapeValues(canaries)) {
     cells.push(cell(`${label} in a free-text field`, `note: key ${text} end`, { planted, mustKeep: ["note: key", "end"], sinks: "data" }));
+    cells.push(cell(`${label} in a benign-keyed snapshot string`, JSON.stringify({ snapshot: snapshotString(text) }), { planted, mustKeep: ["snapshot", "description"], sinks: "data" }));
   }
+  const webhook = webhookUrlRow(canaries);
+  cells.push(cell("webhook_url loses path and query on the data side", `webhook_url=${webhook.url}`, { planted: webhook.planted, mustRemove: webhook.mustRemove, mustKeep: ["webhook_url"], sinks: "data" }));
   cells.push(cell("name-shaped 16+ run stays on the data side", `cluster ${NAME_SHAPED_DATA_VALUE} was read`, { mustKeep: [NAME_SHAPED_DATA_VALUE], sinks: "data" }));
   return cells;
 }
 
-/** Walker cells: `{ label, value, planted, mustKeep }`; the walker's output is stringified and scanned. */
+/** Walker cells: `{ label, value, planted, mustKeep, mustRemove }`; the walker's output is stringified and scanned. */
 function dataShapeWalkerCells(canaries) {
   const cells = [];
   for (const [label, text, planted] of dataShapeValues(canaries)) {
     cells.push({ label: `${label} in a benign-keyed field`, value: { id: "rec-1", description: `note: key ${text} end`, tags: [{ notes: [`also ${text}`] }] }, planted, mustKeep: ["rec-1", "note: key"] });
+    cells.push({ label: `${label} in a benign-keyed snapshot string`, value: { id: "rec-3", snapshot: snapshotString(text) }, planted, mustKeep: ["rec-3", "snapshot"] });
   }
+  const webhook = webhookUrlRow(canaries);
+  cells.push({ label: "webhook_url loses path and query through the walker", value: { id: "rec-4", webhook_url: webhook.url, name: "benign-sibling" }, planted: webhook.planted, mustRemove: webhook.mustRemove, mustKeep: ["rec-4", "webhook_url", "benign-sibling"] });
   cells.push({ label: "name-shaped 16+ run stays in a benign-keyed field", value: { id: "rec-2", description: `cluster ${NAME_SHAPED_DATA_VALUE} was read` }, planted: [], mustKeep: [NAME_SHAPED_DATA_VALUE] });
   return cells;
 }
@@ -1173,7 +1251,7 @@ export async function runLeakProbe(options) {
 
   const runWalkerCell = async (cls, row) => {
     cls.cells += 1;
-    if (row.planted.length > 0) cls.plantedCells += 1;
+    if (row.planted.length > 0 || (row.mustRemove ?? []).length > 0) cls.plantedCells += 1;
     const leaksBefore = cls.leaks;
     let output;
     let again;
@@ -1186,7 +1264,7 @@ export async function runLeakProbe(options) {
       return undefined;
     }
     const text = stringify(output);
-    scanText(cls, row.label, walkerName, stringify(row.value), text, row.planted, row.mustKeep ?? []);
+    scanText(cls, row.label, walkerName, stringify(row.value), text, row.planted, row.mustKeep ?? [], row.mustRemove ?? []);
     if (stringify(again) !== text) recordIdempotence(cls, { label: row.label, entryPoint: walkerName, input: stringify(row.value), output: text, second: stringify(again) });
     if (cls.leaks > leaksBefore) cls.leakingCells += 1;
     return output;
@@ -1314,7 +1392,21 @@ export async function runLeakProbe(options) {
         ["absolute same origin", `${configuredOrigin}/api/v2/users?cursor=${queryCanary}`],
         ["case-differing host", `${originUrl.protocol.toUpperCase()}//${host.toUpperCase()}/api/v2/users?cursor=${queryCanary}`],
         ["default port", `${originUrl.protocol}//${originUrl.hostname}:${originUrl.protocol === "https:" ? 443 : 80}/api/v2/users?cursor=${queryCanary}`],
+        // Group D self-check: an uppercase scheme is still an absolute URL, followed as one and never fetched as a relative path.
+        ["uppercase scheme", `${originUrl.protocol.toUpperCase()}//${host}/api/v2/users?cursor=${queryCanary}`],
       ];
+      // The origin a rejected link names once resolved against the configured origin (`https://evil.example`,
+      // `javascript:`); the refusal note must name it beside the configured origin.
+      const rejectedOriginOf = (link) => {
+        try {
+          const resolved = new URL(link, configuredOrigin);
+          const origin = originOfParsedUrl(resolved);
+          return origin === configuredOrigin ? undefined : origin;
+        } catch {
+          return undefined;
+        }
+      };
+      const RELATIVE_ABSOLUTE_PATH = /^\/[A-Za-z][A-Za-z0-9+.-]*:(\/\/|%2F%2F)/i;
       const runLink = async (label, nextLink, expectFollowed) => {
         cls.cells += 1;
         cls.plantedCells += 1;
@@ -1351,7 +1443,20 @@ export async function runLeakProbe(options) {
           // (a library may name the configured origin in the error and the rejected origin in the note).
           const reasonTexts = [outcome?.note ?? outcome?.reason, ...(outcome?.errorTexts ?? [])].filter((text) => typeof text === "string");
           if (reasonTexts.length > 0 && !reasonTexts.some((text) => text.includes(configuredOrigin))) recordLoss(cls, { label, entryPoint: "nextLinkRunner note", input: nextLink, output: reasonTexts.join(" | "), missing: configuredOrigin });
+          // Group D self-check: the refusal names the rejected origin too (scheme, host, and port, or the bare scheme).
+          const rejectedOrigin = rejectedOriginOf(nextLink);
+          if (rejectedOrigin !== undefined && reasonTexts.length > 0 && !reasonTexts.some((text) => text.includes(rejectedOrigin))) recordLoss(cls, { label, entryPoint: "nextLinkRunner note", input: nextLink, output: reasonTexts.join(" | "), missing: rejectedOrigin });
         } else {
+          // Group D self-check: an absolute link fetched as a relative path lands under the configured origin with the scheme in its path.
+          for (const request of requests) {
+            let pathname;
+            try {
+              pathname = new URL(String(request.url)).pathname;
+            } catch {
+              continue;
+            }
+            if (RELATIVE_ABSOLUTE_PATH.test(pathname)) recordLeak(cls, { label, entryPoint: "nextLinkRunner request", input: nextLink, output: maskUserinfo(String(request.url)), planted: nextLink, window: "absolute link fetched as a relative path" });
+          }
           const followed = requests.some((request) => {
             try {
               const url = new URL(request.url);

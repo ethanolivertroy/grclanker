@@ -27,6 +27,7 @@ import {
   SESSION_ID_KEYS,
   SETTING_SUFFIX_CONTROLS,
   SETTING_SUFFIX_UUID_CONTROL_KEYS,
+  VENDOR_ENV_KEYS,
   assertCanariesDisjoint,
   assertNoLeaks,
   leakedWindow,
@@ -45,8 +46,10 @@ import {
  * the informational rows (percent-encoded and JavaScript hex line breaks, non-gating by the
  * principal's ruling) are counted in the report without ever failing `assertNoLeaks`, and that
  * class 8 flags a userinfo-bearing request on the configured origin, an unparseable request, and a
- * userinfo-stripped follow of a rejected link (CodeRabbit 5286122785 on #78 `8b92f20`). The library
- * run wires every entry point the library exposes and must report zero leaks.
+ * userinfo-stripped follow of a rejected link (CodeRabbit 5286122785 on #78 `8b92f20`), wants the
+ * rejected origin named in a refusal note, and catches an uppercase-scheme link fetched as a relative
+ * path (group D self-check, revision 3). The library run wires every entry point the library exposes
+ * and must report zero leaks.
  */
 
 const identity = (text) => text;
@@ -179,9 +182,22 @@ async function followerNextLinkRunner({ nextLink, fetchImpl, origin }) {
   return { errorTexts: [`followed next link ${nextLink}`], findings: [{ id: "USERS-01", status: "pass", summary: "read every page" }], truncated: false };
 }
 
-/** A clean outcome for a walk that stops: nothing in the texts, the inventory truncated, the configured origin in the note. */
-function cleanStopOutcome(origin) {
-  return { errorTexts: [], findings: [{ id: "USERS-01", status: "not_evaluated", summary: "users inventory truncated" }], truncated: true, note: `walk stopped at ${origin}` };
+/** The origin a link names once resolved against the configured origin, as the library spells it (scheme, host, and port, or the bare scheme). */
+function linkOrigin(nextLink, origin) {
+  try {
+    const url = new URL(nextLink, origin);
+    return url.host.length > 0 ? `${url.protocol}//${url.host}` : url.protocol;
+  } catch {
+    return origin;
+  }
+}
+
+/**
+ * A clean outcome for a walk that stops: nothing in the texts, the inventory truncated, the
+ * configured origin and the rejected origin in the note, as the rule 10 phrasing requires.
+ */
+function cleanStopOutcome(origin, nextLink) {
+  return { errorTexts: [], findings: [{ id: "USERS-01", status: "not_evaluated", summary: "users inventory truncated" }], truncated: true, note: `walk stopped: next link named ${linkOrigin(nextLink, origin)} rather than the configured origin ${origin}` };
 }
 
 /**
@@ -192,13 +208,13 @@ async function identityNextLinkRunner({ nextLink, fetchImpl, origin }) {
   const base = `${origin}/api/v2/users?per_page=100`;
   await fetchImpl(base, { headers: { Authorization: `Bearer ${CONFIGURED_SECRET}` } });
   await fetchImpl(new URL(nextLink, base).href, { headers: { Authorization: `Bearer ${CONFIGURED_SECRET}` } });
-  return cleanStopOutcome(origin);
+  return cleanStopOutcome(origin, nextLink);
 }
 
 /** A walk that hands the next link to fetch verbatim, so a relative or protocol-relative link is not a URL at all. */
 async function verbatimNextLinkRunner({ nextLink, fetchImpl, origin }) {
   await fetchImpl(nextLink, { headers: { Authorization: `Bearer ${CONFIGURED_SECRET}` } });
-  return cleanStopOutcome(origin);
+  return cleanStopOutcome(origin, nextLink);
 }
 
 /** A walk that strips the userinfo off the next link and follows the rest on the configured origin. */
@@ -208,7 +224,22 @@ async function strippingNextLinkRunner({ nextLink, fetchImpl, origin }) {
   next.username = "";
   next.password = "";
   if (`${next.protocol}//${next.host}` === origin) await fetchImpl(next.href, { headers: { Authorization: `Bearer ${CONFIGURED_SECRET}` } });
-  return cleanStopOutcome(origin);
+  return cleanStopOutcome(origin, nextLink);
+}
+
+/** A walk that refuses correctly but whose note names only the configured origin, never the rejected one. */
+async function configuredOnlyNoteNextLinkRunner({ nextLink, fetchImpl, origin }) {
+  const base = `${origin}/api/v2/users?per_page=100`;
+  const next = new URL(nextLink, base);
+  const sameOrigin = linkOrigin(nextLink, origin) === origin && next.username.length === 0 && next.password.length === 0;
+  if (sameOrigin) await fetchImpl(next.href, { headers: { Authorization: `Bearer ${CONFIGURED_SECRET}` } });
+  return { ...cleanStopOutcome(origin, nextLink), note: `walk stopped at the configured origin ${origin}` };
+}
+
+/** A walk that treats every next link as a path under the configured origin, so an absolute link with an uppercase scheme is fetched as a relative path. */
+async function relativePathNextLinkRunner({ nextLink, fetchImpl, origin }) {
+  await fetchImpl(`${origin}/${nextLink.replace(/^\/+/, "")}`, { headers: { Authorization: `Bearer ${CONFIGURED_SECRET}` } });
+  return cleanStopOutcome(origin, nextLink);
 }
 
 /** An export that writes whatever the server answered into its bundle directory. */
@@ -281,13 +312,17 @@ function byClass(result, id) {
 
 test("leak-probe harness: the class table names all ten classes", () => {
   assert.deepEqual(LEAK_CLASSES.map((cls) => cls.id), [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
-  assert.equal(GENERIC_CREDENTIAL_KEYS.length, 12);
+  assert.equal(GENERIC_CREDENTIAL_KEYS.length, 20);
+  for (const key of ["assertion", "connection_string", "secret_key", "secret_access_key", "AWS_SECRET_ACCESS_KEY", "AZURE_CLIENT_SECRET", "SecretAccessKey", "SessionToken", "ClientSecret", "SecretKey"]) {
+    assert.ok(GENERIC_CREDENTIAL_KEYS.includes(key), `${key} is a generic credential key`);
+  }
+  assert.equal(VENDOR_ENV_KEYS.length, 12);
   assert.deepEqual([...BEARER_ID_KEYS], ["secret_id", "VAULT_SECRET_ID", "role_secret_id", "roleSecretId", "token_id", "tokenId"]);
   assert.deepEqual([...SESSION_ID_KEYS], ["session_id", "sid", "jsessionid", "PHPSESSID"]);
   assert.equal(FIXED_PASSWORDS.length, 12);
   assert.deepEqual(SETTING_SUFFIX_CONTROLS.map(([key]) => key), ["secret_id_ttl", "secret_id_num_uses", "token_max_ttl", "token_num_uses", "secret_id_bound_cidrs", "token_bound_cidrs", "webhook_count"]);
   assert.deepEqual(SETTING_SUFFIX_UUID_CONTROL_KEYS, ["secret_id_accessor", "token_accessor"]);
-  assert.deepEqual([...FIXED_SCHEME_WORDS], ["Bearer", "Basic", "Token", "Digest", "OAuth", "Negotiate", "NTLM", "SSWS", "ApiKey", "Api-Key", "Splunk"]);
+  assert.deepEqual([...FIXED_SCHEME_WORDS], ["Bearer", "Basic", "Token", "Digest", "OAuth", "Negotiate", "NTLM", "SSWS", "ApiKey", "Api-Key", "Splunk", "Snowflake", "AWS4-HMAC-SHA256"]);
   assert.deepEqual([...INFORMATIONAL_ESCAPE_FORMS], ["%0A", "%0D%0A", "%09", "\\x0a", "\\x09", "\\x0d\\x0a"]);
 });
 
@@ -360,6 +395,30 @@ test("leak-probe harness: every planted row leaks against an identity scrubber a
     assert.ok(result.leaks.some((leak) => leak.label.startsWith(prefix)), `${prefix} leaks against identity`);
   }
   assert.ok(result.mustKeepLosses.every((loss) => !/^setting suffix control /.test(loss.label)), "the setting-suffix controls keep their values under identity");
+  // Revision 3 rows (group D self-check) are present and leak against identity.
+  for (const prefix of [
+    'scheme casing after escape "\\\\/" / aws4-hmac-sha256 / name-shaped',
+    'scheme casing after decoded control "\\n" / SNOWFLAKE / name-shaped',
+    "scheme sNoWfLaKe in a header / name-shaped",
+    "scheme BEARER in a header / name-shaped",
+    'escape "\\\\/" / GITHUB_TOKEN= / token / bare',
+    'escape "\\\\/" / URL userinfo / name-shaped / bare',
+    "credential key SecretAccessKey / name-shaped / single-quoted",
+    "credential key AWS_SECRET_ACCESS_KEY / name-shaped / XML attribute",
+    "credential key secret_key / name-shaped / NAME=v",
+    "quoted scheme and value",
+    "JWT in a benign-keyed snapshot string",
+    "webhook_url loses path and query on the data side",
+    "webhook_url loses path and query through the walker",
+  ]) {
+    assert.ok(result.leaks.some((leak) => leak.label.startsWith(prefix)), `${prefix} leaks against identity`);
+  }
+  assert.ok(result.leaks.some((leak) => leak.label === "webhook_url loses path and query through the walker" && leak.window === "services/T/B"), "the walker row asserts the path is removed");
+  assert.equal(result.mustKeepLosses.filter((loss) => /^identifier control AccessKeyId=/.test(loss.label)).length, 0, "AccessKeyId=<plain> keeps its value under identity");
+  const casedSpellings = new Set(result.leaks.filter((leak) => /^scheme casing after /.test(leak.label)).map((leak) => leak.label.split(" / ")[1]));
+  for (const spelled of ["bearer", "BEARER", "Bearer", "bEaReR", "snowflake", "SNOWFLAKE", "sNoWfLaKe", "aws4-hmac-sha256", "AWS4-HMAC-SHA256", "aWs4-HmAc-sHa256", "api-key", "aPi-kEy", "ntlm", "nTlM"]) {
+    assert.ok(casedSpellings.has(spelled), `${spelled} runs after every escape and control character`);
+  }
   assert.match(byClass(result, 8).skipped, /no nextLinkRunner/);
   assert.match(byClass(result, 9).skipped, /no truncationRunner/);
   assert.match(result.report, /\| 8\. Next links \| skipped: no nextLinkRunner given \|/);
@@ -427,7 +486,7 @@ test("leak-probe harness: class 8 catches a walk that follows a foreign next lin
   const result = await runLeakProbe({ integration: "follower", nextLinkRunner: followerNextLinkRunner });
   const cls = byClass(result, 8);
   assert.equal(cls.skipped, null);
-  assert.equal(cls.cells, 16);
+  assert.equal(cls.cells, 17);
   const foreignRequests = result.leaks.filter((leak) => leak.class === 8 && leak.entryPoint === "nextLinkRunner request");
   assert.ok(foreignRequests.length >= 10, `foreign requests were recorded (${foreignRequests.length})`);
   for (const label of ["foreign host", "foreign port", "foreign scheme", "protocol-relative foreign host", "backslash foreign host", "IPv4 literal", "IPv6 literal", "javascript: scheme", "data: scheme", "blob: scheme", "file: scheme"]) {
@@ -457,7 +516,7 @@ test("leak-probe harness: class 8 flags a userinfo request on the configured ori
   for (const label of ["foreign host", "foreign port", "foreign scheme", "IPv4 literal", "IPv6 literal", "javascript: scheme", "data: scheme", "blob: scheme", "file: scheme"]) {
     assert.ok(identityUnsafe.some((request) => request.label === label && /differs from the configured origin https:\/\/api\.example\.com$/.test(request.reason)), `${label}: off the configured origin`);
   }
-  for (const label of ["relative same origin", "absolute same origin", "case-differing host", "default port"]) {
+  for (const label of ["relative same origin", "absolute same origin", "case-differing host", "default port", "uppercase scheme"]) {
     assert.ok(!identityUnsafe.some((request) => request.label === label), `${label}: the followed control is safe`);
   }
   assert.equal(identity.mustKeepLosses.filter((loss) => loss.class === 8).length, 0, "the controls are followed and the notes name the origin");
@@ -484,6 +543,42 @@ test("leak-probe harness: class 8 flags a userinfo request on the configured ori
   assert.ok(!stripped.url.includes(stripping.canaries.tokens[7]), "the stripped request carries no userinfo");
   assert.equal(byClass(stripping, 8).unsafeRequests.filter((request) => request.label !== "userinfo on the configured host").length, 0, "the foreign links produced no request");
   assert.equal(stripping.mustKeepLosses.filter((loss) => loss.class === 8).length, 0);
+});
+
+test("leak-probe harness: class 8 wants the rejected origin in the refusal note and an uppercase-scheme link followed as an absolute URL", async () => {
+  const configuredOnly = await runLeakProbe({ integration: "configured-only-note", nextLinkRunner: configuredOnlyNoteNextLinkRunner });
+  assert.equal(byClass(configuredOnly, 8).unsafeRequests.length, 0, "the walk refused every rejected link without a request");
+  const noteLosses = configuredOnly.mustKeepLosses.filter((loss) => loss.class === 8 && loss.entryPoint === "nextLinkRunner note");
+  const expectedRejectedOrigins = {
+    "foreign host": "https://evil.example",
+    "foreign port": "https://api.example.com:8443",
+    "foreign scheme": "http://api.example.com",
+    "protocol-relative foreign host": "https://evil.example",
+    "backslash foreign host": "https://evil.example",
+    "IPv4 literal": "http://10.0.0.1",
+    "IPv6 literal": "https://[::1]:8443",
+    "javascript: scheme": "javascript:",
+    "data: scheme": "data:",
+    "blob: scheme": "blob:",
+    "file: scheme": "file:",
+  };
+  for (const [label, rejectedOrigin] of Object.entries(expectedRejectedOrigins)) {
+    assert.ok(noteLosses.some((loss) => loss.label === label && loss.missing === rejectedOrigin), `${label}: the note must name ${rejectedOrigin}`);
+  }
+  assert.ok(!noteLosses.some((loss) => loss.label === "userinfo on the configured host"), "the userinfo link names no second origin");
+  assert.ok(!noteLosses.some((loss) => loss.missing === "https://api.example.com"), "every note names the configured origin");
+  assert.equal(configuredOnly.leaks.filter((leak) => leak.class === 8).length, 0, "naming only the configured origin is a must-keep loss, not a leak");
+
+  const identity = await runLeakProbe({ integration: "identity-walk", nextLinkRunner: identityNextLinkRunner });
+  assert.equal(identity.mustKeepLosses.filter((loss) => loss.class === 8 && loss.entryPoint === "nextLinkRunner note").length, 0, "a note naming both origins passes");
+  assert.ok(!identity.leaks.some((leak) => leak.class === 8 && leak.label === "uppercase scheme"), "the identity walk follows the uppercase-scheme link as an absolute URL");
+
+  const relative = await runLeakProbe({ integration: "relative-path-walk", nextLinkRunner: relativePathNextLinkRunner });
+  const relativeLeak = relative.leaks.find((leak) => leak.class === 8 && leak.label === "uppercase scheme" && leak.window === "absolute link fetched as a relative path");
+  assert.ok(relativeLeak, "the uppercase-scheme link fetched as a relative path is a leak");
+  assert.match(relativeLeak.output, /^https:\/\/api\.example\.com\/HTTPS:\/\/api\.example\.com\/api\/v2\/users\?cursor=/);
+  assert.ok(relative.mustKeepLosses.some((loss) => loss.class === 8 && loss.label === "uppercase scheme" && loss.entryPoint === "nextLinkRunner request"), "the uppercase-scheme page was not followed");
+  assert.ok(byClass(relative, 8).unsafeRequests.some((request) => request.label === "foreign host" && /carries the link's path/.test(request.reason)), "the foreign link fetched as a relative path still carries the link");
 });
 
 test("leak-probe harness: class 9 catches a collector that flips, passes on a truncated read, names principals, and writes absence values", async () => {
