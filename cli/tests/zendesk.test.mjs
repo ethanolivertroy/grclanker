@@ -1299,7 +1299,11 @@ test("assessZendeskAccessControl enumerates API token events from the audit log 
     },
   }), { now: () => NOW });
   assert.equal(findingById(truncatedHistory, "ZD-13").status, "warn");
-  assert.match(findingById(truncatedHistory, "ZD-13").summary, /history truncated/);
+  assert.match(findingById(truncatedHistory, "ZD-13").summary, /The token event inventory was truncated after 2 items \(.+\), so the verdict is limited to the seen population and item-level detail is withheld/);
+  assert.match(findingById(truncatedHistory, "ZD-13").summary, /Older tokens may be missing from the unread remainder of the history\./);
+  assert.equal(findingById(truncatedHistory, "ZD-13").evidence.token_events_truncated, true);
+  assert.equal(findingById(truncatedHistory, "ZD-13").evidence.tokens_outstanding, null, "a zero count over a truncated inventory is not asserted");
+  assert.equal(findingById(truncatedHistory, "ZD-13").evidence.outstanding_tokens, null, "item-level detail is withheld while the inventory is incomplete");
 
   const noAuditLog = await assessZendeskAccessControl(healthyClient({
     getAccountSettings: tokenSettings,
@@ -3388,7 +3392,7 @@ test("ZD-15 caps the zero-installation pass when owned apps are unreadable and r
   assert.equal(findingById(result, "ZD-16").status, "manual");
 });
 
-test("ZD-02 marks named principal lists as partial when the team inventory is truncated", async () => {
+test("ZD-02 withholds named principal lists and keeps the counts when the team inventory is truncated", async () => {
   const result = await assessZendeskAuthentication(healthyClient({
     async listTeamMembers() {
       const member = teamMember({ id: 2, role: "agent", two_factor_auth_enabled: false });
@@ -3401,14 +3405,25 @@ test("ZD-02 marks named principal lists as partial when the team inventory is tr
   assert.equal(item.status, "warn");
   assert.match(item.summary, /at least 1 team members report two_factor_auth_enabled=false \(not yet enrolled\) and at least 1 did not expose the flag/);
   assert.equal(item.evidence.inventory_truncated, true);
-  assert.equal(item.evidence.without_two_factor_partial, true);
-  assert.equal(item.evidence.two_factor_flag_missing_partial, true);
-  assert.deepEqual(item.evidence.without_two_factor, ["user-2@example.com"]);
-  assert.deepEqual(item.evidence.two_factor_flag_missing, ["user-3@example.com"]);
+  assert.equal(item.evidence.without_two_factor_count, 1, "a positive count over a truncated inventory is the observed lower bound");
+  assert.equal(item.evidence.two_factor_flag_missing_count, 1);
+  assert.equal(item.evidence.without_two_factor, null, "item-level detail is withheld until the inventory is read to completion");
+  assert.equal(item.evidence.two_factor_flag_missing, null);
+  assert.ok(!("without_two_factor_partial" in item.evidence) && !("two_factor_flag_missing_partial" in item.evidence), "no partial flags accompany withheld detail");
+  assert.doesNotMatch(JSON.stringify(item), /user-2@example\.com|user-3@example\.com/, "no principal from the truncated inventory is named");
 
-  const complete = findingById(await assessZendeskAuthentication(healthyClient(), { now: () => NOW }), "ZD-02");
-  assert.equal(complete.evidence.without_two_factor_partial, false);
-  assert.equal(complete.evidence.two_factor_flag_missing_partial, false);
+  const complete = findingById(await assessZendeskAuthentication(healthyClient({
+    async listTeamMembers() {
+      const member = teamMember({ id: 2, role: "agent", two_factor_auth_enabled: false });
+      const unknown = teamMember({ id: 3, role: "agent" });
+      delete unknown.two_factor_auth_enabled;
+      return list([teamMember({ id: 1, role: "admin" }), member, unknown]);
+    },
+  }), { now: () => NOW }), "ZD-02");
+  assert.equal(complete.evidence.inventory_truncated, false);
+  assert.deepEqual(complete.evidence.without_two_factor, ["user-2@example.com"]);
+  assert.deepEqual(complete.evidence.two_factor_flag_missing, ["user-3@example.com"]);
+  assert.equal(complete.evidence.without_two_factor_count, 1);
 });
 
 test("assessment summaries and evidence render unread inventories as null, never 0 or []", async () => {
@@ -3974,7 +3989,10 @@ test("foreign-origin next link over HTTP: a refused link demotes the dependent f
   const admins = findingById(accessControl, "ZD-07");
   assert.equal(admins.status, "warn", `a finding over the truncated team inventory demotes: ${admins.summary}`);
   assert.equal(admins.evidence.inventory_truncated, true);
-  assert.match(admins.summary, new RegExp(`The team member inventory was truncated after ${teamSeen} items \\(the next link pointed to https://evil\\.example\\.com, outside the configured origin https://acme\\.zendesk\\.com, and was not followed\\), so the verdict is limited to the seen population\\.`));
+  assert.match(admins.summary, new RegExp(`The team member inventory was truncated after ${teamSeen} items \\(the next link pointed to https://evil\\.example\\.com, outside the configured origin https://acme\\.zendesk\\.com, and was not followed\\), so the verdict is limited to the seen population and item-level detail is withheld from the evidence until the inventory is read to completion\\.`));
+  assert.equal(admins.evidence.admins, null, "admin names are withheld while the team inventory is truncated");
+  assert.equal(admins.evidence.dormant_admins_count, null, "a zero count over a truncated inventory is not asserted");
+  assert.equal(admins.evidence.seen_admins, 2, "the positive count is the observed lower bound");
   const destinations = findingById(results.find((result) => result.category === "integrations"), "ZD-24");
   assert.equal(destinations.status, "warn", `a finding over the truncated target inventory demotes: ${destinations.summary}`);
   assert.equal(destinations.evidence.inventory_truncated, true);

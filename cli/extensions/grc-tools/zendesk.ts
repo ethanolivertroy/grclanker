@@ -1999,7 +1999,9 @@ function isListResult(value: unknown): value is ZendeskListResult {
 
 // Per-read collection status for assessment summaries. seen, truncated, and pages
 // are counts of what the read actually did, so a read that never ran reports null
-// for all three rather than 0, false, or 1.
+// for all three rather than 0, false, or 1. A list read that stopped early before
+// adding any item reports seen null as well: 0 beside truncated=true would still be
+// read as an empty inventory by a consumer that takes the count alone.
 function collectionStatusOf(snap: ZendeskSnapshot<unknown>): JsonRecord {
   const list = snap.status === "ok" && isListResult(snap.data) ? snap.data : undefined;
   const readObject = snap.status === "ok" && !list;
@@ -2007,7 +2009,7 @@ function collectionStatusOf(snap: ZendeskSnapshot<unknown>): JsonRecord {
     status: snap.status,
     endpoint: snap.endpoint ?? null,
     http_status: snap.httpStatus ?? null,
-    seen: list ? list.items.length : readObject ? (snap.data === undefined || snap.data === null ? 0 : 1) : null,
+    seen: list ? (list.items.length === 0 && list.truncated ? null : list.items.length) : readObject ? (snap.data === undefined || snap.data === null ? 0 : 1) : null,
     truncated: list ? list.truncated : readObject ? false : null,
     truncation_reason: list?.truncation_reason ?? null,
     pages: list ? list.pages : null,
@@ -2084,38 +2086,90 @@ function truncationOrNull(...snaps: Array<ZendeskSnapshot<ZendeskListResult>>): 
   return snaps.some((snap) => snap.status !== "ok") ? null : false;
 }
 
+// The truncation reason of a list read that stopped early; undefined for a complete read.
+function truncationReasonOf(snap: ZendeskSnapshot<unknown>): string | undefined {
+  if (snap.status !== "ok" || !isListResult(snap.data) || !snap.data.truncated) return undefined;
+  return snap.data.truncation_reason ?? "more pages exist or the cursor stopped advancing";
+}
+
+/*
+ * Incomplete inventories. An inventory is incomplete when it could not be read (refused,
+ * unavailable, or failed) or when paging stopped before the end (the item or page cap, a
+ * stalled cursor, a next link outside the configured origin). Evidence over an incomplete
+ * inventory asserts no absence and names no item:
+ *
+ * - A count is a lower bound. A positive count is rendered as observed, qualified by the
+ *   inventory_truncated flag and the summary's truncation note; zero renders null, since 0
+ *   would read as a verified "none" that a partial read cannot support. A count over an
+ *   unreadable inventory renders null.
+ * - Item-level detail (names, labels, hosts, per-item records) is withheld and renders
+ *   null: a partial named list is filed as the review list, and whatever the unread
+ *   remainder holds escapes the review. The summary and evidence say how much was seen;
+ *   reading the inventory to completion (a higher max_items, a fixed cursor, the missing
+ *   permission) restores the detail.
+ * - No finding passes over an incomplete inventory it read, even one its pass branch did
+ *   not consume (rule 1 corollary), and a fail that rests on an absence (zero records
+ *   seen) is warn, since the unread remainder may hold the records.
+ * - A status count over a category that read an incomplete inventory is not asserted
+ *   when it is zero: a finding over that inventory may be undetermined, so 0 would claim
+ *   that no finding has the status when one may.
+ */
+function isIncomplete(snap: ZendeskSnapshot<unknown>): boolean {
+  return snap.status !== "ok" || truncationReasonOf(snap) !== undefined;
+}
+
 function truncationNote(name: string, snap: ZendeskSnapshot<ZendeskListResult>): string {
   return isTruncated(snap)
-    ? ` The ${name} inventory was truncated after ${listSnapshotItems(snap).length} items (${snap.data?.truncation_reason ?? "more pages exist or the cursor stopped advancing"}), so the verdict is limited to the seen population.`
+    ? ` The ${name} inventory was truncated after ${listSnapshotItems(snap).length} items (${truncationReasonOf(snap)}), so the verdict is limited to the seen population and item-level detail is withheld from the evidence until the inventory is read to completion.`
     : "";
 }
 
-// Evidence and summary counts derived from a dataset that could not be read render as
-// null rather than 0 or [], so an unread inventory is never mistaken for an empty one.
-function countOrNull(snap: ZendeskSnapshot<unknown>, count: number): number | null {
-  return snap.status === "ok" ? count : null;
+// A count over the inventories it is derived from: null when one was unreadable, null
+// when it is zero and one was truncated, the count otherwise (see "Incomplete inventories").
+function countOrNull(count: number, ...snaps: Array<ZendeskSnapshot<unknown>>): number | null {
+  if (snaps.some((snap) => snap.status !== "ok")) return null;
+  return count === 0 && snaps.some(isIncomplete) ? null : count;
 }
 
 function listCountOrNull(snap: ZendeskSnapshot<ZendeskListResult>): number | null {
-  return countOrNull(snap, listSnapshotItems(snap).length);
+  return countOrNull(listSnapshotItems(snap).length, snap);
 }
 
-function listOrNull<T>(snap: ZendeskSnapshot<unknown>, values: T[]): T[] | null {
-  return snap.status === "ok" ? values : null;
+// Item-level detail over the inventories it is drawn from: withheld (null) while any of
+// them is incomplete (see "Incomplete inventories").
+function detailOrNull<T>(values: T, ...snaps: Array<ZendeskSnapshot<unknown>>): T | null {
+  return snaps.some(isIncomplete) ? null : values;
+}
+
+// Why an inventory is incomplete: the cause of a failed read, or the point where paging stopped.
+function incompleteCause(name: string, snap: ZendeskSnapshot<unknown>): string {
+  const reason = truncationReasonOf(snap);
+  return reason === undefined
+    ? snapshotCause(name, snap)
+    : `${name} was truncated after ${isListResult(snap.data) ? snap.data.items.length : 0} items (${reason}), so its unread remainder may hold what the pass ruled out.`;
 }
 
 // Rule 1 corollary: a finding that read several inventories may not pass when a
-// secondary one was unreadable, even when the pass branch did not consume it, because
+// secondary one was incomplete, even when the pass branch did not consume it, because
 // the reviewer cannot tell a verified absence from an unread one. The cause is named and
-// the secondaries are recorded in evidence.
-function capForUnreadable(item: ZendeskFinding, secondaries: Array<[string, ZendeskSnapshot<unknown>]>): ZendeskFinding {
+// the secondaries are recorded in evidence, unreadable and truncated ones apart.
+function capForIncomplete(item: ZendeskFinding, secondaries: Array<[string, ZendeskSnapshot<unknown>]>): ZendeskFinding {
   const unreadable = secondaries.filter(([, snap]) => snap.status !== "ok");
-  if (item.status !== "pass" || unreadable.length === 0) return item;
+  const truncated = secondaries.filter(([, snap]) => truncationReasonOf(snap) !== undefined);
+  if (item.status !== "pass" || (unreadable.length === 0 && truncated.length === 0)) return item;
+  const causes = [
+    ...(unreadable.length > 0 ? [`Verdict capped at warn because a secondary inventory could not be read: ${unreadable.map(([name, snap]) => incompleteCause(name, snap)).join(" ")}`] : []),
+    ...(truncated.length > 0 ? [`Verdict capped at warn because a secondary inventory was truncated: ${truncated.map(([name, snap]) => incompleteCause(name, snap)).join(" ")}`] : []),
+  ];
   return {
     ...item,
     status: "warn",
-    summary: `${item.summary} Verdict capped at warn because a secondary inventory could not be read: ${unreadable.map(([name, snap]) => snapshotCause(name, snap)).join(" ")}`,
-    evidence: { ...(item.evidence ?? {}), verdict_capped_by_unreadable: unreadable.map(([name]) => name) },
+    summary: `${item.summary} ${causes.join(" ")}`,
+    evidence: {
+      ...(item.evidence ?? {}),
+      ...(unreadable.length > 0 ? { verdict_capped_by_unreadable: unreadable.map(([name]) => name) } : {}),
+      ...(truncated.length > 0 ? { verdict_capped_by_truncated: truncated.map(([name]) => name) } : {}),
+    },
   };
 }
 
@@ -2300,13 +2354,20 @@ function resolveOptions(options: ZendeskAssessmentOptions): Required<Omit<Zendes
   };
 }
 
-function summarizeStatuses(findings: ZendeskFinding[]): JsonRecord {
-  return {
-    pass: findings.filter((item) => item.status === "pass").length,
-    warn: findings.filter((item) => item.status === "warn").length,
-    fail: findings.filter((item) => item.status === "fail").length,
-    manual: findings.filter((item) => item.status === "manual").length,
+// Status counts over a set of findings. With incomplete=true (an inventory the findings
+// read was unreadable or truncated) a count of zero renders null: a finding over that
+// inventory may be undetermined, so 0 would claim that no finding has the status when
+// one may (see "Incomplete inventories"). A positive count is rendered as observed.
+function summarizeStatuses(findings: ZendeskFinding[], incomplete: boolean): JsonRecord {
+  const count = (status: ZendeskFindingStatus): number | null => {
+    const total = findings.filter((item) => item.status === status).length;
+    return total === 0 && incomplete ? null : total;
   };
+  return { pass: count("pass"), warn: count("warn"), fail: count("fail"), manual: count("manual") };
+}
+
+function anyIncomplete(entries: Array<[string, ZendeskSnapshot<unknown>]>): boolean {
+  return entries.some(([, snap]) => isIncomplete(snap));
 }
 
 function roleCeilingReason(currentUser: ZendeskSnapshot<JsonRecord>): string | undefined {
@@ -2410,7 +2471,7 @@ function assessAgentTwoFactor(
     return manualFinding(2, title, "critical", `${snapshotCause("Team member list (/users?role[]=agent&role[]=admin)", teamSnap)} ${enforcementText}`, `export the team member list from Admin Center > People > Team > Team members and ${requirementInstruction}`, { two_factor_enforce: enforce ?? null, security_settings_status: securitySnap.status });
   }
   if (teamMembers.length === 0) {
-    return manualFinding(2, title, "critical", `Zero active agents or admins were visible although every Zendesk account has at least one admin, so the credential sees only a partial population. ${enforcementText}`, `use an admin credential and ${requirementInstruction}`, { seen_team_members: 0, two_factor_enforce: enforce ?? null, security_settings_status: securitySnap.status });
+    return manualFinding(2, title, "critical", `Zero active agents or admins were visible although every Zendesk account has at least one admin, so the credential sees only a partial population.${truncationNote("team member", teamSnap)} ${enforcementText}`, `use an admin credential and ${requirementInstruction}`, { seen_team_members: countOrNull(0, teamSnap), inventory_truncated: truncationOrNull(teamSnap), two_factor_enforce: enforce ?? null, security_settings_status: securitySnap.status });
   }
   const withoutTwoFactor = teamMembers.filter((user) => asBoolean(user.two_factor_auth_enabled) === false);
   const unknownTwoFactor = teamMembers.filter((user) => asBoolean(user.two_factor_auth_enabled) === undefined);
@@ -2422,11 +2483,11 @@ function assessAgentTwoFactor(
     enforce_sso: enforceSso ?? null,
     security_settings_status: securitySnap.status,
     seen_team_members: teamMembers.length,
+    without_two_factor_count: countOrNull(withoutTwoFactor.length, teamSnap),
+    two_factor_flag_missing_count: countOrNull(unknownTwoFactor.length, teamSnap),
     inventory_truncated: truncated,
-    without_two_factor: withoutTwoFactor.slice(0, 50).map(userLabel),
-    without_two_factor_partial: truncated,
-    two_factor_flag_missing: unknownTwoFactor.slice(0, 50).map(userLabel),
-    two_factor_flag_missing_partial: truncated,
+    without_two_factor: detailOrNull(withoutTwoFactor.slice(0, 50).map(userLabel), teamSnap),
+    two_factor_flag_missing: detailOrNull(unknownTwoFactor.slice(0, 50).map(userLabel), teamSnap),
   };
   const atLeast = truncated ? "at least " : "";
   if (securitySnap.status !== "ok") {
@@ -2594,7 +2655,7 @@ function assessEndUserAuthentication(
       ? " Note: settings.api.api_password_access_end_users=true, so end users may call the API with email and password; review whether that is intended."
       : "";
   const baseEvidence: JsonRecord = { api_password_access_end_users: passwordApiAccess ?? null, account_settings_status: settingsSnap.status, security_settings_status: securitySnap.status };
-  const cap = (item: ZendeskFinding): ZendeskFinding => capForUnreadable(item, [["Account settings (/account/settings)", settingsSnap]]);
+  const cap = (item: ZendeskFinding): ZendeskFinding => capForIncomplete(item, [["Account settings (/account/settings)", settingsSnap]]);
   if (securitySnap.status !== "ok") {
     return manualFinding(21, title, "high", `${snapshotCause(SECURITY_SETTINGS_SOURCE, securitySnap)}${apiNote}`, `capture Admin Center > Account > Security > End user authentication and ${anonymousInstruction}`, baseEvidence);
   }
@@ -2671,8 +2732,8 @@ export async function assessZendeskAuthentication(
     summary: {
       subdomain: config.subdomain,
       current_user_role: asString(currentUserSnap.data?.role) ?? null,
-      seen_team_members: countOrNull(teamSnap, teamMembers.length),
-      ...summarizeStatuses(finalFindings),
+      seen_team_members: countOrNull(teamMembers.length, teamSnap),
+      ...summarizeStatuses(finalFindings, anyIncomplete(entries)),
       collection: collectionSummary(entries),
     },
     findings: finalFindings,
@@ -2743,24 +2804,24 @@ function assessApiTokens(
     api_token_access: apiTokenAccess ?? null,
     auth_mode: config.authMode,
     token_audit_log_status: tokenLogsSnap.status,
-    token_events_read: countOrNull(tokenLogsSnap, events.length),
+    token_events_read: countOrNull(events.length, tokenLogsSnap),
     token_events_truncated: tokenLogsSnap.status === "ok" ? isTruncated(tokenLogsSnap) : null,
-    tokens_created: countOrNull(tokenLogsSnap, summary.created),
-    tokens_destroyed: countOrNull(tokenLogsSnap, summary.destroyed),
-    tokens_outstanding: countOrNull(tokenLogsSnap, summary.outstanding.length),
-    tokens_outstanding_over_stale_days: countOrNull(tokenLogsSnap, summary.outstandingOverStale),
-    tokens_outstanding_undated: countOrNull(tokenLogsSnap, summary.outstandingUndated),
-    outstanding_tokens: listOrNull(tokenLogsSnap, summary.outstanding.slice(0, 50)),
+    tokens_created: countOrNull(summary.created, tokenLogsSnap),
+    tokens_destroyed: countOrNull(summary.destroyed, tokenLogsSnap),
+    tokens_outstanding: countOrNull(summary.outstanding.length, tokenLogsSnap),
+    tokens_outstanding_over_stale_days: countOrNull(summary.outstandingOverStale, tokenLogsSnap),
+    tokens_outstanding_undated: countOrNull(summary.outstandingUndated, tokenLogsSnap),
+    outstanding_tokens: detailOrNull(summary.outstanding.slice(0, 50), tokenLogsSnap),
     newest_token_event: summary.newestEvent ?? null,
   };
   const auditText = tokenLogsSnap.status === "ok"
-    ? `The audit log (filter[source_type]=apitoken) recorded ${summary.created} token creation and ${summary.destroyed} deletion events${isTruncated(tokenLogsSnap) ? " (history truncated)" : ""}, leaving ${summary.outstanding.length} outstanding token(s).`
+    ? `The audit log (filter[source_type]=apitoken) recorded ${summary.created} token creation and ${summary.destroyed} deletion events, leaving ${summary.outstanding.length} outstanding token(s).${truncationNote("token event", tokenLogsSnap)}`
     : snapshotCause(tokenLogSource, tokenLogsSnap);
   if (settingsSnap.status !== "ok") {
     return manualFinding(13, title, "high", `${snapshotCause("Account settings", settingsSnap)} ${auditText}`, instruction, evidence);
   }
   if (apiTokenAccess === false) {
-    return capForUnreadable(
+    return capForIncomplete(
       finding(13, title, "high", "pass", `settings.api.api_token_access=false, so API tokens cannot be used to authenticate to this account. ${auditText}`, evidence),
       [[tokenLogSource, tokenLogsSnap]],
     );
@@ -2773,7 +2834,7 @@ function assessApiTokens(
     const caveat = config.authMode === "api_token"
       ? " This assessment itself authenticated with an API token, so the audit history does not cover every token."
       : isTruncated(tokenLogsSnap)
-        ? " The token event history was truncated, so older tokens may be missing."
+        ? " Older tokens may be missing from the unread remainder of the history."
         : " The audit log records events rather than an inventory, so confirm the token list in Admin Center.";
     return finding(13, title, "high", "warn", `${accessText} ${auditText}${caveat} ${retirement}`, evidence);
   }
@@ -2813,7 +2874,7 @@ export async function assessZendeskAccessControl(
   if (teamSnap.status !== "ok") {
     findings.push(manualFinding(6, leastPrivilegeTitle, "critical", snapshotCause("Team member list", teamSnap), "export Admin Center > People > Team > Team members with role assignments and Admin Center > People > Team > Roles."));
   } else if (teamMembers.length === 0) {
-    findings.push(manualFinding(6, leastPrivilegeTitle, "critical", "Zero active team members were visible, which indicates a partial view of the account.", "use an admin credential and export the team member and role lists from Admin Center.", { seen_team_members: 0 }));
+    findings.push(manualFinding(6, leastPrivilegeTitle, "critical", `Zero active team members were visible, which indicates a partial view of the account.${truncationNote("team member", teamSnap)}`, "use an admin credential and export the team member and role lists from Admin Center.", { seen_team_members: countOrNull(0, teamSnap), inventory_truncated: truncationOrNull(teamSnap) }));
   } else {
     const customRoles = listSnapshotItems(rolesSnap);
     const adminEquivalent = customRoles
@@ -2822,18 +2883,21 @@ export async function assessZendeskAccessControl(
     const unrestrictedAgents = agents.filter((user) => asBoolean(user.restricted_agent) === false);
     const evidence: JsonRecord = {
       seen_team_members: teamMembers.length,
-      admins: admins.length,
-      agents: agents.length,
-      unrestricted_agents: unrestrictedAgents.length,
+      admins: countOrNull(admins.length, teamSnap),
+      agents: countOrNull(agents.length, teamSnap),
+      unrestricted_agents: countOrNull(unrestrictedAgents.length, teamSnap),
       custom_roles_status: rolesSnap.status,
       custom_roles: listCountOrNull(rolesSnap),
-      admin_equivalent_custom_roles: listOrNull(rolesSnap, adminEquivalent.slice(0, 25)),
+      admin_equivalent_custom_roles_count: countOrNull(adminEquivalent.length, rolesSnap),
+      admin_equivalent_custom_roles: detailOrNull(adminEquivalent.slice(0, 25), rolesSnap),
       inventory_truncated: truncationOrNull(teamSnap, rolesSnap),
     };
+    // The roles are named only when the role inventory was read to completion.
+    const adminEquivalentText = isTruncated(rolesSnap) ? "" : ` (${adminEquivalent.map((role) => `${role.name}: ${role.reasons.join(", ")}`).join("; ")})`;
     if (rolesSnap.status !== "ok") {
-      findings.push(manualFinding(6, leastPrivilegeTitle, "critical", `${snapshotCause("Custom roles (/custom_roles, Enterprise plan)", rolesSnap)} Built-in roles seen: ${admins.length} admins, ${agents.length} agents (${unrestrictedAgents.length} unrestricted).`, "capture Admin Center > People > Team > Roles and confirm agents are assigned the least-privileged built-in or custom role.", evidence));
+      findings.push(manualFinding(6, leastPrivilegeTitle, "critical", `${snapshotCause("Custom roles (/custom_roles, Enterprise plan)", rolesSnap)} Built-in roles seen: ${admins.length} admins, ${agents.length} agents (${unrestrictedAgents.length} unrestricted).${truncationNote("team member", teamSnap)}`, "capture Admin Center > People > Team > Roles and confirm agents are assigned the least-privileged built-in or custom role.", evidence));
     } else if (adminEquivalent.some((role) => role.members > 0)) {
-      findings.push(finding(6, leastPrivilegeTitle, "critical", "fail", `${adminEquivalent.filter((role) => role.members > 0).length} custom roles grant admin-equivalent permissions (${adminEquivalent.map((role) => `${role.name}: ${role.reasons.join(", ")}`).join("; ")}).${truncationNote("team member", teamSnap)}`, evidence));
+      findings.push(finding(6, leastPrivilegeTitle, "critical", "fail", `${adminEquivalent.filter((role) => role.members > 0).length} custom roles grant admin-equivalent permissions${adminEquivalentText}.${truncationNote("team member", teamSnap)}${truncationNote("custom role", rolesSnap)}`, evidence));
     } else if (isTruncated(teamSnap) || isTruncated(rolesSnap) || adminEquivalent.length > 0 || (agents.length > 0 && unrestrictedAgents.length === agents.length)) {
       findings.push(finding(6, leastPrivilegeTitle, "critical", "warn", `${customRoles.length} custom roles reviewed; ${adminEquivalent.length} admin-equivalent roles have no members; ${unrestrictedAgents.length}/${agents.length} agents are unrestricted.${truncationNote("team member", teamSnap)}${truncationNote("custom role", rolesSnap)} Review whether unrestricted agents need account-wide ticket access.`, evidence));
     } else {
@@ -2845,15 +2909,17 @@ export async function assessZendeskAccessControl(
   if (teamSnap.status !== "ok") {
     findings.push(manualFinding(7, adminTitle, "high", snapshotCause("Team member list", teamSnap), "export the admin list from Admin Center > People > Team > Team members filtered to the Administrator role."));
   } else if (admins.length === 0) {
-    findings.push(manualFinding(7, adminTitle, "high", "Zero admins were visible although every account has at least one admin (account owner), so the inventory is partial.", "use an admin credential and export the Administrator list from Admin Center.", { seen_admins: 0, seen_team_members: teamMembers.length }));
+    findings.push(manualFinding(7, adminTitle, "high", `Zero admins were visible although every account has at least one admin (account owner), so the inventory is partial.${truncationNote("team member", teamSnap)}`, "use an admin credential and export the Administrator list from Admin Center.", { seen_admins: countOrNull(0, teamSnap), seen_team_members: countOrNull(teamMembers.length, teamSnap), inventory_truncated: truncationOrNull(teamSnap) }));
   } else {
     const loginBuckets = partitionByDate(admins, "last_login_at", resolved.staleDays, now);
     const evidence: JsonRecord = {
       seen_admins: admins.length,
       admin_threshold: resolved.adminThreshold,
-      admins: admins.slice(0, 50).map(userLabel),
-      dormant_admins: loginBuckets.stale.slice(0, 25).map(userLabel),
-      admins_without_last_login: loginBuckets.undated.slice(0, 25).map(userLabel),
+      dormant_admins_count: countOrNull(loginBuckets.stale.length, teamSnap),
+      admins_without_last_login_count: countOrNull(loginBuckets.undated.length, teamSnap),
+      admins: detailOrNull(admins.slice(0, 50).map(userLabel), teamSnap),
+      dormant_admins: detailOrNull(loginBuckets.stale.slice(0, 25).map(userLabel), teamSnap),
+      admins_without_last_login: detailOrNull(loginBuckets.undated.slice(0, 25).map(userLabel), teamSnap),
       inventory_truncated: truncationOrNull(teamSnap),
     };
     if (admins.length > resolved.adminThreshold) {
@@ -2871,20 +2937,20 @@ export async function assessZendeskAccessControl(
   if (groupsSnap.status !== "ok" || membershipsSnap.status !== "ok") {
     findings.push(manualFinding(8, groupsTitle, "medium", `${snapshotCause("Groups", groupsSnap)} ${snapshotCause("Group memberships", membershipsSnap)}`, "capture Admin Center > People > Team > Groups with member counts."));
   } else if (groups.length === 0) {
-    findings.push(manualFinding(8, groupsTitle, "medium", "Zero groups were visible although every account has a default group, so the inventory is partial.", "use an admin credential and capture Admin Center > People > Team > Groups.", { seen_groups: 0 }));
+    findings.push(manualFinding(8, groupsTitle, "medium", `Zero groups were visible although every account has a default group, so the inventory is partial.${truncationNote("group", groupsSnap)}`, "use an admin credential and capture Admin Center > People > Team > Groups.", { seen_groups: countOrNull(0, groupsSnap), inventory_truncated: truncationOrNull(groupsSnap, membershipsSnap) }));
   } else {
     const privateGroups = groups.filter((group) => asBoolean(group.is_public) === false);
     const evidence: JsonRecord = {
       seen_groups: groups.length,
-      private_groups: privateGroups.length,
-      seen_memberships: memberships.length,
-      groups: groups.slice(0, 50).map((group) => asString(group.name) ?? asString(group.id) ?? "group"),
+      private_groups: countOrNull(privateGroups.length, groupsSnap),
+      seen_memberships: countOrNull(memberships.length, membershipsSnap),
+      groups: detailOrNull(groups.slice(0, 50).map((group) => asString(group.name) ?? asString(group.id) ?? "group"), groupsSnap),
       inventory_truncated: truncationOrNull(groupsSnap, membershipsSnap),
     };
     if (groups.length === 1 || memberships.length === 0) {
-      findings.push(finding(8, groupsTitle, "medium", "warn", `${groups.length} group(s) and ${memberships.length} memberships were visible, so ticket access is not segmented by group.${truncationNote("group", groupsSnap)}`, evidence));
+      findings.push(finding(8, groupsTitle, "medium", "warn", `${groups.length} group(s) and ${memberships.length} memberships were visible, so ticket access is not segmented by group.${truncationNote("group", groupsSnap)}${truncationNote("group membership", membershipsSnap)}`, evidence));
     } else if (isTruncated(groupsSnap) || isTruncated(membershipsSnap)) {
-      findings.push(finding(8, groupsTitle, "medium", "warn", `${groups.length} groups and ${memberships.length} memberships were seen but the inventory was truncated, so segmentation could not be fully confirmed.`, evidence));
+      findings.push(finding(8, groupsTitle, "medium", "warn", `${groups.length} groups and ${memberships.length} memberships were seen but the inventory was truncated, so segmentation could not be fully confirmed.${truncationNote("group", groupsSnap)}${truncationNote("group membership", membershipsSnap)}`, evidence));
     } else {
       findings.push(finding(8, groupsTitle, "medium", "pass", `${groups.length} groups (${privateGroups.length} private) with ${memberships.length} memberships were read to completion, showing group-based segmentation is configured.`, evidence));
     }
@@ -2905,17 +2971,21 @@ export async function assessZendeskAccessControl(
     const nonExpiringTokens = tokens.filter((token) => !asString(token.expires_at));
     const usage = partitionByDate(tokens, "used_at", resolved.staleDays, now);
     const tokenSource = "OAuth tokens (/oauth/tokens?all=true, admin only)";
+    const clientLabel = (item: JsonRecord): string => asString(item.name) ?? asString(item.identifier) ?? "client";
     const evidence: JsonRecord = {
-      oauth_clients: clients.length,
-      clients_without_scope_restriction: unscoped.slice(0, 25).map((item) => asString(item.name) ?? asString(item.identifier) ?? "client"),
-      public_clients: publicClients.slice(0, 25).map((item) => asString(item.name) ?? asString(item.identifier) ?? "client"),
-      clients_with_http_redirects: insecureRedirects.slice(0, 25).map((item) => asString(item.name) ?? asString(item.identifier) ?? "client"),
+      oauth_clients: countOrNull(clients.length, clientsSnap),
+      clients_without_scope_restriction_count: countOrNull(unscoped.length, clientsSnap),
+      public_clients_count: countOrNull(publicClients.length, clientsSnap),
+      clients_with_http_redirects_count: countOrNull(insecureRedirects.length, clientsSnap),
+      clients_without_scope_restriction: detailOrNull(unscoped.slice(0, 25).map(clientLabel), clientsSnap),
+      public_clients: detailOrNull(publicClients.slice(0, 25).map(clientLabel), clientsSnap),
+      clients_with_http_redirects: detailOrNull(insecureRedirects.slice(0, 25).map(clientLabel), clientsSnap),
       oauth_tokens_status: tokensSnap.status,
       oauth_tokens: listCountOrNull(tokensSnap),
-      tokens_with_write_or_impersonate: countOrNull(tokensSnap, privilegedTokens.length),
-      tokens_without_expiry: countOrNull(tokensSnap, nonExpiringTokens.length),
-      tokens_unused_over_stale_days: countOrNull(tokensSnap, usage.stale.length),
-      tokens_without_used_at: countOrNull(tokensSnap, usage.undated.length),
+      tokens_with_write_or_impersonate: countOrNull(privilegedTokens.length, tokensSnap),
+      tokens_without_expiry: countOrNull(nonExpiringTokens.length, tokensSnap),
+      tokens_unused_over_stale_days: countOrNull(usage.stale.length, tokensSnap),
+      tokens_without_used_at: countOrNull(usage.undated.length, tokensSnap),
       inventory_truncated: truncationOrNull(clientsSnap, tokensSnap),
     };
     if (unscoped.length > 0 || insecureRedirects.length > 0) {
@@ -2955,13 +3025,13 @@ export async function assessZendeskAccessControl(
     summary: {
       subdomain: config.subdomain,
       current_user_role: asString(currentUserSnap.data?.role) ?? null,
-      seen_team_members: countOrNull(teamSnap, teamMembers.length),
-      admins: countOrNull(teamSnap, admins.length),
+      seen_team_members: countOrNull(teamMembers.length, teamSnap),
+      admins: countOrNull(admins.length, teamSnap),
       custom_roles: listCountOrNull(rolesSnap),
-      groups: countOrNull(groupsSnap, groups.length),
+      groups: countOrNull(groups.length, groupsSnap),
       oauth_clients: listCountOrNull(clientsSnap),
       oauth_tokens: listCountOrNull(tokensSnap),
-      ...summarizeStatuses(finalFindings),
+      ...summarizeStatuses(finalFindings, anyIncomplete(entries)),
       collection: collectionSummary(entries),
     },
     findings: finalFindings,
@@ -3020,11 +3090,11 @@ function assessDeletionPolicies(
     deletion_schedules_status: deletionSnap.status,
     account_settings_status: settingsSnap.status,
     agent_ticket_deletion: agentTicketDeletion ?? null,
-    custom_roles_with_ticket_redaction: countOrNull(rolesSnap, redactionRoles),
-    custom_roles_managing_deletion_schedules: countOrNull(rolesSnap, deletionScheduleRoles),
+    custom_roles_with_ticket_redaction: countOrNull(redactionRoles, rolesSnap),
+    custom_roles_managing_deletion_schedules: countOrNull(deletionScheduleRoles, rolesSnap),
     custom_roles_status: rolesSnap.status,
   };
-  const cap = (item: ZendeskFinding): ZendeskFinding => capForUnreadable(item, [[settingsSource, settingsSnap], [rolesSource, rolesSnap]]);
+  const cap = (item: ZendeskFinding): ZendeskFinding => capForIncomplete(item, [[settingsSource, settingsSnap], [rolesSource, rolesSnap]]);
   if (deletionSnap.status !== "ok") {
     return manualFinding(12, title, "high", `${snapshotCause("Deletion schedules (/deletion_schedules, admin only)", deletionSnap)}${context}`, instruction, baseEvidence);
   }
@@ -3036,19 +3106,25 @@ function assessDeletionPolicies(
   const defaults = schedules.filter((schedule) => asBoolean(schedule.default) === true).length;
   const evidence: JsonRecord = {
     ...baseEvidence,
-    deletion_schedules: schedules.length,
-    active_deletion_schedules: active.length,
-    active_by_object: { ...activeByObject, other: otherActive },
-    active_without_conditions: activeWithoutConditions,
-    default_schedules: defaults,
+    deletion_schedules: countOrNull(schedules.length, deletionSnap),
+    active_deletion_schedules: countOrNull(active.length, deletionSnap),
+    active_by_object: Object.fromEntries(Object.entries({ ...activeByObject, other: otherActive }).map(([object, count]) => [object, countOrNull(count, deletionSnap)])),
+    active_without_conditions: countOrNull(activeWithoutConditions, deletionSnap),
+    default_schedules: countOrNull(defaults, deletionSnap),
     inventory_truncated: truncationOrNull(deletionSnap),
-    schedules: schedules.slice(0, 25).map(summarizeDeletionSchedule),
+    schedules: detailOrNull(schedules.slice(0, 25).map(summarizeDeletionSchedule), deletionSnap),
   };
+  // Zero schedules, or zero active ones, is a verified gap only when the inventory was
+  // read to completion; a truncated read may have stopped before the schedules.
   if (schedules.length === 0) {
-    return finding(12, title, "high", "fail", `The deletion schedules endpoint was readable and returned zero schedules, so no automated retention or deletion policy is configured.${context}`, evidence);
+    return isTruncated(deletionSnap)
+      ? finding(12, title, "high", "warn", `Zero deletion schedules were seen but the inventory was truncated before completion, so whether an automated retention or deletion policy is configured could not be determined.${truncationNote("deletion schedule", deletionSnap)}${context}`, evidence)
+      : finding(12, title, "high", "fail", `The deletion schedules endpoint was readable and returned zero schedules, so no automated retention or deletion policy is configured.${context}`, evidence);
   }
   if (active.length === 0) {
-    return finding(12, title, "high", "fail", `${schedules.length} deletion schedule(s) exist but none is active.${context}`, evidence);
+    return isTruncated(deletionSnap)
+      ? finding(12, title, "high", "warn", `${schedules.length} deletion schedule(s) were seen and none is active, but the inventory was truncated before completion.${truncationNote("deletion schedule", deletionSnap)}${context}`, evidence)
+      : finding(12, title, "high", "fail", `${schedules.length} deletion schedule(s) exist but none is active.${context}`, evidence);
   }
   const byObjectText = Object.entries(activeByObject).filter(([, count]) => count > 0).map(([object, count]) => `${count} for ${object}`).concat(otherActive > 0 ? [`${otherActive} for custom objects`] : []).join(", ");
   const ticketSchedules = activeByObject["zen:ticket"] ?? 0;
@@ -3088,17 +3164,29 @@ export async function assessZendeskDataProtection(
 
   const auditTitle = "Audit logging enabled and accessible";
   const auditEntries = listSnapshotItems(auditSnap);
+  // The recent-log read is a sample: it asks for DEFAULT_AUDIT_LOG_SAMPLE entries and stops
+  // at that cap by design, so a sample that filled is complete even though the walk reports
+  // the cap. The sample is cut short when paging stopped before it filled (a stalled cursor
+  // or a refused next link), and only then is the read incomplete for this finding.
+  const sampleCutShort = isTruncated(auditSnap) && auditEntries.length < DEFAULT_AUDIT_LOG_SAMPLE;
   if (auditSnap.status !== "ok") {
     findings.push(manualFinding(9, auditTitle, "high", `${snapshotCause("Audit logs (/audit_logs, Enterprise plan and admin role)", auditSnap)} This is a plan or permission limitation, not a pass.`, "capture Admin Center > Account > Audit log showing recent entries, or record that the plan does not include the audit log.", { audit_log_status: auditSnap.status }));
   } else if (auditEntries.length === 0) {
-    findings.push(manualFinding(9, auditTitle, "high", "The audit log endpoint was readable but returned zero entries, which is unexpected for an active account.", "open Admin Center > Account > Audit log and confirm entries are being recorded.", { audit_log_entries: 0 }));
+    findings.push(manualFinding(9, auditTitle, "high", sampleCutShort
+      ? `The audit log endpoint was readable but the read stopped before any entry arrived (${truncationReasonOf(auditSnap)}), so whether entries are being recorded could not be determined.`
+      : "The audit log endpoint was readable but returned zero entries, which is unexpected for an active account.", "open Admin Center > Account > Audit log and confirm entries are being recorded.", { audit_log_entries: countOrNull(0, auditSnap), sample_size: DEFAULT_AUDIT_LOG_SAMPLE, sample_cut_short: sampleCutShort }));
   } else {
     const newest = parseDate(auditEntries[0]?.created_at);
-    findings.push(finding(9, auditTitle, "high", "pass", `The audit log is readable with ${auditEntries.length} recent entries sampled; newest entry ${newest ? newest.toISOString() : "has no created_at"}.`, {
+    const evidence: JsonRecord = {
       audit_log_entries_sampled: auditEntries.length,
+      sample_size: DEFAULT_AUDIT_LOG_SAMPLE,
+      sample_cut_short: sampleCutShort,
       newest_entry: newest?.toISOString() ?? null,
-      actions_seen: [...new Set(auditEntries.map((entry) => asString(entry.action)).filter(Boolean))],
-    }));
+      actions_seen: sampleCutShort ? null : [...new Set(auditEntries.map((entry) => asString(entry.action)).filter(Boolean))],
+    };
+    findings.push(sampleCutShort
+      ? finding(9, auditTitle, "high", "warn", `The audit log is readable, but the ${DEFAULT_AUDIT_LOG_SAMPLE}-entry sample was cut short after ${auditEntries.length} entries (${truncationReasonOf(auditSnap)}), so the sampled window could not be confirmed; newest entry ${newest ? newest.toISOString() : "has no created_at"}.`, evidence)
+      : finding(9, auditTitle, "high", "pass", `The audit log is readable with ${auditEntries.length} recent entries sampled; newest entry ${newest ? newest.toISOString() : "has no created_at"}.`, evidence));
   }
 
   const retentionTitle = "Audit log retention meets compliance requirements";
@@ -3158,11 +3246,11 @@ export async function assessZendeskDataProtection(
     const suspended = listSnapshotItems(suspendedSnap);
     const buckets = partitionByDate(suspended, "created_at", resolved.suspendedTicketAgeDays, now);
     const evidence: JsonRecord = {
-      seen_suspended_tickets: suspended.length,
-      older_than_threshold: buckets.stale.length,
-      without_created_at: buckets.undated.length,
+      seen_suspended_tickets: countOrNull(suspended.length, suspendedSnap),
+      older_than_threshold: countOrNull(buckets.stale.length, suspendedSnap),
+      without_created_at: countOrNull(buckets.undated.length, suspendedSnap),
       age_threshold_days: resolved.suspendedTicketAgeDays,
-      causes: [...new Set(suspended.map((ticket) => asString(ticket.cause)).filter(Boolean))].slice(0, 20),
+      causes: detailOrNull([...new Set(suspended.map((ticket) => asString(ticket.cause)).filter(Boolean))].slice(0, 20), suspendedSnap),
       inventory_truncated: truncationOrNull(suspendedSnap),
     };
     if (suspended.length === 0 && isTruncated(suspendedSnap)) {
@@ -3195,11 +3283,12 @@ export async function assessZendeskDataProtection(
       subdomain: config.subdomain,
       current_user_role: asString(currentUserSnap.data?.role) ?? null,
       audit_log_status: auditSnap.status,
-      audit_log_entries_sampled: countOrNull(auditSnap, auditEntries.length),
+      audit_log_entries_sampled: countOrNull(auditEntries.length, auditSnap),
       private_attachments: privateAttachments ?? null,
       deletion_schedules: listCountOrNull(deletionSnap),
       suspended_tickets: listCountOrNull(suspendedSnap),
-      ...summarizeStatuses(finalFindings),
+      // The recent-log sample stops at its cap by design; it is incomplete only when cut short.
+      ...summarizeStatuses(finalFindings, sampleCutShort || anyIncomplete(entries.filter(([name]) => name !== "audit_logs_recent"))),
       collection: collectionSummary(entries),
     },
     findings: finalFindings,
@@ -3237,23 +3326,30 @@ export async function assessZendeskIntegrations(
   } else {
     const marketplace = installations.filter((item) => !ownedIds.has(asString(item.app_id) ?? ""));
     const enabled = marketplace.filter((item) => asBoolean(item.enabled) !== false);
+    // Marketplace apps are the installations not matched to an owned app, so the split
+    // rests on both inventories: it is not asserted while either is incomplete.
     const evidence: JsonRecord = {
-      app_installations: installations.length,
-      marketplace_installations: countOrNull(ownedSnap, marketplace.length),
-      enabled_marketplace_installations: countOrNull(ownedSnap, enabled.length),
+      app_installations: countOrNull(installations.length, installationsSnap),
+      marketplace_installations: countOrNull(marketplace.length, installationsSnap, ownedSnap),
+      enabled_marketplace_installations: countOrNull(enabled.length, installationsSnap, ownedSnap),
       owned_apps_status: ownedSnap.status,
       inventory_truncated: truncationOrNull(installationsSnap, ownedSnap),
-      apps: marketplace.slice(0, 50).map((item) => ({ name: installationName(item), enabled: asBoolean(item.enabled) ?? null, product: asString(item.product) ?? null, role_restrictions: asArray(item.role_restrictions).length, group_restrictions: asArray(item.group_restrictions).length })),
+      apps: detailOrNull(marketplace.slice(0, 50).map((item) => ({ name: installationName(item), enabled: asBoolean(item.enabled) ?? null, product: asString(item.product) ?? null, role_restrictions: asArray(item.role_restrictions).length, group_restrictions: asArray(item.group_restrictions).length })), installationsSnap, ownedSnap),
     };
+    const ownedNote = ownedSnap.status !== "ok"
+      ? `, but owned apps could not be separated because ${snapshotCause("/apps/owned", ownedSnap).toLowerCase()}`
+      : isTruncated(ownedSnap)
+        ? `, but the owned app inventory was truncated after ${ownedApps.length} items (${truncationReasonOf(ownedSnap)}), so the split between private and marketplace apps is not asserted`
+        : "";
     if (installations.length === 0 && isTruncated(installationsSnap)) {
       findings.push(finding(15, marketplaceTitle, "medium", "warn", `Zero installed apps were seen but the installation inventory was truncated before completion.${truncationNote("app installation", installationsSnap)}`, evidence));
     } else if (installations.length === 0) {
-      findings.push(capForUnreadable(
+      findings.push(capForIncomplete(
         finding(15, marketplaceTitle, "medium", "pass", "The app installation endpoint was readable and returned zero installed apps, so there are no marketplace apps to review.", evidence),
         [["Owned apps (/apps/owned, used to separate private apps from marketplace apps)", ownedSnap]],
       ));
     } else {
-      findings.push(manualFinding(15, marketplaceTitle, "medium", `${marketplace.length} marketplace app installations (${enabled.length} enabled) were inventoried${ownedSnap.status !== "ok" ? ", but owned apps could not be separated because " + snapshotCause("/apps/owned", ownedSnap).toLowerCase() : ""}; app permission reviews cannot be verified through the API.`, "record the reviewer, date, and outcome of the permission review for each installed app in Admin Center > Apps and integrations > Zendesk Support apps.", evidence));
+      findings.push(manualFinding(15, marketplaceTitle, "medium", `${marketplace.length} marketplace app installations (${enabled.length} enabled) were inventoried among ${installations.length} installed apps${ownedNote}; app permission reviews cannot be verified through the API.${truncationNote("app installation", installationsSnap)}`, "record the reviewer, date, and outcome of the permission review for each installed app in Admin Center > Apps and integrations > Zendesk Support apps.", evidence));
     }
   }
 
@@ -3263,19 +3359,20 @@ export async function assessZendeskIntegrations(
   } else {
     const retired = ownedApps.filter((app) => asBoolean(app.deprecated) === true || asBoolean(app.obsolete) === true);
     const evidence: JsonRecord = {
-      owned_apps: ownedApps.length,
-      deprecated_or_obsolete: retired.slice(0, 25).map((app) => asString(app.name) ?? asString(app.id) ?? "app"),
+      owned_apps: countOrNull(ownedApps.length, ownedSnap),
+      deprecated_or_obsolete_count: countOrNull(retired.length, ownedSnap),
+      deprecated_or_obsolete: detailOrNull(retired.slice(0, 25).map((app) => asString(app.name) ?? asString(app.id) ?? "app"), ownedSnap),
       inventory_truncated: truncationOrNull(ownedSnap),
-      apps: ownedApps.slice(0, 50).map((app) => ({ name: asString(app.name) ?? null, visibility: asString(app.visibility) ?? null, framework_version: asString(app.framework_version) ?? null, parameters: asArray(app.parameters).length })),
+      apps: detailOrNull(ownedApps.slice(0, 50).map((app) => ({ name: asString(app.name) ?? null, visibility: asString(app.visibility) ?? null, framework_version: asString(app.framework_version) ?? null, parameters: asArray(app.parameters).length })), ownedSnap),
     };
     if (ownedApps.length === 0 && isTruncated(ownedSnap)) {
       findings.push(finding(16, customAppTitle, "medium", "warn", `Zero owned apps were seen but the inventory was truncated before completion.${truncationNote("owned app", ownedSnap)}`, evidence));
     } else if (ownedApps.length === 0) {
       findings.push(finding(16, customAppTitle, "medium", "pass", "The owned apps endpoint was readable and returned zero private or custom apps.", evidence));
     } else if (retired.length > 0) {
-      findings.push(finding(16, customAppTitle, "medium", "warn", `${retired.length}/${ownedApps.length} owned apps are deprecated or obsolete and should be removed or updated; scope review of the remaining apps is manual.`, evidence));
+      findings.push(finding(16, customAppTitle, "medium", "warn", `${retired.length}/${ownedApps.length} owned apps are deprecated or obsolete and should be removed or updated; scope review of the remaining apps is manual.${truncationNote("owned app", ownedSnap)}`, evidence));
     } else {
-      findings.push(manualFinding(16, customAppTitle, "medium", `${ownedApps.length} private or custom apps were inventoried; requested locations and secure parameters must be reviewed against the manifest.`, "record the scope review for each private app (manifest locations, secure parameters, external domains).", evidence));
+      findings.push(manualFinding(16, customAppTitle, "medium", `${ownedApps.length} private or custom apps were inventoried; requested locations and secure parameters must be reviewed against the manifest.${truncationNote("owned app", ownedSnap)}`, "record the scope review for each private app (manifest locations, secure parameters, external domains).", evidence));
     }
   }
 
@@ -3300,21 +3397,21 @@ export async function assessZendeskIntegrations(
     const activeBrands = brands.filter((brand) => asBoolean(brand.active) !== false);
     const states = [...new Set(activeBrands.map((brand) => asString(brand.help_center_state) ?? "unknown"))];
     const evidence: JsonRecord = {
-      brands: brands.length,
-      active_brands: activeBrands.length,
-      help_center_states: states,
+      brands: countOrNull(brands.length, brandsSnap),
+      active_brands: countOrNull(activeBrands.length, brandsSnap),
+      help_center_states: detailOrNull(states, brandsSnap),
       current_user_role: currentRole ?? null,
-      brands_detail: brands.slice(0, 50).map((brand) => ({ name: asString(brand.name) ?? null, active: asBoolean(brand.active) ?? null, help_center_state: asString(brand.help_center_state) ?? null, has_help_center: asBoolean(brand.has_help_center) ?? null, host_mapping: asString(brand.host_mapping) ?? null })),
+      brands_detail: detailOrNull(brands.slice(0, 50).map((brand) => ({ name: asString(brand.name) ?? null, active: asBoolean(brand.active) ?? null, help_center_state: asString(brand.help_center_state) ?? null, has_help_center: asBoolean(brand.has_help_center) ?? null, host_mapping: asString(brand.host_mapping) ?? null })), brandsSnap),
       inventory_truncated: truncationOrNull(brandsSnap),
     };
     if (brands.length === 0) {
-      findings.push(manualFinding(22, brandTitle, "medium", "Zero brands were visible although every account has a default brand, so the view is partial.", "use an admin credential and capture Admin Center > Account > Brand management.", evidence));
+      findings.push(manualFinding(22, brandTitle, "medium", `Zero brands were visible although every account has a default brand, so the view is partial.${truncationNote("brand", brandsSnap)}`, "use an admin credential and capture Admin Center > Account > Brand management.", evidence));
     } else if (currentRole !== "admin") {
       // A role that could not be read is not a non-admin role; the summary says which.
       const credential = currentRole === undefined ? "a credential whose role could not be read, which may list only the brands the agent belongs to" : `a non-admin credential (role ${currentRole}), which only lists brands the agent belongs to`;
-      findings.push(finding(22, brandTitle, "medium", "warn", `${brands.length} brands were visible to ${credential}, so cross-brand consistency cannot be confirmed.`, evidence));
+      findings.push(finding(22, brandTitle, "medium", "warn", `${brands.length} brands were visible to ${credential}, so cross-brand consistency cannot be confirmed.${truncationNote("brand", brandsSnap)}`, evidence));
     } else if (isTruncated(brandsSnap)) {
-      findings.push(finding(22, brandTitle, "medium", "warn", `${brands.length} brands were seen but the inventory was truncated, so cross-brand consistency cannot be confirmed.`, evidence));
+      findings.push(finding(22, brandTitle, "medium", "warn", `${brands.length} brands were seen but the inventory was truncated, so cross-brand consistency cannot be confirmed.${truncationNote("brand", brandsSnap)}`, evidence));
     } else if (states.length > 1 || states.includes("unknown")) {
       findings.push(finding(22, brandTitle, "medium", "warn", `${activeBrands.length} active brands expose mixed help center states (${states.join(", ")}); confirm each public or restricted help center is intentional.`, evidence));
     } else {
@@ -3330,19 +3427,22 @@ export async function assessZendeskIntegrations(
     const active = agreements.filter((item) => ["accepted", "pending"].includes(asString(item.status) ?? ""));
     const broken = agreements.filter((item) => ["failed", "ssl_error", "configuration_error"].includes(asString(item.status) ?? ""));
     const evidence: JsonRecord = {
-      sharing_agreements: agreements.length,
-      active_agreements: active.slice(0, 25).map((item) => ({ name: asString(item.name) ?? null, remote_subdomain: asString(item.remote_subdomain) ?? null, partner_name: asString(item.partner_name) ?? null, status: asString(item.status) ?? null, type: asString(item.type) ?? null })),
-      broken_agreements: broken.length,
+      sharing_agreements: countOrNull(agreements.length, sharingSnap),
+      active_agreements_count: countOrNull(active.length, sharingSnap),
+      active_agreements: detailOrNull(active.slice(0, 25).map((item) => ({ name: asString(item.name) ?? null, remote_subdomain: asString(item.remote_subdomain) ?? null, partner_name: asString(item.partner_name) ?? null, status: asString(item.status) ?? null, type: asString(item.type) ?? null })), sharingSnap),
+      broken_agreements: countOrNull(broken.length, sharingSnap),
       inventory_truncated: truncationOrNull(sharingSnap),
     };
+    // Remote accounts are named only when the agreement inventory was read to completion.
+    const remoteAccounts = isTruncated(sharingSnap) ? "" : ` (${active.map((item) => asString(item.remote_subdomain) ?? asString(item.partner_name) ?? asString(item.name) ?? "unnamed").join(", ")})`;
     if (agreements.length === 0 && isTruncated(sharingSnap)) {
       findings.push(finding(23, sharingTitle, "medium", "warn", `Zero sharing agreements were seen but the inventory was truncated before completion.${truncationNote("sharing agreement", sharingSnap)}`, evidence));
     } else if (agreements.length === 0) {
       findings.push(finding(23, sharingTitle, "medium", "pass", "The sharing agreement endpoint was readable and returned zero agreements, so tickets are not shared with external Zendesk accounts.", evidence));
     } else if (broken.length > 0) {
-      findings.push(finding(23, sharingTitle, "medium", "warn", `${broken.length}/${agreements.length} sharing agreements are in a failed, ssl_error, or configuration_error state and ${active.length} are active; review each remote account.`, evidence));
+      findings.push(finding(23, sharingTitle, "medium", "warn", `${broken.length}/${agreements.length} sharing agreements are in a failed, ssl_error, or configuration_error state and ${active.length} are active; review each remote account.${truncationNote("sharing agreement", sharingSnap)}`, evidence));
     } else {
-      findings.push(manualFinding(23, sharingTitle, "medium", `${active.length}/${agreements.length} sharing agreements are accepted or pending with external accounts (${active.map((item) => asString(item.remote_subdomain) ?? asString(item.partner_name) ?? asString(item.name) ?? "unnamed").join(", ")}).`, "record the business justification and data handling agreement for each remote account.", evidence));
+      findings.push(manualFinding(23, sharingTitle, "medium", `${active.length}/${agreements.length} sharing agreements are accepted or pending with external accounts${remoteAccounts}.${truncationNote("sharing agreement", sharingSnap)}`, "record the business justification and data handling agreement for each remote account.", evidence));
     }
   }
 
@@ -3362,14 +3462,19 @@ export async function assessZendeskIntegrations(
     const truncationNotes = `${truncationNote("target", targetsSnap)}${truncationNote("webhook", webhooksSnap)}`;
     const targetText = targetsSnap.status === "ok" ? `${insecureTargets.length} active targets` : "an unread target inventory";
     const webhookText = webhooksSnap.status === "ok" ? `${insecureWebhooks.length} active webhooks` : "an unread webhook inventory";
+    const targetLabel = (target: JsonRecord): string => asString(target.title) ?? asString(target.id) ?? "target";
+    const webhookLabel = (hook: JsonRecord): string => asString(hook.name) ?? asString(hook.id) ?? "webhook";
     const evidence: JsonRecord = {
       targets_status: targetsSnap.status,
-      active_targets: countOrNull(targetsSnap, activeTargets.length),
-      insecure_targets: listOrNull(targetsSnap, insecureTargets.slice(0, 25).map((target) => asString(target.title) ?? asString(target.id) ?? "target")),
+      active_targets: countOrNull(activeTargets.length, targetsSnap),
+      insecure_targets_count: countOrNull(insecureTargets.length, targetsSnap),
+      insecure_targets: detailOrNull(insecureTargets.slice(0, 25).map(targetLabel), targetsSnap),
       webhooks_status: webhooksSnap.status,
-      active_webhooks: countOrNull(webhooksSnap, activeWebhooks.length),
-      insecure_webhooks: listOrNull(webhooksSnap, insecureWebhooks.slice(0, 25).map((hook) => asString(hook.name) ?? asString(hook.id) ?? "webhook")),
-      webhooks_without_authentication: listOrNull(webhooksSnap, unauthenticatedWebhooks.slice(0, 25).map((hook) => asString(hook.name) ?? asString(hook.id) ?? "webhook")),
+      active_webhooks: countOrNull(activeWebhooks.length, webhooksSnap),
+      insecure_webhooks_count: countOrNull(insecureWebhooks.length, webhooksSnap),
+      webhooks_without_authentication_count: countOrNull(unauthenticatedWebhooks.length, webhooksSnap),
+      insecure_webhooks: detailOrNull(insecureWebhooks.slice(0, 25).map(webhookLabel), webhooksSnap),
+      webhooks_without_authentication: detailOrNull(unauthenticatedWebhooks.slice(0, 25).map(webhookLabel), webhooksSnap),
       inventory_truncated: truncationOrNull(targetsSnap, webhooksSnap),
     };
     if (insecureTargets.length > 0 || insecureWebhooks.length > 0) {
@@ -3416,29 +3521,39 @@ export async function assessZendeskIntegrations(
     const unresolvedNote = unresolved.length > 0
       ? ` ${unresolved.length} destination(s) could not be resolved to a URL, so their scheme was not checked:${targetsSnap.status !== "ok" ? ` ${snapshotCause("targets", targetsSnap)}` : ""}${webhooksSnap.status !== "ok" ? ` ${snapshotCause("webhooks", webhooksSnap)}` : ""}${isTruncated(targetsSnap) || isTruncated(webhooksSnap) ? " The target or webhook inventory was truncated." : ""}`
       : "";
+    // The action list is drawn from the rule inventories, and its resolved destinations
+    // from the target and webhook inventories: a truncated destination inventory withholds
+    // the list too, since the URLs it resolved are a partial view of that inventory. An
+    // unreadable destination inventory resolved nothing, so it withholds nothing.
+    const actionDetail = detailOrNull(external.slice(0, 50), triggersSnap, automationsSnap, ...[targetsSnap, webhooksSnap].filter(isTruncated));
+    const destinationHosts = actionDetail === null ? "" : ` (${[...new Set(external.map((item) => urlHost(item.destination) ?? item.destination))].slice(0, 10).join(", ")})`;
     const evidence: JsonRecord = {
-      active_triggers: listSnapshotItems(triggersSnap).filter((rule) => asBoolean(rule.active) !== false).length,
-      active_automations: listSnapshotItems(automationsSnap).filter((rule) => asBoolean(rule.active) !== false).length,
-      external_notification_actions: external.slice(0, 50),
+      active_triggers: countOrNull(listSnapshotItems(triggersSnap).filter((rule) => asBoolean(rule.active) !== false).length, triggersSnap),
+      active_automations: countOrNull(listSnapshotItems(automationsSnap).filter((rule) => asBoolean(rule.active) !== false).length, automationsSnap),
+      external_notification_actions_count: countOrNull(external.length, triggersSnap, automationsSnap),
+      external_notification_actions: actionDetail,
       // With a destination left unresolved the insecure count is unknown, not zero; the
       // count among the destinations that did resolve to a URL is kept beside it.
-      insecure_destinations: unresolved.length > 0 ? null : insecure.length,
-      insecure_resolved_destinations: insecure.length,
+      insecure_destinations: unresolved.length > 0 ? null : countOrNull(insecure.length, triggersSnap, automationsSnap),
+      // Zero among the resolved destinations is asserted only over complete inventories; an
+      // unreadable destination inventory resolved nothing, so it does not unsettle the count.
+      insecure_resolved_destinations: insecure.length === 0 && [triggersSnap, automationsSnap, targetsSnap, webhooksSnap].some(isTruncated) ? null : insecure.length,
       unresolved_destinations: unresolved.length,
       targets_status: targetsSnap.status,
       webhooks_status: webhooksSnap.status,
       inventory_truncated: truncated,
     };
+    const ruleTruncationNotes = `${truncationNote("trigger", triggersSnap)}${truncationNote("automation", automationsSnap)}`;
     if (insecure.length > 0) {
-      findings.push(finding(25, exfilTitle, "high", "fail", `${insecure.length}/${external.length} external notification actions deliver ticket data to http:// destinations.${unresolvedNote}${truncationNote("trigger", triggersSnap)}${truncationNote("automation", automationsSnap)}`, evidence));
+      findings.push(finding(25, exfilTitle, "high", "fail", `${insecure.length}/${external.length} external notification actions deliver ticket data to http:// destinations.${unresolvedNote}${ruleTruncationNotes}`, evidence));
     } else if (rules.length === 0) {
-      findings.push(manualFinding(25, exfilTitle, "high", "Zero active triggers or automations were visible although Zendesk accounts ship with default triggers, so the view is partial.", "export the trigger and automation lists from Admin Center > Objects and rules and record every 'Notify webhook', 'Notify target', and 'Share ticket' action.", evidence));
+      findings.push(manualFinding(25, exfilTitle, "high", `Zero active triggers or automations were visible although Zendesk accounts ship with default triggers, so the view is partial.${ruleTruncationNotes}`, "export the trigger and automation lists from Admin Center > Objects and rules and record every 'Notify webhook', 'Notify target', and 'Share ticket' action.", evidence));
     } else if (external.length > 0) {
-      findings.push(finding(25, exfilTitle, "high", "warn", `${external.length} active rule actions send ticket data to external destinations (${[...new Set(external.map((item) => urlHost(item.destination) ?? item.destination))].slice(0, 10).join(", ")}); confirm each destination is an approved processor.${unresolvedNote}${truncated ? " The rule inventory was truncated." : ""}`, evidence));
+      findings.push(finding(25, exfilTitle, "high", "warn", `${external.length} active rule actions send ticket data to external destinations${destinationHosts}; confirm each destination is an approved processor.${unresolvedNote}${ruleTruncationNotes}`, evidence));
     } else if (truncated) {
-      findings.push(finding(25, exfilTitle, "high", "warn", "No external notification actions were found in the seen rules, but the trigger or automation inventory was truncated, so the full population was not reviewed.", evidence));
+      findings.push(finding(25, exfilTitle, "high", "warn", `No external notification actions were found in the seen rules, but the trigger or automation inventory was truncated, so the full population was not reviewed.${ruleTruncationNotes}`, evidence));
     } else {
-      findings.push(capForUnreadable(
+      findings.push(capForIncomplete(
         finding(25, exfilTitle, "high", "pass", `${rules.length} active triggers and automations were read to completion and none notify external targets, webhooks, or sharing agreements.`, evidence),
         destinationSources,
       ));
@@ -3469,7 +3584,7 @@ export async function assessZendeskIntegrations(
       brands: listCountOrNull(brandsSnap),
       webhooks: listCountOrNull(webhooksSnap),
       targets: listCountOrNull(targetsSnap),
-      ...summarizeStatuses(finalFindings),
+      ...summarizeStatuses(finalFindings, anyIncomplete(entries)),
       collection: collectionSummary(entries),
     },
     findings: finalFindings,
@@ -3600,7 +3715,11 @@ function formatAssessmentText(result: ZendeskAssessmentResult): string {
 
 function buildExecutiveSummary(config: ZendeskResolvedConfig, assessments: ZendeskAssessmentResult[], errors: string[], generatedAt: string): string {
   const findings = assessments.flatMap((assessment) => assessment.findings);
-  const counts = summarizeStatuses(findings);
+  // A category renders a null status count only when an inventory its findings read was
+  // incomplete, so the roll-up inherits that state from the category summaries.
+  const incomplete = assessments.some((assessment) => ["pass", "warn", "fail", "manual"].some((key) => assessment.summary[key] === null));
+  const counts = summarizeStatuses(findings, incomplete);
+  const renderCount = (value: unknown): string => value === null ? "none seen (not asserted: an inventory the findings read was incomplete)" : String(value);
   const lines = [
     "# Zendesk Security Inspection Executive Summary",
     "",
@@ -3610,10 +3729,10 @@ function buildExecutiveSummary(config: ZendeskResolvedConfig, assessments: Zende
     "",
     "## Result Counts",
     "",
-    `- Pass: ${counts.pass}`,
-    `- Warn: ${counts.warn}`,
-    `- Fail: ${counts.fail}`,
-    `- Manual: ${counts.manual}`,
+    `- Pass: ${renderCount(counts.pass)}`,
+    `- Warn: ${renderCount(counts.warn)}`,
+    `- Fail: ${renderCount(counts.fail)}`,
+    `- Manual: ${renderCount(counts.manual)}`,
     "",
     "## Failing and Warning Findings",
     "",
