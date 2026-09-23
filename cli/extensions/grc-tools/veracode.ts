@@ -515,11 +515,26 @@ function registeredSecretsIn(text: string): string[] {
   return registeredSecrets.filter((entry) => entry.forms.some((form) => lower.includes(form))).map((entry) => entry.value);
 }
 
-/** Removes the secrets handed in and every registered credential in each encoded form. */
+/** Removes the secrets handed in and every registered credential in each encoded form; a handed-in value also goes wherever it stands. */
 function scrubConfiguredSecrets(text: string, secrets: ReadonlyArray<string | undefined>): string {
-  const values = [...new Set([...secrets, ...registeredSecretsIn(text)])].filter((value): value is string => typeof value === "string" && value.length >= MIN_CONFIGURED_SECRET_LENGTH);
+  const handed = [...new Set(secrets)].filter((value): value is string => typeof value === "string" && value.length >= MIN_CONFIGURED_SECRET_LENGTH);
+  const values = [...new Set([...handed, ...registeredSecretsIn(text)])];
   if (values.length === 0) return text;
-  return scrubSensitiveValues(text, values).split(REDACTED_VALUE).join(REDACTED);
+  return scrubLiteralSecrets(scrubSensitiveValues(text, values).split(REDACTED_VALUE).join(REDACTED), handed);
+}
+
+/**
+ * The shared needle rule matches a form under eight characters only as a whole token, so a short
+ * passphrase glued into a longer run ("xhunter2y") would survive it. A value handed to the call is
+ * this client's own credential wherever it stands, so it goes literally as well, longest first; a
+ * value that is part of the marker itself is skipped so a second pass changes nothing.
+ */
+function scrubLiteralSecrets(text: string, values: readonly string[]): string {
+  let output = text;
+  for (const value of [...values].sort((left, right) => right.length - left.length)) {
+    if (!REDACTED.includes(value) && output.includes(value)) output = output.split(value).join(REDACTED);
+  }
+  return output;
 }
 
 /** A URL keeps its scheme, host, and path and loses its userinfo, query, and fragment; a slash-escaped URL is written back with its slashes escaped. */
