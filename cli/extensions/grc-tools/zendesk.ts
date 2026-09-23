@@ -560,7 +560,7 @@ const FOLLOWING_HEADER_LOOKAHEAD = 96;
 // ({"status":"denied"}, "rejected") is still read; a quoted value ends at its closing quote
 // whatever it holds.
 const AUTHORIZATION_HEADERS = new Set(["authorization", "proxy-authorization"]);
-const LIST_VALUE_HEADERS = new Set(["cookie", "set-cookie", "x-cookie", "x-apikeys"]);
+const LIST_VALUE_HEADERS = new Set(["cookie", "set-cookie", "x-cookie", "x-apikeys", "x-apikey"]);
 const AUTH_SCHEME_WORDS = new Set([
   "basic", "bearer", "digest", "hoba", "mutual", "negotiate", "oauth", "scram-sha-1", "scram-sha-256", "vapid", "dpop", "gnap",
   "privatetoken", "concealed", "ntlm", "token", "ssws", "apikey", "api-key", "splunk", "snowflake", "aws4-hmac-sha256",
@@ -633,6 +633,8 @@ const FLAG_VALUE_PATTERN = /(?<![^\s])--([A-Za-z][A-Za-z0-9_.-]{0,63})([ \t]+)((
 // prose after that token (/api/v1/api-tokens: request failed with 403) makes the segment a
 // label, not a pair.
 const PROSE_CONTINUATION_PATTERN = /^[ \t]+[A-Za-z]/;
+// The "-D" of a Java system property (java -Dkey=value) is not part of the key.
+const JAVA_PROPERTY_PREFIX_PATTERN = /(?:^|\s)-$/;
 // A value also ends at a line break left escaped by one stringify (\n, \r, \u000a, \u000d),
 // as it does at the raw character, so the header or pair on the next escaped line is read
 // on its own.
@@ -1088,7 +1090,8 @@ function replaceCredentialAssignments(text: string): string {
   let match: RegExpExecArray | null;
   while ((match = ASSIGNMENT_KEY_PATTERN.exec(text)) !== null) {
     const [whole, openingQuote, key, separator, operator] = match;
-    const name = keyAfterEscape(text, match.index + openingQuote.length, key);
+    const spelledName = keyAfterEscape(text, match.index + openingQuote.length, key);
+    const name = openingQuote === "" && spelledName.startsWith("D") && JAVA_PROPERTY_PREFIX_PATTERN.test(text.slice(Math.max(0, match.index - 2), match.index)) ? spelledName.slice(1) : spelledName;
     const valueStart = match.index + whole.length;
     if (isWebhookUrlKey(name)) {
       WEBHOOK_VALUE_PATTERN.lastIndex = valueStart;

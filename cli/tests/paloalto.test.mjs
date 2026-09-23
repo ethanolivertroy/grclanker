@@ -1333,7 +1333,7 @@ function xmlApostropheResponse() {
 test("redaction helpers scrub credential-shaped text, JSON pairs, URL credentials, and credential-named properties", () => {
   assert.equal(redactErrorText(`upstream sent Bearer ${CANARY_BEARER} then stopped`), "upstream sent Bearer [REDACTED] then stopped");
   assert.equal(redactErrorText("Basic dXNlcjpwYXNzd29yZA== was refused"), "Basic [REDACTED] was refused");
-  assert.equal(redactErrorText(`X-Api-Key: ${CANARY_API_KEY} rejected`), "X-Api-Key: [REDACTED]", "header lines are withheld to the end of the line");
+  assert.equal(redactErrorText(`X-Api-Key: ${CANARY_API_KEY} rejected`), "X-Api-Key: [REDACTED] rejected", "a single-token header loses its first token and the prose after it stays");
   assert.equal(redactErrorText("Set-Cookie: PHPSESSID=abc123def; Path=/"), "Set-Cookie: [REDACTED]");
   assert.equal(redactErrorText("GET /api/?type=op&key=LUFRPT0123456789abcdefghij&cmd=x"), "GET /api/?type=op&key=[REDACTED]&cmd=x");
   assert.equal(redactErrorText("key LUFRPT0123456789abcdefghijklmnop expired"), "key [REDACTED] expired", "PAN-OS API keys are recognized by shape");
@@ -1368,7 +1368,7 @@ test("redaction helpers scrub credential-shaped text, JSON pairs, URL credential
     { key: "Authorization", value: "[REDACTED]", secure: true },
     { key: "Content-Type", value: "application/json", secure: false },
   ], "only the value of a secure or credential-labelled header pair is replaced");
-  assert.equal(redacted[2].integrationConfig.webhookUrl, "https://hooks.slack.com/services/[REDACTED]");
+  assert.equal(redacted[2].integrationConfig.webhookUrl, "https://hooks.slack.com/[REDACTED]", "a URL under a webhook key keeps its origin only");
   assert.equal(redacted[3].integrationConfig.password, "[REDACTED]");
   assert.equal(redacted[3].integrationConfig.login, "prisma-svc");
   assert.equal(redacted[3].integrationConfig.hostUrl, "acme.service-now.com");
@@ -1423,8 +1423,8 @@ function carriersOf(value) {
     [`Cookie: sid='${value}'; theme=dark`, /^Cookie: \[REDACTED\]$/],
     [`Cookie: theme=dark; sid="${value}"; lang=en`, /^Cookie: \[REDACTED\]$/],
     [`Set-Cookie: PHPSESSID="${value}"; Path=/; HttpOnly`, /^Set-Cookie: \[REDACTED\]$/],
-    [`Authorization: Bearer "${value}"`, /^Authorization: \[REDACTED\]$/],
-    [`Authorization: "Bearer ${value}" was rejected`, /^Authorization: "\[REDACTED\]" was rejected$/],
+    [`Authorization: Bearer "${value}"`, /^Authorization: Bearer "\[REDACTED\]"$/],
+    [`Authorization: "Bearer ${value}" was rejected`, /^Authorization: "Bearer \[REDACTED\]" was rejected$/],
     [`X-Api-Key: "${value}"`, /^X-Api-Key: "\[REDACTED\]"$/],
     [`X-PAN-KEY: '${value}'`, /^X-PAN-KEY: '\[REDACTED\]'$/],
     [`x-redlock-auth: "${value}"`, /^x-redlock-auth: "\[REDACTED\]"$/],
@@ -1462,7 +1462,7 @@ function carriersOf(value) {
     // down) lose their values and keep their escaped quotes, so the JSON stays well formed.
     [`{"detail":"{\\"Cookie\\": \\"sid=${value}\\", \\"X-PAN-KEY\\": \\"${value}\\", \\"Content-Type\\": \\"application/json\\"}"}`, /^\{"detail":"\{\\"Cookie\\": \\"\[REDACTED\]\\", \\"X-PAN-KEY\\": \\"\[REDACTED\]\\", \\"Content-Type\\": \\"application\/json\\"\}"\}$/],
     [`{"o":"{\\"detail\\":\\"{\\\\\\"Cookie\\\\\\": \\\\\\"sid=${value}\\\\\\", \\\\\\"x-redlock-auth\\\\\\": \\\\\\"${value}\\\\\\"}\\"}"}`, /^\{"o":"\{\\"detail\\":\\"\{\\\\\\"Cookie\\\\\\": \\\\\\"\[REDACTED\]\\\\\\", \\\\\\"x-redlock-auth\\\\\\": \\\\\\"\[REDACTED\]\\\\\\"\}\\"\}"\}$/],
-    [`{"detail":"{\\"Authorization\\": \\"Bearer ${value}\\"}"}`, /^\{"detail":"\{\\"Authorization\\": \\"\[REDACTED\]\\"\}"\}$/],
+    [`{"detail":"{\\"Authorization\\": \\"Bearer ${value}\\"}"}`, /^\{"detail":"\{\\"Authorization\\": \\"Bearer \[REDACTED\]\\"\}"\}$/],
     [`{"detail":"{'Cookie': 'sid=${value}'}"}`, /^\{"detail":"\{'Cookie': '\[REDACTED\]'\}"\}$/],
     [`{"o":"{\\"detail\\":\\"Cookie: sid=${value}; path=/\\",\\"code\\":401}"}`, /^\{"o":"\{\\"detail\\":\\"Cookie: \[REDACTED\]\\",\\"code\\":401\}"\}$/],
     [`{"detail":"{\\"password\\": \\"${value}\\", \\"user\\": \\"a\\"}"}`, /^\{"detail":"\{\\"password\\": \\"\[REDACTED\]\\", \\"user\\": \\"a\\"\}"\}$/],
@@ -1604,7 +1604,7 @@ const GAP10_ROWS = [
   [(v) => `{"headers":"Set-Cookie: my#sid=\\"${v}\\"; HttpOnly; Content-Type: \\"text/html\\""}`, () => `{"headers":"Set-Cookie: [REDACTED]; Content-Type: \\"text/html\\""}`],
   [(v) => `{"headers":"Cookie: theme=dark; my&sid=\\"${v}\\"; Content-Type: \\"text/html; charset=utf-8\\"; Date: \\"Mon, 22 Sep 2026 12:30:00 GMT\\""}`, () => `{"headers":"Cookie: [REDACTED]; Content-Type: \\"text/html; charset=utf-8\\"; Date: \\"Mon, 22 Sep 2026 12:30:00 GMT\\""}`],
   // boundaries that held before and must keep holding
-  [(v) => `Authorization: Bearer ${v}&token=${v}`, () => `Authorization: [REDACTED]`],
+  [(v) => `Authorization: Bearer ${v}&token=${v}`, () => `Authorization: Bearer [REDACTED]`],
   [(v) => `Cookie: my&sid=${v}`, () => `Cookie: [REDACTED]`],
   [(v) => `Cookie: theme=dark; my#sid=${v}`, () => `Cookie: [REDACTED]`],
   [(v) => `rejected header "Cookie: sid=${v}" and "X-Other: 1"`, () => `rejected header "Cookie: [REDACTED]" and "X-Other: 1"`],
@@ -1614,7 +1614,7 @@ const GAP10_ROWS = [
   [(v) => `X-ApiKeys: accessKey="${v}";secretKey="${v}"; Content-Type: application/json`, () => `X-ApiKeys: [REDACTED]; Content-Type: application/json`],
   [(v) => `{"error":"X-ApiKeys: accessKey=\\"${v}\\";secretKey=\\"${v}\\"","code":403}`, () => `{"error":"X-ApiKeys: [REDACTED]","code":403}`],
   [(v) => `Cookie: sid=${v}"; theme=dark`, () => `Cookie: [REDACTED]"; theme=dark`],
-  [(v) => `{"detail":"Authorization: Basic ${v}=","code":401}`, () => `{"detail":"Authorization: [REDACTED]","code":401}`],
+  [(v) => `{"detail":"Authorization: Basic ${v}=","code":401}`, () => `{"detail":"Authorization: Basic [REDACTED]","code":401}`],
   [(v) => `Cookie: sid=${v}=" and "X-Other: 1"`, () => `Cookie: [REDACTED]" and "X-Other: 1"`],
   [(v) => `sid=${v}'; path=/`, () => `sid=[REDACTED]'; path=/`],
   [(v) => `api_key=${v}"}`, () => `api_key=[REDACTED]"}`],
@@ -1691,8 +1691,9 @@ test("scrub boundary: name-shaped values stay bare in prose, leave every carrier
     assert.equal(redactErrorText(expected), expected, "idempotent");
   }
   // After a scheme the value goes whatever its shape, a plain lowercase word included,
-  // unless it is one of the listed prose words; after the noun "Token" any short plain
-  // lowercase word is prose.
+  // unless it is one of the listed prose words; after the nouns "Token", "OAuth", "Splunk",
+  // and "Snowflake" a plain lowercase word shorter than a long token run is prose, and
+  // "realm=" or another auth parameter name after any scheme is prose.
   for (const [text, expected] of [
     ["Bearer abcdefghijklmnop rejected", "Bearer [REDACTED] rejected"],
     ["Basic canarybasic rejected", "Basic [REDACTED] rejected"],
@@ -1700,7 +1701,9 @@ test("scrub boundary: name-shaped values stay bare in prose, leave every carrier
     ["SSWS canarysswsvalue rejected", "SSWS [REDACTED] rejected"],
     ["Token abcdefghijklmnopq expired", "Token [REDACTED] expired"],
     ["Token hygiene could not be judged; token inventory read; Token count 3", "Token hygiene could not be judged; token inventory read; Token count 3"],
-    ["OAuth clients all declare scopes; an OAuth bearer token; OAuth abcdefghijklmnop", "OAuth clients all declare scopes; an OAuth bearer token; OAuth abcdefghijklmnop"],
+    ["OAuth clients all declare scopes; an OAuth bearer token; OAuth authentication failed; OAuth abcdefghijklmnop rejected", "OAuth clients all declare scopes; an OAuth bearer token; OAuth authentication failed; OAuth [REDACTED] rejected"],
+    ["replayed OAuth Kq7Zx2Vw9Lm4Tp8R upstream; replayed Splunk Kq7Zx2Vw9Lm4Tp8R upstream; replayed Snowflake Kq7Zx2Vw9Lm4Tp8R upstream; replayed AWS4-HMAC-SHA256 Kq7Zx2Vw9Lm4Tp8R upstream", "replayed OAuth [REDACTED] upstream; replayed Splunk [REDACTED] upstream; replayed Snowflake [REDACTED] upstream; replayed AWS4-HMAC-SHA256 [REDACTED] upstream"],
+    ["Bearer realm=\"api\"; Bearer token is missing; Digest realm=\"api\", qop=\"auth\"; Splunk search head", "Bearer realm=\"api\"; Bearer token is missing; Digest realm=\"api\", qop=\"auth\"; Splunk search head"],
     ["Basic with Can View on scans; Bearer tokens expire; Basic credential; Basic authentication is required", "Basic with Can View on scans; Bearer tokens expire; Basic credential; Basic authentication is required"],
     // A Titlecase word makes the scheme name an adjective in a title; a digit, a symbol,
     // token casing, or a run longer than a word still marks a credential.
@@ -1901,7 +1904,7 @@ test("exportPaloaltoAuditBundle and the assessment results never carry Prisma Cl
   assert.equal(integration("splunk").url, "https://splunk.example.com:8088/services/collector");
   assert.equal(integration("soar-webhook").url, "https://soar.example.com/prisma?token=[REDACTED]&env=prod");
   assert.deepEqual(integration("soar-webhook").headers, [{ key: "Authorization", value: "[REDACTED]", secure: true }, { key: "Content-Type", value: "application/json", secure: false }]);
-  assert.equal(integration("slack").webhookUrl, "https://hooks.slack.com/services/[REDACTED]");
+  assert.equal(integration("slack").webhookUrl, "https://hooks.slack.com/[REDACTED]");
   assert.equal(integration("servicenow").password, "[REDACTED]");
   assert.equal(integration("servicenow").login, "prisma-svc");
   assert.equal(integration("tenable").secretKey, "[REDACTED]");

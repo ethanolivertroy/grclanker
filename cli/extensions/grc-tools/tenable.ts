@@ -358,20 +358,28 @@ const REDACTED = CREDENTIAL_REDACTION_MARKER;
  * the unread inventory is itself a verdict-safety requirement. Two guards make
  * that safe and both hold by construction:
  *
- * 1. A value inside a carrier is removed whatever its shape: the Authorization,
- *    Proxy-Authorization, Cookie, Set-Cookie, X-Api-Key, X-ApiKeys, X-Cookie,
- *    X-SecurityCenter, X-Auth-Token and similar header lines to the end of the
- *    line; the userinfo of every embedded URL; credential-named query and fragment
- *    pairs of every URL and bare query string (the ?token= an audit-log field or a
- *    webhook target may carry) and any query value shaped like a token; the schemes
- *    Bearer, Basic, Digest, Token, Negotiate, NTLM, SSWS, and ApiKey (only a listed
- *    prose word after the scheme, "Basic authentication", stays; after the noun
- *    "Token" any short plain lowercase word does); credential-named key=value pairs
- *    (to the next delimiter: the accessKey= and secretKey= halves of an echoed
- *    X-ApiKeys header), key: value pairs (to the end of the line), "key":"value"
- *    pairs, and key="value" XML or HTML attributes; and webhook services whose URL
- *    path is the secret. Nothing this module renders puts a credential word in front
- *    of a colon or an equals sign, so every fixed text survives the scrub.
+ * 1. A value inside a carrier is removed whatever its shape: the Authorization and
+ *    Proxy-Authorization header lines, keeping the scheme word the credentials follow
+ *    (Bearer, Basic, Digest, ...) and removing the one token after it, or the whole
+ *    parameter list after a Digest or AWS4-HMAC-SHA256 scheme; the Cookie, Set-Cookie,
+ *    X-Cookie, and X-ApiKeys lines to the end of the line; the X-Api-Key,
+ *    X-SecurityCenter, X-Auth-Token and similar single-token header lines to the end
+ *    of their first token; the userinfo of every embedded URL, bare or with its slashes
+ *    escaped by a stringify; credential-named query and fragment pairs of every URL
+ *    and bare query string (the ?token= an audit-log field or a webhook target may
+ *    carry) and any query value shaped like a token; the schemes Bearer, Basic, Digest,
+ *    Token, OAuth, Negotiate, NTLM, SSWS, ApiKey, Splunk, Snowflake, and
+ *    AWS4-HMAC-SHA256 in any casing (only a listed prose word after the scheme, "Basic
+ *    authentication", or an auth-param name, Bearer realm=, stays; after the nouns
+ *    Token, OAuth, Splunk, and Snowflake any short plain lowercase word does);
+ *    credential-named key=value pairs (to the next delimiter, wherever the key starts:
+ *    after --, -D, or a path slash; the accessKey= and secretKey= halves of an echoed
+ *    X-ApiKeys header), key: value pairs (to the end of the line, or one token after a
+ *    path slash), --key value flags, "key":"value" pairs, and key="value" XML or HTML
+ *    attributes; the path and query of a URL under a webhook or webhook_url key; and
+ *    webhook services whose URL path is the secret. Nothing this module renders puts a
+ *    credential word in front of a colon or an equals sign, so every fixed text
+ *    survives the scrub.
  * 2. A configured secret (the Vulnerability Management access key and secret key,
  *    and the Security Center access key and secret key) is removed whatever its
  *    shape and in every encoded form (JSON-escaped, URL-encoded, form-encoded,
@@ -381,8 +389,8 @@ const REDACTED = CREDENTIAL_REDACTION_MARKER;
  *    payload and every written file.
  *
  * Real token shapes are still removed bare: PEM blocks, JWTs, LUFRPT-prefixed
- * PAN-OS keys (a proxy page may echo any vendor's key), AWS access key ids, and (in
- * error text) any run of
+ * PAN-OS keys (a proxy page may echo any vendor's key), AWS access key ids, GitHub,
+ * Stripe, and Slack prefixed tokens, and (in error text) any run of
  * LONG_TOKEN_MIN_LENGTH or more token characters that carries base64 symbols,
  * digits scattered through its letters (0f9e8d7c6b5a4938), or token casing
  * (Kq7Zx2Vw9Lm4Tp8R). The rule is path-safe: "/", ".", ":", "@", "=", and
@@ -446,22 +454,54 @@ const HEADER_VALUE_OPENER_PATTERN = /[=:,;(\s]/;
 const QUOTE_BOUNDARY_PATTERN = /[\s,;:)}\]<>"'\\]/;
 const HEADER_VALUE_TERMINATOR_PATTERN = /[\r\n<>]/;
 // The "Name:" token of the next header after ";" or "," on a compound line (the name may be
-// quoted, as in a JSON object, with the quotes escaped to any depth); a colon followed by
-// "//" is a URL scheme, not a header. The token is looked for within
-// FOLLOWING_HEADER_LOOKAHEAD characters of the separator.
-const FOLLOWING_HEADER_PATTERN = /^\s*(?:\\*["'])?[A-Za-z][A-Za-z0-9-]*(?:\\*["'])?\s*:(?!\/\/)/;
+// quoted, as in a JSON object, with the quotes escaped to any depth, and may hold dots, as
+// X.Api.Key does when a proxy rewrites hyphens); a colon followed by "//" is a URL scheme,
+// not a header. The token is looked for within FOLLOWING_HEADER_LOOKAHEAD characters of the
+// separator.
+const FOLLOWING_HEADER_PATTERN = /^\s*(?:\\*["'])?[A-Za-z][A-Za-z0-9.-]*(?:\\*["'])?\s*:(?!\/\/)/;
 const FOLLOWING_HEADER_LOOKAHEAD = 96;
+// Header classes. An Authorization or Proxy-Authorization value opens with the scheme word
+// its credentials follow (Bearer, Basic, Digest, and the rest of AUTH_SCHEME_WORDS, in any
+// casing): the word stays as spelled and the one token (or one quoted string) after it
+// goes, so the operator still reads which scheme was replayed and prose after the token
+// stays; a parameter list after the scheme (Digest username=..., realm=...) goes whole, as
+// does a value that opens with anything else. A cookie header, or Tenable's X-ApiKeys
+// (accessKey=...; secretKey=...), is a list of pairs and goes whole. Every other header
+// (X-Api-Key, X-Auth-Token, X-Vault-Token, ...) carries one token: an unquoted value ends at
+// the first whitespace, so a JSON fragment or prose after it on the same line
+// ({"status":"denied"}, "rejected") is still read; a quoted value ends at its closing quote
+// whatever it holds.
+const AUTHORIZATION_HEADERS = new Set(["authorization", "proxy-authorization"]);
+const LIST_VALUE_HEADERS = new Set(["cookie", "set-cookie", "x-cookie", "x-apikeys", "x-apikey"]);
+const AUTH_SCHEME_WORDS = new Set([
+  "basic", "bearer", "digest", "hoba", "mutual", "negotiate", "oauth", "scram-sha-1", "scram-sha-256", "vapid", "dpop", "gnap",
+  "privatetoken", "concealed", "ntlm", "token", "ssws", "apikey", "api-key", "splunk", "snowflake", "aws4-hmac-sha256",
+]);
+const AUTH_SCHEME_PATTERN = /^([A-Za-z][A-Za-z0-9-]*)(?:\s+|$)/;
+// A header value the header rule already treated, as the pair rules then see it: the scheme
+// word and, after whitespace and an optional quote, the marker.
+const REDACTED_SCHEME_VALUE_PATTERN = /^([A-Za-z][A-Za-z0-9-]*)\s+((?:\\*["'])?)\[REDACTED\]/;
+const AUTH_PARAM_LIST_PATTERN = /^[A-Za-z][A-Za-z0-9_-]*=/;
 // A scheme and its credentials: the value is removed whatever its shape, except the
 // prose words that follow a scheme name in a sentence ("Basic authentication is
 // required", "Bearer token") and a Titlecase word, which makes the scheme name an
 // adjective in a title ("Basic Network Scan", "Bearer Token", "Token Hygiene"): a Basic
 // credential is base64 and a bearer token or API key carries digits, symbols, or token
-// casing, so neither is ever one capitalized word of letters. "Token" is also this
-// module's own noun ("Token hygiene", "token inventory"), so after it any plain
-// lowercase word shorter than LONG_TOKEN_MIN_LENGTH is prose. OAuth 1.0 carries its
-// credentials as key="value" attributes, which the attribute rule removes, so OAuth is
-// not a scheme here and "OAuth clients" stays.
-const SCHEME_VALUE_PATTERN = /\b(Bearer|Basic|Digest|Token|Negotiate|NTLM|SSWS|ApiKey|Api-Key)\s+((?!\[REDACTED\])[A-Za-z0-9._~+/=-]{4,})/gi;
+// casing, so neither is ever one capitalized word of letters. "Token", "OAuth", "Splunk",
+// and "Snowflake" are also nouns of this module's own prose and of product names ("Token
+// hygiene", "OAuth clients", "Splunk index", "Snowflake account"), so after them any plain
+// lowercase word shorter than LONG_TOKEN_MIN_LENGTH is prose. An auth-param name before
+// "=" (Bearer realm="api", Digest qop="auth") is the challenge's grammar, not a credential;
+// the quoted value after it is judged by the attribute rule under its own name. OAuth 1.0
+// carries its credentials as key="value" attributes, which that rule removes.
+const SCHEME_VALUE_PATTERN = /\b(Bearer|Basic|Digest|Token|OAuth|Negotiate|NTLM|SSWS|ApiKey|Api-Key|Splunk|Snowflake|AWS4-HMAC-SHA256)\s+((?!\[REDACTED\])[A-Za-z0-9._~+/=-]{4,})/gi;
+const NOUN_SCHEME_WORDS = new Set(["token", "oauth", "splunk", "snowflake"]);
+const AUTH_PARAM_PATTERN = /^([A-Za-z][A-Za-z0-9_-]*)=$/;
+const AUTH_PARAM_NAMES = new Set([
+  "realm", "error", "error_description", "error_uri", "scope", "charset", "nonce", "opaque", "qop", "algorithm", "stale", "domain",
+  "uri", "response", "cnonce", "nc", "username", "credential", "signedheaders", "signature", "oauth_consumer_key", "oauth_token",
+  "oauth_signature_method", "oauth_signature", "oauth_timestamp", "oauth_nonce", "oauth_version", "oauth_callback", "oauth_verifier",
+]);
 const PLAIN_WORD_PATTERN = /^[a-z]+$/;
 const TITLE_WORD_PATTERN = /^[A-Z][a-z]{1,19}$/;
 const SCHEME_PROSE_WORDS = new Set([
@@ -492,8 +532,21 @@ const QUOTED_ATTRIBUTE_PATTERN = /(?<![A-Za-z0-9_.:-])([A-Za-z_][A-Za-z0-9_.:-]{
 // YAML-style line) to the end of the line, where a brace or bracket ends it so a JSON
 // structure after a credential-named key (compact "password":{...}, "auth":null}) is
 // never taken for a value. The key and the value may be quoted with the quotes escaped to
-// any depth; a value never runs into the escaped quote that closes it.
-const ASSIGNMENT_KEY_PATTERN = /(?<![A-Za-z0-9_.-])((?:\\*["'])?)([A-Za-z_][A-Za-z0-9_.-]{0,63})((?:\\*["'])?\s*([:=])\s*(?:\\*["'])?)/g;
+// any depth; a value never runs into the escaped quote that closes it. A key starts where
+// no word character precedes it: after the "--" of a command-line flag (--password=v), the
+// "-D" of a Java system property (-Dpassword=v, where the D is read as part of the key and
+// the credential word is still its tail), a "/" path separator, or a "." (the tail of a
+// dotted name is scanned only when no key match started earlier on the name).
+const ASSIGNMENT_KEY_PATTERN = /(?<![A-Za-z0-9_])((?:\\*["'])?)([A-Za-z_][A-Za-z0-9_.-]{0,63})((?:\\*["'])?\s*([:=])\s*(?:\\*["'])?)/g;
+// A credential name after "--" with its value as the next argument (psql --password value):
+// the value is the one token after the flag, never another flag.
+const FLAG_VALUE_PATTERN = /(?<![^\s])--([A-Za-z][A-Za-z0-9_.-]{0,63})([ \t]+)((?!\[REDACTED\])(?!-)[^\s"'<>;,&]+)/g;
+// After a credential-named path segment and ":" (kv/password: value) the value is one token;
+// prose after that token (/api/v1/api-tokens: request failed with 403) makes the segment a
+// label, not a pair.
+const PROSE_CONTINUATION_PATTERN = /^[ \t]+[A-Za-z]/;
+// The "-D" of a Java system property (java -Dkey=value) is not part of the key.
+const JAVA_PROPERTY_PREFIX_PATTERN = /(?:^|\s)-$/;
 // A value also ends at a line break left escaped by one stringify (\n, \r, \u000a, \u000d),
 // as it does at the raw character, so the header or pair on the next escaped line is read
 // on its own.
@@ -502,9 +555,27 @@ const ASSIGNMENT_KEY_PATTERN = /(?<![A-Za-z0-9_.-])((?:\\*["'])?)([A-Za-z_][A-Za
 const DELIMITED_VALUE_PATTERN = /(?!\[REDACTED\])(?!["'])(?:(?!\\+["'])(?!\\(?:[nr]|u000[adAD]))[^\s"'<>;,&]|["'](?=[^\s"'<>;,&:)}\]\\]))+/y;
 const LINE_VALUE_PATTERN = /(?!\[REDACTED\])(?!["'])(?:(?!\\+["'])(?!\\(?:[nr]|u000[adAD]))[^\r\n<>"',;{}[\]]|["'](?=[^\s\r\n<>"',;{}[\]:)\\]))*(?!\\+["'])(?!\\(?:[nr]|u000[adAD]))[^\s\r\n<>"',;{}[\]]/y;
 const TOKEN_IN_PATH_WEBHOOK_PATTERN = /(https?:\/\/(?:hooks\.slack\.com\/services|discord(?:app)?\.com\/api\/webhooks|[a-z0-9.-]*webhook\.office\.com\/webhookb2)\/)(?!\[REDACTED\])(?:[^\s"'<>\\]|["'](?=[^\s"'<>\\,;:)}\]]))+/gi;
+// A URL whose slashes arrive escaped by a stringify (https:\/\/user:secret@host\/path): the
+// userinfo goes as it does from a bare URL; the query pairs are read by the pair rule.
+const SLASH_ESCAPED_URL_USERINFO_PATTERN = /\b([a-z][a-z0-9+.-]*:\\\/\\\/)[^\s/@"'<>\\]+@/gi;
+// A key naming a webhook URL: the incoming webhooks of Slack, Discord, Teams, and PagerDuty
+// carry their token in the path or query, so under webhook, webhook_url, webhookUrl, or
+// WEBHOOK_URL a URL value keeps its scheme and host only, whatever the host. webhook_count,
+// webhook_id, and webhook_name are not URL-valued and stay; a webhook key whose value is not
+// a URL (a name, an id) stays too.
+const WEBHOOK_URL_TAIL_WORDS = new Set(["url", "uri", "endpoint", "address", "link"]);
+const URL_VALUE_PATTERN = /^[a-z][a-z0-9+.-]*:\/\/\S+$/i;
+const WEBHOOK_VALUE_PATTERN = /[a-z][a-z0-9+.-]*:\/\/[^\s"'<>]+/iy;
+const URL_ORIGIN_PATTERN = /^([a-z][a-z0-9+.-]*:\/\/)(?:[^/?#@]*@)?([^/?#]*)/i;
 const JWT_PATTERN = /\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}(?:\.[A-Za-z0-9_-]+)*/g;
 const PANOS_API_KEY_PATTERN = /\bLUFRPT[A-Za-z0-9+/=_-]{16,}/g;
 const AWS_ACCESS_KEY_ID_PATTERN = /\b(?:AKIA|ASIA|AROA|AIDA|AGPA|ANPA|ANVA|APKA|ABIA|ACCA)[A-Z0-9]{16}\b/g;
+// Vendor token prefixes that name a credential on their own, on both sides: GitHub (ghp_,
+// gho_, ghu_, ghs_, ghr_, github_pat_), Stripe (sk_live_, sk_test_, rk_live_, rk_test_), and
+// Slack (xoxb-, xoxp-, xoxa-, xoxr-, xoxs-, xoxe-, xoxo-).
+const GITHUB_TOKEN_PATTERN = /\b(?:gh[oprsu]_[A-Za-z0-9]{36,}|github_pat_[A-Za-z0-9_]{22,})/g;
+const STRIPE_KEY_PATTERN = /\b[rs]k_(?:live|test)_[A-Za-z0-9]{16,}/g;
+const SLACK_TOKEN_PATTERN = /\bxox[abeoprs]-[A-Za-z0-9-]{10,}/g;
 const LONG_TOKEN_RUN_PATTERN = /[A-Za-z0-9+_-]{16,}(?:={1,2}(?![A-Za-z0-9&]))?/g;
 const TOKEN_VALUE_PATTERN = /^[A-Za-z0-9+_-]{16,}={0,2}$/;
 const UPPERCASE_CODE_PATTERN = /^[A-Z][A-Z_]*$|^[A-Z][A-Z0-9]*(?:[_-][A-Z0-9]+)+$/;
@@ -548,6 +619,11 @@ const NON_CREDENTIAL_KEY_QUALIFIERS = new Set(["public"]);
 // activation_code, authorization_code, recovery_code); status_code, error_code, and
 // country_code stay evidence.
 const CREDENTIAL_CODE_QUALIFIERS = new Set(["registration", "activation", "linking", "auth", "authorization", "access", "verification", "recovery", "backup", "security", "mfa", "otp", "pairing", "enrollment", "license"]);
+// A secret id or token id is the bearer credential itself (a Vault AppRole secret_id, an
+// API token_id, roleSecretId), unlike client_id, tenant_id, key_id, or access_key_id, which
+// name a public identifier; secret_id_ttl, secret_id_accessor, and token_accessor end in a
+// setting word and stay. The qualifier is tested by its tail so -Dsecret_id is read too.
+const BEARER_ID_QUALIFIER_PATTERN = /(?:secret|token)$/;
 
 function propertyNameSegments(name: string): string[] {
   return name
@@ -575,8 +651,27 @@ export function isCredentialKey(key: string): boolean {
   if (last === undefined || BOUND_KEY_SEGMENTS.has(words[0])) return false;
   if ((last === "key" || last === "keys") && words.length > 1 && NON_CREDENTIAL_KEY_QUALIFIERS.has(words[words.length - 2])) return false;
   if (last === "code" || last === "codes") return words.length > 1 && CREDENTIAL_CODE_QUALIFIERS.has(words[words.length - 2]);
+  if (last === "id") return words.length > 1 && BEARER_ID_QUALIFIER_PATTERN.test(words[words.length - 2]);
+  // A connection string (connection_string, connectionString, DB_CONNECTION_STRING) embeds
+  // the password of the account it connects as.
+  if (last === "string" && words[words.length - 2] === "connection") return true;
   if (credentialKeyWord(last)) return true;
   return CREDENTIAL_VALUE_FORM_WORDS.has(last) && words.slice(0, -1).some(credentialKeyWord);
+}
+
+/** True when a key names a webhook URL whose path and query carry the webhook's token. */
+function isWebhookUrlKey(key: string): boolean {
+  const words = keyWords(key);
+  const last = words[words.length - 1];
+  if (last === "webhook") return true;
+  return last !== undefined && WEBHOOK_URL_TAIL_WORDS.has(last) && words[words.length - 2] === "webhook";
+}
+
+// The URL under a webhook key with its userinfo, path, query, and fragment replaced: the
+// scheme and host stay, so the destination is still read.
+function redactedWebhookUrl(url: string): string {
+  const origin = URL_ORIGIN_PATTERN.exec(url);
+  return `${origin ? `${origin[1]}${origin[2]}` : ""}/${REDACTED}`;
 }
 
 // True for a value that opens with a bare integer under a plural credential word: a count,
@@ -640,14 +735,17 @@ function isTokenShapedValue(value: string): boolean {
   return TOKEN_VALUE_PATTERN.test(value) && looksLikeToken(value);
 }
 
-// The word after a scheme name is prose when it is a Titlecase word, a plain lowercase
-// word from the list above, or, after "Token", any plain lowercase word too short to be
-// a real token.
+// The word after a scheme name is prose when it is a Titlecase word, an auth-param name
+// before its "=", a plain lowercase word from the list above, or, after a noun scheme
+// word (Token, OAuth, Splunk, Snowflake), any plain lowercase word too short to be a real
+// token.
 function isSchemeProse(scheme: string, value: string): boolean {
   if (TITLE_WORD_PATTERN.test(value)) return true;
+  const authParam = AUTH_PARAM_PATTERN.exec(value);
+  if (authParam) return AUTH_PARAM_NAMES.has(authParam[1].toLowerCase());
   if (!PLAIN_WORD_PATTERN.test(value)) return false;
   if (SCHEME_PROSE_WORDS.has(value)) return true;
-  return scheme.toLowerCase() === "token" && value.length < LONG_TOKEN_MIN_LENGTH;
+  return NOUN_SCHEME_WORDS.has(scheme.toLowerCase()) && value.length < LONG_TOKEN_MIN_LENGTH;
 }
 
 function isPublicPemLabel(label: string): boolean {
@@ -813,23 +911,86 @@ function enclosingQuote(value: string): string {
   return token !== undefined && value.length >= token.length * 2 && value.endsWith(token) ? token : "";
 }
 
-// Every credential-bearing header line loses its value whatever the value's shape; a value
-// that is one quoted string keeps its quotes around the marker so quoted text stays quoted.
-// On a compound line each header is its own line: the value of one ends before the name of
-// the next, which is then matched and treated on its own.
+// True for an Authorization pair whose value reads "Bearer [REDACTED]" or the like: the header
+// rule already treated it, and the pair rules leave the scheme word standing. Under any other
+// credential-named key the scheme word is part of the value and goes with it.
+function keepsSchemeWord(key: string, value: string): boolean {
+  if (!AUTHORIZATION_HEADERS.has(key.toLowerCase())) return false;
+  const scheme = REDACTED_SCHEME_VALUE_PATTERN.exec(value);
+  return scheme !== null && AUTH_SCHEME_WORDS.has(scheme[1].toLowerCase());
+}
+
+// Where the value of a single-token header ends: an unquoted value at its first whitespace,
+// a quoted one where headerValueEnd put it.
+function singleTokenEnd(text: string, start: number, end: number): number {
+  const value = text.slice(start, end);
+  if (enclosingQuote(value) !== "") return end;
+  return start + (/^\S*/.exec(value)?.[0].length ?? 0);
+}
+
+// Where an Authorization value ends: after the scheme word and the one token (or one quoted
+// string) of credentials that follows it, so prose after the token on a free-text line
+// stays; a parameter list after the scheme (Digest username=..., realm=...) goes to the end
+// of the line, as does a value quoted as a whole or without a scheme word.
+function authorizationValueEnd(text: string, start: number, end: number): number {
+  const value = text.slice(start, end);
+  if (enclosingQuote(value) !== "") return end;
+  const scheme = AUTH_SCHEME_PATTERN.exec(value);
+  if (!scheme || !AUTH_SCHEME_WORDS.has(scheme[1].toLowerCase())) return singleTokenEnd(text, start, end);
+  const credentialsStart = start + scheme[0].length;
+  const credentials = value.slice(scheme[0].length);
+  if (credentials.length === 0 || AUTH_PARAM_LIST_PATTERN.test(credentials)) return end;
+  const quote = quoteTokenAt(credentials, 0);
+  if (quote !== undefined) {
+    const close = closingQuoteIndex(text, credentialsStart + quote.length, quote, end);
+    return close === -1 ? end : close + quote.length;
+  }
+  return credentialsStart + (/^\S*/.exec(credentials)?.[0].length ?? 0);
+}
+
+// The replacement for a header value, or undefined when nothing is left to remove: the value
+// already opens with the marker (bare, inside its quotes, or after its scheme word), or an
+// Authorization value is a bare scheme word with no credentials after it. An Authorization
+// value keeps its scheme word as spelled; the credentials after it go whole, inside their own
+// quotes when they were quoted (Bearer "value" becomes Bearer "[REDACTED]"). A value that is
+// one quoted string keeps its quotes around the replacement so quoted text stays quoted.
+function redactedHeaderValue(header: string, value: string): string | undefined {
+  const quote = enclosingQuote(value);
+  const inner = quote === "" ? value : value.slice(quote.length, value.length - quote.length);
+  if (inner.startsWith(CREDENTIAL_REDACTION_MARKER)) return undefined;
+  if (AUTHORIZATION_HEADERS.has(header)) {
+    const scheme = AUTH_SCHEME_PATTERN.exec(inner);
+    if (scheme && AUTH_SCHEME_WORDS.has(scheme[1].toLowerCase())) {
+      const credentials = inner.slice(scheme[0].length);
+      if (credentials.length === 0) return undefined;
+      const credentialQuote = enclosingQuote(credentials);
+      if (credentials.slice(credentialQuote.length).startsWith(CREDENTIAL_REDACTION_MARKER)) return undefined;
+      return `${quote}${scheme[1]} ${credentialQuote}${CREDENTIAL_REDACTION_MARKER}${credentialQuote}${quote}`;
+    }
+  }
+  return `${quote}${CREDENTIAL_REDACTION_MARKER}${quote}`;
+}
+
+// Every credential-bearing header line loses its credentials whatever their shape, by the
+// header's class: an Authorization value keeps its scheme word and loses the token after it
+// (or its whole parameter list), a cookie or key list goes whole, and a single-token header
+// loses its first token. On a compound line each header is its own line: the value of one
+// ends before the name of the next, which is then matched and treated on its own.
 function scrubHeaderLines(text: string): string {
   HEADER_LINE_PATTERN.lastIndex = 0;
   let out = "";
   let last = 0;
   let match: RegExpExecArray | null;
   while ((match = HEADER_LINE_PATTERN.exec(text)) !== null) {
+    const header = match[1].toLowerCase();
     const start = match.index + match[0].length;
-    const end = headerValueEnd(text, start);
+    const lineEnd = headerValueEnd(text, start);
+    const end = LIST_VALUE_HEADERS.has(header) ? lineEnd : AUTHORIZATION_HEADERS.has(header) ? authorizationValueEnd(text, start, lineEnd) : singleTokenEnd(text, start, lineEnd);
     const value = text.slice(start, end);
-    if (value.length === 0 || value.startsWith(CREDENTIAL_REDACTION_MARKER)) continue;
-    const quote = enclosingQuote(value);
-    if (value.slice(quote.length).startsWith(CREDENTIAL_REDACTION_MARKER)) continue;
-    out += `${text.slice(last, start)}${quote}${CREDENTIAL_REDACTION_MARKER}${quote}`;
+    if (value.length === 0) continue;
+    const replacement = redactedHeaderValue(header, value);
+    if (replacement === undefined) continue;
+    out += `${text.slice(last, start)}${replacement}`;
     last = end;
     HEADER_LINE_PATTERN.lastIndex = end;
   }
@@ -838,7 +999,12 @@ function scrubHeaderLines(text: string): string {
 
 // The key and separator are matched on their own and the value is consumed only when the
 // key names a credential, so the value of an ordinary pair is rescanned and a credential
-// pair nested inside it (data=token=...) is still caught.
+// pair nested inside it (data=token=...) is still caught. A value the scheme rule already
+// reduced to "<scheme> [REDACTED]" keeps its scheme word under an Authorization key and loses
+// it under any other credential key, where the scheme word was the start of the value. A
+// colon-terminated key that ends a path segment (/api/v1/api-tokens: request failed) is a
+// label, not a pair: its value is one token, and a prose continuation after the token means
+// there was no value at all; an escaped slash (\/) before the key is a line break, not a path.
 function replaceCredentialAssignments(text: string): string {
   ASSIGNMENT_KEY_PATTERN.lastIndex = 0;
   let out = "";
@@ -846,35 +1012,69 @@ function replaceCredentialAssignments(text: string): string {
   let match: RegExpExecArray | null;
   while ((match = ASSIGNMENT_KEY_PATTERN.exec(text)) !== null) {
     const [whole, openingQuote, key, separator, operator] = match;
-    const name = keyAfterEscape(text, match.index + openingQuote.length, key);
+    const spelledName = keyAfterEscape(text, match.index + openingQuote.length, key);
+    const name = openingQuote === "" && spelledName.startsWith("D") && JAVA_PROPERTY_PREFIX_PATTERN.test(text.slice(Math.max(0, match.index - 2), match.index)) ? spelledName.slice(1) : spelledName;
+    const valueStart = match.index + whole.length;
+    if (isWebhookUrlKey(name)) {
+      WEBHOOK_VALUE_PATTERN.lastIndex = valueStart;
+      const url = WEBHOOK_VALUE_PATTERN.exec(text)?.[0];
+      if (url === undefined) continue;
+      out += `${text.slice(last, match.index)}${openingQuote}${key}${separator}${redactedWebhookUrl(url)}`;
+      last = valueStart + url.length;
+      ASSIGNMENT_KEY_PATTERN.lastIndex = last;
+      continue;
+    }
     if (!(operator === "=" ? isCredentialAssignmentKey(name) : isCredentialKey(name))) continue;
-    const valuePattern = operator === ":" ? LINE_VALUE_PATTERN : DELIMITED_VALUE_PATTERN;
-    valuePattern.lastIndex = match.index + whole.length;
+    const redactedScheme = REDACTED_SCHEME_VALUE_PATTERN.exec(text.slice(valueStart));
+    if (redactedScheme !== null && AUTH_SCHEME_WORDS.has(redactedScheme[1].toLowerCase())) {
+      if (AUTHORIZATION_HEADERS.has(name.toLowerCase())) continue;
+      out += `${text.slice(last, match.index)}${openingQuote}${key}${separator}${redactedScheme[2]}${CREDENTIAL_REDACTION_MARKER}`;
+      last = valueStart + redactedScheme[0].length;
+      ASSIGNMENT_KEY_PATTERN.lastIndex = last;
+      continue;
+    }
+    const pathLabel = operator === ":" && text[match.index - 1] === "/" && text[match.index - 2] !== "\\";
+    const valuePattern = operator === ":" && !pathLabel ? LINE_VALUE_PATTERN : DELIMITED_VALUE_PATTERN;
+    valuePattern.lastIndex = valueStart;
     const value = valuePattern.exec(text)?.[0];
     if (value === undefined || STRUCTURAL_VALUE_PATTERN.test(value) || isCountValue(name, value)) continue;
+    if (pathLabel && PROSE_CONTINUATION_PATTERN.test(text.slice(valueStart + value.length))) continue;
     out += `${text.slice(last, match.index)}${openingQuote}${key}${separator}${CREDENTIAL_REDACTION_MARKER}`;
-    last = match.index + whole.length + value.length;
+    last = valueStart + value.length;
     ASSIGNMENT_KEY_PATTERN.lastIndex = last;
   }
   return last === 0 ? text : `${out}${text.slice(last)}`;
+}
+
+// A credential-named flag with its value as the next argument loses that argument.
+function replaceFlagValues(text: string): string {
+  return text.replace(FLAG_VALUE_PATTERN, (match, flag: string, space: string) => (isCredentialKey(flag) ? `--${flag}${space}${CREDENTIAL_REDACTION_MARKER}` : match));
 }
 
 /** Every carrier rule (guard 1) plus the token shapes a prefix identifies on its own; the long-token rule is left to redactErrorText. */
 // Header lines go first: a recognised header line takes its whole value, so the URL and
 // query rules never split a cookie pair whose name holds "&" or "#" off its cookie.
 function scrubCarriers(text: string, pemScope: PemScope): string {
+  const quotedValue = (key: string, value: string, redacted: () => string, webhook: (url: string) => string, match: string): string => {
+    if (isWebhookUrlKey(key) && URL_VALUE_PATTERN.test(value)) return webhook(redactedWebhookUrl(value));
+    return isCredentialKey(key) && !isCountValue(key, value) && !keepsSchemeWord(key, value) ? redacted() : match;
+  };
   const scrubbed = scrubHeaderLines(scrubPem(text, pemScope))
     .replace(TOKEN_IN_PATH_WEBHOOK_PATTERN, `$1${CREDENTIAL_REDACTION_MARKER}`)
     .replace(EMBEDDED_URL_PATTERN, scrubUrlUserinfo)
+    .replace(SLASH_ESCAPED_URL_USERINFO_PATTERN, `$1${CREDENTIAL_REDACTION_MARKER}@`)
     .replace(QUERY_PAIR_PATTERN, (match, separator: string, key: string, value: string) => (isCredentialAssignmentKey(key) || isTokenShapedValue(value) ? `${separator}${key}=${CREDENTIAL_REDACTION_MARKER}` : match))
     .replace(SCHEME_VALUE_PATTERN, (match, scheme: string, value: string) => (isSchemeProse(scheme, value) ? match : `${scheme} ${CREDENTIAL_REDACTION_MARKER}`))
-    .replace(JSON_QUOTED_PAIR_PATTERN, (match, key: string, separator: string, value: string) => (isCredentialKey(key) && !isCountValue(key, value) ? `"${key}"${separator}"${CREDENTIAL_REDACTION_MARKER}"` : match))
-    .replace(JSON_ESCAPED_PAIR_PATTERN, (match, run: string, key: string, separator: string, value: string) => (isCredentialKey(key) && !isCountValue(key, value) ? `${run}"${key}${run}"${separator}${run}"${CREDENTIAL_REDACTION_MARKER}${run}"` : match))
-    .replace(QUOTED_ATTRIBUTE_PATTERN, (match, key: string, quote: string, _value: string, offset: number, whole: string) => (isCredentialKey(keyAfterEscape(whole, offset, key)) ? `${key}=${quote}${CREDENTIAL_REDACTION_MARKER}${quote}` : match));
-  return replaceCredentialAssignments(scrubbed)
+    .replace(JSON_QUOTED_PAIR_PATTERN, (match, key: string, separator: string, value: string) => quotedValue(key, value, () => `"${key}"${separator}"${CREDENTIAL_REDACTION_MARKER}"`, (url) => `"${key}"${separator}"${url}"`, match))
+    .replace(JSON_ESCAPED_PAIR_PATTERN, (match, run: string, key: string, separator: string, value: string) => quotedValue(key, value, () => `${run}"${key}${run}"${separator}${run}"${CREDENTIAL_REDACTION_MARKER}${run}"`, (url) => `${run}"${key}${run}"${separator}${run}"${url}${run}"`, match))
+    .replace(QUOTED_ATTRIBUTE_PATTERN, (match, key: string, quote: string, value: string, offset: number, whole: string) => quotedValue(keyAfterEscape(whole, offset, key), value, () => `${key}=${quote}${CREDENTIAL_REDACTION_MARKER}${quote}`, (url) => `${key}=${quote}${url}${quote}`, match));
+  return replaceCredentialAssignments(replaceFlagValues(scrubbed))
     .replace(JWT_PATTERN, CREDENTIAL_REDACTION_MARKER)
     .replace(PANOS_API_KEY_PATTERN, CREDENTIAL_REDACTION_MARKER)
-    .replace(AWS_ACCESS_KEY_ID_PATTERN, CREDENTIAL_REDACTION_MARKER);
+    .replace(AWS_ACCESS_KEY_ID_PATTERN, CREDENTIAL_REDACTION_MARKER)
+    .replace(GITHUB_TOKEN_PATTERN, CREDENTIAL_REDACTION_MARKER)
+    .replace(STRIPE_KEY_PATTERN, CREDENTIAL_REDACTION_MARKER)
+    .replace(SLACK_TOKEN_PATTERN, CREDENTIAL_REDACTION_MARKER);
 }
 
 /** The general scrub for error text: every carrier rule, every PEM block, and the long-token rule. Idempotent. */
@@ -964,6 +1164,9 @@ function redactCredentialNode(value: unknown): unknown {
       result[key] = entry;
     } else if (propertyNameIsCredential(key) || (pairIsCredential && (key === "value" || key === "default"))) {
       result[key] = REDACTED;
+    } else if (typeof entry === "string" && isWebhookUrlKey(key) && URL_VALUE_PATTERN.test(entry)) {
+      // A URL under a webhook key keeps its origin only: the path and query are the secret.
+      result[key] = redactedWebhookUrl(entry);
     } else {
       result[key] = redactCredentialNode(entry);
     }

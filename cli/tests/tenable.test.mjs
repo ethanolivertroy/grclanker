@@ -1089,8 +1089,8 @@ function carriersOf(value) {
     [`Set-Cookie: TNS_SESSIONID="${value}"; Path=/; HttpOnly`, /^Set-Cookie: \[REDACTED\]$/],
     [`X-ApiKeys: accessKey="${value}";secretKey="${value}"`, /^X-ApiKeys: \[REDACTED\]$/],
     [`x-apikey: accesskey='${value}'; secretkey='${value}';`, /^x-apikey: \[REDACTED\]$/],
-    [`Authorization: Bearer "${value}"`, /^Authorization: \[REDACTED\]$/],
-    [`Authorization: "Bearer ${value}" was rejected`, /^Authorization: "\[REDACTED\]" was rejected$/],
+    [`Authorization: Bearer "${value}"`, /^Authorization: Bearer "\[REDACTED\]"$/],
+    [`Authorization: "Bearer ${value}" was rejected`, /^Authorization: "Bearer \[REDACTED\]" was rejected$/],
     [`X-Api-Key: "${value}"`, /^X-Api-Key: "\[REDACTED\]"$/],
     [`X-SecurityCenter: '${value}'`, /^X-SecurityCenter: '\[REDACTED\]'$/],
     [`{"detail":"upstream rejected Cookie: sid=\\"${value}\\"; path=/","code":401}`, /^\{"detail":"upstream rejected Cookie: \[REDACTED\]","code":401\}$/],
@@ -1127,7 +1127,7 @@ function carriersOf(value) {
     // down) lose their values and keep their escaped quotes, so the JSON stays well formed.
     [`{"detail":"{\\"Cookie\\": \\"sid=${value}\\", \\"X-ApiKeys\\": \\"accessKey=${value}\\", \\"Content-Type\\": \\"application/json\\"}"}`, /^\{"detail":"\{\\"Cookie\\": \\"\[REDACTED\]\\", \\"X-ApiKeys\\": \\"\[REDACTED\]\\", \\"Content-Type\\": \\"application\/json\\"\}"\}$/],
     [`{"o":"{\\"detail\\":\\"{\\\\\\"Cookie\\\\\\": \\\\\\"sid=${value}\\\\\\", \\\\\\"X-SecurityCenter\\\\\\": \\\\\\"${value}\\\\\\"}\\"}"}`, /^\{"o":"\{\\"detail\\":\\"\{\\\\\\"Cookie\\\\\\": \\\\\\"\[REDACTED\]\\\\\\", \\\\\\"X-SecurityCenter\\\\\\": \\\\\\"\[REDACTED\]\\\\\\"\}\\"\}"\}$/],
-    [`{"detail":"{\\"Authorization\\": \\"Bearer ${value}\\"}"}`, /^\{"detail":"\{\\"Authorization\\": \\"\[REDACTED\]\\"\}"\}$/],
+    [`{"detail":"{\\"Authorization\\": \\"Bearer ${value}\\"}"}`, /^\{"detail":"\{\\"Authorization\\": \\"Bearer \[REDACTED\]\\"\}"\}$/],
     [`{"detail":"{'X-Cookie': 'token=${value}'}"}`, /^\{"detail":"\{'X-Cookie': '\[REDACTED\]'\}"\}$/],
     [`{"o":"{\\"detail\\":\\"Cookie: sid=${value}; path=/\\",\\"code\\":401}"}`, /^\{"o":"\{\\"detail\\":\\"Cookie: \[REDACTED\]\\",\\"code\\":401\}"\}$/],
     [`{"detail":"{\\"password\\": \\"${value}\\", \\"user\\": \\"a\\"}"}`, /^\{"detail":"\{\\"password\\": \\"\[REDACTED\]\\", \\"user\\": \\"a\\"\}"\}$/],
@@ -1142,11 +1142,11 @@ function carriersOf(value) {
     // or Date keeps name and value, and a quoted value still ends at its closing quote.
     [`request failed\\napi_key=${value}; \\nX-SecurityCenter: ${value}\\nContent-Type: application/json`, /^request failed\\napi_key=\[REDACTED\]; \\nX-SecurityCenter: \[REDACTED\]\\nContent-Type: application\/json$/],
     [`{"detail":"request failed\\napi_key=${value}; \\nX-SecurityCenter: ${value}\\nContent-Type: application/json"}`, /^\{"detail":"request failed\\napi_key=\[REDACTED\]; \\nX-SecurityCenter: \[REDACTED\]\\nContent-Type: application\/json"\}$/],
-    [`upstream said {"headers":"\\r\\nX-SecurityCenter: ${value}\\r\\nAuthorization: Bearer ${value}\\r\\nX-Cookie: token=${value}\\u000aCookie: sid=${value}"}`, /^upstream said \{"headers":"\\r\\nX-SecurityCenter: \[REDACTED\]\\r\\nAuthorization: \[REDACTED\]\\r\\nX-Cookie: \[REDACTED\]\\u000aCookie: \[REDACTED\]"\}$/],
+    [`upstream said {"headers":"\\r\\nX-SecurityCenter: ${value}\\r\\nAuthorization: Bearer ${value}\\r\\nX-Cookie: token=${value}\\u000aCookie: sid=${value}"}`, /^upstream said \{"headers":"\\r\\nX-SecurityCenter: \[REDACTED\]\\r\\nAuthorization: Bearer \[REDACTED\]\\r\\nX-Cookie: \[REDACTED\]\\u000aCookie: \[REDACTED\]"\}$/],
     [`\\tX-SecurityCenter: "${value}"\\u0009X-ApiKeys: accessKey=${value};secretKey=${value}\\r\\nDate: Tue, 22 Sep 2026 18:00:00 GMT`, /^\\tX-SecurityCenter: "\[REDACTED\]"\\u0009X-ApiKeys: \[REDACTED\]\\r\\nDate: Tue, 22 Sep 2026 18:00:00 GMT$/],
     [`\\nX-PAN-KEY: ${value}\\nx-redlock-auth: ${value}\\nSet-Cookie: session=${value}; Path=/\\nX-Total-Count: 3`, /^\\nX-PAN-KEY: \[REDACTED\]\\nx-redlock-auth: \[REDACTED\]\\nSet-Cookie: \[REDACTED\]\\nX-Total-Count: 3$/],
     [`\\tpassword: ${value}\\nkey=${value}&x=1\\u000apin=${value}\\nContent-Length: 42`, /^\\tpassword: \[REDACTED\]\\nkey=\[REDACTED\]&x=1\\u000apin=\[REDACTED\]\\nContent-Length: 42$/],
-    [`{"detail":"login failed\\nAuthorization: Basic ${value}\\nsid=${value}; \\nauth: ${value}"}`, /^\{"detail":"login failed\\nAuthorization: \[REDACTED\]\\nsid=\[REDACTED\]; \\nauth: \[REDACTED\]"\}$/],
+    [`{"detail":"login failed\\nAuthorization: Basic ${value}\\nsid=${value}; \\nauth: ${value}"}`, /^\{"detail":"login failed\\nAuthorization: Basic \[REDACTED\]\\nsid=\[REDACTED\]; \\nauth: \[REDACTED\]"\}$/],
     [`accessKey=${value};secretKey=${value}`, /^accessKey=\[REDACTED\];secretKey=\[REDACTED\]$/],
     [`TNS_SESSIONID=${value}; Path=/`, /^TNS_SESSIONID=\[REDACTED\]; Path=\/$/],
     [`session=${value} expired`, /^session=\[REDACTED\] expired$/],
@@ -1280,7 +1280,7 @@ const GAP10_ROWS = [
   [(v) => `{"headers":"Set-Cookie: my#sid=\\"${v}\\"; HttpOnly; Content-Type: \\"text/html\\""}`, () => `{"headers":"Set-Cookie: [REDACTED]; Content-Type: \\"text/html\\""}`],
   [(v) => `{"headers":"Cookie: theme=dark; my&sid=\\"${v}\\"; Content-Type: \\"text/html; charset=utf-8\\"; Date: \\"Mon, 22 Sep 2026 12:30:00 GMT\\""}`, () => `{"headers":"Cookie: [REDACTED]; Content-Type: \\"text/html; charset=utf-8\\"; Date: \\"Mon, 22 Sep 2026 12:30:00 GMT\\""}`],
   // boundaries that held before and must keep holding
-  [(v) => `Authorization: Bearer ${v}&token=${v}`, () => `Authorization: [REDACTED]`],
+  [(v) => `Authorization: Bearer ${v}&token=${v}`, () => `Authorization: Bearer [REDACTED]`],
   [(v) => `Cookie: my&sid=${v}`, () => `Cookie: [REDACTED]`],
   [(v) => `Cookie: theme=dark; my#sid=${v}`, () => `Cookie: [REDACTED]`],
   [(v) => `rejected header "Cookie: sid=${v}" and "X-Other: 1"`, () => `rejected header "Cookie: [REDACTED]" and "X-Other: 1"`],
@@ -1290,7 +1290,7 @@ const GAP10_ROWS = [
   [(v) => `X-ApiKeys: accessKey="${v}";secretKey="${v}"; Content-Type: application/json`, () => `X-ApiKeys: [REDACTED]; Content-Type: application/json`],
   [(v) => `{"error":"X-ApiKeys: accessKey=\\"${v}\\";secretKey=\\"${v}\\"","code":403}`, () => `{"error":"X-ApiKeys: [REDACTED]","code":403}`],
   [(v) => `Cookie: sid=${v}"; theme=dark`, () => `Cookie: [REDACTED]"; theme=dark`],
-  [(v) => `{"detail":"Authorization: Basic ${v}=","code":401}`, () => `{"detail":"Authorization: [REDACTED]","code":401}`],
+  [(v) => `{"detail":"Authorization: Basic ${v}=","code":401}`, () => `{"detail":"Authorization: Basic [REDACTED]","code":401}`],
   [(v) => `Cookie: sid=${v}=" and "X-Other: 1"`, () => `Cookie: [REDACTED]" and "X-Other: 1"`],
   [(v) => `sid=${v}'; path=/`, () => `sid=[REDACTED]'; path=/`],
   [(v) => `api_key=${v}"}`, () => `api_key=[REDACTED]"}`],
@@ -1370,8 +1370,9 @@ test("scrub boundary: name-shaped values stay bare in prose, leave every carrier
     assert.equal(redactErrorText(expected), expected, "idempotent");
   }
   // After a scheme the value goes whatever its shape, a plain lowercase word included,
-  // unless it is one of the listed prose words; after the noun "Token" any short plain
-  // lowercase word is prose.
+  // unless it is one of the listed prose words; after the nouns "Token", "OAuth", "Splunk",
+  // and "Snowflake" a plain lowercase word shorter than a long token run is prose, and
+  // "realm=" or another auth parameter name after any scheme is prose.
   for (const [text, expected] of [
     ["Bearer abcdefghijklmnop rejected", "Bearer [REDACTED] rejected"],
     ["Basic canarybasic rejected", "Basic [REDACTED] rejected"],
@@ -1379,6 +1380,9 @@ test("scrub boundary: name-shaped values stay bare in prose, leave every carrier
     ["Token abcdefghijklmnopq expired", "Token [REDACTED] expired"],
     ["Token hygiene could not be judged; token inventory read; Token count 3", "Token hygiene could not be judged; token inventory read; Token count 3"],
     ["API key basic auth; Bearer tokens expire; Basic credential; Basic authentication is required", "API key basic auth; Bearer tokens expire; Basic credential; Basic authentication is required"],
+    ["OAuth clients all declare scopes; an OAuth bearer token; OAuth authentication failed; OAuth abcdefghijklmnop rejected", "OAuth clients all declare scopes; an OAuth bearer token; OAuth authentication failed; OAuth [REDACTED] rejected"],
+    ["replayed OAuth Kq7Zx2Vw9Lm4Tp8R upstream; replayed Splunk Kq7Zx2Vw9Lm4Tp8R upstream; replayed Snowflake Kq7Zx2Vw9Lm4Tp8R upstream; replayed AWS4-HMAC-SHA256 Kq7Zx2Vw9Lm4Tp8R upstream", "replayed OAuth [REDACTED] upstream; replayed Splunk [REDACTED] upstream; replayed Snowflake [REDACTED] upstream; replayed AWS4-HMAC-SHA256 [REDACTED] upstream"],
+    ["Bearer realm=\"api\"; Bearer token is missing; Digest realm=\"api\", qop=\"auth\"; Splunk search head", "Bearer realm=\"api\"; Bearer token is missing; Digest realm=\"api\", qop=\"auth\"; Splunk search head"],
     // A Titlecase word makes the scheme name an adjective in a title; a digit, a symbol,
     // token casing, or a run longer than a word still marks a credential.
     ["templates: Basic Network Scan, Basic Agent Scan, Advanced Scan; Bearer Token rotation; Token Hygiene; ApiKey Rotation", "templates: Basic Network Scan, Basic Agent Scan, Advanced Scan; Bearer Token rotation; Token Hygiene; ApiKey Rotation"],
@@ -1733,7 +1737,7 @@ function escapedHeaderCanaryResponse() {
     error_msg: `\\tX-SecurityCenter: "${CANARY_ESCAPED_HEADER}"\\u0009X-ApiKeys: accessKey=${CANARY_API_KEY};secretKey=${CANARY_API_KEY}\\r\\nDate: Tue, 22 Sep 2026 18:00:00 GMT`,
   }), { status: 403, statusText: "Forbidden", headers: { "content-type": "application/json" } });
 }
-const ESCAPED_HEADER_MARKER = new RegExp(escapeRegExp('HTTP 403 Forbidden; request failed\\napi_key=[REDACTED]; \\nX-SecurityCenter: [REDACTED]\\nContent-Type: application/json; upstream said {"headers":"\\r\\nX-SecurityCenter: [REDACTED]\\r\\nAuthorization: [REDACTED]\\r\\nX-Cookie: [REDACTED]\\u000aCookie: [REDACTED]"}; \\tX-SecurityCenter: "[REDACTED]"\\u0009X-ApiKeys: [REDACTED]\\r\\nDate: Tue, 22 Sep 2026 18:00:00 GMT'));
+const ESCAPED_HEADER_MARKER = new RegExp(escapeRegExp('HTTP 403 Forbidden; request failed\\napi_key=[REDACTED]; \\nX-SecurityCenter: [REDACTED]\\nContent-Type: application/json; upstream said {"headers":"\\r\\nX-SecurityCenter: [REDACTED]\\r\\nAuthorization: Bearer [REDACTED]\\r\\nX-Cookie: [REDACTED]\\u000aCookie: [REDACTED]"}; \\tX-SecurityCenter: "[REDACTED]"\\u0009X-ApiKeys: [REDACTED]\\r\\nDate: Tue, 22 Sep 2026 18:00:00 GMT'));
 // The header names of the escaped shape are the documented fields' own text, so only the
 // HTML body's text counts as echoed there.
 const ESCAPED_ECHOED_BODY_TEXT = /<html|Set-Cookie|TNS_SESSIONID|did not answer|Proxy-Authorization/i;
