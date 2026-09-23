@@ -65,7 +65,7 @@ const MAX_REDACTION_DEPTH = 64;
 
 const REDACTED = "[REDACTED]";
 const CREDENTIAL_LAST_SEGMENTS = new Set([
-  "token", "tokens", "secret", "secrets", "password", "passwd", "pwd", "passphrase", "apikey", "appkey", "authorization",
+  "token", "tokens", "secret", "secrets", "password", "passwd", "pwd", "passphrase", "apikey", "appkey", "appkeys", "applicationkey", "applicationkeys", "authorization",
   "credential", "credentials", "bearer",
 ]);
 const CREDENTIAL_KEY_QUALIFIERS = new Set(["api", "app", "application", "private", "secret", "signing", "access", "shared", "session", "master", "client", "auth"]);

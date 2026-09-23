@@ -540,6 +540,8 @@ const COMPOUND_CREDENTIAL_KEYS = [...new Set([
   "apiKey", "appKey", "appkey", "private_key",
   "apiToken", "phisher_api_token", "phisherApiToken",
   "api-key", "bearer_token", "bearer-token", "bearerToken", "cloud_api_key", "cloud-api-key", "cloudApiKey",
+  // Webhook-prefixed credential keys (gap 39): the prefix does not make them URL keys.
+  "webhook_secret", "WEBHOOK_SECRET", "webhookSecret", "webhook_token", "webhook_signing_key",
 ])];
 
 /** Human-chosen values: the four that pass a digit, symbol, or length test and the eight a shape gate would keep. */
@@ -586,7 +588,7 @@ function assertPairValueGone(scrubbed, key, value, label) {
 }
 
 test("row (a): every credential-named key the five modules read loses a human-chosen value whatever its shape, in every pair form, through every entry point", () => {
-  assert.equal(COMPOUND_CREDENTIAL_KEYS.length, 50);
+  assert.equal(COMPOUND_CREDENTIAL_KEYS.length, 55);
   for (const key of COMPOUND_CREDENTIAL_KEYS) assert.ok(isCredentialKey(key), `key rule misses ${key}`);
   let cells = 0;
   for (const [entryLabel, entry] of ENTRY_POINTS) {
@@ -697,6 +699,149 @@ test("row (a), webhooks: a webhook or callback URL key stays a credential key wh
     { webhook_url: REDACTED, callbackUri: REDACTED, hook_url: "", webhook: "nightly-sync", webhooks: ["nightly-sync"] },
     "a schemeless path under a URL-named webhook key becomes the marker, a blank stays blank, and a webhook name stays a name",
   );
+});
+
+// Gap 35: the application-key spellings a Datadog integration record carries (`appKey`, `application_key`, `DD_APP_KEY`)
+// are credential keys on the data side in every walker, not only the shared one and Datadog's own.
+const APPLICATION_KEY_SPELLINGS = ["appKey", "application_key", "DD_APP_KEY", "DD_APPLICATION_KEY", "DATADOG_APP_KEY", "appkey", "applicationKey", "app_key", "app-key", "applicationkeys"];
+
+test("gap 35: every application-key spelling loses a human-chosen value in the shared record walker and every module walker, while the identifier and name beside it stay", () => {
+  const walkers = [
+    ["shared scrubData", (value) => createCredentialScrubber().scrubData(value)],
+    ["box redactCredentialValues", redactBoxValues],
+    ["launchdarkly redactCredentialValues", redactLaunchdarklyValues],
+    ["knowbe4 redactCredentialValues", redactKnowbe4Values],
+    ["datadog redactCredentialValues", redactDatadogValues],
+    ["elastic redactSensitiveValues", redactElasticValues],
+  ];
+  for (const [label, walk] of walkers) {
+    for (const value of WEAK_VALUES) {
+      const record = { id: "int-1", name: "datadog-sync", ...Object.fromEntries(APPLICATION_KEY_SPELLINGS.map((key) => [key, value])) };
+      const out = walk(record);
+      for (const key of APPLICATION_KEY_SPELLINGS) assert.equal(out[key], REDACTED, `${label}: ${key}=${value} survived as ${JSON.stringify(out[key])}`);
+      assert.equal(out.id, "int-1", `${label}: the identifier stays`);
+      assert.equal(out.name, "datadog-sync", `${label}: the name stays`);
+    }
+    const nested = walk({ integrations: [{ kind: "datadog", config: { appKey: "monkey", region: "us1" } }] });
+    assert.deepEqual(nested, { integrations: [{ kind: "datadog", config: { appKey: REDACTED, region: "us1" } }] }, `${label}: nested application key`);
+  }
+});
+
+// Gap 39: a `webhook`-prefixed key whose last segment names a credential is a credential key, not a URL key, so its
+// value goes whatever its shape in every carrier form; the URL keys and the bare webhook name keep their rulings.
+const WEBHOOK_CREDENTIAL_KEYS = ["webhook_secret", "WEBHOOK_SECRET", "webhookSecret", "webhook_token", "webhook_signing_key"];
+const WEBHOOK_CREDENTIAL_FORMS = [
+  ["flag with a space", (key, value) => `--${key.replace(/_/g, "-")} ${value}`],
+  ["flag with =", (key, value) => `--${key.replace(/_/g, "-")}=${value}`],
+  ["Java property", (key, value) => `-D${key}=${value}`],
+  ["path segment", (key, value) => `/api/v1/${key}=${value}`],
+  ["scheme word first", (key, value) => `${key}=token ${value}`],
+  ["scheme word first, colon", (key, value) => `${key}: bearer ${value}`],
+  ["JSON with a URL sibling", (key, value) => `{"webhook_url": "https://hooks.example.com/services/T/B/x", "${key}": "${value}"}`],
+];
+const WEBHOOK_KEPT_TEXTS = [
+  "webhook=nightly-sync",
+  "webhooks: 3 configured",
+  "webhook_name=nightly-sync",
+  "webhook_id=123",
+  "webhook_count: 3",
+  "webhook_status: active",
+  '"webhook": "canary-insecure-hook-zq"',
+];
+
+test("gap 39: a webhook-prefixed credential key loses a human-chosen value in the flag, Java property, path, scheme-first, and JSON forms through every entry point, while the webhook name and setting keys stay", () => {
+  for (const key of WEBHOOK_CREDENTIAL_KEYS) assert.ok(!isWebhookKey(key) && isCredentialKey(key), `expected a credential key that is not a URL key: ${key}`);
+  for (const key of ["webhook_name", "webhook_id", "webhook_count", "webhook_status"]) assert.ok(!isWebhookKey(key) && !isCredentialKey(key), `expected a setting: ${key}`);
+  let cells = 0;
+  for (const [entryLabel, entry] of ENTRY_POINTS) {
+    for (const key of WEBHOOK_CREDENTIAL_KEYS) {
+      for (const value of WEAK_VALUES) {
+        for (const [formLabel, form] of WEBHOOK_CREDENTIAL_FORMS) {
+          const scrubbed = entry(form(key, value));
+          assertPairValueGone(scrubbed, formLabel.startsWith("flag") ? key.replace(/_/g, "-") : key, value, `${entryLabel}, ${formLabel}, ${key}=${value}`);
+          if (formLabel.startsWith("scheme word first")) {
+            assert.ok(!/[=:] ?(?:token|bearer)\b/i.test(scrubbed), `${entryLabel}, ${formLabel}, ${key}: the scheme word is the value's first word and goes: ${scrubbed}`);
+          }
+          if (formLabel === "JSON with a URL sibling") {
+            assert.ok(scrubbed.includes("https://hooks.example.com/"), `${entryLabel}, ${key}: the sibling URL keeps its origin: ${scrubbed}`);
+          }
+          cells += 1;
+        }
+      }
+    }
+    for (const text of WEBHOOK_KEPT_TEXTS) {
+      const output = entry(text);
+      assert.ok(output.includes(text) || output.includes(JSON.stringify(text).slice(1, -1)), `${entryLabel}: a webhook name or setting changed: ${text} -> ${output}`);
+    }
+  }
+  assert.equal(cells, ENTRY_POINTS.length * WEBHOOK_CREDENTIAL_KEYS.length * WEAK_VALUES.length * WEBHOOK_CREDENTIAL_FORMS.length);
+  const scrubber = createCredentialScrubber();
+  assert.equal(scrubber.scrub("webhook_secret=token rejected"), `webhook_secret=${REDACTED}`);
+  assert.equal(scrubber.scrub("webhook_url=https://hooks.example.com/services/T/B/x webhook_secret=hunter2"), `webhook_url=https://hooks.example.com/${REDACTED} webhook_secret=${REDACTED}`);
+  // A URL-named key's non-URL value becomes the marker on the text side too (a schemeless path would keep its token);
+  // a clause after `webhook_url:` is prose and stays.
+  assert.equal(scrubber.scrub("webhook_url=hooks.example.com/services/T/B/x"), `webhook_url=${REDACTED}`);
+  assert.equal(scrubber.scrub('"webhook_url": "hooks.example.com/services/T/B/x"'), `"webhook_url": "${REDACTED}"`);
+  assert.equal(scrubber.scrub("callback_url=hooks.example.com/services/T/B/x"), `callback_url=${REDACTED}`);
+  assert.equal(scrubber.scrub("webhook_url: the endpoint was unreachable after 3 attempts"), "webhook_url: the endpoint was unreachable after 3 attempts");
+  assert.equal(scrubber.scrub("webhook_url: https://hooks.example.com/services/T/B/x was unreachable"), `webhook_url: https://hooks.example.com/${REDACTED} was unreachable`);
+});
+
+// The (b) residual: a header-named key (`apiKey`, `x-api-key`, `x-auth-token`, `x-vault-token`) is read by the header
+// carrier, which kept a leading scheme word for every header name; only the Authorization-style names keep it.
+const HEADER_NAMED_KEYS = ["apiKey", "apikey", "api-key", "x-api-key", "X-Api-Key", "x-auth-token", "X-Auth-Token", "x-vault-token", "private-token", "x-access-token"];
+const HEADER_SCHEME_WORDS = ["splunk", "token", "bearer", "Basic", "ApiKey", "OAuth", "Negotiate"];
+const HEADER_SCHEME_FORMS = [
+  ["NAME=<scheme> rejected", (key, scheme) => `${key}=${scheme} rejected`, (scheme) => `=${scheme}`],
+  ["NAME=<scheme> <word>", (key, scheme) => `${key}=${scheme} ${NAME_SHAPED[0]}`, (scheme) => `=${scheme}`],
+  ["NAME: <scheme>", (key, scheme) => `${key}: ${scheme}`, (scheme) => `: ${scheme}`],
+  ["NAME: <scheme> rejected", (key, scheme) => `${key}: ${scheme} rejected`, (scheme) => `: ${scheme}`],
+  ['NAME="<scheme> rejected"', (key, scheme) => `${key}="${scheme} rejected"`, (scheme) => `"${scheme}`],
+  ['"NAME": "<scheme>"', (key, scheme) => `"${key}": "${scheme}"`, (scheme) => `"${scheme}"`],
+];
+
+test("header carrier: under an API-key or token header name a leading scheme word is the value's first word and goes with it, through every text entry point, while Authorization-style headers keep their scheme", () => {
+  const textEntryPoints = ENTRY_POINTS.filter(([label]) => label.endsWith("scrub") || label.endsWith("scrubErrorText"));
+  assert.equal(textEntryPoints.length, 6);
+  let cells = 0;
+  for (const [entryLabel, entry] of textEntryPoints) {
+    for (const key of HEADER_NAMED_KEYS) {
+      for (const scheme of HEADER_SCHEME_WORDS) {
+        if (key.toLowerCase().includes(scheme.toLowerCase())) continue;
+        for (const [formLabel, form, removed] of HEADER_SCHEME_FORMS) {
+          const scrubbed = entry(form(key, scheme));
+          const label = `${entryLabel}, ${formLabel}, ${key} / ${scheme}`;
+          assert.ok(!scrubbed.includes(removed(scheme)), `${label}: the scheme word survived as the value: ${scrubbed}`);
+          assert.ok(scrubbed.includes(key), `${label}: key lost: ${scrubbed}`);
+          assert.ok(scrubbed.includes(REDACTED), `${label}: no marker written: ${scrubbed}`);
+          assert.ok(!scrubbed.includes(NAME_SHAPED[0]), `${label}: the word after the scheme survived: ${scrubbed}`);
+          cells += 1;
+        }
+      }
+    }
+    const kept = [
+      `Authorization: Bearer ${REDACTED}`,
+      `Authorization: ApiKey ${REDACTED}`,
+      `Proxy-Authorization: Basic ${REDACTED}`,
+      `authorization=Bearer ${REDACTED}`,
+      'WWW-Authenticate: Bearer realm="api", error="invalid_token"',
+      "X-Api-Key: [REDACTED]",
+    ];
+    assert.deepEqual(scrubAlterations(kept, entry), [], `${entryLabel}: an Authorization-style header lost its scheme or a fixed text changed`);
+  }
+  assert.ok(cells >= 6 * 9 * 6 * 6, `expected the full matrix, got ${cells}`);
+  const scrubber = createCredentialScrubber({ headers: ["DD-API-KEY", "X-Phisher-Token"] });
+  assert.equal(scrubber.scrub("X-Api-Key: token rejected"), `X-Api-Key: ${REDACTED}`);
+  assert.equal(scrubber.scrub("apiKey=splunk rejected"), `apiKey=${REDACTED}`);
+  assert.equal(scrubber.scrub("x-vault-token: splunk rejected"), `x-vault-token: ${REDACTED}`);
+  assert.equal(scrubber.scrub("apiKey=token rejected value here"), `apiKey=${REDACTED} value here`);
+  assert.equal(scrubber.scrub('X-Api-Key: Bearer "abcdefghijkl"'), `X-Api-Key: "${REDACTED}"`);
+  assert.equal(scrubber.scrub("DD-API-KEY: token rejected"), `DD-API-KEY: ${REDACTED}`);
+  assert.equal(scrubber.scrub("X-Phisher-Token: splunk rejected"), `X-Phisher-Token: ${REDACTED}`);
+  assert.equal(scrubber.scrub("Authorization: Bearer abcdefghijkl"), `Authorization: Bearer ${REDACTED}`);
+  assert.equal(scrubber.scrub('Authorization: Bearer "abcdefghijkl"'), `Authorization: Bearer "${REDACTED}"`);
+  assert.equal(scrubber.scrub("Authorization: ApiKey abcdefghijkl"), `Authorization: ApiKey ${REDACTED}`);
+  assert.equal(scrubber.scrub("Proxy-Authorization: Basic abcdefghijkl"), `Proxy-Authorization: Basic ${REDACTED}`);
 });
 
 // The bearer-id override (CodeRabbit on #78, r4077259415; `token_id` joined it in the 01:40 rulings, fail closed): a key

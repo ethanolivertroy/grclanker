@@ -66,12 +66,17 @@ const CREDENTIAL_LAST_SEGMENTS = new Set([
   "passphrase",
   "apikey",
   "apikeys",
+  "appkey",
+  "appkeys",
+  "applicationkey",
+  "applicationkeys",
   "authorization",
   "credential",
   "credentials",
   "community",
 ]);
-const CREDENTIAL_KEY_QUALIFIERS = new Set(["api", "private", "secret", "signing", "access", "shared", "encryption", "session", "master", "client"]);
+// `app` and `application` qualify a key (`appKey`, `application_key`, `DD_APP_KEY` in a Datadog integration record; gap 35).
+const CREDENTIAL_KEY_QUALIFIERS = new Set(["api", "app", "application", "private", "secret", "signing", "access", "shared", "encryption", "session", "master", "client"]);
 const JWT_ASSERTION_TTL_SECONDS = 45;
 const MAX_RETRY_AFTER_MS = 60_000;
 

@@ -808,11 +808,12 @@ function maskSecret(value: unknown): string | undefined {
 }
 
 const CREDENTIAL_LAST_SEGMENTS = new Set([
-  "token", "tokens", "secret", "secrets", "password", "passwd", "pwd", "passphrase", "apikey", "authorization",
+  "token", "tokens", "secret", "secrets", "password", "passwd", "pwd", "passphrase", "apikey", "appkey", "appkeys", "applicationkey", "applicationkeys", "authorization",
   "credential", "credentials", "bearer",
 ]);
+// `app` and `application` qualify a key (`appKey`, `applicationKey`, `application_key` in a Datadog integration subscription; gap 35).
 const CREDENTIAL_KEY_QUALIFIERS = new Set([
-  "api", "private", "secret", "signing", "access", "shared", "encryption", "session", "master", "client", "auth", "full",
+  "api", "app", "application", "private", "secret", "signing", "access", "shared", "encryption", "session", "master", "client", "auth", "full",
   "mobile", "sdk", "relay", "service",
 ]);
 const URL_KEY_SEGMENTS = new Set(["url", "urls", "uri", "endpoint", "webhook", "webhookurl"]);

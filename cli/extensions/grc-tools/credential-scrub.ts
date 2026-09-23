@@ -483,9 +483,14 @@ function isUnqualifiedKeyName(key: string): boolean {
   return (last === "key" || last === "keys") && !isCredentialDataKey(key);
 }
 // Incoming-webhook and callback URLs carry their credential in the path (rule 9), so these stay credential keys
-// whatever their suffix: `webhook_url`, `webhookUrl`, `slack_hook_url`, `callback_url`. Their URL value keeps only its
-// origin and loses its path and query; a value that is not a URL (a webhook's name) has nothing to lose.
+// whatever their suffix: `webhook_url`, `webhookUrl`, `slack_hook_url`, `callback_url`, and the bare `webhook` or
+// `webhooks` a URL stands under. Their URL value keeps only its origin and loses its path and query; a value that is
+// not a URL becomes the marker under a URL-named key (a schemeless path would keep its token) and is a webhook's name
+// under the bare key. A `webhook`-prefixed key whose last segment says what it holds is judged by that segment, not by
+// the prefix: `webhook_secret`, `webhook_token`, `webhookSigningKey` are credential keys outright and lose their value
+// whatever its shape; `webhook_name`, `webhook_id`, `webhook_count` are settings (gap 39).
 const WEBHOOK_KEY_LAST_SEGMENTS = new Set(["url", "uri"]);
+const BARE_WEBHOOK_KEYS = new Set(["webhook", "webhooks"]);
 
 // Names that carry a credential in query strings and pairs beyond the Flue heuristic: bare `sid`, `sig`, `pwd`,
 // `session`, `auth`, the concatenated application-key spellings (`appkey` in `~/.dogrc`), and the signed-URL parameters
@@ -517,20 +522,23 @@ function keySegments(key: string): string[] {
     .filter(Boolean);
 }
 
-/** True for `webhook*`, `*hook_url`, `*hook_uri`, and `callback_url` keys, whose URL value carries a credential in its path. */
+/**
+ * True for the keys whose value is a webhook or callback URL: `webhook*_url`, `*hook_uri`, `callback_url`, and the
+ * bare `webhook` or `webhooks`. A `webhook`-prefixed key with any other last segment (`webhook_secret`, `webhook_name`)
+ * is not a URL key and is judged by that segment.
+ */
 export function isWebhookKey(key: string): boolean {
   const segments = keySegments(key);
   if (segments.length === 0) return false;
-  if (segments[0].startsWith("webhook")) return true;
-  if (segments.length < 2 || !WEBHOOK_KEY_LAST_SEGMENTS.has(segments[segments.length - 1])) return false;
+  if (segments.length === 1) return BARE_WEBHOOK_KEYS.has(segments[0]);
+  if (!WEBHOOK_KEY_LAST_SEGMENTS.has(segments[segments.length - 1])) return false;
   const qualifier = segments[segments.length - 2];
-  return qualifier.endsWith("hook") || qualifier === "callback";
+  return segments[0].startsWith("webhook") || qualifier.endsWith("hook") || qualifier === "callback";
 }
 
-/** True for the webhook keys whose last segment names a URL (`webhook_url`, `callbackUri`), as opposed to a bare `webhook` name. */
+/** True for the webhook keys whose last segment names a URL (`webhook_url`, `callbackUri`), as opposed to the bare `webhook` name. */
 function isWebhookUrlKey(key: string): boolean {
-  const segments = keySegments(key);
-  return isWebhookKey(key) && segments.length >= 2 && WEBHOOK_KEY_LAST_SEGMENTS.has(segments[segments.length - 1]);
+  return isWebhookKey(key) && keySegments(key).length >= 2;
 }
 
 /** True when the key's final segment names a setting (`token_url`, `auth_method`, `client_id`) or a threshold (`max_keys`). */
@@ -820,7 +828,12 @@ function readCarrierValue(text: string, valueStart: number, barePattern: RegExp,
   return { end: afterScheme + bare.length, replacement: `${kept}${REDACTED}` };
 }
 
-const readHeaderValue: ValueReader = (text, valueStart) => readCarrierValue(text, valueStart, HEADER_BARE_VALUE_PATTERN, true);
+/**
+ * The value of a credential header. The scheme word stays only under an Authorization-style name (`Authorization:
+ * Bearer v`, `Proxy-Authorization: Basic v`); under an API-key or token header (`X-Api-Key: token rejected`,
+ * `apiKey=splunk rejected`, `X-Vault-Token: splunk v`) a scheme word is the value's first word and goes with it.
+ */
+const readHeaderValue: ValueReader = (text, valueStart, carrier) => readCarrierValue(text, valueStart, HEADER_BARE_VALUE_PATTERN, keepsSchemeWord(carrier[1]));
 const readPairValue: ValueReader = (text, valueStart, carrier) => readCarrierValue(text, valueStart, PAIR_BARE_VALUE_PATTERN, keepsSchemeWord(carrier[1]));
 /** The value after a credential-named `--flag`: read like a pair value once the flag's name is a credential key. */
 const readFlagValue: ValueReader = (text, valueStart, carrier) => (isCredentialKey(carrier[1]) ? readCarrierValue(text, valueStart, PAIR_BARE_VALUE_PATTERN, false) : null);
@@ -979,7 +992,11 @@ function isClauseLabel(key: string): boolean {
  * by a colon.
  */
 function bareValueOpensClause(text: string, key: string, valueEnd: number): boolean {
-  if (!isClauseLabel(key)) return false;
+  return isClauseLabel(key) && clauseContinues(text, valueEnd);
+}
+
+/** True when more of a clause follows the bare value ending at `valueEnd`: another word, rather than a line end, a closer, or the next pair. */
+function clauseContinues(text: string, valueEnd: number): boolean {
   // A label chain: the value is itself followed by a `:` and its own clause.
   if (text[valueEnd] === ":") return true;
   let index = valueEnd;
@@ -1060,9 +1077,11 @@ function replaceCompoundCredentialPairs(text: string): string {
     if (quoted !== null) {
       const content = text.slice(quoted.start, quoted.end);
       if (webhook) {
+        // A URL keeps its origin; under a URL-named key (`webhook_url`) any other value becomes the marker, since a
+        // schemeless path would keep its token; under the bare `webhook` key it is a name and stays.
         const reduced = webhookValueReplacement(content);
-        if (reduced === null) continue;
-        replacement = `${quoted.open}${reduced}${quoted.close}`;
+        if (reduced === null && (!isWebhookUrlKey(key) || isBlankOrScrubbed(content))) continue;
+        replacement = `${quoted.open}${reduced ?? REDACTED}${quoted.close}`;
       } else {
         const scheme = keepScheme ? stickyExec(HEADER_SCHEME_PATTERN, content, 0) ?? "" : "";
         if (isBlankOrScrubbed(content.slice(scheme.length))) continue;
@@ -1079,6 +1098,11 @@ function replaceCompoundCredentialPairs(text: string): string {
         if (isBlankOrScrubbed(text.slice(quotedAfterScheme.start, quotedAfterScheme.end))) continue;
         replacement = `${kept}${quotedAfterScheme.open}${REDACTED}${quotedAfterScheme.close}`;
         end = quotedAfterScheme.after;
+      } else if (scheme.length > 0 && !keepScheme && text.startsWith(REDACTED, afterScheme)) {
+        // The bare scheme-word pass already replaced the value after the word (`password: bearer [REDACTED]`); under
+        // a non-Authorization key the word is part of the value, so the two fold into one marker.
+        replacement = REDACTED;
+        end = absorbMarkers(text, afterScheme);
       } else {
         const value = stickyExec(GENERIC_PAIR_VALUE_PATTERN, text, afterScheme);
         // A container opener is rescanned element by element; an unquoted literal after `:` carries no secret text.
@@ -1087,8 +1111,11 @@ function replaceCompoundCredentialPairs(text: string): string {
         end = afterScheme + value.length;
         if (webhook) {
           const reduced = webhookValueReplacement(value);
-          if (reduced === null) continue;
-          replacement = reduced;
+          // A URL-named key's non-URL value goes when it stands as an assignment or alone; a clause after
+          // `webhook_url:` is prose. A name under the bare `webhook` key stays.
+          const standsAlone = separator.includes("=") || !clauseContinues(text, end);
+          if (reduced === null && (!isWebhookUrlKey(key) || !standsAlone)) continue;
+          replacement = reduced ?? REDACTED;
         } else {
           const tightAssignment = separator.includes("=") && !WHITESPACE_PATTERN.test(separator);
           const assignment = !shapeGated && (tightAssignment || scheme.length > 0 || !bareValueOpensClause(text, key, end));
