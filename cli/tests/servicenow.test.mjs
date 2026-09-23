@@ -23,8 +23,9 @@ import {
   exportServicenowAuditBundle,
   listServicenowControls,
   mappingsForControl,
-  FOREIGN_NEXT_LINK_REASON,
+  nextLinkRefusal,
   parseLinkNext,
+  refusedUrlClause,
   projectAclRow,
   projectRows,
   redactSecrets,
@@ -1678,15 +1679,98 @@ test("ServicenowApiClient never follows a Link rel=next that points at another o
   assert.equal(snapshot.pages, 1);
   assert.equal(snapshot.rows.length, 2);
   assert.equal(snapshot.truncated, true);
-  assert.equal(snapshot.truncationReason, FOREIGN_NEXT_LINK_REASON);
+  const foreignReason = "Link rel=next pointed at another origin, https://collector.attacker.example, than the configured instance https://dev12345.service-now.com; not followed";
+  assert.equal(snapshot.truncationReason, foreignReason);
   assert.equal(snapshot.error, undefined, "a foreign link is a truncation, not a read failure");
 
   const result = await assessServicenowIdentityAccess(createClient(fetchImpl, { pageSize: 2 }));
   const review = findingsById(result).get("SNOW-04");
   assert.equal(review.status, "warn");
-  assert.match(review.summary, /sys_user was truncated at 2 of 6 rows \(Link rel=next pointed at another origin; not followed\)/);
-  assert.equal(review.evidence.inputs[0].truncation_reason, FOREIGN_NEXT_LINK_REASON);
+  assert.match(review.summary, /sys_user was truncated at 2 of 6 rows \(Link rel=next pointed at another origin, https:\/\/collector\.attacker\.example, than the configured instance https:\/\/dev12345\.service-now\.com; not followed\)/);
+  assert.equal(review.evidence.inputs[0].truncation_reason, foreignReason);
   assert.deepEqual([...hosts], ["dev12345.service-now.com"], "the assessment did not request the foreign host either");
+});
+
+test("reviewer B round 4 verdict CodeRabbit (a) residue: ServicenowApiClient refuses a userinfo-bearing or foreign Link rel=next before fetch and names only the two origins in the reason", async () => {
+  const instance = sampleConfig().instanceUrl;
+  const configured = "https://dev12345.service-now.com";
+  // Canaries for every fragment of the link that must never be echoed: userinfo (name-shaped and
+  // token-shaped), the path, and the query pairs.
+  const userCanary = "svc-reader-canary";
+  const passwordCanary = "Pw7Qx9Lm2Vn4Rt6Yz1Kj3Hb5";
+  const pathCanary = "exfil-path-canary-7f3a";
+  const queryCanary = "marker-canary-9c1d";
+  const linkFragments = [userCanary, passwordCanary, pathCanary, queryCanary, "/exfil", "sysparm_offset=2", "marker="];
+  const assertNoFragment = (text, label) => {
+    for (const fragment of linkFragments) assert.ok(!String(text).includes(fragment), `${label} must not carry the link fragment ${fragment}: ${text}`);
+    assert.ok(!/cannot be constructed from a URL that includes credentials/.test(String(text)), `${label} must not be the transport's message: ${text}`);
+  };
+  const path = `/${pathCanary}/api/now/table/sys_user?marker=${queryCanary}&sysparm_offset=2`;
+  const variants = [
+    ["different host", `https://evil.example.test${path}`, `pointed at another origin, https://evil.example.test, than the configured instance ${configured}`],
+    ["different port", `https://dev12345.service-now.com:8443${path}`, `pointed at another origin, https://dev12345.service-now.com:8443, than the configured instance ${configured}`],
+    ["different scheme", `http://dev12345.service-now.com${path}`, `pointed at another origin, http://dev12345.service-now.com, than the configured instance ${configured}`],
+    ["protocol-relative", `//evil.example.test${path}`, `pointed at another origin, https://evil.example.test, than the configured instance ${configured}`],
+    ["userinfo on the instance host", `https://${userCanary}:${passwordCanary}@dev12345.service-now.com${path}`, `carried embedded credentials (userinfo) and pointed at the configured instance ${configured}`],
+    ["userinfo on a foreign host", `https://${userCanary}:${passwordCanary}@evil.example.test${path}`, `carried embedded credentials (userinfo) and pointed at another origin, https://evil.example.test, than the configured instance ${configured}`],
+    ["username only", `https://${userCanary}@dev12345.service-now.com${path}`, `carried embedded credentials (userinfo) and pointed at the configured instance ${configured}`],
+    ["opaque scheme", `javascript:${pathCanary}`, `pointed at another origin, an opaque javascript: origin, than the configured instance ${configured}`],
+  ];
+  for (const [label, link, clause] of variants) {
+    assert.equal(refusedUrlClause(link, instance), clause, label);
+    assert.equal(nextLinkRefusal(link, instance), `Link rel=next ${clause}; not followed`, label);
+    assertNoFragment(nextLinkRefusal(link, instance), `${label} reason`);
+    assert.equal(nextLinkRefusal(link, instance), redactSecrets(nextLinkRefusal(link, instance), [passwordCanary, SAMPLE_PASSWORD]), `${label} reason survives the redaction pass unchanged`);
+  }
+  assert.equal(refusedUrlClause(`${configured}/api/now/table/sys_user?sysparm_offset=2`, instance), undefined, "a plain link on the configured origin is followed");
+  assert.equal(refusedUrlClause("/api/now/table/sys_user?sysparm_offset=2", instance), undefined, "a relative link resolves to the configured origin");
+  assert.equal(nextLinkRefusal("http://[::1", instance), `Link rel=next was not a valid URL (configured instance ${configured}); not followed`, "an unparsable link is refused with a fixed reason");
+
+  // Live: every variant on the sys_user and sys_user_has_role walks; no request leaves for the link,
+  // the table renders truncated (not unread) with the reason, and no fragment reaches any output.
+  for (const [label, link, clause] of variants.slice(0, 6)) {
+    for (const table of ["sys_user", "sys_user_has_role"]) {
+      const fixture = healthyFixture();
+      const inner = fixtureFetch(fixture);
+      const requested = [];
+      const paged = overrideTablePage(inner, table, (url) => {
+        if (url.searchParams.get("sysparm_offset") !== "0") return undefined;
+        return jsonResponse({ result: fixture.tables[table].slice(0, 1) }, { headers: { "X-Total-Count": String(fixture.tables[table].length + 5), Link: `<${link}>;rel="next"` } });
+      });
+      const fetchImpl = (input, init) => {
+        requested.push(String(input));
+        return paged(input, init);
+      };
+      const snapshot = await createClient(fetchImpl, { maxRetries: 0 }).queryTable(table, { limit: 100 });
+      assert.equal(snapshot.pages, 1, `${label} ${table}: the link is not fetched`);
+      assert.equal(snapshot.truncated, true, `${label} ${table}`);
+      assert.equal(snapshot.error, undefined, `${label} ${table}: a refused link is a truncation, not a read failure`);
+      assert.equal(snapshot.truncationReason, `Link rel=next ${clause}; not followed`, `${label} ${table}`);
+      for (const url of requested) {
+        assert.equal(new URL(url).origin, configured, `${label} ${table}: every request stays on the configured origin`);
+        assertNoFragment(url, `${label} ${table} request URL`);
+      }
+
+      const result = await assessServicenowIdentityAccess(createClient(fetchImpl, { maxRetries: 0 }));
+      const rendered = JSON.stringify(result);
+      assertNoFragment(rendered, `${label} ${table} assessment output`);
+      assert.ok(rendered.includes(`Link rel=next ${clause}; not followed`), `${label} ${table}: the assessment carries the reason`);
+      for (const url of requested) assert.equal(new URL(url).origin, configured, `${label} ${table}: the assessment stayed on the configured origin`);
+    }
+  }
+
+  // The fetch site itself refuses a credentialed or foreign URL before attaching the Authorization header.
+  const direct = [];
+  const client = createClient((input, init) => {
+    direct.push(String(input));
+    return jsonResponse({ result: [] });
+  }, { maxRetries: 0 });
+  for (const [label, link, clause] of variants) {
+    const error = await client.requestJson(link).then(() => assert.fail(`${label}: expected a refusal`), (thrown) => thrown);
+    assert.equal(error.message, `ServiceNow request URL ${clause}; the request was not sent.`, label);
+    assertNoFragment(error.message, `${label} requestJson message`);
+  }
+  assert.deepEqual(direct, [], "no refused URL reached fetch");
 });
 
 test("ServicenowApiClient marks a non-empty read without X-Total-Count as total unknown so dependent findings cannot pass (rule 10)", async () => {
@@ -2374,9 +2458,15 @@ test("planted values self-check: every canary and planted secret is alphanumeric
  * skipped wordings, the inventory states, the withheld notes, and the corollary summary templates.
  */
 const SERVICENOW_FIXED_TEXTS = [
-  // A next link off the instance origin is never requested; the read is truncated with this reason.
-  "Link rel=next pointed at another origin; not followed",
-  "sys_user was truncated at 2 of 6 rows (Link rel=next pointed at another origin; not followed)",
+  // A next link off the instance origin or carrying userinfo is never requested; the read is truncated
+  // with a reason that names the configured origin and the rejected origin only.
+  "Link rel=next pointed at another origin, https://collector.attacker.example, than the configured instance https://dev12345.service-now.com; not followed",
+  "Link rel=next pointed at another origin, https://dev12345.service-now.com:8443, than the configured instance https://dev12345.service-now.com; not followed",
+  "Link rel=next carried embedded credentials (userinfo) and pointed at the configured instance https://dev12345.service-now.com; not followed",
+  "Link rel=next carried embedded credentials (userinfo) and pointed at another origin, https://evil.example.test, than the configured instance https://dev12345.service-now.com; not followed",
+  "Link rel=next was not a valid URL (configured instance https://dev12345.service-now.com); not followed",
+  "sys_user was truncated at 2 of 6 rows (Link rel=next pointed at another origin, https://collector.attacker.example, than the configured instance https://dev12345.service-now.com; not followed)",
+  "ServiceNow request URL carried embedded credentials (userinfo) and pointed at the configured instance https://dev12345.service-now.com; the request was not sent.",
   // The resolver's own messages, which reach check_access, assess, and export results live.
   "SERVICENOW_URL or SERVICENOW_INSTANCE (or an instance_url / instance argument) is required.",
   "ServiceNow credentials are required. Set SERVICENOW_USERNAME plus SERVICENOW_PASSWORD for basic auth, SERVICENOW_CLIENT_ID plus SERVICENOW_CLIENT_SECRET (optionally with username and password for the password grant) for OAuth, or SERVICENOW_ACCESS_TOKEN for a pre-issued bearer token.",

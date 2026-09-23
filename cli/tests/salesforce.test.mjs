@@ -6,8 +6,6 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import {
-  FOREIGN_NEXT_RECORDS_REASON,
-  FOREIGN_URL_MESSAGE,
   SalesforceApiClient,
   SalesforceApiError,
   assessSalesforceDataProtection,
@@ -23,11 +21,14 @@ import {
   collectProfileMetadata,
   decodeJwtClaims,
   exportSalesforceAuditBundle,
+  foreignUrlMessage,
   isSalesforceRecordId,
+  nextRecordsRefusal,
   parseSimpleXml,
   projectMyDomainSettings,
   projectProfileMetadata,
   projectSecuritySettings,
+  refusedUrlClause,
   registerSalesforceTools,
   resolveSalesforceConfiguration,
   resolveSecureOutputPath,
@@ -1521,11 +1522,12 @@ test("SalesforceApiClient never follows a nextRecordsUrl or request URL that poi
   assert.equal(foreign.pages, 1, "the foreign cursor is not fetched");
   assert.equal(foreign.done, false);
   assert.equal(foreign.truncated, true);
-  assert.equal(foreign.truncationReason, FOREIGN_NEXT_RECORDS_REASON);
+  const foreignReason = "nextRecordsUrl pointed at another origin, https://collector.attacker.example, than the instance origin https://acme.my.salesforce.com; not followed";
+  assert.equal(foreign.truncationReason, foreignReason);
 
   pages.set(`${query}?SELECT Id FROM Scheme`, { totalSize: 10, done: false, nextRecordsUrl: `http://acme.my.salesforce.com${query}/01g-2000`, records: [{ Id: "1" }] });
   const scheme = await client.query("SELECT Id FROM Scheme");
-  assert.equal(scheme.truncationReason, FOREIGN_NEXT_RECORDS_REASON, "a scheme change is another origin");
+  assert.equal(scheme.truncationReason, "nextRecordsUrl pointed at another origin, http://acme.my.salesforce.com, than the instance origin https://acme.my.salesforce.com; not followed", "a scheme change is another origin");
 
   pages.set(`${query}?SELECT Id FROM Relative`, { totalSize: 3, done: false, nextRecordsUrl: `${query}/relative-2`, records: [{ Id: "1" }, { Id: "2" }] });
   pages.set(`${query}/relative-2`, { totalSize: 3, done: true, records: [{ Id: "3" }] });
@@ -1541,8 +1543,9 @@ test("SalesforceApiClient never follows a nextRecordsUrl or request URL that poi
 
   await assert.rejects(
     client.getJson(`https://collector.attacker.example${query}/01g-2000`),
-    (error) => error instanceof SalesforceApiError && error.message === FOREIGN_URL_MESSAGE,
-    "getJson refuses a foreign absolute URL before any request",
+    (error) => error instanceof SalesforceApiError && error.endpoint === undefined
+      && error.message === "Salesforce request URL pointed at another origin, https://collector.attacker.example, than the instance origin https://acme.my.salesforce.com; the request was not sent.",
+    "getJson refuses a foreign absolute URL before any request and records no endpoint",
   );
   assert.deepEqual([...hosts], ["acme.my.salesforce.com"], "the only host requested is the instance");
 
@@ -1557,8 +1560,98 @@ test("SalesforceApiClient never follows a nextRecordsUrl or request URL that poi
     return fetchImpl(input);
   };
   const identity = await assessSalesforceIdentityAccess(new SalesforceApiClient(sampleConfig({ maxRetries: 0 }), { fetchImpl: collectorFetch }));
-  assert.match(identity.summary.inventories.User, /^User read: partial \(3 of 4000 rows; nextRecordsUrl pointed at another origin; not followed\)$/);
+  assert.equal(identity.summary.inventories.User, `User read: partial (3 of 4000 rows; ${foreignReason})`);
   assert.deepEqual([...hosts], ["acme.my.salesforce.com"], "the assessment did not request the foreign host either");
+});
+
+test("reviewer B round 4 verdict CodeRabbit (a) residue: SalesforceApiClient refuses a userinfo-bearing or foreign nextRecordsUrl before fetch, names only the two origins, and keeps the link's path out of the dataset marker", async () => {
+  const instance = "https://acme.my.salesforce.com";
+  const query = "/services/data/v64.0/query";
+  const userCanary = "svc-reader-canary";
+  const passwordCanary = "Pw7Qx9Lm2Vn4Rt6Yz1Kj3Hb5";
+  const pathCanary = "exfil-path-canary-7f3a";
+  const locatorCanary = "01gLocatorCanary4b2e-2000";
+  const queryCanary = "marker-canary-9c1d";
+  const linkFragments = [userCanary, passwordCanary, pathCanary, locatorCanary, queryCanary, "/exfil", "marker="];
+  const assertNoFragment = (text, label) => {
+    for (const fragment of linkFragments) assert.ok(!String(text).includes(fragment), `${label} must not carry the link fragment ${fragment}: ${text}`);
+    assert.ok(!/cannot be constructed from a URL that includes credentials/.test(String(text)), `${label} must not be the transport's message: ${text}`);
+  };
+  const path = `/${pathCanary}${query}/${locatorCanary}?marker=${queryCanary}`;
+  const variants = [
+    ["different host", `https://evil.example.test${path}`, `pointed at another origin, https://evil.example.test, than the instance origin ${instance}`],
+    ["different port", `https://acme.my.salesforce.com:8443${path}`, `pointed at another origin, https://acme.my.salesforce.com:8443, than the instance origin ${instance}`],
+    ["different scheme", `http://acme.my.salesforce.com${path}`, `pointed at another origin, http://acme.my.salesforce.com, than the instance origin ${instance}`],
+    ["protocol-relative", `//evil.example.test${path}`, `pointed at another origin, https://evil.example.test, than the instance origin ${instance}`],
+    ["userinfo on the instance host", `https://${userCanary}:${passwordCanary}@acme.my.salesforce.com${path}`, `carried embedded credentials (userinfo) and pointed at the instance origin ${instance}`],
+    ["userinfo on a foreign host", `https://${userCanary}:${passwordCanary}@evil.example.test${path}`, `carried embedded credentials (userinfo) and pointed at another origin, https://evil.example.test, than the instance origin ${instance}`],
+    ["username only", `https://${userCanary}@acme.my.salesforce.com${path}`, `carried embedded credentials (userinfo) and pointed at the instance origin ${instance}`],
+    ["opaque scheme", `javascript:${pathCanary}`, `pointed at another origin, an opaque javascript: origin, than the instance origin ${instance}`],
+  ];
+  for (const [label, link, clause] of variants) {
+    assert.equal(refusedUrlClause(link, instance), clause, label);
+    assert.equal(nextRecordsRefusal(link, instance), `nextRecordsUrl ${clause}; not followed`, label);
+    assertNoFragment(nextRecordsRefusal(link, instance), `${label} reason`);
+    assertNoFragment(foreignUrlMessage(clause), `${label} request message`);
+  }
+  assert.equal(refusedUrlClause(`${instance}${query}/01g-2000`, instance), undefined, "a plain absolute cursor on the instance origin is followed");
+  assert.equal(refusedUrlClause(`${query}/01g-2000`, instance), undefined, "a relative cursor resolves to the instance origin");
+  assert.equal(nextRecordsRefusal("http://[::1", instance), `nextRecordsUrl was not a valid URL (instance origin ${instance}); not followed`, "an unparsable cursor is refused with a fixed reason");
+
+  // Live through listUsers: no request leaves for the link, the dataset renders partial (not unread)
+  // with the reason, and neither the summary, the marker, nor the bundle carries a link fragment.
+  for (const [label, link, clause] of variants.slice(0, 6)) {
+    const requested = [];
+    const fetchImpl = async (input) => {
+      const url = new URL(input);
+      requested.push(String(input));
+      const soql = url.searchParams.get("q") ?? "";
+      if (url.pathname.endsWith("/query") && /FROM User\b/.test(soql) && !soql.includes("WHERE")) {
+        return jsonResponse({ totalSize: 4000, done: false, nextRecordsUrl: link, records: goodUsers });
+      }
+      return jsonResponse([{ message: "no fixture", errorCode: "NOT_FOUND" }], { status: 404 });
+    };
+    const client = new SalesforceApiClient(sampleConfig({ maxRetries: 2 }), { fetchImpl });
+    const users = await client.listUsers();
+    assert.equal(users.pages, 1, `${label}: the cursor is not fetched`);
+    assert.equal(users.truncated, true, label);
+    assert.equal(users.truncationReason, `nextRecordsUrl ${clause}; not followed`, label);
+    for (const url of requested) {
+      assert.equal(new URL(url).origin, instance, `${label}: every request stays on the instance origin`);
+      assertNoFragment(url, `${label} request URL`);
+    }
+
+    const identity = await assessSalesforceIdentityAccess(new SalesforceApiClient(sampleConfig({ maxRetries: 2 }), { fetchImpl }));
+    assert.equal(identity.summary.inventories.User, `User read: partial (3 of 4000 rows; nextRecordsUrl ${clause}; not followed)`, label);
+    assertNoFragment(JSON.stringify(identity), `${label} assessment output`);
+    for (const url of requested) assert.equal(new URL(url).origin, instance, `${label}: the assessment stayed on the instance origin`);
+  }
+
+  // The bundle: the users dataset is partial with the reason, and its core_data file carries no
+  // marker endpoint with the link's path (the link never reached fetch, so no error names it).
+  const userinfoLink = variants[4][1];
+  const bundleFetch = async (input) => {
+    const url = new URL(input);
+    assert.equal(url.origin, instance, "the export stayed on the instance origin");
+    assertNoFragment(String(input), "export request URL");
+    const soql = url.searchParams.get("q") ?? "";
+    if (url.pathname.endsWith("/query") && /FROM User\b/.test(soql) && !soql.includes("WHERE")) {
+      return jsonResponse({ totalSize: 4000, done: false, nextRecordsUrl: userinfoLink, records: goodUsers });
+    }
+    return jsonResponse([{ message: "no fixture", errorCode: "NOT_FOUND" }], { status: 404 });
+  };
+  const base = createTempBase("grclanker-salesforce-userinfo-link-");
+  try {
+    const result = await exportSalesforceAuditBundle(new SalesforceApiClient(sampleConfig({ maxRetries: 0 }), { fetchImpl: bundleFetch }), sampleConfig({ maxRetries: 0 }), base, { now: NOW });
+    const files = readBundleFiles(result.outputDir);
+    const usersFile = files.get("core_data/users.json");
+    assert.ok(usersFile, "core_data/users.json is written");
+    assertNoFragment(usersFile, "core_data/users.json");
+    assert.ok(usersFile.includes(`nextRecordsUrl ${variants[4][2]}; not followed`), "the users dataset carries the refusal reason");
+    for (const [name, content] of files) assertNoFragment(content, `bundle file ${name}`);
+  } finally {
+    rmSync(base, { recursive: true, force: true });
+  }
 });
 
 test("rule 10: SF-07, SF-09, and SF-10 demote when a secondary list is truncated and state seen versus total", () => {
@@ -2120,9 +2213,15 @@ const SF_SAMPLE_DENIAL = "Salesforce request /services/data/v64.0/query failed (
  * templates. Each must come back from SalesforceApiError's pass unchanged.
  */
 const SALESFORCE_FIXED_TEXTS = [
-  // A request URL or nextRecordsUrl off the instance origin is never requested.
-  "Salesforce request URL pointed at another origin than the instance URL; the request was not sent.",
-  "User read: partial (3 of 4000 rows; nextRecordsUrl pointed at another origin; not followed)",
+  // A request URL or nextRecordsUrl off the instance origin or carrying userinfo is never requested;
+  // the reason names the instance origin and the rejected origin only.
+  "Salesforce request URL pointed at another origin, https://collector.attacker.example, than the instance origin https://acme.my.salesforce.com; the request was not sent.",
+  "Salesforce request URL carried embedded credentials (userinfo) and pointed at the instance origin https://acme.my.salesforce.com; the request was not sent.",
+  "User read: partial (3 of 4000 rows; nextRecordsUrl pointed at another origin, https://collector.attacker.example, than the instance origin https://acme.my.salesforce.com; not followed)",
+  "User read: partial (3 of 4000 rows; nextRecordsUrl pointed at another origin, https://acme.my.salesforce.com:8443, than the instance origin https://acme.my.salesforce.com; not followed)",
+  "User read: partial (3 of 4000 rows; nextRecordsUrl carried embedded credentials (userinfo) and pointed at the instance origin https://acme.my.salesforce.com; not followed)",
+  "User read: partial (3 of 4000 rows; nextRecordsUrl carried embedded credentials (userinfo) and pointed at another origin, https://evil.example.test, than the instance origin https://acme.my.salesforce.com; not followed)",
+  "User read: partial (3 of 4000 rows; nextRecordsUrl was not a valid URL (instance origin https://acme.my.salesforce.com); not followed)",
   "OauthToken read: partial (2000 of an unknown total of rows; more records promised without a nextRecordsUrl)",
   // The resolver's own messages, which reach check_access, assess, and export results live.
   "Salesforce credentials are required: JWT bearer (SF_CONSUMER_KEY, SF_USERNAME, SF_PRIVATE_KEY_FILE), username-password (SF_USERNAME, SF_PASSWORD, SF_SECURITY_TOKEN, SF_CONSUMER_KEY, SF_CONSUMER_SECRET), a refresh token, an access token with SF_INSTANCE_URL, or SF_CREDENTIALS_FILE.",

@@ -1072,8 +1072,36 @@ function isRetryableStatus(status: number): boolean {
   return status === 429 || status >= 500;
 }
 
-/** Truncation reason recorded when a `Link rel=next` points off the instance's origin; the link is never requested. */
-export const FOREIGN_NEXT_LINK_REASON = "Link rel=next pointed at another origin; not followed";
+/**
+ * Judges a server-supplied URL before it is requested. requestJson attaches the Authorization header
+ * to whatever it fetches, so a URL is requested only when it resolves to the configured instance
+ * origin and carries no userinfo: a credentialed URL is refused here, not handed to fetch. The clause
+ * names the configured origin and the rejected origin (scheme, host, port) and never the URL's path,
+ * query, or userinfo; undefined means the URL may be requested.
+ */
+export function refusedUrlClause(link: string, instanceUrl: string): string | undefined {
+  const configuredOrigin = new URL(instanceUrl).origin;
+  let resolved: URL;
+  try {
+    resolved = new URL(link, instanceUrl);
+  } catch {
+    return `was not a valid URL (configured instance ${configuredOrigin})`;
+  }
+  const carriesUserinfo = resolved.username !== "" || resolved.password !== "";
+  const foreignOrigin = resolved.origin !== configuredOrigin;
+  if (!carriesUserinfo && !foreignOrigin) return undefined;
+  const rejectedOrigin = resolved.origin === "null" ? `an opaque ${resolved.protocol} origin` : resolved.origin;
+  const target = foreignOrigin
+    ? `pointed at another origin, ${rejectedOrigin}, than the configured instance ${configuredOrigin}`
+    : `pointed at the configured instance ${configuredOrigin}`;
+  return carriesUserinfo ? `carried embedded credentials (userinfo) and ${target}` : target;
+}
+
+/** Truncation reason recorded when a `Link rel=next` is refused; the link is never requested. */
+export function nextLinkRefusal(link: string, instanceUrl: string): string | undefined {
+  const clause = refusedUrlClause(link, instanceUrl);
+  return clause === undefined ? undefined : `Link rel=next ${clause}; not followed`;
+}
 
 export function parseLinkNext(header: string | null | undefined): string | undefined {
   if (!header) return undefined;
@@ -1322,6 +1350,10 @@ export class ServicenowApiClient implements ServicenowReadClient {
   }
 
   async requestJson(url: string, init: RequestInit = {}): Promise<{ payload: JsonRecord; headers: Headers; status: number }> {
+    // The one fetch site for table reads: a URL off the configured origin or carrying userinfo is
+    // refused before the Authorization header is attached, whatever path led here.
+    const refusal = refusedUrlClause(url, this.config.instanceUrl);
+    if (refusal !== undefined) throw new Error(`ServiceNow request URL ${refusal}; the request was not sent.`);
     let attempt = 0;
     let reauthenticated = false;
     for (;;) {
@@ -1398,14 +1430,17 @@ export class ServicenowApiClient implements ServicenowReadClient {
           truncationReason = "record limit reached";
           break;
         }
-        const nextUrl = new URL(next, this.config.instanceUrl);
-        // A next link is followed on the instance's own origin only: requestJson attaches the
-        // Authorization header to whatever it fetches, so an absolute link elsewhere would carry the
-        // credential to a foreign host. The read stops here and is reported truncated with the reason.
-        if (nextUrl.origin !== new URL(this.config.instanceUrl).origin) {
-          truncationReason = FOREIGN_NEXT_LINK_REASON;
+        // A next link is followed on the instance's own origin only, and never with userinfo:
+        // requestJson attaches the Authorization header to whatever it fetches, so an absolute link
+        // elsewhere would carry the credential to a foreign host, and a credentialed link must not
+        // reach fetch at all. The read stops here and is reported truncated with a reason that names
+        // the two origins only.
+        const refusal = nextLinkRefusal(next, this.config.instanceUrl);
+        if (refusal !== undefined) {
+          truncationReason = refusal;
           break;
         }
+        const nextUrl = new URL(next, this.config.instanceUrl);
         const nextOffset = asNumber(nextUrl.searchParams.get("sysparm_offset"));
         if (total !== undefined && nextOffset !== undefined && nextOffset >= total) break;
         const nextUrlText = nextUrl.toString();

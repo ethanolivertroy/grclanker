@@ -387,13 +387,40 @@ function normalizeBaseUrl(rawUrl: string): string {
   return parsed.toString().replace(/\/+$/, "");
 }
 
-/** Fixed text for a request whose URL resolved off the session's instance origin; the request is never sent. */
-export const FOREIGN_URL_MESSAGE = "Salesforce request URL pointed at another origin than the instance URL; the request was not sent.";
-/** Truncation reason recorded when a query's nextRecordsUrl points off the instance origin; the cursor is never requested. */
-export const FOREIGN_NEXT_RECORDS_REASON = "nextRecordsUrl pointed at another origin; not followed";
+/**
+ * Judges a server-supplied URL before it is requested. getJson puts the Bearer token on whatever it
+ * fetches, so a URL is requested only when it resolves to the session's instance origin and carries
+ * no userinfo: a credentialed URL is refused here, not handed to fetch. The clause names the
+ * configured origin and the rejected origin (scheme, host, port) and never the URL's path, query, or
+ * userinfo; undefined means the URL may be requested.
+ */
+export function refusedUrlClause(link: string, instanceUrl: string): string | undefined {
+  const configuredOrigin = new URL(instanceUrl).origin;
+  let resolved: URL;
+  try {
+    resolved = new URL(link, instanceUrl);
+  } catch {
+    return `was not a valid URL (instance origin ${configuredOrigin})`;
+  }
+  const carriesUserinfo = resolved.username !== "" || resolved.password !== "";
+  const foreignOrigin = resolved.origin !== configuredOrigin;
+  if (!carriesUserinfo && !foreignOrigin) return undefined;
+  const rejectedOrigin = resolved.origin === "null" ? `an opaque ${resolved.protocol} origin` : resolved.origin;
+  const target = foreignOrigin
+    ? `pointed at another origin, ${rejectedOrigin}, than the instance origin ${configuredOrigin}`
+    : `pointed at the instance origin ${configuredOrigin}`;
+  return carriesUserinfo ? `carried embedded credentials (userinfo) and ${target}` : target;
+}
 
-function isSameOrigin(url: URL, instanceUrl: string): boolean {
-  return url.origin === new URL(instanceUrl).origin;
+/** Fixed text for a request URL that was refused; the request is never sent. */
+export function foreignUrlMessage(clause: string): string {
+  return `Salesforce request URL ${clause}; the request was not sent.`;
+}
+
+/** Truncation reason recorded when a query's nextRecordsUrl is refused; the cursor is never requested. */
+export function nextRecordsRefusal(link: string, instanceUrl: string): string | undefined {
+  const clause = refusedUrlClause(link, instanceUrl);
+  return clause === undefined ? undefined : `nextRecordsUrl ${clause}; not followed`;
 }
 
 function serializeJson(value: unknown): string {
@@ -1345,10 +1372,13 @@ export class SalesforceApiClient {
 
   async getJson(pathOrUrl: string, query: Record<string, string> = {}): Promise<unknown> {
     const session = await this.getSession();
-    // Every request resolves against the session's instance URL and must stay on its origin: the
-    // Bearer token goes on the request, so a server-supplied absolute URL elsewhere is never fetched.
+    // Every request resolves against the session's instance URL and must stay on its origin without
+    // userinfo: the Bearer token goes on the request, so a server-supplied absolute URL elsewhere, or a
+    // credentialed one, is refused here and never fetched. The error carries no endpoint, so the
+    // refused URL's path never reaches a dataset marker.
+    const refusal = refusedUrlClause(pathOrUrl, session.instanceUrl);
+    if (refusal !== undefined) throw new SalesforceApiError(foreignUrlMessage(refusal));
     const url = new URL(pathOrUrl, session.instanceUrl);
-    if (!isSameOrigin(url, session.instanceUrl)) throw new SalesforceApiError(FOREIGN_URL_MESSAGE);
     for (const [key, value] of Object.entries(query)) url.searchParams.set(key, value);
     const response = await this.fetchWithRetry(url.toString(), {
       method: "GET",
@@ -1397,12 +1427,15 @@ export class SalesforceApiClient {
         truncationReason = nextUrl ? "nextRecordsUrl did not advance" : "more records promised without a nextRecordsUrl";
         break;
       }
-      // The cursor is followed on the instance's own origin only; an absolute URL elsewhere would carry
-      // the Bearer token to a foreign host, so it is never requested and the read is reported truncated.
+      // The cursor is followed on the instance's own origin only, and never with userinfo: an absolute
+      // URL elsewhere would carry the Bearer token to a foreign host, and a credentialed URL must not
+      // reach fetch at all, so the read stops and is reported truncated with a reason that names the
+      // two origins only.
       const { instanceUrl } = await this.getSession();
-      if (!isSameOrigin(new URL(nextUrl, instanceUrl), instanceUrl)) {
+      const refusal = nextRecordsRefusal(nextUrl, instanceUrl);
+      if (refusal !== undefined) {
         stalled = true;
-        truncationReason = FOREIGN_NEXT_RECORDS_REASON;
+        truncationReason = refusal;
         break;
       }
       visitedCursors.add(nextUrl);
