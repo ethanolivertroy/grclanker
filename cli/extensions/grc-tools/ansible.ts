@@ -1074,7 +1074,7 @@ function requestPath(target: string): string {
   }
 }
 
-/** Why a server-supplied link is not followed. Each class renders as fixed text that never carries the link. */
+/** Why a server-supplied link is not followed. Each class renders as text that names the origins involved and never the link. */
 type NextLinkRefusal = "foreign_origin" | "userinfo" | "unparseable";
 
 /**
@@ -1097,16 +1097,59 @@ function nextLinkRefusal(target: string, base: string): NextLinkRefusal | undefi
   return undefined;
 }
 
-const NEXT_LINK_REFUSAL_NOTES: Readonly<Record<NextLinkRefusal, string>> = Object.freeze({
-  foreign_origin: "the API advertised a next page on another origin (scheme, host, or port), so the walk was stopped; the link was not followed and no request was made for it",
-  userinfo: "the API advertised a next page link carrying userinfo, so the walk was stopped; the link was not followed and no request was made for it",
-  unparseable: "the API advertised a next page link that could not be parsed, so the walk was stopped; the link was not followed and no request was made for it",
-});
+/**
+ * The origin `target` names once resolved against `base`, as scheme, host, and port (`https://aap.example.com:8443`)
+ * or as the bare scheme of a URL without a host (`javascript:`, `data:`); undefined when it does not parse.
+ */
+function originLabel(target: string, base?: string): string | undefined {
+  try {
+    const url = new URL(target, base);
+    return url.host.length > 0 ? `${url.protocol}//${url.host}` : url.protocol;
+  } catch {
+    return undefined;
+  }
+}
+
+const NEXT_LINK_REFUSED_TAIL = "so the walk was stopped; the link was not followed and no request was made for it";
+
+/**
+ * The truncation reason recorded for a refused next link (harness revision 3, class 8): it names the configured
+ * origin and, when the link resolved onto another one, that origin too (scheme, host, and port, or the bare
+ * scheme of a `javascript:` or `data:` link), so the operator can see where the API tried to send the client.
+ * Never the link itself: no path, query, fragment, or userinfo is recorded. A link on another origin and a
+ * link with userinfo both parsed against the configured base (that is how they were classified), so their
+ * origins are known; the unparseable class has no origin of its own to name.
+ */
+function nextLinkRefusalNote(refusal: NextLinkRefusal, target: string, base: string): string {
+  const configuredOrigin = originLabel(base);
+  const configured = configuredOrigin === undefined ? "the configured origin" : `the configured origin ${configuredOrigin}`;
+  switch (refusal) {
+    case "foreign_origin":
+      return `the API advertised a next page on ${originLabel(target, base) ?? "another origin"} rather than ${configured}, ${NEXT_LINK_REFUSED_TAIL}`;
+    case "userinfo": {
+      const linkOrigin = originLabel(target, base);
+      const where = linkOrigin === undefined || linkOrigin === configuredOrigin ? configured : `${linkOrigin} rather than ${configured}`;
+      return `the API advertised a next page link carrying userinfo for ${where}, ${NEXT_LINK_REFUSED_TAIL}`;
+    }
+    case "unparseable":
+      return `the API advertised a next page link that could not be parsed against ${configured}, ${NEXT_LINK_REFUSED_TAIL}`;
+    default: {
+      const exhaustive: never = refusal;
+      return exhaustive;
+    }
+  }
+}
 
 /** Rendering of a request refused by the same-origin rule before it was made; the target itself is never recorded. */
 const REQUEST_REFUSED_NOTE = "AAP request refused: the target is not on the configured origin, so no request was made.";
 /** The `endpoint` of a refused request: none was sent, and the refused target must not be named. */
 const REFUSED_ENDPOINT = "not requested";
+/**
+ * A target the URL parser reads as absolute rather than as a path: one with a scheme (any casing) or one that
+ * opens with two slashes or backslashes (a protocol-relative link; the parser reads `\\` as `//`). The same
+ * reading the same-origin rule applied, so a target it let through is requested as the URL it is.
+ */
+const ABSOLUTE_URL_PATTERN = /^(?:[a-z][a-z0-9+.-]*:|[\\/]{2})/i;
 
 function normalizeKeyName(key: string): string {
   return key.toLowerCase().replace(/[^a-z0-9]/g, "");
@@ -1508,9 +1551,15 @@ export class AnsibleAapClient {
     registerConfiguredSecrets(config.token, config.password);
   }
 
+  /**
+   * An absolute target (a scheme in any casing, `HTTPS://host/...` included, or a protocol-relative `//host/...`)
+   * resolves against the configured base the way the same-origin rule parsed it, so it is requested as the URL
+   * it is and never appended to the base as a path (harness revision 3, class 8). A relative target is a path
+   * under the base: root-relative as given, otherwise under `/api/v2/`.
+   */
   private resolveUrl(pathOrUrl: string): string {
-    if (pathOrUrl.startsWith("http://") || pathOrUrl.startsWith("https://")) {
-      return pathOrUrl;
+    if (ABSOLUTE_URL_PATTERN.test(pathOrUrl)) {
+      return new URL(pathOrUrl, this.config.baseUrl).toString();
     }
 
     const normalizedPath = pathOrUrl.startsWith("/") ? pathOrUrl : `/api/v2/${pathOrUrl}`;
@@ -1653,8 +1702,8 @@ export class AnsibleAapClient {
       // A next link that leaves the configured origin is refused here, before get() would attach the credential
       // to it; the collection records the refusal as its truncation reason and the link itself is never recorded.
       const refusal = following ? nextLinkRefusal(following, this.config.baseUrl) : undefined;
-      if (refusal) {
-        stalled = NEXT_LINK_REFUSAL_NOTES[refusal];
+      if (refusal && following) {
+        stalled = nextLinkRefusalNote(refusal, following, this.config.baseUrl);
         break;
       }
       if (following && following === next) {
@@ -4079,6 +4128,20 @@ export function ansibleFixedTexts(): readonly string[] {
   const parentFailed: Snapshot<AnsibleCollection> = { data: { items: [], complete: false }, error: inventoriesDenied, status: 403, endpoint: "/api/v2/inventories/" };
   const inventories = inventory("inventories", parentFailed);
   const unknownScope: Snapshot<AnsibleScope> = { data: { fullVisibility: null, note: "current user could not be read, so the visibility of the audit account is unknown" }, error: "current user (/api/v2/me/): no user returned", status: null, endpoint: "/api/v2/me/" };
+  // Refused next links rendered for every origin shape the rule can meet: another host, port, or scheme, a
+  // scheme without a host, an IP literal, userinfo on the configured host and on another, and a link that
+  // does not parse. The link's path, query, fragment, and userinfo never reach the note.
+  const aapBase = "https://aap.example.com";
+  const refusalNotes = [
+    nextLinkRefusalNote("foreign_origin", "https://evil.example/api/v2/users/?page=2&page_size=100", aapBase),
+    nextLinkRefusalNote("foreign_origin", "https://aap.example.com:8443/api/v2/users/?page=2", aapBase),
+    nextLinkRefusalNote("foreign_origin", "http://aap.example.com/api/v2/users/?page=2", aapBase),
+    nextLinkRefusalNote("foreign_origin", "javascript:alert(1)", aapBase),
+    nextLinkRefusalNote("foreign_origin", "https://[::1]:8443/api/v2/users/?page=2", aapBase),
+    nextLinkRefusalNote("userinfo", "https://svc:placeholder@aap.example.com/api/v2/users/?page=2", aapBase),
+    nextLinkRefusalNote("userinfo", "https://svc:placeholder@evil.example/api/v2/users/?page=2", aapBase),
+    nextLinkRefusalNote("unparseable", "https://[bad/api/v2/users/?page=2", aapBase),
+  ];
   return Object.freeze([
     PARSE_ERROR_NOTE,
     describeNonJsonBody("text/html; charset=utf-8", html),
@@ -4093,8 +4156,8 @@ export function ansibleFixedTexts(): readonly string[] {
     "AAP session login failed (401 Unauthorized).",
     "AAP session auth requires AAP_USERNAME and AAP_PASSWORD.",
     ...partialNotes(unknownScope, inventories, inventory("hosts", { data: { items: [{}], complete: false, total: 40, truncation: "page cap reached" } })),
-    ...Object.values(NEXT_LINK_REFUSAL_NOTES),
-    inventory("users", { data: { items: [{}], complete: false, total: 2, truncation: NEXT_LINK_REFUSAL_NOTES.foreign_origin } }).partial ?? "",
+    ...refusalNotes,
+    inventory("users", { data: { items: [{}], complete: false, total: 2, truncation: refusalNotes[0] } }).partial ?? "",
     REQUEST_REFUSED_NOTE,
     REFUSED_ENDPOINT,
     finding(22, "pass", "No team holds the Admin role on every inventory.", undefined, partialNotes(unknownScope, inventories)).summary,

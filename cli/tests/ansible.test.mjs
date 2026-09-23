@@ -574,33 +574,56 @@ const NEXT_LINK_PATH_CANARY = "Hq7vTm3KpXw9ZbLn2Rf";
 const NEXT_LINK_QUERY_CANARY = "Wn4kJd8VqRz2TxPy6Mc";
 const NEXT_LINK_USERINFO_CANARY = "Fy9bNs2LtKp7WqXm4Vd";
 const FOREIGN_PAGE_USER_CANARY = "Zc3tRv8HnQm5KwYp7Lb";
-const NEXT_LINK_PATH_NAME = "offsite-hop-segment";
-const NEXT_LINK_QUERY_NAME = "offsite-query-marker";
+// Name-shaped and sharing no window with the origins the refusal reason names (the reason names the link's origin,
+// never its path or query).
+const NEXT_LINK_PATH_NAME = "planted-hop-segment";
+const NEXT_LINK_QUERY_NAME = "planted-query-marker";
 const NEXT_LINK_CANARIES = Object.freeze([NEXT_LINK_PATH_CANARY, NEXT_LINK_QUERY_CANARY, NEXT_LINK_USERINFO_CANARY, FOREIGN_PAGE_USER_CANARY, NEXT_LINK_PATH_NAME, NEXT_LINK_QUERY_NAME]);
 const FOREIGN_NEXT_HOST = "offsite.example.net";
 /** Origin of AAP_CLIENT_CONFIG.baseUrl, spelled out because that config is declared further down the file. */
 const AAP_ORIGIN = "https://aap.example.com";
+const NEXT_LINK_REFUSED_TAIL = "so the walk was stopped; the link was not followed and no request was made for it";
+
+function escapeRegExp(text) {
+  return text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
 
 /**
- * Every shape a server-supplied `next` link can take off the configured base, each with the refusal class its
- * truncation reason must name, plus the same-origin controls (AAP's real root-relative form and the absolute form)
+ * The truncation reason for a link that resolved onto `origin`: it names that origin and the configured one
+ * (harness revision 3, class 8), so the operator sees where the API tried to send the client, and nothing else
+ * of the link.
+ */
+function foreignOriginReason(origin) {
+  return new RegExp(`^the API advertised a next page on ${escapeRegExp(origin)} rather than the configured origin ${escapeRegExp(AAP_ORIGIN)}, ${escapeRegExp(NEXT_LINK_REFUSED_TAIL)}$`);
+}
+const USERINFO_REASON = new RegExp(`^the API advertised a next page link carrying userinfo for the configured origin ${escapeRegExp(AAP_ORIGIN)}, ${escapeRegExp(NEXT_LINK_REFUSED_TAIL)}$`);
+const UNPARSEABLE_REASON = new RegExp(`^the API advertised a next page link that could not be parsed against the configured origin ${escapeRegExp(AAP_ORIGIN)}, ${escapeRegExp(NEXT_LINK_REFUSED_TAIL)}$`);
+
+/**
+ * Every shape a server-supplied `next` link can take off the configured base, each with the refusal reason its
+ * truncation must carry, plus the same-origin controls (AAP's real root-relative form and the absolute form)
  * that must still be followed.
  */
 function aapNextLinkVariants(listPath) {
   const path = `/${NEXT_LINK_PATH_CANARY}/${NEXT_LINK_PATH_NAME}/page2`;
   const query = `page=2&page_size=100&token=${NEXT_LINK_QUERY_CANARY}&hop=${NEXT_LINK_QUERY_NAME}`;
+  const insecureOrigin = AAP_ORIGIN.replace("https://", "http://");
   return {
     refused: {
-      host: [`https://${FOREIGN_NEXT_HOST}${path}?${query}`, /another origin \(scheme, host, or port\)/],
-      port: [`${AAP_ORIGIN}:8443${path}?${query}`, /another origin \(scheme, host, or port\)/],
-      scheme: [`${AAP_ORIGIN.replace("https://", "http://")}${path}?${query}`, /another origin \(scheme, host, or port\)/],
-      userinfo: [`${AAP_ORIGIN.replace("https://", `https://intruder:${NEXT_LINK_USERINFO_CANARY}@`)}${path}?${query}`, /carrying userinfo/],
-      protocol_relative: [`//${FOREIGN_NEXT_HOST}${path}?${query}`, /another origin \(scheme, host, or port\)/],
-      unparseable: [`https://[${NEXT_LINK_PATH_CANARY}${path}?${query}`, /could not be parsed/],
+      host: [`https://${FOREIGN_NEXT_HOST}${path}?${query}`, foreignOriginReason(`https://${FOREIGN_NEXT_HOST}`)],
+      port: [`${AAP_ORIGIN}:8443${path}?${query}`, foreignOriginReason(`${AAP_ORIGIN}:8443`)],
+      scheme: [`${insecureOrigin}${path}?${query}`, foreignOriginReason(insecureOrigin)],
+      userinfo: [`${AAP_ORIGIN.replace("https://", `https://intruder:${NEXT_LINK_USERINFO_CANARY}@`)}${path}?${query}`, USERINFO_REASON],
+      protocol_relative: [`//${FOREIGN_NEXT_HOST}${path}?${query}`, foreignOriginReason(`https://${FOREIGN_NEXT_HOST}`)],
+      unparseable: [`https://[${NEXT_LINK_PATH_CANARY}${path}?${query}`, UNPARSEABLE_REASON],
     },
     followed: {
       relative_same_origin: `${listPath}?page=2&page_size=100&token=ctrl-page-2`,
       absolute_same_origin: `${AAP_ORIGIN}${listPath}?page=2&page_size=100&token=ctrl-page-2`,
+      // The URL parser reads the scheme and the host case-insensitively, so these name the configured origin too
+      // and must be requested as the URLs they are, not appended to the base as paths.
+      uppercase_scheme_same_origin: `${AAP_ORIGIN.toUpperCase()}${listPath}?page=2&page_size=100&token=ctrl-page-2`,
+      case_differing_host_same_origin: `${AAP_ORIGIN.replace("aap.example.com", "AAP.Example.COM")}${listPath}?page=2&page_size=100&token=ctrl-page-2`,
     },
   };
 }
@@ -651,10 +674,9 @@ test("rule 9: a next link that leaves the configured base is refused before any 
     assert.deepEqual(collection.items.map((user) => user.username), ["auditor", "ops", "reviewer"], `${label}: the inventory is page one only, nothing merged from the link`);
     assert.equal(collection.complete, false, `${label}: the collection is reported incomplete`);
     assert.equal(collection.total, 4, `${label}: the API's count is kept as the total`);
-    assert.match(collection.truncation ?? "", reason, `${label}: the truncation reason names the refusal class`);
-    assert.match(collection.truncation, /so the walk was stopped; the link was not followed and no request was made for it/, `${label}: the reason states that no request left`);
+    assert.match(collection.truncation ?? "", reason, `${label}: the truncation reason names the origins involved and states that no request left`);
     assertNoCanaryWindows(assert, collection, NEXT_LINK_CANARIES, `${label} collection`);
-    assert.ok(!JSON.stringify(collection).includes(FOREIGN_NEXT_HOST), `${label}: the reason is fixed text without the link's host`);
+    assert.ok(!JSON.stringify({ ...collection, truncation: undefined }).includes(FOREIGN_NEXT_HOST), `${label}: outside the reason, nothing names the link's host`);
   }
   for (const [variant, link] of Object.entries(variants.followed)) {
     const label = `next (${variant})`;
@@ -663,6 +685,7 @@ test("rule 9: a next link that leaves the configured base is refused before any 
     const collection = await client.listCollection(listPath);
     assert.equal(calls.length, 2, `${label}: the same-origin control page is followed`);
     assert.equal(requestOrigin(calls[1].url), AAP_ORIGIN, `${label}: the control request stays on the configured base`);
+    assert.equal(new URL(calls[1].url).pathname, listPath, `${label}: the control link is requested as the URL it is, never appended to the base as a path`);
     assert.equal(new URL(calls[1].url).searchParams.get("token"), "ctrl-page-2", `${label}: the control link is requested as served`);
     assert.deepEqual(collection.items.map((user) => user.username), ["auditor", "ops", "reviewer", "ctrl-page-2-user"], `${label}: both pages are merged`);
     assert.equal(collection.complete, true, `${label}: a complete same-origin walk is complete`);
@@ -704,7 +727,8 @@ test("rule 9: a refused next link on the users list leaves the access check, the
   const rbac = run.assessments.flatMap((assessment) => assessment.findings).find((item) => item.control === 23);
   assert.equal(rbac.status, "warn", "a verdict over the truncated users list is downgraded from pass");
   assert.equal(rbac.evidence.probed_users, 3, "only the users of page one were probed");
-  assert.ok(rbac.evidence.partial_view.some((note) => /^users: 3 of 4 seen \(the API advertised a next page on another origin \(scheme, host, or port\), so the walk was stopped; the link was not followed and no request was made for it\)$/.test(note)), `the partial view carries the reason: ${JSON.stringify(rbac.evidence.partial_view)}`);
+  const usersReason = `the API advertised a next page on https://${FOREIGN_NEXT_HOST} rather than the configured origin ${AAP_ORIGIN}, ${NEXT_LINK_REFUSED_TAIL}`;
+  assert.ok(rbac.evidence.partial_view.includes(`users: 3 of 4 seen (${usersReason})`), `the partial view carries the reason: ${JSON.stringify(rbac.evidence.partial_view)}`);
   for (const assessment of run.assessments) assertNoCanaryWindows(assert, assessment, NEXT_LINK_CANARIES, assessment.title);
 
   assert.equal(run.exportError, undefined);
@@ -713,10 +737,12 @@ test("rule 9: a refused next link on the users list leaves the access check, the
   assertNoCanaryWindowsInFiles(assert, readZipEntries(run.exported.zipPath), NEXT_LINK_CANARIES, "zip");
   const users = JSON.parse(files.get("core_data/users.json"));
   assert.equal(users.data.complete, false);
-  assert.match(users.data.truncation, /another origin/);
+  assert.equal(users.data.truncation, usersReason);
   assert.deepEqual(users.data.items.map((user) => user.username), ["auditor", "ops", "reviewer"], "the dataset holds page one only");
   const allText = [...files.values()].join("\n");
-  assert.ok(!allText.includes(FOREIGN_NEXT_HOST), "the bundle never names the link's host");
+  const hostMentions = allText.split(FOREIGN_NEXT_HOST).length - 1;
+  const reasonMentions = allText.split(`on https://${FOREIGN_NEXT_HOST} rather than the configured origin ${AAP_ORIGIN}`).length - 1;
+  assert.ok(hostMentions > 0 && hostMentions === reasonMentions, `the bundle names the link's host only as the origin inside the refusal reason, never as a link (${hostMentions} mentions, ${reasonMentions} in reasons)`);
 });
 
 test("checkAnsibleAccess reports readable AAP audit surfaces and visibility", async () => {
