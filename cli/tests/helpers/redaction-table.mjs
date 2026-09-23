@@ -235,13 +235,27 @@ export function assertFlagAndPathPairRows(assert, redact, rows = FLAG_AND_PATH_P
  * `https://h?e=a@x.com&token=s3cr3t` read as userinfo `h?e=a@` and host `x.com&token=s3cr3t`, so the query rule
  * never saw the token: the pair rule removed `token=s3cr3t` on its own, while the same query under a benign key
  * (`&v=s3cr3t`, the third row) reached the output whole, and `https://h#f@x.com` read as userinfo `h#f@` and host
- * `x.com`. Each row is `[text, expected]`: the host `h` stays, a query becomes the marker whole, and a fragment
- * is kept. The rows hold for the error sink, the data-string sink, and a snapshot string alike.
+ * `x.com`. Each row is `[text, expected]`: the host `h` stays, and a query and a fragment each become the marker
+ * whole. The boundary opened a regression against main (the merge-first delta on `7c7bf86`): a raw `?` or `#`
+ * inside a password (`https://svc:s3cr3t?7@x.com/v1`) left `svc:s3cr3t` standing as the authority, which main's
+ * greedy userinfo run had removed. An authority that is not `host[:port]` followed by an `@` in the run is
+ * userinfo again, so the four raw-character rows render as main did, while a host with a numeric port or a
+ * bracketed IPv6 address before an `@` in its query keeps the CodeRabbit reading. The rows hold for the error
+ * sink, the data-string sink, and a snapshot string alike.
  */
 export const URL_USERINFO_BOUNDARY_ROWS = Object.freeze([
   ["https://h?e=a@x.com&token=s3cr3t", "https://h?[REDACTED]"],
-  ["https://h#f@x.com", "https://h#f@x.com"],
+  ["https://h#f@x.com", "https://h#[REDACTED]"],
   ["https://h?e=a@x.com&v=s3cr3t", "https://h?[REDACTED]"],
+  ["https://svc:s3cr3t?7@x.com/v1", "https://x.com/v1"],
+  ["https://svc:pa?s3cr3t@x.com/v1", "https://x.com/v1"],
+  ["https://svc:s3cr3t#7@x.com/v1", "https://x.com/v1"],
+  ["https://svc:pa#s3cr3t@x.com/v1", "https://x.com/v1"],
+  ["https:\\/\\/svc:s3cr3t?7@x.com\\/v1?next=1", "https:\\/\\/x.com\\/v1?[REDACTED]"],
+  ["https://svc:s3cr3t%3F7@x.com/v1", "https://x.com/v1"],
+  ["https://x.com/cb#access_token=s3cr3t", "https://x.com/cb#[REDACTED]"],
+  ["https://x.com:8443?next=a@b.com&v=s3cr3t", "https://x.com:8443?[REDACTED]"],
+  ["https://[::1]:8443/v1?e=a@b.com&v=s3cr3t", "https://[::1]:8443/v1?[REDACTED]"],
 ]);
 
 /**

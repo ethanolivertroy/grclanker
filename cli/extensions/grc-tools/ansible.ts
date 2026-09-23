@@ -1200,17 +1200,39 @@ const BARE_SHAPE_PATTERNS: ReadonlyArray<TextRule> = [
 ];
 
 /**
- * URL userinfo and query strings anywhere in the string, not only when the string starts with a URL: any scheme
- * (`https://`, `proxy://`), plain or with its slashes JSON-escaped (`https:\/\/`, reviewer #78 row C), after a
- * JSON escape as after any other boundary. The scheme, host, and path stay; the userinfo goes and the query
- * becomes the marker. The userinfo ends at the first `/`, `?`, or `#` as at whitespace (CodeRabbit on #76), so an
- * `@` inside a query or a fragment is not a userinfo boundary: `https://h?e=a@x.com&token=v` is host `h` with a
- * query, which becomes the marker whole, and `https://h#f@x.com` is host `h` with a fragment, kept.
+ * URL userinfo, query, and fragment anywhere in the string, not only when the string starts with a URL: any
+ * scheme (`https://`, `proxy://`), plain or with its slashes JSON-escaped (`https:\/\/`, reviewer #78 row C),
+ * after a JSON escape as after any other boundary. The scheme, host, and path stay; the userinfo goes and the
+ * query and the fragment each become the marker. The userinfo ends at the first `/`, `?`, or `#` as at
+ * whitespace (CodeRabbit on #76), so an `@` inside a query or a fragment is not a userinfo boundary when the
+ * authority before it is a host: `https://h?e=a@x.com&token=v` is host `h` with a query, which becomes the
+ * marker whole. When that authority is not `host[:port]` (`svc:secret`, a password read up to a raw `?` or `#`
+ * inside it) and an `@` follows in the run, the run up to that `@` is userinfo after all (scrubUrlMatch).
  */
 const ERROR_URL_PATTERN = new RegExp(
-  String.raw`(?:(?<![A-Za-z0-9+.\\-])|(?<=\\[nrtbfv])|(?<=\\u[0-9A-Fa-f]{4}))([A-Za-z][A-Za-z0-9+.-]*:(?:\/\/|\\\/\\\/))(?:[^\s\/?#@"'<>\\]+@)?((?:[^\s?#"'<>\\]|\\\/)+)(\?(?:[^\s#"'<>\\]|\\\/)*)?`,
+  String.raw`(?:(?<![A-Za-z0-9+.\\-])|(?<=\\[nrtbfv])|(?<=\\u[0-9A-Fa-f]{4}))([A-Za-z][A-Za-z0-9+.-]*:(?:\/\/|\\\/\\\/))(?:[^\s\/?#@"'<>\\]+@)?((?:[^\s?#"'<>\\]|\\\/)+)(\?(?:[^\s#"'<>\\]|\\\/)*)?(#(?:[^\s"'<>\\]|\\\/)*)?`,
   "g",
 );
+/** A URL authority that is `host[:port]`: a name or address, or a bracketed IPv6 address, with at most a numeric port. */
+const HOST_AND_PORT_PATTERN = /^(?:\[[^\]\s]*\]|[^:\[\]@\\]+)(?::\d*)?$/;
+/** The first path separator of a host-and-path run, plain or JSON-escaped. */
+const PATH_START_PATTERN = /\\?\//;
+
+/**
+ * Renders one URL match: the userinfo is gone (the pattern never captures it) and the query and the fragment
+ * are the marker. An authority that is not `host[:port]` followed by an `@` later in the run is a userinfo
+ * whose password carried a raw `?` or `#`, so everything up to that `@` goes and the URL after it is rendered
+ * on its own; with a valid authority the `@` belongs to the query or the fragment.
+ */
+function scrubUrlMatch(_match: string, scheme: string, hostPath: string, query?: string, fragment?: string): string {
+  const pathStart = hostPath.search(PATH_START_PATTERN);
+  const tail = `${query ?? ""}${fragment ?? ""}`;
+  const at = tail.indexOf("@");
+  if (pathStart === -1 && at !== -1 && !HOST_AND_PORT_PATTERN.test(hostPath)) {
+    return `${scheme}${tail.slice(at + 1)}`.replace(ERROR_URL_PATTERN, scrubUrlMatch);
+  }
+  return `${scheme}${hostPath}${query ? `?${REDACTED_ERROR_VALUE}` : ""}${fragment ? `#${REDACTED_ERROR_VALUE}` : ""}`;
+}
 
 /**
  * Rule 9 scrub boundary for bare values. A run of 16 or more token characters is removed when it is shaped
@@ -1276,12 +1298,10 @@ export function redactErrorText(text: string): string {
   return scrubLongTokens(scrubbed);
 }
 
-/** The carrier passes shared by error text and snapshot strings: configured secrets, URL userinfo and query, header carriers, Authorization parameter lists, challenge proofs, quoted values, schemes, vendor token prefixes, JWT and PEM shapes. */
+/** The carrier passes shared by error text and snapshot strings: configured secrets, URL userinfo, query, and fragment, header carriers, Authorization parameter lists, challenge proofs, quoted values, schemes, vendor token prefixes, JWT and PEM shapes. */
 function scrubCarriers(text: string): string {
   let scrubbed = scrubConfiguredSecrets(text);
-  scrubbed = scrubbed.replace(ERROR_URL_PATTERN, (_match: string, scheme: string, hostPath: string, query?: string) =>
-    `${scheme}${hostPath}${query ? `?${REDACTED_ERROR_VALUE}` : ""}`,
-  );
+  scrubbed = scrubbed.replace(ERROR_URL_PATTERN, scrubUrlMatch);
   scrubbed = scrubHeaderCarriers(scrubbed);
   scrubbed = scrubAuthorizationParameters(scrubbed);
   scrubbed = scrubChallengeParameters(scrubbed);
@@ -1291,7 +1311,7 @@ function scrubCarriers(text: string): string {
 
 /**
  * Rule 9 data-side scrub for a string kept in a snapshot (reviewer D round 5 depth control): the carrier rules of
- * redactErrorText (the configured secrets in every encoded form, URL userinfo and query strings, the free-form
+ * redactErrorText (the configured secrets in every encoded form, URL userinfo, query, and fragment strings, the free-form
  * header carriers, the proofs in Authorization parameter lists and in challenges, quoted header and pair values,
  * authorization schemes, vendor token prefixes, JWT and PEM shapes, and credential-named pairs) without its
  * bare-shape rules, so a value is removed for what carries it and an identifier, a digest, or a key id that is

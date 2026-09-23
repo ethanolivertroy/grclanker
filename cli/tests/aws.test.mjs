@@ -2854,7 +2854,7 @@ test("rule 9 credential-named pairs (reviewer D round 5 baseline): a value under
   }
 });
 
-test("rule 9 URL userinfo boundary (CodeRabbit on #76 at b0ef16f): an `@` inside a query or a fragment is not a userinfo boundary, so the real host stays, a query becomes the marker whole, and a fragment is kept, on the error sink, the data-string sink, and a snapshot string", () => {
+test("rule 9 URL userinfo boundary (CodeRabbit on #76 at b0ef16f; the raw ? or # inside a password from the merge-first delta against main on 7c7bf86): an `@` inside a query or a fragment is not a userinfo boundary when the authority before it is a host, so the real host stays and a query and a fragment each become the marker whole, while an authority that is not host[:port] followed by an `@` is userinfo, so a password holding a raw `?` or `#` goes whole, on the error sink, the data-string sink, and a snapshot string", () => {
   assertUrlUserinfoBoundaryRows(assert, redactErrorText, { label: "aws.redactErrorText" });
   assertUrlUserinfoBoundaryRows(assert, redactCarrierText, { label: "aws.redactCarrierText" });
   assertUrlUserinfoBoundaryRows(assert, (text) => scrubSnapshotValue(text), { label: "aws.scrubSnapshotValue" });
