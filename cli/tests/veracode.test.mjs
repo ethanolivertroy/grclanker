@@ -2662,3 +2662,21 @@ test("data-side ruling: vendor-prefixed tokens, JWTs, PEM blocks, and credential
   const scanCoverage = JSON.parse(files.get("core_data/scan-coverage.json"));
   assert.equal(scanCoverage.applications.items[0].profile.description, REDACTED_NOTE, "the application description keeps its prose and the cluster name around the removed shapes");
 });
+
+const REGISTERED_SECRET = "registry-passphrase-2026-echo";
+
+test("item 7: once a client is constructed its configured API key secret is removed by redactSnapshot on a string leaf and by scrubDataText and scrubErrorText called without it, in every encoded form, while the API key id stays", () => {
+  const leaf = `the value ${REGISTERED_SECRET} was echoed by the proxy`;
+  assert.equal(redactSnapshot(leaf), leaf, "before any client carries the value, the data side keeps a word-shaped run");
+  assert.equal(scrubErrorText(`auth_method=${REGISTERED_SECRET}`), `auth_method=${REGISTERED_SECRET}`, "before any client carries the value, a setting keeps a word-shaped run");
+
+  new VeracodeApiClient(sampleConfig({ apiKeyId: "registry-key-id-2026", apiKeySecret: REGISTERED_SECRET }), { fetchImpl: async () => new Response("{}", { status: 200, headers: { "content-type": "application/json" } }) });
+  assert.equal(redactSnapshot(leaf), "the value [REDACTED] was echoed by the proxy");
+  assert.equal(scrubDataText(`{"detail":"${REGISTERED_SECRET}"}`), '{"detail":"[REDACTED]"}');
+  assert.equal(scrubErrorText(`auth_method=${REGISTERED_SECRET}`), "auth_method=[REDACTED]");
+  assert.deepEqual(
+    redactSnapshot({ note: leaf, nested: [{ text: `b64 ${Buffer.from(REGISTERED_SECRET).toString("base64")} end` }], count: 2 }),
+    { note: "the value [REDACTED] was echoed by the proxy", nested: [{ text: "b64 [REDACTED] end" }], count: 2 },
+  );
+  assert.equal(redactSnapshot("key id registry-key-id-2026 is an identifier"), "key id registry-key-id-2026 is an identifier", "the API key id is not registered");
+});

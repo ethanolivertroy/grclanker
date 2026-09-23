@@ -2800,3 +2800,24 @@ test("data-side ruling: vendor-prefixed tokens, JWTs, PEM blocks, and credential
   const accessControl = JSON.parse(files.get("core_data/access-control.json"));
   assert.equal(accessControl.roles.data[0].description, REDACTED_NOTE, "the role description keeps its prose and the cluster name around the removed shapes");
 });
+
+const REGISTERED_SECRET = "registry-passphrase-2026-echo";
+
+test("item 7: once a client is constructed its configured access key and the Basic credential built from it are removed by redactSnapshot on a string leaf and by scrubDataText and scrubErrorText called without them, in every encoded form", () => {
+  const leaf = `the value ${REGISTERED_SECRET} was echoed by the proxy`;
+  const basic = Buffer.from(`suREGISTRY:${REGISTERED_SECRET}`).toString("base64");
+  assert.equal(redactSnapshot(leaf), leaf, "before any client carries the value, the data side keeps a word-shaped run");
+  assert.equal(redactSnapshot(`credential ${basic} echoed`), `credential ${basic} echoed`, "before any client carries the value, the data side keeps a bare base64 run");
+  assert.equal(scrubErrorText(`auth_method=${REGISTERED_SECRET}`), `auth_method=${REGISTERED_SECRET}`, "before any client carries the value, a setting keeps a word-shaped run");
+
+  new SumologicApiClient(sampleConfig({ accessId: "suREGISTRY", accessKey: REGISTERED_SECRET }), { fetchImpl: async () => jsonResponse({}) });
+  assert.equal(redactSnapshot(leaf), "the value [REDACTED] was echoed by the proxy");
+  assert.equal(redactSnapshot(`credential ${basic} echoed`), "credential [REDACTED] echoed", "the Basic credential is registered beside the access key");
+  assert.equal(scrubDataText(`{"detail":"${REGISTERED_SECRET}"}`), '{"detail":"[REDACTED]"}');
+  assert.equal(scrubErrorText(`auth_method=${REGISTERED_SECRET}`), "auth_method=[REDACTED]");
+  assert.deepEqual(
+    redactSnapshot({ note: leaf, nested: [{ text: `b64 ${Buffer.from(REGISTERED_SECRET).toString("base64")} end` }], count: 2 }),
+    { note: "the value [REDACTED] was echoed by the proxy", nested: [{ text: "b64 [REDACTED] end" }], count: 2 },
+  );
+  assert.equal(redactSnapshot("access id suREGISTRY is an identifier"), "access id suREGISTRY is an identifier", "the access id is not registered");
+});

@@ -19,7 +19,7 @@ import { basename, dirname, join, relative, resolve } from "node:path";
 import { createHmac, randomBytes } from "node:crypto";
 import { ZipArchive } from "archiver";
 import { Type } from "@sinclair/typebox";
-import { REDACTED_VALUE, isSensitiveArgumentKey, scrubSensitiveValues } from "../../flue/redact.js";
+import { REDACTED_VALUE, isSensitiveArgumentKey, scrubSensitiveValues, scrubbedFormsOf } from "../../flue/redact.js";
 import { errorResult, formatTable, textResult } from "./shared.js";
 
 type FetchImpl = typeof fetch;
@@ -476,8 +476,39 @@ function scrubBareTokens(text: string): string {
   );
 }
 
+// The credentials this process has configured or minted (a client's token, private key, client
+// assertion, and the access token or session it obtained), so every scrub pass removes them without
+// being handed the client: redactSnapshot on a string leaf, an error text built outside the client.
+// Each entry keeps its encoded forms, lower-cased, so a leaf that carries none of them is passed over
+// with a substring check; bounded so a long-lived process that mints tokens does not grow it without limit.
+const REGISTERED_SECRET_LIMIT = 64;
+interface RegisteredSecret {
+  readonly value: string;
+  readonly forms: readonly string[];
+}
+const registeredSecrets: RegisteredSecret[] = [];
+
+/** Registers the credentials a client was configured with or minted; a value under the configured-secret minimum is ignored. */
+export function registerConfiguredSecrets(values: ReadonlyArray<string | undefined>): void {
+  for (const value of values) {
+    if (typeof value !== "string" || value.length < MIN_CONFIGURED_SECRET_LENGTH || registeredSecrets.some((entry) => entry.value === value)) continue;
+    const forms = [...new Set(scrubbedFormsOf(value).map((form) => form.toLowerCase()))].filter((form) => form.length >= MIN_CONFIGURED_SECRET_LENGTH);
+    registeredSecrets.push({ value, forms });
+    if (registeredSecrets.length > REGISTERED_SECRET_LIMIT) registeredSecrets.shift();
+  }
+}
+
+/** The registered credentials whose encoded forms may occur in the text; a text that carries none skips the full pass. */
+function registeredSecretsIn(text: string): string[] {
+  if (registeredSecrets.length === 0) return [];
+  const lower = text.toLowerCase();
+  if (lower.length !== text.length) return registeredSecrets.map((entry) => entry.value);
+  return registeredSecrets.filter((entry) => entry.forms.some((form) => lower.includes(form))).map((entry) => entry.value);
+}
+
+/** Removes the secrets handed in and every registered credential in each encoded form. */
 function scrubConfiguredSecrets(text: string, secrets: ReadonlyArray<string | undefined>): string {
-  const values = secrets.filter((value): value is string => typeof value === "string" && value.length >= MIN_CONFIGURED_SECRET_LENGTH);
+  const values = [...new Set([...secrets, ...registeredSecretsIn(text)])].filter((value): value is string => typeof value === "string" && value.length >= MIN_CONFIGURED_SECRET_LENGTH);
   if (values.length === 0) return text;
   return scrubSensitiveValues(text, values).split(REDACTED_VALUE).join(REDACTED);
 }
@@ -1287,6 +1318,7 @@ export class VeracodeApiClient {
     this.config = config;
     this.fetchImpl = options.fetchImpl ?? fetch;
     this.sleep = options.sleep ?? ((ms) => new Promise((done) => setTimeout(done, ms)));
+    registerConfiguredSecrets([config.apiKeySecret]);
   }
 
   getResolvedConfig(): VeracodeResolvedConfig {

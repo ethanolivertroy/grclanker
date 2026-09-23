@@ -2774,3 +2774,24 @@ test("data-side ruling: vendor-prefixed tokens, JWTs, PEM blocks, and credential
   const apps = JSON.parse(files.get("core_data/apps.json"));
   assert.equal(apps.entries.find((item) => item.name === "search").content.description, REDACTED_NOTE, "the app description keeps its prose and the cluster name around the removed shapes");
 });
+
+const REGISTERED_SECRET = "registry-passphrase-2026-echo";
+
+test("item 7: once a client is constructed its configured credential is removed by redactSnapshot on a string leaf and by scrubDataText and scrubErrorText called without it, in every encoded form, and the session key the client obtains joins it", async () => {
+  const leaf = `the value ${REGISTERED_SECRET} was echoed by the proxy`;
+  assert.equal(redactSnapshot(leaf), leaf, "before any client carries the value, the data side keeps a word-shaped run");
+  assert.equal(scrubErrorText(`auth_method=${REGISTERED_SECRET}`), `auth_method=${REGISTERED_SECRET}`, "before any client carries the value, a setting keeps a word-shaped run");
+
+  const { fetchImpl } = createFetch(HARDENED);
+  const api = new SplunkApiClient(sampleConfig({ token: undefined, username: "svc", password: REGISTERED_SECRET }), { fetchImpl, retryDelayMs: 0 });
+  assert.equal(redactSnapshot(leaf), "the value [REDACTED] was echoed by the proxy");
+  assert.equal(scrubDataText(`{"detail":"${REGISTERED_SECRET}"}`), '{"detail":"[REDACTED]"}');
+  assert.equal(scrubErrorText(`auth_method=${REGISTERED_SECRET}`), "auth_method=[REDACTED]");
+  assert.deepEqual(
+    redactSnapshot({ note: leaf, nested: [{ text: `b64 ${Buffer.from(REGISTERED_SECRET).toString("base64")} end` }], count: 2 }),
+    { note: "the value [REDACTED] was echoed by the proxy", nested: [{ text: "b64 [REDACTED] end" }], count: 2 },
+  );
+
+  await api.getServerInfo();
+  assert.equal(redactSnapshot("echoed session-key-abc here"), "echoed [REDACTED] here", "the session key is registered when the login answers");
+});

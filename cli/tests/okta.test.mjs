@@ -3578,3 +3578,34 @@ test("data-side ruling: vendor-prefixed tokens, JWTs, PEM blocks, and credential
   assert.equal(app.description, REDACTED_NOTE, "the app description keeps its prose and the cluster name around the removed shapes");
   assert.equal(app.settings.notes.enduser, REDACTED_NOTE, "the end-user note is walked the same way");
 });
+
+const REGISTERED_SECRET = "registry-passphrase-2026-echo";
+const MINTED_ACCESS_TOKEN = "Mk2Pq8Rt4Vw6Xy1Zb3Cd5Fg7Hj9Ln0Ns";
+
+test("item 7: once a client is constructed its configured credential is removed by redactSnapshot on a string leaf and by scrubDataText and scrubErrorText called without it, in every encoded form, and the access token the client mints joins it", async () => {
+  const leaf = `the value ${REGISTERED_SECRET} was echoed by the proxy`;
+  assert.equal(redactSnapshot(leaf), leaf, "before any client carries the value, the data side keeps a word-shaped run");
+  assert.equal(scrubErrorText(`auth_method=${REGISTERED_SECRET}`), `auth_method=${REGISTERED_SECRET}`, "before any client carries the value, a setting keeps a word-shaped run");
+
+  new OktaAuditorClient({ orgUrl: "https://registry.example.okta.com", authMode: "SSWS", token: REGISTERED_SECRET, scopes: [], sourceChain: ["tests"] });
+  assert.equal(redactSnapshot(leaf), "the value [REDACTED] was echoed by the proxy");
+  assert.equal(scrubDataText(`{"detail":"${REGISTERED_SECRET}"}`), '{"detail":"[REDACTED]"}');
+  assert.equal(scrubErrorText(`auth_method=${REGISTERED_SECRET}`), "auth_method=[REDACTED]");
+  assert.deepEqual(
+    redactSnapshot({ note: leaf, nested: [{ text: `b64 ${Buffer.from(REGISTERED_SECRET).toString("base64")} end` }], count: 2 }),
+    { note: "the value [REDACTED] was echoed by the proxy", nested: [{ text: "b64 [REDACTED] end" }], count: 2 },
+  );
+
+  const fetchImpl = async (input) => {
+    const url = new URL(typeof input === "string" ? input : input.url);
+    if (url.pathname === "/oauth2/v1/token") return new Response(JSON.stringify({ access_token: MINTED_ACCESS_TOKEN, expires_in: 3600 }), { status: 200, headers: { "content-type": "application/json" } });
+    return new Response(JSON.stringify([]), { status: 200, headers: { "content-type": "application/json" } });
+  };
+  const client = new OktaAuditorClient(
+    { orgUrl: "https://registry.example.okta.com", authMode: "PrivateKey", clientId: "registry-client", clientAssertion: "registry-assertion-jwt", scopes: ["okta.users.read"], sourceChain: ["tests"] },
+    { fetchImpl },
+  );
+  assert.equal(redactSnapshot(`minted ${MINTED_ACCESS_TOKEN} echoed`), `minted ${MINTED_ACCESS_TOKEN} echoed`, "the data side keeps a bare run it has not been told about");
+  await client.getJson("/api/v1/users");
+  assert.equal(redactSnapshot(`minted ${MINTED_ACCESS_TOKEN} echoed`), "minted [REDACTED] echoed", "the minted access token is registered when it is obtained");
+});

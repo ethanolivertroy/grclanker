@@ -3496,3 +3496,22 @@ test("data-side ruling: vendor-prefixed tokens, JWTs, PEM blocks, and credential
   const policies = JSON.parse(files.get("core_data/show_network_policies.json"));
   assert.equal(policies.rows[0].comment, REDACTED_NOTE, "the policy comment keeps its prose and the cluster name around the removed shapes");
 });
+
+const REGISTERED_SECRET = "registry-passphrase-2026-echo";
+
+test("item 7: once a client is constructed its configured passphrase, token, and private key are removed by redactSnapshot on a string leaf and by scrubDataText and redactSecrets called without them, in every encoded form", () => {
+  const leaf = `the value ${REGISTERED_SECRET} was echoed by the proxy`;
+  const pemBodyLine = TEST_PRIVATE_KEY_PEM.split("\n")[1];
+  assert.equal(redactSnapshot(leaf), leaf, "before any client carries the value, the data side keeps a word-shaped run");
+  assert.equal(redactSecrets(`auth_method=${REGISTERED_SECRET}`), `auth_method=${REGISTERED_SECRET}`, "before any client carries the value, a setting keeps a word-shaped run");
+
+  new SnowflakeSqlClient(sampleConfig({ privateKeyPassphrase: REGISTERED_SECRET }), { fetchImpl: async () => jsonResponse({}) });
+  assert.equal(redactSnapshot(leaf), "the value [REDACTED] was echoed by the proxy");
+  assert.equal(scrubDataText(`{"detail":"${REGISTERED_SECRET}"}`), '{"detail":"[REDACTED]"}');
+  assert.equal(redactSecrets(`auth_method=${REGISTERED_SECRET}`), "auth_method=[REDACTED]");
+  assert.equal(redactSnapshot(`line ${pemBodyLine} end`), "line [REDACTED] end", "each line of the configured private key is a registered form");
+  assert.deepEqual(
+    redactSnapshot({ note: leaf, nested: [{ text: `b64 ${Buffer.from(REGISTERED_SECRET).toString("base64")} end` }], count: 2 }),
+    { note: "the value [REDACTED] was echoed by the proxy", nested: [{ text: "b64 [REDACTED] end" }], count: 2 },
+  );
+});
