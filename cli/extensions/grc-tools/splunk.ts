@@ -502,13 +502,13 @@ function isWebhookKey(segments: readonly string[]): boolean {
   return URL_KEY_SUFFIXES.has(segments[segments.length - 1] ?? "") && segments.slice(0, -1).some((segment) => WEBHOOK_URL_WORDS.has(segment));
 }
 
-/** Authorization, Proxy-Authorization, and WWW-Authenticate carry a scheme word in front of the credential; every other key's value goes whatever word it starts with. */
 /** Whether a key's last word is a credential noun or the key is a bearer id: the test a bare path label must pass to be read as a pair. */
 function namesCredential(key: string): boolean {
   const segments = keySegments(key);
   return CREDENTIAL_NOUN_PATTERN.test(segments[segments.length - 1] ?? "") || isBearerIdKey(key, segments);
 }
 
+/** Authorization, Proxy-Authorization, and WWW-Authenticate carry a scheme word in front of the credential; every other key's value goes whatever word it starts with. */
 function isAuthorizationStyleKey(segments: readonly string[]): boolean {
   return segments[segments.length - 1] === "authorization" || segments.slice(-2).join("_") === "www_authenticate";
 }
