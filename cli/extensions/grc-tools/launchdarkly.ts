@@ -767,6 +767,12 @@ function requestLabel(url: string): string {
   return `GET ${parsed.pathname}${query ? `?${query}` : ""}`;
 }
 
+/** The page size a next link asks for, read from its own limit parameter; undefined when the link names none. */
+function requestedLimit(url: string): number | undefined {
+  const value = asNumber(new URL(url).searchParams.get("limit"));
+  return value !== undefined && Number.isInteger(value) && value > 0 ? value : undefined;
+}
+
 /**
  * The label of the request a collector issues for a path and query, built the same way the client labels the request
  * it sends. Used only when no request was observed (a client that returns plain arrays), so a caveat can still name the
@@ -1660,7 +1666,10 @@ export class LaunchdarklyApiClient {
     let total: number | undefined;
     let remaining = false;
     let truncationReason: string | undefined;
-    let nextUrl: string | undefined = this.buildUrl(path, { ...query, limit: Math.min(pageSize, limit), offset });
+    // The page size each request asks for: the first request's own, then the limit a followed next link carries
+    // (undefined when the link names none), then the size this client sets when it pages by offset.
+    let requestedPageSize: number | undefined = Math.min(pageSize, limit);
+    let nextUrl: string | undefined = this.buildUrl(path, { ...query, limit: requestedPageSize, offset });
     const endpoint = requestLabel(nextUrl);
     const visited = new Set<string>([nextUrl]);
 
@@ -1689,6 +1698,7 @@ export class LaunchdarklyApiClient {
       if (nextHref) {
         try {
           nextUrl = this.buildUrl(nextHref);
+          requestedPageSize = requestedLimit(nextUrl);
         } catch (error) {
           if (!(error instanceof LaunchdarklyForeignOriginError)) throw error;
           // The link is refused before any request is built: the pages already read stay, the rest is reported unseen.
@@ -1697,11 +1707,14 @@ export class LaunchdarklyApiClient {
           break;
         }
       } else if (total !== undefined && offset < total && pageItems.length >= Math.min(pageSize, limit)) {
-        nextUrl = this.buildUrl(path, { ...query, limit: Math.min(pageSize, limit - items.length), offset });
+        requestedPageSize = Math.min(pageSize, limit - items.length);
+        nextUrl = this.buildUrl(path, { ...query, limit: requestedPageSize, offset });
       } else {
-        // A full last page at the cap with neither a total nor a next link is the API's end signal, but it is
-        // indistinguishable from a server that omitted both, so the remainder is reported unseen rather than absent.
-        remaining = total === undefined && items.length >= limit;
+        // A last page shorter than the size requested for it is the end of the listing, even when it lands on the cap.
+        // A page as long as requested at the cap with neither a total nor a next link is indistinguishable from a
+        // server that omitted both, as is a page whose request named no size, so that remainder is reported unseen
+        // rather than absent.
+        remaining = total === undefined && items.length >= limit && (requestedPageSize === undefined || pageItems.length >= requestedPageSize);
         nextUrl = undefined;
       }
       if (nextUrl && visited.has(nextUrl)) {

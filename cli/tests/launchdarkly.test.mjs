@@ -470,6 +470,41 @@ test("LaunchdarklyApiClient signals truncation when _links.next remains at the l
   assert.equal(belowCap.seen, 2);
 });
 
+test("LaunchdarklyApiClient reads a last page against the size its own request asked for: a short page at the cap ends the listing, a full page at the cap stays truncated", async () => {
+  const listingOf = (count, { linkLimit = true } = {}) => async (input) => {
+    const url = new URL(typeof input === "string" ? input : input.toString());
+    const limit = Number(url.searchParams.get("limit") ?? "2");
+    const offset = Number(url.searchParams.get("offset") ?? "0");
+    const items = Array.from({ length: count }, (_, index) => ({ _id: `m${index + 1}` })).slice(offset, offset + limit);
+    const nextHref = linkLimit ? `/api/v2/members?limit=${limit}&offset=${offset + limit}` : `/api/v2/members?offset=${offset + limit}`;
+    return jsonResponse({ items, ...(offset + limit < count ? { _links: { next: { href: nextHref } } } : {}) });
+  };
+  const list = (count, options = {}, limit = 3) => new LaunchdarklyApiClient(sampleConfig(), { fetchImpl: listingOf(count, options) }).list("/api/v2/members", {}, { limit, pageSize: 2 });
+
+  const three = await list(3);
+  assert.deepEqual(three.items.map((member) => member._id), ["m1", "m2", "m3"]);
+  assert.equal(three.truncated, false, "a second page of one where two were requested is the end of the listing, even though it lands on the cap");
+  assert.equal(three.seen, 3);
+  assert.equal(three.total, undefined);
+  assert.equal(three.truncationReason, undefined);
+
+  for (const count of [4, 5]) {
+    const listing = await list(count);
+    assert.deepEqual(listing.items.map((member) => member._id), ["m1", "m2", "m3"]);
+    assert.equal(listing.truncated, true, `a full second page at the cap leaves ${count - 3} of ${count} unseen`);
+    assert.equal(listing.seen, 3);
+    assert.equal(listing.truncationReason, undefined, "a cap exit still carries the option remedy");
+  }
+
+  const fullLastPage = await list(4, {}, 4);
+  assert.equal(fullLastPage.seen, 4);
+  assert.equal(fullLastPage.truncated, true, "a second page as long as requested that lands on the cap with neither totalCount nor _links.next cannot prove the remainder empty");
+
+  const unsized = await list(3, { linkLimit: false });
+  assert.deepEqual(unsized.items.map((member) => member._id), ["m1", "m2", "m3"]);
+  assert.equal(unsized.truncated, true, "a next link that names no limit leaves the requested size unknown, so a page at the cap cannot be read as short");
+});
+
 test("verdict rule 10: a member page full at member_limit with neither totalCount nor _links.next demotes LD-03 and LD-11 with the member_limit remedy", async () => {
   const members = [
     { _id: "m1", email: "owner-one@example.com", role: "owner", mfa: "enabled", _lastSeen: RECENT_MS },
