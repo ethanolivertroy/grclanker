@@ -127,10 +127,11 @@ const URL_PARTS_PATTERN = /^([a-z][a-z0-9+.-]*:(?:\/\/|\\\/\\\/))(?:[^\s\/?#@"'<
 const TRAILING_PUNCTUATION_PATTERN = /[.,;:!?]+$/;
 
 // A relative path or bare query string: the named parameter keeps its name, the value goes. A
-// backslash ends the value so a JSON-escaped closing quote is kept, and so does ";": a cookie pair
-// whose name begins with "&" (`Cookie: &sid=<v>; pref=<v>`) is matched here first, and the ";" must
-// stay for the cookie reader to read the later pair (CodeRabbit r4077655607, review of #78 row E).
-const QUERY_PAIR_PATTERN = /([?&])([A-Za-z0-9_.[\]-]+)=(?!\[REDACTED\])([^&#;\s"'<>\\]+)/g;
+// backslash ends the value so a JSON-escaped closing quote is kept. A ";" does not end it:
+// `URLSearchParams` reads `?token=<v>;<rest>` as one value, so the run to the next "&", "#", or space
+// goes whole (Codex r4080768613 on #81; the ";" boundary belongs to the cookie reader, which runs
+// before this rule so a cookie pair whose name begins with "&" or "#" never reaches it).
+const QUERY_PAIR_PATTERN = /([?&])([A-Za-z0-9_.[\]-]+)=(?!\[REDACTED\])([^&#\s"'<>\\]+)/g;
 
 // Carriers. Each carrier pattern matches a name and its separator only; the value that follows is read
 // by a quote-aware reader (see "Carrier values"), never by the pattern, so a quoted value is removed
@@ -877,8 +878,8 @@ const readFlagArgument: ValueReader = (text, valueStart, carrier) => (isCredenti
  * character stands right after it, the run names one more pair and that quoted value belongs to it
  * (`theme=dark#sid=\"<v>\"`, review of #78 row E). A quote there that runs unterminated or encloses
  * prose is the quote of a header line quoted whole (`'Cookie: sid=<base64>==' then ...`) and ends the
- * value. A marker an earlier rule left at the end of the value (`&sid=[REDACTED]` after the query
- * rule) is part of it, so the attributes or the later pairs after the marker are still read.
+ * value. A marker the URL rule left at the end of the value (`return_to=https://x/y?[REDACTED]`) is
+ * part of it, so the attributes or the later pairs after the marker are still read.
  */
 function cookieValueEnd(text: string, index: number): number {
   const quoted = readQuotedValue(text, index);
@@ -895,11 +896,13 @@ function cookieValueEnd(text: string, index: number): number {
 /**
  * Reads a Cookie or Set-Cookie header value: quoted whole; `name=value` (spaces around "=" allowed)
  * followed by attributes (`; Path=/; HttpOnly`) whose values may themselves be quoted; or a bare run
- * after the singular header name. The whole header value is replaced by one marker, a marker an
- * earlier rule left in it (`Cookie: &sid=[REDACTED]; pref=<v>` after the query rule) folded in with
- * the pairs after it. The value ends at ",", at a `; Name:` token (the next header on a compound
- * line, which is never a cookie attribute, so the ";" and the name stay for that header's own rule),
- * or at the line end.
+ * after the singular header name. The whole header value is replaced by one marker, a marker the URL
+ * rule left in it (`Cookie: return_to=https://x/y?[REDACTED]; pref=<v>`) folded in with the pairs
+ * after it. The reader runs before the query-pair rule, so the ";" between pairs and attributes is
+ * read here alone and a pair whose name begins with "&" or "#" (`Cookie: &sid=<v>; pref=<v>`, review
+ * of #78 row E) is a cookie pair, not a query pair. The value ends at ",", at a `; Name:` token (the
+ * next header on a compound line, which is never a cookie attribute, so the ";" and the name stay for
+ * that header's own rule), or at the line end.
  */
 const readCookieHeaderValue: ValueReader = (text, valueStart, carrier) => {
   const quoted = readQuotedValue(text, valueStart);
@@ -1037,9 +1040,13 @@ export function scrubErrorText(text: string, options: ScrubErrorTextOptions = {}
   scrubbed = scrubbed
     .replace(PEM_BLOCK_PATTERN, REDACTED)
     .replace(PEM_OPEN_PATTERN, REDACTED)
-    .replace(EMBEDDED_URL_PATTERN, scrubEmbeddedUrl)
-    .replace(QUERY_PAIR_PATTERN, scrubQueryPair);
+    .replace(EMBEDDED_URL_PATTERN, scrubEmbeddedUrl);
+  // The cookie reader runs before the query-pair rule: the ";" between a cookie's pairs and attributes
+  // is its boundary alone, so a cookie pair whose name begins with "&" or "#" (`Cookie: &sid=<v>;
+  // pref=<v>`) is read whole here rather than as a query pair, and a query value keeps running through
+  // ";" (Codex r4080768613 on #81).
   scrubbed = replaceCarrierValues(scrubbed, COOKIE_HEADER_PATTERN, readCookieHeaderValue);
+  scrubbed = scrubbed.replace(QUERY_PAIR_PATTERN, scrubQueryPair);
   scrubbed = replaceCarrierValues(scrubbed, CREDENTIAL_HEADER_PATTERN, readHeaderValue);
   // The pair rules read a scheme word at the start of their value as the value (see `readCarrierValue`),
   // so they run before the bare scheme-word rule, which would otherwise keep the word and leave

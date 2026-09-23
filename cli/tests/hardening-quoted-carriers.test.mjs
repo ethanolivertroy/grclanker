@@ -561,13 +561,14 @@ const REQUEST_ID_HEADER = "X-Request-Id: 5add72d1-b870-423d-a911-7f51772d8e6a";
 
 /**
  * Review of #78 row E (CodeRabbit r4077655607 on `dd7426e`; leak-probe class 3): a cookie pair whose
- * name begins with "&" is matched by the query rule before the cookie reader runs, and a query value
- * that took the ";" with it ended the cookie there, so the later pair survived (`Cookie: [REDACTED]
- * pref=<v>`). A query value now ends at ";", and the cookie reader folds the marker in and reads the
- * pairs and attributes after it. A bare cookie run that ends in "=" (`theme=dark#sid=`,
- * `theme=dark&sid=`) names one more pair whose JSON-escaped quoted value belongs to it, so that value
- * goes with the header rather than standing after the marker. The header after the cookie keeps its
- * name and value in every row.
+ * name begins with "&" was matched by the query rule before the cookie reader ran, and the query
+ * value took the ";" with it and ended the cookie there, so the later pair survived (`Cookie:
+ * [REDACTED] pref=<v>`). The cookie reader now runs before the query rule and reads the pairs and
+ * attributes whole, the ";" its boundary alone; a query value keeps running through ";" as on main
+ * (Codex r4080768613 on #81, see the test after this one). A bare cookie run that ends in "="
+ * (`theme=dark#sid=`, `theme=dark&sid=`) names one more pair whose JSON-escaped quoted value belongs
+ * to it, so that value goes with the header rather than standing after the marker. The header after
+ * the cookie keeps its name and value in every row.
  */
 const AMPERSAND_COOKIE_ROWS = Object.freeze([
   ["ampersand name, then a later pair", (a, b) => `Cookie: &sid=${a}; pref=${b}`, () => `Cookie: ${REDACTED}`, []],
@@ -580,7 +581,7 @@ const AMPERSAND_COOKIE_ROWS = Object.freeze([
   ["later ampersand name with a JSON-escaped quoted value", (a) => `Cookie: theme=dark; my&sid=\\"${a}\\"; ${REQUEST_ID_HEADER}`, () => `Cookie: ${REDACTED}; ${REQUEST_ID_HEADER}`, [REQUEST_ID_HEADER]],
   ["bare run ending in =, then a quoted value, then attributes", (a) => `Set-Cookie: theme=dark&sid="${a}"; Path=/; HttpOnly`, () => `Set-Cookie: ${REDACTED}`, []],
   ["ampersand name in a JSON-escaped header line", (a, b) => `{"detail":"Cookie: &sid=${a}; pref=${b}; ${REQUEST_ID_HEADER}"}`, () => `{"detail":"Cookie: ${REDACTED}; ${REQUEST_ID_HEADER}"}`, [REQUEST_ID_HEADER]],
-  ["query value ends at the cookie separator, the pair after it keeps its name", (a) => `GET /v1/users?api_key=${a};x=1 failed`, () => `GET /v1/users?api_key=${REDACTED};x=1 failed`, [";x=1 failed"]],
+  ["a query value runs through a semicolon, which is not a cookie separator there", (a) => `GET /v1/users?api_key=${a};x=1 failed`, () => `GET /v1/users?api_key=${REDACTED} failed`, [" failed"]],
 ]);
 
 test("#78 row E: an ampersand or hash cookie name takes the whole header value with the pairs after it, a bare run ending in = owns the quoted value after it, and the following header stays", () => {
@@ -608,14 +609,72 @@ test("#78 row E: an ampersand or hash cookie name takes the whole header value w
   // The renderings the review reported, with the literal values it used: the later pair survived.
   assert.equal(scrubErrorText("Cookie: &sid=hunter2; pref=dark"), `Cookie: ${REDACTED}`);
   assert.equal(scrubDataText("Cookie: theme=dark#sid=\\\"hunter2\\\"; X-Request-Id: 1"), `Cookie: ${REDACTED}; X-Request-Id: 1`);
-  // A ";" still ends a bare query value, so a later query pair on a path keeps its name.
-  assert.equal(scrubErrorText("GET /v1/users?api_key=abcdef123456;page=2 failed"), `GET /v1/users?api_key=${REDACTED};page=2 failed`);
+  // A ";" does not end a bare query value: `URLSearchParams` reads it as part of the value.
+  assert.equal(scrubErrorText("GET /v1/users?api_key=abcdef123456;page=2 failed"), `GET /v1/users?api_key=${REDACTED} failed`);
   // Base64 padding before the closing quote of a header line quoted whole: the quote after "==" runs
   // unterminated or encloses prose, so it ends the value rather than opening one.
   assert.equal(scrubErrorText("sent 'Cookie: sid=dGhpcyBpcyBhIHNlY3JldA==' then 'Accept: text/html'"), `sent 'Cookie: ${REDACTED}' then 'Accept: text/html'`);
   assert.equal(scrubErrorText("header -H 'Cookie: sid=dGhpcyBpcyBhIHNlY3JldA=='. Retry later"), `header -H 'Cookie: ${REDACTED}'. Retry later`);
   assert.equal(scrubErrorText('{"detail":"sent \\"Cookie: sid=dGhpcyBpcyBhIHNlY3JldA==\\", then \\"Accept: text/html\\""}'), `{"detail":"sent \\"Cookie: ${REDACTED}\\", then \\"Accept: text/html\\""}`);
   assert.equal(scrubErrorText('{"detail":"sent \\"Cookie: sid=dGhpcyBpcyBhIHNlY3JldA==\\" then \\"Accept: text/html\\""}'), `{"detail":"sent \\"Cookie: ${REDACTED}\\" then \\"Accept: text/html\\""}`);
+});
+
+/**
+ * Codex r4080768613 on #81 (P1 at `5f75c90`): the ";" boundary row E gave the query value class
+ * applied to every query pair, so `?token=<v>;<rest>` rendered `?token=[REDACTED];<rest>` and the tail
+ * of the value survived, where `02967cc` and `b47f90d` redacted through the semicolon
+ * (`URLSearchParams` reads ";" as part of the value). The value now goes whole again in the bare,
+ * relative, absolute, slash-escaped, JSON, and JSON-escaped forms, and the cookie rows above keep
+ * their rendering because the cookie reader owns the ";" and runs first. Mutation check (recorded in
+ * the round 3 body): with ";" put back in the query value class every query row here renders
+ * `[REDACTED];<rest>` and fails while the cookie rows still pass.
+ */
+const SEMICOLON_QUERY_ROWS = Object.freeze([
+  ["bare query string", (value) => `?token=${value}`, () => `?token=${REDACTED}`],
+  ["relative path", (value) => `GET /v1/x?token=${value} HTTP/1.1`, () => `GET /v1/x?token=${REDACTED} HTTP/1.1`],
+  ["later pair on a relative path", (value) => `/v1/x?a=1&token=${value}&b=2`, () => `/v1/x?a=1&token=${REDACTED}&b=2`],
+  ["bare later pair", (value) => `&api_key=${value}`, () => `&api_key=${REDACTED}`],
+  ["absolute URL", (value) => `https://host/v1/x?token=${value}`, () => `https://host/v1/x?${REDACTED}`],
+  ["absolute URL in a sentence", (value) => `GET https://host/v1/x?token=${value} failed with 401`, () => `GET https://host/v1/x?${REDACTED} failed with 401`],
+  ["slash-escaped URL", (value) => `https:\\/\\/host\\/v1\\/x?token=${value}`, () => `https:\\/\\/host\\/v1\\/x?${REDACTED}`],
+  ["relative path in a JSON string", (value) => `{"url":"/v1/x?token=${value}"}`, () => `{"url":"/v1/x?token=${REDACTED}"}`],
+  ["absolute URL in a JSON string", (value) => `{"url":"https://host/v1/x?token=${value}"}`, () => `{"url":"https://host/v1/x?${REDACTED}"}`],
+  ["relative path in a JSON-escaped string", (value) => `{\\"url\\":\\"/v1/x?token=${value}\\"}`, () => `{\\"url\\":\\"/v1/x?token=${REDACTED}\\"}`],
+  ["slash-escaped URL in a JSON-escaped string", (value) => `{\\"url\\":\\"https:\\/\\/host\\/v1\\/x?token=${value}\\"}`, () => `{\\"url\\":\\"https:\\/\\/host\\/v1\\/x?${REDACTED}\\"}`],
+]);
+
+test("Codex r4080768613 on #81: a query value runs through a semicolon, so `?token=<v>;<rest>` loses the whole value in every URL form and sink, and the cookie rows keep their rendering", () => {
+  const legitimate = new Map(SEMICOLON_QUERY_ROWS.map(([label, line]) => [label, line("")]));
+  assertCanariesDisjointFromFixture(assert, plantedValues(), legitimate, "semicolon query rows");
+  const valuePairs = [["hunter2", "restofsecret"], ...plantedPairs()];
+  for (const [label, line, expected] of SEMICOLON_QUERY_ROWS) {
+    for (const [head, tail] of valuePairs) {
+      const input = line(`${head};${tail}`);
+      for (const [scrubName, scrub] of EXACT_SCRUBS) {
+        const output = scrub(input);
+        assert.equal(output, expected(), `${scrubName}: ${label} with ${head};${tail}`);
+        assertNoCanaryWindows(assert, output, [head, tail], `${scrubName}: ${label}`);
+        assert.equal(scrub(output), output, `${scrubName}: ${label}: a second pass changed the text`);
+      }
+      assertNoCanaryWindows(assert, errorMessage(new Error(input)), [head, tail], `errorMessage: ${label}`);
+    }
+  }
+  // The row as reported, through both scrubbers and a record under `redactSecretValues`.
+  assert.equal(scrubErrorText("?token=hunter2;restofsecret"), `?token=${REDACTED}`);
+  assert.equal(scrubDataText("?token=hunter2;restofsecret"), `?token=${REDACTED}`);
+  assert.deepEqual(redactSecretValues({ request: "GET /v1/x?token=hunter2;restofsecret HTTP/1.1" }), { request: `GET /v1/x?token=${REDACTED} HTTP/1.1` });
+  // The cookie rows the ";" boundary was added for keep their rendering: the boundary is the cookie reader's.
+  for (const [text, expected] of [
+    ["Cookie: &sid=a; pref=b", `Cookie: ${REDACTED}`],
+    ["Cookie: &sid=hunter2; pref=dark", `Cookie: ${REDACTED}`],
+    ["Cookie: #sid=hunter2; pref=dark; X-Request-Id: 1", `Cookie: ${REDACTED}; X-Request-Id: 1`],
+    ["Cookie: sid=hunter2; Path=/; HttpOnly", `Cookie: ${REDACTED}`],
+    ["Set-Cookie: &sid=hunter2; Path=/; HttpOnly", `Set-Cookie: ${REDACTED}`],
+    ["Cookie: sid=hunter2; X-Request-Id: 1", `Cookie: ${REDACTED}; X-Request-Id: 1`],
+    ["Cookie: return_to=https://x/y?token=hunter2;restofsecret; pref=dark", `Cookie: ${REDACTED}`],
+  ]) {
+    for (const [scrubName, scrub] of EXACT_SCRUBS) assert.equal(scrub(text), expected, `${scrubName}: ${text}`);
+  }
 });
 
 /**
