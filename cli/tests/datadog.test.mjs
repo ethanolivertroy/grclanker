@@ -1207,6 +1207,38 @@ test("identity findings flag truncated user and role inventories instead of pass
   assert.ok(result.errors.some((error) => /roles: inventory truncated at 10 items/.test(error)));
 });
 
+test("assessDatadogIdentity honors key_limit for the application key inventory behind DD-19", async () => {
+  const requestedLimits = [];
+  const client = healthyClient({
+    async listApplicationKeys(limit) {
+      requestedLimits.push(limit);
+      return {
+        data: fill(limit, (index) => ({
+          id: `ak${index}`,
+          type: "application_keys",
+          attributes: { name: `deploy-${index}`, last4: "1111", created_at: daysAgo(10), last_used_at: daysAgo(1), scopes: ["dashboards_read"] },
+          relationships: { owned_by: { data: { id: "svc-terraform", type: "users" } } },
+        })),
+        included: [user("svc-terraform", { service_account: true, last_login_time: undefined })],
+      };
+    },
+  });
+  const capped = await assessDatadogIdentity(client, { now: NOW, keyLimit: 2 });
+  // The cap is probed with one extra record, exactly as the access control assessment does.
+  assert.deepEqual(requestedLimits, [3]);
+  const serviceAccounts = findingById(capped, "DD-19");
+  assert.equal(serviceAccounts.status, "warn");
+  assert.match(serviceAccounts.summary, /application_keys inventory is truncated at 2 items \(2 of an unknown total loaded; raise key_limit\)/);
+  assert.equal(serviceAccounts.evidence.application_keys_inventory_truncated, true);
+  assert.ok(capped.errors.some((error) => /application_keys: inventory truncated at 2 items \(2 of an unknown total loaded; more than 2 keys exist\); raise key_limit/.test(error)));
+
+  // Without key_limit the identity assessment keeps the default cap the caveat text has always advised raising.
+  requestedLimits.length = 0;
+  const defaulted = await assessDatadogIdentity(client, { now: NOW });
+  assert.deepEqual(requestedLimits, [501]);
+  assert.match(findingById(defaulted, "DD-19").summary, /application_keys inventory is truncated at 500 items/);
+});
+
 test("assessDatadogAccessControls passes on rotated keys, closed sharing, and a scoped allowlist", async () => {
   const result = await assessDatadogAccessControls(healthyClient(), { now: NOW });
   assert.equal(result.findings.length, 5);
@@ -1516,9 +1548,49 @@ test("DD-12 downgrades to warn when posture counts are truncated instead of repo
   }), { now: NOW, findingLimit: 100 });
   const cspm = findingById(truncated, "DD-12");
   assert.equal(cspm.status, "warn");
-  assert.match(cspm.summary, /carried no total_filtered_count and the paged counts hit the finding_limit/);
+  // A truncated payload that recorded no reason names the stop without inventing one, and offers only the console remedy.
+  assert.match(cspm.summary, /but the passing rate could not be measured reliably: the posture findings response carried no total_filtered_count and the paged failing and passing counts stopped early\. Capture the passing percentage from the console\./);
+  assert.doesNotMatch(cspm.summary, /finding_limit/);
   assert.equal(cspm.evidence.posture_counts_truncated, true);
+  assert.deepEqual(cspm.evidence.posture_counts_truncation_reasons, { failing: null, passing: null });
   assert.equal(cspm.evidence.posture_count_source, "paged_data");
+
+  // The finding renders the same truncation_reason the collection_status row carries; a cap stop advises finding_limit.
+  const capReason = "finding_limit (100) was reached while a next-page cursor was still present";
+  const capped = await assessDatadogSecurityMonitoring(healthyClient({
+    async listPostureFindings(options = {}) {
+      return { data: fill(options.limit ?? 100, (index) => ({ id: `f${index}` })), total_filtered_count: null, truncated: true, truncation_reason: capReason, cap_reached: true, seen: options.limit ?? 100 };
+    },
+  }), { now: NOW, findingLimit: 100 });
+  const cappedCspm = findingById(capped, "DD-12");
+  assert.equal(cappedCspm.status, "warn");
+  assert.match(cappedCspm.summary, /carried no total_filtered_count and the paged failing and passing counts stopped early because finding_limit \(100\) was reached while a next-page cursor was still present\. Raise finding_limit or capture the passing percentage from the console\./);
+  assert.deepEqual(cappedCspm.evidence.posture_counts_truncation_reasons, { failing: capReason, passing: capReason });
+
+  // A repeated cursor is the server's doing: the reason is rendered and a larger finding_limit is not offered.
+  const cursorReason = "the server repeated the same page cursor, so the remaining findings could not be counted";
+  const repeated = await assessDatadogSecurityMonitoring(healthyClient({
+    async listPostureFindings(options = {}) {
+      return options.evaluation === "fail"
+        ? { data: fill(3, (index) => ({ id: `f${index}` })), total_filtered_count: null, truncated: true, truncation_reason: cursorReason, cap_reached: false, seen: 3 }
+        : { data: fill(40, (index) => ({ id: `p${index}` })), total_filtered_count: null, truncated: false, truncation_reason: null, cap_reached: false, seen: 40 };
+    },
+  }), { now: NOW, findingLimit: 100 });
+  const repeatedCspm = findingById(repeated, "DD-12");
+  assert.equal(repeatedCspm.status, "warn");
+  assert.match(repeatedCspm.summary, /carried no total_filtered_count and the paged failing count stopped early because the server repeated the same page cursor, so the remaining findings could not be counted\. Capture the passing percentage from the console\./);
+  assert.doesNotMatch(repeatedCspm.summary, /finding_limit/);
+  assert.deepEqual(repeatedCspm.evidence.posture_counts_truncation_reasons, { failing: cursorReason, passing: null });
+
+  // Two evaluations that stopped for different reasons are each named.
+  const mixed = await assessDatadogSecurityMonitoring(healthyClient({
+    async listPostureFindings(options = {}) {
+      return options.evaluation === "fail"
+        ? { data: fill(3, (index) => ({ id: `f${index}` })), total_filtered_count: null, truncated: true, truncation_reason: cursorReason, cap_reached: false, seen: 3 }
+        : { data: fill(100, (index) => ({ id: `p${index}` })), total_filtered_count: null, truncated: true, truncation_reason: capReason, cap_reached: true, seen: 100 };
+    },
+  }), { now: NOW, findingLimit: 100 });
+  assert.match(findingById(mixed, "DD-12").summary, /the paged failing count stopped early because the server repeated the same page cursor, so the remaining findings could not be counted and the paged passing count stopped early because finding_limit \(100\) was reached while a next-page cursor was still present\. Raise finding_limit or capture the passing percentage from the console\./);
 
   const pagedToCompletion = await assessDatadogSecurityMonitoring(healthyClient({
     async listPostureFindings(options = {}) {
@@ -1998,7 +2070,7 @@ test("false-pass self-check (c): a partial inventory never passes on any of the 
   assert.match(findings.get("DD-09").summary, /truncated list/);
   assert.match(findings.get("DD-10").summary, /log_archives/);
   assert.match(findings.get("DD-11").summary, /were not returned in the included payload/);
-  assert.match(findings.get("DD-12").summary, /paged counts hit the finding_limit/);
+  assert.match(findings.get("DD-12").summary, /the paged failing and passing counts stopped early/);
   assert.match(findings.get("DD-14").summary, /confirm each uses invite-only sharing/);
   assert.equal(findings.get("DD-14").evidence.shared_dashboards_inventory_truncated, true);
   assert.match(findings.get("DD-15").summary, /returned no CIDR entries/);
@@ -2767,8 +2839,13 @@ test("exportDatadogAuditBundle writes collection_status.json with readable, comp
   assert.match(errorLog, /users: inventory truncated at 50 items \(50 of an unknown total loaded; more than 50 items exist\); raise user_limit to inspect the full list/);
   assert.match(errorLog, /org_connections: inventory truncated at 10000 items \(10000 of 12000 loaded; the listing stopped early\); raise the org connection limit/);
   const findings = JSON.parse(readFileSync(join(result.outputDir, "analysis", "findings.json"), "utf8"));
-  assert.equal(findings.find((item) => item.id === "DD-12").status, "warn");
-  assert.match(findings.find((item) => item.id === "DD-12").summary, /paged counts hit the finding_limit/);
+  const cspm = findings.find((item) => item.id === "DD-12");
+  assert.equal(cspm.status, "warn");
+  // The finding text carries the row's truncation_reason verbatim and, since the cap was not what stopped the paging, does not advise finding_limit.
+  assert.match(cspm.summary, /the paged failing count stopped early because the server repeated the same page cursor\. Capture the passing percentage from the console\./);
+  assert.ok(cspm.summary.includes(failing.truncation_reason));
+  assert.doesNotMatch(cspm.summary, /finding_limit/);
+  assert.deepEqual(cspm.evidence.posture_counts_truncation_reasons, { failing: failing.truncation_reason, passing: null });
   const orgSettings = findings.find((item) => item.id === "DD-20");
   assert.equal(orgSettings.status, "warn");
   // DD-20 already warns on the readable inventories, so the truncation caveat is recorded in evidence rather than re-demoting the verdict.
@@ -2802,6 +2879,11 @@ test("Datadog tools are registered in the tool catalog under the Datadog group",
     assert.equal(tool.group, "Datadog");
     assert.equal(tool.kind, "domain");
     assert.ok(tool.parameterSummaries.some((parameter) => parameter.name === "site"));
+  }
+  // Every tool whose caveats advise raising key_limit accepts it.
+  for (const name of ["datadog_assess_identity", "datadog_assess_access_controls", "datadog_export_audit_bundle"]) {
+    const tool = tools.find((candidate) => candidate.name === name);
+    assert.ok(tool.parameterSummaries.some((parameter) => parameter.name === "key_limit"), `${name} accepts key_limit`);
   }
 });
 
