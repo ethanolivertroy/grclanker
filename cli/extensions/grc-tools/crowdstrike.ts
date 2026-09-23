@@ -142,6 +142,124 @@ const SENSITIVE_EXCLUSION_PATH_PATTERNS = [
 ];
 const SHARED_ACCOUNT_PATTERN = /(^|[._-])(admin|administrator|root|shared|service|svc|soc|security|ops|team|helpdesk|noreply|generic|test)([._-]|$|@)/i;
 
+// Redaction pass shared by every error string and by the free-text exclusion carriers.
+const REDACTED = "[REDACTED]";
+// Falcon client secrets and bearer tokens are long; a shorter minimum would remember common words
+// (a fixture token spelled "token") and redact them out of ordinary prose such as "/oauth2/token".
+const MIN_REMEMBERED_SECRET_LENGTH = 8;
+/** Nesting beyond this depth is left as served; parsed API payloads never reach it. */
+const MAX_REDACTION_DEPTH = 32;
+const KNOWN_SECRETS = new Set<string>();
+/** The forms a remembered secret takes in an echoed body (raw, base64, base64url, URL-encoded, JSON-escaped), computed once per secret. */
+const SECRET_FORMS = new Map<string, string[]>();
+// Scrub boundary. A value inside a carrier (an Authorization, Cookie, Set-Cookie, or API key header, a
+// cookie or session assignment, URL userinfo or a query pair, a Bearer/Basic/Digest/Token/ApiKey scheme,
+// a credential-named key-value pair, a SOAP credential element) is removed whatever its shape, quoted or bare; a
+// remembered secret is removed whatever its shape and in its encoded forms; a bare value is removed only
+// when it has a real token shape (JWT, PEM block, hex digest, vendor prefix, or a 16+ character run with
+// base64 symbols, scattered digits, or token casing). A bare name-shaped value (words joined by hyphens
+// or underscores, such as prod-us-east-2026) is indistinguishable from a resource name and stays.
+// A literal JSON escape (`\n`, `\r`, `\t`, `\b`, `\f`, `\/`, `\"`, `\uXXXX`) stands right before a header, a scheme,
+// a URL, or a token in a doubly-encoded body (a gateway error whose field holds serialized JSON). Its last character is
+// a word character for most of them, so `\b` and a "not preceded by a word character" lookbehind see no boundary there;
+// every carrier and token opener of the pass therefore also starts right after one, and no token shape starts inside one.
+const JSON_ESCAPE = String.raw`\\(?:u[0-9a-fA-F]{4}|[nrtbf/"])`;
+const AFTER_JSON_ESCAPE = `(?<=${JSON_ESCAPE})`;
+const OPENER_BOUNDARY = String.raw`(?:\b|${AFTER_JSON_ESCAPE})`;
+const NOT_INSIDE_JSON_ESCAPE = String.raw`(?!(?<=\\)(?:u[0-9a-fA-F]{4}|[nrtbf/]))`;
+const URL_IN_TEXT_PATTERN = new RegExp(String.raw`${OPENER_BOUNDARY}(https?:\/\/)(?:([^\s/?#@"'<>]+)@)?([^\s/?#"'<>]+)([^\s?#"'<>]*)(\?[^\s#"'<>]*)?(#[^\s"'<>]*)?`, "gi");
+// A query pair standing without its URL (`?token=...`, `&sid=...`).
+const BARE_QUERY_PAIR_PATTERN = /([?&][\w.~%-]+=)([^\s"'&#<>\\]+)/g;
+// Header name to value: `: `, `="`, or the JSON-escaped `\":\"`.
+const HEADER_SEPARATOR = String.raw`\\?["']?\s*[:=]\s*\\?["']?`;
+// The next header on the same line (`; X-Api-Key: x`, `, Content-Type: x`, ` Accept: x`, a quoted or JSON-object
+// name too): a cookie or header value ends before it, so that header keeps its name and gets its own carrier treatment.
+const NEXT_HEADER_NAME = String.raw`\s*\{?\s*\\?["']?[A-Za-z][\w-]*\\?["']?\s*:`;
+// The schemes that stand as carriers in prose (the ruling's list) and the wider set recognized inside an Authorization header.
+const PROSE_AUTH_SCHEMES = "bearer|basic|digest|token|apikey|api-key";
+const HEADER_AUTH_SCHEMES = `${PROSE_AUTH_SCHEMES}|negotiate|ntlm|hmac|oauth|hoba|mutual|vapid|aws4-hmac-sha256|scram-sha-1|scram-sha-256`;
+// A quote closes a value only when a delimiter or the end of the text follows it; a quote followed by a value
+// character opens the next header's value instead, so the value it seemed to close was never terminated.
+const CLOSING_QUOTE_BOUNDARY = String.raw`(?![\w/+=-])`;
+// A quoted value, in double quotes (possibly JSON-escaped) or single quotes, on one line, ending at its closing
+// quote even with `; Name:` inside. Quotes around a credential belong to its carrier: `Bearer "x"`, `sid='x'`,
+// `--token "x"` carry x whatever its shape.
+const QUOTED_VALUE = String.raw`(?:\\?"[^"\\\r\n]+\\?"|'[^'\r\n]+')${CLOSING_QUOTE_BOUNDARY}`;
+// A value whose opening quote never closes: it runs to the next `;`, `,`, or space (where the header patterns
+// apply the `Name:` cut) or to the end of the line, stray quotes included.
+const UNTERMINATED_QUOTED_VALUE = String.raw`\\?["'][^\s<>,;\\]+`;
+// One credential token (bare or quoted), or a parameter list such as Digest's `username="u", response="r"`
+// (quotes possibly JSON-escaped or single) or PagerDuty's `token=k`.
+const CREDENTIAL_TOKEN = String.raw`(?:${QUOTED_VALUE}|${UNTERMINATED_QUOTED_VALUE}|[^\s"'<>,;\\]+)`;
+const CREDENTIAL_PARAMETER_VALUE = String.raw`(?:(?:\\?"[^"\\\r\n]*\\?"|'[^'\r\n]*')${CLOSING_QUOTE_BOUNDARY}|\\?["']?[^\s"',;<>\\]+)`;
+const CREDENTIAL_PARAMETERS = String.raw`[\w-]+=${CREDENTIAL_PARAMETER_VALUE}(?:\s*[,;]\s*[\w-]+=${CREDENTIAL_PARAMETER_VALUE})*`;
+// The whole value of an Authorization header: a scheme and its credential, or up to two tokens for an unknown scheme.
+const AUTHORIZATION_HEADER_PATTERN = new RegExp(
+  String.raw`${OPENER_BOUNDARY}((?:proxy-)?authorization)(${HEADER_SEPARATOR})(?:(?:${HEADER_AUTH_SCHEMES})\s+(?:${CREDENTIAL_PARAMETERS}|${CREDENTIAL_TOKEN})|${CREDENTIAL_PARAMETERS}|${CREDENTIAL_TOKEN}(?:\s+(?!${NEXT_HEADER_NAME})${CREDENTIAL_TOKEN})?)`,
+  "gi",
+);
+// Cookie and Set-Cookie headers: every pair of the header value is a session credential. A pair's value may be
+// quoted (`sid="x"`, `sid = 'x'`, JSON-escaped `sid=\"x\"`) and ends at its closing quote even with `; Name:`
+// inside; a quote anywhere else closes the value, so the next header of a JSON headers object is not taken; an
+// unquoted value, or one whose opening quote never closes, runs to the `;`, `,`, or space that begins the next
+// header on the line, or to the end of the line.
+const COOKIE_PAIR_VALUE = String.raw`(?<==\s*)(?:(?:\\?"[^"\\\r\n,;\s][^"\\\r\n]*\\?"|'[^'\r\n,;\s][^'\r\n]*')${CLOSING_QUOTE_BOUNDARY}|${UNTERMINATED_QUOTED_VALUE})`;
+const COOKIE_HEADER_VALUE = String.raw`(?:[^\s"'<>\\;,]|[ \t;,](?!${NEXT_HEADER_NAME})|${COOKIE_PAIR_VALUE})+`;
+const COOKIE_HEADER_PATTERN = new RegExp(String.raw`${OPENER_BOUNDARY}(set-cookie|cookie)(${HEADER_SEPARATOR})(${COOKIE_HEADER_VALUE})`, "gi");
+// A scheme standing in prose (`Bearer x`, `Bearer "x"`, `Token token=x`, `ApiKey x`); a scheme word that is itself a
+// header or field name (`X-Api-Key : x`) is left to the field rule.
+const AUTH_SCHEME_PATTERN = new RegExp(String.raw`${OPENER_BOUNDARY}(${PROSE_AUTH_SCHEMES})(?!\s*[:=])\s+(${CREDENTIAL_PARAMETERS}|${CREDENTIAL_TOKEN})`, "gi");
+// What follows a scheme word in prose rather than as its credential: after a lowercase scheme, a word without
+// digits (lowercase, Capitalized, camelCase with up to three humps, a short acronym, or an acronym-led word such
+// as OAuth) or an environment variable name ("bearer of", "OAuth bearer token.", "access token (OAuth bearer
+// token)", "JWT bearer (SF_CONSUMER_KEY,"); after a capitalized scheme, only the capitalized next word of a title
+// ("Refresh Token Policy"). Wrapping punctuation belongs to the prose, so it is allowed around the word.
+const PROSE_AFTER_LOWERCASE_SCHEME_PATTERN = /^\(?(?:[A-Z]?[a-z]+(?:[A-Z][a-z]+){0,3}|[A-Z]{2,5}(?:[a-z]+)?|[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)+)[).:!?]*$/;
+const PROSE_AFTER_CAPITALIZED_SCHEME_PATTERN = /^\(?[A-Z][a-z]+[).:!?]*$/;
+const CREDENTIAL_PARAMETER_PATTERN = new RegExp(String.raw`([\w-]+=)${CREDENTIAL_PARAMETER_VALUE}`, "g");
+// Credential-named assignments (`client_secret=x`, `client_secret = "x"`, `JSESSIONID=x`, `connect.sid='x'`, `--token=x`).
+const SECRET_ASSIGNMENT_PATTERN = new RegExp(
+  String.raw`(?:(?<![\w.-])|${AFTER_JSON_ESCAPE})([\w.-]*(?:sess|sid|token|secret|passw|passphrase|pwd|passcode|api[_-]?key|apikey|access[_-]?key|private[_-]?key|credential|assertion|signature|auth|cookie|otp)[\w.-]*\s*=\s*)(${QUOTED_VALUE}|${UNTERMINATED_QUOTED_VALUE}|[^\s"'&;,<>\\]+)`,
+  "gi",
+);
+// Credential-named fields and single-value credential headers (`x-api-key: x`, `"password": "x"`, `\"access_token\":\"x\"`).
+const SECRET_FIELD_PATTERN = new RegExp(
+  String.raw`(?:(?<![\w/.-])|${AFTER_JSON_ESCAPE})((?:[\w-]*(?:api[_-]?key|apikey|token|secret|passw|passphrase|credential|assertion|signature|private[_-]?key|access[_-]?key|authorization)[\w-]*|pwd|passcode|otp|sid|jsessionid|session|sessionid|session[_-]?id|cookie|set-cookie|x-auth|x-token|x-secret|auth)\\?["']?\s*:\s*\\?["']?)([^\s"'&;,<>\\]+(?:["'](?=[\w/+=-])[^\s"'&;,<>\\]*)*)`,
+  "gi",
+);
+// SOAP and XML credential elements (`<sessionId>x</sessionId>`, `<urn:password>x</urn:password>`).
+const CREDENTIAL_ELEMENT_PATTERN = /<((?:[\w.-]+:)?(?:session_?id|session|passw(?:or)?d|pwd|passcode|otp|token|access_?token|refresh_?token|id_?token|secret|client_?secret|api_?key|apikey|assertion|signature|credentials?|authorization|private_?key)[\w-]*)(\s[^>]*)?>([^<]*)<\/\1\s*>/gi;
+// Command-line credential flags (IOA exclusion cl_regex values are command-line regexes): `--token VALUE`, `-password VALUE`;
+// the flag starts a word, so `access-token against` is prose.
+const CLI_SECRET_FLAG_PATTERN = new RegExp(
+  String.raw`(?:(?<![\w-])|${AFTER_JSON_ESCAPE})(--?(?:token|password|passwd|pwd|passcode|secret|api[_-]?key|apikey|access[_-]?key|client[_-]?secret|credential|auth|bearer|session|cookie|sid|otp)\s+)(${QUOTED_VALUE}|${UNTERMINATED_QUOTED_VALUE}|[^\s"'&;,<>-][^\s"'&;,<>]*)`,
+  "gi",
+);
+// Real token shapes, removed bare.
+const PEM_BLOCK_PATTERN = /-----BEGIN [A-Z0-9 ]+-----[\s\S]*?(?:-----END [A-Z0-9 ]+-----|$)/g;
+const JWT_PATTERN = new RegExp(String.raw`${OPENER_BOUNDARY}eyJ[A-Za-z0-9_-]{4,}\.[A-Za-z0-9_-]{4,}\.[A-Za-z0-9_-]*`, "g");
+const HEX_DIGEST_PATTERN = new RegExp(String.raw`(?:(?<![A-Za-z0-9])|${AFTER_JSON_ESCAPE})${NOT_INSIDE_JSON_ESCAPE}[0-9a-f]{32,}(?![A-Za-z0-9])`, "gi");
+const VENDOR_TOKEN_PATTERN = new RegExp(String.raw`${OPENER_BOUNDARY}${NOT_INSIDE_JSON_ESCAPE}(?:(?:sk|rk|pk)_(?:live|test)_[A-Za-z0-9]{8,}|sk-(?:proj-)?[A-Za-z0-9_-]{20,}|gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|xox[abopsre]-[A-Za-z0-9-]{10,}|xapp-[A-Za-z0-9-]{10,}|(?:AKIA|ASIA|AGPA|AIDA|AROA|ANPA|ANVA)[0-9A-Z]{16}|AIza[0-9A-Za-z_-]{20,}|ya29\.[0-9A-Za-z_-]{20,}|glpat-[A-Za-z0-9_-]{16,}|npm_[A-Za-z0-9]{30,}|pypi-[A-Za-z0-9_-]{30,}|dop_v1_[a-f0-9]{40,}|SG\.[A-Za-z0-9_-]{16,}\.[A-Za-z0-9_-]{16,}|hvs\.[A-Za-z0-9_-]{20,}|shpat_[a-fA-F0-9]{32}|dckr_pat_[A-Za-z0-9_-]{20,}|lin_api_[A-Za-z0-9]{20,}|figd_[A-Za-z0-9_-]{20,}|u\+[A-Za-z0-9_-]{16,})(?![A-Za-z0-9_-])`, "g");
+// A run long enough to be a token; redactTokenRun decides by segment shape whether it is one. It may start right
+// after `=` (`theme=<run>`, `x==<run>`): the pair rule has already replaced every credential-named pair by the time
+// this rule runs, so a run still standing after `=` is under a non-credential name and is judged by its shape alone;
+// the padding of a base64 run is taken on its right side.
+const BARE_TOKEN_RUN_PATTERN = new RegExp(String.raw`(?:(?<![A-Za-z0-9+/_-])|${AFTER_JSON_ESCAPE})${NOT_INSIDE_JSON_ESCAPE}[A-Za-z0-9+/_-]{16,}={0,2}(?![A-Za-z0-9+/_=-])`, "g");
+// A segment that reads as a word: lowercase, UPPERCASE, Capitalized, or camelCase with up to six humps, each
+// hump optionally led by a short acronym (enableCSRFOnPost, connectedAppOAuth) or closed by one
+// (sessionTimeoutSAML), optionally followed by digits (oauth2, sha256, dev12345) or a version suffix
+// (EngineProtectionV2, getDeviceControlPoliciesV2).
+const WORD_SEGMENT_PATTERN = /^(?:[A-Z]+|[A-Z]?[a-z]+(?:[A-Z]{1,5}[a-z]+){0,6}(?:[A-Z]{2,5})?|[A-Z]{2,}[a-z]+(?:[A-Z]{1,5}[a-z]+){0,6}(?:[A-Z]{2,5})?)(?:V\d+|\d*)$/;
+// A canonical UUID (8-4-4-4-12 hex) is a vendor identifier (a Falcon user uuid, an Anypoint organization or
+// environment id), not a credential, so it stays bare; inside a carrier or when remembered it still goes.
+const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+// Node fs error codes (ENOENT, EACCES, EISDIR); anything else on error.code is not echoed.
+const FS_ERROR_CODE_PATTERN = /^E[A-Z0-9_]{1,30}$/;
+// The only part of a JSON.parse message that is taken; the rest quotes the source.
+const JSON_POSITION_PATTERN = /at position (\d+)/;
+// Exclusion fields that carry free text authored by operators (command-line and image regexes, paths, notes).
+const EXCLUSION_TEXT_FIELDS = ["cl_regex", "ifn_regex", "value", "name", "description", "comment"];
+
 type FrameworkKey = "fedramp" | "cmmc" | "soc2" | "cis" | "pci_dss" | "disa_stig" | "irap" | "ismap";
 
 interface FrameworkDefinition {
@@ -250,6 +368,7 @@ export interface CrowdstrikeAccessSurface {
   scope: string;
   status: "readable" | "forbidden" | "not_readable";
   count?: number;
+  http_status?: number;
   error?: string;
 }
 
@@ -338,10 +457,32 @@ type ExportAuditBundleArgs = AssessArgs & {
   output_dir?: string;
 };
 
+/**
+ * A dataset read for an assessment. `data` always holds a usable value (the fallback when the read
+ * failed) so evaluators can run; `error` and `status` describe a failed read, `skipped` the reason a
+ * dependent read was never requested (its parent list was denied or returned no ids), and
+ * `endpoint` the Falcon path the read targets.
+ */
 interface CollectedDataset<T> {
   data: T;
+  label: string;
+  endpoint?: string;
   error?: string;
   status?: number;
+  skipped?: string;
+}
+
+/**
+ * Written to core_data (and into each category's snapshots) in place of a dataset that was denied,
+ * errored, or never requested, so a bundle consumer cannot mistake a failed read for an empty
+ * inventory. A readable dataset with no items keeps its array shape.
+ */
+export interface NotCollectedMarker {
+  collected: false;
+  dataset: string;
+  status: number | null;
+  endpoint: string | null;
+  error: string;
 }
 
 interface PartialInventory {
@@ -350,12 +491,16 @@ interface PartialInventory {
   total?: number;
 }
 
+/**
+ * Every Falcon error string is built here or in the transport branches of the client; the constructor
+ * applies the redaction pass so a message assembled at a throw site cannot bypass it.
+ */
 export class CrowdstrikeHttpError extends Error {
   readonly status: number;
   readonly path: string;
 
   constructor(message: string, status: number, path: string) {
-    super(message);
+    super(scrubSecretText(message));
     this.name = "CrowdstrikeHttpError";
     this.status = status;
     this.path = path;
@@ -629,24 +774,236 @@ function unlicensedFinding(id: ControlId, module: string, error: string, console
   );
 }
 
+/**
+ * The single point where a thrown error becomes a recorded string (dataset errors, access-check
+ * surfaces, role-lookup errors, errors arrays, _errors.log); it re-applies the redaction pass so a
+ * message built outside CrowdstrikeHttpError cannot bypass it.
+ */
 function summarizeError(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
+  return scrubSecretText(error instanceof Error ? error.message : String(error));
+}
+
+/**
+ * The unanchored redaction pass applied to every error string (once in CrowdstrikeHttpError, again at
+ * summarizeError) and to the free-text exclusion carriers: every secret any client in this process has
+ * seen, in every form it can take in an echoed body, then the carriers (URL userinfo, query strings,
+ * and fragments anywhere in the text, Authorization and cookie headers, auth schemes in prose,
+ * credential-named assignments, fields, and elements, command-line credential flags), then the bare
+ * token shapes (PEM blocks, JWTs, hex digests, vendor prefixes, and long runs with base64 symbols,
+ * scattered digits, or token casing).
+ */
+function scrubSecretText(text: string, secrets: Iterable<string | undefined> = []): string {
+  let scrubbed = text;
+  for (const secret of [...secrets, ...KNOWN_SECRETS]) {
+    if (!secret || secret.length < MIN_REMEMBERED_SECRET_LENGTH) continue;
+    for (const form of secretForms(secret)) scrubbed = scrubbed.split(form).join(REDACTED);
+  }
+  return scrubBareTokens(scrubCarriers(scrubbed));
+}
+
+/**
+ * The carrier stage of the pass: URL userinfo, query strings, and fragments anywhere in the text,
+ * Authorization and cookie headers, credential elements, JWTs and PEM blocks, auth schemes in prose,
+ * credential-named assignments, fields, and command-line flags. It removes a value by the company it
+ * keeps, never by its shape alone.
+ */
+function scrubCarriers(text: string): string {
+  return text
+    .replace(PEM_BLOCK_PATTERN, REDACTED)
+    .replace(URL_IN_TEXT_PATTERN, (_match, scheme: string, userinfo: string | undefined, host: string, path: string, query?: string, fragment?: string) =>
+      `${scheme}${userinfo ? `${REDACTED}@` : ""}${host}${path}${query ? `?${REDACTED}` : ""}${fragment ? `#${REDACTED}` : ""}`)
+    .replace(BARE_QUERY_PAIR_PATTERN, (_match, pair: string) => `${pair}${REDACTED}`)
+    .replace(AUTHORIZATION_HEADER_PATTERN, (_match, header: string, separator: string) => `${header}${separator}${REDACTED}`)
+    .replace(COOKIE_HEADER_PATTERN, (_match, header: string, separator: string) => `${header}${separator}${REDACTED}`)
+    .replace(CREDENTIAL_ELEMENT_PATTERN, (_match, element: string, attributes: string | undefined) => `<${element}${attributes ?? ""}>${REDACTED}</${element}>`)
+    .replace(JWT_PATTERN, REDACTED)
+    .replace(AUTH_SCHEME_PATTERN, (match: string, scheme: string, credential: string) =>
+      (isProseAfterScheme(scheme, credential) ? match : `${scheme} ${redactCredentialParameters(credential)}`))
+    .replace(SECRET_ASSIGNMENT_PATTERN, (_match, assignment: string) => `${assignment}${REDACTED}`)
+    .replace(SECRET_FIELD_PATTERN, (_match, field: string) => `${field}${REDACTED}`)
+    .replace(CLI_SECRET_FLAG_PATTERN, (_match, flag: string) => `${flag}${REDACTED}`);
+}
+
+/** The bare-token stage: real token shapes removed whatever their company (vendor prefixes, hex digests, long runs with base64 symbols, scattered digits, or token casing). */
+function scrubBareTokens(text: string): string {
+  return text
+    .replace(VENDOR_TOKEN_PATTERN, REDACTED)
+    .replace(HEX_DIGEST_PATTERN, REDACTED)
+    .replace(BARE_TOKEN_RUN_PATTERN, redactTokenRun);
+}
+
+/** Every secret any client in this process has seen, in every form it can take in a text. */
+function scrubRememberedSecrets(text: string): string {
+  let scrubbed = text;
+  for (const secret of KNOWN_SECRETS) {
+    for (const form of secretForms(secret)) scrubbed = scrubbed.split(form).join(REDACTED);
+  }
+  return scrubbed;
+}
+
+/**
+ * The data-side pass (rule 9, data-side carrier class) for every string a snapshot, evidence list,
+ * summary, core_data file, or tool payload keeps from an API response: the remembered secrets in every
+ * form, then the carrier stage (which takes JWTs and PEM blocks), then the vendor-prefixed token shapes
+ * (`sk_live_`, `xoxb-`, `ghp_`, `AKIA`, and the rest of VENDOR_TOKEN_PATTERN), unambiguous credential
+ * shapes with no identifier collision. It has no generic bare-run stage, so prose identifiers (a UUID, a
+ * sys_id, a name such as prod-us-east-2026) stay while a header line, URL credential, assignment,
+ * configured secret, or vendor token embedded in a description, name, or note goes.
+ */
+function scrubDataText(text: string): string {
+  return scrubCarriers(scrubRememberedSecrets(text)).replace(VENDOR_TOKEN_PATTERN, REDACTED);
+}
+
+/**
+ * A collected value with every string leaf through the data-side pass; arrays and plain objects are
+ * rebuilt, primitives and null are kept, and a container nested deeper than MAX_REDACTION_DEPTH is
+ * replaced by the marker rather than passed through unscrubbed (the payload is server-controlled).
+ */
+function scrubDataStrings<T>(value: T, depth = 0): T {
+  if (typeof value === "string") return scrubDataText(value) as T;
+  if (value === null || typeof value !== "object") return value;
+  if (depth > MAX_REDACTION_DEPTH) return REDACTED as T;
+  if (Array.isArray(value)) return value.map((item) => scrubDataStrings(item, depth + 1)) as T;
+  const prototype = Object.getPrototypeOf(value);
+  if (prototype !== Object.prototype && prototype !== null) return value;
+  const output: Record<string, unknown> = {};
+  for (const [key, entry] of Object.entries(value as Record<string, unknown>)) output[key] = scrubDataStrings(entry, depth + 1);
+  return output as T;
+}
+
+/** A scheme word standing in prose ("bearer of", "OAuth bearer token.", "Refresh Token Policy") rather than carrying a credential. */
+function isProseAfterScheme(scheme: string, credential: string): boolean {
+  return /^[a-z]+$/.test(scheme)
+    ? PROSE_AFTER_LOWERCASE_SCHEME_PATTERN.test(credential)
+    : PROSE_AFTER_CAPITALIZED_SCHEME_PATTERN.test(credential);
+}
+
+/** A parameter list (`token=k`, `username="u", response="r"`) keeps its parameter names; a single credential is replaced whole. */
+function redactCredentialParameters(credential: string): string {
+  return /^[\w-]+=/.test(credential) ? credential.replace(CREDENTIAL_PARAMETER_PATTERN, (_match, name: string) => `${name}${REDACTED}`) : REDACTED;
+}
+
+/** The raw, base64, base64url, URL-encoded, and JSON-escaped forms of a secret, so an encoded echo is caught too. */
+function secretForms(secret: string): string[] {
+  let forms = SECRET_FORMS.get(secret);
+  if (!forms) {
+    const bytes = Buffer.from(secret, "utf8");
+    const base64 = bytes.toString("base64");
+    const urlEncoded = encodeURIComponent(secret);
+    forms = [...new Set([
+      secret,
+      base64,
+      base64.replace(/=+$/, ""),
+      bytes.toString("base64url"),
+      urlEncoded,
+      urlEncoded.replace(/%20/g, "+"),
+      urlEncoded.replace(/%[0-9A-F]{2}/g, (escape) => escape.toLowerCase()),
+      JSON.stringify(secret).slice(1, -1),
+    ])].filter((form) => form.length >= MIN_REMEMBERED_SECRET_LENGTH);
+    SECRET_FORMS.set(secret, forms);
+  }
+  return forms;
+}
+
+/**
+ * A run reads as a token when any hyphen- or underscore-separated segment is neither a word, a number, nor
+ * a short abbreviation; a canonical UUID is an identifier and never reads as one.
+ */
+function looksLikeToken(value: string): boolean {
+  if (UUID_PATTERN.test(value)) return false;
+  return value.split(/[-_]+/).some((segment) =>
+    segment.length > 0 && !/^\d+$/.test(segment) && !WORD_SEGMENT_PATTERN.test(segment) && !(segment.length < 8 && /^[A-Za-z0-9]+$/.test(segment)));
+}
+
+/** Base64 symbols mark a token; otherwise a run without slashes is judged whole and a path piece by piece, keeping its word-like skeleton. */
+function redactTokenRun(run: string): string {
+  if (run.includes("+") || run.endsWith("=")) return REDACTED;
+  if (!run.includes("/")) return looksLikeToken(run) ? REDACTED : run;
+  return run.split("/").map((piece) => (looksLikeToken(piece) ? REDACTED : piece)).join("/");
+}
+
+function rememberSecrets(...values: Array<string | undefined>): void {
+  for (const value of values) {
+    if (value && value.length >= MIN_REMEMBERED_SECRET_LENGTH) KNOWN_SECRETS.add(value);
+  }
+}
+
+/** An exclusion record with its operator-authored text fields run through the redaction pass. */
+function scrubExclusionText(record: JsonRecord): JsonRecord {
+  const output: JsonRecord = { ...record };
+  for (const field of EXCLUSION_TEXT_FIELDS) {
+    const value = asString(record[field]);
+    if (value !== undefined) output[field] = scrubSecretText(value);
+  }
+  return output;
 }
 
 function isForbiddenOrMissing(dataset: CollectedDataset<unknown>): boolean {
   return dataset.status === 401 || dataset.status === 403 || dataset.status === 404;
 }
 
-async function collectDataset<T>(load: () => Promise<T>, fallback: T, label: string): Promise<CollectedDataset<T>> {
+async function collectDataset<T>(load: () => Promise<T>, fallback: T, label: string, endpoint?: string): Promise<CollectedDataset<T>> {
   try {
-    return { data: await load() };
+    return { data: scrubDataStrings(await load()), label, endpoint };
   } catch (error) {
+    const http = error instanceof CrowdstrikeHttpError ? error : undefined;
     return {
       data: fallback,
+      label,
+      endpoint: http?.path ?? endpoint,
       error: `${label}: ${summarizeError(error)}`,
-      status: error instanceof CrowdstrikeHttpError ? error.status : undefined,
+      status: http?.status,
     };
   }
+}
+
+/** A dependent read that was never requested; `reason` names the parent read that was denied or returned no ids. */
+function skippedDataset<T>(fallback: T, label: string, reason: string, endpoint?: string): CollectedDataset<T> {
+  return { data: fallback, label, endpoint, skipped: reason };
+}
+
+function isCollected(dataset: CollectedDataset<unknown>): boolean {
+  return !dataset.error && !dataset.skipped;
+}
+
+function notCollectedMarker(dataset: CollectedDataset<unknown>): NotCollectedMarker {
+  return {
+    collected: false,
+    dataset: dataset.label,
+    status: dataset.status ?? null,
+    endpoint: dataset.endpoint ?? null,
+    error: dataset.error ?? `not requested: ${dataset.skipped}`,
+  };
+}
+
+/** The exported view of a dataset: its value when the read was answered, a not-collected marker otherwise. */
+function snapshotOf(dataset: CollectedDataset<unknown>, value: unknown): unknown {
+  return isCollected(dataset) ? value : notCollectedMarker(dataset);
+}
+
+/** A count, list, or flag derived from one or more reads renders null when any of them was not answered. */
+function derived<T>(value: T, ...datasets: Array<CollectedDataset<unknown>>): T | null {
+  return datasets.every(isCollected) ? value : null;
+}
+
+function isPage(value: unknown): value is CrowdstrikePage<unknown> {
+  const object = asObject(value);
+  return object !== undefined && Array.isArray(object.items) && typeof object.truncated === "boolean";
+}
+
+/** The collection state of a dataset for a summary's `inventories` map: read (with its count), unread, or not requested. */
+function describeDataset(dataset: CollectedDataset<unknown>): string {
+  if (dataset.error) return `unread (${dataset.error})`;
+  if (dataset.skipped) return `not requested (${dataset.skipped})`;
+  const value = dataset.data;
+  if (isPage(value)) {
+    const total = value.total === undefined ? "an unknown total" : String(value.total);
+    return value.truncated ? `read, truncated (${value.items.length} of ${total} items)` : `read (${value.items.length} items)`;
+  }
+  if (Array.isArray(value)) return `read (${value.length} records)`;
+  if (typeof value === "number") return `read (total ${value})`;
+  if (value === undefined) return "read (no server-side total reported)";
+  return "read";
 }
 
 function listErrors(datasets: Array<CollectedDataset<unknown>>): string[] {
@@ -662,6 +1019,19 @@ function partialInventory(page: CrowdstrikePage<unknown>, dataset: string): Part
   return { dataset, seen: page.items.length, total: page.total };
 }
 
+/**
+ * The sentence for a truncated page that showed no matching row: emptiness is compliant (or failing)
+ * only for a complete read, so the property is neither confirmed nor ruled out from the visible rows.
+ */
+function truncatedBeforeVisible(read: string, row: string, property: string): string {
+  return `The ${read} read was truncated before any ${row} was visible, so ${property} cannot be confirmed or ruled out from the visible rows.`;
+}
+
+/**
+ * A sampled or truncated inventory caps pass at warn. A fail that rests on the absence of something in
+ * the visible rows (no enabled and assigned policy, no policy container) is provable only against the
+ * rows that were not read, so it renders manual instead of fail.
+ */
 function withPartialInventory(
   item: CrowdstrikeFinding,
   partials: Array<PartialInventory | undefined>,
@@ -671,10 +1041,13 @@ function withPartialInventory(
   const description = present
     .map((partial) => `${partial.seen} of ${partial.total === undefined ? "an unknown total of" : partial.total} ${partial.dataset}`)
     .join("; ");
+  const absenceClaim = item.status === "fail" && asObject(item.evidence)?.absence_claim === true;
   return {
     ...item,
-    status: item.status === "pass" ? "warn" : item.status,
-    summary: `${item.summary} Partial inventory: only ${description} were read (sampled or truncated), so this verdict cannot exceed warn.`,
+    status: item.status === "pass" ? "warn" : absenceClaim ? "manual" : item.status,
+    summary: absenceClaim
+      ? `${item.summary} Partial inventory: only ${description} were read (sampled or truncated), so the absence this verdict rests on cannot be asserted for the unread rows. Verdict: manual (unknown).`
+      : `${item.summary} Partial inventory: only ${description} were read (sampled or truncated), so this verdict cannot exceed warn.`,
     evidence: { ...(item.evidence ?? {}), partial_inventory: present },
   };
 }
@@ -689,12 +1062,68 @@ function withUndatedItems(item: CrowdstrikeFinding, count: number, label: string
   };
 }
 
-function readJsonConfigFile(location: string): JsonRecord | undefined {
-  if (!existsSync(location)) return undefined;
-  const raw = readFileSync(location, "utf8");
-  const parsed = asObject(JSON.parse(raw) as unknown);
+function withUnreadableSecondary(item: CrowdstrikeFinding, dataset: string, errors: Array<string | undefined>, consequence: string): CrowdstrikeFinding {
+  const present = errors.filter((error): error is string => Boolean(error));
+  if (present.length === 0) return item;
+  const previous = asRecordArray(asObject(item.evidence)?.unreadable_secondary_reads);
+  return {
+    ...item,
+    status: item.status === "pass" ? "warn" : item.status,
+    summary: `${item.summary} The ${dataset} read failed (${present.join("; ")}), so ${consequence} and this verdict cannot exceed warn.`,
+    evidence: { ...(item.evidence ?? {}), unreadable_secondary_reads: [...previous, { dataset, errors: present }] },
+  };
+}
+
+/**
+ * Thrown by the config loader. The message is fixed text carrying only the path, the fs error code,
+ * and the line: neither Node's fs message (which quotes its own wording and path) nor V8's
+ * JSON.parse message (which quotes a window of the source, or the whole source when it is short)
+ * is ever interpolated.
+ */
+export class CrowdstrikeConfigFileError extends Error {
+  readonly code: string;
+
+  constructor(message: string, code: string) {
+    super(message);
+    this.name = "CrowdstrikeConfigFileError";
+    this.code = code;
+  }
+}
+
+/** Read step of the config loader: any failure becomes fixed text with the validated fs code. */
+function readConfigFileText(location: string): string {
+  try {
+    return readFileSync(location, "utf8");
+  } catch (error) {
+    const rawCode = (error as { code?: unknown } | null)?.code;
+    const code = typeof rawCode === "string" && FS_ERROR_CODE_PATTERN.test(rawCode) ? rawCode : undefined;
+    throw new CrowdstrikeConfigFileError(`Unable to read CrowdStrike config file ${location}${code ? ` (${code})` : ""}`, code ?? "EUNKNOWN");
+  }
+}
+
+/**
+ * Parse step of the config loader: every thrown value is caught and only a position taken through
+ * the strict `at position N` pattern is kept, converted to the line it falls on.
+ */
+function parseConfigFileJson(location: string, text: string): unknown {
+  try {
+    return JSON.parse(text) as unknown;
+  } catch (error) {
+    const position = error instanceof Error ? JSON_POSITION_PATTERN.exec(error.message) : null;
+    const line = position ? text.slice(0, Number(position[1])).split("\n").length : undefined;
+    throw new CrowdstrikeConfigFileError(`Unable to parse CrowdStrike config file: invalid JSON in ${location}${line ? ` at line ${line}` : ""}`, "INVALID_JSON");
+  }
+}
+
+/**
+ * Loads the config file. The default location is skipped when absent; an explicit path that cannot
+ * be read fails with the fixed-text read error (ENOENT included).
+ */
+function readJsonConfigFile(location: string, explicit = false): JsonRecord | undefined {
+  if (!explicit && !existsSync(location)) return undefined;
+  const parsed = asObject(parseConfigFileJson(location, readConfigFileText(location)));
   if (!parsed) {
-    throw new Error(`CrowdStrike config file ${location} must contain a JSON object.`);
+    throw new CrowdstrikeConfigFileError(`Unable to parse CrowdStrike config file: ${location} must contain a JSON object`, "INVALID_JSON");
   }
   return parsed;
 }
@@ -714,10 +1143,9 @@ export function resolveCrowdstrikeConfiguration(
   homeDir: string = homedir(),
 ): CrowdstrikeResolvedConfig {
   const sourceChain: string[] = [];
-  const configPath = asString(input.config_file)
-    ?? asString(env.CS_CONFIG_FILE)
-    ?? join(homeDir, ".crowdstrike", "config.json");
-  const fileConfig = readJsonConfigFile(configPath);
+  const explicitConfigPath = asString(input.config_file) ?? asString(env.CS_CONFIG_FILE);
+  const configPath = explicitConfigPath ?? join(homeDir, ".crowdstrike", "config.json");
+  const fileConfig = readJsonConfigFile(configPath, explicitConfigPath !== undefined);
   if (fileConfig) {
     sourceChain.push(`config:${configPath}`);
   }
@@ -786,24 +1214,31 @@ export function resolveCrowdstrikeConfiguration(
   };
 }
 
-function redactSecrets(text: string, secrets: Array<string | undefined>): string {
-  let redacted = text;
-  for (const secret of secrets) {
-    if (secret && secret.length >= 6) {
-      redacted = redacted.split(secret).join("[REDACTED]");
-    }
-  }
-  return redacted;
-}
-
-function falconErrorSummary(payload: unknown): string | undefined {
-  const object = asObject(payload);
-  if (!object) return undefined;
-  const messages = asRecordArray(object.errors)
+/** Only the documented Falcon error fields (errors[].message, error_description, error, message) are kept from a JSON error body. */
+function falconErrorSummary(payload: JsonRecord | undefined): string | undefined {
+  if (!payload) return undefined;
+  const messages = asRecordArray(payload.errors)
     .map((item) => asString(item.message))
     .filter((item): item is string => Boolean(item));
   if (messages.length > 0) return messages.join("; ");
-  return asString(object.error_description) ?? asString(object.error) ?? asString(object.message);
+  return asString(payload.error_description) ?? asString(payload.error) ?? asString(payload.message);
+}
+
+/**
+ * A response body without a documented Falcon error field is described by content type and byte
+ * length only, whatever its content type (a proxy or WAF page, a JSON body of another shape); its
+ * text is never sliced into an error string because those strings land in the bundle's error log.
+ */
+function describeOpaqueBody(response: Response, rawText: string, payload: JsonRecord | undefined): string | undefined {
+  if (rawText.length === 0) return undefined;
+  const contentType = response.headers.get("content-type")?.split(";")[0]?.trim() || "unknown content type";
+  const kind = payload ? "JSON body without a documented error field" : "non-JSON body";
+  return `${kind} (${contentType}, ${Buffer.byteLength(rawText, "utf8")} bytes)`;
+}
+
+function errorDetail(response: Response, rawText: string, payload: JsonRecord | undefined): string {
+  const detail = falconErrorSummary(payload) ?? describeOpaqueBody(response, rawText, payload);
+  return detail ? `: ${detail}` : "";
 }
 
 function paginationOf(payload: JsonRecord): JsonRecord {
@@ -837,12 +1272,13 @@ function defaultSleep(ms: number): Promise<void> {
   return new Promise((resolvePromise) => setTimeout(resolvePromise, ms));
 }
 
-function parseJsonText(rawText: string): JsonRecord {
-  if (rawText.length === 0) return {};
+/** The parsed JSON object of a response body, or undefined when the body is empty, not JSON, or not an object. */
+function parseJsonBody(rawText: string): JsonRecord | undefined {
+  if (rawText.length === 0) return undefined;
   try {
-    return asObject(JSON.parse(rawText) as unknown) ?? {};
+    return asObject(JSON.parse(rawText) as unknown);
   } catch {
-    return {};
+    return undefined;
   }
 }
 
@@ -851,8 +1287,13 @@ function pageOf<T>(items: T[], total: number | undefined, moreAvailable: boolean
   return { items, total, truncated };
 }
 
+/**
+ * An entity lookup that returns fewer records than the id query listed (deleted or forbidden
+ * entities) leaves the consumer counting a subset of what the server said exists, so the page
+ * is marked truncated and the dependent verdict demotes instead of passing on the shortfall.
+ */
 function recordPage<T>(page: CrowdstrikePage<T>, entities: JsonRecord[]): CrowdstrikePage<JsonRecord> {
-  return { items: entities, total: page.total, truncated: page.truncated };
+  return { items: entities, total: page.total, truncated: page.truncated || entities.length < page.items.length };
 }
 
 export class CrowdstrikeApiClient {
@@ -876,6 +1317,7 @@ export class CrowdstrikeApiClient {
     this.fetchImpl = options.fetchImpl ?? fetch;
     this.sleep = options.sleep ?? defaultSleep;
     this.retryLimit = clampNumber(options.retryLimit, DEFAULT_RETRY_LIMIT, 0, 10);
+    rememberSecrets(config.clientSecret);
   }
 
   getResolvedConfig(): CrowdstrikeResolvedConfig {
@@ -883,7 +1325,7 @@ export class CrowdstrikeApiClient {
   }
 
   private redact(text: string): string {
-    return redactSecrets(text, [this.config.clientSecret, this.accessToken]);
+    return scrubSecretText(text, [this.config.clientSecret, this.accessToken]);
   }
 
   private buildUrl(path: string, query: JsonRecord = {}): string {
@@ -934,21 +1376,21 @@ export class CrowdstrikeApiClient {
       body: body.toString(),
     });
     const rawText = await response.text();
-    const payload = parseJsonText(rawText);
+    const payload = parseJsonBody(rawText);
     if (!response.ok) {
-      const detail = falconErrorSummary(payload) ?? rawText.slice(0, 200);
       throw new CrowdstrikeHttpError(
-        this.redact(`CrowdStrike OAuth2 token request failed (${response.status})${detail ? `: ${detail}` : ""}`),
+        this.redact(`CrowdStrike OAuth2 token request failed (${response.status})${errorDetail(response, rawText, payload)}`),
         response.status,
         "/oauth2/token",
       );
     }
 
-    const accessToken = asString(payload.access_token);
+    const accessToken = asString(payload?.access_token);
     if (!accessToken) {
       throw new Error("CrowdStrike OAuth2 token response did not include access_token.");
     }
-    const expiresIn = asNumber(payload.expires_in) ?? DEFAULT_TOKEN_TTL_SECONDS;
+    const expiresIn = asNumber(payload?.expires_in) ?? DEFAULT_TOKEN_TTL_SECONDS;
+    rememberSecrets(accessToken);
     this.accessToken = accessToken;
     this.accessTokenExpiresAt = Date.now() + Math.max(expiresIn * 1000 - TOKEN_SKEW_MS, TOKEN_SKEW_MS);
     return accessToken;
@@ -1003,16 +1445,15 @@ export class CrowdstrikeApiClient {
       }
 
       const rawText = await response.text();
-      const payload = parseJsonText(rawText);
+      const payload = parseJsonBody(rawText);
       if (!response.ok) {
-        const detail = falconErrorSummary(payload) ?? rawText.slice(0, 200);
         throw new CrowdstrikeHttpError(
-          this.redact(`CrowdStrike request failed for ${path} (${response.status})${detail ? `: ${detail}` : ""}`),
+          this.redact(`CrowdStrike request failed for ${path} (${response.status})${errorDetail(response, rawText, payload)}`),
           response.status,
           path,
         );
       }
-      return payload;
+      return payload ?? {};
     }
   }
 
@@ -1068,12 +1509,43 @@ export class CrowdstrikeApiClient {
         break;
       }
       if (opaqueCursor !== undefined) {
-        if (seenCursors.has(opaqueCursor)) break;
+        if (seenCursors.has(opaqueCursor)) {
+          moreAvailable = true;
+          break;
+        }
         seenCursors.add(opaqueCursor);
         offset = opaqueCursor;
         continue;
       }
       offset = (typeof offset === "number" ? offset : 0) + pageItems.length;
+    }
+
+    return pageOf(items.slice(0, limit), total, moreAvailable);
+  }
+
+  private async paginateAfter(
+    loadPage: (after: string | undefined, pageLimit: number) => Promise<JsonRecord>,
+    limit: number,
+    pageSize: number,
+  ): Promise<CrowdstrikePage<unknown>> {
+    const items: unknown[] = [];
+    let after: string | undefined;
+    let total: number | undefined;
+    let moreAvailable = false;
+
+    while (items.length < limit) {
+      const payload = await loadPage(after, Math.min(pageSize, limit - items.length));
+      const pageItems = asArray(payload.resources);
+      items.push(...pageItems);
+      const pagination = paginationOf(payload);
+      total = asNumber(pagination.total) ?? total;
+      const nextAfter = asString(pagination.after);
+      if (!nextAfter) break;
+      if (items.length >= limit || pageItems.length === 0 || nextAfter === after) {
+        moreAvailable = total === undefined || items.length < total;
+        break;
+      }
+      after = nextAfter;
     }
 
     return pageOf(items.slice(0, limit), total, moreAvailable);
@@ -1086,31 +1558,7 @@ export class CrowdstrikeApiClient {
   ): Promise<CrowdstrikePage<unknown>> {
     const limit = clampNumber(options.limit, DEFAULT_HOST_PAGE_SIZE, 1, 100_000);
     const pageSize = Math.min(clampNumber(options.pageSize, DEFAULT_HOST_PAGE_SIZE, 1, 10_000), limit);
-    const items: unknown[] = [];
-    let after: string | undefined;
-    let total: number | undefined;
-    let moreAvailable = false;
-
-    while (items.length < limit) {
-      const payload = await this.getJson(path, {
-        ...query,
-        limit: Math.min(pageSize, limit - items.length),
-        after,
-      });
-      const pageItems = asArray(payload.resources);
-      items.push(...pageItems);
-      const pagination = paginationOf(payload);
-      total = asNumber(pagination.total) ?? total;
-      const nextAfter = asString(pagination.after);
-      if (pageItems.length === 0 || !nextAfter || nextAfter === after) break;
-      if (items.length >= limit) {
-        moreAvailable = total === undefined || items.length < total;
-        break;
-      }
-      after = nextAfter;
-    }
-
-    return pageOf(items.slice(0, limit), total, moreAvailable);
+    return this.paginateAfter((after, pageLimit) => this.getJson(path, { ...query, limit: pageLimit, after }), limit, pageSize);
   }
 
   async getByIds(path: string, ids: string[], batchSize = DEFAULT_ID_BATCH_SIZE): Promise<JsonRecord[]> {
@@ -1143,7 +1591,8 @@ export class CrowdstrikeApiClient {
   private async listEntitiesBySinglePageQuery(queryPath: string, entityPath: string, query: JsonRecord = {}): Promise<CrowdstrikePage<JsonRecord>> {
     const payload = await this.getJson(queryPath, query);
     const ids = asStringArray(asArray(payload.resources));
-    const idPage = pageOf(ids, asNumber(paginationOf(payload).total), false);
+    const total = asNumber(paginationOf(payload).total);
+    const idPage = pageOf(ids, total, total === undefined);
     const entities = await this.getByIds(entityPath, ids);
     return recordPage(idPage, entities);
   }
@@ -1245,30 +1694,17 @@ export class CrowdstrikeApiClient {
   }
 
   async listAlerts(filter: string, limit = DEFAULT_ALERT_LIMIT): Promise<CrowdstrikePage<JsonRecord>> {
-    const items: JsonRecord[] = [];
-    let after: string | undefined;
-    let total: number | undefined;
-    let moreAvailable = false;
-    while (items.length < limit) {
-      const payload = await this.postJson("/alerts/combined/alerts/v1", {
+    const page = await this.paginateAfter(
+      (after, pageLimit) => this.postJson("/alerts/combined/alerts/v1", {
         filter,
-        limit: Math.min(1000, limit - items.length),
+        limit: pageLimit,
         sort: "created_timestamp|desc",
         ...(after ? { after } : {}),
-      });
-      const pageItems = asRecordArray(payload.resources);
-      items.push(...pageItems);
-      const pagination = paginationOf(payload);
-      total = asNumber(pagination.total) ?? total;
-      const nextAfter = asString(pagination.after);
-      if (pageItems.length === 0 || !nextAfter || nextAfter === after) break;
-      if (items.length >= limit) {
-        moreAvailable = total === undefined || items.length < total;
-        break;
-      }
-      after = nextAfter;
-    }
-    return pageOf(items.slice(0, limit), total, moreAvailable);
+      }),
+      clampNumber(limit, DEFAULT_ALERT_LIMIT, 1, 100_000),
+      1000,
+    );
+    return recordPage(page, asRecordArray(page.items));
   }
 
   async listIoaExclusions(limit = DEFAULT_EXCLUSION_LIMIT): Promise<CrowdstrikePage<JsonRecord>> {
@@ -1360,12 +1796,14 @@ export async function checkCrowdstrikeAccess(client: AccessProbeClient): Promise
         count: totalOrResourceCount(payload),
       });
     } catch (error) {
-      const forbidden = error instanceof CrowdstrikeHttpError && (error.status === 401 || error.status === 403);
+      const http = error instanceof CrowdstrikeHttpError ? error : undefined;
+      const forbidden = http !== undefined && (http.status === 401 || http.status === 403);
       surfaces.push({
         name: probe.name,
         endpoint: probe.endpoint,
         scope: probe.scope,
         status: forbidden ? "forbidden" : "not_readable",
+        http_status: http?.status,
         error: summarizeError(error),
       });
     }
@@ -1472,6 +1910,12 @@ function policyInventory(policies: JsonRecord[]): JsonRecord {
   };
 }
 
+/** The policy inventory for a category summary: counts from the read policies, or null for each when the list was not read. */
+function policyInventorySummary(dataset: CollectedDataset<CrowdstrikePage<JsonRecord>>): JsonRecord {
+  if (isCollected(dataset)) return policyInventory(dataset.data.items);
+  return { total_policies: null, enabled_policies: null, enabled_and_assigned_policies: null, enabled_but_unassigned_policies: null };
+}
+
 function platformsCovered(policies: JsonRecord[]): string[] {
   return [...new Set(policies.map((policy) => asString(policy.platform_name)).filter((item): item is string => Boolean(item)))].sort();
 }
@@ -1481,8 +1925,9 @@ function missingPlatforms(policies: JsonRecord[]): string[] {
   return ["Windows", "Mac", "Linux"].filter((platform) => !covered.has(platform.toLowerCase()));
 }
 
+/** A fail resting on the absence of an enabled and assigned policy; `absence_claim` lets a partial read demote it to manual. */
 function noAssignedPolicyFinding(id: ControlId, policyKind: string, policies: JsonRecord[]): CrowdstrikeFinding {
-  const inventory = policyInventory(policies);
+  const inventory: JsonRecord = { ...policyInventory(policies), absence_claim: true };
   if (policies.length === 0) {
     return finding(id, "fail", `The ${policyKind} policies endpoint was readable but returned zero policies; with no ${policyKind} policy defined this control fails.`, inventory);
   }
@@ -1494,7 +1939,11 @@ function noAssignedPolicyFinding(id: ControlId, policyKind: string, policies: Js
   );
 }
 
-function evaluateMlDetectionLevels(policies: JsonRecord[]): CrowdstrikeFinding {
+/**
+ * `partial` is set when the policy list was sampled or truncated: the platforms no visible policy covers
+ * are then provable only against the unread policies, so the clause is dropped and the field renders null.
+ */
+function evaluateMlDetectionLevels(policies: JsonRecord[], partial = false): CrowdstrikeFinding {
   const applied = assignedPolicies(policies);
   if (applied.length === 0) return noAssignedPolicyFinding("CS-01", "prevention", policies);
 
@@ -1532,9 +1981,9 @@ function evaluateMlDetectionLevels(policies: JsonRecord[]): CrowdstrikeFinding {
     return { policy: policyLabel(policy), status, min_rank: minRank, sliders_complete: !incomplete, sliders };
   });
 
-  const missing = missingPlatforms(applied);
+  const missing = partial ? null : missingPlatforms(applied);
   const statuses = perPolicy.map((item) => item.status);
-  if (missing.length > 0) statuses.push("warn");
+  if (missing && missing.length > 0) statuses.push("warn");
   const status = worstStatus(statuses);
   const weak = perPolicy.filter((item) => item.status !== "pass").map((item) => item.policy);
   return finding(
@@ -1542,7 +1991,7 @@ function evaluateMlDetectionLevels(policies: JsonRecord[]): CrowdstrikeFinding {
     status,
     status === "pass"
       ? `All ${applied.length} enabled and host-assigned prevention policies keep Cloud and Sensor Anti-malware detection and prevention at AGGRESSIVE or higher.`
-      : `${weak.length}/${applied.length} enabled and host-assigned prevention policies have ML sliders below AGGRESSIVE, missing, or incomplete${missing.length > 0 ? `; no assigned policy covers ${missing.join(", ")}` : ""}.`,
+      : `${weak.length}/${applied.length} enabled and host-assigned prevention policies have ML sliders below AGGRESSIVE, missing, or incomplete${missing && missing.length > 0 ? `; no assigned policy covers ${missing.join(", ")}` : ""}.`,
     { ...policyInventory(policies), platforms_without_policy: missing, policies: perPolicy },
   );
 }
@@ -1650,7 +2099,7 @@ const PREVENTION_CONSOLE_EVIDENCE = "export each prevention policy from Falcon c
 export async function assessCrowdstrikePreventionPolicies(
   client: Pick<CrowdstrikeApiClient, "getResolvedConfig" | "listPreventionPolicies">,
 ): Promise<CrowdstrikeAssessmentResult> {
-  const policiesDataset = await collectDataset(() => client.listPreventionPolicies(), emptyPage<JsonRecord>(), "prevention policies");
+  const policiesDataset = await collectDataset(() => client.listPreventionPolicies(), emptyPage<JsonRecord>(), "prevention policies", "/policy/combined/prevention/v1");
   const policies = policiesDataset.data.items;
   const partial = partialInventory(policiesDataset.data, "prevention policies");
   const controls: ControlId[] = ["CS-01", "CS-02", "CS-03", "CS-04", "CS-05"];
@@ -1658,7 +2107,7 @@ export async function assessCrowdstrikePreventionPolicies(
   const findings = policiesDataset.error
     ? controls.map((id) => unreadableFinding(id, "prevention policies", policiesDataset.error ?? "unknown error", PREVENTION_CONSOLE_EVIDENCE))
     : [
-      evaluateMlDetectionLevels(policies),
+      evaluateMlDetectionLevels(policies, partial !== undefined),
       evaluateToggleControl("CS-02", policies, [...CORE_EXPLOIT_MITIGATIONS, ...EXTENDED_EXPLOIT_MITIGATIONS], [], {
         policyKind: "prevention",
         passSummary: "Exploit mitigation toggles are enabled",
@@ -1684,14 +2133,15 @@ export async function assessCrowdstrikePreventionPolicies(
     category: "prevention_policies",
     summary: {
       ...assessmentSummaryBase(client.getResolvedConfig()),
-      ...policyInventory(policies),
-      policies_truncated: policiesDataset.data.truncated,
-      platforms_covered: platformsCovered(assignedPolicies(policies)).join(", ") || "none",
+      ...policyInventorySummary(policiesDataset),
+      policies_truncated: derived(policiesDataset.data.truncated, policiesDataset),
+      platforms_covered: derived(platformsCovered(assignedPolicies(policies)).join(", ") || "none", policiesDataset),
+      inventories: { prevention_policies: describeDataset(policiesDataset) },
       ...statusCounts(findings),
     },
     findings,
     errors: listErrors([policiesDataset]),
-    snapshots: { prevention_policies: policies },
+    snapshots: { prevention_policies: snapshotOf(policiesDataset, policies) },
   };
 }
 
@@ -1867,12 +2317,17 @@ function evaluateDetectionSla(alerts: CollectedDataset<CrowdstrikePage<JsonRecor
   const openWithinSla = Math.max(0, dated - resolvedCount - openBreaches);
   const compliant = withinSla + openWithinSla;
   const pct = percentage(compliant, dated);
-  const status: CrowdstrikeFinding["status"] = dated === 0 ? "pass" : pct >= 95 ? "pass" : pct >= 80 ? "warn" : "fail";
+  const partial = partialInventory(alerts.data, "critical/high alerts");
+  // Emptiness is compliant only for a complete read; a truncated page with no dated alert visible cannot
+  // rule breaches out for the unread rows.
+  const status: CrowdstrikeFinding["status"] = dated === 0 ? (partial ? "warn" : "pass") : pct >= 95 ? "pass" : pct >= 80 ? "warn" : "fail";
   const base = finding(
     "CS-22",
     status,
     dated === 0
-      ? `The alerts endpoint was readable and returned no dated critical or high alerts created in the last ${lookbackDays} days (window stated), so there was nothing to respond to; emptiness is compliant for this control.`
+      ? partial
+        ? truncatedBeforeVisible("critical/high alerts", "dated alert", "response within the SLA")
+        : `The alerts endpoint was readable and returned no dated critical or high alerts created in the last ${lookbackDays} days (window stated), so there was nothing to respond to; emptiness is compliant for this control.`
       : `${pct}% of ${dated} dated critical/high alerts from the last ${lookbackDays} days were resolved (or remain open) within the ${CRITICAL_SLA_HOURS}h critical / ${HIGH_SLA_HOURS}h high SLA; ${breaches.length} breached the SLA.`,
     {
       lookback_days: lookbackDays,
@@ -1884,7 +2339,7 @@ function evaluateDetectionSla(alerts: CollectedDataset<CrowdstrikePage<JsonRecor
       breach_samples: breaches.slice(0, 15),
     },
   );
-  return withPartialInventory(withUndatedItems(base, undated, "alerts", "created_timestamp"), [partialInventory(alerts.data, "critical/high alerts")]);
+  return withPartialInventory(withUndatedItems(base, undated, "alerts", "created_timestamp"), [partial]);
 }
 
 const CONTAINMENT_CONSOLE_EVIDENCE = "export the contained host list from Falcon console > Host setup and management > Host management filtered by containment status, with containment start dates and incident references.";
@@ -1905,16 +2360,100 @@ function evaluateContainment(hosts: CollectedDataset<CrowdstrikePage<JsonRecord>
   });
   const undated = contained.filter((host) => host.hours_since_status_change === undefined).length;
   const aged = contained.filter((host) => (host.hours_since_status_change ?? 0) > maxContainmentHours);
-  const status: CrowdstrikeFinding["status"] = contained.length === 0 ? "pass" : "warn";
+  const partial = partialInventory(hosts.data, "contained hosts");
+  // Emptiness is compliant only for a complete read; a truncated page with no visible match cannot rule
+  // containment out for the unread rows, so the absence sentence is not emitted and pass is withheld.
+  const status: CrowdstrikeFinding["status"] = contained.length === 0 && !partial ? "pass" : "warn";
   const base = finding(
     "CS-23",
     status,
     contained.length === 0
-      ? "The Hosts API was readable and the containment status filter returned no hosts, so there is no active containment to document; emptiness is compliant for this control."
+      ? partial
+        ? "The containment status filter read was truncated before any matching host was visible, so active containment cannot be confirmed or ruled out from the visible rows; document each containment and its incident reference."
+        : "The Hosts API was readable and the containment status filter returned no hosts, so there is no active containment to document; emptiness is compliant for this control."
       : `${contained.length} hosts are network contained or pending containment changes${aged.length > 0 ? `, ${aged.length} for more than ${maxContainmentHours} hours (based on last host record change)` : ""}; document each containment and its incident reference.`,
     { contained_hosts: contained.length, aged_over_hours: maxContainmentHours, hosts: contained.slice(0, 50) },
   );
-  return withPartialInventory(withUndatedItems(base, undated, "contained hosts", "modified_timestamp"), [partialInventory(hosts.data, "contained hosts")]);
+  return withPartialInventory(withUndatedItems(base, undated, "contained hosts", "modified_timestamp"), [partial]);
+}
+
+const ALERT_SNAPSHOT_FIELDS = [
+  "id",
+  "composite_id",
+  "aggregate_id",
+  "cid",
+  "agent_id",
+  "product",
+  "type",
+  "scenario",
+  "objective",
+  "tactic",
+  "tactic_id",
+  "technique",
+  "technique_id",
+  "pattern_id",
+  "name",
+  "display_name",
+  "severity",
+  "severity_name",
+  "confidence",
+  "status",
+  "assigned_to_name",
+  "resolution",
+  "created_timestamp",
+  "updated_timestamp",
+  "timestamp",
+  "seconds_to_triaged",
+  "seconds_to_resolved",
+  "data_domains",
+  "tags",
+];
+const ALERT_DEVICE_SNAPSHOT_FIELDS = ["device_id", "hostname", "platform_name", "os_version", "agent_version"];
+const RTR_SESSION_SNAPSHOT_FIELDS = [
+  "id",
+  "cid",
+  "device_id",
+  "hostname",
+  "platform_name",
+  "platform_id",
+  "user_id",
+  "user_uuid",
+  "created_at",
+  "updated_at",
+  "deleted_at",
+  "duration",
+];
+
+function pickFields(record: JsonRecord, fields: string[]): JsonRecord {
+  const output: JsonRecord = {};
+  for (const field of fields) {
+    if (record[field] !== undefined) output[field] = record[field];
+  }
+  return output;
+}
+
+function projectAlert(alert: JsonRecord): JsonRecord {
+  const device = asObject(alert.device);
+  return {
+    ...pickFields(alert, ALERT_SNAPSHOT_FIELDS),
+    ...(device ? { device: pickFields(device, ALERT_DEVICE_SNAPSHOT_FIELDS) } : {}),
+  };
+}
+
+function projectRtrSession(session: JsonRecord): JsonRecord {
+  const commands = asRecordArray(session.commands);
+  return {
+    ...pickFields(session, RTR_SESSION_SNAPSHOT_FIELDS),
+    command_count: commands.length,
+    base_commands: [...new Set(commands.map((command) => asString(command.base_command)).filter((command): command is string => Boolean(command)))],
+  };
+}
+
+function projectPage(
+  dataset: CollectedDataset<CrowdstrikePage<JsonRecord>>,
+  project: (record: JsonRecord) => JsonRecord,
+): CollectedDataset<CrowdstrikePage<JsonRecord>> {
+  return { ...dataset, data: { ...dataset.data, items: dataset.data.items.map(project) } };
 }
 
 export async function assessCrowdstrikeResponseReadiness(
@@ -1927,17 +2466,25 @@ export async function assessCrowdstrikeResponseReadiness(
   const maxSessionMinutes = clampNumber(options.maxSessionMinutes, DEFAULT_MAX_SESSION_MINUTES, 1, 1440);
   const maxConcurrentSessions = clampNumber(options.maxConcurrentSessions, DEFAULT_MAX_CONCURRENT_SESSIONS, 1, 100);
 
-  const policies = await collectDataset(() => client.listResponsePolicies(), emptyPage<JsonRecord>(), "response policies");
-  const sessions = await collectDataset(() => client.listRtrSessions(`created_at:>'now-${lookbackDays}d'`), emptyPage<JsonRecord>(), "rtr audit sessions");
-  const alerts = await collectDataset(
-    () => client.listAlerts(`severity:>=${HIGH_SEVERITY_FLOOR}+created_timestamp:>'now-${lookbackDays}d'`, alertLimit),
-    emptyPage<JsonRecord>(),
-    "alerts",
+  const policies = await collectDataset(() => client.listResponsePolicies(), emptyPage<JsonRecord>(), "response policies", "/policy/combined/response/v1");
+  const sessions = projectPage(
+    await collectDataset(() => client.listRtrSessions(`created_at:>'now-${lookbackDays}d'`), emptyPage<JsonRecord>(), "rtr audit sessions", "/real-time-response-audit/combined/sessions/v1"),
+    projectRtrSession,
+  );
+  const alerts = projectPage(
+    await collectDataset(
+      () => client.listAlerts(`severity:>=${HIGH_SEVERITY_FLOOR}+created_timestamp:>'now-${lookbackDays}d'`, alertLimit),
+      emptyPage<JsonRecord>(),
+      "alerts",
+      "/alerts/combined/alerts/v1",
+    ),
+    projectAlert,
   );
   const containedHosts = await collectDataset(
     () => client.listHosts(hostLimit, "status:['contained','containment_pending','lift_containment_pending']"),
     emptyPage<JsonRecord>(),
     "contained hosts",
+    "/devices/combined/devices/v1",
   );
 
   const findings = [
@@ -1955,21 +2502,27 @@ export async function assessCrowdstrikeResponseReadiness(
     summary: {
       ...assessmentSummaryBase(client.getResolvedConfig()),
       lookback_days: lookbackDays,
-      response_policies: policies.data.items.length,
-      enabled_and_assigned_response_policies: assignedPolicies(policies.data.items).length,
-      rtr_sessions_reviewed: sessions.data.items.length,
-      critical_high_alerts: alerts.data.items.length,
-      alerts_truncated: alerts.data.truncated,
-      contained_hosts: containedHosts.data.items.length,
+      response_policies: derived(policies.data.items.length, policies),
+      enabled_and_assigned_response_policies: derived(assignedPolicies(policies.data.items).length, policies),
+      rtr_sessions_reviewed: derived(sessions.data.items.length, sessions),
+      critical_high_alerts: derived(alerts.data.items.length, alerts),
+      alerts_truncated: derived(alerts.data.truncated, alerts),
+      contained_hosts: derived(containedHosts.data.items.length, containedHosts),
+      inventories: {
+        response_policies: describeDataset(policies),
+        rtr_audit_sessions: describeDataset(sessions),
+        alerts: describeDataset(alerts),
+        contained_hosts: describeDataset(containedHosts),
+      },
       ...statusCounts(findings),
     },
     findings,
     errors: listErrors([policies, sessions, alerts, containedHosts]),
     snapshots: {
-      response_policies: policies.data.items,
-      rtr_audit_sessions: sessions.data.items,
-      alerts: alerts.data.items,
-      contained_hosts: containedHosts.data.items,
+      response_policies: snapshotOf(policies, policies.data.items),
+      rtr_audit_sessions: snapshotOf(sessions, sessions.data.items),
+      alerts: snapshotOf(alerts, alerts.data.items),
+      contained_hosts: snapshotOf(containedHosts, containedHosts.data.items),
     },
   };
 }
@@ -2118,7 +2671,7 @@ function evaluateDefaultDeny(policies: JsonRecord[], containers: JsonRecord[], r
   const appliedIds = new Set(assignedPolicies(policies).map((policy) => asString(policy.id) ?? ""));
   const activeContainers = containers.filter((container) => appliedIds.has(asString(container.policy_id) ?? ""));
   if (activeContainers.length === 0) {
-    return finding("CS-11", "fail", `No firewall policy containers were returned for enabled and host-assigned firewall policies (${appliedIds.size} applied policies, ${containers.length} containers), so a default deny posture cannot be demonstrated.`, { ...policyInventory(policies), containers: containers.length });
+    return finding("CS-11", "fail", `No firewall policy containers were returned for enabled and host-assigned firewall policies (${appliedIds.size} applied policies, ${containers.length} containers), so a default deny posture cannot be demonstrated.`, { ...policyInventory(policies), containers: containers.length, absence_claim: true });
   }
   const perContainer = activeContainers.map((container) => {
     const inbound = asString(container.default_inbound)?.toUpperCase();
@@ -2168,18 +2721,28 @@ export async function assessCrowdstrikeDeviceFirewall(
   const maxUsbExceptions = clampNumber(options.maxUsbExceptions, DEFAULT_MAX_USB_EXCEPTIONS, 0, 10_000);
   const ruleLimit = clampNumber(options.ruleLimit, DEFAULT_RULE_LIMIT, 1, 10_000);
 
-  const deviceControl = await collectDataset(() => client.listDeviceControlPolicies(), emptyPage<JsonRecord>(), "device control policies");
+  const deviceControl = await collectDataset(() => client.listDeviceControlPolicies(), emptyPage<JsonRecord>(), "device control policies", "/policy/combined/device-control/v1");
   const deviceControlIds = deviceControl.data.items.map((policy) => asString(policy.id)).filter((id): id is string => Boolean(id));
   const deviceControlDetails: CollectedDataset<JsonRecord[]> = deviceControlIds.length > 0
-    ? await collectDataset(() => client.getDeviceControlPoliciesV2(deviceControlIds), [] as JsonRecord[], "device control policy details")
-    : { data: [] };
-  const firewallPolicies = await collectDataset(() => client.listFirewallPolicies(), emptyPage<JsonRecord>(), "firewall policies");
+    ? await collectDataset(() => client.getDeviceControlPoliciesV2(deviceControlIds), [] as JsonRecord[], "device control policy details", "/policy/entities/device-control/v2")
+    : skippedDataset(
+      [] as JsonRecord[],
+      "device control policy details",
+      isCollected(deviceControl) ? "the device control policies list returned no policy ids to look up" : "the device control policies list was not read",
+      "/policy/entities/device-control/v2",
+    );
+  const firewallPolicies = await collectDataset(() => client.listFirewallPolicies(), emptyPage<JsonRecord>(), "firewall policies", "/policy/combined/firewall/v1");
   const firewallIds = assignedPolicies(firewallPolicies.data.items).map((policy) => asString(policy.id)).filter((id): id is string => Boolean(id));
   const containers: CollectedDataset<JsonRecord[]> = firewallIds.length > 0
-    ? await collectDataset(() => client.getFirewallPolicyContainers(firewallIds), [] as JsonRecord[], "firewall policy containers")
-    : { data: [] };
-  const ruleGroups = await collectDataset(() => client.listFirewallRuleGroups(ruleLimit), emptyPage<JsonRecord>(), "firewall rule groups");
-  const rules = await collectDataset(() => client.listFirewallRules(ruleLimit), emptyPage<JsonRecord>(), "firewall rules");
+    ? await collectDataset(() => client.getFirewallPolicyContainers(firewallIds), [] as JsonRecord[], "firewall policy containers", "/fwmgr/entities/policies/v1")
+    : skippedDataset(
+      [] as JsonRecord[],
+      "firewall policy containers",
+      isCollected(firewallPolicies) ? "the firewall policies list returned no enabled and host-assigned policy ids to look up" : "the firewall policies list was not read",
+      "/fwmgr/entities/policies/v1",
+    );
+  const ruleGroups = await collectDataset(() => client.listFirewallRuleGroups(ruleLimit), emptyPage<JsonRecord>(), "firewall rule groups", "/fwmgr/queries/rule-groups/v1");
+  const rules = await collectDataset(() => client.listFirewallRules(ruleLimit), emptyPage<JsonRecord>(), "firewall rules", "/fwmgr/queries/rules/v1");
 
   const detailById = new Map(deviceControlDetails.data.map((detail) => [asString(detail.id) ?? "", detail]));
   const views = deviceControl.data.items.map((policy) => deviceControlView(policy, detailById.get(asString(policy.id) ?? "")));
@@ -2209,24 +2772,32 @@ export async function assessCrowdstrikeDeviceFirewall(
     category: "device_firewall",
     summary: {
       ...assessmentSummaryBase(client.getResolvedConfig()),
-      device_control_policies: deviceControl.data.items.length,
-      enabled_and_assigned_device_control_policies: views.filter((view) => view.applied).length,
-      firewall_policies: firewallPolicies.data.items.length,
-      enabled_and_assigned_firewall_policies: firewallIds.length,
-      firewall_rule_groups: ruleGroups.data.items.length,
-      firewall_rules_reviewed: rules.data.items.length,
-      firewall_rules_truncated: rules.data.truncated,
+      device_control_policies: derived(deviceControl.data.items.length, deviceControl),
+      enabled_and_assigned_device_control_policies: derived(views.filter((view) => view.applied).length, deviceControl),
+      firewall_policies: derived(firewallPolicies.data.items.length, firewallPolicies),
+      enabled_and_assigned_firewall_policies: derived(firewallIds.length, firewallPolicies),
+      firewall_rule_groups: derived(ruleGroups.data.items.length, ruleGroups),
+      firewall_rules_reviewed: derived(rules.data.items.length, rules),
+      firewall_rules_truncated: derived(rules.data.truncated, rules),
+      inventories: {
+        device_control_policies: describeDataset(deviceControl),
+        device_control_policy_details: describeDataset(deviceControlDetails),
+        firewall_policies: describeDataset(firewallPolicies),
+        firewall_policy_containers: describeDataset(containers),
+        firewall_rule_groups: describeDataset(ruleGroups),
+        firewall_rules: describeDataset(rules),
+      },
       ...statusCounts(findings),
     },
     findings,
     errors: listErrors([deviceControl, deviceControlDetails, firewallPolicies, containers, ruleGroups, rules]),
     snapshots: {
-      device_control_policies: deviceControl.data.items,
-      device_control_policy_details: deviceControlDetails.data,
-      firewall_policies: firewallPolicies.data.items,
-      firewall_policy_containers: containers.data,
-      firewall_rule_groups: ruleGroups.data.items,
-      firewall_rules: rules.data.items,
+      device_control_policies: snapshotOf(deviceControl, deviceControl.data.items),
+      device_control_policy_details: snapshotOf(deviceControlDetails, deviceControlDetails.data),
+      firewall_policies: snapshotOf(firewallPolicies, firewallPolicies.data.items),
+      firewall_policy_containers: snapshotOf(containers, containers.data),
+      firewall_rule_groups: snapshotOf(ruleGroups, ruleGroups.data.items),
+      firewall_rules: snapshotOf(rules, rules.data.items),
     },
   };
 }
@@ -2301,13 +2872,19 @@ function evaluateSensorUpdate(policies: JsonRecord[], buildsByPlatform: Map<stri
 
   const status = worstStatus(perPolicy.map((item) => item.status));
   const weak = perPolicy.filter((item) => item.status !== "pass");
-  return finding(
-    "CS-12",
-    status,
-    status === "pass"
-      ? `All ${perPolicy.length} enabled and host-assigned sensor update policies auto-update or pin a build within N-2 with uninstall protection enabled.`
-      : `${weak.length}/${perPolicy.length} enabled and host-assigned sensor update policies disable updates, pin builds older than N-2 or unverifiable against the build catalog, or lack uninstall protection: ${weak.map((item) => item.policy).join(", ")}.`,
-    { ...policyInventory(policies), policies: perPolicy },
+  const catalogErrors = [...buildsByPlatform.values()].map((dataset) => dataset.error);
+  return withUnreadableSecondary(
+    finding(
+      "CS-12",
+      status,
+      status === "pass"
+        ? `All ${perPolicy.length} enabled and host-assigned sensor update policies auto-update or pin a build within N-2 with uninstall protection enabled.`
+        : `${weak.length}/${perPolicy.length} enabled and host-assigned sensor update policies disable updates, pin builds older than N-2 or unverifiable against the build catalog, or lack uninstall protection: ${weak.map((item) => item.policy).join(", ")}.`,
+      { ...policyInventory(policies), policies: perPolicy },
+    ),
+    "sensor build catalog",
+    catalogErrors,
+    "build tags and pinned builds could not be verified against the catalog for that platform",
   );
 }
 
@@ -2330,6 +2907,10 @@ function evaluateDeploymentCompleteness(hosts: CollectedDataset<CrowdstrikePage<
     versions.set(version, (versions.get(version) ?? 0) + 1);
   }
   const pct = percentage(active.length, dated.length);
+  const partial = partialInventory(hosts.data, "hosts");
+  // A fail asserted from zero visible rows of a truncated list is a claim about rows that were not read;
+  // `absence_claim` lets withPartialInventory render it manual. A complete empty read still fails.
+  const emptyPartial = items.length === 0 && partial !== undefined;
   const status: CrowdstrikeFinding["status"] = items.length === 0
     ? "fail"
     : dated.length === 0
@@ -2343,11 +2924,14 @@ function evaluateDeploymentCompleteness(hosts: CollectedDataset<CrowdstrikePage<
     "CS-13",
     status,
     items.length === 0
-      ? "The Hosts API was readable but returned zero hosts, so no sensor deployment coverage can be demonstrated; emptiness fails this control."
+      ? emptyPartial
+        ? truncatedBeforeVisible("hosts", "host", "sensor deployment coverage")
+        : "The Hosts API was readable but returned zero hosts, so no sensor deployment coverage can be demonstrated; emptiness fails this control."
       : dated.length === 0
         ? `None of the ${items.length} sampled hosts carries a last_seen timestamp, so sensor freshness cannot be demonstrated from the API.`
         : `${pct}% of ${dated.length} dated hosts (${items.length} sampled) reported to Falcon within the last ${staleDays} days; ${stale.length} are stale, ${undated} have no last_seen, and ${rfm.length} run in reduced functionality mode.`,
     {
+      ...(emptyPartial ? { absence_claim: true } : {}),
       sampled_hosts: items.length,
       reported_total_hosts: hosts.data.total,
       active_hosts: active.length,
@@ -2359,7 +2943,7 @@ function evaluateDeploymentCompleteness(hosts: CollectedDataset<CrowdstrikePage<
       stale_samples: stale.slice(0, 25).map((host) => ({ hostname: asString(host.hostname), last_seen: asString(host.last_seen), platform: asString(host.platform_name) })),
     },
   );
-  return withPartialInventory(withUndatedItems(base, undated, "hosts", "last_seen"), [partialInventory(hosts.data, "hosts")]);
+  return withPartialInventory(withUndatedItems(base, undated, "hosts", "last_seen"), [partial]);
 }
 
 const HOST_GROUP_CONSOLE_EVIDENCE = "export host group membership from Falcon console > Host setup and management > Host groups and confirm every managed host belongs to at least one policy-bearing group.";
@@ -2379,16 +2963,27 @@ function evaluateHostGroupAssignment(hosts: CollectedDataset<CrowdstrikePage<Jso
     const type = asString(group.group_type) ?? "unknown";
     groupTypes.set(type, (groupTypes.get(type) ?? 0) + 1);
   }
+  const hostPartial = partialInventory(hosts.data, "hosts");
+  const groupPartial = partialInventory(groups.data, "host groups");
+  // The empty list that the fail rests on decides: zero rows of a truncated list is a claim about unread
+  // rows (`absence_claim`, rendered manual by withPartialInventory); zero rows of a complete list fails.
+  const emptyPartialGroups = groups.data.items.length === 0 && groupPartial !== undefined;
+  const emptyPartialHosts = groups.data.items.length > 0 && items.length === 0 && hostPartial !== undefined;
   const status: CrowdstrikeFinding["status"] = items.length === 0 || groups.data.items.length === 0 ? "fail" : pct >= 95 ? "pass" : pct >= 80 ? "warn" : "fail";
   const base = finding(
     "CS-14",
     status,
     groups.data.items.length === 0
-      ? "The host groups endpoint was readable but returned zero host groups, so no policy assignment coverage can be demonstrated; emptiness fails this control."
+      ? emptyPartialGroups
+        ? truncatedBeforeVisible("host groups", "host group", "policy assignment coverage")
+        : "The host groups endpoint was readable but returned zero host groups, so no policy assignment coverage can be demonstrated; emptiness fails this control."
       : items.length === 0
-        ? "The Hosts API was readable but returned zero hosts, so host group assignment coverage cannot be demonstrated; emptiness fails this control."
+        ? emptyPartialHosts
+          ? truncatedBeforeVisible("hosts", "host", "host group assignment coverage")
+          : "The Hosts API was readable but returned zero hosts, so host group assignment coverage cannot be demonstrated; emptiness fails this control."
         : `${pct}% of ${items.length} sampled hosts belong to at least one of ${groups.data.items.length} host groups.`,
     {
+      ...(emptyPartialGroups || emptyPartialHosts ? { absence_claim: true } : {}),
       sampled_hosts: items.length,
       reported_total_hosts: hosts.data.total,
       assigned_hosts: assigned.length,
@@ -2398,7 +2993,7 @@ function evaluateHostGroupAssignment(hosts: CollectedDataset<CrowdstrikePage<Jso
       unassigned_samples: items.filter((host) => asArray(host.groups).length === 0).slice(0, 25).map((host) => ({ hostname: asString(host.hostname), platform: asString(host.platform_name) })),
     },
   );
-  return withPartialInventory(base, [partialInventory(hosts.data, "hosts"), partialInventory(groups.data, "host groups")]);
+  return withPartialInventory(base, [hostPartial, groupPartial]);
 }
 
 const DISCOVER_CONSOLE_EVIDENCE = "provide the Falcon Discover unmanaged asset report (Falcon console > Exposure management > Assets) or an equivalent network discovery inventory for the review period.";
@@ -2543,28 +3138,36 @@ export async function assessCrowdstrikeSensorCoverage(
   const staleDays = clampNumber(options.staleSensorDays, DEFAULT_STALE_SENSOR_DAYS, 1, 365);
   const minScore = clampNumber(options.minZtaScore, DEFAULT_MIN_ZTA_SCORE, 1, 100);
 
-  const sensorUpdate = await collectDataset(() => client.listSensorUpdatePolicies(), emptyPage<JsonRecord>(), "sensor update policies");
+  const sensorUpdate = await collectDataset(() => client.listSensorUpdatePolicies(), emptyPage<JsonRecord>(), "sensor update policies", "/policy/combined/sensor-update/v2");
   const platforms = [...new Set(assignedPolicies(sensorUpdate.data.items).map((policy) => (asString(policy.platform_name) ?? "").toLowerCase()).filter(Boolean))];
   const buildsByPlatform = new Map<string, CollectedDataset<JsonRecord[]>>();
   for (const platform of platforms) {
-    buildsByPlatform.set(platform, await collectDataset(() => client.listSensorUpdateBuilds(platform), [] as JsonRecord[], `sensor builds (${platform})`));
+    buildsByPlatform.set(platform, await collectDataset(() => client.listSensorUpdateBuilds(platform), [] as JsonRecord[], `sensor builds (${platform})`, "/policy/combined/sensor-update-builds/v1"));
   }
-  const hosts = await collectDataset(() => client.listHosts(hostLimit), emptyPage<JsonRecord>(), "hosts");
-  const hostGroups = await collectDataset(() => client.listHostGroups(), emptyPage<JsonRecord>(), "host groups");
-  const unmanagedCount = await collectDataset(() => client.countDiscoverHosts("entity_type:'unmanaged'"), undefined as number | undefined, "discover unmanaged hosts");
+  const hosts = await collectDataset(() => client.listHosts(hostLimit), emptyPage<JsonRecord>(), "hosts", "/devices/combined/devices/v1");
+  const hostGroups = await collectDataset(() => client.listHostGroups(), emptyPage<JsonRecord>(), "host groups", "/devices/combined/host-groups/v1");
+  const unmanagedCount = await collectDataset(() => client.countDiscoverHosts("entity_type:'unmanaged'"), undefined as number | undefined, "discover unmanaged hosts", "/discover/queries/hosts/v1");
   const managedCount: CollectedDataset<number | undefined> = unmanagedCount.error
-    ? { data: undefined }
-    : await collectDataset(() => client.countDiscoverHosts("entity_type:'managed'"), undefined as number | undefined, "discover managed hosts");
+    ? skippedDataset(undefined as number | undefined, "discover managed hosts", "the discover unmanaged hosts count was not read", "/discover/queries/hosts/v1")
+    : await collectDataset(() => client.countDiscoverHosts("entity_type:'managed'"), undefined as number | undefined, "discover managed hosts", "/discover/queries/hosts/v1");
   const unmanagedSamples: CollectedDataset<CrowdstrikePage<JsonRecord>> = unmanagedCount.error
-    ? { data: emptyPage<JsonRecord>() }
-    : await collectDataset(() => client.listDiscoverHosts("entity_type:'unmanaged'", 100), emptyPage<JsonRecord>(), "discover unmanaged samples");
-  const ztaTotal = await collectDataset(() => client.countZtaAssessments("score:>=0"), undefined as number | undefined, "zero trust assessment totals");
+    ? skippedDataset(emptyPage<JsonRecord>(), "discover unmanaged samples", "the discover unmanaged hosts count was not read", "/discover/combined/hosts/v1")
+    : await collectDataset(() => client.listDiscoverHosts("entity_type:'unmanaged'", 100), emptyPage<JsonRecord>(), "discover unmanaged samples", "/discover/combined/hosts/v1");
+  const ztaTotal = await collectDataset(() => client.countZtaAssessments("score:>=0"), undefined as number | undefined, "zero trust assessment totals", "/zero-trust-assessment/queries/assessments/v1");
   const ztaBelow: CollectedDataset<CrowdstrikePage<JsonRecord>> = ztaTotal.error
-    ? { data: emptyPage<JsonRecord>() }
-    : await collectDataset(() => client.listZtaAssessments(`score:<${minScore}`, 1000), emptyPage<JsonRecord>(), "zero trust assessments below threshold");
+    ? skippedDataset(emptyPage<JsonRecord>(), "zero trust assessments below threshold", "the zero trust assessment totals count was not read", "/zero-trust-assessment/queries/assessments/v1")
+    : await collectDataset(() => client.listZtaAssessments(`score:<${minScore}`, 1000), emptyPage<JsonRecord>(), "zero trust assessments below threshold", "/zero-trust-assessment/queries/assessments/v1");
   const ztaBelowTotal: CollectedDataset<number | undefined> = ztaTotal.error
-    ? { data: undefined }
-    : await collectDataset(() => client.countZtaAssessments(`score:<${minScore}`), undefined as number | undefined, "zero trust assessment below-threshold totals");
+    ? skippedDataset(undefined as number | undefined, "zero trust assessment below-threshold totals", "the zero trust assessment totals count was not read", "/zero-trust-assessment/queries/assessments/v1")
+    : await collectDataset(() => client.countZtaAssessments(`score:<${minScore}`), undefined as number | undefined, "zero trust assessment below-threshold totals", "/zero-trust-assessment/queries/assessments/v1");
+  const sensorBuilds: CollectedDataset<Record<string, unknown>> = platforms.length > 0
+    ? { data: Object.fromEntries([...buildsByPlatform.entries()].map(([platform, dataset]) => [platform, snapshotOf(dataset, dataset.data)])), label: "sensor update builds", endpoint: "/policy/combined/sensor-update-builds/v1" }
+    : skippedDataset(
+      {} as Record<string, unknown>,
+      "sensor update builds",
+      isCollected(sensorUpdate) ? "no enabled and host-assigned sensor update policy named a platform to look up" : "the sensor update policies list was not read",
+      "/policy/combined/sensor-update-builds/v1",
+    );
 
   const findings = [
     sensorUpdate.error
@@ -2572,7 +3175,12 @@ export async function assessCrowdstrikeSensorCoverage(
       : withPartialInventory(evaluateSensorUpdate(sensorUpdate.data.items, buildsByPlatform), [partialInventory(sensorUpdate.data, "sensor update policies")]),
     evaluateDeploymentCompleteness(hosts, staleDays),
     evaluateHostGroupAssignment(hosts, hostGroups),
-    evaluateUnmanagedAssets(unmanagedCount, managedCount, unmanagedSamples),
+    withUnreadableSecondary(
+      evaluateUnmanagedAssets(unmanagedCount, managedCount, unmanagedSamples),
+      "Falcon Discover unmanaged asset samples",
+      [unmanagedSamples.error],
+      "the unmanaged asset sample list is unavailable",
+    ),
     evaluateZeroTrust(ztaTotal, ztaBelow, ztaBelowTotal, minScore),
   ];
 
@@ -2581,25 +3189,39 @@ export async function assessCrowdstrikeSensorCoverage(
     category: "sensor_coverage",
     summary: {
       ...assessmentSummaryBase(client.getResolvedConfig()),
-      sensor_update_policies: sensorUpdate.data.items.length,
-      enabled_and_assigned_sensor_update_policies: assignedPolicies(sensorUpdate.data.items).length,
-      sampled_hosts: hosts.data.items.length,
-      reported_total_hosts: hosts.data.total ?? "unknown",
-      hosts_truncated: hosts.data.truncated,
-      host_groups: hostGroups.data.items.length,
-      unmanaged_assets: unmanagedCount.data ?? "unavailable",
-      zta_scored_hosts: ztaTotal.data ?? "unavailable",
+      sensor_update_policies: derived(sensorUpdate.data.items.length, sensorUpdate),
+      enabled_and_assigned_sensor_update_policies: derived(assignedPolicies(sensorUpdate.data.items).length, sensorUpdate),
+      sampled_hosts: derived(hosts.data.items.length, hosts),
+      reported_total_hosts: derived(hosts.data.total ?? "unknown", hosts),
+      hosts_truncated: derived(hosts.data.truncated, hosts),
+      host_groups: derived(hostGroups.data.items.length, hostGroups),
+      unmanaged_assets: derived(unmanagedCount.data ?? "unknown", unmanagedCount),
+      zta_scored_hosts: derived(ztaTotal.data ?? "unknown", ztaTotal),
+      inventories: {
+        sensor_update_policies: describeDataset(sensorUpdate),
+        sensor_update_builds: platforms.length > 0
+          ? Object.fromEntries([...buildsByPlatform.entries()].map(([platform, dataset]) => [platform, describeDataset(dataset)]))
+          : describeDataset(sensorBuilds),
+        hosts: describeDataset(hosts),
+        host_groups: describeDataset(hostGroups),
+        discover_unmanaged_hosts: describeDataset(unmanagedCount),
+        discover_managed_hosts: describeDataset(managedCount),
+        discover_unmanaged_samples: describeDataset(unmanagedSamples),
+        zero_trust_assessment_totals: describeDataset(ztaTotal),
+        zero_trust_assessments_below_threshold: describeDataset(ztaBelow),
+        zero_trust_assessment_below_threshold_totals: describeDataset(ztaBelowTotal),
+      },
       ...statusCounts(findings),
     },
     findings,
     errors: listErrors([sensorUpdate, ...buildsByPlatform.values(), hosts, hostGroups, unmanagedCount, managedCount, unmanagedSamples, ztaTotal, ztaBelow, ztaBelowTotal]),
     snapshots: {
-      sensor_update_policies: sensorUpdate.data.items,
-      sensor_update_builds: Object.fromEntries([...buildsByPlatform.entries()].map(([platform, dataset]) => [platform, dataset.data])),
-      hosts: hosts.data.items,
-      host_groups: hostGroups.data.items,
-      discover_unmanaged_samples: unmanagedSamples.data.items,
-      zero_trust_assessments_below_threshold: ztaBelow.data.items,
+      sensor_update_policies: snapshotOf(sensorUpdate, sensorUpdate.data.items),
+      sensor_update_builds: snapshotOf(sensorBuilds, sensorBuilds.data),
+      hosts: snapshotOf(hosts, hosts.data.items),
+      host_groups: snapshotOf(hostGroups, hostGroups.data.items),
+      discover_unmanaged_samples: snapshotOf(unmanagedSamples, unmanagedSamples.data.items),
+      zero_trust_assessments_below_threshold: snapshotOf(ztaBelow, ztaBelow.data.items),
     },
   };
 }
@@ -2675,12 +3297,12 @@ function evaluateLeastPrivilege(views: UserView[], maxRoles: number, staleLoginD
   });
   const undatedPrivileged = admins.filter((view) => parseTimestamp(view.last_login_at) === undefined);
   const status: CrowdstrikeFinding["status"] = stalePrivileged.length > 0 ? "fail" : overprivileged.length > 0 ? "warn" : "pass";
+  // Scoped to the users that were read: under a truncated user list the partial-inventory clause names the
+  // unread rows, so the sentence never asserts an absence across users it did not see.
   const base = finding(
     "CS-17",
     status,
-    status === "pass"
-      ? `No user exceeds ${maxRoles} roles or stacks extra roles on an admin grant, and every dated admin login is within ${staleLoginDays} days.`
-      : `${overprivileged.length} users carry more than ${maxRoles} roles or redundant roles on top of admin, and ${stalePrivileged.length} admin accounts have a last login older than ${staleLoginDays} days.`,
+    `${views.length} users reviewed; ${overprivileged.length} carry more than ${maxRoles} roles or redundant roles on top of an admin grant, and ${stalePrivileged.length} of ${admins.length} admin accounts have a last login older than ${staleLoginDays} days.`,
     {
       users_reviewed: views.length,
       max_roles_per_user: maxRoles,
@@ -2852,15 +3474,19 @@ function evaluateIoaExclusions(exclusions: CollectedDataset<CrowdstrikePage<Json
   }));
   const broad = views.filter((view) => view.broad);
   const broadGlobal = broad.filter((view) => view.applied_globally);
-  const status: CrowdstrikeFinding["status"] = broadGlobal.length > 0 ? "fail" : broad.length > 0 ? "warn" : "pass";
+  const partial = partialInventory(exclusions.data, "IOA exclusions");
+  // Emptiness is compliant only for a complete read (the CS-23 rule).
+  const status: CrowdstrikeFinding["status"] = views.length === 0 ? (partial ? "warn" : "pass") : broadGlobal.length > 0 ? "fail" : broad.length > 0 ? "warn" : "pass";
   return withPartialInventory(finding(
     "CS-19",
     status,
     views.length === 0
-      ? "The IOA exclusions endpoint was readable and returned zero exclusions; no detection logic is being suppressed, so emptiness is compliant for this control."
+      ? partial
+        ? truncatedBeforeVisible("IOA exclusions", "exclusion", "suppression of detection logic")
+        : "The IOA exclusions endpoint was readable and returned zero exclusions; no detection logic is being suppressed, so emptiness is compliant for this control."
       : `${views.length} IOA exclusions reviewed; ${broad.length} use wildcard-only image or command line patterns (${broadGlobal.length} applied globally).`,
     { exclusions: views.length, reported_total_exclusions: exclusions.data.total, broad_exclusions: broad.slice(0, 25), globally_applied: views.filter((view) => view.applied_globally).length, listing: views.slice(0, 100) },
-  ), [partialInventory(exclusions.data, "IOA exclusions")]);
+  ), [partial]);
 }
 
 function isSensitivePath(value: string | undefined): boolean {
@@ -2884,15 +3510,18 @@ function evaluateMlExclusions(exclusions: CollectedDataset<CrowdstrikePage<JsonR
   }));
   const sensitive = views.filter((view) => view.sensitive);
   const sensitiveGlobal = sensitive.filter((view) => view.applied_globally);
-  const status: CrowdstrikeFinding["status"] = sensitiveGlobal.length > 0 ? "fail" : sensitive.length > 0 ? "warn" : "pass";
+  const partial = partialInventory(exclusions.data, "ML exclusions");
+  const status: CrowdstrikeFinding["status"] = views.length === 0 ? (partial ? "warn" : "pass") : sensitiveGlobal.length > 0 ? "fail" : sensitive.length > 0 ? "warn" : "pass";
   return withPartialInventory(finding(
     "CS-20",
     status,
     views.length === 0
-      ? "The ML exclusions endpoint was readable and returned zero exclusions; no machine learning coverage is being suppressed, so emptiness is compliant for this control."
+      ? partial
+        ? truncatedBeforeVisible("ML exclusions", "exclusion", "suppression of machine learning coverage")
+        : "The ML exclusions endpoint was readable and returned zero exclusions; no machine learning coverage is being suppressed, so emptiness is compliant for this control."
       : `${views.length} ML exclusions reviewed; ${sensitive.length} cover system, program, user, or temp directories or broad wildcards (${sensitiveGlobal.length} applied globally).`,
     { exclusions: views.length, reported_total_exclusions: exclusions.data.total, sensitive_exclusions: sensitive.slice(0, 25), globally_applied: views.filter((view) => view.applied_globally).length, listing: views.slice(0, 100) },
-  ), [partialInventory(exclusions.data, "ML exclusions")]);
+  ), [partial]);
 }
 
 function hidesDirectory(value: string | undefined): boolean {
@@ -2915,15 +3544,18 @@ function evaluateSensorVisibilityExclusions(exclusions: CollectedDataset<Crowdst
   }));
   const hiding = views.filter((view) => view.hides_directory);
   const hidingGlobal = hiding.filter((view) => view.applied_globally);
-  const status: CrowdstrikeFinding["status"] = hidingGlobal.length > 0 ? "fail" : hiding.length > 0 ? "warn" : "pass";
+  const partial = partialInventory(exclusions.data, "sensor visibility exclusions");
+  const status: CrowdstrikeFinding["status"] = views.length === 0 ? (partial ? "warn" : "pass") : hidingGlobal.length > 0 ? "fail" : hiding.length > 0 ? "warn" : "pass";
   return withPartialInventory(finding(
     "CS-21",
     status,
     views.length === 0
-      ? "The sensor visibility exclusions endpoint was readable and returned zero exclusions; nothing is hidden from the sensor, so emptiness is compliant for this control."
+      ? partial
+        ? truncatedBeforeVisible("sensor visibility exclusions", "exclusion", "paths hidden from the sensor")
+        : "The sensor visibility exclusions endpoint was readable and returned zero exclusions; nothing is hidden from the sensor, so emptiness is compliant for this control."
       : `${views.length} sensor visibility exclusions reviewed; ${hiding.length} hide entire directories or sensitive paths from the sensor (${hidingGlobal.length} applied globally).`,
     { exclusions: views.length, reported_total_exclusions: exclusions.data.total, directory_exclusions: hiding.slice(0, 25), globally_applied: views.filter((view) => view.applied_globally).length, listing: views.slice(0, 100) },
-  ), [partialInventory(exclusions.data, "sensor visibility exclusions")]);
+  ), [partial]);
 }
 
 const IDENTITY_CONSOLE_EVIDENCE = "capture the Identity Protection policy rule list (enabled, enforcement action, simulation mode) from Falcon console > Identity protection > Policy management, or provide evidence of an equivalent identity threat protection control.";
@@ -2951,15 +3583,21 @@ function evaluateIdentityProtection(rules: CollectedDataset<CrowdstrikePage<Json
   });
   const active = views.filter((view) => view.enabled && !view.simulation_mode);
   const enforcing = views.filter((view) => view.enforcing);
+  const partial = partialInventory(rules.data, "Identity Protection policy rules");
+  // Zero visible rules of a truncated list is a claim about the unread rules (`absence_claim`, rendered
+  // manual by withPartialInventory); zero rules on a complete read fails.
+  const emptyPartial = views.length === 0 && partial !== undefined;
   const status: CrowdstrikeFinding["status"] = views.length === 0 ? "fail" : enforcing.length > 0 ? "pass" : active.length > 0 ? "warn" : "fail";
   return withPartialInventory(finding(
     "CS-24",
     status,
     views.length === 0
-      ? "Identity Protection policy rules were readable but zero rules exist, so identity-based lateral movement is not being prevented; emptiness fails this control."
+      ? emptyPartial
+        ? truncatedBeforeVisible("Identity Protection policy rules", "rule", "identity-based lateral movement prevention")
+        : "Identity Protection policy rules were readable but zero rules exist, so identity-based lateral movement is not being prevented; emptiness fails this control."
       : `${enforcing.length} of ${views.length} Identity Protection policy rules actively enforce (block, MFA, or verification) outside simulation mode; ${active.length} rules are enabled in total.`,
-    { rules: views.length, active_rules: active.length, enforcing_rules: enforcing.length, listing: views.slice(0, 50) },
-  ), [partialInventory(rules.data, "Identity Protection policy rules")]);
+    { ...(emptyPartial ? { absence_claim: true } : {}), rules: views.length, active_rules: active.length, enforcing_rules: enforcing.length, listing: views.slice(0, 50) },
+  ), [partial]);
 }
 
 const USER_CONSOLE_EVIDENCE = "export the user list with roles and last login dates from Falcon console > Users and roles and count Falcon Administrator grants.";
@@ -2986,34 +3624,41 @@ export async function assessCrowdstrikeAccessGovernance(
   const maxRoles = clampNumber(options.maxRolesPerUser, DEFAULT_MAX_ROLES_PER_USER, 1, 100);
   const maxWriteClients = clampNumber(options.maxWriteClients, DEFAULT_MAX_WRITE_CLIENTS, 0, 10_000);
 
-  const uuids = await collectDataset(() => client.listUserUuids(userLimit), emptyPage<string>(), "user uuids");
+  const uuids = await collectDataset(() => client.listUserUuids(userLimit), emptyPage<string>(), "user uuids", "/user-management/queries/users/v1");
   const users: CollectedDataset<JsonRecord[]> = uuids.error
-    ? { data: [] }
-    : await collectDataset(() => client.getUsers(uuids.data.items), [] as JsonRecord[], "users");
+    ? skippedDataset([] as JsonRecord[], "users", "the user uuid list was not read", "/user-management/entities/users/GET/v1")
+    : await collectDataset(() => client.getUsers(uuids.data.items), [] as JsonRecord[], "users", "/user-management/entities/users/GET/v1");
   const rolesByUser = new Map<string, JsonRecord[]>();
+  const roleSnapshots: Record<string, unknown> = {};
   const roleErrors: string[] = [];
   let rolesTruncated = 0;
   for (const user of users.data) {
     const uuid = asString(user.uuid) ?? asString(user.id);
     if (!uuid) continue;
-    try {
-      const rolePage = await client.listUserRoles(uuid);
-      rolesByUser.set(uuid, rolePage.items);
-      if (rolePage.truncated) rolesTruncated += 1;
-    } catch (error) {
-      roleErrors.push(`user roles (${uuid}): ${summarizeError(error)}`);
+    const rolePage = await collectDataset(() => client.listUserRoles(uuid), emptyPage<JsonRecord>(), `user roles (${uuid})`, "/user-management/combined/user-roles/v2");
+    roleSnapshots[uuid] = snapshotOf(rolePage, rolePage.data.items);
+    if (rolePage.error) {
+      roleErrors.push(rolePage.error);
+      continue;
     }
+    rolesByUser.set(uuid, rolePage.data.items);
+    if (rolePage.data.truncated) rolesTruncated += 1;
   }
-  const roleCatalog = await collectDataset(() => client.listRoles(), emptyPage<JsonRecord>(), "role catalog");
-  const apiClients = await collectDataset(() => client.listApiClients(userLimit), emptyPage<JsonRecord>(), "api clients");
-  const ioa = await collectDataset(() => client.listIoaExclusions(exclusionLimit), emptyPage<JsonRecord>(), "ioa exclusions");
-  const ml = await collectDataset(() => client.listMlExclusions(exclusionLimit), emptyPage<JsonRecord>(), "ml exclusions");
-  const sv = await collectDataset(() => client.listSensorVisibilityExclusions(exclusionLimit), emptyPage<JsonRecord>(), "sensor visibility exclusions");
-  const identity = await collectDataset(() => client.listIdentityProtectionRules(), emptyPage<JsonRecord>(), "identity protection rules");
+  const roleCatalog = await collectDataset(() => client.listRoles(), emptyPage<JsonRecord>(), "role catalog", "/user-management/queries/roles/v1");
+  const apiClients = await collectDataset(() => client.listApiClients(userLimit), emptyPage<JsonRecord>(), "api clients", "/api-clients/queries/api-clients/v1");
+  // Exclusion regexes, paths, and notes are operator-authored text that can carry literal tokens and
+  // passwords; the redaction pass runs over them before they reach evidence, summaries, or the bundle.
+  const ioa = projectPage(await collectDataset(() => client.listIoaExclusions(exclusionLimit), emptyPage<JsonRecord>(), "ioa exclusions", "/policy/queries/ioa-exclusions/v1"), scrubExclusionText);
+  const ml = projectPage(await collectDataset(() => client.listMlExclusions(exclusionLimit), emptyPage<JsonRecord>(), "ml exclusions", "/policy/queries/ml-exclusions/v1"), scrubExclusionText);
+  const sv = projectPage(await collectDataset(() => client.listSensorVisibilityExclusions(exclusionLimit), emptyPage<JsonRecord>(), "sensor visibility exclusions", "/policy/queries/sv-exclusions/v1"), scrubExclusionText);
+  const identity = await collectDataset(() => client.listIdentityProtectionRules(), emptyPage<JsonRecord>(), "identity protection rules", "/identity-protection/queries/policy-rules/v1");
 
   const views = buildUserViews(users.data, rolesByUser);
   const usersUnavailable = uuids.error ?? users.error;
   const allRolesFailed = views.length > 0 && views.every((view) => !view.roles_readable);
+  const userRoles: CollectedDataset<Record<string, unknown>> = usersUnavailable
+    ? skippedDataset({} as Record<string, unknown>, "user roles", uuids.error ? "the user uuid list was not read" : "the user details were not read", "/user-management/combined/user-roles/v2")
+    : { data: roleSnapshots, label: "user roles", endpoint: "/user-management/combined/user-roles/v2" };
   const userPartial = partialInventory(uuids.data, "users");
   const userFinding = (id: ControlId, evaluate: () => CrowdstrikeFinding): CrowdstrikeFinding => {
     if (usersUnavailable) {
@@ -3030,9 +3675,14 @@ export async function assessCrowdstrikeAccessGovernance(
     if (allRolesFailed) {
       return unreadableFinding(id, "user role grants", roleErrors[0] ?? "role lookups failed", USER_CONSOLE_EVIDENCE);
     }
-    return withPartialInventory(
-      withRoleVisibility(evaluate(), views, roleErrors, rolesTruncated),
-      [userPartial, partialInventory(roleCatalog.data, "roles in the role catalog")],
+    return withUnreadableSecondary(
+      withPartialInventory(
+        withRoleVisibility(evaluate(), views, roleErrors, rolesTruncated),
+        [userPartial, partialInventory(roleCatalog.data, "roles in the role catalog")],
+      ),
+      "role catalog",
+      [roleCatalog.error],
+      "the role inventory could not be checked for completeness against the catalog",
     );
   };
 
@@ -3051,34 +3701,48 @@ export async function assessCrowdstrikeAccessGovernance(
     category: "access_governance",
     summary: {
       ...assessmentSummaryBase(client.getResolvedConfig()),
-      users_reviewed: views.length,
-      reported_total_users: uuids.data.total ?? "unknown",
-      users_truncated: uuids.data.truncated,
-      role_lookups_failed: roleErrors.length,
-      role_pages_truncated: rolesTruncated,
-      admin_users: views.filter((view) => view.admin_roles.length > 0).length,
-      roles_in_catalog: roleCatalog.data.items.length,
-      reported_total_roles: roleCatalog.data.total ?? "unknown",
-      role_catalog_truncated: roleCatalog.data.truncated,
-      api_clients: apiClients.data.items.length,
-      ioa_exclusions: ioa.data.items.length,
-      ml_exclusions: ml.data.items.length,
-      sensor_visibility_exclusions: sv.data.items.length,
+      users_reviewed: derived(views.length, uuids, users),
+      reported_total_users: derived(uuids.data.total ?? "unknown", uuids),
+      users_truncated: derived(uuids.data.truncated, uuids),
+      role_lookups_failed: derived(roleErrors.length, uuids, users),
+      role_pages_truncated: derived(rolesTruncated, uuids, users),
+      // Admin grants come from the per-user role lookups; with none readable the count is unknown, not zero.
+      admin_users: allRolesFailed ? null : derived(views.filter((view) => view.admin_roles.length > 0).length, uuids, users),
+      roles_in_catalog: roleCatalog.error ? "unavailable" : roleCatalog.data.items.length,
+      reported_total_roles: roleCatalog.error ? "unavailable" : roleCatalog.data.total ?? "unknown",
+      role_catalog_truncated: roleCatalog.error ? "unavailable" : roleCatalog.data.truncated,
+      api_clients: derived(apiClients.data.items.length, apiClients),
+      ioa_exclusions: derived(ioa.data.items.length, ioa),
+      ml_exclusions: derived(ml.data.items.length, ml),
+      sensor_visibility_exclusions: derived(sv.data.items.length, sv),
       identity_protection_rules: identity.error ? "unavailable" : identity.data.items.length,
       identity_protection_rules_truncated: identity.error ? "unavailable" : identity.data.truncated,
+      inventories: {
+        user_uuids: describeDataset(uuids),
+        users: describeDataset(users),
+        user_roles: usersUnavailable
+          ? describeDataset(userRoles)
+          : `read for ${rolesByUser.size} of ${views.length} users (${roleErrors.length} lookups failed, ${rolesTruncated} truncated)`,
+        roles: describeDataset(roleCatalog),
+        api_clients: describeDataset(apiClients),
+        ioa_exclusions: describeDataset(ioa),
+        ml_exclusions: describeDataset(ml),
+        sensor_visibility_exclusions: describeDataset(sv),
+        identity_protection_rules: describeDataset(identity),
+      },
       ...statusCounts(findings),
     },
     findings,
     errors: [...listErrors([uuids, users, roleCatalog, apiClients, ioa, ml, sv, identity]), ...roleErrors],
     snapshots: {
-      users: users.data,
-      user_roles: Object.fromEntries(rolesByUser),
-      roles: roleCatalog.data.items,
-      api_clients: apiClients.data.items,
-      ioa_exclusions: ioa.data.items,
-      ml_exclusions: ml.data.items,
-      sensor_visibility_exclusions: sv.data.items,
-      identity_protection_rules: identity.data.items,
+      users: snapshotOf(users, users.data),
+      user_roles: snapshotOf(userRoles, userRoles.data),
+      roles: snapshotOf(roleCatalog, roleCatalog.data.items),
+      api_clients: snapshotOf(apiClients, apiClients.data.items),
+      ioa_exclusions: snapshotOf(ioa, ioa.data.items),
+      ml_exclusions: snapshotOf(ml, ml.data.items),
+      sensor_visibility_exclusions: snapshotOf(sv, sv.data.items),
+      identity_protection_rules: snapshotOf(identity, identity.data.items),
     },
   };
 }
@@ -3243,10 +3907,11 @@ function buildQuickReference(assessments: CrowdstrikeAssessmentResult[], hasErro
     "## Contents",
     "",
     "- `metadata.json`: non-secret run metadata (API base URL, member CID scope, source chain, timestamps).",
-    "- `core_data/<category>/*.json`: raw Falcon API snapshots collected for each assessment.",
+    "- `core_data/<category>/*.json`: Falcon API snapshots collected for each assessment, projected and redacted: alerts and RTR audit sessions keep verdict fields only (process command lines, file paths, and RTR command strings are never exported) and exclusion regexes, paths, and notes pass through the credential redaction pass.",
+    "- A dataset that was denied, errored, or never requested is written as `{ \"collected\": false, \"dataset\", \"status\", \"endpoint\", \"error\" }` instead of an empty array; a readable dataset with no items keeps its array shape. A dependent read that was skipped names the parent read in `error` as `not requested: ...`.",
     "- `analysis/findings.json`: every normalized finding with severity, status, evidence, and framework mappings.",
-    "- `analysis/<category>.json`: per-assessment summaries and findings.",
-    "- `analysis/access_check.json`: readable Falcon API surfaces and missing scopes.",
+    "- `analysis/<category>.json`: per-assessment summaries and findings. Summary counts and truncation flags derived from a dataset that was not read render `null`, and `summary.inventories` states each dataset's read, truncated, unread, or not requested state.",
+    "- `analysis/access_check.json`: readable Falcon API surfaces, the HTTP status of each failed probe, and missing scopes; error strings carry a status-and-length note in place of any non-JSON error body.",
     "- `compliance/executive_summary.md`: prioritized summary for leadership and auditors.",
     "- `compliance/unified_compliance_matrix.md`: every control mapped across all frameworks.",
     "- `compliance/frameworks/<framework>.md`: one report per framework (FedRAMP, CMMC, SOC 2, CIS, PCI-DSS, DISA STIG, IRAP, ISMAP).",
@@ -3261,7 +3926,7 @@ function buildQuickReference(assessments: CrowdstrikeAssessmentResult[], hasErro
     "1. `compliance/executive_summary.md`",
     "2. `compliance/unified_compliance_matrix.md`",
     "3. the framework report your assessor needs",
-    "4. `analysis/findings.json` for evidence details, then `core_data/` for raw payloads",
+    "4. `analysis/findings.json` for evidence details, then `core_data/` for the projected snapshots",
     "",
   ].join("\n");
 }
@@ -3602,7 +4267,7 @@ export function registerCrowdstrikeTools(pi: any): void {
     name: "crowdstrike_export_audit_bundle",
     label: "Export CrowdStrike audit bundle",
     description:
-      "Export a CrowdStrike Falcon audit package covering all 25 spec controls: raw API snapshots, normalized findings, executive summary, unified compliance matrix, per-framework reports (FedRAMP, CMMC, SOC 2, CIS, PCI-DSS, DISA STIG, IRAP, ISMAP), quick reference, error log, and a zip archive named after the allocated bundle directory.",
+      "Export a CrowdStrike Falcon audit package covering all 25 spec controls: projected and redacted API snapshots (with not-collected markers for denied datasets), normalized findings, executive summary, unified compliance matrix, per-framework reports (FedRAMP, CMMC, SOC 2, CIS, PCI-DSS, DISA STIG, IRAP, ISMAP), quick reference, error log, and a zip archive named after the allocated bundle directory.",
     parameters: Type.Object({
       ...authParams,
       ...hostParams,

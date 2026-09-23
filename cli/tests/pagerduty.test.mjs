@@ -5,6 +5,7 @@ import {
   mkdtempSync,
   readFileSync,
   readdirSync,
+  rmSync,
   symlinkSync,
   writeFileSync,
 } from "node:fs";
@@ -15,15 +16,19 @@ import {
   DEFAULT_AUDIT_LIMIT,
   PAGERDUTY_CONTROLS,
   PagerdutyApiClient,
+  PagerdutyRequestError,
   assessPagerdutyAccessControl,
   assessPagerdutyAuditLogging,
   assessPagerdutyIncidentResponse,
   assessPagerdutyIntegrationSecurity,
   assessPagerdutyOncallCoverage,
   checkPagerdutyAccess,
+  collectPagerdutyAccessControlData,
   collectionOf,
   exportPagerdutyAuditBundle,
   findingId,
+  redactSnapshot,
+  reduceUrl,
   registerPagerdutyTools,
   resolvePagerdutyConfiguration,
   resolveSecureOutputPath,
@@ -35,9 +40,21 @@ import {
   scheduleCoverageGaps,
 } from "../dist/extensions/grc-tools/pagerduty.js";
 import { getRegisteredToolSummaries } from "../dist/pi/tool-catalog.js";
+import { assertSecretFragmentsAbsent, readBundleFiles, readZipEntries } from "./helpers/bundle-contents.mjs";
+import { CONFIG_CANARIES, assertConfigLoaderMatrix, configLoaderCases } from "./helpers/config-loader-matrix.mjs";
+import { assertFixedTextsSurvive, collectFixedTexts, collectThrownMessage, collectToolTexts, logLines } from "./helpers/fixed-text-survival.mjs";
+import { assertFragmentsAbsent, assertPlantedValuesWellFormed } from "./helpers/planted-values.mjs";
+import { BARE_TOKEN_CONTROL, CONFIGURED_SECRET_CANARIES, VENDOR_TOKEN_CANARIES, assertTextFieldCarriers, carrierSuffix, injectingFetch } from "./helpers/text-field-carriers.mjs";
+import { assertDeepCanariesWellFormed, assertDeepNesting, deepFields, plantingFetch } from "./helpers/deep-nesting.mjs";
+import { ESCAPE_CANARIES, ESCAPE_CANARY_PLANTED_VALUES, escapeBoundaryTrace } from "./helpers/escape-boundary.mjs";
+import { assertScrubBoundary } from "./helpers/scrub-boundary-matrix.mjs";
 
 const NOW = new Date("2026-09-21T00:00:00.000Z");
-const EMPTY_ENV = { PAGERDUTY_CONFIG_FILE: "/nonexistent/pagerduty.json" };
+// An explicit config path must exist (a missing explicit file is a read error), so isolation from
+// the operator's ~/.config/grclanker/pagerduty.json uses an empty JSON object in a scratch directory.
+const EMPTY_CONFIG_FILE = join(mkdtempSync(join(tmpdir(), "grclanker-pagerduty-empty-config-")), "pagerduty.json");
+writeFileSync(EMPTY_CONFIG_FILE, "{}\n");
+const EMPTY_ENV = { PAGERDUTY_CONFIG_FILE: EMPTY_CONFIG_FILE };
 const DAY_MS = 24 * 60 * 60 * 1000;
 const COVERAGE_UNTIL = new Date(NOW.getTime() + 30 * DAY_MS);
 const COVERAGE_WINDOW = { since: NOW.toISOString(), until: COVERAGE_UNTIL.toISOString(), days: 30 };
@@ -52,10 +69,13 @@ function createTempBase(prefix) {
   return mkdtempSync(join(tmpdir(), prefix));
 }
 
+/** The configured REST API key: a planted credential, so random-looking (see the planted-values self-check). */
+const SAMPLE_API_TOKEN = "WjB6eRwTvdctKEemdV";
+
 function sampleConfig(overrides = {}) {
   return {
     authMode: "api_token",
-    apiToken: "pd-secret-token",
+    apiToken: SAMPLE_API_TOKEN,
     region: "us",
     baseUrl: "https://api.pagerduty.com",
     identityTokenUrl: "https://identity.pagerduty.com/oauth/token",
@@ -412,7 +432,7 @@ test("resolvePagerdutyConfiguration prefers explicit args over environment value
       region: "eu",
       from_email: "auditor@example.com",
       timeout_seconds: 9,
-      config_file: "/nonexistent/pagerduty.json",
+      config_file: EMPTY_CONFIG_FILE,
     },
     {
       PAGERDUTY_API_TOKEN: "env-token",
@@ -484,6 +504,38 @@ test("resolvePagerdutyConfiguration selects OAuth auth modes and reads config fi
   assert.throws(() => resolvePagerdutyConfiguration({}, EMPTY_ENV), /PagerDuty credentials are required/);
 });
 
+test("addendum 6b: the JSON config loader reports read and parse failures with fixed text and never quotes the file, JSON.parse, or the fs error", async () => {
+  const cases = configLoaderCases({ format: "json", displayName: "PagerDuty", fileNoun: "config file", extension: ".json" });
+  assert.deepEqual(cases.map((item) => item.name), [
+    "json unquoted value",
+    "json short source",
+    "json trailing comma with position",
+    "EISDIR",
+    "EACCES",
+    "ENOENT on an explicit path",
+  ]);
+  const registered = [];
+  registerPagerdutyTools({ registerTool: (tool) => registered.push(tool) });
+  const checkAccess = registered.find((tool) => tool.name === "pagerduty_check_access");
+  await assertConfigLoaderMatrix(cases, {
+    resolve: (path) => resolvePagerdutyConfiguration({ config_file: path }, {}),
+    checkAccess: (path) => checkAccess.execute("call-config", checkAccess.prepareArguments({ config_file: path })),
+  });
+  // The env-pointed path is explicit as well: the same defect there is a parse failure, and a missing file a read error.
+  const [unquoted] = cases;
+  assert.throws(() => resolvePagerdutyConfiguration({}, { PAGERDUTY_CONFIG_FILE: unquoted.path }), (error) => {
+    assert.equal(error.message, unquoted.expectedMessage);
+    assert.equal(error.code, "INVALID_JSON");
+    return true;
+  });
+  const absent = join(createTempBase("grclanker-pagerduty-absent-"), "absent.json");
+  assert.throws(() => resolvePagerdutyConfiguration({}, { PAGERDUTY_CONFIG_FILE: absent }), (error) => {
+    assert.equal(error.message, `Unable to read PagerDuty config file ${absent} (ENOENT)`);
+    assert.equal(error.code, "ENOENT");
+    return true;
+  });
+});
+
 test("PagerdutyApiClient sends the versioned Accept header, Token auth, and follows classic pagination to completion", async () => {
   const seen = [];
   const fetchImpl = async (input, init = {}) => {
@@ -512,7 +564,7 @@ test("PagerdutyApiClient sends the versioned Accept header, Token auth, and foll
   assert.equal(seen.length, 2);
   assert.equal(seen[0].pathname, "/users");
   assert.equal(seen[0].accept, "application/vnd.pagerduty+json;version=2");
-  assert.equal(seen[0].auth, "Token token=pd-secret-token");
+  assert.equal(seen[0].auth, `Token token=${SAMPLE_API_TOKEN}`);
   assert.equal(seen[0].params.offset, "0");
   assert.equal(seen[0].params.total, "true");
   assert.equal(seen[1].params.offset, "1");
@@ -572,7 +624,7 @@ test("PagerdutyApiClient retries 429 and 5xx responses using ratelimit headers",
 test("PagerdutyApiClient surfaces API errors with redacted tokens", async () => {
   const fetchImpl = async () =>
     jsonResponse(
-      { error: { message: "Access denied for token pd-secret-token", code: 2010, errors: ["insufficient scope"] } },
+      { error: { message: `Access denied for token ${SAMPLE_API_TOKEN}`, code: 2010, errors: ["insufficient scope"] } },
       { status: 403, statusText: "Forbidden" },
     );
 
@@ -581,7 +633,7 @@ test("PagerdutyApiClient surfaces API errors with redacted tokens", async () => 
     assert.equal(error.status, 403);
     assert.match(error.message, /403 Forbidden/);
     assert.match(error.message, /insufficient scope/);
-    assert.ok(!error.message.includes("pd-secret-token"));
+    assertFragmentsAbsent(assert, error.message, [SAMPLE_API_TOKEN], "error message echoing the API key");
     assert.ok(error.message.includes("[REDACTED]"));
     return true;
   });
@@ -1919,8 +1971,8 @@ test("exportPagerdutyAuditBundle writes core data, analysis, compliance reports,
   assert.match(matrix, /PD-01/);
   assert.match(matrix, /PD-25/);
   const summary = readFileSync(join(result.outputDir, "compliance", "executive_summary.md"), "utf8");
-  assert.ok(!summary.includes("pd-secret-token"));
-  assert.ok(!readFileSync(join(result.outputDir, "core_data", "access_check.json"), "utf8").includes("pd-secret-token"));
+  assertFragmentsAbsent(assert, summary, [SAMPLE_API_TOKEN], "executive summary");
+  assertFragmentsAbsent(assert, readFileSync(join(result.outputDir, "core_data", "access_check.json"), "utf8"), [SAMPLE_API_TOKEN], "access_check.json");
 });
 
 test("exportPagerdutyAuditBundle records partial collection failures in _errors.log", async () => {
@@ -1989,4 +2041,1520 @@ test("PagerDuty tools are registered in the tool catalog under the PagerDuty gro
     assert.equal(tool.group, "PagerDuty", `${tool.name} group`);
     assert.ok(tool.description.length > 20, `${tool.name} description`);
   }
+});
+
+// Verdict safety rules 9 and 10 (export credential hygiene and pagination truncation), plus the rule 1 corollary.
+
+/**
+ * Random-looking alphanumeric planted secrets; the bundle and zip scans check every substring of them at
+ * lengths 6 through 24. The inbound email's local part and the Slack webhook path's secret segment are the
+ * planted values; their fixed surroundings (`@example.pagerduty.com`, `T0FAKE/B0FAKE/`) are added at the plant site.
+ */
+const FAKE_PAGERDUTY_SECRETS = {
+  integrationKey: "3XnuC3YjgaXwrN8krz",
+  integrationEmail: "D7ePYs8LEMsRqFTwy8",
+  slackWebhookPath: "gRGTPKptPmUt9CkWQP",
+  extensionUrlToken: "BWf7DSVupXeuZRagtp",
+  snowPassword: "jFQbwYfhySPpDdR8jg",
+  webhookPathSecret: "ZKGD9nYbzN8SWnFdLs",
+  webhookHeader: "Ayz7WucqBw89qWnmb5",
+  deliverySecret: "tvurJUAQrzbu3GJ5XN",
+  workflowUrlToken: "xYtFC7ZxDzSt3vPHs4",
+  workflowHeader: "SZ6rTaBn7xLdkpPXLw",
+  changeEventApiKey: "g7Y5mqtqHaU98JFu73",
+  changeEventLinkToken: "7ATZj5mshYWwkGmdma",
+  auditFieldUrlSecret: "yPynAQd8eG9pNR7Z4c",
+  phoneNumber: "ek6KS4LYkZArQXRe8a",
+  pushAddress: "tUCgjfzM7pMFTtHg4U",
+};
+
+function secretBearingPagerdutyClient() {
+  const fixtures = healthyFixtures();
+  const secrets = FAKE_PAGERDUTY_SECRETS;
+  return healthyClient({
+    async listUsers() {
+      return collectionOf(fixtures.users.map((item) => ({
+        ...item,
+        contact_methods: [
+          { id: `${item.id}-email`, type: "email_contact_method", enabled: true, address: item.email },
+          { id: `${item.id}-phone`, type: "phone_contact_method", enabled: true, blacklisted: false, address: secrets.phoneNumber, country_code: 1 },
+          { id: `${item.id}-push`, type: "push_notification_contact_method", enabled: true, blacklisted: false, address: secrets.pushAddress, device_type: "ios" },
+        ],
+      })));
+    },
+    async listServices() {
+      return collectionOf([
+        service("svc-1", {
+          integrations: [
+            { id: "svc-1-int", summary: "Events API v2", type: "events_api_v2_inbound_integration", integration_key: secrets.integrationKey },
+            { id: "svc-1-email", summary: "Email", type: "generic_email_inbound_integration", email_filter_mode: "or-rules-email", integration_email: `${secrets.integrationEmail}@example.pagerduty.com` },
+          ],
+        }),
+        service("svc-2", { incident_urgency_rule: { type: "constant", urgency: "high" } }),
+      ]);
+    },
+    async listExtensions() {
+      return collectionOf([
+        {
+          id: "ext-1",
+          summary: "Slack",
+          endpoint_url: `https://hooks.slack.com/services/T0FAKE/B0FAKE/${secrets.slackWebhookPath}`,
+          extension_schema: { summary: "Slack V2" },
+          config: { channel: "#alerts", snow_user: "pagerduty", snow_password: secrets.snowPassword },
+        },
+        {
+          id: "ext-2",
+          summary: "Legacy receiver",
+          endpoint_url: `http://receiver.example.com/hook?token=${secrets.extensionUrlToken}`,
+          extension_schema: { summary: "Generic V2 Webhook" },
+        },
+      ]);
+    },
+    async listWebhookSubscriptions() {
+      return collectionOf([{
+        id: "wh-1",
+        description: "SIEM",
+        active: true,
+        delivery_method: {
+          type: "http_delivery_method",
+          url: `https://siem.example.com/pd/${secrets.webhookPathSecret}`,
+          custom_headers: [{ name: "Authorization", value: `Bearer ${secrets.webhookHeader}` }],
+          secret: secrets.deliverySecret,
+        },
+      }]);
+    },
+    async listIncidentWorkflows() {
+      return collectionOf([{
+        id: "wf-1",
+        name: "Page leadership",
+        is_enabled: true,
+        steps: [{
+          id: "step-1",
+          name: "Notify",
+          action_configuration: {
+            action_id: "pagerduty.com:http:send-request:1",
+            inputs: [
+              { name: "url", value: `https://automation.example.com/hook?token=${secrets.workflowUrlToken}` },
+              { name: "headers", value: `Authorization: ${secrets.workflowHeader}` },
+            ],
+          },
+        }],
+      }]);
+    },
+    async listChangeEvents() {
+      return collectionOf([{
+        id: "chg-1",
+        summary: "deploy 1.2.3",
+        timestamp: new Date(NOW.getTime() - DAY_MS).toISOString(),
+        services: [{ id: "svc-1" }],
+        custom_details: { api_key: secrets.changeEventApiKey, build: "1.2.3" },
+        links: [{ href: `https://ci.example.com/run/42?token=${secrets.changeEventLinkToken}` }],
+      }]);
+    },
+    async listAuditRecords(since) {
+      return collectionOf([
+        auditRecord("audit-1", new Date(since.getTime() + DAY_MS).toISOString(), {
+          details: {
+            resource: { id: "ext-1", type: "extension_reference" },
+            fields: [{ name: "endpoint_url", value: `https://hooks.slack.com/services/${secrets.auditFieldUrlSecret}` }],
+          },
+        }),
+      ]);
+    },
+  });
+}
+
+test("verdict safety rule 9: redactSnapshot masks secret-named keys, name/value pairs, and URL query tokens while reduceUrl keeps only scheme and host", () => {
+  const redacted = redactSnapshot({
+    integration_key: "FAKE_KEY",
+    Integration_Key: "FAKE_KEY_2",
+    "routing-key": "FAKE_ROUTING",
+    nested: { authorization: "Bearer FAKE", custom_headers: [{ name: "X-Api-Key", value: "FAKE_HEADER" }, { name: "Accept", value: "application/json" }] },
+    inputs: [{ name: "webhook token", value: "FAKE_INPUT" }],
+    html_url: "https://example.pagerduty.com/services/P123?access_token=FAKE_QUERY&page=2",
+    truncated_token: "abcd",
+    enabled: true,
+    is_secret: false,
+    secret_missing: null,
+  });
+  assert.equal(redacted.integration_key, "[REDACTED]");
+  assert.equal(redacted.Integration_Key, "[REDACTED]");
+  assert.equal(redacted["routing-key"], "[REDACTED]");
+  assert.equal(redacted.nested.authorization, "[REDACTED]");
+  assert.deepEqual(redacted.nested.custom_headers, [{ name: "X-Api-Key", value: "[REDACTED]" }, { name: "Accept", value: "application/json" }]);
+  assert.deepEqual(redacted.inputs, [{ name: "webhook token", value: "[REDACTED]" }]);
+  assert.equal(redacted.html_url, "https://example.pagerduty.com/services/P123?[REDACTED]", "a URL query string is a carrier: it goes whole, the path stays");
+  assert.equal(redacted.truncated_token, "abcd", "the vendor-truncated four character suffix PD-13 counts is not a secret");
+  assert.equal(redacted.enabled, true);
+  assert.equal(redacted.is_secret, false, "boolean flags keep their value even under a secret-named key");
+  assert.equal(redacted.secret_missing, null);
+
+  let deep = { leaf: "value" };
+  for (let depth = 0; depth < 40; depth += 1) deep = { child: deep };
+  assert.match(JSON.stringify(redactSnapshot(deep)), /"\[REDACTED\]"/, "recursion stops at the depth cap with the marker");
+
+  assert.equal(reduceUrl("https://hooks.slack.com/services/T0/B0/SECRET"), "https://hooks.slack.com/[REDACTED]");
+  assert.equal(reduceUrl("http://receiver.example.com/hook?token=SECRET"), "http://receiver.example.com/[REDACTED]");
+  assert.equal(reduceUrl("https://user:pass@siem.example.com/"), "https://siem.example.com/[REDACTED]");
+  assert.equal(reduceUrl("https://siem.example.com:8443/"), "https://siem.example.com:8443");
+  assert.equal(reduceUrl("not a url"), "[REDACTED]");
+  assert.equal(reduceUrl(undefined), undefined);
+});
+
+test("verdict safety rule 9: exportPagerdutyAuditBundle never writes integration keys, webhook URL secrets, extension config, header values, workflow inputs, change event details, or audit field values into the bundle, its zip, or the tool payloads", async () => {
+  const base = createTempBase("grclanker-pagerduty-export-secrets-");
+  const secrets = Object.values(FAKE_PAGERDUTY_SECRETS);
+  const client = secretBearingPagerdutyClient();
+  const result = await exportPagerdutyAuditBundle(client, sampleConfig(), base, { maxAdmins: 3 });
+  assert.equal(result.errorCount, 0);
+  assert.equal(result.findingCount, 25);
+
+  const files = readBundleFiles(result.outputDir);
+  for (const file of [
+    "core_data/users.json",
+    "core_data/services.json",
+    "core_data/extensions.json",
+    "core_data/webhook_subscriptions.json",
+    "core_data/incident_workflows.json",
+    "core_data/change_events.json",
+    "core_data/audit_records_recent.json",
+    "analysis/integration_security.json",
+    "analysis/findings.json",
+    "compliance/executive_summary.md",
+  ]) {
+    assert.ok(files.has(file), `expected ${file} in ${[...files.keys()].join(", ")}`);
+  }
+  assertSecretFragmentsAbsent(assert, files, secrets, "bundle directory");
+  const zipEntries = readZipEntries(result.zipPath);
+  assert.equal(zipEntries.size, files.size, "the zip carries exactly the written files");
+  assertSecretFragmentsAbsent(assert, zipEntries, secrets, "zip archive");
+
+  const { results } = await runAllAssessments(client);
+  const payloads = JSON.stringify([await checkPagerdutyAccess(client), ...results]);
+  for (const secret of secrets) {
+    assert.ok(!payloads.includes(secret), `tool payloads must not carry ${secret}`);
+  }
+
+  const services = JSON.parse(files.get("core_data/services.json"));
+  assert.equal(services.items[0].integrations[0].integration_key, "[REDACTED]");
+  assert.equal(services.items[0].integrations[0].type, "events_api_v2_inbound_integration");
+  assert.equal(services.items[0].integrations[1].integration_email, "[REDACTED]");
+  assert.equal(services.items[0].integrations[1].email_filter_mode, "or-rules-email");
+  assert.equal(services.items[0].acknowledgement_timeout, 1800);
+
+  const extensions = JSON.parse(files.get("core_data/extensions.json"));
+  assert.equal(extensions.items[0].config, "[REDACTED]");
+  assert.equal(extensions.items[0].endpoint_url, "https://hooks.slack.com/[REDACTED]");
+  assert.equal(extensions.items[0].extension_schema.summary, "Slack V2");
+  assert.equal(extensions.items[1].endpoint_url, "http://receiver.example.com/[REDACTED]");
+
+  const subscriptions = JSON.parse(files.get("core_data/webhook_subscriptions.json"));
+  assert.equal(subscriptions.items[0].delivery_method.url, "https://siem.example.com/[REDACTED]");
+  assert.deepEqual(subscriptions.items[0].delivery_method.custom_headers, [{ name: "Authorization", value: "[REDACTED]" }]);
+  assert.equal(subscriptions.items[0].delivery_method.secret, "[REDACTED]");
+  assert.equal(subscriptions.items[0].active, true);
+
+  const workflows = JSON.parse(files.get("core_data/incident_workflows.json"));
+  assert.deepEqual(Object.keys(workflows.items[0]).sort(), ["id", "is_enabled", "name"]);
+  const changeEvents = JSON.parse(files.get("core_data/change_events.json"));
+  assert.deepEqual(Object.keys(changeEvents.items[0]).sort(), ["id", "services", "summary", "timestamp"]);
+  const auditRecords = JSON.parse(files.get("core_data/audit_records_recent.json"));
+  assert.deepEqual(Object.keys(auditRecords.items[0]).sort(), ["actors", "execution_time", "id", "method"]);
+  assert.equal(auditRecords.items[0].method.truncated_token, "abcd");
+  const users = JSON.parse(files.get("core_data/users.json"));
+  assert.equal(users.items[0].email, "owner-1@example.com");
+  assert.deepEqual(Object.keys(users.items[0].contact_methods[1]).sort(), ["blacklisted", "enabled", "id", "type"]);
+  assert.deepEqual(Object.keys(users.items[0].contact_methods[2]).sort(), ["blacklisted", "device_type", "enabled", "id", "type"]);
+
+  const integrationSecurity = JSON.parse(files.get("analysis/integration_security.json"));
+  const webhookTransport = findingById(integrationSecurity, 14);
+  assert.equal(webhookTransport.status, "fail");
+  assert.deepEqual(webhookTransport.evidence.insecure_extensions, ["Legacy receiver -> http://receiver.example.com/[REDACTED]"]);
+  assert.equal(findingById(integrationSecurity, 16).status, "pass", "projected integrations still carry the type and filter mode PD-16 reads");
+  const auditLogging = JSON.parse(files.get("analysis/audit_logging.json"));
+  assert.equal(findingById(auditLogging, 11).status, "pass");
+  assert.deepEqual(findingById(auditLogging, 13).evidence.api_tokens_observed.map((item) => item.truncated_token), ["...abcd"]);
+  const oncall = JSON.parse(files.get("analysis/oncall_coverage.json"));
+  assert.equal(findingById(oncall, 18).status, "pass", "projected contact methods still carry the type and blacklisted flag PD-18 reads");
+  assert.equal(JSON.parse(files.get("core_data/access_check.json")).status, "healthy");
+});
+
+test("verdict safety rule 10: list reports empty pages under more:true, totals above the items read, absent more flags on full pages, and oversize pages as truncated", async () => {
+  const users = Array.from({ length: 100 }, (_, index) => ({ id: `user-${index}`, role: index === 0 ? "owner" : "user", created_via_sso: true, teams: [{ id: "team-1" }] }));
+  const stalledUsers = new PagerdutyApiClient(sampleConfig(), {
+    fetchImpl: async (input) => {
+      const url = new URL(typeof input === "string" ? input : input.toString());
+      const offset = Number(url.searchParams.get("offset") ?? "0");
+      return jsonResponse({ users: offset === 0 ? users : [], more: true, total: 2500 });
+    },
+  });
+  const stalled = await stalledUsers.listUsers(150);
+  assert.equal(stalled.items.length, 100);
+  assert.equal(stalled.complete, false);
+  assert.equal(stalled.total, 2500);
+  assert.match(stalled.truncation, /empty page while reporting more results available/);
+
+  const assessment = assessPagerdutyAccessControl({
+    scope: accountScope(),
+    abilities: snapshot(["sso", "teams"]),
+    users: snapshot(stalled),
+    teams: list([{ id: "team-1" }]),
+    teamMembers: snapshot({}),
+  });
+  for (const control of [2, 3, 4]) {
+    assert.notEqual(findingById(assessment, control).status, "pass", `PD-0${control} must not pass on a stalled user listing`);
+    assert.match(findingById(assessment, control).evidence.partial_view[0], /users: 100 of 2500 seen \(the API returned an empty page/);
+  }
+  assert.match(findingById(assessment, 3).summary, /Downgraded from pass to warn because the inventory is partial/);
+
+  const totalAboveItems = new PagerdutyApiClient(sampleConfig(), {
+    fetchImpl: async () => jsonResponse({ teams: [{ id: "a" }, { id: "b" }, { id: "c" }], more: false, total: 10 }),
+  });
+  const shortOfTotal = await totalAboveItems.listTeams(100);
+  assert.equal(shortOfTotal.items.length, 3);
+  assert.equal(shortOfTotal.complete, false);
+  assert.equal(shortOfTotal.total, 10);
+  assert.match(shortOfTotal.truncation, /no more results after 3 records while declaring a total of 10/);
+
+  const requests = [];
+  const noMoreFlag = new PagerdutyApiClient(sampleConfig(), {
+    fetchImpl: async (input) => {
+      const url = new URL(typeof input === "string" ? input : input.toString());
+      const offset = Number(url.searchParams.get("offset") ?? "0");
+      const limit = Number(url.searchParams.get("limit") ?? "100");
+      requests.push(offset);
+      return jsonResponse({ teams: offset === 0 ? Array.from({ length: limit }, (_, index) => ({ id: `team-${index}` })) : [] });
+    },
+  });
+  const fullPageNoFlag = await noMoreFlag.listTeams(100);
+  assert.equal(fullPageNoFlag.items.length, 100);
+  assert.equal(fullPageNoFlag.complete, false);
+  assert.equal(fullPageNoFlag.total, undefined);
+  assert.match(fullPageNoFlag.truncation, /declares no more flag, so further results may exist/);
+  assert.deepEqual(requests, [0], "a full page at the limit without a more flag is not trusted as the end");
+
+  requests.length = 0;
+  const followedNoFlag = await noMoreFlag.listTeams(200);
+  assert.equal(followedNoFlag.items.length, 100);
+  assert.equal(followedNoFlag.complete, true, "an empty page without a more flag ends the listing as complete");
+  assert.deepEqual(requests, [0, 100]);
+
+  const oversize = new PagerdutyApiClient(sampleConfig(), {
+    fetchImpl: async () => jsonResponse({ priorities: [{ id: "p1" }, { id: "p2" }, { id: "p3" }, { id: "p4" }, { id: "p5" }], more: false, total: 5 }),
+  });
+  const sliced = await oversize.listPriorities(2);
+  assert.equal(sliced.items.length, 2);
+  assert.equal(sliced.complete, false, "rows dropped by the client-side slice are reported as truncation");
+  assert.match(sliced.truncation, /stopped at the requested limit of 2 with more results available/);
+});
+
+test("verdict safety rule 10: listCursor reports an empty page with a next_cursor and a repeated next_cursor as truncated and the audit findings demote with total unknown", async () => {
+  const stalledCalls = [];
+  const stalledCursor = new PagerdutyApiClient(sampleConfig(), {
+    fetchImpl: async (input) => {
+      const url = new URL(typeof input === "string" ? input : input.toString());
+      const cursor = url.searchParams.get("cursor");
+      stalledCalls.push(cursor);
+      return cursor === null
+        ? jsonResponse({ records: [auditRecord("r1", "2026-09-20T10:00:00Z"), auditRecord("r2", "2026-09-19T10:00:00Z")], next_cursor: "cursor-2" })
+        : jsonResponse({ records: [], next_cursor: "cursor-3" });
+    },
+  });
+  const stalled = await stalledCursor.listAuditRecords(new Date(AUDIT_WINDOWS.recent.since), NOW, 2000);
+  assert.deepEqual(stalledCalls, [null, "cursor-2"]);
+  assert.equal(stalled.items.length, 2);
+  assert.equal(stalled.complete, false);
+  assert.equal(stalled.total, undefined);
+  assert.match(stalled.truncation, /empty page with a next_cursor still present/);
+
+  const repeatedCalls = [];
+  const repeatedCursor = new PagerdutyApiClient(sampleConfig(), {
+    fetchImpl: async (input) => {
+      const url = new URL(typeof input === "string" ? input : input.toString());
+      repeatedCalls.push(url.searchParams.get("cursor"));
+      return jsonResponse({ records: [auditRecord(`r-${repeatedCalls.length}`, "2026-09-20T10:00:00Z")], next_cursor: "cursor-repeat" });
+    },
+  });
+  const repeated = await repeatedCursor.listAuditRecords(new Date(AUDIT_WINDOWS.recent.since), NOW, 2000);
+  assert.deepEqual(repeatedCalls, [null, "cursor-repeat"], "a cursor the API already served is not followed again");
+  assert.equal(repeated.items.length, 2);
+  assert.equal(repeated.complete, false);
+  assert.match(repeated.truncation, /next_cursor it had already served/);
+
+  const triggers = await new PagerdutyApiClient(sampleConfig(), {
+    fetchImpl: async (input) => {
+      const url = new URL(typeof input === "string" ? input : input.toString());
+      return url.searchParams.get("cursor") === null
+        ? jsonResponse({ triggers: [{ id: "trig-1", is_disabled: false, workflow: { id: "wf-1" } }], next_cursor: "t-2" })
+        : jsonResponse({ triggers: [], next_cursor: "t-3" });
+    },
+  }).listIncidentWorkflowTriggers();
+  assert.equal(triggers.complete, false);
+
+  const auditAssessment = assessPagerdutyAuditLogging({
+    scope: accountScope(),
+    recentRecords: snapshot(stalled),
+    retentionProbe: list([auditRecord("old-1", "2025-10-01T00:00:00Z")]),
+    windows: AUDIT_WINDOWS,
+  });
+  assertStatuses(auditAssessment, { 11: "warn", 12: "warn" });
+  for (const control of [11, 12]) {
+    assert.match(findingById(auditAssessment, control).summary, /Downgraded from pass to warn because the inventory is partial: audit records: 2 seen of an unknown total \(the API returned an empty page with a next_cursor still present/);
+  }
+
+  const automation = assessPagerdutyIncidentResponse({
+    scope: accountScope(),
+    services: list([service("svc-1")]),
+    escalationPolicies: list([escalationPolicy("ep-1")]),
+    priorities: list([{ id: "p1", name: "P1" }]),
+    incidentWorkflows: list([{ id: "wf-1", is_enabled: true }]),
+    workflowTriggers: snapshot(triggers),
+  });
+  assertStatuses(automation, { 10: "warn" });
+  assert.match(findingById(automation, 10).summary, /incident workflow triggers: 1 seen of an unknown total/);
+});
+
+test("verdict safety rule 10: truncated team member lists are carried into PD-04 instead of being dropped", async () => {
+  const fixtures = healthyFixtures();
+  const client = healthyClient({
+    async listTeamMembers() {
+      return collectionOf(fixtures.teamMembers, { complete: false, total: 40, truncation: "stopped at the requested limit of 2 with more results available" });
+    },
+  });
+  const data = await collectPagerdutyAccessControlData(client, {});
+  assert.deepEqual(data.teamMembersTruncated, ["Platform: 2 members seen of 40"]);
+
+  const result = assessPagerdutyAccessControl(data, { maxAdmins: 3 });
+  const teamScoping = findingById(result, 4);
+  assert.match(teamScoping.summary, /member lists were truncated for 1 teams/);
+  assert.deepEqual(teamScoping.evidence.team_member_lists_truncated, ["Platform: 2 members seen of 40"]);
+  assert.equal(teamScoping.evidence.team_manager_assignments, 1);
+});
+
+test("rule 1 corollary: each secondary read forbidden one at a time with the primary healthy demotes the dependent finding and names the read", () => {
+  const forbidden = (path) => `PagerDuty request failed (403 Forbidden) for ${path}: Access Denied`;
+  const fixtures = healthyFixtures();
+
+  const abilitiesForbidden = assessPagerdutyAccessControl({
+    scope: accountScope(),
+    abilities: snapshot([], forbidden("/abilities")),
+    users: list(fixtures.users),
+    teams: list(fixtures.teams),
+    teamMembers: snapshot({ "team-1": fixtures.teamMembers }),
+  }, { maxAdmins: 3 });
+  assertStatuses(abilitiesForbidden, { 1: "manual", 2: "pass", 3: "pass", 4: "warn" });
+  const teamScoping = findingById(abilitiesForbidden, 4);
+  assert.match(teamScoping.summary, /every one of 4 users belongs to at least one team/);
+  assert.match(teamScoping.summary, /The "teams" ability could not be confirmed because the abilities list could not be read \(PagerDuty request failed \(403 Forbidden\) for \/abilities/);
+  assert.match(teamScoping.summary, /verdict cannot exceed warn/);
+  assert.equal(teamScoping.evidence.teams_ability, null);
+  assert.match(teamScoping.evidence.abilities_status, /abilities list could not be read/);
+
+  const abilitiesEmpty = assessPagerdutyAccessControl({
+    scope: accountScope(),
+    abilities: snapshot([]),
+    users: list(fixtures.users),
+    teams: list(fixtures.teams),
+    teamMembers: snapshot({}),
+  }, { maxAdmins: 3 });
+  assertStatuses(abilitiesEmpty, { 4: "warn" });
+  assert.match(findingById(abilitiesEmpty, 4).summary, /GET \/abilities returned an empty ability list/);
+
+  const abilitiesWithoutTeams = assessPagerdutyAccessControl({
+    scope: accountScope(),
+    abilities: snapshot(["sso"]),
+    users: list(fixtures.users),
+    teams: list(fixtures.teams),
+    teamMembers: snapshot({}),
+  }, { maxAdmins: 3 });
+  assertStatuses(abilitiesWithoutTeams, { 4: "fail" });
+  assert.match(findingById(abilitiesWithoutTeams, 4).summary, /"teams" ability is absent/);
+
+  const membersForbidden = assessPagerdutyAccessControl({
+    scope: accountScope(),
+    abilities: snapshot(fixtures.abilities),
+    users: list(fixtures.users),
+    teams: list(fixtures.teams),
+    teamMembers: snapshot({}, forbidden("/teams/team-1/members")),
+  }, { maxAdmins: 3 });
+  assertStatuses(membersForbidden, { 4: "pass" });
+  assert.match(findingById(membersForbidden, 4).summary, /team membership listing failed \(PagerDuty request failed \(403 Forbidden\) for \/teams\/team-1\/members: Access Denied\), so manager assignments could not be sampled/);
+  assert.equal(findingById(membersForbidden, 4).evidence.team_manager_assignments, null, "a manager count cannot be sampled from a denied member listing");
+  assert.equal(findingById(membersForbidden, 4).evidence.team_member_lists_truncated, null);
+  assert.match(membersForbidden.summary.inventories.team_members, /^team members: unread \(PagerDuty request failed \(403 Forbidden\) for \/teams\/team-1\/members/);
+
+  const servicesForbidden = assessPagerdutyIncidentResponse({
+    scope: accountScope(),
+    services: list([], forbidden("/services")),
+    escalationPolicies: list(fixtures.escalationPolicies),
+    priorities: list(fixtures.priorities),
+    incidentWorkflows: list(fixtures.incidentWorkflows),
+    workflowTriggers: list(fixtures.incidentWorkflowTriggers),
+  });
+  assertStatuses(servicesForbidden, { 5: "manual", 10: "warn" });
+  const automation = findingById(servicesForbidden, 10);
+  assert.match(automation.summary, /1 incident workflows with is_enabled true/);
+  assert.match(automation.summary, /services could not be read \(PagerDuty request failed \(403 Forbidden\) for \/services/);
+  assert.match(automation.summary, /cannot exceed warn until the service directory is readable/);
+  assert.doesNotMatch(automation.summary, /0 services still reference one/);
+  assert.match(automation.evidence.services_inventory, /^services: unread \(PagerDuty request failed \(403 Forbidden\) for \/services/);
+
+  const servicesForbiddenNoAutomation = assessPagerdutyIncidentResponse({
+    scope: accountScope(),
+    services: list([], forbidden("/services")),
+    escalationPolicies: list(fixtures.escalationPolicies),
+    priorities: list(fixtures.priorities),
+    incidentWorkflows: list([]),
+    workflowTriggers: list([]),
+  });
+  assertStatuses(servicesForbiddenNoAutomation, { 10: "fail" });
+  assert.match(findingById(servicesForbiddenNoAutomation, 10).summary, /response play references could not be checked because services could not be read/);
+  assert.doesNotMatch(findingById(servicesForbiddenNoAutomation, 10).summary, /no service references a response play/);
+
+  const servicesReadable = assessPagerdutyIncidentResponse({
+    scope: accountScope(),
+    services: list(fixtures.services),
+    escalationPolicies: list(fixtures.escalationPolicies),
+    priorities: list(fixtures.priorities),
+    incidentWorkflows: list(fixtures.incidentWorkflows),
+    workflowTriggers: list(fixtures.incidentWorkflowTriggers),
+  });
+  assertStatuses(servicesReadable, { 10: "pass" });
+  assert.match(findingById(servicesReadable, 10).summary, /0 services still reference one/);
+
+  const detailsForbidden = assessPagerdutyOncallCoverage({
+    scope: accountScope(),
+    schedules: list(fixtures.schedules),
+    scheduleDetails: snapshot([], forbidden("/schedules/sched-1")),
+    oncalls: list(fixtures.oncalls),
+    users: list(fixtures.users),
+    coverageWindow: COVERAGE_WINDOW,
+  });
+  assertStatuses(detailsForbidden, { 8: "manual", 9: "manual", 18: "pass" });
+  for (const control of [8, 9]) {
+    assert.match(findingById(detailsForbidden, control).summary, /Schedule details could not be rendered \(PagerDuty request failed \(403 Forbidden\) for \/schedules\/sched-1/);
+  }
+
+  const probeForbidden = assessPagerdutyAuditLogging({
+    scope: accountScope(),
+    recentRecords: list([auditRecord("a1", "2026-09-20T10:00:00Z")]),
+    retentionProbe: list([], forbidden("/audit/records")),
+    windows: AUDIT_WINDOWS,
+  });
+  assertStatuses(probeForbidden, { 11: "pass", 12: "warn" });
+  assert.match(findingById(probeForbidden, 12).summary, /retention window could not be probed \(PagerDuty request failed \(403 Forbidden\) for \/audit\/records/);
+});
+
+// Fetch-level fixture serving the whole PagerDuty read surface with a request log, so a run can
+// deny, empty, or truncate a single endpoint and every status code and path in the output can be
+// checked against requests the run actually made.
+const PAGERDUTY_LIST_ENDPOINTS = [
+  ["/users", "users"],
+  ["/teams", "teams"],
+  ["/teams/team-1/members", "members"],
+  ["/services", "services"],
+  ["/escalation_policies", "escalation_policies"],
+  ["/priorities", "priorities"],
+  ["/incident_workflows", "incident_workflows"],
+  ["/incident_workflows/triggers", "triggers"],
+  ["/schedules", "schedules"],
+  ["/oncalls", "oncalls"],
+  ["/audit/records", "records"],
+  ["/extensions", "extensions"],
+  ["/webhook_subscriptions", "webhook_subscriptions"],
+  ["/business_services", "business_services"],
+  ["/change_events", "change_events"],
+];
+const PAGERDUTY_OBJECT_ENDPOINTS = ["/abilities", "/schedules/sched-1", "/service_dependencies/business_services/bs-1"];
+const PAGERDUTY_CORE_DATA_FILES = {
+  "/abilities": "core_data/abilities.json",
+  "/users": "core_data/users.json",
+  "/teams": "core_data/teams.json",
+  "/teams/team-1/members": "core_data/team_members.json",
+  "/services": "core_data/services.json",
+  "/escalation_policies": "core_data/escalation_policies.json",
+  "/priorities": "core_data/priorities.json",
+  "/incident_workflows": "core_data/incident_workflows.json",
+  "/incident_workflows/triggers": "core_data/incident_workflow_triggers.json",
+  "/schedules": "core_data/schedules.json",
+  "/schedules/sched-1": "core_data/schedule_details.json",
+  "/oncalls": "core_data/oncalls.json",
+  "/audit/records": "core_data/audit_records_recent.json",
+  "/extensions": "core_data/extensions.json",
+  "/webhook_subscriptions": "core_data/webhook_subscriptions.json",
+  "/business_services": "core_data/business_services.json",
+  "/service_dependencies/business_services/bs-1": "core_data/business_service_dependencies.json",
+  "/change_events": "core_data/change_events.json",
+};
+
+/** Random-looking alphanumeric canaries; the leak assertions check every substring of them at lengths 6 through 24. */
+const PD_CANARY = {
+  bearer: "TC9fpcVv34JXGcK2hF",
+  session: "saMVDPH9QJLhc9E4pT",
+  apiKey: "sgBL63d4Me6NjrukVb",
+  urlToken: "6CLuXRpZNQfQZzyfkG",
+  apiToken: "5bGHanNnsgV3Vay9SY",
+  clientSecret: "L2ZmNtntFXSxpXDBgy",
+  accessToken: "VP6RDnThNgGxBpL42W",
+};
+const PD_CANARY_URL = `https://api.example.com/v1/x?token=${PD_CANARY.urlToken}`;
+
+function pdCanaryHtml() {
+  return [
+    "<html><head><title>502 Bad Gateway</title></head><body>",
+    `<p>The upstream request carried Authorization: Bearer ${PD_CANARY.bearer} and Set-Cookie: session=${PD_CANARY.session}.</p>`,
+    `<p>Retry with x-api-key: ${PD_CANARY.apiKey}; the incident is tracked at ${PD_CANARY_URL} until resolved.</p>`,
+    "</body></html>",
+  ].join("");
+}
+
+// `fail` serves one path with a body that must never be echoed: { path, flavor: "html" | "json" },
+// where html is a 502 proxy page carrying the canaries and json is a 403 PagerDuty error object whose
+// message embeds the canary URL mid-sentence and ends with the doubly-encoded escape-boundary trace
+// (every literal JSON escape before a plain-name cookie pair, a URL userinfo password, and an X-Api-Key header).
+function pagerdutyApiFixture({ deny = [], empty = [], truncate = [], fail } = {}) {
+  const fixtures = healthyFixtures();
+  const requests = [];
+  const listPayload = (key, items, url) => {
+    const offset = Number(url.searchParams.get("offset") ?? "0");
+    const limit = Number(url.searchParams.get("limit") ?? "100");
+    if (truncate.includes(url.pathname)) {
+      // First page claims more results, the next page comes back empty: the collector records truncation.
+      return offset === 0
+        ? { [key]: items, more: true, total: 2500, limit, offset }
+        : { [key]: [], more: true, total: 2500, limit, offset };
+    }
+    return { [key]: items, more: false, total: items.length, limit, offset };
+  };
+  const listItems = (pathname, url) => {
+    switch (pathname) {
+      case "/users": return fixtures.users;
+      case "/teams": return fixtures.teams;
+      case "/teams/team-1/members": return fixtures.teamMembers;
+      case "/services": return fixtures.services;
+      case "/escalation_policies": return fixtures.escalationPolicies;
+      case "/priorities": return fixtures.priorities;
+      case "/incident_workflows": return fixtures.incidentWorkflows;
+      case "/incident_workflows/triggers": return fixtures.incidentWorkflowTriggers;
+      case "/schedules": return fixtures.schedules;
+      case "/oncalls": return fixtures.oncalls;
+      case "/audit/records": {
+        const since = new Date(url.searchParams.get("since"));
+        return [auditRecord(`audit-${since.getTime()}`, new Date(since.getTime() + DAY_MS).toISOString())];
+      }
+      case "/extensions": return fixtures.extensions;
+      case "/webhook_subscriptions": return fixtures.webhookSubscriptions;
+      case "/business_services": return fixtures.businessServices;
+      case "/change_events": return fixtures.changeEvents;
+      default: return undefined;
+    }
+  };
+  const fetchImpl = async (input, init = {}) => {
+    const url = new URL(typeof input === "string" ? input : input.url);
+    const respond = (value, status = 200, statusText = "OK") => {
+      requests.push({ method: init.method ?? "GET", url: url.toString(), path: url.pathname, status });
+      return jsonResponse(value, { status, statusText });
+    };
+    if (fail && url.pathname === fail.path) {
+      if (fail.flavor === "html") {
+        requests.push({ method: init.method ?? "GET", url: url.toString(), path: url.pathname, status: 502 });
+        return new Response(pdCanaryHtml(), { status: 502, statusText: "Bad Gateway", headers: { "content-type": "text/html; charset=utf-8" } });
+      }
+      // Credential-free failure flavors for the fixed-text harvest: a plain proxy page, an unrecognized JSON shape, a documented error.
+      if (fail.flavor === "plainHtml") {
+        requests.push({ method: init.method ?? "GET", url: url.toString(), path: url.pathname, status: 502 });
+        return new Response("<html><head><title>502 Bad Gateway</title></head><body>upstream unavailable</body></html>", { status: 502, statusText: "Bad Gateway", headers: { "content-type": "text/html; charset=utf-8" } });
+      }
+      if (fail.flavor === "opaqueJson") return respond({ unexpected: { shape: true } }, 403, "Forbidden");
+      if (fail.flavor === "plainJson") return respond({ error: { message: "Access Denied", code: 2010, errors: ["Access Denied"] } }, 403, "Forbidden");
+      if (url.pathname === "/oauth/token") {
+        return respond({ error: "invalid_client", error_description: `client rejected; see ${PD_CANARY_URL} for the registration; ${escapeBoundaryTrace()}` }, 403, "Forbidden");
+      }
+      return respond({ error: { message: `Access Denied; see ${PD_CANARY_URL} for the missing scope; ${escapeBoundaryTrace()}`, code: 2010, errors: [`scope details at ${PD_CANARY_URL}`] } }, 403, "Forbidden");
+    }
+    if (url.pathname === "/oauth/token") {
+      return respond({ access_token: PD_CANARY.accessToken, token_type: "bearer", expires_in: 3600 });
+    }
+    if (deny.includes(url.pathname)) {
+      return respond({ error: { message: "Access Denied", code: 2010, errors: ["Access Denied"] } }, 403, "Forbidden");
+    }
+    if (url.pathname === "/users/me") {
+      // An account-level REST API key has no user, and the API answers 400.
+      return respond({ error: { message: "Account-level access token has no user", code: 2001 } }, 400, "Bad Request");
+    }
+    if (url.pathname === "/abilities") return respond({ abilities: fixtures.abilities });
+    if (url.pathname === "/schedules/sched-1") return respond({ schedule: coveredSchedule("sched-1") });
+    if (url.pathname === "/service_dependencies/business_services/bs-1") {
+      return respond({ relationships: fixtures.businessServiceDependencies });
+    }
+    const listEntry = PAGERDUTY_LIST_ENDPOINTS.find(([path]) => path === url.pathname);
+    if (listEntry) {
+      const items = empty.includes(url.pathname) ? [] : listItems(url.pathname, url);
+      if (url.pathname === "/audit/records" || url.pathname === "/incident_workflows/triggers") {
+        return respond({ [listEntry[1]]: items, next_cursor: null });
+      }
+      return respond(listPayload(listEntry[1], items, url));
+    }
+    return respond({ error: { message: "Not Found", code: 2100 } }, 404, "Not Found");
+  };
+  return { fetchImpl, requests, fixtures };
+}
+
+function pagerdutyApiClient(options = {}) {
+  const fixture = pagerdutyApiFixture(options);
+  const client = new PagerdutyApiClient(sampleConfig(), { fetchImpl: fixture.fetchImpl, now: () => NOW, sleep: async () => {} });
+  return { client, requests: fixture.requests, fixtures: fixture.fixtures };
+}
+
+function isAbsenceValue(value) {
+  if (value === 0 || value === false) return true;
+  if (Array.isArray(value)) return value.length === 0;
+  if (value !== null && typeof value === "object") return Object.keys(value).length === 0;
+  return false;
+}
+
+function fieldLeaves(value, path, out) {
+  if (value === null || Array.isArray(value) || typeof value !== "object") {
+    out.set(path, value);
+    return out;
+  }
+  for (const [key, child] of Object.entries(value)) fieldLeaves(child, `${path}.${key}`, out);
+  return out;
+}
+
+function assessmentLeaves(result) {
+  const out = new Map();
+  fieldLeaves(result.summary, `${result.category}.summary`, out);
+  for (const item of result.findings) {
+    out.set(`${item.id}.status`, item.status);
+    out.set(`${item.id}.summary`, item.summary);
+    fieldLeaves(item.evidence ?? {}, `${item.id}.evidence`, out);
+  }
+  return out;
+}
+
+const STATUS_COUNT_KEYS = new Set(["pass", "warn", "fail", "manual"]);
+
+// Every leaf that carried a value in the all-readable baseline must, under a single denial, either
+// keep that value, become null, or (for prose) change text; it must never fall to 0, [], {}, or false.
+function assertNoDefaultedLeaves(baseline, current, label) {
+  const nullAncestor = (path) => {
+    const segments = path.split(".");
+    for (let depth = segments.length - 1; depth > 0; depth -= 1) {
+      const ancestor = segments.slice(0, depth).join(".");
+      if (current.has(ancestor)) return current.get(ancestor) === null;
+    }
+    return false;
+  };
+  for (const [path, base] of baseline) {
+    if (STATUS_COUNT_KEYS.has(path.split(".").at(-1)) && path.includes(".summary.")) continue;
+    if (!current.has(path)) {
+      assert.ok(nullAncestor(path), `${label}: leaf ${path} disappeared without its parent rendering null`);
+      continue;
+    }
+    const value = current.get(path);
+    if (base === null || isAbsenceValue(base)) continue;
+    if (typeof base === "string") continue;
+    if (value === null) continue;
+    assert.ok(
+      !isAbsenceValue(value),
+      `${label}: leaf ${path} defaulted from ${JSON.stringify(base)} to ${JSON.stringify(value)}`,
+    );
+    assert.deepEqual(value, base, `${label}: leaf ${path} changed from ${JSON.stringify(base)} to ${JSON.stringify(value)} instead of rendering null`);
+  }
+}
+
+function collectStrings(value, out = []) {
+  if (typeof value === "string") out.push(value);
+  else if (Array.isArray(value)) for (const item of value) collectStrings(item, out);
+  else if (value && typeof value === "object") for (const item of Object.values(value)) collectStrings(item, out);
+  return out;
+}
+
+// Status codes appear in output as "(403 Forbidden)" or "HTTP 403"; endpoint paths as "/teams" or
+// "/teams/team-1/members" after whitespace, a parenthesis, or "for ".
+function mentionedStatusCodes(text) {
+  return [...text.matchAll(/\((\d{3}) [A-Za-z]/g), ...text.matchAll(/\b(?:HTTP|status)\s+(\d{3})\b/gi)].map((match) => Number(match[1]));
+}
+
+function mentionedEndpoints(text) {
+  return [...text.matchAll(/(?:^|[\s(]|for )(\/[a-z_]+(?:\/[A-Za-z0-9_\-{}]+)*)/g)].map((match) => match[1]);
+}
+
+function assertMentionsMatchRequests(outputs, requests, label) {
+  const strings = collectStrings(outputs);
+  const loggedStatuses = new Set(requests.map((request) => request.status));
+  const loggedPaths = new Set(requests.map((request) => request.path));
+  for (const text of strings) {
+    for (const code of mentionedStatusCodes(text)) {
+      assert.ok(loggedStatuses.has(code), `${label}: output names HTTP ${code} but no request returned it: ${text}`);
+    }
+    for (const endpoint of mentionedEndpoints(text)) {
+      assert.ok(
+        loggedPaths.has(endpoint) || [...loggedPaths].some((path) => path.startsWith(`${endpoint}/`)),
+        `${label}: output names ${endpoint} but no request was made to it: ${text}`,
+      );
+    }
+  }
+}
+
+function principalLabels(fixtures) {
+  return fixtures.users.map((item) => item.email);
+}
+
+async function exportWithFixture(options) {
+  const base = createTempBase("grclanker-pagerduty-sweep-");
+  const { client, requests, fixtures } = pagerdutyApiClient(options);
+  const result = await exportPagerdutyAuditBundle(client, sampleConfig(), base, { maxAdmins: 3, coverageDays: 30 });
+  const files = readBundleFiles(result.outputDir);
+  const analysis = ["access_control", "incident_response", "oncall_coverage", "audit_logging", "integration_security"]
+    .map((category) => JSON.parse(files.get(`analysis/${category}.json`)));
+  const accessCheck = JSON.parse(files.get("core_data/access_check.json"));
+  const payloads = [await checkPagerdutyAccess(client), ...(await runAllAssessments(client)).results];
+  return { result, files, analysis, accessCheck, payloads, requests, fixtures, errors: files.get("_errors.log") ?? "" };
+}
+
+test("collection status, request matching, and denied-list markers: each endpoint denied one at a time writes a marker, renders dependent counts null, names no principal from the denied set, and mentions only observed statuses and paths", async () => {
+  // /extensions is served readable but empty throughout, so every run carries one dataset that must stay [].
+  const baseline = await exportWithFixture({ empty: ["/extensions"] });
+  assert.equal(baseline.result.errorCount, 0);
+  assert.deepEqual(JSON.parse(baseline.files.get("core_data/extensions.json")).items, []);
+  assert.equal(baseline.accessCheck.status, "healthy");
+  const baselineLeaves = new Map(baseline.analysis.flatMap((item) => [...assessmentLeaves(item)]));
+  for (const item of baseline.analysis) {
+    for (const [name, state] of Object.entries(item.summary.inventories)) {
+      assert.match(state, /^.+: complete \(\d+ seen\)$/, `${item.category}.inventories.${name} must be complete in the baseline`);
+    }
+  }
+  assertMentionsMatchRequests([baseline.analysis, baseline.accessCheck, baseline.payloads], baseline.requests, "baseline");
+  for (const file of Object.values(PAGERDUTY_CORE_DATA_FILES)) {
+    assert.notEqual(JSON.parse(baseline.files.get(file)).collected, false, `${file} is collected in the baseline`);
+  }
+
+  const emails = principalLabels(baseline.fixtures);
+  const deniable = [...PAGERDUTY_OBJECT_ENDPOINTS, ...PAGERDUTY_LIST_ENDPOINTS.map(([path]) => path)];
+  for (const endpoint of deniable) {
+    const label = `deny ${endpoint}`;
+    const run = await exportWithFixture({ deny: [endpoint], empty: ["/extensions"] });
+    const denied = run.requests.filter((request) => request.path === endpoint);
+    assert.ok(denied.length > 0 && denied.every((request) => request.status === 403), `${label}: the fixture served 403 for the endpoint`);
+
+    const marker = JSON.parse(run.files.get(PAGERDUTY_CORE_DATA_FILES[endpoint]));
+    assert.equal(marker.collected, false, `${label}: core_data carries the not-collected marker`);
+    assert.equal(marker.status, 403, `${label}: the marker status is the observed status`);
+    assert.equal(marker.endpoint, endpoint, `${label}: the marker endpoint is the requested path`);
+    assert.match(marker.error, /\(403 Forbidden\)/);
+    assert.ok(!("items" in marker), `${label}: a denied dataset is never written as an item list`);
+    const readableEmpty = JSON.parse(run.files.get("core_data/extensions.json"));
+    if (endpoint !== "/extensions") {
+      assert.deepEqual(readableEmpty.items, [], `${label}: a readable-but-empty dataset keeps an empty item list`);
+      assert.equal(readableEmpty.complete, true);
+      assert.notEqual(readableEmpty.collected, false);
+    }
+
+    const currentLeaves = new Map(run.analysis.flatMap((item) => [...assessmentLeaves(item)]));
+    assertNoDefaultedLeaves(baselineLeaves, currentLeaves, label);
+    const unreadStates = run.analysis.flatMap((item) => Object.values(item.summary.inventories)).filter((state) => /: unread \(/.test(state));
+    assert.ok(unreadStates.length > 0, `${label}: at least one assessment summary names the unread inventory`);
+    for (const state of unreadStates) assert.match(state, /\(403 Forbidden\)/, `${label}: the unread state carries the observed failure`);
+    assert.ok(run.errors.includes("(403 Forbidden)") && run.errors.includes(endpoint), `${label}: _errors.log names the observed failure`);
+    const mentionedText = collectStrings([run.analysis, run.errors]);
+    assert.ok(mentionedText.flatMap(mentionedStatusCodes).includes(403), `${label}: the scanner sees the 403 the output names`);
+    assert.ok(mentionedText.flatMap(mentionedEndpoints).includes(endpoint), `${label}: the scanner sees the denied path the output names`);
+    assertMentionsMatchRequests([run.analysis, run.accessCheck, run.payloads, run.errors], run.requests, label);
+
+    const surface = run.accessCheck.surfaces.find((item) => item.endpoint === endpoint);
+    if (surface) {
+      assert.equal(surface.status, "not_readable", label);
+      assert.equal(surface.http_status, 403, label);
+      assert.ok(!("count" in surface), `${label}: an unreadable surface carries no count`);
+    }
+
+    if (endpoint === "/users") {
+      const text = JSON.stringify([run.analysis, run.payloads]);
+      for (const email of emails) assert.ok(!text.includes(email), `${label}: ${email} must not be named from the denied user directory`);
+      const accessControl = run.analysis.find((item) => item.category === "access_control");
+      for (const key of ["users_seen", "users_total", "privileged_users", "owners", "users_without_teams"]) {
+        assert.equal(accessControl.summary[key], null, `${label}: summary ${key} renders null`);
+      }
+      for (const control of [1, 2, 3, 4]) {
+        const evidence = findingById(accessControl, control).evidence;
+        assert.match(evidence.principals_withheld, /^users: unread \(PagerDuty request failed \(403 Forbidden\) for \/users/, `${label}: PD-${control} names the unread inventory`);
+      }
+      const oncall = run.analysis.find((item) => item.category === "oncall_coverage");
+      assert.equal(oncall.summary.responders, null);
+      assert.equal(oncall.summary.current_oncall_users, null);
+    }
+    if (endpoint === "/audit/records") {
+      const audit = run.analysis.find((item) => item.category === "audit_logging");
+      assert.equal(audit.summary.api_tokens_observed, null);
+      assert.equal(findingById(audit, 13).evidence.api_tokens_observed, null);
+      assert.ok(!JSON.stringify(audit).includes("abcd"), `${label}: no token suffix is named from the denied audit trail`);
+    }
+    if (endpoint === "/services") {
+      const incident = run.analysis.find((item) => item.category === "incident_response");
+      assert.equal(incident.summary.active_services, null);
+      assert.equal(findingById(incident, 5).evidence.disabled_services, null);
+      assert.equal(findingById(incident, 19).evidence.urgency_modes, null);
+    }
+    if (endpoint === "/change_events") {
+      const integration = run.analysis.find((item) => item.category === "integration_security");
+      assert.equal(findingById(integration, 25).evidence.change_events_complete, null, `${label}: a completeness flag never defaults on an unread inventory`);
+    }
+    if (endpoint === "/schedules/sched-1") {
+      const oncall = run.analysis.find((item) => item.category === "oncall_coverage");
+      for (const key of ["attached_schedules", "schedules_with_gaps", "single_participant_schedules"]) {
+        assert.equal(oncall.summary[key], null, `${label}: summary ${key} renders null`);
+      }
+    }
+
+    // Review round item 12: per-item reads keyed on a denied parent list are never issued, and the
+    // dependent dataset is a marker naming the parent instead of a readable-but-empty {} or [].
+    const dependent = PAGERDUTY_DEPENDENT_DATASETS[endpoint];
+    if (dependent) {
+      const skipped = JSON.parse(run.files.get(dependent.file));
+      assert.equal(skipped.collected, false, `${label}: ${dependent.file} carries the not-collected marker`);
+      assert.equal(skipped.status, null, `${label}: a skipped dependent borrows no status from the parent`);
+      assert.equal(skipped.endpoint, null, `${label}: a skipped dependent names no endpoint of its own`);
+      assert.match(skipped.error, new RegExp(`^not requested: the ${endpoint.replace(/\//g, "\\/")} list was not read \\(PagerDuty request failed \\(403 Forbidden\\) for ${endpoint.replace(/\//g, "\\/")}`), `${label}: ${skipped.error}`);
+      assert.ok(!Array.isArray(skipped) && !("items" in skipped), `${label}: a skipped dependent is never an item list`);
+      assert.ok(run.requests.every((request) => !request.path.startsWith(dependent.childPrefix)), `${label}: no ${dependent.childPrefix} request was issued`);
+      const analysis = run.analysis.find((item) => item.category === dependent.category);
+      assert.match(analysis.summary.inventories[dependent.inventory], /^.+: not requested \(the .+ list was not read/, `${label}: inventories.${dependent.inventory}`);
+      assert.ok(run.errors.includes("not requested:"), `${label}: _errors.log records the skipped dependent`);
+      const analysisSnapshot = analysis.snapshots?.[dependent.inventory];
+      if (analysisSnapshot !== undefined) assert.equal(analysisSnapshot.error, skipped.error, `${label}: the analysis snapshot carries the same skip`);
+    }
+    if (endpoint === "/teams") {
+      const accessControl = run.analysis.find((item) => item.category === "access_control");
+      assert.equal(findingById(accessControl, 4).evidence.team_member_lists_truncated, null, `${label}: PD-04 renders no truncation list for lookups that never ran`);
+      assert.equal(findingById(accessControl, 4).evidence.team_manager_assignments, null, label);
+      assert.equal(findingById(accessControl, 4).status, "manual", label);
+    }
+    if (endpoint === "/schedules") {
+      const oncall = run.analysis.find((item) => item.category === "oncall_coverage");
+      for (const key of ["attached_schedules", "schedules_with_gaps", "single_participant_schedules"]) {
+        assert.equal(oncall.summary[key], null, `${label}: summary ${key} renders null`);
+      }
+    }
+    if (endpoint === "/business_services") {
+      const integration = run.analysis.find((item) => item.category === "integration_security");
+      assert.equal(findingById(integration, 21).evidence.unmapped_business_services, null, label);
+      assert.equal(findingById(integration, 21).status, "manual", label);
+    }
+  }
+});
+
+const PAGERDUTY_DEPENDENT_DATASETS = {
+  "/teams": { file: "core_data/team_members.json", childPrefix: "/teams/", category: "access_control", inventory: "team_members" },
+  "/schedules": { file: "core_data/schedule_details.json", childPrefix: "/schedules/", category: "oncall_coverage", inventory: "schedule_details" },
+  "/business_services": { file: "core_data/business_service_dependencies.json", childPrefix: "/service_dependencies/", category: "integration_security", inventory: "business_service_dependencies" },
+};
+
+// Addendum 4: on every PagerDuty surface (every access-check probe, every collector, the credential
+// scope read, and the Scoped OAuth token endpoint), a 502 HTML body or a JSON error embedding a
+// credential URL never reaches tool results, findings, summaries, or the bundle, and the recorded
+// error carries a status-and-length note or the redacted URL instead.
+const PAGERDUTY_CANARY_SURFACES = [
+  "/users/me",
+  ...PAGERDUTY_OBJECT_ENDPOINTS,
+  ...PAGERDUTY_LIST_ENDPOINTS.map(([path]) => path),
+];
+
+/** No canary (the PagerDuty set and the escape-boundary pair) survives in any substring at lengths 6 through 24. */
+function assertPdCanariesAbsent(text, context) {
+  assertFragmentsAbsent(assert, text, [...Object.values(PD_CANARY), ...Object.values(ESCAPE_CANARIES)], context);
+}
+
+async function pdCanaryRun(config, fail) {
+  const base = createTempBase("grclanker-pagerduty-canary-");
+  const fixture = pagerdutyApiFixture({ fail });
+  const client = new PagerdutyApiClient(config, { fetchImpl: fixture.fetchImpl, now: () => NOW, sleep: async () => {} });
+  const context = `${fail.path} (${fail.flavor})`;
+  const access = await checkPagerdutyAccess(client);
+  const assessments = (await runAllAssessments(client)).results;
+  const result = await exportPagerdutyAuditBundle(client, config, base, { maxAdmins: 3, coverageDays: 30 });
+  const files = readBundleFiles(result.outputDir);
+  const zipEntries = readZipEntries(result.zipPath);
+  assert.ok(fixture.requests.some((request) => request.path === fail.path), `${context}: the failing surface was requested`);
+
+  assertPdCanariesAbsent(JSON.stringify(access), `${context} check_access`);
+  assertPdCanariesAbsent(JSON.stringify(assessments), `${context} assessments`);
+  for (const [name, content] of files) assertPdCanariesAbsent(content, `${context} bundle ${name}`);
+  for (const [name, content] of zipEntries) assertPdCanariesAbsent(content, `${context} zip ${name}`);
+
+  const errorStrings = [
+    ...access.surfaces.map((surface) => surface.error).filter(Boolean),
+    ...access.notes.filter((note) => /could not be determined/.test(note)),
+    ...assessments.flatMap((assessment) => assessment.errors),
+    ...(files.get("_errors.log") ?? "").split("\n").filter(Boolean),
+  ].filter((text) => !/^not requested:|: not requested: /.test(text));
+  assert.ok(errorStrings.length > 0, `${context}: the failing surface must be exercised by the access check, an assessment, or the export`);
+  for (const errorString of errorStrings) {
+    if (fail.flavor === "html") {
+      assert.match(errorString, /\(502(?: Bad Gateway)?\)[^\n]*: non-JSON body \(text\/html, \d+ bytes\)/, `${context}: ${errorString}`);
+    } else {
+      assert.match(errorString, /\(403(?: Forbidden)?\)[^\n]*https:\/\/api\.example\.com\/v1\/x\?\[REDACTED\]/, `${context}: ${errorString}`);
+      assert.ok(!errorString.includes("token="), `${context}: ${errorString}`);
+    }
+  }
+  return { access, assessments, files, requests: fixture.requests };
+}
+
+test("addendum 4: on every PagerDuty surface a 502 HTML body or a JSON error embedding a credential URL never reaches results or the bundle, and the recorded error carries a status-and-length note", async () => {
+  const config = sampleConfig({ apiToken: PD_CANARY.apiToken });
+  let runs = 0;
+  for (const path of PAGERDUTY_CANARY_SURFACES) {
+    for (const flavor of ["html", "json"]) {
+      const run = await pdCanaryRun(config, { path, flavor });
+      if (path === "/users/me") {
+        assert.match(run.access.notes.find((note) => /Credential scope/.test(note)), flavor === "html" ? /non-JSON body \(text\/html, \d+ bytes\)/ : /\?\[REDACTED\]/);
+      }
+      runs += 1;
+    }
+  }
+  assert.equal(runs, PAGERDUTY_CANARY_SURFACES.length * 2);
+});
+
+/**
+ * Round 4 item 2 (data-side carrier class): the healthy PagerDuty fixture with reviewer B's fifteen carrier
+ * forms, the configured secrets bare in prose, and the must-survive controls appended to every text-like
+ * field of every response. Nothing planted may survive in any 6-to-24-character window of the access
+ * check, the assessments, the bundle files, or the zip entries; the controls (a hostname, a table name,
+ * a UUID, a quoted non-credential header, prose using a scheme word) and the bare token must.
+ */
+test("rule 9 data side: a credential carried in any free-text field of any PagerDuty response never reaches a snapshot, evidence, summary, bundle file, or zip entry, while identifiers in the same fields stay", async () => {
+  const configuredSecrets = [CONFIGURED_SECRET_CANARIES.pagerdutyApiToken];
+  const suffix = carrierSuffix(configuredSecrets);
+  const harvest = async (injected) => {
+    const config = sampleConfig({ apiToken: configuredSecrets[0] });
+    const fixture = pagerdutyApiFixture();
+    const client = new PagerdutyApiClient(config, { fetchImpl: injected ? injectingFetch(fixture.fetchImpl, suffix) : fixture.fetchImpl, now: () => NOW, sleep: async () => {} });
+    const access = await checkPagerdutyAccess(client);
+    const assessments = (await runAllAssessments(client)).results;
+    const base = createTempBase("grclanker-pagerduty-text-fields-");
+    try {
+      const result = await exportPagerdutyAuditBundle(client, config, base, { maxAdmins: 3, coverageDays: 30 });
+      return [
+        ["check_access", JSON.stringify(access)],
+        ["assessments", JSON.stringify(assessments)],
+        ...[...readBundleFiles(result.outputDir)].map(([name, content]) => [`bundle file ${name}`, content]),
+        ...[...readZipEntries(result.zipPath)].map(([name, content]) => [`zip entry ${name}`, content]),
+      ];
+    } finally {
+      rmSync(base, { recursive: true, force: true });
+    }
+  };
+  const healthyTexts = await harvest(false);
+  const texts = await harvest(true);
+  assertTextFieldCarriers(assert, texts, { configuredSecrets, healthyTexts });
+  // Ruling 6 on the snapshot walker itself: a vendor-prefixed token, a JWT, and a PEM block go bare; the generic run stays.
+  assert.deepEqual(
+    redactSnapshot({ note: `key ${VENDOR_TOKEN_CANARIES.stripeLiveKey} end`, jwt: `jwt ${VENDOR_TOKEN_CANARIES.jwt} end`, pem: `-----BEGIN PRIVATE KEY-----\n${VENDOR_TOKEN_CANARIES.pemBody}\n-----END PRIVATE KEY-----`, id: `id ${BARE_TOKEN_CONTROL} end` }),
+    { note: "key [REDACTED] end", jwt: "jwt [REDACTED] end", pem: "[REDACTED]", id: `id ${BARE_TOKEN_CONTROL} end` },
+  );
+});
+
+/**
+ * CodeRabbit (#62, second review) items 2 and 3: a container nested past MAX_REDACTION_DEPTH in a PagerDuty
+ * response is replaced by the marker, never passed through unscrubbed. PagerDuty's walker is redactSnapshot
+ * behind capture; the schedule detail (kept whole in core_data/schedule_details.json) carries the three planted
+ * fields; the walker's root is the details array, so the schedule is depth 1 and the planted fields depth 2.
+ * redactSnapshot checks the depth before its string branch, so the control leaf at depth 32 keeps its keys
+ * and every value becomes the marker (stricter than scrubbing in place, and no leak).
+ */
+test("CodeRabbit (#62, second review) items 2 and 3: a PagerDuty record container nested past MAX_REDACTION_DEPTH is replaced whole, the leaf at the maximum depth is scrubbed in place, and no planted window reaches any output", async () => {
+  const harvest = async (planted) => {
+    const config = sampleConfig();
+    const fixture = pagerdutyApiFixture();
+    const planting = plantingFetch(fixture.fetchImpl, (url) => url.pathname === "/schedules/sched-1", (payload) => {
+      Object.assign(payload.schedule, deepFields(2));
+      return payload;
+    });
+    const client = new PagerdutyApiClient(config, { fetchImpl: planted ? planting : fixture.fetchImpl, now: () => NOW, sleep: async () => {} });
+    const access = await checkPagerdutyAccess(client);
+    const assessments = (await runAllAssessments(client)).results;
+    const base = createTempBase("grclanker-pagerduty-deep-nesting-");
+    try {
+      const result = await exportPagerdutyAuditBundle(client, config, base, { maxAdmins: 3, coverageDays: 30 });
+      return [
+        ["check_access", JSON.stringify(access)],
+        ["assessments", JSON.stringify(assessments)],
+        ...[...readBundleFiles(result.outputDir)].map(([name, content]) => [`bundle file ${name}`, content]),
+        ...[...readZipEntries(result.zipPath)].map(([name, content]) => [`zip entry ${name}`, content]),
+      ];
+    } finally {
+      rmSync(base, { recursive: true, force: true });
+    }
+  };
+  assertDeepCanariesWellFormed(assert, await harvest(false));
+  assertDeepNesting(assert, await harvest(true), { stringsPastDepth: "replaced" });
+});
+
+test("addendum 4: a Scoped OAuth token endpoint that answers with a 502 HTML page or a JSON error embedding a credential URL never echoes the body, and the obtained bearer token is redacted from every error string", async () => {
+  const config = sampleConfig({
+    authMode: "oauth_client_credentials",
+    apiToken: undefined,
+    clientId: "pd-client-id",
+    clientSecret: PD_CANARY.clientSecret,
+    subdomain: "example",
+  });
+  for (const flavor of ["html", "json"]) {
+    const run = await pdCanaryRun(config, { path: "/oauth/token", flavor });
+    for (const surface of run.access.surfaces) {
+      assert.equal(surface.status, "not_readable");
+      assert.equal(surface.http_status, flavor === "html" ? 502 : 403);
+      assert.match(surface.error, /^PagerDuty OAuth token request failed \(\d{3}\) for \/oauth\/token: /);
+    }
+    assert.ok(run.requests.every((request) => request.path === "/oauth/token"), `${flavor}: no API request is issued without a bearer token`);
+  }
+
+  // With the token endpoint healthy, the bearer it returns is remembered and redacted from a later error.
+  const fixture = pagerdutyApiFixture({ fail: { path: "/users", flavor: "json" } });
+  const client = new PagerdutyApiClient(config, { fetchImpl: fixture.fetchImpl, now: () => NOW, sleep: async () => {} });
+  await assert.rejects(client.listUsers(5), (error) => {
+    assertFragmentsAbsent(assert, error.message, [PD_CANARY.accessToken, PD_CANARY.urlToken, PD_CANARY.clientSecret], "post-exchange error message");
+    return true;
+  });
+  const redacted = client.redact(`header Bearer ${PD_CANARY.accessToken}, key Token token=${PD_CANARY.clientSecret}, at https://u:p@example.com/a?sid=1#frag`);
+  assert.equal(redacted, "header Bearer [REDACTED], key Token token=[REDACTED], at https://[REDACTED]@example.com/a?[REDACTED]#[REDACTED]");
+  assert.match(client.redact("Authorization: Bearer eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.c2lnbmF0dXJl"), /^Authorization: \[REDACTED\]/);
+});
+
+test("planted values self-check: every canary and planted secret is alphanumeric, distinct in every 6-character window, and no window occurs in the healthy fixtures, the sample configuration, or a healthy bundle", async () => {
+  const healthy = await exportWithFixture({});
+  assert.equal(healthy.result.errorCount, 0);
+  assertPlantedValuesWellFormed(assert, {
+    ...Object.fromEntries(Object.entries(PD_CANARY).map(([name, value]) => [`PD_CANARY.${name}`, value])),
+    ...Object.fromEntries(Object.entries(FAKE_PAGERDUTY_SECRETS).map(([name, value]) => [`FAKE_PAGERDUTY_SECRETS.${name}`, value])),
+    ...Object.fromEntries(Object.entries(CONFIG_CANARIES).map(([name, value]) => [`CONFIG_CANARIES.${name}`, value])),
+    ...ESCAPE_CANARY_PLANTED_VALUES,
+    SAMPLE_API_TOKEN,
+  }, [
+    ["healthy fixtures", JSON.stringify(healthyFixtures())],
+    ["sample configuration", JSON.stringify({ ...sampleConfig(), apiToken: null })],
+    ["healthy tool payloads", JSON.stringify(healthy.payloads)],
+    ...[...healthy.files].map(([name, content]) => [`healthy bundle ${name}`, content]),
+  ]);
+});
+
+/** Every PagerDuty inventory the collectors read, as the summaries' inventories and the markers label them. */
+const PAGERDUTY_DATASETS = [
+  "users", "teams", "team members", "services", "escalation policies", "priorities", "incident workflows", "incident workflow triggers",
+  "schedules", "schedule details", "oncalls", "audit records", "extensions", "webhook subscriptions", "business services",
+  "business service dependencies", "change events", "abilities", "credential scope",
+];
+
+const PD_SAMPLE_DENIAL = "PagerDuty request failed (403 Forbidden) for /users: Access Denied; code 2010; Access Denied";
+
+/**
+ * The standing fixed texts PagerDuty emits, rendered with sample paths and names: the config loader read and
+ * parse messages, the non-JSON and opaque-body notes, the timeout, the inventory states (complete, partial with
+ * the truncation reason, unread, not requested), the `not requested:` marker errors naming the parent read, the
+ * principals_withheld and partial-view wordings, the credential scope notes, and the corollary summary templates.
+ * Each must come back from PagerdutyRequestError's pass and client.redact unchanged.
+ */
+const PAGERDUTY_FIXED_TEXTS = [
+  // The resolver's own messages, which reach check_access, assess, and export results live.
+  "PagerDuty credentials are required: set PAGERDUTY_API_TOKEN (account or user REST API key), PAGERDUTY_ACCESS_TOKEN (OAuth bearer token), or PAGERDUTY_CLIENT_ID, PAGERDUTY_CLIENT_SECRET, and PAGERDUTY_SUBDOMAIN (Scoped OAuth app credentials).",
+  "Unsupported PagerDuty service region \"mars\". Use \"us\" or \"eu\".",
+  "Pre-issued PagerDuty OAuth bearer token. Defaults to PAGERDUTY_ACCESS_TOKEN.",
+  "Assess PagerDuty audit logging (spec controls 11-13): audit record availability, retention against the documented 12 months, and API key rotation evidence derived from audit record token usage.",
+  "Unable to read PagerDuty config file /home/svc/.config/grclanker/pagerduty.json (ENOENT)",
+  "Unable to read PagerDuty config file /tmp/grclanker-pagerduty-loader-Ab3dEf/directory.json (EISDIR)",
+  "Unable to read PagerDuty config file /tmp/grclanker-pagerduty-loader-Ab3dEf/locked.json (EACCES)",
+  "Unable to parse PagerDuty config file: invalid JSON in /tmp/grclanker-pagerduty-loader-Ab3dEf/short.json",
+  "Unable to parse PagerDuty config file: invalid JSON in /tmp/grclanker-pagerduty-loader-Ab3dEf/trailing-comma.json at line 3",
+  "PagerDuty request failed (502 Bad Gateway) for /users: non-JSON body (text/html, 5120 bytes)",
+  "PagerDuty request failed (403 Forbidden) for /audit/records: JSON body without documented error fields (application/json, 27 bytes)",
+  "PagerDuty request failed (429 Too Many Requests) for /oncalls: non-JSON body (text/plain, 12 bytes)",
+  "PagerDuty OAuth token request failed (502) for /oauth/token: non-JSON body (text/html, 5120 bytes)",
+  "PagerDuty OAuth token request failed (403) for /oauth/token: invalid_client: client rejected",
+  "PagerDuty request timed out after 30000ms: /users",
+  PD_SAMPLE_DENIAL,
+  `users: unread (${PD_SAMPLE_DENIAL})`,
+  "users: complete (4 seen)",
+  "users: 4 of 2500 seen (the API returned an empty page while more was true)",
+  "users: 100 seen of an unknown total (collection incomplete)",
+  "audit records: 100 of 2500 seen (record limit 100 reached)",
+  "team members: not requested (the teams list was not read)",
+  "schedule details: not requested (the schedules list was not read)",
+  "business service dependencies: not requested (the business services list was not read)",
+  "not requested: the teams list was not read",
+  "not requested: the schedules list was not read",
+  "users could not be read (PagerDuty request failed (403 Forbidden) for /users: Access Denied; code 2010; Access Denied). Export Users > All Users from the PagerDuty web app and confirm each admin role.",
+  "credential scope could not be determined (PagerDuty request failed (502 Bad Gateway) for /users/me: non-JSON body (text/html, 5120 bytes))",
+  "Credential scope could not be determined (PagerDuty request failed (502 Bad Gateway) for /users/me: non-JSON body (text/html, 5120 bytes)); universal-claim findings will not pass until it is.",
+  "Credential scope: account-level REST API key.",
+  "Credential scope: user-level credential for bob.user@acme.example with role admin (partial visibility, passing findings are downgraded to warn).",
+  "user-level credential for bob.user@acme.example with role responder only returns the objects that user can see",
+  "Downgraded from pass to warn because the inventory is partial: users: 4 of 2500 seen (the API returned an empty page while more was true).",
+  "users: 4 of 2500 seen (the API returned an empty page while more was true); teams: unread (PagerDuty request failed (403 Forbidden) for /teams: Access Denied; code 2010; Access Denied)",
+  "Use a read-only account-level REST API key created by an account admin (Integrations > API Access Keys), or a Scoped OAuth app token that includes the listed *.read scopes.",
+  "escalation policy Platform-Primary-2026 and schedule SRE_Weekend_Rotation on team Acme_Platform_Team",
+  "Only 2 of 25 controls read every inventory to completion on acme-corp.pagerduty.com; PD-03 is manual and names users",
+];
+
+/** Addendum 7 must-keep table for PagerDuty: paths and inventories, tenants, principals, finding ids, and the standing fixed texts. */
+function pagerdutyKeepTable() {
+  return {
+    paths: ["/oauth/token", "/users/me", ...PAGERDUTY_CANARY_SURFACES.filter((path) => path !== "/users/me")],
+    tables: PAGERDUTY_DATASETS,
+    tenants: [
+      "acme-corp.pagerduty.com",
+      "https://api.pagerduty.com",
+      "api.eu.pagerduty.com",
+      "https://identity.pagerduty.com/oauth/token",
+      "acme-corp",
+      "prod-us-east-2026",
+      "Acme_Platform_Team",
+    ],
+    principals: [
+      "bob.user@acme.example",
+      "owner-1@example.com",
+      // PagerDuty ids: an uppercase P followed by six alphanumerics.
+      "PABC123",
+      "PXYZ789",
+      "PF9KQ2M",
+      "owner-1",
+      "team-1",
+      "sched-1",
+      "Platform-Primary-2026",
+      "SRE_Weekend_Rotation",
+    ],
+    findingIds: ALL_CONTROLS.map((control) => findingId(control)),
+    fixedTexts: PAGERDUTY_FIXED_TEXTS,
+  };
+}
+
+test("scrub boundary: bare name-shaped values stay, carriers and registered secrets (in every encoded form) and real token shapes go, in PagerdutyRequestError and on client.redact; the addendum 7 must-keep table survives in isolation and in sentences", () => {
+  const fetchImpl = async () => jsonResponse({});
+  const mustKeep = [
+    "PagerDuty request failed (502 Bad Gateway) for /users: non-JSON body (text/html, 5120 bytes)",
+    "PagerDuty request failed (403 Forbidden) for /audit/records: JSON body without documented error fields (application/json, 42 bytes)",
+    "Unable to read PagerDuty config file /home/svc/.pagerduty/config.json (ENOENT)",
+    "Unable to parse PagerDuty config file: invalid JSON in /tmp/grclanker-pagerduty-loader-Ab3dEf/short.json",
+    "escalation policy Platform-Primary-2026 and schedule SRE_Weekend_Rotation on team Acme_Platform_Team",
+  ];
+  const keepTable = pagerdutyKeepTable();
+  assert.equal(keepTable.findingIds.length, 25, "every PagerDuty finding id is in the table");
+  assert.ok(keepTable.findingIds.includes(findingId(3)));
+  assert.equal(keepTable.paths.length, PAGERDUTY_CANARY_SURFACES.length + 1, "every requested path plus the token endpoint is in the table");
+  // The client constructor is the registration path (rememberSecrets on the configured REST API key); the error constructor is the pass.
+  assertScrubBoundary({
+    scrub: (text) => new PagerdutyRequestError(502, text, "/x").message,
+    registerSecret: (secret) => new PagerdutyApiClient(sampleConfig({ apiToken: secret }), { fetchImpl }),
+    mustKeep,
+    keepTable,
+  });
+  assertScrubBoundary({ scrub: (text) => new PagerdutyApiClient(sampleConfig(), { fetchImpl }).redact(text), mustKeep, keepTable });
+});
+
+test("round 7 note 1: every fixed-text message PagerDuty emits (loader, opaque body, timeout, inventory states, not requested markers, principals_withheld, credential scope notes, corollary summaries) comes back from PagerdutyRequestError's pass unchanged", async () => {
+  const texts = new Set(PAGERDUTY_FIXED_TEXTS);
+  const fetchImpl = async () => jsonResponse({});
+  const scrubs = {
+    "PagerdutyRequestError": (text) => new PagerdutyRequestError(502, text, "/x").message,
+    "client.redact": (text) => new PagerdutyApiClient(sampleConfig(), { fetchImpl }).redact(text),
+  };
+
+  // The loader's own read and parse messages on real failing files.
+  for (const item of configLoaderCases({ format: "json", displayName: "PagerDuty", fileNoun: "config file", extension: ".json" })) {
+    if (item.skip) continue;
+    assert.throws(() => resolvePagerdutyConfiguration({ config_file: item.path }, {}), (error) => {
+      texts.add(error.message);
+      return true;
+    });
+  }
+
+  // The resolver's own messages on the real path with an empty environment and an explicit config file
+  // that holds no credentials (so the default location under the real home is never consulted): no
+  // credentials, and credentials with an unsupported service region.
+  const emptyConfigPath = join(createTempBase("grclanker-pd-fixed-text-config-"), "config.json");
+  writeFileSync(emptyConfigPath, "{}\n");
+  const resolverMessages = [
+    collectThrownMessage(texts, () => resolvePagerdutyConfiguration({ config_file: emptyConfigPath }, {}), "no credentials"),
+    collectThrownMessage(texts, () => resolvePagerdutyConfiguration({ config_file: emptyConfigPath, api_token: "rest-api-key", region: "mars" }, {}), "unsupported region"),
+  ];
+  assert.ok(resolverMessages.some((message) => /^PagerDuty credentials are required: set PAGERDUTY_API_TOKEN/.test(message)), "the resolver rendered its credentials-required message");
+  assert.ok(resolverMessages.some((message) => /^Unsupported PagerDuty service region "mars"\./.test(message)), "the resolver rendered its region message");
+
+  // Every tool label, description, and argument description the integration registers.
+  const registered = [];
+  registerPagerdutyTools({ registerTool: (tool) => registered.push(tool) });
+  const toolTexts = collectToolTexts(registered);
+  assert.ok([...toolTexts].some((text) => /OAuth bearer token/.test(text)), "the tool schemas carry the bearer token argument description");
+  for (const text of toolTexts) texts.add(text);
+
+  // Every surface under three credential-free failure flavors (plain proxy page, unrecognized JSON shape, documented
+  // error), then every endpoint denied, every list empty, and every list truncated: the access check, the five
+  // assessments, the analysis and core_data files, and the error log render the opaque-body notes, the inventory
+  // states, the markers naming the parent read, the withheld notes, and the demotion templates on real paths.
+  const harvest = (run) => {
+    collectFixedTexts([run.analysis, run.accessCheck, run.payloads], texts);
+    for (const line of logLines(run.errors)) texts.add(line);
+    for (const [name, content] of run.files) {
+      if (name.startsWith("core_data/") && name.endsWith(".json")) collectFixedTexts(JSON.parse(content), texts);
+    }
+  };
+  for (const path of PAGERDUTY_CANARY_SURFACES) {
+    for (const flavor of ["plainHtml", "opaqueJson", "plainJson"]) harvest(await exportWithFixture({ fail: { path, flavor } }));
+  }
+  harvest(await exportWithFixture({}));
+  const listPaths = PAGERDUTY_LIST_ENDPOINTS.map(([path]) => path);
+  harvest(await exportWithFixture({ deny: [...PAGERDUTY_OBJECT_ENDPOINTS, ...listPaths] }));
+  harvest(await exportWithFixture({ empty: listPaths }));
+  harvest(await exportWithFixture({ truncate: listPaths }));
+  for (const path of [...PAGERDUTY_OBJECT_ENDPOINTS, ...listPaths]) harvest(await exportWithFixture({ deny: [path] }));
+
+  // The token endpoint and the timeout wording through the real client.
+  const oauth = sampleConfig({ authMode: "oauth_client_credentials", apiToken: undefined, clientId: "pd-client-id", clientSecret: "pd-client-secret-value", subdomain: "acme-corp" });
+  for (const flavor of ["plainHtml", "opaqueJson"]) {
+    const fixture = pagerdutyApiFixture({ fail: { path: "/oauth/token", flavor } });
+    const client = new PagerdutyApiClient(oauth, { fetchImpl: fixture.fetchImpl, now: () => NOW, sleep: async () => {} });
+    collectFixedTexts(await checkPagerdutyAccess(client), texts);
+  }
+  const timingOut = new PagerdutyApiClient(sampleConfig({ timeoutMs: 1000 }), {
+    fetchImpl: async (_input, init) => new Promise((_resolve, reject) => init?.signal?.addEventListener("abort", () => reject(new DOMException("aborted", "AbortError")))),
+    now: () => NOW,
+    sleep: async () => {},
+  });
+  await assert.rejects(timingOut.listUsers(5), (error) => {
+    texts.add(error.message);
+    return true;
+  });
+
+  for (const [label, scrub] of Object.entries(scrubs)) {
+    const checked = assertFixedTextsSurvive(scrub, texts, `PagerDuty fixed texts through ${label}`);
+    assert.ok(checked >= PAGERDUTY_FIXED_TEXTS.length + 40, `the harvest rendered texts beyond the standing list (${checked})`);
+  }
+  assert.ok([...texts].some((text) => /^[a-z ]+: unread \(/.test(text)), "the harvest rendered an unread inventory state");
+  assert.ok([...texts].some((text) => /^[a-z ]+: not requested \(/.test(text)), "the harvest rendered a not requested inventory state");
+  assert.ok([...texts].some((text) => /^not requested: /.test(text)), "the harvest rendered a not requested marker error");
+  assert.ok([...texts].some((text) => / of \d+ seen \(/.test(text)), "the harvest rendered a partial inventory state");
+  assert.ok([...texts].some((text) => /non-JSON body \(text\/html, \d+ bytes\)/.test(text)), "the harvest rendered a status-and-length note");
+  assert.ok([...texts].some((text) => /JSON body without documented error fields \(application\/json, \d+ bytes\)/.test(text)), "the harvest rendered an opaque JSON note");
+  assert.ok([...texts].some((text) => /^Credential scope/.test(text)), "the harvest rendered a credential scope note");
+  assert.ok([...texts].some((text) => /timed out after \d+ms/.test(text)), "the harvest rendered the timeout wording");
+});
+
+test("round 7 note 2: credentials and the config file path set through the environment survive an unrelated argument, and the source chain names the environment", () => {
+  const base = createTempBase("grclanker-pagerduty-env-survives-");
+  const configPath = join(base, "pagerduty.json");
+  writeFileSync(configPath, JSON.stringify({ api_token: "file-api-token-value", region: "eu", from_email: "file@acme.example" }));
+  for (const tokenKey of ["PAGERDUTY_API_TOKEN", "PAGERDUTY_API_KEY", "PAGERDUTY_TOKEN", "PD_API_KEY"]) {
+    const env = { PAGERDUTY_CONFIG_FILE: configPath, [tokenKey]: "env-api-token-value" };
+    for (const [label, unrelated] of [
+      ["timeout_seconds", { timeout_seconds: 45 }],
+      ["region", { region: "us" }],
+      ["subdomain", { subdomain: "acme-corp" }],
+    ]) {
+      const resolved = resolvePagerdutyConfiguration(unrelated, env);
+      const context = `${tokenKey} with ${label}`;
+      assert.equal(resolved.authMode, "api_token", context);
+      assert.equal(resolved.apiToken, "env-api-token-value", `${context}: the environment token resolves over the file`);
+      assert.equal(resolved.fromEmail, "file@acme.example", `${context}: the file value not set elsewhere still applies`);
+      assert.ok(resolved.sourceChain.includes("environment-api-token"), `${context}: the source chain names the environment: ${JSON.stringify(resolved.sourceChain)}`);
+      assert.ok(resolved.sourceChain.includes("config-file-from-email"), `${context}: the source chain names the config file from the environment`);
+      assert.ok(!resolved.sourceChain.includes("arguments-api-token"), `${context}: the unrelated argument does not claim the token`);
+      assert.equal(resolved.baseUrl, label === "region" ? "https://api.pagerduty.com" : "https://api.eu.pagerduty.com", context);
+      if (label === "timeout_seconds") assert.equal(resolved.timeoutMs, 45000, context);
+    }
+  }
+  // An argument object whose credential keys are present but undefined must not shadow the environment.
+  const env = { PAGERDUTY_CONFIG_FILE: configPath, PAGERDUTY_API_TOKEN: "env-api-token-value" };
+  const shadowed = resolvePagerdutyConfiguration({ api_token: undefined, token: undefined, timeout_seconds: 45 }, env);
+  assert.equal(shadowed.apiToken, "env-api-token-value");
+  assert.deepEqual(shadowed.sourceChain, ["environment-api-token", "config-file-from-email", "config-file-region"]);
+  // Scoped OAuth credentials through the environment survive the same way.
+  const oauth = resolvePagerdutyConfiguration({ timeout_seconds: 45 }, { PAGERDUTY_CONFIG_FILE: EMPTY_CONFIG_FILE, PAGERDUTY_CLIENT_ID: "env-client-id", PAGERDUTY_CLIENT_SECRET: "env-client-secret-value", PAGERDUTY_SUBDOMAIN: "acme-corp" });
+  assert.equal(oauth.authMode, "oauth_client_credentials");
+  assert.equal(oauth.clientSecret, "env-client-secret-value");
+  assert.deepEqual(oauth.sourceChain, ["environment-client-id", "environment-client-secret", "environment-subdomain"]);
+});
+
+test("collection status: a truncated user directory keeps seen counts, renders principal-derived counts and lists null, and names no user from the partial set", async () => {
+  const run = await exportWithFixture({ truncate: ["/users"] });
+  const users = JSON.parse(run.files.get("core_data/users.json"));
+  assert.equal(users.complete, false);
+  assert.equal(users.total, 2500);
+  assert.equal(users.items.length, 4);
+  const accessControl = run.analysis.find((item) => item.category === "access_control");
+  assert.equal(accessControl.summary.users_seen, 4);
+  assert.equal(accessControl.summary.users_total, 2500);
+  assert.equal(accessControl.summary.privileged_users, null);
+  assert.equal(accessControl.summary.owners, null);
+  assert.match(accessControl.summary.inventories.users, /^users: 4 of 2500 seen \(/);
+  const text = JSON.stringify(run.analysis);
+  for (const email of principalLabels(run.fixtures)) assert.ok(!text.includes(email), `${email} must not be named from a partly read directory`);
+  for (const control of [1, 2, 3, 4]) {
+    const item = findingById(accessControl, control);
+    assert.notEqual(item.status, "pass", `PD-${control} cannot pass on a partial directory`);
+    assert.match(item.evidence.principals_withheld, /^users: 4 of 2500 seen/);
+  }
+  const oncall = run.analysis.find((item) => item.category === "oncall_coverage");
+  assert.equal(findingById(oncall, 17).evidence.responders_without_rules, null);
+  assert.equal(findingById(oncall, 18).evidence.oncall_email_only, null);
+  assertMentionsMatchRequests([run.analysis, run.accessCheck, run.payloads, run.errors], run.requests, "truncated users");
+});
+
+test("reviewer B round 4 verdict N3: PD-04, PD-20, and PD-21 are manual, not fail, on a page truncated before any item was visible, with the partial-view sentence; PD-10, PD-11, and PD-12 state emptiness only from a complete read or with the partial-view clause; complete empty lists still fail", () => {
+  const fixtures = healthyFixtures();
+  const truncatedTeams = assessPagerdutyAccessControl({
+    scope: accountScope(),
+    abilities: snapshot(fixtures.abilities),
+    users: list(fixtures.users),
+    teams: partialList([], 40),
+    teamMembers: snapshot({}),
+  }, { maxAdmins: 3 });
+  const teamScoping = findingById(truncatedTeams, 4);
+  assert.equal(teamScoping.status, "manual");
+  assert.match(teamScoping.summary, /^GET \/teams was truncated before any team was visible \(teams: 0 of 40 seen \(stopped at the requested limit of 0 with more results available\)\), so whether access is scoped by team cannot be confirmed or ruled out from the visible rows; the verdict is manual \(unknown\)\. Review Teams in the web app/);
+  assert.doesNotMatch(teamScoping.summary, /empty team list fails/);
+  assert.equal(teamScoping.evidence.teams_seen, 0);
+  assert.equal(teamScoping.evidence.teams_total, 40);
+  assert.equal(teamScoping.evidence.team_member_lists_truncated, null, "an empty list from a truncated teams page is an absence claim");
+  assert.deepEqual(teamScoping.evidence.partial_view, ["teams: 0 of 40 seen (stopped at the requested limit of 0 with more results available)"]);
+
+  // An absent "teams" ability is a complete observation: it fails even beside the truncated page, and the sentence names both.
+  const truncatedTeamsNoAbility = assessPagerdutyAccessControl({
+    scope: accountScope(),
+    abilities: snapshot(["sso"]),
+    users: list(fixtures.users),
+    teams: partialList([], 40),
+    teamMembers: snapshot({}),
+  }, { maxAdmins: 3 });
+  assertStatuses(truncatedTeamsNoAbility, { 4: "fail" });
+  assert.match(findingById(truncatedTeamsNoAbility, 4).summary, /GET \/teams returned 0 teams \(teams: 0 of 40 seen \(stopped at the requested limit of 0 with more results available\)\) and the "teams" ability is absent from GET \/abilities, so access is not scoped by team; the absent teams ability fails this control\./);
+
+  // A complete empty team list still fails.
+  const emptyTeams = assessPagerdutyAccessControl({
+    scope: accountScope(),
+    abilities: snapshot(fixtures.abilities),
+    users: list(fixtures.users),
+    teams: list([]),
+    teamMembers: snapshot({}),
+  }, { maxAdmins: 3 });
+  assertStatuses(emptyTeams, { 4: "fail" });
+  assert.match(findingById(emptyTeams, 4).summary, /GET \/teams returned 0 teams, so access is not scoped by team; an empty team list fails this control\./);
+  assert.deepEqual(findingById(emptyTeams, 4).evidence.team_member_lists_truncated, []);
+
+  const truncatedPriorities = assessPagerdutyIncidentResponse({
+    scope: accountScope(),
+    services: list(fixtures.services),
+    escalationPolicies: list(fixtures.escalationPolicies),
+    priorities: partialList([], 40),
+    incidentWorkflows: list(fixtures.incidentWorkflows),
+    workflowTriggers: list(fixtures.incidentWorkflowTriggers),
+  });
+  const priorities = findingById(truncatedPriorities, 20);
+  assert.equal(priorities.status, "manual");
+  assert.match(priorities.summary, /^GET \/priorities was truncated before any priority was visible \(priorities: 0 of 40 seen \(stopped at the requested limit of 0 with more results available\)\), so whether custom incident priorities are defined cannot be confirmed or ruled out from the visible rows; the verdict is manual \(unknown\)\. Record the incident priority levels/);
+  assert.doesNotMatch(priorities.summary, /emptiness fails/);
+  assert.equal(priorities.evidence.priorities, null);
+  assert.equal(priorities.evidence.priorities_seen, 0);
+  assert.deepEqual(priorities.evidence.partial_view, ["priorities: 0 of 40 seen (stopped at the requested limit of 0 with more results available)"]);
+  const emptyPriorities = assessPagerdutyIncidentResponse({
+    scope: accountScope(),
+    services: list(fixtures.services),
+    escalationPolicies: list(fixtures.escalationPolicies),
+    priorities: list([]),
+    incidentWorkflows: list(fixtures.incidentWorkflows),
+    workflowTriggers: list(fixtures.incidentWorkflowTriggers),
+  });
+  assertStatuses(emptyPriorities, { 20: "fail" });
+  assert.match(findingById(emptyPriorities, 20).summary, /returned zero priorities.*emptiness fails this control/);
+
+  // PD-10: the response-play count is stated bare only from a complete service read.
+  const truncatedServices = assessPagerdutyIncidentResponse({
+    scope: accountScope(),
+    services: partialList([], 40),
+    escalationPolicies: list(fixtures.escalationPolicies),
+    priorities: list(fixtures.priorities),
+    incidentWorkflows: list(fixtures.incidentWorkflows),
+    workflowTriggers: list(fixtures.incidentWorkflowTriggers),
+  });
+  const automation = findingById(truncatedServices, 10);
+  assert.notEqual(automation.status, "fail");
+  assert.doesNotMatch(automation.summary, /0 services still reference one/);
+  assert.match(automation.summary, /0 of the 0 visible services still reference one \(services: 0 of 40 seen \(stopped at the requested limit of 0 with more results available\); the unread services are not counted\)/);
+  assert.equal(automation.evidence.services_with_legacy_response_plays, null);
+  const truncatedServicesNoAutomation = assessPagerdutyIncidentResponse({
+    scope: accountScope(),
+    services: partialList([], 40),
+    escalationPolicies: list(fixtures.escalationPolicies),
+    priorities: list(fixtures.priorities),
+    incidentWorkflows: list([]),
+    workflowTriggers: list([]),
+  });
+  assertStatuses(truncatedServicesNoAutomation, { 10: "fail" });
+  assert.doesNotMatch(findingById(truncatedServicesNoAutomation, 10).summary, /no service references a response play/);
+  assert.match(findingById(truncatedServicesNoAutomation, 10).summary, /0 of the 0 visible services reference deprecated response plays \(services: 0 of 40 seen/);
+  const completeServices = assessPagerdutyIncidentResponse({
+    scope: accountScope(),
+    services: list(fixtures.services),
+    escalationPolicies: list(fixtures.escalationPolicies),
+    priorities: list(fixtures.priorities),
+    incidentWorkflows: list(fixtures.incidentWorkflows),
+    workflowTriggers: list(fixtures.incidentWorkflowTriggers),
+  });
+  assert.match(findingById(completeServices, 10).summary, /; 0 services still reference one\)/);
+
+  const truncatedBusinessServices = assessPagerdutyIntegrationSecurity({
+    scope: accountScope(),
+    services: list([service("svc-1")]),
+    extensions: list([{ id: "ext-1", summary: "Slack", endpoint_url: "https://hooks.example.com/slack", extension_schema: { summary: "Slack V2" } }]),
+    webhookSubscriptions: list([{ id: "wh-1", active: true, delivery_method: { url: "https://siem.example.com/pd" } }]),
+    businessServices: partialList([], 40),
+    businessServiceDependencies: snapshot({}),
+    changeEvents: list([{ id: "chg-1", timestamp: "2026-09-15T00:00:00Z", services: [{ id: "svc-1" }] }]),
+    changeWindow: CHANGE_WINDOW,
+  });
+  const dependencies = findingById(truncatedBusinessServices, 21);
+  assert.equal(dependencies.status, "manual");
+  assert.match(dependencies.summary, /^GET \/business_services was truncated before any business service was visible \(business services: 0 of 40 seen \(stopped at the requested limit of 0 with more results available\)\), so whether service dependencies are mapped for impact analysis cannot be confirmed or ruled out from the visible rows; the verdict is manual \(unknown\)\. Record the business services/);
+  assert.doesNotMatch(dependencies.summary, /emptiness fails/);
+  assert.equal(dependencies.evidence.business_services_seen, 0);
+  assert.equal(dependencies.evidence.unmapped_business_services, null);
+  assert.deepEqual(dependencies.evidence.partial_view, ["business services: 0 of 40 seen (stopped at the requested limit of 0 with more results available)"]);
+  const emptyBusinessServices = assessPagerdutyIntegrationSecurity({
+    scope: accountScope(),
+    services: list([service("svc-1")]),
+    extensions: list([]),
+    webhookSubscriptions: list([]),
+    businessServices: list([]),
+    businessServiceDependencies: snapshot({}),
+    changeEvents: list([]),
+    changeWindow: CHANGE_WINDOW,
+  });
+  assertStatuses(emptyBusinessServices, { 21: "fail" });
+  assert.match(findingById(emptyBusinessServices, 21).summary, /returned zero business services.*emptiness fails this control/);
+
+  // PD-11 and PD-12 stay at warn on a truncated empty page, and their sentences carry the partial view instead of the emptiness claim.
+  const truncatedAudit = assessPagerdutyAuditLogging({
+    scope: accountScope(),
+    recentRecords: partialList([], 40),
+    retentionProbe: partialList([], 40),
+    windows: AUDIT_WINDOWS,
+  });
+  assertStatuses(truncatedAudit, { 11: "warn", 12: "warn", 13: "manual" });
+  const logging = findingById(truncatedAudit, 11);
+  assert.doesNotMatch(logging.summary, /returned zero records/);
+  assert.match(logging.summary, /^The audit records API is readable but the read was truncated before any record between \S+ and \S+ was visible \(audit records: 0 of 40 seen \(stopped at the requested limit of 0 with more results available\)\), so whether logging is active cannot be confirmed or ruled out from the visible records; confirm recent configuration changes appear in the web app audit trail\.$/);
+  assert.equal(logging.evidence.records_returned, 0);
+  assert.equal(logging.evidence.records_dated_in_window, null);
+  const retention = findingById(truncatedAudit, 12);
+  assert.doesNotMatch(retention.summary, /No audit records were returned/);
+  assert.match(retention.summary, /^The retention probe was truncated before any record for \S+ to \S+ was visible \(retention probe records: 0 of 40 seen \(stopped at the requested limit of 0 with more results available\)\), so retention cannot be confirmed or ruled out from the visible records\. PagerDuty documents 12 months of retention\.$/);
+  assert.equal(retention.evidence.probe_records_returned, 0);
+  assert.equal(retention.evidence.probe_records_dated_in_window, null);
+  const quietAudit = assessPagerdutyAuditLogging({
+    scope: accountScope(),
+    recentRecords: list([]),
+    retentionProbe: list([]),
+    windows: AUDIT_WINDOWS,
+  });
+  assertStatuses(quietAudit, { 11: "warn", 12: "warn" });
+  assert.match(findingById(quietAudit, 11).summary, /returned zero records/);
+  assert.match(findingById(quietAudit, 12).summary, /No audit records were returned/);
 });

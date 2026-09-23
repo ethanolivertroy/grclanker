@@ -6,6 +6,7 @@ import {
   mkdtempSync,
   readFileSync,
   readdirSync,
+  rmSync,
   symlinkSync,
   writeFileSync,
 } from "node:fs";
@@ -28,10 +29,20 @@ import {
   parseSimpleToml,
   redactSecretText,
   redactSnapshot,
+  registerMulesoftTools,
   resolveMulesoftConfiguration,
   resolveSecureOutputPath,
 } from "../dist/extensions/grc-tools/mulesoft.js";
 import { getRegisteredToolSummaries } from "../dist/pi/tool-catalog.js";
+import { assertSecretFragmentsAbsent, readBundleFiles, readZipEntries } from "./helpers/bundle-contents.mjs";
+import { CONFIG_CANARIES, assertConfigLoaderMatrix, configLoaderCases } from "./helpers/config-loader-matrix.mjs";
+import { assertFixedTextsSurvive, collectFixedTexts, collectThrownMessage, collectToolTexts, logLines } from "./helpers/fixed-text-survival.mjs";
+import { assertLeavesNullUnderDenial } from "./helpers/leaf-diff.mjs";
+import { assertFragmentsAbsent, assertPlantedValuesWellFormed } from "./helpers/planted-values.mjs";
+import { BARE_TOKEN_CONTROL, CONFIGURED_SECRET_CANARIES, VENDOR_TOKEN_CANARIES, assertTextFieldCarriers, carrierSuffix, injectingFetch } from "./helpers/text-field-carriers.mjs";
+import { assertDeepCanariesWellFormed, assertDeepNesting, deepFields, plantingFetch } from "./helpers/deep-nesting.mjs";
+import { ESCAPE_CANARIES, ESCAPE_CANARY_PLANTED_VALUES, escapeBoundaryTrace } from "./helpers/escape-boundary.mjs";
+import { assertScrubBoundary } from "./helpers/scrub-boundary-matrix.mjs";
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 const ORG_ID = "org-1";
@@ -44,13 +55,30 @@ function isoDaysFromNow(days) {
   return new Date(Date.now() + days * DAY_MS).toISOString();
 }
 
+/** The configured bearer token and the credentials echoed by fixtures: planted, so random-looking (see the planted-values self-check). */
+const SAMPLE_TOKEN = "zS8UnCR3BnceRQyrBb";
+const PLANTED = {
+  echoedClientSecret: "HmRgJvEWE6WKZWgN3j",
+  bearer: "6aqyv2X4mZXxphbTmg",
+  clientSecret: "h2fpZsVuYwfaNAVJZv",
+  password: "5BL3GwUzeH3x5BGRGE",
+  configuredSecret: "9dUvtkD5mgQkKTzZvj",
+};
+
+/** Credentials planted on the malformed TOML lines the strict reader must stop on (see the planted-values self-check). */
+const TOML_CANARIES = {
+  bareLine: "jLBw6AEIKfPbU6CUxx",
+  unterminatedQuote: "SuENX6SvYS1MCVBZue",
+  multiLineString: "RltxNPr3Iga7jo7PLG",
+};
+
 function sampleConfig(overrides = {}) {
   return {
     organizationId: ORG_ID,
     controlPlane: "us",
     baseUrl: "https://anypoint.mulesoft.com",
     authMode: "token",
-    token: "anypoint-token",
+    token: SAMPLE_TOKEN,
     environmentFilter: [],
     timeoutMs: 30000,
     sourceChain: ["tests"],
@@ -315,6 +343,56 @@ test("parseSimpleToml handles sections, comments, arrays, and quoted values", ()
   assert.equal(parsed.verbose, true);
   assert.equal(parsed["auth.client_id"], "file-client");
   assert.deepEqual(parsed["auth.environments"], ["Production", "Sandbox"]);
+
+  // The accepted subset also covers quoted keys, one-line triple-quoted strings, escaped quotes, empty
+  // arrays, bare words, and a `#` inside a string.
+  const edges = parseSimpleToml([
+    "\"quoted key\" = 'v'",
+    "triple = \"\"\"a \"b\" c\"\"\"",
+    "escaped = \"say \\\"hi\\\" # not a comment\"",
+    "empty = []",
+    "bare = eu",
+    "[\"dotted.section\"]",
+    "n = 1_000",
+  ].join("\n"));
+  assert.equal(edges["quoted key"], "v");
+  assert.equal(edges.triple, "a \"b\" c");
+  assert.equal(edges.escaped, "say \"hi\" # not a comment");
+  assert.deepEqual(edges.empty, []);
+  assert.equal(edges.bare, "eu");
+  assert.equal(edges["dotted.section.n"], 1000);
+});
+
+test("parseSimpleToml is strict: any line that is not blank, a comment, a [table] header, or a single-line key = value pair, and any quote that does not close on its line, throws with the line number only", () => {
+  const rejected = [
+    ["bare value line", ["org_id = \"o\"", "stray-value", "x = 1"], 2],
+    ["unclosed table header", ["[anypoint", "x = 1"], 1],
+    ["array of tables", ["[[servers]]", "x = 1"], 1],
+    ["missing value", ["x =", "y = 1"], 1],
+    ["missing value after a comment", ["x = # nothing", "y = 1"], 1],
+    ["unterminated basic string", ["a = 1", "x = \"open"], 2],
+    ["unterminated literal string", ["x = 'open"], 1],
+    ["escaped closing quote only", ["x = \"open\\\""], 1],
+    ["multi-line basic string opener", ["a = 1", "b = 2", "x = \"\"\"", "value", "\"\"\""], 3],
+    ["multi-line literal string opener", ["x = '''"], 1],
+    ["continued array", ["x = [", "1,", "]"], 1],
+    ["text after a closed string", ["x = \"a\" b"], 1],
+    ["unclosed quote in a bare value", ["x = it's"], 1],
+    ["key with spaces", ["my key = 1"], 1],
+    ["key without separator", ["client_secret"], 1],
+    ["equals only", ["="], 1],
+    ["nested array", ["x = [[1, 2], [3]]"], 1],
+  ];
+  for (const [name, lines, expectedLine] of rejected) {
+    assert.throws(() => parseSimpleToml(lines.join("\n")), (error) => {
+      assert.equal(error.name, "MulesoftTomlSyntaxError", name);
+      assert.equal(error.line, expectedLine, `${name}: line number`);
+      assert.equal(error.message, `Invalid TOML at line ${expectedLine}`, `${name}: the message carries the line number only`);
+      return true;
+    }, name);
+  }
+  // CRLF files count lines the same way.
+  assert.throws(() => parseSimpleToml("a = 1\r\nb = 2\r\nstray\r\n"), (error) => error.line === 3);
 });
 
 test("resolveMulesoftConfiguration prefers explicit args over environment and config file", () => {
@@ -373,6 +451,124 @@ test("resolveMulesoftConfiguration prefers explicit args over environment and co
   assert.deepEqual(fromFile.environmentFilter, ["FileEnv"]);
   assert.equal(fromFile.timeoutMs, 45000);
   assert.ok(fromFile.sourceChain.includes("config-organization"));
+});
+
+test("addendum 6b: the TOML config loader reports read failures with fixed text and never quotes the fs error", async () => {
+  const home = createTempBase("grclanker-mulesoft-loader-home-");
+  const cases = configLoaderCases({ format: "toml", displayName: "MuleSoft", fileNoun: "config file", extension: ".toml" });
+  assert.deepEqual(cases.map((item) => item.name), ["EISDIR", "EACCES", "ENOENT on an explicit path"]);
+  const registered = [];
+  registerMulesoftTools({ registerTool: (tool) => registered.push(tool) });
+  const checkAccess = registered.find((tool) => tool.name === "mulesoft_check_access");
+  await assertConfigLoaderMatrix(cases, {
+    resolve: (path) => resolveMulesoftConfiguration({ config_file: path }, {}, { homeDir: home }),
+    checkAccess: (path) => checkAccess.execute("call-config", checkAccess.prepareArguments({ config_file: path })),
+  });
+  // The env-pointed paths are explicit as well: a missing file is a read error, not a silent skip.
+  const absent = join(home, "absent.toml");
+  for (const env of [{ MULESOFT_SEC_INSPECTOR_CONFIG: absent }, { ANYPOINT_CONFIG_FILE: absent }]) {
+    assert.throws(() => resolveMulesoftConfiguration({}, env, { homeDir: home }), (error) => {
+      assert.equal(error.message, `Unable to read MuleSoft config file ${absent} (ENOENT)`);
+      assert.equal(error.code, "ENOENT");
+      return true;
+    });
+  }
+  // A malformed file stops the loader at the first line the strict reader cannot accept (here the
+  // unclosed table header), with fixed text naming the path and line; the planted values on the
+  // following line are never read, so no window of them can reach the message.
+  const malformed = join(home, "malformed.toml");
+  writeFileSync(malformed, `[anypoint\nclient_secret = ${TOML_CANARIES.bareLine}: Bearer ${TOML_CANARIES.unterminatedQuote}\n`);
+  assert.throws(() => resolveMulesoftConfiguration({ config_file: malformed }, {}, { homeDir: home }), (error) => {
+    assert.equal(error.message, `Unable to parse MuleSoft config file: invalid TOML in ${malformed} at line 1 (INVALID_TOML)`);
+    assert.equal(error.code, "INVALID_TOML");
+    assertFragmentsAbsent(assert, String(error), Object.values(TOML_CANARIES), "malformed config resolver error");
+    return true;
+  });
+});
+
+test("round 2 BLOCKING: the strict TOML reader stops on a bare credential line, an unterminated quote, and a multi-line string with fixed text naming the line, and no 6-to-24-character window of the planted credential reaches the reader, the resolver, check_access, the export result, or an output root", async () => {
+  const home = createTempBase("grclanker-mulesoft-toml-strict-home-");
+  const registered = [];
+  registerMulesoftTools({ registerTool: (tool) => registered.push(tool) });
+  const checkAccess = registered.find((tool) => tool.name === "mulesoft_check_access");
+  const exportTool = registered.find((tool) => tool.name === "mulesoft_export_audit_bundle");
+  const shapes = [
+    {
+      name: "bare credential line",
+      canary: TOML_CANARIES.bareLine,
+      text: `org_id = "org-1"\nclient_id = "client-1"\n${TOML_CANARIES.bareLine}\ncontrol_plane = "us"\n`,
+      line: 3,
+    },
+    {
+      name: "unterminated quote",
+      canary: TOML_CANARIES.unterminatedQuote,
+      text: `org_id = "org-1"\nclient_secret = "${TOML_CANARIES.unterminatedQuote}\ncontrol_plane = "us"\n`,
+      line: 2,
+    },
+    {
+      name: "multi-line string",
+      canary: TOML_CANARIES.multiLineString,
+      text: `[anypoint]\norg_id = "org-1"\nclient_secret = """\n${TOML_CANARIES.multiLineString}\n"""\n`,
+      line: 3,
+    },
+  ];
+  const textOf = (result) => result.content.map((part) => part.text ?? "").join("\n");
+  for (const shape of shapes) {
+    const label = shape.name;
+    // Positive control: the reader itself stops at the malformed line (the lenient reader skipped or
+    // swallowed it), and its own message carries the line number only.
+    assert.throws(() => parseSimpleToml(shape.text), (error) => {
+      assert.equal(error.name, "MulesoftTomlSyntaxError", `${label}: reader error class`);
+      assert.equal(error.line, shape.line, `${label}: reader line`);
+      assert.equal(error.message, `Invalid TOML at line ${shape.line}`, `${label}: reader message`);
+      assertFragmentsAbsent(assert, String(error), [shape.canary], `${label}: reader String(error)`);
+      return true;
+    }, label);
+
+    const path = join(home, `${shape.name.replace(/ /g, "-")}.toml`);
+    writeFileSync(path, shape.text);
+    assert.ok(readFileSync(path, "utf8").includes(shape.canary), `${label}: the file on disk carries the credential`);
+    const expected = `Unable to parse MuleSoft config file: invalid TOML in ${path} at line ${shape.line} (INVALID_TOML)`;
+
+    // The exported resolver throws the fixed text, whether the path arrives as an argument or through either environment variable.
+    for (const [source, args, env] of [
+      ["argument", { config_file: path }, {}],
+      ["MULESOFT_SEC_INSPECTOR_CONFIG", {}, { MULESOFT_SEC_INSPECTOR_CONFIG: path }],
+      ["ANYPOINT_CONFIG_FILE", {}, { ANYPOINT_CONFIG_FILE: path }],
+    ]) {
+      assert.throws(() => resolveMulesoftConfiguration(args, env, { homeDir: home }), (error) => {
+        assert.equal(error.message, expected, `${label} via ${source}: fixed text`);
+        assert.equal(error.code, "INVALID_TOML", `${label} via ${source}: code`);
+        assert.equal(error.name, "MulesoftConfigFileError", `${label} via ${source}: class`);
+        assertFragmentsAbsent(assert, String(error), [shape.canary], `${label} via ${source}: resolver String(error)`);
+        assertFragmentsAbsent(assert, JSON.stringify({ ...error, message: error.message, stack: error.stack }), [shape.canary], `${label} via ${source}: resolver error fields`);
+        return true;
+      }, `${label} via ${source}`);
+    }
+
+    // check_access returns the fixed text and nothing from the file.
+    const access = await checkAccess.execute("call-toml-access", checkAccess.prepareArguments({ config_file: path }));
+    assert.equal(access.isError, true, `${label}: check_access reports an error`);
+    assert.ok(textOf(access).includes(expected), `${label}: check_access carries the fixed text: ${textOf(access)}`);
+    assertFragmentsAbsent(assert, textOf(access), [shape.canary], `${label}: check_access text`);
+    assertFragmentsAbsent(assert, JSON.stringify(access.details ?? {}), [shape.canary], `${label}: check_access details`);
+
+    // The export stops before an output directory or zip exists, so the bundle cannot carry the credential:
+    // the tool result is the fixed text and the output root stays empty.
+    const outputRoot = createTempBase("grclanker-mulesoft-toml-strict-out-");
+    const exported = await exportTool.execute("call-toml-export", exportTool.prepareArguments({ config_file: path, output_dir: outputRoot }));
+    assert.equal(exported.isError, true, `${label}: export reports an error`);
+    assert.ok(textOf(exported).includes(expected), `${label}: export carries the fixed text: ${textOf(exported)}`);
+    assertFragmentsAbsent(assert, textOf(exported), [shape.canary], `${label}: export text`);
+    assertFragmentsAbsent(assert, JSON.stringify(exported.details ?? {}), [shape.canary], `${label}: export details`);
+    assert.deepEqual(readdirSync(outputRoot), [], `${label}: no bundle directory or zip is written under the output root`);
+  }
+
+  // Fixed text on the malformed-line class survives every MuleSoft redaction pass unchanged.
+  const samplePath = join(home, "bare-credential-line.toml");
+  const sample = `Unable to parse MuleSoft config file: invalid TOML in ${samplePath} at line 3 (INVALID_TOML)`;
+  assert.equal(redactSecretText(sample), sample);
+  assert.equal(new MulesoftApiError(502, sample, "/x").message, sample);
 });
 
 test("resolveMulesoftConfiguration reads the default config.toml location under the home directory", () => {
@@ -519,7 +715,7 @@ test("MulesoftApiClient uses a pre-issued token without exchanging credentials",
   assert.equal(organization.name, "Acme");
   assert.equal(seen.length, 1);
   assert.equal(seen[0].pathname, `/accounts/api/organizations/${ORG_ID}`);
-  assert.equal(seen[0].auth, "Bearer anypoint-token");
+  assert.equal(seen[0].auth, `Bearer ${SAMPLE_TOKEN}`);
 });
 
 test("MulesoftApiClient retries 429 and 5xx responses with backoff", async () => {
@@ -550,7 +746,7 @@ test("MulesoftApiClient retries 429 and 5xx responses with backoff", async () =>
 test("MulesoftApiClient surfaces non-retryable errors with status and redacted secrets", async () => {
   const sleeps = [];
   const fetchImpl = async () => jsonResponse(
-    { error: "forbidden", message: "Not allowed for client_secret=top-secret-value with Bearer anypoint-token" },
+    { error: "forbidden", message: `Not allowed for client_secret=${PLANTED.echoedClientSecret} with Bearer ${SAMPLE_TOKEN}` },
     { status: 403, statusText: "Forbidden" },
   );
   const client = new MulesoftApiClient(sampleConfig(), {
@@ -567,12 +763,28 @@ test("MulesoftApiClient surfaces non-retryable errors with status and redacted s
       assert.equal(error.status, 403);
       assert.match(error.message, /403/);
       assert.match(error.message, /\/accounts\/api\/organizations\/org-1\/members/);
-      assert.doesNotMatch(error.message, /top-secret-value/);
-      assert.doesNotMatch(error.message, /anypoint-token/);
+      assertFragmentsAbsent(assert, error.message, [PLANTED.echoedClientSecret, SAMPLE_TOKEN], "403 error message echoing credentials");
       return true;
     },
   );
   assert.deepEqual(sleeps, []);
+
+  const opaqueClient = new MulesoftApiClient(sampleConfig(), {
+    fetchImpl: async () => new Response("<html>gateway error: x-api-key FAKE_PROXY_ECHOED_SECRET</html>", {
+      status: 403,
+      statusText: "Forbidden",
+      headers: { "content-type": "text/html; charset=utf-8" },
+    }),
+    sleepImpl: async () => {},
+  });
+  await assert.rejects(
+    () => opaqueClient.listMembers(),
+    (error) => {
+      assert.match(error.message, /403 Forbidden.*: non-JSON body \(text\/html, 62 bytes\)$/);
+      assert.doesNotMatch(error.message, /FAKE_PROXY_ECHOED_SECRET/, "a non-JSON error body is never copied into the error string");
+      return true;
+    },
+  );
 });
 
 test("redaction helpers mask secret-bearing keys and token text", () => {
@@ -588,11 +800,8 @@ test("redaction helpers mask secret-bearing keys and token text", () => {
   assert.equal(redacted.nested[0].name, "ok");
   assert.equal(redacted.authorization, "[REDACTED]");
 
-  const text = redactSecretText("Authorization: Bearer abc.def-ghi, client_secret=super-secret, \"password\": \"pw123\" body my-token-value", ["my-token-value"]);
-  assert.doesNotMatch(text, /abc\.def-ghi/);
-  assert.doesNotMatch(text, /super-secret/);
-  assert.doesNotMatch(text, /pw123/);
-  assert.doesNotMatch(text, /my-token-value/);
+  const text = redactSecretText(`Authorization: Bearer ${PLANTED.bearer}, client_secret=${PLANTED.clientSecret}, "password": "${PLANTED.password}" body ${PLANTED.configuredSecret}`, [PLANTED.configuredSecret]);
+  assertFragmentsAbsent(assert, text, [PLANTED.bearer, PLANTED.clientSecret, PLANTED.password, PLANTED.configuredSecret], "redactSecretText output");
 });
 
 test("checkMulesoftAccess reports a healthy organization when every surface is readable", async () => {
@@ -946,7 +1155,7 @@ test("assessMulesoftRuntimeInfrastructure marks VPC controls manual and certific
   assert.equal(statusOf(result, "MULESOFT-RT-14"), "manual");
   assert.equal(statusOf(result, "MULESOFT-RT-16"), "manual");
   assert.match(findingById(result, "MULESOFT-RT-16").summary, /Runtime Manager > Load Balancers/);
-  assert.ok(result.errors.some((error) => error.startsWith("certificate_probe:prod-dlb.lb.anypointdns.net")));
+  assert.ok(result.errors.some((error) => error.startsWith("certificate_probe (prod-dlb.lb.anypointdns.net")));
 });
 
 test("assessMulesoftAuditMonitoring passes when audit logs flow and production alerts cover applications", async () => {
@@ -1140,7 +1349,7 @@ test("MuleSoft tools are registered in the tool catalog under the MuleSoft group
 
 function forbidden(label) {
   return async () => {
-    throw new MulesoftApiError(403, `Anypoint request failed (403 Forbidden) for GET ${label}`);
+    throw new MulesoftApiError(403, `Anypoint request failed (403 Forbidden) for GET ${label}`, label);
   };
 }
 
@@ -2259,7 +2468,7 @@ test("review fix 9: IAM-19 warns as the documented expected outcome when the pub
   assert.match(finding.summary, /record the last-used dates manually/);
   assert.equal(finding.evidence.apps_with_usage_data, 0);
   assert.deepEqual(finding.evidence.apps_without_usage_date, ["Auditor", "CI deployer"]);
-  assert.match(finding.evidence.usage_data_source, /includeUsage=true; not part of the published schema, so absence is expected/);
+  assert.match(finding.evidence.usage_data_source, /connectedApplications with includeUsage=true; not part of the published schema, so absence is expected/);
   assert.ok(seen.find((item) => item.pathname.endsWith("/connectedApplications")).search.includes("includeUsage=true"));
   assert.equal(seen.some((item) => item.pathname.includes("/connectedApplications/authorizations")), false, "the per-user authorizations view is not read");
 
@@ -2375,7 +2584,8 @@ test("review fix 4: RT-15 evaluates defaultCipherSuite, failing weak ciphers and
   }));
   assert.equal(statusOf(detailForbidden, "MULESOFT-RT-15"), "manual");
   assert.match(findingById(detailForbidden, "MULESOFT-RT-15").summary, /Could not evaluate: load_balancer_details could not be read, the credential lacks permission \(HTTP 403\)/);
-  assert.equal(statusOf(detailForbidden, "MULESOFT-RT-16"), "pass", "the certificate control does not depend on the DLB detail read");
+  assert.equal(statusOf(detailForbidden, "MULESOFT-RT-16"), "warn", "the certificate probe reads sslEndpoints from the merged record, so a failed detail read is a partial view");
+  assert.match(findingById(detailForbidden, "MULESOFT-RT-16").summary, /^Partial view: load_balancer_details could not be read, the credential lacks permission \(HTTP 403\): .*so SSL endpoints carried only by the detail record were not probed/);
 });
 
 function opensslAvailable() {
@@ -2419,7 +2629,7 @@ test("review fix 5: RT-16 caps at warn when a dated certificate chain does not v
   const certificate = findingById(untrusted, "MULESOFT-RT-16").evidence.certificates[0];
   assert.equal(certificate.authorized, false);
   assert.equal(certificate.authorization_error, "DEPTH_ZERO_SELF_SIGNED_CERT");
-  assert.match(findingById(untrusted, "MULESOFT-RT-16").evidence.probe_note, /rejectUnauthorized=false/);
+  assert.match(findingById(untrusted, "MULESOFT-RT-16").evidence.probe_note, /rejectUnauthorized set to false/);
 
   const unreported = await assessMulesoftRuntimeInfrastructure(healthyRuntimeClient({
     async probeCertificate(host) {
@@ -2534,4 +2744,1336 @@ test("optional: AUD-17 records the audit log retention period as evidence withou
   const allForbidden = await assessMulesoftAuditMonitoring(forbidAll(healthyAuditClient()));
   assert.equal(statusOf(allForbidden, "MULESOFT-AUD-17"), "manual");
   assert.ok(allForbidden.errors.some((error) => error.startsWith("audit_retention_settings:")));
+});
+
+// Verdict safety rules 9 and 10 (export credential hygiene and pagination truncation), plus the rule 1 corollary.
+
+/** Random-looking alphanumeric planted secrets; the bundle and zip scans check every substring of them at lengths 6 through 24. */
+const FAKE_MULESOFT_SECRETS = {
+  connectedAppSecret: "wUVX8UCFMdjtBgL4TL",
+  oidcClientSecret: "TscV6cNhpsMdCpaFuP",
+  mqClientSecret: "5jvpnK4cuqE5bd8ESd",
+  cloudhubApiKey: "J8srNkQC7YrwHjF5eY",
+  cloudhubJdbcPassword: "82BzRHwkheLNAwayXu",
+  cloudhubPlainProperty: "eEYxETD3E7ucsEBmZ2",
+  policyTextKey: "KCFpPdp6JcCkEKxWtV",
+  policyHeaderValue: "TCVqBTy5UMeLQhJ4kU",
+  policyClientSecret: "bmreKj2rqjDtkNE4Hz",
+  auditPayloadSecret: "GgJvJG5gjJqDXc5hLN",
+  exchangeUrlToken: "sz8rQcmHDrurRdFAeQ",
+  alertWebhookToken: "DVc8cAxc3V73Vqt6e7",
+  secretGroupValue: "pZvH4eWJ57cMuBga5N",
+  loadBalancerPrivateKey: "zfRMRp7nDygejtnkdm",
+  organizationAccessKey: "BeZzmaRmeqXpKGLa5k",
+  serverCredential: "SCRragWfu3gVEZWS7v",
+  vpnPresharedKey: "7Ns9b9DJjEj8cJj9cM",
+  serverRegistrationKey: "tF7Yvm3gKVjL4eyXvG",
+  alertWebhookPathToken: "QWFbud4ugH3fGdPzv8",
+};
+
+function secretBearingBundleClient() {
+  const secrets = FAKE_MULESOFT_SECRETS;
+  return healthyBundleClient({
+    async getOrganization() {
+      return { id: ORG_ID, name: "Acme", isFederated: true, entitlements: { createSubOrgs: true }, accessKey: secrets.organizationAccessKey };
+    },
+    async listIdentityProviders() {
+      return [
+        { provider_id: "idp-1", name: "Okta SAML", type: { name: "saml" } },
+        { provider_id: "idp-2", name: "Entra OIDC", type: { name: "openid" }, oidc_provider: { client: { credentials: { client_id: "oidc-client", client_secret: secrets.oidcClientSecret } } } },
+      ];
+    },
+    async listConnectedApplications() {
+      return [{ client_id: "app-1", client_name: "Auditor", enabled: true, last_used: isoDaysFromNow(-3), client_secret: secrets.connectedAppSecret }];
+    },
+    async listApiPolicies() {
+      return [
+        {
+          policyId: 1,
+          assetId: "jwt-validation",
+          template: { groupId: "68ef9520-24e9-4cf2-b2f5-620025690913", assetId: "jwt-validation", assetVersion: "1.3.2" },
+          disabled: false,
+          order: 1,
+          configurationData: {
+            jwtOrigin: "httpBearerAuthenticationHeader",
+            signingMethod: "hmac",
+            textKey: secrets.policyTextKey,
+            clientIdExpression: "#[vars.claimSet.client_id]",
+          },
+        },
+        {
+          policyId: 2,
+          assetId: "header-injection",
+          disabled: false,
+          order: 2,
+          configurationData: { inboundHeaders: [{ key: "Authorization", value: `Bearer ${secrets.policyHeaderValue}` }] },
+        },
+        {
+          policyId: 3,
+          assetId: "rate-limiting",
+          disabled: false,
+          order: 3,
+          configurationData: { rateLimits: [{ maximumRequests: 100, timePeriodInMilliseconds: 60000 }], upstream: { client_secret: secrets.policyClientSecret } },
+        },
+      ];
+    },
+    async listExchangeAssets() {
+      return [{
+        organizationId: ORG_ID,
+        assetId: "orders-api",
+        name: "Orders API",
+        status: "published",
+        isPublic: false,
+        type: "rest-api",
+        icon: `https://exchange.example.com/icons/orders-api.png?token=${secrets.exchangeUrlToken}&v=2`,
+      }];
+    },
+    async listCloudhubApplications(environmentId) {
+      if (environmentId !== "env-prod") return [];
+      return [{
+        domain: "orders-prod",
+        muleVersion: { version: "4.6.0", endOfSupportDate: isoDaysFromNow(400) },
+        workers: { amount: 2, type: { name: "Small", weight: 0.2 }, recentStatistics: { cpu: 45 } },
+        persistentQueues: true,
+        persistentQueuesEncrypted: true,
+        properties: {
+          "db.password": "****",
+          "db.url": `jdbc:postgresql://db.internal/orders?user=svc&sslmode=require&plain=${secrets.cloudhubPlainProperty}`,
+          "downstream.apiKey": secrets.cloudhubApiKey,
+          "legacy.jdbc.password": secrets.cloudhubJdbcPassword,
+        },
+        propertiesOptions: { "db.password": { secure: true }, "legacy.jdbc.password": { secure: false } },
+      }];
+    },
+    async listLoadBalancers() {
+      return [{
+        id: "lb-1",
+        name: "prod-dlb",
+        domain: "prod-dlb.lb.anypointdns.net",
+        httpMode: "redirect",
+        tlsv1: false,
+        tlsv13: true,
+        state: "STARTED",
+        defaultCipherSuite: STRONG_CIPHER_SUITE,
+        sslEndpoints: [{ publicKeyLabel: "api-cert", privateKeyLabel: "api-key", privateKey: secrets.loadBalancerPrivateKey }],
+      }];
+    },
+    async getVpc() {
+      return {
+        id: "vpc-1",
+        name: "prod-vpc",
+        firewallRules: [{ cidrBlock: "10.0.0.0/16", protocol: "tcp", fromPort: 8091, toPort: 8092 }],
+        vpnConnections: [{ name: "dc-vpn", remoteIpAddress: "203.0.113.10", presharedKey: secrets.vpnPresharedKey }],
+      };
+    },
+    async listHybridServers(environmentId) {
+      return environmentId === "env-prod"
+        ? [{
+          id: 1,
+          name: "onprem-1",
+          status: "RUNNING",
+          muleVersion: "4.6.0",
+          registrationKey: secrets.serverRegistrationKey,
+          registration: { credentials: { token: secrets.serverCredential } },
+        }]
+        : [];
+    },
+    async listMqClients() {
+      return [{ clientId: "mq-client-1", clientSecret: secrets.mqClientSecret }];
+    },
+    async listSecretGroups(environmentId) {
+      return environmentId === "env-prod" ? [{ id: "sg-1", name: "prod-secrets", secrets: [{ name: "tls-key", value: secrets.secretGroupValue }] }] : [];
+    },
+    async queryAuditLogs() {
+      return {
+        data: [{
+          timestamp: new Date().toISOString(),
+          platform: "Access Management",
+          action: "LOGIN",
+          objectType: "User",
+          payload: { body: `password=${secrets.auditPayloadSecret}` },
+        }],
+        total: 42,
+      };
+    },
+    async listCloudhubAlerts(environmentId) {
+      return environmentId === "env-prod"
+        ? [{
+          id: "alert-1",
+          name: "CPU",
+          enabled: true,
+          condition: { resources: ["*"] },
+          actions: [
+            { type: "webhook", url: `https://hooks.example.com/services/T1/B2?token=${secrets.alertWebhookToken}` },
+            { type: "webhook", webhookUrl: `https://hooks.example.com/services/T1/B2/${secrets.alertWebhookPathToken}` },
+          ],
+        }]
+        : [];
+    },
+  });
+}
+
+test("verdict safety rule 9: redactSnapshot masks normalized key variants, nested trees, name/value pairs, URL query tokens, and deep nesting", () => {
+  const deep = { level: 0 };
+  let cursor = deep;
+  for (let index = 1; index <= 40; index += 1) {
+    cursor.child = { level: index, password: `deep-secret-${index}` };
+    cursor = cursor.child;
+  }
+  const redacted = redactSnapshot({
+    apiKey: "camel-secret",
+    access_key: "snake-secret",
+    "signing-key": "kebab-secret",
+    textKey: "jwt-secret",
+    community: "public-community",
+    passwordHash: "hash-secret",
+    credentials: { client_id: "keep-me", client_secret: "nested-secret" },
+    tokens: ["array-secret-1", "array-secret-2"],
+    headers: [{ key: "Authorization", value: "Bearer pair-secret" }, { name: "X-Trace", value: "trace-1" }],
+    webhook: "https://hooks.example.com/hook?token=url-secret&channel=ops",
+    flag: true,
+    hashed: false,
+    nothing: null,
+    deep,
+  });
+
+  for (const key of ["apiKey", "access_key", "signing-key", "textKey", "community", "passwordHash", "credentials", "tokens"]) {
+    assert.equal(redacted[key], "[REDACTED]", key);
+  }
+  assert.equal(redacted.headers[0].value, "[REDACTED]");
+  assert.equal(redacted.headers[0].key, "Authorization");
+  assert.equal(redacted.headers[1].value, "trace-1");
+  assert.equal(redacted.webhook, "https://hooks.example.com/hook?[REDACTED]", "a URL query string is a carrier: it goes whole, the path stays");
+  assert.equal(redacted.flag, true);
+  assert.equal(redacted.hashed, false);
+  assert.equal(redacted.nothing, null);
+  const serialized = JSON.stringify(redacted);
+  assert.doesNotMatch(serialized, /deep-secret-/);
+  assert.doesNotMatch(serialized, /-secret"/);
+  assert.doesNotMatch(serialized, /keep-me/, "an object under a credential-bearing key is dropped whole rather than descended into");
+});
+
+test("verdict safety rule 9: exportMulesoftAuditBundle never writes connected app, OIDC, MQ, CloudHub property, policy configuration, or URL-embedded secrets into the bundle, its zip, or the tool payloads", async () => {
+  const base = createTempBase("grclanker-mulesoft-export-secrets-");
+  const secrets = Object.values(FAKE_MULESOFT_SECRETS);
+  const client = secretBearingBundleClient();
+  const result = await exportMulesoftAuditBundle(client, sampleConfig(), base);
+  assert.equal(result.errorCount, 0);
+
+  const files = readBundleFiles(result.outputDir);
+  for (const file of [
+    "core_data/connected_applications.json",
+    "core_data/identity_providers.json",
+    "core_data/api_manager_apis.json",
+    "core_data/exchange_assets.json",
+    "core_data/cloudhub_applications.json",
+    "core_data/load_balancers.json",
+    "core_data/hybrid_servers.json",
+    "core_data/mq_clients.json",
+    "core_data/secret_groups.json",
+    "core_data/audit_log_recent.json",
+    "core_data/alerts.json",
+    "core_data/organization.json",
+    "analysis/runtime_infrastructure.json",
+  ]) {
+    assert.ok(files.has(file), `expected ${file} in ${[...files.keys()].join(", ")}`);
+  }
+  assertSecretFragmentsAbsent(assert, files, secrets, "bundle directory");
+  const zipEntries = readZipEntries(result.zipPath);
+  assert.equal(zipEntries.size, files.size, "the zip carries exactly the written files");
+  assertSecretFragmentsAbsent(assert, zipEntries, secrets, "zip archive");
+
+  const payloads = JSON.stringify([
+    await checkMulesoftAccess(client),
+    await assessMulesoftIdentityAccess(client),
+    await assessMulesoftApiGateway(client),
+    await assessMulesoftRuntimeInfrastructure(client),
+    await assessMulesoftAuditMonitoring(client),
+  ]);
+  for (const secret of secrets) {
+    assert.ok(!payloads.includes(secret), `tool payloads must not carry ${secret}`);
+  }
+
+  const connectedApps = JSON.parse(files.get("core_data/connected_applications.json"));
+  assert.equal(connectedApps[0].client_secret, "[REDACTED]");
+  assert.equal(connectedApps[0].client_id, "app-1");
+  const providers = JSON.parse(files.get("core_data/identity_providers.json"));
+  assert.equal(providers[1].oidc_provider.client.credentials, "[REDACTED]");
+  const applications = JSON.parse(files.get("core_data/cloudhub_applications.json"));
+  assert.deepEqual(applications[0].application.properties, {
+    "db.password": "[REDACTED]",
+    "db.url": "[REDACTED]",
+    "downstream.apiKey": "[REDACTED]",
+    "legacy.jdbc.password": "[REDACTED]",
+  });
+  assert.deepEqual(applications[0].application.securePropertyKeys, ["db.password"]);
+  assert.deepEqual(applications[0].application.insecureSensitiveProperties, ["downstream.apiKey", "legacy.jdbc.password"]);
+  assert.equal(applications[0].application.muleVersion.version, "4.6.0");
+  assert.equal(applications[0].application.workers.recentStatistics.cpu, 45);
+  const apis = JSON.parse(files.get("core_data/api_manager_apis.json"));
+  const productionPolicies = apis.find((record) => record.environment === "Production").policies;
+  assert.deepEqual(productionPolicies.map((policy) => policy.assetId), ["jwt-validation", "header-injection", "rate-limiting"]);
+  assert.ok(productionPolicies.every((policy) => policy.configurationData === "[REDACTED]"));
+  assert.equal(productionPolicies[0].template.assetVersion, "1.3.2");
+  assert.equal(productionPolicies[0].disabled, false);
+  const assets = JSON.parse(files.get("core_data/exchange_assets.json"));
+  assert.equal(assets[0].icon, "https://exchange.example.com/icons/orders-api.png?[REDACTED]");
+  const mqClients = JSON.parse(files.get("core_data/mq_clients.json"));
+  assert.equal(mqClients[0].clients[0].clientSecret, "[REDACTED]");
+  const auditLog = JSON.parse(files.get("core_data/audit_log_recent.json"));
+  assert.deepEqual(Object.keys(auditLog[0]).sort(), ["action", "object_type", "platform", "timestamp"]);
+  const alerts = JSON.parse(files.get("core_data/alerts.json"));
+  assert.equal(alerts[0].cloudhub_alerts[0].actions[0].url, "https://hooks.example.com", "an alert action URL keeps scheme and host only");
+  assert.equal(alerts[0].cloudhub_alerts[0].actions[1].webhookUrl, "https://hooks.example.com", "a path-embedded webhook token goes with the path");
+  const vpcs = JSON.parse(files.get("core_data/vpcs.json"));
+  assert.equal(vpcs[0].vpnConnections[0].presharedKey, "[REDACTED]");
+  assert.equal(vpcs[0].vpnConnections[0].remoteIpAddress, "203.0.113.10");
+  const servers = JSON.parse(files.get("core_data/hybrid_servers.json"));
+  assert.equal(servers[0].server.registrationKey, "[REDACTED]");
+  assert.equal(servers[0].server.registration.credentials, "[REDACTED]");
+  assert.equal(servers[0].server.name, "onprem-1");
+  const runtime = JSON.parse(files.get("analysis/runtime_infrastructure.json"));
+  assert.equal(findingById(runtime, "MULESOFT-RT-22").status, "fail");
+  assert.deepEqual(findingById(runtime, "MULESOFT-RT-22").evidence.insecure_property_keys, ["Production: orders-prod: downstream.apiKey, legacy.jdbc.password"]);
+});
+
+test("verdict safety rule 10: listOffset marks an empty page below the server-reported total as truncated and the dependent findings demote", async () => {
+  const requests = [];
+  const hiddenRemainder = async (input) => {
+    const url = new URL(typeof input === "string" ? input : input.toString());
+    const offset = Number(url.searchParams.get("offset"));
+    requests.push(offset);
+    return jsonResponse(offset === 0 ? { data: [{ id: "u1" }, { id: "u2" }], total: 6 } : { data: [], total: 6 });
+  };
+  const page = await new MulesoftApiClient(sampleConfig(), { fetchImpl: hiddenRemainder })
+    .listOffset("/accounts/api/organizations/org-1/members", { limit: 100, pageSize: 2 });
+  assert.deepEqual(page.items.map((item) => item.id), ["u1", "u2"]);
+  assert.equal(page.total, 6);
+  assert.equal(page.truncated, true, "the server said 6 but delivered 2, so the remainder was never seen");
+  assert.deepEqual(requests, [0, 2]);
+
+  const completeEmpty = await new MulesoftApiClient(sampleConfig(), {
+    fetchImpl: async () => jsonResponse({ data: [], total: 0 }),
+  }).listOffset("/accounts/api/organizations/org-1/members", { limit: 100, pageSize: 2 });
+  assert.equal(completeEmpty.truncated, false, "an empty collection with total 0 is complete");
+
+  const mfaTruncated = await assessMulesoftIdentityAccess(healthyIdentityClient({
+    async listMfaExemptUsers() {
+      return truncatedPage([], 3);
+    },
+  }));
+  assert.equal(statusOf(mfaTruncated, "MULESOFT-IAM-02"), "manual");
+  assert.match(findingById(mfaTruncated, "MULESOFT-IAM-02").summary, /Partial view: MFA-exempt users list truncated at 0 of 3 total/);
+
+  const rolesTruncated = await assessMulesoftIdentityAccess(healthyIdentityClient({
+    async listRoleGroupRoles(roleGroupId) {
+      const roles = await healthyIdentityClient().listRoleGroupRoles(roleGroupId);
+      return roleGroupId === "rg-dev" ? truncatedPage(roles, 80) : roles;
+    },
+  }));
+  assert.equal(statusOf(rolesTruncated, "MULESOFT-IAM-03"), "warn");
+  assert.match(findingById(rolesTruncated, "MULESOFT-IAM-03").summary, /Partial view: role assignments truncated for Developers/);
+  assert.match(findingById(rolesTruncated, "MULESOFT-IAM-03").summary, /cannot pass on this sample/);
+});
+
+test("rule 1 corollary: each secondary read forbidden one at a time with the primary healthy is named in the dependent summary", async () => {
+  const detailForbidden = await assessMulesoftRuntimeInfrastructure(healthyRuntimeClient({
+    async listLoadBalancers() {
+      return [{ id: "lb-1", name: "prod-dlb", domain: "prod-dlb.lb.anypointdns.net", vpcId: "vpc-1", httpMode: "redirect", tlsv1: false, tlsv13: true, state: "STARTED" }];
+    },
+    getLoadBalancer: forbidden("/cloudhub/api/organizations/org-1/vpcs/vpc-1/loadbalancers/lb-1"),
+  }));
+  assert.equal(statusOf(detailForbidden, "MULESOFT-RT-16"), "warn");
+  assert.match(findingById(detailForbidden, "MULESOFT-RT-16").summary, /load_balancer_details could not be read, the credential lacks permission \(HTTP 403\)/);
+  assert.match(findingById(detailForbidden, "MULESOFT-RT-16").summary, /cannot pass on this sample/);
+  assert.deepEqual(findingById(detailForbidden, "MULESOFT-RT-16").evidence.partial_view.length, 1);
+  assert.match(detailForbidden.summary.inventories.load_balancer_details, /^unread \(/);
+
+  const platformsForbidden = await assessMulesoftAuditMonitoring(healthyAuditClient({
+    listAuditPlatforms: forbidden("/audit/v2/organizations/org-1/platforms"),
+  }));
+  const audit = findingById(platformsForbidden, "MULESOFT-AUD-17");
+  assert.equal(audit.status, "pass", "the verdict rests on the audit query, which succeeded");
+  assert.match(audit.summary, /42 audit log entries recorded within the last 24 hours \(1 fetched\); the audit platform list is unknown because audit_platforms could not be read, the credential lacks permission \(HTTP 403\)/);
+  assert.doesNotMatch(audit.summary, /across 0 platform\(s\)/);
+  assert.match(audit.evidence.platforms_error, /403 Forbidden/);
+  assert.equal(audit.evidence.platforms, null, "the denied platform list renders null, not an empty list");
+  assert.equal(platformsForbidden.summary.audit_platforms, null, "the summary count of a denied list renders null, not 0");
+  assert.match(platformsForbidden.summary.inventories.audit_platforms, /^unread \(.*403 Forbidden/);
+  assert.ok(platformsForbidden.errors.some((error) => error.startsWith("audit_platforms:")));
+
+  const retentionForbidden = await assessMulesoftAuditMonitoring(healthyAuditClient({
+    getAuditRetentionSettings: forbidden("/audit/v2/organizations/org-1/retentionSettings"),
+  }));
+  const retentionEvidence = findingById(retentionForbidden, "MULESOFT-AUD-17").evidence;
+  assert.equal(retentionEvidence.retention_period_days, null);
+  assert.equal(retentionEvidence.retention_entries, null, "the denied retention list renders null, not an empty list");
+  assert.equal(retentionForbidden.summary.audit_retention_period_days, null);
+
+  const mqClientsForbidden = await assessMulesoftRuntimeInfrastructure(healthyRuntimeClient({
+    listMqClients: forbidden("/mq/admin/api/v1/organizations/org-1/environments/env-prod/clients"),
+  }));
+  assert.equal(statusOf(mqClientsForbidden, "MULESOFT-RT-21"), "manual");
+  assert.match(findingById(mqClientsForbidden, "MULESOFT-RT-21").summary, /^Could not confirm: mq_clients could not be read, the credential lacks permission \(HTTP 403\)/);
+  assert.match(mqClientsForbidden.summary.inventories.mq_clients, /^unread \(/);
+  assert.equal(mqClientsForbidden.summary.mq_queues, 1, "the readable queue inventory keeps its count");
+});
+
+const MULESOFT_DENIAL_MARKERS = [
+  ["getOrganization", "organization", `/accounts/api/organizations/${ORG_ID}`],
+  ["getOrganizationHierarchy", "organization_hierarchy", `/accounts/api/organizations/${ORG_ID}/hierarchy`],
+  ["listIdentityProviders", "identity_providers", `/accounts/api/organizations/${ORG_ID}/identityProviders`],
+  ["getIdentityProviderSettings", "identity_provider_settings", `/accounts/api/organizations/${ORG_ID}/identityProviderSettings`],
+  ["listMembers", "members", `/accounts/api/organizations/${ORG_ID}/members`],
+  ["listMfaExemptUsers", "mfa_exempt_users", `/accounts/api/organizations/${ORG_ID}/users`],
+  ["listRoleGroups", "role_groups", `/accounts/api/organizations/${ORG_ID}/rolegroups`],
+  ["listConnectedApplications", "connected_applications", `/accounts/api/organizations/${ORG_ID}/connectedApplications`],
+  ["listEnvironments", "environments", `/accounts/api/organizations/${ORG_ID}/environments`],
+  ["listManagedApis", "api_manager_apis", `/apimanager/api/v1/organizations/${ORG_ID}/environments/env-prod/apis`],
+  ["listExchangeAssets", "exchange_assets", "/exchange/api/v2/assets/search"],
+  ["listCloudhubApplications", "cloudhub_applications", "/cloudhub/api/v2/applications"],
+  ["listVpcs", "vpcs", `/cloudhub/api/organizations/${ORG_ID}/vpcs`],
+  ["listLoadBalancers", "load_balancers", `/cloudhub/api/organizations/${ORG_ID}/loadbalancers`],
+  ["listHybridServers", "hybrid_servers", "/hybrid/api/v1/servers"],
+  ["listMqRegions", "mq_queues", `/mq/admin/api/v1/organizations/${ORG_ID}/environments/env-prod/regions`],
+  ["listMqClients", "mq_clients", `/mq/admin/api/v1/organizations/${ORG_ID}/environments/env-prod/clients`],
+  ["listSecretGroups", "secret_groups", `/secrets-manager/api/v1/organizations/${ORG_ID}/environments/env-prod/secretGroups`],
+  ["listCloudhubAlerts", "alerts", "/cloudhub/api/v2/alerts"],
+  ["listAuditPlatforms", "audit_platforms", `/audit/v2/organizations/${ORG_ID}/platforms`],
+  ["getAuditRetentionSettings", "audit_retention_settings", `/audit/v2/organizations/${ORG_ID}/retentionSettings`],
+  // The recent audit log file is produced by the audit_query source, which the marker names.
+  ["queryAuditLogs", "audit_log_recent", `/audit/v2/organizations/${ORG_ID}/query`, "audit_query"],
+];
+
+function assertNotCollectedMarker(marker, dataset, label) {
+  assert.equal(marker.collected, false, `${label}: collected`);
+  assert.equal(marker.dataset, dataset, `${label}: dataset`);
+  assert.equal(typeof marker.error, "string", `${label}: error`);
+  assert.ok(!("items" in marker) && !Array.isArray(marker), `${label}: a marker carries no item list`);
+  return marker;
+}
+
+test("review round items 7 and 8: denied Anypoint datasets are written as not-collected markers, a denied parent list marks its children not requested, and every derived count renders null", async () => {
+  for (const [method, dataset, endpoint, sourceLabel = dataset] of MULESOFT_DENIAL_MARKERS) {
+    const base = createTempBase("grclanker-mulesoft-markers-");
+    const client = healthyBundleClient({ [method]: forbidden(endpoint) });
+    const result = await exportMulesoftAuditBundle(client, sampleConfig(), base);
+    const files = readBundleFiles(result.outputDir);
+    if (dataset === "alerts") {
+      // The alerts dataset merges CloudHub and Runtime Manager reads; with only the CloudHub read denied the file is a
+      // partial snapshot that keeps the hybrid alerts beside the failed read, and the per-environment entry is a marker.
+      const partial = JSON.parse(files.get("core_data/alerts.json"));
+      assert.equal(partial.collected, "partial");
+      assert.equal(partial.dataset, "alerts");
+      assert.deepEqual(partial.failed_reads.map((read) => [read.read, read.status]), [["cloudhub_alerts (Production)", 403]]);
+      assertNotCollectedMarker(partial.items[0].cloudhub_alerts, "cloudhub_alerts (Production)", "alerts[].cloudhub_alerts");
+      assert.deepEqual(partial.items[0].runtime_manager_alerts, []);
+      const zipped = JSON.parse(readZipEntries(result.zipPath).get("core_data/alerts.json"));
+      assert.equal(zipped.collected, "partial");
+      continue;
+    }
+    const marker = assertNotCollectedMarker(JSON.parse(files.get(`core_data/${dataset}.json`)), sourceLabel, `${method} -> ${dataset}`);
+    if (dataset === "mq_queues") {
+      assert.match(marker.error, /^not requested: the mq_regions read failed \(.*403 Forbidden/, "a child of a denied parent names the parent");
+    } else {
+      assert.equal(marker.status, 403, `${dataset}: status`);
+      assert.match(marker.error, /403 Forbidden/);
+      if (["organization", "organization_hierarchy", "identity_providers", "identity_provider_settings", "members", "mfa_exempt_users", "role_groups", "connected_applications", "environments", "exchange_assets", "vpcs", "load_balancers", "audit_platforms", "audit_retention_settings", "audit_log_recent"].includes(dataset)) {
+        assert.equal(marker.endpoint, endpoint, `${dataset}: endpoint`);
+      }
+    }
+    const zipEntries = readZipEntries(result.zipPath);
+    assertNotCollectedMarker(JSON.parse(zipEntries.get(`core_data/${dataset}.json`)), sourceLabel, `zip ${dataset}`);
+    const summary = JSON.parse(files.get("analysis/summary.json"));
+    for (const category of summary.categories) {
+      for (const [key, value] of Object.entries(category.summary.inventories ?? {})) {
+        if (value.startsWith("unread") || value.startsWith("not requested")) {
+          assert.ok(!/complete/.test(value), `${dataset}: ${category.category}.inventories.${key} must not claim completeness`);
+        }
+      }
+    }
+  }
+
+  // A listEnvironments denial: every environment-scoped child is a marker whose reason names the environments read.
+  const cascadeBase = createTempBase("grclanker-mulesoft-cascade-");
+  const cascade = await exportMulesoftAuditBundle(
+    healthyBundleClient({ listEnvironments: forbidden(`/accounts/api/organizations/${ORG_ID}/environments`) }),
+    sampleConfig(),
+    cascadeBase,
+  );
+  const cascadeFiles = readBundleFiles(cascade.outputDir);
+  const environmentsMarker = assertNotCollectedMarker(JSON.parse(cascadeFiles.get("core_data/environments.json")), "environments", "environments");
+  assert.equal(environmentsMarker.status, 403);
+  for (const child of ["cloudhub_applications", "api_manager_apis", "hybrid_servers", "mq_clients", "mq_queues", "secret_groups", "alerts"]) {
+    const marker = assertNotCollectedMarker(JSON.parse(cascadeFiles.get(`core_data/${child}.json`)), child, child);
+    assert.match(marker.error, /^not requested: /, `${child} was never requested`);
+    assert.match(marker.error, /the environments read failed \(.*403 Forbidden/, `${child} names the denied parent`);
+  }
+  const identity = JSON.parse(cascadeFiles.get("analysis/identity_access.json"));
+  const gateway = JSON.parse(cascadeFiles.get("analysis/api_gateway.json"));
+  const runtime = JSON.parse(cascadeFiles.get("analysis/runtime_infrastructure.json"));
+  const auditAnalysis = JSON.parse(cascadeFiles.get("analysis/audit_monitoring.json"));
+  assert.equal(identity.summary.environments, null);
+  for (const key of ["environments_visible", "environments_sampled", "apis_sampled", "production_apis", "active_contracts", "production_without_authentication"]) {
+    assert.equal(gateway.summary[key], null, `api_gateway.summary.${key}`);
+  }
+  assert.equal(gateway.summary.exchange_assets, 1, "the readable Exchange inventory keeps its count");
+  assert.equal(gateway.summary.partial_view, null, "no partial view exists for lists that were never read");
+  assert.match(gateway.summary.inventories.api_manager_apis, /^not requested \(the environments read failed/);
+  for (const key of ["environments_visible", "environments_sampled", "cloudhub_applications", "unsupported_runtime_applications", "hybrid_servers", "mq_queues", "secret_groups"]) {
+    assert.equal(runtime.summary[key], null, `runtime_infrastructure.summary.${key}`);
+  }
+  assert.equal(runtime.summary.vpcs, 1, "the readable VPC inventory keeps its count");
+  assert.equal(runtime.summary.load_balancers, 1, "the readable DLB inventory keeps its count");
+  for (const key of ["environments_visible", "production_environments", "production_applications", "enabled_alerts", "uncovered_production_applications"]) {
+    assert.equal(auditAnalysis.summary[key], null, `audit_monitoring.summary.${key}`);
+  }
+  assert.equal(auditAnalysis.summary.audit_platforms, 2, "the readable platform list keeps its count");
+  const api09 = findingById(gateway, "MULESOFT-API-09");
+  assert.equal(api09.evidence.apis_sampled, null);
+  assert.equal(api09.evidence.active_contracts, null);
+  assert.equal(api09.evidence.partial_view, null);
+  for (const id of ["MULESOFT-API-07", "MULESOFT-RT-10", "MULESOFT-RT-21", "MULESOFT-AUD-24"]) {
+    const item = findingById(id.startsWith("MULESOFT-API") ? gateway : id.startsWith("MULESOFT-RT") ? runtime : auditAnalysis, id);
+    assert.equal(item.status, "manual", id);
+    assert.equal(item.evidence.partial_view, null, `${id}: a list that was never read has no partial view`);
+    assert.equal(item.evidence.unreadable_sources.length, 1, `${id}: the skipped children are reported through the denied environments read`);
+    assert.match(item.evidence.unreadable_sources[0], /^environments could not be read, the credential lacks permission \(HTTP 403\)/);
+  }
+
+  // Denied members: the members snapshot is a marker and every members-derived summary field renders null.
+  const membersDenied = await assessMulesoftIdentityAccess(healthyIdentityClient({ listMembers: forbidden(`/accounts/api/organizations/${ORG_ID}/members`) }));
+  assert.equal(membersDenied.summary.members_sampled, null);
+  assert.equal(membersDenied.summary.members_total, null);
+  assert.equal(membersDenied.summary.members_truncated, null, "a truncation flag for an unread list is unknown, not false");
+  assert.match(membersDenied.summary.inventories.members, /^unread \(/);
+  assertNotCollectedMarker(membersDenied.snapshots.members, "members", "snapshots.members");
+  assert.equal(membersDenied.summary.identity_providers, 1, "the readable provider inventory keeps its count");
+  assert.equal(membersDenied.summary.identity_providers_truncated, false);
+
+  // Denied per-group role reads: each role group keeps its record and its roles become a marker; the admin count is unknown.
+  const rolesDenied = await assessMulesoftIdentityAccess(healthyIdentityClient({ listRoleGroupRoles: forbidden(`/accounts/api/organizations/${ORG_ID}/rolegroups/rg-admin/roles`) }));
+  assert.equal(rolesDenied.summary.role_groups, 2);
+  assert.equal(rolesDenied.summary.organization_admins, null);
+  for (const group of rolesDenied.snapshots.role_groups) {
+    assertNotCollectedMarker(group.roles, `role_group_roles (${group.role_group.name})`, `role_groups[].roles for ${group.role_group.name}`);
+    assert.equal(group.roles_truncated, null);
+  }
+  for (const id of ["MULESOFT-IAM-03", "MULESOFT-IAM-04", "MULESOFT-IAM-05"]) {
+    assert.equal(statusOf(rolesDenied, id), "manual", id);
+    assert.equal(findingById(rolesDenied, id).evidence.partial_view, null, id);
+  }
+
+  // Denied connected app scopes: the app record stays and its scopes become a marker; IAM-18 is manual with no partial view.
+  const scopesDenied = await assessMulesoftIdentityAccess(healthyIdentityClient({ listConnectedApplicationScopes: forbidden(`/accounts/api/organizations/${ORG_ID}/connectedApplications/app-1/scopes`) }));
+  assertNotCollectedMarker(scopesDenied.snapshots.connected_applications[0].scopes, "connected_app_scopes (Auditor)", "connected_applications[].scopes");
+  assert.equal(scopesDenied.snapshots.connected_applications[0].client_id, "app-1");
+  assert.equal(statusOf(scopesDenied, "MULESOFT-IAM-18"), "manual");
+  assert.equal(findingById(scopesDenied, "MULESOFT-IAM-18").evidence.partial_view, null);
+
+  // Denied API policies: each API keeps its record and its policies become a marker; the gateway verdicts are manual.
+  const policiesDenied = await assessMulesoftApiGateway(healthyApiGatewayClient({ listApiPolicies: forbidden(`/apimanager/api/v1/organizations/${ORG_ID}/environments/env-prod/apis/101/policies`) }));
+  assert.equal(policiesDenied.snapshots.api_manager_apis.length, 2);
+  for (const record of policiesDenied.snapshots.api_manager_apis) {
+    assert.equal(record.policies.collected, false, `${record.environment}: policies are a marker`);
+    assert.match(record.policies.dataset, /^api_policies \(/);
+    assert.equal(record.policies.status, 403);
+    assert.equal(record.api.assetName, "orders-api", "the API record itself is kept");
+  }
+  assert.equal(policiesDenied.summary.apis_sampled, 2, "the API inventory itself was read");
+  assert.equal(policiesDenied.summary.production_without_authentication, null, "a count that needs the denied policy reads is unknown");
+  assert.equal(statusOf(policiesDenied, "MULESOFT-API-07"), "manual");
+  assert.equal(statusOf(policiesDenied, "MULESOFT-API-08"), "manual");
+
+  // A truncated identity provider page cannot prove there is no non-SSO provider: IAM-01 stops at warn.
+  const truncatedProviders = await assessMulesoftIdentityAccess(healthyIdentityClient({
+    async listIdentityProviders() {
+      return truncatedPage([{ provider_id: "idp-1", name: "Okta SAML", type: { name: "saml" } }], 3);
+    },
+  }));
+  assert.equal(statusOf(truncatedProviders, "MULESOFT-IAM-01"), "warn");
+  assert.match(findingById(truncatedProviders, "MULESOFT-IAM-01").summary, /Partial view: identity provider list truncated at 1 of 3 total/);
+  assert.match(findingById(truncatedProviders, "MULESOFT-IAM-01").summary, /cannot pass on this sample/);
+  assert.equal(truncatedProviders.summary.identity_providers_truncated, true);
+});
+
+test("round 2 SEND BACK 4: under a listLoadBalancers denial the certificate probes are never requested, and core_data/load_balancer_certificates.json and snapshots.load_balancer_certificates are the not-requested marker naming the parent read", async () => {
+  const endpoint = `/cloudhub/api/organizations/${ORG_ID}/loadbalancers`;
+  const denied = healthyBundleClient({ listLoadBalancers: forbidden(endpoint) });
+
+  // The assessment result: the snapshot is a marker, RT-16 is manual through the denied parent, and no probe ran.
+  const runtime = await assessMulesoftRuntimeInfrastructure(denied);
+  const snapshotMarker = assertNotCollectedMarker(runtime.snapshots.load_balancer_certificates, "load_balancer_certificates", "snapshots.load_balancer_certificates");
+  assert.equal(snapshotMarker.status, 403);
+  assert.match(snapshotMarker.error, /^not requested: the load_balancers read failed \(Anypoint request failed \(403 Forbidden\) for .*loadbalancers.*\), so there were no load_balancers to scope the load_balancer_certificates read$/);
+  assertNotCollectedMarker(runtime.snapshots.load_balancers, "load_balancers", "snapshots.load_balancers");
+  assert.equal(statusOf(runtime, "MULESOFT-RT-16"), "manual");
+  assert.match(findingById(runtime, "MULESOFT-RT-16").summary, /^Could not evaluate: load_balancers could not be read, the credential lacks permission \(HTTP 403\)/);
+  assert.equal(findingById(runtime, "MULESOFT-RT-16").evidence.certificates, undefined, "no certificate list is claimed for a list that was never read");
+  assert.equal(runtime.summary.load_balancers, null);
+
+  // The bundle and the zip carry the same marker; no file renders [] for the unrequested probes.
+  const exported = await exportMulesoftAuditBundle(denied, sampleConfig(), createTempBase("grclanker-mulesoft-lb-certs-"));
+  const files = readBundleFiles(exported.outputDir);
+  const fileMarker = assertNotCollectedMarker(JSON.parse(files.get("core_data/load_balancer_certificates.json")), "load_balancer_certificates", "core_data/load_balancer_certificates.json");
+  assert.deepEqual(fileMarker, snapshotMarker);
+  assertNotCollectedMarker(JSON.parse(readZipEntries(exported.zipPath).get("core_data/load_balancer_certificates.json")), "load_balancer_certificates", "zip core_data/load_balancer_certificates.json");
+  const analysis = JSON.parse(files.get("analysis/runtime_infrastructure.json"));
+  assert.match(analysis.summary.inventories.load_balancers, /^unread \(/);
+  for (const [name, content] of files) {
+    if (!name.startsWith("core_data/") || !name.endsWith(".json")) continue;
+    const parsed = JSON.parse(content);
+    if (Array.isArray(parsed)) assert.notEqual(name, "core_data/load_balancer_certificates.json", "the certificates file is not an empty array");
+  }
+
+  // Controls: a readable list keeps the array shape, including a readable list with zero load balancers.
+  const healthy = await assessMulesoftRuntimeInfrastructure(healthyBundleClient());
+  assert.ok(Array.isArray(healthy.snapshots.load_balancer_certificates) && healthy.snapshots.load_balancer_certificates.length === 1, "the healthy fixture probes its one load balancer");
+  const none = await assessMulesoftRuntimeInfrastructure(healthyBundleClient({ async listLoadBalancers() { return []; } }));
+  assert.deepEqual(none.snapshots.load_balancer_certificates, [], "a complete empty list keeps its array shape");
+  assert.equal(statusOf(none, "MULESOFT-RT-16"), "manual");
+});
+
+test("round 2 SEND BACK 3: leaf diff per denial, the members and MQ client leaves of IAM-02, IAM-03, and RT-21 render null under the denial of their source and no other leaf becomes an empty reading", async () => {
+  const membersPath = `/accounts/api/organizations/${ORG_ID}/members`;
+  const identityBaseline = await assessMulesoftIdentityAccess(healthyIdentityClient());
+  const membersDenied = await assessMulesoftIdentityAccess(healthyIdentityClient({ listMembers: forbidden(membersPath) }));
+  for (const id of ["MULESOFT-IAM-02", "MULESOFT-IAM-03"]) {
+    const baseline = findingById(identityBaseline, id);
+    const denied = findingById(membersDenied, id);
+    assert.equal(baseline.evidence.members_sampled, 2, `${id}: the healthy run sampled the fixture's members`);
+    assertLeavesNullUnderDenial(assert, {
+      label: `${id} under listMembers denied`,
+      baseline: baseline.evidence,
+      denied: denied.evidence,
+      nullLeaves: ["members_sampled"],
+      allow: [/^unreadable_sources\[\d+\]$/],
+    });
+    // The member sample is context for these two verdicts, not an input: the status is unchanged and only the count is unread.
+    assert.equal(denied.status, baseline.status, `${id}: the verdict does not read members`);
+  }
+
+  const mqClientsPath = `/mq/admin/api/v1/organizations/${ORG_ID}/environments/env-prod/clients`;
+  const runtimeBaseline = await assessMulesoftRuntimeInfrastructure(healthyRuntimeClient());
+  const mqClientsDenied = await assessMulesoftRuntimeInfrastructure(healthyRuntimeClient({ listMqClients: forbidden(mqClientsPath) }));
+  const rtBaseline = findingById(runtimeBaseline, "MULESOFT-RT-21");
+  const rtDenied = findingById(mqClientsDenied, "MULESOFT-RT-21");
+  assert.deepEqual(rtBaseline.evidence.mq_clients, [{ environment: "Production", clients: 1 }], "the healthy run counted the fixture's MQ client");
+  assertLeavesNullUnderDenial(assert, {
+    label: "MULESOFT-RT-21 under listMqClients denied",
+    baseline: rtBaseline.evidence,
+    denied: rtDenied.evidence,
+    nullLeaves: ["mq_clients[0].clients"],
+    allow: [/^unreadable_sources\[\d+\]$/],
+  });
+  assert.equal(rtDenied.evidence.mq_clients[0].environment, "Production", "the environment name is kept; only the unread count is null");
+  assert.match(rtBaseline.summary, /1 queue\(s\) and 1 MQ client app\(s\) inventoried per environment/);
+  assert.match(rtDenied.summary, /1 queue\(s\) and an unread number of MQ client app\(s\) inventoried per environment/, "the summary does not claim zero clients for an unread list");
+  assert.doesNotMatch(rtDenied.summary, /\b0 MQ client app/, "no zero client count is rendered");
+  assert.equal(mqClientsDenied.summary.inventories.mq_clients.startsWith("unread ("), true);
+
+  // Control: the leaf-diff helper rejects a defaulted leaf and a new empty reading.
+  assert.throws(() => assertLeavesNullUnderDenial(assert, { label: "control", baseline: { a: 3, b: [1] }, denied: { a: 0, b: [1] }, nullLeaves: ["a"] }), /a renders null under the denial, got 0/);
+  assert.throws(() => assertLeavesNullUnderDenial(assert, { label: "control", baseline: { a: 3, b: [1] }, denied: { a: null, b: [] }, nullLeaves: ["a"] }), /b appears under the denial as the empty reading \[\]/);
+  assert.throws(() => assertLeavesNullUnderDenial(assert, { label: "control", baseline: { a: 3, c: true }, denied: { a: null, c: false }, nullLeaves: ["a"] }), /c changed under the denial from true to false/);
+  assertLeavesNullUnderDenial(assert, { label: "control", baseline: { a: 3, c: true }, denied: { a: null, c: true, unreadable_sources: ["x"] }, nullLeaves: ["a"] });
+});
+
+/** Random-looking alphanumeric canaries; the leak assertions check every substring of them at lengths 6 through 24. */
+const MS_CANARY = {
+  bearer: "84mB6BU92Uw8NYAD4Z",
+  cookie: "8hHTkNDdRNVq6273cm",
+  apiKey: "puGsP4hvM4Gp6YaHTw",
+  urlToken: "WJ4yHcfVzvCgStgZAx",
+  // The configured connected-app secret of the canary client and the bearer its token endpoint issues.
+  clientSecret: "5FYVrSz8PxBN9R3U8m",
+  accessToken: "nMyDpGtQfqmSt3xNY4",
+};
+const MS_CANARY_VALUES = Object.values(MS_CANARY);
+const MS_CANARY_URL = `https://api.example.com/v1/x?token=${MS_CANARY.urlToken}`;
+
+function msCanaryHtml() {
+  return [
+    "<html><head><title>502 Bad Gateway</title></head><body>",
+    `<p>Upstream rejected Authorization: Bearer ${MS_CANARY.bearer} while proxying.</p>`,
+    `<p>Set-Cookie: JSESSIONID=${MS_CANARY.cookie}; Path=/; Secure</p>`,
+    `<p>x-api-key: ${MS_CANARY.apiKey}</p>`,
+    `<p>Retry the request at ${MS_CANARY_URL} after the gateway recovers.</p>`,
+    "</body></html>",
+  ].join("");
+}
+
+function msSurfaceOf(url) {
+  const path = url.pathname;
+  const org = `/accounts/api/organizations/${ORG_ID}`;
+  if (path === "/accounts/api/v2/oauth2/token") return "oauth2/token";
+  if (path === "/accounts/api/me") return "me";
+  if (path === org) return "organization";
+  if (path === `${org}/hierarchy`) return "hierarchy";
+  if (path === `${org}/identityProviders`) return "identityProviders";
+  if (path === `${org}/identityProviderSettings`) return "identityProviderSettings";
+  if (path === `${org}/members`) return "members";
+  if (path === `${org}/users`) return "mfaExemptUsers";
+  if (path === `${org}/rolegroups`) return "roleGroups";
+  if (/\/rolegroups\/[^/]+\/roles$/.test(path)) return "roleGroupRoles";
+  if (/\/rolegroups\/[^/]+\/users$/.test(path)) return "roleGroupUsers";
+  if (path === `${org}/environments`) return "environments";
+  if (path === `${org}/connectedApplications`) return "connectedApplications";
+  if (/\/connectedApplications\/[^/]+\/scopes$/.test(path)) return "connectedApplicationScopes";
+  if (/^\/apimanager\/.*\/apis$/.test(path)) return "managedApis";
+  if (/^\/apimanager\/.*\/policies$/.test(path)) return "apiPolicies";
+  if (path === "/exchange/api/v2/assets/search") return "exchangeAssets";
+  if (path === "/cloudhub/api/v2/applications") return "cloudhubApplications";
+  if (path === "/cloudhub/api/v2/alerts") return "cloudhubAlerts";
+  if (path === `/cloudhub/api/organizations/${ORG_ID}/vpcs`) return "vpcs";
+  if (/\/vpcs\/[^/]+\/loadbalancers\/[^/]+$/.test(path)) return "loadBalancer";
+  if (/^\/cloudhub\/api\/organizations\/[^/]+\/vpcs\/[^/]+$/.test(path)) return "vpc";
+  if (path === `/cloudhub/api/organizations/${ORG_ID}/loadbalancers`) return "loadBalancers";
+  if (path === "/hybrid/api/v1/servers") return "hybridServers";
+  if (path === "/hybrid/api/v1/alerts") return "hybridAlerts";
+  if (path === `/audit/v2/organizations/${ORG_ID}/platforms`) return "auditPlatforms";
+  if (path === `/audit/v2/organizations/${ORG_ID}/retentionSettings`) return "auditRetentionSettings";
+  if (path === `/audit/v2/organizations/${ORG_ID}/query`) return "auditQuery";
+  if (/\/mq\/admin\/.*\/regions$/.test(path)) return "mqRegions";
+  if (/\/mq\/admin\/.*\/destinations\/queues$/.test(path)) return "mqQueues";
+  if (/\/mq\/admin\/.*\/clients$/.test(path)) return "mqClients";
+  if (/\/secrets-manager\/.*\/secretGroups$/.test(path)) return "secretGroups";
+  return undefined;
+}
+
+const MS_CANARY_SURFACES = [
+  "oauth2/token", "me", "organization", "hierarchy", "identityProviders", "identityProviderSettings", "members", "mfaExemptUsers",
+  "roleGroups", "roleGroupRoles", "roleGroupUsers", "environments", "connectedApplications", "connectedApplicationScopes",
+  "managedApis", "apiPolicies", "exchangeAssets", "cloudhubApplications", "cloudhubAlerts", "vpcs", "vpc", "loadBalancers", "loadBalancer",
+  "hybridServers", "hybridAlerts", "auditPlatforms", "auditRetentionSettings", "auditQuery", "mqRegions", "mqQueues", "mqClients", "secretGroups",
+];
+
+function msCanaryFetch(failing) {
+  const page = (url, items, envelope = true) => {
+    const offset = Number(url.searchParams.get("offset") ?? 0);
+    const limit = Number(url.searchParams.get("limit") ?? items.length);
+    const slice = items.slice(offset, offset + limit);
+    return jsonResponse(envelope ? { data: slice, total: items.length } : slice);
+  };
+  const loadBalancer = { id: "lb-1", name: "prod-dlb", domain: "prod-dlb.lb.anypointdns.net", vpcId: "vpc-1", httpMode: "redirect", tlsv1: false, tlsv13: true, state: "STARTED", defaultCipherSuite: STRONG_CIPHER_SUITE };
+  const healthy = {
+    "oauth2/token": () => jsonResponse({ access_token: MS_CANARY.accessToken, expires_in: 3600 }),
+    me: () => jsonResponse({ user: { id: "u1", username: "alice" } }),
+    organization: () => jsonResponse({ id: ORG_ID, name: "Acme", isFederated: true, entitlements: { createSubOrgs: true } }),
+    hierarchy: () => jsonResponse({ id: ORG_ID, isRoot: true, subOrganizations: [{ id: "bg-1", name: "Payments" }] }),
+    identityProviders: (url) => page(url, [{ provider_id: "idp-1", name: "Okta SAML", type: { name: "saml" } }]),
+    identityProviderSettings: () => jsonResponse({ allow_new_non_sso_users: false }),
+    members: (url) => page(url, [{ id: "u1", username: "alice" }]),
+    mfaExemptUsers: (url) => page(url, []),
+    roleGroups: (url) => page(url, [{ role_group_id: "rg-admin", name: "Organization Administrators", editable: false }]),
+    roleGroupRoles: (url) => page(url, [{ role_id: "r1", name: "Organization Administrator" }]),
+    roleGroupUsers: (url) => page(url, [{ id: "u1", username: "alice" }]),
+    environments: (url) => page(url, ENVIRONMENTS),
+    connectedApplications: (url) => page(url, [{ client_id: "app-1", client_name: "Auditor", enabled: true, last_used: isoDaysFromNow(-3) }]),
+    connectedApplicationScopes: (url) => page(url, [{ scope: "profile" }]),
+    managedApis: (url) => {
+      const environmentId = url.pathname.match(/\/environments\/([^/]+)\/apis$/)?.[1];
+      const offset = Number(url.searchParams.get("offset") ?? 0);
+      return jsonResponse({
+        assets: offset === 0 ? [{ name: "orders-api", groupId: ORG_ID, assetId: "orders-api", apis: [{ id: 101, instanceLabel: "v1", environmentId, activeContractsCount: 2 }] }] : [],
+        total: 1,
+      });
+    },
+    apiPolicies: () => jsonResponse({ policies: [{ policyId: 1, assetId: "client-id-enforcement", disabled: false }, { policyId: 2, assetId: "rate-limiting", disabled: false }] }),
+    exchangeAssets: (url) => page(url, [{ organizationId: ORG_ID, assetId: "orders-api", name: "Orders API", status: "published", isPublic: false, type: "rest-api" }], false),
+    cloudhubApplications: () => jsonResponse({
+      data: [{ domain: "orders-prod", muleVersion: { version: "4.6.0", endOfSupportDate: isoDaysFromNow(400) }, workers: { amount: 2, type: { name: "Small", weight: 0.2 }, recentStatistics: { cpu: 45 } }, persistentQueues: true, persistentQueuesEncrypted: true, properties: {}, propertiesOptions: {} }],
+    }),
+    cloudhubAlerts: () => jsonResponse({ data: [{ id: "alert-1", name: "CPU", enabled: true, condition: { resources: ["*"] } }] }),
+    vpcs: (url) => page(url, [{ id: "vpc-1", name: "prod-vpc" }]),
+    vpc: () => jsonResponse({ id: "vpc-1", name: "prod-vpc", firewallRules: [{ cidrBlock: "10.0.0.0/16", protocol: "tcp", fromPort: 8091, toPort: 8092 }] }),
+    // The list omits defaultCipherSuite so the per-DLB detail read is requested, as against the real API.
+    loadBalancers: (url) => page(url, [{ ...loadBalancer, defaultCipherSuite: undefined }]),
+    loadBalancer: () => jsonResponse(loadBalancer),
+    hybridServers: () => jsonResponse({ data: [{ data: { id: 1, name: "onprem-1", status: "RUNNING", muleVersion: "4.6.0" } }] }),
+    hybridAlerts: () => jsonResponse({ data: [] }),
+    auditPlatforms: () => jsonResponse({ data: [{ name: "Access Management" }] }),
+    auditRetentionSettings: () => jsonResponse({ data: [{ retentionPeriod: 2190, effectiveFrom: null }] }),
+    auditQuery: () => jsonResponse({ data: [{ timestamp: new Date().toISOString(), platform: "Access Management", action: "LOGIN", objectType: "User" }], total: 42 }),
+    mqRegions: () => jsonResponse([{ regionId: "us-east-1" }]),
+    mqQueues: () => jsonResponse([{ queueId: "orders", encrypted: true }]),
+    mqClients: () => jsonResponse([{ clientId: "mq-client-1", clientSecret: "hidden" }]),
+    secretGroups: () => jsonResponse([{ id: "sg-1", name: "prod-secrets" }]),
+  };
+  return async (input) => {
+    const url = new URL(typeof input === "string" ? input : input.toString());
+    const surface = msSurfaceOf(url);
+    if (!surface) return jsonResponse({ message: "not found" }, { status: 404, statusText: "Not Found" });
+    if (surface === failing.surface) {
+      if (failing.flavor === "html") {
+        return new Response(msCanaryHtml(), { status: 502, statusText: "Bad Gateway", headers: { "content-type": "text/html; charset=utf-8" } });
+      }
+      // Credential-free failure flavors for the fixed-text harvest: a plain proxy page, an unrecognized JSON shape, a documented error.
+      if (failing.flavor === "plainHtml") return new Response("<html><head><title>502 Bad Gateway</title></head><body>upstream unavailable</body></html>", { status: 502, statusText: "Bad Gateway", headers: { "content-type": "text/html; charset=utf-8" } });
+      if (failing.flavor === "opaqueJson") return jsonResponse({ unexpected: { shape: true } }, { status: 403, statusText: "Forbidden" });
+      if (failing.flavor === "plainJson") return jsonResponse({ message: "Forbidden: insufficient permissions for this organization" }, { status: 403, statusText: "Forbidden" });
+      // The message ends with the doubly-encoded escape-boundary trace (every literal JSON escape before a plain-name
+      // cookie pair, a URL userinfo password, and an X-Api-Key header).
+      return jsonResponse(
+        { message: `Upstream failed; retry at ${MS_CANARY_URL} with Bearer ${MS_CANARY.bearer} (JSESSIONID=${MS_CANARY.cookie}; x-api-key: ${MS_CANARY.apiKey}); ${escapeBoundaryTrace()}` },
+        { status: 403, statusText: "Forbidden" },
+      );
+    }
+    return healthy[surface](url);
+  };
+}
+
+/** No canary (the Anypoint set and the escape-boundary pair) survives in any substring at lengths 6 through 24. */
+function assertMsCanariesAbsent(text, label) {
+  assertFragmentsAbsent(assert, text, [...MS_CANARY_VALUES, ...Object.values(ESCAPE_CANARIES)], label);
+}
+
+test("rule 9 error strings: on every Anypoint surface a 502 HTML body or a JSON error embedding a credential URL never reaches results or the bundle", async () => {
+  const errorStrings = [];
+  let exercised = 0;
+  for (const surface of MS_CANARY_SURFACES) {
+    for (const flavor of ["html", "json"]) {
+      const config = sampleConfig({ authMode: "connected_app", clientId: "client-1", clientSecret: MS_CANARY.clientSecret, token: undefined });
+      const client = new MulesoftApiClient(config, {
+        fetchImpl: msCanaryFetch({ surface, flavor }),
+        sleepImpl: async () => {},
+        maxRetries: 0,
+        certificateProbe: async (host, _timeoutMs, servername = host) => ({ host, servername, subject: "*.example.com", issuer: "Example CA", validFrom: isoDaysFromNow(-100), validTo: isoDaysFromNow(200), authorized: true }),
+      });
+      const access = await checkMulesoftAccess(client);
+      const assessments = [
+        await assessMulesoftIdentityAccess(client),
+        await assessMulesoftApiGateway(client),
+        await assessMulesoftRuntimeInfrastructure(client),
+        await assessMulesoftAuditMonitoring(client),
+      ];
+      const base = createTempBase("grclanker-mulesoft-canary-");
+      const exported = await exportMulesoftAuditBundle(client, config, base);
+      const files = readBundleFiles(exported.outputDir);
+      const zipEntries = readZipEntries(exported.zipPath);
+      const label = `${surface}/${flavor}`;
+      assertMsCanariesAbsent(JSON.stringify(access), `${label} check_access`);
+      assertMsCanariesAbsent(JSON.stringify(assessments), `${label} assessments`);
+      for (const [path, content] of files) assertMsCanariesAbsent(content, `${label} bundle file ${path}`);
+      for (const [path, content] of zipEntries) assertMsCanariesAbsent(content, `${label} zip entry ${path}`);
+      const surfaceErrors = [
+        ...access.surfaces.filter((item) => item.error).map((item) => item.error),
+        ...assessments.flatMap((assessment) => assessment.errors),
+        ...(files.has("_errors.log") ? [files.get("_errors.log")] : []),
+      ];
+      assert.ok(surfaceErrors.length > 0, `${label} recorded at least one error`);
+      const joined = surfaceErrors.join("\n");
+      if (flavor === "html") {
+        assert.match(joined, /\(502 Bad Gateway\)[^\n]*: non-JSON body \(text\/html, \d+ bytes\)/, `${label} error strings carry the status-and-length note: ${joined.slice(0, 400)}`);
+      } else {
+        assert.match(joined, /\(403 Forbidden\)[^\n]*https:\/\/api\.example\.com\/v1\/x\?\[REDACTED\]/, `${label} error strings keep the URL host with the query string redacted: ${joined.slice(0, 400)}`);
+        assert.match(joined, /Bearer \[REDACTED\]/, `${label} redacts the Authorization value`);
+      }
+      errorStrings.push(joined);
+      exercised += 1;
+    }
+  }
+  assert.equal(exercised, MS_CANARY_SURFACES.length * 2, "every surface and both flavors were exercised");
+  assertMsCanariesAbsent(errorStrings.join("\n"), "collected error strings");
+});
+
+/**
+ * Round 4 item 2 (data-side carrier class): the healthy Anypoint fixture with reviewer B's fifteen carrier
+ * forms, the configured secrets bare in prose, and the must-survive controls appended to every text-like
+ * field of every response. Nothing planted may survive in any 6-to-24-character window of the access
+ * check, the assessments, the bundle files, or the zip entries; the controls (a hostname, a table name,
+ * a UUID, a quoted non-credential header, prose using a scheme word) and the bare token must.
+ */
+test("rule 9 data side: a credential carried in any free-text field of any Anypoint response never reaches a snapshot, evidence, summary, bundle file, or zip entry, while identifiers in the same fields stay", async () => {
+  const configuredSecrets = [CONFIGURED_SECRET_CANARIES.mulesoftClientSecret];
+  const suffix = carrierSuffix(configuredSecrets);
+  const harvest = async (injected) => {
+    const config = sampleConfig({ authMode: "connected_app", clientId: "client-1", clientSecret: configuredSecrets[0], token: undefined });
+    const healthyFetch = msCanaryFetch({ surface: null, flavor: null });
+    const client = new MulesoftApiClient(config, {
+      fetchImpl: injected ? injectingFetch(healthyFetch, suffix) : healthyFetch,
+      sleepImpl: async () => {},
+      maxRetries: 0,
+      certificateProbe: async (host, _timeoutMs, servername = host) => ({
+        host,
+        servername,
+        subject: injected ? `*.example.com ${suffix}` : "*.example.com",
+        issuer: "Example CA",
+        validFrom: isoDaysFromNow(-100),
+        validTo: isoDaysFromNow(200),
+        authorized: true,
+      }),
+    });
+    const access = await checkMulesoftAccess(client);
+    const assessments = await msAssessAll(client);
+    const base = createTempBase("grclanker-mulesoft-text-fields-");
+    try {
+      const exported = await exportMulesoftAuditBundle(client, config, base);
+      return [
+        ["check_access", JSON.stringify(access)],
+        ["assessments", JSON.stringify(assessments)],
+        ...[...readBundleFiles(exported.outputDir)].map(([path, content]) => [`bundle file ${path}`, content]),
+        ...[...readZipEntries(exported.zipPath)].map(([path, content]) => [`zip entry ${path}`, content]),
+      ];
+    } finally {
+      rmSync(base, { recursive: true, force: true });
+    }
+  };
+  const healthyTexts = await harvest(false);
+  const texts = await harvest(true);
+  assertTextFieldCarriers(assert, texts, { configuredSecrets, healthyTexts });
+  // Ruling 6 on the snapshot walker itself: a vendor-prefixed token, a JWT, and a PEM block go bare; the generic run stays.
+  assert.deepEqual(
+    redactSnapshot({ note: `key ${VENDOR_TOKEN_CANARIES.stripeLiveKey} end`, jwt: `jwt ${VENDOR_TOKEN_CANARIES.jwt} end`, pem: `-----BEGIN PRIVATE KEY-----\n${VENDOR_TOKEN_CANARIES.pemBody}\n-----END PRIVATE KEY-----`, id: `id ${BARE_TOKEN_CONTROL} end` }),
+    { note: "key [REDACTED] end", jwt: "jwt [REDACTED] end", pem: "[REDACTED]", id: `id ${BARE_TOKEN_CONTROL} end` },
+  );
+});
+
+/**
+ * CodeRabbit (#62, second review) items 2 and 3: a container nested past MAX_REDACTION_DEPTH in an Anypoint
+ * response is replaced by the marker, never passed through unscrubbed. The first VPC record (kept whole in
+ * core_data/vpcs.json) carries the three planted fields; the walker's root is the MulesoftPage, so items is
+ * depth 1, the VPC depth 2, and the planted fields depth 3.
+ */
+test("CodeRabbit (#62, second review) items 2 and 3: a MuleSoft record container nested past MAX_REDACTION_DEPTH is replaced whole, the leaf at the maximum depth is scrubbed in place, and no planted window reaches any output", async () => {
+  const harvest = async (planted) => {
+    const config = sampleConfig({ authMode: "connected_app", clientId: "client-1", clientSecret: "connected-app-secret-value", token: undefined });
+    const healthyFetch = msCanaryFetch({ surface: null, flavor: null });
+    const planting = plantingFetch(healthyFetch, (url) => url.pathname.endsWith("/vpcs"), (payload) => {
+      Object.assign(payload.data[0], deepFields(3));
+      return payload;
+    });
+    const client = new MulesoftApiClient(config, {
+      fetchImpl: planted ? planting : healthyFetch,
+      sleepImpl: async () => {},
+      maxRetries: 0,
+      certificateProbe: async (host, _timeoutMs, servername = host) => ({ host, servername, subject: "*.example.com", issuer: "Example CA", validFrom: isoDaysFromNow(-100), validTo: isoDaysFromNow(200), authorized: true }),
+    });
+    const access = await checkMulesoftAccess(client);
+    const assessments = await msAssessAll(client);
+    const base = createTempBase("grclanker-mulesoft-deep-nesting-");
+    try {
+      const exported = await exportMulesoftAuditBundle(client, config, base);
+      return [
+        ["check_access", JSON.stringify(access)],
+        ["assessments", JSON.stringify(assessments)],
+        ...[...readBundleFiles(exported.outputDir)].map(([path, content]) => [`bundle file ${path}`, content]),
+        ...[...readZipEntries(exported.zipPath)].map(([path, content]) => [`zip entry ${path}`, content]),
+      ];
+    } finally {
+      rmSync(base, { recursive: true, force: true });
+    }
+  };
+  assertDeepCanariesWellFormed(assert, await harvest(false));
+  assertDeepNesting(assert, await harvest(true));
+});
+
+test("planted values self-check: every canary and planted secret is alphanumeric, distinct in every 6-character window, and no window occurs in the healthy fixtures, the sample configuration, or a healthy bundle", async () => {
+  const client = new MulesoftApiClient(sampleConfig(), {
+    fetchImpl: msCanaryFetch({ surface: "no-surface-fails", flavor: "json" }),
+    sleepImpl: async () => {},
+    maxRetries: 0,
+    certificateProbe: async (host, _timeoutMs, servername = host) => ({ host, servername, subject: "*.example.com", issuer: "Example CA", validFrom: isoDaysFromNow(-100), validTo: isoDaysFromNow(200), authorized: true }),
+  });
+  const payloads = [
+    await checkMulesoftAccess(client),
+    await assessMulesoftIdentityAccess(client),
+    await assessMulesoftApiGateway(client),
+    await assessMulesoftRuntimeInfrastructure(client),
+    await assessMulesoftAuditMonitoring(client),
+  ];
+  const liveBundle = await exportMulesoftAuditBundle(client, sampleConfig(), createTempBase("grclanker-mulesoft-planted-self-check-"));
+  assert.equal(liveBundle.errorCount, 0);
+  const mockBundle = await exportMulesoftAuditBundle(healthyBundleClient(), sampleConfig(), createTempBase("grclanker-mulesoft-planted-self-check-mock-"));
+  assert.equal(mockBundle.errorCount, 0);
+  assertPlantedValuesWellFormed(assert, {
+    ...Object.fromEntries(Object.entries(MS_CANARY).map(([name, value]) => [`MS_CANARY.${name}`, value])),
+    ...Object.fromEntries(Object.entries(FAKE_MULESOFT_SECRETS).map(([name, value]) => [`FAKE_MULESOFT_SECRETS.${name}`, value])),
+    ...Object.fromEntries(Object.entries(PLANTED).map(([name, value]) => [`PLANTED.${name}`, value])),
+    ...Object.fromEntries(Object.entries(CONFIG_CANARIES).map(([name, value]) => [`CONFIG_CANARIES.${name}`, value])),
+    ...Object.fromEntries(Object.entries(TOML_CANARIES).map(([name, value]) => [`TOML_CANARIES.${name}`, value])),
+    ...ESCAPE_CANARY_PLANTED_VALUES,
+    SAMPLE_TOKEN,
+  }, [
+    ["sample configuration", JSON.stringify({ ...sampleConfig(), token: null })],
+    ["healthy tool payloads", JSON.stringify(payloads)],
+    ...[...readBundleFiles(liveBundle.outputDir)].map(([name, content]) => [`healthy bundle ${name}`, content]),
+    ...[...readBundleFiles(mockBundle.outputDir)].map(([name, content]) => [`mock-client bundle ${name}`, content]),
+  ]);
+});
+
+function msCanaryClient(failing, config = sampleConfig()) {
+  return new MulesoftApiClient(config, {
+    fetchImpl: msCanaryFetch(failing),
+    sleepImpl: async () => {},
+    maxRetries: 0,
+    certificateProbe: async (host, _timeoutMs, servername = host) => ({ host, servername, subject: "*.example.com", issuer: "Example CA", validFrom: isoDaysFromNow(-100), validTo: isoDaysFromNow(200), authorized: true }),
+  });
+}
+
+async function msAssessAll(client) {
+  return [
+    await assessMulesoftIdentityAccess(client),
+    await assessMulesoftApiGateway(client),
+    await assessMulesoftRuntimeInfrastructure(client),
+    await assessMulesoftAuditMonitoring(client),
+  ];
+}
+
+/** Every Anypoint path the client requests, with the organization, environment, and item ids the fixtures use. */
+const MULESOFT_PATHS = [
+  "/accounts/api/v2/oauth2/token",
+  "/accounts/login",
+  "/accounts/api/me",
+  `/accounts/api/organizations/${ORG_ID}`,
+  `/accounts/api/organizations/${ORG_ID}/hierarchy`,
+  `/accounts/api/organizations/${ORG_ID}/identityProviders`,
+  `/accounts/api/organizations/${ORG_ID}/identityProviderSettings`,
+  `/accounts/api/organizations/${ORG_ID}/members`,
+  `/accounts/api/organizations/${ORG_ID}/users`,
+  `/accounts/api/organizations/${ORG_ID}/rolegroups`,
+  `/accounts/api/organizations/${ORG_ID}/rolegroups/rg-admin/roles`,
+  `/accounts/api/organizations/${ORG_ID}/rolegroups/rg-admin/users`,
+  `/accounts/api/organizations/${ORG_ID}/environments`,
+  `/accounts/api/organizations/${ORG_ID}/connectedApplications`,
+  `/accounts/api/organizations/${ORG_ID}/connectedApplications/app-1/scopes`,
+  `/apimanager/api/v1/organizations/${ORG_ID}/environments/env-prod/apis`,
+  `/apimanager/api/v1/organizations/${ORG_ID}/environments/env-prod/apis/101/policies`,
+  "/exchange/api/v2/assets/search",
+  "/cloudhub/api/v2/applications",
+  "/cloudhub/api/v2/alerts",
+  `/cloudhub/api/organizations/${ORG_ID}/vpcs`,
+  `/cloudhub/api/organizations/${ORG_ID}/vpcs/vpc-1`,
+  `/cloudhub/api/organizations/${ORG_ID}/loadbalancers`,
+  `/cloudhub/api/organizations/${ORG_ID}/vpcs/vpc-1/loadbalancers/lb-1`,
+  "/hybrid/api/v1/servers",
+  "/hybrid/api/v1/alerts",
+  `/audit/v2/organizations/${ORG_ID}/platforms`,
+  `/audit/v2/organizations/${ORG_ID}/retentionSettings`,
+  `/audit/v2/organizations/${ORG_ID}/query`,
+  `/mq/admin/api/v1/organizations/${ORG_ID}/environments/env-prod/regions`,
+  `/mq/admin/api/v1/organizations/${ORG_ID}/environments/env-prod/regions/us-east-1/destinations/queues`,
+  `/mq/admin/api/v1/organizations/${ORG_ID}/environments/env-prod/clients`,
+  `/secrets-manager/api/v1/organizations/${ORG_ID}/environments/env-prod/secretGroups`,
+];
+
+const MS_SAMPLE_DENIAL = `Anypoint request failed (403 Forbidden) for GET /accounts/api/organizations/${ORG_ID}/members: Forbidden: insufficient permissions for this organization`;
+const MS_SAMPLE_ROLE_GROUP_DENIAL = `Anypoint request failed (403 Forbidden) for GET /accounts/api/organizations/${ORG_ID}/rolegroups: Forbidden: insufficient permissions for this organization`;
+const MS_SAMPLE_ENVIRONMENTS_DENIAL = `Anypoint request failed (403 Forbidden) for GET /accounts/api/organizations/${ORG_ID}/environments: Forbidden: insufficient permissions for this organization`;
+const MS_SAMPLE_HIERARCHY_DENIAL = `Anypoint request failed (403 Forbidden) for GET /accounts/api/organizations/${ORG_ID}/hierarchy: Forbidden: insufficient permissions for this organization`;
+const MS_SAMPLE_ROLE_GROUPS_SKIP = `the role_groups read failed (${MS_SAMPLE_ROLE_GROUP_DENIAL}), so there were no role_groups to scope the role_group_roles read`;
+const MS_SAMPLE_APIS_SKIP = `the environments read failed (${MS_SAMPLE_ENVIRONMENTS_DENIAL}), so there were no environments to scope the api_manager_apis read`;
+
+/**
+ * The standing fixed texts MuleSoft emits, rendered with sample paths and the snake_case source labels the
+ * collectors use: the config loader read and parse messages, the credential and organization requirements,
+ * the non-JSON and opaque-body notes, the documented-error rendering, the timeout and transport wordings,
+ * the TLS probe texts, the source states (complete, partial, unread, not requested), the skipped-read
+ * reasons naming the parent, the merged-read wordings, the failure descriptions with their HTTP cause, and
+ * the corollary summary templates. Each must come back from redactSecretText, MulesoftApiError's pass, and
+ * client.redact unchanged.
+ */
+const MULESOFT_FIXED_TEXTS = [
+  // The resolver's own messages, which reach check_access, assess, and export results live.
+  "ANYPOINT_ORG_ID, an organization_id argument, or org_id in config.toml is required.",
+  "Provide connected app credentials (ANYPOINT_CLIENT_ID and ANYPOINT_CLIENT_SECRET), username and password (ANYPOINT_USERNAME and ANYPOINT_PASSWORD), a pre-issued ANYPOINT_TOKEN, or the matching arguments or config.toml keys.",
+  "Unsupported MuleSoft control plane \"mars\". Use us, eu, or gov, or pass base_url.",
+  "Pre-issued Anypoint bearer token. Defaults to ANYPOINT_TOKEN.",
+  "The TLS probe connects with rejectUnauthorized set to false so untrusted chains can still be read; authorized and authorization_error record whether each chain validated against the auditor's trust store.",
+  "last_used, lastUsed, last_used_at, or usage.* on GET /organizations/{orgId}/connectedApplications with includeUsage=true; not part of the published schema, so absence is expected",
+  "Unable to read MuleSoft config file /home/svc/.config/mulesoft-sec-inspector/config.toml (ENOENT)",
+  "Unable to read MuleSoft config file /tmp/grclanker-mulesoft-loader-Ab3dEf/directory.toml (EISDIR)",
+  "Unable to read MuleSoft config file /tmp/grclanker-mulesoft-loader-Ab3dEf/locked.toml (EACCES)",
+  "Unable to read MuleSoft config file /tmp/grclanker-mulesoft-loader-Ab3dEf/config.toml",
+  "Unable to parse MuleSoft config file: invalid TOML in /tmp/grclanker-mulesoft-loader-Ab3dEf/config.toml at line 3 (INVALID_TOML)",
+  "Unable to parse MuleSoft config file: invalid TOML in /home/svc/.config/mulesoft-sec-inspector/config.toml at line 12 (INVALID_TOML)",
+  "ANYPOINT_ORG_ID, an organization_id argument, or org_id in config.toml is required.",
+  "Provide connected app credentials (ANYPOINT_CLIENT_ID and ANYPOINT_CLIENT_SECRET), username and password (ANYPOINT_USERNAME and ANYPOINT_PASSWORD), a pre-issued ANYPOINT_TOKEN, or the matching arguments or config.toml keys.",
+  'Unsupported MuleSoft control plane "apac". Use us, eu, or gov, or pass base_url.',
+  "Anypoint response was not valid JSON.",
+  `Anypoint request failed (502 Bad Gateway) for GET /accounts/api/organizations/${ORG_ID}/members: non-JSON body (text/html, 5120 bytes)`,
+  "Anypoint request failed (403 Forbidden) for GET /cloudhub/api/v2/applications: JSON body without a recognized error field (application/json, 27 bytes)",
+  "Anypoint request failed (429 Too Many Requests) for GET /exchange/api/v2/assets/search: non-JSON body (text/plain, 12 bytes)",
+  "Anypoint request failed (503 Service Unavailable) for GET /hybrid/api/v1/servers: non-JSON body (unknown content type, 64 bytes)",
+  "Anypoint request failed (502 Bad Gateway) for POST /accounts/api/v2/oauth2/token: non-JSON body (text/html, 5120 bytes)",
+  "Anypoint request failed (401 Unauthorized) for POST /accounts/api/v2/oauth2/token: Client authentication failed; invalid_client",
+  "Anypoint request failed (401 Unauthorized) for POST /accounts/login: Unauthorized",
+  `Anypoint request to GET /accounts/api/organizations/${ORG_ID}/members timed out after 30000 ms`,
+  "Anypoint request failed for GET /hybrid/api/v1/servers: fetch failed",
+  "TLS probe of prod-dlb.lb.anypointdns.net timed out.",
+  "Load balancer did not expose a domain to probe.",
+  MS_SAMPLE_DENIAL,
+  `unread (${MS_SAMPLE_DENIAL})`,
+  "complete (12 items)",
+  "complete (1 item)",
+  "complete (0 items)",
+  "complete",
+  "partial (200 of 2500 total)",
+  "partial (200 of an unknown total)",
+  `not requested (${MS_SAMPLE_ROLE_GROUPS_SKIP})`,
+  `not requested (the api_manager_apis read was not requested (${MS_SAMPLE_APIS_SKIP}), so there were no api_manager_apis to scope the api_policies read)`,
+  `not requested: ${MS_SAMPLE_ROLE_GROUPS_SKIP}`,
+  `role_group_roles reads were requested only for the role_groups that were read (${MS_SAMPLE_ROLE_GROUP_DENIAL})`,
+  `2 of 2 reads failed (api_manager_apis (Production): Anypoint request failed (403 Forbidden) for GET /apimanager/api/v1/organizations/${ORG_ID}/environments/env-prod/apis: Forbidden; api_manager_apis (Sandbox): Anypoint request failed (403 Forbidden) for GET /apimanager/api/v1/organizations/${ORG_ID}/environments/env-sandbox/apis: Forbidden)`,
+  `members could not be read, the credential lacks permission (HTTP 403): ${MS_SAMPLE_DENIAL}`,
+  `audit_platforms could not be read, the endpoint is unavailable on this control plane or plan (HTTP 404): Anypoint request failed (404 Not Found) for GET /audit/v2/organizations/${ORG_ID}/platforms`,
+  "hybrid_servers could not be read, the read errored: Anypoint request failed for GET /hybrid/api/v1/servers: fetch failed",
+  `role_group_users was not requested because ${MS_SAMPLE_ROLE_GROUPS_SKIP}`,
+  `organization_hierarchy could not be read, the credential lacks permission (HTTP 403): ${MS_SAMPLE_HIERARCHY_DENIAL}, so it is unknown whether this organization is a business group with root settings and sibling groups outside the view`,
+  "the organization hierarchy did not expose isRoot, so it is unknown whether this organization is a business group with root settings and sibling groups outside the view",
+  `load_balancer_details could not be read, the credential lacks permission (HTTP 403): Anypoint request failed (403 Forbidden) for GET /cloudhub/api/organizations/${ORG_ID}/vpcs/vpc-1/loadbalancers/lb-1: Forbidden, so SSL endpoints carried only by the detail record were not probed`,
+  "Zero connected apps were returned for this organization. Zero apps is treated as manual rather than pass: confirm in Access Management > Connected Apps that no apps exist in child business groups either.",
+  "Zero CloudHub 1.0 applications were visible in 2 sampled environment(s). Zero applications is treated as manual: this tool inventories CloudHub 1.0 only, so if workloads run on CloudHub 2.0, Runtime Fabric, or hybrid servers, export their configuration from Runtime Manager.",
+];
+
+/** Addendum 7 must-keep table for MuleSoft: paths and sources, control planes and tenants, principals, finding ids, and the standing fixed texts. */
+function mulesoftKeepTable(sourceLabels) {
+  return {
+    paths: MULESOFT_PATHS,
+    tables: sourceLabels,
+    tenants: [
+      "anypoint.mulesoft.com",
+      "https://anypoint.mulesoft.com",
+      "eu1.anypoint.mulesoft.com",
+      "gov.anypoint.mulesoft.com",
+      "prod-dlb.lb.anypointdns.net",
+      // Anypoint organization and environment ids are canonical UUIDs.
+      "550e8400-e29b-41d4-a716-446655440000",
+      "Acme_Platform_Team",
+      "Production-US-East-2026",
+      "prod-us-east-2026",
+      "us-east-1",
+    ],
+    principals: [
+      "alice",
+      "bob.user@acme.example",
+      "svc-integration-2026",
+      "Organization Administrators",
+      "Organization Administrator",
+      "Auditor",
+      "app-1",
+      "mq-client-1",
+      "orders-api",
+      "orders-prod",
+    ],
+    findingIds: getMulesoftControlCatalog().map((definition) => definition.id),
+    fixedTexts: MULESOFT_FIXED_TEXTS,
+  };
+}
+
+test("scrub boundary: bare name-shaped values stay, carriers and registered secrets (in every encoded form) and real token shapes go, on redactSecretText, in MulesoftApiError, and on client.redact; the addendum 7 must-keep table survives in isolation and in sentences", async () => {
+  const fetchImpl = async () => jsonResponse({});
+  const mustKeep = [
+    "Anypoint request failed (502 Bad Gateway) for /accounts/api/organizations/org-1/members: non-JSON body (text/html, 5120 bytes)",
+    "Anypoint request failed (403 Forbidden) for /cloudhub/api/v2/applications: JSON body without documented error fields (application/json, 42 bytes)",
+    "Unable to read MuleSoft config file /home/svc/.anypoint/config.toml (ENOENT)",
+    "Unable to parse MuleSoft config file: invalid TOML in /tmp/grclanker-mulesoft-loader-Ab3dEf/config.toml at line 3 (INVALID_TOML)",
+    "environment Production-US-East-2026 and business group Acme_Platform_Team on control plane us",
+  ];
+  const sourceLabels = [...new Set((await msAssessAll(healthyBundleClient())).flatMap((assessment) => Object.keys(assessment.summary.inventories)))];
+  const keepTable = mulesoftKeepTable(sourceLabels);
+  assert.equal(keepTable.findingIds.length, 25, "every MuleSoft finding id is in the table");
+  assert.ok(keepTable.findingIds.includes("MULESOFT-IAM-03"));
+  assert.ok(sourceLabels.length >= 20, `every source the four assessments name is in the table (${sourceLabels.length})`);
+  // The client constructor is the registration path (rememberSecrets on the configured token).
+  assertScrubBoundary({
+    scrub: (text) => redactSecretText(text),
+    registerSecret: (secret) => new MulesoftApiClient(sampleConfig({ token: secret }), { fetchImpl }),
+    mustKeep,
+    keepTable,
+  });
+  assertScrubBoundary({ scrub: (text) => new MulesoftApiError(502, text, "/x").message, mustKeep, keepTable });
+  assertScrubBoundary({ scrub: (text) => new MulesoftApiClient(sampleConfig(), { fetchImpl }).redact(text), mustKeep, keepTable });
+});
+
+test("round 7 note 1: every fixed-text message MuleSoft emits (loader, opaque body, timeout, source states, skipped reads naming the parent, merged reads, failure causes, corollary summaries) comes back from every MuleSoft pass unchanged", async () => {
+  const texts = new Set(MULESOFT_FIXED_TEXTS);
+  const fetchImpl = async () => jsonResponse({});
+  const scrubs = {
+    redactSecretText: (text) => redactSecretText(text),
+    MulesoftApiError: (text) => new MulesoftApiError(502, text, "/x").message,
+    "client.redact": (text) => new MulesoftApiClient(sampleConfig(), { fetchImpl }).redact(text),
+  };
+  const harvest = async (client, config = sampleConfig()) => {
+    collectFixedTexts(await checkMulesoftAccess(client), texts);
+    collectFixedTexts(await msAssessAll(client), texts);
+    const exported = await exportMulesoftAuditBundle(client, config, createTempBase("grclanker-mulesoft-fixed-text-bundle-"));
+    const files = readBundleFiles(exported.outputDir);
+    for (const line of logLines(files.get("_errors.log"))) texts.add(line);
+    for (const [name, content] of files) {
+      if ((name.startsWith("analysis/") || name.startsWith("core_data/")) && name.endsWith(".json")) collectFixedTexts(JSON.parse(content), texts);
+    }
+  };
+
+  // The loader's own read and parse messages on real failing files, plus the required-organization message.
+  for (const item of configLoaderCases({ format: "toml", displayName: "MuleSoft", fileNoun: "config file", extension: ".toml" })) {
+    if (item.skip) continue;
+    assert.throws(() => resolveMulesoftConfiguration({ config_file: item.path }, {}), (error) => {
+      texts.add(error.message);
+      return true;
+    });
+  }
+  const scratch = createTempBase("grclanker-mulesoft-fixed-text-");
+  const emptyPath = join(scratch, "config.toml");
+  writeFileSync(emptyPath, "# no keys\n");
+  assert.throws(() => resolveMulesoftConfiguration({ config_file: emptyPath }, {}), (error) => {
+    texts.add(error.message);
+    return true;
+  });
+  // The parse message on a real malformed file (a multi-line string opener on line 2).
+  const malformedPath = join(scratch, "malformed.toml");
+  writeFileSync(malformedPath, `org_id = "org-1"\nclient_secret = """\n${TOML_CANARIES.multiLineString}\n"""\n`);
+  const parseMessage = collectThrownMessage(texts, () => resolveMulesoftConfiguration({ config_file: malformedPath }, {}), "invalid TOML");
+  assert.equal(parseMessage, `Unable to parse MuleSoft config file: invalid TOML in ${malformedPath} at line 2 (INVALID_TOML)`);
+
+  // The resolver's own messages on the real path with an empty environment and an empty home: no
+  // organization, an organization without credentials, and credentials with an unsupported control plane.
+  const emptyHome = { homeDir: createTempBase("grclanker-mulesoft-fixed-text-home-") };
+  const resolverMessages = [
+    collectThrownMessage(texts, () => resolveMulesoftConfiguration({}, {}, emptyHome), "no organization"),
+    collectThrownMessage(texts, () => resolveMulesoftConfiguration({ organization_id: "org-1" }, {}, emptyHome), "no credentials"),
+    collectThrownMessage(texts, () => resolveMulesoftConfiguration({ organization_id: "org-1", token: "anypoint-token", control_plane: "mars" }, {}, emptyHome), "unsupported control plane"),
+  ];
+  assert.ok(resolverMessages.some((message) => /^Provide connected app credentials \(ANYPOINT_CLIENT_ID and ANYPOINT_CLIENT_SECRET\)/.test(message)), "the resolver rendered its credentials-required message");
+  assert.ok(resolverMessages.some((message) => /^Unsupported MuleSoft control plane "mars"\./.test(message)), "the resolver rendered its control plane message");
+
+  // Every tool label, description, and argument description the integration registers.
+  const registered = [];
+  registerMulesoftTools({ registerTool: (tool) => registered.push(tool) });
+  const toolTexts = collectToolTexts(registered);
+  assert.ok([...toolTexts].some((text) => /Anypoint bearer token/.test(text)), "the tool schemas carry the bearer token argument description");
+  for (const text of toolTexts) texts.add(text);
+
+  // Every surface under three credential-free failure flavors (plain proxy page, unrecognized JSON shape, documented
+  // error): the access check, the four assessments, the analysis and core_data files, and the error log render the
+  // opaque-body notes, the unread and not requested states, the skipped-read reasons naming the parent, the merged
+  // read wordings, and the demotion templates on real paths.
+  for (const surface of MS_CANARY_SURFACES) {
+    for (const flavor of ["plainHtml", "opaqueJson", "plainJson"]) {
+      const config = sampleConfig({ authMode: "connected_app", clientId: "client-1", clientSecret: "connected-app-secret-value", token: undefined });
+      await harvest(msCanaryClient({ surface, flavor }, config), config);
+    }
+  }
+
+  // The mock clients: healthy and every read forbidden.
+  await harvest(healthyBundleClient());
+  await harvest(forbidAll(healthyBundleClient()));
+
+  // The timeout wording through the real client.
+  const timingOut = new MulesoftApiClient(sampleConfig({ timeoutMs: 1000 }), {
+    fetchImpl: async (_input, init) => new Promise((_resolve, reject) => init?.signal?.addEventListener("abort", () => reject(new DOMException("aborted", "AbortError")))),
+    sleepImpl: async () => {},
+    maxRetries: 0,
+  });
+  await assert.rejects(timingOut.getOrganization(), (error) => {
+    texts.add(error.message);
+    return true;
+  });
+
+  for (const [label, scrub] of Object.entries(scrubs)) {
+    const checked = assertFixedTextsSurvive(scrub, texts, `MuleSoft fixed texts through ${label}`);
+    assert.ok(checked >= MULESOFT_FIXED_TEXTS.length + 40, `the harvest rendered texts beyond the standing list (${checked})`);
+  }
+  assert.ok([...texts].some((text) => /^unread \(/.test(text)), "the harvest rendered an unread source state");
+  assert.ok([...texts].some((text) => /^not requested \(/.test(text)), "the harvest rendered a not requested source state");
+  assert.ok([...texts].some((text) => /^not requested: /.test(text)), "the harvest rendered a not requested marker error");
+  assert.ok([...texts].some((text) => /^partial \(/.test(text)), "the harvest rendered a partial source state");
+  assert.ok([...texts].some((text) => /non-JSON body \(text\/html, \d+ bytes\)/.test(text)), "the harvest rendered a status-and-length note");
+  assert.ok([...texts].some((text) => /JSON body without a recognized error field \(application\/json, \d+ bytes\)/.test(text)), "the harvest rendered an opaque JSON note");
+  assert.ok([...texts].some((text) => /timed out after \d+ ms/.test(text)), "the harvest rendered the timeout wording");
+  assert.ok([...texts].some((text) => /could not be read, the credential lacks permission \(HTTP 403\)/.test(text)), "the harvest rendered a failure description with its HTTP cause");
+});
+
+test("round 7 note 2: credentials and the config file path set through the environment survive an unrelated argument, and the source chain names the environment", () => {
+  const base = createTempBase("grclanker-mulesoft-env-survives-");
+  const configPath = join(base, "config.toml");
+  writeFileSync(configPath, ["[anypoint]", 'org_id = "file-org"', 'token = "file-token-value"', 'control_plane = "eu"', 'environments = ["env-file"]', ""].join("\n"));
+  for (const configEnv of ["ANYPOINT_CONFIG_FILE", "MULESOFT_SEC_INSPECTOR_CONFIG"]) {
+    for (const tokenKey of ["ANYPOINT_TOKEN", "ANYPOINT_ACCESS_TOKEN"]) {
+      const env = { [configEnv]: configPath, [tokenKey]: "env-token-value", ANYPOINT_ORG_ID: "env-org" };
+      for (const [label, unrelated] of [
+        ["timeout_seconds", { timeout_seconds: 45 }],
+        ["control_plane", { control_plane: "us" }],
+        ["environments", { environments: ["env-arg"] }],
+      ]) {
+        const resolved = resolveMulesoftConfiguration(unrelated, env, { homeDir: base });
+        const context = `${configEnv} and ${tokenKey} with ${label}`;
+        assert.equal(resolved.authMode, "token", context);
+        assert.equal(resolved.token, "env-token-value", `${context}: the environment token resolves over the file`);
+        assert.equal(resolved.organizationId, "env-org", `${context}: the environment organization resolves over the file`);
+        assert.ok(resolved.sourceChain.includes("environment-token"), `${context}: the source chain names the environment: ${JSON.stringify(resolved.sourceChain)}`);
+        assert.ok(resolved.sourceChain.includes("environment-organization"), context);
+        assert.ok(resolved.sourceChain.includes(`config:${configPath}`), `${context}: the source chain names the config file from the environment`);
+        assert.ok(!resolved.sourceChain.includes("arguments-token"), `${context}: the unrelated argument does not claim the token`);
+        assert.equal(resolved.controlPlane, label === "control_plane" ? "us" : "eu", `${context}: the file value not set elsewhere still applies`);
+        assert.deepEqual(resolved.environmentFilter, label === "environments" ? ["env-arg"] : ["env-file"], context);
+        if (label === "timeout_seconds") assert.equal(resolved.timeoutMs, 45000, context);
+      }
+    }
+  }
+  // An argument object whose credential keys are present but undefined must not shadow the environment.
+  const env = { ANYPOINT_CONFIG_FILE: configPath, ANYPOINT_TOKEN: "env-token-value", ANYPOINT_ORG_ID: "env-org" };
+  const shadowed = resolveMulesoftConfiguration({ token: undefined, client_id: undefined, organization_id: undefined, timeout_seconds: 45 }, env, { homeDir: base });
+  assert.equal(shadowed.token, "env-token-value");
+  assert.equal(shadowed.organizationId, "env-org");
+  assert.deepEqual(shadowed.sourceChain, [`config:${configPath}`, "environment-organization", "environment-token", "config-control-plane", "config-environments"]);
+  // Connected app credentials through the environment survive the same way.
+  const connected = resolveMulesoftConfiguration({ timeout_seconds: 45 }, { ANYPOINT_ORG_ID: "env-org", ANYPOINT_CLIENT_ID: "env-client-id", ANYPOINT_CLIENT_SECRET: "env-client-secret-value" }, { homeDir: base });
+  assert.equal(connected.authMode, "connected_app");
+  assert.equal(connected.clientSecret, "env-client-secret-value");
+  assert.deepEqual(connected.sourceChain, ["environment-organization", "environment-client-id", "environment-client-secret"]);
+});
+
+test("reviewer B round 4 verdict N3: MULESOFT-IAM-01 is manual, not fail, on an identity provider page truncated before any provider was visible, with the partial-view sentence and its absence evidence null; summary.identity_providers is null under any partial read; a complete empty read still fails", async () => {
+  const truncated = await assessMulesoftIdentityAccess(healthyIdentityClient({
+    async listIdentityProviders() {
+      return truncatedPage([], 40);
+    },
+  }));
+  const provider = findingById(truncated, "MULESOFT-IAM-01");
+  assert.equal(provider.status, "manual");
+  assert.match(provider.summary, /identityProviders read was truncated before any provider was visible/);
+  assert.match(provider.summary, /Partial view: identity provider list truncated at 0 of 40 total/);
+  assert.match(provider.summary, /cannot be asserted for the items that were not read, so the verdict is manual \(unknown\)/);
+  assert.match(provider.summary, /Export Access Management > Identity Providers/);
+  assert.doesNotMatch(provider.summary, /treated as fail/);
+  assert.equal(provider.evidence.identity_providers, null, "an empty list from a truncated page is an absence claim");
+  assert.equal(provider.evidence.active_identity_providers, null, "a zero from a truncated page is an absence claim");
+  assert.equal(provider.evidence.is_federated, true, "a positive sighting from a complete read stays");
+  assert.deepEqual(provider.evidence.partial_view, ["identity provider list truncated at 0 of 40 total"]);
+  assert.equal(truncated.summary.identity_providers, null);
+  assert.equal(truncated.summary.identity_providers_seen, 0);
+  assert.equal(truncated.summary.identity_providers_total, 40);
+  assert.equal(truncated.summary.identity_providers_truncated, true);
+
+  // A partial read with a visible provider: the bare count is unknown too, the seen and total counts carry the sample, and the verdict stops at warn.
+  const partial = await assessMulesoftIdentityAccess(healthyIdentityClient({
+    async listIdentityProviders() {
+      return truncatedPage([{ provider_id: "idp-1", name: "Okta SAML", type: { name: "saml" } }], 3);
+    },
+  }));
+  assert.equal(statusOf(partial, "MULESOFT-IAM-01"), "warn");
+  assert.equal(partial.summary.identity_providers, null);
+  assert.equal(partial.summary.identity_providers_seen, 1);
+  assert.equal(partial.summary.identity_providers_total, 3);
+  assert.equal(partial.summary.identity_providers_truncated, true);
+
+  // A complete empty read still fails with the bare zero.
+  const empty = await assessMulesoftIdentityAccess(emptyIdentityClient());
+  assert.equal(statusOf(empty, "MULESOFT-IAM-01"), "fail");
+  assert.match(findingById(empty, "MULESOFT-IAM-01").summary, /Zero providers is treated as fail/);
+  assert.equal(findingById(empty, "MULESOFT-IAM-01").evidence.active_identity_providers, 0);
+  assert.equal(empty.summary.identity_providers, 0);
+  assert.equal(empty.summary.identity_providers_seen, 0);
+  assert.equal(empty.summary.identity_providers_truncated, false);
+
+  // A fail that does not rest on an absence keeps failing under a partial view: every visible provider disabled.
+  const disabled = await assessMulesoftIdentityAccess(healthyIdentityClient({
+    async listIdentityProviders() {
+      return truncatedPage([{ provider_id: "idp-1", name: "Okta SAML", type: { name: "saml" }, enabled: false }], 3);
+    },
+  }));
+  const disabledFinding = findingById(disabled, "MULESOFT-IAM-01");
+  assert.equal(disabledFinding.status, "fail", disabledFinding.summary);
+  assert.match(disabledFinding.summary, /Partial view: identity provider list truncated at 1 of 3 total/);
 });

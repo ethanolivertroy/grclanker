@@ -124,7 +124,120 @@ const AUTHENTICATION_POLICY_PATTERN =
   /client-id-enforcement|jwt|oauth|openid|basic-auth|http-basic|saml|mtls|tls/i;
 const RATE_LIMIT_POLICY_PATTERN = /rate-limit|spike-control/i;
 const SENSITIVE_PROPERTY_PATTERN = /pass(word|wd)?|secret|token|api[-_]?key|private[-_]?key|credential/i;
-const SECRET_KEY_PATTERN = /secret|password|passwd|token|private[_-]?key|authorization/i;
+// Tested against key names normalized to lowercase with underscores, hyphens, and spaces removed, so camelCase and
+// snake_case variants (apiKey, api_key, signing-key) all match.
+const SECRET_KEY_PATTERN = /secret|password|passwd|token|privatekey|authorization|apikey|accesskey|credential|textkey|signingkey|community|hash|presharedkey|registrationkey/;
+// Keys whose string values are URLs (alert webhookUrl, callback and redirect targets); the exported value keeps scheme and host only
+// because tokens travel in the path and query of such targets.
+const URL_KEY_PATTERN = /(url|uri)s?$/;
+// Node fs error codes (ENOENT, EACCES, EISDIR); anything else on error.code is not echoed.
+const FS_ERROR_CODE_PATTERN = /^E[A-Z0-9_]{1,30}$/;
+const REDACTED = "[REDACTED]";
+const MIN_REMEMBERED_SECRET_LENGTH = 4;
+const KNOWN_SECRETS = new Set<string>();
+/** The forms a remembered secret takes in an echoed body (raw, base64, base64url, URL-encoded, JSON-escaped), computed once per secret. */
+const SECRET_FORMS = new Map<string, string[]>();
+// Scrub boundary. A value inside a carrier (an Authorization, Cookie, Set-Cookie, or API key header, a
+// cookie or session assignment, URL userinfo or a query pair, a Bearer/Basic/Digest/Token/ApiKey scheme,
+// a credential-named key-value pair, a SOAP credential element) is removed whatever its shape, quoted or bare; a
+// remembered secret is removed whatever its shape and in its encoded forms; a bare value is removed only
+// when it has a real token shape (JWT, PEM block, hex digest, vendor prefix, or a 16+ character run with
+// base64 symbols, scattered digits, or token casing). A bare name-shaped value (words joined by hyphens
+// or underscores, such as prod-us-east-2026) is indistinguishable from a resource name and stays.
+// A literal JSON escape (`\n`, `\r`, `\t`, `\b`, `\f`, `\/`, `\"`, `\uXXXX`) stands right before a header, a scheme,
+// a URL, or a token in a doubly-encoded body (a gateway error whose field holds serialized JSON). Its last character is
+// a word character for most of them, so `\b` and a "not preceded by a word character" lookbehind see no boundary there;
+// every carrier and token opener of the pass therefore also starts right after one, and no token shape starts inside one.
+const JSON_ESCAPE = String.raw`\\(?:u[0-9a-fA-F]{4}|[nrtbf/"])`;
+const AFTER_JSON_ESCAPE = `(?<=${JSON_ESCAPE})`;
+const OPENER_BOUNDARY = String.raw`(?:\b|${AFTER_JSON_ESCAPE})`;
+const NOT_INSIDE_JSON_ESCAPE = String.raw`(?!(?<=\\)(?:u[0-9a-fA-F]{4}|[nrtbf/]))`;
+const URL_IN_TEXT_PATTERN = new RegExp(String.raw`${OPENER_BOUNDARY}(https?:\/\/)(?:([^\s/?#@"'<>]+)@)?([^\s/?#"'<>]+)([^\s?#"'<>]*)(\?[^\s#"'<>]*)?(#[^\s"'<>]*)?`, "gi");
+// A query pair standing without its URL (`?token=...`, `&sid=...`).
+const BARE_QUERY_PAIR_PATTERN = /([?&][\w.~%-]+=)([^\s"'&#<>\\]+)/g;
+// Header name to value: `: `, `="`, or the JSON-escaped `\":\"`.
+const HEADER_SEPARATOR = String.raw`\\?["']?\s*[:=]\s*\\?["']?`;
+// The next header on the same line (`; X-Api-Key: x`, `, Content-Type: x`, ` Accept: x`, a quoted or JSON-object
+// name too): a cookie or header value ends before it, so that header keeps its name and gets its own carrier treatment.
+const NEXT_HEADER_NAME = String.raw`\s*\{?\s*\\?["']?[A-Za-z][\w-]*\\?["']?\s*:`;
+// The schemes that stand as carriers in prose (the ruling's list) and the wider set recognized inside an Authorization header.
+const PROSE_AUTH_SCHEMES = "bearer|basic|digest|token|apikey|api-key";
+const HEADER_AUTH_SCHEMES = `${PROSE_AUTH_SCHEMES}|negotiate|ntlm|hmac|oauth|hoba|mutual|vapid|aws4-hmac-sha256|scram-sha-1|scram-sha-256`;
+// A quote closes a value only when a delimiter or the end of the text follows it; a quote followed by a value
+// character opens the next header's value instead, so the value it seemed to close was never terminated.
+const CLOSING_QUOTE_BOUNDARY = String.raw`(?![\w/+=-])`;
+// A quoted value, in double quotes (possibly JSON-escaped) or single quotes, on one line, ending at its closing
+// quote even with `; Name:` inside. Quotes around a credential belong to its carrier: `Bearer "x"`, `sid='x'`,
+// `--token "x"` carry x whatever its shape.
+const QUOTED_VALUE = String.raw`(?:\\?"[^"\\\r\n]+\\?"|'[^'\r\n]+')${CLOSING_QUOTE_BOUNDARY}`;
+// A value whose opening quote never closes: it runs to the next `;`, `,`, or space (where the header patterns
+// apply the `Name:` cut) or to the end of the line, stray quotes included.
+const UNTERMINATED_QUOTED_VALUE = String.raw`\\?["'][^\s<>,;\\]+`;
+// One credential token (bare or quoted), or a parameter list such as Digest's `username="u", response="r"`
+// (quotes possibly JSON-escaped or single) or PagerDuty's `token=k`.
+const CREDENTIAL_TOKEN = String.raw`(?:${QUOTED_VALUE}|${UNTERMINATED_QUOTED_VALUE}|[^\s"'<>,;\\]+)`;
+const CREDENTIAL_PARAMETER_VALUE = String.raw`(?:(?:\\?"[^"\\\r\n]*\\?"|'[^'\r\n]*')${CLOSING_QUOTE_BOUNDARY}|\\?["']?[^\s"',;<>\\]+)`;
+const CREDENTIAL_PARAMETERS = String.raw`[\w-]+=${CREDENTIAL_PARAMETER_VALUE}(?:\s*[,;]\s*[\w-]+=${CREDENTIAL_PARAMETER_VALUE})*`;
+// The whole value of an Authorization header: a scheme and its credential, or up to two tokens for an unknown scheme.
+const AUTHORIZATION_HEADER_PATTERN = new RegExp(
+  String.raw`${OPENER_BOUNDARY}((?:proxy-)?authorization)(${HEADER_SEPARATOR})(?:(?:${HEADER_AUTH_SCHEMES})\s+(?:${CREDENTIAL_PARAMETERS}|${CREDENTIAL_TOKEN})|${CREDENTIAL_PARAMETERS}|${CREDENTIAL_TOKEN}(?:\s+(?!${NEXT_HEADER_NAME})${CREDENTIAL_TOKEN})?)`,
+  "gi",
+);
+// Cookie and Set-Cookie headers: every pair of the header value is a session credential. A pair's value may be
+// quoted (`sid="x"`, `sid = 'x'`, JSON-escaped `sid=\"x\"`) and ends at its closing quote even with `; Name:`
+// inside; a quote anywhere else closes the value, so the next header of a JSON headers object is not taken; an
+// unquoted value, or one whose opening quote never closes, runs to the `;`, `,`, or space that begins the next
+// header on the line, or to the end of the line.
+const COOKIE_PAIR_VALUE = String.raw`(?<==\s*)(?:(?:\\?"[^"\\\r\n,;\s][^"\\\r\n]*\\?"|'[^'\r\n,;\s][^'\r\n]*')${CLOSING_QUOTE_BOUNDARY}|${UNTERMINATED_QUOTED_VALUE})`;
+const COOKIE_HEADER_VALUE = String.raw`(?:[^\s"'<>\\;,]|[ \t;,](?!${NEXT_HEADER_NAME})|${COOKIE_PAIR_VALUE})+`;
+const COOKIE_HEADER_PATTERN = new RegExp(String.raw`${OPENER_BOUNDARY}(set-cookie|cookie)(${HEADER_SEPARATOR})(${COOKIE_HEADER_VALUE})`, "gi");
+// A scheme standing in prose (`Bearer x`, `Bearer "x"`, `Token token=x`, `ApiKey x`); a scheme word that is itself a
+// header or field name (`X-Api-Key : x`) is left to the field rule.
+const AUTH_SCHEME_PATTERN = new RegExp(String.raw`${OPENER_BOUNDARY}(${PROSE_AUTH_SCHEMES})(?!\s*[:=])\s+(${CREDENTIAL_PARAMETERS}|${CREDENTIAL_TOKEN})`, "gi");
+// What follows a scheme word in prose rather than as its credential: after a lowercase scheme, a word without
+// digits (lowercase, Capitalized, camelCase with up to three humps, a short acronym, or an acronym-led word such
+// as OAuth) or an environment variable name ("bearer of", "OAuth bearer token.", "access token (OAuth bearer
+// token)", "JWT bearer (SF_CONSUMER_KEY,"); after a capitalized scheme, only the capitalized next word of a title
+// ("Refresh Token Policy"). Wrapping punctuation belongs to the prose, so it is allowed around the word.
+const PROSE_AFTER_LOWERCASE_SCHEME_PATTERN = /^\(?(?:[A-Z]?[a-z]+(?:[A-Z][a-z]+){0,3}|[A-Z]{2,5}(?:[a-z]+)?|[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)+)[).:!?]*$/;
+const PROSE_AFTER_CAPITALIZED_SCHEME_PATTERN = /^\(?[A-Z][a-z]+[).:!?]*$/;
+const CREDENTIAL_PARAMETER_PATTERN = new RegExp(String.raw`([\w-]+=)${CREDENTIAL_PARAMETER_VALUE}`, "g");
+// Credential-named assignments (`client_secret=x`, `client_secret = "x"`, `JSESSIONID=x`, `connect.sid='x'`, `--token=x`).
+const SECRET_ASSIGNMENT_PATTERN = new RegExp(
+  String.raw`(?:(?<![\w.-])|${AFTER_JSON_ESCAPE})([\w.-]*(?:sess|sid|token|secret|passw|passphrase|pwd|passcode|api[_-]?key|apikey|access[_-]?key|private[_-]?key|credential|assertion|signature|auth|cookie|otp)[\w.-]*\s*=\s*)(${QUOTED_VALUE}|${UNTERMINATED_QUOTED_VALUE}|[^\s"'&;,<>\\]+)`,
+  "gi",
+);
+// Credential-named fields and single-value credential headers (`x-api-key: x`, `"password": "x"`, `\"access_token\":\"x\"`).
+const SECRET_FIELD_PATTERN = new RegExp(
+  String.raw`(?:(?<![\w/.-])|${AFTER_JSON_ESCAPE})((?:[\w-]*(?:api[_-]?key|apikey|token|secret|passw|passphrase|credential|assertion|signature|private[_-]?key|access[_-]?key|authorization)[\w-]*|pwd|passcode|otp|sid|jsessionid|session|sessionid|session[_-]?id|cookie|set-cookie|x-auth|x-token|x-secret|auth)\\?["']?\s*:\s*\\?["']?)([^\s"'&;,<>\\]+(?:["'](?=[\w/+=-])[^\s"'&;,<>\\]*)*)`,
+  "gi",
+);
+// SOAP and XML credential elements (`<sessionId>x</sessionId>`, `<urn:password>x</urn:password>`).
+const CREDENTIAL_ELEMENT_PATTERN = /<((?:[\w.-]+:)?(?:session_?id|session|passw(?:or)?d|pwd|passcode|otp|token|access_?token|refresh_?token|id_?token|secret|client_?secret|api_?key|apikey|assertion|signature|credentials?|authorization|private_?key)[\w-]*)(\s[^>]*)?>([^<]*)<\/\1\s*>/gi;
+// Command-line credential flags (`--token x`, `-password x`); the flag starts a word, so `access-token against` is prose.
+const CLI_SECRET_FLAG_PATTERN = new RegExp(
+  String.raw`(?:(?<![\w-])|${AFTER_JSON_ESCAPE})(--?(?:token|password|passwd|pwd|passcode|secret|api[_-]?key|apikey|access[_-]?key|client[_-]?secret|credential|auth|bearer|session|cookie|sid|otp)\s+)(${QUOTED_VALUE}|${UNTERMINATED_QUOTED_VALUE}|[^\s"'&;,<>-][^\s"'&;,<>]*)`,
+  "gi",
+);
+// Real token shapes, removed bare.
+const PEM_BLOCK_PATTERN = /-----BEGIN [A-Z0-9 ]+-----[\s\S]*?(?:-----END [A-Z0-9 ]+-----|$)/g;
+const JWT_PATTERN = new RegExp(String.raw`${OPENER_BOUNDARY}eyJ[A-Za-z0-9_-]{4,}\.[A-Za-z0-9_-]{4,}\.[A-Za-z0-9_-]*`, "g");
+const HEX_DIGEST_PATTERN = new RegExp(String.raw`(?:(?<![A-Za-z0-9])|${AFTER_JSON_ESCAPE})${NOT_INSIDE_JSON_ESCAPE}[0-9a-f]{32,}(?![A-Za-z0-9])`, "gi");
+const VENDOR_TOKEN_PATTERN = new RegExp(String.raw`${OPENER_BOUNDARY}${NOT_INSIDE_JSON_ESCAPE}(?:(?:sk|rk|pk)_(?:live|test)_[A-Za-z0-9]{8,}|sk-(?:proj-)?[A-Za-z0-9_-]{20,}|gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|xox[abopsre]-[A-Za-z0-9-]{10,}|xapp-[A-Za-z0-9-]{10,}|(?:AKIA|ASIA|AGPA|AIDA|AROA|ANPA|ANVA)[0-9A-Z]{16}|AIza[0-9A-Za-z_-]{20,}|ya29\.[0-9A-Za-z_-]{20,}|glpat-[A-Za-z0-9_-]{16,}|npm_[A-Za-z0-9]{30,}|pypi-[A-Za-z0-9_-]{30,}|dop_v1_[a-f0-9]{40,}|SG\.[A-Za-z0-9_-]{16,}\.[A-Za-z0-9_-]{16,}|hvs\.[A-Za-z0-9_-]{20,}|shpat_[a-fA-F0-9]{32}|dckr_pat_[A-Za-z0-9_-]{20,}|lin_api_[A-Za-z0-9]{20,}|figd_[A-Za-z0-9_-]{20,}|u\+[A-Za-z0-9_-]{16,})(?![A-Za-z0-9_-])`, "g");
+// A run long enough to be a token; redactTokenRun decides by segment shape whether it is one. It may start right
+// after `=` (`theme=<run>`, `x==<run>`): the pair rule has already replaced every credential-named pair by the time
+// this rule runs, so a run still standing after `=` is under a non-credential name and is judged by its shape alone;
+// the padding of a base64 run is taken on its right side.
+const BARE_TOKEN_RUN_PATTERN = new RegExp(String.raw`(?:(?<![A-Za-z0-9+/_-])|${AFTER_JSON_ESCAPE})${NOT_INSIDE_JSON_ESCAPE}[A-Za-z0-9+/_-]{16,}={0,2}(?![A-Za-z0-9+/_=-])`, "g");
+// A segment that reads as a word: lowercase, UPPERCASE, Capitalized, or camelCase with up to six humps, each
+// hump optionally led by a short acronym (enableCSRFOnPost, connectedAppOAuth) or closed by one
+// (sessionTimeoutSAML), optionally followed by digits (oauth2, sha256, dev12345) or a version suffix
+// (EngineProtectionV2, getDeviceControlPoliciesV2).
+const WORD_SEGMENT_PATTERN = /^(?:[A-Z]+|[A-Z]?[a-z]+(?:[A-Z]{1,5}[a-z]+){0,6}(?:[A-Z]{2,5})?|[A-Z]{2,}[a-z]+(?:[A-Z]{1,5}[a-z]+){0,6}(?:[A-Z]{2,5})?)(?:V\d+|\d*)$/;
+// A canonical UUID (8-4-4-4-12 hex) is a vendor identifier (a Falcon user uuid, an Anypoint organization or
+// environment id), not a credential, so it stays bare; inside a carrier or when remembered it still goes.
+const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const MAX_REDACTION_DEPTH = 32;
 const PRODUCTION_NAME_PATTERN = /\bprod(uction)?\b/i;
 const NON_PRODUCTION_NAME_PATTERN = /\b(sandbox|dev(elopment)?|test|qa|uat|staging|stage)\b/i;
 
@@ -272,13 +385,21 @@ export interface MulesoftPage {
 
 export type MulesoftListResult = JsonRecord[] | MulesoftPage;
 
+/**
+ * The only field carrying response text is the message (status line, method and path, and either
+ * Anypoint's documented message, error_description, error, or errors[0].message, or the opaque-body
+ * note); it is scrubbed in the constructor so no throw site can hand an unredacted body to a catch
+ * block. `endpoint` is the request path, recorded so a not-collected marker can name the request.
+ */
 export class MulesoftApiError extends Error {
   readonly status: number;
+  readonly endpoint?: string;
 
-  constructor(status: number, message: string) {
-    super(message);
+  constructor(status: number, message: string, endpoint?: string) {
+    super(scrubErrorText(message));
     this.name = "MulesoftApiError";
     this.status = status;
+    this.endpoint = endpoint;
   }
 }
 
@@ -443,8 +564,167 @@ function serializeJson(value: unknown): string {
   return `${JSON.stringify(value, null, 2)}\n`;
 }
 
+/**
+ * The single sink every recorded error string passes through (collect() dataset errors and the errors
+ * arrays, access-check surfaces, _errors.log); it re-applies the redaction pass so a message built
+ * outside MulesoftApiError cannot bypass it.
+ */
 function errorMessage(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
+  return scrubErrorText(error instanceof Error ? error.message : String(error));
+}
+
+/**
+ * The unanchored redaction pass every error string receives, once in MulesoftApiError and again at
+ * the sink (errorMessage): every secret any client in this process has seen, in every form it can
+ * take in an echoed body, then the carriers (URL userinfo, query strings, and fragments anywhere in
+ * the text, Authorization and cookie headers, auth schemes in prose, credential-named assignments,
+ * fields, and elements, command-line flags), then the bare token shapes (PEM blocks, JWTs, hex
+ * digests, vendor prefixes, and long runs with base64 symbols, scattered digits, or token casing).
+ */
+function scrubErrorText(text: string, secrets: Iterable<string | undefined> = KNOWN_SECRETS): string {
+  let scrubbed = text;
+  for (const secret of secrets) {
+    if (!secret || secret.length < MIN_REMEMBERED_SECRET_LENGTH) continue;
+    for (const form of secretForms(secret)) scrubbed = scrubbed.split(form).join(REDACTED);
+  }
+  return scrubBareTokens(scrubCarriers(scrubbed));
+}
+
+/**
+ * The carrier stage of the pass: URL userinfo, query strings, and fragments anywhere in the text,
+ * Authorization and cookie headers, credential elements, JWTs and PEM blocks, auth schemes in prose,
+ * credential-named assignments, fields, and command-line flags. It removes a value by the company it
+ * keeps, never by its shape alone.
+ */
+function scrubCarriers(text: string): string {
+  return text
+    .replace(PEM_BLOCK_PATTERN, REDACTED)
+    .replace(URL_IN_TEXT_PATTERN, (_match, scheme: string, userinfo: string | undefined, host: string, path: string, query?: string, fragment?: string) =>
+      `${scheme}${userinfo ? `${REDACTED}@` : ""}${host}${path}${query ? `?${REDACTED}` : ""}${fragment ? `#${REDACTED}` : ""}`)
+    .replace(BARE_QUERY_PAIR_PATTERN, (_match, pair: string) => `${pair}${REDACTED}`)
+    .replace(AUTHORIZATION_HEADER_PATTERN, (_match, header: string, separator: string) => `${header}${separator}${REDACTED}`)
+    .replace(COOKIE_HEADER_PATTERN, (_match, header: string, separator: string) => `${header}${separator}${REDACTED}`)
+    .replace(CREDENTIAL_ELEMENT_PATTERN, (_match, element: string, attributes: string | undefined) => `<${element}${attributes ?? ""}>${REDACTED}</${element}>`)
+    .replace(JWT_PATTERN, REDACTED)
+    .replace(AUTH_SCHEME_PATTERN, (match: string, scheme: string, credential: string) =>
+      (isProseAfterScheme(scheme, credential) ? match : `${scheme} ${redactCredentialParameters(credential)}`))
+    .replace(SECRET_ASSIGNMENT_PATTERN, (_match, assignment: string) => `${assignment}${REDACTED}`)
+    .replace(SECRET_FIELD_PATTERN, (_match, field: string) => `${field}${REDACTED}`)
+    .replace(CLI_SECRET_FLAG_PATTERN, (_match, flag: string) => `${flag}${REDACTED}`);
+}
+
+/** The bare-token stage: real token shapes removed whatever their company (vendor prefixes, hex digests, long runs with base64 symbols, scattered digits, or token casing). */
+function scrubBareTokens(text: string): string {
+  return text
+    .replace(VENDOR_TOKEN_PATTERN, REDACTED)
+    .replace(HEX_DIGEST_PATTERN, REDACTED)
+    .replace(BARE_TOKEN_RUN_PATTERN, redactTokenRun);
+}
+
+/** Every secret any client in this process has seen, in every form it can take in a text. */
+function scrubRememberedSecrets(text: string): string {
+  let scrubbed = text;
+  for (const secret of KNOWN_SECRETS) {
+    for (const form of secretForms(secret)) scrubbed = scrubbed.split(form).join(REDACTED);
+  }
+  return scrubbed;
+}
+
+/**
+ * The data-side pass (rule 9, data-side carrier class) for every string a snapshot, evidence list,
+ * summary, core_data file, or tool payload keeps from an API response: the remembered secrets in every
+ * form, then the carrier stage (which takes JWTs and PEM blocks), then the vendor-prefixed token shapes
+ * (`sk_live_`, `xoxb-`, `ghp_`, `AKIA`, and the rest of VENDOR_TOKEN_PATTERN), unambiguous credential
+ * shapes with no identifier collision. It has no generic bare-run stage, so prose identifiers (a UUID, a
+ * sys_id, a name such as prod-us-east-2026) stay while a header line, URL credential, assignment,
+ * configured secret, or vendor token embedded in a description, name, or note goes.
+ */
+function scrubDataText(text: string): string {
+  return scrubCarriers(scrubRememberedSecrets(text)).replace(VENDOR_TOKEN_PATTERN, REDACTED);
+}
+
+/**
+ * A collected value with every string leaf through the data-side pass; arrays and plain objects are
+ * rebuilt, primitives and null are kept, and a container nested deeper than MAX_REDACTION_DEPTH is
+ * replaced by the marker rather than passed through unscrubbed (the payload is server-controlled).
+ */
+function scrubDataStrings<T>(value: T, depth = 0): T {
+  if (typeof value === "string") return scrubDataText(value) as T;
+  if (value === null || typeof value !== "object") return value;
+  if (depth > MAX_REDACTION_DEPTH) return REDACTED as T;
+  if (Array.isArray(value)) return value.map((item) => scrubDataStrings(item, depth + 1)) as T;
+  const prototype = Object.getPrototypeOf(value);
+  if (prototype !== Object.prototype && prototype !== null) return value;
+  const output: Record<string, unknown> = {};
+  for (const [key, entry] of Object.entries(value as Record<string, unknown>)) output[key] = scrubDataStrings(entry, depth + 1);
+  return output as T;
+}
+
+/** A scheme word standing in prose ("bearer of", "OAuth bearer token.", "Refresh Token Policy") rather than carrying a credential. */
+function isProseAfterScheme(scheme: string, credential: string): boolean {
+  return /^[a-z]+$/.test(scheme)
+    ? PROSE_AFTER_LOWERCASE_SCHEME_PATTERN.test(credential)
+    : PROSE_AFTER_CAPITALIZED_SCHEME_PATTERN.test(credential);
+}
+
+/** A parameter list (`token=k`, `username="u", response="r"`) keeps its parameter names; a single credential is replaced whole. */
+function redactCredentialParameters(credential: string): string {
+  return /^[\w-]+=/.test(credential) ? credential.replace(CREDENTIAL_PARAMETER_PATTERN, (_match, name: string) => `${name}${REDACTED}`) : REDACTED;
+}
+
+/** The raw, base64, base64url, URL-encoded, and JSON-escaped forms of a secret, so an encoded echo is caught too. */
+function secretForms(secret: string): string[] {
+  let forms = SECRET_FORMS.get(secret);
+  if (!forms) {
+    const bytes = Buffer.from(secret, "utf8");
+    const base64 = bytes.toString("base64");
+    const urlEncoded = encodeURIComponent(secret);
+    forms = [...new Set([
+      secret,
+      base64,
+      base64.replace(/=+$/, ""),
+      bytes.toString("base64url"),
+      urlEncoded,
+      urlEncoded.replace(/%20/g, "+"),
+      urlEncoded.replace(/%[0-9A-F]{2}/g, (escape) => escape.toLowerCase()),
+      JSON.stringify(secret).slice(1, -1),
+    ])].filter((form) => form.length >= MIN_REMEMBERED_SECRET_LENGTH);
+    SECRET_FORMS.set(secret, forms);
+  }
+  return forms;
+}
+
+/**
+ * A run reads as a token when any hyphen- or underscore-separated segment is neither a word, a number, nor
+ * a short abbreviation; a canonical UUID is an identifier and never reads as one.
+ */
+function looksLikeToken(value: string): boolean {
+  if (UUID_PATTERN.test(value)) return false;
+  return value.split(/[-_]+/).some((segment) =>
+    segment.length > 0 && !/^\d+$/.test(segment) && !WORD_SEGMENT_PATTERN.test(segment) && !(segment.length < 8 && /^[A-Za-z0-9]+$/.test(segment)));
+}
+
+/** Base64 symbols mark a token; otherwise a run without slashes is judged whole and a path piece by piece, keeping its word-like skeleton. */
+function redactTokenRun(run: string): string {
+  if (run.includes("+") || run.endsWith("=")) return REDACTED;
+  if (!run.includes("/")) return looksLikeToken(run) ? REDACTED : run;
+  return run.split("/").map((piece) => (looksLikeToken(piece) ? REDACTED : piece)).join("/");
+}
+
+function rememberSecrets(...values: Array<string | undefined>): void {
+  for (const value of values) {
+    if (value && value.length >= MIN_REMEMBERED_SECRET_LENGTH) KNOWN_SECRETS.add(value);
+  }
+}
+
+/** A URL reduced to scheme and host: alert webhooks and callback targets carry tokens in their path and query. */
+export function reduceUrl(value: string): string {
+  try {
+    const url = new URL(value);
+    return `${url.protocol}//${url.host}`;
+  } catch {
+    return REDACTED;
+  }
 }
 
 function sample<T>(items: T[], limit = MAX_EVIDENCE_SAMPLES): T[] {
@@ -513,29 +793,61 @@ function truncationNote(label: string, page: MulesoftPage): string | undefined {
   return `${label} list truncated at ${page.items.length} of ${pageTotalLabel(page)}`;
 }
 
+function isSecretKey(key: string): boolean {
+  return SECRET_KEY_PATTERN.test(key.toLowerCase().replace(/[-_\s]/g, ""));
+}
+
+function isUrlKey(key: string): boolean {
+  return URL_KEY_PATTERN.test(key.toLowerCase().replace(/[-_\s]/g, ""));
+}
+
+function redactUrlQuery(text: string): string {
+  if (!/^https?:\/\/[^?]+\?/i.test(text)) return text;
+  return text.replace(/([?&])([^=&#]+)=([^&#]*)/g, (match, separator: string, key: string) => (
+    isSecretKey(key) ? `${separator}${key}=${REDACTED}` : match
+  ));
+}
+
+function isSecretNamedPair(object: JsonRecord): boolean {
+  if (!("value" in object)) return false;
+  const name = asString(object.name) ?? asString(object.key);
+  return name !== undefined && isSecretKey(name);
+}
+
+function redactedValue(entry: unknown): unknown {
+  return entry === null || entry === undefined || typeof entry === "boolean" ? entry : REDACTED;
+}
+
+const ABSOLUTE_URL_PATTERN = /^[a-z][a-z0-9+.-]*:\/\//i;
+
+/** The value under a URL-named key: absolute URLs (alone or in a list) are reduced to scheme and host; anything else is redacted as usual. */
+function reducedUrlValue(entry: unknown, depth: number): unknown {
+  if (typeof entry === "string") return ABSOLUTE_URL_PATTERN.test(entry) ? reduceUrl(entry) : scrubDataText(redactUrlQuery(entry));
+  if (Array.isArray(entry)) return entry.map((item) => reducedUrlValue(item, depth + 1));
+  return redactSnapshot(entry, depth + 1);
+}
+
 export function redactSnapshot(value: unknown, depth = 0): unknown {
-  if (depth > 16) return value;
+  if (depth > MAX_REDACTION_DEPTH) return REDACTED;
+  if (typeof value === "string") return scrubDataText(redactUrlQuery(value));
   if (Array.isArray(value)) return value.map((item) => redactSnapshot(item, depth + 1));
   const object = asObject(value);
   if (!object) return value;
+  const secretPair = isSecretNamedPair(object);
   const output: JsonRecord = {};
   for (const [key, entry] of Object.entries(object)) {
-    const isScalar = typeof entry === "string" || typeof entry === "number";
-    output[key] = SECRET_KEY_PATTERN.test(key) && isScalar ? "[REDACTED]" : redactSnapshot(entry, depth + 1);
+    output[key] = isSecretKey(key) || (secretPair && key === "value")
+      ? redactedValue(entry)
+      : isUrlKey(key)
+        ? reducedUrlValue(entry, depth)
+        : redactSnapshot(entry, depth + 1);
   }
   return output;
 }
 
+/** Kept for callers that pass explicit secrets; it is the same pass as scrubErrorText over those secrets plus every remembered one. */
 export function redactSecretText(text: string, secrets: Array<string | undefined> = []): string {
-  let output = text.replace(/Bearer\s+[A-Za-z0-9._~+/=-]+/gi, "Bearer [REDACTED]");
-  output = output.replace(
-    /("?(?:client_secret|password|access_token|refresh_token|accessToken|token)"?\s*[:=]\s*"?)([^"&\s,}]+)/gi,
-    "$1[REDACTED]",
-  );
-  for (const secret of secrets) {
-    if (secret && secret.length >= 4) output = output.split(secret).join("[REDACTED]");
-  }
-  return output;
+  return scrubErrorText(text, [...secrets, ...KNOWN_SECRETS]);
 }
 
 function safeDirName(value: string): string {
@@ -645,11 +957,30 @@ async function countFilesRecursively(rootDir: string): Promise<number> {
   return total;
 }
 
-function stripTomlComment(line: string): string {
+/** A TOML line the simple reader cannot accept; it records the line number only, never the line. */
+export class MulesoftTomlSyntaxError extends Error {
+  readonly line: number;
+
+  constructor(line: number) {
+    super(`Invalid TOML at line ${line}`);
+    this.name = "MulesoftTomlSyntaxError";
+    this.line = line;
+  }
+}
+
+/**
+ * Drops a trailing comment. A quote that is still open at the end of the line (a multi-line string
+ * opener, or a value that never closes) is a syntax error, so the line is never read as a value.
+ */
+function stripTomlComment(line: string, lineNumber: number): string {
   let quote: string | undefined;
   for (let index = 0; index < line.length; index += 1) {
     const character = line[index];
     if (quote) {
+      if (quote === "\"" && character === "\\") {
+        index += 1;
+        continue;
+      }
       if (character === quote) quote = undefined;
       continue;
     }
@@ -659,7 +990,20 @@ function stripTomlComment(line: string): string {
     }
     if (character === "#") return line.slice(0, index);
   }
+  if (quote) throw new MulesoftTomlSyntaxError(lineNumber);
   return line;
+}
+
+/** Index of the quote that closes the string opened at index 0, honoring backslash escapes in basic strings. */
+function closingQuoteIndex(value: string, quote: string): number {
+  for (let index = 1; index < value.length; index += 1) {
+    if (quote === "\"" && value[index] === "\\") {
+      index += 1;
+      continue;
+    }
+    if (value[index] === quote) return index;
+  }
+  return -1;
 }
 
 function unquoteTomlString(value: string): string {
@@ -703,33 +1047,62 @@ function splitTomlArray(value: string): string[] {
   return items;
 }
 
-function parseTomlValue(raw: string): unknown {
+/**
+ * Parses one value: a single-line array of scalars, a string closed on the same line (basic, literal,
+ * or a one-line triple-quoted string), a boolean, or a number; any other quoted or bracketed shape is
+ * a syntax error at this line. A bare word stays a string, as in the Snowflake reader.
+ */
+function parseTomlValue(raw: string, lineNumber: number): unknown {
   const value = raw.trim();
-  if (value.startsWith("[") && value.endsWith("]")) {
-    return splitTomlArray(value.slice(1, -1)).map((item) => parseTomlValue(item));
+  if (value.length === 0) throw new MulesoftTomlSyntaxError(lineNumber);
+  if (value.startsWith("[")) {
+    if (!value.endsWith("]")) throw new MulesoftTomlSyntaxError(lineNumber);
+    return splitTomlArray(value.slice(1, -1)).map((item) => parseTomlValue(item, lineNumber));
   }
-  if (value.startsWith("\"") || value.startsWith("'")) return unquoteTomlString(value);
+  for (const delimiter of ["\"\"\"", "'''"]) {
+    if (!value.startsWith(delimiter)) continue;
+    if (value.length < delimiter.length * 2 || value.indexOf(delimiter, delimiter.length) !== value.length - delimiter.length) {
+      throw new MulesoftTomlSyntaxError(lineNumber);
+    }
+    return value.slice(delimiter.length, -delimiter.length);
+  }
+  if (value.startsWith("\"") || value.startsWith("'")) {
+    if (closingQuoteIndex(value, value[0]) !== value.length - 1) throw new MulesoftTomlSyntaxError(lineNumber);
+    return unquoteTomlString(value);
+  }
   if (/^(true|false)$/i.test(value)) return value.toLowerCase() === "true";
   const numeric = Number(value.replace(/_/g, ""));
-  if (value.length > 0 && Number.isFinite(numeric)) return numeric;
+  if (Number.isFinite(numeric)) return numeric;
   return value;
 }
 
+const TOML_TABLE_HEADER_PATTERN = /^\[([^[\]]+)\]$/;
+const TOML_KEY_VALUE_PATTERN = /^("[^"]*"|'[^']*'|[A-Za-z0-9_.-]+)\s*=\s*(.+)$/;
+
+/**
+ * Reads the subset of TOML the config file uses: blank lines, `#` comments, `[table]` headers, and
+ * single-line `key = value` pairs. Any other line (a bare value, an array of tables, a continued
+ * array or string), and any quote that does not close on its own line, throws a
+ * MulesoftTomlSyntaxError carrying the line number only, so a stray credential line is never
+ * skipped, never read as a value, and never quoted.
+ */
 export function parseSimpleToml(contents: string): Record<string, unknown> {
   const result: Record<string, unknown> = {};
   let section = "";
-  for (const rawLine of contents.split(/\r?\n/)) {
-    const line = stripTomlComment(rawLine).trim();
+  const lines = contents.split(/\r?\n/);
+  for (let index = 0; index < lines.length; index += 1) {
+    const lineNumber = index + 1;
+    const line = stripTomlComment(lines[index], lineNumber).trim();
     if (line.length === 0) continue;
-    const sectionMatch = /^\[([^\]]+)\]$/.exec(line);
+    const sectionMatch = TOML_TABLE_HEADER_PATTERN.exec(line);
     if (sectionMatch) {
       section = sectionMatch[1].trim().replace(/^["']|["']$/g, "");
       continue;
     }
-    const separator = line.indexOf("=");
-    if (separator === -1) continue;
-    const key = unquoteTomlString(line.slice(0, separator).trim());
-    const value = parseTomlValue(line.slice(separator + 1));
+    const pairMatch = TOML_KEY_VALUE_PATTERN.exec(line);
+    if (!pairMatch) throw new MulesoftTomlSyntaxError(lineNumber);
+    const key = unquoteTomlString(pairMatch[1]);
+    const value = parseTomlValue(pairMatch[2], lineNumber);
     result[section ? `${section}.${key}` : key] = value;
   }
   return result;
@@ -749,13 +1122,52 @@ function configFileValue(values: Record<string, unknown> | undefined, keys: stri
   return undefined;
 }
 
-function loadConfigFile(path: string): Record<string, unknown> | undefined {
-  if (!existsSync(path)) return undefined;
-  try {
-    return parseSimpleToml(readFileSync(path, "utf8"));
-  } catch (error) {
-    throw new Error(`Unable to read MuleSoft config file ${path}: ${errorMessage(error)}`);
+/**
+ * Thrown by the config loader. The message is fixed text carrying only the path and the fs error
+ * code: Node's fs message (which quotes its own wording and path) is never interpolated, and the
+ * TOML parser's output is never quoted either, because the file holds the client secret.
+ */
+export class MulesoftConfigFileError extends Error {
+  readonly code: string;
+
+  constructor(message: string, code: string) {
+    super(message);
+    this.name = "MulesoftConfigFileError";
+    this.code = code;
   }
+}
+
+/** Read step of the config loader: any failure becomes fixed text with the validated fs code. */
+function readConfigFileText(path: string): string {
+  try {
+    return readFileSync(path, "utf8");
+  } catch (error) {
+    const rawCode = (error as { code?: unknown } | null)?.code;
+    const code = typeof rawCode === "string" && FS_ERROR_CODE_PATTERN.test(rawCode) ? rawCode : undefined;
+    throw new MulesoftConfigFileError(`Unable to read MuleSoft config file ${path}${code ? ` (${code})` : ""}`, code ?? "EUNKNOWN");
+  }
+}
+
+/**
+ * Parse step of the config loader: every thrown value is caught and replaced with fixed text carrying
+ * the path, the line number when the reader reported one, and the code; never the line itself.
+ */
+function parseConfigFileToml(path: string, text: string): Record<string, unknown> {
+  try {
+    return parseSimpleToml(text);
+  } catch (error) {
+    const where = error instanceof MulesoftTomlSyntaxError ? ` at line ${error.line}` : "";
+    throw new MulesoftConfigFileError(`Unable to parse MuleSoft config file: invalid TOML in ${path}${where} (INVALID_TOML)`, "INVALID_TOML");
+  }
+}
+
+/**
+ * Loads the config file. The default location is skipped when absent; an explicit path that cannot
+ * be read fails with the fixed-text read error (ENOENT included).
+ */
+function loadConfigFile(path: string, explicit: boolean): Record<string, unknown> | undefined {
+  if (!explicit && !existsSync(path)) return undefined;
+  return parseConfigFileToml(path, readConfigFileText(path));
 }
 
 type ConfigSource = "arguments" | "environment" | "config";
@@ -817,11 +1229,11 @@ export function resolveMulesoftConfiguration(
 ): MulesoftResolvedConfig {
   const sourceChain: string[] = [];
   const homeDir = options.homeDir ?? homedir();
-  const configPath = asString(input.config_file)
+  const explicitConfigPath = asString(input.config_file)
     ?? asString(env.MULESOFT_SEC_INSPECTOR_CONFIG)
-    ?? asString(env.ANYPOINT_CONFIG_FILE)
-    ?? join(homeDir, ...DEFAULT_CONFIG_FILE_SEGMENTS);
-  const fileValues = loadConfigFile(configPath);
+    ?? asString(env.ANYPOINT_CONFIG_FILE);
+  const configPath = explicitConfigPath ?? join(homeDir, ...DEFAULT_CONFIG_FILE_SEGMENTS);
+  const fileValues = loadConfigFile(configPath, explicitConfigPath !== undefined);
   if (fileValues) sourceChain.push(`config:${configPath}`);
 
   const record = (resolved: ResolvedValue, label: string): string | undefined => {
@@ -940,17 +1352,32 @@ function parseJsonText(rawText: string): unknown {
   }
 }
 
-function anypointErrorDetail(payload: unknown, rawText: string): string {
+/**
+ * A non-JSON error body (a proxy or WAF page) is described by shape only; its text is never
+ * copied into an error string because those strings land in the bundle's error log.
+ */
+function anypointErrorDetail(payload: unknown, response: Response, rawText: string): string {
   const object = asObject(payload);
-  const detail = object
+  const documented = object
     ? [
       asString(object.message),
       asString(object.error_description),
       asString(object.error),
       asString(getNestedValue(object, ["errors", "0", "message"])),
     ].filter((item): item is string => Boolean(item)).join("; ")
-    : rawText.slice(0, 240);
+    : "";
+  const detail = documented || describeOpaqueBody(response, rawText, payload === undefined ? "non-JSON body" : "JSON body without a recognized error field");
   return detail ? `: ${detail}` : "";
+}
+
+/**
+ * A response body without a recognizable Anypoint error field is described by content type and byte
+ * length only, whatever its content type; its text is never sliced into an error string.
+ */
+function describeOpaqueBody(response: Response, rawText: string, kind: string): string {
+  if (rawText.length === 0) return "";
+  const contentType = response.headers.get("content-type")?.split(";")[0]?.trim() || "unknown content type";
+  return `${kind} (${contentType}, ${Buffer.byteLength(rawText, "utf8")} bytes)`;
 }
 
 function isRetryableStatus(status: number): boolean {
@@ -1021,6 +1448,7 @@ export class MulesoftApiClient {
     this.maxRetries = clampNumber(options.maxRetries, DEFAULT_MAX_RETRIES, 0, 10);
     this.retryBaseDelayMs = clampNumber(options.retryBaseDelayMs, DEFAULT_RETRY_BASE_DELAY_MS, 0, MAX_RETRY_DELAY_MS);
     this.certificateProbe = options.certificateProbe ?? defaultCertificateProbe;
+    rememberSecrets(config.clientSecret, config.password, config.token);
     if (config.authMode === "token" && config.token) {
       this.accessToken = config.token;
       this.accessTokenExpiresAt = Number.MAX_SAFE_INTEGER;
@@ -1100,14 +1528,18 @@ export class MulesoftApiClient {
           response.status,
           this.redact(
             `Anypoint request failed (${response.status} ${response.statusText}) for ${method} ${pathLabel}`
-            + anypointErrorDetail(payload, rawText),
+            + anypointErrorDetail(payload, response, rawText),
           ),
+          pathLabel,
         );
       } catch (error) {
         if (error instanceof MulesoftApiError) throw error;
         if (attempt < this.maxRetries) {
           await this.sleepImpl(this.retryDelayMs(undefined, attempt));
           continue;
+        }
+        if (error instanceof Error && error.name === "AbortError") {
+          throw new Error(`Anypoint request to ${method} ${pathLabel} timed out after ${this.config.timeoutMs} ms`);
         }
         throw new Error(this.redact(`Anypoint request failed for ${method} ${pathLabel}: ${errorMessage(error)}`));
       } finally {
@@ -1159,6 +1591,7 @@ export class MulesoftApiClient {
       throw new Error("Anypoint token response did not include access_token.");
     }
     const expiresIn = asNumber(record.expires_in) ?? 3600;
+    rememberSecrets(accessToken);
     this.accessToken = accessToken;
     this.accessTokenExpiresAt = Date.now() + Math.max((expiresIn - 60) * 1000, 60_000);
     return accessToken;
@@ -1203,7 +1636,11 @@ export class MulesoftApiClient {
       items.push(...pageItems.slice(0, limit - items.length));
       offset += pageItems.length;
 
-      if (pageItems.length === 0) break;
+      if (pageItems.length === 0) {
+        // An empty page below a server-reported total means the remainder was never delivered.
+        truncated = total !== undefined && offset < total;
+        break;
+      }
       if (total !== undefined && offset >= total) break;
       if (items.length >= limit) {
         truncated = total !== undefined
@@ -1464,16 +1901,112 @@ type AccessClient = IdentityClient & ApiGatewayClient & RuntimeClient & AuditCli
 export type MulesoftBundleClient = AccessClient;
 
 interface Collected<T> {
+  /**
+   * The source name, with the scope of a per-item read in parentheses (`secret_groups (Production)`).
+   * A `name:scope` shape would put a credential-named label such as `secret_groups` before a colon,
+   * which the redaction pass reads as a credential pair and eats along with the scope.
+   */
   label: string;
   value: T;
   error?: string;
   httpStatus?: number;
+  /** Path of the request that failed; absent when the read succeeded or no request was made. */
+  endpoint?: string;
+  /** Set when the read was never requested because its parent list failed; names the parent and its failure. */
+  skipped?: string;
+  /** Label of the parent source whose failure caused the skip. */
+  skippedParent?: string;
+}
+
+/**
+ * Written to core_data (and into each category's snapshots) in place of a dataset that was denied,
+ * errored, or never requested, so a bundle consumer cannot mistake a failed read for an empty
+ * inventory. A readable dataset with no items keeps its array shape.
+ */
+export interface NotCollectedMarker {
+  collected: false;
+  dataset: string;
+  status: number | null;
+  endpoint: string | null;
+  error: string;
+}
+
+/** A dataset assembled from several reads of which some failed: the collected items plus one entry per failed read. */
+export interface PartiallyCollectedSnapshot {
+  collected: "partial";
+  dataset: string;
+  failed_reads: Array<{ read: string; status: number | null; endpoint: string | null; error: string }>;
+  items: unknown;
+}
+
+function sourceCollected(source: Collected<unknown>): boolean {
+  return !source.error && !source.skipped;
+}
+
+function sourceFailure(source: Collected<unknown>): string {
+  return source.error ?? `not requested: ${source.skipped}`;
+}
+
+function notCollectedMarker(source: Collected<unknown>): NotCollectedMarker {
+  return {
+    collected: false,
+    dataset: source.label,
+    status: source.httpStatus ?? null,
+    endpoint: source.endpoint ?? null,
+    error: sourceFailure(source),
+  };
+}
+
+/**
+ * The exported view of a dataset: the redacted value when its source was read, a not-collected marker
+ * when it was denied, errored, or skipped, and a partial snapshot when it merges several reads of which
+ * only some failed (so the items that were read are kept beside the failures).
+ */
+export function snapshotOf(source: Collected<unknown>, value: unknown, reads: Array<Collected<unknown>> = []): unknown {
+  if (sourceCollected(source)) return redactSnapshot(value);
+  const succeeded = reads.filter(sourceCollected);
+  if (succeeded.length === 0) return notCollectedMarker(source);
+  // When every child read succeeded the failure sits on the merged source itself (an unread parent).
+  const failedReads = reads.some((read) => !sourceCollected(read)) ? reads.filter((read) => !sourceCollected(read)) : [source];
+  return {
+    collected: "partial",
+    dataset: source.label,
+    failed_reads: failedReads.map((read) => ({
+      read: read.label,
+      status: read.httpStatus ?? null,
+      endpoint: read.endpoint ?? null,
+      error: sourceFailure(read),
+    })),
+    items: redactSnapshot(value),
+  } satisfies PartiallyCollectedSnapshot;
+}
+
+/** A count, list, or flag derived from one or more reads renders null when any of them was not answered. */
+function derived<T>(value: T, ...sources: Array<Collected<unknown>>): T | null {
+  return sources.every(sourceCollected) ? value : null;
+}
+
+/**
+ * The partial-view notes of a summary: the notes when there are any, null when a source was not read at
+ * all (the view is absent rather than partial), and [] only when every source was read completely.
+ */
+function partialViewOf(notes: Array<string | undefined>, ...sources: Array<Collected<unknown>>): string[] | null {
+  const present = notes.filter((note): note is string => Boolean(note));
+  if (present.length > 0) return present;
+  return sources.every(sourceCollected) ? [] : null;
 }
 
 interface Verdict {
   status: MulesoftFindingStatus;
   summary: string;
   evidence?: JsonRecord;
+  /**
+   * A fail that rests on the absence of an item among the visible items of a truncated page (zero
+   * providers before the page was cut). The absence is provable only against the items that were not
+   * read, so `evaluate` renders the verdict manual and its absence-valued evidence (0, [], {}) null; the
+   * compute sets it only when the list itself was truncated, so a complete empty read still fails.
+   */
+  absenceClaim?: boolean;
 }
 
 interface EvaluationInputs {
@@ -1484,7 +2017,7 @@ interface EvaluationInputs {
 
 async function collect<T>(label: string, fallback: T, load: () => Promise<T>, errors: string[]): Promise<Collected<T>> {
   try {
-    return { label, value: await load() };
+    return { label, value: scrubDataStrings(await load()) };
   } catch (error) {
     const message = errorMessage(error);
     errors.push(`${label}: ${message}`);
@@ -1493,8 +2026,17 @@ async function collect<T>(label: string, fallback: T, load: () => Promise<T>, er
       value: fallback,
       error: message,
       httpStatus: error instanceof MulesoftApiError ? error.status : undefined,
+      endpoint: error instanceof MulesoftApiError ? error.endpoint : undefined,
     };
   }
+}
+
+/** A read that was never requested because the list it depends on failed; the reason names that parent. */
+function skippedSource<T>(label: string, parent: Collected<unknown>, fallback: T): Collected<T> {
+  const reason = parent.error
+    ? `the ${parent.label} read failed (${parent.error}), so there were no ${parent.label} to scope the ${label} read`
+    : `the ${parent.label} read was not requested (${parent.skipped}), so there were no ${parent.label} to scope the ${label} read`;
+  return { label, value: fallback, skipped: reason, skippedParent: parent.label, httpStatus: parent.httpStatus };
 }
 
 async function collectPage(label: string, load: () => Promise<MulesoftListResult>, errors: string[]): Promise<Collected<MulesoftPage>> {
@@ -1510,19 +2052,38 @@ function failedSource(label: string, error: string): Collected<undefined> {
   return { label, value: undefined, error };
 }
 
-function mergeSources(label: string, sources: Array<Collected<unknown>>): Collected<undefined> {
-  const failed = sources.filter((source) => source.error);
+/**
+ * Combine per-item reads into one source. When the parent list the reads depend on was not collected,
+ * the merged source is skipped and names that parent, so an empty set of reads is never mistaken for
+ * a successful empty read.
+ */
+function mergeSources(label: string, sources: Array<Collected<unknown>>, parent?: Collected<unknown>): Collected<undefined> {
+  if (parent && !sourceCollected(parent)) {
+    if (sources.length === 0) return skippedSource(label, parent, undefined);
+    // Some parents were read and their children requested; the children of the unread parents were not.
+    return {
+      label,
+      value: undefined,
+      error: `${label} reads were requested only for the ${parent.label} that were read (${sourceFailure(parent)})`,
+      httpStatus: parent.httpStatus,
+      endpoint: parent.endpoint,
+      skippedParent: parent.label,
+    };
+  }
+  const failed = sources.filter((source) => !sourceCollected(source));
   if (failed.length === 0) return readySource(label);
-  const detail = failed.slice(0, 3).map((source) => `${source.label}: ${source.error}`).join("; ");
+  const detail = failed.slice(0, 3).map((source) => `${source.label}: ${sourceFailure(source)}`).join("; ");
   return {
     label,
     value: undefined,
     error: `${failed.length} of ${sources.length} reads failed (${detail}${failed.length > 3 ? "; ..." : ""})`,
     httpStatus: failed[0].httpStatus,
+    endpoint: failed[0].endpoint,
   };
 }
 
 function describeFailure(source: Collected<unknown>): string {
+  if (source.skipped) return `${source.label} was not requested because ${source.skipped}`;
   const status = source.httpStatus;
   const cause = status === 401 || status === 403
     ? `the credential lacks permission (HTTP ${status})`
@@ -1536,30 +2097,68 @@ function verdict(status: MulesoftFindingStatus, summary: string, evidence?: Json
   return { status, summary, evidence };
 }
 
+/** A fail resting on the absence of an item among the visible items of a truncated page; `evaluate` renders it manual. */
+function absenceVerdict(summary: string, evidence?: JsonRecord): Verdict {
+  return { status: "fail", summary, evidence, absenceClaim: true };
+}
+
+function isAbsenceValue(value: unknown): boolean {
+  if (value === 0) return true;
+  if (Array.isArray(value)) return value.length === 0;
+  if (value !== null && typeof value === "object") return Object.keys(value as object).length === 0;
+  return false;
+}
+
+/** Under a partial view, evidence values that assert absence (0, [], {}) render null because the unread items could hold the item. */
+function withoutAbsenceClaims(evidence: JsonRecord): JsonRecord {
+  return Object.fromEntries(Object.entries(evidence).map(([key, value]) => [key, isAbsenceValue(value) ? null : value]));
+}
+
+/** A count of the items of a paged list, unknown (null) unless the list was read to completion. */
+function completeCount(value: number, source: Collected<MulesoftPage>): number | null {
+  return sourceCollected(source) && !source.value.truncated ? value : null;
+}
+
 function evaluate(
   number: number,
   inputs: EvaluationInputs,
   evidenceToCollect: string,
   compute: () => Verdict,
 ): MulesoftFinding {
-  const primaryFailures = inputs.primary.filter((source) => source.error);
-  const secondaryFailures = (inputs.secondary ?? []).filter((source) => source.error);
+  const failures = [...inputs.primary, ...(inputs.secondary ?? [])].filter((source) => !sourceCollected(source));
+  // A read skipped because its parent failed is reported through the parent when both feed this finding.
+  const cascaded = (source: Collected<unknown>): boolean =>
+    source.skippedParent !== undefined && failures.some((failure) => failure.label === source.skippedParent);
+  const primaryFailures = inputs.primary.filter((source) => !sourceCollected(source) && !cascaded(source));
+  const secondaryFailures = (inputs.secondary ?? []).filter((source) => !sourceCollected(source) && !cascaded(source));
   const unreadableSources = [...primaryFailures, ...secondaryFailures].map(describeFailure);
   const partialView = (inputs.partial ?? []).filter((note): note is string => Boolean(note));
 
   if (primaryFailures.length > 0) {
+    // A list that was never read has no partial view to report; null says so where [] would claim a complete empty read.
     return finding(
       number,
       "manual",
       `Could not evaluate: ${primaryFailures.map(describeFailure).join("; ")}. ${evidenceToCollect}`,
-      { unreadable_sources: unreadableSources, partial_view: partialView },
+      { unreadable_sources: unreadableSources, partial_view: partialView.length > 0 ? partialView : null },
     );
   }
 
   const result = compute();
-  const evidence: JsonRecord = { ...(result.evidence ?? {}) };
+  // A fail resting on an absence among the visible items is a claim about the unread items under a partial view.
+  const absenceUnderPartialView = result.status === "fail" && result.absenceClaim === true && partialView.length > 0;
+  const evidence: JsonRecord = absenceUnderPartialView ? withoutAbsenceClaims(result.evidence ?? {}) : { ...(result.evidence ?? {}) };
   if (unreadableSources.length > 0) evidence.unreadable_sources = unreadableSources;
   if (partialView.length > 0) evidence.partial_view = partialView;
+
+  if (absenceUnderPartialView) {
+    return finding(
+      number,
+      "manual",
+      `${result.summary} Partial view: ${partialView.join("; ")}. The absence this verdict rests on cannot be asserted for the items that were not read, so the verdict is manual (unknown). ${evidenceToCollect}`,
+      evidence,
+    );
+  }
 
   if (secondaryFailures.length > 0) {
     const causes = secondaryFailures.map(describeFailure).join("; ");
@@ -1789,28 +2388,28 @@ export async function assessMulesoftIdentityAccess(
     const id = roleGroupId(roleGroup);
     const name = roleGroupName(roleGroup);
     if (!id) {
-      roleGroupDetails.push({ roleGroup, roles: { ...failedSource(`role_group_roles:${name}`, "role group has no id"), value: toPage([]) } });
+      roleGroupDetails.push({ roleGroup, roles: { ...failedSource(`role_group_roles (${name})`, "role group has no id"), value: toPage([]) } });
       continue;
     }
-    const roles = await collectPage(`role_group_roles:${name}`, () => client.listRoleGroupRoles(id), errors);
+    const roles = await collectPage(`role_group_roles (${name})`, () => client.listRoleGroupRoles(id), errors);
     const users = isOrgAdminRoleGroup(roleGroup, roles.value.items)
-      ? await collectPage(`role_group_users:${name}`, () => client.listRoleGroupUsers(id), errors)
+      ? await collectPage(`role_group_users (${name})`, () => client.listRoleGroupUsers(id), errors)
       : undefined;
     roleGroupDetails.push({ roleGroup, roles, users });
   }
-  const roleGroupRolesSource = mergeSources("role_group_roles", roleGroupDetails.map((detail) => detail.roles));
-  const adminUsersSource = mergeSources("role_group_users", roleGroupDetails.flatMap((detail) => (detail.users ? [detail.users] : [])));
+  const roleGroupRolesSource = mergeSources("role_group_roles", roleGroupDetails.map((detail) => detail.roles), roleGroups);
+  const adminUsersSource = mergeSources("role_group_users", roleGroupDetails.flatMap((detail) => (detail.users ? [detail.users] : [])), roleGroups);
 
   const connectedAppScopes: Array<{ app: JsonRecord; scopes: Collected<MulesoftPage> }> = [];
   for (const app of connectedApps.value.items) {
     const clientId = asString(app.client_id);
     const name = connectedAppName(app);
     const scopes = clientId
-      ? await collectPage(`connected_app_scopes:${name}`, () => client.listConnectedApplicationScopes(clientId), errors)
-      : { ...failedSource(`connected_app_scopes:${name}`, "connected app has no client_id"), value: toPage([]) };
+      ? await collectPage(`connected_app_scopes (${name})`, () => client.listConnectedApplicationScopes(clientId), errors)
+      : { ...failedSource(`connected_app_scopes (${name})`, "connected app has no client_id"), value: toPage([]) };
     connectedAppScopes.push({ app, scopes });
   }
-  const scopesSource = mergeSources("connected_app_scopes", connectedAppScopes.map((item) => item.scopes));
+  const scopesSource = mergeSources("connected_app_scopes", connectedAppScopes.map((item) => item.scopes), connectedApps);
 
   const providers = identityProviders.value.items;
   const providerSummaries = providers.map((provider) => ({
@@ -1896,7 +2495,7 @@ export async function assessMulesoftIdentityAccess(
   const findings: MulesoftFinding[] = [
     evaluate(
       1,
-      { primary: [identityProviders, organization], secondary: [identityProviderSettings], partial: [scopeNote] },
+      { primary: [identityProviders, organization], secondary: [identityProviderSettings], partial: [scopeNote, truncationNote("identity provider", identityProviders.value)] },
       "Export Access Management > Identity Providers (type and status) and the organization SSO settings as evidence.",
       () => {
         const evidence = {
@@ -1906,6 +2505,11 @@ export async function assessMulesoftIdentityAccess(
           allow_new_non_sso_users: allowNewNonSsoUsers ?? null,
         };
         if (providers.length === 0) {
+          // A truncated page with zero visible providers is an absence claim over the unread providers and renders
+          // manual (evaluate); a complete empty read fails, whatever the business-group scope of the credential.
+          if (identityProviders.value.truncated) {
+            return absenceVerdict("No external identity provider was among the visible providers (the identityProviders read was truncated before any provider was visible), so whether one is configured cannot be confirmed or ruled out from the visible items.", evidence);
+          }
           return verdict("fail", "No external identity provider is configured (the identityProviders read succeeded and returned zero providers); users authenticate with Anypoint Platform passwords. Zero providers is treated as fail.", evidence);
         }
         if (activeProviders.length === 0) {
@@ -1925,13 +2529,16 @@ export async function assessMulesoftIdentityAccess(
     ),
     evaluate(
       2,
-      { primary: [mfaExemptUsers], partial: [truncationNote("members", members.value), scopeNote] },
+      {
+        primary: [mfaExemptUsers],
+        partial: [truncationNote("MFA-exempt users", mfaExemptUsers.value), truncationNote("members", members.value), scopeNote],
+      },
       "Capture the Access Management > Organization > multi-factor authentication setting, or the external identity provider MFA policy, as evidence.",
       () => {
         const evidence = {
           mfa_exempt_users: sample(exemptFlagged.map(memberLabel)),
           users_returned_without_flag: sample(exemptUnflagged.map(memberLabel)),
-          members_sampled: members.value.items.length,
+          members_sampled: derived(members.value.items.length, members),
           is_federated: isFederated ?? null,
         };
         if (exemptFlagged.length > 0) {
@@ -1949,6 +2556,7 @@ export async function assessMulesoftIdentityAccess(
         primary: [roleGroups, roleGroupRolesSource, adminUsersSource],
         partial: [
           truncationNote("role groups", roleGroups.value),
+          truncatedRoleGroups.length > 0 ? `role assignments truncated for ${truncatedRoleGroups.join(", ")}` : undefined,
           adminUsersTruncated ? `admin role group membership truncated at ${adminUsers.size} users` : undefined,
           scopeNote,
         ],
@@ -1960,7 +2568,7 @@ export async function assessMulesoftIdentityAccess(
           admin_users: sample([...adminUsers.values()]),
           admin_user_count: adminUsers.size,
           max_admins: maxAdmins,
-          members_sampled: members.value.items.length,
+          members_sampled: derived(members.value.items.length, members),
         };
         if (roleGroupItems.length === 0) {
           return verdict("manual", "Zero role groups were returned even though the read succeeded; every organization has a built-in Organization Administrators group, so the credential sees a scoped-down view. Zero role groups is treated as manual.", evidence);
@@ -2110,7 +2718,7 @@ export async function assessMulesoftIdentityAccess(
           managed_apps_included: true,
           apps_with_usage_data: appsWithUsageDate.length,
           apps_without_usage_date: sample(appsWithoutUsageDate.map(connectedAppName)),
-          usage_data_source: "last_used, lastUsed, last_used_at, or usage.* on GET /organizations/{orgId}/connectedApplications?includeUsage=true; not part of the published schema, so absence is expected",
+          usage_data_source: "last_used, lastUsed, last_used_at, or usage.* on GET /organizations/{orgId}/connectedApplications with includeUsage=true; not part of the published schema, so absence is expected",
           stale_apps: sample(staleApps.map(connectedAppName)),
           disabled_apps: sample(disabledApps.map(connectedAppName)),
           stale_days: staleDays,
@@ -2157,39 +2765,66 @@ export async function assessMulesoftIdentityAccess(
   return {
     category: "identity_access",
     title: "MuleSoft identity and access posture",
+    // Counts derived from a list that was not read render null rather than the empty fallback's zero; the
+    // identity provider count is a bare count of the tenant's providers, unknown from a truncated page.
     summary: {
       organization_id: config.organizationId,
-      identity_providers: providers.length,
-      members_sampled: members.value.items.length,
-      members_truncated: members.value.truncated,
-      mfa_exempt_users: exemptFlagged.length,
-      organization_admins: adminUsers.size,
-      role_groups: roleGroupItems.length,
-      environments: environmentItems.length,
-      connected_apps: connectedAppItems.length,
-      stale_connected_apps: staleApps.length,
-      business_groups: subOrganizations.length,
+      identity_providers: completeCount(providers.length, identityProviders),
+      identity_providers_seen: derived(providers.length, identityProviders),
+      identity_providers_total: derived(identityProviders.value.total ?? null, identityProviders),
+      identity_providers_truncated: derived(identityProviders.value.truncated, identityProviders),
+      members_sampled: derived(members.value.items.length, members),
+      members_total: derived(members.value.total ?? null, members),
+      members_truncated: derived(members.value.truncated, members),
+      mfa_exempt_users: derived(exemptFlagged.length, mfaExemptUsers),
+      organization_admins: derived(adminUsers.size, roleGroups, roleGroupRolesSource, adminUsersSource),
+      role_groups: derived(roleGroupItems.length, roleGroups),
+      environments: derived(environmentItems.length, environments),
+      connected_apps: derived(connectedAppItems.length, connectedApps),
+      stale_connected_apps: derived(staleApps.length, connectedApps),
+      business_groups: derived(subOrganizations.length, hierarchy),
       unreadable_sources: errors.length,
+      inventories: describeSources(organization, hierarchy, identityProviders, identityProviderSettings, members, mfaExemptUsers, roleGroups, roleGroupRolesSource, adminUsersSource, environments, connectedApps, scopesSource),
     },
     findings,
     snapshots: {
-      organization: redactSnapshot(organization.value),
-      organization_hierarchy: redactSnapshot(hierarchy.value),
-      identity_providers: redactSnapshot(providers),
-      identity_provider_settings: redactSnapshot(identityProviderSettings.value),
-      members: redactSnapshot(members.value.items),
-      mfa_exempt_users: redactSnapshot(exemptReturned),
-      role_groups: redactSnapshot(roleGroupDetails.map((detail) => ({
+      organization: snapshotOf(organization, organization.value),
+      organization_hierarchy: snapshotOf(hierarchy, hierarchy.value),
+      identity_providers: snapshotOf(identityProviders, providers),
+      identity_provider_settings: snapshotOf(identityProviderSettings, identityProviderSettings.value),
+      members: snapshotOf(members, members.value.items),
+      mfa_exempt_users: snapshotOf(mfaExemptUsers, exemptReturned),
+      role_groups: snapshotOf(roleGroups, roleGroupDetails.map((detail) => ({
         role_group: detail.roleGroup,
-        roles: detail.roles.value.items,
-        roles_truncated: detail.roles.value.truncated,
-        users: detail.users?.value.items ?? [],
+        roles: sourceCollected(detail.roles) ? detail.roles.value.items : notCollectedMarker(detail.roles),
+        roles_truncated: derived(detail.roles.value.truncated, detail.roles),
+        users: detail.users === undefined ? null : sourceCollected(detail.users) ? detail.users.value.items : notCollectedMarker(detail.users),
       }))),
-      environments: redactSnapshot(environmentItems),
-      connected_applications: redactSnapshot(connectedAppScopes.map((item) => ({ ...item.app, scopes: item.scopes.value.items }))),
+      environments: snapshotOf(environments, environmentItems),
+      connected_applications: snapshotOf(connectedApps, connectedAppScopes.map((item) => ({
+        ...item.app,
+        scopes: sourceCollected(item.scopes) ? item.scopes.value.items : notCollectedMarker(item.scopes),
+      }))),
     },
     errors,
   };
+}
+
+/** One line per source stating whether it was read completely, partially, or not at all. */
+function describeSources(...sources: Array<Collected<unknown>>): Record<string, string> {
+  return Object.fromEntries(sources.map((source) => [source.label, describeSource(source)]));
+}
+
+function describeSource(source: Collected<unknown>): string {
+  if (source.skipped) return `not requested (${source.skipped})`;
+  if (source.error) return `unread (${source.error})`;
+  if (isPage(source.value)) {
+    return source.value.truncated
+      ? `partial (${source.value.items.length} of ${pageTotalLabel(source.value)})`
+      : `complete (${source.value.items.length} item${source.value.items.length === 1 ? "" : "s"})`;
+  }
+  if (Array.isArray(source.value)) return `complete (${source.value.length} item${source.value.length === 1 ? "" : "s"})`;
+  return "complete";
 }
 
 function policyAssetId(policy: JsonRecord): string {
@@ -2199,6 +2834,32 @@ function policyAssetId(policy: JsonRecord): string {
     ["implementationAsset", "assetId"],
     ["policyTemplateId"],
   ])) ?? "policy";
+}
+
+function projectPolicyAsset(asset: unknown): JsonRecord | null {
+  const record = asObject(asset);
+  if (!record) return null;
+  return {
+    groupId: asString(record.groupId) ?? null,
+    assetId: asString(record.assetId) ?? null,
+    assetVersion: asString(record.assetVersion) ?? asString(record.version) ?? null,
+  };
+}
+
+// configurationData carries the policy's own settings (JWT secrets, injected header values, client credentials),
+// so the snapshot keeps a marker in its place rather than the tree.
+function projectApiPolicy(policy: JsonRecord): JsonRecord {
+  return {
+    policyId: asString(policy.policyId) ?? asString(policy.id) ?? null,
+    assetId: asString(policy.assetId) ?? null,
+    assetVersion: asString(policy.assetVersion) ?? null,
+    policyTemplateId: asString(policy.policyTemplateId) ?? null,
+    template: projectPolicyAsset(policy.template),
+    implementationAsset: projectPolicyAsset(policy.implementationAsset),
+    disabled: asBoolean(policy.disabled) ?? null,
+    order: asNumber(policy.order) ?? null,
+    configurationData: policy.configurationData === undefined ? null : REDACTED,
+  };
 }
 
 type PolicyState = "enabled" | "disabled" | "unknown";
@@ -2289,7 +2950,7 @@ export async function assessMulesoftApiGateway(
     const environmentId = asString(environment.id);
     const label = environmentLabel(environment);
     if (!environmentId) {
-      apiSources.push({ ...failedSource(`managed_apis:${label}`, "environment has no id"), value: toPage([]) });
+      apiSources.push({ ...failedSource(`api_manager_apis (${label})`, "environment has no id"), value: toPage([]) });
       continue;
     }
     const remaining = apiLimit - apiRecords.length;
@@ -2297,20 +2958,20 @@ export async function assessMulesoftApiGateway(
       apiPartialNotes.push(`the API limit of ${apiLimit} was reached before sampling ${label}`);
       continue;
     }
-    const apis = await collectPage(`managed_apis:${label}`, () => client.listManagedApis(environmentId, remaining), errors);
+    const apis = await collectPage(`api_manager_apis (${label})`, () => client.listManagedApis(environmentId, remaining), errors);
     apiSources.push(apis);
     const note = truncationNote(`${label} API instance`, apis.value);
     if (note) apiPartialNotes.push(note);
     for (const api of apis.value.items) {
       const apiId = asString(api.id);
       const policies: Collected<JsonRecord[]> = apiId
-        ? await collect<JsonRecord[]>(`api_policies:${apiLabel(api)}`, [], () => client.listApiPolicies(environmentId, apiId), errors)
-        : { label: `api_policies:${apiLabel(api)}`, value: [], error: "API instance has no id" };
+        ? await collect<JsonRecord[]>(`api_policies (${apiLabel(api)})`, [], () => client.listApiPolicies(environmentId, apiId), errors)
+        : { label: `api_policies (${apiLabel(api)})`, value: [], error: "API instance has no id" };
       apiRecords.push({ environment, api, policies });
     }
   }
-  const apisSource = mergeSources("managed_apis", apiSources);
-  const policiesSource = mergeSources("api_policies", apiRecords.map((record) => record.policies));
+  const apisSource = mergeSources("api_manager_apis", apiSources, environments.source);
+  const policiesSource = mergeSources("api_policies", apiRecords.map((record) => record.policies), apisSource);
 
   const exchangeAssets = await collectPage("exchange_assets", () => client.listExchangeAssets(), errors);
   const organizationAssets = exchangeAssets.value.items.filter((asset) => {
@@ -2340,7 +3001,7 @@ export async function assessMulesoftApiGateway(
     primary: [environments.source, apisSource, policiesSource],
     partial: gatewayPartialNotes,
   };
-  const apiInventoryFailure = [environments.source, apisSource].find((source) => source.error);
+  const apiInventoryFailure = [environments.source, apisSource].find((source) => !sourceCollected(source));
 
   const findings: MulesoftFinding[] = [
     evaluate(
@@ -2377,9 +3038,9 @@ export async function assessMulesoftApiGateway(
         : `Anypoint Platform does not expose client secret rotation timestamps. Export the ${activeContracts} active contract(s) from API Manager > API instance > Contracts and the client applications from Exchange > My Applications, then confirm each client secret was reset within the rotation period.`,
       {
         active_contracts: apiInventoryFailure ? null : activeContracts,
-        apis_sampled: apiRecords.length,
+        apis_sampled: apiInventoryFailure ? null : apiRecords.length,
         unreadable_sources: apiInventoryFailure ? [describeFailure(apiInventoryFailure)] : [],
-        partial_view: gatewayPartialNotes.filter((note): note is string => Boolean(note)),
+        partial_view: partialViewOf(gatewayPartialNotes, environments.source, apisSource),
       },
     ),
     evaluate(
@@ -2407,30 +3068,32 @@ export async function assessMulesoftApiGateway(
   return {
     category: "api_gateway",
     title: "MuleSoft API gateway and Exchange posture",
+    // Counts derived from a list that was not read render null rather than the empty fallback's zero.
     summary: {
       organization_id: config.organizationId,
-      environments_visible: environments.all.length,
-      environments_sampled: environments.sampled.length,
-      apis_sampled: apiRecords.length,
-      production_apis: productionApis.length,
-      production_without_authentication: productionWithoutAuth.length,
-      production_without_rate_limiting: productionWithoutRateLimit.length,
-      active_contracts: activeContracts,
-      exchange_assets: organizationAssets.length,
-      public_exchange_assets: publicAssets.length,
-      partial_view: gatewayPartialNotes.filter((note): note is string => Boolean(note)),
+      environments_visible: derived(environments.all.length, environments.source),
+      environments_sampled: derived(environments.sampled.length, environments.source),
+      apis_sampled: derived(apiRecords.length, environments.source, apisSource),
+      production_apis: derived(productionApis.length, environments.source, apisSource),
+      production_without_authentication: derived(productionWithoutAuth.length, environments.source, apisSource, policiesSource),
+      production_without_rate_limiting: derived(productionWithoutRateLimit.length, environments.source, apisSource, policiesSource),
+      active_contracts: derived(activeContracts, environments.source, apisSource),
+      exchange_assets: derived(organizationAssets.length, exchangeAssets),
+      public_exchange_assets: derived(publicAssets.length, exchangeAssets),
+      partial_view: partialViewOf(gatewayPartialNotes, environments.source, apisSource, policiesSource, exchangeAssets),
       unreadable_sources: errors.length,
+      inventories: describeSources(environments.source, apisSource, policiesSource, exchangeAssets),
     },
     findings,
     snapshots: {
-      api_manager_apis: redactSnapshot(apiRecords.map((record) => ({
+      api_manager_apis: snapshotOf(apisSource, apiRecords.map((record) => ({
         environment: environmentLabel(record.environment),
         environment_id: asString(record.environment.id),
         api: record.api,
-        policies: record.policies.value,
+        policies: sourceCollected(record.policies) ? record.policies.value.map(projectApiPolicy) : notCollectedMarker(record.policies),
         policies_error: record.policies.error ?? null,
-      }))),
-      exchange_assets: redactSnapshot(organizationAssets),
+      })), apiSources),
+      exchange_assets: snapshotOf(exchangeAssets, organizationAssets),
     },
     errors,
   };
@@ -2480,6 +3143,46 @@ function insecureSensitiveProperties(application: JsonRecord): string[] {
       return !secure && !masked;
     })
     .map(([key]) => key);
+}
+
+// The snapshot keeps only what the runtime verdicts read. Property values are never copied, since CloudHub returns
+// plaintext values for every property that is not marked secure.
+function projectCloudhubApplication(application: JsonRecord): JsonRecord {
+  const properties = asObject(application.properties);
+  const propertyOptions = asObject(application.propertiesOptions) ?? {};
+  const workers = asObject(application.workers);
+  const workerType = asObject(workers?.type);
+  const version = asObject(application.muleVersion);
+  return {
+    id: asString(application.id) ?? null,
+    domain: asString(application.domain) ?? null,
+    name: asString(application.name) ?? null,
+    status: asString(application.status) ?? null,
+    region: asString(application.region) ?? null,
+    muleVersion: version
+      ? {
+        version: asString(version.version) ?? null,
+        endOfSupportDate: asString(version.endOfSupportDate) ?? null,
+        endOfLifeDate: asString(version.endOfLifeDate) ?? null,
+      }
+      : asString(application.muleVersion) ?? null,
+    runtimeVersion: asString(application.runtimeVersion) ?? null,
+    workers: workers
+      ? {
+        amount: asNumber(workers.amount) ?? null,
+        type: workerType ? { name: asString(workerType.name) ?? null, weight: asNumber(workerType.weight) ?? null } : null,
+        recentStatistics: { cpu: workerCpu(application) ?? null },
+      }
+      : null,
+    persistentQueues: asBoolean(application.persistentQueues) ?? null,
+    persistentQueuesEncrypted: asBoolean(application.persistentQueuesEncrypted) ?? null,
+    persistentQueuesEncryptionEnabled: asBoolean(application.persistentQueuesEncryptionEnabled) ?? null,
+    properties: properties ? Object.fromEntries(Object.keys(properties).map((key) => [key, REDACTED])) : null,
+    securePropertyKeys: properties
+      ? Object.keys(properties).filter((key) => asBoolean(getNestedValue(propertyOptions, [key, "secure"])) === true)
+      : null,
+    insecureSensitiveProperties: insecureSensitiveProperties(application),
+  };
 }
 
 function cidrPrefixLength(cidr: string): number | undefined {
@@ -2635,10 +3338,10 @@ export async function assessMulesoftRuntimeInfrastructure(
     const environmentId = asString(environment.id);
     const label = environmentLabel(environment);
     if (!environmentId) {
-      applicationSources.push({ label: `cloudhub_applications:${label}`, value: [], error: "environment has no id" });
+      applicationSources.push({ label: `cloudhub_applications (${label})`, value: [], error: "environment has no id" });
       continue;
     }
-    const environmentApplications = await collect<JsonRecord[]>(`cloudhub_applications:${label}`, [], () => client.listCloudhubApplications(environmentId), errors);
+    const environmentApplications = await collect<JsonRecord[]>(`cloudhub_applications (${label})`, [], () => client.listCloudhubApplications(environmentId), errors);
     applicationSources.push(environmentApplications);
     for (const application of environmentApplications.value) {
       if (applications.length >= applicationLimit) {
@@ -2648,38 +3351,38 @@ export async function assessMulesoftRuntimeInfrastructure(
       applications.push({ environment, application });
     }
 
-    const environmentServers = await collect<JsonRecord[]>(`hybrid_servers:${label}`, [], () => client.listHybridServers(environmentId), errors);
+    const environmentServers = await collect<JsonRecord[]>(`hybrid_servers (${label})`, [], () => client.listHybridServers(environmentId), errors);
     serverSources.push(environmentServers);
     servers.push(...environmentServers.value.map((server) => ({ environment, server })));
 
-    const regions = await collect<JsonRecord[]>(`mq_regions:${label}`, [], () => client.listMqRegions(environmentId), errors);
+    const regions = await collect<JsonRecord[]>(`mq_regions (${label})`, [], () => client.listMqRegions(environmentId), errors);
     mqRegionSources.push(regions);
     for (const region of regions.value) {
       const regionId = asString(region.regionId) ?? asString(region.id);
       if (!regionId) {
-        mqQueueSources.push({ label: `mq_queues:${label}`, value: [], error: "MQ region has no id" });
+        mqQueueSources.push({ label: `mq_queues (${label})`, value: [], error: "MQ region has no id" });
         continue;
       }
-      const queues = await collect<JsonRecord[]>(`mq_queues:${label}:${regionId}`, [], () => client.listMqQueues(environmentId, regionId), errors);
+      const queues = await collect<JsonRecord[]>(`mq_queues (${label}, ${regionId})`, [], () => client.listMqQueues(environmentId, regionId), errors);
       mqQueueSources.push(queues);
       mqInventory.push({ environment: label, region: regionId, queues: queues.value });
     }
     if (regions.value.length > 0) {
-      const clients = await collect<JsonRecord[]>(`mq_clients:${label}`, [], () => client.listMqClients(environmentId), errors);
+      const clients = await collect<JsonRecord[]>(`mq_clients (${label})`, [], () => client.listMqClients(environmentId), errors);
       mqClientSources.push(clients);
       mqClients.push({ environment: label, clients: clients.value });
     }
 
-    const secretGroups = await collect<JsonRecord[]>(`secret_groups:${label}`, [], () => client.listSecretGroups(environmentId), errors);
+    const secretGroups = await collect<JsonRecord[]>(`secret_groups (${label})`, [], () => client.listSecretGroups(environmentId), errors);
     secretGroupSources.push(secretGroups);
     secretGroupsByEnvironment.push({ environment, secretGroups: secretGroups.value });
   }
-  const applicationsSource = mergeSources("cloudhub_applications", applicationSources);
-  const serversSource = mergeSources("hybrid_servers", serverSources);
-  const mqRegionsSource = mergeSources("mq_regions", mqRegionSources);
-  const mqQueuesSource = mergeSources("mq_queues", mqQueueSources);
-  const mqClientsSource = mergeSources("mq_clients", mqClientSources);
-  const secretGroupsSource = mergeSources("secret_groups", secretGroupSources);
+  const applicationsSource = mergeSources("cloudhub_applications", applicationSources, environments.source);
+  const serversSource = mergeSources("hybrid_servers", serverSources, environments.source);
+  const mqRegionsSource = mergeSources("mq_regions", mqRegionSources, environments.source);
+  const mqQueuesSource = mergeSources("mq_queues", mqQueueSources, mqRegionsSource);
+  const mqClientsSource = mergeSources("mq_clients", mqClientSources, mqRegionsSource);
+  const secretGroupsSource = mergeSources("secret_groups", secretGroupSources, environments.source);
 
   const vpcSummaries = await collectPage("vpcs", () => client.listVpcs(DEFAULT_VPC_LIMIT), errors);
   const vpcPage = capPage(vpcSummaries.value, DEFAULT_VPC_LIMIT);
@@ -2689,12 +3392,12 @@ export async function assessMulesoftRuntimeInfrastructure(
     const vpcId = asString(vpc.id);
     const vpcName = asString(vpc.name) ?? vpcId ?? "vpc";
     const detail: Collected<JsonRecord> = vpcId
-      ? await collect<JsonRecord>(`vpc:${vpcName}`, {}, () => client.getVpc(vpcId), errors)
-      : { label: `vpc:${vpcName}`, value: {}, error: "VPC has no id" };
+      ? await collect<JsonRecord>(`vpc (${vpcName})`, {}, () => client.getVpc(vpcId), errors)
+      : { label: `vpc (${vpcName})`, value: {}, error: "VPC has no id" };
     vpcDetails.push(detail);
     vpcs.push({ ...vpc, ...detail.value });
   }
-  const vpcDetailsSource = mergeSources("vpc_details", vpcDetails);
+  const vpcDetailsSource = mergeSources("vpc_details", vpcDetails, vpcSummaries);
   const vpcPartialNote = truncationNote("VPC", vpcPage);
   const vpcsWithoutRules = vpcs.filter((vpc) => !Array.isArray(vpc.firewallRules));
 
@@ -2709,12 +3412,21 @@ export async function assessMulesoftRuntimeInfrastructure(
       loadBalancers.push(summary);
       continue;
     }
-    const detail = await collect<JsonRecord>(`load_balancer:${loadBalancerLabel(summary)}`, {}, () => client.getLoadBalancer(vpcId, loadBalancerId), errors);
+    const detail = await collect<JsonRecord>(`load_balancer (${loadBalancerLabel(summary)})`, {}, () => client.getLoadBalancer(vpcId, loadBalancerId), errors);
     loadBalancerDetails.push(detail);
     loadBalancers.push({ ...summary, ...detail.value });
   }
-  const loadBalancerDetailsSource = mergeSources("load_balancer_details", loadBalancerDetails);
+  const loadBalancerDetailsSource = mergeSources("load_balancer_details", loadBalancerDetails, loadBalancerSource);
   const loadBalancerPartialNote = truncationNote("load balancer", loadBalancerPage);
+  // Certificate probes read sslEndpoints from the merged record, so a failed detail read leaves endpoints unprobed.
+  const loadBalancerDetailNote = loadBalancerDetailsSource.error
+    ? `${describeFailure(loadBalancerDetailsSource)}, so SSL endpoints carried only by the detail record were not probed`
+    : undefined;
+  // The probes are scoped by the load balancer list: when that list was not read, no probe was requested,
+  // and the certificates snapshot is a not-requested marker naming the parent rather than an empty list.
+  const certificateSource: Collected<undefined> = sourceCollected(loadBalancerSource)
+    ? readySource("load_balancer_certificates")
+    : skippedSource("load_balancer_certificates", loadBalancerSource, undefined);
   const certificateProbes: CertificateProbeRecord[] = [];
   for (const loadBalancer of loadBalancers) {
     const host = asString(loadBalancer.domain);
@@ -2724,11 +3436,11 @@ export async function assessMulesoftRuntimeInfrastructure(
     }
     for (const target of certificateProbeTargets(loadBalancer, host)) {
       try {
-        const certificate = await client.probeCertificate(host, target.servername);
+        const certificate = scrubDataStrings(await client.probeCertificate(host, target.servername));
         certificateProbes.push({ loadBalancer, sslEndpoint: target.label, servername: target.servername, certificate });
       } catch (error) {
         const message = errorMessage(error);
-        errors.push(`certificate_probe:${host}${target.servername === host ? "" : `:${target.servername}`}: ${message}`);
+        errors.push(`certificate_probe (${host}${target.servername === host ? "" : `, ${target.servername}`}): ${message}`);
         certificateProbes.push({ loadBalancer, sslEndpoint: target.label, servername: target.servername, error: message });
       }
     }
@@ -2837,7 +3549,7 @@ export async function assessMulesoftRuntimeInfrastructure(
   const applicationInputs: EvaluationInputs = { primary: [environments.source, applicationsSource], partial: applicationPartialNotes };
   const vpcInputs: EvaluationInputs = { primary: [vpcSummaries, vpcDetailsSource], partial: [vpcPartialNote, scope.note] };
   const loadBalancerTlsInputs: EvaluationInputs = { primary: [loadBalancerSource, loadBalancerDetailsSource], partial: [loadBalancerPartialNote, scope.note] };
-  const loadBalancerInputs: EvaluationInputs = { primary: [loadBalancerSource], partial: [loadBalancerPartialNote, scope.note] };
+  const loadBalancerInputs: EvaluationInputs = { primary: [loadBalancerSource], partial: [loadBalancerPartialNote, loadBalancerDetailNote, scope.note] };
   const zeroApplicationsSummary = `Zero CloudHub 1.0 applications were visible in ${environments.sampled.length} sampled environment(s). Zero applications is treated as manual: this tool inventories CloudHub 1.0 only, so if workloads run on CloudHub 2.0, Runtime Fabric, or hybrid servers, export their configuration from Runtime Manager.`;
   const noVpcSummary = "Zero CloudHub VPCs are visible, which is treated as manual. If applications run in CloudHub 2.0 private spaces or Runtime Fabric, export the private space firewall rules or cluster network policy from Runtime Manager as evidence.";
   const noLoadBalancerSummary = "No dedicated load balancers exist, so this control is not applicable and is recorded as manual: confirm whether applications are exposed through the shared load balancer or CloudHub 2.0 ingress, whose TLS configuration MuleSoft manages.";
@@ -3024,7 +3736,7 @@ export async function assessMulesoftRuntimeInfrastructure(
           load_balancers: loadBalancers.length,
           fail_days: DEFAULT_CERTIFICATE_FAIL_DAYS,
           warning_days: certificateWarningDays,
-          probe_note: "The TLS probe connects with rejectUnauthorized=false so untrusted chains can still be read; authorized and authorization_error record whether each chain validated against the auditor's trust store.",
+          probe_note: "The TLS probe connects with rejectUnauthorized set to false so untrusted chains can still be read; authorized and authorization_error record whether each chain validated against the auditor's trust store.",
         };
         if (loadBalancers.length === 0) return verdict("manual", noLoadBalancerSummary, evidence);
         if (expiringCertificates.length > 0) {
@@ -3055,7 +3767,8 @@ export async function assessMulesoftRuntimeInfrastructure(
           environments_with_mq: [...new Set(mqInventory.map((item) => item.environment))],
           queues: allQueues.length,
           unencrypted_queues: sample(unencryptedQueues.map((item) => `${item.environment}/${item.region}: ${asString(item.queue.queueId) ?? "queue"}`)),
-          mq_clients: mqClients.map((item) => ({ environment: item.environment, clients: item.clients.length })),
+          // mqClientSources[index] is the read that produced mqClients[index]; an unread environment renders null, not 0.
+          mq_clients: mqClients.map((item, index) => ({ environment: item.environment, clients: derived(item.clients.length, mqClientSources[index]) })),
         };
         if (mqInventory.length === 0) {
           return verdict("manual", `Anypoint MQ returned zero regions in ${environments.sampled.length} sampled environment(s), so this control is not applicable and is recorded as manual: confirm in Anypoint MQ that no queues or client apps exist.`, evidence);
@@ -3063,7 +3776,8 @@ export async function assessMulesoftRuntimeInfrastructure(
         if (unencryptedQueues.length > 0) {
           return verdict("warn", `${unencryptedQueues.length}/${allQueues.length} Anypoint MQ queue(s) are not encrypted; MQ client apps are environment-scoped by design, so also confirm credentials are not shared across environments.`, evidence);
         }
-        return verdict("manual", `${allQueues.length} queue(s) and ${totalMqClients} MQ client app(s) inventoried per environment. Confirm MQ client app credentials are not reused across environments and MQ roles are environment-scoped in Access Management.`, evidence);
+        const mqClientCount = mqClientSources.every(sourceCollected) ? `${totalMqClients}` : "an unread number of";
+        return verdict("manual", `${allQueues.length} queue(s) and ${mqClientCount} MQ client app(s) inventoried per environment. Confirm MQ client app credentials are not reused across environments and MQ roles are environment-scoped in Access Management.`, evidence);
       },
     ),
     evaluate(
@@ -3124,39 +3838,44 @@ export async function assessMulesoftRuntimeInfrastructure(
   return {
     category: "runtime_infrastructure",
     title: "MuleSoft runtime and infrastructure posture",
+    // Counts derived from a list that was not read render null rather than the empty fallback's zero.
     summary: {
       organization_id: config.organizationId,
-      environments_visible: environments.all.length,
-      environments_sampled: environments.sampled.length,
-      cloudhub_applications: applicationRecords.length,
-      applications_not_inspected: applicationsDropped,
-      unsupported_runtime_applications: unsupportedRuntime.length,
-      vpcs: vpcs.length,
-      firewall_rules: firewallRules.length,
-      load_balancers: loadBalancers.length,
-      hybrid_servers: servers.length,
-      mq_queues: allQueues.length,
-      secret_groups: totalSecretGroups,
-      partial_view: [...applicationPartialNotes, vpcPartialNote, loadBalancerPartialNote].filter((note): note is string => Boolean(note)),
+      environments_visible: derived(environments.all.length, environments.source),
+      environments_sampled: derived(environments.sampled.length, environments.source),
+      cloudhub_applications: derived(applicationRecords.length, environments.source, applicationsSource),
+      applications_not_inspected: derived(applicationsDropped, environments.source, applicationsSource),
+      unsupported_runtime_applications: derived(unsupportedRuntime.length, environments.source, applicationsSource),
+      vpcs: derived(vpcs.length, vpcSummaries),
+      firewall_rules: derived(firewallRules.length, vpcSummaries, vpcDetailsSource),
+      load_balancers: derived(loadBalancers.length, loadBalancerSource),
+      hybrid_servers: derived(servers.length, environments.source, serversSource),
+      mq_queues: derived(allQueues.length, environments.source, mqRegionsSource, mqQueuesSource),
+      secret_groups: derived(totalSecretGroups, environments.source, secretGroupsSource),
+      partial_view: partialViewOf(
+        [...applicationPartialNotes, vpcPartialNote, loadBalancerPartialNote],
+        environments.source, applicationsSource, serversSource, mqRegionsSource, mqQueuesSource, mqClientsSource, secretGroupsSource, vpcSummaries, vpcDetailsSource, loadBalancerSource, loadBalancerDetailsSource,
+      ),
       unreadable_sources: errors.length,
+      inventories: describeSources(environments.source, applicationsSource, serversSource, mqRegionsSource, mqQueuesSource, mqClientsSource, secretGroupsSource, vpcSummaries, vpcDetailsSource, loadBalancerSource, loadBalancerDetailsSource),
     },
     findings,
     snapshots: {
-      cloudhub_applications: redactSnapshot(applications.map((item) => ({
+      cloudhub_applications: snapshotOf(applicationsSource, applications.map((item) => ({
         environment: environmentLabel(item.environment),
         environment_id: asString(item.environment.id),
-        application: item.application,
-      }))),
-      vpcs: redactSnapshot(vpcs),
-      load_balancers: redactSnapshot(loadBalancers),
-      load_balancer_certificates: certificateResults,
-      hybrid_servers: redactSnapshot(servers.map((item) => ({ environment: environmentLabel(item.environment), server: item.server }))),
-      mq_queues: redactSnapshot(mqInventory),
-      mq_clients: redactSnapshot(mqClients),
-      secret_groups: redactSnapshot(secretGroupsByEnvironment.map((item) => ({
+        application: projectCloudhubApplication(item.application),
+      })), applicationSources),
+      vpcs: snapshotOf(vpcSummaries, vpcs),
+      load_balancers: snapshotOf(loadBalancerSource, loadBalancers),
+      load_balancer_certificates: sourceCollected(certificateSource) ? certificateResults : notCollectedMarker(certificateSource),
+      hybrid_servers: snapshotOf(serversSource, servers.map((item) => ({ environment: environmentLabel(item.environment), server: item.server })), serverSources),
+      mq_queues: snapshotOf(mqQueuesSource, mqInventory, mqQueueSources),
+      mq_clients: snapshotOf(mqClientsSource, mqClients, mqClientSources),
+      secret_groups: snapshotOf(secretGroupsSource, secretGroupsByEnvironment.map((item) => ({
         environment: environmentLabel(item.environment),
         secret_groups: item.secretGroups,
-      }))),
+      })), secretGroupSources),
     },
     errors,
   };
@@ -3273,7 +3992,8 @@ export async function assessMulesoftAuditMonitoring(
   const recentQuery = await collect<JsonRecord>("audit_query", {}, () => client.queryAuditLogs({ startDate, endDate, limit: AUDIT_QUERY_PAGE_LIMIT }), errors);
   const recentEntries = extractCollection(recentQuery.value);
   const recentTotal = asNumber(recentQuery.value.total);
-  const fallbackQuery: Collected<JsonRecord> = !recentQuery.error && recentEntries.length === 0
+  const fallbackRequested = !recentQuery.error && recentEntries.length === 0;
+  const fallbackQuery: Collected<JsonRecord> = fallbackRequested
     ? await collect<JsonRecord>("audit_query_fallback", {}, () => client.queryAuditLogs({
       startDate: new Date(now - AUDIT_FALLBACK_LOOKBACK_DAYS * DAY_MS).toISOString(),
       endDate,
@@ -3290,7 +4010,7 @@ export async function assessMulesoftAuditMonitoring(
     const environmentId = asString(environment.id);
     const label = environmentLabel(environment);
     if (!environmentId) {
-      const missing = { label: `alerts:${label}`, value: [] as JsonRecord[], error: "environment has no id" };
+      const missing = { label: `alerts (${label})`, value: [] as JsonRecord[], error: "environment has no id" };
       alertCoverage.push({
         environment: label,
         cloudhubAlerts: missing,
@@ -3303,9 +4023,9 @@ export async function assessMulesoftAuditMonitoring(
       });
       continue;
     }
-    const cloudhubAlerts = await collect<JsonRecord[]>(`cloudhub_alerts:${label}`, [], () => client.listCloudhubAlerts(environmentId), errors);
-    const hybridAlerts = await collect<JsonRecord[]>(`hybrid_alerts:${label}`, [], () => client.listHybridAlerts(environmentId), errors);
-    const applications = await collect<JsonRecord[]>(`cloudhub_applications:${label}`, [], () => client.listCloudhubApplications(environmentId), errors);
+    const cloudhubAlerts = await collect<JsonRecord[]>(`cloudhub_alerts (${label})`, [], () => client.listCloudhubAlerts(environmentId), errors);
+    const hybridAlerts = await collect<JsonRecord[]>(`hybrid_alerts (${label})`, [], () => client.listHybridAlerts(environmentId), errors);
+    const applications = await collect<JsonRecord[]>(`cloudhub_applications (${label})`, [], () => client.listCloudhubApplications(environmentId), errors);
     const allAlerts = [...cloudhubAlerts.value, ...hybridAlerts.value];
     const enabledAlerts = allAlerts.filter((alert) => alertState(alert) === "enabled");
     const unknownStateAlerts = allAlerts.filter((alert) => alertState(alert) === "unknown");
@@ -3327,8 +4047,9 @@ export async function assessMulesoftAuditMonitoring(
       unknownCoverageApplications,
     });
   }
-  const alertsSource = mergeSources("alerts", alertCoverage.flatMap((item) => [item.cloudhubAlerts, item.hybridAlerts]));
-  const applicationsSource = mergeSources("cloudhub_applications", alertCoverage.map((item) => item.applications));
+  const alertReads = alertCoverage.flatMap((item) => [item.cloudhubAlerts, item.hybridAlerts]);
+  const alertsSource = mergeSources("alerts", alertReads, environments.source);
+  const applicationsSource = mergeSources("cloudhub_applications", alertCoverage.map((item) => item.applications), environments.source);
 
   const environmentsWithoutAlerts = alertCoverage.filter((item) => item.enabledAlerts.length === 0 && item.unknownStateAlerts.length === 0);
   const environmentsWithOnlyUnknownAlerts = alertCoverage.filter((item) => item.enabledAlerts.length === 0 && item.unknownStateAlerts.length > 0);
@@ -3349,13 +4070,13 @@ export async function assessMulesoftAuditMonitoring(
           lookback_hours: lookbackHours,
           entries_in_window: entriesInWindow,
           entries_fetched: recentEntries.length,
-          entries_in_fallback_window: fallbackEntries.length,
+          entries_in_fallback_window: fallbackRequested ? fallbackEntries.length : null,
           fallback_lookback_days: AUDIT_FALLBACK_LOOKBACK_DAYS,
-          platforms: platforms.value.map((platform) => asString(platform.name) ?? asString(platform.label) ?? "platform"),
+          platforms: derived(platforms.value.map((platform) => asString(platform.name) ?? asString(platform.label) ?? "platform"), platforms),
           platforms_error: platforms.error ?? null,
           retention_period_days: retention.currentPeriodDays,
-          retention_scheduled_change: retention.scheduledChange,
-          retention_entries: retention.entries,
+          retention_scheduled_change: derived(retention.scheduledChange, retentionSettings),
+          retention_entries: derived(retention.entries, retentionSettings),
           retention_settings_error: retentionSettings.error ?? null,
           retention_settings_source: "GET /audit/v2/organizations/{orgId}/retentionSettings; evidence only, the verdict does not depend on it",
           recent_entries: sample(recentEntries.map(auditEntrySummary), 10),
@@ -3363,7 +4084,10 @@ export async function assessMulesoftAuditMonitoring(
         const retentionNote = auditRetentionNote(retention, retentionSettings);
         if (recentEntries.length > 0) {
           const fetchedNote = entriesInWindow > recentEntries.length ? ` (${recentEntries.length} fetched)` : "";
-          return verdict("pass", `${entriesInWindow} audit log entr${entriesInWindow === 1 ? "y" : "ies"} recorded within the last ${lookbackHours} hours${fetchedNote} across ${platforms.value.length} platform(s).${retentionNote}`, evidence);
+          const platformsNote = platforms.error
+            ? `; the audit platform list is unknown because ${describeFailure(platforms)}.`
+            : ` across ${platforms.value.length} platform(s).`;
+          return verdict("pass", `${entriesInWindow} audit log entr${entriesInWindow === 1 ? "y" : "ies"} recorded within the last ${lookbackHours} hours${fetchedNote}${platformsNote}${retentionNote}`, evidence);
         }
         if (fallbackEntries.length > 0) {
           return verdict("warn", `Audit logging is queryable but no entries were recorded in the last ${lookbackHours} hours; the most recent activity is older than that window.${retentionNote}`, evidence);
@@ -3379,13 +4103,13 @@ export async function assessMulesoftAuditMonitoring(
         const evidence = {
           production_environments: alertCoverage.map((item) => ({
             environment: item.environment,
-            cloudhub_alerts: item.cloudhubAlerts.value.length,
-            runtime_manager_alerts: item.hybridAlerts.value.length,
-            enabled_alerts: item.enabledAlerts.length,
-            unknown_state_alerts: item.unknownStateAlerts.length,
-            applications: item.applications.value.length,
-            uncovered_applications: sample(item.uncoveredApplications),
-            unknown_coverage_applications: sample(item.unknownCoverageApplications),
+            cloudhub_alerts: derived(item.cloudhubAlerts.value.length, item.cloudhubAlerts),
+            runtime_manager_alerts: derived(item.hybridAlerts.value.length, item.hybridAlerts),
+            enabled_alerts: derived(item.enabledAlerts.length, item.cloudhubAlerts, item.hybridAlerts),
+            unknown_state_alerts: derived(item.unknownStateAlerts.length, item.cloudhubAlerts, item.hybridAlerts),
+            applications: derived(item.applications.value.length, item.applications),
+            uncovered_applications: derived(sample(item.uncoveredApplications), item.applications, item.cloudhubAlerts, item.hybridAlerts),
+            unknown_coverage_applications: derived(sample(item.unknownCoverageApplications), item.applications, item.cloudhubAlerts, item.hybridAlerts),
           })),
           environments_without_alerts: environmentsWithoutAlerts.map((item) => item.environment),
           production_environments_sampled: productionSampleNote(environments),
@@ -3416,30 +4140,34 @@ export async function assessMulesoftAuditMonitoring(
   return {
     category: "audit_monitoring",
     title: "MuleSoft audit logging and monitoring posture",
+    // Counts derived from a list that was not read render null rather than the empty fallback's zero.
     summary: {
       organization_id: config.organizationId,
-      audit_platforms: platforms.value.length,
-      audit_entries_in_window: recentTotal ?? recentEntries.length,
+      audit_platforms: derived(platforms.value.length, platforms),
+      audit_entries_in_window: derived(recentTotal ?? recentEntries.length, recentQuery),
       audit_lookback_hours: lookbackHours,
-      audit_retention_period_days: retention.currentPeriodDays,
-      environments_visible: environments.all.length,
-      production_environments: productionEnvironments.length,
-      production_applications: totalProductionApplications,
-      enabled_alerts: totalEnabledAlerts,
-      uncovered_production_applications: uncoveredApplications.length,
-      partial_view: environmentPartialNotes.filter((note): note is string => Boolean(note)),
+      audit_retention_period_days: derived(retention.currentPeriodDays, retentionSettings),
+      environments_visible: derived(environments.all.length, environments.source),
+      environments_total: derived(environments.source.value.total ?? null, environments.source),
+      environments_truncated: derived(environments.source.value.truncated, environments.source),
+      production_environments: derived(productionEnvironments.length, environments.source),
+      production_applications: derived(totalProductionApplications, environments.source, applicationsSource),
+      enabled_alerts: derived(totalEnabledAlerts, environments.source, alertsSource),
+      uncovered_production_applications: derived(uncoveredApplications.length, environments.source, applicationsSource, alertsSource),
+      partial_view: partialViewOf(environmentPartialNotes, platforms, retentionSettings, recentQuery, environments.source, alertsSource, applicationsSource),
       unreadable_sources: errors.length,
+      inventories: describeSources(platforms, retentionSettings, recentQuery, environments.source, alertsSource, applicationsSource),
     },
     findings,
     snapshots: {
-      audit_platforms: redactSnapshot(platforms.value),
-      audit_retention_settings: redactSnapshot(retentionSettings.value),
-      audit_log_recent: redactSnapshot(recentEntries),
-      alerts: redactSnapshot(alertCoverage.map((item) => ({
+      audit_platforms: snapshotOf(platforms, platforms.value),
+      audit_retention_settings: snapshotOf(retentionSettings, retentionSettings.value),
+      audit_log_recent: snapshotOf(recentQuery, recentEntries.map(auditEntrySummary)),
+      alerts: snapshotOf(alertsSource, alertCoverage.map((item) => ({
         environment: item.environment,
-        cloudhub_alerts: item.cloudhubAlerts.value,
-        runtime_manager_alerts: item.hybridAlerts.value,
-      }))),
+        cloudhub_alerts: sourceCollected(item.cloudhubAlerts) ? item.cloudhubAlerts.value : notCollectedMarker(item.cloudhubAlerts),
+        runtime_manager_alerts: sourceCollected(item.hybridAlerts) ? item.hybridAlerts.value : notCollectedMarker(item.hybridAlerts),
+      })), alertReads),
     },
     errors,
   };
@@ -3496,7 +4224,7 @@ export async function checkMulesoftAccess(client: AccessClient): Promise<Mulesof
     endpoint: "/accounts/api/me",
     permission: "Any authenticated principal (profile scope)",
     load: async () => {
-      currentUser = await client.getCurrentUser();
+      currentUser = scrubDataStrings(await client.getCurrentUser());
       return currentUser;
     },
     count: () => 1,
@@ -3783,8 +4511,9 @@ function buildQuickReference(): string {
   return [
     "# MuleSoft Audit Bundle Quick Reference",
     "",
-    "- `core_data/` contains raw Anypoint Platform API responses used during this assessment, with secret-bearing fields redacted.",
-    "- `analysis/findings.json` contains every normalized finding; `analysis/<category>.json` contains each assessment with its summary.",
+    "- `core_data/` contains the Anypoint Platform API responses used during this assessment, with secret-bearing fields redacted and URL-valued fields reduced to scheme and host; CloudHub application properties, API policy configuration, and audit log entries are projected to the fields the verdicts read.",
+    "- A dataset that was denied, errored, or never requested (because the list it depends on failed) is written as `{ collected: false, dataset, status, endpoint, error }` instead of an empty list, so `[]` always means a readable list with no items; a dataset assembled from several reads of which some failed is written as `{ collected: \"partial\", failed_reads, items }`.",
+    "- `analysis/findings.json` contains every normalized finding; `analysis/<category>.json` contains each assessment with its summary and an `inventories` map stating each source as complete, partial, unread, or not requested; counts derived from an unread or unrequested source render null rather than zero.",
     "- `analysis/summary.json` contains per-category status counts.",
     "- `compliance/` contains the executive summary, the unified matrix, and one report per framework (FedRAMP, CMMC, SOC 2, CIS, PCI-DSS, DISA STIG, IRAP, ISMAP).",
     "- `_errors.log` appears only when some reads fail but the bundle still completes.",
@@ -4114,7 +4843,7 @@ export function registerMulesoftTools(pi: any): void {
     name: "mulesoft_export_audit_bundle",
     label: "Export MuleSoft audit bundle",
     description:
-      "Export a MuleSoft Anypoint Platform audit package covering all 25 spec controls: raw API snapshots in core_data/, findings and category summaries in analysis/, executive summary, unified matrix, and per-framework reports in compliance/, a QUICK_REFERENCE.md, an _errors.log when collection partially fails, and a zip archive.",
+      "Export a MuleSoft Anypoint Platform audit package covering all 25 spec controls: redacted and projected API snapshots in core_data/ (denied or unrequested datasets written as not-collected markers), findings and category summaries in analysis/, executive summary, unified matrix, and per-framework reports in compliance/, a QUICK_REFERENCE.md, an _errors.log when collection partially fails, and a zip archive.",
     parameters: Type.Object({
       ...authParams,
       output_dir: Type.Optional(Type.String({ description: `Output root. Defaults to ${DEFAULT_OUTPUT_DIR}.` })),
