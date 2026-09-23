@@ -610,10 +610,34 @@ function backslashRun(text: string, index: number): number {
  * Reads a quoted value opening at `index`: a double or single quote, with any backslashes that escape it in JSON or
  * JavaScript-escaped text (`\"value\"`, `\\\"value\\\"`). The value ends at the same quote token; a quote escaped one
  * level deeper is content, a quote escaped less deeply closes an enclosing string and leaves the value unterminated,
- * and an unterminated value runs to the next header's `Name:` token on the line (`; X-Api-Key:`), or to the end of
- * the line or of the text, so a truncated carrier still loses its value and the header after it keeps its name.
+ * and a value with no closing quote on its line runs to the next header's `Name:` token on the line (`; X-Api-Key:`),
+ * or to the end of the line or of the text, so a truncated carrier still loses its value and the header after it
+ * keeps its name. A closing quote on the line wins over that cut, so `"abc; Foo: def"` is one value; the exception is
+ * a following header whose own value opens with a quote (`sid="abc; X-Api-Key: "def"`), where that quote is an opener
+ * and the unterminated value ends at the header's name.
  */
 function readQuotedValue(text: string, index: number): QuotedValue | null {
+  const whole = scanQuotedValue(text, index, "quoted-value");
+  if (whole === null || whole.terminated) return whole?.value ?? null;
+  return scanQuotedValue(text, index, "always")?.value ?? null;
+}
+
+/** When a quoted-value scan ends at the next header's `Name:` token: never, only when that header's value opens with a quote, or always. */
+type FollowingHeaderCut = "quoted-value" | "always";
+
+/** True when the text after a `; Name:` token opens a quoted value, so the quote there is an opener rather than our closer. */
+function followingHeaderOpensQuote(text: string, headerEnd: number): boolean {
+  let cursor = headerEnd;
+  while (text[cursor] === " " || text[cursor] === "\t") cursor += 1;
+  const next = text[cursor + backslashRun(text, cursor)];
+  return next === '"' || next === "'";
+}
+
+/**
+ * One pass of the quoted-value scan. `terminated` is true when the value ended at a quote token rather than at the
+ * line end, a header cut, or the text end.
+ */
+function scanQuotedValue(text: string, index: number, cut: FollowingHeaderCut): { value: QuotedValue; terminated: boolean } | null {
   const depth = backslashRun(text, index);
   const quote = text[index + depth];
   if (quote !== '"' && quote !== "'") return null;
@@ -623,7 +647,10 @@ function readQuotedValue(text: string, index: number): QuotedValue | null {
   while (cursor < text.length) {
     const char = text[cursor];
     if (char === "\n" || char === "\r") break;
-    if ((char === ";" || char === ",") && stickyExec(FOLLOWING_HEADER_PATTERN, text, cursor) !== null) break;
+    if (char === ";" || char === ",") {
+      const header = stickyExec(FOLLOWING_HEADER_PATTERN, text, cursor);
+      if (header !== null && (cut === "always" || followingHeaderOpensQuote(text, cursor + header.length))) break;
+    }
     if (char !== "\\" && char !== quote) {
       cursor += 1;
       continue;
@@ -635,14 +662,14 @@ function readQuotedValue(text: string, index: number): QuotedValue | null {
       cursor += run + (next === undefined || next === "\n" || next === "\r" ? 0 : 1);
       continue;
     }
-    if (run < depth) return { open, close: "", start, end: cursor, after: cursor };
+    if (run < depth) return { value: { open, close: "", start, end: cursor, after: cursor }, terminated: true };
     if ((run - depth) % 2 === 0) {
       const end = cursor + run - depth;
-      return { open, close: text.slice(end, cursor + run + 1), start, end, after: cursor + run + 1 };
+      return { value: { open, close: text.slice(end, cursor + run + 1), start, end, after: cursor + run + 1 }, terminated: true };
     }
     cursor += run + 1;
   }
-  return { open, close: "", start, end: cursor, after: cursor };
+  return { value: { open, close: "", start, end: cursor, after: cursor }, terminated: false };
 }
 
 interface ValueReplacement {

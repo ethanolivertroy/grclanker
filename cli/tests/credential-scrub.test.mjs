@@ -62,7 +62,7 @@ const CARRIERS = [
   ["x-api-key header", (value) => `x-api-key: ${value}`],
   ["X-Auth-Token header", (value) => `X-Auth-Token: ${value}`],
   ["x-vault-token header", (value) => `x-vault-token=${value}`],
-  ["custom x- credential header", (value) => `X-Canary-Session-Key: ${value}`],
+  ["custom x- credential header", (value) => `X-Probe-Session-Key: ${value}`],
   ["cookie assignment in text", (value) => `the response set session=${value} before failing`],
   ["session id assignment", (value) => `session_id: ${value}`],
   ["sid assignment", (value) => `sid=${value}`],
@@ -299,17 +299,11 @@ const MUST_KEEP = [
   JSON.stringify({ collected: false, status: 403, endpoint: "GET /api/v2/tokens?showAll=true", error: "LaunchDarkly request failed (403 Forbidden) for GET /api/v2/tokens?showAll=true: forbidden: access_denied", reason: "not_readable" }),
 ];
 
-function eightCharacterWindows(text) {
-  const windows = [];
-  for (let index = 0; index + 8 <= text.length; index += 1) windows.push(text.slice(index, index + 8));
-  return windows;
-}
-
-/** Asserts the value and every 8-character window of it are gone and the marker took its place. */
+/** Asserts the value and every window of it at lengths 6 through 24 are gone and the marker took its place. */
 function assertRemoved(scrubbed, value, label) {
   assert.ok(!scrubbed.includes(value), `${label}: value survived: ${scrubbed}`);
-  for (const fragment of eightCharacterWindows(value)) {
-    assert.ok(!scrubbed.includes(fragment), `${label}: fragment "${fragment}" survived: ${scrubbed}`);
+  for (const fragment of canaryWindows(value)) {
+    assert.ok(!scrubbed.includes(fragment), `${label}: fragment "${fragment}" (${fragment.length} of ${value.length} characters) survived: ${scrubbed}`);
   }
   assert.ok(scrubbed.includes(REDACTED), `${label}: no marker written: ${scrubbed}`);
 }
@@ -378,6 +372,37 @@ test("scrub boundary guard 1, quoted carriers: the reported forms, a plain word 
   assert.equal(scrubber.scrub('\\"Authorization\\": \\"Bearer token\\"'), `\\"Authorization\\": \\"Bearer ${REDACTED}\\"`);
   assert.equal(scrubber.scrub('X-Api-Key: ""'), 'X-Api-Key: ""', "an empty quoted value has nothing to remove");
   assert.equal(scrubber.scrub("Bearer token authentication is required"), "Bearer token authentication is required", "a bare plain word after a scheme word is still prose");
+});
+
+test("scrub boundary guard 1, quoted carriers: a closing quote on the line wins over the following-header cut, which applies only to a value left unterminated", () => {
+  const scrubber = createCredentialScrubber();
+  assert.equal(scrubber.scrub('X-Api-Key: "abc-def; Foo: ghi-jkl"'), `X-Api-Key: "${REDACTED}"`, "a terminated value holding `; Name:` is one value");
+  assert.equal(scrubber.scrub('X-Api-Key: "abc-def, Foo: ghi-jkl" and more'), `X-Api-Key: "${REDACTED}" and more`, "a terminated value holding `, Name:` is one value");
+  assert.equal(scrubber.scrub('X-Api-Key: "abc-def; Foo: ghi-jkl'), `X-Api-Key: "${REDACTED}; Foo: ghi-jkl`, "an unterminated value still stops at the next header's name");
+  assert.equal(scrubber.scrub('X-Api-Key: "abc-def; Content-Type: application/json'), `X-Api-Key: "${REDACTED}; Content-Type: application/json`);
+  assert.equal(
+    scrubber.scrub('Authorization: \\"Bearer abc-def; Foo: ghi-jkl\\", Accept: \\"application/json\\"'),
+    `Authorization: \\"Bearer ${REDACTED}\\", Accept: \\"application/json\\"`,
+    "the same holds JSON-escaped",
+  );
+  const [canary] = QUOTED_CANARIES;
+  const carriers = [
+    ["terminated header value", `X-Api-Key: "${canary}; Foo: ghi-jkl"`, `X-Api-Key: "${REDACTED}"`, []],
+    ["terminated header value, comma", `X-Api-Key: "${canary}, Foo: ghi-jkl" and more`, `X-Api-Key: "${REDACTED}" and more`, [" and more"]],
+    ["unterminated header value", `X-Api-Key: "${canary}; Foo: ghi-jkl`, `X-Api-Key: "${REDACTED}; Foo: ghi-jkl`, ["Foo: ghi-jkl"]],
+    ["terminated JSON pair", `{"X-Api-Key":"${canary}; Foo: ghi-jkl","Accept":"application/json"}`, `{"X-Api-Key":"${REDACTED}","Accept":"application/json"}`, ['"Accept":"application/json"']],
+    ["unterminated value before a header whose value opens with a quote", `Cookie: sid="${canary}; X-Api-Key: "${canary}"; Accept: "application/json"`, `Cookie: ${REDACTED}; X-Api-Key: "${REDACTED}"; Accept: "application/json"`, ['X-Api-Key: "', 'Accept: "application/json"']],
+    ["unterminated value before a header whose value opens with a single quote", `X-Api-Key: "${canary}; Authorization: 'Bearer ${canary}'`, `X-Api-Key: "${REDACTED}; Authorization: 'Bearer ${REDACTED}'`, ["Authorization: 'Bearer "]],
+  ];
+  for (const [entryPoint, scrub] of TEXT_ENTRY_POINTS) {
+    for (const [label, text, expected, controls] of carriers) {
+      const scrubbed = scrub(text);
+      assert.equal(scrubbed, expected, `${entryPoint}: ${label}`);
+      assertCanaryWindowsAbsent(assert, scrubbed, [canary], `${entryPoint}: ${label}`);
+      for (const control of controls) assert.ok(scrubbed.includes(control), `${entryPoint}: ${label}: ${JSON.stringify(control)} did not survive`);
+      assert.equal(scrub(scrubbed), scrubbed, `${entryPoint}: ${label}: a second pass changed the text`);
+    }
+  }
 });
 
 test("scrub boundary guard 2: a configured secret is removed whatever its shape and in its base64, base64url, URL-encoded, form-encoded, and JSON-escaped forms", () => {
