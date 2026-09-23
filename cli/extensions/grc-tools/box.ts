@@ -1980,16 +1980,22 @@ function whenAllRead<T>(datasets: Array<CollectedDataset<unknown>>, value: T): T
 }
 
 /**
- * A list of records observed to hold a property: the records found are real observations and always render, while an
- * empty list renders `[]` only when every dataset that could have revealed one was read completely, and null otherwise.
+ * The count of records observed to hold a property. A positive count is a real observation and renders (a lower bound
+ * while a source listing stopped short, which the truncation marker beside it records); zero is asserted only from
+ * listings that were read to completion, and renders null from a read that stopped or failed, so an absence is never
+ * derived from a partial inventory. Counts named for the read's own size (sampled_users, sampled_events) use whenRead.
  */
-function observedList<T>(sources: Array<CollectedDataset<unknown>>, items: T[]): T[] | null {
-  return items.length > 0 || sources.every(isComplete) ? items : null;
-}
-
-/** The count of records observed to hold a property, with the same rule as observedList: zero is asserted only from complete reads. */
 function observedCount(sources: Array<CollectedDataset<unknown>>, count: number): number | null {
   return count > 0 || sources.every(isComplete) ? count : null;
+}
+
+/**
+ * Item-level detail (user labels, domains, policy or product names) drawn from listings: rendered only when every
+ * listing it is drawn from was read to completion, and withheld as null while any of them stopped short or failed,
+ * with an observedCount lower bound beside it, so a truncated page never names its part of the inventory as the whole.
+ */
+function detailOrNull<T>(sources: Array<CollectedDataset<unknown>>, detail: T): T | null {
+  return sources.every(isComplete) ? detail : null;
 }
 
 function isNotCollectedMarker(value: unknown): value is BoxNotCollectedMarker {
@@ -2214,11 +2220,13 @@ function isExemptFromLoginVerification(user: JsonRecord): boolean {
 
 function userInventoryGap(dataset: CollectedDataset<JsonRecord[]>): string | undefined {
   const users = dataset.data;
+  // The listing's own stop is tested before the empty branch: an empty page under a next_marker read nothing and says
+  // nothing about the inventory, while a complete empty read is the impossible enterprise without its primary admin.
+  if (dataset.truncated === true) {
+    return `the user list ${truncationClause(dataset, users.length, "records", "Box reported more users (a next_marker remained)")}, so the inventory is ${users.length === 0 ? "unread" : "partial"} and the absence of a matching record proves nothing; ${truncationRemedy(dataset, "user_limit")}`;
+  }
   if (users.length === 0) {
     return "the user list was readable but returned zero managed users; a Box enterprise always has at least the primary admin, so the inventory is empty and nothing was assessed";
-  }
-  if (dataset.truncated === true) {
-    return `the user list ${truncationClause(dataset, users.length, "records", "Box reported more users (a next_marker remained)")}, so the inventory is partial and the absence of a matching record proves nothing; ${truncationRemedy(dataset, "user_limit")}`;
   }
   if (!users.some(isAdminUser)) {
     return `the ${users.length}-user inventory contains no admin account; a Box enterprise always has a primary admin, so the listing is incomplete or the audit principal cannot see admin accounts`;
@@ -2410,10 +2418,11 @@ export function assessBoxIdentityAccessData(data: BoxIdentityData, options: BoxI
   const usersTruncated = data.users.truncated === true;
   const inventoryGap = usersReadable ? userInventoryGap(data.users) : undefined;
   // Every count and name below is gated on the dataset that proves it: a denied user listing renders null, never 0 or
-  // [], and a user is named as holding a property only from a record that was actually read.
+  // [], a zero from a listing that stopped short renders null, and user labels are withheld while the listing is
+  // incomplete (the counts beside them are lower bounds); sampled_users is the read's own size and always renders.
   const inventoryEvidence = {
     sampled_users: whenRead(data.users, users.length),
-    admin_users: whenRead(data.users, admins.length),
+    admin_users: observedCount([data.users], admins.length),
     users_truncated: whenRead(data.users, usersTruncated),
     inventory_gap: inventoryGap ?? null,
   };
@@ -2455,8 +2464,9 @@ export function assessBoxIdentityAccessData(data: BoxIdentityData, options: BoxI
     multi_factor_auth_type: mfaType ?? null,
     is_enterprise_sso_required: ssoRequired ?? null,
     ...settingsEvidence(securityReadable, mfaSettings, mfaUnused),
-    privileged_users: whenRead(data.users, privileged.length),
-    exempt_privileged_users: observedList([data.users], truncateList(exemptPrivileged.map(userLabel))),
+    privileged_users: observedCount([data.users], privileged.length),
+    exempt_privileged_users: detailOrNull([data.users], truncateList(exemptPrivileged.map(userLabel))),
+    exempt_privileged_users_count: observedCount([data.users], exemptPrivileged.length),
     ...inventoryEvidence,
   };
   const adminMfaManualEvidence = "Admin Console > Enterprise Settings > Security > 2-Step Verification: confirm 2-step verification is required for all managed users, and open each admin and co-admin user record to confirm the 'Exempt from 2-step verification' option is not set.";
@@ -2487,7 +2497,8 @@ export function assessBoxIdentityAccessData(data: BoxIdentityData, options: BoxI
     multi_factor_auth_type: mfaType ?? null,
     is_enterprise_sso_required: ssoRequired ?? null,
     ...settingsEvidence(securityReadable, mfaSettings, mfaUnused),
-    exempt_users: observedList([data.users], truncateList(exemptUsers.map(userLabel))),
+    exempt_users: detailOrNull([data.users], truncateList(exemptUsers.map(userLabel))),
+    exempt_users_count: observedCount([data.users], exemptUsers.length),
     ...inventoryEvidence,
   };
   const userMfaManualEvidence = "Admin Console > Enterprise Settings > Security > 2-Step Verification: confirm 2-step verification is required for all users, including external collaborators.";
@@ -2514,9 +2525,13 @@ export function assessBoxIdentityAccessData(data: BoxIdentityData, options: BoxI
   );
 
   const adminRoleChanges = events.filter((event) => eventType(event) === "CHANGE_ADMIN_ROLE");
+  const coAdminEvidence = {
+    coadmins: detailOrNull([data.users], truncateList(coAdmins.map(userLabel))),
+    coadmin_users: observedCount([data.users], coAdmins.length),
+  };
   const adminCountEvidence = {
-    admins: observedList([data.users], truncateList(admins.map(userLabel))),
-    coadmins: observedList([data.users], truncateList(coAdmins.map(userLabel))),
+    admins: detailOrNull([data.users], truncateList(admins.map(userLabel))),
+    ...coAdminEvidence,
     max_admins: maxAdmins,
     admin_role_change_events: observedCount([data.events], adminRoleChanges.length),
     ...inventoryEvidence,
@@ -2535,10 +2550,10 @@ export function assessBoxIdentityAccessData(data: BoxIdentityData, options: BoxI
     !usersReadable
       ? finding(18, "manual", `Enterprise users could not be listed because ${unreadableReason(data.users)}.`, undefined, "Admin Console > Users & Groups: open each co-admin and review the co-admin permission set under Edit User Access Permissions.")
       : coAdmins.length > 0
-        ? finding(18, "manual", `${coAdmins.length} co-admin accounts exist; the Box API does not expose individual co-admin permission sets, so scoping must be confirmed in the Admin Console.`, { coadmins: truncateList(coAdmins.map(userLabel)), ...inventoryEvidence }, "Admin Console > Users & Groups > (each co-admin) > Edit User Access Permissions: confirm each co-admin has only the permission categories they need (for example Users and Groups, Reports, Content) and no co-admin holds the full set equivalent to a primary admin.")
+        ? finding(18, "manual", `${coAdmins.length} co-admin accounts exist${usersTruncated ? " among the users read" : ""}; the Box API does not expose individual co-admin permission sets, so scoping must be confirmed in the Admin Console.`, { ...coAdminEvidence, ...inventoryEvidence }, "Admin Console > Users & Groups > (each co-admin) > Edit User Access Permissions: confirm each co-admin has only the permission categories they need (for example Users and Groups, Reports, Content) and no co-admin holds the full set equivalent to a primary admin.")
         : inventoryGap
-          ? finding(18, "warn", `Co-admin permission scoping could not be assessed because ${inventoryGap}.`, { coadmins: observedCount([data.users], 0), ...inventoryEvidence }, inventoryManualEvidence)
-          : finding(18, "pass", "No co-admin accounts exist, so there are no delegated permission sets to scope.", { coadmins: 0, ...inventoryEvidence }),
+          ? finding(18, "warn", `Co-admin permission scoping could not be assessed because ${inventoryGap}.`, { ...coAdminEvidence, ...inventoryEvidence }, inventoryManualEvidence)
+          : finding(18, "pass", "No co-admin accounts exist, so there are no delegated permission sets to scope.", { ...coAdminEvidence, ...inventoryEvidence }),
   );
 
   const passwordMinLength = configNumber(configuration, "security", "password_min_length");
@@ -2654,17 +2669,22 @@ export function assessBoxIdentityAccessData(data: BoxIdentityData, options: BoxI
   const inactiveWithFailedLogins = inactiveCandidates.filter((user) => failedLoginActorIds.has(asString(user.id) ?? ""));
   const eventsTruncated = data.events.truncated === true;
   const inactiveRatio = activeUsers.length > 0 ? inactiveCandidates.length / activeUsers.length : 0;
-  // Inactivity is the absence of an event, so a user is named inactive only when the event stream was read completely
-  // and the user's own record was read; a capped stream renders the candidates as unknown.
+  // Inactivity is the absence of an event, so a user is counted inactive only when the event stream was read completely
+  // and the user's own record was read; a capped stream renders the candidates as unknown. The candidates are named
+  // only when the user listing was also read to completion; while it stopped short, the count beside them is a lower
+  // bound over the users read and the labels are withheld.
   const inactivityProven = usersReadable && isComplete(data.events);
+  const inactivityDetail = inactivityProven && isComplete(data.users);
   const inactivityEvidence = {
     lookback_days: data.lookbackDays,
-    active_users: whenRead(data.users, activeUsers.length),
-    inactive_candidates: inactivityProven ? truncateList(inactiveCandidates.map(userLabel)) : null,
-    inactive_candidates_with_failed_logins: inactivityProven ? truncateList(inactiveWithFailedLogins.map(userLabel)) : null,
+    active_users: observedCount([data.users], activeUsers.length),
+    inactive_candidates: inactivityDetail ? truncateList(inactiveCandidates.map(userLabel)) : null,
+    inactive_candidates_count: inactivityProven ? observedCount([data.users], inactiveCandidates.length) : null,
+    inactive_candidates_with_failed_logins: inactivityDetail ? truncateList(inactiveWithFailedLogins.map(userLabel)) : null,
+    inactive_candidates_with_failed_logins_count: inactivityProven ? observedCount([data.users], inactiveWithFailedLogins.length) : null,
     sampled_events: whenRead(data.events, events.length),
-    activity_events: whenRead(data.events, activityEvents.length),
-    failed_login_events: whenRead(data.events, failedLogins.length),
+    activity_events: observedCount([data.events], activityEvents.length),
+    failed_login_events: observedCount([data.events], failedLogins.length),
     event_limit: data.eventLimit,
     events_truncated: whenRead(data.events, eventsTruncated),
     ...inventoryEvidence,
@@ -2692,15 +2712,17 @@ export function assessBoxIdentityAccessData(data: BoxIdentityData, options: BoxI
     summary: {
       enterprise_id: data.enterpriseId ?? null,
       sampled_users: whenRead(data.users, users.length),
-      admins: whenRead(data.users, admins.length),
-      coadmins: whenRead(data.users, coAdmins.length),
+      users_truncated: whenRead(data.users, usersTruncated),
+      admins: observedCount([data.users], admins.length),
+      coadmins: observedCount([data.users], coAdmins.length),
       exempt_privileged_users: observedCount([data.users], exemptPrivileged.length),
       sso_required: ssoRequired ?? null,
       mfa_required: mfaRequired ?? null,
       password_min_length: passwordMinLength ?? null,
       session_duration: sessionDuration ?? null,
-      inactive_candidates: inactivityProven ? inactiveCandidates.length : null,
+      inactive_candidates: inactivityProven ? observedCount([data.users], inactiveCandidates.length) : null,
       sampled_events: whenRead(data.events, events.length),
+      events_truncated: whenRead(data.events, eventsTruncated),
       lookback_days: data.lookbackDays,
     },
     findings: sortFindings(findings),
@@ -2781,11 +2803,15 @@ export function assessBoxSharingCollaborationData(data: BoxSharingData, options:
 
   const externalSettings = configSettings(configuration, "content_and_sharing", ["external_collaboration_status", "collaboration_restrictions", "external_collaboration_allowlist_users"]);
   const externalUnused = unusedSettings(externalSettings, ["external_collaboration_status"]);
+  const entriesTruncated = data.allowlistEntries.truncated === true;
+  const entriesTruncationNote = listingTruncationNote("collaboration allowlist", data.allowlistEntries);
+  const entriesRemedy = truncationRemedy(data.allowlistEntries, "list_limit");
   const externalEvidence = {
     external_collaboration_status: externalStatus ?? null,
     collaboration_restrictions: configReadable ? collaborationRestrictions : null,
-    allowlist_entries: whenRead(data.allowlistEntries, entries.length),
-    allowlist_exempt_users: configReadable && isRead(data.exemptTargets) ? exemptTargets.length + allowlistUsers.length : null,
+    allowlist_entries: observedCount([data.allowlistEntries], entries.length),
+    allowlist_entries_truncated: whenRead(data.allowlistEntries, entriesTruncated),
+    allowlist_exempt_users: configReadable && isRead(data.exemptTargets) ? observedCount([data.exemptTargets], exemptTargets.length + allowlistUsers.length) : null,
     ...settingsEvidence(configReadable, externalSettings, externalUnused),
   };
   const externalManualEvidence = "Admin Console > Enterprise Settings > Content & Sharing > Collaboration: record whether external collaboration is enabled for everyone, restricted to allowlisted domains, or disabled.";
@@ -2804,9 +2830,13 @@ export function assessBoxSharingCollaborationData(data: BoxSharingData, options:
         : externalStatus === "limit_collaboration_to_allowlisted_domains"
           ? !allowlistReadable
             ? finding(4, "warn", `External collaboration is limited to allowlisted domains, but the ${describeInventory("collaboration allowlist", data.allowlistEntries)} could not be read because ${unreadableReason(data.allowlistEntries)}, so the permitted domains were not checked.`, externalEvidence, "Admin Console > Enterprise Settings > Content & Sharing > Collaboration > Allowlisted domains: export the domain list and confirm each entry is a business partner.")
+            // The pass rests on the enterprise setting; a listing that stopped short keeps it and states the stop, while an
+            // empty page from a listing that stopped proves nothing about whether the allowlist is populated.
             : entries.length > 0
-              ? finding(4, "pass", `External collaboration is limited to allowlisted domains (${entries.length} domain entries visible).`, externalEvidence)
-              : finding(4, "warn", "External collaboration is limited to allowlisted domains, but the allowlist is empty, which may block all external work or indicate an incomplete rollout.", externalEvidence)
+              ? finding(4, "pass", `External collaboration is limited to allowlisted domains (${entries.length} domain entries visible${entriesTruncated ? `; ${entriesTruncationNote}, so the entry count is a lower bound; ${entriesRemedy}` : ""}).`, externalEvidence)
+              : entriesTruncated
+                ? finding(4, "warn", `External collaboration is limited to allowlisted domains, but the collaboration allowlist listing returned no entries before it stopped (${data.allowlistEntries.truncation?.reason ?? "the listing stopped at its cap"}), so whether the allowlist is populated is unknown; ${entriesRemedy}.`, externalEvidence, externalManualEvidence)
+                : finding(4, "warn", "External collaboration is limited to allowlisted domains, but the allowlist is empty, which may block all external work or indicate an incomplete rollout.", externalEvidence)
           : externalStatus === "enable_external_collaboration"
             ? finding(4, "fail", "External collaboration is enabled for any domain without an allowlist restriction.", externalEvidence)
             : finding(4, "warn", `External collaboration status "${externalStatus ?? "unknown"}" was not recognized; confirm the setting manually.`, externalEvidence),
@@ -2821,11 +2851,17 @@ export function assessBoxSharingCollaborationData(data: BoxSharingData, options:
     return createdAt !== undefined && daysBetween(data.now, createdAt) > staleDays;
   });
   const bothDirectionEntries = entries.filter((entry) => asString(entry.direction) === "both");
+  // Domain names are item-level detail: withheld while the allowlist listing stopped short, with the counts beside them
+  // as lower bounds, so a capped page never presents its domains as the whole allowlist.
   const allowlistEvidence = {
-    allowlist_entries: observedList([data.allowlistEntries], truncateList(entries.map((entry) => `${asString(entry.domain) ?? "domain"} (${asString(entry.direction) ?? "direction"})`))),
-    public_email_domains: observedList([data.allowlistEntries], publicDomainEntries.map((entry) => asString(entry.domain))),
-    stale_entries: observedList([data.allowlistEntries], truncateList(staleEntries.map((entry) => asString(entry.domain)))),
-    undated_entries: observedList([data.allowlistEntries], truncateList(undatedEntries.map((entry) => `${asString(entry.domain) ?? asString(entry.id) ?? "entry"} (created_at: ${entry.created_at === undefined ? "missing" : JSON.stringify(entry.created_at)})`))),
+    allowlist_entries: detailOrNull([data.allowlistEntries], truncateList(entries.map((entry) => `${asString(entry.domain) ?? "domain"} (${asString(entry.direction) ?? "direction"})`))),
+    allowlist_entries_count: observedCount([data.allowlistEntries], entries.length),
+    public_email_domains: detailOrNull([data.allowlistEntries], publicDomainEntries.map((entry) => asString(entry.domain))),
+    public_email_domain_count: observedCount([data.allowlistEntries], publicDomainEntries.length),
+    stale_entries: detailOrNull([data.allowlistEntries], truncateList(staleEntries.map((entry) => asString(entry.domain)))),
+    stale_entry_count: observedCount([data.allowlistEntries], staleEntries.length),
+    undated_entries: detailOrNull([data.allowlistEntries], truncateList(undatedEntries.map((entry) => `${asString(entry.domain) ?? asString(entry.id) ?? "entry"} (created_at: ${entry.created_at === undefined ? "missing" : JSON.stringify(entry.created_at)})`))),
+    undated_entry_count: observedCount([data.allowlistEntries], undatedEntries.length),
     both_direction_entries: observedCount([data.allowlistEntries], bothDirectionEntries.length),
     exempt_targets: observedCount([data.exemptTargets], exemptTargets.length),
     stale_days: staleDays,
@@ -2957,9 +2993,9 @@ export function assessBoxSharingCollaborationData(data: BoxSharingData, options:
     finding(
       19,
       "manual",
-      `${countOrUnread(data.events, appEvents.length)} app authorization or creation events occurred in the last ${data.lookbackDays} days and ${countOrUnread(data.shieldLists, integrationLists.length)} Shield integration lists exist; the Box API does not expose the app approval policy itself.`,
+      `${sampledCountText(data.events, appEvents.length)} app authorization or creation events occurred in the last ${data.lookbackDays} days and ${countOrUnread(data.shieldLists, integrationLists.length)} Shield integration lists exist; the Box API does not expose the app approval policy itself.`,
       {
-        app_events: whenRead(data.events, countEventTypes(appEvents)),
+        app_events: sampledValue(data.events, countEventTypes(appEvents)),
         integration_shield_lists: whenRead(data.shieldLists, integrationLists.map((list) => asString(list.name) ?? asString(list.id) ?? "list")),
         events_error: data.events.error ?? null,
         shield_lists_error: data.shieldLists.error ?? null,
@@ -2992,16 +3028,19 @@ export function assessBoxSharingCollaborationData(data: BoxSharingData, options:
     summary: {
       enterprise_id: data.enterpriseId ?? null,
       external_collaboration_status: externalStatus ?? null,
-      allowlist_entries: whenRead(data.allowlistEntries, entries.length),
+      allowlist_entries: observedCount([data.allowlistEntries], entries.length),
+      allowlist_entries_truncated: whenRead(data.allowlistEntries, entriesTruncated),
       public_email_domains: observedCount([data.allowlistEntries], publicDomainEntries.length),
       stale_allowlist_entries: observedCount([data.allowlistEntries], staleEntries.length),
       undated_allowlist_entries: observedCount([data.allowlistEntries], undatedEntries.length),
-      exempt_targets: whenRead(data.exemptTargets, exemptTargets.length),
+      exempt_targets: observedCount([data.exemptTargets], exemptTargets.length),
       shared_link_default_access: sharedLinkDefault ?? null,
       shared_links_expiration_enabled: expirationEnabled ?? null,
       watermarking_enabled: watermarkingEnabled ?? null,
       managed_terms_enabled: whenRead(data.termsOfServices, enabledManaged.length),
-      app_events: whenRead(data.events, appEvents.length),
+      app_events: observedCount([data.events], appEvents.length),
+      sampled_events: whenRead(data.events, events.length),
+      events_truncated: whenRead(data.events, data.events.truncated === true),
       lookback_days: data.lookbackDays,
     },
     findings: sortFindings(findings),
@@ -3142,19 +3181,24 @@ export function assessBoxDataGovernanceData(data: BoxGovernanceData): BoxAssessm
   const findings: BoxFinding[] = [];
 
   const pins = data.devicePinners.data;
+  const pinsTruncated = data.devicePinners.truncated === true;
   const pinProducts = countEventTypesBy(pins, (pin) => asString(pin.product_name) ?? "unknown");
   const deviceEvidence = {
-    device_pins: whenRead(data.devicePinners, pins.length),
-    device_pin_products: whenRead(data.devicePinners, pinProducts),
+    device_pins: observedCount([data.devicePinners], pins.length),
+    device_pins_truncated: whenRead(data.devicePinners, pinsTruncated),
+    device_pin_products: detailOrNull([data.devicePinners], pinProducts),
     is_device_limit_exemption_enabled_for_new_users: configBool(configuration, "user_settings", "is_device_limit_exemption_enabled_for_new_users") ?? null,
     is_box_sync_restricted_for_new_users: configBool(configuration, "user_settings", "is_box_sync_restricted_for_new_users") ?? null,
   };
+  const deviceManualEvidence = "Admin Console > Enterprise Settings > Device Trust: record whether device pinning is enforced for Box Drive, Box Sync, and mobile apps, and export the pinned device list.";
   findings.push(
     data.devicePinners.error
-      ? finding(10, "manual", `Device pins could not be read because ${unreadableReason(data.devicePinners)}.`, deviceEvidence, "Admin Console > Enterprise Settings > Device Trust: record whether device pinning is enforced for Box Drive, Box Sync, and mobile apps, and export the pinned device list.")
+      ? finding(10, "manual", `Device pins could not be read because ${unreadableReason(data.devicePinners)}.`, deviceEvidence, deviceManualEvidence)
       : pins.length === 0
-        ? finding(10, "warn", "No device pins exist, which indicates device pinning is not enforced for desktop or mobile clients.", deviceEvidence, "Admin Console > Enterprise Settings > Device Trust: confirm whether device pinning and device trust checks are intentionally disabled.")
-        : finding(10, "manual", `${pins.length} device pins are registered; the Box API does not expose the device trust policy that decides whether unpinned devices are blocked.`, deviceEvidence, "Admin Console > Enterprise Settings > Device Trust: confirm device pinning is required, record per-user device limits, and review the pinned device inventory for stale entries."),
+        ? pinsTruncated
+          ? finding(10, "manual", `The device pin listing returned no pins before it stopped (${data.devicePinners.truncation?.reason ?? "the listing stopped at its cap"}), so whether device pinning is in use is unknown; ${truncationRemedy(data.devicePinners, "list_limit")}.`, deviceEvidence, deviceManualEvidence)
+          : finding(10, "warn", "No device pins exist, which indicates device pinning is not enforced for desktop or mobile clients.", deviceEvidence, "Admin Console > Enterprise Settings > Device Trust: confirm whether device pinning and device trust checks are intentionally disabled.")
+        : finding(10, "manual", `${pins.length} device pins are registered${pinsTruncated ? ` (a lower bound: ${listingTruncationNote("device pin", data.devicePinners)}; ${truncationRemedy(data.devicePinners, "list_limit")})` : ""}; the Box API does not expose the device trust policy that decides whether unpinned devices are blocked.`, deviceEvidence, "Admin Console > Enterprise Settings > Device Trust: confirm device pinning is required, record per-user device limits, and review the pinned device inventory for stale entries."),
   );
 
   const templates = data.metadataTemplates.data;
@@ -3163,7 +3207,8 @@ export function assessBoxDataGovernanceData(data: BoxGovernanceData): BoxAssessm
   const classifications = isRead(data.classificationTemplate) ? classificationOptions(data.classificationTemplate.data) : [];
   const classificationEvidence = {
     classifications: classificationReadable ? classifications : null,
-    enterprise_metadata_templates: whenRead(data.metadataTemplates, templates.length),
+    enterprise_metadata_templates: observedCount([data.metadataTemplates], templates.length),
+    metadata_templates_truncated: whenRead(data.metadataTemplates, data.metadataTemplates.truncated === true),
     classification_error: data.classificationTemplate.error ?? null,
   };
   findings.push(
@@ -3178,8 +3223,10 @@ export function assessBoxDataGovernanceData(data: BoxGovernanceData): BoxAssessm
   const retentionTruncated = data.retentionPolicies.truncated === true;
   const activeRetention = retentionPolicies.filter((policy) => (asString(policy.status) ?? "active") === "active");
   const assignedRetention = activeRetention.filter((policy) => hasKnownAssignments(policy, data.retentionAssignments.data));
+  // Policy records are item-level detail: withheld while the listing stopped short, with the counts beside them as lower
+  // bounds and policies_read as the size of the read itself.
   const retentionEvidence = {
-    retention_policies: whenRead(data.retentionPolicies, truncateList(retentionPolicies.map((policy) => ({
+    retention_policies: detailOrNull([data.retentionPolicies], truncateList(retentionPolicies.map((policy) => ({
       name: asString(policy.policy_name),
       status: asString(policy.status),
       type: asString(policy.policy_type),
@@ -3187,13 +3234,15 @@ export function assessBoxDataGovernanceData(data: BoxGovernanceData): BoxAssessm
       disposition_action: asString(policy.disposition_action),
       assignments: knownAssignments(policy, data.retentionAssignments.data),
     })))),
-    active_policies: whenRead(data.retentionPolicies, activeRetention.length),
+    policies_read: whenRead(data.retentionPolicies, retentionPolicies.length),
+    active_policies: observedCount([data.retentionPolicies], activeRetention.length),
     assigned_policies: observedCount([data.retentionPolicies, data.retentionAssignments], assignedRetention.length),
     retention_policies_truncated: whenRead(data.retentionPolicies, retentionTruncated),
   };
   const retentionManualEvidence = "Admin Console > Governance > Retention: record each policy, its retention length, disposition action, and the folders or metadata it is assigned to.";
   // A listing that stopped short is tested before the empty branch: an empty or inactive truncated read proves no
-  // absence, and the counts a truncated pass or warn states are lower bounds carried with the listing's own exit.
+  // absence, and a universal claim over the policies read ("every active policy has assignments") is a warn, not a
+  // pass, while the total behind the stop is unknown; the counts it states are lower bounds carried with the exit.
   const retentionTruncationNote = listingTruncationNote("retention policy", data.retentionPolicies);
   const retentionRemedy = truncationRemedy(data.retentionPolicies, "list_limit");
   findings.push(capForUnreadableInventories(
@@ -3202,7 +3251,9 @@ export function assessBoxDataGovernanceData(data: BoxGovernanceData): BoxAssessm
       : retentionTruncated && retentionPolicies.length === 0
         ? finding(12, "warn", `The retention policy listing returned no policies before it stopped (${data.retentionPolicies.truncation?.reason ?? "the listing stopped at its cap"}), so whether active retention policies exist is unknown; ${retentionRemedy}.`, retentionEvidence, retentionManualEvidence)
         : assignedRetention.length > 0
-          ? finding(12, "pass", `${assignedRetention.length}/${activeRetention.length} active retention policies have assignments${retentionTruncated ? ` among the policies read; ${retentionTruncationNote}, so both counts are lower bounds; ${retentionRemedy}` : ""}.`, retentionEvidence)
+          ? retentionTruncated
+            ? finding(12, "warn", `${assignedRetention.length}/${activeRetention.length} active retention policies have assignments among the ${retentionPolicies.length} policies read, but ${retentionTruncationNote}; the total number of policies is unknown and the policies beyond the stop were not assessed, so the assignment coverage holds only for the policies read and both counts are lower bounds; ${retentionRemedy}.`, retentionEvidence, retentionManualEvidence)
+            : finding(12, "pass", `${assignedRetention.length}/${activeRetention.length} active retention policies have assignments.`, retentionEvidence)
           : activeRetention.length > 0
             ? finding(12, "warn", `${activeRetention.length} active retention policies exist but none have visible assignments${retentionTruncated ? `; ${retentionTruncationNote}, so assigned policies may remain unread; ${retentionRemedy}` : ""}.`, retentionEvidence)
             : retentionTruncated
@@ -3217,12 +3268,13 @@ export function assessBoxDataGovernanceData(data: BoxGovernanceData): BoxAssessm
   const activeHolds = legalHolds.filter((policy) => ["active", "applying"].includes(asString(policy.status) ?? ""));
   const assignedHolds = activeHolds.filter((policy) => hasKnownAssignments(policy, data.legalHoldAssignments.data));
   const holdEvidence = {
-    legal_hold_policies: whenRead(data.legalHoldPolicies, truncateList(legalHolds.map((policy) => ({
+    legal_hold_policies: detailOrNull([data.legalHoldPolicies], truncateList(legalHolds.map((policy) => ({
       name: asString(policy.policy_name),
       status: asString(policy.status),
       assignments: knownAssignments(policy, data.legalHoldAssignments.data),
     })))),
-    active_policies: whenRead(data.legalHoldPolicies, activeHolds.length),
+    policies_read: whenRead(data.legalHoldPolicies, legalHolds.length),
+    active_policies: observedCount([data.legalHoldPolicies], activeHolds.length),
     assigned_policies: observedCount([data.legalHoldPolicies, data.legalHoldAssignments], assignedHolds.length),
     legal_hold_policies_truncated: whenRead(data.legalHoldPolicies, holdsTruncated),
   };
@@ -3235,7 +3287,9 @@ export function assessBoxDataGovernanceData(data: BoxGovernanceData): BoxAssessm
       : holdsTruncated && legalHolds.length === 0
         ? finding(13, "warn", `The legal hold policy listing returned no policies before it stopped (${data.legalHoldPolicies.truncation?.reason ?? "the listing stopped at its cap"}), so whether legal hold policies exist is unknown; ${holdRemedy}.`, holdEvidence, holdManualEvidence)
         : assignedHolds.length > 0
-          ? finding(13, "pass", `${assignedHolds.length}/${activeHolds.length} active legal hold policies have custodian or content assignments${holdsTruncated ? ` among the policies read; ${holdTruncationNote}, so both counts are lower bounds; ${holdRemedy}` : ""}.`, holdEvidence)
+          ? holdsTruncated
+            ? finding(13, "warn", `${assignedHolds.length}/${activeHolds.length} active legal hold policies have custodian or content assignments among the ${legalHolds.length} policies read, but ${holdTruncationNote}; the total number of policies is unknown and the policies beyond the stop were not assessed, so the assignment coverage holds only for the policies read and both counts are lower bounds; ${holdRemedy}.`, holdEvidence, holdManualEvidence)
+            : finding(13, "pass", `${assignedHolds.length}/${activeHolds.length} active legal hold policies have custodian or content assignments.`, holdEvidence)
           : activeHolds.length > 0
             ? finding(13, "warn", `${activeHolds.length} active legal hold policies exist without visible assignments${holdsTruncated ? `; ${holdTruncationNote}, so assigned holds may remain unread; ${holdRemedy}` : ""}.`, holdEvidence)
             : holdsTruncated
@@ -3250,12 +3304,14 @@ export function assessBoxDataGovernanceData(data: BoxGovernanceData): BoxAssessm
     title: "Box data governance posture",
     summary: {
       enterprise_id: data.enterpriseId ?? null,
-      device_pins: whenRead(data.devicePinners, pins.length),
+      device_pins: observedCount([data.devicePinners], pins.length),
       classifications: classificationReadable ? classifications.length : null,
-      metadata_templates: whenRead(data.metadataTemplates, templates.length),
-      retention_policies: whenRead(data.retentionPolicies, retentionPolicies.length),
+      metadata_templates: observedCount([data.metadataTemplates], templates.length),
+      retention_policies: observedCount([data.retentionPolicies], retentionPolicies.length),
+      retention_policies_truncated: whenRead(data.retentionPolicies, retentionTruncated),
       assigned_retention_policies: observedCount([data.retentionPolicies, data.retentionAssignments], assignedRetention.length),
-      legal_hold_policies: whenRead(data.legalHoldPolicies, legalHolds.length),
+      legal_hold_policies: observedCount([data.legalHoldPolicies], legalHolds.length),
+      legal_hold_policies_truncated: whenRead(data.legalHoldPolicies, holdsTruncated),
       assigned_legal_hold_policies: observedCount([data.legalHoldPolicies, data.legalHoldAssignments], assignedHolds.length),
     },
     findings: sortFindings(findings),
@@ -3346,35 +3402,52 @@ export function assessBoxShieldMonitoringData(data: BoxShieldData): BoxAssessmen
   );
 
   const barriers = data.barriers.data;
+  const barriersTruncated = data.barriers.truncated === true;
+  const segmentsTruncated = data.barrierSegments.truncated === true;
   const enabledBarriers = barriers.filter((barrier) => asString(barrier.status) === "enabled");
+  const segmentCount = (barrier: JsonRecord): number | null => {
+    const segments = childList(data.barrierSegments.data, asString(barrier.id));
+    return segments === undefined ? null : observedCount([data.barrierSegments], segments.length);
+  };
+  // A per-barrier segment count of zero from a segment listing that stopped short renders null (the marker beside the
+  // list says why); a positive count is a lower bound while the listing is truncated.
   const barrierEvidence = {
-    barriers: whenRead(data.barriers, truncateList(barriers.map((barrier) => ({
+    barriers: detailOrNull([data.barriers], truncateList(barriers.map((barrier) => ({
       id: asString(barrier.id),
       status: asString(barrier.status),
-      segments: childList(data.barrierSegments.data, asString(barrier.id))?.length ?? null,
+      segments: segmentCount(barrier),
     })))),
-    enabled_barriers: whenRead(data.barriers, enabledBarriers.length),
+    barriers_read: whenRead(data.barriers, barriers.length),
+    barriers_truncated: whenRead(data.barriers, barriersTruncated),
+    enabled_barriers: observedCount([data.barriers], enabledBarriers.length),
+    segments_truncated: whenRead(data.barrierSegments, segmentsTruncated),
   };
   const enabledWithSegments = enabledBarriers.filter((barrier) => (childList(data.barrierSegments.data, asString(barrier.id))?.length ?? 0) > 0);
+  const segmentTruncationNote = `the segment listing ${truncationClause(data.barrierSegments, datasetRecordCount(data.barrierSegments.data) ?? 0, "segments", "Box reported more segments (a next_marker remained)")}`;
   const barrierManualEvidence = "Admin Console > Shield > Information Barriers: record each barrier, its segments, and the restrictions between segments, or confirm barriers are not required for this enterprise.";
   findings.push(capForUnreadableInventories(
     data.barriers.error
       ? finding(15, "manual", `Shield information barriers could not be read because ${unreadableReason(data.barriers)}.`, barrierEvidence, barrierManualEvidence)
+      // The pass rests on a segment existing behind an enabled barrier; a segment listing that stopped short keeps it
+      // and states the stop, since the segments read are real and the counts are lower bounds.
       : enabledWithSegments.length > 0
-        ? finding(15, "pass", `${enabledWithSegments.length} enabled information barriers have segments defined.`, barrierEvidence)
+        ? finding(15, "pass", `${enabledWithSegments.length} enabled information barriers have segments defined${segmentsTruncated ? `; ${segmentTruncationNote}, so the segment counts are lower bounds; review the remainder in the Admin Console` : ""}.`, barrierEvidence)
         : enabledBarriers.length > 0
-          // "No segments" is asserted only from segment reads that completed; a denied segment read leaves them unread.
-          ? finding(15, "warn", `${enabledBarriers.length} information barriers are enabled but ${isRead(data.barrierSegments) ? "have no visible segments" : "their segments could not be read"}.`, barrierEvidence)
+          // "No segments" is asserted only from segment reads that completed; a denied segment read leaves them unread,
+          // and a listing that stopped before any segment was read leaves whether segments exist unknown.
+          ? finding(15, "warn", `${enabledBarriers.length} information barriers are enabled but ${!isRead(data.barrierSegments) ? "their segments could not be read" : segmentsTruncated ? `their segment listing returned no segments before it stopped (${data.barrierSegments.truncation?.reason ?? "the listing stopped at its cap"}), so whether they have segments is unknown` : "have no visible segments"}.`, barrierEvidence, segmentsTruncated ? barrierManualEvidence : undefined)
           : barriers.length > 0
-            ? finding(15, "warn", `${barriers.length} information barriers exist but none are enabled.`, barrierEvidence)
-            : finding(15, "warn", "No information barriers are configured; confirm segregation between groups is not required.", barrierEvidence, "Document whether regulatory or conflict-of-interest requirements call for information barriers between business units."),
+            ? finding(15, "warn", `${barriers.length} information barriers exist but none are enabled${barriersTruncated ? ` among the barriers read; ${listingTruncationNote("information barrier", data.barriers)}, so enabled barriers may remain unread` : ""}.`, barrierEvidence)
+            : barriersTruncated
+              ? finding(15, "warn", `The information barrier listing returned no barriers before it stopped (${data.barriers.truncation?.reason ?? "the listing stopped at its cap"}), so whether barriers are configured is unknown; review the remainder in the Admin Console.`, barrierEvidence, barrierManualEvidence)
+              : finding(15, "warn", "No information barriers are configured; confirm segregation between groups is not required.", barrierEvidence, "Document whether regulatory or conflict-of-interest requirements call for information barriers between business units."),
     [unreadableInventory("shield_information_barrier_segments", data.barrierSegments, "the segments behind the enabled barriers were not checked")],
     barrierManualEvidence,
   ));
 
   const streamEvidence = {
     sampled_events: whenRead(data.events, events.length),
-    event_types: whenRead(data.events, eventCounts),
+    event_types: sampledValue(data.events, eventCounts),
     lookback_days: data.lookbackDays,
     events_error: data.events.error ?? null,
     verified_scope: "admin_logs stream readability only",
@@ -3429,8 +3502,9 @@ export function assessBoxShieldMonitoringData(data: BoxShieldData): BoxAssessmen
     summary: {
       enterprise_id: data.enterpriseId ?? null,
       shield_rules: shieldReadable ? shieldRules.length : null,
-      information_barriers: whenRead(data.barriers, barriers.length),
-      enabled_information_barriers: whenRead(data.barriers, enabledBarriers.length),
+      information_barriers: observedCount([data.barriers], barriers.length),
+      information_barriers_truncated: whenRead(data.barriers, barriersTruncated),
+      enabled_information_barriers: observedCount([data.barriers], enabledBarriers.length),
       shield_lists: whenRead(data.shieldLists, data.shieldLists.data.length),
       sampled_events: whenRead(data.events, events.length),
       events_truncated: whenRead(data.events, data.events.truncated === true),

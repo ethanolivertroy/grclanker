@@ -959,22 +959,27 @@ test("gap 41: a marker list counts a record once by id, ends after a page that a
   assert.equal(overlapping.truncated, false, "the server ended the list itself, so an overlap is not a truncation");
   assert.equal(overlapping.truncation, undefined);
 
-  // The governance findings over the same server: a re-served policy list is a truncated read whose pass carries
-  // the listing's own exit and whose counts do not exceed the distinct ids.
+  // The governance findings over the same server: a re-served policy list is a truncated read, so the universal claim
+  // over the policies read is a warn that carries the listing's own exit, the counts do not exceed the distinct ids and
+  // are lower bounds, and the policy records are withheld until the listing is read to completion.
   const governance = await assessBoxDataGovernance(routed.client, { listLimit: 100 });
   const retention = findingById(governance, "BOX-12");
-  assert.equal(retention.status, "pass", "an assigned active policy was observed, so the positive evidence stands");
-  assert.equal(retention.summary, `1/1 active retention policies have assignments among the policies read; the retention policy listing stopped after 1 records because ${RESERVED_RECORDS_REASON}, so both counts are lower bounds; review the remainder in the Admin Console.`);
+  assert.equal(retention.status, "warn", "every policy read has assignments, but the total behind the stop is unknown");
+  assert.equal(retention.summary, `1/1 active retention policies have assignments among the 1 policies read, but the retention policy listing stopped after 1 records because ${RESERVED_RECORDS_REASON}; the total number of policies is unknown and the policies beyond the stop were not assessed, so the assignment coverage holds only for the policies read and both counts are lower bounds; review the remainder in the Admin Console.`);
   assert.doesNotMatch(retention.summary, /raise list_limit/, "a higher list_limit does not read past a server that re-serves records");
   assert.equal(retention.evidence.retention_policies_truncated, true);
+  assert.equal(retention.evidence.policies_read, 1, "the read's own size counts the distinct policy once");
   assert.equal(retention.evidence.active_policies, 1);
   assert.equal(retention.evidence.assigned_policies, 1);
-  assert.equal(retention.evidence.retention_policies.length, 1, "the evidence lists the distinct policy once");
+  assert.equal(retention.evidence.retention_policies, null, "policy records are withheld while the listing is truncated");
   assert.equal(governance.summary.retention_policies, 1, "the summary count does not exceed the distinct ids");
+  assert.equal(governance.summary.retention_policies_truncated, true);
   const hold = findingById(governance, "BOX-13");
-  assert.equal(hold.status, "pass");
-  assert.equal(hold.summary, "2/2 active legal hold policies have custodian or content assignments among the policies read; the legal hold policy listing stopped after 2 records because the server repeated its marker, so the remaining records could not be paged, so both counts are lower bounds; review the remainder in the Admin Console.");
+  assert.equal(hold.status, "warn");
+  assert.equal(hold.summary, "2/2 active legal hold policies have custodian or content assignments among the 2 policies read, but the legal hold policy listing stopped after 2 records because the server repeated its marker, so the remaining records could not be paged; the total number of policies is unknown and the policies beyond the stop were not assessed, so the assignment coverage holds only for the policies read and both counts are lower bounds; review the remainder in the Admin Console.");
   assert.equal(hold.evidence.legal_hold_policies_truncated, true);
+  assert.equal(hold.evidence.legal_hold_policies, null);
+  assert.equal(hold.evidence.policies_read, 2);
   assert.equal(governance.summary.legal_hold_policies, 2);
   assert.ok(governance.truncated.some((note) => note.startsWith("retention_policies: ") && note.includes(RESERVED_RECORDS_REASON)), JSON.stringify(governance.truncated));
   assert.ok(governance.truncated.some((note) => note.startsWith("legal_hold_policies: ") && note.includes("repeated its marker")), JSON.stringify(governance.truncated));
@@ -994,9 +999,12 @@ test("gap 41: BOX-12 and BOX-13 test the listing's truncation before the empty b
   assert.equal(emptyRetention.status, "warn");
   assert.equal(emptyRetention.summary, `The retention policy listing returned no policies before it stopped (${EMPTY_MARKER_PAGE_REASON}), so whether active retention policies exist is unknown; review the remainder in the Admin Console.`);
   assert.equal(emptyRetention.evidence.retention_policies_truncated, true);
-  assert.deepEqual(emptyRetention.evidence.retention_policies, []);
-  assert.equal(emptyRetention.evidence.active_policies, 0);
+  assert.equal(emptyRetention.evidence.retention_policies, null, "an empty page under a next_marker names no policy and asserts no absence");
+  assert.equal(emptyRetention.evidence.policies_read, 0, "the read's own size is the one zero that renders");
+  assert.equal(emptyRetention.evidence.active_policies, null, "zero active policies is not asserted from a truncated read");
   assert.equal(emptyRetention.evidence.assigned_policies, null, "zero assigned policies is not asserted from a truncated read");
+  assert.equal(empty.summary.retention_policies, null);
+  assert.equal(empty.summary.legal_hold_policies, null);
   assert.match(emptyRetention.manualEvidence, /Admin Console > Governance > Retention/);
   const emptyHold = findingById(empty, "BOX-13");
   assert.equal(emptyHold.status, "warn");
@@ -1020,33 +1028,254 @@ test("gap 41: BOX-12 and BOX-13 test the listing's truncation before the empty b
   assert.equal(cappedRetention.status, "warn", "an inactive sample from a capped read does not prove that no active policy exists");
   assert.equal(cappedRetention.summary, "None of the 2 retention policies read is active, but the retention policy listing stopped after 2 records because the 2-record cap was reached while the server offered a next marker, so active policies may remain unread; raise list_limit and rerun.");
   assert.equal(cappedRetention.evidence.retention_policies_truncated, true);
-  assert.equal(cappedRetention.evidence.active_policies, 0);
+  assert.equal(cappedRetention.evidence.active_policies, null, "no active policy among a capped sample is not a zero");
+  assert.equal(cappedRetention.evidence.policies_read, 2);
   const cappedHold = findingById(capped, "BOX-13");
   assert.equal(cappedHold.status, "warn");
   assert.equal(cappedHold.summary, "None of the 2 legal hold policies read is active, but the legal hold policy listing stopped after 2 records because the 2-record cap was reached while the server offered a next marker, so active holds may remain unread; raise list_limit and rerun.");
 
-  // A capped read that did observe an assigned active policy: the pass stands and carries the clause, the cap option, and the flag.
+  // A capped read that did observe assigned active policies: a universal claim over the policies read is a warn that
+  // states the seen count against the unknown total, carries the cap option and the flag, and withholds the records
+  // while the counts stand as lower bounds.
   const cappedAssigned = httpBox(hardenedFixture(), {
     routes: {
       "GET /2.0/retention_policies": (url) => boxMarkerPage([ASSIGNED_RETENTION_POLICY, { ...ASSIGNED_RETENTION_POLICY, id: "retention-2" }, { ...ASSIGNED_RETENTION_POLICY, id: "retention-3" }], url),
     },
   });
-  const passed = findingById(await assessBoxDataGovernance(cappedAssigned.client, { listLimit: 2 }), "BOX-12");
-  assert.equal(passed.status, "pass");
-  assert.equal(passed.summary, "2/2 active retention policies have assignments among the policies read; the retention policy listing stopped after 2 records because the 2-record cap was reached while the server offered a next marker, so both counts are lower bounds; raise list_limit and rerun.");
-  assert.equal(passed.evidence.retention_policies_truncated, true);
+  const cappedPass = findingById(await assessBoxDataGovernance(cappedAssigned.client, { listLimit: 2 }), "BOX-12");
+  assert.equal(cappedPass.status, "warn", "a pass over the seen part of a truncated listing is not a pass over the inventory");
+  assert.equal(cappedPass.summary, "2/2 active retention policies have assignments among the 2 policies read, but the retention policy listing stopped after 2 records because the 2-record cap was reached while the server offered a next marker; the total number of policies is unknown and the policies beyond the stop were not assessed, so the assignment coverage holds only for the policies read and both counts are lower bounds; raise list_limit and rerun.");
+  assert.equal(cappedPass.evidence.retention_policies_truncated, true);
+  assert.equal(cappedPass.evidence.retention_policies, null);
+  assert.equal(cappedPass.evidence.policies_read, 2);
+  assert.equal(cappedPass.evidence.active_policies, 2, "a positive count from a truncated read renders as a lower bound");
+  assert.equal(cappedPass.evidence.assigned_policies, 2);
+  assert.match(cappedPass.manualEvidence, /Admin Console > Governance > Retention/);
 
-  // Complete reads keep their wording and carry the flag as false.
+  // Complete reads keep their wording, carry the flag as false, and render the records and every count, zero included.
   const complete = await assessBoxDataGovernance(httpBox(hardenedFixture()).client, { listLimit: 100 });
+  assert.equal(findingById(complete, "BOX-12").status, "pass");
   assert.equal(findingById(complete, "BOX-12").summary, "1/1 active retention policies have assignments.");
   assert.equal(findingById(complete, "BOX-12").evidence.retention_policies_truncated, false);
+  assert.equal(findingById(complete, "BOX-12").evidence.retention_policies.length, 1);
+  assert.equal(findingById(complete, "BOX-13").status, "pass");
   assert.equal(findingById(complete, "BOX-13").summary, "1/1 active legal hold policies have custodian or content assignments.");
   assert.equal(findingById(complete, "BOX-13").evidence.legal_hold_policies_truncated, false);
+  const completeEmpty = await assessBoxDataGovernance(httpBox(hardenedFixture(), {
+    routes: { "GET /2.0/retention_policies": () => jsonResponse({ entries: [], limit: 100 }) },
+  }).client, { listLimit: 100 });
+  assert.equal(findingById(completeEmpty, "BOX-12").status, "fail");
+  assert.deepEqual(findingById(completeEmpty, "BOX-12").evidence.retention_policies, [], "a complete empty read renders the empty list");
+  assert.equal(findingById(completeEmpty, "BOX-12").evidence.active_policies, 0, "and asserts the zero");
+  assert.equal(completeEmpty.summary.retention_policies, 0);
   const denied = await assessBoxDataGovernance(httpBox(hardenedFixture(), {
     routes: { "GET /2.0/retention_policies": () => jsonResponse({ type: "error", status: 403, code: "access_denied_insufficient_permissions", message: "Access denied" }, { status: 403 }) },
   }).client, { listLimit: 100 });
   assert.equal(findingById(denied, "BOX-12").status, "manual");
   assert.equal(findingById(denied, "BOX-12").evidence.retention_policies_truncated, null, "a denied read carries no truncation flag");
+});
+
+test("class 9: a zero from a user listing that stopped short renders null, user labels are withheld with a lower bound beside them, and a complete read renders every zero and name", async () => {
+  // Truncated-empty: an empty first page under a next_marker read nothing, so nothing is asserted absent.
+  const zeroRows = await assessBoxIdentityAccess(httpBox(hardenedFixture(), {
+    routes: { "GET /2.0/users": () => jsonResponse({ entries: [], limit: 100, next_marker: "later" }) },
+  }).client);
+  for (const id of ["BOX-02", "BOX-03", "BOX-17", "BOX-18", "BOX-24"]) {
+    const entry = findingById(zeroRows, id);
+    assert.notEqual(entry.status, "pass", id);
+    assert.match(entry.summary, /the user list stopped after 0 records because the server returned an empty page while still offering a next marker/, id);
+    assert.equal(entry.evidence.sampled_users, 0, `${id}: the read's own size is the one zero that renders`);
+    assert.equal(entry.evidence.users_truncated, true, id);
+    assert.equal(entry.evidence.admin_users, null, `${id}: zero admins is not asserted from a truncated read`);
+  }
+  assert.equal(findingById(zeroRows, "BOX-02").evidence.privileged_users, null);
+  assert.equal(findingById(zeroRows, "BOX-02").evidence.exempt_privileged_users, null);
+  assert.equal(findingById(zeroRows, "BOX-02").evidence.exempt_privileged_users_count, null);
+  assert.equal(findingById(zeroRows, "BOX-03").evidence.exempt_users, null);
+  assert.equal(findingById(zeroRows, "BOX-17").evidence.admins, null);
+  assert.equal(findingById(zeroRows, "BOX-17").evidence.coadmins, null);
+  assert.equal(findingById(zeroRows, "BOX-17").evidence.coadmin_users, null);
+  assert.equal(findingById(zeroRows, "BOX-18").evidence.coadmins, null);
+  assert.equal(findingById(zeroRows, "BOX-24").evidence.active_users, null);
+  assert.equal(findingById(zeroRows, "BOX-24").evidence.inactive_candidates, null);
+  assert.equal(findingById(zeroRows, "BOX-24").evidence.inactive_candidates_count, null);
+  assert.deepEqual(
+    [zeroRows.summary.sampled_users, zeroRows.summary.users_truncated, zeroRows.summary.admins, zeroRows.summary.coadmins, zeroRows.summary.exempt_privileged_users, zeroRows.summary.inactive_candidates],
+    [0, true, null, null, null, null],
+    "the summary carries the read's size and its flag, and no zero derived from the truncated listing",
+  );
+
+  // Truncated-partial: the users read are real, so the counts render as lower bounds while the labels are withheld.
+  const users = [
+    user("admin-1", { role: "admin" }),
+    user("coadmin-1", { role: "coadmin", is_exempt_from_login_verification: true }),
+    user("member-1"),
+    user("member-2"),
+  ];
+  const events = [loginEvent("admin-1", "ADMIN_LOGIN")];
+  const capped = await assessBoxIdentityAccess(httpBox({ ...hardenedFixture(), users, events }).client, { userLimit: 2 });
+  assertStatuses(capped, { "BOX-02": "fail", "BOX-17": "warn", "BOX-18": "manual", "BOX-24": "warn" });
+  const cappedAdminMfa = findingById(capped, "BOX-02");
+  assert.match(cappedAdminMfa.summary, /^1\/2 admin or co-admin accounts are exempt from login verification/);
+  assert.equal(cappedAdminMfa.evidence.users_truncated, true);
+  assert.equal(cappedAdminMfa.evidence.sampled_users, 2);
+  assert.equal(cappedAdminMfa.evidence.privileged_users, 2, "a positive count from a truncated read is a lower bound");
+  assert.equal(cappedAdminMfa.evidence.exempt_privileged_users, null, "the exempt admin is not named while the listing is truncated");
+  assert.equal(cappedAdminMfa.evidence.exempt_privileged_users_count, 1, "but is counted");
+  assert.match(cappedAdminMfa.evidence.inventory_gap, /the user list stopped after 2 records because the 2-record cap was reached/);
+  const cappedAdmins = findingById(capped, "BOX-17");
+  assert.equal(cappedAdmins.evidence.admins, null);
+  assert.equal(cappedAdmins.evidence.admin_users, 1);
+  assert.equal(cappedAdmins.evidence.coadmins, null);
+  assert.equal(cappedAdmins.evidence.coadmin_users, 1);
+  const cappedCoAdmins = findingById(capped, "BOX-18");
+  assert.equal(cappedCoAdmins.summary, "1 co-admin accounts exist among the users read; the Box API does not expose individual co-admin permission sets, so scoping must be confirmed in the Admin Console.");
+  assert.equal(cappedCoAdmins.evidence.coadmins, null);
+  assert.equal(cappedCoAdmins.evidence.coadmin_users, 1);
+  const cappedInactive = findingById(capped, "BOX-24");
+  assert.equal(cappedInactive.evidence.active_users, 2);
+  assert.equal(cappedInactive.evidence.inactive_candidates, null, "the inactive co-admin is not named while the user listing is truncated");
+  assert.equal(cappedInactive.evidence.inactive_candidates_count, 1, "the count over the users read is a lower bound");
+  assert.equal(cappedInactive.evidence.inactive_candidates_with_failed_logins, null);
+  assert.equal(cappedInactive.evidence.inactive_candidates_with_failed_logins_count, null, "zero among a truncated read is not asserted");
+  assert.deepEqual([capped.summary.admins, capped.summary.coadmins, capped.summary.exempt_privileged_users, capped.summary.inactive_candidates, capped.summary.users_truncated], [1, 1, 1, 1, true]);
+  for (const text of JSON.stringify(capped).matchAll(/coadmin-1|member-1|member-2/g)) {
+    assert.fail(`a user label from the truncated listing reached the output: ${text[0]}`);
+  }
+
+  // Complete: the same enterprise read whole names the exempt co-admin and the inactive users and asserts every zero.
+  const complete = await assessBoxIdentityAccess(httpBox({ ...hardenedFixture(), users, events }).client, { userLimit: 100 });
+  const completeAdminMfa = findingById(complete, "BOX-02");
+  assert.equal(completeAdminMfa.evidence.users_truncated, false);
+  assert.deepEqual(completeAdminMfa.evidence.exempt_privileged_users, ["coadmin-1@example.com"]);
+  assert.equal(completeAdminMfa.evidence.exempt_privileged_users_count, 1);
+  assert.deepEqual(findingById(complete, "BOX-03").evidence.exempt_users, []);
+  assert.equal(findingById(complete, "BOX-03").evidence.exempt_users_count, 0);
+  assert.deepEqual(findingById(complete, "BOX-17").evidence.admins, ["admin-1@example.com"]);
+  assert.deepEqual(findingById(complete, "BOX-18").evidence.coadmins, ["coadmin-1@example.com"]);
+  const completeInactive = findingById(complete, "BOX-24");
+  assert.deepEqual(completeInactive.evidence.inactive_candidates, ["coadmin-1@example.com", "member-1@example.com", "member-2@example.com"]);
+  assert.equal(completeInactive.evidence.inactive_candidates_count, 3);
+  assert.deepEqual(completeInactive.evidence.inactive_candidates_with_failed_logins, []);
+  assert.equal(completeInactive.evidence.inactive_candidates_with_failed_logins_count, 0);
+  assert.equal(completeInactive.evidence.activity_events, 1);
+  assert.equal(completeInactive.evidence.failed_login_events, 0, "a zero from a complete event read is asserted");
+});
+
+test("class 9: the allowlist and information barrier findings keep a presence-based pass under a truncated listing but state the stop, and never assert an empty allowlist or an unsegmented barrier from a page that stopped short", async () => {
+  const entries = [
+    { id: "entry-1", type: "collaboration_whitelist_entry", domain: "partner.example", direction: "both", created_at: "2026-06-01T00:00:00Z" },
+    { id: "entry-2", type: "collaboration_whitelist_entry", domain: "vendor.example", direction: "inbound", created_at: "2026-06-01T00:00:00Z" },
+    { id: "entry-3", type: "collaboration_whitelist_entry", domain: "supplier.example", direction: "outbound", created_at: "2026-06-01T00:00:00Z" },
+  ];
+
+  // Truncated-empty allowlist: the mode is read, the listing read nothing, so the allowlist is not called empty.
+  const zeroRows = await assessBoxSharingCollaboration(httpBox(hardenedFixture(), {
+    routes: { "GET /2.0/collaboration_whitelist_entries": () => jsonResponse({ entries: [], limit: 100, next_marker: "later" }) },
+  }).client, { listLimit: 100 });
+  const zeroMode = findingById(zeroRows, "BOX-04");
+  assert.equal(zeroMode.status, "warn");
+  assert.equal(zeroMode.summary, `External collaboration is limited to allowlisted domains, but the collaboration allowlist listing returned no entries before it stopped (${EMPTY_MARKER_PAGE_REASON}), so whether the allowlist is populated is unknown; review the remainder in the Admin Console.`);
+  assert.doesNotMatch(zeroMode.summary, /allowlist is empty/);
+  assert.equal(zeroMode.evidence.allowlist_entries, null, "zero entries is not asserted from a truncated read");
+  assert.equal(zeroMode.evidence.allowlist_entries_truncated, true);
+  const zeroAllowlist = findingById(zeroRows, "BOX-05");
+  assert.equal(zeroAllowlist.status, "warn");
+  assert.match(zeroAllowlist.summary, /^The collaboration allowlist collection stopped at the cap \(0 entries and 0 exempt users retrieved\)/);
+  assert.equal(zeroAllowlist.evidence.allowlist_entries, null);
+  assert.equal(zeroAllowlist.evidence.allowlist_entries_count, null);
+  assert.equal(zeroAllowlist.evidence.public_email_domains, null);
+  assert.equal(zeroAllowlist.evidence.public_email_domain_count, null);
+  assert.equal(zeroRows.summary.allowlist_entries, null);
+  assert.equal(zeroRows.summary.allowlist_entries_truncated, true);
+  assert.equal(zeroRows.summary.public_email_domains, null);
+
+  // Truncated-partial allowlist: the mode pass rests on the setting and stands with the stop stated; the domains read
+  // are withheld from the evidence while the counts beside them stand as lower bounds.
+  const capped = await assessBoxSharingCollaboration(httpBox({ ...hardenedFixture(), allowlistEntries: entries }).client, { listLimit: 2 });
+  const cappedMode = findingById(capped, "BOX-04");
+  assert.equal(cappedMode.status, "pass", "the pass rests on the enterprise setting, not on the listing");
+  assert.equal(cappedMode.summary, "External collaboration is limited to allowlisted domains (2 domain entries visible; the collaboration allowlist listing stopped after 2 records because the 2-record cap was reached while the server offered a next marker, so the entry count is a lower bound; raise list_limit and rerun).");
+  assert.equal(cappedMode.evidence.allowlist_entries, 2);
+  assert.equal(cappedMode.evidence.allowlist_entries_truncated, true);
+  const cappedAllowlist = findingById(capped, "BOX-05");
+  assert.equal(cappedAllowlist.status, "warn");
+  assert.equal(cappedAllowlist.evidence.allowlist_entries, null, "domain names are withheld while the listing is truncated");
+  assert.equal(cappedAllowlist.evidence.allowlist_entries_count, 2);
+  assert.equal(cappedAllowlist.evidence.both_direction_entries, 1);
+  assert.equal(cappedAllowlist.evidence.stale_entries, null);
+  assert.equal(cappedAllowlist.evidence.stale_entry_count, null, "zero stale entries among a truncated read is not asserted");
+  assert.equal(cappedAllowlist.evidence.allowlist_truncated, true);
+  assert.doesNotMatch(JSON.stringify(capped), /partner\.example|vendor\.example/, "no domain from the truncated listing reaches the output");
+  assert.equal(capped.summary.allowlist_entries, 2);
+
+  // Complete allowlist: the domains are named and every zero is asserted.
+  const complete = await assessBoxSharingCollaboration(httpBox({ ...hardenedFixture(), allowlistEntries: entries }).client, { listLimit: 100 });
+  assert.equal(findingById(complete, "BOX-04").summary, "External collaboration is limited to allowlisted domains (3 domain entries visible).");
+  assert.equal(findingById(complete, "BOX-04").evidence.allowlist_entries_truncated, false);
+  assert.deepEqual(findingById(complete, "BOX-05").evidence.allowlist_entries, ["partner.example (both)", "vendor.example (inbound)", "supplier.example (outbound)"]);
+  assert.equal(findingById(complete, "BOX-05").evidence.allowlist_entries_count, 3);
+  assert.deepEqual(findingById(complete, "BOX-05").evidence.public_email_domains, []);
+  assert.equal(findingById(complete, "BOX-05").evidence.public_email_domain_count, 0);
+  assert.equal(findingById(complete, "BOX-05").evidence.stale_entry_count, 0);
+  const completeEmpty = await assessBoxSharingCollaboration(httpBox({ ...hardenedFixture(), allowlistEntries: [] }).client, { listLimit: 100 });
+  assert.match(findingById(completeEmpty, "BOX-04").summary, /but the allowlist is empty/, "a complete empty read is the one that calls the allowlist empty");
+  assert.equal(findingById(completeEmpty, "BOX-04").evidence.allowlist_entries, 0);
+  assert.deepEqual(findingById(completeEmpty, "BOX-05").evidence.allowlist_entries, []);
+  assert.equal(findingById(completeEmpty, "BOX-05").evidence.allowlist_entries_count, 0);
+
+  // Barrier segments: an empty segment page under a next_marker leaves whether the barrier has segments unknown.
+  const zeroSegments = await assessBoxShieldMonitoring(httpBox(hardenedFixture(), {
+    routes: { "GET /2.0/shield_information_barrier_segments": () => jsonResponse({ entries: [], limit: 100, next_marker: "later" }) },
+  }).client);
+  const zeroBarrier = findingById(zeroSegments, "BOX-15");
+  assert.equal(zeroBarrier.status, "warn");
+  assert.equal(zeroBarrier.summary, `1 information barriers are enabled but their segment listing returned no segments before it stopped (for policy barrier-1, ${EMPTY_MARKER_PAGE_REASON}), so whether they have segments is unknown.`);
+  assert.doesNotMatch(zeroBarrier.summary, /no visible segments/);
+  assert.equal(zeroBarrier.evidence.barriers[0].segments, null, "zero segments is not asserted from a truncated segment listing");
+  assert.equal(zeroBarrier.evidence.segments_truncated, true);
+  assert.equal(zeroBarrier.evidence.enabled_barriers, 1);
+  assert.match(zeroBarrier.manualEvidence, /Information Barriers/);
+
+  // A capped segment listing: the pass rests on a segment existing and stands with the stop stated; the count is a lower bound.
+  const segments = [
+    { id: "segment-1", type: "shield_information_barrier_segment", name: "Research" },
+    { id: "segment-2", type: "shield_information_barrier_segment", name: "Trading" },
+  ];
+  const cappedSegments = await assessBoxShieldMonitoring(httpBox({ ...hardenedFixture(), barrierSegments: segments }, {
+    routes: { "GET /2.0/shield_information_barrier_segments": (url) => jsonResponse({ entries: segments.slice(0, 1), limit: 1, next_marker: "1" }) },
+  }).client);
+  const cappedBarrier = findingById(cappedSegments, "BOX-15");
+  assert.equal(cappedBarrier.status, "pass", "a segment was read, so the presence-based pass stands");
+  assert.match(cappedBarrier.summary, /^1 enabled information barriers have segments defined; the segment listing stopped after 1 segments because for policy barrier-1, the server re-served already-collected records under a new marker, so the remaining records could not be paged, so the segment counts are lower bounds; review the remainder in the Admin Console\.$/);
+  assert.equal(cappedBarrier.evidence.barriers[0].segments, 1);
+  assert.equal(cappedBarrier.evidence.segments_truncated, true);
+
+  // Complete: the segment count and the flag as false.
+  const completeBarrier = findingById(await assessBoxShieldMonitoring(httpBox(hardenedFixture()).client), "BOX-15");
+  assert.equal(completeBarrier.summary, "1 enabled information barriers have segments defined.");
+  assert.equal(completeBarrier.evidence.barriers[0].segments, 1);
+  assert.equal(completeBarrier.evidence.segments_truncated, false);
+  assert.equal(completeBarrier.evidence.barriers_truncated, false);
+
+  // Device pins: an empty page under a next_marker is not "no device pins", and a capped read names no product.
+  const zeroPins = findingById(await assessBoxDataGovernance(httpBox(hardenedFixture(), {
+    routes: { "GET /2.0/enterprises/{enterprise}/device_pinners": () => jsonResponse({ entries: [], limit: 100, next_marker: "later" }) },
+  }).client), "BOX-10");
+  assert.equal(zeroPins.status, "manual");
+  assert.equal(zeroPins.summary, `The device pin listing returned no pins before it stopped (${EMPTY_MARKER_PAGE_REASON}), so whether device pinning is in use is unknown; review the remainder in the Admin Console.`);
+  assert.equal(zeroPins.evidence.device_pins, null);
+  assert.equal(zeroPins.evidence.device_pin_products, null);
+  assert.equal(zeroPins.evidence.device_pins_truncated, true);
+  const pins = [{ id: "pin-1", type: "device_pinner", product_name: "iPhone" }, { id: "pin-2", type: "device_pinner", product_name: "Box Drive" }];
+  const cappedPins = findingById(await assessBoxDataGovernance(httpBox({ ...hardenedFixture(), devicePinners: pins }).client, { listLimit: 1 }), "BOX-10");
+  assert.equal(cappedPins.status, "manual");
+  assert.match(cappedPins.summary, /^1 device pins are registered \(a lower bound: the device pin listing stopped after 1 records because the 1-record cap was reached while the server offered a next marker; raise list_limit and rerun\); the Box API/);
+  assert.equal(cappedPins.evidence.device_pins, 1);
+  assert.equal(cappedPins.evidence.device_pin_products, null, "the product breakdown is withheld while the listing is truncated");
+  const completePins = findingById(await assessBoxDataGovernance(httpBox({ ...hardenedFixture(), devicePinners: pins }).client, { listLimit: 100 }), "BOX-10");
+  assert.deepEqual(completePins.evidence.device_pin_products, { iPhone: 1, "Box Drive": 1 });
+  assert.equal(completePins.evidence.device_pins_truncated, false);
 });
 
 test("verdict rule 9: non-JSON error bodies are described, never echoed, into Box error text", async () => {
@@ -1404,9 +1633,11 @@ test("assessBoxIdentityAccess warns instead of passing on an empty user inventor
   assert.match(findingById(empty, "BOX-02").summary, /^Multi-factor authentication is required for managed users \(totp\), but admin exemptions could not be assessed/);
   assert.match(findingById(empty, "BOX-03").summary, /per-user exemptions could not be assessed/);
   assert.equal(findingById(empty, "BOX-17").evidence.sampled_users, 0);
-  assert.equal(findingById(empty, "BOX-18").evidence.coadmins, 0);
-  assert.equal(findingById(empty, "BOX-24").evidence.active_users, 0);
+  assert.deepEqual(findingById(empty, "BOX-18").evidence.coadmins, [], "a complete empty read names no co-admin");
+  assert.equal(findingById(empty, "BOX-18").evidence.coadmin_users, 0);
+  assert.equal(findingById(empty, "BOX-24").evidence.active_users, 0, "zero active users is asserted from a complete read");
   assert.equal(empty.summary.admins, 0);
+  assert.equal(empty.summary.users_truncated, false);
 
   const noAdmin = await assessBoxIdentityAccess(createStubClient({
     ...hardenedFixture(),
