@@ -2627,11 +2627,13 @@ const PLANTED_JWT_PAYLOAD = "Zm9vYmFyLXByb2JlLXBheWxvYWQtOTgxMjM0NTY3ODkw";
 const PLANTED_JWT_SIGNATURE = "c2lnbmF0dXJlLXBhcnQtb2YtdGhlLWpvdC1nb2VzLWhlcmU";
 const PLANTED_JWT = `eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9.${PLANTED_JWT_PAYLOAD}.${PLANTED_JWT_SIGNATURE}`;
 const PLANTED_PEM = "-----BEGIN PRIVATE KEY-----\nMIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQC7\n-----END PRIVATE KEY-----";
-const PLANTED_CANARIES = [PLANTED_TOKEN, PLANTED_STRIPE_KEY, PLANTED_JWT_PAYLOAD, PLANTED_JWT_SIGNATURE];
+/** The name-shaped proof of the CodeRabbit #81 auth-param extension (discussion_r4081776771): no shape rule removes it, so only the proof rule can, and it is a canary of the data-side probe. */
+const PROOF_VALUE = "proof-lumen-vexar";
+const PLANTED_CANARIES = [PLANTED_TOKEN, PLANTED_STRIPE_KEY, PLANTED_JWT_PAYLOAD, PLANTED_JWT_SIGNATURE, PROOF_VALUE];
 const BEARER_ID_UUID = "6f1c2b3a-4d5e-4f60-8a9b-0c1d2e3f4a5b";
 /** The free-text note planted in the export probe: two unambiguous shapes, a header carrier, and an identifier that must survive. */
-const PLANTED_NOTE = `Runbook: key ${PLANTED_STRIPE_KEY} end; bearer ${PLANTED_JWT}; Authorization: Bearer ${PLANTED_TOKEN}; cluster prod-us-east-2026-cluster was read`;
-const REDACTED_NOTE = "Runbook: key [REDACTED] end; bearer [REDACTED]; Authorization: Bearer [REDACTED]; cluster prod-us-east-2026-cluster was read";
+const PLANTED_NOTE = `Runbook: key ${PLANTED_STRIPE_KEY} end; bearer ${PLANTED_JWT}; Authorization: Bearer ${PLANTED_TOKEN}; cluster prod-us-east-2026-cluster was read; challenge realm="api", nonce="n", response="${PROOF_VALUE}"`;
+const REDACTED_NOTE = "Runbook: key [REDACTED] end; bearer [REDACTED]; Authorization: Bearer [REDACTED]; cluster prod-us-east-2026-cluster was read; challenge realm=\"api\", nonce=\"[REDACTED]\", response=\"[REDACTED]\"";
 
 /**
  * Scheme-word order (CodeRabbit r4078025849): a credential-named key loses its value before any
@@ -2879,6 +2881,72 @@ test("CodeRabbit #81 quoted auth-params, end to end: a 401 body that echoes the 
   assert.match(result.error, /^Sumo Logic request to \/v1\/roles failed \(401[^)]*\): Credential could not be verified\. /);
   assert.ok(result.error.endsWith(ECHOED_HEADER_REDACTED), `the echoed header reaches the caller redacted: ${result.error}`);
   assertNoWindowOf(result.error, QUOTED_TOKEN, "Sumo Logic 401 body");
+});
+
+/**
+ * CodeRabbit on #81 (discussion_r4081776771): a challenge-shaped pair list is not exempt when a later
+ * parameter is a proof. A proof parameter (`response`, `signature`, `oauth_signature`, `mac`, `sig`) loses its
+ * value wherever its pair sits in a list with a challenge parameter (`realm`, `nonce`, `cnonce`, `opaque`, `qop`,
+ * an `oauth_*` name), with or without a scheme word or a header in front of the list and whatever the value's
+ * shape, and a bare proof inside a scheme word's list goes whatever its neighbours. A proof-free challenge keeps
+ * its descriptive values (its nonce goes as a credential-named pair does everywhere), and a pair list of another
+ * kind keeps its values. Before the fix `response` and `mac` survived as a bare data value, after a literal
+ * escape, inside a JSON string, and as a bare value inside a Digest, MAC, or Hawk header's list.
+ */
+const PROOF_PARAM_ROWS = [
+  [`realm="api", nonce="n", response="${PROOF_VALUE}"`, 'realm="api", nonce="[REDACTED]", response="[REDACTED]"'],
+  [`realm=api, nonce=n, response=${PROOF_VALUE}`, "realm=api, nonce=[REDACTED], response=[REDACTED]"],
+  [`realm="api", nonce="n", signature="${PROOF_VALUE}"`, 'realm="api", nonce="[REDACTED]", signature="[REDACTED]"'],
+  [`realm="api", nonce="n", oauth_signature="${PROOF_VALUE}"`, 'realm="api", nonce="[REDACTED]", oauth_signature="[REDACTED]"'],
+  [`realm="api", nonce="n", mac="${PROOF_VALUE}"`, 'realm="api", nonce="[REDACTED]", mac="[REDACTED]"'],
+  [`realm=api, nonce=n, mac=${PROOF_VALUE}`, "realm=api, nonce=[REDACTED], mac=[REDACTED]"],
+  [`realm="api", nonce="n", sig="${PROOF_VALUE}"`, 'realm="api", nonce="[REDACTED]", sig="[REDACTED]"'],
+  [`realm="api", response="${PROOF_VALUE}"`, 'realm="api", response="[REDACTED]"'],
+  [`request failed\\nrealm=\\"api\\", nonce=\\"n\\", response=\\"${PROOF_VALUE}\\"`, 'request failed\\nrealm=\\"api\\", nonce=\\"[REDACTED]\\", response=\\"[REDACTED]\\"'],
+  [`request failed\\u000arealm="api", nonce="n", response="${PROOF_VALUE}"`, 'request failed\\u000arealm="api", nonce="[REDACTED]", response="[REDACTED]"'],
+  [`{"note":"realm=\\"api\\", nonce=\\"n\\", response=\\"${PROOF_VALUE}\\""}`, '{"note":"realm=\\"api\\", nonce=\\"[REDACTED]\\", response=\\"[REDACTED]\\""}'],
+  [`{"note":"id=\\"h480djs93hd8\\", ts=\\"1336363200\\", nonce=\\"dj83hs9s\\", mac=\\"${PROOF_VALUE}\\""}`, '{"note":"id=\\"h480djs93hd8\\", ts=\\"1336363200\\", nonce=\\"[REDACTED]\\", mac=\\"[REDACTED]\\""}'],
+  [`upstream said Digest realm="api", nonce="n", response="${PROOF_VALUE}" and moved on`, 'upstream said Digest realm="api", nonce="[REDACTED]", response="[REDACTED]" and moved on'],
+  [`upstream said Digest realm=api, nonce=n, response=${PROOF_VALUE} and moved on`, "upstream said Digest realm=api, nonce=[REDACTED], response=[REDACTED] and moved on"],
+  [`Bearer realm=api, response=${PROOF_VALUE}`, "Bearer realm=api, response=[REDACTED]"],
+  [`WWW-Authenticate: Digest realm="api", nonce="n", response="${PROOF_VALUE}"`, 'WWW-Authenticate: Digest realm="api", nonce="[REDACTED]", response="[REDACTED]"'],
+  [`WWW-Authenticate: Digest realm=api, nonce=n, response=${PROOF_VALUE}`, "WWW-Authenticate: Digest realm=api, nonce=[REDACTED], response=[REDACTED]"],
+  [`Authorization: Digest username="auditor", realm="api", nonce="n", uri="/api/v1/things", response=${PROOF_VALUE}`, 'Authorization: Digest username="[REDACTED]", realm="api", nonce="[REDACTED]", uri="[REDACTED]", response=[REDACTED]'],
+  [`Authorization: Digest realm=api, nonce=n, response=${PROOF_VALUE}`, "Authorization: Digest [REDACTED], nonce=[REDACTED], response=[REDACTED]"],
+  [`Authorization: Digest username="auditor", response=${PROOF_VALUE}`, 'Authorization: Digest username="[REDACTED]", response=[REDACTED]'],
+  [`Authorization: MAC id="h480djs93hd8", ts="1336363200", nonce="dj83hs9s", mac="${PROOF_VALUE}"`, 'Authorization: [REDACTED] id="h480djs93hd8", ts="1336363200", nonce="[REDACTED]", mac="[REDACTED]"'],
+  [`Authorization: Hawk id="dh37fgj492je", ts="1353832234", nonce="j4h3g2", ext="some-app-ext-data", mac="${PROOF_VALUE}"`, 'Authorization: [REDACTED] id="dh37fgj492je", ts="1353832234", nonce="[REDACTED]", ext="some-app-ext-data", mac="[REDACTED]"'],
+  ['WWW-Authenticate: Bearer realm="api"', 'WWW-Authenticate: Bearer realm="api"'],
+  ['WWW-Authenticate: Digest realm="api", qop="auth", nonce="n"', 'WWW-Authenticate: Digest realm="api", qop="auth", nonce="[REDACTED]"'],
+  ['Digest realm="api", qop="auth", nonce="n"', 'Digest realm="api", qop="auth", nonce="[REDACTED]"'],
+  ['realm="api", qop="auth", nonce="n"', 'realm="api", qop="auth", nonce="[REDACTED]"'],
+  ["unexpected response: 502 Bad Gateway from upstream", "unexpected response: 502 Bad Gateway from upstream"],
+  ["API response=200 in 30ms", "API response=200 in 30ms"],
+  ['index=web status=500 response=slow host="edge-01"', 'index=web status=500 response=slow host="edge-01"'],
+  ["device mac=00:11:22:33:44:55 joined vlan=10", "device mac=00:11:22:33:44:55 joined vlan=10"],
+];
+/** The Digest header and the challenge-shaped list a 401 body echoes in the end-to-end probe, with a bare proof and a quoted one, and how they must reach the caller. */
+const ECHOED_PROOF = `request headers: Authorization: Digest username="auditor", realm="api", nonce="n", uri="/api/v1/things", response=${PROOF_VALUE}; challenge: realm="api", nonce="n", response="${PROOF_VALUE}"`;
+const ECHOED_PROOF_REDACTED = 'request headers: Authorization: Digest username="[REDACTED]", realm="api", nonce="[REDACTED]", uri="[REDACTED]", response=[REDACTED]; challenge: realm="api", nonce="[REDACTED]", response="[REDACTED]"';
+
+test("CodeRabbit #81 proof parameters: a proof parameter in a challenge-shaped pair list loses its value bare, unquoted, after a JSON escape, inside a JSON string, in prose after a scheme word, and under a header, through the error scrubber, the data scrubber, and redactSnapshot, while a proof-free challenge keeps its descriptive values and an unrelated pair list stays", () => {
+  assertRows(scrubErrorText, PROOF_PARAM_ROWS, "proof parameter, error side");
+  assertRows(scrubDataText, PROOF_PARAM_ROWS, "proof parameter, data side");
+  assertRows((text) => redactSnapshot({ note: text, nested: [{ deeper: text }] }).nested[0].deeper, PROOF_PARAM_ROWS, "proof parameter, redactSnapshot leaf");
+  for (const [input, expected] of PROOF_PARAM_ROWS) {
+    if (!input.includes(PROOF_VALUE)) continue;
+    for (const output of [scrubErrorText(input), scrubDataText(input), redactSnapshot({ note: input }).note]) assertNoWindowOf(output, PROOF_VALUE, `proof parameter: ${input} -> ${expected}`);
+  }
+});
+
+test("CodeRabbit #81 proof parameters, end to end: a 401 body that echoes a Digest header with a bare proof and a challenge-shaped list with a quoted one reaches the caller with both proofs removed and no window of them", async () => {
+  const client = new SumologicApiClient(sampleConfig(), { fetchImpl: async () => jsonResponse({ errors: [{ code: "unauthorized", message: `Credential could not be verified. ${ECHOED_PROOF}` }] }, { status: 401 }), sleepImpl: async () => {}, maxRetries: 1 });
+  const result = await client.listRoles();
+  assert.equal(result.ok, false);
+  assert.equal(result.httpStatus, 401);
+  assert.match(result.error, /^Sumo Logic request to \/v1\/roles failed \(401[^)]*\): Credential could not be verified\. /);
+  assert.ok(result.error.endsWith(ECHOED_PROOF_REDACTED), `the echoed proofs reach the caller redacted: ${result.error}`);
+  assertNoWindowOf(result.error, PROOF_VALUE, "Sumo Logic 401 body");
 });
 
 test("reviewer C final verdict, scheme-word order (r4078025849) and the key audit: a credential-named key loses its value before any scheme word is read in both spellings, scheme words act only under Authorization-style keys and bare in prose, bearer ids go, setting suffixes and URL-valued webhook keys keep their values, and the flag, path, escaped-URL, and cookie carriers are read", () => {
