@@ -330,6 +330,16 @@ const SETTING_ROWS = Object.freeze([
   ["client_id", "my-app-2026"],
   ["tenant_id", "2f3c1a9e-7b6d-4c5e-8f9a-0b1c2d3e4f5a"],
   ["user_name", "svc-backup-2026"],
+  // Review of #78 (01:40 rulings): the Vault AppRole settings and a webhook setting that is not the URL.
+  ["secret_id_ttl", "3600"],
+  ["token_max_ttl", "7200"],
+  ["secret_id_num_uses", "5"],
+  ["token_num_uses", "0"],
+  ["secret_id_bound_cidrs", "10.0.0.0/8"],
+  ["token_bound_cidrs", "10.0.0.0/8"],
+  ["secret_id_accessor", "6b1f4c2e-9d3a-4f7b-8c5e-2a1d0e9f8b7c"],
+  ["token_accessor", "6b1f4c2e-9d3a-4f7b-8c5e-2a1d0e9f8b7c"],
+  ["webhook_count", "3"],
 ]);
 
 /**
@@ -345,10 +355,38 @@ function mainCredentialKey(key) {
 }
 
 /** The setting rows main at 02967cc redacted in its text scrubs (main's key rule, main's value rule) and the head keeps. */
-const MAIN_REDACTED_SETTINGS = Object.freeze(["BOX_TOKEN_URL", "auth_method", "token_endpoint", "token_uri", "tokenUrl", "oauth_signature_method", "token_audience", "jwt_issuer", "secret_name", "key_name", "key_id", "api_key_id"]);
+const MAIN_REDACTED_SETTINGS = Object.freeze([
+  "BOX_TOKEN_URL",
+  "auth_method",
+  "token_endpoint",
+  "token_uri",
+  "tokenUrl",
+  "oauth_signature_method",
+  "token_audience",
+  "jwt_issuer",
+  "secret_name",
+  "key_name",
+  "key_id",
+  "api_key_id",
+  "secret_id_bound_cidrs",
+  "token_bound_cidrs",
+  "secret_id_accessor",
+  "token_accessor",
+]);
 
 /** The setting rows main redacted in `redactSecretValues` over an object (every key main classified, whatever the value). */
-const MAIN_REDACTED_SETTING_ENTRIES = Object.freeze([...MAIN_REDACTED_SETTINGS, "BOX_AUTH_METHOD", "BOX_JWT_ALGORITHM", "token_type", "auth_mode", "token_shape"]);
+const MAIN_REDACTED_SETTING_ENTRIES = Object.freeze([
+  ...MAIN_REDACTED_SETTINGS,
+  "BOX_AUTH_METHOD",
+  "BOX_JWT_ALGORITHM",
+  "token_type",
+  "auth_mode",
+  "token_shape",
+  "secret_id_ttl",
+  "token_max_ttl",
+  "secret_id_num_uses",
+  "token_num_uses",
+]);
 
 test("settings: a key whose final segment is a setting suffix keeps its value in every form, frame, and sink, and the rows main redacted are exactly the documented list", () => {
   let trials = 0;
@@ -386,7 +424,9 @@ test("settings: the exceptions stay credential keys whatever their suffix and lo
     ["slack_hook_url", "https://hooks.slack.com/services/abcdefghijkl"],
     ["callback_url", "https://app.example.com/oauth/return"],
     ["webhook", "https://hooks.example.com/services/foo/bar/abcdefghijkl"],
-    ["webhook_count", "abcdefghijkl"],
+    ["webhook_path", "/services/foo/bar/abcdefghijkl"],
+    ["token_id", "abcdefghijkl"],
+    ["tokenId", "abcdefghijkl"],
     ["session_id", "abcdefghijkl"],
     ["user_session_id", "abcdefghijkl"],
     ["PHPSESSID", "abcdefghijkl"],

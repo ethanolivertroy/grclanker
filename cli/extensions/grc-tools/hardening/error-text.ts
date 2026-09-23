@@ -257,8 +257,9 @@ const AUTH_PARAM_PATTERN = /^(?:realm|error|error_description|error_uri|scope|ch
 // `InvalidAuthenticationToken`) are handled by the generic pair rule below under the same ruling,
 // with the one prose exemption described there, and a compound key whose final segment is a setting
 // suffix (`token_url`, `auth_method`, `client_id`) is a setting, not a credential key (see
-// `SETTING_SUFFIXES`). The secret id (`secret_id`, `VAULT_SECRET_ID`, `role_secret_id`) is a bearer
-// name like the session names, so it is explicit here with any prefix and takes any value.
+// `SETTING_SUFFIXES`). The bearer ids (`secret_id`, `VAULT_SECRET_ID`, `role_secret_id`, `token_id`)
+// are bearer names like the session names, so they are explicit here with any prefix and take any
+// value, the prose exemption never applying to them.
 const CREDENTIAL_PAIR_NAMES: readonly string[] = [
   "api[_-]?key",
   "app[_-]?key",
@@ -274,6 +275,7 @@ const CREDENTIAL_PAIR_NAMES: readonly string[] = [
   "passcode",
   "secret",
   "[a-z0-9_-]*secret[_-]?id",
+  "[a-z0-9_-]*token[_-]?id",
   "token",
   "access[_-]?token",
   "refresh[_-]?token",
@@ -398,25 +400,33 @@ const EXTRA_CREDENTIAL_KEY_SEGMENTS = new Set(["sid", "sig", "pwd", "passwd", "p
 // `auth_method=client_secret`, `token_endpoint=<url>`, `oauth_signature_method=HMAC-SHA1`,
 // `secret_name`, `private_key_path`, `credentials_file`, `token_limit`), as does a threshold
 // (`max_keys`, `min_password_length`) and an identifier (`client_id`, `api_key_id`, `tenant_id`,
-// `key_name`). Its value stays unless it is token-shaped (the long-token decision, which the data
-// scrubs apply to the value under such a key even though their long-token rule is otherwise off, so
-// a 40-character `private_key_id` still goes) or a registered secret, and a URL value passes the URL
-// rule like any other (userinfo and query removed, path kept). Three families stay credential keys
-// whatever their suffix: the webhook and callback keys (`webhook*`, `*hook_url`, `callback_url`; rule
-// 9 names webhook URLs with embedded tokens, `webhook_url=https://hooks.example.com/services/<token>`
-// loses its whole value); the session identifiers (`session_id`, `sid`, `PHPSESSID`,
-// `ASP.NET_SessionId`), which are bearer credentials, not identifiers, and are explicit credential
-// pair names; and the secret id (`secret_id`, `VAULT_SECRET_ID`, `role_secret_id`, `secretId`), the
-// Vault AppRole bearer half whose UUID shape keeps it off the long-token rule, so the key alone must
-// carry it (CodeRabbit on #78; main redacted it through the `secret` word). The two identifier
-// families the suffix rule keeps are the ones whose value names something (`client_id`, `key_id`,
-// `access_key_id`, `tenant_id`, `private_key_id`, `secret_name`, `user_name`). The three patterns read
-// the key in its segment form (`webhookUrl` and `WEBHOOK_URL` are `webhook_url`).
-const SETTING_SUFFIXES = new Set(["url", "uri", "endpoint", "method", "algorithm", "audience", "issuer", "shape", "type", "mode", "path", "file", "dir", "limit", "count", "id", "name", "days", "hours", "minutes", "seconds"]);
+// `key_name`). The lifetime, use-count, network, and accessor settings a Vault AppRole assessment
+// reports beside the bearer keys are settings too (`secret_id_ttl`, `token_max_ttl`,
+// `secret_id_num_uses`, `token_num_uses`, `secret_id_bound_cidrs`, `token_bound_cidrs`,
+// `secret_id_accessor`, `token_accessor`; a Vault accessor is a UUID that looks a token up and never
+// authenticates; review of #78, 01:40 rulings). Its value stays unless it is token-shaped (the
+// long-token decision, which the data scrubs apply to the value under such a key even though their
+// long-token rule is otherwise off, so a 40-character `private_key_id` still goes) or a registered
+// secret, and a URL value passes the URL rule like any other (userinfo and query removed, path kept).
+// Three families stay credential keys whatever their suffix: the URL-valued webhook and callback keys
+// (`webhook`, `webhooks`, `slack_webhook`, `webhook_url`, `webhook_uri`, `webhook_endpoint`,
+// `webhook_path`, `*hook_url`, `callback_url`; rule 9 names webhook URLs with embedded tokens,
+// `webhook_url=https://hooks.example.com/services/<token>` loses its whole value; a webhook setting
+// whose value is not the URL, `webhook_count`, `webhook_id`, `webhook_name`, is a setting like any
+// other); the session identifiers (`session_id`, `sid`, `PHPSESSID`, `ASP.NET_SessionId`), which are
+// bearer credentials, not identifiers, and are explicit credential pair names; and the bearer ids
+// (`secret_id`, `VAULT_SECRET_ID`, `role_secret_id`, `secretId`, the Vault AppRole bearer half whose
+// UUID shape keeps it off the long-token rule, and `token_id`, `tokenId`, a token id that is the
+// token), so the key alone must carry the value (CodeRabbit on #78; main redacted the secret id
+// through the `secret` word). The two identifier families the suffix rule keeps are the ones whose
+// value names something (`client_id`, `key_id`, `access_key_id`, `tenant_id`, `private_key_id`,
+// `secret_name`, `user_name`). The three patterns read the key in its segment form (`webhookUrl` and
+// `WEBHOOK_URL` are `webhook_url`).
+const SETTING_SUFFIXES = new Set(["url", "uri", "endpoint", "method", "algorithm", "audience", "issuer", "shape", "type", "mode", "path", "file", "dir", "limit", "count", "id", "name", "days", "hours", "minutes", "seconds", "ttl", "uses", "cidrs", "accessor"]);
 const THRESHOLD_KEY_PATTERN = /^(?:max|min)[_-]/i;
-const WEBHOOK_KEY_PATTERN = /(?:^|_)webhooks?(?:_|$)|hook_url$|callback_url$/;
+const WEBHOOK_KEY_PATTERN = /(?:^|_)webhooks?(?:_(?:url|uri|endpoint|address|link|path))?$|hook_url$|callback_url$/;
 const SESSION_ID_KEY_PATTERN = /(?:^|_)(?:sid|sessid|jsessionid|phpsessid|session_id)$/;
-const SECRET_ID_KEY_PATTERN = /secret_id$/;
+const BEARER_ID_KEY_PATTERN = /(?:secret|token)_id$/;
 const EXTRA_CREDENTIAL_KEYS = new Set([
   "x-amz-signature",
   "x-amz-credential",
@@ -468,13 +478,14 @@ function isSettingKey(key: string): boolean {
  * True when a name in a query string, header, or name-value pair carries a credential: the Flue
  * argument-key heuristic (`token`, `secret`, `password`, `api_key`, `authorization`, `cookie`, ...)
  * plus the bare and signed-URL names it does not cover. A key whose final segment is a setting suffix
- * (`token_url`, `auth_method`, `client_id`, `credentials_file`, see `SETTING_SUFFIXES`) is a setting
- * and is not a credential key; the webhook and callback keys, the session identifiers, and a key
- * ending in `secret_id` (any prefix, casing, or separator) are credential keys whatever their suffix.
+ * (`token_url`, `auth_method`, `client_id`, `credentials_file`, `secret_id_ttl`, see
+ * `SETTING_SUFFIXES`) is a setting and is not a credential key; the URL-valued webhook and callback
+ * keys, the session identifiers, and a key ending in `secret_id` or `token_id` (any prefix, casing,
+ * or separator) are credential keys whatever their suffix.
  */
 export function isCredentialKey(key: string): boolean {
   const joined = keySegments(key).join("_");
-  if (WEBHOOK_KEY_PATTERN.test(joined) || SESSION_ID_KEY_PATTERN.test(joined) || SECRET_ID_KEY_PATTERN.test(joined)) return true;
+  if (WEBHOOK_KEY_PATTERN.test(joined) || SESSION_ID_KEY_PATTERN.test(joined) || BEARER_ID_KEY_PATTERN.test(joined)) return true;
   if (isSettingKey(key)) return false;
   return namesCredential(key);
 }

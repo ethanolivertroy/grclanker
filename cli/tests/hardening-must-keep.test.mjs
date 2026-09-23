@@ -415,7 +415,7 @@ test("boundary: opaque identifiers are removed from error text and kept in data 
   }
 });
 
-test("must-redact: a webhook, hook, or callback key loses its whole value whatever its suffix, a name-shaped path segment included, through every scrub", () => {
+test("must-redact: a URL-valued webhook, hook, or callback key loses its whole value, a name-shaped path segment included, through every scrub; a webhook setting that is not the URL keeps its value", () => {
   // The Codex example on #78 (r4076357762) is name-shaped in every segment; the token canary is the issued shape.
   for (const value of ["abcdefghijkl", "T000B000XXXXXXXXXXXXXXXX", ERROR_CANARY.urlToken]) {
     for (const carrier of WEBHOOK_CARRIERS) {
@@ -430,11 +430,94 @@ test("must-redact: a webhook, hook, or callback key loses its whole value whatev
       assert.equal(scrubDataText(`webhook_url=https://hooks.example.com/services/foo/bar/${value}`), `webhook_url=${REDACTED}`);
     }
   }
-  assert.deepEqual(redactSecretValues({ webhook_url: "https://hooks.example.com/services/T000/B000/abcdefghijkl", webhook_count: 3, callback_url: "https://app.example.com/cb" }), {
-    webhook_url: REDACTED,
-    webhook_count: REDACTED,
-    callback_url: REDACTED,
-  });
+  // Review of #78 (01:40 rulings): the webhook exception covers the URL-valued keys; `webhook_count`,
+  // `webhook_id`, and `webhook_name` are settings whose values stay, in the data walker too.
+  assert.deepEqual(
+    redactSecretValues({
+      webhook_url: "https://hooks.example.com/services/T000/B000/abcdefghijkl",
+      webhook_path: "/services/T000/B000/abcdefghijkl",
+      webhook_count: 3,
+      webhook_id: "wh-2026-primary",
+      webhook_name: "deploy-notifier",
+      callback_url: "https://app.example.com/cb",
+    }),
+    {
+      webhook_url: REDACTED,
+      webhook_path: REDACTED,
+      webhook_count: 3,
+      webhook_id: "wh-2026-primary",
+      webhook_name: "deploy-notifier",
+      callback_url: REDACTED,
+    },
+  );
+  for (const [text, expected] of [
+    ["webhook_count=3", "webhook_count=3"],
+    ["webhook_count: 3", "webhook_count: 3"],
+    ['{"webhook_count":"3"}', '{"webhook_count":"3"}'],
+    ["webhooks_limit=25", "webhooks_limit=25"],
+    ["webhook_id=wh-2026-primary", "webhook_id=wh-2026-primary"],
+    ["webhook_path=/services/T000/B000/abcdefghijkl", `webhook_path=${REDACTED}`],
+    ["webhook_endpoint=https://hooks.example.com/services/T000/B000/abcdefghijkl", `webhook_endpoint=${REDACTED}`],
+  ]) {
+    for (const [scrubName, scrub] of SCRUBS) assert.equal(scrub(text), expected, `${scrubName} on ${text}`);
+  }
+});
+
+test("must-keep: the Vault AppRole lifetime, use-count, network, and accessor settings keep their values beside the bearer keys, which lose theirs whatever the shape, through every scrub", () => {
+  // Review of #78 (01:40 rulings): `secret_id_ttl`, `token_max_ttl`, `secret_id_num_uses`,
+  // `token_num_uses`, `secret_id_bound_cidrs`, `token_bound_cidrs`, `secret_id_accessor`, and
+  // `token_accessor` are the settings an assessment reports (an accessor is a UUID that looks a token
+  // up and never authenticates); `secret_id` and `token_id` are the bearer half and go in any shape.
+  const accessor = "6b1f4c2e-9d3a-4f7b-8c5e-2a1d0e9f8b7c";
+  const settings = [
+    ["secret_id_ttl", "3600"],
+    ["secret_id_num_uses", "5"],
+    ["token_max_ttl", "7200"],
+    ["token_ttl", "1800"],
+    ["token_num_uses", "0"],
+    ["secret_id_bound_cidrs", "10.0.0.0/8"],
+    ["token_bound_cidrs", "10.0.0.0/8"],
+    ["secret_id_accessor", accessor],
+    ["token_accessor", accessor],
+    ["tokenAccessor", accessor],
+    ["secretIdTtl", "3600"],
+  ];
+  const forms = [
+    (key, value) => `${key}=${value}`,
+    (key, value) => `${key}: ${value}`,
+    (key, value) => `"${key}": "${value}"`,
+    (key, value) => `{"${key}":"${value}"}`,
+    (key, value) => `\\"${key}\\": \\"${value}\\"`,
+    (key, value) => `${key}="${value}"`,
+    (key, value) => `export ${key}=${value}`,
+    (key, value) => `upstream echoed ${key}=${value} before closing`,
+    (key, value) => `{"detail":"upstream sent ${key}=${value}"}`,
+  ];
+  for (const [key, value] of settings) {
+    for (const form of forms) {
+      const text = form(key, value);
+      for (const [scrubName, scrub] of SCRUBS) assert.equal(scrub(text), text, `${scrubName} on ${text}`);
+    }
+  }
+  assert.deepEqual(
+    redactSecretValues({ secret_id_ttl: 3600, secret_id_num_uses: 5, token_bound_cidrs: ["10.0.0.0/8"], token_accessor: accessor, secret_id: accessor, token_id: accessor }),
+    { secret_id_ttl: 3600, secret_id_num_uses: 5, token_bound_cidrs: ["10.0.0.0/8"], token_accessor: accessor, secret_id: REDACTED, token_id: REDACTED },
+  );
+  for (const key of ["token_id", "tokenId", "TOKEN_ID", "secret_id", "VAULT_SECRET_ID"]) {
+    for (const value of [accessor, "k7Qm2xZp9vLw4nRt8sYb", "qzvkwpmtr"]) {
+      for (const form of forms) {
+        const text = form(key, value);
+        for (const [scrubName, scrub] of SCRUBS) {
+          const scrubbed = scrub(text);
+          assertNoFragment(scrubbed, value, { label: `${scrubName} on ${text}` });
+          assert.ok(scrubbed.includes(key), `${scrubName}: the key stays in ${scrubbed}`);
+        }
+      }
+    }
+  }
+  // A token id in prose is the bearer id, not a word: the prose exemption does not apply to it.
+  assert.equal(scrubErrorText("token_id: qzvkwpmtr was revoked"), `token_id: ${REDACTED} was revoked`);
+  assert.equal(scrubErrorText("token_id_count: 3 of 5"), "token_id_count: 3 of 5");
 });
 
 test("must-redact: a token-shaped value under a setting key beside a credential word goes by shape through every scrub, the data scrubs included, while the setting's name-shaped value stays", () => {

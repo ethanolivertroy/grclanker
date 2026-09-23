@@ -1029,19 +1029,37 @@ test("isCredentialKey covers the Flue heuristic plus bare and signed-URL names",
     "X-Snowflake-Authorization-Token-Type",
     "x-auth-mode",
     "min_password_length",
+    // Review of #78 (01:40 rulings): the Vault AppRole lifetime, use-count, network, and accessor
+    // settings, and a webhook setting whose value is not the URL.
+    "secret_id_ttl",
+    "secretIdTtl",
+    "token_max_ttl",
+    "TOKEN_TTL",
+    "secret_id_num_uses",
+    "token_num_uses",
+    "secret_id_bound_cidrs",
+    "token_bound_cidrs",
+    "secret_id_accessor",
+    "token_accessor",
+    "tokenAccessor",
+    "webhook_count",
+    "webhooks_limit",
+    "webhook_id",
+    "webhook_name",
   ]) {
     assert.ok(!isCredentialKey(key), `${key} names a setting`);
   }
-  for (const key of ["webhook_url", "webhookUrl", "WEBHOOK_URL", "webhook", "webhooks", "slack_webhook", "webhook_count", "slack_hook_url", "incoming-hook-url", "callback_url", "oauth_callback_url", "session_id", "sessionId", "user_session_id", "PHPSESSID", "JSESSIONID", "ASP.NET_SessionId", "sid"]) {
+  for (const key of ["webhook_url", "webhookUrl", "WEBHOOK_URL", "webhook_uri", "webhook_endpoint", "webhook_path", "webhook", "webhooks", "slack_webhook", "slack_hook_url", "incoming-hook-url", "callback_url", "oauth_callback_url", "session_id", "sessionId", "user_session_id", "PHPSESSID", "JSESSIONID", "ASP.NET_SessionId", "sid"]) {
     assert.ok(isCredentialKey(key), `${key} stays a credential key whatever its suffix`);
   }
   // CodeRabbit (#78) secret_id: the Vault AppRole secret id is the bearer half of the pair, so a key
-  // ending in `secret_id` is a credential key in any prefix, casing, or separator; the identifier half
-  // (`role_id`) and the other identifier keys stay settings.
-  for (const key of ["secret_id", "SECRET_ID", "VAULT_SECRET_ID", "role_secret_id", "secretId", "roleSecretId", "secret-id", "vault.approle.secret_id", "X-Vault-Secret-Id", "secretid"]) {
-    assert.ok(isCredentialKey(key), `${key} is the bearer secret id`);
+  // ending in `secret_id` is a credential key in any prefix, casing, or separator, as is a token id
+  // (`token_id`, the token itself; 01:40 rulings); the identifier half (`role_id`) and the other
+  // identifier keys stay settings.
+  for (const key of ["secret_id", "SECRET_ID", "VAULT_SECRET_ID", "role_secret_id", "secretId", "roleSecretId", "secret-id", "vault.approle.secret_id", "X-Vault-Secret-Id", "secretid", "token_id", "tokenId", "TOKEN_ID", "access_token_id", "X-Token-Id"]) {
+    assert.ok(isCredentialKey(key), `${key} is a bearer id`);
   }
-  for (const key of ["role_id", "VAULT_ROLE_ID", "roleId", "key_id", "access_key_id", "private_key_id", "secret_name", "client_id", "tenant_id", "user_name", "secret_id_count"]) {
+  for (const key of ["role_id", "VAULT_ROLE_ID", "roleId", "key_id", "access_key_id", "private_key_id", "secret_name", "client_id", "tenant_id", "user_name", "secret_id_count", "token_id_count", "id_token_url"]) {
     assert.ok(!isCredentialKey(key), `${key} is an identifier or a setting`);
   }
 });
