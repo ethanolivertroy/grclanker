@@ -231,6 +231,8 @@ export interface Knowbe4Collected<T> {
   endpoint?: string;
   /** The read stopped at a cap while the API could still hold more records. */
   truncated?: boolean;
+  /** Why a truncated read stopped when the reason was not its cap (see Knowbe4Listing.truncationReason). */
+  truncationReason?: string;
   /** Server-reported total when the API exposes one (PhishER pagination). */
   total?: number;
   /** The cap applied to the read. */
@@ -244,6 +246,11 @@ export interface Knowbe4Listing {
   limit: number;
   pages: number;
   total?: number;
+  /**
+   * Present when the listing stopped short for a reason other than its cap: the server returned an empty page or
+   * ended paging while still reporting more records, or repeated its page key. Raising the cap does not read further.
+   */
+  truncationReason?: string;
   /** The request the listing made, as "METHOD /path[?filters]" without the pagination parameters. */
   endpoint?: string;
 }
@@ -309,6 +316,8 @@ export interface Knowbe4TruncatedInventory {
   total: number | null;
   limit: number | null;
   argument: string | null;
+  /** The listing's own exit when the cap was not the reason it stopped; null for a cap exit. */
+  reason: string | null;
 }
 
 export interface Knowbe4Snapshot {
@@ -1522,6 +1531,8 @@ export class Knowbe4ApiClient {
     let nextPageKey: string | undefined;
     let total: number | undefined;
     let truncated = false;
+    // Set for an exit the cap did not cause, so the caller can tell a server stop from the limit it configured.
+    let truncationReason: string | undefined;
     let pages = 0;
 
     for (let page = 1; ; page += 1) {
@@ -1545,11 +1556,22 @@ export class Knowbe4ApiClient {
         truncated = true;
         break;
       }
-      if (nodes.length === 0) break;
+      if (nodes.length === 0) {
+        if (total !== undefined && total > items.length) {
+          truncationReason = `the server returned an empty page while reporting ${total} records`;
+        }
+        break;
+      }
       const lastPage = totalPages !== undefined && page >= totalPages && !nextPageKey;
-      if (lastPage) break;
+      if (lastPage) {
+        if (total !== undefined && total > items.length) {
+          truncationReason = `the server ended paging after ${items.length} records while reporting ${total}`;
+        }
+        break;
+      }
       if (nextPageKey !== undefined && nextPageKey === previousKey) {
         truncated = true;
+        truncationReason = "the server repeated its page key, so the remaining records could not be paged";
         break;
       }
       if (items.length >= limit) {
@@ -1559,7 +1581,15 @@ export class Knowbe4ApiClient {
     }
 
     if (total !== undefined) truncated = truncated || total > items.length;
-    return { items, truncated, limit, pages, total, endpoint: `POST ${new URL(this.config.phisherGraphqlUrl).pathname} ${field}` };
+    return {
+      items,
+      truncated,
+      limit,
+      pages,
+      total,
+      ...(truncated && truncationReason ? { truncationReason } : {}),
+      endpoint: `POST ${new URL(this.config.phisherGraphqlUrl).pathname} ${field}`,
+    };
   }
 
   async listPhisherMessages(options: { query?: string; limit?: number } = {}): Promise<Knowbe4Listing> {
@@ -1740,12 +1770,14 @@ function toListing(value: unknown, limit: number): Knowbe4Listing {
   }
   const record = asObject(value);
   if (record && Array.isArray(record.items)) {
+    const truncationReason = asString(record.truncationReason);
     return {
       items: asRecordArray(record.items),
       truncated: asBoolean(record.truncated) ?? false,
       limit: asNumber(record.limit) ?? limit,
       pages: asNumber(record.pages) ?? 1,
       total: asNumber(record.total),
+      ...(truncationReason ? { truncationReason } : {}),
       endpoint: asString(record.endpoint),
     };
   }
@@ -1765,6 +1797,7 @@ async function collectListing(
       data: listing.items.map(project),
       collected: true,
       truncated: listing.truncated,
+      ...(listing.truncated && listing.truncationReason ? { truncationReason: listing.truncationReason } : {}),
       total: listing.total,
       limit: listing.limit,
       ...(listing.endpoint ? { endpoint: listing.endpoint } : {}),
@@ -1935,6 +1968,8 @@ export function knowbe4CollectionStatus(snapshot: Knowbe4Snapshot): { inventorie
       error: collection.error ?? null,
       complete: read ? collection.truncated !== true : null,
       truncated: read ? collection.truncated === true : null,
+      // The listing's own exit when it was not the cap; null for a cap exit, an unread inventory, or a complete read.
+      truncation_reason: read && collection.truncated === true ? collection.truncationReason ?? null : null,
       seen: read ? seen : null,
       total: read ? collection.total ?? null : null,
       limit: collection.collected ? collection.limit ?? null : null,
@@ -2238,10 +2273,20 @@ interface Knowbe4InventoryRead {
   verdict?: boolean;
 }
 
+/**
+ * "loaded, truncated at <argument> (<limit>)" for a listing its cap stopped, and the listing's own exit for one the
+ * server stopped, so a server-side stop is never attributed to the configured limit.
+ */
+function truncationClause(item: Pick<Knowbe4TruncatedInventory, "seen" | "total" | "limit" | "argument" | "reason">): string {
+  const loaded = `${item.seen} of ${item.total ?? "unknown"} loaded`;
+  if (item.reason) return `${loaded}; ${item.reason}`;
+  return `${loaded}, truncated at ${item.argument ?? "the collection cap"} (${item.limit ?? "unknown"})`;
+}
+
 function truncationCaveat(item: Knowbe4TruncatedInventory): string {
-  const cap = `${item.argument ?? "the collection cap"} (${item.limit ?? "unknown"})`;
-  const raise = item.argument ? `; raise ${item.argument} to cover the full inventory` : "";
-  return `Truncated listing: ${item.inventory} (${item.seen} of ${item.total ?? "unknown"} loaded, truncated at ${cap}), so this verdict only covers the records that were loaded${raise}.`;
+  // Raising the cap reads further only when the cap was the exit; a server stop needs the console export.
+  const raise = item.argument && !item.reason ? `; raise ${item.argument} to cover the full inventory` : "";
+  return `Truncated listing: ${item.inventory} (${truncationClause(item)}), so this verdict only covers the records that were loaded${raise}.`;
 }
 
 /**
@@ -2267,6 +2312,7 @@ function withInventoryCaveats(item: Knowbe4Finding, snapshot: Knowbe4Snapshot, r
         total: collection.total ?? null,
         limit: collection.limit ?? null,
         argument: INVENTORY_LIMIT_ARGUMENTS[read.inventory] ?? null,
+        reason: collection.truncationReason ?? null,
       };
       truncated.push(entry);
       if (read.verdict ?? true) truncatedVerdictReads.push(entry);
@@ -2782,6 +2828,7 @@ function assessReportRate(snapshot: Knowbe4Snapshot, now: Date, lookbackDays: nu
       messages_read: whenRead(phisher, phisher.data.length),
       messages_total: whenRead(phisher, phisher.total ?? null),
       truncated: truncatedFlag(phisher),
+      truncation_reason: whenRead(phisher, phisher.truncationReason ?? null),
       message_limit: phisher.limit ?? null,
       by_category: whenComplete(phisher, countBy(phisher.data, "category")),
       by_action_status: whenComplete(phisher, countBy(phisher.data, "actionStatus")),
@@ -2805,8 +2852,9 @@ function assessReportRate(snapshot: Knowbe4Snapshot, now: Date, lookbackDays: nu
     summary = `Only ${reportRate ?? 0}% of ${delivered} delivered simulated phishing emails were reported, far below the ${minReportRatePct}% policy minimum.`;
   }
   if (phisher.collected && !phisher.error) {
+    // The clause names the read's own exit: the cap when the cap stopped it, the server's stop otherwise.
     const loaded = phisher.truncated
-      ? ` (${phisher.data.length} of ${phisher.total ?? "unknown"} loaded, truncated at phisher_message_limit (${phisher.limit ?? "unknown"}))`
+      ? ` (${truncationClause({ seen: phisher.data.length, total: phisher.total ?? null, limit: phisher.limit ?? null, argument: "phisher_message_limit", reason: phisher.truncationReason ?? null })})`
       : "";
     summary += ` PhishER inbox: ${phisher.data.length} user-reported messages in the window${loaded}.`;
   }
@@ -4204,7 +4252,7 @@ function buildQuickReference(): string {
     "# KnowBe4 Audit Bundle Quick Reference",
     "",
     "- `core_data/` contains the KnowBe4 Reporting API (and PhishER GraphQL) responses used during this assessment. User records drop free-form comment and custom fields at collection time; credential-shaped values are replaced with [REDACTED] and URLs are reduced to scheme and host before writing.",
-    "- `core_data/collection_status.json` records, per inventory (`inventories[]`), whether the read succeeded, the HTTP status and request of a failed read, how the read ended (complete or truncated at a cap), how many records were loaded, and the server total when the API exposes one. Every flag and count is `null` for a read that never completed, and `totals` counts those reads as unknown rather than as complete or untruncated.",
+    "- `core_data/collection_status.json` records, per inventory (`inventories[]`), whether the read succeeded, the HTTP status and request of a failed read, how the read ended (complete, truncated at a cap, or stopped by the server, with the listing's own stop reason under `truncation_reason`), how many records were loaded, and the server total when the API exposes one. Every flag and count is `null` for a read that never completed, and `totals` counts those reads as unknown rather than as complete or untruncated.",
     "- A list inventory that was denied, errored, or never requested is written as a marker object (`{ collected: false, status, endpoint, error, reason }`) instead of an empty array; a readable but empty inventory stays `[]`. Per-test recipient reads that failed appear as per-test markers alongside the loaded samples.",
     "- `analysis/` contains normalized findings, per-area assessment summaries, and the 20-control coverage map. A `null` count or list in a finding or summary means the inventory behind it was not read in full; named users, groups, or modules only appear when the inventories that prove the property were read completely.",
     "- `compliance/` contains the executive summary, unified matrix, and one report per mapped framework.",

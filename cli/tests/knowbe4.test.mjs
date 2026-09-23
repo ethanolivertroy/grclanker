@@ -1709,6 +1709,7 @@ test("verdict rule 10: Knowbe4ApiClient reports PhishER connections truncated on
   assert.deepEqual(atCap.items.map((item) => item.id), ["m1a", "m1b"]);
   assert.equal(atCap.truncated, true);
   assert.equal(atCap.total, 5, "the server total is kept so the summary can say seen versus total");
+  assert.equal(atCap.truncationReason, undefined, "a cap exit carries no reason: the cap is the reason");
   assert.equal(capped.getRequestCount(), 1);
 
   const stuck = phisherClient(({ page }) => ({
@@ -1718,6 +1719,7 @@ test("verdict rule 10: Knowbe4ApiClient reports PhishER connections truncated on
   const stuckListing = await stuck.listPhisherMessages({ limit: 10 });
   assert.deepEqual(stuckListing.items.map((item) => item.id), ["m1", "m2"]);
   assert.equal(stuckListing.truncated, true, "a nextPageKey that never advances ends the loop as truncated");
+  assert.equal(stuckListing.truncationReason, "the server repeated its page key, so the remaining records could not be paged");
   assert.equal(stuck.getRequestCount(), 2);
 
   const shortfall = phisherClient(() => ({ nodes: [], pagination: { page: 1, pages: 1, per: 200, totalCount: 7, nextPageKey: null } }));
@@ -1725,6 +1727,13 @@ test("verdict rule 10: Knowbe4ApiClient reports PhishER connections truncated on
   assert.equal(empty.items.length, 0);
   assert.equal(empty.total, 7);
   assert.equal(empty.truncated, true, "an empty page while totalCount says more exist is not a complete read");
+  assert.equal(empty.truncationReason, "the server returned an empty page while reporting 7 records");
+
+  const endedEarly = phisherClient(() => ({ nodes: [{ id: "m1" }], pagination: { page: 1, pages: 1, per: 200, totalCount: 4, nextPageKey: null } }));
+  const ended = await endedEarly.listPhisherMessages({ limit: 10 });
+  assert.deepEqual(ended.items.map((item) => item.id), ["m1"]);
+  assert.equal(ended.truncated, true, "a last page below the server total is not a complete read");
+  assert.equal(ended.truncationReason, "the server ended paging after 1 records while reporting 4");
 
   const complete = phisherClient(({ page }) => ({
     nodes: page === 1 ? [{ id: "r1" }, { id: "r2" }] : [{ id: "r3" }],
@@ -1734,6 +1743,60 @@ test("verdict rule 10: Knowbe4ApiClient reports PhishER connections truncated on
   assert.deepEqual(rules.items.map((item) => item.id), ["r1", "r2", "r3"]);
   assert.equal(rules.truncated, false);
   assert.equal(rules.total, 3);
+  assert.equal(rules.truncationReason, undefined);
+});
+
+test("gap 44: the PhishER inbox clause and the truncation caveat name the listing's own stop, and attribute a stop to phisher_message_limit only when the cap caused it", async () => {
+  const fixture = healthyFixture();
+  const stopReason = "the server returned an empty page while reporting 500 records";
+
+  // The server stopped: zero rows, a total of 500, and the cap of 2 never reached.
+  const serverStopped = mockClient(fixture, { phisher: true });
+  serverStopped.listPhisherMessages = async () => ({ items: [], truncated: true, limit: 2, pages: 1, total: 500, truncationReason: stopReason });
+  const stoppedSnapshot = await collectKnowbe4Snapshot(serverStopped, { scopes: ["phishing"], now: NOW });
+  assert.equal(stoppedSnapshot.phisherMessages.truncationReason, stopReason);
+  const stopped = findingFor(assessKnowbe4PhishingProgram(stoppedSnapshot, { now: NOW }), 19);
+  assert.equal(stopped.status, "pass", "the report rate rests on the security test counters");
+  assert.match(stopped.summary, /PhishER inbox: 0 user-reported messages in the window \(0 of 500 loaded; the server returned an empty page while reporting 500 records\)\./);
+  assert.doesNotMatch(stopped.summary, /truncated at phisher_message_limit/, "a server stop is not attributed to the cap");
+  assert.doesNotMatch(stopped.summary, /raise phisher_message_limit/, "raising the cap does not read past a server stop");
+  // The inbox is enrichment on KB4-19, so its truncation never adds the verdict caveat; the clause carries the exit.
+  assert.doesNotMatch(stopped.summary, /Truncated listing: phisher_messages/);
+  assert.equal(stopped.evidence.phisher.truncation_reason, stopReason);
+  assert.equal(stopped.evidence.phisher.truncated, true);
+  assert.deepEqual(stopped.evidence.truncated_inventories.find((entry) => entry.inventory === "phisher_messages"), { inventory: "phisher_messages", seen: 0, total: 500, limit: 2, argument: "phisher_message_limit", reason: stopReason });
+  const stoppedRow = knowbe4CollectionStatus(stoppedSnapshot).inventories.find((row) => row.inventory === "phisher_messages");
+  assert.deepEqual({ truncated: stoppedRow.truncated, complete: stoppedRow.complete, truncation_reason: stoppedRow.truncation_reason, seen: stoppedRow.seen, total: stoppedRow.total }, { truncated: true, complete: false, truncation_reason: stopReason, seen: 0, total: 500 });
+
+  // The cap stopped it: the clause names the cap and the remedy offers to raise it.
+  const cappedClient = mockClient(fixture, { phisher: true });
+  cappedClient.listPhisherMessages = async () => ({ items: fixture.phisherMessages, truncated: true, limit: 2, pages: 1, total: 500 });
+  const cappedSnapshot = await collectKnowbe4Snapshot(cappedClient, { scopes: ["phishing"], now: NOW });
+  assert.equal(cappedSnapshot.phisherMessages.truncationReason, undefined);
+  const cappedFinding = findingFor(assessKnowbe4PhishingProgram(cappedSnapshot, { now: NOW }), 19);
+  assert.match(cappedFinding.summary, /PhishER inbox: 2 user-reported messages in the window \(2 of 500 loaded, truncated at phisher_message_limit \(2\)\)\./);
+  assert.equal(cappedFinding.evidence.phisher.truncation_reason, null);
+  assert.deepEqual(cappedFinding.evidence.truncated_inventories.find((entry) => entry.inventory === "phisher_messages"), { inventory: "phisher_messages", seen: 2, total: 500, limit: 2, argument: "phisher_message_limit", reason: null });
+  assert.equal(knowbe4CollectionStatus(cappedSnapshot).inventories.find((row) => row.inventory === "phisher_messages").truncation_reason, null);
+
+  // A complete read carries neither.
+  const completeSnapshot = await collectKnowbe4Snapshot(mockClient(fixture, { phisher: true }), { scopes: ["phishing"], now: NOW });
+  const completeFinding = findingFor(assessKnowbe4PhishingProgram(completeSnapshot, { now: NOW }), 19);
+  assert.match(completeFinding.summary, /PhishER inbox: 2 user-reported messages in the window\./);
+  assert.equal(completeFinding.evidence.phisher.truncation_reason, null);
+  assert.equal(knowbe4CollectionStatus(completeSnapshot).inventories.find((row) => row.inventory === "phisher_messages").truncation_reason, null);
+
+  // On a verdict inventory the caveat follows the same rule: the remedy names the cap only when the cap was the exit.
+  const usersStopReason = "the server ended paging after 5 records while reporting 40";
+  const usersStopped = mockClient(fixture);
+  usersStopped.listUsers = async () => ({ items: fixture.users.slice(0, 5), truncated: true, limit: 5000, pages: 1, total: 40, truncationReason: usersStopReason });
+  const usersStoppedCoverage = findingFor(assessKnowbe4PhishingProgram(await collectKnowbe4Snapshot(usersStopped, { scopes: ["phishing"], now: NOW }), { now: NOW }), 2);
+  assert.equal(usersStoppedCoverage.status, "warn");
+  assert.match(usersStoppedCoverage.summary, /Truncated listing: users \(5 of 40 loaded; the server ended paging after 5 records while reporting 40\), so this verdict only covers the records that were loaded\./);
+  assert.doesNotMatch(usersStoppedCoverage.summary, /truncated at user_limit|raise user_limit/);
+  assert.deepEqual(usersStoppedCoverage.evidence.truncated_inventories, [{ inventory: "users", seen: 5, total: 40, limit: 5000, argument: "user_limit", reason: usersStopReason }]);
+  const usersCappedCoverage = findingFor(assessKnowbe4PhishingProgram(await collectKnowbe4Snapshot(mockClient(fixture), { scopes: ["phishing"], now: NOW, userLimit: 5 }), { now: NOW }), 2);
+  assert.match(usersCappedCoverage.summary, /Truncated listing: users \(5 of unknown loaded, truncated at user_limit \(5\)\), so this verdict only covers the records that were loaded; raise user_limit to cover the full inventory\./);
 });
 
 test("verdict rule 10: truncated KnowBe4 inventories demote the findings that judge them and state seen versus total", async () => {
@@ -1753,7 +1816,7 @@ test("verdict rule 10: truncated KnowBe4 inventories demote the findings that ju
     const item = findingFor(result, control);
     assert.equal(item.status, "warn", `control ${control} cannot pass on a truncated security test list`);
     assert.match(item.summary, /Truncated listing: security_tests \(12 of unknown loaded, truncated at the collection cap \(20000\)\), so this verdict only covers the records that were loaded\./);
-    assert.deepEqual(item.evidence.truncated_inventories.find((entry) => entry.inventory === "security_tests"), { inventory: "security_tests", seen: 12, total: null, limit: 20000, argument: null });
+    assert.deepEqual(item.evidence.truncated_inventories.find((entry) => entry.inventory === "security_tests"), { inventory: "security_tests", seen: 12, total: null, limit: 20000, argument: null, reason: null });
   }
   const reportRate = findingFor(result, 19);
   assert.equal(reportRate.status, "warn");
