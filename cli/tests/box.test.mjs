@@ -2,6 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { createVerify, generateKeyPairSync } from "node:crypto";
 import {
+  chmodSync,
   existsSync,
   mkdirSync,
   mkdtempSync,
@@ -13,10 +14,13 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { parse as parseYaml, YAMLError } from "yaml";
 
 import {
   BoxApiClient,
   BoxApiError,
+  BoxConfigFileError,
+  BoxTransportError,
   assessBoxDataGovernance,
   assessBoxIdentityAccess,
   assessBoxSharingCollaboration,
@@ -31,6 +35,7 @@ import {
   projectEnterpriseEvent,
   redactCredentialValues,
   redactSecrets,
+  registerBoxTools,
   resolveBoxConfiguration,
   resolveSecureOutputPath,
   scrubErrorText,
@@ -39,6 +44,7 @@ import { getRegisteredToolSummaries } from "../dist/pi/tool-catalog.js";
 import { assertSecretsAbsent, readBundleFiles, readZipEntries } from "./helpers/bundle-contents.mjs";
 import { assertCanaryFixture, assertCanaryWindowsAbsent, assertDepthCapPins } from "./helpers/canary-windows.mjs";
 import { assertCookieAttributeCarriersScrubbed } from "./helpers/cookie-attribute-carriers.mjs";
+import { scrubAlterations } from "./helpers/scrub-survival.mjs";
 
 const NOW = new Date("2026-09-21T00:00:00Z");
 const FRAMEWORKS = ["FedRAMP", "CMMC", "SOC 2", "CIS", "PCI-DSS", "STIG", "IRAP", "ISMAP"];
@@ -2583,4 +2589,398 @@ test("cookie attribute class: a later cookie whose name holds a dot or another t
   assertCookieAttributeCarriersScrubbed(assert, (text) => redactSecrets(text, []), "box redactSecrets");
   assertCookieAttributeCarriersScrubbed(assert, (text) => redactCredentialValues({ note: text }).note, "box redactCredentialValues");
   assertCookieAttributeCarriersScrubbed(assert, (text) => redactCredentialValues([{ message: text }])[0].message, "box redactCredentialValues, error list");
+});
+
+// ---------------------------------------------------------------------------------------------------------------
+// Config loader errors, transport parse errors, fixed-text survival, and the environment overlay.
+// ---------------------------------------------------------------------------------------------------------------
+
+// Random alphanumeric values planted in config files, a parser message, and the environment (self-checked below).
+const BOX_CONFIG_CANARIES = {
+  yamlQuote: "MwNL3pcZ20zfWntbHACd3RCUiGoP3097",
+  yamlAlias: "M5nXQjEH99RdKXEp8TyaftpsJ4i7Leo0",
+  yamlDuplicate: "rwvxKwmv56hUDT6efg8OZg2tT1bf9tzA",
+  yamlTab: "XfrIGSM9qI0R5rJsZnB6bvNwFP6zhXBt",
+  tomlLine: "xzFv33EsoDnyEGF18MRUW7DPJuKW4cy1",
+  unrelatedKey: "f5GCpCy4b88x1VLSGueF6ZHW3KGLeN1z",
+  unreadable: "pnkP3OcfUYN8t9fJmlxRyV7kwBVeLTIw",
+  jwtValue: "RwFxfvM31YZUZFHodnrJUmuXqTYFXWQA",
+};
+const BOX_PARSER_SNIPPET_CANARY = "B2825Qtqrpi2IkJdb04OfHvJrZPzaRLf";
+const BOX_ENV_TOKEN_CANARY = "AV0dmemkRXsetix24wXkRWifYWmR9WuJ";
+
+/** Wording the yaml library, JSON.parse, and the filesystem put in their own messages; none of it may reach a recorded message. */
+const BOX_LIBRARY_WORDING = [
+  "Missing closing",
+  "Unresolved alias",
+  "Map keys must be unique",
+  "Tabs are not allowed",
+  ", column ",
+  "is not valid JSON",
+  "Unexpected token",
+  "Expected ',' or '}'",
+  "illegal operation",
+  "permission denied",
+  "no such file",
+];
+
+/** Asserts a message carries neither any window of a canary nor the parser's or filesystem's own wording. */
+function assertBoxFixedTextOnly(message, canaries, label) {
+  assertCanaryWindowsAbsent(assert, message, canaries, label);
+  for (const wording of BOX_LIBRARY_WORDING) assert.ok(!message.includes(wording), `${label}: carries library wording "${wording}": ${message}`);
+}
+
+/** The Box tools as the runtime registers them, by name. */
+function registeredBoxTools() {
+  const registered = [];
+  registerBoxTools({ registerTool: (tool) => registered.push(tool) });
+  return new Map(registered.map((tool) => [tool.name, tool]));
+}
+
+/** Runs `fn` with every BOX_* variable removed from process.env (plus `overrides` set), restoring the environment afterwards. */
+async function withBoxEnvironment(overrides, fn) {
+  const saved = Object.fromEntries(Object.entries(process.env).filter(([key]) => key.startsWith("BOX_")));
+  for (const key of Object.keys(saved)) delete process.env[key];
+  for (const [key, value] of Object.entries(overrides)) process.env[key] = value;
+  try {
+    return await fn();
+  } finally {
+    for (const key of Object.keys(process.env)) if (key.startsWith("BOX_")) delete process.env[key];
+    for (const [key, value] of Object.entries(saved)) process.env[key] = value;
+  }
+}
+
+/**
+ * Positive control for a YAML case: the yaml library rejects `text` with a message that quotes the planted value, and
+ * the line it reports (undefined when the thrown value is not a YAMLError) is the only position the fixed text may carry.
+ */
+function yamlLibraryLine(text, canary, label) {
+  let thrown;
+  try {
+    parseYaml(text);
+  } catch (error) {
+    thrown = error;
+  }
+  assert.ok(thrown, `${label}: positive control, the yaml library rejects the text`);
+  assert.ok(thrown.message.includes(canary), `${label}: positive control, the library's own message quotes the source`);
+  return thrown instanceof YAMLError ? thrown.linePos?.[0]?.line : undefined;
+}
+
+/**
+ * Positive control for a JSON case: JSON.parse rejects `text`; its message and the position it reports (if any) come
+ * back so the case can assert what the library exposes, the position being the only detail the fixed text may carry.
+ */
+function jsonLibraryError(text, label) {
+  let thrown;
+  try {
+    JSON.parse(text);
+  } catch (error) {
+    thrown = error;
+  }
+  assert.ok(thrown instanceof SyntaxError, `${label}: positive control, JSON.parse rejects the text`);
+  return { message: thrown.message, position: /at position (\d+)/.exec(thrown.message)?.[1] };
+}
+
+test("canary fixture self-check: every planted Box config, parser, and environment canary is alphanumeric, random-looking, and shares no 6-character window with the fixture's legitimate values", async () => {
+  const { client, config } = httpBox(hardenedFixture());
+  const access = await checkBoxAccess(client);
+  const assessments = await runAllBoxAssessments(client);
+  const exported = await exportBoxAuditBundle(client, config, createTempBase("grclanker-box-config-self-check-"));
+  const legitimate = new Map([
+    ...readBundleFiles(exported.outputDir),
+    ["hardened fixture", JSON.stringify(hardenedFixture())],
+    ["weak fixture", JSON.stringify(weakFixture())],
+    ["check_access", JSON.stringify(access)],
+    ["assessments", JSON.stringify(assessments)],
+    ["config", JSON.stringify({ ...config, clientSecret: null })],
+  ]);
+  assertCanaryFixture(assert, [...Object.values(BOX_CONFIG_CANARIES), BOX_PARSER_SNIPPET_CANARY, BOX_ENV_TOKEN_CANARY], legitimate, "Box config canaries");
+});
+
+test("config loader errors: a Box config or JWT file that cannot be read or parsed yields fixed text with only the path, a validated code, and the parser's own line or position, from the resolver, from check_access, and from the export tool, which writes nothing", async () => {
+  const tools = registeredBoxTools();
+  const checkTool = tools.get("box_check_access");
+  const exportTool = tools.get("box_export_audit_bundle");
+  const canaries = Object.values(BOX_CONFIG_CANARIES);
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = () => { throw new Error("no request may be made while a config file is unreadable"); };
+  try {
+    await withBoxEnvironment({}, async () => {
+      const base = createTempBase("grclanker-box-config-errors-");
+      const cases = [];
+
+      // An unterminated quote: the library's message quotes the offending source line; the fixed text carries the line alone.
+      const quote = join(base, "unterminated-quote.yaml");
+      const quoteText = `# Box\nclient_id: abc\nclient_secret: "${BOX_CONFIG_CANARIES.yamlQuote}\n`;
+      writeFileSync(quote, quoteText, "utf8");
+      const quoteLine = yamlLibraryLine(quoteText, BOX_CONFIG_CANARIES.yamlQuote, "unterminated quote");
+      assert.equal(typeof quoteLine, "number", "positive control: the library reports a line for an unterminated quote");
+      cases.push({ name: "yaml unterminated quote", args: { config_path: quote }, path: quote, code: "INVALID_YAML", message: `Unable to parse Box config file: invalid YAML in ${quote} at line ${quoteLine}` });
+
+      // An unresolved alias: the library throws a plain ReferenceError whose message ends with the alias, so no line is known.
+      const alias = join(base, "alias.yaml");
+      const aliasText = `client_id: abc\nclient_secret: *${BOX_CONFIG_CANARIES.yamlAlias}\n`;
+      writeFileSync(alias, aliasText, "utf8");
+      assert.equal(yamlLibraryLine(aliasText, BOX_CONFIG_CANARIES.yamlAlias, "unresolved alias"), undefined, "positive control: an unresolved alias is not a YAMLError and carries no line");
+      cases.push({ name: "yaml unresolved alias", args: { config_path: alias }, path: alias, code: "INVALID_YAML", message: `Unable to parse Box config file: invalid YAML in ${alias}` });
+
+      // A duplicate key: the library quotes both lines; the fixed text names the second.
+      const duplicate = join(base, "duplicate-key.yaml");
+      const duplicateText = `client_secret: ${BOX_CONFIG_CANARIES.yamlDuplicate}\nclient_secret: other\n`;
+      writeFileSync(duplicate, duplicateText, "utf8");
+      assert.equal(yamlLibraryLine(duplicateText, BOX_CONFIG_CANARIES.yamlDuplicate, "duplicate key"), 2);
+      cases.push({ name: "yaml duplicate key", args: { config_path: duplicate }, path: duplicate, code: "INVALID_YAML", message: `Unable to parse Box config file: invalid YAML in ${duplicate} at line 2` });
+
+      // Tab indentation: rejected by line, the line itself (which holds the secret) is not copied.
+      const tab = join(base, "tab-indent.yaml");
+      const tabText = `box:\n\tclient_secret: ${BOX_CONFIG_CANARIES.yamlTab}\n`;
+      writeFileSync(tab, tabText, "utf8");
+      assert.equal(yamlLibraryLine(tabText, BOX_CONFIG_CANARIES.yamlTab, "tab indentation"), 2);
+      cases.push({ name: "yaml tab indentation", args: { config_path: tab }, path: tab, code: "INVALID_YAML", message: `Unable to parse Box config file: invalid YAML in ${tab} at line 2` });
+
+      // A TOML-style line is valid YAML: one plain scalar, which is not a mapping, so the file holds no Box settings.
+      const tomlStyle = join(base, "toml-style.yaml");
+      const tomlText = `client_secret = "${BOX_CONFIG_CANARIES.tomlLine}"\n`;
+      writeFileSync(tomlStyle, tomlText, "utf8");
+      assert.equal(typeof parseYaml(tomlText), "string", "positive control: the line parses as one scalar that holds the value");
+      cases.push({ name: "toml-style line", args: { config_path: tomlStyle }, path: tomlStyle, code: "EMPTY_CONFIG", message: `Box config file did not contain any Box settings: ${tomlStyle}` });
+
+      // A mapping without any Box key: an explicitly named file that configures nothing is an error, and its values are not quoted.
+      const unrelated = join(base, "unrelated.yaml");
+      writeFileSync(unrelated, `service_note: ${BOX_CONFIG_CANARIES.unrelatedKey}\nregion: eu\n`, "utf8");
+      cases.push({ name: "no Box settings", args: { config_path: unrelated }, path: unrelated, code: "EMPTY_CONFIG", message: `Box config file did not contain any Box settings: ${unrelated}` });
+
+      // EISDIR: a directory at the path is a read failure, not a parse failure.
+      const directory = join(base, "config-dir");
+      mkdirSync(directory);
+      assert.throws(() => readFileSync(directory, "utf8"), (error) => error.code === "EISDIR" && /illegal operation/.test(error.message), "positive control: the filesystem message carries its own wording");
+      cases.push({ name: "EISDIR", args: { config_path: directory }, path: directory, code: "EISDIR", message: `Unable to read Box config file ${directory} (EISDIR)` });
+
+      // EACCES: an unreadable file (root reads everything, so the case is skipped when running as root).
+      if (typeof process.getuid === "function" && process.getuid() !== 0) {
+        const unreadable = join(base, "unreadable.yaml");
+        writeFileSync(unreadable, `client_secret: ${BOX_CONFIG_CANARIES.unreadable}\n`, "utf8");
+        chmodSync(unreadable, 0o000);
+        assert.throws(() => readFileSync(unreadable, "utf8"), (error) => error.code === "EACCES" && /permission denied/.test(error.message), "positive control");
+        cases.push({ name: "EACCES", args: { config_path: unreadable }, path: unreadable, code: "EACCES", message: `Unable to read Box config file ${unreadable} (EACCES)` });
+      }
+
+      // ENOENT on an explicit path: a missing file named by argument or environment is an error, not a silent default.
+      const missing = join(base, "missing.yaml");
+      cases.push({ name: "ENOENT", args: { config_path: missing }, path: missing, code: "ENOENT", message: `Unable to read Box config file ${missing} (ENOENT)` });
+
+      // The JWT app config, cut off after the secret: JSON.parse reports a position (and no source window), and the
+      // fixed text carries that position alone.
+      const jwtUnterminated = join(base, "jwt-unterminated.json");
+      const jwtUnterminatedText = `{"boxAppSettings": {"clientID": "abc", "clientSecret": "${BOX_CONFIG_CANARIES.jwtValue}"`;
+      writeFileSync(jwtUnterminated, jwtUnterminatedText, "utf8");
+      const unterminated = jsonLibraryError(jwtUnterminatedText, "JWT unterminated object");
+      assert.match(unterminated.position ?? "", /^\d+$/, `positive control: JSON.parse reports a position for an unterminated object: ${unterminated.message}`);
+      cases.push({ name: "JWT JSON unterminated", args: { jwt_config_path: jwtUnterminated }, path: jwtUnterminated, code: "INVALID_JSON", message: `Unable to parse Box JWT config file: invalid JSON in ${jwtUnterminated} at position ${unterminated.position}` });
+
+      // A bare secret where a JSON string was expected: JSON.parse quotes a window of the source around it and reports
+      // no position, so the fixed text carries the path alone.
+      const jwtBare = join(base, "jwt-bare-value.json");
+      const jwtBareText = `{"boxAppSettings": {"clientID": "abc", "clientSecret": ${BOX_CONFIG_CANARIES.jwtValue}}}`;
+      writeFileSync(jwtBare, jwtBareText, "utf8");
+      const bare = jsonLibraryError(jwtBareText, "JWT bare value");
+      assert.ok(bare.message.includes(BOX_CONFIG_CANARIES.jwtValue.slice(0, 6)), `positive control: JSON.parse quotes a window of the source: ${bare.message}`);
+      assert.equal(bare.position, undefined, "positive control: an unexpected token carries no position, only the quoted window");
+      cases.push({ name: "JWT JSON bare value", args: { jwt_config_path: jwtBare }, path: jwtBare, code: "INVALID_JSON", message: `Unable to parse Box JWT config file: invalid JSON in ${jwtBare}` });
+
+      const jwtMissing = join(base, "jwt-missing.json");
+      cases.push({ name: "JWT ENOENT", args: { jwt_config_path: jwtMissing }, path: jwtMissing, code: "ENOENT", message: `Unable to read Box JWT config file ${jwtMissing} (ENOENT)` });
+
+      assert.ok(cases.length >= 12, `expected the full matrix, got ${cases.length} cases`);
+      for (const [index, item] of cases.entries()) {
+        let thrown;
+        try {
+          resolveBoxConfiguration(item.args, {}, { homeDir: base, cwd: base });
+        } catch (error) {
+          thrown = error;
+        }
+        assert.ok(thrown, `${item.name}: the resolver must reject the file`);
+        assert.equal(thrown.name, "BoxConfigFileError", item.name);
+        assert.ok(thrown instanceof BoxConfigFileError, item.name);
+        assert.equal(thrown.message, item.message, `${item.name}: fixed text only`);
+        assert.equal(thrown.code, item.code, item.name);
+        assert.equal(thrown.path, item.path, item.name);
+        assertBoxFixedTextOnly(thrown.message, canaries, `${item.name} resolver`);
+
+        const access = await checkTool.execute("call-config", checkTool.prepareArguments(item.args));
+        assert.equal(access.isError, true, item.name);
+        assert.equal(access.content[0].text, `Box access check failed: ${item.message}`, item.name);
+        assertBoxFixedTextOnly(JSON.stringify(access), canaries, `${item.name} check_access`);
+
+        const outputDir = join(base, `export-${index}-${item.code.toLowerCase()}`);
+        const exported = await exportTool.execute("call-config-export", exportTool.prepareArguments({ ...item.args, output_dir: outputDir }));
+        assert.equal(exported.isError, true, item.name);
+        assert.equal(exported.content[0].text, `Box audit bundle export failed: ${item.message}`, item.name);
+        assertBoxFixedTextOnly(JSON.stringify(exported), canaries, `${item.name} export`);
+        assert.equal(existsSync(outputDir), false, `${item.name}: nothing is written when a config file is unreadable`);
+      }
+
+      // The environment variable is an explicit path too, and a missing default file is still simply absent.
+      assert.throws(() => resolveBoxConfiguration({ access_token: BOX_ENV_TOKEN_CANARY }, { BOX_CONFIG_PATH: missing }, { homeDir: base, cwd: base }), { message: `Unable to read Box config file ${missing} (ENOENT)` });
+      assert.equal(resolveBoxConfiguration({ access_token: BOX_ENV_TOKEN_CANARY }, {}, { homeDir: base, cwd: base }).accessToken, BOX_ENV_TOKEN_CANARY);
+    });
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("config loader errors: a SyntaxError raised by the Box transport is recorded by name only, never by the parser's message that quotes the body", async () => {
+  const snippet = `<html>${BOX_PARSER_SNIPPET_CANARY}</html>`;
+  const client = new BoxApiClient(sampleConfig({ authMode: "oauth", accessToken: "oauth-fixture-access-2026", clientId: undefined, clientSecret: undefined, maxRetries: 0 }), {
+    fetchImpl: async () => { throw new SyntaxError(`Unexpected token '<', "${snippet}"... is not valid JSON`); },
+    now: () => NOW,
+    sleep: async () => {},
+  });
+  await assert.rejects(() => client.getCurrentUser(), (error) => {
+    assert.ok(error instanceof BoxTransportError);
+    assert.match(error.message, /^Box request failed: GET \/2\.0\/users\/me\?fields=[A-Za-z0-9_%]+: SyntaxError: response could not be parsed as JSON; the parser's message is not recorded because it quotes the body$/);
+    assert.match(error.request, /^GET \/2\.0\/users\/me\?fields=/);
+    assertCanaryWindowsAbsent(assert, error.message, [BOX_PARSER_SNIPPET_CANARY], "transport error");
+    return true;
+  });
+  const access = await checkBoxAccess(client);
+  assertCanaryWindowsAbsent(assert, JSON.stringify(access), [BOX_PARSER_SNIPPET_CANARY], "check_access");
+  assert.ok(access.surfaces.length > 0 && access.surfaces.every((surface) => surface.status !== "readable"), "no surface reads through a transport that only throws");
+  assert.ok(access.surfaces.every((surface) => typeof surface.error === "string" && surface.error.includes("SyntaxError: response could not be parsed as JSON")), access.surfaces.map((surface) => surface.error).join("\n"));
+  const identity = await assessBoxIdentityAccess(client);
+  assert.ok(identity.errors.length > 0 && identity.errors.every((text) => text.includes("SyntaxError: response could not be parsed as JSON")), identity.errors.join("\n"));
+  assertCanaryWindowsAbsent(assert, JSON.stringify(identity), [BOX_PARSER_SNIPPET_CANARY], "assess payload");
+});
+
+/** Every fixed-text message the Box integration emits that a fixture run does not already produce. */
+const BOX_FIXED_TEXT_MESSAGES = [
+  "Unable to read Box config file /home/auditor/.box-sec-inspector/config.yaml (ENOENT)",
+  "Unable to read Box config file /home/auditor/.box-sec-inspector/config.yaml (EACCES)",
+  "Unable to parse Box config file: invalid YAML in /home/auditor/.box-sec-inspector/config.yaml at line 3",
+  "Unable to parse Box config file: invalid YAML in /home/auditor/.box-sec-inspector/config.yaml",
+  "Box config file did not contain any Box settings: /home/auditor/.box-sec-inspector/config.yaml",
+  "Unable to read Box JWT config file /home/auditor/box-jwt-config.json (ENOENT)",
+  "Unable to parse Box JWT config file: invalid JSON in /home/auditor/box-jwt-config.json at position 70",
+  "Unable to parse Box JWT config file: invalid JSON in /home/auditor/box-jwt-config.json",
+  "Box credentials are required. Set BOX_JWT_CONFIG_PATH for JWT, BOX_CLIENT_ID plus BOX_CLIENT_SECRET plus BOX_ENTERPRISE_ID for Client Credentials Grant, or BOX_ACCESS_TOKEN for OAuth 2.0.",
+  "Box JWT auth requires BOX_JWT_CONFIG_PATH or a jwt_config_path argument.",
+  "Box JWT config file did not include boxAppSettings.appAuth.privateKey.",
+  "Box CCG auth requires a client ID and client secret (BOX_CLIENT_ID and BOX_CLIENT_SECRET).",
+  "Box JWT auth requires BOX_ENTERPRISE_ID (or enterpriseID in the JWT config file).",
+  "Box user-subject auth requires BOX_SUBJECT_ID.",
+  "Box OAuth 2.0 auth requires BOX_ACCESS_TOKEN, or BOX_REFRESH_TOKEN with BOX_CLIENT_ID and BOX_CLIENT_SECRET.",
+  'Unsupported Box JWT algorithm "RS1024". Use RS256, RS384, or RS512.',
+  "Box Client Credentials Grant credentials are incomplete.",
+  "Box OAuth 2.0 access token expired and no refresh token with client credentials is available.",
+  "Box token response did not include access_token.",
+  "Unable to determine the Box enterprise ID; set BOX_ENTERPRISE_ID explicitly.",
+  "Box request timed out after 30000ms: GET /2.0/users/me?fields=id%2Ctype%2Cname%2Clogin%2Crole%2Cstatus%2Centerprise%2Cis_platform_access_only",
+  "Box request failed: GET /2.0/users/me?fields=id%2Ctype%2Cname%2Clogin%2Crole%2Cstatus%2Centerprise%2Cis_platform_access_only: SyntaxError: response could not be parsed as JSON; the parser's message is not recorded because it quotes the body",
+  "Box request GET /2.0/users?fields=id%2Clogin&limit=1000 returned 200 OK with an empty body (0 bytes); the endpoint is not serving the JSON API",
+  "Box request GET /2.0/users?limit=1000 returned 200 OK with a non-JSON text/html; charset=utf-8 response body (128 bytes, not echoed); the endpoint is not serving the JSON API",
+  "Box request GET /2.0/users?limit=1000 returned 200 OK with a JSON body that is not the documented list object with an entries array (64 bytes, not echoed); the endpoint is not serving the JSON API",
+  "Box request POST /oauth2/token returned 200 OK with a JSON body that is not the documented resource object with any of access_token (32 bytes, not echoed); the endpoint is not serving the JSON API",
+  "Box request failed (502 Bad Gateway) for GET /2.0/retention_policies?limit=100: non-JSON text/html response body (5120 bytes, not echoed)",
+  "Box request failed (403 Forbidden) for GET /2.0/retention_policies?limit=100: JSON body without a documented error field (42 bytes, not echoed)",
+  "Box request failed (403 Forbidden) for GET /2.0/shield_information_barriers?limit=100: Access denied - insufficient permission",
+  "Box request failed (404 Not Found) for GET /2.0/metadata_templates/enterprise/securityClassification-6VMVochwUWo/schema: Not Found",
+  "Box reported more users (a next_marker remained)",
+  "Box reported more events (a next_stream_position remained)",
+  "Box access check: healthy",
+  "Box access check: limited",
+  "Box audit bundle exported.",
+];
+
+/** A Box 403 for one route: the documented error object with a fixed message. */
+function boxDenyRoute() {
+  return () => jsonResponse(
+    { type: "error", status: 403, code: "access_denied_insufficient_permissions", message: "Access denied - insufficient permission", request_id: "req-denied" },
+    { status: 403, statusText: "Forbidden" },
+  );
+}
+
+/** Every string a run records: surface errors and notes, assessment errors and truncation notes, finding text, evidence leaves, and the error log. */
+function boxRecordedStrings(access, assessments, files) {
+  const strings = [];
+  for (const surface of access.surfaces) if (typeof surface.error === "string") strings.push(surface.error);
+  strings.push(...access.notes, access.recommendedNextStep);
+  for (const assessment of assessments) {
+    strings.push(...(assessment.errors ?? []), ...(assessment.truncated ?? []));
+    for (const finding of assessment.findings) {
+      strings.push(finding.title, finding.summary);
+      if (typeof finding.manualEvidence === "string") strings.push(finding.manualEvidence);
+      for (const [, value] of boxLeafEntries(finding.evidence ?? {})) if (typeof value === "string") strings.push(value);
+    }
+    for (const [, value] of boxLeafEntries(assessment.summary ?? {})) if (typeof value === "string") strings.push(value);
+  }
+  const errorsLog = files.get("_errors.log");
+  if (errorsLog) strings.push(...errorsLog.split("\n"));
+  return strings;
+}
+
+test("round 7a: every fixed-text message the Box integration emits survives its own scrubber unchanged, including every string a healthy, weak, or partially denied run records", async () => {
+  for (const message of BOX_FIXED_TEXT_MESSAGES) {
+    assert.equal(scrubErrorText(message), message, `fixed text was altered by the scrubber: ${message}`);
+  }
+
+  // Every string a run writes about legitimate data is fixed text from the run's point of view: the scrubber must not
+  // rewrite a finding summary, a manual-evidence instruction, an inventory gap, or a bundle document.
+  const runs = [httpBox(hardenedFixture()), httpBox(weakFixture())];
+  for (const dataset of BOX_SILENT_DATASETS) {
+    runs.push(httpBox(hardenedFixture(), { routes: { [dataset.route]: boxDenyRoute() } }));
+  }
+  let checked = 0;
+  const altered = new Set();
+  for (const { client, config, log } of runs) {
+    const access = await checkBoxAccess(client);
+    const assessments = await runAllBoxAssessments(client);
+    const exported = await exportBoxAuditBundle(client, config, createTempBase("grclanker-box-fixed-text-"));
+    const files = readBundleFiles(exported.outputDir);
+    const texts = [
+      ...boxRecordedStrings(access, assessments, files),
+      ...[...files].filter(([name]) => !name.startsWith("core_data/")).map(([, text]) => text),
+      ...log.map((entry) => `${entry.method} ${entry.path}`),
+    ];
+    checked += texts.length;
+    for (const alteration of scrubAlterations(texts, scrubErrorText)) altered.add(alteration);
+  }
+  assert.ok(checked > 2000, `expected thousands of recorded strings, got ${checked}`);
+  assert.deepEqual([...altered], [], `legitimate run text altered by the scrubber:\n${[...altered].join("\n")}`);
+});
+
+test("round 7b: resolveBoxConfiguration keeps env-provided credentials and config path when an unrelated argument is passed, and the tool sends the env token to the instance the env-named file configures", async () => {
+  const checkTool = registeredBoxTools().get("box_check_access");
+  const home = createTempBase("grclanker-box-env-overlay-");
+  const configPath = join(home, "canary.yaml");
+  writeFileSync(configPath, "box:\n  base_url: https://api.box.eu/2.0\n  max_retries: 1\n", "utf8");
+  const env = { BOX_ACCESS_TOKEN: BOX_ENV_TOKEN_CANARY, BOX_CONFIG_PATH: configPath };
+
+  // The tool's prepareArguments emits every auth key (undefined when not passed); that shape must not erase env values.
+  const prepared = checkTool.prepareArguments({ timeout_seconds: 45 });
+  assert.ok(Object.prototype.hasOwnProperty.call(prepared, "access_token") && prepared.access_token === undefined, "the overlay carries an undefined access_token key");
+  assert.ok(Object.prototype.hasOwnProperty.call(prepared, "config_path") && prepared.config_path === undefined, "the overlay carries an undefined config_path key");
+  const resolved = resolveBoxConfiguration(prepared, env, { homeDir: home, cwd: home });
+  assert.equal(resolved.accessToken, BOX_ENV_TOKEN_CANARY, "the env token survives an unrelated argument");
+  assert.equal(resolved.authMode, "oauth", "the auth mode is inferred from the env token");
+  assert.equal(resolved.baseUrl, "https://api.box.eu/2.0", "the file the env path names is still read");
+  assert.equal(resolved.maxRetries, 1, "a file setting survives too");
+  assert.equal(resolved.timeoutMs, 45000, "the unrelated argument still applies");
+  assert.deepEqual(resolved.sourceChain, ["config:canary.yaml", "environment", "arguments"], `the source chain names the file, the environment, and the argument: ${resolved.sourceChain.join(" -> ")}`);
+
+  // Through the registered tool with the environment set: every request carries the env token to the env-named instance.
+  const { log, fetchImpl } = httpBox(hardenedFixture());
+  const originalFetch = globalThis.fetch;
+  try {
+    globalThis.fetch = fetchImpl;
+    const result = await withBoxEnvironment(env, () => checkTool.execute("call-env", checkTool.prepareArguments({ timeout_seconds: 45 })));
+    assert.notEqual(result.isError, true, result.content[0].text);
+    assert.ok(log.length > 0, "requests were made");
+    assert.ok(log.every((entry) => entry.authorization === `Bearer ${BOX_ENV_TOKEN_CANARY}`), "every request carries the env token");
+    assert.ok(log.every((entry) => entry.host === "api.box.eu"), `the base URL from the env-named config file is used: ${[...new Set(log.map((entry) => entry.host))].join(", ")}`);
+    assert.ok(log.every((entry) => entry.path !== "/oauth2/token"), "a pre-issued token is used as it is; no token is requested");
+    assert.match(result.content[0].text, /^Box access check: healthy/);
+    assertCanaryWindowsAbsent(assert, JSON.stringify(result), [BOX_ENV_TOKEN_CANARY], "check_access result");
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
 });
