@@ -605,3 +605,77 @@ test("#78 row D: a credential name after --, -D, -Dprefix., or a path segment is
     assert.equal(scrubErrorText(expected), expected, `idempotent: ${text}`);
   }
 });
+
+test("CodeRabbit r4078025849 (#63): a scheme word in front of a credential-named pair's value is the value and goes with the run after it in every form and sink, while a header keeps its scheme word", () => {
+  // Regression from main at 02967cc: `sslPassword=splunk rejected` kept `splunk` (the scheme-word
+  // branch applied to every carrier), so a password that is a scheme word, or a header-like rendering
+  // under a credential-named key (`client_token: Bearer <token>`), left the scheme word in place. The
+  // scheme-word branch now applies to headers and Authorization-style keys; a credential-named pair or
+  // flag loses the scheme word with the run after it, whatever the casing, and the prose exemption
+  // does not apply to a value that starts with one.
+  const keys = ["sslPassword", "db_password", "password", "api_key", "client_secret", "secret", "assertion", "connection_string", "private_key", "AZURE_CLIENT_SECRET", "SecretAccessKey", "SERVICENOW_PASSWORD", "DUO_SKEY", "cloud_api_key"];
+  const schemes = ["splunk", "Splunk", "token", "Token", "bearer", "Bearer", "BEARER", "Basic", "basic", "Digest", "OAuth", "NTLM", "SSWS", "ApiKey", "Api-Key", "Negotiate", "Snowflake", "AWS4-HMAC-SHA256"];
+  const continuation = "vpqxkrmtyzwo";
+  const forms = [
+    [(key, scheme) => `${key}=${scheme} rejected`, (scheme) => [`=${scheme}`]],
+    [(key, scheme) => `${key}: ${scheme}`, (scheme) => [`: ${scheme}`]],
+    [(key, scheme) => `${key}="${scheme} rejected"`, (scheme) => [`"${scheme}`]],
+    [(key, scheme) => `"${key}": "${scheme}"`, (scheme) => [`"${scheme}"`]],
+    [(key, scheme) => `${key}=${scheme} ${continuation}`, (scheme) => [`=${scheme}`, continuation]],
+    [(key, scheme) => `${key}: ${scheme} ${continuation}`, (scheme) => [`: ${scheme}`, continuation]],
+    [(key, scheme) => `--${key} ${scheme} ${continuation}`, (scheme) => [` ${scheme}`, continuation]],
+  ];
+  let trials = 0;
+  for (const key of keys) {
+    for (const scheme of schemes) {
+      if (key.toLowerCase().includes(scheme.toLowerCase())) continue;
+      for (const [form, remove] of forms) {
+        const text = form(key, scheme);
+        for (const [sinkName, sink] of SINKS) {
+          trials += 1;
+          const output = sink(text);
+          const rendered = typeof output === "string" ? output : JSON.stringify(output);
+          for (const fragment of remove(scheme)) assert.ok(!rendered.includes(fragment), `${JSON.stringify(text)} kept ${JSON.stringify(fragment)} through ${sinkName}: ${rendered}`);
+          assert.ok(rendered.includes(key), `${JSON.stringify(text)} lost its key through ${sinkName}: ${rendered}`);
+        }
+      }
+    }
+  }
+  assert.ok(trials > 10000, `${trials} trials`);
+  const token = "yln2bVNl4tE9Cyp1B18V2mX7CVud5LhW";
+  for (const [text, expected] of [
+    ["sslPassword=splunk rejected", `sslPassword=${REDACTED}`],
+    ["db_password: token", `db_password: ${REDACTED}`],
+    ['password="Bearer rejected"', `password="${REDACTED}"`],
+    ['"password": "Basic"', `"password": "${REDACTED}"`],
+    ["password=bearer vpqxkrmtyzwo", `password=${REDACTED}`],
+    [`client_token: Bearer ${token}`, `client_token: ${REDACTED}`],
+    ["client_token: Bearer abcdef expected", `client_token: ${REDACTED} expected`],
+    [`password=Bearer "${token}"`, `password=${REDACTED}`],
+    ["password: Bearer, retry later", `password: ${REDACTED}, retry later`],
+    ['{"detail":"password: Bearer"}', `{"detail":"password: ${REDACTED}"}`],
+    [`--password Bearer ${token} -h db`, `--password ${REDACTED} -h db`],
+    // A header keeps its scheme word, as does an Authorization-style key the generic rule reads.
+    [`Authorization: Bearer ${token}`, `Authorization: Bearer ${REDACTED}`],
+    [`Proxy-Authorization: Basic ${token}`, `Proxy-Authorization: Basic ${REDACTED}`],
+    [`X-Auth-Token: Bearer ${token}`, `X-Auth-Token: Bearer ${REDACTED}`],
+    [`"Authorization": "Bearer ${token}"`, `"Authorization": "Bearer ${REDACTED}"`],
+    [`request failed\\x0aAuthorization: Bearer ${token} see the log`, `request failed\\x0aAuthorization: Bearer ${REDACTED} see the log`],
+    // Fixed texts: a setting key keeps a scheme word, and a scheme word in prose keeps its plain word.
+    ["token_type: Bearer token expected", "token_type: Bearer token expected"],
+    ["token_type: Bearer", "token_type: Bearer"],
+    ['{"access_token":"abc","token_type":"Bearer","expires_in":3600}', `{"access_token":"${REDACTED}","token_type":"Bearer","expires_in":3600}`],
+    ["Bearer token authentication is required", "Bearer token authentication is required"],
+    ["the snowflake account was suspended", "the snowflake account was suspended"],
+    ["failed to negotiate TLS with the upstream", "failed to negotiate TLS with the upstream"],
+    // Scrubbed text is a fixed point: a scheme word that only a marker follows is left as it is.
+    [`Authorization: Bearer ${REDACTED}`, `Authorization: Bearer ${REDACTED}`],
+    [`X-Auth-Token: 'Bearer ${REDACTED} [truncated]`, `X-Auth-Token: 'Bearer ${REDACTED} [truncated]`],
+    [`password=Bearer ${REDACTED}`, `password=Bearer ${REDACTED}`],
+  ]) {
+    assert.equal(scrubErrorText(text), expected, text);
+    assert.equal(scrubDataText(text), expected, text);
+    assert.equal(redactSecretValues(text), expected, text);
+    assert.equal(scrubErrorText(expected), expected, `idempotent: ${text}`);
+  }
+});

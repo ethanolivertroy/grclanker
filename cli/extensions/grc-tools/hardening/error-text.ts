@@ -427,6 +427,7 @@ const THRESHOLD_KEY_PATTERN = /^(?:max|min)[_-]/i;
 const WEBHOOK_KEY_PATTERN = /(?:^|_)webhooks?(?:_(?:url|uri|endpoint|address|link|path))?$|hook_url$|callback_url$/;
 const SESSION_ID_KEY_PATTERN = /(?:^|_)(?:sid|sessid|jsessionid|phpsessid|session_id)$/;
 const BEARER_ID_KEY_PATTERN = /(?:secret|token)_id$/;
+const AUTHORIZATION_KEY_PATTERN = /(?:^|_)authorization$/;
 const EXTRA_CREDENTIAL_KEYS = new Set([
   "x-amz-signature",
   "x-amz-credential",
@@ -488,6 +489,16 @@ export function isCredentialKey(key: string): boolean {
   if (WEBHOOK_KEY_PATTERN.test(joined) || SESSION_ID_KEY_PATTERN.test(joined) || BEARER_ID_KEY_PATTERN.test(joined)) return true;
   if (isSettingKey(key)) return false;
   return namesCredential(key);
+}
+
+/**
+ * An Authorization-style key the generic pair rule reads (`Authorization`, `Proxy-Authorization`, or one
+ * glued to a non-JSON escape, `x0aAuthorization`): the scheme word in front of its value names the
+ * scheme and stays, as under the header rule (CodeRabbit r4078025849 on #63: the scheme-word branches
+ * apply to Authorization-style keys, a credential-named pair loses the scheme word with its value).
+ */
+function isAuthorizationKey(key: string): boolean {
+  return AUTHORIZATION_KEY_PATTERN.test(keySegments(key).join("_"));
 }
 
 /**
@@ -768,33 +779,53 @@ function readBareValue(text: string, index: number, barePattern: RegExp): string
 
 /**
  * Reads the value of a header or credential-named pair: a quoted value goes whole up to its closing
- * quote with the quotes and a leading scheme word kept (`"Bearer value"` becomes `"Bearer
- * [REDACTED]"`); a bare value may carry a scheme word in front of it and then either a quoted value
- * (`Bearer "value"`) or a bare run. A bare run is kept when `keepBare` says so (the generic pair
- * rule's prose exemption, which reads the word after a scheme word too so `token_type: Bearer token
- * expected` stays); a quoted value is never prose.
+ * quote with the quotes kept; a bare value may carry a scheme word in front of it and then either a
+ * quoted value (`Bearer "value"`) or a bare run.
+ *
+ * The scheme word is treated by the carrier (CodeRabbit r4078025849 on #63, the scheme-word order).
+ * Under a header (`keepScheme`) it names the scheme and stays: `Authorization: Bearer <value>` becomes
+ * `Authorization: Bearer [REDACTED]`, `"Bearer value"` becomes `"Bearer [REDACTED]"`, and a scheme
+ * word alone, or one that only a marker follows, is left as it is. Under a credential-named pair or
+ * flag it is the start of the value, whatever the casing: `password=Bearer rejected`,
+ * `sslPassword=splunk rejected`, `db_password: token`, `password="Bearer rejected"`, and `"password":
+ * "Basic"` lose the scheme word and the run after it as one value (`password=[REDACTED]`), and the
+ * prose exemption never applies to a value that starts with one (`client_token: Bearer abcdef` is a
+ * header-like rendering whose token is `abcdef`). A scheme word that only a marker follows is text
+ * an earlier rule scrubbed (`Authorization: Bearer [REDACTED]` seen again by the generic rule) and is
+ * left as it is. A bare run without a scheme word is kept when `keepBare` says so (the generic pair
+ * rule's prose exemption); a quoted value is never prose.
  */
-function readCarrierValue(text: string, valueStart: number, barePattern: RegExp, keepBare?: (value: string, valueEnd: number) => boolean): ValueReplacement | null {
+function readCarrierValue(text: string, valueStart: number, barePattern: RegExp, keepBare?: (value: string, valueEnd: number) => boolean, keepScheme = true): ValueReplacement | null {
   const quoted = readQuotedValue(text, valueStart);
   if (quoted !== null) {
     if (!opensValue(text, quoted)) return null;
     const content = text.slice(quoted.start, quoted.end);
     const scheme = stickyExec(VALUE_SCHEME_PATTERN, content, 0) ?? "";
-    if (isBlankOrScrubbed(content.slice(scheme.length))) return null;
-    return { end: quoted.after, replacement: `${quoted.open}${scheme}${REDACTED}${quoted.close}` };
+    const rest = content.slice(scheme.length);
+    if (keepScheme) {
+      if (isBlankOrScrubbed(rest)) return null;
+      return { end: quoted.after, replacement: `${quoted.open}${scheme}${REDACTED}${quoted.close}` };
+    }
+    if (isBlankOrScrubbed(content) || (scheme.length > 0 && rest.trim().length > 0 && isBlankOrScrubbed(rest))) return null;
+    return { end: quoted.after, replacement: `${quoted.open}${REDACTED}${quoted.close}` };
   }
   const scheme = stickyExec(VALUE_SCHEME_PATTERN, text, valueStart) ?? "";
   const afterScheme = valueStart + scheme.length;
   const quotedAfterScheme = scheme.length > 0 ? readQuotedValue(text, afterScheme) : null;
-  if (quotedAfterScheme !== null) {
+  if (quotedAfterScheme !== null && (keepScheme || opensValue(text, quotedAfterScheme))) {
     if (!opensValue(text, quotedAfterScheme) || isBlankOrScrubbed(text.slice(quotedAfterScheme.start, quotedAfterScheme.end))) return null;
-    return { end: quotedAfterScheme.after, replacement: `${scheme}${quotedAfterScheme.open}${REDACTED}${quotedAfterScheme.close}` };
+    return keepScheme
+      ? { end: quotedAfterScheme.after, replacement: `${scheme}${quotedAfterScheme.open}${REDACTED}${quotedAfterScheme.close}` }
+      : { end: quotedAfterScheme.after, replacement: REDACTED };
   }
   const value = readBareValue(text, afterScheme, barePattern);
-  if (value === null) return null;
+  if (value === null) {
+    if (keepScheme || scheme.length === 0 || text.startsWith(REDACTED, afterScheme)) return null;
+    return { end: valueStart + scheme.trimEnd().length, replacement: REDACTED };
+  }
   const valueEnd = afterScheme + value.length;
-  if (keepBare?.(value, valueEnd)) return null;
-  return { end: absorbMarkers(text, valueEnd), replacement: `${scheme}${REDACTED}` };
+  if (scheme.length === 0 && keepBare?.(value, valueEnd)) return null;
+  return { end: absorbMarkers(text, valueEnd), replacement: keepScheme ? `${scheme}${REDACTED}` : REDACTED };
 }
 
 /**
@@ -832,9 +863,10 @@ function readSettingValue(text: string, valueStart: number): ValueReplacement | 
 
 /** A credential header's value, unless the header name says the value is a descriptor (`...-token-type`). */
 const readHeaderValue: ValueReader = (text, valueStart, carrier) => (HEADER_DESCRIPTOR_SUFFIX_PATTERN.test(carrier[1]) ? null : readCarrierValue(text, valueStart, HEADER_BARE_VALUE_PATTERN));
-const readPairValue: ValueReader = (text, valueStart) => readCarrierValue(text, valueStart, PAIR_BARE_VALUE_PATTERN);
+/** An explicit credential pair's value: a scheme word in front of it is part of the value (see `readCarrierValue`). */
+const readPairValue: ValueReader = (text, valueStart) => readCarrierValue(text, valueStart, PAIR_BARE_VALUE_PATTERN, undefined, false);
 /** The argument of a long flag (`--password <value>`), when the flag names a credential (see `FLAG_ARGUMENT_PATTERN`). */
-const readFlagArgument: ValueReader = (text, valueStart, carrier) => (isCredentialKey(carrier[1]) ? readCarrierValue(text, valueStart, PAIR_BARE_VALUE_PATTERN) : null);
+const readFlagArgument: ValueReader = (text, valueStart, carrier) => (isCredentialKey(carrier[1]) ? readCarrierValue(text, valueStart, PAIR_BARE_VALUE_PATTERN, undefined, false) : null);
 
 /**
  * Index just past a cookie pair's or attribute's value, which may be quoted. A bare run may hold "="
@@ -938,7 +970,7 @@ function replaceGenericCredentialPairs(text: string): string {
     const valueStart = match.index + whole.length;
     const credential = isCredentialKey(key);
     const read = credential
-      ? readCarrierValue(text, valueStart, PAIR_BARE_VALUE_PATTERN, (value, valueEnd) => continuesAsProse(text, separator, value, valueEnd))
+      ? readCarrierValue(text, valueStart, PAIR_BARE_VALUE_PATTERN, (value, valueEnd) => continuesAsProse(text, separator, value, valueEnd), isAuthorizationKey(key))
       : isCredentialWordSetting(key)
         ? readSettingValue(text, valueStart)
         : null;
@@ -1003,10 +1035,13 @@ export function scrubErrorText(text: string, options: ScrubErrorTextOptions = {}
     .replace(QUERY_PAIR_PATTERN, scrubQueryPair);
   scrubbed = replaceCarrierValues(scrubbed, COOKIE_HEADER_PATTERN, readCookieHeaderValue);
   scrubbed = replaceCarrierValues(scrubbed, CREDENTIAL_HEADER_PATTERN, readHeaderValue);
-  scrubbed = replaceCarrierValues(scrubbed, SCHEME_WORD_PATTERN, readSchemeValue);
+  // The pair rules read a scheme word at the start of their value as the value (see `readCarrierValue`),
+  // so they run before the bare scheme-word rule, which would otherwise keep the word and leave
+  // `password=Bearer [REDACTED]` for them.
   scrubbed = replaceCarrierValues(scrubbed, CREDENTIAL_PAIR_PATTERN, readPairValue);
   scrubbed = replaceGenericCredentialPairs(scrubbed);
-  scrubbed = replaceCarrierValues(scrubbed, FLAG_ARGUMENT_PATTERN, readFlagArgument)
+  scrubbed = replaceCarrierValues(scrubbed, FLAG_ARGUMENT_PATTERN, readFlagArgument);
+  scrubbed = replaceCarrierValues(scrubbed, SCHEME_WORD_PATTERN, readSchemeValue)
     .replace(JWT_PATTERN, REDACTED)
     .replace(AWS_ACCESS_KEY_ID_PATTERN, REDACTED)
     .replace(AWS_SECRET_PATTERN, (run) => (looksLikeAwsSecret(run) ? REDACTED : run));

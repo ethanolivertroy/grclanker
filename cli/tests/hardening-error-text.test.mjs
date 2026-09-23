@@ -363,7 +363,9 @@ test("credential-named pairs lose any nonempty value whatever its shape, compoun
     ["settings.token: enabled", `settings.token: ${REDACTED}`],
     ["secrets: truncated", `secrets: ${REDACTED}`],
     ["x-auth-header: legacy", `x-auth-header: ${REDACTED}`],
-    ["client_token: Bearer abcdef", `client_token: Bearer ${REDACTED}`],
+    // A scheme word in front of a credential-named pair's value is the start of the value and goes
+    // with it (CodeRabbit r4078025849 on #63); under a header it stays (see the header rows above).
+    ["client_token: Bearer abcdef", `client_token: ${REDACTED}`],
     ["client_token: Kq7Zx2Vw9Lm4Tp8R rejected", `client_token: ${REDACTED} rejected`],
     ["user_session: 0f9e8d7c6b5a4938 rejected", `user_session: ${REDACTED} rejected`],
     ["access_tokens: dGhpcyBpcyBh== rejected", `access_tokens: ${REDACTED} rejected`],
