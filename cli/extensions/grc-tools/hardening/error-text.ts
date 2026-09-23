@@ -113,14 +113,17 @@ const PEM_BLOCK_PATTERN = /-----BEGIN [A-Z0-9 ]+-----[\s\S]*?-----END [A-Z0-9 ]+
 const PEM_OPEN_PATTERN = /-----BEGIN [A-Z0-9 ]+-----[\s\S]*$/;
 
 // Any scheme-prefixed URL wherever it sits in the text: the userinfo is dropped, the query and the
-// fragment are replaced, the scheme, host, and path stay because they name the surface. A marker
-// already standing in the query or fragment is consumed with the URL so a second pass is a no-op,
-// and a backslash ends the URL so a JSON-escaped closing quote is kept, except the escaped solidus
-// `\/`: a JSON encoder may write every "/" of a URL as `\/` (review of #78 row C), so
+// fragment are replaced, the scheme, host, and path stay because they name the surface. The userinfo
+// ends where the authority does, at the first "/", "?", or "#", so `https://h?e=a@x.com&token=<v>` is
+// the host `h` and a query (`https://h?[REDACTED]`), not the userinfo `h?e=a@` before a host of
+// `x.com&token=<v>` (CodeRabbit on #76), and `https://h#f@x.com` is the host `h` and a fragment. A
+// marker already standing in the query or fragment is consumed with the URL so a second pass is a
+// no-op, and a backslash ends the URL so a JSON-escaped closing quote is kept, except the escaped
+// solidus `\/`: a JSON encoder may write every "/" of a URL as `\/` (review of #78 row C), so
 // `https:\/\/svc:<value>@api.example.com\/v1\/items` is the same URL and loses its userinfo, query, and
 // fragment the same way, its escaped separators kept as written.
 const EMBEDDED_URL_PATTERN = /\b[a-z][a-z0-9+.-]*:(?:\/\/|\\\/\\\/)(?:\[REDACTED\]|\\\/|[^\s"'<>()[\]{}\\])+/gi;
-const URL_PARTS_PATTERN = /^([a-z][a-z0-9+.-]*:(?:\/\/|\\\/\\\/))(?:[^\s/@"'<>\\]+@)?([^?#]*)(\?[^#]*)?(#.*)?$/i;
+const URL_PARTS_PATTERN = /^([a-z][a-z0-9+.-]*:(?:\/\/|\\\/\\\/))(?:[^\s\/?#@"'<>\\]+@)?([^?#]*)(\?[^#]*)?(#.*)?$/i;
 const TRAILING_PUNCTUATION_PATTERN = /[.,;:!?]+$/;
 
 // A relative path or bare query string: the named parameter keeps its name, the value goes. A

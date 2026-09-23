@@ -686,3 +686,89 @@ test("CodeRabbit r4078025849 (#63): a scheme word in front of a credential-named
     assert.equal(scrubErrorText(expected), expected, `idempotent: ${text}`);
   }
 });
+
+test("CodeRabbit on #76: a URL's userinfo ends at the first \"/\", \"?\", or \"#\", so `https://h?e=a@x.com&token=<v>` keeps the host `h` and loses its query in every form and sink", () => {
+  // Regression from main at 02967cc, where the userinfo class did not stop at "?" or "#": the URL rule
+  // read `h?e=a@` as the userinfo and `x.com&token=<v>` as the host, rendered `https://x.com&token=<v>`
+  // (the wrong host, and no query marker), and left the value for the later query-pair rule, which did
+  // remove it in every form and sink measured. The fix is to the rendering and to which rule reads the
+  // value; the slash-escaped URL goes through the same class and is fixed with it.
+  const token = "Qm7pJ2sX9vRk4tLw8nHy3bZc";
+  const withQuery = (value) => `https://h?e=a@x.com&token=${value}`;
+  const withFragment = "https://h#f@x.com";
+  const slashEscaped = (url) => url.replace(/\//g, "\\/");
+  const forms = [
+    ["bare", (url) => url],
+    ["sentence", (url) => `see ${url} for details`],
+    ["sentence with a trailing period", (url) => `request to ${url}.`],
+    ["JSON", (url) => `{"url":"${url}"}`],
+    ["JSON-escaped", (url) => `{\\"url\\":\\"${url}\\"}`],
+    ["slash-escaped", (url) => slashEscaped(url)],
+    ["slash-escaped in a JSON-escaped string", (url) => `{\\"detail\\":\\"see ${slashEscaped(url)} for details\\"}`],
+    ["double-quoted", (url) => `url "${url}" rejected`],
+    ["single-quoted", (url) => `url '${url}' rejected`],
+    ["angle-bracketed", (url) => `url <${url}> rejected`],
+  ];
+  let trials = 0;
+  for (const [value, url, kept] of [
+    [token, withQuery(token), `h?${REDACTED}`],
+    ["s3cr3t", withQuery("s3cr3t"), `h?${REDACTED}`],
+    [undefined, withFragment, `h#${REDACTED}`],
+  ]) {
+    for (const [formName, form] of forms) {
+      const text = form(url);
+      for (const [sinkName, sink] of SINKS) {
+        trials += 1;
+        const output = sink(text);
+        const rendered = typeof output === "string" ? output : JSON.stringify(output);
+        if (value !== undefined) assert.ok(!leaked(output, value), `${JSON.stringify(text)} leaked through ${sinkName}: ${rendered}`);
+        // The nested sink JSON-encodes the text a second time, which turns `\/` into `\\/`, a backslash
+        // pair that is not the escaped solidus: that text is not a URL to the rule (nor was it on main),
+        // and the query-pair rule alone removes the value, so only the leak check applies to it.
+        if (sinkName === "describeErrorBody nested" && formName.startsWith("slash-escaped")) {
+          if (value !== undefined) assert.ok(rendered.includes(`token=${REDACTED}`), `${JSON.stringify(text)} kept its query value through ${sinkName}: ${rendered}`);
+          continue;
+        }
+        assert.ok(rendered.includes(kept), `${JSON.stringify(text)} lost the host through ${sinkName} (${formName}): ${rendered}`);
+        assert.ok(!rendered.includes("x.com"), `${JSON.stringify(text)} rendered the query or fragment as the host through ${sinkName} (${formName}): ${rendered}`);
+      }
+    }
+  }
+  assert.equal(trials, 3 * forms.length * SINKS.length);
+  // A relative query string is not a URL: the query-pair rule alone reads it, name kept, value gone.
+  for (const text of [`request ?e=a@x.com&token=${token} failed`, `path /cb?e=a@x.com&token=${token} rejected`]) {
+    for (const [sinkName, sink] of SINKS) {
+      const output = sink(text);
+      const rendered = typeof output === "string" ? output : JSON.stringify(output);
+      assert.ok(!leaked(output, token), `${JSON.stringify(text)} leaked through ${sinkName}: ${rendered}`);
+      assert.ok(rendered.includes(`?e=a@x.com&token=${REDACTED}`), `${JSON.stringify(text)} lost the query names through ${sinkName}: ${rendered}`);
+    }
+  }
+  for (const [text, expected] of [
+    ["https://h?e=a@x.com&token=s3cr3t", `https://h?${REDACTED}`],
+    ["https://h#f@x.com", `https://h#${REDACTED}`],
+    ["https://h#f@x.com&token=s3cr3t", `https://h#${REDACTED}`],
+    ["see https://h?e=a@x.com&token=s3cr3t for details", `see https://h?${REDACTED} for details`],
+    ["request to https://h#f@x.com.", `request to https://h#${REDACTED}.`],
+    ['{"url":"https://h?e=a@x.com&token=s3cr3t"}', `{"url":"https://h?${REDACTED}"}`],
+    ['{\\"url\\":\\"https://h?e=a@x.com&token=s3cr3t\\"}', `{\\"url\\":\\"https://h?${REDACTED}\\"}`],
+    ["https:\\/\\/h?e=a@x.com&token=s3cr3t", `https:\\/\\/h?${REDACTED}`],
+    ["https:\\/\\/h#f@x.com", `https:\\/\\/h#${REDACTED}`],
+    ['{\\"detail\\":\\"see https:\\/\\/h#f@x.com for details\\"}', `{\\"detail\\":\\"see https:\\/\\/h#${REDACTED} for details\\"}`],
+    ["request ?e=a@x.com&token=s3cr3t failed", `request ?e=a@x.com&token=${REDACTED} failed`],
+    // Controls: a userinfo before the host still goes, with or without a password, before a path or a
+    // query, in the plain and the slash-escaped form, and a path already ended it on main.
+    ["https://svc:s3cr3t@h/path?x=1", `https://h/path?${REDACTED}`],
+    ["https://user@h?x=1", `https://h?${REDACTED}`],
+    ["https://svc:s3cr3t@h#frag", `https://h#${REDACTED}`],
+    ["https:\\/\\/svc:s3cr3t@h\\/path", "https:\\/\\/h\\/path"],
+    ["https://h/a?e=a@x.com&token=s3cr3t", `https://h/a?${REDACTED}`],
+    ["open https://docs.example.com/guide/setup for details", "open https://docs.example.com/guide/setup for details"],
+  ]) {
+    assert.equal(scrubErrorText(text), expected, text);
+    assert.equal(scrubDataText(text), expected, text);
+    assert.equal(redactSecretValues(text), expected, text);
+    assert.equal(scrubErrorText(expected), expected, `idempotent: ${text}`);
+    assert.equal(scrubDataText(expected), expected, `idempotent: ${text}`);
+  }
+});
