@@ -1972,7 +1972,15 @@ const REFUSED_NEXT_LINKS = [
   { link: `https:\\\\collector.evil-example.net${FOREIGN_TAIL}`, refusal: `is on origin ${FOREIGN_ORIGIN}, not the configured org origin ${CONFIGURED_ORIGIN}` },
   { link: `api/v1/apps?${FOREIGN_LINK_WINDOWS.query}`, refusal: `is a protocol-relative or relative reference rather than a root path on the configured org origin ${CONFIGURED_ORIGIN} or an absolute URL on it` },
   { link: `@collector.evil-example.net${FOREIGN_TAIL}`, refusal: `is a protocol-relative or relative reference rather than a root path on the configured org origin ${CONFIGURED_ORIGIN} or an absolute URL on it` },
-  { link: `data:text/plain,${FOREIGN_LINK_WINDOWS.userinfo}`, refusal: `is on origin null, not the configured org origin ${CONFIGURED_ORIGIN}` },
+  // A hostless scheme is refused by its scheme, never as the opaque origin "null" (leak-probe class 8).
+  { link: `data:text/plain,${FOREIGN_LINK_WINDOWS.userinfo}`, refusal: `is on origin data:, not the configured org origin ${CONFIGURED_ORIGIN}` },
+  { link: `javascript:alert('${FOREIGN_LINK_WINDOWS.userinfo}')`, refusal: `is on origin javascript:, not the configured org origin ${CONFIGURED_ORIGIN}` },
+  { link: `file:///etc${FOREIGN_LINK_WINDOWS.path}`, refusal: `is on origin file:, not the configured org origin ${CONFIGURED_ORIGIN}` },
+  { link: `blob:${FOREIGN_ORIGIN}${FOREIGN_LINK_WINDOWS.path}`, refusal: `is on origin blob:, not the configured org origin ${CONFIGURED_ORIGIN}` },
+  // A blob: URL wrapping the configured origin is still not on it: URL.origin would read the inner origin and let it through.
+  { link: `blob:${CONFIGURED_ORIGIN}${FOREIGN_LINK_WINDOWS.path}`, refusal: `is on origin blob:, not the configured org origin ${CONFIGURED_ORIGIN}` },
+  { link: `http://10.0.0.1${FOREIGN_TAIL}`, refusal: `is on origin http://10.0.0.1, not the configured org origin ${CONFIGURED_ORIGIN}` },
+  { link: `https://[::1]:8443${FOREIGN_TAIL}`, refusal: `is on origin https://[::1]:8443, not the configured org origin ${CONFIGURED_ORIGIN}` },
   { link: `https://[::1${FOREIGN_TAIL}`, refusal: `could not be parsed against the configured org origin ${CONFIGURED_ORIGIN}` },
 ];
 

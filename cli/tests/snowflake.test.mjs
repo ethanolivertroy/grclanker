@@ -1675,7 +1675,15 @@ const REFUSED_STATUS_URLS = [
   { statusUrl: `/\\collector.evil-example.net${FOREIGN_STATUS_TAIL}`, refusal: `is on origin ${FOREIGN_ACCOUNT_ORIGIN}, not the configured account origin ${CONFIGURED_ACCOUNT_ORIGIN}` },
   { statusUrl: `https:\\\\collector.evil-example.net${FOREIGN_STATUS_TAIL}`, refusal: `is on origin ${FOREIGN_ACCOUNT_ORIGIN}, not the configured account origin ${CONFIGURED_ACCOUNT_ORIGIN}` },
   { statusUrl: `api/v2/statements/handle-9?${FOREIGN_STATUS_WINDOWS.query}`, refusal: RELATIVE_REFERENCE_REFUSAL },
-  { statusUrl: `data:text/plain,${FOREIGN_STATUS_WINDOWS.userinfo}`, refusal: `is on origin null, not the configured account origin ${CONFIGURED_ACCOUNT_ORIGIN}` },
+  // A hostless scheme is refused by its scheme, never as the opaque origin "null" (leak-probe class 8).
+  { statusUrl: `data:text/plain,${FOREIGN_STATUS_WINDOWS.userinfo}`, refusal: `is on origin data:, not the configured account origin ${CONFIGURED_ACCOUNT_ORIGIN}` },
+  { statusUrl: `javascript:alert('${FOREIGN_STATUS_WINDOWS.userinfo}')`, refusal: `is on origin javascript:, not the configured account origin ${CONFIGURED_ACCOUNT_ORIGIN}` },
+  { statusUrl: `file:///etc${FOREIGN_STATUS_WINDOWS.path}`, refusal: `is on origin file:, not the configured account origin ${CONFIGURED_ACCOUNT_ORIGIN}` },
+  { statusUrl: `blob:${FOREIGN_ACCOUNT_ORIGIN}${FOREIGN_STATUS_WINDOWS.path}`, refusal: `is on origin blob:, not the configured account origin ${CONFIGURED_ACCOUNT_ORIGIN}` },
+  // A blob: URL wrapping the configured origin is still not on it: URL.origin would read the inner origin and let it through.
+  { statusUrl: `blob:${CONFIGURED_ACCOUNT_ORIGIN}${FOREIGN_STATUS_WINDOWS.path}`, refusal: `is on origin blob:, not the configured account origin ${CONFIGURED_ACCOUNT_ORIGIN}` },
+  { statusUrl: `http://10.0.0.1${FOREIGN_STATUS_TAIL}`, refusal: `is on origin http://10.0.0.1, not the configured account origin ${CONFIGURED_ACCOUNT_ORIGIN}` },
+  { statusUrl: `https://[::1]:8443${FOREIGN_STATUS_TAIL}`, refusal: `is on origin https://[::1]:8443, not the configured account origin ${CONFIGURED_ACCOUNT_ORIGIN}` },
   { statusUrl: `https://[::1${FOREIGN_STATUS_TAIL}`, refusal: `could not be parsed against the configured account origin ${CONFIGURED_ACCOUNT_ORIGIN}` },
 ];
 

@@ -1969,6 +1969,17 @@ const ABSOLUTE_URL_PATTERN = /^[a-z][a-z0-9+.-]*:/i;
 const REFUSED_ENDPOINT = "(refused: not on the configured org origin)";
 
 /**
+ * The origin a URL names, spelled as scheme and host (`https://host:8443`) or,
+ * for a URL without a host (`javascript:`, `data:`, `file:`, `blob:`), as its
+ * bare scheme. `URL.origin` would spell the first three as the opaque string
+ * "null" and a blob: URL as the origin of the URL inside it, so a blob: link
+ * carrying the configured host would compare equal to it.
+ */
+function originLabel(url: URL): string {
+  return url.host.length > 0 ? `${url.protocol}//${url.host}` : url.protocol;
+}
+
+/**
  * Where a URL may lead, decided before any request is sent. A client-built
  * path or a server-supplied Link rel="next" URL is followed only when it is a
  * root path on the configured org origin or an absolute URL that resolves, as
@@ -1976,25 +1987,27 @@ const REFUSED_ENDPOINT = "(refused: not on the configured org origin)";
  * normalization, so casing never matters) and carries no userinfo. A
  * protocol-relative (`//host`) or backslash (`\\host`) form is refused whatever
  * host it names, since concatenating it onto the org URL would request a path
- * the server never meant while a browser would leave for that host. Each
- * refusal is fixed text naming only the configured origin and the rejected
- * origin: no path, query, fragment, or userinfo of the link reaches any text,
- * so the SSWS token or bearer credential never leaves for another host and no
- * window of the link is echoed.
+ * the server never meant while a browser would leave for that host; a link on
+ * a hostless scheme (`javascript:`, `data:`, `blob:`, `file:`) is refused by
+ * its scheme. Each refusal is fixed text naming only the configured origin and
+ * the rejected origin: no path, query, fragment, or userinfo of the link
+ * reaches any text, so the SSWS token or bearer credential never leaves for
+ * another host and no window of the link is echoed.
  */
 function resolveOnConfiguredOrigin(config: OktaResolvedConfig, pathOrUrl: string): OriginResolution {
-  const configured = new URL(config.orgUrl).origin;
+  const configured = originLabel(new URL(config.orgUrl));
   let resolved: URL;
   try {
     resolved = new URL(pathOrUrl, config.orgUrl);
   } catch {
     return { refusal: `could not be parsed against the configured org origin ${configured}` };
   }
+  const origin = originLabel(resolved);
   if (resolved.username !== "" || resolved.password !== "") {
-    return { refusal: `carries userinfo for origin ${resolved.origin} (configured org origin ${configured})` };
+    return { refusal: `carries userinfo for origin ${origin} (configured org origin ${configured})` };
   }
-  if (resolved.origin !== configured) {
-    return { refusal: `is on origin ${resolved.origin}, not the configured org origin ${configured}` };
+  if (origin !== configured) {
+    return { refusal: `is on origin ${origin}, not the configured org origin ${configured}` };
   }
   if (!ROOT_PATH_PATTERN.test(pathOrUrl) && !ABSOLUTE_URL_PATTERN.test(pathOrUrl)) {
     return { refusal: `is a protocol-relative or relative reference rather than a root path on the configured org origin ${configured} or an absolute URL on it` };

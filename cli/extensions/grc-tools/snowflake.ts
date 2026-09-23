@@ -1524,6 +1524,17 @@ const ROOT_PATH_PATTERN = /^\/(?![/\\])/;
 const ABSOLUTE_URL_PATTERN = /^[a-z][a-z0-9+.-]*:/i;
 
 /**
+ * The origin a URL names, spelled as scheme and host (`https://host:8443`) or,
+ * for a URL without a host (`javascript:`, `data:`, `file:`, `blob:`), as its
+ * bare scheme. `URL.origin` would spell the first three as the opaque string
+ * "null" and a blob: URL as the origin of the URL inside it, so a blob: link
+ * carrying the configured host would compare equal to it.
+ */
+function originLabel(url: URL): string {
+  return url.host.length > 0 ? `${url.protocol}//${url.host}` : url.protocol;
+}
+
+/**
  * Where a URL may lead, decided before any credential is built or any request
  * is sent. A client-built path or the server-supplied statementStatusUrl of an
  * asynchronous statement is followed only when it is a root path on the
@@ -1533,24 +1544,26 @@ const ABSOLUTE_URL_PATTERN = /^[a-z][a-z0-9+.-]*:/i;
  * as `@other.example/x`, a protocol-relative (`//host`) form, or a backslash
  * (`\\host`) form is refused whatever host it names, since concatenating it
  * onto the account URL would move the host or request a path the server never
- * meant. Each refusal is fixed text naming only the configured origin and the
- * rejected origin: no path, query, fragment, or userinfo of the link reaches
- * any text, so the bearer token never leaves for another host and no window of
- * the link is echoed.
+ * meant; a link on a hostless scheme (`javascript:`, `data:`, `blob:`, `file:`)
+ * is refused by its scheme. Each refusal is fixed text naming only the
+ * configured origin and the rejected origin: no path, query, fragment, or
+ * userinfo of the link reaches any text, so the bearer token never leaves for
+ * another host and no window of the link is echoed.
  */
 function resolveOnConfiguredOrigin(candidate: string, baseUrl: string): OriginResolution {
-  const configured = new URL(baseUrl).origin;
+  const configured = originLabel(new URL(baseUrl));
   let resolved: URL;
   try {
     resolved = new URL(candidate, baseUrl);
   } catch {
     return { refusal: `could not be parsed against the configured account origin ${configured}` };
   }
+  const origin = originLabel(resolved);
   if (resolved.username !== "" || resolved.password !== "") {
-    return { refusal: `carries userinfo for origin ${resolved.origin} (configured account origin ${configured})` };
+    return { refusal: `carries userinfo for origin ${origin} (configured account origin ${configured})` };
   }
-  if (resolved.origin !== configured) {
-    return { refusal: `is on origin ${resolved.origin}, not the configured account origin ${configured}` };
+  if (origin !== configured) {
+    return { refusal: `is on origin ${origin}, not the configured account origin ${configured}` };
   }
   if (!ROOT_PATH_PATTERN.test(candidate) && !ABSOLUTE_URL_PATTERN.test(candidate)) {
     return { refusal: `is a protocol-relative or relative reference rather than a root path on the configured account origin ${configured} or an absolute URL on it` };
