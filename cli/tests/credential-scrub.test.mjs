@@ -939,10 +939,11 @@ const BOUNDARY_KEPT = [
 ];
 
 /**
- * URL rows the boundary rules must leave unchanged. The LaunchDarkly and Elastic data walkers reduce a URL to its
- * origin by design (`reduceUrl`, `reduceUrlsToOrigin`), so those two entry points are not run on these rows.
+ * URL rows the boundary rules must leave unchanged. The LaunchDarkly data walker reduces a URL to its origin wherever
+ * it stands by design (`reduceUrl`), so that entry point is not run on these rows; the Elastic walker reduces only a
+ * value that is one URL (`reduceUrlValueToOrigin`) and runs on them.
  */
-const URL_REDUCING_ENTRY_POINTS = new Set(["launchdarkly redactCredentialValues", "elastic redactSensitiveValues"]);
+const URL_REDUCING_ENTRY_POINTS = new Set(["launchdarkly redactCredentialValues"]);
 const BOUNDARY_KEPT_URLS = [
   "https://api.box.com/oauth2/token: 400 Bad Request",
   "GET https://es.example.com:9200/_security/api_key: 403 Forbidden",

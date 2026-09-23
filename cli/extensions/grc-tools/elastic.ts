@@ -636,10 +636,9 @@ function isSecretKey(key: string, parentKey: string | undefined): boolean {
 }
 
 const SCHEME_URL_PATTERN = /^[a-z][a-z0-9+.-]*:\/\//i;
-// The marker is part of a URL an earlier pass wrote (`https://hooks.example.com/[REDACTED]`), so a second pass reads
-// the whole URL and reduces it again instead of cutting it before the bracket and gluing the marker onto the host.
-const EMBEDDED_URL_PATTERN = /\b[a-z][a-z0-9+.-]*:\/\/(?:\[REDACTED\]|[^\s"'<>()[\]{}\\])+/gi;
-const TRAILING_PUNCTUATION_PATTERN = /[.,;:!?]+$/;
+// A value that is one URL and nothing else (`https://es.example.com:9200`, `ldaps://svc:pw@ldap.example.com:636`), as
+// opposed to prose that mentions one.
+const URL_VALUE_PATTERN = /^[a-z][a-z0-9+.-]*:\/\/\S+$/i;
 
 function urlOrigin(url: string): string {
   try {
@@ -651,37 +650,37 @@ function urlOrigin(url: string): string {
 }
 
 /**
- * Reduces every URL in a collected string to its origin (scheme and host): a URL-shaped value as a whole, and every
- * scheme-prefixed URL embedded in free text. No Elastic verdict reads a URL past its scheme (plain-http checks on
- * Fleet hosts and connector URLs), so userinfo, paths, query strings, and fragments never reach an assess payload
- * or the bundle, whichever field carries them.
+ * Reduces a collected value that is one URL to its origin (scheme and host). No Elastic verdict reads a URL field past
+ * its scheme (plain-http checks on Fleet hosts and connector URLs), so the userinfo, path, query string, and fragment
+ * of a URL value never reach an assess payload or the bundle, whichever field carries it. A URL embedded in free text
+ * (a note, a description, an error detail kept in a record) is left to the shared pattern pass, which drops its
+ * userinfo and replaces its query and fragment while keeping the scheme, host, and path that name the surface, as
+ * every other module's data walker does.
  */
-export function reduceUrlsToOrigin(value: string): string {
-  if (SCHEME_URL_PATTERN.test(value.trim())) return urlOrigin(value.trim());
-  return value.replace(EMBEDDED_URL_PATTERN, (match) => {
-    const trailing = TRAILING_PUNCTUATION_PATTERN.exec(match)?.[0] ?? "";
-    return `${urlOrigin(match.slice(0, match.length - trailing.length))}${trailing}`;
-  });
+export function reduceUrlValueToOrigin(value: string): string {
+  const trimmed = value.trim();
+  return URL_VALUE_PATTERN.test(trimmed) ? urlOrigin(trimmed) : value;
 }
 
 /**
  * The data-side scrub every collected dataset passes through before it is assessed or written (see
  * credential-scrub.ts `scrubData`): the whole subtree under a secret-shaped key becomes the marker, `{name, value}`
- * pairs with a credential-shaped name lose their value, every string loses its URLs past the origin and then runs
- * through the module's pattern scrubber (carriers, configured secrets, token shapes; shape rules off under identifier
- * keys such as `id` or `ca_sha256`), and nesting past the cap becomes the marker. Booleans and nulls pass through.
+ * pairs with a credential-shaped name lose their value, a string that is one URL keeps its origin only, and every
+ * string runs through the module's pattern scrubber (carriers, configured secrets, token shapes, and the userinfo,
+ * query, and fragment of a URL inside free text; shape rules off under identifier keys such as `id` or `ca_sha256`),
+ * and nesting past the cap becomes the marker. Booleans and nulls pass through.
  */
 export function redactSensitiveValues(value: unknown): unknown {
   return credentialScrubber.scrubData(value, {
     isCredentialKey: isSecretKey,
-    transformString: reduceUrlsToOrigin,
+    transformString: reduceUrlValueToOrigin,
     maxDepth: MAX_REDACTION_DEPTH,
   });
 }
 
 /** Keeps only scheme and host of a URL-shaped value so paths and query strings carrying tokens never reach the bundle. */
 function reduceUrlToOrigin(value: unknown): unknown {
-  return typeof value === "string" ? reduceUrlsToOrigin(value) : value;
+  return typeof value === "string" ? reduceUrlValueToOrigin(value) : value;
 }
 
 const CONNECTOR_URL_KEYS = ["url", "webhookUrl", "apiUrl", "configUrl", "webhook_url", "api_url"];

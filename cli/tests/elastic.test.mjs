@@ -35,7 +35,7 @@ import {
   projectDataset,
   redactSecrets,
   redactSensitiveValues,
-  reduceUrlsToOrigin,
+  reduceUrlValueToOrigin,
   registerElasticTools,
   resolveElasticConfiguration,
   resolveSecureOutputPath,
@@ -3006,31 +3006,36 @@ test("verdict rule 9: every collected dataset is projected to the fields its ver
   assertCanaryWindowsAbsent(assert, JSON.stringify(plainFindings), [DATA_CARRIERS.outputHostUserinfo], "plain-http verdict payload");
 });
 
-test("verdict rule 9: reduceUrlsToOrigin reduces a URL value and every URL embedded in free text to scheme and host, and redactSensitiveValues applies it to every collected string", () => {
-  assert.equal(reduceUrlsToOrigin("https://user:pw@host.example.com:9243/path/x?token=abc#frag"), "https://host.example.com:9243");
-  assert.equal(reduceUrlsToOrigin("  ldaps://svc:pw@ldap.example.com:636 "), "ldaps://ldap.example.com:636");
-  assert.equal(reduceUrlsToOrigin("see https://a.example.com/x?token=abc, then http://b.example.com/y#f."), "see https://a.example.com, then http://b.example.com.");
-  assert.equal(reduceUrlsToOrigin("no url here"), "no url here");
-  assert.equal(reduceUrlsToOrigin("http://"), "[REDACTED]", "a URL that does not parse is the marker rather than copied");
+test("verdict rule 9: reduceUrlValueToOrigin reduces a value that is one URL to scheme and host and leaves a URL inside free text to the shared pass, which redactSensitiveValues applies to every collected string", () => {
+  assert.equal(reduceUrlValueToOrigin("https://user:pw@host.example.com:9243/path/x?token=abc#frag"), "https://host.example.com:9243");
+  assert.equal(reduceUrlValueToOrigin("  ldaps://svc:pw@ldap.example.com:636 "), "ldaps://ldap.example.com:636");
+  assert.equal(reduceUrlValueToOrigin("no url here"), "no url here");
+  assert.equal(reduceUrlValueToOrigin("http://"), "http://", "a value with no host is not a URL and is left to the shared pass");
+  assert.equal(reduceUrlValueToOrigin("https://[not a host/x"), "https://[not a host/x", "a value with a space is prose, not one URL");
+  assert.equal(reduceUrlValueToOrigin("https://[::1"), "[REDACTED]", "a value that is one URL and does not parse is the marker rather than copied");
+  const prose = "see https://a.example.com/x?token=abc, then http://svc:pw@b.example.com/y#f.";
+  assert.equal(reduceUrlValueToOrigin(prose), prose, "a URL embedded in free text is left to the shared pass");
   const scrubbed = redactSensitiveValues({
     hosts: ["https://svc:pw@es.example.com:9200"],
     note: "docs at https://wiki.example.com/x?token=abc",
+    detail: `${prose} (https://api.example.com/oauth2/token: 400 Bad Request)`,
+    flag: "curl --password=nwkdpkhggeny https://api.example.com/v1",
     nested: { url: "https://u:p@h.example.com/a" },
     id: "https://id.example.com/x?token=abc",
   });
   assert.deepEqual(scrubbed, {
     hosts: ["https://es.example.com:9200"],
-    note: "docs at https://wiki.example.com",
+    note: "docs at https://wiki.example.com/x?[REDACTED]",
+    detail: "see https://a.example.com/x?[REDACTED], then http://b.example.com/y?[REDACTED]. (https://api.example.com/oauth2/token: 400 Bad Request)",
+    flag: "curl --password=[REDACTED] https://api.example.com/v1",
     nested: { url: "https://h.example.com" },
     id: "https://id.example.com",
-  });
-  // A URL that carries the marker from an earlier pass is read whole: the marker is not cut off and glued to the host,
-  // so a second pass over a webhook pair is a fixed point instead of collapsing the whole value.
-  assert.equal(reduceUrlsToOrigin("sent to https://hooks.example.com/[REDACTED] twice"), "sent to https://hooks.example.com twice");
+  }, "a URL value keeps its origin; a URL in free text keeps scheme, host, and path and loses userinfo, query, and fragment");
+  assert.deepEqual(redactSensitiveValues(scrubbed), scrubbed, "the data-side scrub is a fixed point");
   const webhookPair = "webhook_url=https://hooks.example.com/services/T0/B0/Kq7Zx2Vw9Lm4Tp8RfiCYcanaryKEY";
-  const once = redactSensitiveValues({ note: webhookPair }).note;
-  assert.equal(once, "webhook_url=https://hooks.example.com/[REDACTED]");
-  assert.equal(redactSensitiveValues({ note: once }).note, once, "the data-side scrub of a webhook pair is idempotent");
+  const once = redactSensitiveValues({ note: webhookPair, webhook_url: webhookPair.slice("webhook_url=".length) });
+  assert.deepEqual(once, { note: "webhook_url=https://hooks.example.com/[REDACTED]", webhook_url: "https://hooks.example.com" }, "a webhook pair in free text keeps its origin and the marker, a webhook value its origin");
+  assert.deepEqual(redactSensitiveValues(once), once, "the data-side scrub of a webhook pair is idempotent");
 });
 
 test("verdict rule 9: a configured secret straddling the 240-character error detail cut is scrubbed at full length before the cut in every encoding, so no fragment survives in the error, a tool payload, or the bundle", async () => {
