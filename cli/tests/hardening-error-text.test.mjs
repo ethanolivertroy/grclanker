@@ -265,6 +265,56 @@ test("scheme-carried values are removed whatever their casing or entropy; the pr
   }
 });
 
+test("#78 row B: every scheme word carries in any casing on both sides, Snowflake and AWS4-HMAC-SHA256 included; a name-shaped value after a scheme word in a header goes, the scheme word as spelled stays", () => {
+  // Regression from main at 02967cc on the data side: `SCHEME_WORD_PATTERN` enumerated conventional
+  // spellings, so `replayed DIGEST <token>`, `bEaReR`, `negotiate`, `API-KEY` carried nothing. The
+  // pattern is case-insensitive now (01:40 ruling); the lowercase spellings of the English words
+  // (`basic`, `token`, `digest`, `oauth`, `splunk`, `negotiate`, `snowflake`) stay the weaker carriers.
+  const alternate = (word) => [...word].map((char, index) => (index % 2 === 0 ? char.toLowerCase() : char.toUpperCase())).join("");
+  const token = "YUVEiVuCTge5Xk7iTaMU2YHLgrPkg5bm";
+  const opaque = "c3ZjOndsa3RheXVkZAAA";
+  const nameShaped = "aaohkypvimed";
+  const schemes = ["Bearer", "Basic", "Token", "Digest", "OAuth", "Negotiate", "NTLM", "SSWS", "ApiKey", "Api-Key", "Splunk", "Snowflake", "AWS4-HMAC-SHA256"];
+  for (const scheme of schemes) {
+    for (const spelled of new Set([scheme, scheme.toLowerCase(), scheme.toUpperCase(), alternate(scheme)])) {
+      for (const value of [token, opaque, nameShaped]) {
+        for (const text of [`Authorization: ${spelled} ${value}`, `request failed\\/Authorization: ${spelled} ${value} see the log`, `request failed\nAuthorization: ${spelled} ${value}`]) {
+          const expected = text.replace(value, REDACTED);
+          for (const scrub of [scrubErrorText, scrubDataText, (t) => redactSecretValues(t)]) {
+            assert.equal(scrub(text), expected, JSON.stringify(text));
+          }
+        }
+      }
+      for (const value of [token, opaque]) {
+        const text = `replayed ${spelled} ${value} upstream`;
+        for (const scrub of [scrubErrorText, scrubDataText, (t) => redactSecretValues(t)]) {
+          assert.equal(scrub(text), `replayed ${spelled} ${REDACTED} upstream`, text);
+        }
+      }
+    }
+  }
+  // The prose exemption holds in every casing, and the lowercase English words take no word-shaped value.
+  for (const prose of [
+    "Bearer token is missing",
+    'BEARER realm="api"',
+    "failed to negotiate TLS with the upstream",
+    "the snowflake account was suspended",
+    "Snowflake account locked",
+    "NEGOTIATE authentication is disabled",
+    "token canary-noexpiry-token-zq has no expiry",
+    "Authorization: SNOWFLAKE",
+    "Authorization: aws4-hmac-sha256",
+  ]) {
+    assert.equal(scrubErrorText(prose), prose, prose);
+    assert.equal(scrubDataText(prose), prose, prose);
+  }
+  // A SigV4 header loses its credential scope and signature and keeps the scheme word.
+  const sigv4 = "Authorization: AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/20260922/us-east-1/s3/aws4_request, SignedHeaders=host;x-amz-date, Signature=fe5f80f77d5fa3beca038a248ff027d0445342fe2855ddc963176630326f1024";
+  const scrubbedSigv4 = scrubErrorText(sigv4);
+  assert.ok(scrubbedSigv4.startsWith(`Authorization: AWS4-HMAC-SHA256 ${REDACTED}`), scrubbedSigv4);
+  assert.ok(!scrubbedSigv4.includes("AKIAIOSFODNN7EXAMPLE") && !scrubbedSigv4.includes("fe5f80f77d5fa3be"), scrubbedSigv4);
+});
+
 test("credential-named pairs lose any nonempty value whatever its shape, compound and env-style keys included; the one exemption is a word that continues as prose", () => {
   // Codex P2 (credential-labelled pair with a short lowercase word value): guard 1 as written, no shape gate.
   for (const [text, expected] of [

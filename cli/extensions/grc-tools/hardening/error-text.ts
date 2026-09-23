@@ -12,8 +12,10 @@
  * or underscores, digits standing in whole segments) is indistinguishable from a resource name and
  * stays. Two guards make that safe, and both are construction requirements. (1) A value inside a
  * carrier is removed whatever its shape: the Cookie, Set-Cookie, Authorization, Proxy-Authorization,
- * x-api-key and similar headers; the schemes Bearer, Basic, Token, ApiKey, Digest, OAuth, SSWS, and
- * Splunk; credential-named pairs (`token=`, `"password":`, `api_key:`, `session_id=`); URL userinfo
+ * x-api-key and similar headers; the schemes Bearer, Basic, Token, ApiKey, Digest, OAuth, Negotiate,
+ * NTLM, SSWS, Splunk, Snowflake, and AWS4-HMAC-SHA256 in any casing; credential-named pairs (`token=`,
+ * `"password":`, `api_key:`, `session_id=`, and the flags and path segments a spawned CLI echoes,
+ * `--password=`, `--password <value>`, `-Dpassword=`, `kv/password:`); URL userinfo
  * and query pairs. A quoted value (`X-Api-Key: "value"`, `Cookie: sid='value'`, `Authorization:
  * Bearer "value"`, the JSON pair `"Authorization": "Bearer value"`, and their JSON-escaped forms
  * `\"X-Api-Key\": \"value\"` at any depth) is removed whole up to its closing quote, spaces and all,
@@ -78,7 +80,7 @@ const MAX_CUT_ATTEMPTS = 4;
 // The tail of a cut head that a second pass would read as a value: a separator followed only by a
 // quote, a scheme word, or both (`X-Api-Key: "`, `"Authorization": "Bearer`), a trailing partial query
 // or fragment of a URL (`?token=`, `#`), trailing spaces, and a dangling escape backslash.
-const CUT_VALUE_OPENER_PATTERN = /([:=])[ \t]*(?:\\*["'])?[ \t]*(?:(?:Bearer|Basic|Token|Digest|OAuth|Negotiate|NTLM|SSWS|ApiKey|Api-Key|Splunk)[ \t]*)?$/i;
+const CUT_VALUE_OPENER_PATTERN = /([:=])[ \t]*(?:\\*["'])?[ \t]*(?:(?:Bearer|Basic|Token|Digest|OAuth|Negotiate|NTLM|SSWS|ApiKey|Api-Key|Splunk|Snowflake|AWS4-HMAC-SHA256)[ \t]*)?$/i;
 const CUT_URL_TAIL_PATTERN = /([a-z][a-z0-9+.-]*:\/\/(?:\[REDACTED\]|[^\s"'<>()[\]{}\\])*?)[?#&](?!\[REDACTED\]$)[^\s?#&"'<>()[\]{}\\]*$/i;
 const CUT_TAIL_PATTERN = /(?:[ \t]|\\+|[?#&]+)+$/;
 const CUT_WORD_CHARACTER_PATTERN = /[A-Za-z0-9_-]/;
@@ -180,11 +182,14 @@ const GENERIC_CREDENTIAL_HEADER = String.raw`x-[a-z0-9-]*(?:key|token|secret|aut
 const CREDENTIAL_HEADER_PATTERN = new RegExp(String.raw`${NAME_START}(${CREDENTIAL_HEADER_NAMES.join("|")}|${GENERIC_CREDENTIAL_HEADER})\b${NAME_CLOSE_AND_SEPARATOR}`, "gi");
 const HEADER_DESCRIPTOR_SUFFIX_PATTERN = /-(?:type|mode|scheme|method|status|version|timeout|ttl|expires|expiry|expiration|count|limit|name|url|uri|endpoint|header)$/i;
 
-// A scheme word in front of a header or pair value (`Authorization: Bearer <value>`, `"Bearer <value>"`)
-// is kept and the value after it goes; a scheme word with nothing after it (`Authorization: Bearer` at
-// the end of a line) is the whole value and stays. The spacing does not cross a line, so a scheme word
-// ending a line is not joined to the next line's first word.
-const VALUE_SCHEME_PATTERN = /(?:Bearer|Basic|Token|Digest|OAuth|Negotiate|NTLM|SSWS|ApiKey|Api-Key|Splunk)(?![A-Za-z0-9_-])[ \t]*/iy;
+// A scheme word in front of a header value (`Authorization: Bearer <value>`, `"Bearer <value>"`), in
+// any casing, is kept and the value after it goes whatever its shape (the header names the
+// credential, so a name-shaped value after `Negotiate` or `Snowflake` goes too); a scheme word with
+// nothing after it (`Authorization: Bearer` at the end of a line) is the whole value and stays. The
+// spacing does not cross a line, so a scheme word ending a line is not joined to the next line's
+// first word. Under a credential-named pair the scheme word is part of the value (see
+// `readCarrierValue`).
+const VALUE_SCHEME_PATTERN = /(?:Bearer|Basic|Token|Digest|OAuth|Negotiate|NTLM|SSWS|ApiKey|Api-Key|Splunk|Snowflake|AWS4-HMAC-SHA256)(?![A-Za-z0-9_-])[ \t]*/iy;
 // A bare header value runs to the first character that ends a header value in free text; a bare pair
 // value also stops at "&" and the closing brackets of a JSON or query fragment. A backslash ends both
 // so a JSON-escaped closing quote is kept, and neither can begin at "[" so the marker is never a value.
@@ -204,26 +209,31 @@ const ENCLOSING_STRING_CLOSE_PATTERN = /^[}\],]/;
 const JSON_LITERAL_PATTERN = /^(?:null|true|false)$/;
 
 // Authorization schemes in free text (`Bearer <value>`, `Basic <base64>`, Okta `SSWS`, GitHub `Token`,
-// Splunk `Splunk`): the value goes whatever its casing or entropy unless it is one plain word, which
-// is prose ("Basic authentication is disabled", "Token request failed", "OAuth bearer token", "Splunk
-// Enterprise"). The exemption is derived from the fixed texts the integrations emit after these
-// words (121 distinct continuations across every integration source): every one is a single word of
-// letters in one casing (the longest, "authentication", has 14) or a hyphenated compound of lowercase
-// words ("OAuth sign-in", "OAuth service-app"), a dotted version ("OAuth 2.0"), or an auth-param of a
-// challenge (`Bearer realm="api"`, `error="invalid_token"`). A value with a digit, a symbol, or mixed
-// casing inside a word is never prose. "token", "basic", "digest", "oauth", and "splunk" in lowercase
-// are English words as often as schemes ("token canary-noexpiry-token-zq has no expiry" names a
-// LaunchDarkly token; "basic authentication is disabled"), yet a peer's error text may spell a scheme
-// in lowercase (Codex P1 on #78: "replayed basic dXNlcjpwYXNz upstream"), so the lowercase spellings
-// are weaker carriers: the value goes only when it cannot be a word or a name, that is when it carries
-// a digit, a symbol, or mixed casing inside the word, and is at least `LOWERCASE_SCHEME_VALUE_MIN_LENGTH`
-// characters (main's floor at 02967cc); a word in either casing or a hyphenated lowercase compound of
-// any length after them is prose. Every one of the 103 distinct continuations after these spellings in
-// the sources is prose under this rule. A quoted value is delimited by its quotes and goes whole when
-// it begins like a credential; in `"Basic ", "token"` inside a JSON document the quote after the
-// scheme word closes one string rather than opening a value.
-const SCHEME_WORD_PATTERN = new RegExp(String.raw`${NAME_START}(?:Bearer|BEARER|bearer|Basic|BASIC|basic|Token|TOKEN|token|Digest|digest|OAuth|oauth|Negotiate|NTLM|SSWS|ApiKey|Apikey|apikey|APIKEY|Api-Key|api-key|Splunk|splunk)[ \t]+`, "g");
-const LOWERCASE_SCHEME_WORDS = new Set(["basic", "token", "digest", "oauth", "splunk"]);
+// Splunk `Splunk`, Snowflake `Snowflake`, SigV4 `AWS4-HMAC-SHA256`), in any casing (a peer's error text
+// or a log may spell one `BEARER`, `bEaReR`, `negotiate`, or `API-KEY`; 01:40 ruling, row B): the value
+// goes whatever its casing or entropy unless it is one plain word, which is prose ("Basic
+// authentication is disabled", "Token request failed", "OAuth bearer token", "Splunk Enterprise"). The
+// exemption is derived from the fixed texts the integrations emit after these words (121 distinct
+// continuations across every integration source): every one is a single word of letters in one
+// casing (the longest, "authentication", has 14) or a hyphenated compound of lowercase words ("OAuth
+// sign-in", "OAuth service-app"), a dotted version ("OAuth 2.0"), or an auth-param of a challenge
+// (`Bearer realm="api"`, `error="invalid_token"`). A value with a digit, a symbol, or mixed casing
+// inside a word is never prose. "token", "basic", "digest", "oauth", "splunk", "negotiate", and
+// "snowflake" in lowercase are English words as often as schemes ("token canary-noexpiry-token-zq has
+// no expiry" names a LaunchDarkly token; "basic authentication is disabled"; "failed to negotiate
+// tls"), yet a peer's error text may spell a scheme in lowercase (Codex P1 on #78: "replayed basic
+// dXNlcjpwYXNz upstream"), so the lowercase spellings of the English words are weaker carriers: the
+// value goes only when it cannot be a word or a name, that is when it carries a digit, a symbol, or
+// mixed casing inside the word, and is at least `LOWERCASE_SCHEME_VALUE_MIN_LENGTH` characters (main's
+// floor at 02967cc); a word in either casing or a hyphenated lowercase compound of any length after
+// them is prose. Every one of the 103 distinct continuations after these spellings in the sources is
+// prose under this rule. Every other spelling (`Bearer`, `bearer`, `TOKEN`, `tOkEn`, `ntlm`, `ssws`,
+// `apikey`, `api-key`, `aws4-hmac-sha256`) is a scheme, not a word, and carries under the plain-word
+// exemption alone. A quoted value is delimited by its quotes and goes whole when it begins like a
+// credential; in `"Basic ", "token"` inside a JSON document the quote after the scheme word closes
+// one string rather than opening a value.
+const SCHEME_WORD_PATTERN = new RegExp(String.raw`${NAME_START}(?:Bearer|Basic|Token|Digest|OAuth|Negotiate|NTLM|SSWS|ApiKey|Api-Key|Splunk|Snowflake|AWS4-HMAC-SHA256)(?![A-Za-z0-9_-])[ \t]+`, "gi");
+const LOWERCASE_SCHEME_WORDS = new Set(["basic", "token", "digest", "oauth", "splunk", "negotiate", "snowflake"]);
 const SCHEME_BARE_VALUE_PATTERN = /[A-Za-z0-9][A-Za-z0-9._~+/=-]{3,}/y;
 const SCHEME_VALUE_MIN_LENGTH = 4;
 const LOWERCASE_SCHEME_VALUE_MIN_LENGTH = 8;
@@ -917,7 +927,8 @@ function replaceGenericCredentialPairs(text: string): string {
  * query strings, Cookie and Set-Cookie values, credential header values (Authorization,
  * Proxy-Authorization, x-api-key and the like, a scheme word in front of the value kept),
  * authorization scheme values in free text (Bearer, Basic, Digest, Token, OAuth, Negotiate, NTLM,
- * SSWS, ApiKey, Splunk), credential-named pairs in prose, headers, query strings, and JSON fragments
+ * SSWS, ApiKey, Splunk, Snowflake, AWS4-HMAC-SHA256, in any casing, the lowercase English words
+ * among them as weaker carriers), credential-named pairs in prose, headers, query strings, and JSON fragments
  * (the value whatever its shape, under the credential words themselves and under every compound or
  * env-style key `isCredentialKey` classifies, `DB_PASSWORD`, `client_token`, `clientToken`; the one
  * exemption is a plain word after `Key: ` that continues as prose, see `continuesAsProse`; a key whose
