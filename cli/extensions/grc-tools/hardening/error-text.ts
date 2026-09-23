@@ -115,9 +115,12 @@ const PEM_OPEN_PATTERN = /-----BEGIN [A-Z0-9 ]+-----[\s\S]*$/;
 // Any scheme-prefixed URL wherever it sits in the text: the userinfo is dropped, the query and the
 // fragment are replaced, the scheme, host, and path stay because they name the surface. A marker
 // already standing in the query or fragment is consumed with the URL so a second pass is a no-op,
-// and a backslash ends the URL so a JSON-escaped closing quote is kept.
-const EMBEDDED_URL_PATTERN = /\b[a-z][a-z0-9+.-]*:\/\/(?:\[REDACTED\]|[^\s"'<>()[\]{}\\])+/gi;
-const URL_PARTS_PATTERN = /^([a-z][a-z0-9+.-]*:\/\/)(?:[^\s/@"'<>]+@)?([^?#]*)(\?[^#]*)?(#.*)?$/i;
+// and a backslash ends the URL so a JSON-escaped closing quote is kept, except the escaped solidus
+// `\/`: a JSON encoder may write every "/" of a URL as `\/` (review of #78 row C), so
+// `https:\/\/svc:<value>@api.example.com\/v1\/items` is the same URL and loses its userinfo, query, and
+// fragment the same way, its escaped separators kept as written.
+const EMBEDDED_URL_PATTERN = /\b[a-z][a-z0-9+.-]*:(?:\/\/|\\\/\\\/)(?:\[REDACTED\]|\\\/|[^\s"'<>()[\]{}\\])+/gi;
+const URL_PARTS_PATTERN = /^([a-z][a-z0-9+.-]*:(?:\/\/|\\\/\\\/))(?:[^\s/@"'<>\\]+@)?([^?#]*)(\?[^#]*)?(#.*)?$/i;
 const TRAILING_PUNCTUATION_PATTERN = /[.,;:!?]+$/;
 
 // A relative path or bare query string: the named parameter keeps its name, the value goes. A

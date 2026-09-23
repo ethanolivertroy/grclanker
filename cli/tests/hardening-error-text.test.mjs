@@ -803,6 +803,24 @@ test("URLs keep scheme, host, and path and lose userinfo, query, and fragment; b
   );
   assert.equal(scrubErrorText("GET /v1/users?api_key=abcdef123456&page=2&sig=zzzz9999 failed"), `GET /v1/users?api_key=${REDACTED}&page=2&sig=${REDACTED} failed`);
   assert.equal(scrubErrorText("open https://docs.example.com/guide/setup for details"), "open https://docs.example.com/guide/setup for details");
+  // #78 row C: a JSON encoder may write every "/" of a URL as `\/`; the slash-escaped URL is the same
+  // URL and loses its userinfo, query, and fragment with its escaped separators kept as written.
+  // Regression from main at 02967cc, where a backslash ended the URL before the userinfo was read.
+  const escapedHost = "api.example.com\\/v1\\/items";
+  for (const [text, expected] of [
+    [`upstream https:\\/\\/svc:${CANARY.basic}@${escapedHost} refused`, `upstream https:\\/\\/${escapedHost} refused`],
+    [`upstream https:\\/\\/svc:aaohkypvimed@${escapedHost} refused`, `upstream https:\\/\\/${escapedHost} refused`],
+    [`{"detail":"upstream https:\\/\\/svc:${CANARY.basic}@${escapedHost}?token=${CANARY.urlToken}&x=1 refused"}`, `{"detail":"upstream https:\\/\\/${escapedHost}?${REDACTED} refused"}`],
+    [`request url: proxy:\\/\\/svc:${CANARY.basic}@proxy.example.com:8080`, "request url: proxy:\\/\\/proxy.example.com:8080"],
+    [`{"url":"https:\\/\\/${escapedHost}?token=${CANARY.urlToken}#frag"}`, `{"url":"https:\\/\\/${escapedHost}?${REDACTED}#${REDACTED}"}`],
+    // A backslash that is not an escaped solidus still ends the URL, so the JSON-escaped closing quote stays.
+    [`{"detail":"see https:\\/\\/${escapedHost}\\" next"}`, `{"detail":"see https:\\/\\/${escapedHost}\\" next"}`],
+  ]) {
+    for (const scrub of [scrubErrorText, scrubDataText, (t) => redactSecretValues(t)]) {
+      assert.equal(scrub(text), expected, JSON.stringify(text));
+      assert.equal(scrub(expected), expected, `idempotent: ${JSON.stringify(text)}`);
+    }
+  }
 });
 
 test("describeErrorBody never echoes a body and keeps only documented message fields", () => {
