@@ -4166,15 +4166,17 @@ export async function assessLaunchdarklyMonitoringIntegrations(
   const findings: LaunchdarklyFinding[] = [
     retentionFinding(
       12,
+      // An audit log that could not be read proves nothing about retention either way; fail is reserved for a readable
+      // log that returned nothing.
       !auditReadable
-        ? "fail"
+        ? "manual"
         : retentionProbeGap
           ? "manual"
           : retentionProbe.length > 0
             ? "pass"
             : recentAuditGap ? "manual" : recentAuditEntries.length === 0 ? "fail" : "warn",
       !auditReadable
-        ? `The audit log could not be read (${failedReadNote(recentAuditCollection, auditRequest())}), so retention cannot be demonstrated.`
+        ? `The audit log could not be read (${failedReadNote(recentAuditCollection, auditRequest())}), so retention cannot be judged from the API.`
         : retentionProbeGap
           ? `The retention probe for entries older than ${retentionDays} days could not be read, so retention cannot be demonstrated from the API.`
           : retentionProbe.length > 0
@@ -4194,12 +4196,12 @@ export async function assessLaunchdarklyMonitoringIntegrations(
     criticalActionFinding(
       13,
       !auditReadable
-        ? "fail"
+        ? "manual"
         : bothCriticalAuditGaps
           ? "manual"
           : criticalActionsSeen.length > 0 ? "pass" : "warn",
       !auditReadable
-        ? "The audit log could not be read, so critical action coverage cannot be demonstrated."
+        ? `The audit log could not be read (${failedReadNote(memberAuditCollection, auditRequest({ spec: "member/*" }))}), so critical action coverage cannot be judged from the API.`
         : bothCriticalAuditGaps
           ? "Neither the member nor the role audit log query could be read, so critical action coverage could not be evaluated."
           : criticalActionsSeen.length > 0

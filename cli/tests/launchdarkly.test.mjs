@@ -1772,7 +1772,7 @@ test("assessLaunchdarklyMonitoringIntegrations passes retained audit logs, scope
   assert.deepEqual(finding(result, "LD-13").evidence.critical_actions_seen, ["createMember", "updatePolicy"]);
 });
 
-test("assessLaunchdarklyMonitoringIntegrations fails unreadable audit logs, broad relay and integration scopes, and insecure webhooks", async () => {
+test("assessLaunchdarklyMonitoringIntegrations sends unreadable audit logs to manual and fails broad relay and integration scopes and insecure webhooks", async () => {
   const result = await assessLaunchdarklyMonitoringIntegrations(healthyClient({
     async listAuditLogEntries() {
       throw new Error("LaunchDarkly request failed (403 Forbidden) for GET /api/v2/auditlog");
@@ -1789,8 +1789,10 @@ test("assessLaunchdarklyMonitoringIntegrations fails unreadable audit logs, broa
     },
   }), { now: NOW });
 
-  assert.equal(findingStatus(result, "LD-12"), "fail");
-  assert.equal(findingStatus(result, "LD-13"), "fail");
+  assert.equal(findingStatus(result, "LD-12"), "manual", "an unreadable audit log proves nothing about retention");
+  assert.match(finding(result, "LD-12").summary, /^The audit log could not be read \(.*403 Forbidden.*\), so retention cannot be judged from the API\. Unreadable inventory: audit_log_recent \(GET \/api\/v2\/auditlog: /);
+  assert.equal(findingStatus(result, "LD-13"), "manual");
+  assert.match(finding(result, "LD-13").summary, /^The audit log could not be read \(.*403 Forbidden.*\), so critical action coverage cannot be judged from the API\. Unreadable inventory: audit_log_members \(GET \/api\/v2\/auditlog\?spec=member%2F\*: /);
   assert.equal(findingStatus(result, "LD-18"), "fail");
   assert.deepEqual(finding(result, "LD-18").evidence.broad_relay_configs, ["wide-open"]);
   assert.equal(findingStatus(result, "LD-20"), "fail");
@@ -1939,8 +1941,24 @@ test("verdict rule 1 corollary: LaunchDarkly findings keep judging readable inve
       throw forbidden("/api/v2/auditlog");
     },
   }), { now: NOW });
-  assert.equal(findingStatus(allAudit, "LD-12"), "fail", "a wholly unreadable audit log remains a fail");
-  assert.equal(findingStatus(allAudit, "LD-13"), "fail");
+  assert.equal(findingStatus(allAudit, "LD-12"), "manual", "a wholly unreadable audit log cannot be judged, so it is manual rather than fail");
+  assert.equal(findingStatus(allAudit, "LD-13"), "manual");
+  for (const id of ["LD-12", "LD-13"]) {
+    const item = finding(allAudit, id);
+    assert.match(item.summary, /Unreadable inventory: audit_log_/, id);
+    assert.ok(item.evidence.unreadable_inventories.length >= 2, `${id} names the audit queries that were denied`);
+    assert.ok(item.evidence.unreadable_inventories.every((gap) => gap.http_status === 403 && /GET \/api\/v2\/auditlog/.test(gap.endpoint)), id);
+    assert.ok(item.evidence.manual_evidence.length > 0, `${id} carries the manual evidence`);
+  }
+
+  const emptyAudit = await assessLaunchdarklyMonitoringIntegrations(healthyClient({
+    async listAuditLogEntries() {
+      return [];
+    },
+  }), { now: NOW });
+  assert.equal(findingStatus(emptyAudit, "LD-12"), "fail", "a readable audit log that returned nothing is the fail case");
+  assert.equal(finding(emptyAudit, "LD-12").summary, "The audit log returned no entries at all.");
+  assert.equal(findingStatus(emptyAudit, "LD-13"), "warn");
 });
 
 // Credential values planted in collected objects. Alphanumeric and random-looking so that every 6-to-24-character window
