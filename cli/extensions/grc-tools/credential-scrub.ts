@@ -13,7 +13,9 @@
  *    Basic, Token, and ApiKey; credential-named key/value pairs (`token=`, `"password":`, `api_key:`). A quoted value
  *    (`X-Api-Key: "value"`, `Cookie: sid='value'`, `Authorization: Bearer "value"`, the JSON pair
  *    `"Authorization": "Bearer value"`, and their JSON-escaped forms `\"X-Api-Key\": \"value\"`) is removed whole up to
- *    its closing quote, spaces and all, with the quotes and the scheme word kept.
+ *    its closing quote, spaces and all, with the quotes and the scheme word kept. A carrier fires after a JSON escape
+ *    (`\napi_key=`, `\/password=`), after a command-line flag's dashes (`--password=`, `-Dpassword=`), and after a
+ *    path segment (`kv/password:`) as it does after a space (see `NAME_START`).
  * 2. A configured secret is removed whatever its shape and in its base64, base64url, URL-encoded, form-encoded, and
  *    JSON-escaped forms; the Flue redaction primitives own the encoded forms.
  *
@@ -78,8 +80,9 @@ export interface ScrubDataOptions {
    */
   transformString?: (value: string, key: string | undefined) => string;
   /**
-   * Nesting deeper than this is replaced by the marker: containers and strings alike, so a string one level past the
-   * cap cannot skip the pattern pass. Numbers, booleans, and nulls pass through.
+   * Nesting deeper than this is replaced by the marker: a container past the cap becomes the marker whole, so nothing
+   * below it is copied. Every string at every depth still gets the pattern pass first, so the strings inside the
+   * deepest kept container are scrubbed rather than dropped. Numbers, booleans, and nulls pass through.
    */
   maxDepth?: number;
 }
@@ -170,17 +173,17 @@ function isNameValuePair(record: Record<string, unknown>): string | undefined {
  * (`tokens: ["..."]`), an object (`credentials: { value }`), or a number (a PIN under `password`), so no nested
  * container keeps a value its key names as a credential; the key itself survives so a reader sees the field existed.
  * Booleans and nulls pass through everywhere because they carry no secret (`serviceToken: true`), and numbers pass
- * through under every other key.
+ * through under every other key. The string branch runs before the depth test (gap 36): a string at any depth is
+ * scrubbed, never dropped, and a container past the cap becomes the marker whole.
  */
 function scrubDataValue(value: unknown, scrubText: (text: string, options?: ScrubTextOptions) => string, options: ScrubDataOptions, key: string | undefined, depth: number): unknown {
-  const maxDepth = options.maxDepth ?? DEFAULT_DATA_SCRUB_DEPTH;
-  if (depth > maxDepth) return typeof value === "string" || (value !== null && typeof value === "object") ? REDACTED : value;
   if (typeof value === "string") {
     const transformed = options.transformString ? options.transformString(value, key) : value;
     return scrubText(transformed, { shapes: key === undefined || !isIdentifierKey(key) });
   }
-  if (Array.isArray(value)) return value.map((entry) => scrubDataValue(entry, scrubText, options, key, depth + 1));
   if (value === null || typeof value !== "object") return value;
+  if (depth > (options.maxDepth ?? DEFAULT_DATA_SCRUB_DEPTH)) return REDACTED;
+  if (Array.isArray(value)) return value.map((entry) => scrubDataValue(entry, scrubText, options, key, depth + 1));
   const record = value as Record<string, unknown>;
   const pairName = isNameValuePair(record);
   const credentialKey = options.isCredentialKey ?? isCredentialDataKey;
@@ -209,8 +212,11 @@ const PEM_OPEN_PATTERN = /-----BEGIN [A-Z0-9 ]+-----[\s\S]*$/;
 
 // Any scheme-prefixed URL wherever it sits: the userinfo is dropped and the query and fragment are replaced by one
 // marker; the scheme, host, and path stay because they name the surface. An already-scrubbed `?[REDACTED]` tail is
-// consumed whole so a second pass is a no-op. A backslash ends the URL so a JSON-escaped closing quote is kept.
-const EMBEDDED_URL_PATTERN = /\b[a-z][a-z0-9+.-]*:\/\/(?:\[REDACTED\]|[^\s"'<>()[\]{}\\])+/gi;
+// consumed whole so a second pass is a no-op. A URL written with JSON-escaped slashes (`https:\/\/svc:pw@host\/v1`)
+// is read the same way and written back in that form. Any other backslash ends the URL so a JSON-escaped closing
+// quote is kept.
+const EMBEDDED_URL_PATTERN = /\b[a-z][a-z0-9+.-]*:(?:\/\/|\\\/\\\/)(?:\[REDACTED\]|\\\/|[^\s"'<>()[\]{}\\])+/gi;
+const ESCAPED_SLASH_PATTERN = /\\\//g;
 const TRAILING_PUNCTUATION_PATTERN = /[.,;:!?]+$/;
 
 // A relative path or bare query string: a credential-named parameter keeps its name and loses its value. A backslash
@@ -218,8 +224,21 @@ const TRAILING_PUNCTUATION_PATTERN = /[.,;:!?]+$/;
 const QUERY_PAIR_PATTERN = /([?&])([A-Za-z0-9_.[\]-]+)=(?!\[REDACTED\])([^&#\s"'<>\\]+)/g;
 
 // A carrier name must stand on its own: preceded by neither a word character nor "-", ".", or "/", so `sdk-keys:`,
-// `environment-token`, `settings.token`, and `/_security/api_key:` are names and paths, not carriers.
-const NAME_START = String.raw`(?<![A-Za-z0-9_/.-])`;
+// `environment-token`, `settings.token`, and `GET /_security/api_key: 403` are names and paths, not carriers. Three
+// positions count as standing on its own although a name character precedes them (coordinator rulings, rows A and D):
+// - after the letters of a JSON escape written into the text (`\napi_key=`, `\r\nAuthorization:`, `\u000asdk_key=`),
+//   which is a line break or tab in the decoded text;
+// - after the one or two dashes that open a command-line flag (`--password=`, `-Dpassword=`), where the dashes start a
+//   word; a dash inside a word (`user-session:`, `environment-token`) still joins the name;
+// - after a raw or JSON-escaped slash that ends a path segment (`kv/password: v`, `path\/password=v`), unless the
+//   slash sits inside a request line or a URL (`GET /_security/api_key: 403`, `POST /oauth2/token: invalid_grant`,
+//   `https://api.box.com/oauth2/token: 400`), where the word after it is a path segment naming the surface.
+const NAME_CHARACTER_CLASS = String.raw`[A-Za-z0-9_/.-]`;
+const REQUEST_PATH_CONTEXT = String.raw`(?:\b(?:GET|HEAD|POST|PUT|PATCH|DELETE|OPTIONS)[ \t]|:\/\/|:\\\/\\\/)\S{0,512}`;
+const NAME_START = String.raw`(?:(?<!${NAME_CHARACTER_CLASS})|(?<=\\[nrtbfv]|\\u[0-9A-Fa-f]{4})|(?<=(?<!${NAME_CHARACTER_CLASS})-{1,2})|(?<=/)(?<!${REQUEST_PATH_CONTEXT}))`;
+// The letters a JSON escape leaves in front of a word when the pattern above starts a name at the escape's backslash
+// (`\nsdk_key=` read as the key `nsdk_key`); see `replaceCompoundCredentialPairs` and `escapePrefixOf`.
+const ESCAPE_LETTER_PATTERN = /^(?:[nrtbfv]|u[0-9A-Fa-f]{4})/;
 
 // A quote that may close a quoted carrier name in JSON or JSON-escaped text (`"X-Api-Key":`, `\"X-Api-Key\":`), then
 // the separator. Each carrier pattern below matches through the separator only; the value that follows is read by a
@@ -499,12 +518,18 @@ export function isCredentialKey(key: string): boolean {
   return keySegments(key).some((segment) => EXTRA_CREDENTIAL_KEY_SEGMENTS.has(segment));
 }
 
+// The auth-params a challenge carries after its scheme word (`WWW-Authenticate: Bearer realm="api", error="invalid_token"`,
+// `Basic realm="Restricted"`, `Digest qop="auth"`, RFC 7235, 6750, 7616, 9470, and UMA): a name and "=" where a
+// credential would stand, so the challenge keeps its parameters.
+const AUTH_PARAM_PATTERN = /^(?:realm|error|error_description|error_uri|scope|charset|algorithm|qop|stale|domain|opaque|title|resource|client_id|authorization_uri|as_uri|ticket)=/i;
+
 /**
  * A value after an authorization scheme is the credential unless it is one plain word ("Basic authentication",
- * "Owner token for", "Bearer token") shorter than 20 characters.
+ * "Owner token for", "Bearer token") shorter than 20 characters, or a challenge's auth-param (`Bearer realm="api"`).
  */
 function looksLikeSchemeValue(value: string): boolean {
-  return !(PLAIN_WORD_PATTERN.test(value) && value.length < PLAIN_WORD_MAX_LENGTH);
+  if (PLAIN_WORD_PATTERN.test(value) && value.length < PLAIN_WORD_MAX_LENGTH) return false;
+  return !AUTH_PARAM_PATTERN.test(value);
 }
 
 /**
@@ -828,14 +853,18 @@ const WEBHOOK_PATH_PATTERN = /^(\/services\/T[A-Z0-9]+\/B[A-Z0-9]+\/|\/api\/webh
 
 function scrubEmbeddedUrl(match: string): string {
   const trailing = TRAILING_PUNCTUATION_PATTERN.exec(match)?.[0] ?? "";
-  const url = match.slice(0, match.length - trailing.length);
+  const written = match.slice(0, match.length - trailing.length);
+  // A slash-escaped URL is judged unescaped and written back escaped, so the text keeps the form it came in.
+  const escaped = written.includes("\\/");
+  const url = escaped ? written.replace(ESCAPED_SLASH_PATTERN, "/") : written;
+  const rewrite = (text: string): string => (escaped ? text.replace(/\//g, "\\/") : text);
   try {
     const parsed = new URL(url);
     const hadUserinfo = parsed.username.length > 0 || parsed.password.length > 0;
     const hadDetail = parsed.search.length > 0 || parsed.hash.length > 0 || hadUserinfo || url.endsWith("?") || url.endsWith("#");
     const pathname = parsed.pathname.replace(WEBHOOK_PATH_PATTERN, `$1${REDACTED}`);
-    if (hadDetail) return `${parsed.protocol}//${parsed.host}${pathname}?${REDACTED}${trailing}`;
-    return pathname === parsed.pathname ? match : `${parsed.protocol}//${parsed.host}${pathname}${trailing}`;
+    if (hadDetail) return `${rewrite(`${parsed.protocol}//${parsed.host}${pathname}`)}?${REDACTED}${trailing}`;
+    return pathname === parsed.pathname ? match : `${rewrite(`${parsed.protocol}//${parsed.host}${pathname}`)}${trailing}`;
   } catch {
     return `${REDACTED}${trailing}`;
   }
@@ -845,12 +874,24 @@ function scrubQueryPair(match: string, separator: string, key: string): string {
   return isCredentialKey(key) ? `${separator}${key}=${REDACTED}` : match;
 }
 
-function scrubLongToken(run: string): string {
-  return looksLikeToken(run) ? REDACTED : run;
+/**
+ * The letters of a JSON escape written into the text, when `run` starts right after its backslash: `\u000a` glues
+ * `u000a` to the word that follows, so `\u000aKNOWBE4_API_TOKEN` reads as the run `u000aKNOWBE4_API_TOKEN`, whose first
+ * segment carries two digit groups and would be judged a token. The escape is written back as it was and only the run
+ * after it is judged. Empty when no escape precedes the run.
+ */
+function escapePrefixOf(run: string, offset: number, text: string): string {
+  return offset > 0 && text[offset - 1] === "\\" ? ESCAPE_LETTER_PATTERN.exec(run)?.[0] ?? "" : "";
 }
 
-function scrubAwsSecret(run: string): string {
-  return looksLikeAwsSecret(run) ? REDACTED : run;
+function scrubLongToken(run: string, offset: number, text: string): string {
+  const escape = escapePrefixOf(run, offset, text);
+  return looksLikeToken(run.slice(escape.length)) ? `${escape}${REDACTED}` : run;
+}
+
+function scrubAwsSecret(run: string, offset: number, text: string): string {
+  // Forty characters that begin with an escape are a shorter run after it, which this rule does not judge.
+  return escapePrefixOf(run, offset, text).length === 0 && looksLikeAwsSecret(run) ? REDACTED : run;
 }
 
 /**
@@ -916,11 +957,15 @@ function replaceCompoundCredentialPairs(text: string): string {
   let last = 0;
   let match: RegExpExecArray | null;
   while ((match = GENERIC_PAIR_KEY_PATTERN.exec(text)) !== null) {
-    const [whole, openingQuote, key, separator] = match;
+    const [whole, openingQuote, matchedKey, separator] = match;
     if (whole.length === 0) {
       GENERIC_PAIR_KEY_PATTERN.lastIndex += 1;
       continue;
     }
+    // After a backslash, a key that begins with the letters of a JSON escape is read without them when that reading is
+    // the credential (`\nsdk_key=` is the escape `\n` and the key `sdk_key`); the letters are written back untouched.
+    const escape = openingQuote === "" && match.index > 0 && text[match.index - 1] === "\\" ? ESCAPE_LETTER_PATTERN.exec(matchedKey)?.[0] ?? "" : "";
+    const key = escape.length > 0 && isCredentialKey(matchedKey.slice(escape.length)) ? matchedKey.slice(escape.length) : matchedKey;
     if (!isCredentialKey(key)) continue;
     const valueStart = match.index + whole.length;
     const webhook = isWebhookKey(key);
@@ -969,7 +1014,7 @@ function replaceCompoundCredentialPairs(text: string): string {
         }
       }
     }
-    out += `${text.slice(last, match.index)}${openingQuote}${key}${separator}${replacement}`;
+    out += `${text.slice(last, match.index)}${openingQuote}${matchedKey}${separator}${replacement}`;
     last = end;
     GENERIC_PAIR_KEY_PATTERN.lastIndex = last;
   }

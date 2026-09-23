@@ -1850,7 +1850,7 @@ test("verdict rule 9: redactCredentialValues masks credential-shaped keys and re
   assert.deepEqual(Object.keys(projected), ["id", "email", "joined_on"]);
 });
 
-test("gap 36: KnowBe4 redactCredentialValues keeps and scrubs a string at depth 23 and 24 and masks strings and containers at depth 25 and 26", () => {
+test("gap 36: KnowBe4 redactCredentialValues keeps and scrubs every string down to depth 25 (inside the deepest kept container), masks the container at depth 25, and copies nothing from depth 26", () => {
   assertDepthCapPins(assert, redactCredentialValues, 24, "KnowBe4 walker");
 });
 

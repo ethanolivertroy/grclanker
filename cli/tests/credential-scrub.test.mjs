@@ -876,6 +876,131 @@ test("cookie attribute class: the reported shapes come out with the whole header
   }
 });
 
+// ---------------------------------------------------------------------------------------------------------------
+// Name boundary (coordinator rulings, rows A and D): a carrier fires after the letters of a JSON escape written into the
+// text, after the dashes that open a command-line flag, and after a raw or escaped slash that ends a path segment;
+// a name inside a request line or a URL, a hyphenated word, and a challenge's auth-param stay.
+// ---------------------------------------------------------------------------------------------------------------
+
+/** Random alphanumeric values planted in the boundary rows; the second is only ever planted after an escape. */
+const BOUNDARY_CANARIES = ["VpUp1M1zy4myCidHiCobqUCXgAdEOzww", "AHc5hFZwLzYsazaf4xQ3O3mlLmhdDaby"];
+
+/** [label, carrier(value), text that must survive around the marker]. */
+const BOUNDARY_CARRIERS = [
+  ["escape \\n before a pair", (value) => `request failed\\nsdk_key=${value} see the log`, ["request failed\\nsdk_key=", " see the log"]],
+  ["escape \\t before a colon pair", (value) => `request failed\\tclient_token: ${value} see the log`, ["request failed\\tclient_token: ", " see the log"]],
+  ["escape \\u000a before a pair", (value) => `request failed\\u000amobile_key=${value} see the log`, ["request failed\\u000amobile_key=", " see the log"]],
+  ["escape \\u000a before an upper-case pair whose name carries digits", (value) => `request failed\\u000aKNOWBE4_API_TOKEN: ${value} see the log`, ["request failed\\u000aKNOWBE4_API_TOKEN: ", " see the log"]],
+  ["escape \\r\\n before a scheme word", (value) => `request failed\\r\\nBearer ${value} see the log`, ["request failed\\r\\nBearer ", " see the log"]],
+  ["escape \\r\\n before a header", (value) => `request failed\\r\\nAuthorization: Bearer ${value} see the log`, ["request failed\\r\\nAuthorization: Bearer ", " see the log"]],
+  ["escape \\n before a pair inside a JSON string member", (value) => `{"detail":"request failed\\nsdk_key=${value} see the log"}`, ['{"detail":"request failed\\nsdk_key=', ' see the log"}']],
+  ["escaped slash before a pair", (value) => `request failed\\/password=${value} see the log`, ["request failed\\/password=", " see the log"]],
+  ["escaped slash after a path segment", (value) => `secret at path\\/password=${value} see the log`, ["secret at path\\/password=", " see the log"]],
+  ["raw slash after a path segment, colon pair", (value) => `vault read kv/password: ${value} see the log`, ["vault read kv/password: ", " see the log"]],
+  ["raw slash before a pair", (value) => `mount /password=${value} see the log`, ["mount /password=", " see the log"]],
+  ["long flag", (value) => `mysql --password=${value} -h db.example.com`, ["mysql --password=", " -h db.example.com"]],
+  ["short flag with a property key", (value) => `java -Dspring.datasource.password=${value} -jar app.jar`, ["java -Dspring.datasource.password=", " -jar app.jar"]],
+  ["long flag with a hyphenated key", (value) => `vault login --vault-secret-id=${value} now`, ["vault login --vault-secret-id=", " now"]],
+  ["backslash before a plain pair name", (value) => `note \\token=${value} end`, ["note \\token=", " end"]],
+];
+
+/** Text the boundary rules must leave unchanged: request lines, URLs, hyphenated words, and challenge auth-params. */
+const BOUNDARY_KEPT = [
+  "api_keys (GET /_security/api_key: 403 Forbidden: security_exception)",
+  "POST /oauth2/token: invalid_grant",
+  "GET /_security/api_key?with_limited_by=true",
+  "user-session: 3 active sessions",
+  "Config precedence resolved from: environment-token -> config-base-url -> config-file-present.",
+  'WWW-Authenticate: Bearer realm="api", error="invalid_token"',
+  'WWW-Authenticate: Basic realm="Restricted"',
+  "Bearer error_description=\"The access token expired\"",
+];
+
+/**
+ * URL rows the boundary rules must leave unchanged. The LaunchDarkly and Elastic data walkers reduce a URL to its
+ * origin by design (`reduceUrl`, `reduceUrlsToOrigin`), so those two entry points are not run on these rows.
+ */
+const URL_REDUCING_ENTRY_POINTS = new Set(["launchdarkly redactCredentialValues", "elastic redactSensitiveValues"]);
+const BOUNDARY_KEPT_URLS = [
+  "https://api.box.com/oauth2/token: 400 Bad Request",
+  "GET https://es.example.com:9200/_security/api_key: 403 Forbidden",
+  "https:\\/\\/es.example.com:9200\\/_security\\/api_key: 403 Forbidden",
+];
+
+test("name boundary: the planted values look random and share no 6-character window with the boundary rows or the must-keep strings", () => {
+  const legitimate = [
+    ...BOUNDARY_CARRIERS.map(([label, carrier]) => [label, carrier("")]),
+    ...BOUNDARY_KEPT.map((text, index) => [`kept ${index}`, text]),
+    ...BOUNDARY_KEPT_URLS.map((text, index) => [`kept url ${index}`, text]),
+    ...MUST_KEEP.map((text, index) => [`must-keep ${index}`, text]),
+  ];
+  assertCanaryFixture(assert, BOUNDARY_CANARIES, legitimate, "boundary rows");
+});
+
+test("name boundary rows A and D: a carrier fires after a JSON escape, after a flag's dashes, and after a path segment, through every entry point, and the escape, the flag, and the path stay", () => {
+  const values = [...BOUNDARY_CANARIES, ...NAME_SHAPED];
+  for (const [entryPoint, scrub] of TEXT_ENTRY_POINTS) {
+    for (const [label, carrier, survivors] of BOUNDARY_CARRIERS) {
+      for (const value of values) {
+        const scrubbed = scrub(carrier(value));
+        assertRemoved(scrubbed, value, `${entryPoint}: ${label} with ${value}`);
+        for (const survivor of survivors) assert.ok(scrubbed.includes(survivor), `${entryPoint}: ${label} with ${value}: ${JSON.stringify(survivor)} did not survive: ${scrubbed}`);
+        assert.equal(scrub(scrubbed), scrubbed, `${entryPoint}: ${label} with ${value}: a second pass changed the text`);
+      }
+    }
+  }
+  const scrubber = createCredentialScrubber();
+  const [canary] = BOUNDARY_CANARIES;
+  assert.equal(scrubber.scrub(`request failed\\nsdk_key=${canary} see the log`), `request failed\\nsdk_key=${REDACTED} see the log`);
+  assert.equal(scrubber.scrub(`request failed\\u000aKNOWBE4_API_TOKEN: ${canary} see the log`), `request failed\\u000aKNOWBE4_API_TOKEN: ${REDACTED} see the log`, "the escape letters are not judged with the name they precede");
+  assert.equal(scrubber.scrub(`request failed\\/password=${canary} see the log`), `request failed\\/password=${REDACTED} see the log`);
+  assert.equal(scrubber.scrub(`mysql --password=${canary} -h db.example.com`), `mysql --password=${REDACTED} -h db.example.com`);
+  assert.equal(scrubber.scrub(`java -Dspring.datasource.password=${canary} -jar app.jar`), `java -Dspring.datasource.password=${REDACTED} -jar app.jar`);
+  assert.equal(scrubber.scrub(`vault read kv/password: ${canary} see the log`), `vault read kv/password: ${REDACTED} see the log`);
+  assert.equal(scrubber.scrub(`mysql --password=hunter2abcd -h db`), `mysql --password=${REDACTED} -h db`, "a short plain value after a flag goes too: the flag is an assignment");
+});
+
+test("name boundary: an escape glued to a bare token run is written back and only the run after it is judged", () => {
+  const scrubber = createCredentialScrubber();
+  const [, canary] = BOUNDARY_CANARIES;
+  assert.equal(scrubber.scrub(`echoed\\u000a${canary} by the proxy`), `echoed\\u000a${REDACTED} by the proxy`);
+  assert.equal(scrubber.scrub(`echoed\\n${canary} by the proxy`), `echoed\\n${REDACTED} by the proxy`);
+  assert.equal(scrubber.scrub("request failed\\u000aKNOWBE4_PHISHER_API_TOKEN see the log"), "request failed\\u000aKNOWBE4_PHISHER_API_TOKEN see the log", "a name after an escape is a name, not a token with two digit groups");
+  assert.equal(scrubber.scrub("request failed\\u000aKNOWBE4_REGION: us see the log"), "request failed\\u000aKNOWBE4_REGION: us see the log");
+  for (const [entryPoint, scrub] of TEXT_ENTRY_POINTS) {
+    const scrubbed = scrub(`echoed\\u000a${canary} by the proxy`);
+    assertRemoved(scrubbed, canary, `${entryPoint}: escape glued to a token`);
+    assert.ok(scrubbed.includes("echoed\\u000a"), `${entryPoint}: the escape survived: ${scrubbed}`);
+  }
+});
+
+test("name boundary: request lines, URLs, hyphenated words, and challenge auth-params are kept unchanged through every entry point", () => {
+  for (const [entryPoint, scrub] of TEXT_ENTRY_POINTS) {
+    assert.deepEqual(scrubAlterations(BOUNDARY_KEPT, scrub), [], `${entryPoint}: a kept row was altered`);
+    if (!URL_REDUCING_ENTRY_POINTS.has(entryPoint)) assert.deepEqual(scrubAlterations(BOUNDARY_KEPT_URLS, scrub), [], `${entryPoint}: a kept URL row was altered`);
+  }
+  const scrubber = createCredentialScrubber();
+  assert.equal(scrubber.scrub('Bearer realm="api"'), 'Bearer realm="api"', "an auth-param after a scheme word is the challenge, not a credential");
+  assert.equal(scrubber.scrub(`Bearer realm="api", access_token=${BOUNDARY_CANARIES[0]}`), `Bearer realm="api", access_token=${REDACTED}`, "a credential pair after the auth-param still goes");
+});
+
+test("URL rule: a URL written with JSON-escaped slashes loses its userinfo and query the same way and keeps its escaped form", () => {
+  const [canary] = BOUNDARY_CANARIES;
+  for (const [entryPoint, scrub] of TEXT_ENTRY_POINTS) {
+    const scrubbed = scrub(`fetched https:\\/\\/svc:${canary}@api.example.com\\/v1 mid-sentence`);
+    assertRemoved(scrubbed, canary, `${entryPoint}: escaped URL userinfo`);
+    assert.ok(scrubbed.includes("https:\\/\\/api.example.com\\/v1"), `${entryPoint}: the escaped form survived: ${scrubbed}`);
+    assert.equal(scrub(scrubbed), scrubbed, `${entryPoint}: a second pass changed the text`);
+    const query = scrub(`{"url":"https:\\/\\/api.example.com\\/v1?token=${canary}"}`);
+    assertRemoved(query, canary, `${entryPoint}: escaped URL query`);
+    assert.ok(query.includes('{"url":"https:\\/\\/api.example.com\\/v1?'), `${entryPoint}: the escaped form survived: ${query}`);
+  }
+  const scrubber = createCredentialScrubber();
+  assert.equal(scrubber.scrub(`fetched https:\\/\\/svc:${canary}@api.example.com\\/v1 mid-sentence`), `fetched https:\\/\\/api.example.com\\/v1?${REDACTED} mid-sentence`);
+  assert.equal(scrubber.scrub(`{"url":"https:\\/\\/api.example.com\\/v1?token=${canary}"}`), `{"url":"https:\\/\\/api.example.com\\/v1?${REDACTED}"}`);
+  assert.equal(scrubber.scrub('{"url":"https:\\/\\/api.example.com\\/v1"}'), '{"url":"https:\\/\\/api.example.com\\/v1"}', "an escaped URL with nothing to remove is unchanged");
+});
+
 const DATA_CANARIES = {
   tokensEntry: "BPt5mgDrRZ5YyLTHaQPepJUYQbGYRCjG",
   credentialsValue: "zSVNdtuTMXK9T7qXe8CEDEYXmJ9K6vVL",
@@ -884,12 +1009,12 @@ const DATA_CANARIES = {
   deepNote: "U7ktAa5zEHKELrac4CfrjWJF3zBQuiEx",
 };
 
-test("scrubData: the module key rule sees the enclosing key, pair values go by name, identifier keys keep their value, and containers and strings past the depth cap become the marker", () => {
+test("scrubData: the module key rule sees the enclosing key, pair values go by name, identifier keys keep their value, a container past the depth cap becomes the marker, and the strings inside the deepest kept container are scrubbed rather than dropped", () => {
   const scrubber = createCredentialScrubber();
   const deep = { level: 0 };
   let cursor = deep;
   for (let level = 1; level <= 12; level += 1) {
-    cursor.child = { level, note: level === 9 ? DATA_CANARIES.deepNote : `depth-note-${level}` };
+    cursor.child = { level, label: `depth-label-${level}`, note: level === 9 ? DATA_CANARIES.deepNote : `depth-note-${level}` };
     cursor = cursor.child;
   }
   const record = {
@@ -927,20 +1052,22 @@ test("scrubData: the module key rule sees the enclosing key, pair values go by n
   assert.equal(out.none, null);
   assert.equal(scrubber.scrubData({ ssl: { key: "pem-body" } }).ssl.key, "pem-body", "without a module rule a bare key under ssl is an identifier");
 
-  // deep sits at depth 1, child level L at depth L + 1, and its note at depth L + 2: level 8's note (depth 10) is at the
-  // cap and stays, level 9's note (depth 11) and level 9's child (depth 11) are past it and become the marker.
+  // deep sits at depth 1, child level L at depth L + 1, and its strings at depth L + 2: level 9 (depth 10) is the deepest
+  // kept container, so its strings (depth 11) are scrubbed and kept, and its child (depth 11) becomes the marker.
   let level = out.deep;
   for (let index = 1; index <= 8; index += 1) level = level.child;
   assert.equal(level.level, 8);
   assert.equal(level.note, "depth-note-8", "a string at the cap is kept");
   assert.equal(level.child.level, 9);
-  assert.equal(level.child.note, REDACTED, "a string one level past the cap becomes the marker instead of skipping the pattern pass");
-  assert.equal(level.child.child, REDACTED, "a container past the cap becomes the marker");
+  assert.equal(level.child.label, "depth-label-9", "a string inside the deepest kept container is kept");
+  assert.equal(level.child.note, REDACTED, "a token-shaped string inside the deepest kept container still gets the pattern pass");
+  assert.equal(level.child.child, REDACTED, "a container past the cap becomes the marker, so nothing below it is copied");
+  assert.ok(!JSON.stringify(out).includes("depth-label-10"), "no string below the masked container is copied");
   assertCanaryWindowsAbsent(assert, JSON.stringify(out), Object.values(DATA_CANARIES), "scrubData output");
   assert.deepEqual(scrubber.scrubData(out, { isCredentialKey: isModuleCredentialKey, maxDepth: 10 }), out, "the data-side scrub is idempotent");
 });
 
-test("gap 36: scrubData at the default cap of 24 keeps and scrubs a string at depth 23 and 24 and masks strings and containers at depth 25 and 26, and the same pins hold at 32 and 64", () => {
+test("gap 36: scrubData at the default cap of 24 keeps and scrubs every string down to depth 25 (inside the deepest kept container), masks the container at depth 25, copies nothing from depth 26, and the same pins hold at 32 and 64", () => {
   const scrubber = createCredentialScrubber();
   assertDepthCapPins(assert, (value) => scrubber.scrubData(value), DEFAULT_DATA_SCRUB_DEPTH, "shared scrubData, default cap");
   assert.equal(DEFAULT_DATA_SCRUB_DEPTH, 24);

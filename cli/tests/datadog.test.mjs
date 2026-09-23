@@ -2408,7 +2408,7 @@ test("isCredentialKey, reduceUrl, and redactCredentialValues cover nested, plura
   assert.ok(steps <= 66 && steps >= 60, `redaction recursed ${steps} levels before capping`);
 });
 
-test("gap 36: Datadog redactCredentialValues keeps and scrubs a string at depth 63 and 64 and masks strings and containers at depth 65 and 66", () => {
+test("gap 36: Datadog redactCredentialValues keeps and scrubs every string down to depth 65 (inside the deepest kept container), masks the container at depth 65, and copies nothing from depth 66", () => {
   assertDepthCapPins(assert, redactCredentialValues, 64, "Datadog walker");
 });
 

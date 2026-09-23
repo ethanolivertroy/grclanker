@@ -2643,7 +2643,7 @@ test("verdict rule 9: redactSensitiveValues masks whole subtrees, plural and cam
   assert.equal(level.child, "[REDACTED]", "the container past the depth cap becomes the uniform marker, the same shape Box and LaunchDarkly render");
 });
 
-test("gap 36: Elastic redactSensitiveValues keeps and scrubs a string at depth 31 and 32 and masks strings and containers at depth 33 and 34", () => {
+test("gap 36: Elastic redactSensitiveValues keeps and scrubs every string down to depth 33 (inside the deepest kept container), masks the container at depth 33, and copies nothing from depth 34", () => {
   assertDepthCapPins(assert, redactSensitiveValues, 32, "Elastic walker");
 });
 

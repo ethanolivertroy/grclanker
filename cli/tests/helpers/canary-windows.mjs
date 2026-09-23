@@ -83,9 +83,9 @@ export function depthCapChain(cap) {
 }
 
 /**
- * Pins a data-side walker's depth cap: a string at depth cap - 1 and at depth cap is kept and still gets the pattern
- * pass (the token-shaped canary there becomes the marker), while a string and a container at depth cap + 1 become the
- * marker and nothing from depth cap + 2 survives in any window.
+ * Pins a data-side walker's depth cap (gap 36 shape): every string down to depth cap + 1, inside the deepest kept
+ * container, is kept and still gets the pattern pass (the token-shaped canary there becomes the marker), the container
+ * at depth cap + 1 becomes the marker whole, and nothing from depth cap + 2 survives in any window.
  */
 export function assertDepthCapPins(assert, redact, cap, label) {
   const { root, canaries } = depthCapChain(cap);
@@ -97,12 +97,14 @@ export function assertDepthCapPins(assert, redact, cap, label) {
   assert.equal(record.bare, "[REDACTED]", `${label}: a token-shaped string at depth ${cap - 1} still gets the pattern pass`);
   assert.equal(record.child.plain, `depth-${cap}-plain`, `${label}: a string at depth ${cap} (the cap) is kept`);
   assert.equal(record.child.bare, "[REDACTED]", `${label}: a token-shaped string at depth ${cap} still gets the pattern pass`);
-  const atCap = record.child.child;
-  assert.equal(atCap.plain, "[REDACTED]", `${label}: a string at depth ${cap + 1} (cap + 1) becomes the marker instead of being copied through`);
-  assert.equal(atCap.bare, "[REDACTED]", `${label}: a canary at depth ${cap + 1} becomes the marker`);
-  assert.equal(atCap.child, "[REDACTED]", `${label}: the container at depth ${cap + 1} becomes the marker, so depth ${cap + 2} is never copied`);
+  // The level cap record is the deepest kept container (depth cap); its strings sit at depth cap + 1 and are scrubbed,
+  // not dropped; its child container at depth cap + 1 is the marker.
+  const deepestKept = record.child.child;
+  assert.equal(deepestKept.plain, `depth-${cap + 1}-plain`, `${label}: a string at depth ${cap + 1}, inside the deepest kept container, is kept`);
+  assert.equal(deepestKept.bare, "[REDACTED]", `${label}: a token-shaped string at depth ${cap + 1} still gets the pattern pass`);
+  assert.equal(deepestKept.child, "[REDACTED]", `${label}: the container at depth ${cap + 1} becomes the marker, so depth ${cap + 2} is never copied`);
   assertCanaryWindowsAbsent(assert, JSON.stringify(out), canaries, `${label}: depth-cap canaries`);
-  assert.ok(!JSON.stringify(out).includes(`depth-${cap + 1}-plain`) && !JSON.stringify(out).includes(`depth-${cap + 2}-plain`), `${label}: no string past the cap is copied through`);
+  assert.ok(!JSON.stringify(out).includes(`depth-${cap + 2}-plain`), `${label}: no string past the masked container is copied through`);
 }
 
 /**
