@@ -4,11 +4,14 @@ import { spawnSync } from "node:child_process";
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 
 import {
   COMPUTE_BACKEND_KINDS,
+  detectComputeBackendStatuses,
   getComputeBackendConfigurationIssues,
   getComputeBackendCredentialState,
+  getComputeBackendRequiredTools,
   getComputeBackendSurfaceLabel,
   getComputeProfileIssues,
   getDefaultComputeProfile,
@@ -65,6 +68,7 @@ import {
   ONE_SHOT_SMOKE_NOTE,
   runBackendSearchSmokeTest,
   runBackendToolSmokeTest,
+  selectLiveSmokeCandidates,
 } from "../dist/pi/env.js";
 import { createHostBackend, createSandboxRuntimeBackend } from "../dist/pi/backends/local.js";
 import {
@@ -96,6 +100,10 @@ const RUNPOD_POD_JSON = JSON.stringify({
 // A profile path that never exists, so a real ~/.modal.toml on the test host cannot change
 // what the "no Modal credentials" cases observe.
 const MISSING_MODAL_CONFIG_PATH = join(tmpdir(), "grclanker-no-modal-profile-3f9c1a", ".modal.toml");
+
+// This repository's own ignore rules, copied into the temp repos so the planted secrets are
+// ignored files that were force-added, exactly the case the deny list exists for.
+const REPO_GITIGNORE = join(dirname(fileURLToPath(import.meta.url)), "..", "..", ".gitignore");
 
 function createFakeRunner(handler) {
   const calls = [];
@@ -552,6 +560,114 @@ test("env list reports every backend with kind, bucket, and readiness", () => {
   });
 });
 
+test("runpod-pod readiness requires git next to ssh and scp on every surface", async () => {
+  const GIT_ISSUE = "Install `git`; git is required to stage tracked files (runpod-pod uploads the git index of the workspace).";
+  const SSH_ISSUE = "Install an `ssh` client; grclanker executes inside RunPod pods over SSH.";
+  const SCP_ISSUE = "Install `scp` (part of the OpenSSH client); the staged workspace is uploaded to the pod with scp.";
+  const lookupFor = (present) => {
+    const seen = [];
+    return {
+      seen,
+      toolExists: (tool) => {
+        seen.push(tool);
+        return present.includes(tool);
+      },
+    };
+  };
+  await withEnv({
+    RUNPOD_API_KEY: "rpa_podkey_ABCDEFG",
+    RUNPOD_POD_ID: "pod42",
+    RUNPOD_ENDPOINT_ID: undefined,
+    MODAL_TOKEN_ID: undefined,
+    MODAL_TOKEN_SECRET: undefined,
+    MODAL_CONFIG_PATH: MISSING_MODAL_CONFIG_PATH,
+  }, async () => {
+    const settings = { computeBackend: "runpod-pod", computeProfile: "persistent-remote" };
+    assert.deepEqual(getComputeBackendRequiredTools("runpod-pod").map((requirement) => requirement.tool), ["ssh", "scp", "git"]);
+    assert.deepEqual(getComputeBackendRequiredTools("modal").map((requirement) => requirement.tool), ["modal"]);
+    assert.deepEqual(getComputeBackendRequiredTools("runpod-serverless"), []);
+
+    // ssh and scp present, git absent: the issues list, env list, env doctor's status, and the
+    // live smoke selector all report the backend as not ready and name git.
+    const noGit = lookupFor(["ssh", "scp"]);
+    assert.deepEqual(getComputeBackendConfigurationIssues(settings, "runpod-pod", { toolExists: noGit.toolExists }), [GIT_ISSUE]);
+    const statuses = detectComputeBackendStatuses({ toolExists: noGit.toolExists });
+    const pod = statuses.find((status) => status.kind === "runpod-pod");
+    assert.equal(pod.available, false);
+    assert.equal(pod.detail, "Found RUNPOD_API_KEY, RUNPOD_POD_ID in the environment. Install `git` to use this backend; git is required to stage tracked files (runpod-pod uploads the git index of the workspace).");
+    assert.ok(noGit.seen.includes("git") && noGit.seen.includes("ssh") && noGit.seen.includes("scp"));
+    assert.ok(noGit.seen.includes("docker"), "the docker lookup goes through the injected function too, so no real docker runs");
+    const entry = buildComputeBackendList(settings, statuses, { toolExists: noGit.toolExists }).find((listed) => listed.kind === "runpod-pod");
+    assert.equal(entry.readiness, "not detected");
+    assert.equal(entry.detail, GIT_ISSUE);
+    assert.deepEqual(selectLiveSmokeCandidates(statuses, ["runpod-pod"]), [], "the live smoke selector skips it");
+    assert.deepEqual(selectLiveSmokeCandidates(statuses), []);
+
+    // Each missing tool is named on its own, in the order ssh, scp, git.
+    assert.deepEqual(getComputeBackendConfigurationIssues(settings, "runpod-pod", { toolExists: lookupFor(["scp", "git"]).toolExists }), [SSH_ISSUE]);
+    assert.deepEqual(getComputeBackendConfigurationIssues(settings, "runpod-pod", { toolExists: lookupFor(["ssh", "git"]).toolExists }), [SCP_ISSUE]);
+    assert.deepEqual(getComputeBackendConfigurationIssues(settings, "runpod-pod", { toolExists: lookupFor([]).toolExists }), [SSH_ISSUE, SCP_ISSUE, GIT_ISSUE]);
+    const nothing = detectComputeBackendStatuses({ toolExists: lookupFor([]).toolExists }).find((status) => status.kind === "runpod-pod");
+    assert.equal(nothing.available, false);
+    assert.match(nothing.detail, /Install `ssh` to use this backend; .* Install `scp` to use this backend; .* Install `git` to use this backend; git is required to stage tracked files/);
+
+    // All three present: ready as before, and the smoke selector picks it.
+    const all = lookupFor(["ssh", "scp", "git"]);
+    assert.deepEqual(getComputeBackendConfigurationIssues(settings, "runpod-pod", { toolExists: all.toolExists }), []);
+    const readyStatuses = detectComputeBackendStatuses({ toolExists: all.toolExists });
+    const readyPod = readyStatuses.find((status) => status.kind === "runpod-pod");
+    assert.equal(readyPod.available, true);
+    assert.equal(readyPod.detail, "Found RUNPOD_API_KEY, RUNPOD_POD_ID in the environment. Found `ssh`, `scp`, `git` on PATH.");
+    assert.equal(buildComputeBackendList(settings, readyStatuses, { toolExists: all.toolExists }).find((listed) => listed.kind === "runpod-pod").readiness, "ready");
+    assert.deepEqual(selectLiveSmokeCandidates(readyStatuses, ["runpod-pod"]).map((status) => status.kind), ["runpod-pod"]);
+    assert.deepEqual(selectLiveSmokeCandidates(readyStatuses, ["runpod-pod", "modal"]).map((status) => status.kind), ["runpod-pod"], "modal has no credentials here");
+
+    // Tools present but credentials missing is still not ready (unchanged behavior).
+    await withEnv({ RUNPOD_POD_ID: undefined }, () => {
+      const noPod = detectComputeBackendStatuses({ toolExists: all.toolExists }).find((status) => status.kind === "runpod-pod");
+      assert.equal(noPod.available, false);
+      assert.match(noPod.detail, /^Set RUNPOD_POD_ID to use this backend\. Found `ssh`, `scp`, `git` on PATH\.$/);
+    });
+
+    // The modal CLI check goes through the same requirement list with its original wording.
+    assert.ok(getComputeBackendConfigurationIssues({ computeBackend: "modal" }, "modal", { toolExists: lookupFor([]).toolExists })
+      .includes("Install the modal CLI (`pip install modal`) and run `modal setup`; grclanker drives Modal through `modal shell`."));
+  });
+
+  // The live smoke script itself, with a PATH that holds `which`, `ssh`, and `scp` but no `git`:
+  // it selects nothing and exits 0 with the skip message instead of advertising runpod-pod.
+  const realWhich = spawnSync("which", ["which"], { encoding: "utf8" });
+  if (realWhich.status !== 0 || process.platform === "win32") return;
+  const stubBin = mkdtempSync(join(tmpdir(), "grclanker-live-smoke-path-"));
+  try {
+    writeFileSync(join(stubBin, "which"), `#!/bin/sh\nexec ${quoteForBash(realWhich.stdout.trim())} "$@"\n`);
+    for (const tool of ["which", "ssh", "scp"]) {
+      if (tool !== "which") writeFileSync(join(stubBin, tool), "#!/bin/sh\nexit 0\n");
+      chmodSync(join(stubBin, tool), 0o755);
+    }
+    const script = join(dirname(fileURLToPath(import.meta.url)), "..", "scripts", "compute-backends-live-smoke.mjs");
+    const run = spawnSync(process.execPath, [script], {
+      encoding: "utf8",
+      timeout: 60_000,
+      env: {
+        ...process.env,
+        PATH: stubBin,
+        GRCLANKER_LIVE_BACKENDS: "runpod-pod",
+        RUNPOD_API_KEY: "rpa_podkey_ABCDEFG",
+        RUNPOD_POD_ID: "pod42",
+        MODAL_TOKEN_ID: "",
+        MODAL_TOKEN_SECRET: "",
+        MODAL_CONFIG_PATH: MISSING_MODAL_CONFIG_PATH,
+      },
+    });
+    assert.equal(run.status, 0, `live smoke exited ${run.status}: ${run.stdout}${run.stderr}`);
+    assert.match(run.stdout, /^Skipping live compute backend smoke test: .*RUNPOD_API_KEY \+ RUNPOD_POD_ID with ssh, scp, and git on PATH/);
+    assert.ok(!run.stdout.includes("env smoke-test --backend runpod-pod"), "runpod-pod was not selected without git");
+  } finally {
+    rmSync(stubBin, { recursive: true, force: true });
+  }
+});
+
 test("runtime awaits remote teardown on the success path and the throw path", async () => {
   await withEnv({ RUNPOD_API_KEY: "rpa_podkey_ABCDEFG", RUNPOD_POD_ID: "pod42" }, async () => {
     const settings = { computeBackend: "runpod-pod", computeProfile: "persistent-remote" };
@@ -823,6 +939,143 @@ test("runpod pod cleanup keeps the session tracked until the removal is confirme
   });
 });
 
+test("runpod pod staging keeps the remote session state when the local temp copy cannot be removed", async () => {
+  await withEnv({ RUNPOD_API_KEY: "rpa_podkey_ABCDEFG", RUNPOD_POD_ID: "pod42" }, async () => {
+    const fetchMock = async () => new Response(RUNPOD_POD_JSON, { status: 200 });
+    const isRemoval = (call) => call.executable === "ssh" && String(call.args.at(-1)).startsWith("rm -rf");
+    const removals = (calls) => calls.filter(isRemoval);
+    // A remover that behaves like a Windows file lock: it throws with an errno code and a message
+    // that must never be interpolated. The copies it refused to delete are removed by the test.
+    const lockedCopies = [];
+    const lockedRemover = (path) => {
+      lockedCopies.push(path);
+      throw Object.assign(new Error("EBUSY: resource busy or locked, rmdir rpa_podkey_ABCDEFG"), { code: "EBUSY" });
+    };
+    const remnantPattern = (path) => new RegExp(`^The local staging copy ${path.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")} could not be removed \\(EBUSY\\); delete it by hand\\.$`);
+    try {
+      // Adapter level, successful upload: the staged workspace is returned with the remnant as a
+      // warning that names the temp path and the code only, and the session stays staged.
+      const adapter = createFakeRunner(async () => ({ exitCode: 0 }));
+      const backend = createRunpodPodBackend({ fetch: fetchMock, runner: adapter.runner, removeLocalDirectory: lockedRemover });
+      const staged = await backend.stageWorkspace({ localPath: "/repo", sessionId: "sess" });
+      assert.equal(staged.remotePath, "/workspace/sess");
+      assert.equal(lockedCopies.length, 1);
+      assert.match(lockedCopies[0], /grclanker-runpod-stage-/);
+      assert.ok(existsSync(lockedCopies[0]), "the stubbed remover left the copy in place");
+      assert.equal(staged.warnings.length, 1);
+      assert.match(staged.warnings[0], remnantPattern(lockedCopies[0]));
+      assert.ok(!staged.warnings[0].includes("resource busy"), "the fs message is not interpolated");
+      assert.ok(!staged.warnings[0].includes("rpa_podkey_ABCDEFG"));
+      assert.deepEqual(adapter.calls.map((call) => call.executable), ["git", "ssh", "scp"]);
+      await backend.teardown("sess");
+      assert.equal(removals(adapter.calls).length, 1, "the session was still staged, so teardown removed the remote directory");
+      await backend.teardown("sess");
+      assert.equal(removals(adapter.calls).length, 1, "exit code 0 untracked it");
+
+      // Runtime level: the contract adapter sees a successful stage, registers the session, hands
+      // the warning to the sink, and teardown reaches backend.teardown (remoteStateMayRemain).
+      const warnings = [];
+      const runtime = createFakeRunner(async () => ({ exitCode: 0, stdout: "ok\n" }));
+      assert.equal(activeComputeSessionCount(), 0);
+      const execution = resolveComputeBackendExecution("/repo", { computeBackend: "runpod-pod" }, {
+        fetch: fetchMock,
+        runner: runtime.runner,
+        removeLocalDirectory: lockedRemover,
+        warn: (message) => warnings.push(message),
+      });
+      const result = await execution.bashOperations.exec("true", "/repo", { onData: () => {} });
+      assert.equal(result.exitCode, 0);
+      assert.equal(activeComputeSessionCount(), 1, "the session stays registered");
+      assert.equal(lockedCopies.length, 2);
+      assert.deepEqual(warnings.length, 1);
+      assert.match(warnings[0], remnantPattern(lockedCopies[1]));
+      assert.equal(removals(runtime.calls).length, 0);
+      await execution.teardown();
+      assert.equal(removals(runtime.calls).length, 1, "teardown issued the remote removal");
+      assert.equal(activeComputeSessionCount(), 0, "exit code 0 untracked the session");
+
+      // Without an injected sink the warning is one scrubbed line on stderr.
+      const written = [];
+      const originalWrite = process.stderr.write;
+      process.stderr.write = (chunk) => {
+        written.push(String(chunk));
+        return true;
+      };
+      try {
+        const defaultSink = resolveComputeBackendExecution("/repo", { computeBackend: "runpod-pod" }, {
+          fetch: fetchMock,
+          runner: createFakeRunner(async () => ({ exitCode: 0 })).runner,
+          removeLocalDirectory: lockedRemover,
+        });
+        await defaultSink.bashOperations.exec("true", "/repo", { onData: () => {} });
+        await defaultSink.teardown();
+      } finally {
+        process.stderr.write = originalWrite;
+      }
+      assert.equal(lockedCopies.length, 3);
+      assert.ok(
+        written.includes(`The local staging copy ${lockedCopies[2]} could not be removed (EBUSY); delete it by hand.\n`),
+        `stderr got: ${JSON.stringify(written)}`,
+      );
+      assert.equal(activeComputeSessionCount(), 0);
+
+      // Failed upload: the original error keeps its type and message, the remnant is appended,
+      // and nothing stays tracked because the remote removal succeeded.
+      const failing = createFakeRunner(async (executable) => (executable === "scp" ? { exitCode: 1, stderr: "lost connection" } : { exitCode: 0 }));
+      const failingBackend = createRunpodPodBackend({ fetch: fetchMock, runner: failing.runner, removeLocalDirectory: lockedRemover });
+      await assert.rejects(
+        () => failingBackend.stageWorkspace({ localPath: "/repo", sessionId: "fail" }),
+        (error) => {
+          assert.ok(error instanceof ExecutionBackendError);
+          assert.ok(!(error instanceof ExecutionBackendCleanupError), "no remote remnant, so not a cleanup error");
+          const [first, second, ...rest] = error.message.split("\n");
+          assert.equal(first, "Compute backend error: Could not copy the workspace to the pod. lost connection");
+          assert.match(second, remnantPattern(lockedCopies[3]));
+          assert.deepEqual(rest, []);
+          return true;
+        },
+      );
+      assert.equal(removals(failing.calls).length, 1);
+      await failingBackend.teardown("fail");
+      assert.equal(removals(failing.calls).length, 1, "the failed upload's session is not tracked");
+
+      // Failed upload whose remote removal fails too: the cleanup error type survives (so the
+      // adapter marks remote state), the remnant is appended, and the session stays staged.
+      let stuckRemovalExit = 1;
+      const stuck = createFakeRunner(async (executable, args) => {
+        if (executable === "scp") return { exitCode: 1, stderr: "lost connection" };
+        if (String(args.at(-1)).startsWith("rm -rf")) return { exitCode: stuckRemovalExit, stderr: stuckRemovalExit ? "busy" : "" };
+        return { exitCode: 0 };
+      });
+      const stuckExecution = resolveComputeBackendExecution("/repo", { computeBackend: "runpod-pod" }, {
+        fetch: fetchMock,
+        runner: stuck.runner,
+        removeLocalDirectory: lockedRemover,
+        warn: (message) => warnings.push(message),
+      });
+      await assert.rejects(
+        () => stuckExecution.bashOperations.exec("true", "/repo", { onData: () => {} }),
+        (error) => {
+          assert.ok(error instanceof ExecutionBackendCleanupError);
+          const lines = error.message.split("\n");
+          assert.match(lines[0], /^Compute backend error: runpod-pod could not remove \/workspace\/grclanker-[0-9a-z-]+ on RunPod pod pod42 .*The workspace copy failed \(scp exited 1: lost connection\) and the partial upload could not be removed \(rm -rf exited 1 on 2 attempts: busy\)\.$/);
+          assert.match(lines[1], remnantPattern(lockedCopies[4]));
+          assert.equal(lines.length, 2);
+          return true;
+        },
+      );
+      assert.equal(warnings.length, 1, "a failed stage reports the remnant in the error, not as a warning");
+      assert.equal(activeComputeSessionCount(), 1, "the partial upload keeps the session tracked");
+      stuckRemovalExit = 0;
+      await stuckExecution.teardown();
+      assert.equal(activeComputeSessionCount(), 0);
+      assert.equal(removals(stuck.calls).length, RUNPOD_CLEANUP_ATTEMPTS + 1);
+    } finally {
+      for (const path of lockedCopies) rmSync(path, { recursive: true, force: true });
+    }
+  });
+});
+
 function git(cwd, ...args) {
   const result = spawnSync("git", ["-C", cwd, ...args], { encoding: "utf8" });
   assert.equal(result.status, 0, `git ${args.join(" ")} failed: ${result.stderr}`);
@@ -944,6 +1197,138 @@ test("runpod pod staging uploads the git index only and never a planted secret",
       assert.equal(isSensitiveStagingPath(path), false, path);
     }
     assert.ok(RUNPOD_STAGING_DENYLIST.includes("*service-account*.json"));
+  } finally {
+    rmSync(repo, { recursive: true, force: true });
+  }
+});
+
+test("runpod pod staging denies the whole .env family and every gitignore secret name even when force-added", async () => {
+  const repo = mkdtempSync(join(tmpdir(), "grclanker-pod-deny-"));
+  // Every path below is ignored by this repository's own .gitignore and then force-added, the way
+  // a credential file lands in the index by mistake. Each carries a distinct canary. The two
+  // `.dev.vars.example` directories are the exception: .gitignore's `!.dev.vars.example` negation
+  // lets them through without -f, so the deny layer is the only thing keeping them local. They sit
+  // under separate parents because the root already holds the template file of that name and the
+  // two casings would collide on a case-insensitive filesystem.
+  const forceAdded = {
+    ".envrc": "export PLANTED=fake-envrc-canary-a1\n",
+    ".env.local": "PLANTED=fake-env-local-canary-b2\n",
+    ".env.production": "PLANTED=fake-env-production-canary-c3\n",
+    ".environment": "PLANTED=fake-environment-canary-d4\n",
+    "nested/dir/.envrc": "export PLANTED=fake-nested-envrc-canary-e5\n",
+    "nested/.envs/token.txt": "fake-env-directory-canary-f6\n",
+    "deploy/my.service-account.v2.json": "{\"private_key\":\"fake-service-account-v2-canary-g7\"}\n",
+    "deploy/service-account.json": "{\"private_key\":\"fake-service-account-plain-canary-h8\"}\n",
+    "ops/.okta.yaml": "okta:\n  token: fake-okta-canary-i9\n",
+    "data/export/x.zip": "fake-export-canary-j0\n",
+    "audits/oscal-workspace/y.json": "{\"token\":\"fake-oscal-canary-k1\"}\n",
+    "config/client_secret.json": "{\"client_secret\":\"fake-client-secret-canary-l2\"}\n",
+    "config/app-client_secret.prod.json": "{\"client_secret\":\"fake-client-secret-glob-canary-m3\"}\n",
+    "config/app-client-secret.json": "{\"client_secret\":\"fake-client-secret-dash-canary-n4\"}\n",
+    "svc/prod.credentials.json": "{\"secret\":\"fake-credentials-suffix-canary-o5\"}\n",
+    "svc/robot.sa.json": "{\"private_key\":\"fake-sa-json-canary-p6\"}\n",
+    "legacy/Credentials.JSON": "{\"secret\":\"fake-case-canary-q7\"}\n",
+    ".dev.vars": "PLANTED=fake-dev-vars-canary-r8\n",
+    ".dev.vars.production": "PLANTED=fake-dev-vars-production-canary-s9\n",
+    "cf/.dev.vars.example/token": "fake-dev-vars-example-dir-canary-b8\n",
+    "cf-upper/.DEV.VARS.EXAMPLE/token": "fake-dev-vars-example-upper-dir-canary-c9\n",
+    ".secrets/token.txt": "fake-secrets-dir-canary-t0\n",
+    "keys/id_rsa": "fake-id-rsa-canary-u1\n",
+    "keys/server.key": "fake-server-key-canary-v2\n",
+    "keys/apns.p8": "fake-p8-canary-w3\n",
+    "keys/putty.ppk": "fake-ppk-canary-x4\n",
+    "keys/store.jks": "fake-jks-canary-y5\n",
+    "keys/store.keystore": "fake-keystore-canary-z6\n",
+    "keys/bundle.p12": "fake-p12-canary-a7\n",
+  };
+  // Ordinary tracked files, including names that merely contain "env", the negated
+  // `.dev.vars.example` template as a file (at the root, nested, and upper-cased), and a public
+  // key half, must still stage.
+  const ordinary = {
+    "README.md": "# tracked\n",
+    "environment.md": "# environment notes\n",
+    "config/envelope.ts": "export const envelope = true;\n",
+    "guides/env.md": "# env guide\n",
+    "src/exporter.ts": "export const exporter = true;\n",
+    ".dev.vars.example": "PLANTED=replace-me\n",
+    "nested/dir/.dev.vars.example": "PLANTED=replace-me-nested\n",
+    "nested/upper/.DEV.VARS.EXAMPLE": "PLANTED=replace-me-upper\n",
+    "keys/id_ed25519.pub": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIPublicHalfOnly comment\n",
+  };
+  try {
+    git(repo, "init", "-q");
+    plant(repo, ".gitignore", readFileSync(REPO_GITIGNORE, "utf8"));
+    for (const [relativePath, contents] of Object.entries(ordinary)) plant(repo, relativePath, contents);
+    git(repo, "add", ".gitignore", ...Object.keys(ordinary));
+    for (const [relativePath, contents] of Object.entries(forceAdded)) plant(repo, relativePath, contents);
+    git(repo, "add", "-f", ...Object.keys(forceAdded));
+    git(repo, "-c", "user.email=test@example.invalid", "-c", "user.name=test", "commit", "-q", "-m", "force-added secrets");
+
+    // Everything planted is in the index now, so only the deny layer can keep it local.
+    const index = git(repo, "ls-files", "--cached").split("\n").filter(Boolean);
+    for (const relativePath of Object.keys(forceAdded)) assert.ok(index.includes(relativePath), `${relativePath} should be tracked`);
+    const expectedFiles = [".gitignore", ...Object.keys(ordinary)].sort();
+
+    const plan = await planPodWorkspaceStaging(repo, createProcessCommandRunner());
+    assert.deepEqual([...plan.files].sort(), expectedFiles);
+    assert.deepEqual([...plan.excluded].sort(), Object.keys(forceAdded).sort());
+    assert.deepEqual(plan.skipped, []);
+
+    const realRunner = createProcessCommandRunner();
+    let uploaded;
+    const { runner, calls } = createFakeRunner(async (executable, args) => {
+      if (executable === "git") return realRunner(executable, args);
+      if (executable === "scp") {
+        const stageRoot = args.at(-2).slice(0, -2);
+        const files = listFilesRecursively(stageRoot);
+        uploaded = { files, contents: Object.fromEntries(files.map((file) => [file, readFileSync(join(stageRoot, file), "utf8")])) };
+      }
+      return { exitCode: 0 };
+    });
+    await withEnv({ RUNPOD_API_KEY: "rpa_podkey_ABCDEFG", RUNPOD_POD_ID: "pod42" }, async () => {
+      const backend = createRunpodPodBackend({ fetch: async () => new Response(RUNPOD_POD_JSON, { status: 200 }), runner });
+      const staged = await backend.stageWorkspace({ localPath: repo, sessionId: "sess" });
+      assert.match(staged.detail, new RegExp(`^copied ${expectedFiles.length} tracked files \\(${Object.keys(forceAdded).length} sensitive paths excluded, `));
+    });
+
+    assert.deepEqual(uploaded.files, expectedFiles);
+    for (const [relativePath, contents] of Object.entries(ordinary)) assert.equal(uploaded.contents[relativePath], contents);
+    const remoteArgs = calls.filter((call) => call.executable !== "git").flatMap((call) => call.args);
+    assert.deepEqual(calls.map((call) => call.executable), ["git", "ssh", "scp"]);
+    const stagedText = Object.values(uploaded.contents).join("\n") + remoteArgs.join("\n");
+    for (const [relativePath, contents] of Object.entries(forceAdded)) {
+      const canary = /fake-[a-z0-9-]+/.exec(contents)[0];
+      assert.ok(!uploaded.files.includes(relativePath), `${relativePath} reached the materialized copy`);
+      assert.ok(!remoteArgs.some((arg) => arg.includes(relativePath)), `${relativePath} appeared in an ssh or scp argument`);
+      assert.ok(!stagedText.includes(canary), `canary ${canary} from ${relativePath} reached the upload`);
+    }
+
+    // The predicate itself, including the flip of `.envrc` from allowed to denied and the names
+    // that were re-checked against .gitignore and AGENTS.md.
+    for (const path of [
+      ".envrc", ".env.local", ".env.production", ".environment", ".ENV", "nested/dir/.envrc", "a/.envs/b.txt",
+      "deploy/my.service-account.v2.json", "acme-service-account.json", "service-account.json", "Service-Account.JSON",
+      "ops/.okta.yaml", "data/export/x.zip", "deep/oscal-workspace/y", ".secrets/x", ".secrets",
+      ".dev.vars", ".dev.vars.local", "worker/.dev.vars",
+      // The template exemption is for the file only: a directory of that name, in any casing, is
+      // still a `.dev.vars*` directory.
+      ".dev.vars.example/token", ".DEV.VARS.EXAMPLE/token", "cf/.dev.vars.example/token", "a/.Dev.Vars.Example/b/c",
+      "x/prod.credentials.json", "x/robot.sa.json", "x/app-client-secret.json", "x/app-client_secret.v2.json", "legacy/Credentials.JSON",
+      "k/apns.p8", "k/putty.ppk", "k/store.jks", "k/store.keystore", "k/bundle.p12", "k/bundle.pfx", "k/server.PEM", "k/id_ecdsa",
+    ]) {
+      assert.equal(isSensitiveStagingPath(path), true, path);
+    }
+    for (const path of [
+      "README.md", "src/exporter.ts", "environment.md", "id_ed25519.pub", "docs/env.md", "config/envelope.ts",
+      ".dev.vars.example", ".DEV.VARS.EXAMPLE", "nested/dir/.dev.vars.example", "nested/upper/.DEV.VARS.EXAMPLE",
+      "env/config.ts", "envrc", "export.ts", "my-export/x.txt", "exports/x.txt", "secrets/x.txt", "keys/notes.txt",
+    ]) {
+      assert.equal(isSensitiveStagingPath(path), false, path);
+    }
+    for (const entry of [".env*", ".dev.vars*", "!.dev.vars.example", ".secrets/", "*.credentials.json", "*client-secret*.json", "*.sa.json", "*.p8", "*.ppk"]) {
+      assert.ok(RUNPOD_STAGING_DENYLIST.includes(entry), entry);
+    }
+    assert.ok(!RUNPOD_STAGING_DENYLIST.includes(".env.*"), "the narrow .env.* entry is replaced by the .env* family");
   } finally {
     rmSync(repo, { recursive: true, force: true });
   }

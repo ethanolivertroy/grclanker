@@ -533,7 +533,13 @@ export function buildDockerToolRunArgs(
 type ContractAdapterOptions = {
   preflight?: () => void;
   unavailableMessage?: string;
+  /** Sink for the backend's non-fatal staging warnings; defaults to one line on stderr. */
+  warn?: (message: string) => void;
 };
+
+function writeWarningToStderr(message: string): void {
+  process.stderr.write(`${message}\n`);
+}
 
 function createContractCommandAdapter(
   localCwd: string,
@@ -584,6 +590,10 @@ function createContractCommandAdapter(
     try {
       const staged = await backend.stageWorkspace({ localPath: localCwd, sessionId });
       remoteStateMayRemain = true;
+      // Warnings (a local staging copy that could not be removed) ride along with a successful
+      // stage: the session is tracked and torn down exactly as if there had been none.
+      const warn = adapterOptions.warn ?? writeWarningToStderr;
+      for (const warning of staged.warnings ?? []) warn(warning);
       return staged.remotePath;
     } catch (error) {
       if (error instanceof ExecutionBackendCleanupError) remoteStateMayRemain = true;
@@ -782,7 +792,7 @@ export function resolveComputeBackendExecution(
     case "sandbox-runtime": {
       const sandboxConfig = loadSandboxConfig(localCwd);
       const backend = createExecutionBackend(localCwd, settings, deps, kind);
-      const adapter = createContractCommandAdapter(localCwd, backend);
+      const adapter = createContractCommandAdapter(localCwd, backend, { warn: deps.warn });
       return {
         kind,
         label,
@@ -805,6 +815,7 @@ export function resolveComputeBackendExecution(
       const backend = createExecutionBackend(localCwd, settings, deps, kind);
       const adapter = createContractCommandAdapter(localCwd, backend, {
         unavailableMessage: "Docker is selected, but the Docker daemon is not reachable. Run `grclanker env doctor` for details.",
+        warn: deps.warn,
       });
       return buildFullToolSurface(
         kind,
@@ -822,6 +833,7 @@ export function resolveComputeBackendExecution(
           assertParallelsSourceIsUsable(settings);
         },
         unavailableMessage: "Parallels VM is selected, but `prlctl` is not available on this host. Run `grclanker env doctor` for details.",
+        warn: deps.warn,
       });
       return buildFullToolSurface(kind, label, describeParallelsSummary(settings), localCwd, adapter, backend);
     }
@@ -831,7 +843,7 @@ export function resolveComputeBackendExecution(
     case "cloudflare-sandbox":
     case "vercel-sandbox": {
       const backend = createExecutionBackend(localCwd, settings, deps, kind);
-      const adapter = createContractCommandAdapter(localCwd, backend);
+      const adapter = createContractCommandAdapter(localCwd, backend, { warn: deps.warn });
       if (backend.capabilities.oneShot) {
         return buildOneShotToolSurface(kind, label, describeRemoteSummary(kind), adapter, backend);
       }

@@ -2,7 +2,8 @@ import { spawnSync } from "node:child_process";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { detectComputeBackendStatuses, getComputeBackendShipState } from "../dist/pi/compute.js";
+import { detectComputeBackendStatuses } from "../dist/pi/compute.js";
+import { selectLiveSmokeCandidates } from "../dist/pi/env.js";
 
 const cliEntrypoint = resolve(dirname(fileURLToPath(import.meta.url)), "..", "dist", "index.js");
 
@@ -27,16 +28,13 @@ const requested = process.env.GRCLANKER_LIVE_BACKENDS
   .map((value) => value.trim())
   .filter(Boolean);
 
-const candidates = detectComputeBackendStatuses()
-  .filter((status) => status.kind !== "host")
-  .filter((status) => status.kind !== "sandbox-runtime" || requested?.includes("sandbox-runtime"))
-  .filter((status) => getComputeBackendShipState(status.kind) !== "stub")
-  .filter((status) => status.available)
-  .filter((status) => !requested || requested.includes(status.kind));
+// Readiness comes from the same detection `env list` and `env doctor` use, so a backend missing a
+// mandatory local tool (for runpod-pod: ssh, scp, and git) is skipped here too.
+const candidates = selectLiveSmokeCandidates(detectComputeBackendStatuses(), requested);
 
 if (candidates.length === 0) {
   log(
-    "Skipping live compute backend smoke test: no non-host backend has its binaries or credentials present (docker daemon, prlctl, modal + MODAL_TOKEN_* or a ~/.modal.toml profile, RUNPOD_API_KEY + RUNPOD_ENDPOINT_ID or RUNPOD_POD_ID). Set GRCLANKER_LIVE_BACKENDS=sandbox-runtime to include the local sandbox.",
+    "Skipping live compute backend smoke test: no non-host backend has its binaries or credentials present (docker daemon, prlctl, modal + MODAL_TOKEN_* or a ~/.modal.toml profile, RUNPOD_API_KEY + RUNPOD_ENDPOINT_ID, or RUNPOD_API_KEY + RUNPOD_POD_ID with ssh, scp, and git on PATH). Set GRCLANKER_LIVE_BACKENDS=sandbox-runtime to include the local sandbox.",
   );
   process.exit(0);
 }

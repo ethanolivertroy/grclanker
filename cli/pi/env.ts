@@ -20,6 +20,7 @@ import {
   resolveComputeProfile,
   type ComputeBackendKind,
   type ComputeBackendStatus,
+  type ComputeDetectionOptions,
 } from "./compute.js";
 import { ExecutionBackendCleanupError, redactErrorMessage, redactSecrets } from "./execution-backend.js";
 import { joinBashArgs, quoteForBash } from "./shell.js";
@@ -88,11 +89,12 @@ export function extractComputeFlag(args: string[]): { compute?: ComputeBackendKi
 export function buildComputeBackendList(
   settings: GrclankerSettings,
   statuses: ComputeBackendStatus[] = detectComputeBackendStatuses(),
+  options: ComputeDetectionOptions = {},
 ): ComputeBackendListEntry[] {
   const preferred = resolveComputeBackend(settings);
   return COMPUTE_BACKEND_KINDS.map((kind) => {
     const status = statuses.find((entry) => entry.kind === kind);
-    const issues = getComputeBackendConfigurationIssues(settings, kind);
+    const issues = getComputeBackendConfigurationIssues(settings, kind, options);
     const readiness: ComputeBackendListEntry["readiness"] = getComputeBackendShipState(kind) === "stub"
       ? "not available"
       : !status?.available
@@ -109,6 +111,24 @@ export function buildComputeBackendList(
       detail: issues[0] ?? status?.detail ?? "",
     };
   });
+}
+
+/**
+ * Picks the backends the live smoke script exercises: every shipped non-host backend that
+ * `detectComputeBackendStatuses` reports as available (credentials plus every required local tool,
+ * so a runpod-pod host without `git` is skipped), narrowed to GRCLANKER_LIVE_BACKENDS when set.
+ * sandbox-runtime only runs when requested explicitly.
+ */
+export function selectLiveSmokeCandidates(
+  statuses: readonly ComputeBackendStatus[],
+  requested?: readonly ComputeBackendKind[] | readonly string[],
+): ComputeBackendStatus[] {
+  return statuses
+    .filter((status) => status.kind !== "host")
+    .filter((status) => status.kind !== "sandbox-runtime" || requested?.includes("sandbox-runtime") === true)
+    .filter((status) => getComputeBackendShipState(status.kind) !== "stub")
+    .filter((status) => status.available)
+    .filter((status) => !requested || requested.includes(status.kind));
 }
 
 export function formatComputeBackendList(

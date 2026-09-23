@@ -58,6 +58,12 @@ export type StagedWorkspace = {
   sessionId: string;
   remotePath: string;
   detail: string;
+  /**
+   * Non-fatal conditions the runtime should surface to the operator (already scrubbed), such as
+   * a local staging copy that could not be removed. Staging itself succeeded and the remote
+   * session state is exactly what `detail` describes.
+   */
+  warnings?: string[];
 };
 
 export type ExecutionBackendCapabilities = {
