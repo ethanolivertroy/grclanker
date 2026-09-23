@@ -204,6 +204,26 @@ export type SumologicPolicyName =
   | "maxUserSessionTimeout"
   | "accessKeysLifetime";
 
+/**
+ * The members each documented object resource carries. A 200 body with none
+ * of them is not the resource (a proxy page, a foreign API's JSON) and is
+ * recorded as a not-collected marker rather than read as evidence.
+ */
+const POLICY_MEMBERS: Readonly<Record<SumologicPolicyName, readonly string[]>> = {
+  audit: ["enabled"],
+  searchAudit: ["enabled"],
+  shareDashboardsOutsideOrganization: ["enabled"],
+  dataAccessLevel: ["enabled"],
+  userConcurrentSessionsLimit: ["enabled", "maxConcurrentSessions"],
+  maxUserSessionTimeout: ["maxUserSessionTimeout"],
+  accessKeysLifetime: ["accessKeysLifetimeInDays"],
+};
+const ACCOUNT_STATUS_MEMBERS: readonly string[] = ["pricingModel", "planType", "applicationUse", "canUpdatePlan"];
+const PASSWORD_POLICY_MEMBERS: readonly string[] = ["minLength", "maxLength", "requireMfa", "maxPasswordAgeInDays"];
+const SERVICE_ALLOWLIST_STATUS_MEMBERS: readonly string[] = ["loginEnabled", "contentEnabled"];
+const FOLDER_MEMBERS: readonly string[] = ["id", "itemType", "children"];
+const CONTENT_PERMISSIONS_MEMBERS: readonly string[] = ["explicitPermissions", "implicitPermissions"];
+
 export interface SumologicReader {
   getResolvedConfig(): SumologicResolvedConfig;
   getAccountStatus(): Promise<SumologicCollection<JsonRecord>>;
@@ -1520,8 +1540,24 @@ export class SumologicApiClient implements SumologicReader {
     return { data: items, complete: false };
   }
 
-  private async getObject(path: string, query: JsonRecord = {}): Promise<{ data: JsonRecord; complete: boolean }> {
-    return { data: asObject(await this.get(path, query)) ?? {}, complete: true };
+  /**
+   * A single object is kept only when it carries at least one member the
+   * documented resource has; a 200 body with none of them is another document
+   * (a proxy page, a foreign API's JSON) and is recorded as a not-collected
+   * marker naming the endpoint, never as evidence, so the verdicts that read it
+   * render manual.
+   */
+  private async getObject(path: string, members: readonly string[], query: JsonRecord = {}): Promise<{ data: JsonRecord; complete: boolean }> {
+    const data = asObject(await this.get(path, query));
+    if (!data || !members.some((member) => member in data)) {
+      throw new SumologicApiError(
+        `Sumo Logic request to ${path} returned a 200 body that is not the expected object (none of ${members.join(", ")} present), so the response was not recorded`,
+        200,
+        undefined,
+        path,
+      );
+    }
+    return { data, complete: true };
   }
 
   private async getArray(path: string): Promise<{ data: JsonRecord[]; complete: boolean }> {
@@ -1529,7 +1565,7 @@ export class SumologicApiClient implements SumologicReader {
   }
 
   getAccountStatus() {
-    return this.collect("/v1/account/status", () => this.getObject("/v1/account/status"));
+    return this.collect("/v1/account/status", () => this.getObject("/v1/account/status", ACCOUNT_STATUS_MEMBERS));
   }
 
   listUsers() {
@@ -1561,11 +1597,11 @@ export class SumologicApiClient implements SumologicReader {
   }
 
   getPasswordPolicy() {
-    return this.collect("/v1/passwordPolicy", () => this.getObject("/v1/passwordPolicy"));
+    return this.collect("/v1/passwordPolicy", () => this.getObject("/v1/passwordPolicy", PASSWORD_POLICY_MEMBERS));
   }
 
   getServiceAllowlistStatus() {
-    return this.collect("/v1/serviceAllowlist/status", () => this.getObject("/v1/serviceAllowlist/status"));
+    return this.collect("/v1/serviceAllowlist/status", () => this.getObject("/v1/serviceAllowlist/status", SERVICE_ALLOWLIST_STATUS_MEMBERS));
   }
 
   listServiceAllowlistAddresses() {
@@ -1576,7 +1612,7 @@ export class SumologicApiClient implements SumologicReader {
   }
 
   getPolicy(name: SumologicPolicyName) {
-    return this.collect(`/v1/policies/${name}`, () => this.getObject(`/v1/policies/${name}`));
+    return this.collect(`/v1/policies/${name}`, () => this.getObject(`/v1/policies/${name}`, POLICY_MEMBERS[name]));
   }
 
   listPartitions() {
@@ -1608,7 +1644,7 @@ export class SumologicApiClient implements SumologicReader {
   }
 
   getPersonalFolder() {
-    return this.collect("/v2/content/folders/personal", () => this.getObject("/v2/content/folders/personal"));
+    return this.collect("/v2/content/folders/personal", () => this.getObject("/v2/content/folders/personal", FOLDER_MEMBERS));
   }
 
   listDashboards() {
@@ -1617,7 +1653,7 @@ export class SumologicApiClient implements SumologicReader {
 
   getContentPermissions(contentId: string) {
     const path = `/v2/content/${encodeURIComponent(contentId)}/permissions`;
-    return this.collect(path, () => this.getObject(path, { explicitOnly: false }));
+    return this.collect(path, () => this.getObject(path, CONTENT_PERMISSIONS_MEMBERS, { explicitOnly: false }));
   }
 }
 
@@ -1702,12 +1738,16 @@ function finding(
   return { id: definition.id, title: definition.title, severity, status, summary, evidence, mappings: mappingsFor(definition) };
 }
 
+const UNEXPECTED_SHAPE_PATTERN = /returned a 200 body that is not the expected object/;
+
 function unreadableCause(collection: SumologicCollection<unknown>): string {
   return collection.httpStatus === 401
     ? "credentials were rejected (401)"
     : collection.httpStatus === 403
       ? "the access key lacks the role capability (403)"
-      : `the endpoint returned an error (${collection.error ?? "unknown error"})`;
+      : UNEXPECTED_SHAPE_PATTERN.test(collection.error ?? "")
+        ? `the endpoint returned a 200 body that is not the expected object (${collection.error})`
+        : `the endpoint returned an error (${collection.error ?? "unknown error"})`;
 }
 
 function unreadableSummary(what: string, collection: SumologicCollection<unknown>, evidenceToCollect: string): string {

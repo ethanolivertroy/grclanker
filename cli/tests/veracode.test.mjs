@@ -2680,3 +2680,92 @@ test("item 7: once a client is constructed its configured API key secret is remo
   );
   assert.equal(redactSnapshot("key id registry-key-id-2026 is an identifier"), "key id registry-key-id-2026 is an identifier", "the API key id is not registered");
 });
+
+const FOREIGN_BODY_CANARY = "yln2bVNl4tE9Cyp1B18V2mX7";
+const FOREIGN_BEARER_CANARY = "Qw8Zr2Lm5Pk1Vt7Xy3Nb6Hd9";
+/** The frozen harness class 10 "200 foreign JSON" body: another API's document served with a 200 at a documented endpoint. */
+const FOREIGN_JSON_BODY = { foo: FOREIGN_BODY_CANARY, items: [{ password: FOREIGN_BODY_CANARY, description: `Authorization: Bearer ${FOREIGN_BEARER_CANARY}` }] };
+const FOREIGN_OBJECT_PATHS = [/^\/api\/authn\/v2\/users\/self$/, /^\/api\/authn\/v2\/api_credentials$/, /^\/api\/authn\/v2\/api_credentials\/user_id\/[^/]+$/];
+const LIBRARY_FAILURE_PATTERN = /TypeError|ReferenceError|Cannot read properties|is not a function/;
+
+/** Serves the healthy route table, except that every path matching `paths` answers 200 with the foreign JSON body. */
+function foreignJsonVeracodeFetch(paths) {
+  const { fetchImpl: serve, requests } = recordingVeracodeFetch();
+  const fetchImpl = async (input, init = {}) => {
+    const url = new URL(typeof input === "string" ? input : input.toString());
+    if (!paths.some((pattern) => pattern.test(url.pathname))) return serve(input, init);
+    requests.push({ method: init.method ?? "GET", path: url.pathname, status: 200 });
+    return jsonResponse(FOREIGN_JSON_BODY);
+  };
+  return { fetchImpl, requests };
+}
+
+function shapeErrorPattern(members) {
+  return new RegExp(`^Veracode request to /api/authn/v2/[A-Za-z0-9_/-]+ returned a 200 body that is not the expected object \\(none of ${members} present\\), so the response was not recorded$`);
+}
+
+test("class 10: a 200 body that is not the expected object is a not-collected marker in core_data and the assess payload, the principal is withheld, VERACODE-09 renders manual, and no part of the body reaches the bundle, the zip, the assess payloads, or the access check", async () => {
+  const { fetchImpl, requests } = foreignJsonVeracodeFetch(FOREIGN_OBJECT_PATHS);
+  const client = new VeracodeApiClient(sampleConfig({ retries: 0 }), { fetchImpl, sleep: async () => {} });
+  const access = await checkVeracodeAccess(client);
+  const results = await runVeracodeAssessments(client);
+  const exported = await exportVeracodeAuditBundle(client, sampleConfig(), createTempBase("grclanker-veracode-foreign-json-"), { now: NOW });
+
+  const selfError = shapeErrorPattern("user_id, user_name, email_address, roles");
+  const credentialError = shapeErrorPattern("api_id, created_ts, expiration_ts, revocation_ts");
+  const snapshot = JSON.parse(readFileSync(join(exported.outputDir, "core_data", "access-controls.json"), "utf8"));
+  assertNotCollectedMarker(snapshot.self, "core_data/access-controls.json self", { status: 200, endpoint: /^\/api\/authn\/v2\/users\/self$/, error: selfError });
+  assertNotCollectedMarker(snapshot.api_credentials_by_user["u-2"], "core_data/access-controls.json api_credentials_by_user u-2", { status: 200, endpoint: /^\/api\/authn\/v2\/api_credentials\/user_id\/u-2$/, error: credentialError });
+  assert.deepEqual(Object.keys(snapshot.api_credentials_by_user), ["u-2"], "the one API account's credential record was requested and recorded as a marker");
+
+  const [, , , , accessControls] = results;
+  assert.deepEqual(accessControls.rawData.self, snapshot.self, "the assess payload carries the same self marker as core_data");
+  assert.deepEqual(accessControls.rawData.api_credentials_by_user, snapshot.api_credentials_by_user, "the assess payload carries the same credential marker as core_data");
+  const credentialFinding = accessControls.findings.find((item) => item.id === "VERACODE-09");
+  assert.equal(credentialFinding.status, "manual");
+  assert.match(credentialFinding.summary, /^The api_credentials \(Administrator role\) endpoint returned a 200 body that is not the expected object \(unexpected response shape\), so the control could not be verified: Veracode request to \/api\/authn\/v2\/api_credentials\/user_id\/u-2 returned a 200 body/);
+  assert.equal(credentialFinding.evidence.credentials_readable, 0, "no credential record was read");
+  assert.equal(credentialFinding.evidence.credentials_current, null, "the age classification is unknown, not 0");
+  assert.equal(credentialFinding.evidence.credentials_over_max_age, null);
+  assert.ok(accessControls.errors.some((line) => /^api credentials \(svc-api\): Veracode request to \/api\/authn\/v2\/api_credentials\/user_id\/u-2 returned a 200 body that is not the expected object/.test(line)), `the error log names the unexpected shape, got ${JSON.stringify(accessControls.errors)}`);
+
+  for (const [name, endpoint, error] of [["self", "/api/authn/v2/users/self", selfError], ["api_credentials", "/api/authn/v2/api_credentials", credentialError]]) {
+    const surface = access.surfaces.find((item) => item.name === name);
+    assert.equal(surface.status, "not_readable", `${name} probe is not readable`);
+    assert.equal(surface.count, null, `${name} probe count is null, not 0 or 1`);
+    assert.equal(surface.statusCode, 200, `${name} probe records the observed 200`);
+    assert.equal(surface.endpoint, endpoint);
+    assert.match(surface.error, error);
+  }
+  assert.equal(access.status, "limited");
+  assert.equal(access.principal, undefined, "a body that is not a user record names no principal");
+  assert.deepEqual(access.missingRoles, [], "a 200 of the wrong shape is not a missing role");
+  assert.ok(access.notes.includes("The principal could not be read from /api/authn/v2/users/self."), `the access check says the principal was not read, got ${JSON.stringify(access.notes)}`);
+  assert.equal(JSON.parse(readFileSync(join(exported.outputDir, "metadata.json"), "utf8")).principal, null, "metadata.json carries no principal");
+
+  const outputs = veracodeOutputs(access, results, exported);
+  for (const [name, content] of readZipEntries(exported.zipPath)) outputs.set(`zip ${name}`, content);
+  for (const [name, text] of outputs) {
+    for (const canary of [FOREIGN_BODY_CANARY, FOREIGN_BEARER_CANARY]) assertNoWindowOf(text, canary, `class 10 foreign JSON ${name}`);
+    assert.doesNotMatch(text, LIBRARY_FAILURE_PATTERN, `class 10 foreign JSON ${name}: no library failure text`);
+  }
+  assertOutputsNameOnlyObservedRequests(outputs, requests, "class 10 foreign JSON");
+});
+
+test("class 10: a single object carrying a documented member is kept whatever else it carries", async () => {
+  const fixture = healthyFixture();
+  fixture.self = { user_name: "svc-api", extra_member: "kept-beside-the-documented-member" };
+  fixture.credentials = { api_id: "abc123", extra_member: "kept-beside-the-documented-member" };
+  const { fetchImpl } = recordingVeracodeFetch({ fixture });
+  const client = new VeracodeApiClient(sampleConfig({ retries: 0 }), { fetchImpl, sleep: async () => {} });
+  const access = await checkVeracodeAccess(client);
+  assert.equal(access.principal, "svc-api", "a user record with one documented member names the principal");
+  for (const name of ["self", "api_credentials"]) {
+    const surface = access.surfaces.find((item) => item.name === name);
+    assert.equal(surface.status, "readable", `${name} is readable`);
+    assert.equal(surface.count, 1);
+  }
+  const [, , , , accessControls] = await runVeracodeAssessments(client);
+  assert.deepEqual(accessControls.rawData.self, fixture.self, "the record is kept whole");
+  assert.equal(accessControls.rawData.api_credentials_by_user["u-2"].api_id, "abc123", "the credential record is projected, not marked");
+});

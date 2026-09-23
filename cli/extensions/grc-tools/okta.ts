@@ -2562,12 +2562,44 @@ async function collectArrayDataset(
   }
 }
 
-async function collectObjectDataset<T>(
+/** The members the documented resource carries; a 200 body with none of them is another document (a proxy page, a foreign API's JSON), not the resource. */
+interface ObjectEnvelope {
+  readonly target: string;
+  readonly members: readonly string[];
+}
+
+const OKTA_SUPPORT_ENVELOPE: ObjectEnvelope = { target: "/api/v1/org/privacy/oktaSupport", members: ["support", "expiration"] };
+const THIRD_PARTY_ADMIN_ENVELOPE: ObjectEnvelope = { target: "/api/v1/org/orgSettings/thirdPartyAdminSetting", members: ["thirdPartyAdmin"] };
+const DEFAULT_AUTHORIZATION_SERVER_ENVELOPE: ObjectEnvelope = { target: "/api/v1/authorizationServers/default", members: ["id", "issuer", "audiences"] };
+const THREAT_INSIGHT_ENVELOPE: ObjectEnvelope = { target: "/api/v1/threats/configuration", members: ["action", "mode", "settings", "excludeZones"] };
+const ORG_CONTACT_USER_MEMBERS: readonly string[] = ["userId"];
+
+function carriesExpectedMember(data: unknown, members: readonly string[]): boolean {
+  const record = asRecord(data);
+  return members.some((member) => member in record);
+}
+
+function unexpectedShapeError(target: string, members: readonly string[]): string {
+  return `GET ${target} returned a 200 body that is not the expected object (none of ${members.join(", ")} present), so the response was not recorded`;
+}
+
+const UNEXPECTED_SHAPE_PATTERN = /returned a 200 body that is not the expected object/;
+
+/** A 200 body that is not the resource is a marker, never evidence: the fallback stays in memory, the verdicts read the error as they do for a failed request, and no part of the body is kept. */
+function unexpectedShapeDataset<T>(fallback: T, envelope: ObjectEnvelope): CollectedDataset<T> {
+  const error = unexpectedShapeError(envelope.target, envelope.members);
+  return { data: fallback, error, truncated: null, notCollected: { collected: false, status: 200, endpoint: envelope.target, error } };
+}
+
+/** A single object lands here: a null (404) stays null, a body carrying none of the documented members becomes a marker, and the resource is redacted before it is kept. */
+async function collectObjectDataset<T extends JsonRecord | null>(
   fetcher: () => Promise<T>,
   fallback: T,
+  envelope: ObjectEnvelope,
 ): Promise<CollectedDataset<T>> {
   try {
     const data = await fetcher();
+    if (data !== null && !carriesExpectedMember(data, envelope.members)) return unexpectedShapeDataset(fallback, envelope);
     return { data: redactSnapshot(data) as T };
   } catch (error) {
     return failedDataset(fallback, error);
@@ -2764,6 +2796,7 @@ export async function collectOktaAuthenticationData(
     defaultAuthorizationServer: await collectObjectDataset(
       () => client.getDefaultAuthorizationServer(),
       null,
+      DEFAULT_AUTHORIZATION_SERVER_ENVELOPE,
     ),
     orgFactors: await collectArrayDataset(() => client.listOrgFactors()),
   };
@@ -2849,10 +2882,10 @@ export async function collectOktaAdminAccessData(
   const users = await collectUsersDataset(client);
   const privilegedUserFactors = await collectPrivilegedUserFactors(client, usersWithRoleAssignments);
   const oktaSupportAccess = client.getOktaSupportSettings
-    ? await collectObjectDataset(() => client.getOktaSupportSettings!(), null)
+    ? await collectObjectDataset(() => client.getOktaSupportSettings!(), null, OKTA_SUPPORT_ENVELOPE)
     : unavailableDataset<JsonRecord | null>(null, "Okta Support access settings are not available on this client.");
   const thirdPartyAdminSetting = client.getThirdPartyAdminSetting
-    ? await collectObjectDataset(() => client.getThirdPartyAdminSetting!(), null)
+    ? await collectObjectDataset(() => client.getThirdPartyAdminSetting!(), null, THIRD_PARTY_ADMIN_ENVELOPE)
     : unavailableDataset<JsonRecord | null>(null, "Third-party admin setting is not available on this client.");
 
   return {
@@ -2944,6 +2977,13 @@ async function collectOrgContacts(
       attempted += 1;
       try {
         const assignment = await client.getOrgContactUser(contactType);
+        if (assignment !== null && !carriesExpectedMember(assignment, ORG_CONTACT_USER_MEMBERS)) {
+          const endpoint = `/api/v1/org/contacts/${encodeURIComponent(contactType)}`;
+          const error = unexpectedShapeError(endpoint, ORG_CONTACT_USER_MEMBERS);
+          errors.push(`${contactType}: ${error}`);
+          childMarkers[contactType] = { collected: false, status: 200, endpoint, error };
+          continue;
+        }
         const userId = asString(asRecord(assignment).userId);
         const user = userId && client.getUser ? await client.getUser(userId) : null;
         resolved.push({
@@ -2986,7 +3026,7 @@ export async function collectOktaMonitoringData(
       (event) => redactRecord(projectSystemLogEvent(event)),
     ),
     behaviors: await collectArrayDataset(() => client.listBehaviors()),
-    threatInsight: await collectObjectDataset(() => client.getThreatInsight(), null),
+    threatInsight: await collectObjectDataset(() => client.getThreatInsight(), null, THREAT_INSIGHT_ENVELOPE),
     apiTokens: await collectArrayDataset(() => client.listApiTokens()),
     deviceAssurance: await collectArrayDataset(() => client.listDeviceAssurancePolicies()),
     orgContacts: await collectOrgContacts(client),
@@ -3213,6 +3253,7 @@ function describeEndpointError(error: string): string {
   if (/\(403 /.test(error)) return "the endpoint returned 403 Forbidden (missing scope or admin role)";
   if (/\(401 /.test(error)) return "the endpoint returned 401 Unauthorized (credential rejected)";
   if (/\(404 /.test(error)) return "the endpoint returned 404 Not Found (feature not enabled on this org edition)";
+  if (UNEXPECTED_SHAPE_PATTERN.test(error)) return "the endpoint returned a 200 body that is not the expected object (unexpected response shape)";
   if (/not available on this client/i.test(error)) return "the collector did not expose this endpoint";
   return "the endpoint request failed";
 }

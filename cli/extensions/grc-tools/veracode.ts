@@ -29,6 +29,9 @@ const DEFAULT_OUTPUT_DIR = "./export/veracode";
 const DEFAULT_TIMEOUT_MS = 30_000;
 const DEFAULT_PAGE_SIZE = 100;
 const DEFAULT_MAX_PAGES = 50;
+/** The members the documented user and API credential records carry; a 200 body with none of them is not the resource and is never read as evidence. */
+const USER_MEMBERS: readonly string[] = ["user_id", "user_name", "email_address", "roles"];
+const API_CREDENTIAL_MEMBERS: readonly string[] = ["api_id", "created_ts", "expiration_ts", "revocation_ts"];
 const DEFAULT_MAX_APPLICATIONS = 100;
 const DEFAULT_MAX_WORKSPACES = 25;
 const DEFAULT_MAX_ANALYSES = 25;
@@ -1429,12 +1432,30 @@ export class VeracodeApiClient {
     return { items, pagesFetched, totalPages, totalElements, complete: complete && (totalElements === undefined || items.length >= totalElements) };
   }
 
+  /**
+   * A single object is kept only when it carries at least one member the
+   * documented resource has; a 200 body with none of them is another document
+   * (a proxy page, a foreign API's JSON) and is reported as an error naming
+   * the endpoint, never read as evidence, so the surface renders unreadable.
+   */
+  private async getObject(path: string, members: readonly string[]): Promise<JsonRecord> {
+    const payload = await this.get(path);
+    if (!members.some((member) => member in payload)) {
+      throw new VeracodeApiError(
+        `Veracode request to ${path} returned a 200 body that is not the expected object (none of ${members.join(", ")} present), so the response was not recorded`,
+        200,
+        path,
+      );
+    }
+    return payload;
+  }
+
   async getSelf(): Promise<JsonRecord> {
-    return this.get("/api/authn/v2/users/self");
+    return this.getObject("/api/authn/v2/users/self", USER_MEMBERS);
   }
 
   async getSelfApiCredentials(): Promise<JsonRecord> {
-    return this.get("/api/authn/v2/api_credentials");
+    return this.getObject("/api/authn/v2/api_credentials", API_CREDENTIAL_MEMBERS);
   }
 
   async listApplications(options: { maxPages?: number } = {}): Promise<HalListResult> {
@@ -1482,7 +1503,7 @@ export class VeracodeApiClient {
   }
 
   async getUserApiCredentials(userId: string): Promise<JsonRecord> {
-    return this.get(`/api/authn/v2/api_credentials/user_id/${encodeURIComponent(userId)}`);
+    return this.getObject(`/api/authn/v2/api_credentials/user_id/${encodeURIComponent(userId)}`, API_CREDENTIAL_MEMBERS);
   }
 
   async listScaWorkspaces(options: { maxPages?: number } = {}): Promise<HalListResult> {
@@ -1601,13 +1622,17 @@ function isUnavailable(item: Surface<unknown>): boolean {
   return item.status === "error" && (item.statusCode === 404 || isForbidden(item));
 }
 
+const UNEXPECTED_SHAPE_PATTERN = /returned a 200 body that is not the expected object/;
+
 function unreadableReason(name: string, item: Surface<unknown>): string {
   if (item.status !== "error") return `The ${name} surface was not read.`;
   const cause = item.statusCode === 401 || item.statusCode === 403
     ? `was forbidden (${item.statusCode})`
-    : item.statusCode
-      ? `returned an error (${item.statusCode})`
-      : "could not be read";
+    : UNEXPECTED_SHAPE_PATTERN.test(item.error)
+      ? "returned a 200 body that is not the expected object (unexpected response shape)"
+      : item.statusCode
+        ? `returned an error (${item.statusCode})`
+        : "could not be read";
   return `The ${name} endpoint ${cause}, so the control could not be verified: ${item.error}`;
 }
 

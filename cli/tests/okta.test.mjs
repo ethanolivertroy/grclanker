@@ -3609,3 +3609,95 @@ test("item 7: once a client is constructed its configured credential is removed 
   await client.getJson("/api/v1/users");
   assert.equal(redactSnapshot(`minted ${MINTED_ACCESS_TOKEN} echoed`), "minted [REDACTED] echoed", "the minted access token is registered when it is obtained");
 });
+
+const FOREIGN_BODY_CANARY = "yln2bVNl4tE9Cyp1B18V2mX7";
+const FOREIGN_BEARER_CANARY = "Qw8Zr2Lm5Pk1Vt7Xy3Nb6Hd9";
+const FOREIGN_JSON_BODY = { foo: FOREIGN_BODY_CANARY, items: [{ password: FOREIGN_BODY_CANARY, description: `Authorization: Bearer ${FOREIGN_BEARER_CANARY}` }] };
+/** The single-object endpoints whose 200 body is recorded whole; each has a documented member the verdicts read. */
+const FOREIGN_OBJECT_TARGETS = {
+  "core_data/okta_support_access.json": "/api/v1/org/privacy/oktaSupport",
+  "core_data/third_party_admin_setting.json": "/api/v1/org/orgSettings/thirdPartyAdminSetting",
+  "core_data/default_authorization_server.json": "/api/v1/authorizationServers/default",
+  "core_data/threat_insight.json": "/api/v1/threats/configuration",
+};
+const FOREIGN_CONTACT_TARGET = "/api/v1/org/contacts/TECHNICAL";
+
+/** Serves the foreign JSON document at the given paths with a 200 and the fixtures everywhere else. */
+function foreignJsonOktaFetch(paths) {
+  const recorder = recordingOktaFetch();
+  const fetchImpl = async (input, init = {}) => {
+    const url = new URL(input.toString());
+    if (!paths.includes(url.pathname)) return recorder.fetchImpl(input, init);
+    recorder.requests.push({ method: init.method ?? "GET", path: url.pathname, status: 200 });
+    return new Response(JSON.stringify(FOREIGN_JSON_BODY), { status: 200, statusText: "OK", headers: { "content-type": "application/json" } });
+  };
+  return { fetchImpl, requests: recorder.requests };
+}
+
+test("class 10: a 200 body that is not the expected object is a not-collected marker, its findings demote, and no part of the body reaches the bundle, the zip, the assess payloads, or the access check", async () => {
+  const { fetchImpl, requests } = foreignJsonOktaFetch([...Object.values(FOREIGN_OBJECT_TARGETS), FOREIGN_CONTACT_TARGET]);
+  const client = new OktaAuditorClient(RECORDING_CONFIG, { fetchImpl });
+  const access = await runOktaAccessCheck(client, RECORDING_CONFIG);
+  const results = await runAllAssessments(client, RECORDING_CONFIG);
+  const exported = await exportOktaAuditBundle(client, RECORDING_CONFIG, createTempBase("grclanker-okta-foreign-"));
+  const files = readBundleFiles(exported.outputDir);
+  const collectionStatus = JSON.parse(files.get("core_data/collection_status.json"));
+  const outputs = oktaOutputs(access, results, exported);
+  for (const [name, text] of readZipEntries(exported.zipPath)) outputs.set(`zip ${name}`, text);
+
+  const shapeError = /^GET \/api\/v1\/[A-Za-z/]+ returned a 200 body that is not the expected object \(none of [A-Za-z, ]+ present\), so the response was not recorded$/;
+  for (const [file, target] of Object.entries(FOREIGN_OBJECT_TARGETS)) {
+    assertOktaNotCollectedMarker(JSON.parse(files.get(file)), file, { status: 200, endpoint: new RegExp(`^${target.replace(/[/.]/g, "\\$&")}$`), error: shapeError });
+    assert.ok(collectionStatus.not_collected.includes(file), `${file} is listed as not collected`);
+    const entry = collectionStatus.datasets.find((row) => row.file === file);
+    assert.equal(entry.collected, false, file);
+    assert.equal(entry.status, 200, `${file}: the marker keeps the observed status`);
+    assert.equal(entry.endpoint, target, file);
+  }
+
+  const support = findingById(results.admin, "OKTA-ADMIN-006");
+  assert.equal(support.status, "Manual", "the Okta Support verdict is manual, never pass or fail, over a body that is not the setting");
+  assert.match(support.summary, /the endpoint returned a 200 body that is not the expected object \(unexpected response shape\) for Okta Support access/);
+  assert.match(support.summary, /unexpected response shape\) for the third-party admin setting/);
+  assert.equal(results.admin.snapshotSummary.okta_support_access, "not collected", "the support state label reads not collected, never unknown or a state");
+  const threatInsight = findingById(results.monitoring, "OKTA-MON-003");
+  assert.equal(threatInsight.status, "Manual");
+  assert.match(threatInsight.summary, /unexpected response shape/);
+  assert.equal(results.monitoring.snapshotSummary.threat_insight_mode, "not collected");
+  const contact = findingById(results.monitoring, "OKTA-MON-008");
+  assert.equal(contact.status, "Partial", "a contact assignment body without userId is a failed lookup, not an unassigned contact");
+  assert.match(contact.summary, /technical contact lookup failed/);
+  assert.doesNotMatch(contact.summary, /No technical contact user is assigned/);
+  assert.ok(contact.evidence.some((line) => /TECHNICAL: GET \/api\/v1\/org\/contacts\/TECHNICAL returned a 200 body that is not the expected object/.test(line)));
+  assert.equal(results.admin.snapshotSummary.datasets_not_collected, 2);
+  assert.equal(results.authentication.snapshotSummary.datasets_not_collected, 1);
+  assert.equal(results.monitoring.snapshotSummary.datasets_not_collected, 1);
+
+  for (const [name, text] of outputs) {
+    assert.ok(!text.includes(FOREIGN_BODY_CANARY), `${name}: the foreign body's member value never reaches an output`);
+    assert.ok(!text.includes(FOREIGN_BEARER_CANARY), `${name}: the foreign body's bearer token never reaches an output`);
+    assert.ok(!/TypeError|ReferenceError|Cannot read properties|is not a function/.test(text), `${name}: a foreign body never surfaces as a runtime error`);
+  }
+  assertOktaOutputsNameOnlyObservedRequests(outputs, requests, "foreign JSON");
+  assert.ok(requests.some((request) => request.path === FOREIGN_CONTACT_TARGET && request.status === 200), "the fixture served the foreign contact body");
+});
+
+test("class 10: a single object carrying a documented member is kept whatever else it carries, and a 404 stays null", async () => {
+  const supportOnly = { ...createSampleClient(), async getOktaSupportSettings() { return { support: "DISABLED", expiration: null, foo: FOREIGN_BODY_CANARY }; } };
+  const kept = await collectOktaAdminAccessData(supportOnly);
+  assert.equal(kept.oktaSupportAccess.notCollected, undefined, "a body with the documented member is the resource");
+  assert.equal(kept.oktaSupportAccess.data.support, "DISABLED");
+  assert.equal(statusOf(assessOktaAdminAccess(kept, createSampleConfig()), "OKTA-ADMIN-006"), "Pass");
+
+  const foreign = { ...createSampleClient(), async getThreatInsight() { return FOREIGN_JSON_BODY; } };
+  const monitoring = await collectOktaMonitoringData(foreign);
+  assert.equal(monitoring.threatInsight.data, null, "the fallback stays in memory, never the body");
+  assert.equal(monitoring.threatInsight.notCollected.status, 200);
+  assert.equal(monitoring.threatInsight.notCollected.endpoint, "/api/v1/threats/configuration");
+  assert.match(monitoring.threatInsight.error, /none of action, mode, settings, excludeZones present/);
+  assert.ok(!JSON.stringify(monitoring).includes(FOREIGN_BODY_CANARY));
+
+  const absent = await collectOktaMonitoringData({ ...createSampleClient(), async getThreatInsight() { return null; } });
+  assert.equal(absent.threatInsight.data, null);
+  assert.equal(absent.threatInsight.notCollected, undefined, "a 404 (null) is an absent feature, not a shape failure");
+});

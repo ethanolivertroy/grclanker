@@ -2821,3 +2821,97 @@ test("item 7: once a client is constructed its configured access key and the Bas
   );
   assert.equal(redactSnapshot("access id suREGISTRY is an identifier"), "access id suREGISTRY is an identifier", "the access id is not registered");
 });
+
+const FOREIGN_BODY_CANARY = "yln2bVNl4tE9Cyp1B18V2mX7";
+const FOREIGN_BEARER_CANARY = "Qw8Zr2Lm5Pk1Vt7Xy3Nb6Hd9";
+const FOREIGN_JSON_BODY = { foo: FOREIGN_BODY_CANARY, items: [{ password: FOREIGN_BODY_CANARY, description: `Authorization: Bearer ${FOREIGN_BEARER_CANARY}` }] };
+/** Every single-object surface by its rawData name, the core_data file that carries it, and the finding that reads it (null when no finding is gated on it alone). */
+const SUMOLOGIC_OBJECT_SURFACES = [
+  ["account_status", "/api/v1/account/status", "data-governance.json", null],
+  ["password_policy", "/api/v1/passwordPolicy", "identity.json", "SUMO-03"],
+  ["service_allowlist_status", "/api/v1/serviceAllowlist/status", "access-control.json", "SUMO-13"],
+  ["audit_policy", "/api/v1/policies/audit", "data-governance.json", "SUMO-09"],
+  ["search_audit_policy", "/api/v1/policies/searchAudit", "data-governance.json", null],
+  ["share_dashboards_outside_organization_policy", "/api/v1/policies/shareDashboardsOutsideOrganization", "content-sharing.json", "SUMO-19"],
+  ["data_access_level_policy", "/api/v1/policies/dataAccessLevel", "content-sharing.json", "SUMO-11"],
+  ["user_concurrent_sessions_limit_policy", "/api/v1/policies/userConcurrentSessionsLimit", "access-control.json", null],
+  ["max_user_session_timeout_policy", "/api/v1/policies/maxUserSessionTimeout", "access-control.json", "SUMO-14"],
+  ["access_keys_lifetime_policy", "/api/v1/policies/accessKeysLifetime", "access-control.json", null],
+  ["personal_folder", "/api/v2/content/folders/personal", "content-sharing.json", null],
+];
+
+/** Serves the foreign JSON document with a 200 at the given paths and the healthy fixtures everywhere else. */
+function foreignJsonFetch(paths) {
+  const routes = healthyRoutes();
+  const requests = [];
+  const fetchImpl = async (input, init = {}) => {
+    const url = new URL(typeof input === "string" ? input : input.toString());
+    const foreign = paths.includes(url.pathname);
+    if (!foreign) assert.ok(url.pathname in routes, `unexpected request to ${url.pathname}`);
+    const response = jsonResponse(foreign ? FOREIGN_JSON_BODY : routes[url.pathname]);
+    requests.push({ method: init.method ?? "GET", path: url.pathname, status: response.status });
+    return response;
+  };
+  return { fetchImpl, requests };
+}
+
+test("class 10: a 200 body that is not the expected object is a not-collected marker in core_data, the assess payload, and the access check, its findings render manual, and no part of the body reaches any output", async () => {
+  const { fetchImpl, requests } = foreignJsonFetch([...SUMOLOGIC_OBJECT_SURFACES.map(([, path]) => path), "/api/v2/content/c1/permissions"]);
+  const client = new SumologicApiClient(sampleConfig(), { fetchImpl, sleepImpl: async () => {}, maxRetries: 0 });
+  const access = await checkSumologicAccess(client);
+  const results = await allAssessments(client);
+  const exported = await exportSumologicAuditBundle(client, sampleConfig(), createTempBase("grclanker-sumo-foreign-"), { now: NOW });
+  const outputs = sumologicOutputs(access, results, exported);
+  for (const [name, text] of readZipEntries(exported.zipPath)) outputs.set(`zip ${name}`, text);
+
+  const shapeError = /^Sumo Logic request to \/v[12]\/[A-Za-z/]+ returned a 200 body that is not the expected object \(none of [A-Za-z, ]+ present\), so the response was not recorded$/;
+  for (const [dataset, path, areaFile, findingId] of SUMOLOGIC_OBJECT_SURFACES) {
+    const entry = JSON.parse(readFileSync(join(exported.outputDir, "core_data", areaFile), "utf8"))[dataset];
+    assert.ok(entry, `${dataset}: written to core_data/${areaFile}`);
+    assert.equal(entry.ok, false, `${dataset}: a body that is not the resource is not ok`);
+    assert.equal(entry.complete, null, dataset);
+    assert.equal(entry.count, null, dataset);
+    assert.equal(entry.http_status, 200, `${dataset}: the marker keeps the observed status`);
+    assert.equal(entry.endpoint, path.replace(/^\/api/, ""), dataset);
+    assert.deepEqual(entry.data, { collected: false, status: 200, endpoint: entry.endpoint, error: entry.error }, `${dataset}: the data slot is the marker, never the body`);
+    assert.match(entry.error, shapeError, dataset);
+    const rawEntry = results.find((result) => result.rawData[dataset])?.rawData[dataset];
+    assert.deepEqual(rawEntry.data, entry.data, `${dataset}: the assess payload carries the same marker`);
+    const surface = access.surfaces.find((item) => item.name === dataset);
+    if (surface) {
+      assert.equal(surface.status, "not_readable", dataset);
+      assert.equal(surface.count, null, dataset);
+      assert.equal(surface.complete, null, dataset);
+      assert.equal(surface.httpStatus, 200, dataset);
+      assert.match(surface.error, shapeError, dataset);
+    }
+    if (findingId) {
+      const finding = results.flatMap((result) => result.findings).find((item) => item.id === findingId);
+      assert.equal(finding.status, "manual", `${findingId} is manual, never pass or fail, over a body that is not the resource`);
+      assert.match(finding.summary, /could not be read because the endpoint returned a 200 body that is not the expected object/, findingId);
+      assert.equal(finding.evidence.http_status, 200, findingId);
+    }
+  }
+  assert.equal(access.surfaces.filter((surface) => surface.status === "not_readable").length, 5, "the five probed object surfaces read not_readable");
+  const permissions = results.find((result) => result.area === "content-sharing").rawData.content_permissions;
+  assert.ok(JSON.stringify(permissions).includes("returned a 200 body that is not the expected object"), "a permission lookup body that is not the resource is a failed lookup");
+
+  for (const [name, text] of outputs) {
+    assert.ok(!text.includes(FOREIGN_BODY_CANARY), `${name}: the foreign body's member value never reaches an output`);
+    assert.ok(!text.includes(FOREIGN_BEARER_CANARY), `${name}: the foreign body's bearer token never reaches an output`);
+    assert.ok(!/TypeError|ReferenceError|Cannot read properties|is not a function/.test(text), `${name}: a foreign body never surfaces as a runtime error`);
+  }
+  assertOutputsNameOnlyObservedRequests(outputs, requests, "foreign JSON");
+});
+
+test("class 10: a single object carrying a documented member is kept whatever else it carries", async () => {
+  const routes = healthyRoutes();
+  routes["/api/v1/policies/audit"] = { enabled: true, foo: FOREIGN_BODY_CANARY };
+  const client = new SumologicApiClient(sampleConfig(), { fetchImpl: async (input) => jsonResponse(routes[new URL(input.toString()).pathname]), sleepImpl: async () => {}, maxRetries: 0 });
+  const audit = await client.getPolicy("audit");
+  assert.equal(audit.ok, true, "a body with the documented member is the resource");
+  assert.equal(audit.data.enabled, true);
+  const governance = await assessSumologicDataGovernance(client, { now: NOW });
+  assert.equal(byId(governance, "SUMO-09").status, "pass");
+  assert.ok(!JSON.stringify(governance.findings).includes(FOREIGN_BODY_CANARY), "an undocumented member never reaches a finding");
+});
