@@ -927,7 +927,10 @@ const readCookieHeaderValue: ValueReader = (text, valueStart, carrier) => {
  * Reads the value after a bare scheme word in free text: a quoted value goes whole when it begins like
  * a credential; a bare value goes unless it is one of the prose shapes (see `looksLikeSchemeValue`).
  * After a lowercase English-word spelling (`basic`, `token`, `digest`, `oauth`, `splunk`) a bare or
- * quoted value goes only when it cannot be a word or a name.
+ * quoted value goes only when it cannot be a word or a name. A marker an earlier rule left glued to
+ * the bare run is part of it: the pair rules run first and have turned `Token token=<key>` into
+ * `Token token=[REDACTED]`, so the run `token=` and its marker go as one (`Token [REDACTED]`) rather
+ * than as `[REDACTED][REDACTED]`.
  */
 const readSchemeValue: ValueReader = (text, valueStart, carrier) => {
   const lowercaseScheme = LOWERCASE_SCHEME_WORDS.has(carrier[0].trim());
@@ -942,7 +945,7 @@ const readSchemeValue: ValueReader = (text, valueStart, carrier) => {
   if (bare === null) return null;
   const value = bare.replace(CLAUSE_PUNCTUATION_PATTERN, "");
   if (value.length < SCHEME_VALUE_MIN_LENGTH || !looksLikeSchemeValue(value, lowercaseScheme)) return null;
-  return { end: valueStart + value.length, replacement: REDACTED };
+  return { end: absorbMarkers(text, valueStart + value.length), replacement: REDACTED };
 };
 
 /**

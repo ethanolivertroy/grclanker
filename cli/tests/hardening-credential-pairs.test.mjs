@@ -655,6 +655,13 @@ test("CodeRabbit r4078025849 (#63): a scheme word in front of a credential-named
     ["password: Bearer, retry later", `password: ${REDACTED}, retry later`],
     ['{"detail":"password: Bearer"}', `{"detail":"password: ${REDACTED}"}`],
     [`--password Bearer ${token} -h db`, `--password ${REDACTED} -h db`],
+    // A scheme word in front of a credential-named pair in free text (PagerDuty's `Token token=<key>`)
+    // renders one marker, as on main: the pair rule scrubs the value first and the scheme-word rule
+    // takes the `token=` run with the marker glued to it.
+    [`sent Token token=${token} to PagerDuty`, `sent Token ${REDACTED} to PagerDuty`],
+    ["Token token=abc123 rest", `Token ${REDACTED} rest`],
+    ["Basic sid=abc123 rest", `Basic ${REDACTED} rest`],
+    [`Authorization: Token token=${token}`, `Authorization: Token ${REDACTED}`],
     // A header keeps its scheme word, as does an Authorization-style key the generic rule reads.
     [`Authorization: Bearer ${token}`, `Authorization: Bearer ${REDACTED}`],
     [`Proxy-Authorization: Basic ${token}`, `Proxy-Authorization: Basic ${REDACTED}`],
