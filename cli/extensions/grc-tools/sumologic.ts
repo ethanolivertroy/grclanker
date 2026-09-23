@@ -816,11 +816,11 @@ const LEADING_SCHEME_IN_VALUE = /^([A-Za-z][A-Za-z0-9-]*)(\s+)(\S[\s\S]*)$/;
 const PAIR_LIST_START = /^[A-Za-z][A-Za-z0-9_.-]*=/;
 // After a bare path label the text is prose ("/api/v1/api-tokens: request failed with 403",
 // "/oauth/token-request: invalid_client") and stays, unless the segment itself names a credential
-// in the singular (its last word is password, key, secret, token, or passphrase, or it is a bearer
-// id): then the next token is the value whatever its shape and whatever follows it
+// in the singular (its last word is password, key, secret, token, passphrase, or assertion, or it is
+// a bearer id): then the next token is the value whatever its shape and whatever follows it
 // ("kv/password: <value> [code 003001]"), while a plural label ("api-tokens", "secrets") names a
 // collection and its colon continues as prose.
-const CREDENTIAL_NOUN_PATTERN = /(?:password|passwd|passphrase|pwd|secret|token|key)$/;
+const CREDENTIAL_NOUN_PATTERN = /(?:password|passwd|passphrase|pwd|secret|token|key|assertion)$/;
 // A credential-named flag whose value is the next argument (`psql --password <value> -h db`), as a
 // spawned CLI echoes its command line; `--name=value` is a pair and is read by the pair rule.
 const FLAG_VALUE_PATTERN = new RegExp(String.raw`(?<![A-Za-z0-9_-])--([A-Za-z][A-Za-z0-9_.-]{0,63})([ \t]+)(?!\[REDACTED\])(?!-)([^\s"'<>;,&()[\]{}\\]+)`, "g");
