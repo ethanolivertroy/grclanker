@@ -2395,6 +2395,80 @@ test("reviewer E gap 10: a quote inside a token is content of a cookie, pair, at
   assert.equal(cases, 2 * GAP10_ROWS.length * GAP10_VALUES.length);
 });
 
+// Reviewer E finding C: an Authorization or Proxy-Authorization value whose first word is not
+// a listed scheme word (Bot, GenieKey, Zoho-oauthtoken, Api-Token, SharedKey, LOW, AWS, Key,
+// Element, HMAC) goes whole, to the end of the line or to the next header on a compound
+// line, in both scrubs: the unknown word may be a scheme with its credentials after it, so
+// nothing after it is trusted. A single-token header whose value opens with a listed scheme
+// word (X-Auth-Token: Bearer <v>, X-Api-Key: Token <v>) loses the word and the token after it
+// under one marker, so the token is never left standing after the marker while prose after
+// the token stays. A listed scheme under Authorization keeps its word and loses the one
+// token after it. The values are shapes the long-token rule does not catch (a UUID, a dotted
+// token, short values) beside one it does; each row is read bare, as a JSON string member,
+// and on an escaped line, and the text around the header survives.
+const FINDING_C_VALUES = ["eb243592-faa2-4ba2-a551-1afdf565c889", "MTA1MjQ4NDQ2NzI2.GhYz9q.r0tAt3dT0k3nV4lu3", "a1b2c3d4e5f", "hunter2x", "Kq7Zx2Vw9Lm4Tp8Rq3Wn6Yb1Xc5Vd8Fg"];
+const FINDING_C_ROWS = [
+  // an unlisted first word, or no word at all: the whole value goes
+  [(v) => `Authorization: Bot ${v}`, () => "Authorization: [REDACTED]"],
+  [(v) => `Authorization: GenieKey ${v}`, () => "Authorization: [REDACTED]"],
+  [(v) => `Authorization: Zoho-oauthtoken ${v}`, () => "Authorization: [REDACTED]"],
+  [(v) => `Authorization: Zoho-enczapikey ${v}`, () => "Authorization: [REDACTED]"],
+  [(v) => `Authorization: Api-Token ${v}`, () => "Authorization: [REDACTED]"],
+  [(v) => `Authorization: Key ${v}`, () => "Authorization: [REDACTED]"],
+  [(v) => `Authorization: Element ${v}`, () => "Authorization: [REDACTED]"],
+  [(v) => `Authorization: HMAC ${v}`, () => "Authorization: [REDACTED]"],
+  [(v) => `Authorization: SharedKey account:${v}`, () => "Authorization: [REDACTED]"],
+  [(v) => `Authorization: LOW ${v}:${v}`, () => "Authorization: [REDACTED]"],
+  [(v) => `Authorization: AWS AKIAIOSFODNN7EXAMPLE:${v}`, () => "Authorization: [REDACTED]"],
+  [(v) => `Proxy-Authorization: Bot ${v}`, () => "Proxy-Authorization: [REDACTED]"],
+  [(v) => `Authorization: GenieKey ${v} was rejected`, () => "Authorization: [REDACTED]"],
+  [(v) => `Authorization: ${v} was rejected`, () => "Authorization: [REDACTED]"],
+  [(v) => `Authorization: 12345 ${v}`, () => "Authorization: [REDACTED]"],
+  [(v) => `Authorization: GenieKey ${v}, X-Api-Key: ${v}; Date: Tue, 22 Sep 2026 18:00:00 GMT`, () => "Authorization: [REDACTED], X-Api-Key: [REDACTED]; Date: Tue, 22 Sep 2026 18:00:00 GMT"],
+  // a single-token header whose value opens with a listed scheme word: the word and the token go together
+  [(v) => `X-Auth-Token: Bearer ${v}`, () => "X-Auth-Token: [REDACTED]"],
+  [(v) => `X-Api-Key: Token ${v}`, () => "X-Api-Key: [REDACTED]"],
+  [(v) => `X-Auth-Token: Bearer ${v} rejected`, () => "X-Auth-Token: [REDACTED] rejected"],
+  [(v) => `X-Api-Key: Token ${v} then retry`, () => "X-Api-Key: [REDACTED] then retry"],
+  [(v) => `X-Api-Key: ApiKey ${v}; Content-Type: application/json`, () => "X-Api-Key: [REDACTED]; Content-Type: application/json"],
+  // controls: a listed scheme under Authorization keeps its word and loses the one token
+  // after it, or its whole parameter list; a bare token under a single-token header goes alone
+  [(v) => `Authorization: Bearer ${v} was rejected`, () => "Authorization: Bearer [REDACTED] was rejected"],
+  [(v) => `Proxy-Authorization: Basic ${v} was rejected`, () => "Proxy-Authorization: Basic [REDACTED] was rejected"],
+  [(v) => `Authorization: SSWS ${v}`, () => "Authorization: SSWS [REDACTED]"],
+  [(v) => `Authorization: AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/20260922/us-east-1/s3/aws4_request, SignedHeaders=host, Signature=${v}`, () => "Authorization: AWS4-HMAC-SHA256 [REDACTED]"],
+  [(v) => `X-Auth-Token: ${v} rejected`, () => "X-Auth-Token: [REDACTED] rejected"],
+];
+const FINDING_C_CONTEXTS = [
+  ["bare", (line) => line],
+  ["JSON member", (line) => `{"detail":"${line}","code":401}`],
+  ["escaped line", (line) => `request failed\\n${line}\\nContent-Type: application/json`],
+];
+const FINDING_C_CONTROLS = [
+  "Proxy-Authorization: [REDACTED]; Content-Type: application/json",
+  "X-Auth-Token: [REDACTED] rejected",
+  'Authorization: "Bearer [REDACTED]" was rejected',
+  "Basic authentication is required; the Bearer token is missing; Content-Type: application/json, Date: Tue, 22 Sep 2026 18:00:00 GMT",
+];
+
+test("reviewer E finding C: an Authorization value with an unlisted first word goes whole, a single-token header that opens with a listed scheme word loses the word and the token together, and a listed scheme under Authorization keeps its word, in both scrubs, bare, as a JSON member, and on an escaped line", () => {
+  let cases = 0;
+  for (const scrub of [redactErrorText, redactCredentialValueText]) {
+    for (const [make, expect] of FINDING_C_ROWS) for (const value of FINDING_C_VALUES) for (const [context, wrap] of FINDING_C_CONTEXTS) {
+      const input = wrap(make(value));
+      const out = scrub(input);
+      const label = `reviewer E finding C: ${scrub.name} ${context} ${JSON.stringify(input)}`;
+      assert.equal(out, wrap(expect(value)), label);
+      assertNoWindow(out, value, label);
+      assert.ok(!out.includes("AKIAIOSFODNN7EXAMPLE"), `${label}: the access key id half of a SigV2 value survived in ${out}`);
+      assert.equal(scrub(out), out, `${label}: not idempotent on ${out}`);
+      cases += 1;
+    }
+    for (const text of FINDING_C_CONTROLS) assert.equal(scrub(text), text, `reviewer E finding C: ${scrub.name} changed a control: ${text}`);
+  }
+  assert.equal(cases, 2 * FINDING_C_ROWS.length * FINDING_C_VALUES.length * FINDING_C_CONTEXTS.length);
+});
+
 test("scrub boundary: name-shaped values stay bare in prose, leave every carrier whatever their shape, and go as configured secrets in every form", () => {
   for (const value of NAME_SHAPED_VALUES) {
     for (const prose of [`inventory ${value} was not read`, `${value}`, `webhook ${value} read 12 of 40 destinations`, `path /var/lib/${value}/state`]) {

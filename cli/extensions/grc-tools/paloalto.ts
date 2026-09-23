@@ -539,12 +539,17 @@ const FOLLOWING_HEADER_LOOKAHEAD = 96;
 // casing): the word stays as spelled and the one token (or one quoted string) after it
 // goes, so the operator still reads which scheme was replayed and prose after the token
 // stays; a parameter list after the scheme (Digest username=..., realm=...) goes whole, as
-// does a value that opens with anything else. A cookie header, or Tenable's X-ApiKeys
-// (accessKey=...; secretKey=...), is a list of pairs and goes whole. Every other header
-// (X-Api-Key, X-Auth-Token, X-Vault-Token, ...) carries one token: an unquoted value ends at
-// the first whitespace, so a JSON fragment or prose after it on the same line
-// ({"status":"denied"}, "rejected") is still read; a quoted value ends at its closing quote
-// whatever it holds.
+// does a value that opens with anything else (a scheme word the list does not know, such
+// as GenieKey, SharedKey, or Bot, a bare token, a digit), to the end of the line: an
+// unknown first word may be a scheme with its credentials after it, so nothing after it
+// is trusted. A cookie header, or Tenable's X-ApiKeys (accessKey=...; secretKey=...), is
+// a list of pairs and goes whole. Every other header (X-Api-Key, X-Auth-Token,
+// X-Vault-Token, ...) carries one token: an unquoted value ends at the first whitespace,
+// so a JSON fragment or prose after it on the same line ({"status":"denied"}, "rejected")
+// is still read; a value that opens with a listed scheme word (X-Auth-Token: Bearer <v>)
+// is the word and the token after it together, and both go under the one marker, as the
+// scheme word is part of the value under any key but Authorization; a quoted value ends
+// at its closing quote whatever it holds.
 const AUTHORIZATION_HEADERS = new Set(["authorization", "proxy-authorization"]);
 const LIST_VALUE_HEADERS = new Set(["cookie", "set-cookie", "x-cookie", "x-apikeys", "x-apikey"]);
 const AUTH_SCHEME_WORDS = new Set([
@@ -984,32 +989,55 @@ function keepsSchemeWord(key: string, value: string): boolean {
   return scheme !== null && AUTH_SCHEME_WORDS.has(scheme[1].toLowerCase());
 }
 
-// Where the value of a single-token header ends: an unquoted value at its first whitespace,
-// a quoted one where headerValueEnd put it.
-function singleTokenEnd(text: string, start: number, end: number): number {
-  const value = text.slice(start, end);
-  if (enclosingQuote(value) !== "") return end;
-  return start + (/^\S*/.exec(value)?.[0].length ?? 0);
+// The listed scheme word a header value opens with, when a token follows it, or undefined:
+// for a bare scheme word, a word the list does not know, or a value that opens with anything
+// but a word.
+function leadingSchemeWord(value: string): RegExpExecArray | undefined {
+  const scheme = AUTH_SCHEME_PATTERN.exec(value);
+  if (!scheme || scheme[0].length === value.length || !AUTH_SCHEME_WORDS.has(scheme[1].toLowerCase())) return undefined;
+  return scheme;
 }
 
-// Where an Authorization value ends: after the scheme word and the one token (or one quoted
-// string) of credentials that follows it, so prose after the token on a free-text line
-// stays; a parameter list after the scheme (Digest username=..., realm=...) goes to the end
-// of the line, as does a value quoted as a whole or without a scheme word.
-function authorizationValueEnd(text: string, start: number, end: number): number {
-  const value = text.slice(start, end);
-  if (enclosingQuote(value) !== "") return end;
-  const scheme = AUTH_SCHEME_PATTERN.exec(value);
-  if (!scheme || !AUTH_SCHEME_WORDS.has(scheme[1].toLowerCase())) return singleTokenEnd(text, start, end);
-  const credentialsStart = start + scheme[0].length;
-  const credentials = value.slice(scheme[0].length);
-  if (credentials.length === 0 || AUTH_PARAM_LIST_PATTERN.test(credentials)) return end;
+// Where the credentials after a scheme word end, credentialsStart being the index after the
+// word and the whitespace behind it: a parameter list (username=..., realm=...) runs to end,
+// a quoted string to the quote that closes it (or to end when nothing does), and a bare
+// token to its first whitespace.
+function schemeCredentialsEnd(text: string, credentialsStart: number, end: number): number {
+  const credentials = text.slice(credentialsStart, end);
+  if (AUTH_PARAM_LIST_PATTERN.test(credentials)) return end;
   const quote = quoteTokenAt(credentials, 0);
   if (quote !== undefined) {
     const close = closingQuoteIndex(text, credentialsStart + quote.length, quote, end);
     return close === -1 ? end : close + quote.length;
   }
   return credentialsStart + (/^\S*/.exec(credentials)?.[0].length ?? 0);
+}
+
+// Where the value of a single-token header ends: an unquoted value at its first whitespace,
+// a quoted one where headerValueEnd put it. A value that opens with a listed scheme word
+// and a token (X-Auth-Token: Bearer <token>) is the word and the credentials after it, as
+// it would be under Authorization, so the token is never left standing after the marker.
+function singleTokenEnd(text: string, start: number, end: number): number {
+  const value = text.slice(start, end);
+  if (enclosingQuote(value) !== "") return end;
+  const scheme = leadingSchemeWord(value);
+  if (scheme !== undefined) return schemeCredentialsEnd(text, start + scheme[0].length, end);
+  return start + (/^\S*/.exec(value)?.[0].length ?? 0);
+}
+
+// Where an Authorization value ends: after the listed scheme word and the one token (or one
+// quoted string) of credentials that follows it, so prose after the token on a free-text
+// line stays; a parameter list after the scheme (Digest username=..., realm=...) goes to the
+// end of the line, as does a value quoted as a whole, a bare scheme word, and a value that
+// opens with anything but a listed scheme word (GenieKey <token>, SharedKey account:<sig>,
+// a bare token): the first word may be a scheme the list does not know, with its credentials
+// after it, so the whole line goes.
+function authorizationValueEnd(text: string, start: number, end: number): number {
+  const value = text.slice(start, end);
+  if (enclosingQuote(value) !== "") return end;
+  const scheme = leadingSchemeWord(value);
+  if (scheme === undefined) return end;
+  return schemeCredentialsEnd(text, start + scheme[0].length, end);
 }
 
 // The replacement for a header value, or undefined when nothing is left to remove: the value
@@ -1036,10 +1064,12 @@ function redactedHeaderValue(header: string, value: string): string | undefined 
 }
 
 // Every credential-bearing header line loses its credentials whatever their shape, by the
-// header's class: an Authorization value keeps its scheme word and loses the token after it
-// (or its whole parameter list), a cookie or key list goes whole, and a single-token header
-// loses its first token. On a compound line each header is its own line: the value of one
-// ends before the name of the next, which is then matched and treated on its own.
+// header's class: an Authorization value keeps its listed scheme word and loses the token
+// after it (or its whole parameter list), or goes whole when it opens with anything else; a
+// cookie or key list goes whole; and a single-token header loses its first token, or the
+// listed scheme word and the token after it when it opens with one. On a compound line each
+// header is its own line: the value of one ends before the name of the next, which is then
+// matched and treated on its own.
 function scrubHeaderLines(text: string): string {
   HEADER_LINE_PATTERN.lastIndex = 0;
   let out = "";
