@@ -1231,6 +1231,155 @@ test("URL rule: a URL written with JSON-escaped slashes loses its userinfo and q
   assert.equal(scrubber.scrub('{"url":"https:\\/\\/api.example.com\\/v1"}'), '{"url":"https:\\/\\/api.example.com\\/v1"}', "an escaped URL with nothing to remove is unchanged");
 });
 
+// ---------------------------------------------------------------------------------------------------------------
+// Query values (Codex P1 on #81, shared by 76a0d8c on this branch): a ";" inside a query value is part of the value, as
+// URLSearchParams reads it, so `?token=<v>;<rest>` renders `?token=[REDACTED]` with no tail. The ";" boundary belongs
+// to the Cookie and Set-Cookie readers alone, which run before the query rule. Main (b47f90d) renders the query value
+// whole; the boundary was introduced on this branch, so these rows pin the return to main's rendering.
+// ---------------------------------------------------------------------------------------------------------------
+
+/** The head of a query value and the part of it after a ";"; both are random and both must go. */
+const QUERY_VALUE_CANARIES = ["hSfz6qWpLmKt4vbGx9uz", "Rj8UwPnZfkuMbGq3Ta5d"];
+
+/** [label, carrier(head, tail), text that must survive around the marker]. The tail is the part of the value after the ";". */
+const QUERY_SEMICOLON_CARRIERS = [
+  ["relative request line", (head, tail) => `GET /v1/users?token=${head};${tail} HTTP/1.1`, ["GET /v1/users?token=", " HTTP/1.1"]],
+  ["relative with a following parameter", (head, tail) => `/v1/users?token=${head};${tail}&page=2`, ["/v1/users?token=", "&page=2"]],
+  ["later parameter", (head, tail) => `/v1/users?page=2&access_token=${head};${tail} rejected`, ["/v1/users?page=2&access_token=", " rejected"]],
+  ["absolute URL", (head, tail) => `retry at https://api.example.com/v1/users?token=${head};${tail}&page=2 later`, ["https://api.example.com", " later"]],
+  ["JSON-escaped relative", (head, tail) => `{"url":"/v1/users?token=${head};${tail}"}`, ['{"url":"/v1/users?token=', '"}']],
+  ["JSON-escaped relative after an escape", (head, tail) => `{"detail":"request failed\\n?sid=${head};${tail} see the log"}`, ['{"detail":"request failed\\n?sid=', ' see the log"}']],
+  ["slash-escaped absolute", (head, tail) => `{"url":"https:\\/\\/api.example.com\\/v1\\/users?token=${head};${tail}"}`, ['{"url":"https:\\/\\/api.example.com', '"}']],
+];
+
+/** Cookie headers whose ";" separates pairs and attributes: the whole header value goes, whatever the query rule sees first. */
+const COOKIE_SEMICOLON_CONTROLS = [
+  ["ampersand-led first pair", (value) => `Cookie: &sid=${value}; pref=b`, `Cookie: ${REDACTED}`],
+  ["first pair", (value) => `Cookie: sid=${value}; pref=b`, `Cookie: ${REDACTED}`],
+  ["Set-Cookie with attributes", (value) => `Set-Cookie: sid=${value}; Path=/; HttpOnly`, `Set-Cookie: ${REDACTED}`],
+  ["ampersand-led first pair before the next header", (value) => `Cookie: &sid=${value}; pref=b; Accept: application/json`, `Cookie: ${REDACTED}; Accept: application/json`],
+  ["query-shaped cookie value", (value) => `Cookie: sid=${value}?x=1&token=${value}; Path=/`, `Cookie: ${REDACTED}`],
+];
+
+test("query values: the planted head and tail look random and share no 6-character window with the rows or the must-keep strings", () => {
+  const legitimate = [
+    ...QUERY_SEMICOLON_CARRIERS.map(([label, carrier]) => [label, carrier("", "")]),
+    ...COOKIE_SEMICOLON_CONTROLS.map(([label, carrier]) => [`cookie ${label}`, carrier("")]),
+    ...MUST_KEEP.map((text, index) => [`must-keep ${index}`, text]),
+  ];
+  assertCanaryFixture(assert, QUERY_VALUE_CANARIES, legitimate, "query value rows");
+});
+
+test("query values: a ';' inside a query value is part of the value, so the head and the tail both go in relative, absolute, JSON-escaped, and slash-escaped forms through every text entry point, and the text around the value survives", () => {
+  const [head, tail] = QUERY_VALUE_CANARIES;
+  for (const [entryPoint, scrub] of TEXT_ENTRY_POINTS) {
+    for (const [label, carrier, survivors] of QUERY_SEMICOLON_CARRIERS) {
+      const scrubbed = scrub(carrier(head, tail));
+      assertRemoved(scrubbed, head, `${entryPoint}: ${label}, head`);
+      assertRemoved(scrubbed, tail, `${entryPoint}: ${label}, tail`);
+      assert.ok(!scrubbed.includes(`${REDACTED};`), `${entryPoint}: ${label}: a tail was left after the marker: ${scrubbed}`);
+      if (!URL_REDUCING_ENTRY_POINTS.has(entryPoint)) {
+        for (const survivor of survivors) assert.ok(scrubbed.includes(survivor), `${entryPoint}: ${label}: ${JSON.stringify(survivor)} did not survive: ${scrubbed}`);
+      }
+      assert.equal(scrub(scrubbed), scrubbed, `${entryPoint}: ${label}: a second pass changed the text`);
+    }
+    for (const [label, carrier, expected] of COOKIE_SEMICOLON_CONTROLS) {
+      assert.equal(scrub(carrier(head)), expected, `${entryPoint}: cookie ${label}`);
+    }
+  }
+  const scrubber = createCredentialScrubber();
+  assert.equal(scrubber.scrub(`GET /v1/users?token=${head};${tail} HTTP/1.1`), `GET /v1/users?token=${REDACTED} HTTP/1.1`);
+  assert.equal(scrubber.scrub(`/v1/users?token=${head};${tail}&page=2`), `/v1/users?token=${REDACTED}&page=2`);
+  assert.equal(scrubber.scrub(`https://api.example.com/v1/users?token=${head};${tail}&page=2`), `https://api.example.com/v1/users?${REDACTED}`);
+  assert.equal(scrubber.scrub(`{"url":"/v1/users?token=${head};${tail}"}`), `{"url":"/v1/users?token=${REDACTED}"}`);
+  assert.equal(scrubber.scrub(`{"url":"https:\\/\\/api.example.com\\/v1\\/users?token=${head};${tail}"}`), `{"url":"https:\\/\\/api.example.com\\/v1\\/users?${REDACTED}"}`);
+  assert.equal(scrubber.scrub(`see ?token=${head}; then`), `see ?token=${REDACTED} then`, "a ';' that ends the value is part of it too");
+  assert.equal(scrubber.scrub(`?token=${head};${tail}#fragment`), `?token=${REDACTED}`, "the fragment after a credential value goes with the value, as before");
+  assert.equal(scrubber.scrub(`?page=2;per_page=50`), `?page=2;per_page=50`, "a ';' in a value under a non-credential name changes nothing");
+});
+
+// ---------------------------------------------------------------------------------------------------------------
+// Quoted auth-params after a scheme word (CodeRabbit on #81, r4081238237): `Authorization: Snowflake Token="v"` is a
+// scheme word and an auth-param list, not a scheme word and a bare token, so the header reader takes the list whole and
+// the quoted value never stands beside the marker. The same holds for any `<Scheme> <Key>="v"` shape, for the quoted
+// auth-params after Digest, OAuth 1.0, and SigV4, and for an unregistered scheme in front of a list. A WWW-Authenticate
+// challenge is no carrier, so its `realm="api"` stays. Main (b47f90d) leaks the Bearer and Digest forms; the Snowflake
+// form held there only because main does not read `snowflake` as a scheme word.
+// ---------------------------------------------------------------------------------------------------------------
+
+/** Random values planted as the quoted auth-param values; two so the nonce and response of one Digest list are told apart. */
+const AUTH_PARAM_CANARIES = ["pQ7vRzk2WmTxLb4Ynd8H", "Zc3nKw9XrTq5LbVm2Hy7"];
+
+/** [label, carrier(value, second), exact rendering on the shared scrubber]. */
+const AUTH_PARAM_CARRIERS = [
+  ["Snowflake Token=", (value) => `Authorization: Snowflake Token="${value}"`, `Authorization: Snowflake ${REDACTED}`],
+  ["Bearer Token=", (value) => `Authorization: Bearer Token="${value}"`, `Authorization: Bearer ${REDACTED}`],
+  ["Token token= (PagerDuty)", (value) => `Authorization: Token token="${value}"`, `Authorization: Token ${REDACTED}`],
+  ["Digest auth-params", (value, second) => `Authorization: Digest username="alice", realm="api", nonce="${value}", uri="/v1", response="${second}"`, `Authorization: Digest ${REDACTED}`],
+  ["Digest auth-params, realm first", (value, second) => `Authorization: Digest realm="api", nonce="${value}", uri="/v1", response="${second}"`, `Authorization: Digest ${REDACTED}`],
+  ["OAuth 1.0 auth-params", (value, second) => `Authorization: OAuth oauth_consumer_key="${value}", oauth_signature_method="HMAC-SHA1", oauth_signature="${second}%3D"`, `Authorization: OAuth ${REDACTED}`],
+  ["SigV4 bare auth-params", (value, second) => `Authorization: AWS4-HMAC-SHA256 Credential=${value}/20130524/us-east-1/s3/aws4_request, SignedHeaders=host;range;x-amz-date, Signature=${second}`, `Authorization: AWS4-HMAC-SHA256 ${REDACTED}`],
+  ["unregistered scheme before a list", (value, second) => `Authorization: Hawk id="${value}", ts="1353832234", nonce="j4h3g2", mac="${second}"`, `Authorization: ${REDACTED}`],
+  ["Proxy-Authorization", (value) => `Proxy-Authorization: Snowflake Token="${value}"`, `Proxy-Authorization: Snowflake ${REDACTED}`],
+  ["API-key header", (value) => `X-Api-Key: Token="${value}"`, `X-Api-Key: ${REDACTED}`],
+  ["API-key header before an unregistered scheme", (value) => `X-Api-Key: Hawk id="${value}"`, `X-Api-Key: ${REDACTED}`],
+  ["single quotes and prose after", (value) => `Authorization: Snowflake Token='${value}' rejected`, `Authorization: Snowflake ${REDACTED} rejected`],
+  ["spaces around the equals sign", (value) => `Authorization: Snowflake Token = "${value}"`, `Authorization: Snowflake ${REDACTED}`],
+  ["after a JSON escape", (value) => `request failed\\nAuthorization: Snowflake Token="${value}" see the log`, `request failed\\nAuthorization: Snowflake ${REDACTED} see the log`],
+  ["inside a JSON string", (value) => `{"detail":"Authorization: Snowflake Token=\\"${value}\\""}`, `{"detail":"Authorization: Snowflake ${REDACTED}"}`],
+  ["Digest inside a JSON string with a member after it", (value, second) => `{"detail":"Authorization: Digest username=\\"alice\\", response=\\"${second}\\"","code":401}`, `{"detail":"Authorization: Digest ${REDACTED}","code":401}`],
+  ["truncated list", (value, second) => `Authorization: Digest username="alice", response="${second}`, `Authorization: Digest ${REDACTED}`],
+  ["compound line", (value, second) => `Authorization: Snowflake Token="${value}"; X-Api-Key: "${second}"`, `Authorization: Snowflake ${REDACTED}; X-Api-Key: "${REDACTED}"`],
+  ["scheme word in prose", (value) => `Bearer Token="${value}"`, `Bearer ${REDACTED}`],
+  ["Token token= in prose", (value) => `Token token="${value}"`, `Token ${REDACTED}`],
+  ["Authorization-style pair key", (value) => `auth_header: Snowflake Token="${value}"`, `auth_header: Snowflake ${REDACTED}`],
+  ["credential key whose run opens a quoted value", (value) => `BOX_CLIENT_SECRET=Token="${value}"`, `BOX_CLIENT_SECRET=${REDACTED}`],
+];
+
+/** Text the list reader must leave as it is: challenges, base64 padding before a closing quote, and the pairs after a pair's value. */
+const AUTH_PARAM_CONTROLS = [
+  ['WWW-Authenticate: Bearer realm="api", error="invalid_token"', 'WWW-Authenticate: Bearer realm="api", error="invalid_token"'],
+  ['WWW-Authenticate: Digest realm="api", qop="auth", algorithm=MD5', 'WWW-Authenticate: Digest realm="api", qop="auth", algorithm=MD5'],
+  ['Proxy-Authenticate: Basic realm="proxy"', 'Proxy-Authenticate: Basic realm="proxy"'],
+  ['{"detail":"Authorization: Basic YWJjZGU="}', `{"detail":"Authorization: Basic ${REDACTED}"}`],
+  ['{"detail":"Authorization: Basic YWJjZGU=","code":401}', `{"detail":"Authorization: Basic ${REDACTED}","code":401}`],
+  ["-H 'Authorization: Basic YWJjZGU=' -H 'Accept: json'", `-H 'Authorization: Basic ${REDACTED}' -H 'Accept: json'`],
+  ["Authorization: Basic dXNlcjpwYXNz==", `Authorization: Basic ${REDACTED}`],
+  ["Authorization: Bearer abc123def status=401 path=/v1", `Authorization: Bearer ${REDACTED} status=401 path=/v1`],
+  ["password=hunter2abcd user=alice", `password=${REDACTED} user=alice`],
+  ["client_secret=abc==, scope=read", `client_secret=${REDACTED}, scope=read`],
+];
+
+test("quoted auth-params: the planted values look random and share no 6-character window with the rows, the controls, or the must-keep strings", () => {
+  const legitimate = [
+    ...AUTH_PARAM_CARRIERS.map(([label, carrier]) => [label, carrier("", "")]),
+    ...AUTH_PARAM_CONTROLS.map(([text], index) => [`control ${index}`, text]),
+    ...MUST_KEEP.map((text, index) => [`must-keep ${index}`, text]),
+  ];
+  assertCanaryFixture(assert, AUTH_PARAM_CANARIES, legitimate, "auth-param rows");
+});
+
+test("quoted auth-params: a <Scheme> <Key>=\"v\" header value and the auth-params after Digest, OAuth, SigV4, or an unregistered scheme go whole, bare, after a JSON escape, and inside a JSON string, through every text entry point, and a challenge's realm stays", () => {
+  const [value, second] = AUTH_PARAM_CANARIES;
+  for (const [entryPoint, scrub] of TEXT_ENTRY_POINTS) {
+    for (const [label, carrier] of AUTH_PARAM_CARRIERS) {
+      const text = carrier(value, second);
+      const scrubbed = scrub(text);
+      if (text.includes(value)) assertRemoved(scrubbed, value, `${entryPoint}: ${label}`);
+      if (text.includes(second)) assertRemoved(scrubbed, second, `${entryPoint}: ${label}, second value`);
+      assert.ok(!/\[REDACTED\]\\*["'][A-Za-z0-9]/.test(scrubbed), `${entryPoint}: ${label}: a quoted value was left beside the marker: ${scrubbed}`);
+      assert.equal(scrub(scrubbed), scrubbed, `${entryPoint}: ${label}: a second pass changed the text`);
+    }
+    for (const [text, expected] of AUTH_PARAM_CONTROLS) assert.equal(scrub(text), expected, `${entryPoint}: control ${text}`);
+    const challenge = scrub(`WWW-Authenticate: Digest realm="api", nonce="${value}", qop="auth"`);
+    assertRemoved(challenge, value, `${entryPoint}: challenge nonce`);
+    assert.ok(challenge.startsWith('WWW-Authenticate: Digest realm="api", nonce='), `${entryPoint}: the challenge kept its realm: ${challenge}`);
+    assert.ok(challenge.endsWith(', qop="auth"'), `${entryPoint}: the challenge kept its qop: ${challenge}`);
+  }
+  const scrubber = createCredentialScrubber();
+  for (const [label, carrier, expected] of AUTH_PARAM_CARRIERS) assert.equal(scrubber.scrub(carrier(value, second)), expected, label);
+});
+
 const DATA_CANARIES = {
   tokensEntry: "BPt5mgDrRZ5YyLTHaQPepJUYQbGYRCjG",
   credentialsValue: "zSVNdtuTMXK9T7qXe8CEDEYXmJ9K6vVL",

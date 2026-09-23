@@ -237,11 +237,13 @@ const EMBEDDED_URL_PATTERN = /\b[a-z][a-z0-9+.-]*:(?:\/\/|\\\/\\\/)(?:\[REDACTED
 const ESCAPED_SLASH_PATTERN = /\\\//g;
 const TRAILING_PUNCTUATION_PATTERN = /[.,;:!?]+$/;
 
-// A relative path or bare query string: a credential-named parameter keeps its name and loses its value. A backslash
-// ends the value so a JSON-escaped closing quote is kept, and so does ";", which separates the next parameter in the
-// legacy query syntax and the next pair or attribute in a cookie header (`Cookie: &sid=v; pref=w`), so the cookie rule
-// still reads the header value to its end.
-const QUERY_PAIR_PATTERN = /([?&])([A-Za-z0-9_.[\]-]+)=(?!\[REDACTED\])([^&#;\s"'<>\\]+)/g;
+// A relative path or bare query string: a credential-named parameter keeps its name and loses its value. The value
+// runs to the next parameter, the fragment, whitespace, or a quote or bracket that closes the text around it, and a
+// backslash ends it so a JSON-escaped closing quote is kept. A ";" inside the value is part of it, as URLSearchParams
+// reads it (`?token=<v>;<rest>` is one value and goes whole; Codex on #81): only the Cookie and Set-Cookie readers
+// treat ";" as a boundary, and they run before this rule so a header's `; pref=w` is read as its attribute rather than
+// taken off the header as the tail of a query value.
+const QUERY_PAIR_PATTERN = /([?&])([A-Za-z0-9_.[\]-]+)=(?!\[REDACTED\])([^&#\s"'<>\\]+)/g;
 
 // A carrier name must stand on its own: preceded by neither a word character nor "-", ".", or "/", so `sdk-keys:`,
 // `environment-token`, `settings.token`, and `GET /_security/api_key: 403` are names and paths, not carriers. Three
@@ -335,6 +337,22 @@ const HEADER_SCHEME_PATTERN = new RegExp(String.raw`(?:${HEADER_SCHEME_WORDS.joi
 // A bare header value runs to the first character that ends a header value in free text; a backslash ends it so a
 // JSON-escaped closing quote is kept.
 const HEADER_BARE_VALUE_PATTERN = /[^\s,;"'<>\\]+/y;
+
+// An RFC 7235 auth-param list after the scheme word of a credential header value (`Snowflake Token="v"`, `Digest
+// username="v", realm="api", nonce="v", response="v"`, `AWS4-HMAC-SHA256 Credential=v, SignedHeaders=host;range,
+// Signature=v`, `Hawk id="v", mac="v"`): comma-separated `name=value` parameters whose values are quoted or bare. The
+// list is the credential and goes whole with the run that opens it, so the quoted value after `Token=` is never left
+// standing beside the marker (CodeRabbit on #81, r4081238237). A bare parameter value may hold ";"
+// (`SignedHeaders=host;range`) but ends before a `;Name:` token, the next header on a compound line, and before "&"
+// or "}", which close a query pair or a JSON fragment around the value. The first parameter's quoted value must begin
+// like a value: after the "=" padding of a base64 credential (`Basic YWJjZGU="}`, `Basic YWJjZGU=", "next": 1`) the
+// quote closes the string the header sits in and opens no parameter. A word standing where the scheme would be
+// (`Hawk`) is an unregistered scheme when a parameter list follows it, and goes with the list.
+const AUTH_PARAM_NAME_PATTERN = /[A-Za-z][A-Za-z0-9_.-]*[ \t]*=[ \t]*/y;
+const AUTH_PARAM_BARE_VALUE_PATTERN = /[^\s,"'<>&}\\]+/y;
+const AUTH_PARAM_SEPARATOR_PATTERN = /[ \t]*,[ \t]*/y;
+const AUTH_PARAM_FIRST_VALUE_PATTERN = /^[^\s,;)\]}>]/;
+const SCHEME_TOKEN_PATTERN = /^[A-Za-z][A-Za-z0-9-]*$/;
 
 // Authorization scheme values in free text (`Bearer <value>`, `Basic <value>`, `Token <value>`, `ApiKey <value>`):
 // the value goes whatever its shape unless it is one plain word, which is prose ("Basic authentication is disabled",
@@ -806,13 +824,82 @@ function keepsSchemeWord(key: string): boolean {
   return segments.includes("authorization") || segments.includes("authenticate") || (segments.includes("auth") && segments.includes("header"));
 }
 
+/** Index just past a bare auth-param value starting at `start`: the run less a `;Name:` header cut and any trailing ";". */
+function authParamBareValueEnd(text: string, start: number): number {
+  const run = stickyExec(AUTH_PARAM_BARE_VALUE_PATTERN, text, start);
+  if (run === null) return start;
+  let length = run.length;
+  for (let cut = run.indexOf(";"); cut !== -1; cut = run.indexOf(";", cut + 1)) {
+    if (stickyExec(FOLLOWING_HEADER_PATTERN, text, start + cut) !== null) {
+      length = cut;
+      break;
+    }
+  }
+  while (length > 0 && run[length - 1] === ";") length -= 1;
+  return start + length;
+}
+
+/**
+ * Index just past the auth-param list that starts at `index`, or null when no parameter starts there. The first
+ * parameter's quoted value must begin like a value (see AUTH_PARAM_FIRST_VALUE_PATTERN); a later parameter's value
+ * goes whatever it holds, so `uri="/v1"` or `realm=""` in the middle of a Digest list does not end the list. Without
+ * `continueList` only the first parameter is read: outside a header value a comma after a pair's value starts the
+ * next pair of the line (`client_secret=abc==, scope=read`), not the next parameter of the same credential.
+ */
+function authParamListEnd(text: string, index: number, continueList: boolean): number | null {
+  let cursor = index;
+  let count = 0;
+  for (;;) {
+    const name = stickyExec(AUTH_PARAM_NAME_PATTERN, text, cursor);
+    if (name === null) break;
+    const valueStart = cursor + name.length;
+    const quoted = readQuotedValue(text, valueStart);
+    let valueEnd: number;
+    if (quoted !== null) {
+      if (count === 0 && !AUTH_PARAM_FIRST_VALUE_PATTERN.test(text.slice(quoted.start, quoted.end))) break;
+      valueEnd = quoted.after;
+    } else {
+      valueEnd = authParamBareValueEnd(text, valueStart);
+      if (valueEnd === valueStart) break;
+    }
+    cursor = valueEnd;
+    count += 1;
+    if (!continueList) break;
+    const separator = stickyExec(AUTH_PARAM_SEPARATOR_PATTERN, text, cursor);
+    if (separator === null || stickyExec(AUTH_PARAM_NAME_PATTERN, text, cursor + separator.length) === null) break;
+    cursor += separator.length;
+  }
+  return count === 0 ? null : cursor;
+}
+
+/**
+ * Index just past a bare carrier value that begins with `run` at `afterScheme`: the run itself, or the auth-param
+ * list it opens or stands in front of. The run opens a list when it is the first parameter's name and "=" (`Token=`
+ * before `"v"`) or a whole bare parameter (`Credential=v` before `, Signature=v`). In a header value (`headerValue`:
+ * under any credential header name, or under an Authorization-style pair key) the list continues over commas, and a
+ * run that is one word where no registered scheme was read is an unregistered scheme when a list follows it (`Hawk
+ * id="v", mac="v"`); under any other carrier only the parameter the run opens goes with it, since the pairs after a
+ * comma or a space belong to the line (`password=hunter2 user=alice`). Either way what is taken is credential
+ * material and goes with the run.
+ */
+function bareValueEndWithAuthParams(text: string, valueStart: number, afterScheme: number, run: string, headerValue: boolean): number {
+  const runEnd = afterScheme + run.length;
+  const opened = authParamListEnd(text, afterScheme, headerValue);
+  if (opened !== null && opened > runEnd) return opened;
+  if (!headerValue || afterScheme > valueStart || !SCHEME_TOKEN_PATTERN.test(run)) return runEnd;
+  let cursor = runEnd;
+  while (text[cursor] === " " || text[cursor] === "\t") cursor += 1;
+  return (cursor > runEnd ? authParamListEnd(text, cursor, true) : null) ?? runEnd;
+}
+
 /**
  * Reads the value of a header, session, or credential-named pair: a quoted value goes whole up to its closing quote
  * with the quotes kept; a bare value may carry a scheme word in front of it and then either a quoted value
- * (`Bearer "value"`) or a bare run. With `keepScheme` the scheme word is written back (`"Bearer value"` becomes
- * `"Bearer [REDACTED]"`); without it the word is part of the value and the marker covers both.
+ * (`Bearer "value"`), a bare run, or an auth-param list (`Token="value"`, `username="v", response="v"`), which goes
+ * whole in a header value and by its first parameter elsewhere. With `keepScheme` the scheme word is written back
+ * (`"Bearer value"` becomes `"Bearer [REDACTED]"`); without it the word is part of the value and the marker covers both.
  */
-function readCarrierValue(text: string, valueStart: number, barePattern: RegExp, keepScheme: boolean): ValueReplacement | null {
+function readCarrierValue(text: string, valueStart: number, barePattern: RegExp, keepScheme: boolean, headerValue: boolean): ValueReplacement | null {
   const quoted = readQuotedValue(text, valueStart);
   if (quoted !== null) {
     const content = text.slice(quoted.start, quoted.end);
@@ -830,18 +917,24 @@ function readCarrierValue(text: string, valueStart: number, barePattern: RegExp,
   }
   const bare = stickyExec(barePattern, text, afterScheme);
   if (bare === null || isBlankOrScrubbed(bare)) return null;
-  return { end: afterScheme + bare.length, replacement: `${kept}${REDACTED}` };
+  return { end: bareValueEndWithAuthParams(text, valueStart, afterScheme, bare, headerValue), replacement: `${kept}${REDACTED}` };
 }
 
 /**
  * The value of a credential header. The scheme word stays only under an Authorization-style name (`Authorization:
  * Bearer v`, `Proxy-Authorization: Basic v`); under an API-key or token header (`X-Api-Key: token rejected`,
- * `apiKey=splunk rejected`, `X-Vault-Token: splunk v`) a scheme word is the value's first word and goes with it.
+ * `apiKey=splunk rejected`, `X-Vault-Token: splunk v`) a scheme word is the value's first word and goes with it. An
+ * auth-param list goes whole under any header name; under a pair key only an Authorization-style key
+ * (`auth_header=Digest username="v", response="v"`) holds a header value, and any other pair's value ends at the
+ * parameter it opens so the next pair on the line keeps its own name.
  */
-const readHeaderValue: ValueReader = (text, valueStart, carrier) => readCarrierValue(text, valueStart, HEADER_BARE_VALUE_PATTERN, keepsSchemeWord(carrier[1]));
-const readPairValue: ValueReader = (text, valueStart, carrier) => readCarrierValue(text, valueStart, PAIR_BARE_VALUE_PATTERN, keepsSchemeWord(carrier[1]));
+const readHeaderValue: ValueReader = (text, valueStart, carrier) => readCarrierValue(text, valueStart, HEADER_BARE_VALUE_PATTERN, keepsSchemeWord(carrier[1]), true);
+const readPairValue: ValueReader = (text, valueStart, carrier) => {
+  const keepScheme = keepsSchemeWord(carrier[1]);
+  return readCarrierValue(text, valueStart, PAIR_BARE_VALUE_PATTERN, keepScheme, keepScheme);
+};
 /** The value after a credential-named `--flag`: read like a pair value once the flag's name is a credential key. */
-const readFlagValue: ValueReader = (text, valueStart, carrier) => (isCredentialKey(carrier[1]) ? readCarrierValue(text, valueStart, PAIR_BARE_VALUE_PATTERN, false) : null);
+const readFlagValue: ValueReader = (text, valueStart, carrier) => (isCredentialKey(carrier[1]) ? readCarrierValue(text, valueStart, PAIR_BARE_VALUE_PATTERN, false, false) : null);
 
 /** Index past any markers an earlier rule left at `index` (`Cookie: a=1&sid=[REDACTED]` after the query rule), so they fold into one. */
 function absorbMarkers(text: string, index: number): number {
@@ -852,9 +945,9 @@ function absorbMarkers(text: string, index: number): number {
 
 /**
  * Index just past a cookie pair's or attribute's value, which may be quoted. A marker an earlier rule left inside a
- * bare value (a configured secret or a query pair already replaced), or after an apostrophe inside it (`O'[REDACTED]`),
- * is stepped over, so the attributes after it (`; Path=/`) still belong to the header value rather than surviving
- * beside the marker.
+ * bare value (a configured secret or an embedded URL's query already replaced), or after an apostrophe inside it
+ * (`O'[REDACTED]`), is stepped over, so the attributes after it (`; Path=/`) still belong to the header value rather
+ * than surviving beside the marker.
  */
 function cookieValueEnd(text: string, index: number): number {
   const quoted = readQuotedValue(text, index);
@@ -897,7 +990,8 @@ const readCookieHeaderValue: ValueReader = (text, valueStart) => {
 
 /**
  * Reads the value after a bare scheme word in free text: a quoted value goes whole when it begins like a credential;
- * a bare value goes unless it is one plain word.
+ * a bare value goes unless it is one plain word or a challenge's auth-param (`Bearer realm="api"`), and when it opens
+ * an auth-param list that is not a challenge (`Bearer Token="v"`) the list goes whole.
  */
 const readSchemeValue: ValueReader = (text, valueStart, carrier) => {
   const scheme = carrier[1];
@@ -911,7 +1005,7 @@ const readSchemeValue: ValueReader = (text, valueStart, carrier) => {
   }
   const bare = stickyExec(SCHEME_BARE_VALUE_PATTERN, text, valueStart);
   if (bare === null || !looksLikeSchemeValue(bare)) return null;
-  return { end: valueStart + bare.length, replacement: REDACTED };
+  return { end: Math.max(valueStart + bare.length, authParamListEnd(text, valueStart, true) ?? 0), replacement: REDACTED };
 };
 
 // ---------------------------------------------------------------------------------------------------------------------
@@ -1125,6 +1219,9 @@ function replaceCompoundCredentialPairs(text: string): string {
           const tightAssignment = separator.includes("=") && !WHITESPACE_PATTERN.test(separator);
           const assignment = !shapeGated && (tightAssignment || scheme.length > 0 || !bareValueOpensClause(text, key, end));
           if (!assignment && !looksLikeCredentialValue(value)) continue;
+          // A quoted value the run opens goes with it (`BOX_CLIENT_SECRET=Token="v"`), and under an Authorization-style
+          // key the whole auth-param list after the scheme word does (`auth_header: Snowflake Token="v"`).
+          end = bareValueEndWithAuthParams(text, valueStart, afterScheme, value, keepScheme);
           replacement = `${kept}${REDACTED}`;
         }
       }
@@ -1191,9 +1288,11 @@ export function createCredentialScrubber(options: CredentialScrubberOptions = {}
     let scrubbed = scrubConfiguredSecrets(text, plainSecrets)
       .replace(PEM_BLOCK_PATTERN, REDACTED)
       .replace(PEM_OPEN_PATTERN, REDACTED)
-      .replace(EMBEDDED_URL_PATTERN, scrubEmbeddedUrl)
-      .replace(QUERY_PAIR_PATTERN, scrubQueryPair);
-    scrubbed = replaceCarrierValues(scrubbed, COOKIE_HEADER_PATTERN, readCookieHeaderValue);
+      .replace(EMBEDDED_URL_PATTERN, scrubEmbeddedUrl);
+    // The cookie reader runs before the query rule: ";" separates a cookie header's pairs and attributes but is part
+    // of a query value, so the query rule would otherwise take `; pref=w` off `Cookie: &sid=v; pref=w` as the tail of
+    // the value before the cookie reader saw the header.
+    scrubbed = replaceCarrierValues(scrubbed, COOKIE_HEADER_PATTERN, readCookieHeaderValue).replace(QUERY_PAIR_PATTERN, scrubQueryPair);
     scrubbed = replaceCarrierValues(scrubbed, headerPattern, readHeaderValue);
     scrubbed = replaceCarrierValues(scrubbed, SCHEME_WORD_PATTERN, readSchemeValue);
     scrubbed = replaceCarrierValues(scrubbed, SESSION_ASSIGNMENT_PATTERN, readPairValue);

@@ -3216,6 +3216,38 @@ test("row (a): a Datadog 403 body echoing weak values under credential-named key
   assertCanaryWindowsAbsent(assert, JSON.stringify(access), WEAK_PAIR_VALUES, "check_access payload");
 });
 
+/**
+ * A 401 body echoing the request's Authorization header as a scheme word and a quoted auth-param (CodeRabbit on #81,
+ * r4081238237) and the request URL with a ";" inside a query value (Codex P1 on #81). The auth-param list goes whole
+ * after the scheme word and the query value goes whole, so nothing stands after either marker.
+ */
+const ECHOED_HEADER_CANARY = "Wq4zNv8LkTp2XbRm6Hcy";
+const ECHOED_QUERY_CANARIES = ["Gt7kPz3MvXw9QnLbJs5e", "Yd2sRf6HjKm4TcVpNa8u"];
+const ECHOED_401_BODY = `Authentication failed: Authorization: Snowflake Token="${ECHOED_HEADER_CANARY}" was sent to GET /api/v2/logs/config/archives?token=${ECHOED_QUERY_CANARIES[0]};${ECHOED_QUERY_CANARIES[1]}&page=1`;
+
+test("a Datadog 401 body echoing a quoted auth-param after the scheme word and a query value holding a ';' reaches the access check, the bundle, and the assessments with every value gone and nothing left after either marker", async () => {
+  const routes = routesFromClient(healthyClient());
+  routes["GET /api/v2/logs/config/archives"] = () => jsonResponse({ errors: [ECHOED_401_BODY] }, { status: 401, statusText: "Unauthorized" });
+  const log = [];
+  const { client, config } = httpClient(routes, log);
+  const access = await checkDatadogAccess(client);
+  const archives = access.surfaces.find((surface) => surface.name === "log_archives");
+  assert.equal(archives.http_status, 401);
+  assert.ok(log.some((entry) => entry.status === 401), "the 401 was observed on the wire");
+  assert.equal(
+    archives.error,
+    `Datadog request failed (401 Unauthorized) GET /api/v2/logs/config/archives: Authentication failed: Authorization: Snowflake [REDACTED] was sent to GET /api/v2/logs/config/archives?token=[REDACTED]&page=1`,
+  );
+  const result = await exportDatadogAuditBundle(client, config, createTempBase("grclanker-datadog-echoed-401-"), { now: NOW });
+  const assessments = await runAllAssessments(client);
+  const outputs = [...readBundleFiles(result.outputDir), ["check_access", JSON.stringify(access)], ["assessments", JSON.stringify(assessments)]];
+  const text = outputs.map(([, content]) => content).join("\n");
+  assertCanaryWindowsAbsent(assert, text, [ECHOED_HEADER_CANARY, ...ECHOED_QUERY_CANARIES], "echoed 401 outputs");
+  assert.ok(text.includes(`Authorization: Snowflake [REDACTED] was sent to GET /api/v2/logs/config/archives?token=[REDACTED]&page=1`), `the echoed line reached the outputs with both markers: ${archives.error}`);
+  assert.ok(!text.includes(`[REDACTED];`), "no tail stands after a marker");
+  assert.ok(!/\[REDACTED\]\\*["'][A-Za-z0-9]/.test(text), "no quoted value stands after a marker");
+});
+
 test("addendum 5: every endpoint and status code named in Datadog output corresponds to a request the run made and observed", async () => {
   const routes = routesFromClient(healthyClient());
   routes["GET /api/v2/ip_allowlist"] = htmlGateway();
