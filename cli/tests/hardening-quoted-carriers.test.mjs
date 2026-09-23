@@ -678,6 +678,86 @@ test("Codex r4080768613 on #81: a query value runs through a semicolon, so `?tok
 });
 
 /**
+ * CodeRabbit r4081238237 on #81 (at `a377984`): `Authorization: Snowflake Token="<jwt>"` carries its
+ * credential as a quoted auth-param (RFC 7235), the header reader's bare run stopped at the quote, and
+ * the pair rule could not match `Token` after the marker, so the quoted value survived
+ * (`Snowflake [REDACTED]"<jwt>"`); the same for the quoted params after `Digest` (`response`, `nonce`,
+ * `cnonce`) and for any `<Scheme> <Key>="..."` shape. The reader now reads the auth-param list: one
+ * quoted param keeps its label and quotes (`Snowflake Token="[REDACTED]"`), a list (Digest, OAuth 1,
+ * SigV4) goes whole, a challenge's params (`realm="api"`) stay, and a scheme spelling that "=" follows
+ * is a param name (`Authorization: Token="[REDACTED]"`). The fixed values in the Digest, SigV4, and
+ * OAuth 1 rows are the RFC 7616, AWS, and RFC 5849 examples. Mutation check (recorded in the round 3
+ * body): with the list reader returning null, 13 of the 15 rows fail and 10 leak the value through
+ * every sink; the two rows inside a JSON string hold because the quoted header path takes the whole
+ * string there.
+ */
+const AUTH_PARAM_ROWS = Object.freeze([
+  ["bare header line", (value) => `Authorization: Snowflake Token="${value}"`, () => `Authorization: Snowflake Token="${REDACTED}"`],
+  ["single-quoted header line", (value) => `Authorization: Snowflake Token='${value}'`, () => `Authorization: Snowflake Token='${REDACTED}'`],
+  ["after a JSON escape", (value) => `request failed\\nAuthorization: Snowflake Token=\\"${value}\\"`, () => `request failed\\nAuthorization: Snowflake Token=\\"${REDACTED}\\"`],
+  ["inside a JSON string", (value) => `{"headers":{"Authorization":"Snowflake Token=\\"${value}\\""}}`, () => `{"headers":{"Authorization":"Snowflake ${REDACTED}"}}`],
+  ["header line inside a JSON string", (value) => `{"detail":"Authorization: Snowflake Token=\\"${value}\\""}`, () => `{"detail":"Authorization: Snowflake Token=\\"${REDACTED}\\""}`],
+  ["compound line", (value) => `Authorization: Snowflake Token="${value}"; X-Request-Id: 1`, () => `Authorization: Snowflake Token="${REDACTED}"; X-Request-Id: 1`],
+  ["Bearer with a quoted param", (value) => `Authorization: Bearer Token="${value}"`, () => `Authorization: Bearer Token="${REDACTED}"`],
+  ["scheme spelling as the param name", (value) => `Authorization: Token="${value}"`, () => `Authorization: Token="${REDACTED}"`],
+  ["generic credential header", (value) => `X-Api-Key: Token="${value}"`, () => `X-Api-Key: Token="${REDACTED}"`],
+  ["scheme word in free text", (value) => `replayed Snowflake Token="${value}" upstream`, () => `replayed Snowflake Token="${REDACTED}" upstream`],
+  ["credential-named pair", (value) => `password=Token="${value}"`, () => `password=${REDACTED}`],
+  ["Digest auth-param list", (value) => `Authorization: Digest username="Mufasa", realm="testrealm@host.com", nonce="dcd98b7102dd2f0e8b11d0f600bfb0c093", uri="/dir/index.html", qop=auth, nc=00000001, cnonce="0a4f113b", response="${value}", opaque="5ccc069c403ebaf9f0171e9517f40e41"`, () => `Authorization: Digest ${REDACTED}`],
+  ["Digest auth-param list inside a JSON string", (value) => `{"Authorization":"Digest username=\\"Mufasa\\", realm=\\"testrealm@host.com\\", nonce=\\"dcd98b7102dd2f0e8b11d0f600bfb0c093\\", response=\\"${value}\\", opaque=\\"5ccc069c403ebaf9f0171e9517f40e41\\""}`, () => `{"Authorization":"Digest ${REDACTED}"}`],
+  ["SigV4 auth-param list", (value) => `Authorization: AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/20260922/eu-north-1/s3/aws4_request, SignedHeaders=host;x-amz-date, Signature=${value}`, () => `Authorization: AWS4-HMAC-SHA256 ${REDACTED}`],
+  ["OAuth 1 auth-param list", (value) => `Authorization: OAuth oauth_consumer_key="dpf43f3p2l4k3l03", oauth_token="${value}", oauth_signature_method="HMAC-SHA1", oauth_version="1.0"`, () => `Authorization: OAuth ${REDACTED}`],
+]);
+
+test("CodeRabbit r4081238237 on #81: a quoted auth-param after a scheme word goes with its label kept, a Digest, OAuth 1, or SigV4 list goes whole, and a challenge's params stay, through every sink", () => {
+  const legitimate = new Map(AUTH_PARAM_ROWS.map(([label, line]) => [label, line("")]));
+  assertCanariesDisjointFromFixture(assert, plantedValues(), legitimate, "auth-param rows");
+  // "skvclmtirehs" is the value the review used.
+  for (const [label, line, expected] of AUTH_PARAM_ROWS) {
+    for (const value of ["skvclmtirehs", ...plantedValues()]) {
+      const input = line(value);
+      for (const [scrubName, scrub] of EXACT_SCRUBS) {
+        const output = scrub(input);
+        assert.equal(output, expected(), `${scrubName}: ${label} with ${value}`);
+        assertNoCanaryWindows(assert, output, [value], `${scrubName}: ${label}`);
+        assert.equal(scrub(output), output, `${scrubName}: ${label}: a second pass changed the text`);
+      }
+      assertNoCanaryWindows(assert, errorMessage(new Error(input)), [value], `errorMessage: ${label}`);
+    }
+  }
+  // The row as reported, through both scrubbers and records under `redactSecretValues`.
+  const reported = 'Authorization: Snowflake Token="skvclmtirehs"';
+  assert.equal(scrubErrorText(reported), `Authorization: Snowflake Token="${REDACTED}"`);
+  assert.equal(scrubDataText(reported), `Authorization: Snowflake Token="${REDACTED}"`);
+  assert.equal(redactSecretValues(reported), `Authorization: Snowflake Token="${REDACTED}"`);
+  assert.deepEqual(redactSecretValues({ detail: reported }), { detail: `Authorization: Snowflake Token="${REDACTED}"` });
+  assert.deepEqual(redactSecretValues({ headers: { Authorization: 'Snowflake Token="skvclmtirehs"' } }), { headers: { Authorization: REDACTED } });
+  // A challenge's params describe the server and stay, in a WWW-Authenticate header and in prose.
+  for (const text of [
+    'WWW-Authenticate: Bearer realm="api", error="invalid_token", error_description="The access token expired"',
+    'WWW-Authenticate: Basic realm="WallyWorld"',
+    'Bearer realm="api", error="invalid_token", error_description="The access token expired"',
+    'Basic realm="WallyWorld"',
+  ]) {
+    for (const [scrubName, scrub] of EXACT_SCRUBS) assert.equal(scrub(text), text, `${scrubName}: ${text}`);
+  }
+  const digestChallenge = 'WWW-Authenticate: Digest realm="testrealm@host.com", qop="auth,auth-int", nonce="dcd98b7102dd2f0e8b11d0f600bfb0c093", opaque="5ccc069c403ebaf9f0171e9517f40e41"';
+  for (const [scrubName, scrub] of EXACT_SCRUBS) {
+    assert.ok(scrub(digestChallenge).startsWith('WWW-Authenticate: Digest realm="testrealm@host.com", qop="auth,auth-int", '), `${scrubName}: ${scrub(digestChallenge)}`);
+  }
+  // A bare run after the scheme word goes whole as before, and the renderings are fixed points.
+  for (const [text, expected] of [
+    ["Authorization: Snowflake Token=skvclmtirehs", `Authorization: Snowflake ${REDACTED}`],
+    ['"Authorization": "Token=skvclmtirehs"', `"Authorization": "${REDACTED}"`],
+    [`Authorization: Snowflake Token="${REDACTED}"`, `Authorization: Snowflake Token="${REDACTED}"`],
+    [`Authorization: Token=${REDACTED}`, `Authorization: Token=${REDACTED}`],
+    [`Authorization: Digest ${REDACTED}`, `Authorization: Digest ${REDACTED}`],
+  ]) {
+    for (const [scrubName, scrub] of EXACT_SCRUBS) assert.equal(scrub(text), expected, `${scrubName}: ${text}`);
+  }
+});
+
+/**
  * A header line quoted whole in single quotes (a curl `-H` argument, a Python dict repr, a sentence
  * that ends after the quote) keeps its closing quote: the apostrophe that closes it is followed by a
  * space, a bracket, sentence punctuation, or the end, which is where a cookie name or value ends.

@@ -197,9 +197,25 @@ const HEADER_DESCRIPTOR_SUFFIX_PATTERN = /-(?:type|mode|scheme|method|status|ver
 // credential, so a name-shaped value after `Negotiate` or `Snowflake` goes too); a scheme word with
 // nothing after it (`Authorization: Bearer` at the end of a line) is the whole value and stays. The
 // spacing does not cross a line, so a scheme word ending a line is not joined to the next line's
-// first word. Under a credential-named pair the scheme word is part of the value (see
-// `readCarrierValue`).
-const VALUE_SCHEME_PATTERN = /(?:Bearer|Basic|Token|Digest|OAuth|Negotiate|NTLM|SSWS|ApiKey|Api-Key|Splunk|Snowflake|AWS4-HMAC-SHA256)(?![A-Za-z0-9_-])[ \t]*/iy;
+// first word. A scheme spelling that "=" follows is the name of a param, not a scheme (`X-Api-Key:
+// Token="<v>"`, `client_token: Token="<v>"`; see `readAuthParamList`). Under a credential-named pair
+// the scheme word is part of the value (see `readCarrierValue`).
+const VALUE_SCHEME_PATTERN = /(?:Bearer|Basic|Token|Digest|OAuth|Negotiate|NTLM|SSWS|ApiKey|Api-Key|Splunk|Snowflake|AWS4-HMAC-SHA256)(?![A-Za-z0-9_-])(?![ \t]*=)[ \t]*/iy;
+// The auth-params of a credential (RFC 7235: after the scheme word stand either one token68 or a
+// comma-separated list of `name=value` and `name="value"` params; see `readAuthParamList`). A param
+// name is a word of letters, digits, "_", "-", and "." that is not token-cased (`isAuthParamName`),
+// and a quoted param value begins like a credential, so a base64 value whose one padding "=" a quote
+// happens to follow (`'Authorization: Basic <base64>=' then ...`) is neither a name nor a param. A
+// bare param value runs to the next ",", space, or quote; ";" is content there (SigV4's
+// `SignedHeaders=host;x-amz-date`) unless it introduces the next header of a compound line (see
+// `FOLLOWING_HEADER_PATTERN`).
+const AUTH_PARAM_NAME = String.raw`[A-Za-z][A-Za-z0-9_.-]{0,63}`;
+const AUTH_PARAM_KEY_PATTERN = new RegExp(String.raw`^${AUTH_PARAM_NAME}=$`);
+// A name and a bare value in one run; the value does not begin with "=", so a base64 value's padding
+// (`dXNlcjpwYXNz==`) names no param.
+const AUTH_PARAM_KEYED_RUN_PATTERN = new RegExp(String.raw`^(${AUTH_PARAM_NAME})=[^=]`);
+const AUTH_PARAM_NEXT_PATTERN = new RegExp(String.raw`[ \t]*,[ \t]*(${AUTH_PARAM_NAME})=`, "y");
+const AUTH_PARAM_BARE_VALUE_PATTERN = /[^\s,"'<>()[\]{}\\]+/y;
 // A bare header value runs to the first character that ends a header value in free text; a bare pair
 // value also stops at "&" and the closing brackets of a JSON or query fragment. A backslash ends both
 // so a JSON-escaped closing quote is kept, and neither can begin at "[" so the marker is never a value.
@@ -711,8 +727,12 @@ interface ValueReplacement {
 type ValueReader = (text: string, valueStart: number, carrier: RegExpExecArray) => ValueReplacement | null;
 
 function stickyExec(pattern: RegExp, text: string, index: number): string | null {
+  return stickyMatch(pattern, text, index)?.[0] ?? null;
+}
+
+function stickyMatch(pattern: RegExp, text: string, index: number): RegExpExecArray | null {
   pattern.lastIndex = index;
-  return pattern.exec(text)?.[0] ?? null;
+  return pattern.exec(text);
 }
 
 /**
@@ -798,6 +818,18 @@ function readBareValue(text: string, index: number, barePattern: RegExp): string
  * an earlier rule scrubbed (`Authorization: Bearer [REDACTED]` seen again by the generic rule) and is
  * left as it is. A bare run without a scheme word is kept when `keepBare` says so (the generic pair
  * rule's prose exemption); a quoted value is never prose.
+ *
+ * A bare run that begins an auth-param list is read with the list (see `readAuthParamList`,
+ * CodeRabbit r4081238237 on #81). Under a header the list is the credential after the scheme word:
+ * one quoted param keeps its name and quotes (`Authorization: Snowflake Token="[REDACTED]"`,
+ * `X-Api-Key: Token="[REDACTED]"`), a longer list goes whole (`Authorization: Digest [REDACTED]`,
+ * `Authorization: AWS4-HMAC-SHA256 [REDACTED]`, `Authorization: OAuth [REDACTED]`), and a bare run
+ * goes whole as before (`Authorization: Snowflake Token=<v>` renders `Authorization: Snowflake
+ * [REDACTED]`). Under a credential-named pair or flag a quoted param goes with the rest of the value
+ * (`password=Token="<v>"` and `--password Token="<v>"` render `password=[REDACTED]` and `--password
+ * [REDACTED]`) and the list is not walked, a pair's value being one value; a compound key's value
+ * that begins that way (`client_token: Snowflake Token="<v>"`) has been read by the explicit pair
+ * rule at `Token=` first and renders `client_token: Snowflake Token="[REDACTED]"`.
  */
 function readCarrierValue(text: string, valueStart: number, barePattern: RegExp, keepBare?: (value: string, valueEnd: number) => boolean, keepScheme = true): ValueReplacement | null {
   const quoted = readQuotedValue(text, valueStart);
@@ -829,6 +861,11 @@ function readCarrierValue(text: string, valueStart: number, barePattern: RegExp,
   }
   const valueEnd = afterScheme + value.length;
   if (scheme.length === 0 && keepBare?.(value, valueEnd)) return null;
+  const params = readAuthParamList(text, afterScheme, value, keepScheme);
+  if (params !== null) {
+    if (params.scrubbed) return null;
+    return { end: params.end, replacement: keepScheme ? `${scheme}${params.single?.rendering ?? REDACTED}` : REDACTED };
+  }
   return { end: absorbMarkers(text, valueEnd), replacement: keepScheme ? `${scheme}${REDACTED}` : REDACTED };
 }
 
@@ -844,6 +881,94 @@ function absorbMarkers(text: string, index: number): number {
     else if ((text[cursor] === "?" || text[cursor] === "#") && text.startsWith(REDACTED, cursor + 1)) cursor += REDACTED.length + 1;
     else return cursor;
   }
+}
+
+interface AuthParamList {
+  /** Index just past the list and any marker glued to it. */
+  end: number;
+  /** True when no value in the list is live (each is the marker an earlier pass left), so there is nothing to replace. */
+  scrubbed: boolean;
+  /** For a list of one quoted param: the text inside its quotes and its rendering with the name and the quotes kept (`Token="[REDACTED]"`); null for a longer list. */
+  single: { content: string; rendering: string } | null;
+}
+
+/** A param name that is a word rather than a token-cased run (see `AUTH_PARAM_NAME`). */
+function isAuthParamName(name: string): boolean {
+  return !hasTokenCasing(name.replace(/[^A-Za-z]/g, ""));
+}
+
+/** A value that is the marker an earlier pass left, with at most a non-value character after it (see `isBlankOrScrubbed`); blank is not scrubbed. */
+function isScrubbedMarker(value: string): boolean {
+  return value.trim().startsWith(REDACTED) && isBlankOrScrubbed(value);
+}
+
+/** Index just past a bare param value, cut before a ";" that introduces the next header of a compound line. */
+function authParamBareValueEnd(text: string, valueStart: number, bare: string): number {
+  for (let semicolon = bare.indexOf(";"); semicolon >= 0; semicolon = bare.indexOf(";", semicolon + 1)) {
+    if (stickyExec(FOLLOWING_HEADER_PATTERN, text, valueStart + semicolon) !== null) return valueStart + semicolon;
+  }
+  return valueStart + bare.length;
+}
+
+/**
+ * Reads the auth-param list that the bare run `run`, read at `start`, begins (CodeRabbit r4081238237
+ * on #81): `Authorization: Snowflake Token="<jwt>"` carries its credential as a quoted param, and the
+ * bare run stops at the quote, so a reader that replaced the run alone left the quoted value standing
+ * after the marker (`Snowflake [REDACTED]"<jwt>"`). The run is the first param when it is a param name
+ * and its "=" with the quoted value right after (`Token=` then `"<v>"`, `\"<v>\"`, `'<v>'`, closed or
+ * running to the line end), the quoted text beginning like a credential (a letter or digit, so the
+ * quote after a padded base64 value, `'Authorization: Basic <base64>=' then`, opens no param), or,
+ * with `walk`, when it is a name and a bare value in one (`Credential=<key id>/<scope>`) and another
+ * param follows. With `walk` the list continues over every `, name=value` or `, name="value"` after
+ * it: a Digest, OAuth 1, or SigV4 credential is the whole list, whose proof is computed over the
+ * other params, and goes as one marker; a list of one quoted param is a labelled credential and keeps
+ * its label (`Snowflake Token="[REDACTED]"`, `Bearer Token="[REDACTED]"`). Null when the run is not a
+ * param (a bare `name=value` alone is the run as before, so `Snowflake Token=<v>` and `Token
+ * token=<key>` still render `Snowflake [REDACTED]` and `Token [REDACTED]`), in which case the caller
+ * replaces the run; `scrubbed` when every value is already the marker (`Token="[REDACTED]"`, or
+ * `Token=[REDACTED]` where a configured secret was replaced first), so a rendering read again is left
+ * as it is.
+ */
+function readAuthParamList(text: string, start: number, run: string, walk: boolean): AuthParamList | null {
+  let cursor = start + run.length;
+  let live = false;
+  let single: AuthParamList["single"] = null;
+  if (AUTH_PARAM_KEY_PATTERN.test(run)) {
+    if (!isAuthParamName(run.slice(0, -1))) return null;
+    if (text.startsWith(REDACTED, cursor)) {
+      cursor = absorbMarkers(text, cursor);
+    } else {
+      const quoted = readQuotedValue(text, cursor);
+      if (quoted === null || !opensValue(text, quoted)) return null;
+      const content = text.slice(quoted.start, quoted.end);
+      const scrubbed = isScrubbedMarker(content);
+      if (!scrubbed && !QUOTED_SCHEME_VALUE_START_PATTERN.test(content)) return null;
+      live = !scrubbed;
+      cursor = quoted.after;
+      single = { content, rendering: `${run}${quoted.open}${REDACTED}${quoted.close}` };
+    }
+  } else {
+    const keyed = AUTH_PARAM_KEYED_RUN_PATTERN.exec(run);
+    if (!walk || keyed === null || !isAuthParamName(keyed[1]) || stickyMatch(AUTH_PARAM_NEXT_PATTERN, text, cursor) === null) return null;
+    live = true;
+  }
+  let next: RegExpExecArray | null;
+  while (walk && (next = stickyMatch(AUTH_PARAM_NEXT_PATTERN, text, cursor)) !== null) {
+    if (!isAuthParamName(next[1])) break;
+    const valueStart = cursor + next[0].length;
+    const quoted = readQuotedValue(text, valueStart);
+    if (quoted !== null) {
+      if (!opensValue(text, quoted)) break;
+      if (!isScrubbedMarker(text.slice(quoted.start, quoted.end))) live = true;
+      cursor = quoted.after;
+    } else {
+      const bare = stickyExec(AUTH_PARAM_BARE_VALUE_PATTERN, text, valueStart);
+      cursor = bare === null ? valueStart : authParamBareValueEnd(text, valueStart, bare);
+      if (bare !== null && !isBlankOrScrubbed(bare)) live = true;
+    }
+    single = null;
+  }
+  return { end: absorbMarkers(text, cursor), scrubbed: !live, single };
 }
 
 /**
@@ -936,7 +1061,12 @@ const readCookieHeaderValue: ValueReader = (text, valueStart, carrier) => {
  * quoted value goes only when it cannot be a word or a name. A marker an earlier rule left glued to
  * the bare run is part of it: the pair rules run first and have turned `Token token=<key>` into
  * `Token token=[REDACTED]`, so the run `token=` and its marker go as one (`Token [REDACTED]`) rather
- * than as `[REDACTED][REDACTED]`.
+ * than as `[REDACTED][REDACTED]`. An auth-param list after the scheme word (see `readAuthParamList`)
+ * is read as under a header when its first param is not one of a challenge: `replayed Snowflake
+ * Token="<v>"` renders `replayed Snowflake Token="[REDACTED]"` and `OAuth oauth_consumer_key="<v>",
+ * oauth_token="<v>"` goes whole, while `Bearer realm="api", error="invalid_token"` is the prose of a
+ * challenge and stays (`AUTH_PARAM_PATTERN`); after a lowercase English word only a single quoted
+ * param goes, and only when its value cannot be a word or a name.
  */
 const readSchemeValue: ValueReader = (text, valueStart, carrier) => {
   const lowercaseScheme = LOWERCASE_SCHEME_WORDS.has(carrier[0].trim());
@@ -950,6 +1080,13 @@ const readSchemeValue: ValueReader = (text, valueStart, carrier) => {
   const bare = stickyExec(SCHEME_BARE_VALUE_PATTERN, text, valueStart);
   if (bare === null) return null;
   const value = bare.replace(CLAUSE_PUNCTUATION_PATTERN, "");
+  // A run the marker follows is the pair the pair rules have scrubbed and goes with its marker as one.
+  const params = text.startsWith(REDACTED, valueStart + value.length) ? null : readAuthParamList(text, valueStart, value, !lowercaseScheme);
+  if (params !== null) {
+    if (params.scrubbed || AUTH_PARAM_PATTERN.test(value)) return null;
+    if (lowercaseScheme && (params.single === null || !looksLikeSchemeValue(params.single.content, true))) return null;
+    return { end: params.end, replacement: params.single?.rendering ?? REDACTED };
+  }
   if (value.length < SCHEME_VALUE_MIN_LENGTH || !looksLikeSchemeValue(value, lowercaseScheme)) return null;
   return { end: absorbMarkers(text, valueStart + value.length), replacement: REDACTED };
 };

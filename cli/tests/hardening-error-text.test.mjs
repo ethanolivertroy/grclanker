@@ -308,11 +308,10 @@ test("#78 row B: every scheme word carries in any casing on both sides, Snowflak
     assert.equal(scrubErrorText(prose), prose, prose);
     assert.equal(scrubDataText(prose), prose, prose);
   }
-  // A SigV4 header loses its credential scope and signature and keeps the scheme word.
+  // A SigV4 header loses its whole auth-param list (credential scope, signed headers, and signature) and keeps the scheme word.
   const sigv4 = "Authorization: AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/20260922/us-east-1/s3/aws4_request, SignedHeaders=host;x-amz-date, Signature=fe5f80f77d5fa3beca038a248ff027d0445342fe2855ddc963176630326f1024";
-  const scrubbedSigv4 = scrubErrorText(sigv4);
-  assert.ok(scrubbedSigv4.startsWith(`Authorization: AWS4-HMAC-SHA256 ${REDACTED}`), scrubbedSigv4);
-  assert.ok(!scrubbedSigv4.includes("AKIAIOSFODNN7EXAMPLE") && !scrubbedSigv4.includes("fe5f80f77d5fa3be"), scrubbedSigv4);
+  assert.equal(scrubErrorText(sigv4), `Authorization: AWS4-HMAC-SHA256 ${REDACTED}`);
+  assert.equal(scrubDataText(sigv4), `Authorization: AWS4-HMAC-SHA256 ${REDACTED}`);
 });
 
 test("credential-named pairs lose any nonempty value whatever its shape, compound and env-style keys included; the one exemption is a word that continues as prose", () => {
