@@ -2049,6 +2049,92 @@ test("reviewer C final verdict, item H: a literal JSON escape is a boundary befo
   assert.equal(scrubErrorText("Authorization: Bearer \\hunter2"), "Authorization: Bearer [REDACTED]");
 });
 
+/** Reviewer C's compound header lines (item F): several carriers on one line. Each builder takes distinct planted values and gives the line, its credential slots, the header names that must survive as often as they appeared, and the fragments that must survive verbatim. */
+const COMPOUND_HEADER_LINES = [
+  (a, b) => [`Cookie: sid="${a}"; X-Api-Key: "${b}"; Content-Type: "application/json"`, [a, b], ["Cookie", "X-Api-Key", "Content-Type"], ["application/json"]],
+  (a, b) => [`Cookie: sid=${a}; X-Api-Key: "${b}"; Content-Type: "application/json"`, [a, b], ["Cookie", "X-Api-Key", "Content-Type"], ["application/json"]],
+  (a, b) => [`Cookie: sid="${a}", X-Api-Key: "${b}", Content-Type: "application/json"`, [a, b], ["Cookie", "X-Api-Key", "Content-Type"], ["application/json"]],
+  (a, b) => [`Cookie: sid=${a}, X-Api-Key: "${b}", Content-Type: "application/json"`, [a, b], ["Cookie", "X-Api-Key", "Content-Type"], ["application/json"]],
+  (a, b) => [`Cookie: theme=light; sid=${a}; lang=en; X-Api-Key: "${b}"; Content-Type: "application/json"`, [a, b], ["Cookie", "X-Api-Key", "Content-Type"], ["application/json"]],
+  (a, b) => [`Set-Cookie: sid="${a}"; Path=/; HttpOnly, X-Api-Key: "${b}", Content-Type: "application/json"`, [a, b], ["Set-Cookie", "X-Api-Key", "Content-Type"], ["application/json"]],
+  (a, b) => [`Cookie: sid='${a}'; X-Api-Key: '${b}'; Content-Type: 'application/json'`, [a, b], ["Cookie", "X-Api-Key", "Content-Type"], ["application/json"]],
+  (a, b) => [`Authorization: Bearer "${a}"; X-Api-Key: "${b}"; Content-Type: "application/json"`, [a, b], ["Authorization", "X-Api-Key", "Content-Type"], ["Bearer", "application/json"]],
+  (a, b) => [`X-Api-Key: "${a}", Authorization: "Bearer ${b}", Content-Type: "application/json"`, [a, b], ["X-Api-Key", "Authorization", "Content-Type"], ["Bearer", "application/json"]],
+  (a, b) => [`X-Api-Key: "${a}"; Cookie: sid="${b}"; Content-Type: "application/json"`, [a, b], ["X-Api-Key", "Cookie", "Content-Type"], ["application/json"]],
+  (a, b, c) => [`Cookie: sid="${a}", Authorization: Bearer "${b}", X-Api-Key: "${c}", Content-Type: "application/json"`, [a, b, c], ["Cookie", "Authorization", "X-Api-Key", "Content-Type"], ["Bearer", "application/json"]],
+  (a, b) => [`Cookie: sid="${a}" {"X-Api-Key": "${b}", "Content-Type": "application/json"}`, [a, b], ["Cookie", "X-Api-Key", "Content-Type"], ["application/json"]],
+  (a, b) => [`Authorization: Bearer "${a}" {"Cookie": "sid=${b}", "Content-Type": "application/json"}`, [a, b], ["Authorization", "Cookie", "Content-Type"], ["Bearer", "application/json"]],
+  (a, b) => [`{"Cookie": "sid=${a}"} X-Api-Key: "${b}"; Content-Type: "application/json"`, [a, b], ["Cookie", "X-Api-Key", "Content-Type"], ["application/json"]],
+  (a, b) => [`Authorization: SSWS "${a}"; X-Api-Key: "${b}"; Content-Type: "application/json"`, [a, b], ["Authorization", "X-Api-Key", "Content-Type"], ["SSWS", "application/json"]],
+  (a, b) => [`Authorization: Splunk "${a}"; Cookie: sid=${b}; Content-Type: "application/json"`, [a, b], ["Authorization", "Cookie", "Content-Type"], ["Splunk", "application/json"]],
+  (a, b) => [`Authorization: Snowflake Token="${a}", X-Api-Key: "${b}", Content-Type: "application/json"`, [a, b], ["Authorization", "X-Api-Key", "Content-Type"], ["application/json"]],
+  (a, b, c) => [`Authorization: VERACODE-HMAC-SHA-256 id=${a},ts=1700000000,nonce=${b},sig=${c}; Content-Type: "application/json"`, [a, b, c], ["Authorization", "Content-Type"], ["VERACODE-HMAC-SHA-256", "ts=1700000000", "application/json"]],
+  (a, b) => [`Authorization: Basic "${a}"; Cookie: AWSALB="${b}"; Content-Type: "application/json"`, [a, b], ["Authorization", "Cookie", "Content-Type"], ["Basic", "application/json"]],
+  // An unterminated quote ends before the next "Name:" token, which keeps its name (item F).
+  (a, b) => [`Cookie: sid="${a}; X-Api-Key: "${b}"; Content-Type: "application/json"`, [a, b], ["Cookie", "X-Api-Key", "Content-Type"], ["application/json"]],
+  (a, b) => [`X-Api-Key: "${a}; Cookie: sid=${b}; Content-Type: "application/json"`, [a, b], ["X-Api-Key", "Cookie", "Content-Type"], ["application/json"]],
+  // A JSON-object header whose value carries escaped inner quotes (item F).
+  (a, b) => [`{"Cookie": "sid=\\"${a}\\"", "X-Api-Key": "${b}", "Content-Type": "application/json"}`, [a, b], ["Cookie", "X-Api-Key", "Content-Type"], ["application/json"]],
+  (a, b) => [`{"X-Api-Key": "\\"${a}\\"", "Cookie": "sid=${b}", "Content-Type": "application/json"}`, [a, b], ["X-Api-Key", "Cookie", "Content-Type"], ["application/json"]],
+  (a, b) => [`{"Authorization": "Bearer \\"${a}\\"", "X-Api-Key": "${b}", "Content-Type": "application/json"}`, [a, b], ["Authorization", "X-Api-Key", "Content-Type"], ["Bearer", "application/json"]],
+];
+/** The two value shapes of the compound matrix: pairwise distinct canaries sharing no 6-character window with any line or frame text. */
+const COMPOUND_VALUE_SHAPES = [
+  ["name-shaped", ["prod-iidsre-itdpqey", "prod-yzrupn-efussqe", "prod-hnxttf-anwlqzo"]],
+  ["token-shaped", ["K7pQz2VxN9mR4tYw8LbC1dFgH6jS==", "Wq3Zt8Hv5Nc2Xf9Lm4Rp7Bd1Gk6Ty==", "Jx5Cn2Vb8Mq4Wz7Rt1Hp9Kf3Ld6Sg=="]],
+];
+/** The frames of the compound matrix: a bare line, a sentence, a 502 banner, a JSON string member, a 502 JSON body, and a double-escaped raw member. */
+const COMPOUND_FRAMES = [
+  ["line", (text) => text],
+  ["sentence", (text) => `Vendor request failed (502 Bad Gateway) for /api/v1/items: ${text} while proxying`],
+  ["502-text", (text) => `Vendor request failed (502 Bad Gateway) for /api/v1/items: Environment as echoed by the proxy:\n${text}`],
+  ["json-escaped", (text) => `{"message":${JSON.stringify(text)}}`],
+  ["502-json", (text) => `{"status":502,"error":"Bad Gateway","message":${JSON.stringify(`The upstream rejected the request; ${text}`)}}`],
+  ["502-json-raw", (text) => `{"status":502,"raw":${JSON.stringify(JSON.stringify({ headers: text }))}}`],
+];
+
+/** How often `fragment` occurs in `text`. */
+function occurrencesOf(text, fragment) {
+  return text.split(fragment).length - 1;
+}
+
+test("reviewer C final verdict, item F: on a compound header line every carrier value goes at every JSON depth, an escaped inner quote is inner content, an unterminated quote ends before the next header token, and every following header keeps its name", () => {
+  for (const [shapeName, values] of COMPOUND_VALUE_SHAPES) {
+    for (const build of COMPOUND_HEADER_LINES) {
+      const [line, credentials, names, keeps] = build(...values);
+      for (const [frameName, frame] of COMPOUND_FRAMES) {
+        const input = frame(line);
+        const scrubbed = scrubErrorText(input);
+        const label = `${shapeName} ${frameName}: ${input}`;
+        for (const credential of credentials) assertNoWindowOf(scrubbed, credential, label);
+        for (const name of names) assert.ok(occurrencesOf(scrubbed, name) >= occurrencesOf(input, name), `the header name ${name} survives in ${label} -> ${scrubbed}`);
+        for (const keep of keeps) assert.ok(occurrencesOf(scrubbed, keep) >= occurrencesOf(input, keep), `${keep} survives in ${label} -> ${scrubbed}`);
+        assert.equal(scrubErrorText(scrubbed), scrubbed, `second pass over ${label}`);
+      }
+    }
+  }
+
+  // The reviewer's edge rows, rendered: the following header keeps its name and its own carrier treatment.
+  assert.equal(scrubErrorText('Cookie: sid="prod-iidsre-itdpqey; X-Api-Key: "prod-yzrupn-efussqe"; Content-Type: "application/json"'), 'Cookie: [REDACTED]; X-Api-Key: "[REDACTED]"; Content-Type: "application/json"');
+  assert.equal(scrubErrorText('X-Api-Key: "prod-iidsre-itdpqey; Cookie: sid=prod-yzrupn-efussqe; Content-Type: "application/json"'), 'X-Api-Key: "[REDACTED]; Cookie: [REDACTED]; Content-Type: "application/json"');
+  assert.equal(scrubErrorText('{"Cookie": "sid=\\"prod-iidsre-itdpqey\\"", "X-Api-Key": "prod-yzrupn-efussqe", "Content-Type": "application/json"}'), '{"Cookie": "[REDACTED]", "X-Api-Key": "[REDACTED]", "Content-Type": "application/json"}');
+  assert.equal(scrubErrorText('{"X-Api-Key": "\\"prod-iidsre-itdpqey\\"", "Cookie": "sid=prod-yzrupn-efussqe", "Content-Type": "application/json"}'), '{"X-Api-Key": "[REDACTED]", "Cookie": "[REDACTED]", "Content-Type": "application/json"}');
+  assert.equal(scrubErrorText('{"Authorization": "Bearer \\"prod-iidsre-itdpqey\\"", "X-Api-Key": "prod-yzrupn-efussqe", "Content-Type": "application/json"}'), '{"Authorization": "Bearer [REDACTED]", "X-Api-Key": "[REDACTED]", "Content-Type": "application/json"}');
+  // Inside a double-escaped raw JSON string every quoted carrier goes and the quote units at that depth stay.
+  const rawMember = (headers) => `{"status":502,"raw":${JSON.stringify(JSON.stringify({ headers }))}}`;
+  assert.equal(
+    scrubErrorText(rawMember('Cookie: sid="prod-iidsre-itdpqey"; X-Api-Key: "prod-yzrupn-efussqe"; Content-Type: "application/json"')),
+    rawMember('Cookie: [REDACTED]; X-Api-Key: "[REDACTED]"; Content-Type: "application/json"'),
+  );
+  assert.equal(
+    scrubErrorText(rawMember('{"Cookie": "sid=\\"prod-iidsre-itdpqey\\"", "X-Api-Key": "\\"prod-yzrupn-efussqe\\""}')),
+    rawMember('{"Cookie": "[REDACTED]", "X-Api-Key": "[REDACTED]"}'),
+  );
+  // Reading to the matching closer keeps a quoted value whole: spaces, "=", and ";" inside the quotes go with it.
+  assert.equal(scrubErrorText('"password": "correct horse battery staple"'), '"password": "[REDACTED]"');
+  assert.equal(scrubErrorText('Cookie: "sid=a=b; theme=dark"; X-Api-Key: guest'), 'Cookie: "[REDACTED]"; X-Api-Key: [REDACTED]');
+});
+
 /** Every endpoint the Veracode client requests (applications, identity, SCA Agent, and Dynamic Analysis APIs), with the sample identifiers the fixtures use. */
 const VERACODE_REQUESTED_PATHS = [
   "/api/authn/v2/users/self",

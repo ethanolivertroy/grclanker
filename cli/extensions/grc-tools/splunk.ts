@@ -359,6 +359,12 @@ function errorMessage(error: unknown): string {
 // opener, so a header line that begins after one ("request headers:\u000aAuthorization: Splunk
 // <key>", "proxy:\n\tpassword: hunter2") is scrubbed as a header line, never as the value of the
 // word before the escape; see the note above ESCAPE_LETTER.
+//
+// The quote rule (reviewer C, item F): a quoted carrier value is read to the closing quote that
+// matches its opener (the same quote character behind the same backslash run), so an escaped inner
+// quote at any JSON depth is inner content and goes with the value; an unterminated quote and an
+// unquoted value end at a ";" or "," before the next header token, so the following header keeps its
+// name and its own treatment; see readQuotedContent and scrubCookieHeaders.
 // ---------------------------------------------------------------------------------------------
 
 const MIN_CONFIGURED_SECRET_LENGTH = 4;
@@ -385,16 +391,7 @@ const PEM_OPEN_PATTERN = /-----BEGIN [A-Z0-9 ]+-----[\s\S]*$/;
 const EMBEDDED_URL_PATTERN = new RegExp(String.raw`${CARRIER_START}[a-z][a-z0-9+.-]*:\/\/[^\s"'<>()[\]{}\\]+`, "gi");
 const URL_PARTS_PATTERN = /^([a-z][a-z0-9+.-]*:\/\/)(?:[^\s/@"'<>]+@)?([^?#]*)(\?[^#]*)?(#.*)?$/i;
 const TRAILING_PUNCTUATION_PATTERN = /[.,;:!?]+$/;
-const TRAILING_WHITESPACE_PATTERN = /[ \t]+$/;
 const QUERY_PAIR_PATTERN = /([?&])([A-Za-z0-9_.[\]-]+)=([^&#\s"'<>)\]}\\]+)/g;
-// A cookie header value quoted as a whole ends at its closing quote (plain, single, or JSON-escaped).
-// An unquoted value may hold quoted pair values after "=" and runs to the end of the line, except that it
-// ends at a ";" or "," that precedes the next "Name:" header token or a JSON fragment, at whitespace
-// before a JSON fragment, and at a literal escape, so a following header keeps its name and gets its own carrier treatment.
-const COOKIE_HEADER_PATTERN = new RegExp(
-  String.raw`${CARRIER_START}(set-cookie|cookies?)(${QUOTE_UNIT}?\s*[:=]\s*)(?!${QUOTE_UNIT}?\[REDACTED\])(?:(${QUOTE_UNIT})[^"'\r\n\\]*${QUOTE_UNIT}|([^\r\n\t <>"'\\;,=](?:[^\r\n\t <>"'\\;,=]|=[ \t]*(?:${QUOTE_UNIT}(?:[^"'\r\n\\]*${QUOTE_UNIT}|[^\r\n]*))?|[;,](?![ \t]*(?:[{[]|${QUOTE_UNIT}?[A-Za-z][A-Za-z0-9_-]*${QUOTE_UNIT}?[ \t]*:))|[ \t](?![ \t]*[{[]))*))`,
-  "gi",
-);
 // A scheme word spelled as a header scheme followed by a run of 8 or more token characters is a
 // credential whatever the run's shape; only the mechanism words vendor prose puts there ("Basic
 // authentication", "Bearer credentials") are kept. Lowercase spellings in prose ("token provided")
@@ -585,16 +582,182 @@ function scrubQueryPair(match: string, separator: string, key: string): string {
   return isCredentialCarrierKey(key) ? `${separator}${key}=${REDACTED}` : match;
 }
 
-function scrubCookieHeader(match: string, header: string, separator: string, quote: string | undefined, value: string | undefined): string {
-  if (quote !== undefined) return `${header}${separator}${quote}${REDACTED}${quote}`;
-  const trailing = TRAILING_WHITESPACE_PATTERN.exec(value ?? "")?.[0] ?? "";
-  return `${header}${separator}${REDACTED}${trailing}`;
-}
-
 function scrubSchemeValue(match: string, scheme: string, quote: string, value: string): string {
   const trailing = TRAILING_PUNCTUATION_PATTERN.exec(value)?.[0] ?? "";
   const word = value.slice(0, value.length - trailing.length);
   return SCHEME_PROSE_WORDS.has(word.toLowerCase()) ? match : `${scheme} ${quote}${REDACTED}${trailing}`;
+}
+
+// The name of a following header, as the cookie and pair readers recognise it.
+const NEXT_HEADER_NAME = String.raw`[A-Za-z][A-Za-z0-9_-]*`;
+// A ";" or "," ends a carrier value when the text after it (past optional spaces) opens the next
+// header "Name:" token or a JSON fragment.
+const NEXT_HEADER_AFTER_SEPARATOR = new RegExp(String.raw`^[ \t]*(?:[{[]|${QUOTE_UNIT}?${NEXT_HEADER_NAME}${QUOTE_UNIT}?[ \t]*:)`);
+// A quoted value that opens with a scheme word keeps the scheme and its gap and loses the rest, except
+// that a scheme followed by a pair list (an HMAC signature header: "id=...,ts=...,nonce=...,sig=...")
+// is read pair by pair so each key's own rule applies and a timestamp stays legible.
+const LEADING_SCHEME_IN_VALUE = /^([A-Za-z][A-Za-z0-9-]*)(\s+)(\S[\s\S]*)$/;
+const PAIR_LIST_START = /^[A-Za-z][A-Za-z0-9_.-]*=/;
+
+/** The number of backslashes in the run ending immediately before `index`. */
+function backslashRunBefore(text: string, index: number): number {
+  let count = 0;
+  while (index - count - 1 >= 0 && text[index - count - 1] === "\\") count += 1;
+  return count;
+}
+
+/** True when a ";" or "," at `index` precedes the next header "Name:" token or a JSON fragment. */
+function endsAtNextHeader(text: string, index: number): boolean {
+  const ch = text[index];
+  if (ch !== ";" && ch !== ",") return false;
+  return NEXT_HEADER_AFTER_SEPARATOR.test(text.slice(index + 1));
+}
+
+interface QuotedRead {
+  /** The value content between the opener and the closer (or the unterminated stop), to be redacted. */
+  content: string;
+  /** The index just past the value: past the closing quote unit when terminated, at the stop otherwise. */
+  end: number;
+  /** True when a matching closer was found; false when a raw newline, an outer string, or the next header token ended the value. */
+  terminated: boolean;
+}
+
+/** A quote unit opening a value at `start`: its leading backslash run and quote character, or undefined when `start` is not on a quote unit. */
+function openingQuoteUnit(text: string, start: number): { backslashes: number; quoteChar: string; contentStart: number } | undefined {
+  let backslashes = 0;
+  while (text[start + backslashes] === "\\") backslashes += 1;
+  const quoteChar = text[start + backslashes];
+  if (quoteChar !== '"' && quoteChar !== "'") return undefined;
+  return { backslashes, quoteChar, contentStart: start + backslashes + 1 };
+}
+
+/**
+ * Reads the content of a quoted value that opened with `openBackslashes` backslashes and quote char
+ * `quoteChar`. A quote of the same char preceded by the same backslash run closes it, so a deeper
+ * quote (more backslashes: an escaped inner quote at any JSON depth) is inner content; a raw newline,
+ * a shallower quote (an outer string closing), or a ";"/"," before the next header token ends it
+ * unterminated so the following header keeps its name.
+ */
+function readQuotedContent(text: string, contentStart: number, openBackslashes: number, quoteChar: string): QuotedRead {
+  let i = contentStart;
+  while (i < text.length) {
+    const ch = text[i];
+    if (ch === "\n" || ch === "\r") return { content: text.slice(contentStart, i), end: i, terminated: false };
+    if (ch === quoteChar) {
+      const run = backslashRunBefore(text, i);
+      if (run === openBackslashes) return { content: text.slice(contentStart, i - run), end: i + 1, terminated: true };
+      if (run < openBackslashes) return { content: text.slice(contentStart, i - run), end: i - run, terminated: false };
+    }
+    if (endsAtNextHeader(text, i)) return { content: text.slice(contentStart, i), end: i, terminated: false };
+    i += 1;
+  }
+  return { content: text.slice(contentStart, i), end: i, terminated: false };
+}
+
+// A cookie header value that is not wholly quoted runs across ";"/"," separated pairs; these are the
+// characters that make up a bare pair name or value (everything but the delimiters handled below).
+const COOKIE_PLAIN_CHAR = /[^\r\n\t <>"'\\;,=]/;
+const SPACE_BEFORE_JSON = /^[ \t]*[{[]/;
+
+/**
+ * Reads an unquoted cookie header value from `start`: it runs across ";"/"," separated pairs whose
+ * values may themselves be quoted, and ends before a ";"/"," or a space that precedes the next header
+ * token or a JSON fragment, at a raw newline or tab, at a literal escape, or at a bare quote. A pair
+ * value opened with a quote is read quote-aware, and an unterminated one ends the whole value there so
+ * the following header keeps its name. Returns the index just past the value.
+ */
+function readUnquotedCookieValue(text: string, start: number): number {
+  if (!COOKIE_PLAIN_CHAR.test(text[start] ?? "")) return start;
+  let i = start + 1;
+  while (i < text.length) {
+    const ch = text[i];
+    if (COOKIE_PLAIN_CHAR.test(ch)) {
+      i += 1;
+      continue;
+    }
+    if (ch === "=") {
+      i += 1;
+      while (text[i] === " " || text[i] === "\t") i += 1;
+      const opener = openingQuoteUnit(text, i);
+      if (opener) {
+        const read = readQuotedContent(text, opener.contentStart, opener.backslashes, opener.quoteChar);
+        if (!read.terminated) return read.end;
+        i = read.end;
+      }
+      continue;
+    }
+    if (ch === ";" || ch === ",") {
+      if (endsAtNextHeader(text, i)) break;
+      i += 1;
+      continue;
+    }
+    if (ch === " " || ch === "\t") {
+      if (SPACE_BEFORE_JSON.test(text.slice(i + 1))) break;
+      i += 1;
+      continue;
+    }
+    break;
+  }
+  return i;
+}
+
+// A cookie or session header at a carrier start, up to the separator; the value is read procedurally.
+const COOKIE_HEADER_START = new RegExp(String.raw`${CARRIER_START}(set-cookie|cookies?)(${QUOTE_UNIT}?\s*[:=]\s*)`, "gi");
+
+/**
+ * Removes the value of every Cookie and Set-Cookie header. A wholly quoted value is read to its
+ * matching closer (an escaped inner quote at any JSON depth is inner content); an unquoted value runs
+ * across its pairs and ends before the next header token, so the following header keeps its name. The
+ * marker `[REDACTED]` is left untouched so the pass is idempotent.
+ */
+function scrubCookieHeaders(text: string): string {
+  COOKIE_HEADER_START.lastIndex = 0;
+  let out = "";
+  let last = 0;
+  let match: RegExpExecArray | null;
+  while ((match = COOKIE_HEADER_START.exec(text)) !== null) {
+    const [whole, header, separator] = match;
+    if (whole.length === 0) {
+      COOKIE_HEADER_START.lastIndex += 1;
+      continue;
+    }
+    const valueStart = match.index + whole.length;
+    const opener = openingQuoteUnit(text, valueStart);
+    let prefix: string;
+    let redacted: string;
+    let end: number;
+    if (opener) {
+      const read = readQuotedContent(text, opener.contentStart, opener.backslashes, opener.quoteChar);
+      if (read.content.length === 0 || read.content === REDACTED) {
+        COOKIE_HEADER_START.lastIndex = valueStart;
+        continue;
+      }
+      const openerText = text.slice(valueStart, opener.contentStart);
+      const closerText = read.terminated ? text.slice(read.end - (opener.backslashes + 1), read.end) : "";
+      prefix = openerText;
+      redacted = `${REDACTED}${closerText}`;
+      end = read.end;
+    } else {
+      const valueEnd = readUnquotedCookieValue(text, valueStart);
+      if (valueEnd === valueStart) {
+        COOKIE_HEADER_START.lastIndex = valueStart;
+        continue;
+      }
+      let contentEnd = valueEnd;
+      while (contentEnd > valueStart && (text[contentEnd - 1] === " " || text[contentEnd - 1] === "\t")) contentEnd -= 1;
+      if (text.slice(valueStart, contentEnd) === REDACTED) {
+        COOKIE_HEADER_START.lastIndex = valueStart;
+        continue;
+      }
+      prefix = "";
+      redacted = `${REDACTED}${text.slice(contentEnd, valueEnd)}`;
+      end = valueEnd;
+    }
+    out += `${text.slice(last, match.index)}${header}${separator}${prefix}${redacted}`;
+    last = end;
+    COOKIE_HEADER_START.lastIndex = last;
+  }
+  return last === 0 ? text : `${out}${text.slice(last)}`;
 }
 
 /**
@@ -613,7 +776,7 @@ function replaceCredentialAssignments(text: string): string {
   let last = 0;
   let match: RegExpExecArray | null;
   while ((match = ASSIGNMENT_KEY_PATTERN.exec(text)) !== null) {
-    const [whole, openingQuote, key, separator, separatorChar] = match;
+    const [whole, openingQuote, key, separator, separatorChar, valueOpenQuote] = match;
     if (whole.length === 0) {
       ASSIGNMENT_KEY_PATTERN.lastIndex += 1;
       continue;
@@ -622,22 +785,53 @@ function replaceCredentialAssignments(text: string): string {
     if (rule === "none") continue;
     if (openingQuote === "" && separatorChar === ":" && isBarePathSegment(text, match.index, urlSpans)) continue;
     const valueStart = match.index + whole.length;
-    ASSIGNMENT_VALUE_PATTERN.lastIndex = valueStart;
-    const value = ASSIGNMENT_VALUE_PATTERN.exec(text)?.[0];
-    if (value === undefined) continue;
     let kept = "";
-    let consumed = value.length;
+    let consumed: number;
     let replacement = REDACTED;
-    if (SCHEME_WORD_PATTERN.test(value)) {
-      const token = SCHEME_TOKEN_PATTERN.exec(text.slice(valueStart + value.length));
-      if (!token) continue;
-      kept = `${value}${token[1]}${token[2]}`;
-      consumed += token[0].length;
-    } else if (rule === "setting") {
-      if (!isTokenShapedValue(value)) continue;
-    } else if (rule === "webhook") {
-      replacement = webhookReplacement(value);
-      if (text.startsWith(REDACTED, valueStart + consumed)) consumed += REDACTED.length;
+    if (valueOpenQuote !== "") {
+      // The value is quoted; read to its matching closer so an escaped inner quote at any JSON depth stays inner content and the value never ends early.
+      const { content } = readQuotedContent(text, valueStart, valueOpenQuote.length - 1, valueOpenQuote[valueOpenQuote.length - 1] ?? '"');
+      if (content.length === 0 || content === REDACTED) {
+        ASSIGNMENT_KEY_PATTERN.lastIndex = valueStart;
+        continue;
+      }
+      consumed = content.length;
+      const lead = LEADING_SCHEME_IN_VALUE.exec(content);
+      if (lead && SCHEME_WORD_PATTERN.test(lead[1])) {
+        if (lead[3].startsWith(REDACTED)) {
+          ASSIGNMENT_KEY_PATTERN.lastIndex = valueStart;
+          continue;
+        }
+        kept = `${lead[1]}${lead[2]}`;
+        const firstPair = PAIR_LIST_START.test(lead[3]) ? SCHEME_TOKEN_PATTERN.exec(text.slice(valueStart + lead[1].length)) : null;
+        if (firstPair) {
+          kept = `${lead[1]}${firstPair[1]}${firstPair[2]}`;
+          consumed = lead[1].length + firstPair[0].length;
+        }
+      } else if (rule === "setting") {
+        if (!isTokenShapedValue(content)) {
+          ASSIGNMENT_KEY_PATTERN.lastIndex = valueStart;
+          continue;
+        }
+      } else if (rule === "webhook") {
+        replacement = webhookReplacement(content);
+      }
+    } else {
+      ASSIGNMENT_VALUE_PATTERN.lastIndex = valueStart;
+      const value = ASSIGNMENT_VALUE_PATTERN.exec(text)?.[0];
+      if (value === undefined) continue;
+      consumed = value.length;
+      if (SCHEME_WORD_PATTERN.test(value)) {
+        const token = SCHEME_TOKEN_PATTERN.exec(text.slice(valueStart + value.length));
+        if (!token) continue;
+        kept = `${value}${token[1]}${token[2]}`;
+        consumed += token[0].length;
+      } else if (rule === "setting") {
+        if (!isTokenShapedValue(value)) continue;
+      } else if (rule === "webhook") {
+        replacement = webhookReplacement(value);
+        if (text.startsWith(REDACTED, valueStart + consumed)) consumed += REDACTED.length;
+      }
     }
     out += `${text.slice(last, match.index)}${openingQuote}${key}${separator}${kept}${replacement}`;
     last = valueStart + consumed;
@@ -654,8 +848,8 @@ export function scrubErrorText(text: string, secrets: ReadonlyArray<string | und
   let scrubbed = text.replace(PEM_BLOCK_PATTERN, REDACTED).replace(PEM_OPEN_PATTERN, REDACTED);
   scrubbed = scrubConfiguredSecrets(scrubbed, secrets)
     .replace(EMBEDDED_URL_PATTERN, scrubEmbeddedUrl)
-    .replace(QUERY_PAIR_PATTERN, scrubQueryPair)
-    .replace(COOKIE_HEADER_PATTERN, scrubCookieHeader);
+    .replace(QUERY_PAIR_PATTERN, scrubQueryPair);
+  scrubbed = scrubCookieHeaders(scrubbed);
   scrubbed = replaceCredentialAssignments(scrubbed)
     .replace(SCHEME_VALUE_PATTERN, scrubSchemeValue)
     .replace(JWT_IN_TEXT_PATTERN, REDACTED)
