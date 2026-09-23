@@ -545,6 +545,46 @@ test("must-redact: a token-shaped value under a setting key beside a credential 
   assert.equal(scrubDataText("OKTA_CLIENT_ID=0oa1b2c3d4e5f6g7h8i9"), "OKTA_CLIENT_ID=0oa1b2c3d4e5f6g7h8i9");
 });
 
+test("must-redact: a token-shaped value under a non-URL webhook setting goes by shape through every scrub, the data scrubs included, while the setting's count, id, and name values stay", () => {
+  // Review of #78 (01:40 rulings) and the merge bar for #81: `webhook_count`, `webhook_id`, and
+  // `webhook_name` are settings (`main` at `b47f90d` redacted them whole; the frozen harness keeps
+  // `webhook_count=3`), and a token-shaped value under one still goes as it did on `main`, so the
+  // ruling narrows the keys and not the shapes that go (`isCredentialWordSetting`).
+  const carriers = Object.freeze([
+    (key, value) => `${key}=${value}`,
+    (key, value) => `${key}: ${value}`,
+    (key, value) => `{"${key}":"${value}"}`,
+    (key, value) => `listing webhooks failed with ${key}=${value} and status 500`,
+  ]);
+  const keys = ["webhook_count", "webhook_id", "webhook_name", "webhookId", "WEBHOOK_NAME", "slack_webhook_id", "webhooks_limit"];
+  for (const value of [ERROR_CANARY.apiKey, "Kq7Zx2Vw9Lm4Tp8RwQ12", "0f9e8d7c6b5a49382716f5e4d3c2b1a09f8e7d6c"]) {
+    for (const key of keys) {
+      for (const carrier of carriers) {
+        const text = carrier(key, value);
+        for (const [scrubName, scrub] of SCRUBS) {
+          const scrubbed = scrub(text);
+          assertNoFragment(scrubbed, value, { label: `${scrubName} on ${text}` });
+          assert.equal(scrubbed, carrier(key, REDACTED), `${scrubName}: only the token-shaped run goes, the key and the rest of the line stay: ${scrubbed}`);
+        }
+      }
+      assert.deepEqual(redactSecretValues({ [key]: value, page: 2 }), { [key]: REDACTED, page: 2 });
+    }
+  }
+  // The setting's own values stay, as the 01:40 ruling and the frozen harness require.
+  for (const [key, value] of [
+    ["webhook_count", "3"],
+    ["webhook_id", "wh-2026-primary"],
+    ["webhook_id", "6f1c2d3e-4a5b-4c6d-a7e8-9f0a1b2c3d4e"],
+    ["webhook_name", "deploy-notifier"],
+    ["webhooks_limit", "25"],
+  ]) {
+    for (const carrier of carriers) {
+      const text = carrier(key, value);
+      for (const [scrubName, scrub] of SCRUBS) assert.equal(scrub(text), text, `${scrubName} on ${text}`);
+    }
+  }
+});
+
 test("must-keep: a URL under a setting key passes the URL rule, userinfo and query removed and the path kept, and a webhook URL under a setting key goes only by its query", () => {
   for (const [text, expected] of [
     ["BOX_TOKEN_URL=https://user:pw@api.box.com/oauth2/token?client_secret=abc#frag", `BOX_TOKEN_URL=https://api.box.com/oauth2/token?${REDACTED}#${REDACTED}`],

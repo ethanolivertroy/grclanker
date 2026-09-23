@@ -533,14 +533,19 @@ function isAuthorizationKey(key: string): boolean {
 
 /**
  * A setting whose earlier segments name a credential (`token_url`, `BOX_AUTH_METHOD`, `private_key_id`,
- * `api_key_name`): the value is a setting and stays, except that a token-shaped run inside it goes
- * under every scrub, the data scrubs included (see `SETTING_SUFFIXES`). A key the bearer overrides
- * keep as a credential key (`session_id`, `secret_id`) is never a setting.
+ * `api_key_name`) or a webhook (`webhook_count`, `webhook_id`, `webhook_name`, `slack_webhook_id`; see
+ * `WEBHOOK_KEY_PATTERN`): the value is a setting and stays, except that a token-shaped run inside it
+ * goes under every scrub, the data scrubs included (see `SETTING_SUFFIXES`). The webhook settings
+ * were credential keys on `main` before the 01:40 ruling made them settings, so a token-shaped value
+ * under one goes as it did there while `webhook_count=3` and `webhook_name=deploy-hook` stay. A key
+ * the bearer overrides keep as a credential key (`session_id`, `secret_id`) is never a setting.
  */
 function isCredentialWordSetting(key: string): boolean {
   if (!isSettingKey(key) || isCredentialKey(key)) return false;
   const segments = keySegments(key);
-  return segments.length > 1 && namesCredential(segments.slice(0, -1).join("_"));
+  if (segments.length < 2) return false;
+  const stem = segments.slice(0, -1).join("_");
+  return namesCredential(stem) || WEBHOOK_KEY_PATTERN.test(stem);
 }
 
 /**
