@@ -15,6 +15,12 @@
  * checked against the harness vocabulary so no 6-character window of one occurs in a value the
  * output may keep.
  *
+ * Revision 2 (01:40 rulings) adds the bearer-id `token_id`, the setting suffixes `ttl`, `max_ttl`,
+ * `num_uses`, `bound_cidrs`, `accessor` and the URL-only webhook exception, flag and path carriers,
+ * the scheme-word-order row, slash-escaped URLs, the query-separator cookie row, and any-casing
+ * scheme words. Percent-encoded and JavaScript hex line breaks run as informational rows: counted
+ * in the report, never a leak in the gating totals, never a throw from `assertNoLeaks`.
+ *
  * Depends only on `node:` modules and `./bundle-contents.mjs`; runs on Node 22.19 or newer.
  */
 import { readBundleFiles, readZipEntries } from "./bundle-contents.mjs";
@@ -23,6 +29,7 @@ export const WINDOW_MIN = 6;
 export const WINDOW_MAX = 24;
 export const DISTINCT_WINDOW = 8;
 const MAX_EXAMPLES_PER_CLASS = 20;
+const MAX_INFORMATIONAL_EXAMPLES = 10;
 const MAX_DEPTH_PROBE = 80;
 const DEFAULT_SEED = 0x5eed2026;
 const DEFAULT_ORIGIN = "https://api.example.com";
@@ -59,11 +66,54 @@ export const GENERIC_CREDENTIAL_KEYS = Object.freeze([
 
 /**
  * Keys that end in an identifier suffix but carry a bearer credential: a Vault AppRole secret id is a
- * UUID and a session id is the session, so their values go whatever the shape (CodeRabbit
- * r4077259415 on #78 `e848385`; the bearer-id override is checked before the setting-suffix test).
+ * UUID, a token id is the token, and a session id is the session, so their values go whatever the
+ * shape (CodeRabbit r4077259415 on #78 `e848385`; the bearer-id override is checked before the
+ * setting-suffix test; `token_id` joined it in the 01:40 rulings, fail closed).
  */
-export const BEARER_ID_KEYS = Object.freeze(["secret_id", "VAULT_SECRET_ID", "role_secret_id", "roleSecretId"]);
+export const BEARER_ID_KEYS = Object.freeze(["secret_id", "VAULT_SECRET_ID", "role_secret_id", "roleSecretId", "token_id", "tokenId"]);
 export const SESSION_ID_KEYS = Object.freeze(["session_id", "sid", "jsessionid", "PHPSESSID"]);
+
+/**
+ * Setting keys whose final segment the 01:40 rulings added to the setting suffixes (`ttl`, `max_ttl`,
+ * `num_uses`, `bound_cidrs`, `accessor`: the AppRole settings an assessment reports) and the webhook
+ * exception narrowed to URL-valued keys (`webhook_count` keeps its value). Each is `[key, value]`;
+ * every value must survive every scrub.
+ */
+export const SETTING_SUFFIX_CONTROLS = Object.freeze([
+  Object.freeze(["secret_id_ttl", "3600"]),
+  Object.freeze(["secret_id_num_uses", "5"]),
+  Object.freeze(["token_max_ttl", "7200"]),
+  Object.freeze(["token_num_uses", "0"]),
+  Object.freeze(["secret_id_bound_cidrs", "10.0.0.0/8"]),
+  Object.freeze(["token_bound_cidrs", "10.0.0.0/8"]),
+  Object.freeze(["webhook_count", "3"]),
+]);
+
+/**
+ * Setting keys ending in `accessor` (a Vault accessor is a UUID); their value is a UUID canary and
+ * must survive every scrub, so it lives beside the identifier controls rather than in the fixed list.
+ */
+export const SETTING_SUFFIX_UUID_CONTROL_KEYS = Object.freeze(["secret_id_accessor", "token_accessor"]);
+
+/**
+ * Scheme words every scrubber recognises in any casing on both sides (01:40 ruling, row B); an
+ * integration's own `schemeWords` are added to these.
+ */
+export const FIXED_SCHEME_WORDS = Object.freeze(["Bearer", "Basic", "Token", "Digest", "OAuth", "Negotiate", "NTLM", "SSWS", "ApiKey", "Api-Key", "Splunk"]);
+
+/**
+ * Credential names probed in flag and path position (reviewer #78 row D): `=` after a
+ * credential-named segment is a pair whatever precedes the name, `--name=v`, `--name v`, `-Dname=v`,
+ * and `-Dprefix.name=v` are carriers, and `:` after a path segment removes a single-token value.
+ */
+const FLAG_PATH_KEYS = Object.freeze(["password", "api_key", "api-key", "client_secret", "client-secret", "token", "access_token", "secret_id", "DB_PASSWORD", "X-Api-Key", "private-key"]);
+
+/**
+ * Line-break encodings the principal ruled NON-GATING for every PR in this effort: percent-encoded
+ * and JavaScript hex line breaks before a carrier opener run as informational rows (counted in the
+ * report, never a leak in the gating totals, never a throw from `assertNoLeaks`).
+ */
+export const INFORMATIONAL_ESCAPE_FORMS = Object.freeze(["%0A", "%0D%0A", "%09", "\\x0a", "\\x09", "\\x0d\\x0a"]);
 
 /** Human-chosen password shapes the shape gate let through (reviewer D round 5 baseline). */
 export const FIXED_PASSWORDS = Object.freeze([
@@ -104,7 +154,38 @@ const VOCABULARY = Object.freeze([
   ...CONTROL_HEADER_LINES,
   ...PLAIN_SETTING_VALUES,
   ...IDENTIFIER_PLAIN_VALUES,
+  ...SETTING_SUFFIX_CONTROLS.flat(),
+  ...SETTING_SUFFIX_UUID_CONTROL_KEYS,
+  ...FIXED_SCHEME_WORDS,
+  ...FLAG_PATH_KEYS,
+  ...INFORMATIONAL_ESCAPE_FORMS,
   NAME_SHAPED_DATA_VALUE,
+  "mysql",
+  "psql",
+  "curl",
+  "java",
+  "-h db",
+  "-jar app.jar",
+  "spring.datasource",
+  "path/",
+  "see log",
+  "kv/",
+  "/api/v1/api-tokens: request failed with 403",
+  "helm --set db.password",
+  "upgrade",
+  "x_password",
+  "(password",
+  "a,password",
+  "sslPassword",
+  "db_password",
+  "rejected",
+  "pref",
+  "webhook",
+  "proxy.example.com",
+  "api.example.com",
+  "upstream",
+  "refused",
+  "request url",
   "client_id",
   "tenant_id",
   "access_key_id",
@@ -271,7 +352,7 @@ export function makeCanaries(n = 8, fixtureText = "", { seed = DEFAULT_SEED } = 
   };
   const many = (count, generate, shape) => Array.from({ length: count }, () => fresh(generate, shape));
   const tokens = many(Math.max(n, 4), () => pick(random, ALNUM, 32), isTokenShaped);
-  const nameShaped = many(3, () => pick(random, LOWER, 12));
+  const nameShaped = many(5, () => pick(random, LOWER, 12));
   const alphabetic = many(3, () => pick(random, LOWER, 9));
   const short = many(3, () => `${pick(random, LOWER, 3)}${pick(random, DIGITS, 2)}`);
   const digitGroup = many(3, () => `${pick(random, LOWER, 7)}${pick(random, DIGITS, 4)}`);
@@ -329,8 +410,21 @@ export function assertCanariesDisjoint(canaries, fixtureText) {
 // `mustKeep` strings present whole; `sinks` names the scrubber set ("error", "data", or "all").
 // ---------------------------------------------------------------------------------------------
 
-function cell(label, input, { planted = [], mustKeep = [], mustRemove = [], sinks = "all" } = {}) {
-  return { label, input, planted: planted.filter(Boolean), mustKeep: mustKeep.filter(Boolean), mustRemove: mustRemove.filter(Boolean), sinks };
+function cell(label, input, { planted = [], mustKeep = [], mustRemove = [], sinks = "all", informational = false } = {}) {
+  return { label, input, planted: planted.filter(Boolean), mustKeep: mustKeep.filter(Boolean), mustRemove: mustRemove.filter(Boolean), sinks, informational };
+}
+
+/** A token index that stays inside the canary set an integration may have sized itself. */
+function tokenAt(canaries, index) {
+  return canaries.tokens[index % canaries.tokens.length];
+}
+
+function nameShapedAt(canaries, index) {
+  return canaries.nameShaped[index % canaries.nameShaped.length];
+}
+
+function alternateCase(word) {
+  return [...word].map((character, index) => (index % 2 === 0 ? character.toLowerCase() : character.toUpperCase())).join("");
 }
 
 const PAIR_FORMS = Object.freeze([
@@ -415,7 +509,20 @@ function credentialPairCells(options, canaries) {
   const webhook = `https://hooks.example.com/services/T/B/${canaries.tokens[2]}`;
   for (const [formName, form] of PAIR_FORMS) {
     cells.push(cell(`webhook_url loses path and query / ${formName}`, form("webhook_url", webhook), { planted: [canaries.tokens[2]], mustRemove: ["services/T/B"], mustKeep: ["webhook_url"] }));
+    cells.push(cell(`bare webhook loses path and query / ${formName}`, form("webhook", webhook), { planted: [canaries.tokens[2]], mustRemove: ["services/T/B"], mustKeep: ["webhook"] }));
   }
+  for (const [key, value] of SETTING_SUFFIX_CONTROLS) {
+    for (const [formName, form] of PAIR_FORMS) {
+      cells.push(cell(`setting suffix control ${key}=${value} / ${formName}`, form(key, value), { mustKeep: [key, value] }));
+    }
+  }
+  for (const key of SETTING_SUFFIX_UUID_CONTROL_KEYS) {
+    for (const [formName, form] of PAIR_FORMS) {
+      cells.push(cell(`setting suffix control ${key}=<uuid> / ${formName}`, form(key, canaries.uuid[1]), { mustKeep: [key, canaries.uuid[1]] }));
+    }
+  }
+  cells.push(...flagAndPathCarrierCells(options, canaries));
+  cells.push(...schemeWordOrderCells(options, canaries));
   for (const key of unique(options.identifierKeys ?? [])) {
     for (const value of IDENTIFIER_PLAIN_VALUES) {
       for (const [formName, form] of PAIR_FORMS) {
@@ -430,6 +537,76 @@ function credentialPairCells(options, canaries) {
     cells.push(cell("configured secret in prose", `the value ${secret} was echoed by the proxy`, { planted: [secret], mustKeep: ["echoed by the proxy"] }));
     cells.push(cell("configured secret under a setting key", `auth_method=${secret}`, { planted: [secret], mustKeep: ["auth_method"] }));
     cells.push(cell("configured secret in a JSON member", `{"detail":"${secret}"}`, { planted: [secret], mustKeep: ["detail"] }));
+  }
+  return cells;
+}
+
+/**
+ * Reviewer #78 row D: a credential name after `--`, `-D`, or `/` is a carrier (CLI flags echoed in a
+ * spawned CLI's stderr, path segments), with the controls the ruling keeps (a bare path label whose
+ * `:` continues as prose) and the pair positions main already handled.
+ */
+function flagAndPathCarrierCells(options, canaries) {
+  const cells = [];
+  const keys = unique([...FLAG_PATH_KEYS, ...(options.credentialKeys ?? [])]);
+  const values = [
+    ["word", nameShapedAt(canaries, 3)],
+    ["token", tokenAt(canaries, 8)],
+  ];
+  const forms = [
+    ["--NAME=v after a command", (key, value) => `mysql --${key}=${value} -h db`, (key) => [`mysql --${key}`, "-h db"]],
+    ["--NAME v after a command", (key, value) => `psql --${key} ${value} -h db`, (key) => [`psql --${key}`, "-h db"]],
+    ["--NAME=v at line start", (key, value) => `--${key}=${value}`, (key) => [`--${key}`]],
+    ["--NAME=v before a URL", (key, value) => `curl --${key}=${value} https://api.example.com/v1`, (key) => [`curl --${key}`, "https://api.example.com/v1"]],
+    ["-DNAME=v", (key, value) => `java -D${key}=${value} -jar app.jar`, (key) => [`java -D${key}`, "-jar app.jar"]],
+    ["-Dprefix.NAME=v", (key, value) => `java -Dspring.datasource.${key}=${value} -jar app.jar`, (key) => [`java -Dspring.datasource.${key}`, "-jar app.jar"]],
+    ["path/NAME=v", (key, value) => `path/${key}=${value} see log`, (key) => [`path/${key}`, "see log"]],
+    ["/NAME=v at line start", (key, value) => `/${key}=${value}`, (key) => [`/${key}`]],
+    ["kv/NAME: v (single token)", (key, value) => `kv/${key}: ${value}`, (key) => [`kv/${key}`]],
+  ];
+  for (const key of keys) {
+    for (const [valueName, value] of values) {
+      for (const [formName, form, keep] of forms) {
+        cells.push(cell(`flag or path carrier ${key} / ${valueName} / ${formName}`, form(key, value), { planted: [value], mustKeep: keep(key) }));
+      }
+    }
+  }
+  cells.push(cell("path label control: /api/v1/api-tokens: prose continuation", "/api/v1/api-tokens: request failed with 403", { mustKeep: ["/api/v1/api-tokens: request failed with 403"] }));
+  for (const [valueName, value] of values) {
+    cells.push(cell(`flag control --set db.password=v / ${valueName}`, `helm --set db.password=${value} upgrade`, { planted: [value], mustKeep: ["helm --set db.password", "upgrade"] }));
+    cells.push(cell(`compound control x_password=v / ${valueName}`, `x_password=${value}`, { planted: [value], mustKeep: ["x_password"] }));
+    cells.push(cell(`parenthesis control (password=v) / ${valueName}`, `(password=${value})`, { planted: [value], mustKeep: ["(password"] }));
+    cells.push(cell(`comma control a,password=v / ${valueName}`, `a,password=${value}`, { planted: [value], mustKeep: ["a,password"] }));
+  }
+  return cells;
+}
+
+/**
+ * CodeRabbit r4078025849 on #63: a credential-named key whose value starts with a scheme word is
+ * redacted unconditionally (`sslPassword=splunk rejected`, `db_password: token`); the scheme-word
+ * branches apply only to Authorization-style keys and bare scheme words in prose. The scheme word is
+ * the value, so it must go; a prose continuation after it may stay. Keys that contain the scheme word
+ * themselves are left out of that scheme's rows so the key cannot be read as the surviving value.
+ */
+function schemeWordOrderCells(options, canaries) {
+  const cells = [];
+  const keys = unique(["sslPassword", "db_password", ...GENERIC_CREDENTIAL_KEYS, ...(options.credentialKeys ?? [])]);
+  const schemes = unique(["splunk", "token", "bearer", "Basic", ...(options.schemeWords ?? [])]);
+  const forms = [
+    ["NAME=<scheme> rejected", (key, scheme) => `${key}=${scheme} rejected`, (scheme) => [`=${scheme}`]],
+    ["NAME: <scheme>", (key, scheme) => `${key}: ${scheme}`, (scheme) => [`: ${scheme}`]],
+    ['NAME="<scheme> rejected"', (key, scheme) => `${key}="${scheme} rejected"`, (scheme) => [`"${scheme}`]],
+    ['"NAME": "<scheme>"', (key, scheme) => `"${key}": "${scheme}"`, (scheme) => [`"${scheme}"`]],
+  ];
+  const continuation = nameShapedAt(canaries, 4);
+  for (const key of keys) {
+    for (const scheme of schemes) {
+      if (key.toLowerCase().includes(scheme.toLowerCase())) continue;
+      for (const [formName, form, remove] of forms) {
+        cells.push(cell(`scheme-word order ${key} / ${scheme} / ${formName}`, form(key, scheme), { mustRemove: remove(scheme), mustKeep: [key] }));
+      }
+      cells.push(cell(`scheme-word order ${key} / ${scheme} / NAME=<scheme> <word>`, `${key}=${scheme} ${continuation}`, { mustRemove: [`=${scheme}`], mustKeep: [key] }));
+    }
   }
   return cells;
 }
@@ -462,19 +639,19 @@ function escapeBoundaryCells(options, canaries) {
     ["inside a JSON string member", (escape, carrier) => `{"detail":"request failed${escape}${carrier} see the log"}`, ["failed", "detail"]],
     ["after a colon-terminated word", (escape, carrier) => `request headers:${escape}${carrier} see the log`, ["headers"]],
   ];
+  const carriersFor = (value) => [
+    ...headerCarrierLines(options, value),
+    ...pairKeys.flatMap((key) => [
+      [`${key}=`, `${key}=${value}`, [key]],
+      [`${key}: `, `${key}: ${value}`, [key]],
+    ]),
+    ["URL userinfo", `https://svc:${value}@api.example.com/v1/items`, ["api.example.com"]],
+    ["Cookie: theme=", `Cookie: theme=${value}`, ["Cookie"]],
+  ];
   const prefixes = [...ESCAPE_FORMS.map((literal) => [`escape ${JSON.stringify(literal)}`, literal]), ...DECODED_CONTROLS.map((decoded) => [`decoded control ${JSON.stringify(decoded)}`, decoded])];
   for (const [prefixName, escape] of prefixes) {
     for (const [valueName, value] of values) {
-      const carriers = [
-        ...headerCarrierLines(options, value),
-        ...pairKeys.flatMap((key) => [
-          [`${key}=`, `${key}=${value}`, [key]],
-          [`${key}: `, `${key}: ${value}`, [key]],
-        ]),
-        ["URL userinfo", `https://svc:${value}@api.example.com/v1/items`, ["api.example.com"]],
-        ["Cookie: theme=", `Cookie: theme=${value}`, ["Cookie"]],
-      ];
-      for (const [carrierName, carrier, keep] of carriers) {
+      for (const [carrierName, carrier, keep] of carriersFor(value)) {
         for (const [contextName, context, contextKeep] of contexts) {
           cells.push(cell(`${prefixName} / ${carrierName} / ${valueName} / ${contextName}`, context(escape, carrier), { planted: [value], mustKeep: [...keep, ...contextKeep] }));
         }
@@ -483,6 +660,34 @@ function escapeBoundaryCells(options, canaries) {
     for (const [contextName, context, contextKeep] of contexts) {
       cells.push(cell(`${prefixName} / control Content-Type / ${contextName}`, context(escape, "Content-Type: application/json"), { mustKeep: ["Content-Type: application/json", ...contextKeep] }));
       cells.push(cell(`${prefixName} / control X-Request-Id / ${contextName}`, context(escape, `X-Request-Id: ${canaries.uuid[1]}`), { mustKeep: [`X-Request-Id: ${canaries.uuid[1]}`, ...contextKeep] }));
+    }
+  }
+  // Percent-encoded and JavaScript hex line breaks: the same rows, informational by the principal's ruling.
+  for (const literal of INFORMATIONAL_ESCAPE_FORMS) {
+    for (const [valueName, value] of values) {
+      for (const [carrierName, carrier, keep] of carriersFor(value)) {
+        for (const [contextName, context, contextKeep] of contexts) {
+          cells.push(cell(`informational escape ${JSON.stringify(literal)} / ${carrierName} / ${valueName} / ${contextName}`, context(literal, carrier), { planted: [value], mustKeep: [...keep, ...contextKeep], informational: true }));
+        }
+      }
+    }
+  }
+  // Slash-escaped URLs (reviewer #78 row C): `:\/\/` is a URL like `://`, losing userinfo and query.
+  const urlContexts = [
+    ["bare", (url) => `upstream ${url} refused`, ["upstream", "refused"]],
+    ["inside a JSON string member", (url) => `{"detail":"upstream ${url} refused"}`, ["upstream", "refused", "detail"]],
+    ["after a colon-terminated word", (url) => `request url: ${url}`, ["request url"]],
+  ];
+  for (const [valueName, value] of values) {
+    const urls = [
+      ["slash-escaped https URL userinfo", `https:\\/\\/svc:${value}@api.example.com\\/v1\\/items`, ["api.example.com"]],
+      ["slash-escaped proxy URL userinfo", `proxy:\\/\\/svc:${value}@proxy.example.com:8080`, ["proxy.example.com"]],
+      ["slash-escaped https URL query", `https:\\/\\/api.example.com\\/v1\\/items?token=${value}&x=1`, ["api.example.com"]],
+    ];
+    for (const [urlName, url, keep] of urls) {
+      for (const [contextName, context, contextKeep] of urlContexts) {
+        cells.push(cell(`${urlName} / ${valueName} / ${contextName}`, context(url), { planted: [value], mustKeep: [...keep, ...contextKeep] }));
+      }
     }
   }
   return cells;
@@ -512,6 +717,14 @@ function cookieHeaderNameCells(canaries) {
     const attributes = `Set-Cookie: session=${value}; Path=/; HttpOnly; Expires=Wed, 21 Oct 2026 07:28:00 GMT${separator}${followingKeep.join(separator)}`;
     cells.push(cell(`cookie attributes before the next header (${JSON.stringify(separator.trim())})`, attributes, { planted: [value], mustKeep: ["Set-Cookie", ...followingKeep] }));
   }
+  // CodeRabbit r4077655607 on `dd7426e`: a query-pair value that may hold `;` consumes the cookie
+  // separator before the cookie reader runs and the later pair survives; expected `Cookie: [REDACTED]`.
+  const later = nameShapedAt(canaries, 4);
+  for (const symbol of ["&", "#"]) {
+    cells.push(cell(`${symbol} cookie name then a later pair (query separator)`, `Cookie: ${symbol}sid=${value}; pref=${later}`, { planted: [value, later], mustKeep: ["Cookie"] }));
+    cells.push(cell(`${symbol} cookie name then a later pair before a header`, `Cookie: ${symbol}sid=${value}; pref=${later}; X-Request-Id: ${uuid}`, { planted: [value, later], mustKeep: ["Cookie", `X-Request-Id: ${uuid}`] }));
+  }
+  cells.push(cell("& cookie name in Set-Cookie before attributes", `Set-Cookie: &sid=${value}; Path=/; HttpOnly`, { planted: [value], mustKeep: ["Set-Cookie"] }));
   cells.push(cell("following header whose name holds a dot", `Cookie: sid=${value}; X.Api.Key: ${second}; Content-Type: text/plain`, { planted: [value, second], mustKeep: ["Cookie", "X.Api.Key", "Content-Type: text/plain"] }));
   cells.push(cell("controls after a cookie value", `Cookie: sid=${value}; ${following}`, { planted: [value], mustKeep: ["Cookie", ...followingKeep] }));
   return cells;
@@ -547,13 +760,14 @@ function quotedCompoundHeaderCells(canaries) {
 
 function schemeCasingCells(options, canaries) {
   const cells = [];
-  const schemes = unique([...(options.schemeWords ?? []), "Bearer"]);
+  const schemes = unique([...FIXED_SCHEME_WORDS, ...(options.schemeWords ?? [])]);
   const values = [
     ["token", canaries.tokens[7]],
     ["opaque", canaries.opaque[0]],
   ];
   for (const scheme of schemes) {
-    const casings = unique([scheme.toLowerCase(), scheme.toUpperCase(), scheme]);
+    // Lower, upper, the given spelling, and an alternating one: any casing matches (01:40 ruling).
+    const casings = unique([scheme.toLowerCase(), scheme.toUpperCase(), scheme, alternateCase(scheme)]);
     for (const spelled of casings) {
       for (const [valueName, value] of values) {
         cells.push(cell(`scheme ${spelled} in a header / ${valueName}`, `Authorization: ${spelled} ${value}`, { planted: [value], mustKeep: ["Authorization", spelled] }));
@@ -766,12 +980,21 @@ class ClassResult {
     this.idempotenceFailures = 0;
     this.entryPoints = new Set();
     this.examples = [];
+    // Informational rows: run and counted, never part of the gating totals.
+    this.informationalCells = 0;
+    this.informational = 0;
+    this.informationalEntryPoints = new Set();
+    this.informationalExamples = [];
     this.skipped = null;
     this.notes = [];
   }
 
   example(kind, detail) {
     if (this.examples.length < MAX_EXAMPLES_PER_CLASS) this.examples.push({ kind, ...detail });
+  }
+
+  informationalExample(kind, detail) {
+    if (this.informationalExamples.length < MAX_INFORMATIONAL_EXAMPLES) this.informationalExamples.push({ kind, ...detail });
   }
 }
 
@@ -790,8 +1013,10 @@ function fixtureTextOf(options) {
 
 /**
  * Runs every class the integration wires and returns `{ integration, classes, leaks, mustKeepLosses,
- * idempotenceFailures, report, ok, canaries, revision }`. Every option is optional except
- * `integration`; a class whose runner is missing is skipped and the report says so.
+ * idempotenceFailures, informational, report, ok, canaries }`. Every option is optional except
+ * `integration`; a class whose runner is missing is skipped and the report says so. `ok` and
+ * `assertNoLeaks` read the three gating lists; `informational` holds the observations on the
+ * non-gating rows (per class: `informationalCells`, `informational`, `informationalEntryPoints`).
  *
  * - `textScrubbers: { error: [sink], data: [sink] }`, a sink being a function or
  *   `{ name, fn(text), idempotent }`; `idempotent: false` marks a wrapping entry point whose second
@@ -826,36 +1051,48 @@ export async function runLeakProbe(options) {
   const leaks = [];
   const mustKeepLosses = [];
   const idempotenceFailures = [];
+  const informational = [];
 
+  // An observation on an informational row is counted and shown, never gated on.
+  const recordInformational = (cls, kind, detail) => {
+    cls.informational += 1;
+    cls.informationalEntryPoints.add(detail.entryPoint);
+    cls.informationalExample(kind, detail);
+    informational.push({ class: cls.id, kind, ...detail });
+  };
   const recordLeak = (cls, detail) => {
+    if (detail.informational) return recordInformational(cls, "leak", detail);
     cls.leaks += 1;
     cls.entryPoints.add(detail.entryPoint);
     cls.example("leak", detail);
     leaks.push({ class: cls.id, ...detail });
   };
   const recordLoss = (cls, detail) => {
+    if (detail.informational) return recordInformational(cls, "must-keep loss", detail);
     cls.mustKeepLosses += 1;
     cls.entryPoints.add(detail.entryPoint);
     cls.example("must-keep loss", detail);
     mustKeepLosses.push({ class: cls.id, ...detail });
   };
   const recordIdempotence = (cls, detail) => {
+    if (detail.informational) return recordInformational(cls, "idempotence", detail);
     cls.idempotenceFailures += 1;
     cls.entryPoints.add(detail.entryPoint);
     cls.example("idempotence", detail);
     idempotenceFailures.push({ class: cls.id, ...detail });
   };
 
-  const scanText = (cls, label, entryPoint, input, output, planted, mustKeep = [], mustRemove = []) => {
+  const scanText = (cls, label, entryPoint, input, output, planted, mustKeep = [], mustRemove = [], informationalRow = false) => {
+    const base = informationalRow ? { label, entryPoint, input, output, informational: true } : { label, entryPoint, input, output };
     for (const value of planted) {
       const window = leakedWindow(output, value);
-      if (window !== undefined) recordLeak(cls, { label, entryPoint, input, output, planted: value, window });
+      if (window !== undefined) recordLeak(cls, { ...base, planted: value, window });
     }
     for (const value of mustRemove) {
-      if (output.includes(value)) recordLeak(cls, { label, entryPoint, input, output, planted: value, window: value });
+      if (output.includes(value)) recordLeak(cls, { ...base, planted: value, window: value });
     }
     for (const value of mustKeep) {
-      if (!output.includes(value)) recordLoss(cls, { label, entryPoint, input, output, missing: value });
+      if (!output.includes(value)) recordLoss(cls, { ...base, missing: value });
     }
   };
 
@@ -863,9 +1100,14 @@ export async function runLeakProbe(options) {
     for (const row of cells) {
       const sinks = sinksFor(row.sinks);
       if (sinks.length === 0) continue;
+      const informationalRow = row.informational === true;
+      const flag = informationalRow ? { informational: true } : {};
       for (const sink of sinks) {
-        cls.cells += 1;
-        if (row.planted.length > 0 || row.mustRemove.length > 0) cls.plantedCells += 1;
+        if (informationalRow) cls.informationalCells += 1;
+        else {
+          cls.cells += 1;
+          if (row.planted.length > 0 || row.mustRemove.length > 0) cls.plantedCells += 1;
+        }
         const leaksBefore = cls.leaks;
         let first;
         let second;
@@ -873,16 +1115,16 @@ export async function runLeakProbe(options) {
           first = String(await sink.fn(row.input));
           second = String(await sink.fn(first));
         } catch (error) {
-          recordLeak(cls, { label: row.label, entryPoint: sink.name, input: row.input, output: `threw ${error instanceof Error ? error.message : String(error)}`, planted: row.planted[0] ?? "", window: "(scrubber threw)" });
-          cls.leakingCells += 1;
+          recordLeak(cls, { ...flag, label: row.label, entryPoint: sink.name, input: row.input, output: `threw ${error instanceof Error ? error.message : String(error)}`, planted: row.planted[0] ?? "", window: "(scrubber threw)" });
+          if (!informationalRow) cls.leakingCells += 1;
           continue;
         }
-        scanText(cls, row.label, sink.name, row.input, first, row.planted, row.mustKeep, row.mustRemove);
-        if (sink.idempotent && second !== first) recordIdempotence(cls, { label: row.label, entryPoint: sink.name, input: row.input, output: first, second });
+        scanText(cls, row.label, sink.name, row.input, first, row.planted, row.mustKeep, row.mustRemove, informationalRow);
+        if (sink.idempotent && second !== first) recordIdempotence(cls, { ...flag, label: row.label, entryPoint: sink.name, input: row.input, output: first, second });
         else {
           for (const value of row.planted) {
             const window = leakedWindow(second, value);
-            if (window !== undefined && leakedWindow(first, value) === undefined) recordLeak(cls, { label: row.label, entryPoint: sink.name, input: row.input, output: second, planted: value, window });
+            if (window !== undefined && leakedWindow(first, value) === undefined) recordLeak(cls, { ...flag, label: row.label, entryPoint: sink.name, input: row.input, output: second, planted: value, window });
           }
         }
         if (cls.leaks > leaksBefore) cls.leakingCells += 1;
@@ -1216,13 +1458,19 @@ export async function runLeakProbe(options) {
       idempotenceFailures: cls.idempotenceFailures,
       entryPoints: [...cls.entryPoints].sort(),
       examples: cls.examples,
+      informationalCells: cls.informationalCells,
+      informational: cls.informational,
+      informationalEntryPoints: [...cls.informationalEntryPoints].sort(),
+      informationalExamples: cls.informationalExamples,
       skipped: cls.skipped,
       notes: cls.notes,
     })),
     leaks,
     mustKeepLosses,
     idempotenceFailures,
+    informational,
   };
+  // Informational rows never gate: `ok` reads the three gating totals only.
   summary.ok = leaks.length === 0 && mustKeepLosses.length === 0 && idempotenceFailures.length === 0;
   summary.report = renderReport(summary);
   return summary;
@@ -1233,17 +1481,26 @@ function clip(text, limit = 160) {
   return flat.length > limit ? `${flat.slice(0, limit)}...` : flat;
 }
 
+function exampleLines(example) {
+  const detail = example.kind === "leak" ? `window ${JSON.stringify(example.window)} of ${JSON.stringify(clip(example.planted, 40))}` : example.kind === "must-keep loss" ? `lost ${JSON.stringify(clip(example.missing, 80))}` : `second pass changed the text`;
+  return [`- ${example.kind} / ${clip(example.label, 100)} / ${example.entryPoint}: ${detail}`, `  - input: ${JSON.stringify(clip(example.input))}`, `  - output: ${JSON.stringify(clip(example.output))}`];
+}
+
 function renderReport(summary) {
+  const gating = summary.ok ? "zero leaks" : `${summary.leaks.length} leaks, ${summary.mustKeepLosses.length} must-keep losses, ${summary.idempotenceFailures.length} idempotence failures`;
+  const informationalCells = summary.classes.reduce((total, cls) => total + cls.informationalCells, 0);
+  const informationalNote = informationalCells > 0 ? `; ${summary.informational.length} informational of ${informationalCells} cells, non-gating` : "";
   const lines = [
-    `Leak-probe harness: ${summary.integration} (${summary.ok ? "zero leaks" : `${summary.leaks.length} leaks, ${summary.mustKeepLosses.length} must-keep losses, ${summary.idempotenceFailures.length} idempotence failures`})`,
+    `Leak-probe harness: ${summary.integration} (${gating}${informationalNote})`,
     "",
-    "| Class | Cells | Leaks | Must-keep losses | Idempotence failures | Leaking entry points |",
-    "| --- | ---: | ---: | ---: | ---: | --- |",
+    "| Class | Cells | Leaks | Must-keep losses | Idempotence failures | Informational | Leaking entry points |",
+    "| --- | ---: | ---: | ---: | ---: | ---: | --- |",
   ];
   for (const cls of summary.classes) {
     const cellsText = cls.skipped ? `skipped: ${cls.skipped}` : String(cls.cells);
     const entryPoints = cls.entryPoints.length > 0 ? cls.entryPoints.join(", ") : "-";
-    lines.push(`| ${cls.id}. ${cls.name} | ${cellsText} | ${cls.leaks} | ${cls.mustKeepLosses} | ${cls.idempotenceFailures} | ${entryPoints} |`);
+    const informationalText = cls.informationalCells > 0 ? `${cls.informational} of ${cls.informationalCells}` : "-";
+    lines.push(`| ${cls.id}. ${cls.name} | ${cellsText} | ${cls.leaks} | ${cls.mustKeepLosses} | ${cls.idempotenceFailures} | ${informationalText} | ${entryPoints} |`);
   }
   for (const cls of summary.classes) {
     if (cls.notes.length > 0) lines.push("", `Notes, class ${cls.id}: ${unique(cls.notes).join("; ")}`);
@@ -1251,15 +1508,20 @@ function renderReport(summary) {
   for (const cls of summary.classes) {
     if (cls.examples.length === 0) continue;
     lines.push("", `#### Class ${cls.id} examples (${cls.examples.length} of ${cls.leaks + cls.mustKeepLosses + cls.idempotenceFailures})`);
-    for (const example of cls.examples) {
-      const detail = example.kind === "leak" ? `window ${JSON.stringify(example.window)} of ${JSON.stringify(clip(example.planted, 40))}` : example.kind === "must-keep loss" ? `lost ${JSON.stringify(clip(example.missing, 80))}` : `second pass changed the text`;
-      lines.push(`- ${example.kind} / ${clip(example.label, 100)} / ${example.entryPoint}: ${detail}`, `  - input: ${JSON.stringify(clip(example.input))}`, `  - output: ${JSON.stringify(clip(example.output))}`);
-    }
+    for (const example of cls.examples) lines.push(...exampleLines(example));
+  }
+  for (const cls of summary.classes) {
+    if (cls.informationalExamples.length === 0) continue;
+    lines.push("", `#### Class ${cls.id} informational, non-gating (${cls.informationalExamples.length} of ${cls.informational}; entry points: ${cls.informationalEntryPoints.join(", ")})`);
+    for (const example of cls.informationalExamples) lines.push(...exampleLines(example));
   }
   return lines.join("\n");
 }
 
-/** Throws with the per-class table when the run recorded any leak, must-keep loss, or idempotence failure. */
+/**
+ * Throws with the per-class table when the run recorded any leak, must-keep loss, or idempotence
+ * failure. Informational rows never throw.
+ */
 export function assertNoLeaks(result) {
   if (!result || !Array.isArray(result.classes)) throw new TypeError("assertNoLeaks: expected the result of runLeakProbe");
   if (result.ok) return;

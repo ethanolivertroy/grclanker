@@ -20,9 +20,13 @@ import { datasetState, derived, gatedPrincipals, isComplete, isReadable, readDat
 import {
   BEARER_ID_KEYS,
   FIXED_PASSWORDS,
+  FIXED_SCHEME_WORDS,
   GENERIC_CREDENTIAL_KEYS,
+  INFORMATIONAL_ESCAPE_FORMS,
   LEAK_CLASSES,
   SESSION_ID_KEYS,
+  SETTING_SUFFIX_CONTROLS,
+  SETTING_SUFFIX_UUID_CONTROL_KEYS,
   assertCanariesDisjoint,
   assertNoLeaks,
   leakedWindow,
@@ -37,8 +41,10 @@ import {
  * value against an identity scrubber, that every must-keep row passes an identity scrubber, that
  * the canary self-check rejects a colliding canary, that the runner classes catch a follower, a
  * flipping collector, and a raw-writing export, and that the class 1 bearer-id row detects the
- * setting-suffix exemption without its override (CodeRabbit r4077259415 on #78 `e848385`). The
- * library run wires every entry point the library exposes and must report zero leaks.
+ * setting-suffix exemption without its override (CodeRabbit r4077259415 on #78 `e848385`), and that
+ * the informational rows (percent-encoded and JavaScript hex line breaks, non-gating by the
+ * principal's ruling) are counted in the report without ever failing `assertNoLeaks`. The library
+ * run wires every entry point the library exposes and must report zero leaks.
  */
 
 const identity = (text) => text;
@@ -242,9 +248,13 @@ function byClass(result, id) {
 test("leak-probe harness: the class table names all ten classes", () => {
   assert.deepEqual(LEAK_CLASSES.map((cls) => cls.id), [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
   assert.equal(GENERIC_CREDENTIAL_KEYS.length, 12);
-  assert.deepEqual([...BEARER_ID_KEYS], ["secret_id", "VAULT_SECRET_ID", "role_secret_id", "roleSecretId"]);
+  assert.deepEqual([...BEARER_ID_KEYS], ["secret_id", "VAULT_SECRET_ID", "role_secret_id", "roleSecretId", "token_id", "tokenId"]);
   assert.deepEqual([...SESSION_ID_KEYS], ["session_id", "sid", "jsessionid", "PHPSESSID"]);
   assert.equal(FIXED_PASSWORDS.length, 12);
+  assert.deepEqual(SETTING_SUFFIX_CONTROLS.map(([key]) => key), ["secret_id_ttl", "secret_id_num_uses", "token_max_ttl", "token_num_uses", "secret_id_bound_cidrs", "token_bound_cidrs", "webhook_count"]);
+  assert.deepEqual(SETTING_SUFFIX_UUID_CONTROL_KEYS, ["secret_id_accessor", "token_accessor"]);
+  assert.deepEqual([...FIXED_SCHEME_WORDS], ["Bearer", "Basic", "Token", "Digest", "OAuth", "Negotiate", "NTLM", "SSWS", "ApiKey", "Api-Key", "Splunk"]);
+  assert.deepEqual([...INFORMATIONAL_ESCAPE_FORMS], ["%0A", "%0D%0A", "%09", "\\x0a", "\\x09", "\\x0d\\x0a"]);
 });
 
 test("leak-probe harness: leakedWindow finds a fragment at every length and checks short values whole", () => {
@@ -299,10 +309,65 @@ test("leak-probe harness: every planted row leaks against an identity scrubber a
   const describerLosses = result.mustKeepLosses.filter((loss) => loss.class === 10);
   assert.equal(describerLosses.length, 2);
   assert.ok(describerLosses.every((loss) => loss.entryPoint === "echo" && /^content type text\/html and byte length \d+$/.test(loss.missing)), "class 10 losses are the two undescribed HTML bodies");
+  // The percent-encoded and JavaScript hex line-break rows ran, leaked against identity, and stayed out of the gating lists.
+  const escapes = byClass(result, 2);
+  assert.ok(escapes.informationalCells > 0, "informational rows ran");
+  assert.equal(escapes.informational, escapes.informationalCells, "every informational cell leaked against identity");
+  assert.equal(result.informational.length, escapes.informationalCells);
+  assert.ok(result.informational.every((entry) => entry.class === 2 && entry.kind === "leak" && /^informational escape /.test(entry.label)));
+  assert.ok(!result.leaks.some((leak) => /^informational escape /.test(leak.label)), "no informational row is in the gating leaks");
+  for (const form of INFORMATIONAL_ESCAPE_FORMS) {
+    assert.ok(result.informational.some((entry) => entry.label.startsWith(`informational escape ${JSON.stringify(form)} / `)), `${JSON.stringify(form)} ran`);
+  }
+  assert.match(result.report, /\| Informational \|/);
+  assert.match(result.report, new RegExp(`\\| 2\\. Escape boundaries \\| \\d+ \\| \\d+ \\| 0 \\| 0 \\| ${escapes.informational} of ${escapes.informationalCells} \\|`));
+  // Revision 2 gating rows are present and leak against identity.
+  for (const prefix of ["flag or path carrier password / word / --NAME=v after a command", "scheme-word order sslPassword / splunk / NAME=<scheme> rejected", "bearer-id key token_id / UUID / NAME=v", "slash-escaped https URL userinfo / token / bare", "& cookie name then a later pair (query separator)", "scheme bEaReR in prose / token"]) {
+    assert.ok(result.leaks.some((leak) => leak.label.startsWith(prefix)), `${prefix} leaks against identity`);
+  }
+  assert.ok(result.mustKeepLosses.every((loss) => !/^setting suffix control /.test(loss.label)), "the setting-suffix controls keep their values under identity");
   assert.match(byClass(result, 8).skipped, /no nextLinkRunner/);
   assert.match(byClass(result, 9).skipped, /no truncationRunner/);
   assert.match(result.report, /\| 8\. Next links \| skipped: no nextLinkRunner given \|/);
   assert.throws(() => assertNoLeaks(result), /Leak-probe harness: identity \(\d+ leaks/);
+});
+
+test("leak-probe harness: informational rows are counted in the report but never gate", async () => {
+  const options = {
+    integration: "oracle",
+    textScrubbers: IDENTITY_SINKS,
+    headerNames: ["Authorization", "Cookie", "X-Api-Key"],
+    schemeWords: ["Bearer", "Basic"],
+    credentialKeys: ["SERVICENOW_PASSWORD"],
+    settingKeys: ["auth_method"],
+    identifierKeys: ["client_id"],
+    configuredSecrets: [CONFIGURED_SECRET],
+    mustKeep: ["prod-us-east-2026"],
+  };
+  // An oracle built from the identity run: it removes, per input text, exactly what the gating rows
+  // flagged, and touches nothing else, so the informational rows are the only ones it fails.
+  const identityRun = await runLeakProbe(options);
+  const removals = new Map();
+  for (const leak of identityRun.leaks) {
+    if (typeof leak.planted !== "string" || leak.planted.length === 0) continue;
+    if (!removals.has(leak.input)) removals.set(leak.input, new Set());
+    removals.get(leak.input).add(leak.planted);
+  }
+  const oracle = (text) => {
+    const values = removals.get(text);
+    if (!values) return text;
+    let output = text;
+    for (const value of [...values].sort((a, b) => b.length - a.length)) output = output.split(value).join("[REDACTED]");
+    return output;
+  };
+  const result = await runLeakProbe({ ...options, canaries: identityRun.canaries, textScrubbers: { error: [{ name: "oracle", fn: oracle }], data: [{ name: "oracle-data", fn: oracle }] } });
+  assert.deepEqual([result.leaks.length, result.mustKeepLosses.length, result.idempotenceFailures.length], [0, 0, 0]);
+  assert.ok(result.informational.length > 0, "the informational rows still leaked");
+  assert.equal(byClass(result, 2).informational, byClass(identityRun, 2).informational);
+  assert.equal(result.ok, true);
+  assert.doesNotThrow(() => assertNoLeaks(result));
+  assert.match(result.report, /^Leak-probe harness: oracle \(zero leaks; \d+ informational of \d+ cells, non-gating\)/);
+  assert.match(result.report, /#### Class 2 informational, non-gating \(10 of \d+; entry points: oracle, oracle-data\)/);
 });
 
 test("leak-probe harness: the class 1 bearer-id row detects the setting-suffix exemption without its override", async () => {
