@@ -1944,9 +1944,39 @@ test("rule 10: every list walk reports truncated on the page cap, a repeated cur
   assert.match(stalled.truncationNote, /an empty page still advertised a Link rel="next" cursor, total unknown/);
 });
 
-test('foreign-origin next link: a Link rel="next" URL off the configured org origin is never requested, the inventory is truncated with the reason, and no part of the link reaches any text', async () => {
-  const foreignParts = { host: "collector.evil-example.net", path: "/harvest/okta-tokens", query: "sink=okta-ssws&after=page-2", fragment: "frag-marker" };
-  const foreign = `https://${foreignParts.host}${foreignParts.path}?${foreignParts.query}#${foreignParts.fragment}`;
+const CONFIGURED_ORIGIN = "https://tenant.example.okta.com";
+const FOREIGN_ORIGIN = "https://collector.evil-example.net";
+/** The windows of a refused link that must reach no text: its path, query, fragment, and userinfo. The origin is the one part a refusal may name. */
+const FOREIGN_LINK_WINDOWS = { path: "/harvest/okta-tokens", query: "sink=okta-ssws&after=page-2", fragment: "frag-marker", userinfo: "okta-test-token" };
+const FOREIGN_TAIL = `${FOREIGN_LINK_WINDOWS.path}?${FOREIGN_LINK_WINDOWS.query}#${FOREIGN_LINK_WINDOWS.fragment}`;
+
+/**
+ * Every next-link shape that must be refused before any request, with the fixed refusal each earns
+ * (reviewer C final verdict, item K): off-origin absolute URLs, userinfo-bearing URLs on either origin,
+ * protocol-relative and backslash-host forms whatever host they name, relative references, and an
+ * unparseable URL. Each refusal names only the configured origin and the rejected origin.
+ */
+const REFUSED_NEXT_LINKS = [
+  { link: `${FOREIGN_ORIGIN}${FOREIGN_TAIL}`, refusal: `is on origin ${FOREIGN_ORIGIN}, not the configured org origin ${CONFIGURED_ORIGIN}` },
+  { link: `http://tenant.example.okta.com${FOREIGN_TAIL}`, refusal: `is on origin http://tenant.example.okta.com, not the configured org origin ${CONFIGURED_ORIGIN}` },
+  { link: `https://tenant.example.okta.com:8443${FOREIGN_TAIL}`, refusal: `is on origin https://tenant.example.okta.com:8443, not the configured org origin ${CONFIGURED_ORIGIN}` },
+  { link: `https://tenant.example.okta.com.evil-example.net${FOREIGN_TAIL}`, refusal: `is on origin https://tenant.example.okta.com.evil-example.net, not the configured org origin ${CONFIGURED_ORIGIN}` },
+  { link: `https://${FOREIGN_LINK_WINDOWS.userinfo}@collector.evil-example.net${FOREIGN_TAIL}`, refusal: `carries userinfo for origin ${FOREIGN_ORIGIN} (configured org origin ${CONFIGURED_ORIGIN})` },
+  { link: `https://${FOREIGN_LINK_WINDOWS.userinfo}@tenant.example.okta.com${FOREIGN_TAIL}`, refusal: `carries userinfo for origin ${CONFIGURED_ORIGIN} (configured org origin ${CONFIGURED_ORIGIN})` },
+  { link: `https://auditor:${FOREIGN_LINK_WINDOWS.userinfo}@tenant.example.okta.com${FOREIGN_TAIL}`, refusal: `carries userinfo for origin ${CONFIGURED_ORIGIN} (configured org origin ${CONFIGURED_ORIGIN})` },
+  { link: `//collector.evil-example.net${FOREIGN_TAIL}`, refusal: `is on origin ${FOREIGN_ORIGIN}, not the configured org origin ${CONFIGURED_ORIGIN}` },
+  { link: `//tenant.example.okta.com${FOREIGN_TAIL}`, refusal: `is a protocol-relative or relative reference rather than a root path on the configured org origin ${CONFIGURED_ORIGIN} or an absolute URL on it` },
+  { link: `\\\\collector.evil-example.net${FOREIGN_TAIL.replaceAll("/", "\\")}`, refusal: `is on origin ${FOREIGN_ORIGIN}, not the configured org origin ${CONFIGURED_ORIGIN}` },
+  { link: `\\\\tenant.example.okta.com${FOREIGN_TAIL}`, refusal: `is a protocol-relative or relative reference rather than a root path on the configured org origin ${CONFIGURED_ORIGIN} or an absolute URL on it` },
+  { link: `/\\collector.evil-example.net${FOREIGN_TAIL}`, refusal: `is on origin ${FOREIGN_ORIGIN}, not the configured org origin ${CONFIGURED_ORIGIN}` },
+  { link: `https:\\\\collector.evil-example.net${FOREIGN_TAIL}`, refusal: `is on origin ${FOREIGN_ORIGIN}, not the configured org origin ${CONFIGURED_ORIGIN}` },
+  { link: `api/v1/apps?${FOREIGN_LINK_WINDOWS.query}`, refusal: `is a protocol-relative or relative reference rather than a root path on the configured org origin ${CONFIGURED_ORIGIN} or an absolute URL on it` },
+  { link: `@collector.evil-example.net${FOREIGN_TAIL}`, refusal: `is a protocol-relative or relative reference rather than a root path on the configured org origin ${CONFIGURED_ORIGIN} or an absolute URL on it` },
+  { link: `data:text/plain,${FOREIGN_LINK_WINDOWS.userinfo}`, refusal: `is on origin null, not the configured org origin ${CONFIGURED_ORIGIN}` },
+  { link: `https://[::1${FOREIGN_TAIL}`, refusal: `could not be parsed against the configured org origin ${CONFIGURED_ORIGIN}` },
+];
+
+test('reviewer C final verdict, item K: a Link rel="next" URL that is off the configured org origin, carries userinfo, or is protocol-relative or backslash-relative is refused before any request with a fixed reason naming only the two origins, the inventory is truncated with that reason, and no window of the link reaches any text', async () => {
   const requests = [];
   const serveWithNext = (nextLink) => async (input, init = {}) => {
     const url = new URL(input.toString());
@@ -1954,50 +1984,55 @@ test('foreign-origin next link: a Link rel="next" URL off the configured org ori
     const headers = { "content-type": "application/json", link: `<${nextLink}>; rel="next"` };
     return new Response(JSON.stringify([{ id: `${url.pathname}-item`, status: "ACTIVE", label: "App", signOnMode: "SAML_2_0" }]), { status: 200, headers });
   };
-  const client = createRealClient(serveWithNext(foreign));
 
-  const apps = await client.listApps();
-  assert.equal(apps.truncated, true);
-  assert.equal(apps.pagesFetched, 1);
-  assert.equal(apps.items.length, 1);
-  assert.equal(apps.truncationNote, 'GET /api/v1/apps?limit=200 stopped after 1 pages (1 items): the Link rel="next" URL is not on the configured org origin and was not followed, total unknown.');
-  assert.equal(requests.length, 1, "the walk sent the first page only");
-  assert.ok(requests.every((request) => request.url.origin === "https://tenant.example.okta.com"), "no request left the configured origin");
-  assert.ok(requests.every((request) => request.authorization === "SSWS okta-test-token"), "the credential went to the configured origin only");
-  for (const part of Object.values(foreignParts)) assert.ok(!apps.truncationNote.includes(part), `the truncation note carries no ${part}`);
+  for (const { link, refusal } of REFUSED_NEXT_LINKS) {
+    requests.length = 0;
+    const client = createRealClient(serveWithNext(link));
+    const apps = await client.listApps();
+    assert.equal(apps.truncated, true, link);
+    assert.equal(apps.pagesFetched, 1, link);
+    assert.equal(apps.items.length, 1, link);
+    assert.equal(apps.truncationNote, `GET /api/v1/apps?limit=200 stopped after 1 pages (1 items): the Link rel="next" URL ${refusal} and was not followed, total unknown.`, link);
+    assert.equal(requests.length, 1, `${link}: the walk sent the first page only`);
+    assert.ok(requests.every((request) => request.url.origin === CONFIGURED_ORIGIN), `${link}: no request left the configured origin`);
+    assert.ok(requests.every((request) => request.authorization === "SSWS okta-test-token"), `${link}: the credential went to the configured origin only`);
+    for (const [name, part] of Object.entries(FOREIGN_LINK_WINDOWS)) assert.ok(!apps.truncationNote.includes(part), `${link}: the truncation note carries no ${name}`);
 
-  const integrations = await collectOktaIntegrationData(client);
+    const sameOriginRequests = requests.length;
+    await assert.rejects(() => client.getJson(link), (error) => {
+      assert.equal(error.name, "OktaApiError");
+      assert.equal(error.message, `Okta API request refused: the request URL ${refusal}, so no request was sent.`, link);
+      assert.equal(error.status, null);
+      assert.equal(error.endpoint, "(refused: not on the configured org origin)");
+      for (const [name, part] of Object.entries(FOREIGN_LINK_WINDOWS)) assert.ok(!error.message.includes(part), `${link}: the refusal carries no ${name}`);
+      return true;
+    });
+    assert.equal(requests.length, sameOriginRequests, `${link}: a refused URL produces no request at all`);
+  }
+
+  const foreign = createRealClient(serveWithNext(`${FOREIGN_ORIGIN}${FOREIGN_TAIL}`));
+  const integrations = await collectOktaIntegrationData(foreign);
   assert.equal(integrations.apps.truncated, true);
   const integResult = assessOktaIntegrations(integrations, createSampleConfig());
   for (const id of ["OKTA-INTEG-003", "OKTA-INTEG-005", "OKTA-INTEG-006"]) {
     assert.equal(statusOf(integResult, id), "Partial", id);
-    assert.match(findingById(integResult, id).summary, /not on the configured org origin and was not followed, total unknown/, id);
+    assert.match(findingById(integResult, id).summary, new RegExp(`is on origin ${FOREIGN_ORIGIN.replaceAll(".", "\\.")}, not the configured org origin ${CONFIGURED_ORIGIN.replaceAll(".", "\\.")} and was not followed, total unknown`), id);
   }
   const rendered = JSON.stringify([integrations, integResult]);
-  for (const part of Object.values(foreignParts)) assert.ok(!rendered.includes(part), `no dataset or finding carries ${part}`);
+  for (const [name, part] of Object.entries(FOREIGN_LINK_WINDOWS)) assert.ok(!rendered.includes(part), `no dataset or finding carries the link ${name}`);
 
-  const sameOriginRequests = requests.length;
-  for (const candidate of [
-    foreign,
-    "http://tenant.example.okta.com/api/v1/apps?after=page-2",
-    "https://tenant.example.okta.com:8443/api/v1/apps?after=page-2",
-    "https://tenant.example.okta.com.evil-example.net/api/v1/apps?after=page-2",
-    "https://okta-test-token@collector.evil-example.net/api/v1/apps",
+  for (const link of [
+    "https://tenant.example.okta.com/api/v1/apps?limit=200&after=page-2",
+    "HTTPS://TENANT.EXAMPLE.OKTA.COM/api/v1/apps?limit=200&after=page-2",
+    "https://tenant.example.okta.com:443/api/v1/apps?limit=200&after=page-2",
+    "/api/v1/apps?limit=200&after=page-2",
   ]) {
-    await assert.rejects(() => client.getJson(candidate), (error) => {
-      assert.equal(error.name, "OktaApiError");
-      assert.equal(error.message, "Okta API request refused: the request URL is not on the configured org origin, so no request was sent.");
-      assert.equal(error.status, null);
-      assert.equal(error.endpoint, "(refused: not on the configured org origin)");
-      return true;
-    });
+    requests.length = 0;
+    const followed = await createRealClient(serveWithNext(link)).listApps();
+    assert.equal(followed.pagesFetched, 2, `${link}: a next link on the configured origin is followed whatever its casing or default port`);
+    assert.match(followed.truncationNote, /cursor repeated a page already read/, link);
+    assert.ok(requests.every((request) => request.url.origin === CONFIGURED_ORIGIN), link);
   }
-  assert.equal(requests.length, sameOriginRequests, "a refused URL produces no request at all");
-
-  const sameOrigin = createRealClient(serveWithNext("https://tenant.example.okta.com/api/v1/apps?limit=200&after=page-2"));
-  const followed = await sameOrigin.listApps();
-  assert.equal(followed.pagesFetched, 2, "a next link on the configured origin is still followed");
-  assert.match(followed.truncationNote, /cursor repeated a page already read/);
 });
 
 test("rule 10: listSystemLogs is bounded, capped at five pages, and demotes OKTA-MON-002 to a total-unknown statement", async () => {
@@ -3194,6 +3229,10 @@ const OKTA_FIXED_TEXTS = [
   "Okta API request failed for /api/v1/logs?limit=1 (429 Too Many Requests)",
   "Okta API response from /api/v1/users?limit=200 (200) was not JSON (5120 chars)",
   "Okta OAuth token request failed (401 Unauthorized): invalid_client",
+  "Okta API request refused: the request URL is on origin https://collector.evil-example.net, not the configured org origin https://tenant.example.okta.com, so no request was sent.",
+  "Okta API request refused: the request URL carries userinfo for origin https://tenant.example.okta.com (configured org origin https://tenant.example.okta.com), so no request was sent.",
+  'GET /api/v1/apps?limit=200 stopped after 1 pages (1 items): the Link rel="next" URL is a protocol-relative or relative reference rather than a root path on the configured org origin https://tenant.example.okta.com or an absolute URL on it and was not followed, total unknown.',
+  'GET /api/v1/apps?limit=200 stopped after 1 pages (1 items): the Link rel="next" URL could not be parsed against the configured org origin https://tenant.example.okta.com and was not followed, total unknown.',
   "Not requested: no role lookups were requested because the parent list was not collected (Okta API request failed for /api/v1/iam/assignees/users?limit=200 (403 Forbidden)).",
   "every lookup of the role assignments failed (3 of 3): the endpoint returned 403 Forbidden (missing scope or admin role)",
   "User population listing is not available on this client.",

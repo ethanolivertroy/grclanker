@@ -1512,7 +1512,7 @@ function projectSystemLogEvent(event: JsonRecord): JsonRecord {
 /** Error text names the request path and query without the opaque `after` cursor of follow-up pages. */
 function describeRequestTarget(config: OktaResolvedConfig, pathOrUrl: string): string {
   try {
-    const url = new URL(makeUrl(config, pathOrUrl));
+    const url = new URL(pathOrUrl, config.orgUrl);
     url.searchParams.delete("after");
     return `${url.pathname}${url.search}`;
   } catch {
@@ -1860,28 +1860,48 @@ function normalizeExportArgs(args: unknown): ExportArgs {
   return base;
 }
 
-function makeUrl(config: OktaResolvedConfig, pathOrUrl: string): string {
-  if (pathOrUrl.startsWith("http://") || pathOrUrl.startsWith("https://")) {
-    return pathOrUrl;
-  }
-  return `${config.orgUrl}${pathOrUrl}`;
-}
+/** A URL resolved onto the configured org origin, or the fixed reason it was refused before any request. */
+type OriginResolution = { url: string; refusal?: undefined } | { url?: undefined; refusal: string };
 
-/** Fixed text for a request the client refuses to send; it never names the URL, so no path, query, or host of a server-supplied link reaches an error string. */
-const FOREIGN_ORIGIN_REFUSED = "Okta API request refused: the request URL is not on the configured org origin, so no request was sent.";
-const FOREIGN_ORIGIN_NEXT_LINK = 'the Link rel="next" URL is not on the configured org origin and was not followed';
+/** A root path (`/...` but not `//...` or `/\...`); any other slash or backslash form is a protocol-relative or relative reference. */
+const ROOT_PATH_PATTERN = /^\/(?![/\\])/;
+/** An absolute URL: a scheme (any casing) followed by a colon. */
+const ABSOLUTE_URL_PATTERN = /^[a-z][a-z0-9+.-]*:/i;
+/** Fixed endpoint label for a refused request; the URL itself is never recorded. */
+const REFUSED_ENDPOINT = "(refused: not on the configured org origin)";
 
 /**
- * A server-supplied URL (a Link rel="next" page) is followed only when it
- * resolves to the configured org origin, so the SSWS token or bearer
- * credential never leaves for another host.
+ * Where a URL may lead, decided before any request is sent. A client-built
+ * path or a server-supplied Link rel="next" URL is followed only when it is a
+ * root path on the configured org origin or an absolute URL that resolves, as
+ * a browser would, onto that origin (scheme and host compared after URL
+ * normalization, so casing never matters) and carries no userinfo. A
+ * protocol-relative (`//host`) or backslash (`\\host`) form is refused whatever
+ * host it names, since concatenating it onto the org URL would request a path
+ * the server never meant while a browser would leave for that host. Each
+ * refusal is fixed text naming only the configured origin and the rejected
+ * origin: no path, query, fragment, or userinfo of the link reaches any text,
+ * so the SSWS token or bearer credential never leaves for another host and no
+ * window of the link is echoed.
  */
-function onConfiguredOrigin(config: OktaResolvedConfig, pathOrUrl: string): boolean {
+function resolveOnConfiguredOrigin(config: OktaResolvedConfig, pathOrUrl: string): OriginResolution {
+  const configured = new URL(config.orgUrl).origin;
+  let resolved: URL;
   try {
-    return new URL(makeUrl(config, pathOrUrl)).origin === new URL(config.orgUrl).origin;
+    resolved = new URL(pathOrUrl, config.orgUrl);
   } catch {
-    return false;
+    return { refusal: `could not be parsed against the configured org origin ${configured}` };
   }
+  if (resolved.username !== "" || resolved.password !== "") {
+    return { refusal: `carries userinfo for origin ${resolved.origin} (configured org origin ${configured})` };
+  }
+  if (resolved.origin !== configured) {
+    return { refusal: `is on origin ${resolved.origin}, not the configured org origin ${configured}` };
+  }
+  if (!ROOT_PATH_PATTERN.test(pathOrUrl) && !ABSOLUTE_URL_PATTERN.test(pathOrUrl)) {
+    return { refusal: `is a protocol-relative or relative reference rather than a root path on the configured org origin ${configured} or an absolute URL on it` };
+  }
+  return { url: resolved.href };
 }
 
 /** Keeps only the vendor's error summary fields; a body without them is described by size so a token echoed by a proxy never lands in an error string. */
@@ -2030,8 +2050,9 @@ export class OktaAuditorClient {
     init: RequestInit = {},
     attempt = 0,
   ): Promise<Response> {
-    if (!onConfiguredOrigin(this.config, pathOrUrl)) {
-      throw new OktaApiError(FOREIGN_ORIGIN_REFUSED, null, "(refused: not on the configured org origin)");
+    const resolution = resolveOnConfiguredOrigin(this.config, pathOrUrl);
+    if (resolution.url === undefined) {
+      throw new OktaApiError(`Okta API request refused: the request URL ${resolution.refusal}, so no request was sent.`, null, REFUSED_ENDPOINT);
     }
     const headers = new Headers(init.headers ?? {});
     headers.set("accept", "application/json");
@@ -2042,7 +2063,7 @@ export class OktaAuditorClient {
     const target = describeRequestTarget(this.config, pathOrUrl);
     let response: Response;
     try {
-      response = await this.fetchImpl(makeUrl(this.config, pathOrUrl), {
+      response = await this.fetchImpl(resolution.url, {
         ...init,
         headers,
       });
@@ -2104,9 +2125,10 @@ export class OktaAuditorClient {
   /**
    * Walks Link rel="next" pages up to maxPages. Every early exit (page cap, a
    * next URL already visited, an empty page that still advertises a next
-   * link, or a next URL on another origin, which is never requested) returns
-   * truncated: true with a note stating pages and items seen and that the
-   * total is unknown, so the partial-inventory demotion applies.
+   * link, or a next URL refused by resolveOnConfiguredOrigin, which is never
+   * requested) returns truncated: true with a note stating pages and items
+   * seen, the reason, and that the total is unknown, so the partial-inventory
+   * demotion applies.
    */
   async listPaginatedWithMeta(pathOrUrl: string, maxPages: number = MAX_LIST_PAGES): Promise<PaginatedList> {
     const items: JsonRecord[] = [];
@@ -2126,7 +2148,7 @@ export class OktaAuditorClient {
       if (pagesFetched >= maxPages) {
         return truncatedList(`the ${maxPages}-page cap was reached with a Link rel="next" page unread`);
       }
-      visited.add(makeUrl(this.config, nextUrl));
+      visited.add(resolveOnConfiguredOrigin(this.config, nextUrl).url ?? nextUrl);
       const response = await this.request(nextUrl);
       const payload = await readJsonBody(response, target);
       if (!Array.isArray(payload)) {
@@ -2136,16 +2158,17 @@ export class OktaAuditorClient {
       pagesFetched += 1;
       const next = parseLinkHeaderNext(response.headers.get("link"));
       if (!next) break;
-      if (!onConfiguredOrigin(this.config, next)) {
-        return truncatedList(FOREIGN_ORIGIN_NEXT_LINK);
+      const resolution = resolveOnConfiguredOrigin(this.config, next);
+      if (resolution.url === undefined) {
+        return truncatedList(`the Link rel="next" URL ${resolution.refusal} and was not followed`);
       }
-      if (visited.has(makeUrl(this.config, next))) {
+      if (visited.has(resolution.url)) {
         return truncatedList('the Link rel="next" cursor repeated a page already read');
       }
       if (payload.length === 0) {
         return truncatedList('an empty page still advertised a Link rel="next" cursor');
       }
-      nextUrl = next;
+      nextUrl = resolution.url;
     }
 
     return { items, truncated: false, pagesFetched };

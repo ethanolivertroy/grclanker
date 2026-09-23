@@ -1439,6 +1439,10 @@ const SNOWFLAKE_FIXED_TEXTS = [
   "Snowflake SQL API request returned an unreadable response (200 OK): non-JSON body (text/html, 5120 bytes)",
   "Snowflake SQL API request failed (429 Too Many Requests): Rate limit exceeded [code 000630]",
   "Refusing to execute a non read-only Snowflake statement: DROP TABLE SALES.PUBLIC.CUSTOMERS",
+  "Snowflake SQL API request refused: the request URL is on origin https://collector.evil-example.net, not the configured account origin https://myorg-myaccount.snowflakecomputing.com, so no request was sent.",
+  "Snowflake SQL API returned a statement status URL that carries userinfo for origin https://myorg-myaccount.snowflakecomputing.com (configured account origin https://myorg-myaccount.snowflakecomputing.com); the statement was not polled and its result was not read.",
+  "Snowflake SQL API returned a statement status URL that is a protocol-relative or relative reference rather than a root path on the configured account origin https://myorg-myaccount.snowflakecomputing.com or an absolute URL on it; the statement was not polled and its result was not read.",
+  "Snowflake SQL API returned a statement status URL that could not be parsed against the configured account origin https://myorg-myaccount.snowflakecomputing.com; the statement was not polled and its result was not read.",
   "Using Snowflake account myorg-myaccount via https://myorg-myaccount.snowflakecomputing.com (KEYPAIR_JWT).",
   "Authenticated as auditor with role ACCOUNTADMIN and warehouse AUDIT_WH.",
   "Authenticated as auditor with role (default role).",
@@ -1642,13 +1646,42 @@ test("SnowflakeSqlClient submits async statements, polls, and fetches every part
   assert.equal(calls[3].url, "https://myorg-myaccount.snowflakecomputing.com/api/v2/statements/handle-1?partition=1");
 });
 
-test("foreign-origin next link: a statementStatusUrl that leaves the configured account origin is never polled, the outcome records the fixed reason, and no part of the URL reaches any text", async () => {
-  const foreignParts = { host: "collector.evil-example.net", path: "/harvest/snowflake-jwt", query: "sink=bearer&handle=handle-9" };
-  const foreignTarget = `${foreignParts.host}${foreignParts.path}?${foreignParts.query}`;
-  const statusText = "Snowflake SQL API returned a statement status URL that is not on the configured account origin; the statement was not polled and its result was not read.";
-  const refusedText = "Snowflake SQL API request refused: the request URL is not on the configured account origin, so no request was sent.";
+const CONFIGURED_ACCOUNT_ORIGIN = "https://myorg-myaccount.snowflakecomputing.com";
+const FOREIGN_ACCOUNT_ORIGIN = "https://collector.evil-example.net";
+/** The windows of a refused status URL that must reach no text: its path, query, and userinfo. The origin is the one part a refusal may name. */
+const FOREIGN_STATUS_WINDOWS = { path: "/harvest/snowflake-jwt", query: "sink=bearer&handle=handle-9", userinfo: "bearer-canary-9" };
+const FOREIGN_STATUS_TAIL = `${FOREIGN_STATUS_WINDOWS.path}?${FOREIGN_STATUS_WINDOWS.query}`;
+const RELATIVE_REFERENCE_REFUSAL = `is a protocol-relative or relative reference rather than a root path on the configured account origin ${CONFIGURED_ACCOUNT_ORIGIN} or an absolute URL on it`;
 
-  for (const statusUrl of [`@${foreignTarget}`, `:443@${foreignTarget}`, `https://${foreignTarget}`]) {
+/**
+ * Every statementStatusUrl shape that must be refused before any poll, with the fixed refusal each earns
+ * (reviewer C final verdict, item K): host-moving relative references, off-origin absolute URLs,
+ * userinfo-bearing URLs on either origin, protocol-relative and backslash-host forms whatever host they
+ * name, and an unparseable URL. Each refusal names only the configured origin and the rejected origin.
+ */
+const REFUSED_STATUS_URLS = [
+  { statusUrl: `@collector.evil-example.net${FOREIGN_STATUS_TAIL}`, refusal: RELATIVE_REFERENCE_REFUSAL },
+  { statusUrl: `:443@collector.evil-example.net${FOREIGN_STATUS_TAIL}`, refusal: RELATIVE_REFERENCE_REFUSAL },
+  { statusUrl: `${FOREIGN_ACCOUNT_ORIGIN}${FOREIGN_STATUS_TAIL}`, refusal: `is on origin ${FOREIGN_ACCOUNT_ORIGIN}, not the configured account origin ${CONFIGURED_ACCOUNT_ORIGIN}` },
+  { statusUrl: `http://myorg-myaccount.snowflakecomputing.com${FOREIGN_STATUS_TAIL}`, refusal: `is on origin http://myorg-myaccount.snowflakecomputing.com, not the configured account origin ${CONFIGURED_ACCOUNT_ORIGIN}` },
+  { statusUrl: `https://myorg-myaccount.snowflakecomputing.com:8443${FOREIGN_STATUS_TAIL}`, refusal: `is on origin https://myorg-myaccount.snowflakecomputing.com:8443, not the configured account origin ${CONFIGURED_ACCOUNT_ORIGIN}` },
+  { statusUrl: `https://${FOREIGN_STATUS_WINDOWS.userinfo}@collector.evil-example.net${FOREIGN_STATUS_TAIL}`, refusal: `carries userinfo for origin ${FOREIGN_ACCOUNT_ORIGIN} (configured account origin ${CONFIGURED_ACCOUNT_ORIGIN})` },
+  { statusUrl: `https://${FOREIGN_STATUS_WINDOWS.userinfo}@myorg-myaccount.snowflakecomputing.com${FOREIGN_STATUS_TAIL}`, refusal: `carries userinfo for origin ${CONFIGURED_ACCOUNT_ORIGIN} (configured account origin ${CONFIGURED_ACCOUNT_ORIGIN})` },
+  { statusUrl: `https://auditor:${FOREIGN_STATUS_WINDOWS.userinfo}@myorg-myaccount.snowflakecomputing.com${FOREIGN_STATUS_TAIL}`, refusal: `carries userinfo for origin ${CONFIGURED_ACCOUNT_ORIGIN} (configured account origin ${CONFIGURED_ACCOUNT_ORIGIN})` },
+  { statusUrl: `//collector.evil-example.net${FOREIGN_STATUS_TAIL}`, refusal: `is on origin ${FOREIGN_ACCOUNT_ORIGIN}, not the configured account origin ${CONFIGURED_ACCOUNT_ORIGIN}` },
+  { statusUrl: `//myorg-myaccount.snowflakecomputing.com${FOREIGN_STATUS_TAIL}`, refusal: RELATIVE_REFERENCE_REFUSAL },
+  { statusUrl: `\\\\collector.evil-example.net${FOREIGN_STATUS_TAIL.replaceAll("/", "\\")}`, refusal: `is on origin ${FOREIGN_ACCOUNT_ORIGIN}, not the configured account origin ${CONFIGURED_ACCOUNT_ORIGIN}` },
+  { statusUrl: `\\\\myorg-myaccount.snowflakecomputing.com${FOREIGN_STATUS_TAIL}`, refusal: RELATIVE_REFERENCE_REFUSAL },
+  { statusUrl: `/\\collector.evil-example.net${FOREIGN_STATUS_TAIL}`, refusal: `is on origin ${FOREIGN_ACCOUNT_ORIGIN}, not the configured account origin ${CONFIGURED_ACCOUNT_ORIGIN}` },
+  { statusUrl: `https:\\\\collector.evil-example.net${FOREIGN_STATUS_TAIL}`, refusal: `is on origin ${FOREIGN_ACCOUNT_ORIGIN}, not the configured account origin ${CONFIGURED_ACCOUNT_ORIGIN}` },
+  { statusUrl: `api/v2/statements/handle-9?${FOREIGN_STATUS_WINDOWS.query}`, refusal: RELATIVE_REFERENCE_REFUSAL },
+  { statusUrl: `data:text/plain,${FOREIGN_STATUS_WINDOWS.userinfo}`, refusal: `is on origin null, not the configured account origin ${CONFIGURED_ACCOUNT_ORIGIN}` },
+  { statusUrl: `https://[::1${FOREIGN_STATUS_TAIL}`, refusal: `could not be parsed against the configured account origin ${CONFIGURED_ACCOUNT_ORIGIN}` },
+];
+
+test("reviewer C final verdict, item K: a statementStatusUrl that leaves the configured account origin, carries userinfo, or is protocol-relative or backslash-relative is never polled, the outcome records the fixed reason naming only the two origins, and no window of the URL reaches any text", async () => {
+  for (const { statusUrl, refusal } of REFUSED_STATUS_URLS) {
+    const statusText = `Snowflake SQL API returned a statement status URL that ${refusal}; the statement was not polled and its result was not read.`;
     const calls = [];
     const fetchImpl = async (url, init) => {
       calls.push({ url: new URL(String(url)), authorization: headerValue(init.headers, "authorization") });
@@ -1665,7 +1698,7 @@ test("foreign-origin next link: a statementStatusUrl that leaves the configured 
       return true;
     });
     assert.equal(calls.length, 1, `status URL ${statusUrl}: only the submit left`);
-    assert.equal(calls[0].url.origin, "https://myorg-myaccount.snowflakecomputing.com");
+    assert.equal(calls[0].url.origin, CONFIGURED_ACCOUNT_ORIGIN);
 
     const outcome = await collectStatement(client, "users", "SHOW USERS");
     assert.equal(outcome.status, "error");
@@ -1674,34 +1707,41 @@ test("foreign-origin next link: a statementStatusUrl that leaves the configured 
     assert.equal(outcome.partitionCount, null);
     assert.equal(outcome.truncated, null);
     assert.equal(calls.length, 2, "the collector's submit is the only further request");
-    assert.ok(calls.every((call) => call.url.origin === "https://myorg-myaccount.snowflakecomputing.com"), "no request left the configured origin");
-    for (const part of Object.values(foreignParts)) assert.ok(!JSON.stringify(outcome).includes(part), `the outcome carries no ${part}`);
-  }
+    assert.ok(calls.every((call) => call.url.origin === CONFIGURED_ACCOUNT_ORIGIN), "no request left the configured origin");
+    for (const [name, part] of Object.entries(FOREIGN_STATUS_WINDOWS)) assert.ok(!JSON.stringify(outcome).includes(part), `${statusUrl}: the outcome carries no ${name}`);
 
-  const sameOriginCalls = [];
-  const sameOrigin = new SnowflakeSqlClient(sampleConfig(), {
-    fetchImpl: async (url, init) => {
-      sameOriginCalls.push(new URL(String(url)));
-      if (init.method === "POST") {
-        return jsonResponse({ code: "333334", message: "Asynchronous execution in progress.", statementHandle: "handle-9", statementStatusUrl: "/api/v2/statements/handle-9" }, { status: 202 });
-      }
-      return jsonResponse({ code: "090001", statementHandle: "handle-9", resultSetMetaData: { numRows: 1, format: "jsonv2", rowType: [{ name: "NAME", type: "text" }], partitionInfo: [{ rowCount: 1 }] }, data: [["a"]] });
-    },
-  });
-  const followed = await sameOrigin.execute("SHOW USERS");
-  assert.equal(followed.rows.length, 1, "a status URL on the configured origin is still polled");
-  assert.equal(sameOriginCalls.length, 2);
-
-  // Defense in depth on the request layer itself (a private method, reached here as plain JavaScript): any path that would move the host is refused before a credential is built, with fixed text.
-  const guarded = new SnowflakeSqlClient(sampleConfig(), { fetchImpl: async (url) => { throw new Error(`a request left for ${String(url)}`); } });
-  for (const pathname of [`@${foreignTarget}`, `:8443@${foreignTarget}`, `https://${foreignTarget}`]) {
-    await assert.rejects(() => guarded.request("GET", pathname), (error) => {
+    // Defense in depth on the request layer itself (a private method, reached here as plain JavaScript): the same shapes are refused before a credential is built, with the same fixed reason.
+    const guarded = new SnowflakeSqlClient(sampleConfig(), { fetchImpl: async (url) => { throw new Error(`a request left for ${String(url)}`); } });
+    await assert.rejects(() => guarded.request("GET", statusUrl), (error) => {
       assert.equal(error.name, "SnowflakeStatementError");
-      assert.equal(error.message, refusedText, `pathname ${pathname}`);
+      assert.equal(error.message, `Snowflake SQL API request refused: the request URL ${refusal}, so no request was sent.`, `pathname ${statusUrl}`);
       assert.equal(error.kind, "error");
-      for (const part of Object.values(foreignParts)) assert.ok(!error.message.includes(part), `the refusal carries no ${part}`);
+      for (const [name, part] of Object.entries(FOREIGN_STATUS_WINDOWS)) assert.ok(!error.message.includes(part), `${statusUrl}: the refusal carries no ${name}`);
       return true;
     });
+  }
+
+  for (const statusUrl of [
+    "/api/v2/statements/handle-9?requestId=6f1c2b3a-4d5e-4f60-8a9b-0c1d2e3f4a5b",
+    `${CONFIGURED_ACCOUNT_ORIGIN}/api/v2/statements/handle-9`,
+    "HTTPS://MYORG-MYACCOUNT.SNOWFLAKECOMPUTING.COM/api/v2/statements/handle-9",
+    "https://myorg-myaccount.snowflakecomputing.com:443/api/v2/statements/handle-9",
+  ]) {
+    const sameOriginCalls = [];
+    const sameOrigin = new SnowflakeSqlClient(sampleConfig(), {
+      fetchImpl: async (url, init) => {
+        sameOriginCalls.push(new URL(String(url)));
+        if (init.method === "POST") {
+          return jsonResponse({ code: "333334", message: "Asynchronous execution in progress.", statementHandle: "handle-9", statementStatusUrl: statusUrl }, { status: 202 });
+        }
+        return jsonResponse({ code: "090001", statementHandle: "handle-9", resultSetMetaData: { numRows: 1, format: "jsonv2", rowType: [{ name: "NAME", type: "text" }], partitionInfo: [{ rowCount: 1 }] }, data: [["a"]] });
+      },
+    });
+    const followed = await sameOrigin.execute("SHOW USERS");
+    assert.equal(followed.rows.length, 1, `${statusUrl}: a status URL on the configured origin is polled whatever its casing or default port`);
+    assert.equal(sameOriginCalls.length, 2, statusUrl);
+    assert.ok(sameOriginCalls.every((call) => call.origin === CONFIGURED_ACCOUNT_ORIGIN), statusUrl);
+    assert.equal(sameOriginCalls[1].pathname, "/api/v2/statements/handle-9", statusUrl);
   }
 });
 

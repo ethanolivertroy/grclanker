@@ -1424,22 +1424,47 @@ export class SnowflakeStatementError extends Error {
   }
 }
 
-/** Fixed text for a request the client refuses to send; it never names the URL, so no path, query, or host of a server-supplied link reaches an error string. */
-const FOREIGN_ORIGIN_REFUSED = "Snowflake SQL API request refused: the request URL is not on the configured account origin, so no request was sent.";
-const FOREIGN_STATUS_URL = "Snowflake SQL API returned a statement status URL that is not on the configured account origin; the statement was not polled and its result was not read.";
+/** A URL resolved onto the configured account origin, or the fixed reason it was refused before any request. */
+type OriginResolution = { url: string; refusal?: undefined } | { url?: undefined; refusal: string };
+
+/** A root path (`/...` but not `//...` or `/\...`); any other slash or backslash form is a protocol-relative or relative reference. */
+const ROOT_PATH_PATTERN = /^\/(?![/\\])/;
+/** An absolute URL: a scheme (any casing) followed by a colon. */
+const ABSOLUTE_URL_PATTERN = /^[a-z][a-z0-9+.-]*:/i;
 
 /**
- * A server-supplied path (the statementStatusUrl of an asynchronous
- * statement) is followed only when it resolves onto the configured account
- * origin, so the bearer token never leaves for another host: a value such as
- * `@other.example/x` would otherwise move the host of the concatenated URL.
+ * Where a URL may lead, decided before any credential is built or any request
+ * is sent. A client-built path or the server-supplied statementStatusUrl of an
+ * asynchronous statement is followed only when it is a root path on the
+ * configured account origin or an absolute URL that resolves, as a browser
+ * would, onto that origin (scheme and host compared after URL normalization,
+ * so casing never matters) and carries no userinfo. A relative reference such
+ * as `@other.example/x`, a protocol-relative (`//host`) form, or a backslash
+ * (`\\host`) form is refused whatever host it names, since concatenating it
+ * onto the account URL would move the host or request a path the server never
+ * meant. Each refusal is fixed text naming only the configured origin and the
+ * rejected origin: no path, query, fragment, or userinfo of the link reaches
+ * any text, so the bearer token never leaves for another host and no window of
+ * the link is echoed.
  */
-function onConfiguredOrigin(candidateUrl: string, baseUrl: string): boolean {
+function resolveOnConfiguredOrigin(candidate: string, baseUrl: string): OriginResolution {
+  const configured = new URL(baseUrl).origin;
+  let resolved: URL;
   try {
-    return new URL(candidateUrl).origin === new URL(baseUrl).origin;
+    resolved = new URL(candidate, baseUrl);
   } catch {
-    return false;
+    return { refusal: `could not be parsed against the configured account origin ${configured}` };
   }
+  if (resolved.username !== "" || resolved.password !== "") {
+    return { refusal: `carries userinfo for origin ${resolved.origin} (configured account origin ${configured})` };
+  }
+  if (resolved.origin !== configured) {
+    return { refusal: `is on origin ${resolved.origin}, not the configured account origin ${configured}` };
+  }
+  if (!ROOT_PATH_PATTERN.test(candidate) && !ABSOLUTE_URL_PATTERN.test(candidate)) {
+    return { refusal: `is a protocol-relative or relative reference rather than a root path on the configured account origin ${configured} or an absolute URL on it` };
+  }
+  return { url: resolved.href };
 }
 
 function classifyErrorMessage(message: string, statusCode?: number): "denied" | "error" | "timeout" {
@@ -1524,13 +1549,14 @@ export class SnowflakeSqlClient {
     pathname: string,
     body?: JsonRecord,
   ): Promise<SnowflakeApiResponse> {
-    // The URL is checked against the configured origin before any credential
-    // is built or attached, so a path that would move the host is refused
-    // with fixed text and nothing leaves.
-    const url = `${this.config.baseUrl}${pathname}`;
-    if (!onConfiguredOrigin(url, this.config.baseUrl)) {
-      throw new SnowflakeStatementError(FOREIGN_ORIGIN_REFUSED, { kind: "error" });
+    // The URL is resolved onto the configured origin before any credential is
+    // built or attached, so a path that would move the host is refused with
+    // fixed text naming only the two origins and nothing leaves.
+    const resolution = resolveOnConfiguredOrigin(pathname, this.config.baseUrl);
+    if (resolution.url === undefined) {
+      throw new SnowflakeStatementError(`Snowflake SQL API request refused: the request URL ${resolution.refusal}, so no request was sent.`, { kind: "error" });
     }
+    const url = resolution.url;
     let attempt = 0;
     for (;;) {
       // A credential that cannot be turned into a bearer token is a
@@ -1617,8 +1643,9 @@ export class SnowflakeSqlClient {
 
     while (latest.nonJsonBody === undefined && (latest.status === 202 || (latest.status === 429 && handle))) {
       if (!statusUrl) break;
-      if (!onConfiguredOrigin(`${this.config.baseUrl}${statusUrl}`, this.config.baseUrl)) {
-        throw new SnowflakeStatementError(FOREIGN_STATUS_URL, { kind: "error" });
+      const statusResolution = resolveOnConfiguredOrigin(statusUrl, this.config.baseUrl);
+      if (statusResolution.url === undefined) {
+        throw new SnowflakeStatementError(`Snowflake SQL API returned a statement status URL that ${statusResolution.refusal}; the statement was not polled and its result was not read.`, { kind: "error" });
       }
       if (this.now().getTime() > deadline) {
         throw new SnowflakeStatementError(`Snowflake statement ${handle ?? ""} did not complete before the ${this.config.statementTimeoutSeconds}s statement timeout.`, { kind: "timeout" });
