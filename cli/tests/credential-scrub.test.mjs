@@ -1380,6 +1380,82 @@ test("quoted auth-params: a <Scheme> <Key>=\"v\" header value and the auth-param
   for (const [label, carrier, expected] of AUTH_PARAM_CARRIERS) assert.equal(scrubber.scrub(carrier(value, second)), expected, label);
 });
 
+// ---------------------------------------------------------------------------------------------------------------
+// An auth-param list led by a challenge param that carries a proof (CodeRabbit r4081776771 on #81): the prose scheme
+// reader exempted every list that began with `realm=` as a WWW-Authenticate challenge, so `Digest realm="api",
+// nonce="n", response="<proof>"` kept its `response` (no pair rule names `response` or `mac`, and a name-shaped proof
+// is outside the token-shape rules). The list reader now records a proof param (`response`, `signature`, `sig`,
+// `mac`, `hmac`, `assertion`, read as the final segment of the name) and a list that holds one goes whole, as the
+// same list does under a header, whatever param it begins with; a challenge without a proof keeps its params. The
+// planted values are name-shaped so only the list rule can remove them. `Digest` is read as a prose scheme word in
+// its conventional spelling only, so "Digest access authentication" and "sha256 digest mismatch" stay.
+// ---------------------------------------------------------------------------------------------------------------
+
+/** Random name-shaped values planted as the proof; neither the token-shape rules nor the pair rules reach them. */
+const PROOF_PARAM_CANARIES = ["Pxqvmzrtkwlb", "Gjtnwqzsvhrk"];
+
+test("proof params: the planted values stand outside every other rule, so only the list rule can remove them", () => {
+  const scrubber = createCredentialScrubber();
+  for (const value of PROOF_PARAM_CANARIES) {
+    assert.equal(looksLikeToken(value), false, `${value} is name-shaped`);
+    assert.equal(scrubber.scrub(`response="${value}"`), `response="${value}"`, `${value}: response= alone is no pair rule's key`);
+  }
+});
+
+/** [label, carrier(value), exact rendering on the shared scrubber]. */
+const PROOF_PARAM_CARRIERS = [
+  ["Digest response", (value) => `Digest realm="api", nonce="n", response="${value}"`, `Digest ${REDACTED}`],
+  ["Digest response with bare values", (value) => `Digest realm=api, nonce=n, response=${value}`, `Digest ${REDACTED}`],
+  ["Digest response led by realm, full RFC 7616 shape", (value) => `Digest realm="api", username="Mufasa", nonce="dcd98b7102dd2f0e8b11d0f600bfb0c093", uri="/dir/index.html", qop=auth, nc=00000001, cnonce="0a4f113b", response="${value}"`, `Digest ${REDACTED}`],
+  ["Digest response first", (value) => `Digest response="${value}"`, `Digest ${REDACTED}`],
+  ["mac after a Bearer challenge's params", (value) => `Bearer realm="api", error="invalid_token", mac="${value}"`, `Bearer ${REDACTED}`],
+  ["MAC token", (value) => `Token realm="api", id="h480djs93hd8", ts="1336363200", nonce="dj83hs9s", mac="${value}"`, `Token ${REDACTED}`],
+  ["Basic response", (value) => `Basic realm="Restricted", response="${value}"`, `Basic ${REDACTED}`],
+  ["signature as the final segment of a hyphenated name", (value) => `Bearer realm="api", X-Amz-Signature=${value}`, `Bearer ${REDACTED}`],
+  ["WWW-Authenticate header led by realm", (value) => `WWW-Authenticate: Digest realm="api", nonce="n", response="${value}"`, `WWW-Authenticate: Digest ${REDACTED}`],
+  ["Authorization header led by realm", (value) => `Authorization: Digest realm="api", nonce="n", response="${value}"`, `Authorization: Digest ${REDACTED}`],
+  ["after a JSON escape", (value) => `request failed\\nWWW-Authenticate: Digest realm="api", response="${value}" see the log`, `request failed\\nWWW-Authenticate: Digest ${REDACTED} see the log`],
+  ["inside a JSON string with a member after it", (value) => `{"detail":"Digest realm=\\"api\\", nonce=\\"n\\", response=\\"${value}\\"","code":401}`, `{"detail":"Digest ${REDACTED}","code":401}`],
+];
+
+/** Text the proof rule must leave as the pair rules render it: challenges without a proof, and Digest as an English word. */
+const PROOF_PARAM_CONTROLS = [
+  ['WWW-Authenticate: Digest realm="api", qop="auth", nonce="n"', `WWW-Authenticate: Digest realm="api", qop="auth", nonce="${REDACTED}"`],
+  ['Digest realm="api", qop="auth", algorithm=MD5', 'Digest realm="api", qop="auth", algorithm=MD5'],
+  ['Bearer realm="api", error="invalid_token"', 'Bearer realm="api", error="invalid_token"'],
+  ['Bearer realm="api", scope="read", oauth_signature_method="HMAC-SHA1"', 'Bearer realm="api", scope="read", oauth_signature_method="HMAC-SHA1"'],
+  ["Digest access authentication", "Digest access authentication"],
+  ["sha256 digest mismatch for bundle export/grclanker-launchdarkly-2026-09-22", "sha256 digest mismatch for bundle export/grclanker-launchdarkly-2026-09-22"],
+  [`Bearer realm="api", access_token=${BOUNDARY_CANARIES[0]}`, `Bearer realm="api", access_token=${REDACTED}`],
+];
+
+test("proof params: the planted values look random and share no 6-character window with the rows, the controls, or the must-keep strings", () => {
+  const legitimate = [
+    ...PROOF_PARAM_CARRIERS.map(([label, carrier]) => [label, carrier("")]),
+    ...PROOF_PARAM_CONTROLS.map(([text], index) => [`control ${index}`, text]),
+    ...MUST_KEEP.map((text, index) => [`must-keep ${index}`, text]),
+  ];
+  assertCanaryFixture(assert, PROOF_PARAM_CANARIES, legitimate, "proof-param rows");
+});
+
+test("proof params: an auth-param list led by realm= goes whole when a later param is a proof, bare, after a JSON escape, and inside a JSON string, through every text entry point, while a challenge without a proof keeps its params", () => {
+  for (const [entryPoint, scrub] of TEXT_ENTRY_POINTS) {
+    for (const value of PROOF_PARAM_CANARIES) {
+      for (const [label, carrier] of PROOF_PARAM_CARRIERS) {
+        const scrubbed = scrub(carrier(value));
+        assertRemoved(scrubbed, value, `${entryPoint}: ${label}`);
+        assert.ok(!/\[REDACTED\]\\*["'][A-Za-z0-9]/.test(scrubbed), `${entryPoint}: ${label}: a quoted value was left beside the marker: ${scrubbed}`);
+        assert.equal(scrub(scrubbed), scrubbed, `${entryPoint}: ${label}: a second pass changed the text`);
+      }
+    }
+    for (const [text, expected] of PROOF_PARAM_CONTROLS) assert.equal(scrub(text), expected, `${entryPoint}: control ${text}`);
+  }
+  const scrubber = createCredentialScrubber();
+  for (const value of PROOF_PARAM_CANARIES) {
+    for (const [label, carrier, expected] of PROOF_PARAM_CARRIERS) assert.equal(scrubber.scrub(carrier(value)), expected, label);
+  }
+});
+
 const DATA_CANARIES = {
   tokensEntry: "BPt5mgDrRZ5YyLTHaQPepJUYQbGYRCjG",
   credentialsValue: "zSVNdtuTMXK9T7qXe8CEDEYXmJ9K6vVL",

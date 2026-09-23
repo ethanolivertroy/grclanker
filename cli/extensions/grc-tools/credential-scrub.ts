@@ -353,17 +353,27 @@ const AUTH_PARAM_BARE_VALUE_PATTERN = /[^\s,"'<>&}\\]+/y;
 const AUTH_PARAM_SEPARATOR_PATTERN = /[ \t]*,[ \t]*/y;
 const AUTH_PARAM_FIRST_VALUE_PATTERN = /^[^\s,;)\]}>]/;
 const SCHEME_TOKEN_PATTERN = /^[A-Za-z][A-Za-z0-9-]*$/;
+// The auth-params that carry a proof (an RFC 7616 `response`, an OAuth 1.0 `oauth_signature`, a MAC token's `mac`, an
+// HMAC `sig` or `hmac`, a SAML or JWT `assertion`), read as the final segment of the parameter name (`X-Amz-Signature`,
+// `oauth_signature`): a list that holds one is a credential whatever parameter it begins with, so the challenge
+// exemption of the prose scheme reader does not reach it (CodeRabbit r4081776771 on #81: `Digest realm="api",
+// nonce="n", response="<proof>"` kept its proof because the list began with `realm=` and no pair rule names
+// `response`). A name that only begins with one of these words is a setting (`oauth_signature_method`), a challenge's
+// `nonce`, `opaque`, and `cnonce` name no proof, and a credential-named parameter (`access_token=`, `Token=`) is
+// scrubbed in place by the pair rules, which leave the challenge's other parameters standing.
+const PROOF_PARAM_WORDS: ReadonlySet<string> = new Set(["response", "signature", "sig", "mac", "hmac", "assertion"]);
 
-// Authorization scheme values in free text (`Bearer <value>`, `Basic <value>`, `Token <value>`, `ApiKey <value>`):
-// the value goes whatever its shape unless it is one plain word, which is prose ("Basic authentication is disabled",
-// "an Owner token for a complete inventory"). A bare value starts with a letter or digit and is at least four
-// characters, so an arrow or a dash after the word ("environment-token -> config") is punctuation, not a credential;
-// a quoted value (`Bearer "token"`) is delimited by its quotes and goes whole whatever it holds. "Token" and "Basic"
-// are English words as often as schemes, so they count as schemes only in their conventional capitalised spelling
-// ("token canary-noexpiry-token-zq has no expiry" names a token; "Token canary-noexpiry-token-zq" replays one).
-const SCHEME_WORD_PATTERN = new RegExp(String.raw`${NAME_START}(bearer|basic|token|apikey|api-key)[ \t]+`, "gi");
+// Authorization scheme values in free text (`Bearer <value>`, `Basic <value>`, `Token <value>`, `ApiKey <value>`,
+// `Digest <value>`): the value goes whatever its shape unless it is one plain word, which is prose ("Basic
+// authentication is disabled", "an Owner token for a complete inventory", "Digest access authentication"). A bare value
+// starts with a letter or digit and is at least four characters, so an arrow or a dash after the word
+// ("environment-token -> config") is punctuation, not a credential; a quoted value (`Bearer "token"`) is delimited by
+// its quotes and goes whole whatever it holds. "Token", "Basic", and "Digest" are English words as often as schemes, so
+// they count as schemes only in their conventional capitalised spelling ("token canary-noexpiry-token-zq has no expiry"
+// names a token; "Token canary-noexpiry-token-zq" replays one; "sha256 digest mismatch" names a checksum).
+const SCHEME_WORD_PATTERN = new RegExp(String.raw`${NAME_START}(bearer|basic|token|apikey|api-key|digest)[ \t]+`, "gi");
 const SCHEME_BARE_VALUE_PATTERN = /[A-Za-z0-9][A-Za-z0-9._~+/=-]{3,}/y;
-const CAPITALISED_SCHEMES = new Map([["token", "Token"], ["basic", "Basic"]]);
+const CAPITALISED_SCHEMES = new Map([["token", "Token"], ["basic", "Basic"], ["digest", "Digest"]]);
 const PLAIN_WORD_PATTERN = /^(?:[A-Z]?[a-z]+|[A-Z]+)$/;
 const PLAIN_WORD_MAX_LENGTH = 20;
 // A quoted value after a bare scheme word in prose is a credential when it begins like one; in `"Basic ", "token"`
@@ -839,16 +849,30 @@ function authParamBareValueEnd(text: string, start: number): number {
   return start + length;
 }
 
+/** An auth-param list read from the text: where it ends, and whether one of its parameters names a proof. */
+interface AuthParamList {
+  end: number;
+  /** True when a parameter of the list, the first included, names a proof (see PROOF_PARAM_WORDS). */
+  proof: boolean;
+}
+
+/** Whether a parameter name's final segment is a proof word (`response`, `oauth_signature`, `X-Amz-Signature`, `mac`). */
+function isProofParamName(name: string): boolean {
+  const segments = keySegments(name);
+  return segments.length > 0 && PROOF_PARAM_WORDS.has(segments[segments.length - 1]);
+}
+
 /**
- * Index just past the auth-param list that starts at `index`, or null when no parameter starts there. The first
- * parameter's quoted value must begin like a value (see AUTH_PARAM_FIRST_VALUE_PATTERN); a later parameter's value
- * goes whatever it holds, so `uri="/v1"` or `realm=""` in the middle of a Digest list does not end the list. Without
- * `continueList` only the first parameter is read: outside a header value a comma after a pair's value starts the
- * next pair of the line (`client_secret=abc==, scope=read`), not the next parameter of the same credential.
+ * The auth-param list that starts at `index`, or null when no parameter starts there. The first parameter's quoted
+ * value must begin like a value (see AUTH_PARAM_FIRST_VALUE_PATTERN); a later parameter's value goes whatever it
+ * holds, so `uri="/v1"` or `realm=""` in the middle of a Digest list does not end the list. Without `continueList`
+ * only the first parameter is read: outside a header value a comma after a pair's value starts the next pair of the
+ * line (`client_secret=abc==, scope=read`), not the next parameter of the same credential.
  */
-function authParamListEnd(text: string, index: number, continueList: boolean): number | null {
+function readAuthParamList(text: string, index: number, continueList: boolean): AuthParamList | null {
   let cursor = index;
   let count = 0;
+  let proof = false;
   for (;;) {
     const name = stickyExec(AUTH_PARAM_NAME_PATTERN, text, cursor);
     if (name === null) break;
@@ -864,12 +888,18 @@ function authParamListEnd(text: string, index: number, continueList: boolean): n
     }
     cursor = valueEnd;
     count += 1;
+    if (isProofParamName(name)) proof = true;
     if (!continueList) break;
     const separator = stickyExec(AUTH_PARAM_SEPARATOR_PATTERN, text, cursor);
     if (separator === null || stickyExec(AUTH_PARAM_NAME_PATTERN, text, cursor + separator.length) === null) break;
     cursor += separator.length;
   }
-  return count === 0 ? null : cursor;
+  return count === 0 ? null : { end: cursor, proof };
+}
+
+/** Index just past the auth-param list that starts at `index`, or null when no parameter starts there. */
+function authParamListEnd(text: string, index: number, continueList: boolean): number | null {
+  return readAuthParamList(text, index, continueList)?.end ?? null;
 }
 
 /**
@@ -991,7 +1021,11 @@ const readCookieHeaderValue: ValueReader = (text, valueStart) => {
 /**
  * Reads the value after a bare scheme word in free text: a quoted value goes whole when it begins like a credential;
  * a bare value goes unless it is one plain word or a challenge's auth-param (`Bearer realm="api"`), and when it opens
- * an auth-param list that is not a challenge (`Bearer Token="v"`) the list goes whole.
+ * an auth-param list that is not a challenge (`Bearer Token="v"`) the list goes whole. A list that holds a proof
+ * parameter (`Digest realm="api", nonce="n", response="<proof>"`, `Bearer realm="api", error="invalid_token",
+ * mac="<proof>"`; see PROOF_PARAM_WORDS) is a credential whatever parameter it begins with and goes whole, as the same
+ * list does under a header, so the rendering does not depend on the order of the parameters; a challenge without a
+ * proof keeps its parameters (CodeRabbit r4081776771 on #81).
  */
 const readSchemeValue: ValueReader = (text, valueStart, carrier) => {
   const scheme = carrier[1];
@@ -1004,8 +1038,11 @@ const readSchemeValue: ValueReader = (text, valueStart, carrier) => {
     return { end: quoted.after, replacement: `${quoted.open}${REDACTED}${quoted.close}` };
   }
   const bare = stickyExec(SCHEME_BARE_VALUE_PATTERN, text, valueStart);
-  if (bare === null || !looksLikeSchemeValue(bare)) return null;
-  return { end: Math.max(valueStart + bare.length, authParamListEnd(text, valueStart, true) ?? 0), replacement: REDACTED };
+  if (bare === null) return null;
+  const list = readAuthParamList(text, valueStart, true);
+  if (list?.proof) return { end: list.end, replacement: REDACTED };
+  if (!looksLikeSchemeValue(bare)) return null;
+  return { end: Math.max(valueStart + bare.length, list?.end ?? 0), replacement: REDACTED };
 };
 
 // ---------------------------------------------------------------------------------------------------------------------
