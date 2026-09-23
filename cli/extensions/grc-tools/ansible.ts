@@ -1311,8 +1311,10 @@ export function sanitizeScmUrl(value: unknown): unknown {
  * every other string is scrubbed for carriers (a bearer, a cookie, a
  * credential pair inside an arbitrary nested setting value) at every depth;
  * an object or array nested past the snapshot cap is the marker (reviewer D
- * round 5 depth control). The AAP settings API returns arbitrary nested
- * values, so the tree's shape is the server's.
+ * round 5 depth control). A settings tree reaches this step already projected
+ * to its documented keys (settingsProjector); the credential `inputs` and
+ * notification header maps handed in with redactEveryValue keep the shape the
+ * server returned.
  */
 export function redactCredentialTree(value: unknown, redactEveryValue = false, depth = 1): unknown {
   if (typeof value === "string") return redactCarrierText(sanitizeUrlText(value));
@@ -1421,6 +1423,22 @@ function listOf(spec: FieldSpec): (value: unknown) => JsonRecord[] | undefined {
 }
 
 /**
+ * A map of records keyed by name (an IdP map) projected entry by entry. The names are server-supplied content, so an
+ * entry that is not an object or carries none of the documented fields is dropped with its name rather than kept
+ * as an empty record.
+ */
+function mapOf(spec: FieldSpec): (value: unknown) => JsonRecord | undefined {
+  return (value) => {
+    const object = asObject(value);
+    if (!object) return undefined;
+    const entries = Object.entries(object)
+      .map(([name, entry]): [string, JsonRecord] => [name, pickTyped(entry, spec)])
+      .filter(([, projected]) => Object.keys(projected).length > 0);
+    return Object.fromEntries(entries);
+  };
+}
+
+/**
  * Projects the documented fields of a record in their documented types. A body that parsed to a primitive or
  * an array is not the documented object: it projects to nothing rather than reaching the `in` operator, whose
  * TypeError message would quote the value. A documented key whose value is not of its documented type (a
@@ -1495,6 +1513,39 @@ const JOB_HOST_SUMMARY_FIELDS = ["id", "job", "host", "host_name", "failed", "ch
 const EXECUTION_ENVIRONMENT_FIELDS = ["id", "name", "description", "image", "pull", "organization", "credential", "managed", "created", "modified"];
 const SURVEY_QUESTION_FIELDS = ["variable", "type", "required", "question_name", "min", "max"];
 const JOB_SETTING_FIELDS: FieldSpec = Object.freeze({ SCHEDULE_MAX_JOBS: "number", MAX_FORKS: "number", DEFAULT_JOB_TIMEOUT: "number", DEFAULT_INVENTORY_UPDATE_TIMEOUT: "number", DEFAULT_PROJECT_UPDATE_TIMEOUT: "number", AD_HOC_COMMANDS: stringList, AWX_TASK_ENV: scalarMap, GALAXY_TASK_ENV: scalarMap });
+/**
+ * The settings categories the platform findings read, projected the way `job_settings.json` is (reviewer D
+ * round 5 class 10): each spec names the documented keys in their documented types, so an undocumented key of
+ * the server's dictionary is dropped rather than copied and a documented key holding another type is dropped
+ * rather than copied verbatim. Authentication keeps the category's session and local-auth flags, the backend
+ * list, and the LDAP, SAML, and OIDC keys whose populatedness control 25 reads (a server URI, a bind or template
+ * DN, a search base, a group DN, an attribute map, the SAML SP entity id and IdP map, the OIDC endpoint), for
+ * `AUTH_LDAP_` and the five numbered `AUTH_LDAP_<n>_` servers. The bind password, the SP certificate and private
+ * key, the OIDC client id and secret, the organization and team maps, and the keys that are populated by default
+ * (`AUTH_LDAP_GROUP_TYPE`, `AUTH_LDAP_CONNECTION_OPTIONS`, `SAML_AUTO_CREATE_OBJECTS`,
+ * `SOCIAL_AUTH_OIDC_VERIFY_SSL`, the read-only SAML callback and metadata URLs) are not documented here, so
+ * neither a secret nor a default stands in for a configured authenticator. System keeps the two activity stream
+ * flags; logging keeps the aggregator flags and enumerations control 26 reads and never the host, port,
+ * username, or password.
+ */
+const LDAP_SETTING_FIELDS: FieldSpec = Object.freeze({ SERVER_URI: "string", BIND_DN: "string", USER_DN_TEMPLATE: "string", USER_SEARCH: stringList, GROUP_SEARCH: stringList, REQUIRE_GROUP: "string", DENY_GROUP: "string", USER_ATTR_MAP: scalarMap });
+const LDAP_SETTING_PREFIXES = ["AUTH_LDAP_", "AUTH_LDAP_1_", "AUTH_LDAP_2_", "AUTH_LDAP_3_", "AUTH_LDAP_4_", "AUTH_LDAP_5_"];
+const SAML_IDP_FIELDS: FieldSpec = Object.freeze({ entity_id: "string", url: "string" });
+const AUTHENTICATION_SETTING_FIELDS: FieldSpec = Object.freeze({
+  SESSION_COOKIE_AGE: "number",
+  SESSIONS_PER_USER: "number",
+  DISABLE_LOCAL_AUTH: "boolean",
+  AUTH_BASIC_ENABLED: "boolean",
+  ALLOW_OAUTH2_FOR_EXTERNAL_USERS: "boolean",
+  SOCIAL_AUTH_USERNAME_IS_FULL_EMAIL: "boolean",
+  AUTHENTICATION_BACKENDS: stringList,
+  ...Object.fromEntries(LDAP_SETTING_PREFIXES.flatMap((prefix) => Object.entries(LDAP_SETTING_FIELDS).map(([key, rule]): [string, FieldRule] => [`${prefix}${key}`, rule]))),
+  SOCIAL_AUTH_SAML_SP_ENTITY_ID: "string",
+  SOCIAL_AUTH_SAML_ENABLED_IDPS: mapOf(SAML_IDP_FIELDS),
+  SOCIAL_AUTH_OIDC_OIDC_ENDPOINT: "string",
+});
+const SYSTEM_SETTING_FIELDS: FieldSpec = Object.freeze({ ACTIVITY_STREAM_ENABLED: "boolean", ACTIVITY_STREAM_ENABLED_FOR_INVENTORY_SYNC: "boolean" });
+const LOGGING_SETTING_FIELDS: FieldSpec = Object.freeze({ LOG_AGGREGATOR_ENABLED: "boolean", LOG_AGGREGATOR_TYPE: "string", LOG_AGGREGATOR_PROTOCOL: "string", LOG_AGGREGATOR_LEVEL: "string", LOG_AGGREGATOR_VERIFY_CERT: "boolean", LOG_AGGREGATOR_INDIVIDUAL_FACTS: "boolean", LOG_AGGREGATOR_LOGGERS: stringList });
 const SUMMARY_CREDENTIAL_FIELDS = ["id", "name", "kind", "credential_type_id"];
 
 /** The documented user fields in their documented types; anything else under those keys is dropped. */
@@ -1627,13 +1678,19 @@ function projectSurveySpec(spec: JsonRecord | undefined): JsonRecord | undefined
   };
 }
 
-function projectJobSettings(settings: JsonRecord | undefined): JsonRecord | undefined {
-  return settings ? redactCredentialTree(pickTyped(settings, JOB_SETTING_FIELDS)) as JsonRecord : settings;
+/**
+ * The core_data projection of a settings category: its documented keys in their documented types (idempotent over
+ * the collection-time projection, so a snapshot handed in raw is projected here too), then the credential-bearing
+ * values redacted. The server's whole dictionary never reaches a settings file.
+ */
+function settingsProjector(spec: FieldSpec): (settings: JsonRecord | undefined) => JsonRecord | undefined {
+  return (settings) => (settings ? redactCredentialTree(pickTyped(settings, spec)) as JsonRecord : settings);
 }
 
-function projectSettings(settings: JsonRecord | undefined): JsonRecord | undefined {
-  return settings ? redactCredentialTree(settings) as JsonRecord : settings;
-}
+const projectJobSettings = settingsProjector(JOB_SETTING_FIELDS);
+const projectAuthenticationSettings = settingsProjector(AUTHENTICATION_SETTING_FIELDS);
+const projectSystemSettings = settingsProjector(SYSTEM_SETTING_FIELDS);
+const projectLoggingSettings = settingsProjector(LOGGING_SETTING_FIELDS);
 
 /**
  * The ping document's documented fields in their documented types (`version`, `active_node` strings, `ha` a
@@ -1956,6 +2013,30 @@ async function fetchObject(client: AnsibleClientSurface, label: string, path: st
   } catch (error) {
     return { data: undefined, ...failedSnapshot(label, path, error) };
   }
+}
+
+/** The fixed error a settings read records when the body carries none of the category's documented keys. */
+function unrecognizedSettingsError(label: string, path: string): string {
+  return `${label} (${path}): no documented settings key returned`;
+}
+
+/**
+ * A settings category read and projected to its documented keys at collection time, so the findings, the
+ * summary, and the bundle all see the projection and never the server's whole dictionary (rule 9's tenant
+ * configuration clause; reviewer D round 5 class 10). A body that carries none of the documented keys (a foreign
+ * JSON document, an empty object, a primitive or array, a category whose documented keys all hold undocumented
+ * types) is not a recognizable settings surface: the snapshot carries a fixed error and no data, the way an
+ * unrecognizable `me` body does in probeScope, so the bundle writes the not-collected marker and the dependent
+ * findings take their unreadable paths.
+ */
+async function fetchSettings(client: AnsibleClientSurface, label: string, path: string, spec: FieldSpec): Promise<Snapshot<JsonRecord | undefined>> {
+  const snapshot = await fetchObject(client, label, path);
+  if (snapshot.error) return snapshot;
+  const settings = pickTyped(snapshot.data, spec);
+  if (Object.keys(settings).length === 0) {
+    return { data: undefined, error: unrecognizedSettingsError(label, path), status: null, endpoint: requestPath(path) };
+  }
+  return { data: settings };
 }
 
 interface InventoryView {
@@ -2948,9 +3029,9 @@ export async function collectAnsiblePlatformSecurityData(client: AnsibleClientSu
   const notificationTemplates = await collect(client, "notification templates", "/api/v2/notification_templates/", {}, 200);
   const notifications = await collect(client, "notifications", "/api/v2/notifications/", { order_by: "-created" }, 100);
   const activity = await collect(client, "activity stream", "/api/v2/activity_stream/", { order_by: "-timestamp" }, 10);
-  const authSettings = await fetchObject(client, "authentication settings", "/api/v2/settings/authentication/");
-  const systemSettings = await fetchObject(client, "system settings", "/api/v2/settings/system/");
-  const loggingSettings = await fetchObject(client, "logging settings", "/api/v2/settings/logging/");
+  const authSettings = await fetchSettings(client, "authentication settings", "/api/v2/settings/authentication/", AUTHENTICATION_SETTING_FIELDS);
+  const systemSettings = await fetchSettings(client, "system settings", "/api/v2/settings/system/", SYSTEM_SETTING_FIELDS);
+  const loggingSettings = await fetchSettings(client, "logging settings", "/api/v2/settings/logging/", LOGGING_SETTING_FIELDS);
   return {
     scope,
     organizations,
@@ -3834,9 +3915,9 @@ export function buildAnsibleCoreDataFiles(
     ["core_data/notification_templates.json", projectCollectionSnapshot(platformData.notificationTemplates, projectNotificationTemplate)],
     ["core_data/notifications.json", projectCollectionSnapshot(platformData.notifications, projectNotification)],
     ["core_data/activity_stream.json", projectCollectionSnapshot(platformData.activity, projectActivity)],
-    ["core_data/settings_authentication.json", projectObjectSnapshot(platformData.authSettings, projectSettings)],
-    ["core_data/settings_system.json", projectObjectSnapshot(platformData.systemSettings, projectSettings)],
-    ["core_data/settings_logging.json", projectObjectSnapshot(platformData.loggingSettings, projectSettings)],
+    ["core_data/settings_authentication.json", projectObjectSnapshot(platformData.authSettings, projectAuthenticationSettings)],
+    ["core_data/settings_system.json", projectObjectSnapshot(platformData.systemSettings, projectSystemSettings)],
+    ["core_data/settings_logging.json", projectObjectSnapshot(platformData.loggingSettings, projectLoggingSettings)],
   ];
 }
 
@@ -4283,6 +4364,12 @@ export function ansibleFixedTexts(): readonly string[] {
     "ACTIVITY_STREAM_ENABLED is not exposed by the system settings, so it was not confirmed",
     "ACTIVITY_STREAM_ENABLED is false, so platform changes are not being recorded.",
     `the logging settings could not be read (no settings object returned), so external log aggregation was not confirmed`,
+    unrecognizedSettingsError("authentication settings", "/api/v2/settings/authentication/"),
+    unrecognizedSettingsError("system settings", "/api/v2/settings/system/"),
+    unrecognizedSettingsError("logging settings", "/api/v2/settings/logging/"),
+    `the system settings could not be read (${unrecognizedSettingsError("system settings", "/api/v2/settings/system/")}), so ACTIVITY_STREAM_ENABLED was not confirmed`,
+    `the logging settings could not be read (${unrecognizedSettingsError("logging settings", "/api/v2/settings/logging/")}), so external log aggregation was not confirmed`,
+    manualForUnreadable(25, { label: "authentication settings", error: unrecognizedSettingsError("authentication settings", "/api/v2/settings/authentication/"), status: null, endpoint: "/api/v2/settings/authentication/" }, "the LDAP, SAML, or OIDC authenticator configuration (Settings > Authentication, or the platform gateway Authentication page on AAP 2.5)").summary,
     `the inventories list could not be read (${inventoriesDenied}), so inventory-wide Admin roles were not checked`,
     `the job templates list could not be read (${templatesDenied}), so last-run ages were not checked`,
     `owning template unknown: the job templates list could not be read (${templatesDenied})`,

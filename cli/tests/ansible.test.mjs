@@ -1614,15 +1614,19 @@ test("verdict rule 9: exportAnsibleAuditBundle never writes variables bodies, cr
   assert.deepEqual(survey, { variable: "api_token", type: "text", required: true, default: ANSIBLE_REDACTION_MARKER });
   assert.equal(read("activity_stream.json").data.items[0].changes, `${ANSIBLE_REDACTION_MARKER} (variable names: extra_vars)`);
   assert.deepEqual(read("activity_stream.json").data.items[0].summary_fields.actor, { id: 1, username: "auditor" });
+  // The three settings files carry the documented keys only (reviewer D round 5 class 10): the secret-named keys the
+  // fixture plants are not documented, so they are absent rather than redacted, and so is every other undocumented key.
   const authSettings = read("settings_authentication.json").data;
-  assert.equal(authSettings.AUTH_LDAP_SERVER_URI, "ldaps://ldap.example.com");
-  assert.equal(authSettings.AUTH_LDAP_BIND_DN, "cn=svc,dc=example");
-  assert.equal(authSettings.AUTH_LDAP_BIND_PASSWORD, ANSIBLE_REDACTION_MARKER);
-  assert.equal(authSettings.SOCIAL_AUTH_SAML_SP_PRIVATE_KEY, ANSIBLE_REDACTION_MARKER);
-  assert.equal(authSettings.SOCIAL_AUTH_SAML_ENABLED_IDPS.okta.url, "https://idp.example.com/sso", "URL query strings are dropped from settings values");
-  assert.deepEqual(read("settings_system.json").data, { ACTIVITY_STREAM_ENABLED: true, REDHAT_PASSWORD: ANSIBLE_REDACTION_MARKER, LICENSE: { license_key: ANSIBLE_REDACTION_MARKER, subscription_name: "AAP" } });
-  assert.equal(read("settings_logging.json").data.LOG_AGGREGATOR_PASSWORD, ANSIBLE_REDACTION_MARKER);
-  assert.equal(read("settings_logging.json").data.LOG_AGGREGATOR_TYPE, "splunk");
+  assert.deepEqual(authSettings, {
+    AUTH_LDAP_SERVER_URI: "ldaps://ldap.example.com",
+    AUTH_LDAP_BIND_DN: "cn=svc,dc=example",
+    SOCIAL_AUTH_SAML_ENABLED_IDPS: { okta: { entity_id: "https://idp.example.com/", url: "https://idp.example.com/sso" } },
+  }, "the authentication settings keep the documented LDAP and SAML keys; URL query strings are dropped from settings values");
+  for (const undocumented of ["AUTH_LDAP_BIND_PASSWORD", "SOCIAL_AUTH_SAML_SP_PRIVATE_KEY", "SOCIAL_AUTH_GITHUB_SECRET"]) {
+    assert.ok(!(undocumented in authSettings), `${undocumented} is not a documented authentication key and is absent, not redacted`);
+  }
+  assert.deepEqual(read("settings_system.json").data, { ACTIVITY_STREAM_ENABLED: true }, "REDHAT_PASSWORD and LICENSE are not documented system keys and are absent");
+  assert.deepEqual(read("settings_logging.json").data, { LOG_AGGREGATOR_ENABLED: true, LOG_AGGREGATOR_TYPE: "splunk" }, "LOG_AGGREGATOR_PASSWORD is not a documented logging key and is absent");
   assert.deepEqual(Object.keys(read("users.json").data.items[0]).sort(), ["id", "is_superuser", "is_system_auditor", "username"]);
   assert.deepEqual(read("access.json").currentUser, { id: 1, username: "auditor", is_superuser: true, is_system_auditor: false });
   assert.deepEqual(Object.keys(read("notifications.json").data.items[0]).sort(), ["id", "status"]);
@@ -1788,6 +1792,19 @@ const ANSIBLE_ERROR_BODY_CANARIES = Object.freeze({ json: "Uw34sFSRwES87v9q", ht
  */
 const ANSIBLE_PRIMITIVE_BODY_CANARY = "kR7dQx2mVt9HpZ4wLc3";
 
+/**
+ * Reviewer D round 5 class 10: the values a `200 foreign JSON` settings body carries under keys no settings category
+ * documents (a bare token, a credential-named pair, a bearer carrier, a cookie carrier) and under a documented key of
+ * an undocumented shape.
+ */
+const ANSIBLE_FOREIGN_SETTINGS_CANARIES = Object.freeze({
+  bare: "Hq8vN2tKz5Rw7Ym3Pd6Lc9Xb4Fg",
+  pair: "Gk3Zt8Mq5Xw2Nr7Yp4Lc9Vb6Hd",
+  bearer: "Wc4Tn7Ks2Qp9Zx5Vm8Rb3Jd6Hf",
+  cookie: "Rt6Kp9Wq2Zn5Xc8Vm3Yb7Jf4Hd",
+  typed: "Lm5Xr8Qw3Tz6Kp2Vn9Yc4Hb7Jd",
+});
+
 /** Every planted canary an Ansible output is swept for, window by window. */
 const ANSIBLE_PLANTED_CANARIES = Object.freeze([
   ...CANARY_VALUES,
@@ -1799,6 +1816,7 @@ const ANSIBLE_PLANTED_CANARIES = Object.freeze([
   ANSIBLE_RUN_TOKEN_CANARY,
   ...Object.values(ANSIBLE_ERROR_BODY_CANARIES),
   ANSIBLE_PRIMITIVE_BODY_CANARY,
+  ...Object.values(ANSIBLE_FOREIGN_SETTINGS_CANARIES),
 ]);
 
 const AAP_CLIENT_CONFIG = { baseUrl: "https://aap.example.com", token: ANSIBLE_RUN_TOKEN_CANARY, timeoutMs: 30_000, verifySsl: true, sourceChain: ["tests"] };
@@ -1925,9 +1943,15 @@ test("rule 9 fixed texts (GWS note 1): every fixed-text message the integration 
     "AAP session login failed (401 Unauthorized).",
     "AAP session auth requires AAP_USERNAME and AAP_PASSWORD.",
     "ACTIVITY_STREAM_ENABLED is not exposed by the system settings, so it was not confirmed",
+    "authentication settings (/api/v2/settings/authentication/): no documented settings key returned",
+    "system settings (/api/v2/settings/system/): no documented settings key returned",
+    "logging settings (/api/v2/settings/logging/): no documented settings key returned",
+    "the system settings could not be read (system settings (/api/v2/settings/system/): no documented settings key returned), so ACTIVITY_STREAM_ENABLED was not confirmed",
+    "the logging settings could not be read (logging settings (/api/v2/settings/logging/): no documented settings key returned), so external log aggregation was not confirmed",
   ]) {
     assert.ok(texts.includes(required), `the fixed-text list carries: ${required}`);
   }
+  assert.ok(texts.some((text) => /^authentication settings could not be read \(authentication settings \(\/api\/v2\/settings\/authentication\/\): no documented settings key returned\), so this control cannot be verified from the API\. Collect this evidence manually: /.test(text)), "the manual-for-unrecognizable-settings summary is in the list");
   assert.ok(texts.some((text) => HTML_BODY_NOTE.test(text)), "the fixed-text list carries the non-JSON body note");
   assert.ok(texts.some((text) => /^inventories could not be read \(AAP request failed: \/api\/v2\/inventories\/ \(403 Forbidden\) .*\), so this control cannot be verified from the API\. Collect this evidence manually: /.test(text)), "the manual-for-unreadable summary is in the list");
   assert.ok(texts.some((text) => /^No team holds the Admin role on every inventory\. Downgraded from pass to warn because the inventory is partial or unreadable: current user could not be read, so the visibility of the audit account is unknown; inventories: unreadable \(/.test(text)), "the warn-capped pass summary built on an unreadable view is in the list");
@@ -2062,11 +2086,10 @@ test("rule 9 depth control (reviewer D round 5 depth control): every string a sn
   aapClient(healthyAapRoutes());
   assertCarrierTextScrub(assert, redactCarrierText, { label: "ansible.redactCarrierText", configuredSecret: AAP_CLIENT_CONFIG.token });
 
-  // End to end: the tree planted on every body and in every record and nested record of every healthy route. The
-  // AAP settings API returns arbitrary nested values, so the settings files carry the tree as data, and the cap
-  // counts containers from the root of the written file: `{ data: <settings> }` is depth 1, the settings object
-  // depth 2, the planted tree's level 1 its member at depth 3, so level 30 sits at the cap in place and level 31 is
-  // the marker. Every other writer projects documented fields, so no other file carries a trace of the tree.
+  // End to end: the tree planted on every body and in every record and nested record of every healthy route. Every
+  // writer projects documented fields, the three settings writers included since reviewer D round 5 class 10, so no
+  // core_data file, zip entry, or tool payload carries a trace of the tree; the cap is exercised on the walkers above.
+  // The planted key beside the documented keys leaves every settings body recognizable, so no read fails.
   const planted = { count: 0 };
   const log = [];
   const run = await runEveryAnsibleTool(aapClient(withPlantedRoutes(healthyAapRoutes(), { planted }), log), createTempBase("grclanker-ansible-depth-"));
@@ -2076,28 +2099,134 @@ test("rule 9 depth control (reviewer D round 5 depth control): every string a sn
   assert.equal(run.exported.errorCount, 0, "the planted tree causes no read to fail");
   const files = readBundleFiles(run.exported.outputDir);
   const zipEntries = readZipEntries(run.exported.zipPath);
-  const carrying = assertDepthControlOutputs(
+  assertDepthControlOutputs(
     assert,
     { files, zipEntries, outputs: [run.access, ...run.assessments] },
-    { label: "ansible", treeExpected: true, marker: ANSIBLE_REDACTION_MARKER },
+    { label: "ansible", treeExpected: false, marker: ANSIBLE_REDACTION_MARKER },
   );
-  const settingsFiles = ["core_data/settings_system.json", "core_data/settings_authentication.json", "core_data/settings_logging.json"];
-  assert.deepEqual(carrying.filter((entry) => entry.startsWith("file ")).sort(), settingsFiles.map((name) => `file ${name}`).sort(), "exactly the three settings files carry the nested tree with the cap applied");
-  for (const name of settingsFiles) {
-    assert.ok(carrying.some((entry) => entry.startsWith("zip ") && entry.endsWith(name)), `the zip entry for ${name} carries it too`);
+  for (const name of ["core_data/settings_system.json", "core_data/settings_authentication.json", "core_data/settings_logging.json"]) {
     const settings = JSON.parse(files.get(name));
-    let node = settings.data.x_deep_probe;
-    let level = 0;
-    while (node && typeof node === "object") {
-      level += 1;
-      node = node.child;
-    }
-    assert.equal(level, DEPTH_CONTROL.cap - 2, `${name}: levels 1 to ${DEPTH_CONTROL.cap - 2} sit in place below the wrapper and the settings object`);
-    assert.equal(node, ANSIBLE_REDACTION_MARKER, `${name}: level ${DEPTH_CONTROL.cap - 1} (depth ${DEPTH_CONTROL.cap + 1}) is the marker`);
+    assert.ok(!("x_deep_probe" in settings.data), `${name}: the undocumented key is dropped by the projection, not carried with the cap applied`);
+    assert.ok(Object.keys(settings.data).length > 0, `${name}: the documented keys beside it are kept`);
   }
   assert.ok(!JSON.stringify([run.access, ...run.assessments]).includes("benign-note-"), "no tool payload copies the settings tree");
   assertNoCanaryWindows(assert, run.access, DEPTH_CONTROL_CANARIES, "check_access");
   for (const assessment of run.assessments) assertNoCanaryWindows(assert, assessment, DEPTH_CONTROL_CANARIES, assessment.title);
+});
+
+/** The three settings categories the platform findings read: path, core_data file, and the label the read records. */
+const ANSIBLE_SETTINGS_SURFACES = Object.freeze([
+  ["/api/v2/settings/authentication/", "core_data/settings_authentication.json", "authentication settings"],
+  ["/api/v2/settings/system/", "core_data/settings_system.json", "system settings"],
+  ["/api/v2/settings/logging/", "core_data/settings_logging.json", "logging settings"],
+]);
+
+/**
+ * Reviewer D's class 10 members (the `200 foreign JSON` body): a bare token under a key no settings category
+ * documents, a credential-named pair and a bearer carrier inside a record list, and a cookie carrier two containers
+ * down, planted beside or instead of the documented keys of each settings body.
+ */
+function foreignSettingsMembers(canaries = ANSIBLE_FOREIGN_SETTINGS_CANARIES) {
+  return {
+    foo: canaries.bare,
+    items: [{ password: canaries.pair, description: `Authorization: Bearer ${canaries.bearer}` }],
+    nested: { deeper: { note: `Cookie: sessionid=${canaries.cookie}; theme=dark` } },
+  };
+}
+
+test("rule 9 settings projection (reviewer D round 5 class 10): a bare token and a carrier under undocumented keys of the three settings bodies reach no bundle file, zip entry, or tool payload, a documented body projects unchanged, and a body carrying none of the documented keys is an unrecognizable settings surface that writes the marker and demotes without TypeError text", async () => {
+  const canaries = Object.values(ANSIBLE_FOREIGN_SETTINGS_CANARIES);
+  const healthy = await runEveryAnsibleTool(aapClient(healthyAapRoutes()), createTempBase("grclanker-ansible-settings-documented-"));
+  assert.equal(healthy.exportError, undefined);
+  const healthyFiles = readBundleFiles(healthy.exported.outputDir);
+  const healthyPlatform = healthy.assessments[2];
+
+  // A documented body projects to its documented keys in their documented types and nothing else.
+  assert.deepEqual(JSON.parse(healthyFiles.get("core_data/settings_authentication.json")), { data: { AUTH_LDAP_SERVER_URI: "ldaps://ldap.example.com", SOCIAL_AUTH_SAML_ENABLED_IDPS: {} } });
+  assert.deepEqual(JSON.parse(healthyFiles.get("core_data/settings_system.json")), { data: { ACTIVITY_STREAM_ENABLED: true } });
+  assert.deepEqual(JSON.parse(healthyFiles.get("core_data/settings_logging.json")), { data: { LOG_AGGREGATOR_ENABLED: true, LOG_AGGREGATOR_TYPE: "splunk" } });
+  assert.equal(byControl(healthyPlatform, 25).status, "pass");
+  assert.equal(byControl(healthyPlatform, 26).status, "pass");
+  assert.equal(healthyPlatform.summary.external_auth, true);
+
+  // The foreign members beside the documented keys, plus an undocumented shape under a documented key of a nested
+  // type (an object where a string list is documented): every foreign value is dropped, the documented keys are
+  // kept in place, and the findings are the documented body's findings.
+  const mixedRoutes = {
+    "/api/v2/settings/authentication/": () => jsonResponse({ ...HEALTHY_ROUTES["/api/v2/settings/authentication/"], AUTHENTICATION_BACKENDS: { nested: ANSIBLE_FOREIGN_SETTINGS_CANARIES.typed }, ...foreignSettingsMembers() }),
+    "/api/v2/settings/system/": () => jsonResponse({ ...HEALTHY_ROUTES["/api/v2/settings/system/"], ...foreignSettingsMembers() }),
+    "/api/v2/settings/logging/": () => jsonResponse({ ...HEALTHY_ROUTES["/api/v2/settings/logging/"], LOG_AGGREGATOR_LOGGERS: { nested: ANSIBLE_FOREIGN_SETTINGS_CANARIES.typed }, ...foreignSettingsMembers() }),
+  };
+  const mixed = await runEveryAnsibleTool(aapClient({ ...healthyAapRoutes(), ...mixedRoutes }), createTempBase("grclanker-ansible-settings-mixed-"));
+  assert.equal(mixed.accessError, undefined);
+  assert.equal(mixed.exportError, undefined);
+  assert.equal(mixed.exported.errorCount, 0, "foreign members beside the documented keys fail no read");
+  const mixedFiles = readBundleFiles(mixed.exported.outputDir);
+  const mixedZip = readZipEntries(mixed.exported.zipPath);
+  assert.equal(mixedZip.size, mixedFiles.size, "the zip carries exactly the written files");
+  assertNoCanaryWindowsInFiles(assert, mixedFiles, canaries, "mixed bundle directory");
+  assertNoCanaryWindowsInFiles(assert, mixedZip, canaries, "mixed zip archive");
+  for (const payload of [mixed.access, ...mixed.assessments, mixed.exported]) assertNoCanaryWindows(assert, payload, canaries, "mixed tool payload");
+  assert.deepEqual(JSON.parse(mixedFiles.get("core_data/settings_authentication.json")), JSON.parse(healthyFiles.get("core_data/settings_authentication.json")), "an object under the string-list key AUTHENTICATION_BACKENDS is dropped with the foreign members");
+  assert.deepEqual(JSON.parse(mixedFiles.get("core_data/settings_system.json")), JSON.parse(healthyFiles.get("core_data/settings_system.json")));
+  assert.deepEqual(JSON.parse(mixedFiles.get("core_data/settings_logging.json")), JSON.parse(healthyFiles.get("core_data/settings_logging.json")), "an object under the string-list key LOG_AGGREGATOR_LOGGERS is dropped");
+  for (const control of [25, 26]) {
+    assert.equal(byControl(mixed.assessments[2], control).status, byControl(healthyPlatform, control).status, `control ${control} keeps the documented body's status`);
+    assert.equal(byControl(mixed.assessments[2], control).summary, byControl(healthyPlatform, control).summary, `control ${control} keeps the documented body's summary`);
+  }
+  assert.equal(mixed.assessments[2].summary.external_auth, true);
+
+  // Bodies carrying none of the documented keys: reviewer D's foreign document on all three, then an empty object, a
+  // JSON string, and a JSON array. None is a settings surface: the file is the not-collected marker with a fixed
+  // error and a null status, control 25 is manual through the unreadable path, control 26 caps at warn naming both
+  // unconfirmed settings, the summary flags are null and false, and no TypeError text is recorded anywhere.
+  const unrecognizable = [
+    ["foreign document", Object.fromEntries(ANSIBLE_SETTINGS_SURFACES.map(([path]) => [path, () => jsonResponse(foreignSettingsMembers())]))],
+    ["empty object, string, and array", {
+      "/api/v2/settings/authentication/": () => jsonResponse({}),
+      "/api/v2/settings/system/": () => jsonResponse(ANSIBLE_PRIMITIVE_BODY_CANARY),
+      "/api/v2/settings/logging/": () => jsonResponse([{ LOG_AGGREGATOR_ENABLED: true, note: ANSIBLE_FOREIGN_SETTINGS_CANARIES.bare }]),
+    }],
+  ];
+  for (const [label, routes] of unrecognizable) {
+    const run = await runEveryAnsibleTool(aapClient({ ...healthyAapRoutes(), ...routes }), createTempBase("grclanker-ansible-settings-unrecognizable-"));
+    assert.equal(run.accessError, undefined, `${label}: the access check completes`);
+    assert.equal(run.exportError, undefined, `${label}: the export completes`);
+    const files = readBundleFiles(run.exported.outputDir);
+    const zipEntries = readZipEntries(run.exported.zipPath);
+    const swept = [...canaries, ANSIBLE_PRIMITIVE_BODY_CANARY];
+    assertNoCanaryWindowsInFiles(assert, files, swept, `${label} bundle directory`);
+    assertNoCanaryWindowsInFiles(assert, zipEntries, swept, `${label} zip archive`);
+    for (const payload of [run.access, ...run.assessments, run.exported]) assertNoCanaryWindows(assert, payload, swept, `${label} tool payload`);
+    for (const [path, file, name] of ANSIBLE_SETTINGS_SURFACES) {
+      assert.deepEqual(JSON.parse(files.get(file)), { collected: false, status: null, endpoint: path, error: `${name} (${path}): no documented settings key returned` }, `${label}: ${file} is the not-collected marker`);
+    }
+    const platform = run.assessments[2];
+    const auth = byControl(platform, 25);
+    assert.equal(auth.status, "manual", `${label}: control 25 is manual`);
+    assert.match(auth.summary, /^authentication settings could not be read \(authentication settings \(\/api\/v2\/settings\/authentication\/\): no documented settings key returned\), so this control cannot be verified from the API\. Collect this evidence manually: /);
+    assert.deepEqual(auth.evidence, { error: "authentication settings (/api/v2/settings/authentication/): no documented settings key returned", http_status: null, endpoint: "/api/v2/settings/authentication/" });
+    const audit = byControl(platform, 26);
+    assert.equal(audit.status, "warn", `${label}: control 26 caps at warn`);
+    assert.deepEqual(audit.evidence.settings_gaps, [
+      "the system settings could not be read (system settings (/api/v2/settings/system/): no documented settings key returned), so ACTIVITY_STREAM_ENABLED was not confirmed",
+      "the logging settings could not be read (logging settings (/api/v2/settings/logging/): no documented settings key returned), so external log aggregation was not confirmed",
+    ]);
+    assert.deepEqual(
+      { enabled: audit.evidence.activity_stream_enabled, system: audit.evidence.system_settings_readable, aggregator: audit.evidence.log_aggregator_enabled, type: audit.evidence.log_aggregator_type, logging: audit.evidence.logging_settings_readable },
+      { enabled: null, system: false, aggregator: null, type: null, logging: false },
+      `${label}: settings-derived flags render null with their readable flags false`,
+    );
+    assert.equal(platform.summary.external_auth, null);
+    assert.equal(platform.summary.auth_settings_readable, false);
+    for (const [path, , name] of ANSIBLE_SETTINGS_SURFACES) {
+      assert.ok(platform.errors.includes(`${name} (${path}): no documented settings key returned`), `${label}: the errors array carries the fixed error for ${path}`);
+    }
+    assert.equal(run.exported.errorCount, 3, `${label}: the three unrecognizable reads are the bundle's only errors`);
+    assert.match(files.get("_errors.log"), /no documented settings key returned/);
+    const everything = JSON.stringify([run.access, ...run.assessments, run.exported, [...files.values()]]);
+    assert.ok(!/TypeError/.test(everything), `${label}: no TypeError text is recorded`);
+  }
 });
 
 test("rule 9 credential-named pairs (reviewer D round 5 baseline): a value under a credential-named key is removed whatever its shape and length, unquoted as well as quoted, in every form the pair takes, while identifier-named keys keep their values unless the value's own shape removes it", () => {
