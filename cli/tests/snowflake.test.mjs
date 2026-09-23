@@ -3462,6 +3462,102 @@ test("CodeRabbit #76 userinfo: the userinfo of a URL ends at the first slash, qu
   }
 });
 
+/**
+ * Codex P1 on #81: a ";" inside a URL query value is part of the value (URLSearchParams semantics), so
+ * "?token=hunter2;restofsecret" loses the whole value with no tail, in the relative, absolute, JSON-escaped,
+ * and slash-escaped spellings. The ";" separator belongs to Cookie and Set-Cookie parsing alone, and the
+ * cookie reader runs before the query pass, so "Cookie: &sid=a; pref=b" still reads as one cookie header.
+ */
+const QUERY_SEMICOLON_ROWS = [
+  ["GET /api/v1/things?token=hunter2;restofsecret failed", "GET /api/v1/things?token=[REDACTED] failed"],
+  ["/api/v1/things?token=hunter2;restofsecret", "/api/v1/things?token=[REDACTED]"],
+  ["GET https://h.example/api/v1/things?token=hunter2;restofsecret failed", "GET https://h.example/api/v1/things?[REDACTED] failed"],
+  ['{"url":"\\/api\\/v1\\/things?token=hunter2;restofsecret"}', '{"url":"\\/api\\/v1\\/things?token=[REDACTED]"}'],
+  ['{"url":"https:\\/\\/h.example\\/api\\/v1\\/things?token=hunter2;restofsecret"}', '{"url":"https:\\/\\/h.example\\/api\\/v1\\/things?[REDACTED]"}'],
+  ['{"body":"{\\"url\\":\\"/api/v1/things?token=hunter2;restofsecret\\"}"}', '{"body":"{\\"url\\":\\"/api/v1/things?token=[REDACTED]\\"}"}'],
+  ['{"body":"{\\"url\\":\\"https://h.example/api/v1/things?token=hunter2;restofsecret\\"}"}', '{"body":"{\\"url\\":\\"https://h.example/api/v1/things?[REDACTED]\\"}"}'],
+  ["/api/v1/things?page=2&token=hunter2;restofsecret&limit=5", "/api/v1/things?page=2&token=[REDACTED]&limit=5"],
+  [`/api/v1/things?token=${PLANTED_TOKEN};tail=2&page=3`, "/api/v1/things?token=[REDACTED]&page=3"],
+  ["Cookie: &sid=a; pref=b", "Cookie: [REDACTED]"],
+  ["Cookie: sid=hunter2;restofsecret; pref=b", "Cookie: [REDACTED]"],
+  ["Set-Cookie: sid=hunter2;restofsecret; Path=/; HttpOnly", "Set-Cookie: [REDACTED]"],
+  [`Cookie: my&sid=${PLANTED_TOKEN}; Content-Type: application/json`, "Cookie: [REDACTED]; Content-Type: application/json"],
+];
+const QUERY_SEMICOLON_PIECES = ["hunter2", "restofsecret", "tail=2", "sid=a", "pref=b", "Path=/"];
+
+test("Codex P1 on #81: a semicolon inside a URL query value is part of the value, so the whole value goes with no tail, relative, absolute, JSON-escaped, and slash-escaped, through the error scrubber, the data scrubber, and redactSnapshot, while the semicolon still separates cookie pairs", () => {
+  assertRows(redactSecrets, QUERY_SEMICOLON_ROWS, "query semicolon, error side");
+  assertRows(scrubDataText, QUERY_SEMICOLON_ROWS, "query semicolon, data side");
+  assertRows((text) => redactSnapshot({ note: text, nested: [{ deeper: text }] }).nested[0].deeper, QUERY_SEMICOLON_ROWS, "query semicolon, redactSnapshot leaf");
+  for (const [input] of QUERY_SEMICOLON_ROWS) {
+    for (const output of [redactSecrets(input), scrubDataText(input), redactSnapshot({ note: input }).note]) {
+      for (const piece of QUERY_SEMICOLON_PIECES) assert.ok(!output.includes(piece), `${piece} left in the output of ${input}: ${output}`);
+    }
+  }
+});
+
+/** The short token CodeRabbit quoted on #81 (discussion_r4081238237); it is not a planted canary, so its rows check for a window of it by hand. */
+const QUOTED_TOKEN = "skvclmtirehs";
+/**
+ * CodeRabbit on #81: after a scheme word under Authorization or Proxy-Authorization a pair list is the
+ * credential. A quoted value goes whatever its key (Snowflake's own `Token="..."`, any `<Scheme> <Key>="..."`,
+ * Digest's `username`, `nonce`, `uri`, `cnonce`, `response`, and `opaque`) unless the key is a descriptive
+ * parameter (realm, qop, algorithm, charset, error, error_description, error_uri, scope), and a bare value
+ * follows its key's own rule (`qop=auth` and `nc=00000001` stay). The same list rule reads a WWW-Authenticate
+ * challenge and a pair list in prose, so `realm="api"` stays everywhere. Before the fix a quoted value under an
+ * unknown key stayed, a JSON-object header kept the token beside a consumed key, and Digest's params survived.
+ */
+const QUOTED_AUTH_PARAM_ROWS = [
+  [`Authorization: Snowflake Token="${QUOTED_TOKEN}"`, 'Authorization: Snowflake Token="[REDACTED]"'],
+  [`Authorization: Snowflake Token="${PLANTED_TOKEN}"`, 'Authorization: Snowflake Token="[REDACTED]"'],
+  [`Authorization: Snowflake Token='${QUOTED_TOKEN}'`, "Authorization: Snowflake Token='[REDACTED]'"],
+  [`Authorization: Snowflake Token=${QUOTED_TOKEN}`, "Authorization: Snowflake [REDACTED]"],
+  [`Proxy-Authorization: Snowflake Token="${QUOTED_TOKEN}"`, 'Proxy-Authorization: Snowflake Token="[REDACTED]"'],
+  [`Authorization: Bearer blob="${QUOTED_TOKEN}"`, 'Authorization: Bearer blob="[REDACTED]"'],
+  [`Authorization: Digest username="auditor", realm="api", nonce="${QUOTED_TOKEN}", uri="/api/v1/things", qop=auth, nc=00000001, cnonce="${QUOTED_TOKEN}", response="${QUOTED_TOKEN}", opaque="opaque-state-1"`, 'Authorization: Digest username="[REDACTED]", realm="api", nonce="[REDACTED]", uri="[REDACTED]", qop=auth, nc=00000001, cnonce="[REDACTED]", response="[REDACTED]", opaque="[REDACTED]"'],
+  [`Authorization: Snowflake Token="${QUOTED_TOKEN}"; Content-Type: application/json`, 'Authorization: Snowflake Token="[REDACTED]"; Content-Type: application/json'],
+  [`Authorization: Snowflake Token="${QUOTED_TOKEN}" and X-Next: v`, 'Authorization: Snowflake Token="[REDACTED]" and X-Next: v'],
+  [`Authorization: Snowflake Token="${QUOTED_TOKEN}\nX-Next: v`, 'Authorization: Snowflake Token="[REDACTED]\nX-Next: v'],
+  [`{"headers":{"Authorization":"Snowflake Token=\\"${QUOTED_TOKEN}\\""}}`, '{"headers":{"Authorization":"Snowflake Token=\\"[REDACTED]\\""}}'],
+  [`{"headers":{"Authorization":"Digest username=\\"auditor\\", realm=\\"api\\", response=\\"${QUOTED_TOKEN}\\""}}`, '{"headers":{"Authorization":"Digest username=\\"[REDACTED]\\", realm=\\"api\\", response=\\"[REDACTED]\\""}}'],
+  [`{"body":"{\\"headers\\":{\\"Authorization\\":\\"Snowflake Token=\\\\\\"${QUOTED_TOKEN}\\\\\\"\\"}}"}`, '{"body":"{\\"headers\\":{\\"Authorization\\":\\"Snowflake Token=\\\\\\"[REDACTED]\\\\\\"\\"}}"}'],
+  [`request headers:\\nAuthorization: Snowflake Token=\\"${QUOTED_TOKEN}\\"\\nAccept: application/json`, 'request headers:\\nAuthorization: Snowflake Token=\\"[REDACTED]\\"\\nAccept: application/json'],
+  [`upstream said Bearer blob="${QUOTED_TOKEN}" and moved on`, 'upstream said Bearer blob="[REDACTED]" and moved on'],
+  [`upstream said Digest username="auditor", response="${QUOTED_TOKEN}" and moved on`, 'upstream said Digest username="[REDACTED]", response="[REDACTED]" and moved on'],
+  [`Snowflake Token="${QUOTED_TOKEN}" was rejected`, 'Snowflake Token="[REDACTED]" was rejected'],
+  ['WWW-Authenticate: Bearer realm="api"', 'WWW-Authenticate: Bearer realm="api"'],
+  ['WWW-Authenticate: Bearer realm="api", error="invalid_token", error_description="The access token expired"', 'WWW-Authenticate: Bearer realm="api", error="invalid_token", error_description="The access token expired"'],
+  [`WWW-Authenticate: Digest realm="api", qop="auth", algorithm=MD5, nonce="${QUOTED_TOKEN}", opaque="opaque-state-1"`, 'WWW-Authenticate: Digest realm="api", qop="auth", algorithm=MD5, nonce="[REDACTED]", opaque="[REDACTED]"'],
+  ['WWW-Authenticate: Snowflake realm="api"', 'WWW-Authenticate: Snowflake realm="api"'],
+  ["Authorization: VERACODE-HMAC-SHA-256 id=abcdef1234567890,ts=1700000000000,nonce=0123456789abcdef,sig=deadbeefdeadbeef", "Authorization: VERACODE-HMAC-SHA-256 [REDACTED],ts=1700000000000,nonce=[REDACTED],sig=[REDACTED]"],
+  [`Authorization: VERACODE-HMAC-SHA-256 id="abcdef1234567890",ts="1700000000000",nonce="${QUOTED_TOKEN}",sig="${QUOTED_TOKEN}"`, 'Authorization: VERACODE-HMAC-SHA-256 id="[REDACTED]",ts="[REDACTED]",nonce="[REDACTED]",sig="[REDACTED]"'],
+  ['index="main" sourcetype="okta:system" earliest=-24h', 'index="main" sourcetype="okta:system" earliest=-24h'],
+];
+/** The Authorization header a 401 body echoes in the end-to-end probe, bare and inside a JSON object (the form that leaked before the fix), and how it must reach the caller. */
+const ECHOED_HEADER = `request headers: Authorization: Snowflake Token="${QUOTED_TOKEN}"; Accept: application/json; request: {"headers":{"Authorization":"Snowflake Token=\\"${QUOTED_TOKEN}\\""}}`;
+const ECHOED_HEADER_REDACTED = 'request headers: Authorization: Snowflake Token="[REDACTED]"; Accept: application/json; request: {"headers":{"Authorization":"Snowflake Token=\\"[REDACTED]\\""}}';
+
+test("CodeRabbit #81 quoted auth-params: a quoted value in the pair list after a scheme word goes whatever its key, bare, JSON-escaped, and inside a JSON string, through the error scrubber, the data scrubber, and redactSnapshot, while a challenge's realm and the other descriptive parameters stay", () => {
+  assertRows(redactSecrets, QUOTED_AUTH_PARAM_ROWS, "quoted auth-param, error side");
+  assertRows(scrubDataText, QUOTED_AUTH_PARAM_ROWS, "quoted auth-param, data side");
+  assertRows((text) => redactSnapshot({ note: text, nested: [{ deeper: text }] }).nested[0].deeper, QUOTED_AUTH_PARAM_ROWS, "quoted auth-param, redactSnapshot leaf");
+  for (const [input, expected] of QUOTED_AUTH_PARAM_ROWS) {
+    if (!input.includes(QUOTED_TOKEN)) continue;
+    for (const output of [redactSecrets(input), scrubDataText(input), redactSnapshot({ note: input }).note]) assertNoWindowOf(output, QUOTED_TOKEN, `quoted auth-param: ${input} -> ${expected}`);
+  }
+});
+
+test("CodeRabbit #81 quoted auth-params, end to end: a 401 body that echoes the request's Authorization header reaches the caller with the quoted token removed and no window of it", async () => {
+  const client = new SnowflakeSqlClient(sampleConfig({ maxRetries: 0 }), { fetchImpl: async () => jsonResponse({ code: "390144", message: `JWT token is invalid. ${ECHOED_HEADER}` }, { status: 401, statusText: "Unauthorized" }) });
+  await assert.rejects(() => client.execute("SELECT 1"), (error) => {
+    assert.equal(error.name, "SnowflakeStatementError");
+    assert.match(error.message, /^Snowflake SQL API request failed \(401 Unauthorized\): JWT token is invalid\. /);
+    assert.ok(error.message.includes(ECHOED_HEADER_REDACTED), `the echoed header reaches the caller redacted: ${error.message}`);
+    assertNoWindowOf(error.message, QUOTED_TOKEN, "Snowflake 401 body");
+    return true;
+  });
+});
+
 test("reviewer C final verdict, scheme-word order (r4078025849) and the key audit: a credential-named key loses its value before any scheme word is read in both spellings, scheme words act only under Authorization-style keys and bare in prose, bearer ids go, setting suffixes and URL-valued webhook keys keep their values, and the flag, path, escaped-URL, and cookie carriers are read", () => {
   assertRows(redactSecrets, SCHEME_ORDER_ROWS, "scheme-word order");
   assertRows(redactSecrets, KEY_AUDIT_ROWS, "key audit");
