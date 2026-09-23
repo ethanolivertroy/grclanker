@@ -842,6 +842,63 @@ test("verdict rule 10: every Box pagination exit that leaves records behind repo
   assert.equal(usersCaveat.truncated.find((note) => note.startsWith("users:")), "users: collection stopped after 1 records because the server returned an empty page while still offering a next marker; review the remainder in the Admin Console before treating absence as compliance");
 });
 
+const RESERVED_EVENTS_REASON = "the server re-served already-collected events under a new stream position, so the remaining events could not be paged";
+
+/** Every page answers with the same event under a fresh stream position (pos-1, pos-2, ...). */
+function reservedEventsRoute(url) {
+  const position = url.searchParams.get("stream_position");
+  const next = position === null ? "pos-1" : `pos-${Number(position.slice(4)) + 1}`;
+  return jsonResponse({ entries: [{ event_id: "e-1", event_type: "LOGIN", created_at: "2026-09-11T00:00:00Z", created_by: { id: "member-1", type: "user" } }], next_stream_position: next, chunk_size: 1 });
+}
+
+test("verdict rule 10 (gap 37): the events walk ends after the first page that adds no unseen event under a fresh stream position, a trickle of one new event per page ends at the page cap, and the bundle rows carry the reason", async () => {
+  const positions = [];
+  const fetchImpl = async (input) => {
+    const url = new URL(typeof input === "string" ? input : input.url);
+    if (url.pathname !== "/2.0/events") return jsonResponse({}, { status: 404 });
+    positions.push(url.searchParams.get("stream_position"));
+    if (url.searchParams.get("event_type") === "LOGIN") return reservedEventsRoute(url);
+    // One never-seen event per page with a fresh position every time: the event cap is never reached from a trickle.
+    const index = Number(url.searchParams.get("stream_position") ?? "0");
+    return jsonResponse({ entries: [{ event_id: `fresh-${index}`, event_type: "DOWNLOAD" }], next_stream_position: String(index + 1), chunk_size: 1 });
+  };
+  const client = new BoxApiClient(sampleConfig({ authMode: "oauth", accessToken: "oauth-fixture-access-2026", clientId: undefined, clientSecret: undefined }), { fetchImpl, now: () => NOW });
+
+  const reserved = await client.listEnterpriseEvents({ eventTypes: ["LOGIN"], limit: 10 });
+  assert.deepEqual(positions, [null, "pos-1"], "the second page re-serves the collected event, so no third request is made");
+  assert.deepEqual(reserved.items.map((event) => event.event_id), ["e-1"]);
+  assert.equal(reserved.truncated, true);
+  assert.deepEqual(reserved.truncation, { reason: RESERVED_EVENTS_REASON, capReached: false });
+
+  positions.length = 0;
+  const trickle = await client.listEnterpriseEvents({ eventTypes: ["DOWNLOAD"], limit: 100 });
+  assert.equal(positions.length, 8, "a 100-event limit needs one 500-event page, so the walk is bounded at 4 pages per page needed plus 4");
+  assert.deepEqual(trickle.items.map((event) => event.event_id), Array.from({ length: 8 }, (_, index) => `fresh-${index}`));
+  assert.equal(trickle.truncated, true);
+  assert.deepEqual(trickle.truncation, { reason: "the 8-page cap was reached with 8 of 100 events collected, so the remaining events could not be paged", capReached: true });
+
+  // End to end over the routed client: each of the three event walks stops after two requests and every events row
+  // in collection_status carries the reason, so the export completes against a server that never stops paging.
+  const routed = httpBox(hardenedFixture(), { routes: { "GET /2.0/events": reservedEventsRoute } });
+  const exported = await exportBoxAuditBundle(routed.client, routed.config, createTempBase("grclanker-box-reserved-events-"));
+  const eventRequests = routed.log.filter((entry) => entry.path === "/2.0/events");
+  // A walk is one event-type filter and lookback; its page size shrinks with the remainder, so it is not part of the key.
+  const walks = new Set(eventRequests.map((entry) => {
+    const url = new URL(entry.url);
+    return `${url.searchParams.get("event_type")} ${url.searchParams.get("created_after")}`;
+  }));
+  assert.ok(walks.size >= 1, "the export walks the events stream at least once");
+  assert.equal(eventRequests.length, walks.size * 2, `every events walk made exactly two requests: ${eventRequests.map((entry) => entry.url).join(" ")}`);
+  const status = JSON.parse(readFileSync(join(exported.outputDir, "core_data/collection_status.json"), "utf8"));
+  for (const file of ["core_data/enterprise_events_activity.json", "core_data/enterprise_events_sharing.json", "core_data/enterprise_events_shield.json"]) {
+    const row = status.datasets.find((entry) => entry.file === file);
+    assert.equal(row.truncated, true, `${file} is recorded truncated`);
+    assert.equal(row.truncation_reason, RESERVED_EVENTS_REASON, `${file} carries the reason`);
+  }
+  assert.ok(status.truncated_datasets.some((note) => note.includes(RESERVED_EVENTS_REASON) && note.includes("review the remainder in the Admin Console")), `the truncation notes name the exit and do not advise raising event_limit: ${JSON.stringify(status.truncated_datasets)}`);
+  assert.ok(!status.truncated_datasets.some((note) => note.includes(RESERVED_EVENTS_REASON) && note.includes("raise event_limit")));
+});
+
 test("verdict rule 9: non-JSON error bodies are described, never echoed, into Box error text", async () => {
   const fetchImpl = async () => new Response(`<html><body>gateway error; upstream header Authorization: Bearer FAKE_SECRET_TOKEN_8</body></html>`, {
     status: 502,

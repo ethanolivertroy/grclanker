@@ -39,6 +39,10 @@ const DEFAULT_MAX_RETRIES = 3;
 const DEFAULT_PAGE_SIZE = 100;
 const DEFAULT_USER_PAGE_SIZE = 1000;
 const DEFAULT_EVENT_PAGE_SIZE = 500;
+// The events walk is bounded by pages as well as by events: a server offering a fresh stream position with one new
+// event per page cannot hold the walk past this many pages per full page the cap would need. A stream that serves
+// pages a quarter full or better completes within it.
+const EVENT_PAGES_PER_FULL_PAGE = 4;
 const DEFAULT_USER_LIMIT = 1000;
 const DEFAULT_GROUP_LIMIT = 200;
 const DEFAULT_EVENT_LIMIT = 2000;
@@ -1300,6 +1304,11 @@ function pagingTruncation(reason: string): BoxTruncation {
   return { reason, capReached: false };
 }
 
+/** The most event pages a walk requests for `limit` events, whatever the server serves per page. */
+function eventPageCap(limit: number): number {
+  return EVENT_PAGES_PER_FULL_PAGE * (Math.ceil(limit / DEFAULT_EVENT_PAGE_SIZE) + 1);
+}
+
 /**
  * The documented shape of a successful body. Every list the inspector reads answers with an object carrying an
  * `entries` array (empty when the inventory is empty); a single resource answers with an object carrying at least one
@@ -1759,6 +1768,8 @@ export class BoxApiClient implements BoxReadClient {
     return this.memoized(key, async () => {
       const items: JsonRecord[] = [];
       const seenEventIds = new Set<string>();
+      const pageCap = eventPageCap(limit);
+      let pages = 0;
       let streamPosition: string | undefined;
       let truncation: BoxTruncation | undefined;
       while (true) {
@@ -1770,6 +1781,7 @@ export class BoxApiClient implements BoxReadClient {
           created_after: options.createdAfter?.toISOString(),
           stream_position: streamPosition,
         }), { method: "GET" }, { shape: LIST_SHAPE });
+        pages += 1;
         const entries = asRecordArray(payload.entries);
         // A server that repeats its stream position re-serves the same page; an event already collected is not
         // counted twice, so the truncated sample holds each event once.
@@ -1791,12 +1803,22 @@ export class BoxApiClient implements BoxReadClient {
           truncation = pagingTruncation("the server repeated its stream position, so the remaining events could not be paged");
           break;
         }
+        // A non-empty page that adds nothing (every event already collected, served under a fresh position) makes no
+        // progress; without this exit a server answering every position with the same events holds the walk open.
+        if (unseen.length === 0) {
+          truncation = pagingTruncation("the server re-served already-collected events under a new stream position, so the remaining events could not be paged");
+          break;
+        }
         if (entries.length > remaining) {
           truncation = capTruncation(`the ${limit}-event cap was reached while the server returned more events than requested`);
           break;
         }
         if (items.length >= limit) {
           truncation = capTruncation(`the ${limit}-event cap was reached while the server offered a next stream position`);
+          break;
+        }
+        if (pages >= pageCap) {
+          truncation = capTruncation(`the ${pageCap}-page cap was reached with ${items.length} of ${limit} events collected, so the remaining events could not be paged`);
           break;
         }
         streamPosition = nextPosition;
