@@ -491,9 +491,13 @@ const PEM_OPEN_PATTERN = /-----BEGIN ([A-Z0-9 ]+)-----(?:(?!-----END )[\s\S])*$/
 // ENCRYPTED PRIVATE KEY, RSA/EC/DSA/OPENSSH PRIVATE KEY, PGP PRIVATE KEY BLOCK) is a secret.
 const PUBLIC_PEM_LABELS = new Set(["CERTIFICATE", "TRUSTED CERTIFICATE", "X509 CRL", "CERTIFICATE REQUEST", "NEW CERTIFICATE REQUEST", "PUBLIC KEY", "RSA PUBLIC KEY", "PKCS7", "CMS"]);
 // Any scheme-prefixed URL: the userinfo is dropped; its query and fragment pairs are
-// judged by the pair rule below, so the scheme, host, path, and ordinary pairs stay.
+// judged by the pair rule below, so the scheme, host, path, and ordinary pairs stay. The
+// userinfo ends where the authority does, at "/", "?", or "#", so an "@" inside a query or
+// fragment (https://h?e=a@x.com&token=..., https://h#f@x.com) is never read as userinfo: the
+// host stays "h", and the query is left to the pair rule and the origin reducer instead of
+// being carried on as if it were the host.
 const EMBEDDED_URL_PATTERN = /\b[a-z][a-z0-9+.-]*:\/\/[^\s"'<>()[\]{}]+/gi;
-const URL_USERINFO_PATTERN = /^([a-z][a-z0-9+.-]*:\/\/)[^\s/@"'<>]+@/i;
+const URL_USERINFO_PATTERN = /^([a-z][a-z0-9+.-]*:\/\/)[^\s\/?#@"'<>\\]+@/i;
 // A query or fragment pair, in a URL or a bare query string: a credential-named pair or a
 // token-shaped value loses the value. A value ends at "&", "#", whitespace, a quote, a
 // backslash (no token carries one; the escape after it, \" or \n inside a JSON string, is
@@ -651,8 +655,9 @@ const DELIMITED_VALUE_PATTERN = new RegExp(String.raw`(?!\[REDACTED\])(?!["'])(?
 const LINE_VALUE_PATTERN = /(?!\[REDACTED\])(?!["'])(?:(?!\\+["'])(?!\\(?:[nr]|u000[adAD]|x0[adAD]))[^\r\n<>"',;{}[\]]|["'](?=[^\s\r\n<>"',;{}[\]:)\\]))*(?!\\+["'])(?!\\(?:[nr]|u000[adAD]|x0[adAD]))[^\s\r\n<>"',;{}[\]]/y;
 const TOKEN_IN_PATH_WEBHOOK_PATTERN = /(https?:\/\/(?:hooks\.slack\.com\/services|discord(?:app)?\.com\/api\/webhooks|[a-z0-9.-]*webhook\.office\.com\/webhookb2)\/)(?!\[REDACTED\])(?:[^\s"'<>\\]|["'](?=[^\s"'<>\\,;:)}\]]))+/gi;
 // A URL whose slashes arrive escaped by a stringify (https:\/\/user:secret@host\/path): the
-// userinfo goes as it does from a bare URL; the query pairs are read by the pair rule.
-const SLASH_ESCAPED_URL_USERINFO_PATTERN = /\b([a-z][a-z0-9+.-]*:\\\/\\\/)[^\s/@"'<>\\]+@/gi;
+// userinfo goes as it does from a bare URL and ends at the same "/", "?", or "#"; the query
+// pairs are read by the pair rule.
+const SLASH_ESCAPED_URL_USERINFO_PATTERN = /\b([a-z][a-z0-9+.-]*:\\\/\\\/)[^\s\/?#@"'<>\\]+@/gi;
 // A key naming a webhook URL: the incoming webhooks of Slack, Discord, Teams, and PagerDuty
 // carry their token in the path or query, so under webhook, webhook_url, webhookUrl, or
 // WEBHOOK_URL a URL value keeps its scheme and host only, whatever the host. webhook_count,

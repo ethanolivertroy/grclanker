@@ -1544,6 +1544,76 @@ test("reviewer E finding D: a singular credential label at the end of a path seg
   assert.equal(cases, 2 * (FINDING_D_VALUES.length * FINDING_D_CONTEXTS.length * (FINDING_D_SINGULAR_LABELS.length * FINDING_D_TAILS.length + FINDING_D_PLURAL_LABELS.length) + FINDING_D_CONTEXTS.length * FINDING_D_PLURAL_LABELS.length * FINDING_D_PROSE.length));
 });
 
+// CodeRabbit item on #76: the user-and-secret prefix of a URL ends where its authority does, at
+// the first "/", "?", or "#", so an "@" inside a query or fragment is never read as userinfo.
+// Before the fix https://h?e=a@x.com&token=<v> rendered https://[REDACTED]@x.com&token=[REDACTED]
+// (the host "h" and the query lost, "x.com&token=" carried on as the host) and a webhook_url
+// with that shape reduced to the fake origin https://x.com&v=<v>/[REDACTED].
+const USERINFO_LONG_CANARY = "Qm7Vx2Lk9Rt4Pw8Zs3Yh6Nd1Bc5Fg0Jt";
+// [input, expected, the value no window of which may appear in the output]
+const USERINFO_URL_ROWS = [
+  ["https://h?e=a@x.com&token=s3cr3t", "https://h?e=a@x.com&token=[REDACTED]", "s3cr3t"],
+  ["https://h#f@x.com", "https://h#f@x.com", null],
+  [`https://h?e=a@x.com&token=${USERINFO_LONG_CANARY}`, "https://h?e=a@x.com&token=[REDACTED]", USERINFO_LONG_CANARY],
+  ["https://h?token=s3cr3t@x.com", "https://h?token=[REDACTED]", "s3cr3t"],
+  ["https://h/p?e=a@x.com#f@y.com", "https://h/p?e=a@x.com#f@y.com", null],
+  // Controls: a real user-and-secret prefix still goes, before a path, a query, or a fragment.
+  [`https://svc:${USERINFO_LONG_CANARY}@x.com/path?e=a`, "https://[REDACTED]@x.com/path?e=a", USERINFO_LONG_CANARY],
+  [`https://svc:${USERINFO_LONG_CANARY}@x.com?e=a`, "https://[REDACTED]@x.com?e=a", USERINFO_LONG_CANARY],
+  [`https://svc:${USERINFO_LONG_CANARY}@x.com#frag`, "https://[REDACTED]@x.com#frag", USERINFO_LONG_CANARY],
+];
+const USERINFO_WEBHOOK_ROWS = [
+  ["webhook_url=https://h?e=a@x.com&v=s3cr3t", "webhook_url=https://h/[REDACTED]", "s3cr3t"],
+  ['{"webhook_url":"https://h?e=a@x.com&v=s3cr3t"}', '{"webhook_url":"https://h/[REDACTED]"}', "s3cr3t"],
+  ["webhook_url: https://h#f@x.com", "webhook_url: https://h/[REDACTED]", null],
+];
+const escapeSlashes = (text) => text.replaceAll("/", "\\/");
+const USERINFO_CONTEXTS = [
+  ["bare", (url) => url],
+  ["in a sentence", (url) => `redirect to ${url} denied`],
+  ["escaped bare", (url) => escapeSlashes(url)],
+  ["escaped JSON member", (url) => `{"detail":"redirect to ${escapeSlashes(url)} denied","code":403}`],
+];
+
+test("CodeRabbit #76 userinfo: the user-and-secret prefix of a URL ends at the first /, ?, or #, so an @ inside a query or fragment keeps the host, the query is read pair by pair, and a webhook URL reduces to its true origin, in both scrubs, the walker, and an echoed URL in a Tenable error string", async () => {
+  let cases = 0;
+  for (const scrub of [redactErrorText, redactCredentialValueText]) {
+    for (const [input, expected, canary] of USERINFO_URL_ROWS) for (const [context, wrap] of USERINFO_CONTEXTS) {
+      const text = wrap(input);
+      const out = scrub(text);
+      const name = `userinfo: ${scrub.name} ${context} ${JSON.stringify(text)} -> ${JSON.stringify(out)}`;
+      assert.equal(out, wrap(expected), name);
+      if (canary) assertNoWindow(out, canary, name);
+      assert.equal(scrub(out), out, `${name}: not idempotent`);
+      cases += 1;
+    }
+    for (const [input, expected, canary] of USERINFO_WEBHOOK_ROWS) {
+      const out = scrub(input);
+      const name = `userinfo: ${scrub.name} ${JSON.stringify(input)} -> ${JSON.stringify(out)}`;
+      assert.equal(out, expected, name);
+      if (canary) assertNoWindow(out, canary, name);
+      assert.equal(scrub(out), out, `${name}: not idempotent`);
+      cases += 1;
+    }
+  }
+  assert.equal(cases, 2 * (USERINFO_URL_ROWS.length * USERINFO_CONTEXTS.length + USERINFO_WEBHOOK_ROWS.length));
+  // The walker applies the same rules to every string leaf and reads a webhook_url from the raw value.
+  for (const [input, expected, canary] of USERINFO_URL_ROWS) {
+    const walked = redactCredentialProperties({ url: input, description: `see ${input} for details`, nested: [{ endpoint: input }] });
+    assert.deepEqual(walked, { url: expected, description: `see ${expected} for details`, nested: [{ endpoint: expected }] }, `userinfo: walker ${input}`);
+    if (canary) assertNoWindow(JSON.stringify(walked), canary, `userinfo: walker ${input}`);
+  }
+  assert.deepEqual(redactCredentialProperties({ webhook_url: "https://h?e=a@x.com&v=s3cr3t", other: { webhook_url: "https://h#f@x.com" } }), { webhook_url: "https://h/[REDACTED]", other: { webhook_url: "https://h/[REDACTED]" } }, "userinfo: the walker reduces a webhook_url to its true origin");
+  // End to end: a 403 body echoing the URL reaches the operator through the client's error path.
+  for (const [url, expected, canary] of USERINFO_URL_ROWS) {
+    const clients = createTenableClients(vmConfig(), { fetchImpl: async () => jsonResponse({ error: `redirect to ${url} denied` }, 403), sleepImpl: async () => {}, exportPollMs: 0, exportTimeoutMs: 5_000 });
+    const error = await clients.vm.get("/users").catch((thrown) => thrown);
+    assert.ok(error instanceof TenableApiError, `userinfo: ${url} threw ${String(error)}`);
+    assert.ok(error.message.includes(`redirect to ${expected} denied`), `userinfo: echoed URL ${url} -> ${error.message}`);
+    if (canary) assertNoWindow(error.message, canary, `userinfo: echoed URL ${url}`);
+  }
+});
+
 test("scrub boundary: name-shaped values stay bare in prose, leave every carrier whatever their shape, and go as configured secrets in every form", () => {
   for (const value of NAME_SHAPED_VALUES) {
     for (const prose of [`inventory ${value} was not read`, `${value}`, `scanner ${value} reported 12 of 40 agents`, `path /var/lib/${value}/state`]) {
