@@ -1274,7 +1274,9 @@ test("assessLaunchdarklyIdentity never passes member or team controls on truncat
     ]);
   }
   assert.equal(findingStatus(truncatedMembers, "LD-01"), "manual");
-  assert.equal(findingStatus(truncatedMembers, "LD-07"), "pass");
+  // LD-07 states the built-in Admin or Owner holders from the members listing, so it never passes on a partial one (gap 42).
+  assert.equal(findingStatus(truncatedMembers, "LD-07"), "warn");
+  assert.match(finding(truncatedMembers, "LD-07").summary, /Truncated listing: members \(3 of 400 collected\)/);
   assert.equal(truncatedMembers.summary.truncated_collections, 1);
   assert.equal(truncatedMembers.snapshots.members.truncated, true);
   assert.equal(truncatedMembers.snapshots.members.seen, 3);
@@ -1299,6 +1301,66 @@ test("assessLaunchdarklyIdentity never passes member or team controls on truncat
   }), { now: NOW });
   assert.equal(findingStatus(failingAndTruncated, "LD-02"), "fail");
   assert.match(finding(failingAndTruncated, "LD-02").summary, /1\/1 active members do not have MFA enabled\. Truncated listing/);
+});
+
+test("gap 42: LD-07 states why built-in Admin or Owner holders are unknown under a truncated or denied members listing, renders the count null, and never passes", async () => {
+  const healthy = await assessLaunchdarklyIdentity(healthyClient(), { now: NOW });
+  assert.equal(findingStatus(healthy, "LD-07"), "pass");
+  assert.match(finding(healthy, "LD-07").summary, /; \d+ members still hold built-in Admin or Owner base roles\.$/);
+  assert.equal(typeof finding(healthy, "LD-07").evidence.built_in_admin_or_owner_members, "number", "a complete listing renders the total");
+
+  // An empty first page under a server that reported more members: nothing was read, nothing is counted.
+  const emptyTruncated = await assessLaunchdarklyIdentity(healthyClient({
+    async listMembers() {
+      return { items: [], truncated: true, seen: 0, total: 500, truncationReason: "the server returned an empty page while reporting 500 members" };
+    },
+  }), { now: NOW });
+  const truncated = finding(emptyTruncated, "LD-07");
+  assert.notEqual(truncated.status, "pass", "a truncated members listing never supports a pass");
+  assert.equal(truncated.status, "warn");
+  assert.match(truncated.summary, /All 1 sampled teams with readable roles have at least one custom role assigned; the members listing was truncated after 0 of 500, so holders of built-in Admin or Owner base roles are unknown\./);
+  assert.doesNotMatch(truncated.summary, /0 members still hold/);
+  assert.match(truncated.summary, /Truncated listing: members \(0 of 500 collected; the server returned an empty page while reporting 500 members\)/);
+  assert.doesNotMatch(truncated.summary, /raise member_limit/, "a server-side stop is not fixed by raising the cap");
+  assert.equal(truncated.evidence.built_in_admin_or_owner_members, null);
+  assert.deepEqual(truncated.evidence.truncated_collections, [{ collection: "members", option: "member_limit", seen: 0, total: 500, reason: "the server returned an empty page while reporting 500 members" }]);
+
+  // A capped listing that did observe built-in role holders: the observation is stated, the total is not.
+  const base = healthyClient();
+  const cappedWithAdmins = await assessLaunchdarklyIdentity(healthyClient({
+    async listMembers() {
+      const members = await base.listMembers();
+      const admin = members.find((member) => member.role === "admin" || member.role === "owner") ?? { ...members[0], role: "admin" };
+      return { items: [admin], truncated: true, seen: 1, total: 400 };
+    },
+  }), { now: NOW });
+  const capped = finding(cappedWithAdmins, "LD-07");
+  assert.equal(capped.status, "warn");
+  assert.match(capped.summary, /the members listing was truncated after 1 of 400, so holders of built-in Admin or Owner base roles are unknown \(1 observed among the collected members\)\./);
+  assert.match(capped.summary, /raise member_limit and rerun/);
+  assert.equal(capped.evidence.built_in_admin_or_owner_members, null, "a partial count is not written as a total");
+
+  // A denied members listing: the clause says so, the finding is manual, and the gap names the request.
+  const deniedMembers = await assessLaunchdarklyIdentity(healthyClient({
+    listMembers: async () => { throw forbidden("/api/v2/members"); },
+  }), { now: NOW });
+  const denied = finding(deniedMembers, "LD-07");
+  assert.equal(denied.status, "manual");
+  assert.match(denied.summary, /All 1 sampled teams with readable roles have at least one custom role assigned; the members listing could not be read, so holders of built-in Admin or Owner base roles are unknown\./);
+  assert.doesNotMatch(denied.summary, /unread members still hold/);
+  assert.match(denied.summary, /Unreadable inventory: members \(GET \/api\/v2\/members: .*403 Forbidden.*\), so member posture was not checked\. Collect manually: Organization settings > Members export/);
+  assert.equal(denied.evidence.built_in_admin_or_owner_members, null);
+  assert.ok(denied.evidence.unreadable_inventories.some((gap) => gap.inventory === "members"));
+
+  // The team half still fails on its own evidence whatever the members listing did.
+  const failingTeams = await assessLaunchdarklyIdentity(healthyClient({
+    listMembers: async () => { throw forbidden("/api/v2/members"); },
+    async listTeamRoles() {
+      return [];
+    },
+  }), { now: NOW });
+  assert.equal(findingStatus(failingTeams, "LD-07"), "fail");
+  assert.match(finding(failingTeams, "LD-07").summary, /sampled teams with readable roles have no custom roles assigned/);
 });
 
 test("assessLaunchdarklyAccessControl never passes role or token controls on truncated listings", async () => {
@@ -1953,6 +2015,7 @@ const LAUNCHDARKLY_MULTI_INVENTORY_CASES = [
   { id: "LD-06", assess: assessLaunchdarklyIdentity, secondary: "members", status: "manual", names: /Unreadable inventory: members \(GET \/api\/v2\/members: .*403 Forbidden/, overrides: () => ({ listMembers: async () => { throw forbidden("/api/v2/members"); } }) },
   { id: "LD-07", assess: assessLaunchdarklyIdentity, secondary: "team_roles", status: "manual", names: /Unreadable inventory: team_roles for team platform \(GET \/api\/v2\/teams\/platform\/roles: .*403 Forbidden/, overrides: () => ({ listTeamRoles: async (teamKey) => { throw forbidden(`/api/v2/teams/${teamKey}/roles`); } }) },
   { id: "LD-07", assess: assessLaunchdarklyIdentity, secondary: "teams", status: "manual", names: /Unreadable inventory: teams \(GET \/api\/v2\/teams\?expand=members/, overrides: () => ({ listTeams: async () => { throw forbidden("/api/v2/teams?expand=members"); } }) },
+  { id: "LD-07", assess: assessLaunchdarklyIdentity, secondary: "members", status: "manual", names: /the members listing could not be read, so holders of built-in Admin or Owner base roles are unknown\. Unreadable inventory: members \(GET \/api\/v2\/members: .*403 Forbidden/, overrides: () => ({ listMembers: async () => { throw forbidden("/api/v2/members"); } }) },
   { id: "LD-08", assess: assessLaunchdarklyAccessControl, secondary: "members", status: "warn", names: /member inventory was unreadable \(GET \/api\/v2\/members: .*403 Forbidden/, overrides: () => ({ listMembers: async () => { throw forbidden("/api/v2/members"); } }) },
   { id: "LD-09", assess: assessLaunchdarklyAccessControl, secondary: "members", status: "warn", names: /member inventory was unreadable \(GET \/api\/v2\/members/, overrides: () => ({ listMembers: async () => { throw forbidden("/api/v2/members"); } }) },
   { id: "LD-10", assess: assessLaunchdarklyAccessControl, secondary: "members", status: "warn", names: /member inventory was unreadable \(GET \/api\/v2\/members/, overrides: () => ({ listMembers: async () => { throw forbidden("/api/v2/members"); } }) },

@@ -2142,9 +2142,17 @@ function observedCount(sources: LaunchdarklyCollection[], count: number): number
   return count > 0 || sources.every(isComplete) ? count : null;
 }
 
-/** "N" for a listing that was read, "unread" for one that was not, so a sentence never states a zero from a denied read. */
-function countOrUnread(collection: LaunchdarklyCollection, count: number = collection.items.length): string {
-  return isRead(collection) ? String(count) : "unread";
+/**
+ * The built-in Admin or Owner clause LD-07 states beside its team verdict: the count from a complete members listing,
+ * and otherwise why the holders are unknown, so a truncated or denied read is never written as "0 members".
+ */
+function builtInRoleClause(memberCollection: LaunchdarklyCollection, count: number): string {
+  if (!isRead(memberCollection)) return "the members listing could not be read, so holders of built-in Admin or Owner base roles are unknown";
+  if (memberCollection.truncated) {
+    const observed = count > 0 ? ` (${count} observed among the collected members)` : "";
+    return `the members listing was truncated after ${memberCollection.items.length} of ${memberCollection.total ?? "an unknown total"}, so holders of built-in Admin or Owner base roles are unknown${observed}`;
+  }
+  return `${count} members still hold built-in Admin or Owner base roles`;
 }
 
 /**
@@ -2413,10 +2421,12 @@ export async function assessLaunchdarklyIdentity(
   const memberFinding = truncationAwareFinding(memberNotes, presentGaps([membersGap]), "manual");
   const ssoFinding = truncationAwareFinding(memberNotes, presentGaps([membersGap, accountAuditGap]), "manual");
   const membershipFinding = truncationAwareFinding([...memberNotes, ...teamNotes], presentGaps([membersGap, teamsGap]), "manual");
+  // LD-07 reads the members listing for its built-in Admin or Owner clause, so a truncated members read demotes its
+  // pass and a denied one renders manual, the same as the team inventories it judges.
   const teamRoleFinding = truncationAwareFinding(
-    [...teamNotes, ...teamRoleNotes],
-    presentGaps([teamsGap, ...teamRoleGaps]),
-    teamsGap || (teamRoles.length > 0 && unreadableTeamRoles.length === teamRoles.length) ? "manual" : "warn",
+    [...memberNotes, ...teamNotes, ...teamRoleNotes],
+    presentGaps([membersGap, teamsGap, ...teamRoleGaps]),
+    membersGap || teamsGap || (teamRoles.length > 0 && unreadableTeamRoles.length === teamRoles.length) ? "manual" : "warn",
   );
   const membershipReadable = !membersGap && !teamsGap;
 
@@ -2570,14 +2580,15 @@ export async function assessLaunchdarklyIdentity(
           : teamRoles.length > 0 && unreadableTeamRoles.length === teamRoles.length
             ? `The role listing was unreadable for every one of the ${teamRoles.length} sampled teams, so team assigned custom roles could not be evaluated.`
             : teamsWithoutCustomRoles.length === 0
-              ? `All ${teamRoles.length - unreadableTeamRoles.length} sampled teams with readable roles have at least one custom role assigned; ${countOrUnread(memberCollection, admins.length + owners.length)} members still hold built-in Admin or Owner base roles.`
+              ? `All ${teamRoles.length - unreadableTeamRoles.length} sampled teams with readable roles have at least one custom role assigned; ${builtInRoleClause(memberCollection, admins.length + owners.length)}.`
               : `${teamsWithoutCustomRoles.length}/${teamRoles.length - unreadableTeamRoles.length} sampled teams with readable roles have no custom roles assigned, so their members rely on built-in base roles.`,
       {
         teams_sampled: whenRead(teamCollection, teamRoles.length),
         teams_with_unreadable_roles: whenRead(teamCollection, sample(unreadableTeamRoles.map((team) => team.key))),
         // A team is named as lacking custom roles only from its own readable role listing; "none lack" needs every listing complete.
         teams_without_custom_roles: whenRead(teamCollection, observedList([teamCollection, ...teamRoleCollections], sample(teamsWithoutCustomRoles.map((team) => team.key)))),
-        built_in_admin_or_owner_members: whenRead(memberCollection, admins.length + owners.length),
+        // A count of built-in role holders is a total only from a complete members listing; a partial or denied read renders null.
+        built_in_admin_or_owner_members: whenAllComplete([memberCollection], admins.length + owners.length),
         team_roles: whenRead(teamCollection, sample(teamRoles.map((team) => ({
           team: team.key,
           roles: whenRead(team.collection, team.roles.map((role) => asString(role.key) ?? asString(role.name))),
