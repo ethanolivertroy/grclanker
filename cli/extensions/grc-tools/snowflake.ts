@@ -1944,12 +1944,71 @@ function serviceClassLoginNote(users: SnowflakeStatementOutcome, serviceCount: n
 }
 
 /**
+ * Rule 9 deny list for the rows every statement returns: matched on the
+ * lowercased key with dots, underscores, and hyphens removed, so PASSWORD,
+ * OAUTH_CLIENT_SECRET, and a parameter named *_TOKEN match while the
+ * boolean and policy columns that merely mention a credential (HAS_PASSWORD,
+ * MUST_CHANGE_PASSWORD, PASSWORD_MIN_LENGTH, SESSION_MAX_LIFESPAN_MINS) and
+ * every identifier (NAME, LOGIN_NAME, OWNER, ROLE_NAME) stay legible.
+ */
+const CREDENTIAL_COLUMN_PATTERN = /(password|passwd|passphrase|secret|token|privatekey|apikey|clientsecret)$/;
+const CREDENTIAL_COLUMN_EXEMPT_PREFIX = /^(has|is|must|uses|min|max|require)/;
+const JSON_LITERAL_PATTERN = /^(?:true|false|null)$/i;
+const PAIR_NAME_COLUMNS = ["name", "key", "property"];
+const PAIR_VALUE_COLUMNS = new Set(["value", "property_value"]);
+
+function isCredentialColumn(key: string): boolean {
+  const normalized = key.toLowerCase().replace(/[._-]/g, "");
+  return CREDENTIAL_COLUMN_PATTERN.test(normalized) && !CREDENTIAL_COLUMN_EXEMPT_PREFIX.test(normalized);
+}
+
+function pairNameOf(record: JsonRecord): string | undefined {
+  for (const column of PAIR_NAME_COLUMNS) {
+    const name = asString(record[column]);
+    if (name !== undefined) return name;
+  }
+  return undefined;
+}
+
+/**
+ * Applied to the rows of every completed statement before they are written to
+ * core_data or echoed in a tool payload: removes the value of every
+ * credential-named column (and of the value column of a {key, value} or
+ * {property, property_value} row whose name is credential-named, unless it is
+ * a JSON literal such as a parameter's "false"), keeps only the origin of a
+ * webhook-named column's URL, and passes every other string through the
+ * data-side text pass, so a vendor-prefixed token, a JWT, a PEM block, or a
+ * credential carrier inside a comment, a query text, or an error message is
+ * removed there too. Column names and nulls are kept so the evidence stays
+ * legible, and containers are kept at every depth.
+ */
+export function redactSnapshot(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(redactSnapshot);
+  const record = asObject(value);
+  if (!record) return typeof value === "string" ? scrubDataText(value) : value;
+  const pairName = pairNameOf(record);
+  const output: JsonRecord = {};
+  for (const [key, item] of Object.entries(record)) {
+    const credentialPair = PAIR_VALUE_COLUMNS.has(key.toLowerCase()) && pairName !== undefined && isCredentialColumn(pairName);
+    if (isCredentialColumn(key) || credentialPair) {
+      output[key] = item === null || item === undefined || (typeof item === "string" && JSON_LITERAL_PATTERN.test(item)) ? item : REDACTED;
+    } else if (typeof item === "string" && pairRuleFor(key) === "webhook") {
+      output[key] = webhookReplacement(item);
+    } else {
+      output[key] = redactSnapshot(item);
+    }
+  }
+  return output;
+}
+
+/**
  * The single serializer for a statement outcome on every output path: the
  * rows of a statement that did not complete are replaced by a marker naming
- * the statement, its outcome, and the error, and its columns become null.
+ * the statement, its outcome, and the error, and its columns become null; the
+ * rows of one that completed pass through the rule 9 walk above.
  */
 export function snapshotStatement(outcome: SnowflakeStatementOutcome): SnowflakeStatementSnapshot {
-  if (outcome.status === "ok") return { ...outcome };
+  if (outcome.status === "ok") return { ...outcome, rows: redactSnapshot(outcome.rows) as SqlRow[] };
   // A statement that was never sent is not named: the key identifies what
   // would have been collected, and the error names the local failure.
   const statement = outcome.status === "not_requested" ? null : outcome.statement;

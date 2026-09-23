@@ -3375,18 +3375,22 @@ function scrubUrlValue(value: string): string {
   }
 }
 
+/** A string leaf: a ciphertext or JWT goes whole; any other string loses URL userinfo and query, then every credential carrier and unambiguous credential shape it carries (scrubDataText). */
 function redactLeaf(value: string): string {
-  return CIPHERTEXT_OR_JWT_PATTERN.test(value) ? REDACTED : scrubUrlValue(value);
+  return CIPHERTEXT_OR_JWT_PATTERN.test(value) ? REDACTED : scrubDataText(scrubUrlValue(value));
 }
 
 /**
  * Rule 9 deny list applied to every core_data snapshot: redacts the value of
  * every credential-named key (including {name, value} and {key, value} pair
  * shapes), every $1$ or $7$ ciphertext or JWT-shaped string, and the userinfo
- * and query string of every URL-valued string. Key names are kept so the
+ * and query string of every URL-valued string; every other string leaf goes
+ * through the data-side text pass, so a vendor-prefixed token, a JWT, a PEM
+ * block, or a credential carrier inside a free-text field (a description, a
+ * serialized snapshot) is removed there too. Key names are kept so the
  * evidence stays legible.
  */
-function redactSnapshot(value: unknown): unknown {
+export function redactSnapshot(value: unknown): unknown {
   if (Array.isArray(value)) return value.map(redactSnapshot);
   const object = asObject(value);
   if (!object) return typeof value === "string" ? redactLeaf(value) : value;

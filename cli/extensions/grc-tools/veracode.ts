@@ -3315,22 +3315,33 @@ function scrubUrlValue(value: string): string {
   }
 }
 
+/** A string leaf: a JWT goes whole; any other string loses URL userinfo, query, and fragment, then every credential carrier and unambiguous credential shape it carries (scrubDataText). */
+function redactLeaf(value: string): string {
+  return JWT_PATTERN.test(value) ? REDACTED : scrubDataText(scrubUrlValue(value));
+}
+
 /**
  * Applied to every JSON object written into the bundle: redacts the value of
  * every credential-named key (including {name, value} pair shapes such as
  * application profile custom_fields), every JWT-shaped string, and the
- * userinfo and query string of every URL-valued string, keeping key names so
- * the evidence stays legible.
+ * userinfo and query string of every URL-valued string; a webhook-named key
+ * keeps only its URL's origin, and every other string leaf goes through the
+ * data-side text pass, so a vendor-prefixed token, a JWT, a PEM block, or a
+ * credential carrier inside a free-text field (a description, a serialized
+ * snapshot) is removed there too. Key names are kept so the evidence stays
+ * legible.
  */
-function redactSnapshot(value: unknown): unknown {
+export function redactSnapshot(value: unknown): unknown {
   if (Array.isArray(value)) return value.map(redactSnapshot);
   const object = asObject(value);
-  if (!object) return typeof value === "string" ? (JWT_PATTERN.test(value) ? REDACTED : scrubUrlValue(value)) : value;
+  if (!object) return typeof value === "string" ? redactLeaf(value) : value;
   const pairName = asString(object.name) ?? asString(object.key);
   const output: JsonRecord = {};
   for (const [key, item] of Object.entries(object)) {
     if (isCredentialKey(key) || (key === "value" && pairName !== undefined && isCredentialKey(pairName))) {
       output[key] = item === null || item === undefined ? item : REDACTED;
+    } else if (typeof item === "string" && pairRuleFor(key) === "webhook") {
+      output[key] = webhookReplacement(item);
     } else {
       output[key] = redactSnapshot(item);
     }

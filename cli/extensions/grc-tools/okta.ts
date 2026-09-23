@@ -1495,18 +1495,23 @@ function scrubUrlValue(value: string): string {
   }
 }
 
+/** A string leaf: a JWT or SSWS token goes whole; any other string loses URL userinfo and query, then every credential carrier and unambiguous credential shape it carries (scrubDataText). */
 function redactString(value: string): string {
-  return JWT_PATTERN.test(value) || SSWS_TOKEN_PATTERN.test(value) ? REDACTED : scrubUrlValue(value);
+  return JWT_PATTERN.test(value) || SSWS_TOKEN_PATTERN.test(value) ? REDACTED : scrubDataText(scrubUrlValue(value));
 }
 
 /**
  * Applied to every collected record and again to every JSON document written
  * into the bundle: redacts the value of every credential-named key (including
  * {key, value} and {name, value} pair shapes), every JWT or SSWS token shaped
- * string, and the userinfo and query string of every URL, keeping key names so
- * the evidence stays legible.
+ * string, and the userinfo and query string of every URL; a webhook-named key
+ * keeps only its URL's origin, and every other string leaf goes through the
+ * data-side text pass, so a vendor-prefixed token, a JWT, a PEM block, or a
+ * credential carrier inside a free-text field (a description, a serialized
+ * snapshot) is removed there too. Key names are kept so the evidence stays
+ * legible.
  */
-function redactSnapshot(value: unknown): unknown {
+export function redactSnapshot(value: unknown): unknown {
   if (Array.isArray(value)) return value.map(redactSnapshot);
   if (typeof value === "string") return redactString(value);
   if (!value || typeof value !== "object") return value;
@@ -1517,6 +1522,8 @@ function redactSnapshot(value: unknown): unknown {
     const credentialPair = key === "value" && pairName !== undefined && isCredentialKey(pairName);
     if ((isCredentialKey(key) && !isPasswordPolicySettings(key, item)) || credentialPair) {
       output[key] = item === null || item === undefined ? item : REDACTED;
+    } else if (typeof item === "string" && pairRuleFor(key) === "webhook") {
+      output[key] = webhookReplacement(item);
     } else {
       output[key] = redactSnapshot(item);
     }

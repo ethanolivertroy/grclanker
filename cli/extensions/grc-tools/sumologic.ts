@@ -1907,9 +1907,50 @@ function projectSnapshotData(name: string, data: unknown): unknown {
 }
 
 /**
+ * Rule 9 deny list for the datasets the projections above pass through
+ * (roles, partitions, scheduled views, policies): matched on the lowercased
+ * key with dots, underscores, and hyphens removed, so accessKey, client_secret,
+ * and authorization match while accessId, roleIds, and label stay legible.
+ */
+const CREDENTIAL_KEY_PATTERN = /(password|passwd|passphrase|secret|token|apikey|privatekey|secretkey|accesskey|authorization)$/;
+
+function isCredentialKey(key: string): boolean {
+  return CREDENTIAL_KEY_PATTERN.test(key.toLowerCase().replace(/[._-]/g, ""));
+}
+
+/**
+ * Applied to every projected snapshot before it is written to core_data or
+ * echoed in a tool payload: redacts the value of every credential-named key
+ * (including {name, value} and {key, value} pair shapes), keeps only the
+ * origin of a webhook-named key's URL, and passes every other string leaf
+ * through the data-side text pass, so a vendor-prefixed token, a JWT, a PEM
+ * block, or a credential carrier inside a free-text field (a role description,
+ * a query, a serialized snapshot) is removed there too. Key names are kept so
+ * the evidence stays legible.
+ */
+export function redactSnapshot(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(redactSnapshot);
+  const object = asObject(value);
+  if (!object) return typeof value === "string" ? scrubDataText(value) : value;
+  const pairName = asString(object.name) ?? asString(object.key);
+  const output: JsonRecord = {};
+  for (const [key, item] of Object.entries(object)) {
+    if (isCredentialKey(key) || (key === "value" && pairName !== undefined && isCredentialKey(pairName))) {
+      output[key] = item === null || item === undefined ? item : REDACTED;
+    } else if (typeof item === "string" && pairRuleFor(key) === "webhook") {
+      output[key] = webhookReplacement(item);
+    } else {
+      output[key] = redactSnapshot(item);
+    }
+  }
+  return output;
+}
+
+/**
  * The single serializer for every raw snapshot: core_data/<area>.json and the
  * rawData echoed by the assess tools both come from here, so the rule 9
- * projection above is applied exactly once and on every path.
+ * projection above and the deny-list walk are applied exactly once and on
+ * every path.
  */
 function rawSnapshot(collections: Array<[string, SumologicCollection<unknown>]>): Record<string, unknown> {
   return Object.fromEntries(collections.map(([name, item]) => [name, {
@@ -1920,7 +1961,7 @@ function rawSnapshot(collections: Array<[string, SumologicCollection<unknown>]>)
     error: item.error ?? null,
     http_status: item.httpStatus ?? null,
     endpoint: item.endpoint ?? null,
-    data: item.ok ? projectSnapshotData(name, item.data) : notCollectedMarker(item),
+    data: item.ok ? redactSnapshot(projectSnapshotData(name, item.data)) : notCollectedMarker(item),
   }]));
 }
 
