@@ -828,8 +828,10 @@ function keySegments(name: string): string[] {
 
 /**
  * True for keys such as apiKey, mobile_key, clientSecret, token, authorization, and privateKeys, and for a bearer id
- * (`secret_id`, `session_id`, `sid`) whose value authenticates by itself; `_id` keys that name a thing (`member_id`,
- * `token_id`, `_id`) keep their value.
+ * (`secret_id`, `token_id`, `session_id`, `sid`), which the shared rule redacts because in most APIs its value
+ * authenticates by itself; `_id` keys that name a thing (`member_id`, `_id`) keep their value. LaunchDarkly's
+ * caller-identity `tokenId` falls under the bearer-id rule, so the client matches it against the token listing on the
+ * raw value before this pass and writes the marker (see LaunchdarklyApiClient.isCallerToken).
  */
 export function isCredentialKey(name: string): boolean {
   if (isBearerIdKey(name)) return true;
@@ -1468,6 +1470,11 @@ export class LaunchdarklyApiClient {
   private readonly sleep: SleepImpl;
   private readonly maxRetries: number;
   private pauseUntil = 0;
+  /**
+   * The caller's own token id as the last /caller-identity read returned it. The bearer-id rule writes `tokenId` as the
+   * marker in every record the client hands out, so the raw id lives only here, for matching the token listing's `_id`.
+   */
+  private callerTokenId: string | undefined;
 
   constructor(
     config: LaunchdarklyResolvedConfig,
@@ -1633,8 +1640,12 @@ export class LaunchdarklyApiClient {
 
   /** Reads one resource; the body must carry at least one of the documented keys, or the read fails with the observed status. */
   async get(path: string, query: JsonRecord = {}, options: { apiVersion?: string; shape?: LaunchdarklyResponseShape } = {}): Promise<JsonRecord> {
-    const payload = await this.fetchJson(this.buildUrl(path, query), { ...options, shape: options.shape ?? { kind: "object", documentedKeys: ["_id", "_links", "key", "name", "items"] } });
-    return scrubCollectedRecord(payload);
+    return scrubCollectedRecord(await this.fetchRecord(path, query, options));
+  }
+
+  /** The unscrubbed record behind get(); callers scrub before handing it out. */
+  private async fetchRecord(path: string, query: JsonRecord, options: { apiVersion?: string; shape?: LaunchdarklyResponseShape }): Promise<JsonRecord> {
+    return this.fetchJson(this.buildUrl(path, query), { ...options, shape: options.shape ?? { kind: "object", documentedKeys: ["_id", "_links", "key", "name", "items"] } });
   }
 
   async list(
@@ -1722,8 +1733,20 @@ export class LaunchdarklyApiClient {
     return singlePageCollection(await this.fetchJson(url, options), requestLabel(url), (item) => scrubCollectedRecord(mapItem(item)));
   }
 
+  /**
+   * The caller identity with `tokenId` written as the marker (bearer-id rule). The raw id is kept on the client for
+   * isCallerToken() only; a read that fails leaves no id behind, so a stale match cannot outlive it.
+   */
   async getCallerIdentity(): Promise<JsonRecord> {
-    return this.get("/api/v2/caller-identity", {}, { shape: CALLER_IDENTITY_SHAPE });
+    this.callerTokenId = undefined;
+    const payload = await this.fetchRecord("/api/v2/caller-identity", {}, { shape: CALLER_IDENTITY_SHAPE });
+    this.callerTokenId = asString(payload.tokenId);
+    return scrubCollectedRecord(payload);
+  }
+
+  /** True when the token listing record is the caller's own token, matched on the id the last caller identity read returned. */
+  isCallerToken(token: JsonRecord): boolean {
+    return this.callerTokenId !== undefined && asString(token._id) === this.callerTokenId;
   }
 
   async listMembers(limit = DEFAULT_MEMBER_LIMIT): Promise<LaunchdarklyCollection> {
@@ -1817,7 +1840,7 @@ type IdentityClient = Pick<
 type AccessControlClient = Pick<
   LaunchdarklyApiClient,
   "getResolvedConfig" | "getCallerIdentity" | "listCustomRoles" | "listTokens" | "listMembers"
->;
+> & Partial<Pick<LaunchdarklyApiClient, "isCallerToken">>;
 
 type EnvironmentGovernanceClient = Pick<
   LaunchdarklyApiClient,
@@ -2767,13 +2790,26 @@ function failedReadNote(read: Pick<LaunchdarklyCollection, "error" | "endpoint">
   return `${read.endpoint ?? request}: ${read.error ?? "unknown error"}`;
 }
 
+/**
+ * Recognises the caller's own record in the token listing. The real client matches on the id the caller identity
+ * returned before the data-side scrub wrote it as the marker; a client without that hook is matched on the identity it
+ * returned, and never on the marker itself.
+ */
+function callerTokenMatcher(client: Pick<AccessControlClient, "isCallerToken">, caller: LaunchdarklyCallerIdentity): (token: JsonRecord) => boolean {
+  const hook = client.isCallerToken;
+  if (typeof hook === "function") return (token) => hook.call(client, token);
+  const tokenId = caller.tokenId !== undefined && caller.tokenId !== REDACTED ? caller.tokenId : undefined;
+  return (token) => tokenId !== undefined && asString(token._id) === tokenId;
+}
+
 function resolveTokenInventory(
   tokens: JsonRecord[],
   members: JsonRecord[],
   caller: LaunchdarklyCallerIdentity,
   readability: TokenInventoryReadability,
+  isCallerToken: (token: JsonRecord) => boolean,
 ): TokenInventory {
-  const callerToken = caller.tokenId ? tokens.find((token) => asString(token._id) === caller.tokenId) : undefined;
+  const callerToken = tokens.find((token) => isCallerToken(token));
   const callerTokenRole = callerToken ? tokenRole(callerToken) : undefined;
   const callerMemberId = caller.memberId ?? (callerToken ? asString(callerToken.memberId) : undefined);
   const callerMemberRole = knownMemberBaseRole(callerMemberId ? members.find((member) => asString(member._id) === callerMemberId) : undefined);
@@ -2903,7 +2939,13 @@ export async function assessLaunchdarklyAccessControl(
   );
   const roleFinding = truncationAwareFinding(roleNotes, presentGaps([rolesGap]), "manual");
   const inventory = withTruncatedTokens(
-    resolveTokenInventory(tokens, members, callerIdentity, { tokens: tokenCollection, caller: callerRead, members: memberCollection }),
+    resolveTokenInventory(
+      tokens,
+      members,
+      callerIdentity,
+      { tokens: tokenCollection, caller: callerRead, members: memberCollection },
+      callerTokenMatcher(client, callerIdentity),
+    ),
     tokenCollection,
   );
   const inventoryEvidence: JsonRecord = {

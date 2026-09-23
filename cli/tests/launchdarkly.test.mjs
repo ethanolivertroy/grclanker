@@ -2923,6 +2923,74 @@ test("verdict rule 9 / addendum 2: the LaunchDarkly bundle, its zip, every asses
   assert.equal(assessments[1].summary.wildcard_roles, null);
 });
 
+/**
+ * A token id the way LaunchDarkly issues one (a 24-hex object id), random-looking so every 6-to-24-character window of
+ * it can be asserted absent. The same id names the caller's own token in /caller-identity (tokenId) and in the token
+ * listing (_id).
+ */
+const LD_CALLER_TOKEN_ID = "6f3a9c1e7b2d48e05a9f31c7";
+
+/** The listing record's own `_id` field carries the identifier, as on main; every other occurrence of the id is a leak. */
+function withoutTokenRecordId(text, id) {
+  return text.replaceAll(`"_id": "${id}"`, '"_id": "<identifier>"').replaceAll(`"_id":"${id}"`, '"_id":"<identifier>"');
+}
+
+test("Codex r4082447897: through the real client the caller identity is reconciled against the token listing on the raw tokenId before the scrub, so an Admin audit service token is the assessment token (LD-10 warn, not fail) and the inventory is full, while every written tokenId stays redacted", async () => {
+  const fixture = ldFixture();
+  fixture.identity = { accountId: "acct-123", memberId: "m1", tokenId: LD_CALLER_TOKEN_ID, tokenName: "grc-audit-service", serviceToken: true };
+  // The only visible personal token is the caller's own, so nothing but the caller-token match can establish a full inventory.
+  fixture.tokens = [
+    { _id: LD_CALLER_TOKEN_ID, name: "grc-audit-service", role: "admin", serviceToken: true, memberId: "m1", expiry: FUTURE_MS, lastUsed: RECENT_MS, creationDate: RECENT_MS },
+    ...fixture.tokens.filter((token) => token._id !== "t2"),
+  ];
+  const { client, config } = httpLaunchdarkly(fixture);
+
+  const accessControl = await assessLaunchdarklyAccessControl(client, { now: NOW });
+  const inventory = finding(accessControl, "LD-08").evidence.token_inventory;
+  assert.equal(accessControl.summary.token_inventory_scope, "full");
+  assert.deepEqual(
+    { scope: inventory.scope, reason: inventory.reason, caller_token_role: inventory.caller_token_role, caller_member_role: inventory.caller_member_role },
+    { scope: "full", reason: "The assessment token has the admin base role, so showAll returned every member's personal tokens.", caller_token_role: "admin", caller_member_role: "owner" },
+  );
+  for (const id of ["LD-08", "LD-09", "LD-11"]) assert.equal(findingStatus(accessControl, id), "pass", `${id} is not degraded by an unknown inventory`);
+  assert.equal(findingStatus(accessControl, "LD-10"), "warn", "the caller's own Admin service token is disclosed, not counted as an unrelated over-scoped token");
+  assert.match(finding(accessControl, "LD-10").summary, /^Of 2 visible service tokens, the assessment token grc-audit-service uses the admin base role that LaunchDarkly requires for a complete token inventory, so keep it expiring, rotated, and dedicated to auditing\.$/);
+  assert.deepEqual(finding(accessControl, "LD-10").evidence.assessment_service_token, { token: "grc-audit-service", role: "admin", over_scoped: true });
+  assert.deepEqual(finding(accessControl, "LD-10").evidence.owner_or_admin_service_tokens, []);
+
+  const access = await checkLaunchdarklyAccess(client);
+  assert.deepEqual(
+    { tokenId: access.callerIdentity.tokenId, tokenName: access.callerIdentity.tokenName, memberId: access.callerIdentity.memberId, serviceToken: access.callerIdentity.serviceToken },
+    { tokenId: "[REDACTED]", tokenName: "grc-audit-service", memberId: "m1", serviceToken: true },
+  );
+  assert.equal(access.notes[1], "Authenticated as grc-audit-service (service token, member m1).");
+
+  const exported = await exportLaunchdarklyAuditBundle(client, config, createTempBase("grclanker-ld-caller-token-"), { now: NOW });
+  const assessments = await runAllLaunchdarklyAssessments(client);
+  const files = readBundleFiles(exported.outputDir);
+  const entries = readZipEntries(exported.zipPath);
+  assert.equal(JSON.parse(files.get("core_data/access_check.json")).callerIdentity.tokenId, "[REDACTED]");
+  const bundledAccessControl = JSON.parse(files.get("analysis/access_control.json"));
+  assert.equal(findingStatus(bundledAccessControl, "LD-10"), "warn");
+  assert.equal(bundledAccessControl.summary.token_inventory_scope, "full");
+  assert.deepEqual(
+    JSON.parse(files.get("core_data/access_tokens.json")).items.map((token) => token._id),
+    [LD_CALLER_TOKEN_ID, "tok-1", "t1"],
+    "the listing keeps every token record's own identifier, as on main",
+  );
+  // Outside the listing records' own `_id` field, no window of the id reaches any bundle file, zip entry, or payload.
+  const written = new Map([
+    ...files,
+    ...[...entries].map(([name, text]) => [`zip:${name}`, text]),
+    ["check_access", JSON.stringify(access)],
+    ["assessments", JSON.stringify(assessments)],
+  ]);
+  const outsideIdentifierField = new Map([...written].map(([name, text]) => [name, withoutTokenRecordId(text, LD_CALLER_TOKEN_ID)]));
+  assertCanaryWindowsAbsent(assert, outsideIdentifierField, [LD_CALLER_TOKEN_ID], "written output outside the token listing's _id field");
+  const idFieldMentions = [...written.values()].filter((text) => text !== withoutTokenRecordId(text, LD_CALLER_TOKEN_ID)).length;
+  assert.ok(idFieldMentions >= 3, `the id is written only as the listing record's _id (access_tokens.json, its zip entry, the assess payload); saw ${idFieldMentions} texts carrying it`);
+});
+
 /** A 403 body echoing weak human-chosen pairs (no digits, symbols, or length a shape gate would catch) under vendor env names, a config key, a webhook-prefixed credential key (gap 39), and a header-named key whose value opens with a scheme word. */
 const WEAK_PAIR_BODY = "Access denied: LAUNCHDARKLY_API_TOKEN=monkey LD_ACCESS_TOKEN=Sunshine webhook_secret=hunter2 DD_APP_KEY=p@ss BOX_CLIENT_SECRET=football KNOWBE4_API_TOKEN=qwerty ELASTIC_PASSWORD=iloveyou x-api-key: splunk correcthorse";
 const WEAK_PAIR_VALUES = ["monkey", "Sunshine", "hunter2", "p@ss", "football", "qwerty", "iloveyou", "splunk correcthorse"];
