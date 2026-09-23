@@ -545,18 +545,22 @@ function isSecretKey(key: string): boolean {
 }
 
 /**
- * The documented Slack token shape: bot `xoxb-` and user `xoxp-` strings (docs.slack.dev/authentication/tokens) and
- * the rotating access form `xoxe.xoxp-` (docs.slack.dev/authentication/using-token-rotation). token_format evidence is
- * derived only from a match, so a configured value outside the shape (a misconfigured value, a proxy or gateway token,
- * a pasted OAuth code) renders the fixed prefix "unknown" and never any substring of itself.
+ * The documented xox-family token prefixes, the text before the first `-`: bot `xoxb` and user `xoxp`
+ * (docs.slack.dev/authentication/tokens), the rotating access forms `xoxe.xoxb` and `xoxe.xoxp`, and the refresh form
+ * `xoxe` (docs.slack.dev/authentication/using-token-rotation). token_format evidence is derived only from an exact
+ * member of this set, so a configured value with any other prefix (an undocumented letter such as xoxz or xoxa, `xoxe.`
+ * followed by anything but xoxb or xoxp, an xapp or xwfp token, a misconfigured value, a proxy or gateway token, a
+ * pasted OAuth code) renders the fixed prefix "unknown" and never any substring of itself.
  */
-const SLACK_TOKEN_PREFIX_PATTERN = /^(xoxe\.)?(xox[a-z])-/;
+export const SLACK_TOKEN_PREFIXES: ReadonlySet<string> = new Set(["xoxb", "xoxp", "xoxe", "xoxe.xoxb", "xoxe.xoxp"]);
+const ROTATING_TOKEN_PREFIX = "xoxe.";
 const UNKNOWN_TOKEN_PREFIX = "unknown";
 
 function describeTokenFormat(token: string): JsonRecord {
-  const match = SLACK_TOKEN_PREFIX_PATTERN.exec(token);
-  if (!match) return { prefix: UNKNOWN_TOKEN_PREFIX, rotating_format: false };
-  return { prefix: `${match[1] ?? ""}${match[2]}`, rotating_format: match[1] === "xoxe." };
+  const separator = token.indexOf("-");
+  const prefix = separator > 0 ? token.slice(0, separator) : "";
+  if (!SLACK_TOKEN_PREFIXES.has(prefix)) return { prefix: UNKNOWN_TOKEN_PREFIX, rotating_format: false };
+  return { prefix, rotating_format: prefix.startsWith(ROTATING_TOKEN_PREFIX) };
 }
 
 /** Shorter configured values are not scrubbed by exact match, so a degenerate token cannot blank unrelated text. */
