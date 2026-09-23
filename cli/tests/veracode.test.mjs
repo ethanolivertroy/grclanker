@@ -18,9 +18,11 @@ import {
   computeVeracodeSignature,
   exportVeracodeAuditBundle,
   parseIniProfiles,
+  redactSnapshot,
   registerVeracodeTools,
   resolveSecureOutputPath,
   resolveVeracodeConfiguration,
+  scrubDataText,
   scrubErrorText,
 } from "../dist/extensions/grc-tools/veracode.js";
 import { getRegisteredToolSummaries } from "../dist/pi/tool-catalog.js";
@@ -2476,4 +2478,161 @@ test("resolveVeracodeConfiguration keeps environment credentials when an unrelat
   const fileOnly = resolveVeracodeConfiguration({ timeout_seconds: 9 }, { VERACODE_API_CREDENTIALS_FILE: credentialsFile }, { homeDir: home });
   assert.equal(fileOnly.apiKeyId, "file-id", "the credentials file named through the environment still supplies the credential");
   assert.deepEqual(fileOnly.sourceChain, ["credentials-file-api-key-id (default)", "credentials-file-api-key-secret (default)", "region-us"]);
+});
+
+/** A 32-character random run: any 6 to 24 character window of it in an output is a leak. */
+const PLANTED_TOKEN = "Xq7Vw2Lm9Tp4Rb8Kd3Fh6Jn1Zs5Yc0Ag";
+/** A Stripe-shaped live key: the vendor prefix makes it an unambiguous credential shape on both sides. */
+const PLANTED_STRIPE_KEY = "sk_live_4eC39HqLyjWDarjtT1zdp7dc";
+/** The distinctive segments of the planted JWT; the header is the common RS256 prefix and is not a canary. */
+const PLANTED_JWT_PAYLOAD = "Zm9vYmFyLXByb2JlLXBheWxvYWQtOTgxMjM0NTY3ODkw";
+const PLANTED_JWT_SIGNATURE = "c2lnbmF0dXJlLXBhcnQtb2YtdGhlLWpvdC1nb2VzLWhlcmU";
+const PLANTED_JWT = `eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9.${PLANTED_JWT_PAYLOAD}.${PLANTED_JWT_SIGNATURE}`;
+const PLANTED_PEM = "-----BEGIN PRIVATE KEY-----\nMIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQC7\n-----END PRIVATE KEY-----";
+const PLANTED_CANARIES = [PLANTED_TOKEN, PLANTED_STRIPE_KEY, PLANTED_JWT_PAYLOAD, PLANTED_JWT_SIGNATURE];
+const BEARER_ID_UUID = "6f1c2b3a-4d5e-4f60-8a9b-0c1d2e3f4a5b";
+/** The free-text note planted in the export probe: two unambiguous shapes, a header carrier, and an identifier that must survive. */
+const PLANTED_NOTE = `Runbook: key ${PLANTED_STRIPE_KEY} end; bearer ${PLANTED_JWT}; Authorization: Bearer ${PLANTED_TOKEN}; cluster prod-us-east-2026-cluster was read`;
+const REDACTED_NOTE = "Runbook: key [REDACTED] end; bearer [REDACTED]; Authorization: Bearer [REDACTED]; cluster prod-us-east-2026-cluster was read";
+
+/**
+ * Scheme-word order (CodeRabbit r4078025849): a credential-named key loses its value before any
+ * scheme word is read, so "VERACODE_API_KEY_SECRET=VERACODE-HMAC-SHA-256 rejected" is a secret whose
+ * value starts with a scheme name, not an HMAC header. Scheme words act under Authorization-style
+ * keys and bare in prose; auth-params and prose mentions of a scheme stay.
+ */
+const SCHEME_ORDER_ROWS = [
+  ["sslPassword=splunk rejected", "sslPassword=[REDACTED] rejected"],
+  ["db_password: token", "db_password: [REDACTED]"],
+  ['sslPassword="splunk rejected"', 'sslPassword="[REDACTED]"'],
+  ['"db_password": "token"', '"db_password": "[REDACTED]"'],
+  ["SPLUNK_PASSWORD=bearer expired", "SPLUNK_PASSWORD=[REDACTED] expired"],
+  ["VERACODE_API_KEY_SECRET=VERACODE-HMAC-SHA-256 rejected", "VERACODE_API_KEY_SECRET=[REDACTED] rejected"],
+  ["VERACODE_API_KEY_SECRET: VERACODE-HMAC-SHA-256 rejected", "VERACODE_API_KEY_SECRET: [REDACTED] rejected"],
+  ['VERACODE_API_KEY_SECRET="VERACODE-HMAC-SHA-256 rejected"', 'VERACODE_API_KEY_SECRET="[REDACTED]"'],
+  ['"VERACODE_API_KEY_SECRET": "VERACODE-HMAC-SHA-256"', '"VERACODE_API_KEY_SECRET": "[REDACTED]"'],
+  [`Authorization: VERACODE-HMAC-SHA-256 ${PLANTED_TOKEN}`, "Authorization: VERACODE-HMAC-SHA-256 [REDACTED]"],
+  ["Authorization: Splunk 4eC39HqLyjWDarjtT1zdp7dc", "Authorization: Splunk [REDACTED]"],
+  [`Proxy-Authorization: Basic ${PLANTED_TOKEN}==`, "Proxy-Authorization: Basic [REDACTED]"],
+  [`Authorization: bearer ${PLANTED_TOKEN}`, "Authorization: bearer [REDACTED]"],
+  [`Authorization: sNoWfLaKe ${PLANTED_TOKEN}`, "Authorization: sNoWfLaKe [REDACTED]"],
+  ["Authorization: SSWS prod-us-east-2026", "Authorization: SSWS [REDACTED]"],
+  [`replayed BASIC ${PLANTED_TOKEN} upstream`, "replayed BASIC [REDACTED] upstream"],
+  [`replayed splunk ${PLANTED_TOKEN} upstream`, "replayed splunk [REDACTED] upstream"],
+  ["Bearer abcdefghijkl rejected", "Bearer [REDACTED] rejected"],
+  ['WWW-Authenticate: Bearer realm="api"', 'WWW-Authenticate: Bearer realm="api"'],
+  ['Bearer realm="api", error="invalid_token"', 'Bearer realm="api", error="invalid_token"'],
+  ["Snowflake statement failed", "Snowflake statement failed"],
+  ["Splunk Enterprise rejected the request", "Splunk Enterprise rejected the request"],
+  ["the bearer presented an expired token", "the bearer presented an expired token"],
+  ["Basic authentication failed", "Basic authentication failed"],
+  ["OAuth 2.0 introspection", "OAuth 2.0 introspection"],
+  ["token_type=Bearer", "token_type=Bearer"],
+];
+
+/** The key audit: bearer ids go whatever their shape, setting suffixes and URL-valued webhook keys keep their values, identifiers are judged by shape. */
+const KEY_AUDIT_ROWS = [
+  [`token_id=${BEARER_ID_UUID}`, "token_id=[REDACTED]"],
+  [`tokenId: ${BEARER_ID_UUID}`, "tokenId: [REDACTED]"],
+  [`role_secret_id=${BEARER_ID_UUID}`, "role_secret_id=[REDACTED]"],
+  ["secret_id_ttl=3600 secret_id_num_uses=5 token_max_ttl=7200 token_bound_cidrs=10.0.0.0/8", "secret_id_ttl=3600 secret_id_num_uses=5 token_max_ttl=7200 token_bound_cidrs=10.0.0.0/8"],
+  [`secret_id_accessor=${BEARER_ID_UUID}`, `secret_id_accessor=${BEARER_ID_UUID}`],
+  ["webhook_count=3", "webhook_count=3"],
+  [`webhook_url=https://hooks.example.com/services/T/B/${PLANTED_TOKEN}?ts=1`, "webhook_url=https://hooks.example.com/[REDACTED]"],
+  [`client_id=svc-audit-2026 tenant_id=${BEARER_ID_UUID}`, `client_id=svc-audit-2026 tenant_id=${BEARER_ID_UUID}`],
+  ["access_key_id=svc-audit-2026 key_id=kid-primary private_key_id=kid-primary secret_name=db-credentials-prod", "access_key_id=svc-audit-2026 key_id=kid-primary private_key_id=kid-primary secret_name=db-credentials-prod"],
+  [`token_type=${PLANTED_TOKEN}`, "token_type=[REDACTED]"],
+];
+
+/** Flag, path-label, slash-escaped URL, and cookie carriers: the value goes and the prose around it stays. */
+const CARRIER_ROWS = [
+  [`psql --password ${PLANTED_TOKEN} -h db`, "psql --password [REDACTED] -h db"],
+  [`mysql --password=${PLANTED_TOKEN} -h db`, "mysql --password=[REDACTED] -h db"],
+  [`java -Dspring.datasource.password=${PLANTED_TOKEN} -jar app.jar`, "java -Dspring.datasource.password=[REDACTED] -jar app.jar"],
+  [`helm --set db.password=${PLANTED_TOKEN} upgrade`, "helm --set db.password=[REDACTED] upgrade"],
+  [`kv/password: ${PLANTED_TOKEN}`, "kv/password: [REDACTED]"],
+  ["/oauth/token-request: invalid_client", "/oauth/token-request: invalid_client"],
+  ["/api/v1/api-tokens: request failed with 403", "/api/v1/api-tokens: request failed with 403"],
+  [`/api_key=${PLANTED_TOKEN}`, "/api_key=[REDACTED]"],
+  [`SPLUNK_ACS_TOKEN='${PLANTED_TOKEN}'`, "SPLUNK_ACS_TOKEN='[REDACTED]'"],
+  [`httpEventCollectorToken="${PLANTED_TOKEN}"`, 'httpEventCollectorToken="[REDACTED]"'],
+  [`X-Api-Key: "${PLANTED_TOKEN}"`, 'X-Api-Key: "[REDACTED]"'],
+  [`note https:\\/\\/hooks.example.com\\/a?token=${PLANTED_TOKEN} next`, "note https:\\/\\/hooks.example.com\\/a?[REDACTED] next"],
+  [`Cookie: theme=dark; my'pref=${PLANTED_TOKEN}`, "Cookie: [REDACTED]"],
+  [`Cookie: sid=O'${PLANTED_TOKEN}; X-Api-Key: ${PLANTED_TOKEN}`, "Cookie: [REDACTED]; X-Api-Key: [REDACTED]"],
+  [`Cookie: my&sid=${PLANTED_TOKEN}; Content-Type: application/json`, "Cookie: [REDACTED]; Content-Type: application/json"],
+];
+
+/** The data side: unambiguous shapes and carriers go, identifiers and bare runs survive (the generic long-run rule is off there). */
+const DATA_SIDE_ROWS = [
+  [`key ${PLANTED_STRIPE_KEY} end`, "key [REDACTED] end"],
+  [`note ${PLANTED_JWT} end`, "note [REDACTED] end"],
+  [`Authorization: Bearer ${PLANTED_TOKEN}`, "Authorization: Bearer [REDACTED]"],
+  [`pem ${PLANTED_PEM} end`, "pem [REDACTED] end"],
+  ["xoxb-1234567890-abcdefghijklmnop", "[REDACTED]"],
+  ["AKIAIOSFODNN7EXAMPLE", "[REDACTED]"],
+  ["ghp_16C7e42F292c6912E7710c838347Ae178B4a", "[REDACTED]"],
+  ["cluster prod-us-east-2026-cluster was read", "cluster prod-us-east-2026-cluster was read"],
+  [`run ${PLANTED_TOKEN} end`, `run ${PLANTED_TOKEN} end`],
+];
+
+function assertRows(scrub, rows, label) {
+  for (const [input, expected] of rows) {
+    const scrubbed = scrub(input);
+    assert.equal(scrubbed, expected, `${label}: ${input}`);
+    assert.equal(scrub(scrubbed), scrubbed, `${label}, second pass: ${input}`);
+    for (const canary of PLANTED_CANARIES) {
+      if (input.includes(canary) && !expected.includes(canary)) assertNoWindowOf(scrubbed, canary, `${label}: ${input}`);
+    }
+  }
+}
+
+test("reviewer C final verdict, scheme-word order (r4078025849) and the key audit: a credential-named key loses its value before any scheme word is read in both spellings, scheme words act only under Authorization-style keys and bare in prose, bearer ids go, setting suffixes and URL-valued webhook keys keep their values, and the flag, path, escaped-URL, and cookie carriers are read", () => {
+  assertRows(scrubErrorText, SCHEME_ORDER_ROWS, "scheme-word order");
+  assertRows(scrubErrorText, KEY_AUDIT_ROWS, "key audit");
+  assertRows(scrubErrorText, CARRIER_ROWS, "carrier");
+  assert.equal(scrubErrorText(`run ${PLANTED_TOKEN} end`), "run [REDACTED] end", "the error side keeps the generic long-run rule");
+});
+
+test("data-side ruling: vendor-prefixed tokens, JWTs, PEM blocks, and credential carriers are removed on the data side while identifiers and bare runs survive, in scrubDataText, in redactSnapshot, and in the exported Veracode bundle", async () => {
+  assertRows(scrubDataText, DATA_SIDE_ROWS, "data side");
+
+  const record = {
+    id: "rec-1",
+    description: `note: key ${PLANTED_STRIPE_KEY} end`,
+    tags: [{ notes: [`also ${PLANTED_JWT}`] }],
+    webhook_url: `https://hooks.example.com/services/T/B/${PLANTED_TOKEN}?ts=1`,
+    password: PLANTED_TOKEN,
+    name: "benign",
+    count: 3,
+    enabled: true,
+    empty: null,
+  };
+  const walked = redactSnapshot(record);
+  assert.deepEqual(walked, {
+    id: "rec-1",
+    description: "note: key [REDACTED] end",
+    tags: [{ notes: ["also [REDACTED]"] }],
+    webhook_url: "https://hooks.example.com/[REDACTED]",
+    password: "[REDACTED]",
+    name: "benign",
+    count: 3,
+    enabled: true,
+    empty: null,
+  }, "the walker reaches every string leaf and keeps the origin of a webhook URL");
+  assert.deepEqual(redactSnapshot(walked), walked, "second pass over the walked record");
+
+  const fixture = healthyFixture();
+  fixture.applications[0].profile.description = PLANTED_NOTE;
+  assertFixtureFreeOfCanaryWindows(`${JSON.stringify(fixture)} ${JSON.stringify(sampleConfig())} ${NOW.toISOString()}`, PLANTED_CANARIES, "data-side probe fixture");
+  const secrets = leakWindows(PLANTED_CANARIES);
+  const client = mockClient(fixture);
+  const base = createTempBase("grclanker-veracode-data-side-");
+  const result = await exportVeracodeAuditBundle(client, sampleConfig(), base, { now: NOW });
+  const files = readBundleFiles(result.outputDir);
+  assertSecretsAbsent(assert, files, secrets, "bundle directory");
+  assertSecretsAbsent(assert, readZipEntries(result.zipPath), secrets, "zip archive");
+  assertSecretsAbsent(assert, new Map([["assess results and access check", JSON.stringify([await runAllAssessments(client), await checkVeracodeAccess(client)])]]), secrets, "tool payloads");
+  const scanCoverage = JSON.parse(files.get("core_data/scan-coverage.json"));
+  assert.equal(scanCoverage.applications.items[0].profile.description, REDACTED_NOTE, "the application description keeps its prose and the cluster name around the removed shapes");
 });
