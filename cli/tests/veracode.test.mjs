@@ -962,6 +962,73 @@ test("false-pass self-check (c): partial inventories downgrade every would-be pa
   assert.match(truncatedFindings.findings[0].summary, /truncated/);
 });
 
+/** The reviewer's hiding cap: the first entry only, with the whole population claimed behind unfetched pages. */
+function hidingList(items) {
+  return list(items.slice(0, 1), { pagesFetched: 1, totalPages: 3, totalElements: items.length, complete: false });
+}
+
+/** Every scalar leaf of a JSON value as [dotted path, value] pairs. */
+function scalarLeaves(value, prefix = "") {
+  if (value === null || typeof value !== "object") return [[prefix, value]];
+  return Object.entries(value).flatMap(([key, entry]) => scalarLeaves(entry, prefix ? `${prefix}.${key}` : key));
+}
+
+test("reviewer C final verdict, item I: VERACODE-09 calls an API account inventory that a partial user list left empty unread rather than absent, and api_accounts renders null over a partially read user list", async () => {
+  const findingOf = (result, number) => result.findings.find((item) => item.id === `VERACODE-${String(number).padStart(2, "0")}`);
+  const fixture = healthyFixture();
+  const hiddenUsers = mockClient(fixture, { async listUsers() { return hidingList(fixture.users); } });
+  const credentials = findingOf(await assessVeracodeAccessControls(hiddenUsers, { now: NOW }), 9);
+  assert.equal(credentials.status, "manual");
+  assert.equal(credentials.summary, "No active API service account was among the users read, so the credential inventory is unread rather than empty; read the full user list before judging it. Only 1 of 2 users were read (1/3 pages), so the verdict reflects a partial inventory. Manual evidence required: Export API credential creation and expiration dates per API service account from the Platform.");
+  assert.doesNotMatch(credentials.summary, /were returned|unverifiable/);
+  assert.equal(credentials.evidence.users_seen, 1);
+  assert.equal(credentials.evidence.users_total, 2);
+  assert.equal(credentials.evidence.users_complete, false);
+
+  const apiFirst = mockClient(fixture, { async listUsers() { return hidingList([...fixture.users].reverse()); } });
+  const partialAccounts = findingOf(await assessVeracodeAccessControls(apiFirst, { now: NOW }), 9);
+  assert.equal(partialAccounts.status, "warn");
+  assert.equal(partialAccounts.evidence.api_accounts, null, "the API account count over a partial user list is not the count of the part read");
+  assert.equal(partialAccounts.evidence.api_accounts_sampled, 1);
+  assert.equal(partialAccounts.evidence.credentials_readable, 1);
+  assert.match(partialAccounts.summary, /Only 1 of 2 users were read \(1\/3 pages\), so the verdict reflects a partial inventory\./);
+
+  const complete = findingOf(await assessVeracodeAccessControls(mockClient(fixture), { now: NOW }), 9);
+  assert.equal(complete.status, "pass");
+  assert.equal(complete.evidence.api_accounts, 1, "a complete user list keeps its real count");
+  const completeWithoutApi = findingOf(await assessVeracodeAccessControls(mockClient({ ...fixture, users: fixture.users.slice(0, 1) }), { now: NOW }), 9);
+  assert.equal(completeWithoutApi.status, "manual");
+  assert.match(completeWithoutApi.summary, /^No active API service accounts were returned even though this request is authenticated with API credentials, so the credential inventory is unverifiable\./);
+  assert.equal(completeWithoutApi.evidence.users_seen, 1);
+});
+
+test("reviewer C final verdict, item I: no evidence leaf that a complete read rendered positive or true renders 0 or false under a hiding cap on any list method", async () => {
+  const fixture = healthyFixture();
+  const completeFindings = await runAllAssessments(mockClient(fixture));
+  const completeLeaves = new Map(completeFindings.flatMap((item) => scalarLeaves(item.evidence).map(([path, value]) => [`${item.id}.${path}`, value])));
+  const listMethods = Object.keys(mockClient(fixture)).filter((name) => name.startsWith("list"));
+  assert.equal(listMethods.length, 12);
+  const defaulted = [];
+  for (const method of listMethods) {
+    const hidden = mockClient(fixture, {
+      async [method](...args) {
+        const served = await mockClient(fixture)[method](...args);
+        return hidingList(served.items);
+      },
+    });
+    for (const item of await runAllAssessments(hidden)) {
+      for (const [path, value] of scalarLeaves(item.evidence)) {
+        // A *_complete flag turning false is the disclosure itself, and a *_requested count records what the tool asked for, not what the tenant holds.
+        if (/_complete$|_requested$/.test(path)) continue;
+        const before = completeLeaves.get(`${item.id}.${path}`);
+        const positive = (typeof before === "number" && before > 0) || before === true;
+        if (positive && (value === 0 || value === false)) defaulted.push(`${method}: ${item.id}.${path} ${before} -> ${value}`);
+      }
+    }
+  }
+  assert.deepEqual(defaulted, []);
+});
+
 /** Planted credentials: random alphanumerics, so no 6-character window of one occurs in a legitimate fixture value (checked by assertFixtureFreeOfCanaryWindows) or in another canary. */
 const FAKE_SECRETS = {
   customFieldToken: "AX9Ajv33cV74xYBtFWjbQQvyLw4T2LkSH9BdWsRy",
@@ -2283,6 +2350,7 @@ const VERACODE_FIXED_TEXTS = [
   "The users endpoint returned zero users, which cannot be a complete inventory because the API credential belongs to a user; the empty list is treated as unverifiable rather than compliant.",
   "The roles endpoint returned zero roles, which cannot be a complete inventory because Veracode ships built-in roles; the empty list is treated as unverifiable rather than compliant.",
   "No active API service accounts were returned even though this request is authenticated with API credentials, so the credential inventory is unverifiable.",
+  "No active API service account was among the users read, so the credential inventory is unread rather than empty; read the full user list before judging it. Only 1 of 2 users were read (1/3 pages), so the verdict reflects a partial inventory.",
   "No Dynamic Analysis configurations exist, so there is no DAST configuration to evaluate; the empty inventory is treated as not applicable rather than compliant.",
   "No Dynamic Analysis scan configuration could be read, so authentication and crawl settings are unknown.",
   "No open vulnerability issues were returned, but no libraries were readable in the sampled workspaces, so it is unknown whether any scan has populated them.",

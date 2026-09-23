@@ -1798,6 +1798,33 @@ export function rowsSeen(outcome: SnowflakeStatementOutcome): number | null {
   return outcome.status === "ok" ? outcome.rows.length : null;
 }
 
+/** True when the statement completed and every partition was fetched within the row limit, so a count over its rows describes the whole inventory. */
+function fullyRead(outcome: SnowflakeStatementOutcome): boolean {
+  return outcome.status === "ok" && outcome.truncated !== true;
+}
+
+/**
+ * A count judged over a statement's rows describes the whole inventory only
+ * when the read was complete: under a partial read it renders null rather than
+ * the count of the rows read, since a 0 there would claim an absence from the
+ * unread partitions (reviewer C, item I). The seen-of-total sits in the
+ * finding's statements list and partial_inventory note beside it.
+ */
+function countIfFullyRead(outcome: SnowflakeStatementOutcome, count: number): number | null {
+  return fullyRead(outcome) ? count : null;
+}
+
+/** The suffix a summary gives a population under a partial read, so a count of the rows read never reads as a count for the account. */
+function amongRowsRead(outcome: SnowflakeStatementOutcome): string {
+  return fullyRead(outcome) ? "" : " among the rows read";
+}
+
+/** The service-class remark in a stale-login pass: under a partial read an empty class is unread, not a count of zero for the account. */
+function serviceClassLoginNote(users: SnowflakeStatementOutcome, serviceCount: number): string {
+  if (fullyRead(users)) return `${serviceCount} service-class users showed no stale logins`;
+  return serviceCount === 0 ? "no service-class user was among the rows read" : `${serviceCount} service-class users among the rows read showed no stale logins`;
+}
+
 /**
  * The single serializer for a statement outcome on every output path: the
  * rows of a statement that did not complete are replaced by a marker naming
@@ -2138,6 +2165,17 @@ function unrecognizedUserNote(summary: UserClassSummary): string | undefined {
   return `${summary.unrecognized} users carry an unrecognized TYPE (${summary.unrecognized_types.join(", ")}) and were not classified; review them manually`;
 }
 
+/** User class counts for evidence: null under a partial user read, since a 0 there would claim an absence from the unread rows; the unrecognized type names seen stay. */
+function userClassesEvidence(users: SnowflakeStatementOutcome, summary: UserClassSummary): JsonRecord {
+  return {
+    person: countIfFullyRead(users, summary.person),
+    service: countIfFullyRead(users, summary.service),
+    snowflake_managed: countIfFullyRead(users, summary.snowflake_managed),
+    unrecognized: countIfFullyRead(users, summary.unrecognized),
+    unrecognized_types: summary.unrecognized_types,
+  };
+}
+
 function isDisabledUser(row: SqlRow): boolean {
   return rowBoolean(row, "DISABLED") === true;
 }
@@ -2382,11 +2420,11 @@ export async function assessSnowflakeNetworkAndAuthentication(
     const withoutMfa = passwordHumans.filter((row) => rowBoolean(row, "HAS_MFA") !== true && rowBoolean(row, "EXT_AUTHN_DUO") !== true);
     const unknownFlags = passwordHumans.filter((row) => rowBoolean(row, "HAS_MFA") === undefined && rowBoolean(row, "EXT_AUTHN_DUO") === undefined);
     const evidence = {
-      enabled_human_users: humans.length,
-      password_human_users: passwordHumans.length,
+      enabled_human_users: countIfFullyRead(users, humans.length),
+      password_human_users: countIfFullyRead(users, passwordHumans.length),
       users_without_mfa: withoutMfa.slice(0, 50).map(userName),
-      users_with_unknown_mfa_flags: unknownFlags.length,
-      user_classes: userClasses,
+      users_with_unknown_mfa_flags: countIfFullyRead(users, unknownFlags.length),
+      user_classes: userClassesEvidence(users, userClasses),
     };
     const unrecognized = unrecognizedUserNote(userClasses);
     if (users.rows.length === 0) {
@@ -2399,9 +2437,9 @@ export async function assessSnowflakeNetworkAndAuthentication(
       return { status: "warn", summary: `Every classified person user with a password reports MFA, but ${unrecognized}.`, evidence };
     }
     if (passwordHumans.length === 0) {
-      return { status: "pass", summary: `No enabled person users hold a password (${humans.length} enabled person users rely on SSO, key pair, or other factors; ${userClasses.service} service-class users are assessed under control 5), so password MFA enforcement is not applicable and no unprotected password login exists.`, evidence };
+      return { status: "pass", summary: `No enabled person users${amongRowsRead(users)} hold a password (${humans.length} enabled person users rely on SSO, key pair, or other factors; ${userClasses.service} service-class users${amongRowsRead(users)} are assessed under control 5), so password MFA enforcement is not applicable and no unprotected password login exists.`, evidence };
     }
-    return { status: "pass", summary: `All ${passwordHumans.length} enabled person users with passwords report HAS_MFA or EXT_AUTHN_DUO = true.`, evidence };
+    return { status: "pass", summary: `All ${passwordHumans.length} enabled person users with passwords${amongRowsRead(users)} report HAS_MFA or EXT_AUTHN_DUO = true.`, evidence };
   }));
 
   findings.push(evaluateControl(4, [passwordPolicies, ...passwordReferences.outcomes], "the ACCOUNT_USAGE PASSWORD_POLICIES view and each policy's INFORMATION_SCHEMA POLICY_REFERENCES lookup, or Snowsight Admin > Security: confirm an account-level password policy with length, complexity, retry, and lockout settings.", () => {
@@ -2457,16 +2495,19 @@ export async function assessSnowflakeNetworkAndAuthentication(
     const withoutKey = serviceUsers.filter((row) => rowBoolean(row, "HAS_RSA_PUBLIC_KEY") !== true && rowBoolean(row, "HAS_WORKLOAD_IDENTITY") !== true);
     const withPassword = serviceUsers.filter((row) => rowBoolean(row, "HAS_PASSWORD") === true);
     const evidence = {
-      service_users: serviceUsers.length,
+      service_users: countIfFullyRead(users, serviceUsers.length),
       service_users_by_type: countBy(serviceUsers, (row) => upper(rowValue(row, "TYPE"))),
       snowflake_managed_service_users: managedUsers.slice(0, 50).map(userName),
       service_users_without_key_pair: withoutKey.slice(0, 50).map(userName),
       service_users_with_password: withPassword.slice(0, 50).map(userName),
-      user_classes: userClasses,
+      user_classes: userClassesEvidence(users, userClasses),
     };
     const unrecognized = unrecognizedUserNote(userClasses);
     if (users.rows.length === 0) {
       return { status: "manual", summary: "USERS returned zero rows; service account authentication cannot be assessed from an empty inventory.", evidence };
+    }
+    if (serviceUsers.length === 0 && !fullyRead(users)) {
+      return { status: "manual", summary: `No user typed SERVICE, SERVICE_AGENT, or LEGACY_SERVICE was among the ${users.rows.length} user rows read, and the read stopped early, so the service account inventory is unread rather than empty. Read the full USERS view, then confirm each service-class user uses key-pair or workload identity authentication.${unrecognized ? ` ${unrecognized}.` : ""}`, evidence };
     }
     if (serviceUsers.length === 0) {
       return { status: "manual", summary: `None of the ${users.rows.length} users are typed SERVICE, SERVICE_AGENT, or LEGACY_SERVICE (${managedUsers.length} SNOWFLAKE_SERVICE users are Snowflake managed); classify automation accounts with TYPE = SERVICE and confirm each uses key-pair or workload identity authentication.${unrecognized ? ` ${unrecognized}.` : ""}`, evidence };
@@ -2475,9 +2516,9 @@ export async function assessSnowflakeNetworkAndAuthentication(
       return { status: "fail", summary: `${withoutKey.length}/${serviceUsers.length} service-class users lack an RSA public key or workload identity and ${withPassword.length} still hold a password.`, evidence };
     }
     if (unrecognized) {
-      return { status: "warn", summary: `All ${serviceUsers.length} enabled service-class users authenticate with key pairs or workload identity, but ${unrecognized}.`, evidence };
+      return { status: "warn", summary: `All ${serviceUsers.length} enabled service-class users${amongRowsRead(users)} authenticate with key pairs or workload identity, but ${unrecognized}.`, evidence };
     }
-    return { status: "pass", summary: `All ${serviceUsers.length} enabled service-class users (SERVICE, SERVICE_AGENT, LEGACY_SERVICE) authenticate with key pairs or workload identity and hold no password${managedUsers.length > 0 ? `; ${managedUsers.length} SNOWFLAKE_SERVICE users are Snowflake managed and listed in evidence` : ""}.`, evidence };
+    return { status: "pass", summary: `All ${serviceUsers.length} enabled service-class users${amongRowsRead(users)} (SERVICE, SERVICE_AGENT, LEGACY_SERVICE) authenticate with key pairs or workload identity and hold no password${managedUsers.length > 0 ? `; ${managedUsers.length} SNOWFLAKE_SERVICE users are Snowflake managed and listed in evidence` : ""}.`, evidence };
   }));
 
   findings.push(evaluateControl(6, [integrations], "SHOW SECURITY INTEGRATIONS in Snowsight: confirm an enabled SAML2 (or External OAuth) security integration and SCIM provisioning.", () => {
@@ -2734,18 +2775,21 @@ export async function assessSnowflakeMonitoringAndLifecycle(
     const excessive = failedLogins.rows.filter((row) => (rowNumber(row, "FAILURE_COUNT") ?? 0) >= failedLoginThreshold);
     const evidence = {
       lookback_days: lookbackDays,
-      successful_logins: successes,
-      failed_logins: failures,
+      successful_logins: countIfFullyRead(loginOutcomes, successes),
+      failed_logins: countIfFullyRead(loginOutcomes, failures),
       threshold: failedLoginThreshold,
       excessive_sources: excessive.slice(0, 50).map((row) => ({ user: rowValue(row, "USER_NAME"), ip: rowValue(row, "CLIENT_IP"), failures: rowValue(row, "FAILURE_COUNT"), last_error: rowValue(row, "LAST_ERROR") })),
     };
+    if (successes + failures === 0 && !fullyRead(loginOutcomes)) {
+      return { status: "manual", summary: `No LOGIN_HISTORY outcome row for the last ${lookbackDays} days was among the rows read, and the read stopped early, so the login window is unread rather than empty.`, evidence };
+    }
     if (successes + failures === 0) {
       return { status: "manual", summary: `LOGIN_HISTORY returned zero events for the last ${lookbackDays} days; monitoring cannot be evaluated from an empty window (view latency is up to 2 hours).`, evidence };
     }
     if (excessive.length > 0) {
-      return { status: "fail", summary: `${excessive.length} user/IP sources exceeded ${failedLoginThreshold} failed logins in ${lookbackDays} days (${failures} failures total).`, evidence };
+      return { status: "fail", summary: `${excessive.length} user/IP sources exceeded ${failedLoginThreshold} failed logins in ${lookbackDays} days (${failures} failures${amongRowsRead(loginOutcomes)}).`, evidence };
     }
-    return { status: "pass", summary: `${failures} failed logins across ${successes + failures} login events in ${lookbackDays} days; no source exceeded the ${failedLoginThreshold}-failure threshold.`, evidence };
+    return { status: "pass", summary: `${failures} failed logins across ${successes + failures} login events${amongRowsRead(loginOutcomes)} in ${lookbackDays} days; no source${amongRowsRead(failedLogins)} exceeded the ${failedLoginThreshold}-failure threshold.`, evidence };
   }));
 
   findings.push(evaluateControl(12, [users], `Review enabled users whose LAST_SUCCESS_LOGIN is older than ${staleUserDays} days or NULL and disable or remove them.`, () => {
@@ -2767,13 +2811,13 @@ export async function assessSnowflakeMonitoringAndLifecycle(
       if (daysSince(lastLogin, now) > staleUserDays) stale.push(userName(row));
     }
     const evidence = {
-      enabled_human_users: humans.length,
+      enabled_human_users: countIfFullyRead(users, humans.length),
       stale_user_days: staleUserDays,
       stale_users: stale.slice(0, 50),
       users_without_login_timestamp: neverOrUnknown.slice(0, 50),
-      users_without_login_timestamp_count: neverOrUnknown.length,
+      users_without_login_timestamp_count: countIfFullyRead(users, neverOrUnknown.length),
       stale_service_class_users: staleServiceUsers.slice(0, 50).map(userName),
-      user_classes: userClasses,
+      user_classes: userClassesEvidence(users, userClasses),
     };
     const unrecognized = unrecognizedUserNote(userClasses);
     if (users.rows.length === 0) {
@@ -2783,15 +2827,15 @@ export async function assessSnowflakeMonitoringAndLifecycle(
       return { status: "fail", summary: `${stale.length}/${humans.length} enabled person users have not logged in for more than ${staleUserDays} days; ${neverOrUnknown.length} more have no LAST_SUCCESS_LOGIN and were not counted as active.`, evidence };
     }
     if (neverOrUnknown.length > 0) {
-      return { status: "warn", summary: `No enabled person user exceeded ${staleUserDays} days since login, but ${neverOrUnknown.length}/${humans.length} have a NULL LAST_SUCCESS_LOGIN (never logged in or outside the one-year retention) and must be reviewed.`, evidence };
+      return { status: "warn", summary: `No enabled person user${amongRowsRead(users)} exceeded ${staleUserDays} days since login, but ${neverOrUnknown.length}/${humans.length} have a NULL LAST_SUCCESS_LOGIN (never logged in or outside the one-year retention) and must be reviewed.`, evidence };
     }
     if (unrecognized) {
-      return { status: "warn", summary: `All ${humans.length} enabled person users logged in within ${staleUserDays} days, but ${unrecognized}.`, evidence };
+      return { status: "warn", summary: `All ${humans.length} enabled person users${amongRowsRead(users)} logged in within ${staleUserDays} days, but ${unrecognized}.`, evidence };
     }
     if (staleServiceUsers.length > 0) {
-      return { status: "warn", summary: `All ${humans.length} enabled person users logged in within ${staleUserDays} days, but ${staleServiceUsers.length} enabled service-class users have not authenticated in that window and should be reviewed for decommissioning.`, evidence };
+      return { status: "warn", summary: `All ${humans.length} enabled person users${amongRowsRead(users)} logged in within ${staleUserDays} days, but ${staleServiceUsers.length} enabled service-class users have not authenticated in that window and should be reviewed for decommissioning.`, evidence };
     }
-    return { status: "pass", summary: `All ${humans.length} enabled person users logged in within ${staleUserDays} days (${userClasses.service} service-class users showed no stale logins).`, evidence };
+    return { status: "pass", summary: `All ${humans.length} enabled person users${amongRowsRead(users)} logged in within ${staleUserDays} days (${serviceClassLoginNote(users, userClasses.service)}).`, evidence };
   }));
 
   findings.push(evaluateControl(13, [retention], "SHOW PARAMETERS LIKE 'DATA_RETENTION_TIME_IN_DAYS' IN ACCOUNT and confirm ACCESS_HISTORY/QUERY_HISTORY (365-day fixed retention) are exported to long-term storage if longer retention is required.", () => {

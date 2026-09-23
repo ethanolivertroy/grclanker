@@ -1649,6 +1649,85 @@ test("rule 10: control 10 names each capped forwarding inventory and never passe
   assert.deepEqual(byId(allCapped, "SUMO-10").evidence.incomplete_inventories, ["connection list", "partition list", "scheduled view list"]);
 });
 
+/** Every number and boolean leaf of a value by dotted path, so a hiding cap can be diffed against the complete read. */
+function scalarLeaves(value, prefix = "") {
+  const leaves = new Map();
+  if (Array.isArray(value)) {
+    value.forEach((item, index) => { for (const [path, leaf] of scalarLeaves(item, `${prefix}[${index}]`)) leaves.set(path, leaf); });
+  } else if (value !== null && typeof value === "object") {
+    for (const [key, item] of Object.entries(value)) for (const [path, leaf] of scalarLeaves(item, prefix ? `${prefix}.${key}` : key)) leaves.set(path, leaf);
+  } else if (typeof value === "number" || typeof value === "boolean") {
+    leaves.set(prefix, value);
+  }
+  return leaves;
+}
+
+test("reviewer C final verdict, item I: a count judged over a partially read inventory renders null in the assessment summary and the evidence, never the count of the part read, and SUMO-09 calls a hidden audit index unread rather than absent", async () => {
+  const data = healthyData();
+  data.users.push({ id: "u4", email: "dormant@example.com", isActive: true, isMfaEnabled: true, isLocked: false, lastLoginTimestamp: STALE });
+  data.monitors[0].notifications = [{ notification: { connectionType: "Email", recipients: ["someone@gmail.com"] }, runForTriggerTypes: ["Critical"] }];
+  // The reviewer's hiding cap: the first item only, with the walk reported incomplete, so the truncation hides real entries.
+  const hiding = (items) => collectionOf(items.slice(0, 1), { complete: false });
+
+  const identity = await assessSumologicIdentity(readerFrom(data), { now: NOW });
+  assert.equal(identity.summary.users_complete, true);
+  assert.equal(identity.summary.dormant_active_users, 1);
+  const identityHidden = await assessSumologicIdentity(readerFrom(data, { listUsers: async () => hiding(data.users) }), { now: NOW });
+  assert.equal(identityHidden.summary.users_seen, 1);
+  assert.equal(identityHidden.summary.users_complete, false);
+  for (const leaf of ["active_users_without_mfa", "locked_users", "dormant_active_users", "active_users_without_last_login"]) {
+    assert.equal(identityHidden.summary[leaf], null, `${leaf} over a partial user list is null, not the count of the part read`);
+  }
+  assert.equal(identityHidden.summary.identity_providers, 1, "a count over a completely read inventory keeps its value");
+
+  const governance = await assessSumologicDataGovernance(readerFrom(data), { now: NOW });
+  assert.equal(byId(governance, "SUMO-09").evidence.active_audit_index_partitions, 1);
+  assert.equal(governance.summary.active_audit_indexes, 1);
+  assert.equal(governance.summary.partitions_complete, true);
+  const governanceHidden = await assessSumologicDataGovernance(readerFrom(data, { listPartitions: async () => hiding(data.partitions) }), { now: NOW });
+  const audit = byId(governanceHidden, "SUMO-09");
+  assert.equal(audit.status, "manual", audit.summary);
+  assert.equal(audit.summary, "The audit policy is enabled but no active AuditIndex partition was among the 1 partitions seen before pagination stopped, so the audit index is unread rather than absent. Read the full partition list and run `_index=sumologic_audit_events` to confirm events are received. Pagination stopped before the last page, so only 1 items were seen and the population is incomplete.");
+  assert.doesNotMatch(audit.summary, /may be unavailable on this plan/);
+  assert.equal(audit.evidence.active_audit_index_partitions, null);
+  assert.equal(audit.evidence.partitions_seen, 1);
+  assert.equal(audit.evidence.partitions_complete, false);
+  assert.deepEqual(audit.evidence.audit_index_partitions, []);
+  assert.equal(governanceHidden.summary.active_audit_indexes, null);
+  assert.equal(governanceHidden.summary.partitions_complete, false);
+  assert.equal(governanceHidden.summary.partitions_seen, 1);
+  // The completely read list without an audit index is the real absence and keeps its wording.
+  const noAudit = await assessSumologicDataGovernance(readerFrom({ ...data, partitions: data.partitions.slice(0, 1) }), { now: NOW });
+  assert.match(byId(noAudit, "SUMO-09").summary, /no active AuditIndex partition was visible \(plan Paid\); the audit index may be unavailable on this plan/);
+  assert.equal(byId(noAudit, "SUMO-09").evidence.active_audit_index_partitions, 0);
+
+  const sharing = await assessSumologicContentSharing(readerFrom(data), { now: NOW });
+  assert.equal(sharing.summary.external_email_recipients, 1);
+  assert.equal(sharing.summary.monitors_complete, true);
+  const sharingHidden = await assessSumologicContentSharing(readerFrom(data, { listMonitors: async () => collectionOf([], { complete: false }) }), { now: NOW });
+  assert.equal(sharingHidden.summary.external_email_recipients, null);
+  assert.equal(sharingHidden.summary.monitors_complete, false);
+  assert.equal(sharingHidden.summary.monitors_seen, 0);
+
+  // Under every hiding cap, no finding evidence or assessment summary leaf that the complete read rendered as a positive count or true renders 0 or false: it is null, or a seen count that is still positive.
+  const complete = await allAssessments(readerFrom(data));
+  const listReaders = { listUsers: "users", listRoles: "roles", listAccessKeys: "accessKeys", listPartitions: "partitions", listScheduledViews: "scheduledViews", listIngestBudgets: "ingestBudgets", listConnections: "connections", listCollectors: "collectors", listMonitors: "monitors", listDashboards: "dashboards" };
+  for (const [reader, key] of Object.entries(listReaders)) {
+    const items = data[key];
+    assert.ok(Array.isArray(items), `${reader} reads a fixture list`);
+    const capped = await allAssessments(readerFrom(data, { [reader]: async () => hiding(items) }));
+    for (const [index, area] of complete.entries()) {
+      const before = new Map([...scalarLeaves(area.summary, "summary"), ...area.findings.flatMap((item) => [...scalarLeaves(item.evidence, `${item.id}.evidence`)])]);
+      const after = new Map([...scalarLeaves(capped[index].summary, "summary"), ...capped[index].findings.flatMap((item) => [...scalarLeaves(item.evidence, `${item.id}.evidence`)])]);
+      for (const [leaf, value] of before) {
+        const cappedValue = after.get(leaf);
+        if (typeof value === "number" && value > 0 && !/^summary\.(pass|warn|fail|manual)$/.test(leaf)) assert.notEqual(cappedValue, 0, `${reader} hidden: ${area.area} ${leaf} defaulted ${value} -> 0`);
+        if (value === true && !/_complete$/.test(leaf)) assert.notEqual(cappedValue, false, `${reader} hidden: ${area.area} ${leaf} defaulted true -> false`);
+      }
+    }
+  }
+});
+
 // `unread` names the evidence fields derived from the denied inventory; each
 // must render null (never 0 or []) when that inventory returns 403.
 const MULTI_INVENTORY_FINDINGS = [
@@ -2404,6 +2483,7 @@ const SUMOLOGIC_FIXED_TEXTS = [
   "Role least privilege holds for 2 roles. Not checked: the user list could not be read because the access key lacks the role capability (403); collect manually: export the user list with last login dates",
   "The access key lifetime policy was unreadable (Sumo Logic request to /v1/policies/accessKeysLifetime failed (403 Forbidden forbidden)).",
   "Pagination stopped before the last page, so only 100 items were seen and the population is incomplete.",
+  "The audit policy is enabled but no active AuditIndex partition was among the 1 partitions seen before pagination stopped, so the audit index is unread rather than absent. Read the full partition list and run `_index=sumologic_audit_events` to confirm events are received. Pagination stopped before the last page, so only 1 items were seen and the population is incomplete.",
   "per-user MFA status is unknown because the user list could not be read (the access key lacks the role capability (403))",
   "The password policy was unreadable, so org-wide MFA enforcement is unknown; per-user MFA status is unknown because the user list could not be read (the access key lacks the role capability (403)). Confirm Require MFA in Administration > Security > Password Policy.",
   "Require MFA is enabled, but the user list was unreadable (Sumo Logic request to /v1/users failed (403 Forbidden forbidden)), so per-user coverage cannot be confirmed; export the user list with MFA status.",

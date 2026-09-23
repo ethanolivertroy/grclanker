@@ -1672,6 +1672,17 @@ function partialView(result: SplunkListResult): boolean {
   return result.truncated || result.total > result.entries.length;
 }
 
+/**
+ * A count judged over a paginated inventory describes the whole inventory
+ * only when the walk was complete: under a partial view it renders null
+ * rather than the count of the part read, since a 0 there would claim an
+ * absence from the unread part (reviewer C, item I). The seen count and the
+ * claimed total sit in the inventory note beside it.
+ */
+function countWhenComplete(result: SplunkListResult, count: number): number | null {
+  return partialView(result) ? null : count;
+}
+
 type SubjectCheckView = "complete" | "partial" | "unreadable";
 
 /** How far the token subject-to-user check can go: a complete user list decides, a partial one cannot show a subject orphaned, an unreadable one skips the check. */
@@ -1854,13 +1865,21 @@ export async function assessSplunkAuthentication(
     const evidence = {
       auth_type: authType,
       auth_settings: settingsNames,
+      conf_authentication: inventoryNote(authConf.value),
       provider_endpoint_readable: providers.ok,
+      provider_inventory: providers.ok ? inventoryNote(providers.value) : null,
       provider_entries: providers.ok ? providers.value.entries.map((entry) => entry.name) : null,
-      provider_stanzas_in_conf: providerStanzas.length,
-      disabled_provider_stanzas: disabledProviders.length,
+      provider_stanzas_in_conf: countWhenComplete(authConf.value, providerStanzas.length),
+      disabled_provider_stanzas: countWhenComplete(authConf.value, disabledProviders.length),
       local_splunk_users: users.ok ? localUsers.map((user) => user.name).slice(0, 50) : null,
     };
-    if (settingsNames.length === 0 || (providerStanzas.length === 0 && !(providers.ok && providers.value.entries.length > 0))) {
+    const providerListed = providers.ok && providers.value.entries.length > 0;
+    const providerMayBeUnread = partialView(authConf.value) || (providers.ok && partialView(providers.value));
+    if (settingsNames.length === 0) {
+      findings.push(finding(1, "fail", `authType is ${authType} but the [authentication] stanza names no authSettings provider, so enforcement cannot be confirmed.`, evidence));
+    } else if (providerStanzas.length === 0 && !providerListed && providerMayBeUnread) {
+      findings.push(finding(1, "manual", `Unknown: authType is ${authType} with authSettings ${settingsNames.join(", ")}, but no provider stanza was among the ${seenVersusTotal(authConf.value, "stanzas")} read from authentication.conf and ${providers.ok ? `the provider endpoint listed ${seenVersusTotal(providers.value, "providers")}` : `the provider endpoint could not be read (${unreadableCause(providers)})`}, so the stanza may sit in the unread part. Read the full authentication.conf to confirm enforcement.`, evidence));
+    } else if (providerStanzas.length === 0 && !providerListed) {
       findings.push(finding(1, "fail", `authType is ${authType} but no ${authType} provider stanza was readable in authentication.conf or the provider endpoint, so enforcement cannot be confirmed.`, evidence));
     } else if (disabledProviders.length > 0) {
       findings.push(finding(1, "fail", `authType is ${authType} but ${disabledProviders.length} referenced provider stanza(s) are disabled.`, evidence));
@@ -2423,9 +2442,12 @@ export async function assessSplunkDataProtection(client: SplunkInspectorClient):
     const noAck = enabled.filter((token) => asBoolean(token.useACK) !== true && asBoolean(token.useAck) !== true);
     const anyIndex = enabled.filter((token) => asStringList(token.allowedIndexes).length === 0);
     const noSourcetype = enabled.filter((token) => !asString(token.defaultSourcetype));
-    const evidence = { source: "acs:/inputs/http-event-collectors", tokens: tokens.length, enabled: enabled.length, truncated: acsHec.value.truncated, no_useACK: noAck.map((token) => asString(token.name)).slice(0, 50), any_index_allowed: anyIndex.map((token) => asString(token.name)).slice(0, 50), no_default_sourcetype: noSourcetype.map((token) => asString(token.name)).slice(0, 50) };
+    const acsTruncated = acsHec.value.truncated;
+    const evidence = { source: "acs:/inputs/http-event-collectors", seen: tokens.length, total: acsTruncated ? null : tokens.length, total_known: !acsTruncated, truncated: acsTruncated, tokens: acsTruncated ? null : tokens.length, enabled: acsTruncated ? null : enabled.length, no_useACK: noAck.map((token) => asString(token.name)).slice(0, 50), any_index_allowed: anyIndex.map((token) => asString(token.name)).slice(0, 50), no_default_sourcetype: noSourcetype.map((token) => asString(token.name)).slice(0, 50) };
     let hecFinding: SplunkFinding;
-    if (tokens.length === 0) {
+    if (tokens.length === 0 && acsTruncated) {
+      hecFinding = finding(16, "manual", "ACS returned no HEC tokens before its page walk stopped, so the token list is unread rather than empty. Confirm HEC is unused on this stack or that the ACS token can list HEC tokens.", evidence);
+    } else if (tokens.length === 0) {
       hecFinding = finding(16, "manual", "ACS returned no HEC tokens. Emptiness is treated as unknown: confirm HEC is unused on this stack or that the ACS token can list HEC tokens.", evidence);
     } else if (anyIndex.length > 0) {
       hecFinding = finding(16, "fail", `${anyIndex.length} enabled HEC tokens have no allowedIndexes restriction (any index accepted); ${noAck.length} lack useACK and ${noSourcetype.length} lack a default sourcetype.`, evidence);
@@ -2446,14 +2468,17 @@ export async function assessSplunkDataProtection(client: SplunkInspectorClient):
     const noAck = enabled.filter((token) => asBoolean(token.content.useACK) !== true);
     const anyIndex = enabled.filter((token) => asStringList(token.content.indexes).length === 0);
     const noSourcetype = enabled.filter((token) => !asString(token.content.sourcetype));
-    const evidence = { ...inventoryNote(hecInputs.value), global_entry_present: Boolean(globalEntry), hec_disabled: globalEntry?.content.disabled ?? null, enableSSL: globalEntry?.content.enableSSL ?? null, tokens: tokens.length, enabled: enabled.length, no_useACK: noAck.map((token) => token.name).slice(0, 50), any_index_allowed: anyIndex.map((token) => token.name).slice(0, 50), no_sourcetype: noSourcetype.map((token) => token.name).slice(0, 50) };
+    const hecPartial = partialView(hecInputs.value);
+    const evidence = { ...inventoryNote(hecInputs.value), global_entry_present: hecPartial && !globalEntry ? null : Boolean(globalEntry), hec_disabled: globalEntry?.content.disabled ?? null, enableSSL: globalEntry?.content.enableSSL ?? null, tokens: countWhenComplete(hecInputs.value, tokens.length), enabled: countWhenComplete(hecInputs.value, enabled.length), no_useACK: noAck.map((token) => token.name).slice(0, 50), any_index_allowed: anyIndex.map((token) => token.name).slice(0, 50), no_sourcetype: noSourcetype.map((token) => token.name).slice(0, 50) };
     let hecFinding: SplunkFinding;
     if (hecInputs.value.entries.length === 0) {
       hecFinding = finding(16, "manual", "The HEC input list was empty, including the global [http] entry, so neither the disabled flag nor enableSSL could be read. Confirm the credential holds list_inputs and whether HEC is in use.", evidence);
     } else if (!globalEntry) {
-      hecFinding = finding(16, "manual", `Unknown: ${tokens.length} HEC tokens were listed but the global [http] entry (disabled, enableSSL) was not returned; collect inputs.conf [http] manually.`, evidence);
-    } else if (hecDisabled === true && tokens.length === 0) {
+      hecFinding = finding(16, "manual", `Unknown: ${tokens.length} HEC tokens were listed but the global [http] entry (disabled, enableSSL) was not ${hecPartial ? `among the ${seenVersusTotal(hecInputs.value, "entries")} read` : "returned"}; collect inputs.conf [http] manually.`, evidence);
+    } else if (hecDisabled === true && tokens.length === 0 && !hecPartial) {
       hecFinding = finding(16, "pass", "HEC is globally disabled (inputs.conf [http] disabled=1 read explicitly) and no tokens are defined.", evidence);
+    } else if (tokens.length === 0 && hecPartial) {
+      hecFinding = finding(16, "manual", `${hecDisabled === true ? "HEC is globally disabled (inputs.conf [http] disabled=1 read explicitly)" : "HEC is enabled"} and no token was among the ${seenVersusTotal(hecInputs.value, "entries")} read from the HEC input list, so the token inventory is unread rather than empty. Read the full list to confirm whether tokens are defined.`, evidence);
     } else if (tokens.length === 0) {
       hecFinding = finding(16, "manual", "HEC is enabled but no tokens were visible. Emptiness is treated as unknown: confirm the credential can list HEC tokens or that HEC is unused.", evidence);
     } else if (enableSsl === false || anyIndex.length > 0) {
@@ -2636,17 +2661,39 @@ function listenerEvidence(listener: S2sListener): JsonRecord {
 
 const REQUIRE_CLIENT_CERT_DEFAULT_NOTE = 'documented default: "false" if using self-signed and third-party certificates, "true" if using the default certificates, and the REST view cannot tell which certificates are in use';
 
+/** The source a per-port TLS setting reports when its own stanza leaves it unset and the [SSL] stanza it would inherit from was not among the inputs.conf stanzas read. */
+const SSL_STANZA_UNREAD_SOURCE = "unresolved: [SSL] was not among the inputs.conf stanzas read";
+
+/**
+ * How the global [SSL] stanza was seen: read, absent from a completely read
+ * inputs.conf, or possibly sitting in the unread part of a partial one. Only
+ * the second view can call a setting absent from [SSL] (reviewer C, item I).
+ */
+interface GlobalSslView {
+  stanza: JsonRecord | undefined;
+  unread: boolean;
+}
+
+function globalSslView(inputs: SplunkListResult): GlobalSslView {
+  const found = stanza(inputs, "SSL");
+  return { stanza: found, unread: found === undefined && partialView(inputs) };
+}
+
 function listenerPort(name: string): string {
   const match = /(\d+)\s*$/.exec(name);
   return match ? match[1] : name;
 }
 
-function resolveS2sTlsSettings(listener: S2sListener, globalSsl: JsonRecord | undefined): S2sTlsSettings {
-  const levels: SettingLevels = [[`[splunktcp-ssl:${listener.port}]`, listener.tlsStanza], ["[SSL]", globalSsl]];
-  const serverCert = resolveLayeredSetting("serverCert", levels);
-  const requireClientCert = resolveLayeredSetting("requireClientCert", levels);
-  const sslVersions = resolveLayeredSetting("sslVersions", levels);
-  const cipherSuite = resolveLayeredSetting("cipherSuite", levels);
+function resolveS2sTlsSettings(listener: S2sListener, globalSsl: GlobalSslView): S2sTlsSettings {
+  const levels: SettingLevels = [[`[splunktcp-ssl:${listener.port}]`, listener.tlsStanza], ["[SSL]", globalSsl.stanza]];
+  const resolve = (key: string): { value: string | undefined; source: string } => {
+    const resolved = resolveLayeredSetting(key, levels);
+    return resolved.value === undefined && globalSsl.unread ? { value: undefined, source: SSL_STANZA_UNREAD_SOURCE } : resolved;
+  };
+  const serverCert = resolve("serverCert");
+  const requireClientCert = resolve("requireClientCert");
+  const sslVersions = resolve("sslVersions");
+  const cipherSuite = resolve("cipherSuite");
   return {
     serverCert: serverCert.value ?? null,
     serverCert_source: serverCert.source,
@@ -2657,6 +2704,11 @@ function resolveS2sTlsSettings(listener: S2sListener, globalSsl: JsonRecord | un
     cipherSuite: cipherSuite.value ?? null,
     cipherSuite_source: cipherSuite.source,
   };
+}
+
+/** A TLS listener whose serverCert or requireClientCert fell through to an unread [SSL] stanza cannot be judged either way. */
+function tlsUnresolvedBehindUnreadSsl(listener: S2sListener): boolean {
+  return listener.state === "tls" && (listener.tls?.serverCert_source === SSL_STANZA_UNREAD_SOURCE || listener.tls?.requireClientCert_source === SSL_STANZA_UNREAD_SOURCE);
 }
 
 function describeRequireClientCert(listener: S2sListener, globalSsl: JsonRecord | undefined): string {
@@ -2854,26 +2906,32 @@ export async function assessSplunkPlatformHardening(client: SplunkInspectorClien
   } else if (!cookedInputs.ok) {
     findings.push(capWithCaveats(manualUnreadable(23, "/services/data/inputs/tcp/cooked", cookedInputs, "inputs.conf [splunktcp://*] and [splunktcp-ssl:*] receiving stanzas plus the [SSL] stanza serverCert and requireClientCert from each indexer."), [deploymentNote]));
   } else {
-    const sslStanza = inputsConf.ok ? stanza(inputsConf.value, "SSL") : undefined;
-    const listeners = s2sListeners(cookedInputs.value, inputsConf.ok ? inputsConf.value : EMPTY_LIST);
+    const inputs = inputsConf.ok ? inputsConf.value : EMPTY_LIST;
+    const globalSsl = inputsConf.ok ? globalSslView(inputs) : { stanza: undefined, unread: false };
+    const sslStanza = globalSsl.stanza;
+    const listeners = s2sListeners(cookedInputs.value, inputs);
     for (const listener of listeners) {
-      if (listener.state === "tls") listener.tls = resolveS2sTlsSettings(listener, sslStanza);
+      if (listener.state === "tls") listener.tls = resolveS2sTlsSettings(listener, globalSsl);
     }
     const plaintext = listeners.filter((item) => s2sListenerStatus(item.state) === "fail");
     const unconfirmed = listeners.filter((item) => s2sListenerStatus(item.state) === "manual");
+    const behindUnreadSsl = listeners.filter(tlsUnresolvedBehindUnreadSsl);
     const withoutClientCert = listeners.filter((item) => item.state === "tls" && asBoolean(item.tls?.requireClientCert) !== true);
     const withoutServerCert = listeners.filter((item) => item.state === "tls" && !item.tls?.serverCert);
+    const sslStanzaRead = inputsConf.ok && !globalSsl.unread;
     const evidence = {
       ...inventoryNote(cookedInputs.value),
       listeners: listeners.map(listenerEvidence),
       inputs_conf_readable: inputsConf.ok,
-      ssl_stanza_present: inputsConf.ok ? Boolean(sslStanza) : null,
-      ssl_stanza: inputsConf.ok
+      inputs_conf: inputsConf.ok ? inventoryNote(inputs) : null,
+      ssl_stanza_present: sslStanzaRead ? Boolean(sslStanza) : null,
+      ssl_stanza: sslStanzaRead
         ? { serverCert: asString(sslStanza?.serverCert) ?? null, requireClientCert: sslStanza?.requireClientCert ?? null, sslVersions: asStringList(sslStanza?.sslVersions) }
         : null,
       note: "data/inputs/tcp/cooked does not report TLS; encryption is decided from inputs.conf [splunktcp-ssl:*] stanzas, and serverCert and requireClientCert are resolved per port from [splunktcp-ssl:<port>] first, then [SSL]",
     };
     const ports = (items: S2sListener[]): string => items.map((item) => item.port).join(", ");
+    const stanzasRead = inputsConf.ok && partialView(inputs) ? `the ${seenVersusTotal(inputs, "stanzas")} read from inputs.conf` : "the readable inputs.conf";
     let s2sFinding: SplunkFinding;
     if (listeners.length === 0) {
       s2sFinding = finding(23, "manual", "This node has no enabled splunktcp receiving ports, so S2S security must be collected from the indexers manually.", evidence);
@@ -2882,7 +2940,9 @@ export async function assessSplunkPlatformHardening(client: SplunkInspectorClien
     } else if (!inputsConf.ok) {
       s2sFinding = finding(23, "manual", `Unknown: ${listeners.length} enabled splunktcp listeners exist (ports ${ports(listeners)}) but /services/configs/conf-inputs could not be read because ${unreadableCause(inputsConf)}, and the data/inputs/tcp/cooked REST view does not report TLS. Collect inputs.conf [splunktcp-ssl:*] and [SSL] from each indexer manually.`, evidence);
     } else if (unconfirmed.length > 0) {
-      s2sFinding = finding(23, "manual", `Unknown: ${unconfirmed.length} of ${listeners.length} enabled splunktcp listeners (ports ${ports(unconfirmed)}) have no [splunktcp-ssl:<port>] stanza in the readable inputs.conf, so the REST view cannot confirm TLS. Collect inputs.conf from each indexer manually.`, evidence);
+      s2sFinding = finding(23, "manual", `Unknown: ${unconfirmed.length} of ${listeners.length} enabled splunktcp listeners (ports ${ports(unconfirmed)}) have no [splunktcp-ssl:<port>] stanza in ${stanzasRead}, so the REST view cannot confirm TLS. Collect inputs.conf from each indexer manually.`, evidence);
+    } else if (behindUnreadSsl.length > 0) {
+      s2sFinding = finding(23, "manual", `Unknown: ${behindUnreadSsl.length} of ${listeners.length} [splunktcp-ssl:*] listeners leave serverCert or requireClientCert to the [SSL] stanza, which was not among ${stanzasRead}, so neither setting can be called present or absent. Read the full inputs.conf to resolve the TLS settings.`, evidence);
     } else if (withoutClientCert.length > 0) {
       s2sFinding = finding(23, "warn", `All ${listeners.length} listeners are [splunktcp-ssl:*] receivers but requireClientCert is not true for ${withoutClientCert.length} of them: ${withoutClientCert.map((item) => describeRequireClientCert(item, sslStanza)).join("; ")}. Forwarders on those ports are not certificate-authenticated.`, evidence);
     } else if (withoutServerCert.length > 0) {

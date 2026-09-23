@@ -1613,6 +1613,16 @@ function whenReadable<T>(collection: SumologicCollection<unknown>, value: T): T 
 }
 
 /**
+ * A count judged over a paginated collection describes the whole inventory only when the walk
+ * was complete: under a partial walk it renders null rather than the count of the part read,
+ * since a 0 there would claim an absence from the unread part (reviewer C, item I). The seen
+ * count and the completeness flag sit beside it.
+ */
+function whenComplete<T>(collection: SumologicCollection<unknown>, value: T): T | null {
+  return collection.ok && collection.complete !== false ? value : null;
+}
+
+/**
  * Rule 10 for findings that read several paginated inventories: every
  * inventory whose pagination stopped early is named in the summary, and a
  * pass becomes warn because the population it was judged on is incomplete.
@@ -2059,10 +2069,11 @@ export async function assessSumologicIdentity(
       identity_providers: whenReadable(identityProviders, idps.length),
       allowlisted_users: whenReadable(allowlisted, allowlistedUsers.length),
       users_seen: whenReadable(users, userList.length),
-      active_users_without_mfa: whenReadable(users, activeWithoutMfa.length),
-      locked_users: whenReadable(users, activity.locked.length),
-      dormant_active_users: whenReadable(users, activity.dormant.length),
-      active_users_without_last_login: whenReadable(users, activity.undatedLogin.length),
+      users_complete: whenReadable(users, users.complete),
+      active_users_without_mfa: whenComplete(users, activeWithoutMfa.length),
+      locked_users: whenComplete(users, activity.locked.length),
+      dormant_active_users: whenComplete(users, activity.dormant.length),
+      active_users_without_last_login: whenComplete(users, activity.undatedLogin.length),
       unreadable_surfaces: collectErrors(collections).length,
     },
     findings,
@@ -2325,13 +2336,15 @@ export async function assessSumologicDataGovernance(
       search_audit_enabled: searchAuditPolicy.ok ? searchAuditPolicy.data?.enabled === true : null,
       partitions_readable: partitions.ok,
       audit_index_partitions: whenReadable(partitions, names(auditIndexes)),
-      active_audit_index_partitions: whenReadable(partitions, activeAuditIndexes.length),
+      active_audit_index_partitions: whenComplete(partitions, activeAuditIndexes.length),
       partitions_seen: whenReadable(partitions, partitionList.length),
       partitions_complete: whenReadable(partitions, partitions.complete),
       plan_type: planType ?? null,
     };
     if (!partitions.ok) {
       findings.push(finding(9, "high", "manual", `The audit policy is enabled but the partition list was unreadable (${partitions.error ?? "unknown error"}), so the audit index state is unverified; run \`_index=sumologic_audit_events\` for the last 24 hours to prove events flow.`, evidence));
+    } else if (activeAuditIndexes.length === 0 && partitions.complete === false) {
+      findings.push(finding(9, "high", "manual", `The audit policy is enabled but no active AuditIndex partition was among the ${partitionList.length} partitions seen before pagination stopped, so the audit index is unread rather than absent. Read the full partition list and run \`_index=sumologic_audit_events\` to confirm events are received.${partialNote(partitions)}`, evidence));
     } else if (activeAuditIndexes.length === 0) {
       findings.push(finding(9, "high", "manual", `The audit policy is enabled but no active AuditIndex partition was visible${planType ? ` (plan ${planType})` : ""}; the audit index may be unavailable on this plan. Run \`_index=sumologic_audit_events\` to confirm events are received.${partialNote(partitions)}`, evidence));
     } else if (searchAuditPolicy.ok && searchAuditPolicy.data?.enabled !== true) {
@@ -2415,7 +2428,7 @@ export async function assessSumologicDataGovernance(
     const ephemeral = collectorList.filter((collector) => collector.ephemeral === true);
     const versions = [...new Set(installed.map((collector) => asString(collector.collectorVersion)).filter((item): item is string => Boolean(item)))].sort();
     const missingVersion = installed.filter((collector) => !asString(collector.collectorVersion));
-    const evidence = { collectors_seen: collectorList.length, collectors_complete: collectors.complete, installed: installed.length, hosted: collectorList.length - installed.length, offline_non_ephemeral: names(offline), offline_beyond_threshold: names(longOffline), ephemeral: ephemeral.length, collector_versions: versions, installed_missing_version: names(missingVersion), offline_threshold_days: offlineDays };
+    const evidence = { collectors_seen: collectorList.length, collectors_complete: collectors.complete, installed: whenComplete(collectors, installed.length), hosted: whenComplete(collectors, collectorList.length - installed.length), offline_non_ephemeral: names(offline), offline_beyond_threshold: names(longOffline), ephemeral: whenComplete(collectors, ephemeral.length), collector_versions: versions, installed_missing_version: names(missingVersion), offline_threshold_days: offlineDays };
     if (longOffline.length > 0) {
       findings.push(finding(12, "medium", "fail", `${longOffline.length} installed collector(s) have been offline for more than ${offlineDays} days (or have no last-seen timestamp) and remain registered.${partialNote(collectors)}`, evidence));
     } else if (offline.length > 0 || versions.length > 1 || missingVersion.length > 0) {
@@ -2468,7 +2481,8 @@ export async function assessSumologicDataGovernance(
     area: "data-governance",
     summary: {
       partitions_seen: whenReadable(partitions, partitionList.length),
-      active_audit_indexes: whenReadable(partitions, activeAuditIndexes.length),
+      partitions_complete: whenReadable(partitions, partitions.complete),
+      active_audit_indexes: whenComplete(partitions, activeAuditIndexes.length),
       connections_seen: whenReadable(connections, connectionList.length),
       collectors_seen: whenReadable(collectors, collectorList.length),
       ingest_budgets_seen: whenReadable(ingestBudgets, budgets.length),
@@ -2699,7 +2713,8 @@ export async function assessSumologicContentSharing(
       org_shared_items: whenPermissionsRead(orgShared.length),
       dashboards_seen: whenReadable(dashboards, dashboardList.length),
       monitors_seen: whenReadable(monitors, monitorList.length),
-      external_email_recipients: monitors.ok && orgDomains.size > 0 ? externalRecipients.length : null,
+      monitors_complete: whenReadable(monitors, monitors.complete),
+      external_email_recipients: orgDomains.size > 0 ? whenComplete(monitors, externalRecipients.length) : null,
       unreadable_surfaces: collectErrors(collections).length,
     },
     findings,

@@ -1456,6 +1456,11 @@ const SNOWFLAKE_FIXED_TEXTS = [
   "Unreadable inventory: password_policies (denied), session_policies (timeout).",
   "Partial inventory: show_network_policies hit the 10000-row limit (10000 rows seen); the verdict cannot be pass on a partial result.",
   "Partial inventory: users returned 1/3 partitions (1000/2600 rows seen).",
+  "All 1 enabled person users with passwords among the rows read report HAS_MFA or EXT_AUTHN_DUO = true. Partial inventory: users returned 2/3 partitions (1/4 rows seen); the verdict cannot be pass on a partial result.",
+  "No user typed SERVICE, SERVICE_AGENT, or LEGACY_SERVICE was among the 1 user rows read, and the read stopped early, so the service account inventory is unread rather than empty. Read the full USERS view, then confirm each service-class user uses key-pair or workload identity authentication.",
+  "No LOGIN_HISTORY outcome row for the last 30 days was among the rows read, and the read stopped early, so the login window is unread rather than empty.",
+  "All 1 enabled person users among the rows read logged in within 90 days (no service-class user was among the rows read).",
+  "0 failed logins across 900 login events among the rows read in 30 days; no source exceeded the 10-failure threshold.",
   "the active role could not be verified and the share inventory may be scoped to a role with narrower visibility",
   "[denied] show_shares: Snowflake SQL API request failed (422 Unprocessable Entity): SQL access control error: Insufficient privileges to operate on account 'MYORG' [code 003001, sqlState 42501]\n  SHOW SHARES",
   "[not_requested] session_context: Not requested: the Snowflake private key could not be loaded (ERR_OSSL_UNSUPPORTED); no statement was sent. Provide a PKCS#8 PEM key and, for an encrypted key, its passphrase.",
@@ -2373,6 +2378,109 @@ test("false-pass self-check (c): partial results with unfetched partitions never
     assert.match(item.summary, /cannot be pass on a partial result/);
     assert.ok(item.evidence.partial_inventory);
   }
+});
+
+/** The reviewer's hiding cap: the first row only, with the whole population claimed behind unfetched partitions. */
+function hidingRows(result) {
+  return { ...result, rows: result.rows.slice(0, 1), numRows: result.rows.length, partitionCount: 3, fetchedPartitions: 2, truncated: true };
+}
+
+/** Every scalar leaf of a JSON value as [dotted path, value] pairs. */
+function scalarLeaves(value, prefix = "") {
+  if (value === null || typeof value !== "object") return [[prefix, value]];
+  return Object.entries(value).flatMap(([key, entry]) => scalarLeaves(entry, prefix ? `${prefix}.${key}` : key));
+}
+
+const isUsersInventory = (statement) => statement.includes("ACCOUNT_USAGE.USERS") && !statement.includes("COUNT(*)");
+const isLoginOutcomes = (statement) => statement.includes("ACCOUNT_USAGE.LOGIN_HISTORY") && statement.includes("GROUP BY IS_SUCCESS");
+
+function hidingFixture(matches, hide = hidingRows) {
+  return (statement) => {
+    const healthy = healthyFixture(statement);
+    return matches(normalizeStatement(statement)) ? hide(healthy) : healthy;
+  };
+}
+
+test("reviewer C final verdict, item I: a count judged over a partially read inventory renders null, never the count of the rows read, and an empty class from a partial read is unread rather than absent (SNOWFLAKE-03, SNOWFLAKE-05, SNOWFLAKE-11, SNOWFLAKE-12)", async () => {
+  const [networkAuth, , monitoring] = await runAllAssessments(createMockClient(hidingFixture(isUsersInventory)));
+
+  const mfa = findingById(networkAuth, "SNOWFLAKE-03");
+  assert.equal(mfa.status, "warn");
+  assert.equal(mfa.summary, "All 1 enabled person users with passwords among the rows read report HAS_MFA or EXT_AUTHN_DUO = true. Partial inventory: users returned 2/3 partitions (1/4 rows seen); the verdict cannot be pass on a partial result.");
+  assert.equal(mfa.evidence.enabled_human_users, null);
+  assert.equal(mfa.evidence.password_human_users, null);
+  assert.equal(mfa.evidence.users_with_unknown_mfa_flags, null);
+  assert.deepEqual(mfa.evidence.user_classes, { person: null, service: null, snowflake_managed: null, unrecognized: null, unrecognized_types: [] });
+  assert.deepEqual(mfa.evidence.statements, [{ key: "users", status: "ok", rows: 1, truncated: true, error: undefined }]);
+
+  const service = findingById(networkAuth, "SNOWFLAKE-05");
+  assert.equal(service.status, "manual");
+  assert.equal(service.summary, "No user typed SERVICE, SERVICE_AGENT, or LEGACY_SERVICE was among the 1 user rows read, and the read stopped early, so the service account inventory is unread rather than empty. Read the full USERS view, then confirm each service-class user uses key-pair or workload identity authentication. Partial inventory: users returned 2/3 partitions (1/4 rows seen).");
+  assert.equal(service.evidence.service_users, null);
+  assert.equal(service.evidence.user_classes.service, null);
+  assert.deepEqual(service.evidence.service_users_by_type, {});
+
+  const stale = findingById(monitoring, "SNOWFLAKE-12");
+  assert.equal(stale.status, "warn");
+  assert.equal(stale.summary, "All 1 enabled person users among the rows read logged in within 90 days (no service-class user was among the rows read). Partial inventory: users returned 2/3 partitions (1/4 rows seen); the verdict cannot be pass on a partial result.");
+  assert.equal(stale.evidence.enabled_human_users, null);
+  assert.equal(stale.evidence.users_without_login_timestamp_count, null);
+  assert.equal(stale.evidence.user_classes.service, null);
+
+  const completeWithoutService = await assessSnowflakeNetworkAndAuthentication(createMockClient((statement) => {
+    const healthy = healthyFixture(statement);
+    return isUsersInventory(normalizeStatement(statement)) ? { ...healthy, rows: healthy.rows.slice(0, 3), numRows: 3 } : healthy;
+  }));
+  const noService = findingById(completeWithoutService, "SNOWFLAKE-05");
+  assert.equal(noService.status, "manual");
+  assert.match(noService.summary, /^None of the 3 users are typed SERVICE, SERVICE_AGENT, or LEGACY_SERVICE \(0 SNOWFLAKE_SERVICE users are Snowflake managed\)/);
+  assert.equal(noService.evidence.service_users, 0);
+  assert.equal(noService.evidence.user_classes.service, 0);
+  const completeMfa = findingById(completeWithoutService, "SNOWFLAKE-03");
+  assert.equal(completeMfa.status, "pass");
+  assert.equal(completeMfa.summary, "All 2 enabled person users with passwords report HAS_MFA or EXT_AUTHN_DUO = true.");
+  assert.equal(completeMfa.evidence.enabled_human_users, 2);
+
+  const [, , hiddenLogins] = await runAllAssessments(createMockClient(hidingFixture(isLoginOutcomes)));
+  const logins = findingById(hiddenLogins, "SNOWFLAKE-11");
+  assert.equal(logins.status, "warn");
+  assert.equal(logins.summary, "0 failed logins across 900 login events among the rows read in 30 days; no source exceeded the 10-failure threshold. Partial inventory: login_outcomes returned 2/3 partitions (1/2 rows seen); the verdict cannot be pass on a partial result.");
+  assert.equal(logins.evidence.failed_logins, null);
+  assert.equal(logins.evidence.successful_logins, null);
+  assert.equal(logins.evidence.threshold, 10);
+
+  const emptyPartialWindow = await assessSnowflakeMonitoringAndLifecycle(createMockClient(hidingFixture(isLoginOutcomes, (result) => ({ ...hidingRows(result), rows: [] }))));
+  const unreadWindow = findingById(emptyPartialWindow, "SNOWFLAKE-11");
+  assert.equal(unreadWindow.status, "manual");
+  assert.equal(unreadWindow.summary, "No LOGIN_HISTORY outcome row for the last 30 days was among the rows read, and the read stopped early, so the login window is unread rather than empty. Partial inventory: login_outcomes returned 2/3 partitions (0/2 rows seen).");
+  assert.equal(unreadWindow.evidence.failed_logins, null);
+  const emptyCompleteWindow = await assessSnowflakeMonitoringAndLifecycle(createMockClient(hidingFixture(isLoginOutcomes, (result) => ({ ...result, rows: [], numRows: 0 }))));
+  assert.equal(findingById(emptyCompleteWindow, "SNOWFLAKE-11").status, "manual");
+  assert.match(findingById(emptyCompleteWindow, "SNOWFLAKE-11").summary, /^LOGIN_HISTORY returned zero events for the last 30 days; monitoring cannot be evaluated from an empty window/);
+  assert.equal(findingById(emptyCompleteWindow, "SNOWFLAKE-11").evidence.failed_logins, 0);
+});
+
+test("reviewer C final verdict, item I: no evidence leaf that a complete read rendered positive or true renders 0 or false under a hiding cap on any statement", async () => {
+  const complete = createMockClient((statement) => healthyFixture(statement));
+  const completeFindings = allFindings(await runAllAssessments(complete));
+  const completeLeaves = new Map(completeFindings.flatMap((item) => scalarLeaves(item.evidence).map(([path, value]) => [`${item.id}.${path}`, value])));
+  const statements = [...new Set(complete.executed.map(normalizeStatement))].filter((statement) => !statement.startsWith("SELECT CURRENT_ACCOUNT()"));
+  assert.ok(statements.length >= 30, `expected the complete run to execute the full statement set, saw ${statements.length}`);
+  const defaulted = [];
+  for (const hidden of statements) {
+    const findings = allFindings(await runAllAssessments(createMockClient(hidingFixture((statement) => statement === hidden))));
+    for (const item of findings) {
+      for (const [path, value] of scalarLeaves(item.evidence)) {
+        const before = completeLeaves.get(`${item.id}.${path}`);
+        const positive = (typeof before === "number" && before > 0) || before === true;
+        if (positive && (value === 0 || value === false)) defaulted.push(`${hidden.slice(0, 60)}: ${item.id}.${path} ${before} -> ${value}`);
+      }
+      if (item.evidence.statements?.some((statement) => statement.truncated === true)) {
+        assert.notEqual(item.status, "pass", `${item.id} passed while ${hidden.slice(0, 60)} was partially read`);
+      }
+    }
+  }
+  assert.deepEqual(defaulted, []);
 });
 
 test("false-pass self-check (c): a row-limited inventory downgrades pass to warn with seen counts", async () => {

@@ -2474,9 +2474,14 @@ function wasCollected(dataset: CollectedDataset<unknown>): boolean {
   return dataset.notCollected === undefined;
 }
 
-/** A count derived from a dataset: null, never 0, when the dataset was not collected. */
+/** True when the dataset was collected and its walk ran to completion, so a count over it describes the whole inventory. */
+function wasFullyRead(dataset: CollectedDataset<unknown>): boolean {
+  return wasCollected(dataset) && dataset.truncated !== true;
+}
+
+/** A count derived from a dataset: null, never 0, when the dataset was not collected or only partially read (a count of the part read would stand for the whole; the seen count is in the truncation note). */
 function countIfCollected(count: number, ...datasets: Array<CollectedDataset<unknown>>): number | null {
-  return datasets.every(wasCollected) ? count : null;
+  return datasets.every(wasFullyRead) ? count : null;
 }
 
 /** A label derived from a dataset: "not collected" when the dataset was not collected. */

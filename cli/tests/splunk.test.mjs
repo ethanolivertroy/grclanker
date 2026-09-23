@@ -181,6 +181,10 @@ function createFetch(fixture, options = {}) {
     if (options.partial || options.partialPaths?.includes(url.pathname)) {
       return jsonResponse(entryList(offset === 0 ? entries : [], entries.length + 5));
     }
+    // The reviewer's hiding cap: the first entry only, with the whole population claimed, so the truncation hides real entries.
+    if (options.hidePaths?.includes(url.pathname)) {
+      return jsonResponse(entryList(offset === 0 ? entries.slice(0, 1) : [], entries.length));
+    }
     const count = Number(url.searchParams.get("count") ?? "100");
     return jsonResponse({ entry: entries.slice(offset, offset + count), paging: { total: entries.length, perPage: count, offset } });
   };
@@ -729,6 +733,122 @@ test("reviewer C final verdict, item J: a truncated user list never turns SPLUNK
   assert.equal(named.status, "fail");
   assert.deepEqual(named.evidence.subject_not_in_user_list, ["tok2 (analyst1, enabled)"]);
   assert.equal(named.evidence.subjects_not_among_seen_users, null);
+});
+
+/** Every number and boolean leaf of a finding's evidence by dotted path, so a hiding cap can be diffed against the complete read. */
+function scalarLeaves(value, prefix = "") {
+  const leaves = new Map();
+  if (Array.isArray(value)) {
+    value.forEach((item, index) => { for (const [path, leaf] of scalarLeaves(item, `${prefix}[${index}]`)) leaves.set(path, leaf); });
+  } else if (value !== null && typeof value === "object") {
+    for (const [key, item] of Object.entries(value)) for (const [path, leaf] of scalarLeaves(item, prefix ? `${prefix}.${key}` : key)) leaves.set(path, leaf);
+  } else if (typeof value === "number" || typeof value === "boolean") {
+    leaves.set(prefix, value);
+  }
+  return leaves;
+}
+
+test("reviewer C final verdict, item I: a count judged over a partially read inventory renders null, never the count of the part read, and no verdict calls a stanza or setting absent when it may sit in the unread part (SPLUNK-AUTH-01, SPLUNK-DP-16, SPLUNK-PLAT-23)", async () => {
+  const hiding = (paths, fixture = HARDENED) => client(fixture, { hidePaths: paths }).client;
+  const baseline = new Map((await runAllAssessments(client(HARDENED).client)).flatMap((item) => item.findings).map((item) => [item.id, item]));
+  const unreadSsl = "unresolved: [SSL] was not among the inputs.conf stanzas read";
+
+  // SPLUNK-AUTH-01: [authentication] is read and the okta provider stanza is hidden; the provider endpoint still lists okta, so the verdict stands and is downgraded for the partial conf.
+  assert.equal(baseline.get("SPLUNK-AUTH-01").evidence.provider_stanzas_in_conf, 1);
+  const auth01 = byId(await assessSplunkAuthentication(hiding(["/services/configs/conf-authentication"])), "SPLUNK-AUTH-01");
+  assert.equal(auth01.status, "warn", auth01.summary);
+  assert.match(auth01.summary, /Downgraded: the conf-authentication \(1 of 3 entries\) inventory was only partially retrieved/);
+  assert.equal(auth01.evidence.provider_stanzas_in_conf, null, "the stanza count over a partial conf is null, not the count of the part read");
+  assert.equal(auth01.evidence.disabled_provider_stanzas, null);
+  assert.deepEqual(auth01.evidence.conf_authentication, { seen: 1, total: 3, total_known: true, truncated: true });
+  assert.deepEqual(auth01.evidence.provider_inventory, { seen: 1, total: 1, total_known: true, truncated: false });
+  assert.deepEqual(auth01.evidence.provider_entries, ["okta"]);
+
+  // With the provider endpoint forbidden as well, the hidden stanza is unknown, never absent: manual, not fail.
+  const auth01Unknown = byId(await assessSplunkAuthentication(forbidding(HARDENED, ["/services/authentication/providers/SAML"], { hidePaths: ["/services/configs/conf-authentication"] })), "SPLUNK-AUTH-01");
+  assert.equal(auth01Unknown.status, "manual", auth01Unknown.summary);
+  assert.match(auth01Unknown.summary, /^Unknown: authType is SAML with authSettings okta, but no provider stanza was among the 1 of 3 stanzas read from authentication\.conf and the provider endpoint could not be read \(.*403.*\), so the stanza may sit in the unread part\. Read the full authentication\.conf to confirm enforcement\.$/);
+  assert.doesNotMatch(auth01Unknown.summary, /no SAML provider stanza was readable/);
+  assert.equal(auth01Unknown.evidence.provider_stanzas_in_conf, null);
+  // The completely read conf without the stanza, with the endpoint forbidden, is the real absence and still fails.
+  const [authenticationStanza, , passwordStanza] = HARDENED["/services/configs/conf-authentication"];
+  const absent = byId(await assessSplunkAuthentication(forbidding({ ...HARDENED, "/services/configs/conf-authentication": [authenticationStanza, passwordStanza] }, ["/services/authentication/providers/SAML"])), "SPLUNK-AUTH-01");
+  assert.equal(absent.status, "fail");
+  assert.match(absent.summary, /no SAML provider stanza was readable in authentication\.conf or the provider endpoint/);
+  assert.equal(absent.evidence.provider_stanzas_in_conf, 0);
+
+  // SPLUNK-DP-16: the global [http] entry is read and the token is hidden; the token inventory is unread, not empty.
+  assert.equal(baseline.get("SPLUNK-DP-16").evidence.tokens, 1);
+  const dp16 = byId(await assessSplunkDataProtection(hiding(["/services/data/inputs/http"])), "SPLUNK-DP-16");
+  assert.equal(dp16.status, "manual", dp16.summary);
+  assert.match(dp16.summary, /^HEC is enabled and no token was among the 1 of 2 entries read from the HEC input list, so the token inventory is unread rather than empty\. Read the full list to confirm whether tokens are defined\./);
+  assert.doesNotMatch(dp16.summary, /no tokens were visible|Emptiness/);
+  assert.equal(dp16.evidence.tokens, null);
+  assert.equal(dp16.evidence.enabled, null);
+  assert.equal(dp16.evidence.global_entry_present, true);
+  assert.deepEqual([dp16.evidence.seen, dp16.evidence.total, dp16.evidence.truncated], [1, 2, true]);
+  // The one explicit empty-inventory pass (HEC disabled, no tokens) needs the complete list: under the cap it is manual.
+  const disabledHec = { ...HARDENED, "/services/data/inputs/http": [entry("http", { disabled: 1, enableSSL: 1 }), HARDENED["/services/data/inputs/http"][1]] };
+  const disabledPartial = byId(await assessSplunkDataProtection(hiding(["/services/data/inputs/http"], disabledHec)), "SPLUNK-DP-16");
+  assert.equal(disabledPartial.status, "manual", disabledPartial.summary);
+  assert.match(disabledPartial.summary, /^HEC is globally disabled \(inputs\.conf \[http\] disabled=1 read explicitly\) and no token was among the 1 of 2 entries read/);
+  // The token entry read and the global [http] entry hidden: the entry is unread, and global_entry_present is null rather than false.
+  const tokenFirst = { ...HARDENED, "/services/data/inputs/http": [...HARDENED["/services/data/inputs/http"]].reverse() };
+  const noGlobal = byId(await assessSplunkDataProtection(hiding(["/services/data/inputs/http"], tokenFirst)), "SPLUNK-DP-16");
+  assert.equal(noGlobal.status, "manual");
+  assert.match(noGlobal.summary, /the global \[http\] entry \(disabled, enableSSL\) was not among the 1 of 2 entries read/);
+  assert.equal(noGlobal.evidence.global_entry_present, null);
+  assert.equal(noGlobal.evidence.tokens, null);
+  // The complete list with the global entry alone is the real emptiness and keeps its wording.
+  const emptyTokens = byId(await assessSplunkDataProtection(client({ ...HARDENED, "/services/data/inputs/http": [HARDENED["/services/data/inputs/http"][0]] }).client), "SPLUNK-DP-16");
+  assert.equal(emptyTokens.status, "manual");
+  assert.match(emptyTokens.summary, /^HEC is enabled but no tokens were visible\. Emptiness is treated as unknown/);
+  assert.equal(emptyTokens.evidence.tokens, 0);
+
+  // SPLUNK-PLAT-23: [splunktcp-ssl:9997] is read and [SSL] is hidden, so the port's serverCert and requireClientCert fall through to a stanza that was not read.
+  assert.equal(baseline.get("SPLUNK-PLAT-23").evidence.ssl_stanza_present, true);
+  const plat23 = byId(await assessSplunkPlatformHardening(hiding(["/services/configs/conf-inputs"])), "SPLUNK-PLAT-23");
+  assert.equal(plat23.status, "manual", plat23.summary);
+  assert.match(plat23.summary, /^Unknown: 1 of 1 \[splunktcp-ssl:\*\] listeners leave serverCert or requireClientCert to the \[SSL\] stanza, which was not among the 1 of 2 stanzas read from inputs\.conf, so neither setting can be called present or absent\. Read the full inputs\.conf to resolve the TLS settings\./);
+  assert.doesNotMatch(plat23.summary, /absent from both|requireClientCert is not true|port 9997|not certificate-authenticated/);
+  assert.equal(plat23.evidence.ssl_stanza_present, null);
+  assert.equal(plat23.evidence.ssl_stanza, null);
+  assert.deepEqual(plat23.evidence.inputs_conf, { seen: 1, total: 2, total_known: true, truncated: true });
+  assert.equal(plat23.evidence.listeners.length, 1);
+  const listener = plat23.evidence.listeners[0].tls;
+  assert.equal(listener.requireClientCert, null);
+  assert.equal(listener.requireClientCert_source, unreadSsl);
+  assert.equal(listener.serverCert_source, unreadSsl);
+  assert.doesNotMatch(JSON.stringify(plat23), /"unset"/, "no setting is called unset behind an unread [SSL] stanza");
+  // A port whose own stanza carries both settings never consults [SSL]: the pass is downgraded for the partial conf and the [SSL] leaves are null rather than false.
+  const perPort = { ...HARDENED, "/services/configs/conf-inputs": [entry("splunktcp-ssl:9997", { disabled: 0, serverCert: "/opt/splunk/etc/auth/port9997.pem", requireClientCert: "true" }), HARDENED["/services/configs/conf-inputs"][1]] };
+  const perPortPartial = byId(await assessSplunkPlatformHardening(hiding(["/services/configs/conf-inputs"], perPort)), "SPLUNK-PLAT-23");
+  assert.equal(perPortPartial.status, "warn", perPortPartial.summary);
+  assert.match(perPortPartial.summary, /Downgraded: the conf-inputs \(1 of 2 entries\) inventory was only partially retrieved/);
+  assert.equal(perPortPartial.evidence.ssl_stanza_present, null);
+  assert.equal(perPortPartial.evidence.listeners[0].tls.requireClientCert_source, "[splunktcp-ssl:9997]");
+  assert.equal(perPortPartial.evidence.listeners[0].tls.sslVersions_source, unreadSsl);
+  // The completely read conf without [SSL] is the real absence: the warn names it and ssl_stanza_present is false.
+  const missing = byId(await assessSplunkPlatformHardening(client({ ...HARDENED, "/services/configs/conf-inputs": [HARDENED["/services/configs/conf-inputs"][0]] }).client), "SPLUNK-PLAT-23");
+  assert.equal(missing.status, "warn");
+  assert.match(missing.summary, /requireClientCert absent from both \[splunktcp-ssl:9997\] and \[SSL\]/);
+  assert.equal(missing.evidence.ssl_stanza_present, false);
+  assert.equal(missing.evidence.listeners[0].tls.requireClientCert_source, "unset");
+
+  // Under every hiding cap, no evidence leaf that the complete read rendered as a positive count or true renders 0 or false: it is null, or a seen count that is still positive.
+  for (const [path, { name, readers }] of Object.entries(INVENTORY_READERS)) {
+    const findings = (await runAllAssessments(hiding([path]))).flatMap((item) => item.findings);
+    for (const item of findings) {
+      const before = scalarLeaves(baseline.get(item.id).evidence);
+      const after = scalarLeaves(item.evidence);
+      for (const [leaf, value] of before) {
+        const capped = after.get(leaf);
+        if (typeof value === "number" && value > 0) assert.notEqual(capped, 0, `${name} hidden: ${item.id} ${leaf} defaulted ${value} -> 0`);
+        if (value === true) assert.notEqual(capped, false, `${name} hidden: ${item.id} ${leaf} defaulted true -> false`);
+      }
+      if (!readers.includes(item.id)) assert.equal(item.status, baseline.get(item.id).status, `${name} hidden: non-reader ${item.id} keeps its verdict`);
+    }
+  }
 });
 
 test("unreadable audit search downgrades an enabled _audit index to warn, and a disabled search skips to warn", async () => {
@@ -2302,6 +2422,15 @@ const SPLUNK_FIXED_TEXTS = [
   "authType is Splunk: local Splunk authentication is the primary method; SAML or LDAP is not enforced.",
   "authType is Scripted: enforcement depends on the external proxy or script; collect the upstream identity provider configuration manually.",
   "authType is SAML but no SAML provider stanza was readable in authentication.conf or the provider endpoint, so enforcement cannot be confirmed.",
+  "authType is SAML but the [authentication] stanza names no authSettings provider, so enforcement cannot be confirmed.",
+  "Unknown: authType is SAML with authSettings okta, but no provider stanza was among the 1 of 3 stanzas read from authentication.conf and the provider endpoint could not be read (the credential lacks the required capability (403)), so the stanza may sit in the unread part. Read the full authentication.conf to confirm enforcement.",
+  "Unknown: authType is SAML with authSettings okta, but no provider stanza was among the 1 of 3 stanzas read from authentication.conf and the provider endpoint listed 0 of 1 providers, so the stanza may sit in the unread part. Read the full authentication.conf to confirm enforcement.",
+  "HEC is enabled and no token was among the 1 of 2 entries read from the HEC input list, so the token inventory is unread rather than empty. Read the full list to confirm whether tokens are defined.",
+  "Unknown: 1 HEC tokens were listed but the global [http] entry (disabled, enableSSL) was not among the 1 of 2 entries read; collect inputs.conf [http] manually.",
+  "ACS returned no HEC tokens before its page walk stopped, so the token list is unread rather than empty. Confirm HEC is unused on this stack or that the ACS token can list HEC tokens.",
+  "Unknown: 1 of 1 [splunktcp-ssl:*] listeners leave serverCert or requireClientCert to the [SSL] stanza, which was not among the 1 of 2 stanzas read from inputs.conf, so neither setting can be called present or absent. Read the full inputs.conf to resolve the TLS settings.",
+  "Unknown: 1 of 1 enabled splunktcp listeners (ports 9997) have no [splunktcp-ssl:<port>] stanza in the 1 of 2 stanzas read from inputs.conf, so the REST view cannot confirm TLS. Collect inputs.conf from each indexer manually.",
+  "unresolved: [SSL] was not among the inputs.conf stanzas read",
   "authType is LDAP but 1 referenced provider stanza(s) are disabled.",
   "externalTwoFactorAuthVendor is Duo and the Duo-MFA configuration is present.",
   "externalTwoFactorAuthVendor is RSA but no Rsa-MFA configuration stanza exists.",

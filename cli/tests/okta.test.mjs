@@ -2065,6 +2065,56 @@ test("rule 10: a truncated page returned by any list method demotes every depend
   }
   assert.equal(statusOf(integResult, "OKTA-INTEG-001"), "Pass", "findings that do not read apps keep their verdict");
   assert.equal(statusOf(integResult, "OKTA-INTEG-002"), "Pass");
+  // Reviewer C final verdict, item I: a snapshot counter over a partially read inventory renders null, never the count of the part read (a 0 there would claim an absence from the unread part).
+  for (const counter of ["applications", "active_applications", "risky_oidc_apps", "inactive_apps", "provisioning_apps", "deactivation_push_apps"]) {
+    assert.equal(integResult.snapshotSummary[counter], null, `${counter} renders null over the truncated apps list`);
+  }
+  assert.equal(integResult.snapshotSummary.contextual_rules, null, "contextual_rules reads the truncated sign-on rules");
+  assert.equal(typeof integResult.snapshotSummary.trusted_origins, "number", "a fully read inventory keeps its count");
+  assert.equal(typeof integResult.snapshotSummary.custom_network_zones, "number");
+  const hiddenZones = { ...sample, async listNetworkZones() { return { items: (await sample.listNetworkZones()).slice(0, 1), truncated: true, pagesFetched: 2, truncationNote: 'GET /api/v1/zones?limit=200 stopped after 2 pages (1 items): the Link rel="next" cursor repeated a page already read, total unknown.' }; } };
+  const hiddenZonesResult = assessOktaIntegrations(await collectOktaIntegrationData(hiddenZones), createSampleConfig());
+  assert.equal(hiddenZonesResult.snapshotSummary.custom_network_zones, null, "the custom zone hidden behind the cap is not reported as 0");
+  assert.equal(typeof hiddenZonesResult.snapshotSummary.applications, "number");
+  assert.equal(statusOf(hiddenZonesResult, "OKTA-INTEG-002"), "Partial");
+
+  // Under every hiding cap (the first item only, the walk reported truncated), no snapshot counter that the complete read rendered as a positive count or true renders 0 or false: it is null, or a seen count that is still positive.
+  const assessAll = async (target) => [
+    assessOktaAuthentication(await collectOktaAuthenticationData(target), createSampleConfig()),
+    assessOktaAdminAccess(await collectOktaAdminAccessData(target), createSampleConfig()),
+    assessOktaIntegrations(await collectOktaIntegrationData(target), createSampleConfig()),
+    assessOktaMonitoring(await collectOktaMonitoringData(target), createSampleConfig()),
+  ];
+  const scalarLeaves = (value, prefix = "") => {
+    const leaves = new Map();
+    if (value !== null && typeof value === "object" && !Array.isArray(value)) {
+      for (const [key, item] of Object.entries(value)) for (const [path, leaf] of scalarLeaves(item, prefix ? `${prefix}.${key}` : key)) leaves.set(path, leaf);
+    } else if (typeof value === "number" || typeof value === "boolean") {
+      leaves.set(prefix, value);
+    }
+    return leaves;
+  };
+  const complete = await assessAll(sample);
+  const listMethods = Object.keys(sample).filter((name) => /^list/.test(name) && name !== "listUsersWithMeta");
+  assert.ok(listMethods.length >= 20, `every list method of the sample client is swept (${listMethods.length})`);
+  for (const method of [...listMethods, "listUsersWithMeta"]) {
+    const hidden = {
+      ...sample,
+      async [method](...args) {
+        const result = await sample[method](...args);
+        const items = Array.isArray(result) ? result : result.items;
+        return { items: items.slice(0, 1), truncated: true, pagesFetched: 2, truncationNote: `GET /api/v1/${method} stopped after 2 pages (1 items): the Link rel="next" cursor repeated a page already read, total unknown.` };
+      },
+    };
+    const capped = await assessAll(hidden);
+    for (const [index, area] of complete.entries()) {
+      for (const [leaf, value] of scalarLeaves(area.snapshotSummary)) {
+        const cappedValue = scalarLeaves(capped[index].snapshotSummary).get(leaf);
+        if (typeof value === "number" && value > 0) assert.notEqual(cappedValue, 0, `${method} hidden: ${area.area ?? index} snapshot ${leaf} defaulted ${value} -> 0`);
+        if (value === true) assert.notEqual(cappedValue, false, `${method} hidden: ${area.area ?? index} snapshot ${leaf} defaulted true -> false`);
+      }
+    }
+  }
 
   const authentication = await collectOktaAuthenticationData(client);
   assert.equal(authentication.signOnPolicyRules.truncated, true);
