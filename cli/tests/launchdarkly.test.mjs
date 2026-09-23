@@ -455,6 +455,41 @@ test("LaunchdarklyApiClient signals truncation when _links.next remains at the l
   });
   const none = await empty.list("/api/v2/members", {}, { limit: 5 });
   assert.deepEqual(none, { items: [], truncated: false, seen: 0, total: 0, endpoint: "GET /api/v2/members" });
+
+  const bareFullPage = new LaunchdarklyApiClient(sampleConfig(), {
+    fetchImpl: async () => jsonResponse({ items: [{ _id: "a" }, { _id: "b" }] }),
+  });
+  const fullAtCap = await bareFullPage.list("/api/v2/members", {}, { limit: 2, pageSize: 2 });
+  assert.equal(fullAtCap.truncated, true, "a full last page at the cap with neither totalCount nor _links.next cannot prove the remainder empty");
+  assert.equal(fullAtCap.seen, 2);
+  assert.equal(fullAtCap.total, undefined);
+  assert.equal(fullAtCap.truncationReason, undefined, "the defensive exit is a cap exit, so the option remedy still applies");
+  const belowCap = await bareFullPage.list("/api/v2/members", {}, { limit: 3, pageSize: 3 });
+  assert.equal(belowCap.truncated, false, "a short bare page below the cap is the end of the listing");
+  assert.equal(belowCap.seen, 2);
+});
+
+test("verdict rule 10: a member page full at member_limit with neither totalCount nor _links.next demotes LD-03 and LD-11 with the member_limit remedy", async () => {
+  const members = [
+    { _id: "m1", email: "owner-one@example.com", role: "owner", mfa: "enabled", _lastSeen: RECENT_MS },
+    { _id: "m2", email: "owner-two@example.com", role: "owner", mfa: "enabled", _lastSeen: RECENT_MS },
+  ];
+  const fetchImpl = async (input) => {
+    const url = new URL(typeof input === "string" ? input : input.toString());
+    if (url.pathname === "/api/v2/members") return jsonResponse({ items: members });
+    if (url.pathname === "/api/v2/caller-identity") return jsonResponse({ accountId: "acct", memberId: "m1", tokenKind: "personal" });
+    if (url.pathname === "/api/v2/tokens") return jsonResponse({ items: [], totalCount: 0 });
+    if (url.pathname === "/api/v2/teams") return jsonResponse({ items: [], totalCount: 0 });
+    if (url.pathname === "/api/v2/roles") return jsonResponse({ items: [], totalCount: 0 });
+    return jsonResponse({ items: [], totalCount: 0 });
+  };
+  const client = new LaunchdarklyApiClient(sampleConfig(), { fetchImpl });
+  const result = await assessLaunchdarklyIdentity(client, { memberLimit: 2, now: NOW });
+  const owners = finding(result, "LD-03");
+  assert.notEqual(owners.status, "pass");
+  assert.match(owners.summary, /Truncated listing: members \(2 of an unknown total collected\)\. The verdict covers only the collected items, so raise member_limit and rerun/);
+  assert.equal(owners.evidence.truncated_collections[0].collection, "members");
+  assert.equal(owners.evidence.truncated_collections[0].option, "member_limit");
 });
 
 test("LaunchdarklyApiClient retries 429 using X-Ratelimit-Reset and retries 5xx responses", async () => {
@@ -1959,6 +1994,40 @@ test("verdict rule 1 corollary: LaunchDarkly findings keep judging readable inve
   assert.equal(findingStatus(emptyAudit, "LD-12"), "fail", "a readable audit log that returned nothing is the fail case");
   assert.equal(finding(emptyAudit, "LD-12").summary, "The audit log returned no entries at all.");
   assert.equal(findingStatus(emptyAudit, "LD-13"), "warn");
+});
+
+test("LD-18 names a denied environments read as an unreadable inventory, and a key-filtered project listing the server did not narrow carries its reason without offering project_limit", async () => {
+  const requests = [];
+  const fetchFor = (projectsTotal) => async (input) => {
+    const url = new URL(typeof input === "string" ? input : input.toString());
+    requests.push(`${url.pathname}${url.search}`);
+    if (url.pathname === "/api/v2/account/relay-auto-configs") {
+      return jsonResponse({ items: [{ name: "edge", lastModified: RECENT_MS, policy: [{ effect: "allow", actions: ["*"], resources: ["proj/web:env/production"] }] }] });
+    }
+    if (url.pathname === "/api/v2/projects") return jsonResponse({ items: [{ key: "web", name: "Web" }], totalCount: projectsTotal });
+    if (url.pathname === "/api/v2/projects/web/environments") return jsonResponse({ code: "forbidden", message: "denied" }, { status: 403, statusText: "Forbidden" });
+    if (url.pathname === "/api/v2/auditlog") return jsonResponse({ items: [{ _id: "a1", date: RECENT_MS, kind: "member", name: "x", accesses: [{ action: "createMember" }] }], totalCount: 1 });
+    if (url.pathname === "/api/v2/caller-identity") return jsonResponse({ accountId: "acct", memberId: "m1", tokenKind: "personal" });
+    return jsonResponse({ items: [], totalCount: 0 });
+  };
+
+  const narrowed = await assessLaunchdarklyMonitoringIntegrations(new LaunchdarklyApiClient(sampleConfig(), { fetchImpl: fetchFor(1) }), { now: NOW });
+  const relay = finding(narrowed, "LD-18");
+  assert.equal(relay.status, "warn");
+  assert.match(relay.summary, /Unreadable inventory: environments for project web \(GET \/api\/v2\/projects\/web\/environments: .*403 Forbidden.*\), so secure mode on the production environments the Relay Proxy serves was not checked/);
+  assert.doesNotMatch(relay.summary, /Truncated listing/, "a project listing the server narrowed to the referenced key is complete");
+  assert.equal(relay.evidence.truncated_collections, undefined);
+  assert.equal(relay.evidence.unreadable_inventories[0].endpoint, "GET /api/v2/projects/web/environments");
+  assert.equal(relay.evidence.unreadable_inventories[0].http_status, 403);
+  assert.ok(requests.includes("/api/v2/projects?filter=keys%3Aweb&limit=1&offset=0"), "the project listing is capped at the referenced project count");
+
+  const unnarrowed = await assessLaunchdarklyMonitoringIntegrations(new LaunchdarklyApiClient(sampleConfig(), { fetchImpl: fetchFor(2) }), { now: NOW });
+  const relayUnnarrowed = finding(unnarrowed, "LD-18");
+  assert.match(relayUnnarrowed.summary, /Truncated listing: projects \(1 of 2 collected; the server reported 2 projects for the 1 referenced key, so the key filter may not have applied and only the collected projects were evaluated\)\. The verdict covers only the collected items, so review the uncollected items manually\./);
+  assert.doesNotMatch(relayUnnarrowed.summary, /project_limit/, "the monitoring tool has no project_limit to raise");
+  assert.match(relayUnnarrowed.summary, /Unreadable inventory: environments for project web \(GET \/api\/v2\/projects\/web\/environments: /);
+  assert.equal(relayUnnarrowed.evidence.truncated_collections[0].option, undefined);
+  assert.match(relayUnnarrowed.evidence.truncated_collections[0].reason, /the key filter may not have applied/);
 });
 
 // Credential values planted in collected objects. Alphanumeric and random-looking so that every 6-to-24-character window

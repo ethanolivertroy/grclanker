@@ -1652,6 +1652,9 @@ export class LaunchdarklyApiClient {
       } else if (total !== undefined && offset < total && pageItems.length >= Math.min(pageSize, limit)) {
         nextUrl = this.buildUrl(path, { ...query, limit: Math.min(pageSize, limit - items.length), offset });
       } else {
+        // A full last page at the cap with neither a total nor a next link is the API's end signal, but it is
+        // indistinguishable from a server that omitted both, so the remainder is reported unseen rather than absent.
+        remaining = total === undefined && items.length >= limit;
         nextUrl = undefined;
       }
       if (nextUrl && visited.has(nextUrl)) {
@@ -3140,12 +3143,15 @@ function environmentsRequest(projectKey: string): string {
 async function collectEnvironmentContexts(
   client: Pick<LaunchdarklyApiClient, "listProjects" | "listEnvironments">,
   errors: string[],
-  options: { projectLimit: number; environmentLimit: number; projectKeys: string[]; productionPattern: RegExp },
+  options: { projectLimit: number; environmentLimit: number; projectKeys: string[]; productionPattern: RegExp; projectLimitOption?: string },
 ): Promise<EnvironmentInventory> {
-  const projects = await collectList(
-    errors,
-    "projects",
-    () => client.listProjects(options.projectLimit, options.projectKeys),
+  const projects = withKeyFilterReason(
+    await collectList(
+      errors,
+      "projects",
+      () => client.listProjects(options.projectLimit, options.projectKeys),
+    ),
+    options.projectKeys,
   );
   const environments: EnvironmentContext[] = [];
   const environmentCollections: EnvironmentInventory["environmentCollections"] = [];
@@ -3175,7 +3181,7 @@ async function collectEnvironmentContexts(
     }
   }
   const notes = [
-    ...truncationNote("projects", "project_limit", projects),
+    ...truncationNote("projects", options.projectLimitOption, projects),
     ...environmentCollections.flatMap((entry) =>
       truncationNote("environments", "environment_limit", entry.collection, `project ${entry.projectKey}`)),
   ];
@@ -3198,6 +3204,19 @@ async function collectEnvironmentContexts(
     )),
   ]);
   return { projects, projectsRequest: request, environments, environmentCollections, notes, gaps, unreadableProjects };
+}
+
+/**
+ * A key-filtered project listing whose server total exceeds the keys asked for was not narrowed by the filter, so its
+ * truncation is not a cap exit: the reason says so and no limit option is offered for it.
+ */
+function withKeyFilterReason(projects: LaunchdarklyCollection, projectKeys: string[]): LaunchdarklyCollection {
+  if (!projects.truncated || projects.truncationReason !== undefined || projectKeys.length === 0) return projects;
+  if (projects.total === undefined || projects.total <= projectKeys.length) return projects;
+  return {
+    ...projects,
+    truncationReason: `the server reported ${projects.total} projects for the ${projectKeys.length} referenced key${projectKeys.length === 1 ? "" : "s"}, so the key filter may not have applied and only the collected projects were evaluated`,
+  };
 }
 
 /**
@@ -3439,6 +3458,7 @@ export async function assessLaunchdarklyEnvironmentGovernance(
     environmentLimit: clampNumber(options.environmentLimit, DEFAULT_ENVIRONMENT_LIMIT, 1, 500),
     projectKeys: options.projectKeys && options.projectKeys.length > 0 ? options.projectKeys : config.projectKeys,
     productionPattern,
+    projectLimitOption: "project_limit",
   });
   const projects = inventory.projects.items;
   const environments = inventory.environments;
@@ -3766,6 +3786,7 @@ export async function assessLaunchdarklyFlagHygiene(
     environmentLimit: DEFAULT_ENVIRONMENT_LIMIT,
     projectKeys: options.projectKeys && options.projectKeys.length > 0 ? options.projectKeys : config.projectKeys,
     productionPattern,
+    projectLimitOption: "project_limit",
   });
   const projects = inventory.projects.items;
   const environments = inventory.environments;
@@ -4099,6 +4120,7 @@ export async function assessLaunchdarklyMonitoringIntegrations(
   const referencedProjects = uniqueStrings(relayStatements.flatMap((item) => relayReferencedEnvironments(item.statements).map((reference) => reference.projectKey)));
   const relayInventory = referencedProjects.length > 0
     ? await collectEnvironmentContexts(client, errors, {
+      // Capped at the projects the Relay Proxy policies reference; the monitoring tool has no project_limit to raise.
       projectLimit: referencedProjects.length,
       environmentLimit: DEFAULT_ENVIRONMENT_LIMIT,
       projectKeys: referencedProjects,
