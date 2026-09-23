@@ -465,6 +465,9 @@ const SETTING_KEY_SUFFIXES = new Set([
   // `key_expiry`, `token_inventory_scope`, `caller_token_role`, `key_status`).
   "days", "hours", "minutes", "seconds", "ttl", "at", "date", "time", "timestamp", "expiry", "expiration", "expires", "version",
   "scope", "role", "status", "state", "kind", "label", "title", "description", "owner",
+  // The enterprise settings an assessment reports as words (`session_duration: 12 hours`, `session_duration: never`,
+  // `password_reset_frequency: 90 days`, `key_rotation_interval`, `password_min_length`).
+  "duration", "frequency", "interval", "length",
   // The Vault AppRole and token settings an assessment reports (`secret_id_bound_cidrs`, `token_bound_cidrs`,
   // `secret_id_num_uses`) and the accessor, a UUID handle to a token or secret id that cannot be used in its place
   // (`secret_id_accessor`, `token_accessor`; 01:40 rulings).

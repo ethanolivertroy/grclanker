@@ -638,15 +638,24 @@ test("row (a), identifiers and settings: a key whose final segment names a setti
     "token_created_at: 2026-09-22T10:00:00Z key_expiry: 2027-01-01 token_inventory_scope: full caller_token_role: admin",
     'LAUNCHDARKLY_KEY_SHAPE: "sdk-uuid"',
     '{"BOX_AUTH_METHOD": "ccg", "BOX_TOKEN_URL": "https://api.box.com/oauth2/token"}',
+    // The enterprise settings Box reports as words, as the analysis documents and finding evidence write them.
+    '{"session_duration": "12 hours", "password_reset_frequency": "90 days", "previous_password_reuse_limit": "5"}',
+    '"session_duration": "never"',
+    "session_duration: 12 hours password_reset_frequency: 90 days key_rotation_interval=30d password_min_length=14",
   ];
   const scrubber = createCredentialScrubber();
   assert.deepEqual(scrubAlterations(kept, scrubber.scrub), []);
   for (const scrubErrorText of [scrubBoxErrorText, scrubLaunchdarklyErrorText, scrubKnowbe4ErrorText, scrubDatadogErrorText, scrubElasticErrorText]) {
     assert.deepEqual(scrubAlterations(kept, scrubErrorText), []);
   }
-  for (const key of ["BOX_AUTH_METHOD", "BOX_TOKEN_URL", "BOX_JWT_ALGORITHM", "BOX_JWT_AUDIENCE", "LAUNCHDARKLY_KEY_SHAPE", "BOX_CLIENT_ID", "client_id", "token_type", "auth_mode", "key_name", "token_created_at", "maxKeys", "redirect_uri", "authorization_endpoint", "password_file", "private_key_path"]) {
+  for (const key of ["BOX_AUTH_METHOD", "BOX_TOKEN_URL", "BOX_JWT_ALGORITHM", "BOX_JWT_AUDIENCE", "LAUNCHDARKLY_KEY_SHAPE", "BOX_CLIENT_ID", "client_id", "token_type", "auth_mode", "key_name", "token_created_at", "maxKeys", "redirect_uri", "authorization_endpoint", "password_file", "private_key_path", "session_duration", "password_reset_frequency", "key_rotation_interval", "password_min_length"]) {
     assert.ok(isSettingKey(key) && !isCredentialKey(key), `expected a setting key: ${key}`);
   }
+  // A duration or frequency key is a setting, not a spelling of the credential it qualifies.
+  for (const key of ["session_token", "sessionToken", "password", "user_session"]) {
+    assert.ok(isCredentialKey(key), `expected a credential key: ${key}`);
+  }
+  assert.equal(scrubber.scrub(`session_duration=${TOKEN_SHAPED.tokenCasing}`), `session_duration=${REDACTED}`, "a token-shaped value goes under a duration key as under any setting key");
   // The URL rule still applies to a setting's URL value: userinfo and query go, the path stays.
   assert.equal(scrubber.scrub("BOX_TOKEN_URL=https://svc:pw@api.box.com/oauth2/token?client_secret=football"), `BOX_TOKEN_URL=https://api.box.com/oauth2/token?${REDACTED}`);
   // Token-shaped and registered values go under a setting key as anywhere else.
