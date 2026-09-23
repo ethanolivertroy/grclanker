@@ -1181,7 +1181,9 @@ test("class 9: the allowlist and information barrier findings keep a presence-ba
   assert.equal(zeroMode.evidence.allowlist_entries_truncated, true);
   const zeroAllowlist = findingById(zeroRows, "BOX-05");
   assert.equal(zeroAllowlist.status, "warn");
-  assert.match(zeroAllowlist.summary, /^The collaboration allowlist collection stopped at the cap \(0 entries and 0 exempt users retrieved\)/);
+  // An empty page under a remaining marker is not a cap stop, so BOX-05 names that exit and does not offer list_limit.
+  assert.equal(zeroAllowlist.summary, `With 0 entries and 0 exempt users retrieved, the collaboration allowlist listing stopped after 0 records because ${EMPTY_MARKER_PAGE_REASON}, so unreviewed public, stale, or exempt entries may remain; review the remainder in the Admin Console.`);
+  assert.doesNotMatch(zeroAllowlist.summary, /list_limit/);
   assert.equal(zeroAllowlist.evidence.allowlist_entries, null);
   assert.equal(zeroAllowlist.evidence.allowlist_entries_count, null);
   assert.equal(zeroAllowlist.evidence.public_email_domains, null);
@@ -1723,8 +1725,8 @@ test("truncated allowlist and Shield event lists downgrade absence-based verdict
     listCollaborationAllowlistEntries: truncatedList(fixture.allowlistEntries),
   }));
   assertStatuses(truncatedEntries, { "BOX-04": "pass", "BOX-05": "warn" });
-  assert.match(findingById(truncatedEntries, "BOX-05").summary, /stopped at the cap \(1 entries and 0 exempt users retrieved\)/);
-  assert.match(findingById(truncatedEntries, "BOX-05").summary, /raise list_limit/);
+  // A page that carried the flag alone is read as a cap exit, so the generic cap wording and the list_limit remedy apply.
+  assert.equal(findingById(truncatedEntries, "BOX-05").summary, "With 1 entries and 0 exempt users retrieved, the collaboration allowlist listing stopped at the 1-record cap while Box reported more records (a next_marker remained), so unreviewed public, stale, or exempt entries may remain; raise list_limit and rerun.");
   assert.equal(findingById(truncatedEntries, "BOX-05").evidence.allowlist_truncated, true);
   assert.equal(truncatedEntries.truncated.length, 1);
   assert.match(truncatedEntries.truncated[0], /^collaboration_allowlist_entries: /);
@@ -1733,6 +1735,7 @@ test("truncated allowlist and Shield event lists downgrade absence-based verdict
     listCollaborationAllowlistExemptTargets: truncatedList(fixture.exemptTargets),
   }));
   assertStatuses(truncatedExempt, { "BOX-05": "warn" });
+  assert.match(findingById(truncatedExempt, "BOX-05").summary, /^With 1 entries and 0 exempt users retrieved, the collaboration allowlist exempt user listing stopped .*, so unreviewed public, stale, or exempt entries may remain; raise list_limit and rerun\.$/);
   assert.match(truncatedExempt.truncated[0], /^collaboration_allowlist_exempt_targets: /);
 
   const weak = weakFixture();
@@ -1797,6 +1800,64 @@ test("truncated allowlist and Shield event lists downgrade absence-based verdict
   assert.match(findingById(alertsTruncated, "BOX-25").summary, /and 1 among 2 sampled events \(collection truncated\) Shield alert or block events show content access monitoring is active/);
   assert.deepEqual(findingById(alertsTruncated, "BOX-25").evidence.anomaly_events, { observed: 1, sampled_events: 2, events_truncated: true });
   assert.deepEqual(findingById(alertsTruncated, "BOX-14").evidence.shield_events, { observed: { SHIELD_ALERT: 1 }, sampled_events: 2, events_truncated: true });
+});
+
+test("BOX-05 names each truncated listing's own exit and offers list_limit only for the listing a cap stopped", async () => {
+  const entry = (id) => ({ id, type: "collaboration_whitelist_entry", domain: `${id}.example`, direction: "both", created_at: "2026-06-01T00:00:00Z" });
+  const target = (id) => ({ id, type: "collaboration_whitelist_exempt_target", user: { id: `user-${id}`, type: "user" } });
+  const repeatedMarkerReason = "the server repeated its marker, so the remaining records could not be paged";
+  const capReason = "the 3-record cap was reached while the server offered a next marker";
+
+  // The allowlist server answers the second page under the marker it already served (a non-cap stop, capReached false);
+  // the exempt target server fills the cap and still offers a marker (a cap stop, capReached true).
+  const both = await assessBoxSharingCollaboration(httpBox(hardenedFixture(), {
+    routes: {
+      "GET /2.0/collaboration_whitelist_entries": (url) => jsonResponse(url.searchParams.get("marker") === null
+        ? { entries: [entry("entry-1")], limit: 3, next_marker: "stuck" }
+        : { entries: [entry("entry-2")], limit: 3, next_marker: "stuck" }),
+      "GET /2.0/collaboration_whitelist_exempt_targets": () => jsonResponse({ entries: [target("exempt-1"), target("exempt-2"), target("exempt-3")], limit: 3, next_marker: "more" }),
+    },
+  }).client, { listLimit: 3 });
+  const bothStopped = findingById(both, "BOX-05");
+  assert.equal(bothStopped.status, "warn");
+  assert.equal(bothStopped.summary, `With 2 entries and 3 exempt users retrieved, the collaboration allowlist listing stopped after 2 records because ${repeatedMarkerReason}, and the collaboration allowlist exempt user listing stopped after 3 records because ${capReason}, so unreviewed public, stale, or exempt entries may remain; review the remainder in the Admin Console, and raise list_limit and rerun.`);
+  assert.equal(bothStopped.evidence.allowlist_truncated, true);
+  assert.equal(bothStopped.evidence.allowlist_entries, null, "domain names stay withheld from a truncated listing");
+  assert.equal(bothStopped.evidence.allowlist_entries_count, 2);
+  assert.equal(bothStopped.evidence.exempt_targets, 3);
+  assert.equal(bothStopped.manualEvidence, "Admin Console > Enterprise Settings > Content & Sharing > Collaboration > Allowlisted domains: export the domain list and review each entry for business justification, direction, and age.");
+  assert.deepEqual(both.truncated.map((line) => line.split(":")[0]).sort(), ["collaboration_allowlist_entries", "collaboration_allowlist_exempt_targets"]);
+
+  // The allowlist alone, stopped by the server: the cap remedy is not offered because a larger list_limit cannot help.
+  const allowlistOnly = await assessBoxSharingCollaboration(httpBox(hardenedFixture(), {
+    routes: {
+      "GET /2.0/collaboration_whitelist_entries": (url) => jsonResponse(url.searchParams.get("marker") === null
+        ? { entries: [entry("entry-1")], limit: 3, next_marker: "stuck" }
+        : { entries: [entry("entry-2")], limit: 3, next_marker: "stuck" }),
+    },
+  }).client, { listLimit: 3 });
+  assert.equal(findingById(allowlistOnly, "BOX-05").status, "warn");
+  assert.equal(findingById(allowlistOnly, "BOX-05").summary, `With 2 entries and 0 exempt users retrieved, the collaboration allowlist listing stopped after 2 records because ${repeatedMarkerReason}, so unreviewed public, stale, or exempt entries may remain; review the remainder in the Admin Console.`);
+  assert.doesNotMatch(findingById(allowlistOnly, "BOX-05").summary, /list_limit/);
+
+  // The exempt targets alone, stopped at the cap: list_limit is the remedy and the console is not the only way forward.
+  const exemptOnly = await assessBoxSharingCollaboration(httpBox(hardenedFixture(), {
+    routes: {
+      "GET /2.0/collaboration_whitelist_exempt_targets": () => jsonResponse({ entries: [target("exempt-1"), target("exempt-2"), target("exempt-3")], limit: 3, next_marker: "more" }),
+    },
+  }).client, { listLimit: 3 });
+  assert.equal(findingById(exemptOnly, "BOX-05").status, "warn");
+  assert.equal(findingById(exemptOnly, "BOX-05").summary, `With 1 entries and 3 exempt users retrieved, the collaboration allowlist exempt user listing stopped after 3 records because ${capReason}, so unreviewed public, stale, or exempt entries may remain; raise list_limit and rerun.`);
+
+  // Two cap stops share one remedy, written once.
+  const bothCapped = await assessBoxSharingCollaboration(httpBox(hardenedFixture(), {
+    routes: {
+      "GET /2.0/collaboration_whitelist_entries": () => jsonResponse({ entries: [entry("entry-1"), entry("entry-2"), entry("entry-3")], limit: 3, next_marker: "more" }),
+      "GET /2.0/collaboration_whitelist_exempt_targets": () => jsonResponse({ entries: [target("exempt-1"), target("exempt-2"), target("exempt-3")], limit: 3, next_marker: "more" }),
+    },
+  }).client, { listLimit: 3 });
+  assert.equal(findingById(bothCapped, "BOX-05").summary, `With 3 entries and 3 exempt users retrieved, the collaboration allowlist listing stopped after 3 records because ${capReason}, and the collaboration allowlist exempt user listing stopped after 3 records because ${capReason}, so unreviewed public, stale, or exempt entries may remain; raise list_limit and rerun.`);
+  assert.equal((findingById(bothCapped, "BOX-05").summary.match(/raise list_limit/g) ?? []).length, 1);
 });
 
 test("assessBoxIdentityAccess treats null configuration categories as absent data instead of failing", async () => {

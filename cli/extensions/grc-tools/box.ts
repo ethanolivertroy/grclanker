@@ -2868,6 +2868,14 @@ export function assessBoxSharingCollaborationData(data: BoxSharingData, options:
     allowlist_truncated: whenAllRead([data.allowlistEntries, data.exemptTargets], allowlistTruncated),
   };
   const allowlistManualEvidence = "Admin Console > Enterprise Settings > Content & Sharing > Collaboration > Allowlisted domains: export the domain list and review each entry for business justification, direction, and age.";
+  // Each listing that stopped short names its own exit, and the remedy follows that exit: a cap stop advises list_limit,
+  // while a repeated marker, a re-served page, or an empty page under a remaining marker sends the reader to the console.
+  const allowlistStops = [
+    ...(data.allowlistEntries.truncated ? [{ note: listingTruncationNote("collaboration allowlist", data.allowlistEntries), remedy: truncationRemedy(data.allowlistEntries, "list_limit") }] : []),
+    ...(data.exemptTargets.truncated ? [{ note: listingTruncationNote("collaboration allowlist exempt user", data.exemptTargets), remedy: truncationRemedy(data.exemptTargets, "list_limit") }] : []),
+  ];
+  const allowlistStopNotes = allowlistStops.map((stop) => stop.note).join(", and ");
+  const allowlistStopRemedies = [...new Set(allowlistStops.map((stop) => stop.remedy))].join(", and ");
   const allowlistReviewReasons = [
     ...(staleEntries.length > 0 ? [`${staleEntries.length} allowlist entries are older than ${staleDays} days`] : []),
     ...(undatedEntries.length > 0 ? [`${undatedEntries.length} allowlist entries have a missing or unparseable created_at (a documented CollaborationAllowlistEntry field), so their age cannot be assessed`] : []),
@@ -2879,7 +2887,7 @@ export function assessBoxSharingCollaborationData(data: BoxSharingData, options:
       : publicDomainEntries.length > 0
         ? finding(5, "fail", `${publicDomainEntries.length} allowlisted domains are public consumer email providers, which effectively allow anyone to collaborate.`, allowlistEvidence)
         : allowlistTruncated
-          ? finding(5, "warn", `The collaboration allowlist collection stopped at the cap (${entries.length} entries and ${countOrUnread(data.exemptTargets, exemptTargets.length)} exempt users retrieved) while Box reported more records, so unreviewed public, stale, or exempt entries may remain; raise list_limit and rerun.`, allowlistEvidence, allowlistManualEvidence)
+          ? finding(5, "warn", `With ${entries.length} entries and ${countOrUnread(data.exemptTargets, exemptTargets.length)} exempt users retrieved, ${allowlistStopNotes}, so unreviewed public, stale, or exempt entries may remain; ${allowlistStopRemedies}.`, allowlistEvidence, allowlistManualEvidence)
         : entries.length === 0
           ? finding(5, externalStatus === "limit_collaboration_to_allowlisted_domains" ? "warn" : "pass", entries.length === 0 && externalStatus === "limit_collaboration_to_allowlisted_domains" ? "The allowlist is empty while collaboration is limited to allowlisted domains." : "No collaboration allowlist entries exist to audit.", allowlistEvidence)
           : allowlistReviewReasons.length > 0
