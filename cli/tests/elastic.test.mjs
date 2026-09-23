@@ -3132,6 +3132,101 @@ test("verdict rule 9: every collected dataset is projected to the fields its ver
   assertCanaryWindowsAbsent(assert, JSON.stringify(plainFindings), [DATA_CARRIERS.outputHostUserinfo], "plain-http verdict payload");
 });
 
+/**
+ * Values planted in the undocumented fields of a realistic Elastic Cloud deployment body (the Cloud ID, the cluster
+ * endpoint host, a user settings override, a plan-level hash, and a non-array resource kind), each random-looking so
+ * every 6-to-24-character window can be asserted absent from what the projection keeps.
+ */
+const CLOUD_DEPLOYMENT_CARRIERS = {
+  cloudId: "d8XwvUz3nRtE5qLbY0hKp2sVmA7cGf4J",
+  endpointHost: "kJ4vNq8ZbT2xLwR6yPd0HsM3cFgE9uAo",
+  userSettings: "Bq7YzT2wLn9KdP4rXs6VhG1jFm3cUe8N",
+  planHash: "W3nKp8ZrTq5xLv2mYb7HdG4sJf9cAe6U",
+  nonArrayKind: "Fy6MtR3vXp9LzQ2wKn8HbJ4dGc7sTa1E",
+};
+const CLOUD_DEPLOYMENT_PLACEHOLDERS = { cloudId: "cloudid", endpointHost: "es-host", userSettings: "principal", planHash: "hash", nonArrayKind: "att" };
+
+/** One deployment the way GET /api/v1/deployments returns it: resources listed per kind as arrays, each element carrying its info, plan, and settings. */
+function cloudDeploymentBody(planted = CLOUD_DEPLOYMENT_CARRIERS) {
+  const endpoint = `${planted.endpointHost}.us-central1.gcp.cloud.es.io`;
+  return {
+    id: "3f2a9c8e7b6d5a4c3b2a1f0e9d8c7b6a",
+    name: "prod-observability",
+    alias: "prod-observability",
+    healthy: true,
+    metadata: { last_modified: "2026-09-01T10:15:00.000Z", system_owned: false, hidden: false, organization_id: "1234567890", owner_id: "42", tags: [{ key: "cloud_id", value: planted.cloudId }] },
+    settings: { traffic_filter_settings: { rulesets: ["ruleset-1"] } },
+    resources: {
+      elasticsearch: [{
+        ref_id: "main-elasticsearch",
+        id: "5c4b3a2f1e0d9c8b7a6f5e4d3c2b1a09",
+        region: "gcp-us-central1",
+        info: {
+          cluster_id: "5c4b3a2f1e0d9c8b7a6f5e4d3c2b1a09",
+          cluster_name: "prod-observability",
+          healthy: true,
+          status: "started",
+          metadata: { cloud_id: `prod-observability:${planted.cloudId}`, endpoint, ports: { http: 9200, https: 9243 }, version: "8.15.2" },
+          plan_info: { current: { plan: { elasticsearch: { version: "8.15.2", user_settings_yaml: `xpack.security.authc.realms.saml.corp.attributes.principal: ${planted.userSettings}` }, cluster_topology: [{ id: "hot_content", size: { value: 8192, resource: "memory" }, zone_count: 2 }] } } },
+          settings: { snapshot: { enabled: true, repository: { reference: { repository_name: "found-snapshots" } } }, metadata: { hash: planted.planHash } },
+        },
+      }],
+      kibana: [{ ref_id: "main-kibana", id: "9a8b7c6d5e4f3a2b1c0d9e8f7a6b5c4d", region: "gcp-us-central1", elasticsearch_cluster_ref_id: "main-elasticsearch", info: { cluster_id: "9a8b7c6d5e4f3a2b1c0d9e8f7a6b5c4d", cluster_name: "prod-observability", healthy: true, status: "started", metadata: { endpoint, ports: { http: 9200, https: 9243 }, version: "8.15.2" } } }],
+      integrations_server: [{ ref_id: "main-integrations_server", id: "1f2e3d4c5b6a79880716253443526170", region: "gcp-us-central1", elasticsearch_cluster_ref_id: "main-elasticsearch", info: { healthy: true, status: "started", metadata: { endpoint } } }],
+      apm: [],
+      enterprise_search: [],
+      appsearch: [],
+      attachments: { id: planted.nonArrayKind, region: "gcp-us-central1" },
+    },
+  };
+}
+
+test("Codex r4082447905: a deployment's per-kind resource arrays are projected element by element, so every resource id and region reaches the cloud_deployments evidence while no undocumented field or planted value does", async () => {
+  const projected = projectDataset("cloud_deployments", [cloudDeploymentBody()]);
+  assert.deepEqual(projected, [{
+    id: "3f2a9c8e7b6d5a4c3b2a1f0e9d8c7b6a",
+    name: "prod-observability",
+    alias: "prod-observability",
+    healthy: true,
+    metadata: { last_modified: "2026-09-01T10:15:00.000Z", system_owned: false, hidden: false },
+    resources: {
+      elasticsearch: [{ ref_id: "main-elasticsearch", id: "5c4b3a2f1e0d9c8b7a6f5e4d3c2b1a09", region: "gcp-us-central1" }],
+      kibana: [{ ref_id: "main-kibana", id: "9a8b7c6d5e4f3a2b1c0d9e8f7a6b5c4d", region: "gcp-us-central1" }],
+      integrations_server: [{ ref_id: "main-integrations_server", id: "1f2e3d4c5b6a79880716253443526170", region: "gcp-us-central1" }],
+      apm: [],
+      enterprise_search: [],
+      appsearch: [],
+    },
+  }], "each array element keeps ref_id, id, and region; the non-array kind, info, plan, settings, and free-form metadata are dropped");
+
+  // Through the real client: the deployment listing is served over the router, collected, written, and zipped.
+  const config = sampleConfig({ maxRetries: 0, cloudApiKey: "cloud-key" });
+  const fixtures = healthyFixtures();
+  fixtures.cloudDeployments = [cloudDeploymentBody()];
+  const client = new ElasticApiClient(config, { fetchImpl: createRouter(healthyRoutes(fixtures)) });
+  const access = await checkElasticAccess(client);
+  const snapshot = await collectElasticSnapshot(client, ["cloud_deployments"], {});
+  const result = await exportElasticAuditBundle(client, config, createTempBase("elastic-cloud-resources-"), {});
+  const files = readBundleFiles(result.outputDir);
+  const entries = readZipEntries(result.zipPath);
+  const written = JSON.parse(files.get("core_data/cloud_deployments.json")).data;
+  assert.deepEqual(written, projected, "the bundle carries the projected deployment, ids and regions included");
+  assert.deepEqual(JSON.parse(entries.get("core_data/cloud_deployments.json")).data, projected);
+  assert.deepEqual(snapshot.cloud_deployments.data, projected);
+  assert.deepEqual(
+    written[0].resources.elasticsearch.map((resource) => [resource.id, resource.region]),
+    [["5c4b3a2f1e0d9c8b7a6f5e4d3c2b1a09", "gcp-us-central1"]],
+  );
+
+  const planted = Object.values(CLOUD_DEPLOYMENT_CARRIERS);
+  const outputs = new Map([...files, ...[...entries].map(([name, text]) => [`zip:${name}`, text]), ["access", JSON.stringify(access)], ["snapshot", JSON.stringify(snapshot)]]);
+  assertCanaryWindowsAbsent(assert, outputs, planted, "cloud deployment output");
+  for (const dropped of ["organization_id", "owner_id", "tags", "traffic_filter_settings", "cluster_name", "plan_info", "user_settings_yaml", "cloud.es.io", "elasticsearch_cluster_ref_id", "attachments"]) {
+    assert.ok(!files.get("core_data/cloud_deployments.json").includes(dropped), `undocumented field ${dropped} is not written`);
+  }
+  assertCanaryFixture(assert, planted, new Map([["deployment body", JSON.stringify(cloudDeploymentBody(CLOUD_DEPLOYMENT_PLACEHOLDERS))], ...outputs]), "cloud deployment carriers");
+});
+
 test("verdict rule 9: reduceUrlValueToOrigin reduces a value that is one URL to scheme and host and leaves a URL inside free text to the shared pass, which redactSensitiveValues applies to every collected string", () => {
   assert.equal(reduceUrlValueToOrigin("https://user:pw@host.example.com:9243/path/x?token=abc#frag"), "https://host.example.com:9243");
   assert.equal(reduceUrlValueToOrigin("  ldaps://svc:pw@ldap.example.com:636 "), "ldaps://ldap.example.com:636");

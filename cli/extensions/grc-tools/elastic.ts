@@ -987,14 +987,26 @@ function projectAlertingRule(rule: JsonRecord): JsonRecord {
   };
 }
 
+/**
+ * Elastic Cloud lists a deployment's resources per kind as arrays (`elasticsearch: [{ ref_id, id, region, info, ... }]`,
+ * likewise kibana, apm, integrations_server, enterprise_search, appsearch); each element keeps its documented identity
+ * fields and a kind whose value is not an array is dropped.
+ */
+function projectCloudResources(resources: JsonRecord): JsonRecord {
+  const output: JsonRecord = {};
+  for (const [kind, value] of Object.entries(resources)) {
+    if (Array.isArray(value)) output[kind] = asObjectArray(value).map((resource) => pick(resource, ["ref_id", "id", "region"]));
+  }
+  return output;
+}
+
 function projectCloudDeployment(deployment: JsonRecord): JsonRecord {
   const metadata = asObject(deployment.metadata);
+  const resources = asObject(deployment.resources);
   return {
     ...pick(deployment, ["id", "name", "alias", "healthy"]),
     ...(metadata ? { metadata: pick(metadata, ["last_modified", "system_owned", "hidden"]) } : {}),
-    ...(asObject(deployment.resources)
-      ? { resources: projectRecordMap(deployment.resources, (kind) => asObjectArray(kind).map((resource) => pick(resource, ["ref_id", "id", "region"])) as unknown as JsonRecord) }
-      : {}),
+    ...(resources ? { resources: projectCloudResources(resources) } : {}),
   };
 }
 
