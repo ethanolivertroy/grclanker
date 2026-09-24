@@ -23,11 +23,14 @@ import {
   duoFixedTexts,
   projectCollectionStatus,
   redactBypassCodeRecords,
+  redactCarrierText,
   redactErrorText,
+  redactFields,
   redactIntegrationRecords,
   resolveDuoConfiguration,
   resolveSecureOutputPath,
   runDuoAccessCheck,
+  scrubSnapshotValue,
 } from "../dist/extensions/grc-tools/duo.js";
 import { readBundleFiles, readZipEntries } from "./helpers/bundle-contents.mjs";
 import {
@@ -54,7 +57,30 @@ import {
   parserSnippetBody,
   shortBodyResponse,
 } from "./helpers/error-canaries.mjs";
-import { assertFixedTextsSurvive, assertMustKeepRows, assertMustRedactRowsBesideMustKeep } from "./helpers/redaction-table.mjs";
+import {
+  BEARER_ID_CARRIER_CONTROL_ROWS,
+  BEARER_ID_VALUES,
+  DEPTH_CONTROL,
+  ESCAPED_HEADER_LINES,
+  JSON_ESCAPES,
+  QUOTED_NON_CREDENTIAL_GROUP,
+  assertAuthorizationParameterRows,
+  assertBearerIdKeyRows,
+  assertBearerIdSnapshotKeys,
+  assertCarrierTextScrub,
+  assertChallengeProofRows,
+  assertCredentialPairValuesRemoved,
+  assertDepthControl,
+  assertDepthControlOutputs,
+  assertEscapedHeaderCarriers,
+  assertFixedTextsSurvive,
+  assertIdentifierKeyRows,
+  assertFlagAndPathPairRows,
+  assertUrlUserinfoBoundaryRows,
+  assertMustKeepRows,
+  assertMustRedactRowsBesideMustKeep,
+  withPlantedRoutes,
+} from "./helpers/redaction-table.mjs";
 
 function createTempBase(prefix) {
   return mkdtempSync(join(tmpdir(), prefix));
@@ -2042,9 +2068,157 @@ test("rule 9 must-keep and must-redact table (addendum 7): every endpoint path, 
       values: duoFixedTexts(),
       sentence: (value) => `DUO-AUTH-006 ${value}`,
     },
+    QUOTED_NON_CREDENTIAL_GROUP,
   ];
   assertMustKeepRows(assert, redactErrorText, groups);
   assertMustRedactRowsBesideMustKeep(assert, redactErrorText, groups);
+});
+
+test("rule 9 escapes (reviewer D round 5 escapes): a header carrier after a two-character or six-character JSON escape is removed exactly as at a line start, for the nineteen header lines the integrations send, the six escapes, and five forms, at 6-to-24 windows, direct and through the client's JSON error path", async () => {
+  const judged = assertEscapedHeaderCarriers(assert, redactErrorText);
+  assert.equal(judged, ESCAPED_HEADER_LINES.length * JSON_ESCAPES.length * 5);
+  assert.equal(ESCAPED_HEADER_LINES.length, 19);
+
+  // The two classes reviewer D found leaking, carried by an error message on a probed surface: a later cookie
+  // pair whose name has no credential word, and X-Auth-Key with an alphabetic value, each after a two-character
+  // and a six-character escape.
+  const tracker = "Rk7mVq2Zt9Xw4Ly6Pn8Hc3Jb";
+  const globalKey = "prodkeyQz8Nv3Tm5Rk2Wy7";
+  const message = `request failed\\nCookie: theme=dark; my.tracker=${tracker}\\u000aX-Auth-Key: ${globalKey}`;
+  assert.ok(message.includes("\\n") && message.includes("\\u000a"), "the message carries the escapes as backslash text");
+  const expectedTail = "\\nCookie: [REDACTED]\\u000aX-Auth-Key: [REDACTED]";
+  const config = createSampleConfig();
+  const surface = [...DUO_ACCESS_PROBE_PATHS][0];
+  const respond = () => new Response(JSON.stringify({ stat: "FAIL", code: 40301, message, message_detail: "" }), { status: 403, statusText: "Forbidden", headers: { "content-type": "application/json" } });
+  const client = new DuoAuditorClient(config, { fetchImpl: routedFetch({ ...healthyDuoRoutes(), [surface]: respond }) });
+  const access = await runDuoAccessCheck(client, config);
+  const probe = access.probes.find((entry) => entry.path === surface);
+  assert.ok(probe && probe.status !== "ok", `the probe for ${surface} is not ok`);
+  assert.ok(probe.detail.includes(expectedTail), `both carriers are removed whole after their escapes: ${probe.detail}`);
+  assertNoCanaryWindows(assert, access, [tracker, globalKey], "check_access after escaped headers");
+});
+
+test("rule 9 depth control (reviewer D round 5 depth control): every string a snapshot keeps passes the data-side carrier scrub at every depth in place, a credential-keyed value is the marker in place with its benign sibling kept, and a container nested past the cap of 32 is the marker, on redactFields, redactIntegrationRecords, and scrubSnapshotValue and end to end through every healthy route into the bundle, the zip, and every tool payload", async () => {
+  assert.equal(DEPTH_CONTROL.cap, 32);
+  // The exported walkers: level k of the tree handed to the walker sits at depth k, so levels 1 to 32 are in place and level 33 is the marker.
+  assertDepthControl(assert, (tree) => redactFields(tree, /^(secret_key|secretkey|skey)$/i), { label: "duo.redactFields (integration pattern)" });
+  assertDepthControl(assert, (tree) => redactIntegrationRecords([tree])[0], { label: "duo.redactIntegrationRecords", rootDepth: 2 });
+  assertDepthControl(assert, scrubSnapshotValue, { label: "duo.scrubSnapshotValue" });
+  assertDepthControl(assert, (tree) => scrubSnapshotValue({ response: [tree] }).response[0], { label: "duo.scrubSnapshotValue under an envelope", rootDepth: 3 });
+  // redactBypassCodeRecords keys on `code`, not `secret_key`, so only the string half and the cap apply to it.
+  const bypassWalked = redactBypassCodeRecords([{ code: "123456", note: `Authorization: Bearer ${DEPTH_CONTROL.carrierCanary}` }])[0];
+  assert.deepEqual(bypassWalked, { code: "[REDACTED]", note: "Authorization: Bearer [REDACTED]" });
+  // The string half on its own: carriers go, identifiers stay, the configured skey goes in every form.
+  const config = createSampleConfig();
+  new DuoAuditorClient(config, { fetchImpl: routedFetch(healthyDuoRoutes()) });
+  assertCarrierTextScrub(assert, redactCarrierText, { label: "duo.redactCarrierText", configuredSecret: config.skey });
+
+  // End to end: the tree planted on every envelope and in every record and nested record of every healthy route.
+  // Duo keeps its core_data records whole (the Admin API returns arbitrary nested values in policies and logs), so
+  // the files carry the tree as data with the cap counted from the file's root: in a record list the tree's level 1
+  // sits at depth 3 (list, record, member) and level 30 is the last in place; in an object file at depth 2 and level
+  // 31 is. The datasets a collector returns are the same snapshots, so no function result carries a canary either.
+  const planted = { count: 0 };
+  const client = new DuoAuditorClient(config, { fetchImpl: routedFetch(withPlantedRoutes(healthyDuoRoutes(), { planted })) });
+  const access = await runDuoAccessCheck(client, config);
+  const datasets = [
+    await collectDuoAuthenticationData(client, config.lookbackDays),
+    await collectDuoAdminAccessData(client, config.lookbackDays),
+    await collectDuoIntegrationData(client),
+    await collectDuoMonitoringData(client, config.lookbackDays),
+  ];
+  const assessments = [
+    assessDuoAuthentication(datasets[0], config),
+    assessDuoAdminAccess(datasets[1], config),
+    assessDuoIntegrations(datasets[2], config),
+    assessDuoMonitoring(datasets[3], config),
+  ];
+  const exported = await exportDuoAuditBundle(client, config, createTempBase("grclanker-duo-depth-"));
+  assert.ok(planted.count >= Object.keys(healthyDuoRoutes()).length, `the fixture planted the tree into ${planted.count} objects`);
+  assert.equal(exported.errorCount, 0, "the planted tree causes no read to fail");
+  assert.ok(access.probes.every((probe) => probe.status === "ok"), "every probe reads the planted fixture");
+  const files = readBundleFiles(exported.outputDir);
+  const carrying = assertDepthControlOutputs(
+    assert,
+    { files, zipEntries: readZipEntries(exported.zipPath), outputs: [access, ...datasets, ...assessments] },
+    { label: "duo", treeExpected: true },
+  );
+  for (const [name, levelAtCap] of [["core_data/users.json", DEPTH_CONTROL.cap - 2], ["core_data/settings.json", DEPTH_CONTROL.cap - 1]]) {
+    assert.ok(carrying.includes(`file ${name}`), `${name} carries the tree with the cap applied`);
+    assert.ok(carrying.some((entry) => entry.startsWith("zip ") && entry.endsWith(name)), `the zip entry for ${name} carries it too`);
+    const text = files.get(name);
+    assert.ok(text.includes(`"benign-note-${levelAtCap}"`) && !text.includes(`"benign-note-${levelAtCap + 1}"`), `${name}: level ${levelAtCap} is the last in place`);
+  }
+  assert.ok(!JSON.stringify(assessments).includes("benign-note-"), "no assessment copies a record tree into its evidence");
+  // The dataset a collector returns is already the snapshot: the same tree, capped, with no canary.
+  const settingsDataset = datasets[0].settings.data;
+  assert.equal(settingsDataset.x_deep_probe.secret_key, "[REDACTED]");
+  assert.equal(settingsDataset.x_deep_probe.detail, "Authorization: Bearer [REDACTED]");
+});
+
+test("rule 9 credential-named pairs (reviewer D round 5 baseline): a value under a credential-named key is removed whatever its shape and length, unquoted as well as quoted, in every form the pair takes, while identifier-named keys keep their values unless the value's own shape removes it", () => {
+  assertCredentialPairValuesRemoved(assert, redactErrorText);
+  assertIdentifierKeyRows(assert, redactErrorText);
+  assertFlagAndPathPairRows(assert, redactErrorText);
+  // The retired value-shape test would have kept every one of these; the pair rule no longer asks.
+  for (const [text, expected] of [
+    ["password=letmein", "password=[REDACTED]"],
+    ["DB_PASSWORD=Sunshine", "DB_PASSWORD=[REDACTED]"],
+    ["AZURE_CLIENT_SECRET: abc12", "AZURE_CLIENT_SECRET: [REDACTED]"],
+    ["DUO_SKEY=p@ss", "DUO_SKEY=[REDACTED]"],
+    ["DUO_IKEY=DIXXXXXXXXXXXXXXXXXX", "DUO_IKEY=[REDACTED]"],
+    ["DUO_IKEY=letmein", "DUO_IKEY=[REDACTED]"],
+    ["ikey: monkey", "ikey: [REDACTED]"],
+    ['{"DUO_IKEY":"Sunshine"}', '{"DUO_IKEY":"[REDACTED]"}'],
+    ['"ikey": "abc12"', '"ikey": "[REDACTED]"'],
+    ["Authorization: Basic letmein", "Authorization: Basic [REDACTED]"],
+    ["token: value shape", "token: [REDACTED] shape"],
+  ]) {
+    assert.equal(redactErrorText(text), expected, `credential-named pair: ${text}`);
+  }
+  // A PascalCase error code that ends in a credential word is prose, and a bare scheme word is not a pair; a path segment
+  // ending in a credential word is one (assertFlagAndPathPairRows).
+  for (const text of [
+    "InvalidAuthenticationToken: Access token has expired. Basic authentication is disabled for this tenant.",
+    "ExpiredToken: The security token included in the request is expired",
+    "sent as Authorization: Bearer) or as X-Auth-Key",
+    "oauth: invalid_grant was returned",
+  ]) {
+    assert.equal(redactErrorText(text), text, `prose beside a credential word survives: ${text}`);
+  }
+});
+
+test("rule 9 URL userinfo boundary (CodeRabbit on #76 at b0ef16f; the raw ? or # inside a password from the merge-first delta against main on 7c7bf86): an `@` inside a query or a fragment is not a userinfo boundary when the authority before it is a host, so the real host stays and a query and a fragment each become the marker whole, while an authority that is not host[:port] followed by an `@` is userinfo, so a password holding a raw `?` or `#` goes whole, on the error sink, the data-string sink, and a snapshot string", () => {
+  assertUrlUserinfoBoundaryRows(assert, redactErrorText, { label: "duo.redactErrorText" });
+  assertUrlUserinfoBoundaryRows(assert, redactCarrierText, { label: "duo.redactCarrierText" });
+  assertUrlUserinfoBoundaryRows(assert, (text) => scrubSnapshotValue(text), { label: "duo.scrubSnapshotValue" });
+});
+test("rule 9 Authorization parameter lists (CodeRabbit on #81, discussion_r4081238237): under an Authorization or Proxy-Authorization scheme every parameter value that is a proof is removed whatever its name, quoted or bare (Snowflake Token=\"...\", Bearer value=\"...\", Digest response, nonce, cnonce, and opaque, OAuth 1.0 oauth_token, oauth_signature, and oauth_nonce), while realm, username, uri, qop, nc, the SigV4 scope and signed headers, a WWW-Authenticate challenge, and Bearer realm=\"api\" in prose stay, on the error sink, the data-string sink, and a snapshot string, bare, inside a sentence, after a JSON escape, and inside a JSON string", () => {
+  assertAuthorizationParameterRows(assert, redactErrorText, { label: "duo.redactErrorText" });
+  assertAuthorizationParameterRows(assert, redactCarrierText, { label: "duo.redactCarrierText" });
+  assertAuthorizationParameterRows(assert, (text) => scrubSnapshotValue(text), { label: "duo.scrubSnapshotValue" });
+});
+test("rule 9 challenge proofs (CodeRabbit on #81, discussion_r4081776771): a parameter list that is not under an Authorization key (a WWW-Authenticate challenge, Digest realm=\"api\", ... in prose, a bare realm=\"api\", nonce=\"n\", response=\"...\" data value) is not exempt because it is shaped like a challenge: the value of a parameter named response, signature, oauth_signature, mac, or sig goes, quoted at any depth or bare, before or after the realm, while realm, qop, algorithm, error, and error_description keep theirs, a proof-free challenge passes unchanged, and a response or mac field outside such a list is data, on the error sink, the data-string sink, and a snapshot string, bare, inside a sentence, after a JSON escape, and inside a JSON string", () => {
+  assertChallengeProofRows(assert, redactErrorText, { label: "duo.redactErrorText" });
+  assertChallengeProofRows(assert, redactCarrierText, { label: "duo.redactCarrierText" });
+  assertChallengeProofRows(assert, (text) => scrubSnapshotValue(text), { label: "duo.scrubSnapshotValue" });
+});
+test("rule 9 bearer-id override (CodeRabbit r4077259415 on #78): a key ending in secret_id or naming a session id is a credential key despite its id suffix, so a Vault AppRole secret id goes whatever its shape, a UUID included, through the error sink, the data-string sink, the snapshot walker, and the thrown error, while AZURE_TENANT_ID=<uuid> and the other identifier keys keep their values", async () => {
+  assertBearerIdKeyRows(assert, redactErrorText);
+  assertBearerIdKeyRows(assert, redactCarrierText, { controls: BEARER_ID_CARRIER_CONTROL_ROWS });
+  assertBearerIdSnapshotKeys(assert, scrubSnapshotValue);
+  const [uuid, random] = BEARER_ID_VALUES;
+  const tenant = "3f2504e0-4f89-11d3-9a0c-0305e82c3301";
+  const echoed = `VAULT_SECRET_ID=${uuid} and role_secret_id: ${random} were rejected; AZURE_TENANT_ID=${tenant} was accepted`;
+  const expected = `VAULT_SECRET_ID=[REDACTED] and role_secret_id: [REDACTED] were rejected; AZURE_TENANT_ID=${tenant} was accepted`;
+  const client = new DuoAuditorClient(createSampleConfig(), {
+    fetchImpl: async () => new Response(JSON.stringify({ stat: "FAIL", code: 40301, message: "Access forbidden", message_detail: echoed }), { status: 403, statusText: "Forbidden", headers: { "content-type": "application/json" } }),
+  });
+  await assert.rejects(() => client.getSettings(), (error) => {
+    assert.equal(error.message, `Duo API request failed for /admin/v1/settings (403 Forbidden): Access forbidden: ${expected}`);
+    assertNoCanaryWindows(assert, error.message, [uuid, random], "DuoApiError message");
+    return true;
+  });
 });
 
 const DUO_ACCESS_PROBE_PATHS = new Set([

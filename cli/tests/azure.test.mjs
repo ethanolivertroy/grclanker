@@ -28,13 +28,16 @@ import {
   isExposedAdminRule,
   parseNetworkWatcherId,
   projectCredentialCarrier,
+  redactCarrierText,
   resolveAzureCloud,
   resolveAzureConfiguration,
   redactErrorText,
   resolveSecureOutputPath,
+  scrubSnapshotValue,
   toPage,
 } from "../dist/extensions/grc-tools/azure.js";
 import {
+  CANARY,
   CANARY_URL,
   CANARY_VALUES,
   ENCODED_FORM_SECRET,
@@ -57,7 +60,30 @@ import {
   parserSnippetBody,
   shortBodyResponse,
 } from "./helpers/error-canaries.mjs";
-import { assertFixedTextsSurvive, assertMustKeepRows, assertMustRedactRowsBesideMustKeep } from "./helpers/redaction-table.mjs";
+import {
+  BEARER_ID_CARRIER_CONTROL_ROWS,
+  BEARER_ID_VALUES,
+  DEPTH_CONTROL,
+  ESCAPED_HEADER_LINES,
+  JSON_ESCAPES,
+  QUOTED_NON_CREDENTIAL_GROUP,
+  assertAuthorizationParameterRows,
+  assertBearerIdKeyRows,
+  assertBearerIdSnapshotKeys,
+  assertCarrierTextScrub,
+  assertChallengeProofRows,
+  assertCredentialPairValuesRemoved,
+  assertDepthControl,
+  assertDepthControlOutputs,
+  assertEscapedHeaderCarriers,
+  assertFixedTextsSurvive,
+  assertIdentifierKeyRows,
+  assertFlagAndPathPairRows,
+  assertUrlUserinfoBoundaryRows,
+  assertMustKeepRows,
+  assertMustRedactRowsBesideMustKeep,
+  withPlantedRoutes,
+} from "./helpers/redaction-table.mjs";
 import { getRegisteredToolSummaries, groupRegisteredTools } from "../dist/pi/tool-catalog.js";
 import { readBundleFiles, readZipEntries } from "./helpers/bundle-contents.mjs";
 
@@ -319,7 +345,7 @@ test("AzureAuditorClient acquires tokens via the documented client credentials g
 });
 
 // Prototype members that do not issue a Graph or ARM request; every other client method must appear in the URL assertions below.
-const NON_REQUEST_CLIENT_MEMBERS = new Set(["constructor", "getToken", "parseJsonBody", "getResolvedConfig", "getNow", "getCloud", "requestJson", "collectPages", "collectGraph", "collectArm", "graph", "arm"]);
+const NON_REQUEST_CLIENT_MEMBERS = new Set(["constructor", "getToken", "parseJsonBody", "send", "getResolvedConfig", "getNow", "getCloud", "requestJson", "collectPages", "collectGraph", "collectArm", "graph", "arm"]);
 
 test("AzureAuditorClient sends the documented request URL and API version for every request method", async () => {
   const requests = [];
@@ -470,6 +496,215 @@ test("rule 10: a next link that repeats or arrives with an empty page exits as t
   assert.equal(guardrails.findings.find((item) => item.id === "AZURE-SUB-01").status, "warn");
 });
 
+// A next link the server controls: its path segment, its query token, a userinfo password, the id of the only
+// item the foreign page would serve, and two name-shaped parts that the token scrub would keep, so they vanish only
+// when nothing echoes the link itself.
+const NEXT_LINK_PATH_CANARY = "Hq7vTm3KpXw9ZbLn2Rf";
+const NEXT_LINK_QUERY_CANARY = "Wn4kJd8VqRz2TxPy6Mc";
+const NEXT_LINK_USERINFO_CANARY = "Fy9bNs2LtKp7WqXm4Vd";
+const FOREIGN_PAGE_ITEM_CANARY = "Zc3tRv8HnQm5KwYp7Lb";
+// Name-shaped and sharing no window with the origins the refusal reason names (the reason names the link's origin,
+// never its path or query).
+const NEXT_LINK_PATH_NAME = "planted-hop-segment";
+const NEXT_LINK_QUERY_NAME = "planted-query-marker";
+const NEXT_LINK_CANARIES = Object.freeze([NEXT_LINK_PATH_CANARY, NEXT_LINK_QUERY_CANARY, NEXT_LINK_USERINFO_CANARY, FOREIGN_PAGE_ITEM_CANARY, NEXT_LINK_PATH_NAME, NEXT_LINK_QUERY_NAME]);
+const FOREIGN_NEXT_HOST = "offsite.example.net";
+const AZURE_CONFIGURED_ORIGINS = new Set(["https://login.microsoftonline.com", "https://graph.microsoft.com", "https://management.azure.com"]);
+const NEXT_LINK_REFUSED_TAIL = "so the link was not followed and no request was made for it";
+
+function escapeRegExp(text) {
+  return text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+/**
+ * The truncation reason for a link that resolved onto `origin` off the `configured` one: it names both origins
+ * (harness revision 3, class 8), so the operator sees where the API tried to send the client, and nothing else of
+ * the link.
+ */
+function foreignOriginReason(origin, configured) {
+  return new RegExp(`^the API advertised a next page on ${escapeRegExp(origin)} rather than the configured origin ${escapeRegExp(configured)}, ${escapeRegExp(NEXT_LINK_REFUSED_TAIL)}$`);
+}
+function userinfoReason(configured) {
+  return new RegExp(`^the API advertised a next page link carrying userinfo for the configured origin ${escapeRegExp(configured)}, ${escapeRegExp(NEXT_LINK_REFUSED_TAIL)}$`);
+}
+function unparseableReason(configured) {
+  return new RegExp(`^the API advertised a next page link that could not be parsed against the configured origin ${escapeRegExp(configured)}, ${escapeRegExp(NEXT_LINK_REFUSED_TAIL)}$`);
+}
+
+/**
+ * Every shape a server-supplied next link can take off the configured origin, each with the refusal reason its
+ * truncation must carry, plus the two same-origin controls (absolute, and relative to the base) that must still
+ * be followed. `legitUrl` is the first page's URL; `extraQuery` carries ARM's api-version.
+ */
+function nextLinkVariants(legitUrl, queryKey, extraQuery = "") {
+  const legit = new URL(legitUrl);
+  const path = `/${NEXT_LINK_PATH_CANARY}/${NEXT_LINK_PATH_NAME}/page2`;
+  const query = `${queryKey}=${NEXT_LINK_QUERY_CANARY}&hop=${NEXT_LINK_QUERY_NAME}${extraQuery}`;
+  return {
+    refused: {
+      host: [`https://${FOREIGN_NEXT_HOST}${path}?${query}`, foreignOriginReason(`https://${FOREIGN_NEXT_HOST}`, legit.origin)],
+      port: [`${legit.protocol}//${legit.hostname}:8443${path}?${query}`, foreignOriginReason(`${legit.protocol}//${legit.hostname}:8443`, legit.origin)],
+      scheme: [`http://${legit.hostname}${path}?${query}`, foreignOriginReason(`http://${legit.hostname}`, legit.origin)],
+      userinfo: [`https://intruder:${NEXT_LINK_USERINFO_CANARY}@${legit.hostname}${path}?${query}`, userinfoReason(legit.origin)],
+      protocol_relative: [`//${FOREIGN_NEXT_HOST}${path}?${query}`, foreignOriginReason(`https://${FOREIGN_NEXT_HOST}`, legit.origin)],
+      unparseable: [`https://[${NEXT_LINK_PATH_CANARY}${path}?${query}`, unparseableReason(legit.origin)],
+    },
+    followed: {
+      absolute_same_origin: `${legit.origin}${legit.pathname}?${queryKey}=ctrl-page-2${extraQuery}`,
+      relative_same_origin: `${legit.pathname}?${queryKey}=ctrl-page-2${extraQuery}`,
+      // The URL parser reads the scheme and the host case-insensitively, so these name the configured origin too.
+      uppercase_scheme_same_origin: `${legit.origin.toUpperCase()}${legit.pathname}?${queryKey}=ctrl-page-2${extraQuery}`,
+      case_differing_host_same_origin: `${legit.protocol}//${legit.hostname.toUpperCase()}${legit.pathname}?${queryKey}=ctrl-page-2${extraQuery}`,
+    },
+  };
+}
+
+function requestOrigin(url) {
+  try {
+    return new URL(url).origin;
+  } catch {
+    return "unparseable";
+  }
+}
+
+/**
+ * Transport for a planted next link: the first page carries the link, a same-origin control page serves one control
+ * item, and any request that leaves the configured origins is answered with a page carrying the foreign item so a
+ * followed link shows up as inventory poisoning as well as in the request log.
+ */
+function plantedNextLinkFetch(firstPagePath, linkField, link, calls) {
+  return async (url, init) => {
+    calls.push({ url, authorization: init?.headers?.Authorization ?? null });
+    if (!AZURE_CONFIGURED_ORIGINS.has(requestOrigin(url))) {
+      return new Response(JSON.stringify({ value: [{ id: FOREIGN_PAGE_ITEM_CANARY, displayName: FOREIGN_PAGE_ITEM_CANARY, properties: { roleDefinitionId: FOREIGN_PAGE_ITEM_CANARY, principalType: "User" } }] }), { status: 200 });
+    }
+    const parsed = new URL(url);
+    if (parsed.searchParams.get("$skiptoken") === "ctrl-page-2") {
+      return new Response(JSON.stringify({ value: [{ id: "ctrl-page-2-item", displayName: "control", properties: { roleDefinitionId: "role-reader", principalType: "User" } }] }), { status: 200 });
+    }
+    if (parsed.pathname === firstPagePath) {
+      return new Response(JSON.stringify({ value: [{ id: "page-1-item", properties: { roleDefinitionId: "role-owner", principalType: "User" } }], [linkField]: link }), { status: 200 });
+    }
+    throw new Error(`Unexpected Azure request: ${parsed.pathname}`);
+  };
+}
+
+test("rule 9: a next link that leaves the configured origin is refused before any request is made for it, recorded as the page's truncation reason, and never echoed", async () => {
+  const graphFirstPage = "https://graph.microsoft.com/v1.0/identity/conditionalAccess/policies";
+  const armFirstPage = "https://management.azure.com/subscriptions/sub-123/providers/Microsoft.Authorization/roleAssignments";
+  const walks = [
+    ["Graph @odata.nextLink", graphFirstPage, "@odata.nextLink", (client) => client.listConditionalAccessPolicies(), ""],
+    ["ARM nextLink", armFirstPage, "nextLink", (client) => client.listRoleAssignments(), `&api-version=${AZURE_ARM_API_VERSIONS.roleAssignments}`],
+  ];
+  for (const [walk, firstPage, linkField, list, extraQuery] of walks) {
+    const variants = nextLinkVariants(firstPage, "$skiptoken", extraQuery);
+    for (const [variant, [link, reason]] of Object.entries(variants.refused)) {
+      const label = `${walk} (${variant})`;
+      const calls = [];
+      const client = new AzureAuditorClient(sampleConfig(), { fetchImpl: plantedNextLinkFetch(new URL(firstPage).pathname, linkField, link, calls), now: () => NOW });
+      const page = await list(client);
+      assert.equal(calls.length, 1, `${label}: only the first page is requested; the planted link never reaches the transport`);
+      assert.equal(new URL(calls[0].url).pathname, new URL(firstPage).pathname, `${label}: the one request is the first page`);
+      assert.deepEqual(page.items.map((item) => item.id), ["page-1-item"], `${label}: the inventory is the first page only, nothing merged from the link`);
+      assert.equal(page.truncated, true, `${label}: the walk is reported truncated`);
+      assert.equal(page.seen, 1, `${label}: seen counts the first page`);
+      assert.match(page.truncation ?? "", reason, `${label}: the truncation reason names the origins involved and states that no request left`);
+      assertNoCanaryWindows(assert, page, NEXT_LINK_CANARIES, `${label} page`);
+      assert.ok(!JSON.stringify({ ...page, truncation: undefined }).includes(FOREIGN_NEXT_HOST), `${label}: outside the reason, nothing names the link's host`);
+    }
+    for (const [variant, link] of Object.entries(variants.followed)) {
+      const label = `${walk} (${variant})`;
+      const calls = [];
+      const client = new AzureAuditorClient(sampleConfig(), { fetchImpl: plantedNextLinkFetch(new URL(firstPage).pathname, linkField, link, calls), now: () => NOW });
+      const page = await list(client);
+      assert.equal(calls.length, 2, `${label}: the same-origin control page is followed`);
+      assert.equal(new URL(calls[1].url).origin, new URL(firstPage).origin, `${label}: the control request stays on the configured origin`);
+      assert.equal(new URL(calls[1].url).pathname, new URL(firstPage).pathname, `${label}: the control link is requested as the URL it is`);
+      assert.equal(new URL(calls[1].url).searchParams.get("$skiptoken"), "ctrl-page-2", `${label}: the control link is requested as served (a relative link resolves onto the base)`);
+      assert.deepEqual(page.items.map((item) => item.id), ["page-1-item", "ctrl-page-2-item"], `${label}: both pages are merged`);
+      assert.equal(page.truncated, false, `${label}: a complete same-origin walk is not truncated`);
+      assert.equal(page.truncation, undefined, `${label}: a complete walk carries no reason`);
+    }
+  }
+
+  // The rule also sits in front of the transport itself, so a URL that reaches the request path from anywhere else
+  // is refused with fixed text naming the configured base, not the target, and no request (token included) is made.
+  let transportCalls = 0;
+  const guarded = new AzureAuditorClient(sampleConfig(), { fetchImpl: async () => { transportCalls += 1; return new Response("{}", { status: 200 }); }, now: () => NOW });
+  for (const [resource, base] of [["graph", "https://graph.microsoft.com"], ["management", "https://management.azure.com"]]) {
+    const foreign = `https://${FOREIGN_NEXT_HOST}/${NEXT_LINK_PATH_CANARY}?$skiptoken=${NEXT_LINK_QUERY_CANARY}`;
+    const error = await guarded.requestJson(foreign, resource).then(() => undefined, (thrown) => thrown);
+    assert.ok(error instanceof AzureApiError, `${resource}: the refusal is an AzureApiError`);
+    assert.equal(error.message, "Request refused: the target is not on the configured origin, so no request was made.");
+    assert.equal(error.url, base, `${resource}: the error names the configured base, not the target`);
+    assert.equal(error.status, undefined, `${resource}: no HTTP status, because no request was made`);
+    assertNoCanaryWindows(assert, { message: error.message, url: error.url }, NEXT_LINK_CANARIES, `${resource} refusal`);
+  }
+  assert.equal(transportCalls, 0, "a refused target never reaches the transport");
+  assert.ok(azureFixedTexts().includes("Request refused: the target is not on the configured origin, so no request was made."), "the refusal text is in the fixed-text list");
+});
+
+test("rule 9: a refused next link on a probed surface leaves the access check, the verdicts, and the bundle without any part of the link, with the count as a floor and the reason recorded", async () => {
+  const config = canaryConfig();
+  const graphVariants = nextLinkVariants("https://graph.microsoft.com/v1.0/identity/conditionalAccess/policies", "$skiptoken");
+  const armVariants = nextLinkVariants("https://management.azure.com/subscriptions/sub-123/providers/Microsoft.Authorization/roleAssignments", "$skiptoken", `&api-version=${AZURE_ARM_API_VERSIONS.roleAssignments}`);
+  const [graphLink] = graphVariants.refused.host;
+  const [armLink] = armVariants.refused.userinfo;
+  const routes = {
+    ...healthyAzureRoutes(),
+    "/v1.0/identity/conditionalAccess/policies": () => new Response(JSON.stringify({ value: [CA_MFA, CA_LEGACY, CA_SIGNIN_RISK, CA_USER_RISK, CA_COMPLIANT_DEVICE], "@odata.nextLink": graphLink }), { status: 200 }),
+    [`${AZURE_SUB}/providers/Microsoft.Authorization/roleAssignments`]: () => new Response(JSON.stringify({ value: [{ properties: { roleDefinitionId: "role-owner", principalType: "User" } }], nextLink: armLink }), { status: 200 }),
+  };
+  const foreignRequests = [];
+  const routed = azureRoutedFetch(routes);
+  const fetchImpl = async (url, init) => {
+    if (!AZURE_CONFIGURED_ORIGINS.has(requestOrigin(url))) {
+      foreignRequests.push({ url, credential: Boolean(init?.headers?.Authorization) });
+      return new Response(JSON.stringify({ value: [{ id: FOREIGN_PAGE_ITEM_CANARY, properties: { roleDefinitionId: FOREIGN_PAGE_ITEM_CANARY, principalType: "User" } }] }), { status: 200 });
+    }
+    return routed(url, init);
+  };
+  const client = new AzureAuditorClient(config, { fetchImpl, now: () => NOW });
+  const { access, assessments, exported } = await runEveryAzureTool(client, config, createTempBase("grclanker-azure-next-link-"));
+
+  assert.deepEqual(foreignRequests, [], "no request leaves the configured origins, credentialed or not");
+  const conditionalAccess = access.surfaces.find((entry) => entry.name === "conditional_access");
+  assert.equal(conditionalAccess.status, "readable");
+  assert.equal(conditionalAccess.count, 5, "the probe count is the first page, a floor");
+  assert.equal(conditionalAccess.truncated, true);
+  const graphReason = `the API advertised a next page on https://${FOREIGN_NEXT_HOST} rather than the configured origin https://graph.microsoft.com, ${NEXT_LINK_REFUSED_TAIL}`;
+  const armReason = `the API advertised a next page link carrying userinfo for the configured origin https://management.azure.com, ${NEXT_LINK_REFUSED_TAIL}`;
+  assert.equal(conditionalAccess.truncation, graphReason);
+  const roleAssignments = access.surfaces.find((entry) => entry.name === "role_assignments");
+  assert.deepEqual({ status: roleAssignments.status, count: roleAssignments.count, truncated: roleAssignments.truncated }, { status: "readable", count: 1, truncated: true });
+  assert.equal(roleAssignments.truncation, armReason);
+  assert.ok(access.notes.some((note) => note.includes(`Probe counts for conditional_access are lower bounds, not inventory sizes: ${graphReason}`)), `the access note carries the reason: ${JSON.stringify(access.notes)}`);
+  assert.ok(access.notes.some((note) => note.includes(`Probe counts for role_assignments are lower bounds, not inventory sizes: ${armReason}`)), `the access note carries the userinfo reason: ${JSON.stringify(access.notes)}`);
+  assert.ok(!access.notes.some((note) => /probe page cap/.test(note)), "a refused link is not described as a page cap");
+  assertNoCanaryWindows(assert, access, NEXT_LINK_CANARIES, "check_access");
+
+  const identity = assessments.find((assessment) => assessment.findings.some((item) => item.id === "AZURE-ID-01"));
+  const mfaBaseline = identity.findings.find((item) => item.id === "AZURE-ID-01");
+  assert.equal(mfaBaseline.status, "warn", "a verdict over the truncated page is capped at warn");
+  assert.ok(mfaBaseline.summary.includes(`Inventory of Conditional Access policies is partial (5 seen of unknown total; ${graphReason}`), `the summary carries the reason: ${mfaBaseline.summary}`);
+  assert.deepEqual({ seen: mfaBaseline.evidence.seen, truncated: mfaBaseline.evidence.truncated }, { seen: 5, truncated: true });
+  assert.equal(mfaBaseline.evidence.truncation, graphReason);
+  const guardrails = assessments.find((assessment) => assessment.findings.some((item) => item.id === "AZURE-SUB-01"));
+  const owners = guardrails.findings.find((item) => item.id === "AZURE-SUB-01");
+  assert.equal(owners.status, "warn");
+  assert.ok(owners.summary.includes(`partial (1 seen of unknown total; ${armReason}`), `the summary carries the userinfo reason: ${owners.summary}`);
+  for (const assessment of assessments) assertNoCanaryWindows(assert, assessment, NEXT_LINK_CANARIES, assessment.title);
+
+  const files = readBundleFiles(exported.outputDir);
+  assertNoCanaryWindowsInFiles(assert, files, NEXT_LINK_CANARIES, "bundle");
+  assertNoCanaryWindowsInFiles(assert, readZipEntries(exported.zipPath), NEXT_LINK_CANARIES, "zip");
+  const allText = [...files.values()].join("\n");
+  const hostMentions = allText.split(FOREIGN_NEXT_HOST).length - 1;
+  const reasonMentions = allText.split(`on https://${FOREIGN_NEXT_HOST} rather than the configured origin https://graph.microsoft.com`).length - 1;
+  assert.ok(hostMentions > 0 && hostMentions === reasonMentions, `the bundle names the link's host only as the origin inside the refusal reason, never as a link (${hostMentions} mentions, ${reasonMentions} in reasons)`);
+  assert.ok(allText.includes(graphReason), "the bundle records the refusal as the truncation reason");
+});
+
 test("rule 9: API error bodies are reduced to the documented error envelope before they reach messages, evidence, or logs", async () => {
   assert.equal(describeErrorBody(""), "");
   assert.equal(describeErrorBody(JSON.stringify({ error: { code: "Authorization_RequestDenied", message: "Insufficient privileges to complete the operation.", innerError: { "request-id": "req-1", date: "2026-04-16" } } })), "Authorization_RequestDenied: Insufficient privileges to complete the operation.");
@@ -480,6 +715,26 @@ test("rule 9: API error bodies are reduced to the documented error envelope befo
   assert.equal(describeErrorBody("[1,2,3]", "application/json"), "non-JSON body (application/json, 7 bytes)", "a JSON body that is not an object is described by shape too");
   assert.equal(describeErrorBody(JSON.stringify({ unexpected: "shape", token: "leaked-token" })), "error body without code or message");
   assertRedactionCases(assert, redactErrorText);
+
+  // Round 4 item D: the vendor message is scrubbed before it is shortened, so a credential whose start lies inside
+  // the 160-character cut is removed whole instead of leaving a 7 to 11 character tail the bare-token rule cannot see.
+  const sliceCanaries = { awsSecret: CANARY.awsSecret, cookie: CANARY.sessionCookie, bearerBare: CANARY.bearer, apiKey: CANARY.apiKey };
+  const envelopes = {
+    graph403: (message) => JSON.stringify({ error: { code: "Authorization_RequestDenied", message } }),
+    token400: (description) => JSON.stringify({ error: "invalid_client", error_description: description }),
+  };
+  for (const [envelopeName, envelope] of Object.entries(envelopes)) {
+    for (const [canaryName, canary] of Object.entries(sliceCanaries)) {
+      for (const keep of [7, 9, 11, 12, 15]) {
+        const lead = "the diagnostic context follows ".padStart(160 - keep, "x");
+        const described = describeErrorBody(envelope(`${lead}${canary} and more text after the cut`), "application/json");
+        assertNoCanaryWindows(assert, described, [canary], `${envelopeName} ${canaryName} keep ${keep}`);
+        assert.ok(described.length <= 160 + "Authorization_RequestDenied: ".length, `${envelopeName} ${canaryName} keep ${keep}: the line stays short (${described.length})`);
+      }
+    }
+  }
+  assert.equal(describeErrorBody(envelopes.graph403(`${"word ".repeat(40)}tail`), "application/json").endsWith("word"), true, "a long message is cut on a whitespace boundary");
+  assert.equal(describeErrorBody(envelopes.token400("AADSTS7000215: Invalid client secret provided. Trace ID: 0f7b2a6c-9c4e-4a63-8f2c-2f1d9a1c0b77"), "application/json"), "invalid_client: AADSTS7000215: Invalid client secret provided. Trace ID: 0f7b2a6c-9c4e-4a63-8f2c-2f1d9a1c0b77", "a short message keeps its UUID and is otherwise unchanged");
   assert.equal(
     new AzureApiError(`403 Forbidden: AuthorizationFailed: see ${CANARY_URL} for the denied scope`, "https://management.azure.com/x", 403).message,
     "403 Forbidden: AuthorizationFailed: see https://api.example.com/v1/x?[REDACTED] for the denied scope",
@@ -552,7 +807,9 @@ test("rule 9 fixed texts (GWS note 1): every fixed-text message the integration 
   }
   assert.ok(texts.some((text) => HTML_BODY_NOTE.test(text)), "the fixed-text list carries the non-JSON body note");
   assert.ok(texts.some((text) => /^POST \/tenant-123\/oauth2\/v2\.0\/token returned 403 Forbidden, so no Azure Resource Manager request was made for this finding\./.test(text)), "the token-failure finding summary is in the list");
-  assert.ok(texts.some((text) => /^AZURE-ID-01 POST \/tenant-123\/oauth2\/v2\.0\/token: 401 Unauthorized; no Microsoft Graph request was made$/.test(text)), "the token-failure error-log line is in the list");
+  // The token endpoint path ends in `token`, so the status is joined by "returned" rather than a colon: a
+  // `path: value` pair with a credential-named last segment loses its value to the error sink (harness revision 3).
+  assert.ok(texts.some((text) => /^AZURE-ID-01 POST \/tenant-123\/oauth2\/v2\.0\/token returned 401 Unauthorized; no Microsoft Graph request was made$/.test(text)), "the token-failure error-log line is in the list");
 
   // The renderings the client throws, built the way getToken, requestJson, and parseJsonBody build them.
   const tokenUrl = "https://login.microsoftonline.com/tenant-123/oauth2/v2.0/token";
@@ -648,9 +905,126 @@ test("rule 9 must-keep and must-redact table (addendum 7): every endpoint path, 
       values: azureFixedTexts(),
       sentence: (value) => `AZURE-ID-01 ${value}`,
     },
+    QUOTED_NON_CREDENTIAL_GROUP,
   ];
   assertMustKeepRows(assert, redactErrorText, groups);
   assertMustRedactRowsBesideMustKeep(assert, redactErrorText, groups);
+});
+
+test("rule 9 escapes (reviewer D round 5 escapes): a header carrier after a two-character or six-character JSON escape is removed exactly as at a line start, for the nineteen header lines the integrations send, the six escapes, and five forms, at 6-to-24 windows, direct and through the client's JSON error path", async () => {
+  const judged = assertEscapedHeaderCarriers(assert, redactErrorText);
+  assert.equal(judged, ESCAPED_HEADER_LINES.length * JSON_ESCAPES.length * 5);
+  assert.equal(ESCAPED_HEADER_LINES.length, 19);
+
+  // The two classes reviewer D found leaking, carried by an error message on a probed surface: a later cookie
+  // pair whose name has no credential word, and X-Auth-Key with an alphabetic value, each after a two-character
+  // and a six-character escape.
+  const tracker = "Rk7mVq2Zt9Xw4Ly6Pn8Hc3Jb";
+  const globalKey = "prodkeyQz8Nv3Tm5Rk2Wy7";
+  const message = `request failed\\nCookie: theme=dark; my.tracker=${tracker}\\u000aX-Auth-Key: ${globalKey}`;
+  assert.ok(message.includes("\\n") && message.includes("\\u000a"), "the message carries the escapes as backslash text");
+  const expectedTail = "\\nCookie: [REDACTED]\\u000aX-Auth-Key: [REDACTED]";
+  const config = sampleConfig();
+  const probed = new Set();
+  await checkAzureAccess(new AzureAuditorClient(config, { fetchImpl: azureRoutedFetch(healthyAzureRoutes(), probed), now: () => NOW }));
+  const surface = [...probed].find((path) => path !== AZURE_TOKEN_PATH);
+  assert.ok(surface, "the access check probes a resource surface");
+  const respond = () => new Response(JSON.stringify({ error: { code: "AuthorizationFailed", message } }), { status: 403, statusText: "Forbidden", headers: { "content-type": "application/json" } });
+  const access = await checkAzureAccess(new AzureAuditorClient(config, { fetchImpl: azureRoutedFetch({ ...healthyAzureRoutes(), [surface]: respond }), now: () => NOW }));
+  const failed = access.surfaces.filter((entry) => entry.status === "not_readable");
+  assert.ok(failed.length > 0, "the access check records the failing surface");
+  assert.ok(failed.some((entry) => entry.error.includes(expectedTail)), `both carriers are removed whole after their escapes: ${JSON.stringify(failed.map((entry) => entry.error))}`);
+  assertNoCanaryWindows(assert, access, [tracker, globalKey], "check_access after escaped headers");
+});
+
+test("rule 9 depth control (reviewer D round 5 depth control): every string a snapshot keeps passes the data-side carrier scrub at every depth in place, a credential-keyed value is the marker in place with its benign sibling kept, and a container nested past the cap of 32 is the marker, on scrubSnapshotValue and end to end through every healthy Graph and ARM route into the bundle, the zip, and every tool payload", async () => {
+  assert.equal(DEPTH_CONTROL.cap, 32);
+  // The exported walker: level k of the tree handed to it sits at depth k, so levels 1 to 32 are in place and level 33 is the marker.
+  assertDepthControl(assert, scrubSnapshotValue, { label: "azure.scrubSnapshotValue" });
+  assertDepthControl(assert, (tree) => scrubSnapshotValue({ value: [tree] }).value[0], { label: "azure.scrubSnapshotValue under a Graph page", rootDepth: 3 });
+  // The string half on its own: carriers go, identifiers stay (a tenant or role template UUID among them), the configured tokens go in every form.
+  const config = sampleConfig({ graphToken: "GraphTok3nQz8Nv3Tm5Rk2Wy7Lp4", managementToken: "ArmTok3nHx9Pl2Vt7Rb4Kn6Mc1" });
+  new AzureAuditorClient(config, { fetchImpl: azureRoutedFetch(healthyAzureRoutes()), now: () => NOW });
+  assertCarrierTextScrub(assert, redactCarrierText, { label: "azure.redactCarrierText", configuredSecret: config.graphToken });
+  assert.equal(redactCarrierText(`note: ${config.managementToken}`), "note: [REDACTED]", "the ARM token is a configured secret too");
+
+  // End to end: the tree planted on every Graph page, ARM list, and object body and in every record and nested
+  // record of every healthy route (the token endpoint left alone). Every Azure writer projects documented fields,
+  // so no bundle file, zip entry, or tool payload carries a trace of it.
+  const planted = { count: 0 };
+  const run = await runEveryAzureTool(
+    new AzureAuditorClient(config, { fetchImpl: azureRoutedFetch(withPlantedRoutes(healthyAzureRoutes(), { planted, skip: [AZURE_TOKEN_PATH] })), now: () => NOW }),
+    config,
+    createTempBase("grclanker-azure-depth-"),
+  );
+  assert.ok(planted.count >= Object.keys(healthyAzureRoutes()).length - 1, `the fixture planted the tree into ${planted.count} objects`);
+  assert.equal(run.exported.errorCount, 0, "the planted tree causes no read to fail");
+  assert.ok(run.access.surfaces.every((surface) => surface.status === "readable"), "every surface reads the planted fixture");
+  assertDepthControlOutputs(
+    assert,
+    { files: readBundleFiles(run.exported.outputDir), zipEntries: readZipEntries(run.exported.zipPath), outputs: [run.access, ...run.assessments] },
+    { label: "azure", treeExpected: false },
+  );
+});
+
+test("rule 9 credential-named pairs (reviewer D round 5 baseline): a value under a credential-named key is removed whatever its shape and length, unquoted as well as quoted, in every form the pair takes, while identifier-named keys keep their values unless the value's own shape removes it", () => {
+  assertCredentialPairValuesRemoved(assert, redactErrorText);
+  assertIdentifierKeyRows(assert, redactErrorText);
+  assertFlagAndPathPairRows(assert, redactErrorText);
+  // The retired value-shape test would have kept every one of these; the pair rule no longer asks.
+  for (const [text, expected] of [
+    ["password=letmein", "password=[REDACTED]"],
+    ["DB_PASSWORD=Sunshine", "DB_PASSWORD=[REDACTED]"],
+    ["AZURE_CLIENT_SECRET: abc12", "AZURE_CLIENT_SECRET: [REDACTED]"],
+    ["DUO_SKEY=p@ss", "DUO_SKEY=[REDACTED]"],
+    ["DUO_IKEY=DIXXXXXXXXXXXXXXXXXX", "DUO_IKEY=[REDACTED]"],
+    ["DUO_IKEY=letmein", "DUO_IKEY=[REDACTED]"],
+    ["ikey: monkey", "ikey: [REDACTED]"],
+    ['{"DUO_IKEY":"Sunshine"}', '{"DUO_IKEY":"[REDACTED]"}'],
+    ['"ikey": "abc12"', '"ikey": "[REDACTED]"'],
+    ["Authorization: Basic letmein", "Authorization: Basic [REDACTED]"],
+    ["token: value shape", "token: [REDACTED] shape"],
+  ]) {
+    assert.equal(redactErrorText(text), expected, `credential-named pair: ${text}`);
+  }
+  // A PascalCase error code that ends in a credential word is prose, and a bare scheme word is not a pair; a path segment
+  // ending in a credential word is one (assertFlagAndPathPairRows).
+  for (const text of [
+    "InvalidAuthenticationToken: Access token has expired. Basic authentication is disabled for this tenant.",
+    "ExpiredToken: The security token included in the request is expired",
+    "sent as Authorization: Bearer) or as X-Auth-Key",
+    "oauth: invalid_grant was returned",
+  ]) {
+    assert.equal(redactErrorText(text), text, `prose beside a credential word survives: ${text}`);
+  }
+});
+
+test("rule 9 URL userinfo boundary (CodeRabbit on #76 at b0ef16f; the raw ? or # inside a password from the merge-first delta against main on 7c7bf86): an `@` inside a query or a fragment is not a userinfo boundary when the authority before it is a host, so the real host stays and a query and a fragment each become the marker whole, while an authority that is not host[:port] followed by an `@` is userinfo, so a password holding a raw `?` or `#` goes whole, on the error sink, the data-string sink, and a snapshot string", () => {
+  assertUrlUserinfoBoundaryRows(assert, redactErrorText, { label: "azure.redactErrorText" });
+  assertUrlUserinfoBoundaryRows(assert, redactCarrierText, { label: "azure.redactCarrierText" });
+  assertUrlUserinfoBoundaryRows(assert, (text) => scrubSnapshotValue(text), { label: "azure.scrubSnapshotValue" });
+});
+test("rule 9 Authorization parameter lists (CodeRabbit on #81, discussion_r4081238237): under an Authorization or Proxy-Authorization scheme every parameter value that is a proof is removed whatever its name, quoted or bare (Snowflake Token=\"...\", Bearer value=\"...\", Digest response, nonce, cnonce, and opaque, OAuth 1.0 oauth_token, oauth_signature, and oauth_nonce), while realm, username, uri, qop, nc, the SigV4 scope and signed headers, a WWW-Authenticate challenge, and Bearer realm=\"api\" in prose stay, on the error sink, the data-string sink, and a snapshot string, bare, inside a sentence, after a JSON escape, and inside a JSON string", () => {
+  assertAuthorizationParameterRows(assert, redactErrorText, { label: "azure.redactErrorText" });
+  assertAuthorizationParameterRows(assert, redactCarrierText, { label: "azure.redactCarrierText" });
+  assertAuthorizationParameterRows(assert, (text) => scrubSnapshotValue(text), { label: "azure.scrubSnapshotValue" });
+});
+test("rule 9 challenge proofs (CodeRabbit on #81, discussion_r4081776771): a parameter list that is not under an Authorization key (a WWW-Authenticate challenge, Digest realm=\"api\", ... in prose, a bare realm=\"api\", nonce=\"n\", response=\"...\" data value) is not exempt because it is shaped like a challenge: the value of a parameter named response, signature, oauth_signature, mac, or sig goes, quoted at any depth or bare, before or after the realm, while realm, qop, algorithm, error, and error_description keep theirs, a proof-free challenge passes unchanged, and a response or mac field outside such a list is data, on the error sink, the data-string sink, and a snapshot string, bare, inside a sentence, after a JSON escape, and inside a JSON string", () => {
+  assertChallengeProofRows(assert, redactErrorText, { label: "azure.redactErrorText" });
+  assertChallengeProofRows(assert, redactCarrierText, { label: "azure.redactCarrierText" });
+  assertChallengeProofRows(assert, (text) => scrubSnapshotValue(text), { label: "azure.scrubSnapshotValue" });
+});
+test("rule 9 bearer-id override (CodeRabbit r4077259415 on #78): a key ending in secret_id or naming a session id is a credential key despite its id suffix, so a Vault AppRole secret id goes whatever its shape, a UUID included, through the error sink, the data-string sink, the snapshot walker, and the thrown error, while AZURE_TENANT_ID=<uuid> and the other identifier keys keep their values", async () => {
+  assertBearerIdKeyRows(assert, redactErrorText);
+  assertBearerIdKeyRows(assert, redactCarrierText, { controls: BEARER_ID_CARRIER_CONTROL_ROWS });
+  assertBearerIdSnapshotKeys(assert, scrubSnapshotValue);
+  const [uuid, random] = BEARER_ID_VALUES;
+  const tenant = "3f2504e0-4f89-11d3-9a0c-0305e82c3301";
+  const echoed = `VAULT_SECRET_ID=${uuid} and role_secret_id: ${random} were rejected; AZURE_TENANT_ID=${tenant} was accepted`;
+  const expected = `VAULT_SECRET_ID=[REDACTED] and role_secret_id: [REDACTED] were rejected; AZURE_TENANT_ID=${tenant} was accepted`;
+  const thrown = new AzureApiError(`403 Forbidden: ${echoed}`, "https://graph.microsoft.com/v1.0/identity/conditionalAccess/policies", 403);
+  assert.equal(thrown.message, `403 Forbidden: ${expected}`);
+  assertNoCanaryWindows(assert, thrown.message, [uuid, random], "AzureApiError message");
 });
 
 test("rule 9: service principal and application credential records keep only schedule fields at collection time", async () => {
@@ -1774,13 +2148,103 @@ test("request matching: a token-endpoint denial is attributed to POST /<tenant>/
     assert.ok(recorded.some((item) => item.evidence.resource_request.endsWith("no Microsoft Graph request was made")), `${label}: Graph findings name their API`);
     for (const assessment of assessments) {
       for (const error of assessment.errors) {
-        assert.match(error, new RegExp(`^AZURE-[A-Z]+-\\d+ POST ${AZURE_TOKEN_PATH.replace(/[.]/g, "\\.")}: ${status} ${statusText}; no (Microsoft Graph|Azure Resource Manager) request was made$`), `${label}: the errors array names the token request: ${error}`);
+        assert.match(error, new RegExp(`^AZURE-[A-Z]+-\\d+ POST ${AZURE_TOKEN_PATH.replace(/[.]/g, "\\.")} returned ${status} ${statusText}; no (Microsoft Graph|Azure Resource Manager) request was made$`), `${label}: the errors array names the token request: ${error}`);
       }
     }
     assert.ok(exported.errorCount >= 30, `${label}: the export logs every failed read`);
     assert.doesNotMatch(files.get("_errors.log"), /GET /, `${label}: the error log attributes nothing to a GET`);
     assertNoCanaryWindowsInFiles(assert, files, AZURE_PLANTED_CANARIES, `${label} bundle`);
   }
+});
+
+const AZURE_TRANSPORT_CANARY = "Vq8LmT2xRc7ZpWd4Kn9Y";
+
+/** Rejections before any HTTP response, each carrying a credential the way transport errors sometimes echo request headers. */
+const AZURE_TRANSPORT_REJECTIONS = [
+  ["dns", () => Object.assign(new TypeError("fetch failed"), { cause: Object.assign(new Error("getaddrinfo ENOTFOUND login.microsoftonline.com"), { code: "ENOTFOUND" }) }), /^TypeError: fetch failed \(ENOTFOUND\)$/],
+  ["tls", () => Object.assign(new TypeError(`fetch failed: unable to verify the first certificate; request carried Authorization: Bearer ${AZURE_TRANSPORT_CANARY}`), { cause: Object.assign(new Error("unable to verify the first certificate"), { code: "UNABLE_TO_VERIFY_LEAF_SIGNATURE" }) }), /^TypeError: fetch failed: unable to verify the first certificate; request carried Authorization: Bearer \[REDACTED\]$/],
+  ["timeout", () => Object.assign(new Error(`The operation was aborted due to timeout; last header X-Auth-Key: "${AZURE_TRANSPORT_CANARY}"`), { name: "TimeoutError" }), /^TimeoutError: The operation was aborted due to timeout; last header X-Auth-Key: "\[REDACTED\]"$/],
+];
+
+test("request matching (Codex P2): a token request rejected before any response (DNS, TLS, timeout) is attributed to POST /<tenant>/oauth2/v2.0/token with no status, every output states that no resource request was made, no Graph or ARM endpoint or status is named anywhere, and the transport message reaches no sink unscrubbed", async () => {
+  for (const [label, reject, detail] of AZURE_TRANSPORT_REJECTIONS) {
+    const config = canaryConfig();
+    const outputRoot = createTempBase(`grclanker-azure-token-${label}-`);
+    const log = [];
+    const fetchImpl = async (url, init) => {
+      log.push({ method: init?.method ?? "GET", url: String(url).split("?")[0], status: null });
+      throw reject();
+    };
+    const client = new AzureAuditorClient(config, { fetchImpl, now: () => NOW });
+    const { access, assessments, exported } = await runEveryAzureTool(client, config, outputRoot);
+
+    // The only request the run made is the token request, and it produced no response.
+    assert.ok(log.length > 0, `${label}: the token request was made`);
+    assert.deepEqual([...new Set(log.map((entry) => `${entry.method} ${entry.url} ${entry.status}`))], [`POST ${AZURE_TOKEN_URL} null`], `${label}: the run made only the token request and observed no status`);
+
+    const files = readBundleFiles(exported.outputDir);
+    const outputs = [JSON.stringify(access), ...assessments.map((assessment) => JSON.stringify(assessment)), ...files.values()];
+    const text = outputs.join("\n");
+    const mentions = namedAzureEndpoints(text);
+    assert.deepEqual([...mentions], [`POST ${AZURE_TOKEN_PATH}`], `${label}: the token request is the only endpoint named anywhere (${[...mentions].join(", ")})`);
+    for (const url of namedAzureRequestUrls(text)) assert.equal(url, AZURE_TOKEN_URL, `${label}: request URL ${url} is named in output but the run never requested it`);
+    assert.deepEqual([...namedAzureStatusCodes(text)], [], `${label}: no HTTP status is named because none was observed`);
+    assert.ok(!text.includes("/v1.0/") && !text.includes("/beta/") && !/\bMicrosoft\.[A-Za-z]+\//.test(text), `${label}: no resource endpoint is named anywhere in the outputs`);
+    assert.doesNotMatch(text, /Grant /, `${label}: no output recommends a permission grant for a request that was never answered`);
+    assertNoCanaryWindows(assert, text, [AZURE_TRANSPORT_CANARY, ...AZURE_PLANTED_CANARIES], `${label} outputs`);
+    assertNoCanaryWindowsInFiles(assert, files, [AZURE_TRANSPORT_CANARY, ...AZURE_PLANTED_CANARIES], `${label} bundle`);
+
+    // Access check: every probe failed at the token request with no status; the note and next step name the network path, not a credential or permission.
+    assert.equal(access.status, "limited", `${label}: the access check is limited`);
+    for (const probe of access.surfaces) {
+      assert.equal(probe.status, "not_readable", `${label}: probe ${probe.name} is not readable`);
+      assert.deepEqual({ count: probe.count, truncated: probe.truncated, http_status: probe.http_status, request_url: probe.request_url }, { count: null, truncated: null, http_status: null, request_url: AZURE_TOKEN_URL }, `${label}: probe ${probe.name} records the token request without a status`);
+      assert.match(probe.error, new RegExp(`^Token request failed: no response \\(${detail.source.slice(1, -1)}\\)$`), `${label}: probe ${probe.name} records the shape of the transport failure: ${probe.error}`);
+    }
+    const note = access.notes.find((item) => item.startsWith(`POST ${AZURE_TOKEN_PATH} received no response (`));
+    assert.ok(note, `${label}: the access check note names the token request and says no response arrived: ${JSON.stringify(access.notes)}`);
+    assert.match(note, /\); no resource request was made for organization, conditional_access, directory_roles, secure_scores, defender_pricings, role_assignments, diagnostic_settings, security_contacts\.$/, `${label}: the note lists every probe that never reached its resource`);
+    assert.equal(access.recommendedNextStep, "Restore network access to login.microsoftonline.com (DNS, TLS, proxy) so the token request receives a response, then re-run the access check.", `${label}: the next step is the network path`);
+
+    // Findings: every finding that recorded the failure names the token request, carries no status, and carries the not-attempted marker.
+    const recorded = assessments.flatMap((assessment) => assessment.findings.filter((finding) => finding.evidence?.request_url === AZURE_TOKEN_URL));
+    assert.ok(recorded.length >= 30, `${label}: the token failure reaches every finding that reads a resource (${recorded.length})`);
+    assert.ok(recorded.some((item) => item.id === "AZURE-ID-01") && recorded.some((item) => item.id === "AZURE-ID-02"), `${label}: AZURE-ID-01 and AZURE-ID-02 record the token failure`);
+    for (const item of recorded) {
+      assert.equal(item.status, "manual", `${label}: ${item.id} renders manual`);
+      assert.equal(item.evidence.endpoint, `POST ${AZURE_TOKEN_PATH}`, `${label}: ${item.id} names the token request as the failed request`);
+      assert.equal(item.evidence.http_status, null, `${label}: ${item.id} records no status`);
+      assert.match(item.evidence.resource_request, /^not attempted: the token request failed, so no (Microsoft Graph|Azure Resource Manager) request was made$/, `${label}: ${item.id} carries the not-attempted marker`);
+      assert.match(item.summary, new RegExp(`^POST ${AZURE_TOKEN_PATH.replace(/[.]/g, "\\.")} received no response \\(${detail.source.slice(1, -1)}\\), so no (Microsoft Graph|Azure Resource Manager) request was made for this finding\\. Restore network access to login\\.microsoftonline\\.com \\(DNS, TLS, proxy\\) so the token request receives a response; the read then needs `), `${label}: ${item.id} summary names the token request and the network remedy: ${item.summary}`);
+      assert.doesNotMatch(item.summary, /^GET |Grant |returned/, `${label}: ${item.id} neither attributes the failure to its resource endpoint nor says the token endpoint returned anything`);
+      assert.equal(typeof item.evidence.required_access, "string", `${label}: ${item.id} still records the permission the read will need`);
+    }
+    for (const assessment of assessments) {
+      for (const error of assessment.errors) {
+        assert.match(error, new RegExp(`^AZURE-[A-Z]+-\\d+ POST ${AZURE_TOKEN_PATH.replace(/[.]/g, "\\.")} received no response \\(${detail.source.slice(1, -1)}\\); no (Microsoft Graph|Azure Resource Manager) request was made$`), `${label}: the errors array names the token request: ${error}`);
+      }
+    }
+    assert.ok(exported.errorCount >= 30, `${label}: the export logs every failed read`);
+    assert.doesNotMatch(files.get("_errors.log"), /GET /, `${label}: the error log attributes nothing to a GET`);
+  }
+});
+
+test("request matching (Codex P2): a Graph request rejected before any response keeps its own endpoint and observed URL, records no status, and asks for the network path rather than a permission grant", async () => {
+  const config = canaryConfig();
+  const [, reject, detail] = AZURE_TRANSPORT_REJECTIONS[0];
+  const routes = { ...healthyAzureRoutes(), "/v1.0/identity/conditionalAccess/policies": async () => { throw reject(); } };
+  const client = new AzureAuditorClient(config, { fetchImpl: azureRoutedFetch(routes), now: () => NOW });
+  const identity = await assessAzureIdentity(client);
+  const finding = identity.findings.find((item) => item.id === "AZURE-ID-01");
+  assert.equal(finding.status, "manual");
+  assert.match(finding.summary, new RegExp(`^GET /v1\\.0/identity/conditionalAccess/policies received no response \\(${detail.source.slice(1, -1)}\\)\\. Restore network access to graph\\.microsoft\\.com \\(DNS, TLS, proxy\\) and re-run; the read needs Policy\\.Read\\.All\\. Or collect `), finding.summary);
+  assert.doesNotMatch(finding.summary, /Grant |returned/);
+  assert.deepEqual(
+    { endpoint: finding.evidence.endpoint, http_status: finding.evidence.http_status, request_url: finding.evidence.request_url, resource_request: finding.evidence.resource_request },
+    { endpoint: "GET /v1.0/identity/conditionalAccess/policies", http_status: null, request_url: "https://graph.microsoft.com/v1.0/identity/conditionalAccess/policies", resource_request: undefined },
+  );
+  assert.match(finding.evidence.error, new RegExp(`^no response \\(${detail.source.slice(1, -1)}\\)$`));
+  assert.ok(identity.errors.some((error) => error === `AZURE-ID-01 GET /v1.0/identity/conditionalAccess/policies: no response (${detail.source.slice(1, -1).replace(/\\/g, "")})`), JSON.stringify(identity.errors));
 });
 
 test("verdict safety 8: re-running the export never overwrites a prior bundle and logs errors on partial failure", async () => {

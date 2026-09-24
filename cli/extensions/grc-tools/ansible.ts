@@ -545,8 +545,9 @@ function formatPercent(value: number): string {
   return `${value.toFixed(1)}%`;
 }
 
+/** Every JSON file the bundle writes goes through the snapshot walk first (rule 9 at every depth, with the cap). */
 function serializeJson(value: unknown): string {
-  return `${JSON.stringify(value, null, 2)}\n`;
+  return `${JSON.stringify(scrubSnapshotValue(value), null, 2)}\n`;
 }
 
 function safeDirName(value: string): string {
@@ -721,56 +722,517 @@ function scrubConfiguredSecrets(text: string): string {
   return scrubbed;
 }
 
-const ERROR_CREDENTIAL_KEY_PATTERN =
-  "[A-Za-z0-9_.-]*(?:token|secret|passw(?:or)?d|pwd|api[_-]?key|apikey|session(?:[_-]?id)?|sid|cookie|csrftoken|authorization|auth|signature|sig|nonce|credentials?|access[_-]?key|private[_-]?key|skey)";
-// key=value, key: value, and "key":"value" pairs whose key names a credential; the value's shape decides below.
+// The words that name a credential. A key ends in one of them; isCredentialNamedKey below decides how the word may
+// be attached to the rest of the key. `skey` and `ikey` are Duo's secret key and integration key (DUO_SKEY, DUO_IKEY),
+// both configured secrets of that integration; there is no bare `key`, so KmsKeyId, ssh_key_name, and the like stay
+// identifiers. The compound words (`session_token`, `client_secret`, `secret_access_key`, `secret_key`,
+// `connection_string`, `ssh_key_data`) are the members an SDK response or a credential store carries, so they count
+// in their PascalCase form too (`SessionToken`, `ClientSecret`, `SecretAccessKey`, `SecretKey`), where a PascalCase
+// error code that merely ends in `Token` (`ExpiredToken`) does not; see isCredentialNamedKey. The bearer ids are the
+// one override to the identifier suffix (CodeRabbit r4077259415 on #78, harness revision 3): a key ending in
+// `secret_id` (a Vault AppRole secret id) or `token_id` (a token id is the token), or in a session id (`session_id`,
+// `sid`, `sessid`, `jsessionid`, `PHPSESSID`), authenticates rather than identifies, so it is a credential key
+// despite ending in `id` and its value goes whatever its shape, UUID included, while `client_id`, `tenant_id`,
+// `access_key_id`, `key_id`, and `secret_name` keep theirs unless the value's own shape goes. A URL-valued webhook
+// key (`webhook`, `webhook_url`) carries its token in the path, so the whole value goes; `webhook_count` is a count.
+const ERROR_CREDENTIAL_WORDS =
+  "token|secret[_.-]?id|token[_.-]?id|session[_.-]?token|access[_.-]?token|refresh[_.-]?token|id[_.-]?token|client[_.-]?secret|api[_.-]?secret|secret[_.-]?access[_.-]?key|secret[_.-]?key|secret|passw(?:or)?d|pwd|passphrase|api[_.-]?key|apikey|auth[_.-]?key|auth[_.-]?email|session(?:[_.-]?id)?|sessid|sid|cookie|csrftoken|authorization|auth|signature|sig|nonce|credentials?|access[_.-]?key|private[_.-]?key|ssh[_.-]?key[_.-]?data|skey|ikey|assertion|connection[_.-]?string|webhook(?:[_.-]?url)?";
+const ERROR_CREDENTIAL_KEY_PATTERN = `[A-Za-z0-9_.-]*(?:${ERROR_CREDENTIAL_WORDS})`;
+
+/**
+ * Where a key may start: after a character that cannot be part of a key, or after a JSON escape (`\n`, `\t`,
+ * `\u000a`) inside a serialized message, where the character before the key is the escape's last letter and
+ * `\b` sees no boundary (reviewer D round 5 escapes). Never right after a backslash, so the escape letter is not
+ * read as the first letter of the key (`\nExpiredToken:` is the error code, not a key `nExpiredToken`).
+ */
+const KEY_BOUNDARY_PATTERN = String.raw`(?:(?<![A-Za-z0-9_.\\-])|(?<=\\[nrtbfv])|(?<=\\u[0-9A-Fa-f]{4}))`;
+/** Where a header name or a scheme word may start: the same boundaries, allowing a `.` or `-` before the name. */
+const NAME_BOUNDARY_PATTERN = String.raw`(?:(?<![A-Za-z0-9_])|(?<=\\[nrtbfv])|(?<=\\u[0-9A-Fa-f]{4}))`;
+
+/**
+ * The authorization scheme words, matched in any casing (harness revision 3, row B): the HTTP schemes, Okta's
+ * SSWS, the Splunk and Snowflake header schemes, and SigV4. Under a credential-named key only an Authorization
+ * header treats the word as a scheme in front of the value; under any other key the word is the value.
+ */
+const ERROR_SCHEME_WORDS = "Bearer|Basic|Digest|Negotiate|NTLM|OAuth|SSWS|Token|ApiKey|Api-Key|Splunk|Snowflake|AWS4-HMAC-SHA256";
+const ERROR_SCHEME_PATTERN = `(?:${ERROR_SCHEME_WORDS})`;
+/**
+ * key=value and key: value pairs whose key ends in a credential word, wherever the key stands (after a flag
+ * prefix `--`, `-D`, a path segment `kv/`, a parenthesis, or a comma: reviewer #78 row D). The value runs to
+ * whitespace, a quote, `&`, `;`, `,`, a closing bracket, an angle bracket, or a backslash (the compound-line
+ * rule), so a pair inside a query string, a header list, a JSON fragment, or a parenthesis keeps the text after
+ * it; a marker inside the value (a URL whose query was already removed) is part of it. A value that is already
+ * the marker is not a value, so a second pass over a scrubbed message changes nothing; scrubCredentialPairs
+ * decides whether the key names a credential.
+ */
 const ERROR_CREDENTIAL_PAIR_PATTERN = new RegExp(
-  `\\b(${ERROR_CREDENTIAL_KEY_PATTERN})(["']?\\s*[=:]\\s*["']?)((?:(?:Bearer|Basic|Digest|Token|ApiKey)\\s+)?[^\\s"'&;,<>]+)`,
+  `${KEY_BOUNDARY_PATTERN}(${ERROR_CREDENTIAL_KEY_PATTERN})((?:\\\\*["'])?\\s*[=:]\\s*["']?)((?:${ERROR_SCHEME_PATTERN}\\s+)?(?!\\[REDACTED\\])(?:\\[REDACTED\\]|[^\\s"'&;,<>)\\]}\\\\])+)`,
   "gi",
 );
+/** `--name value` (a CLI flag echoed in a spawned CLI's stderr, reviewer #78 row D): the next token is the value. */
+const FLAG_CARRIER_PATTERN = new RegExp(`(?<![A-Za-z0-9_.-])--(${ERROR_CREDENTIAL_KEY_PATTERN})(\\s+)(?![-\\[])([^\\s"'&;,<>)\\]}\\\\]+)`, "gi");
 const TRAILING_PUNCTUATION_PATTERN = /[.!?:)]+$/;
 
 /**
- * A value after a credential-named key is the credential (whatever its shape) when it is at least six
- * characters and is twelve or longer, carries a digit or a character that is not a letter, or changes case
- * inside the word. Short plain words after a colon ("InvalidAuthenticationToken: Access token has expired")
- * are prose and stay.
+ * A quoted value: the opening quote with the backslashes that escape it at its serialization depth (none when the
+ * message is plain, one when it was serialized once, three when twice), the value up to the close quote at the
+ * same depth (an escaped quote inside the value, `\"` inside `"..."`, is part of the value, as is a deeper
+ * quote), and that close quote. Both patterns below place it after two capturing groups, so the backslashes are
+ * group 4, the quote character group 5, the value group 6, and the close quote group 7.
  */
-function looksLikeCredentialValue(value: string): boolean {
-  return value.length >= 6 && (value.length >= 12 || /\d/.test(value) || /[^A-Za-z]/.test(value) || /[a-z][A-Z]/.test(value));
+const ERROR_QUOTED_VALUE_PATTERN = String.raw`(?<!\\)((\\*)(["']))((?:(?!(?<!\\)\4\5)[^\n])+)((?<!\\)\4\5)`;
+/**
+ * Codex P1 (quoted header value). `X-Api-Key: "value"`, `Cookie: sid='value'`, `Authorization: Bearer "value"`,
+ * `\"X-Auth-Key\":\"value\"`: with or without spaces, single or double quotes, plain or JSON-escaped. The quotes
+ * delimit the carrier, so the quoted value is removed whole whatever its shape; the pair rule above stops at the
+ * opening quote and would judge a short or name-shaped value ("key", "prod-key") as prose. The header name, the
+ * separator, the scheme, and the quotes stay so the message remains diagnosable.
+ */
+const ERROR_QUOTED_CREDENTIAL_PATTERN = new RegExp(
+  String.raw`${KEY_BOUNDARY_PATTERN}(${ERROR_CREDENTIAL_KEY_PATTERN})((?:\\*["'])?\s*[=:]\s*(?:${ERROR_SCHEME_PATTERN}\s*)?)${ERROR_QUOTED_VALUE_PATTERN}`,
+  "gi",
+);
+// A scheme word that is itself quoted (`"Token":"..."`, a JSON key) or ends a compound key (`"x-api-key":`,
+// `"settings.token":`) is a pair the rule above already handled.
+const ERROR_QUOTED_SCHEME_PATTERN = new RegExp(String.raw`(?<!["'\\./-])\b(${ERROR_SCHEME_PATTERN})(\s*)${ERROR_QUOTED_VALUE_PATTERN}`, "gi");
+const QUOTED_VALUE_REPLACEMENT = `$1$2$3${REDACTED_ERROR_VALUE}$7`;
+/**
+ * A quoted phrase that is a scheme word and one value (`"Bearer prod-token"`, `\"Token prod-key\"`, `'Basic abc'`):
+ * the quotes delimit a header value being quoted, so the value goes whatever its shape (reviewer D round 5 depth
+ * control, the quoted name-shaped bearer), where the same phrase bare in prose (`sent as Bearer prod-token`) is
+ * judged by the scheme rule's shape test. A quoted phrase of several words after the scheme is prose and stays.
+ */
+const ERROR_QUOTED_SCHEME_PHRASE_PATTERN = new RegExp(
+  String.raw`(?<!\\)((\\*)(["']))(${ERROR_SCHEME_PATTERN})(\s+)((?:(?!(?<!\\)\2\3)[^\s"'\\])+)((?<!\\)\2\3)`,
+  "gi",
+);
+const QUOTED_SCHEME_PHRASE_REPLACEMENT = `$1$4$5${REDACTED_ERROR_VALUE}$7`;
+
+const CREDENTIAL_KEY_WORD_PATTERN = new RegExp(`(?:${ERROR_CREDENTIAL_WORDS})$`, "i");
+// Credential words that end too many ordinary words to count when glued to a lowercase prefix (`oauth`, `ssid`).
+const WEAK_CREDENTIAL_WORD_PATTERN = /^(?:auth|sid|sig)$/i;
+const PAIR_VALUE_SCHEME_PATTERN = new RegExp(`^${ERROR_SCHEME_PATTERN}\\s+`, "i");
+const BARE_SCHEME_WORD_PATTERN = new RegExp(`^${ERROR_SCHEME_PATTERN}$`, "i");
+/** The keys whose value is `<scheme> <credential>`: Authorization and Proxy-Authorization. */
+const AUTHORIZATION_KEY_PATTERN = /authorization$/i;
+const SCHEME_PARAMETER_PATTERN = /^([A-Za-z][A-Za-z0-9_-]*)=(?!=)/;
+
+/**
+ * Whether the value after a scheme word is a `name=value` parameter list (SigV4 `Credential=...`, `realm="api"`,
+ * `OAuth oauth_consumer_key=...`) rather than one bearer credential: the name is shaped like a name segment by
+ * segment (`oauth_consumer_key`, `x-amz-date`), and the `=` is followed by more text, or by the quote that opens
+ * the parameter's value where the caller's value stopped (`uri="/dir"`, `Session="v"`: `quoteFollows`), or the
+ * whole is not base64-length (`realm=` is a parameter; `cGFzc3dvcmQ=` is padding).
+ */
+function isSchemeParameterList(value: string, quoteFollows = false): boolean {
+  const parameter = SCHEME_PARAMETER_PATTERN.exec(value);
+  if (parameter === null || !isParameterName(parameter[1])) return false;
+  return parameter[0].length < value.length || quoteFollows || value.length % 4 !== 0;
 }
 
+/** A parameter name: `-` or `_` separated segments that are each shaped like part of a name (see isNameSegment). */
+function isParameterName(name: string): boolean {
+  return name.split(/[-_]/).every((segment) => isNameSegment(segment));
+}
+
+/** Whether a quote, plain or behind the backslashes of its JSON escape, stands at `index` in `text`. */
+function quoteOpensAt(text: string, index: number): boolean {
+  let cursor = index;
+  while (text[cursor] === "\\") cursor += 1;
+  return text[cursor] === '"' || text[cursor] === "'";
+}
+
+/**
+ * Whether a key names a credential (reviewer D round 5 baseline). It does when it is a credential word
+ * (`password`, `Token`, `skey`, `SessionToken`), sets one off with `_`, `-`, or `.` (`DB_PASSWORD`,
+ * `AZURE_CLIENT_SECRET`, `x-api-key`, `Proxy-Authorization`), or is a lowerCamelCase, lowercase, or uppercase
+ * compound ending in one (`accessToken`, `clientSecret`, `dbpassword`, `ACCESSTOKEN`). A PascalCase identifier
+ * that merely ends in the word (`InvalidAuthenticationToken`, `ExpiredToken`) is an error code or a type name,
+ * and the text after its colon is prose. A key that names an identifier (`AWS_ACCESS_KEY_ID`, `AZURE_TENANT_ID`,
+ * `CLOUDFLARE_EMAIL`) never ends in a credential word, so its value is judged by its own shape alone; the bearer
+ * ids (`secret_id`, `token_id`, and the session ids, see ERROR_CREDENTIAL_WORDS) are credential words, so that
+ * suffix test never reaches them.
+ */
+function isCredentialNamedKey(key: string): boolean {
+  const word = CREDENTIAL_KEY_WORD_PATTERN.exec(key)?.[0];
+  if (word === undefined) return false;
+  const prefix = key.slice(0, key.length - word.length);
+  if (prefix.length === 0 || /[_.-]$/.test(prefix)) return true;
+  if (/^[A-Z]/.test(prefix) && /[a-z]/.test(prefix)) return false;
+  return !WEAK_CREDENTIAL_WORD_PATTERN.test(word);
+}
+
+/**
+ * The value of a pair whose key names a credential is the credential and is removed whatever its shape and
+ * length (reviewer D round 5 baseline): `password=letmein`, `DB_PASSWORD=Sunshine`, `AZURE_CLIENT_SECRET: abc12`,
+ * and `DUO_SKEY=p@ss` go the way `{"password":"letmein"}` already did. The key, the separator, and the sentence
+ * punctuation after the value stay. Under an Authorization header a scheme word in front of the value stays
+ * too, a scheme word standing alone ("sent as Authorization: Bearer") names the scheme and carries nothing, and
+ * a parameter list after the scheme (SigV4 `Credential=..., SignedHeaders=..., Signature=...`) is judged pair by
+ * pair so the region and the request scope stay (scrubAuthorizationParameters has already removed every
+ * parameter value that is a proof, so this pass sees markers and the kept parameters). Under any other
+ * credential key the scheme word is the value (CodeRabbit r4078025849 on #63: `sslPassword=splunk rejected`,
+ * `db_password: token`), and the prose after it stays. A `--name value` flag is a pair whose separator is the space.
+ */
 function scrubCredentialPairs(text: string): string {
-  return text.replace(ERROR_CREDENTIAL_PAIR_PATTERN, (match: string, key: string, separator: string, value: string) => {
-    // A value the scheme rule already replaced ("Authorization: Bearer [REDACTED]") keeps its scheme name.
-    if (value.includes(REDACTED_ERROR_VALUE)) return match;
-    const core = value.replace(TRAILING_PUNCTUATION_PATTERN, "");
-    return looksLikeCredentialValue(core) ? `${key}${separator}${REDACTED_ERROR_VALUE}${value.slice(core.length)}` : match;
+  const scrubbed = text.replace(ERROR_CREDENTIAL_PAIR_PATTERN, (match: string, key: string, separator: string, value: string, offset: number) => {
+    if (!isCredentialNamedKey(key)) return match;
+    const scheme = PAIR_VALUE_SCHEME_PATTERN.exec(value)?.[0] ?? "";
+    const authorization = AUTHORIZATION_KEY_PATTERN.test(key);
+    if (scheme.length > 0 && !authorization) {
+      const word = scheme.trimEnd();
+      return `${key}${separator}${REDACTED_ERROR_VALUE}${value.slice(word.length)}`;
+    }
+    const core = value.slice(scheme.length).replace(TRAILING_PUNCTUATION_PATTERN, "");
+    if (core.length === 0) return match;
+    const tail = value.slice(scheme.length + core.length);
+    if (authorization) {
+      if (BARE_SCHEME_WORD_PATTERN.test(core)) return match;
+      if (isSchemeParameterList(core, quoteOpensAt(text, offset + match.length - tail.length))) {
+        return `${key}${separator}${scheme}${scrubCredentialPairs(core)}${tail}`;
+      }
+    }
+    return `${key}${separator}${scheme}${REDACTED_ERROR_VALUE}${tail}`;
   });
+  return scrubbed.replace(FLAG_CARRIER_PATTERN, (match: string, key: string, space: string) =>
+    isCredentialNamedKey(key) ? `--${key}${space}${REDACTED_ERROR_VALUE}` : match,
+  );
 }
 
-const ERROR_TEXT_PATTERNS: ReadonlyArray<readonly [RegExp, string]> = [
-  // Authorization scheme values wherever they appear (headers, cookies, HTML, JSON messages); the value must be
-  // long, carry a digit or base64 symbol, or change case inside the word, so prose such as "Basic authentication"
-  // and "Bearer Token" stays.
-  // Case-sensitive so the inner-case-change test means what it says (under /i, [a-z][A-Z] is any two letters).
-  [/\b(Bearer|bearer|BEARER|Basic|basic|BASIC|Digest|digest|Negotiate|negotiate|SSWS|Token|token|TOKEN|ApiKey|apikey|APIKEY|Api-Key|api-key)\s+(?=[A-Za-z0-9\-._~+/=:]{16,}|[A-Za-z0-9\-._~+/=:]*[\d+/=]|[A-Za-z0-9\-._~+/=:]*[a-z][A-Z])[A-Za-z0-9\-._~+/=:]{6,}/g, `$1 ${REDACTED_ERROR_VALUE}`],
+/**
+ * Header carriers whose value is free form: Cookie and Set-Cookie (session values with their attributes) and
+ * Cloudflare's legacy X-Auth-Key / X-Auth-Email pair (the global API key and its account; round 4 item F). The
+ * value is removed whatever its shape. Where it ends follows the compound-line rule shared by every scrubber:
+ * a quoted value (a plain or JSON-escaped quote) ends at its closing quote, so a closed value that holds `; Name:`
+ * is one value and the quotes stay around the marker; an unquoted value, or a quoted one that is never closed,
+ * ends at the `;` or `,` that introduces the next `Name:` header token on the line (a name may hold dots,
+ * `X.Api.Key:`), at a `<` or `>` (the header quoted inside markup), at a `"` that closes the JSON string and
+ * container that carried the line (`"}`, `"]`), at a JSON-escaped line break (`\n`, `\r`, `\u000a`, `\u000d` as
+ * backslash text, the end of the line inside a serialized message), or at the end of the line, so the next
+ * header keeps its name and gets its own carrier treatment. A value that is already the marker is left alone,
+ * so a second pass over a scrubbed message leaves the text after the marker as it is.
+ *
+ * The header name counts as a carrier at a line start, after any character that is not part of a name, and
+ * after a JSON escape (reviewer D round 5 escapes): inside a serialized message the character before `Cookie`
+ * is the escape's last letter (`\nCookie`, `\u000aCookie`), a word character to `\b`, and a boundary that
+ * relied on `\b` left the free-form removal to the pair rule, which stops at the first `;` and judges every
+ * later cookie pair on its own name and shape. After `--`, `.`, or `/` (plain or JSON-escaped) the name is a
+ * flag, a property, or a path segment (`--x-auth-key=value -h db`, `-Dspring.datasource.x-auth-key=value`,
+ * `kv/x-auth-key=value see log`), a pair whose value ends at the next space, so the pair rule takes it and the
+ * text after the value stays.
+ */
+const HEADER_CARRIER_PATTERN = new RegExp(`(?:(?<![A-Za-z0-9_./-])|(?<=\\\\[nrtbfv])|(?<=\\\\u[0-9A-Fa-f]{4}))(set-cookie|cookie|x-auth-key|x-auth-email)(\\s*[:=]\\s*)(?!\\s*\\[REDACTED\\])`, "gi");
+const HEADER_CARRIER_QUOTE_PATTERN = /^(\\*)(["'])/;
+const NEXT_HEADER_TOKEN_PATTERN = /[;,]\s*[A-Za-z][A-Za-z0-9.-]*\s*:/;
+const MARKUP_OR_JSON_CLOSE_PATTERN = /[<>]|"(?=\s*[}\]])/;
+const ESCAPED_LINE_BREAK_PATTERN = /\\(?:[nr]|u000[aAdD])/;
+
+/** The first occurrence of `quote` in `line` at or after `from` that is not escaped by a backslash before it, or -1. */
+function closingQuoteIndex(line: string, quote: string, from: number): number {
+  for (let index = line.indexOf(quote, from); index !== -1; index = line.indexOf(quote, index + 1)) {
+    if (index === 0 || line[index - 1] !== "\\") return index;
+  }
+  return -1;
+}
+
+/** The end of a free-form header value that starts at `start`, and the quote (plain or escaped) that encloses a closed quoted value. */
+function headerCarrierValueEnd(text: string, start: number): { end: number; quote?: string } {
+  const newline = text.indexOf("\n", start);
+  const line = text.slice(start, newline === -1 ? text.length : newline);
+  const opening = HEADER_CARRIER_QUOTE_PATTERN.exec(line);
+  if (opening) {
+    const close = closingQuoteIndex(line, opening[0], opening[0].length);
+    if (close !== -1) return { end: start + close + opening[0].length, quote: opening[0] };
+  }
+  // An unterminated quote is part of the value; the stops are searched after it.
+  const skip = opening ? opening[0].length : 0;
+  const rest = line.slice(skip);
+  const stops = [MARKUP_OR_JSON_CLOSE_PATTERN.exec(rest)?.index, NEXT_HEADER_TOKEN_PATTERN.exec(rest)?.index, ESCAPED_LINE_BREAK_PATTERN.exec(rest)?.index].filter(
+    (index): index is number => index !== undefined,
+  );
+  return { end: start + skip + (stops.length > 0 ? Math.min(...stops) : rest.length) };
+}
+
+function scrubHeaderCarriers(text: string): string {
+  let scrubbed = "";
+  let cursor = 0;
+  for (const match of text.matchAll(HEADER_CARRIER_PATTERN)) {
+    // A carrier name inside a value already consumed (`Cookie: "a; X-Auth-Key: b"`) is part of that value.
+    if (match.index < cursor) continue;
+    const valueStart = match.index + match[0].length;
+    const { end, quote } = headerCarrierValueEnd(text, valueStart);
+    if (end === valueStart) continue;
+    scrubbed += text.slice(cursor, valueStart) + (quote === undefined ? REDACTED_ERROR_VALUE : `${quote}${REDACTED_ERROR_VALUE}${quote}`);
+    cursor = end;
+  }
+  return scrubbed + text.slice(cursor);
+}
+
+/**
+ * An Authorization or Proxy-Authorization header (any prefix the key rule accepts, any casing, plain or after a
+ * JSON escape) whose value is a scheme word and a parameter list (CodeRabbit on #81, discussion_r4081238237):
+ * `Authorization: Snowflake Token="..."`, `Authorization: Digest username="...", realm="...", nonce="...",
+ * uri="...", response="..."`, `Authorization: OAuth oauth_token="..."`, any `<Scheme> <name>="..."` shape. The
+ * match ends after the space that follows the scheme word, where the first parameter's name starts, and
+ * scrubSchemeParameterList walks the list. A header value quoted whole (`Authorization: "Digest ..."`, a JSON
+ * header object) is not this shape: the quoted-value rule below removes it whole.
+ */
+const AUTHORIZATION_PARAMETERS_PATTERN = new RegExp(
+  String.raw`${KEY_BOUNDARY_PATTERN}([A-Za-z0-9_.-]*authorization)((?:\\*["'])?\s*[=:]\s*)(${ERROR_SCHEME_PATTERN})(\s+)(?=[A-Za-z])`,
+  "gi",
+);
+/**
+ * The parameters whose value describes the exchange rather than proves it, so they stay: Digest's `realm`,
+ * `username`, `uri`, `qop`, `nc`, `algorithm`, `charset`, and `userhash` (RFC 7616), OAuth 1.0's consumer key (a
+ * client identifier), signature method, timestamp, version, and callback (RFC 5849), and SigV4's `Credential`
+ * (the access key id in front of the request scope, judged by the vendor prefix rule and the pair rule as before)
+ * and `SignedHeaders`. Every other parameter is the proof or an opaque blob (`response`, `nonce`, `cnonce`,
+ * `opaque`, `oauth_token`, `oauth_signature`, `oauth_nonce`, `Token`, `Session`, `value`) and its value becomes
+ * the marker, quoted at any serialization depth or bare.
+ */
+const KEPT_SCHEME_PARAMETER_PATTERN =
+  /^(?:realm|username|uri|qop|nc|algorithm|charset|userhash|oauth_consumer_key|oauth_signature_method|oauth_timestamp|oauth_version|oauth_callback|credential|signedheaders)$/i;
+/**
+ * The parameters whose name says the value is a proof wherever the list stands (CodeRabbit on #81,
+ * discussion_r4081776771): Digest's `response`, a `signature` or `sig`, OAuth 1.0's `oauth_signature`, and the MAC
+ * scheme's `mac`. In a challenge (see CHALLENGE_PARAMETERS_PATTERN) only these go; under an Authorization header
+ * every parameter that is not kept goes, so this list never widens what that header gives up.
+ */
+const PROOF_SCHEME_PARAMETER_PATTERN = /^(?:response|signature|oauth_signature|mac|sig)$/i;
+const REALM_PARAMETER_PATTERN = /^realm$/i;
+/** Which values a parameter list gives up: every proof under an Authorization header, only the proof-named parameters in a challenge. */
+type SchemeParameterListKind = "authorization" | "challenge";
+const SCHEME_PARAMETER_NAME_PATTERN = /([A-Za-z][A-Za-z0-9_-]*)=(?!=)/y;
+const SCHEME_PARAMETER_BARE_VALUE_PATTERN = /(?:\[REDACTED\]|[^\s"'&;,<>)\]}\\])+/y;
+const SCHEME_PARAMETER_SEPARATOR_PATTERN = /\s*,\s*/y;
+
+/**
+ * Where the parameter value that starts at `start` ends, and the quote (plain or JSON-escaped) that encloses a
+ * quoted value: a quoted value runs to its closing quote at the same depth on the same line (an escaped quote
+ * inside it is part of it), a bare value ends where the pair rule's value ends. An unterminated quote or an
+ * empty bare value is not a parameter value, so the list ends before it.
+ */
+function schemeParameterValueEnd(text: string, start: number): { end: number; quote?: string } | undefined {
+  const newline = text.indexOf("\n", start);
+  const line = text.slice(start, newline === -1 ? text.length : newline);
+  const opening = HEADER_CARRIER_QUOTE_PATTERN.exec(line);
+  if (opening) {
+    const close = closingQuoteIndex(line, opening[0], opening[0].length);
+    return close === -1 ? undefined : { end: start + close + opening[0].length, quote: opening[0] };
+  }
+  SCHEME_PARAMETER_BARE_VALUE_PATTERN.lastIndex = start;
+  const bare = SCHEME_PARAMETER_BARE_VALUE_PATTERN.exec(text);
+  return bare === null ? undefined : { end: start + bare[0].length };
+}
+
+/**
+ * Walks the `name=value` parameter list that starts at `start`, the parameters separated by commas (RFC 7235),
+ * each name shaped like a name (a base64 value with its padding, `cGFzc3dvcmQ=`, is no parameter). Under an
+ * Authorization header a kept parameter passes whole and every other value becomes the marker; in a challenge
+ * only a proof-named value does. The marker stands inside the value's own quotes, an empty value stays empty,
+ * and a value that is already the marker is left as it is, so a second pass changes nothing. The list ends
+ * before the first text that is not a parameter (prose, a `)`, the close of the JSON string that carried the
+ * line, the `;` inside SigV4's `SignedHeaders=host;x-amz-date`), which the caller keeps; a separator with no
+ * parameter after it is not consumed. Returns the end of the list, its scrubbed text, and whether a `realm`
+ * parameter was among the parameters walked.
+ */
+function scrubSchemeParameterList(text: string, start: number, kind: SchemeParameterListKind): { end: number; replacement: string; realm: boolean } {
+  let end = start;
+  let replacement = "";
+  let pending = "";
+  let cursor = start;
+  let realm = false;
+  for (;;) {
+    SCHEME_PARAMETER_NAME_PATTERN.lastIndex = cursor;
+    const name = SCHEME_PARAMETER_NAME_PATTERN.exec(text);
+    if (name === null || !isParameterName(name[1])) break;
+    const valueStart = cursor + name[0].length;
+    const value = schemeParameterValueEnd(text, valueStart);
+    if (value === undefined) break;
+    const quote = value.quote ?? "";
+    const content = text.slice(valueStart + quote.length, value.end - quote.length);
+    const kept =
+      content.length === 0 || (kind === "authorization" ? KEPT_SCHEME_PARAMETER_PATTERN.test(name[1]) : !PROOF_SCHEME_PARAMETER_PATTERN.test(name[1]));
+    if (REALM_PARAMETER_PATTERN.test(name[1])) realm = true;
+    replacement += `${pending}${name[0]}${quote}${kept ? content : REDACTED_ERROR_VALUE}${quote}`;
+    end = cursor = value.end;
+    SCHEME_PARAMETER_SEPARATOR_PATTERN.lastIndex = cursor;
+    const separator = SCHEME_PARAMETER_SEPARATOR_PATTERN.exec(text);
+    if (separator === null) break;
+    pending = separator[0];
+    cursor += separator[0].length;
+  }
+  return { end, replacement, realm };
+}
+
+/**
+ * Removes the proofs from every Authorization parameter list in the text (see AUTHORIZATION_PARAMETERS_PATTERN),
+ * the header name, the scheme word, the parameter names, the kept parameters, their quotes, and the text after
+ * the list staying. Runs before the quoted-value and scheme rules, which then see the marker where a proof
+ * stood; a header name inside a list already walked (`Authorization: Digest opaque="Authorization: ..."`) is part
+ * of that value.
+ */
+function scrubAuthorizationParameters(text: string): string {
+  let scrubbed = "";
+  let cursor = 0;
+  for (const match of text.matchAll(AUTHORIZATION_PARAMETERS_PATTERN)) {
+    if (match.index < cursor || !isCredentialNamedKey(match[1])) continue;
+    const listStart = match.index + match[0].length;
+    const { end, replacement } = scrubSchemeParameterList(text, listStart, "authorization");
+    if (end === listStart) continue;
+    scrubbed += text.slice(cursor, listStart) + replacement;
+    cursor = end;
+  }
+  return scrubbed + text.slice(cursor);
+}
+
+/**
+ * Where a parameter list that is not under an Authorization key may start (CodeRabbit on #81,
+ * discussion_r4081776771): after a scheme word and its whitespace when a parameter follows (a WWW-Authenticate or
+ * Proxy-Authenticate challenge, `Digest realm="api", nonce="n", response="..."` in prose or in a JSON string, any
+ * casing), or at a `realm` parameter or a proof-named parameter standing on its own (`realm="api", nonce="n",
+ * response="..."` as a data value, `response="...", realm="api"`). A list shaped like a challenge is not exempt
+ * from the proof rule because the challenge names it: scrubChallengeParameters removes the proof-named values and
+ * keeps the rest, where a list under an Authorization key has already given up every proof.
+ */
+const CHALLENGE_PARAMETERS_PATTERN = new RegExp(
+  String.raw`(${NAME_BOUNDARY_PATTERN}(?:${ERROR_SCHEME_PATTERN})\s+)(?=[A-Za-z][A-Za-z0-9_-]*=(?!=))|${KEY_BOUNDARY_PATTERN}(?=(?:realm|response|signature|oauth_signature|mac|sig)=(?!=))`,
+  "gi",
+);
+
+/**
+ * Removes the proof-named values (see PROOF_SCHEME_PARAMETER_PATTERN) from every challenge-shaped parameter list in
+ * the text: the list after a scheme word, whatever its parameters, and a bare list that holds a `realm` parameter,
+ * before or after the proof. The scheme word, the parameter names, the other parameters (`realm`, `qop`,
+ * `algorithm`, `opaque`, `error`, `error_description`), their quotes, and the text after the list stay, so
+ * `WWW-Authenticate: Bearer realm="api"` and `Digest realm="api", qop="auth"` pass unchanged. A bare list with no
+ * `realm` and no scheme word is data (`response="ok", status="done"`, `mac=aa:bb:cc:dd:ee:ff response=200`), as is
+ * a `response` or `mac` field outside a parameter list (`"response": 403`). A list under an Authorization key has
+ * already been walked by scrubAuthorizationParameters and holds markers where its proofs stood, which this pass
+ * leaves as they are; a parameter name inside a value already walked is part of that value.
+ */
+function scrubChallengeParameters(text: string): string {
+  let scrubbed = "";
+  let cursor = 0;
+  for (const match of text.matchAll(CHALLENGE_PARAMETERS_PATTERN)) {
+    if (match.index < cursor) continue;
+    const scheme: string | undefined = match[1];
+    const listStart = match.index + match[0].length;
+    const { end, replacement, realm } = scrubSchemeParameterList(text, listStart, "challenge");
+    if (end === listStart || (scheme === undefined && !realm)) continue;
+    scrubbed += text.slice(cursor, listStart) + replacement;
+    cursor = end;
+  }
+  return scrubbed + text.slice(cursor);
+}
+
+/**
+ * Whether the token after a bare scheme word in prose is a credential: long, or carrying a digit or a base64
+ * symbol (padding included), or changing case inside the word, so prose such as "Basic authentication" and
+ * "Bearer token is missing" stays. A `name=value` parameter list after the scheme (`Bearer realm="api"`, SigV4
+ * `Credential=...`, `OAuth oauth_consumer_key=...`), its first value quoted (`quoteFollows`) or bare, is judged
+ * parameter by parameter by scrubAuthorizationParameters, scrubChallengeParameters, and the pair rule, not as one
+ * bearer value.
+ */
+function looksLikeSchemeCredential(value: string, quoteFollows = false): boolean {
+  if (isSchemeParameterList(value, quoteFollows)) return false;
+  return value.length >= 16 || /[\d+/=]/.test(value) || /[a-z][A-Z]/.test(value);
+}
+
+/** A pattern and its replacement: a string, or a callback typed as String.prototype.replace types it (the match, its groups, the offset, the text). */
+type TextRule = readonly [RegExp, string | ((substring: string, ...args: any[]) => string)];
+
+function applyTextRule(text: string, [pattern, replacement]: TextRule): string {
+  return typeof replacement === "string" ? text.replace(pattern, replacement) : text.replace(pattern, replacement);
+}
+
+/**
+ * Carrier rules: a value is removed because of what carries it (a quoted header or pair value, an authorization
+ * scheme, a vendor token prefix, a JWT or PEM shape), not because of its own shape. The free-form header carriers
+ * (Cookie, Set-Cookie, X-Auth-Key, X-Auth-Email) run first in scrubHeaderCarriers, the Authorization parameter
+ * lists in scrubAuthorizationParameters, and the challenge proofs in scrubChallengeParameters, so these only ever
+ * see the marker.
+ */
+const CARRIER_TEXT_PATTERNS: ReadonlyArray<TextRule> = [
+  // Quoted header and pair values first, whatever their shape, so the scheme and pair rules see the marker. Under
+  // an Authorization header a scheme word that opens the quoted value stays (`Authorization: "Bearer [REDACTED]"`).
+  [
+    ERROR_QUOTED_CREDENTIAL_PATTERN,
+    (_match: string, key: string, separator: string, opening: string, _backslashes: string, _quote: string, content: string, closing: string) => {
+      const scheme = AUTHORIZATION_KEY_PATTERN.test(key) ? PAIR_VALUE_SCHEME_PATTERN.exec(content)?.[0] ?? "" : "";
+      return `${key}${separator}${opening}${scheme}${REDACTED_ERROR_VALUE}${closing}`;
+    },
+  ],
+  [ERROR_QUOTED_SCHEME_PATTERN, QUOTED_VALUE_REPLACEMENT],
+  [ERROR_QUOTED_SCHEME_PHRASE_PATTERN, QUOTED_SCHEME_PHRASE_REPLACEMENT],
+  // Authorization scheme values wherever they appear (headers, cookies, HTML, JSON messages), in any casing of
+  // the scheme word; looksLikeSchemeCredential keeps prose and parameter lists (a first parameter whose quoted
+  // value follows the match included).
+  [
+    new RegExp(String.raw`${NAME_BOUNDARY_PATTERN}(${ERROR_SCHEME_PATTERN})\s+([A-Za-z0-9\-._~+/=:]{6,})`, "gi"),
+    (match: string, scheme: string, value: string, offset: number, text: string) =>
+      looksLikeSchemeCredential(value, quoteOpensAt(text, offset + match.length)) ? `${scheme} ${REDACTED_ERROR_VALUE}` : match,
+  ],
+  // Vendor token prefixes name the token type: AWS access key ids (long-term `AKIA`, temporary `ASIA`) and STS
+  // bearer and context-specific credentials (`ABIA`, `ACCA`), Stripe secret and restricted keys, GitHub tokens,
+  // Slack tokens. The prefix is the carrier, so these go from snapshots too (AWS evidence carries its access key
+  // ids masked); the AWS unique ids of resources (roles, users, groups, policies) are bare shapes below.
+  [/\b(?:AKIA|ASIA|ABIA|ACCA)[A-Z0-9]{16}\b/g, REDACTED_ERROR_VALUE],
+  [/\b[sr]k_(?:live|test)_[A-Za-z0-9]{16,}/g, REDACTED_ERROR_VALUE],
+  [/\b(?:gh[oprsu]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,})/g, REDACTED_ERROR_VALUE],
+  [/\bxox[abeoprs]-[A-Za-z0-9-]{10,}/g, REDACTED_ERROR_VALUE],
   // JWT-shaped strings.
   [/\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}/g, REDACTED_ERROR_VALUE],
   // PEM blocks, whole or cut off.
   [/-----BEGIN [A-Z0-9 ]+-----[\s\S]*?(?:-----END [A-Z0-9 ]+-----|$)/g, REDACTED_ERROR_VALUE],
-  // AWS access key ids, 40-character secret access keys, long secret-shaped blobs, and hex digests.
-  [/\b(?:AKIA|ASIA|AROA|AIDA|AGPA|ANPA|ANVA|APKA|ABIA|ACCA)[A-Z0-9]{16}\b/g, REDACTED_ERROR_VALUE],
+];
+
+/** Bare-shape rules: a value is removed for its own shape, wherever it stands. Error text only; a snapshot keeps its identifiers. */
+const BARE_SHAPE_PATTERNS: ReadonlyArray<TextRule> = [
+  // AWS unique ids of roles, users, groups, managed policies, policy versions, and public keys: opaque
+  // identifiers in error text, resource names in a snapshot (an assumed-role principal is `AROA...:session`).
+  [/\b(?:AROA|AIDA|AGPA|ANPA|ANVA|APKA)[A-Z0-9]{16}\b/g, REDACTED_ERROR_VALUE],
+  // 40-character secret access keys, long secret-shaped blobs, and hex digests.
   [/(?<![A-Za-z0-9/+=])[A-Za-z0-9/+]{40}(?![A-Za-z0-9/+=])/g, REDACTED_ERROR_VALUE],
   // Long blobs must carry a digit so camelCase identifiers survive.
   [/(?<![A-Za-z0-9+_=-])(?=[A-Za-z0-9+_-]*\d)[A-Za-z0-9+_-]{40,}={0,2}(?![A-Za-z0-9+_=-])/g, REDACTED_ERROR_VALUE],
   [/\b[a-f0-9]{32,}\b/gi, REDACTED_ERROR_VALUE],
-  // Cookie headers carry session values in free form.
-  [/\b(set-cookie|cookie)(\s*[:=]\s*)[^\n<>]+/gi, `$1$2${REDACTED_ERROR_VALUE}`],
 ];
 
-// URL userinfo and query strings anywhere in the string, not only when the string starts with a URL.
-const ERROR_URL_PATTERN = /\b(https?:\/\/)(?:[^\s/@"'<>]+@)?([^\s?#"'<>]+)(\?[^\s#"'<>]*)?/gi;
+/**
+ * URL userinfo, query, and fragment anywhere in the string, not only when the string starts with a URL: any
+ * scheme (`https://`, `proxy://`), plain or with its slashes JSON-escaped (`https:\/\/`, reviewer #78 row C),
+ * after a JSON escape as after any other boundary. The scheme, host, and path stay; the userinfo goes and the
+ * query and the fragment each become the marker. The userinfo ends at the first `/`, `?`, or `#` as at
+ * whitespace (CodeRabbit on #76), so an `@` inside a query or a fragment is not a userinfo boundary when the
+ * authority before it is a host: `https://h?e=a@x.com&token=v` is host `h` with a query, which becomes the
+ * marker whole. When that authority is not `host[:port]` (`svc:secret`, a password read up to a raw `?` or `#`
+ * inside it) and an `@` follows in the run, the run up to that `@` is userinfo after all (scrubUrlMatch).
+ */
+const ERROR_URL_PATTERN = new RegExp(
+  String.raw`(?:(?<![A-Za-z0-9+.\\-])|(?<=\\[nrtbfv])|(?<=\\u[0-9A-Fa-f]{4}))([A-Za-z][A-Za-z0-9+.-]*:(?:\/\/|\\\/\\\/))(?:[^\s\/?#@"'<>\\]+@)?((?:[^\s?#"'<>\\]|\\\/)+)(\?(?:[^\s#"'<>\\]|\\\/)*)?(#(?:[^\s"'<>\\]|\\\/)*)?`,
+  "g",
+);
+/** A URL authority that is `host[:port]`: a name or address, or a bracketed IPv6 address, with at most a numeric port. */
+const HOST_AND_PORT_PATTERN = /^(?:\[[^\]\s]*\]|[^:\[\]@\\]+)(?::\d*)?$/;
+/** The first path separator of a host-and-path run, plain or JSON-escaped. */
+const PATH_START_PATTERN = /\\?\//;
+
+/**
+ * Renders one URL match: the userinfo is gone (the pattern never captures it) and the query and the fragment
+ * are the marker. An authority that is not `host[:port]` followed by an `@` later in the run is a userinfo
+ * whose password carried a raw `?` or `#`, so everything up to that `@` goes and the URL after it is rendered
+ * on its own; with a valid authority the `@` belongs to the query or the fragment.
+ */
+function scrubUrlMatch(_match: string, scheme: string, hostPath: string, query?: string, fragment?: string): string {
+  const pathStart = hostPath.search(PATH_START_PATTERN);
+  const tail = `${query ?? ""}${fragment ?? ""}`;
+  const at = tail.indexOf("@");
+  if (pathStart === -1 && at !== -1 && !HOST_AND_PORT_PATTERN.test(hostPath)) {
+    return `${scheme}${tail.slice(at + 1)}`.replace(ERROR_URL_PATTERN, scrubUrlMatch);
+  }
+  return `${scheme}${hostPath}${query ? `?${REDACTED_ERROR_VALUE}` : ""}${fragment ? `#${REDACTED_ERROR_VALUE}` : ""}`;
+}
 
 /**
  * Rule 9 scrub boundary for bare values. A run of 16 or more token characters is removed when it is shaped
@@ -781,7 +1243,10 @@ const ERROR_URL_PATTERN = /\b(https?:\/\/)(?:[^\s/@"'<>]+@)?([^\s?#"'<>]+)(\?[^\
  * whitespace end a run, so path segments, hostnames, ARNs, and emails are judged piece by piece. Opaque
  * identifiers whose shape is a token's are removed from error text as well; they travel in structured fields.
  */
-const LONG_TOKEN_RUN_PATTERN = /[A-Za-z0-9+_-]{16,}(?:={1,2}(?![A-Za-z0-9&]))?/g;
+// Trailing "=" is base64 padding only when a delimiter follows it; before a marker (`API_KEY=[REDACTED]`), a quote
+// (`AWS_SECRET_ACCESS_KEY='[REDACTED]'`, `signature_method='ccg'`), an escape, or a path
+// (`AWS_SHARED_CREDENTIALS_FILE=/home/audit/.aws/credentials`) it is the pair's separator, so the key keeps its name.
+const LONG_TOKEN_RUN_PATTERN = /[A-Za-z0-9+_-]{16,}(?:={1,2}(?![A-Za-z0-9&[/"'\\<]))?/g;
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const UPPERCASE_CODE_PATTERN = /^[A-Z][A-Z_]*$|^[A-Z][A-Z0-9]*(?:[_-][A-Z0-9]+)+$/;
 const MIN_LETTERS_FOR_CASING = 6;
@@ -827,15 +1292,82 @@ function scrubLongTokens(text: string): string {
  * error body, a transport error, or a URL into the audit output.
  */
 export function redactErrorText(text: string): string {
-  let scrubbed = scrubConfiguredSecrets(text);
-  scrubbed = scrubbed.replace(ERROR_URL_PATTERN, (_match, scheme: string, hostPath: string, query?: string) =>
-    `${scheme}${hostPath}${query ? `?${REDACTED_ERROR_VALUE}` : ""}`,
-  );
-  for (const [pattern, replacement] of ERROR_TEXT_PATTERNS) {
-    scrubbed = scrubbed.replace(pattern, replacement);
-  }
+  let scrubbed = scrubCarriers(text);
+  for (const rule of BARE_SHAPE_PATTERNS) scrubbed = applyTextRule(scrubbed, rule);
   scrubbed = scrubCredentialPairs(scrubbed);
   return scrubLongTokens(scrubbed);
+}
+
+/** The carrier passes shared by error text and snapshot strings: configured secrets, URL userinfo, query, and fragment, header carriers, Authorization parameter lists, challenge proofs, quoted values, schemes, vendor token prefixes, JWT and PEM shapes. */
+function scrubCarriers(text: string): string {
+  let scrubbed = scrubConfiguredSecrets(text);
+  scrubbed = scrubbed.replace(ERROR_URL_PATTERN, scrubUrlMatch);
+  scrubbed = scrubHeaderCarriers(scrubbed);
+  scrubbed = scrubAuthorizationParameters(scrubbed);
+  scrubbed = scrubChallengeParameters(scrubbed);
+  for (const rule of CARRIER_TEXT_PATTERNS) scrubbed = applyTextRule(scrubbed, rule);
+  return scrubbed;
+}
+
+/**
+ * Rule 9 data-side scrub for a string kept in a snapshot (reviewer D round 5 depth control): the carrier rules of
+ * redactErrorText (the configured secrets in every encoded form, URL userinfo, query, and fragment strings, the free-form
+ * header carriers, the proofs in Authorization parameter lists and in challenges, quoted header and pair values,
+ * authorization schemes, vendor token prefixes, JWT and PEM shapes, and credential-named pairs) without its
+ * bare-shape rules, so a value is removed for what carries it and an identifier, a digest, or a key id that is
+ * data stays data.
+ */
+export function redactCarrierText(text: string): string {
+  return scrubCredentialPairs(scrubCarriers(text));
+}
+
+/** Nesting past which an object or array in a snapshot is replaced by the marker; the value handed to the walker is depth 1. */
+const SNAPSHOT_DEPTH_CAP = 32;
+/**
+ * Field names whose value in API data is a secret whatever its shape. Exact names, not the suffix rule of the error
+ * text pair rule: a snapshot's own keys name collections about credentials (`tokens`, `credentials`,
+ * `passwordCredentials`, `webauthncredentials`, `hardtoken`) that carry metadata, and those stay. The URL-valued
+ * webhook keys are here because the token travels in the URL's path.
+ */
+const SNAPSHOT_SECRET_KEY_PATTERN =
+  /^(?:secret[_-]?key|skey|secret|client[_-]?secret|api[_-]?secret|password|passwd|passphrase|private[_-]?key|access[_-]?token|refresh[_-]?token|id[_-]?token|session[_-]?token|secret[_-]?access[_-]?key|assertion|connection[_-]?string|authorization|cookie|set-cookie|x-auth-key|api[_-]?key|x-api-key|webhook(?:[_-]?url)?)$/i;
+/**
+ * The bearer-id override for snapshot keys (CodeRabbit r4077259415 on #78, harness revision 3): a key ending in
+ * `secret_id` or `token_id`, any prefix, casing, and separator (`secret_id`, `VAULT_SECRET_ID`, `role_secret_id`,
+ * `roleSecretId`, `token_id`, `tokenId`), holds a Vault AppRole secret id or a token id, which authenticates rather
+ * than identifies, so its value is the marker whatever its shape; an `_id` key that identifies (`client_id`,
+ * `tenant_id`, `key_id`, `user_id`) is data and stays.
+ */
+const SNAPSHOT_BEARER_ID_KEY_PATTERN = /(?:secret|token)[_-]?id$/i;
+
+/** The snapshot walk behind scrubSnapshotValue and the integration's own data walkers: one key rule, one string rule, one cap. */
+function scrubSnapshotTree(value: unknown, isSecretKey: (key: string) => boolean, depth: number): unknown {
+  if (typeof value === "string") return redactCarrierText(value);
+  if (value === null || typeof value !== "object") return value;
+  if (value instanceof Date) return value;
+  if (depth > SNAPSHOT_DEPTH_CAP) return REDACTED_ERROR_VALUE;
+  if (Array.isArray(value)) return value.map((entry) => scrubSnapshotTree(entry, isSecretKey, depth + 1));
+  const output: Record<string, unknown> = {};
+  for (const [key, entry] of Object.entries(value as Record<string, unknown>)) {
+    output[key] = isSecretKey(key) ? snapshotMarkerFor(entry) : scrubSnapshotTree(entry, isSecretKey, depth + 1);
+  }
+  return output;
+}
+
+/** An absent or empty secret stays as it is (it reports that nothing was set); anything else is the marker. */
+function snapshotMarkerFor(entry: unknown): unknown {
+  return entry === undefined || entry === null || entry === "" ? entry : REDACTED_ERROR_VALUE;
+}
+
+/**
+ * Rule 9 walk over a value about to be written to a bundle file or returned as data (reviewer D round 5 depth
+ * control). Every string at every depth goes through redactCarrierText, so a carrier inside a benign-keyed string
+ * (`detail: "Authorization: Bearer ..."`) is scrubbed in place with its siblings kept; a value under a secret
+ * field name is the marker; an object or array nested past SNAPSHOT_DEPTH_CAP is the marker, so the depth of a
+ * server-supplied tree bounds the work and nothing deeper than the cap is copied.
+ */
+export function scrubSnapshotValue(value: unknown): unknown {
+  return scrubSnapshotTree(value, (key) => SNAPSHOT_SECRET_KEY_PATTERN.test(key) || SNAPSHOT_BEARER_ID_KEY_PATTERN.test(key), 1);
 }
 
 export class AnsibleApiError extends Error {
@@ -860,6 +1392,83 @@ function requestPath(target: string): string {
     return target.split("?")[0] ?? target;
   }
 }
+
+/** Why a server-supplied link is not followed. Each class renders as text that names the origins involved and never the link. */
+type NextLinkRefusal = "foreign_origin" | "userinfo" | "unparseable";
+
+/**
+ * Same-origin rule for every URL taken from a response (a list page's `next`): resolved against the configured
+ * base the way a browser would, so AAP's root-relative `/api/v2/...?page=2` links land on the base and a
+ * protocol-relative `//host/...` link names its own host, the link must keep the base's scheme, host, and port
+ * and carry no userinfo. Anything else is refused before a request (and the token or session cookie) leaves for it.
+ */
+function nextLinkRefusal(target: string, base: string): NextLinkRefusal | undefined {
+  let baseUrl: URL;
+  let resolved: URL;
+  try {
+    baseUrl = new URL(base);
+    resolved = new URL(target, baseUrl);
+  } catch {
+    return "unparseable";
+  }
+  if (resolved.username !== "" || resolved.password !== "") return "userinfo";
+  if (resolved.origin === "null" || resolved.origin !== baseUrl.origin) return "foreign_origin";
+  return undefined;
+}
+
+/**
+ * The origin `target` names once resolved against `base`, as scheme, host, and port (`https://aap.example.com:8443`)
+ * or as the bare scheme of a URL without a host (`javascript:`, `data:`); undefined when it does not parse.
+ */
+function originLabel(target: string, base?: string): string | undefined {
+  try {
+    const url = new URL(target, base);
+    return url.host.length > 0 ? `${url.protocol}//${url.host}` : url.protocol;
+  } catch {
+    return undefined;
+  }
+}
+
+const NEXT_LINK_REFUSED_TAIL = "so the walk was stopped; the link was not followed and no request was made for it";
+
+/**
+ * The truncation reason recorded for a refused next link (harness revision 3, class 8): it names the configured
+ * origin and, when the link resolved onto another one, that origin too (scheme, host, and port, or the bare
+ * scheme of a `javascript:` or `data:` link), so the operator can see where the API tried to send the client.
+ * Never the link itself: no path, query, fragment, or userinfo is recorded. A link on another origin and a
+ * link with userinfo both parsed against the configured base (that is how they were classified), so their
+ * origins are known; the unparseable class has no origin of its own to name.
+ */
+function nextLinkRefusalNote(refusal: NextLinkRefusal, target: string, base: string): string {
+  const configuredOrigin = originLabel(base);
+  const configured = configuredOrigin === undefined ? "the configured origin" : `the configured origin ${configuredOrigin}`;
+  switch (refusal) {
+    case "foreign_origin":
+      return `the API advertised a next page on ${originLabel(target, base) ?? "another origin"} rather than ${configured}, ${NEXT_LINK_REFUSED_TAIL}`;
+    case "userinfo": {
+      const linkOrigin = originLabel(target, base);
+      const where = linkOrigin === undefined || linkOrigin === configuredOrigin ? configured : `${linkOrigin} rather than ${configured}`;
+      return `the API advertised a next page link carrying userinfo for ${where}, ${NEXT_LINK_REFUSED_TAIL}`;
+    }
+    case "unparseable":
+      return `the API advertised a next page link that could not be parsed against ${configured}, ${NEXT_LINK_REFUSED_TAIL}`;
+    default: {
+      const exhaustive: never = refusal;
+      return exhaustive;
+    }
+  }
+}
+
+/** Rendering of a request refused by the same-origin rule before it was made; the target itself is never recorded. */
+const REQUEST_REFUSED_NOTE = "AAP request refused: the target is not on the configured origin, so no request was made.";
+/** The `endpoint` of a refused request: none was sent, and the refused target must not be named. */
+const REFUSED_ENDPOINT = "not requested";
+/**
+ * A target the URL parser reads as absolute rather than as a path: one with a scheme (any casing) or one that
+ * opens with two slashes or backslashes (a protocol-relative link; the parser reads `\\` as `//`). The same
+ * reading the same-origin rule applied, so a target it let through is requested as the URL it is.
+ */
+const ABSOLUTE_URL_PATTERN = /^(?:[a-z][a-z0-9+.-]*:|[\\/]{2})/i;
 
 function normalizeKeyName(key: string): string {
   return key.toLowerCase().replace(/[^a-z0-9]/g, "");
@@ -905,21 +1514,31 @@ export function sanitizeScmUrl(value: unknown): unknown {
  * Returns a deep copy of a settings or configuration tree in which every value
  * under a credential-bearing key, every value of an environment dictionary,
  * and every value of a {name, value} or {key, value} pair is replaced by the
- * redaction marker, and every URL string loses its userinfo and query string.
+ * redaction marker, every URL string loses its userinfo and query string, and
+ * every other string is scrubbed for carriers (a bearer, a cookie, a
+ * credential pair inside an arbitrary nested setting value) at every depth;
+ * an object or array nested past the snapshot cap is the marker (reviewer D
+ * round 5 depth control). A settings tree reaches this step already projected
+ * to its documented keys (settingsProjector); the credential `inputs` and
+ * notification header maps handed in with redactEveryValue keep the shape the
+ * server returned.
  */
-export function redactCredentialTree(value: unknown, redactEveryValue = false): unknown {
+export function redactCredentialTree(value: unknown, redactEveryValue = false, depth = 1): unknown {
+  if (typeof value === "string") return redactCarrierText(sanitizeUrlText(value));
+  if (value === null || typeof value !== "object") return value;
+  if (depth > SNAPSHOT_DEPTH_CAP) return ANSIBLE_REDACTION_MARKER;
   if (Array.isArray(value)) {
     return value.map((entry) => {
       const pair = asObject(entry);
       if (pair && "value" in pair && (typeof pair.name === "string" || typeof pair.key === "string")) {
         return {
-          ...(redactCredentialTree(pair, redactEveryValue) as JsonRecord),
+          ...(redactCredentialTree(pair, redactEveryValue, depth + 1) as JsonRecord),
           ...(typeof pair.name === "string" ? { name: pair.name } : {}),
           ...(typeof pair.key === "string" ? { key: pair.key } : {}),
           value: redactedOr(pair.value),
         };
       }
-      return redactCredentialTree(entry, redactEveryValue);
+      return redactCredentialTree(entry, redactEveryValue, depth + 1);
     });
   }
   const object = asObject(value);
@@ -929,12 +1548,11 @@ export function redactCredentialTree(value: unknown, redactEveryValue = false): 
       if (redactEveryValue || isCredentialKeyName(key)) {
         output[key] = redactedOr(entry);
       } else {
-        output[key] = redactCredentialTree(entry, ENVIRONMENT_KEY_PATTERN.test(normalizeKeyName(key)));
+        output[key] = redactCredentialTree(entry, ENVIRONMENT_KEY_PATTERN.test(normalizeKeyName(key)), depth + 1);
       }
     }
     return output;
   }
-  if (typeof value === "string") return sanitizeUrlText(value);
   return value;
 }
 
@@ -966,18 +1584,97 @@ export function redactVariables(value: unknown): unknown {
 }
 
 /**
- * Projects the documented fields of a record. A body that parsed to a primitive or an array is not the
- * documented object: it projects to nothing rather than reaching the `in` operator, whose TypeError
- * message would quote the value.
+ * The documented type of a projected field, or a projector that returns the value to keep (undefined to drop
+ * it). `scalar` accepts a string, number, boolean, or null; every kind accepts null, the API's rendering of an
+ * unset field.
  */
-function pick(item: unknown, keys: readonly string[]): JsonRecord {
+type FieldKind = "scalar" | "string" | "number" | "boolean";
+type FieldRule = FieldKind | ((value: unknown) => unknown);
+type FieldSpec = Readonly<Record<string, FieldRule>>;
+
+function isScalar(value: unknown): value is string | number | boolean | null {
+  return value === null || typeof value === "string" || typeof value === "number" || typeof value === "boolean";
+}
+
+function hasFieldKind(value: unknown, kind: FieldKind): boolean {
+  switch (kind) {
+    case "scalar":
+      return isScalar(value);
+    case "string":
+      return typeof value === "string";
+    case "number":
+      return typeof value === "number" && Number.isFinite(value);
+    case "boolean":
+      return typeof value === "boolean";
+    default: {
+      const exhaustive: never = kind;
+      throw new Error(`unhandled field kind ${String(exhaustive)}`);
+    }
+  }
+}
+
+/** A list whose entries are strings; entries of any other type are dropped. */
+function stringList(value: unknown): string[] | undefined {
+  return Array.isArray(value) ? value.filter((entry): entry is string => typeof entry === "string") : undefined;
+}
+
+/** An object whose values are scalars (an environment map); nested values are dropped. */
+function scalarMap(value: unknown): JsonRecord | undefined {
+  const object = asObject(value);
+  return object ? Object.fromEntries(Object.entries(object).filter(([, entry]) => isScalar(entry))) : undefined;
+}
+
+/** A list of records projected one by one; entries that are not objects are dropped. */
+function listOf(spec: FieldSpec): (value: unknown) => JsonRecord[] | undefined {
+  return (value) => (Array.isArray(value) ? value.filter((entry) => asObject(entry) !== undefined).map((entry) => pickTyped(entry, spec)) : undefined);
+}
+
+/**
+ * A map of records keyed by name (an IdP map) projected entry by entry. The names are server-supplied content, so an
+ * entry that is not an object or carries none of the documented fields is dropped with its name rather than kept
+ * as an empty record.
+ */
+function mapOf(spec: FieldSpec): (value: unknown) => JsonRecord | undefined {
+  return (value) => {
+    const object = asObject(value);
+    if (!object) return undefined;
+    const entries = Object.entries(object)
+      .map(([name, entry]): [string, JsonRecord] => [name, pickTyped(entry, spec)])
+      .filter(([, projected]) => Object.keys(projected).length > 0);
+    return Object.fromEntries(entries);
+  };
+}
+
+/**
+ * Projects the documented fields of a record in their documented types. A body that parsed to a primitive or
+ * an array is not the documented object: it projects to nothing rather than reaching the `in` operator, whose
+ * TypeError message would quote the value. A documented key whose value is not of its documented type (a
+ * nested object or array where a scalar is documented, a string where a number is) is dropped rather than
+ * copied verbatim, so an undocumented shape under a documented key never travels into the access check, a
+ * finding, or the bundle (round 4 item E).
+ */
+function pickTyped(item: unknown, spec: FieldSpec): JsonRecord {
   const projected: JsonRecord = {};
   const object = asObject(item);
   if (!object) return projected;
-  for (const key of keys) {
-    if (key in object) projected[key] = object[key];
+  for (const [key, rule] of Object.entries(spec)) {
+    if (!(key in object)) continue;
+    const value = object[key];
+    if (value === null) {
+      projected[key] = null;
+    } else if (typeof rule === "function") {
+      const kept = rule(value);
+      if (kept !== undefined) projected[key] = kept;
+    } else if (hasFieldKind(value, rule)) {
+      projected[key] = value;
+    }
   }
   return projected;
+}
+
+/** Projects the documented fields of a record, each of which is a scalar (an id, a name, a flag, a timestamp, or null). */
+function pick(item: unknown, keys: readonly string[]): JsonRecord {
+  return pickTyped(item, Object.fromEntries(keys.map((key) => [key, "scalar" as const])));
 }
 
 function redactField(item: JsonRecord, key: string, redact: (value: unknown) => unknown = redactedOr): JsonRecord {
@@ -998,8 +1695,10 @@ function pickSummaryList(item: JsonRecord, field: string, keys: readonly string[
     .map((entry) => pick(entry, keys));
 }
 
-const USER_FIELDS = ["id", "username", "is_superuser", "is_system_auditor", "external_account", "last_login", "created", "modified"];
-const PING_FIELDS = ["version", "active_node", "ha", "instances", "instance_groups"];
+const USER_FIELDS: FieldSpec = Object.freeze({ id: "number", username: "string", is_superuser: "boolean", is_system_auditor: "boolean", external_account: "string", last_login: "string", created: "string", modified: "string" });
+const PING_INSTANCE_FIELDS: FieldSpec = Object.freeze({ node: "string", node_type: "string", uuid: "string", heartbeat: "string", capacity: "number", version: "string" });
+const PING_INSTANCE_GROUP_FIELDS: FieldSpec = Object.freeze({ name: "string", capacity: "number", instances: stringList });
+const PING_FIELDS: FieldSpec = Object.freeze({ version: "string", active_node: "string", ha: "boolean", instances: listOf(PING_INSTANCE_FIELDS), instance_groups: listOf(PING_INSTANCE_GROUP_FIELDS) });
 const JOB_FIELDS = ["id", "type", "name", "status", "failed", "launch_type", "started", "finished", "elapsed", "job_template", "unified_job_template", "inventory", "project", "playbook", "created"];
 const TEMPLATE_FIELDS = ["id", "type", "name", "description", "playbook", "project", "inventory", "status", "last_job_run", "last_job_failed", "execution_environment", "survey_enabled", "ask_variables_on_launch", "ask_credential_on_launch", "ask_execution_environment_on_launch", "created", "modified"];
 const SCHEDULE_FIELDS = ["id", "name", "unified_job_template", "enabled", "rrule", "next_run", "dtstart", "dtend", "created", "modified"];
@@ -1020,11 +1719,45 @@ const INSTANCE_GROUP_FIELDS = ["id", "name", "max_concurrent_jobs", "max_forks",
 const JOB_HOST_SUMMARY_FIELDS = ["id", "job", "host", "host_name", "failed", "changed", "ok", "failures", "skipped", "unreachable", "created"];
 const EXECUTION_ENVIRONMENT_FIELDS = ["id", "name", "description", "image", "pull", "organization", "credential", "managed", "created", "modified"];
 const SURVEY_QUESTION_FIELDS = ["variable", "type", "required", "question_name", "min", "max"];
-const JOB_SETTING_KEYS = ["SCHEDULE_MAX_JOBS", "MAX_FORKS", "DEFAULT_JOB_TIMEOUT", "DEFAULT_INVENTORY_UPDATE_TIMEOUT", "DEFAULT_PROJECT_UPDATE_TIMEOUT", "AD_HOC_COMMANDS", "AWX_TASK_ENV", "GALAXY_TASK_ENV"];
+const JOB_SETTING_FIELDS: FieldSpec = Object.freeze({ SCHEDULE_MAX_JOBS: "number", MAX_FORKS: "number", DEFAULT_JOB_TIMEOUT: "number", DEFAULT_INVENTORY_UPDATE_TIMEOUT: "number", DEFAULT_PROJECT_UPDATE_TIMEOUT: "number", AD_HOC_COMMANDS: stringList, AWX_TASK_ENV: scalarMap, GALAXY_TASK_ENV: scalarMap });
+/**
+ * The settings categories the platform findings read, projected the way `job_settings.json` is (reviewer D
+ * round 5 class 10): each spec names the documented keys in their documented types, so an undocumented key of
+ * the server's dictionary is dropped rather than copied and a documented key holding another type is dropped
+ * rather than copied verbatim. Authentication keeps the category's session and local-auth flags, the backend
+ * list, and the LDAP, SAML, and OIDC keys whose populatedness control 25 reads (a server URI, a bind or template
+ * DN, a search base, a group DN, an attribute map, the SAML SP entity id and IdP map, the OIDC endpoint), for
+ * `AUTH_LDAP_` and the five numbered `AUTH_LDAP_<n>_` servers. The bind password, the SP certificate and private
+ * key, the OIDC client id and secret, the organization and team maps, and the keys that are populated by default
+ * (`AUTH_LDAP_GROUP_TYPE`, `AUTH_LDAP_CONNECTION_OPTIONS`, `SAML_AUTO_CREATE_OBJECTS`,
+ * `SOCIAL_AUTH_OIDC_VERIFY_SSL`, the read-only SAML callback and metadata URLs) are not documented here, so
+ * neither a secret nor a default stands in for a configured authenticator. System keeps the two activity stream
+ * flags; logging keeps the aggregator flags and enumerations control 26 reads and never the host, port,
+ * username, or password.
+ */
+const LDAP_SETTING_FIELDS: FieldSpec = Object.freeze({ SERVER_URI: "string", BIND_DN: "string", USER_DN_TEMPLATE: "string", USER_SEARCH: stringList, GROUP_SEARCH: stringList, REQUIRE_GROUP: "string", DENY_GROUP: "string", USER_ATTR_MAP: scalarMap });
+const LDAP_SETTING_PREFIXES = ["AUTH_LDAP_", "AUTH_LDAP_1_", "AUTH_LDAP_2_", "AUTH_LDAP_3_", "AUTH_LDAP_4_", "AUTH_LDAP_5_"];
+const SAML_IDP_FIELDS: FieldSpec = Object.freeze({ entity_id: "string", url: "string" });
+const AUTHENTICATION_SETTING_FIELDS: FieldSpec = Object.freeze({
+  SESSION_COOKIE_AGE: "number",
+  SESSIONS_PER_USER: "number",
+  DISABLE_LOCAL_AUTH: "boolean",
+  AUTH_BASIC_ENABLED: "boolean",
+  ALLOW_OAUTH2_FOR_EXTERNAL_USERS: "boolean",
+  SOCIAL_AUTH_USERNAME_IS_FULL_EMAIL: "boolean",
+  AUTHENTICATION_BACKENDS: stringList,
+  ...Object.fromEntries(LDAP_SETTING_PREFIXES.flatMap((prefix) => Object.entries(LDAP_SETTING_FIELDS).map(([key, rule]): [string, FieldRule] => [`${prefix}${key}`, rule]))),
+  SOCIAL_AUTH_SAML_SP_ENTITY_ID: "string",
+  SOCIAL_AUTH_SAML_ENABLED_IDPS: mapOf(SAML_IDP_FIELDS),
+  SOCIAL_AUTH_OIDC_OIDC_ENDPOINT: "string",
+});
+const SYSTEM_SETTING_FIELDS: FieldSpec = Object.freeze({ ACTIVITY_STREAM_ENABLED: "boolean", ACTIVITY_STREAM_ENABLED_FOR_INVENTORY_SYNC: "boolean" });
+const LOGGING_SETTING_FIELDS: FieldSpec = Object.freeze({ LOG_AGGREGATOR_ENABLED: "boolean", LOG_AGGREGATOR_TYPE: "string", LOG_AGGREGATOR_PROTOCOL: "string", LOG_AGGREGATOR_LEVEL: "string", LOG_AGGREGATOR_VERIFY_CERT: "boolean", LOG_AGGREGATOR_INDIVIDUAL_FACTS: "boolean", LOG_AGGREGATOR_LOGGERS: stringList });
 const SUMMARY_CREDENTIAL_FIELDS = ["id", "name", "kind", "credential_type_id"];
 
+/** The documented user fields in their documented types; anything else under those keys is dropped. */
 export function projectUser(user: JsonRecord): JsonRecord {
-  return pick(user, USER_FIELDS);
+  return pickTyped(user, USER_FIELDS);
 }
 
 function projectJob(job: JsonRecord): JsonRecord {
@@ -1152,18 +1885,29 @@ function projectSurveySpec(spec: JsonRecord | undefined): JsonRecord | undefined
   };
 }
 
-function projectJobSettings(settings: JsonRecord | undefined): JsonRecord | undefined {
-  return settings ? redactCredentialTree(pick(settings, JOB_SETTING_KEYS)) as JsonRecord : settings;
+/**
+ * The core_data projection of a settings category: its documented keys in their documented types (idempotent over
+ * the collection-time projection, so a snapshot handed in raw is projected here too), then the credential-bearing
+ * values redacted. The server's whole dictionary never reaches a settings file.
+ */
+function settingsProjector(spec: FieldSpec): (settings: JsonRecord | undefined) => JsonRecord | undefined {
+  return (settings) => (settings ? redactCredentialTree(pickTyped(settings, spec)) as JsonRecord : settings);
 }
 
-function projectSettings(settings: JsonRecord | undefined): JsonRecord | undefined {
-  return settings ? redactCredentialTree(settings) as JsonRecord : settings;
-}
+const projectJobSettings = settingsProjector(JOB_SETTING_FIELDS);
+const projectAuthenticationSettings = settingsProjector(AUTHENTICATION_SETTING_FIELDS);
+const projectSystemSettings = settingsProjector(SYSTEM_SETTING_FIELDS);
+const projectLoggingSettings = settingsProjector(LOGGING_SETTING_FIELDS);
 
-/** The ping document's documented fields; a body that is not a JSON object (a string, number, or array) is not a ping and is dropped. */
-function projectPing(ping: unknown): JsonRecord | undefined {
+/**
+ * The ping document's documented fields in their documented types (`version`, `active_node` strings, `ha` a
+ * boolean, `instances` and `instance_groups` lists of records projected the same way); a body that is not a
+ * JSON object (a string, number, or array) is not a ping and is dropped, and so is a nested value under one
+ * of those keys.
+ */
+export function projectPing(ping: unknown): JsonRecord | undefined {
   const object = asObject(ping);
-  return object ? pick(object, PING_FIELDS) : undefined;
+  return object ? pickTyped(object, PING_FIELDS) : undefined;
 }
 
 export class AnsibleAapClient {
@@ -1183,9 +1927,15 @@ export class AnsibleAapClient {
     registerConfiguredSecrets(config.token, config.password);
   }
 
+  /**
+   * An absolute target (a scheme in any casing, `HTTPS://host/...` included, or a protocol-relative `//host/...`)
+   * resolves against the configured base the way the same-origin rule parsed it, so it is requested as the URL
+   * it is and never appended to the base as a path (harness revision 3, class 8). A relative target is a path
+   * under the base: root-relative as given, otherwise under `/api/v2/`.
+   */
   private resolveUrl(pathOrUrl: string): string {
-    if (pathOrUrl.startsWith("http://") || pathOrUrl.startsWith("https://")) {
-      return pathOrUrl;
+    if (ABSOLUTE_URL_PATTERN.test(pathOrUrl)) {
+      return new URL(pathOrUrl, this.config.baseUrl).toString();
     }
 
     const normalizedPath = pathOrUrl.startsWith("/") ? pathOrUrl : `/api/v2/${pathOrUrl}`;
@@ -1271,6 +2021,12 @@ export class AnsibleAapClient {
    * status-and-length note and transport failures carry the transport message, all scrubbed.
    */
   async get<T = unknown>(pathOrUrl: string): Promise<T> {
+    // The same-origin rule sits in front of the transport (and of the session login), so no target that left the
+    // configured base can be fetched with the token or session cookie, whichever path handed it in. The error
+    // names neither the target nor its path.
+    if (nextLinkRefusal(pathOrUrl, this.config.baseUrl)) {
+      throw new AnsibleApiError(REQUEST_REFUSED_NOTE, undefined, REFUSED_ENDPOINT);
+    }
     await this.ensureSession();
     const headers: Record<string, string> = { accept: "application/json" };
     if (this.config.token) {
@@ -1318,7 +2074,14 @@ export class AnsibleAapClient {
       const remaining = limit - items.length;
       if (results.length > remaining) dropped += results.length - remaining;
       items.push(...results.slice(0, remaining));
-      const following: string | null = Array.isArray(page) ? null : page.next ?? null;
+      const following: string | null = Array.isArray(page) ? null : typeof page.next === "string" ? page.next : null;
+      // A next link that leaves the configured origin is refused here, before get() would attach the credential
+      // to it; the collection records the refusal as its truncation reason and the link itself is never recorded.
+      const refusal = following ? nextLinkRefusal(following, this.config.baseUrl) : undefined;
+      if (refusal && following) {
+        stalled = nextLinkRefusalNote(refusal, following, this.config.baseUrl);
+        break;
+      }
       if (following && following === next) {
         stalled = "the API repeated the same next page link, so the walk was stopped";
         break;
@@ -1459,6 +2222,30 @@ async function fetchObject(client: AnsibleClientSurface, label: string, path: st
   }
 }
 
+/** The fixed error a settings read records when the body carries none of the category's documented keys. */
+function unrecognizedSettingsError(label: string, path: string): string {
+  return `${label} (${path}): no documented settings key returned`;
+}
+
+/**
+ * A settings category read and projected to its documented keys at collection time, so the findings, the
+ * summary, and the bundle all see the projection and never the server's whole dictionary (rule 9's tenant
+ * configuration clause; reviewer D round 5 class 10). A body that carries none of the documented keys (a foreign
+ * JSON document, an empty object, a primitive or array, a category whose documented keys all hold undocumented
+ * types) is not a recognizable settings surface: the snapshot carries a fixed error and no data, the way an
+ * unrecognizable `me` body does in probeScope, so the bundle writes the not-collected marker and the dependent
+ * findings take their unreadable paths.
+ */
+async function fetchSettings(client: AnsibleClientSurface, label: string, path: string, spec: FieldSpec): Promise<Snapshot<JsonRecord | undefined>> {
+  const snapshot = await fetchObject(client, label, path);
+  if (snapshot.error) return snapshot;
+  const settings = pickTyped(snapshot.data, spec);
+  if (Object.keys(settings).length === 0) {
+    return { data: undefined, error: unrecognizedSettingsError(label, path), status: null, endpoint: requestPath(path) };
+  }
+  return { data: settings };
+}
+
 interface InventoryView {
   label: string;
   items: JsonRecord[];
@@ -1510,11 +2297,18 @@ export interface AnsibleScope {
   note?: string;
 }
 
-function currentUserFromMe(value: unknown): JsonRecord | undefined {
+/**
+ * The current user from a `/api/v2/me/` body: the first entry of `results` (AAP) or the object itself, projected
+ * to its documented fields in their documented types. A body without a string `username` or a numeric `id`
+ * after projection is not a recognizable user and yields none.
+ */
+export function currentUserFromMe(value: unknown): JsonRecord | undefined {
   const object = asObject(value);
   if (!object) return undefined;
-  if (Array.isArray(object.results)) return asObject(object.results[0]);
-  return object;
+  const candidate = Array.isArray(object.results) ? asObject(object.results[0]) : object;
+  if (!candidate) return undefined;
+  const user = projectUser(candidate);
+  return typeof user.username === "string" || typeof user.id === "number" ? user : undefined;
 }
 
 async function probeScope(client: AnsibleClientSurface): Promise<Snapshot<AnsibleScope>> {
@@ -2400,7 +3194,9 @@ export async function collectAnsiblePlatformSecurityData(client: AnsibleClientSu
     if (!id) continue;
     teamRoles[id] = await collect(client, `team ${nameOf(team)} roles`, `/api/v2/teams/${id}/roles/`, {}, 500);
   }
-  const credentials = await collect(client, "credentials", "/api/v2/credentials/", {}, 500);
+  // Labelled "credential records" rather than "credentials": the label opens the "<label>: <count> of <total> seen" and
+  // "<label>: unreadable (...)" notes, and a value after a credential-named key is removed whatever its shape.
+  const credentials = await collect(client, "credential records", "/api/v2/credentials/", {}, 500);
   const credentialOwners: PlatformSecurityData["credentialOwners"] = {};
   for (const credential of credentials.data.items) {
     const id = asString(credential.id);
@@ -2440,9 +3236,9 @@ export async function collectAnsiblePlatformSecurityData(client: AnsibleClientSu
   const notificationTemplates = await collect(client, "notification templates", "/api/v2/notification_templates/", {}, 200);
   const notifications = await collect(client, "notifications", "/api/v2/notifications/", { order_by: "-created" }, 100);
   const activity = await collect(client, "activity stream", "/api/v2/activity_stream/", { order_by: "-timestamp" }, 10);
-  const authSettings = await fetchObject(client, "authentication settings", "/api/v2/settings/authentication/");
-  const systemSettings = await fetchObject(client, "system settings", "/api/v2/settings/system/");
-  const loggingSettings = await fetchObject(client, "logging settings", "/api/v2/settings/logging/");
+  const authSettings = await fetchSettings(client, "authentication settings", "/api/v2/settings/authentication/", AUTHENTICATION_SETTING_FIELDS);
+  const systemSettings = await fetchSettings(client, "system settings", "/api/v2/settings/system/", SYSTEM_SETTING_FIELDS);
+  const loggingSettings = await fetchSettings(client, "logging settings", "/api/v2/settings/logging/", LOGGING_SETTING_FIELDS);
   return {
     scope,
     organizations,
@@ -2511,7 +3307,7 @@ export function assessAnsiblePlatformSecurityData(data: PlatformSecurityData, no
   const organizations = inventory("organizations", data.organizations);
   const users = inventory("users", data.users);
   const teams = inventory("teams", data.teams);
-  const credentials = inventory("credentials", data.credentials);
+  const credentials = inventory("credential records", data.credentials);
   const tokens = inventory("OAuth2 tokens", data.tokens);
   const projects = inventory("projects", data.projects);
   const templates = inventory("job templates", data.jobTemplates);
@@ -2681,7 +3477,7 @@ export function assessAnsiblePlatformSecurityData(data: PlatformSecurityData, no
     const vaultCredentials = credentials.items.filter((credential) => isVaultCredential(credential));
     const vaultNote = credentials.readable
       ? ` ${vaultCredentials.length} Vault credentials (vault_id: ${vaultCredentials.map((credential) => vaultId(credential) ?? "default").join(", ") || "none"}) are defined for encrypted variables.`
-      : ` Vault credential usage could not be read (credentials: ${credentials.error}), so encrypted variable coverage was not checked.`;
+      : ` Vault credential usage could not be read (${credentials.error}), so encrypted variable coverage was not checked.`;
     const launchNote = launchTimeVariableTemplates.length > 0
       ? ` ${launchTimeVariableTemplates.length} templates set ask_variables_on_launch; launch-time extra_vars are not scanned.`
       : "";
@@ -3326,9 +4122,9 @@ export function buildAnsibleCoreDataFiles(
     ["core_data/notification_templates.json", projectCollectionSnapshot(platformData.notificationTemplates, projectNotificationTemplate)],
     ["core_data/notifications.json", projectCollectionSnapshot(platformData.notifications, projectNotification)],
     ["core_data/activity_stream.json", projectCollectionSnapshot(platformData.activity, projectActivity)],
-    ["core_data/settings_authentication.json", projectObjectSnapshot(platformData.authSettings, projectSettings)],
-    ["core_data/settings_system.json", projectObjectSnapshot(platformData.systemSettings, projectSettings)],
-    ["core_data/settings_logging.json", projectObjectSnapshot(platformData.loggingSettings, projectSettings)],
+    ["core_data/settings_authentication.json", projectObjectSnapshot(platformData.authSettings, projectAuthenticationSettings)],
+    ["core_data/settings_system.json", projectObjectSnapshot(platformData.systemSettings, projectSystemSettings)],
+    ["core_data/settings_logging.json", projectObjectSnapshot(platformData.loggingSettings, projectLoggingSettings)],
   ];
 }
 
@@ -3728,9 +4524,24 @@ export function ansibleFixedTexts(): readonly string[] {
   const settingsDenied = `AAP request failed: /api/v2/settings/system/ (403 Forbidden)${responseDetail(deniedBody, "application/json")}`;
   const templatesDenied = `AAP request failed: /api/v2/job_templates/ (403 Forbidden)${responseDetail(deniedBody, "application/json")}`;
   const notificationsDenied = `AAP request failed: /api/v2/notifications/ (403 Forbidden)${responseDetail(deniedBody, "application/json")}`;
+  const credentialsDenied = `credential records (/api/v2/credentials/): AAP request failed: /api/v2/credentials/ (403 Forbidden)${responseDetail(deniedBody, "application/json")}`;
   const parentFailed: Snapshot<AnsibleCollection> = { data: { items: [], complete: false }, error: inventoriesDenied, status: 403, endpoint: "/api/v2/inventories/" };
   const inventories = inventory("inventories", parentFailed);
   const unknownScope: Snapshot<AnsibleScope> = { data: { fullVisibility: null, note: "current user could not be read, so the visibility of the audit account is unknown" }, error: "current user (/api/v2/me/): no user returned", status: null, endpoint: "/api/v2/me/" };
+  // Refused next links rendered for every origin shape the rule can meet: another host, port, or scheme, a
+  // scheme without a host, an IP literal, userinfo on the configured host and on another, and a link that
+  // does not parse. The link's path, query, fragment, and userinfo never reach the note.
+  const aapBase = "https://aap.example.com";
+  const refusalNotes = [
+    nextLinkRefusalNote("foreign_origin", "https://evil.example/api/v2/users/?page=2&page_size=100", aapBase),
+    nextLinkRefusalNote("foreign_origin", "https://aap.example.com:8443/api/v2/users/?page=2", aapBase),
+    nextLinkRefusalNote("foreign_origin", "http://aap.example.com/api/v2/users/?page=2", aapBase),
+    nextLinkRefusalNote("foreign_origin", "javascript:alert(1)", aapBase),
+    nextLinkRefusalNote("foreign_origin", "https://[::1]:8443/api/v2/users/?page=2", aapBase),
+    nextLinkRefusalNote("userinfo", "https://svc:placeholder@aap.example.com/api/v2/users/?page=2", aapBase),
+    nextLinkRefusalNote("userinfo", "https://svc:placeholder@evil.example/api/v2/users/?page=2", aapBase),
+    nextLinkRefusalNote("unparseable", "https://[bad/api/v2/users/?page=2", aapBase),
+  ];
   return Object.freeze([
     PARSE_ERROR_NOTE,
     describeNonJsonBody("text/html; charset=utf-8", html),
@@ -3745,6 +4556,10 @@ export function ansibleFixedTexts(): readonly string[] {
     "AAP session login failed (401 Unauthorized).",
     "AAP session auth requires AAP_USERNAME and AAP_PASSWORD.",
     ...partialNotes(unknownScope, inventories, inventory("hosts", { data: { items: [{}], complete: false, total: 40, truncation: "page cap reached" } })),
+    ...refusalNotes,
+    inventory("users", { data: { items: [{}], complete: false, total: 2, truncation: refusalNotes[0] } }).partial ?? "",
+    REQUEST_REFUSED_NOTE,
+    REFUSED_ENDPOINT,
     finding(22, "pass", "No team holds the Admin role on every inventory.", undefined, partialNotes(unknownScope, inventories)).summary,
     unknownScope.error ?? "",
     manualForUnreadable(22, inventories, "the Teams list with each team's roles and the inventories each Admin role covers").summary,
@@ -3756,13 +4571,22 @@ export function ansibleFixedTexts(): readonly string[] {
     "ACTIVITY_STREAM_ENABLED is not exposed by the system settings, so it was not confirmed",
     "ACTIVITY_STREAM_ENABLED is false, so platform changes are not being recorded.",
     `the logging settings could not be read (no settings object returned), so external log aggregation was not confirmed`,
+    unrecognizedSettingsError("authentication settings", "/api/v2/settings/authentication/"),
+    unrecognizedSettingsError("system settings", "/api/v2/settings/system/"),
+    unrecognizedSettingsError("logging settings", "/api/v2/settings/logging/"),
+    `the system settings could not be read (${unrecognizedSettingsError("system settings", "/api/v2/settings/system/")}), so ACTIVITY_STREAM_ENABLED was not confirmed`,
+    `the logging settings could not be read (${unrecognizedSettingsError("logging settings", "/api/v2/settings/logging/")}), so external log aggregation was not confirmed`,
+    manualForUnreadable(25, { label: "authentication settings", error: unrecognizedSettingsError("authentication settings", "/api/v2/settings/authentication/"), status: null, endpoint: "/api/v2/settings/authentication/" }, "the LDAP, SAML, or OIDC authenticator configuration (Settings > Authentication, or the platform gateway Authentication page on AAP 2.5)").summary,
     `the inventories list could not be read (${inventoriesDenied}), so inventory-wide Admin roles were not checked`,
     `the job templates list could not be read (${templatesDenied}), so last-run ages were not checked`,
     `owning template unknown: the job templates list could not be read (${templatesDenied})`,
     `the notification delivery history could not be read (${notificationsDenied}), so failed deliveries were not checked`,
     "No notification templates exist, so job failures cannot alert anyone. An empty notification inventory is treated as fail for this control.",
     "None of the 3 teams holds the Admin role on an organization or on every inventory.",
-    `Vault credential usage could not be read (credentials: AAP request failed: /api/v2/credentials/ (403 Forbidden)${responseDetail(deniedBody, "application/json")}), so encrypted variable coverage was not checked.`,
+    `Vault credential usage could not be read (${credentialsDenied}), so encrypted variable coverage was not checked.`,
+    `credential records could not be read (${credentialsDenied}), so this control cannot be verified from the API. Collect this evidence manually: the Credentials list with Last Modified and the Access tab of each credential`,
+    "credential records: 12 of 40 seen (page cap reached)",
+    `credential records: unreadable (${credentialsDenied})`,
     "3 credentials expose no owners summary and their owner_users/owner_teams endpoints could not be read; review their Access tab manually.",
   ]);
 }

@@ -19,21 +19,27 @@ import {
   ANSIBLE_CONTROLS,
   ANSIBLE_REDACTION_MARKER,
   AnsibleAapClient,
+  AnsibleApiError,
   ansibleFixedTexts,
   assessAnsibleHostCoverage,
   assessAnsibleJobHealth,
   assessAnsiblePlatformSecurity,
   checkAnsibleAccess,
   createTlsOptOutFetch,
+  currentUserFromMe,
   exportAnsibleAuditBundle,
   findPlaintextSecrets,
   parseRruleInterval,
+  projectPing,
+  projectUser,
+  redactCarrierText,
   redactCredentialTree,
   redactErrorText,
   redactVariables,
   resolveAnsibleConfiguration,
   resolveSecureOutputPath,
   sanitizeScmUrl,
+  scrubSnapshotValue,
 } from "../dist/extensions/grc-tools/ansible.js";
 import { readBundleFiles, readZipEntries } from "./helpers/bundle-contents.mjs";
 import {
@@ -58,7 +64,31 @@ import {
   parserMessageFor,
   parserSnippetBody,
 } from "./helpers/error-canaries.mjs";
-import { assertFixedTextsSurvive, assertMustKeepRows, assertMustRedactRowsBesideMustKeep } from "./helpers/redaction-table.mjs";
+import {
+  BEARER_ID_CARRIER_CONTROL_ROWS,
+  BEARER_ID_VALUES,
+  DEPTH_CONTROL,
+  DEPTH_CONTROL_CANARIES,
+  ESCAPED_HEADER_LINES,
+  JSON_ESCAPES,
+  QUOTED_NON_CREDENTIAL_GROUP,
+  assertAuthorizationParameterRows,
+  assertBearerIdKeyRows,
+  assertBearerIdSnapshotKeys,
+  assertCarrierTextScrub,
+  assertChallengeProofRows,
+  assertCredentialPairValuesRemoved,
+  assertDepthControl,
+  assertDepthControlOutputs,
+  assertEscapedHeaderCarriers,
+  assertFixedTextsSurvive,
+  assertIdentifierKeyRows,
+  assertFlagAndPathPairRows,
+  assertUrlUserinfoBoundaryRows,
+  assertMustKeepRows,
+  assertMustRedactRowsBesideMustKeep,
+  withPlantedRoutes,
+} from "./helpers/redaction-table.mjs";
 
 const NOW = new Date("2026-09-21T00:00:00.000Z");
 const SUPERUSER = { id: 1, username: "auditor", is_superuser: true, is_system_auditor: false };
@@ -539,6 +569,184 @@ test("verdict rule 10: listCollection reports a trimmed last page, a repeated ne
 
   const noCount = makeClient(async () => jsonResponse({ results: [{ id: 1 }] }));
   assert.equal(await noCount.count("/api/v2/teams/"), undefined, "a missing count is reported as unknown, not as the probe page size");
+});
+
+// A `next` link the server controls: its path segment, its query token, a userinfo password, the username of the
+// only user the foreign page would serve, and two name-shaped parts the token scrub would keep, so they vanish only
+// when nothing echoes the link itself.
+const NEXT_LINK_PATH_CANARY = "Hq7vTm3KpXw9ZbLn2Rf";
+const NEXT_LINK_QUERY_CANARY = "Wn4kJd8VqRz2TxPy6Mc";
+const NEXT_LINK_USERINFO_CANARY = "Fy9bNs2LtKp7WqXm4Vd";
+const FOREIGN_PAGE_USER_CANARY = "Zc3tRv8HnQm5KwYp7Lb";
+// Name-shaped and sharing no window with the origins the refusal reason names (the reason names the link's origin,
+// never its path or query).
+const NEXT_LINK_PATH_NAME = "planted-hop-segment";
+const NEXT_LINK_QUERY_NAME = "planted-query-marker";
+const NEXT_LINK_CANARIES = Object.freeze([NEXT_LINK_PATH_CANARY, NEXT_LINK_QUERY_CANARY, NEXT_LINK_USERINFO_CANARY, FOREIGN_PAGE_USER_CANARY, NEXT_LINK_PATH_NAME, NEXT_LINK_QUERY_NAME]);
+const FOREIGN_NEXT_HOST = "offsite.example.net";
+/** Origin of AAP_CLIENT_CONFIG.baseUrl, spelled out because that config is declared further down the file. */
+const AAP_ORIGIN = "https://aap.example.com";
+const NEXT_LINK_REFUSED_TAIL = "so the walk was stopped; the link was not followed and no request was made for it";
+
+function escapeRegExp(text) {
+  return text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+/**
+ * The truncation reason for a link that resolved onto `origin`: it names that origin and the configured one
+ * (harness revision 3, class 8), so the operator sees where the API tried to send the client, and nothing else
+ * of the link.
+ */
+function foreignOriginReason(origin) {
+  return new RegExp(`^the API advertised a next page on ${escapeRegExp(origin)} rather than the configured origin ${escapeRegExp(AAP_ORIGIN)}, ${escapeRegExp(NEXT_LINK_REFUSED_TAIL)}$`);
+}
+const USERINFO_REASON = new RegExp(`^the API advertised a next page link carrying userinfo for the configured origin ${escapeRegExp(AAP_ORIGIN)}, ${escapeRegExp(NEXT_LINK_REFUSED_TAIL)}$`);
+const UNPARSEABLE_REASON = new RegExp(`^the API advertised a next page link that could not be parsed against the configured origin ${escapeRegExp(AAP_ORIGIN)}, ${escapeRegExp(NEXT_LINK_REFUSED_TAIL)}$`);
+
+/**
+ * Every shape a server-supplied `next` link can take off the configured base, each with the refusal reason its
+ * truncation must carry, plus the same-origin controls (AAP's real root-relative form and the absolute form)
+ * that must still be followed.
+ */
+function aapNextLinkVariants(listPath) {
+  const path = `/${NEXT_LINK_PATH_CANARY}/${NEXT_LINK_PATH_NAME}/page2`;
+  const query = `page=2&page_size=100&token=${NEXT_LINK_QUERY_CANARY}&hop=${NEXT_LINK_QUERY_NAME}`;
+  const insecureOrigin = AAP_ORIGIN.replace("https://", "http://");
+  return {
+    refused: {
+      host: [`https://${FOREIGN_NEXT_HOST}${path}?${query}`, foreignOriginReason(`https://${FOREIGN_NEXT_HOST}`)],
+      port: [`${AAP_ORIGIN}:8443${path}?${query}`, foreignOriginReason(`${AAP_ORIGIN}:8443`)],
+      scheme: [`${insecureOrigin}${path}?${query}`, foreignOriginReason(insecureOrigin)],
+      userinfo: [`${AAP_ORIGIN.replace("https://", `https://intruder:${NEXT_LINK_USERINFO_CANARY}@`)}${path}?${query}`, USERINFO_REASON],
+      protocol_relative: [`//${FOREIGN_NEXT_HOST}${path}?${query}`, foreignOriginReason(`https://${FOREIGN_NEXT_HOST}`)],
+      unparseable: [`https://[${NEXT_LINK_PATH_CANARY}${path}?${query}`, UNPARSEABLE_REASON],
+    },
+    followed: {
+      relative_same_origin: `${listPath}?page=2&page_size=100&token=ctrl-page-2`,
+      absolute_same_origin: `${AAP_ORIGIN}${listPath}?page=2&page_size=100&token=ctrl-page-2`,
+      // The URL parser reads the scheme and the host case-insensitively, so these name the configured origin too
+      // and must be requested as the URLs they are, not appended to the base as paths.
+      uppercase_scheme_same_origin: `${AAP_ORIGIN.toUpperCase()}${listPath}?page=2&page_size=100&token=ctrl-page-2`,
+      case_differing_host_same_origin: `${AAP_ORIGIN.replace("aap.example.com", "AAP.Example.COM")}${listPath}?page=2&page_size=100&token=ctrl-page-2`,
+    },
+  };
+}
+
+function requestOrigin(url) {
+  try {
+    return new URL(url).origin;
+  } catch {
+    return "unparseable";
+  }
+}
+
+/**
+ * Transport for a planted `next` link on the users list: page one carries the link, the same-origin control page
+ * serves one control user, and any request that leaves the configured base is answered with a page carrying the
+ * foreign superuser so a followed link shows up as inventory poisoning as well as in the request log.
+ */
+function plantedNextLinkFetch(routes, listPath, link, calls) {
+  const routed = aapRoutedFetch(routes);
+  return async (url, init) => {
+    calls.push({ url, credential: Boolean(init?.headers?.authorization || init?.headers?.cookie) });
+    if (requestOrigin(url) !== AAP_ORIGIN) {
+      return jsonResponse({ count: 1, next: null, previous: null, results: [{ id: 999, username: FOREIGN_PAGE_USER_CANARY, is_superuser: true, is_system_auditor: false }] });
+    }
+    const parsed = new URL(url);
+    if (parsed.pathname === listPath && parsed.searchParams.get("token") === "ctrl-page-2") {
+      return jsonResponse({ count: 4, next: null, previous: `${listPath}?page_size=100`, results: [{ id: 42, username: "ctrl-page-2-user", is_superuser: false, is_system_auditor: false }] });
+    }
+    if (parsed.pathname === listPath && !parsed.searchParams.get("page")) {
+      const firstPage = await routes[listPath](parsed).json();
+      return jsonResponse({ ...firstPage, count: firstPage.results.length + 1, next: link });
+    }
+    return routed(url, init);
+  };
+}
+
+test("rule 9: a next link that leaves the configured base is refused before any request is made for it, recorded as the collection's truncation reason, and never echoed", async () => {
+  const listPath = "/api/v2/users/";
+  assert.equal(new URL(AAP_CLIENT_CONFIG.baseUrl).origin, AAP_ORIGIN, "the planted links are built against the configured base");
+  const variants = aapNextLinkVariants(listPath);
+  for (const [variant, [link, reason]] of Object.entries(variants.refused)) {
+    const label = `next (${variant})`;
+    const calls = [];
+    const client = new AnsibleAapClient(AAP_CLIENT_CONFIG, { fetchImpl: plantedNextLinkFetch(healthyAapRoutes(), listPath, link, calls), now: () => NOW });
+    const collection = await client.listCollection(listPath);
+    assert.equal(calls.length, 1, `${label}: only page one is requested; the planted link never reaches the transport`);
+    assert.equal(new URL(calls[0].url).pathname, listPath, `${label}: the one request is the list itself`);
+    assert.deepEqual(collection.items.map((user) => user.username), ["auditor", "ops", "reviewer"], `${label}: the inventory is page one only, nothing merged from the link`);
+    assert.equal(collection.complete, false, `${label}: the collection is reported incomplete`);
+    assert.equal(collection.total, 4, `${label}: the API's count is kept as the total`);
+    assert.match(collection.truncation ?? "", reason, `${label}: the truncation reason names the origins involved and states that no request left`);
+    assertNoCanaryWindows(assert, collection, NEXT_LINK_CANARIES, `${label} collection`);
+    assert.ok(!JSON.stringify({ ...collection, truncation: undefined }).includes(FOREIGN_NEXT_HOST), `${label}: outside the reason, nothing names the link's host`);
+  }
+  for (const [variant, link] of Object.entries(variants.followed)) {
+    const label = `next (${variant})`;
+    const calls = [];
+    const client = new AnsibleAapClient(AAP_CLIENT_CONFIG, { fetchImpl: plantedNextLinkFetch(healthyAapRoutes(), listPath, link, calls), now: () => NOW });
+    const collection = await client.listCollection(listPath);
+    assert.equal(calls.length, 2, `${label}: the same-origin control page is followed`);
+    assert.equal(requestOrigin(calls[1].url), AAP_ORIGIN, `${label}: the control request stays on the configured base`);
+    assert.equal(new URL(calls[1].url).pathname, listPath, `${label}: the control link is requested as the URL it is, never appended to the base as a path`);
+    assert.equal(new URL(calls[1].url).searchParams.get("token"), "ctrl-page-2", `${label}: the control link is requested as served`);
+    assert.deepEqual(collection.items.map((user) => user.username), ["auditor", "ops", "reviewer", "ctrl-page-2-user"], `${label}: both pages are merged`);
+    assert.equal(collection.complete, true, `${label}: a complete same-origin walk is complete`);
+    assert.equal(collection.truncation, undefined, `${label}: a complete walk carries no reason`);
+  }
+
+  // The rule also sits in front of the transport itself, ahead of the session login, so a target that reaches get()
+  // from anywhere else is refused with fixed text and no request (login bootstrap included) is made for it.
+  for (const config of [AAP_CLIENT_CONFIG, { ...AAP_CLIENT_CONFIG, token: undefined, username: "auditor", password: "session-password-for-tests-1" }]) {
+    let transportCalls = 0;
+    const guarded = new AnsibleAapClient(config, { fetchImpl: async () => { transportCalls += 1; return jsonResponse({}); }, now: () => NOW });
+    for (const [variant, [link]] of Object.entries(variants.refused)) {
+      const error = await guarded.get(link).then(() => undefined, (thrown) => thrown);
+      assert.equal(error?.name, "AnsibleApiError", `${variant}: the refusal is an AnsibleApiError`);
+      assert.equal(error.message, "AAP request refused: the target is not on the configured origin, so no request was made.");
+      assert.equal(error.endpoint, "not requested", `${variant}: the endpoint field never carries the refused target's path`);
+      assert.equal(error.status, undefined, `${variant}: no HTTP status, because no request was made`);
+      assertNoCanaryWindows(assert, { message: error.message, endpoint: error.endpoint }, NEXT_LINK_CANARIES, `${variant} refusal`);
+    }
+    assert.equal(transportCalls, 0, `${config.token ? "token" : "session"} auth: a refused target never reaches the transport`);
+  }
+  for (const text of ["AAP request refused: the target is not on the configured origin, so no request was made.", "not requested"]) {
+    assert.ok(ansibleFixedTexts().includes(text), `"${text}" is in the fixed-text list`);
+  }
+});
+
+test("rule 9: a refused next link on the users list leaves the access check, the verdicts, and the bundle without any part of the link or the foreign principal, with the reason recorded", async () => {
+  const listPath = "/api/v2/users/";
+  const [link] = aapNextLinkVariants(listPath).refused.host;
+  const calls = [];
+  const client = new AnsibleAapClient(AAP_CLIENT_CONFIG, { fetchImpl: plantedNextLinkFetch(healthyAapRoutes(), listPath, link, calls), now: () => NOW });
+  const run = await runEveryAnsibleTool(client, createTempBase("grclanker-ansible-next-link-"));
+
+  assert.deepEqual(calls.filter((call) => requestOrigin(call.url) !== AAP_ORIGIN), [], "no request leaves the configured base, credentialed or not");
+  assert.equal(run.accessError, undefined);
+  assert.equal(run.access.surfaces.find((surface) => surface.name === "users").status, "readable");
+  assertNoCanaryWindows(assert, run.access, NEXT_LINK_CANARIES, "check_access");
+
+  const rbac = run.assessments.flatMap((assessment) => assessment.findings).find((item) => item.control === 23);
+  assert.equal(rbac.status, "warn", "a verdict over the truncated users list is downgraded from pass");
+  assert.equal(rbac.evidence.probed_users, 3, "only the users of page one were probed");
+  const usersReason = `the API advertised a next page on https://${FOREIGN_NEXT_HOST} rather than the configured origin ${AAP_ORIGIN}, ${NEXT_LINK_REFUSED_TAIL}`;
+  assert.ok(rbac.evidence.partial_view.includes(`users: 3 of 4 seen (${usersReason})`), `the partial view carries the reason: ${JSON.stringify(rbac.evidence.partial_view)}`);
+  for (const assessment of run.assessments) assertNoCanaryWindows(assert, assessment, NEXT_LINK_CANARIES, assessment.title);
+
+  assert.equal(run.exportError, undefined);
+  const files = readBundleFiles(run.exported.outputDir);
+  assertNoCanaryWindowsInFiles(assert, files, NEXT_LINK_CANARIES, "bundle");
+  assertNoCanaryWindowsInFiles(assert, readZipEntries(run.exported.zipPath), NEXT_LINK_CANARIES, "zip");
+  const users = JSON.parse(files.get("core_data/users.json"));
+  assert.equal(users.data.complete, false);
+  assert.equal(users.data.truncation, usersReason);
+  assert.deepEqual(users.data.items.map((user) => user.username), ["auditor", "ops", "reviewer"], "the dataset holds page one only");
+  const allText = [...files.values()].join("\n");
+  const hostMentions = allText.split(FOREIGN_NEXT_HOST).length - 1;
+  const reasonMentions = allText.split(`on https://${FOREIGN_NEXT_HOST} rather than the configured origin ${AAP_ORIGIN}`).length - 1;
+  assert.ok(hostMentions > 0 && hostMentions === reasonMentions, `the bundle names the link's host only as the origin inside the refusal reason, never as a link (${hostMentions} mentions, ${reasonMentions} in reasons)`);
 });
 
 test("checkAnsibleAccess reports readable AAP audit surfaces and visibility", async () => {
@@ -1409,15 +1617,19 @@ test("verdict rule 9: exportAnsibleAuditBundle never writes variables bodies, cr
   assert.deepEqual(survey, { variable: "api_token", type: "text", required: true, default: ANSIBLE_REDACTION_MARKER });
   assert.equal(read("activity_stream.json").data.items[0].changes, `${ANSIBLE_REDACTION_MARKER} (variable names: extra_vars)`);
   assert.deepEqual(read("activity_stream.json").data.items[0].summary_fields.actor, { id: 1, username: "auditor" });
+  // The three settings files carry the documented keys only (reviewer D round 5 class 10): the secret-named keys the
+  // fixture plants are not documented, so they are absent rather than redacted, and so is every other undocumented key.
   const authSettings = read("settings_authentication.json").data;
-  assert.equal(authSettings.AUTH_LDAP_SERVER_URI, "ldaps://ldap.example.com");
-  assert.equal(authSettings.AUTH_LDAP_BIND_DN, "cn=svc,dc=example");
-  assert.equal(authSettings.AUTH_LDAP_BIND_PASSWORD, ANSIBLE_REDACTION_MARKER);
-  assert.equal(authSettings.SOCIAL_AUTH_SAML_SP_PRIVATE_KEY, ANSIBLE_REDACTION_MARKER);
-  assert.equal(authSettings.SOCIAL_AUTH_SAML_ENABLED_IDPS.okta.url, "https://idp.example.com/sso", "URL query strings are dropped from settings values");
-  assert.deepEqual(read("settings_system.json").data, { ACTIVITY_STREAM_ENABLED: true, REDHAT_PASSWORD: ANSIBLE_REDACTION_MARKER, LICENSE: { license_key: ANSIBLE_REDACTION_MARKER, subscription_name: "AAP" } });
-  assert.equal(read("settings_logging.json").data.LOG_AGGREGATOR_PASSWORD, ANSIBLE_REDACTION_MARKER);
-  assert.equal(read("settings_logging.json").data.LOG_AGGREGATOR_TYPE, "splunk");
+  assert.deepEqual(authSettings, {
+    AUTH_LDAP_SERVER_URI: "ldaps://ldap.example.com",
+    AUTH_LDAP_BIND_DN: "cn=svc,dc=example",
+    SOCIAL_AUTH_SAML_ENABLED_IDPS: { okta: { entity_id: "https://idp.example.com/", url: "https://idp.example.com/sso" } },
+  }, "the authentication settings keep the documented LDAP and SAML keys; URL query strings are dropped from settings values");
+  for (const undocumented of ["AUTH_LDAP_BIND_PASSWORD", "SOCIAL_AUTH_SAML_SP_PRIVATE_KEY", "SOCIAL_AUTH_GITHUB_SECRET"]) {
+    assert.ok(!(undocumented in authSettings), `${undocumented} is not a documented authentication key and is absent, not redacted`);
+  }
+  assert.deepEqual(read("settings_system.json").data, { ACTIVITY_STREAM_ENABLED: true }, "REDHAT_PASSWORD and LICENSE are not documented system keys and are absent");
+  assert.deepEqual(read("settings_logging.json").data, { LOG_AGGREGATOR_ENABLED: true, LOG_AGGREGATOR_TYPE: "splunk" }, "LOG_AGGREGATOR_PASSWORD is not a documented logging key and is absent");
   assert.deepEqual(Object.keys(read("users.json").data.items[0]).sort(), ["id", "is_superuser", "is_system_auditor", "username"]);
   assert.deepEqual(read("access.json").currentUser, { id: 1, username: "auditor", is_superuser: true, is_system_auditor: false });
   assert.deepEqual(Object.keys(read("notifications.json").data.items[0]).sort(), ["id", "status"]);
@@ -1524,7 +1736,7 @@ test("rule 1 corollary: multi-inventory findings never pass when a secondary inv
   const cases = [
     { control: 12, assess: assessAnsibleHostCoverage, forbidden: "/api/v2/schedules/", names: /schedules could not be read/ },
     { control: 13, assess: assessAnsibleHostCoverage, forbidden: "/api/v2/job_templates/", names: /job templates list could not be read/ },
-    { control: 18, assess: assessAnsiblePlatformSecurity, forbidden: "/api/v2/credentials/", names: /Vault credential usage could not be read \(credentials: /, expected: "warn" },
+    { control: 18, assess: assessAnsiblePlatformSecurity, forbidden: "/api/v2/credentials/", names: /Vault credential usage could not be read \(credential records \(\/api\/v2\/credentials\/\): /, expected: "warn" },
     { control: 18, assess: assessAnsiblePlatformSecurity, forbidden: "/api/v2/inventories/", names: /variable sources \(inventories\) could not be read/, expected: "manual" },
     { control: 21, assess: assessAnsiblePlatformSecurity, forbidden: "/api/v2/organizations/1/admins/", names: /admins list of 1 organizations \(Default\) could not be read/, expected: "manual" },
     { control: 22, assess: assessAnsiblePlatformSecurity, forbidden: "/api/v2/inventories/", names: /inventories list could not be read/, expected: "warn", partialView: /^inventories: unreadable \(inventories \(\/api\/v2\/inventories\/\): / },
@@ -1583,6 +1795,19 @@ const ANSIBLE_ERROR_BODY_CANARIES = Object.freeze({ json: "Uw34sFSRwES87v9q", ht
  */
 const ANSIBLE_PRIMITIVE_BODY_CANARY = "kR7dQx2mVt9HpZ4wLc3";
 
+/**
+ * Reviewer D round 5 class 10: the values a `200 foreign JSON` settings body carries under keys no settings category
+ * documents (a bare token, a credential-named pair, a bearer carrier, a cookie carrier) and under a documented key of
+ * an undocumented shape.
+ */
+const ANSIBLE_FOREIGN_SETTINGS_CANARIES = Object.freeze({
+  bare: "Hq8vN2tKz5Rw7Ym3Pd6Lc9Xb4Fg",
+  pair: "Gk3Zt8Mq5Xw2Nr7Yp4Lc9Vb6Hd",
+  bearer: "Wc4Tn7Ks2Qp9Zx5Vm8Rb3Jd6Hf",
+  cookie: "Rt6Kp9Wq2Zn5Xc8Vm3Yb7Jf4Hd",
+  typed: "Lm5Xr8Qw3Tz6Kp2Vn9Yc4Hb7Jd",
+});
+
 /** Every planted canary an Ansible output is swept for, window by window. */
 const ANSIBLE_PLANTED_CANARIES = Object.freeze([
   ...CANARY_VALUES,
@@ -1594,6 +1819,7 @@ const ANSIBLE_PLANTED_CANARIES = Object.freeze([
   ANSIBLE_RUN_TOKEN_CANARY,
   ...Object.values(ANSIBLE_ERROR_BODY_CANARIES),
   ANSIBLE_PRIMITIVE_BODY_CANARY,
+  ...Object.values(ANSIBLE_FOREIGN_SETTINGS_CANARIES),
 ]);
 
 const AAP_CLIENT_CONFIG = { baseUrl: "https://aap.example.com", token: ANSIBLE_RUN_TOKEN_CANARY, timeoutMs: 30_000, verifySsl: true, sourceChain: ["tests"] };
@@ -1720,9 +1946,15 @@ test("rule 9 fixed texts (GWS note 1): every fixed-text message the integration 
     "AAP session login failed (401 Unauthorized).",
     "AAP session auth requires AAP_USERNAME and AAP_PASSWORD.",
     "ACTIVITY_STREAM_ENABLED is not exposed by the system settings, so it was not confirmed",
+    "authentication settings (/api/v2/settings/authentication/): no documented settings key returned",
+    "system settings (/api/v2/settings/system/): no documented settings key returned",
+    "logging settings (/api/v2/settings/logging/): no documented settings key returned",
+    "the system settings could not be read (system settings (/api/v2/settings/system/): no documented settings key returned), so ACTIVITY_STREAM_ENABLED was not confirmed",
+    "the logging settings could not be read (logging settings (/api/v2/settings/logging/): no documented settings key returned), so external log aggregation was not confirmed",
   ]) {
     assert.ok(texts.includes(required), `the fixed-text list carries: ${required}`);
   }
+  assert.ok(texts.some((text) => /^authentication settings could not be read \(authentication settings \(\/api\/v2\/settings\/authentication\/\): no documented settings key returned\), so this control cannot be verified from the API\. Collect this evidence manually: /.test(text)), "the manual-for-unrecognizable-settings summary is in the list");
   assert.ok(texts.some((text) => HTML_BODY_NOTE.test(text)), "the fixed-text list carries the non-JSON body note");
   assert.ok(texts.some((text) => /^inventories could not be read \(AAP request failed: \/api\/v2\/inventories\/ \(403 Forbidden\) .*\), so this control cannot be verified from the API\. Collect this evidence manually: /.test(text)), "the manual-for-unreadable summary is in the list");
   assert.ok(texts.some((text) => /^No team holds the Admin role on every inventory\. Downgraded from pass to warn because the inventory is partial or unreadable: current user could not be read, so the visibility of the audit account is unknown; inventories: unreadable \(/.test(text)), "the warn-capped pass summary built on an unreadable view is in the list");
@@ -1816,9 +2048,248 @@ test("rule 9 must-keep and must-redact table (addendum 7): every endpoint path, 
       values: ansibleFixedTexts(),
       sentence: (value) => `AAP-RBAC-02: ${value}`,
     },
+    QUOTED_NON_CREDENTIAL_GROUP,
   ];
   assertMustKeepRows(assert, redactErrorText, groups);
   assertMustRedactRowsBesideMustKeep(assert, redactErrorText, groups);
+});
+
+test("rule 9 escapes (reviewer D round 5 escapes): a header carrier after a two-character or six-character JSON escape is removed exactly as at a line start, for the nineteen header lines the integrations send, the six escapes, and five forms, at 6-to-24 windows, direct and through the client's JSON error path", async () => {
+  const judged = assertEscapedHeaderCarriers(assert, redactErrorText);
+  assert.equal(judged, ESCAPED_HEADER_LINES.length * JSON_ESCAPES.length * 5);
+  assert.equal(ESCAPED_HEADER_LINES.length, 19);
+
+  // The two classes reviewer D found leaking, carried by an error message on a probed surface: a later cookie
+  // pair whose name has no credential word, and X-Auth-Key with an alphabetic value, each after a two-character
+  // and a six-character escape.
+  const tracker = "Rk7mVq2Zt9Xw4Ly6Pn8Hc3Jb";
+  const globalKey = "prodkeyQz8Nv3Tm5Rk2Wy7";
+  const message = `request failed\\nCookie: theme=dark; my.tracker=${tracker}\\u000aX-Auth-Key: ${globalKey}`;
+  assert.ok(message.includes("\\n") && message.includes("\\u000a"), "the message carries the escapes as backslash text");
+  const expectedTail = "\\nCookie: [REDACTED]\\u000aX-Auth-Key: [REDACTED]";
+  const probeLog = [];
+  await checkAnsibleAccess(aapClient(healthyAapRoutes(), probeLog));
+  const surface = probeLog.map((entry) => entry.path).find((path) => path !== "/api/v2/me/" && path !== "/api/v2/ping/");
+  assert.ok(surface, "the access check probes a surface beyond me and ping");
+  const access = await checkAnsibleAccess(aapClient({ ...healthyAapRoutes(), [surface]: () => aapResponse(JSON.stringify({ detail: message }), 403, "Forbidden", "application/json") }));
+  const failed = access.surfaces.find((entry) => entry.endpoint === surface);
+  assert.equal(failed.status, "not_readable");
+  assert.ok(failed.error.includes(expectedTail), `both carriers are removed whole after their escapes: ${failed.error}`);
+  assertNoCanaryWindows(assert, access, [tracker, globalKey], "check_access after escaped headers");
+});
+
+test("rule 9 depth control (reviewer D round 5 depth control): every string a snapshot keeps passes the data-side carrier scrub at every depth in place, a credential-keyed value is the marker in place with its benign sibling kept, and a container nested past the cap of 32 is the marker, on redactCredentialTree and scrubSnapshotValue and end to end through a nested settings tree into core_data, the zip, and every tool payload", async () => {
+  assert.equal(DEPTH_CONTROL.cap, 32);
+  // The exported walkers: level k of the tree handed to the walker sits at depth k, so levels 1 to 32 are in place and level 33 is the marker.
+  assertDepthControl(assert, (tree) => redactCredentialTree(tree), { label: "ansible.redactCredentialTree", marker: ANSIBLE_REDACTION_MARKER });
+  assertDepthControl(assert, scrubSnapshotValue, { label: "ansible.scrubSnapshotValue" });
+  assertDepthControl(assert, (tree) => scrubSnapshotValue([tree])[0], { label: "ansible.scrubSnapshotValue on a record list", rootDepth: 2 });
+  assertDepthControl(assert, (tree) => redactCredentialTree({ record: tree }).record, { label: "ansible.redactCredentialTree under a benign key", rootDepth: 2, marker: ANSIBLE_REDACTION_MARKER });
+  // The string half on its own: carriers go, identifiers stay, the configured token goes in every form.
+  aapClient(healthyAapRoutes());
+  assertCarrierTextScrub(assert, redactCarrierText, { label: "ansible.redactCarrierText", configuredSecret: AAP_CLIENT_CONFIG.token });
+
+  // End to end: the tree planted on every body and in every record and nested record of every healthy route. Every
+  // writer projects documented fields, the three settings writers included since reviewer D round 5 class 10, so no
+  // core_data file, zip entry, or tool payload carries a trace of the tree; the cap is exercised on the walkers above.
+  // The planted key beside the documented keys leaves every settings body recognizable, so no read fails.
+  const planted = { count: 0 };
+  const log = [];
+  const run = await runEveryAnsibleTool(aapClient(withPlantedRoutes(healthyAapRoutes(), { planted }), log), createTempBase("grclanker-ansible-depth-"));
+  assert.ok(planted.count >= Object.keys(healthyAapRoutes()).length, `the fixture planted the tree into ${planted.count} objects`);
+  assert.equal(run.accessError, undefined, "the access check reads the planted fixture");
+  assert.equal(run.exportError, undefined, "the export reads the planted fixture");
+  assert.equal(run.exported.errorCount, 0, "the planted tree causes no read to fail");
+  const files = readBundleFiles(run.exported.outputDir);
+  const zipEntries = readZipEntries(run.exported.zipPath);
+  assertDepthControlOutputs(
+    assert,
+    { files, zipEntries, outputs: [run.access, ...run.assessments] },
+    { label: "ansible", treeExpected: false, marker: ANSIBLE_REDACTION_MARKER },
+  );
+  for (const name of ["core_data/settings_system.json", "core_data/settings_authentication.json", "core_data/settings_logging.json"]) {
+    const settings = JSON.parse(files.get(name));
+    assert.ok(!("x_deep_probe" in settings.data), `${name}: the undocumented key is dropped by the projection, not carried with the cap applied`);
+    assert.ok(Object.keys(settings.data).length > 0, `${name}: the documented keys beside it are kept`);
+  }
+  assert.ok(!JSON.stringify([run.access, ...run.assessments]).includes("benign-note-"), "no tool payload copies the settings tree");
+  assertNoCanaryWindows(assert, run.access, DEPTH_CONTROL_CANARIES, "check_access");
+  for (const assessment of run.assessments) assertNoCanaryWindows(assert, assessment, DEPTH_CONTROL_CANARIES, assessment.title);
+});
+
+/** The three settings categories the platform findings read: path, core_data file, and the label the read records. */
+const ANSIBLE_SETTINGS_SURFACES = Object.freeze([
+  ["/api/v2/settings/authentication/", "core_data/settings_authentication.json", "authentication settings"],
+  ["/api/v2/settings/system/", "core_data/settings_system.json", "system settings"],
+  ["/api/v2/settings/logging/", "core_data/settings_logging.json", "logging settings"],
+]);
+
+/**
+ * Reviewer D's class 10 members (the `200 foreign JSON` body): a bare token under a key no settings category
+ * documents, a credential-named pair and a bearer carrier inside a record list, and a cookie carrier two containers
+ * down, planted beside or instead of the documented keys of each settings body.
+ */
+function foreignSettingsMembers(canaries = ANSIBLE_FOREIGN_SETTINGS_CANARIES) {
+  return {
+    foo: canaries.bare,
+    items: [{ password: canaries.pair, description: `Authorization: Bearer ${canaries.bearer}` }],
+    nested: { deeper: { note: `Cookie: sessionid=${canaries.cookie}; theme=dark` } },
+  };
+}
+
+test("rule 9 settings projection (reviewer D round 5 class 10): a bare token and a carrier under undocumented keys of the three settings bodies reach no bundle file, zip entry, or tool payload, a documented body projects unchanged, and a body carrying none of the documented keys is an unrecognizable settings surface that writes the marker and demotes without TypeError text", async () => {
+  const canaries = Object.values(ANSIBLE_FOREIGN_SETTINGS_CANARIES);
+  const healthy = await runEveryAnsibleTool(aapClient(healthyAapRoutes()), createTempBase("grclanker-ansible-settings-documented-"));
+  assert.equal(healthy.exportError, undefined);
+  const healthyFiles = readBundleFiles(healthy.exported.outputDir);
+  const healthyPlatform = healthy.assessments[2];
+
+  // A documented body projects to its documented keys in their documented types and nothing else.
+  assert.deepEqual(JSON.parse(healthyFiles.get("core_data/settings_authentication.json")), { data: { AUTH_LDAP_SERVER_URI: "ldaps://ldap.example.com", SOCIAL_AUTH_SAML_ENABLED_IDPS: {} } });
+  assert.deepEqual(JSON.parse(healthyFiles.get("core_data/settings_system.json")), { data: { ACTIVITY_STREAM_ENABLED: true } });
+  assert.deepEqual(JSON.parse(healthyFiles.get("core_data/settings_logging.json")), { data: { LOG_AGGREGATOR_ENABLED: true, LOG_AGGREGATOR_TYPE: "splunk" } });
+  assert.equal(byControl(healthyPlatform, 25).status, "pass");
+  assert.equal(byControl(healthyPlatform, 26).status, "pass");
+  assert.equal(healthyPlatform.summary.external_auth, true);
+
+  // The foreign members beside the documented keys, plus an undocumented shape under a documented key of a nested
+  // type (an object where a string list is documented): every foreign value is dropped, the documented keys are
+  // kept in place, and the findings are the documented body's findings.
+  const mixedRoutes = {
+    "/api/v2/settings/authentication/": () => jsonResponse({ ...HEALTHY_ROUTES["/api/v2/settings/authentication/"], AUTHENTICATION_BACKENDS: { nested: ANSIBLE_FOREIGN_SETTINGS_CANARIES.typed }, ...foreignSettingsMembers() }),
+    "/api/v2/settings/system/": () => jsonResponse({ ...HEALTHY_ROUTES["/api/v2/settings/system/"], ...foreignSettingsMembers() }),
+    "/api/v2/settings/logging/": () => jsonResponse({ ...HEALTHY_ROUTES["/api/v2/settings/logging/"], LOG_AGGREGATOR_LOGGERS: { nested: ANSIBLE_FOREIGN_SETTINGS_CANARIES.typed }, ...foreignSettingsMembers() }),
+  };
+  const mixed = await runEveryAnsibleTool(aapClient({ ...healthyAapRoutes(), ...mixedRoutes }), createTempBase("grclanker-ansible-settings-mixed-"));
+  assert.equal(mixed.accessError, undefined);
+  assert.equal(mixed.exportError, undefined);
+  assert.equal(mixed.exported.errorCount, 0, "foreign members beside the documented keys fail no read");
+  const mixedFiles = readBundleFiles(mixed.exported.outputDir);
+  const mixedZip = readZipEntries(mixed.exported.zipPath);
+  assert.equal(mixedZip.size, mixedFiles.size, "the zip carries exactly the written files");
+  assertNoCanaryWindowsInFiles(assert, mixedFiles, canaries, "mixed bundle directory");
+  assertNoCanaryWindowsInFiles(assert, mixedZip, canaries, "mixed zip archive");
+  for (const payload of [mixed.access, ...mixed.assessments, mixed.exported]) assertNoCanaryWindows(assert, payload, canaries, "mixed tool payload");
+  assert.deepEqual(JSON.parse(mixedFiles.get("core_data/settings_authentication.json")), JSON.parse(healthyFiles.get("core_data/settings_authentication.json")), "an object under the string-list key AUTHENTICATION_BACKENDS is dropped with the foreign members");
+  assert.deepEqual(JSON.parse(mixedFiles.get("core_data/settings_system.json")), JSON.parse(healthyFiles.get("core_data/settings_system.json")));
+  assert.deepEqual(JSON.parse(mixedFiles.get("core_data/settings_logging.json")), JSON.parse(healthyFiles.get("core_data/settings_logging.json")), "an object under the string-list key LOG_AGGREGATOR_LOGGERS is dropped");
+  for (const control of [25, 26]) {
+    assert.equal(byControl(mixed.assessments[2], control).status, byControl(healthyPlatform, control).status, `control ${control} keeps the documented body's status`);
+    assert.equal(byControl(mixed.assessments[2], control).summary, byControl(healthyPlatform, control).summary, `control ${control} keeps the documented body's summary`);
+  }
+  assert.equal(mixed.assessments[2].summary.external_auth, true);
+
+  // Bodies carrying none of the documented keys: reviewer D's foreign document on all three, then an empty object, a
+  // JSON string, and a JSON array. None is a settings surface: the file is the not-collected marker with a fixed
+  // error and a null status, control 25 is manual through the unreadable path, control 26 caps at warn naming both
+  // unconfirmed settings, the summary flags are null and false, and no TypeError text is recorded anywhere.
+  const unrecognizable = [
+    ["foreign document", Object.fromEntries(ANSIBLE_SETTINGS_SURFACES.map(([path]) => [path, () => jsonResponse(foreignSettingsMembers())]))],
+    ["empty object, string, and array", {
+      "/api/v2/settings/authentication/": () => jsonResponse({}),
+      "/api/v2/settings/system/": () => jsonResponse(ANSIBLE_PRIMITIVE_BODY_CANARY),
+      "/api/v2/settings/logging/": () => jsonResponse([{ LOG_AGGREGATOR_ENABLED: true, note: ANSIBLE_FOREIGN_SETTINGS_CANARIES.bare }]),
+    }],
+  ];
+  for (const [label, routes] of unrecognizable) {
+    const run = await runEveryAnsibleTool(aapClient({ ...healthyAapRoutes(), ...routes }), createTempBase("grclanker-ansible-settings-unrecognizable-"));
+    assert.equal(run.accessError, undefined, `${label}: the access check completes`);
+    assert.equal(run.exportError, undefined, `${label}: the export completes`);
+    const files = readBundleFiles(run.exported.outputDir);
+    const zipEntries = readZipEntries(run.exported.zipPath);
+    const swept = [...canaries, ANSIBLE_PRIMITIVE_BODY_CANARY];
+    assertNoCanaryWindowsInFiles(assert, files, swept, `${label} bundle directory`);
+    assertNoCanaryWindowsInFiles(assert, zipEntries, swept, `${label} zip archive`);
+    for (const payload of [run.access, ...run.assessments, run.exported]) assertNoCanaryWindows(assert, payload, swept, `${label} tool payload`);
+    for (const [path, file, name] of ANSIBLE_SETTINGS_SURFACES) {
+      assert.deepEqual(JSON.parse(files.get(file)), { collected: false, status: null, endpoint: path, error: `${name} (${path}): no documented settings key returned` }, `${label}: ${file} is the not-collected marker`);
+    }
+    const platform = run.assessments[2];
+    const auth = byControl(platform, 25);
+    assert.equal(auth.status, "manual", `${label}: control 25 is manual`);
+    assert.match(auth.summary, /^authentication settings could not be read \(authentication settings \(\/api\/v2\/settings\/authentication\/\): no documented settings key returned\), so this control cannot be verified from the API\. Collect this evidence manually: /);
+    assert.deepEqual(auth.evidence, { error: "authentication settings (/api/v2/settings/authentication/): no documented settings key returned", http_status: null, endpoint: "/api/v2/settings/authentication/" });
+    const audit = byControl(platform, 26);
+    assert.equal(audit.status, "warn", `${label}: control 26 caps at warn`);
+    assert.deepEqual(audit.evidence.settings_gaps, [
+      "the system settings could not be read (system settings (/api/v2/settings/system/): no documented settings key returned), so ACTIVITY_STREAM_ENABLED was not confirmed",
+      "the logging settings could not be read (logging settings (/api/v2/settings/logging/): no documented settings key returned), so external log aggregation was not confirmed",
+    ]);
+    assert.deepEqual(
+      { enabled: audit.evidence.activity_stream_enabled, system: audit.evidence.system_settings_readable, aggregator: audit.evidence.log_aggregator_enabled, type: audit.evidence.log_aggregator_type, logging: audit.evidence.logging_settings_readable },
+      { enabled: null, system: false, aggregator: null, type: null, logging: false },
+      `${label}: settings-derived flags render null with their readable flags false`,
+    );
+    assert.equal(platform.summary.external_auth, null);
+    assert.equal(platform.summary.auth_settings_readable, false);
+    for (const [path, , name] of ANSIBLE_SETTINGS_SURFACES) {
+      assert.ok(platform.errors.includes(`${name} (${path}): no documented settings key returned`), `${label}: the errors array carries the fixed error for ${path}`);
+    }
+    assert.equal(run.exported.errorCount, 3, `${label}: the three unrecognizable reads are the bundle's only errors`);
+    assert.match(files.get("_errors.log"), /no documented settings key returned/);
+    const everything = JSON.stringify([run.access, ...run.assessments, run.exported, [...files.values()]]);
+    assert.ok(!/TypeError/.test(everything), `${label}: no TypeError text is recorded`);
+  }
+});
+
+test("rule 9 credential-named pairs (reviewer D round 5 baseline): a value under a credential-named key is removed whatever its shape and length, unquoted as well as quoted, in every form the pair takes, while identifier-named keys keep their values unless the value's own shape removes it", () => {
+  assertCredentialPairValuesRemoved(assert, redactErrorText);
+  assertIdentifierKeyRows(assert, redactErrorText);
+  assertFlagAndPathPairRows(assert, redactErrorText);
+  // The retired value-shape test would have kept every one of these; the pair rule no longer asks.
+  for (const [text, expected] of [
+    ["password=letmein", "password=[REDACTED]"],
+    ["DB_PASSWORD=Sunshine", "DB_PASSWORD=[REDACTED]"],
+    ["AZURE_CLIENT_SECRET: abc12", "AZURE_CLIENT_SECRET: [REDACTED]"],
+    ["DUO_SKEY=p@ss", "DUO_SKEY=[REDACTED]"],
+    ["DUO_IKEY=DIXXXXXXXXXXXXXXXXXX", "DUO_IKEY=[REDACTED]"],
+    ["DUO_IKEY=letmein", "DUO_IKEY=[REDACTED]"],
+    ["ikey: monkey", "ikey: [REDACTED]"],
+    ['{"DUO_IKEY":"Sunshine"}', '{"DUO_IKEY":"[REDACTED]"}'],
+    ['"ikey": "abc12"', '"ikey": "[REDACTED]"'],
+    ["Authorization: Basic letmein", "Authorization: Basic [REDACTED]"],
+    ["token: value shape", "token: [REDACTED] shape"],
+  ]) {
+    assert.equal(redactErrorText(text), expected, `credential-named pair: ${text}`);
+  }
+  // A PascalCase error code that ends in a credential word is prose, and a bare scheme word is not a pair; a path segment
+  // ending in a credential word is one (assertFlagAndPathPairRows).
+  for (const text of [
+    "InvalidAuthenticationToken: Access token has expired. Basic authentication is disabled for this tenant.",
+    "ExpiredToken: The security token included in the request is expired",
+    "sent as Authorization: Bearer) or as X-Auth-Key",
+    "oauth: invalid_grant was returned",
+  ]) {
+    assert.equal(redactErrorText(text), text, `prose beside a credential word survives: ${text}`);
+  }
+});
+
+test("rule 9 URL userinfo boundary (CodeRabbit on #76 at b0ef16f; the raw ? or # inside a password from the merge-first delta against main on 7c7bf86): an `@` inside a query or a fragment is not a userinfo boundary when the authority before it is a host, so the real host stays and a query and a fragment each become the marker whole, while an authority that is not host[:port] followed by an `@` is userinfo, so a password holding a raw `?` or `#` goes whole, on the error sink, the data-string sink, and a snapshot string", () => {
+  assertUrlUserinfoBoundaryRows(assert, redactErrorText, { label: "ansible.redactErrorText" });
+  assertUrlUserinfoBoundaryRows(assert, redactCarrierText, { label: "ansible.redactCarrierText" });
+  assertUrlUserinfoBoundaryRows(assert, (text) => scrubSnapshotValue(text), { label: "ansible.scrubSnapshotValue" });
+});
+test("rule 9 Authorization parameter lists (CodeRabbit on #81, discussion_r4081238237): under an Authorization or Proxy-Authorization scheme every parameter value that is a proof is removed whatever its name, quoted or bare (Snowflake Token=\"...\", Bearer value=\"...\", Digest response, nonce, cnonce, and opaque, OAuth 1.0 oauth_token, oauth_signature, and oauth_nonce), while realm, username, uri, qop, nc, the SigV4 scope and signed headers, a WWW-Authenticate challenge, and Bearer realm=\"api\" in prose stay, on the error sink, the data-string sink, and a snapshot string, bare, inside a sentence, after a JSON escape, and inside a JSON string", () => {
+  assertAuthorizationParameterRows(assert, redactErrorText, { label: "ansible.redactErrorText" });
+  assertAuthorizationParameterRows(assert, redactCarrierText, { label: "ansible.redactCarrierText" });
+  assertAuthorizationParameterRows(assert, (text) => scrubSnapshotValue(text), { label: "ansible.scrubSnapshotValue" });
+});
+test("rule 9 challenge proofs (CodeRabbit on #81, discussion_r4081776771): a parameter list that is not under an Authorization key (a WWW-Authenticate challenge, Digest realm=\"api\", ... in prose, a bare realm=\"api\", nonce=\"n\", response=\"...\" data value) is not exempt because it is shaped like a challenge: the value of a parameter named response, signature, oauth_signature, mac, or sig goes, quoted at any depth or bare, before or after the realm, while realm, qop, algorithm, error, and error_description keep theirs, a proof-free challenge passes unchanged, and a response or mac field outside such a list is data, on the error sink, the data-string sink, and a snapshot string, bare, inside a sentence, after a JSON escape, and inside a JSON string", () => {
+  assertChallengeProofRows(assert, redactErrorText, { label: "ansible.redactErrorText" });
+  assertChallengeProofRows(assert, redactCarrierText, { label: "ansible.redactCarrierText" });
+  assertChallengeProofRows(assert, (text) => scrubSnapshotValue(text), { label: "ansible.scrubSnapshotValue" });
+});
+test("rule 9 bearer-id override (CodeRabbit r4077259415 on #78): a key ending in secret_id or naming a session id is a credential key despite its id suffix, so a Vault AppRole secret id goes whatever its shape, a UUID included, through the error sink, the data-string sink, the snapshot walker, and the thrown error, while AZURE_TENANT_ID=<uuid> and the other identifier keys keep their values", async () => {
+  assertBearerIdKeyRows(assert, redactErrorText);
+  assertBearerIdKeyRows(assert, redactCarrierText, { controls: BEARER_ID_CARRIER_CONTROL_ROWS });
+  assertBearerIdSnapshotKeys(assert, scrubSnapshotValue);
+  const [uuid, random] = BEARER_ID_VALUES;
+  const tenant = "3f2504e0-4f89-11d3-9a0c-0305e82c3301";
+  const echoed = `VAULT_SECRET_ID=${uuid} and role_secret_id: ${random} were rejected; AZURE_TENANT_ID=${tenant} was accepted`;
+  const expected = `VAULT_SECRET_ID=[REDACTED] and role_secret_id: [REDACTED] were rejected; AZURE_TENANT_ID=${tenant} was accepted`;
+  const thrown = new AnsibleApiError(`AAP request failed for /api/v2/users/ (403 Forbidden): ${echoed}`, 403, "/api/v2/users/");
+  assert.equal(thrown.message, `AAP request failed for /api/v2/users/ (403 Forbidden): ${expected}`);
+  assertNoCanaryWindows(assert, thrown.message, [uuid, random], "AnsibleApiError message");
 });
 
 test("fixture self-check: every planted canary is alphanumeric and random-looking, and no 6-to-24-character window of any canary occurs in the healthy fixture's legitimate values, so a windowed leak assertion can fail only on a real echo", async () => {
@@ -2266,6 +2737,70 @@ test("rule 9: a 200 answer whose body is a JSON string or array on /api/v2/ping/
     for (const [name, text] of files) assert.doesNotMatch(text, PRIMITIVE_BODY_WORDING, `${label}: no TypeError wording reaches bundle ${name}`);
     const accessFile = JSON.parse(files.get("core_data/access.json"));
     if (surface === "/api/v2/ping/") assert.equal(accessFile.ping, undefined, `${label}: access.json carries no ping`);
+    assert.ok(log.some((entry) => entry.path === surface && entry.status === 200), `${label}: the 200 answer was observed`);
+  }
+});
+
+const ANSIBLE_NESTED_SHORT_CANARY = "Wq4nTz8kBv2xRj6mPc7Ld";
+const ANSIBLE_NESTED_LONG_CANARY = "Hx9pLm3vQt7wZk2nRb5cYd8fJg4sNa6uEe1rTi0oKy3qXz7wVb5nMc8dLp2gHf4jSk6tUa9yWo1zPl3eRv7iBn5xCm8oDq2uFa3tGw6yJb9k";
+
+test("rule 9 (round 4 item E): a nested object or array under a documented ping or me key is not the documented value and is dropped, never copied verbatim; no 6-to-24-character window of it reaches the access check, an assessment, or the bundle, and a nested user is not a recognizable user", async () => {
+  assert.equal(ANSIBLE_NESTED_SHORT_CANARY.length, 21);
+  assert.ok(ANSIBLE_NESTED_LONG_CANARY.length > 100);
+  const canaries = [ANSIBLE_NESTED_SHORT_CANARY, ANSIBLE_NESTED_LONG_CANARY];
+
+  // The typed projections alone: documented keys keep only their documented types.
+  assert.deepEqual(
+    projectPing({ version: { nested: ANSIBLE_NESTED_SHORT_CANARY }, active_node: [ANSIBLE_NESTED_SHORT_CANARY], ha: { flag: ANSIBLE_NESTED_SHORT_CANARY }, instances: { count: ANSIBLE_NESTED_SHORT_CANARY }, results: { username: ANSIBLE_NESTED_SHORT_CANARY }, detail: { text: ANSIBLE_NESTED_SHORT_CANARY } }),
+    {},
+    "nested21: every documented key holds another shape and is dropped",
+  );
+  assert.deepEqual(
+    projectPing({ version: "4.6.0", active_node: "controller-1", ha: false, instances: [{ node: "controller-1", node_type: "hybrid", capacity: 61, heartbeat: { nested: ANSIBLE_NESTED_LONG_CANARY }, extra: ANSIBLE_NESTED_LONG_CANARY }, ANSIBLE_NESTED_LONG_CANARY], instance_groups: [{ name: "default", capacity: 61, instances: ["controller-1", { node: ANSIBLE_NESTED_LONG_CANARY }] }] }),
+    { version: "4.6.0", active_node: "controller-1", ha: false, instances: [{ node: "controller-1", node_type: "hybrid", capacity: 61 }], instance_groups: [{ name: "default", capacity: 61, instances: ["controller-1"] }] },
+    "a documented ping keeps its documented fields, list entries included, and drops the nested values beside them",
+  );
+  assert.deepEqual(projectPing({ version: "4.6.0", active_node: null, ha: true }), { version: "4.6.0", active_node: null, ha: true }, "null is the API's unset and is kept");
+  assert.deepEqual(projectUser({ id: "1", username: { nested: ANSIBLE_NESTED_LONG_CANARY }, is_superuser: "true", is_system_auditor: { flag: true }, email: { addr: ANSIBLE_NESTED_LONG_CANARY }, last_login: null }), { last_login: null }, "a user whose documented keys hold other types projects to nothing but its nulls");
+  assert.deepEqual(projectUser(SUPERUSER), SUPERUSER, "a documented user is unchanged");
+  assert.equal(currentUserFromMe({ count: 1, results: [{ username: { nested: ANSIBLE_NESTED_LONG_CANARY }, id: ANSIBLE_NESTED_LONG_CANARY, email: { addr: ANSIBLE_NESTED_LONG_CANARY } }] }), undefined, "nestedLong: no string username or numeric id, so no user");
+  assert.equal(currentUserFromMe({ version: { nested: ANSIBLE_NESTED_SHORT_CANARY }, results: { username: ANSIBLE_NESTED_SHORT_CANARY } }), undefined, "nested21: results is not a list, so no user");
+  assert.deepEqual(currentUserFromMe({ count: 1, results: [{ ...SUPERUSER, password: ANSIBLE_NESTED_LONG_CANARY, email: { addr: ANSIBLE_NESTED_LONG_CANARY } }] }), SUPERUSER, "a documented user projects to its documented fields");
+
+  const nested21 = { version: { nested: ANSIBLE_NESTED_SHORT_CANARY }, active_node: [ANSIBLE_NESTED_SHORT_CANARY], ha: { flag: ANSIBLE_NESTED_SHORT_CANARY }, instances: { count: ANSIBLE_NESTED_SHORT_CANARY }, results: { username: ANSIBLE_NESTED_SHORT_CANARY }, detail: { text: ANSIBLE_NESTED_SHORT_CANARY } };
+  const nestedLong = { version: { nested: ANSIBLE_NESTED_LONG_CANARY }, active_node: { node: ANSIBLE_NESTED_LONG_CANARY }, results: [{ username: { nested: ANSIBLE_NESTED_LONG_CANARY }, id: ANSIBLE_NESTED_LONG_CANARY, email: { addr: ANSIBLE_NESTED_LONG_CANARY } }], detail: [ANSIBLE_NESTED_LONG_CANARY] };
+  for (const [surface, bodyName, body] of [
+    ["/api/v2/ping/", "nested21", nested21],
+    ["/api/v2/ping/", "nestedLong", nestedLong],
+    ["/api/v2/me/", "nested21", nested21],
+    ["/api/v2/me/", "nestedLong", nestedLong],
+  ]) {
+    const label = `${surface} ${bodyName}`;
+    const log = [];
+    const client = aapClient({ ...healthyAapRoutes(), [surface]: () => aapResponse(JSON.stringify(body), 200, "OK", "application/json") }, log);
+    const run = await runEveryAnsibleTool(client, createTempBase("grclanker-ansible-nested-body-"));
+
+    assert.equal(run.accessError, undefined, `${label}: the access check completes`);
+    if (surface === "/api/v2/ping/") {
+      assert.deepEqual(run.access.ping, {}, `${label}: the ping projects to no documented field`);
+      assert.equal(run.access.status, "healthy", `${label}: the ping body does not change the verdict of the readable surfaces`);
+    } else {
+      assert.equal(run.access.currentUser, undefined, `${label}: a nested user is not a recognizable user`);
+      assert.ok(run.access.notes.includes("Authentication succeeded but /api/v2/me/ did not return a recognizable user."), `${label}: the access check says the user was not recognizable`);
+      assert.equal(run.access.status, "limited", `${label}: no current user caps the access verdict`);
+    }
+    assertNoCanaryWindows(assert, run.access, canaries, `${label} check_access`);
+    assert.doesNotMatch(JSON.stringify(run.access), PRIMITIVE_BODY_WORDING, `${label}: no TypeError wording reaches check_access`);
+    for (const assessment of run.assessments) {
+      assertNoCanaryWindows(assert, assessment, canaries, `${label} ${assessment.title}`);
+      assert.doesNotMatch(JSON.stringify(assessment), PRIMITIVE_BODY_WORDING, `${label}: no TypeError wording reaches ${assessment.title}`);
+    }
+
+    assert.equal(run.exportError, undefined, `${label}: the export completes`);
+    const files = readBundleFiles(run.exported.outputDir);
+    assertNoCanaryWindowsInFiles(assert, files, canaries, `${label} bundle`);
+    assertNoCanaryWindowsInFiles(assert, readZipEntries(run.exported.zipPath), canaries, `${label} zip`);
+    for (const [name, text] of files) assert.doesNotMatch(text, PRIMITIVE_BODY_WORDING, `${label}: no TypeError wording reaches bundle ${name}`);
     assert.ok(log.some((entry) => entry.path === surface && entry.status === 200), `${label}: the 200 answer was observed`);
   }
 });
