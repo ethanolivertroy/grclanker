@@ -38,7 +38,8 @@ import {
 } from "../dist/extensions/grc-tools/knowbe4.js";
 import { getRegisteredToolSummaries } from "../dist/pi/tool-catalog.js";
 import { readBundleFiles, readZipEntries } from "./helpers/bundle-contents.mjs";
-import { assertCanaryFixture, assertCanaryWindowsAbsent } from "./helpers/canary-windows.mjs";
+import { assertCanaryFixture, assertCanaryWindowsAbsent, assertDepthCapPins } from "./helpers/canary-windows.mjs";
+import { assertCookieAttributeCarriersScrubbed } from "./helpers/cookie-attribute-carriers.mjs";
 import { scrubAlterations } from "./helpers/scrub-survival.mjs";
 
 const NOW = new Date("2026-09-21T12:00:00Z");
@@ -596,6 +597,27 @@ test("Knowbe4ApiClient sends bearer auth, paginates with page and per_page, and 
   assert.equal(client.getRequestCount(), 3);
 });
 
+test("foreign-origin next link: KnowBe4 paging is a client-side page counter on the configured base, so a payload carrying a URL-shaped field cannot redirect the next request", async () => {
+  const FOREIGN = "https://collector.attacker.example/v1/users?page=2";
+  const seen = [];
+  const fetchImpl = async (input) => {
+    const url = new URL(typeof input === "string" ? input : input.toString());
+    seen.push(url);
+    // The Reporting API returns bare arrays; a next link in any shape the server might add is not part of the contract.
+    return url.searchParams.get("page") === "1"
+      ? jsonResponse([{ id: 1, next: FOREIGN, links: { next: FOREIGN } }, { id: 2 }])
+      : jsonResponse([{ id: 3 }]);
+  };
+  const client = new Knowbe4ApiClient(sampleConfig({ apiToken: "reporting-token" }), { fetchImpl, minRequestIntervalMs: 0 });
+
+  const users = await client.list("/v1/users", { status: "active" }, { limit: 10, pageSize: 2 });
+
+  assert.deepEqual(users.items.map((item) => item.id), [1, 2, 3]);
+  assert.equal(seen.length, 2);
+  assert.ok(seen.every((url) => url.origin === "https://us.api.knowbe4.com" && url.pathname === "/v1/users"), "every page request went to the configured origin");
+  assert.deepEqual(seen.map((url) => url.searchParams.get("page")), ["1", "2"], "the next page is the client's own counter, not a server value");
+});
+
 test("Knowbe4ApiClient stops retrying after max retries and redacts tokens in errors", async () => {
   const always429 = async () => jsonResponse({ message: "slow down" }, { status: 429, statusText: "Too Many Requests" });
   const limited = new Knowbe4ApiClient(sampleConfig(), { fetchImpl: always429, sleepImpl: async () => {}, maxRetries: 1, minRequestIntervalMs: 0 });
@@ -1042,6 +1064,54 @@ test("assessKnowbe4TrainingProgram degrades remedial training to warn when tests
   assert.equal(full.status, "pass");
   assert.equal(full.evidence.unsampled_security_tests, 0);
   assert.equal(full.evidence.sampled_security_tests.length, 3);
+});
+
+test("assessKnowbe4TrainingProgram renders remediated_users as null when the enrollments read stopped before any remediation was seen", async () => {
+  const fixture = healthyFixture();
+
+  // Capped: the first four enrollments belong to users who never failed a test, and the remediation sits beyond the cap.
+  // Zero remediations among the records read is not an observation that none happened.
+  const cappedSnapshot = await collectKnowbe4Snapshot(mockClient(fixture), { scopes: ["training"], now: NOW, enrollmentLimit: 4 });
+  assert.equal(cappedSnapshot.enrollmentLimitReached, true);
+  const capped = findingFor(assessKnowbe4TrainingProgram(cappedSnapshot, { now: NOW }), 10);
+  assert.equal(capped.status, "warn");
+  assert.match(capped.summary, /truncated at enrollment_limit \(4\)/);
+  assert.equal(capped.evidence.failed_users_evaluated, 1);
+  assert.equal(capped.evidence.remediated_users, null);
+  assert.equal(capped.evidence.unremediated_users, null);
+  assert.equal(capped.evidence.remediated_pct, null);
+  assert.ok(capped.evidence.truncated_inventories.some((row) => row.inventory === "training_enrollments" && row.seen === 4));
+
+  // Zero rows read while the server reported more: the same null, beside the marker that says why.
+  const zeroRowsClient = mockClient(fixture);
+  zeroRowsClient.listTrainingEnrollments = async () => ({ items: [], truncated: true, truncationReason: "the server repeated the same page", total: 500 });
+  const zeroRowsSnapshot = await collectKnowbe4Snapshot(zeroRowsClient, { scopes: ["training"], now: NOW });
+  const zeroRows = findingFor(assessKnowbe4TrainingProgram(zeroRowsSnapshot, { now: NOW }), 10);
+  assert.equal(zeroRows.status, "warn");
+  assert.equal(zeroRows.evidence.remediated_users, null);
+  assert.equal(zeroRows.evidence.unremediated_users, null);
+  assert.ok(zeroRows.evidence.truncated_inventories.some((row) => row.inventory === "training_enrollments" && row.seen === 0 && row.total === 500));
+
+  // A remediation seen within a read that still stopped at its cap is a real observation and renders as a lower bound.
+  const partialSnapshot = await collectKnowbe4Snapshot(mockClient(fixture), { scopes: ["training"], now: NOW, enrollmentLimit: fixture.enrollments.length });
+  assert.equal(partialSnapshot.enrollmentLimitReached, true);
+  const partial = findingFor(assessKnowbe4TrainingProgram(partialSnapshot, { now: NOW }), 10);
+  assert.equal(partial.status, "warn");
+  assert.equal(partial.evidence.remediated_users, 1);
+  assert.equal(partial.evidence.unremediated_users, null);
+
+  // An unreadable enrollments listing has no count to report either: the manual finding carries the gap, not a zero.
+  const unreadableClient = mockClient(fixture, { failures: { listTrainingEnrollments: "KnowBe4 request failed (403 Forbidden) for /v1/training/enrollments" } });
+  const unreadableSnapshot = await collectKnowbe4Snapshot(unreadableClient, { scopes: ["training"], now: NOW });
+  const unreadable = findingFor(assessKnowbe4TrainingProgram(unreadableSnapshot, { now: NOW }), 10);
+  assert.equal(unreadable.status, "manual");
+  assert.equal(unreadable.evidence.remediated_users ?? null, null);
+
+  // A complete read asserts the count, zero included.
+  const complete = findingFor(assessKnowbe4TrainingProgram(await collectKnowbe4Snapshot(mockClient(fixture), { scopes: ["training"], now: NOW }), { now: NOW }), 10);
+  assert.equal(complete.evidence.remediated_users, 1);
+  const none = findingFor(assessKnowbe4TrainingProgram(await collectKnowbe4Snapshot(mockClient(failingFixture()), { scopes: ["training"], now: NOW }), { now: NOW }), 10);
+  assert.equal(none.evidence.remediated_users, 0);
 });
 
 test("assessKnowbe4TrainingProgram treats a -1 completion sentinel with truncated enrollments as unmeasurable", async () => {
@@ -1687,6 +1757,7 @@ test("verdict rule 10: Knowbe4ApiClient reports PhishER connections truncated on
   assert.deepEqual(atCap.items.map((item) => item.id), ["m1a", "m1b"]);
   assert.equal(atCap.truncated, true);
   assert.equal(atCap.total, 5, "the server total is kept so the summary can say seen versus total");
+  assert.equal(atCap.truncationReason, undefined, "a cap exit carries no reason: the cap is the reason");
   assert.equal(capped.getRequestCount(), 1);
 
   const stuck = phisherClient(({ page }) => ({
@@ -1696,6 +1767,7 @@ test("verdict rule 10: Knowbe4ApiClient reports PhishER connections truncated on
   const stuckListing = await stuck.listPhisherMessages({ limit: 10 });
   assert.deepEqual(stuckListing.items.map((item) => item.id), ["m1", "m2"]);
   assert.equal(stuckListing.truncated, true, "a nextPageKey that never advances ends the loop as truncated");
+  assert.equal(stuckListing.truncationReason, "the server repeated its page key, so the remaining records could not be paged");
   assert.equal(stuck.getRequestCount(), 2);
 
   const shortfall = phisherClient(() => ({ nodes: [], pagination: { page: 1, pages: 1, per: 200, totalCount: 7, nextPageKey: null } }));
@@ -1703,6 +1775,13 @@ test("verdict rule 10: Knowbe4ApiClient reports PhishER connections truncated on
   assert.equal(empty.items.length, 0);
   assert.equal(empty.total, 7);
   assert.equal(empty.truncated, true, "an empty page while totalCount says more exist is not a complete read");
+  assert.equal(empty.truncationReason, "the server returned an empty page while reporting 7 records");
+
+  const endedEarly = phisherClient(() => ({ nodes: [{ id: "m1" }], pagination: { page: 1, pages: 1, per: 200, totalCount: 4, nextPageKey: null } }));
+  const ended = await endedEarly.listPhisherMessages({ limit: 10 });
+  assert.deepEqual(ended.items.map((item) => item.id), ["m1"]);
+  assert.equal(ended.truncated, true, "a last page below the server total is not a complete read");
+  assert.equal(ended.truncationReason, "the server ended paging after 1 records while reporting 4");
 
   const complete = phisherClient(({ page }) => ({
     nodes: page === 1 ? [{ id: "r1" }, { id: "r2" }] : [{ id: "r3" }],
@@ -1712,6 +1791,60 @@ test("verdict rule 10: Knowbe4ApiClient reports PhishER connections truncated on
   assert.deepEqual(rules.items.map((item) => item.id), ["r1", "r2", "r3"]);
   assert.equal(rules.truncated, false);
   assert.equal(rules.total, 3);
+  assert.equal(rules.truncationReason, undefined);
+});
+
+test("gap 44: the PhishER inbox clause and the truncation caveat name the listing's own stop, and attribute a stop to phisher_message_limit only when the cap caused it", async () => {
+  const fixture = healthyFixture();
+  const stopReason = "the server returned an empty page while reporting 500 records";
+
+  // The server stopped: zero rows, a total of 500, and the cap of 2 never reached.
+  const serverStopped = mockClient(fixture, { phisher: true });
+  serverStopped.listPhisherMessages = async () => ({ items: [], truncated: true, limit: 2, pages: 1, total: 500, truncationReason: stopReason });
+  const stoppedSnapshot = await collectKnowbe4Snapshot(serverStopped, { scopes: ["phishing"], now: NOW });
+  assert.equal(stoppedSnapshot.phisherMessages.truncationReason, stopReason);
+  const stopped = findingFor(assessKnowbe4PhishingProgram(stoppedSnapshot, { now: NOW }), 19);
+  assert.equal(stopped.status, "pass", "the report rate rests on the security test counters");
+  assert.match(stopped.summary, /PhishER inbox: 0 user-reported messages in the window \(0 of 500 loaded; the server returned an empty page while reporting 500 records\)\./);
+  assert.doesNotMatch(stopped.summary, /truncated at phisher_message_limit/, "a server stop is not attributed to the cap");
+  assert.doesNotMatch(stopped.summary, /raise phisher_message_limit/, "raising the cap does not read past a server stop");
+  // The inbox is enrichment on KB4-19, so its truncation never adds the verdict caveat; the clause carries the exit.
+  assert.doesNotMatch(stopped.summary, /Truncated listing: phisher_messages/);
+  assert.equal(stopped.evidence.phisher.truncation_reason, stopReason);
+  assert.equal(stopped.evidence.phisher.truncated, true);
+  assert.deepEqual(stopped.evidence.truncated_inventories.find((entry) => entry.inventory === "phisher_messages"), { inventory: "phisher_messages", seen: 0, total: 500, limit: 2, argument: "phisher_message_limit", reason: stopReason });
+  const stoppedRow = knowbe4CollectionStatus(stoppedSnapshot).inventories.find((row) => row.inventory === "phisher_messages");
+  assert.deepEqual({ truncated: stoppedRow.truncated, complete: stoppedRow.complete, truncation_reason: stoppedRow.truncation_reason, seen: stoppedRow.seen, total: stoppedRow.total }, { truncated: true, complete: false, truncation_reason: stopReason, seen: 0, total: 500 });
+
+  // The cap stopped it: the clause names the cap and the remedy offers to raise it.
+  const cappedClient = mockClient(fixture, { phisher: true });
+  cappedClient.listPhisherMessages = async () => ({ items: fixture.phisherMessages, truncated: true, limit: 2, pages: 1, total: 500 });
+  const cappedSnapshot = await collectKnowbe4Snapshot(cappedClient, { scopes: ["phishing"], now: NOW });
+  assert.equal(cappedSnapshot.phisherMessages.truncationReason, undefined);
+  const cappedFinding = findingFor(assessKnowbe4PhishingProgram(cappedSnapshot, { now: NOW }), 19);
+  assert.match(cappedFinding.summary, /PhishER inbox: 2 user-reported messages in the window \(2 of 500 loaded, truncated at phisher_message_limit \(2\)\)\./);
+  assert.equal(cappedFinding.evidence.phisher.truncation_reason, null);
+  assert.deepEqual(cappedFinding.evidence.truncated_inventories.find((entry) => entry.inventory === "phisher_messages"), { inventory: "phisher_messages", seen: 2, total: 500, limit: 2, argument: "phisher_message_limit", reason: null });
+  assert.equal(knowbe4CollectionStatus(cappedSnapshot).inventories.find((row) => row.inventory === "phisher_messages").truncation_reason, null);
+
+  // A complete read carries neither.
+  const completeSnapshot = await collectKnowbe4Snapshot(mockClient(fixture, { phisher: true }), { scopes: ["phishing"], now: NOW });
+  const completeFinding = findingFor(assessKnowbe4PhishingProgram(completeSnapshot, { now: NOW }), 19);
+  assert.match(completeFinding.summary, /PhishER inbox: 2 user-reported messages in the window\./);
+  assert.equal(completeFinding.evidence.phisher.truncation_reason, null);
+  assert.equal(knowbe4CollectionStatus(completeSnapshot).inventories.find((row) => row.inventory === "phisher_messages").truncation_reason, null);
+
+  // On a verdict inventory the caveat follows the same rule: the remedy names the cap only when the cap was the exit.
+  const usersStopReason = "the server ended paging after 5 records while reporting 40";
+  const usersStopped = mockClient(fixture);
+  usersStopped.listUsers = async () => ({ items: fixture.users.slice(0, 5), truncated: true, limit: 5000, pages: 1, total: 40, truncationReason: usersStopReason });
+  const usersStoppedCoverage = findingFor(assessKnowbe4PhishingProgram(await collectKnowbe4Snapshot(usersStopped, { scopes: ["phishing"], now: NOW }), { now: NOW }), 2);
+  assert.equal(usersStoppedCoverage.status, "warn");
+  assert.match(usersStoppedCoverage.summary, /Truncated listing: users \(5 of 40 loaded; the server ended paging after 5 records while reporting 40\), so this verdict only covers the records that were loaded\./);
+  assert.doesNotMatch(usersStoppedCoverage.summary, /truncated at user_limit|raise user_limit/);
+  assert.deepEqual(usersStoppedCoverage.evidence.truncated_inventories, [{ inventory: "users", seen: 5, total: 40, limit: 5000, argument: "user_limit", reason: usersStopReason }]);
+  const usersCappedCoverage = findingFor(assessKnowbe4PhishingProgram(await collectKnowbe4Snapshot(mockClient(fixture), { scopes: ["phishing"], now: NOW, userLimit: 5 }), { now: NOW }), 2);
+  assert.match(usersCappedCoverage.summary, /Truncated listing: users \(5 of unknown loaded, truncated at user_limit \(5\)\), so this verdict only covers the records that were loaded; raise user_limit to cover the full inventory\./);
 });
 
 test("verdict rule 10: truncated KnowBe4 inventories demote the findings that judge them and state seen versus total", async () => {
@@ -1731,7 +1864,7 @@ test("verdict rule 10: truncated KnowBe4 inventories demote the findings that ju
     const item = findingFor(result, control);
     assert.equal(item.status, "warn", `control ${control} cannot pass on a truncated security test list`);
     assert.match(item.summary, /Truncated listing: security_tests \(12 of unknown loaded, truncated at the collection cap \(20000\)\), so this verdict only covers the records that were loaded\./);
-    assert.deepEqual(item.evidence.truncated_inventories.find((entry) => entry.inventory === "security_tests"), { inventory: "security_tests", seen: 12, total: null, limit: 20000, argument: null });
+    assert.deepEqual(item.evidence.truncated_inventories.find((entry) => entry.inventory === "security_tests"), { inventory: "security_tests", seen: 12, total: null, limit: 20000, argument: null, reason: null });
   }
   const reportRate = findingFor(result, 19);
   assert.equal(reportRate.status, "warn");
@@ -1828,6 +1961,10 @@ test("verdict rule 9: redactCredentialValues masks credential-shaped keys and re
   assert.deepEqual(Object.keys(projected), ["id", "email", "joined_on"]);
 });
 
+test("gap 36: KnowBe4 redactCredentialValues keeps and scrubs every string down to depth 25 (inside the deepest kept container), masks the container at depth 25, and copies nothing from depth 26", () => {
+  assertDepthCapPins(assert, redactCredentialValues, 24, "KnowBe4 walker");
+});
+
 // Credential values planted in collected objects, in order: policy URL signature, user custom field, user comment,
 // account shared secret, webhook URL path, recipient user custom field, name/value pair setting, policy password,
 // PhishER attachment URL token. Alphanumeric and random-looking so that every 6-to-24-character window can be asserted absent.
@@ -1841,6 +1978,10 @@ const KNOWBE4_FAKE_SECRETS = [
   "X7dGVP2XHLR6Na7nD3e8vgwAJUvL34bA",
   "tUYsX4ybRbBMD9qRG6Jsc8nLQRGTEKaB",
   "QVzH3EeJNJyVKuza4iSEnrasY5UxSheU",
+  "Wm6RkT2xPz8HqYvB4NdLc7GsJf3AeUyK",
+  "Pv9NcXr4TbQz2MkHsL7dWyE6GfAj8RuC",
+  "Zk3HtVq7RmYb5NcXw2PdLg9SfJe4AuTn",
+  "Bq8LmWx3TzKv6HnRc2YdPf7GsJa5EuXk",
 ];
 
 function secretBearingKnowbe4Fixture() {
@@ -1849,6 +1990,10 @@ function secretBearingKnowbe4Fixture() {
   fixture.users[0].custom_field_1 = KNOWBE4_FAKE_SECRETS[1];
   fixture.users[0].comment = `shared vpn password ${KNOWBE4_FAKE_SECRETS[2]}`;
   fixture.account.integrations = [{ name: "SIEM webhook", webhook_url: `https://hooks.example.com/services/${KNOWBE4_FAKE_SECRETS[4]}`, shared_secret: KNOWBE4_FAKE_SECRETS[3] }];
+  fixture.account.sso_certificate = `-----BEGIN CERTIFICATE-----\n${KNOWBE4_FAKE_SECRETS[9]}\n-----END CERTIFICATE-----`;
+  fixture.account.sso_certificate_fingerprint = KNOWBE4_FAKE_SECRETS[10];
+  fixture.account.sso = { idp_entity_id: "https://idp.example.com", certificate: KNOWBE4_FAKE_SECRETS[11] };
+  fixture.account.admins[0].api_token = KNOWBE4_FAKE_SECRETS[12];
   const rows = fixture.recipientsByTest.get(String(fixture.securityTests[0].pst_id));
   rows[0] = { ...rows[0], user: { ...rows[0].user, custom_field_2: KNOWBE4_FAKE_SECRETS[5] } };
   fixture.trainingPolicies[0].settings = [{ name: "download_token", value: KNOWBE4_FAKE_SECRETS[6] }, { name: "minimum_time", value: "60" }];
@@ -1882,9 +2027,25 @@ test("verdict rule 9: the KnowBe4 bundle and its zip never carry credential-shap
   assert.ok(!("custom_field_1" in users[0]) && !("comment" in users[0]), "free-form user fields are dropped at collection time");
   assert.equal(users[0].email, "user1@acme.example", "assessment fields survive without PII redaction enabled");
   const account = JSON.parse(files.get(join("core_data", "account.json")));
-  assert.equal(account.integrations[0].shared_secret, "[REDACTED]");
-  assert.equal(account.integrations[0].webhook_url, "https://hooks.example.com");
-  assert.equal(account.integrations[0].name, "SIEM webhook");
+  assert.deepEqual(
+    account,
+    {
+      name: "Acme Corp",
+      type: "paid",
+      domains: ["acme.example"],
+      subscription_level: "Diamond",
+      subscription_end_date: "2027-01-01",
+      number_of_seats: 100,
+      current_risk_score: 28.4,
+      admins: [{ id: 1, first_name: "First1", last_name: "Last1", email: "user1@acme.example" }],
+      certificates: {
+        sso_certificate: { present: true, length: 86 },
+        sso_certificate_fingerprint: { present: true, fingerprint_length: 32 },
+      },
+    },
+    "the account snapshot carries only the fields the findings read, with certificates summarized as present and their length",
+  );
+  assert.ok(!("integrations" in account) && !("sso" in account), "fields no finding reads are dropped rather than scrubbed field by field");
   const recipients = JSON.parse(files.get(join("core_data", "security_test_recipients.json")));
   assert.ok(recipients.every((sample) => sample.recipients.every((row) => !("custom_field_2" in row.user))), "embedded recipient users are projected too");
   const policies = JSON.parse(files.get(join("core_data", "training_policies.json")));
@@ -2161,6 +2322,24 @@ test("verdict rule 9 / addendum 2: the KnowBe4 bundle, its zip, every assess pay
   assert.ok(!JSON.stringify([...files.values()]).includes("{pst_id}"), "no templated endpoint reaches the bundle");
   const groupsState = risk.summary.inventories.find((row) => row.inventory === "groups");
   assert.deepEqual({ status: groupsState.status, read: groupsState.read, http_status: groupsState.http_status, endpoint: groupsState.endpoint }, { status: "not_readable", read: false, http_status: 502, endpoint: "GET /v1/groups" });
+});
+
+/** A 403 body echoing weak human-chosen pairs (no digits, symbols, or length a shape gate would catch) under vendor env names, a config key, a webhook-prefixed credential key (gap 39), and a header-named key whose value opens with a scheme word. */
+const WEAK_PAIR_BODY = "Access denied: LAUNCHDARKLY_API_TOKEN=monkey LD_ACCESS_TOKEN=Sunshine webhook_secret=hunter2 DD_APP_KEY=p@ss BOX_CLIENT_SECRET=football KNOWBE4_API_TOKEN=qwerty ELASTIC_PASSWORD=iloveyou x-api-key: splunk correcthorse";
+const WEAK_PAIR_VALUES = ["monkey", "Sunshine", "hunter2", "p@ss", "football", "qwerty", "iloveyou", "splunk correcthorse"];
+const WEAK_PAIR_KEYS = ["LAUNCHDARKLY_API_TOKEN", "LD_ACCESS_TOKEN", "webhook_secret", "DD_APP_KEY", "BOX_CLIENT_SECRET", "KNOWBE4_API_TOKEN", "ELASTIC_PASSWORD", "x-api-key"];
+
+test("row (a): a KnowBe4 403 body echoing weak values under credential-named keys reaches the access check with every value gone and every key kept", async () => {
+  const { client, log } = httpKnowbe4(healthyFixture(), {
+    routes: { "GET /v1/training/store_purchases": () => jsonResponse({ message: WEAK_PAIR_BODY }, { status: 403, statusText: "Forbidden" }) },
+  });
+  const access = await checkKnowbe4Access(client);
+  const purchases = access.surfaces.find((surface) => surface.name === "store_purchases");
+  assert.equal(purchases.http_status, 403);
+  assert.ok(log.some((entry) => entry.status === 403), "the 403 was observed on the wire");
+  assert.match(purchases.error, /KnowBe4 request failed \(403 Forbidden\) GET \/v1\/training\/store_purchases: Access denied: /);
+  for (const key of WEAK_PAIR_KEYS) assert.ok(purchases.error.includes(`${key}=[REDACTED]`) || purchases.error.includes(`${key}: [REDACTED]`), `${key} keeps its name and gets the marker: ${purchases.error}`);
+  assertCanaryWindowsAbsent(assert, JSON.stringify(access), WEAK_PAIR_VALUES, "check_access payload");
 });
 
 test("addendum 5: every endpoint and status code named in KnowBe4 output corresponds to a request the run made and observed", async () => {
@@ -2767,4 +2946,10 @@ test("silent success: a 2xx whose body is empty, an HTML page, or JSON of anothe
   await assert.rejects(() => account.client.getAccount(), /returned 200 OK with a JSON body that is not the documented JSON object \(one of name, type, domains, admins, subscription_level, subscription_end_date, number_of_seats, current_risk_score\) \(\d+ bytes, not echoed\)/);
   const phisher = httpKnowbe4(healthyFixture(), { routes: { [KB_PHISHER_ROUTE]: () => jsonResponse({ hello: "world" }) } });
   await assert.rejects(() => phisher.client.graphql("query { x }"), /returned 200 OK with a JSON body that is not the documented GraphQL response object \(data or errors\) \(\d+ bytes, not echoed\)/);
+});
+
+test("cookie attribute class: a later cookie whose name holds a dot or another token character goes with the header value through the KnowBe4 error text and record scrubbers", () => {
+  assertCookieAttributeCarriersScrubbed(assert, scrubErrorText, "knowbe4 scrubErrorText");
+  assertCookieAttributeCarriersScrubbed(assert, (text) => redactCredentialValues({ note: text }).note, "knowbe4 redactCredentialValues");
+  assertCookieAttributeCarriersScrubbed(assert, (text) => redactCredentialValues([{ message: text }])[0].message, "knowbe4 redactCredentialValues, error list");
 });

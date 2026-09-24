@@ -20,6 +20,7 @@ import {
   LaunchdarklyApiClient,
   LaunchdarklyApiError,
   LaunchdarklyConfigFileError,
+  LaunchdarklyForeignOriginError,
   assessLaunchdarklyAccessControl,
   assessLaunchdarklyEnvironmentGovernance,
   assessLaunchdarklyFlagHygiene,
@@ -27,7 +28,10 @@ import {
   assessLaunchdarklyMonitoringIntegrations,
   checkLaunchdarklyAccess,
   exportLaunchdarklyAuditBundle,
+  launchdarklyRefusedLinkMessage,
+  refusedLinkOrigin,
   parseSimpleToml,
+  redactCredentialValues,
   registerLaunchdarklyTools,
   resolveLaunchdarklyConfiguration,
   resolveSecureOutputPath,
@@ -35,7 +39,8 @@ import {
 } from "../dist/extensions/grc-tools/launchdarkly.js";
 import { getRegisteredToolSummaries } from "../dist/pi/tool-catalog.js";
 import { readBundleFiles, readZipEntries } from "./helpers/bundle-contents.mjs";
-import { assertCanaryFixture, assertCanaryWindowsAbsent } from "./helpers/canary-windows.mjs";
+import { assertCanaryFixture, assertCanaryWindowsAbsent, assertDepthCapPins } from "./helpers/canary-windows.mjs";
+import { assertCookieAttributeCarriersScrubbed } from "./helpers/cookie-attribute-carriers.mjs";
 import { scrubAlterations } from "./helpers/scrub-survival.mjs";
 
 const NOW = Date.parse("2026-09-21T00:00:00Z");
@@ -451,6 +456,76 @@ test("LaunchdarklyApiClient signals truncation when _links.next remains at the l
   });
   const none = await empty.list("/api/v2/members", {}, { limit: 5 });
   assert.deepEqual(none, { items: [], truncated: false, seen: 0, total: 0, endpoint: "GET /api/v2/members" });
+
+  const bareFullPage = new LaunchdarklyApiClient(sampleConfig(), {
+    fetchImpl: async () => jsonResponse({ items: [{ _id: "a" }, { _id: "b" }] }),
+  });
+  const fullAtCap = await bareFullPage.list("/api/v2/members", {}, { limit: 2, pageSize: 2 });
+  assert.equal(fullAtCap.truncated, true, "a full last page at the cap with neither totalCount nor _links.next cannot prove the remainder empty");
+  assert.equal(fullAtCap.seen, 2);
+  assert.equal(fullAtCap.total, undefined);
+  assert.equal(fullAtCap.truncationReason, undefined, "the defensive exit is a cap exit, so the option remedy still applies");
+  const belowCap = await bareFullPage.list("/api/v2/members", {}, { limit: 3, pageSize: 3 });
+  assert.equal(belowCap.truncated, false, "a short bare page below the cap is the end of the listing");
+  assert.equal(belowCap.seen, 2);
+});
+
+test("LaunchdarklyApiClient reads a last page against the size its own request asked for: a short page at the cap ends the listing, a full page at the cap stays truncated", async () => {
+  const listingOf = (count, { linkLimit = true } = {}) => async (input) => {
+    const url = new URL(typeof input === "string" ? input : input.toString());
+    const limit = Number(url.searchParams.get("limit") ?? "2");
+    const offset = Number(url.searchParams.get("offset") ?? "0");
+    const items = Array.from({ length: count }, (_, index) => ({ _id: `m${index + 1}` })).slice(offset, offset + limit);
+    const nextHref = linkLimit ? `/api/v2/members?limit=${limit}&offset=${offset + limit}` : `/api/v2/members?offset=${offset + limit}`;
+    return jsonResponse({ items, ...(offset + limit < count ? { _links: { next: { href: nextHref } } } : {}) });
+  };
+  const list = (count, options = {}, limit = 3) => new LaunchdarklyApiClient(sampleConfig(), { fetchImpl: listingOf(count, options) }).list("/api/v2/members", {}, { limit, pageSize: 2 });
+
+  const three = await list(3);
+  assert.deepEqual(three.items.map((member) => member._id), ["m1", "m2", "m3"]);
+  assert.equal(three.truncated, false, "a second page of one where two were requested is the end of the listing, even though it lands on the cap");
+  assert.equal(three.seen, 3);
+  assert.equal(three.total, undefined);
+  assert.equal(three.truncationReason, undefined);
+
+  for (const count of [4, 5]) {
+    const listing = await list(count);
+    assert.deepEqual(listing.items.map((member) => member._id), ["m1", "m2", "m3"]);
+    assert.equal(listing.truncated, true, `a full second page at the cap leaves ${count - 3} of ${count} unseen`);
+    assert.equal(listing.seen, 3);
+    assert.equal(listing.truncationReason, undefined, "a cap exit still carries the option remedy");
+  }
+
+  const fullLastPage = await list(4, {}, 4);
+  assert.equal(fullLastPage.seen, 4);
+  assert.equal(fullLastPage.truncated, true, "a second page as long as requested that lands on the cap with neither totalCount nor _links.next cannot prove the remainder empty");
+
+  const unsized = await list(3, { linkLimit: false });
+  assert.deepEqual(unsized.items.map((member) => member._id), ["m1", "m2", "m3"]);
+  assert.equal(unsized.truncated, true, "a next link that names no limit leaves the requested size unknown, so a page at the cap cannot be read as short");
+});
+
+test("verdict rule 10: a member page full at member_limit with neither totalCount nor _links.next demotes LD-03 and LD-11 with the member_limit remedy", async () => {
+  const members = [
+    { _id: "m1", email: "owner-one@example.com", role: "owner", mfa: "enabled", _lastSeen: RECENT_MS },
+    { _id: "m2", email: "owner-two@example.com", role: "owner", mfa: "enabled", _lastSeen: RECENT_MS },
+  ];
+  const fetchImpl = async (input) => {
+    const url = new URL(typeof input === "string" ? input : input.toString());
+    if (url.pathname === "/api/v2/members") return jsonResponse({ items: members });
+    if (url.pathname === "/api/v2/caller-identity") return jsonResponse({ accountId: "acct", memberId: "m1", tokenKind: "personal" });
+    if (url.pathname === "/api/v2/tokens") return jsonResponse({ items: [], totalCount: 0 });
+    if (url.pathname === "/api/v2/teams") return jsonResponse({ items: [], totalCount: 0 });
+    if (url.pathname === "/api/v2/roles") return jsonResponse({ items: [], totalCount: 0 });
+    return jsonResponse({ items: [], totalCount: 0 });
+  };
+  const client = new LaunchdarklyApiClient(sampleConfig(), { fetchImpl });
+  const result = await assessLaunchdarklyIdentity(client, { memberLimit: 2, now: NOW });
+  const owners = finding(result, "LD-03");
+  assert.notEqual(owners.status, "pass");
+  assert.match(owners.summary, /Truncated listing: members \(2 of an unknown total collected\)\. The verdict covers only the collected items, so raise member_limit and rerun/);
+  assert.equal(owners.evidence.truncated_collections[0].collection, "members");
+  assert.equal(owners.evidence.truncated_collections[0].option, "member_limit");
 });
 
 test("LaunchdarklyApiClient retries 429 using X-Ratelimit-Reset and retries 5xx responses", async () => {
@@ -648,6 +723,200 @@ test("verdict rule 10: LaunchdarklyApiClient.list reports truncation on an empty
   });
   const complete = await drained.list("/api/v2/members", {}, { limit: 10, pageSize: 2 });
   assert.equal(complete.truncated, false, "a bare empty page drains the listing");
+});
+
+// Every shape a server could use to point _links.next.href at another origin. The path and query are the ones the real
+// API would send, so only the authority differs from a legitimate link.
+// Each row: the link, and the origin the refusal names for it (scheme, host, and port after the URL parser has
+// lowercased and normalized them, or the bare scheme for a link without an authority).
+const FOREIGN_NEXT_LINKS = [
+  ["absolute foreign host", "https://collector.attacker.example/api/v2/members?limit=2&offset=2", "https://collector.attacker.example"],
+  ["protocol-relative foreign host", "//collector.attacker.example/api/v2/members?limit=2&offset=2", "https://collector.attacker.example"],
+  ["scheme downgrade on the configured host", "http://app.launchdarkly.com/api/v2/members?limit=2&offset=2", "http://app.launchdarkly.com"],
+  ["configured host on another port", "https://app.launchdarkly.com:8443/api/v2/members?limit=2&offset=2", "https://app.launchdarkly.com:8443"],
+  ["lookalike subdomain", "https://app.launchdarkly.com.attacker.example/api/v2/members?limit=2&offset=2", "https://app.launchdarkly.com.attacker.example"],
+  ["configured host as userinfo before a foreign host", "https://app.launchdarkly.com@collector.attacker.example/api/v2/members?limit=2&offset=2", "https://collector.attacker.example"],
+  // The WHATWG parser reads each of these leading spellings as an authority, not a path, when resolved against the base.
+  ["triple-slash authority", "///collector.attacker.example/api/v2/members?limit=2&offset=2", "https://collector.attacker.example"],
+  ["slash-backslash authority", "/\\collector.attacker.example/api/v2/members?limit=2&offset=2", "https://collector.attacker.example"],
+  ["double-backslash authority", "\\\\collector.attacker.example/api/v2/members?limit=2&offset=2", "https://collector.attacker.example"],
+  ["backslash-slash authority", "\\/collector.attacker.example/api/v2/members?limit=2&offset=2", "https://collector.attacker.example"],
+  // Absolute links in spellings that a prefix check for "https://" would have missed.
+  ["upper-case scheme", "HTTPS://collector.attacker.example/api/v2/members?limit=2&offset=2", "https://collector.attacker.example"],
+  ["backslashes after the scheme", "https:\\\\collector.attacker.example/api/v2/members?limit=2&offset=2", "https://collector.attacker.example"],
+  ["scheme without slashes", "https:collector.attacker.example/api/v2/members?limit=2&offset=2", "https://collector.attacker.example"],
+  ["IPv4 literal", "http://10.0.0.1/api/v2/members?limit=2&offset=2", "http://10.0.0.1"],
+  ["IPv6 literal on another port", "https://[::1]:8443/api/v2/members?limit=2&offset=2", "https://[::1]:8443"],
+  ["non-http scheme", "javascript:alert(1)", "javascript:"],
+  ["data scheme", "data:text/plain,members", "data:"],
+  ["file scheme", "file:///etc/members", "file:"],
+  // A blob link wrapping the configured origin reports that origin as its own `origin`; the scheme and host comparison
+  // still refuses it, and the refusal names the bare scheme.
+  ["blob wrapping the configured origin", "blob:https://app.launchdarkly.com/6f1c0a2e", "blob:"],
+  ["blob wrapping a foreign origin", "blob:https://collector.attacker.example/6f1c0a2e", "blob:"],
+];
+
+// The refusal texts are fixed apart from two origins: the configured one, and for a foreign link the scheme, host, and
+// port it resolved to; the link's path, query, fragment, and userinfo never enter them.
+const CONFIGURED_ORIGIN = "https://app.launchdarkly.com";
+const FOREIGN_ORIGIN_MESSAGE = launchdarklyRefusedLinkMessage("foreign-origin", CONFIGURED_ORIGIN, "https://collector.attacker.example");
+const USERINFO_MESSAGE = launchdarklyRefusedLinkMessage("userinfo", CONFIGURED_ORIGIN, CONFIGURED_ORIGIN);
+
+test("foreign-origin next link: the refusal texts are fixed apart from the origins they name, name the configured origin and the refused one, and differ only by cause", () => {
+  assert.equal(FOREIGN_ORIGIN_MESSAGE, "LaunchDarkly next link points to https://collector.attacker.example, outside the configured origin https://app.launchdarkly.com, so it was not followed and no request was sent");
+  assert.equal(USERINFO_MESSAGE, "LaunchDarkly next link carries credentials in its authority, so it was not followed and no request was sent; only the configured origin https://app.launchdarkly.com is requested");
+  assert.equal(launchdarklyRefusedLinkMessage("foreign-origin", "https://ld.internal.example:8443", "javascript:"), "LaunchDarkly next link points to javascript:, outside the configured origin https://ld.internal.example:8443, so it was not followed and no request was sent");
+  // The refused origin is read from the parsed link: scheme, host, and port only, or the bare scheme without an authority.
+  assert.equal(refusedLinkOrigin(new URL("HTTPS://svc:pw@Collector.Attacker.Example:8443/api/v2/members?limit=2#frag")), "https://collector.attacker.example:8443");
+  assert.equal(refusedLinkOrigin(new URL("https://collector.attacker.example:443/api/v2/members")), "https://collector.attacker.example");
+  assert.equal(refusedLinkOrigin(new URL("blob:https://app.launchdarkly.com/6f1c0a2e")), "blob:");
+  assert.equal(refusedLinkOrigin(new URL("data:text/plain,members")), "data:");
+});
+
+test("foreign-origin next link: LaunchdarklyApiClient.list refuses a server-supplied _links.next.href outside the configured origin, sends no request to it, and reports the listing truncated with fixed text naming both origins", async () => {
+  for (const [label, href, refusedOrigin] of FOREIGN_NEXT_LINKS) {
+    const requests = [];
+    const fetchImpl = async (input, init = {}) => {
+      const url = new URL(typeof input === "string" ? input : input.toString());
+      requests.push({ origin: url.origin, href: url.href, auth: headerValue(init.headers, "authorization") });
+      return jsonResponse({ items: [{ _id: "a" }, { _id: "b" }], totalCount: 2, _links: { next: { href } } });
+    };
+    const client = new LaunchdarklyApiClient(sampleConfig(), { fetchImpl });
+    const members = await client.list("/api/v2/members", {}, { limit: 10, pageSize: 2 });
+
+    assert.equal(requests.length, 1, `${label}: only the first page request leaves; the refused link is never fetched`);
+    assert.equal(requests[0].origin, "https://app.launchdarkly.com", `${label}: the one request went to the configured origin`);
+    assert.equal(requests[0].auth, TEST_TOKEN, `${label}: the token travelled only to the configured origin`);
+    assert.ok(!requests[0].href.includes("attacker") && !requests[0].href.includes(":8443") && !requests[0].href.includes("javascript") && !requests[0].href.includes("blob") && !requests[0].href.includes("10.0.0.1"), `${label}: no request names the foreign authority`);
+    assert.deepEqual(members.items.map((item) => item._id), ["a", "b"], `${label}: the pages already read are kept`);
+    assert.equal(members.truncated, true, `${label}: the refused remainder is unread even though the server total matched the items seen, so the listing is truncated`);
+    assert.equal(members.truncationReason, launchdarklyRefusedLinkMessage("foreign-origin", CONFIGURED_ORIGIN, refusedOrigin), `${label}: the reason is the fixed client text naming the refused origin and the configured one`);
+    assert.ok(members.truncationReason.includes(CONFIGURED_ORIGIN) && members.truncationReason.includes(refusedOrigin), `${label}: the reason names both origins`);
+    assert.doesNotMatch(members.truncationReason, /api\/v2|members|limit=|offset=|alert|etc|6f1c|text\/plain|HTTPS|\\|@/, `${label}: nothing from the refused link beyond its scheme, host, and port enters the reason`);
+    assert.equal(members.endpoint, "GET /api/v2/members", `${label}: the endpoint names the request that was made`);
+  }
+
+  // The direct get() path is gated by the same check, so no caller can route a server-supplied URL around it.
+  const direct = new LaunchdarklyApiClient(sampleConfig(), {
+    fetchImpl: async () => { throw new Error("no request may leave for a foreign origin"); },
+  });
+  await assert.rejects(direct.get("https://collector.attacker.example/api/v2/members"), (error) => {
+    assert.ok(error instanceof LaunchdarklyForeignOriginError, "the client throws its fixed-text error class");
+    assert.equal(error.kind, "foreign-origin");
+    assert.equal(error.configuredOrigin, CONFIGURED_ORIGIN);
+    assert.equal(error.refusedOrigin, "https://collector.attacker.example");
+    assert.equal(error.message, FOREIGN_ORIGIN_MESSAGE);
+    return true;
+  });
+});
+
+test("foreign-origin next link: a same-origin link whose authority carries credentials is refused before any request, with fixed text that names neither the credentials nor the link", async () => {
+  const planted = "Qw7ZpL2rTk9VbN4xHs8FdC3yMe6GjA5u";
+  for (const [label, href] of [
+    ["absolute same-origin URL with userinfo", `https://audit:${planted}@app.launchdarkly.com/api/v2/members?limit=1&offset=1`],
+    ["absolute same-origin URL with a bare username", `https://${planted}@app.launchdarkly.com/api/v2/members?limit=1&offset=1`],
+  ]) {
+    const requests = [];
+    const fetchImpl = async (input) => {
+      const url = new URL(typeof input === "string" ? input : input.toString());
+      requests.push(url.href);
+      return jsonResponse({ items: [{ _id: "a" }], totalCount: 2, _links: { next: { href } } });
+    };
+    const client = new LaunchdarklyApiClient(sampleConfig(), { fetchImpl });
+    const members = await client.list("/api/v2/members", {}, { limit: 10, pageSize: 1 });
+
+    assert.equal(requests.length, 1, `${label}: only the first page request leaves`);
+    assert.ok(!requests[0].includes("@") && !requests[0].includes(planted.slice(0, 6)), `${label}: the credentials never ride along into a request`);
+    assert.deepEqual(members.items.map((item) => item._id), ["a"], `${label}: the page already read is kept`);
+    assert.equal(members.truncated, true, `${label}: the refused remainder is reported unread`);
+    assert.equal(members.truncationReason, USERINFO_MESSAGE, `${label}: the reason is the fixed userinfo text`);
+    assert.ok(!members.truncationReason.includes(planted.slice(0, 6)) && !members.truncationReason.includes("audit:"), `${label}: nothing from the link enters the reason`);
+  }
+  const direct = new LaunchdarklyApiClient(sampleConfig(), {
+    fetchImpl: async () => { throw new Error("no request may leave with credentials in its authority"); },
+  });
+  await assert.rejects(direct.get(`https://audit:${planted}@app.launchdarkly.com/api/v2/members`), (error) => {
+    assert.ok(error instanceof LaunchdarklyForeignOriginError);
+    assert.equal(error.kind, "userinfo");
+    assert.equal(error.refusedOrigin, CONFIGURED_ORIGIN, "a userinfo refusal is on the configured origin itself");
+    assert.equal(error.message, USERINFO_MESSAGE);
+    return true;
+  });
+});
+
+test("foreign-origin next link: same-origin next links are still followed, including spellings that differ only in host case or a default port", async () => {
+  const SAME_ORIGIN_LINKS = [
+    ["relative path", "/api/v2/members?limit=1&offset=1"],
+    ["absolute same-origin URL", "https://app.launchdarkly.com/api/v2/members?limit=1&offset=1"],
+    ["upper-case scheme and host", "HTTPS://APP.LAUNCHDARKLY.COM/api/v2/members?limit=1&offset=1"],
+    ["explicit default port", "https://app.launchdarkly.com:443/api/v2/members?limit=1&offset=1"],
+  ];
+  for (const [label, href] of SAME_ORIGIN_LINKS) {
+    const requests = [];
+    const fetchImpl = async (input) => {
+      const url = new URL(typeof input === "string" ? input : input.toString());
+      requests.push(url.href);
+      if (url.searchParams.get("offset") === "1") return jsonResponse({ items: [{ _id: "b" }], totalCount: 2 });
+      return jsonResponse({ items: [{ _id: "a" }], totalCount: 2, _links: { next: { href } } });
+    };
+    const client = new LaunchdarklyApiClient(sampleConfig(), { fetchImpl });
+    const members = await client.list("/api/v2/members", {}, { limit: 10, pageSize: 1 });
+
+    assert.deepEqual(members.items.map((item) => item._id), ["a", "b"], `${label}: the next page is read`);
+    assert.equal(members.truncated, false, `${label}: the listing drained`);
+    assert.equal(members.truncationReason, undefined, `${label}: no reason is recorded for a followed link`);
+    assert.equal(requests.length, 2, `${label}: both pages were requested`);
+    assert.ok(requests.every((request) => new URL(request).origin === "https://app.launchdarkly.com"), `${label}: every request stayed on the configured origin`);
+  }
+});
+
+test("foreign-origin next link: a refused link is recorded as a truncation with its reason in findings, summaries, and the core_data snapshot, and the cap remedy is not offered", async () => {
+  const base = healthyClient();
+  const result = await assessLaunchdarklyIdentity(healthyClient({
+    listMembers: async () => {
+      const items = await base.listMembers();
+      return { items, truncated: true, seen: items.length, total: items.length, endpoint: "GET /api/v2/members", truncationReason: FOREIGN_ORIGIN_MESSAGE };
+    },
+  }), { now: NOW });
+
+  for (const id of ["LD-02", "LD-03", "LD-06", "LD-24"]) {
+    assert.equal(findingStatus(result, id), "warn", `${id} must not pass on a listing whose remainder was refused`);
+    assert.match(finding(result, id).summary, /Truncated listing: members \(\d+ of \d+ collected; LaunchDarkly next link points to https:\/\/collector\.attacker\.example, outside the configured origin https:\/\/app\.launchdarkly\.com/, `${id}: the caveat carries the reason`);
+    assert.doesNotMatch(finding(result, id).summary, /raise member_limit/, `${id}: raising the cap cannot fix a refused link, so it is not offered`);
+    assert.match(finding(result, id).summary, /review the uncollected items manually/);
+    const [note] = finding(result, id).evidence.truncated_collections;
+    assert.equal(note.collection, "members");
+    assert.equal(note.reason, FOREIGN_ORIGIN_MESSAGE, `${id}: the note names the reason`);
+  }
+  assert.equal(result.summary.truncated_collections, 1);
+  assert.equal(result.snapshots.members.truncated, true);
+  assert.equal(result.snapshots.members.truncation_reason, FOREIGN_ORIGIN_MESSAGE, "the core_data snapshot records why paging stopped");
+  assert.equal(result.snapshots.members.collected, true, "the pages that were read stay readable data, not a marker");
+
+  // The same refusal reaches the bundle: the members row of collection_status.json carries the reason next to its flag,
+  // while every other readable row renders null for it and a failed read renders null for everything.
+  const exported = await exportLaunchdarklyAuditBundle(healthyClient({
+    listMembers: async () => {
+      const items = await base.listMembers();
+      return { items, truncated: true, seen: items.length, total: items.length, endpoint: "GET /api/v2/members", truncationReason: FOREIGN_ORIGIN_MESSAGE };
+    },
+    listCustomRoles: async () => { throw apiError(403, "Forbidden", "GET /api/v2/roles"); },
+  }), sampleConfig(), createTempBase("grclanker-ld-foreign-link-"), { now: NOW });
+  const files = readBundleFiles(exported.outputDir);
+  const membersRecord = JSON.parse(files.get("core_data/members.json"));
+  assert.equal(membersRecord.truncation_reason, FOREIGN_ORIGIN_MESSAGE);
+  const status = JSON.parse(files.get("core_data/collection_status.json"));
+  const membersRow = status.inventories.find((row) => row.inventory === "members");
+  assert.deepEqual(
+    { status: membersRow.status, collected: membersRow.collected, complete: membersRow.complete, truncated: membersRow.truncated, truncation_reason: membersRow.truncation_reason },
+    { status: "readable", collected: true, complete: false, truncated: true, truncation_reason: FOREIGN_ORIGIN_MESSAGE },
+  );
+  const rolesRow = status.inventories.find((row) => row.inventory === "custom_roles");
+  assert.deepEqual({ collected: rolesRow.collected, truncated: rolesRow.truncated, truncation_reason: rolesRow.truncation_reason }, { collected: false, truncated: null, truncation_reason: null }, "a failed read renders null for the reason like every other flag");
+  const completeRows = status.inventories.filter((row) => row.collected && row.truncated === false);
+  assert.ok(completeRows.length > 0);
+  assert.ok(completeRows.every((row) => row.truncation_reason === null), "a complete read renders null, not an empty string, for the reason");
+  assert.ok(status.inventories.every((row) => "truncation_reason" in row), "every row carries the field");
 });
 
 test("verdict rule 9: non-JSON error bodies are described, never echoed, into LaunchDarkly error text", async () => {
@@ -1040,7 +1309,9 @@ test("assessLaunchdarklyIdentity never passes member or team controls on truncat
     ]);
   }
   assert.equal(findingStatus(truncatedMembers, "LD-01"), "manual");
-  assert.equal(findingStatus(truncatedMembers, "LD-07"), "pass");
+  // LD-07 states the built-in Admin or Owner holders from the members listing, so it never passes on a partial one (gap 42).
+  assert.equal(findingStatus(truncatedMembers, "LD-07"), "warn");
+  assert.match(finding(truncatedMembers, "LD-07").summary, /Truncated listing: members \(3 of 400 collected\)/);
   assert.equal(truncatedMembers.summary.truncated_collections, 1);
   assert.equal(truncatedMembers.snapshots.members.truncated, true);
   assert.equal(truncatedMembers.snapshots.members.seen, 3);
@@ -1065,6 +1336,148 @@ test("assessLaunchdarklyIdentity never passes member or team controls on truncat
   }), { now: NOW });
   assert.equal(findingStatus(failingAndTruncated, "LD-02"), "fail");
   assert.match(finding(failingAndTruncated, "LD-02").summary, /1\/1 active members do not have MFA enabled\. Truncated listing/);
+});
+
+test("class 9: population counts and inventory lists render null from a listing that stopped before any record was read, and token names are withheld with a count while the token listing is truncated", async () => {
+  const base = healthyClient();
+  const emptyTruncated = (total) => async () => ({ items: [], truncated: true, seen: 0, total, truncationReason: `the server returned an empty page while reporting ${total} records` });
+
+  // Complete reads assert their counts and lists.
+  const identity = await assessLaunchdarklyIdentity(base, { now: NOW });
+  assert.ok(finding(identity, "LD-01").evidence.active_members > 0);
+  assert.ok(Array.isArray(finding(identity, "LD-24").evidence.domain_distribution) && finding(identity, "LD-24").evidence.domain_distribution.length > 0);
+  assert.ok(identity.summary.members > 0);
+
+  // Members: zero rows under a server count of 500.
+  const noMembers = await assessLaunchdarklyIdentity(healthyClient({ listMembers: emptyTruncated(500) }), { now: NOW });
+  assert.equal(finding(noMembers, "LD-01").evidence.active_members, null);
+  assert.equal(finding(noMembers, "LD-02").evidence.active_members, null);
+  assert.equal(finding(noMembers, "LD-02").evidence.mfa_enforced_members, null);
+  assert.equal(finding(noMembers, "LD-03").evidence.total_members, null);
+  assert.equal(finding(noMembers, "LD-24").evidence.domain_distribution, null);
+  assert.deepEqual([noMembers.summary.members, noMembers.summary.active_members], [null, null]);
+  assert.deepEqual(finding(noMembers, "LD-03").evidence.truncated_collections, [{ collection: "members", option: "member_limit", seen: 0, total: 500, reason: "the server returned an empty page while reporting 500 records" }]);
+
+  // Members: a capped read with rows keeps the rows read as a lower bound.
+  const someMembers = await assessLaunchdarklyIdentity(healthyClient({ listMembers: () => truncatedListing(base, "listMembers", 2, 400) }), { now: NOW });
+  assert.equal(finding(someMembers, "LD-03").evidence.total_members, 2);
+  assert.equal(someMembers.summary.members, 2);
+
+  // Teams: zero rows.
+  const noTeams = await assessLaunchdarklyIdentity(healthyClient({ listTeams: emptyTruncated(30) }), { now: NOW });
+  assert.equal(finding(noTeams, "LD-06").evidence.teams, null);
+  assert.equal(finding(noTeams, "LD-07").evidence.team_roles, null);
+  assert.equal(noTeams.summary.teams, null);
+  assert.equal(finding(noTeams, "LD-07").evidence.teams_sampled, 0, "a count named for the read's own size still renders");
+
+  // Roles and tokens.
+  const noRoles = await assessLaunchdarklyAccessControl(healthyClient({ listCustomRoles: emptyTruncated(12) }), { now: NOW });
+  assert.equal(finding(noRoles, "LD-04").evidence.custom_roles, null);
+  assert.equal(finding(noRoles, "LD-05").evidence.custom_roles, null);
+  assert.equal(noRoles.summary.custom_roles, null);
+  const noTokens = await assessLaunchdarklyAccessControl(healthyClient({ listTokens: emptyTruncated(40) }), { now: NOW });
+  assert.equal(finding(noTokens, "LD-08").evidence.tokens, null);
+  assert.equal(finding(noTokens, "LD-08").evidence.tokens_without_expiry, null);
+  assert.equal(finding(noTokens, "LD-08").evidence.tokens_without_expiry_count, null);
+  assert.equal(finding(noTokens, "LD-10").evidence.service_tokens, null);
+  assert.equal(finding(noTokens, "LD-11").evidence.personal_tokens, null);
+  assert.deepEqual([noTokens.summary.tokens, noTokens.summary.service_tokens, noTokens.summary.personal_tokens], [null, null, null]);
+
+  // Tokens: a capped read that observed tokens without expiry withholds their names and keeps the count as a lower bound.
+  const cappedTokens = await assessLaunchdarklyAccessControl(healthyClient({
+    async listTokens() {
+      const tokens = await base.listTokens();
+      return { items: tokens.slice(0, 2).map((token) => ({ ...token, expiry: undefined })), truncated: true, seen: 2, total: 40 };
+    },
+  }), { now: NOW });
+  const cappedExpiry = finding(cappedTokens, "LD-08");
+  assert.equal(cappedExpiry.status, "fail");
+  assert.equal(cappedExpiry.evidence.tokens, 2);
+  assert.equal(cappedExpiry.evidence.tokens_without_expiry, null, "names from a truncated listing are withheld");
+  assert.equal(cappedExpiry.evidence.tokens_without_expiry_count, 2);
+  assert.match(cappedExpiry.summary, /^2\/2 visible access tokens have no expiry configured\. Partial token inventory: The token listing was truncated at 2 of 40 tokens/);
+  assert.ok(!JSON.stringify(cappedExpiry.evidence).includes("grc-audit"), "no token name from the truncated page appears in the evidence");
+  const completeTokens = finding(await assessLaunchdarklyAccessControl(healthyClient({
+    async listTokens() {
+      return (await base.listTokens()).map((token) => ({ ...token, expiry: undefined }));
+    },
+  }), { now: NOW }), "LD-08");
+  assert.equal(completeTokens.evidence.tokens_without_expiry.length, 3, "a complete listing renders the names");
+  assert.equal(completeTokens.evidence.tokens_without_expiry_count, 3);
+  assert.deepEqual(finding(await assessLaunchdarklyAccessControl(base, { now: NOW }), "LD-08").evidence.tokens_without_expiry, [], "a complete listing asserts the empty list");
+
+  // Projects: zero rows empties every environment-derived leaf, which renders null rather than 0 or [].
+  const noProjects = await assessLaunchdarklyEnvironmentGovernance(healthyClient({ listProjects: emptyTruncated(9) }), { now: NOW });
+  assert.equal(finding(noProjects, "LD-16").evidence.production_environments, null);
+  assert.equal(finding(noProjects, "LD-17").evidence.production_environment_settings, null);
+  assert.equal(finding(noProjects, "LD-22").evidence.projects, null);
+  assert.equal(finding(noProjects, "LD-23").evidence.production_environment_settings, null);
+  assert.deepEqual([noProjects.summary.projects, noProjects.summary.environments, noProjects.summary.production_environments], [null, null, null]);
+  const noProjectFlags = await assessLaunchdarklyFlagHygiene(healthyClient({ listProjects: emptyTruncated(9) }), { now: NOW });
+  assert.equal(finding(noProjectFlags, "LD-14").evidence.production_environments, null);
+  assert.equal(noProjectFlags.summary.projects, null);
+  const governance = await assessLaunchdarklyEnvironmentGovernance(base, { now: NOW });
+  assert.ok(governance.summary.projects > 0 && governance.summary.production_environments > 0, "complete reads keep their counts");
+});
+
+test("gap 42: LD-07 states why built-in Admin or Owner holders are unknown under a truncated or denied members listing, renders the count null, and never passes", async () => {
+  const healthy = await assessLaunchdarklyIdentity(healthyClient(), { now: NOW });
+  assert.equal(findingStatus(healthy, "LD-07"), "pass");
+  assert.match(finding(healthy, "LD-07").summary, /; \d+ members still hold built-in Admin or Owner base roles\.$/);
+  assert.equal(typeof finding(healthy, "LD-07").evidence.built_in_admin_or_owner_members, "number", "a complete listing renders the total");
+
+  // An empty first page under a server that reported more members: nothing was read, nothing is counted.
+  const emptyTruncated = await assessLaunchdarklyIdentity(healthyClient({
+    async listMembers() {
+      return { items: [], truncated: true, seen: 0, total: 500, truncationReason: "the server returned an empty page while reporting 500 members" };
+    },
+  }), { now: NOW });
+  const truncated = finding(emptyTruncated, "LD-07");
+  assert.notEqual(truncated.status, "pass", "a truncated members listing never supports a pass");
+  assert.equal(truncated.status, "warn");
+  assert.match(truncated.summary, /All 1 sampled teams with readable roles have at least one custom role assigned; the members listing was truncated after 0 of 500, so holders of built-in Admin or Owner base roles are unknown\./);
+  assert.doesNotMatch(truncated.summary, /0 members still hold/);
+  assert.match(truncated.summary, /Truncated listing: members \(0 of 500 collected; the server returned an empty page while reporting 500 members\)/);
+  assert.doesNotMatch(truncated.summary, /raise member_limit/, "a server-side stop is not fixed by raising the cap");
+  assert.equal(truncated.evidence.built_in_admin_or_owner_members, null);
+  assert.deepEqual(truncated.evidence.truncated_collections, [{ collection: "members", option: "member_limit", seen: 0, total: 500, reason: "the server returned an empty page while reporting 500 members" }]);
+
+  // A capped listing that did observe built-in role holders: the observation is stated, the total is not.
+  const base = healthyClient();
+  const cappedWithAdmins = await assessLaunchdarklyIdentity(healthyClient({
+    async listMembers() {
+      const members = await base.listMembers();
+      const admin = members.find((member) => member.role === "admin" || member.role === "owner") ?? { ...members[0], role: "admin" };
+      return { items: [admin], truncated: true, seen: 1, total: 400 };
+    },
+  }), { now: NOW });
+  const capped = finding(cappedWithAdmins, "LD-07");
+  assert.equal(capped.status, "warn");
+  assert.match(capped.summary, /the members listing was truncated after 1 of 400, so holders of built-in Admin or Owner base roles are unknown \(1 observed among the collected members\)\./);
+  assert.match(capped.summary, /raise member_limit and rerun/);
+  assert.equal(capped.evidence.built_in_admin_or_owner_members, null, "a partial count is not written as a total");
+
+  // A denied members listing: the clause says so, the finding is manual, and the gap names the request.
+  const deniedMembers = await assessLaunchdarklyIdentity(healthyClient({
+    listMembers: async () => { throw forbidden("/api/v2/members"); },
+  }), { now: NOW });
+  const denied = finding(deniedMembers, "LD-07");
+  assert.equal(denied.status, "manual");
+  assert.match(denied.summary, /All 1 sampled teams with readable roles have at least one custom role assigned; the members listing could not be read, so holders of built-in Admin or Owner base roles are unknown\./);
+  assert.doesNotMatch(denied.summary, /unread members still hold/);
+  assert.match(denied.summary, /Unreadable inventory: members \(GET \/api\/v2\/members: .*403 Forbidden.*\), so member posture was not checked\. Collect manually: Organization settings > Members export/);
+  assert.equal(denied.evidence.built_in_admin_or_owner_members, null);
+  assert.ok(denied.evidence.unreadable_inventories.some((gap) => gap.inventory === "members"));
+
+  // The team half still fails on its own evidence whatever the members listing did.
+  const failingTeams = await assessLaunchdarklyIdentity(healthyClient({
+    listMembers: async () => { throw forbidden("/api/v2/members"); },
+    async listTeamRoles() {
+      return [];
+    },
+  }), { now: NOW });
+  assert.equal(findingStatus(failingTeams, "LD-07"), "fail");
+  assert.match(finding(failingTeams, "LD-07").summary, /sampled teams with readable roles have no custom roles assigned/);
 });
 
 test("assessLaunchdarklyAccessControl never passes role or token controls on truncated listings", async () => {
@@ -1115,6 +1528,32 @@ test("assessLaunchdarklyAccessControl never passes role or token controls on tru
   assert.deepEqual(finding(truncatedMembers, "LD-11").evidence.truncated_collections, [
     { collection: "members", option: "member_limit", seen: 1, total: 400 },
   ]);
+});
+
+test("CodeRabbit on #77: a token listing stopped by a refused next link renders the refusal in the token inventory caveat with no token_limit remedy, while a cap stop still offers token_limit", async () => {
+  const base = healthyClient();
+  const refused = await assessLaunchdarklyAccessControl(healthyClient({
+    listTokens: async () => ({ ...(await truncatedListing(base, "listTokens", 2, undefined)), endpoint: "GET /api/v2/tokens?showAll=true", truncationReason: FOREIGN_ORIGIN_MESSAGE }),
+  }), { now: NOW });
+  assert.equal(refused.summary.token_inventory_scope, "partial");
+  for (const id of ["LD-08", "LD-09", "LD-10", "LD-11"]) {
+    const summary = finding(refused, id).summary;
+    assert.equal(findingStatus(refused, id), "warn", `${id} must not pass on a listing whose next link was refused`);
+    assert.match(summary, /Partial token inventory: The token listing was truncated at 2 of an unknown total tokens, so the uncollected tokens were not evaluated\. /);
+    assert.ok(summary.includes(`${FOREIGN_ORIGIN_MESSAGE}; review the uncollected tokens in Authorization > Access tokens.`), `${id} carries the refusal reason`);
+    assert.doesNotMatch(summary, /token_limit/, `${id} must not offer token_limit for a stop the cap did not cause`);
+    assert.deepEqual(finding(refused, id).evidence.truncated_collections, [
+      { collection: "access_tokens", option: "token_limit", seen: 2, total: null, reason: FOREIGN_ORIGIN_MESSAGE },
+    ]);
+  }
+
+  const capped = await assessLaunchdarklyAccessControl(healthyClient({
+    listTokens: () => truncatedListing(base, "listTokens", 2, 40),
+  }), { now: NOW });
+  for (const id of ["LD-08", "LD-09", "LD-10", "LD-11"]) {
+    assert.match(finding(capped, id).summary, /Partial token inventory: The token listing was truncated at 2 of 40 tokens, so the uncollected tokens were not evaluated\. Raise token_limit and rerun for a complete inventory\./, `${id} still offers token_limit for a cap stop`);
+    assert.doesNotMatch(finding(capped, id).summary, /next link/);
+  }
 });
 
 test("assessLaunchdarklyAccessControl marks token controls manual instead of passing when tokens cannot be read", async () => {
@@ -1639,7 +2078,7 @@ test("assessLaunchdarklyMonitoringIntegrations passes retained audit logs, scope
   assert.deepEqual(finding(result, "LD-13").evidence.critical_actions_seen, ["createMember", "updatePolicy"]);
 });
 
-test("assessLaunchdarklyMonitoringIntegrations fails unreadable audit logs, broad relay and integration scopes, and insecure webhooks", async () => {
+test("assessLaunchdarklyMonitoringIntegrations sends unreadable audit logs to manual and fails broad relay and integration scopes and insecure webhooks", async () => {
   const result = await assessLaunchdarklyMonitoringIntegrations(healthyClient({
     async listAuditLogEntries() {
       throw new Error("LaunchDarkly request failed (403 Forbidden) for GET /api/v2/auditlog");
@@ -1656,8 +2095,10 @@ test("assessLaunchdarklyMonitoringIntegrations fails unreadable audit logs, broa
     },
   }), { now: NOW });
 
-  assert.equal(findingStatus(result, "LD-12"), "fail");
-  assert.equal(findingStatus(result, "LD-13"), "fail");
+  assert.equal(findingStatus(result, "LD-12"), "manual", "an unreadable audit log proves nothing about retention");
+  assert.match(finding(result, "LD-12").summary, /^The audit log could not be read \(.*403 Forbidden.*\), so retention cannot be judged from the API\. Unreadable inventory: audit_log_recent \(GET \/api\/v2\/auditlog: /);
+  assert.equal(findingStatus(result, "LD-13"), "manual");
+  assert.match(finding(result, "LD-13").summary, /^The audit log could not be read \(.*403 Forbidden.*\), so critical action coverage cannot be judged from the API\. Unreadable inventory: audit_log_members \(GET \/api\/v2\/auditlog\?spec=member%2F\*: /);
   assert.equal(findingStatus(result, "LD-18"), "fail");
   assert.deepEqual(finding(result, "LD-18").evidence.broad_relay_configs, ["wide-open"]);
   assert.equal(findingStatus(result, "LD-20"), "fail");
@@ -1717,6 +2158,7 @@ const LAUNCHDARKLY_MULTI_INVENTORY_CASES = [
   { id: "LD-06", assess: assessLaunchdarklyIdentity, secondary: "members", status: "manual", names: /Unreadable inventory: members \(GET \/api\/v2\/members: .*403 Forbidden/, overrides: () => ({ listMembers: async () => { throw forbidden("/api/v2/members"); } }) },
   { id: "LD-07", assess: assessLaunchdarklyIdentity, secondary: "team_roles", status: "manual", names: /Unreadable inventory: team_roles for team platform \(GET \/api\/v2\/teams\/platform\/roles: .*403 Forbidden/, overrides: () => ({ listTeamRoles: async (teamKey) => { throw forbidden(`/api/v2/teams/${teamKey}/roles`); } }) },
   { id: "LD-07", assess: assessLaunchdarklyIdentity, secondary: "teams", status: "manual", names: /Unreadable inventory: teams \(GET \/api\/v2\/teams\?expand=members/, overrides: () => ({ listTeams: async () => { throw forbidden("/api/v2/teams?expand=members"); } }) },
+  { id: "LD-07", assess: assessLaunchdarklyIdentity, secondary: "members", status: "manual", names: /the members listing could not be read, so holders of built-in Admin or Owner base roles are unknown\. Unreadable inventory: members \(GET \/api\/v2\/members: .*403 Forbidden/, overrides: () => ({ listMembers: async () => { throw forbidden("/api/v2/members"); } }) },
   { id: "LD-08", assess: assessLaunchdarklyAccessControl, secondary: "members", status: "warn", names: /member inventory was unreadable \(GET \/api\/v2\/members: .*403 Forbidden/, overrides: () => ({ listMembers: async () => { throw forbidden("/api/v2/members"); } }) },
   { id: "LD-09", assess: assessLaunchdarklyAccessControl, secondary: "members", status: "warn", names: /member inventory was unreadable \(GET \/api\/v2\/members/, overrides: () => ({ listMembers: async () => { throw forbidden("/api/v2/members"); } }) },
   { id: "LD-10", assess: assessLaunchdarklyAccessControl, secondary: "members", status: "warn", names: /member inventory was unreadable \(GET \/api\/v2\/members/, overrides: () => ({ listMembers: async () => { throw forbidden("/api/v2/members"); } }) },
@@ -1806,8 +2248,58 @@ test("verdict rule 1 corollary: LaunchDarkly findings keep judging readable inve
       throw forbidden("/api/v2/auditlog");
     },
   }), { now: NOW });
-  assert.equal(findingStatus(allAudit, "LD-12"), "fail", "a wholly unreadable audit log remains a fail");
-  assert.equal(findingStatus(allAudit, "LD-13"), "fail");
+  assert.equal(findingStatus(allAudit, "LD-12"), "manual", "a wholly unreadable audit log cannot be judged, so it is manual rather than fail");
+  assert.equal(findingStatus(allAudit, "LD-13"), "manual");
+  for (const id of ["LD-12", "LD-13"]) {
+    const item = finding(allAudit, id);
+    assert.match(item.summary, /Unreadable inventory: audit_log_/, id);
+    assert.ok(item.evidence.unreadable_inventories.length >= 2, `${id} names the audit queries that were denied`);
+    assert.ok(item.evidence.unreadable_inventories.every((gap) => gap.http_status === 403 && /GET \/api\/v2\/auditlog/.test(gap.endpoint)), id);
+    assert.ok(item.evidence.manual_evidence.length > 0, `${id} carries the manual evidence`);
+  }
+
+  const emptyAudit = await assessLaunchdarklyMonitoringIntegrations(healthyClient({
+    async listAuditLogEntries() {
+      return [];
+    },
+  }), { now: NOW });
+  assert.equal(findingStatus(emptyAudit, "LD-12"), "fail", "a readable audit log that returned nothing is the fail case");
+  assert.equal(finding(emptyAudit, "LD-12").summary, "The audit log returned no entries at all.");
+  assert.equal(findingStatus(emptyAudit, "LD-13"), "warn");
+});
+
+test("LD-18 names a denied environments read as an unreadable inventory, and a key-filtered project listing the server did not narrow carries its reason without offering project_limit", async () => {
+  const requests = [];
+  const fetchFor = (projectsTotal) => async (input) => {
+    const url = new URL(typeof input === "string" ? input : input.toString());
+    requests.push(`${url.pathname}${url.search}`);
+    if (url.pathname === "/api/v2/account/relay-auto-configs") {
+      return jsonResponse({ items: [{ name: "edge", lastModified: RECENT_MS, policy: [{ effect: "allow", actions: ["*"], resources: ["proj/web:env/production"] }] }] });
+    }
+    if (url.pathname === "/api/v2/projects") return jsonResponse({ items: [{ key: "web", name: "Web" }], totalCount: projectsTotal });
+    if (url.pathname === "/api/v2/projects/web/environments") return jsonResponse({ code: "forbidden", message: "denied" }, { status: 403, statusText: "Forbidden" });
+    if (url.pathname === "/api/v2/auditlog") return jsonResponse({ items: [{ _id: "a1", date: RECENT_MS, kind: "member", name: "x", accesses: [{ action: "createMember" }] }], totalCount: 1 });
+    if (url.pathname === "/api/v2/caller-identity") return jsonResponse({ accountId: "acct", memberId: "m1", tokenKind: "personal" });
+    return jsonResponse({ items: [], totalCount: 0 });
+  };
+
+  const narrowed = await assessLaunchdarklyMonitoringIntegrations(new LaunchdarklyApiClient(sampleConfig(), { fetchImpl: fetchFor(1) }), { now: NOW });
+  const relay = finding(narrowed, "LD-18");
+  assert.equal(relay.status, "warn");
+  assert.match(relay.summary, /Unreadable inventory: environments for project web \(GET \/api\/v2\/projects\/web\/environments: .*403 Forbidden.*\), so secure mode on the production environments the Relay Proxy serves was not checked/);
+  assert.doesNotMatch(relay.summary, /Truncated listing/, "a project listing the server narrowed to the referenced key is complete");
+  assert.equal(relay.evidence.truncated_collections, undefined);
+  assert.equal(relay.evidence.unreadable_inventories[0].endpoint, "GET /api/v2/projects/web/environments");
+  assert.equal(relay.evidence.unreadable_inventories[0].http_status, 403);
+  assert.ok(requests.includes("/api/v2/projects?filter=keys%3Aweb&limit=1&offset=0"), "the project listing is capped at the referenced project count");
+
+  const unnarrowed = await assessLaunchdarklyMonitoringIntegrations(new LaunchdarklyApiClient(sampleConfig(), { fetchImpl: fetchFor(2) }), { now: NOW });
+  const relayUnnarrowed = finding(unnarrowed, "LD-18");
+  assert.match(relayUnnarrowed.summary, /Truncated listing: projects \(1 of 2 collected; the server reported 2 projects for the 1 referenced key, so the key filter may not have applied and only the collected projects were evaluated\)\. The verdict covers only the collected items, so review the uncollected items manually\./);
+  assert.doesNotMatch(relayUnnarrowed.summary, /project_limit/, "the monitoring tool has no project_limit to raise");
+  assert.match(relayUnnarrowed.summary, /Unreadable inventory: environments for project web \(GET \/api\/v2\/projects\/web\/environments: /);
+  assert.equal(relayUnnarrowed.evidence.truncated_collections[0].option, undefined);
+  assert.match(relayUnnarrowed.evidence.truncated_collections[0].reason, /the key filter may not have applied/);
 });
 
 // Credential values planted in collected objects. Alphanumeric and random-looking so that every 6-to-24-character window
@@ -1901,7 +2393,7 @@ test("verdict rule 9: the LaunchDarkly bundle and its zip never carry credential
   const config = subscriptions[0].items[0].config;
   assert.equal(config.url, "https://hooks.example.com");
   assert.deepEqual(config.headers, [{ name: "Authorization", value: "[REDACTED]" }]);
-  assert.equal(config.destination.credentials.apiKey, "[REDACTED]");
+  assert.equal(config.destination.credentials, "[REDACTED]", "the whole subtree under a credential-shaped key is blanked, not only its string leaves");
   const flags = JSON.parse(files.get(join("core_data", "flags.json")));
   assert.equal(flags[0].items[0].variations, 2, "flag variations are projected to a count");
   assert.equal(flags[0].items[0].environments.production.rules, 1, "rule clauses are projected to a count");
@@ -2060,6 +2552,30 @@ test("exportLaunchdarklyAuditBundle records truncated listings in core data snap
   assert.match(executive, /## Truncated Listings/);
   assert.match(executive, /- members: 3 of 400 collected; raise member_limit/);
   assert.doesNotMatch(executive, /Partial Collection Warnings/);
+});
+
+test("exportLaunchdarklyAuditBundle writes a refused next link's reason to the executive summary's Truncated Listings instead of the cap remedy, while a cap stop still advises its option", async () => {
+  const base = createTempBase("grclanker-ld-export-refused-");
+  const reference = healthyClient();
+  const result = await exportLaunchdarklyAuditBundle(healthyClient({
+    listMembers: async () => {
+      const items = await reference.listMembers();
+      return { items, truncated: true, seen: items.length, total: items.length, endpoint: "GET /api/v2/members", truncationReason: FOREIGN_ORIGIN_MESSAGE };
+    },
+    listCustomRoles: () => truncatedListing(reference, "listCustomRoles", 1, 40),
+  }), sampleConfig(), base, { now: NOW });
+
+  const findings = JSON.parse(readFileSync(join(result.outputDir, "analysis", "findings.json"), "utf8"));
+  const [memberNote] = findings.find((item) => item.id === "LD-02").evidence.truncated_collections;
+  assert.equal(memberNote.reason, FOREIGN_ORIGIN_MESSAGE, "the finding note carries the refusal");
+
+  const executive = readFileSync(join(result.outputDir, "compliance", "executive_summary.md"), "utf8");
+  const truncatedLines = executive.slice(executive.indexOf("## Truncated Listings")).split("\n").filter((line) => line.startsWith("- "));
+  const membersLine = truncatedLines.find((line) => line.startsWith("- members:"));
+  assert.equal(membersLine, `- members: 3 of 3 collected; ${FOREIGN_ORIGIN_MESSAGE}`, "the summary line names the refusal, as the finding caveat and QUICK_REFERENCE.md do");
+  assert.doesNotMatch(membersLine, /raise member_limit/, "raising the cap cannot fix a refused link, so the summary does not offer it");
+  const rolesLine = truncatedLines.find((line) => line.startsWith("- custom_roles:"));
+  assert.equal(rolesLine, "- custom_roles: 1 of 40 collected; raise role_limit", "a cap stop keeps the option remedy");
 });
 
 test("exportLaunchdarklyAuditBundle keeps directory and zip paired across repeated exports", async () => {
@@ -2492,6 +3008,92 @@ test("verdict rule 9 / addendum 2: the LaunchDarkly bundle, its zip, every asses
   assert.equal(assessments[1].summary.wildcard_roles, null);
 });
 
+/**
+ * A token id the way LaunchDarkly issues one (a 24-hex object id), random-looking so every 6-to-24-character window of
+ * it can be asserted absent. The same id names the caller's own token in /caller-identity (tokenId) and in the token
+ * listing (_id).
+ */
+const LD_CALLER_TOKEN_ID = "6f3a9c1e7b2d48e05a9f31c7";
+
+/** The listing record's own `_id` field carries the identifier, as on main; every other occurrence of the id is a leak. */
+function withoutTokenRecordId(text, id) {
+  return text.replaceAll(`"_id": "${id}"`, '"_id": "<identifier>"').replaceAll(`"_id":"${id}"`, '"_id":"<identifier>"');
+}
+
+test("Codex r4082447897: through the real client the caller identity is reconciled against the token listing on the raw tokenId before the scrub, so an Admin audit service token is the assessment token (LD-10 warn, not fail) and the inventory is full, while every written tokenId stays redacted", async () => {
+  const fixture = ldFixture();
+  fixture.identity = { accountId: "acct-123", memberId: "m1", tokenId: LD_CALLER_TOKEN_ID, tokenName: "grc-audit-service", serviceToken: true };
+  // The only visible personal token is the caller's own, so nothing but the caller-token match can establish a full inventory.
+  fixture.tokens = [
+    { _id: LD_CALLER_TOKEN_ID, name: "grc-audit-service", role: "admin", serviceToken: true, memberId: "m1", expiry: FUTURE_MS, lastUsed: RECENT_MS, creationDate: RECENT_MS },
+    ...fixture.tokens.filter((token) => token._id !== "t2"),
+  ];
+  const { client, config } = httpLaunchdarkly(fixture);
+
+  const accessControl = await assessLaunchdarklyAccessControl(client, { now: NOW });
+  const inventory = finding(accessControl, "LD-08").evidence.token_inventory;
+  assert.equal(accessControl.summary.token_inventory_scope, "full");
+  assert.deepEqual(
+    { scope: inventory.scope, reason: inventory.reason, caller_token_role: inventory.caller_token_role, caller_member_role: inventory.caller_member_role },
+    { scope: "full", reason: "The assessment token has the admin base role, so showAll returned every member's personal tokens.", caller_token_role: "admin", caller_member_role: "owner" },
+  );
+  for (const id of ["LD-08", "LD-09", "LD-11"]) assert.equal(findingStatus(accessControl, id), "pass", `${id} is not degraded by an unknown inventory`);
+  assert.equal(findingStatus(accessControl, "LD-10"), "warn", "the caller's own Admin service token is disclosed, not counted as an unrelated over-scoped token");
+  assert.match(finding(accessControl, "LD-10").summary, /^Of 2 visible service tokens, the assessment token grc-audit-service uses the admin base role that LaunchDarkly requires for a complete token inventory, so keep it expiring, rotated, and dedicated to auditing\.$/);
+  assert.deepEqual(finding(accessControl, "LD-10").evidence.assessment_service_token, { token: "grc-audit-service", role: "admin", over_scoped: true });
+  assert.deepEqual(finding(accessControl, "LD-10").evidence.owner_or_admin_service_tokens, []);
+
+  const access = await checkLaunchdarklyAccess(client);
+  assert.deepEqual(
+    { tokenId: access.callerIdentity.tokenId, tokenName: access.callerIdentity.tokenName, memberId: access.callerIdentity.memberId, serviceToken: access.callerIdentity.serviceToken },
+    { tokenId: "[REDACTED]", tokenName: "grc-audit-service", memberId: "m1", serviceToken: true },
+  );
+  assert.equal(access.notes[1], "Authenticated as grc-audit-service (service token, member m1).");
+
+  const exported = await exportLaunchdarklyAuditBundle(client, config, createTempBase("grclanker-ld-caller-token-"), { now: NOW });
+  const assessments = await runAllLaunchdarklyAssessments(client);
+  const files = readBundleFiles(exported.outputDir);
+  const entries = readZipEntries(exported.zipPath);
+  assert.equal(JSON.parse(files.get("core_data/access_check.json")).callerIdentity.tokenId, "[REDACTED]");
+  const bundledAccessControl = JSON.parse(files.get("analysis/access_control.json"));
+  assert.equal(findingStatus(bundledAccessControl, "LD-10"), "warn");
+  assert.equal(bundledAccessControl.summary.token_inventory_scope, "full");
+  assert.deepEqual(
+    JSON.parse(files.get("core_data/access_tokens.json")).items.map((token) => token._id),
+    [LD_CALLER_TOKEN_ID, "tok-1", "t1"],
+    "the listing keeps every token record's own identifier, as on main",
+  );
+  // Outside the listing records' own `_id` field, no window of the id reaches any bundle file, zip entry, or payload.
+  const written = new Map([
+    ...files,
+    ...[...entries].map(([name, text]) => [`zip:${name}`, text]),
+    ["check_access", JSON.stringify(access)],
+    ["assessments", JSON.stringify(assessments)],
+  ]);
+  const outsideIdentifierField = new Map([...written].map(([name, text]) => [name, withoutTokenRecordId(text, LD_CALLER_TOKEN_ID)]));
+  assertCanaryWindowsAbsent(assert, outsideIdentifierField, [LD_CALLER_TOKEN_ID], "written output outside the token listing's _id field");
+  const idFieldMentions = [...written.values()].filter((text) => text !== withoutTokenRecordId(text, LD_CALLER_TOKEN_ID)).length;
+  assert.ok(idFieldMentions >= 3, `the id is written only as the listing record's _id (access_tokens.json, its zip entry, the assess payload); saw ${idFieldMentions} texts carrying it`);
+});
+
+/** A 403 body echoing weak human-chosen pairs (no digits, symbols, or length a shape gate would catch) under vendor env names, a config key, a webhook-prefixed credential key (gap 39), and a header-named key whose value opens with a scheme word. */
+const WEAK_PAIR_BODY = "Access denied: LAUNCHDARKLY_API_TOKEN=monkey LD_ACCESS_TOKEN=Sunshine webhook_secret=hunter2 DD_APP_KEY=p@ss BOX_CLIENT_SECRET=football KNOWBE4_API_TOKEN=qwerty ELASTIC_PASSWORD=iloveyou x-api-key: splunk correcthorse";
+const WEAK_PAIR_VALUES = ["monkey", "Sunshine", "hunter2", "p@ss", "football", "qwerty", "iloveyou", "splunk correcthorse"];
+const WEAK_PAIR_KEYS = ["LAUNCHDARKLY_API_TOKEN", "LD_ACCESS_TOKEN", "webhook_secret", "DD_APP_KEY", "BOX_CLIENT_SECRET", "KNOWBE4_API_TOKEN", "ELASTIC_PASSWORD", "x-api-key"];
+
+test("row (a): a LaunchDarkly 403 body echoing weak values under credential-named keys reaches the access check with every value gone and every key kept", async () => {
+  const { client, log } = httpLaunchdarkly(ldFixture(), {
+    routes: { "GET /api/v2/roles": () => jsonResponse({ code: "forbidden", message: WEAK_PAIR_BODY }, { status: 403, statusText: "Forbidden" }) },
+  });
+  const access = await checkLaunchdarklyAccess(client);
+  const roles = access.surfaces.find((surface) => surface.name === "custom_roles");
+  assert.deepEqual({ status: roles.status, http_status: roles.http_status }, { status: "not_readable", http_status: 403 });
+  assert.ok(log.some((entry) => entry.status === 403), "the 403 was observed on the wire");
+  assert.match(roles.error, /LaunchDarkly request failed \(403 Forbidden\) for GET \/api\/v2\/roles: forbidden: Access denied: /);
+  for (const key of WEAK_PAIR_KEYS) assert.ok(roles.error.includes(`${key}=[REDACTED]`) || roles.error.includes(`${key}: [REDACTED]`), `${key} keeps its name and gets the marker: ${roles.error}`);
+  assertCanaryWindowsAbsent(assert, JSON.stringify(access), WEAK_PAIR_VALUES, "check_access payload");
+});
+
 test("addendum 5: every request label and status code named in LaunchDarkly output corresponds to a request the run made and observed", async () => {
   const fixture = ldFixture();
   const base = ldRoutes(fixture);
@@ -2697,6 +3299,41 @@ function isLdFallback(path, value, baselineValue) {
   return !LD_READ_STATE_PATHS.some((pattern) => pattern.test(path));
 }
 
+/**
+ * Diffs every summary and evidence leaf of a degraded run (tool payloads and the bundle's analysis summaries) against
+ * the all-readable baseline, appending each zero, false, or empty fallback to `offenders`; returns the leaf count.
+ */
+function ldCollectFallbacks(label, degraded, baseline, files, baselineFiles, offenders) {
+  let comparedLeaves = 0;
+  for (const [areaIndex, result] of degraded.entries()) {
+    const baselineResult = baseline[areaIndex];
+    for (const [path, value] of ldLeafEntries(result.summary)) {
+      comparedLeaves += 1;
+      const baselineValue = ldPluck(baselineResult.summary, path);
+      if (isLdFallback(path, value, baselineValue)) offenders.push(`${label}: ${result.category} summary.${path} = ${JSON.stringify(value)} (baseline ${JSON.stringify(baselineValue)})`);
+    }
+    for (const item of result.findings) {
+      const baselineFinding = finding(baselineResult, item.id);
+      for (const [path, value] of ldLeafEntries(item.evidence ?? {})) {
+        comparedLeaves += 1;
+        const baselineValue = ldPluck(baselineFinding.evidence ?? {}, path);
+        if (isLdFallback(path, value, baselineValue)) offenders.push(`${label}: ${item.id} evidence.${path} = ${JSON.stringify(value)} (baseline ${JSON.stringify(baselineValue)})`);
+      }
+    }
+  }
+  // The bundle's assessment-level summaries get the same treatment as the tool payloads.
+  for (const [, area] of LD_AREAS.map(([category]) => [category, `analysis/${category}.json`])) {
+    if (!files.has(area)) continue;
+    const summary = JSON.parse(files.get(area)).summary ?? {};
+    const baselineSummary = JSON.parse(baselineFiles.get(area)).summary ?? {};
+    for (const [path, value] of ldLeafEntries(summary)) {
+      comparedLeaves += 1;
+      if (isLdFallback(path, value, ldPluck(baselineSummary, path))) offenders.push(`${label}: ${area} summary.${path} = ${JSON.stringify(value)}`);
+    }
+  }
+  return comparedLeaves;
+}
+
 test("addendum 3: under every single-inventory denial no LaunchDarkly finding, summary, or tool payload falls back to a zero, false, or empty value, and no principal is named from the denied inventory", async () => {
   const baselineRun = httpLaunchdarkly(ldPrincipalFixture());
   const baseline = await runAllLaunchdarklyAssessments(baselineRun.client);
@@ -2746,32 +3383,7 @@ test("addendum 3: under every single-inventory denial no LaunchDarkly finding, s
       ];
       assert.ok(!deniedText.includes(canary), `${label}: ${canary} is still named from the denied inventory at ${where.join(", ")}`);
     }
-    for (const [areaIndex, result] of denied.entries()) {
-      const baselineResult = baseline[areaIndex];
-      for (const [path, value] of ldLeafEntries(result.summary)) {
-        comparedLeaves += 1;
-        const baselineValue = ldPluck(baselineResult.summary, path);
-        if (isLdFallback(path, value, baselineValue)) offenders.push(`${label}: ${result.category} summary.${path} = ${JSON.stringify(value)} (baseline ${JSON.stringify(baselineValue)})`);
-      }
-      for (const item of result.findings) {
-        const baselineFinding = finding(baselineResult, item.id);
-        for (const [path, value] of ldLeafEntries(item.evidence ?? {})) {
-          comparedLeaves += 1;
-          const baselineValue = ldPluck(baselineFinding.evidence ?? {}, path);
-          if (isLdFallback(path, value, baselineValue)) offenders.push(`${label}: ${item.id} evidence.${path} = ${JSON.stringify(value)} (baseline ${JSON.stringify(baselineValue)})`);
-        }
-      }
-    }
-    // The bundle's assessment-level summaries get the same treatment as the tool payloads.
-    for (const [, area] of LD_AREAS.map(([category]) => [category, `analysis/${category}.json`])) {
-      if (!files.has(area)) continue;
-      const summary = JSON.parse(files.get(area)).summary ?? {};
-      const baselineSummary = JSON.parse(baselineFiles.get(area)).summary ?? {};
-      for (const [path, value] of ldLeafEntries(summary)) {
-        comparedLeaves += 1;
-        if (isLdFallback(path, value, ldPluck(baselineSummary, path))) offenders.push(`${label}: ${area} summary.${path} = ${JSON.stringify(value)}`);
-      }
-    }
+    comparedLeaves += ldCollectFallbacks(label, denied, baseline, files, baselineFiles, offenders);
     if (denial.inventory === "caller_identity") {
       const metadata = JSON.parse(files.get("metadata.json"));
       assert.equal(metadata.account_id, null, "the account id is unknown when the caller identity was not readable");
@@ -2779,6 +3391,186 @@ test("addendum 3: under every single-inventory denial no LaunchDarkly finding, s
   }
   assert.ok(comparedLeaves > 3000, `expected the sweep to compare thousands of leaves, got ${comparedLeaves}`);
   assert.deepEqual(offenders, [], `values that fell back to zero, false, or empty under a denial:\n${offenders.join("\n")}`);
+});
+
+// ---------------------------------------------------------------------------------------------------------------
+// Silent success: a 200 whose body is not the documented shape is a failed read, never an empty inventory.
+// ---------------------------------------------------------------------------------------------------------------
+
+/** A word planted in every silent body; any echo of the body into an output is caught by looking for it. */
+const LD_SILENT_MARKER = "SilentPortalMarkerZq";
+
+/** The four bodies a 200 can carry without being a LaunchDarkly answer, with the fixed note each must produce. */
+const LD_SILENT_BODIES = [
+  { name: "empty body", response: () => new Response("", { status: 200, statusText: "OK" }), note: /returned 200 OK with an empty body \(0 bytes\); the endpoint is not serving the JSON API/ },
+  { name: "HTML page", response: () => new Response(`<html><body><h1>Sign in</h1><p>${LD_SILENT_MARKER}</p></body></html>`, { status: 200, statusText: "OK", headers: { "content-type": "text/html; charset=utf-8" } }), note: /was not valid JSON \(200 OK: non-JSON body \(text\/html, \d+ bytes, not echoed\)\)/ },
+  { name: "foreign JSON object", response: () => jsonResponse({ status: "ok", service: LD_SILENT_MARKER, version: "3.2.1" }), note: /returned 200 OK with a JSON body that is not the documented (list object with an items array|resource object with any of [A-Za-z_, ]+) \(\d+ bytes, not echoed\); the endpoint is not serving the JSON API/ },
+  { name: "JSON array", response: () => jsonResponse([{ _id: LD_SILENT_MARKER, email: "array@example.com" }]), note: /returned 200 OK with a JSON body that is not the documented (list object with an items array|resource object with any of [A-Za-z_, ]+) \(\d+ bytes, not echoed\)/ },
+];
+
+/** Answers one dataset's route with a silent 200; audit log datasets share a route and are told apart by their query. */
+function ldSilentDataset(base, denial, variant) {
+  if (denial.query === undefined) return () => variant.response();
+  return (url, params, init) => (denial.query(url) ? variant.response() : base[denial.route](url, params, init));
+}
+
+test("verdict rule 1 (silent success): LaunchdarklyApiClient treats a 200 with an empty, HTML, foreign-JSON, or array body as a failed read with http_status 200 and a fixed note, never as an empty inventory", async () => {
+  for (const variant of LD_SILENT_BODIES) {
+    const client = new LaunchdarklyApiClient(sampleConfig(), { fetchImpl: async () => variant.response(), maxRetries: 0 });
+    await assert.rejects(client.listMembers(5), (error) => {
+      assert.ok(error instanceof LaunchdarklyApiError, `${variant.name}: the read fails as an API error`);
+      assert.equal(error.status, 200, `${variant.name}: the observed 200 travels with the error`);
+      assert.equal(error.endpoint, "GET /api/v2/members");
+      assert.match(error.message, variant.note, `${variant.name}: the message is the fixed note`);
+      assert.ok(!error.message.includes(LD_SILENT_MARKER) && !error.message.includes("array@example.com") && !error.message.includes("3.2.1"), `${variant.name}: nothing from the body is echoed`);
+      return true;
+    });
+    await assert.rejects(client.getCallerIdentity(), (error) => {
+      assert.ok(error instanceof LaunchdarklyApiError);
+      assert.equal(error.status, 200, `${variant.name}: a single-resource read is guarded the same way`);
+      assert.ok(!error.message.includes(LD_SILENT_MARKER));
+      return true;
+    });
+  }
+
+  // The documented shapes still read: an empty inventory is `items: []`, and a caller identity carries its documented keys.
+  const documented = new LaunchdarklyApiClient(sampleConfig(), {
+    fetchImpl: async (input) => (String(input).includes("caller-identity") ? jsonResponse({ accountId: "acct-1", memberId: "m1" }) : jsonResponse({ items: [], totalCount: 0 })),
+  });
+  const none = await documented.listMembers(5);
+  assert.deepEqual({ items: none.items, truncated: none.truncated, seen: none.seen, total: none.total }, { items: [], truncated: false, seen: 0, total: 0 }, "a documented empty listing stays a readable empty inventory");
+  assert.equal((await documented.getCallerIdentity()).accountId, "acct-1");
+});
+
+test("verdict rule 1 (silent success): a silent 200 on any LaunchDarkly inventory is recorded not_readable with the observed 200, nothing passes or fails on it, no value falls back, and nothing from the body is echoed", async () => {
+  const baselineRun = httpLaunchdarkly(ldPrincipalFixture());
+  const baseline = await runAllLaunchdarklyAssessments(baselineRun.client);
+  const baselineExport = await exportLaunchdarklyAuditBundle(baselineRun.client, baselineRun.config, createTempBase("grclanker-ld-silent-baseline-"), { now: NOW });
+  const baselineFiles = readBundleFiles(baselineExport.outputDir);
+
+  const offenders = [];
+  let comparedLeaves = 0;
+  let rowsChecked = 0;
+  for (const [index, denial] of LD_SINGLE_INVENTORY_DENIALS.entries()) {
+    // Every inventory meets one silent body and every body meets several inventories; the client test above covers each pair.
+    const variant = LD_SILENT_BODIES[index % LD_SILENT_BODIES.length];
+    const fixture = ldPrincipalFixture();
+    const { client, config, log } = httpLaunchdarkly(fixture, { routes: { [denial.route]: ldSilentDataset(ldRoutes(fixture), denial, variant) } });
+    const degraded = await runAllLaunchdarklyAssessments(client);
+    const exported = await exportLaunchdarklyAuditBundle(client, config, createTempBase("grclanker-ld-silent-"), { now: NOW });
+    const files = readBundleFiles(exported.outputDir);
+    const label = `${denial.inventory} answered with a silent 200 (${variant.name})`;
+
+    comparedLeaves += ldCollectFallbacks(label, degraded, baseline, files, baselineFiles, offenders);
+    const outputs = new Map([...files, ["assess payloads", JSON.stringify(degraded)]]);
+    for (const [name, text] of outputs) {
+      assert.ok(!text.includes(LD_SILENT_MARKER), `${label}: the body text was echoed into ${name}`);
+    }
+    assert.ok(log.some((entry) => entry.status === 200), `${label}: the 200 the rows cite was observed on the wire`);
+
+    if (denial.file === null) {
+      const metadata = JSON.parse(files.get("metadata.json"));
+      assert.equal(metadata.account_id, null, `${label}: the account id is unknown when the caller identity was not readable`);
+      continue;
+    }
+    const status = JSON.parse(files.get("core_data/collection_status.json"));
+    const rows = status.inventories.filter((row) => row.inventory === denial.inventory);
+    assert.ok(rows.length > 0, `${label}: the inventory has a collection_status row`);
+    for (const row of rows) {
+      rowsChecked += 1;
+      assert.deepEqual(
+        { status: row.status, collected: row.collected, http_status: row.http_status, complete: row.complete, truncated: row.truncated, truncation_reason: row.truncation_reason, seen: row.seen, total: row.total },
+        { status: "not_readable", collected: false, http_status: 200, complete: null, truncated: null, truncation_reason: null, seen: null, total: null },
+        `${label}: the row is a failed read carrying the observed 200, with every flag and count null`,
+      );
+      assert.match(row.error, variant.note, `${label}: the row's error is the fixed note`);
+      assert.match(row.endpoint, /^GET \/api\/v2\//, `${label}: the row names the request that was made`);
+    }
+    const record = JSON.parse(files.get(denial.file));
+    const markers = Array.isArray(record) ? record : Array.isArray(record.failed_reads) ? record.failed_reads : [record];
+    for (const marker of markers) {
+      assert.deepEqual({ collected: marker.collected, status: marker.status, items: marker.items, seen: marker.seen }, { collected: false, status: 200, items: null, seen: null }, `${label}: ${denial.file} is a marker object with the observed 200, not an empty array`);
+    }
+  }
+  assert.ok(rowsChecked >= LD_CORE_DATA_DATASETS.length, `every dataset produced at least one row, got ${rowsChecked}`);
+  assert.ok(comparedLeaves > 3000, `expected the sweep to compare thousands of leaves, got ${comparedLeaves}`);
+  assert.deepEqual(offenders, [], `values that fell back to zero, false, or empty under a silent 200:\n${offenders.join("\n")}`);
+});
+
+// ---------------------------------------------------------------------------------------------------------------
+// Data-side carriers: credential subtrees and free text in collected records.
+// ---------------------------------------------------------------------------------------------------------------
+
+// Random alphanumeric values with no 6-character window in common with each other or the fixture (self-checked below).
+const LD_DATA_CANARIES = {
+  tokensEntry: "itUua8RSaaYJmiJJafrKLp7xzGScVwRi",
+  credentialsValue: "Vp8CkeZuEMbdWw5eD9FfgsrZEFCFBcAV",
+  secretValue: "56eDKUCdKB43HRb5QAXnPEJt4VQB6bwi",
+  customHeaderValue: "HUZVrVBd6HGoeNEMKHNdtiC3EBjRfC9K",
+  commentToken: "3HBmKocR7PPS5uBfjHMcVCV7WgcSJFhH",
+  descriptionBearer: "xbNmLM27AbakCH5EMqypSkSNTkqHc3d6",
+  titleQuery: "tUgNTdkCYRefmSZrsDsEk2Fxjn7CHfyG",
+  nameAssignment: "LR53Hd7BzBVfXcjtksAYPnwYLg79V4xf",
+  roleDescriptionToken: "gG8UG456pXwM9PVP6LAeK9KXvPEJbo7v",
+};
+
+test("gap 36: LaunchDarkly redactCredentialValues keeps and scrubs every string down to depth 25 (inside the deepest kept container), masks the container at depth 25, and copies nothing from depth 26", () => {
+  assertDepthCapPins(assert, redactCredentialValues, 24, "LaunchDarkly walker");
+});
+
+test("verdict rule 9 (data-side carriers): LaunchDarkly blanks the whole subtree under tokens, credentials, and secret keys and scrubs bare tokens, bearer and assignment carriers, and query tokens out of free text before core_data and analysis files are written", async () => {
+  const canaries = Object.values(LD_DATA_CANARIES);
+  const baselineRun = httpLaunchdarkly(ldFixture());
+  const baselineExport = await exportLaunchdarklyAuditBundle(baselineRun.client, baselineRun.config, createTempBase("grclanker-ld-data-baseline-"), { now: NOW });
+  assertCanaryFixture(assert, canaries, readBundleFiles(baselineExport.outputDir), "data-side canaries");
+
+  const fixture = ldFixture();
+  fixture.integrations.datadog[0] = {
+    ...fixture.integrations.datadog[0],
+    config: {
+      url: `https://hooks.example.com/ingest/${LD_DATA_CANARIES.tokensEntry.slice(0, 8)}`,
+      tokens: [LD_DATA_CANARIES.tokensEntry],
+      credentials: { value: LD_DATA_CANARIES.credentialsValue, kind: "api" },
+      secret: { value: LD_DATA_CANARIES.secretValue },
+      headers: [{ name: "X-Custom-Route", value: LD_DATA_CANARIES.customHeaderValue }],
+    },
+  };
+  fixture.auditLog.recent[0] = {
+    ...fixture.auditLog.recent[0],
+    comment: `rotated the ingest key to ${LD_DATA_CANARIES.commentToken} during the incident`,
+    description: `set header Authorization: Bearer ${LD_DATA_CANARIES.descriptionBearer} on the relay`,
+    title: `pointed the sink at https://api.example.com/v1/x?access_token=${LD_DATA_CANARIES.titleQuery} for a week`,
+    name: `api_key=${LD_DATA_CANARIES.nameAssignment}`,
+  };
+  fixture.customRoles[0] = { ...fixture.customRoles[0], description: `Release role; break-glass token ${LD_DATA_CANARIES.roleDescriptionToken} lives in the vault` };
+
+  const { client, config } = httpLaunchdarkly(fixture);
+  const assessments = await runAllLaunchdarklyAssessments(client);
+  const exported = await exportLaunchdarklyAuditBundle(client, config, createTempBase("grclanker-ld-data-"), { now: NOW });
+  const files = readBundleFiles(exported.outputDir);
+  const entries = readZipEntries(exported.zipPath);
+
+  assertCanaryWindowsAbsent(assert, files, canaries, "bundle file");
+  assertCanaryWindowsAbsent(assert, entries, canaries, "zip entry");
+  assertCanaryWindowsAbsent(assert, new Map([["assess payloads", JSON.stringify(assessments)]]), canaries, "assess payload");
+
+  const subscriptions = JSON.parse(files.get("core_data/integration_subscriptions.json"));
+  const written = subscriptions[0].items[0].config;
+  assert.equal(written.tokens, "[REDACTED]", "a credential-shaped list is blanked whole, not walked");
+  assert.equal(written.credentials, "[REDACTED]", "a credential-shaped object is blanked whole");
+  assert.equal(written.secret, "[REDACTED]");
+  assert.deepEqual(written.headers, [{ name: "X-Custom-Route", value: "[REDACTED]" }], "a header pair loses its value whatever its name");
+  assert.equal(written.url, "https://hooks.example.com", "a URL field keeps scheme and host only");
+  const audit = JSON.parse(files.get("core_data/audit_log_recent.json"));
+  const entry = audit.items[0];
+  assert.equal(entry.comment, "rotated the ingest key to [REDACTED] during the incident", "a bare token in free text is removed and the prose kept");
+  assert.match(entry.description, /^set header Authorization: (Bearer )?\[REDACTED\] on the relay$/, "a bearer carrier in free text loses its value");
+  assert.match(entry.title, /^pointed the sink at https:\/\/api\.example\.com\S* for a week$/, "a query token in free text goes with the URL's query");
+  assert.doesNotMatch(entry.title, /access_token=[^[]/);
+  assert.equal(entry.name, "api_key=[REDACTED]", "an assignment carrier in a name field loses its value");
+  const roles = JSON.parse(files.get("core_data/custom_roles.json"));
+  assert.equal(roles.items[0].description, "Release role; break-glass token [REDACTED] lives in the vault");
+  assert.equal(roles.items[0].key, "release-manager", "an identifier key is untouched");
 });
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -3052,4 +3844,10 @@ test("round 7b: resolveLaunchdarklyConfiguration keeps env-provided credentials 
       else process.env[key] = value;
     }
   }
+});
+
+test("cookie attribute class: a later cookie whose name holds a dot or another token character goes with the header value through the LaunchDarkly error text and record scrubbers", () => {
+  assertCookieAttributeCarriersScrubbed(assert, scrubErrorText, "launchdarkly scrubErrorText");
+  assertCookieAttributeCarriersScrubbed(assert, (text) => redactCredentialValues({ note: text }).note, "launchdarkly redactCredentialValues");
+  assertCookieAttributeCarriersScrubbed(assert, (text) => redactCredentialValues([{ message: text }])[0].message, "launchdarkly redactCredentialValues, error list");
 });

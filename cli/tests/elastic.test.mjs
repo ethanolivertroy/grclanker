@@ -27,11 +27,15 @@ import {
   assessElasticTransportSecurity,
   checkElasticAccess,
   collectElasticSnapshot,
+  describeResponseShape,
   evaluateElasticArea,
   exportElasticAuditBundle,
+  matchesResponseShape,
   normalizeElasticApiKey,
+  projectDataset,
   redactSecrets,
   redactSensitiveValues,
+  reduceUrlValueToOrigin,
   registerElasticTools,
   resolveElasticConfiguration,
   resolveSecureOutputPath,
@@ -39,7 +43,8 @@ import {
 } from "../dist/extensions/grc-tools/elastic.js";
 import { getRegisteredToolSummaries } from "../dist/pi/tool-catalog.js";
 import { readBundleFiles, readZipEntries } from "./helpers/bundle-contents.mjs";
-import { assertCanaryFixture, assertCanaryWindowsAbsent } from "./helpers/canary-windows.mjs";
+import { assertCanaryFixture, assertCanaryWindowsAbsent, assertDepthCapPins } from "./helpers/canary-windows.mjs";
+import { assertCookieAttributeCarriersScrubbed } from "./helpers/cookie-attribute-carriers.mjs";
 import { scrubAlterations } from "./helpers/scrub-survival.mjs";
 
 const DAY_MS = 86_400_000;
@@ -796,7 +801,7 @@ test("ElasticApiClient adds kbn-xsrf and space-aware paths for Kibana requests",
   const fetchImpl = createRouter({
     "GET /s/audit-space/api/spaces/space": [{ id: "audit-space" }],
     "GET /api/spaces/space": [{ id: "default" }],
-    "GET /api/status": { status: { overall: { level: "available" } } },
+    "GET /api/status": { name: "kibana", uuid: "kb-1", version: { number: "8.15.0" }, status: { overall: { level: "available" } } },
   }, seen);
 
   const spaced = new ElasticApiClient(sampleConfig({ kibanaSpaceId: "audit-space" }), { fetchImpl });
@@ -814,6 +819,27 @@ test("ElasticApiClient adds kbn-xsrf and space-aware paths for Kibana requests",
   const withoutKibana = new ElasticApiClient(sampleConfig({ kibanaUrl: undefined }), { fetchImpl });
   await assert.rejects(() => withoutKibana.listSpaces(), /KIBANA_URL is not configured/);
   assert.equal(withoutKibana.hasKibana(), false);
+});
+
+test("foreign-origin next link: a URL-shaped Elastic search_after value travels only inside the request body to the configured origin, so no request leaves for the origin it names", async () => {
+  const FOREIGN = "https://collector.attacker.example/_security/_query/api_key";
+  const seen = [];
+  const fetchImpl = createRouter({
+    "POST /_security/_query/api_key": (_url, init) => {
+      const body = JSON.parse(init.body);
+      return body.search_after
+        ? { total: 3, count: 1, api_keys: [{ id: "k3", _sort: [3, "k3"] }] }
+        : { total: 3, count: 2, api_keys: [{ id: "k1", _sort: [1, "k1"] }, { id: "k2", _sort: [FOREIGN, "k2"] }] };
+    },
+  }, seen);
+  const client = new ElasticApiClient(sampleConfig(), { fetchImpl });
+
+  const keys = await client.listApiKeys(10, 2);
+
+  assert.deepEqual(keys.items.map((key) => key.id), ["k1", "k2", "k3"], "paging continued through the planted cursor");
+  assert.equal(seen.length, 2);
+  assert.ok(seen.every((request) => request.host === "es.example.com:9200" && request.pathname === "/_security/_query/api_key"), "every request, including the one that carried the planted cursor, went to the configured Elasticsearch origin");
+  assert.deepEqual(seen[1].body.search_after, [FOREIGN, "k2"], "the cursor travels only as a value inside the POST body");
 });
 
 test("ElasticApiClient paginates API keys with search_after, Watcher with from/size, and Kibana with page parameters", async () => {
@@ -1895,6 +1921,132 @@ test("verdict rule 5: partial inventories are flagged with seen and total counts
   assert.match(findingById(truncatedWatches, "ELASTIC-20").summary, /watches is truncated \(100 of 500 seen/);
 });
 
+test("gap 43: ELASTIC-23 counts a truncated watches read as Watcher in use, names watches as a partial source, and never reports the requirement set complete", async () => {
+  const fixtures = healthyFixtures();
+  fixtures.spaces = [fixtures.spaces[0]];
+  const complete = findingById(await assessElasticClusterHardening(stubClient(fixtures)), "ELASTIC-23");
+  assert.equal(complete.status, "pass");
+  assert.equal(complete.evidence.requirements_complete, true);
+  assert.deepEqual(complete.evidence.partial_sources, []);
+  assert.ok(complete.evidence.required_features.some((item) => item.feature === "Watcher"), "the healthy fixture carries a watch, so Watcher is a requirement");
+  const requirementCount = complete.evidence.required_features.length;
+  assert.match(complete.summary, new RegExp(`\\(${requirementCount} requirement\\(s\\) checked\\)\\.$`));
+
+  // Zero rows under a server count of 500: Watcher is in use, the requirement set is incomplete, and the read is partial.
+  const zero = findingById(await assessElasticClusterHardening(stubClient(fixtures, { listWatches: async () => pagedList([], 500, true) })), "ELASTIC-23");
+  assert.notEqual(zero.status, "pass", "a truncated watches read never supports a pass");
+  assert.equal(zero.status, "warn");
+  assert.equal(zero.evidence.requirements_complete, false);
+  assert.deepEqual(zero.evidence.required_features, complete.evidence.required_features, "the Watcher requirement is kept from the server count");
+  assert.deepEqual(zero.evidence.partial_sources, ["watches is truncated (0 of 500 seen across 1 page(s); raise the collection limit)"]);
+  assert.match(zero.summary, new RegExp(`covers every configured security feature \\(${requirementCount} requirement\\(s\\) checked\\)\\. Verdict is capped at warn because the inventory is partial: watches is truncated \\(0 of 500 seen`));
+  assert.equal(zero.evidence.unsupported_features, null, "coverage is not asserted from an incomplete requirement set");
+  assert.equal(zero.evidence.observed_status, "pass");
+
+  // A capped read with rows: the same requirement set and the same partial note.
+  const capped = findingById(await assessElasticClusterHardening(stubClient(fixtures, {
+    listWatches: async () => pagedList(Array.from({ length: 100 }, (_, index) => ({ ...fixtures.watches[0], _id: `w${index}` })), 500, true),
+  })), "ELASTIC-23");
+  assert.equal(capped.status, "warn");
+  assert.equal(capped.evidence.requirements_complete, false);
+  assert.equal(capped.evidence.required_features.length, requirementCount);
+  assert.deepEqual(capped.evidence.partial_sources, ["watches is truncated (100 of 500 seen across 1 page(s); raise the collection limit)"]);
+
+  // Zero rows with no server count: Watcher in use cannot be proven, so the requirement is not added, and the set stays incomplete.
+  const unknownTotal = findingById(await assessElasticClusterHardening(stubClient(fixtures, { listWatches: async () => pagedList([], undefined, true) })), "ELASTIC-23");
+  assert.equal(unknownTotal.status, "warn");
+  assert.equal(unknownTotal.evidence.requirements_complete, false);
+  assert.equal(unknownTotal.evidence.required_features.length, requirementCount - 1);
+  assert.ok(!unknownTotal.evidence.required_features.some((item) => item.feature === "Watcher"));
+  assert.deepEqual(unknownTotal.evidence.partial_sources, ["watches is truncated (0 of an unknown total seen across 1 page(s); raise the collection limit)"]);
+
+  // Below gold, the Watcher requirement a truncated read establishes is a coverage failure, and the partial note travels with it.
+  const basic = { ...fixtures, license: { license: { ...fixtures.license.license, type: "basic" } } };
+  const uncovered = findingById(await assessElasticClusterHardening(stubClient(basic, { listWatches: async () => pagedList([], 500, true) })), "ELASTIC-23");
+  assert.equal(uncovered.status, "fail");
+  assert.match(uncovered.summary, /does not cover configured features: .*Watcher \(needs gold\)/);
+  assert.match(uncovered.summary, /Additional sources were unreadable or partial: watches is truncated \(0 of 500 seen/);
+  assert.equal(uncovered.evidence.requirements_complete, false);
+
+  // A complete empty read proves the feature absent: no Watcher requirement, no partial note.
+  const none = findingById(await assessElasticClusterHardening(stubClient(fixtures, { listWatches: async () => pagedList([], 0, false) })), "ELASTIC-23");
+  assert.equal(none.status, "pass");
+  assert.equal(none.evidence.requirements_complete, true);
+  assert.equal(none.evidence.required_features.length, requirementCount - 1);
+  assert.deepEqual(none.evidence.partial_sources, []);
+});
+
+test("ELASTIC-20 renders an alerting inventory count as null when its listing stopped before any record was read, and as the rows read otherwise", async () => {
+  const fixtures = healthyFixtures();
+  fixtures.spaces = [fixtures.spaces[0]];
+  const inventoryRow = (item, dataset) => item.evidence.inventories.find((row) => row.dataset === dataset);
+
+  const complete = await assessElasticClusterHardening(stubClient(fixtures));
+  const completeAlerting = findingById(complete, "ELASTIC-20");
+  assert.equal(completeAlerting.status, "pass");
+  assert.deepEqual(
+    [completeAlerting.evidence.watches, completeAlerting.evidence.connectors, completeAlerting.evidence.alerting_rules, completeAlerting.evidence.detection_rules, completeAlerting.evidence.rules_with_actions],
+    [fixtures.watches.length, fixtures.connectors.length, 1, 1, 1],
+  );
+  assert.deepEqual([complete.summary.watches, complete.summary.detection_rules], [fixtures.watches.length, 1]);
+
+  // Zero watches read under a server count of 500: the count is unknown, and the inventory state beside it says why.
+  const zeroWatches = await assessElasticClusterHardening(stubClient(fixtures, { listWatches: async () => pagedList([], 500, true) }));
+  const zeroWatchesAlerting = findingById(zeroWatches, "ELASTIC-20");
+  assert.equal(zeroWatchesAlerting.status, "warn");
+  assert.equal(zeroWatchesAlerting.evidence.watches, null);
+  assert.equal(zeroWatches.summary.watches, null);
+  assert.deepEqual([inventoryRow(zeroWatchesAlerting, "watches").complete, inventoryRow(zeroWatchesAlerting, "watches").seen, inventoryRow(zeroWatchesAlerting, "watches").total], [false, 0, 500]);
+  assert.equal(zeroWatchesAlerting.evidence.connectors, fixtures.connectors.length, "the complete connectors read keeps its count");
+  assert.match(zeroWatchesAlerting.summary, /^0 watches and \d+ connectors reviewed .* Verdict is capped at warn because the inventory is partial: watches is truncated \(0 of 500 seen/);
+
+  // Zero detection rules read: the same rule in the finding and the tool summary; the rules that carry actions were
+  // seen among the alerting rules, so that count stays as a lower bound.
+  const zeroRules = await assessElasticClusterHardening(stubClient(fixtures, { listDetectionRules: async () => pagedList([], 40, true) }));
+  const zeroRulesAlerting = findingById(zeroRules, "ELASTIC-20");
+  assert.equal(zeroRulesAlerting.status, "warn");
+  assert.equal(zeroRulesAlerting.evidence.detection_rules, null);
+  assert.equal(zeroRules.summary.detection_rules, null);
+  assert.equal(zeroRulesAlerting.evidence.rules_with_actions, 1);
+  assert.deepEqual([inventoryRow(zeroRulesAlerting, "detection_rules").complete, inventoryRow(zeroRulesAlerting, "detection_rules").seen], [false, 0]);
+
+  // No rule carries an action among rules read from a listing that stopped: unknown, never "none".
+  const quietRules = { ...fixtures, alertingRules: [{ ...fixtures.alertingRules[0], actions: [] }] };
+  const zeroActions = findingById(await assessElasticClusterHardening(stubClient(quietRules, { listDetectionRules: async () => pagedList([], 40, true) })), "ELASTIC-20");
+  assert.equal(zeroActions.evidence.rules_with_actions, null);
+  assert.equal(findingById(await assessElasticClusterHardening(stubClient(quietRules)), "ELASTIC-20").evidence.rules_with_actions, 0, "a complete read asserts the zero");
+
+  // A capped read with rows renders the rows read as a lower bound beside the partial marker.
+  const capped = await assessElasticClusterHardening(stubClient(fixtures, {
+    listWatches: async () => pagedList(Array.from({ length: 100 }, (_, index) => ({ ...fixtures.watches[0], _id: `w${index}` })), 500, true),
+  }));
+  const cappedAlerting = findingById(capped, "ELASTIC-20");
+  assert.equal(cappedAlerting.status, "warn");
+  assert.equal(cappedAlerting.evidence.watches, 100);
+  assert.equal(capped.summary.watches, 100);
+  assert.equal(inventoryRow(cappedAlerting, "watches").complete, false);
+
+  // Both listings stopped before any record was read: the text does not assert that no destination exists.
+  const emptyStopped = findingById(await assessElasticClusterHardening(stubClient(fixtures, {
+    listWatches: async () => pagedList([], 500, true),
+    listConnectors: async () => pagedList([], 5, true),
+  })), "ELASTIC-20");
+  assert.equal(emptyStopped.status, "warn");
+  assert.equal(emptyStopped.evidence.observed_status, "warn");
+  assert.match(emptyStopped.summary, /^Zero watches and zero connectors were read before the listing stopped, so no alerting destination was assessed and their absence is not established\. Verdict is capped at warn because the inventory is partial: watches is truncated \(0 of 500 seen.*connectors is truncated \(0 of 5 seen/);
+  assert.ok(!/exist in the only Kibana space/.test(emptyStopped.summary));
+  assert.deepEqual([emptyStopped.evidence.watches, emptyStopped.evidence.connectors], [null, null]);
+
+  // Complete empty reads are an observed absence and keep the pass.
+  const emptyComplete = findingById(await assessElasticClusterHardening(stubClient(fixtures, {
+    listWatches: async () => pagedList([], 0, false),
+    listConnectors: async () => pagedList([], 0, false),
+  })), "ELASTIC-20");
+  assert.equal(emptyComplete.status, "pass");
+  assert.match(emptyComplete.summary, /^Zero watches and zero connectors exist in the only Kibana space; this passes because/);
+  assert.deepEqual([emptyComplete.evidence.watches, emptyComplete.evidence.connectors], [0, 0]);
+});
+
 test("verdict rule 6: every enabling flag is read, absent or false flags never support pass, and settings precedence is honored", async () => {
   const now = Date.now();
 
@@ -2611,7 +2763,14 @@ test("verdict rule 9: redactSensitiveValues masks whole subtrees, plural and cam
   assert.equal(redacted.has_private_key, true);
   assert.deepEqual(redacted.fine, { name: "ok", count: 2 });
   assert.ok(!JSON.stringify(redacted).includes("deep-40"), "values past the depth cap are replaced, never copied through");
-  assert.match(JSON.stringify(redacted), /\[REDACTED\]: nesting deeper than 32 levels/);
+  let level = redacted.deep;
+  for (let depth = 1; depth <= 31; depth += 1) level = level.child;
+  assert.equal(level.level, 31);
+  assert.equal(level.child, "[REDACTED]", "the container past the depth cap becomes the uniform marker, the same shape Box and LaunchDarkly render");
+});
+
+test("gap 36: Elastic redactSensitiveValues keeps and scrubs every string down to depth 33 (inside the deepest kept container), masks the container at depth 33, and copies nothing from depth 34", () => {
+  assertDepthCapPins(assert, redactSensitiveValues, 32, "Elastic walker");
 });
 
 test("verdict rule 9: ElasticApiClient describes non-JSON bodies by status and length and echoes only documented JSON error fields", async () => {
@@ -2665,7 +2824,7 @@ test("canary fixture self-check: every planted Elastic credential is alphanumeri
     ["assessments", JSON.stringify(assessments)],
     ["config", JSON.stringify({ ...config, apiKey: null })],
   ]);
-  const canaries = [...Object.values(CANARIES), API_KEY, API_KEY_SECRET, CONFIG_FILE_CANARY, ...Object.values(ELASTIC_CONFIG_CANARIES), ES_PARSER_SNIPPET_CANARY];
+  const canaries = [...Object.values(CANARIES), API_KEY, API_KEY_SECRET, CONFIG_FILE_CANARY, ...Object.values(ELASTIC_CONFIG_CANARIES), ES_PARSER_SNIPPET_CANARY, ...Object.values(DATA_CARRIERS)];
   assertCanaryFixture(assert, canaries, legitimate, "Elastic canaries");
 });
 
@@ -2731,6 +2890,24 @@ function recordedErrorStrings(access, assessments, files) {
   if (errorsLog) strings.push(...errorsLog.split("\n"));
   return strings;
 }
+
+/** A 403 body echoing weak human-chosen pairs (no digits, symbols, or length a shape gate would catch) under vendor env names, a config key, a webhook-prefixed credential key (gap 39), and a header-named key whose value opens with a scheme word. */
+const WEAK_PAIR_BODY = "Access denied: LAUNCHDARKLY_API_TOKEN=monkey LD_ACCESS_TOKEN=Sunshine webhook_secret=hunter2 DD_APP_KEY=p@ss BOX_CLIENT_SECRET=football KNOWBE4_API_TOKEN=qwerty ELASTIC_PASSWORD=iloveyou x-api-key: splunk correcthorse";
+const WEAK_PAIR_VALUES = ["monkey", "Sunshine", "hunter2", "p@ss", "football", "qwerty", "iloveyou", "splunk correcthorse"];
+const WEAK_PAIR_KEYS = ["LAUNCHDARKLY_API_TOKEN", "LD_ACCESS_TOKEN", "webhook_secret", "DD_APP_KEY", "BOX_CLIENT_SECRET", "KNOWBE4_API_TOKEN", "ELASTIC_PASSWORD", "x-api-key"];
+
+test("row (a): an Elastic 403 body echoing weak values under credential-named keys reaches the access check with every value gone and every key kept", async () => {
+  const routes = healthyRoutes(healthyFixtures());
+  routes["GET /_ssl/certificates"] = () => jsonResponse({ error: { type: "security_exception", reason: WEAK_PAIR_BODY }, status: 403 }, { status: 403, statusText: "Forbidden" });
+  const seen = [];
+  const client = new ElasticApiClient(sampleConfig({ maxRetries: 0 }), { fetchImpl: createRouter(routes, seen) });
+  const access = await checkElasticAccess(client);
+  const certificates = access.surfaces.find((surface) => surface.name === "ssl_certificates");
+  assert.equal(certificates.status, "not_readable");
+  assert.match(certificates.error, /^elasticsearch request GET \/_ssl\/certificates failed \(403 Forbidden\): .*Access denied: /);
+  for (const key of WEAK_PAIR_KEYS) assert.ok(certificates.error.includes(`${key}=[REDACTED]`) || certificates.error.includes(`${key}: [REDACTED]`), `${key} keeps its name and gets the marker: ${certificates.error}`);
+  assertCanaryWindowsAbsent(assert, JSON.stringify(access), WEAK_PAIR_VALUES, "check_access payload");
+});
 
 test("addendum 4: a 502 HTML page or a JSON error message carrying credentials on any Elastic surface never reaches the access check, an assess payload, or the bundle, and every recorded error carries the status-and-length note", async () => {
   const fixtures = canaryFixtures();
@@ -2808,6 +2985,519 @@ test("verdict rule 10: listApiKeys reports truncation when a full page has no se
   const outputsUncapped = await client.listFleetOutputs(10);
   assert.equal(outputsUncapped.seen, 3);
   assert.equal(outputsUncapped.truncated, true, "fewer items than the advertised total is still truncated");
+});
+
+/**
+ * The data-side carrier classes of the batch 1 review, one random canary each: userinfo in URL values, bearer tokens
+ * and query-string tokens in free text, webhook-style paths, assignment pairs, name/value pairs, and bare tokens in
+ * notes, spread over the 19 core_data files the review found them in. Each is planted in a field no verdict reads, so
+ * the projection drops it, or in a field a verdict reads, so the scrub reduces it (URL origin, marker).
+ */
+const DATA_CARRIERS = {
+  csUserinfo: "Rp3LnrUG21ICji5YWmflylRgTp9ap9DZ",
+  csBareToken: "z4vwczZ3wciSgujZu5okOpC2GOSEUuse",
+  csSettingBare: "AdwT3zlaOPYAi0yrQjj1IONiXyirPEGe",
+  nsExporterUserinfo: "4EBlZ2FPRmPnySVsr9aI3zH8v4bxfoLK",
+  nsIdpQuery: "ri5FXoBzHS5jVwzWfC0COiylvlDTLiou",
+  authMetaPairValue: "qykqlQJBFt8Qlt48qnH43GKBnUsakj9Y",
+  userMetaPasswordPair: "6WHC8a6NVk0LTUArutZ7wjhnNauZpeGY",
+  userNameValuePair: "KNWNIhmQKQyTTAAYr1AM7XMUqyDfWJFY",
+  roleMetaQuery: "mih3m7UmTYdLoJRiTeELoTju2XgOTGWQ",
+  rmMetaBearer: "X9mgImalhvj3pbHpeVU2QDK9oS8Vuv1x",
+  keyWebhookPath: "pAK0qHjsDBBWtEz4cMrnJV3AjvBcXOAH",
+  keyKvPair: "OGYVOxq9KdXXf8ZYGZxfnFRw3TbLqyIE",
+  keyMetaBare: "qcTKOOqVk8geD6X6NGQMozTRCHnNSf2A",
+  ilmMetaPair: "4RvwTbXIjoxFqtYApreI4F22QqT24DW6",
+  slmMetaPair: "3EQvuCdpDeV2SrI7fBTYxX1tOkyhnzm0",
+  repoUrlUserinfo: "IiPGt54CgFZHFlohCAiD8xC6l3QKymeu",
+  pipeDescBearer: "bYJO5Wq4hEluvgAV2Ynr7IkWDod23xt0",
+  kroleMetaQuery: "qX7og8AH9m46LFVd5ubAB2diwbARVEdv",
+  spaceDescBare: "vpF1PmhUr3SpBBpDyaC31nEFPj6cdqqW",
+  policyDescQuery: "L1JSRmj5KRdCYW6DOkX3HjXm91HRmjwo",
+  policyOverrideUserinfo: "CfhpPnzvqOU7TVH7PGPjC85OcWw1kuRa",
+  outputHostUserinfo: "bBOot5m30grizlyJE8cpVlQFl9m8I1Ka",
+  outputYamlPassphrase: "GkU7jb9kicZPJXiy1r9pqZ5LnQBYlES2",
+  fshUserinfo: "2i4U8v0meo6Ixf6VsTOBLMZ5FdIfhvz6",
+  ruleDescBearer: "kLfqQ3gD1RB3FDkbiUbp9GlBdQT6uKMq",
+  ruleQueryBearer: "BOBA20w5EpfCLZM13iHBEYBHbzV5oe4q",
+  ruleNoteQuery: "5Rl51PAsJk2xt68K4MTbCuQyX8x3j5Ha",
+  ruleRefQuery: "0xDUAHLWpxtrnRfcnilsuH8A3GE6ndrx",
+  alertParamUrl: "glLU0tXx0SuALE0U5HqjLoXa54dOeVsw",
+  ruleActionPath: "JDhScRQydwDgA8MZxAR0CHJYXKorioMp",
+  alertActionBodyPair: "mtyvwwtn6VwgP8p5MuNz9nDIODvSgSsB",
+  cloudMetaBare: "9UqnjUhcKnCrs0XYA1bz5d4Gy2SV0iYJ",
+};
+
+/** The healthy fixture with every DATA_CARRIERS class planted; the verdicts must not move. */
+function carrierFixtures(now = Date.now()) {
+  const C = DATA_CARRIERS;
+  const fixtures = healthyFixtures(now);
+  const node = fixtures.nodeSettings.nodes["node-1"];
+  fixtures.clusterSettings.persistent["xpack.security.authc.realms.ldap.ldap1.url"] = `ldaps://svc:${C.csUserinfo}@ldap.example.com:636`;
+  fixtures.clusterSettings.persistent["xpack.security.authc.realms.saml.corp_sso.attributes.mail"] = C.csSettingBare;
+  fixtures.clusterSettings.persistent["cluster.metadata.owner_note"] = `rotate with ${C.csBareToken} on request`;
+  node.settings["xpack.monitoring.exporters.cloud.host"] = [`https://svc:${C.nsExporterUserinfo}@monitor.example.com:9243`];
+  node.settings["xpack.security.authc.realms.saml.corp_sso.idp.metadata.path"] = `https://idp.example.com/metadata?token=${C.nsIdpQuery}`;
+  fixtures.authenticate.metadata = { headers: [{ name: "X-Api-Key", value: C.authMetaPairValue }] };
+  fixtures.users.auditor.metadata = { note: `password=${C.userMetaPasswordPair}`, attributes: [{ name: "api_token", value: C.userNameValuePair }] };
+  fixtures.roles.analyst_fls.metadata = { docs: `https://wiki.example.com/roles?token=${C.roleMetaQuery}` };
+  fixtures.roleMappings.saml_users.metadata = { note: `upstream sends Authorization: Bearer ${C.rmMetaBearer}` };
+  fixtures.apiKeys[0].metadata = { webhook: `https://hooks.slack.com/services/T000/B000/${C.keyWebhookPath}`, pairs: [{ name: "secret", value: C.keyKvPair }], note: C.keyMetaBare };
+  fixtures.ilmPolicies["logs-retention"].policy._meta = { managed: false, note: `token=${C.ilmMetaPair}` };
+  fixtures.slmPolicies.nightly.policy = { indices: ["*"], config: { indices: ["*"], metadata: { note: `secret=${C.slmMetaPair}` } } };
+  fixtures.snapshotRepositories.offsite = { type: "s3", settings: { bucket: "es-offsite", server_side_encryption: true, endpoint: `https://svc:${C.repoUrlUserinfo}@s3.example.com/snapshots` } };
+  fixtures.ingestPipelines["logs-enrich"].description = `enrich; the upstream proxy sends Authorization: Bearer ${C.pipeDescBearer}`;
+  fixtures.kibanaRoles[1].metadata = { docs: `https://wiki.example.com/kibana?token=${C.kroleMetaQuery}` };
+  fixtures.spaces[1].description = C.spaceDescBare;
+  fixtures.agentPolicies[0].description = `see https://wiki.example.com/fleet?token=${C.policyDescQuery}`;
+  fixtures.agentPolicies[0].overrides = { outputs: { default: { hosts: [`https://svc:${C.policyOverrideUserinfo}@es.example.com:9200`] } } };
+  fixtures.fleetOutputs[0].hosts = [`https://svc:${C.outputHostUserinfo}@es.example.com:9200`];
+  fixtures.fleetOutputs[0].config_yaml = `ssl.key_passphrase: ${C.outputYamlPassphrase}\n`;
+  fixtures.fleetServerHosts[0].host_urls = [`https://agent:${C.fshUserinfo}@fleet.example.com:8220`];
+  fixtures.detectionRules[0].description = `Detects replay of Authorization: Bearer ${C.ruleDescBearer}`;
+  fixtures.detectionRules[0].query = `http.request.headers.authorization:"Bearer ${C.ruleQueryBearer}"`;
+  fixtures.detectionRules[0].note = `Runbook https://runbook.example.com/login?token=${C.ruleNoteQuery}`;
+  fixtures.detectionRules[0].references = [`https://ref.example.com/x?token=${C.ruleRefQuery}`];
+  fixtures.alertingRules[0].params = { url: `https://hook.example.com/notify?token=${C.alertParamUrl}` };
+  fixtures.alertingRules[0].actions[0].params = { path: `/services/T000/B000/${C.ruleActionPath}`, body: `{"token":"${C.alertActionBodyPair}"}` };
+  fixtures.cloudDeployments[0].metadata = { tags: [{ key: "note", value: C.cloudMetaBare }] };
+  return fixtures;
+}
+
+test("verdict rule 9: every collected dataset is projected to the fields its verdicts read and scrubbed before it is assessed or written, so userinfo, free-text tokens, webhook paths, pairs, and bare tokens in 19 core_data files never reach the bundle, the zip, an assess payload, or the access check, and the verdicts do not move", async () => {
+  const config = sampleConfig({ maxRetries: 0, cloudApiKey: "cloud-key" });
+  const options = { sensitiveIndexPatterns: ["customers-*"] };
+  const baseline = new ElasticApiClient(config, { fetchImpl: createRouter(healthyRoutes(healthyFixtures())) });
+  const baselineStatuses = Object.fromEntries((await assessAll(baseline, options)).map((finding) => [finding.id, finding.status]));
+
+  const client = new ElasticApiClient(config, { fetchImpl: createRouter(healthyRoutes(carrierFixtures())) });
+  const access = await checkElasticAccess(client);
+  const snapshot = await collectElasticSnapshot(client, ELASTIC_ALL_DATASETS, options);
+  const assessments = ALL_AREAS.map((area) => evaluateElasticArea(area, snapshot, options, { elasticsearchUrl: config.elasticsearchUrl }));
+  const result = await exportElasticAuditBundle(client, config, createTempBase("elastic-carriers-"), options);
+  const files = readBundleFiles(result.outputDir);
+  const entries = readZipEntries(result.zipPath);
+  const planted = Object.values(DATA_CARRIERS);
+
+  const coreFiles = [...files.keys()].filter((name) => name.startsWith("core_data/"));
+  assert.ok(coreFiles.length >= 29, `expected every dataset in core_data, got ${coreFiles.length}`);
+  assertCanaryWindowsAbsent(assert, files, planted, "bundle file");
+  assertCanaryWindowsAbsent(assert, entries, planted, "zip entry");
+  assertCanaryWindowsAbsent(assert, new Map([["access", JSON.stringify(access)], ["assessments", JSON.stringify(assessments)], ["snapshot", JSON.stringify(snapshot)]]), planted, "tool payload");
+
+  const statuses = Object.fromEntries(assessments.flatMap((assessment) => assessment.findings).map((finding) => [finding.id, finding.status]));
+  assert.deepEqual(statuses, baselineStatuses, "carriers in fields no verdict reads do not move a verdict, and the projection keeps every field the verdicts read");
+  assert.equal(access.status, "healthy");
+
+  const core = (name) => JSON.parse(files.get(`core_data/${name}.json`)).data;
+  assert.equal(core("cluster_settings").persistent["xpack.security.authc.realms.ldap.ldap1.url"], "ldaps://ldap.example.com:636", "a URL setting keeps scheme and host only");
+  assert.equal(core("cluster_settings").persistent["xpack.security.authc.realms.saml.corp_sso.attributes.mail"], "[REDACTED]", "a bare token in a kept setting is the marker");
+  assert.equal(core("cluster_settings").persistent["cluster.metadata.owner_note"], undefined, "settings outside xpack.security are not written");
+  assert.equal(core("node_settings").nodes["node-1"].settings["xpack.security.authc.realms.saml.corp_sso.idp.metadata.path"], "https://idp.example.com");
+  assert.equal(core("node_settings").nodes["node-1"].settings["xpack.monitoring.exporters.cloud.host"], undefined);
+  assert.deepEqual(core("authenticate"), { username: "grc-auditor", roles: ["grc_auditor"], enabled: true, authentication_type: "api_key", authentication_realm: { name: "native1", type: "native" }, lookup_realm: { name: "native1", type: "native" } });
+  assert.deepEqual(core("users").auditor, { username: "auditor", roles: ["analyst_fls"], enabled: true, metadata: {} }, "user metadata keeps only its reserved flags");
+  assert.deepEqual(core("roles").analyst_fls.metadata, {});
+  assert.deepEqual(core("role_mappings").saml_users, { enabled: true, roles: ["kibana_user"], rules: { field: { "realm.name": "corp_sso" } }, metadata: {} });
+  assert.deepEqual(core("api_keys")[0].metadata, {});
+  assert.deepEqual(core("ilm_policies")["logs-retention"].policy._meta, { managed: false });
+  assert.deepEqual(core("ilm_policies")["logs-retention"].policy.phases, { hot: { min_age: "0ms", actions: { rollover: { max_age: "7d" } } }, delete: { min_age: "365d", actions: { delete: {} } } });
+  assert.deepEqual(core("slm_policies").nightly.policy, { config: { indices: ["*"] } });
+  assert.deepEqual(core("snapshot_repositories").offsite, { type: "s3", settings: { bucket: "es-offsite", server_side_encryption: true, endpoint: "https://s3.example.com" } });
+  assert.deepEqual(
+    redactSensitiveValues(projectDataset("snapshot_repositories", { mirror: { type: "url", settings: { url: `https://svc:${DATA_CARRIERS.repoUrlUserinfo}@repo.example.com/snapshots?sig=${DATA_CARRIERS.repoUrlUserinfo}`, readonly: true } } })),
+    { mirror: { type: "url", settings: { readonly: true, url: "https://repo.example.com" } } },
+    "a read-only URL repository keeps scheme and host only",
+  );
+  assert.equal(core("ingest_pipelines")["logs-enrich"].has_description, true);
+  assert.equal(core("ingest_pipelines")["logs-enrich"].description, undefined);
+  assert.deepEqual(core("kibana_roles")[1].metadata, {});
+  assert.deepEqual(core("kibana_spaces")[1], { id: "security-team", name: "Security", disabledFeatures: ["ml"] });
+  assert.deepEqual(core("fleet_agent_policies")[0], { id: "policy-1", name: "Linux servers", namespace: "default", is_protected: true });
+  assert.deepEqual(core("fleet_outputs")[0].hosts, ["https://es.example.com:9200"], "output hosts keep scheme and host only");
+  assert.equal(core("fleet_outputs")[0].config_yaml, undefined);
+  assert.deepEqual(core("fleet_server_hosts")[0].host_urls, ["https://fleet.example.com:8220"]);
+  assert.deepEqual(core("detection_rules")[0], { id: "rule-1", name: "Suspicious login", enabled: true, actions: [] });
+  assert.deepEqual(core("alerting_rules")[0], { id: "alert-1", name: "CPU high", enabled: true, actions: [{ id: "connector-1", group: "default" }] });
+  assert.deepEqual(core("cloud_deployments")[0], { id: "deployment-1", name: "prod", metadata: {} });
+
+  // The plain-http verdicts still read the reduced hosts.
+  const plain = principalFixtures();
+  plain.fleetOutputs[1].hosts = [`http://svc:${DATA_CARRIERS.outputHostUserinfo}@es-plain.example.com:9200`];
+  const plainClient = new ElasticApiClient(config, { fetchImpl: createRouter(healthyRoutes(plain)) });
+  const plainFindings = await assessAll(plainClient, options);
+  const fleet = plainFindings.find((finding) => finding.id === "ELASTIC-21");
+  assert.equal(fleet.status, "fail");
+  assert.deepEqual(fleet.evidence.insecure_outputs, ["output-canary-plain"]);
+  assertCanaryWindowsAbsent(assert, JSON.stringify(plainFindings), [DATA_CARRIERS.outputHostUserinfo], "plain-http verdict payload");
+});
+
+/**
+ * Values planted in the undocumented fields of a realistic Elastic Cloud deployment body (the Cloud ID, the cluster
+ * endpoint host, a user settings override, a plan-level hash, and a non-array resource kind), each random-looking so
+ * every 6-to-24-character window can be asserted absent from what the projection keeps.
+ */
+const CLOUD_DEPLOYMENT_CARRIERS = {
+  cloudId: "d8XwvUz3nRtE5qLbY0hKp2sVmA7cGf4J",
+  endpointHost: "kJ4vNq8ZbT2xLwR6yPd0HsM3cFgE9uAo",
+  userSettings: "Bq7YzT2wLn9KdP4rXs6VhG1jFm3cUe8N",
+  planHash: "W3nKp8ZrTq5xLv2mYb7HdG4sJf9cAe6U",
+  nonArrayKind: "Fy6MtR3vXp9LzQ2wKn8HbJ4dGc7sTa1E",
+};
+const CLOUD_DEPLOYMENT_PLACEHOLDERS = { cloudId: "cloudid", endpointHost: "es-host", userSettings: "principal", planHash: "hash", nonArrayKind: "att" };
+
+/** One deployment the way GET /api/v1/deployments/{id} (DeploymentGetResponse) returns it: resources listed per kind as arrays, each element carrying its info, plan, and settings. */
+function cloudDeploymentBody(planted = CLOUD_DEPLOYMENT_CARRIERS) {
+  const endpoint = `${planted.endpointHost}.us-central1.gcp.cloud.es.io`;
+  return {
+    id: "3f2a9c8e7b6d5a4c3b2a1f0e9d8c7b6a",
+    name: "prod-observability",
+    alias: "prod-observability",
+    healthy: true,
+    metadata: { last_modified: "2026-09-01T10:15:00.000Z", system_owned: false, hidden: false, organization_id: "1234567890", owner_id: "42", tags: [{ key: "cloud_id", value: planted.cloudId }] },
+    settings: { traffic_filter_settings: { rulesets: ["ruleset-1"] } },
+    resources: {
+      elasticsearch: [{
+        ref_id: "main-elasticsearch",
+        id: "5c4b3a2f1e0d9c8b7a6f5e4d3c2b1a09",
+        region: "gcp-us-central1",
+        info: {
+          cluster_id: "5c4b3a2f1e0d9c8b7a6f5e4d3c2b1a09",
+          cluster_name: "prod-observability",
+          healthy: true,
+          status: "started",
+          metadata: { cloud_id: `prod-observability:${planted.cloudId}`, endpoint, ports: { http: 9200, https: 9243 }, version: "8.15.2" },
+          plan_info: { current: { plan: { elasticsearch: { version: "8.15.2", user_settings_yaml: `xpack.security.authc.realms.saml.corp.attributes.principal: ${planted.userSettings}` }, cluster_topology: [{ id: "hot_content", size: { value: 8192, resource: "memory" }, zone_count: 2 }] } } },
+          settings: { snapshot: { enabled: true, repository: { reference: { repository_name: "found-snapshots" } } }, metadata: { hash: planted.planHash } },
+        },
+      }],
+      kibana: [{ ref_id: "main-kibana", id: "9a8b7c6d5e4f3a2b1c0d9e8f7a6b5c4d", region: "gcp-us-central1", elasticsearch_cluster_ref_id: "main-elasticsearch", info: { cluster_id: "9a8b7c6d5e4f3a2b1c0d9e8f7a6b5c4d", cluster_name: "prod-observability", healthy: true, status: "started", metadata: { endpoint, ports: { http: 9200, https: 9243 }, version: "8.15.2" } } }],
+      integrations_server: [{ ref_id: "main-integrations_server", id: "1f2e3d4c5b6a79880716253443526170", region: "gcp-us-central1", elasticsearch_cluster_ref_id: "main-elasticsearch", info: { healthy: true, status: "started", metadata: { endpoint } } }],
+      apm: [],
+      enterprise_search: [],
+      appsearch: [],
+      attachments: { id: planted.nonArrayKind, region: "gcp-us-central1" },
+    },
+  };
+}
+
+test("Codex r4082447905: a deployment's per-kind resource arrays are projected element by element, so every resource id and region reaches the cloud_deployments evidence while no undocumented field or planted value does", async () => {
+  const projected = projectDataset("cloud_deployments", [cloudDeploymentBody()]);
+  assert.deepEqual(projected, [{
+    id: "3f2a9c8e7b6d5a4c3b2a1f0e9d8c7b6a",
+    name: "prod-observability",
+    alias: "prod-observability",
+    healthy: true,
+    metadata: { last_modified: "2026-09-01T10:15:00.000Z", system_owned: false, hidden: false },
+    resources: {
+      elasticsearch: [{ ref_id: "main-elasticsearch", id: "5c4b3a2f1e0d9c8b7a6f5e4d3c2b1a09", region: "gcp-us-central1" }],
+      kibana: [{ ref_id: "main-kibana", id: "9a8b7c6d5e4f3a2b1c0d9e8f7a6b5c4d", region: "gcp-us-central1" }],
+      integrations_server: [{ ref_id: "main-integrations_server", id: "1f2e3d4c5b6a79880716253443526170", region: "gcp-us-central1" }],
+      apm: [],
+      enterprise_search: [],
+      appsearch: [],
+    },
+  }], "each array element keeps ref_id, id, and region; the non-array kind, info, plan, settings, and free-form metadata are dropped");
+
+  // Through the real client: the deployment listing is served over the router, collected, written, and zipped.
+  const config = sampleConfig({ maxRetries: 0, cloudApiKey: "cloud-key" });
+  const fixtures = healthyFixtures();
+  fixtures.cloudDeployments = [cloudDeploymentBody()];
+  const client = new ElasticApiClient(config, { fetchImpl: createRouter(healthyRoutes(fixtures)) });
+  const access = await checkElasticAccess(client);
+  const snapshot = await collectElasticSnapshot(client, ["cloud_deployments"], {});
+  const result = await exportElasticAuditBundle(client, config, createTempBase("elastic-cloud-resources-"), {});
+  const files = readBundleFiles(result.outputDir);
+  const entries = readZipEntries(result.zipPath);
+  const written = JSON.parse(files.get("core_data/cloud_deployments.json")).data;
+  assert.deepEqual(written, projected, "the bundle carries the projected deployment, ids and regions included");
+  assert.deepEqual(JSON.parse(entries.get("core_data/cloud_deployments.json")).data, projected);
+  assert.deepEqual(snapshot.cloud_deployments.data, projected);
+  assert.deepEqual(
+    written[0].resources.elasticsearch.map((resource) => [resource.id, resource.region]),
+    [["5c4b3a2f1e0d9c8b7a6f5e4d3c2b1a09", "gcp-us-central1"]],
+  );
+
+  const planted = Object.values(CLOUD_DEPLOYMENT_CARRIERS);
+  const outputs = new Map([...files, ...[...entries].map(([name, text]) => [`zip:${name}`, text]), ["access", JSON.stringify(access)], ["snapshot", JSON.stringify(snapshot)]]);
+  assertCanaryWindowsAbsent(assert, outputs, planted, "cloud deployment output");
+  for (const dropped of ["organization_id", "owner_id", "tags", "traffic_filter_settings", "cluster_name", "plan_info", "user_settings_yaml", "cloud.es.io", "elasticsearch_cluster_ref_id", "attachments"]) {
+    assert.ok(!files.get("core_data/cloud_deployments.json").includes(dropped), `undocumented field ${dropped} is not written`);
+  }
+  assertCanaryFixture(assert, planted, new Map([["deployment body", JSON.stringify(cloudDeploymentBody(CLOUD_DEPLOYMENT_PLACEHOLDERS))], ...outputs]), "cloud deployment carriers");
+});
+
+/**
+ * Values planted in the undocumented fields of a DeploymentsListResponse element (the Cloud ID, the credentials the
+ * resource schema allows, a secret token, and the id of an element that names no kind), random-looking so every
+ * 6-to-24-character window can be asserted absent from what the projection keeps.
+ */
+const CLOUD_LISTING_CARRIERS = {
+  cloudId: "Vn7QxL2kRz9TbW4mYp8HdC3sJf6gAe1U",
+  password: "Hq3ZwN8vKt5XcL2rPy7BdM9sGf4jTa6E",
+  secretToken: "Rk8PmT4xVz2LqW7nYb3HdJ9cGs5fAe1N",
+  kindless: "Zt5KpX9wQr2LvN7mYc4HbD8sJf3gTe6A",
+};
+const CLOUD_LISTING_PLACEHOLDERS = { cloudId: "cloudid", password: "pw", secretToken: "secret", kindless: "kindless" };
+
+/** One deployment the way GET /api/v1/deployments (DeploymentsListResponse), the request the client makes, returns it: one resources array whose elements each name their kind. */
+function cloudDeploymentListingBody(planted = CLOUD_LISTING_CARRIERS) {
+  return {
+    id: "3f2a9c8e7b6d5a4c3b2a1f0e9d8c7b6a",
+    name: "prod-observability",
+    resources: [
+      { kind: "elasticsearch", ref_id: "main-elasticsearch", id: "5c4b3a2f1e0d9c8b7a6f5e4d3c2b1a09", region: "gcp-us-central1", cloud_id: `prod-observability:${planted.cloudId}`, credentials: { username: "elastic", password: planted.password }, warnings: [] },
+      { kind: "kibana", ref_id: "main-kibana", id: "9a8b7c6d5e4f3a2b1c0d9e8f7a6b5c4d", region: "gcp-us-central1", secret_token: planted.secretToken },
+      { kind: "kibana", ref_id: "secondary-kibana", id: "0b1c2d3e4f5a69788796a5b4c3d2e1f0", region: "gcp-europe-west1" },
+      { ref_id: "orphan", id: planted.kindless, region: "gcp-us-central1" },
+      { kind: 7, ref_id: "numeric-kind", id: "c0ffee00c0ffee00c0ffee00c0ffee00", region: "gcp-us-central1" },
+    ],
+  };
+}
+
+test("CodeRabbit on #77: the deployment listing's resources array (DeploymentsListResponse) is grouped by each element's kind, so the ids and regions main carried reach core_data/cloud_deployments.json, its zip entry, and the snapshot on the path the client uses", async () => {
+  const projected = projectDataset("cloud_deployments", [cloudDeploymentListingBody()]);
+  assert.deepEqual(projected, [{
+    id: "3f2a9c8e7b6d5a4c3b2a1f0e9d8c7b6a",
+    name: "prod-observability",
+    resources: {
+      elasticsearch: [{ ref_id: "main-elasticsearch", id: "5c4b3a2f1e0d9c8b7a6f5e4d3c2b1a09", region: "gcp-us-central1" }],
+      kibana: [
+        { ref_id: "main-kibana", id: "9a8b7c6d5e4f3a2b1c0d9e8f7a6b5c4d", region: "gcp-us-central1" },
+        { ref_id: "secondary-kibana", id: "0b1c2d3e4f5a69788796a5b4c3d2e1f0", region: "gcp-europe-west1" },
+      ],
+    },
+  }], "each element keeps ref_id, id, and region under its kind; an element without a string kind, the Cloud ID, credentials, secret token, and warnings are dropped");
+
+  // Through the real client: GET /api/v1/deployments is served over the router, collected, written, and zipped.
+  const config = sampleConfig({ maxRetries: 0, cloudApiKey: "cloud-key" });
+  const fixtures = healthyFixtures();
+  fixtures.cloudDeployments = [cloudDeploymentListingBody()];
+  const client = new ElasticApiClient(config, { fetchImpl: createRouter(healthyRoutes(fixtures)) });
+  const access = await checkElasticAccess(client);
+  const snapshot = await collectElasticSnapshot(client, ["cloud_deployments"], {});
+  const result = await exportElasticAuditBundle(client, config, createTempBase("elastic-cloud-listing-"), {});
+  const files = readBundleFiles(result.outputDir);
+  const entries = readZipEntries(result.zipPath);
+  const written = JSON.parse(files.get("core_data/cloud_deployments.json")).data;
+  assert.deepEqual(written, projected, "the bundle carries the projected deployment, ids and regions included");
+  assert.deepEqual(JSON.parse(entries.get("core_data/cloud_deployments.json")).data, projected);
+  assert.deepEqual(snapshot.cloud_deployments.data, projected);
+  assert.deepEqual(
+    written[0].resources.elasticsearch.map((resource) => [resource.id, resource.region]),
+    [["5c4b3a2f1e0d9c8b7a6f5e4d3c2b1a09", "gcp-us-central1"]],
+  );
+  assert.deepEqual(
+    written[0].resources.kibana.map((resource) => [resource.id, resource.region]),
+    [["9a8b7c6d5e4f3a2b1c0d9e8f7a6b5c4d", "gcp-us-central1"], ["0b1c2d3e4f5a69788796a5b4c3d2e1f0", "gcp-europe-west1"]],
+  );
+
+  const planted = Object.values(CLOUD_LISTING_CARRIERS);
+  const outputs = new Map([...files, ...[...entries].map(([name, text]) => [`zip:${name}`, text]), ["access", JSON.stringify(access)], ["snapshot", JSON.stringify(snapshot)]]);
+  assertCanaryWindowsAbsent(assert, outputs, planted, "cloud deployment listing output");
+  for (const dropped of ["cloud_id", "credentials", "password", "secret_token", "warnings", "orphan", "numeric-kind", "c0ffee00"]) {
+    assert.ok(!files.get("core_data/cloud_deployments.json").includes(dropped), `undocumented field or kindless element ${dropped} is not written`);
+  }
+  assertCanaryFixture(assert, planted, new Map([["deployment listing body", JSON.stringify(cloudDeploymentListingBody(CLOUD_LISTING_PLACEHOLDERS))], ...outputs]), "cloud deployment listing carriers");
+});
+
+test("verdict rule 9: reduceUrlValueToOrigin reduces a value that is one URL to scheme and host and leaves a URL inside free text to the shared pass, which redactSensitiveValues applies to every collected string", () => {
+  assert.equal(reduceUrlValueToOrigin("https://user:pw@host.example.com:9243/path/x?token=abc#frag"), "https://host.example.com:9243");
+  assert.equal(reduceUrlValueToOrigin("  ldaps://svc:pw@ldap.example.com:636 "), "ldaps://ldap.example.com:636");
+  assert.equal(reduceUrlValueToOrigin("no url here"), "no url here");
+  assert.equal(reduceUrlValueToOrigin("http://"), "http://", "a value with no host is not a URL and is left to the shared pass");
+  assert.equal(reduceUrlValueToOrigin("https://[not a host/x"), "https://[not a host/x", "a value with a space is prose, not one URL");
+  assert.equal(reduceUrlValueToOrigin("https://[::1"), "[REDACTED]", "a value that is one URL and does not parse is the marker rather than copied");
+  const prose = "see https://a.example.com/x?token=abc, then http://svc:pw@b.example.com/y#f.";
+  assert.equal(reduceUrlValueToOrigin(prose), prose, "a URL embedded in free text is left to the shared pass");
+  const scrubbed = redactSensitiveValues({
+    hosts: ["https://svc:pw@es.example.com:9200"],
+    note: "docs at https://wiki.example.com/x?token=abc",
+    detail: `${prose} (https://api.example.com/oauth2/token: 400 Bad Request)`,
+    flag: "curl --password=nwkdpkhggeny https://api.example.com/v1",
+    nested: { url: "https://u:p@h.example.com/a" },
+    id: "https://id.example.com/x?token=abc",
+  });
+  assert.deepEqual(scrubbed, {
+    hosts: ["https://es.example.com:9200"],
+    note: "docs at https://wiki.example.com/x?[REDACTED]",
+    detail: "see https://a.example.com/x?[REDACTED], then http://b.example.com/y?[REDACTED]. (https://api.example.com/oauth2/token: 400 Bad Request)",
+    flag: "curl --password=[REDACTED] https://api.example.com/v1",
+    nested: { url: "https://h.example.com" },
+    id: "https://id.example.com",
+  }, "a URL value keeps its origin; a URL in free text keeps scheme, host, and path and loses userinfo, query, and fragment");
+  assert.deepEqual(redactSensitiveValues(scrubbed), scrubbed, "the data-side scrub is a fixed point");
+  const webhookPair = "webhook_url=https://hooks.example.com/services/T0/B0/Kq7Zx2Vw9Lm4Tp8RfiCYcanaryKEY";
+  const once = redactSensitiveValues({ note: webhookPair, webhook_url: webhookPair.slice("webhook_url=".length) });
+  assert.deepEqual(once, { note: "webhook_url=https://hooks.example.com/[REDACTED]", webhook_url: "https://hooks.example.com" }, "a webhook pair in free text keeps its origin and the marker, a webhook value its origin");
+  assert.deepEqual(redactSensitiveValues(once), once, "the data-side scrub of a webhook pair is idempotent");
+});
+
+test("verdict rule 9: a configured secret straddling the 240-character error detail cut is scrubbed at full length before the cut in every encoding, so no fragment survives in the error, a tool payload, or the bundle", async () => {
+  // Each encoding is the secret as the body carries it; the JSON-escaped fragment wraps the plain secret in an escaped
+  // JSON pair, the way a proxy quotes the request body it rejected.
+  const base64Secret = Buffer.from(API_KEY_SECRET, "utf8").toString("base64");
+  const base64urlKey = Buffer.from(API_KEY, "utf8").toString("base64url");
+  const encodings = {
+    plain_secret: { text: API_KEY_SECRET, canary: API_KEY_SECRET },
+    configured_key: { text: API_KEY, canary: API_KEY },
+    base64_secret: { text: base64Secret, canary: base64Secret },
+    base64url_key: { text: base64urlKey, canary: base64urlKey },
+    url_encoded_key: { text: encodeURIComponent(`${API_KEY}=`), canary: API_KEY },
+    json_escaped_fragment: { text: `{\\"api_key\\":\\"${API_KEY_SECRET}\\"}`, canary: API_KEY_SECRET },
+  };
+  const planted = [API_KEY_SECRET, API_KEY, base64Secret, base64urlKey];
+  const config = sampleConfig({ maxRetries: 0 });
+  for (const [encoding, { text, canary }] of Object.entries(encodings)) {
+    for (const offset of [225, 235, 239, 240]) {
+      const reason = `${"denied ".repeat(50).slice(0, offset)}${text} was rejected by the proxy`;
+      const routes = healthyRoutes(healthyFixtures());
+      routes["GET /_security/user"] = () => jsonResponse({ error: { type: "security_exception", reason }, status: 403 }, { status: 403, statusText: "Forbidden" });
+      const client = new ElasticApiClient(config, { fetchImpl: createRouter(routes) });
+      await assert.rejects(client.listUsers(), (error) => {
+        const label = `${encoding} at offset ${offset}`;
+        assertCanaryWindowsAbsent(assert, error.message, [...planted, canary], label);
+        assert.match(error.message, /^elasticsearch request GET \/_security\/user failed \(403 Forbidden\): \(detail truncated to 240 characters\) denied /, `${label}: the documented message is still quoted up to the cut, behind the truncation note`);
+        assert.ok(error.message.length <= 360, `${label}: the detail is still cut (${error.message.length} characters)`);
+        return true;
+      });
+    }
+  }
+
+  const routes = healthyRoutes(healthyFixtures());
+  const reason = `${"denied ".repeat(50).slice(0, 235)}${API_KEY_SECRET} was rejected by the proxy`;
+  routes["GET /_security/user"] = () => jsonResponse({ error: { type: "security_exception", reason }, status: 403 }, { status: 403, statusText: "Forbidden" });
+  const client = new ElasticApiClient(config, { fetchImpl: createRouter(routes) });
+  const access = await checkElasticAccess(client);
+  const snapshot = await collectElasticSnapshot(client, ELASTIC_ALL_DATASETS, {});
+  const assessments = ALL_AREAS.map((area) => evaluateElasticArea(area, snapshot, {}, { elasticsearchUrl: config.elasticsearchUrl }));
+  const result = await exportElasticAuditBundle(client, config, createTempBase("elastic-secret-cut-"), {});
+  const files = readBundleFiles(result.outputDir);
+  assertCanaryWindowsAbsent(assert, files, planted, "bundle file");
+  assertCanaryWindowsAbsent(assert, readZipEntries(result.zipPath), planted, "zip entry");
+  assertCanaryWindowsAbsent(assert, new Map([["access", JSON.stringify(access)], ["assessments", JSON.stringify(assessments)]]), planted, "tool payload");
+  assert.match(files.get("_errors.log"), /users \(GET \/_security\/user\): elasticsearch request GET \/_security\/user failed \(403 Forbidden\): \(detail truncated to 240 characters\) denied /);
+});
+
+const ELASTIC_SILENT_BODIES = [
+  ["empty", () => new Response("", { status: 200, statusText: "OK" }), /returned a 200 OK: empty body \(0 bytes\); the endpoint is not serving the JSON API$/],
+  ["html", () => new Response("<html><body>Sign in to Kibana</body></html>", { status: 200, statusText: "OK", headers: { "content-type": "text/html" } }), /returned a 200 OK: non-JSON body \(text\/html, \d+ bytes, not echoed\); the endpoint is not serving the JSON API$/],
+  ["foreign", () => jsonResponse({ status: "ok", service: "status-page" }), /returned a 200 OK: JSON body that is not the documented JSON (object|array)[^;]*\(application\/json, \d+ bytes, not echoed\); the endpoint is not serving the JSON API$/],
+];
+
+test("silent success: matchesResponseShape accepts only the documented container of each Elastic response", () => {
+  assert.equal(matchesResponseShape({ username: "u", roles: [] }, { kind: "object", keys: ["username", "roles"] }), true);
+  assert.equal(matchesResponseShape({ status: "ok" }, { kind: "object", keys: ["username", "roles"] }), false, "an object without a documented key is foreign");
+  assert.equal(matchesResponseShape([], { kind: "object", keys: ["username"] }), false);
+  assert.equal(matchesResponseShape({ name: "kibana", uuid: "kb-1", version: { number: "8.15.0" }, status: { overall: { level: "available" } } }, { kind: "object", keys: ["name", "uuid", "version", "status"], all: true }), true);
+  assert.equal(matchesResponseShape({ status: "ok", service: "status-page" }, { kind: "object", keys: ["name", "uuid", "version", "status"], all: true }), false, "a status page sharing one common key with the Kibana status document is foreign");
+  assert.equal(matchesResponseShape({ name: "kibana", uuid: "kb-1", version: { number: "8.15.0" } }, { kind: "object", keys: ["name", "uuid", "version", "status"], all: true }), false, "an all-keys shape needs every key");
+  assert.equal(describeResponseShape({ kind: "object", keys: ["name", "uuid", "version", "status"], all: true }), "JSON object with all of name, uuid, version, status");
+  assert.equal(matchesResponseShape({}, { kind: "map", entryKeys: ["username"] }), true, "an empty map is a documented answer (no mappings, no repositories)");
+  assert.equal(matchesResponseShape({ elastic: { username: "elastic" } }, { kind: "map", entryKeys: ["username", "roles"] }), true);
+  assert.equal(matchesResponseShape({ message: "ok" }, { kind: "map", entryKeys: ["username"] }), false, "a map whose entry is not an object is foreign");
+  assert.equal(matchesResponseShape({ foo: { bar: 1 } }, { kind: "map", entryKeys: ["username"] }), false, "a map whose entry carries no documented key is foreign");
+  assert.equal(matchesResponseShape([], { kind: "array" }), true);
+  assert.equal(matchesResponseShape([{ id: "x" }], { kind: "array" }), true);
+  assert.equal(matchesResponseShape([1, 2], { kind: "array" }), false);
+  assert.equal(matchesResponseShape({ items: [] }, { kind: "array" }), false);
+  assert.equal(matchesResponseShape({ items: [] }, { kind: "list", key: "items" }), true);
+  assert.equal(matchesResponseShape({ items: {} }, { kind: "list", key: "items" }), false);
+  assert.equal(matchesResponseShape({}, { kind: "list", key: "api_keys" }), false, "a bare object is not an empty listing");
+  assert.equal(describeResponseShape({ kind: "list", key: "api_keys" }), "JSON object with an array under api_keys");
+  assert.equal(describeResponseShape({ kind: "map", entryKeys: ["username", "roles"] }), "JSON object of named entries each carrying any of username, roles");
+  for (const shape of [{ kind: "object", keys: ["license"] }, { kind: "map", entryKeys: ["policy", "version"] }, { kind: "array" }, { kind: "list", key: "items" }]) {
+    const text = describeResponseShape(shape);
+    assert.equal(scrubErrorText(text), text, `the shape description is fixed text the scrubber leaves alone: ${text}`);
+  }
+});
+
+test("silent success: a 2xx whose body is empty, an HTML page, or JSON of another shape on any Elastic surface is a failed read with http_status 200, a marker in core_data, and only manual or warn movement in the findings, never an empty inventory", async () => {
+  const config = sampleConfig({ maxRetries: 0, cloudApiKey: "cloud-key" });
+  const options = { sensitiveIndexPatterns: ["customers-*"] };
+  const surfaces = Object.keys(healthyRoutes(healthyFixtures()));
+  assert.ok(surfaces.length >= 30, `expected every collector and access probe route, got ${surfaces.length}`);
+  const baselineClient = new ElasticApiClient(config, { fetchImpl: createRouter(healthyRoutes(healthyFixtures())) });
+  const baseline = Object.fromEntries((await assessAll(baselineClient, options)).map((finding) => [finding.id, finding.status]));
+
+  // Every surface, every body: the surface is not readable with the 200 the server sent, the error is fixed text that
+  // survives the scrubber, and no finding moves anywhere but manual or warn.
+  for (const surface of surfaces) {
+    for (const [kind, body, expected] of ELASTIC_SILENT_BODIES) {
+      const label = `${surface} served a ${kind} 200`;
+      const routes = healthyRoutes(healthyFixtures());
+      routes[surface] = body;
+      const client = new ElasticApiClient(config, { fetchImpl: createRouter(routes) });
+      const access = await checkElasticAccess(client);
+      const row = access.surfaces.find((entry) => entry.endpoint === surface || (entry.endpoint !== null && entry.endpoint.startsWith(`${surface}?`)));
+      if (row) {
+        assert.deepEqual({ status: row.status, collected: row.collected, http_status: row.http_status, count: row.count, truncated: row.truncated }, { status: "not_readable", collected: false, http_status: 200, count: null, truncated: null }, label);
+        assert.match(row.error, expected, label);
+        assert.equal(scrubErrorText(row.error), row.error, `${label}: the recorded error is fixed text`);
+        assert.ok(!/status-page|Sign in/.test(row.error), `${label}: the body is not echoed`);
+      } else {
+        assert.equal(surface, "POST /_security/user/_has_privileges", `${label}: only the privilege probe has no surface row`);
+        assert.equal(access.privilegeProbe, "not_readable", label);
+        assert.match(access.notes.find((note) => note.startsWith("Privilege probe failed")), expected, label);
+      }
+      const findings = await assessAll(client, options);
+      for (const finding of findings) {
+        if (baseline[finding.id] === finding.status) continue;
+        assert.ok(["manual", "warn"].includes(finding.status), `${label}: ${finding.id} moved ${baseline[finding.id]} -> ${finding.status}; only manual or warn may follow an unobserved read: ${finding.summary}`);
+        assert.ok(!/full inventory visibility/.test(finding.summary), `${label}: ${finding.id} claims full visibility of an unobserved inventory: ${finding.summary}`);
+      }
+    }
+  }
+
+  // The reviewer's shapes, end to end: an empty API key listing rendered ELASTIC-09/10 pass on zero keys, and an empty
+  // or foreign body rendered ELASTIC-17/18/23 fail and ELASTIC-06/22 pass on data that was never observed.
+  for (const [kind, body, expected] of ELASTIC_SILENT_BODIES) {
+    const routes = healthyRoutes(healthyFixtures());
+    routes["POST /_security/_query/api_key"] = body;
+    const client = new ElasticApiClient(config, { fetchImpl: createRouter(routes) });
+    const exported = await exportElasticAuditBundle(client, config, createTempBase("elastic-silent-"), options);
+    const files = readBundleFiles(exported.outputDir);
+    const label = `api_keys served a ${kind} 200`;
+    const row = JSON.parse(files.get("collection_status.json")).datasets.find((entry) => entry.name === "api_keys");
+    assert.deepEqual({ status: row.status, collected: row.collected, http_status: row.http_status, count: row.count, paged: row.paged, truncated: row.truncated, seen: row.seen, total: row.total }, { status: "not_readable", collected: false, http_status: 200, count: null, paged: null, truncated: null, seen: null, total: null }, label);
+    assert.match(row.error, expected, label);
+    const written = JSON.parse(files.get("core_data/api_keys.json"));
+    assert.deepEqual({ collected: written.collected, status: written.status, reason: written.reason, page: written.page }, { collected: false, status: 200, reason: "not_readable", page: null }, `${label}: core_data carries a marker, not []`);
+    assert.deepEqual(written.data, { collected: false, status: 200, endpoint: "POST /_security/_query/api_key?with_limited_by=true", target: "elasticsearch", error: written.error, reason: "not_readable" }, label);
+    const findings = JSON.parse(files.get("analysis/findings.json"));
+    for (const id of ["ELASTIC-09", "ELASTIC-10"]) {
+      const finding = findings.find((item) => item.id === id);
+      assert.equal(finding.status, "manual", `${label}: ${id} is ${finding.status}: ${finding.summary}`);
+      assert.match(finding.summary, /api_keys \(POST \/_security\/_query\/api_key\?with_limited_by=true\)/, `${label}: ${id} names the unread inventory`);
+      assert.equal(finding.evidence.inventory.read, false, label);
+      assert.equal(finding.evidence.inventory.status, "not_readable", label);
+    }
+    assert.match(files.get("_errors.log"), new RegExp(expected.source, "m"), label);
+
+    // Every endpoint silent: nothing was observed, so no finding may pass or fail.
+    const silentRoutes = Object.fromEntries(surfaces.map((route) => [route, body]));
+    const silentClient = new ElasticApiClient(config, { fetchImpl: createRouter(silentRoutes) });
+    const silentAccess = await checkElasticAccess(silentClient);
+    assert.equal(silentAccess.status, "limited", `${kind} on every endpoint: the access check is limited`);
+    assert.ok(silentAccess.surfaces.every((entry) => entry.status === "not_readable" && entry.http_status === 200), `${kind} on every endpoint: every surface is a failed read with the observed 200`);
+    for (const finding of await assessAll(silentClient, options)) {
+      assert.equal(finding.status, "manual", `${kind} on every endpoint: ${finding.id} is ${finding.status}: ${finding.summary}`);
+    }
+  }
+
+  // Documented empty containers stay readable: an empty map is no role mappings or repositories, an empty array is no
+  // connectors, and an empty listing is zero watches; the emptiness rules, not the shape guard, judge them.
+  const emptyRoutes = healthyRoutes(healthyFixtures());
+  emptyRoutes["GET /_security/role_mapping"] = {};
+  emptyRoutes["GET /_snapshot/_all"] = {};
+  emptyRoutes["GET /api/actions/connectors"] = [];
+  emptyRoutes["POST /_watcher/_query/watches"] = { count: 0, watches: [] };
+  const emptyClient = new ElasticApiClient(config, { fetchImpl: createRouter(emptyRoutes) });
+  const emptyAccess = await checkElasticAccess(emptyClient);
+  for (const name of ["role_mappings", "snapshot_repositories", "connectors", "watches"]) {
+    const row = emptyAccess.surfaces.find((entry) => entry.name === name);
+    assert.deepEqual({ status: row.status, collected: row.collected, http_status: row.http_status, count: row.count }, { status: "readable", collected: true, http_status: null, count: 0 }, `${name}: a documented empty container is a readable zero-entry inventory`);
+  }
 });
 
 const ELASTIC_MULTI_INVENTORY = [
@@ -3140,6 +3830,13 @@ const ELASTIC_FIXED_TEXT_MESSAGES = [
   "elasticsearch request GET /_ssl/certificates failed (403 Forbidden): security_exception: unauthorized; see https://api.example.com/v1/x?[REDACTED] for details",
   "kibana request GET /api/fleet/outputs failed (403 Forbidden): Forbidden: missing fleet read",
   "elasticsearch request GET /_security/user returned a 200 OK: non-JSON body (text/html, 1024 bytes, not echoed); the endpoint is not serving the JSON API",
+  "elasticsearch request GET /_security/user returned a 200 OK: empty body (0 bytes); the endpoint is not serving the JSON API",
+  "elasticsearch request GET /_security/user failed (403 Forbidden): (detail truncated to 240 characters) security_exception: action [cluster:admin/xpack/security/user/get] is unauthorized for user [grc-auditor]",
+  "elasticsearch request POST /_security/_query/api_key returned a 200 OK: JSON body that is not the documented JSON object with an array under api_keys (application/json, 41 bytes, not echoed); the endpoint is not serving the JSON API",
+  "elasticsearch request GET /_security/user returned a 200 OK: JSON body that is not the documented JSON object of named entries each carrying any of username, roles, enabled (application/json, 41 bytes, not echoed); the endpoint is not serving the JSON API",
+  "elasticsearch request GET /_security/role_mapping returned a 200 OK: JSON body that is not the documented JSON object of named entries each carrying any of enabled, roles, role_templates, rules, metadata (application/json, 41 bytes, not echoed); the endpoint is not serving the JSON API",
+  "kibana request GET /api/spaces/space returned a 200 OK: JSON body that is not the documented JSON array of objects (application/json, 41 bytes, not echoed); the endpoint is not serving the JSON API",
+  "elasticsearch request GET /_license returned a 200 OK: JSON body that is not the documented JSON object with any of license (application/json, 41 bytes, not echoed); the endpoint is not serving the JSON API",
   "elasticsearch request POST /_security/_query/api_key timed out after 30000ms",
   "elasticsearch request GET /_cluster/settings failed: SyntaxError: response could not be parsed as JSON; the parser's message is not recorded because it quotes the body",
   "Using Elasticsearch https://es.example.com:9200 with api_key authentication.",
@@ -3196,4 +3893,11 @@ test("scrub boundary: every fixed-text message the Elastic integration emits sur
   assert.ok(surfaces.length >= 30, `expected every collector and access probe route, got ${surfaces.length}`);
   assert.ok(checked > 2000, `expected thousands of recorded strings, got ${checked}`);
   assert.deepEqual([...altered], [], `legitimate run text altered by the scrubber:\n${[...altered].join("\n")}`);
+});
+
+test("cookie attribute class: a later cookie whose name holds a dot or another token character goes with the header value through the Elastic error text, secret, and record scrubbers", () => {
+  assertCookieAttributeCarriersScrubbed(assert, scrubErrorText, "elastic scrubErrorText");
+  assertCookieAttributeCarriersScrubbed(assert, (text) => redactSecrets(text, sampleConfig()), "elastic redactSecrets");
+  assertCookieAttributeCarriersScrubbed(assert, (text) => redactSensitiveValues({ note: text }).note, "elastic redactSensitiveValues");
+  assertCookieAttributeCarriersScrubbed(assert, (text) => redactSensitiveValues([{ message: text }])[0].message, "elastic redactSensitiveValues, error list");
 });

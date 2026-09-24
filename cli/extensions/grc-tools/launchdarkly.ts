@@ -18,7 +18,7 @@ import { homedir } from "node:os";
 import { basename, dirname, join, relative, resolve } from "node:path";
 import { ZipArchive } from "archiver";
 import { Type } from "@sinclair/typebox";
-import { REDACTED, createCredentialScrubber } from "./credential-scrub.js";
+import { DEFAULT_DATA_SCRUB_DEPTH, REDACTED, createCredentialScrubber, isBearerIdKey } from "./credential-scrub.js";
 import { errorResult, formatTable, textResult } from "./shared.js";
 
 type FetchImpl = typeof fetch;
@@ -136,6 +136,11 @@ export interface LaunchdarklyCollection {
   httpStatus?: number | null;
   /** The request the listing made (for a failed listing, the one that failed), as "GET /path[?query]". */
   endpoint?: string;
+  /**
+   * Why paging stopped before the server's last page when the cause was not the item cap: today only a server-supplied
+   * next link that the client refused to follow. Absent for a listing that drained or stopped at its cap.
+   */
+  truncationReason?: string;
 }
 
 /** A single record read (caller identity) together with how the read ended. */
@@ -165,6 +170,8 @@ export interface LaunchdarklyTruncationNote {
   seen: number;
   total: number | null;
   scope?: string;
+  /** Present when the listing stopped for a reason other than its cap (see LaunchdarklyCollection.truncationReason). */
+  reason?: string;
 }
 
 /** A secondary inventory that a finding reads but that could not be collected (403, 401, 5xx, transport). */
@@ -685,6 +692,57 @@ export class LaunchdarklyApiError extends Error {
   }
 }
 
+/** Why a server-supplied link was refused: it resolves to another origin, or its authority carries user:password@. */
+export type LaunchdarklyRefusedLinkKind = "foreign-origin" | "userinfo";
+
+/**
+ * The origin a refused link resolves to, in the form a reader compares with the configured origin: the scheme, host,
+ * and port (`https://evil.example:8443`), or the bare scheme when the link has no authority (`javascript:`, `data:`,
+ * `file:`). Only the parsed scheme and host enter the text; the link's userinfo, path, query, and fragment never do.
+ */
+export function refusedLinkOrigin(url: URL): string {
+  return url.host.length > 0 ? `${url.protocol}//${url.host}` : url.protocol;
+}
+
+/**
+ * The whole message for a server-supplied link the client refuses. Fixed text plus the configured origin (the
+ * operator's own, userinfo-free setting), so the reader knows which origin was expected, and for a foreign link the
+ * origin it resolved to (scheme, host, and port, or the bare scheme), so the reader knows where the server pointed; the
+ * link's path, query, fragment, and userinfo never enter the message, so a hostile link cannot smuggle content into an
+ * error string.
+ */
+export function launchdarklyRefusedLinkMessage(kind: LaunchdarklyRefusedLinkKind, configuredOrigin: string, refusedOrigin: string): string {
+  switch (kind) {
+    case "foreign-origin":
+      return `LaunchDarkly next link points to ${refusedOrigin}, outside the configured origin ${configuredOrigin}, so it was not followed and no request was sent`;
+    case "userinfo":
+      return `LaunchDarkly next link carries credentials in its authority, so it was not followed and no request was sent; only the configured origin ${configuredOrigin} is requested`;
+    default: {
+      const exhaustive: never = kind;
+      throw new Error(`Unhandled refused link kind: ${String(exhaustive)}`);
+    }
+  }
+}
+
+/** A link that names its own scheme (RFC 3986 scheme characters, any case) and so is not a path on the configured base. */
+const ABSOLUTE_LINK_PATTERN = /^[a-z][a-z0-9+.-]*:/i;
+
+/** Thrown before a request is built when a server-supplied link resolves outside the configured base origin or carries userinfo. */
+export class LaunchdarklyForeignOriginError extends Error {
+  readonly kind: LaunchdarklyRefusedLinkKind;
+  readonly configuredOrigin: string;
+  /** The scheme, host, and port the link resolved to (or its bare scheme); the configured origin for a userinfo refusal. */
+  readonly refusedOrigin: string;
+
+  constructor(kind: LaunchdarklyRefusedLinkKind, configuredOrigin: string, refusedOrigin: string) {
+    super(launchdarklyRefusedLinkMessage(kind, configuredOrigin, refusedOrigin));
+    this.name = "LaunchdarklyForeignOriginError";
+    this.kind = kind;
+    this.configuredOrigin = configuredOrigin;
+    this.refusedOrigin = refusedOrigin;
+  }
+}
+
 /** The HTTP status a failed request observed, or null when the failure produced no response or the error did not come from the client. */
 function observedStatus(error: unknown): number | null {
   return error instanceof LaunchdarklyApiError ? error.status : null;
@@ -707,6 +765,12 @@ function requestLabel(url: string): string {
   }
   const query = params.toString();
   return `GET ${parsed.pathname}${query ? `?${query}` : ""}`;
+}
+
+/** The page size a next link asks for, read from its own limit parameter; undefined when the link names none. */
+function requestedLimit(url: string): number | undefined {
+  const value = asNumber(new URL(url).searchParams.get("limit"));
+  return value !== undefined && Number.isInteger(value) && value > 0 ? value : undefined;
 }
 
 /**
@@ -750,11 +814,12 @@ function maskSecret(value: unknown): string | undefined {
 }
 
 const CREDENTIAL_LAST_SEGMENTS = new Set([
-  "token", "tokens", "secret", "secrets", "password", "passwd", "pwd", "passphrase", "apikey", "authorization",
+  "token", "tokens", "secret", "secrets", "password", "passwd", "pwd", "passphrase", "apikey", "appkey", "appkeys", "applicationkey", "applicationkeys", "authorization",
   "credential", "credentials", "bearer",
 ]);
+// `app` and `application` qualify a key (`appKey`, `applicationKey`, `application_key` in a Datadog integration subscription; gap 35).
 const CREDENTIAL_KEY_QUALIFIERS = new Set([
-  "api", "private", "secret", "signing", "access", "shared", "encryption", "session", "master", "client", "auth", "full",
+  "api", "app", "application", "private", "secret", "signing", "access", "shared", "encryption", "session", "master", "client", "auth", "full",
   "mobile", "sdk", "relay", "service",
 ]);
 const URL_KEY_SEGMENTS = new Set(["url", "urls", "uri", "endpoint", "webhook", "webhookurl"]);
@@ -767,8 +832,15 @@ function keySegments(name: string): string[] {
     .filter(Boolean);
 }
 
-/** True for keys such as apiKey, mobile_key, clientSecret, token, authorization, and privateKeys. */
+/**
+ * True for keys such as apiKey, mobile_key, clientSecret, token, authorization, and privateKeys, and for a bearer id
+ * (`secret_id`, `token_id`, `session_id`, `sid`), which the shared rule redacts because in most APIs its value
+ * authenticates by itself; `_id` keys that name a thing (`member_id`, `_id`) keep their value. LaunchDarkly's
+ * caller-identity `tokenId` falls under the bearer-id rule, so the client matches it against the token listing on the
+ * raw value before this pass and writes the marker (see LaunchdarklyApiClient.isCallerToken).
+ */
 export function isCredentialKey(name: string): boolean {
+  if (isBearerIdKey(name)) return true;
   const segments = keySegments(name);
   if (segments.length === 0) return false;
   const last = segments[segments.length - 1];
@@ -803,33 +875,49 @@ function isNameValuePair(record: JsonRecord): boolean {
   return "value" in record && (typeof record.name === "string" || typeof record.key === "string");
 }
 
-const REDACTION_DEPTH_LIMIT = 12;
-
 /**
- * Recursively redacts credential-shaped keys, reduces every absolute URL to scheme plus host, and blanks the value of
- * {name, value} or {key, value} pairs (header lists). Arrays and nested objects are walked; the shape is preserved.
+ * Header lists ({name, value} or {key, value}) lose their value whatever the name says: an integration subscription's
+ * custom header is a credential more often than not, and nothing downstream reads the value. Booleans and numbers
+ * pass through; the shape is preserved.
  */
-export function redactCredentialValues(value: unknown, depth = 0): unknown {
-  if (depth > REDACTION_DEPTH_LIMIT) return REDACTED;
-  if (typeof value === "string") return reduceUrl(value);
-  if (Array.isArray(value)) return value.map((entry) => redactCredentialValues(entry, depth + 1));
-  const record = asObject(value);
-  if (!record) return value;
+function blankPairValues(value: unknown, depth = 0): unknown {
+  if (depth > DEFAULT_DATA_SCRUB_DEPTH || value === null || typeof value !== "object") return value;
+  if (Array.isArray(value)) return value.map((entry) => blankPairValues(entry, depth + 1));
+  const record = value as JsonRecord;
   const pair = isNameValuePair(record);
   return Object.fromEntries(Object.entries(record).map(([key, entry]) => {
-    if (entry === undefined || entry === null) return [key, entry];
-    if (typeof entry === "string") {
-      // Booleans and numbers under credential-shaped keys (serviceToken: true) carry no secret, so only strings are blanked.
-      if (isCredentialKey(key) || (pair && key === "value")) return [key, REDACTED];
-      // A url/endpoint key whose value is not an absolute URL may still be a host-relative path carrying a token. The
-      // inspector's own request labels ("GET /api/v2/...") name the request a read made and carry no credential.
-      if (isUrlKey(key) && !ABSOLUTE_URL_PATTERN.test(entry) && !REQUEST_LABEL_PATTERN.test(entry)) return [key, REDACTED];
-      return [key, reduceUrl(entry)];
-    }
-    if (typeof entry !== "object") return [key, entry];
-    if (pair && key === "value") return [key, REDACTED];
-    return [key, redactCredentialValues(entry, depth + 1)];
+    if (pair && key === "value" && entry !== null && entry !== undefined && typeof entry !== "boolean" && typeof entry !== "number") return [key, REDACTED];
+    return [key, blankPairValues(entry, depth + 1)];
   }));
+}
+
+/**
+ * Data-side pass over everything written to core_data/ and everything a finding reads. The whole subtree under a
+ * credential-shaped key becomes [REDACTED] whether it is a string, a list (`tokens: [...]`), or an object
+ * (`credentials: { value }`); header pairs lose their value; a url/endpoint key keeps scheme and host of an absolute
+ * URL and is blanked when it holds a host-relative path (which may carry a token), except for the inspector's own
+ * request labels ("GET /api/v2/..."), which name a read and carry no credential; and every other string, free text
+ * included (`comment`, `description`, `name`, `title`), gets the shared scrubber's pattern pass: query tokens
+ * anywhere in the text, bearer and assignment carriers, LaunchDarkly key shapes, real token shapes, and the
+ * configured secrets. Booleans, numbers, and nulls pass through.
+ */
+export function redactCredentialValues(value: unknown): unknown {
+  return credentialScrubber.scrubData(blankPairValues(value), {
+    isCredentialKey,
+    transformString: (text, key) => {
+      if (key !== undefined && isUrlKey(key) && !ABSOLUTE_URL_PATTERN.test(text) && !REQUEST_LABEL_PATTERN.test(text)) return REDACTED;
+      return reduceUrl(text);
+    },
+  });
+}
+
+/**
+ * The client's collection boundary: every record a listing or single-resource read returns passes through the
+ * data-side scrub once, so an assess payload's snapshots, the findings' evidence, and the bundle all read the same
+ * scrubbed record; the export's second pass over snapshots is defense in depth against a fake or future client.
+ */
+function scrubCollectedRecord(record: JsonRecord): JsonRecord {
+  return asObject(redactCredentialValues(record)) ?? record;
 }
 
 /** Keeps only the flag fields the hygiene verdicts read; variation values and rule clauses are user data and are dropped. */
@@ -1256,6 +1344,34 @@ function extractItems(payload: JsonRecord): JsonRecord[] {
   return asRecordArray(payload.items);
 }
 
+/**
+ * The documented shape of a successful body. Every list endpoint the inspector reads answers with an object carrying an
+ * `items` array (empty when the inventory is empty); a single resource answers with an object carrying at least one of
+ * its documented keys. A 2xx whose body is empty, is not JSON, or has another shape (a portal or proxy page, a status
+ * document, a different API behind the same host) is a failed read of that request, not an empty inventory.
+ */
+type LaunchdarklyResponseShape =
+  | { kind: "list" }
+  | { kind: "object"; documentedKeys: readonly string[] };
+
+const LIST_SHAPE: LaunchdarklyResponseShape = { kind: "list" };
+// GET /api/v2/caller-identity as documented; a body carrying none of these is some other service's JSON.
+const CALLER_IDENTITY_SHAPE: LaunchdarklyResponseShape = { kind: "object", documentedKeys: ["accountId", "memberId", "tokenId", "tokenName", "serviceToken", "clientId", "environmentId", "projectId"] };
+// GET /api/v2/members/{id} as documented.
+const MEMBER_SHAPE: LaunchdarklyResponseShape = { kind: "object", documentedKeys: ["_id", "email", "role", "customRoles", "mfa", "_lastSeen", "teams"] };
+
+function matchesResponseShape(payload: unknown, shape: LaunchdarklyResponseShape): payload is JsonRecord {
+  const record = asObject(payload);
+  if (!record) return false;
+  if (shape.kind === "list") return Array.isArray(record.items);
+  return shape.documentedKeys.some((key) => key in record);
+}
+
+/** Fixed text naming the documented shape; nothing from the body enters it. */
+function describeResponseShape(shape: LaunchdarklyResponseShape): string {
+  return shape.kind === "list" ? "list object with an items array" : `resource object with any of ${shape.documentedKeys.join(", ")}`;
+}
+
 // Only LaunchDarkly's documented JSON error fields (code, message) are quoted; anything else is described, never echoed,
 // so no reflected header or token from a proxy or WAF page can reach the bundle. The message is redacted before it is
 // cut to length: cutting first could leave the tail of a token that the whole-value scrub no longer recognizes.
@@ -1360,6 +1476,11 @@ export class LaunchdarklyApiClient {
   private readonly sleep: SleepImpl;
   private readonly maxRetries: number;
   private pauseUntil = 0;
+  /**
+   * The caller's own token id as the last /caller-identity read returned it. The bearer-id rule writes `tokenId` as the
+   * marker in every record the client hands out, so the raw id lives only here, for matching the token listing's `_id`.
+   */
+  private callerTokenId: string | undefined;
 
   constructor(
     config: LaunchdarklyResolvedConfig,
@@ -1381,10 +1502,24 @@ export class LaunchdarklyApiClient {
     return this.config;
   }
 
+  /**
+   * Builds every request URL the client sends. A server-supplied link (an absolute URL, a protocol-relative `//host`
+   * path, or a scheme change) is resolved against the configured base and refused with fixed text naming the origin it
+   * resolved to and the configured one unless the two are equal, so the token never travels to a host the server chose;
+   * a link whose authority carries user:password@ is refused too, since the configured base never has one and such
+   * credentials would otherwise ride along into the request and its label.
+   */
   private buildUrl(pathOrUrl: string, query: JsonRecord = {}): string {
-    const url = pathOrUrl.startsWith("http://") || pathOrUrl.startsWith("https://")
+    const base = new URL(`${this.config.baseUrl}/`);
+    // Any scheme prefix (in any case, with / or \ after the colon) is an absolute link judged by its own origin; everything
+    // else is a path on the base, where the WHATWG parser also turns leading // /// /\ and \\ into an authority.
+    const url = ABSOLUTE_LINK_PATTERN.test(pathOrUrl)
       ? new URL(pathOrUrl)
-      : new URL(pathOrUrl.startsWith("/") ? pathOrUrl : `/${pathOrUrl}`, `${this.config.baseUrl}/`);
+      : new URL(pathOrUrl.startsWith("/") ? pathOrUrl : `/${pathOrUrl}`, base);
+    // The scheme and host are compared directly rather than through `origin`: a `blob:` link that wraps the configured
+    // origin reports that origin as its own, yet it is not a request to the configured base.
+    if (url.protocol !== base.protocol || url.host !== base.host) throw new LaunchdarklyForeignOriginError("foreign-origin", base.origin, refusedLinkOrigin(url));
+    if (url.username !== "" || url.password !== "") throw new LaunchdarklyForeignOriginError("userinfo", base.origin, base.origin);
     for (const [key, value] of Object.entries(query)) {
       if (value === undefined || value === null || value === "") continue;
       url.searchParams.set(key, String(value));
@@ -1423,9 +1558,10 @@ export class LaunchdarklyApiClient {
     return Math.min(500 * 2 ** attempt, MAX_RATE_LIMIT_WAIT_MS);
   }
 
-  private async fetchJson(url: string, options: { apiVersion?: string } = {}): Promise<JsonRecord> {
+  private async fetchJson(url: string, options: { apiVersion?: string; shape?: LaunchdarklyResponseShape } = {}): Promise<JsonRecord> {
     // Every error names the request as it was actually issued (path plus non-pagination query), never a template.
     const endpoint = requestLabel(url);
+    const shape = options.shape ?? LIST_SHAPE;
     for (let attempt = 0; ; attempt += 1) {
       const pause = this.pauseUntil - Date.now();
       if (pause > 0) await this.sleep(Math.min(pause, MAX_RATE_LIMIT_WAIT_MS));
@@ -1479,10 +1615,27 @@ export class LaunchdarklyApiClient {
           endpoint,
         );
       }
+      // A success status is not a success by itself. An empty body, a portal or proxy page, or JSON of some other shape
+      // is not an empty inventory; each is recorded as a failed read of this request with the status the server sent,
+      // so the dependents go manual instead of passing or failing on data that was never observed. The body is never
+      // echoed: the parser's message would quote it.
+      if (rawText.trim().length === 0) {
+        throw new LaunchdarklyApiError(
+          this.redact(`LaunchDarkly response for ${endpoint} returned ${statusLine(response)} with an empty body (0 bytes); the endpoint is not serving the JSON API.`),
+          response.status,
+          endpoint,
+        );
+      }
       if (!payload) {
-        // The body is not echoed: the parser's message would quote it, and a 200 with a non-JSON body is typically a portal page.
         throw new LaunchdarklyApiError(
           this.redact(`LaunchDarkly response for ${endpoint} was not valid JSON (${describeOpaqueBody(response, rawText)}).`),
+          response.status,
+          endpoint,
+        );
+      }
+      if (!matchesResponseShape(payload, shape)) {
+        throw new LaunchdarklyApiError(
+          this.redact(`LaunchDarkly response for ${endpoint} returned ${statusLine(response)} with a JSON body that is not the documented ${describeResponseShape(shape)} (${Buffer.byteLength(rawText, "utf8")} bytes, not echoed); the endpoint is not serving the JSON API.`),
           response.status,
           endpoint,
         );
@@ -1491,8 +1644,14 @@ export class LaunchdarklyApiClient {
     }
   }
 
-  async get(path: string, query: JsonRecord = {}, options: { apiVersion?: string } = {}): Promise<JsonRecord> {
-    return this.fetchJson(this.buildUrl(path, query), options);
+  /** Reads one resource; the body must carry at least one of the documented keys, or the read fails with the observed status. */
+  async get(path: string, query: JsonRecord = {}, options: { apiVersion?: string; shape?: LaunchdarklyResponseShape } = {}): Promise<JsonRecord> {
+    return scrubCollectedRecord(await this.fetchRecord(path, query, options));
+  }
+
+  /** The unscrubbed record behind get(); callers scrub before handing it out. */
+  private async fetchRecord(path: string, query: JsonRecord, options: { apiVersion?: string; shape?: LaunchdarklyResponseShape }): Promise<JsonRecord> {
+    return this.fetchJson(this.buildUrl(path, query), { ...options, shape: options.shape ?? { kind: "object", documentedKeys: ["_id", "_links", "key", "name", "items"] } });
   }
 
   async list(
@@ -1506,7 +1665,11 @@ export class LaunchdarklyApiClient {
     let offset = 0;
     let total: number | undefined;
     let remaining = false;
-    let nextUrl: string | undefined = this.buildUrl(path, { ...query, limit: Math.min(pageSize, limit), offset });
+    let truncationReason: string | undefined;
+    // The page size each request asks for: the first request's own, then the limit a followed next link carries
+    // (undefined when the link names none), then the size this client sets when it pages by offset.
+    let requestedPageSize: number | undefined = Math.min(pageSize, limit);
+    let nextUrl: string | undefined = this.buildUrl(path, { ...query, limit: requestedPageSize, offset });
     const endpoint = requestLabel(nextUrl);
     const visited = new Set<string>([nextUrl]);
 
@@ -1533,10 +1696,25 @@ export class LaunchdarklyApiClient {
       offset += pageItems.length;
 
       if (nextHref) {
-        nextUrl = this.buildUrl(nextHref);
+        try {
+          nextUrl = this.buildUrl(nextHref);
+          requestedPageSize = requestedLimit(nextUrl);
+        } catch (error) {
+          if (!(error instanceof LaunchdarklyForeignOriginError)) throw error;
+          // The link is refused before any request is built: the pages already read stay, the rest is reported unseen.
+          remaining = true;
+          truncationReason = error.message;
+          break;
+        }
       } else if (total !== undefined && offset < total && pageItems.length >= Math.min(pageSize, limit)) {
-        nextUrl = this.buildUrl(path, { ...query, limit: Math.min(pageSize, limit - items.length), offset });
+        requestedPageSize = Math.min(pageSize, limit - items.length);
+        nextUrl = this.buildUrl(path, { ...query, limit: requestedPageSize, offset });
       } else {
+        // A last page shorter than the size requested for it is the end of the listing, even when it lands on the cap.
+        // A page as long as requested at the cap with neither a total nor a next link is indistinguishable from a
+        // server that omitted both, as is a page whose request named no size, so that remainder is reported unseen
+        // rather than absent.
+        remaining = total === undefined && items.length >= limit && (requestedPageSize === undefined || pageItems.length >= requestedPageSize);
         nextUrl = undefined;
       }
       if (nextUrl && visited.has(nextUrl)) {
@@ -1548,11 +1726,13 @@ export class LaunchdarklyApiClient {
     }
 
     return {
-      items,
-      truncated: total !== undefined ? total > items.length : remaining,
+      items: items.map(scrubCollectedRecord),
+      // A refused next link leaves the remainder unread even when the server total matches the items seen so far.
+      truncated: truncationReason !== undefined || (total !== undefined ? total > items.length : remaining),
       seen: items.length,
       total,
       endpoint,
+      ...(truncationReason !== undefined ? { truncationReason } : {}),
     };
   }
 
@@ -1563,11 +1743,23 @@ export class LaunchdarklyApiClient {
     options: { apiVersion?: string } = {},
   ): Promise<LaunchdarklyCollection> {
     const url = this.buildUrl(path, query);
-    return singlePageCollection(await this.fetchJson(url, options), requestLabel(url), mapItem);
+    return singlePageCollection(await this.fetchJson(url, options), requestLabel(url), (item) => scrubCollectedRecord(mapItem(item)));
   }
 
+  /**
+   * The caller identity with `tokenId` written as the marker (bearer-id rule). The raw id is kept on the client for
+   * isCallerToken() only; a read that fails leaves no id behind, so a stale match cannot outlive it.
+   */
   async getCallerIdentity(): Promise<JsonRecord> {
-    return this.get("/api/v2/caller-identity");
+    this.callerTokenId = undefined;
+    const payload = await this.fetchRecord("/api/v2/caller-identity", {}, { shape: CALLER_IDENTITY_SHAPE });
+    this.callerTokenId = asString(payload.tokenId);
+    return scrubCollectedRecord(payload);
+  }
+
+  /** True when the token listing record is the caller's own token, matched on the id the last caller identity read returned. */
+  isCallerToken(token: JsonRecord): boolean {
+    return this.callerTokenId !== undefined && asString(token._id) === this.callerTokenId;
   }
 
   async listMembers(limit = DEFAULT_MEMBER_LIMIT): Promise<LaunchdarklyCollection> {
@@ -1575,7 +1767,7 @@ export class LaunchdarklyApiClient {
   }
 
   async getMember(memberId: string): Promise<JsonRecord> {
-    return this.get(`/api/v2/members/${encodeURIComponent(memberId)}`);
+    return this.get(`/api/v2/members/${encodeURIComponent(memberId)}`, {}, { shape: MEMBER_SHAPE });
   }
 
   async listTeams(limit = DEFAULT_TEAM_LIMIT): Promise<LaunchdarklyCollection> {
@@ -1661,7 +1853,7 @@ type IdentityClient = Pick<
 type AccessControlClient = Pick<
   LaunchdarklyApiClient,
   "getResolvedConfig" | "getCallerIdentity" | "listCustomRoles" | "listTokens" | "listMembers"
->;
+> & Partial<Pick<LaunchdarklyApiClient, "isCallerToken">>;
 
 type EnvironmentGovernanceClient = Pick<
   LaunchdarklyApiClient,
@@ -1758,14 +1950,16 @@ function toCollection(value: unknown): LaunchdarklyCollection {
   const error = asString(record?.error);
   const endpoint = asString(record?.endpoint);
   const httpStatus = record?.httpStatus === null ? null : asNumber(record?.httpStatus);
+  const truncationReason = asString(record?.truncationReason);
   return {
     items,
-    truncated: asBoolean(record?.truncated) === true || (total !== undefined && total > items.length),
+    truncated: asBoolean(record?.truncated) === true || truncationReason !== undefined || (total !== undefined && total > items.length),
     seen: items.length,
     total,
     ...(error ? { error } : {}),
     ...(endpoint ? { endpoint } : {}),
     ...(error && httpStatus !== undefined ? { httpStatus } : {}),
+    ...(truncationReason ? { truncationReason } : {}),
   };
 }
 
@@ -1984,9 +2178,17 @@ function observedCount(sources: LaunchdarklyCollection[], count: number): number
   return count > 0 || sources.every(isComplete) ? count : null;
 }
 
-/** "N" for a listing that was read, "unread" for one that was not, so a sentence never states a zero from a denied read. */
-function countOrUnread(collection: LaunchdarklyCollection, count: number = collection.items.length): string {
-  return isRead(collection) ? String(count) : "unread";
+/**
+ * The built-in Admin or Owner clause LD-07 states beside its team verdict: the count from a complete members listing,
+ * and otherwise why the holders are unknown, so a truncated or denied read is never written as "0 members".
+ */
+function builtInRoleClause(memberCollection: LaunchdarklyCollection, count: number): string {
+  if (!isRead(memberCollection)) return "the members listing could not be read, so holders of built-in Admin or Owner base roles are unknown";
+  if (memberCollection.truncated) {
+    const observed = count > 0 ? ` (${count} observed among the collected members)` : "";
+    return `the members listing was truncated after ${memberCollection.items.length} of ${memberCollection.total ?? "an unknown total"}, so holders of built-in Admin or Owner base roles are unknown${observed}`;
+  }
+  return `${count} members still hold built-in Admin or Owner base roles`;
 }
 
 /**
@@ -2035,13 +2237,15 @@ function truncationNote(
     seen: result.seen,
     total: result.total ?? null,
     ...(scope ? { scope } : {}),
+    ...(result.truncationReason ? { reason: result.truncationReason } : {}),
   }];
 }
 
 function truncationCaveat(notes: LaunchdarklyTruncationNote[]): string {
   const parts = notes.map((note) =>
-    `${note.collection}${note.scope ? ` for ${note.scope}` : ""} (${note.seen} of ${note.total ?? "an unknown total"} collected)`);
-  const options = uniqueStrings(notes.map((note) => note.option).filter((option): option is string => Boolean(option)));
+    `${note.collection}${note.scope ? ` for ${note.scope}` : ""} (${note.seen} of ${note.total ?? "an unknown total"} collected${note.reason ? `; ${note.reason}` : ""})`);
+  // A listing that stopped for a reason other than its cap is not fixed by raising the cap, so its option is not offered.
+  const options = uniqueStrings(notes.filter((note) => !note.reason).map((note) => note.option).filter((option): option is string => Boolean(option)));
   const remedy = options.length > 0
     ? `raise ${options.join(" and ")} and rerun for a complete evaluation`
     : "review the uncollected items manually";
@@ -2127,6 +2331,7 @@ function collectionSnapshot(result: LaunchdarklyCollection, items: unknown[] = r
     collected: true,
     endpoint: result.endpoint ?? request,
     truncated: result.truncated,
+    ...(result.truncationReason ? { truncation_reason: result.truncationReason } : {}),
     seen: result.seen,
     total: result.total ?? null,
     items,
@@ -2252,10 +2457,12 @@ export async function assessLaunchdarklyIdentity(
   const memberFinding = truncationAwareFinding(memberNotes, presentGaps([membersGap]), "manual");
   const ssoFinding = truncationAwareFinding(memberNotes, presentGaps([membersGap, accountAuditGap]), "manual");
   const membershipFinding = truncationAwareFinding([...memberNotes, ...teamNotes], presentGaps([membersGap, teamsGap]), "manual");
+  // LD-07 reads the members listing for its built-in Admin or Owner clause, so a truncated members read demotes its
+  // pass and a denied one renders manual, the same as the team inventories it judges.
   const teamRoleFinding = truncationAwareFinding(
-    [...teamNotes, ...teamRoleNotes],
-    presentGaps([teamsGap, ...teamRoleGaps]),
-    teamsGap || (teamRoles.length > 0 && unreadableTeamRoles.length === teamRoles.length) ? "manual" : "warn",
+    [...memberNotes, ...teamNotes, ...teamRoleNotes],
+    presentGaps([membersGap, teamsGap, ...teamRoleGaps]),
+    membersGap || teamsGap || (teamRoles.length > 0 && unreadableTeamRoles.length === teamRoles.length) ? "manual" : "warn",
   );
   const membershipReadable = !membersGap && !teamsGap;
 
@@ -2320,10 +2527,11 @@ export async function assessLaunchdarklyIdentity(
             : "No recent account audit entries touched SAML, SCIM, or MFA settings.",
       ].filter((part): part is string => Boolean(part)).join(" "),
       {
-        active_members: whenRead(memberCollection, activeMembers.length),
-        scim_provisioned_members: whenRead(memberCollection, scimProvisioned.length),
-        members_with_password: whenRead(memberCollection, passwordMembers.length),
-        members_with_oauth_providers: whenRead(memberCollection, oauthMembers.length),
+        // Population counts: zero from a listing that stopped early is unknown, not an absence (truncated_collections says why).
+        active_members: observedCount([memberCollection], activeMembers.length),
+        scim_provisioned_members: observedCount([memberCollection], scimProvisioned.length),
+        members_with_password: observedCount([memberCollection], passwordMembers.length),
+        members_with_oauth_providers: observedCount([memberCollection], oauthMembers.length),
         recent_sso_audit_events: whenRead(accountAuditCollection, sample(ssoAuditEvents.map((entry) => ({
           date: isoDate(asTimestamp(entry.date)),
           actions: auditActions(entry),
@@ -2346,11 +2554,11 @@ export async function assessLaunchdarklyIdentity(
             ? `All ${activeMembers.length} active members report MFA enabled (${mfaEnforcedMembers.length} under account enforcement). Confirm the account level Require MFA for new members setting in Organization settings > Security.`
             : `${membersWithoutMfa.length}/${activeMembers.length} active members do not have MFA enabled.`,
       {
-        active_members: whenRead(memberCollection, activeMembers.length),
-        pending_invites: whenRead(memberCollection, pendingMembers.length),
+        active_members: observedCount([memberCollection], activeMembers.length),
+        pending_invites: observedCount([memberCollection], pendingMembers.length),
         // Members observed without MFA are real observations; an empty list is asserted only from a complete listing.
         members_without_mfa: observedList([memberCollection], sample(membersWithoutMfa.map(memberEmail))),
-        mfa_enforced_members: whenRead(memberCollection, mfaEnforcedMembers.length),
+        mfa_enforced_members: observedCount([memberCollection], mfaEnforcedMembers.length),
       },
     ),
     memberFinding(
@@ -2370,7 +2578,7 @@ export async function assessLaunchdarklyIdentity(
         admins: observedList([memberCollection], sample(admins.map(memberEmail))),
         max_owners: maxOwners,
         max_admins: maxAdmins,
-        total_members: whenRead(memberCollection, members.length),
+        total_members: observedCount([memberCollection], members.length),
       },
     ),
     membershipFinding(
@@ -2388,7 +2596,7 @@ export async function assessLaunchdarklyIdentity(
             ? `All ${activeMembers.length} active members belong to at least one of ${teams.length} teams.`
             : `${orphanedMembers.length}/${activeMembers.length} active members are not assigned to any team.`,
       {
-        teams: whenRead(teamCollection, teams.length),
+        teams: observedCount([teamCollection], teams.length),
         // A member is named as unassigned only when both the member and team inventories were read; the list is complete only from complete reads.
         orphaned_members: whenAllRead([memberCollection, teamCollection], observedList([memberCollection, teamCollection], sample(orphanedMembers.map(memberEmail)))),
       },
@@ -2409,15 +2617,17 @@ export async function assessLaunchdarklyIdentity(
           : teamRoles.length > 0 && unreadableTeamRoles.length === teamRoles.length
             ? `The role listing was unreadable for every one of the ${teamRoles.length} sampled teams, so team assigned custom roles could not be evaluated.`
             : teamsWithoutCustomRoles.length === 0
-              ? `All ${teamRoles.length - unreadableTeamRoles.length} sampled teams with readable roles have at least one custom role assigned; ${countOrUnread(memberCollection, admins.length + owners.length)} members still hold built-in Admin or Owner base roles.`
+              ? `All ${teamRoles.length - unreadableTeamRoles.length} sampled teams with readable roles have at least one custom role assigned; ${builtInRoleClause(memberCollection, admins.length + owners.length)}.`
               : `${teamsWithoutCustomRoles.length}/${teamRoles.length - unreadableTeamRoles.length} sampled teams with readable roles have no custom roles assigned, so their members rely on built-in base roles.`,
       {
         teams_sampled: whenRead(teamCollection, teamRoles.length),
         teams_with_unreadable_roles: whenRead(teamCollection, sample(unreadableTeamRoles.map((team) => team.key))),
         // A team is named as lacking custom roles only from its own readable role listing; "none lack" needs every listing complete.
         teams_without_custom_roles: whenRead(teamCollection, observedList([teamCollection, ...teamRoleCollections], sample(teamsWithoutCustomRoles.map((team) => team.key)))),
-        built_in_admin_or_owner_members: whenRead(memberCollection, admins.length + owners.length),
-        team_roles: whenRead(teamCollection, sample(teamRoles.map((team) => ({
+        // A count of built-in role holders is a total only from a complete members listing; a partial or denied read renders null.
+        built_in_admin_or_owner_members: whenAllComplete([memberCollection], admins.length + owners.length),
+        // The sampled teams and their roles are observations; an empty sample from a team listing that stopped early is unknown.
+        team_roles: observedList([teamCollection], sample(teamRoles.map((team) => ({
           team: team.key,
           roles: whenRead(team.collection, team.roles.map((role) => asString(role.key) ?? asString(role.name))),
         })))),
@@ -2437,7 +2647,7 @@ export async function assessLaunchdarklyIdentity(
             : `${offDomainMembers.length}/${activeMembers.length} active members use email domains outside the approved list (${allowedDomains.join(", ")}).`,
       {
         allowed_domains: allowedDomains,
-        domain_distribution: whenRead(memberCollection, sample(domainDistribution)),
+        domain_distribution: observedList([memberCollection], sample(domainDistribution)),
         off_domain_members: whenRead(memberCollection, allowedDomains.length === 0 ? [] : observedList([memberCollection], sample(offDomainMembers.map(memberEmail)))),
       },
     ),
@@ -2448,13 +2658,13 @@ export async function assessLaunchdarklyIdentity(
     category: "identity",
     summary: {
       base_url: config.baseUrl,
-      members: whenRead(memberCollection, members.length),
-      active_members: whenRead(memberCollection, activeMembers.length),
-      pending_invites: whenRead(memberCollection, pendingMembers.length),
+      members: observedCount([memberCollection], members.length),
+      active_members: observedCount([memberCollection], activeMembers.length),
+      pending_invites: observedCount([memberCollection], pendingMembers.length),
       members_without_mfa: observedCount([memberCollection], membersWithoutMfa.length),
       owners: observedCount([memberCollection], owners.length),
       admins: observedCount([memberCollection], admins.length),
-      teams: whenRead(teamCollection, teams.length),
+      teams: observedCount([teamCollection], teams.length),
       orphaned_members: whenAllRead([memberCollection, teamCollection], observedCount([memberCollection, teamCollection], orphanedMembers.length)),
       teams_without_custom_roles: whenRead(teamCollection, observedCount([teamCollection, ...teamRoleCollections], teamsWithoutCustomRoles.length)),
       allowed_domains: allowedDomains.length,
@@ -2593,13 +2803,26 @@ function failedReadNote(read: Pick<LaunchdarklyCollection, "error" | "endpoint">
   return `${read.endpoint ?? request}: ${read.error ?? "unknown error"}`;
 }
 
+/**
+ * Recognises the caller's own record in the token listing. The real client matches on the id the caller identity
+ * returned before the data-side scrub wrote it as the marker; a client without that hook is matched on the identity it
+ * returned, and never on the marker itself.
+ */
+function callerTokenMatcher(client: Pick<AccessControlClient, "isCallerToken">, caller: LaunchdarklyCallerIdentity): (token: JsonRecord) => boolean {
+  const hook = client.isCallerToken;
+  if (typeof hook === "function") return (token) => hook.call(client, token);
+  const tokenId = caller.tokenId !== undefined && caller.tokenId !== REDACTED ? caller.tokenId : undefined;
+  return (token) => tokenId !== undefined && asString(token._id) === tokenId;
+}
+
 function resolveTokenInventory(
   tokens: JsonRecord[],
   members: JsonRecord[],
   caller: LaunchdarklyCallerIdentity,
   readability: TokenInventoryReadability,
+  isCallerToken: (token: JsonRecord) => boolean,
 ): TokenInventory {
-  const callerToken = caller.tokenId ? tokens.find((token) => asString(token._id) === caller.tokenId) : undefined;
+  const callerToken = tokens.find((token) => isCallerToken(token));
   const callerTokenRole = callerToken ? tokenRole(callerToken) : undefined;
   const callerMemberId = caller.memberId ?? (callerToken ? asString(callerToken.memberId) : undefined);
   const callerMemberRole = knownMemberBaseRole(callerMemberId ? members.find((member) => asString(member._id) === callerMemberId) : undefined);
@@ -2662,7 +2885,8 @@ function withTruncatedTokens(inventory: TokenInventory, tokens: LaunchdarklyColl
     ...inventory,
     scope: "partial",
     reason: `The token listing was truncated at ${tokens.seen} of ${tokens.total ?? "an unknown total"} tokens, so the uncollected tokens were not evaluated.`,
-    remedy: "Raise token_limit and rerun for a complete inventory.",
+    // A listing that stopped for a reason other than its cap (a refused next link, for one) is not completed by raising the cap.
+    remedy: tokens.truncationReason ? `${tokens.truncationReason}; review the uncollected tokens in Authorization > Access tokens.` : "Raise token_limit and rerun for a complete inventory.",
   };
 }
 
@@ -2729,7 +2953,13 @@ export async function assessLaunchdarklyAccessControl(
   );
   const roleFinding = truncationAwareFinding(roleNotes, presentGaps([rolesGap]), "manual");
   const inventory = withTruncatedTokens(
-    resolveTokenInventory(tokens, members, callerIdentity, { tokens: tokenCollection, caller: callerRead, members: memberCollection }),
+    resolveTokenInventory(
+      tokens,
+      members,
+      callerIdentity,
+      { tokens: tokenCollection, caller: callerRead, members: memberCollection },
+      callerTokenMatcher(client, callerIdentity),
+    ),
     tokenCollection,
   );
   const inventoryEvidence: JsonRecord = {
@@ -2848,7 +3078,7 @@ export async function assessLaunchdarklyAccessControl(
             ? `All ${roles.length} custom roles enumerate explicit actions without wildcard or notActions grants.`
             : `${wildcardRoles.length}/${roles.length} custom roles contain allow statements with wildcard actions or open ended notActions grants.`,
       {
-        custom_roles: whenRead(roleCollection, roles.length),
+        custom_roles: observedCount([roleCollection], roles.length),
         wildcard_roles: observedList([roleCollection], sample(wildcardRoles.map((role) => ({
           role: role.key,
           statements: role.wildcardStatements.map((statement) => ({ actions: statement.actions, notActions: statement.notActions, resources: statement.resources })),
@@ -2872,7 +3102,7 @@ export async function assessLaunchdarklyAccessControl(
               ? `No custom role grants sensitive administration actions, but ${readerBaseRoles.length}/${roles.length} roles use reader base permissions instead of no_access.`
               : `All ${roles.length} custom roles start from no_access base permissions and do not allow sensitive administration actions.`,
       {
-        custom_roles: whenRead(roleCollection, roles.length),
+        custom_roles: observedCount([roleCollection], roles.length),
         sensitive_roles: observedList([roleCollection], sample(sensitiveRoles.map((role) => ({ role: role.key, granted: sample(role.sensitiveGrants) })))),
         reader_base_permission_roles: observedList([roleCollection], sample(readerBaseRoles.map((role) => role.key))),
       },
@@ -2886,8 +3116,12 @@ export async function assessLaunchdarklyAccessControl(
           ? `All ${tokens.length} visible access tokens have an expiry configured.`
           : `${tokensWithoutExpiry.length}/${tokens.length} visible access tokens have no expiry configured.`,
       {
-        tokens: whenRead(tokenCollection, tokens.length),
-        tokens_without_expiry: observedList([tokenCollection], sample(tokensWithoutExpiry.map(tokenLabel))),
+        tokens: observedCount([tokenCollection], tokens.length),
+        // Token names are item-level detail: rendered in full from a complete listing, withheld while the listing stopped
+        // early so a truncated page never names its part of the inventory as the whole; the count beside them is the
+        // lower bound observed (zero only from a complete listing).
+        tokens_without_expiry: whenAllComplete([tokenCollection], sample(tokensWithoutExpiry.map(tokenLabel))),
+        tokens_without_expiry_count: observedCount([tokenCollection], tokensWithoutExpiry.length),
       },
     ),
     tokenFinding(
@@ -2921,7 +3155,7 @@ export async function assessLaunchdarklyAccessControl(
           ? `Of ${serviceTokens.length} visible service tokens, ${serviceTokenIssues.join("; ")}.`
           : `All ${serviceTokens.length} visible service tokens use Reader, custom role, or scoped inline policy permissions.`,
       {
-        service_tokens: whenRead(tokenCollection, serviceTokens.length),
+        service_tokens: observedCount([tokenCollection], serviceTokens.length),
         owner_or_admin_service_tokens: observedList([tokenCollection], sample(overScopedOtherServiceTokens.map(tokenLabel))),
         assessment_service_token: whenRead(tokenCollection, assessmentServiceToken
           ? { token: tokenLabel(assessmentServiceToken), role: tokenRole(assessmentServiceToken), over_scoped: assessmentTokenOverScoped }
@@ -2949,7 +3183,7 @@ export async function assessLaunchdarklyAccessControl(
                 ? "No personal tokens are visible."
                 : `All ${personalTokens.length} visible personal tokens are tied to current members and stay within each member's base role scope.`,
       {
-        personal_tokens: whenRead(tokenCollection, personalTokens.length),
+        personal_tokens: observedCount([tokenCollection], personalTokens.length),
         orphaned_personal_tokens: membersReconciled ? observedList([tokenCollection], sample(orphanedPersonalTokens.map(tokenLabel))) : null,
         unverified_personal_tokens: tokensRead && membersRead ? sample(unverifiedPersonalTokens.map(tokenLabel)) : null,
         over_scoped_personal_tokens: whenRead(memberCollection, observedList([tokenCollection, memberCollection], sample(overScopedPersonalTokens))),
@@ -2965,13 +3199,13 @@ export async function assessLaunchdarklyAccessControl(
     category: "access_control",
     summary: {
       base_url: config.baseUrl,
-      custom_roles: whenRead(roleCollection, roles.length),
+      custom_roles: observedCount([roleCollection], roles.length),
       wildcard_roles: observedCount([roleCollection], wildcardRoles.length),
       sensitive_roles: observedCount([roleCollection], sensitiveRoles.length),
-      tokens: whenRead(tokenCollection, tokens.length),
+      tokens: observedCount([tokenCollection], tokens.length),
       token_inventory_scope: inventory.scope,
-      service_tokens: whenRead(tokenCollection, serviceTokens.length),
-      personal_tokens: whenRead(tokenCollection, personalTokens.length),
+      service_tokens: observedCount([tokenCollection], serviceTokens.length),
+      personal_tokens: observedCount([tokenCollection], personalTokens.length),
       tokens_without_expiry: observedCount([tokenCollection], tokensWithoutExpiry.length),
       stale_tokens: observedCount([tokenCollection], staleTokens.length),
       orphaned_personal_tokens: membersReconciled ? observedCount([tokenCollection], orphanedPersonalTokens.length) : null,
@@ -3018,12 +3252,15 @@ function environmentsRequest(projectKey: string): string {
 async function collectEnvironmentContexts(
   client: Pick<LaunchdarklyApiClient, "listProjects" | "listEnvironments">,
   errors: string[],
-  options: { projectLimit: number; environmentLimit: number; projectKeys: string[]; productionPattern: RegExp },
+  options: { projectLimit: number; environmentLimit: number; projectKeys: string[]; productionPattern: RegExp; projectLimitOption?: string },
 ): Promise<EnvironmentInventory> {
-  const projects = await collectList(
-    errors,
-    "projects",
-    () => client.listProjects(options.projectLimit, options.projectKeys),
+  const projects = withKeyFilterReason(
+    await collectList(
+      errors,
+      "projects",
+      () => client.listProjects(options.projectLimit, options.projectKeys),
+    ),
+    options.projectKeys,
   );
   const environments: EnvironmentContext[] = [];
   const environmentCollections: EnvironmentInventory["environmentCollections"] = [];
@@ -3053,7 +3290,7 @@ async function collectEnvironmentContexts(
     }
   }
   const notes = [
-    ...truncationNote("projects", "project_limit", projects),
+    ...truncationNote("projects", options.projectLimitOption, projects),
     ...environmentCollections.flatMap((entry) =>
       truncationNote("environments", "environment_limit", entry.collection, `project ${entry.projectKey}`)),
   ];
@@ -3076,6 +3313,19 @@ async function collectEnvironmentContexts(
     )),
   ]);
   return { projects, projectsRequest: request, environments, environmentCollections, notes, gaps, unreadableProjects };
+}
+
+/**
+ * A key-filtered project listing whose server total exceeds the keys asked for was not narrowed by the filter, so its
+ * truncation is not a cap exit: the reason says so and no limit option is offered for it.
+ */
+function withKeyFilterReason(projects: LaunchdarklyCollection, projectKeys: string[]): LaunchdarklyCollection {
+  if (!projects.truncated || projects.truncationReason !== undefined || projectKeys.length === 0) return projects;
+  if (projects.total === undefined || projects.total <= projectKeys.length) return projects;
+  return {
+    ...projects,
+    truncationReason: `the server reported ${projects.total} projects for the ${projectKeys.length} referenced key${projectKeys.length === 1 ? "" : "s"}, so the key filter may not have applied and only the collected projects were evaluated`,
+  };
 }
 
 /**
@@ -3317,6 +3567,7 @@ export async function assessLaunchdarklyEnvironmentGovernance(
     environmentLimit: clampNumber(options.environmentLimit, DEFAULT_ENVIRONMENT_LIMIT, 1, 500),
     projectKeys: options.projectKeys && options.projectKeys.length > 0 ? options.projectKeys : config.projectKeys,
     productionPattern,
+    projectLimitOption: "project_limit",
   });
   const projects = inventory.projects.items;
   const environments = inventory.environments;
@@ -3454,8 +3705,9 @@ export async function assessLaunchdarklyEnvironmentGovernance(
               ? `${criticalOnlyProduction.length}/${productionEnvironments.length} production environments are marked critical, which only enables safeguards and UI prompts; no custom role denies, excludes, or scopes actions away from them (for example a deny on proj/*:env/*;{critical:true}:flag/*).`
               : `All ${productionEnvironments.length} production environments are restricted by custom role statements that deny, exclude, or scope actions away from them (${roles.length} custom roles evaluated).`,
       {
-        // The production set is known only when the project listing and every project's environment listing were read.
-        production_environments: whenAllRead(environmentCollections, sample(productionEnvironments.map(environmentLabel))),
+        // The production set is known only when the project listing and every project's environment listing were read,
+        // and an empty set is asserted only when every one of them ran to completion.
+        production_environments: whenAllRead(environmentCollections, observedList(environmentCollections, sample(productionEnvironments.map(environmentLabel)))),
         // A restriction is a role statement observed to cover the environment; "none is restricted" needs every listing complete.
         restricted_production_environments: whenRead(roleCollection, observedList([roleCollection, ...environmentCollections], sample(restrictedProduction.map((entry) => ({
           environment: environmentLabel(entry.context),
@@ -3486,7 +3738,7 @@ export async function assessLaunchdarklyEnvironmentGovernance(
           weaknesses: entry.approvals.weaknesses,
           settings: entry.approvals.settings,
         })))),
-        production_environment_settings: whenAllRead(environmentCollections, sample(productionSummary)),
+        production_environment_settings: whenAllRead(environmentCollections, observedList(environmentCollections, sample(productionSummary))),
       },
     ),
     sdkKeyFinding(
@@ -3528,7 +3780,7 @@ export async function assessLaunchdarklyEnvironmentGovernance(
             ? `None of the ${projects.length} projects look like test or temporary projects.`
             : `${testProjects.length}/${projects.length} projects look like test or temporary projects; confirm they are intentional and not exposed to production SDK traffic.`,
       {
-        projects: whenRead(inventory.projects, projects.length),
+        projects: observedCount([inventory.projects], projects.length),
         test_like_projects: observedList([inventory.projects], sample(testProjects.map((project) => asString(project.key) ?? asString(project.name) ?? "project"))),
       },
     ),
@@ -3545,7 +3797,7 @@ export async function assessLaunchdarklyEnvironmentGovernance(
             ? `Secure mode is enabled everywhere, but ${ttlZero.length} production environments use a zero default TTL and ${changeSafeguardsMissing.length} lack confirm changes or require comments.`
             : `All ${productionEnvironments.length} production environments enable secure mode, a non-zero default TTL, confirm changes, and required comments.`,
       {
-        production_environment_settings: whenAllRead(environmentCollections, sample(productionSummary)),
+        production_environment_settings: whenAllRead(environmentCollections, observedList(environmentCollections, sample(productionSummary))),
         secure_mode_missing: observedList(environmentCollections, sample(secureModeMissing.map(environmentLabel))),
         zero_ttl: observedList(environmentCollections, sample(ttlZero.map(environmentLabel))),
         change_safeguards_missing: observedList(environmentCollections, sample(changeSafeguardsMissing.map(environmentLabel))),
@@ -3559,9 +3811,9 @@ export async function assessLaunchdarklyEnvironmentGovernance(
     category: "environment_governance",
     summary: {
       base_url: config.baseUrl,
-      projects: whenRead(inventory.projects, projects.length),
-      environments: whenAllRead(environmentCollections, environments.length),
-      production_environments: whenAllRead(environmentCollections, productionEnvironments.length),
+      projects: observedCount([inventory.projects], projects.length),
+      environments: whenAllRead(environmentCollections, observedCount(environmentCollections, environments.length)),
+      production_environments: whenAllRead(environmentCollections, observedCount(environmentCollections, productionEnvironments.length)),
       restricted_production_environments: whenRead(roleCollection, observedCount([roleCollection, ...environmentCollections], restrictedProduction.length)),
       critical_only_production_environments: rolesComplete ? observedCount(environmentCollections, criticalOnlyProduction.length) : null,
       unrestricted_production_environments: rolesComplete ? observedCount(environmentCollections, unrestrictedProduction.length) : null,
@@ -3644,6 +3896,7 @@ export async function assessLaunchdarklyFlagHygiene(
     environmentLimit: DEFAULT_ENVIRONMENT_LIMIT,
     projectKeys: options.projectKeys && options.projectKeys.length > 0 ? options.projectKeys : config.projectKeys,
     productionPattern,
+    projectLimitOption: "project_limit",
   });
   const projects = inventory.projects.items;
   const environments = inventory.environments;
@@ -3776,7 +4029,7 @@ export async function assessLaunchdarklyFlagHygiene(
             ? `None of the ${evaluatedFlags} evaluated flags use individual context targets in production environments.`
             : `${individuallyTargetedFlags.length} flags expose individual user or context keys through production targeting.`,
       {
-        production_environments: whenAllRead(environmentCollections, sample(productionTargets.map(environmentLabel))),
+        production_environments: whenAllRead(environmentCollections, observedList(environmentCollections, sample(productionTargets.map(environmentLabel)))),
         // A targeted flag is a real observation; "no flag is targeted" needs every environment and flag listing complete.
         individually_targeted_flags: observedList([...environmentCollections, ...flagCollections], sample(individuallyTargetedFlags)),
       },
@@ -3824,7 +4077,7 @@ export async function assessLaunchdarklyFlagHygiene(
     category: "flag_hygiene",
     summary: {
       base_url: config.baseUrl,
-      projects: whenRead(inventory.projects, projects.length),
+      projects: observedCount([inventory.projects], projects.length),
       evaluated_environments: whenAllRead(environmentCollections, targetEnvironments.length),
       evaluated_flags: whenAllRead([...environmentCollections, ...flagCollections], evaluatedFlags),
       individually_targeted_flags: observedCount([...environmentCollections, ...flagCollections], individuallyTargetedFlags.length),
@@ -3977,6 +4230,7 @@ export async function assessLaunchdarklyMonitoringIntegrations(
   const referencedProjects = uniqueStrings(relayStatements.flatMap((item) => relayReferencedEnvironments(item.statements).map((reference) => reference.projectKey)));
   const relayInventory = referencedProjects.length > 0
     ? await collectEnvironmentContexts(client, errors, {
+      // Capped at the projects the Relay Proxy policies reference; the monitoring tool has no project_limit to raise.
       projectLimit: referencedProjects.length,
       environmentLimit: DEFAULT_ENVIRONMENT_LIMIT,
       projectKeys: referencedProjects,
@@ -4044,15 +4298,17 @@ export async function assessLaunchdarklyMonitoringIntegrations(
   const findings: LaunchdarklyFinding[] = [
     retentionFinding(
       12,
+      // An audit log that could not be read proves nothing about retention either way; fail is reserved for a readable
+      // log that returned nothing.
       !auditReadable
-        ? "fail"
+        ? "manual"
         : retentionProbeGap
           ? "manual"
           : retentionProbe.length > 0
             ? "pass"
             : recentAuditGap ? "manual" : recentAuditEntries.length === 0 ? "fail" : "warn",
       !auditReadable
-        ? `The audit log could not be read (${failedReadNote(recentAuditCollection, auditRequest())}), so retention cannot be demonstrated.`
+        ? `The audit log could not be read (${failedReadNote(recentAuditCollection, auditRequest())}), so retention cannot be judged from the API.`
         : retentionProbeGap
           ? `The retention probe for entries older than ${retentionDays} days could not be read, so retention cannot be demonstrated from the API.`
           : retentionProbe.length > 0
@@ -4072,12 +4328,12 @@ export async function assessLaunchdarklyMonitoringIntegrations(
     criticalActionFinding(
       13,
       !auditReadable
-        ? "fail"
+        ? "manual"
         : bothCriticalAuditGaps
           ? "manual"
           : criticalActionsSeen.length > 0 ? "pass" : "warn",
       !auditReadable
-        ? "The audit log could not be read, so critical action coverage cannot be demonstrated."
+        ? `The audit log could not be read (${failedReadNote(memberAuditCollection, auditRequest({ spec: "member/*" }))}), so critical action coverage cannot be judged from the API.`
         : bothCriticalAuditGaps
           ? "Neither the member nor the role audit log query could be read, so critical action coverage could not be evaluated."
           : criticalActionsSeen.length > 0
@@ -4327,7 +4583,10 @@ function buildExecutiveSummary(
   if (truncated.length > 0) {
     lines.push("", "## Truncated Listings", "");
     for (const note of truncated) {
-      lines.push(`- ${note.collection}${note.scope ? ` (${note.scope})` : ""}: ${note.seen} of ${note.total ?? "an unknown total"} collected${note.option ? `; raise ${note.option}` : ""}`);
+      // The same rule as the finding caveat: a listing that stopped for a reason other than its cap (a refused next
+      // link, for one) is written with that reason, and raising the cap is offered only for a stop the cap caused.
+      const remedy = note.reason ? `; ${note.reason}` : note.option ? `; raise ${note.option}` : "";
+      lines.push(`- ${note.collection}${note.scope ? ` (${note.scope})` : ""}: ${note.seen} of ${note.total ?? "an unknown total"} collected${remedy}`);
     }
   }
 
@@ -4352,12 +4611,14 @@ function collectTruncationNotes(findings: LaunchdarklyFinding[]): LaunchdarklyTr
       const key = `${collection}|${scope ?? ""}`;
       if (seen.has(key)) continue;
       seen.add(key);
+      const reason = asString(entry.reason);
       notes.push({
         collection,
         ...(asString(entry.option) ? { option: asString(entry.option) } : {}),
         seen: asNumber(entry.seen) ?? 0,
         total: asNumber(entry.total) ?? null,
         ...(scope ? { scope } : {}),
+        ...(reason ? { reason } : {}),
       });
     }
   }
@@ -4413,8 +4674,8 @@ function buildQuickReference(): string {
     "# LaunchDarkly Audit Bundle Quick Reference",
     "",
     "- `core_data/` contains LaunchDarkly REST API v2 snapshots: credential-shaped keys (SDK, mobile, relay, and API keys, webhook and integration secrets) are written as [REDACTED], destination URLs are reduced to scheme plus host, and flags are projected to the fields the verdicts read.",
-    "- A listing that was read carries `collected: true`, the request it made as `endpoint`, `truncated`, `seen`, `total`, and `items` (an empty inventory stays `items: []`). A listing that was denied, errored, or timed out is a marker object, never an empty array: `collected: false`, the HTTP `status` observed (or `error`), the `endpoint` that failed, the scrubbed `error`, and `null` for every flag and count. A listing that was never requested because its parent inventory was unreadable is a `status: \"not-collected\"` marker. Listings collected per team, environment, or integration are arrays with one entry per scope, collapsing to a single marker when no scope could be read.",
-    "- `core_data/collection_status.json` records, per listing (`inventories[]`), whether the read completed, the request and HTTP status of a failed read, how the read ended (complete or truncated at a cap), how many records were loaded, and the server total when the API exposes one; every flag and count is `null` for a read that did not complete, and `totals` counts those reads as unknown rather than as complete or untruncated.",
+    "- A listing that was read carries `collected: true`, the request it made as `endpoint`, `truncated`, `seen`, `total`, and `items` (an empty inventory stays `items: []`); `truncation_reason` is present only when paging stopped for a reason other than the cap, such as a server-supplied `_links.next.href` whose origin differed from the configured base URL or whose authority carried credentials (the client refuses such a link before any request is built, with fixed text naming the configured origin and, for a foreign link, the scheme, host, and port it resolved to; nothing else from the link enters the text). A listing that was denied, errored, or timed out is a marker object, never an empty array: `collected: false`, the HTTP `status` observed (or `error`), the `endpoint` that failed, the scrubbed `error`, and `null` for every flag and count. A listing that was never requested because its parent inventory was unreadable is a `status: \"not-collected\"` marker. Listings collected per team, environment, or integration are arrays with one entry per scope, collapsing to a single marker when no scope could be read.",
+    "- `core_data/collection_status.json` records, per listing (`inventories[]`), whether the read completed, the request and HTTP status of a failed read, how the read ended (complete or truncated at a cap), `truncation_reason` when a truncated read stopped for a reason other than its cap (otherwise `null`), how many records were loaded, and the server total when the API exposes one; every flag and count is `null` for a read that did not complete, and `totals` counts those reads as unknown rather than as complete or untruncated.",
     "- Error strings in every file are scrubbed before they are recorded (LaunchDarkly key shapes, authorization and cookie values, credential-shaped key/value pairs, JWTs, and URL userinfo and query strings anywhere in the text); non-JSON error bodies are described by status, content type, and length, never echoed.",
     "- Finding evidence, assessment summaries, and analysis snapshots render `null` (never 0, [], or \"none\") for any count, list, or flag derived from an inventory that was not read; lists of named members, tokens, roles, environments, or flags are populated only from inventories that were actually read, and an empty list is asserted only from complete reads.",
     "- Every HTTP status code and request label (method plus path and query) named in a finding, summary, access check surface, or error string is the request the run actually made and the response it observed.",
@@ -4446,6 +4707,8 @@ interface LaunchdarklyCollectionStatusRow {
   error: string | null;
   complete: boolean | null;
   truncated: boolean | null;
+  /** Why a truncated read stopped when the cause was not its cap (a refused next link); null for a complete, capped, or failed read. */
+  truncation_reason: string | null;
   seen: number | null;
   total: number | null;
 }
@@ -4464,6 +4727,7 @@ function collectionStatusRow(inventory: string, record: JsonRecord): Launchdarkl
     error: asString(record.error) ?? null,
     complete: collected ? asBoolean(record.truncated) !== true : null,
     truncated: collected ? asBoolean(record.truncated) === true : null,
+    truncation_reason: collected && asBoolean(record.truncated) === true ? asString(record.truncation_reason) ?? null : null,
     seen: collected ? asNumber(record.seen) ?? null : null,
     total: collected ? asNumber(record.total) ?? null : null,
   };

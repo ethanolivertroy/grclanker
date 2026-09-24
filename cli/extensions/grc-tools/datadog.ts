@@ -18,7 +18,7 @@ import { homedir } from "node:os";
 import { basename, dirname, join, relative, resolve } from "node:path";
 import { ZipArchive } from "archiver";
 import { Type } from "@sinclair/typebox";
-import { createCredentialScrubber } from "./credential-scrub.js";
+import { createCredentialScrubber, isBearerIdKey } from "./credential-scrub.js";
 import { errorResult, formatTable, textResult } from "./shared.js";
 
 type FetchImpl = typeof fetch;
@@ -65,7 +65,7 @@ const MAX_REDACTION_DEPTH = 64;
 
 const REDACTED = "[REDACTED]";
 const CREDENTIAL_LAST_SEGMENTS = new Set([
-  "token", "tokens", "secret", "secrets", "password", "passwd", "pwd", "passphrase", "apikey", "appkey", "authorization",
+  "token", "tokens", "secret", "secrets", "password", "passwd", "pwd", "passphrase", "apikey", "appkey", "appkeys", "applicationkey", "applicationkeys", "authorization",
   "credential", "credentials", "bearer",
 ]);
 const CREDENTIAL_KEY_QUALIFIERS = new Set(["api", "app", "application", "private", "secret", "signing", "access", "shared", "session", "master", "client", "auth"]);
@@ -424,6 +424,8 @@ export interface DatadogIdentityOptions {
   now?: Date;
   userLimit?: number;
   roleLimit?: number;
+  /** Cap on the application keys read for service account key rotation (DD-19); shared with the access control assessment's key_limit. */
+  keyLimit?: number;
   maxAdmins?: number;
   inactiveDays?: number;
   pendingInviteDays?: number;
@@ -475,6 +477,7 @@ type CheckAccessArgs = {
 type IdentityArgs = CheckAccessArgs & {
   user_limit?: number;
   role_limit?: number;
+  key_limit?: number;
   max_admins?: number;
   inactive_days?: number;
   pending_invite_days?: number;
@@ -617,11 +620,13 @@ function keySegments(name: string): string[] {
 }
 
 /**
- * True for token/secret/password style keys, for `key`/`keys` qualified by api, private, client, and so on, and for
+ * True for token/secret/password style keys, for `key`/`keys` qualified by api, private, client, and so on, for
  * the `<qualifier>_key_id` identifiers (access_key_id, private_key_id) that name a credential even when they are not
- * the secret half of it.
+ * the secret half of it, and for a bearer id (`secret_id`, `session_id`, `sid`) whose value authenticates by itself;
+ * every other `_id` (`org_id`, `account_id`, `key_id` unqualified) names a thing and keeps its value.
  */
 export function isCredentialKey(name: string): boolean {
+  if (isBearerIdKey(name)) return true;
   const segments = keySegments(name);
   const last = segments[segments.length - 1];
   if (!last) return false;
@@ -1550,6 +1555,7 @@ export class DatadogApiClient {
     let cursor: string | undefined;
     let truncated = false;
     let truncationReason: string | null = null;
+    let capReached = false;
     let emptyPages = 0;
     for (;;) {
       const payload = asObject(await this.get("/api/v2/posture_management/findings", {
@@ -1572,6 +1578,7 @@ export class DatadogApiClient {
       }
       if (items.length >= limit) {
         truncated = true;
+        capReached = true;
         truncationReason = `finding_limit (${limit}) was reached while a next-page cursor was still present`;
         break;
       }
@@ -1592,6 +1599,8 @@ export class DatadogApiClient {
       total_filtered_count: totalFilteredCount,
       truncated,
       truncation_reason: truncationReason,
+      // Only a cap-driven stop yields to a larger finding_limit; a repeated cursor or a run of empty pages does not.
+      cap_reached: capReached,
       seen: items.length,
     };
   }
@@ -2128,12 +2137,13 @@ export async function collectDatadogIdentityData(
   const errors: string[] = [];
   const userLimit = clampNumber(options.userLimit, DEFAULT_USER_LIMIT, 1, 20000);
   const roleLimit = clampNumber(options.roleLimit, DEFAULT_ROLE_LIMIT, 1, 1000);
+  const keyLimit = clampNumber(options.keyLimit, DEFAULT_KEY_LIMIT, 1, 10000);
 
   const [organization, users, roles, applicationKeys, orgConfigs] = await Promise.all([
     loadSurface("organization", () => client.getOrganization(), errors),
     loadInventory("users", userLimit, (probeLimit) => client.listUsers(probeLimit), errors),
     loadInventory("roles", roleLimit, (probeLimit) => client.listRoles(probeLimit), errors),
-    loadApplicationKeyInventory(client, DEFAULT_KEY_LIMIT, errors),
+    loadApplicationKeyInventory(client, keyLimit, errors),
     loadSurface("org_configs", () => client.listOrgConfigs(), errors),
   ]);
 
@@ -2344,7 +2354,7 @@ function evaluateMfaControl(snapshot: DatadogIdentitySnapshot, strictSaml: boole
   );
 }
 
-function evaluateRbacControl(snapshot: DatadogIdentitySnapshot, maxAdmins: number, totalUsers: number | undefined): DatadogFinding {
+function evaluateRbacControl(snapshot: DatadogIdentitySnapshot, maxAdmins: number): DatadogFinding {
   if (!snapshot.roles.value) {
     return manualFinding(3, "high", unreadableReason("roles (user_access_read)", snapshot.roles), [
       "Export Organization Settings > Roles with each custom role's permission list and the Datadog Admin Role membership count.",
@@ -2397,7 +2407,10 @@ function evaluateRbacControl(snapshot: DatadogIdentitySnapshot, maxAdmins: numbe
     ),
     violation_observed: violationFlag([snapshot.roles, permissionsComplete], overPrivileged.length),
     admin_role_user_count: adminCount ?? null,
-    total_users: totalUsers ?? null,
+    // The user population is a second inventory of this finding: its count renders only from a complete read, and its
+    // own truncation marker sits beside the count because the `inventory` object below covers the roles read alone.
+    total_users: whenComplete(snapshot.users, snapshot.users.value?.length ?? 0),
+    users_inventory_truncated: truncatedFlag(snapshot.users),
     max_admins: maxAdmins,
     custom_roles_without_permission_detail: unresolved.length,
     custom_roles_without_permission_detail_sample: sample(unresolvedDetail),
@@ -2673,7 +2686,7 @@ export function evaluateDatadogIdentity(
   const findings = [
     saml.finding,
     evaluateMfaControl(snapshot, saml.strictSaml),
-    evaluateRbacControl(snapshot, maxAdmins, totalUsers),
+    evaluateRbacControl(snapshot, maxAdmins),
     evaluateUserAccessControl(snapshot, now, inactiveDays, pendingInviteDays),
     evaluateSessionTimeoutControl(snapshot),
     evaluateServiceAccountControl(snapshot, now, keyRotationDays, serviceAccountPattern),
@@ -3275,10 +3288,19 @@ function evaluateDetectionRulesControl(snapshot: DatadogSecurityMonitoringSnapsh
     rules_inventory_truncated: truncatedFlag(surface),
     inventory: inventoryState("security_rules", surface),
   };
+  const caveats = [truncationCaveat("security_rules", surface, "rule_limit")];
+  // An empty inventory proves that no detection is active only when the listing was read completely. A listing that
+  // returned no rows before it stopped (an empty first page under a next-page cursor, a repeated cursor) leaves whether
+  // any rule exists unknown, so it is reported with the collection's own stop reason rather than as a fail (gap 40).
+  if (rules.length === 0 && !complete) {
+    return withVerdictCaveats(
+      finding(8, "high", "warn", `The security monitoring rules listing returned no rules before it stopped (${surface.truncationReason ?? "the listing stopped early"}), so whether any detection rule is enabled is unknown.`, evidence),
+      caveats,
+    );
+  }
   if (rules.length === 0) {
     return finding(8, "high", "fail", "The security monitoring rules endpoint returned no rules at all. An empty rule inventory is treated as fail because no detection is active; if Cloud SIEM is not licensed for this organization, record the control as not applicable with the plan evidence.", evidence);
   }
-  const caveats = [truncationCaveat("security_rules", surface, "rule_limit")];
   // An absence (no enabled rule, no rule for a category) is proven only by a complete list; from a truncated list it
   // is reported as warn because rules beyond the cap may hold what was not seen.
   if (enabledDetection.length === 0) {
@@ -3400,11 +3422,48 @@ function integrationCspmEnabled(snapshot: { awsIntegrations: SurfaceResult<JsonR
   return { enabled, total: aws.length + gcp.length + azure.length };
 }
 
-function postureCount(surface: SurfaceResult<JsonRecord>): { count: number; source: "total_filtered_count" | "paged_data"; truncated: boolean } | undefined {
+interface PostureCount {
+  count: number;
+  source: "total_filtered_count" | "paged_data";
+  truncated: boolean;
+  /** The same truncation_reason the collection_status row reports for this posture surface. */
+  truncationReason?: string;
+  capReached: boolean;
+}
+
+function postureCount(surface: SurfaceResult<JsonRecord>): PostureCount | undefined {
   if (!surface.value) return undefined;
   const total = asNumber(surface.value.total_filtered_count);
-  if (total !== undefined) return { count: total, source: "total_filtered_count", truncated: false };
-  return { count: asRecordArray(surface.value.data).length, source: "paged_data", truncated: asBoolean(surface.value.truncated) === true };
+  if (total !== undefined) return { count: total, source: "total_filtered_count", truncated: false, capReached: false };
+  const truncated = asBoolean(surface.value.truncated) === true;
+  return {
+    count: asRecordArray(surface.value.data).length,
+    source: "paged_data",
+    truncated,
+    truncationReason: truncated ? asString(surface.value.truncation_reason) : undefined,
+    capReached: truncated && asBoolean(surface.value.cap_reached) === true,
+  };
+}
+
+/**
+ * Why the paged posture counts stopped, in the words the collection_status row carries for the same surfaces. Each
+ * truncated evaluation is named, and raising finding_limit is advised only when a cap stopped the paging: a repeated
+ * cursor or a run of empty pages does not yield to a larger limit, so those leave the console as the only remedy.
+ */
+function postureTruncation(failing: PostureCount | undefined, passing: PostureCount | undefined): { clause: string; remedy: string } {
+  const stopped: Array<{ label: string; count: PostureCount }> = [];
+  if (failing?.truncated) stopped.push({ label: "failing", count: failing });
+  if (passing?.truncated) stopped.push({ label: "passing", count: passing });
+  const describe = (labels: string[], reason: string | undefined): string =>
+    `the paged ${labels.join(" and ")} count${labels.length === 1 ? "" : "s"} stopped early${reason === undefined ? "" : ` because ${reason}`}`;
+  const reasons = new Set(stopped.map((entry) => entry.count.truncationReason));
+  const clause = reasons.size <= 1
+    ? describe(stopped.map((entry) => entry.label), stopped[0]?.count.truncationReason)
+    : stopped.map((entry) => describe([entry.label], entry.count.truncationReason)).join(" and ");
+  const remedy = stopped.some((entry) => entry.count.capReached)
+    ? "Raise finding_limit or capture the passing percentage from the console."
+    : "Capture the passing percentage from the console.";
+  return { clause, remedy };
 }
 
 function evaluateCspmControl(snapshot: DatadogSecurityMonitoringSnapshot, minPassRate: number): DatadogFinding {
@@ -3446,6 +3505,9 @@ function evaluateCspmControl(snapshot: DatadogSecurityMonitoringSnapshot, minPas
     posture_findings_passing: passing?.count ?? null,
     posture_count_source: failing?.source ?? passing?.source ?? null,
     posture_counts_truncated: unreadablePosture.length === 0 ? countsTruncated : null,
+    posture_counts_truncation_reasons: unreadablePosture.length === 0
+      ? { failing: failing?.truncationReason ?? null, passing: passing?.truncationReason ?? null }
+      : null,
     posture_pass_rate: passRate === undefined ? null : Number(passRate.toFixed(3)),
     min_posture_pass_rate: minPassRate,
     posture_findings_readable: unreadablePosture.length === 0,
@@ -3486,7 +3548,8 @@ function evaluateCspmControl(snapshot: DatadogSecurityMonitoringSnapshot, minPas
   }
   const ruleCaveats = [truncationCaveat("security_rules", snapshot.rules, "rule_limit")];
   if (countsTruncated) {
-    return withVerdictCaveats(finding(12, "high", "warn", `CSPM is active with ${enabledCloudRules.length} enabled compliance rules${rulesRead}, but the posture findings response carried no total_filtered_count and the paged counts hit the finding_limit, so the passing rate could not be measured reliably; raise finding_limit or capture the passing percentage from the console.`, evidence), ruleCaveats);
+    const { clause, remedy } = postureTruncation(failing, passing);
+    return withVerdictCaveats(finding(12, "high", "warn", `CSPM is active with ${enabledCloudRules.length} enabled compliance rules${rulesRead}, but the passing rate could not be measured reliably: the posture findings response carried no total_filtered_count and ${clause}. ${remedy}`, evidence), ruleCaveats);
   }
   if (passRate === undefined) {
     return withVerdictCaveats(finding(12, "high", "warn", `CSPM is active with ${enabledCloudRules.length} enabled compliance rules${rulesRead}, but no posture findings were returned yet so the passing rate could not be measured.`, evidence), ruleCaveats);
@@ -4606,6 +4669,7 @@ function normalizeIdentityArgs(args: unknown): IdentityArgs {
     ...normalizeCheckAccessArgs(args),
     user_limit: asNumber(value.user_limit),
     role_limit: asNumber(value.role_limit),
+    key_limit: asNumber(value.key_limit),
     max_admins: asNumber(value.max_admins),
     inactive_days: asNumber(value.inactive_days),
     pending_invite_days: asNumber(value.pending_invite_days),
@@ -4669,6 +4733,7 @@ function identityOptions(args: IdentityArgs): DatadogIdentityOptions {
   return {
     userLimit: args.user_limit,
     roleLimit: args.role_limit,
+    keyLimit: args.key_limit,
     maxAdmins: args.max_admins,
     inactiveDays: args.inactive_days,
     pendingInviteDays: args.pending_invite_days,
@@ -4722,6 +4787,7 @@ const authParams = {
 const identityParams = {
   user_limit: Type.Optional(Type.Number({ description: "Maximum users to inspect; a larger inventory is reported as truncated and caps the verdict at warn. Defaults to 2000.", default: DEFAULT_USER_LIMIT })),
   role_limit: Type.Optional(Type.Number({ description: "Maximum roles to inspect (every listed custom role has its permissions expanded); a larger inventory is reported as truncated. Defaults to 100.", default: DEFAULT_ROLE_LIMIT })),
+  key_limit: Type.Optional(Type.Number({ description: "Maximum application keys to inspect for service account key rotation; a larger inventory is reported as truncated. Defaults to 500.", default: DEFAULT_KEY_LIMIT })),
   max_admins: Type.Optional(Type.Number({ description: "Maximum acceptable Datadog Admin Role members before warning. Defaults to 10.", default: DEFAULT_MAX_ADMINS })),
   inactive_days: Type.Optional(Type.Number({ description: "Days without login before an active user is flagged. Defaults to 90.", default: DEFAULT_INACTIVE_USER_DAYS })),
   pending_invite_days: Type.Optional(Type.Number({ description: "Days before a pending invitation is flagged. Defaults to 30.", default: DEFAULT_PENDING_INVITE_DAYS })),

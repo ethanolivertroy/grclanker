@@ -20,7 +20,7 @@ import { dirname, join, relative, resolve } from "node:path";
 import { ZipArchive } from "archiver";
 import { Type } from "@sinclair/typebox";
 import { parse as parseYaml, YAMLError } from "yaml";
-import { createCredentialScrubber } from "./credential-scrub.js";
+import { createCredentialScrubber, isCredentialDataKey } from "./credential-scrub.js";
 import { errorResult, formatTable, textResult } from "./shared.js";
 
 type FetchImpl = typeof fetch;
@@ -617,51 +617,412 @@ export function redactSecrets(text: string, config: ElasticSecretConfig): string
   return scrubErrorText(text);
 }
 
+/**
+ * The record-key rule for collected Elastic data: the Elasticsearch settings vocabulary (`bind_password`,
+ * `secure_password`, `keystore_password`, `client_secret`, a bare `key` under `ssl`, `tls`, `keystore`, or `secrets`,
+ * with a flat dotted settings key such as `xpack.security.http.ssl.key` carrying its own parent segment) plus the
+ * shared conservative rule (`token`, `credentials`, `hmac_key`, `shared_secret`, ...). `is_*` and `has_*` flags are
+ * never credentials. The whole subtree under a matching key becomes the marker.
+ */
 function isSecretKey(key: string, parentKey: string | undefined): boolean {
   const segments = key.split(".");
   const last = segments[segments.length - 1] ?? key;
   if (/^(is|has)_/i.test(last)) return false;
-  if (SECRET_KEY_PATTERN.test(last) || SECRET_KEY_SUFFIX_PATTERN.test(last)) return true;
+  if (SECRET_KEY_PATTERN.test(last) || SECRET_KEY_SUFFIX_PATTERN.test(last) || isCredentialDataKey(key)) return true;
   // Flat dotted settings keys ("xpack.security.http.ssl.key") carry their own parent segment,
   // which takes precedence over the enclosing object key ("persistent").
   const parent = segments.length > 1 ? segments[segments.length - 2] : parentKey;
   return /^key$/i.test(last) && /^(ssl|tls|keystore|secrets)$/i.test(parent ?? "");
 }
 
-function isRedactableValue(value: unknown): boolean {
-  return value !== null && value !== undefined && typeof value !== "boolean";
-}
+const SCHEME_URL_PATTERN = /^[a-z][a-z0-9+.-]*:\/\//i;
+// A value that is one URL and nothing else (`https://es.example.com:9200`, `ldaps://svc:pw@ldap.example.com:636`), as
+// opposed to prose that mentions one.
+const URL_VALUE_PATTERN = /^[a-z][a-z0-9+.-]*:\/\/\S+$/i;
 
-export function redactSensitiveValues(value: unknown, depth = 0, parentKey?: string): unknown {
-  if (depth > MAX_REDACTION_DEPTH) {
-    return value !== null && typeof value === "object" ? `${REDACTED}: nesting deeper than ${MAX_REDACTION_DEPTH} levels` : value;
-  }
-  if (Array.isArray(value)) return value.map((item) => redactSensitiveValues(item, depth + 1, parentKey));
-  const object = asObject(value);
-  if (!object) return value;
-  const output: JsonRecord = {};
-  for (const [key, entry] of Object.entries(object)) {
-    if (isSecretKey(key, parentKey) && isRedactableValue(entry)) {
-      output[key] = REDACTED;
-    } else {
-      output[key] = redactSensitiveValues(entry, depth + 1, key);
-    }
-  }
-  return output;
-}
-
-/** Keeps only scheme and host of a URL-shaped value so paths and query strings carrying tokens never reach the bundle. */
-function reduceUrlToOrigin(value: unknown): unknown {
-  if (typeof value !== "string" || !/^[a-z][a-z0-9+.-]*:\/\//i.test(value)) return value;
+function urlOrigin(url: string): string {
   try {
-    const parsed = new URL(value);
+    const parsed = new URL(url);
     return `${parsed.protocol}//${parsed.host}`;
   } catch {
     return REDACTED;
   }
 }
 
+/**
+ * Reduces a collected value that is one URL to its origin (scheme and host). No Elastic verdict reads a URL field past
+ * its scheme (plain-http checks on Fleet hosts and connector URLs), so the userinfo, path, query string, and fragment
+ * of a URL value never reach an assess payload or the bundle, whichever field carries it. A URL embedded in free text
+ * (a note, a description, an error detail kept in a record) is left to the shared pattern pass, which drops its
+ * userinfo and replaces its query and fragment while keeping the scheme, host, and path that name the surface, as
+ * every other module's data walker does.
+ */
+export function reduceUrlValueToOrigin(value: string): string {
+  const trimmed = value.trim();
+  return URL_VALUE_PATTERN.test(trimmed) ? urlOrigin(trimmed) : value;
+}
+
+/**
+ * The data-side scrub every collected dataset passes through before it is assessed or written (see
+ * credential-scrub.ts `scrubData`): the whole subtree under a secret-shaped key becomes the marker, `{name, value}`
+ * pairs with a credential-shaped name lose their value, a string that is one URL keeps its origin only, and every
+ * string runs through the module's pattern scrubber (carriers, configured secrets, token shapes, and the userinfo,
+ * query, and fragment of a URL inside free text; shape rules off under identifier keys such as `id` or `ca_sha256`),
+ * and nesting past the cap becomes the marker. Booleans and nulls pass through.
+ */
+export function redactSensitiveValues(value: unknown): unknown {
+  return credentialScrubber.scrubData(value, {
+    isCredentialKey: isSecretKey,
+    transformString: reduceUrlValueToOrigin,
+    maxDepth: MAX_REDACTION_DEPTH,
+  });
+}
+
+/** Keeps only scheme and host of a URL-shaped value so paths and query strings carrying tokens never reach the bundle. */
+function reduceUrlToOrigin(value: unknown): unknown {
+  return typeof value === "string" ? reduceUrlValueToOrigin(value) : value;
+}
+
 const CONNECTOR_URL_KEYS = ["url", "webhookUrl", "apiUrl", "configUrl", "webhook_url", "api_url"];
+
+/** A value stored under a URL key: its origin when it is a URL, the marker when it is a string of any other shape (a schemeless webhook path would keep its token), and unchanged otherwise. */
+function reduceUrlKeyValue(value: unknown): unknown {
+  if (typeof value !== "string") return value;
+  return SCHEME_URL_PATTERN.test(value.trim()) ? urlOrigin(value.trim()) : REDACTED;
+}
+
+/** Copies the listed keys that are present on the record, so an absent field stays absent (never rendered as null). */
+function pick(record: JsonRecord | undefined, keys: readonly string[]): JsonRecord {
+  const out: JsonRecord = {};
+  for (const key of keys) if (record !== undefined && record[key] !== undefined) out[key] = record[key];
+  return out;
+}
+
+/** Keeps a `metadata` object down to its documented reserved and managed flags; free-form metadata is never copied. */
+function projectMetadata(metadata: unknown): JsonRecord | undefined {
+  const object = asObject(metadata);
+  if (!object) return undefined;
+  return pick(object, ["_reserved", "_deprecated", "managed", "managed_by"]);
+}
+
+/** Projects a role or API key role descriptor to the privilege fields the RBAC, FLS/DLS, and API key scope verdicts read. */
+function projectRoleDescriptor(descriptor: unknown): JsonRecord {
+  const role = asObject(descriptor) ?? {};
+  const projected: JsonRecord = pick(role, ["cluster", "run_as"]);
+  if (role.indices !== undefined) {
+    projected.indices = asObjectArray(role.indices).map((entry) => ({
+      ...pick(entry, ["names", "privileges", "allow_restricted_indices", "query"]),
+      ...(asObject(entry.field_security) ? { field_security: pick(asObject(entry.field_security), ["grant", "except"]) } : {}),
+    }));
+  }
+  if (role.applications !== undefined) {
+    projected.applications = asObjectArray(role.applications).map((entry) => pick(entry, ["application", "privileges", "resources"]));
+  }
+  const metadata = projectMetadata(role.metadata);
+  if (metadata) projected.metadata = metadata;
+  return projected;
+}
+
+/** Projects a map of named records with the given per-entry projector, keeping the names as keys. */
+function projectRecordMap(records: unknown, project: (entry: JsonRecord, name: string) => JsonRecord): JsonRecord {
+  const output: JsonRecord = {};
+  for (const [name, value] of Object.entries(asObject(records) ?? {})) output[name] = project(asObject(value) ?? {}, name);
+  return output;
+}
+
+/** Keeps the `xpack.security.*` settings the verdicts read (flattened when the API returned them nested); every other setting is dropped. */
+function projectSettingsMap(settings: unknown): JsonRecord {
+  const flat = flattenSettings(settings);
+  const output: JsonRecord = {};
+  for (const [key, value] of Object.entries(flat)) {
+    if (/^(xpack\.security\.|xpack\.ssl\.|cluster\.name$|node\.name$|node\.roles$)/.test(key)) output[key] = value;
+  }
+  return output;
+}
+
+function projectAuthenticate(record: JsonRecord): JsonRecord {
+  return {
+    ...pick(record, ["username", "roles", "enabled", "authentication_type"]),
+    ...(asObject(record.authentication_realm) ? { authentication_realm: pick(asObject(record.authentication_realm), ["name", "type"]) } : {}),
+    ...(asObject(record.lookup_realm) ? { lookup_realm: pick(asObject(record.lookup_realm), ["name", "type"]) } : {}),
+  };
+}
+
+/** Keeps the boolean grant map of a has-privileges response at any nesting (cluster, index, application). */
+function projectGrantMap(value: unknown, depth = 0): unknown {
+  if (typeof value === "boolean") return value;
+  const object = asObject(value);
+  if (!object || depth > 4) return undefined;
+  const output: JsonRecord = {};
+  for (const [key, entry] of Object.entries(object)) {
+    const projected = projectGrantMap(entry, depth + 1);
+    if (projected !== undefined) output[key] = projected;
+  }
+  return output;
+}
+
+function projectPrivileges(record: JsonRecord): JsonRecord {
+  return {
+    ...pick(record, ["username", "has_all_requested"]),
+    ...(record.cluster !== undefined ? { cluster: projectGrantMap(record.cluster) ?? {} } : {}),
+    ...(record.index !== undefined ? { index: projectGrantMap(record.index) ?? {} } : {}),
+    ...(record.application !== undefined ? { application: projectGrantMap(record.application) ?? {} } : {}),
+  };
+}
+
+const LICENSE_KEYS = ["status", "uid", "type", "mode", "issue_date", "issue_date_in_millis", "expiry_date", "expiry_date_in_millis", "start_date_in_millis", "max_nodes", "max_resource_units", "issued_to", "issuer"];
+
+function projectLicense(record: JsonRecord): JsonRecord {
+  return asObject(record.license) ? { license: pick(asObject(record.license), LICENSE_KEYS) } : {};
+}
+
+function projectXpackInfo(record: JsonRecord): JsonRecord {
+  return {
+    ...(asObject(record.build) ? { build: pick(asObject(record.build), ["hash", "date"]) } : {}),
+    ...(asObject(record.license) ? { license: pick(asObject(record.license), LICENSE_KEYS) } : {}),
+    ...(asObject(record.features) ? { features: projectRecordMap(record.features, (feature) => pick(feature, ["available", "enabled"])) } : {}),
+  };
+}
+
+/** Keeps the security usage block whole (the verdicts read realms, roles, ssl, audit, ipfilter, anonymous, token and API key services, fips) and only the availability flags of every other feature. */
+function projectXpackUsage(record: JsonRecord): JsonRecord {
+  const output: JsonRecord = {};
+  for (const [feature, value] of Object.entries(record)) {
+    const object = asObject(value);
+    if (!object) continue;
+    output[feature] = feature === "security" ? object : pick(object, ["available", "enabled"]);
+  }
+  return output;
+}
+
+function projectClusterSettings(record: JsonRecord): JsonRecord {
+  const output: JsonRecord = {};
+  for (const section of ["persistent", "transient", "defaults"]) {
+    if (record[section] !== undefined) output[section] = projectSettingsMap(record[section]);
+  }
+  return output;
+}
+
+function projectNodeSettings(record: JsonRecord): JsonRecord {
+  return {
+    ...(asObject(record._nodes) ? { _nodes: pick(asObject(record._nodes), ["total", "successful", "failed"]) } : {}),
+    ...pick(record, ["cluster_name"]),
+    ...(record.nodes !== undefined
+      ? { nodes: projectRecordMap(record.nodes, (node) => ({ ...pick(node, ["name", "version", "roles"]), ...(node.settings !== undefined ? { settings: projectSettingsMap(node.settings) } : {}) })) }
+      : {}),
+  };
+}
+
+function projectSslCertificate(certificate: JsonRecord): JsonRecord {
+  return pick(certificate, ["path", "format", "alias", "subject_dn", "serial_number", "has_private_key", "expiry", "issuer"]);
+}
+
+function projectUser(user: JsonRecord): JsonRecord {
+  const metadata = projectMetadata(user.metadata);
+  return { ...pick(user, ["username", "roles", "enabled"]), ...(metadata ? { metadata } : {}) };
+}
+
+function projectRoleMapping(mapping: JsonRecord): JsonRecord {
+  const metadata = projectMetadata(mapping.metadata);
+  return {
+    ...pick(mapping, ["enabled", "roles", "rules"]),
+    ...(Array.isArray(mapping.role_templates) ? { role_template_count: mapping.role_templates.length } : {}),
+    ...(metadata ? { metadata } : {}),
+  };
+}
+
+function projectApiKey(key: JsonRecord): JsonRecord {
+  const metadata = projectMetadata(key.metadata);
+  return {
+    ...pick(key, ["id", "name", "type", "creation", "expiration", "invalidated", "invalidation", "username", "realm", "realm_type"]),
+    ...(metadata ? { metadata } : {}),
+    ...(key.role_descriptors !== undefined ? { role_descriptors: projectRecordMap(key.role_descriptors, projectRoleDescriptor) } : {}),
+    ...(key.limited_by !== undefined ? { limited_by: asObjectArray(key.limited_by).map((entry) => projectRecordMap(entry, projectRoleDescriptor)) } : {}),
+  };
+}
+
+const ROLLOVER_THRESHOLD_KEYS = ["max_age", "max_docs", "max_size", "max_primary_shard_size", "max_primary_shard_docs", "min_age", "min_docs", "min_size", "min_primary_shard_size", "min_primary_shard_docs"];
+
+/** Keeps a phase's age and the names of its actions; only rollover keeps its thresholds, since no verdict reads another action's configuration. */
+function projectIlmPhase(phase: JsonRecord): JsonRecord {
+  return {
+    ...pick(phase, ["min_age"]),
+    ...(phase.actions !== undefined
+      ? { actions: projectRecordMap(phase.actions, (action, name) => (name === "rollover" ? pick(action, ROLLOVER_THRESHOLD_KEYS) : {})) }
+      : {}),
+  };
+}
+
+function projectIlmPolicy(entry: JsonRecord): JsonRecord {
+  const policy = asObject(entry.policy);
+  const inUseBy = asObject(entry.in_use_by);
+  return {
+    ...pick(entry, ["version", "modified_date"]),
+    ...(policy
+      ? {
+        policy: {
+          ...(projectMetadata(policy._meta) ? { _meta: projectMetadata(policy._meta) } : {}),
+          ...(policy.phases !== undefined ? { phases: projectRecordMap(policy.phases, projectIlmPhase) } : {}),
+        },
+      }
+      : {}),
+    ...(inUseBy ? { in_use_by: pick(inUseBy, ["indices", "data_streams", "composable_templates"]) } : {}),
+  };
+}
+
+function projectSlmPolicy(entry: JsonRecord): JsonRecord {
+  const policy = asObject(entry.policy);
+  return {
+    ...pick(entry, ["version", "modified_date", "modified_date_millis", "next_execution", "next_execution_millis", "repository"]),
+    ...(policy
+      ? {
+        policy: {
+          ...pick(policy, ["name", "schedule", "repository", "retention"]),
+          ...(asObject(policy.config) ? { config: pick(asObject(policy.config), ["indices", "include_global_state", "ignore_unavailable", "partial"]) } : {}),
+        },
+      }
+      : {}),
+    ...(asObject(entry.last_success) ? { last_success: pick(asObject(entry.last_success), ["snapshot_name", "time"]) } : {}),
+    ...(asObject(entry.last_failure) ? { last_failure: pick(asObject(entry.last_failure), ["snapshot_name", "time"]) } : {}),
+  };
+}
+
+function projectSnapshotRepository(entry: JsonRecord): JsonRecord {
+  const settings = asObject(entry.settings);
+  return {
+    ...pick(entry, ["type", "uuid"]),
+    ...(settings
+      ? {
+        settings: {
+          ...pick(settings, ["bucket", "container", "location", "base_path", "client", "server_side_encryption", "readonly", "compress"]),
+          ...(settings.url !== undefined ? { url: reduceUrlKeyValue(settings.url) } : {}),
+          ...(settings.endpoint !== undefined ? { endpoint: reduceUrlToOrigin(settings.endpoint) } : {}),
+        },
+      }
+      : {}),
+  };
+}
+
+function projectKibanaStatus(record: JsonRecord): JsonRecord {
+  const overall = asObject(asObject(record.status)?.overall);
+  return {
+    ...pick(record, ["name", "uuid"]),
+    ...(asObject(record.version) ? { version: pick(asObject(record.version), ["number", "build_hash", "build_number"]) } : {}),
+    ...(overall ? { status: { overall: pick(overall, ["level", "state"]) } } : {}),
+  };
+}
+
+function projectKibanaSpace(space: JsonRecord): JsonRecord {
+  return pick(space, ["id", "name", "disabledFeatures", "_reserved", "solution"]);
+}
+
+function projectKibanaRole(role: JsonRecord): JsonRecord {
+  const metadata = projectMetadata(role.metadata);
+  return {
+    ...pick(role, ["name"]),
+    ...(metadata ? { metadata } : {}),
+    ...(role.elasticsearch !== undefined ? { elasticsearch: projectRoleDescriptor(role.elasticsearch) } : {}),
+    ...(role.kibana !== undefined ? { kibana: asObjectArray(role.kibana).map((entry) => pick(entry, ["base", "feature", "spaces"])) } : {}),
+  };
+}
+
+function projectAgentPolicy(policy: JsonRecord): JsonRecord {
+  return {
+    ...pick(policy, ["id", "name", "namespace", "status", "revision", "updated_at", "agents", "is_protected", "is_managed", "is_default", "is_preconfigured", "monitoring_enabled", "data_output_id", "monitoring_output_id", "fleet_server_host_id", "download_source_id"]),
+    ...(Array.isArray(policy.package_policies) ? { package_policy_count: policy.package_policies.length } : {}),
+  };
+}
+
+/** Projects a Fleet output to its transport shape: origin-only hosts, CA trust fields, and whether TLS material is configured (never the material itself). */
+function projectFleetOutput(output: JsonRecord): JsonRecord {
+  const ssl = asObject(output.ssl);
+  return {
+    ...pick(output, ["id", "name", "type", "is_default", "is_default_monitoring", "is_preconfigured", "ca_sha256", "ca_trusted_fingerprint", "proxy_id", "preset"]),
+    ...(output.hosts !== undefined ? { hosts: asStringList(output.hosts).map(reduceUrlKeyValue) } : {}),
+    ...(ssl
+      ? {
+        ssl: {
+          ...pick(ssl, ["verification_mode"]),
+          certificate_authorities_count: asArray(ssl.certificate_authorities).length,
+          certificate_present: ssl.certificate !== undefined,
+          key_present: ssl.key !== undefined,
+        },
+      }
+      : {}),
+  };
+}
+
+function projectEnrollmentApiKey(key: JsonRecord): JsonRecord {
+  return { ...pick(key, ["id", "active", "api_key_id", "name", "policy_id", "created_at"]), ...(key.api_key !== undefined ? { api_key: REDACTED } : {}) };
+}
+
+function projectFleetServerHost(host: JsonRecord): JsonRecord {
+  return {
+    ...pick(host, ["id", "name", "is_default", "is_preconfigured", "is_internal", "proxy_id"]),
+    ...(host.host_urls !== undefined ? { host_urls: asStringList(host.host_urls).map(reduceUrlKeyValue) } : {}),
+  };
+}
+
+/** Projects a Kibana rule action to its connector reference; parameters (message bodies, URLs) are never copied. */
+function projectRuleAction(action: JsonRecord): JsonRecord {
+  return {
+    ...pick(action, ["id", "uuid", "group", "action_type_id", "connector_type_id"]),
+    ...(asObject(action.frequency) ? { frequency: pick(asObject(action.frequency), ["summary", "notify_when", "notifyWhen", "throttle"]) } : {}),
+  };
+}
+
+function projectDetectionRule(rule: JsonRecord): JsonRecord {
+  return {
+    ...pick(rule, ["id", "rule_id", "name", "enabled", "type", "severity", "risk_score", "interval", "from", "created_at", "updated_at", "version", "immutable"]),
+    ...(rule.actions !== undefined ? { actions: asObjectArray(rule.actions).map(projectRuleAction) } : {}),
+  };
+}
+
+function projectAlertingRule(rule: JsonRecord): JsonRecord {
+  const executionStatus = asObject(rule.execution_status);
+  return {
+    ...pick(rule, ["id", "name", "rule_type_id", "consumer", "enabled", "schedule", "notify_when", "throttle", "mute_all", "created_at", "updated_at", "revision"]),
+    ...(executionStatus ? { execution_status: pick(executionStatus, ["status", "last_execution_date"]) } : {}),
+    ...(rule.actions !== undefined ? { actions: asObjectArray(rule.actions).map(projectRuleAction) } : {}),
+  };
+}
+
+/**
+ * Elastic Cloud gives a deployment's resources in two shapes. The listing the client reads, GET /api/v1/deployments
+ * (DeploymentsListResponse), carries one array of `{ kind, ref_id, id, region, ... }`; the per-deployment read,
+ * GET /api/v1/deployments/{id}, groups them per kind as arrays (`elasticsearch: [{ ref_id, id, region, info, ... }]`,
+ * likewise kibana, apm, integrations_server, enterprise_search, appsearch). Both project to the per-kind map, each
+ * element keeping its documented identity fields; an array element without a string kind and a per-kind value that is
+ * not an array are dropped, and any other value is not a resource collection at all.
+ */
+function projectCloudResources(resources: unknown): JsonRecord | undefined {
+  const projectResource = (resource: JsonRecord): JsonRecord => pick(resource, ["ref_id", "id", "region"]);
+  if (Array.isArray(resources)) {
+    const grouped: Record<string, JsonRecord[]> = {};
+    for (const resource of asObjectArray(resources)) {
+      const kind = typeof resource.kind === "string" ? resource.kind.trim() : "";
+      if (kind) (grouped[kind] ??= []).push(projectResource(resource));
+    }
+    return grouped;
+  }
+  const perKind = asObject(resources);
+  if (!perKind) return undefined;
+  const output: JsonRecord = {};
+  for (const [kind, value] of Object.entries(perKind)) {
+    if (Array.isArray(value)) output[kind] = asObjectArray(value).map(projectResource);
+  }
+  return output;
+}
+
+function projectCloudDeployment(deployment: JsonRecord): JsonRecord {
+  const metadata = asObject(deployment.metadata);
+  const resources = projectCloudResources(deployment.resources);
+  return {
+    ...pick(deployment, ["id", "name", "alias", "healthy"]),
+    ...(metadata ? { metadata: pick(metadata, ["last_modified", "system_owned", "hidden"]) } : {}),
+    ...(resources ? { resources } : {}),
+  };
+}
 
 /** Projects a Kibana connector to its identity, type, and origin-only URL fields; secrets and headers are dropped. */
 function projectConnector(connector: JsonRecord): JsonRecord {
@@ -669,9 +1030,9 @@ function projectConnector(connector: JsonRecord): JsonRecord {
   const projectedConfig: JsonRecord = {};
   for (const [key, value] of Object.entries(config)) {
     if (CONNECTOR_URL_KEYS.includes(key)) {
-      projectedConfig[key] = reduceUrlToOrigin(value);
+      projectedConfig[key] = reduceUrlKeyValue(value);
     } else if (/^(headers|hasAuth|has_auth|authType|auth_type|method|from|service|host|port|secure|index|executionTimeField|apiProvider|defaultModel|isDeprecated|usesTableApi|createIncidentUrl|getIncidentUrl|updateIncidentUrl|viewIncidentUrl)$/i.test(key)) {
-      projectedConfig[key] = key.toLowerCase() === "headers" ? (asObject(value) ? Object.keys(asObject(value) ?? {}) : null) : /url$/i.test(key) ? reduceUrlToOrigin(value) : value;
+      projectedConfig[key] = key.toLowerCase() === "headers" ? (asObject(value) ? Object.keys(asObject(value) ?? {}) : null) : /url$/i.test(key) ? reduceUrlKeyValue(value) : value;
     } else if (typeof value === "boolean" || typeof value === "number") {
       projectedConfig[key] = value;
     }
@@ -733,7 +1094,7 @@ function projectPipelineProcessors(processors: unknown): unknown {
       const entry: JsonRecord = {
         field: asString(config.field) ?? null,
         target_field: asString(config.target_field) ?? null,
-        ...(config.description !== undefined ? { description: asString(config.description) ?? null } : {}),
+        ...(config.description !== undefined ? { has_description: true } : {}),
         ...(config.if !== undefined ? { has_condition: true } : {}),
         ...(config.ignore_failure !== undefined ? { ignore_failure: asBoolean(config.ignore_failure) ?? null } : {}),
       };
@@ -755,13 +1116,13 @@ function projectPipelineProcessors(processors: unknown): unknown {
   });
 }
 
-/** Projects the ingest pipeline inventory so processor configuration literals never reach the bundle. */
+/** Projects the ingest pipeline inventory so processor configuration literals and free-text descriptions never reach the bundle. */
 function projectPipelines(pipelines: JsonRecord): JsonRecord {
   const output: JsonRecord = {};
   for (const [name, value] of Object.entries(pipelines)) {
     const entry = asObject(value) ?? {};
     output[name] = {
-      description: asString(entry.description) ?? null,
+      has_description: entry.description !== undefined,
       version: asNumber(entry.version) ?? null,
       _meta: asObject(entry._meta) ? { managed: asBoolean(asObject(entry._meta)?.managed) ?? null, managed_by: asString(asObject(entry._meta)?.managed_by) ?? null } : null,
       processors: projectPipelineProcessors(entry.processors) ?? null,
@@ -1014,8 +1375,13 @@ export class ElasticRequestError extends Error {
 /**
  * Extracts only the documented error fields of the Elasticsearch, Kibana, and
  * Elastic Cloud JSON error shapes; anything else in the body is never echoed.
+ * The summary is scrubbed (configured secrets in every encoding, then every
+ * credential carrier) before it is cut to length, so a secret straddling the
+ * cut cannot leave an unmatched fragment behind. The truncation note leads the
+ * detail rather than trailing it: a cut can end inside a quoted carrier, and a
+ * later scrub would read a trailing note as that carrier's value.
  */
-function elasticErrorSummary(payload: unknown): string | undefined {
+function elasticErrorSummary(payload: unknown, config: ElasticSecretConfig): string | undefined {
   const object = asObject(payload);
   if (!object) return undefined;
   const error = asObject(object.error);
@@ -1030,8 +1396,90 @@ function elasticErrorSummary(payload: unknown): string | undefined {
   ];
   const summary = candidates.filter((item): item is string => Boolean(item)).join(": ");
   if (!summary) return undefined;
-  return summary.length > MAX_ERROR_DETAIL_CHARS ? `${summary.slice(0, MAX_ERROR_DETAIL_CHARS)}… (truncated)` : summary;
+  const scrubbed = redactSecrets(summary, config);
+  return scrubbed.length > MAX_ERROR_DETAIL_CHARS ? `(detail truncated to ${MAX_ERROR_DETAIL_CHARS} characters) ${scrubbed.slice(0, MAX_ERROR_DETAIL_CHARS)}` : scrubbed;
 }
+
+/**
+ * The documented container of a 2xx body, checked before a payload is accepted: an object carrying one of its
+ * documented keys (or every one of them, for a document whose keys are all guaranteed and whose names are common
+ * enough on foreign pages that one match proves nothing), a map whose every entry is an object carrying one of the
+ * documented entry keys (an empty map is a documented answer: no role mappings, no repositories), an array of
+ * objects, or an object whose documented key holds an array. An empty body, a non-JSON body, or JSON of any other
+ * shape is recorded as a failed read of the request with the status the server sent, never as an empty inventory, so
+ * the dependent verdicts go manual instead of passing or failing on data that was never observed.
+ */
+export type ElasticResponseShape =
+  | { kind: "object"; keys: readonly string[]; all?: boolean }
+  | { kind: "map"; entryKeys: readonly string[] }
+  | { kind: "array" }
+  | { kind: "list"; key: string };
+
+export function matchesResponseShape(payload: unknown, shape: ElasticResponseShape): boolean {
+  switch (shape.kind) {
+    case "object": {
+      const record = asObject(payload);
+      if (record === undefined) return false;
+      return shape.all ? shape.keys.every((key) => record[key] !== undefined) : shape.keys.some((key) => record[key] !== undefined);
+    }
+    case "map": {
+      const record = asObject(payload);
+      if (!record) return false;
+      return Object.values(record).every((entry) => {
+        const item = asObject(entry);
+        return item !== undefined && shape.entryKeys.some((key) => item[key] !== undefined);
+      });
+    }
+    case "array":
+      return Array.isArray(payload) && payload.every((entry) => asObject(entry) !== undefined);
+    case "list": {
+      const record = asObject(payload);
+      return record !== undefined && Array.isArray(record[shape.key]);
+    }
+    default: {
+      const exhaustive: never = shape;
+      throw new Error(`Unsupported Elastic response shape: ${String(exhaustive)}`);
+    }
+  }
+}
+
+/** Fixed text naming the documented shape; nothing from the body enters it. */
+export function describeResponseShape(shape: ElasticResponseShape): string {
+  switch (shape.kind) {
+    case "object":
+      return `JSON object with ${shape.all ? "all" : "any"} of ${shape.keys.join(", ")}`;
+    case "map":
+      return `JSON object of named entries each carrying any of ${shape.entryKeys.join(", ")}`;
+    case "array":
+      return "JSON array of objects";
+    case "list":
+      return `JSON object with an array under ${shape.key}`;
+    default: {
+      const exhaustive: never = shape;
+      throw new Error(`Unsupported Elastic response shape: ${String(exhaustive)}`);
+    }
+  }
+}
+
+const ARRAY_SHAPE: ElasticResponseShape = { kind: "array" };
+const ITEMS_SHAPE: ElasticResponseShape = { kind: "list", key: "items" };
+const OPERATION_MODE_SHAPE: ElasticResponseShape = { kind: "object", keys: ["operation_mode"] };
+const AUTHENTICATE_SHAPE: ElasticResponseShape = { kind: "object", keys: ["username", "roles"] };
+const HAS_PRIVILEGES_SHAPE: ElasticResponseShape = { kind: "object", keys: ["has_all_requested", "cluster", "index", "application"] };
+const LICENSE_SHAPE: ElasticResponseShape = { kind: "object", keys: ["license"] };
+const XPACK_INFO_SHAPE: ElasticResponseShape = { kind: "object", keys: ["features", "license", "build"] };
+const XPACK_USAGE_SHAPE: ElasticResponseShape = { kind: "object", keys: ["security", "monitoring", "watcher", "ml", "ilm", "sql", "rollup", "graph"] };
+const CLUSTER_SETTINGS_SHAPE: ElasticResponseShape = { kind: "object", keys: ["persistent", "transient", "defaults"] };
+const NODE_SETTINGS_SHAPE: ElasticResponseShape = { kind: "object", keys: ["nodes", "_nodes"] };
+const USERS_SHAPE: ElasticResponseShape = { kind: "map", entryKeys: ["username", "roles", "enabled"] };
+const ROLES_SHAPE: ElasticResponseShape = { kind: "map", entryKeys: ["cluster", "indices", "applications", "run_as", "metadata", "transient_metadata"] };
+const ROLE_MAPPINGS_SHAPE: ElasticResponseShape = { kind: "map", entryKeys: ["enabled", "roles", "role_templates", "rules", "metadata"] };
+const ILM_POLICIES_SHAPE: ElasticResponseShape = { kind: "map", entryKeys: ["policy", "version", "modified_date", "in_use_by"] };
+const SLM_POLICIES_SHAPE: ElasticResponseShape = { kind: "map", entryKeys: ["policy", "version", "modified_date", "modified_date_millis", "next_execution", "next_execution_millis", "repository", "schedule"] };
+const SNAPSHOT_REPOSITORIES_SHAPE: ElasticResponseShape = { kind: "map", entryKeys: ["type", "settings", "uuid"] };
+const INGEST_PIPELINES_SHAPE: ElasticResponseShape = { kind: "map", entryKeys: ["processors", "description", "version", "_meta", "on_failure"] };
+/** Both status formats (v7 and v8) always carry all four; `status` alone is a common foreign status-page key. */
+const KIBANA_STATUS_SHAPE: ElasticResponseShape = { kind: "object", keys: ["name", "uuid", "version", "status"], all: true };
 
 function contentTypeLabel(response: Response): string {
   const raw = response.headers.get("content-type");
@@ -1140,7 +1588,7 @@ export class ElasticApiClient {
   async request(
     target: ElasticTarget,
     path: string,
-    options: { method?: "GET" | "POST"; query?: JsonRecord; body?: unknown } = {},
+    options: { shape: ElasticResponseShape; method?: "GET" | "POST"; query?: JsonRecord; body?: unknown },
   ): Promise<unknown> {
     const method = options.method ?? "GET";
     const url = this.buildUrl(target, path, options.query ?? {});
@@ -1175,19 +1623,25 @@ export class ElasticApiClient {
           }
         }
         if (!response.ok) {
-          const detail = (parsedJson ? elasticErrorSummary(payload) : undefined) ?? describeOpaqueBody(response, rawText, parsedJson);
+          const detail = (parsedJson ? elasticErrorSummary(payload, this.config) : undefined) ?? describeOpaqueBody(response, rawText, parsedJson);
           throw new ElasticRequestError(
             redactSecrets(`${target} request ${method} ${path} failed (${response.status} ${response.statusText}): ${detail}`, this.config),
             response.status,
             target,
           );
         }
-        if (!parsedJson) {
+        // A success status is not a success by itself. An empty body, a portal or proxy page, or JSON of some other
+        // shape is not an empty inventory; each is a failed read of this request with the status the server sent.
+        const silentSuccess = rawText.length === 0
+          ? `${response.status} ${response.statusText}: empty body (0 bytes)`
+          : !parsedJson
+            ? describeOpaqueBody(response, rawText, false)
+            : matchesResponseShape(payload, options.shape)
+              ? undefined
+              : `${response.status} ${response.statusText}: JSON body that is not the documented ${describeResponseShape(options.shape)} (${contentTypeLabel(response)}, ${Buffer.byteLength(rawText, "utf8")} bytes, not echoed)`;
+        if (silentSuccess !== undefined) {
           throw new ElasticRequestError(
-            redactSecrets(
-              `${target} request ${method} ${path} returned a ${describeOpaqueBody(response, rawText, false)}; the endpoint is not serving the JSON API`,
-              this.config,
-            ),
+            redactSecrets(`${target} request ${method} ${path} returned a ${silentSuccess}; the endpoint is not serving the JSON API`, this.config),
             response.status,
             target,
           );
@@ -1212,20 +1666,20 @@ export class ElasticApiClient {
     }
   }
 
-  async esGet(path: string, query: JsonRecord = {}): Promise<unknown> {
-    return this.request("elasticsearch", path, { query });
+  async esGet(path: string, shape: ElasticResponseShape, query: JsonRecord = {}): Promise<unknown> {
+    return this.request("elasticsearch", path, { shape, query });
   }
 
-  async esPost(path: string, body: unknown, query: JsonRecord = {}): Promise<unknown> {
-    return this.request("elasticsearch", path, { method: "POST", body, query });
+  async esPost(path: string, shape: ElasticResponseShape, body: unknown, query: JsonRecord = {}): Promise<unknown> {
+    return this.request("elasticsearch", path, { shape, method: "POST", body, query });
   }
 
-  async kibanaGet(path: string, query: JsonRecord = {}): Promise<unknown> {
-    return this.request("kibana", path, { query });
+  async kibanaGet(path: string, shape: ElasticResponseShape, query: JsonRecord = {}): Promise<unknown> {
+    return this.request("kibana", path, { shape, query });
   }
 
-  async cloudGet(path: string, query: JsonRecord = {}): Promise<unknown> {
-    return this.request("cloud", path, { query });
+  async cloudGet(path: string, shape: ElasticResponseShape, query: JsonRecord = {}): Promise<unknown> {
+    return this.request("cloud", path, { shape, query });
   }
 
   async listKibanaPages(
@@ -1239,7 +1693,7 @@ export class ElasticApiClient {
     let pages = 0;
     let exhausted = false;
     for (let page = 1; items.length < limit; page += 1) {
-      const payload = asObject(await this.kibanaGet(path, {
+      const payload = asObject(await this.kibanaGet(path, { kind: "list", key: options.itemsKey }, {
         ...(options.query ?? {}),
         page,
         [options.perPageParam]: perPage,
@@ -1257,50 +1711,50 @@ export class ElasticApiClient {
   }
 
   async authenticate(): Promise<JsonRecord> {
-    return asObject(await this.esGet("/_security/_authenticate")) ?? {};
+    return asObject(await this.esGet("/_security/_authenticate", AUTHENTICATE_SHAPE)) ?? {};
   }
 
   async hasPrivileges(clusterPrivileges: string[] = REQUIRED_CLUSTER_PRIVILEGES): Promise<JsonRecord> {
-    return asObject(await this.esPost("/_security/user/_has_privileges", {
+    return asObject(await this.esPost("/_security/user/_has_privileges", HAS_PRIVILEGES_SHAPE, {
       cluster: clusterPrivileges,
       index: [{ names: [".security*"], privileges: ["read"], allow_restricted_indices: true }],
     })) ?? {};
   }
 
   async getLicense(): Promise<JsonRecord> {
-    return asObject(await this.esGet("/_license")) ?? {};
+    return asObject(await this.esGet("/_license", LICENSE_SHAPE)) ?? {};
   }
 
   async getXpackInfo(): Promise<JsonRecord> {
-    return asObject(await this.esGet("/_xpack")) ?? {};
+    return asObject(await this.esGet("/_xpack", XPACK_INFO_SHAPE)) ?? {};
   }
 
   async getXpackUsage(): Promise<JsonRecord> {
-    return asObject(await this.esGet("/_xpack/usage")) ?? {};
+    return asObject(await this.esGet("/_xpack/usage", XPACK_USAGE_SHAPE)) ?? {};
   }
 
   async getClusterSettings(): Promise<JsonRecord> {
-    return asObject(await this.esGet("/_cluster/settings", { include_defaults: true, flat_settings: true })) ?? {};
+    return asObject(await this.esGet("/_cluster/settings", CLUSTER_SETTINGS_SHAPE, { include_defaults: true, flat_settings: true })) ?? {};
   }
 
   async getNodeSettings(): Promise<JsonRecord> {
-    return asObject(await this.esGet("/_nodes/settings", { flat_settings: true })) ?? {};
+    return asObject(await this.esGet("/_nodes/settings", NODE_SETTINGS_SHAPE, { flat_settings: true })) ?? {};
   }
 
   async listSslCertificates(): Promise<JsonRecord[]> {
-    return asObjectArray(await this.esGet("/_ssl/certificates"));
+    return asObjectArray(await this.esGet("/_ssl/certificates", ARRAY_SHAPE));
   }
 
   async listUsers(): Promise<JsonRecord> {
-    return asObject(await this.esGet("/_security/user")) ?? {};
+    return asObject(await this.esGet("/_security/user", USERS_SHAPE)) ?? {};
   }
 
   async listRoles(): Promise<JsonRecord> {
-    return asObject(await this.esGet("/_security/role")) ?? {};
+    return asObject(await this.esGet("/_security/role", ROLES_SHAPE)) ?? {};
   }
 
   async listRoleMappings(): Promise<JsonRecord> {
-    return asObject(await this.esGet("/_security/role_mapping")) ?? {};
+    return asObject(await this.esGet("/_security/role_mapping", ROLE_MAPPINGS_SHAPE)) ?? {};
   }
 
   async listApiKeys(limit = DEFAULT_API_KEY_LIMIT, pageSize = DEFAULT_API_KEY_PAGE_SIZE): Promise<ElasticPagedList> {
@@ -1313,7 +1767,7 @@ export class ElasticApiClient {
     let exhausted = false;
     let cursorMissing = false;
     while (items.length < maxItems) {
-      const payload = asObject(await this.esPost("/_security/_query/api_key", {
+      const payload = asObject(await this.esPost("/_security/_query/api_key", { kind: "list", key: "api_keys" }, {
         size,
         sort: [{ creation: { order: "asc" } }, { name: { order: "asc" } }],
         ...(searchAfter ? { search_after: searchAfter } : {}),
@@ -1339,23 +1793,23 @@ export class ElasticApiClient {
   }
 
   async getIlmStatus(): Promise<JsonRecord> {
-    return asObject(await this.esGet("/_ilm/status")) ?? {};
+    return asObject(await this.esGet("/_ilm/status", OPERATION_MODE_SHAPE)) ?? {};
   }
 
   async listIlmPolicies(): Promise<JsonRecord> {
-    return asObject(await this.esGet("/_ilm/policy")) ?? {};
+    return asObject(await this.esGet("/_ilm/policy", ILM_POLICIES_SHAPE)) ?? {};
   }
 
   async getSlmStatus(): Promise<JsonRecord> {
-    return asObject(await this.esGet("/_slm/status")) ?? {};
+    return asObject(await this.esGet("/_slm/status", OPERATION_MODE_SHAPE)) ?? {};
   }
 
   async listSlmPolicies(): Promise<JsonRecord> {
-    return asObject(await this.esGet("/_slm/policy")) ?? {};
+    return asObject(await this.esGet("/_slm/policy", SLM_POLICIES_SHAPE)) ?? {};
   }
 
   async listSnapshotRepositories(): Promise<JsonRecord> {
-    return asObject(await this.esGet("/_snapshot/_all")) ?? {};
+    return asObject(await this.esGet("/_snapshot/_all", SNAPSHOT_REPOSITORIES_SHAPE)) ?? {};
   }
 
   async listWatches(limit = DEFAULT_WATCH_LIMIT): Promise<ElasticPagedList> {
@@ -1366,7 +1820,7 @@ export class ElasticApiClient {
     let pages = 0;
     let exhausted = false;
     for (let from = 0; items.length < maxItems; from += size) {
-      const payload = asObject(await this.esPost("/_watcher/_query/watches", { from, size })) ?? {};
+      const payload = asObject(await this.esPost("/_watcher/_query/watches", { kind: "list", key: "watches" }, { from, size })) ?? {};
       pages += 1;
       const pageItems = asObjectArray(payload.watches);
       items.push(...pageItems.slice(0, maxItems - items.length));
@@ -1380,19 +1834,19 @@ export class ElasticApiClient {
   }
 
   async listIngestPipelines(): Promise<JsonRecord> {
-    return asObject(await this.esGet("/_ingest/pipeline")) ?? {};
+    return asObject(await this.esGet("/_ingest/pipeline", INGEST_PIPELINES_SHAPE)) ?? {};
   }
 
   async getKibanaStatus(): Promise<JsonRecord> {
-    return asObject(await this.kibanaGet("/api/status")) ?? {};
+    return asObject(await this.kibanaGet("/api/status", KIBANA_STATUS_SHAPE)) ?? {};
   }
 
   async listSpaces(): Promise<JsonRecord[]> {
-    return asObjectArray(await this.kibanaGet("/api/spaces/space"));
+    return asObjectArray(await this.kibanaGet("/api/spaces/space", ARRAY_SHAPE));
   }
 
   async listKibanaRoles(): Promise<JsonRecord[]> {
-    return asObjectArray(await this.kibanaGet("/api/security/role"));
+    return asObjectArray(await this.kibanaGet("/api/security/role", ARRAY_SHAPE));
   }
 
   async listAgentPolicies(limit = DEFAULT_KIBANA_LIMIT): Promise<ElasticPagedList> {
@@ -1401,7 +1855,7 @@ export class ElasticApiClient {
 
   async listFleetOutputs(limit = DEFAULT_KIBANA_LIMIT): Promise<ElasticPagedList> {
     const cap = clampNumber(limit, DEFAULT_KIBANA_LIMIT, 1, 10_000);
-    const payload = asObject(await this.kibanaGet("/api/fleet/outputs")) ?? {};
+    const payload = asObject(await this.kibanaGet("/api/fleet/outputs", ITEMS_SHAPE)) ?? {};
     const outputs = asObjectArray(payload.items);
     return pagedList(outputs.slice(0, cap), asNumber(payload.total) ?? outputs.length, 1, outputs.length <= cap);
   }
@@ -1413,7 +1867,7 @@ export class ElasticApiClient {
 
   async listFleetServerHosts(limit = DEFAULT_KIBANA_LIMIT): Promise<ElasticPagedList> {
     const cap = clampNumber(limit, DEFAULT_KIBANA_LIMIT, 1, 10_000);
-    const payload = asObject(await this.kibanaGet("/api/fleet/fleet_server_hosts")) ?? {};
+    const payload = asObject(await this.kibanaGet("/api/fleet/fleet_server_hosts", ITEMS_SHAPE)) ?? {};
     const hosts = asObjectArray(payload.items);
     return pagedList(hosts.slice(0, cap), asNumber(payload.total) ?? hosts.length, 1, hosts.length <= cap);
   }
@@ -1427,11 +1881,11 @@ export class ElasticApiClient {
   }
 
   async listConnectors(): Promise<JsonRecord[]> {
-    return asObjectArray(await this.kibanaGet("/api/actions/connectors"));
+    return asObjectArray(await this.kibanaGet("/api/actions/connectors", ARRAY_SHAPE));
   }
 
   async listCloudDeployments(): Promise<JsonRecord[]> {
-    return asObjectArray(asObject(await this.cloudGet("/api/v1/deployments"))?.deployments);
+    return asObjectArray(asObject(await this.cloudGet("/api/v1/deployments", { kind: "list", key: "deployments" }))?.deployments);
   }
 }
 
@@ -1634,19 +2088,81 @@ export async function collectElasticSnapshot(
   return snapshot;
 }
 
-/** Applies the per-dataset projection that drops free-form configuration before anything is stored or assessed. */
-function projectDataset(name: ElasticDatasetName, data: unknown): unknown {
+/**
+ * Applies the per-dataset projection before anything is stored or assessed: every dataset is reduced to the documented
+ * fields its verdicts read, so descriptions, notes, metadata, rule queries and parameters, policy overrides, output
+ * YAML, and every other free-form carrier are dropped rather than scrubbed. The data-side scrub then runs over what
+ * remains. A dataset whose payload is not the documented container (guarded at the client) projects to itself.
+ */
+export function projectDataset(name: ElasticDatasetName, data: unknown): unknown {
+  const record = asObject(data);
+  const projectObject = (project: (record: JsonRecord) => JsonRecord): unknown => (record ? project(record) : data);
+  const projectMap = (project: (entry: JsonRecord, key: string) => JsonRecord): unknown => (record ? projectRecordMap(record, project) : data);
+  const projectList = (project: (entry: JsonRecord) => JsonRecord): unknown => (Array.isArray(data) ? asObjectArray(data).map(project) : data);
   switch (name) {
-    case "connectors":
-      return asObjectArray(data).map(projectConnector);
+    case "authenticate":
+      return projectObject(projectAuthenticate);
+    case "privileges":
+      return projectObject(projectPrivileges);
+    case "license":
+      return projectObject(projectLicense);
+    case "xpack_info":
+      return projectObject(projectXpackInfo);
+    case "xpack_usage":
+      return projectObject(projectXpackUsage);
+    case "cluster_settings":
+      return projectObject(projectClusterSettings);
+    case "node_settings":
+      return projectObject(projectNodeSettings);
+    case "ssl_certificates":
+      return projectList(projectSslCertificate);
+    case "users":
+      return projectMap(projectUser);
+    case "roles":
+      return projectMap(projectRoleDescriptor);
+    case "role_mappings":
+      return projectMap(projectRoleMapping);
+    case "api_keys":
+      return projectList(projectApiKey);
+    case "ilm_status":
+    case "slm_status":
+      return projectObject((status) => pick(status, ["operation_mode"]));
+    case "ilm_policies":
+      return projectMap(projectIlmPolicy);
+    case "slm_policies":
+      return projectMap(projectSlmPolicy);
+    case "snapshot_repositories":
+      return projectMap(projectSnapshotRepository);
     case "watches":
-      return asObjectArray(data).map(projectWatch);
-    case "ingest_pipelines": {
-      const pipelines = asObject(data);
-      return pipelines ? projectPipelines(pipelines) : data;
+      return projectList(projectWatch);
+    case "ingest_pipelines":
+      return projectObject(projectPipelines);
+    case "kibana_status":
+      return projectObject(projectKibanaStatus);
+    case "kibana_spaces":
+      return projectList(projectKibanaSpace);
+    case "kibana_roles":
+      return projectList(projectKibanaRole);
+    case "fleet_agent_policies":
+      return projectList(projectAgentPolicy);
+    case "fleet_outputs":
+      return projectList(projectFleetOutput);
+    case "fleet_enrollment_api_keys":
+      return projectList(projectEnrollmentApiKey);
+    case "fleet_server_hosts":
+      return projectList(projectFleetServerHost);
+    case "detection_rules":
+      return projectList(projectDetectionRule);
+    case "alerting_rules":
+      return projectList(projectAlertingRule);
+    case "connectors":
+      return projectList(projectConnector);
+    case "cloud_deployments":
+      return projectList(projectCloudDeployment);
+    default: {
+      const exhaustive: never = name;
+      throw new Error(`Unsupported Elastic dataset: ${String(exhaustive)}`);
     }
-    default:
-      return data;
   }
 }
 
@@ -1804,6 +2320,16 @@ function whenRead<T>(readable: boolean, value: T): T | null {
 /** Renders a count from an inventory that was read; unread inventories render null rather than 0. */
 function countWhenRead(readable: boolean, count: number): number | null {
   return readable ? count : null;
+}
+
+/**
+ * The count of records observed in an inventory: a positive count is a real observation and renders (a lower bound
+ * while the listing stopped short, which the inventory state beside it records); zero is asserted only from a listing
+ * read to completion and renders null from a read that stopped or failed, so an absence is never derived from a
+ * partial inventory.
+ */
+function observedCount(complete: boolean, count: number): number | null {
+  return count > 0 || complete ? count : null;
 }
 
 /**
@@ -3250,6 +3776,8 @@ export function evaluateElasticClusterHardening(
 
   const watchesComplete = datasetComplete(snapshot, "watches");
   const connectorsComplete = datasetComplete(snapshot, "connectors");
+  const alertingRulesComplete = datasetComplete(snapshot, "alerting_rules");
+  const detectionRulesComplete = datasetComplete(snapshot, "detection_rules");
   const rulesReadable = datasetReadable(snapshot, "alerting_rules") && datasetReadable(snapshot, "detection_rules");
   const watchIssues = (watches ?? []).map((watch) => ({ id: asString(watch._id) ?? "watch", ...watchActionIssues(watch) }));
   const insecureWatchActions = watchIssues.filter((watch) => watch.insecureWebhooks.length > 0);
@@ -3278,18 +3806,19 @@ export function evaluateElasticClusterHardening(
       inventoryState(snapshot, "alerting_rules", alertingRules?.length),
       inventoryState(snapshot, "detection_rules", detectionRules?.length),
     ],
-    watches: watches?.length ?? null,
+    // Inventory counts: zero from a listing that stopped early is unknown, not an absence (the inventories above say why).
+    watches: observedCount(watchesComplete, watches?.length ?? 0),
     watcher_unreadable: watcherProblem ?? null,
     watcher_licensed: watcherLicensed ?? null,
     watcher_not_applicable: whenRead(licenseReadable, watcherNotApplicable),
     kibana_scoped_out: kibanaScopedOut ?? null,
     kibana_space_queried: kibanaSpaceId ?? "default",
     kibana_spaces_total: kibanaSpaces?.length ?? null,
-    connectors: connectors?.length ?? null,
+    connectors: observedCount(connectorsComplete, connectors?.length ?? 0),
     connectors_unreadable: connectorProblem ?? null,
-    alerting_rules: alertingRules?.length ?? null,
-    detection_rules: detectionRules?.length ?? null,
-    rules_with_actions: countWhenRead(rulesReadable, rulesWithActions),
+    alerting_rules: observedCount(alertingRulesComplete, alertingRules?.length ?? 0),
+    detection_rules: observedCount(detectionRulesComplete, detectionRules?.length ?? 0),
+    rules_with_actions: rulesReadable ? observedCount(alertingRulesComplete && detectionRulesComplete, rulesWithActions) : null,
     insecure_watch_webhooks: principalsWhenComplete(watchesComplete, insecureWatchActions.map((watch) => ({ id: watch.id, actions: watch.insecureWebhooks }))),
     watch_actions_with_embedded_credentials: principalsWhenComplete(watchesComplete, credentialWatchActions.map((watch) => ({ id: watch.id, actions: watch.embeddedCredentials }))),
     insecure_connectors: principalsWhenComplete(connectorsComplete, insecureConnectors.map((connector) => ({ id: asString(connector.id), name: asString(connector.name), type: asString(connector.connector_type_id), url: connectorUrl(connector) }))),
@@ -3301,6 +3830,9 @@ export function evaluateElasticClusterHardening(
   const alertingFailed = insecureWatchActions.length > 0 || insecureConnectors.length > 0;
   const alertingWarned = credentialWatchActions.length > 0 || connectorsMissingSecrets.length > 0;
   const alertingEmpty = (watches?.length ?? 0) === 0 && (connectors?.length ?? 0) === 0;
+  // An empty read is an observed absence only when every listing behind it ran to completion; a page that stopped before
+  // any watch or connector was read says nothing about whether alerting destinations exist.
+  const alertingEmptyObserved = alertingEmpty && (watches === undefined || watchesComplete) && (connectors === undefined || connectorsComplete);
   const alertingManualEvidence: JsonRecord = { ...alertingEvidence, unreadable_sources: alertingProblems, partial_sources: alertingPartial, unchecked_sources: alertingUnchecked };
   if (!alertingFailed && alertingProblems.length === 0 && watcherNotApplicable && kibanaScopedOut) {
     findings.push(manualFinding(
@@ -3328,16 +3860,18 @@ export function evaluateElasticClusterHardening(
     ));
   } else {
     findings.push(guardedFinding(20, "medium", {
-      status: alertingFailed ? "fail" : alertingWarned ? "warn" : "pass",
+      status: alertingFailed ? "fail" : alertingWarned || (alertingEmpty && !alertingEmptyObserved) ? "warn" : "pass",
       summary: alertingFailed
         ? `${insecureWatchActions.length} watch(es) and ${insecureConnectors.length} Kibana connector(s) send to plain http webhook destinations.`
         : alertingWarned
           ? `${credentialWatchActions.length} watch action(s) embed basic-auth credentials and ${connectorsMissingSecrets.length} connector(s) are missing secrets.`
           : alertingProblems.length > 0
             ? "the readable alerting inventories show no insecure destination, but the alerting picture is incomplete."
-            : alertingEmpty
+            : alertingEmptyObserved
               ? `Zero watches and zero connectors exist in the only Kibana space${watcherNotApplicable ? ` (Watcher is not available on the ${license.type} license)` : ""}; this passes because the control governs the security of existing alerting destinations and none exist.`
-              : `${watches?.length ?? 0} watches and ${connectors?.length ?? 0} connectors reviewed (${rulesWithActions} rules carry actions); all webhook destinations use https and no inline credentials were found${watcherNotApplicable ? `; Watcher is not available on the ${license.type} license, so only Kibana connectors were assessed` : ""}.`,
+              : alertingEmpty
+                ? "Zero watches and zero connectors were read before the listing stopped, so no alerting destination was assessed and their absence is not established."
+                : `${watches?.length ?? 0} watches and ${connectors?.length ?? 0} connectors reviewed (${rulesWithActions} rules carry actions); all webhook destinations use https and no inline credentials were found${watcherNotApplicable ? `; Watcher is not available on the ${license.type} license, so only Kibana connectors were assessed` : ""}.`,
       evidence: alertingEvidence,
     }, { problems: alertingProblems, partial: alertingPartial, unchecked: alertingUnchecked, collect: alertingCollect }));
   }
@@ -3388,13 +3922,17 @@ export function evaluateElasticClusterHardening(
   const realmTypes = new Set([...parseRealms(view).filter((realm) => realm.enabled).map((realm) => realm.type), ...usageRealmTypes(usage)]);
   const rolesReadable = roles !== undefined;
   const usesFlsOrDls = roles ? roleIndexEntries(roles).some((entry) => (entry.fieldSecurity && Object.keys(entry.fieldSecurity).length > 0) || (entry.query !== undefined && entry.query !== null)) : false;
-  const requirements = requiredLicenseRankFor(realmTypes, usesFlsOrDls, auditEnabled, watches?.length ?? 0);
+  // A partial watches read proves Watcher is in use from any collected row or a server count above zero; it never
+  // proves the feature absent, so the requirement set stays incomplete and the read is named as partial.
+  const watchesInUse = watches !== undefined ? Math.max(watches.length, datasetPage(snapshot, "watches")?.total ?? 0) : 0;
+  const requirements = requiredLicenseRankFor(realmTypes, usesFlsOrDls, auditEnabled, watchesInUse);
   const unsupported = license.rank === undefined ? [] : requirements.filter((requirement) => requirement.rank > (license.rank as number));
   const expiryDays = licenseExpiry ? daysBetween(now, Date.parse(licenseExpiry)) : undefined;
   const expiryMissing = licenseReadable && licenseExpiry === undefined && license.type !== "basic";
   const featureSourceProblems = [...settingsProblems, ...dependencyProblems(snapshot, ["roles"])];
   const featureSourcesUnchecked = uncheckedSources(snapshot, ["xpack_usage", "xpack_info"]).concat(watches || watcherNotApplicable ? [] : uncheckedSources(snapshot, ["watches"]));
-  const requirementsComplete = settingsReadable && rolesReadable && usageReadable && (watches !== undefined || watcherNotApplicable);
+  const featureSourcesPartial = truncationNotes(snapshot, ["watches"]);
+  const requirementsComplete = settingsReadable && rolesReadable && usageReadable && (watchesComplete || watcherNotApplicable);
   // Below platinum the configured features decide coverage, so their sources are essential; at platinum or above every feature is covered and they only cross-check.
   const coverageEssential = license.rank === undefined || license.rank < LICENSE_RANK.platinum;
   const licenseEvidence: JsonRecord = {
@@ -3433,7 +3971,7 @@ export function evaluateElasticClusterHardening(
     evidence: licenseEvidence,
   }, {
     problems: [...licenseProblems, ...(coverageEssential ? featureSourceProblems : [])],
-    partial: nodeNotes,
+    partial: [...nodeNotes, ...featureSourcesPartial],
     unchecked: [...(coverageEssential ? [] : featureSourceProblems), ...featureSourcesUnchecked],
     collect: "the output of GET /_license and the subscription tier that covers the configured realms, FLS/DLS, audit logging, and Watcher.",
   }));
@@ -3449,10 +3987,10 @@ export function evaluateElasticClusterHardening(
       snapshot_repositories: countWhenRead(reposReadable, Object.keys(repositories ?? {}).length),
       slm_policies: countWhenRead(slmReadable, Object.keys(slmPolicies ?? {}).length),
       slm_operation_mode: slmMode ?? null,
-      watches: watches?.length ?? null,
-      connectors: connectors?.length ?? null,
-      alerting_rules: alertingRules?.length ?? null,
-      detection_rules: detectionRules?.length ?? null,
+      watches: observedCount(watchesComplete, watches?.length ?? 0),
+      connectors: observedCount(connectorsComplete, connectors?.length ?? 0),
+      alerting_rules: observedCount(alertingRulesComplete, alertingRules?.length ?? 0),
+      detection_rules: observedCount(detectionRulesComplete, detectionRules?.length ?? 0),
       ingest_pipelines: countWhenRead(pipelinesReadable, Object.keys(pipelines ?? {}).length),
       license_type: whenRead(licenseReadable, license.type ?? null),
       license_status: whenRead(licenseReadable, license.status ?? null),

@@ -44,7 +44,8 @@ import {
 } from "../dist/extensions/grc-tools/datadog.js";
 import { getRegisteredToolSummaries } from "../dist/pi/tool-catalog.js";
 import { readBundleFiles, readZipEntries } from "./helpers/bundle-contents.mjs";
-import { assertCanaryFixture, assertCanaryWindowsAbsent } from "./helpers/canary-windows.mjs";
+import { assertCanaryFixture, assertCanaryWindowsAbsent, assertDepthCapPins } from "./helpers/canary-windows.mjs";
+import { assertCookieAttributeCarriersScrubbed } from "./helpers/cookie-attribute-carriers.mjs";
 import { scrubAlterations } from "./helpers/scrub-survival.mjs";
 
 const NOW = new Date("2026-09-21T00:00:00.000Z");
@@ -716,6 +717,27 @@ test("DatadogApiClient follows meta.page.after cursors and page/page_size monito
   assert.equal(connectionCalls[0].searchParams.has("page[limit]"), false);
 });
 
+test("foreign-origin next link: a URL-shaped Datadog page cursor is an opaque value appended to the configured base, so no request leaves for the origin it names", async () => {
+  const FOREIGN = "https://collector.attacker.example/api/v2/audit/events?page[cursor]=stolen";
+  const seen = [];
+  const fetchImpl = async (input) => {
+    const url = new URL(typeof input === "string" ? input : input.toString());
+    seen.push(url);
+    if (url.pathname !== "/api/v2/audit/events") throw new Error(`unexpected ${url.pathname}`);
+    return url.searchParams.get("page[cursor]")
+      ? jsonResponse({ data: [{ id: "e2", attributes: {} }], meta: { page: {} } })
+      : jsonResponse({ data: [{ id: "e1", attributes: {} }], meta: { page: { after: FOREIGN } } });
+  };
+
+  const client = new DatadogApiClient(sampleConfig(), { fetchImpl });
+  const events = await client.listAuditEvents({ from: "now-1d", to: "now", query: "@action:login", limit: 10 });
+
+  assert.deepEqual(events.items.map((event) => event.id), ["e1", "e2"], "paging continued through the planted cursor");
+  assert.equal(seen.length, 2);
+  assert.ok(seen.every((url) => url.origin === "https://api.datadoghq.com"), "every request, including the one that carried the planted cursor, went to the configured origin");
+  assert.equal(seen[1].searchParams.get("page[cursor]"), FOREIGN, "the cursor travels only as a query parameter value on the configured base");
+});
+
 test("DatadogApiClient retries 429 honoring X-RateLimit-Reset and retries 5xx with backoff", async () => {
   const sleeps = [];
   let attempts = 0;
@@ -1185,6 +1207,81 @@ test("identity findings flag truncated user and role inventories instead of pass
   assert.ok(result.errors.some((error) => /roles: inventory truncated at 10 items/.test(error)));
 });
 
+test("DD-03 renders the user population as null beside its own truncation marker when the users read stopped early", async () => {
+  // A complete read keeps the count, and the marker beside it reads false.
+  const complete = findingById(await assessDatadogIdentity(healthyClient(), { now: NOW }), "DD-03");
+  assert.equal(complete.evidence.total_users, 3);
+  assert.equal(complete.evidence.users_inventory_truncated, false);
+
+  // Zero rows read while the server reported more: the population is unknown, never 0, and the finding's own evidence
+  // says why, because its `inventory` object covers the roles read alone.
+  const zeroRows = await assessDatadogIdentity(healthyClient({
+    async listUsers() {
+      return { items: [], truncated: true, truncationReason: "the server repeated the same page cursor", total: 500 };
+    },
+  }), { now: NOW });
+  const zeroRowsRbac = findingById(zeroRows, "DD-03");
+  assert.equal(zeroRowsRbac.status, "pass", "the roles verdict does not depend on the users read");
+  assert.equal(zeroRowsRbac.evidence.total_users, null);
+  assert.equal(zeroRowsRbac.evidence.users_inventory_truncated, true);
+  assert.deepEqual([zeroRowsRbac.evidence.inventory.inventory, zeroRowsRbac.evidence.inventory.complete], ["roles", true]);
+  assert.equal(zeroRows.summary.users, null);
+  assert.equal(zeroRows.summary.users_seen, 0);
+
+  // A capped read: the records read are real, the population is not.
+  const capped = await assessDatadogIdentity(healthyClient({
+    async listUsers(limit) {
+      return fill(limit, (index) => user(`u${index}`));
+    },
+  }), { now: NOW, userLimit: 2 });
+  const cappedRbac = findingById(capped, "DD-03");
+  assert.equal(cappedRbac.evidence.total_users, null);
+  assert.equal(cappedRbac.evidence.users_inventory_truncated, true);
+  assert.equal(capped.summary.users_seen, 2);
+
+  // An unread inventory has no count and no truncation flag to report.
+  const denied = await assessDatadogIdentity(healthyClient({
+    async listUsers() {
+      throw forbidden("/api/v2/users");
+    },
+  }), { now: NOW });
+  const deniedRbac = findingById(denied, "DD-03");
+  assert.equal(deniedRbac.evidence.total_users, null);
+  assert.equal(deniedRbac.evidence.users_inventory_truncated, null);
+});
+
+test("assessDatadogIdentity honors key_limit for the application key inventory behind DD-19", async () => {
+  const requestedLimits = [];
+  const client = healthyClient({
+    async listApplicationKeys(limit) {
+      requestedLimits.push(limit);
+      return {
+        data: fill(limit, (index) => ({
+          id: `ak${index}`,
+          type: "application_keys",
+          attributes: { name: `deploy-${index}`, last4: "1111", created_at: daysAgo(10), last_used_at: daysAgo(1), scopes: ["dashboards_read"] },
+          relationships: { owned_by: { data: { id: "svc-terraform", type: "users" } } },
+        })),
+        included: [user("svc-terraform", { service_account: true, last_login_time: undefined })],
+      };
+    },
+  });
+  const capped = await assessDatadogIdentity(client, { now: NOW, keyLimit: 2 });
+  // The cap is probed with one extra record, exactly as the access control assessment does.
+  assert.deepEqual(requestedLimits, [3]);
+  const serviceAccounts = findingById(capped, "DD-19");
+  assert.equal(serviceAccounts.status, "warn");
+  assert.match(serviceAccounts.summary, /application_keys inventory is truncated at 2 items \(2 of an unknown total loaded; raise key_limit\)/);
+  assert.equal(serviceAccounts.evidence.application_keys_inventory_truncated, true);
+  assert.ok(capped.errors.some((error) => /application_keys: inventory truncated at 2 items \(2 of an unknown total loaded; more than 2 keys exist\); raise key_limit/.test(error)));
+
+  // Without key_limit the identity assessment keeps the default cap the caveat text has always advised raising.
+  requestedLimits.length = 0;
+  const defaulted = await assessDatadogIdentity(client, { now: NOW });
+  assert.deepEqual(requestedLimits, [501]);
+  assert.match(findingById(defaulted, "DD-19").summary, /application_keys inventory is truncated at 500 items/);
+});
+
 test("assessDatadogAccessControls passes on rotated keys, closed sharing, and a scoped allowlist", async () => {
   const result = await assessDatadogAccessControls(healthyClient(), { now: NOW });
   assert.equal(result.findings.length, 5);
@@ -1486,6 +1583,43 @@ test("DD-12 is manual when either the rules or the posture findings source is un
   assert.match(findingById(integrationsForbidden, "DD-12").summary, /Unreadable inventory: gcp_integrations \(GET \/api\/v1\/integration\/gcp, gcp_configuration_read: .*403 Forbidden/);
 });
 
+test("gap 40: DD-08 does not fail on an empty rules listing that stopped early; the collection's own stop reason is rendered and fail is reserved for a complete read that returned nothing", async () => {
+  const cursorReason = "the server repeated the same page cursor, so the remaining pages could not be read";
+  const emptyTruncated = await assessDatadogSecurityMonitoring(healthyClient({
+    async listSecurityRules() {
+      return { items: [], truncated: true, truncationReason: cursorReason, total: 500 };
+    },
+  }), { now: NOW });
+  const rules = findingById(emptyTruncated, "DD-08");
+  assert.equal(rules.status, "warn", `an empty first page under a next-page cursor is not a fail: ${rules.summary}`);
+  assert.match(rules.summary, /^The security monitoring rules listing returned no rules before it stopped \(the server repeated the same page cursor, so the remaining pages could not be read\), so whether any detection rule is enabled is unknown\./);
+  assert.doesNotMatch(rules.summary, /returned no rules at all|no detection is active/);
+  assert.deepEqual(
+    { returned: rules.evidence.rules_returned, total: rules.evidence.total_rules, enabled: rules.evidence.enabled_detection_rules, truncated: rules.evidence.rules_inventory_truncated, complete: rules.evidence.inventory.complete, seen: rules.evidence.inventory.seen, inventoryTotal: rules.evidence.inventory.total },
+    { returned: 0, total: null, enabled: null, truncated: true, complete: false, seen: 0, inventoryTotal: 500 },
+  );
+  assert.ok(rules.evidence.verdict_caveats.some((caveat) => caveat.startsWith("security_rules inventory is truncated")), "the truncation caveat is recorded");
+
+  // An empty page that stopped at the cap reads the same way, with that reason.
+  const capReason = "the item cap of 500 was reached while a next-page cursor was still present";
+  const emptyCapped = await assessDatadogSecurityMonitoring(healthyClient({
+    async listSecurityRules() {
+      return { items: [], truncated: true, truncationReason: capReason };
+    },
+  }), { now: NOW });
+  assert.equal(findingStatus(emptyCapped, "DD-08"), "warn");
+  assert.match(findingById(emptyCapped, "DD-08").summary, /before it stopped \(the item cap of 500 was reached while a next-page cursor was still present\)/);
+
+  // A complete read that returned nothing is the only empty inventory that fails.
+  const emptyComplete = await assessDatadogSecurityMonitoring(healthyClient({
+    async listSecurityRules() {
+      return { items: [], truncated: false, total: 0 };
+    },
+  }), { now: NOW });
+  assert.equal(findingStatus(emptyComplete, "DD-08"), "fail");
+  assert.match(findingById(emptyComplete, "DD-08").summary, /^The security monitoring rules endpoint returned no rules at all\./);
+});
+
 test("DD-12 downgrades to warn when posture counts are truncated instead of reporting a fixed rate", async () => {
   const truncated = await assessDatadogSecurityMonitoring(healthyClient({
     async listPostureFindings(options = {}) {
@@ -1494,9 +1628,49 @@ test("DD-12 downgrades to warn when posture counts are truncated instead of repo
   }), { now: NOW, findingLimit: 100 });
   const cspm = findingById(truncated, "DD-12");
   assert.equal(cspm.status, "warn");
-  assert.match(cspm.summary, /carried no total_filtered_count and the paged counts hit the finding_limit/);
+  // A truncated payload that recorded no reason names the stop without inventing one, and offers only the console remedy.
+  assert.match(cspm.summary, /but the passing rate could not be measured reliably: the posture findings response carried no total_filtered_count and the paged failing and passing counts stopped early\. Capture the passing percentage from the console\./);
+  assert.doesNotMatch(cspm.summary, /finding_limit/);
   assert.equal(cspm.evidence.posture_counts_truncated, true);
+  assert.deepEqual(cspm.evidence.posture_counts_truncation_reasons, { failing: null, passing: null });
   assert.equal(cspm.evidence.posture_count_source, "paged_data");
+
+  // The finding renders the same truncation_reason the collection_status row carries; a cap stop advises finding_limit.
+  const capReason = "finding_limit (100) was reached while a next-page cursor was still present";
+  const capped = await assessDatadogSecurityMonitoring(healthyClient({
+    async listPostureFindings(options = {}) {
+      return { data: fill(options.limit ?? 100, (index) => ({ id: `f${index}` })), total_filtered_count: null, truncated: true, truncation_reason: capReason, cap_reached: true, seen: options.limit ?? 100 };
+    },
+  }), { now: NOW, findingLimit: 100 });
+  const cappedCspm = findingById(capped, "DD-12");
+  assert.equal(cappedCspm.status, "warn");
+  assert.match(cappedCspm.summary, /carried no total_filtered_count and the paged failing and passing counts stopped early because finding_limit \(100\) was reached while a next-page cursor was still present\. Raise finding_limit or capture the passing percentage from the console\./);
+  assert.deepEqual(cappedCspm.evidence.posture_counts_truncation_reasons, { failing: capReason, passing: capReason });
+
+  // A repeated cursor is the server's doing: the reason is rendered and a larger finding_limit is not offered.
+  const cursorReason = "the server repeated the same page cursor, so the remaining findings could not be counted";
+  const repeated = await assessDatadogSecurityMonitoring(healthyClient({
+    async listPostureFindings(options = {}) {
+      return options.evaluation === "fail"
+        ? { data: fill(3, (index) => ({ id: `f${index}` })), total_filtered_count: null, truncated: true, truncation_reason: cursorReason, cap_reached: false, seen: 3 }
+        : { data: fill(40, (index) => ({ id: `p${index}` })), total_filtered_count: null, truncated: false, truncation_reason: null, cap_reached: false, seen: 40 };
+    },
+  }), { now: NOW, findingLimit: 100 });
+  const repeatedCspm = findingById(repeated, "DD-12");
+  assert.equal(repeatedCspm.status, "warn");
+  assert.match(repeatedCspm.summary, /carried no total_filtered_count and the paged failing count stopped early because the server repeated the same page cursor, so the remaining findings could not be counted\. Capture the passing percentage from the console\./);
+  assert.doesNotMatch(repeatedCspm.summary, /finding_limit/);
+  assert.deepEqual(repeatedCspm.evidence.posture_counts_truncation_reasons, { failing: cursorReason, passing: null });
+
+  // Two evaluations that stopped for different reasons are each named.
+  const mixed = await assessDatadogSecurityMonitoring(healthyClient({
+    async listPostureFindings(options = {}) {
+      return options.evaluation === "fail"
+        ? { data: fill(3, (index) => ({ id: `f${index}` })), total_filtered_count: null, truncated: true, truncation_reason: cursorReason, cap_reached: false, seen: 3 }
+        : { data: fill(100, (index) => ({ id: `p${index}` })), total_filtered_count: null, truncated: true, truncation_reason: capReason, cap_reached: true, seen: 100 };
+    },
+  }), { now: NOW, findingLimit: 100 });
+  assert.match(findingById(mixed, "DD-12").summary, /the paged failing count stopped early because the server repeated the same page cursor, so the remaining findings could not be counted and the paged passing count stopped early because finding_limit \(100\) was reached while a next-page cursor was still present\. Raise finding_limit or capture the passing percentage from the console\./);
 
   const pagedToCompletion = await assessDatadogSecurityMonitoring(healthyClient({
     async listPostureFindings(options = {}) {
@@ -1976,7 +2150,7 @@ test("false-pass self-check (c): a partial inventory never passes on any of the 
   assert.match(findings.get("DD-09").summary, /truncated list/);
   assert.match(findings.get("DD-10").summary, /log_archives/);
   assert.match(findings.get("DD-11").summary, /were not returned in the included payload/);
-  assert.match(findings.get("DD-12").summary, /paged counts hit the finding_limit/);
+  assert.match(findings.get("DD-12").summary, /the paged failing and passing counts stopped early/);
   assert.match(findings.get("DD-14").summary, /confirm each uses invite-only sharing/);
   assert.equal(findings.get("DD-14").evidence.shared_dashboards_inventory_truncated, true);
   assert.match(findings.get("DD-15").summary, /returned no CIDR entries/);
@@ -2298,8 +2472,9 @@ test("isCredentialKey, reduceUrl, and redactCredentialValues cover nested, plura
     plain: "/relative/path?query=1",
   });
 
-  // Booleans, numbers, and nulls under credential keys pass through: they cannot carry a secret and often mean "is set".
-  assert.deepEqual(redactCredentialValues({ api_key: null, has_secret: true, token: 4 }), { api_key: null, has_secret: true, token: 4 });
+  // Booleans and nulls under credential keys pass through (they cannot carry a secret and often mean "is set"); a
+  // number under a credential key is a PIN or one-time code and goes, while a number under an ordinary key stays.
+  assert.deepEqual(redactCredentialValues({ api_key: null, has_secret: true, token: 4, count: 4 }), { api_key: null, has_secret: true, token: "[REDACTED]", count: 4 });
 
   let deep = { leaf: "value" };
   for (let depth = 0; depth < 80; depth += 1) deep = { level: deep };
@@ -2311,6 +2486,10 @@ test("isCredentialKey, reduceUrl, and redactCredentialValues cover nested, plura
   }
   assert.equal(cursor, "[REDACTED]", "nesting beyond the depth cap collapses to [REDACTED]");
   assert.ok(steps <= 66 && steps >= 60, `redaction recursed ${steps} levels before capping`);
+});
+
+test("gap 36: Datadog redactCredentialValues keeps and scrubs every string down to depth 65 (inside the deepest kept container), masks the container at depth 65, and copies nothing from depth 66", () => {
+  assertDepthCapPins(assert, redactCredentialValues, 64, "Datadog walker");
 });
 
 test("projection helpers keep only assessment fields and drop key values, cloud credentials, signal payloads, and configuration bodies", () => {
@@ -2740,8 +2919,13 @@ test("exportDatadogAuditBundle writes collection_status.json with readable, comp
   assert.match(errorLog, /users: inventory truncated at 50 items \(50 of an unknown total loaded; more than 50 items exist\); raise user_limit to inspect the full list/);
   assert.match(errorLog, /org_connections: inventory truncated at 10000 items \(10000 of 12000 loaded; the listing stopped early\); raise the org connection limit/);
   const findings = JSON.parse(readFileSync(join(result.outputDir, "analysis", "findings.json"), "utf8"));
-  assert.equal(findings.find((item) => item.id === "DD-12").status, "warn");
-  assert.match(findings.find((item) => item.id === "DD-12").summary, /paged counts hit the finding_limit/);
+  const cspm = findings.find((item) => item.id === "DD-12");
+  assert.equal(cspm.status, "warn");
+  // The finding text carries the row's truncation_reason verbatim and, since the cap was not what stopped the paging, does not advise finding_limit.
+  assert.match(cspm.summary, /the paged failing count stopped early because the server repeated the same page cursor\. Capture the passing percentage from the console\./);
+  assert.ok(cspm.summary.includes(failing.truncation_reason));
+  assert.doesNotMatch(cspm.summary, /finding_limit/);
+  assert.deepEqual(cspm.evidence.posture_counts_truncation_reasons, { failing: failing.truncation_reason, passing: null });
   const orgSettings = findings.find((item) => item.id === "DD-20");
   assert.equal(orgSettings.status, "warn");
   // DD-20 already warns on the readable inventories, so the truncation caveat is recorded in evidence rather than re-demoting the verdict.
@@ -2775,6 +2959,11 @@ test("Datadog tools are registered in the tool catalog under the Datadog group",
     assert.equal(tool.group, "Datadog");
     assert.equal(tool.kind, "domain");
     assert.ok(tool.parameterSummaries.some((parameter) => parameter.name === "site"));
+  }
+  // Every tool whose caveats advise raising key_limit accepts it.
+  for (const name of ["datadog_assess_identity", "datadog_assess_access_controls", "datadog_export_audit_bundle"]) {
+    const tool = tools.find((candidate) => candidate.name === name);
+    assert.ok(tool.parameterSummaries.some((parameter) => parameter.name === "key_limit"), `${name} accepts key_limit`);
   }
 });
 
@@ -3049,6 +3238,57 @@ test("verdict rule 9 / addendum 2: the Datadog bundle, its zip, every assess pay
   assert.match(findingById(accessControls, "DD-15").summary, /502 Bad Gateway/);
   assert.equal(accessControls.summary.ip_allowlist_enabled, null);
   assert.equal(assessments[3].summary.archives, null);
+});
+
+/** A 403 body echoing weak human-chosen pairs (no digits, symbols, or length a shape gate would catch) under vendor env names, a config key, a webhook-prefixed credential key (gap 39), and a header-named key whose value opens with a scheme word. */
+const WEAK_PAIR_BODY = "Access denied: LAUNCHDARKLY_API_TOKEN=monkey LD_ACCESS_TOKEN=Sunshine webhook_secret=hunter2 DD_APP_KEY=p@ss BOX_CLIENT_SECRET=football KNOWBE4_API_TOKEN=qwerty ELASTIC_PASSWORD=iloveyou x-api-key: splunk correcthorse";
+const WEAK_PAIR_VALUES = ["monkey", "Sunshine", "hunter2", "p@ss", "football", "qwerty", "iloveyou", "splunk correcthorse"];
+const WEAK_PAIR_KEYS = ["LAUNCHDARKLY_API_TOKEN", "LD_ACCESS_TOKEN", "webhook_secret", "DD_APP_KEY", "BOX_CLIENT_SECRET", "KNOWBE4_API_TOKEN", "ELASTIC_PASSWORD", "x-api-key"];
+
+test("row (a): a Datadog 403 body echoing weak values under credential-named keys reaches the access check with every value gone and every key kept", async () => {
+  const routes = routesFromClient(healthyClient());
+  routes["GET /api/v2/logs/config/archives"] = () => jsonResponse({ errors: [WEAK_PAIR_BODY] }, { status: 403, statusText: "Forbidden" });
+  const log = [];
+  const { client } = httpClient(routes, log);
+  const access = await checkDatadogAccess(client);
+  const archives = access.surfaces.find((surface) => surface.name === "log_archives");
+  assert.equal(archives.http_status, 403);
+  assert.ok(log.some((entry) => entry.status === 403), "the 403 was observed on the wire");
+  assert.match(archives.error, /Datadog request failed \(403 Forbidden\) GET \/api\/v2\/logs\/config\/archives: Access denied: /);
+  for (const key of WEAK_PAIR_KEYS) assert.ok(archives.error.includes(`${key}=[REDACTED]`) || archives.error.includes(`${key}: [REDACTED]`), `${key} keeps its name and gets the marker: ${archives.error}`);
+  assertCanaryWindowsAbsent(assert, JSON.stringify(access), WEAK_PAIR_VALUES, "check_access payload");
+});
+
+/**
+ * A 401 body echoing the request's Authorization header as a scheme word and a quoted auth-param (CodeRabbit on #81,
+ * r4081238237) and the request URL with a ";" inside a query value (Codex P1 on #81). The auth-param list goes whole
+ * after the scheme word and the query value goes whole, so nothing stands after either marker.
+ */
+const ECHOED_HEADER_CANARY = "Wq4zNv8LkTp2XbRm6Hcy";
+const ECHOED_QUERY_CANARIES = ["Gt7kPz3MvXw9QnLbJs5e", "Yd2sRf6HjKm4TcVpNa8u"];
+const ECHOED_401_BODY = `Authentication failed: Authorization: Snowflake Token="${ECHOED_HEADER_CANARY}" was sent to GET /api/v2/logs/config/archives?token=${ECHOED_QUERY_CANARIES[0]};${ECHOED_QUERY_CANARIES[1]}&page=1`;
+
+test("a Datadog 401 body echoing a quoted auth-param after the scheme word and a query value holding a ';' reaches the access check, the bundle, and the assessments with every value gone and nothing left after either marker", async () => {
+  const routes = routesFromClient(healthyClient());
+  routes["GET /api/v2/logs/config/archives"] = () => jsonResponse({ errors: [ECHOED_401_BODY] }, { status: 401, statusText: "Unauthorized" });
+  const log = [];
+  const { client, config } = httpClient(routes, log);
+  const access = await checkDatadogAccess(client);
+  const archives = access.surfaces.find((surface) => surface.name === "log_archives");
+  assert.equal(archives.http_status, 401);
+  assert.ok(log.some((entry) => entry.status === 401), "the 401 was observed on the wire");
+  assert.equal(
+    archives.error,
+    `Datadog request failed (401 Unauthorized) GET /api/v2/logs/config/archives: Authentication failed: Authorization: Snowflake [REDACTED] was sent to GET /api/v2/logs/config/archives?token=[REDACTED]&page=1`,
+  );
+  const result = await exportDatadogAuditBundle(client, config, createTempBase("grclanker-datadog-echoed-401-"), { now: NOW });
+  const assessments = await runAllAssessments(client);
+  const outputs = [...readBundleFiles(result.outputDir), ["check_access", JSON.stringify(access)], ["assessments", JSON.stringify(assessments)]];
+  const text = outputs.map(([, content]) => content).join("\n");
+  assertCanaryWindowsAbsent(assert, text, [ECHOED_HEADER_CANARY, ...ECHOED_QUERY_CANARIES], "echoed 401 outputs");
+  assert.ok(text.includes(`Authorization: Snowflake [REDACTED] was sent to GET /api/v2/logs/config/archives?token=[REDACTED]&page=1`), `the echoed line reached the outputs with both markers: ${archives.error}`);
+  assert.ok(!text.includes(`[REDACTED];`), "no tail stands after a marker");
+  assert.ok(!/\[REDACTED\]\\*["'][A-Za-z0-9]/.test(text), "no quoted value stands after a marker");
 });
 
 test("addendum 5: every endpoint and status code named in Datadog output corresponds to a request the run made and observed", async () => {
@@ -3883,4 +4123,10 @@ test("verdict rule 10: a short page under a larger server-reported total is a tr
     assert.notEqual(finding.status, "pass", `${id} must not pass on 1 of 7 users: ${finding.summary}`);
   }
   assert.match(findings.find((item) => item.id === "DD-02").summary, /1 of 7 loaded/);
+});
+
+test("cookie attribute class: a later cookie whose name holds a dot or another token character goes with the header value through the Datadog error text and record scrubbers", () => {
+  assertCookieAttributeCarriersScrubbed(assert, scrubErrorText, "datadog scrubErrorText");
+  assertCookieAttributeCarriersScrubbed(assert, (text) => redactCredentialValues({ note: text }).note, "datadog redactCredentialValues");
+  assertCookieAttributeCarriersScrubbed(assert, (text) => redactCredentialValues([{ message: text }])[0].message, "datadog redactCredentialValues, error list");
 });
